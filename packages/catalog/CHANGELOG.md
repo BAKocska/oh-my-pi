@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed LM Studio first turns failing with `400 Invalid tool_choice type: 'object'` when eager todo forced a named tool. LM Studio now receives the supported string selector `tool_choice: "required"` while the requested tool remains available ([#6925](https://github.com/can1357/oh-my-pi/issues/6925)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Added

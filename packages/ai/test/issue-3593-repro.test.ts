@@ -55,9 +55,12 @@ function capturePayload(target: Model<"openai-completions">): Promise<ChatComple
 	return promise;
 }
 
-describe("issue #3593 — llama.cpp string-only tool_choice", () => {
-	it("downgrades named forced tool_choice to required for llama.cpp", async () => {
-		const payload = await capturePayload(model({}));
+describe("issues #3593 and #6925 — string-only tool_choice hosts", () => {
+	it.each([
+		["llama.cpp", "http://localhost:8080/v1"],
+		["lm-studio", "http://127.0.0.1:1234/v1"],
+	])("downgrades named forced tool_choice to required for %s", async (provider, baseUrl) => {
+		const payload = await capturePayload(model({ provider, baseUrl }));
 
 		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["resolve"]);
 		expect(payload.tool_choice).toBe("required");
