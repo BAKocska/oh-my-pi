@@ -997,6 +997,42 @@ These tools became available:
 		expect(fetchText).not.toContain("xd://mcp__nucleus_search");
 	});
 
+	it("re-announces a device after the transcript is replaced by /new", async () => {
+		const xdev = createTestXdevState();
+		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev,
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+
+		// Announce the device in the original transcript.
+		await session.refreshMCPTools([search]);
+		await session.prompt("hello");
+		expect(
+			session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "xdev-mount-notice",
+			),
+		).toHaveLength(1);
+
+		// /new swaps in a fresh transcript that no longer carries the notice. A
+		// resume/reconnect rebuilds the mount set from scratch, so model the device
+		// dropping out across the boundary.
+		await session.newSession();
+		xdev.mountedNames.clear();
+
+		// The same device reconnects into the new transcript: because the announced
+		// baseline was reset with the transcript, it must announce again (otherwise
+		// the new conversation never learns the device is available).
+		await session.refreshMCPTools([search]);
+		await session.prompt("world");
+		const newTranscriptNotices = session.agent.state.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(newTranscriptNotices).toHaveLength(1);
+		const text = typeof newTranscriptNotices[0].content === "string" ? newTranscriptNotices[0].content : "";
+		expect(text).toContain("xd://mcp__nucleus_search");
+	});
+
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
 			xdev: createTestXdevState(),

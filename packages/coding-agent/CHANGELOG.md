@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed `xd://` mount notices re-announcing already-known devices on session resume / host reconnect: the notice was diff-gated only against the in-memory mount set, which reset each resume, so reconnecting MCP/RPC-host devices re-spliced a redundant developer message into history and busted the provider prompt-cache prefix (re-billing the whole suffix at full price on metered providers). Notices now carry a structured `{ added, removed }` payload and are gated against the devices persisted history already announced—including legacy rendered notices from before the structured payload—so a resume that re-establishes the same inventory emits nothing ([#6921](https://github.com/can1357/oh-my-pi/issues/6921)).
+- Fixed `xd://` mount notices re-announcing already-known devices on session resume / host reconnect: the notice was diff-gated only against the in-memory mount set, which reset each resume, so reconnecting MCP/RPC-host devices re-spliced a redundant developer message into history and busted the provider prompt-cache prefix (re-billing the whole suffix at full price on metered providers). Notices now carry a structured `{ added, removed }` payload and are gated against the devices persisted history already announced—including legacy rendered notices from before the structured payload—so a resume that re-establishes the same inventory emits nothing. The announced baseline is reset when the transcript is replaced (`/new`, `switchSession`, `branch`), so a device reconnecting into the fresh history announces again ([#6921](https://github.com/can1357/oh-my-pi/issues/6921)).
 
 ## [17.1.8] - 2026-07-28
 

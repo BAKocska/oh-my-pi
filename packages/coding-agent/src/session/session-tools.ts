@@ -695,6 +695,20 @@ export class SessionTools {
 	}
 
 	/**
+	 * Forget mount-notice tracking for a replaced transcript. Called when session
+	 * history is swapped wholesale (`/new`, `switchSession`, `branch`): the base
+	 * system prompt is rebuilt from the current tool set, so the previous
+	 * transcript's announced baseline and any undelivered delta no longer apply.
+	 * The next notice re-seeds from the new transcript, and a device reconnecting
+	 * into it announces again.
+	 */
+	resetAnnouncedMounts(): void {
+		this.#announcedMounts.clear();
+		this.#announcedMountsSeeded = false;
+		this.#pendingXdevMountDelta = undefined;
+	}
+
+	/**
 	 * Seed {@link #announcedMounts} from persisted mount notices the first time a
 	 * notice is consumed. On resume the in-memory mount set is rebuilt from
 	 * scratch, so without replaying history every already-announced dynamic device
