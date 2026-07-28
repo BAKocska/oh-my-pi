@@ -44,11 +44,14 @@ function abortedSignal(): AbortSignal {
 	return controller.signal;
 }
 
-function capturePayload(target: Model<"openai-completions">): Promise<ChatCompletionsPayload> {
+function capturePayload(
+	target: Model<"openai-completions">,
+	overrides?: { context?: Context; toolChoice?: ToolChoice },
+): Promise<ChatCompletionsPayload> {
 	const { promise, resolve } = Promise.withResolvers<ChatCompletionsPayload>();
-	streamOpenAICompletions(target, context, {
+	streamOpenAICompletions(target, overrides?.context ?? context, {
 		apiKey: "test-key",
-		toolChoice: forcedResolve,
+		toolChoice: overrides?.toolChoice ?? forcedResolve,
 		signal: abortedSignal(),
 		onPayload: payload => resolve(payload as ChatCompletionsPayload),
 	});
@@ -64,6 +67,18 @@ describe("issues #3593 and #6925 — string-only tool_choice hosts", () => {
 
 		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["resolve"]);
 		expect(payload.tool_choice).toBe("required");
+	});
+
+	it.each([
+		["llama.cpp", "http://localhost:8080/v1"],
+		["lm-studio", "http://127.0.0.1:1234/v1"],
+	])("drops the forced choice for %s when the named tool is absent", async (provider, baseUrl) => {
+		const payload = await capturePayload(model({ provider, baseUrl }), {
+			context: { messages: context.messages, tools: [] },
+			toolChoice: { type: "tool", name: "resolve" },
+		});
+
+		expect(payload.tool_choice).toBeUndefined();
 	});
 
 	it("preserves OpenAI's named tool_choice object", async () => {
