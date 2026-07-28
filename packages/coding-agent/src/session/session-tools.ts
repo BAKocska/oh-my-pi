@@ -695,17 +695,20 @@ export class SessionTools {
 	}
 
 	/**
-	 * Forget mount-notice tracking for a replaced transcript. Called when session
-	 * history is swapped wholesale (`/new`, `switchSession`, `branch`): the base
-	 * system prompt is rebuilt from the current tool set, so the previous
-	 * transcript's announced baseline and any undelivered delta no longer apply.
-	 * The next notice re-seeds from the new transcript, and a device reconnecting
-	 * into it announces again.
+	 * Forget the announced-mount baseline for a replaced transcript. Called when
+	 * session history is swapped wholesale (`/new`, `switchSession`, `branch`): the
+	 * previous transcript's persisted notices no longer apply, so the next notice
+	 * re-seeds from the new history and a device reconnecting into it announces
+	 * again.
+	 *
+	 * The pending delta is deliberately preserved: it holds mounts that are still
+	 * live but not yet delivered to the model, and `branch()` does not rebuild the
+	 * base system prompt, so dropping it would leave the branched transcript
+	 * unaware of a still-mounted device that no later refresh would re-queue.
 	 */
 	resetAnnouncedMounts(): void {
 		this.#announcedMounts.clear();
 		this.#announcedMountsSeeded = false;
-		this.#pendingXdevMountDelta = undefined;
 	}
 
 	/**

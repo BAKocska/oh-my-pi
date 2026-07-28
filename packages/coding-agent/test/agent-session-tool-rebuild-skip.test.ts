@@ -1033,6 +1033,34 @@ These tools became available:
 		expect(text).toContain("xd://mcp__nucleus_search");
 	});
 
+	it("preserves an undelivered mount notice across a branch that does not rebuild the prompt", async () => {
+		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+		});
+		session.subscribe(() => {});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+
+		// A user turn establishes a branch point.
+		await session.prompt("first");
+		// The device mounts but the user branches before the next prompt consumes
+		// its queued notice. `branch()` does not rebuild the base system prompt, so
+		// the delta is the only channel that can tell the branched transcript the
+		// device exists.
+		await session.refreshMCPTools([search]);
+		const branchable = session.getUserMessagesForBranching();
+		expect(branchable.length).toBeGreaterThan(0);
+		await session.branch(branchable[0].entryId);
+
+		await session.prompt("second");
+		const notices = session.agent.state.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(notices).toHaveLength(1);
+		const text = typeof notices[0].content === "string" ? notices[0].content : "";
+		expect(text).toContain("xd://mcp__nucleus_search");
+	});
+
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
 			xdev: createTestXdevState(),
