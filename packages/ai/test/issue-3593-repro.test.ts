@@ -15,6 +15,17 @@ const resolveTool: Tool = {
 	parameters: z.object({ action: z.enum(["apply", "discard"]), reason: z.string() }),
 };
 
+const todoTool: Tool = {
+	name: "todo",
+	description: "Track work items",
+	parameters: z.object({ note: z.string() }),
+};
+
+const multiToolContext: Context = {
+	messages: [{ role: "user", content: "Inspect this project.", timestamp: 0 }],
+	tools: [todoTool, resolveTool],
+};
+
 const context: Context = {
 	messages: [{ role: "user", content: "Resolve the pending preview.", timestamp: 0 }],
 	tools: [resolveTool],
@@ -79,6 +90,29 @@ describe("issues #3593 and #6925 — string-only tool_choice hosts", () => {
 		});
 
 		expect(payload.tool_choice).toBeUndefined();
+	});
+
+	it.each([
+		["llama.cpp", "http://localhost:8080/v1"],
+		["lm-studio", "http://127.0.0.1:1234/v1"],
+	])("narrows the advertised tools to the forced one for %s", async (provider, baseUrl) => {
+		const payload = await capturePayload(model({ provider, baseUrl }), {
+			context: multiToolContext,
+			toolChoice: { type: "tool", name: "todo" },
+		});
+
+		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["todo"]);
+		expect(payload.tool_choice).toBe("required");
+	});
+
+	it("keeps every tool for OpenAI's named object, without narrowing", async () => {
+		const payload = await capturePayload(
+			model({ provider: "openai", baseUrl: "https://api.openai.com/v1", id: "gpt-4o-mini", name: "GPT-4o mini" }),
+			{ context: multiToolContext, toolChoice: { type: "tool", name: "todo" } },
+		);
+
+		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["todo", "resolve"]);
+		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "todo" } });
 	});
 
 	it("preserves OpenAI's named tool_choice object", async () => {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed named forced `tool_choice` no longer being enforced on string-only OpenAI-compatible hosts (llama.cpp, LM Studio): the named object degrades to `"required"`, which alone lets the host call any advertised tool, so the request now narrows the advertised tools to the forced one (mirroring the Ollama chat transport). When the forced tool is absent the full tool list is kept and the choice is dropped for an unforced turn ([#6925](https://github.com/can1357/oh-my-pi/issues/6925)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed
