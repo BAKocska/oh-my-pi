@@ -35,6 +35,12 @@ describe("parseRateLimitReason", () => {
 		expect(parseRateLimitReason("Connect error resource_exhausted: Error")).toBe("MODEL_CAPACITY_EXHAUSTED");
 	});
 
+	it("keeps explicit quota details authoritative after resource_exhausted", () => {
+		expect(parseRateLimitReason("Connect error resource_exhausted: Quota exceeded for this account")).toBe(
+			"QUOTA_EXHAUSTED",
+		);
+	});
+
 	it("classifies Too many requests as RATE_LIMIT_EXCEEDED", () => {
 		expect(parseRateLimitReason("Cloud Code Assist API error (429): Too many requests")).toBe("RATE_LIMIT_EXCEEDED");
 	});

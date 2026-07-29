@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed bare `resource_exhausted` (the gRPC/Connect status name emitted by Cursor end-streams) classifying as `QUOTA_EXHAUSTED` in `parseRateLimitReason`, which pinned a 30-minute credential block and tripped the `retry.maxDelayMs` fail-fast at the session layer. The underscore form now matches the same `MODEL_CAPACITY_EXHAUSTED` branch as the space form (45–75s backoff), while `USAGE_LIMIT_PATTERN` stays intact so stream-layer credential rotation is preserved. ([#7032](https://github.com/can1357/oh-my-pi/issues/7032))
+- Fixed bare `resource_exhausted` (the gRPC/Connect status name emitted by Cursor end-streams) classifying as `QUOTA_EXHAUSTED` in `parseRateLimitReason`, which pinned a 30-minute credential block and tripped the `retry.maxDelayMs` fail-fast at the session layer. Bare/opaque underscore status now matches the same `MODEL_CAPACITY_EXHAUSTED` branch as the space form (45–75s backoff), explicit quota details remain `QUOTA_EXHAUSTED`, and `USAGE_LIMIT_PATTERN` stays intact so stream-layer credential rotation is preserved. ([#7032](https://github.com/can1357/oh-my-pi/issues/7032))
 
 ## [17.1.8] - 2026-07-28
 
