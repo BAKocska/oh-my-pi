@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed direct Anthropic Claude Opus 5 requests failing with HTTP 400 when the endpoint rejected `strict` tool fields; the existing non-strict retry now recognizes `tools.N.custom.strict: Extra inputs are not permitted` responses ([#6976](https://github.com/can1357/oh-my-pi/issues/6976)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed
