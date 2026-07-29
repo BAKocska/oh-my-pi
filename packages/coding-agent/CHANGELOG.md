@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/tan` agents being unable to read parent-session `local://` attachments (pasted files, generated references). `TanCommandController` now threads the parent session's `localProtocolOptions` into the tan clone, so `local://` resolves against `<parent-artifacts>/local` instead of the clone-nested `<parent-artifacts>/Tan-<id>/local` root — matching the task-subagent path ([#6971](https://github.com/can1357/oh-my-pi/issues/6971)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes

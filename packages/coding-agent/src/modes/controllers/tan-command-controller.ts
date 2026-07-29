@@ -80,6 +80,17 @@ export class TanCommandController {
 		const ownerId = session.getAgentId() ?? MAIN_AGENT_ID;
 		const mcpManager = this.ctx.mcpManager;
 		const cwd = this.ctx.sessionManager.getCwd();
+		const parentSessionManager = this.ctx.sessionManager;
+		// Share the parent session's local:// root so the tan can read attachments
+		// (pasted files, generated references) the parent stored under
+		// `<parent-artifacts>/local`. The clone's own session file nests one level
+		// deeper (`<parent-artifacts>/Tan-<id>.jsonl`), so without this its derived
+		// root would be `<parent-artifacts>/Tan-<id>/local` — matching the
+		// task-subagent path, which explicitly inherits the parent's mapping.
+		const localProtocolOptions = {
+			getArtifactsDir: () => parentSessionManager.getArtifactsDir(),
+			getSessionId: () => parentSessionManager.getSessionId(),
+		};
 		// Nest the clone inside the parent's artifact directory (like a subagent
 		// session) rather than as a top-level sibling, so it shares the parent's
 		// artifacts in place — no copy needed.
@@ -132,6 +143,7 @@ export class TanCommandController {
 							parentAgentId: ownerId,
 							agentRegistry,
 							disableExtensionDiscovery: true,
+							localProtocolOptions,
 						});
 						clone = created.session;
 						clone.sessionManager?.appendSessionInit?.({
