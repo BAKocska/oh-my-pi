@@ -1772,7 +1772,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getArtifactsDir,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 		};
-		if (options.localProtocolOptions) {
+		if (options.localProtocolOptions && !options.parentTaskPrefix) {
 			LocalProtocolHandler.setOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
