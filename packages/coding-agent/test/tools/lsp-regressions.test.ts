@@ -73,6 +73,8 @@ interface FakeLspServer {
 	send(message: RpcMessage): void;
 	/** Resolve the process `exited` promise and close stdout. */
 	exit(code?: number): void;
+	/** Fail stdout without exiting the process. */
+	failStdout(error: Error): void;
 	/** Whether the client invoked `proc.kill()` (production's hard-kill fallback). */
 	readonly killed: boolean;
 	/** Resolve once a received message matches `predicate` (already-seen or future). */
@@ -81,13 +83,19 @@ interface FakeLspServer {
 
 type FakeLspHandler = (message: RpcMessage, server: FakeLspServer) => void | Promise<void>;
 
+interface FakeLspOptions {
+	killResolvesExit?: boolean;
+	stderr?: string;
+	stdoutClosesBeforeExit?: boolean;
+}
+
 // In-memory LSP transport fake. Replaces the real subprocess (`ptree.spawn`)
 // with an in-process JSON-RPC peer so the initialize / shutdown / exit and
 // workspace-folder handshakes resolve deterministically -- no subprocess spawn,
 // no real-clock latency. Installed by spying on the shared `ptree` namespace
 // object (NOT `mock.module`, which would leak across files); the suite's
 // `afterEach` `vi.restoreAllMocks()` removes it.
-function installFakeLsp(handler: FakeLspHandler, options?: { killResolvesExit?: boolean }): FakeLspServer {
+function installFakeLsp(handler: FakeLspHandler, options?: FakeLspOptions): FakeLspServer {
 	const encoder = new TextEncoder();
 	const received: RpcMessage[] = [];
 	const waiters: Array<{
@@ -97,6 +105,7 @@ function installFakeLsp(handler: FakeLspHandler, options?: { killResolvesExit?: 
 	}> = [];
 	let exitCode: number | null = null;
 	let killed = false;
+	let stdoutStopped = false;
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	const { promise: exited, resolve: resolveExited } = Promise.withResolvers<number>();
 
@@ -114,13 +123,28 @@ function installFakeLsp(handler: FakeLspHandler, options?: { killResolvesExit?: 
 	const server: FakeLspServer = {
 		received,
 		send(message) {
-			if (controller && exitCode === null) controller.enqueue(frame(message));
+			if (controller && exitCode === null && !stdoutStopped) controller.enqueue(frame(message));
 		},
 		exit(code = 0) {
 			if (exitCode !== null) return;
+			if (!stdoutStopped) {
+				stdoutStopped = true;
+				controller?.close();
+			}
+			if (options?.stdoutClosesBeforeExit) {
+				queueMicrotask(() => {
+					exitCode = code;
+					resolveExited(code);
+				});
+				return;
+			}
 			exitCode = code;
-			controller?.close();
 			resolveExited(code);
+		},
+		failStdout(error) {
+			if (stdoutStopped) return;
+			stdoutStopped = true;
+			controller?.error(error);
 		},
 		get killed() {
 			return killed;
@@ -189,7 +213,7 @@ function installFakeLsp(handler: FakeLspHandler, options?: { killResolvesExit?: 
 			end: async () => 0,
 		},
 		stdout,
-		peekStderr: () => "",
+		peekStderr: () => options?.stderr ?? "",
 		kill() {
 			killed = true;
 			if (options?.killResolvesExit !== false) server.exit(0);
@@ -3009,6 +3033,102 @@ describe("lsp regressions", () => {
 				tempDir.removeSync();
 			}
 		}, 15_000);
+	});
+	describe("reader exit ordering and initialization backoff (#7041)", () => {
+		it("surfaces the process diagnostic when stdout closes before exit publication", async () => {
+			installFakeLsp(
+				(message, server) => {
+					if (message.method === "initialize") server.exit(23);
+				},
+				{
+					stdoutClosesBeforeExit: true,
+					stderr: "simulated rust-analyzer crash",
+				},
+			);
+			const tempDir = TempDir.createSync("@omp-lsp-quick-exit-");
+			try {
+				const config: ServerConfig = {
+					command: "fake-lsp-quick-exit",
+					fileTypes: [".rs"],
+					rootMarkers: [],
+				};
+
+				await expect(lspClient.getOrCreateClient(config, tempDir.path())).rejects.toThrow(
+					"LSP server exited (code 23): simulated rust-analyzer crash",
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("kills and evicts a client whose stdout reader fails while the process is alive", async () => {
+			const server = installFakeLsp((message, fake) => {
+				if (message.method === "initialize") fake.failStdout(new Error("simulated reader failure"));
+			});
+			const tempDir = TempDir.createSync("@omp-lsp-reader-failure-");
+			try {
+				const config: ServerConfig = {
+					command: "fake-lsp-reader-failure",
+					fileTypes: [".ts"],
+					rootMarkers: [],
+				};
+
+				await expect(lspClient.getOrCreateClient(config, tempDir.path())).rejects.toThrow(
+					"LSP connection closed: Error: simulated reader failure",
+				);
+				expect(server.killed).toBe(true);
+				expect(lspClient.getActiveClients().some(client => client.name === config.command)).toBe(false);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("keeps ordinary backoff but lets explicit reload retry immediately", async () => {
+			installFakeLsp((message, server) => {
+				if (message.method === "initialize") server.exit(23);
+			});
+			const tempDir = TempDir.createSync("@omp-lsp-reload-init-failure-");
+			const config: ServerConfig = {
+				command: "fake-lsp-reload-init-failure",
+				fileTypes: [".ts"],
+				rootMarkers: [],
+			};
+			try {
+				await expect(lspClient.getOrCreateClient(config, tempDir.path())).rejects.toBeInstanceOf(Error);
+				await expect(lspClient.getOrCreateClient(config, tempDir.path())).rejects.toThrow(
+					"failed to initialize recently",
+				);
+
+				vi.restoreAllMocks();
+				const retryServer = installFakeLsp((message, server) => {
+					if (message.method === "initialize") {
+						server.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+					} else if (message.method === "rust-analyzer/reloadWorkspace") {
+						server.send({ jsonrpc: "2.0", id: message.id, result: null });
+					} else if (message.method === "shutdown") {
+						server.send({ jsonrpc: "2.0", id: message.id, result: null });
+					} else if (message.method === "exit") {
+						server.exit(0);
+					}
+				});
+				vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+					servers: { fake: config },
+					idleTimeoutMs: undefined,
+				});
+
+				const tool = new LspTool(makeLspSession(tempDir.path()));
+				const result = await tool.execute("reload-init-failure", { action: "reload", file: "*" });
+
+				expect(textResult(result)).toContain("Reloaded fake");
+				expect(retryServer.received.some(message => message.method === "initialize")).toBe(true);
+			} finally {
+				vi.restoreAllMocks();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
 	});
 
 	// #3962 — LSP cold-start and notification writes must honor the tool's

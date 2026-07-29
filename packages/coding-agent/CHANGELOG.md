@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed quick LSP server exits being misreported as reader failures and explicit reloads being blocked by the initialization backoff ([#7041](https://github.com/can1357/oh-my-pi/issues/7041)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes
