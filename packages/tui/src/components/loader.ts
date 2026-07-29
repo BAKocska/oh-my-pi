@@ -58,12 +58,17 @@ export class Loader extends Text {
 		}
 
 		const frame = this.#frames[this.#currentFrame];
+		// The wrapped text carries a fixed sentinel glyph (frames[0]); advancing
+		// the spinner swaps only the visible glyph here, so the wrap/width cache
+		// stays valid across ticks. Assumes every frame shares one display width
+		// (true for the default braille set and all in-repo callers).
+		const sentinel = this.#frames[0];
 		const lines = [""];
 		const layout = this.#layout ?? [];
 		for (let i = 0; i < layout.length; i++) {
 			const { leading, content, trailing } = layout[i];
-			if (i === 0 && content.startsWith(frame)) {
-				const remainder = content.slice(frame.length);
+			if (i === 0 && content.startsWith(sentinel)) {
+				const remainder = content.slice(sentinel.length);
 				const separator = remainder.startsWith(" ") ? " " : "";
 				const message = remainder.slice(separator.length);
 				lines.push(
@@ -78,7 +83,8 @@ export class Loader extends Text {
 
 	start() {
 		this.#lastSpinnerTick = performance.now();
-		this.#updateDisplay();
+		this.#syncText();
+		this.#requestPaint();
 		const intervalMs = this.messageColorFn.animated === true ? RENDER_INTERVAL_MS : SPINNER_ADVANCE_MS;
 		this.#intervalId = setInterval(() => {
 			const now = performance.now();
@@ -90,7 +96,7 @@ export class Loader extends Text {
 				this.#lastSpinnerTick += steps * SPINNER_ADVANCE_MS;
 			}
 			if (shouldAdvanceSpinner || this.#ui?.synchronizedOutput === true) {
-				this.#updateDisplay();
+				this.#requestPaint();
 			}
 		}, intervalMs);
 	}
@@ -112,22 +118,27 @@ export class Loader extends Text {
 			return;
 		}
 		this.message = message;
-		this.#updateDisplay();
+		this.#syncText();
+		this.#requestPaint();
 	}
 
-	#updateDisplay() {
-		const frame = this.#frames[this.#currentFrame];
-		const textChanged = this.setText(`${frame} ${this.message}`);
-		if ((textChanged || this.messageColorFn.animated === true) && this.#ui) {
-			// Direct write: a loader tick changes only this component, so the TUI
-			// can update the already-positioned rows without driving the full
-			// compose/prepare/diff pipeline. Lightweight test stubs may not carry
-			// the newer API; keep their legacy component-scoped path working.
-			if (typeof this.#ui.requestDirectWrite === "function") {
-				this.#ui.requestDirectWrite(this);
-			} else {
-				this.#ui.requestComponentRender(this);
-			}
+	/** Re-wrap the underlying Text with the stable sentinel glyph plus message. */
+	#syncText(): boolean {
+		return this.setText(`${this.#frames[0]} ${this.message}`);
+	}
+
+	#requestPaint() {
+		if (!this.#ui) {
+			return;
+		}
+		// Direct write: a loader tick changes only this component, so the TUI can
+		// update the already-positioned rows without driving the full
+		// compose/prepare/diff pipeline. Lightweight test stubs may not carry the
+		// newer API; keep their legacy component-scoped path working.
+		if (typeof this.#ui.requestDirectWrite === "function") {
+			this.#ui.requestDirectWrite(this);
+		} else {
+			this.#ui.requestComponentRender(this);
 		}
 	}
 }
