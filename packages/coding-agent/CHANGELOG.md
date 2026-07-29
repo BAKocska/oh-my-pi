@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Codex web search silently returning a plain model completion when a GPT-5.6 Responses-Lite model skipped the hosted `web_search` tool; the provider now requires a `web_search_call` event and advances to a searching model or fails clearly instead of accepting a non-search answer ([#6988](https://github.com/can1357/oh-my-pi/issues/6988)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes
