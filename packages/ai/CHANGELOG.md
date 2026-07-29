@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the Amazon Bedrock and Devin providers crashing when `Context.systemPrompt` is a bare string (as legacy `@earendil-works/pi-ai` extensions pass it), which surfaced as `stopReason: "error"` with `systemPrompt?.map is not a function`. Both providers now route through the existing `normalizeSystemPrompts()` helper like the other providers ([#7037](https://github.com/can1357/oh-my-pi/issues/7037)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed
