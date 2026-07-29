@@ -121,7 +121,7 @@ function createContext(overrides?: {
 	} as unknown as InteractiveModeContext["session"];
 	const parentArtifactsDir = parentFile.slice(0, -6);
 	const getArtifactsDir = vi.fn(() => parentArtifactsDir);
-	const getSessionId = vi.fn(() => "parent-session");
+	const getSessionId = vi.fn(() => "parent-local-session");
 	const sessionManager = {
 		getSessionFile: vi.fn(() => parentFile),
 		getCwd: vi.fn(() => tempDir.path()),
@@ -255,7 +255,9 @@ describe("TanCommandController", () => {
 		const opts = capturedOptions?.localProtocolOptions;
 		if (!opts) throw new Error("localProtocolOptions was not passed");
 		expect(resolveLocalRoot(opts)).toBe(path.join(harness.parentArtifactsDir, "local"));
-		expect(opts.getSessionId?.()).toBe("parent-session");
+		// The local mapping keys off the session-manager id (not `session.sessionId`,
+		// still "parent-session"), matching the parent's large-paste / local:// writes.
+		expect(opts.getSessionId?.()).toBe("parent-local-session");
 	});
 
 	it("aborts the cloned agent when the background job signal aborts", async () => {
