@@ -62,4 +62,4 @@ test("models config validation resources are retained only for a custom config",
 	} finally {
 		await tempDir.remove().catch(() => {});
 	}
-});
+}, 60_000);

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the spawn-based models config validator laziness test flaking under CPU contention by giving its two sequential probe processes an explicit 60s per-test timeout instead of sharing bun's 5s default ([#7018](https://github.com/can1357/oh-my-pi/issues/7018)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes
