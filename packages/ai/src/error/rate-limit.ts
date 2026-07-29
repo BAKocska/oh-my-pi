@@ -21,13 +21,18 @@ const ACCOUNT_RATE_LIMIT_PATTERN =
 const INSUFFICIENT_BALANCE_PATTERN = /insufficient.?balance/i;
 const SPEND_LIMIT_PATTERN = /spend.?limit/i;
 const OPENROUTER_DAILY_FREE_LIMIT_PATTERN = /\bfree[-_ ]models[-_ ]per[-_ ]day\b/i;
+// gRPC/Connect end-streams carry the status as its name (`resource_exhausted`),
+// while HTTP bodies use the phrase ("resource exhausted"). Match both so the
+// MODEL_CAPACITY branch classifies them identically — consistent with the
+// `resource.?exhausted` clause in USAGE_LIMIT_PATTERN below.
+const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/i;
 
 /**
  * Classify a rate-limit error message into a reason category.
  * Priority order: QUOTA (Antigravity "quota will reset") > MODEL_CAPACITY > QUOTA (account) >
  * RATE_LIMIT > QUOTA (generic) > SERVER_ERROR > UNKNOWN.
  *
- * "resource exhausted" maps to MODEL_CAPACITY (transient, short wait)
+ * "resource exhausted" / "resource_exhausted" maps to MODEL_CAPACITY (transient, short wait)
  * "quota exceeded" / "quota will reset" maps to QUOTA_EXHAUSTED (long wait, switch account)
  */
 export function parseRateLimitReason(errorMessage: string): RateLimitReason {
@@ -47,7 +52,7 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 		lower.includes("overloaded") ||
 		lower.includes("529") ||
 		lower.includes("503") ||
-		lower.includes("resource exhausted")
+		RESOURCE_EXHAUSTED_PATTERN.test(errorMessage)
 	) {
 		return "MODEL_CAPACITY_EXHAUSTED";
 	}
