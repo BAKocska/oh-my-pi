@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed hash-prefixed UUIDs in prose being misclassified as 8-digit CSS colors and receiving spurious swatches ([#7002](https://github.com/can1357/oh-my-pi/issues/7002)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed
