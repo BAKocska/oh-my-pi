@@ -25,7 +25,7 @@ const OPENROUTER_DAILY_FREE_LIMIT_PATTERN = /\bfree[-_ ]models[-_ ]per[-_ ]day\b
 // while HTTP bodies use the phrase ("resource exhausted"). Strip either form
 // before classifying explicit details; an otherwise opaque status is transient
 // model capacity, while quota/rate-limit/server wording remains authoritative.
-const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/i;
+const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/gi;
 
 /**
  * Classify a rate-limit error message into a reason category.
@@ -38,8 +38,8 @@ const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/i;
  */
 export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 	const lowerWithStatus = errorMessage.toLowerCase();
-	const hasResourceExhaustedStatus = RESOURCE_EXHAUSTED_PATTERN.test(lowerWithStatus);
-	const lower = hasResourceExhaustedStatus ? lowerWithStatus.replace(RESOURCE_EXHAUSTED_PATTERN, "") : lowerWithStatus;
+	const lower = lowerWithStatus.replace(RESOURCE_EXHAUSTED_PATTERN, "");
+	const hasResourceExhaustedStatus = lower !== lowerWithStatus;
 
 	// Antigravity / Cloud Code Assist surface multi-hour daily-quota exhaustion as
 	// "You have exhausted your capacity on this model. Your quota will reset after …".

@@ -35,6 +35,15 @@ describe("parseRateLimitReason", () => {
 		expect(parseRateLimitReason("Connect error resource_exhausted: Error")).toBe("MODEL_CAPACITY_EXHAUSTED");
 	});
 
+	// parseConnectEndStream repeats the default status phrase in the message body:
+	// `Connect error resource_exhausted: resource exhausted`. Both tokens must be
+	// stripped so the leftover "exhausted" doesn't trip the generic quota branch.
+	it("classifies repeated bare resource-exhausted tokens as MODEL_CAPACITY_EXHAUSTED", () => {
+		expect(parseRateLimitReason("Connect error resource_exhausted: resource exhausted")).toBe(
+			"MODEL_CAPACITY_EXHAUSTED",
+		);
+	});
+
 	it("keeps explicit quota details authoritative after resource_exhausted", () => {
 		expect(parseRateLimitReason("Connect error resource_exhausted: Quota exceeded for this account")).toBe(
 			"QUOTA_EXHAUSTED",
