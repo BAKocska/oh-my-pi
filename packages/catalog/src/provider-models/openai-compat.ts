@@ -2815,6 +2815,15 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 		contextWindow: 1_000_000,
 		maxTokens: 131_072,
 		input: ["text", "image"],
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+			defaultLevel: Effort.XHigh,
+		},
+		compat: {
+			...ALIBABA_TOKEN_PLAN_COMPAT,
+			supportsReasoningEffort: true,
+		},
 	}),
 	createAlibabaTokenPlanModel({
 		id: "deepseek-v4-pro",

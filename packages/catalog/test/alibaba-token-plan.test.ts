@@ -56,6 +56,16 @@ describe("QwenCloud Token Plan provider", () => {
 			},
 		});
 
+		expect(ALIBABA_TOKEN_PLAN_STATIC_MODELS.find(model => model.id === "qwen3.8-max")).toMatchObject({
+			thinking: {
+				efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+				defaultLevel: Effort.XHigh,
+			},
+			compat: {
+				supportsReasoningEffort: true,
+			},
+		});
+
 		expect(ALIBABA_TOKEN_PLAN_STATIC_MODELS.find(model => model.id === "glm-5.2")?.thinking?.efforts).toEqual([
 			Effort.Minimal,
 			Effort.Low,
