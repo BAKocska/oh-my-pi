@@ -38,25 +38,25 @@ export const DISCOVERY_DEFAULT_CONTEXT_WINDOW = OPENAI_COMPAT_DISCOVERY_DEFAULT_
 export const DISCOVERY_DEFAULT_MAX_TOKENS = OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS;
 
 /**
- * Run `fn` with an abort signal that fires after `timeoutMs`, clearing the
- * backing timer the instant the operation settles.
+ * Run `fn` with a hard deadline while also signalling cooperative transports
+ * to abort. The independent rejection keeps discovery bounded when a runtime
+ * leaves its fetch promise pending after `AbortSignal.abort()` (observed with
+ * Windows localhost probes).
  *
- * Unlike the built-in abort-signal timeout API, the timer never outlives the
- * request: on the success path it is cancelled before `fn` resolves, so the
- * signal is never aborted and no pending callback lingers on the heap. A leaked
- * abort-signal timeout (e.g. discovery against a mocked fetch that resolves
- * instantly) fires seconds later and sets its abort `reason` — which crashed
- * Bun's concurrent GC while it marked the signal's wrapped reason during an
- * unrelated allocation (`JSAbortSignal::visitAdditionalChildren`).
+ * The backing timer is cleared as soon as `fn` settles, unlike
+ * `AbortSignal.timeout()`, whose delayed reason previously crashed Bun's
+ * concurrent GC during an unrelated allocation.
  */
 async function withTimeoutSignal<T>(timeoutMs: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
 	const controller = new AbortController();
-	const timer = setTimeout(
-		() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")),
-		timeoutMs,
-	);
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => {
+		const error = new DOMException("The operation timed out.", "TimeoutError");
+		controller.abort(error);
+		timeout.reject(error);
+	}, timeoutMs);
 	try {
-		return await fn(controller.signal);
+		return await Promise.race([fn(controller.signal), timeout.promise]);
 	} finally {
 		clearTimeout(timer);
 	}

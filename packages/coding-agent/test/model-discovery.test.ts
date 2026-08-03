@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,7 +10,11 @@ import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
-import { applyLlamaCppQwenThinking, discoveryProbeTimeoutMs } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
+import {
+	applyLlamaCppQwenThinking,
+	discoverOllamaModels,
+	discoveryProbeTimeoutMs,
+} from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -1159,6 +1163,41 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(plain?.api).toBe("openai-responses");
 		expect(plain?.baseUrl).toBe("http://127.0.0.1:8080");
 		expect((plain?.compat as DialectFields | undefined)?.reasoningDisableMode).not.toBe("qwen-template-false");
+	});
+
+	test("discovery timeout rejects even when fetch ignores abort", async () => {
+		vi.useFakeTimers();
+		try {
+			const pending = Promise.withResolvers<Response>();
+			let outcome: string | undefined;
+			void discoverOllamaModels(
+				{
+					provider: "ollama",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:11434",
+					discovery: { type: "ollama", timeoutMs: 25 },
+					optional: true,
+				},
+				{
+					fetch: () => pending.promise,
+					getBearerApiKeyResolver: async () => undefined,
+				},
+			).then(
+				() => {
+					outcome = "resolved";
+				},
+				error => {
+					outcome = error instanceof DOMException ? error.name : String(error);
+				},
+			);
+
+			vi.advanceTimersByTime(25);
+			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
+
+			expect(outcome).toBe("TimeoutError");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	test("configured provider discovery accepts timeoutMs and passes it to probes", async () => {
