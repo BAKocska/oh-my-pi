@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { CATALOG_PROVIDERS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import {
 	ALIBABA_TOKEN_PLAN_BASE_URL,
 	ALIBABA_TOKEN_PLAN_STATIC_MODELS,
 	alibabaTokenPlanModelManagerOptions,
 } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
-import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
+import type { FetchImpl, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { serializeAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 
 describe("QwenCloud Token Plan provider", () => {
@@ -139,6 +143,66 @@ describe("QwenCloud Token Plan provider", () => {
 			id: "qwen3.7-plus",
 			baseUrl: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
 		});
+	});
+
+	test("drops pre-metadata cache rows while preserving the credential region offline", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-alibaba-token-plan-cache-"));
+		const cacheDbPath = path.join(tempDir, "models.db");
+		const cacheProviderId = "alibaba-token-plan-metadata-migration-test";
+		const beijingBaseUrl = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+		const staleKimi: ModelSpec<"openai-completions"> = {
+			id: "kimi-k2.7-code",
+			name: "kimi-k2.7-code",
+			api: "openai-completions",
+			provider: "alibaba-token-plan",
+			baseUrl: beijingBaseUrl,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: null,
+			maxTokens: null,
+		};
+		const oldStaticModelIds: Record<string, true> = {
+			"qwen3.8-max-preview": true,
+			"qwen3.7-max": true,
+			"qwen3.7-plus": true,
+			"qwen3.6-flash": true,
+			"glm-5.2": true,
+			"deepseek-v4-pro": true,
+		};
+
+		try {
+			await resolveProviderModels(
+				{
+					providerId: "alibaba-token-plan",
+					cacheProviderId,
+					cacheDbPath,
+					staticModels: ALIBABA_TOKEN_PLAN_STATIC_MODELS.filter(model => oldStaticModelIds[model.id]),
+					dynamicModelsAuthoritative: true,
+					fetchDynamicModels: async () => [staleKimi],
+				},
+				"online",
+			);
+
+			const apiKey = serializeAlibabaTokenPlanCredential("sk-sp-beijing", "", beijingBaseUrl);
+			const offline = await resolveProviderModels(
+				{
+					...alibabaTokenPlanModelManagerOptions({ apiKey }),
+					cacheProviderId,
+					cacheDbPath,
+				},
+				"offline",
+			);
+
+			expect(offline.models.find(model => model.id === staleKimi.id)).toMatchObject({
+				baseUrl: beijingBaseUrl,
+				input: ["text", "image"],
+				contextWindow: 262_144,
+				maxTokens: 262_144,
+			});
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	test("rejects malformed compound credentials before model discovery", () => {

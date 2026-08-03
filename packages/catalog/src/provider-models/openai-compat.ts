@@ -2894,6 +2894,8 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 	}),
 ];
 
+const ALIBABA_TOKEN_PLAN_STATIC_MODEL_IDS = ALIBABA_TOKEN_PLAN_STATIC_MODELS.map(model => model.id);
+
 const ALIBABA_TOKEN_PLAN_NON_CHAT_MODEL_PREFIXES = [
 	"fun-asr",
 	"happyhorse-",
@@ -2925,10 +2927,15 @@ export function alibabaTokenPlanModelManagerOptions(
 	// its key only authenticates against its own region, so fetching /models from
 	// any other base URL would 401 (#6682).
 	const baseUrl = credential?.baseUrl ?? config?.baseUrl ?? ALIBABA_TOKEN_PLAN_BASE_URL;
+	const staticModels =
+		baseUrl === ALIBABA_TOKEN_PLAN_BASE_URL
+			? ALIBABA_TOKEN_PLAN_STATIC_MODELS
+			: ALIBABA_TOKEN_PLAN_STATIC_MODELS.map(model => ({ ...model, baseUrl }));
 	return {
 		providerId: "alibaba-token-plan",
 		dynamicModelsAuthoritative: true,
-		staticModels: ALIBABA_TOKEN_PLAN_STATIC_MODELS,
+		staticModels,
+		dropCachedModelIdsOnStaticMismatch: ALIBABA_TOKEN_PLAN_STATIC_MODEL_IDS,
 		...(apiKey && {
 			fetchDynamicModels: () =>
 				fetchOpenAICompatibleModels({
@@ -2938,7 +2945,7 @@ export function alibabaTokenPlanModelManagerOptions(
 					apiKey,
 					filterModel: (_entry, model) => isAlibabaTokenPlanChatModelId(model.id),
 					mapModel: (_entry, defaults) => {
-						const reference = ALIBABA_TOKEN_PLAN_STATIC_MODELS.find(model => model.id === defaults.id);
+						const reference = staticModels.find(model => model.id === defaults.id);
 						return reference
 							? {
 									...reference,
