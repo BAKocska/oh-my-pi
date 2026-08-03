@@ -2765,6 +2765,18 @@ const ALIBABA_TOKEN_PLAN_DEEPSEEK_REASONING: ThinkingConfig = {
 	efforts: [Effort.High, Effort.Max],
 };
 
+// Qwen3.8-Max drives reasoning through the OpenAI-standard `reasoning_effort`
+// control on Model Studio compatible-mode (`xhigh` default / `medium` / `low`),
+// not the legacy binary `enable_thinking` toggle the older Qwen3.x builds use
+// (https://qwen.ai/blog?id=qwen3.8). The default `qwen` thinkingFormat maps to
+// the `qwen-enable-thinking-false` disable mode, which drops the selected effort
+// from the wire, so pin the OpenAI dialect to route the advertised ladder.
+const ALIBABA_TOKEN_PLAN_QWEN_EFFORT_COMPAT: OpenAICompat = {
+	...ALIBABA_TOKEN_PLAN_COMPAT,
+	supportsReasoningEffort: true,
+	thinkingFormat: "openai",
+};
+
 export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
 	createAlibabaTokenPlanModel({
 		id: "qwen3.6-plus",
@@ -2804,10 +2816,7 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 			efforts: [Effort.Low, Effort.High, Effort.XHigh],
 			requiresEffort: true,
 		},
-		compat: {
-			...ALIBABA_TOKEN_PLAN_COMPAT,
-			supportsReasoningEffort: true,
-		},
+		compat: ALIBABA_TOKEN_PLAN_QWEN_EFFORT_COMPAT,
 	}),
 	createAlibabaTokenPlanModel({
 		id: "qwen3.8-max",
@@ -2820,10 +2829,7 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
 			defaultLevel: Effort.XHigh,
 		},
-		compat: {
-			...ALIBABA_TOKEN_PLAN_COMPAT,
-			supportsReasoningEffort: true,
-		},
+		compat: ALIBABA_TOKEN_PLAN_QWEN_EFFORT_COMPAT,
 	}),
 	createAlibabaTokenPlanModel({
 		id: "deepseek-v4-pro",

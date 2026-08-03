@@ -224,7 +224,6 @@ describe("OpenAI completions disableReasoning and thinking dialects", () => {
 		expect(payload.enable_thinking).toBeUndefined();
 		expect(payload.chat_template_kwargs).toBeUndefined();
 	});
-
 	it("sets Z.AI thinking format and toggles type logically based on forced tool choice", async () => {
 		const model = buildModel({
 			id: "zai-reasoner",

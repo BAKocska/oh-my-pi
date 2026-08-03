@@ -8352,7 +8352,8 @@
 			},
 			"compat": {
 				"supportsDeveloperRole": false,
-				"supportsReasoningEffort": true
+				"supportsReasoningEffort": true,
+				"thinkingFormat": "openai"
 			}
 		},
 		"qwen3.8-max-preview": {
@@ -8385,7 +8386,8 @@
 			},
 			"compat": {
 				"supportsDeveloperRole": false,
-				"supportsReasoningEffort": true
+				"supportsReasoningEffort": true,
+				"thinkingFormat": "openai"
 			}
 		}
 	},
@@ -86483,9 +86485,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.7153999999999999,
-				"output": 2.2483999999999997,
-				"cacheRead": 0.13286,
+				"input": 0.7126,
+				"output": 2.2396000000000003,
+				"cacheRead": 0.13234,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,

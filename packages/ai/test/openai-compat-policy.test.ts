@@ -9,6 +9,7 @@ import {
 import type { Model, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 function chatModel(compat: OpenAICompat): Model<"openai-completions"> {
 	return buildModel({
@@ -159,5 +160,37 @@ describe("OpenAI compat policy", () => {
 		expect(responsesPolicy.tools.toolCallIdKind).toBe("mistral-9-alnum");
 		expect(chatPolicy.stream.reasoningDeltasMayBeCumulative).toBe(true);
 		expect(responsesPolicy.stream.reasoningDeltasMayBeCumulative).toBe(true);
+	});
+
+	it("routes the reasoning_effort ladder for the bundled Token Plan qwen3.8-max", () => {
+		// qwen3.8-max drives reasoning through the OpenAI-standard
+		// `reasoning_effort` control, not the legacy `enable_thinking` toggle the
+		// older Qwen3.x Token Plan builds ride. Build from the real bundled entry
+		// so the dialect classification — not a hardcoded override — is exercised.
+		const model = getBundledModel<"openai-completions">("alibaba-token-plan", "qwen3.8-max");
+		for (const [effort, wire] of [
+			[Effort.Low, "low"],
+			[Effort.Medium, "medium"],
+			[Effort.XHigh, "xhigh"],
+		] as const) {
+			const params = chatParams();
+			applyChatCompletionsCompatPolicy(
+				params,
+				resolveOpenAICompatPolicy(model, { endpoint: "chat-completions", reasoning: effort }),
+			);
+			expect(params.reasoning_effort).toBe(wire);
+			expect(params.enable_thinking).toBeUndefined();
+			expect(params.chat_template_kwargs).toBeUndefined();
+		}
+
+		// Disabling reasoning clamps to the lowest supported effort rather than
+		// emitting the legacy binary toggle.
+		const disabled = chatParams();
+		applyChatCompletionsCompatPolicy(
+			disabled,
+			resolveOpenAICompatPolicy(model, { endpoint: "chat-completions", disableReasoning: true }),
+		);
+		expect(disabled.reasoning_effort).toBe("low");
+		expect(disabled.enable_thinking).toBeUndefined();
 	});
 });
