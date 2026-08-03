@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Fixed `inspect_image` ignoring the thinking effort configured on `modelRoles.vision` (e.g. `<model>:high`): the oneshot resolved the model but dropped the `:high` selector and passed no `reasoning`, so the request went out with a suppressed/zero thinking budget and thinking-only Gemini models rejected it with HTTP 400 (`Budget 0 is invalid. This model only works in thinking mode.`). The tool now resolves the role's explicit thinking selector, clamps it to the model's supported efforts, and forwards it as the oneshot `reasoning` ([#7448](https://github.com/can1357/oh-my-pi/issues/7448)).
 - Fixed template argument substitution (`substituteArgs`) executing recursive placeholder expansion when positional argument values contain literal `$@` or `$ARGUMENTS` tokens.
 - Fixed focused-agent status bar dimming darkening Powerline end caps.
 - Fixed the browser relay creating duplicate "omp" tab groups: the bridge now keeps at most one group RPC in flight (a queued drain replaces fire-and-forget per-tab requests), so concurrent requests can no longer race the extension's non-atomic query→create→set-title sequence in the same window. Also fixed an extension reconnect (relay daemon restart, service-worker recycle) being misread as the user dragging every tab out of the omp group — grouping state is reset when the extension socket closes, so tabs regroup on the next hello instead of being permanently opted out.
