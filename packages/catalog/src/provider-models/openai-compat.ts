@@ -2733,18 +2733,72 @@ const ALIBABA_TOKEN_PLAN_REASONING: ThinkingConfig = {
 	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
 };
 
-export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
-	{
-		id: "qwen3.8-max-preview",
-		name: "Qwen3.8 Max Preview",
+interface AlibabaTokenPlanModelSpec {
+	id: string;
+	name: string;
+	contextWindow: number;
+	maxTokens: number;
+	input?: ("text" | "image")[];
+	thinking?: ThinkingConfig;
+	compat?: OpenAICompat;
+}
+
+function createAlibabaTokenPlanModel(spec: AlibabaTokenPlanModelSpec): ModelSpec<"openai-completions"> {
+	return {
+		id: spec.id,
+		name: spec.name,
 		api: "openai-completions",
 		provider: "alibaba-token-plan",
 		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
 		reasoning: true,
-		input: ["text", "image"],
+		input: spec.input ?? ["text"],
 		cost: ALIBABA_TOKEN_PLAN_COST,
-		contextWindow: 983_616,
+		contextWindow: spec.contextWindow,
+		maxTokens: spec.maxTokens,
+		thinking: spec.thinking ?? ALIBABA_TOKEN_PLAN_REASONING,
+		compat: spec.compat ?? ALIBABA_TOKEN_PLAN_COMPAT,
+	};
+}
+
+const ALIBABA_TOKEN_PLAN_DEEPSEEK_REASONING: ThinkingConfig = {
+	mode: "effort",
+	efforts: [Effort.High, Effort.Max],
+};
+
+export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
+	createAlibabaTokenPlanModel({
+		id: "qwen3.6-plus",
+		name: "Qwen3.6 Plus",
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		input: ["text", "image"],
+	}),
+	createAlibabaTokenPlanModel({
+		id: "qwen3.6-flash",
+		name: "Qwen3.6 Flash",
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		input: ["text", "image"],
+	}),
+	createAlibabaTokenPlanModel({
+		id: "qwen3.7-max",
+		name: "Qwen3.7 Max",
+		contextWindow: 1_000_000,
 		maxTokens: 131_072,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "qwen3.7-plus",
+		name: "Qwen3.7 Plus",
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		input: ["text", "image"],
+	}),
+	createAlibabaTokenPlanModel({
+		id: "qwen3.8-max-preview",
+		name: "Qwen3.8 Max Preview",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text", "image"],
 		thinking: {
 			mode: "effort",
 			efforts: [Effort.Low, Effort.High, Effort.XHigh],
@@ -2754,83 +2808,90 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 			...ALIBABA_TOKEN_PLAN_COMPAT,
 			supportsReasoningEffort: true,
 		},
-	},
-	{
-		id: "qwen3.7-max",
-		name: "Qwen3.7 Max",
-		api: "openai-completions",
-		provider: "alibaba-token-plan",
-		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
-		reasoning: true,
-		input: ["text"],
-		cost: ALIBABA_TOKEN_PLAN_COST,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "qwen3.8-max",
+		name: "Qwen3.8 Max",
 		contextWindow: 1_000_000,
-		maxTokens: 65_536,
-		thinking: ALIBABA_TOKEN_PLAN_REASONING,
-		compat: ALIBABA_TOKEN_PLAN_COMPAT,
-	},
-	{
-		id: "qwen3.7-plus",
-		name: "Qwen3.7 Plus",
-		api: "openai-completions",
-		provider: "alibaba-token-plan",
-		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
-		reasoning: true,
+		maxTokens: 131_072,
 		input: ["text", "image"],
-		cost: ALIBABA_TOKEN_PLAN_COST,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "deepseek-v4-pro",
+		name: "DeepSeek V4 Pro",
 		contextWindow: 1_000_000,
-		maxTokens: 64_000,
-		thinking: ALIBABA_TOKEN_PLAN_REASONING,
-		compat: ALIBABA_TOKEN_PLAN_COMPAT,
-	},
-	{
-		id: "qwen3.6-flash",
-		name: "Qwen3.6 Flash",
-		api: "openai-completions",
-		provider: "alibaba-token-plan",
-		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
-		reasoning: true,
-		input: ["text", "image"],
-		cost: ALIBABA_TOKEN_PLAN_COST,
+		maxTokens: 384_000,
+		thinking: ALIBABA_TOKEN_PLAN_DEEPSEEK_REASONING,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "deepseek-v4-flash",
+		name: "DeepSeek V4 Flash",
 		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		thinking: ALIBABA_TOKEN_PLAN_DEEPSEEK_REASONING,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "deepseek-v4-flash-0731",
+		name: "DeepSeek V4 Flash 0731",
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		thinking: ALIBABA_TOKEN_PLAN_DEEPSEEK_REASONING,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "deepseek-v3.2",
+		name: "DeepSeek V3.2",
+		contextWindow: 131_072,
 		maxTokens: 65_536,
-		thinking: ALIBABA_TOKEN_PLAN_REASONING,
-		compat: ALIBABA_TOKEN_PLAN_COMPAT,
-	},
-	{
+	}),
+	createAlibabaTokenPlanModel({
 		id: "glm-5.2",
 		name: "GLM-5.2",
-		api: "openai-completions",
-		provider: "alibaba-token-plan",
-		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
-		reasoning: true,
-		input: ["text"],
-		cost: ALIBABA_TOKEN_PLAN_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 131_072,
 		thinking: {
 			mode: "effort",
 			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.Max],
 		},
-		compat: ALIBABA_TOKEN_PLAN_COMPAT,
-	},
-	{
-		id: "deepseek-v4-pro",
-		name: "DeepSeek V4 Pro",
-		api: "openai-completions",
-		provider: "alibaba-token-plan",
-		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
-		reasoning: true,
-		input: ["text"],
-		cost: ALIBABA_TOKEN_PLAN_COST,
-		contextWindow: 1_000_000,
-		maxTokens: 384_000,
-		thinking: {
-			mode: "effort",
-			efforts: [Effort.High, Effort.Max],
-		},
-		compat: ALIBABA_TOKEN_PLAN_COMPAT,
-	},
+	}),
+	createAlibabaTokenPlanModel({
+		id: "glm-5.1",
+		name: "GLM-5.1",
+		contextWindow: 202_752,
+		maxTokens: 128_000,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "glm-5",
+		name: "GLM-5",
+		contextWindow: 202_752,
+		maxTokens: 16_384,
+	}),
+	createAlibabaTokenPlanModel({
+		id: "kimi-k2.7-code",
+		name: "Kimi K2.7 Code",
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+		input: ["text", "image"],
+	}),
+	createAlibabaTokenPlanModel({
+		id: "kimi-k2.6",
+		name: "Kimi K2.6",
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+		input: ["text", "image"],
+	}),
+	createAlibabaTokenPlanModel({
+		id: "kimi-k2.5",
+		name: "Kimi K2.5",
+		contextWindow: 262_144,
+		maxTokens: 98_304,
+		input: ["text", "image"],
+	}),
+	createAlibabaTokenPlanModel({
+		id: "MiniMax-M2.5",
+		name: "MiniMax-M2.5",
+		contextWindow: 196_608,
+		maxTokens: 32_768,
+	}),
 ];
 
 const ALIBABA_TOKEN_PLAN_NON_CHAT_MODEL_PREFIXES = [

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed dynamically discovered `alibaba-token-plan` chat models showing unknown context and output limits by curating metadata for every advertised model ID ([#7486](https://github.com/can1357/oh-my-pi/issues/7486)).
+
 ## [17.2.5] - 2026-08-03
 
 ### Fixed
