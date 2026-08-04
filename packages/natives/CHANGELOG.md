@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Windows startup aborts when Tokio refused a scheduler worker after the native capacity probe; runtime installation now recovers to a current-thread fallback ([#7653](https://github.com/can1357/oh-my-pi/issues/7653)).
+
 ## [17.2.7] - 2026-08-03
 
 ### Added

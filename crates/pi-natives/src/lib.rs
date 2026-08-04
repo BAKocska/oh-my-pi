@@ -62,6 +62,8 @@ pub(crate) mod utils;
 pub mod vectors;
 pub mod workspace;
 
+#[cfg(any(target_os = "windows", test))]
+use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(target_os = "windows")]
 use std::sync::{
 	Arc,
@@ -139,16 +141,16 @@ fn rayon_pool_plan(desired: usize, spawnable: usize) -> RayonPoolPlan {
 /// not even one extra thread is possible).
 ///
 /// `Builder::build()` for a multi-thread runtime spawns every worker eagerly
-/// and **panics** (not `Err`) when Windows refuses one — on a
-/// memory-constrained host (tiny pagefile / commit limit, `os error 1455`) that
-/// aborts the whole process at addon load before any JS error can surface — and
-/// a panic thrown that deep in runtime construction is not something we can
-/// usefully catch and recover from at module-init time. We instead pre-flight
-/// with `std::thread::Builder::spawn`, which returns an
-/// `io::Result`, holding each probe thread alive (so their stacks are committed
-/// concurrently, matching how real workers coexist) until we know the safe
-/// count. Probe threads use the std default stack, exactly like Tokio's workers
-/// (it leaves `thread_stack_size` unset), so the probe is representative.
+/// and **panics** (not `Err`) when Windows refuses one. On a memory-constrained
+/// host (tiny pagefile / commit limit, `os error 1455`), an uncaught panic
+/// aborts startup before any JS error can surface. Pre-flight with
+/// `std::thread::Builder::spawn`, which returns an `io::Result`, holding each
+/// probe thread alive so their stacks are committed concurrently, matching how
+/// real workers coexist. Probe threads use the std default stack, exactly like
+/// Tokio's workers (it leaves `thread_stack_size` unset).
+///
+/// Capacity can disappear after the probes join. The runtime builder therefore
+/// also catches Tokio's spawn panic and falls back to a current-thread runtime.
 ///
 /// Keep this Windows-only. On Linux, spawning probe threads from `module_init`
 /// can deadlock while Bun is loading the `.node`; napi-rs's default runtime
@@ -212,23 +214,21 @@ fn configure_rayon_pool() {
 }
 
 /// Build the custom Tokio runtime napi-rs uses on Windows, sized to what the
-/// host can actually spawn. Never panics: backs off from
-/// [`desired_worker_threads`] to whatever the probe allows, and falls back to a
-/// current-thread runtime (which spawns no workers at build time, so it can't
-/// abort under commit-limit pressure) when not even one worker is available.
-/// Returns `None` only if even that fails, in which case we leave napi-rs to
-/// construct its own default.
-#[cfg(target_os = "windows")]
-fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
-	let workers = probe_spawnable_workers(desired_worker_threads());
+/// host can actually spawn. Falls back to a current-thread runtime (which
+/// spawns no workers at build time) when no worker is available, the
+/// multi-thread builder returns an error, or Tokio panics after a stale probe.
+#[cfg(any(target_os = "windows", test))]
+fn build_windows_napi_tokio_runtime(
+	workers: usize,
+	build_multi_thread: impl FnOnce(usize) -> std::io::Result<tokio::runtime::Runtime>,
+) -> Option<tokio::runtime::Runtime> {
 	let multi_thread = (workers > 0)
 		.then(|| {
-			tokio::runtime::Builder::new_multi_thread()
-				.worker_threads(workers)
-				.max_blocking_threads(NAPI_TOKIO_MAX_BLOCKING_THREADS)
-				.enable_all()
-				.build()
-				.ok()
+			catch_unwind(AssertUnwindSafe(|| {
+				crash_handler::recoverable_panic_scope(|| build_multi_thread(workers))
+			}))
+			.ok()
+			.and_then(Result::ok)
 		})
 		.flatten();
 	multi_thread.or_else(|| {
@@ -236,6 +236,18 @@ fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
 			.enable_all()
 			.build()
 			.ok()
+	})
+}
+
+/// Probe Windows thread capacity before building the custom napi-rs runtime.
+#[cfg(target_os = "windows")]
+fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
+	build_windows_napi_tokio_runtime(probe_spawnable_workers(desired_worker_threads()), |workers| {
+		tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(workers)
+			.max_blocking_threads(NAPI_TOKIO_MAX_BLOCKING_THREADS)
+			.enable_all()
+			.build()
 	})
 }
 
@@ -296,8 +308,9 @@ static TOKIO_RUNTIME_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Without the Tokio override napi builds its own default (one worker per CPU,
 /// spawned eagerly), which aborts the process (`os error 1455`) on a
 /// memory-constrained Windows host before any JS error can surface;
-/// [`create_windows_napi_tokio_runtime`] pre-flights the spawn instead. Rayon
-/// has the same one-thread-per-core lazy default, so [`configure_rayon_pool`]
+/// [`create_windows_napi_tokio_runtime`] pre-flights the spawn and recovers
+/// from a stale probe by falling back to a current-thread runtime. Rayon has
+/// the same one-thread-per-core lazy default, so [`configure_rayon_pool`]
 /// installs a probed global pool before `count_tokens` or vendored `sort` can
 /// trigger it across a N-API nounwind boundary. If no worker thread is
 /// spawnable, patched Rayon callsites stay sequential rather than registering a
@@ -321,8 +334,10 @@ pub fn omp_install_tokio_runtime() {
 #[cfg(test)]
 mod tests {
 	use super::{
-		RAYON_MAX_THREADS, RayonPoolPlan, clamped_rayon_threads, rayon_pool_plan, rayon_probe_target,
+		RAYON_MAX_THREADS, RayonPoolPlan, build_windows_napi_tokio_runtime, clamped_rayon_threads,
+		rayon_pool_plan, rayon_probe_target,
 	};
+	use crate::testing::SilenceHook;
 
 	#[test]
 	fn rayon_threads_are_capped_for_windows_commit_pressure() {
@@ -359,5 +374,15 @@ mod tests {
 	fn rayon_skips_global_pool_when_only_reserved_capacity_can_spawn() {
 		assert_eq!(rayon_pool_plan(4, 1), RayonPoolPlan::SkipGlobalPool);
 		assert_eq!(rayon_pool_plan(1, 0), RayonPoolPlan::SkipGlobalPool);
+	}
+	#[test]
+	fn tokio_spawn_panic_uses_current_thread_runtime() {
+		let _silence = SilenceHook::new();
+		let runtime = build_windows_napi_tokio_runtime(1, |_| {
+			panic!("OS can't spawn worker thread: simulated commit pressure")
+		})
+		.expect("current-thread fallback");
+
+		assert_eq!(runtime.block_on(async { 42 }), 42);
 	}
 }

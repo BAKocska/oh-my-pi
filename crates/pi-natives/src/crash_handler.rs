@@ -57,13 +57,13 @@ static INSTALL: Once = Once::new();
 static ALLOC_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-	/// Active `task::blocking` panic recovery frames on this thread.
+	/// Active recoverable panic frames on this thread.
 	///
 	/// The panic hook runs before [`std::panic::catch_unwind`] returns. A
 	/// borrow-free `Cell` lets the hook recognize panics that are already inside
 	/// a known recovery boundary without touching potentially borrowed task
 	/// state while the stack is unwinding.
-	static BLOCKING_TASK_PANIC_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+	static RECOVERABLE_PANIC_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,9 +71,9 @@ enum PanicDisposition {
 	/// No recovery boundary is active: persist the report, echo it to stderr,
 	/// and chain to the default hook (which ends the process).
 	Fatal,
-	/// The panic will be caught and mapped to a failed command / rejected
-	/// Promise: persist the report to the crash log for diagnosis, but keep
-	/// stderr quiet and do not chain to the default hook.
+	/// The panic will be caught and mapped to a recoverable result or fallback:
+	/// persist the report to the crash log for diagnosis, but keep stderr quiet
+	/// and do not chain to the default hook.
 	LoggedRecoverable,
 }
 
@@ -109,34 +109,33 @@ pub fn install() {
 	});
 }
 
-/// Run `f` inside a `task::blocking` panic recovery boundary.
+/// Run `f` inside a panic recovery boundary.
 ///
-/// The global panic hook checks this thread-local scope before reporting a
-/// panic. When a blocking worker closure panics, [`std::panic::catch_unwind`]
-/// will turn it into a rejected JS Promise, so the hook downgrades the panic
-/// to [`PanicDisposition::LoggedRecoverable`]: the report (location +
-/// backtrace) is still persisted to the crash log, but nothing is echoed to
-/// stderr and the default hook is not chained.
-pub(crate) fn blocking_task_panic_scope<R>(f: impl FnOnce() -> R) -> R {
+/// Callers MUST wrap this scope in [`std::panic::catch_unwind`]. The scope
+/// tells the global panic hook that an unwind will be recovered, downgrading
+/// the report to [`PanicDisposition::LoggedRecoverable`]: the report is still
+/// persisted for diagnosis, but nothing is echoed to stderr and the default
+/// hook is not chained.
+pub(crate) fn recoverable_panic_scope<R>(f: impl FnOnce() -> R) -> R {
 	struct Guard;
 
 	impl Drop for Guard {
 		fn drop(&mut self) {
-			BLOCKING_TASK_PANIC_SCOPE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+			RECOVERABLE_PANIC_SCOPE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
 		}
 	}
 
-	BLOCKING_TASK_PANIC_SCOPE_DEPTH.with(|d| d.set(d.get() + 1));
+	RECOVERABLE_PANIC_SCOPE_DEPTH.with(|d| d.set(d.get() + 1));
 	let _guard = Guard;
 	f()
 }
 
-fn blocking_task_panic_scope_active() -> bool {
-	BLOCKING_TASK_PANIC_SCOPE_DEPTH.with(|d| d.get() > 0)
+fn recoverable_panic_scope_active() -> bool {
+	RECOVERABLE_PANIC_SCOPE_DEPTH.with(|d| d.get() > 0)
 }
 
 fn panic_disposition() -> PanicDisposition {
-	if blocking_task_panic_scope_active() || pi_uutils_ctx::is_active() {
+	if recoverable_panic_scope_active() || pi_uutils_ctx::is_active() {
 		PanicDisposition::LoggedRecoverable
 	} else {
 		PanicDisposition::Fatal
@@ -390,20 +389,20 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn blocking_task_panic_scope_downgrades_to_logged_recoverable() {
+	fn recoverable_panic_scope_downgrades_hook() {
 		assert_eq!(panic_disposition(), PanicDisposition::Fatal);
-		blocking_task_panic_scope(|| {
+		recoverable_panic_scope(|| {
 			assert_eq!(panic_disposition(), PanicDisposition::LoggedRecoverable);
 		});
 		assert_eq!(panic_disposition(), PanicDisposition::Fatal);
 	}
 
 	#[test]
-	fn blocking_task_panic_scope_restores_after_unwind() {
+	fn recoverable_panic_scope_restores_after_unwind() {
 		// Silence the process-global hook for the injected panic (and serialize
 		// the swap with every other hook-mutating test — see `crate::testing`).
 		let _silence = crate::testing::SilenceHook::new();
-		let unwound = std::panic::catch_unwind(|| blocking_task_panic_scope(|| panic!("boom")));
+		let unwound = std::panic::catch_unwind(|| recoverable_panic_scope(|| panic!("boom")));
 
 		assert!(unwound.is_err(), "panic propagated to catch_unwind");
 		assert_eq!(panic_disposition(), PanicDisposition::Fatal);

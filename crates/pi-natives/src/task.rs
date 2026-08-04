@@ -186,7 +186,7 @@ where
 		// `GenericFailure`, so it downgrades the report to a disk-only crash
 		// log — no stderr dump, no default-hook chaining.
 		match catch_unwind(AssertUnwindSafe(move || {
-			crate::crash_handler::blocking_task_panic_scope(move || work(cancel_token))
+			crate::crash_handler::recoverable_panic_scope(move || work(cancel_token))
 		})) {
 			Ok(result) => result,
 			Err(payload) => {
@@ -228,7 +228,7 @@ where
 /// and leaks the allocation).
 fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
 	if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| {
-		crate::crash_handler::blocking_task_panic_scope(|| drop(payload));
+		crate::crash_handler::recoverable_panic_scope(|| drop(payload));
 	})) {
 		std::mem::forget(secondary);
 	}
