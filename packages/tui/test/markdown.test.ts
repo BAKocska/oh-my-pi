@@ -466,6 +466,43 @@ describe("Markdown component", () => {
 			}
 		});
 
+		it("does not leak inline-code color into table borders when a cell wraps mid-code-span (#7575)", () => {
+			const markdown = new Markdown(
+				`| Command | Notes |
+| --- | --- |
+| \`config.setupgrading(pendingRequests, emptyFlag)\` | plain |`,
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const width = 30;
+			const lines = markdown.render(width);
+
+			// The code column must actually wrap: more than one physical row carries
+			// the code color, so at least one wrapped line ends mid-code-span — the
+			// exact condition that used to leak the color into the trailing border.
+			const codeRows = lines.filter(line => line.includes("\x1b[33m"));
+			expect(codeRows.length).toBeGreaterThan(1);
+
+			// Render into the VT engine and assert every table border glyph resolves
+			// to the default foreground — never the codespan color.
+			const terminal = new VirtualTerminal(width, lines.length + 2);
+			terminal.write(lines.join("\r\n"));
+			const vertical = defaultMarkdownTheme.symbols.table.vertical;
+			for (let row = 0; row < lines.length; row++) {
+				const plain = stripVTControlCharacters(lines[row]);
+				if (!plain.includes(vertical)) continue;
+				const colored = new Set(terminal.getViewportRowForegroundColumns(row));
+				for (let col = 0; col < plain.length; col++) {
+					if (plain[col] !== vertical) continue;
+					expect(colored.has(col), `border at row ${row} col ${col} inherited a non-default fg: "${plain}"`).toBe(
+						false,
+					);
+				}
+			}
+		});
+
 		it("should handle extremely narrow width gracefully", () => {
 			const markdown = new Markdown(
 				`| A | B | C |

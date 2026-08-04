@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed markdown table borders inheriting an inline code (or bold/italic) color when a cell wraps mid-span; wrapped cell lines now close any open foreground/bold/italic before the border glyph ([#7575](https://github.com/can1357/oh-my-pi/issues/7575)).
+
 ## [17.2.5] - 2026-08-03
 
 ### Fixed

@@ -324,6 +324,84 @@ function compactSgrCarry(carry: string): string {
 	return cut === -1 ? carry : carry.slice(cut);
 }
 
+// Closers for the inline attributes a wrapped table-cell line can leave open.
+// Background is deliberately preserved (no `49`/`0`) so an outer
+// message-background pass keeps its fill; only foreground color and the
+// bold/dim + italic attributes that would tint or embolden the following border
+// glyph are cleared.
+const CELL_STYLE_FG_RESET = "\x1b[39m";
+const CELL_STYLE_WEIGHT_RESET = "\x1b[22m";
+const CELL_STYLE_ITALIC_RESET = "\x1b[23m";
+
+/**
+ * Terminate a wrapped table-cell line so its trailing border glyph, padding,
+ * and every cell to its right never inherit an inline style left open mid-cell.
+ *
+ * `wrapTextWithAnsi` keeps foreground/bold/italic open across wrapped line ends
+ * by design — paragraph continuation lines re-open the run via
+ * `write_active_codes`, and only underline/strikethrough/OSC 8 are reset per
+ * line. Table cells instead splice each wrapped line directly between unstyled
+ * `│` borders, so an open color (e.g. an inline codespan that wraps) bleeds
+ * into the border. This scans the line's SGR runs and appends only the closers
+ * actually needed (fg → `39`, bold/dim → `22`, italic → `23`), leaving
+ * background and underline/strike (already closed by the wrapper) untouched.
+ */
+function closeOpenCellLineStyle(line: string): string {
+	let fg = false;
+	let weight = false;
+	let italic = false;
+	const reset = () => {
+		fg = false;
+		weight = false;
+		italic = false;
+	};
+	for (const match of line.matchAll(SGR_SEQUENCE_GLOBAL)) {
+		const body = match[0].slice(2, -1);
+		if (body.length === 0) {
+			reset();
+			continue;
+		}
+		const params = body.split(/[;:]/);
+		for (let i = 0; i < params.length; i++) {
+			const code = params[i] === "" ? 0 : Number(params[i]);
+			switch (code) {
+				case 0:
+					reset();
+					break;
+				case 1:
+				case 2:
+					weight = true;
+					break;
+				case 3:
+					italic = true;
+					break;
+				case 22:
+					weight = false;
+					break;
+				case 23:
+					italic = false;
+					break;
+				case 39:
+					fg = false;
+					break;
+				case 38:
+				case 48:
+				case 58:
+					// Consume extended-color arguments so their numeric values are
+					// never misread as attributes (`38;2;r;g;b`, `38;5;n`).
+					if (code === 38) fg = true;
+					i += params[i + 1] === "5" ? 2 : params[i + 1] === "2" ? 4 : 0;
+					break;
+				default:
+					if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) fg = true;
+					break;
+			}
+		}
+	}
+	if (!fg && !weight && !italic) return line;
+	return `${line}${weight ? CELL_STYLE_WEIGHT_RESET : ""}${italic ? CELL_STYLE_ITALIC_RESET : ""}${fg ? CELL_STYLE_FG_RESET : ""}`;
+}
+
 interface TreeGuidePrefix {
 	/** Index of the first char past the guide run (start of the node text). */
 	end: number;
@@ -2816,7 +2894,10 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 		while (wrapped.length > 1 && wrapped[wrapped.length - 1] === "") {
 			wrapped.pop();
 		}
-		return wrapped;
+		// Close any fg/bold/italic left open at a wrapped line end so the border
+		// glyph spliced after the cell never inherits an inline codespan/emphasis
+		// color (issue #7575). The wrapper only resets underline/strike/OSC 8.
+		return wrapped.map(closeOpenCellLineStyle);
 	}
 
 	/**
