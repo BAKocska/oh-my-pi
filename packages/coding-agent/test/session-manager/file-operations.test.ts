@@ -6,7 +6,14 @@ import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session
 import { findMostRecentSession, resolveResumableSession } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getConfigRootDir, getSessionsDir, removeSyncWithRetries, Snowflake, setAgentDir } from "@oh-my-pi/pi-utils";
+import {
+	getConfigRootDir,
+	getSessionsDir,
+	removeSyncWithRetries,
+	resolveEquivalentPath,
+	Snowflake,
+	setAgentDir,
+} from "@oh-my-pi/pi-utils";
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -173,6 +180,17 @@ describe("SessionManager temp cwd session dirs", () => {
 			.replace(/[/\\:]/g, "-")}--`;
 	}
 
+	function toHashedTempSessionDirName(tempCwd: string): string {
+		const canonicalCwd = resolveEquivalentPath(path.resolve(tempCwd));
+		const readable = path
+			.basename(canonicalCwd)
+			.replace(/[^a-zA-Z0-9._-]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(-80);
+		const digest = Bun.SHA256.hash(canonicalCwd.replaceAll("\\", "/"), "hex");
+		return `tmp-${readable || "project"}-${digest}`;
+	}
+
 	beforeEach(() => {
 		testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-dir-test-"));
 		setAgentDir(testAgentDir);
@@ -216,6 +234,24 @@ describe("SessionManager temp cwd session dirs", () => {
 		expect(fs.existsSync(legacyDir)).toBe(false);
 		expect(path.dirname(sessionFile)).toBe(expectedDir);
 		expect(fs.existsSync(path.join(expectedDir, "carried.jsonl"))).toBe(true);
+	});
+
+	it("migrates 17.2.8 hashed temp buckets back to -tmp prefixes", () => {
+		const tempCwd = path.join(testAgentDir, `hashed-cwd-${Snowflake.next()}`);
+		fs.mkdirSync(tempCwd, { recursive: true });
+
+		const hashedDir = path.join(getSessionsDir(), toHashedTempSessionDirName(tempCwd));
+		fs.mkdirSync(hashedDir, { recursive: true });
+		fs.writeFileSync(path.join(hashedDir, "hashed.jsonl"), "marker\n");
+
+		const session = SessionManager.create(tempCwd);
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file path");
+
+		const expectedDir = path.join(getSessionsDir(), expectedTempSessionDirName(tempCwd));
+		expect(fs.existsSync(hashedDir)).toBe(false);
+		expect(path.dirname(sessionFile)).toBe(expectedDir);
+		expect(fs.existsSync(path.join(expectedDir, "hashed.jsonl"))).toBe(true);
 	});
 });
 

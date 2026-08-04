@@ -6,6 +6,10 @@
 
 - Restored the legacy project-scoped session directory naming scheme and removed its automatic migration ([#7646](https://github.com/can1357/oh-my-pi/issues/7646)).
 
+### Fixed
+
+- Migrated 17.2.8 hashed session buckets (`<scope>-<project>-<sha256>`) back into the restored legacy `-<project>` directories so project-local resume and list flows keep seeing those transcripts ([#7646](https://github.com/can1357/oh-my-pi/issues/7646)).
+
 ## [17.2.8] - 2026-08-04
 
 ### Changed
