@@ -50,6 +50,7 @@ function encodeLegacyRelativeSessionDirName(prefix: string, relative: string): s
 function getDefaultSessionDirName(cwd: string): {
 	encodedDirName: string;
 	legacyRelativeDirName: string | undefined;
+	legacyDigestDirName: string | undefined;
 	resolvedCwd: string;
 } {
 	const resolvedCwd = path.resolve(cwd);
@@ -73,15 +74,27 @@ function getDefaultSessionDirName(cwd: string): {
 		scope = "abs";
 	}
 
-	const normalized = canonicalCwd.replaceAll("\\", "/");
+	const slashed = canonicalCwd.replaceAll("\\", "/");
+	// Windows filesystems are case-insensitive, so the same directory can surface
+	// with different drive-letter or path casing depending on the shell that
+	// launched omp (e.g. `d:\code\zig` vs `D:\code\zig`). Fold the bucket key to
+	// lowercase on win32 so those variants map to one session workspace. No-op on
+	// macOS/Linux, keeping their case-sensitive keys unchanged.
+	const normalized = process.platform === "win32" ? slashed.toLowerCase() : slashed;
 	const readable = path
 		.basename(canonicalCwd)
 		.replace(/[^a-zA-Z0-9._-]+/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(-80);
+	const label = readable || "project";
 	const digest = Bun.SHA256.hash(normalized, "hex");
-	const encodedDirName = `${scope}-${readable || "project"}-${digest}`;
-	return { encodedDirName, legacyRelativeDirName, resolvedCwd };
+	const encodedDirName = `${scope}-${label}-${digest}`;
+	// Pre-fold bucket for the same cwd, kept only where folding actually changes
+	// the key (win32 paths containing uppercase). Lets existing sessions migrate
+	// into the folded bucket exactly once.
+	const legacyDigestDirName =
+		normalized === slashed ? undefined : `${scope}-${label}-${Bun.SHA256.hash(slashed, "hex")}`;
+	return { encodedDirName, legacyRelativeDirName, legacyDigestDirName, resolvedCwd };
 }
 
 function readSessionCwd(sessionFile: string, buffer: Buffer): string | undefined {
@@ -159,10 +172,11 @@ function rerouteCollidingSessions(
 
 export function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | undefined {
 	const currentDirName = path.basename(sessionDir);
-	const { encodedDirName, legacyRelativeDirName } = getDefaultSessionDirName(cwd);
+	const { encodedDirName, legacyRelativeDirName, legacyDigestDirName } = getDefaultSessionDirName(cwd);
 	if (
 		currentDirName !== encodedDirName &&
 		currentDirName !== legacyRelativeDirName &&
+		currentDirName !== legacyDigestDirName &&
 		currentDirName !== encodeLegacyAbsoluteSessionDirName(cwd)
 	) {
 		return undefined;
@@ -180,7 +194,7 @@ export function computeDefaultSessionDir(
 	storage: SessionStorage,
 	sessionsRoot: string = getSessionsDir(),
 ): string {
-	const { encodedDirName, legacyRelativeDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
+	const { encodedDirName, legacyRelativeDirName, legacyDigestDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
 	const sessionDir = path.join(sessionsRoot, encodedDirName);
 	const legacyDirs: Array<{ kind: "relative" | "absolute"; name: string | undefined }> = [
 		{ kind: "relative", name: legacyRelativeDirName },
@@ -195,6 +209,19 @@ export function computeDefaultSessionDir(
 			migrateSessionDirPath(legacyDir, sessionDir);
 		} catch {
 			// Best effort
+		}
+	}
+	// Consolidate a pre-fold win32 bucket (case-preserving digest) into the folded
+	// one. Distinct casings hash to distinct buckets, so a direct move suffices —
+	// no cross-cwd reroute like the legacy relative/absolute schemes need.
+	if (legacyDigestDirName) {
+		const legacyDir = path.join(sessionsRoot, legacyDigestDirName);
+		if (legacyDir !== sessionDir && fs.existsSync(legacyDir)) {
+			try {
+				migrateSessionDirPath(legacyDir, sessionDir);
+			} catch {
+				// Best effort
+			}
 		}
 	}
 	storage.ensureDirSync(sessionDir);

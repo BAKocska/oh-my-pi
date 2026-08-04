@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Windows session workspaces splitting by drive-letter/path casing: the session bucket key is now case-folded on win32 so the same directory opened as `d:\code\zig` or `D:\code\zig` resolves to one workspace for `/resume`, `--continue`, and auto-resume. Existing case-variant buckets migrate into the folded bucket on first use ([#7642](https://github.com/can1357/oh-my-pi/issues/7642)).
+
 ## [17.2.8] - 2026-08-04
 
 ### Changed
