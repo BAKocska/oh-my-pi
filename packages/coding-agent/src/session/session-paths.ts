@@ -5,6 +5,7 @@ import { getTerminalId } from "@oh-my-pi/pi-tui";
 import {
 	getSessionsDir,
 	getTerminalSessionsDir,
+	isEexist,
 	isEnoent,
 	isRecord,
 	logger,
@@ -14,27 +15,87 @@ import type { SessionStorage } from "./session-storage";
 
 const SESSION_HEADER_PREFIX_BYTES = 4096;
 
-/**
- * Merge or rename a legacy session directory into its canonical target.
- * Best effort: callers decide whether migration failures should surface.
- */
-function migrateSessionDirPath(oldPath: string, newPath: string): void {
-	const existing = fs.statSync(newPath, { throwIfNoEntry: false });
-	if (existing?.isDirectory()) {
-		for (const file of fs.readdirSync(oldPath)) {
-			const src = path.join(oldPath, file);
-			const dst = path.join(newPath, file);
-			if (!fs.existsSync(dst)) {
-				fs.renameSync(src, dst);
-			}
-		}
-		fs.rmSync(oldPath, { recursive: true, force: true });
+function warnSessionMigrationCollision(source: string, destination: string): void {
+	logger.warn("Session directory migration collision; preserving legacy entry", { source, destination });
+}
+
+function migrateExistingSessionEntry(
+	sourcePath: string,
+	destinationPath: string,
+	source: fs.Stats,
+	destination: fs.Stats,
+): void {
+	if (resolveEquivalentPath(sourcePath) === resolveEquivalentPath(destinationPath)) return;
+	if (source.dev === destination.dev && source.ino === destination.ino) {
+		fs.unlinkSync(sourcePath);
 		return;
 	}
-	if (existing) {
-		fs.rmSync(newPath, { recursive: true, force: true });
+	if (source.isDirectory() && destination.isDirectory()) {
+		migrateSessionDirPath(sourcePath, destinationPath);
+		return;
 	}
-	fs.renameSync(oldPath, newPath);
+	warnSessionMigrationCollision(sourcePath, destinationPath);
+}
+
+function migrateSessionEntry(sourcePath: string, destinationPath: string): void {
+	const source = fs.lstatSync(sourcePath);
+	const destination = fs.lstatSync(destinationPath, { throwIfNoEntry: false });
+	if (destination) {
+		migrateExistingSessionEntry(sourcePath, destinationPath, source, destination);
+		return;
+	}
+
+	if (source.isDirectory()) {
+		try {
+			fs.mkdirSync(destinationPath);
+		} catch (error) {
+			if (!isEexist(error)) throw error;
+			const racedDestination = fs.lstatSync(destinationPath);
+			migrateExistingSessionEntry(sourcePath, destinationPath, source, racedDestination);
+			return;
+		}
+		migrateSessionDirPath(sourcePath, destinationPath);
+		return;
+	}
+
+	try {
+		fs.linkSync(sourcePath, destinationPath);
+	} catch (error) {
+		if (!isEexist(error)) throw error;
+		const racedDestination = fs.lstatSync(destinationPath);
+		migrateExistingSessionEntry(sourcePath, destinationPath, source, racedDestination);
+		return;
+	}
+	fs.unlinkSync(sourcePath);
+}
+
+/**
+ * Merge a legacy session directory into its canonical target without
+ * overwriting either side of a collision.
+ */
+function migrateSessionDirPath(oldPath: string, newPath: string): void {
+	let destination = fs.lstatSync(newPath, { throwIfNoEntry: false });
+	if (!destination) {
+		try {
+			fs.mkdirSync(newPath);
+			destination = fs.lstatSync(newPath);
+		} catch (error) {
+			if (!isEexist(error)) throw error;
+			destination = fs.lstatSync(newPath);
+		}
+	}
+	if (!destination.isDirectory()) {
+		warnSessionMigrationCollision(oldPath, newPath);
+		return;
+	}
+	for (const entry of fs.readdirSync(oldPath)) {
+		migrateSessionEntry(path.join(oldPath, entry), path.join(newPath, entry));
+	}
+	fs.rmdirSync(oldPath);
+}
+
+function createLegacySessionRedirect(oldPath: string, newPath: string): void {
+	fs.symlinkSync(path.resolve(newPath), oldPath, process.platform === "win32" ? "junction" : "dir");
 }
 
 function encodeLegacyAbsoluteSessionDirName(cwd: string): string {
@@ -115,15 +176,7 @@ function moveSessionBundle(sourceDir: string, targetDir: string, sessionName: st
 		if (entry !== sessionName && entry !== artifactsName && !entry.startsWith(`${sessionName}.`)) continue;
 		const source = path.join(sourceDir, entry);
 		if (!fs.existsSync(source)) continue;
-		const target = path.join(targetDir, entry);
-		const existing = fs.statSync(target, { throwIfNoEntry: false });
-		if (!existing) {
-			fs.renameSync(source, target);
-		} else if (existing.isDirectory() && fs.statSync(source).isDirectory()) {
-			migrateSessionDirPath(source, target);
-		} else {
-			fs.rmSync(source, { recursive: true, force: true });
-		}
+		migrateSessionEntry(source, path.join(targetDir, entry));
 	}
 }
 
@@ -132,29 +185,28 @@ function rerouteCollidingSessions(
 	legacyDir: string,
 	sessionsRoot: string,
 	kind: "relative" | "absolute",
-): void {
+): boolean {
 	const entries = fs.readdirSync(legacyDir);
 	const currentCwd = resolveEquivalentPath(path.resolve(cwd));
 	const buffer = Buffer.allocUnsafe(SESSION_HEADER_PREFIX_BYTES);
+	let sharedLegacyDir = false;
 	for (const entry of entries) {
 		if (!entry.endsWith(".jsonl")) continue;
 		const recordedCwd = readSessionCwd(path.join(legacyDir, entry), buffer);
 		if (!recordedCwd) continue;
 		const recordedCanonical = resolveEquivalentPath(path.resolve(recordedCwd));
-		if (
-			recordedCanonical === currentCwd ||
-			!fs.statSync(recordedCanonical, { throwIfNoEntry: false })?.isDirectory()
-		) {
-			continue;
-		}
+		if (recordedCanonical === currentCwd) continue;
 		const recordedNames = getDefaultSessionDirName(recordedCanonical);
 		const recordedLegacyName =
 			kind === "relative"
 				? recordedNames.legacyRelativeDirName
 				: encodeLegacyAbsoluteSessionDirName(recordedCanonical);
 		if (recordedLegacyName !== path.basename(legacyDir)) continue;
+		sharedLegacyDir = true;
+		if (!fs.statSync(recordedCanonical, { throwIfNoEntry: false })?.isDirectory()) continue;
 		moveSessionBundle(legacyDir, path.join(sessionsRoot, recordedNames.encodedDirName), entry, entries);
 	}
+	return sharedLegacyDir;
 }
 
 export function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | undefined {
@@ -189,12 +241,32 @@ export function computeDefaultSessionDir(
 	for (const legacy of legacyDirs) {
 		if (!legacy.name) continue;
 		const legacyDir = path.join(sessionsRoot, legacy.name);
-		if (legacyDir === sessionDir || !fs.existsSync(legacyDir)) continue;
+		if (legacyDir === sessionDir) continue;
+		const legacyStat = fs.lstatSync(legacyDir, { throwIfNoEntry: false });
+		if (!legacyStat) continue;
+		if (legacyStat.isSymbolicLink()) {
+			if (fs.existsSync(sessionDir) && resolveEquivalentPath(legacyDir) === resolveEquivalentPath(sessionDir)) {
+				continue;
+			}
+			logger.warn("Legacy session redirect points to a different canonical directory", {
+				source: legacyDir,
+				destination: sessionDir,
+				redirect: resolveEquivalentPath(legacyDir),
+			});
+			continue;
+		}
 		try {
-			rerouteCollidingSessions(resolvedCwd, legacyDir, sessionsRoot, legacy.kind);
+			const sharedLegacyDir = rerouteCollidingSessions(resolvedCwd, legacyDir, sessionsRoot, legacy.kind);
 			migrateSessionDirPath(legacyDir, sessionDir);
-		} catch {
-			// Best effort
+			if (!sharedLegacyDir && !fs.existsSync(legacyDir)) {
+				createLegacySessionRedirect(legacyDir, sessionDir);
+			}
+		} catch (error) {
+			logger.warn("Session directory migration failed", {
+				source: legacyDir,
+				destination: sessionDir,
+				error: String(error),
+			});
 		}
 	}
 	storage.ensureDirSync(sessionDir);

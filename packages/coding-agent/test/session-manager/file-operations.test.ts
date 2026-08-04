@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,9 +6,12 @@ import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session
 import { findMostRecentSession, resolveResumableSession } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { computeDefaultSessionDir } from "@oh-my-pi/pi-coding-agent/session/session-paths";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	getConfigRootDir,
 	getSessionsDir,
+	logger,
 	removeSyncWithRetries,
 	resolveEquivalentPath,
 	Snowflake,
@@ -222,9 +225,68 @@ describe("SessionManager temp cwd session dirs", () => {
 		if (!sessionFile) throw new Error("Expected session file path");
 
 		const expectedDir = path.join(getSessionsDir(), expectedTempSessionDirName(tempCwd));
-		expect(fs.existsSync(legacyDir)).toBe(false);
+		expect(fs.realpathSync(legacyDir)).toBe(expectedDir);
 		expect(path.dirname(sessionFile)).toBe(expectedDir);
 		expect(fs.existsSync(path.join(expectedDir, "carried.jsonl"))).toBe(true);
+	});
+
+	it("preserves an open legacy session when the canonical filename collides", () => {
+		const tempCwd = path.join(testAgentDir, `collision-cwd-${Snowflake.next()}`);
+		fs.mkdirSync(tempCwd, { recursive: true });
+
+		const legacyDir = path.join(getSessionsDir(), toLegacyAbsoluteSessionDirName(tempCwd));
+		const canonicalDir = path.join(getSessionsDir(), expectedTempSessionDirName(tempCwd));
+		const legacyFile = path.join(legacyDir, "active.jsonl");
+		const canonicalFile = path.join(canonicalDir, "active.jsonl");
+		fs.mkdirSync(legacyDir, { recursive: true });
+		fs.mkdirSync(canonicalDir, { recursive: true });
+		fs.writeFileSync(legacyFile, "legacy-before\n");
+		fs.writeFileSync(canonicalFile, "canonical-stale\n");
+		const descriptor = fs.openSync(legacyFile, "a");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+
+		try {
+			const storage = new FileSessionStorage();
+			expect(computeDefaultSessionDir(tempCwd, storage)).toBe(canonicalDir);
+			fs.writeSync(descriptor, "after-migration\n");
+			expect(computeDefaultSessionDir(tempCwd, storage)).toBe(canonicalDir);
+			expect(warn).toHaveBeenCalledWith("Session directory migration collision; preserving legacy entry", {
+				source: legacyFile,
+				destination: canonicalFile,
+			});
+			expect(warn).toHaveBeenCalledWith(
+				"Session directory migration failed",
+				expect.objectContaining({ source: legacyDir, destination: canonicalDir }),
+			);
+		} finally {
+			fs.closeSync(descriptor);
+			warn.mockRestore();
+		}
+
+		expect(fs.readFileSync(legacyFile, "utf8")).toBe("legacy-before\nafter-migration\n");
+		expect(fs.readFileSync(canonicalFile, "utf8")).toBe("canonical-stale\n");
+	});
+
+	it("redirects an older process reopening its migrated legacy path", () => {
+		const tempCwd = path.join(testAgentDir, `reopen-cwd-${Snowflake.next()}`);
+		fs.mkdirSync(tempCwd, { recursive: true });
+
+		const legacyDir = path.join(getSessionsDir(), toLegacyAbsoluteSessionDirName(tempCwd));
+		const legacyFile = path.join(legacyDir, "active.jsonl");
+		fs.mkdirSync(legacyDir, { recursive: true });
+		fs.writeFileSync(legacyFile, "before-migration\n");
+
+		const storage = new FileSessionStorage();
+		const canonicalDir = computeDefaultSessionDir(tempCwd, storage);
+		const canonicalFile = path.join(canonicalDir, "active.jsonl");
+		expect(fs.realpathSync(legacyDir)).toBe(canonicalDir);
+
+		const descriptor = fs.openSync(legacyFile, "a");
+		fs.writeSync(descriptor, "written-through-legacy-path\n");
+		fs.closeSync(descriptor);
+
+		expect(computeDefaultSessionDir(tempCwd, storage)).toBe(canonicalDir);
+		expect(fs.readFileSync(canonicalFile, "utf8")).toBe("before-migration\nwritten-through-legacy-path\n");
 	});
 
 	it("separates colliding legacy cwd buckets into safe directories", () => {
