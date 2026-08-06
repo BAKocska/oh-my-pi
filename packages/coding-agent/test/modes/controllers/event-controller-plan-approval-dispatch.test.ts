@@ -38,24 +38,25 @@ describe("EventController plan-approval dispatch", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("keeps dispatching session events while the approved plan's execution turn runs (issue #7684)", async () => {
-		// Contract: the fullscreen Plan Review closes and the approved plan begins
-		// executing, but `handlePlanApproval` -> `#approvePlan` awaits
-		// `session.prompt` for the WHOLE run. The propose write's
+	it("keeps dispatching during approve-and-compact compaction and execution (issue #7684)", async () => {
+		// Contract: "Approve and compact context" first awaits compaction, then
+		// `session.prompt` for the WHOLE execution run. The propose write's
 		// `tool_execution_end` handler runs inside `EventController`'s serialized
-		// dispatch chain (`#runSerialized`), so awaiting the approval there froze
-		// the chain and every later agent_start / message_start / tool /
-		// message_update event queued behind it — the chat stayed blank until
-		// execution finished. The approval must instead be detached so later events
-		// keep dispatching mid-execution.
+		// dispatch chain (`#runSerialized`), so awaiting `handlePlanApproval` there
+		// froze every later agent_start / message_start / tool / message_update
+		// event during BOTH stages. The approval must be detached so events keep
+		// dispatching through compaction and the subsequent execution.
 		let listener: ((event: AgentSessionEvent) => void | Promise<void>) | undefined;
-		// A pending gate stands in for the still-running execution turn: it never
-		// resolves during the assertions, so a later event that dispatches proves
-		// it did not wait for the run to finish. If a regression re-adds the
-		// blocking await, `dispatch(...)` below never settles and the test times
-		// out — the deadlock IS the failure.
+		const compactionStarted = Promise.withResolvers<void>();
+		const compaction = Promise.withResolvers<void>();
+		const executionStarted = Promise.withResolvers<void>();
 		const executionTurn = Promise.withResolvers<void>();
-		const handlePlanApproval = vi.fn(() => executionTurn.promise);
+		const handlePlanApproval = vi.fn(async () => {
+			compactionStarted.resolve();
+			await compaction.promise;
+			executionStarted.resolve();
+			await executionTurn.promise;
+		});
 
 		const ctx = {
 			isInitialized: true,
@@ -78,18 +79,24 @@ describe("EventController plan-approval dispatch", () => {
 
 		const handleEventSpy = vi.spyOn(controller, "handleEvent");
 
-		// Propose completion approved for execution. Awaiting the callback resolves
-		// only once its `#runSerialized` link settles: after the fix the approval is
-		// detached, so the link settles even though the execution turn is unresolved.
+		// The propose completion opens Plan Review; the mocked approval represents
+		// selecting "Approve and compact context" and stopping inside compaction.
+		// The serialized link must settle despite the unresolved compaction.
 		await dispatch(proposeExecuteEnd());
+		await compactionStarted.promise;
 		expect(handlePlanApproval).toHaveBeenCalledTimes(1);
 
-		// A later session event arrives while the execution turn is still running.
-		// `turn_start` rides the exact same `#runSerialized` gate that carries
-		// agent_start / message_start / tool events / the coalesced message_update
-		// flush, so its dispatch proves the gate is open mid-execution.
+		// `turn_start` rides the same `#runSerialized` gate as agent_start /
+		// message_start / tool events / the coalesced message_update flush.
 		await dispatch({ type: "turn_start" } as AgentSessionEvent);
-		expect(handleEventSpy).toHaveBeenCalledWith(expect.objectContaining({ type: "turn_start" }));
+		expect(handleEventSpy.mock.calls.filter(([event]) => event.type === "turn_start")).toHaveLength(1);
+
+		// Finish compaction and hold the approved execution turn open. A second
+		// event must still dispatch before that turn settles.
+		compaction.resolve();
+		await executionStarted.promise;
+		await dispatch({ type: "turn_start" } as AgentSessionEvent);
+		expect(handleEventSpy.mock.calls.filter(([event]) => event.type === "turn_start")).toHaveLength(2);
 
 		executionTurn.resolve();
 		await executionTurn.promise;
