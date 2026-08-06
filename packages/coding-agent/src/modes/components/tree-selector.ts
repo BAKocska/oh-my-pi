@@ -291,7 +291,13 @@ class TreeList implements Component {
 				entry.type === "label" ||
 				entry.type === "custom" ||
 				entry.type === "model_change" ||
-				entry.type === "thinking_level_change";
+				entry.type === "thinking_level_change" ||
+				entry.type === "title_change" ||
+				entry.type === "mode_change" ||
+				entry.type === "service_tier_change" ||
+				entry.type === "session_init" ||
+				entry.type === "ttsr_injection" ||
+				entry.type === "credential_pin";
 
 			switch (this.#filterMode) {
 				case "user-only":
@@ -646,6 +652,36 @@ class TreeList implements Component {
 			case "branch_summary":
 				result = theme.fg("warning", `[branch summary]: `) + normalize(entry.summary);
 				break;
+			case "title_change":
+				result = theme.fg("dim", `[title: ${normalize(entry.title)}]`);
+				break;
+			case "mode_change":
+				result = theme.fg("dim", `[mode: ${entry.mode}]`);
+				break;
+			case "reset_boundary":
+				result = theme.fg("dim", "[reset]");
+				break;
+			case "service_tier_change": {
+				let tiers = "";
+				if (entry.serviceTier?.openai) tiers = `openai=${entry.serviceTier.openai}`;
+				if (entry.serviceTier?.anthropic) {
+					tiers += `${tiers ? ", " : ""}anthropic=${entry.serviceTier.anthropic}`;
+				}
+				if (entry.serviceTier?.google) tiers += `${tiers ? ", " : ""}google=${entry.serviceTier.google}`;
+				result = theme.fg("dim", `[service tier: ${tiers || "default"}]`);
+				break;
+			}
+			case "session_init": {
+				const agent = entry.agent ?? entry.modelRole ?? entry.resolvedModel ?? "agent";
+				result = theme.fg("dim", `[session init: ${agent}] `) + normalize(entry.task);
+				break;
+			}
+			case "ttsr_injection":
+				result = theme.fg("dim", `[ttsr: ${entry.injectedRules.join(", ") || "(none)"}]`);
+				break;
+			case "credential_pin":
+				result = theme.fg("dim", `[credential pin: ${entry.provider}]`);
+				break;
 			case "model_change":
 				result = theme.fg("dim", `[model: ${entry.model}]`);
 				break;
@@ -659,7 +695,8 @@ class TreeList implements Component {
 				result = theme.fg("dim", `[label: ${entry.label ?? "(cleared)"}]`);
 				break;
 			default:
-				result = "";
+				entry satisfies never;
+				result = theme.fg("dim", "[unknown session entry]");
 		}
 
 		return isSelected ? theme.bold(result) : result;

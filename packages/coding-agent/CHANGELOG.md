@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/tree` rendering blank rows for session bookkeeping and lifecycle entries, while keeping noisy bookkeeping hidden from the default filter ([#7778](https://github.com/can1357/oh-my-pi/issues/7778)).
+
 ## [17.2.9] - 2026-08-05
 
 ### Breaking Changes
