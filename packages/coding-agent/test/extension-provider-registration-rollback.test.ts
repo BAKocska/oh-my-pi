@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { unregisterOAuthProvider } from "@oh-my-pi/pi-ai/oauth";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ProviderConfig } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 const testProviderConfig: ProviderConfig = {
 	baseUrl: "https://example.invalid/v1",
@@ -41,6 +47,33 @@ describe("extension provider registration rollback", () => {
 		expect(runtime.pendingProviderRegistrations).toEqual([]);
 	});
 
+	test("replaces a queued provider after unregistering it", async () => {
+		const runtime = new ExtensionRuntime();
+		const events = new EventBus();
+
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerProvider("cliproxyapi", testProviderConfig);
+				pi.unregisterProvider("cliproxyapi");
+				pi.registerProvider("cliproxyapi", {
+					baseUrl: "https://replacement.example.invalid/v1",
+				});
+			},
+			process.cwd(),
+			events,
+			runtime,
+			"pi-cliproxyapi-provider@1.4.13",
+		);
+
+		expect(runtime.pendingProviderRegistrations).toEqual([
+			{
+				name: "cliproxyapi",
+				config: { baseUrl: "https://replacement.example.invalid/v1" },
+				sourceId: "pi-cliproxyapi-provider@1.4.13",
+			},
+		]);
+	});
+
 	test("preserves provider registrations from earlier successful extensions", async () => {
 		const runtime = new ExtensionRuntime();
 		const events = new EventBus();
@@ -71,6 +104,36 @@ describe("extension provider registration rollback", () => {
 		expect(runtime.pendingProviderRegistrations.map(r => r.name)).toEqual(["working-provider"]);
 	});
 
+	test("restores an earlier registration when unregistering extension fails", async () => {
+		const runtime = new ExtensionRuntime();
+		const events = new EventBus();
+
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerProvider("working-provider", testProviderConfig);
+			},
+			process.cwd(),
+			events,
+			runtime,
+			"working-extension",
+		);
+
+		await expect(
+			loadExtensionFromFactory(
+				pi => {
+					pi.unregisterProvider("working-provider");
+					throw new Error("failed after unregistering");
+				},
+				process.cwd(),
+				events,
+				runtime,
+				"broken-extension",
+			),
+		).rejects.toThrow("failed after unregistering");
+
+		expect(runtime.pendingProviderRegistrations.map(registration => registration.name)).toEqual(["working-provider"]);
+	});
+
 	test("keeps provider registrations when extension initialization succeeds", async () => {
 		const runtime = new ExtensionRuntime();
 		const events = new EventBus();
@@ -91,6 +154,85 @@ describe("extension provider registration rollback", () => {
 		);
 
 		expect(runtime.pendingProviderRegistrations.map(r => r.name)).toEqual(["provider-one", "provider-two"]);
+	});
+
+	test("applies provider replacement after runtime initialization", async () => {
+		const tempDir = TempDir.createSync("@provider-replacement-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		try {
+			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.json"));
+			modelRegistry.registerProvider("cliproxyapi", testProviderConfig, "pi-cliproxyapi-provider");
+
+			const runtime = new ExtensionRuntime();
+			const events = new EventBus();
+			let replaceProvider: (() => void) | undefined;
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					replaceProvider = () => {
+						pi.unregisterProvider("cliproxyapi");
+						pi.registerProvider("cliproxyapi", {
+							baseUrl: "https://replacement.example.invalid/v1",
+							api: "openai-completions",
+							models: testProviderConfig.models,
+							oauth: {
+								name: "CLIProxyAPI",
+								login: async () => "test-token",
+							},
+						});
+					};
+				},
+				process.cwd(),
+				events,
+				runtime,
+				"pi-cliproxyapi-provider",
+			);
+			const runner = new ExtensionRunner(
+				[extension],
+				runtime,
+				process.cwd(),
+				SessionManager.inMemory(),
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			if (!replaceProvider) throw new Error("Extension did not expose its provider replacement action");
+			replaceProvider();
+
+			expect(modelRegistry.authStorage.hasAuth("cliproxyapi")).toBe(false);
+			expect(modelRegistry.find("cliproxyapi", "test-model")?.baseUrl).toBe(
+				"https://replacement.example.invalid/v1",
+			);
+		} finally {
+			unregisterOAuthProvider("cliproxyapi");
+			authStorage.close();
+			tempDir.removeSync();
+		}
 	});
 
 	test("rolls back every provider added by the failed extension", async () => {

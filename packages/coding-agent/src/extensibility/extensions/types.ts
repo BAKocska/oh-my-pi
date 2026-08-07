@@ -1373,6 +1373,14 @@ export interface ExtensionAPI {
 	 */
 	registerProvider(name: string, config: ProviderConfig): void;
 
+	/**
+	 * Unregister a provider previously registered by an extension.
+	 *
+	 * Removes extension-provided models and restores overridden built-in models.
+	 * Has no effect when the provider is not registered.
+	 */
+	unregisterProvider(name: string): void;
+
 	/** Shared event bus for extension communication. */
 	events: EventBus;
 }
@@ -1516,6 +1524,10 @@ export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
+	/** Queue a provider registration until initialization, then apply it immediately. */
+	registerProvider(name: string, config: ProviderConfig, sourceId: string): void;
+	/** Remove a queued or initialized provider registration. */
+	unregisterProvider(name: string, sourceId: string): void;
 }
 
 /** Action implementations for ExtensionAPI methods. */

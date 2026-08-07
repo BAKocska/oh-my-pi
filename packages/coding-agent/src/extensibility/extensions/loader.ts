@@ -73,6 +73,15 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	flagValues = new Map<string, boolean | string>();
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }> = [];
 
+	registerProvider(name: string, config: ProviderConfig, sourceId: string): void {
+		this.pendingProviderRegistrations.push({ name, config, sourceId });
+	}
+
+	unregisterProvider(name: string): void {
+		const remaining = this.pendingProviderRegistrations.filter(registration => registration.name !== name);
+		this.pendingProviderRegistrations.splice(0, this.pendingProviderRegistrations.length, ...remaining);
+	}
+
 	sendMessage(): void {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
@@ -290,7 +299,11 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	}
 
 	registerProvider(name: string, config: ProviderConfig): void {
-		this.runtime.pendingProviderRegistrations.push({ name, config, sourceId: this.extension.path });
+		this.runtime.registerProvider(name, config, this.extension.path);
+	}
+
+	unregisterProvider(name: string): void {
+		this.runtime.unregisterProvider(name, this.extension.path);
 	}
 }
 
@@ -313,20 +326,24 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 
 /**
  * Runs an extension factory with provider registration rollback on failure.
- * Records the number of pending provider registrations before the factory runs,
- * and restores that checkpoint if the factory throws.
+ * Restores the complete registration queue when the factory throws because an
+ * extension may unregister entries queued by an earlier extension.
  */
 async function runExtensionFactory(
 	factory: ExtensionFactory,
 	api: ExtensionAPI,
 	runtime: IExtensionRuntime,
 ): Promise<void> {
-	const providerRegistrationCheckpoint = runtime.pendingProviderRegistrations.length;
+	const providerRegistrationCheckpoint = [...runtime.pendingProviderRegistrations];
 
 	try {
 		await factory(api);
 	} catch (error) {
-		runtime.pendingProviderRegistrations.length = providerRegistrationCheckpoint;
+		runtime.pendingProviderRegistrations.splice(
+			0,
+			runtime.pendingProviderRegistrations.length,
+			...providerRegistrationCheckpoint,
+		);
 		throw error;
 	}
 }
