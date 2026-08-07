@@ -5457,6 +5457,7 @@ export class AgentSession {
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
+			isProjectTrusted: () => true,
 			setInterval: (callback, ms, ...args) => this.#fallbackTimers().setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#fallbackTimers().setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#fallbackTimers().clear(timer),

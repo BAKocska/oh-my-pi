@@ -860,6 +860,7 @@ export class ExtensionRunner {
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
+			isProjectTrusted: () => true,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
