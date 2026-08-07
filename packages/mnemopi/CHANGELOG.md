@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover from a partially-extracted local embedding model cache. An interrupted fastembed model download left `<cacheDir>/<model>/` with sidecars and a truncated `model.onnx_data` but no `model.onnx`, which upstream `retrieveModel` treats as complete forever, so `FlagEmbedding.init` threw `Model file not found at .../model.onnx` every session — semantic recall was silently dead machine-wide and the rebuild queue grew every open. A `Model file not found` init failure now clears the incomplete model directory and the leftover partial `<model>.tar.gz` (which upstream would otherwise reuse) and retries init once, so the next attempt re-downloads cleanly. ([#7916](https://github.com/can1357/oh-my-pi/issues/7916))
+
 ## [17.2.10] - 2026-08-06
 
 ### Changed
