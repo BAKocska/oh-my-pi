@@ -132,13 +132,13 @@
       }
     },
     "stdioServer": {
+      "type": "object",
       "allOf": [
         {
           "$ref": "#/$defs/serverBase"
         },
         {
           "type": "object",
-          "additionalProperties": false,
           "required": ["command"],
           "properties": {
             "type": {
@@ -171,16 +171,17 @@
             "required": ["url"]
           }
         }
-      ]
+      ],
+      "unevaluatedProperties": false
     },
     "httpServer": {
+      "type": "object",
       "allOf": [
         {
           "$ref": "#/$defs/serverBase"
         },
         {
           "type": "object",
-          "additionalProperties": false,
           "required": ["type", "url"],
           "properties": {
             "type": {
@@ -202,16 +203,17 @@
             "required": ["command"]
           }
         }
-      ]
+      ],
+      "unevaluatedProperties": false
     },
     "sseServer": {
+      "type": "object",
       "allOf": [
         {
           "$ref": "#/$defs/serverBase"
         },
         {
           "type": "object",
-          "additionalProperties": false,
           "required": ["type", "url"],
           "properties": {
             "type": {
@@ -233,7 +235,8 @@
             "required": ["command"]
           }
         }
-      ]
+      ],
+      "unevaluatedProperties": false
     },
     "serverConfig": {
       "oneOf": [
