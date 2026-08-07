@@ -3020,10 +3020,22 @@ export class AgentSession {
 				}
 				this.#beginInFlight();
 				try {
-					await this.#recovery.maybeRestoreRetryFallbackPrimary();
+					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
+					}
+					// A cooldown-expiry revert can drop the active window below the
+					// accumulated context. The user-prompt path re-checks context after
+					// the revert via runPrePromptCompactionIfNeeded; the auto-continue
+					// path must do the same so agent.continue() never sends a
+					// predictably oversized request to the reverted (smaller) model.
+					if (reverted) {
+						await this.#maintenance.runPrePromptCompactionIfNeeded([]);
+						if (signal.aborted || this.#isDisposed) {
+							this.#skipAgentContinue("post-restore-unavailable", options);
+							return;
+						}
 					}
 					if (this.settings.get("retry.usageAwareFallback")) {
 						if (!(await this.#runQueuedUsageAwarePreflight(signal))) {

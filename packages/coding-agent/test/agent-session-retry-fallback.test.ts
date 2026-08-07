@@ -3395,6 +3395,120 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.id).toBe(primaryModel.id);
 	});
 
+	it("re-checks context before a cooldown-expiry revert onto a smaller-window model in the auto-continue path", async () => {
+		// Regression for #7952: a cooldown-expiry revert reverts the model at a
+		// turn boundary. The user-prompt path re-checks context after the revert
+		// (runPrePromptCompactionIfNeeded), but the automatic agent.continue()
+		// path did not — so reverting onto a model whose window is smaller than
+		// the accumulated context sent a predictably oversized request. Here the
+		// small primary (4000-token window) fell back to a large-window model,
+		// accumulated context past 4000 while there, then the cooldown expired and
+		// a queued follow-up drained through the auto-continue path.
+		const modelsConfigPath = path.join(tempDir.path(), "revert-overflow-models.json");
+		await Bun.write(
+			modelsConfigPath,
+			JSON.stringify({
+				providers: {
+					openai: {
+						modelOverrides: {
+							"gpt-4o-mini": { contextWindow: 4000, contextPromotionTarget: "openai/gpt-4o" },
+							"gpt-4o": { contextWindow: 1_000_000 },
+						},
+					},
+				},
+			}),
+		);
+		modelRegistry = new ModelRegistry(authStorage, modelsConfigPath);
+
+		const primaryModel = modelRegistry.find("openai", "gpt-4o-mini");
+		const fallbackModel = modelRegistry.find("openai", "gpt-4o");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected override models to resolve");
+		}
+		expect(primaryModel.contextWindow).toBe(4000);
+		expect(fallbackModel.contextWindow).toBe(1_000_000);
+
+		// ~15k estimated tokens: over the primary's 4000 window (80% => 3200) but
+		// far under the fallback's (800k), so it sits on the fallback without
+		// compaction and only overflows once the window shrinks on revert.
+		const bigText = "lorem ipsum ".repeat(5000);
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		let primaryAttempts = 0;
+		let fallbackTurns = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.id === primaryModel.id && primaryAttempts === 0) {
+					primaryAttempts += 1;
+					mock.push({ throw: "rate limit exceeded retry-after-ms=200" });
+				} else if (model.id === fallbackModel.id && fallbackTurns === 0) {
+					fallbackTurns += 1;
+					mock.push({ content: [bigText] });
+				} else {
+					mock.push({ content: ["ok"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": true,
+			"compaction.strategy": "context-full",
+			"compaction.thresholdPercent": 80,
+			"compaction.thresholdTokens": -1,
+			"contextPromotion.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+			"retry.fallbackRevertPolicy": "cooldown-expiry",
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+
+		// Primary rate-limits, falls back to the large-window model, and that turn
+		// returns a large payload that grows context past the primary's window.
+		await session.prompt("Trigger fallback and grow context past the primary window");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(session.model?.id).toBe(fallbackModel.id);
+
+		// Cooldown expires; a queued follow-up drains through the auto-continue
+		// (agent.continue) path, which reverts to the primary. The post-revert
+		// context check now runs there too: the accumulated context no longer fits
+		// the primary's 4000 window, so it promotes to the larger-window model
+		// instead of issuing the oversized request. Before the fix the session
+		// stayed on the reverted primary and received the over-window request.
+		now += 60_000;
+		await session.followUp("Please continue on the reverted primary");
+		await session.waitForIdle();
+
+		expect(session.model?.id).toBe(fallbackModel.id);
+		expect(requestedModels.at(-1)).toBe(`${fallbackModel.provider}/${fallbackModel.id}`);
+		// The 4000-window primary is only ever hit by the initial rate-limited
+		// request — never by an over-window continuation after the revert.
+		expect(requestedModels.filter(id => id === `${primaryModel.provider}/${primaryModel.id}`)).toHaveLength(1);
+	});
+
 	it("restores routed fallback primaries after cooldown expiry", async () => {
 		const openRouterModel = getBundledModel("openrouter", "z-ai/glm-4.7");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
