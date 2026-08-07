@@ -204,6 +204,7 @@ brush-builtins = { path = "crates/vendor/brush-builtins" }
 # Async Runtime & Concurrency
 # ──────────────────────────────────────────────────────────────────────────────
 async-trait = "0.1"
+futures = "0.3"
 dashmap = "6.1"
 parking_lot = "0.12.5"
 rayon = "1.12"

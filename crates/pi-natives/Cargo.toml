@@ -30,6 +30,7 @@ clap.workspace = true
 globset.workspace = true
 fontdue.workspace = true
 grep-matcher.workspace = true
+futures.workspace = true
 grep-pcre2.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
