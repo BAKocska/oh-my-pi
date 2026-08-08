@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed user-message OSC 133 prompt zones never emitting the `;C` (command-output start) marker, which left Ghostty-family terminals with a sticky `.input` cursor semantic so their default `cursor-click-to-move` injected arrow-key bursts into the editor on every left-click (caret jumping to column 0) ([#8030](https://github.com/can1357/oh-my-pi/issues/8030)).
+
 ## [17.2.12] - 2026-08-08
 
 ### Fixed

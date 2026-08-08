@@ -4,12 +4,17 @@ import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import { imageReferenceHyperlink, renderPlaceholders } from "../image-references";
 import { highlightMagicKeywords } from "../magic-keywords";
 
-// OSC 133 shell integration: marks prompt zones for terminal multiplexers
-// Do not emit OSC 133 C ("command start") here: the transcript has no matching
-// command-finished marker, so terminals can group later assistant/tool output
-// under the first submitted prompt.
+// OSC 133 shell integration: marks prompt zones for terminal multiplexers.
+// Per the FinalTerm/OSC 133 spec the markers are A=prompt-start,
+// B=command-input-start, C=command-output-start, D=command-finished. We wrap
+// each user bubble in A…B and MUST close it with C: C is the "output starts
+// here" marker terminals group the following assistant/tool output under, and
+// — critically — it clears the sticky `.input` cursor semantic that B sets in
+// Ghostty-family terminals. Omitting C leaves the cursor permanently "inside
+// prompt input", so Ghostty's default cursor-click-to-move injects arrow-key
+// bursts into the pty on every left-click (#8030).
 const OSC133_ZONE_START = "\x1b]133;A\x07";
-const OSC133_ZONE_END = "\x1b]133;B\x07";
+const OSC133_ZONE_END = "\x1b]133;B\x07\x1b]133;C\x07";
 
 /**
  * Component that renders a user message

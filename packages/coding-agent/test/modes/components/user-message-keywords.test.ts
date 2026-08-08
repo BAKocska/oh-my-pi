@@ -49,11 +49,14 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(raw).toContain("orchestrate");
 	});
 
-	it("closes OSC 133 prompt zones without opening a command-output zone", () => {
+	it("closes the OSC 133 prompt zone with a command-output start so the cursor leaves .input", () => {
 		const raw = render("first line\nsecond line");
 		expect(raw).toContain("\x1b]133;A\x07");
 		expect(raw).toContain("\x1b]133;B\x07");
-		expect(raw).not.toContain("\x1b]133;C\x07");
+		// ;C (output-start) MUST follow ;B: it clears the sticky `.input` cursor
+		// semantic in Ghostty-family terminals (#8030). Missing ;C leaves click-to-move
+		// injecting arrow keys into the editor on every left-click.
+		expect(raw).toContain("\x1b]133;B\x07\x1b]133;C\x07");
 	});
 
 	it("bolds and underlines image references in the rendered message bubble", () => {
