@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored the omptype module namespace exposed as `api.arktype` to custom commands, preserving `api.arktype.type(...)` compatibility ([#7968](https://github.com/can1357/oh-my-pi/issues/7968)).
+
 ## [17.2.11] - 2026-08-07
 
 ### Added
