@@ -716,6 +716,47 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		});
 	});
 
+	it("exposes additional-root context files in before_agent_start prompt options", async () => {
+		const tempDir = makeTempDir();
+		const extraRoot = makeTempDir();
+		const extraAgentsPath = path.join(extraRoot, "AGENTS.md");
+		fs.writeFileSync(extraAgentsPath, "# Extra Root Rules\n\nMulti-root marker directive.\n");
+
+		const sessionManager = SessionManager.inMemory(tempDir);
+		await sessionManager.setAdditionalDirectories([extraRoot]);
+		expect(sessionManager.getAdditionalDirectories()).toContain(extraRoot);
+
+		let captured: BeforeAgentStartSystemPromptOptions | undefined;
+		const captureExtension: ExtensionFactory = pi => {
+			pi.on("before_agent_start", event => {
+				captured = event.systemPromptOptions;
+			});
+		};
+
+		await withProviderAuth(["openai"], async () => {
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				// Let the builder discover context files for both roots instead of
+				// the empty override, so the snapshot reflects the merged set.
+				contextFiles: undefined,
+				sessionManager,
+				extensions: [captureExtension],
+			});
+			const mock = createMockModel({ responses: [{ content: [{ type: "text", text: "done" }] }] });
+			vi.spyOn(session.agent, "streamFn").mockImplementation(mock.stream);
+			try {
+				await session.prompt("inspect context");
+				const promptOptions = captured;
+				if (!promptOptions) throw new Error("before_agent_start did not expose prompt options");
+				const extraEntry = promptOptions.contextFiles?.find(file => file.path === extraAgentsPath);
+				expect(extraEntry).toBeDefined();
+				expect(extraEntry?.content).toContain("Multi-root marker directive.");
+			} finally {
+				await session.dispose();
+			}
+		});
+	});
+
 	it("answers a native pi_edit after a session switches onto Cursor", async () => {
 		const tempDir = makeTempDir();
 		const cursorModel = getBundledModel("cursor", "composer-1.5");

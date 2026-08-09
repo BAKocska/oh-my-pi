@@ -2931,7 +2931,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				promptGuidelines,
 				appendSystemPrompt: appendPrompt,
 				cwd: promptCwd,
-				contextFiles,
+				contextFiles: defaultPrompt.contextFiles,
 				skills: promptSkills,
 			};
 
@@ -2944,6 +2944,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: options.systemPrompt;
 			return {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
+				contextFiles: defaultPrompt.contextFiles,
 			};
 		};
 

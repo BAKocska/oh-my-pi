@@ -595,12 +595,18 @@ export interface BuildSystemPromptResult {
 	 * a catalog the prompt already carries (issue #7139).
 	 */
 	xdevCatalogNames?: readonly string[];
+	/**
+	 * Fully resolved context files rendered into the prompt, including entries
+	 * discovered for `additionalWorkspaceRoots`. Lets callers expose the exact
+	 * set the builder used (e.g. Pi's `before_agent_start.systemPromptOptions`).
+	 */
+	contextFiles: Array<{ path: string; content: string; depth?: number }>;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	if ($env.NULL_PROMPT === "true") {
-		return { systemPrompt: [] };
+		return { systemPrompt: [], contextFiles: [] };
 	}
 
 	const {
@@ -941,5 +947,5 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// default template; a resolved custom prompt uses a template that omits it.
 	const xdevCatalogNames =
 		!resolvedCustomPrompt && xdevTools.length > 0 ? xdevTools.map(mounted => mounted.name) : undefined;
-	return { systemPrompt, xdevCatalogNames };
+	return { systemPrompt, xdevCatalogNames, contextFiles };
 }
