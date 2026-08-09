@@ -1385,7 +1385,11 @@ export class ExtensionRunner {
 						messages.push(result.message);
 					}
 					if (result.systemPrompt !== undefined) {
-						currentSystemPrompt = result.systemPrompt;
+						// Upstream Pi returns a string; omp extensions predating this
+						// contract still return string[]. Normalize both to the string
+						// the event now carries so the wrapped result is never nested.
+						const override = result.systemPrompt as string | readonly string[];
+						currentSystemPrompt = typeof override === "string" ? override : override.join("\n\n");
 						systemPromptModified = true;
 					}
 				}

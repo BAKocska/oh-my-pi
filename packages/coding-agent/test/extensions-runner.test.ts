@@ -173,6 +173,35 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	it("flattens legacy array systemPrompt overrides so the result is never nested", async () => {
+		const extCode = `
+			export default function(pi) {
+				pi.on("before_agent_start", () => ({
+					systemPrompt: ["legacy block one", "legacy block two"],
+				}));
+			}
+		`;
+		fs.writeFileSync(path.join(extensionsDir, "legacy-array-override.ts"), extCode);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+
+		const emitted = await runner.emitBeforeAgentStart("hello", undefined, ["base prompt"], {
+			cwd: tempDir.path(),
+			selectedTools: ["read"],
+			skills: [],
+		});
+
+		// A pre-contract extension returning string[] must be joined into a single
+		// string block, not stored as a nested array the provider cannot consume.
+		expect(emitted?.systemPrompt).toEqual(["legacy block one\n\nlegacy block two"]);
+	});
+
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
