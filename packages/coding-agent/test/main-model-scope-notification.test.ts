@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ScopedModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
-import { buildModelScopeNotification } from "@oh-my-pi/pi-coding-agent/main";
+import { buildModelScopeNotification, buildPostSetupModelFallbackNotification } from "@oh-my-pi/pi-coding-agent/main";
 
 function scopedModel(id: string): ScopedModel {
 	return {
@@ -57,6 +57,23 @@ describe("buildModelScopeNotification", () => {
 		expect(buildModelScopeNotification([withDefault], false)).toEqual({
 			kind: "info",
 			message: "Model scope: claude-sonnet-4-5 (Ctrl+P to cycle)",
+		});
+	});
+});
+
+describe("buildPostSetupModelFallbackNotification", () => {
+	const message = "No models available. Use /login.";
+
+	it("drops the pre-setup warning after onboarding selects a model", () => {
+		expect(
+			buildPostSetupModelFallbackNotification(message, undefined, scopedModel("claude-sonnet-4-5").model),
+		).toBeNull();
+	});
+
+	it("retains the warning when onboarding leaves the session without a model", () => {
+		expect(buildPostSetupModelFallbackNotification(message, undefined, undefined)).toEqual({
+			kind: "warn",
+			message,
 		});
 	});
 });

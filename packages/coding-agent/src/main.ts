@@ -8,7 +8,8 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
 	directoryExists,
@@ -271,6 +272,21 @@ export interface InteractiveModeNotify {
 	message: string;
 }
 
+interface InteractiveStartupNotifications {
+	queued: (InteractiveModeNotify | null)[];
+	modelFallbackMessage?: string;
+}
+
+/** Builds a startup model warning only while setup has not replaced the model that produced it. */
+export function buildPostSetupModelFallbackNotification(
+	message: string | undefined,
+	modelBeforeSetup: Model | undefined,
+	modelAfterSetup: Model | undefined,
+): InteractiveModeNotify | null {
+	if (!message || (modelAfterSetup && !modelsAreEqual(modelBeforeSetup, modelAfterSetup))) return null;
+	return { kind: "warn", message };
+}
+
 export function buildModelScopeNotification(
 	scopedModelsForDisplay: readonly Pick<ScopedModel, "model" | "thinkingLevel" | "explicitThinkingLevel">[],
 	startupQuiet: boolean,
@@ -444,7 +460,7 @@ async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
 	startupChangelog: StartupChangelogSelection | undefined,
-	notifs: (InteractiveModeNotify | null)[],
+	notifications: InteractiveStartupNotifications,
 	versionCheckPromise: Promise<string | undefined>,
 	initialMessages: string[],
 	setExtensionUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
@@ -458,6 +474,7 @@ async function runInteractiveMode(
 	initialImages?: ImageContent[],
 	joinLink?: string,
 ): Promise<void> {
+	const modelBeforeSetup = session.model;
 	const mode = new InteractiveMode(
 		session,
 		version,
@@ -519,7 +536,16 @@ async function runInteractiveMode(
 	// transcript above the fresh one.
 	mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: true });
 
-	for (const notify of notifs) {
+	const modelFallbackNotification = buildPostSetupModelFallbackNotification(
+		notifications.modelFallbackMessage,
+		modelBeforeSetup,
+		session.model,
+	);
+	if (modelFallbackNotification) {
+		mode.showWarning(modelFallbackNotification.message);
+	}
+
+	for (const notify of notifications.queued) {
 		if (!notify) {
 			continue;
 		}
@@ -1207,7 +1233,7 @@ export async function runRootCommand(
 	const parsedArgs = parsed;
 	await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 
-	const notifs: (InteractiveModeNotify | null)[] = [];
+	const notifications: InteractiveStartupNotifications = { queued: [] };
 
 	if (parsedArgs.version) {
 		writeStartupNotice(parsedArgs, `${VERSION}\n`);
@@ -1513,7 +1539,7 @@ export async function runRootCommand(
 				sessionFile: sessionManager.getSessionFile(),
 			});
 			if (isInteractive) {
-				notifs.push({ kind: "warn", message: pendingToolWarning });
+				notifications.queued.push({ kind: "warn", message: pendingToolWarning });
 			} else {
 				process.stderr.write(`${chalk.yellow(`${pendingToolWarning}\n`)}`);
 			}
@@ -1623,7 +1649,7 @@ export async function runRootCommand(
 		}
 		for (const message of formatExtensionLoadNotifications(extensionsResult.errors)) {
 			if (isInteractive) {
-				notifs.push({ kind: "warn", message });
+				notifications.queued.push({ kind: "warn", message });
 			} else {
 				process.stderr.write(`${chalk.yellow(`${message}\n`)}`);
 			}
@@ -1703,12 +1729,12 @@ export async function runRootCommand(
 		}
 
 		if (modelFallbackMessage) {
-			notifs.push({ kind: "warn", message: modelFallbackMessage });
+			notifications.modelFallbackMessage = modelFallbackMessage;
 		}
 
 		const modelRegistryError = modelRegistry.getError();
 		if (modelRegistryError) {
-			notifs.push({ kind: "error", message: modelRegistryError.message });
+			notifications.queued.push({ kind: "error", message: modelRegistryError.message });
 		}
 
 		if (!isInteractive && !session.model) {
@@ -1743,7 +1769,7 @@ export async function runRootCommand(
 				// Routed through the TUI (not stdout): the startup capture owns the
 				// terminal in raw mode here, and the TUI's first clearScrollback paint
 				// would wipe a pre-TUI line anyway.
-				notifs.push(modelScopeNotification);
+				notifications.queued.push(modelScopeNotification);
 			}
 
 			if ($env.PI_TIMING) {
@@ -1759,7 +1785,7 @@ export async function runRootCommand(
 				session,
 				VERSION,
 				startupChangelog,
-				notifs,
+				notifications,
 				versionCheckPromise,
 				initialArgs.messages,
 				setToolUIContext,

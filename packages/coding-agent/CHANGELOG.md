@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed first-run setup displaying a stale no-model warning after provider sign-in and model selection completed in the same session ([#8053](https://github.com/can1357/oh-my-pi/issues/8053)).
+
 ## [17.2.12] - 2026-08-08
 
 ### Fixed
