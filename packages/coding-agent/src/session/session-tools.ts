@@ -7,7 +7,12 @@ import { formatModelString } from "../config/model-resolver";
 import type { Settings, SkillsSettings } from "../config/settings";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
-import type { ExtensionRunner, SourceInfo, ToolInfo } from "../extensibility/extensions";
+import type {
+	BeforeAgentStartSystemPromptOptions,
+	ExtensionRunner,
+	SourceInfo,
+	ToolInfo,
+} from "../extensibility/extensions";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import { type LocalProtocolOptions, XD_URL_PREFIX } from "../internal-urls";
@@ -76,6 +81,7 @@ interface SessionToolsOptions {
 		toolNames: string[],
 		tools: Map<string, AgentTool>,
 	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
+	getSystemPromptOptions?: () => BeforeAgentStartSystemPromptOptions;
 	getLocalCalendarDate?: () => string;
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
 	xdev?: XdevState;
@@ -219,6 +225,7 @@ export class SessionTools {
 	#mcpRefreshTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
+	#getSystemPromptOptions: SessionToolsOptions["getSystemPromptOptions"];
 	#getLocalCalendarDate: () => string;
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	#setActiveToolNames: SessionToolsOptions["setActiveToolNames"];
@@ -240,6 +247,7 @@ export class SessionTools {
 		this.#presentationPinnedToolNames = options.presentationPinnedToolNames;
 		this.#ensureWriteRegistered = options.ensureWriteRegistered;
 		this.#rebuildSystemPrompt = options.rebuildSystemPrompt;
+		this.#getSystemPromptOptions = options.getSystemPromptOptions;
 		this.#getLocalCalendarDate = options.getLocalCalendarDate ?? formatLocalCalendarDate;
 		this.#getMcpServerInstructions = options.getMcpServerInstructions;
 		this.#xdev = options.xdev;
@@ -264,6 +272,16 @@ export class SessionTools {
 	/** Current stable base system prompt. */
 	get baseSystemPrompt(): string[] {
 		return this.#baseSystemPrompt;
+	}
+	/** Current resolved inputs for Pi-compatible `before_agent_start` events. */
+	getSystemPromptOptions(): BeforeAgentStartSystemPromptOptions {
+		return (
+			this.#getSystemPromptOptions?.() ?? {
+				cwd: this.#host.sessionManager.getCwd(),
+				selectedTools: this.getActiveToolNames(),
+				skills: this.#skills,
+			}
+		);
 	}
 
 	/** Replaces the controller-owned base prompt without applying it to the agent. */

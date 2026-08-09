@@ -106,13 +106,10 @@ describe("autoresearch before_agent_start handler", () => {
 
 		const result = (await handlers.before_agent_start(event, ctx)) as BeforeAgentStartEventResult;
 		expect(result).toBeDefined();
-		expect(Array.isArray(result.systemPrompt)).toBe(true);
-		const blocks = result.systemPrompt as string[];
-		expect(blocks).toHaveLength(1);
-		expect(blocks[0]).toContain("Autoresearch Mode");
+		expect(result.systemPrompt).toContain("Autoresearch Mode");
 	});
 
-	it("joins event.systemPrompt blocks into the rendered base prompt", async () => {
+	it("preserves event.systemPrompt at the start of the rendered prompt", async () => {
 		const { handlers } = buildHarness();
 		if (!handlers.session_start || !handlers.before_agent_start) {
 			throw new Error("Autoresearch extension should register both session_start and before_agent_start");
@@ -124,12 +121,12 @@ describe("autoresearch before_agent_start handler", () => {
 		const event: BeforeAgentStartEvent = {
 			type: "before_agent_start",
 			prompt: "kick off",
-			systemPrompt: ["alpha block", "beta block"],
+			systemPrompt: "alpha block\n\nbeta block",
+			systemPromptOptions: { cwd: cwdDir.path() },
 		};
 
 		const result = (await handlers.before_agent_start(event, ctx)) as BeforeAgentStartEventResult;
 		expect(result).toBeDefined();
-		const rendered = (result.systemPrompt as string[])[0];
-		expect(rendered.startsWith("alpha block\n\nbeta block")).toBe(true);
+		expect(result.systemPrompt?.startsWith("alpha block\n\nbeta block")).toBe(true);
 	});
 });

@@ -1245,6 +1245,7 @@ export class AgentSession {
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
+			getSystemPromptOptions: config.getSystemPromptOptions,
 			getLocalCalendarDate: config.getLocalCalendarDate,
 			getMcpServerInstructions: config.getMcpServerInstructions,
 			xdev: config.xdev,
@@ -5363,6 +5364,7 @@ export class AgentSession {
 					expandedText,
 					options?.images,
 					beforeAgentStartSystemPrompt,
+					this.#tools.getSystemPromptOptions(),
 				);
 				if (result?.messages) {
 					const promptAttribution: "user" | "agent" | undefined =

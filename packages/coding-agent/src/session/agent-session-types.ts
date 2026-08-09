@@ -28,8 +28,7 @@ import type { CursorMcpResourceAdapter } from "../cursor";
 import type { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
-import type { ExtensionRunner } from "../extensibility/extensions";
-import type { ContextUsage } from "../extensibility/extensions/types";
+import type { BeforeAgentStartSystemPromptOptions, ContextUsage, ExtensionRunner } from "../extensibility/extensions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
@@ -207,6 +206,8 @@ export interface AgentSessionConfig {
 		toolNames: string[],
 		tools: Map<string, AgentTool>,
 	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
+	/** Current resolved inputs for Pi-compatible `before_agent_start` events. */
+	getSystemPromptOptions?: () => BeforeAgentStartSystemPromptOptions;
 	/** Local calendar date provider used by prompt-cache invalidation. */
 	getLocalCalendarDate?: () => string;
 	/** Tools mounted under `xd://`, for `/tools` display. */

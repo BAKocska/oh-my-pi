@@ -81,6 +81,7 @@ import {
 import { discoverCustomToolPaths, loadCustomTools, type ToolPathWithSource } from "./extensibility/custom-tools";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./extensibility/custom-tools/types";
 import {
+	type BeforeAgentStartSystemPromptOptions,
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
 	type ExtensionContext,
@@ -2781,6 +2782,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const eagerTasksAlways = settings.get("task.eager") === "always";
 		const intentField = $flag("PI_INTENT_TRACING", settings.get("tools.intentTracing")) ? INTENT_FIELD : undefined;
 		const includeWorkspaceTree = settings.get("includeWorkspaceTree") ?? false;
+		let currentSystemPromptOptions: BeforeAgentStartSystemPromptOptions = {
+			cwd: sessionManager.getCwd(),
+			selectedTools: [],
+			skills,
+		};
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
@@ -2865,6 +2871,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
 					: options.appendSystemPrompt;
 			}
+			const promptSkills = session?.skills ?? skills;
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
@@ -2873,7 +2880,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? xdevDocsAll(toolSession.xdev, settings.get("tools.xdevDocs"), settings.get("tools.xdevInlineDevices"))
 					: "",
 				resolvedCustomPrompt: options.customSystemPrompt,
-				skills: session?.skills ?? skills,
+				skills: promptSkills,
 				contextFiles,
 				tools: promptTools,
 				toolNames,
@@ -2905,6 +2912,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
 			});
+			currentSystemPromptOptions = {
+				customPrompt: options.customSystemPrompt,
+				selectedTools: toolNames,
+				appendSystemPrompt: appendPrompt,
+				cwd: promptCwd,
+				contextFiles,
+				skills: promptSkills,
+			};
 
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
@@ -3388,6 +3403,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			preferWebsockets: preferOpenAICodexWebsockets,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			getSystemPromptOptions: () => currentSystemPromptOptions,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames: explicitlyRequestedToolNameSet,

@@ -26,6 +26,7 @@ import type {
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
+	BeforeAgentStartSystemPromptOptions,
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
 	CompactOptions,
@@ -1351,10 +1352,11 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPrompt: string[],
+		systemPromptOptions: BeforeAgentStartSystemPromptOptions,
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		const ctx = this.createContext();
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
-		let currentSystemPrompt = systemPrompt;
+		let currentSystemPrompt = systemPrompt.join("\n\n");
 		let systemPromptModified = false;
 
 		for (const ext of this.extensions) {
@@ -1367,6 +1369,7 @@ export class ExtensionRunner {
 					prompt,
 					images,
 					systemPrompt: currentSystemPrompt,
+					systemPromptOptions,
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1382,8 +1385,7 @@ export class ExtensionRunner {
 						messages.push(result.message);
 					}
 					if (result.systemPrompt !== undefined) {
-						currentSystemPrompt =
-							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
+						currentSystemPrompt = result.systemPrompt;
 						systemPromptModified = true;
 					}
 				}
@@ -1393,7 +1395,7 @@ export class ExtensionRunner {
 		if (messages.length > 0 || systemPromptModified) {
 			return {
 				messages: messages.length > 0 ? messages : undefined,
-				systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
+				systemPrompt: systemPromptModified ? [currentSystemPrompt] : undefined,
 			};
 		}
 

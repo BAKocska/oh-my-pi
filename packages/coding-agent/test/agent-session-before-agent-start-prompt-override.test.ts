@@ -54,12 +54,11 @@ describe("AgentSession before_agent_start system prompt override", () => {
 	 * re-reads `state.systemPrompt` for the request — reproducing a rebuild that
 	 * lands in the window between the hook and the provider request.
 	 */
-	function createSession(
-		responses: MockResponseSource,
-		options: { rebuildInWindow?: boolean } = {},
-	): { session: AgentSession; systemPrompts: string[][] } {
+	function createSession(responses: MockResponseSource, options: { rebuildInWindow?: boolean } = {}) {
 		const mock = createMockModel({ responses });
 		const systemPrompts: string[][] = [];
+		const systemPromptOptions = { cwd: "/workspace", selectedTools: ["read"] };
+		const emitBeforeAgentStart = vi.fn(async () => ({ systemPrompt: [OVERRIDE] }));
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -82,10 +81,11 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
 			extensionRunner: {
-				emitBeforeAgentStart: async () => ({ systemPrompt: [OVERRIDE] }),
+				emitBeforeAgentStart,
 				emit: async () => undefined,
 			} as unknown as ExtensionRunner,
 			rebuildSystemPrompt: async () => ({ systemPrompt: [REBUILT_BASE] }),
+			getSystemPromptOptions: () => systemPromptOptions,
 		});
 		const activeSession = session;
 
@@ -98,7 +98,7 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			});
 		}
 
-		return { session, systemPrompts };
+		return { session, systemPrompts, emitBeforeAgentStart, systemPromptOptions };
 	}
 
 	it("keeps the override when a base rebuild fires in the prompt window", async () => {
@@ -111,6 +111,15 @@ describe("AgentSession before_agent_start system prompt override", () => {
 		// override must still reach the provider instead of the rebuilt base.
 		expect(systemPrompts).toHaveLength(1);
 		expect(systemPrompts[0]).toEqual([OVERRIDE]);
+	});
+
+	it("forwards resolved system prompt options to before_agent_start", async () => {
+		const { session, emitBeforeAgentStart, systemPromptOptions } = createSession([{ content: ["Done"] }]);
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		expect(emitBeforeAgentStart).toHaveBeenCalledWith("hello", undefined, ["initial-base"], systemPromptOptions);
 	});
 
 	it("falls back to the rebuilt base once the turn ends", async () => {

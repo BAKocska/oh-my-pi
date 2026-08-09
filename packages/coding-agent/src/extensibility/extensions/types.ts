@@ -103,6 +103,7 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../shared-events";
+import type { Skill } from "../skills";
 import type { SlashCommandInfo } from "../slash-commands";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
@@ -681,12 +682,25 @@ export interface AfterProviderResponseEvent extends ProviderResponseMetadata {
 	type: "after_provider_response";
 }
 
+/** Structured inputs used to build the system prompt exposed to Pi-compatible extensions. */
+export interface BeforeAgentStartSystemPromptOptions {
+	customPrompt?: string;
+	selectedTools?: string[];
+	toolSnippets?: Record<string, string>;
+	promptGuidelines?: string[];
+	appendSystemPrompt?: string;
+	cwd: string;
+	contextFiles?: Array<{ path: string; content: string }>;
+	skills?: readonly Skill[];
+}
+
 /** Fired after user submits prompt but before agent loop. */
 export interface BeforeAgentStartEvent {
 	type: "before_agent_start";
 	prompt: string;
 	images?: ImageContent[];
-	systemPrompt: string[];
+	systemPrompt: string;
+	systemPromptOptions: BeforeAgentStartSystemPromptOptions;
 }
 
 export type {
@@ -1063,7 +1077,7 @@ export type { ToolResultEventResult } from "../shared-events";
 export interface BeforeAgentStartEventResult {
 	message?: CustomMessagePayload;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
-	systemPrompt?: string[];
+	systemPrompt?: string;
 }
 
 export type {
