@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 /** Lexical containment: `target` is `base` itself or a descendant of it. */
-export function isContained(base: string, target: string): boolean {
+function isContained(base: string, target: string): boolean {
 	const relative = path.relative(base, target);
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
@@ -29,10 +29,7 @@ export async function realpathIfExists(p: string): Promise<string | null> {
 }
 
 /** Outcome of resolving a fixed package path without reading it. */
-export type ContainedPathResolution =
-	| { status: "missing" }
-	| { status: "outside" }
-	| { status: "ok"; realPath: string };
+type ContainedPathResolution = { status: "missing" } | { status: "outside" } | { status: "ok"; realPath: string };
 
 /**
  * Resolve a fixed package path WITHOUT reading it: symlinks and equivalent

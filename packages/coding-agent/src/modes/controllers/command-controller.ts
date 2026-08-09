@@ -11,7 +11,7 @@ import {
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
@@ -1442,6 +1442,9 @@ export class CommandController {
 			if (message === "Handoff cancelled") {
 				this.ctx.showError("Handoff cancelled");
 			} else {
+				// Persist the real failure so it is debuggable after the transient
+				// TUI error clears (#7993).
+				logger.error("Handoff failed", { error: message });
 				this.ctx.showError(`Handoff failed: ${message}`);
 			}
 		} finally {

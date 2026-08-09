@@ -14,7 +14,7 @@
  */
 
 /** Header buckets for one MCP HTTP request. */
-export interface MCPHeaderSources {
+interface MCPHeaderSources {
 	/** Client-generated HTTP/MCP/authorization headers; win case-insensitively. */
 	generated: Record<string, string>;
 	/** Configured headers from the server entry (package or user config). */

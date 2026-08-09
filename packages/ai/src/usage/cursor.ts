@@ -1,3 +1,4 @@
+import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { extractCursorAccessTokenUserId } from "../registry/oauth/cursor";
 import type {
 	UsageAmount,
@@ -6,21 +7,15 @@ import type {
 	UsageLimit,
 	UsageProvider,
 	UsageReport,
-	UsageStatus,
 	UsageWindow,
 } from "../usage";
-import { toNumber } from "./shared";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+import { isRecord } from "../utils";
+import { parseIsoTimestamp, usageStatus } from "./shared";
 
 function parseTimestamp(value: unknown): number | undefined {
 	const numeric = toNumber(value);
 	if (numeric !== undefined) return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
-	if (typeof value !== "string" || !value.trim()) return undefined;
-	const parsed = Date.parse(value);
-	return Number.isFinite(parsed) ? parsed : undefined;
+	return parseIsoTimestamp(value);
 }
 
 const DEFAULT_CURSOR_BASE_URL = "https://api2.cursor.sh";
@@ -78,13 +73,6 @@ function deriveResetsAt(payload: Record<string, unknown>): number | undefined {
 	return undefined;
 }
 
-function resolveCursorStatus(usedFraction: number | undefined): UsageStatus {
-	if (usedFraction === undefined) return "unknown";
-	if (usedFraction >= 1) return "exhausted";
-	if (usedFraction >= 0.9) return "warning";
-	return "ok";
-}
-
 export function parseCursorIndividualUsage(payload: unknown, fetchedAt = Date.now()): UsageReport | null {
 	if (!isRecord(payload) || !isRecord(payload.individualUsage) || !isRecord(payload.individualUsage.overall)) {
 		return null;
@@ -140,7 +128,7 @@ export function parseCursorIndividualUsage(payload: unknown, fetchedAt = Date.no
 		},
 		window,
 		amount,
-		...(amount.usedFraction !== undefined ? { status: resolveCursorStatus(amount.usedFraction) } : {}),
+		...(amount.usedFraction !== undefined ? { status: usageStatus(amount.usedFraction) } : {}),
 	};
 	return {
 		provider: "cursor",
@@ -197,7 +185,7 @@ export function parseCursorUsage(payload: unknown, fetchedAt = Date.now()): Usag
 				unit,
 			};
 
-			const status = resolveCursorStatus(amount.usedFraction);
+			const status = usageStatus(amount.usedFraction);
 
 			limits.push({
 				id: limitId,

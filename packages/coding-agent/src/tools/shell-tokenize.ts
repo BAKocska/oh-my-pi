@@ -87,7 +87,7 @@ export function tokenizeShellSegments(command: string): string[][] {
  *
  * @see extractFlatShellCommandSegments
  */
-export interface FlatShellCommandSegment {
+interface FlatShellCommandSegment {
 	/** Original segment text with quoting and escaping preserved. */
 	text: string;
 	/**

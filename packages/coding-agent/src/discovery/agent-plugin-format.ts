@@ -74,13 +74,13 @@ export interface AgentPluginManifest {
  * - `invalid` — the document targets Agent Plugins but violates the closed schema
  *   fatally; the plugin must be rejected and none of its components loaded (spec §5.2).
  */
-export type AgentPluginManifestResult =
+type AgentPluginManifestResult =
 	| { status: "none" }
 	| { status: "valid"; manifest: AgentPluginManifest; warnings: string[] }
 	| { status: "invalid"; reason: string };
 
 /** Enforce the plugin `name` constraints from spec §5.5. */
-export function isValidAgentPluginName(name: string): boolean {
+function isValidAgentPluginName(name: string): boolean {
 	if (name.length < 1 || name.length > 64) return false;
 	if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(name)) return false;
 	return !name.includes("--") && !name.includes("..");
@@ -240,14 +240,14 @@ export function parseAgentPluginManifest(raw: string): AgentPluginManifestResult
  * (spec §9.2). Single non-recursive pass; replacement text is never rescanned,
  * and no other placeholder or environment-variable expansion is performed.
  */
-export function expandAgentPluginPlaceholders(value: string, pluginRoot: string, pluginData: string): string {
+function expandAgentPluginPlaceholders(value: string, pluginRoot: string, pluginData: string): string {
 	return value.replace(/\$\{PLUGIN_(ROOT|DATA)\}/g, (_match, which: string) =>
 		which === "ROOT" ? pluginRoot : pluginData,
 	);
 }
 
 /** A validated `mcp.json` server entry, resolved to launch-ready values. */
-export interface AgentPluginMcpServer {
+interface AgentPluginMcpServer {
 	name: string;
 	transport: "stdio" | "http" | "sse";
 	/** Absolute path for `./`-relative commands; bare executable token otherwise. */
@@ -268,11 +268,11 @@ export interface AgentPluginMcpServer {
  * - `ok` — the document is valid; individually invalid server entries are
  *   skipped with a warning (spec §7.2.2 rule 3).
  */
-export type AgentPluginMcpResult =
+type AgentPluginMcpResult =
 	| { status: "disabled"; reason: string }
 	| { status: "ok"; servers: AgentPluginMcpServer[]; warnings: string[] };
 
-export interface AgentPluginMcpOptions {
+interface AgentPluginMcpOptions {
 	/** Filesystem-resolved plugin root. */
 	pluginRoot: string;
 	/** Client-managed persistent data directory for this plugin (spec §9.1). */
@@ -488,7 +488,7 @@ export async function parseAgentPluginMcp(raw: string, options: AgentPluginMcpOp
  * - `invalid` — the root claims Agent Plugins conformance but its manifest is
  *   fatally invalid; no component may be discovered or executed (spec §11.3).
  */
-export type AgentPluginRootStatus =
+type AgentPluginRootStatus =
 	| { kind: "none" }
 	| { kind: "standard"; manifest: AgentPluginManifest; warnings: string[]; realRoot: string }
 	| { kind: "invalid"; reason: string };
