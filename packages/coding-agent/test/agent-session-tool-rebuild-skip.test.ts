@@ -50,11 +50,18 @@ function createBasicTool(name: string, label: string, description = `${label} to
 	};
 }
 
-function createMcpCustomTool(name: string, serverName: string, mcpToolName: string, description: string): CustomTool {
+function createMcpCustomTool(
+	name: string,
+	serverName: string,
+	mcpToolName: string,
+	description: string,
+	promptMetadata: { promptSnippet?: string; promptGuidelines?: string[] } = {},
+): CustomTool {
 	return {
 		name,
 		label: `${serverName}/${mcpToolName}`,
 		description,
+		...promptMetadata,
 		parameters: type({ q: "string" }),
 		strict: true,
 		mcpServerName: serverName,
@@ -213,6 +220,37 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		await session.refreshMCPTools([initialMcp]);
 		expect(rebuildCount).toBe(1);
+	});
+
+	it("rebuilds when active tool prompt metadata changes", async () => {
+		let rebuildCount = 0;
+		const { session } = newSession(async toolNames => {
+			rebuildCount++;
+			return `tools:${toolNames.join(",")}`;
+		});
+		const makeSearch = (promptMetadata: { promptSnippet: string; promptGuidelines: string[] }): CustomTool =>
+			createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus", promptMetadata);
+
+		await session.refreshMCPTools([
+			makeSearch({ promptSnippet: "Search v1", promptGuidelines: ["Use stable queries."] }),
+		]);
+		expect(rebuildCount).toBe(1);
+
+		await session.refreshMCPTools([
+			makeSearch({ promptSnippet: "Search v2", promptGuidelines: ["Use stable queries."] }),
+		]);
+		expect(rebuildCount).toBe(2);
+
+		await session.refreshMCPTools([
+			makeSearch({ promptSnippet: "Search v2", promptGuidelines: ["Prefer exact queries."] }),
+		]);
+		expect(rebuildCount).toBe(3);
+
+		// Byte-identical metadata still preserves the provider prompt cache.
+		await session.refreshMCPTools([
+			makeSearch({ promptSnippet: "Search v2", promptGuidelines: ["Prefer exact queries."] }),
+		]);
+		expect(rebuildCount).toBe(3);
 	});
 
 	it("warns and keeps the stable winner when distinct MCP tools mint the same name", async () => {
