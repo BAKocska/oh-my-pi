@@ -103,7 +103,6 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../shared-events";
-import type { Skill } from "../skills";
 import type { SlashCommandInfo } from "../slash-commands";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
@@ -686,6 +685,21 @@ export interface AfterProviderResponseEvent extends ProviderResponseMetadata {
 	type: "after_provider_response";
 }
 
+/**
+ * Skill projected into the upstream Pi `Skill` shape for
+ * {@link BeforeAgentStartSystemPromptOptions}. Pi extensions filter on the
+ * required `disableModelInvocation` flag (never omp's `hide`), so the host maps
+ * `hide === true` onto it here rather than leaking the native skill object.
+ */
+export interface BeforeAgentStartSkill {
+	name: string;
+	description: string;
+	filePath: string;
+	baseDir: string;
+	disableModelInvocation: boolean;
+	sourceInfo: SourceInfo;
+}
+
 /** Structured inputs used to build the system prompt exposed to Pi-compatible extensions. */
 export interface BeforeAgentStartSystemPromptOptions {
 	customPrompt?: string;
@@ -695,7 +709,7 @@ export interface BeforeAgentStartSystemPromptOptions {
 	appendSystemPrompt?: string;
 	cwd: string;
 	contextFiles?: Array<{ path: string; content: string }>;
-	skills?: readonly Skill[];
+	skills?: BeforeAgentStartSkill[];
 }
 
 /** Fired after user submits prompt but before agent loop. */

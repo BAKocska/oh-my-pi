@@ -15,6 +15,7 @@ import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text"
 import userInvocationTemplate from "../prompts/skills/user-invocation.md" with { type: "text" };
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
+import type { BeforeAgentStartSkill } from "./extensions/types";
 export interface Skill {
 	name: string;
 	description: string;
@@ -64,6 +65,29 @@ export function setActiveSkills(value: readonly Skill[]): void {
 /** Reset the active skill snapshot. Test-only. */
 export function resetActiveSkillsForTests(): void {
 	activeSkills = [];
+}
+
+/**
+ * Project omp skills into the upstream Pi `Skill` shape for the
+ * `before_agent_start` event options. Pi extensions filter on the required
+ * `disableModelInvocation` flag, so `hide === true` maps onto it; `sourceInfo`
+ * is synthesized best-effort from the skill's capability metadata.
+ */
+export function projectSkillsForBeforeAgentStart(skills: readonly Skill[]): BeforeAgentStartSkill[] {
+	return skills.map(skill => ({
+		name: skill.name,
+		description: skill.description,
+		filePath: skill.filePath,
+		baseDir: skill.baseDir,
+		disableModelInvocation: skill.hide === true,
+		sourceInfo: {
+			path: skill._source?.path ?? skill.filePath,
+			source: skill.source,
+			scope: skill._source?.level === "user" ? "user" : skill._source?.level === "native" ? "temporary" : "project",
+			origin: skill.containRoot ? "package" : "top-level",
+			baseDir: skill.baseDir,
+		},
+	}));
 }
 
 /**

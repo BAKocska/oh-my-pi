@@ -470,9 +470,10 @@ export function projectSystemPromptToolMetadata(
 		const wireNameValue = override?.wireName ?? tool.customWireName;
 		const label = typeof labelValue === "string" ? labelValue : "";
 		const wireName = typeof wireNameValue === "string" ? wireNameValue : undefined;
-		const promptSnippet = normalizeToolPromptSnippet(
-			override?.promptSnippet ?? tool.promptSnippet ?? tool.summary ?? tool.description,
-		);
+		// Pi's `toolSnippets` map carries only an explicit one-line `promptSnippet`.
+		// NEVER fall back to `summary`/`description`: compact projection MUST NOT
+		// read the lazy descriptor getters (system-prompt-inventory contract).
+		const promptSnippet = normalizeToolPromptSnippet(override?.promptSnippet ?? tool.promptSnippet);
 		const promptGuidelines = normalizeToolPromptGuidelines(override?.promptGuidelines ?? tool.promptGuidelines);
 
 		if (projection.mode === "compact") {

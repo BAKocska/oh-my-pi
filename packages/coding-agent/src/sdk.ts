@@ -97,6 +97,7 @@ import {
 } from "./extensibility/extensions";
 import {
 	loadSkills as loadSkillsInternal,
+	projectSkillsForBeforeAgentStart,
 	type Skill,
 	type SkillWarning,
 	setActiveSkills,
@@ -2785,7 +2786,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		let currentSystemPromptOptions: BeforeAgentStartSystemPromptOptions = {
 			cwd: sessionManager.getCwd(),
 			selectedTools: [],
-			skills,
+			skills: projectSkillsForBeforeAgentStart(skills),
 		};
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
@@ -2924,26 +2925,41 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
 			});
-			currentSystemPromptOptions = {
-				customPrompt: options.customSystemPrompt,
-				selectedTools: toolNames,
-				toolSnippets: Object.fromEntries(toolSnippetEntries),
-				promptGuidelines,
-				appendSystemPrompt: appendPrompt,
-				cwd: promptCwd,
-				contextFiles: defaultPrompt.contextFiles,
-				skills: promptSkills,
-			};
-
 			if (options.systemPrompt === undefined) {
+				// The default builder output IS the emitted prompt: expose its
+				// resolved inputs. `appendSystemPrompt` is the caller/user input
+				// only — host-generated memory/MCP/auto-learn sections (folded into
+				// `appendPrompt`) are deliberately excluded so a Pi extension does
+				// not treat changing host state as a cache-stable prefix.
+				currentSystemPromptOptions = {
+					customPrompt: options.customSystemPrompt,
+					selectedTools: toolNames,
+					toolSnippets: Object.fromEntries(toolSnippetEntries),
+					promptGuidelines,
+					appendSystemPrompt: options.appendSystemPrompt,
+					cwd: promptCwd,
+					contextFiles: defaultPrompt.contextFiles,
+					skills: projectSkillsForBeforeAgentStart(promptSkills),
+				};
 				return defaultPrompt;
 			}
+			// A full SDK `systemPrompt` override replaces the built prompt. The
+			// default builder's context files, skills, snippets, and guidelines are
+			// NOT in the emitted prompt, so exposing them would misrepresent it.
+			// Surface the override as the Pi `customPrompt` and drop the discarded
+			// structured inputs.
 			const customPrompt =
 				typeof options.systemPrompt === "function"
 					? options.systemPrompt(defaultPrompt.systemPrompt)
 					: options.systemPrompt;
+			const customBlocks = typeof customPrompt === "string" ? [customPrompt] : customPrompt;
+			currentSystemPromptOptions = {
+				customPrompt: customBlocks.join("\n\n"),
+				selectedTools: toolNames,
+				cwd: promptCwd,
+			};
 			return {
-				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
+				systemPrompt: customBlocks,
 				contextFiles: defaultPrompt.contextFiles,
 			};
 		};

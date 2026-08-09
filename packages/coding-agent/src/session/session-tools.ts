@@ -14,7 +14,13 @@ import type {
 	ToolInfo,
 } from "../extensibility/extensions";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
-import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
+import {
+	loadSkills,
+	projectSkillsForBeforeAgentStart,
+	type Skill,
+	type SkillWarning,
+	setActiveSkills,
+} from "../extensibility/skills";
 import { type LocalProtocolOptions, XD_URL_PREFIX } from "../internal-urls";
 import { deduplicateMCPToolsByName } from "../mcp/tool-bridge";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
@@ -279,7 +285,7 @@ export class SessionTools {
 			this.#getSystemPromptOptions?.() ?? {
 				cwd: this.#host.sessionManager.getCwd(),
 				selectedTools: this.getActiveToolNames(),
-				skills: this.#skills,
+				skills: projectSkillsForBeforeAgentStart(this.#skills),
 			}
 		);
 	}
