@@ -366,21 +366,21 @@ function getModelDefinedEfforts<TApi extends Api>(
 	if (spec.provider === "ollama") {
 		return OLLAMA_REASONING_EFFORTS;
 	}
-	// DeepSeek V4 Flash accepts the wire-exact low/high/max ladder on every
-	// host and every wire — the direct API, aggregators, and the opencode-go
-	// responses route alike. Ungated by api: the responses route must keep
-	// this ladder, not fall through to the generic responses default.
-	//
-	// DeepSeek's official Responses API contract collapses seven effort
-	// spellings onto three distinct strengths (see
-	// https://api-docs.deepseek.com/api/create-response, reasoning.effort):
-	// none=off, minimal/low=low, medium/high/xhigh=high, max=max. Exposing
-	// only the three distinct tiers keeps every selector value 1:1 with a wire
-	// strength — no UI tier silently collapses onto another.
-	if (isDeepseekV4FlashModelId(spec.id)) {
-		return LOW_HIGH_MAX_REASONING_EFFORTS;
-	}
-	if (isOpenAICompatReasoningApi(spec.api) && isDeepseekReasoningModel(spec)) {
+	// DeepSeek reasoning routes that speak a wire `reasoning.effort` ladder:
+	// OpenAI chat/completions, OpenRouter, and the responses API (the
+	// opencode-go route). Gated by api — anthropic-messages and Ollama-cloud
+	// treat these same models as budget-token controls, not an effort ladder,
+	// so they must fall through to their own budget tiers, not this ladder.
+	if ((isOpenAICompatReasoningApi(spec.api) || spec.api === "openai-responses") && isDeepseekReasoningModel(spec)) {
+		// DeepSeek V4 Flash uses the wire-exact low/high/max ladder. DeepSeek's
+		// Responses contract (https://api-docs.deepseek.com/api/create-response,
+		// reasoning.effort) collapses seven spellings onto three strengths:
+		// none=off, minimal/low=low, medium/high/xhigh=high, max=max — so only
+		// these three tiers are wire-exact and every selector maps 1:1 to a
+		// strength (no UI tier silently collapses onto another).
+		if (isDeepseekV4FlashModelId(spec.id)) {
+			return LOW_HIGH_MAX_REASONING_EFFORTS;
+		}
 		// V4 Pro and the older reasoners top out at high/max, and OpenRouter's
 		// non-flash DeepSeek route exposes only high.
 		return isOpenRouterThinkingFormat(compat) ? HIGH_ONLY_REASONING_EFFORTS : HIGH_MAX_REASONING_EFFORTS;

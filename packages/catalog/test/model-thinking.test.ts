@@ -66,6 +66,31 @@ describe("model thinking derivation", () => {
 		expect(requireSupportedEffort(model, Effort.XHigh)).toBe(Effort.XHigh);
 	});
 
+	it("scopes the DeepSeek V4 Flash low/high/max ladder to wire-effort routes (#8064 review)", () => {
+		// OpenAI-compatible reasoning routes (chat/completions, OpenRouter) and
+		// the responses API (opencode-go) speak a wire reasoning.effort ladder:
+		// low/high/max.
+		const responses = createModel({ id: "deepseek-v4-flash", api: "openai-responses", provider: "opencode-go" });
+		const completions = createModel({ id: "deepseek-v4-flash", api: "openai-completions", provider: "deepseek" });
+		expect(responses.thinking?.efforts).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		expect(completions.thinking?.efforts).toEqual([Effort.Low, Effort.High, Effort.Max]);
+
+		// anthropic-messages and Ollama-cloud host the same model as budget-token
+		// controls, not an effort ladder — the override must NOT reach them, so
+		// their [minimal, low, medium, high, xhigh] budget tiers survive.
+		const budget = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+		const umans = createModel({ id: "umans-deepseek-v4-flash-0731", api: "anthropic-messages", provider: "umans" });
+		const vercel = createModel({
+			id: "deepseek/deepseek-v4-flash",
+			api: "anthropic-messages",
+			provider: "vercel-ai-gateway",
+		});
+		const ollama = createModel({ id: "deepseek-v4-flash", api: "ollama-chat", provider: "ollama-cloud" });
+		expect(umans.thinking?.efforts).toEqual(budget);
+		expect(vercel.thinking?.efforts).toEqual(budget);
+		expect(ollama.thinking?.efforts).toEqual(budget);
+	});
+
 	it("stores MiniMax M2 and GPT-OSS OpenAI-compatible effort limits in model metadata", () => {
 		const minimax = createModel({
 			id: "minimax-m2.7",
