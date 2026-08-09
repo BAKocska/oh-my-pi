@@ -366,14 +366,17 @@ function getModelDefinedEfforts<TApi extends Api>(
 	if (spec.provider === "ollama") {
 		return OLLAMA_REASONING_EFFORTS;
 	}
+	// DeepSeek V4 Flash accepts the wire-exact low/high/max ladder on every
+	// host and every wire — the direct API, aggregators, and the opencode-go
+	// responses route alike (medium/xhigh map to high). Ungated by api: the
+	// responses route must keep this ladder, not fall through to the generic
+	// responses default.
+	if (isDeepseekV4FlashModelId(spec.id)) {
+		return LOW_HIGH_MAX_REASONING_EFFORTS;
+	}
 	if (isOpenAICompatReasoningApi(spec.api) && isDeepseekReasoningModel(spec)) {
-		// DeepSeek V4 Flash accepts the wire-exact low/high/max ladder on every
-		// host — the direct API and aggregators alike (medium/xhigh map to
-		// high). V4 Pro and the older reasoners top out at high/max, and
-		// OpenRouter's non-flash DeepSeek route exposes only high.
-		if (isDeepseekV4FlashModelId(spec.id)) {
-			return LOW_HIGH_MAX_REASONING_EFFORTS;
-		}
+		// V4 Pro and the older reasoners top out at high/max, and OpenRouter's
+		// non-flash DeepSeek route exposes only high.
 		return isOpenRouterThinkingFormat(compat) ? HIGH_ONLY_REASONING_EFFORTS : HIGH_MAX_REASONING_EFFORTS;
 	}
 	if (spec.provider === "baseten" && isOpenAIGptOssModelId(spec.id)) {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored the `max` thinking-effort tier for `opencode-go/deepseek-v4-flash`. Rerouting the model to the responses API in 17.2.12 caused effort derivation to fall through to the generic `[minimal, low, medium, high, xhigh]` responses default; the wire-exact `[low, high, max]` ladder is now applied regardless of API ([#8063](https://github.com/can1357/oh-my-pi/issues/8063)).
+
 ## [17.2.12] - 2026-08-08
 
 ### Fixed

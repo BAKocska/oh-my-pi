@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { PROVIDER_DESCRIPTORS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import {
@@ -52,6 +54,30 @@ describe("OpenCode provider discovery", () => {
 			api: "openai-completions",
 			baseUrl: "https://opencode.ai/zen/go/v1",
 		});
+	});
+
+	test("keeps the low/high/max ladder for deepseek-v4-flash on the responses route (#8063)", () => {
+		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
+		const routed = descriptor?.resolveApi?.("deepseek-v4-flash", { tool_call: true });
+		expect(routed?.api).toBe("openai-responses");
+		// bf04fbfc8 rerouted this model to the responses API; the effort ladder
+		// must survive the switch. DSV4-Flash uses the wire-exact low/high/max
+		// scale on every host (medium/xhigh map to high). Before the fix the
+		// responses route fell through to the generic responses default
+		// [minimal, low, medium, high, xhigh] and silently dropped `max`.
+		const model = buildModel({
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash (2x usage)",
+			api: "openai-responses",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0.07, output: 0.14, cacheRead: 0.0014, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 384_000,
+		});
+		expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.High, Effort.Max]);
 	});
 
 	test("replaces stale bundled Zen models with each credential's live endpoint list", async () => {
