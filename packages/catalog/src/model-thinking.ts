@@ -368,9 +368,15 @@ function getModelDefinedEfforts<TApi extends Api>(
 	}
 	// DeepSeek V4 Flash accepts the wire-exact low/high/max ladder on every
 	// host and every wire — the direct API, aggregators, and the opencode-go
-	// responses route alike (medium/xhigh map to high). Ungated by api: the
-	// responses route must keep this ladder, not fall through to the generic
-	// responses default.
+	// responses route alike. Ungated by api: the responses route must keep
+	// this ladder, not fall through to the generic responses default.
+	//
+	// DeepSeek's official Responses API contract collapses seven effort
+	// spellings onto three distinct strengths (see
+	// https://api-docs.deepseek.com/api/create-response, reasoning.effort):
+	// none=off, minimal/low=low, medium/high/xhigh=high, max=max. Exposing
+	// only the three distinct tiers keeps every selector value 1:1 with a wire
+	// strength — no UI tier silently collapses onto another.
 	if (isDeepseekV4FlashModelId(spec.id)) {
 		return LOW_HIGH_MAX_REASONING_EFFORTS;
 	}
