@@ -2866,6 +2866,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				tools,
 				nativeTools && !inlineToolDescriptors ? { mode: "compact", toolNames } : { mode: "full" },
 			);
+			const toolSnippetEntries: Array<[string, string]> = [];
+			const promptGuidelines: string[] = [];
+			const seenPromptGuidelines = new Set<string>();
+			for (const name of toolNames) {
+				const metadata = promptTools.get(name);
+				if (metadata?.promptSnippet) toolSnippetEntries.push([name, metadata.promptSnippet]);
+				for (const guideline of metadata?.promptGuidelines ?? []) {
+					if (seenPromptGuidelines.has(guideline)) continue;
+					seenPromptGuidelines.add(guideline);
+					promptGuidelines.push(guideline);
+				}
+			}
 			if (options.appendSystemPrompt) {
 				appendPrompt = appendPrompt
 					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
@@ -2915,6 +2927,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			currentSystemPromptOptions = {
 				customPrompt: options.customSystemPrompt,
 				selectedTools: toolNames,
+				toolSnippets: Object.fromEntries(toolSnippetEntries),
+				promptGuidelines,
 				appendSystemPrompt: appendPrompt,
 				cwd: promptCwd,
 				contextFiles,

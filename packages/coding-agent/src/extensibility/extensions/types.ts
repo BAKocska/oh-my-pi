@@ -552,6 +552,10 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	label: string;
 	/** Description for LLM */
 	description: string;
+	/** Optional one-line snippet exposed for Pi-compatible prompt reconstruction while active. */
+	promptSnippet?: string;
+	/** Optional guideline bullets exposed for Pi-compatible prompt reconstruction while active. */
+	promptGuidelines?: string[];
 	/** Parameter schema (Zod, or TypeBox for legacy/extension compat). */
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */

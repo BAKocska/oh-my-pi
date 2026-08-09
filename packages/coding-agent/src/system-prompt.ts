@@ -420,6 +420,24 @@ export interface SystemPromptToolMetadata {
 	parameters?: TSchema;
 	/** Illustrative examples rendered into the verbose inventory. */
 	examples?: readonly ToolExample[];
+	/** One-line Pi-compatible tool summary for system-prompt reconstruction. */
+	promptSnippet?: string;
+	/** Pi-compatible guideline bullets active with this tool. */
+	promptGuidelines?: readonly string[];
+}
+
+function normalizeToolPromptSnippet(value: string | undefined): string | undefined {
+	const normalized = value
+		?.replace(/[\r\n]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return normalized || undefined;
+}
+
+function normalizeToolPromptGuidelines(values: readonly string[] | undefined): readonly string[] | undefined {
+	if (!values) return undefined;
+	const normalized = [...new Set(values.map(value => value.trim()).filter(value => value.length > 0))];
+	return normalized.length > 0 ? normalized : undefined;
 }
 
 export type SystemPromptToolMetadataProjection =
@@ -452,9 +470,13 @@ export function projectSystemPromptToolMetadata(
 		const wireNameValue = override?.wireName ?? tool.customWireName;
 		const label = typeof labelValue === "string" ? labelValue : "";
 		const wireName = typeof wireNameValue === "string" ? wireNameValue : undefined;
+		const promptSnippet = normalizeToolPromptSnippet(
+			override?.promptSnippet ?? tool.promptSnippet ?? tool.summary ?? tool.description,
+		);
+		const promptGuidelines = normalizeToolPromptGuidelines(override?.promptGuidelines ?? tool.promptGuidelines);
 
 		if (projection.mode === "compact") {
-			metadata.set(name, { label, description: "", wireName });
+			metadata.set(name, { label, description: "", wireName, promptSnippet, promptGuidelines });
 			return;
 		}
 
@@ -465,6 +487,8 @@ export function projectSystemPromptToolMetadata(
 			parameters: tool.parameters,
 			examples: tool.examples,
 			wireName,
+			promptSnippet,
+			promptGuidelines,
 		});
 	};
 

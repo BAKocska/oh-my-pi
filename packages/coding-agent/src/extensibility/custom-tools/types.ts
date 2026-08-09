@@ -206,6 +206,10 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	strict?: boolean;
 	/** Description for LLM */
 	description: string;
+	/** Optional one-line snippet exposed for Pi-compatible prompt reconstruction while active. */
+	promptSnippet?: string;
+	/** Optional guideline bullets exposed for Pi-compatible prompt reconstruction while active. */
+	promptGuidelines?: string[];
 	/** Parameter schema (arktype, TypeBox, or legacy formats). */
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */

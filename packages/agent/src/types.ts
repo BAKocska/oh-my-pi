@@ -761,6 +761,10 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	loadMode?: ToolLoadMode;
 	/** Short one-line summary used for tool discovery indexes. */
 	summary?: string;
+	/** Optional one-line summary used by Pi-compatible system-prompt reconstruction. */
+	promptSnippet?: string;
+	/** Optional prompt guidelines included while this tool is active. */
+	promptGuidelines?: readonly string[];
 	/**
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)
