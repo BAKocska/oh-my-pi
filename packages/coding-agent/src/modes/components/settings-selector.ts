@@ -352,6 +352,7 @@ class ProviderLimitsSubmenu extends Container {
 
 	constructor(
 		private readonly providers: readonly string[],
+		private readonly getLimits: () => Record<string, number>,
 		private readonly onChange: (value: Record<string, number>) => void,
 		private readonly onCancel: () => void,
 		private readonly requestRender?: () => void,
@@ -361,7 +362,7 @@ class ProviderLimitsSubmenu extends Container {
 	}
 
 	#providerIds(): string[] {
-		const limits = normalizeProviderMaxInFlightRequests(settings.get("providers.maxInFlightRequests"));
+		const limits = this.getLimits();
 		return [...new Set([...this.providers, ...Object.keys(limits)])].sort((a, b) => a.localeCompare(b));
 	}
 
@@ -381,7 +382,7 @@ class ProviderLimitsSubmenu extends Container {
 		);
 		this.addChild(new Spacer(1));
 
-		const limits = normalizeProviderMaxInFlightRequests(settings.get("providers.maxInFlightRequests"));
+		const limits = this.getLimits();
 		const providerItems = this.#providerIds().map((provider): SelectItem => {
 			const limit = limits[provider];
 			return {
@@ -412,7 +413,7 @@ class ProviderLimitsSubmenu extends Container {
 	}
 
 	#showProviderEditor(provider: string): void {
-		const limits = normalizeProviderMaxInFlightRequests(settings.get("providers.maxInFlightRequests"));
+		const limits = this.getLimits();
 		this.clear();
 		this.#selectList = undefined;
 		this.addChild(
@@ -995,10 +996,20 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	/**
+	 * Value shown and edited for a setting in the active persistence scope:
+	 * the global-layer value (plus defaults) in global scope, or the merged
+	 * effective value in project scope. Reading the global layer directly keeps
+	 * a project override from masking the value a global-scope edit writes.
+	 */
+	#scopedValue(path: SettingPath): unknown {
+		return this.#scope === "global" ? settings.getGlobalValue(path) : settings.get(path);
+	}
+
+	/**
 	 * Get the current value for a setting.
 	 */
 	#getCurrentValue(def: SettingDef): unknown {
-		return settings.get(def.path);
+		return this.#scopedValue(def.path);
 	}
 
 	#isChanged(def: SettingDef, currentValue: unknown): boolean {
@@ -1138,7 +1149,7 @@ export class SettingsSelectorComponent implements Component {
 		return new TextInputSubmenu(
 			def.label,
 			def.description,
-			this.#formatTextInputEditValue(def.path, settings.get(def.path)),
+			this.#formatTextInputEditValue(def.path, this.#scopedValue(def.path)),
 			def.secret,
 			value => {
 				// Empty string clears the setting; undefined-typed string settings
@@ -1154,6 +1165,7 @@ export class SettingsSelectorComponent implements Component {
 	#createProviderLimitsInput(done: (value?: string) => void): Container {
 		return new ProviderLimitsSubmenu(
 			this.context.providers,
+			() => normalizeProviderMaxInFlightRequests(this.#scopedValue("providers.maxInFlightRequests")),
 			value => {
 				const effective = this.#persistSetting("providers.maxInFlightRequests", value);
 				this.callbacks.onChange("providers.maxInFlightRequests", effective);
@@ -1180,7 +1192,7 @@ export class SettingsSelectorComponent implements Component {
 			}
 		}
 
-		const current: unknown = settings.get(def.path);
+		const current: unknown = this.#scopedValue(def.path);
 		const initial = Array.isArray(current)
 			? current.filter((entry): entry is string => typeof entry === "string")
 			: [];
@@ -1194,7 +1206,7 @@ export class SettingsSelectorComponent implements Component {
 				const effective = this.#persistSetting(def.path, value);
 				this.callbacks.onChange(def.path, effective);
 			},
-			() => done(this.#formatMultiSelectValue(def, settings.get(def.path))),
+			() => done(this.#formatMultiSelectValue(def, this.#scopedValue(def.path))),
 		);
 	}
 
@@ -1217,11 +1229,13 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	/**
-	 * Persist a setting in the selected scope and return its recomputed effective value.
+	 * Persist a setting in the selected scope and return the value that scope
+	 * now resolves to, so callbacks and row summaries reflect the layer written
+	 * rather than a higher-precedence layer that may shadow it.
 	 */
 	#persistSetting(path: SettingPath, value: unknown): unknown {
 		settings.set(path, value as never, this.#scope);
-		return settings.get(path);
+		return this.#scopedValue(path);
 	}
 
 	/**
