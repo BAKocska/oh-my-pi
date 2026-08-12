@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/login together` always failing key validation: it probed the hardcoded non-serverless model `moonshotai/Kimi-K2.5` via chat-completions, which returns `400 model_not_available` even for a valid key. Together now validates against its `/v1/models` listing, matching other plan-varying providers ([#8328](https://github.com/can1357/oh-my-pi/issues/8328)).
+
 ## [17.2.15] - 2026-08-12
 
 ### Fixed
