@@ -29,6 +29,16 @@ const SUBSCRIPTION_CAP_PATTERN =
 	/\b(?:subscription|plan|membership)\b[^\n]{0,80}\b(?:rate.?limits?|quota|cap)\b|\b(?:rate.?limits?|quota|cap)\b[^\n]{0,80}\b(?:subscription|plan|membership)\b/i;
 const TRANSIENT_INTERVAL_RATE_LIMIT_PATTERN = /\bper\s+(?:second|minute)\b/i;
 
+/**
+ * Bailian (Alibaba Model Studio / DashScope compatible-mode) reports its
+ * transient per-minute token throttle (429 `Throttling.AllocationQuota`) using
+ * OpenAI's exact `insufficient_quota` billing wording, but embeds a link to its
+ * `error-code#token-limit` doc anchor. That anchor is the reliable
+ * discriminator: OpenAI's genuine account-quota error carries the same text
+ * without it, so the transient reclassification gates on the anchor alone.
+ */
+export const BAILIAN_TOKEN_THROTTLE_PATTERN = /error-code#token-limit/i;
+
 function matchesSubscriptionCapText(errorMessage: string): boolean {
 	return SUBSCRIPTION_CAP_PATTERN.test(errorMessage) && !TRANSIENT_INTERVAL_RATE_LIMIT_PATTERN.test(errorMessage);
 }
@@ -145,6 +155,13 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 	const lowerWithStatus = errorMessage.toLowerCase();
 	const lower = lowerWithStatus.replace(RESOURCE_EXHAUSTED_PATTERN, "");
 	const hasResourceExhaustedStatus = lower !== lowerWithStatus;
+
+	// Bailian's transient TPM/TPS throttle mimics OpenAI's `insufficient_quota`
+	// wording; its `error-code#token-limit` doc anchor keeps it a retryable rate
+	// limit instead of a 30-minute quota block.
+	if (BAILIAN_TOKEN_THROTTLE_PATTERN.test(errorMessage)) {
+		return "RATE_LIMIT_EXCEEDED";
+	}
 
 	// Antigravity / Cloud Code Assist surface multi-hour daily-quota exhaustion as
 	// "You have exhausted your capacity on this model. Your quota will reset after …".
@@ -340,6 +357,9 @@ export function isOpaqueStatusBody(message: string): boolean {
  * {@link isUsageLimitOutcome} uses it for the account-rotation decision.
  */
 export function matchesUsageLimitText(errorMessage: string): boolean {
+	// Bailian's transient TPM throttle carries `insufficient_quota` wording but is
+	// not a credential-rotatable usage cap (see BAILIAN_TOKEN_THROTTLE_PATTERN).
+	if (BAILIAN_TOKEN_THROTTLE_PATTERN.test(errorMessage)) return false;
 	const structuredReason = parseGoogleRpcRateLimitReason(errorMessage);
 	if (structuredReason !== undefined) return isQuotaExhaustedReason(structuredReason);
 	return (

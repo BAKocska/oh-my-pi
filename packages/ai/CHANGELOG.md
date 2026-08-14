@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Bailian (Alibaba Model Studio / DashScope compatible-mode) transient per-minute token throttles (HTTP 429 with OpenAI's `insufficient_quota` wording) being misclassified as persistent quota exhaustion, which blocked the credential for 30 minutes instead of retrying within the throttle's recovery window; the `error-code#token-limit` doc anchor now classifies these as retryable rate limits while OpenAI's genuine account-quota error (same wording, no anchor) stays a quota block ([#8496](https://github.com/can1357/oh-my-pi/issues/8496)).
+
 ## [17.3.2] - 2026-08-13
 
 ### Fixed

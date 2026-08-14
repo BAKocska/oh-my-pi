@@ -8,6 +8,7 @@ import {
 	STREAM_ENVELOPE_ERROR_PREFIX,
 } from "./classes";
 import {
+	BAILIAN_TOKEN_THROTTLE_PATTERN,
 	isAccountScopedCapText,
 	isOpaqueStatusBody,
 	isUsageLimitStatus,
@@ -431,7 +432,10 @@ export function classify(error: unknown, api?: Api): number {
 		} else if (link instanceof ProviderHttpError) {
 			let linkKinds = 0;
 			const { status: codeStatus, code } = link;
-			if (code === "usage_limit_reached" || code === "insufficient_quota") {
+			if (
+				code === "usage_limit_reached" ||
+				(code === "insufficient_quota" && !BAILIAN_TOKEN_THROTTLE_PATTERN.test(link.message))
+			) {
 				linkKinds |= Flag.UsageLimit;
 			}
 			if (code === "overloaded_error" || code === "rate_limit_error") {

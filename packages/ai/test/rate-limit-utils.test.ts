@@ -10,6 +10,14 @@ import {
 	parseRateLimitReason,
 } from "@oh-my-pi/pi-ai/error/rate-limit";
 
+// Bailian/DashScope transient TPM throttle: OpenAI `insufficient_quota` wording
+// with the `error-code#token-limit` doc anchor discriminator (issue #8496).
+const BAILIAN_THROTTLE_BODY =
+	"429 You exceeded your current quota, please check your plan and billing details. For details, see: https://help.aliyun.com/zh/model-studio/error-code#token-limit (type=insufficient_quota param=insufficient_quota)";
+// OpenAI's genuine account-quota error: identical wording, no aliyun anchor.
+const OPENAI_QUOTA_BODY =
+	"429 You exceeded your current quota, please check your plan and billing details. (type=insufficient_quota param=insufficient_quota)";
+
 function googleRpc429(reason: string, retryDelay?: string, message = "Resource exhausted"): string {
 	const details: Array<Record<string, string>> = [
 		{
@@ -242,6 +250,18 @@ describe("parseRateLimitReason", () => {
 		expect(parseRateLimitReason(body)).toBe("RATE_LIMIT_EXCEEDED");
 		expect(isUsageLimitOutcome(429, body)).toBe(false);
 	});
+
+	// Bailian/DashScope's transient TPM throttle reuses OpenAI's
+	// `insufficient_quota` wording; the `error-code#token-limit` doc anchor keeps
+	// it a retryable 30s rate limit instead of a 30-min quota block. OpenAI's
+	// genuine account quota (same wording, no anchor) must stay QUOTA_EXHAUSTED.
+	// Regression for #8496.
+	it("classifies Bailian TPM throttle as RATE_LIMIT_EXCEEDED via the doc anchor", () => {
+		expect(parseRateLimitReason(BAILIAN_THROTTLE_BODY)).toBe("RATE_LIMIT_EXCEEDED");
+		expect(calculateRateLimitBackoffMs(parseRateLimitReason(BAILIAN_THROTTLE_BODY))).toBe(30_000);
+		expect(parseRateLimitReason(OPENAI_QUOTA_BODY)).toBe("QUOTA_EXHAUSTED");
+		expect(calculateRateLimitBackoffMs(parseRateLimitReason(OPENAI_QUOTA_BODY))).toBe(30 * 60 * 1000);
+	});
 });
 
 describe("isUsageLimit", () => {
@@ -355,6 +375,19 @@ describe("isUsageLimit", () => {
 		expect(isUsageLimit(new ProviderHttpError("Generic provider failure", 429, { code: "rate_limit_error" }))).toBe(
 			false,
 		);
+	});
+
+	// Bailian's throttle carries the OpenAI `insufficient_quota` payload code but
+	// is transient — it must classify as a retryable rate limit (Flag.Transient),
+	// never a credential-rotatable usage cap. OpenAI's genuine `insufficient_quota`
+	// (no anchor) stays a usage limit. Regression for #8496.
+	it("treats Bailian insufficient_quota throttle as transient, not a usage limit", () => {
+		const bailian = new ProviderHttpError(BAILIAN_THROTTLE_BODY, 429, { code: "insufficient_quota" });
+		expect(isUsageLimit(bailian)).toBe(false);
+		expect(retriable(classify(bailian))).toBe(true);
+		expect(is(classify(bailian), Flag.Transient)).toBe(true);
+		const openai = new ProviderHttpError(OPENAI_QUOTA_BODY, 429, { code: "insufficient_quota" });
+		expect(isUsageLimit(openai)).toBe(true);
 	});
 });
 
@@ -567,6 +600,14 @@ describe("isUsageLimitOutcome", () => {
 		// 429 concurrency cap: shed-and-backoff, do not rotate.
 		expect(isUsageLimitOutcome(429, message)).toBe(false);
 		expect(isUsageLimit(Object.assign(new Error(message), { status: 429 }))).toBe(false);
+	});
+
+	// Bailian's transient TPM throttle must not burn/rotate the credential; the
+	// `error-code#token-limit` anchor keeps the 429 in the provider backoff lane.
+	// Regression for #8496.
+	it("does not rotate credentials on Bailian TPM throttle", () => {
+		expect(isUsageLimitOutcome(429, BAILIAN_THROTTLE_BODY)).toBe(false);
+		expect(isUsageLimitOutcome(429, OPENAI_QUOTA_BODY)).toBe(true);
 	});
 });
 
