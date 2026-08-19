@@ -30,7 +30,9 @@ use omp_proto::{
 	document::v1 as document, env::v1::InvokeTool, inference::v1 as inference, thread::v1 as thread,
 };
 use omp_storage::transcript::{Header, SessionId};
-use omp_tool::{PromptCaps, Registry, Rev, ToolIdentity, Verdict};
+use omp_tool::{
+	CallOutcome, CapsBase, Claims, ModelClass, Precedence, Presentation, Registry, Rev, ToolIdentity,
+};
 use omp_tools::edit::{self, FormatPolicy};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -98,7 +100,15 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 			rev:  Rev { family: Str::new_static("hl"), n: 1 },
 		};
 		let mut registry = Registry::new();
-		registry.register(edit::tool(direct_a.clone(), FormatPolicy::Configured))?;
+		registry.register(
+			edit::tool(direct_a.clone(), FormatPolicy::Configured),
+			Presentation::Slot,
+			Claims {
+				precedence: Precedence::CORE,
+				claimant:   Str::new_static("omp/core"),
+				replaces:   None,
+			},
+		)?;
 		let registry = Arc::new(registry);
 
 		let a1_args = edit_args("f.rs", initial_tag.as_str(), "PUT 2.=2:\n+    let value = 2;")?;
@@ -217,10 +227,11 @@ fn agent(
 	})?;
 	let mut snapshot = AgentSnapshot::new(Default::default(), Default::default(), registry);
 	snapshot.enabled_tools = Arc::from([Str::new_static("edit")]);
-	let agent = Agent::new(client, env, AgentState::new(snapshot), journal, PromptCaps {
+	let agent = Agent::new(client, env, AgentState::new(snapshot), journal, CapsBase {
 		maximum_parts:      16,
 		maximum_text_bytes: 128 * 1024,
 		media:              false,
+		model_class:        ModelClass::Standard,
 	});
 	let events = agent.events().subscribe_lossless();
 	Ok((agent, events))
@@ -256,10 +267,10 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 					"snapshot read failed: {}",
 					String::from_utf8_lossy(&verdict.json)
 				);
-				let verdict: Verdict<serde_json::Value, serde_json::Value> =
+				let outcome: CallOutcome<serde_json::Value, serde_json::Value> =
 					serde_json::from_slice(&verdict.json)?;
-				let Verdict::Ok(payload) = verdict else {
-					return Err(anyhow!("snapshot read returned a non-success verdict"));
+				let CallOutcome::Ok(payload) = outcome else {
+					return Err(anyhow!("snapshot read returned a non-success outcome"));
 				};
 				let header = payload["parts"][0]["text"]
 					.as_str()
@@ -361,12 +372,12 @@ async fn next_edit_payload(
 			let details = result
 				.details
 				.as_ref()
-				.ok_or_else(|| anyhow!("missing edit verdict"))?;
-			let verdict: Verdict<edit::Payload, edit::Fault> = serde_json::from_value(
-				proto_json(details).ok_or_else(|| anyhow!("invalid edit verdict"))?,
+				.ok_or_else(|| anyhow!("missing edit outcome"))?;
+			let outcome: CallOutcome<edit::Payload, edit::Fault> = serde_json::from_value(
+				proto_json(details).ok_or_else(|| anyhow!("invalid edit outcome"))?,
 			)?;
-			match verdict {
-				Verdict::Ok(mut payload) => {
+			match outcome {
+				CallOutcome::Ok(mut payload) => {
 					ensure!(
 						payload.sections.len() == 1,
 						"edit transaction should contain exactly one section"

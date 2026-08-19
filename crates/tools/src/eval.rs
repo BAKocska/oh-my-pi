@@ -24,7 +24,7 @@ use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, Outcome, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use parking_lot::Mutex;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -457,11 +457,19 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 		sessions: Mutex::new(HashMap::new()),
 		control: control.clone(),
 		spec: ToolSpec {
-			name:        Str::from("eval"),
-			rev:         Rev { family: Str::default(), n: 1 },
-			description: Str::from(EVAL_DESCRIPTION),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 100 },
+			name:            Str::from("eval"),
+			rev:             Rev { family: Str::default(), n: 1 },
+			description:     Str::from(EVAL_DESCRIPTION),
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("eval.rs"),
+			),
 		},
 	};
 	(tool, control)
@@ -498,7 +506,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				Some(0.0) => None,
 				Some(value) if value.is_finite() && value > 0.0 => Some(Duration::from_secs_f64(value)),
 				Some(_) => {
-					yield Ev::Done(Outcome::Done { result: Err(Fault::InvalidTimeout), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Err(Fault::InvalidTimeout), useless: false });
 					return;
 				},
 			};
@@ -520,7 +528,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			let session = match owned.session.get_or_try_init(|| self.exec.open_session()).await {
 				Ok(session) => session.clone(),
 				Err(fault) => {
-					yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 					return;
 				},
 			};
@@ -533,7 +541,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			}).await {
 				Ok(run) => run,
 				Err(fault) => {
-					yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 					return;
 				},
 			};
@@ -563,7 +571,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 								Err(InterruptWaitError::Protocol(reason)) => reason,
 							};
 							if let Err(fault) = run.cancel().await {
-								yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+								yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 								return;
 							}
 							cancellation_reason = Some(reason);
@@ -585,7 +593,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 					},
 					Ok(Some(RunEvent::Completed(done))) => {
 						let done = *done;
-						yield Ev::Done(Outcome::Done {
+						yield Ev::Done(ToolTerminal::Done {
 							result: Ok(Payload {
 								session_id: session.id,
 								cell_id,
@@ -613,7 +621,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 						return;
 					},
 					Err(fault) => {
-						yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+						yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 						return;
 					},
 				}

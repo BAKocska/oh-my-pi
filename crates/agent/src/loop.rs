@@ -14,7 +14,7 @@ use omp_proto::{
 	inference::v1::{self as pb, ContextRef, Outcome, ThreadDelta},
 	thread::v1::{self as thread, Item},
 };
-use omp_tool::{PromptCaps, Registry as ToolRegistry, ToolIdentity};
+use omp_tool::{CapsBase, Registry as ToolRegistry, ToolIdentity};
 use thiserror::Error;
 
 use crate::{
@@ -119,7 +119,7 @@ pub struct Agent<C: TurnClient> {
 	env:                EnvClient,
 	state:              AgentState,
 	journal:            Journal,
-	caps:               PromptCaps,
+	caps:               CapsBase,
 	events:             EventBus,
 	mailbox:            Mailbox,
 	jobs:               Arc<JobBoard>,
@@ -140,7 +140,7 @@ impl<C: TurnClient> Agent<C> {
 		env: EnvClient,
 		state: AgentState,
 		journal: Journal,
-		caps: PromptCaps,
+		caps: CapsBase,
 	) -> Self {
 		let mailbox = Mailbox::new();
 		let jobs = Arc::new(JobBoard::new(env.clone(), mailbox.sender()));
@@ -666,7 +666,7 @@ impl<C: TurnClient> Agent<C> {
 			.filter(|start| start.turn_id.as_str() == turn_id.as_str())
 			.cloned();
 		if let Some(start) = durable.as_ref() {
-			let current = snapshot.registry.live_hash();
+			let current = snapshot.registry.slot_hash();
 			if current != start.toolset_hash
 				|| start
 					.enabled_tools
@@ -689,7 +689,7 @@ impl<C: TurnClient> Agent<C> {
 			.map_or(pending, |start| start.item_events.clone());
 		let toolset_hash = durable
 			.as_ref()
-			.map_or_else(|| snapshot.registry.live_hash(), |start| start.toolset_hash);
+			.map_or_else(|| snapshot.registry.slot_hash(), |start| start.toolset_hash);
 		let changed_toolset = durable.is_none()
 			&& self
 				.last_toolset_hash
@@ -1281,7 +1281,7 @@ mod tests {
 	use bytes::Bytes;
 	use futures::stream;
 	use omp_storage::transcript::{Entry, Header, Kind, SessionId};
-	use omp_tool::{Constraint, Rev, ToolSpec};
+	use omp_tool::{Claims, Constraint, ModelClass, Precedence, Presentation, Rev, ToolSpec};
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -1437,8 +1437,13 @@ mod tests {
 		(journal, path)
 	}
 
-	fn test_caps() -> PromptCaps {
-		PromptCaps { maximum_parts: 16, maximum_text_bytes: 16_384, media: false }
+	fn test_caps() -> CapsBase {
+		CapsBase {
+			maximum_parts:      16,
+			maximum_text_bytes: 16_384,
+			media:              false,
+			model_class:        ModelClass::Standard,
+		}
 	}
 
 	async fn wait_for_opened(
@@ -1475,11 +1480,20 @@ mod tests {
 
 	fn worker(name: &str) -> ToolSpec {
 		ToolSpec {
-			name:        Str::from(name),
-			rev:         Rev { family: Str::from("test"), n: 1 },
-			description: Str::from("test worker"),
-			schema:      Bytes::from_static(br#"{"type":"object"}"#),
-			constraint:  Constraint::None,
+			name:            Str::from(name),
+			rev:             Rev { family: Str::from("test"), n: 1 },
+			description:     Str::from("test worker"),
+			schema:          Bytes::from_static(br#"{"type":"object"}"#),
+			constraint:      Constraint::None,
+			projection_code: [0; 32],
+		}
+	}
+
+	fn worker_claims() -> Claims {
+		Claims {
+			precedence: Precedence::DEFAULT,
+			claimant:   Str::new_static("test/worker"),
+			replaces:   None,
 		}
 	}
 
@@ -1487,10 +1501,10 @@ mod tests {
 	async fn resumed_turn_freezes_durable_allowlist_then_fresh_turn_uses_snapshot() {
 		let mut registry = ToolRegistry::new();
 		registry
-			.register_worker(worker("old"))
+			.register_worker(worker("old"), Presentation::Device, worker_claims())
 			.expect("register old");
 		registry
-			.register_worker(worker("new"))
+			.register_worker(worker("new"), Presentation::Device, worker_claims())
 			.expect("register new");
 		let registry = Arc::new(registry);
 
@@ -1524,7 +1538,7 @@ mod tests {
 				item_events:        Vec::new(),
 				prompt_hash:        [7; 32],
 				prompt_head_events: Vec::new(),
-				toolset_hash:       registry.live_hash(),
+				toolset_hash:       registry.slot_hash(),
 				enabled_tools:      vec![Str::from("old")],
 				sequence_targets:   Vec::new(),
 				input:              TurnInputRecord::Full { thread: durable_input.clone() },
@@ -1552,11 +1566,7 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(client, env, state, journal, PromptCaps {
-			maximum_parts:      16,
-			maximum_text_bytes: 16_384,
-			media:              false,
-		});
+		let mut agent = Agent::new(client, env, state, journal, test_caps());
 
 		let (_, _, _, _, resumed_tools) = agent
 			.run_turn(TurnId::new("durable-turn"), Vec::new())
@@ -1705,7 +1715,7 @@ mod tests {
 			ToolIdentity { name: Str::from("pending"), rev: Rev { family: Str::from("test"), n: 1 } };
 		let mut registry = ToolRegistry::new();
 		registry
-			.register_worker(worker(identity.name.as_str()))
+			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
 			.expect("register pending tool");
 		let registry = Arc::new(registry);
 		let state = AgentState::new(crate::AgentSnapshot {

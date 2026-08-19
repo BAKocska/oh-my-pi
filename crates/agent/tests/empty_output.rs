@@ -22,7 +22,7 @@ use omp_proto::{
 	thread::v1::{self as thread, Item},
 };
 use omp_storage::transcript::{Header, SessionId};
-use omp_tool::PromptCaps;
+use omp_tool::{CapsBase, ModelClass};
 use parking_lot::Mutex;
 
 const RETRY_TEXT: &str = "<system-injection>\nStopped without actionable output; task incomplete. \
@@ -183,10 +183,11 @@ fn build_agent(
 		ScriptedClient { script: Arc::new(Mutex::new(script.into())), opened: Arc::clone(&opened) };
 	let (env, _transport) = EnvClient::in_process(1);
 	let agent =
-		Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, PromptCaps {
+		Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, CapsBase {
 			maximum_parts:      16,
 			maximum_text_bytes: 16_384,
 			media:              false,
+			model_class:        ModelClass::Standard,
 		});
 	(agent, opened)
 }
@@ -612,10 +613,11 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 	let client = CrashClient { opened: opened_tx, calls: Arc::new(AtomicUsize::new(0)) };
 	let (env, _transport) = EnvClient::in_process(1);
 	let mut first_agent =
-		Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, PromptCaps {
+		Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, CapsBase {
 			maximum_parts:      16,
 			maximum_text_bytes: 16_384,
 			media:              false,
+			model_class:        ModelClass::Standard,
 		});
 	let running = tokio::spawn(async move {
 		first_agent

@@ -7,8 +7,8 @@ use bytes::Bytes;
 use futures::{FutureExt as _, Stream, pin_mut, select_biased};
 use omp_core::Str;
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams, Outcome,
-	ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams, ParamError,
+	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -327,11 +327,19 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(sources: S, blobs: B) -> ReadTool<S, B
 		sources,
 		blobs,
 		spec: ToolSpec {
-			name:        Str::new_static("read"),
-			rev:         Rev { family: Str::new_static(""), n: 1 },
-			description: Str::new_static(DESCRIPTION),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 10 },
+			name:            Str::new_static("read"),
+			rev:             Rev { family: Str::new_static(""), n: 1 },
+			description:     Str::new_static(DESCRIPTION),
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       10,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("read.rs"),
+			),
 		},
 	}
 }
@@ -1267,7 +1275,7 @@ fn push_payload_part(parts: &mut Vec<PayloadPart>, part: PayloadPart) {
 }
 
 const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
-	Ev::Done(Outcome::Done { result, useless: false })
+	Ev::Done(ToolTerminal::Done { result, useless: false })
 }
 
 const fn args_issue() -> ArgIssue {

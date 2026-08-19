@@ -21,7 +21,8 @@ use omp_proto::{
 	prost::Message as _,
 };
 use omp_tool::{
-	ErasedEv, ErasedOutcome, IncomingParams, Interrupt, Registry, RegistryError, ToolRoute,
+	CallOutcome, ErasedEv, ErasedOutcome, IncomingParams, Interrupt, Registry, RegistryError,
+	ToolRoute, ToolTerminal,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -1115,6 +1116,15 @@ impl EnvServer {
 				Err(error) => send_blob_error(responses, frame.request_id, &error).await,
 			},
 			client_frame::Body::Cancel(_) => unreachable!("cancel handled before ordinary dispatch"),
+			_ => {
+				send_error(
+					responses,
+					frame.request_id,
+					pb::ProtocolErrorCode::Unsupported,
+					"client frame operation is not supported by this environment",
+				)
+				.await;
+			},
 		}
 	}
 
@@ -2246,7 +2256,7 @@ async fn send_abort_verdict(
 	invocation_id: &Str,
 	abort: omp_tool::Abort,
 ) {
-	let verdict = omp_tool::Verdict::<serde_json::Value, serde_json::Value>::Aborted(abort);
+	let verdict = CallOutcome::<serde_json::Value, serde_json::Value>::aborted(abort);
 	let Ok(json) = serde_json::to_vec(&verdict) else {
 		let _ = send_invocation_stream_error(
 			responses,
@@ -2469,7 +2479,7 @@ fn spawn_blob_get(
 fn worker_verdict_json(details: Bytes, is_error: bool) -> Result<Bytes, serde_json::Error> {
 	let _: &serde_json::value::RawValue = serde_json::from_slice(&details)?;
 	let prefix: &[u8] = if is_error {
-		br#"{"kind":"fault","value":"#
+		br#"{"kind":"faulted","value":"#
 	} else {
 		br#"{"kind":"ok","value":"#
 	};
@@ -2483,15 +2493,14 @@ fn worker_verdict_json(details: Bytes, is_error: bool) -> Result<Bytes, serde_js
 fn erased_outcome_wire(outcome: ErasedOutcome) -> (Bytes, bool, bool) {
 	match outcome {
 		ErasedOutcome::Done { verdict, useless } => {
-			let is_error = serde_json::from_slice::<
-				omp_tool::Verdict<serde_json::Value, serde_json::Value>,
-			>(&verdict)
-			.map_or(true, |verdict| !matches!(verdict, omp_tool::Verdict::Ok(_)));
+			let is_error =
+				serde_json::from_slice::<CallOutcome<serde_json::Value, serde_json::Value>>(&verdict)
+					.map_or(true, |verdict| !matches!(verdict, CallOutcome::Ok(_)));
 			(verdict, is_error, useless)
 		},
 		ErasedOutcome::Detached(job) => {
 			let json = serde_json::to_vec(
-				&omp_tool::Outcome::<serde_json::Value, serde_json::Value>::Detached(job),
+				&ToolTerminal::<serde_json::Value, serde_json::Value>::Detached(job),
 			)
 			.map(Bytes::from)
 			.unwrap_or_default();

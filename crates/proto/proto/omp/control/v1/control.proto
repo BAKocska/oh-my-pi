@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+package omp.control.v1;
+
+import "omp/inference/v1/common.proto";
+import "omp/thread/v1/thread.proto";
+
+// Typed spawn refusal; refusals are never encoded only as prose.
+enum SpawnRefusal {
+  SPAWN_REFUSAL_UNSPECIFIED = 0;
+  SPAWN_REFUSAL_INVALID_SPEC = 1;
+  SPAWN_REFUSAL_UNKNOWN_AGENT = 2;
+  SPAWN_REFUSAL_DEPTH_EXCEEDED = 3;
+  SPAWN_REFUSAL_CONCURRENCY = 4;
+  SPAWN_REFUSAL_POLICY = 5;
+  SPAWN_REFUSAL_MINIMUM_PHASE = 6;
+  SPAWN_REFUSAL_PATH_ESCAPE = 7;
+}
+
+// Wire mirror of omp_core::InvocationPhase. OPEN is intentionally zero so the
+// default value means the earliest phase rather than an invented eighth state.
+enum InvocationPhase {
+  INVOCATION_PHASE_OPEN = 0;
+  INVOCATION_PHASE_ARGS_FINALIZED = 1;
+  INVOCATION_PHASE_ADMISSION = 2;
+  INVOCATION_PHASE_ADMITTED = 3;
+  INVOCATION_PHASE_ASSISTANT_ITEM_COMMITTED = 4;
+  INVOCATION_PHASE_EFFECTS_AUTHORIZED = 5;
+  INVOCATION_PHASE_SETTLED = 6;
+}
+
+enum Isolation {
+  ISOLATION_UNSPECIFIED = 0;
+  ISOLATION_CLEAN = 1;
+  ISOLATION_FORK = 2;
+  ISOLATION_FILTERED = 3;
+}
+
+enum Boundary {
+  BOUNDARY_UNSPECIFIED = 0;
+  BOUNDARY_IMMEDIATE = 1;
+  BOUNDARY_TURN = 2;
+  BOUNDARY_IDLE = 3;
+}
+
+message Budget {
+  optional uint64 tokens = 1;
+  optional uint64 cost_nanos_usd = 2;
+  optional uint64 wall_ms = 3;
+  optional uint32 turns = 4;
+  optional uint32 descendants = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SubagentSpec {
+  string task = 1;
+  string name = 2;
+  string agent = 3;
+  string system_prompt = 4;
+  string model = 5;
+  string thinking = 6;
+  repeated string allowed_devices = 7;
+  repeated string disallowed_devices = 8;
+  Isolation isolation = 9;
+  uint32 max_depth = 10;
+  string cwd_uri = 11;
+  bool worktree = 12;
+  string merge = 13;
+  map<string, string> env_vars = 14;
+  omp.inference.v1.ValueMap props = 15;
+  bool background = 16;
+  bytes output_schema_json = 17;
+  string schema_mode = 18;
+  uint64 deadline_ms = 19;
+  uint32 request_budget = 20;
+  map<string, string> labels = 21;
+  Budget budget = 22;
+  string on_model_unavailable = 23;
+}
+
+message SpawnAgent {
+  uint64 request_id = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  SubagentSpec spec = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message AgentHandleMsg {
+  string id = 1;
+  string name = 2;
+  string session = 3;
+  uint64 generation = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message AgentRefMsg {
+  string ref = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message CancelAgent {
+  string ref = 1;
+  string reason = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message AgentQuery {
+  optional string ref = 1;
+  bool include_settled = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message AgentResultMsg {
+  AgentHandleMsg agent = 1;
+  string status = 2;
+  repeated omp.thread.v1.Part parts = 3;
+  optional string error = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message UsageMsg {
+  omp.inference.v1.Usage usage = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ReviveAgent {
+  string ref = 1;
+  optional string message = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SpawnLimitsMsg {
+  uint32 maximum_depth = 1;
+  uint32 maximum_concurrent = 2;
+  uint32 active = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SteerAgent {
+  string ref = 1;
+  omp.thread.v1.Item item = 2;
+  Boundary boundary = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+enum ContinuationVerdict {
+  CONTINUATION_VERDICT_UNSPECIFIED = 0;
+  CONTINUATION_VERDICT_SETTLE = 1;
+  CONTINUATION_VERDICT_CONTINUE = 2;
+  CONTINUATION_VERDICT_REFUSED = 3;
+}
+
+message ContinuationLedgerMsg {
+  string submission_id = 1;
+  uint32 used = 2;
+  uint32 maximum = 3;
+  uint32 subtree_used = 4;
+  ContinuationVerdict verdict = 5;
+  optional string reason = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message LoopSignalMsg {
+  string source = 1;
+  Boundary boundary = 2;
+  optional omp.thread.v1.Item item = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ScheduleUpsert {
+  uint64 request_id = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  string schedule_id = 5;
+  string expression = 6;
+  optional omp.thread.v1.Item item = 7;
+  optional SubagentSpec agent = 8;
+  Budget budget = 9;
+  bool enabled = 10;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ScheduleQuery {
+  optional string schedule_id = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ScheduleMsg {
+  string schedule_id = 1;
+  string expression = 2;
+  bool enabled = 3;
+  optional uint64 next_fire_ms = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ScheduleBudgetMsg {
+  string schedule_id = 1;
+  Budget remaining = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message FiringMsg {
+  string schedule_id = 1;
+  uint64 fired_at_ms = 2;
+  uint32 missed = 3;
+  bool upgrade = 4;
+  string principal = 5;
+  bytes artifact_digest = 6;
+  string idempotency_key = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SendMessage {
+  uint64 request_id = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  string to = 5;
+  omp.thread.v1.Item item = 6;
+  Boundary boundary = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ReceiptMsg {
+  string message_id = 1;
+  string recipient = 2;
+  string status = 3;
+  optional string error = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message MessageMsg {
+  string message_id = 1;
+  string sender = 2;
+  omp.thread.v1.Item item = 3;
+  uint64 received_at_ms = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message InboxDrain {
+  optional uint32 limit = 1;
+  bool peek = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message RewindRequest {
+  uint64 request_id = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  uint64 to_event = 5;
+  bool restore_workspace = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message RewindReportMsg {
+  uint64 from_event = 1;
+  uint64 to_event = 2;
+  uint32 entries_dropped = 3;
+  optional string workspace_snapshot = 4;
+  repeated string conflicts = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ControlRequest {
+  oneof body {
+    SpawnAgent spawn_agent = 1;
+    CancelAgent cancel_agent = 2;
+    AgentQuery query_agent = 3;
+    SteerAgent steer_agent = 4;
+    ReviveAgent revive_agent = 5;
+    ScheduleUpsert schedule_upsert = 6;
+    ScheduleQuery schedule_query = 7;
+    SendMessage send_message = 8;
+    InboxDrain inbox_drain = 9;
+    RewindRequest rewind = 10;
+  }
+  InvocationPhase invocation_phase = 14;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ControlResponse {
+  oneof body {
+    AgentHandleMsg agent_handle = 1;
+    AgentResultMsg agent_result = 2;
+    UsageMsg usage = 3;
+    SpawnLimitsMsg spawn_limits = 4;
+    ScheduleMsg schedule = 5;
+    ScheduleBudgetMsg schedule_budget = 6;
+    ReceiptMsg receipt = 7;
+    MessageMsg message = 8;
+    RewindReportMsg rewind_report = 9;
+    SpawnRefusal spawn_refusal = 10;
+  }
+  optional string error = 11;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ControlEvent {
+  oneof body {
+    AgentResultMsg agent_result = 1;
+    ContinuationLedgerMsg continuation = 2;
+    LoopSignalMsg loop_signal = 3;
+    FiringMsg firing = 4;
+    ReceiptMsg receipt = 5;
+    MessageMsg message = 6;
+    SpawnLimitsMsg spawn_limits = 7;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}

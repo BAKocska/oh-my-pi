@@ -7,7 +7,7 @@ use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::Str;
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, Outcome, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -230,9 +230,9 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 		workspace,
 		blobs,
 		spec: ToolSpec {
-			name:        Str::from("glob"),
-			rev:         Rev { family: Str::new(""), n: 1 },
-			description: Str::from(
+			name:            Str::from("glob"),
+			rev:             Rev { family: Str::new(""), n: 1 },
+			description:     Str::from(
 				"Globs files and directories with fast pattern matching.\n\n<instruction>\n- `path`: \
 				 glob, file, or directory; separate targets with `;` (`src/**/*.ts; \
 				 test/**/*.ts`).\n- `gitignore` defaults `true`. Set `false` for ignored files such \
@@ -240,8 +240,16 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 				 `gitignore: false` for ignored dotfiles.\n</instruction>\n\n<output>\nMatches are \
 				 newest-first and grouped by directory; directories end in `/`.\n</output>",
 			),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 100 },
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("glob.rs"),
+			),
 		},
 	}
 }
@@ -498,7 +506,7 @@ fn timeout_notice(payload: &Payload) -> String {
 
 const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	let useless = matches!(&result, Ok(payload) if payload.matches.is_empty() && !payload.timed_out);
-	Ev::Done(Outcome::Done { result, useless })
+	Ev::Done(ToolTerminal::Done { result, useless })
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

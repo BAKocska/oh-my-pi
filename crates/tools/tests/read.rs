@@ -15,7 +15,10 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_core::Str;
-use omp_tool::{Abort, BlobRef, Ev, IncomingParams, Interrupt, Outcome, Part, PromptCaps, Tool};
+use omp_tool::{
+	Abort, BlobRef, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part, PromptCaps, Tool,
+	ToolTerminal,
+};
 use omp_tools::read::{
 	self, DirectoryEntry, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord,
 	SourceKind, SourceStat,
@@ -239,14 +242,21 @@ async fn project(sources: Sources, blobs: Blobs, raw: &str, media: bool) -> Vec<
 		.args_committed(Str::from(raw))
 		.expect("read invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
-	let [Ev::Done(Outcome::Done { result, .. })] = events.as_slice() else {
+	let [Ev::Done(ToolTerminal::Done { result, .. })] = events.as_slice() else {
 		panic!("expected one terminal read event: {events:?}");
 	};
-	tool.prompt(result.as_ref(), &PromptCaps {
-		maximum_parts: 16,
-		maximum_text_bytes: u32::MAX,
-		media,
-	})
+	tool.prompt(
+		result.as_ref(),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts: 16,
+				maximum_text_bytes: u32::MAX,
+				media,
+				model_class: ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		),
+	)
 }
 
 async fn text(sources: Sources, raw: &str) -> String {

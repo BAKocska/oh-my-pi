@@ -47,14 +47,18 @@ use omp_llm_inference::{
 	session::{ConversationSessionPlanner, TurnReplay},
 };
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
-use omp_tool::{LoweringCaps, PromptCaps, Registry as ToolRegistry, TOOL_REV_PROP};
+use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry as ToolRegistry, TOOL_REV_PROP};
 use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
 // env/v1/turn carries no per-model projection caps; this bounded text-only
 // fallback is valid for every transport and never silently exposes media.
-const RPC_HISTORY_PROMPT_CAPS: PromptCaps =
-	PromptCaps { maximum_parts: 1, maximum_text_bytes: 64 * 1024, media: false };
+const RPC_HISTORY_CAPS_BASE: CapsBase = CapsBase {
+	maximum_parts:      1,
+	maximum_text_bytes: 64 * 1024,
+	media:              false,
+	model_class:        ModelClass::Standard,
+};
 
 /// Stream returned by RPC methods whose typed operation produces events.
 pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -290,7 +294,7 @@ impl InferenceRpc {
 					.as_ref()
 					.ok_or_else(|| Status::invalid_argument("Seed.thread is required"))?;
 				let projected =
-					project_thread_history(thread, &self.tool_registry, &RPC_HISTORY_PROMPT_CAPS)
+					project_thread_history(thread, &self.tool_registry, &RPC_HISTORY_CAPS_BASE)
 						.map_err(|error| Status::invalid_argument(error.to_string()))?;
 				let messages = thread_messages(&projected)?;
 				if seed.context_id.is_empty() {
@@ -361,7 +365,7 @@ impl InferenceRpc {
 				let projected = project_thread_history(
 					&thread_pb::Thread { items: delta.append.clone() },
 					&self.tool_registry,
-					&RPC_HISTORY_PROMPT_CAPS,
+					&RPC_HISTORY_CAPS_BASE,
 				)
 				.map_err(|error| Status::invalid_argument(error.to_string()))?;
 				let appended = thread_messages(&projected)?;
@@ -1600,7 +1604,7 @@ pub fn project_provider_turn_for_test(
 	params: &pb::ChatParams,
 	tool_registry: &ToolRegistry,
 ) -> Result<(thread_pb::Thread, omp_llm_inference::call::ChatRequest), Status> {
-	let projected = project_thread_history(thread, tool_registry, &RPC_HISTORY_PROMPT_CAPS)
+	let projected = project_thread_history(thread, tool_registry, &RPC_HISTORY_CAPS_BASE)
 		.map_err(|error| Status::invalid_argument(error.to_string()))?;
 	let request = chat_request(thread_messages(&projected)?, params, tool_registry)?;
 	Ok((projected, request))
@@ -1769,6 +1773,7 @@ fn chat_request(
 	} else {
 		tool_registry
 			.advertise(LoweringCaps { strict_schema: false, grammar: GrammarBits::empty() })
+			.map_err(|error| Status::failed_precondition(error.to_string()))?
 			.into_iter()
 			.filter(|tool| {
 				params

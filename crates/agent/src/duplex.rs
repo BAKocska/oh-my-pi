@@ -8,7 +8,7 @@ use omp_proto::{
 	inference::v1::{ExecStatus, Invoke, InvokeComplete, exec_status},
 	thread::v1::item,
 };
-use omp_tool::{PromptCaps, Registry, RegistryError, ToolIdentity};
+use omp_tool::{CapsBase, Registry, RegistryError, ToolIdentity};
 use tokio::sync::watch;
 
 use crate::{
@@ -74,7 +74,7 @@ pub struct DuplexManager {
 	env:             EnvClient,
 	registry:        Arc<Registry>,
 	events:          EventBus,
-	caps:            PromptCaps,
+	caps:            CapsBase,
 	interrupt_grace: Duration,
 	active:          HashMap<String, ActiveInvocation>,
 	completion_tx:   flume::Sender<Completion>,
@@ -88,7 +88,7 @@ impl DuplexManager {
 		env: EnvClient,
 		registry: Arc<Registry>,
 		events: EventBus,
-		caps: PromptCaps,
+		caps: CapsBase,
 		interrupt_grace: Duration,
 	) -> Self {
 		let (completion_tx, completion_rx) = flume::unbounded();
@@ -194,7 +194,7 @@ async fn run_invocation(
 	env: EnvClient,
 	registry: Arc<Registry>,
 	events: EventBus,
-	caps: PromptCaps,
+	caps: CapsBase,
 	interrupt: watch::Receiver<Option<Str>>,
 	grace: Duration,
 	frames: flume::Sender<Completion>,

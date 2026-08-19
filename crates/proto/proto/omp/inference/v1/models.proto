@@ -104,6 +104,8 @@ message ModelCard {
     SOURCE_DISCOVERED = 2;
     // User/project config.
     SOURCE_CONFIGURED = 3;
+    // Extension-contributed catalog declaration.
+    SOURCE_EXTENSION = 4;
   }
   // Extra catalog metadata that clients do not understand yet (or do not
   // care about) under namespaced keys. Integers remain exact for limits and

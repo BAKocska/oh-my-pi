@@ -11,7 +11,8 @@ use omp_proto::{
 	thread::v1::{Item, Part as CanonicalPart},
 };
 use omp_tool::{
-	Abort, ArgIssue, ArgPath, JobRef, Outcome, Part, PromptCaps, Registry, ToolIdentity, Verdict,
+	Abort, ArgIssue, ArgPath, CallOutcome, CapsBase, JobRef, Part, PromptCaps, Registry,
+	ToolIdentity, ToolTerminal,
 };
 use serde_json::Value;
 use tokio::sync::watch;
@@ -27,7 +28,7 @@ pub enum BatchError {
 	/// The environment channel rejected an operation.
 	Environment(Box<ClientError>),
 	/// A terminal environment payload was not a supported structured outcome.
-	InvalidVerdict(serde_json::Error),
+	InvalidOutcome(serde_json::Error),
 	/// Canonical result construction failed.
 	Projection(Str),
 }
@@ -36,7 +37,7 @@ impl fmt::Display for BatchError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Environment(error) => write!(formatter, "environment invocation failed: {error}"),
-			Self::InvalidVerdict(error) => write!(formatter, "invalid tool verdict: {error}"),
+			Self::InvalidOutcome(error) => write!(formatter, "invalid tool outcome: {error}"),
 			Self::Projection(error) => write!(formatter, "canonical tool result failed: {error}"),
 		}
 	}
@@ -46,7 +47,7 @@ impl std::error::Error for BatchError {
 	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
 		match self {
 			Self::Environment(error) => Some(error.as_ref()),
-			Self::InvalidVerdict(error) => Some(error),
+			Self::InvalidOutcome(error) => Some(error),
 			Self::Projection(_) => None,
 		}
 	}
@@ -508,7 +509,7 @@ impl ToolBatch {
 	/// Results remain in issued order. Once a call is authorized, environment
 	/// or lowering failures become canonical `EffectsUnknown` results so every
 	/// committed call remains journalable and peer truth is never discarded.
-	pub async fn drive(self, registry: &Registry, caps: &PromptCaps) -> Vec<BatchResult> {
+	pub async fn drive(self, registry: &Registry, caps: &CapsBase) -> Vec<BatchResult> {
 		self
 			.drive_inner(registry, caps, None, Duration::ZERO, None)
 			.await
@@ -518,7 +519,7 @@ impl ToolBatch {
 	pub async fn drive_interruptible(
 		self,
 		registry: &Registry,
-		caps: &PromptCaps,
+		caps: &CapsBase,
 		interrupt: watch::Receiver<Option<Str>>,
 		grace: Duration,
 	) -> Vec<BatchResult> {
@@ -531,7 +532,7 @@ impl ToolBatch {
 	pub(crate) async fn drive_streaming(
 		self,
 		registry: &Registry,
-		caps: &PromptCaps,
+		caps: &CapsBase,
 		interrupt: watch::Receiver<Option<Str>>,
 		grace: Duration,
 		updates: flume::Sender<BatchUpdate>,
@@ -544,7 +545,7 @@ impl ToolBatch {
 	async fn drive_inner(
 		self,
 		registry: &Registry,
-		caps: &PromptCaps,
+		caps: &CapsBase,
 		mut interrupt: Option<watch::Receiver<Option<Str>>>,
 		grace: Duration,
 		updates: Option<flume::Sender<BatchUpdate>>,
@@ -588,7 +589,7 @@ async fn run_call(
 	index: usize,
 	call: CommittedCall,
 	registry: &Registry,
-	caps: &PromptCaps,
+	caps: &CapsBase,
 	interrupt: flume::Receiver<InterruptRequest>,
 	grace: Duration,
 	updates: Option<flume::Sender<BatchUpdate>>,
@@ -798,22 +799,25 @@ async fn wait_for_interrupt(receiver: &mut watch::Receiver<Option<Str>>) -> Str 
 fn lower_verdict(
 	call: &CommittedCall,
 	registry: &Registry,
-	caps: PromptCaps,
+	caps: CapsBase,
 	wire: omp_proto::env::v1::Verdict,
 ) -> Result<BatchResult, BatchError> {
-	if let Ok(Outcome::Detached(job)) = serde_json::from_slice::<Outcome<Value, Value>>(&wire.json) {
+	if let Ok(ToolTerminal::Detached(job)) =
+		serde_json::from_slice::<ToolTerminal<Value, Value>>(&wire.json)
+	{
 		return lower_detached(call, wire.json, job);
 	}
 
-	let verdict = serde_json::from_slice::<Verdict<Value, Value>>(&wire.json)
-		.map_err(BatchError::InvalidVerdict)?;
-	let is_error = !matches!(verdict, Verdict::Ok(_));
-	if let Some(parts) = harness_parts(&verdict) {
+	let outcome = serde_json::from_slice::<CallOutcome<Value, Value>>(&wire.json)
+		.map_err(BatchError::InvalidOutcome)?;
+	let is_error = !matches!(outcome, CallOutcome::Ok(_));
+	if let Some(parts) = harness_parts(&outcome) {
 		return lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts);
 	}
+	let caps = PromptCaps::for_tool(caps, &call.identity.rev);
 	match registry.prompt(&call.identity, &wire.json, &caps) {
 		Ok(Some(parts)) => lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts),
-		Ok(None) => unreachable!("harness verdict branches were handled before registry projection"),
+		Ok(None) => unreachable!("harness outcome branches were handled before registry projection"),
 		Err(_) => lower_canonical_parts(call, &wire.json, is_error, wire.useless, wire.parts),
 	}
 }
@@ -834,9 +838,9 @@ fn lower_detached(
 }
 
 fn lower_abort(call: &CommittedCall, abort: Abort) -> Result<BatchResult, BatchError> {
-	let verdict = Verdict::<Value, Value>::Aborted(abort);
-	let raw = Bytes::from(serde_json::to_vec(&verdict).map_err(BatchError::InvalidVerdict)?);
-	let parts = harness_parts(&verdict).expect("aborted verdict always uses the harness renderer");
+	let outcome = CallOutcome::<Value, Value>::aborted(abort);
+	let raw = Bytes::from(serde_json::to_vec(&outcome).map_err(BatchError::InvalidOutcome)?);
+	let parts = harness_parts(&outcome).expect("aborted outcome always uses the harness renderer");
 	lower_tool_parts(call, &raw, true, false, &parts)
 }
 
@@ -883,11 +887,11 @@ fn finish_event(call: &CommittedCall, item: Item) -> Arc<AgentEvent> {
 		.publish(AgentEvent::ToolFinished { call_id: call.call_id.clone(), item })
 }
 
-fn harness_parts(verdict: &Verdict<Value, Value>) -> Option<Vec<Part>> {
-	let text = match verdict {
-		Verdict::Args(issue) => render_arg_issue(issue),
-		Verdict::Aborted(abort) => render_abort(abort),
-		Verdict::Ok(_) | Verdict::Fault(_) => return None,
+fn harness_parts(outcome: &CallOutcome<Value, Value>) -> Option<Vec<Part>> {
+	let text = match outcome {
+		CallOutcome::ArgsRejected(issue) => render_arg_issue(issue),
+		CallOutcome::Aborted { abort, .. } => render_abort(abort),
+		CallOutcome::Ok(_) | CallOutcome::Faulted(_) => return None,
 	};
 	Some(vec![Part::Text { text }])
 }
@@ -943,7 +947,7 @@ mod tests {
 
 	use omp_env::frame::{self, client_frame, server_frame};
 	use omp_proto::thread::v1::{Part as ThreadPart, part};
-	use omp_tool::Rev;
+	use omp_tool::{ModelClass, Rev};
 
 	use super::*;
 
@@ -954,8 +958,13 @@ mod tests {
 		}
 	}
 
-	fn caps() -> PromptCaps {
-		PromptCaps { maximum_parts: 8, maximum_text_bytes: 4096, media: false }
+	fn caps() -> CapsBase {
+		CapsBase {
+			maximum_parts:      8,
+			maximum_text_bytes: 4096,
+			media:              false,
+			model_class:        ModelClass::Standard,
+		}
 	}
 
 	fn terminal_text(result: &BatchResult) -> &str {

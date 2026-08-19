@@ -18,7 +18,7 @@ use omp_hashline::{
 };
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, Outcome, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -355,11 +355,19 @@ pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> Edit
 		documents,
 		format_policy,
 		spec: ToolSpec {
-			name:        "edit".into(),
-			rev:         Rev { family: "hl".into(), n: 1 },
-			description: DESCRIPTION.into(),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 100 },
+			name:            "edit".into(),
+			rev:             Rev { family: "hl".into(), n: 1 },
+			description:     DESCRIPTION.into(),
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("edit.rs"),
+			),
 		},
 	}
 }
@@ -541,7 +549,7 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					yield done_fault(Fault::invalid(noop.diagnostic));
 				} else {
 					let payload = build_payload(&parsed_sections, &projections, None);
-					yield Ev::Done(Outcome::Done { result: Ok(payload), useless: true });
+					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: true });
 				}
 				return;
 			}
@@ -581,7 +589,7 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 						self.documents.reset_noop(work.prepared.path());
 					}
 					let payload = build_payload(&parsed_sections, &projections, Some(&result.sections));
-					yield Ev::Done(Outcome::Done { result: Ok(payload), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
 				},
 				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: "document transaction returned the wrong section count".into() }),
 				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
@@ -775,7 +783,7 @@ fn op_details(edits: &[omp_hashline::Edit]) -> Vec<AppliedOp> {
 }
 
 const fn done_fault(fault: Fault) -> Ev<EditUpdate, Payload, Fault> {
-	Ev::Done(Outcome::Done { result: Err(fault), useless: false })
+	Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false })
 }
 
 fn param_event(error: ParamError) -> Ev<EditUpdate, Payload, Fault> {

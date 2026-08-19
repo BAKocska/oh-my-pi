@@ -16,6 +16,8 @@ pub const USER_AGENT: &str = concat!("omp/", env!("CARGO_PKG_VERSION"));
 pub mod append_vec;
 pub mod cow_bytes;
 pub mod encoding;
+pub mod location;
+pub mod phase;
 pub mod semver;
 pub mod sparse_index;
 pub mod sparse_map;
@@ -26,8 +28,12 @@ pub mod time;
 pub use append_vec::{AppendSlice, AppendVec};
 pub use cow_bytes::CowBytes;
 pub use encoding::{base32, base32_dns, base32_hex, base64, base64_url, hex};
+pub use location::{
+	AgentUrl, ArtifactUrl, ClientPath, EnvPath, HistoryUrl, LocationError, ToolPath, WorkspaceUri,
+};
+pub use phase::InvocationPhase;
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;
 pub use sparse_set::SparseSet;
 pub use str::{CowStr, IntoStr, Str, StrMut};
-pub use time::{format_rfc3339, parse_rfc3339};
+pub use time::{Duration, DurationError, DurationUnit, format_rfc3339, parse_rfc3339};

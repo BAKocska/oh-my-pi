@@ -5,7 +5,9 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use futures::{StreamExt, executor::block_on};
 use omp_core::Str;
-use omp_tool::{Abort, Ev, IncomingParams, Interrupt, Outcome, Part, PromptCaps, Tool};
+use omp_tool::{
+	Abort, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
+};
 use omp_tools::{
 	read::selector::LiteralPathProbe,
 	write::{
@@ -133,14 +135,21 @@ fn invoke(documents: FakeDocuments, raw: &str) -> Invocation {
 		.args_committed(Str::from(raw))
 		.expect("invocation consumer remains live");
 	let events = block_on(tool.call(params).collect::<Vec<_>>());
-	let [Ev::Done(Outcome::Done { result, useless })] = events.as_slice() else {
+	let [Ev::Done(ToolTerminal::Done { result, useless })] = events.as_slice() else {
 		panic!("expected one terminal write outcome: {events:?}");
 	};
-	let parts = tool.prompt(result.as_ref(), &PromptCaps {
-		maximum_parts:      1,
-		maximum_text_bytes: 64 * 1024,
-		media:              false,
-	});
+	let parts = tool.prompt(
+		result.as_ref(),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts:      1,
+				maximum_text_bytes: 64 * 1024,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		),
+	);
 	let text = parts
 		.into_iter()
 		.map(|part| match part {

@@ -39,8 +39,8 @@ use omp_proto::{
 };
 use omp_storage::transcript::{Entry, Header, Kind, SessionId};
 use omp_tool::{
-	ArtifactLifetime, ExpectedArtifact, JobOwner, JobRef, Outcome as ToolOutcome, PromptCaps,
-	Registry, ToolIdentity,
+	ArtifactLifetime, CapsBase, ExpectedArtifact, JobOwner, JobRef, ModelClass, Registry,
+	ToolIdentity, ToolTerminal,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -48,8 +48,12 @@ use tempfile::TempDir;
 
 const LIMIT: Duration = Duration::from_secs(15);
 const SETTLEMENT_MIME: &str = "application/vnd.omp.process-settlement+json";
-const PROMPT_CAPS: PromptCaps =
-	PromptCaps { maximum_parts: 8, maximum_text_bytes: 4096, media: false };
+const CAPS_BASE: CapsBase = CapsBase {
+	maximum_parts:      8,
+	maximum_text_bytes: 4096,
+	media:              false,
+	model_class:        ModelClass::Standard,
+};
 
 struct RealEnv {
 	client: EnvClient,
@@ -265,11 +269,11 @@ fn detached_ref(result: &thread::ToolResult) -> JobRef {
 		.as_ref()
 		.expect("detached result retains exact structured truth");
 	let json = proto_json(details);
-	match serde_json::from_value::<ToolOutcome<JsonValue, JsonValue>>(json)
+	match serde_json::from_value::<ToolTerminal<JsonValue, JsonValue>>(json)
 		.expect("detached result details decode")
 	{
-		ToolOutcome::Detached(job) => job,
-		ToolOutcome::Done { .. } => panic!("detached result lowered as synchronous outcome"),
+		ToolTerminal::Detached(job) => job,
+		ToolTerminal::Done { .. } => panic!("detached result lowered as synchronous outcome"),
 	}
 }
 
@@ -494,7 +498,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		env.client.clone(),
 		state(env.root.path(), env.registry()),
 		journal(&journal_path, env.root.path()),
-		PROMPT_CAPS,
+		CAPS_BASE,
 	);
 	let events = agent.events().subscribe_lossless();
 	let detached_start = tokio::spawn(async move {
@@ -569,7 +573,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		reconnected,
 		state(env.root.path(), env.registry()),
 		reopened_journal,
-		PROMPT_CAPS,
+		CAPS_BASE,
 	);
 	let settled_events = reopened.events().subscribe_lossless();
 	let board = Arc::clone(reopened.jobs());
@@ -672,7 +676,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		env.reconnect("p3-final-reopen").await,
 		state(env.root.path(), env.registry()),
 		Journal::open(&journal_path).expect("reopen already-exited job"),
-		PROMPT_CAPS,
+		CAPS_BASE,
 	);
 	let final_events = final_agent.events().subscribe_lossless();
 	let final_board = Arc::clone(final_agent.jobs());

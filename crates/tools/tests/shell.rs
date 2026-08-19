@@ -7,8 +7,9 @@ use futures::{FutureExt, StreamExt, executor::block_on, pin_mut};
 use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::invoke_input;
 use omp_tool::{
-	Abort, ArtifactLifetime, ErasedEv, ErasedOutcome, IncomingParams, Interrupt, JobOwner, Part,
-	PromptCaps, Registry, Tool, ToolIdentity, Verdict,
+	Abort, ArtifactLifetime, CallOutcome, CapsBase, Claims, ErasedEv, ErasedOutcome, IncomingParams,
+	Interrupt, JobOwner, ModelClass, Part, Precedence, Presentation, PromptCaps, Registry, Tool,
+	ToolIdentity,
 };
 use omp_tools::shell::{
 	self, DetachRequest, DetachedJob, ExecOutcome, ExecStatus, Fault, OutputChannel, Payload,
@@ -162,7 +163,15 @@ fn status(outcome: ExecOutcome) -> ExecStatus {
 fn registry(exec: FakeExec, transcript_limit: usize) -> Registry {
 	let mut registry = Registry::new();
 	registry
-		.register(shell::shell(exec).with_transcript_limit(transcript_limit))
+		.register(
+			shell::shell(exec).with_transcript_limit(transcript_limit),
+			Presentation::Slot,
+			Claims {
+				precedence: Precedence::CORE,
+				claimant:   Str::from("omp/core"),
+				replaces:   None,
+			},
+		)
 		.expect("shell schema and revision register");
 	registry
 }
@@ -178,8 +187,8 @@ fn payload(events: &[ErasedEv]) -> Payload {
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
 		panic!("foreground call must end in a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	let Verdict::Ok(payload) = verdict else {
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	let CallOutcome::Ok(payload) = outcome else {
 		panic!("expected successful payload")
 	};
 	payload
@@ -377,8 +386,8 @@ fn interrupt_during_detach_reports_effect_uncertainty() {
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
 		panic!("interrupted detach must produce a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(verdict, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	assert!(matches!(outcome, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 	assert_eq!(exec.state.lock().detaches.len(), 1);
 }
 
@@ -433,10 +442,10 @@ fn interrupt_before_execution_is_skipped_without_poisoning_later_calls() {
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
 		panic!("interrupted call must produce a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
 	assert!(matches!(
-		verdict,
-		Verdict::Aborted(Abort::Skipped { ref reason }) if reason == "stop now"
+		outcome,
+		CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop now"
 	));
 	{
 		let state = exec.state.lock();
@@ -491,10 +500,10 @@ async fn queued_foreground_interrupt_skips_before_starting_host_execution() {
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = queued_events.last().unwrap() else {
 		panic!("queued interrupt must produce a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
 	assert!(matches!(
-		verdict,
-		Verdict::Aborted(Abort::Skipped { ref reason }) if reason == "stop queued"
+		outcome,
+		CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop queued"
 	));
 	assert_eq!(exec.state.lock().runs.len(), 1);
 
@@ -547,10 +556,10 @@ async fn foreground_queue_keeps_invocation_order_when_streams_poll_in_reverse() 
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = second_events.last().unwrap() else {
 		panic!("queued interrupt must produce a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
 	assert!(matches!(
-		verdict,
-		Verdict::Aborted(Abort::Skipped { ref reason }) if reason == "stop queued"
+		outcome,
+		CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop queued"
 	));
 	assert_eq!(payload(&first_events).status.outcome, ExecOutcome::Cancelled);
 	let state = exec.state.lock();
@@ -565,8 +574,8 @@ fn malformed_whole_arguments_are_a_structured_args_verdict() {
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
 		panic!("malformed args must produce a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(verdict, Verdict::Args(_)));
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	assert!(matches!(outcome, CallOutcome::ArgsRejected(_)));
 	let state = exec.state.lock();
 	assert_eq!(state.opens, 0);
 	assert_eq!(state.runs, [] as [(bytes::Bytes, omp_tools::shell::RunRequest); 0]);
@@ -579,8 +588,8 @@ fn missing_detach_name_is_a_typed_fault() {
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
 		panic!("invalid detach policy must produce a verdict")
 	};
-	let verdict: Verdict<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(verdict, Verdict::Fault(Fault::DetachNameRequired)));
+	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
+	assert!(matches!(outcome, CallOutcome::Faulted(Fault::DetachNameRequired)));
 }
 
 #[test]
@@ -600,12 +609,17 @@ fn prompt_projection_retains_status_and_obeys_text_caps() {
 		panic!("foreground call must produce a verdict")
 	};
 	let (name, rev) = registry.live_identity("shell").unwrap();
-	let parts = registry
-		.prompt(&ToolIdentity { name: name.clone(), rev: rev.clone() }, verdict, &PromptCaps {
+	let caps = PromptCaps::for_tool(
+		CapsBase {
 			maximum_parts:      1,
 			maximum_text_bytes: 96,
 			media:              false,
-		})
+			model_class:        ModelClass::Standard,
+		},
+		&rev,
+	);
+	let parts = registry
+		.prompt(&ToolIdentity { name: name.clone(), rev: rev.clone() }, verdict, &caps)
 		.unwrap()
 		.unwrap();
 	let [Part::Text { text }] = parts.as_slice() else {

@@ -1278,11 +1278,12 @@ mod tests {
 		}
 	}
 
-	fn caps() -> omp_tool::PromptCaps {
-		omp_tool::PromptCaps {
+	fn caps() -> omp_tool::CapsBase {
+		omp_tool::CapsBase {
 			maximum_parts:      1,
 			maximum_text_bytes: 1024,
 			media:              false,
+			model_class:        omp_tool::ModelClass::Standard,
 		}
 	}
 

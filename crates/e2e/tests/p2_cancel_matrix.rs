@@ -34,8 +34,8 @@ use omp_proto::{
 	},
 };
 use omp_tool::{
-	Abort, Constraint, Ev, IncomingParams, Outcome, ParamError, Part, PromptCaps, Registry, Rev,
-	Tool, ToolSpec, Verdict,
+	Abort, CallOutcome, Claims, Constraint, Ev, IncomingParams, ParamError, Part, Precedence,
+	Presentation, PromptCaps, Registry, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -160,11 +160,12 @@ impl CancellableSleeper {
 	const fn new(started: PathBuf, marker: PathBuf, dropped: Arc<AtomicBool>) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static("matrix_sleeper"),
-				rev:         Rev { family: Str::new_static("e2e"), n: 1 },
-				description: Str::new_static("sleeps before attempting a marker mutation"),
-				schema:      Bytes::from_static(br#"{"type":"object"}"#),
-				constraint:  Constraint::None,
+				name:            Str::new_static("matrix_sleeper"),
+				rev:             Rev { family: Str::new_static("e2e"), n: 1 },
+				description:     Str::new_static("sleeps before attempting a marker mutation"),
+				schema:          Bytes::from_static(br#"{"type":"object"}"#),
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 			started,
 			marker,
@@ -207,11 +208,11 @@ impl Tool for CancellableSleeper {
 				Err(ParamError::Interrupted(interrupt)) => {
 					yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
 				},
-				Err(error) => yield Ev::Done(Outcome::Done {
+				Err(error) => yield Ev::Done(ToolTerminal::Done {
 					result: Err(json!({"error": error.to_string()})),
 					useless: false,
 				}),
-				Ok(()) => yield Ev::Done(Outcome::Done {
+				Ok(()) => yield Ev::Done(ToolTerminal::Done {
 					result: Ok(json!({"unexpected": "sleep completed"})),
 					useless: false,
 				}),
@@ -232,7 +233,15 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 	let dropped = Arc::new(AtomicBool::new(false));
 	let mut registry = Registry::new();
 	registry
-		.register(CancellableSleeper::new(started.clone(), marker.clone(), Arc::clone(&dropped)))
+		.register(
+			CancellableSleeper::new(started.clone(), marker.clone(), Arc::clone(&dropped)),
+			Presentation::Slot,
+			Claims {
+				precedence: Precedence::CORE,
+				claimant:   Str::new_static("omp/core"),
+				replaces:   None,
+			},
+		)
 		.expect("register cancellable sleeper");
 	let worker = ToolWorkerConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
 	let env = within(STARTUP_DEADLINE, LocalEnv::start(registry, worker)).await;
@@ -253,14 +262,14 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 	let skipped_terminal = next_verdict(&mut skipped).await;
 	assert_eq!(
 		decode_verdict(&skipped_terminal),
-		Verdict::Aborted(Abort::Skipped {
+		CallOutcome::<Value, Value>::aborted(Abort::Skipped {
 			reason: Str::new_static("invocation cancelled before argument commitment"),
 		})
 	);
 	assert_eq!(
 		skipped_terminal.json,
 		Bytes::from_static(
-			br#"{"kind":"aborted","value":{"kind":"skipped","reason":"invocation cancelled before argument commitment"}}"#,
+			br#"{"kind":"aborted","value":{"abort":{"kind":"skipped","reason":"invocation cancelled before argument commitment"},"kind":"skipped"}}"#,
 		),
 	);
 	assert_abort_envelope(&skipped_terminal);
@@ -285,14 +294,14 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 	let interrupted_terminal = next_verdict(&mut interrupted).await;
 	assert_eq!(
 		decode_verdict(&interrupted_terminal),
-		Verdict::Aborted(Abort::Interrupted {
+		CallOutcome::<Value, Value>::aborted(Abort::Interrupted {
 			reason: Str::new_static("invocation cancelled by client"),
 		})
 	);
 	assert_eq!(
 		interrupted_terminal.json,
 		Bytes::from_static(
-			br#"{"kind":"aborted","value":{"kind":"interrupted","reason":"invocation cancelled by client"}}"#,
+			br#"{"kind":"aborted","value":{"abort":{"kind":"interrupted","reason":"invocation cancelled by client"},"kind":"cancelled"}}"#,
 		),
 	);
 	assert_abort_envelope(&interrupted_terminal);
@@ -440,7 +449,9 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	blocked.guard().cancel();
 	let terminal = next_verdict(&mut blocked).await;
 	let elapsed = cancelled_at.elapsed();
-	let Verdict::Aborted(Abort::EffectsUnknown { reason }) = decode_verdict(&terminal) else {
+	let CallOutcome::Aborted { abort: Abort::EffectsUnknown { reason }, .. } =
+		decode_verdict(&terminal)
+	else {
 		panic!("dispatched Python cancellation was not effects-unknown");
 	};
 	assert_eq!(reason, "environment invocation cancelled");
@@ -471,8 +482,8 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	assert!(!success.is_error);
 	assert!(!success.useless);
 	assert_eq!(success.parts, [] as [omp_proto::thread::v1::Part; 0]);
-	let Verdict::Ok(details) = decode_verdict(&success) else {
-		panic!("replacement worker did not return an ok verdict");
+	let CallOutcome::Ok(details) = decode_verdict(&success) else {
+		panic!("replacement worker did not return an ok outcome");
 	};
 	assert_eq!(details["message"], "after respawn");
 	let replacement_pid = details["pid"].as_i64().expect("replacement worker pid") as i32;
@@ -518,8 +529,8 @@ async fn next_verdict(invocation: &mut Invocation) -> omp_proto::env::v1::Verdic
 	.await
 }
 
-fn decode_verdict(terminal: &omp_proto::env::v1::Verdict) -> Verdict<Value, Value> {
-	serde_json::from_slice(&terminal.json).expect("decode structured terminal verdict")
+fn decode_verdict(terminal: &omp_proto::env::v1::Verdict) -> CallOutcome<Value, Value> {
+	serde_json::from_slice(&terminal.json).expect("decode structured terminal call outcome")
 }
 
 fn assert_abort_envelope(terminal: &omp_proto::env::v1::Verdict) {

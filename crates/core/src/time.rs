@@ -1,6 +1,14 @@
-//! RFC 3339 conversion for [`SystemTime`].
+//! Compact duration values and RFC 3339 conversion for [`SystemTime`].
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+	cmp::Ordering,
+	fmt,
+	hash::{Hash, Hasher},
+	str::FromStr,
+	time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+};
+
+use strum::{Display, EnumString};
 
 /// Formats a [`SystemTime`] as a UTC RFC 3339 timestamp with second precision.
 ///
@@ -90,11 +98,11 @@ pub fn parse_rfc3339(value: &str) -> Option<SystemTime> {
 		.checked_add(i64::from(hour * 3_600 + minute * 60 + second))?;
 	let unix = local.checked_sub(offset)?;
 	if unix >= 0 {
-		UNIX_EPOCH.checked_add(Duration::new(unix as u64, nanos))
+		UNIX_EPOCH.checked_add(StdDuration::new(unix as u64, nanos))
 	} else if nanos == 0 {
-		UNIX_EPOCH.checked_sub(Duration::from_secs(unix.unsigned_abs()))
+		UNIX_EPOCH.checked_sub(StdDuration::from_secs(unix.unsigned_abs()))
 	} else {
-		UNIX_EPOCH.checked_sub(Duration::new(unix.unsigned_abs() - 1, 1_000_000_000 - nanos))
+		UNIX_EPOCH.checked_sub(StdDuration::new(unix.unsigned_abs() - 1, 1_000_000_000 - nanos))
 	}
 }
 
@@ -146,40 +154,214 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 	(year, month, day)
 }
 
+/// The explicit unit carried by a [`Duration`].
+#[derive(Debug, Clone, Copy, Display, EnumString, PartialEq, Eq, Hash)]
+pub enum DurationUnit {
+	/// Nanoseconds.
+	#[strum(serialize = "ns")]
+	Nanoseconds,
+	/// Microseconds.
+	#[strum(serialize = "us")]
+	Microseconds,
+	/// Milliseconds.
+	#[strum(serialize = "ms")]
+	Milliseconds,
+	/// Seconds.
+	#[strum(serialize = "s")]
+	Seconds,
+	/// Minutes.
+	#[strum(serialize = "m")]
+	Minutes,
+	/// Hours.
+	#[strum(serialize = "h")]
+	Hours,
+}
+
+impl DurationUnit {
+	const fn nanoseconds(self) -> u64 {
+		match self {
+			Self::Nanoseconds => 1,
+			Self::Microseconds => 1_000,
+			Self::Milliseconds => 1_000_000,
+			Self::Seconds => 1_000_000_000,
+			Self::Minutes => 60_000_000_000,
+			Self::Hours => 3_600_000_000_000,
+		}
+	}
+}
+
+/// An error converting or parsing a [`Duration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationError {
+	/// The text is not an unsigned integer followed by a supported unit.
+	InvalidSyntax,
+	/// The value cannot be represented by the destination duration type.
+	Overflow,
+	/// The requested unit cannot represent the standard duration exactly.
+	PrecisionLoss,
+}
+
+impl fmt::Display for DurationError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(match self {
+			Self::InvalidSyntax => "duration must be an integer followed by ns, us, ms, s, m, or h",
+			Self::Overflow => "duration is too large",
+			Self::PrecisionLoss => "duration is not an exact multiple of the requested unit",
+		})
+	}
+}
+
+impl std::error::Error for DurationError {}
+
+/// A non-negative time span that retains the unit in which it was specified.
+///
+/// Unlike a floating-seconds API, this type makes units explicit. Equality,
+/// ordering, and hashing compare elapsed time, so `1s` and `1000ms` are equal
+/// even though [`Duration::unit`] preserves their different spellings.
+#[derive(Debug, Clone, Copy)]
+pub struct Duration {
+	value: u64,
+	unit:  DurationUnit,
+}
+
+impl Duration {
+	/// Creates a duration from an integer and an explicit unit.
+	#[must_use]
+	pub const fn new(value: u64, unit: DurationUnit) -> Self {
+		Self { value, unit }
+	}
+
+	/// Returns the integer magnitude in this value's original unit.
+	#[must_use]
+	pub const fn value(self) -> u64 {
+		self.value
+	}
+
+	/// Returns the unit in which this value was specified.
+	#[must_use]
+	pub const fn unit(self) -> DurationUnit {
+		self.unit
+	}
+
+	/// Converts this value to a standard duration, returning an error on
+	/// overflow.
+	pub fn to_std(self) -> Result<StdDuration, DurationError> {
+		let nanos = u128::from(self.value) * u128::from(self.unit.nanoseconds());
+		let seconds = nanos / 1_000_000_000;
+		let subsecond_nanos = (nanos % 1_000_000_000) as u32;
+		let seconds = u64::try_from(seconds).map_err(|_| DurationError::Overflow)?;
+		Ok(StdDuration::new(seconds, subsecond_nanos))
+	}
+
+	/// Converts a standard duration into an exact value in `unit`.
+	///
+	/// A duration with finer precision than `unit`, or a quotient larger than
+	/// [`u64::MAX`], is refused rather than rounded.
+	pub fn from_std(value: StdDuration, unit: DurationUnit) -> Result<Self, DurationError> {
+		let nanos = value.as_nanos();
+		let unit_nanos = u128::from(unit.nanoseconds());
+		if nanos % unit_nanos != 0 {
+			return Err(DurationError::PrecisionLoss);
+		}
+		let value = u64::try_from(nanos / unit_nanos).map_err(|_| DurationError::Overflow)?;
+		Ok(Self::new(value, unit))
+	}
+
+	const fn total_nanoseconds(self) -> u128 {
+		self.value as u128 * self.unit.nanoseconds() as u128
+	}
+}
+
+impl FromStr for Duration {
+	type Err = DurationError;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		let split = value
+			.bytes()
+			.position(|byte| !byte.is_ascii_digit())
+			.ok_or(DurationError::InvalidSyntax)?;
+		if split == 0 {
+			return Err(DurationError::InvalidSyntax);
+		}
+		let magnitude = value[..split]
+			.parse::<u64>()
+			.map_err(|_| DurationError::Overflow)?;
+		let unit = value[split..]
+			.parse::<DurationUnit>()
+			.map_err(|_| DurationError::InvalidSyntax)?;
+		Ok(Self::new(magnitude, unit))
+	}
+}
+
+impl fmt::Display for Duration {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{}{}", self.value, self.unit)
+	}
+}
+
+impl PartialEq for Duration {
+	fn eq(&self, other: &Self) -> bool {
+		self.total_nanoseconds() == other.total_nanoseconds()
+	}
+}
+
+impl Eq for Duration {}
+
+impl PartialOrd for Duration {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for Duration {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.total_nanoseconds().cmp(&other.total_nanoseconds())
+	}
+}
+
+impl Hash for Duration {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.total_nanoseconds().hash(state);
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use std::time::{Duration, UNIX_EPOCH};
+	use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
-	use super::{format_rfc3339, parse_rfc3339};
+	use super::{Duration, DurationError, DurationUnit, format_rfc3339, parse_rfc3339};
 
 	#[test]
 	fn formats_utc_seconds() {
 		assert_eq!(format_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
 		assert_eq!(
-			format_rfc3339(UNIX_EPOCH + Duration::from_secs(1_709_208_245)),
+			format_rfc3339(UNIX_EPOCH + StdDuration::from_secs(1_709_208_245)),
 			"2024-02-29T12:04:05Z"
 		);
-		assert_eq!(format_rfc3339(UNIX_EPOCH - Duration::from_secs(1)), "1970-01-01T00:00:00Z");
+		assert_eq!(format_rfc3339(UNIX_EPOCH - StdDuration::from_secs(1)), "1970-01-01T00:00:00Z");
 	}
 
 	#[test]
 	fn parses_fractional_seconds_and_offsets() {
-		let expected = UNIX_EPOCH + Duration::new(1_700_098_592, 547_123_456);
+		let expected = UNIX_EPOCH + StdDuration::new(1_700_098_592, 547_123_456);
 		assert_eq!(parse_rfc3339("2023-11-16T01:36:32.547123456Z"), Some(expected));
 		assert_eq!(parse_rfc3339("2023-11-16t04:06:32.547123456+02:30"), Some(expected));
 		assert_eq!(parse_rfc3339("2023-11-15T19:36:32.547123456-06:00"), Some(expected));
 		assert_eq!(
 			parse_rfc3339("2023-11-16T01:36:32.5z"),
-			Some(UNIX_EPOCH + Duration::new(1_700_098_592, 500_000_000))
+			Some(UNIX_EPOCH + StdDuration::new(1_700_098_592, 500_000_000))
 		);
 	}
 
 	#[test]
 	fn parses_pre_epoch_values() {
-		assert_eq!(parse_rfc3339("1969-12-31T23:59:59Z"), Some(UNIX_EPOCH - Duration::from_secs(1)));
+		assert_eq!(
+			parse_rfc3339("1969-12-31T23:59:59Z"),
+			Some(UNIX_EPOCH - StdDuration::from_secs(1))
+		);
 		assert_eq!(
 			parse_rfc3339("1969-12-31T23:59:59.5Z"),
-			Some(UNIX_EPOCH - Duration::from_millis(500))
+			Some(UNIX_EPOCH - StdDuration::from_millis(500))
 		);
 	}
 
@@ -202,6 +384,43 @@ mod tests {
 			"2023-11-16T01:36:32Ztrailing",
 		] {
 			assert_eq!(parse_rfc3339(value), None, "accepted {value:?}");
+		}
+	}
+
+	#[test]
+	fn duration_preserves_units_and_compares_elapsed_time() {
+		let seconds = "1s".parse::<Duration>().unwrap();
+		let milliseconds = "1000ms".parse::<Duration>().unwrap();
+		assert_eq!(seconds, milliseconds);
+		assert_eq!(milliseconds.value(), 1000);
+		assert_eq!(milliseconds.unit(), DurationUnit::Milliseconds);
+		assert_eq!(milliseconds.to_string(), "1000ms");
+	}
+
+	#[test]
+	fn duration_std_conversion_checks_boundaries_and_precision() {
+		assert_eq!(
+			Duration::from_std(StdDuration::from_millis(1500), DurationUnit::Milliseconds),
+			Ok(Duration::new(1500, DurationUnit::Milliseconds))
+		);
+		assert_eq!(
+			Duration::from_std(StdDuration::from_millis(1500), DurationUnit::Seconds),
+			Err(DurationError::PrecisionLoss)
+		);
+		assert_eq!(
+			Duration::new(u64::MAX, DurationUnit::Hours).to_std(),
+			Err(DurationError::Overflow)
+		);
+		assert_eq!(
+			Duration::from_std(StdDuration::new(u64::MAX, 999_999_999), DurationUnit::Nanoseconds),
+			Err(DurationError::Overflow)
+		);
+	}
+
+	#[test]
+	fn duration_rejects_implicit_or_malformed_units() {
+		for value in ["", "1", "1.5s", "-1s", "ms", "1seconds", " 1s"] {
+			assert!(matches!(value.parse::<Duration>(), Err(DurationError::InvalidSyntax)));
 		}
 	}
 }

@@ -27,12 +27,20 @@ use omp_proto::{
 	},
 };
 use omp_tool::{
-	Abort, Constraint, Ev, IncomingParams, LoweringCaps, Outcome, ParamError, Part, PromptCaps,
-	Registry, Rev, Tool, ToolRoute, ToolSpec, Verdict,
+	Abort, CallOutcome, Claims, Constraint, Ev, IncomingParams, LoweringCaps, ParamError, Part,
+	Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec, ToolTerminal,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+
+fn test_claims() -> Claims {
+	Claims {
+		precedence: Precedence::CORE,
+		claimant:   Str::new_static("omp/core"),
+		replaces:   None,
+	}
+}
 
 struct EffectTool {
 	spec:   ToolSpec,
@@ -47,11 +55,12 @@ impl EffectTool {
 	const fn named(name: &'static str, marker: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static(name),
-				rev:         Rev { family: Str::new_static("test"), n: 1 },
-				description: Str::new_static("records a committed invocation"),
-				schema:      Bytes::from_static(br#"{"type":"object"}"#),
-				constraint:  Constraint::None,
+				name:            Str::new_static(name),
+				rev:             Rev { family: Str::new_static("test"), n: 1 },
+				description:     Str::new_static("records a committed invocation"),
+				schema:          Bytes::from_static(br#"{"type":"object"}"#),
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 			marker,
 		}
@@ -76,9 +85,9 @@ impl Tool for EffectTool {
 			match params.whole::<Value>().await {
 				Ok(value) => {
 					std::fs::write(&self.marker, b"committed").expect("write effect marker");
-					yield Ev::Done(Outcome::Done { result: Ok(value), useless: true });
+					yield Ev::Done(ToolTerminal::Done { result: Ok(value), useless: true });
 				},
-				Err(error) => yield Ev::Done(Outcome::Done {
+				Err(error) => yield Ev::Done(ToolTerminal::Done {
 					result: Err(json!({"error": error.to_string()})),
 					useless: false,
 				}),
@@ -110,13 +119,14 @@ impl StreamingTool {
 	const fn new(lease: PathBuf, effect: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static("streaming_probe"),
-				rev:         Rev { family: Str::new_static("test"), n: 1 },
-				description: Str::new_static("prepares from streamed arguments before commitment"),
-				schema:      Bytes::from_static(
+				name:            Str::new_static("streaming_probe"),
+				rev:             Rev { family: Str::new_static("test"), n: 1 },
+				description:     Str::new_static("prepares from streamed arguments before commitment"),
+				schema:          Bytes::from_static(
 					br#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
 				),
-				constraint:  Constraint::None,
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 			lease,
 			effect,
@@ -154,7 +164,7 @@ impl Tool for StreamingTool {
 			}
 			std::fs::write(&self.effect, path.as_bytes()).expect("record committed effect");
 			tokio::time::sleep(Duration::from_millis(100)).await;
-			yield Ev::Done(Outcome::Done {
+			yield Ev::Done(ToolTerminal::Done {
 				result: Ok(json!({"path": path})),
 				useless: false,
 			});
@@ -175,11 +185,12 @@ impl BlockingTool {
 	const fn new(started: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static("native_block"),
-				rev:         Rev { family: Str::new_static("test"), n: 1 },
-				description: Str::new_static("waits until the environment cancels it"),
-				schema:      Bytes::from_static(br#"{"type":"object"}"#),
-				constraint:  Constraint::None,
+				name:            Str::new_static("native_block"),
+				rev:             Rev { family: Str::new_static("test"), n: 1 },
+				description:     Str::new_static("waits until the environment cancels it"),
+				schema:          Bytes::from_static(br#"{"type":"object"}"#),
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 			started,
 		}
@@ -225,11 +236,12 @@ impl CooperativeInterruptTool {
 	const fn new() -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static("cooperative_interrupt"),
-				rev:         Rev { family: Str::new_static("test"), n: 1 },
-				description: Str::new_static("reports cooperative interrupt truth"),
-				schema:      Bytes::from_static(br#"{"type":"object"}"#),
-				constraint:  Constraint::None,
+				name:            Str::new_static("cooperative_interrupt"),
+				rev:             Rev { family: Str::new_static("test"), n: 1 },
+				description:     Str::new_static("reports cooperative interrupt truth"),
+				schema:          Bytes::from_static(br#"{"type":"object"}"#),
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 		}
 	}
@@ -483,9 +495,9 @@ fn ok_builtin_payload(verdict: omp_proto::env::v1::Verdict, operation: &str) -> 
 		"{operation} returned an error: {}",
 		String::from_utf8_lossy(&verdict.json)
 	);
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&verdict.json).expect("typed built-in verdict");
-	let Verdict::Ok(payload) = verdict else {
+	let CallOutcome::Ok(payload) = verdict else {
 		panic!("{operation} did not return an ok payload");
 	};
 	payload
@@ -528,7 +540,7 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 	let marker = state.path().join("reserved-write-marker");
 	let mut registry = Registry::new();
 	registry
-		.register(EffectTool::named("write", marker))
+		.register(EffectTool::named("write", marker), Presentation::Slot, test_claims())
 		.expect("register colliding caller write tool");
 	let result = EnvServer::open_local(
 		root.path(),
@@ -550,11 +562,13 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	let registry = harness.server.registry();
 	let agent_registry = harness.server.registry();
 	assert!(Arc::ptr_eq(&registry, &agent_registry));
-	assert_eq!(registry.live_hash(), agent_registry.live_hash());
-	let advertised = registry.advertise(LoweringCaps {
-		strict_schema: true,
-		grammar:       omp_llm_catalog::GrammarBits::empty(),
-	});
+	assert_eq!(registry.slot_hash(), agent_registry.slot_hash());
+	let advertised = registry
+		.advertise(LoweringCaps {
+			strict_schema: true,
+			grammar:       omp_llm_catalog::GrammarBits::empty(),
+		})
+		.expect("advertise production registry");
 	let identities = advertised
 		.iter()
 		.map(|tool| (tool.identity.name.as_str(), tool.identity.rev.to_string()))
@@ -782,9 +796,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		"read adapter returned an error: {}",
 		String::from_utf8_lossy(&read.json)
 	);
-	let read_verdict: Verdict<Value, Value> =
+	let read_verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&read.json).expect("typed read verdict");
-	let Verdict::Ok(read_payload) = read_verdict else {
+	let CallOutcome::Ok(read_payload) = read_verdict else {
 		panic!("read did not return an ok payload");
 	};
 	let read_text = read_payload["parts"][0]["text"]
@@ -822,9 +836,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		"write adapter returned an error: {}",
 		String::from_utf8_lossy(&write.json)
 	);
-	let write_verdict: Verdict<Value, Value> =
+	let write_verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&write.json).expect("typed write verdict");
-	let Verdict::Ok(write_payload) = write_verdict else {
+	let CallOutcome::Ok(write_payload) = write_verdict else {
 		panic!("write did not return an ok payload");
 	};
 	assert_eq!(write_payload["display_path"], "nested/written.txt");
@@ -863,9 +877,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	)
 	.await;
 	assert!(!written.is_error, "write/read round trip returned an error");
-	let written_verdict: Verdict<Value, Value> =
+	let written_verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&written.json).expect("typed read-after-write verdict");
-	assert!(matches!(written_verdict, Verdict::Ok(_)));
+	assert!(matches!(written_verdict, CallOutcome::Ok(_)));
 
 	let shell = invoke_builtin(
 		harness.client(),
@@ -1024,9 +1038,9 @@ async fn edit_rejects_a_stale_tag_after_an_external_file_change() {
 	)
 	.await;
 	assert!(edit.is_error, "stale edit unexpectedly committed");
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&edit.json).expect("typed stale edit verdict");
-	let Verdict::Fault(fault) = verdict else {
+	let CallOutcome::Faulted(fault) = verdict else {
 		panic!("stale edit did not return a typed fault");
 	};
 	assert_eq!(fault["reason"]["kind"], "stale_unrecoverable");
@@ -1125,9 +1139,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!seed.is_error, "embedded Python seed cell failed");
-	let seed: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let seed: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&seed.json).expect("typed eval seed verdict");
-	let Verdict::Ok(seed) = seed else {
+	let CallOutcome::Ok(seed) = seed else {
 		panic!("embedded Python seed cell returned a fault");
 	};
 	assert_eq!(eval_output(&seed, omp_tools::eval::OutputChannel::Stdout), b"seeded\n");
@@ -1150,9 +1164,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!isolated.is_error, "unrelated eval owner failed");
-	let isolated: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let isolated: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&isolated.json).expect("typed owner-isolation verdict");
-	let Verdict::Ok(isolated) = isolated else {
+	let CallOutcome::Ok(isolated) = isolated else {
 		panic!("unrelated eval owner returned a fault");
 	};
 	assert_eq!(
@@ -1200,11 +1214,11 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	.expect("independent Python kernels serialized behind one another");
 	assert!(!left.is_error, "left independent Python kernel failed");
 	assert!(!right.is_error, "right independent Python kernel failed");
-	let left: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let left: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&left.json).expect("typed left parallel eval verdict");
-	let right: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let right: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&right.json).expect("typed right parallel eval verdict");
-	let (Verdict::Ok(left), Verdict::Ok(right)) = (left, right) else {
+	let (CallOutcome::Ok(left), CallOutcome::Ok(right)) = (left, right) else {
 		panic!("independent Python kernels returned a resource fault");
 	};
 	assert_eq!(left.result.and_then(|result| result.json), Some(json!("left")));
@@ -1219,9 +1233,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!bridged_glob.is_error, "eval tool bridge call failed");
-	let bridged_glob: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let bridged_glob: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&bridged_glob.json).expect("typed eval bridge verdict");
-	let Verdict::Ok(bridged_glob) = bridged_glob else {
+	let CallOutcome::Ok(bridged_glob) = bridged_glob else {
 		panic!("eval tool bridge returned a fault");
 	};
 	assert_eq!(bridged_glob.status.outcome, omp_tools::eval::CellOutcome::Complete);
@@ -1247,9 +1261,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!denied_completion.is_error, "completion denial cell failed");
-	let denied_completion: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let denied_completion: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&denied_completion.json).expect("typed completion denial verdict");
-	let Verdict::Ok(denied_completion) = denied_completion else {
+	let CallOutcome::Ok(denied_completion) = denied_completion else {
 		panic!("completion denial returned a resource fault");
 	};
 	assert_eq!(
@@ -1266,9 +1280,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!continued.is_error, "embedded Python continuation cell failed");
-	let continued: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let continued: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&continued.json).expect("typed eval continuation verdict");
-	let Verdict::Ok(continued) = continued else {
+	let CallOutcome::Ok(continued) = continued else {
 		panic!("embedded Python continuation cell returned a fault");
 	};
 	assert_eq!(continued.session_id, seed.session_id);
@@ -1296,9 +1310,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!reset.is_error, "embedded Python reset cell failed");
-	let reset: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let reset: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&reset.json).expect("typed eval reset verdict");
-	let Verdict::Ok(reset) = reset else {
+	let CallOutcome::Ok(reset) = reset else {
 		panic!("embedded Python reset cell returned a fault");
 	};
 	assert_eq!(reset.session_id, seed.session_id);
@@ -1317,9 +1331,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!peer_after_reset.is_error, "peer kernel failed after another kernel reset");
-	let peer_after_reset: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let peer_after_reset: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&peer_after_reset.json).expect("typed peer post-reset verdict");
-	let Verdict::Ok(peer_after_reset) = peer_after_reset else {
+	let CallOutcome::Ok(peer_after_reset) = peer_after_reset else {
 		panic!("peer kernel returned a fault after another kernel reset");
 	};
 	assert_eq!(
@@ -1368,9 +1382,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		.await
 		.expect("queued cell deadlocked behind timed-out Python kernel");
 	assert!(!timed_out.is_error, "timed-out Python cell did not return typed cell truth");
-	let timed_out: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let timed_out: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&timed_out.json).expect("typed eval timeout verdict");
-	let Verdict::Ok(timed_out) = timed_out else {
+	let CallOutcome::Ok(timed_out) = timed_out else {
 		panic!("timed-out Python cell returned a resource fault");
 	};
 	assert_eq!(timed_out.status.outcome, omp_tools::eval::CellOutcome::Timeout);
@@ -1388,9 +1402,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	);
 
 	assert!(!recovered.is_error, "Python kernel did not recover after timeout");
-	let recovered: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let recovered: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&recovered.json).expect("typed post-timeout eval verdict");
-	let Verdict::Ok(recovered) = recovered else {
+	let CallOutcome::Ok(recovered) = recovered else {
 		panic!("post-timeout Python cell returned a fault");
 	};
 	assert_eq!(recovered.session_id, seed.session_id);
@@ -1448,9 +1462,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	let InvocationEvent::Verdict(terminal) = terminal else {
 		panic!("eval cancellation did not produce a verdict");
 	};
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal.json).expect("decode eval cancellation verdict");
-	assert!(matches!(verdict, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	assert!(matches!(verdict, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 
 	let after_cancel = invoke_builtin(
 		harness.client(),
@@ -1461,9 +1475,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!after_cancel.is_error, "Python kernel did not recover after cancellation");
-	let after_cancel: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let after_cancel: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&after_cancel.json).expect("typed post-cancel eval verdict");
-	let Verdict::Ok(after_cancel) = after_cancel else {
+	let CallOutcome::Ok(after_cancel) = after_cancel else {
 		panic!("post-cancel Python cell returned a fault");
 	};
 	assert!(after_cancel.reset, "respawn after cancellation was not reported as a reset");
@@ -1481,9 +1495,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(crashed.is_error, "eval child crash was reported as a successful cell");
-	let crashed: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let crashed: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&crashed.json).expect("typed eval crash verdict");
-	assert!(matches!(crashed, Verdict::Fault(omp_tools::eval::Fault::SessionLost { .. })));
+	assert!(matches!(crashed, CallOutcome::Faulted(omp_tools::eval::Fault::SessionLost { .. })));
 
 	let after_crash = invoke_builtin(
 		harness.client(),
@@ -1493,9 +1507,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		json!({"language":"py","code":"8 * 8"}),
 	)
 	.await;
-	let after_crash: Verdict<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let after_crash: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&after_crash.json).expect("typed post-crash eval verdict");
-	let Verdict::Ok(after_crash) = after_crash else {
+	let CallOutcome::Ok(after_crash) = after_crash else {
 		panic!("post-crash Python cell returned a fault");
 	};
 	assert!(after_crash.reset, "respawn after crash was not reported as a reset");
@@ -1507,10 +1521,14 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 	let harness = Harness::start(Registry::new()).await;
 	std::fs::write(harness.root.path().join("uds-note.txt"), "uds read\n")
 		.expect("UDS read fixture");
-	let advertised = harness.server.registry().advertise(LoweringCaps {
-		strict_schema: true,
-		grammar:       omp_llm_catalog::GrammarBits::empty(),
-	});
+	let advertised = harness
+		.server
+		.registry()
+		.advertise(LoweringCaps {
+			strict_schema: true,
+			grammar:       omp_llm_catalog::GrammarBits::empty(),
+		})
+		.expect("advertise UDS registry");
 	assert!(
 		advertised.iter().any(|tool| tool.identity.name == "eval"),
 		"in-process registry did not advertise eval"
@@ -1594,11 +1612,13 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 	worker.modules.push(Str::new_static(PY_EVAL_MODULE));
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
 	let registry = harness.server.registry();
-	let advertised = registry.advertise(LoweringCaps {
-		strict_schema: true,
-		grammar:       omp_llm_catalog::GrammarBits::empty(),
-	});
-	assert_eq!(advertised.len(), 8);
+	let advertised = registry
+		.advertise(LoweringCaps {
+			strict_schema: true,
+			grammar:       omp_llm_catalog::GrammarBits::empty(),
+		})
+		.expect("advertise worker registry");
+	assert_eq!(advertised.len(), 7);
 	assert_eq!(registry.route("py_eval").expect("python route"), ToolRoute::Worker);
 	assert_eq!(
 		registry
@@ -1619,7 +1639,11 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 	let effect = scratch.path().join("effect");
 	let mut registry = Registry::new();
 	registry
-		.register(StreamingTool::new(lease.clone(), effect.clone()))
+		.register(
+			StreamingTool::new(lease.clone(), effect.clone()),
+			Presentation::Slot,
+			test_claims(),
+		)
 		.expect("register streaming tool");
 	let harness = Harness::start(registry).await;
 
@@ -1663,10 +1687,10 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 	let InvocationEvent::Verdict(terminal) = terminal else {
 		panic!("precommit cancel did not produce a verdict");
 	};
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal.json).expect("decode precommit cancel verdict");
-	assert!(matches!(&verdict, Verdict::Aborted(Abort::Skipped { .. })));
-	assert!(!matches!(&verdict, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	assert!(matches!(&verdict, CallOutcome::Aborted { abort: Abort::Skipped { .. }, .. }));
+	assert!(!matches!(&verdict, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 	assert!(
 		cancelled
 			.next_event()
@@ -1795,10 +1819,10 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 	let completed = scratch.path().join("completed");
 	let mut registry = Registry::new();
 	registry
-		.register(BlockingTool::new(started.clone()))
+		.register(BlockingTool::new(started.clone()), Presentation::Slot, test_claims())
 		.expect("register blocking native tool");
 	registry
-		.register(EffectTool::new(completed.clone()))
+		.register(EffectTool::new(completed.clone()), Presentation::Slot, test_claims())
 		.expect("register follow-up native tool");
 	let harness = Harness::start(registry).await;
 
@@ -1835,9 +1859,9 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 	let InvocationEvent::Verdict(terminal) = terminal else {
 		panic!("native cancellation did not produce a verdict");
 	};
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal.json).expect("decode native cancellation verdict");
-	assert!(matches!(verdict, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	assert!(matches!(verdict, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 	assert!(terminal.is_error);
 	assert!(!terminal.useless);
 	assert!(
@@ -1878,7 +1902,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 	let mut registry = Registry::new();
 	registry
-		.register(CooperativeInterruptTool::new())
+		.register(CooperativeInterruptTool::new(), Presentation::Slot, test_claims())
 		.expect("register cooperative interrupt tool");
 	let harness = Harness::start(registry).await;
 	let mut invocation = harness
@@ -1918,11 +1942,11 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 	let InvocationEvent::Verdict(terminal) = terminal else {
 		panic!("cooperative interrupt did not produce a verdict");
 	};
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal.json).expect("decode cooperative interrupt verdict");
 	assert!(matches!(
 		verdict,
-		Verdict::Aborted(Abort::Interrupted { reason })
+		CallOutcome::Aborted { abort: Abort::Interrupted { reason }, .. }
 			if reason == "steer cooperatively"
 	));
 }
@@ -1933,7 +1957,7 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 	let started = scratch.path().join("deadline-started");
 	let mut registry = Registry::new();
 	registry
-		.register(BlockingTool::new(started.clone()))
+		.register(BlockingTool::new(started.clone()), Presentation::Slot, test_claims())
 		.expect("register deadline native tool");
 	let harness = Harness::start(registry).await;
 	let mut invocation = harness
@@ -1973,9 +1997,9 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 	let InvocationEvent::Verdict(terminal) = terminal else {
 		panic!("native deadline did not produce a verdict");
 	};
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal.json).expect("decode native deadline verdict");
-	assert!(matches!(verdict, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	assert!(matches!(verdict, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 	assert!(started.exists(), "native deadline fired before committed execution began");
 }
 
@@ -2035,9 +2059,9 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 	let InvocationEvent::Verdict(terminal) = terminal else {
 		panic!("worker cancellation did not produce a verdict");
 	};
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal.json).expect("decode worker cancellation verdict");
-	assert!(matches!(verdict, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	assert!(matches!(verdict, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 	assert!(terminal.is_error);
 	assert!(!terminal.useless);
 	assert!(
@@ -2093,9 +2117,9 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		next_terminal.json,
 		Bytes::from_static(br#"{"kind":"ok","value":{"message":"after cancellation"}}"#,),
 	);
-	let verdict: Verdict<Value, Value> =
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&next_terminal.json).expect("decode worker success verdict");
-	assert_eq!(verdict, Verdict::Ok(json!({"message": "after cancellation"})));
+	assert_eq!(verdict, CallOutcome::Ok(json!({"message": "after cancellation"})));
 
 	let mut fault = harness
 		.client()
@@ -2136,10 +2160,13 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 	.expect("worker did not return its structured fault");
 	assert!(fault_terminal.is_error);
 	assert!(!fault_terminal.useless);
-	assert_eq!(fault_terminal.json, Bytes::from_static(br#"{"kind":"fault","value":{"code":409}}"#),);
-	let verdict: Verdict<Value, Value> =
+	assert_eq!(
+		fault_terminal.json,
+		Bytes::from_static(br#"{"kind":"faulted","value":{"code":409}}"#),
+	);
+	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&fault_terminal.json).expect("decode worker fault verdict");
-	assert_eq!(verdict, Verdict::Fault(json!({"code": 409})));
+	assert_eq!(verdict, CallOutcome::Faulted(json!({"code": 409})));
 }
 
 #[tokio::test]
@@ -2224,9 +2251,9 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	let InvocationEvent::Verdict(terminal_b) = terminal_b else {
 		panic!("worker B cancellation did not produce a verdict");
 	};
-	let verdict_b: Verdict<Value, Value> =
+	let verdict_b: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal_b.json).expect("decode worker B cancellation");
-	assert!(matches!(verdict_b, Verdict::Aborted(Abort::Skipped { .. })));
+	assert!(matches!(verdict_b, CallOutcome::Aborted { abort: Abort::Skipped { .. }, .. }));
 	assert!(!started_b.exists(), "cancelled worker B was dispatched");
 	assert!(
 		tokio::time::timeout(Duration::from_millis(100), invocation_a.next_event())
@@ -2244,9 +2271,9 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	let InvocationEvent::Verdict(terminal_a) = terminal_a else {
 		panic!("worker A cancellation did not produce a verdict");
 	};
-	let verdict_a: Verdict<Value, Value> =
+	let verdict_a: CallOutcome<Value, Value> =
 		serde_json::from_slice(&terminal_a.json).expect("decode worker A cancellation");
-	assert!(matches!(verdict_a, Verdict::Aborted(Abort::EffectsUnknown { .. })));
+	assert!(matches!(verdict_a, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 
 	let mut next = client_b
 		.invoke(omp_proto::env::v1::InvokeTool {

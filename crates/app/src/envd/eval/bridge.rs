@@ -13,7 +13,8 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_core::Str;
 use omp_tool::{
-	ErasedEv, ErasedOutcome, IncomingParams, Part, PromptCaps, Registry, ToolIdentity, ToolRoute,
+	CapsBase, ErasedEv, ErasedOutcome, IncomingParams, ModelClass, Part, PromptCaps, Registry,
+	ToolIdentity, ToolRoute,
 };
 use omp_tools::eval::{idle_timeout::TimeoutHandle, kernel::NamespaceInstaller};
 use parking_lot::Mutex;
@@ -444,11 +445,20 @@ impl BridgeHost for RegistryBridgeHost {
 				ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) => {
 					let projected = self
 						.registry
-						.project_verdict(&identity, &verdict, false, &PromptCaps {
-							maximum_parts:      u16::MAX,
-							maximum_text_bytes: u32::MAX,
-							media:              true,
-						})
+						.project_verdict(
+							&identity,
+							&verdict,
+							false,
+							&PromptCaps::for_tool(
+								CapsBase {
+									maximum_parts:      u16::MAX,
+									maximum_text_bytes: u32::MAX,
+									media:              true,
+									model_class:        ModelClass::Standard,
+								},
+								&identity.rev,
+							),
+						)
 						.map_err(registry_error)?;
 					let mut value = projected_parts(projected.parts)?;
 					if projected.is_error {
@@ -851,7 +861,9 @@ mod tests {
 
 	use async_stream::stream;
 	use futures::Stream;
-	use omp_tool::{Constraint, Ev, Outcome, Rev, Tool, ToolSpec};
+	use omp_tool::{
+		Claims, Constraint, Ev, Precedence, Presentation, Rev, Tool, ToolSpec, ToolTerminal,
+	};
 	use serde::{Deserialize, Deserializer, Serialize};
 
 	use super::*;
@@ -931,13 +943,14 @@ mod tests {
 		fn new(name: &'static str, invalid: bool) -> Self {
 			Self {
 				spec: ToolSpec {
-					name:        Str::new_static(name),
-					rev:         Rev { family: Str::default(), n: 1 },
-					description: Str::new_static("eval bridge update probe"),
-					schema:      Bytes::from_static(
+					name:            Str::new_static(name),
+					rev:             Rev { family: Str::default(), n: 1 },
+					description:     Str::new_static("eval bridge update probe"),
+					schema:          Bytes::from_static(
 						br#"{"type":"object","additionalProperties":false}"#,
 					),
-					constraint:  Constraint::None,
+					constraint:      Constraint::None,
+					projection_code: [0; 32],
 				},
 				invalid,
 			}
@@ -967,7 +980,7 @@ mod tests {
 					yield Ev::Update(ProbeUpdate::Value(json!({"step": 1})));
 					yield Ev::Update(ProbeUpdate::Value(json!({"step": 2})));
 				}
-				yield Ev::Done(Outcome::Done {
+				yield Ev::Done(ToolTerminal::Done {
 					result: Ok(json!({"terminal": "done"})),
 					useless: false,
 				});
@@ -1160,11 +1173,19 @@ mod tests {
 		);
 	}
 
+	fn test_claims() -> Claims {
+		Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::new_static("omp/core"),
+			replaces:   None,
+		}
+	}
+
 	#[tokio::test]
 	async fn registry_bridge_preserves_ordered_updates_in_its_private_envelope() {
 		let mut registry = Registry::new();
 		registry
-			.register(StreamingProbe::new("update_probe", false))
+			.register(StreamingProbe::new("update_probe", false), Presentation::Slot, test_claims())
 			.expect("register update probe");
 		let host = RegistryBridgeHost::new(Arc::new(registry));
 		assert_eq!(
@@ -1186,7 +1207,11 @@ mod tests {
 	async fn registry_bridge_surfaces_invalid_update_serialization_as_a_host_fault() {
 		let mut registry = Registry::new();
 		registry
-			.register(StreamingProbe::new("invalid_update_probe", true))
+			.register(
+				StreamingProbe::new("invalid_update_probe", true),
+				Presentation::Slot,
+				test_claims(),
+			)
 			.expect("register invalid update probe");
 		let host = RegistryBridgeHost::new(Arc::new(registry));
 		let error = host

@@ -2,69 +2,122 @@ syntax = "proto3";
 
 package omp.toolhost.v1;
 
+import "omp/control/v1/control.proto";
+import "omp/env/v1/env.proto";
 import "omp/inference/v1/common.proto";
 import "omp/inference/v1/inference.proto";
+import "omp/inference/v1/models.proto";
+import "omp/telemetry/v1/telemetry.proto";
 import "omp/thread/v1/thread.proto";
+import "omp/ui/v1/ui.proto";
 
-// Python worker stdio protocol. HostFrame and WorkerFrame are encoded as
-// varint-length-delimited protobuf messages. request_id 0 is reserved for
-// WorkerHello, RegisterTools, and connection-level health traffic; invocation
-// request ids are nonzero and unique while in flight.
+// Python extension-host CONTROL protocol. Frames are varint-length-delimited;
+// request_id 0 is registration, unsolicited-event, and health traffic.
 //
 // Evolution rules:
 //   - Receivers skip unknown fields and enum values.
 //   - Experimental extensions use a namespaced ValueMap at tag 15.
 //   - Field numbers are never reused; removed fields are reserved.
-//   - A terminal ToolComplete or ToolAborted fuses an invocation stream.
-
+//   - A terminal ToolComplete, ToolArgs, or ToolAborted fuses an invocation.
+//   - New domains use nested envelopes; the original direct arms remain fixed.
 message WorkerHello {
   uint32 schema_rev = 1;
   string python_rev = 2;
   bytes worker_id = 3;
+  uint32 api_level = 4;
+  string layer = 5;
+  string tier = 6;
+  string pool = 7;
+  string host_version = 8;
+  uint64 host_generation = 9;
+  uint64 session_generation = 10;
   omp.inference.v1.ValueMap props = 15;
 }
 
-// Constraint request retained at registration; the host lowers it against the
-// selected inference route rather than silently discarding unsupported forms.
 enum GrammarSyntax {
   GRAMMAR_SYNTAX_UNSPECIFIED = 0;
   GRAMMAR_SYNTAX_LARK = 1;
   GRAMMAR_SYNTAX_REGEX = 2;
+  GRAMMAR_SYNTAX_EBNF = 3;
+  GRAMMAR_SYNTAX_GBNF = 4;
 }
 
 message SchemaConstraint {
   uint32 priority = 1;
+  omp.inference.v1.Fallback on_unsupported = 2;
 }
-
 message GrammarConstraint {
   GrammarSyntax syntax = 1;
   string definition = 2;
   uint32 priority = 3;
+  omp.inference.v1.Fallback on_unsupported = 4;
 }
-
+message TextualConstraint {
+  GrammarSyntax syntax = 1;
+  string expression = 2;
+  uint32 priority = 3;
+  omp.inference.v1.Fallback on_unsupported = 4;
+}
+message JsonConstraint {
+  bytes schema_json = 1;
+  uint32 priority = 2;
+  omp.inference.v1.Fallback on_unsupported = 3;
+}
 message ToolConstraint {
   oneof kind {
     SchemaConstraint schema = 1;
     GrammarConstraint grammar = 2;
+    TextualConstraint textual = 3;
+    JsonConstraint json = 4;
   }
 }
 
-// A worker declaration adds revision and constraint identity to the canonical
-// inference tool definition instead of duplicating name/description/schema.
+message ToolExample {
+  bytes args_json = 1;
+  optional string description = 2;
+}
 message ToolDecl {
   omp.inference.v1.ToolDef definition = 1;
   string rev = 2;
   ToolConstraint constraint = 3;
+  string extension_id = 4;
+  uint32 precedence = 5;
+  repeated string replaces = 6;
+  string summary = 7;
+  string docs = 8;
+  repeated ToolExample examples = 9;
+  bool streams_args = 10;
   omp.inference.v1.ValueMap props = 15;
 }
 
+message ExtensionDecl {
+  string extension_id = 1;
+  string version = 2;
+  uint32 api_level = 3;
+  repeated string capabilities = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SlotDecl {
+  uint32 slot = 1;
+  string class = 2;
+  sint32 priority = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message CommandDecl {
+  string name = 1;
+  string summary = 2;
+  string usage = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
 message RegisterTools {
   repeated ToolDecl tools = 1;
+  uint64 generation = 2;
+  repeated ExtensionDecl extensions = 3;
+  repeated SlotDecl slots = 4;
+  repeated CommandDecl commands = 5;
   omp.inference.v1.ValueMap props = 15;
 }
 
-// Python workers receive only committed args; speculative ArgText never crosses
-// this boundary.
 message InvokeTool {
   string call_id = 1;
   string name = 2;
@@ -73,43 +126,58 @@ message InvokeTool {
   string rev = 5;
   omp.inference.v1.ValueMap props = 15;
 }
-
 message CancelTool {
   string call_id = 1;
   string reason = 2;
   omp.inference.v1.ValueMap props = 15;
 }
-
 message ToolUpdate {
   string call_id = 1;
   bytes json = 2;
   omp.inference.v1.ValueMap props = 15;
 }
 
+message ArgIssue {
+  repeated string path = 1;
+  string expected = 2;
+  string kind = 3;
+  optional string example = 4;
+  optional string found = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+enum OutcomeKind {
+  OUTCOME_KIND_UNSPECIFIED = 0;
+  OUTCOME_KIND_OK = 1;
+  OUTCOME_KIND_FAULTED = 2;
+  OUTCOME_KIND_ARGS_REJECTED = 3;
+  OUTCOME_KIND_ABORTED = 4;
+}
 message ToolComplete {
   string call_id = 1;
   repeated omp.thread.v1.Part parts = 2;
-  // Exact tool-owned JSON value. The environment wraps it as the value of an
-  // omp-tool Verdict::Ok or Verdict::Fault according to is_error.
   bytes details_json = 3;
   bool is_error = 4;
+  bool useless = 5;
+  optional ArgIssue args_issue = 6;
+  optional omp.thread.v1.Blob details_blob = 7;
+  omp.inference.v1.ValueMap props = 15;
+  OutcomeKind kind = 16;
+}
+message ToolArgs {
+  string call_id = 1;
+  ArgIssue issue = 2;
   omp.inference.v1.ValueMap props = 15;
 }
-
-// Terminal abnormal completion used when the worker can still report a failure.
-// EOF/crash is equivalent for the in-flight call but naturally has no frame.
 message ToolAborted {
   string call_id = 1;
   string reason = 2;
   bool effects_unknown = 3;
   omp.inference.v1.ValueMap props = 15;
 }
-
 message Ping {
   uint64 nonce = 1;
   omp.inference.v1.ValueMap props = 15;
 }
-
 message Pong {
   uint64 nonce = 1;
   omp.inference.v1.ValueMap props = 15;
@@ -122,20 +190,761 @@ enum ProtocolErrorCode {
   PROTOCOL_ERROR_CODE_UNSUPPORTED = 3;
   PROTOCOL_ERROR_CODE_INTERNAL = 4;
   PROTOCOL_ERROR_CODE_BUSY = 5;
+  PROTOCOL_ERROR_CODE_PERMISSION_DENIED = 6;
 }
-
 message ProtocolError {
   ProtocolErrorCode code = 1;
   string message = 2;
   omp.inference.v1.ValueMap props = 15;
 }
 
+// Extension lifecycle and activation traffic.
+message AdmittedExtension {
+  string extension_id = 1;
+  string module = 2;
+  string rev = 3;
+}
+message AdmitExtensions {
+  repeated AdmittedExtension extensions = 1;
+  uint64 generation = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message AvailabilityDelta {
+  string name = 1;
+  string rev = 2;
+  bool available = 3;
+  optional string reason = 4;
+}
+message SetAvailability {
+  repeated AvailabilityDelta deltas = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message LifecycleHostEnvelope {
+  oneof body {
+    AdmitExtensions admit_extensions = 1;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message LifecycleWorkerEnvelope {
+  oneof body {
+    SetAvailability set_availability = 1;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Streaming-argument forwarding and pull cursor.
+message PullRequest {
+  string call_id = 1;
+  repeated string path = 2;
+  optional string key = 3;
+  repeated string aliases = 4;
+  optional bytes expected = 5;
+  uint32 chunk_bytes = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message PullReply {
+  string call_id = 1;
+  bytes chunk = 2;
+  bool complete = 3;
+  optional ArgIssue issue = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ArgumentHostEnvelope {
+  oneof body {
+    omp.env.v1.ArgText arg_text = 1;
+    omp.env.v1.ArgsCommitted args_committed = 2;
+    omp.env.v1.Interrupt interrupt = 3;
+    PullReply pull_reply = 4;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message ArgumentWorkerEnvelope {
+  oneof body {
+    PullRequest pull_request = 1;
+    ToolArgs tool_args = 2;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Hook catalog and dispatch.
+enum HookPhase {
+  HOOK_PHASE_UNSPECIFIED = 0;
+  HOOK_PHASE_PRECHECK = 1;
+  HOOK_PHASE_TRANSFORM = 2;
+  HOOK_PHASE_REVIEW = 3;
+  HOOK_PHASE_APPROVAL = 4;
+  HOOK_PHASE_OBSERVE = 5;
+}
+enum Composition {
+  COMPOSITION_UNSPECIFIED = 0;
+  COMPOSITION_REPLACE = 1;
+  COMPOSITION_APPEND = 2;
+  COMPOSITION_INTERSECT = 3;
+}
+enum OnFailure {
+  ON_FAILURE_UNSPECIFIED = 0;
+  ON_FAILURE_DEFER = 1;
+  ON_FAILURE_DENY = 2;
+}
+enum HookEventId {
+  HOOK_EVENT_UNSPECIFIED = 0;
+  HOOK_EVENT_SESSION_START = 1;
+  HOOK_EVENT_SESSION_SHUTDOWN = 2;
+  HOOK_EVENT_SESSION_SWITCH = 3;
+  HOOK_EVENT_SESSION_SWITCHED = 4;
+  HOOK_EVENT_SESSION_BRANCH = 5;
+  HOOK_EVENT_SESSION_BRANCHED = 6;
+  HOOK_EVENT_SESSION_REWIND = 7;
+  HOOK_EVENT_SESSION_REWOUND = 8;
+  HOOK_EVENT_SESSION_RESET = 9;
+  HOOK_EVENT_BEFORE_AGENT_START = 10;
+  HOOK_EVENT_AGENT_START = 11;
+  HOOK_EVENT_TURN_START = 12;
+  HOOK_EVENT_TURN_END = 13;
+  HOOK_EVENT_AGENT_SETTLED = 14;
+  HOOK_EVENT_AGENT_END = 15;
+  HOOK_EVENT_INTERRUPT = 16;
+  HOOK_EVENT_DEADLINE = 17;
+  HOOK_EVENT_MESSAGE_START = 18;
+  HOOK_EVENT_MESSAGE_UPDATE = 19;
+  HOOK_EVENT_MESSAGE_END = 20;
+  HOOK_EVENT_ITEM_COMMITTED = 21;
+  HOOK_EVENT_CALL_OPEN = 22;
+  HOOK_EVENT_TOOL_CALL = 23;
+  HOOK_EVENT_TOOL_EXECUTION_START = 24;
+  HOOK_EVENT_TOOL_UPDATE = 25;
+  HOOK_EVENT_TOOL_EXECUTION_END = 26;
+  HOOK_EVENT_TOOL_RESULT = 27;
+  HOOK_EVENT_TOOL_APPROVAL_REQUESTED = 28;
+  HOOK_EVENT_TOOL_APPROVAL_RESOLVED = 29;
+  HOOK_EVENT_DEVICE_LIST = 30;
+  HOOK_EVENT_USER_INPUT = 31;
+  HOOK_EVENT_USER_BASH = 32;
+  HOOK_EVENT_USER_EVAL = 33;
+  HOOK_EVENT_COMMAND_INVOKE = 34;
+  HOOK_EVENT_RESOURCES_DISCOVER = 35;
+  HOOK_EVENT_RESOURCES_CHANGED = 36;
+  HOOK_EVENT_PROVIDER_LOGIN = 37;
+  HOOK_EVENT_PROVIDER_REFRESH = 38;
+  HOOK_EVENT_PROVIDER_SIGN = 39;
+  HOOK_EVENT_BEFORE_REQUEST = 40;
+  HOOK_EVENT_MODELS_DISCOVER = 41;
+  HOOK_EVENT_PROVIDER_ERROR = 42;
+  HOOK_EVENT_PROVIDER_USAGE = 43;
+  HOOK_EVENT_CAPABILITY_BUDGET = 44;
+  HOOK_EVENT_MODEL_CHANGED = 45;
+  HOOK_EVENT_CREDENTIAL_DISABLED = 46;
+  HOOK_EVENT_COMPACTION = 47;
+  HOOK_EVENT_COMPACTION_DONE = 48;
+  HOOK_EVENT_THREAD_PROJECTION = 49;
+  HOOK_EVENT_SUBAGENT_SPAWN = 50;
+  HOOK_EVENT_WORKER_STATE = 51;
+  HOOK_EVENT_JOB_REGISTERED = 52;
+  HOOK_EVENT_JOB_SETTLED = 53;
+  HOOK_EVENT_EXTENSION_ACTIVATE = 54;
+  HOOK_EVENT_EXTENSION_LOAD = 55;
+  HOOK_EVENT_EXTENSION_UNLOAD = 56;
+  HOOK_EVENT_HOST_RECONNECT = 57;
+}
+message When {
+  repeated string names = 1;
+  repeated string providers = 2;
+  repeated string targets = 3;
+  repeated string roles = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SubscriptionSpec {
+  uint32 subscription_id = 1;
+  HookEventId event_id = 2;
+  HookPhase phase = 3;
+  sint32 order = 4;
+  optional When when = 5;
+  uint64 timeout_ms = 6;
+  OnFailure on_failure = 7;
+  string name = 8;
+  uint64 coalesce_ms = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Subscribe {
+  repeated uint64 mask = 1;
+  repeated SubscriptionSpec specs = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Dispatch {
+  HookEventId event_id = 1;
+  uint32 event_rev = 2;
+  uint64 dispatch_id = 3;
+  HookPhase phase = 4;
+  bytes payload = 5;
+  uint64 deadline_ms = 6;
+  repeated uint32 subscription_ids = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+message CancelDispatch {
+  uint64 dispatch_id = 1;
+  string reason = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Reply {
+  bytes payload = 1;
+  optional ProtocolError error = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Notify {
+  HookEventId event_id = 1;
+  bytes payload = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message HookDecision {
+  uint64 dispatch_id = 1;
+  string decision = 2;
+  optional bytes patch = 3;
+  optional bytes domain = 4;
+  optional string reason = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+message HookFailed {
+  uint64 dispatch_id = 1;
+  string error = 2;
+  OnFailure applied = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message WorkerRequest {
+  string op = 1;
+  bytes payload = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message BudgetPause {
+  uint64 dispatch_id = 1;
+  uint64 requested_ms = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message EffectFrame {
+  uint32 kind = 1;
+  bytes payload = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message HookHostEnvelope {
+  oneof body {
+    Dispatch dispatch = 1;
+    CancelDispatch cancel_dispatch = 2;
+    Reply reply = 3;
+    Notify notify = 4;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message HookWorkerEnvelope {
+  oneof body {
+    Subscribe subscribe = 1;
+    HookDecision decision = 2;
+    HookFailed failed = 3;
+    WorkerRequest request = 4;
+    BudgetPause budget_pause = 5;
+    EffectFrame effect = 6;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Projection, lift, render, and availability operations.
+message ProjectionKey {
+  string name = 1;
+  string rev = 2;
+  bytes caps_hash = 3;
+  bytes projection_hash = 4;
+}
+message ProjectionRequest {
+  ProjectionKey key = 1;
+  bytes verdict_json = 2;
+}
+message ProjectVerdicts {
+  repeated ProjectionRequest requests = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ProjectedVerdict {
+  ProjectionKey key = 1;
+  repeated omp.thread.v1.Part parts = 2;
+  optional string error = 3;
+}
+message ProjectedVerdicts {
+  repeated ProjectedVerdict verdicts = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message LiftCall {
+  string name = 1;
+  string from_rev = 2;
+  string to_rev = 3;
+  bytes verdict_json = 4;
+}
+message LiftCalls {
+  repeated LiftCall calls = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message LiftedCall {
+  bytes verdict_json = 1;
+  optional string error = 2;
+}
+message LiftedCalls {
+  repeated LiftedCall calls = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message RenderView {
+  string call_id = 1;
+  string name = 2;
+  string rev = 3;
+  bytes context_digest = 4;
+  bytes state = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ProjectionHostEnvelope {
+  oneof body {
+    ProjectVerdicts project_verdicts = 1;
+    LiftCalls lift_calls = 2;
+    RenderView render_view = 3;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message ProjectionWorkerEnvelope {
+  oneof body {
+    ProjectedVerdicts projected_verdicts = 1;
+    LiftedCalls lifted_calls = 2;
+    omp.ui.v1.RenderedView rendered_view = 3;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message UiHostEnvelope {
+  oneof body {
+    omp.ui.v1.UiResponse response = 1;
+    omp.ui.v1.UiDispatch dispatch = 2;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message UiWorkerEnvelope {
+  oneof body {
+    omp.ui.v1.RegisterUi register_ui = 1;
+    omp.ui.v1.UiEffect effect = 2;
+    omp.ui.v1.UiRequest request = 3;
+    omp.ui.v1.UiDispatchResult dispatch_result = 4;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Context projection and compaction.
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  MESSAGE_KIND_MESSAGE = 1;
+  MESSAGE_KIND_TOOL_CALL = 2;
+  MESSAGE_KIND_TOOL_RESULT = 3;
+  MESSAGE_KIND_REASONING = 4;
+  MESSAGE_KIND_NOTICE = 5;
+}
+message MessageRef {
+  string id = 1;
+  uint64 event = 2;
+  uint64 seq = 3;
+  MessageKind kind = 4;
+  string role = 5;
+  optional string turn_id = 6;
+  uint64 created_at_ms = 7;
+  uint64 tokens = 8;
+  uint64 byte_len = 9;
+  uint32 part_count = 10;
+  uint32 media_count = 11;
+  optional string tool = 12;
+  bool is_error = 13;
+  bool useless = 14;
+  omp.inference.v1.ValueMap props = 15;
+  bool pinned = 16;
+  bool elided = 17;
+  optional string superseded_by = 18;
+  repeated string artifacts = 19;
+  string preview = 20;
+}
+message ContextUsage {
+  uint64 total_tokens = 1;
+  uint64 context_window = 2;
+  uint64 reserve_tokens = 3;
+  uint64 usable_tokens = 4;
+  double fraction = 5;
+  uint64 prompt_head_tokens = 6;
+  uint64 device_catalog_tokens = 7;
+  uint64 message_tokens = 8;
+  uint64 media_tokens = 9;
+  uint64 compaction_epoch = 10;
+  double threshold_fraction = 11;
+  bool in_flight = 12;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ContextView {
+  string session_id = 1;
+  string turn_id = 2;
+  string model = 3;
+  string provider = 4;
+  uint64 epoch = 5;
+  repeated MessageRef messages = 6;
+  ContextUsage usage = 7;
+  string prompt_hash = 8;
+  optional uint64 reset_event = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Anchor {
+  string relation = 1;
+  optional string id = 2;
+}
+message Prune {
+  repeated string ids = 1;
+  string reason = 2;
+  bool keep_placeholder = 3;
+}
+message Replace {
+  repeated string ids = 1;
+  repeated omp.thread.v1.Part parts = 2;
+  string role = 3;
+  string label = 4;
+  string inherit_position = 5;
+}
+message Insert {
+  repeated omp.thread.v1.Part parts = 1;
+  Anchor anchor = 2;
+  string role = 3;
+  bool ephemeral = 4;
+  optional string dedupe_key = 5;
+}
+message Reorder {
+  repeated string ids = 1;
+  string before = 2;
+}
+message ContextPatch {
+  repeated Prune prune = 1;
+  repeated Replace replace = 2;
+  repeated Insert insert = 3;
+  repeated Reorder reorder = 4;
+  string note = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ThreadProjectionRequest {
+  ContextView view = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message CompactionRequest {
+  string preparation_id = 1;
+  string tier = 2;
+  string reason = 3;
+  uint64 epoch = 4;
+  uint64 tokens_before = 5;
+  uint64 target_tokens = 6;
+  string suggested_first_kept = 7;
+  repeated MessageRef to_summarize = 8;
+  repeated MessageRef to_retain = 9;
+  bool split_turn = 10;
+  optional string previous_summary = 11;
+  optional bytes previous_preserve_json = 12;
+  optional string custom_instructions = 13;
+  uint64 deadline_ms = 14;
+  omp.inference.v1.ValueMap props = 15;
+}
+message CompactionVerdict {
+  string kind = 1;
+  optional string reason = 2;
+  optional string summary = 3;
+  optional string first_kept_id = 4;
+  optional bytes details_json = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+message PromptPull {
+  uint32 slot = 1;
+  string turn_id = 2;
+  bytes context_digest = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message PromptContribution {
+  uint32 slot = 1;
+  repeated omp.thread.v1.Part parts = 2;
+  optional string cache_key = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message RegisterSlots {
+  repeated SlotDecl slots = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message FetchItem {
+  uint64 event = 1;
+  string want = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message FetchedItem {
+  omp.thread.v1.Item item = 1;
+  optional bytes verdict_json = 2;
+  optional bytes raw_args = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ContextResetNotice {
+  uint64 event = 1;
+  uint64 epoch = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ContextHostEnvelope {
+  oneof body {
+    ThreadProjectionRequest thread_projection = 1;
+    CompactionRequest compaction_request = 2;
+    PromptPull prompt_pull = 3;
+    ContextResetNotice context_reset = 4;
+    FetchedItem fetched_item = 5;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message ContextWorkerEnvelope {
+  oneof body {
+    ContextPatch context_patch = 1;
+    CompactionVerdict compaction_verdict = 2;
+    PromptContribution prompt_contribution = 3;
+    RegisterSlots register_slots = 4;
+    FetchItem fetch_item = 5;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Journal, session, usage, and artifact CONTROL traffic.
+message EntryKindDecl {
+  string name = 1;
+  string rev = 2;
+  bool display = 3;
+  bool spill = 4;
+  bool has_projection = 5;
+  bool has_renderer = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message DeclareEntryKinds {
+  repeated EntryKindDecl kinds = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message AppendEntry {
+  string kind = 1;
+  string rev = 2;
+  bytes data_json = 3;
+  repeated omp.thread.v1.Part context = 4;
+  optional bool display = 5;
+  string idempotency_key = 6;
+  uint64 host_generation = 7;
+  uint64 session_generation = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+message AppendEntriesAtomic {
+  repeated AppendEntry entries = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message QueryJournal {
+  string session = 1;
+  repeated string kinds = 2;
+  optional uint64 since_index = 3;
+  optional uint64 until_index = 4;
+  optional uint32 limit = 5;
+  bool live_only = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ListSessions {
+  optional uint32 limit = 1;
+  optional string cursor = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message QueryUsage {
+  optional string session = 1;
+  bool include_tree = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message AdoptArtifact {
+  string source_url = 1;
+  string lifetime = 2;
+  string idempotency_key = 3;
+  uint64 host_generation = 4;
+  uint64 session_generation = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+message StatArtifact {
+  string url = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ListArtifacts {
+  optional string session = 1;
+  optional uint32 limit = 2;
+  optional string cursor = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message PinArtifact {
+  string url = 1;
+  string lifetime = 2;
+  string idempotency_key = 3;
+  uint64 host_generation = 4;
+  uint64 session_generation = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+message EntryAppended {
+  repeated uint64 indexes = 1;
+  bool terminal = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message JournalRow {
+  uint64 index = 1;
+  string kind = 2;
+  string rev = 3;
+  bytes data_json = 4;
+  repeated omp.thread.v1.Part context = 5;
+  bool terminal = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SessionRow {
+  string session = 1;
+  string cwd_uri = 2;
+  uint64 updated_at_ms = 3;
+  bool terminal = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message UsageReport {
+  omp.inference.v1.Usage usage = 1;
+  bool terminal = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ArtifactRow {
+  string url = 1;
+  bytes hash = 2;
+  uint64 size = 3;
+  string lifetime = 4;
+  bool pinned = 5;
+  bool terminal = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message JournalWorkerEnvelope {
+  oneof body {
+    DeclareEntryKinds declare_entry_kinds = 1;
+    AppendEntry append_entry = 2;
+    AppendEntriesAtomic append_entries_atomic = 3;
+    QueryJournal query_journal = 4;
+    ListSessions list_sessions = 5;
+    QueryUsage query_usage = 6;
+    AdoptArtifact adopt_artifact = 7;
+    StatArtifact stat_artifact = 8;
+    ListArtifacts list_artifacts = 9;
+    PinArtifact pin_artifact = 10;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message JournalHostEnvelope {
+  oneof body {
+    EntryAppended entry_appended = 1;
+    JournalRow journal_row = 2;
+    SessionRow session_row = 3;
+    UsageReport usage_report = 4;
+    ArtifactRow artifact_row = 5;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ControlHostEnvelope {
+  oneof body {
+    omp.control.v1.ControlResponse response = 1;
+    omp.control.v1.ControlEvent event = 2;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message ControlWorkerEnvelope {
+  omp.control.v1.ControlRequest request = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Extension-contributed provider and turn-intent declarations.
+message ModelDeclaration {
+  string id = 1;
+  string model = 2;
+  string name = 3;
+  repeated omp.inference.v1.Facet facets = 4;
+  repeated omp.inference.v1.Modality inputs = 5;
+  repeated omp.inference.v1.Modality outputs = 6;
+  repeated omp.inference.v1.Effort efforts = 7;
+  repeated omp.inference.v1.Price pricing = 8;
+  omp.inference.v1.Availability availability = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+message DeclareProvider {
+  string provider = 1;
+  repeated ModelDeclaration models = 2;
+  uint32 priority = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message RetractProvider {
+  string provider = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ReplaceProvider {
+  string provider = 1;
+  repeated ModelDeclaration models = 2;
+  uint32 priority = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SetIntents {
+  string turn_id = 1;
+  repeated ToolConstraint intents = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ClearIntents {
+  string turn_id = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Escalation {
+  string what = 1;
+  string penalty = 2;
+}
+message ConstraintReceipt {
+  repeated omp.inference.v1.Unsupported unsupported = 1;
+  repeated Escalation escalations = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message InferenceHostEnvelope {
+  oneof body {
+    ConstraintReceipt receipt = 1;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+message InferenceWorkerEnvelope {
+  oneof body {
+    DeclareProvider declare_provider = 1;
+    RetractProvider retract_provider = 2;
+    ReplaceProvider replace_provider = 3;
+    SetIntents set_intents = 4;
+    ClearIntents clear_intents = 5;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message TelemetryHostEnvelope {
+  omp.telemetry.v1.Telemetry telemetry = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message TelemetryWorkerEnvelope {
+  omp.telemetry.v1.RegisterSinks register_sinks = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// One unambiguous owner per top-level tag. Domain growth occurs inside the
+// nested envelopes so tag 15 remains ValueMap and existing direct arms stay put.
 message HostFrame {
   uint64 request_id = 1;
   oneof body {
     InvokeTool invoke_tool = 2;
     CancelTool cancel_tool = 3;
     Ping ping = 4;
+    LifecycleHostEnvelope lifecycle = 5;
+    ArgumentHostEnvelope arguments = 6;
+    HookHostEnvelope hooks = 7;
+    ProjectionHostEnvelope projection = 8;
+    UiHostEnvelope ui = 9;
+    ContextHostEnvelope context = 10;
+    JournalHostEnvelope journal = 11;
+    ControlHostEnvelope control = 12;
+    InferenceHostEnvelope inference = 13;
+    TelemetryHostEnvelope telemetry = 14;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -151,6 +960,16 @@ message WorkerFrame {
     Pong pong = 7;
     Ping ping = 8;
     ProtocolError error = 9;
+    LifecycleWorkerEnvelope lifecycle = 10;
+    ArgumentWorkerEnvelope arguments = 11;
+    HookWorkerEnvelope hooks = 12;
+    ProjectionWorkerEnvelope projection = 13;
+    UiWorkerEnvelope ui = 14;
+    ContextWorkerEnvelope context = 16;
+    JournalWorkerEnvelope journal = 17;
+    ControlWorkerEnvelope control = 18;
+    InferenceWorkerEnvelope inference = 19;
+    TelemetryWorkerEnvelope telemetry = 20;
   }
   omp.inference.v1.ValueMap props = 15;
 }

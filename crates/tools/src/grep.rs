@@ -13,7 +13,7 @@ use omp_core::Str;
 use omp_hashline::format_hashline_header;
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, Outcome, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -373,9 +373,9 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W,
 		workspace,
 		blobs,
 		spec: ToolSpec {
-			name:        Str::from("grep"),
-			rev:         Rev { family: Str::new(""), n: 1 },
-			description: Str::new_static(
+			name:            Str::from("grep"),
+			rev:             Rev { family: Str::new(""), n: 1 },
+			description:     Str::new_static(
 				"Searches files/internal URLs: Rust regex, PCRE2 fallback.\n\n<instruction>\n- \
 				 `path`: known files, directories, globs, internal URLs; roots `;`-separated.\n- \
 				 Broad searches may time out → narrow scope or use `glob` first.\n- One-file line \
@@ -383,8 +383,16 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W,
 				 `\\\\n` enables cross-line patterns.\n</instruction>\n\n<critical>\n- MUST use \
 				 instead of shell `grep`/`rg`.\n</critical>",
 			),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 100 },
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("grep.rs"),
+			),
 		},
 	}
 }
@@ -965,7 +973,7 @@ fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	let useless = result
 		.as_ref()
 		.is_ok_and(|payload| payload.files.is_empty() && payload.total_files == 0);
-	Ev::Done(Outcome::Done { result, useless })
+	Ev::Done(ToolTerminal::Done { result, useless })
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

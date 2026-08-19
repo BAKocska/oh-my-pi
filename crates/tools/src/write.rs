@@ -16,7 +16,7 @@ use omp_core::Str;
 use omp_hashline::format_hashline_header;
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Ev, IncomingParams, InterruptWaitError,
-	Outcome, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -372,11 +372,19 @@ pub fn tool<D: WriteDocuments>(documents: D) -> WriteTool<D> {
 	WriteTool {
 		documents,
 		spec: ToolSpec {
-			name:        "write".into(),
-			rev:         Rev { family: Str::new(""), n: 1 },
-			description: DESCRIPTION.into(),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 100 },
+			name:            "write".into(),
+			rev:             Rev { family: Str::new(""), n: 1 },
+			description:     DESCRIPTION.into(),
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("write.rs"),
+			),
 		},
 	}
 }
@@ -856,7 +864,7 @@ fn render_payload(payload: &Payload) -> String {
 }
 
 const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
-	Ev::Done(Outcome::Done { result, useless: false })
+	Ev::Done(ToolTerminal::Done { result, useless: false })
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

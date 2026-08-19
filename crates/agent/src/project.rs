@@ -7,8 +7,8 @@ use omp_core::{Str, encoding::hex};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::transcript::{AmendPatch, Entry, Kind, Log};
 use omp_tool::{
-	Abort, Part as ToolPart, ProjectedCall, PromptCaps, RecordedCallOwned, Registry as ToolRegistry,
-	Rev, TOOL_REV_PROP, ToolIdentity, Verdict,
+	Abort, CallOutcome, CapsBase, Part as ToolPart, ProjectedCall, PromptCaps, RecordedCallOwned,
+	Registry as ToolRegistry, Rev, TOOL_REV_PROP, ToolIdentity,
 };
 use thiserror::Error;
 
@@ -21,9 +21,9 @@ pub enum ProjectionError {
 	/// A committed tool revision string was malformed.
 	#[error("omp/tool-rev contains an invalid revision")]
 	InvalidRevision,
-	/// Structured tool verdict JSON was invalid.
-	#[error("invalid tool verdict JSON: {0}")]
-	VerdictJson(#[from] serde_json::Error),
+	/// Structured tool call-outcome JSON was invalid.
+	#[error("invalid tool call-outcome JSON: {0}")]
+	OutcomeJson(#[from] serde_json::Error),
 	/// A model-facing JSON part was not UTF-8.
 	#[error("tool JSON part is not UTF-8: {0}")]
 	PartUtf8(#[from] std::str::Utf8Error),
@@ -48,7 +48,7 @@ pub enum ProjectionError {
 pub fn project_journal(
 	log: &Log,
 	tool_registry: &ToolRegistry,
-	caps: &PromptCaps,
+	caps: &CapsBase,
 ) -> Result<thread_pb::Thread, ProjectionError> {
 	let mut items = Vec::new();
 	let mut positions = BTreeMap::new();
@@ -92,7 +92,7 @@ pub fn project_journal(
 pub fn project_thread_history(
 	thread: &thread_pb::Thread,
 	tool_registry: &ToolRegistry,
-	caps: &PromptCaps,
+	caps: &CapsBase,
 ) -> Result<thread_pb::Thread, ProjectionError> {
 	let mut projected = thread.clone();
 	for call_index in 0..projected.items.len() {
@@ -150,8 +150,9 @@ pub fn project_thread_history(
 		let ProjectedCall::Live(live) = tool_registry.project(original) else {
 			continue;
 		};
+		let caps = PromptCaps::for_tool(*caps, &live.identity.rev);
 		let rendered =
-			tool_registry.project_verdict(&live.identity, &live.verdict, recorded_useless, caps)?;
+			tool_registry.project_verdict(&live.identity, &live.verdict, recorded_useless, &caps)?;
 		let lifted_verdict: serde_json::Value = serde_json::from_slice(&live.verdict)?;
 		let lifted_details = json_proto_value(lifted_verdict);
 		let lifted_parts = tool_parts(&rendered.parts)?;
@@ -202,8 +203,8 @@ pub fn recovery_tool_result_item(
 		Abort::InputDropped => "aborted: invocation input dropped before commit".to_owned(),
 		Abort::MissingOutcome => "aborted: executor ended without a terminal outcome".to_owned(),
 	};
-	let verdict = Verdict::<serde_json::Value, serde_json::Value>::Aborted(abort);
-	let raw = serde_json::to_vec(&verdict)?;
+	let outcome = CallOutcome::<serde_json::Value, serde_json::Value>::aborted(abort);
+	let raw = serde_json::to_vec(&outcome)?;
 	tool_result_item(created_at_ms, &call.id, &identity, &raw, true, false, &[ToolPart::Text {
 		text: Str::from(text),
 	}])
@@ -402,7 +403,7 @@ mod tests {
 	use omp_core::Str;
 	use omp_proto::thread::v1 as thread_pb;
 	use omp_storage::transcript::{Event, Header, ItemRecord, Kind, SessionId, Writer, load};
-	use omp_tool::PromptCaps;
+	use omp_tool::{CapsBase, ModelClass};
 
 	use super::project_journal;
 
@@ -451,7 +452,12 @@ mod tests {
 		let projected = project_journal(
 			&load(&path).expect("load transcript"),
 			&omp_tool::Registry::new(),
-			&PromptCaps { maximum_parts: 1, maximum_text_bytes: 1024, media: false },
+			&CapsBase {
+				maximum_parts:      1,
+				maximum_text_bytes: 1024,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
 		)
 		.expect("project transcript");
 		assert_eq!(projected.items, vec![item]);

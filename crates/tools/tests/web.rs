@@ -10,7 +10,9 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_ar::zip::Writer;
 use omp_core::Str;
-use omp_tool::{BlobRef, Ev, IncomingParams, Outcome, Part, PromptCaps, Tool};
+use omp_tool::{
+	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
+};
 use omp_tools::read::{
 	self, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord, SourceStat,
 	web::{
@@ -153,14 +155,21 @@ async fn read_tool_text(path: &str, responses: impl IntoIterator<Item = HttpResp
 		.args_committed(Str::from(json!({ "path": path }).to_string()))
 		.expect("read invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
-	let [Ev::Done(Outcome::Done { result, .. })] = events.as_slice() else {
+	let [Ev::Done(ToolTerminal::Done { result, .. })] = events.as_slice() else {
 		panic!("expected one terminal read event: {events:?}");
 	};
-	let parts = tool.prompt(result.as_ref(), &PromptCaps {
-		maximum_parts:      16,
-		maximum_text_bytes: u32::MAX,
-		media:              false,
-	});
+	let parts = tool.prompt(
+		result.as_ref(),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts:      16,
+				maximum_text_bytes: u32::MAX,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		),
+	);
 	let [Part::Text { text }] = parts.as_slice() else {
 		panic!("expected one model-facing web text part: {parts:?}");
 	};

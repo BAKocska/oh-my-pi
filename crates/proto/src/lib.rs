@@ -39,7 +39,7 @@ pub use prost;
 ///
 /// This is bumped for every wire-visible schema change and is the revision
 /// compared by the `omp.gateway.v1.Hello` handshake.
-pub const SCHEMA_REV: u32 = 6;
+pub const SCHEMA_REV: u32 = 7;
 
 /// Generated packages under the protobuf `omp` namespace.
 pub mod omp {
@@ -220,6 +220,106 @@ pub mod omp {
 		}
 	}
 
+	/// Types generated from `omp.policy.v1`: portable policy facts and denials.
+	pub mod policy {
+		/// Version 1.
+		pub mod v1 {
+			#![allow(
+				missing_docs,
+				clippy::pedantic,
+				clippy::nursery,
+				reason = "prost/tonic output is machine-generated and cannot follow handwritten \
+				          documentation and style conventions"
+			)]
+			#![allow(
+				clippy::allow_attributes_without_reason,
+				reason = "prost/tonic emits compatibility allow attributes without Rust reason \
+				          metadata"
+			)]
+			#![allow(
+				clippy::large_enum_variant,
+				reason = "prost maps protobuf oneofs directly to enums; boxing would change the \
+				          generated Rust API"
+			)]
+			include!(concat!(env!("OUT_DIR"), "/omp.policy.v1.rs"));
+		}
+	}
+
+	/// Types generated from `omp.ui.v1`: extension UI effects and dispatch.
+	pub mod ui {
+		/// Version 1.
+		pub mod v1 {
+			#![allow(
+				missing_docs,
+				clippy::pedantic,
+				clippy::nursery,
+				reason = "prost/tonic output is machine-generated and cannot follow handwritten \
+				          documentation and style conventions"
+			)]
+			#![allow(
+				clippy::allow_attributes_without_reason,
+				reason = "prost/tonic emits compatibility allow attributes without Rust reason \
+				          metadata"
+			)]
+			#![allow(
+				clippy::large_enum_variant,
+				reason = "prost maps protobuf oneofs directly to enums; boxing would change the \
+				          generated Rust API"
+			)]
+			include!(concat!(env!("OUT_DIR"), "/omp.ui.v1.rs"));
+		}
+	}
+
+	/// Types generated from `omp.control.v1`: agents and durable control.
+	pub mod control {
+		/// Version 1.
+		pub mod v1 {
+			#![allow(
+				missing_docs,
+				clippy::pedantic,
+				clippy::nursery,
+				reason = "prost/tonic output is machine-generated and cannot follow handwritten \
+				          documentation and style conventions"
+			)]
+			#![allow(
+				clippy::allow_attributes_without_reason,
+				reason = "prost/tonic emits compatibility allow attributes without Rust reason \
+				          metadata"
+			)]
+			#![allow(
+				clippy::large_enum_variant,
+				reason = "prost maps protobuf oneofs directly to enums; boxing would change the \
+				          generated Rust API"
+			)]
+			include!(concat!(env!("OUT_DIR"), "/omp.control.v1.rs"));
+		}
+	}
+
+	/// Types generated from `omp.telemetry.v1`: firehose events and sinks.
+	pub mod telemetry {
+		/// Version 1.
+		pub mod v1 {
+			#![allow(
+				missing_docs,
+				clippy::pedantic,
+				clippy::nursery,
+				reason = "prost/tonic output is machine-generated and cannot follow handwritten \
+				          documentation and style conventions"
+			)]
+			#![allow(
+				clippy::allow_attributes_without_reason,
+				reason = "prost/tonic emits compatibility allow attributes without Rust reason \
+				          metadata"
+			)]
+			#![allow(
+				clippy::large_enum_variant,
+				reason = "prost maps protobuf oneofs directly to enums; boxing would change the \
+				          generated Rust API"
+			)]
+			include!(concat!(env!("OUT_DIR"), "/omp.telemetry.v1.rs"));
+		}
+	}
+
 	/// Types generated from `omp.toolhost.v1`: Python worker stdio protocol.
 	pub mod toolhost {
 		/// Version 1.
@@ -246,4 +346,6 @@ pub mod omp {
 	}
 }
 
-pub use omp::{auth, blob, document, env, gateway, inference, thread, toolhost};
+pub use omp::{
+	auth, blob, control, document, env, gateway, inference, policy, telemetry, thread, toolhost, ui,
+};

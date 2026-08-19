@@ -33,7 +33,7 @@ use omp_proto::{
 	thread::v1::{Item, Message, Part, Role, Thread, item, part},
 };
 use omp_storage::transcript::{Header, Kind, SessionId, read_header, read_line};
-use omp_tool::{LoweringCaps, PromptCaps, Registry};
+use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
 use parking_lot::Mutex;
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
@@ -47,8 +47,12 @@ use crate::{
 	cli::ChatArgs,
 };
 
-const PROMPT_CAPS: PromptCaps =
-	PromptCaps { maximum_parts: 1, maximum_text_bytes: 64 * 1024, media: false };
+const CHAT_CAPS_BASE: CapsBase = CapsBase {
+	maximum_parts:      1,
+	maximum_text_bytes: 64 * 1024,
+	media:              false,
+	model_class:        ModelClass::Standard,
+};
 const DEFAULT_EVAL_CONCURRENCY_LIMIT: usize = 32;
 
 /// Failures while resolving or running one durable project-chat session.
@@ -108,6 +112,9 @@ pub enum ChatError {
 	/// A tool schema could not be encoded for the turn protocol.
 	#[error("could not encode tool schema")]
 	ToolSchema(#[source] serde_json::Error),
+	/// The live tool registry could not lower its advertised slots.
+	#[error(transparent)]
+	ToolRegistry(#[from] omp_tool::RegistryError),
 	/// The requested model selector names a catalog route, not a model.
 	#[error("`{selector}` is a route id, not a model{hint}")]
 	ModelSelectorIsRoute {
@@ -629,7 +636,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			self.env.clone(),
 			AgentState::new(child_snapshot),
 			journal,
-			PROMPT_CAPS,
+			CHAT_CAPS_BASE,
 		);
 		let summary = child
 			.submit(
@@ -839,7 +846,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		};
 		let Session { id, journal, initial_items } = session;
 		let current_id = id.clone();
-		let agent = Agent::new(client.clone(), env.clone(), state.clone(), journal, PROMPT_CAPS);
+		let agent = Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
 		let exit = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
@@ -1029,7 +1036,7 @@ fn open_session(
 			cwd:     root.to_owned(),
 		})?
 	};
-	let initial_items = project_journal(&journal.load()?, registry, &PROMPT_CAPS)?.items;
+	let initial_items = project_journal(&journal.load()?, registry, &CHAT_CAPS_BASE)?.items;
 	Ok(Session { id, journal, initial_items })
 }
 
@@ -1201,7 +1208,7 @@ fn agent_snapshot(
 		registry.advertise(LoweringCaps {
 			strict_schema: true,
 			grammar:       GrammarBits::LARK | GrammarBits::REGEX | GrammarBits::EBNF,
-		})
+		})?
 	};
 	let mut enabled_tools = Vec::with_capacity(advertised.len());
 	let mut tools = Vec::with_capacity(advertised.len());

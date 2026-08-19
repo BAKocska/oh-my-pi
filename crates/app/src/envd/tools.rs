@@ -5,8 +5,13 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use omp_core::Str;
-use omp_proto::toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint};
-use omp_tool::{Constraint, GrammarSyntax, Registry, Rev, ToolSpec};
+use omp_proto::{
+	prost::Message as _,
+	toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint},
+};
+use omp_tool::{
+	Claims, Constraint, GrammarSyntax, Precedence, Presentation, Registry, Rev, ToolSpec,
+};
 use omp_tools::edit::FormatPolicy;
 
 use super::{
@@ -25,8 +30,8 @@ use super::{
 /// Builds the complete registry shared by environment dispatch and the agent.
 ///
 /// Resource adapters are cloned into their typed executors. Worker declarations
-/// occupy explicit worker routes: they are advertised by the registry but can
-/// only be invoked by the environment's worker supervisor.
+/// occupy device presentation entries and explicit worker routes; only the
+/// environment's worker supervisor can invoke them.
 pub fn production_registry(
 	documents: &DocumentHost,
 	blobs: &BlobHost,
@@ -41,23 +46,50 @@ pub fn production_registry(
 		ensure_name_absent(&registry, name)?;
 	}
 	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
-	registry.register(omp_tools::read::tool(read_sources, blobs.clone()))?;
-	registry.register(omp_tools::edit::tool(documents.clone(), FormatPolicy::Configured))?;
-	registry.register(omp_tools::write::tool(documents.clone()))?;
-	registry
-		.register(omp_tools::shell::shell(ShellExecHost::new(exec.clone(), root_uri.clone())))?;
+	registry.register(
+		omp_tools::read::tool(read_sources, blobs.clone()),
+		Presentation::Slot,
+		core_claims(),
+	)?;
+	registry.register(
+		omp_tools::edit::tool(documents.clone(), FormatPolicy::Configured),
+		Presentation::Slot,
+		core_claims(),
+	)?;
+	registry.register(
+		omp_tools::write::tool(documents.clone()),
+		Presentation::Slot,
+		core_claims(),
+	)?;
+	registry.register(
+		omp_tools::shell::shell(ShellExecHost::new(exec.clone(), root_uri.clone())),
+		Presentation::Slot,
+		core_claims(),
+	)?;
 	let search = WorkspaceSearchAdapter::new(workspace.clone(), documents.clone());
-	registry.register(omp_tools::grep::tool(search.clone(), blobs.clone()))?;
-	registry.register(omp_tools::glob::tool(search, blobs.clone()))?;
+	registry.register(
+		omp_tools::grep::tool(search.clone(), blobs.clone()),
+		Presentation::Slot,
+		core_claims(),
+	)?;
+	registry.register(
+		omp_tools::glob::tool(search, blobs.clone()),
+		Presentation::Slot,
+		core_claims(),
+	)?;
 	let eval_host = Arc::new(SessionBridgeHost::new());
 	let eval_exec = ProcessEvalExec::production(Arc::clone(&eval_host))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
 	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
-	registry.register(eval_tool)?;
+	registry.register(eval_tool, Presentation::Slot, core_claims())?;
 	for declaration in workers.registrations() {
 		let spec = worker_spec(declaration)?;
 		ensure_name_absent(&registry, &spec.name)?;
-		registry.register_worker(spec)?;
+		registry.register_worker(spec, Presentation::Device, Claims {
+			precedence: Precedence::DEFAULT,
+			claimant:   Str::from(declaration.extension_id.as_str()),
+			replaces:   None,
+		})?;
 	}
 	let registry = Arc::new(registry);
 	eval_host
@@ -87,17 +119,36 @@ fn ensure_name_absent(registry: &Registry, name: &str) -> Result<(), EnvdError> 
 	Ok(())
 }
 
+fn core_claims() -> Claims {
+	Claims {
+		precedence: Precedence::CORE,
+		claimant:   Str::new_static("omp/core"),
+		replaces:   None,
+	}
+}
+
 fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 	let definition = declaration.definition.as_ref().ok_or_else(|| {
 		EnvdError::WorkerDeclaration(Str::new_static("worker tool declaration has no definition"))
 	})?;
+	if declaration.extension_id.is_empty() {
+		return Err(worker_declaration_error("worker tool declaration has no extension id"));
+	}
 	Ok(ToolSpec {
-		name:        Str::from(definition.name.as_str()),
-		rev:         parse_revision(&declaration.rev)?,
-		description: Str::from(definition.description.as_str()),
-		schema:      definition.schema_json.clone(),
-		constraint:  worker_constraint(declaration)?,
+		name:            Str::from(definition.name.as_str()),
+		rev:             parse_revision(&declaration.rev)?,
+		description:     Str::from(definition.description.as_str()),
+		schema:          definition.schema_json.clone(),
+		constraint:      worker_constraint(declaration)?,
+		projection_code: worker_projection_code(declaration),
 	})
+}
+
+fn worker_projection_code(declaration: &ToolDecl) -> [u8; 32] {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(b"omp/frozen-worker-registration/v1");
+	hasher.update(&declaration.encode_to_vec());
+	*hasher.finalize().as_bytes()
 }
 
 fn parse_revision(value: &str) -> Result<Rev, EnvdError> {
@@ -124,15 +175,19 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 			.and_then(|definition| definition.strict)
 			.unwrap_or(false);
 		return Ok(if strict {
-			Constraint::Schema { priority: 100 }
+			Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_proto::inference::v1::Fallback::Unspecified,
+			}
 		} else {
 			Constraint::None
 		});
 	};
 	match kind {
-		tool_constraint::Kind::Schema(schema) => {
-			Ok(Constraint::Schema { priority: constraint_priority(schema.priority)? })
-		},
+		tool_constraint::Kind::Schema(schema) => Ok(Constraint::Schema {
+			priority:       constraint_priority(schema.priority)?,
+			on_unsupported: omp_proto::inference::v1::Fallback::Unspecified,
+		}),
 		tool_constraint::Kind::Grammar(grammar) => {
 			let syntax = match WorkerGrammarSyntax::try_from(grammar.syntax) {
 				Ok(WorkerGrammarSyntax::Lark) => GrammarSyntax::Lark,
@@ -147,7 +202,14 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 				syntax,
 				definition: Str::from(grammar.definition.as_str()),
 				priority: constraint_priority(grammar.priority)?,
+				on_unsupported: omp_proto::inference::v1::Fallback::Unspecified,
 			})
+		},
+		tool_constraint::Kind::Textual(_) => {
+			Err(worker_declaration_error("worker textual constraints are not supported"))
+		},
+		tool_constraint::Kind::Json(_) => {
+			Err(worker_declaration_error("worker JSON constraints are not supported"))
 		},
 	}
 }

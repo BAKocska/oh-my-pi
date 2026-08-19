@@ -662,7 +662,7 @@ fn select_key(
 				if !progress.complete {
 					return Probe::Pending;
 				}
-				<&str>::from(&progress.value) == wanted
+				progress.value.as_str() == wanted
 			},
 			Some(_) => {
 				let key = parser.unquoted_key();

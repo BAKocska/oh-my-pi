@@ -148,6 +148,7 @@ message ReadDocumentResponse {
     ContentSlices slices = 3;
   }
 }
+
 // Kept and elided summary coordinates are 1-based inclusive original source
 // lines. They intentionally differ from zero-based half-open ReadSelection.
 message CodeSummaryOptions {
@@ -584,7 +585,6 @@ message SetPermissionsResponse {
   PathMetadata metadata = 1;
 }
 
-
 // Exact byte replacement against the mutation's base revision. Edits in one
 // set must be sorted by start, non-overlapping, and use base-revision offsets.
 message ByteEdit {
@@ -671,6 +671,7 @@ message MoveMutation {
     bool destination_must_not_exist = 4;
   }
 }
+
 // Atomically moves the source identity and installs exact final bytes at the
 // destination. The source revision and destination precondition are checked
 // before either path is durably changed.
@@ -684,7 +685,6 @@ message MoveWithContentMutation {
   bytes content = 5;
   FormatPolicy format_policy = 6;
 }
-
 
 // Operations execute in declared order against a transaction-local overlay.
 message DocumentMutation {

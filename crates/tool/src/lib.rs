@@ -15,12 +15,16 @@ pub use incoming::{
 	CommitError, IncomingParams, Interrupt, InterruptWaitError, InterruptibleParams,
 	InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
 };
-use omp_core::Str;
+use omp_core::{InvocationPhase, Str};
+pub use omp_proto::inference::v1::Fallback;
 pub use registry::{
-	ConstraintDisposition, ErasedEv, ErasedOutcome, ErasedStream, LoweredTool, LoweringCaps,
-	ProjectedCall, ProjectedVerdict, Registry, RegistryError, ToolRoute,
+	Claim, Claims, ConstraintDisposition, ErasedEv, ErasedOutcome, ErasedStream, LoweredTool,
+	LoweringCaps, MountedDevice, Precedence, ProjectedCall, ProjectedVerdict, Registry,
+	RegistryError, ShadowClaim, ToolRoute,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use smallvec::SmallVec;
+use thiserror::Error;
 
 /// Generates the compact, deterministic JSON Schema exposed to models for `T`.
 ///
@@ -42,9 +46,32 @@ pub fn schema<T: schemars::JsonSchema>() -> Bytes {
 			.expect("schemars-generated JSON Schema must serialize to compact JSON"),
 	)
 }
+
 /// Namespaced thread-item property carrying a committed tool revision.
 pub const TOOL_REV_PROP: &str = "omp/tool-rev";
-use thiserror::Error;
+
+/// Model-facing registration surface for a tool declaration.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Presentation {
+	/// A stable schema slot advertised directly to the model.
+	Slot,
+	/// A catalog entry reached through the dynamic device tool.
+	Device,
+}
 
 /// One argument-dialect revision within a revision family.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -78,15 +105,39 @@ pub struct ToolIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolSpec {
 	/// Stable wire name exposed to models.
-	pub name:        Str,
+	pub name:            Str,
 	/// Transcript revision.
-	pub rev:         Rev,
+	pub rev:             Rev,
 	/// Model-facing purpose.
-	pub description: Str,
+	pub description:     Str,
 	/// Complete JSON Schema bytes.
-	pub schema:      Bytes,
+	pub schema:          Bytes,
 	/// Requested constrained-sampling behavior.
-	pub constraint:  Constraint,
+	pub constraint:      Constraint,
+	/// Content identity of the code that produces model-facing projections.
+	///
+	/// Native registrations use their crate/build identity. Supervised workers
+	/// use the frozen module-content hash supplied at registration.
+	pub projection_code: [u8; 32],
+}
+
+/// Computes a native projection-code identity without allocating.
+///
+/// `module_source` must contain the source bytes that implement the tool's
+/// projection. Package identity separates equal source shipped by unrelated
+/// crates, while source bytes move the identity when projection code changes.
+#[must_use]
+pub fn native_projection_code(
+	crate_name: &str,
+	crate_version: &str,
+	module_source: &[u8],
+) -> [u8; 32] {
+	let mut hasher = blake3::Hasher::new();
+	for field in [crate_name.as_bytes(), crate_version.as_bytes(), module_source] {
+		hasher.update(&(field.len() as u64).to_le_bytes());
+		hasher.update(field);
+	}
+	*hasher.finalize().as_bytes()
 }
 
 impl ToolSpec {
@@ -105,22 +156,40 @@ pub enum Constraint {
 	/// Strict JSON Schema sampling when supported.
 	Schema {
 		/// Relative request priority retained for upstream negotiation.
-		priority: u8,
+		priority:       u8,
+		/// Required behavior when the selected route lacks strict sampling.
+		#[serde(default)]
+		on_unsupported: Fallback,
 	},
 	/// Freeform input constrained by a grammar.
 	Grammar {
 		/// Grammar language.
-		syntax:     GrammarSyntax,
+		syntax:         GrammarSyntax,
 		/// Complete grammar definition.
-		definition: Str,
+		definition:     Str,
 		/// Relative request priority retained for upstream negotiation.
-		priority:   u8,
+		priority:       u8,
+		/// Required behavior when the selected route lacks this grammar.
+		#[serde(default)]
+		on_unsupported: Fallback,
 	},
 }
 
 /// Grammar languages represented in the model catalog.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum GrammarSyntax {
 	/// Lark grammar.
 	Lark,
@@ -130,7 +199,96 @@ pub enum GrammarSyntax {
 	Ebnf,
 }
 
-/// Deterministic model-facing projection budget.
+/// Argument dialect used by the live tool revision.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[repr(u8)]
+pub enum Dialect {
+	/// Hashline's snapshot-anchored edit language.
+	#[serde(rename = "hl")]
+	#[strum(serialize = "hl")]
+	Hashline,
+	/// Old-text/new-text replacement.
+	#[serde(rename = "rep")]
+	#[strum(serialize = "rep")]
+	Replace,
+	/// Patch-envelope or unified-diff input.
+	#[serde(rename = "patch")]
+	#[strum(serialize = "patch")]
+	Patch,
+	/// A vendor-trained or otherwise unclassified native dialect.
+	#[default]
+	#[serde(rename = "native")]
+	#[strum(serialize = "native")]
+	Native,
+}
+
+impl Dialect {
+	/// Classifies a revision family without consulting model names.
+	#[must_use]
+	pub fn for_rev(rev: &Rev) -> Self {
+		rev.family.parse().unwrap_or_default()
+	}
+}
+
+/// Coarse, ordered model capability band used only for projection verbosity.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	Hash,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ModelClass {
+	/// Embedded classification or titling model.
+	Tiny     = 0,
+	/// Small local model.
+	Small    = 1,
+	/// Mainstream hosted model and the conservative default.
+	#[default]
+	Standard = 2,
+	/// Long-context flagship model.
+	Frontier = 3,
+}
+
+/// Model-wide projection inputs shared by every tool in one request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapsBase {
+	/// Maximum number of parts a tool may emit.
+	pub maximum_parts:      u16,
+	/// Maximum aggregate UTF-8 text bytes.
+	pub maximum_text_bytes: u32,
+	/// Whether blob-backed media parts may be exposed to the model.
+	pub media:              bool,
+	/// Catalog-derived model capability band.
+	pub model_class:        ModelClass,
+}
+
+/// Deterministic model-facing projection budget for one live tool revision.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PromptCaps {
 	/// Maximum number of parts a tool may emit.
@@ -139,6 +297,121 @@ pub struct PromptCaps {
 	pub maximum_text_bytes: u32,
 	/// Whether blob-backed media parts may be exposed to the model.
 	pub media:              bool,
+	/// Argument dialect derived from the live revision family.
+	#[serde(default)]
+	pub dialect:            Dialect,
+	/// Catalog-derived model capability band.
+	#[serde(default)]
+	pub model_class:        ModelClass,
+}
+
+impl PromptCaps {
+	/// Combines model-wide limits with the dialect of `live_rev`.
+	#[must_use]
+	pub fn for_tool(base: CapsBase, live_rev: &Rev) -> Self {
+		Self {
+			maximum_parts:      base.maximum_parts,
+			maximum_text_bytes: base.maximum_text_bytes,
+			media:              base.media,
+			dialect:            Dialect::for_rev(live_rev),
+			model_class:        base.model_class,
+		}
+	}
+
+	/// Returns the model-wide inputs independent of a tool revision.
+	#[must_use]
+	pub const fn base(self) -> CapsBase {
+		CapsBase {
+			maximum_parts:      self.maximum_parts,
+			maximum_text_bytes: self.maximum_text_bytes,
+			media:              self.media,
+			model_class:        self.model_class,
+		}
+	}
+}
+
+/// Whether an operation leaves durable state.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Durability {
+	/// No durable state is promised.
+	Ephemeral,
+	/// The operation acknowledges a durable state transition.
+	Durable,
+}
+
+/// Cost class charged by an operation.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CostClass {
+	/// No separately metered resource is consumed.
+	None,
+	/// A bounded local or quota-metered resource is consumed.
+	Metered,
+	/// A paid upstream resource may be consumed.
+	Paid,
+}
+
+/// Runtime authority responsible for enforcing an operation specification.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Authority {
+	/// The core control-plane boundary enforces the operation.
+	Core,
+	/// The environment data-plane boundary enforces the operation.
+	Environment,
+}
+
+/// Generated phase, durability, cost, and authority metadata for one operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct OperationSpec {
+	/// Earliest invocation phase in which the operation is legal.
+	pub minimum_phase: InvocationPhase,
+	/// Whether the operation leaves durable state.
+	pub durability:    Durability,
+	/// Resource cost class.
+	pub cost:          CostClass,
+	/// Boundary that authoritatively enforces `minimum_phase`.
+	pub authority:     Authority,
 }
 
 /// A content-addressed blob reference suitable for durable projection.
@@ -226,14 +499,14 @@ pub enum Ev<U, P, F> {
 	Args(ArgIssue),
 	/// Terminal structured cancellation or effect-uncertainty report.
 	Aborted(Abort),
-	/// Terminal outcome; supervisors fuse the stream after this event.
-	Done(Outcome<P, F>),
+	/// Terminal event; supervisors fuse the stream after this event.
+	Done(ToolTerminal<P, F>),
 }
 
-/// Terminal executor outcome before journal verdict lowering.
+/// Terminal executor result before durable call-outcome lowering.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Outcome<P, F> {
+pub enum ToolTerminal<P, F> {
 	/// A synchronous success or typed fault.
 	Done {
 		/// Tool-owned durable branch.
@@ -245,18 +518,99 @@ pub enum Outcome<P, F> {
 	Detached(JobRef),
 }
 
-/// Journaled truth for every completed call branch.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Journaled truth for exactly one of a settled call's four branches.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum Verdict<P, F> {
+pub enum CallOutcome<P, F> {
 	/// Successful durable payload.
 	Ok(P),
 	/// Tool-owned durable fault.
-	Fault(F),
+	Faulted(F),
 	/// Structured failure of a parameter the tool actually pulled.
-	Args(ArgIssue),
-	/// Structured cancellation/skip/effect-uncertainty report.
-	Aborted(Abort),
+	ArgsRejected(ArgIssue),
+	/// Structured cancellation, skip, or policy denial.
+	Aborted {
+		/// Fine-grained owner-reported abort reason.
+		abort:  Abort,
+		/// Coarse machine-readable abort class.
+		kind:   AbortKind,
+		/// Structured denial when `kind` is [`AbortKind::PolicyDenied`].
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		policy: Option<PolicyDenied>,
+	},
+}
+
+impl<P, F> CallOutcome<P, F> {
+	/// Creates a non-policy abort, deriving its coarse class from `abort`.
+	#[must_use]
+	pub fn aborted(abort: Abort) -> Self {
+		let kind = abort.kind();
+		Self::Aborted { abort, kind, policy: None }
+	}
+
+	/// Creates a structured policy denial.
+	#[must_use]
+	pub fn policy_denied(abort: Abort, policy: PolicyDenied) -> Self {
+		Self::Aborted { abort, kind: AbortKind::PolicyDenied, policy: Some(policy) }
+	}
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum CallOutcomeRepr<P, F> {
+	Ok(P),
+	#[serde(alias = "fault")]
+	Faulted(F),
+	#[serde(alias = "args")]
+	ArgsRejected(ArgIssue),
+	Aborted(AbortedRepr),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AbortedRepr {
+	Current {
+		abort:  Abort,
+		#[serde(default)]
+		kind:   Option<AbortKind>,
+		#[serde(default)]
+		policy: Option<PolicyDenied>,
+	},
+	Legacy(Abort),
+}
+
+impl<'de, P, F> Deserialize<'de> for CallOutcome<P, F>
+where
+	P: Deserialize<'de>,
+	F: Deserialize<'de>,
+{
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		Ok(match CallOutcomeRepr::<P, F>::deserialize(deserializer)? {
+			CallOutcomeRepr::Ok(payload) => Self::Ok(payload),
+			CallOutcomeRepr::Faulted(fault) => Self::Faulted(fault),
+			CallOutcomeRepr::ArgsRejected(issue) => Self::ArgsRejected(issue),
+			CallOutcomeRepr::Aborted(AbortedRepr::Legacy(abort)) => Self::aborted(abort),
+			CallOutcomeRepr::Aborted(AbortedRepr::Current { abort, kind, policy }) => {
+				let kind = kind.unwrap_or_else(|| {
+					if policy.is_some() {
+						AbortKind::PolicyDenied
+					} else {
+						abort.kind()
+					}
+				});
+				let carries_policy = policy.is_some();
+				if (kind == AbortKind::PolicyDenied) != carries_policy {
+					return Err(serde::de::Error::custom(
+						"policy is present if and only if abort kind is policy_denied",
+					));
+				}
+				Self::Aborted { abort, kind, policy }
+			},
+		})
+	}
 }
 
 /// One segment in a pulled JSON path.
@@ -270,8 +624,20 @@ pub enum ArgPath {
 }
 
 /// Stable class of parameter pull failure.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ArgIssueKind {
 	/// Required pulled value was absent.
 	Missing,
@@ -302,7 +668,7 @@ pub struct ArgIssue {
 	pub found:    Option<Str>,
 }
 
-/// Structured reason an invocation did not produce a normal verdict.
+/// Structured reason an invocation did not produce a normal outcome.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Abort {
@@ -327,12 +693,115 @@ pub enum Abort {
 	MissingOutcome,
 }
 
+impl Abort {
+	/// Returns the coarse class implied by this owner-reported reason.
+	#[must_use]
+	pub const fn kind(&self) -> AbortKind {
+		match self {
+			Self::Skipped { .. } | Self::InputDropped => AbortKind::Skipped,
+			Self::Interrupted { .. } | Self::EffectsUnknown { .. } | Self::MissingOutcome => {
+				AbortKind::Cancelled
+			},
+		}
+	}
+}
+
+/// Coarse machine-readable class of an aborted invocation.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AbortKind {
+	/// A dispatched call failed to settle normally.
+	Cancelled,
+	/// A call was never dispatched.
+	Skipped,
+	/// Core admission policy denied the call.
+	PolicyDenied,
+}
+
+/// Structured durable evidence for a policy denial.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyDenied {
+	/// Human-readable explanation.
+	pub reason:      Str,
+	/// Stable machine-readable denial code, when one exists.
+	pub code:        Option<Str>,
+	/// Durable admission decision identifier.
+	pub decision_id: Str,
+	/// Stable identifiers of every policy rule that fired.
+	pub rules:       SmallVec<Str, 4>,
+}
+
+/// Result of a post-settlement review that cannot rewrite the call outcome.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PostconditionStatus {
+	/// Downstream review accepted the settled outcome.
+	Passed,
+	/// Downstream review found a durable problem after settlement.
+	Rejected,
+}
+
+/// Durable finding attached beside, and never inside, a settled call outcome.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Postcondition {
+	/// Review result.
+	pub status:      PostconditionStatus,
+	/// Human-readable finding.
+	pub reason:      Str,
+	/// Stable machine-readable finding code, when one exists.
+	pub code:        Option<Str>,
+	/// Durable decision identifier.
+	pub decision_id: Str,
+	/// Stable identifiers of policy rules supporting the finding.
+	#[serde(default)]
+	pub rules:       SmallVec<Str, 4>,
+}
+
 /// Retention promise for an artifact produced by detached work.
 ///
 /// This is a lifetime hint for artifact storage, not ownership of an
 /// environment resource. Producers may retain an artifact longer than promised.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ArtifactLifetime {
 	/// Retain only long enough to consume the settlement.
 	Ephemeral,
@@ -414,16 +883,16 @@ impl RecordedCallOwned {
 	}
 }
 
-/// Serialized verdict details before or after blob spill.
+/// Serialized call-outcome details before or after blob spill.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "storage", rename_all = "snake_case")]
-pub enum VerdictDetails {
-	/// Small verdict retained inline as structured JSON bytes.
+pub enum CallOutcomeDetails {
+	/// Small outcome retained inline as structured JSON bytes.
 	Inline {
-		/// Complete serialized verdict JSON bytes.
+		/// Complete serialized call-outcome JSON bytes.
 		json: Bytes,
 	},
-	/// Large verdict retained by content-addressed blob reference.
+	/// Large outcome retained by content-addressed blob reference.
 	Spilled {
 		/// Durable blob reference.
 		blob:     BlobRef,
@@ -432,8 +901,8 @@ pub enum VerdictDetails {
 	},
 }
 
-/// Environment-provided hook for durable large-verdict storage.
-pub trait VerdictSpill: Send + Sync {
+/// Environment-provided hook for durable large-outcome storage.
+pub trait CallOutcomeSpill: Send + Sync {
 	/// Storage error.
 	type Error;
 
@@ -441,36 +910,36 @@ pub trait VerdictSpill: Send + Sync {
 	fn spill(&self, json: Bytes) -> impl Future<Output = Result<BlobRef, Self::Error>> + Send + '_;
 }
 
-/// Failure while serializing or spilling a structured verdict.
+/// Failure while serializing or spilling a structured call outcome.
 #[derive(Debug, Error)]
-pub enum VerdictDetailsError<E> {
-	/// Structured verdict serialization failed.
-	#[error("verdict serialization failed: {0}")]
+pub enum CallOutcomeDetailsError<E> {
+	/// Structured outcome serialization failed.
+	#[error("call-outcome serialization failed: {0}")]
 	Serialize(#[from] serde_json::Error),
 	/// Blob storage failed.
-	#[error("verdict spill failed")]
+	#[error("call-outcome spill failed")]
 	Spill(E),
 }
 
-/// Serializes a verdict deterministically and spills it above `inline_limit`.
-pub async fn verdict_details<P, F, S>(
-	verdict: &Verdict<P, F>,
+/// Serializes an outcome deterministically and spills it above `inline_limit`.
+pub async fn call_outcome_details<P, F, S>(
+	outcome: &CallOutcome<P, F>,
 	inline_limit: usize,
 	spill: &S,
-) -> Result<VerdictDetails, VerdictDetailsError<S::Error>>
+) -> Result<CallOutcomeDetails, CallOutcomeDetailsError<S::Error>>
 where
 	P: Serialize + Sync,
 	F: Serialize + Sync,
-	S: VerdictSpill,
+	S: CallOutcomeSpill,
 {
-	let json = Bytes::from(serde_json::to_vec(verdict)?);
+	let json = Bytes::from(serde_json::to_vec(outcome)?);
 	if json.len() <= inline_limit {
-		return Ok(VerdictDetails::Inline { json });
+		return Ok(CallOutcomeDetails::Inline { json });
 	}
 	let byte_len = json.len() as u64;
 	let blob = spill
 		.spill(json)
 		.await
-		.map_err(VerdictDetailsError::Spill)?;
-	Ok(VerdictDetails::Spilled { blob, byte_len })
+		.map_err(CallOutcomeDetailsError::Spill)?;
+	Ok(CallOutcomeDetails::Spilled { blob, byte_len })
 }

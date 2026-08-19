@@ -26,7 +26,7 @@ use omp_proto::{
 	thread::v1::{self as thread, Item},
 };
 use omp_storage::transcript::{Header, SessionId};
-use omp_tool::PromptCaps;
+use omp_tool::{CapsBase, ModelClass};
 use omp_tui::{Prop, Renderer, Ui, UiContext, components::TextLeaf};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -190,10 +190,11 @@ impl LoopFixture {
 		.context("create loop baseline journal")?;
 		let (env, env_transport) = EnvClient::in_process(8);
 		let agent =
-			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, PromptCaps {
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, CapsBase {
 				maximum_parts:      64,
 				maximum_text_bytes: 1_048_576,
 				media:              false,
+				model_class:        ModelClass::Standard,
 			});
 		Ok(Self { agent, _env_transport: env_transport, _scratch: scratch })
 	}

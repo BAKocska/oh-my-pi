@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package omp.policy.v1;
+
+import "omp/inference/v1/common.proto";
+
+// Portable source coordinates. Offsets are UTF-8 byte offsets.
+message Span {
+  uint32 start = 1;
+  uint32 end = 2;
+  uint32 line = 3;
+  uint32 column = 4;
+}
+
+// One shell word before expansion.
+message BashArg {
+  string text = 1;
+  bool dynamic = 2;
+  // Bitmask: parameter=1, command substitution=2, arithmetic=4, tilde=8,
+  // glob=16, brace=32, escape=64.
+  uint32 dynamism = 3;
+  string quoting = 4;
+  Span span = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// A filesystem fact inferred from a shell command.
+message PathRef {
+  string lexical = 1;
+  optional string resolved = 2;
+  optional string absolute = 3;
+  // Bitmask: read=1, write=2, append=4, exec=8, delete=16,
+  // metadata=32, create=64.
+  uint32 access = 4;
+  string origin = 5;
+  uint32 command_index = 6;
+  bool outside_workspace = 7;
+  bool exists = 8;
+  bool dynamic = 9;
+  Span span = 10;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// A network fact inferred from a shell command.
+message NetRef {
+  string kind = 1;
+  string direction = 2;
+  optional string host = 3;
+  optional uint32 port = 4;
+  optional string scheme = 5;
+  optional string url = 6;
+  uint32 command_index = 7;
+  bool dynamic = 8;
+  Span span = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// One shell redirection and its inferred path effect.
+message BashRedirect {
+  optional int32 fd = 1;
+  string op = 2;
+  string target_kind = 3;
+  optional string target = 4;
+  optional int32 target_fd = 5;
+  uint32 dynamism = 6;
+  optional PathRef path = 7;
+  Span span = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// One flattened command in execution order.
+message BashCommand {
+  uint32 index = 1;
+  optional string name = 2;
+  repeated BashArg argv = 3;
+  repeated bool dynamic_args = 4;
+  repeated BashRedirect redirects = 5;
+  repeated PathRef reads = 6;
+  repeated PathRef writes = 7;
+  repeated NetRef net = 8;
+  optional string cwd = 9;
+  uint32 depth = 10;
+  string container = 11;
+  bool subshell = 12;
+  uint32 classification = 13;
+  optional string interpreter_code = 14;
+  Span span = 16;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Environment-produced shell analysis. It is a fact record, not an enforcement
+// token and not a serialization of the parser AST.
+message BashIr {
+  string source = 1;
+  string rev = 2;
+  string parser_rev = 3;
+  bool parse_ok = 4;
+  optional string parse_error = 5;
+  bool truncated = 6;
+  uint32 node_count = 7;
+  bool is_compound = 8;
+  bool has_dynamic_eval = 9;
+  repeated BashCommand commands = 10;
+  repeated PathRef reads = 11;
+  repeated PathRef writes = 12;
+  repeated NetRef net = 13;
+  repeated string opaque = 14;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Structured policy denial carried by admission and durable call outcomes.
+message PolicyDenied {
+  string reason = 1;
+  string code = 2;
+  string decision_id = 3;
+  repeated string rules = 4;
+  omp.inference.v1.ValueMap props = 15;
+}

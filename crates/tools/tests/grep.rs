@@ -6,7 +6,8 @@ use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
 use omp_core::Str;
 use omp_tool::{
-	BlobRef, ErasedEv, ErasedOutcome, IncomingParams, Part, PromptCaps, Registry, Tool, Verdict,
+	BlobRef, CallOutcome, CapsBase, Claims, ErasedEv, ErasedOutcome, IncomingParams, ModelClass,
+	Part, Precedence, Presentation, PromptCaps, Registry, Tool,
 };
 use omp_tools::{
 	glob, grep,
@@ -66,7 +67,7 @@ impl ReadBlobs for RecordingBlobs {
 }
 
 struct Invocation {
-	verdict: Verdict<grep::Payload, grep::Fault>,
+	outcome: CallOutcome<grep::Payload, grep::Fault>,
 	useless: bool,
 }
 
@@ -95,7 +96,11 @@ fn matched(path: &str, line_number: u32, line: &str, tag: Option<&str>) -> grep:
 fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs) -> Invocation {
 	let mut registry = Registry::new();
 	registry
-		.register(grep::tool(workspace.clone(), blobs))
+		.register(grep::tool(workspace.clone(), blobs), Presentation::Slot, Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::from("omp/core"),
+			replaces:   None,
+		})
 		.expect("grep schema and revision register");
 	let (feed, params) = IncomingParams::channel();
 	feed
@@ -111,8 +116,8 @@ fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs
 		panic!("expected one terminal grep event: {events:?}");
 	};
 	Invocation {
-		verdict: serde_json::from_slice(verdict)
-			.expect("typed grep verdict survives registry erasure"),
+		outcome: serde_json::from_slice(verdict)
+			.expect("typed grep outcome survives registry erasure"),
 		useless: *useless,
 	}
 }
@@ -121,20 +126,21 @@ fn invoke(workspace: &FakeWorkspace, raw: &str) -> Invocation {
 	invoke_with_blobs(workspace, raw, RecordingBlobs::default())
 }
 
-fn prompt(workspace: &FakeWorkspace, verdict: &Verdict<grep::Payload, grep::Fault>) -> String {
+fn prompt(workspace: &FakeWorkspace, outcome: &CallOutcome<grep::Payload, grep::Fault>) -> String {
 	let tool = grep::tool(workspace.clone(), RecordingBlobs::default());
-	let parts = match verdict {
-		Verdict::Ok(payload) => tool.prompt(Ok(payload), &PromptCaps {
+	let caps = PromptCaps::for_tool(
+		CapsBase {
 			maximum_parts:      1,
 			maximum_text_bytes: u32::MAX,
 			media:              false,
-		}),
-		Verdict::Fault(fault) => tool.prompt(Err(fault), &PromptCaps {
-			maximum_parts:      1,
-			maximum_text_bytes: u32::MAX,
-			media:              false,
-		}),
-		other => panic!("expected a projectable grep verdict, got {other:?}"),
+			model_class:        ModelClass::Standard,
+		},
+		&tool.spec().rev,
+	);
+	let parts = match outcome {
+		CallOutcome::Ok(payload) => tool.prompt(Ok(payload), &caps),
+		CallOutcome::Faulted(fault) => tool.prompt(Err(fault), &caps),
+		other => panic!("expected a projectable grep outcome, got {other:?}"),
 	};
 	let [Part::Text { text }] = parts.as_slice() else {
 		panic!("grep must project exactly one text part: {parts:?}");
@@ -144,7 +150,7 @@ fn prompt(workspace: &FakeWorkspace, verdict: &Verdict<grep::Payload, grep::Faul
 
 fn invoke_prompt(workspace: &FakeWorkspace, raw: &str) -> (String, bool) {
 	let invocation = invoke(workspace, raw);
-	(prompt(workspace, &invocation.verdict), invocation.useless)
+	(prompt(workspace, &invocation.outcome), invocation.useless)
 }
 
 #[test]
@@ -304,7 +310,7 @@ fn range_overfetch_and_output_truncation_authorize_only_emitted_rows() {
 	let blobs = RecordingBlobs::default();
 	let invocation =
 		invoke_with_blobs(&workspace, r#"{"pattern":"needle","path":"src/range.rs:500-600"}"#, blobs);
-	let text = prompt(&workspace, &invocation.verdict);
+	let text = prompt(&workspace, &invocation.outcome);
 	let visible = text
 		.lines()
 		.filter_map(|line| line.strip_prefix('*'))
@@ -364,8 +370,8 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	let blobs = RecordingBlobs::default();
 	let invocation =
 		invoke_with_blobs(&workspace, r#"{"pattern":"needle","path":"large.rs"}"#, blobs.clone());
-	let text = prompt(&workspace, &invocation.verdict);
-	let Verdict::Ok(payload) = &invocation.verdict else {
+	let text = prompt(&workspace, &invocation.outcome);
+	let CallOutcome::Ok(payload) = &invocation.outcome else {
 		panic!("large grep output must succeed");
 	};
 	let stored = blobs.stored.lock();
@@ -385,10 +391,18 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	);
 	assert!(text.ends_with(expected_footer.as_str()));
 
-	let zero = grep::tool(workspace, RecordingBlobs::default()).prompt(Ok(payload), &PromptCaps {
-		maximum_parts:      0,
-		maximum_text_bytes: 0,
-		media:              false,
-	});
+	let zero_tool = grep::tool(workspace, RecordingBlobs::default());
+	let zero = zero_tool.prompt(
+		Ok(payload),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts:      0,
+				maximum_text_bytes: 0,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
+			&zero_tool.spec().rev,
+		),
+	);
 	assert_eq!(zero, [] as [omp_tool::Part; 0]);
 }

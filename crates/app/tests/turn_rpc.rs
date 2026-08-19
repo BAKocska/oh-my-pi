@@ -40,9 +40,18 @@ use omp_llm_inference::{
 };
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 use omp_tool::{
-	Constraint, Ev, IncomingParams, LiftedCall, Part, PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
+	Claims, Constraint, Ev, IncomingParams, LiftedCall, Part, Precedence, Presentation, PromptCaps,
+	RecordedCall, Rev, Tool, ToolSpec,
 };
 use tower::Service;
+
+fn test_claims() -> Claims {
+	Claims {
+		precedence: Precedence::CORE,
+		claimant:   Str::new_static("omp/core"),
+		replaces:   None,
+	}
+}
 
 struct RegisteredTestTool {
 	spec: ToolSpec,
@@ -73,15 +82,20 @@ impl Tool for RegisteredTestTool {
 fn tool_registry() -> Arc<omp_tool::Registry> {
 	let mut registry = omp_tool::Registry::new();
 	registry
-		.register(RegisteredTestTool {
-			spec: ToolSpec {
-				name:        Str::from("exec.shell"),
-				rev:         Rev { family: Str::from("shell"), n: 2 },
-				description: Str::from("test shell"),
-				schema:      Bytes::from_static(br#"{"type":"object"}"#),
-				constraint:  Constraint::None,
+		.register(
+			RegisteredTestTool {
+				spec: ToolSpec {
+					name:            Str::from("exec.shell"),
+					rev:             Rev { family: Str::from("shell"), n: 2 },
+					description:     Str::from("test shell"),
+					schema:          Bytes::from_static(br#"{"type":"object"}"#),
+					constraint:      Constraint::None,
+					projection_code: [0; 32],
+				},
 			},
-		})
+			Presentation::Slot,
+			test_claims(),
+		)
 		.expect("test tool registers");
 	Arc::new(registry)
 }
@@ -591,7 +605,7 @@ impl Tool for HistoryTool {
 		let legacy = args.get("legacy")?.clone();
 		let mut verdict: serde_json::Value = serde_json::from_slice(call.verdict).ok()?;
 		*verdict.get_mut("value")?.get_mut("dialect")? = serde_json::json!("hl.2");
-		verdict["kind"] = serde_json::json!("fault");
+		verdict["kind"] = serde_json::json!("faulted");
 		Some(LiftedCall {
 			raw_args: Bytes::from(
 				serde_json::to_vec(&serde_json::json!({
@@ -621,6 +635,7 @@ fn history_tool(n: u16, lifts_hl1: bool) -> HistoryTool {
 			description: Str::from(format!("history law revision {n}")),
 			schema,
 			constraint: Constraint::None,
+			projection_code: [0; 32],
 		},
 		lift_from: lifts_hl1.then(|| Rev { family: Str::from("hl"), n: 1 }),
 	}
@@ -629,10 +644,10 @@ fn history_tool(n: u16, lifts_hl1: bool) -> HistoryTool {
 fn history_registry(with_lift: bool) -> omp_tool::Registry {
 	let mut registry = omp_tool::Registry::new();
 	registry
-		.register(history_tool(1, false))
+		.register(history_tool(1, false), Presentation::Slot, test_claims())
 		.expect("historical revision registers");
 	registry
-		.register(history_tool(2, with_lift))
+		.register(history_tool(2, with_lift), Presentation::Slot, test_claims())
 		.expect("live revision registers");
 	registry
 }

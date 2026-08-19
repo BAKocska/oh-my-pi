@@ -141,7 +141,7 @@ impl fmt::Debug for AgentSnapshot {
 			.debug_struct("AgentSnapshot")
 			.field("turn", &self.turn)
 			.field("enabled_tools", &self.enabled_tools)
-			.field("registry_hash", &self.registry.live_hash())
+			.field("registry_hash", &self.registry.slot_hash())
 			.field("workspace", &self.workspace)
 			.field("prompt_source", &format_args!("<dyn PromptSource>"))
 			.field("defer_interrupts", &self.defer_interrupts)

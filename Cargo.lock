@@ -5111,6 +5111,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "strum",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -5300,6 +5301,7 @@ dependencies = [
  "serde_json",
  "smallvec 2.0.0-alpha.12",
  "smol_bitmap",
+ "strum",
  "thiserror 2.0.20",
 ]
 
@@ -5391,6 +5393,10 @@ dependencies = [
  "parking_lot",
  "thiserror 2.0.20",
 ]
+
+[[package]]
+name = "omp-exthost"
+version = "0.1.0"
 
 [[package]]
 name = "omp-grep"
@@ -5573,6 +5579,10 @@ dependencies = [
  "tower",
  "tracing",
 ]
+
+[[package]]
+name = "omp-sandbox"
+version = "0.1.0"
 
 [[package]]
 name = "omp-shell"
@@ -5770,6 +5780,8 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "smallvec 2.0.0-alpha.12",
+ "strum",
  "thiserror 2.0.20",
 ]
 

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use omp_e2e::support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, within};
 use omp_env::{EnvClient, InvocationEvent};
 use omp_proto::env::v1::InvokeTool;
-use omp_tool::{Registry, Verdict};
+use omp_tool::{CallOutcome, Registry};
 use serde_json::{Value, json};
 
 const FIXTURE_ROOT: &str =
@@ -48,9 +48,9 @@ async fn invoke_ok(
 				if verdict.is_error {
 					bail!("{name} returned an error: {}", String::from_utf8_lossy(&verdict.json));
 				}
-				return match serde_json::from_slice::<Verdict<Value, Value>>(&verdict.json)? {
-					Verdict::Ok(payload) => Ok(payload),
-					other => bail!("{name} returned a non-success verdict: {other:?}"),
+				return match serde_json::from_slice::<CallOutcome<Value, Value>>(&verdict.json)? {
+					CallOutcome::Ok(payload) => Ok(payload),
+					other => bail!("{name} returned a non-success outcome: {other:?}"),
 				};
 			},
 			Some(InvocationEvent::Update(_)) => {},

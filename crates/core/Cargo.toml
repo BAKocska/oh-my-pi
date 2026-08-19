@@ -19,6 +19,7 @@ parking_lot_core = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
 smol_bitmap = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

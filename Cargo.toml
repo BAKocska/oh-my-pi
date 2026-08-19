@@ -124,6 +124,7 @@ omp-ast = { path = "crates/ast", version = "0.1.0" }
 omp-core = { path = "crates/core", version = "0.1.0" }
 omp-docserver = { path = "crates/docserver", version = "0.1.0" }
 omp-env = { path = "crates/env", version = "0.1.0" }
+omp-exthost = { path = "crates/exthost", version = "0.1.0" }
 omp-grep = { path = "crates/grep", version = "0.1.0" }
 omp-gui = { path = "crates/gui", version = "0.1.0" }
 omp-hashline = { path = "crates/hashline", version = "0.1.0" }
@@ -133,6 +134,7 @@ omp-macros = { path = "crates/macros", version = "0.1.0" }
 omp-proto = { path = "crates/proto", version = "0.1.0" }
 omp-py = { path = "crates/py", version = "0.1.0" }
 omp-rpc = { path = "crates/rpc", version = "0.1.0" }
+omp-sandbox = { path = "crates/sandbox", version = "0.1.0" }
 omp-shell = { path = "crates/shell", version = "0.1.0" }
 omp-shell-builtins = { path = "crates/shell-builtins", version = "0.1.0" }
 omp-shell-engine = { path = "crates/shell-engine", version = "0.1.0" }

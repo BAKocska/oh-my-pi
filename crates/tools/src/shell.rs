@@ -13,8 +13,8 @@ use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, ArtifactLifetime, BlobRef, CommitError, Constraint, Ev,
-	ExpectedArtifact, IncomingParams, InterruptWaitError, JobOwner, JobRef, Outcome, ParamError,
-	Part, PromptCaps, Rev, Tool, ToolSpec,
+	ExpectedArtifact, IncomingParams, InterruptWaitError, JobOwner, JobRef, ParamError, Part,
+	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use parking_lot::Mutex;
 use schemars::JsonSchema;
@@ -152,9 +152,9 @@ pub struct Payload {
 	pub exec_id:              Bytes,
 	/// Exact submitted script.
 	pub command:              Str,
-	/// Bounded ordered output retained in the verdict.
+	/// Bounded ordered output retained in the durable call outcome.
 	pub transcript:           Vec<TranscriptFrame>,
-	/// Whether output exceeded the verdict transcript cap.
+	/// Whether output exceeded the durable outcome's transcript cap.
 	pub transcript_truncated: bool,
 	/// Terminal host status, preserved without reinterpretation.
 	pub status:               ExecStatus,
@@ -330,13 +330,21 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		session: OnceCell::new(),
 		run_queue: Arc::new(RunQueue::default()),
 		spec: ToolSpec {
-			name:        Str::from("shell"),
-			rev:         Rev { family: Str::default(), n: 1 },
-			description: Str::from(
+			name:            Str::from("shell"),
+			rev:             Rev { family: Str::default(), n: 1 },
+			description:     Str::from(
 				"Execute a shell script in a persistent session, or start a named detached process.",
 			),
-			schema:      omp_tool::schema::<Params>(),
-			constraint:  Constraint::Schema { priority: 100 },
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("shell.rs"),
+			),
 		},
 		transcript_limit: TRANSCRIPT_LIMIT,
 	}
@@ -383,7 +391,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 			if args.detach {
 				drop(ticket);
 				let Some(name) = args.name else {
-					yield Ev::Done(Outcome::Done { result: Err(Fault::DetachNameRequired), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Err(Fault::DetachNameRequired), useless: false });
 					return;
 				};
 				let detached = {
@@ -408,7 +416,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 						};
 						yield Ev::Aborted(Abort::EffectsUnknown { reason });
 					},
-					Either::Right(Ok(job)) => yield Ev::Done(Outcome::Detached(JobRef {
+					Either::Right(Ok(job)) => yield Ev::Done(ToolTerminal::Detached(JobRef {
 						id: job.id,
 						owner: job.owner,
 						artifact: ExpectedArtifact {
@@ -418,7 +426,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 						},
 					})),
 					Either::Right(Err(fault)) => {
-						yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+						yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 					},
 				}
 				return;
@@ -447,7 +455,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				Ok(session) => session.clone(),
 				Err(fault) => {
 					drop(run_ticket);
-					yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 					return;
 				},
 			};
@@ -460,7 +468,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				Ok(run) => run,
 				Err(fault) => {
 					drop(run_ticket);
-					yield Ev::Done(Outcome::Done { result: Err(fault), useless: false });
+					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 					return;
 				},
 			};
@@ -536,7 +544,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 					},
 					Ok(Some(RunEvent::Exit(status))) => {
 						drop(run_ticket);
-						yield Ev::Done(Outcome::Done {
+						yield Ev::Done(ToolTerminal::Done {
 							result: Ok(Payload {
 								session_id,
 								exec_id,

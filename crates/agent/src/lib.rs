@@ -15,6 +15,7 @@ mod jobs;
 mod journal;
 mod r#loop;
 mod mailbox;
+mod phases;
 mod project;
 mod prompt;
 mod state;
@@ -38,6 +39,7 @@ pub use omp_proto::{
 	},
 	thread::v1::{Item, Thread},
 };
+pub use phases::{HookDecision, HookPhase, InvocationPhase, LifecyclePhase};
 pub use project::{
 	ProjectionError, project_journal, project_thread_history, tool_result_item,
 	tool_result_item_canonical_parts,

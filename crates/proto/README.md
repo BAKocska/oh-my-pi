@@ -11,6 +11,7 @@
 - `proto/omp/toolhost/v1` defines the varint-framed stdio protocol between the environment host and a supervised Python worker.
 - `build.rs` recursively compiles the schemas with the pure-Rust `protox` compiler and `tonic-prost-build`, writing one generated Rust file per Protobuf package to `OUT_DIR`.
 - `src/lib.rs` includes those generated package files, re-exports their modules, and exposes the wire-visible `SCHEMA_REV`.
+- `buf.yaml` configures `buf format`/`buf lint` over `.proto` sources; run them via `just proto-fmt` / `just proto-lint` from the workspace root, or `buf format -w` / `buf lint` from this directory. This is formatting and linting only — Rust bindings still come from `build.rs`/`protox`, never `buf generate`.
 
 ## Philosophy
 

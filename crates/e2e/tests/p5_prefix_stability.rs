@@ -43,7 +43,10 @@ use omp_llm_inference::{
 };
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread};
 use omp_storage::transcript::{Header, SessionId};
-use omp_tool::{Constraint, Ev, IncomingParams, Part, PromptCaps, Rev, Tool, ToolSpec};
+use omp_tool::{
+	CapsBase, Claims, Constraint, Ev, IncomingParams, ModelClass, Part, Precedence, Presentation,
+	PromptCaps, Rev, Tool, ToolSpec,
+};
 use parking_lot::Mutex;
 use ulid::Ulid;
 
@@ -176,15 +179,20 @@ fn tool_schema(revision: u16) -> Bytes {
 fn tool_registry(revision: u16) -> Arc<omp_tool::Registry> {
 	let mut registry = omp_tool::Registry::new();
 	registry
-		.register(RevisionTool {
-			spec: ToolSpec {
-				name:        "probe".into(),
-				rev:         Rev { family: "json".into(), n: revision },
-				description: format!("prefix probe revision {revision}").into(),
-				schema:      tool_schema(revision),
-				constraint:  Constraint::None,
+		.register(
+			RevisionTool {
+				spec: ToolSpec {
+					name:            "probe".into(),
+					rev:             Rev { family: "json".into(), n: revision },
+					description:     format!("prefix probe revision {revision}").into(),
+					schema:          tool_schema(revision),
+					constraint:      Constraint::None,
+					projection_code: [0; 32],
+				},
 			},
-		})
+			Presentation::Slot,
+			Claims { precedence: Precedence::CORE, claimant: "omp/core".into(), replaces: None },
+		)
 		.expect("register revision tool");
 	Arc::new(registry)
 }
@@ -417,10 +425,11 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 	);
 	let state = AgentState::new(AgentSnapshot::new(options, workspace, Arc::clone(&tools_v1)));
 	let (env, _env_transport) = omp_env::EnvClient::in_process(4);
-	let mut agent = Agent::new(client, env, state.clone(), journal(&scratch), PromptCaps {
+	let mut agent = Agent::new(client, env, state.clone(), journal(&scratch), CapsBase {
 		maximum_parts:      4,
 		maximum_text_bytes: 4096,
 		media:              false,
+		model_class:        ModelClass::Standard,
 	});
 
 	let mut revisions = Vec::new();

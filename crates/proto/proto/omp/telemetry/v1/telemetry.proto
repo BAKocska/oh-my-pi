@@ -1,0 +1,288 @@
+syntax = "proto3";
+
+package omp.telemetry.v1;
+
+import "omp/inference/v1/common.proto";
+import "omp/inference/v1/inference.proto";
+
+message TraceRef {
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  bool sampled = 3;
+}
+
+// Authenticated provenance stamped by Core, never accepted as authorship from
+// an untrusted event producer.
+message ExtensionRef {
+  string extension_id = 1;
+  string version = 2;
+  string artifact_digest = 3;
+  string layer = 4;
+  string tier = 5;
+  string pool = 6;
+  uint64 host_generation = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message Envelope {
+  uint64 timestamp_ms = 1;
+  string session = 2;
+  string agent = 3;
+  uint32 depth = 4;
+  string conversation = 5;
+  optional TraceRef trace = 6;
+  string principal = 7;
+  uint64 generation = 8;
+  optional ExtensionRef extension = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SessionStart {
+  bool resumed = 1;
+  optional string parent = 2;
+  string cwd_uri = 3;
+  string place = 4;
+  optional string remote = 5;
+  string model = 6;
+  string provider = 7;
+  repeated string devices = 8;
+  repeated string core_tools = 9;
+  repeated ExtensionRef extensions = 10;
+  uint32 schema_rev = 11;
+  string prompt_hash = 12;
+  string registry_hash = 13;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SessionEnd {
+  string reason = 1;
+  uint32 turns = 2;
+  uint32 requests = 3;
+  uint32 calls = 4;
+  omp.inference.v1.Usage usage = 5;
+  optional omp.inference.v1.Cost cost = 6;
+  uint64 wall_ms = 7;
+  uint32 faults = 8;
+  uint32 issues = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+message TurnStart {
+  uint32 turn = 1;
+  string trigger = 2;
+  uint64 input_chars = 3;
+  uint32 input_parts = 4;
+  uint32 attachments = 5;
+  string model = 6;
+  optional string effort = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+message TurnEnd {
+  uint32 turn = 1;
+  uint32 steps = 2;
+  uint32 requests = 3;
+  uint32 calls = 4;
+  omp.inference.v1.Usage usage = 5;
+  optional omp.inference.v1.Cost cost = 6;
+  uint64 latency_ms = 7;
+  omp.inference.v1.StopReason stop = 8;
+  repeated string tools_used = 9;
+  uint32 faults = 10;
+  bool interrupted = 11;
+  omp.inference.v1.ContextSnapshot context = 12;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ModelRequest {
+  uint32 turn = 1;
+  uint32 step = 2;
+  string requested_model = 3;
+  string served_model = 4;
+  string provider = 5;
+  optional string upstream_provider = 6;
+  optional string response_id = 7;
+  optional string service_tier = 8;
+  omp.inference.v1.StopReason stop = 9;
+  omp.inference.v1.Usage usage = 10;
+  optional omp.inference.v1.Cost cost = 11;
+  uint64 latency_ms = 12;
+  optional uint64 ttft_ms = 13;
+  omp.inference.v1.ContextSnapshot context = 14;
+  omp.inference.v1.ValueMap props = 15;
+  repeated omp.inference.v1.Unsupported unsupported = 16;
+  repeated omp.inference.v1.Diagnostic diagnostics = 17;
+  repeated string core_tools = 18;
+  uint32 attempts = 19;
+  bool replayed = 20;
+}
+message ModelAttempt {
+  uint32 turn = 1;
+  uint32 step = 2;
+  uint32 number = 3;
+  string reason = 4;
+  string provider = 5;
+  string model = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ProviderError {
+  uint32 turn = 1;
+  uint32 step = 2;
+  string error_kind = 3;
+  string detail = 4;
+  string provider = 5;
+  string model = 6;
+  uint32 attempt = 7;
+  omp.inference.v1.Retryability retryability = 8;
+  optional uint64 retry_after_ms = 9;
+  repeated omp.inference.v1.Unsupported degraded = 10;
+  optional uint32 http_status = 11;
+  optional string handled_by = 12;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ToolCall {
+  string call_id = 1;
+  string target = 2;
+  string tool = 3;
+  optional string mcp_server = 4;
+  optional string rev = 5;
+  string place = 6;
+  optional string worker = 7;
+  string status = 8;
+  string phase_reached = 9;
+  uint64 latency_ms = 10;
+  uint64 speculation_ms = 11;
+  uint64 effect_ms = 12;
+  optional string args_raw = 13;
+  repeated string pulls = 14;
+  omp.inference.v1.ValueMap props = 15;
+  repeated omp.inference.v1.ValueMap repairs = 16;
+  string outcome = 17;
+  optional bytes payload_json = 18;
+  optional bytes fault_json = 19;
+  optional string fault_code = 20;
+  optional bytes arg_issue_json = 21;
+  optional bytes abort_json = 22;
+  optional bytes postcondition_json = 23;
+  bool useless = 24;
+  optional bytes decoded_args_json = 25;
+  uint32 updates = 26;
+  uint64 prompt_bytes = 27;
+  uint32 prompt_parts = 28;
+  optional string artifact_url = 29;
+  bool interrupted = 30;
+  optional string batch = 31;
+}
+message CapabilityDegraded {
+  string intent = 1;
+  optional string tool = 2;
+  optional string rev = 3;
+  uint32 requested_priority = 4;
+  bool granted = 5;
+  string reason = 6;
+  string provider = 7;
+  uint32 budget_used = 8;
+  uint32 budget_total = 9;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Compaction {
+  string reason = 1;
+  string strategy = 2;
+  optional string by = 3;
+  uint64 tokens_before = 4;
+  uint64 tokens_after = 5;
+  uint64 items_before = 6;
+  uint64 items_after = 7;
+  uint64 prompt_text_dropped_bytes = 8;
+  uint64 outcomes_kept = 9;
+  repeated string artifacts_promoted = 10;
+  uint64 duration_ms = 11;
+  bool aborted = 12;
+  uint64 epoch = 13;
+  omp.inference.v1.ValueMap props = 15;
+}
+message Branch {
+  string op = 1;
+  string branch_id = 2;
+  optional string parent_branch = 3;
+  optional uint64 from_entry = 4;
+  optional uint64 to_entry = 5;
+  optional string label = 6;
+  uint64 entries_dropped = 7;
+  bool workspace_restored = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ArtifactSpill {
+  string layer = 1;
+  string artifact_url = 2;
+  string origin = 3;
+  optional string rev = 4;
+  string blob = 5;
+  uint64 bytes_total = 6;
+  uint64 bytes_shown = 7;
+  uint64 lines_total = 8;
+  uint64 lines_shown = 9;
+  string reason = 10;
+  omp.inference.v1.ValueMap props = 15;
+}
+message IssueReport {
+  string issue = 1;
+  string tool = 2;
+  string rev = 3;
+  string summary = 4;
+  optional string expected = 5;
+  optional string observed = 6;
+  string reporter = 7;
+  optional string reporter_id = 8;
+  optional string call_id = 9;
+  uint32 turn = 10;
+  optional string args_raw = 11;
+  optional bytes payload_json = 12;
+  optional bytes fault_json = 13;
+  repeated string labels = 14;
+  omp.inference.v1.ValueMap props = 15;
+  string consent = 16;
+}
+message HostWarning {
+  string code = 1;
+  string message = 2;
+  optional string error = 3;
+  optional string subject = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Closed event union. The shared envelope is encoded once beside exactly one
+// event body.
+message Event {
+  Envelope envelope = 1;
+  oneof body {
+    SessionStart session_start = 2;
+    SessionEnd session_end = 3;
+    TurnStart turn_start = 4;
+    TurnEnd turn_end = 5;
+    ModelRequest model_request = 6;
+    ModelAttempt model_attempt = 7;
+    ProviderError provider_error = 8;
+    ToolCall tool_call = 9;
+    CapabilityDegraded capability_degraded = 10;
+    Compaction compaction = 11;
+    Branch branch = 12;
+    ArtifactSpill artifact_spill = 13;
+    IssueReport issue_report = 14;
+    HostWarning host_warning = 16;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message Telemetry {
+  Event event = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message SinkDecl {
+  string name = 1;
+  repeated string kinds = 2;
+  uint32 ring_capacity = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message RegisterSinks {
+  repeated SinkDecl sinks = 1;
+  omp.inference.v1.ValueMap props = 15;
+}

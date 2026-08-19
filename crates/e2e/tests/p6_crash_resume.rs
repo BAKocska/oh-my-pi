@@ -62,8 +62,9 @@ use omp_proto::{
 };
 use omp_storage::transcript::{self, AmendPatch, Entry, Header, Kind, SessionId};
 use omp_tool::{
-	Abort, Constraint, Ev, IncomingParams, Part as ToolPart, PromptCaps, Registry, Rev,
-	TOOL_REV_PROP, Tool, ToolSpec, Verdict,
+	Abort, CallOutcome, CapsBase, Claims, Constraint, Ev, IncomingParams, ModelClass,
+	Part as ToolPart, Precedence, Presentation, PromptCaps, Registry, Rev, TOOL_REV_PROP, Tool,
+	ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -220,13 +221,14 @@ impl HangingTool {
 	fn new(effects: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        TOOL_NAME.into(),
-				rev:         Rev { family: "p6".into(), n: 1 },
-				description: "waits forever after its durable effect gate".into(),
-				schema:      Bytes::from_static(
+				name:            TOOL_NAME.into(),
+				rev:             Rev { family: "p6".into(), n: 1 },
+				description:     "waits forever after its durable effect gate".into(),
+				schema:          Bytes::from_static(
 					br#"{"type":"object","properties":{"call":{"type":"string"}},"required":["call"]}"#,
 				),
-				constraint:  Constraint::None,
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 			effects,
 		}
@@ -462,7 +464,7 @@ async fn resume_rejects_changed_toolset_before_opening_any_authority() {
 			item_events:        vec![input_event],
 			prompt_hash:        hash.into_bytes(),
 			prompt_head_events: Vec::new(),
-			toolset_hash:       durable_registry.live_hash(),
+			toolset_hash:       durable_registry.slot_hash(),
 			enabled_tools:      Vec::new(),
 			sequence_targets:   vec![input_event],
 			input:              input_record(&input),
@@ -472,7 +474,11 @@ async fn resume_rejects_changed_toolset_before_opening_any_authority() {
 
 	let mut changed_registry = Registry::new();
 	changed_registry
-		.register(HangingTool::new(scratch.path().join("must-not-run")))
+		.register(
+			HangingTool::new(scratch.path().join("must-not-run")),
+			Presentation::Slot,
+			core_claims(),
+		)
 		.expect("register changed live tool");
 	let mut snapshot =
 		AgentSnapshot::new(TurnOptions::default(), Default::default(), Arc::new(changed_registry));
@@ -600,13 +606,18 @@ fn binary_gateway_tools() -> Arc<Registry> {
 	let mut registry = Registry::new();
 	for name in ["edit", "eval", "glob", "grep", "read", "shell", "write"] {
 		registry
-			.register_worker(ToolSpec {
-				name:        Str::new_static(name),
-				rev:         Rev { family: Str::new_static("fixture"), n: 1 },
-				description: Str::new_static("binary crash-resume fixture"),
-				schema:      Bytes::from_static(br#"{"type":"object"}"#),
-				constraint:  Constraint::None,
-			})
+			.register_worker(
+				ToolSpec {
+					name:            Str::new_static(name),
+					rev:             Rev { family: Str::new_static("fixture"), n: 1 },
+					description:     Str::new_static("binary crash-resume fixture"),
+					schema:          Bytes::from_static(br#"{"type":"object"}"#),
+					constraint:      Constraint::None,
+					projection_code: [0; 32],
+				},
+				Presentation::Device,
+				worker_claims(),
+			)
 			.expect("register binary gateway tool identity");
 	}
 	Arc::new(registry)
@@ -916,7 +927,7 @@ async fn replay_child(root: &Path, create: bool, _mutated: bool) {
 				item_events:        vec![input_event],
 				prompt_hash:        hash.into_bytes(),
 				prompt_head_events: vec![prompt_event],
-				toolset_hash:       Registry::new().live_hash(),
+				toolset_hash:       Registry::new().slot_hash(),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![prompt_event, input_event],
 				input:              input_record(&input),
@@ -1014,7 +1025,7 @@ fn receipt_child(root: &Path, crash: bool) {
 				item_events:        vec![input],
 				prompt_hash:        hash.into_bytes(),
 				prompt_head_events: vec![prompt],
-				toolset_hash:       Registry::new().live_hash(),
+				toolset_hash:       Registry::new().slot_hash(),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![prompt, input],
 				input:              open.input.clone(),
@@ -1050,12 +1061,12 @@ async fn batch_child(root: &Path, create: bool) {
 	};
 	let mut agent_registry = Registry::new();
 	agent_registry
-		.register(HangingTool::new(root.join("effects")))
+		.register(HangingTool::new(root.join("effects")), Presentation::Slot, core_claims())
 		.expect("register agent hanging tool");
 	let agent_registry = Arc::new(agent_registry);
 	let mut environment_registry = Registry::new();
 	environment_registry
-		.register(HangingTool::new(root.join("effects")))
+		.register(HangingTool::new(root.join("effects")), Presentation::Slot, core_claims())
 		.expect("register environment hanging tool");
 	let state_dir = root.join("env-state");
 	let workspace = root.join("workspace");
@@ -1250,7 +1261,11 @@ fn assert_batch_recovery(journal_path: &Path, gateway_path: &Path) {
 	let log = journal.load().expect("load recovered batch journal");
 	let mut registry = Registry::new();
 	registry
-		.register(HangingTool::new(journal_path.with_extension("unused-effects")))
+		.register(
+			HangingTool::new(journal_path.with_extension("unused-effects")),
+			Presentation::Slot,
+			core_claims(),
+		)
 		.expect("register projection tool");
 	let projected = project_journal(&log, &registry, &caps()).expect("project interrupted batch");
 	let mut result_ids = Vec::new();
@@ -1295,14 +1310,16 @@ fn assert_crash_abort(result: &thread::ToolResult) {
 	let details = result
 		.details
 		.as_ref()
-		.expect("recovery result has structured verdict");
-	let verdict: Verdict<Value, Value> =
-		serde_json::from_value(proto_json(details).expect("recovery verdict is canonical JSON"))
-			.expect("decode recovery verdict");
+		.expect("recovery result has structured outcome");
+	let outcome: CallOutcome<Value, Value> =
+		serde_json::from_value(proto_json(details).expect("recovery outcome is canonical JSON"))
+			.expect("decode recovery outcome");
 	assert!(matches!(
-		verdict,
-		Verdict::Aborted(Abort::EffectsUnknown { reason })
-			if reason.as_str() == "agent restarted after invocation authorization"
+		outcome,
+		CallOutcome::Aborted {
+			abort: Abort::EffectsUnknown { reason },
+			..
+		} if reason.as_str() == "agent restarted after invocation authorization"
 	));
 }
 
@@ -1471,8 +1488,29 @@ fn revision(head: u64) -> thread::Revision {
 	}
 }
 
-const fn caps() -> PromptCaps {
-	PromptCaps { maximum_parts: 8, maximum_text_bytes: 4096, media: false }
+const fn caps() -> CapsBase {
+	CapsBase {
+		maximum_parts:      8,
+		maximum_text_bytes: 4096,
+		media:              false,
+		model_class:        ModelClass::Standard,
+	}
+}
+
+fn core_claims() -> Claims {
+	Claims {
+		precedence: Precedence::CORE,
+		claimant:   Str::new_static("omp/core"),
+		replaces:   None,
+	}
+}
+
+fn worker_claims() -> Claims {
+	Claims {
+		precedence: Precedence::DEFAULT,
+		claimant:   Str::new_static("test/worker"),
+		replaces:   None,
+	}
 }
 
 fn header(root: &Path, id: &str) -> Header {

@@ -8,7 +8,7 @@ use omp_core::Str;
 use omp_hashline::{
 	Clipboard, MismatchDetails, MismatchError, compute_snapshot_tag, loop_guard::NoopLoopGuard,
 };
-use omp_tool::{Ev, IncomingParams, Outcome, Part, PromptCaps, Tool};
+use omp_tool::{CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal};
 use omp_tools::edit::{
 	CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
 	EditPrepared, EditProposal, Fault, FormatPolicy, NoopResult, PrepareRequest, RejectionReason,
@@ -137,8 +137,16 @@ impl EditDocuments for Fake {
 	}
 }
 
-const fn caps() -> PromptCaps {
-	PromptCaps { maximum_parts: 1, maximum_text_bytes: 16 * 1024, media: false }
+fn caps(tool: &impl Tool) -> PromptCaps {
+	PromptCaps::for_tool(
+		CapsBase {
+			maximum_parts:      1,
+			maximum_text_bytes: 16 * 1024,
+			media:              false,
+			model_class:        ModelClass::Standard,
+		},
+		&tool.spec().rev,
+	)
 }
 
 async fn invoke(fake: Fake, input: &str) -> (omp_tools::edit::Payload, Vec<Part>) {
@@ -151,11 +159,11 @@ async fn invoke(fake: Fake, input: &str) -> (omp_tools::edit::Payload, Vec<Part>
 	let payload = events
 		.into_iter()
 		.find_map(|event| match event {
-			Ev::Done(Outcome::Done { result: Ok(payload), .. }) => Some(payload),
+			Ev::Done(ToolTerminal::Done { result: Ok(payload), .. }) => Some(payload),
 			_ => None,
 		})
 		.expect("successful edit payload");
-	let parts = edit.prompt(Ok(&payload), &caps());
+	let parts = edit.prompt(Ok(&payload), &caps(&edit));
 	(payload, parts)
 }
 
@@ -335,12 +343,12 @@ async fn byte_identical_put_escalates_from_exact_soft_diagnostic_to_loop_guard_f
 	let fault = events
 		.into_iter()
 		.find_map(|event| match event {
-			Ev::Done(Outcome::Done { result: Err(fault), .. }) => Some(fault),
+			Ev::Done(ToolTerminal::Done { result: Err(fault), .. }) => Some(fault),
 			_ => None,
 		})
 		.expect("third identical no-op must fail");
 	assert_eq!(
-		text(&edit.prompt(Err(&fault), &caps())),
+		text(&edit.prompt(Err(&fault), &caps(&edit))),
 		"STOP. Edits to a.txt have been a byte-identical no-op 3 times in a row — the patch body \
 		 matches the file at the targeted lines and the soft hint did not break the cycle. Cease \
 		 re-issuing this payload. Either the intended change is already on disk (move on), or your \
@@ -366,7 +374,7 @@ async fn stale_tag_and_transaction_conflict_messages_are_projected_verbatim() {
 		conflicts: Vec::new(),
 	};
 	let edit = tool(Fake::with_files(&[]), FormatPolicy::Configured);
-	assert_eq!(text(&edit.prompt(Err(&stale), &caps())), mismatch.display_message());
+	assert_eq!(text(&edit.prompt(Err(&stale), &caps(&edit))), mismatch.display_message());
 
 	let conflict = Fault {
 		reason:    RejectionReason::Conflict,
@@ -377,7 +385,7 @@ async fn stale_tag_and_transaction_conflict_messages_are_projected_verbatim() {
 		}],
 	};
 	assert_eq!(
-		text(&edit.prompt(Err(&conflict), &caps())),
+		text(&edit.prompt(Err(&conflict), &caps(&edit))),
 		"Edit rejected: conflict (1 overlapping range(s))\n4-6: overlapping concurrent edit"
 	);
 }
@@ -412,8 +420,8 @@ async fn malformed_and_headerless_input_never_commit_and_preserve_parser_diagnos
 		let rendered = events
 			.iter()
 			.find_map(|event| match event {
-				Ev::Done(Outcome::Done { result: Err(fault), .. }) => {
-					Some(text(&edit.prompt(Err(fault), &caps())).to_owned())
+				Ev::Done(ToolTerminal::Done { result: Err(fault), .. }) => {
+					Some(text(&edit.prompt(Err(fault), &caps(&edit))).to_owned())
 				},
 				Ev::Args(issue) => issue.found.as_deref().map(str::to_owned),
 				_ => None,

@@ -1,0 +1,13 @@
+[package]
+name = "omp-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Deferred isolation boundary for OMP process confinement"
+readme = "README.md"
+
+[lints]
+workspace = true

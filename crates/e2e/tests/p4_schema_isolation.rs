@@ -22,8 +22,9 @@ use omp_llm_inference::{
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
-	Constraint, Ev, IncomingParams, LiftedCall, LoweringCaps, Part, PromptCaps, RecordedCall,
-	RecordedCallOwned, Registry, Rev, Tool, ToolIdentity, ToolSpec,
+	CapsBase, Claims, Constraint, Ev, IncomingParams, LiftedCall, LoweringCaps, ModelClass, Part,
+	Precedence, Presentation, PromptCaps, RecordedCall, RecordedCallOwned, Registry, Rev, Tool,
+	ToolIdentity, ToolSpec,
 };
 use prost::Message as _;
 use serde_json::{Value, json};
@@ -32,8 +33,12 @@ use tempfile::TempDir;
 const HL1_SCHEMA_FRAGMENT: &[u8] = b"historical_hl1_schema_poison";
 const HL1_SCHEMA: &[u8] = br#"{"type":"object","properties":{"legacy_patch":{"type":"string"},"historical_hl1_schema_poison":{"const":true}},"required":["legacy_patch"],"additionalProperties":false}"#;
 const HL2_SCHEMA: &[u8] = br#"{"type":"object","properties":{"patch":{"type":"string"},"mode":{"const":"hl.2"},"hl2_schema_only":{"type":"boolean"}},"required":["patch","mode"],"additionalProperties":false}"#;
-const PROMPT_CAPS: PromptCaps =
-	PromptCaps { maximum_parts: 1, maximum_text_bytes: 65_536, media: false };
+const CAPS_BASE: CapsBase = CapsBase {
+	maximum_parts:      1,
+	maximum_text_bytes: 65_536,
+	media:              false,
+	model_class:        ModelClass::Standard,
+};
 
 struct LiveEdit {
 	spec:       ToolSpec,
@@ -44,11 +49,12 @@ impl LiveEdit {
 	const fn new(allow_lift: bool) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static("edit"),
-				rev:         Rev { family: Str::new_static("hl"), n: 2 },
-				description: Str::new_static("apply a hashline edit"),
-				schema:      Bytes::from_static(HL2_SCHEMA),
-				constraint:  Constraint::Schema { priority: 1 },
+				name:            Str::new_static("edit"),
+				rev:             Rev { family: Str::new_static("hl"), n: 2 },
+				description:     Str::new_static("apply a hashline edit"),
+				schema:          Bytes::from_static(HL2_SCHEMA),
+				constraint:      Constraint::Schema { priority: 1 },
+				projection_code: [0; 32],
 			},
 			allow_lift,
 		}
@@ -62,11 +68,12 @@ impl HistoricalEdit {
 	const fn new() -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        Str::new_static("edit"),
-				rev:         Rev { family: Str::new_static("hl"), n: 1 },
-				description: Str::new_static("historical hashline edit"),
-				schema:      Bytes::from_static(HL1_SCHEMA),
-				constraint:  Constraint::Schema { priority: 1 },
+				name:            Str::new_static("edit"),
+				rev:             Rev { family: Str::new_static("hl"), n: 1 },
+				description:     Str::new_static("historical hashline edit"),
+				schema:          Bytes::from_static(HL1_SCHEMA),
+				constraint:      Constraint::Schema { priority: 1 },
+				projection_code: [0; 32],
 			},
 		}
 	}
@@ -163,12 +170,20 @@ impl Tool for LiveEdit {
 fn registry(allow_lift: bool) -> Registry {
 	let mut registry = Registry::new();
 	registry
-		.register(HistoricalEdit::new())
+		.register(HistoricalEdit::new(), Presentation::Slot, core_claims())
 		.expect("historical edit@hl.1 registers for replay authority");
 	registry
-		.register(LiveEdit::new(allow_lift))
+		.register(LiveEdit::new(allow_lift), Presentation::Slot, core_claims())
 		.expect("live edit@hl.2 registers");
 	registry
+}
+
+fn core_claims() -> Claims {
+	Claims {
+		precedence: Precedence::CORE,
+		claimant:   Str::new_static("omp/core"),
+		replaces:   None,
+	}
 }
 
 fn json_proto_value(value: Value) -> pb::Value {
@@ -223,7 +238,7 @@ fn recorded_verdict(branch: &str, marker: &str, line: i64) -> Value {
 
 fn historical_items() -> Vec<thread_pb::Item> {
 	[
-		("edit-one", "alpha", "args-one", "fault", "verdict-one", 7_i64, true, true),
+		("edit-one", "alpha", "args-one", "faulted", "verdict-one", 7_i64, true, true),
 		("edit-two", "beta", "args-two", "ok", "verdict-two", 11_i64, false, false),
 	]
 	.into_iter()
@@ -372,7 +387,8 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 
 	let without_lift = registry(false);
 	let advertised = without_lift
-		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() });
+		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() })
+		.expect("live edit advertisement lowers");
 	let [advertised_edit] = advertised.as_slice() else {
 		panic!("registry must advertise exactly one live edit definition")
 	};
@@ -400,7 +416,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		},
 		raw_args: Bytes::from_static(br#"{"legacy_patch":"alpha","recorded_arg_nonce":"args-one"}"#),
 		verdict:  Bytes::from(
-			serde_json::to_vec(&recorded_verdict("fault", "verdict-one", 7))
+			serde_json::to_vec(&recorded_verdict("faulted", "verdict-one", 7))
 				.expect("recorded verdict serializes"),
 		),
 	};
@@ -408,7 +424,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		matches!(without_lift.project(recorded.clone()), omp_tool::ProjectedCall::Data(data) if data == recorded)
 	);
 
-	let data = project_journal(&log, &without_lift, &PROMPT_CAPS)
+	let data = project_journal(&log, &without_lift, &CAPS_BASE)
 		.expect("unliftable historical revision projects as canonical data");
 	let recorded_schema = original.items[0]
 		.props
@@ -467,7 +483,8 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 
 	let with_lift = registry(true);
 	let lifted_advertised = with_lift
-		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() });
+		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() })
+		.expect("lifted live edit advertisement lowers");
 	let [lifted_advertised] = lifted_advertised.as_slice() else {
 		panic!("adding a lift must not synthesize a historical registration")
 	};
@@ -480,10 +497,10 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		serde_json::to_vec(lifted_schema.as_value()).expect("lifted schema serializes"),
 		HL2_SCHEMA
 	);
-	let first = project_journal(&log, &with_lift, &PROMPT_CAPS)
+	let first = project_journal(&log, &with_lift, &CAPS_BASE)
 		.expect("recorded hl.1 truth lifts to live hl.2");
 	let second =
-		project_journal(&log, &with_lift, &PROMPT_CAPS).expect("unchanged journal reprojects");
+		project_journal(&log, &with_lift, &CAPS_BASE).expect("unchanged journal reprojects");
 	assert_eq!(
 		first.encode_to_vec(),
 		second.encode_to_vec(),
@@ -511,7 +528,8 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		};
 		let expected_nonce = if ordinal == 0 { "args-one" } else { "args-two" };
 		let expected_patch = if ordinal == 0 { "alpha" } else { "beta" };
-		let expected_branch = if ordinal == 0 { "fault" } else { "ok" };
+		let expected_outcome_branch = if ordinal == 0 { "faulted" } else { "ok" };
+		let expected_prompt_branch = if ordinal == 0 { "fault" } else { "ok" };
 		let expected_error = ordinal == 0;
 		let expected_useless = ordinal == 0;
 
@@ -548,7 +566,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		assert_eq!(
 			result.details,
 			Some(json_proto_value(json!({
-				"kind": expected_branch,
+				"kind": expected_outcome_branch,
 				"value": {
 					"recorded_verdict": expected_marker,
 					"detail": {
@@ -563,7 +581,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		assert!(matches!(
 			result.parts.as_slice(),
 			[thread_pb::Part { kind: Some(thread_pb::part::Kind::Text(text)) }]
-				if text == &format!("{expected_branch}|{expected_marker}|hl.2")
+				if text == &format!("{expected_prompt_branch}|{expected_marker}|hl.2")
 		));
 		assert!(matches!(
 			pair[1]
@@ -623,7 +641,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 	);
 	assert_eq!(
 		expected_full,
-		project_journal(&log, &registry(true), &PROMPT_CAPS)
+		project_journal(&log, &registry(true), &CAPS_BASE)
 			.expect("accepted history remains projectable")
 			.encode_to_vec()
 	);

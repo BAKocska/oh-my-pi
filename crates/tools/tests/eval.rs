@@ -8,7 +8,9 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_core::Str;
-use omp_tool::{BlobRef, Ev, IncomingParams, Outcome, Part, PromptCaps, Tool};
+use omp_tool::{
+	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
+};
 use omp_tools::eval::{
 	self, CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, Language,
 	OutputChannel, OutputFrame, Payload, RunEvent, RunRequest, Session,
@@ -86,11 +88,11 @@ async fn execute_params(
 	let mut events = Box::pin(tool.call(params));
 	while let Some(event) = events.next().await {
 		match event {
-			Ev::Done(Outcome::Done { result: Ok(payload), .. }) => return payload,
-			Ev::Done(Outcome::Done { result: Err(fault), .. }) => {
+			Ev::Done(ToolTerminal::Done { result: Ok(payload), .. }) => return payload,
+			Ev::Done(ToolTerminal::Done { result: Err(fault), .. }) => {
 				panic!("eval returned a fault: {fault:?}")
 			},
-			Ev::Done(Outcome::Detached(_)) => panic!("eval unexpectedly detached"),
+			Ev::Done(ToolTerminal::Detached(_)) => panic!("eval unexpectedly detached"),
 			Ev::Args(issue) => panic!("eval rejected arguments: {issue:?}"),
 			Ev::Aborted(abort) => panic!("eval aborted: {abort:?}"),
 			Ev::Update(_) => {},
@@ -136,11 +138,19 @@ fn frame(channel: OutputChannel, text: &str, sequence: u64) -> OutputFrame {
 }
 
 fn project(payload: &Payload, media: bool) -> Vec<Part> {
-	tool().prompt(Ok(payload), &PromptCaps {
-		maximum_parts: 8,
-		maximum_text_bytes: 64 * 1024,
-		media,
-	})
+	let tool = tool();
+	tool.prompt(
+		Ok(payload),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts: 8,
+				maximum_text_bytes: 64 * 1024,
+				media,
+				model_class: ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		),
+	)
 }
 
 fn text(parts: &[Part]) -> String {
@@ -326,11 +336,19 @@ fn image_display_projects_blob_without_base64_text() {
 
 #[test]
 fn invalid_timeout_fault_projection_is_exact() {
-	let parts = tool().prompt(Err(&Fault::InvalidTimeout), &PromptCaps {
-		maximum_parts:      1,
-		maximum_text_bytes: 1024,
-		media:              false,
-	});
+	let tool = tool();
+	let parts = tool.prompt(
+		Err(&Fault::InvalidTimeout),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts:      1,
+				maximum_text_bytes: 1024,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		),
+	);
 	assert_eq!(text(&parts), "eval timeout must be a finite non-negative number");
 }
 

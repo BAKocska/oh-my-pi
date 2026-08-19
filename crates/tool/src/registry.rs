@@ -13,11 +13,12 @@ use omp_llm_inference::{
 };
 use omp_proto::inference::v1::InvokeInput;
 use serde_json::Value;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-	Abort, Constraint, GrammarSyntax, IncomingParams, LiftedCall, Part, PromptCaps, RecordedCall,
-	RecordedCallOwned, Rev, Tool, ToolIdentity, Verdict,
+	Abort, CallOutcome, Constraint, GrammarSyntax, IncomingParams, LiftedCall, Part, Presentation,
+	PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool, ToolIdentity,
 };
 
 /// Catalog capabilities needed for deterministic tool lowering.
@@ -44,6 +45,81 @@ pub enum ToolRoute {
 	Native,
 	/// Externally supervised worker executor.
 	Worker,
+}
+
+/// Declared priority for resolving competing claims on one tool name.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Precedence(pub i32);
+
+impl Precedence {
+	/// Harness-owned core tool precedence.
+	pub const CORE: Self = Self(1_000);
+	/// Ordinary extension precedence.
+	pub const DEFAULT: Self = Self(0);
+	/// Enhancement of an existing capability.
+	pub const ENHANCEMENT: Self = Self(500);
+	/// Deliberate last-resort implementation.
+	pub const FALLBACK: Self = Self(-500);
+	/// First-party or protocol integration precedence.
+	pub const INTEGRATION: Self = Self(700);
+}
+
+/// Claim metadata supplied with one tool registration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Claims {
+	/// Priority used to resolve this name.
+	pub precedence: Precedence,
+	/// Publisher-qualified implementation identity, such as `ff-labs/fff`.
+	pub claimant:   Str,
+	/// Name explicitly replaced by this claim, when replacement is intended.
+	pub replaces:   Option<Str>,
+}
+
+/// Provenance retained for a non-winning claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShadowClaim {
+	/// Current schema revision supplied by this claimant.
+	pub rev:        Rev,
+	/// Declared priority.
+	pub precedence: Precedence,
+	/// Publisher-qualified implementation identity.
+	pub claimant:   Str,
+	/// Explicit replacement target, when declared.
+	pub replaces:   Option<Str>,
+}
+
+/// Policy-resolved claim for one stable tool name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Claim {
+	/// Current schema revision of the winning claimant.
+	pub rev:        Rev,
+	/// Winning priority.
+	pub precedence: Precedence,
+	/// Publisher-qualified winning implementation.
+	pub claimant:   Str,
+	/// Explicit replacement target, when declared.
+	pub replaces:   Option<Str>,
+	/// Losing claims retained in deterministic precedence order.
+	pub shadowed:   SmallVec<ShadowClaim, 1>,
+}
+
+/// Borrowed catalog view of one policy-resolved device.
+#[derive(Clone, Copy, Debug)]
+pub struct MountedDevice<'a> {
+	/// Stable catalog name.
+	pub name:     &'a Str,
+	/// Current schema revision.
+	pub rev:      &'a Rev,
+	/// Publisher-qualified implementation identity.
+	pub claimant: &'a Str,
+	/// Short catalog summary.
+	pub summary:  &'a Str,
+	/// Complete JSON Schema bytes.
+	pub schema:   &'a [u8],
+	/// Long-form documentation, when supplied by the declaration surface.
+	pub docs:     Option<&'a str>,
+	/// Execution placement, independent of device presentation.
+	pub route:    ToolRoute,
 }
 
 /// One live tool declaration ready for inference request construction.
@@ -75,7 +151,7 @@ pub enum ErasedEv {
 pub enum ErasedOutcome {
 	/// Structured journal verdict with compaction metadata.
 	Done {
-		/// Exact serialized [`Verdict`] JSON.
+		/// Exact serialized [`CallOutcome`] JSON.
 		verdict: Bytes,
 		/// Whether projected parts may be compacted.
 		useless: bool,
@@ -118,6 +194,26 @@ pub enum RegistryError {
 	/// Tool name is not registered.
 	#[error("unknown tool: {0}")]
 	UnknownTool(Str),
+	/// Two distinct claimants declared the same precedence for one name.
+	#[error("tool precedence tie for {name}: {first} and {second}")]
+	PrecedenceTie {
+		/// Contested tool name.
+		name:   Str,
+		/// Lexicographically first claimant.
+		first:  Str,
+		/// Lexicographically second claimant.
+		second: Str,
+	},
+	/// A declaration attempted to occupy or outrank a reserved core name.
+	#[error("claimant {claimant} cannot claim reserved core precedence for {name}: {precedence:?}")]
+	CoreNameClaim {
+		/// Contested tool name.
+		name:       Str,
+		/// Rejected device claimant.
+		claimant:   Str,
+		/// Rejected precedence value.
+		precedence: Precedence,
+	},
 	/// Operation requires a native pure or execution surface unavailable for a
 	/// worker declaration.
 	#[error("tool {name}@{rev} is worker-routed and cannot perform registry operation {operation}")]
@@ -154,6 +250,16 @@ pub enum RegistryError {
 		rev:    Rev,
 		/// Typed update decoder failure.
 		source: serde_json::Error,
+	},
+	/// Selected route cannot honor a constraint whose fallback is `ERROR`.
+	#[error("tool {name}@{rev} requires unsupported constraint: {feature}")]
+	UnsupportedConstraint {
+		/// Tool name.
+		name:    Str,
+		/// Exact registered revision.
+		rev:     Rev,
+		/// Unsupported constraint feature.
+		feature: &'static str,
 	},
 }
 
@@ -256,7 +362,7 @@ impl<T: Tool> ErasedTool for Registered<T> {
 					},
 					crate::Ev::Args(issue) => {
 						terminal = true;
-						let verdict = Verdict::<T::Payload, T::Fault>::Args(issue);
+						let verdict = CallOutcome::<T::Payload, T::Fault>::ArgsRejected(issue);
 						match serde_json::to_vec(&verdict) {
 							Ok(json) => yield Ok(ErasedEv::Done(ErasedOutcome::Done {
 								verdict: Bytes::from(json),
@@ -268,7 +374,7 @@ impl<T: Tool> ErasedTool for Registered<T> {
 					},
 					crate::Ev::Aborted(abort) => {
 						terminal = true;
-						let verdict = Verdict::<T::Payload, T::Fault>::Aborted(abort);
+						let verdict = CallOutcome::<T::Payload, T::Fault>::aborted(abort);
 						match serde_json::to_vec(&verdict) {
 							Ok(json) => yield Ok(ErasedEv::Done(ErasedOutcome::Done {
 								verdict: Bytes::from(json),
@@ -281,10 +387,10 @@ impl<T: Tool> ErasedTool for Registered<T> {
 					crate::Ev::Done(outcome) => {
 						terminal = true;
 						let erased = match outcome {
-							crate::Outcome::Done { result, useless } => {
+							crate::ToolTerminal::Done { result, useless } => {
 								let verdict = match result {
-									Ok(payload) => Verdict::<T::Payload, T::Fault>::Ok(payload),
-									Err(fault) => Verdict::<T::Payload, T::Fault>::Fault(fault),
+									Ok(payload) => CallOutcome::<T::Payload, T::Fault>::Ok(payload),
+									Err(fault) => CallOutcome::<T::Payload, T::Fault>::Faulted(fault),
 								};
 								match serde_json::to_vec(&verdict) {
 									Ok(json) => ErasedOutcome::Done {
@@ -297,7 +403,7 @@ impl<T: Tool> ErasedTool for Registered<T> {
 									},
 								}
 							},
-							crate::Outcome::Detached(job) => ErasedOutcome::Detached(job),
+							crate::ToolTerminal::Detached(job) => ErasedOutcome::Detached(job),
 						};
 						yield Ok(ErasedEv::Done(erased));
 						break;
@@ -305,7 +411,7 @@ impl<T: Tool> ErasedTool for Registered<T> {
 				}
 			}
 			if !terminal {
-				let verdict = Verdict::<Value, Value>::Aborted(Abort::MissingOutcome);
+				let verdict = CallOutcome::<Value, Value>::aborted(Abort::MissingOutcome);
 				match serde_json::to_vec(&verdict) {
 					Ok(json) => yield Ok(ErasedEv::Done(ErasedOutcome::Done {
 						verdict: Bytes::from(json),
@@ -323,25 +429,25 @@ impl<T: Tool> ErasedTool for Registered<T> {
 		recorded_useless: bool,
 		caps: PromptCaps,
 	) -> Result<ProjectedVerdict, RegistryError> {
-		let verdict: Verdict<T::Payload, T::Fault> = serde_json::from_slice(verdict)
+		let verdict: CallOutcome<T::Payload, T::Fault> = serde_json::from_slice(verdict)
 			.map_err(|_| RegistryError::VerdictShape(self.tool.spec().name.clone()))?;
 		Ok(match &verdict {
-			Verdict::Ok(payload) => ProjectedVerdict {
+			CallOutcome::Ok(payload) => ProjectedVerdict {
 				parts:    self.tool.prompt(Ok(payload), &caps),
 				is_error: false,
 				useless:  recorded_useless,
 			},
-			Verdict::Fault(fault) => ProjectedVerdict {
+			CallOutcome::Faulted(fault) => ProjectedVerdict {
 				parts:    self.tool.prompt(Err(fault), &caps),
 				is_error: true,
 				useless:  recorded_useless,
 			},
-			Verdict::Args(issue) => ProjectedVerdict {
+			CallOutcome::ArgsRejected(issue) => ProjectedVerdict {
 				parts:    vec![Part::Text { text: render_arg_issue(issue) }],
 				is_error: true,
 				useless:  false,
 			},
-			Verdict::Aborted(abort) => ProjectedVerdict {
+			CallOutcome::Aborted { abort, .. } => ProjectedVerdict {
 				parts:    vec![Part::Text { text: render_abort(abort) }],
 				is_error: true,
 				useless:  false,
@@ -368,6 +474,12 @@ impl<T: Tool> ErasedTool for Registered<T> {
 	}
 }
 
+struct RegistryEntry {
+	tool:         Arc<dyn ErasedTool>,
+	presentation: Presentation,
+	claims:       Claims,
+}
+
 /// Revision-aware tool registry.
 ///
 /// Concrete associated types are erased exactly once by
@@ -376,8 +488,8 @@ impl<T: Tool> ErasedTool for Registered<T> {
 /// revision per stable name.
 #[derive(Default)]
 pub struct Registry {
-	versions: BTreeMap<Str, BTreeMap<Rev, Arc<dyn ErasedTool>>>,
-	live:     BTreeMap<Str, Rev>,
+	versions: BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
+	live:     BTreeMap<Str, Claim>,
 }
 
 impl Registry {
@@ -386,107 +498,220 @@ impl Registry {
 		Self::default()
 	}
 
-	/// Registers a typed tool and makes this revision live for its name.
+	/// Registers a typed tool under one presentation and claimant.
 	///
-	/// Older registered revisions remain only as pure lift steps; they are never
-	/// dispatched or advertised.
-	pub fn register<T: Tool>(&mut self, tool: T) -> Result<(), RegistryError> {
+	/// Older revisions from the same claimant remain only as pure lift steps.
+	/// Competing lower-precedence claimants remain qualified-addressable.
+	pub fn register<T: Tool>(
+		&mut self,
+		tool: T,
+		presentation: Presentation,
+		claims: Claims,
+	) -> Result<(), RegistryError> {
 		let spec = tool.spec();
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
 			RegistryError::InvalidSchema { name: name.clone(), rev: rev.clone(), source }
 		})?;
-		let versions = self.versions.entry(name.clone()).or_default();
-		if versions.contains_key(&rev) {
-			return Err(RegistryError::Duplicate(name, rev));
-		}
-		versions.insert(rev.clone(), Arc::new(Registered { tool, schema: OpaqueJson::new(value) }));
-		self.live.insert(name, rev);
-		Ok(())
+		let entry = RegistryEntry {
+			tool: Arc::new(Registered { tool, schema: OpaqueJson::new(value) }),
+			presentation,
+			claims,
+		};
+		self.insert(name, rev, entry)
 	}
 
-	/// Registers an externally supervised worker declaration and makes it live.
+	/// Registers an externally supervised declaration under one presentation
+	/// and claimant.
 	///
-	/// Worker declarations participate in identity, hashing, and advertisement,
-	/// but execution and pure typed projection remain owned by the worker route.
-	pub fn register_worker(&mut self, spec: crate::ToolSpec) -> Result<(), RegistryError> {
+	/// Worker execution and typed projection remain owned by the worker route.
+	pub fn register_worker(
+		&mut self,
+		spec: crate::ToolSpec,
+		presentation: Presentation,
+		claims: Claims,
+	) -> Result<(), RegistryError> {
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
 			RegistryError::InvalidSchema { name: name.clone(), rev: rev.clone(), source }
 		})?;
-		let versions = self.versions.entry(name.clone()).or_default();
-		if versions.contains_key(&rev) {
+		let entry = RegistryEntry {
+			tool: Arc::new(Worker { spec, schema: OpaqueJson::new(value) }),
+			presentation,
+			claims,
+		};
+		self.insert(name, rev, entry)
+	}
+
+	fn insert(&mut self, name: Str, rev: Rev, entry: RegistryEntry) -> Result<(), RegistryError> {
+		if entry.claims.precedence > Precedence::CORE
+			|| (entry.presentation == Presentation::Device
+				&& entry.claims.precedence >= Precedence::CORE)
+		{
+			return Err(RegistryError::CoreNameClaim {
+				name,
+				claimant: entry.claims.claimant,
+				precedence: entry.claims.precedence,
+			});
+		}
+		if self
+			.versions
+			.get(&name)
+			.is_some_and(|versions| versions.contains_key(&rev))
+		{
 			return Err(RegistryError::Duplicate(name, rev));
 		}
-		versions.insert(rev.clone(), Arc::new(Worker { spec, schema: OpaqueJson::new(value) }));
-		self.live.insert(name, rev);
+		let claim = resolve_claim(&name, self.live.get(&name), rev.clone(), &entry.claims)?;
+		self
+			.versions
+			.entry(name.clone())
+			.or_default()
+			.insert(rev, entry);
+		self.live.insert(name, claim);
 		Ok(())
 	}
 
-	/// Borrows the exact live `(name, revision)` identity for `name`.
+	/// Borrows the exact policy-resolved `(name, revision)` identity.
 	///
-	/// The returned values are owned by this registry and remain valid for the
-	/// duration of the borrow. No transcript-facing identity is synthesized.
+	/// A claimant-qualified name resolves a shadow without promoting it into
+	/// catalog iteration.
 	#[must_use]
 	pub fn live_identity(&self, name: &str) -> Option<(&Str, &Rev)> {
-		self.live.get_key_value(name)
+		let (name, claimant) = split_claimant(name);
+		let (stored_name, claim) = self.live.get_key_value(name)?;
+		Some((stored_name, claim_revision(claim, claimant)?))
 	}
 
-	/// Iterates the exact live identities in deterministic name order.
-	///
-	/// This is an authorization surface for session adapters: callers still
-	/// need to inspect [`Self::route`] before granting an execution capability.
-	pub fn live_identities(&self) -> impl Iterator<Item = (&Str, &Rev)> {
-		self.live.iter()
+	/// Iterates winning identities in deterministic name order.
+	pub fn live_identities(
+		&self,
+	) -> impl DoubleEndedIterator<Item = (&Str, &Rev)> + ExactSizeIterator + '_ {
+		self.live.iter().map(|(name, claim)| (name, &claim.rev))
 	}
 
-	/// Returns the execution route of the live declaration named `name`.
-	pub fn route(&self, name: &str) -> Result<ToolRoute, RegistryError> {
-		Ok(self.live_entry(name)?.route())
-	}
-
-	/// Hashes the ordered live tool identities without allocation or
-	/// serialization.
-	///
-	/// Every identity field is length-delimited with a little-endian `u64`
-	/// length; revision numbers are encoded as little-endian `u16` bytes. The
-	/// live map's `BTreeMap` order makes the digest registration-order
-	/// independent.
+	/// Borrows the resolved claim and its shadow provenance.
 	#[must_use]
-	pub fn live_hash(&self) -> [u8; 32] {
+	pub fn claim(&self, name: &str) -> Option<&Claim> {
+		self.live.get(name)
+	}
+
+	/// Returns the execution route of a winning or claimant-qualified entry.
+	pub fn route(&self, name: &str) -> Result<ToolRoute, RegistryError> {
+		Ok(self.live_entry(name)?.tool.route())
+	}
+
+	/// Returns the presentation of a winning or claimant-qualified entry.
+	pub fn presentation(&self, name: &str) -> Result<Presentation, RegistryError> {
+		Ok(self.live_entry(name)?.presentation)
+	}
+
+	/// Iterates mounted catalog devices without allocating.
+	///
+	/// Shadowed devices remain claimant-qualified but are intentionally absent.
+	pub fn devices(&self) -> impl DoubleEndedIterator<Item = MountedDevice<'_>> + '_ {
+		self.live.iter().filter_map(|(name, claim)| {
+			let entry = self.versions.get(name)?.get(&claim.rev)?;
+			(entry.presentation == Presentation::Device).then(|| MountedDevice {
+				name,
+				rev: &claim.rev,
+				claimant: &claim.claimant,
+				summary: &entry.tool.spec().description,
+				schema: entry.tool.spec().schema.as_ref(),
+				docs: None,
+				route: entry.tool.route(),
+			})
+		})
+	}
+
+	/// Hashes only policy-resolved model-visible slots.
+	#[must_use]
+	pub fn slot_hash(&self) -> [u8; 32] {
 		let mut hasher = blake3::Hasher::new();
-		hasher.update(b"omp-tool/live/v1\0");
-		for (name, rev) in &self.live {
-			hash_field(&mut hasher, name.as_bytes());
-			hash_field(&mut hasher, rev.family.as_bytes());
-			hash_field(&mut hasher, &rev.n.to_le_bytes());
+		hasher.update(b"omp-tool/slots/v1\0");
+		for (name, claim) in &self.live {
+			let Some(entry) = self
+				.versions
+				.get(name)
+				.and_then(|versions| versions.get(&claim.rev))
+			else {
+				continue;
+			};
+			if entry.presentation == Presentation::Slot {
+				hash_identity(&mut hasher, name, &claim.rev);
+			}
 		}
 		*hasher.finalize().as_bytes()
 	}
 
-	/// Dispatches only the live registered revision.
+	/// Hashes mounted device availability and claimant-qualified reachability.
+	#[must_use]
+	pub fn device_hash(&self) -> [u8; 32] {
+		let mut hasher = blake3::Hasher::new();
+		hasher.update(b"omp-tool/devices/v1\0");
+		for (name, claim) in &self.live {
+			for shadow in claim_entries(claim) {
+				let Some(entry) = self
+					.versions
+					.get(name)
+					.and_then(|versions| versions.get(shadow.rev))
+				else {
+					continue;
+				};
+				if entry.presentation != Presentation::Device {
+					continue;
+				}
+				hash_identity(&mut hasher, name, shadow.rev);
+				hash_field(&mut hasher, shadow.claimant.as_bytes());
+				hash_field(
+					&mut hasher,
+					shadow
+						.replaces
+						.map_or(&[][..], |replacement| replacement.as_bytes()),
+				);
+				hasher.update(&shadow.precedence.0.to_le_bytes());
+				hasher.update(&[entry.tool.route() as u8]);
+			}
+		}
+		*hasher.finalize().as_bytes()
+	}
+
+	/// Hashes every registered revision with its projection implementation.
+	#[must_use]
+	pub fn projection_hash(&self) -> [u8; 32] {
+		let mut hasher = blake3::Hasher::new();
+		hasher.update(b"omp-tool/projections/v1\0");
+		for (name, versions) in &self.versions {
+			for (rev, entry) in versions {
+				hash_identity(&mut hasher, name, rev);
+				hash_field(&mut hasher, &entry.tool.spec().projection_code);
+			}
+		}
+		*hasher.finalize().as_bytes()
+	}
+
+	/// Dispatches only the policy-resolved or claimant-qualified revision.
 	pub fn invoke<'a>(
 		&'a self,
 		name: &str,
 		params: IncomingParams<'a>,
 	) -> Result<ErasedStream<'a>, RegistryError> {
 		let entry = self.live_entry(name)?;
-		if entry.route() == ToolRoute::Worker {
-			return Err(external_error(entry.spec(), "invoke"));
+		if entry.tool.route() == ToolRoute::Worker {
+			return Err(external_error(entry.tool.spec(), "invoke"));
 		}
-		Ok(entry.call(params))
+		Ok(entry.tool.call(params))
 	}
 
-	/// Lowers every live spec and no historical spec for one selected route.
-	pub fn advertise(&self, caps: LoweringCaps) -> Vec<LoweredTool> {
+	/// Lowers only policy-resolved model-visible slots.
+	pub fn advertise(&self, caps: LoweringCaps) -> Result<Vec<LoweredTool>, RegistryError> {
 		self
 			.live
 			.iter()
-			.filter_map(|(name, rev)| {
-				let entry = self.versions.get(name)?.get(rev)?;
-				Some(lower(entry.as_ref(), caps))
+			.filter_map(|(name, claim)| {
+				let entry = self.versions.get(name)?.get(&claim.rev)?;
+				(entry.presentation == Presentation::Slot).then(|| lower(entry.tool.as_ref(), caps))
 			})
 			.collect()
 	}
@@ -519,7 +744,7 @@ impl Registry {
 			.get(&identity.name)
 			.and_then(|versions| versions.get(&identity.rev))
 			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))?;
-		entry.project_verdict(verdict, recorded_useless, *caps)
+		entry.tool.project_verdict(verdict, recorded_useless, *caps)
 	}
 
 	/// Projects one exact serialized update through its registered typed tool.
@@ -534,7 +759,7 @@ impl Registry {
 			.get(&identity.name)
 			.and_then(|versions| versions.get(&identity.rev))
 			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))?;
-		entry.invoke_input(invocation_id, json)
+		entry.tool.invoke_input(invocation_id, json)
 	}
 
 	/// Composes registered adjacent lift steps toward the live revision.
@@ -542,9 +767,10 @@ impl Registry {
 	/// Failure of any step returns the exact original bytes as `Data`; partially
 	/// migrated history is never exposed or mistaken for a live schema.
 	pub fn project(&self, original: RecordedCallOwned) -> ProjectedCall {
-		let Some(live_rev) = self.live.get(&original.identity.name) else {
+		let Some(live_claim) = self.live.get(&original.identity.name) else {
 			return ProjectedCall::Data(original);
 		};
+		let live_rev = &live_claim.rev;
 		if &original.identity.rev == live_rev {
 			return ProjectedCall::Live(original);
 		}
@@ -564,7 +790,7 @@ impl Registry {
 			let Some(step) = versions.get(&next_rev) else {
 				return ProjectedCall::Data(original);
 			};
-			let Some(lifted) = step.lift(&current_rev, RecordedCall {
+			let Some(lifted) = step.tool.lift(&current_rev, RecordedCall {
 				raw_args: &current.raw_args,
 				verdict:  &current.verdict,
 			}) else {
@@ -580,18 +806,129 @@ impl Registry {
 		})
 	}
 
-	fn live_entry(&self, name: &str) -> Result<&dyn ErasedTool, RegistryError> {
-		let rev = self
+	fn live_entry(&self, path: &str) -> Result<&RegistryEntry, RegistryError> {
+		let (name, claimant) = split_claimant(path);
+		let claim = self
 			.live
 			.get(name)
-			.ok_or_else(|| RegistryError::UnknownTool(Str::from(name)))?;
+			.ok_or_else(|| RegistryError::UnknownTool(Str::from(path)))?;
+		let rev = claim_revision(claim, claimant)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::from(path)))?;
 		self
 			.versions
 			.get(name)
 			.and_then(|versions| versions.get(rev))
-			.map(|entry| entry.as_ref())
-			.ok_or_else(|| RegistryError::UnknownTool(Str::from(name)))
+			.ok_or_else(|| RegistryError::UnknownTool(Str::from(path)))
 	}
+}
+
+#[derive(Clone, Copy)]
+struct ClaimRef<'a> {
+	rev:        &'a Rev,
+	precedence: Precedence,
+	claimant:   &'a Str,
+	replaces:   Option<&'a Str>,
+}
+
+fn resolve_claim(
+	name: &Str,
+	existing: Option<&Claim>,
+	rev: Rev,
+	claims: &Claims,
+) -> Result<Claim, RegistryError> {
+	let mut contenders = SmallVec::<ShadowClaim, 2>::new();
+	if let Some(existing) = existing {
+		contenders.push(ShadowClaim {
+			rev:        existing.rev.clone(),
+			precedence: existing.precedence,
+			claimant:   existing.claimant.clone(),
+			replaces:   existing.replaces.clone(),
+		});
+		contenders.extend(existing.shadowed.iter().cloned());
+	}
+	if let Some(position) = contenders
+		.iter()
+		.position(|candidate| candidate.claimant == claims.claimant)
+	{
+		contenders.remove(position);
+	}
+	contenders.push(ShadowClaim {
+		rev,
+		precedence: claims.precedence,
+		claimant: claims.claimant.clone(),
+		replaces: claims.replaces.clone(),
+	});
+	contenders.sort_by(|left, right| {
+		right
+			.precedence
+			.cmp(&left.precedence)
+			.then_with(|| left.claimant.cmp(&right.claimant))
+	});
+	for pair in contenders.windows(2) {
+		if pair[0].precedence == pair[1].precedence {
+			let (first, second) = if pair[0].claimant <= pair[1].claimant {
+				(pair[0].claimant.clone(), pair[1].claimant.clone())
+			} else {
+				(pair[1].claimant.clone(), pair[0].claimant.clone())
+			};
+			return Err(RegistryError::PrecedenceTie { name: name.clone(), first, second });
+		}
+	}
+	let winner = contenders.remove(0);
+	Ok(Claim {
+		rev:        winner.rev,
+		precedence: winner.precedence,
+		claimant:   winner.claimant,
+		replaces:   winner.replaces,
+		shadowed:   contenders.into_iter().collect(),
+	})
+}
+
+fn split_claimant(path: &str) -> (&str, Option<&str>) {
+	path
+		.rsplit_once('@')
+		.map_or((path, None), |(name, claimant)| {
+			if name.is_empty() || claimant.is_empty() {
+				(path, None)
+			} else {
+				(name, Some(claimant))
+			}
+		})
+}
+
+fn claim_revision<'a>(claim: &'a Claim, claimant: Option<&str>) -> Option<&'a Rev> {
+	let Some(claimant) = claimant else {
+		return Some(&claim.rev);
+	};
+	if claim.claimant == claimant {
+		return Some(&claim.rev);
+	}
+	claim
+		.shadowed
+		.iter()
+		.find(|shadow| shadow.claimant == claimant)
+		.map(|shadow| &shadow.rev)
+}
+
+fn claim_entries(claim: &Claim) -> impl Iterator<Item = ClaimRef<'_>> {
+	std::iter::once(ClaimRef {
+		rev:        &claim.rev,
+		precedence: claim.precedence,
+		claimant:   &claim.claimant,
+		replaces:   claim.replaces.as_ref(),
+	})
+	.chain(claim.shadowed.iter().map(|shadow| ClaimRef {
+		rev:        &shadow.rev,
+		precedence: shadow.precedence,
+		claimant:   &shadow.claimant,
+		replaces:   shadow.replaces.as_ref(),
+	}))
+}
+
+fn hash_identity(hasher: &mut blake3::Hasher, name: &Str, rev: &Rev) {
+	hash_field(hasher, name.as_bytes());
+	hash_field(hasher, rev.family.as_bytes());
+	hash_field(hasher, &rev.n.to_le_bytes());
 }
 
 fn hash_field(hasher: &mut blake3::Hasher, field: &[u8]) {
@@ -645,7 +982,7 @@ fn render_abort(abort: &Abort) -> Str {
 	}
 }
 
-fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> LoweredTool {
+fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, RegistryError> {
 	let spec = entry.spec();
 	let mut adjustments = Vec::new();
 	let (input, disposition, priority) = match &spec.constraint {
@@ -654,12 +991,19 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> LoweredTool {
 			None,
 			None,
 		),
-		Constraint::Schema { priority } if caps.strict_schema => (
+		Constraint::Schema { priority, .. } if caps.strict_schema => (
 			ToolInputConstraint::JsonSchema { parameters: entry.schema().clone(), strict: true },
 			Some(ConstraintDisposition::Required),
 			Some(*priority),
 		),
-		Constraint::Schema { priority } => {
+		Constraint::Schema { priority, on_unsupported } => {
+			if *on_unsupported == omp_proto::inference::v1::Fallback::Error {
+				return Err(RegistryError::UnsupportedConstraint {
+					name:    spec.name.clone(),
+					rev:     spec.rev.clone(),
+					feature: "schema",
+				});
+			}
 			adjustments.push(dropped(&spec.name, "schema", "catalog.strict-schema-unsupported"));
 			(
 				ToolInputConstraint::JsonSchema {
@@ -670,7 +1014,7 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> LoweredTool {
 				Some(*priority),
 			)
 		},
-		Constraint::Grammar { syntax, definition, priority }
+		Constraint::Grammar { syntax, definition, priority, .. }
 			if caps.grammar.contains(grammar_bit(*syntax)) =>
 		{
 			(
@@ -682,7 +1026,14 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> LoweredTool {
 				Some(*priority),
 			)
 		},
-		Constraint::Grammar { syntax, priority, .. } => {
+		Constraint::Grammar { syntax, priority, on_unsupported, .. } => {
+			if *on_unsupported == omp_proto::inference::v1::Fallback::Error {
+				return Err(RegistryError::UnsupportedConstraint {
+					name:    spec.name.clone(),
+					rev:     spec.rev.clone(),
+					feature: grammar_name(*syntax),
+				});
+			}
 			adjustments.push(dropped(
 				&spec.name,
 				grammar_name(*syntax),
@@ -698,7 +1049,7 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> LoweredTool {
 			)
 		},
 	};
-	LoweredTool {
+	Ok(LoweredTool {
 		identity: spec.identity(),
 		definition: ToolDefinition {
 			name: spec.name.clone(),
@@ -708,7 +1059,7 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> LoweredTool {
 		disposition,
 		priority,
 		adjustments,
-	}
+	})
 }
 
 fn external_error(spec: &crate::ToolSpec, operation: &'static str) -> RegistryError {

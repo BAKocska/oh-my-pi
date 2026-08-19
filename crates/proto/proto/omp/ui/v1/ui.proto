@@ -1,0 +1,281 @@
+syntax = "proto3";
+
+package omp.ui.v1;
+
+import "omp/inference/v1/common.proto";
+
+// Trusted Markup Language source. Receivers must reject source above the
+// negotiated byte/depth bounds before allocating or parsing it.
+message Tml {
+  bytes source = 1;
+  uint64 hash = 2;
+}
+
+enum SlotPlacement {
+  SLOT_PLACEMENT_UNSPECIFIED = 0;
+  SLOT_PLACEMENT_HEADER = 1;
+  SLOT_PLACEMENT_FOOTER = 2;
+  SLOT_PLACEMENT_LEFT_RAIL = 3;
+  SLOT_PLACEMENT_RIGHT_RAIL = 4;
+  SLOT_PLACEMENT_ABOVE_EDITOR = 5;
+  SLOT_PLACEMENT_BELOW_EDITOR = 6;
+  SLOT_PLACEMENT_OVERLAY = 7;
+}
+
+message PropValue {
+  oneof value {
+    string string_value = 1;
+    sint64 integer_value = 2;
+    bool bool_value = 3;
+    double number_value = 4;
+    bytes bytes_value = 5;
+  }
+}
+
+message SlotOptions {
+  sint32 order = 1;
+  bool visible = 2;
+  optional uint32 width = 3;
+  optional uint32 height = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message MountSlot {
+  string key = 1;
+  SlotPlacement placement = 2;
+  Tml content = 3;
+  SlotOptions options = 4;
+}
+
+message UnmountSlot {
+  string key = 1;
+}
+
+message PatchNode {
+  string key = 1;
+  string node_id = 2;
+  optional Tml text = 3;
+  map<string, PropValue> props = 4;
+}
+
+message SetStatus {
+  Tml content = 1;
+}
+message SetWorking {
+  bool working = 1;
+  optional string label = 2;
+}
+message Notify {
+  string message = 1;
+  string level = 2;
+  optional uint64 duration_ms = 3;
+}
+message SetTitle {
+  string title = 1;
+}
+message SetProgress {
+  optional double fraction = 1;
+  optional string label = 2;
+}
+message SetGhost {
+  optional string text = 1;
+}
+message ComposerEdit {
+  uint32 start = 1;
+  uint32 end = 2;
+  string text = 3;
+}
+message FocusSlot {
+  string key = 1;
+}
+message OpenUrl {
+  string url = 1;
+}
+message Bell {}
+
+message UiEffect {
+  oneof kind {
+    MountSlot mount_slot = 1;
+    UnmountSlot unmount_slot = 2;
+    PatchNode patch_node = 3;
+    SetStatus set_status = 4;
+    SetWorking set_working = 5;
+    Notify notify = 6;
+    SetTitle set_title = 7;
+    SetProgress set_progress = 8;
+    SetGhost set_ghost = 9;
+    ComposerEdit composer_edit = 10;
+    FocusSlot focus_slot = 11;
+    OpenUrl open_url = 12;
+    Bell bell = 13;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ShowOverlay {
+  string kind = 1;
+  optional Tml content = 2;
+  omp.inference.v1.ValueMap options = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+message OverlayValues {
+  string overlay_id = 1;
+  repeated string values = 2;
+}
+message CloseOverlay {
+  string overlay_id = 1;
+}
+message Dialog {
+  string kind = 1;
+  string title = 2;
+  optional Tml content = 3;
+  repeated string choices = 4;
+}
+message ComposerText {}
+message Presentation {
+  string name = 1;
+}
+message IconList {
+  optional string prefix = 1;
+}
+
+message UiRequest {
+  // Required correlation to the invocation whose callback issued the request.
+  uint64 owner_invocation = 1;
+  oneof kind {
+    ShowOverlay show_overlay = 2;
+    OverlayValues overlay_values = 3;
+    CloseOverlay close_overlay = 4;
+    Dialog dialog = 5;
+    ComposerText composer_text = 6;
+    Presentation presentation = 7;
+    IconList icon_list = 8;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message DialogOutcome {
+  bool accepted = 1;
+  bool cancelled = 2;
+  optional string value = 3;
+  repeated string values = 4;
+}
+message OverlayOpened {
+  string overlay_id = 1;
+}
+message Values {
+  repeated string values = 1;
+}
+message Text {
+  string value = 1;
+}
+message Names {
+  repeated string names = 1;
+}
+message UiError {
+  string code = 1;
+  string message = 2;
+}
+
+message UiResponse {
+  oneof kind {
+    DialogOutcome dialog_outcome = 1;
+    OverlayOpened overlay_opened = 2;
+    Values values = 3;
+    Text text = 4;
+    Presentation presentation = 5;
+    Names names = 6;
+    UiError error = 7;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ActionFired {
+  string action = 1;
+  omp.inference.v1.ValueMap args = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message CommandInvoked {
+  string name = 1;
+  repeated string argv = 2;
+  string raw = 3;
+  string mode = 4;
+}
+message CompletionQuery {
+  string trigger = 1;
+  string text = 2;
+  uint32 cursor = 3;
+}
+message RenderRequest {
+  string name = 1;
+  string rev = 2;
+  string call_id = 3;
+  bytes state = 4;
+}
+message OverlayEvent {
+  string overlay_id = 1;
+  string kind = 2;
+  optional string value = 3;
+}
+
+message UiDispatch {
+  oneof kind {
+    ActionFired action = 1;
+    CommandInvoked command = 2;
+    CompletionQuery completion = 3;
+    RenderRequest render = 4;
+    OverlayEvent overlay = 5;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CompletionCandidate {
+  string value = 1;
+  optional string display = 2;
+  optional string description = 3;
+}
+message RenderedView {
+  Tml content = 1;
+  bytes state = 2;
+}
+message UiDispatchResult {
+  oneof result {
+    Values values = 1;
+    RenderedView rendered = 2;
+    UiError error = 3;
+  }
+  repeated CompletionCandidate candidates = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CommandDecl {
+  string name = 1;
+  string summary = 2;
+  string usage = 3;
+  sint32 precedence = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ShortcutDecl {
+  string chord = 1;
+  string action = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message TriggerDecl {
+  string prefix = 1;
+  string kind = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message RendererDecl {
+  string name = 1;
+  string rev = 2;
+  repeated string kinds = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message RegisterUi {
+  repeated CommandDecl commands = 1;
+  repeated ShortcutDecl shortcuts = 2;
+  repeated TriggerDecl triggers = 3;
+  repeated RendererDecl renderers = 4;
+  omp.inference.v1.ValueMap props = 15;
+}

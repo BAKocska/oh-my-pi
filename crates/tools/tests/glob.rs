@@ -5,7 +5,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
 use omp_core::Str;
-use omp_tool::{BlobRef, Ev, IncomingParams, Outcome, Part, PromptCaps, Tool};
+use omp_tool::{
+	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
+};
 use omp_tools::{
 	glob, grep,
 	read::{Fault as ReadFault, ReadBlobs},
@@ -99,14 +101,21 @@ fn invoke_with_blobs(workspace: FakeWorkspace, raw: &str, blobs: RecordingBlobs)
 		.args_committed(Str::from(raw))
 		.expect("invocation consumer remains live");
 	let events = block_on(tool.call(params).collect::<Vec<_>>());
-	let [Ev::Done(Outcome::Done { result, useless })] = events.as_slice() else {
+	let [Ev::Done(ToolTerminal::Done { result, useless })] = events.as_slice() else {
 		panic!("expected one terminal glob outcome: {events:?}");
 	};
-	let parts = tool.prompt(result.as_ref(), &PromptCaps {
-		maximum_parts:      1,
-		maximum_text_bytes: 64 * 1024,
-		media:              false,
-	});
+	let parts = tool.prompt(
+		result.as_ref(),
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts:      1,
+				maximum_text_bytes: 64 * 1024,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		),
+	);
 	let text = parts
 		.into_iter()
 		.map(|part| match part {
@@ -360,9 +369,18 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	);
 	assert!(invocation.text.ends_with(expected_footer.as_str()));
 
-	let zero = glob::tool(fake(walk(Vec::new())), RecordingBlobs::default()).prompt(
+	let zero_tool = glob::tool(fake(walk(Vec::new())), RecordingBlobs::default());
+	let zero = zero_tool.prompt(
 		Ok(payload),
-		&PromptCaps { maximum_parts: 0, maximum_text_bytes: 0, media: false },
+		&PromptCaps::for_tool(
+			CapsBase {
+				maximum_parts:      0,
+				maximum_text_bytes: 0,
+				media:              false,
+				model_class:        ModelClass::Standard,
+			},
+			&zero_tool.spec().rev,
+		),
 	);
 	assert_eq!(zero, [] as [omp_tool::Part; 0]);
 }

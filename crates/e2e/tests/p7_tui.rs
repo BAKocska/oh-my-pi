@@ -53,7 +53,10 @@ use omp_llm_inference::{
 	registry::RouteUnavailable,
 	session::ConversationSessionPlanner,
 };
-use omp_tool::{Constraint, Ev, IncomingParams, Part, PromptCaps, Rev, Tool, ToolSpec};
+use omp_tool::{
+	Claims, Constraint, Ev, IncomingParams, Part, Precedence, Presentation, PromptCaps, Rev, Tool,
+	ToolSpec,
+};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tower::Service;
@@ -70,11 +73,14 @@ impl ProofTool {
 	fn new(name: &'static str, family: &'static str) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:        name.into(),
-				rev:         Rev { family: family.into(), n: 1 },
-				description: "P7 gateway-side executor declaration".into(),
-				schema:      Bytes::from_static(br#"{"type":"object","additionalProperties":true}"#),
-				constraint:  Constraint::None,
+				name:            name.into(),
+				rev:             Rev { family: family.into(), n: 1 },
+				description:     "P7 gateway-side executor declaration".into(),
+				schema:          Bytes::from_static(
+					br#"{"type":"object","additionalProperties":true}"#,
+				),
+				constraint:      Constraint::None,
+				projection_code: [0; 32],
 			},
 		}
 	}
@@ -219,7 +225,11 @@ impl ScriptedGateway {
 			("write", ""),
 		] {
 			tools
-				.register(ProofTool::new(name, family))
+				.register(ProofTool::new(name, family), Presentation::Slot, Claims {
+					precedence: Precedence::CORE,
+					claimant:   Str::new_static("omp/core"),
+					replaces:   None,
+				})
 				.expect("proof tool registers");
 		}
 		let (responses, _ignored) = flume::bounded(32);

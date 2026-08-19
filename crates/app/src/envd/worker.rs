@@ -955,8 +955,9 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			body:       Some(worker_frame::Body::Hello(WorkerHello {
 				schema_rev: omp_proto::SCHEMA_REV,
 				python_rev: PYTHON_REV.to_owned(),
-				worker_id:  Bytes::copy_from_slice(&std::process::id().to_be_bytes()),
-				props:      None,
+				worker_id: Bytes::copy_from_slice(&std::process::id().to_be_bytes()),
+				props: None,
+				..Default::default()
 			})),
 			props:      None,
 		},
@@ -970,6 +971,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			body:       Some(worker_frame::Body::RegisterTools(RegisterTools {
 				tools: declarations,
 				props: None,
+				..Default::default()
 			})),
 			props:      None,
 		},
@@ -1015,6 +1017,14 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					})),
 					props:      None,
 				},
+				limit,
+				&mut write_scratch,
+			)?,
+			Some(_) => write_protocol_error(
+				&mut writer,
+				frame.request_id,
+				ProtocolErrorCode::Unsupported,
+				"host frame operation is not supported by the v1 worker",
 				limit,
 				&mut write_scratch,
 			)?,
@@ -1101,7 +1111,9 @@ fn load_tools(engine: &omp_py::Engine, modules: &[Str]) -> Result<Vec<PythonTool
 							}),
 							rev,
 							constraint: None,
+							extension_id: module_name.to_string(),
 							props: None,
+							..Default::default()
 						},
 						handler: handler.unbind(),
 					});
@@ -1230,6 +1242,7 @@ fn serve_invocation<W: Write>(
 				details_json: completion.details_json,
 				is_error: completion.is_error,
 				props: None,
+				..Default::default()
 			})),
 			props: None,
 		},

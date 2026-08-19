@@ -5,7 +5,7 @@ lint:
   use:
     - BASIC
   except:
+    # omp.thread.v1 and omp.inference.v1 intentionally cross-reference each
+    # other (see README.md) — a package-level cycle buf flags but protox/
+    # protoc happily compile, since no two files import each other directly.
     - PACKAGE_NO_IMPORT_CYCLE
-breaking:
-  use:
-    - FILE
