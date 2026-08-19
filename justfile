@@ -1,0 +1,231 @@
+# omp workspace command runner. `just` or `just --list` shows every recipe;
+# `just <recipe>` runs one. Source of truth for these commands is AGENTS.md,
+# .github/workflows/ci.yml, and each crate's README — keep this in sync with
+# them rather than duplicating decisions here.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# List available recipes.
+default:
+    @just --list
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+# One-time embedded-Python fetch crates/py needs before it builds; re-run freely, skips work once the stamp matches crates/py/requirements.txt.
+[group('setup')]
+setup-python:
+    crates/py/scripts/fetch-python.sh
+
+# ---------------------------------------------------------------------------
+# Format & lint
+# ---------------------------------------------------------------------------
+
+# Format the whole repo in place: Rust (rustfmt) + Protobuf (buf).
+[group('format & lint')]
+fmt: fmt-rust proto-fmt
+
+# Format every Rust source in place (hard tabs, see rustfmt.toml).
+[group('format & lint')]
+fmt-rust:
+    cargo fmt --all
+
+# Check the whole repo's formatting without writing (CI gate).
+[group('format & lint')]
+fmt-check: fmt-check-rust proto-fmt-check
+
+[group('format & lint')]
+fmt-check-rust:
+    cargo fmt --all -- --check
+
+# Format every `.proto` schema under crates/proto in place (buf.yaml).
+[group('format & lint')]
+proto-fmt:
+    cd crates/proto && buf format -w
+
+# Check `.proto` formatting under crates/proto without writing.
+[group('format & lint')]
+proto-fmt-check:
+    cd crates/proto && buf format -d --exit-code
+
+# Lint every `.proto` schema under crates/proto (buf.yaml rules).
+[group('format & lint')]
+proto-lint:
+    cd crates/proto && buf lint
+
+# Lint the Rust workspace with clippy (matches CI exactly).
+[group('format & lint')]
+clippy:
+    cargo clippy --workspace --locked
+
+# Run every formatter-check and linter this repo defines.
+[group('format & lint')]
+lint: fmt-check clippy proto-lint
+
+# ---------------------------------------------------------------------------
+# Build & check
+# ---------------------------------------------------------------------------
+
+# Typecheck the whole workspace.
+[group('build & check')]
+check:
+    cargo check --workspace --locked
+
+# Typecheck a single crate, e.g. `just check-pkg omp-agent`.
+[group('build & check')]
+check-pkg pkg:
+    cargo check -p {{ pkg }} --locked
+
+# Build the `omp` CLI/daemon binary (dev profile).
+[group('build & check')]
+build:
+    cargo build -p omp-app --bin omp --locked
+
+# Build the `omp` CLI/daemon binary (release profile; macOS needs vendored release Python + Homebrew LLD, see AGENTS.md "Embedded Python").
+[group('build & check')]
+build-release:
+    PYO3_CONFIG_FILE="{{ justfile_directory() }}/vendor/python-release/pyo3-config.txt" \
+        cargo build -p omp-app --bin omp --release --locked
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+# Run every workspace unit/integration test except the e2e suite.
+[group('test')]
+test:
+    cargo test --workspace --exclude omp-e2e --locked
+
+# Run every workspace test, e2e included (slow; prefer `just e2e` alone so failures are easy to attribute).
+[group('test')]
+test-all:
+    cargo test --workspace --locked
+
+# Run tests for a single crate, e.g. `just test-pkg omp-hashline`.
+[group('test')]
+test-pkg pkg:
+    cargo test -p {{ pkg }} --locked
+
+# ---------------------------------------------------------------------------
+# E2E acceptance suite (crates/e2e, joined-system proofs P1-P8)
+# ---------------------------------------------------------------------------
+
+# Compile every acceptance proof without running them.
+[group('e2e')]
+e2e-build:
+    cargo test -p omp-e2e --tests --no-run --locked
+
+# Run proofs P1-P6: doc race, cancel matrix, detached jobs, schema isolation, prefix stability, crash/resume.
+[group('e2e')]
+e2e-core:
+    cargo test -p omp-e2e --locked \
+        --test p1_doc_race \
+        --test p2_cancel_matrix \
+        --test p3_detached_jobs \
+        --test p4_schema_isolation \
+        --test p5_prefix_stability \
+        --test p6_crash_resume
+
+# Run proof P7: real-PTY terminal UI lifecycle.
+[group('e2e')]
+e2e-p7:
+    TERM=xterm-256color cargo test -p omp-e2e --test p7_tui --locked
+
+# Validate the P8 performance-baseline metric schema/contract (non-gating).
+[group('e2e')]
+e2e-p8:
+    cargo test -p omp-e2e --test p8_baselines --locked
+
+# Record a fresh P8 performance-baseline artifact.
+[group('e2e')]
+e2e-baseline:
+    cargo run -p omp-e2e --bin baseline --locked -- \
+        --artifact target/e2e-artifacts/p8-baselines.json
+
+# Run every P1-P8 proof plus the tool-sources check, in CI order.
+[group('e2e')]
+e2e: e2e-build e2e-core e2e-p7 e2e-p8
+    cargo test -p omp-e2e --test tool_sources --locked
+
+# ---------------------------------------------------------------------------
+# LLM catalog & compat cascade (crates/llm-catalog)
+# ---------------------------------------------------------------------------
+
+# Dump the classified model roster (id, provider, class, family, revision, reasoning) in frozen normalized-catalog order.
+[group('catalog')]
+catalog-identity:
+    cargo run -p omp-llm-catalog --example dump_identity
+
+# Self-test the offline compat-cascade oracle against fixtures/llm-oracle.
+[group('catalog')]
+catalog-oracle:
+    python3 fixtures/llm-oracle/validate.py --self-test
+
+# Run the taxonomy and compat-cascade test suites.
+[group('catalog')]
+catalog-test:
+    cargo test -p omp-llm-catalog --lib taxonomy
+    cargo test -p omp-llm-catalog --test compat_cascade
+
+# ---------------------------------------------------------------------------
+# Run & explore
+# ---------------------------------------------------------------------------
+
+# Run the `omp` CLI, e.g. `just run -- --help`.
+[group('run')]
+run *args:
+    cargo run -p omp-app --bin omp --locked -- {{ args }}
+
+# Run the standalone `omp-sh` shell (facade over shell-engine + builtins).
+[group('run')]
+run-shell *args:
+    cargo run -p omp-shell --bin omp-sh --locked -- {{ args }}
+
+# ---------------------------------------------------------------------------
+# Example galleries (visual smoke tests for tui/gui/webview/ar/inference)
+# ---------------------------------------------------------------------------
+
+# Run an omp-tui example: gallery (default), chat, companies, footers, tml.
+[group('examples')]
+tui example="gallery":
+    cargo run -p omp-tui --example {{ example }}
+
+# Run an omp-gui example: chat (default), browser. Extra args pass through, e.g. `just gui chat -- --shot welcome /tmp/welcome.png`.
+[group('examples')]
+gui example="chat" *args:
+    cargo run -p omp-gui --example {{ example }} -- {{ args }}
+
+# Run an omp-webview example: child (default), frames, ipc, window. Most take a URL, e.g. `just webview frames -- https://example.com`.
+[group('examples')]
+webview example="child" *args:
+    cargo run -p omp-webview --example {{ example }} -- {{ args }}
+
+[group('examples')]
+ar-roundtrip:
+    cargo run -p omp-ar --example roundtrip
+
+[group('examples')]
+inference-smoke:
+    cargo run -p omp-llm-inference --example applefm_smoke
+
+# ---------------------------------------------------------------------------
+# Release packaging
+# ---------------------------------------------------------------------------
+
+# Assemble npm publish packages from built release binaries.
+[group('release')]
+npm-package version binaries out="dist/npm":
+    python3 scripts/gen-npm-packages.py --version {{ version }} --binaries {{ binaries }} --out {{ out }}
+
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+[group('housekeeping')]
+clean:
+    cargo clean
+
+# Reproduce the CI "format" + "rust" jobs locally before pushing (skips macOS/Linux-only Python-toolchain verification steps).
+[group('housekeeping')]
+ci: fmt-check-rust clippy test e2e
