@@ -13,6 +13,7 @@
 ### Fixed
 
 - Fixed Claude Code marketplace plugins ignoring the `enabledPlugins` switch in `~/.claude/settings.json` and `.claude/settings(.local).json`: a plugin turned off for a project no longer loads there, and a local-scope install enabled for a project loads even when its recorded `projectPath` is a different directory
+- Fixed `/mcp reauth <name>` refusing to run the OAuth flow for HTTP/SSE servers that allow unauthenticated `initialize` but require a bearer token for `tools/call`. A clean handshake no longer counts as proof that OAuth is unnecessary; the probe now falls back to OAuth discovery and only reports "reauthorization is not required" when the server advertises no OAuth endpoint ([#8922](https://github.com/can1357/oh-my-pi/issues/8922)).
 - Fixed task and eval subagents discovering newly added agent definitions while resolving their role aliases from stale startup settings. Subagent preflight now atomically reloads persisted settings before agent discovery while preserving live runtime overrides.
 - Fixed images returned by tools mounted under `xd://` rendering only as file links instead of inline terminal graphics.
 - Resume Cursor idle-stall turns after completed MCP/todo tool results. The watchdog already closes the Connect stream, so unmarked blocks no longer need the `exec-resolved` marker to continue.
