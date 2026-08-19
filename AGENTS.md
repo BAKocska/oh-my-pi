@@ -57,10 +57,11 @@ A chat turn flows through these boundaries:
   persistence, wire contracts, RPC support, and observability.
 - `crates/tui`, `tui-macros`, `gui`: terminal and native UI systems.
 - `crates/e2e/tests`: authoritative joined-system proofs P1-P8.
-- `fixtures`, `.plan/quirks`, `.plan/phases`: conformance data, recorded
-  incompatibilities, and architectural contracts. Do not treat scratch notes
-  elsewhere under `.plan` (research, port, feature-map)
-  as stronger than production code and tests.
+- `PLAN.md` (repo root): the authoritative plan — locked decisions D1-D8, the
+  shared defect ledger, and the eight parts with their checklists.
+- `fixtures`, `.plan/quirks`: conformance data and recorded incompatibilities.
+  Do not treat scratch notes elsewhere under `.plan` (research, port,
+  feature-map) as stronger than production code and tests.
 - `.omp/tools`, `scripts`, `crates/*/scripts`: repository-local agent tooling,
   release generation, and subsystem setup scripts.
 

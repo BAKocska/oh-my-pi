@@ -80,8 +80,8 @@ names are `omp-` prefixed; directory names are not.
 
 | Path                  | What it is                                            |
 | --------------------- | ----------------------------------------------------- |
-| `.plan/PLAN.md`       | Agent-mesh plan index and decision record             |
-| `.plan/phases/`       | Per-phase design docs (contracts, loop, tools, proof) |
+| `PLAN.md`             | Authoritative plan: decisions, ledger, eight parts    |
+| `.plan/feature-map/`  | pi-parity feature map and milestone roadmap           |
 | `.plan/quirks/`       | Catalog/inference porting notes                       |
 | `fixtures/llm-oracle` | Recorded inference fixtures                           |
 | `npm/pi-coding-agent` | npm package shim (`scripts/gen-npm-packages.py`)      |
