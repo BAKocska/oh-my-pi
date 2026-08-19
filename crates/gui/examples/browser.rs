@@ -310,6 +310,53 @@ fn send_text(pane: &Pane, text: &SmolStr) {
 	}
 }
 
+/// Pumps the main run loop briefly (macOS: services `WKWebView` delivery for
+/// the system engine) and otherwise sleeps; used by the blocking proof modes.
+fn pump_wait() {
+	#[cfg(target_os = "macos")]
+	{
+		use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSRunLoop};
+		let date = NSDate::dateWithTimeIntervalSinceNow(0.02);
+		// SAFETY: main-run-loop pump on the calling (main) thread; the mode
+		// and date are valid for the duration of the call.
+		let ran = unsafe { NSRunLoop::mainRunLoop().runMode_beforeDate(NSDefaultRunLoopMode, &date) };
+		if ran {
+			return;
+		}
+	}
+	std::thread::sleep(std::time::Duration::from_millis(20));
+}
+
+/// Next webview event within `wait`, pumping the run loop while blocked.
+fn next_event(view: &omp_webview::WebView, wait: std::time::Duration) -> Option<WebViewEvent> {
+	let deadline = std::time::Instant::now() + wait;
+	loop {
+		if let Ok(event) = view.events().try_recv() {
+			return Some(event);
+		}
+		if std::time::Instant::now() >= deadline {
+			return None;
+		}
+		pump_wait();
+	}
+}
+
+/// First delivered frame within 20s; errors on crash or timeout.
+fn first_frame(
+	view: &omp_webview::WebView,
+) -> Result<omp_webview::Frame, Box<dyn std::error::Error>> {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+	loop {
+		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+		match next_event(view, remaining) {
+			Some(WebViewEvent::Frame(frame)) => return Ok(frame),
+			Some(WebViewEvent::Crashed(err)) => return Err(format!("engine crashed: {err}").into()),
+			Some(_) => {},
+			None => return Err("timed out waiting for the first frame".into()),
+		}
+	}
+}
+
 /// Offscreen proof path: first webview frame -> texture -> quad -> readback.
 fn shot(url: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
 	let (width, height) = (800_u32, 600_u32);
@@ -325,14 +372,7 @@ fn shot(url: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
 		})?;
 
 	// Wait for the first delivered frame.
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-	let frame = loop {
-		match view.events().recv_deadline(deadline)? {
-			WebViewEvent::Frame(frame) => break frame,
-			WebViewEvent::Crashed(err) => return Err(format!("engine crashed: {err}").into()),
-			_ => {},
-		}
-	};
+	let frame = first_frame(&view)?;
 
 	let gpu = Gpu::new(None)?;
 	let painter = PixelPainter::new(&gpu, wgpu::TextureFormat::Rgba8Unorm);
@@ -355,7 +395,9 @@ fn shot(url: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
 	const PAGE: &str = r#"<html><body style="margin:0;background:#dddddd">
 		<div id="box" style="position:fixed;left:300px;top:200px;width:60px;height:40px;background:#000"></div>
-		</html>"#;
+		<script>
+		document.getElementById('box').addEventListener('click', () => window.ipc.postMessage('clicked'));
+		</script></html>"#;
 	let (width, height) = (400_u32, 300_u32);
 	let view = WebViewBuilder::new(Engine::find(SurfaceKind::Frames)?)
 		.html(PAGE)
@@ -368,14 +410,7 @@ fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
 			format: omp_webview::FrameFormat::Png,
 		})?;
 
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-	let first = loop {
-		match view.events().recv_deadline(deadline)? {
-			WebViewEvent::Frame(frame) => break frame,
-			WebViewEvent::Crashed(err) => return Err(format!("engine crashed: {err}").into()),
-			_ => {},
-		}
-	};
+	let first = first_frame(&view)?;
 
 	let gpu = Gpu::new(None)?;
 	let painter = PixelPainter::new(&gpu, wgpu::TextureFormat::Rgba8Unorm);
@@ -387,7 +422,7 @@ fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
 	view.eval("document.getElementById('box').style.background='#ff0000'")?;
 	let mut last = None;
 	let quiet = std::time::Duration::from_millis(1500);
-	while let Ok(event) = view.events().recv_timeout(quiet) {
+	while let Some(event) = next_event(&view, quiet) {
 		if let WebViewEvent::Frame(frame) = event {
 			assert_ne!(
 				frame.damage,
@@ -408,6 +443,26 @@ fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
 		"region-uploaded texture must equal the engine's final frame"
 	);
 	println!("delta proof: readback is byte-identical to the final frame");
+
+	// Synthetic input: click the box and expect its IPC message back.
+	view.input(Input::MouseMove { x: 330.0, y: 220.0 })?;
+	view.input(Input::MouseDown {
+		button: MouseButton::Left,
+		x:      330.0,
+		y:      220.0,
+		clicks: 1,
+	})?;
+	view.input(Input::MouseUp { button: MouseButton::Left, x: 330.0, y: 220.0 })?;
+	let click_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+	loop {
+		let remaining = click_deadline.saturating_duration_since(std::time::Instant::now());
+		match next_event(&view, remaining) {
+			Some(WebViewEvent::Ipc(msg)) if msg == "clicked" => break,
+			Some(_) => {},
+			None => return Err("synthetic click never reached the page".into()),
+		}
+	}
+	println!("input proof: synthetic click delivered");
 	Ok(())
 }
 

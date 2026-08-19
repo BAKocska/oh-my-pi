@@ -19,17 +19,18 @@
 //! - **child** — a native subview embedded in a host window (wry's model). The
 //!   OS composites it *above* the host's own rendering.
 //! - **frames** — a stream of RGBA frames the host composites itself, with
-//!   input forwarded explicitly. This is what system webviews cannot do; it
-//!   requires a remote engine running headless.
+//!   input forwarded explicitly. Remote engines run headless; the macOS system
+//!   engine renders in an invisible window and captures via `ScreenCaptureKit`
+//!   (with Screen Recording permission) or `takeSnapshot` polling.
 //! - **window** — an engine-owned OS window (`chrome --app`-style shell).
 //!
 //! # Capability matrix
 //!
-//! | engine   | child | frames | window |
-//! |----------|-------|--------|--------|
-//! | system   | yes   | no     | no     |
-//! | chromium | no    | yes    | yes    |
-//! | firefox  | no    | yes    | yes    |
+//! | engine   | child | frames       | window |
+//! |----------|-------|--------------|--------|
+//! | system   | yes   | yes (macOS)  | no     |
+//! | chromium | no    | yes          | yes    |
+//! | firefox  | no    | yes          | yes    |
 //!
 //! Unsupported combinations fail with [`Error::Unsupported`] at build time.
 //!
@@ -75,6 +76,8 @@ use omp_core::{IntoStr, Str};
 /// Re-exported so hosts don't need a direct dependency to hand windows over.
 pub use raw_window_handle;
 use raw_window_handle::HasWindowHandle;
+#[cfg(target_os = "macos")]
+pub use wk::request_screen_capture;
 
 pub use crate::{
 	discover::{BrowserKind, EngineFamily, InstalledBrowser, discover},
@@ -150,6 +153,12 @@ impl Engine {
 			return Err(Error::NoEngine(surface));
 		}
 		if let Some(path) = std::env::var_os("OMP_WEBVIEW_BROWSER") {
+			if path == "system" {
+				#[cfg(target_os = "macos")]
+				return Ok(Self::System);
+				#[cfg(not(target_os = "macos"))]
+				return Err(Error::NoEngine(surface));
+			}
 			let path = PathBuf::from(path);
 			return Ok(if discover::gecko_like(&path) {
 				Self::Firefox { binary: path }
@@ -281,12 +290,18 @@ impl WebViewBuilder {
 		}
 	}
 
-	/// Run the engine headless and stream frames to the host.
+	/// Run the engine headless (system engine: in an invisible window) and
+	/// stream frames to the host.
+	///
+	/// The system engine captures via `ScreenCaptureKit` when the process has
+	/// Screen Recording permission (see [`request_screen_capture`]), falling
+	/// back to `takeSnapshot` polling otherwise, and requires the caller to
+	/// be on the main thread with a running main run loop.
 	///
 	/// # Errors
 	///
-	/// [`Error::Unsupported`] on the system engine; launch/connect failures
-	/// from the remote engine.
+	/// Launch/connect/capture-setup failures from the engine;
+	/// [`Error::MainThread`] off the main thread on the system engine.
 	pub fn build_frames(self, config: FrameConfig) -> Result<WebView> {
 		let engine = self.engine.kind();
 		let (view, events, state) = match self.engine {
@@ -298,7 +313,16 @@ impl WebViewBuilder {
 			},
 			#[cfg(target_os = "macos")]
 			Engine::System => {
-				return Err(Error::Unsupported("frames surfaces require a remote engine"));
+				let (events_tx, events) = flume::unbounded();
+				let state = SharedState::default();
+				let view = wk::frames::WkFrames::create(&self.page, config, events_tx, state.clone())?;
+				return Ok(WebView {
+					inner: Inner::WkFrames(view),
+					events,
+					state,
+					engine,
+					surface: SurfaceKind::Frames,
+				});
 			},
 		};
 		Ok(WebView {
@@ -343,6 +367,8 @@ impl WebViewBuilder {
 enum Inner {
 	#[cfg(target_os = "macos")]
 	Wk(wk::WkView),
+	#[cfg(target_os = "macos")]
+	WkFrames(wk::frames::WkFrames),
 	Remote(RemoteView),
 }
 
@@ -368,6 +394,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.navigate(url),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.navigate(url),
 			Inner::Remote(view) => view.send(Command::Navigate(url.to_str())),
 		}
 	}
@@ -377,6 +405,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.load_html(html),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.load_html(html),
 			Inner::Remote(view) => view.send(Command::LoadHtml(html.to_str())),
 		}
 	}
@@ -386,6 +416,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.eval(js, None),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.eval(js, None),
 			Inner::Remote(view) => view.send(Command::Eval { js: js.to_str(), reply: None }),
 		}
 	}
@@ -397,6 +429,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.eval(js, reply),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.eval(js, reply),
 			Inner::Remote(view) => view.send(Command::Eval { js: js.to_str(), reply }),
 		}
 	}
@@ -406,6 +440,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.reload(),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.reload(),
 			Inner::Remote(view) => view.send(Command::Reload),
 		}
 	}
@@ -415,6 +451,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.back(),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.back(),
 			Inner::Remote(view) => view.send(Command::Back),
 		}
 	}
@@ -424,6 +462,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.forward(),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.forward(),
 			Inner::Remote(view) => view.send(Command::Forward),
 		}
 	}
@@ -433,6 +473,8 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.focus(),
+			#[cfg(target_os = "macos")]
+			Inner::WkFrames(view) => view.focus(),
 			Inner::Remote(view) => view.send(Command::Focus),
 		}
 	}
@@ -446,7 +488,7 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.set_bounds(bounds),
-			Inner::Remote(_) => Err(Error::Unsupported("set_bounds applies to child surfaces")),
+			_ => Err(Error::Unsupported("set_bounds applies to child surfaces")),
 		}
 	}
 
@@ -459,7 +501,7 @@ impl WebView {
 		match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.set_visible(visible),
-			Inner::Remote(_) => Err(Error::Unsupported("set_visible applies to child surfaces")),
+			_ => Err(Error::Unsupported("set_visible applies to child surfaces")),
 		}
 	}
 
@@ -471,6 +513,8 @@ impl WebView {
 	pub fn resize(&self, width: u32, height: u32) -> Result<()> {
 		match (&self.inner, self.surface) {
 			(Inner::Remote(view), SurfaceKind::Frames) => view.send(Command::Resize { width, height }),
+			#[cfg(target_os = "macos")]
+			(Inner::WkFrames(view), _) => view.resize(width, height),
 			_ => Err(Error::Unsupported("resize applies to frames surfaces")),
 		}
 	}
@@ -483,6 +527,8 @@ impl WebView {
 	pub fn input(&self, input: Input) -> Result<()> {
 		match (&self.inner, self.surface) {
 			(Inner::Remote(view), SurfaceKind::Frames) => view.send(Command::Input(input)),
+			#[cfg(target_os = "macos")]
+			(Inner::WkFrames(view), _) => view.input(input),
 			_ => Err(Error::Unsupported("input applies to frames surfaces")),
 		}
 	}

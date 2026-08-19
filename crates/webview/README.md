@@ -12,25 +12,29 @@ the host.
 
 | engine                       | protocol        | child | frames | window |
 |------------------------------|-----------------|-------|--------|--------|
-| `system` (WKWebView, macOS)  | in-process      | yes   | no     | no     |
+| `system` (WKWebView, macOS)  | in-process      | yes   | yes    | no     |
 | `chromium` (Chrome, Edge, …) | CDP             | no    | yes    | yes    |
 | `firefox` (Gecko family)     | WebDriver BiDi  | no    | yes    | yes    |
 
 - **child** — a native subview embedded in a host window at a `Rect`; the OS
   composites it above the host's rendering (wry's model, same airspace
   limitation).
-- **frames** — the engine runs headless and streams RGBA8 frames the host
-  composites itself (GPU texture, terminal images, …); input is forwarded
-  explicitly with `WebView::input`. Chromium delivers compositor-paced
+- **frames** — the engine streams RGBA8 frames the host composites itself
+  (GPU texture, terminal images, …); input is forwarded explicitly with
+  `WebView::input`. Chromium runs headless and delivers compositor-paced
   screencast frames; Firefox has no screencast, so it is screenshot-polled
-  (default 10 fps). Frames cross the automation socket compressed
+  (default 10 fps). Remote frames cross the automation socket compressed
   (`FrameFormat`: JPEG quality 80 by default — Chromium's own screencast
   default; PNG for pixel-exact needs) and are decoded straight to RGBA.
-  Every delivered frame carries a client-side `damage` rect (tight diff vs.
-  the previous frame) so hosts upload only what changed; unchanged captures
-  are suppressed entirely. Firefox polling is dirty-driven: a preload script
-  signals page changes, so a static page costs zero captures (1 Hz safety
-  net for silent canvas/video changes).
+  The macOS system engine renders in an invisible window and captures via
+  ScreenCaptureKit when the process has Screen Recording permission
+  (`request_screen_capture()` prompts; never prompted implicitly), falling
+  back to dirty-gated `takeSnapshot` polling — no encode/decode at all in
+  the SCK tier. Every delivered frame carries a client-side `damage` rect
+  (tight diff vs. the previous frame) so hosts upload only what changed;
+  unchanged captures are suppressed entirely. Firefox and snapshot polling
+  are dirty-driven: an injected script signals page changes, so a static
+  page costs zero captures (1 Hz safety net for silent canvas/video).
 - **window** — an engine-owned OS window (`chrome --app`-style; Firefox shows
   normal browser chrome).
 
@@ -38,8 +42,8 @@ the host.
 
 - `lib.rs` — `Engine` selection, `WebViewBuilder`, and the `WebView` facade
   dispatching over backends by enum (no `dyn`).
-- `wk` — the in-process WKWebView child backend (macOS), delegate-driven
-  events.
+- `wk` — the in-process WKWebView backend (macOS): `child` subviews and
+  offscreen `frames` capture, delegate-driven events.
 - `remote` — one driver thread per view (current-thread tokio runtime),
   flume command/event channels, ephemeral-by-default browsing profiles;
   `remote::chromium` speaks CDP, `remote::firefox` speaks BiDi, both over

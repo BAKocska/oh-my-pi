@@ -37,3 +37,6 @@ flume = { workspace = true }
 omp-chat-ui = { workspace = true }
 omp-webview = { workspace = true }
 xutf = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-foundation = { workspace = true }
