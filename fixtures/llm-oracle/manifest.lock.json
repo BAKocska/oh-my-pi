@@ -2,24 +2,24 @@
   "schema_version": 1,
   "corpus": "llm-oracle",
   "hash_algorithm": "sha256",
-  "corpus_sha256": "add529235346247cc3a821b39a42d56c1d5e6bc029ecbf142cbb7e05f5235309",
+  "corpus_sha256": "00aa5e54ca291dcd497051f0b4e34d32cb3ecc6caf7de121beeb985ed127365c",
   "category_count": 14,
   "manifest_count": 14,
-  "artifact_count": 265,
-  "indexed_file_count": 279,
-  "secret_free_count": 279,
+  "artifact_count": 267,
+  "indexed_file_count": 281,
+  "secret_free_count": 281,
   "categories": [
     {
       "id": "agent-protocols",
       "manifest_path": "agent-protocols/manifest.json",
-      "artifact_count": 51,
-      "indexed_file_count": 52
+      "artifact_count": 52,
+      "indexed_file_count": 53
     },
     {
       "id": "anthropic",
       "manifest_path": "anthropic/manifest.json",
-      "artifact_count": 30,
-      "indexed_file_count": 31
+      "artifact_count": 31,
+      "indexed_file_count": 32
     },
     {
       "id": "auth-error",
@@ -224,6 +224,14 @@
       "sha256": "881ac5c40f1c254cba9926ea70708cec4707b62c5b91d04c8eebd53245bdedd0"
     },
     {
+      "id": "agent.protocols.cursor.interaction.queries.json.v1",
+      "kind": "artifact",
+      "path": "agent-protocols/cursor/interaction.queries.json",
+      "provenance_category": "agent-protocols",
+      "secret_free": true,
+      "sha256": "9c16de52a07349f25769ed75a77cc2f3037d58adcf214c7a8c2c751106134613"
+    },
+    {
       "id": "agent.protocols.cursor.request.tool.call.json.v1",
       "kind": "artifact",
       "path": "agent-protocols/cursor/request.tool_call.json",
@@ -325,7 +333,7 @@
       "path": "agent-protocols/devin/stream.tool_args_usage.jsonl",
       "provenance_category": "agent-protocols",
       "secret_free": true,
-      "sha256": "78d7a392ad97d5a69e703ad6140bd49180fe9f65a723e36b5f81c93deaa4efab"
+      "sha256": "a9b54dc8dec10c17036e4e06486abdd2029a9d42c3b7df4954605b6e4d7aa94b"
     },
     {
       "id": "agent.protocols.gitlab.action.cases.json.v1",
@@ -421,7 +429,7 @@
       "path": "agent-protocols/manifest.json",
       "provenance_category": "agent-protocols",
       "secret_free": true,
-      "sha256": "72311dbebfb0ccf5da8a339cc5de51104f0fcff961863a9f81dfbae1ff4b60de"
+      "sha256": "4dbf11d5e0bb1febf6c7978c0529983b8fb4e267c1142fdca25176b97b8c49e6"
     },
     {
       "id": "agent.protocols.ollama.auth.discovery.json.v1",
@@ -717,7 +725,7 @@
       "path": "anthropic/manifest.json",
       "provenance_category": "anthropic",
       "secret_free": true,
-      "sha256": "e5e4f87fc5cb096c7ca23d0bad0b04d5b48b8a6fe2e555e621255cdc3299a8b1"
+      "sha256": "fff35329cdc45b2c84ab5d94f927fe5ec6b19301e1213e640703fd2c0ebfc516"
     },
     {
       "id": "anthropic.request.conditional-controls.v1",
@@ -726,6 +734,14 @@
       "provenance_category": "anthropic",
       "secret_free": true,
       "sha256": "2de99257fc842bf6259347c12a1ba60ac94a32b7ac183ad8ddd30ecbbec475f1"
+    },
+    {
+      "id": "anthropic.request.empty-tool-result.v1",
+      "kind": "artifact",
+      "path": "anthropic/requests/empty-tool-result.encoder.json",
+      "provenance_category": "anthropic",
+      "secret_free": true,
+      "sha256": "796931bd134213fff85a7578cc49206705e1bb4b69f7708c9819e7a99ef84e0e"
     },
     {
       "id": "anthropic.request.history-replay.v1",
@@ -1021,7 +1037,7 @@
       "path": "catalog-policy/compat-profiles.json",
       "provenance_category": "catalog-policy",
       "secret_free": true,
-      "sha256": "b5e42a770fadad9b05e36727284fb28301bb50d42362dc5723c20a042bd6d112"
+      "sha256": "813731312a7bf7624bbc6c331c1d28f4e4c4d1a375e0b599155e2df7fb6afb54"
     },
     {
       "id": "catalog.policy.dialect-classifier.v1",
@@ -1069,7 +1085,7 @@
       "path": "catalog-policy/exact-model-overrides.json",
       "provenance_category": "catalog-policy",
       "secret_free": true,
-      "sha256": "62f350671b08a4d2d1579e3b073e02a89d071ab28d45a6ac003cf854407104d1"
+      "sha256": "ecb4f0dad1dac49883d3322b5e00205955ddae7c76473e0e97f7213c662205d6"
     },
     {
       "id": "catalog.policy.family-classifier.v1",
@@ -1093,7 +1109,7 @@
       "path": "catalog-policy/manifest.json",
       "provenance_category": "catalog-policy",
       "secret_free": true,
-      "sha256": "3be6794b87b3e36dc7100b3833fa66c65a5864594a13c031a66b07ffa8b188bf"
+      "sha256": "0294ce166640fbd59d5a661fc4fd7ce0ffa95ed4e489f11c85d733f56c8ab5bf"
     },
     {
       "id": "catalog.policy.openai-version-aliases.v1",
@@ -1125,7 +1141,7 @@
       "path": "catalog-policy/thinking-profiles.json",
       "provenance_category": "catalog-policy",
       "secret_free": true,
-      "sha256": "4fe929d1a139eae0fc3dca672838ffdeb44e3b8ac48ab53d4fc52b09a493f564"
+      "sha256": "8e876c33e9074e6e0fe9f738a77fe6069a653ca0d226d1d47b87ad7b03a45fd0"
     },
     {
       "id": "catalog.census.v1",
@@ -1133,7 +1149,7 @@
       "path": "catalog/census.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "7484b6349d60661028796c1108574841003fd7c0c2a0dd6787023a1d6cdff66b"
+      "sha256": "49d623c86d34b2fe73c9af71648b42dc0fc69d53ef9cade38cfabf9b5cc81960"
     },
     {
       "id": "oracle.category.catalog.manifest.v1",
@@ -1141,7 +1157,7 @@
       "path": "catalog/manifest.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "4ba9cdc205f6ad8843d0184323dd9f95b9f21805744d794514ddc81cb2e1a79a"
+      "sha256": "79568f83d45ead03b17097b6a38a76102e0ef672ef706198884e8b0265b07dac"
     },
     {
       "id": "catalog.models.compressed.v1",
@@ -1157,7 +1173,7 @@
       "path": "catalog/models.normalized.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "d2d69608f4bb67df61bf38f98c92b9124686a5889339fc34c233612633d1fe08"
+      "sha256": "95037fe800b694f6162bc09022db92f1edf5ec61c0cc74ed661137d0b4b5ca86"
     },
     {
       "id": "catalog.models.raw.v1",
@@ -1173,7 +1189,7 @@
       "path": "catalog/oauth.toml",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "c906f9402f9f13891f1dcf47e20a8bce4a0e9f06a97cca421e59d371c080c3ae"
+      "sha256": "410928f94d0f26fd431de302118de2b50907763b8e5cf75dc6d3dad1deffdbf0"
     },
     {
       "id": "catalog.models.normalized.projector.v1",
@@ -1189,7 +1205,7 @@
       "path": "catalog/providers.toml",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "2c17a695cc3de57cba229a7be217d99e479583bab7f75241e262bfd27bd8dd05"
+      "sha256": "4878842fe3d7a49abbf8afde97867f5f89bcf5ff775254d2e91b8e6d323e7a13"
     },
     {
       "id": "google.generated.cca.behavior.v1",
@@ -2141,7 +2157,7 @@
       "path": "vendor-schemas/cursor/agent.proto",
       "provenance_category": "vendor-schemas",
       "secret_free": true,
-      "sha256": "aa6d1715e8ba8309c9049d3d1d9acbea75454f852a82ff22292843c1010ae527"
+      "sha256": "fc1ac3ed472676e6d863fe2238ab1529247b68d3ea21f33b3fae1abae481892c"
     },
     {
       "id": "vendor-schemas.devin.buf.validate.validate.v1",
@@ -2317,7 +2333,7 @@
       "path": "vendor-schemas/manifest.json",
       "provenance_category": "vendor-schemas",
       "secret_free": true,
-      "sha256": "241ab11da11460caacaa93e828a996b4c468a8dfa5f74cdbdfa174f1c82e70bf"
+      "sha256": "87a66db76482369e81bb4f80b5672610bee2a9eb06fbf19d5cb7c798b5407c74"
     },
     {
       "id": "vendor-schemas.provenance.v1",
@@ -2325,7 +2341,7 @@
       "path": "vendor-schemas/provenance.json",
       "provenance_category": "vendor-schemas",
       "secret_free": true,
-      "sha256": "e929195ebb0355055d10f5afeb8a5c6bba198225334c2c706df95705fb11c588"
+      "sha256": "2b8b3816ee18af5362c3b434c59fba2c0e63754bee1f05191505fe1c0e726741"
     }
   ]
 }

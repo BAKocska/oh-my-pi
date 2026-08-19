@@ -160,7 +160,7 @@
       "id": "vendor-schemas.provenance.v1",
       "path": "provenance.json",
       "secret_free": true,
-      "sha256": "e929195ebb0355055d10f5afeb8a5c6bba198225334c2c706df95705fb11c588",
+      "sha256": "2b8b3816ee18af5362c3b434c59fba2c0e63754bee1f05191505fe1c0e726741",
       "source": "repository history paths and archived Cursor/Devin wire bindings"
     }
   ],

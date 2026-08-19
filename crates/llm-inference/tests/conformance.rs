@@ -558,6 +558,10 @@ async fn staging_cancellation_is_terminal_and_receipted_without_a_fake_success()
 	let source = BodySource::bytes(Bytes::from_static(b"never staged"));
 	let policy = StagingPolicy::memory_only(1024, 1024);
 	let cancellation = StagingCancellation::new();
+	// The signal must be raised before staging begins: the contract under
+	// test is that an already-cancelled staging attempt fails terminally
+	// with receipted evidence instead of returning a fake success.
+	cancellation.cancel();
 	let budget = ExecutionBudget { max_staging_bytes: 1024, ..ExecutionBudget::default() };
 	let mut receipt = ExecutionReceipt::default();
 	let error = stage_body(&source, &policy, &budget, &cancellation, &mut receipt)

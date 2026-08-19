@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "source_digest": "6de57f340da7f73fafb4d0a973dc1106b0627843230d89ebf86a57173e2bc6b8",
+  "source_digest": "9efe1aee8037f41f2551104ad9fc7bef13fee985af9b00e12356d254a36275cb",
   "inputs": [
     {
       "id": "catalog-policy.manifest.v1",
       "path": "fixtures/llm-oracle/catalog-policy/manifest.json",
-      "sha256": "663dae7ade36164b5ff4c02888c59080ddb2b76a735db97b84443b8151490262",
+      "sha256": "0294ce166640fbd59d5a661fc4fd7ce0ffa95ed4e489f11c85d733f56c8ab5bf",
       "source": "oracle:catalog-policy.manifest.v1"
     },
     {
@@ -17,7 +17,7 @@
     {
       "id": "catalog.manifest.v1",
       "path": "fixtures/llm-oracle/catalog/manifest.json",
-      "sha256": "013f10ddafdda39a7e43bd0e8d3672b9ce340aa173c390216197b2185d20278d",
+      "sha256": "79568f83d45ead03b17097b6a38a76102e0ef672ef706198884e8b0265b07dac",
       "source": "oracle:catalog.manifest.v1"
     },
     {
@@ -695,7 +695,7 @@
     {
       "id": "compat.cascade.taxonomy._discovery.v1",
       "path": "crates/llm-catalog/compat/taxonomy/_discovery.kdl",
-      "sha256": "c4d5be7c1ad4159d5171aec3dcf0ec105f067e7fd9b0e3c5d8914d60330e98d5",
+      "sha256": "da5295a61eedfcd474e9512b4fca7699caf62da1d8057cab7dff425315c3d90a",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {

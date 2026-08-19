@@ -37,7 +37,7 @@
         "projector": "project_normalized.rs"
       },
       "secret_free": true,
-      "sha256": "784b7b637defdc04f47f178498dd970a7d6beaa056150b3e5f7fffdeac8df4f2",
+      "sha256": "95037fe800b694f6162bc09022db92f1edf5ec61c0cc74ed661137d0b4b5ca86",
       "source": "52b111a4abc8d76064abc4f58afda931edee9833:crates/llm-catalog/src/models.rs"
     },
     {
@@ -58,7 +58,7 @@
         "kind": "verbatim-source-snapshot"
       },
       "secret_free": true,
-      "sha256": "2c17a695cc3de57cba229a7be217d99e479583bab7f75241e262bfd27bd8dd05",
+      "sha256": "4878842fe3d7a49abbf8afde97867f5f89bcf5ff775254d2e91b8e6d323e7a13",
       "source": "archive/llm-legacy/llm-catalog/providers.toml"
     },
     {
@@ -68,7 +68,7 @@
         "kind": "source-snapshot"
       },
       "secret_free": true,
-      "sha256": "c906f9402f9f13891f1dcf47e20a8bce4a0e9f06a97cca421e59d371c080c3ae",
+      "sha256": "410928f94d0f26fd431de302118de2b50907763b8e5cf75dc6d3dad1deffdbf0",
       "source": "archive/llm-legacy/llm-catalog/oauth.toml"
     },
     {
@@ -84,7 +84,7 @@
         ]
       },
       "secret_free": true,
-      "sha256": "7484b6349d60661028796c1108574841003fd7c0c2a0dd6787023a1d6cdff66b",
+      "sha256": "49d623c86d34b2fe73c9af71648b42dc0fc69d53ef9cade38cfabf9b5cc81960",
       "source": "archive/llm-legacy/llm-catalog/src/models.rs::load_catalog_zstd"
     }
   ],

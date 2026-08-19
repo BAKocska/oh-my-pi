@@ -230,7 +230,7 @@
       "id": "agent.protocols.devin.stream.tool.args.usage.jsonl.v1",
       "path": "devin/stream.tool_args_usage.jsonl",
       "source": "archive/llm-legacy/llm-devin/tests/fixtures/devin/stream.tool_args_usage.jsonl",
-      "sha256": "78d7a392ad97d5a69e703ad6140bd49180fe9f65a723e36b5f81c93deaa4efab",
+      "sha256": "a9b54dc8dec10c17036e4e06486abdd2029a9d42c3b7df4954605b6e4d7aa94b",
       "secret_free": true
     },
     {

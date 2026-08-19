@@ -32,6 +32,41 @@ pub struct RawDiscoveryPage {
 	pub next_cursor: Option<Str>,
 }
 
+/// Wire codec identifier of `openai-responses` routes.
+const OPENAI_RESPONSES_CODEC: &str = "openai-responses";
+
+/// Sibling-catalog responses-route hints for gateway-first discovered ids.
+///
+/// The `OpenCode` gateways ship models before any census bundles them
+/// (`muse-spark-1.2[-contributor]`, served only at `/responses`, pi #8957).
+/// When an unbundled discovered id — or its billing-variant base (`-free`,
+/// `-contributor`) — is bundled on this provider or a declared sibling gateway
+/// with an `openai-responses` route, the listing materializes on this
+/// provider's responses route instead of the discovery route. Only the
+/// responses signal is borrowed: anthropic and chat transports genuinely
+/// diverge across the gateways (`minimax-m2.5`), and pricing never transfers.
+#[derive(Clone, Debug)]
+struct ResponsesRouteHints {
+	/// Bundled wire identifiers — on this provider or a sibling gateway —
+	/// whose model rides an `openai-responses` route.
+	wire_ids: Arc<BTreeSet<WireModelId>>,
+	/// This provider's responses route; the materialization target.
+	target:   RouteId,
+}
+
+impl ResponsesRouteHints {
+	/// Whether the discovered wire id — exactly or via its billing-variant
+	/// base — is hinted onto the responses route.
+	fn hinted(&self, wire_model: &WireModelId) -> bool {
+		if self.wire_ids.contains(wire_model) {
+			return true;
+		}
+		taxonomy()
+			.billing_variant_plain(wire_model.as_str())
+			.is_some_and(|base| self.wire_ids.contains(&WireModelId::from(base)))
+	}
+}
+
 /// Route-scoped projector applying canonical discovery normalization during
 /// response recovery.
 #[derive(Clone, Debug)]
@@ -40,6 +75,7 @@ pub struct CatalogDiscoveryProjector {
 	allowlist:         Option<Arc<BTreeMap<WireModelId, ModelSpec>>>,
 	provider_bundled:  Option<Arc<BTreeMap<WireModelId, ModelSpec>>>,
 	canonical_bundled: Option<Arc<BTreeMap<Str, ModelSpec>>>,
+	hints:             Option<ResponsesRouteHints>,
 	provider:          ProviderId,
 	route:             RouteId,
 }
@@ -53,6 +89,7 @@ impl CatalogDiscoveryProjector {
 			allowlist: None,
 			provider_bundled: None,
 			canonical_bundled: None,
+			hints: None,
 			provider,
 			route,
 		}
@@ -106,15 +143,18 @@ impl CatalogDiscoveryProjector {
 				}
 			}
 		}
+		let hints = responses_route_hints(catalog, route);
 		let provider_bundled = (taxonomy().has_routing_variants(route.provider.as_str())
-			|| taxonomy().recovers_canonical_params(route.provider.as_str()))
+			|| taxonomy().recovers_canonical_params(route.provider.as_str())
+			|| hints.is_some())
 		.then(|| {
 			// The taxonomy declares provider-scoped routing-variant suffixes
-			// (`gpt-5.6-luna-wm`, pi PR #8929) or canonical-parameter recovery
-			// (pi PR #8991). The route allowlist above is scoped to the
-			// discovery route, but the bundled SKUs may live on per-model
-			// routes, so collect every bundled wire identity owned by this
-			// provider for the plain-counterpart and seeded-row lookups.
+			// (`gpt-5.6-luna-wm`, pi PR #8929), canonical-parameter recovery
+			// (pi PR #8991), or a responses-route hint group (pi #8957). The
+			// route allowlist above is scoped to the discovery route, but the
+			// bundled SKUs may live on per-model routes, so collect every
+			// bundled wire identity owned by this provider for the
+			// plain-counterpart and seeded-row lookups.
 			let owned: BTreeSet<&RouteId> = catalog
 				.routes()
 				.iter()
@@ -171,10 +211,66 @@ impl CatalogDiscoveryProjector {
 			allowlist: Some(Arc::new(allowlist)),
 			provider_bundled,
 			canonical_bundled,
+			hints,
 			provider: route.provider.clone(),
 			route: route.id.clone(),
 		})
 	}
+}
+
+/// Builds the responses-route hint set for a provider in a declared sibling
+/// group (pi #8957): every bundled wire id — this provider's own or a sibling
+/// gateway's — riding an openai-responses route, plus this provider's
+/// deterministic responses materialization target.
+fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<ResponsesRouteHints> {
+	let group = taxonomy().responses_hint_group(route.provider.as_str())?;
+	// The materialization target mirrors resolver ordering: highest priority,
+	// then lexicographically smallest route id.
+	let target = catalog
+		.routes()
+		.iter()
+		.filter(|definition| {
+			definition.provider == route.provider
+				&& definition.codec.as_str() == OPENAI_RESPONSES_CODEC
+		})
+		.max_by(|left, right| {
+			left
+				.priority
+				.unwrap_or(0)
+				.cmp(&right.priority.unwrap_or(0))
+				.then_with(|| right.id.cmp(&left.id))
+		})
+		.map(|definition| definition.id.clone())?;
+	let responses_routes: BTreeSet<&RouteId> = catalog
+		.routes()
+		.iter()
+		.filter(|definition| definition.codec.as_str() == OPENAI_RESPONSES_CODEC)
+		.map(|definition| &definition.id)
+		.collect();
+	let owners: BTreeMap<&RouteId, &ProviderId> = catalog
+		.routes()
+		.iter()
+		.map(|definition| (&definition.id, &definition.provider))
+		.collect();
+	let mut wire_ids = BTreeSet::new();
+	for model in catalog.models() {
+		let Some(owner) = model.routes.first().and_then(|id| owners.get(id)) else {
+			continue;
+		};
+		if !group
+			.iter()
+			.any(|member| member.eq_ignore_ascii_case(owner.as_str()))
+		{
+			continue;
+		}
+		if !model.routes.iter().any(|id| responses_routes.contains(id)) {
+			continue;
+		}
+		for (_, wire_model) in &model.wire_ids {
+			wire_ids.insert(wire_model.clone());
+		}
+	}
+	Some(ResponsesRouteHints { wire_ids: Arc::new(wire_ids), target })
 }
 
 impl crate::layer::recover::DiscoveryProjector for CatalogDiscoveryProjector {
@@ -196,6 +292,7 @@ impl crate::layer::recover::DiscoveryProjector for CatalogDiscoveryProjector {
 				allowlist,
 				self.provider_bundled.as_deref(),
 				self.canonical_bundled.as_deref(),
+				self.hints.as_ref(),
 				&self.normalizer,
 				&self.provider,
 				&self.route,
@@ -215,6 +312,7 @@ fn project_mixed_page(
 	allowlist: &BTreeMap<WireModelId, ModelSpec>,
 	provider_bundled: Option<&BTreeMap<WireModelId, ModelSpec>>,
 	canonical_bundled: Option<&BTreeMap<Str, ModelSpec>>,
+	hints: Option<&ResponsesRouteHints>,
 	normalizer: &DiscoveryNormalizer,
 	provider: &ProviderId,
 	route: &RouteId,
@@ -275,6 +373,17 @@ fn project_mixed_page(
 				.model;
 			if let Some(canonical) = canonical_reference(canonical_bundled, &model.key) {
 				recover_canonical_params(&mut model, canonical, &row);
+			}
+			if let Some(hints) = hints
+				&& hints.hinted(&row.wire_model)
+			{
+				// Gateway-first id bundled with an openai-responses route on
+				// this provider or a sibling gateway (pi #8957): materialize
+				// the listing on this provider's responses route instead of
+				// the discovery route. Only the route transfers — pricing,
+				// limits, and thinking stay conservative.
+				model.wire_ids = Box::new([(hints.target.clone(), row.wire_model.clone())]);
+				model.routes = Box::new([hints.target.clone()]);
 			}
 			model
 		};
@@ -560,13 +669,17 @@ fn protocol_error(reason: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::BTreeMap, num::NonZeroU32};
+	use std::{
+		collections::{BTreeMap, BTreeSet},
+		num::NonZeroU32,
+		sync::Arc,
+	};
 
 	use omp_core::Str;
 
 	use super::{
-		CatalogDiscoveryProjector, DiscoveryService, RawDiscoveryPage, normalize_page,
-		project_mixed_page,
+		CatalogDiscoveryProjector, DiscoveryService, RawDiscoveryPage, ResponsesRouteHints,
+		normalize_page, project_mixed_page,
 	};
 	use crate::{
 		call::DiscoveryRequest,
@@ -794,6 +907,7 @@ mod tests {
 			&allowlist,
 			None,
 			None,
+			None,
 			&normalizer,
 			&provider,
 			&route,
@@ -849,6 +963,7 @@ mod tests {
 			&BTreeMap::new(),
 			Some(&bundled),
 			None,
+			None,
 			&normalizer,
 			&provider,
 			&route,
@@ -889,6 +1004,7 @@ mod tests {
 			&BTreeMap::new(),
 			Some(&bundled),
 			None,
+			None,
 			&normalizer,
 			&provider,
 			&route,
@@ -922,6 +1038,7 @@ mod tests {
 		let page = project_mixed_page(
 			&BTreeMap::new(),
 			Some(&bundled),
+			None,
 			None,
 			&normalizer,
 			&provider,
@@ -991,6 +1108,7 @@ mod tests {
 			&BTreeMap::new(),
 			None,
 			Some(&canonical),
+			None,
 			&normalizer,
 			&provider,
 			&route,
@@ -1040,6 +1158,7 @@ mod tests {
 			&BTreeMap::new(),
 			None,
 			Some(&canonical),
+			None,
 			&normalizer,
 			&provider,
 			&route,
@@ -1073,6 +1192,7 @@ mod tests {
 			&BTreeMap::new(),
 			None,
 			Some(&canonical),
+			None,
 			&normalizer,
 			&provider,
 			&route,
@@ -1136,5 +1256,157 @@ mod tests {
 			.expect("seeded V4-Flash listing");
 		assert_ne!(flash.pricing, Pricing::default(), "the provider's own seed keeps its tariff");
 		assert!(flash.thinking.is_some(), "the provider's own seed keeps its thinking policy");
+	}
+
+	fn hint_request(provider: &ProviderId, route: &RouteId) -> DiscoveryRequest {
+		DiscoveryRequest {
+			provider:  Some(provider.clone()),
+			route:     Some(route.clone()),
+			cursor:    None,
+			page_size: 8,
+			operation: None,
+		}
+	}
+
+	#[test]
+	fn hinted_gateway_first_ids_materialize_on_the_responses_route() {
+		// pi #8957: the OpenCode gateways ship models before any census
+		// bundles them. An unbundled id whose sibling-bundled spec — or
+		// billing-variant base — rides openai-responses must rebind to the
+		// provider's responses route; everything else keeps the discovery
+		// route.
+		let provider = ProviderId::from("opencode-go");
+		let route = RouteId::from("opencode-go/primary");
+		let target = RouteId::from("opencode-go/responses");
+		let hints = ResponsesRouteHints {
+			wire_ids: Arc::new(BTreeSet::from([
+				WireModelId::from("muse-spark-1.2"),
+				WireModelId::from("gpt-5.5"),
+			])),
+			target:   target.clone(),
+		};
+		let normalizer = DiscoveryNormalizer::new(DiscoveryDefaults {
+			wire_policy:          WirePolicyId::from("wire"),
+			extended_wire_policy: None,
+			context:              ContextStrategy::Replay,
+			thinking:             None,
+			pricing:              Pricing::default(),
+		});
+		let page = project_mixed_page(
+			&BTreeMap::new(),
+			None,
+			None,
+			Some(&hints),
+			&normalizer,
+			&provider,
+			&route,
+			&hint_request(&provider, &route),
+			vec![
+				// Sibling gateway bundles the exact id on responses.
+				discovered(&provider, &route, "gpt-5.5"),
+				// Billing-variant base is hinted (bundled taxonomy suffix).
+				discovered(&provider, &route, "muse-spark-1.2-contributor"),
+				// Anthropic-only sibling ids are never in the hint set.
+				discovered(&provider, &route, "minimax-m2.5"),
+				// No signal anywhere: the discovery route stays.
+				discovered(&provider, &route, "brand-new-model"),
+			],
+			None,
+		)
+		.expect("hinted page");
+		let routes_of = |wire: &str| -> Box<[RouteId]> {
+			page
+				.models
+				.iter()
+				.find(|model| {
+					model
+						.wire_ids
+						.iter()
+						.any(|(_, wire_model)| wire_model.as_str() == wire)
+				})
+				.unwrap_or_else(|| panic!("{wire} listing"))
+				.routes
+				.clone()
+		};
+		assert_eq!(routes_of("gpt-5.5").as_ref(), &[target.clone()]);
+		assert_eq!(routes_of("muse-spark-1.2-contributor").as_ref(), &[target.clone()]);
+		assert_eq!(routes_of("minimax-m2.5").as_ref(), &[route.clone()]);
+		assert_eq!(routes_of("brand-new-model").as_ref(), &[route.clone()]);
+		let contributor = page
+			.models
+			.iter()
+			.find(|model| model.key.as_str().ends_with("muse-spark-1.2-contributor"))
+			.expect("contributor listing");
+		assert_eq!(
+			contributor.wire_ids.as_ref(),
+			&[(target, WireModelId::from("muse-spark-1.2-contributor"))],
+			"the wire identity follows the rebound route"
+		);
+		assert_eq!(contributor.pricing, Pricing::default(), "pricing never follows the hint");
+	}
+
+	#[test]
+	fn opencode_zen_gateway_first_ids_ride_the_hinted_responses_route() {
+		// pi #8957 end-to-end: the bundled taxonomy declares the OpenCode
+		// gateway group, and opencode-zen's discovery route is its anthropic
+		// primary — exactly where an unhinted gateway-first responses model
+		// would break every turn.
+		use crate::catalog::snapshot::Catalog;
+		let catalog = Catalog::embedded();
+		let route = catalog
+			.route(&RouteId::from("opencode-zen/primary"))
+			.expect("zen primary route is bundled");
+		assert_eq!(route.codec.as_str(), "anthropic", "zen discovery route is the anthropic primary");
+		let projector = CatalogDiscoveryProjector::for_route(catalog, route).expect("zen projector");
+		let provider = ProviderId::from("opencode-zen");
+		let page = projector
+			.project(
+				&hint_request(&provider, &route.id),
+				vec![
+					// Billing variant of zen's own bundled responses SKU.
+					discovered(&provider, &route.id, "gpt-5.5-pro-free"),
+					// Bundled chat SKU off the discovery route keeps its card.
+					discovered(&provider, &route.id, "deepseek-v4-pro"),
+					// No bundled signal on either gateway: stays conservative.
+					discovered(&provider, &route.id, "muse-spark-1.3"),
+				],
+				None,
+			)
+			.expect("zen discovery page");
+		let find = |suffix: &str| -> &ModelSpec {
+			page
+				.models
+				.iter()
+				.find(|model| {
+					model
+						.wire_ids
+						.iter()
+						.any(|(_, wire_model)| wire_model.as_str() == suffix)
+				})
+				.unwrap_or_else(|| panic!("{suffix} listing"))
+		};
+		let free = find("gpt-5.5-pro-free");
+		let free_route = free.routes.first().expect("rebound route");
+		assert_ne!(free_route, &route.id, "hinted id leaves the anthropic discovery route");
+		assert_eq!(
+			catalog
+				.route(free_route)
+				.expect("rebound route is bundled")
+				.codec
+				.as_str(),
+			"openai-responses"
+		);
+		let bundled = find("deepseek-v4-pro");
+		assert_ne!(
+			bundled.pricing,
+			Pricing::default(),
+			"the provider's own bundled card wins even off the discovery route"
+		);
+		let unknown = find("muse-spark-1.3");
+		assert_eq!(
+			unknown.routes.as_ref(),
+			&[route.id.clone()],
+			"no bundled signal on either gateway keeps the discovery route"
+		);
 	}
 }

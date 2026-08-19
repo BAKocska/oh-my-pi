@@ -197,14 +197,25 @@ pub struct RoutingVariantSuffix {
 	pub providers: Box<[Str]>,
 }
 
+/// Parsed provider-scoped runtime-discovery vocabulary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DiscoveryVocabulary {
+	/// Providers whose discovery recovers canonical intrinsic parameters.
+	canonical_recovery:       Vec<Str>,
+	/// Sibling-gateway groups whose bundled catalogs hint the responses route.
+	responses_hint_groups:    Vec<Box<[Str]>>,
+	/// Billing-variant suffixes sharing a transport with their base id.
+	billing_variant_suffixes: Vec<Str>,
+}
+
 /// Parsed checked-in identity taxonomy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Taxonomy {
-	classes:            Vec<ClassDef>,
-	collapse:           Vec<SuffixDef>,
-	lanes:              Vec<EffortLaneSuffix>,
-	routing_variants:   Vec<RoutingVariantSuffix>,
-	canonical_recovery: Vec<Str>,
+	classes:          Vec<ClassDef>,
+	collapse:         Vec<SuffixDef>,
+	lanes:            Vec<EffortLaneSuffix>,
+	routing_variants: Vec<RoutingVariantSuffix>,
+	discovery:        DiscoveryVocabulary,
 }
 
 /// Data-dependent taxonomy ambiguity.
@@ -244,7 +255,7 @@ impl Taxonomy {
 		let mut collapse = Vec::new();
 		let mut lanes = Vec::new();
 		let mut routing_variants = Vec::new();
-		let mut canonical_recovery = Vec::new();
+		let mut discovery = DiscoveryVocabulary::default();
 		let mut source_names = BTreeSet::new();
 		let mut class_names = BTreeSet::new();
 		let mut saw_collapse = false;
@@ -299,7 +310,7 @@ impl Taxonomy {
 							return malformed(file, "discovery");
 						}
 						saw_discovery = true;
-						canonical_recovery = parse_discovery(file, node)?;
+						discovery = parse_discovery(file, node)?;
 					},
 					other => return unexpected(file, other, "taxonomy"),
 				}
@@ -308,7 +319,45 @@ impl Taxonomy {
 		if !saw_collapse || collapse.is_empty() {
 			return malformed("taxonomy", "collapse");
 		}
-		Ok(Self { classes, collapse, lanes, routing_variants, canonical_recovery })
+		Ok(Self { classes, collapse, lanes, routing_variants, discovery })
+	}
+
+	/// Returns the full responses-route hint group containing `provider` —
+	/// sibling gateways (opencode-go/opencode-zen, pi #8957) whose bundled
+	/// catalogs hint that a gateway-first discovered id rides the
+	/// openai-responses route. `None` when `provider` is in no declared group.
+	pub fn responses_hint_group(&self, provider: &str) -> Option<&[Str]> {
+		self
+			.discovery
+			.responses_hint_groups
+			.iter()
+			.find(|group| {
+				group
+					.iter()
+					.any(|member| member.eq_ignore_ascii_case(provider))
+			})
+			.map(Box::as_ref)
+	}
+
+	/// Strips a declared billing-variant suffix (`-free`, `-contributor`) from
+	/// a wire identifier, returning the base id it shares a transport with.
+	///
+	/// Matching is ASCII-case-insensitive on the suffix; the returned slice
+	/// preserves the caller's original bytes. A suffix that would leave an
+	/// empty base identifier never matches.
+	pub fn billing_variant_plain<'model>(&self, wire_model: &'model str) -> Option<&'model str> {
+		self
+			.discovery
+			.billing_variant_suffixes
+			.iter()
+			.find_map(|suffix| {
+				let split = wire_model.len().checked_sub(suffix.len())?;
+				if !wire_model.is_char_boundary(split) {
+					return None;
+				}
+				let (plain, candidate) = wire_model.split_at(split);
+				(!plain.is_empty() && candidate.eq_ignore_ascii_case(suffix.as_str())).then_some(plain)
+			})
 	}
 
 	/// Returns the plain wire identifier when `wire_model` is a declared
@@ -353,6 +402,7 @@ impl Taxonomy {
 	/// the bundled canonical reference index (pi PR #8991).
 	pub fn recovers_canonical_params(&self, provider: &str) -> bool {
 		self
+			.discovery
 			.canonical_recovery
 			.iter()
 			.any(|candidate| candidate.eq_ignore_ascii_case(provider))
@@ -881,7 +931,7 @@ fn parse_collapse(
 	Ok((rules, lanes, routing_variants))
 }
 
-fn parse_discovery(file: &str, node: &KdlNode) -> Result<Vec<Str>, CascadeError> {
+fn parse_discovery(file: &str, node: &KdlNode) -> Result<DiscoveryVocabulary, CascadeError> {
 	validate_properties(file, node, "discovery", &[])?;
 	if !positional_strings(node).is_empty() {
 		return malformed(file, "discovery");
@@ -889,12 +939,10 @@ fn parse_discovery(file: &str, node: &KdlNode) -> Result<Vec<Str>, CascadeError>
 	let Some(children) = node.children() else {
 		return malformed(file, "discovery");
 	};
-	let mut providers: Vec<Str> = Vec::new();
+	let mut vocabulary = DiscoveryVocabulary::default();
+	let mut grouped_providers: Vec<Str> = Vec::new();
 	for child in children.nodes() {
 		let directive = child.name().value();
-		if directive != "recover-canonical-params" {
-			return unexpected(file, directive, "discovery");
-		}
 		validate_properties(file, child, directive, &[])?;
 		let arguments = positional_strings(child);
 		if arguments.is_empty()
@@ -903,18 +951,57 @@ fn parse_discovery(file: &str, node: &KdlNode) -> Result<Vec<Str>, CascadeError>
 		{
 			return malformed(file, directive);
 		}
-		for provider in arguments {
-			let provider = provider.to_ascii_lowercase();
-			if providers.iter().any(|held| held.as_str() == provider) {
-				return malformed(file, directive);
-			}
-			providers.push(provider.to_str());
+		match directive {
+			"recover-canonical-params" => {
+				for provider in arguments {
+					let provider = provider.to_ascii_lowercase();
+					if vocabulary
+						.canonical_recovery
+						.iter()
+						.any(|held| held.as_str() == provider)
+					{
+						return malformed(file, directive);
+					}
+					vocabulary.canonical_recovery.push(provider.to_str());
+				}
+			},
+			"borrow-responses-route" => {
+				let mut group = Vec::with_capacity(arguments.len());
+				for provider in arguments {
+					let provider = provider.to_ascii_lowercase().to_str();
+					// A provider in two groups would make its sibling set
+					// ambiguous, including within one directive.
+					if grouped_providers.contains(&provider) {
+						return malformed(file, directive);
+					}
+					grouped_providers.push(provider.clone());
+					group.push(provider);
+				}
+				vocabulary
+					.responses_hint_groups
+					.push(group.into_boxed_slice());
+			},
+			"billing-variant-suffix" => {
+				for suffix in arguments {
+					let suffix = suffix.to_ascii_lowercase();
+					if suffix == "-"
+						|| vocabulary
+							.billing_variant_suffixes
+							.iter()
+							.any(|held| held.as_str() == suffix)
+					{
+						return malformed(file, directive);
+					}
+					vocabulary.billing_variant_suffixes.push(suffix.to_str());
+				}
+			},
+			other => return unexpected(file, other, "discovery"),
 		}
 	}
-	if providers.is_empty() {
+	if vocabulary == DiscoveryVocabulary::default() {
 		return malformed(file, "discovery");
 	}
-	Ok(providers)
+	Ok(vocabulary)
 }
 
 fn matcher_matches(matcher: &Matcher, lower: &str, bare: &str) -> bool {
@@ -1518,6 +1605,20 @@ mod tests {
 			r#"discovery { recover-canonical-params "" }"#,
 			// Duplicate provider.
 			r#"discovery { recover-canonical-params "gmi-cloud" "GMI-Cloud" }"#,
+			// Empty group.
+			r#"discovery { borrow-responses-route }"#,
+			// Empty group member.
+			r#"discovery { borrow-responses-route "" }"#,
+			// Duplicate member within one group.
+			r#"discovery { borrow-responses-route "opencode-go" "OPENCODE-GO" }"#,
+			// A provider may belong to at most one group.
+			r#"discovery { borrow-responses-route "opencode-go" "opencode-zen"; borrow-responses-route "Opencode-Go" }"#,
+			// Empty suffix.
+			r#"discovery { billing-variant-suffix "" }"#,
+			// Bare dash suffix.
+			r#"discovery { billing-variant-suffix "-" }"#,
+			// Duplicate suffix.
+			r#"discovery { billing-variant-suffix "-free" "-FREE" }"#,
 		] {
 			assert!(
 				matches!(
@@ -1539,5 +1640,45 @@ mod tests {
 			]),
 			Err(CascadeError::MalformedDirective { .. })
 		));
+	}
+
+	#[test]
+	fn discovery_responses_route_hints_are_group_and_suffix_scoped() {
+		let taxonomy = parse(&[
+			("collapse", r#"collapse { thinking-suffix "-thinking" }"#),
+			(
+				"discovery",
+				r#"discovery { borrow-responses-route "opencode-go" "opencode-zen"; billing-variant-suffix "-free" "-contributor" }"#,
+			),
+		]);
+		let group = taxonomy
+			.responses_hint_group("OPENCODE-GO")
+			.expect("declared group");
+		assert!(group.iter().any(|member| member.as_str() == "opencode-zen"));
+		assert!(taxonomy.responses_hint_group("openrouter").is_none());
+		assert_eq!(
+			taxonomy.billing_variant_plain("muse-spark-1.2-contributor"),
+			Some("muse-spark-1.2")
+		);
+		assert_eq!(
+			taxonomy.billing_variant_plain("deepseek-v4-flash-FREE"),
+			Some("deepseek-v4-flash")
+		);
+		assert_eq!(taxonomy.billing_variant_plain("-free"), None, "an empty base never matches");
+		assert_eq!(taxonomy.billing_variant_plain("kimi-k3"), None);
+		// pi #8957: the bundled inventory declares the OpenCode gateway group
+		// and the billing-variant suffixes runtime discovery hints with.
+		let bundled = super::taxonomy();
+		assert!(
+			bundled
+				.responses_hint_group("opencode-go")
+				.expect("bundled OpenCode group")
+				.iter()
+				.any(|member| member.as_str() == "opencode-zen")
+		);
+		assert_eq!(
+			bundled.billing_variant_plain("muse-spark-1.2-contributor"),
+			Some("muse-spark-1.2")
+		);
 	}
 }

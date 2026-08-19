@@ -26,7 +26,7 @@
       "id": "catalog.policy.compat-profiles.v1",
       "path": "compat-profiles.json",
       "secret_free": true,
-      "sha256": "b5e42a770fadad9b05e36727284fb28301bb50d42362dc5723c20a042bd6d112",
+      "sha256": "813731312a7bf7624bbc6c331c1d28f4e4c4d1a375e0b599155e2df7fb6afb54",
       "source": "archive/llm-legacy/llm-catalog/models.json.zst::load_catalog_zstd/ModelBehavior.compat"
     },
     {
@@ -68,7 +68,7 @@
       "id": "catalog.policy.exact-model-overrides.v1",
       "path": "exact-model-overrides.json",
       "secret_free": true,
-      "sha256": "dbf9a237a9f7d7a633fc2833f050c4ec1c4dd59191de833568c70e31afae3694",
+      "sha256": "ecb4f0dad1dac49883d3322b5e00205955ddae7c76473e0e97f7213c662205d6",
       "source": "archive/llm-legacy/llm-catalog/tests/generated_models.rs::checked_in_snapshot_retains_representative_server_behavior"
     },
     {
