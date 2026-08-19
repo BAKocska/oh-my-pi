@@ -1383,7 +1383,6 @@ mod tests {
 			NegotiationPolicy, Sampling, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 			ToolInputConstraint,
 		},
-		codec::EncodeAttempt,
 		id::RequestId,
 	};
 
@@ -1870,23 +1869,8 @@ mod tests {
 			.wire_policy(&model.wire_policy)
 			.expect("embedded wire policy");
 		let request_id = RequestId::new("gitlab-grammar-rejection");
-		let context = EncodeContext {
-			request_id: &request_id,
-			route,
-			target: None,
-			policy_model: None,
-			policy,
-			thinking_policy: None,
-			thinking_selection: None,
-			session: None,
-			server_state: None,
-			account: None,
-			attempt: EncodeAttempt {
-				index:                    0,
-				provisional:              false,
-				template_effort_rejected: false,
-			},
-		};
+		let context =
+			EncodeContext { request_id: &request_id, route, policy, ..EncodeContext::default() };
 		let request = ChatRequest {
 			messages:          Arc::from([]),
 			tools:             Arc::from([ToolDefinition {

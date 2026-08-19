@@ -20,6 +20,13 @@ macro_rules! runtime_id {
 				Self(value.into())
 			}
 
+			/// Creates an identifier from static text without allocating;
+			/// `const` so identifiers can back `static` placeholders.
+			#[inline]
+			pub const fn new_static(value: &'static str) -> Self {
+				Self(Str::new_static(value))
+			}
+
 			/// Borrows the identifier as text.
 			#[inline]
 			pub fn as_str(&self) -> &str {

@@ -838,14 +838,15 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 			session: call.session.as_ref(),
 			server_state: server_state.as_ref(),
 			account: account.as_ref(),
-			attempt: EncodeAttempt {
-				index: attempt,
-				provisional,
-				template_effort_rejected: attempt > 0
-					&& execution.provider_error_code_seen(
-						crate::codec::openai_chat::TEMPLATE_EFFORT_REJECTED_CODE,
-					),
-			},
+			attempt: EncodeAttempt::default()
+				.with_index(attempt)
+				.with_provisional(provisional)
+				.with_template_effort_rejected(
+					attempt > 0
+						&& execution.provider_error_code_seen(
+							crate::codec::openai_chat::TEMPLATE_EFFORT_REJECTED_CODE,
+						),
+				),
 		};
 		let mut encoded =
 			encode_wire_request(self.codec.as_ref(), &encode_context, &call.operation, execution)?;
@@ -1595,21 +1596,12 @@ mod tests {
 		}));
 		let request_id = RequestId::new("realtime-handshake-test");
 		let context = EncodeContext {
-			request_id:         &request_id,
-			route:              &route,
-			target:             Some(&target),
-			policy_model:       Some(&policy_model),
-			policy:             wire_policy,
-			thinking_policy:    None,
-			thinking_selection: None,
-			session:            None,
-			server_state:       None,
-			account:            None,
-			attempt:            EncodeAttempt {
-				index:                    0,
-				provisional:              false,
-				template_effort_rejected: false,
-			},
+			request_id: &request_id,
+			route: &route,
+			target: Some(&target),
+			policy_model: Some(&policy_model),
+			policy: wire_policy,
+			..EncodeContext::default()
 		};
 		let execution = ExecutionContext::new(ExecutionBudget::default());
 		let encoded =

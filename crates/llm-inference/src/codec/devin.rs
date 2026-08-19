@@ -391,7 +391,7 @@ impl Codec for DevinCodec {
 						.session
 						.map_or_else(|| context.request_id.as_str(), |session| session.turn.as_str()),
 				);
-				session.reconnect_attempt = context.attempt.index;
+				session.reconnect_attempt = context.attempt.index();
 				let request = self.encode_chat(context, request, &session)?;
 				let uri = endpoint(&context.route.endpoint.base_url, CHAT_PATH);
 				let template = Bytes::from(request.encode_to_vec());

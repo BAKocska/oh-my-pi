@@ -550,13 +550,12 @@ mod tests {
 	use omp_llm_catalog::{
 		AuthSpecId, CodecId, CodecProfile, CodexTransportPreference, DiscoverySpecId, EndpointSpec,
 		HeaderProfileId, ProviderId, RedirectTrust, RouteDef, RouteId, RouteRestrictions,
-		TransportKind, TrustDomain, WirePolicy,
+		TransportKind, TrustDomain,
 	};
 
 	use super::*;
 	use crate::{
 		call::{NegotiationPolicy, Setting},
-		codec::EncodeAttempt,
 		id::RequestId,
 	};
 
@@ -606,25 +605,9 @@ mod tests {
 	#[test]
 	fn exact_official_sonar_request_is_secret_free() {
 		let route = route();
-		let policy = WirePolicy::default();
 		let request_id = RequestId::new("perplexity-search-fixture");
-		let context = EncodeContext {
-			request_id:         &request_id,
-			route:              &route,
-			target:             None,
-			policy_model:       None,
-			policy:             &policy,
-			thinking_policy:    None,
-			thinking_selection: None,
-			session:            None,
-			server_state:       None,
-			account:            None,
-			attempt:            EncodeAttempt {
-				index:                    0,
-				provisional:              false,
-				template_effort_rejected: false,
-			},
-		};
+		let context =
+			EncodeContext { request_id: &request_id, route: &route, ..EncodeContext::default() };
 		let encoded = PerplexitySearchCodec::new()
 			.encode(&context, &OperationCall::Search(Arc::new(search_request())))
 			.expect("request encodes");

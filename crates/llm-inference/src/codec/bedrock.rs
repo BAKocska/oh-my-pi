@@ -2188,7 +2188,6 @@ mod tests {
 	use super::*;
 	use crate::{
 		call::{NegotiationPolicy, ReasoningRequest, Sampling, ToolDefinition, ToolInputConstraint},
-		codec::EncodeAttempt,
 		id::RequestId,
 		transport::{EventStreamDecoder, FramingError},
 	};
@@ -2274,14 +2273,7 @@ mod tests {
 			policy: &policy,
 			thinking_policy,
 			thinking_selection: thinking_selection.as_ref(),
-			session: None,
-			server_state: None,
-			account: None,
-			attempt: EncodeAttempt {
-				index:                    0,
-				provisional:              false,
-				template_effort_rejected: false,
-			},
+			..EncodeContext::default()
 		};
 		encode_converse_request(request, &context, options).expect("fixture request encodes")
 	}

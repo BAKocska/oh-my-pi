@@ -3358,7 +3358,7 @@ mod tests {
 			ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting, ToolDefinition,
 			ToolGrammar, ToolGrammarSyntax, ToolInputConstraint, ToolResultContent,
 		},
-		codec::{EncodeAttempt, EncodeContext},
+		codec::EncodeContext,
 		event::{ChatEvent, FinishReason},
 		id::{RequestId, ToolCallId},
 	};
@@ -3440,18 +3440,8 @@ mod tests {
 			request_id: &request_id,
 			route,
 			target: Some(&target),
-			policy_model: None,
 			policy,
-			thinking_policy: None,
-			thinking_selection: None,
-			session: None,
-			server_state: None,
-			account: None,
-			attempt: EncodeAttempt {
-				index:                    0,
-				provisional:              false,
-				template_effort_rejected: false,
-			},
+			..EncodeContext::default()
 		};
 		let encoded = OpenAiResponsesCodec::default()
 			.encode_chat(&context, &request_with_tool(input))
@@ -3500,18 +3490,8 @@ mod tests {
 			request_id: &request_id,
 			route,
 			target: Some(&target),
-			policy_model: None,
 			policy,
-			thinking_policy: None,
-			thinking_selection: None,
-			session: None,
-			server_state: None,
-			account: None,
-			attempt: EncodeAttempt {
-				index:                    0,
-				provisional:              false,
-				template_effort_rejected: false,
-			},
+			..EncodeContext::default()
 		};
 		OpenAiResponsesCodec::default()
 			.encode_chat(&context, &request)

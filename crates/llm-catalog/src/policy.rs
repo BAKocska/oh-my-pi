@@ -549,25 +549,86 @@ pub struct WirePolicy {
 
 impl WirePolicy {
 	/// Creates an all-unspecified structural override profile.
+	///
+	/// `const` so neutral policies can back `static` placeholders without lazy
+	/// initialization.
 	#[must_use]
-	pub fn overrides() -> Self {
+	pub const fn overrides() -> Self {
 		Self {
-			role:       RolePolicy::default(),
-			tool:       ToolPolicy::default(),
-			structured: StructuredOutputPolicy::default(),
-			reasoning:  ReasoningPolicy::default(),
-			cache:      CachePolicy::default(),
-			context:    ContextPolicy::default(),
-			streaming:  StreamingPolicy::default(),
-			usage:      UsagePolicy::default(),
-			image:      ImagePolicy::default(),
-			audio:      AudioPolicy::default(),
+			role:       RolePolicy {
+				supports_developer_role:          None,
+				multiple_system_messages:         None,
+				supports_mid_conversation_system: None,
+			},
+			tool:       ToolPolicy {
+				supports_tool_choice:        None,
+				named_choice:                None,
+				forced_choice:               None,
+				strict_mode:                 None,
+				schema_flavor:               None,
+				id_profile:                  None,
+				escape_builtin_names:        None,
+				requires_result_id:          None,
+				eager_input_streaming:       None,
+				requires_assistant_content:  None,
+				thinking_conflict:           None,
+				apply_patch:                 None,
+				computer_use:                None,
+				computer_use_config:         None,
+				disable_reasoning_on_choice: None,
+				flatten_root_unions:         None,
+			},
+			structured: StructuredOutputPolicy {
+				penalties:       None,
+				sampling_params: None,
+				stop_sequences:  None,
+			},
+			reasoning:  ReasoningPolicy {
+				wire_format: None,
+				thinking_format: None,
+				supports_effort: None,
+				supports_summary: None,
+				omit_effort: None,
+				effort_map: BTreeMap::new(),
+				disable_mode: None,
+				content_field: None,
+				requires_content_for_tool_calls: None,
+				requires_content_for_all_assistant_turns: None,
+				allows_synthetic_content_for_tool_calls: None,
+				filter_history: None,
+				include_encrypted: None,
+				replay_unsigned: None,
+				requires_enabled: None,
+				disable_adaptive: None,
+				interleaved_thinking: None,
+				official_endpoint: None,
+				signing_endpoint: None,
+				extra_body: None,
+				when_thinking: None,
+				leaked_healer: None,
+				loop_guard: None,
+			},
+			cache:      CachePolicy { control_format: None, supports_long_retention: None },
+			context:    ContextPolicy {
+				max_tokens_field:           None,
+				max_output_tokens:          None,
+				supports_store:             None,
+				stateful_response_chaining: None,
+				extended_mode:              None,
+			},
+			streaming:  StreamingPolicy { protocol: None, watchdog: None },
+			usage:      UsagePolicy { in_streaming: None },
+			image:      ImagePolicy { encoding: None, supports_detail_original: None },
+			audio:      AudioPolicy { api_version: None },
 		}
 	}
 
 	/// Returns the conventional fully resolved OpenAI-compatible profile.
+	///
+	/// `const` so the baseline can back `static` placeholders without lazy
+	/// initialization; every field overwritten here is `Copy`.
 	#[must_use]
-	pub fn baseline() -> Self {
+	pub const fn baseline() -> Self {
 		let mut policy = Self::overrides();
 		policy.role.multiple_system_messages = Some(true);
 		policy.tool.named_choice = Some(true);
@@ -586,7 +647,8 @@ impl WirePolicy {
 		policy.context.max_tokens_field = Some(MaxTokensField::MaxCompletionTokens);
 		policy.context.stateful_response_chaining = Some(false);
 		policy.streaming.protocol = Some(StreamProtocol::SseData);
-		policy.streaming.watchdog = Some(StreamWatchdog::default());
+		policy.streaming.watchdog =
+			Some(StreamWatchdog { first_event_ms: None, idle_ms: None });
 		policy.usage.in_streaming = Some(true);
 		policy.image.encoding = Some(ImageEncodingFormat::OpenAiUrl);
 		policy.audio.api_version = Some(AudioApiVersion::None);

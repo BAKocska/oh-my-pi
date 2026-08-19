@@ -45,9 +45,8 @@ use omp_llm_inference::{
 	},
 	client::{Client, Operation},
 	codec::{
-		Cancellation, Codec, DecodeContext, EncodeAttempt, EncodeContext, EncodedRequest,
-		NativeResponseFormat, RawEvent, RequestMethod, SizeBounds, TransportAttempt,
-		TransportRequest,
+		Cancellation, Codec, DecodeContext, EncodeContext, EncodedRequest, NativeResponseFormat,
+		RawEvent, RequestMethod, SizeBounds, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
 		bedrock::BedrockConverseCodec,
 		cursor::CursorCodec,
@@ -871,16 +870,8 @@ fn signed_gemini_visible_text_proof_round_trips_and_cca_lowers_account_project()
 		target: Some(&target),
 		policy_model: Some(&policy_model),
 		policy,
-		thinking_policy: None,
-		thinking_selection: None,
-		session: None,
-		server_state: None,
 		account: Some(&account),
-		attempt: EncodeAttempt {
-			index:                    0,
-			provisional:              false,
-			template_effort_rejected: false,
-		},
+		..EncodeContext::default()
 	};
 	let encoded =
 		GoogleCcaCodec::gemini_cli(None, CcaHeaders::gemini_cli("fixture-model", "darwin", "arm64"))

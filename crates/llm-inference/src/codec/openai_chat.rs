@@ -458,7 +458,8 @@ impl Codec for OpenAiChatCodec {
 		validate_thinking_selection(request, context.thinking_selection)?;
 		let mut selected = self.clone();
 		selected.profile.apply_policy(context.policy);
-		selected.profile.template_effort_top_level_only = context.attempt.template_effort_rejected;
+		selected.profile.template_effort_top_level_only =
+			context.attempt.is_template_effort_rejected();
 		let wire_model = context
 			.thinking_selection
 			.map_or(&target.wire_model, |selection| &selection.wire_model);

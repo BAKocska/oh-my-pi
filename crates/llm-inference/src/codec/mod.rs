@@ -15,8 +15,10 @@ use bytes::Bytes;
 use futures::{Stream, task::AtomicWaker};
 use omp_core::Str;
 use omp_llm_catalog::{
-	DiscoveredModel, OperationKind, PolicyModel, ProviderId, RouteDef, RouteId, ThinkingPolicy,
-	ThinkingSelection, WireTarget, policy::WirePolicy,
+	AuthSpecId, CodecId, CodecProfile, CodexTransportPreference, DiscoveredModel, EndpointSpec,
+	HeaderProfileId, OperationKind, PolicyModel, ProviderId, RedirectTrust, RouteDef, RouteId,
+	RouteRestrictions, ThinkingPolicy, ThinkingSelection, TransportKind, TrustDomain, WireTarget,
+	policy::WirePolicy,
 };
 use smallvec::SmallVec;
 
@@ -174,16 +176,74 @@ impl EncodedRequest {
 
 /// Attempt identity visible to pure encoding without account or credential
 /// data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EncodeAttempt {
-	/// Zero-based attempt index.
-	pub index:                    u32,
-	/// Whether output from this attempt is held transactionally.
-	pub provisional:              bool,
+///
+/// Packed as one `u64`: the low 32 bits carry the zero-based attempt index,
+/// the high bits carry attempt flags.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct EncodeAttempt(u64);
+
+impl EncodeAttempt {
+	/// Output from this attempt is held transactionally.
+	const PROVISIONAL: u64 = 1 << 32;
 	/// A prior attempt on this route was classified as rejecting the
+	/// `chat_template_kwargs.reasoning_effort` spelling.
+	const TEMPLATE_EFFORT_REJECTED: u64 = 1 << 33;
+
+	/// Returns the identity with the zero-based attempt index set to `index`.
+	#[must_use]
+	pub const fn with_index(self, index: u32) -> Self {
+		Self(self.0 & !(u32::MAX as u64) | index as u64)
+	}
+
+	/// Returns the zero-based attempt index.
+	pub const fn index(self) -> u32 {
+		self.0 as u32
+	}
+
+	/// Whether output from this attempt is held transactionally.
+	pub const fn is_provisional(self) -> bool {
+		self.0 & Self::PROVISIONAL != 0
+	}
+
+	/// Returns the identity with the transactional-hold flag set to `value`.
+	#[must_use]
+	pub const fn with_provisional(self, value: bool) -> Self {
+		Self(if value {
+			self.0 | Self::PROVISIONAL
+		} else {
+			self.0 & !Self::PROVISIONAL
+		})
+	}
+
+	/// Whether a prior attempt on this route was classified as rejecting the
 	/// `chat_template_kwargs.reasoning_effort` spelling; effort-capable Qwen
 	/// dialects must route the effort onto the top-level field only.
-	pub template_effort_rejected: bool,
+	pub const fn is_template_effort_rejected(self) -> bool {
+		self.0 & Self::TEMPLATE_EFFORT_REJECTED != 0
+	}
+
+	/// Returns the identity with the template-effort-rejection flag set to
+	/// `value`.
+	#[must_use]
+	pub const fn with_template_effort_rejected(self, value: bool) -> Self {
+		Self(if value {
+			self.0 | Self::TEMPLATE_EFFORT_REJECTED
+		} else {
+			self.0 & !Self::TEMPLATE_EFFORT_REJECTED
+		})
+	}
+}
+
+impl fmt::Debug for EncodeAttempt {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("EncodeAttempt")
+			.field("index", &self.index())
+			.field("provisional", &self.is_provisional())
+			.field("template_effort_rejected", &self.is_template_effort_rejected())
+			.finish()
+	}
 }
 
 /// Credential-free context for canonical-to-wire lowering.
@@ -215,6 +275,61 @@ pub struct EncodeContext<'a> {
 	pub account:            Option<&'a AccountRoutingContext>,
 	/// Attempt metadata that may affect idempotency fields.
 	pub attempt:            EncodeAttempt,
+}
+
+static DEFAULT_REQUEST_ID: RequestId = RequestId::new_static("");
+static DEFAULT_WIRE_POLICY: WirePolicy = WirePolicy::baseline();
+/// Neutral deny-everything route placeholder backing
+/// [`EncodeContext::default`].
+static DEFAULT_ROUTE: RouteDef = RouteDef {
+	id:                 RouteId::new_static(""),
+	provider:           ProviderId::new_static(""),
+	codec_profile:      CodecProfile::Standard,
+	codec:              CodecId::new_static(""),
+	transport:          TransportKind::Http,
+	endpoint:           EndpointSpec { base_url: Str::new_static(""), region: None },
+	auth:               AuthSpecId::new_static(""),
+	headers:            HeaderProfileId::new_static(""),
+	discovery:          None,
+	capability_limits:  RouteRestrictions {
+		operations:             None,
+		maximum_context_tokens: None,
+		maximum_output_tokens:  None,
+		disable_server_state:   false,
+		disable_prompt_caching: false,
+	},
+	trust_domain:       TrustDomain {
+		origin:          Str::new_static(""),
+		redirects:       RedirectTrust::Deny,
+		allow_plaintext: false,
+	},
+	codex_transport:    CodexTransportPreference::HttpOnly,
+	use_responses_lite: None,
+	priority:           None,
+};
+
+impl Default for EncodeContext<'_> {
+	/// Neutral context for struct-update construction
+	/// (`EncodeContext { policy, ..Default::default() }`).
+	///
+	/// The mandatory borrows point at empty deny-everything placeholders;
+	/// production encoding always overrides `request_id`, `route`, and
+	/// `policy` from the immutable plan.
+	fn default() -> Self {
+		Self {
+			request_id:         &DEFAULT_REQUEST_ID,
+			route:              &DEFAULT_ROUTE,
+			target:             None,
+			policy_model:       None,
+			policy:             &DEFAULT_WIRE_POLICY,
+			thinking_policy:    None,
+			thinking_selection: None,
+			session:            None,
+			server_state:       None,
+			account:            None,
+			attempt:            EncodeAttempt::default(),
+		}
+	}
 }
 
 /// Lossless response representation requested by a native operation.
