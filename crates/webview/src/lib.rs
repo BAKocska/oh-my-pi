@@ -1,0 +1,514 @@
+//! Modular embedded-browser surfaces for omp.
+//!
+//! `omp-webview` follows [wry](https://github.com/tauri-apps/wry)'s footsteps —
+//! embed real web content without shipping a browser engine — and generalizes
+//! it: the engine is pluggable, including the browsers the user already has
+//! installed.
+//!
+//! # Engines
+//!
+//! - **system** — the platform webview, in-process (`WKWebView` on macOS).
+//! - **chromium** — any installed Chromium-family browser (Chrome, Edge, Brave,
+//!   Chromium, Vivaldi, ...), spawned and driven over the Chrome `DevTools`
+//!   Protocol.
+//! - **firefox** — any installed Gecko-family browser (Firefox, `LibreWolf`,
+//!   ...), spawned and driven over `WebDriver` `BiDi`.
+//!
+//! # Surfaces
+//!
+//! - **child** — a native subview embedded in a host window (wry's model). The
+//!   OS composites it *above* the host's own rendering.
+//! - **frames** — a stream of RGBA frames the host composites itself, with
+//!   input forwarded explicitly. This is what system webviews cannot do; it
+//!   requires a remote engine running headless.
+//! - **window** — an engine-owned OS window (`chrome --app`-style shell).
+//!
+//! # Capability matrix
+//!
+//! | engine   | child | frames | window |
+//! |----------|-------|--------|--------|
+//! | system   | yes   | no     | no     |
+//! | chromium | no    | yes    | yes    |
+//! | firefox  | no    | yes    | yes    |
+//!
+//! Unsupported combinations fail with [`Error::Unsupported`] at build time.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use omp_webview::{Engine, FrameConfig, WebViewBuilder, WebViewEvent};
+//!
+//! let view = WebViewBuilder::new(Engine::find(omp_webview::SurfaceKind::Frames)?)
+//!    .url("https://example.com")
+//!    .build_frames(FrameConfig::default())?;
+//! while let Ok(event) = view.events().recv() {
+//!    if let WebViewEvent::Frame(frame) = event {
+//!       // upload frame.data (RGBA8) as a texture
+//!    }
+//! }
+//! ```
+//!
+//! # Remote-engine profiles
+//!
+//! Remote engines never touch the user's daily browsing profile: modern
+//! Chrome refuses automation on the default profile, and clobbering user
+//! state would be hostile anyway. By default each view gets an ephemeral
+//! profile deleted on close; pass [`WebViewBuilder::profile`] for a
+//! persistent one (cookies and logins survive across views).
+//!
+//! The `OMP_WEBVIEW_BROWSER` environment variable (path to a browser binary)
+//! overrides [`Engine::find`]'s discovery for remote surfaces.
+
+mod discover;
+mod error;
+mod event;
+mod geometry;
+mod input;
+mod options;
+mod remote;
+#[cfg(target_os = "macos")]
+mod wk;
+
+use std::path::PathBuf;
+
+use omp_core::{IntoStr, Str};
+/// Re-exported so hosts don't need a direct dependency to hand windows over.
+pub use raw_window_handle;
+use raw_window_handle::HasWindowHandle;
+
+pub use crate::{
+	discover::{BrowserKind, EngineFamily, InstalledBrowser, discover},
+	error::{Error, Result},
+	event::{Frame, WebViewEvent},
+	geometry::Rect,
+	input::{Input, Key, Modifiers, MouseButton},
+	options::{EngineKind, FrameConfig, SurfaceKind, WindowConfig},
+};
+use crate::{
+	event::SharedState,
+	options::PageOptions,
+	remote::{Command, RemoteView},
+};
+
+/// A concrete engine choice for [`WebViewBuilder::new`].
+#[derive(Clone, Debug)]
+pub enum Engine {
+	/// The platform webview (in-process, `child` surfaces only).
+	#[cfg(target_os = "macos")]
+	System,
+	/// An installed Chromium-family browser, driven over CDP.
+	Chromium {
+		/// Path to the browser binary.
+		binary: PathBuf,
+	},
+	/// An installed Gecko-family browser, driven over `WebDriver` `BiDi`.
+	Firefox {
+		/// Path to the browser binary.
+		binary: PathBuf,
+	},
+}
+
+impl Engine {
+	/// The platform webview.
+	#[cfg(target_os = "macos")]
+	pub const fn system() -> Self {
+		Self::System
+	}
+
+	/// A Chromium-family browser at `binary`.
+	pub fn chromium(binary: impl Into<PathBuf>) -> Self {
+		Self::Chromium { binary: binary.into() }
+	}
+
+	/// A Gecko-family browser at `binary`.
+	pub fn firefox(binary: impl Into<PathBuf>) -> Self {
+		Self::Firefox { binary: binary.into() }
+	}
+
+	/// An engine for an [`InstalledBrowser`] found by [`discover`].
+	pub fn installed(browser: &InstalledBrowser) -> Self {
+		match browser.family {
+			EngineFamily::Chromium => Self::chromium(&browser.path),
+			EngineFamily::Gecko => Self::firefox(&browser.path),
+		}
+	}
+
+	/// Pick the best available engine for `surface`.
+	///
+	/// `child` prefers the system webview. Remote surfaces honor the
+	/// `OMP_WEBVIEW_BROWSER` override, then prefer Chromium-family installs
+	/// (full-rate screencast) over Gecko (screenshot polling).
+	///
+	/// # Errors
+	///
+	/// [`Error::NoEngine`] when nothing installed can present `surface`.
+	pub fn find(surface: SurfaceKind) -> Result<Self> {
+		if surface == SurfaceKind::Child {
+			#[cfg(target_os = "macos")]
+			return Ok(Self::System);
+			#[cfg(not(target_os = "macos"))]
+			return Err(Error::NoEngine(surface));
+		}
+		if let Some(path) = std::env::var_os("OMP_WEBVIEW_BROWSER") {
+			let path = PathBuf::from(path);
+			return Ok(if discover::gecko_like(&path) {
+				Self::Firefox { binary: path }
+			} else {
+				Self::Chromium { binary: path }
+			});
+		}
+		let installed = discover();
+		installed
+			.iter()
+			.find(|b| b.family == EngineFamily::Chromium)
+			.or_else(|| installed.first())
+			.map(Self::installed)
+			.ok_or(Error::NoEngine(surface))
+	}
+
+	/// Which [`EngineKind`] this engine is.
+	pub const fn kind(&self) -> EngineKind {
+		match self {
+			#[cfg(target_os = "macos")]
+			Self::System => EngineKind::System,
+			Self::Chromium { .. } => EngineKind::Chromium,
+			Self::Firefox { .. } => EngineKind::Firefox,
+		}
+	}
+}
+
+/// Configures and creates a [`WebView`].
+///
+/// Mirrors wry's builder where the concepts carry over (url/html, user
+/// agent, transparency, init scripts, IPC) and adds the surface choice at
+/// build time.
+pub struct WebViewBuilder {
+	engine: Engine,
+	page:   PageOptions,
+}
+
+impl WebViewBuilder {
+	/// Start configuring a view on `engine`.
+	pub fn new(engine: Engine) -> Self {
+		Self { engine, page: PageOptions::default() }
+	}
+
+	/// Initial URL to load (wins over [`html`](Self::html)).
+	pub fn url(mut self, url: impl IntoStr) -> Self {
+		self.page.url = Some(url.to_str());
+		self
+	}
+
+	/// Initial HTML document (loaded with a null origin).
+	pub fn html(mut self, html: impl IntoStr) -> Self {
+		self.page.html = Some(html.to_str());
+		self
+	}
+
+	/// Custom user-agent string.
+	pub fn user_agent(mut self, ua: impl IntoStr) -> Self {
+		self.page.user_agent = Some(ua.to_str());
+		self
+	}
+
+	/// Render the page on a transparent background.
+	pub const fn transparent(mut self, transparent: bool) -> Self {
+		self.page.transparent = transparent;
+		self
+	}
+
+	/// Solid page background color (RGBA); ignored when transparent.
+	pub const fn background(mut self, rgba: [u8; 4]) -> Self {
+		self.page.background = Some(rgba);
+		self
+	}
+
+	/// Add a script injected before `window.onload` on every new document.
+	///
+	/// Pages can post messages to the host with
+	/// `window.ipc.postMessage("...")`, delivered as [`WebViewEvent::Ipc`].
+	pub fn init_script(mut self, script: impl IntoStr) -> Self {
+		self.page.init_scripts.push(script.to_str());
+		self
+	}
+
+	/// Leave no browsing data behind (remote engines force an ephemeral
+	/// profile; the system webview uses a non-persistent data store).
+	pub const fn incognito(mut self, incognito: bool) -> Self {
+		self.page.incognito = incognito;
+		self
+	}
+
+	/// Persistent browsing-profile directory for remote engines.
+	pub fn profile(mut self, dir: impl Into<PathBuf>) -> Self {
+		self.page.profile = Some(dir.into());
+		self
+	}
+
+	/// Allow opening the engine's devtools.
+	pub const fn devtools(mut self, devtools: bool) -> Self {
+		self.page.devtools = devtools;
+		self
+	}
+
+	/// Embed as a native child view of `parent` at `bounds` (system engine).
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on remote engines, [`Error::MainThread`] off
+	/// the main thread, [`Error::WindowHandle`] for foreign handles.
+	pub fn build_child(self, parent: &impl HasWindowHandle, bounds: Rect) -> Result<WebView> {
+		match self.engine {
+			#[cfg(target_os = "macos")]
+			Engine::System => {
+				let (events_tx, events) = flume::unbounded();
+				let state = SharedState::default();
+				let handle = parent.window_handle().map_err(|_| Error::WindowHandle)?;
+				let view =
+					wk::WkView::create(&self.page, handle.as_raw(), bounds, events_tx, state.clone())?;
+				Ok(WebView {
+					inner: Inner::Wk(view),
+					events,
+					state,
+					engine: EngineKind::System,
+					surface: SurfaceKind::Child,
+				})
+			},
+			_ => {
+				let _ = parent;
+				Err(Error::Unsupported("child surfaces require the system engine"))
+			},
+		}
+	}
+
+	/// Run the engine headless and stream frames to the host.
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on the system engine; launch/connect failures
+	/// from the remote engine.
+	pub fn build_frames(self, config: FrameConfig) -> Result<WebView> {
+		let engine = self.engine.kind();
+		let (view, events, state) = match self.engine {
+			Engine::Chromium { binary } => remote::spawn(self.page, move |ctx| {
+				remote::chromium::drive_frames(binary, config, ctx)
+			})?,
+			Engine::Firefox { binary } => {
+				remote::spawn(self.page, move |ctx| remote::firefox::drive_frames(binary, config, ctx))?
+			},
+			#[cfg(target_os = "macos")]
+			Engine::System => {
+				return Err(Error::Unsupported("frames surfaces require a remote engine"));
+			},
+		};
+		Ok(WebView {
+			inner: Inner::Remote(view),
+			events,
+			state,
+			engine,
+			surface: SurfaceKind::Frames,
+		})
+	}
+
+	/// Open an engine-owned OS window.
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on the system engine; launch/connect failures
+	/// from the remote engine.
+	pub fn build_window(self, config: WindowConfig) -> Result<WebView> {
+		let engine = self.engine.kind();
+		let (view, events, state) = match self.engine {
+			Engine::Chromium { binary } => remote::spawn(self.page, move |ctx| {
+				remote::chromium::drive_window(binary, config, ctx)
+			})?,
+			Engine::Firefox { binary } => {
+				remote::spawn(self.page, move |ctx| remote::firefox::drive_window(binary, config, ctx))?
+			},
+			#[cfg(target_os = "macos")]
+			Engine::System => {
+				return Err(Error::Unsupported("window surfaces require a remote engine"));
+			},
+		};
+		Ok(WebView {
+			inner: Inner::Remote(view),
+			events,
+			state,
+			engine,
+			surface: SurfaceKind::Window,
+		})
+	}
+}
+
+enum Inner {
+	#[cfg(target_os = "macos")]
+	Wk(wk::WkView),
+	Remote(RemoteView),
+}
+
+/// A live web surface.
+///
+/// Dropping the view tears the surface down: child views detach from the
+/// parent window; remote engines are shut down with a bounded grace period.
+///
+/// On macOS a system-engine view is bound to the main thread and the handle
+/// is not `Send`; the [`events`](Self::events) receiver can be cloned and
+/// consumed from any thread regardless of engine.
+pub struct WebView {
+	inner:   Inner,
+	events:  flume::Receiver<WebViewEvent>,
+	state:   SharedState,
+	engine:  EngineKind,
+	surface: SurfaceKind,
+}
+
+impl WebView {
+	/// Navigate to `url`.
+	pub fn navigate(&self, url: &str) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.navigate(url),
+			Inner::Remote(view) => view.send(Command::Navigate(url.to_str())),
+		}
+	}
+
+	/// Replace the document with `html` (null origin).
+	pub fn load_html(&self, html: &str) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.load_html(html),
+			Inner::Remote(view) => view.send(Command::LoadHtml(html.to_str())),
+		}
+	}
+
+	/// Evaluate JavaScript, discarding the result.
+	pub fn eval(&self, js: &str) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.eval(js, None),
+			Inner::Remote(view) => view.send(Command::Eval { js: js.to_str(), reply: None }),
+		}
+	}
+
+	/// Evaluate JavaScript; `reply` receives the JSON-encoded result on the
+	/// engine's driver/main thread.
+	pub fn eval_with(&self, js: &str, reply: impl FnOnce(Str) + Send + 'static) -> Result<()> {
+		let reply = Some(Box::new(reply) as Box<dyn FnOnce(Str) + Send>);
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.eval(js, reply),
+			Inner::Remote(view) => view.send(Command::Eval { js: js.to_str(), reply }),
+		}
+	}
+
+	/// Reload the current page.
+	pub fn reload(&self) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.reload(),
+			Inner::Remote(view) => view.send(Command::Reload),
+		}
+	}
+
+	/// History back.
+	pub fn back(&self) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.back(),
+			Inner::Remote(view) => view.send(Command::Back),
+		}
+	}
+
+	/// History forward.
+	pub fn forward(&self) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.forward(),
+			Inner::Remote(view) => view.send(Command::Forward),
+		}
+	}
+
+	/// Move focus to the surface (child) or raise the window (window).
+	pub fn focus(&self) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.focus(),
+			Inner::Remote(view) => view.send(Command::Focus),
+		}
+	}
+
+	/// Reposition a child surface within its parent window.
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on non-child surfaces.
+	pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.set_bounds(bounds),
+			Inner::Remote(_) => Err(Error::Unsupported("set_bounds applies to child surfaces")),
+		}
+	}
+
+	/// Show or hide a child surface.
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on non-child surfaces.
+	pub fn set_visible(&self, visible: bool) -> Result<()> {
+		match &self.inner {
+			#[cfg(target_os = "macos")]
+			Inner::Wk(view) => view.set_visible(visible),
+			Inner::Remote(_) => Err(Error::Unsupported("set_visible applies to child surfaces")),
+		}
+	}
+
+	/// Resize the viewport of a frames surface (CSS pixels).
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on non-frames surfaces.
+	pub fn resize(&self, width: u32, height: u32) -> Result<()> {
+		match (&self.inner, self.surface) {
+			(Inner::Remote(view), SurfaceKind::Frames) => view.send(Command::Resize { width, height }),
+			_ => Err(Error::Unsupported("resize applies to frames surfaces")),
+		}
+	}
+
+	/// Forward a synthetic input event to a frames surface.
+	///
+	/// # Errors
+	///
+	/// [`Error::Unsupported`] on non-frames surfaces.
+	pub fn input(&self, input: Input) -> Result<()> {
+		match (&self.inner, self.surface) {
+			(Inner::Remote(view), SurfaceKind::Frames) => view.send(Command::Input(input)),
+			_ => Err(Error::Unsupported("input applies to frames surfaces")),
+		}
+	}
+
+	/// Last committed URL.
+	pub fn url(&self) -> Str {
+		self.state.lock().url.clone()
+	}
+
+	/// Last observed document title.
+	pub fn title(&self) -> Str {
+		self.state.lock().title.clone()
+	}
+
+	/// Event stream; clone the receiver to consume from another thread.
+	pub const fn events(&self) -> &flume::Receiver<WebViewEvent> {
+		&self.events
+	}
+
+	/// Which engine renders this view.
+	pub const fn engine(&self) -> EngineKind {
+		self.engine
+	}
+
+	/// How this view is presented.
+	pub const fn surface(&self) -> SurfaceKind {
+		self.surface
+	}
+}

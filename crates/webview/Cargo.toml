@@ -1,0 +1,38 @@
+[package]
+name = "omp-webview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Modular embedded-browser surfaces: system webview or the user's installed Chromium/Firefox"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+omp-core = { workspace = true }
+parking_lot = { workspace = true }
+png = { workspace = true }
+raw-window-handle = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-web-kit = { workspace = true }
+
+[dev-dependencies]
+winit = { workspace = true }

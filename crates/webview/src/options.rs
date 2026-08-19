@@ -1,0 +1,91 @@
+//! Builder option payloads shared across engine backends.
+
+use std::path::PathBuf;
+
+use omp_core::Str;
+
+/// How web content reaches the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+pub enum SurfaceKind {
+	/// A native subview embedded in a host window (wry-style).
+	Child,
+	/// A pixel stream the host composites itself; input is forwarded
+	/// explicitly via [`WebView::input`](crate::WebView::input).
+	Frames,
+	/// An engine-owned OS window (e.g. `chrome --app`).
+	Window,
+}
+
+/// Which engine renders the content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+pub enum EngineKind {
+	/// The platform webview (`WKWebView` on macOS).
+	System,
+	/// An installed Chromium-family browser driven over CDP.
+	Chromium,
+	/// An installed Gecko-family browser driven over `WebDriver` `BiDi`.
+	Firefox,
+}
+
+/// Page configuration accumulated by [`WebViewBuilder`](crate::WebViewBuilder)
+/// and interpreted by each backend.
+#[derive(Debug, Default)]
+pub struct PageOptions {
+	/// Initial URL (wins over `html`).
+	pub url:          Option<Str>,
+	/// Initial HTML document (loaded with a null origin).
+	pub html:         Option<Str>,
+	/// Custom user-agent string.
+	pub user_agent:   Option<Str>,
+	/// Transparent page background.
+	pub transparent:  bool,
+	/// Solid background color (RGBA), ignored when `transparent`.
+	pub background:   Option<[u8; 4]>,
+	/// Scripts injected before `window.onload` on every new document.
+	pub init_scripts: Vec<Str>,
+	/// Do not persist browsing data.
+	pub incognito:    bool,
+	/// Remote engines: browsing-profile directory (cookies, cache, storage).
+	/// `None` uses an ephemeral directory removed when the view closes.
+	pub profile:      Option<PathBuf>,
+	/// Allow opening the engine's devtools.
+	pub devtools:     bool,
+}
+
+/// Configuration for a [`frames`](crate::WebViewBuilder::build_frames) surface.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameConfig {
+	/// Viewport width in CSS pixels.
+	pub width:   u32,
+	/// Viewport height in CSS pixels.
+	pub height:  u32,
+	/// Device scale factor; frame pixel dimensions are `width/height * scale`.
+	pub scale:   f64,
+	/// Upper bound on delivered frames per second. `None` lets the backend
+	/// choose: Chromium delivers every compositor frame; Firefox (which has no
+	/// screencast and is polled via screenshots) defaults to 10 fps.
+	pub fps_cap: Option<f32>,
+}
+
+impl Default for FrameConfig {
+	fn default() -> Self {
+		Self { width: 1280, height: 800, scale: 1.0, fps_cap: None }
+	}
+}
+
+/// Configuration for a [`window`](crate::WebViewBuilder::build_window) surface.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowConfig {
+	/// Initial window width in logical points.
+	pub width:  u32,
+	/// Initial window height in logical points.
+	pub height: u32,
+}
+
+impl Default for WindowConfig {
+	fn default() -> Self {
+		Self { width: 1024, height: 768 }
+	}
+}
