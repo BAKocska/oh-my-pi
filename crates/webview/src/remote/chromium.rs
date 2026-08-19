@@ -24,8 +24,11 @@ use crate::{
 	Error, Result,
 	event::{SharedState, WebViewEvent},
 	input::{Input, Key, Modifiers},
-	options::{FrameConfig, PageOptions, WindowConfig},
-	remote::{Command, DriverCtx, ProfileDir, data_url, decode_png, resolve_profile, ws::WsLink},
+	options::{FrameConfig, FrameFormat, PageOptions, WindowConfig},
+	remote::{
+		Command, DriverCtx, ProfileDir, damage_rect, data_url, decode_frame, resolve_profile,
+		ws::WsLink,
+	},
 };
 
 /// How long to wait for the browser to publish `DevToolsActivePort` and for
@@ -349,6 +352,8 @@ struct Cdp {
 	frame_interval: Option<Duration>,
 	/// When the last frame was emitted to the host.
 	last_frame:     Option<Instant>,
+	/// Pixels of the last delivered frame, for damage-rect computation.
+	last_pixels:    Option<bytes::Bytes>,
 	/// The page target or the socket is gone; the session is over.
 	closed:         bool,
 	/// A load finished; the main loop should re-read `document.title`.
@@ -377,6 +382,7 @@ impl Cdp {
 			frame_cfg,
 			frame_interval,
 			last_frame: None,
+			last_pixels: None,
 			closed: false,
 			title_dirty: false,
 		}
@@ -588,6 +594,8 @@ impl Cdp {
 		cfg.height = height;
 		let cfg = *cfg;
 		self.set_metrics(&cfg).await?;
+		// The viewport changed; the next frame is a full redraw.
+		self.last_pixels = None;
 		self.cmd("Page.stopScreencast", json!({})).await?;
 		self.start_screencast(&cfg).await
 	}
@@ -698,20 +706,22 @@ impl Cdp {
 			.map(drop)
 	}
 
-	/// Start the PNG screencast sized to the device-pixel viewport.
+	/// Start the screencast sized to the device-pixel viewport, encoded per
+	/// the configured [`FrameFormat`].
 	async fn start_screencast(&mut self, cfg: &FrameConfig) -> Result<()> {
-		self
-			.cmd(
-				"Page.startScreencast",
-				json!({
-					"format": "png",
-					"maxWidth": (f64::from(cfg.width) * cfg.scale).ceil() as u32,
-					"maxHeight": (f64::from(cfg.height) * cfg.scale).ceil() as u32,
-					"everyNthFrame": 1,
-				}),
-			)
-			.await
-			.map(drop)
+		let mut params = json!({
+			"format": match cfg.format {
+				FrameFormat::Png => "png",
+				FrameFormat::Jpeg { .. } => "jpeg",
+			},
+			"maxWidth": (f64::from(cfg.width) * cfg.scale).ceil() as u32,
+			"maxHeight": (f64::from(cfg.height) * cfg.scale).ceil() as u32,
+			"everyNthFrame": 1,
+		});
+		if let FrameFormat::Jpeg { quality } = cfg.format {
+			params["quality"] = json!(u32::from(quality.clamp(1, 100)));
+		}
+		self.cmd("Page.startScreencast", params).await.map(drop)
 	}
 
 	/// Re-read `document.title` after a load; static HTML titles do not
@@ -823,10 +833,24 @@ impl Cdp {
 		{
 			return Ok(());
 		}
-		let png = base64::decode(data)
+		let bytes = base64::decode(data)
 			.into_vec()
 			.map_err(|err| Error::Protocol(fmts!("screencast frame base64: {err}")))?;
-		let frame = decode_png(&png)?;
+		let format = self.frame_cfg.map_or(FrameFormat::Png, |cfg| cfg.format);
+		let mut frame = decode_frame(format, &bytes)?;
+		match &self.last_pixels {
+			Some(prev) if prev.len() == frame.data.len() => {
+				// Screencast damage is whole-frame granular; tighten it (and
+				// drop frames that decoded identical despite the signal).
+				match damage_rect(prev, &frame.data, frame.width) {
+					Some(rect) => frame.damage = rect,
+					None => return Ok(()),
+				}
+			},
+			// First frame or a size change: full damage (decoder default).
+			_ => {},
+		}
+		self.last_pixels = Some(frame.data.clone());
 		self.last_frame = Some(Instant::now());
 		let _ = self.events.send(WebViewEvent::Frame(frame));
 		Ok(())

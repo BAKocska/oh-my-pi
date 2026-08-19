@@ -9,6 +9,7 @@ mod input;
 #[cfg(target_os = "macos")]
 mod macos;
 mod mux;
+mod pixels;
 mod scene;
 mod theme;
 
@@ -16,5 +17,6 @@ pub use cells::{CellMetrics, Compositor, Instances, Selection, View};
 pub use fonts::{FontError, Fonts};
 pub use gpu::{Gpu, GpuError, Painter, WindowGpu};
 pub use host::{HostConfig, run};
+pub use pixels::{PixelDraw, PixelPainter, PixelSurface};
 pub use scene::{Effect, Scene, SceneFrame};
 pub use theme::GuiTheme;

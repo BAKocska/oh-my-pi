@@ -26,7 +26,7 @@ use crate::{
 	Error, Result,
 	event::{Frame, SharedState, WebViewEvent},
 	input::Input,
-	options::PageOptions,
+	options::{FrameFormat, PageOptions},
 };
 
 /// How long [`spawn`] waits for the driver to become operational.
@@ -208,9 +208,74 @@ pub fn data_url(html: &str) -> Str {
 	fmts!("data:text/html;base64,{}", base64::encode(html))
 }
 
-/// Decode a PNG image (screencast frame or screenshot) into tightly packed
-/// RGBA8 rows, expanding RGB/grayscale and normalizing palette/16-bit inputs.
-pub fn decode_png(data: &[u8]) -> Result<Frame> {
+/// Decode one captured frame (screencast or screenshot) into tightly packed
+/// RGBA8 rows.
+pub fn decode_frame(format: FrameFormat, data: &[u8]) -> Result<Frame> {
+	match format {
+		FrameFormat::Png => decode_png(data),
+		FrameFormat::Jpeg { .. } => decode_jpeg(data),
+	}
+}
+
+/// Tight bounding box `[x, y, w, h]` (pixels) of everything differing
+/// between two same-sized RGBA8 frames; `None` when they are identical.
+///
+/// Row extent first (whole-row `memcmp`s), then columns trimmed within the
+/// changed band only — for typical small damage (caret blink, hover) this
+/// touches a few rows beyond the initial scan.
+pub fn damage_rect(prev: &[u8], next: &[u8], width: u32) -> Option<[u32; 4]> {
+	debug_assert_eq!(prev.len(), next.len());
+	let stride = width as usize * 4;
+	if stride == 0 || prev.len() != next.len() {
+		return None;
+	}
+	let rows = next.len() / stride;
+	fn row(buf: &[u8], r: usize, stride: usize) -> &[u8] {
+		&buf[r * stride..(r + 1) * stride]
+	}
+	let top = (0..rows).find(|&r| row(prev, r, stride) != row(next, r, stride))?;
+	// `top` differs, so the reverse scan always terminates there.
+	let bottom = (top..rows)
+		.rev()
+		.find(|&r| row(prev, r, stride) != row(next, r, stride))
+		.unwrap_or(top);
+	let (mut left, mut right) = (usize::MAX, 0);
+	for r in top..=bottom {
+		let (p, n) = (row(prev, r, stride), row(next, r, stride));
+		if p == n {
+			continue;
+		}
+		// Positions exist: the rows compare unequal.
+		if let Some(first) = p.iter().zip(n).position(|(a, b)| a != b) {
+			left = left.min(first);
+		}
+		if let Some(last) = p.iter().zip(n).rposition(|(a, b)| a != b) {
+			right = right.max(last);
+		}
+	}
+	let x0 = (left / 4) as u32;
+	let x1 = (right / 4) as u32;
+	Some([x0, top as u32, x1 - x0 + 1, (bottom - top + 1) as u32])
+}
+
+/// Decode a JPEG straight to RGBA8 (single pass; no expansion copy).
+fn decode_jpeg(data: &[u8]) -> Result<Frame> {
+	let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+		.jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+	let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), options);
+	let pixels = decoder
+		.decode()
+		.map_err(|err| Error::Protocol(fmts!("jpeg: {err:?}")))?;
+	let (width, height) = decoder
+		.dimensions()
+		.ok_or_else(|| Error::Protocol("jpeg: missing dimensions".to_str()))?;
+	let (width, height) = (width as u32, height as u32);
+	Ok(Frame { width, height, data: Bytes::from(pixels), damage: [0, 0, width, height] })
+}
+
+/// Decode a PNG into RGBA8, expanding RGB/grayscale and normalizing
+/// palette/16-bit inputs.
+fn decode_png(data: &[u8]) -> Result<Frame> {
 	let protocol = |err: png::DecodingError| Error::Protocol(fmts!("png: {err}"));
 	let mut decoder = png::Decoder::new(Cursor::new(data));
 	// Expand palette/low-bit images and strip 16-bit samples down to 8.
@@ -248,7 +313,12 @@ pub fn decode_png(data: &[u8]) -> Result<Frame> {
 		},
 		other => return Err(Error::Protocol(fmts!("png: unsupported color type {other:?}"))),
 	};
-	Ok(Frame { width: info.width, height: info.height, data: Bytes::from(data) })
+	Ok(Frame {
+		width:  info.width,
+		height: info.height,
+		data:   Bytes::from(data),
+		damage: [0, 0, info.width, info.height],
+	})
 }
 
 #[cfg(test)]
@@ -265,6 +335,31 @@ mod tests {
 		writer.write_image_data(pixels).unwrap();
 		drop(writer);
 		out
+	}
+
+	#[test]
+	fn damage_rect_identical_frames_yield_none() {
+		let frame = vec![7_u8; 4 * 3 * 4];
+		assert_eq!(damage_rect(&frame, &frame.clone(), 4), None);
+	}
+
+	#[test]
+	fn damage_rect_tightens_to_a_single_pixel() {
+		let prev = vec![0_u8; 4 * 3 * 4];
+		let mut next = prev.clone();
+		// Pixel (2, 1).
+		next[(4 + 2) * 4 + 1] = 0xff;
+		assert_eq!(damage_rect(&prev, &next, 4), Some([2, 1, 1, 1]));
+	}
+
+	#[test]
+	fn damage_rect_bounds_scattered_changes() {
+		let prev = vec![0_u8; 4 * 3 * 4];
+		let mut next = prev.clone();
+		// Pixels (0, 0) and (3, 2): the box must span both.
+		next[0] = 1;
+		next[(2 * 4 + 3) * 4 + 3] = 1;
+		assert_eq!(damage_rect(&prev, &next, 4), Some([0, 0, 4, 3]));
 	}
 
 	#[test]
@@ -293,5 +388,24 @@ mod tests {
 	#[test]
 	fn decode_png_rejects_garbage() {
 		assert!(decode_png(b"not a png").is_err());
+	}
+
+	#[test]
+	fn decode_jpeg_yields_rgba_pixels() {
+		// 8x8 solid red, quality 90 (sips-encoded fixture).
+		let jpeg = include_bytes!("fixture-red-8x8.jpg");
+		let frame = decode_frame(FrameFormat::Jpeg { quality: 90 }, jpeg).unwrap();
+		assert_eq!((frame.width, frame.height), (8, 8));
+		assert_eq!(frame.data.len(), 8 * 8 * 4);
+		for px in frame.data.as_chunks::<4>().0 {
+			// Lossy: red should dominate, alpha must be opaque.
+			assert!(px[0] > 0xf0 && px[1] < 0x10 && px[2] < 0x10, "not red: {px:?}");
+			assert_eq!(px[3], 0xff);
+		}
+	}
+
+	#[test]
+	fn decode_jpeg_rejects_garbage() {
+		assert!(decode_frame(FrameFormat::Jpeg { quality: 90 }, b"not a jpeg").is_err());
 	}
 }

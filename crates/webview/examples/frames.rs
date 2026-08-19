@@ -22,10 +22,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let view = WebViewBuilder::new(engine)
 		.url(&url)
 		.build_frames(FrameConfig {
-			width:   800,
-			height:  600,
-			scale:   1.0,
+			width: 800,
+			height: 600,
+			scale: 1.0,
 			fps_cap: Some(10.0),
+			..FrameConfig::default()
 		})?;
 
 	let deadline = Instant::now() + Duration::from_secs(10);

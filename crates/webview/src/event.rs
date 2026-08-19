@@ -18,6 +18,15 @@ pub struct Frame {
 	pub height: u32,
 	/// `width * height * 4` bytes of RGBA8 pixel data (O(1) to clone).
 	pub data:   Bytes,
+	/// Bounding box `[x, y, w, h]` (device px) of everything that changed
+	/// since the *previously delivered* frame; the full frame on first
+	/// delivery and after a resize.
+	///
+	/// `data` always holds the complete frame — `damage` is an upload hint:
+	/// a host keeping the previous frame in a texture may upload only this
+	/// region. Skipping frames requires uploading the union of the skipped
+	/// frames' damage.
+	pub damage: [u32; 4],
 }
 
 /// Something happened inside the web surface.

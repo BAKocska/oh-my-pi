@@ -286,6 +286,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_F
 wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["prefix-symbols", "stream", "tokio-rt", "webpki-roots"] }
 zip = { version = "6", default-features = false, features = ["deflate"] }
 zerocopy = { version = "0.8", features = ["derive"] }
+zune-jpeg = "0.5"
 zeroize = { version = "1.9", features = ["derive"] }
 zstd = "0.13"
 xutf = "1.1"

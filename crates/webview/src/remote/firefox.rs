@@ -6,8 +6,11 @@
 //! this driver:
 //!
 //! - There is no screencast API, so `frames` surfaces poll
-//!   `browsingContext.captureScreenshot` on a timer (default 10 fps) and
-//!   suppress byte-identical frames rather than receiving compositor pushes.
+//!   `browsingContext.captureScreenshot` — dirty-driven, not blind: a preload
+//!   script signals page changes over a `BiDi` channel and polling runs at full
+//!   rate (fps cap, default 10) only while captures keep changing, falling back
+//!   to a 1 Hz safety net for silent changes (canvas, video). A client-side
+//!   diff suppresses unchanged frames and attaches tight damage rects.
 //! - There is no `chrome --app` equivalent, so `window` surfaces show a normal
 //!   Firefox window including its browser chrome.
 //!
@@ -18,7 +21,7 @@
 use std::{
 	path::{Path, PathBuf},
 	process::Stdio,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -30,8 +33,11 @@ use crate::{
 	Error, Result,
 	event::{SharedState, WebViewEvent},
 	input::{Input, Key, Modifiers, MouseButton},
-	options::{FrameConfig, PageOptions, WindowConfig},
-	remote::{Command, DriverCtx, ProfileDir, data_url, decode_png, resolve_profile, ws::WsLink},
+	options::{FrameConfig, FrameFormat, PageOptions, WindowConfig},
+	remote::{
+		Command, DriverCtx, ProfileDir, damage_rect, data_url, decode_frame, resolve_profile,
+		ws::WsLink,
+	},
 };
 
 /// How long to wait for the `BiDi` port file after spawning the browser.
@@ -47,6 +53,23 @@ const MAX_SHOT_FAILURES: u32 = 10;
 
 /// Preload-script channel name carrying `window.ipc.postMessage` payloads.
 const IPC_CHANNEL: &str = "omp-ipc";
+
+/// Preload-script channel signalling likely page changes (frames surfaces).
+const DIRTY_CHANNEL: &str = "omp-dirty";
+
+/// Preload script marking the page dirty on mutations, scroll, input, and
+/// animation starts (throttled page-side). Long-running animations need no
+/// repeat signals: a capture that finds damage keeps the poller hot.
+const DIRTY_SCRIPT: &str =
+	"(chan)=>{let last=0;const mark=()=>{const t=Date.now();if(t-last>40){last=t;chan('d')}};new \
+	 MutationObserver(mark).observe(document,{subtree:true,childList:true,attributes:true,\
+	 characterData:true});for(const ev of \
+	 ['scroll','input','pointermove','pointerdown','keydown','wheel','transitionrun','\
+	 animationstart','load','resize'])addEventListener(ev,mark,{capture:true,passive:true});}";
+
+/// Idle safety-net poll period, catching silent changes (canvas, WebGL,
+/// video) that fire no DOM events; one damaged capture re-arms full rate.
+const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// `WebDriver` modifier codepoints (left-hand variants; the right-hand set at
 /// `\u{e050}..` normalizes to the same modifier keys).
@@ -123,7 +146,16 @@ async fn drive(binary: PathBuf, surface: Surface, ctx: DriverCtx) -> Result<()> 
 						graceful = false;
 						break;
 					},
-			_ = ticker.tick(), if frames => driver.capture(&mut link).await?,
+			_ = ticker.tick(), if frames => {
+				// Capture only when the page signalled a change (or on the idle
+				// safety-net cadence); a changed capture keeps the rate hot.
+				let due = driver.dirty
+					|| driver.last_capture.is_none_or(|at| at.elapsed() >= IDLE_POLL);
+				if due {
+					driver.last_capture = Some(Instant::now());
+					driver.dirty = driver.capture(&mut link).await?;
+				}
+			},
 		}
 		// Load events request a title refresh instead of issuing a nested
 		// command from event dispatch; service it between pump iterations.
@@ -195,7 +227,10 @@ async fn setup(
 		top: Str::default(),
 		next_id: 0,
 		scale: 1.0,
+		format: FrameFormat::Png,
 		closed: false,
+		dirty: true,
+		last_capture: None,
 		title_refresh: false,
 		last_frame: None,
 		shot_failures: 0,
@@ -253,6 +288,19 @@ async fn setup(
 
 	if let Surface::Frames(config) = surface {
 		driver.scale = config.scale;
+		driver.format = config.format;
+		// Dirty-signal preload: lets the poller idle on static pages instead
+		// of burning a Gecko snapshot + JPEG encode per tick.
+		driver
+			.call(
+				&mut link,
+				"script.addPreloadScript",
+				json!({
+					"functionDeclaration": DIRTY_SCRIPT,
+					"arguments": [{ "type": "channel", "value": { "channel": DIRTY_CHANNEL } }],
+				}),
+			)
+			.await?;
 		driver
 			.call(
 				&mut link,
@@ -333,8 +381,15 @@ struct Driver {
 	next_id:       u64,
 	/// Device scale factor reapplied on [`Command::Resize`].
 	scale:         f64,
+	/// Wire encoding for polled screenshots.
+	format:        FrameFormat,
 	/// Set once the top context is destroyed; the pump exits on it.
 	closed:        bool,
+	/// A page change was signalled; capture at full rate until a poll comes
+	/// back unchanged.
+	dirty:         bool,
+	/// When the last screenshot was requested (idle safety-net pacing).
+	last_capture:  Option<Instant>,
 	/// Set by load events; the pump refreshes the title between iterations.
 	title_refresh: bool,
 	/// Last delivered frame pixels, for duplicate suppression.
@@ -402,15 +457,20 @@ impl Driver {
 					let _ = self.events.send(WebViewEvent::LoadFinished(url.to_str()));
 				}
 				self.title_refresh = true;
+				self.dirty = true;
 			},
 			"browsingContext.contextDestroyed" if ours => self.closed = true,
 			"script.message" => {
 				// Keyed by channel, not context: subframe realms of our page
 				// share the preload shim and may post too.
-				if params["channel"].as_str() == Some(IPC_CHANNEL)
-					&& let Some(payload) = params["data"]["value"].as_str()
-				{
-					let _ = self.events.send(WebViewEvent::Ipc(payload.to_str()));
+				match params["channel"].as_str() {
+					Some(IPC_CHANNEL) => {
+						if let Some(payload) = params["data"]["value"].as_str() {
+							let _ = self.events.send(WebViewEvent::Ipc(payload.to_str()));
+						}
+					},
+					Some(DIRTY_CHANNEL) => self.dirty = true,
+					_ => {},
 				}
 			},
 			_ => {},
@@ -431,6 +491,8 @@ impl Driver {
 
 	/// Execute one command from the public handle.
 	async fn handle(&mut self, link: &mut WsLink, cmd: Command) -> Result<()> {
+		// Every command can change what the page shows; poll promptly.
+		self.dirty = true;
 		match cmd {
 			Command::Navigate(url) => self.navigate(link, &url).await,
 			Command::LoadHtml(html) => self.navigate(link, &data_url(&html)).await,
@@ -445,18 +507,22 @@ impl Driver {
 				.call(link, "browsingContext.activate", json!({ "context": self.top }))
 				.await
 				.map(drop),
-			Command::Resize { width, height } => self
-				.call(
-					link,
-					"browsingContext.setViewport",
-					json!({
-						"context": self.top,
-						"viewport": { "width": width, "height": height },
-						"devicePixelRatio": self.scale,
-					}),
-				)
-				.await
-				.map(drop),
+			Command::Resize { width, height } => {
+				// The viewport changed; the next capture is a full redraw.
+				self.last_frame = None;
+				self
+					.call(
+						link,
+						"browsingContext.setViewport",
+						json!({
+							"context": self.top,
+							"viewport": { "width": width, "height": height },
+							"devicePixelRatio": self.scale,
+						}),
+					)
+					.await
+					.map(drop)
+			},
 			Command::Input(input) => self.input(link, input).await,
 			// The pump breaks on Close before dispatching here.
 			Command::Close => Ok(()),
@@ -559,9 +625,10 @@ impl Driver {
 		Ok(())
 	}
 
-	/// Poll one screenshot, decode it, and emit a frame unless it is
-	/// byte-identical to the previous one.
-	async fn capture(&mut self, link: &mut WsLink) -> Result<()> {
+	/// Poll one screenshot, decode it, and emit a frame unless nothing
+	/// changed; returns whether the page content changed (or the capture
+	/// transiently failed and should be retried promptly).
+	async fn capture(&mut self, link: &mut WsLink) -> Result<bool> {
 		let result = self
 			.call(
 				link,
@@ -569,7 +636,13 @@ impl Driver {
 				json!({
 					"context": self.top,
 					"origin": "viewport",
-					"format": { "type": "image/png" },
+					"format": match self.format {
+						FrameFormat::Png => json!({ "type": "image/png" }),
+						FrameFormat::Jpeg { quality } => json!({
+							"type": "image/jpeg",
+							"quality": f64::from(quality.clamp(1, 100)) / 100.0,
+						}),
+					},
 				}),
 			)
 			.await;
@@ -582,7 +655,7 @@ impl Driver {
 				if self.shot_failures >= MAX_SHOT_FAILURES {
 					return Err(Error::Protocol(err));
 				}
-				return Ok(());
+				return Ok(true);
 			},
 			Err(err) => return Err(err),
 		};
@@ -593,13 +666,22 @@ impl Driver {
 		let raw = base64::decode(data.as_bytes())
 			.into_vec()
 			.map_err(|err| Error::Protocol(fmts!("screenshot base64: {err}")))?;
-		let frame = decode_png(&raw)?;
-		if self.last_frame.as_ref() == Some(&frame.data) {
-			return Ok(());
+		let mut frame = decode_frame(self.format, &raw)?;
+		match &self.last_frame {
+			Some(prev) if prev.len() == frame.data.len() => {
+				// Polling has no damage signal at all; the diff both drops
+				// unchanged captures and tightens the upload hint.
+				match damage_rect(prev, &frame.data, frame.width) {
+					Some(rect) => frame.damage = rect,
+					None => return Ok(false),
+				}
+			},
+			// First capture or a size change: full damage (decoder default).
+			_ => {},
 		}
 		self.last_frame = Some(frame.data.clone());
 		let _ = self.events.send(WebViewEvent::Frame(frame));
-		Ok(())
+		Ok(true)
 	}
 
 	/// Forward one synthetic input event via `input.performActions`.

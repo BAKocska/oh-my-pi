@@ -54,6 +54,31 @@ pub struct PageOptions {
 	pub devtools:     bool,
 }
 
+/// Wire encoding for captured frames.
+///
+/// The engine compresses every frame before it crosses the automation
+/// socket; the codec choice trades pixel exactness against encode/decode
+/// cost and wire size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+	/// Lossless; markedly more expensive to encode in-engine and to decode.
+	Png,
+	/// Lossy DCT compression; the fast path for live compositing.
+	Jpeg {
+		/// Quality in `1..=100`.
+		quality: u8,
+	},
+}
+
+impl Default for FrameFormat {
+	/// Quality 80 — Chromium's own screencast default — is visually clean
+	/// for UI content at a fraction of PNG's cost and ~2.5x smaller than
+	/// quality 90.
+	fn default() -> Self {
+		Self::Jpeg { quality: 80 }
+	}
+}
+
 /// Configuration for a [`frames`](crate::WebViewBuilder::build_frames) surface.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameConfig {
@@ -67,11 +92,19 @@ pub struct FrameConfig {
 	/// choose: Chromium delivers every compositor frame; Firefox (which has no
 	/// screencast and is polled via screenshots) defaults to 10 fps.
 	pub fps_cap: Option<f32>,
+	/// Frame wire encoding; see [`FrameFormat`].
+	pub format:  FrameFormat,
 }
 
 impl Default for FrameConfig {
 	fn default() -> Self {
-		Self { width: 1280, height: 800, scale: 1.0, fps_cap: None }
+		Self {
+			width:   1280,
+			height:  800,
+			scale:   1.0,
+			fps_cap: None,
+			format:  FrameFormat::default(),
+		}
 	}
 }
 

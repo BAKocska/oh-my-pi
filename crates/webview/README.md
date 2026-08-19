@@ -23,7 +23,14 @@ the host.
   composites itself (GPU texture, terminal images, …); input is forwarded
   explicitly with `WebView::input`. Chromium delivers compositor-paced
   screencast frames; Firefox has no screencast, so it is screenshot-polled
-  (default 10 fps).
+  (default 10 fps). Frames cross the automation socket compressed
+  (`FrameFormat`: JPEG quality 80 by default — Chromium's own screencast
+  default; PNG for pixel-exact needs) and are decoded straight to RGBA.
+  Every delivered frame carries a client-side `damage` rect (tight diff vs.
+  the previous frame) so hosts upload only what changed; unchanged captures
+  are suppressed entirely. Firefox polling is dirty-driven: a preload script
+  signals page changes, so a static page costs zero captures (1 Hz safety
+  net for silent canvas/video changes).
 - **window** — an engine-owned OS window (`chrome --app`-style; Firefox shows
   normal browser chrome).
 

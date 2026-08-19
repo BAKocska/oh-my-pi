@@ -25,6 +25,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+zune-jpeg = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { workspace = true }

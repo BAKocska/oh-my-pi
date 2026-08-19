@@ -461,20 +461,8 @@ impl Painter {
 	}
 
 	fn write_region(gpu: &Gpu, tex: &wgpu::Texture, region: &AtlasRegion, bpp: u32) {
-		let row_bytes = region.width * bpp;
-		let aligned = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-		let data;
-		let bytes: &[u8] = if aligned == row_bytes {
-			&region.data
-		} else {
-			let mut padded = vec![0_u8; (aligned * region.height) as usize];
-			for row in 0..region.height as usize {
-				let src = &region.data[row * row_bytes as usize..(row + 1) * row_bytes as usize];
-				padded[row * aligned as usize..][..row_bytes as usize].copy_from_slice(src);
-			}
-			data = padded;
-			&data
-		};
+		// Tight rows are fine: `Queue::write_texture` stages internally and
+		// repacks unaligned rows itself; pre-padding would add a copy.
 		gpu.queue.write_texture(
 			wgpu::TexelCopyTextureInfo {
 				texture:   tex,
@@ -482,10 +470,10 @@ impl Painter {
 				origin:    wgpu::Origin3d { x: region.x, y: region.y, z: 0 },
 				aspect:    wgpu::TextureAspect::All,
 			},
-			bytes,
+			&region.data,
 			wgpu::TexelCopyBufferLayout {
 				offset:         0,
-				bytes_per_row:  Some(aligned),
+				bytes_per_row:  Some(region.width * bpp),
 				rows_per_image: Some(region.height),
 			},
 			wgpu::Extent3d {

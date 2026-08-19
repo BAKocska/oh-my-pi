@@ -82,7 +82,7 @@ pub use crate::{
 	event::{Frame, WebViewEvent},
 	geometry::Rect,
 	input::{Input, Key, Modifiers, MouseButton},
-	options::{EngineKind, FrameConfig, SurfaceKind, WindowConfig},
+	options::{EngineKind, FrameConfig, FrameFormat, SurfaceKind, WindowConfig},
 };
 use crate::{
 	event::SharedState,

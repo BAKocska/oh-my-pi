@@ -17,6 +17,13 @@ shell.
 - `cells` is the compositor: it walks the document `Frame`'s visible window
   plus declarative `Layer` bands and emits rect/glyph instances, resolving
   `Style` attributes (reverse, dim, underline, strikethrough, wide graphemes).
+- `pixels` bridges externally rendered content into the frame: a
+  `PixelSurface` keeps one GPU texture current from CPU-side RGBA frames
+  (an embedded browser via `omp-webview` frames surfaces, video, any
+  offscreen producer) — full frames or damage-rect regions, tight rows
+  straight to `write_texture` — and a `PixelPainter` composites surfaces as
+  premultiplied gamma-space quads over or under the cell pass (see
+  `examples/browser.rs`, including its `--delta` readback proof).
 - `scene` is the host contract: a `Scene` produces `SceneFrame`s and routes
   input; `mux` is the pure split-tree layout; `host` is the winit shell that
   drives windows → tabs → split panes (one scene per pane) — window
