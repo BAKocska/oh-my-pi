@@ -16,6 +16,8 @@ tonic = ["dep:tonic", "dep:tonic-prost"]
 bytes = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 

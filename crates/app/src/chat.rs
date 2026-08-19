@@ -850,6 +850,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		let exit = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
+			Arc::clone(&scope.registry),
 			auth.as_ref().map(|worker| &worker.ui),
 			data_dir.clone(),
 			|| {
@@ -1011,7 +1012,7 @@ fn open_session(
 		None => Str::from(ulid::Ulid::generate().to_string()),
 	};
 	let path = sessions_dir.join(format!("{}.jsonl", id.as_str()));
-	let journal = if resume.is_some() {
+	let (journal, initial_items) = if resume.is_some() {
 		validate_session_file(&path).map_err(|source| {
 			if source.kind() == std::io::ErrorKind::NotFound {
 				ChatError::MissingResume(id.clone())
@@ -1020,23 +1021,28 @@ fn open_session(
 			}
 		})?;
 		let journal = Journal::open(&path)?;
-		let log = journal.load()?;
-		if log.header().id.0 != id {
+		let view = journal.load()?;
+		if view.header().id.0 != id {
 			return Err(ChatError::SessionMismatch(id));
 		}
-		if log.header().cwd != root {
+		if view.header().cwd != root {
 			return Err(ChatError::SessionProjectMismatch { session: id });
 		}
-		journal
+		let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
+		drop(view);
+		(journal, initial_items)
 	} else {
-		Journal::create(&path, &Header {
+		let journal = Journal::create(&path, &Header {
 			v:       4,
 			id:      SessionId(id.clone()),
 			created: now_ms(),
 			cwd:     root.to_owned(),
-		})?
+		})?;
+		let view = journal.load()?;
+		let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
+		drop(view);
+		(journal, initial_items)
 	};
-	let initial_items = project_journal(&journal.load()?, registry, &CHAT_CAPS_BASE)?.items;
 	Ok(Session { id, journal, initial_items })
 }
 

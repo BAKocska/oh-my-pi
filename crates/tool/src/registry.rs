@@ -17,8 +17,10 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-	Abort, CallOutcome, Constraint, GrammarSyntax, IncomingParams, LiftedCall, Part, Presentation,
-	PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool, ToolIdentity,
+	Abort, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError, CallOutcome, Constraint, GrammarSyntax,
+	IncomingParams, LiftedCall, Part, Presentation, PromptCaps, RecordedCall, RecordedCallOwned,
+	Rev, Tool, ToolIdentity,
+	render::{Render, RenderEntry, RenderRegistry, RenderRegistryError, ViewState},
 };
 
 /// Catalog capabilities needed for deterministic tool lowering.
@@ -488,14 +490,85 @@ struct RegistryEntry {
 /// revision per stable name.
 #[derive(Default)]
 pub struct Registry {
-	versions: BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
-	live:     BTreeMap<Str, Claim>,
+	versions:  BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
+	live:      BTreeMap<Str, Claim>,
+	arg_specs: ArgSpecRegistry,
+	renderers: RenderRegistry,
 }
 
 impl Registry {
 	/// Creates an empty registry.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Registers one argument declaration for one exact revision.
+	pub fn register_arg_spec(
+		&mut self,
+		rev: Rev,
+		spec: ArgSpec,
+	) -> Result<(), ArgSpecRegistryError> {
+		self.arg_specs.register(rev, spec)
+	}
+
+	/// Seals argument declarations against every later mutation.
+	pub fn seal_arg_specs(&mut self) {
+		self.arg_specs.seal();
+	}
+
+	/// Borrows one exact-revision argument declaration by canonical or alias
+	/// path.
+	#[must_use]
+	pub fn arg_spec(&self, rev: &Rev, path: &[crate::ArgPath]) -> Option<&ArgSpec> {
+		self.arg_specs.get(rev, path)
+	}
+
+	/// Registers one pure renderer for one exact tool identity.
+	pub fn register_renderer<R: Render>(
+		&mut self,
+		identity: ToolIdentity,
+		renderer: R,
+	) -> Result<(), RenderRegistryError> {
+		self.renderers.register(identity, renderer)
+	}
+
+	/// Borrows the exact-revision renderer registry.
+	#[must_use]
+	pub const fn render_registry(&self) -> &RenderRegistry {
+		&self.renderers
+	}
+
+	/// Mutably borrows renderer registration storage during composition.
+	///
+	/// Renderer entries remain excluded from every execution and prompt hash.
+	pub const fn render_registry_mut(&mut self) -> &mut RenderRegistry {
+		&mut self.renderers
+	}
+
+	/// Borrows a cached renderer for one exact identity.
+	#[must_use]
+	pub fn renderer(&self, identity: &ToolIdentity) -> Option<RenderEntry<'_>> {
+		self.renderers.get(identity)
+	}
+
+	/// Folds one serialized update through an exact-revision renderer.
+	pub fn fold_render(
+		&self,
+		identity: &ToolIdentity,
+		state: &mut ViewState,
+		update: Bytes,
+	) -> Result<(), RenderRegistryError> {
+		self.renderers.fold(identity, state, update)
+	}
+
+	/// Renders an exact-revision fold or the generic built-in fallback.
+	pub fn render_view(
+		&self,
+		identity: &ToolIdentity,
+		state: &ViewState,
+		outcome: Option<&[u8]>,
+	) -> Result<Str, RenderRegistryError> {
+		self.renderers.view(identity, state, outcome)
 	}
 
 	/// Registers a typed tool under one presentation and claimant.
@@ -695,12 +768,13 @@ impl Registry {
 	pub fn invoke<'a>(
 		&'a self,
 		name: &str,
-		params: IncomingParams<'a>,
+		mut params: IncomingParams<'a>,
 	) -> Result<ErasedStream<'a>, RegistryError> {
 		let entry = self.live_entry(name)?;
 		if entry.tool.route() == ToolRoute::Worker {
 			return Err(external_error(entry.tool.spec(), "invoke"));
 		}
+		params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
 		Ok(entry.tool.call(params))
 	}
 

@@ -34,6 +34,8 @@
 // Re-exported so consumers use the same `prost` the codegen targeted
 // (the `Message` trait is needed for encode/decode).
 pub use prost;
+/// Allocation-free bounds checks for extension-facing protobuf frames.
+pub mod bounds;
 
 /// Current wire-visible protobuf schema revision.
 ///

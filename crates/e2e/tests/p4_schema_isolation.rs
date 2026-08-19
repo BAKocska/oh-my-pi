@@ -424,7 +424,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		matches!(without_lift.project(recorded.clone()), omp_tool::ProjectedCall::Data(data) if data == recorded)
 	);
 
-	let data = project_journal(&log, &without_lift, &CAPS_BASE)
+	let data = project_journal(&log, log.as_ref(), &without_lift, &CAPS_BASE)
 		.expect("unliftable historical revision projects as canonical data");
 	let recorded_schema = original.items[0]
 		.props
@@ -497,15 +497,16 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		serde_json::to_vec(lifted_schema.as_value()).expect("lifted schema serializes"),
 		HL2_SCHEMA
 	);
-	let first = project_journal(&log, &with_lift, &CAPS_BASE)
+	let first = project_journal(&log, log.as_ref(), &with_lift, &CAPS_BASE)
 		.expect("recorded hl.1 truth lifts to live hl.2");
-	let second =
-		project_journal(&log, &with_lift, &CAPS_BASE).expect("unchanged journal reprojects");
+	let second = project_journal(&log, log.as_ref(), &with_lift, &CAPS_BASE)
+		.expect("unchanged journal reprojects");
 	assert_eq!(
 		first.encode_to_vec(),
 		second.encode_to_vec(),
 		"projection of an unchanged transcript must be byte-identical"
 	);
+	drop(log);
 	assert_eq!(
 		first.items.len(),
 		original.items.len(),
@@ -639,12 +640,12 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		matches!(outcome.event, Some(pb::turn_event::Event::Outcome(_))),
 		"scripted upstream must consume the accepted full history"
 	);
-	assert_eq!(
-		expected_full,
-		project_journal(&log, &registry(true), &CAPS_BASE)
+	let projected_full = {
+		let log = journal.load().expect("load persisted transcript fixture");
+		project_journal(&log, log.as_ref(), &registry(true), &CAPS_BASE)
 			.expect("accepted history remains projectable")
-			.encode_to_vec()
-	);
+	};
+	assert_eq!(expected_full, projected_full.encode_to_vec());
 	gateway
 		.shutdown()
 		.await

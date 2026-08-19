@@ -11,25 +11,18 @@ use std::{
 	fs::File,
 	io::{self, Read},
 	path::{Path, PathBuf},
-	sync::{
-		LazyLock,
-		atomic::{AtomicU64, Ordering},
-	},
+	sync::LazyLock,
 	time::{Duration, Instant},
 };
 
 use grep_matcher::Matcher;
 use grep_pcre2::{RegexMatcher as PcreMatcher, RegexMatcherBuilder as PcreMatcherBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{
-	BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
-};
 use omp_core::Str;
 use omp_walker::{
 	CompiledWalkGlob, DirectoryErrorMode, FileCandidate, FollowLinks, SizeHintPolicy, WalkDetail,
-	WalkFilter, WalkOrder, WalkRequest, execute_candidates_init,
+	WalkFilter, WalkOrder, WalkRequest,
 };
-use parking_lot::Mutex;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -199,138 +192,397 @@ pub enum GrepError {
 		timeout_ms: u32,
 	},
 }
+/// Regex-engine options used when compiling a [`CompiledGrep`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegexOptions {
+	/// Match without regard to case.
+	pub ignore_case: bool,
+	/// Permit matches to span line boundaries.
+	pub multiline:   bool,
+}
 
+/// Per-buffer controls for [`CompiledGrep::search_slice`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamOptions {
+	/// Maximum number of records emitted from this buffer.
+	pub max_count:      Option<u64>,
+	/// Number of complete source lines exposed before a match.
+	pub context_before: u32,
+	/// Number of complete source lines exposed after a match.
+	pub context_after:  u32,
+}
+
+/// Backpressure decision returned by a [`GrepSink`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SearchParams {
-	context_before:     u32,
-	context_after:      u32,
-	max_columns:        Option<u32>,
-	mode:               GrepOutputMode,
-	max_count:          Option<u64>,
-	max_count_per_file: Option<u64>,
-	multiline:          bool,
+pub enum GrepControl {
+	/// Continue searching.
+	Continue,
+	/// Stop successfully after the current callback.
+	Stop,
+	/// Stop because the caller cancelled the operation.
+	Cancel,
 }
 
+/// Why a streaming search ended.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GrepStreamStatus {
+	/// The complete requested input was searched.
+	#[default]
+	Complete,
+	/// The sink requested an early successful stop.
+	Stopped,
+	/// The sink reported cancellation.
+	Cancelled,
+	/// A configured match limit stopped the search.
+	LimitReached,
+}
+
+/// Statistics from a streaming search.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GrepStreamSummary {
+	/// Number of match records delivered to the sink.
+	pub matches:            u64,
+	/// Number of searched files containing at least one match.
+	pub files_with_matches: u64,
+	/// Number of files successfully read and searched.
+	pub files_searched:     u64,
+	/// Oversized files whose bounded leading window could not be read.
+	pub skipped_oversized:  u64,
+	/// Why the search ended.
+	pub status:             GrepStreamStatus,
+}
+
+/// One borrowed exact regex match.
+///
+/// Every byte slice borrows the searched input and remains valid only for the
+/// duration of the sink callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrepMatchRef<'a> {
+	/// Caller-provided display path.
+	pub path:                 &'a str,
+	/// One-based line containing the first byte of the match.
+	pub line_number:          u64,
+	/// Absolute byte offset of the first byte of the match.
+	pub byte_offset:          u64,
+	/// Absolute byte offset immediately after the match.
+	pub match_end:            u64,
+	/// Absolute byte offset of the containing line.
+	pub line_byte_offset:     u64,
+	/// Complete containing line, excluding its line-feed delimiter.
+	pub line_bytes:           &'a [u8],
+	/// Exact bytes selected by the regex.
+	pub matched_bytes:        &'a [u8],
+	/// Contiguous complete lines preceding the containing line.
+	pub context_before_bytes: &'a [u8],
+	/// One-based line number of the first line in `context_before_bytes`.
+	pub context_before_line:  u64,
+	/// Contiguous complete lines following all lines touched by the match.
+	pub context_after_bytes:  &'a [u8],
+	/// One-based line number of the first line in `context_after_bytes`.
+	pub context_after_line:   u64,
+}
+
+/// Synchronous, backpressured receiver for streaming grep records.
+///
+/// [`GrepSink::control`] is called between records and is the cancellation
+/// heartbeat. Returning from [`GrepSink::matched`] provides backpressure
+/// without allocating a channel or erased future.
+pub trait GrepSink {
+	/// Error raised by this sink.
+	type Error;
+
+	/// Check for cancellation or an out-of-band early stop.
+	fn control(&mut self) -> Result<GrepControl, Self::Error> {
+		Ok(GrepControl::Continue)
+	}
+
+	/// Consume one borrowed match.
+	fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error>;
+}
+
+/// Error from a compiled streaming search.
 #[derive(Debug)]
-struct CollectedMatch {
-	line_number:    u64,
-	line:           Str,
-	context_before: SmallVec<ContextLine, 8>,
-	context_after:  SmallVec<ContextLine, 8>,
-	truncated:      bool,
+pub enum GrepStreamError<E> {
+	/// Matcher, traversal, read, or deadline failure.
+	Grep(GrepError),
+	/// Failure returned by the caller's sink.
+	Sink(E),
 }
 
-struct SearchResultInternal {
-	matches:       Vec<CollectedMatch>,
-	match_count:   u64,
-	limit_reached: bool,
-}
-
-#[derive(Debug)]
-struct FileSearchResult {
-	relative_path: Str,
-	matches:       Vec<CollectedMatch>,
-	match_count:   u64,
-	limit_reached: bool,
-}
-
-struct SearchWorker {
-	searcher: Searcher,
-	buffer:   Vec<u8>,
-}
-
-impl SearchWorker {
-	fn new(params: SearchParams) -> Self {
-		Self { searcher: build_searcher(params), buffer: Vec::new() }
-	}
-}
-
-struct MatchCollector {
-	matches:         Vec<CollectedMatch>,
-	match_count:     u64,
-	collected_count: u64,
-	max_count:       Option<u64>,
-	limit_reached:   bool,
-	max_columns:     Option<usize>,
-	collect_matches: bool,
-	context_before:  SmallVec<ContextLine, 8>,
-}
-
-impl MatchCollector {
-	const fn new(max_count: Option<u64>, max_columns: Option<usize>, collect_matches: bool) -> Self {
-		Self {
-			matches: Vec::new(),
-			match_count: 0,
-			collected_count: 0,
-			max_count,
-			limit_reached: false,
-			max_columns,
-			collect_matches,
-			context_before: SmallVec::new(),
+impl<E: fmt::Display> fmt::Display for GrepStreamError<E> {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Grep(error) => error.fmt(formatter),
+			Self::Sink(error) => write!(formatter, "grep sink failed: {error}"),
 		}
 	}
 }
 
-impl Sink for MatchCollector {
-	type Error = io::Error;
-
-	fn matched(
-		&mut self,
-		_searcher: &Searcher,
-		matched: &SinkMatch<'_>,
-	) -> Result<bool, Self::Error> {
-		self.match_count = self.match_count.saturating_add(1);
-		if self.limit_reached {
-			return Ok(false);
+impl<E> std::error::Error for GrepStreamError<E>
+where
+	E: std::error::Error + 'static,
+{
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::Grep(error) => Some(error),
+			Self::Sink(error) => Some(error),
 		}
+	}
+}
 
-		if self.collect_matches {
-			let (line, truncated) =
-				truncate_line(bytes_to_trimmed_str(matched.bytes()), self.max_columns);
-			self.matches.push(CollectedMatch {
-				line_number: matched.line_number().unwrap_or(0),
-				line,
-				context_before: std::mem::take(&mut self.context_before),
-				context_after: SmallVec::new(),
-				truncated,
-			});
-		} else {
-			self.context_before.clear();
-		}
+/// A compiled ripgrep-regex matcher with automatic PCRE2 fallback.
+///
+/// Compilation is performed once and the resulting matcher can be shared
+/// across file workers.
+pub struct CompiledGrep {
+	matcher: CompiledMatcher,
+}
 
-		self.collected_count = self.collected_count.saturating_add(1);
-		if self
-			.max_count
-			.is_some_and(|max| self.collected_count >= max)
-		{
-			self.limit_reached = true;
-		}
-		Ok(true)
+impl CompiledGrep {
+	/// Compile `pattern`, falling back to PCRE2 when Rust regex rejects it.
+	pub fn new(pattern: &str, options: RegexOptions) -> Result<Self, GrepError> {
+		let multiline = infer_multiline(pattern, options.multiline);
+		let matcher = build_matcher(pattern, options.ignore_case, multiline)?;
+		Ok(Self { matcher })
 	}
 
-	fn context(
-		&mut self,
-		_searcher: &Searcher,
-		context: &SinkContext<'_>,
-	) -> Result<bool, Self::Error> {
-		if !self.collect_matches {
-			return Ok(true);
+	/// Emit exact matches from one borrowed byte slice in offset order.
+	pub fn search_slice<S: GrepSink>(
+		&self,
+		path: &str,
+		content: &[u8],
+		options: StreamOptions,
+		sink: &mut S,
+	) -> Result<GrepStreamSummary, GrepStreamError<S::Error>> {
+		stream_search_slice(&self.matcher, path, content, options, sink)
+	}
+
+	/// Read and search one file with the crate's bounded full-read/prefix
+	/// policy.
+	///
+	/// Files larger than [`MAX_FILE_BYTES`] are searched through the same
+	/// bounded leading window used by [`grep`]. Unreadable and binary files emit
+	/// no records.
+	pub fn search_file<S: GrepSink>(
+		&self,
+		path: &Path,
+		display_path: &str,
+		options: StreamOptions,
+		sink: &mut S,
+	) -> Result<GrepStreamSummary, GrepStreamError<S::Error>> {
+		match sink.control().map_err(GrepStreamError::Sink)? {
+			GrepControl::Continue => {},
+			GrepControl::Stop => {
+				return Ok(GrepStreamSummary {
+					status: GrepStreamStatus::Stopped,
+					..GrepStreamSummary::default()
+				});
+			},
+			GrepControl::Cancel => {
+				return Ok(GrepStreamSummary {
+					status: GrepStreamStatus::Cancelled,
+					..GrepStreamSummary::default()
+				});
+			},
 		}
-		let kind = context.kind();
-		let (line, _) = truncate_line(bytes_to_trimmed_str(context.bytes()), self.max_columns);
-		let context_line =
-			ContextLine { line_number: clamp_u32(context.line_number().unwrap_or(0)), line };
-		match kind {
-			SinkContextKind::Before => self.context_before.push(context_line),
-			SinkContextKind::After => {
-				if let Some(last_match) = self.matches.last_mut() {
-					last_match.context_after.push(context_line);
+		let size_hint = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+		let mut buffer = Vec::new();
+		let mut skipped_oversized = 0;
+		let mut searched = false;
+		let read = read_file_bytes_with_size(path, size_hint, &mut buffer);
+		match read {
+			Ok(ReadFile::Read) => searched = true,
+			Ok(ReadFile::Oversized) => {
+				match sink.control().map_err(GrepStreamError::Sink)? {
+					GrepControl::Continue => {},
+					GrepControl::Stop => {
+						return Ok(GrepStreamSummary {
+							status: GrepStreamStatus::Stopped,
+							..GrepStreamSummary::default()
+						});
+					},
+					GrepControl::Cancel => {
+						return Ok(GrepStreamSummary {
+							status: GrepStreamStatus::Cancelled,
+							..GrepStreamSummary::default()
+						});
+					},
+				}
+				match read_file_prefix(path, &mut buffer) {
+					Ok(ReadFile::Read) => searched = true,
+					_ => skipped_oversized = 1,
 				}
 			},
-			SinkContextKind::Other => {},
+			Ok(ReadFile::Skipped) | Err(_) => {},
 		}
-		Ok(true)
+		if !searched {
+			return Ok(GrepStreamSummary { skipped_oversized, ..GrepStreamSummary::default() });
+		}
+		let mut summary = self.search_slice(display_path, &buffer, options, sink)?;
+		summary.files_searched = 1;
+		summary.files_with_matches = u64::from(summary.matches != 0);
+		summary.skipped_oversized = skipped_oversized;
+		Ok(summary)
 	}
+}
+
+fn stream_search_slice<S: GrepSink>(
+	matcher: &CompiledMatcher,
+	path: &str,
+	content: &[u8],
+	options: StreamOptions,
+	sink: &mut S,
+) -> Result<GrepStreamSummary, GrepStreamError<S::Error>> {
+	if options.max_count == Some(0) {
+		return Ok(GrepStreamSummary {
+			status: GrepStreamStatus::LimitReached,
+			..GrepStreamSummary::default()
+		});
+	}
+	if content.contains(&0) {
+		return Ok(GrepStreamSummary::default());
+	}
+
+	let mut summary = GrepStreamSummary::default();
+	let mut sink_error = None;
+	let mut status = GrepStreamStatus::Complete;
+	let mut counted_through = 0usize;
+	let mut line_number = 1u64;
+	let result = matcher.find_iter(content, |matched| {
+		match sink.control() {
+			Ok(GrepControl::Continue) => {},
+			Ok(GrepControl::Stop) => {
+				status = GrepStreamStatus::Stopped;
+				return false;
+			},
+			Ok(GrepControl::Cancel) => {
+				status = GrepStreamStatus::Cancelled;
+				return false;
+			},
+			Err(error) => {
+				sink_error = Some(error);
+				return false;
+			},
+		}
+
+		let start = matched.start();
+		let end = matched.end();
+		let line_start = content[..start]
+			.iter()
+			.rposition(|byte| *byte == b'\n')
+			.map_or(0, |newline| newline + 1);
+		while counted_through < line_start {
+			let Some(relative) = content[counted_through..line_start]
+				.iter()
+				.position(|byte| *byte == b'\n')
+			else {
+				break;
+			};
+			counted_through += relative + 1;
+			line_number = line_number.saturating_add(1);
+		}
+		let line_end = content[start..]
+			.iter()
+			.position(|byte| *byte == b'\n')
+			.map_or(content.len(), |relative| start + relative);
+		let context_before_start = context_before_start(content, line_start, options.context_before);
+		let last_match_byte = end.saturating_sub(1).max(start).min(content.len());
+		let touched_line_end = content[last_match_byte..]
+			.iter()
+			.position(|byte| *byte == b'\n')
+			.map_or(content.len(), |relative| last_match_byte + relative);
+		let context_after_start = if touched_line_end < content.len() {
+			touched_line_end + 1
+		} else {
+			content.len()
+		};
+		let context_after_end =
+			context_after_end(content, context_after_start, options.context_after);
+		let before_lines = content[context_before_start..line_start]
+			.iter()
+			.filter(|byte| **byte == b'\n')
+			.count() as u64;
+		let after_line = line_number.saturating_add(
+			content[line_start..context_after_start]
+				.iter()
+				.filter(|byte| **byte == b'\n')
+				.count() as u64,
+		);
+		let record = GrepMatchRef {
+			path,
+			line_number,
+			byte_offset: start as u64,
+			match_end: end as u64,
+			line_byte_offset: line_start as u64,
+			line_bytes: &content[line_start..line_end],
+			matched_bytes: &content[start..end],
+			context_before_bytes: &content[context_before_start..line_start],
+			context_before_line: line_number.saturating_sub(before_lines),
+			context_after_bytes: &content[context_after_start..context_after_end],
+			context_after_line: after_line,
+		};
+		summary.matches = summary.matches.saturating_add(1);
+		match sink.matched(record) {
+			Ok(GrepControl::Continue) => {},
+			Ok(GrepControl::Stop) => {
+				status = GrepStreamStatus::Stopped;
+				return false;
+			},
+			Ok(GrepControl::Cancel) => {
+				status = GrepStreamStatus::Cancelled;
+				return false;
+			},
+			Err(error) => {
+				sink_error = Some(error);
+				return false;
+			},
+		}
+		if options
+			.max_count
+			.is_some_and(|maximum| summary.matches >= maximum)
+		{
+			status = GrepStreamStatus::LimitReached;
+			return false;
+		}
+		true
+	});
+	if let Some(error) = sink_error {
+		return Err(GrepStreamError::Sink(error));
+	}
+	result.map_err(|error| {
+		GrepStreamError::Grep(GrepError::Search { message: Str::from(error.to_string()) })
+	})?;
+	summary.status = status;
+	Ok(summary)
+}
+
+fn context_before_start(content: &[u8], line_start: usize, count: u32) -> usize {
+	let mut start = line_start;
+	for _ in 0..count {
+		if start == 0 {
+			break;
+		}
+		let preceding_end = start - 1;
+		start = content[..preceding_end]
+			.iter()
+			.rposition(|byte| *byte == b'\n')
+			.map_or(0, |newline| newline + 1);
+	}
+	start
+}
+
+fn context_after_end(content: &[u8], start: usize, count: u32) -> usize {
+	let mut end = start;
+	for _ in 0..count {
+		if end >= content.len() {
+			break;
+		}
+		end = content[end..]
+			.iter()
+			.position(|byte| *byte == b'\n')
+			.map_or(content.len(), |relative| end + relative + 1);
+	}
+	end
 }
 
 #[derive(Clone, Copy)]
@@ -361,31 +613,10 @@ impl Deadline {
 	}
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadPolicy {
-	Full,
-	Prefix,
-}
-
 enum ReadFile {
 	Read,
 	Oversized,
 	Skipped,
-}
-
-enum FileOutcome {
-	Searched(SearchResultInternal),
-	Defer,
-	SkippedOversized,
-	Skipped,
-}
-
-#[derive(Default)]
-struct PassState {
-	results:           Mutex<Vec<FileSearchResult>>,
-	deferred:          Mutex<Vec<FileCandidate>>,
-	files_searched:    AtomicU64,
-	skipped_oversized: AtomicU64,
 }
 
 enum CompiledMatcher {
@@ -438,71 +669,149 @@ impl Matcher for CompiledMatcher {
 pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepError> {
 	let deadline = Deadline::new(options.timeout_ms);
 	deadline.check()?;
-	let multiline = infer_multiline(options.pattern.as_str(), options.multiline);
-	let matcher = build_matcher(options.pattern.as_str(), options.ignore_case, multiline)?;
-	let params = search_params(options, multiline);
-	let result = run_search(&matcher, content, params).map_err(search_error)?;
+	let matcher = CompiledGrep::new(options.pattern.as_str(), RegexOptions {
+		ignore_case: options.ignore_case,
+		multiline:   options.multiline,
+	})?;
+	let mut collector = AggregateGrepCollector::new(options);
+	let mut summary = match matcher.search_slice(
+		options.path.as_str(),
+		content,
+		StreamOptions {
+			max_count:      None,
+			context_before: options.context_before,
+			context_after:  options.context_after,
+		},
+		&mut collector,
+	) {
+		Ok(summary) => summary,
+		Err(GrepStreamError::Grep(error)) => return Err(error),
+		Err(GrepStreamError::Sink(error)) => match error {},
+	};
 	deadline.check()?;
-	Ok(aggregate_single(result, options.path.clone(), params, 0))
+	summary.files_searched = 1;
+	Ok(collector.finish(summary))
 }
 
-/// Search a file or directory synchronously.
+/// Stream exact matches from a file or directory in deterministic path and
+/// byte-offset order.
 ///
-/// Directory searches discover candidates through [`WalkRequest`] and execute
-/// file work through [`execute_candidates_init`]. Directory match paths are
-/// normalized and relative to the requested root.
-pub fn grep(options: &GrepOptions) -> Result<GrepResult, GrepError> {
+/// Candidate discovery may run in parallel inside [`WalkRequest`], while file
+/// delivery follows its explicit [`WalkOrder::Path`] sequence. The function
+/// never collects match records or performs a terminal match sort.
+pub fn grep_stream<S: GrepSink>(
+	options: &GrepOptions,
+	sink: &mut S,
+) -> Result<GrepStreamSummary, GrepStreamError<S::Error>> {
 	let deadline = Deadline::new(options.timeout_ms);
-	deadline.check()?;
-	let target = resolve_search_path(options.path.as_str())?;
+	deadline.check().map_err(GrepStreamError::Grep)?;
+	let target = resolve_search_path(options.path.as_str()).map_err(GrepStreamError::Grep)?;
 	let metadata = std::fs::metadata(&target)
-		.map_err(|_| GrepError::PathNotFound { path: options.path.clone() })?;
-	let multiline = infer_multiline(options.pattern.as_str(), options.multiline);
-	let matcher = build_matcher(options.pattern.as_str(), options.ignore_case, multiline)?;
-	let params = search_params(options, multiline);
-
-	if metadata.is_file() {
-		return grep_file(&target, options.path.clone(), &matcher, params, deadline);
-	}
-	if !metadata.is_dir() {
-		return Ok(GrepResult::default());
+		.map_err(|_| GrepStreamError::Grep(GrepError::PathNotFound { path: options.path.clone() }))?;
+	let matcher = CompiledGrep::new(options.pattern.as_str(), RegexOptions {
+		ignore_case: options.ignore_case,
+		multiline:   options.multiline,
+	})
+	.map_err(GrepStreamError::Grep)?;
+	if !metadata.is_file() && !metadata.is_dir() {
+		return Ok(GrepStreamSummary::default());
 	}
 
-	let request = build_walk_request(&target, options)?;
-	let candidates = request
-		.collect_file_candidates_with_heartbeat(|| deadline.check())
-		.map_err(|error| {
-			if deadline.expired() {
-				GrepError::Timeout { timeout_ms: options.timeout_ms.unwrap_or(0) }
-			} else {
-				GrepError::Walk { message: Str::from(error.to_string()) }
-			}
-		})?;
-	let (results, skipped_oversized, files_searched) =
-		process_candidates(candidates, &matcher, params, deadline)?;
-	deadline.check()?;
-	Ok(aggregate_results(results, params, files_searched, skipped_oversized))
+	let mut summary = GrepStreamSummary::default();
+	let candidates = if metadata.is_file() {
+		vec![FileCandidate {
+			path:     target,
+			relative: options.path.as_str().to_owned(),
+			mtime:    None,
+			size:     Some(metadata.len() as f64),
+		}]
+	} else {
+		build_walk_request(&target, options)
+			.map_err(GrepStreamError::Grep)?
+			.collect_file_candidates_with_heartbeat(|| deadline.check())
+			.map_err(|error| {
+				GrepStreamError::Grep(if deadline.expired() {
+					GrepError::Timeout { timeout_ms: options.timeout_ms.unwrap_or(0) }
+				} else {
+					GrepError::Walk { message: Str::from(error.to_string()) }
+				})
+			})?
+	};
+	let mut saw_limit = false;
+	for candidate in &candidates {
+		deadline.check().map_err(GrepStreamError::Grep)?;
+		let remaining = options
+			.max_count
+			.map(u64::from)
+			.map(|maximum| maximum.saturating_sub(summary.matches));
+		if remaining == Some(0) {
+			summary.status = GrepStreamStatus::LimitReached;
+			return Ok(summary);
+		}
+		let mode_limit = if options.mode == GrepOutputMode::FilesWithMatches {
+			Some(1)
+		} else {
+			options.max_count_per_file.map(u64::from)
+		};
+		let max_count = match (remaining, mode_limit) {
+			(Some(global), Some(per_file)) => Some(global.min(per_file)),
+			(global, per_file) => global.or(per_file),
+		};
+		let file = matcher.search_file(
+			&candidate.path,
+			&candidate.relative,
+			StreamOptions {
+				max_count,
+				context_before: options.context_before,
+				context_after: options.context_after,
+			},
+			sink,
+		)?;
+		summary.matches = summary.matches.saturating_add(file.matches);
+		summary.files_searched = summary.files_searched.saturating_add(file.files_searched);
+		summary.files_with_matches = summary
+			.files_with_matches
+			.saturating_add(file.files_with_matches);
+		summary.skipped_oversized = summary
+			.skipped_oversized
+			.saturating_add(file.skipped_oversized);
+		match file.status {
+			GrepStreamStatus::Stopped | GrepStreamStatus::Cancelled => {
+				summary.status = file.status;
+				return Ok(summary);
+			},
+			GrepStreamStatus::LimitReached => saw_limit = true,
+			GrepStreamStatus::Complete => {},
+		}
+		if options
+			.max_count
+			.is_some_and(|maximum| summary.matches >= u64::from(maximum))
+		{
+			summary.status = GrepStreamStatus::LimitReached;
+			return Ok(summary);
+		}
+	}
+	deadline.check().map_err(GrepStreamError::Grep)?;
+	summary.status = if saw_limit {
+		GrepStreamStatus::LimitReached
+	} else {
+		GrepStreamStatus::Complete
+	};
+	Ok(summary)
 }
 
-fn search_params(options: &GrepOptions, multiline: bool) -> SearchParams {
-	let content_mode = options.mode == GrepOutputMode::Content;
-	SearchParams {
-		context_before: if content_mode {
-			options.context_before
-		} else {
-			0
-		},
-		context_after: if content_mode {
-			options.context_after
-		} else {
-			0
-		},
-		max_columns: options.max_columns,
-		mode: options.mode,
-		max_count: options.max_count.map(u64::from),
-		max_count_per_file: options.max_count_per_file.map(u64::from),
-		multiline,
-	}
+/// Search a file or directory synchronously and collect the streaming records.
+pub fn grep(options: &GrepOptions) -> Result<GrepResult, GrepError> {
+	let mut collector = AggregateGrepCollector::new(options);
+	let mut streaming_options = options.clone();
+	streaming_options.max_count = None;
+	streaming_options.max_count_per_file = None;
+	let summary = match grep_stream(&streaming_options, &mut collector) {
+		Ok(summary) => summary,
+		Err(GrepStreamError::Grep(error)) => return Err(error),
+		Err(GrepStreamError::Sink(error)) => match error {},
+	};
+	Ok(collector.finish(summary))
 }
 
 fn infer_multiline(pattern: &str, requested: bool) -> bool {
@@ -731,226 +1040,147 @@ const fn find_braced_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
 	None
 }
 
-fn build_searcher(params: SearchParams) -> Searcher {
-	let content_mode = params.mode == GrepOutputMode::Content;
-	SearcherBuilder::new()
-		.binary_detection(BinaryDetection::quit(b'\0'))
-		.line_number(content_mode)
-		.multi_line(params.multiline)
-		.before_context(if content_mode {
-			params.context_before as usize
-		} else {
-			0
-		})
-		.after_context(if content_mode {
-			params.context_after as usize
-		} else {
-			0
-		})
-		.build()
-}
-
-fn per_file_params(params: SearchParams) -> SearchParams {
-	let max_count = match params.mode {
-		GrepOutputMode::Content => match (params.max_count, params.max_count_per_file) {
-			(Some(global), Some(per_file)) => Some(global.min(per_file)),
-			(global, per_file) => global.or(per_file),
-		},
-		GrepOutputMode::Count => None,
-		GrepOutputMode::FilesWithMatches => Some(1),
-	};
-	SearchParams { max_count, ..params }
-}
-
-fn run_search(
-	matcher: &CompiledMatcher,
-	content: &[u8],
-	params: SearchParams,
-) -> io::Result<SearchResultInternal> {
-	let mut searcher = build_searcher(params);
-	run_search_slice(&mut searcher, matcher, content, params)
-}
-
-fn run_search_slice(
-	searcher: &mut Searcher,
-	matcher: &CompiledMatcher,
-	content: &[u8],
-	params: SearchParams,
-) -> io::Result<SearchResultInternal> {
-	let mut collector = MatchCollector::new(
-		params.max_count,
-		params.max_columns.map(|columns| columns as usize),
-		params.mode == GrepOutputMode::Content,
-	);
-	searcher.search_slice(matcher, content, &mut collector)?;
-	Ok(SearchResultInternal {
-		matches:       collector.matches,
-		match_count:   collector.match_count,
-		limit_reached: collector.limit_reached,
-	})
-}
-
-fn grep_file(
-	path: &Path,
-	display_path: Str,
-	matcher: &CompiledMatcher,
-	params: SearchParams,
-	deadline: Deadline,
-) -> Result<GrepResult, GrepError> {
-	let mut worker = SearchWorker::new(params);
-	let candidate = FileCandidate {
-		path:     path.to_path_buf(),
-		relative: display_path.as_str().to_owned(),
-		mtime:    None,
-		size:     std::fs::metadata(path)
-			.ok()
-			.map(|metadata| metadata.len() as f64),
-	};
-	let (search, skipped_oversized) =
-		match search_one_file(&mut worker, matcher, &candidate, params, ReadPolicy::Full) {
-			FileOutcome::Searched(search) => (Some(search), 0),
-			FileOutcome::Defer => {
-				match search_one_file(&mut worker, matcher, &candidate, params, ReadPolicy::Prefix) {
-					FileOutcome::Searched(search) => (Some(search), 0),
-					_ => (None, 1),
-				}
-			},
-			_ => (None, 0),
-		};
-	deadline.check()?;
-	Ok(search.map_or_else(
-		|| GrepResult { skipped_oversized, ..GrepResult::default() },
-		|search| aggregate_single(search, display_path, params, skipped_oversized),
-	))
-}
-
-fn process_candidates(
-	candidates: Vec<FileCandidate>,
-	matcher: &CompiledMatcher,
-	params: SearchParams,
-	deadline: Deadline,
-) -> Result<(Vec<FileSearchResult>, u64, u64), GrepError> {
-	let file_params = per_file_params(params);
-	let state = PassState::default();
-	let (normal, oversized): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
-		file_size_hint(candidate.size).is_none_or(|size| size <= MAX_FILE_BYTES)
-	});
-	state.deferred.lock().extend(oversized);
-
-	let mut results = run_pass(&normal, matcher, file_params, ReadPolicy::Full, &state, deadline)?;
-	let deferred = std::mem::take(&mut *state.deferred.lock());
-	let content_budget_satisfied = params.mode == GrepOutputMode::Content
-		&& params.max_count.is_some_and(|maximum| {
-			results
-				.iter()
-				.map(|result| result.matches.len() as u64)
-				.sum::<u64>()
-				>= maximum
-		});
-	if !deferred.is_empty() && !content_budget_satisfied {
-		results.extend(run_pass(
-			&deferred,
-			matcher,
-			file_params,
-			ReadPolicy::Prefix,
-			&state,
-			deadline,
-		)?);
+fn context_lines(
+	bytes: &[u8],
+	first_line: u64,
+	max_columns: Option<usize>,
+) -> SmallVec<ContextLine, 8> {
+	let mut lines = SmallVec::new();
+	let mut line_number = first_line;
+	for bytes in bytes.split_inclusive(|byte| *byte == b'\n') {
+		if bytes.is_empty() {
+			continue;
+		}
+		let (line, _) = truncate_line(bytes_to_trimmed_str(bytes), max_columns);
+		lines.push(ContextLine { line_number: clamp_u32(line_number), line });
+		line_number = line_number.saturating_add(1);
 	}
-	Ok((
-		results,
-		state.skipped_oversized.load(Ordering::Relaxed),
-		state.files_searched.load(Ordering::Relaxed),
-	))
+	lines
+}
+struct AggregateGrepCollector {
+	mode:               GrepOutputMode,
+	max_count:          Option<u64>,
+	max_count_per_file: Option<u64>,
+	max_columns:        Option<usize>,
+	matches:            Vec<GrepMatch>,
+	total_matches:      u64,
+	files_with_matches: u64,
+	emitted:            u64,
+	current_path:       Str,
+	current_line:       Option<u64>,
+	current_file_count: u64,
+	limit_reached:      bool,
 }
 
-fn run_pass(
-	candidates: &[FileCandidate],
-	matcher: &CompiledMatcher,
-	params: SearchParams,
-	policy: ReadPolicy,
-	state: &PassState,
-	deadline: Deadline,
-) -> Result<Vec<FileSearchResult>, GrepError> {
-	execute_candidates_init(
-		candidates,
-		|| SearchWorker::new(params),
-		|worker, candidate| {
-			deadline.check()?;
-			handle_file(worker, matcher, candidate, params, policy, state);
-			deadline.check()
-		},
-	)?;
-	let mut results = std::mem::take(&mut *state.results.lock());
-	results.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-	Ok(results)
+impl AggregateGrepCollector {
+	fn new(options: &GrepOptions) -> Self {
+		Self {
+			mode:               options.mode,
+			max_count:          options.max_count.map(u64::from),
+			max_count_per_file: options.max_count_per_file.map(u64::from),
+			max_columns:        options.max_columns.map(|columns| columns as usize),
+			matches:            Vec::new(),
+			total_matches:      0,
+			files_with_matches: 0,
+			emitted:            0,
+			current_path:       Str::new(""),
+			current_line:       None,
+			current_file_count: 0,
+			limit_reached:      false,
+		}
+	}
+
+	fn finish(self, summary: GrepStreamSummary) -> GrepResult {
+		GrepResult {
+			matches:            self.matches,
+			total_matches:      clamp_u32(self.total_matches),
+			files_with_matches: clamp_u32(self.files_with_matches),
+			files_searched:     clamp_u32(summary.files_searched),
+			limit_reached:      self.limit_reached
+				|| matches!(summary.status, GrepStreamStatus::Stopped | GrepStreamStatus::LimitReached),
+			skipped_oversized:  clamp_u32(summary.skipped_oversized),
+		}
+	}
 }
 
-fn handle_file(
-	worker: &mut SearchWorker,
-	matcher: &CompiledMatcher,
-	candidate: &FileCandidate,
-	params: SearchParams,
-	policy: ReadPolicy,
-	state: &PassState,
-) {
-	match search_one_file(worker, matcher, candidate, params, policy) {
-		FileOutcome::Defer => state.deferred.lock().push(candidate.clone()),
-		FileOutcome::SkippedOversized => {
-			state.skipped_oversized.fetch_add(1, Ordering::Relaxed);
-		},
-		FileOutcome::Skipped => {},
-		FileOutcome::Searched(search) => {
-			state.files_searched.fetch_add(1, Ordering::Relaxed);
-			if search.match_count > 0 {
-				state.results.lock().push(FileSearchResult {
-					relative_path: Str::from(candidate.relative.as_str()),
-					matches:       search.matches,
-					match_count:   search.match_count,
-					limit_reached: search.limit_reached,
+impl GrepSink for AggregateGrepCollector {
+	type Error = std::convert::Infallible;
+
+	fn control(&mut self) -> Result<GrepControl, Self::Error> {
+		if self.max_count == Some(0) {
+			self.limit_reached = true;
+			return Ok(GrepControl::Stop);
+		}
+		Ok(GrepControl::Continue)
+	}
+
+	fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
+		if self.current_path.as_str() != matched.path {
+			self.current_path = Str::from(matched.path);
+			self.current_line = None;
+			self.current_file_count = 0;
+		}
+		if self.current_line == Some(matched.line_byte_offset) {
+			return Ok(GrepControl::Continue);
+		}
+		self.current_line = Some(matched.line_byte_offset);
+		if self.current_file_count == 0 {
+			self.files_with_matches = self.files_with_matches.saturating_add(1);
+		}
+		self.current_file_count = self.current_file_count.saturating_add(1);
+		self.total_matches = self.total_matches.saturating_add(1);
+
+		if self.mode == GrepOutputMode::Content
+			&& self
+				.max_count_per_file
+				.is_some_and(|maximum| self.current_file_count > maximum)
+		{
+			self.limit_reached = true;
+			return Ok(GrepControl::Continue);
+		}
+		match self.mode {
+			GrepOutputMode::Content => {
+				let (line, truncated) =
+					truncate_line(bytes_to_trimmed_str(matched.line_bytes), self.max_columns);
+				self.matches.push(GrepMatch {
+					path: self.current_path.clone(),
+					line_number: clamp_u32(matched.line_number),
+					line,
+					truncated,
+					context_before: context_lines(
+						matched.context_before_bytes,
+						matched.context_before_line,
+						self.max_columns,
+					),
+					context_after: context_lines(
+						matched.context_after_bytes,
+						matched.context_after_line,
+						self.max_columns,
+					),
 				});
-			}
-		},
+				self.emitted = self.emitted.saturating_add(1);
+			},
+			GrepOutputMode::Count if self.current_file_count == 1 => {
+				self.matches.push(file_marker(self.current_path.clone()));
+				self.emitted = self.emitted.saturating_add(1);
+			},
+			GrepOutputMode::FilesWithMatches if self.current_file_count == 1 => {
+				self.matches.push(file_marker(self.current_path.clone()));
+				self.emitted = self.emitted.saturating_add(1);
+			},
+			GrepOutputMode::Count | GrepOutputMode::FilesWithMatches => {},
+		}
+		let consumed = match self.mode {
+			GrepOutputMode::Content => self.emitted,
+			GrepOutputMode::Count => self.total_matches,
+			GrepOutputMode::FilesWithMatches => self.files_with_matches,
+		};
+		if self.max_count.is_some_and(|maximum| consumed >= maximum) {
+			self.limit_reached = true;
+			return Ok(GrepControl::Stop);
+		}
+		Ok(GrepControl::Continue)
 	}
-}
-
-fn search_one_file(
-	worker: &mut SearchWorker,
-	matcher: &CompiledMatcher,
-	candidate: &FileCandidate,
-	params: SearchParams,
-	policy: ReadPolicy,
-) -> FileOutcome {
-	let read = match policy {
-		ReadPolicy::Full => read_file_bytes_with_size(
-			&candidate.path,
-			file_size_hint(candidate.size),
-			&mut worker.buffer,
-		),
-		ReadPolicy::Prefix => read_file_prefix(&candidate.path, &mut worker.buffer),
-	};
-	match read {
-		Ok(ReadFile::Read) => {},
-		Ok(ReadFile::Oversized) => return FileOutcome::Defer,
-		Ok(ReadFile::Skipped) => {
-			return if policy == ReadPolicy::Prefix {
-				FileOutcome::SkippedOversized
-			} else {
-				FileOutcome::Skipped
-			};
-		},
-		Err(_) => {
-			return if policy == ReadPolicy::Prefix {
-				FileOutcome::SkippedOversized
-			} else {
-				FileOutcome::Skipped
-			};
-		},
-	}
-	let search = run_search_slice(&mut worker.searcher, matcher, &worker.buffer, params).unwrap_or(
-		SearchResultInternal { matches: Vec::new(), match_count: 0, limit_reached: false },
-	);
-	FileOutcome::Searched(search)
 }
 
 fn read_file_bytes_with_size(
@@ -1018,112 +1248,6 @@ fn read_owned_prefix(
 	Ok(())
 }
 
-fn file_size_hint(size: Option<f64>) -> Option<u64> {
-	size
-		.filter(|size| size.is_finite() && *size >= 0.0 && *size <= u64::MAX as f64)
-		.map(|size| size as u64)
-}
-
-fn aggregate_single(
-	search: SearchResultInternal,
-	path: Str,
-	params: SearchParams,
-	skipped_oversized: u32,
-) -> GrepResult {
-	let files_with_matches = u32::from(search.match_count > 0);
-	let matches = match params.mode {
-		GrepOutputMode::Content => search
-			.matches
-			.into_iter()
-			.take(params.max_count.map_or(usize::MAX, |max| max as usize))
-			.map(|matched| public_match(path.clone(), matched))
-			.collect(),
-		GrepOutputMode::Count | GrepOutputMode::FilesWithMatches if search.match_count > 0 => {
-			vec![file_marker(path)]
-		},
-		GrepOutputMode::Count | GrepOutputMode::FilesWithMatches => Vec::new(),
-	};
-	let global_limit = params
-		.max_count
-		.is_some_and(|max| u64::try_from(matches.len()).unwrap_or(u64::MAX) >= max);
-	GrepResult {
-		matches,
-		total_matches: clamp_u32(search.match_count),
-		files_with_matches,
-		files_searched: 1,
-		limit_reached: search.limit_reached || global_limit,
-		skipped_oversized,
-	}
-}
-
-fn aggregate_results(
-	results: Vec<FileSearchResult>,
-	params: SearchParams,
-	files_searched: u64,
-	skipped_oversized: u64,
-) -> GrepResult {
-	let mut matches = Vec::new();
-	let mut total_matches = 0u64;
-	let mut files_with_matches = 0u64;
-	let mut emitted = 0u64;
-	let mut limit_reached = false;
-
-	for result in results {
-		if result.match_count == 0 {
-			continue;
-		}
-		total_matches = total_matches.saturating_add(result.match_count);
-		files_with_matches = files_with_matches.saturating_add(1);
-		match params.mode {
-			GrepOutputMode::Content => {
-				for matched in result.matches {
-					if params.max_count.is_some_and(|max| emitted >= max) {
-						limit_reached = true;
-						break;
-					}
-					matches.push(public_match(result.relative_path.clone(), matched));
-					emitted = emitted.saturating_add(1);
-				}
-				limit_reached |= result.limit_reached;
-			},
-			GrepOutputMode::Count | GrepOutputMode::FilesWithMatches => {
-				if params.max_count.is_some_and(|max| emitted >= max) {
-					limit_reached = true;
-					continue;
-				}
-				matches.push(file_marker(result.relative_path));
-				emitted = emitted.saturating_add(match params.mode {
-					GrepOutputMode::Count => result.match_count,
-					GrepOutputMode::FilesWithMatches => 1,
-					GrepOutputMode::Content => unreachable!(),
-				});
-			},
-		}
-	}
-	if params.max_count.is_some_and(|max| emitted >= max) {
-		limit_reached = true;
-	}
-	GrepResult {
-		matches,
-		total_matches: clamp_u32(total_matches),
-		files_with_matches: clamp_u32(files_with_matches),
-		files_searched: clamp_u32(files_searched),
-		limit_reached,
-		skipped_oversized: clamp_u32(skipped_oversized),
-	}
-}
-
-fn public_match(path: Str, matched: CollectedMatch) -> GrepMatch {
-	GrepMatch {
-		path,
-		line_number: clamp_u32(matched.line_number),
-		line: matched.line,
-		truncated: matched.truncated,
-		context_before: matched.context_before,
-		context_after: matched.context_after,
-	}
-}
-
 fn file_marker(path: Str) -> GrepMatch {
 	GrepMatch {
 		path,
@@ -1163,10 +1287,6 @@ const fn clamp_u32(value: u64) -> u32 {
 	}
 }
 
-fn search_error(error: io::Error) -> GrepError {
-	GrepError::Search { message: Str::from(error.to_string()) }
-}
-
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -1198,6 +1318,41 @@ mod tests {
 	impl Drop for TempDir {
 		fn drop(&mut self) {
 			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[derive(Default)]
+	struct RecordingSink {
+		records: Vec<(Str, u64, u64, u64, Vec<u8>, Vec<u8>)>,
+	}
+
+	impl GrepSink for RecordingSink {
+		type Error = std::convert::Infallible;
+
+		fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
+			self.records.push((
+				Str::from(matched.path),
+				matched.line_number,
+				matched.byte_offset,
+				matched.match_end,
+				matched.line_bytes.to_vec(),
+				matched.matched_bytes.to_vec(),
+			));
+			Ok(GrepControl::Continue)
+		}
+	}
+
+	#[derive(Default)]
+	struct CountingSink {
+		matches: usize,
+	}
+
+	impl GrepSink for CountingSink {
+		type Error = std::convert::Infallible;
+
+		fn matched(&mut self, _matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
+			self.matches += 1;
+			Ok(GrepControl::Continue)
 		}
 	}
 
@@ -1244,8 +1399,8 @@ mod tests {
 		assert_eq!(result.files_searched, 2);
 		assert_eq!(result.files_with_matches, 2);
 		assert_eq!(result.skipped_oversized, 0);
-		assert_eq!(result.matches[0].path.as_str(), "small.txt");
-		assert_eq!(result.matches[1].path.as_str(), "large.txt");
+		assert_eq!(result.matches[0].path.as_str(), "large.txt");
+		assert_eq!(result.matches[1].path.as_str(), "small.txt");
 	}
 
 	#[test]
@@ -1278,7 +1433,7 @@ mod tests {
 	}
 
 	#[test]
-	fn satisfied_budget_skips_the_oversized_pass() {
+	fn global_budget_stops_after_first_path_ordered_file() {
 		let root = TempDir::new();
 		fs::write(root.0.join("small.txt"), "needle\n").unwrap();
 		let mut large = Vec::with_capacity(MAX_FILE_BYTES as usize + 1);
@@ -1291,7 +1446,138 @@ mod tests {
 		let result = grep(&options).unwrap();
 		assert_eq!(result.files_searched, 1);
 		assert_eq!(result.matches.len(), 1);
-		assert_eq!(result.matches[0].path.as_str(), "small.txt");
+		assert_eq!(result.matches[0].path.as_str(), "large.txt");
+	}
+
+	#[test]
+	fn compiled_stream_handles_rust_regex_and_pcre2_features() {
+		fn assert_send_sync<T: Send + Sync>() {}
+		assert_send_sync::<CompiledGrep>();
+		let mut rust = RecordingSink::default();
+		CompiledGrep::new(r"\bfoo\d+", RegexOptions::default())
+			.unwrap()
+			.search_slice("rust", b"foo42\nbar\n", StreamOptions::default(), &mut rust)
+			.unwrap();
+		assert_eq!(rust.records[0].5, b"foo42");
+
+		let mut pcre = RecordingSink::default();
+		CompiledGrep::new(r"(?<=foo)bar", RegexOptions::default())
+			.unwrap()
+			.search_slice("pcre", b"foobar\n", StreamOptions::default(), &mut pcre)
+			.unwrap();
+		assert_eq!(pcre.records[0].5, b"bar");
+	}
+
+	#[test]
+	fn streaming_records_report_exact_offsets_and_borrowed_line_bytes() {
+		let mut sink = RecordingSink::default();
+		let summary = CompiledGrep::new("needle", RegexOptions::default())
+			.unwrap()
+			.search_slice("memory", b"zero\nxx needle yy\n", StreamOptions::default(), &mut sink)
+			.unwrap();
+		assert_eq!(summary.matches, 1);
+		assert_eq!(sink.records[0].1, 2);
+		assert_eq!(sink.records[0].2, 8);
+		assert_eq!(sink.records[0].3, 14);
+		assert_eq!(sink.records[0].4, b"xx needle yy");
+	}
+
+	#[test]
+	fn sink_stop_and_cancellation_are_distinct() {
+		struct StopSink;
+		impl GrepSink for StopSink {
+			type Error = std::convert::Infallible;
+
+			fn matched(&mut self, _matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
+				Ok(GrepControl::Stop)
+			}
+		}
+		struct CancelSink {
+			heartbeats: usize,
+			matches:    usize,
+		}
+		impl GrepSink for CancelSink {
+			type Error = std::convert::Infallible;
+
+			fn control(&mut self) -> Result<GrepControl, Self::Error> {
+				self.heartbeats += 1;
+				Ok(if self.heartbeats > 1 {
+					GrepControl::Cancel
+				} else {
+					GrepControl::Continue
+				})
+			}
+
+			fn matched(&mut self, _matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
+				self.matches += 1;
+				Ok(GrepControl::Continue)
+			}
+		}
+
+		let matcher = CompiledGrep::new("x", RegexOptions::default()).unwrap();
+		let stopped = matcher
+			.search_slice("memory", b"x\nx\n", StreamOptions::default(), &mut StopSink)
+			.unwrap();
+		assert_eq!(stopped.status, GrepStreamStatus::Stopped);
+		assert_eq!(stopped.matches, 1);
+		let mut cancel = CancelSink { heartbeats: 0, matches: 0 };
+		let cancelled = matcher
+			.search_slice("memory", b"x\nx\n", StreamOptions::default(), &mut cancel)
+			.unwrap();
+		assert_eq!(cancelled.status, GrepStreamStatus::Cancelled);
+		assert_eq!(cancel.matches, 1);
+
+		let mut limited_sink = CountingSink::default();
+		let limited = matcher
+			.search_slice(
+				"memory",
+				b"x\nx\nx\n",
+				StreamOptions { max_count: Some(2), ..StreamOptions::default() },
+				&mut limited_sink,
+			)
+			.unwrap();
+		assert_eq!(limited.status, GrepStreamStatus::LimitReached);
+		assert_eq!(limited_sink.matches, 2);
+	}
+
+	#[test]
+	fn streaming_directory_order_is_stable_after_parallel_walk() {
+		let root = TempDir::new();
+		fs::write(root.0.join("b.txt"), "x\nx\n").unwrap();
+		fs::write(root.0.join("a.txt"), "x\nx\n").unwrap();
+		let mut options = options("x");
+		options.path = Str::from(root.0.to_string_lossy());
+		let mut first = RecordingSink::default();
+		grep_stream(&options, &mut first).unwrap();
+		let mut second = RecordingSink::default();
+		grep_stream(&options, &mut second).unwrap();
+		let order = |sink: &RecordingSink| {
+			sink
+				.records
+				.iter()
+				.map(|record| (record.0.clone(), record.2))
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(order(&first), order(&second));
+		assert_eq!(first.records[0].0.as_str(), "a.txt");
+		assert_eq!(first.records[2].0.as_str(), "b.txt");
+	}
+
+	#[test]
+	fn non_collecting_sink_memory_is_bounded_by_its_state() {
+		let mut content = Vec::new();
+		for _ in 0..10_000 {
+			content.extend_from_slice(b"x\n");
+		}
+		let mut sink = CountingSink::default();
+		let bytes_before = std::mem::size_of_val(&sink);
+		let summary = CompiledGrep::new("x", RegexOptions::default())
+			.unwrap()
+			.search_slice("memory", &content, StreamOptions::default(), &mut sink)
+			.unwrap();
+		assert_eq!(sink.matches, 10_000);
+		assert_eq!(summary.matches, 10_000);
+		assert_eq!(std::mem::size_of_val(&sink), bytes_before);
 	}
 
 	#[test]

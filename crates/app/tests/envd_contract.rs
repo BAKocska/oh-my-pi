@@ -13,8 +13,8 @@ use futures::Stream;
 use omp_app::envd::{
 	exec::{ExecEvent as HostExecEvent, ExecHost},
 	server::EnvServer,
-	worker::{PY_EVAL_MODULE, ToolWorkerConfig, ToolWorkerSupervisor},
-	workspace::{WorkspaceError, WorkspaceHost},
+	worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
+	workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
 };
 use omp_core::Str;
 use omp_env::{BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent};
@@ -352,7 +352,16 @@ OMP_TOOLS = [
         "handler": fail,
     },
 ]
+
 "#;
+fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig {
+	let mut config = ExtHostConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
+	let mut extension =
+		ExtHostSpec::new(HostKey::new("workspace", "trusted", module), Str::from(module));
+	extension.python_site = python_site;
+	config.extensions.push(extension);
+	config
+}
 
 struct Harness {
 	client:      EnvClient,
@@ -366,12 +375,12 @@ impl Harness {
 	async fn start(registry: Registry) -> Self {
 		Self::start_with_worker(
 			registry,
-			ToolWorkerConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp"))),
+			ExtHostConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp"))),
 		)
 		.await
 	}
 
-	async fn start_with_worker(registry: Registry, worker: ToolWorkerConfig) -> Self {
+	async fn start_with_worker(registry: Registry, worker: ExtHostConfig) -> Self {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("state scratch directory");
 		let server = Arc::new(
@@ -546,7 +555,7 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 		root.path(),
 		state.path(),
 		registry,
-		ToolWorkerConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp"))),
+		ExtHostConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp"))),
 	)
 	.await;
 	let Err(error) = result else {
@@ -1608,8 +1617,7 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 
 #[tokio::test]
 async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
-	let mut worker = ToolWorkerConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
-	worker.modules.push(Str::new_static(PY_EVAL_MODULE));
+	let worker = extension_worker(PY_EVAL_MODULE, None);
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
 	let registry = harness.server.registry();
 	let advertised = registry
@@ -2008,9 +2016,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 	let site = tempfile::tempdir().expect("worker extension scratch");
 	std::fs::write(site.path().join("envd_cancel_tools.py"), WORKER_CANCEL_EXTENSION)
 		.expect("write worker cancellation extension");
-	let mut worker = ToolWorkerConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
-	worker.python_site = Some(site.path().to_owned());
-	worker.modules = vec![Str::new_static("envd_cancel_tools")];
+	let mut worker = extension_worker("envd_cancel_tools", Some(site.path().to_owned()));
 	worker.health_timeout = Duration::from_secs(5);
 	worker.interrupt_grace = Duration::from_millis(150);
 	worker.initial_backoff = Duration::from_millis(10);
@@ -2174,9 +2180,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	let site = tempfile::tempdir().expect("worker collision scratch");
 	std::fs::write(site.path().join("envd_cancel_tools.py"), WORKER_CANCEL_EXTENSION)
 		.expect("write worker collision extension");
-	let mut worker = ToolWorkerConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
-	worker.python_site = Some(site.path().to_owned());
-	worker.modules = vec![Str::new_static("envd_cancel_tools")];
+	let mut worker = extension_worker("envd_cancel_tools", Some(site.path().to_owned()));
 	worker.health_timeout = Duration::from_secs(5);
 	worker.interrupt_grace = Duration::from_millis(100);
 	worker.initial_backoff = Duration::from_millis(10);
@@ -2545,7 +2549,7 @@ async fn timeout_cancel_and_workspace_cancel_have_distinct_truth() {
 	let cancelled = CancellationToken::new();
 	cancelled.cancel();
 	assert!(matches!(
-		workspace.search(&workspace.request(), b"needle", None, &cancelled),
+		workspace.search(&workspace.request(), &WorkspaceSearchOptions::new("needle"), &cancelled,),
 		Err(WorkspaceError::Cancelled)
 	));
 
@@ -2679,10 +2683,9 @@ async fn real_embedded_python_worker_registers_configured_extensions_when_availa
 	else {
 		return;
 	};
-	let mut config = ToolWorkerConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
-	config.python_site = Some(PathBuf::from(site));
-	config.modules = vec![Str::from(module.to_string_lossy().into_owned())];
-	let supervisor = ToolWorkerSupervisor::spawn(config)
+	let module = Str::from(module.to_string_lossy().into_owned());
+	let config = extension_worker(module.as_str(), Some(PathBuf::from(site)));
+	let supervisor = ExtHostSupervisor::spawn(config)
 		.await
 		.expect("real embedded Python worker and extension");
 	assert!(!supervisor.registrations().is_empty(), "configured extension registered no tools");

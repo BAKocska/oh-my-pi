@@ -10,9 +10,9 @@ use omp_proto::{
 	toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint},
 };
 use omp_tool::{
-	Claims, Constraint, GrammarSyntax, Precedence, Presentation, Registry, Rev, ToolSpec,
+	Claims, Constraint, GrammarSyntax, Precedence, Presentation, Registry, Rev, Tool, ToolSpec,
 };
-use omp_tools::edit::FormatPolicy;
+use omp_tools::{BuiltinRendererIdentities, edit::FormatPolicy, register_builtin_renderers};
 
 use super::{
 	EnvdError,
@@ -23,7 +23,7 @@ use super::{
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
 	tool_shell::ShellExecHost,
-	worker::ToolWorkerSupervisor,
+	worker::ExtHostSupervisor,
 	workspace::WorkspaceHost,
 };
 
@@ -38,7 +38,7 @@ pub fn production_registry(
 	exec: &ExecHost,
 	workspace: &WorkspaceHost,
 	root_uri: &Str,
-	workers: &ToolWorkerSupervisor,
+	workers: &ExtHostSupervisor,
 	mut registry: Registry,
 ) -> Result<(Arc<Registry>, Arc<SessionBridgeHost>, omp_tools::eval::EvalSessionControl), EnvdError>
 {
@@ -46,48 +46,48 @@ pub fn production_registry(
 		ensure_name_absent(&registry, name)?;
 	}
 	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
-	registry.register(
-		omp_tools::read::tool(read_sources, blobs.clone()),
-		Presentation::Slot,
-		core_claims(),
-	)?;
-	registry.register(
-		omp_tools::edit::tool(documents.clone(), FormatPolicy::Configured),
-		Presentation::Slot,
-		core_claims(),
-	)?;
-	registry.register(
-		omp_tools::write::tool(documents.clone()),
-		Presentation::Slot,
-		core_claims(),
-	)?;
-	registry.register(
-		omp_tools::shell::shell(ShellExecHost::new(exec.clone(), root_uri.clone())),
-		Presentation::Slot,
-		core_claims(),
-	)?;
+	let read = omp_tools::read::tool(read_sources, blobs.clone());
+	let read_identity = read.spec().identity();
+	registry.register(read, Presentation::Slot, core_claims())?;
+	let edit = omp_tools::edit::tool(documents.clone(), FormatPolicy::Configured);
+	let edit_identity = edit.spec().identity();
+	registry.register(edit, Presentation::Slot, core_claims())?;
+	let write = omp_tools::write::tool(documents.clone());
+	let write_identity = write.spec().identity();
+	registry.register(write, Presentation::Slot, core_claims())?;
+	let shell = omp_tools::shell::shell(ShellExecHost::new(exec.clone(), root_uri.clone()));
+	let shell_identity = shell.spec().identity();
+	registry.register(shell, Presentation::Slot, core_claims())?;
 	let search = WorkspaceSearchAdapter::new(workspace.clone(), documents.clone());
-	registry.register(
-		omp_tools::grep::tool(search.clone(), blobs.clone()),
-		Presentation::Slot,
-		core_claims(),
-	)?;
-	registry.register(
-		omp_tools::glob::tool(search, blobs.clone()),
-		Presentation::Slot,
-		core_claims(),
-	)?;
+	let grep = omp_tools::grep::tool(search.clone(), blobs.clone());
+	let grep_identity = grep.spec().identity();
+	registry.register(grep, Presentation::Slot, core_claims())?;
+	let glob = omp_tools::glob::tool(search, blobs.clone());
+	let glob_identity = glob.spec().identity();
+	registry.register(glob, Presentation::Slot, core_claims())?;
 	let eval_host = Arc::new(SessionBridgeHost::new());
 	let eval_exec = ProcessEvalExec::production(Arc::clone(&eval_host))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
 	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
+	let eval_identity = eval_tool.spec().identity();
 	registry.register(eval_tool, Presentation::Slot, core_claims())?;
-	for declaration in workers.registrations() {
+	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
+		edit:  edit_identity,
+		grep:  grep_identity,
+		glob:  glob_identity,
+		shell: shell_identity,
+		write: write_identity,
+		read:  read_identity,
+		eval:  eval_identity,
+	})
+	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
+	for registration in workers.registrations() {
+		let declaration = &registration.declaration;
 		let spec = worker_spec(declaration)?;
 		ensure_name_absent(&registry, &spec.name)?;
 		registry.register_worker(spec, Presentation::Device, Claims {
 			precedence: Precedence::DEFAULT,
-			claimant:   Str::from(declaration.extension_id.as_str()),
+			claimant:   registration.owner.extension.clone(),
 			replaces:   None,
 		})?;
 	}
@@ -136,7 +136,10 @@ fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 	}
 	Ok(ToolSpec {
 		name:            Str::from(definition.name.as_str()),
-		rev:             parse_revision(&declaration.rev)?,
+		rev:             declaration
+			.rev
+			.parse::<Rev>()
+			.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?,
 		description:     Str::from(definition.description.as_str()),
 		schema:          definition.schema_json.clone(),
 		constraint:      worker_constraint(declaration)?,
@@ -149,18 +152,6 @@ fn worker_projection_code(declaration: &ToolDecl) -> [u8; 32] {
 	hasher.update(b"omp/frozen-worker-registration/v1");
 	hasher.update(&declaration.encode_to_vec());
 	*hasher.finalize().as_bytes()
-}
-
-fn parse_revision(value: &str) -> Result<Rev, EnvdError> {
-	let (family, number) = match value.rsplit_once('.') {
-		Some((family, number)) if !family.is_empty() => (family, number),
-		Some(_) => return Err(worker_declaration_error("worker revision family is empty")),
-		None => ("", value),
-	};
-	let n = number.parse::<u16>().map_err(|_| {
-		worker_declaration_error("worker revision must be `N` or `family.N` with a u16 N")
-	})?;
-	Ok(Rev { family: Str::from(family), n })
 }
 
 fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {

@@ -165,9 +165,9 @@ async fn stream_turn(
 		return;
 	}
 	let _ = events.send(BackendEvent::ToolFinished {
-		id:      tool,
-		ok:      true,
-		summary: vec![Str::new_static("Host seam verified"), Str::new_static("3 files inspected")],
+		id:   tool,
+		ok:   true,
+		view: Str::new_static("Host seam verified\n3 files inspected"),
 	});
 	let _ = events.send(BackendEvent::AssistantDelta {
 		id:   assistant.clone(),

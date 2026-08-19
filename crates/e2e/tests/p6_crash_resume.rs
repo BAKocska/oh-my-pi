@@ -37,7 +37,7 @@ use omp_agent::{
 use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
-	envd::{server::EnvServer, worker::ToolWorkerConfig},
+	envd::{server::EnvServer, worker::ExtHostConfig},
 };
 use omp_core::Str;
 use omp_e2e::support::{Scratch, ScriptedGateway, omp_binary};
@@ -670,8 +670,8 @@ fn assert_binary_resume_journal(path: &Path, turn_id: &str) {
 		1,
 		"CLI resume duplicated its terminal receipt",
 	);
-	let projected =
-		project_journal(&log, &Registry::new(), &caps()).expect("project CLI-resumed journal");
+	let projected = project_journal(&log, log.as_ref(), &Registry::new(), &caps())
+		.expect("project CLI-resumed journal");
 	let outputs = projected
 		.items
 		.iter()
@@ -1077,7 +1077,7 @@ async fn batch_child(root: &Path, create: bool) {
 			&workspace,
 			&state_dir,
 			environment_registry,
-			ToolWorkerConfig::new(omp_binary().expect("worker-capable host binary")),
+			ExtHostConfig::new(omp_binary().expect("worker-capable host binary")),
 		)
 		.await
 		.expect("real local environment host"),
@@ -1197,8 +1197,8 @@ fn assert_single_receipt(path: &Path, turn_id: &str) {
 	assert_eq!(receipts, 1, "terminal receipt duplicated");
 	let receipt = journal.receipt(turn_id).expect("root turn receipt");
 	assert_eq!(receipt.outcome.output.len(), 1);
-	let projected =
-		project_journal(&log, &Registry::new(), &caps()).expect("project replay journal");
+	let projected = project_journal(&log, log.as_ref(), &Registry::new(), &caps())
+		.expect("project replay journal");
 	assert_eq!(projected.items.len(), 3, "replay duplicated or omitted canonical items");
 	assert_eq!(
 		projected
@@ -1232,8 +1232,8 @@ fn assert_recovered_sequences(path: &Path) {
 	let amendments =
 		event_count(&log, |kind| matches!(kind, Kind::Amend { patch: AmendPatch::Seq { .. }, .. }));
 	assert_eq!(amendments, 2, "sequence recovery duplicated or omitted amendments");
-	let projected =
-		project_journal(&log, &Registry::new(), &caps()).expect("project recovered journal");
+	let projected = project_journal(&log, log.as_ref(), &Registry::new(), &caps())
+		.expect("project recovered journal");
 	let seqs: Vec<_> = projected.items.iter().map(|item| item.seq).collect();
 	assert_eq!(seqs, vec![1, 2, 3], "recovered sequence assignment drifted");
 }
@@ -1267,7 +1267,8 @@ fn assert_batch_recovery(journal_path: &Path, gateway_path: &Path) {
 			core_claims(),
 		)
 		.expect("register projection tool");
-	let projected = project_journal(&log, &registry, &caps()).expect("project interrupted batch");
+	let projected =
+		project_journal(&log, log.as_ref(), &registry, &caps()).expect("project interrupted batch");
 	let mut result_ids = Vec::new();
 	for item in &projected.items {
 		if let Some(thread::item::Kind::ToolResult(result)) = &item.kind {

@@ -23,7 +23,10 @@ use nix::{
 	sys::signal,
 	unistd::{Pid, getpgid},
 };
-use omp_app::envd::{server::EnvServer, worker::ToolWorkerConfig};
+use omp_app::envd::{
+	server::EnvServer,
+	worker::{ExtHostConfig, ExtHostSpec, HostKey},
+};
 use omp_core::Str;
 use omp_e2e::support::omp_binary;
 use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
@@ -110,7 +113,7 @@ struct LocalEnv {
 }
 
 impl LocalEnv {
-	async fn start(registry: Registry, worker: ToolWorkerConfig) -> Self {
+	async fn start(registry: Registry, worker: ExtHostConfig) -> Self {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("environment state scratch directory");
 		let server = Arc::new(
@@ -243,7 +246,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 			},
 		)
 		.expect("register cancellable sleeper");
-	let worker = ToolWorkerConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
+	let worker = ExtHostConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
 	let env = within(STARTUP_DEADLINE, LocalEnv::start(registry, worker)).await;
 
 	let mut skipped = within(
@@ -316,7 +319,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 
 #[tokio::test]
 async fn dropping_exec_run_kills_the_whole_pgid_but_preserves_its_session() {
-	let worker = ToolWorkerConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
+	let worker = ExtHostConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
 	let env = within(STARTUP_DEADLINE, LocalEnv::start(Registry::new(), worker)).await;
 	let opened = within(
 		EVENT_DEADLINE,
@@ -398,9 +401,13 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	let site = tempfile::tempdir().expect("Python extension scratch");
 	fs::write(site.path().join("cancel_matrix_tools.py"), PY_EXTENSION)
 		.expect("write Python cancellation extension");
-	let mut worker = ToolWorkerConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
-	worker.python_site = Some(site.path().to_owned());
-	worker.modules = vec![Str::new_static("cancel_matrix_tools")];
+	let mut worker = ExtHostConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
+	let mut spec = ExtHostSpec::new(
+		HostKey::new("project", "workspace", "cancel_matrix_tools"),
+		Str::new_static("cancel_matrix_tools"),
+	);
+	spec.python_site = Some(site.path().to_owned());
+	worker.extensions.push(spec);
 	worker.health_timeout = Duration::from_secs(5);
 	worker.interrupt_grace = Duration::from_millis(150);
 	worker.initial_backoff = Duration::from_millis(10);

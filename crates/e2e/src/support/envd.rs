@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use bytes::BytesMut;
-use omp_app::envd::{server::EnvServer, worker::ToolWorkerConfig};
+use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
 use omp_env::{BlobDownloadEvent, EnvClient};
 use omp_proto::{
 	SCHEMA_REV,
@@ -47,9 +47,10 @@ impl EnvHarness {
 	/// hello.
 	pub async fn spawn(scratch: &Scratch, registry: Registry) -> Result<Self> {
 		let socket = scratch.socket("env.sock");
-		let worker = ToolWorkerConfig::new(omp_binary().context("resolving worker-capable host")?);
+		let ext_host_config =
+			ExtHostConfig::new(omp_binary().context("resolving worker-capable host")?);
 		let server = Arc::new(
-			EnvServer::open_local(scratch.project(), scratch.state(), registry, worker)
+			EnvServer::open_local(scratch.project(), scratch.state(), registry, ext_host_config)
 				.await
 				.context("opening local environment authority")?,
 		);

@@ -469,9 +469,9 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 						chunk: Str::new_static("checking damage ranges\n"),
 					});
 					let _ = events.send(BackendEvent::ToolFinished {
-						id:      tool,
-						ok:      true,
-						summary: vec![Str::new_static("Host seam verified")],
+						id:   tool,
+						ok:   true,
+						view: Str::new_static("Host seam verified"),
 					});
 				}
 				if generation.load(Ordering::SeqCst) == turn {

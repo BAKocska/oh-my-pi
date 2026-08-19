@@ -239,12 +239,14 @@ impl<C: TurnClient> Agent<C> {
 		self.prompt_hash = None;
 		self.prompt_head_events.clear();
 		self.last_toolset_hash = None;
-		Ok(project_journal(
-			&self.journal.load()?,
+		let journal = self.journal.load()?;
+		let projected = project_journal(
+			&journal,
+			journal.as_ref(),
 			self.state.snapshot().registry.as_ref(),
 			&self.caps,
-		)?
-		.items)
+		)?;
+		Ok(projected.items)
 	}
 
 	/// Lists live user messages from oldest to newest for rewind selection.
@@ -770,7 +772,8 @@ impl<C: TurnClient> Agent<C> {
 		);
 		let lifted_reseed = if changed_toolset {
 			self.transition(AgentPhase::Projecting);
-			Some(project_journal(&self.journal.load()?, snapshot.registry.as_ref(), &self.caps)?)
+			let journal = self.journal.load()?;
+			Some(project_journal(&journal, journal.as_ref(), snapshot.registry.as_ref(), &self.caps)?)
 		} else {
 			None
 		};
@@ -786,8 +789,10 @@ impl<C: TurnClient> Agent<C> {
 			let input = if let Some(input) = resume_input.as_ref() {
 				input.clone()
 			} else if full {
+				let journal = self.journal.load()?;
 				TurnInput::Full(project_journal(
-					&self.journal.load()?,
+					&journal,
+					journal.as_ref(),
 					snapshot.registry.as_ref(),
 					&self.caps,
 				)?)
@@ -1640,6 +1645,7 @@ mod tests {
 					if matches!(&event.kind, Kind::TurnAbort(abort) if !abort.recoverable)
 			)
 		}));
+		drop(log);
 
 		let follow_up = agent
 			.submit([message(thread::Role::User, "after abort")], TurnId::new("post-abort-turn"))

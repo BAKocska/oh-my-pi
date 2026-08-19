@@ -22,7 +22,7 @@ pub use overlays::{ListPicker, ListRow, PromptEvent, PromptOverlay};
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
-pub use scene::{Chat, ChatKey, RenderedFrame, ToolKind};
+pub use scene::{Chat, ChatKey, RenderedFrame};
 pub use sidebar::Sidebar;
 pub use welcome::{Welcome, WelcomeEvent};
 
@@ -218,6 +218,13 @@ pub enum BackendEvent {
 		/// Output chunk.
 		chunk: Str,
 	},
+	/// Replace the retained structured view of a live tool invocation.
+	ToolView {
+		/// Stable tool-call identifier.
+		id:   Str,
+		/// Renderer-produced TML or structured generic fallback text.
+		view: Str,
+	},
 	/// Attach an inline image to a live tool invocation.
 	///
 	/// `source` is a filesystem path to persisted PNG bytes; the scene
@@ -232,11 +239,11 @@ pub enum BackendEvent {
 	/// Finish a tool invocation.
 	ToolFinished {
 		/// Stable tool-call identifier.
-		id:      Str,
+		id:   Str,
 		/// Whether the invocation succeeded.
-		ok:      bool,
-		/// Summary lines shown in the committed card.
-		summary: Vec<Str>,
+		ok:   bool,
+		/// Renderer-produced TML or structured generic fallback text.
+		view: Str,
 	},
 	/// Append an informational notice.
 	Notice(Str),

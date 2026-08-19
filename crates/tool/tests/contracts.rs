@@ -2,8 +2,8 @@
 //! history.
 
 use std::{
-	convert::Infallible,
 	future::{Future, ready},
+	io::{self, Write},
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
@@ -17,16 +17,19 @@ use omp_core::Str;
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{Adjustment, ToolGrammarSyntax};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, ArgPath, ArtifactLifetime, BlobRef, CallOutcome,
-	CallOutcomeDetails, CallOutcomeSpill, CapsBase, Claims, CommitError, Constraint,
-	ConstraintDisposition, ErasedEv, ErasedOutcome, Ev, ExpectedArtifact, Fallback, GrammarSyntax,
-	IncomingParams, Interrupt, InterruptWaitError, JobOwner, JobRef, LiftedCall, LoweringCaps,
-	ModelClass, ParamError, Part, Precedence, Presentation, ProjectedCall, PromptCaps, RecordedCall,
+	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
+	ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError,
+	CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint, ConstraintDisposition,
+	ErasedEv, ErasedOutcome, Ev, ExpectedArtifact, Fallback, GrammarSyntax, IncomingParams,
+	Interrupt, InterruptWaitError, JobOwner, JobRef, LiftedCall, LoweringCaps, ModelClass,
+	ParamError, Part, Precedence, Presentation, ProjectedCall, PromptCaps, RecordedCall,
 	RecordedCallOwned, Registry, RegistryError, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal,
 	call_outcome_details,
+	render::{Render, RenderRegistryError, ViewState},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use smallvec::smallvec;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FakeParams {
@@ -1018,22 +1021,85 @@ fn incomplete_lift_chain_preserves_the_exact_original_as_data() {
 	assert_eq!(registry.project(original.clone()), ProjectedCall::Data(original));
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpillError {
+	Open,
+	Finalize,
+}
+
+struct RecordingStage {
+	bytes:      Vec<u8>,
+	writes:     Arc<AtomicUsize>,
+	fail_write: bool,
+}
+
+impl Write for RecordingStage {
+	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+		self.writes.fetch_add(1, Ordering::SeqCst);
+		if self.fail_write {
+			return Err(io::Error::other("injected spill write failure"));
+		}
+		self.bytes.extend_from_slice(bytes);
+		Ok(bytes.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
 struct RecordingSpill {
-	tx: flume::Sender<Bytes>,
-	rx: flume::Receiver<Bytes>,
+	tx:            flume::Sender<Bytes>,
+	rx:            flume::Receiver<Bytes>,
+	opens:         AtomicUsize,
+	finalizes:     AtomicUsize,
+	writes:        Arc<AtomicUsize>,
+	fail_open:     bool,
+	fail_write:    bool,
+	fail_finalize: bool,
 }
 
 impl RecordingSpill {
 	fn new() -> Self {
 		let (tx, rx) = flume::unbounded();
-		Self { tx, rx }
+		Self {
+			tx,
+			rx,
+			opens: AtomicUsize::new(0),
+			finalizes: AtomicUsize::new(0),
+			writes: Arc::new(AtomicUsize::new(0)),
+			fail_open: false,
+			fail_write: false,
+			fail_finalize: false,
+		}
 	}
 }
 
 impl CallOutcomeSpill for RecordingSpill {
-	type Error = Infallible;
+	type Error = SpillError;
+	type Stage<'a> = RecordingStage;
 
-	fn spill(&self, json: Bytes) -> impl Future<Output = Result<BlobRef, Self::Error>> + Send + '_ {
+	fn open(&self) -> Result<Self::Stage<'_>, Self::Error> {
+		self.opens.fetch_add(1, Ordering::SeqCst);
+		if self.fail_open {
+			return Err(SpillError::Open);
+		}
+		Ok(RecordingStage {
+			bytes:      Vec::new(),
+			writes:     self.writes.clone(),
+			fail_write: self.fail_write,
+		})
+	}
+
+	fn finish<'a>(
+		&'a self,
+		stage: Self::Stage<'a>,
+	) -> impl Future<Output = Result<BlobRef, Self::Error>> + Send + 'a {
+		self.finalizes.fetch_add(1, Ordering::SeqCst);
+		if self.fail_finalize {
+			return ready(Err(SpillError::Finalize));
+		}
+		let json = Bytes::from(stage.bytes);
 		self
 			.tx
 			.send(json.clone())
@@ -1046,30 +1112,237 @@ impl CallOutcomeSpill for RecordingSpill {
 	}
 }
 
-#[test]
-fn call_outcome_spill_hook_runs_only_beyond_the_inline_boundary_with_exact_bytes() {
-	let verdict = CallOutcome::<FakePayload, FakeFault>::Ok(FakePayload {
+fn outcome_with_raw(raw: &str) -> CallOutcome<FakePayload, FakeFault> {
+	CallOutcome::Ok(FakePayload {
 		implementation: Str::from("engine"),
-		raw:            Str::from("{value:5}"),
-	});
-	let expected = Bytes::from(serde_json::to_vec(&verdict).unwrap());
+		raw:            Str::from(raw),
+	})
+}
+
+#[test]
+fn call_outcome_threshold_keeps_n_minus_one_and_n_inline_then_spills_n_plus_one() {
+	let n = 128;
+	let mut outcomes = (0..)
+		.map(|width| outcome_with_raw(&"x".repeat(width)))
+		.map(|outcome| {
+			let bytes = Bytes::from(serde_json::to_vec(&outcome).unwrap());
+			(outcome, bytes)
+		});
+	let below = outcomes.find(|(_, bytes)| bytes.len() == n - 1).unwrap();
+	let exact = outcomes.find(|(_, bytes)| bytes.len() == n).unwrap();
+	let above = outcomes.find(|(_, bytes)| bytes.len() == n + 1).unwrap();
 	let spill = RecordingSpill::new();
 
-	let inline = block_on(call_outcome_details(&verdict, expected.len(), &spill)).unwrap();
-	assert_eq!(inline, CallOutcomeDetails::Inline { json: expected.clone() });
-	assert!(spill.rx.try_recv().is_err());
+	assert_eq!(
+		block_on(call_outcome_details(&below.0, n, &spill)).unwrap(),
+		CallOutcomeDetails::Inline { json: below.1 },
+	);
+	assert_eq!(
+		block_on(call_outcome_details(&exact.0, n, &spill)).unwrap(),
+		CallOutcomeDetails::Inline { json: exact.1 },
+	);
+	assert_eq!(spill.opens.load(Ordering::SeqCst), 0);
 
-	let spilled = block_on(call_outcome_details(&verdict, expected.len() - 1, &spill)).unwrap();
-	assert_eq!(spilled, CallOutcomeDetails::Spilled {
-		blob:     BlobRef {
-			hash:       Str::from("sha256:fake"),
-			media_type: Str::from("application/json"),
-			byte_len:   expected.len() as u64,
+	assert_eq!(
+		block_on(call_outcome_details(&above.0, n, &spill)).unwrap(),
+		CallOutcomeDetails::Spilled {
+			blob:     BlobRef {
+				hash:       Str::from("sha256:fake"),
+				media_type: Str::from("application/json"),
+				byte_len:   above.1.len() as u64,
+			},
+			byte_len: above.1.len() as u64,
 		},
-		byte_len: expected.len() as u64,
-	});
-	assert_eq!(spill.rx.try_recv().unwrap(), expected);
+	);
+	assert_eq!(spill.rx.try_recv().unwrap(), above.1);
+	assert_eq!(spill.opens.load(Ordering::SeqCst), 1);
+	assert_eq!(spill.finalizes.load(Ordering::SeqCst), 1);
 	assert!(spill.rx.try_recv().is_err());
+}
+
+#[test]
+fn multi_write_overflow_preserves_order_without_reopening_or_refinalizing() {
+	let outcome = outcome_with_raw(&"0123456789abcdef".repeat(64));
+	let expected = Bytes::from(serde_json::to_vec(&outcome).unwrap());
+	let spill = RecordingSpill::new();
+
+	let details = block_on(call_outcome_details(&outcome, 17, &spill)).unwrap();
+	assert!(matches!(details, CallOutcomeDetails::Spilled { .. }));
+	assert_eq!(spill.rx.try_recv().unwrap(), expected);
+	assert_eq!(spill.opens.load(Ordering::SeqCst), 1);
+	assert_eq!(spill.finalizes.load(Ordering::SeqCst), 1);
+	assert!(spill.writes.load(Ordering::SeqCst) > 2);
+}
+
+struct FailingSerialize;
+
+impl Serialize for FailingSerialize {
+	fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		Err(serde::ser::Error::custom("injected serializer failure"))
+	}
+}
+
+#[test]
+fn call_outcome_reports_serializer_and_each_spill_stage_error() {
+	let serializer = CallOutcome::<FailingSerialize, FakeFault>::Ok(FailingSerialize);
+	let spill = RecordingSpill::new();
+	assert!(matches!(
+		block_on(call_outcome_details(&serializer, 128, &spill)),
+		Err(CallOutcomeDetailsError::Serialize(_)),
+	));
+	assert_eq!(spill.opens.load(Ordering::SeqCst), 0);
+
+	let outcome = outcome_with_raw("overflow");
+	let mut open = RecordingSpill::new();
+	open.fail_open = true;
+	assert!(matches!(
+		block_on(call_outcome_details(&outcome, 0, &open)),
+		Err(CallOutcomeDetailsError::SpillOpen(SpillError::Open)),
+	));
+	assert_eq!(open.finalizes.load(Ordering::SeqCst), 0);
+
+	let mut write = RecordingSpill::new();
+	write.fail_write = true;
+	assert!(matches!(
+		block_on(call_outcome_details(&outcome, 0, &write)),
+		Err(CallOutcomeDetailsError::SpillWrite(_)),
+	));
+	assert_eq!(write.finalizes.load(Ordering::SeqCst), 0);
+
+	let mut finalize = RecordingSpill::new();
+	finalize.fail_finalize = true;
+	assert!(matches!(
+		block_on(call_outcome_details(&outcome, 0, &finalize)),
+		Err(CallOutcomeDetailsError::SpillFinalize(SpillError::Finalize)),
+	));
+	assert_eq!(finalize.opens.load(Ordering::SeqCst), 1);
+	assert_eq!(finalize.finalizes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
+	let rev = Rev { family: Str::from("args"), n: 2 };
+	let canonical = smallvec![ArgPath::Key(Str::from("path"))];
+	let alias = smallvec![ArgPath::Key(Str::from("file"))];
+	let spec = ArgSpec {
+		path:     canonical.clone(),
+		aliases:  smallvec![Str::from("file")],
+		coerce:   smallvec![Coerce::Strip, Coerce::JsonString],
+		expected: Str::from("workspace path"),
+		example:  Some(Str::from("src/lib.rs")),
+	};
+	let mut specs = ArgSpecRegistry::new();
+	specs.register(rev.clone(), spec).unwrap();
+
+	let canonical_spec = specs.get(&rev, &canonical).unwrap();
+	let alias_spec = specs.get(&rev, &alias).unwrap();
+	assert!(std::ptr::eq(canonical_spec, alias_spec));
+	assert_eq!(alias_spec.example.as_deref(), Some("src/lib.rs"));
+	assert!(
+		specs
+			.get(&Rev { family: rev.family.clone(), n: 3 }, &alias)
+			.is_none()
+	);
+	assert!(matches!(
+		specs.register(rev.clone(), ArgSpec {
+			path:     alias,
+			aliases:  smallvec![],
+			coerce:   smallvec![],
+			expected: Str::from("other"),
+			example:  None,
+		},),
+		Err(ArgSpecRegistryError::Duplicate { .. }),
+	));
+	specs.seal();
+	assert!(specs.is_sealed());
+	assert_eq!(
+		specs.register(rev, ArgSpec {
+			path:     smallvec![ArgPath::Key(Str::from("late"))],
+			aliases:  smallvec![],
+			coerce:   smallvec![],
+			expected: Str::from("late"),
+			example:  None,
+		},),
+		Err(ArgSpecRegistryError::Sealed),
+	);
+}
+
+#[derive(Deserialize)]
+struct CountUpdate {
+	count: usize,
+}
+
+struct CountRender;
+
+impl Render for CountRender {
+	type Outcome = serde_json::Value;
+	type State = usize;
+	type Update = CountUpdate;
+
+	fn fold(&self, state: &mut Self::State, update: Self::Update) {
+		*state += update.count;
+	}
+
+	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
+		Some(Str::from(format!("count={state};settled={}", outcome.is_some())))
+	}
+}
+
+#[test]
+fn revision_stamps_round_trip_through_the_canonical_parser() {
+	for rev in [Rev { family: Str::from(""), n: 7 }, Rev { family: Str::from("hl"), n: 3 }] {
+		assert_eq!(rev.to_string().parse::<Rev>().unwrap(), rev);
+	}
+	for invalid in ["", ".3", "hl.", "hl.3.more", "hl.-1", "65536"] {
+		assert!(invalid.parse::<Rev>().is_err(), "{invalid}");
+	}
+}
+
+#[test]
+fn render_registry_is_exact_revision_cached_and_falls_back_without_name_lookup() {
+	let exact =
+		ToolIdentity { name: Str::from("counter"), rev: Rev { family: Str::from("counter"), n: 1 } };
+	let unknown = ToolIdentity {
+		name: exact.name.clone(),
+		rev:  Rev { family: exact.rev.family.clone(), n: 2 },
+	};
+	let mut registry = Registry::new();
+	let hashes = (registry.slot_hash(), registry.device_hash(), registry.projection_hash());
+	registry
+		.register_renderer(exact.clone(), CountRender)
+		.unwrap();
+	assert_eq!((registry.slot_hash(), registry.device_hash(), registry.projection_hash()), hashes,);
+	assert!(matches!(
+		registry.register_renderer(exact.clone(), CountRender),
+		Err(RenderRegistryError::Duplicate(identity)) if identity == exact
+	));
+	assert!(registry.renderer(&exact).is_some());
+	assert!(registry.renderer(&unknown).is_none());
+
+	let mut state = ViewState::new();
+	registry
+		.fold_render(&exact, &mut state, Bytes::from_static(br#"{"count":2}"#))
+		.unwrap();
+	registry
+		.fold_render(&exact, &mut state, Bytes::from_static(br#"{"count":3}"#))
+		.unwrap();
+	assert_eq!(
+		registry
+			.render_view(&exact, &state, Some(br#"{"kind":"ok"}"#))
+			.unwrap(),
+		"count=5;settled=true",
+	);
+	assert_eq!(state.raw_update_count(), 0);
+
+	let mut fallback = ViewState::new();
+	registry
+		.fold_render(&unknown, &mut fallback, Bytes::from_static(br#"{"progress":7}"#))
+		.unwrap();
+	assert_eq!(registry.render_view(&unknown, &fallback, None).unwrap(), r#"{"progress":7}"#,);
+	assert_eq!(fallback.raw_update_count(), 1);
 }
 
 #[test]

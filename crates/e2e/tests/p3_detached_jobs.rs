@@ -15,7 +15,7 @@ use omp_agent::{
 	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnClient, TurnId,
 	TurnInput, TurnOptions, TurnSession, WorkspaceInput,
 };
-use omp_app::envd::{server::EnvServer, worker::ToolWorkerConfig};
+use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
 use omp_core::Str;
 use omp_e2e::support::{
 	Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient, omp_binary,
@@ -72,7 +72,7 @@ impl RealEnv {
 				root.path(),
 				state.path(),
 				Registry::new(),
-				ToolWorkerConfig::new(omp_binary().expect("Cargo-built e2e host")),
+				ExtHostConfig::new(omp_binary().expect("Cargo-built e2e host")),
 			)
 			.await
 			.expect("real local environment"),

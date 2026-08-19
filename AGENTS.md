@@ -182,23 +182,32 @@ saying what it is and its structural philosophy.
   `#[allow]` requires a `reason`.
 - Formatting: `cargo fmt` (hard tabs, 3-column, max width 100 — see
   `rustfmt.toml`). Never hand-format.
-- Enum ↔ string vocabularies are NEVER hand-written match tables. Derive
-  strum: `IntoStaticStr`/`Display` for the emit side, `EnumString` for
-  parsing, `#[strum(serialize_all = "...")]` plus per-variant
-  `to_string`/`serialize` for aliases, `ascii_case_insensitive` for lax
-  input, and `const_into_str` so `as_str` stays `pub const fn`. A custom
-  public parse error keeps its type — parse via the derive and `map_err`.
-  Only when strum can't express the shape (per-arm logic, data variants
-  with dynamic strings, one labeled error shared across many enums) write
-  a local `macro_rules!` that emits both directions from a single
-  variant→string table (see `vocab!` in `crates/telemetry/src/semconv.rs`).
+- Enum ↔ string vocabularies: hand-written `match self { … => "…" }` tables
+  (any name — `name()`, `as_str()`, `label()`, `Display` impls) are
+  PROHIBITED, including on private enums. Every variant→string mapping is
+  derived strum: `IntoStaticStr`/`Display` for the emit side, `EnumString`
+  for parsing, `#[strum(serialize_all = "...")]` plus per-variant
+  `to_string`/`serialize` for aliases and irregular names (dotted protobuf
+  paths, multi-word labels — irregular strings are NOT an excuse to
+  hand-write the match), `ascii_case_insensitive` for lax input, and
+  `const_into_str` so `as_str` stays `pub const fn`. A custom public parse
+  error keeps its type — parse via the derive and `map_err`. The ONLY
+  sanctioned escape hatch, when strum can't express the shape (per-arm
+  logic, data variants with dynamic strings, one labeled error shared
+  across many enums), is a local `macro_rules!` that emits both directions
+  from a single variant→string table (see `vocab!` in
+  `crates/telemetry/src/semconv.rs`). Reviewers reject any new bare match
+  table on sight; migrate existing ones on touch.
 
 ### Composition, errors, and state
 
 - `crates/app` is the dependency-injection boundary. Compose registries,
   concrete Tower services, `TurnClient`s, and authorities there; library crates
   must not build a second production stack.
-- Libraries expose typed domain errors with `thiserror`. Application
+- Libraries expose typed domain errors with `thiserror`. Hand-written
+  `impl fmt::Display`/`impl Error` on error types are PROHIBITED — every
+  variant carries `#[error("…")]`; a manual `Display` on an error is a
+  reviewer-reject, same as a bare enum↔string match table. Application
   orchestration uses `miette` and classifies or redacts untrusted
   provider diagnostics before the top-level error reaches stderr.
 - Durable state belongs in the append-only transcript journal and blob store.

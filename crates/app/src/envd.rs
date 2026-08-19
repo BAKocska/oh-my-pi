@@ -17,7 +17,6 @@ use std::{io, path::Path, sync::Arc};
 #[doc(hidden)]
 pub use eval::{EVAL_CHILD_ARG, ProcessError as EvalChildError, run_eval_child_entry};
 use miette::IntoDiagnostic as _;
-use omp_core::Str;
 use omp_env::EnvClient;
 use omp_proto::env::v1::{ClientHello, ServerHello};
 use omp_tool::Registry;
@@ -25,8 +24,8 @@ pub use server::EnvdError;
 use tokio_util::sync::CancellationToken;
 
 use self::{
-	server::EnvServer,
-	worker::{PY_EVAL_MODULE, ToolWorkerConfig},
+	server::{EnvServer, ExtensionDataBinding},
+	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
 use crate::cli::EnvdArgs;
 
@@ -161,7 +160,7 @@ impl ProjectEnvironment {
 		docserver_socket: &Path,
 		py_eval: bool,
 	) -> Result<Self, EnvdError> {
-		let worker_config = worker_config(py_eval)?;
+		let (worker_config, data_bindings) = worker_config(state_dir, py_eval)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -180,9 +179,11 @@ impl ProjectEnvironment {
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
 		});
+		let shutdown = CancellationToken::new();
+		let mut tasks = vec![in_process];
+		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		hello(&client).await?;
-		let lifecycle =
-			ProjectLifecycle { shutdown: None, tasks: vec![in_process], _server: server };
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, _server: server };
 		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
 	}
 
@@ -193,7 +194,7 @@ impl ProjectEnvironment {
 		docserver_socket: &Path,
 		py_eval: bool,
 	) -> Result<Self, EnvdError> {
-		let worker_config = worker_config(py_eval)?;
+		let (worker_config, data_bindings) = worker_config(state_dir, py_eval)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -227,11 +228,9 @@ impl ProjectEnvironment {
 				);
 			}
 		});
-		let lifecycle = ProjectLifecycle {
-			shutdown: Some(shutdown),
-			tasks:    vec![in_process, uds],
-			_server:  server,
-		};
+		let mut tasks = vec![in_process, uds];
+		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, _server: server };
 		hello(&client).await?;
 		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
 	}
@@ -257,12 +256,48 @@ impl ProjectEnvironment {
 	}
 }
 
-fn worker_config(py_eval: bool) -> Result<ToolWorkerConfig, EnvdError> {
-	let mut config = ToolWorkerConfig::current()?;
+fn worker_config(
+	state_dir: &Path,
+	py_eval: bool,
+) -> Result<(ExtHostConfig, Vec<ExtensionDataBinding>), EnvdError> {
+	let mut config = ExtHostConfig::current()?;
+	let mut bindings = Vec::new();
 	if py_eval {
-		config.modules.push(Str::new_static(PY_EVAL_MODULE));
+		let key = HostKey::new("workspace", "trusted", PY_EVAL_MODULE);
+		let binding = ExtensionDataBinding::built_in(state_dir, key.clone());
+		let mut extension = ExtHostSpec::new(key, PY_EVAL_MODULE);
+		extension.data_socket = Some(binding.path().to_path_buf());
+		config.extensions.push(extension);
+		bindings.push(binding);
 	}
-	Ok(config)
+	Ok((config, bindings))
+}
+
+#[cfg(unix)]
+fn spawn_extension_data_servers(
+	server: &Arc<EnvServer>,
+	bindings: Vec<ExtensionDataBinding>,
+	shutdown: &CancellationToken,
+	tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+	for binding in bindings {
+		let server = Arc::clone(server);
+		let shutdown = shutdown.clone();
+		tasks.push(tokio::spawn(async move {
+			if let Err(error) = server.serve_extension_uds(binding, shutdown).await {
+				tracing::warn!(%error, "extension DATA socket stopped");
+			}
+		}));
+	}
+}
+
+#[cfg(not(unix))]
+fn spawn_extension_data_servers(
+	_server: &Arc<EnvServer>,
+	_bindings: Vec<ExtensionDataBinding>,
+	_shutdown: &CancellationToken,
+	_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
 }
 
 async fn hello(client: &EnvClient) -> Result<ServerHello, EnvdError> {

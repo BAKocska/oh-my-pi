@@ -392,6 +392,83 @@ fn unsupported_uri_is_rejected_before_any_document_probe() {
 	assert!(requests.lock().is_empty());
 }
 
+#[test]
+fn retired_device_write_targets_are_rejected_with_dyn_guidance_and_no_xd_scheme() {
+	let cases = [
+		("xd/report_issue", Some("report_issue"), true),
+		("xd://report_issue", Some("report_issue"), true),
+		("xd:/report_issue", Some("report_issue"), true),
+		("dx:/report_issue", Some("report_issue"), true),
+		("xdd://report_issue", Some("report_issue"), true),
+		("xdt:/report_issue", Some("report_issue"), true),
+		("device:/custom_tool", Some("custom_tool"), false),
+		("xd/", None, true),
+	];
+
+	for (target, tool_name, is_retired) in cases {
+		let documents = FakeDocuments::success(
+			LiteralPathProbe::Missing,
+			committed(WriteDisposition::Created, 0, false, None),
+		);
+		let probed = Arc::clone(&documents.probed);
+		let requests = Arc::clone(&documents.requests);
+		let raw = serde_json::to_string(&json!({
+			"path": target,
+			"content": "payload"
+		}))
+		.unwrap();
+		let invocation = invoke(documents, &raw);
+
+		assert!(invocation.result.is_err(), "target '{target}' should fail");
+		assert!(probed.lock().is_empty(), "target '{target}' probed document");
+		assert!(requests.lock().is_empty(), "target '{target}' requested write");
+
+		let text = &invocation.text;
+		if is_retired {
+			assert!(
+				text.starts_with("Unknown retired device target."),
+				"expected retired target prefix for '{target}', got: '{text}'"
+			);
+			assert!(
+				!text.contains("xd:") && !text.contains("xd/"),
+				"diagnostic for '{target}' echoes or suggests retired scheme: '{text}'"
+			);
+		} else {
+			assert!(
+				text.starts_with(&format!("Unknown URI-like write target '{target}'.")),
+				"expected URI-like target prefix for '{target}', got: '{text}'"
+			);
+			assert!(
+				!text.contains("xd:"),
+				"diagnostic for '{target}' suggests retired scheme: '{text}'"
+			);
+		}
+		assert!(
+			text.contains(r#"{"do_":"search"}"#),
+			"missing search discovery guidance in '{text}' for '{target}'"
+		);
+		assert!(
+			text.contains("docs/<path>"),
+			"missing docs/<path> guidance in '{text}' for '{target}'"
+		);
+		if let Some(name) = tool_name {
+			assert!(
+				text.contains(&format!("docs/{name}")),
+				"missing specific docs/{name} in '{text}' for '{target}'"
+			);
+			assert!(
+				text.contains(&format!(r#"{{"do_":"invoke/{name}",...}}"#)),
+				"missing specific invoke/{name} dispatch in '{text}' for '{target}'"
+			);
+		} else {
+			assert!(
+				text.contains(r#"{"do_":"invoke/<path>",...}"#),
+				"missing generic invoke/<path> dispatch in '{text}' for '{target}'"
+			);
+		}
+	}
+}
+
 async fn interrupt_stalled_special_write(
 	phase: StalledPhase,
 ) -> Vec<Ev<write::Update, write::Payload, Fault>> {

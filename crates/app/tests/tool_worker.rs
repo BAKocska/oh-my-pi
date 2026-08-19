@@ -3,18 +3,27 @@
 
 use std::{
 	fs,
+	io::Write as _,
 	path::Path,
+	process::{Command, Stdio},
 	time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use nix::{errno::Errno, sys::signal, unistd::Pid};
 use omp_app::envd::worker::{
-	CommittedToolCall, PY_EVAL_MODULE, ToolWorkerConfig, ToolWorkerSupervisor, WorkerAbortKind,
-	WorkerEvent,
+	CommittedToolCall, ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE,
+	WorkerAbortKind, WorkerCompletion, WorkerEvent, WorkerOutcomeKind,
 };
 use omp_core::Str;
-use omp_proto::{thread::v1::part, toolhost::v1::ToolComplete};
+use omp_proto::{
+	prost::Message as _,
+	thread::v1::{Blob, Part, part},
+	toolhost::v1::{
+		AdmitExtensions, AdmittedExtension, ArgIssue, HostFrame, LifecycleHostEnvelope, OutcomeKind,
+		ToolComplete, host_frame, lifecycle_host_envelope,
+	},
+};
 use serde_json::{Value, json};
 
 const EXTENSION: &str = r#"
@@ -89,34 +98,207 @@ OMP_TOOLS = [
         "handler": native_block,
     },
 ]
+
 "#;
+
+const SIBLING_EXTENSION: &str = r#"
+import os
+
+def stable_echo(params):
+    return {
+        "parts": [params["message"]],
+        "details": {
+            "message": params["message"],
+            "pid": os.getpid(),
+            "env_socket": os.environ.get("OMP_EXT_ENV_SOCKET"),
+        },
+    }
+
+OMP_TOOLS = [{
+    "name": "stable_echo",
+    "description": "proves another extension process survives",
+    "schema": {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+        "additionalProperties": False,
+    },
+    "rev": "r1",
+    "strict": True,
+    "handler": stable_echo,
+}]
+"#;
+
+#[test]
+fn completion_preserves_all_outcome_branches_and_presence_rules() {
+	let legacy = WorkerCompletion::try_from(ToolComplete {
+		call_id: "legacy".into(),
+		details_json: Bytes::from_static(b"{}"),
+		is_error: true,
+		..Default::default()
+	})
+	.expect("legacy completion");
+	assert_eq!(legacy.kind, WorkerOutcomeKind::Faulted);
+
+	let rejected = WorkerCompletion::try_from(ToolComplete {
+		call_id: "args".into(),
+		details_json: Bytes::from_static(b"null"),
+		kind: OutcomeKind::ArgsRejected.into(),
+		args_issue: Some(ArgIssue {
+			path: vec!["count".into()],
+			expected: "integer".into(),
+			kind: "type".into(),
+			..Default::default()
+		}),
+		..Default::default()
+	})
+	.expect("structured argument rejection");
+	assert_eq!(rejected.kind, WorkerOutcomeKind::ArgsRejected);
+	assert!(rejected.args_issue.is_some());
+
+	let aborted = WorkerCompletion::try_from(ToolComplete {
+		call_id: "aborted".into(),
+		kind: OutcomeKind::Aborted.into(),
+		details_blob: Some(Blob {
+			hash: Bytes::from_static(&[7; 32]),
+			mime: "application/json".into(),
+			size: 2,
+			..Default::default()
+		}),
+		..Default::default()
+	})
+	.expect("spilled abort");
+	assert_eq!(aborted.kind, WorkerOutcomeKind::Aborted);
+	assert!(aborted.details_json.is_none());
+	assert!(aborted.details_blob.is_some());
+
+	assert!(
+		WorkerCompletion::try_from(ToolComplete {
+			call_id: "xor".into(),
+			details_json: Bytes::from_static(b"{}"),
+			details_blob: Some(Blob::default()),
+			..Default::default()
+		})
+		.is_err()
+	);
+	assert!(
+		WorkerCompletion::try_from(ToolComplete {
+			call_id: "part".into(),
+			parts: vec![Part { kind: None }],
+			details_json: Bytes::from_static(b"{}"),
+			..Default::default()
+		})
+		.is_err()
+	);
+}
+#[test]
+fn worker_connection_rejects_nested_counts_before_decode() {
+	let mut child = Command::new(env!("CARGO_BIN_EXE_omp"))
+		.arg(omp_app::envd::worker::WORKER_ARG)
+		.env_remove("OMP_PY_MODULES")
+		.env("OMP_EXT_LAYER", "workspace")
+		.env("OMP_EXT_TIER", "trusted")
+		.env("OMP_EXT_HOST_GENERATION", "1")
+		.env("OMP_EXT_SESSION_GENERATION", "1")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.spawn()
+		.expect("spawn bounded-frame worker");
+	let frame = HostFrame {
+		request_id: 1,
+		body:       Some(host_frame::Body::Lifecycle(LifecycleHostEnvelope {
+			body:  Some(lifecycle_host_envelope::Body::AdmitExtensions(AdmitExtensions {
+				extensions: vec![AdmittedExtension::default(); 1_025],
+				generation: 1,
+				props:      None,
+			})),
+			props: None,
+		})),
+		props:      None,
+	};
+	let mut encoded = Vec::new();
+	frame
+		.encode_length_delimited(&mut encoded)
+		.expect("encode over-count host frame");
+	child
+		.stdin
+		.take()
+		.expect("worker stdin")
+		.write_all(&encoded)
+		.expect("write over-count frame");
+	let output = child
+		.wait_with_output()
+		.expect("wait for bounded-frame rejection");
+	assert!(!output.status.success(), "worker accepted an over-count host frame");
+}
+
+#[tokio::test]
+async fn supervisor_rejects_stale_host_generation() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let scratch = tempfile::tempdir().expect("stale generation scratch");
+	let wrapper = scratch.path().join("stale-worker");
+	let executable = env!("CARGO_BIN_EXE_omp").replace('\'', "'\"'\"'");
+	fs::write(
+		&wrapper,
+		format!("#!/bin/sh\nexport OMP_EXT_HOST_GENERATION=0\nexec '{executable}' \"$@\"\n"),
+	)
+	.expect("write stale-generation wrapper");
+	fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+		.expect("make stale-generation wrapper executable");
+	let mut config = ExtHostConfig::new(wrapper);
+	config
+		.extensions
+		.push(ExtHostSpec::new(HostKey::new("workspace", "trusted", PY_EVAL_MODULE), PY_EVAL_MODULE));
+	let Err(error) = ExtHostSupervisor::spawn(config).await else {
+		panic!("stale WorkerHello generation was accepted");
+	};
+	assert!(
+		error.to_string().contains("identity or generation"),
+		"unexpected stale-generation rejection: {error}"
+	);
+}
 
 #[tokio::test]
 async fn same_binary_worker_kills_native_call_and_respawns() {
 	let site = tempfile::tempdir().expect("Python site scratch directory");
 	fs::write(site.path().join("phase1_worker_tools.py"), EXTENSION)
 		.expect("write temporary Python extension");
+	fs::write(site.path().join("sibling_worker_tools.py"), SIBLING_EXTENSION)
+		.expect("write sibling Python extension");
 
-	let mut config = ToolWorkerConfig::new(env!("CARGO_BIN_EXE_omp").into());
-	config.python_site = Some(site.path().to_owned());
-	config.modules = vec![Str::new_static("phase1_worker_tools")];
-	config.health_timeout = Duration::from_secs(5);
+	let mut config = ExtHostConfig::new(env!("CARGO_BIN_EXE_omp").into());
+	let mut extension = ExtHostSpec::new(
+		HostKey::new("workspace", "trusted", "phase1-worker-tools"),
+		"phase1_worker_tools",
+	);
+	extension.python_site = Some(site.path().to_owned());
+	config.extensions.push(extension);
+	let mut sibling = ExtHostSpec::new(
+		HostKey::new("workspace", "trusted", "sibling-worker-tools"),
+		"sibling_worker_tools",
+	);
+	let scoped_socket = site.path().join("sibling-data.sock");
+	sibling.data_socket = Some(scoped_socket.clone());
+	sibling.python_site = Some(site.path().to_owned());
+	config.extensions.push(sibling);
 	config.interrupt_grace = Duration::from_millis(250);
 	config.initial_backoff = Duration::from_millis(10);
 	config.max_backoff = Duration::from_millis(50);
 	let interrupt_grace = config.interrupt_grace;
 
-	let supervisor =
-		tokio::time::timeout(Duration::from_secs(10), ToolWorkerSupervisor::spawn(config))
-			.await
-			.expect("worker hello and registration timed out")
-			.expect("spawn same-binary Python worker");
+	let supervisor = tokio::time::timeout(Duration::from_secs(10), ExtHostSupervisor::spawn(config))
+		.await
+		.expect("worker hello and registration timed out")
+		.expect("spawn same-binary Python worker");
 
 	let names = supervisor
 		.registrations()
 		.iter()
-		.map(|decl| {
-			decl
+		.map(|registration| {
+			registration
+				.declaration
 				.definition
 				.as_ref()
 				.expect("registered definition")
@@ -124,12 +306,12 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 				.as_str()
 		})
 		.collect::<Vec<_>>();
-	assert_eq!(names, ["echo_update", "native_block"]);
+	assert_eq!(names, ["echo_update", "native_block", "stable_echo"]);
 	assert!(
 		supervisor
 			.registrations()
 			.iter()
-			.all(|decl| decl.rev == "r1")
+			.all(|registration| registration.declaration.rev == "r1")
 	);
 
 	let (first_update, first_complete) = tokio::time::timeout(
@@ -141,14 +323,26 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 	assert_eq!(first_update["message"], "before kill");
 	assert_eq!(first_update["commit_seal"], "committed");
 	assert_eq!(completion_text(&first_complete), "before kill");
-	let first_details: Value =
-		serde_json::from_slice(&first_complete.details_json).expect("echo completion details JSON");
+	let first_details: Value = serde_json::from_slice(
+		first_complete
+			.details_json
+			.as_deref()
+			.expect("inline echo completion details"),
+	)
+	.expect("echo completion details JSON");
 	assert_eq!(first_details, first_update);
 	let first_pid = first_details["pid"]
 		.as_i64()
 		.expect("worker pid in echo details") as i32;
-
 	let started = site.path().join("native-call-started");
+
+	let (sibling_pid, inherited_socket) =
+		stable_roundtrip(&supervisor, "sibling-before", "still alive").await;
+	assert_eq!(
+		inherited_socket.as_deref(),
+		scoped_socket.to_str(),
+		"selected child did not inherit its scoped DATA socket"
+	);
 	let mut blocked = supervisor
 		.invoke_committed(call(
 			"native-block",
@@ -182,6 +376,13 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 	assert_eq!(abort.kind, WorkerAbortKind::Cancelled);
 	assert!(abort.effects_unknown, "dispatched worker cancellation must report effects unknown");
 	assert!(
+		abort
+			.reason
+			.contains("no other extension host was terminated"),
+		"isolated cancellation omitted its blast-radius truth: {}",
+		abort.reason
+	);
+	assert!(
 		cancel_elapsed >= interrupt_grace.saturating_sub(Duration::from_millis(25)),
 		"native call ended cooperatively before the hard-kill grace elapsed: {cancel_elapsed:?}"
 	);
@@ -189,7 +390,11 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		matches!(signal::kill(Pid::from_raw(blocked_pid), None), Err(Errno::ESRCH)),
 		"cancelled native worker process {blocked_pid} is still alive"
 	);
-
+	let (sibling_after, _) = stable_roundtrip(&supervisor, "sibling-after", "never restarted").await;
+	assert_eq!(
+		sibling_after, sibling_pid,
+		"cancelling one extension restarted its independently supervised sibling"
+	);
 	let (second_update, second_complete) = tokio::time::timeout(
 		Duration::from_secs(5),
 		echo_roundtrip(&supervisor, "echo-after", "after respawn"),
@@ -198,8 +403,13 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 	.expect("respawned worker did not serve the next invocation");
 	assert_eq!(second_update["message"], "after respawn");
 	assert_eq!(completion_text(&second_complete), "after respawn");
-	let second_details: Value =
-		serde_json::from_slice(&second_complete.details_json).expect("respawn echo details JSON");
+	let second_details: Value = serde_json::from_slice(
+		second_complete
+			.details_json
+			.as_deref()
+			.expect("inline respawn echo details"),
+	)
+	.expect("respawn echo details JSON");
 	let second_pid = second_details["pid"]
 		.as_i64()
 		.expect("respawned worker pid") as i32;
@@ -211,30 +421,32 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 #[tokio::test]
 async fn opt_in_py_eval_survives_cancel_and_respawn() {
 	let disabled =
-		ToolWorkerSupervisor::spawn(ToolWorkerConfig::new(env!("CARGO_BIN_EXE_omp").into()))
+		ExtHostSupervisor::spawn(ExtHostConfig::new("/definitely/not/an/extension-host".into()))
 			.await
-			.expect("spawn default Python worker");
+			.expect("spawn empty extension supervisor");
 	assert!(
 		disabled.registrations().is_empty(),
 		"default worker unexpectedly advertised a Python tool"
 	);
 	disabled.shutdown().await;
 
-	let mut config = ToolWorkerConfig::new(env!("CARGO_BIN_EXE_omp").into());
-	config.modules.push(Str::new_static(PY_EVAL_MODULE));
+	let mut config = ExtHostConfig::new(env!("CARGO_BIN_EXE_omp").into());
+	config
+		.extensions
+		.push(ExtHostSpec::new(HostKey::new("workspace", "trusted", PY_EVAL_MODULE), PY_EVAL_MODULE));
 	config.interrupt_grace = Duration::from_millis(150);
 	config.initial_backoff = Duration::from_millis(10);
 	config.max_backoff = Duration::from_millis(50);
 	let interrupt_grace = config.interrupt_grace;
-	let supervisor =
-		tokio::time::timeout(Duration::from_secs(10), ToolWorkerSupervisor::spawn(config))
-			.await
-			.expect("py_eval worker registration timed out")
-			.expect("spawn py_eval worker");
+	let supervisor = tokio::time::timeout(Duration::from_secs(10), ExtHostSupervisor::spawn(config))
+		.await
+		.expect("py_eval worker registration timed out")
+		.expect("spawn py_eval worker");
 
-	let [declaration] = supervisor.registrations() else {
+	let [registration] = supervisor.registrations() else {
 		panic!("expected exactly one py_eval declaration");
 	};
+	let declaration = &registration.declaration;
 	let definition = declaration.definition.as_ref().expect("py_eval definition");
 	assert_eq!(definition.name, "py_eval");
 	assert_eq!(declaration.rev, "1");
@@ -251,13 +463,13 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 
 	let first = py_eval_roundtrip(&supervisor, "py-eval-before", "6 * 7").await;
 	assert_eq!(
-		serde_json::from_slice::<Value>(&first.details_json).expect("py_eval result JSON"),
+		serde_json::from_slice::<Value>(completion_details(&first)).expect("py_eval result JSON"),
 		json!({ "result": 42 })
 	);
 
 	let repr = py_eval_roundtrip(&supervisor, "py-eval-repr", "{3, 1, 2}").await;
 	assert_eq!(
-		serde_json::from_slice::<Value>(&repr.details_json).expect("py_eval repr JSON"),
+		serde_json::from_slice::<Value>(completion_details(&repr)).expect("py_eval repr JSON"),
 		json!({ "result": "{1, 2, 3}" })
 	);
 
@@ -266,14 +478,19 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		.expect("dispatch failing py_eval");
 	match fault.next().await.expect("py_eval fault event") {
 		WorkerEvent::Complete(complete) => {
-			assert!(complete.is_error, "Python exception reported clean success");
+			assert_eq!(
+				complete.kind,
+				WorkerOutcomeKind::Aborted,
+				"Python exception flattened into the wrong terminal branch"
+			);
 			let details: Value =
-				serde_json::from_slice(&complete.details_json).expect("py_eval fault details");
+				serde_json::from_slice(completion_details(&complete)).expect("py_eval abort details");
+			assert_eq!(details["kind"], "effects_unknown");
 			assert!(
-				details["error"]
+				details["reason"]
 					.as_str()
-					.is_some_and(|error| error.contains("ZeroDivisionError")),
-				"typed Python fault omitted ZeroDivisionError: {details}"
+					.is_some_and(|reason| reason.contains("ZeroDivisionError")),
+				"typed Python abort omitted ZeroDivisionError: {details}"
 			);
 		},
 		WorkerEvent::Update(_) => panic!("failing py_eval unexpectedly emitted an update"),
@@ -316,10 +533,14 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 	.await
 	.expect("respawned py_eval worker did not recover");
 	assert_eq!(
-		serde_json::from_slice::<Value>(&second.details_json).expect("respawn result JSON"),
+		serde_json::from_slice::<Value>(completion_details(&second)).expect("respawn result JSON"),
 		json!({ "result": 42 })
 	);
-	assert_eq!(supervisor.registrations(), std::slice::from_ref(declaration));
+	assert_eq!(
+		&supervisor.registrations()[0].declaration,
+		declaration,
+		"respawn changed the fenced registration set"
+	);
 	supervisor.shutdown().await;
 }
 
@@ -340,16 +561,16 @@ fn py_eval_call(
 }
 
 async fn py_eval_roundtrip(
-	supervisor: &ToolWorkerSupervisor,
+	supervisor: &ExtHostSupervisor,
 	call_id: &'static str,
 	code: &'static str,
-) -> ToolComplete {
+) -> WorkerCompletion {
 	let mut invocation = supervisor
 		.invoke_committed(py_eval_call(call_id, code, Duration::from_secs(5)))
 		.expect("dispatch py_eval");
 	match invocation.next().await.expect("py_eval event") {
 		WorkerEvent::Complete(complete) => {
-			assert!(!complete.is_error, "py_eval completion reported an error");
+			assert_eq!(complete.kind, WorkerOutcomeKind::Ok);
 			complete
 		},
 		WorkerEvent::Update(_) => panic!("py_eval unexpectedly emitted an update"),
@@ -373,10 +594,10 @@ fn call(
 }
 
 async fn echo_roundtrip(
-	supervisor: &ToolWorkerSupervisor,
+	supervisor: &ExtHostSupervisor,
 	call_id: &'static str,
 	message: &'static str,
-) -> (Value, ToolComplete) {
+) -> (Value, WorkerCompletion) {
 	let mut invocation = supervisor
 		.invoke_committed(call(
 			call_id,
@@ -398,8 +619,34 @@ async fn echo_roundtrip(
 		WorkerEvent::Aborted(abort) => panic!("echo aborted after update: {}", abort.reason),
 	};
 	assert_eq!(complete.call_id, call_id);
-	assert!(!complete.is_error, "echo completion reported an error");
+	assert_eq!(complete.kind, WorkerOutcomeKind::Ok);
 	(update, complete)
+}
+
+async fn stable_roundtrip(
+	supervisor: &ExtHostSupervisor,
+	call_id: &'static str,
+	message: &'static str,
+) -> (i32, Option<String>) {
+	let mut invocation = supervisor
+		.invoke_committed(call(
+			call_id,
+			"stable_echo",
+			json!({ "message": message }),
+			Duration::from_secs(5),
+		))
+		.expect("dispatch sibling invocation");
+	let complete = match invocation.next().await.expect("sibling completion") {
+		WorkerEvent::Complete(complete) => complete,
+		WorkerEvent::Update(_) => panic!("sibling unexpectedly emitted an update"),
+		WorkerEvent::Aborted(abort) => panic!("sibling aborted: {}", abort.reason),
+	};
+	let details =
+		serde_json::from_slice::<Value>(completion_details(&complete)).expect("sibling details JSON");
+	(
+		details["pid"].as_i64().expect("sibling pid") as i32,
+		details["env_socket"].as_str().map(ToOwned::to_owned),
+	)
 }
 
 async fn wait_for_marker(path: &Path) -> i32 {
@@ -415,7 +662,7 @@ async fn wait_for_marker(path: &Path) -> i32 {
 	.expect("native Python call did not enter ctypes sleep")
 }
 
-fn completion_text(complete: &ToolComplete) -> &str {
+fn completion_text(complete: &WorkerCompletion) -> &str {
 	match complete.parts.as_slice() {
 		[part] => match part.kind.as_ref() {
 			Some(part::Kind::Text(text)) => text,
@@ -423,4 +670,11 @@ fn completion_text(complete: &ToolComplete) -> &str {
 		},
 		parts => panic!("expected one completion part, got {}", parts.len()),
 	}
+}
+
+fn completion_details(complete: &WorkerCompletion) -> &[u8] {
+	complete
+		.details_json
+		.as_deref()
+		.expect("completion carries inline JSON details")
 }

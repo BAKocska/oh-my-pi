@@ -10,6 +10,11 @@
 //! renamed into their final location, so readers never observe a
 //! partially-written blob. [`BlobStore::get`] verifies length only by default.
 //! Call [`BlobStore::verify`] when a full digest check is required.
+//!
+//! Blob-producing transactions intentionally finish before the journal entry
+//! that makes them reachable. This put-before-journal ordering can leave an
+//! unreferenced blob after a crash, but never a journal reference to a missing
+//! blob.
 
 use std::{
 	fmt,
@@ -141,45 +146,31 @@ impl BlobStore {
 
 	/// Stores an in-memory blob and returns its content-derived reference.
 	///
-	/// If the digest is already present, this operation succeeds without
-	/// rewriting the file. Otherwise it writes and synchronizes a temporary
-	/// file before atomically renaming it.
+	/// This uses the same staged, single-pass placement authority as
+	/// [`Self::put_reader`] and [`Self::begin_put`]. If the digest is already
+	/// present, the operation succeeds without rewriting the file.
 	///
 	/// # Errors
 	///
-	/// Returns [`Error::Io`] when hashing metadata cannot be represented or a
+	/// Returns [`Error::Io`] when the input length cannot be represented or a
 	/// filesystem operation fails.
 	pub fn put(&self, data: &[u8]) -> Result<BlobRef, Error> {
-		let size = usize_to_u64(data.len())?;
-		let reference = BlobRef { hash: *blake3::hash(data).as_bytes(), size };
-		let destination = self.path(&reference);
-		if destination.try_exists()? {
-			return Ok(reference);
-		}
-
-		Self::prepare_destination(&destination)?;
-		let (mut file, temporary) = self.create_temp()?;
-		file.write_all(data)?;
-		file.sync_all()?;
-		drop(file);
-		Self::commit(temporary, &destination)?;
-		Ok(reference)
+		self.put_reader(data)
 	}
 
 	/// Streams a blob from `reader` into the store while computing its digest.
 	///
-	/// The stream is copied to a temporary file, synchronized, and atomically
-	/// renamed only after its final digest and destination are known. An
-	/// existing destination makes the operation an idempotent success.
+	/// The reader is consumed once using one recycled fixed-size scratch
+	/// allocation. Bytes pass through [`BlobStage`], so reader-driven and
+	/// serializer-driven writes share hashing, synchronization, atomic
+	/// placement, deduplication, and cleanup.
 	///
 	/// # Errors
 	///
 	/// Returns [`Error::Io`] when reading, writing, synchronizing, or renaming
 	/// fails.
 	pub fn put_reader(&self, mut reader: impl Read) -> Result<BlobRef, Error> {
-		let (mut file, temporary) = self.create_temp()?;
-		let mut hasher = blake3::Hasher::new();
-		let mut size = 0_u64;
+		let mut stage = self.begin_put()?;
 		let mut buffer = vec![0_u8; COPY_BUFFER_SIZE].into_boxed_slice();
 
 		loop {
@@ -193,24 +184,33 @@ impl BlobStore {
 					return Err(error.into());
 				},
 			};
-			file.write_all(&buffer[..read])?;
-			hasher.update(&buffer[..read]);
-			size = size
-				.checked_add(usize_to_u64(read)?)
-				.ok_or_else(|| io::Error::other("blob length exceeds u64"))?;
+			stage.write_all(&buffer[..read])?;
 		}
 
-		file.sync_all()?;
-		drop(file);
-		let reference = BlobRef { hash: *hasher.finalize().as_bytes(), size };
-		let destination = self.path(&reference);
-		if destination.try_exists()? {
-			return Ok(reference);
-		}
+		stage.finish()
+	}
 
-		Self::prepare_destination(&destination)?;
-		Self::commit(temporary, &destination)?;
-		Ok(reference)
+	/// Starts a store-owned streaming blob transaction.
+	///
+	/// Write already-encoded bytes into the returned [`BlobStage`] and call
+	/// [`BlobStage::finish`] to synchronize and atomically adopt them. Dropping
+	/// the stage, including while unwinding from a serializer error, removes its
+	/// temporary file. Finalization deliberately precedes any journal record
+	/// that makes the returned reference reachable.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::Io`] when a temporary staging file cannot be created.
+	pub fn begin_put(&self) -> Result<BlobStage, Error> {
+		let (file, temporary) = self.create_temp()?;
+		Ok(BlobStage {
+			store: self.clone(),
+			file: Some(file),
+			temporary,
+			hasher: blake3::Hasher::new(),
+			size: 0,
+			failed: false,
+		})
 	}
 
 	/// Reads a blob, checking that its stored byte length matches the reference.
@@ -327,6 +327,104 @@ impl BlobStore {
 				Ok(())
 			},
 			Err(error) => Err(error.into()),
+		}
+	}
+}
+
+/// A store-owned, single-pass writer for one content-addressed blob.
+///
+/// Each successful write is incorporated into the blob's BLAKE3 digest and
+/// byte length exactly once. The temporary content is removed unless
+/// [`Self::finish`] successfully adopts it.
+pub struct BlobStage {
+	store:     BlobStore,
+	file:      Option<File>,
+	temporary: TemporaryPath,
+	hasher:    blake3::Hasher,
+	size:      u64,
+	failed:    bool,
+}
+
+impl BlobStage {
+	/// Synchronizes and atomically adopts the staged bytes, returning their
+	/// exact content-derived reference.
+	///
+	/// An existing blob with the same digest is a successful deduplication. On
+	/// any error, the unadopted temporary file is removed.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::Io`] when the stage has failed, or when synchronizing,
+	/// preparing the destination, or atomically placing the blob fails.
+	pub fn finish(mut self) -> Result<BlobRef, Error> {
+		if self.failed {
+			return Err(io::Error::other("blob stage previously failed").into());
+		}
+
+		let file = self.file.take().expect("blob stage file is present");
+		file.sync_all()?;
+		drop(file);
+
+		let reference = BlobRef { hash: *self.hasher.finalize().as_bytes(), size: self.size };
+		let destination = self.store.path(&reference);
+		if destination.try_exists()? {
+			return Ok(reference);
+		}
+
+		BlobStore::prepare_destination(&destination)?;
+		BlobStore::commit(self.temporary, &destination)?;
+		Ok(reference)
+	}
+
+	fn file(&mut self) -> &mut File {
+		self.file.as_mut().expect("blob stage file is present")
+	}
+}
+
+impl Write for BlobStage {
+	fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+		let written = match self.file().write(buffer) {
+			Ok(written) => written,
+			Err(error) => {
+				self.failed = true;
+				return Err(error);
+			},
+		};
+		self.hasher.update(&buffer[..written]);
+		self.size = match u64::try_from(written)
+			.ok()
+			.and_then(|written| self.size.checked_add(written))
+		{
+			Some(size) => size,
+			None => {
+				self.failed = true;
+				return Err(io::Error::other("blob length exceeds u64"));
+			},
+		};
+		Ok(written)
+	}
+
+	fn write_all(&mut self, mut buffer: &[u8]) -> io::Result<()> {
+		while !buffer.is_empty() {
+			match self.write(buffer) {
+				Ok(0) => {
+					self.failed = true;
+					return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write staged blob"));
+				},
+				Ok(written) => buffer = &buffer[written..],
+				Err(error) => return Err(error),
+			}
+		}
+		Ok(())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		match self.file().flush() {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				self.failed = true;
+				Err(error)
+			},
 		}
 	}
 }

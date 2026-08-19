@@ -2147,7 +2147,7 @@ All `OMP_*` per repository policy. Every one has a flag equivalent except where 
 | `OMP_EXT_UV` | discovered on `PATH` | Path to the `uv` binary. |
 | `OMP_EXT_TARGETS` | detected | Default target triples for resolution. |
 | `OMP_EXT_TRACE` | unset | `1` logs every resolution decision with its rule ID and every verification with its digest. |
-| `OMP_EXT_ENV_SOCKET` | unset | **Reserved, not yet consumed.** Path to the `env/v1` socket a host child should connect its DATA edge to, one per host so client- and workspace-layer children can be given different `ConnectionPolicy` scopes (§6.0.1). Sits beside the existing `OMP_PY_SITE` / `OMP_PY_MODULES` spawn variables. |
+| `OMP_EXT_ENV_SOCKET` | unset | Path to the `env/v1` socket passed at spawn for the host child DATA edge, scoped per host so client- and workspace-layer children are given different `ConnectionPolicy` scopes (§6.0.1). Sits beside the existing `OMP_PY_SITE` / `OMP_PY_MODULES` spawn variables. |
 
 ### 3.15 Python-visible symbols
 
@@ -2685,7 +2685,7 @@ partly wire-complete, and **unreachable from Python**. Topology-as-shipped is
   via `ConnectionPolicy`. That is also exactly where the per-layer capability scope of §2.1
   attaches: the *client*-layer host and the *workspace*-layer host get env connections with
   different `ConnectionPolicy`, which makes §2.3's scoping a configuration of an existing
-  mechanism rather than a new one. Reserve `OMP_EXT_ENV_SOCKET` for it (§3.14).
+  mechanism rather than a new one. Uses `OMP_EXT_ENV_SOCKET` for it (§3.14).
 - `omp ext sync`'s remote materialization (§6.4) therefore cannot go through a Python client
   at all. It must be driven Rust-side by the supervisor, which is the right place anyway —
   an extension host should not be able to write to its own site tree.

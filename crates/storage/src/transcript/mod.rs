@@ -30,6 +30,6 @@ pub use event::{
 };
 pub use msg::{Content, Msg, UserBlock};
 pub use patch::Patch;
-pub use reader::{Entry, Log, load};
+pub use reader::{Entry, LiveSet, Log, Reader, RefreshReport, RefreshState, load};
 pub use types::*;
 pub use writer::Writer;

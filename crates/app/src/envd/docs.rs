@@ -62,6 +62,15 @@ impl DocumentLease {
 		&self.head
 	}
 
+	/// Advances this lease to a committed head returned for the same document.
+	pub(crate) fn advance(&mut self, head: pb::DocumentHead) -> Result<(), DocumentError> {
+		if head.revision.is_none() || head.document != self.head.document {
+			return Err(unexpected("committed head for the leased document"));
+		}
+		self.head = head;
+		Ok(())
+	}
+
 	fn revision(&self) -> Result<pb::Revision, DocumentError> {
 		self
 			.head
@@ -290,30 +299,45 @@ impl DocumentHost {
 		language_id: Option<Str>,
 		cancel: &CancellationToken,
 	) -> Result<DocumentLease, DocumentError> {
-		let body = self
-			.request(
-				pb::client_frame::Body::OpenDocument(pb::OpenDocumentRequest {
+		let (lease, _) = self
+			.open_request(
+				pb::OpenDocumentRequest {
 					uri:         uri.into(),
 					language_id: language_id.unwrap_or_default().into(),
-				}),
+				},
 				cancel,
 			)
+			.await?;
+		Ok(lease)
+	}
+
+	/// Forwards one canonical open request and returns both its owned lease and
+	/// unmodified protocol response.
+	pub(crate) async fn open_request(
+		&self,
+		request: pb::OpenDocumentRequest,
+		cancel: &CancellationToken,
+	) -> Result<(DocumentLease, pb::OpenDocumentResponse), DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::OpenDocument(request), cancel)
 			.await?;
 		let pb::server_frame::Body::DocumentOpened(opened) = body else {
 			return Err(unexpected("OpenDocumentResponse"));
 		};
 		let head = opened
 			.head
+			.clone()
 			.ok_or_else(|| unexpected("OpenDocumentResponse.head"))?;
 		if opened.lease_id.len() != 16 || head.revision.is_none() {
 			return Err(unexpected("valid lease id and pinned revision"));
 		}
-		Ok(DocumentLease {
-			lease_id: opened.lease_id,
+		let lease = DocumentLease {
+			lease_id: opened.lease_id.clone(),
 			head,
 			host: Arc::clone(&self.inner),
 			released: false,
-		})
+		};
+		Ok((lease, opened))
 	}
 
 	/// Reads ranges from the exact revision pinned by `lease`.
@@ -323,16 +347,33 @@ impl DocumentHost {
 		selection: pb::ReadSelection,
 		cancel: &CancellationToken,
 	) -> Result<pb::ReadDocumentResponse, DocumentError> {
-		self.ensure_owned(lease)?;
-		let body = self
-			.request(
-				pb::client_frame::Body::ReadDocument(pb::ReadDocumentRequest {
+		self
+			.read_request(
+				lease,
+				pb::ReadDocumentRequest {
 					document:  Some(lease_target(lease)),
 					revision:  Some(lease.revision()?),
 					selection: Some(selection),
-				}),
+				},
 				cancel,
 			)
+			.await
+	}
+
+	/// Forwards one canonical read request after validating its connection-owned
+	/// lease and pinned revision.
+	pub(crate) async fn read_request(
+		&self,
+		lease: &DocumentLease,
+		request: pb::ReadDocumentRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::ReadDocumentResponse, DocumentError> {
+		self.ensure_request_pin(lease, request.document.as_ref(), request.revision.as_ref())?;
+		if request.selection.is_none() {
+			return Err(unexpected("ReadDocumentRequest.selection"));
+		}
+		let body = self
+			.request(pb::client_frame::Body::ReadDocument(request), cancel)
 			.await?;
 		let pb::server_frame::Body::DocumentRead(response) = body else {
 			return Err(unexpected("ReadDocumentResponse"));
@@ -348,16 +389,33 @@ impl DocumentHost {
 		options: pb::CodeSummaryOptions,
 		cancel: &CancellationToken,
 	) -> Result<pb::SummarizeDocumentResponse, DocumentError> {
-		self.ensure_owned(lease)?;
-		let body = self
-			.request(
-				pb::client_frame::Body::SummarizeDocument(pb::SummarizeDocumentRequest {
+		self
+			.summarize_request(
+				lease,
+				pb::SummarizeDocumentRequest {
 					document: Some(lease_target(lease)),
 					revision: Some(lease.revision()?),
 					options:  Some(options),
-				}),
+				},
 				cancel,
 			)
+			.await
+	}
+
+	/// Forwards one canonical summary request after validating its
+	/// connection-owned lease and pinned revision.
+	pub(crate) async fn summarize_request(
+		&self,
+		lease: &DocumentLease,
+		request: pb::SummarizeDocumentRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::SummarizeDocumentResponse, DocumentError> {
+		self.ensure_request_pin(lease, request.document.as_ref(), request.revision.as_ref())?;
+		if request.options.is_none() {
+			return Err(unexpected("SummarizeDocumentRequest.options"));
+		}
+		let body = self
+			.request(pb::client_frame::Body::SummarizeDocument(request), cancel)
 			.await?;
 		let pb::server_frame::Body::DocumentSummarized(response) = body else {
 			return Err(unexpected("SummarizeDocumentResponse"));
@@ -421,14 +479,22 @@ impl DocumentHost {
 		operations: Vec<pb::DocumentMutation>,
 		cancel: &CancellationToken,
 	) -> Result<pb::CommitTransactionResponse, DocumentError> {
-		let body = self
-			.request(
-				pb::client_frame::Body::CommitTransaction(pb::CommitTransactionRequest {
-					transaction_id,
-					operations,
-				}),
+		self
+			.commit_transaction_request(
+				pb::CommitTransactionRequest { transaction_id, operations },
 				cancel,
 			)
+			.await
+	}
+
+	/// Forwards one canonical document transaction request.
+	pub(crate) async fn commit_transaction_request(
+		&self,
+		request: pb::CommitTransactionRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CommitTransactionResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::CommitTransaction(request), cancel)
 			.await?;
 		let pb::server_frame::Body::TransactionResult(response) = body else {
 			return Err(unexpected("CommitTransactionResponse"));
@@ -442,22 +508,49 @@ impl DocumentHost {
 		mut lease: DocumentLease,
 		cancel: &CancellationToken,
 	) -> Result<(), DocumentError> {
-		self.ensure_owned(&lease)?;
+		let request = pb::CloseDocumentRequest { lease_id: lease.lease_id.clone() };
+		self.close_request(&mut lease, request, cancel).await?;
+		Ok(())
+	}
+
+	/// Forwards one canonical close request for a connection-owned lease.
+	pub(crate) async fn close_request(
+		&self,
+		lease: &mut DocumentLease,
+		request: pb::CloseDocumentRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CloseDocumentResponse, DocumentError> {
+		self.ensure_owned(lease)?;
+		if request.lease_id != lease.lease_id {
+			return Err(unexpected("connection-owned CloseDocumentRequest.lease_id"));
+		}
 		let body = self
-			.request(
-				pb::client_frame::Body::CloseDocument(pb::CloseDocumentRequest {
-					lease_id: lease.lease_id.clone(),
-				}),
-				cancel,
-			)
+			.request(pb::client_frame::Body::CloseDocument(request), cancel)
 			.await?;
 		match body {
-			pb::server_frame::Body::DocumentClosed(_) => {
+			pb::server_frame::Body::DocumentClosed(response) => {
 				lease.released = true;
-				Ok(())
+				Ok(response)
 			},
 			_ => Err(unexpected("CloseDocumentResponse")),
 		}
+	}
+
+	fn ensure_request_pin(
+		&self,
+		lease: &DocumentLease,
+		target: Option<&pb::DocumentTarget>,
+		revision: Option<&pb::Revision>,
+	) -> Result<(), DocumentError> {
+		self.ensure_owned(lease)?;
+		let lease_target = matches!(
+			target.and_then(|target| target.target.as_ref()),
+			Some(pb::document_target::Target::LeaseId(id)) if id == lease.id()
+		);
+		if !lease_target || revision != lease.head.revision.as_ref() {
+			return Err(unexpected("connection-owned lease and pinned revision"));
+		}
+		Ok(())
 	}
 
 	fn ensure_owned(&self, lease: &DocumentLease) -> Result<(), DocumentError> {

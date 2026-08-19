@@ -11,7 +11,7 @@ use omp_slopjson::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{ArgIssue, ArgIssueKind, ArgPath};
+use crate::{ArgIssue, ArgIssueKind, ArgPath, ArgSpecRegistry, Rev};
 
 /// One event in the client-to-executor invocation stream.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -125,6 +125,7 @@ pub struct IncomingParams<'c> {
 	owner:      Option<Str>,
 	feed:       Option<IncomingFeed>,
 	doc:        Option<IncomingDoc>,
+	arg_specs:  Option<(&'c Rev, &'c ArgSpecRegistry)>,
 	assembled:  String,
 	committed:  Option<Str>,
 	interrupts: VecDeque<Interrupt>,
@@ -150,6 +151,7 @@ impl IncomingParams<'static> {
 			events,
 			owner,
 			feed: Some(feed),
+			arg_specs: None,
 			doc: Some(doc),
 			assembled: String::new(),
 			committed: None,
@@ -168,6 +170,7 @@ impl<'c> IncomingParams<'c> {
 			events,
 			owner: None,
 			feed: Some(feed),
+			arg_specs: None,
 			doc: Some(doc),
 			assembled: String::new(),
 			committed: None,
@@ -180,6 +183,12 @@ impl<'c> IncomingParams<'c> {
 	/// Authenticated owner of the persistent resources used by this invocation.
 	pub const fn owner(&self) -> Option<&Str> {
 		self.owner.as_ref()
+	}
+
+	/// Binds argument pulls to the immutable declarations for the invoked
+	/// revision.
+	pub(crate) const fn bind_arg_specs(&mut self, rev: &'c Rev, specs: &'c ArgSpecRegistry) {
+		self.arg_specs = Some((rev, specs));
 	}
 
 	/// Runs the invocation's sole JSON cursor session while continuing to feed
@@ -256,6 +265,7 @@ impl<'c> IncomingParams<'c> {
 		let doc = self.doc.take().ok_or_else(|| {
 			ParamError::Protocol(Str::from("JSON cursor session was already consumed"))
 		})?;
+		let arg_specs = self.arg_specs;
 		let events = self.events.clone();
 		let pull = operation(doc).fuse();
 		pin_mut!(pull);
@@ -263,7 +273,7 @@ impl<'c> IncomingParams<'c> {
 			let receive = events.recv_async().fuse();
 			pin_mut!(receive);
 			select_biased! {
-				result = pull => return result.map_err(param_error),
+				result = pull => return result.map_err(|error| param_error(error, arg_specs)),
 				event = receive => match event {
 					Ok(event) => {
 						if let Some(interrupt) = self.apply(event).map_err(ParamError::Protocol)?
@@ -395,9 +405,9 @@ impl InterruptibleParams<'_, '_> {
 	}
 }
 
-fn param_error(error: IncomingError) -> ParamError {
+fn param_error(error: IncomingError, arg_specs: Option<(&Rev, &ArgSpecRegistry)>) -> ParamError {
 	match error {
-		IncomingError::Pull(issue) => ParamError::Args(Box::new(arg_issue(issue))),
+		IncomingError::Pull(issue) => ParamError::Args(Box::new(arg_issue(issue, arg_specs))),
 		IncomingError::Aborted => ParamError::Args(Box::new(ArgIssue {
 			path:     Vec::new(),
 			expected: "complete JSON arguments".into(),
@@ -415,7 +425,7 @@ fn param_error(error: IncomingError) -> ParamError {
 	}
 }
 
-fn arg_issue(issue: PullIssue) -> ArgIssue {
+fn arg_issue(issue: PullIssue, arg_specs: Option<(&Rev, &ArgSpecRegistry)>) -> ArgIssue {
 	let (kind, found) = match issue.kind {
 		PullIssueKind::Missing => (ArgIssueKind::Missing, None),
 		PullIssueKind::Incomplete => (ArgIssueKind::Incomplete, None),
@@ -423,18 +433,125 @@ fn arg_issue(issue: PullIssue) -> ArgIssue {
 		PullIssueKind::Malformed => (ArgIssueKind::Malformed, None),
 		PullIssueKind::TypeMismatch { found } => (ArgIssueKind::TypeMismatch, Some(Str::from(found))),
 	};
-	ArgIssue {
-		path: issue
-			.path
-			.into_iter()
-			.map(|part| match part {
-				PullPathSegment::Key(key) => ArgPath::Key(key),
-				PullPathSegment::Index(index) => ArgPath::Index(index as u64),
+	let path = issue
+		.path
+		.into_iter()
+		.map(|part| match part {
+			PullPathSegment::Key(key) => ArgPath::Key(key),
+			PullPathSegment::Index(index) => ArgPath::Index(index as u64),
+		})
+		.collect::<Vec<_>>();
+	let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &path));
+	let expected =
+		spec.map_or_else(|| Str::from(issue.expected), |declared| declared.expected.clone());
+	let example = spec.and_then(|declared| declared.example.clone());
+	ArgIssue { path, expected, kind, example, found }
+}
+
+#[cfg(test)]
+mod tests {
+	use futures::executor::block_on;
+	use smallvec::smallvec;
+
+	use super::*;
+	use crate::ArgSpec;
+
+	const EXAMPLE: &str = r#"{"path":"résumé/💾"}"#;
+
+	fn declarations() -> (Rev, ArgSpecRegistry) {
+		let rev = Rev { family: Str::from("native"), n: 7 };
+		let mut specs = ArgSpecRegistry::new();
+		specs
+			.register(rev.clone(), ArgSpec {
+				path:     smallvec![ArgPath::Key(Str::from("path"))],
+				aliases:  smallvec![Str::from("file_path")],
+				coerce:   smallvec![],
+				expected: Str::from("declared numeric path"),
+				example:  Some(Str::from(EXAMPLE)),
 			})
-			.collect(),
-		expected: Str::from(issue.expected),
-		kind,
-		example: None,
-		found,
+			.expect("argument declaration registers");
+		specs.seal();
+		(rev, specs)
+	}
+
+	fn bound_params<'a>(
+		rev: &'a Rev,
+		specs: &'a ArgSpecRegistry,
+	) -> (InvocationFeed, IncomingParams<'a>) {
+		let (feed, mut params): (_, IncomingParams<'a>) = IncomingParams::channel();
+		params.bind_arg_specs(rev, specs);
+		(feed, params)
+	}
+
+	fn number_issue(params: &mut IncomingParams<'_>, key: &'static str) -> Box<ArgIssue> {
+		let error = block_on(params.pull(|mut doc| async move {
+			let root = doc.json();
+			let mut object = root.object();
+			let mut value = object.key(key);
+			value.number().await
+		}))
+		.expect_err("declared number pull must reject a string");
+		let ParamError::Args(issue) = error else {
+			panic!("pull failure must remain a structured argument issue");
+		};
+		issue
+	}
+
+	#[test]
+	fn canonical_and_alias_failures_share_the_declared_example() {
+		let (rev, specs) = declarations();
+		for key in ["path", "file_path"] {
+			let (feed, mut params) = bound_params(&rev, &specs);
+			feed
+				.args_committed(Str::from(format!(r#"{{"{key}":"wrong"}}"#)))
+				.expect("arguments remain connected");
+
+			let issue = number_issue(&mut params, key);
+			assert_eq!(issue.path, vec![ArgPath::Key(Str::from(key))]);
+			assert_eq!(issue.expected, "declared numeric path");
+			assert_eq!(issue.example.as_deref(), Some(EXAMPLE));
+		}
+	}
+
+	#[test]
+	fn undeclared_failure_does_not_invent_an_example() {
+		let (rev, specs) = declarations();
+		let (feed, mut params) = bound_params(&rev, &specs);
+		feed
+			.args_committed(Str::from(r#"{"other":"wrong"}"#))
+			.expect("arguments remain connected");
+
+		let issue = number_issue(&mut params, "other");
+		assert_eq!(issue.path, vec![ArgPath::Key(Str::from("other"))]);
+		assert_eq!(issue.example, None);
+	}
+
+	#[test]
+	fn declared_example_survives_interrupt_then_pull_reentry() {
+		let (rev, specs) = declarations();
+		let (feed, mut params) = bound_params(&rev, &specs);
+		let interrupt =
+			Interrupt { class: Str::from("steering"), reason: Str::from("change direction") };
+		feed
+			.interrupt(interrupt.clone())
+			.expect("interrupt remains connected");
+		feed
+			.args_committed(Str::from(r#"{"file_path":"wrong"}"#))
+			.expect("arguments remain connected");
+		block_on(params.committed()).expect("commit buffers the earlier interrupt");
+
+		let interrupted = block_on(
+			params
+				.interruptable()
+				.pull(|_| async { Ok::<(), IncomingError>(()) }),
+		);
+		assert!(matches!(
+			interrupted,
+			Err(ParamError::Interrupted(observed)) if observed == interrupt
+		));
+
+		let issue = number_issue(&mut params, "file_path");
+		assert_eq!(issue.path, vec![ArgPath::Key(Str::from("file_path"))]);
+		assert_eq!(issue.example.as_deref().map(str::as_bytes), Some(EXAMPLE.as_bytes()));
 	}
 }

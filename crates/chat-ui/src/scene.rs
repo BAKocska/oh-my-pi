@@ -13,7 +13,7 @@ use omp_tui::{
 	Border, Charset, Color, Command, Component, Decor, DecorKind, Frame, Icon, Key, MouseReport,
 	PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot, Style, Theme, Ui, UiContext, UiEvent,
 	anim::{Easing, Shimmer, Tween},
-	components::{Attachment, Attachments, EditorPane, Segment, Status},
+	components::{Attachment, Attachments, EditorPane, Segment, Status, TextLeaf},
 	next_slot,
 };
 use smallvec::SmallVec;
@@ -50,15 +50,6 @@ pub enum ChatKey {
 	Ignored,
 	/// The scene requested host shutdown.
 	Quit,
-}
-
-/// Presentation selected for a committed tool invocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToolKind {
-	/// A command/output card.
-	Command,
-	/// A file-edit card.
-	Edit,
 }
 
 #[derive(Clone, Copy)]
@@ -118,25 +109,69 @@ struct ToolImageEntry {
 	px:     omp_tui::imagefmt::ImageDimensions,
 }
 
+struct ToolView {
+	source:   Str,
+	width:    u16,
+	rendered: Ui,
+}
+
+impl ToolView {
+	fn structured(source: Str, width: u16, ctx: &UiContext) -> Self {
+		let rendered = Self::render(&source, width, ctx);
+		Self { source, width, rendered }
+	}
+
+	fn render(source: &Str, width: u16, ctx: &UiContext) -> Ui {
+		Ui::from_markup(source.clone(), width.max(1), ctx.clone()).unwrap_or_else(|_| {
+			Ui::from_root(TextLeaf::new().text(source.clone()), width.max(1), ctx.clone())
+		})
+	}
+
+	fn replace(&mut self, source: Str, ctx: &UiContext) {
+		if self.source == source {
+			return;
+		}
+		self.rendered = Self::render(&source, self.width, ctx);
+		self.source = source;
+	}
+
+	fn append_plain(&mut self, chunk: &str, ctx: &UiContext) {
+		let mut source = self.source.to_string();
+		source.push_str(chunk);
+		let source = Str::from(source);
+		self.rendered =
+			Ui::from_root(TextLeaf::new().text(source.clone()), self.width.max(1), ctx.clone());
+		self.source = source;
+	}
+
+	fn resize(&mut self, width: u16, ctx: &UiContext) {
+		let width = width.max(1);
+		if self.width != width {
+			self.width = width;
+			self.rendered = Self::render(&self.source, width, ctx);
+		}
+	}
+
+	const fn height(&self) -> u16 {
+		self.rendered.height()
+	}
+}
+
 struct ToolEntry {
-	title:   Str,
-	kind:    ToolKind,
-	ok:      bool,
-	output:  Str,
-	summary: Vec<Str>,
-	images:  Vec<ToolImageEntry>,
+	title:  Str,
+	ok:     bool,
+	view:   ToolView,
+	images: Vec<ToolImageEntry>,
 }
 
 struct LiveAssistant {
 	id:   Str,
 	text: StrMut,
 }
-
 struct LiveTool {
 	id:     Str,
-	name:   Str,
 	title:  Str,
-	output: StrMut,
+	view:   ToolView,
 	images: Vec<ToolImageEntry>,
 }
 
@@ -606,25 +641,47 @@ impl Chat {
 	}
 
 	/// Begins a live tool card.
-	pub fn tool_started(&mut self, id: impl Into<Str>, name: impl Into<Str>, title: impl Into<Str>) {
+	pub fn tool_started(
+		&mut self,
+		id: impl Into<Str>,
+		_name: impl Into<Str>,
+		title: impl Into<Str>,
+	) {
 		self.live_tools.push(LiveTool {
 			id:     id.into(),
-			name:   name.into(),
 			title:  title.into(),
-			output: StrMut::new(""),
+			view:   ToolView::structured(
+				Str::new_static(""),
+				Self::tool_view_width(self.last_viewport.width),
+				&self.ctx,
+			),
 			images: Vec::new(),
 		});
 		self.bump_live();
 	}
 
-	/// Appends output to a matching live tool card.
+	/// Appends unstructured output to a matching live tool card.
 	pub fn tool_output(&mut self, id: &str, chunk: &str) {
+		let ctx = self.ctx.clone();
 		if let Some(tool) = self
 			.live_tools
 			.iter_mut()
 			.find(|tool| tool.id.as_str() == id)
 		{
-			tool.output.push_str(chunk);
+			tool.view.append_plain(chunk, &ctx);
+			self.bump_live();
+		}
+	}
+
+	/// Replaces a matching live tool card's renderer-produced view.
+	pub fn tool_view(&mut self, id: &str, view: Str) {
+		let ctx = self.ctx.clone();
+		if let Some(tool) = self
+			.live_tools
+			.iter_mut()
+			.find(|tool| tool.id.as_str() == id)
+		{
+			tool.view.replace(view, &ctx);
 			self.bump_live();
 		}
 	}
@@ -650,20 +707,19 @@ impl Chat {
 		}
 	}
 
-	/// Commits a matching live tool card with its terminal state.
-	pub fn tool_finished(&mut self, id: &str, ok: bool, summary: Vec<Str>) {
+	/// Commits a matching live tool card with its terminal branch and view.
+	pub fn tool_finished(&mut self, id: &str, ok: bool, view: Str) {
 		if let Some(index) = self
 			.live_tools
 			.iter()
 			.position(|tool| tool.id.as_str() == id)
 		{
-			let tool = self.live_tools.remove(index);
+			let mut tool = self.live_tools.remove(index);
+			tool.view.replace(view, &self.ctx);
 			self.transcript.push(Entry::Tool(ToolEntry {
-				kind: tool_kind(&tool.name),
 				title: tool.title,
 				ok,
-				output: tool.output.freeze(),
-				summary,
+				view: tool.view,
 				images: tool.images,
 			}));
 			self.bump_live();
@@ -737,10 +793,9 @@ impl Chat {
 			BackendEvent::AssistantEnd { id } => self.end_assistant(id.as_str()),
 			BackendEvent::ToolStarted { id, name, title } => self.tool_started(id, name, title),
 			BackendEvent::ToolOutput { id, chunk } => self.tool_output(id.as_str(), chunk.as_str()),
+			BackendEvent::ToolView { id, view } => self.tool_view(id.as_str(), view),
 			BackendEvent::ToolImage { id, source } => self.tool_image(id.as_str(), source),
-			BackendEvent::ToolFinished { id, ok, summary } => {
-				self.tool_finished(id.as_str(), ok, summary)
-			},
+			BackendEvent::ToolFinished { id, ok, view } => self.tool_finished(id.as_str(), ok, view),
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
@@ -867,6 +922,10 @@ impl Chat {
 			for entry in &mut self.transcript {
 				Self::resize_entry(entry, viewport.width, &self.ctx);
 			}
+			let view_width = Self::tool_view_width(viewport.width);
+			for tool in &mut self.live_tools {
+				tool.view.resize(view_width, &self.ctx);
+			}
 		}
 		let new_rows = self.transcript[self.drawn_entries..]
 			.iter()
@@ -971,12 +1030,19 @@ impl Chat {
 		if narrowed == 0 { 1 } else { narrowed }
 	}
 
+	const fn tool_view_width(width: u16) -> u16 {
+		let inset = if width >= 50 { 2 } else { 0 };
+		let narrowed = width.saturating_sub(inset).saturating_sub(4);
+		if narrowed == 0 { 1 } else { narrowed }
+	}
+
 	fn resize_entry(entry: &mut Entry, width: u16, ctx: &UiContext) {
 		let message_width = Self::message_width(width);
 		match entry {
 			Entry::User(user) => user.body.resize(message_width, ctx),
 			Entry::Assistant(body) => body.resize(width.max(1), ctx),
-			Entry::Tool(_) | Entry::Notice { .. } => {},
+			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
+			Entry::Notice { .. } => {},
 		}
 	}
 
@@ -1112,24 +1178,11 @@ fn draw_live_panel_impl(
 			ink(ctx.theme.info),
 		)]);
 		y = y.saturating_add(1);
-		for line in tool
-			.output
-			.as_str()
-			.lines()
-			.rev()
-			.take(2)
-			.collect::<Vec<_>>()
-			.into_iter()
-			.rev()
-		{
-			if y >= bottom {
-				break;
-			}
-			draw_line(frame, rect.x.saturating_add(3), y, rect.width.saturating_sub(4), &[Span::new(
-				line,
-				ink(ctx.theme.muted),
-			)]);
-			y = y.saturating_add(1);
+		let available = bottom.saturating_sub(y);
+		let height = tool.view.height().min(available);
+		if height > 0 {
+			frame.blit(tool.view.rendered.frame(), 0, height, rect.x.saturating_add(2), y);
+			y = y.saturating_add(height);
 		}
 	}
 }
@@ -1246,25 +1299,10 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 	)]);
 	let mut row = y.saturating_add(1);
 	let bottom = y.saturating_add(height).saturating_sub(1);
-	let lines: Vec<&str> = if tool.summary.is_empty() {
-		tool.output.lines().collect()
-	} else {
-		tool.summary.iter().map(Str::as_str).collect()
-	};
-	for line in lines.into_iter().take(3) {
-		if row >= bottom {
-			break;
-		}
-		let color = if tool.kind == ToolKind::Edit {
-			ctx.theme.info
-		} else {
-			ctx.theme.muted
-		};
-		draw_line(frame, rect.x.saturating_add(2), row, rect.width.saturating_sub(4), &[Span::new(
-			line,
-			ink(color),
-		)]);
-		row = row.saturating_add(1);
+	let view_height = tool.view.height().min(bottom.saturating_sub(row));
+	if view_height > 0 {
+		frame.blit(tool.view.rendered.frame(), 0, view_height, rect.x.saturating_add(2), row);
+		row = row.saturating_add(view_height);
 	}
 	for image in &tool.images {
 		let (cols, rows) = tool_image_box(image, width);
@@ -1299,29 +1337,16 @@ fn tool_image_box(image: &ToolImageEntry, width: u16) -> (u16, u16) {
 }
 
 fn tool_height(tool: &ToolEntry, width: u16) -> u16 {
-	let lines = if tool.summary.is_empty() {
-		tool.output.lines().count()
-	} else {
-		tool.summary.len()
-	};
 	let image_rows = tool
 		.images
 		.iter()
 		.fold(0_u16, |rows, image| rows.saturating_add(tool_image_box(image, width).1));
-	u16::try_from(lines.min(3))
-		.unwrap_or(3)
+	tool
+		.view
+		.height()
 		.saturating_add(image_rows)
 		.saturating_add(2)
 		.max(3)
-}
-
-fn tool_kind(name: &str) -> ToolKind {
-	let name = name.to_ascii_lowercase();
-	if name.contains("edit") || name.contains("write") || name.contains("patch") {
-		ToolKind::Edit
-	} else {
-		ToolKind::Command
-	}
 }
 
 fn preserves_attachments(text: &str) -> bool {
@@ -1683,7 +1708,7 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("t1", "read", "read page.pdf:p1.png");
 		chat.tool_image("t1", source);
-		chat.tool_finished("t1", true, vec![Str::from("rendered page 1")]);
+		chat.tool_finished("t1", true, Str::from("<row>rendered page 1</row>"));
 		let frame = chat.render(Size::new(80, 40)).frame;
 		std::fs::remove_file(&path).ok();
 		assert!(
@@ -1692,7 +1717,7 @@ mod tests {
 		);
 		assert!(
 			(0..frame.size().height).any(|row| row_text(frame, row).contains("rendered page 1")),
-			"summary text stays alongside the inline image"
+			"renderer view stays alongside the inline image"
 		);
 	}
 
@@ -1701,9 +1726,26 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("t1", "shell", "shell ls");
 		chat.tool_image("t1", "/nonexistent/omp-tool-image.png");
-		chat.tool_finished("t1", true, vec![Str::from("done")]);
+		chat.tool_finished("t1", true, Str::from("<row>done</row>"));
 		let frame = chat.render(Size::new(80, 24)).frame;
 		assert!((0..frame.size().height).any(|row| row_text(frame, row).contains("done")));
 		assert!((0..frame.size().height).all(|row| !row_text(frame, row).contains('▀')));
+	}
+
+	#[test]
+	fn live_tool_view_replaces_retained_markup_without_line_vectors() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("t1", "same-name", "same-name");
+		chat.tool_view("t1", Str::from("<row>first update</row>"));
+		chat.tool_view("t1", Str::from("<row>second update</row>"));
+		let live = chat.render(Size::new(80, 24)).frame;
+		assert!((0..live.size().height).any(|row| row_text(live, row).contains("second update")));
+		assert!((0..live.size().height).all(|row| !row_text(live, row).contains("first update")));
+
+		chat.tool_finished("t1", false, Str::from("<row>fault branch</row>"));
+		let settled = chat.render(Size::new(80, 24)).frame;
+		assert!(
+			(0..settled.size().height).any(|row| row_text(settled, row).contains("fault branch"))
+		);
 	}
 }

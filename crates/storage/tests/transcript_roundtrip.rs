@@ -1,6 +1,11 @@
 //! Round-trip tests for transcript persistence.
 
-use std::{collections::BTreeMap, fs::OpenOptions, io::Write as _, path::PathBuf};
+use std::{
+	collections::BTreeMap,
+	fs::OpenOptions,
+	io::{Seek as _, SeekFrom, Write as _},
+	path::PathBuf,
+};
 
 use omp_core::Str;
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
@@ -8,8 +13,9 @@ use omp_storage::{
 	blob::BlobRef,
 	transcript::{
 		AmendPatch, Attribution, Block, BlockKind, CallId, CtxSnapshot, DialectId, Entry, Error,
-		Event, FeatureId, Header, ItemRecord, Kind, ModelChange, ModelId, ModelRef, Msg, Patch, Pin,
-		ProviderId, Replay, RequestError, SessionId, Stop, ThinkingSel, Timing, TitleSource,
+		Event, FeatureId, Header, ItemRecord, Kind, LiveSet, ModelChange, ModelId, ModelRef, Msg,
+		Patch, Pin, PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ProviderId, Reader,
+		RefreshState, Replay, RequestError, SessionId, Stop, ThinkingSel, Timing, TitleSource,
 		ToolBatchAuthorized, TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt,
 		TurnStart, Usage, UserBlock, Writer, load, read_line, write_header, write_line,
 	},
@@ -495,7 +501,248 @@ fn forward_fold_applies_rewind_reset_and_compact() {
 		})
 		.expect("compact");
 	drop(writer);
-	assert_eq!(load(&path).expect("transcript loads").live(), vec![7, 5, 6]);
+	let log = load(&path).expect("transcript loads");
+	assert_eq!(log.live(), vec![7, 5, 6]);
+	let mut live = LiveSet::new();
+	log.live_into(&mut live);
+	assert!(live.iter().eq([7, 5, 6]));
+}
+
+#[test]
+fn reusable_live_set_matches_live_vectors_for_navigation_and_rewrite() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let mut writer = Writer::create(&path, &header()).expect("new transcript");
+	writer.append(&title(1, "zero")).expect("event zero");
+	writer.append(&title(2, "one")).expect("event one");
+	writer
+		.append(&Event { ts: 3, kind: Kind::Rewind { to: Some(0) } })
+		.expect("rewind");
+	writer.append(&title(4, "three")).expect("event three");
+	writer
+		.append(&Event {
+			ts:   5,
+			kind: Kind::Compact {
+				summary:       text("summary"),
+				short:         None,
+				first_kept:    3,
+				tokens_before: 20,
+				warning:       None,
+			},
+		})
+		.expect("compact");
+	let replacement = thread_pb::Item::default();
+	writer
+		.append(&Event {
+			ts:   6,
+			kind: Kind::PromptRewriteIntent(PromptRewriteIntent {
+				prompt_hash:    [7; 32],
+				head:           vec![replacement.clone()],
+				preserved_tail: vec![3],
+			}),
+		})
+		.expect("rewrite intent");
+	writer
+		.append(&Event {
+			ts:   7,
+			kind: Kind::PromptRewriteStage(PromptRewriteStage {
+				intent:  5,
+				ordinal: 0,
+				item:    replacement,
+			}),
+		})
+		.expect("rewrite stage");
+	writer
+		.append(&Event {
+			ts:   8,
+			kind: Kind::PromptRewriteCommit(PromptRewriteCommit {
+				intent:      5,
+				head_events: vec![6],
+			}),
+		})
+		.expect("rewrite commit");
+	drop(writer);
+
+	let log = load(&path).expect("transcript loads");
+	assert_eq!(log.live(), vec![6, 3]);
+	let mut live = LiveSet::new();
+	log.live_into(&mut live);
+	assert!(live.iter().eq([6, 3]));
+	assert!(live.contains(6));
+	assert!(live.contains(3));
+	assert!(!live.contains(4));
+}
+
+#[test]
+fn unchanged_reader_refresh_reuses_projection_capacity() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let mut writer = Writer::create(&path, &header()).expect("new transcript");
+	writer.append(&title(1, "first")).expect("first event");
+	drop(writer);
+	let mut reader = Reader::open(&path).expect("reader opens");
+	let bit_capacity = reader.live().capacity();
+	let chain_capacity = reader.live().chain_capacity();
+	let append_offset = reader.append_offset();
+
+	let report = reader.refresh().expect("unchanged refresh succeeds");
+	assert_eq!(report.state, RefreshState::Unchanged);
+	assert_eq!(report.next_index, 1);
+	assert_eq!(report.append_offset, append_offset);
+	assert_eq!(report.tail_bytes, 0);
+	assert_eq!(reader.live().capacity(), bit_capacity);
+	assert_eq!(reader.live().chain_capacity(), chain_capacity);
+}
+
+#[test]
+fn reader_parses_only_new_complete_lines() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let mut writer = Writer::create(&path, &header()).expect("new transcript");
+	writer.append(&title(1, "first")).expect("first event");
+	drop(writer);
+	let mut reader = Reader::open(&path).expect("reader opens");
+
+	let bytes = std::fs::read(&path).expect("transcript reads");
+	let title_offset = bytes
+		.windows(b"first".len())
+		.position(|window| window == b"first")
+		.expect("first title is present");
+	let mut file = OpenOptions::new()
+		.write(true)
+		.open(&path)
+		.expect("transcript opens");
+	file
+		.seek(SeekFrom::Start(u64::try_from(title_offset).expect("file offset fits in u64")))
+		.expect("prior line seek succeeds");
+	file
+		.write_all(b"other")
+		.expect("same-size prior-line mutation writes");
+	drop(file);
+	let mut writer = Writer::open_append(&path).expect("writer reopens");
+	writer.append(&title(2, "second")).expect("second event");
+	drop(writer);
+
+	let report = reader.refresh().expect("append refresh succeeds");
+	assert_eq!(report.state, RefreshState::Advanced { records: 1 });
+	assert_eq!(report.next_index, 2);
+	assert!(matches!(
+		reader.log().get(0),
+		Some(Entry::Ok(event))
+			if matches!(&event.kind, Kind::Title { title, .. } if title.as_str() == "first")
+	));
+	assert!(matches!(
+		reader.log().get(1),
+		Some(Entry::Ok(event))
+			if matches!(&event.kind, Kind::Title { title, .. } if title.as_str() == "second")
+	));
+}
+
+#[test]
+fn reader_reports_and_repairs_a_torn_tail_without_shifting_indexes() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let writer = Writer::create(&path, &header()).expect("new transcript");
+	drop(writer);
+	let mut reader = Reader::open(&path).expect("reader opens");
+	let append_offset = reader.append_offset();
+	let mut encoded = Vec::new();
+	write_line(&title(1, "repaired"), &mut encoded).expect("event encodes");
+	let split = encoded.len() / 2;
+	let mut file = OpenOptions::new()
+		.append(true)
+		.open(&path)
+		.expect("transcript opens");
+	file
+		.write_all(&encoded[..split])
+		.expect("torn prefix writes");
+	drop(file);
+
+	let report = reader.refresh().expect("torn refresh reports");
+	assert_eq!(report.state, RefreshState::TornTail { records: 0 });
+	assert_eq!(report.next_index, 0);
+	assert_eq!(report.append_offset, append_offset);
+	assert_eq!(report.tail_bytes, u64::try_from(split).expect("tail size fits in u64"));
+	assert!(reader.log().is_empty());
+
+	let mut file = OpenOptions::new()
+		.append(true)
+		.open(&path)
+		.expect("transcript reopens");
+	file
+		.write_all(&encoded[split..])
+		.expect("torn suffix writes");
+	file.write_all(b"\n").expect("record terminator writes");
+	drop(file);
+	let report = reader.refresh().expect("repaired refresh succeeds");
+	assert_eq!(report.state, RefreshState::Advanced { records: 1 });
+	assert_eq!(report.next_index, 1);
+	assert_eq!(report.tail_bytes, 0);
+	assert!(matches!(reader.log().get(0), Some(Entry::Ok(_))));
+
+	let mut file = OpenOptions::new()
+		.append(true)
+		.open(&path)
+		.expect("transcript reopens");
+	file
+		.write_all(b"{not json}\n")
+		.expect("corrupt complete record writes");
+	drop(file);
+	let report = reader.refresh().expect("corrupt record is retained");
+	assert_eq!(report.state, RefreshState::Advanced { records: 1 });
+	assert_eq!(report.next_index, 2);
+	assert!(matches!(reader.log().get(1), Some(Entry::Tombstone(_))));
+}
+
+#[test]
+fn reader_rejects_replacement_without_discarding_prior_state() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let displaced = directory.path().join("displaced.jsonl");
+	let mut writer = Writer::create(&path, &header()).expect("new transcript");
+	writer.append(&title(1, "first")).expect("first event");
+	drop(writer);
+	let mut reader = Reader::open(&path).expect("reader opens");
+	std::fs::rename(&path, &displaced).expect("old transcript moves");
+	let mut replacement = Writer::create(&path, &header()).expect("replacement transcript");
+	replacement
+		.append(&title(2, "replacement"))
+		.expect("replacement event");
+	drop(replacement);
+
+	assert!(reader.refresh().is_err());
+	assert_eq!(reader.log().len(), 1);
+	assert!(matches!(
+		reader.log().get(0),
+		Some(Entry::Ok(event))
+			if matches!(&event.kind, Kind::Title { title, .. } if title.as_str() == "first")
+	));
+}
+
+#[test]
+fn custom_iterator_filters_live_events_without_collection() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let custom = |ts, kind: &str| Event {
+		ts,
+		kind: Kind::Custom { kind: text(kind), data: None, context: None, display: false },
+	};
+	let mut writer = Writer::create(&path, &header()).expect("new transcript");
+	writer.append(&custom(1, "wanted")).expect("wanted event");
+	writer.append(&custom(2, "other")).expect("other event");
+	writer
+		.append(&Event { ts: 3, kind: Kind::Rewind { to: Some(0) } })
+		.expect("rewind");
+	writer
+		.append(&custom(4, "wanted"))
+		.expect("later wanted event");
+	drop(writer);
+
+	let reader = Reader::open(&path).expect("reader opens");
+	let mut matching = reader.log().custom(reader.live(), "wanted");
+	assert_eq!(matching.next().map(|(index, _)| index), Some(0));
+	assert_eq!(matching.next_back().map(|(index, _)| index), Some(3));
+	assert_eq!(matching.next(), None);
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

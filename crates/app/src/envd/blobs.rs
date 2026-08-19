@@ -1,11 +1,11 @@
 //! Content-addressed env blob storage and hash-only result references.
 
-use std::{io, path::Path};
+use std::{future::Future, io, path::Path};
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, encoding::hex};
 use omp_proto::{blob::v1 as blob_pb, thread::v1 as thread_pb};
-use omp_storage::blob::{BlobRef, BlobStore};
+use omp_storage::blob::{BlobRef, BlobStage, BlobStore};
 use thiserror::Error;
 
 /// Stable content identity returned by blob host operations.
@@ -44,6 +44,9 @@ pub enum BlobError {
 	/// Backing blob storage error.
 	#[error(transparent)]
 	Store(#[from] omp_storage::blob::Error),
+	/// Blocking blob finalization task failed.
+	#[error("blob finalization task failed: {0}")]
+	FinalizeTask(#[from] tokio::task::JoinError),
 	/// Blob hash format was not 32 bytes.
 	#[error("blob hash must be exactly 32 bytes")]
 	InvalidHash,
@@ -84,6 +87,11 @@ impl BlobHost {
 	/// Takes ownership of an already-open store.
 	pub const fn from_store(store: BlobStore) -> Self {
 		Self { store }
+	}
+
+	/// Opens the single staged minting path shared by every blob producer.
+	pub(crate) fn begin_spill(&self) -> Result<BlobStage, BlobError> {
+		self.store.begin_put().map_err(BlobError::from)
 	}
 
 	/// Stores exact bytes and returns their BLAKE3-derived identity.
@@ -210,6 +218,150 @@ impl BlobHost {
 	}
 }
 
+impl omp_tool::CallOutcomeSpill for BlobHost {
+	type Error = BlobError;
+	type Stage<'a> = BlobStage;
+
+	fn open(&self) -> Result<Self::Stage<'_>, Self::Error> {
+		self.begin_spill()
+	}
+
+	fn finish<'a>(
+		&'a self,
+		stage: Self::Stage<'a>,
+	) -> impl Future<Output = Result<omp_tool::BlobRef, Self::Error>> + Send + 'a {
+		async move {
+			let reference = tokio::task::spawn_blocking(move || stage.finish()).await??;
+			Ok(call_outcome_reference(reference))
+		}
+	}
+}
+
+fn call_outcome_reference(reference: BlobRef) -> omp_tool::BlobRef {
+	let hash = hex::encode_n(&reference.hash);
+	omp_tool::BlobRef {
+		hash:       Str::from(hash.as_str()),
+		media_type: Str::from("application/json"),
+		byte_len:   reference.size,
+	}
+}
+
 fn parse_hash(hash: &[u8]) -> Result<[u8; 32], BlobError> {
 	hash.try_into().map_err(|_| BlobError::InvalidHash)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs,
+		io::Write as _,
+		path::{Path, PathBuf},
+	};
+
+	use omp_core::encoding::hex;
+	use omp_tool::{CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError, call_outcome_details};
+	use tempfile::TempDir;
+
+	use super::{BlobError, BlobHost, BlobId};
+
+	fn open_host() -> (TempDir, BlobHost) {
+		let root = tempfile::tempdir().expect("temporary blob root");
+		let host = BlobHost::open(root.path()).expect("open blob host");
+		(root, host)
+	}
+
+	fn tmp_dir(root: &Path) -> PathBuf {
+		root.join("tmp")
+	}
+
+	fn poison_tmp_dir(root: &Path) {
+		let tmp = tmp_dir(root);
+		fs::remove_dir(&tmp).expect("remove empty temporary directory");
+		fs::File::create(tmp).expect("replace temporary directory with a file");
+	}
+
+	#[tokio::test]
+	async fn inline_outcome_never_opens_a_blob_stage() {
+		let (root, host) = open_host();
+		poison_tmp_dir(root.path());
+		let outcome = CallOutcome::<u8, u8>::Ok(7);
+
+		let details = call_outcome_details(&outcome, 1_024, &host)
+			.await
+			.expect("inline serialization must not touch poisoned blob staging");
+
+		assert!(matches!(details, CallOutcomeDetails::Inline { .. }));
+	}
+
+	#[tokio::test]
+	async fn spilled_outcome_retains_exact_bytes_digest_and_size() {
+		let (_root, host) = open_host();
+		let outcome = CallOutcome::<omp_core::Str, omp_core::Str>::Ok(omp_core::Str::from(
+			"payload beyond the inline limit",
+		));
+		let expected = serde_json::to_vec(&outcome).expect("serialize expected outcome");
+		let expected_hash = *blake3::hash(&expected).as_bytes();
+
+		let details = call_outcome_details(&outcome, 1, &host)
+			.await
+			.expect("spill outcome");
+		let CallOutcomeDetails::Spilled { blob, byte_len } = details else {
+			panic!("outcome larger than one byte must spill");
+		};
+
+		assert_eq!(byte_len, expected.len() as u64);
+		assert_eq!(blob.byte_len, expected.len() as u64);
+		assert_eq!(blob.media_type.as_str(), "application/json");
+		assert_eq!(blob.hash.as_str(), hex::encode_n(&expected_hash).as_str());
+		assert_eq!(
+			host
+				.get(BlobId { hash: expected_hash, size: expected.len() as u64 })
+				.expect("read spilled outcome")
+				.as_ref(),
+			expected.as_slice()
+		);
+	}
+
+	#[test]
+	fn dropping_an_unfinished_spill_removes_its_temporary_file() {
+		let (root, host) = open_host();
+		let mut stage = host.begin_spill().expect("begin staged spill");
+		stage
+			.write_all(b"cancelled bytes")
+			.expect("write staged bytes");
+		assert_eq!(
+			fs::read_dir(tmp_dir(root.path()))
+				.expect("read tmp")
+				.count(),
+			1
+		);
+
+		drop(stage);
+
+		assert_eq!(
+			fs::read_dir(tmp_dir(root.path()))
+				.expect("read tmp")
+				.count(),
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn storage_open_errors_remain_typed() {
+		let (root, host) = open_host();
+		poison_tmp_dir(root.path());
+		let outcome = CallOutcome::<u8, u8>::Ok(7);
+
+		let error = call_outcome_details(&outcome, 0, &host)
+			.await
+			.expect_err("poisoned staging directory must fail");
+
+		assert!(matches!(error, CallOutcomeDetailsError::SpillOpen(BlobError::Store(_))));
+	}
+
+	#[test]
+	fn blob_host_is_clone_send_and_sync() {
+		fn assert_traits<T: Clone + Send + Sync>() {}
+		assert_traits::<BlobHost>();
+	}
 }

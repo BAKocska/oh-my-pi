@@ -45,6 +45,7 @@ concurrent connections run in parallel.
 
 from __future__ import annotations
 
+import errno
 import functools
 import hashlib
 import hmac
@@ -52,6 +53,7 @@ import marshal
 import os
 import pickle
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -72,6 +74,8 @@ __all__ = [
 ]
 
 _MAX_FRAME = 1 << 34  # 16 GiB sanity bound on any single frame
+_MAX_HEADER = 64 << 10  # headers are small protocol dictionaries
+_MAX_BUFFERS = 1 << 10  # plausible upper bound for pickle-5 OOB buffers
 
 
 class RemoteTraceback(Exception):
@@ -91,17 +95,28 @@ class RemoteError(Exception):
 
 
 def _send(sock, header, payload=None, bufs=()):
+    nbufs = len(bufs) + (payload is not None)
+    if nbufs > _MAX_BUFFERS:
+        raise ValueError(f"too many buffers ({nbufs})")
+
     hb = pickle.dumps(header)
-    sock.sendall(struct.pack("<II", len(hb), len(bufs) + (payload is not None)))
-    sock.sendall(hb)
+    if len(hb) > _MAX_HEADER:
+        raise ValueError(f"oversized header ({len(hb)} bytes)")
+
+    frames = []
     if payload is not None:
-        m = memoryview(payload).cast("B")
-        sock.sendall(struct.pack("<Q", m.nbytes))
-        sock.sendall(m)
+        frames.append(memoryview(payload).cast("B"))
     for b in bufs:
-        m = memoryview(b).cast("B")
-        sock.sendall(struct.pack("<Q", m.nbytes))
-        sock.sendall(m)
+        frames.append(memoryview(b).cast("B"))
+    for frame in frames:
+        if frame.nbytes > _MAX_FRAME:
+            raise ValueError(f"oversized frame ({frame.nbytes} bytes)")
+
+    sock.sendall(struct.pack("<II", len(hb), nbufs))
+    sock.sendall(hb)
+    for frame in frames:
+        sock.sendall(struct.pack("<Q", frame.nbytes))
+        sock.sendall(frame)
 
 
 def _recv_exact(sock, n):
@@ -118,6 +133,11 @@ def _recv_exact(sock, n):
 
 def _recv(sock):
     hlen, nbufs = struct.unpack("<II", _recv_exact(sock, 8))
+    if hlen > _MAX_HEADER:
+        raise ConnectionError(f"oversized header ({hlen} bytes)")
+    if nbufs > _MAX_BUFFERS:
+        raise ConnectionError(f"too many buffers ({nbufs})")
+
     header = pickle.loads(_recv_exact(sock, hlen))
     bufs = []
     for _ in range(nbufs):
@@ -135,10 +155,20 @@ def _dumps_oob(obj):
     return payload, oob
 
 
-def _authenticate(sock, authkey, *, server):
-    """Mutual HMAC-SHA256 challenge-response. Authenticates, never encrypts."""
+def _validate_authkey(authkey, *, required):
+    if authkey is None:
+        if required:
+            raise ValueError("authkey is required for non-AF_UNIX sockets")
+        return
     if not isinstance(authkey, bytes):
         raise TypeError("authkey must be bytes")
+    if not authkey:
+        raise ValueError("authkey must not be empty")
+
+
+def _authenticate(sock, authkey, *, server):
+    """Mutual HMAC-SHA256 challenge-response. Authenticates, never encrypts."""
+    _validate_authkey(authkey, required=True)
 
     def challenge():
         nonce = os.urandom(32)
@@ -179,7 +209,12 @@ def _default_ship(fn):
 
 
 def _pack_function(fn, ship):
-    """Builds the code bundle for `fn` -> (hash, pickled bundle bytes)."""
+    """Builds the code bundle for ``fn`` and returns its cache key and payload.
+
+    The truncated SHA-256 value is strictly a non-security cache key retained
+    for wire cache compatibility. It provides no integrity guarantee and must
+    never be treated as an authentication or trust boundary.
+    """
     if ship is None:
         ship = _default_ship(fn)
     if ship == "pickle":
@@ -216,6 +251,7 @@ def _pack_function(fn, ship):
     else:
         raise ValueError(f"unknown ship mode {ship!r}")
     payload = pickle.dumps(bundle, protocol=5)
+    # Keep the existing wire cache key; this truncated digest is not integrity.
     return hashlib.sha256(payload).hexdigest()[:16], payload
 
 
@@ -292,6 +328,7 @@ class Session:
     """A connection to one worker. Thread-safe; calls are serialized."""
 
     def __init__(self, sock, authkey=None):
+        _validate_authkey(authkey, required=sock.family != socket.AF_UNIX)
         if authkey is not None:
             _authenticate(sock, authkey, server=False)
         self._sock = sock
@@ -338,16 +375,23 @@ def connect(address, authkey=None):
     """Connects to a worker and installs the session as module default.
 
     ``address`` is a filesystem path (``AF_UNIX``) or a ``(host, port)``
-    tuple (``AF_INET``, ``TCP_NODELAY``). Returns the :class:`Session`.
+    tuple (``AF_INET``, ``TCP_NODELAY``). Non-``AF_UNIX`` connections require
+    an explicit, non-empty bytes ``authkey``. Returns the :class:`Session`.
     """
     global _default_session
-    if isinstance(address, tuple):
-        sock = socket.create_connection(address)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    else:
+    is_unix = not isinstance(address, tuple)
+    _validate_authkey(authkey, required=not is_unix)
+    if is_unix:
         sock = socket.socket(socket.AF_UNIX)
         sock.connect(address)
-    _default_session = Session(sock, authkey)
+    else:
+        sock = socket.create_connection(address)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        _default_session = Session(sock, authkey)
+    except BaseException:
+        sock.close()
+        raise
     return _default_session
 
 
@@ -357,6 +401,7 @@ def connect(address, authkey=None):
 def serve(sock, authkey=None):
     """Serves one connected socket until the peer disconnects or sends
     ``shutdown``. Function bodies are cached per connection by hash."""
+    _validate_authkey(authkey, required=sock.family != socket.AF_UNIX)
     if authkey is not None:
         _authenticate(sock, authkey, server=True)
     fns = {}
@@ -411,18 +456,80 @@ def _send_error(sock, exc):
     _send(sock, {"op": "error", "exc": summary, "traceback": tb}, data)
 
 
+def _filesystem_unix_path(address):
+    path = os.fspath(address)
+    if path.startswith(b"\0" if isinstance(path, bytes) else "\0"):
+        return None
+    return path
+
+
+def _remove_stale_unix_socket(path):
+    try:
+        original = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(original.st_mode):
+        raise FileExistsError(errno.EEXIST, "refusing to replace non-socket path", path)
+    if original.st_uid != os.geteuid():
+        raise PermissionError(errno.EPERM, "refusing to replace unowned socket", path)
+
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.connect(path)
+    except ConnectionRefusedError:
+        pass
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise OSError(
+            errno.EADDRINUSE,
+            "refusing to replace Unix socket whose staleness cannot be proven",
+            path,
+        ) from exc
+    else:
+        raise OSError(errno.EADDRINUSE, "Unix socket is already listening", path)
+    finally:
+        probe.close()
+
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        current.st_dev != original.st_dev
+        or current.st_ino != original.st_ino
+        or current.st_uid != original.st_uid
+        or not stat.S_ISSOCK(current.st_mode)
+    ):
+        raise FileExistsError(
+            errno.EEXIST,
+            "refusing to replace Unix socket path changed during cleanup",
+            path,
+        )
+    os.unlink(path)
+
+
 def serve_forever(address, authkey=None):
     """Accept loop: one daemon thread per connection, each running
     :func:`serve`. Under free-threaded CPython connections execute in
     parallel. Never returns."""
-    if isinstance(address, tuple):
-        srv = socket.create_server(address)
-    else:
-        if os.path.exists(address):
-            os.unlink(address)
+    is_unix = not isinstance(address, tuple)
+    _validate_authkey(authkey, required=not is_unix)
+    if is_unix:
+        path = _filesystem_unix_path(address)
+        if path is not None:
+            _remove_stale_unix_socket(path)
         srv = socket.socket(socket.AF_UNIX)
-        srv.bind(address)
-        srv.listen()
+        try:
+            srv.bind(address)
+            if path is not None:
+                os.chmod(path, 0o600)
+            srv.listen()
+        except BaseException:
+            srv.close()
+            raise
+    else:
+        srv = socket.create_server(address)
     while True:
         conn, _ = srv.accept()
         threading.Thread(target=serve, args=(conn, authkey), daemon=True).start()

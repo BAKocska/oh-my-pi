@@ -6,8 +6,9 @@
 
 mod incoming;
 mod registry;
+pub mod render;
 
-use std::{fmt, future::Future};
+use std::{collections::BTreeMap, fmt, future::Future, io::Write};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -15,7 +16,7 @@ pub use incoming::{
 	CommitError, IncomingParams, Interrupt, InterruptWaitError, InterruptibleParams,
 	InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
 };
-use omp_core::{InvocationPhase, Str};
+use omp_core::{InvocationPhase, SparseMap, Str};
 pub use omp_proto::inference::v1::Fallback;
 pub use registry::{
 	Claim, Claims, ConstraintDisposition, ErasedEv, ErasedOutcome, ErasedStream, LoweredTool,
@@ -89,6 +90,36 @@ impl fmt::Display for Rev {
 		} else {
 			write!(f, "{}.{}", self.family, self.n)
 		}
+	}
+}
+
+/// Failure to parse a canonical `family.n` or bare `n` revision stamp.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("invalid tool revision: {value}")]
+pub struct RevParseError {
+	/// Rejected revision text.
+	pub value: Str,
+}
+
+impl std::str::FromStr for Rev {
+	type Err = RevParseError;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		let invalid = || RevParseError { value: Str::from(value) };
+		let (family, number) = match value.split_once('.') {
+			Some((family, number))
+				if !family.is_empty() && !number.is_empty() && !number.contains('.') =>
+			{
+				(family, number)
+			},
+			Some(_) => return Err(invalid()),
+			None => ("", value),
+		};
+		if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+			return Err(invalid());
+		}
+		let n = number.parse().map_err(|_| invalid())?;
+		Ok(Self { family: Str::from(family), n })
 	}
 }
 
@@ -614,13 +645,176 @@ where
 }
 
 /// One segment in a pulled JSON path.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ArgPath {
 	/// Object key.
 	Key(Str),
 	/// Array index.
 	Index(u64),
+}
+
+/// Declared repair coercion applied after a value is pulled.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Coerce {
+	/// Converts common string and numeric boolean spellings.
+	LooseBool,
+	/// Converts an integral string or integral real to an integer.
+	Integer,
+	/// Converts a numeric string to a real.
+	Number,
+	/// Converts a scalar JSON value to its string spelling.
+	String,
+	/// Wraps one non-array value in a one-element array.
+	Singleton,
+	/// Parses a string's contents as the target JSON shape.
+	JsonString,
+	/// Removes leading and trailing string whitespace.
+	Strip,
+	/// Splits a comma-delimited string into an array.
+	Csv,
+	/// Treats null-like optional values as an absent field.
+	NullElision,
+}
+
+/// Immutable declaration for one canonical argument path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArgSpec {
+	/// Canonical key/index path.
+	pub path:     SmallVec<ArgPath, 4>,
+	/// Additional accepted spellings of the final object key.
+	pub aliases:  SmallVec<Str, 4>,
+	/// Coercions applied in declaration order.
+	pub coerce:   SmallVec<Coerce, 2>,
+	/// Human-readable requested shape used by structured argument faults.
+	pub expected: Str,
+	/// Optional valid example borrowed into a structured argument fault.
+	pub example:  Option<Str>,
+}
+
+#[derive(Default)]
+struct RevArgSpecs {
+	path_ids: BTreeMap<SmallVec<ArgPath, 4>, u32>,
+	specs:    SparseMap<u32, ArgSpec>,
+}
+
+/// Per-revision argument declarations keyed by interned path identifiers.
+///
+/// Canonical paths and final-key aliases intern to the same dense identifier.
+/// Once sealed, the table serves borrowed lock-free index lookups and rejects
+/// every later mutation.
+#[derive(Default)]
+pub struct ArgSpecRegistry {
+	revisions: BTreeMap<Rev, RevArgSpecs>,
+	sealed:    bool,
+}
+
+/// Deterministic argument declaration registration failure.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ArgSpecRegistryError {
+	/// A declaration was attempted after the registry was sealed.
+	#[error("argument specification registry is sealed")]
+	Sealed,
+	/// A canonical path or one of its aliases was already declared.
+	#[error("argument path already registered for revision {rev}: {path:?}")]
+	Duplicate {
+		/// Exact argument dialect revision.
+		rev:  Rev,
+		/// Conflicting canonical or alias path.
+		path: SmallVec<ArgPath, 4>,
+	},
+	/// Aliases were declared for a path which does not end in an object key.
+	#[error("argument aliases require a final object key for revision {rev}: {path:?}")]
+	AliasOnIndex {
+		/// Exact argument dialect revision.
+		rev:  Rev,
+		/// Invalid canonical path.
+		path: SmallVec<ArgPath, 4>,
+	},
+	/// One revision exhausted the dense path identifier space.
+	#[error("too many argument paths registered for revision {0}")]
+	PathLimit(Rev),
+}
+
+impl ArgSpecRegistry {
+	/// Creates an empty mutable declaration table.
+	#[must_use]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Registers one canonical declaration and interns its alias paths.
+	pub fn register(&mut self, rev: Rev, spec: ArgSpec) -> Result<(), ArgSpecRegistryError> {
+		if self.sealed {
+			return Err(ArgSpecRegistryError::Sealed);
+		}
+		let mut paths = SmallVec::<SmallVec<ArgPath, 4>, 5>::new();
+		paths.push(spec.path.clone());
+		if !spec.aliases.is_empty() {
+			if !matches!(spec.path.last(), Some(ArgPath::Key(_))) {
+				return Err(ArgSpecRegistryError::AliasOnIndex { rev, path: spec.path });
+			}
+			for alias in &spec.aliases {
+				let mut path = spec.path.clone();
+				let Some(ArgPath::Key(key)) = path.last_mut() else {
+					unreachable!("final path segment was checked as a key")
+				};
+				*key = alias.clone();
+				if paths.contains(&path) {
+					return Err(ArgSpecRegistryError::Duplicate { rev, path });
+				}
+				paths.push(path);
+			}
+		}
+		let revision = self.revisions.entry(rev.clone()).or_default();
+		if let Some(path) = paths
+			.iter()
+			.find(|path| revision.path_ids.contains_key(path.as_slice()))
+		{
+			return Err(ArgSpecRegistryError::Duplicate { rev, path: (*path).clone() });
+		}
+		let path_id = u32::try_from(revision.specs.len())
+			.map_err(|_| ArgSpecRegistryError::PathLimit(rev.clone()))?;
+		for path in paths {
+			let previous = revision.path_ids.insert(path, path_id);
+			debug_assert!(previous.is_none(), "argument paths were checked before insertion");
+		}
+		let previous = revision.specs.insert(path_id, spec);
+		debug_assert!(previous.is_none(), "path identifiers are dense and never reused");
+		Ok(())
+	}
+
+	/// Seals the table against every later registration.
+	pub fn seal(&mut self) {
+		self.sealed = true;
+	}
+
+	/// Reports whether the declaration table is immutable.
+	#[must_use]
+	pub const fn is_sealed(&self) -> bool {
+		self.sealed
+	}
+
+	/// Borrows the declaration for one exact revision and canonical or alias
+	/// path.
+	#[must_use]
+	pub fn get(&self, rev: &Rev, path: &[ArgPath]) -> Option<&ArgSpec> {
+		let revision = self.revisions.get(rev)?;
+		revision.specs.get(*revision.path_ids.get(path)?)
+	}
 }
 
 /// Stable class of parameter pull failure.
@@ -901,27 +1095,127 @@ pub enum CallOutcomeDetails {
 	},
 }
 
-/// Environment-provided hook for durable large-outcome storage.
+/// Environment-provided staged writer for durable large-outcome storage.
 pub trait CallOutcomeSpill: Send + Sync {
-	/// Storage error.
+	/// Storage error returned while opening or finalizing a stage.
 	type Error;
+	/// Environment-owned synchronous stage receiving exact JSON bytes.
+	type Stage<'a>: Write + Send
+	where
+		Self: 'a;
 
-	/// Stores exact JSON bytes and returns their durable blob reference.
-	fn spill(&self, json: Bytes) -> impl Future<Output = Result<BlobRef, Self::Error>> + Send + '_;
+	/// Opens one spill stage after serialization first exceeds the inline limit.
+	fn open(&self) -> Result<Self::Stage<'_>, Self::Error>;
+
+	/// Finalizes one completed stage and returns its durable blob reference.
+	fn finish<'a>(
+		&'a self,
+		stage: Self::Stage<'a>,
+	) -> impl Future<Output = Result<BlobRef, Self::Error>> + Send + 'a;
 }
 
 /// Failure while serializing or spilling a structured call outcome.
 #[derive(Debug, Error)]
 pub enum CallOutcomeDetailsError<E> {
-	/// Structured outcome serialization failed.
+	/// Structured outcome serialization failed before a spill writer failed.
 	#[error("call-outcome serialization failed: {0}")]
-	Serialize(#[from] serde_json::Error),
-	/// Blob storage failed.
-	#[error("call-outcome spill failed")]
-	Spill(E),
+	Serialize(serde_json::Error),
+	/// The environment could not open a spill stage.
+	#[error("call-outcome spill open failed")]
+	SpillOpen(E),
+	/// The environment-owned spill writer rejected serialized bytes.
+	#[error("call-outcome spill write failed: {0}")]
+	SpillWrite(serde_json::Error),
+	/// The environment could not finalize the completed spill stage.
+	#[error("call-outcome spill finalize failed")]
+	SpillFinalize(E),
 }
 
-/// Serializes an outcome deterministically and spills it above `inline_limit`.
+enum ThresholdState<W> {
+	Inline(Vec<u8>),
+	Spilled(W),
+}
+
+struct ThresholdWriter<'a, S: CallOutcomeSpill> {
+	spill:              &'a S,
+	inline_limit:       usize,
+	state:              ThresholdState<S::Stage<'a>>,
+	byte_len:           u64,
+	open_error:         Option<S::Error>,
+	spill_write_failed: bool,
+}
+
+impl<'a, S: CallOutcomeSpill> ThresholdWriter<'a, S> {
+	fn new(spill: &'a S, inline_limit: usize) -> Self {
+		Self {
+			spill,
+			inline_limit,
+			state: ThresholdState::Inline(Vec::new()),
+			byte_len: 0,
+			open_error: None,
+			spill_write_failed: false,
+		}
+	}
+}
+
+impl<S: CallOutcomeSpill> Write for ThresholdWriter<'_, S> {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		if self.open_error.is_some() || self.spill_write_failed {
+			return Err(std::io::Error::other("call-outcome spill writer previously failed"));
+		}
+		if let ThresholdState::Inline(inline) = &mut self.state
+			&& bytes.len() <= self.inline_limit.saturating_sub(inline.len())
+		{
+			inline.extend_from_slice(bytes);
+			self.byte_len = self.byte_len.saturating_add(bytes.len() as u64);
+			return Ok(bytes.len());
+		}
+		if matches!(self.state, ThresholdState::Inline(_)) {
+			let stage = match self.spill.open() {
+				Ok(stage) => stage,
+				Err(error) => {
+					self.open_error = Some(error);
+					return Err(std::io::Error::other("call-outcome spill open failed"));
+				},
+			};
+			let ThresholdState::Inline(inline) =
+				std::mem::replace(&mut self.state, ThresholdState::Spilled(stage))
+			else {
+				unreachable!("inline spill transition changed state")
+			};
+			let ThresholdState::Spilled(opened) = &mut self.state else {
+				unreachable!("spill transition did not retain its stage")
+			};
+			if let Err(error) = opened.write_all(&inline) {
+				self.spill_write_failed = true;
+				return Err(error);
+			}
+		}
+		let ThresholdState::Spilled(stage) = &mut self.state else {
+			unreachable!("threshold writer was neither inline nor spilled")
+		};
+		if let Err(error) = stage.write_all(bytes) {
+			self.spill_write_failed = true;
+			return Err(error);
+		}
+		self.byte_len = self.byte_len.saturating_add(bytes.len() as u64);
+		Ok(bytes.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		match &mut self.state {
+			ThresholdState::Inline(_) => Ok(()),
+			ThresholdState::Spilled(stage) => stage.flush(),
+		}
+	}
+}
+
+/// Serializes an outcome once and spills on the first byte above
+/// `inline_limit`.
+///
+/// The inline buffer never grows beyond the limit. After overflow, buffered
+/// bytes and every later serializer write go directly to one environment-owned
+/// stage in their original order, and that stage is finalized exactly once.
 pub async fn call_outcome_details<P, F, S>(
 	outcome: &CallOutcome<P, F>,
 	inline_limit: usize,
@@ -932,14 +1226,25 @@ where
 	F: Serialize + Sync,
 	S: CallOutcomeSpill,
 {
-	let json = Bytes::from(serde_json::to_vec(outcome)?);
-	if json.len() <= inline_limit {
-		return Ok(CallOutcomeDetails::Inline { json });
+	let mut writer = ThresholdWriter::new(spill, inline_limit);
+	let serialized = outcome.serialize(&mut serde_json::Serializer::new(&mut writer));
+	if let Err(source) = serialized {
+		if let Some(error) = writer.open_error {
+			return Err(CallOutcomeDetailsError::SpillOpen(error));
+		}
+		if writer.spill_write_failed {
+			return Err(CallOutcomeDetailsError::SpillWrite(source));
+		}
+		return Err(CallOutcomeDetailsError::Serialize(source));
 	}
-	let byte_len = json.len() as u64;
-	let blob = spill
-		.spill(json)
-		.await
-		.map_err(CallOutcomeDetailsError::Spill)?;
-	Ok(CallOutcomeDetails::Spilled { blob, byte_len })
+	match writer.state {
+		ThresholdState::Inline(json) => Ok(CallOutcomeDetails::Inline { json: Bytes::from(json) }),
+		ThresholdState::Spilled(stage) => {
+			let blob = spill
+				.finish(stage)
+				.await
+				.map_err(CallOutcomeDetailsError::SpillFinalize)?;
+			Ok(CallOutcomeDetails::Spilled { blob, byte_len: writer.byte_len })
+		},
+	}
 }

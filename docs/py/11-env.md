@@ -1811,7 +1811,7 @@ needs the forwarded `ArgsCommitted` to arrive.
 Three ways to give the host its DATA edge:
 
 **(A) A UDS path in the environment, host connects and helloes.** The Environment passes
-`OMP_ENV_SOCKET` alongside the existing `OMP_PY_*` variables; the host opens it, sends
+`OMP_EXT_ENV_SOCKET` alongside the existing `OMP_PY_*` variables; the host opens it, sends
 `ClientHello` with its requested capability set, and gets a `ServerHello` carrying the granted set.
 **Recommended.** `EnvServer::serve_io` already accepts any `AsyncRead + AsyncWrite` external
 connection and already differentiates policy per connection —`ConnectionPolicy::external` sets

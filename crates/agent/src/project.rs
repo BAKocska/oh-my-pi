@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use omp_core::{Str, encoding::hex};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
-use omp_storage::transcript::{AmendPatch, Entry, Kind, Log};
+use omp_storage::transcript::{AmendPatch, Entry, Kind, LiveSet, Log};
 use omp_tool::{
 	Abort, CallOutcome, CapsBase, Part as ToolPart, ProjectedCall, PromptCaps, RecordedCallOwned,
 	Registry as ToolRegistry, Rev, TOOL_REV_PROP, ToolIdentity,
@@ -43,16 +43,17 @@ pub enum ProjectionError {
 
 /// Projects the live append-only journal chain into one canonical thread.
 ///
-/// Rewinds are resolved by [`Log::live`]. Sequence amendments update only the
+/// Rewinds are already resolved in `live`. Sequence amendments update only the
 /// working copy; original item events remain untouched.
 pub fn project_journal(
 	log: &Log,
+	live: &LiveSet,
 	tool_registry: &ToolRegistry,
 	caps: &CapsBase,
 ) -> Result<thread_pb::Thread, ProjectionError> {
 	let mut items = Vec::new();
 	let mut positions = BTreeMap::new();
-	for index in log.live() {
+	for index in live.iter() {
 		let Some(Entry::Ok(event)) = log.get(index) else {
 			continue;
 		};
@@ -287,16 +288,11 @@ fn tool_revision(item: &thread_pb::Item) -> Result<Option<Rev>, ProjectionError>
 	let Some(pb::value::Kind::String(value)) = value.kind.as_ref() else {
 		return Err(ProjectionError::RevisionType);
 	};
-	let (family, number) = value
-		.rsplit_once('.')
-		.map_or(("", value.as_str()), |(family, number)| (family, number));
-	if number.is_empty() {
-		return Err(ProjectionError::InvalidRevision);
-	}
-	let n = number
-		.parse::<u16>()
-		.map_err(|_| ProjectionError::InvalidRevision)?;
-	Ok(Some(Rev { family: Str::from(family), n }))
+	Ok(Some(
+		value
+			.parse::<Rev>()
+			.map_err(|_| ProjectionError::InvalidRevision)?,
+	))
 }
 
 fn proto_json_bytes(value: &pb::Value) -> Option<Bytes> {
@@ -402,7 +398,9 @@ mod tests {
 	use bytes::Bytes;
 	use omp_core::Str;
 	use omp_proto::thread::v1 as thread_pb;
-	use omp_storage::transcript::{Event, Header, ItemRecord, Kind, SessionId, Writer, load};
+	use omp_storage::transcript::{
+		Event, Header, ItemRecord, Kind, LiveSet, SessionId, Writer, load,
+	};
 	use omp_tool::{CapsBase, ModelClass};
 
 	use super::project_journal;
@@ -449,16 +447,15 @@ mod tests {
 			.expect("append user item");
 		drop(writer);
 
-		let projected = project_journal(
-			&load(&path).expect("load transcript"),
-			&omp_tool::Registry::new(),
-			&CapsBase {
-				maximum_parts:      1,
-				maximum_text_bytes: 1024,
-				media:              false,
-				model_class:        ModelClass::Standard,
-			},
-		)
+		let log = load(&path).expect("load transcript");
+		let mut live = LiveSet::new();
+		log.live_into(&mut live);
+		let projected = project_journal(&log, &live, &omp_tool::Registry::new(), &CapsBase {
+			maximum_parts:      1,
+			maximum_text_bytes: 1024,
+			media:              false,
+			model_class:        ModelClass::Standard,
+		})
 		.expect("project transcript");
 		assert_eq!(projected.items, vec![item]);
 		std::fs::remove_file(path).expect("remove transcript");

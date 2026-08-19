@@ -31,9 +31,9 @@ use omp_proto::{
 	inference::v1::{part_start, turn_event::Event, value},
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
+use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::ViewState};
 use omp_tui::{UiContext, components::AttachmentContent, detect};
 use secrecy::SecretString;
-use xutf::IntoAnsiStripped as _;
 
 use crate::{
 	chat_ui::input::{ChatCommand, commands, help_text, parse_input},
@@ -193,14 +193,11 @@ enum SubmitAck {
 	Interrupted,
 }
 
-#[derive(Debug)]
 struct ToolDisplay {
-	name:           Str,
-	args:           omp_slopjson::Value,
-	started:        bool,
-	output_bytes:   Vec<u8>,
-	emitted_output: String,
-	preview:        String,
+	identity: ToolIdentity,
+	args:     omp_slopjson::Value,
+	started:  bool,
+	fold:     ViewState,
 }
 
 struct BridgeState {
@@ -230,6 +227,7 @@ struct BridgeState {
 pub async fn run<'a, C, R>(
 	mut agent: Agent<C>,
 	session: ChatUiSession,
+	registry: Arc<Registry>,
 	auth: Option<&'a ChatAuth>,
 	data_dir: PathBuf,
 	mut list_sessions: R,
@@ -333,7 +331,13 @@ where
 			),
 		}
 	}
-	replay_items(&backend_tx, &session.initial_items, &mut state.tools, &mut state.part_serial);
+	replay_items(
+		&backend_tx,
+		&session.initial_items,
+		&mut state.tools,
+		&mut state.part_serial,
+		registry.as_ref(),
+	);
 	send_status(&backend_tx, &state, &bus, agent_events.dropped());
 
 	let bridge = async move {
@@ -352,6 +356,7 @@ where
 						&data_dir,
 						&mut list_sessions,
 						&bus,
+						registry.as_ref(),
 						agent_events.dropped(),
 						&mut state,
 					).await? {
@@ -378,6 +383,7 @@ where
 						&backend_tx,
 						&mut state,
 						&event,
+						registry.as_ref(),
 						&bus,
 						agent_events.dropped(),
 					);
@@ -415,6 +421,7 @@ async fn handle_intent<R>(
 	data_dir: &std::path::Path,
 	list_sessions: &mut R,
 	bus: &omp_agent::EventBus,
+	registry: &Registry,
 	dropped: u64,
 	state: &mut BridgeState,
 ) -> anyhow::Result<bool>
@@ -593,7 +600,13 @@ where
 						Ok(Ok(items)) => {
 							state.tools.clear();
 							send_backend(backend, BackendEvent::HistoryCleared);
-							replay_items(backend, &items, &mut state.tools, &mut state.part_serial);
+							replay_items(
+								backend,
+								&items,
+								&mut state.tools,
+								&mut state.part_serial,
+								registry,
+							);
 							state.rewind_targets.clear();
 						},
 						Ok(Err(error)) => send_backend(backend, BackendEvent::Error(Str::from(error))),
@@ -758,6 +771,7 @@ fn handle_agent_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	event: &AgentEvent,
+	registry: &Registry,
 	bus: &omp_agent::EventBus,
 	dropped: u64,
 ) {
@@ -766,7 +780,13 @@ fn handle_agent_event(
 			Some(Event::Accepted(accepted)) => state.replaying_turn = accepted.replay,
 			Some(Event::Outcome(outcome)) => {
 				if state.replaying_turn {
-					replay_items(backend, &outcome.output, &mut state.tools, &mut state.part_serial);
+					replay_items(
+						backend,
+						&outcome.output,
+						&mut state.tools,
+						&mut state.part_serial,
+						registry,
+					);
 					state.replaying_turn = false;
 				}
 				state.queued = 0;
@@ -820,14 +840,12 @@ fn handle_agent_event(
 			},
 			_ => {},
 		},
-		AgentEvent::ToolOpened { call_id, name, .. } => {
+		AgentEvent::ToolOpened { call_id, name, rev } => {
 			state.tools.insert(call_id.clone(), ToolDisplay {
-				name:           name.clone(),
-				args:           omp_slopjson::Value::Object(omp_slopjson::Object::new()),
-				started:        false,
-				output_bytes:   Vec::new(),
-				emitted_output: String::new(),
-				preview:        String::new(),
+				identity: ToolIdentity { name: name.clone(), rev: rev.clone() },
+				args:     omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+				started:  false,
+				fold:     ViewState::new(),
 			});
 		},
 		AgentEvent::ToolArgs { call_id, view, .. } => {
@@ -837,36 +855,26 @@ fn handle_agent_event(
 			}
 		},
 		AgentEvent::ToolUpdate { call_id, json } => {
-			if let Ok(update) = serde_json::from_slice::<serde_json::Value>(json)
-				&& let Some(tool) = state.tools.get_mut(call_id.as_str())
-			{
+			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				ensure_tool_started(backend, call_id, tool, true);
-				if let Some(chunk) = tool_update_text(tool, &update) {
-					send_backend(backend, BackendEvent::ToolOutput { id: call_id.clone(), chunk });
-				}
+				let view = fold_tool_update(registry, tool, json.clone());
+				send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 			}
 		},
 		AgentEvent::ToolFinished { call_id, item } => {
 			let mut tool = state.tools.remove(call_id.as_str());
-			let name = tool
-				.as_ref()
-				.map_or_else(|| tool_result_name(item), |tool| tool.name.clone());
+			let (identity, ok, view) = render_tool_result_view(registry, item, tool.as_ref());
 			if let Some(tool) = tool.as_mut() {
 				ensure_tool_started(backend, call_id, tool, true);
 			} else {
 				send_backend(backend, BackendEvent::ToolStarted {
 					id:    call_id.clone(),
-					name:  name.clone(),
-					title: name.clone(),
+					name:  identity.name.clone(),
+					title: identity.name.clone(),
 				});
 			}
-			send_tool_result_output(backend, call_id, item);
-			let ok = matches!(&item.kind, Some(item::Kind::ToolResult(result)) if !result.is_error);
-			send_backend(backend, BackendEvent::ToolFinished {
-				id: call_id.clone(),
-				ok,
-				summary: tool_summary(&name, item),
-			});
+			send_tool_result_images(backend, call_id, item);
+			send_backend(backend, BackendEvent::ToolFinished { id: call_id.clone(), ok, view });
 		},
 		AgentEvent::JobRegistered { job_id } => {
 			state.jobs.insert(job_id.clone());
@@ -887,6 +895,7 @@ fn replay_items(
 	items: &[Item],
 	tools: &mut HashMap<Str, ToolDisplay>,
 	serial: &mut u64,
+	registry: &Registry,
 ) {
 	for item in items {
 		match &item.kind {
@@ -897,44 +906,32 @@ fn replay_items(
 					|_| omp_slopjson::Value::Object(omp_slopjson::Object::new()),
 					omp_slopjson::parse_streaming,
 				);
-				let name = Str::from(call.name.as_str());
+				let identity =
+					item_tool_identity(item, &call.name).unwrap_or_else(|| missing_identity(&call.name));
 				let title = call
 					.intent
 					.as_deref()
-					.map_or_else(|| tool_title(&name, &args), Str::from);
+					.map_or_else(|| tool_title(&identity.name, &args), Str::from);
 				send_backend(backend, BackendEvent::ToolStarted {
 					id: id.clone(),
-					name: name.clone(),
+					name: identity.name.clone(),
 					title,
 				});
-				tools.insert(id, ToolDisplay {
-					name,
-					args,
-					started: true,
-					output_bytes: Vec::new(),
-					emitted_output: String::new(),
-					preview: String::new(),
-				});
+				tools.insert(id, ToolDisplay { identity, args, started: true, fold: ViewState::new() });
 			},
 			Some(item::Kind::ToolResult(result)) => {
 				let id = Str::from(result.call_id.as_str());
 				let tool = tools.remove(id.as_str());
-				let name = tool
-					.as_ref()
-					.map_or_else(|| Str::from(result.name.as_str()), |tool| tool.name.clone());
+				let (identity, ok, view) = render_tool_result_view(registry, item, tool.as_ref());
 				if tool.is_none() {
 					send_backend(backend, BackendEvent::ToolStarted {
 						id:    id.clone(),
-						name:  name.clone(),
-						title: name.clone(),
+						name:  identity.name.clone(),
+						title: identity.name.clone(),
 					});
 				}
-				send_tool_result_output(backend, &id, item);
-				send_backend(backend, BackendEvent::ToolFinished {
-					id,
-					ok: !result.is_error,
-					summary: tool_summary(&name, item),
-				});
+				send_tool_result_images(backend, &id, item);
+				send_backend(backend, BackendEvent::ToolFinished { id, ok, view });
 			},
 			_ => {},
 		}
@@ -950,13 +947,13 @@ fn ensure_tool_started(
 	if tool.started {
 		return;
 	}
-	let title = tool_title(&tool.name, &tool.args);
-	if !force && title == tool.name {
+	let title = tool_title(&tool.identity.name, &tool.args);
+	if !force && title == tool.identity.name {
 		return;
 	}
 	send_backend(backend, BackendEvent::ToolStarted {
 		id: call_id.clone(),
-		name: tool.name.clone(),
+		name: tool.identity.name.clone(),
 		title,
 	});
 	tool.started = true;
@@ -1078,102 +1075,134 @@ fn blob_label(blob: &Blob) -> Str {
 	fmts!("image {} · {} KB", blob.mime, blob.size.div_ceil(1024))
 }
 
-fn tool_update_text(tool: &mut ToolDisplay, update: &serde_json::Value) -> Option<Str> {
-	if let Some(preview) = update.get("preview").and_then(serde_json::Value::as_str) {
-		let chunk = preview
-			.strip_prefix(&tool.preview)
-			.map_or_else(|| fmts!("\n{preview}"), Str::from);
-		tool.preview.clear();
-		tool.preview.push_str(preview);
-		return (!chunk.is_empty()).then_some(chunk);
+fn item_tool_identity(item: &Item, name: &str) -> Option<ToolIdentity> {
+	let rev = item
+		.props
+		.as_ref()?
+		.fields
+		.get(TOOL_REV_PROP)?
+		.kind
+		.as_ref()
+		.and_then(|kind| match kind {
+			value::Kind::String(rev) => rev.parse::<Rev>().ok(),
+			_ => None,
+		})?;
+	Some(ToolIdentity { name: Str::from(name), rev })
+}
+
+fn durable_tool_identity(item: &Item) -> Option<ToolIdentity> {
+	let Some(item::Kind::ToolResult(result)) = &item.kind else {
+		return None;
+	};
+	item_tool_identity(item, &result.name)
+}
+
+fn missing_identity(name: &str) -> ToolIdentity {
+	ToolIdentity { name: Str::from(name), rev: Rev { family: Str::new_static(""), n: 0 } }
+}
+
+fn missing_tool_identity(item: &Item) -> ToolIdentity {
+	let name = match &item.kind {
+		Some(item::Kind::ToolResult(result)) => result.name.as_str(),
+		_ => "tool",
+	};
+	missing_identity(name)
+}
+
+fn durable_tool_outcome(item: &Item) -> Option<Bytes> {
+	let Some(item::Kind::ToolResult(result)) = &item.kind else {
+		return None;
+	};
+	let details = proto_to_json(result.details.as_ref()?)?;
+	serde_json::to_vec(&details).ok().map(Bytes::from)
+}
+
+fn durable_tool_ok(item: &Item) -> bool {
+	let Some(item::Kind::ToolResult(result)) = &item.kind else {
+		return false;
+	};
+	let branch = result
+		.details
+		.as_ref()
+		.and_then(|details| match details.kind.as_ref()? {
+			value::Kind::Map(map) => map.fields.get("kind"),
+			_ => None,
+		})
+		.and_then(|kind| match kind.kind.as_ref()? {
+			value::Kind::String(kind) => Some(kind.as_str()),
+			_ => None,
+		});
+	match branch {
+		Some("ok") => true,
+		Some("faulted" | "fault" | "args_rejected" | "args" | "aborted") => false,
+		_ => !result.is_error,
 	}
-	if let Some(text) = update.get("text").and_then(serde_json::Value::as_str) {
-		tool.output_bytes.extend_from_slice(text.as_bytes());
-	} else {
-		let bytes = update
-			.get("data")?
-			.as_array()?
-			.iter()
-			.map(|value| value.as_u64().and_then(|byte| u8::try_from(byte).ok()))
-			.collect::<Option<Vec<_>>>()?;
-		tool.output_bytes.extend_from_slice(&bytes);
+}
+
+fn structured_bytes_fallback(bytes: &Bytes) -> Str {
+	std::str::from_utf8(bytes).map_or_else(|_| Str::new_static("{}"), Str::from)
+}
+
+fn fold_tool_update(registry: &Registry, tool: &mut ToolDisplay, update: Bytes) -> Str {
+	match registry.fold_render(&tool.identity, &mut tool.fold, update.clone()) {
+		Ok(()) => registry
+			.render_view(&tool.identity, &tool.fold, None)
+			.unwrap_or_else(|_| structured_bytes_fallback(&update)),
+		Err(_) => structured_bytes_fallback(&update),
 	}
-	let rendered = match std::str::from_utf8(&tool.output_bytes) {
-		Ok(text) => text.to_owned(),
-		Err(error) if error.error_len().is_none() => return None,
-		Err(_) => String::from_utf8_lossy(&tool.output_bytes).into_owned(),
-	}
-	.into_ansi_stripped();
-	let chunk = rendered.strip_prefix(&tool.emitted_output)?;
-	let chunk = (!chunk.is_empty()).then(|| Str::from(chunk))?;
-	tool.emitted_output = rendered;
-	Some(chunk)
+}
+
+fn render_tool_result_view(
+	registry: &Registry,
+	item: &Item,
+	tool: Option<&ToolDisplay>,
+) -> (ToolIdentity, bool, Str) {
+	let outcome = durable_tool_outcome(item);
+	let Some(identity) = durable_tool_identity(item) else {
+		let view = outcome
+			.as_ref()
+			.map_or_else(|| Str::new_static("{}"), structured_bytes_fallback);
+		return (missing_tool_identity(item), durable_tool_ok(item), view);
+	};
+	let empty_fold = ViewState::new();
+	let fold = tool
+		.filter(|tool| tool.identity == identity)
+		.map_or(&empty_fold, |tool| &tool.fold);
+	let view = registry
+		.render_view(&identity, fold, outcome.as_deref())
+		.unwrap_or_else(|_| {
+			outcome
+				.as_ref()
+				.map_or_else(|| Str::new_static("{}"), structured_bytes_fallback)
+		});
+	(identity, durable_tool_ok(item), view)
 }
 
 fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
-	let detail = if name.as_str() == "edit" {
-		args
-			.get("input")
-			.and_then(|value| value.as_str())
-			.and_then(edit_input_path)
-	} else {
-		["title", "path", "command", "pattern", "query"]
-			.into_iter()
-			.find_map(|key| args.get(key).and_then(|value| value.as_str()))
-			.and_then(|text| text.lines().next())
-	};
+	let detail = ["title", "path", "command", "pattern", "query"]
+		.into_iter()
+		.find_map(|key| args.get(key).and_then(|value| value.as_str()))
+		.and_then(|text| text.lines().next());
 	detail.map_or_else(|| name.clone(), |detail| fmts!("{name} · {detail}"))
 }
 
-fn edit_input_path(input: &str) -> Option<&str> {
-	input.lines().find_map(|line| {
-		let body = line.trim().strip_prefix('[')?.strip_suffix(']')?;
-		let (path, tag) = body.rsplit_once('#')?;
-		(!path.is_empty() && !tag.is_empty()).then_some(path)
-	})
-}
-
-fn tool_result_name(item: &Item) -> Str {
-	match &item.kind {
-		Some(item::Kind::ToolResult(result)) => Str::from(result.name.as_str()),
-		_ => Str::new_static("tool"),
-	}
-}
-
-fn send_tool_result_output(backend: &flume::Sender<BackendEvent>, call_id: &Str, item: &Item) {
+fn send_tool_result_images(backend: &flume::Sender<BackendEvent>, call_id: &Str, item: &Item) {
 	let Some(item::Kind::ToolResult(result)) = &item.kind else {
 		return;
 	};
-	let mut has_output = false;
 	for part in &result.parts {
-		let chunk = match &part.kind {
-			Some(part::Kind::Text(text)) if !text.is_empty() => Str::from(text.as_str()),
-			Some(part::Kind::Blob(blob)) => {
-				if let Some(source) = persist_tool_image(blob) {
-					// The scene renders persisted PNG payloads inline via the
-					// terminal graphics tiers (pi UI-06/UI-20).
-					send_backend(backend, BackendEvent::ToolImage { id: call_id.clone(), source });
-					continue;
-				}
-				blob_label(blob)
-			},
-			_ => continue,
+		let Some(part::Kind::Blob(blob)) = &part.kind else {
+			continue;
 		};
-		if has_output {
-			send_backend(backend, BackendEvent::ToolOutput {
-				id:    call_id.clone(),
-				chunk: Str::new_static("\n"),
-			});
+		if let Some(source) = persist_tool_image(blob) {
+			send_backend(backend, BackendEvent::ToolImage { id: call_id.clone(), source });
 		}
-		send_backend(backend, BackendEvent::ToolOutput { id: call_id.clone(), chunk });
-		has_output = true;
 	}
 }
 
 /// Persists an inline PNG tool-result payload to a content-addressed temp
 /// file for inline terminal rendering, returning its path. Non-PNG payloads
-/// and by-reference blobs keep their text label: the terminal graphics
-/// tiers transmit PNG only.
+/// and by-reference blobs are represented by the structured renderer view.
 fn persist_tool_image(blob: &Blob) -> Option<Str> {
 	if blob.mime != "image/png" || blob.inline.is_empty() {
 		return None;
@@ -1194,169 +1223,6 @@ fn persist_tool_image(blob: &Blob) -> Option<Str> {
 		std::fs::write(&path, &blob.inline).ok()?;
 	}
 	Some(Str::from(path.to_string_lossy().as_ref()))
-}
-
-fn tool_summary(name: &Str, item: &Item) -> Vec<Str> {
-	let Some(item::Kind::ToolResult(result)) = &item.kind else {
-		return vec![fmts!("{name} finished without a tool result")];
-	};
-	let details = result.details.as_ref().and_then(proto_to_json);
-	let mut lines = details
-		.as_ref()
-		.map_or_else(Vec::new, |details| specialized_tool_summary(name.as_str(), details));
-	if lines.is_empty()
-		&& result.parts.is_empty()
-		&& let Some(details) = details
-	{
-		let mut preferred = Vec::new();
-		collect_summary_strings(&details, &mut preferred);
-		lines.extend(
-			preferred
-				.into_iter()
-				.flat_map(|text| text.lines().take(12).map(Str::from).collect::<Vec<_>>()),
-		);
-	}
-	if lines.is_empty() {
-		lines.push(if result.is_error {
-			fmts!("{name} failed")
-		} else {
-			fmts!("{name} completed")
-		});
-	}
-	lines.truncate(12);
-	lines
-}
-
-fn specialized_tool_summary(name: &str, details: &serde_json::Value) -> Vec<Str> {
-	let kind = details.get("kind").and_then(serde_json::Value::as_str);
-	let value = details.get("value").unwrap_or(details);
-	if kind.is_some_and(|kind| kind != "ok") {
-		let mut messages = Vec::new();
-		collect_summary_strings(value, &mut messages);
-		return messages
-			.into_iter()
-			.flat_map(|message| message.lines().take(6).map(Str::from).collect::<Vec<_>>())
-			.take(6)
-			.collect();
-	}
-	match name {
-		"edit" => edit_summary(value),
-		"grep" => match_summary(value, "matches", "files"),
-		"glob" => match_summary(value, "paths", "matches"),
-		"shell" | "eval" => status_summary(value),
-		"write" => write_summary(value),
-		_ => Vec::new(),
-	}
-}
-
-fn edit_summary(value: &serde_json::Value) -> Vec<Str> {
-	let Some(sections) = value.get("sections").and_then(serde_json::Value::as_array) else {
-		return Vec::new();
-	};
-	let (mut added, mut removed) = (0usize, 0usize);
-	for line in sections
-		.iter()
-		.filter_map(|section| section.get("diff").and_then(serde_json::Value::as_str))
-		.flat_map(str::lines)
-	{
-		added += usize::from(line.starts_with('+') && !line.starts_with("+++"));
-		removed += usize::from(line.starts_with('-') && !line.starts_with("---"));
-	}
-	let mut lines = vec![fmts!("{} files changed · +{added} -{removed}", sections.len())];
-	lines.extend(sections.iter().take(5).filter_map(|section| {
-		let path = section.get("path")?.as_str()?;
-		let op = section
-			.get("op")
-			.and_then(serde_json::Value::as_str)
-			.unwrap_or("updated");
-		Some(fmts!("{op} {path}"))
-	}));
-	lines
-}
-
-fn match_summary(value: &serde_json::Value, noun: &str, field: &str) -> Vec<Str> {
-	let Some(entries) = value.get(field).and_then(serde_json::Value::as_array) else {
-		return Vec::new();
-	};
-	let count = if field == "files" {
-		entries
-			.iter()
-			.filter_map(|entry| entry.get("matches").and_then(serde_json::Value::as_array))
-			.map(Vec::len)
-			.sum()
-	} else {
-		entries.len()
-	};
-	vec![fmts!("{count} {noun}")]
-}
-
-fn status_summary(value: &serde_json::Value) -> Vec<Str> {
-	let Some(status) = value.get("status") else {
-		return Vec::new();
-	};
-	let outcome = status
-		.get("outcome")
-		.and_then(serde_json::Value::as_str)
-		.unwrap_or("finished");
-	let mut lines = vec![
-		status
-			.get("exit_code")
-			.and_then(serde_json::Value::as_i64)
-			.map_or_else(|| Str::from(outcome), |code| fmts!("{outcome} · exit {code}")),
-	];
-	if let Some(exception) = status.get("exception")
-		&& let Some(message) = exception.get("message").and_then(serde_json::Value::as_str)
-	{
-		lines.push(Str::from(message));
-	}
-	lines
-}
-
-fn write_summary(value: &serde_json::Value) -> Vec<Str> {
-	let Some(path) = value
-		.get("display_path")
-		.and_then(serde_json::Value::as_str)
-	else {
-		return Vec::new();
-	};
-	let disposition = value
-		.get("disposition")
-		.and_then(serde_json::Value::as_str)
-		.unwrap_or("wrote");
-	let bytes = value
-		.get("reported_len")
-		.and_then(serde_json::Value::as_u64);
-	vec![bytes.map_or_else(
-		|| fmts!("{disposition} {path}"),
-		|bytes| fmts!("{disposition} {path} · {bytes} bytes"),
-	)]
-}
-
-fn collect_summary_strings(value: &serde_json::Value, out: &mut Vec<String>) {
-	match value {
-		serde_json::Value::Object(map) => {
-			for key in ["message", "reason", "diagnostic", "text", "display_path", "preview"] {
-				if let Some(text) = map.get(key).and_then(serde_json::Value::as_str) {
-					out.push(text.to_owned());
-				}
-			}
-			for value in map.values() {
-				if out.len() >= 12 {
-					break;
-				}
-				collect_summary_strings(value, out);
-			}
-		},
-		serde_json::Value::Array(values) => {
-			for value in values {
-				if out.len() >= 12 {
-					break;
-				}
-				collect_summary_strings(value, out);
-			}
-		},
-		_ => {},
-	}
 }
 
 fn proto_to_json(value: &omp_proto::inference::v1::Value) -> Option<serde_json::Value> {
@@ -1755,24 +1621,20 @@ mod tests {
 			})),
 			..Default::default()
 		};
-		send_tool_result_output(&tx, &Str::from("call-1"), &item);
+		send_tool_result_images(&tx, &Str::from("call-1"), &item);
 		let events: Vec<_> = rx.drain().collect();
-		assert!(matches!(
-			&events[0],
-			BackendEvent::ToolOutput { chunk, .. } if chunk.as_str() == "rendered page 1"
-		));
-		let Some(BackendEvent::ToolImage { id, source }) = events.get(1) else {
+		let Some(BackendEvent::ToolImage { id, source }) = events.first() else {
 			panic!("PNG blob produces a ToolImage event");
 		};
 		assert_eq!(id.as_str(), "call-1");
 		let persisted = std::fs::read(source.as_str()).expect("persisted image payload");
 		assert_eq!(persisted, png);
-		assert_eq!(events.len(), 2, "the image replaces the blob text label");
+		assert_eq!(events.len(), 1, "model-facing text is not mined into the UI view");
 		std::fs::remove_file(source.as_str()).ok();
 	}
 
 	#[test]
-	fn non_png_tool_result_blobs_keep_their_text_label() {
+	fn non_png_tool_result_blobs_defer_to_the_structured_view() {
 		let (tx, rx) = flume::unbounded();
 		let item = Item {
 			kind: Some(item::Kind::ToolResult(omp_proto::thread::v1::ToolResult {
@@ -1791,13 +1653,8 @@ mod tests {
 			})),
 			..Default::default()
 		};
-		send_tool_result_output(&tx, &Str::from("call-2"), &item);
-		let events: Vec<_> = rx.drain().collect();
-		assert_eq!(events.len(), 1);
-		assert!(matches!(
-			&events[0],
-			BackendEvent::ToolOutput { chunk, .. } if chunk.contains("image/jpeg")
-		));
+		send_tool_result_images(&tx, &Str::from("call-2"), &item);
+		assert!(rx.is_empty());
 	}
 
 	#[test]
@@ -1808,24 +1665,192 @@ mod tests {
 		assert!(startup_recovery_needed(true, true));
 	}
 
-	#[test]
-	fn tool_updates_join_split_utf8_and_strip_terminal_escapes() {
-		let mut tool = ToolDisplay {
-			name:           Str::from("shell"),
-			args:           omp_slopjson::Value::Object(omp_slopjson::Object::new()),
-			started:        true,
-			output_bytes:   Vec::new(),
-			emitted_output: String::new(),
-			preview:        String::new(),
+	#[derive(Default)]
+	struct TestFold {
+		updates: String,
+	}
+
+	#[derive(serde::Deserialize)]
+	struct TestUpdate {
+		text: String,
+	}
+
+	struct TestRenderer(&'static str);
+
+	impl omp_tool::render::Render for TestRenderer {
+		type Outcome = serde_json::Value;
+		type State = TestFold;
+		type Update = TestUpdate;
+
+		fn fold(&self, state: &mut Self::State, update: Self::Update) {
+			state.updates.push_str(&update.text);
+		}
+
+		fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
+			let branch = outcome
+				.and_then(|outcome| outcome.get("kind"))
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or("live");
+			Some(fmts!("<row>{}:{}:{branch}</row>", self.0, state.updates))
+		}
+	}
+
+	fn test_identity(rev: &str) -> ToolIdentity {
+		ToolIdentity { name: Str::from("same"), rev: rev.parse().expect("valid test revision") }
+	}
+
+	fn json_proto(value: serde_json::Value) -> omp_proto::inference::v1::Value {
+		let kind = match value {
+			serde_json::Value::Null => value::Kind::Null(true),
+			serde_json::Value::Bool(value) => value::Kind::Bool(value),
+			serde_json::Value::String(value) => value::Kind::String(value),
+			serde_json::Value::Number(value) => value
+				.as_i64()
+				.map_or_else(|| value::Kind::Uint(value.as_u64().expect("integer")), value::Kind::Int),
+			serde_json::Value::Array(values) => {
+				value::Kind::List(omp_proto::inference::v1::ValueList {
+					values: values.into_iter().map(json_proto).collect(),
+				})
+			},
+			serde_json::Value::Object(values) => {
+				value::Kind::Map(omp_proto::inference::v1::ValueMap {
+					fields: values
+						.into_iter()
+						.map(|(key, value)| (key, json_proto(value)))
+						.collect(),
+				})
+			},
 		};
-		assert!(tool_update_text(&mut tool, &serde_json::json!({ "data": [231, 149] })).is_none());
-		let chunk = tool_update_text(
-			&mut tool,
-			&serde_json::json!({
-				"data": [140, 27, 91, 51, 49, 109, 111, 107, 27, 91, 48, 109]
-			}),
-		)
-		.expect("completed UTF-8 update");
-		assert_eq!(chunk.as_str(), "界ok");
+		omp_proto::inference::v1::Value { kind: Some(kind) }
+	}
+
+	fn revision_props(rev: &str) -> omp_proto::inference::v1::ValueMap {
+		omp_proto::inference::v1::ValueMap {
+			fields: [(TOOL_REV_PROP.to_owned(), omp_proto::inference::v1::Value {
+				kind: Some(value::Kind::String(rev.to_owned())),
+			})]
+			.into_iter()
+			.collect(),
+		}
+	}
+
+	fn result_item(call_id: &str, rev: Option<&str>, branch: &str) -> Item {
+		Item {
+			kind: Some(item::Kind::ToolResult(omp_proto::thread::v1::ToolResult {
+				call_id: call_id.to_owned(),
+				name: "same".to_owned(),
+				details: Some(json_proto(serde_json::json!({
+					"kind": branch,
+					"value": { "fact": format!("{branch}-fact") }
+				}))),
+				is_error: branch == "faulted",
+				..Default::default()
+			})),
+			props: rev.map(revision_props),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn exact_revision_renderers_fold_streamed_updates_independently() {
+		let mut registry = Registry::new();
+		registry
+			.register_renderer(test_identity("test.1"), TestRenderer("one"))
+			.expect("register revision one");
+		registry
+			.register_renderer(test_identity("test.2"), TestRenderer("two"))
+			.expect("register revision two");
+		let mut first = ToolDisplay {
+			identity: test_identity("test.1"),
+			args:     omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+			started:  true,
+			fold:     ViewState::new(),
+		};
+		let mut second = ToolDisplay {
+			identity: test_identity("test.2"),
+			args:     omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+			started:  true,
+			fold:     ViewState::new(),
+		};
+		assert_eq!(
+			fold_tool_update(&registry, &mut first, Bytes::from_static(br#"{"text":"a"}"#)).as_str(),
+			"<row>one:a:live</row>"
+		);
+		assert_eq!(
+			fold_tool_update(&registry, &mut first, Bytes::from_static(br#"{"text":"b"}"#)).as_str(),
+			"<row>one:ab:live</row>"
+		);
+		assert_eq!(
+			fold_tool_update(&registry, &mut second, Bytes::from_static(br#"{"text":"z"}"#)).as_str(),
+			"<row>two:z:live</row>"
+		);
+	}
+
+	#[test]
+	fn durable_branches_and_missing_revisions_preserve_structured_facts() {
+		let mut registry = Registry::new();
+		registry
+			.register_renderer(test_identity("test.1"), TestRenderer("exact"))
+			.expect("register exact renderer");
+		for branch in ["ok", "faulted", "args_rejected", "aborted"] {
+			let (_, ok, view) =
+				render_tool_result_view(&registry, &result_item("call", Some("test.1"), branch), None);
+			assert_eq!(ok, branch == "ok");
+			assert!(view.contains(branch), "{view}");
+		}
+
+		let unknown = result_item("unknown", Some("unknown.9"), "faulted");
+		let (identity, ok, view) = render_tool_result_view(&registry, &unknown, None);
+		assert_eq!(identity.rev.to_string(), "unknown.9");
+		assert!(!ok);
+		assert!(view.contains(r#""kind":"faulted""#));
+		assert!(view.contains("faulted-fact"));
+
+		let missing = result_item("missing", None, "aborted");
+		let (identity, ok, view) = render_tool_result_view(&registry, &missing, None);
+		assert_eq!(identity.rev.n, 0);
+		assert!(!ok);
+		assert!(view.contains(r#""kind":"aborted""#));
+		assert!(view.contains("aborted-fact"));
+	}
+
+	#[test]
+	fn replay_uses_durable_revision_and_is_deterministic() {
+		let mut registry = Registry::new();
+		registry
+			.register_renderer(test_identity("test.1"), TestRenderer("one"))
+			.expect("register revision one");
+		registry
+			.register_renderer(test_identity("test.2"), TestRenderer("two"))
+			.expect("register revision two");
+		let items = [
+			Item {
+				kind: Some(item::Kind::ToolCall(omp_proto::thread::v1::ToolCall {
+					id: "call".to_owned(),
+					name: "same".to_owned(),
+					args_json: Bytes::from_static(b"{}"),
+					..Default::default()
+				})),
+				props: Some(revision_props("test.1")),
+				..Default::default()
+			},
+			result_item("call", Some("test.2"), "ok"),
+		];
+		let replay = || {
+			let (tx, rx) = flume::unbounded();
+			let mut tools = HashMap::new();
+			let mut serial = 0;
+			replay_items(&tx, &items, &mut tools, &mut serial, &registry);
+			rx.drain()
+				.find_map(|event| match event {
+					BackendEvent::ToolFinished { view, .. } => Some(view),
+					_ => None,
+				})
+				.expect("replayed tool result")
+		};
+		let first = replay();
+		let second = replay();
+		assert_eq!(first, second);
+		assert_eq!(first.as_str(), "<row>two::ok</row>");
 	}
 }

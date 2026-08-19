@@ -19,11 +19,11 @@ use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use omp_proto::{
 	prost::Message,
-	thread::v1::{Part, part},
+	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
-		CancelTool, HostFrame, InvokeTool, Ping, Pong, ProtocolError, ProtocolErrorCode,
-		RegisterTools, ToolAborted, ToolComplete, ToolDecl, ToolUpdate, WorkerFrame, WorkerHello,
-		host_frame, worker_frame,
+		ArgIssue, CancelTool, ExtensionDecl, HostFrame, InvokeTool, OutcomeKind, Ping, Pong,
+		ProtocolError, ProtocolErrorCode, RegisterTools, ToolAborted, ToolComplete, ToolDecl,
+		ToolUpdate, WorkerFrame, WorkerHello, host_frame, worker_frame,
 	},
 };
 use pyo3::{
@@ -50,17 +50,63 @@ pub const PYTHON_REV: &str = "3.14t";
 pub const PY_EVAL_MODULE: &str = "omp_py_eval";
 
 /// Default upper bound for one encoded tool-host frame.
-pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_FRAME_BYTES: usize = omp_proto::bounds::FRAME_MAX_BYTES;
 
-/// Configuration for the warm Python worker.
+/// Stable identity of one extension host.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HostKey {
+	/// Extension layer, such as project or user.
+	pub layer:     Str,
+	/// Trust or sandbox tier.
+	pub tier:      Str,
+	/// Stable extension identity.
+	pub extension: Str,
+}
+
+impl HostKey {
+	/// Builds a host identity.
+	#[must_use]
+	pub fn new(layer: impl Into<Str>, tier: impl Into<Str>, extension: impl Into<Str>) -> Self {
+		Self { layer: layer.into(), tier: tier.into(), extension: extension.into() }
+	}
+
+	/// Returns the ordered identity fields used by scoped binding derivation.
+	#[must_use]
+	pub fn fields(&self) -> [&str; 3] {
+		[self.layer.as_str(), self.tier.as_str(), self.extension.as_str()]
+	}
+}
+
+/// Configuration of one active extension.
 #[derive(Clone, Debug)]
-pub struct ToolWorkerConfig {
+pub struct ExtHostSpec {
+	/// Stable extension identity.
+	pub key:         HostKey,
+	/// Python import name containing this extension's declarations.
+	pub module:      Str,
+	/// Explicit opt-in fate-sharing pool. Absence isolates this extension.
+	pub pool:        Option<Str>,
+	/// Optional site-packages directory passed through as `OMP_PY_SITE`.
+	pub python_site: Option<PathBuf>,
+	/// Scoped DATA socket passed only to this extension host.
+	pub data_socket: Option<PathBuf>,
+}
+
+impl ExtHostSpec {
+	/// Builds an isolated extension configuration.
+	#[must_use]
+	pub fn new(key: HostKey, module: impl Into<Str>) -> Self {
+		Self { key, module: module.into(), pool: None, python_site: None, data_socket: None }
+	}
+}
+
+/// Configuration for all active Python extension hosts.
+#[derive(Clone, Debug)]
+pub struct ExtHostConfig {
 	/// Executable to re-enter. Defaults to the current executable.
 	pub executable:      PathBuf,
-	/// Optional site-packages directory passed through as `OMP_PY_SITE`.
-	pub python_site:     Option<PathBuf>,
-	/// Python import names enabled for this worker.
-	pub modules:         Vec<Str>,
+	/// Active extensions. An empty set starts no Python process.
+	pub extensions:      Vec<ExtHostSpec>,
 	/// Expected workspace protobuf schema revision.
 	pub schema_rev:      u32,
 	/// Expected embedded Python ABI revision.
@@ -73,20 +119,21 @@ pub struct ToolWorkerConfig {
 	pub ping_interval:   Duration,
 	/// Courtesy-interrupt grace period before the process group is killed.
 	pub interrupt_grace: Duration,
-	/// Initial delay after an unhealthy worker.
+	/// Initial delay after an unhealthy host.
 	pub initial_backoff: Duration,
 	/// Maximum delay between respawn attempts.
 	pub max_backoff:     Duration,
+	/// Healthy duration after which the per-host backoff resets.
+	pub healthy_reset:   Duration,
 }
 
-impl ToolWorkerConfig {
+impl ExtHostConfig {
 	/// Builds the production configuration for `executable`.
 	#[must_use]
 	pub const fn new(executable: PathBuf) -> Self {
 		Self {
 			executable,
-			python_site: None,
-			modules: Vec::new(),
+			extensions: Vec::new(),
 			schema_rev: omp_proto::SCHEMA_REV,
 			python_rev: Str::new_static(PYTHON_REV),
 			max_frame_bytes: NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES)
@@ -94,8 +141,9 @@ impl ToolWorkerConfig {
 			health_timeout: Duration::from_secs(5),
 			ping_interval: Duration::from_secs(15),
 			interrupt_grace: Duration::from_millis(150),
-			initial_backoff: Duration::from_millis(25),
-			max_backoff: Duration::from_millis(500),
+			initial_backoff: Duration::from_secs(1),
+			max_backoff: Duration::from_secs(30),
+			healthy_reset: Duration::from_secs(30),
 		}
 	}
 
@@ -154,13 +202,46 @@ pub struct WorkerAbort {
 	pub effects_unknown: bool,
 }
 
+/// Decoded terminal branch from an extension host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerOutcomeKind {
+	/// Successful completion.
+	Ok,
+	/// Extension-declared fault.
+	Faulted,
+	/// Structured argument rejection.
+	ArgsRejected,
+	/// Aborted execution.
+	Aborted,
+}
+
+/// Validated completion from an extension host.
+#[derive(Clone, Debug)]
+pub struct WorkerCompletion {
+	/// Stable call identity.
+	pub call_id:      Str,
+	/// Exact terminal branch.
+	pub kind:         WorkerOutcomeKind,
+	/// Model-facing result parts, each with a present discriminator.
+	pub parts:        Vec<Part>,
+	/// Inline structured details when the worker did not spill them.
+	pub details_json: Option<Bytes>,
+	/// Spilled structured details when the worker did not send them inline.
+	pub details_blob: Option<Blob>,
+	/// Structured argument issue, present only for
+	/// [`WorkerOutcomeKind::ArgsRejected`].
+	pub args_issue:   Option<ArgIssue>,
+	/// Whether model-facing parts may be compacted.
+	pub useless:      bool,
+}
+
 /// One ordered event from a committed Python invocation.
 #[derive(Clone, Debug)]
 pub enum WorkerEvent {
 	/// Typed JSON progress serialized by the extension.
 	Update(ToolUpdate),
 	/// Normal terminal completion.
-	Complete(ToolComplete),
+	Complete(WorkerCompletion),
 	/// Abnormal terminal completion owned by the supervisor.
 	Aborted(WorkerAbort),
 }
@@ -228,66 +309,188 @@ impl Drop for WorkerInvocation {
 	}
 }
 
-/// One-worker warm supervisor for Python extension tools.
-pub struct ToolWorkerSupervisor {
-	commands:        flume::Sender<SupervisorCommand>,
-	registrations:   Arc<[ToolDecl]>,
-	next_invocation: AtomicU64,
-	actor:           JoinHandle<()>,
+/// A registered declaration and the extension host that owns it.
+#[derive(Clone, Debug)]
+pub struct OwnedToolDecl {
+	/// Owning extension host.
+	pub owner:       HostKey,
+	/// Worker declaration.
+	pub declaration: ToolDecl,
 }
 
-impl ToolWorkerSupervisor {
-	/// Starts and verifies the warm worker, including its declaration set.
+/// Independently supervises the process group for each active extension host.
+pub struct ExtHostSupervisor {
+	routes:          BTreeMap<(Str, Str), HostRoute>,
+	registrations:   Arc<[OwnedToolDecl]>,
+	next_invocation: AtomicU64,
+	actors:          Vec<HostActor>,
+}
+
+impl ExtHostSupervisor {
+	/// Starts and verifies every configured active extension.
+	///
+	/// An empty configuration is lazy: it starts no Python interpreter.
+	/// Extensions share a process only when every member names the same explicit
+	/// pool in the same layer and tier.
 	///
 	/// # Errors
-	/// Returns a startup or handshake error if a verified worker cannot be
-	/// created.
-	pub async fn spawn(config: ToolWorkerConfig) -> Result<Self, WorkerError> {
-		let process = WorkerProcess::spawn(&config).await?;
-		let registrations: Arc<[ToolDecl]> = process.registrations.clone().into();
-		let (commands, mailbox) = flume::unbounded();
-		let expected_registrations = registrations.clone();
-		let actor = tokio::spawn(run_supervisor(config, process, expected_registrations, mailbox));
-		Ok(Self { commands, registrations, next_invocation: AtomicU64::new(1), actor })
+	/// Returns a startup, identity, registration, or handshake error.
+	pub async fn spawn(config: ExtHostConfig) -> Result<Self, WorkerError> {
+		let mut groups = BTreeMap::<ProcessKey, Vec<ExtHostSpec>>::new();
+		let mut identities = HashSet::with_capacity(config.extensions.len());
+		for extension in config.extensions.iter().cloned() {
+			validate_extension_spec(&extension)?;
+			if !identities.insert(extension.key.clone()) {
+				return Err(WorkerError::Protocol(Str::new_static(
+					"extension host identity is configured more than once",
+				)));
+			}
+			groups
+				.entry(ProcessKey::from_spec(&extension))
+				.or_default()
+				.push(extension);
+		}
+
+		let mut prepared = Vec::with_capacity(groups.len());
+		for (key, extensions) in groups {
+			let process_config = ProcessConfig::new(&config, key, extensions)?;
+			match WorkerProcess::spawn(&process_config, 1).await {
+				Ok(process) => prepared.push((process_config, process)),
+				Err(error) => {
+					for (prepared_config, mut process) in prepared {
+						process.terminate(prepared_config.interrupt_grace).await;
+					}
+					return Err(error);
+				},
+			}
+		}
+
+		let mut routes = BTreeMap::new();
+		let mut registrations = Vec::new();
+		let mut registration_error = None;
+		'registration: for (process_config, process) in &prepared {
+			for declaration in &process.registrations {
+				let owner = match process_config.owner_for(declaration) {
+					Ok(owner) => owner,
+					Err(error) => {
+						registration_error = Some(error);
+						break 'registration;
+					},
+				};
+				let Some(definition) = declaration.definition.as_ref() else {
+					continue;
+				};
+				let route = (Str::from(definition.name.as_str()), Str::from(declaration.rev.as_str()));
+				if routes
+					.insert(route, (process_config.process_id.clone(), owner.clone()))
+					.is_some()
+				{
+					registration_error = Some(WorkerError::Protocol(Str::new_static(
+						"two extension hosts registered the same tool name and revision",
+					)));
+					break 'registration;
+				}
+				registrations.push(OwnedToolDecl { owner, declaration: declaration.clone() });
+			}
+		}
+		if let Some(error) = registration_error {
+			for (prepared_config, mut process) in prepared.drain(..) {
+				process.terminate(prepared_config.interrupt_grace).await;
+			}
+			return Err(error);
+		}
+
+		let mut senders = BTreeMap::new();
+		let mut actors = Vec::with_capacity(prepared.len());
+		for (process_config, process) in prepared {
+			let process_id = process_config.process_id.clone();
+			let expected_registrations: Arc<[ToolDecl]> = process.registrations.clone().into();
+			let (commands, mailbox) = flume::unbounded();
+			let actor = tokio::spawn(run_supervisor(
+				process_config,
+				process,
+				expected_registrations,
+				mailbox,
+				1,
+			));
+			senders.insert(process_id, commands.clone());
+			actors.push(HostActor { commands, actor });
+		}
+		let routes = routes
+			.into_iter()
+			.map(|(route, (process_id, owner))| {
+				let commands = senders
+					.get(&process_id)
+					.expect("every verified process has a command channel")
+					.clone();
+				(route, HostRoute { commands, owner })
+			})
+			.collect();
+		Ok(Self {
+			routes,
+			registrations: registrations.into(),
+			next_invocation: AtomicU64::new(1),
+			actors,
+		})
 	}
 
-	/// Returns the declarations verified during the initial worker handshake.
+	/// Returns declarations paired with their owning host identity.
 	#[must_use]
-	pub fn registrations(&self) -> &[ToolDecl] {
+	pub fn registrations(&self) -> &[OwnedToolDecl] {
 		&self.registrations
 	}
 
 	/// Starts an invocation from committed raw arguments.
 	///
-	/// No streaming-fragment API exists at this boundary: constructing
-	/// [`CommittedToolCall`] is the caller's explicit commitment proof.
-	///
 	/// # Errors
-	/// Returns [`WorkerError::Unavailable`] if the supervisor has shut down.
+	/// Returns [`WorkerError::NotRegistered`] when no active extension owns the
+	/// exact name/revision, or [`WorkerError::Unavailable`] when its host actor
+	/// has stopped.
 	pub fn invoke_committed(
 		&self,
 		call: CommittedToolCall,
 	) -> Result<WorkerInvocation, WorkerError> {
+		let route = self
+			.routes
+			.get(&(call.name.clone(), call.rev.clone()))
+			.ok_or_else(|| WorkerError::NotRegistered {
+				name: call.name.clone(),
+				rev:  call.rev.clone(),
+			})?;
+		let commands = route.commands.clone();
 		let id = self.next_invocation.fetch_add(1, Ordering::Relaxed);
 		let (events_tx, events) = flume::unbounded();
-		self
-			.commands
-			.send(SupervisorCommand::Invoke { id, call, events: events_tx })
+		commands
+			.send(SupervisorCommand::Invoke {
+				id,
+				owner: route.owner.clone(),
+				call,
+				events: events_tx,
+			})
 			.map_err(|_| WorkerError::Unavailable)?;
-		Ok(WorkerInvocation {
-			id,
-			events,
-			commands: self.commands.clone(),
-			terminal: false,
-			cancel_requested: false,
-		})
+		Ok(WorkerInvocation { id, events, commands, terminal: false, cancel_requested: false })
 	}
 
-	/// Stops the warm worker and waits for its process tree to exit.
+	/// Stops every active host and waits for its process group to exit.
 	pub async fn shutdown(self) {
-		let _ = self.commands.send(SupervisorCommand::Shutdown);
-		let _ = self.actor.await;
+		for host in &self.actors {
+			let _ = host.commands.send(SupervisorCommand::Shutdown);
+		}
+		for host in self.actors {
+			let _ = host.actor.await;
+		}
 	}
+}
+
+#[derive(Clone)]
+struct HostRoute {
+	commands: flume::Sender<SupervisorCommand>,
+	owner:    HostKey,
+}
+
+struct HostActor {
+	commands: flume::Sender<SupervisorCommand>,
+	actor:    JoinHandle<()>,
 }
 
 /// Worker startup, transport, protocol, or embedded-Python failure.
@@ -313,6 +516,9 @@ pub enum WorkerError {
 		/// Configured maximum.
 		limit:  usize,
 	},
+	/// An encoded frame violated extension-host allocation bounds.
+	#[error("python tool worker frame bounds violation: {0}")]
+	FrameBounds(#[from] omp_proto::bounds::FrameBoundsError),
 	/// The worker did not complete a health operation in time.
 	#[error("python tool worker health check timed out")]
 	HealthTimeout,
@@ -338,6 +544,14 @@ pub enum WorkerError {
 		/// Worker revision.
 		actual:   Str,
 	},
+	/// No configured extension registered the requested exact tool identity.
+	#[error("no extension host registered tool {name} at revision {rev}")]
+	NotRegistered {
+		/// Requested tool name.
+		name: Str,
+		/// Requested tool revision.
+		rev:  Str,
+	},
 	/// A Python extension declaration or invocation failed.
 	#[error("python tool extension failed: {0}")]
 	Python(Str),
@@ -353,17 +567,167 @@ impl From<PyErr> for WorkerError {
 }
 
 enum SupervisorCommand {
-	Invoke { id: u64, call: CommittedToolCall, events: flume::Sender<WorkerEvent> },
-	Cancel { id: u64, reason: Str },
-	Interrupt { id: u64, reason: Str },
+	Invoke {
+		id:     u64,
+		owner:  HostKey,
+		call:   CommittedToolCall,
+		events: flume::Sender<WorkerEvent>,
+	},
+	Cancel {
+		id:     u64,
+		reason: Str,
+	},
+	Interrupt {
+		id:     u64,
+		reason: Str,
+	},
 	Shutdown,
 }
 
 struct PendingInvocation {
 	id:        u64,
+	owner:     HostKey,
 	call:      CommittedToolCall,
 	interrupt: Option<Str>,
 	events:    flume::Sender<WorkerEvent>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FateUnit {
+	Extension(Str),
+	Pool(Str),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProcessKey {
+	layer: Str,
+	tier:  Str,
+	unit:  FateUnit,
+}
+
+impl ProcessKey {
+	fn from_spec(spec: &ExtHostSpec) -> Self {
+		let unit = spec
+			.pool
+			.clone()
+			.map_or_else(|| FateUnit::Extension(spec.key.extension.clone()), FateUnit::Pool);
+		Self { layer: spec.key.layer.clone(), tier: spec.key.tier.clone(), unit }
+	}
+
+	fn pool(&self) -> Option<&Str> {
+		match &self.unit {
+			FateUnit::Extension(_) => None,
+			FateUnit::Pool(pool) => Some(pool),
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+struct ProcessConfig {
+	process_id:         ProcessKey,
+	executable:         PathBuf,
+	python_site:        Option<PathBuf>,
+	modules:            Vec<Str>,
+	owners:             BTreeMap<Str, HostKey>,
+	data_socket:        Option<PathBuf>,
+	schema_rev:         u32,
+	python_rev:         Str,
+	max_frame_bytes:    NonZeroUsize,
+	health_timeout:     Duration,
+	ping_interval:      Duration,
+	interrupt_grace:    Duration,
+	initial_backoff:    Duration,
+	max_backoff:        Duration,
+	healthy_reset:      Duration,
+	session_generation: u64,
+}
+
+impl ProcessConfig {
+	fn new(
+		root: &ExtHostConfig,
+		process_id: ProcessKey,
+		extensions: Vec<ExtHostSpec>,
+	) -> Result<Self, WorkerError> {
+		let python_site = extensions
+			.first()
+			.and_then(|extension| extension.python_site.clone());
+		if extensions
+			.iter()
+			.any(|extension| extension.python_site != python_site)
+		{
+			return Err(WorkerError::Protocol(Str::new_static(
+				"extensions in an explicit pool must use the same Python site",
+			)));
+		}
+		let data_socket = extensions
+			.first()
+			.and_then(|extension| extension.data_socket.clone());
+		if extensions
+			.iter()
+			.any(|extension| extension.data_socket != data_socket)
+		{
+			return Err(WorkerError::Protocol(Str::new_static(
+				"extensions in an explicit pool must use the same scoped DATA socket",
+			)));
+		}
+		let mut owners = BTreeMap::new();
+		let mut modules = Vec::with_capacity(extensions.len());
+		for extension in extensions {
+			if owners
+				.insert(extension.module.clone(), extension.key)
+				.is_some()
+			{
+				return Err(WorkerError::Protocol(Str::new_static(
+					"an extension module is configured more than once in one host",
+				)));
+			}
+			modules.push(extension.module);
+		}
+		Ok(Self {
+			process_id,
+			executable: root.executable.clone(),
+			python_site,
+			modules,
+			owners,
+			data_socket,
+			schema_rev: root.schema_rev,
+			python_rev: root.python_rev.clone(),
+			max_frame_bytes: root.max_frame_bytes,
+			health_timeout: root.health_timeout,
+			ping_interval: root.ping_interval,
+			interrupt_grace: root.interrupt_grace,
+			initial_backoff: root.initial_backoff,
+			max_backoff: root.max_backoff,
+			healthy_reset: root.healthy_reset,
+			session_generation: 1,
+		})
+	}
+
+	fn owner_for(&self, declaration: &ToolDecl) -> Result<HostKey, WorkerError> {
+		self
+			.owners
+			.get(declaration.extension_id.as_str())
+			.cloned()
+			.ok_or_else(|| {
+				WorkerError::Protocol(Str::new_static(
+					"worker registered a declaration for an unconfigured extension",
+				))
+			})
+	}
+}
+
+fn validate_extension_spec(spec: &ExtHostSpec) -> Result<(), WorkerError> {
+	if spec.key.layer.is_empty()
+		|| spec.key.tier.is_empty()
+		|| spec.key.extension.is_empty()
+		|| spec.module.is_empty()
+		|| spec.pool.as_ref().is_some_and(Str::is_empty)
+	{
+		return Err(WorkerError::Protocol(Str::new_static(
+			"extension host identity, module, and explicit pool names must be nonempty",
+		)));
+	}
+	Ok(())
 }
 
 struct WorkerProcess {
@@ -376,7 +740,7 @@ struct WorkerProcess {
 }
 
 impl WorkerProcess {
-	async fn spawn(config: &ToolWorkerConfig) -> Result<Self, WorkerError> {
+	async fn spawn(config: &ProcessConfig, generation: u64) -> Result<Self, WorkerError> {
 		let mut command = Command::new(&config.executable);
 		command
 			.arg(WORKER_ARG)
@@ -397,6 +761,21 @@ impl WorkerProcess {
 				.collect::<Vec<_>>()
 				.join(",");
 			command.env("OMP_PY_MODULES", modules);
+		}
+		if let Some(socket) = &config.data_socket {
+			command.env("OMP_EXT_ENV_SOCKET", socket);
+		} else {
+			command.env_remove("OMP_EXT_ENV_SOCKET");
+		}
+		command
+			.env("OMP_EXT_LAYER", config.process_id.layer.as_str())
+			.env("OMP_EXT_TIER", config.process_id.tier.as_str())
+			.env("OMP_EXT_HOST_GENERATION", generation.to_string())
+			.env("OMP_EXT_SESSION_GENERATION", config.session_generation.to_string());
+		if let Some(pool) = config.process_id.pool() {
+			command.env("OMP_EXT_POOL", pool.as_str());
+		} else {
+			command.env_remove("OMP_EXT_POOL");
 		}
 		#[cfg(unix)]
 		{
@@ -425,14 +804,18 @@ impl WorkerProcess {
 			write_scratch: BytesMut::with_capacity(8 * 1024),
 			registrations: Vec::new(),
 		};
-		if let Err(error) = process.handshake(config).await {
+		if let Err(error) = process.handshake(config, generation).await {
 			process.terminate(config.interrupt_grace).await;
 			return Err(error);
 		}
 		Ok(process)
 	}
 
-	async fn handshake(&mut self, config: &ToolWorkerConfig) -> Result<(), WorkerError> {
+	async fn handshake(
+		&mut self,
+		config: &ProcessConfig,
+		generation: u64,
+	) -> Result<(), WorkerError> {
 		let hello_frame = self.read_timeout(config).await?;
 		let Some(worker_frame::Body::Hello(hello)) = hello_frame.body else {
 			return Err(WorkerError::Protocol(Str::new_static("WorkerHello must be the first frame")));
@@ -452,19 +835,53 @@ impl WorkerProcess {
 				actual:   Str::from(hello.python_rev),
 			});
 		}
+		if hello.api_level != 1
+			|| hello.layer != config.process_id.layer.as_str()
+			|| hello.tier != config.process_id.tier.as_str()
+			|| hello.pool != config.process_id.pool().map_or("", Str::as_str)
+			|| hello.host_version != env!("CARGO_PKG_VERSION")
+			|| hello.host_generation != generation
+			|| hello.session_generation != config.session_generation
+		{
+			return Err(WorkerError::Protocol(Str::new_static(
+				"WorkerHello identity or generation did not match the spawned host",
+			)));
+		}
 		let registrations = self.read_timeout(config).await?;
-		let Some(worker_frame::Body::RegisterTools(RegisterTools { tools, .. })) = registrations.body
+		let Some(worker_frame::Body::RegisterTools(RegisterTools {
+			tools,
+			generation: registration_generation,
+			extensions,
+			..
+		})) = registrations.body
 		else {
 			return Err(WorkerError::Protocol(Str::new_static(
 				"RegisterTools must follow WorkerHello",
 			)));
 		};
+		if registration_generation != generation {
+			return Err(WorkerError::Protocol(Str::new_static("RegisterTools generation is stale")));
+		}
+		let registered_extensions = extensions
+			.iter()
+			.map(|extension| extension.extension_id.as_str())
+			.collect::<HashSet<_>>();
+		if registered_extensions.len() != config.owners.len()
+			|| config
+				.owners
+				.keys()
+				.any(|module| !registered_extensions.contains(module.as_str()))
+		{
+			return Err(WorkerError::Protocol(Str::new_static(
+				"RegisterTools extension set did not match the spawned host",
+			)));
+		}
 		validate_registrations(&tools)?;
 		self.registrations = tools;
 		Ok(())
 	}
 
-	async fn read_timeout(&mut self, config: &ToolWorkerConfig) -> Result<WorkerFrame, WorkerError> {
+	async fn read_timeout(&mut self, config: &ProcessConfig) -> Result<WorkerFrame, WorkerError> {
 		tokio::time::timeout(
 			config.health_timeout,
 			read_async_frame(&mut self.stdout, config.max_frame_bytes, &mut self.read_scratch),
@@ -474,11 +891,7 @@ impl WorkerProcess {
 		.and_then(|frame| frame.ok_or(WorkerError::Exited))
 	}
 
-	async fn write(
-		&mut self,
-		frame: &HostFrame,
-		config: &ToolWorkerConfig,
-	) -> Result<(), WorkerError> {
+	async fn write(&mut self, frame: &HostFrame, config: &ProcessConfig) -> Result<(), WorkerError> {
 		write_async_frame(&mut self.stdin, frame, config.max_frame_bytes, &mut self.write_scratch)
 			.await
 	}
@@ -527,14 +940,17 @@ impl WorkerProcess {
 }
 
 async fn run_supervisor(
-	config: ToolWorkerConfig,
+	config: ProcessConfig,
 	mut process: WorkerProcess,
 	expected_registrations: Arc<[ToolDecl]>,
 	mailbox: flume::Receiver<SupervisorCommand>,
+	mut generation: u64,
 ) {
 	let mut pending = VecDeque::new();
 	let mut ping_nonce = 1_u64;
 	let mut ping_tick = tokio::time::interval(config.ping_interval);
+	let mut healthy_since = Instant::now();
+	let mut backoff = initial_backoff(&config);
 	ping_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 	ping_tick.tick().await;
 	loop {
@@ -542,8 +958,13 @@ async fn run_supervisor(
 			match run_invocation(&config, &mut process, invocation, &mailbox, &mut pending).await {
 				InvocationAction::KeepWorker => {},
 				InvocationAction::ReplaceWorker => {
+					if healthy_since.elapsed() >= config.healthy_reset {
+						backoff = initial_backoff(&config);
+					}
 					process.terminate(config.interrupt_grace).await;
-					process = respawn(&config, &expected_registrations).await;
+					process =
+						respawn(&config, &expected_registrations, &mut generation, &mut backoff).await;
+					healthy_since = Instant::now();
 				},
 				InvocationAction::Shutdown => {
 					process.terminate(config.interrupt_grace).await;
@@ -555,8 +976,8 @@ async fn run_supervisor(
 
 		tokio::select! {
 			command = mailbox.recv_async() => match command {
-				Ok(SupervisorCommand::Invoke { id, call, events }) => {
-					pending.push_back(PendingInvocation { id, call, interrupt: None, events });
+				Ok(SupervisorCommand::Invoke { id, owner, call, events }) => {
+					pending.push_back(PendingInvocation { id, owner, call, interrupt: None, events });
 				},
 				Ok(SupervisorCommand::Cancel { .. } | SupervisorCommand::Interrupt { .. }) => {},
 				Ok(SupervisorCommand::Shutdown) | Err(_) => {
@@ -575,8 +996,18 @@ async fn run_supervisor(
 						Ok(WorkerFrame { body: Some(worker_frame::Body::Pong(Pong { nonce, .. })), .. }) if nonce == ping_nonce);
 				ping_nonce = ping_nonce.wrapping_add(1).max(1);
 				if !healthy {
+					if healthy_since.elapsed() >= config.healthy_reset {
+						backoff = initial_backoff(&config);
+					}
 					process.terminate(config.interrupt_grace).await;
-					process = respawn(&config, &expected_registrations).await;
+					process = respawn(
+						&config,
+						&expected_registrations,
+						&mut generation,
+						&mut backoff,
+					)
+					.await;
+					healthy_since = Instant::now();
 				}
 			},
 		}
@@ -590,7 +1021,7 @@ enum InvocationAction {
 }
 
 async fn run_invocation(
-	config: &ToolWorkerConfig,
+	config: &ProcessConfig,
 	process: &mut WorkerProcess,
 	mut invocation: PendingInvocation,
 	mailbox: &flume::Receiver<SupervisorCommand>,
@@ -609,8 +1040,8 @@ async fn run_invocation(
 				}));
 				return InvocationAction::KeepWorker;
 			},
-			Ok(SupervisorCommand::Invoke { id, call, events }) => {
-				pending.push_back(PendingInvocation { id, call, interrupt: None, events });
+			Ok(SupervisorCommand::Invoke { id, owner, call, events }) => {
+				pending.push_back(PendingInvocation { id, owner, call, interrupt: None, events });
 			},
 			Ok(SupervisorCommand::Cancel { id, reason }) => {
 				cancel_pending(pending, id, reason);
@@ -679,8 +1110,20 @@ async fn run_invocation(
 						}
 					},
 					Some(worker_frame::Body::ToolComplete(complete)) if complete.call_id == call_id.as_str() => {
-						let _ = invocation.events.send(WorkerEvent::Complete(complete));
-						return InvocationAction::KeepWorker;
+						match WorkerCompletion::try_from(complete) {
+							Ok(complete) => {
+								let _ = invocation.events.send(WorkerEvent::Complete(complete));
+								return InvocationAction::KeepWorker;
+							},
+							Err(_) => {
+								send_abort(
+									&invocation,
+									WorkerAbortKind::Crashed,
+									"worker sent an invalid ToolComplete",
+								);
+								return InvocationAction::ReplaceWorker;
+							},
+						}
 					},
 					Some(worker_frame::Body::ToolAborted(aborted)) if aborted.call_id == call_id.as_str() => {
 						let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
@@ -700,11 +1143,12 @@ async fn run_invocation(
 			command = mailbox.recv_async() => match command {
 				Ok(SupervisorCommand::Cancel { id: cancelled, reason }) if cancelled == id => {
 					cancel_worker(process, config, request_id, &call_id, reason.as_str()).await;
+					let reason = cancellation_reason(config, &invocation.owner, reason.as_str());
 					send_abort(&invocation, WorkerAbortKind::Cancelled, reason.as_str());
 					return InvocationAction::ReplaceWorker;
 				},
-				Ok(SupervisorCommand::Invoke { id, call, events }) => {
-					pending.push_back(PendingInvocation { id, call, interrupt: None, events });
+				Ok(SupervisorCommand::Invoke { id, owner, call, events }) => {
+					pending.push_back(PendingInvocation { id, owner, call, interrupt: None, events });
 				},
 				Ok(SupervisorCommand::Cancel { id, reason }) => {
 					cancel_pending(pending, id, reason);
@@ -728,7 +1172,7 @@ async fn run_invocation(
 
 async fn interrupt_worker(
 	process: &mut WorkerProcess,
-	config: &ToolWorkerConfig,
+	config: &ProcessConfig,
 	request_id: u64,
 	call_id: &Str,
 	reason: &str,
@@ -752,7 +1196,7 @@ async fn interrupt_worker(
 
 async fn cancel_worker(
 	process: &mut WorkerProcess,
-	config: &ToolWorkerConfig,
+	config: &ProcessConfig,
 	request_id: u64,
 	call_id: &Str,
 	reason: &str,
@@ -803,20 +1247,87 @@ fn send_abort(invocation: &PendingInvocation, kind: WorkerAbortKind, reason: &st
 	}));
 }
 
-async fn respawn(config: &ToolWorkerConfig, expected: &[ToolDecl]) -> WorkerProcess {
-	let max_delay = config.max_backoff.max(Duration::from_millis(1));
-	let mut delay = config
+fn initial_backoff(config: &ProcessConfig) -> Duration {
+	config
 		.initial_backoff
 		.max(Duration::from_millis(1))
-		.min(max_delay);
+		.min(config.max_backoff.max(Duration::from_millis(1)))
+}
+
+fn cancellation_reason(config: &ProcessConfig, owner: &HostKey, reason: &str) -> Str {
+	if let Some(pool) = config.process_id.pool() {
+		Str::from(format!(
+			"{reason}; effects unknown for {}; explicit pool {pool} fate-sharing terminated sibling \
+			 extension calls",
+			owner.extension,
+		))
+	} else {
+		Str::from(format!(
+			"{reason}; effects unknown for {}; no other extension host was terminated",
+			owner.extension,
+		))
+	}
+}
+
+async fn respawn(
+	config: &ProcessConfig,
+	expected: &[ToolDecl],
+	generation: &mut u64,
+	backoff: &mut Duration,
+) -> WorkerProcess {
+	let max_delay = config.max_backoff.max(Duration::from_millis(1));
 	loop {
-		tokio::time::sleep(delay).await;
-		match WorkerProcess::spawn(config).await {
-			Ok(process) if process.registrations.as_slice() == expected => return process,
+		tokio::time::sleep(*backoff).await;
+		*generation = generation.wrapping_add(1).max(1);
+		match WorkerProcess::spawn(config, *generation).await {
+			Ok(process) if process.registrations.as_slice() == expected => {
+				*backoff = backoff.saturating_mul(2).min(max_delay);
+				return process;
+			},
 			Ok(mut process) => process.terminate(config.interrupt_grace).await,
 			Err(_) => {},
 		}
-		delay = delay.saturating_mul(2).min(max_delay);
+		*backoff = backoff.saturating_mul(2).min(max_delay);
+	}
+}
+impl TryFrom<ToolComplete> for WorkerCompletion {
+	type Error = WorkerError;
+
+	fn try_from(complete: ToolComplete) -> Result<Self, Self::Error> {
+		if complete.parts.iter().any(|part| part.kind.is_none()) {
+			return Err(WorkerError::Protocol(Str::new_static(
+				"ToolComplete contains a part without its presence discriminator",
+			)));
+		}
+		let has_json = !complete.details_json.is_empty();
+		let has_blob = complete.details_blob.is_some();
+		if has_json == has_blob {
+			return Err(WorkerError::Protocol(Str::new_static(
+				"ToolComplete must carry exactly one of details_json or details_blob",
+			)));
+		}
+		let kind = match OutcomeKind::try_from(complete.kind).unwrap_or(OutcomeKind::Unspecified) {
+			OutcomeKind::Unspecified if complete.is_error => WorkerOutcomeKind::Faulted,
+			OutcomeKind::Unspecified => WorkerOutcomeKind::Ok,
+			OutcomeKind::Ok => WorkerOutcomeKind::Ok,
+			OutcomeKind::Faulted => WorkerOutcomeKind::Faulted,
+			OutcomeKind::ArgsRejected => WorkerOutcomeKind::ArgsRejected,
+			OutcomeKind::Aborted => WorkerOutcomeKind::Aborted,
+		};
+		if matches!(kind, WorkerOutcomeKind::ArgsRejected) != complete.args_issue.is_some() {
+			return Err(WorkerError::Protocol(Str::new_static(
+				"ToolComplete args_issue presence does not match ArgsRejected",
+			)));
+		}
+		Ok(WorkerCompletion {
+			call_id: Str::from(complete.call_id),
+			kind,
+			parts: complete.parts,
+			details_json: has_json.then_some(complete.details_json),
+			details_blob: complete.details_blob,
+			args_issue: complete.args_issue,
+			useless: complete.useless,
+		})
 	}
 }
 
@@ -938,8 +1449,23 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 		sys.setattr("stdout", sys.getattr("stderr")?)?;
 		Ok(())
 	})?;
+	let layer = required_env("OMP_EXT_LAYER")?;
+	let tier = required_env("OMP_EXT_TIER")?;
+	let pool = env::var("OMP_EXT_POOL").unwrap_or_default();
+	let host_generation = required_env_u64("OMP_EXT_HOST_GENERATION")?;
+	let session_generation = required_env_u64("OMP_EXT_SESSION_GENERATION")?;
 	let tools = load_tools(engine, modules)?;
 	let declarations = tools.iter().map(|tool| tool.decl.clone()).collect();
+	let extensions = modules
+		.iter()
+		.map(|module| ExtensionDecl {
+			extension_id: module.to_string(),
+			version:      env!("CARGO_PKG_VERSION").to_owned(),
+			api_level:    1,
+			capabilities: Vec::new(),
+			props:        None,
+		})
+		.collect();
 	let stdin = io::stdin();
 	let stdout = io::stdout();
 	let mut reader = stdin.lock();
@@ -956,8 +1482,14 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 				schema_rev: omp_proto::SCHEMA_REV,
 				python_rev: PYTHON_REV.to_owned(),
 				worker_id: Bytes::copy_from_slice(&std::process::id().to_be_bytes()),
+				api_level: 1,
+				layer: layer.clone(),
+				tier: tier.clone(),
+				pool: pool.clone(),
+				host_version: env!("CARGO_PKG_VERSION").to_owned(),
+				host_generation,
+				session_generation,
 				props: None,
-				..Default::default()
 			})),
 			props:      None,
 		},
@@ -970,6 +1502,8 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			request_id: 0,
 			body:       Some(worker_frame::Body::RegisterTools(RegisterTools {
 				tools: declarations,
+				generation: host_generation,
+				extensions,
 				props: None,
 				..Default::default()
 			})),
@@ -1038,6 +1572,19 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			)?,
 		}
 	}
+}
+fn required_env(name: &'static str) -> Result<String, WorkerError> {
+	env::var(name).map_err(|_| {
+		WorkerError::Protocol(Str::from(format!(
+			"worker process is missing required identity variable {name}",
+		)))
+	})
+}
+
+fn required_env_u64(name: &'static str) -> Result<u64, WorkerError> {
+	required_env(name)?
+		.parse()
+		.map_err(|_| WorkerError::Protocol(Str::from(format!("{name} is not an unsigned integer"))))
 }
 
 struct PythonTool {
@@ -1209,7 +1756,7 @@ fn serve_invocation<W: Write>(
 			return Ok(PythonCompletion {
 				parts:        Vec::new(),
 				details_json: Bytes::from_static(b"null"),
-				is_error:     false,
+				kind:         OutcomeKind::Ok,
 			});
 		}
 		let details_json = Bytes::from(
@@ -1219,17 +1766,20 @@ fn serve_invocation<W: Write>(
 				.extract::<String>()?,
 		);
 		let text = value.str()?.to_string_lossy().into_owned();
-		Ok(PythonCompletion { parts: vec![text_part(text)], details_json, is_error: false })
+		Ok(PythonCompletion { parts: vec![text_part(text)], details_json, kind: OutcomeKind::Ok })
 	});
 	let completion = match result {
 		Ok(completion) => completion,
 		Err(error) => PythonCompletion {
 			parts:        vec![text_part(error.to_string())],
 			details_json: Bytes::from(
-				serde_json::to_vec(&serde_json::json!({ "error": error.to_string() }))
-					.expect("serializing a string error cannot fail"),
+				serde_json::to_vec(&serde_json::json!({
+					"kind": "effects_unknown",
+					"reason": error.to_string(),
+				}))
+				.expect("serializing a string abort cannot fail"),
 			),
-			is_error:     true,
+			kind:         OutcomeKind::Aborted,
 		},
 	};
 	write_sync_frame(
@@ -1240,7 +1790,8 @@ fn serve_invocation<W: Write>(
 				call_id,
 				parts: completion.parts,
 				details_json: completion.details_json,
-				is_error: completion.is_error,
+				is_error: matches!(completion.kind, OutcomeKind::Faulted),
+				kind: completion.kind.into(),
 				props: None,
 				..Default::default()
 			})),
@@ -1254,7 +1805,7 @@ fn serve_invocation<W: Write>(
 struct PythonCompletion {
 	parts:        Vec<Part>,
 	details_json: Bytes,
-	is_error:     bool,
+	kind:         OutcomeKind,
 }
 
 fn completion_from_dict(
@@ -1284,12 +1835,17 @@ fn completion_from_dict(
 		},
 		None => Bytes::from_static(b"null"),
 	};
-	let is_error = dict
+	let kind = if dict
 		.get_item("is_error")?
 		.map(|value| value.extract::<bool>())
 		.transpose()?
-		.unwrap_or(false);
-	Ok(PythonCompletion { parts, details_json, is_error })
+		.unwrap_or(false)
+	{
+		OutcomeKind::Faulted
+	} else {
+		OutcomeKind::Ok
+	};
+	Ok(PythonCompletion { parts, details_json, kind })
 }
 
 fn write_update<W: Write>(
@@ -1351,6 +1907,22 @@ fn write_protocol_error<W: Write>(
 	)
 }
 
+trait BoundedFrame: Message + Default {
+	fn validate_raw(bytes: &[u8]) -> Result<(), omp_proto::bounds::FrameBoundsError>;
+}
+
+impl BoundedFrame for HostFrame {
+	fn validate_raw(bytes: &[u8]) -> Result<(), omp_proto::bounds::FrameBoundsError> {
+		omp_proto::bounds::validate_host_frame(bytes)
+	}
+}
+
+impl BoundedFrame for WorkerFrame {
+	fn validate_raw(bytes: &[u8]) -> Result<(), omp_proto::bounds::FrameBoundsError> {
+		omp_proto::bounds::validate_worker_frame(bytes)
+	}
+}
+
 async fn read_async_frame<R, M>(
 	reader: &mut R,
 	limit: NonZeroUsize,
@@ -1358,7 +1930,7 @@ async fn read_async_frame<R, M>(
 ) -> Result<Option<M>, WorkerError>
 where
 	R: AsyncRead + Unpin,
-	M: Message + Default,
+	M: BoundedFrame,
 {
 	let Some(length) = read_async_length(reader).await? else {
 		return Ok(None);
@@ -1367,6 +1939,7 @@ where
 	scratch.clear();
 	scratch.resize(length, 0);
 	reader.read_exact(scratch).await?;
+	M::validate_raw(&scratch[..length])?;
 	Ok(Some(M::decode(&scratch[..length])?))
 }
 
@@ -1397,7 +1970,7 @@ fn read_sync_frame<R, M>(
 ) -> Result<Option<M>, WorkerError>
 where
 	R: Read,
-	M: Message + Default,
+	M: BoundedFrame,
 {
 	let Some(length) = read_sync_length(reader)? else {
 		return Ok(None);
@@ -1406,6 +1979,7 @@ where
 	scratch.clear();
 	scratch.resize(length, 0);
 	reader.read_exact(scratch)?;
+	M::validate_raw(&scratch[..length])?;
 	Ok(Some(M::decode(&scratch[..length])?))
 }
 
@@ -1482,8 +2056,13 @@ fn read_sync_length<R: Read>(reader: &mut R) -> Result<Option<usize>, WorkerErro
 }
 
 const fn check_length(length: usize, limit: NonZeroUsize) -> Result<(), WorkerError> {
-	if length > limit.get() {
-		Err(WorkerError::FrameTooLarge { actual: length, limit: limit.get() })
+	let limit = if limit.get() < omp_proto::bounds::FRAME_MAX_BYTES {
+		limit.get()
+	} else {
+		omp_proto::bounds::FRAME_MAX_BYTES
+	};
+	if length > limit {
+		Err(WorkerError::FrameTooLarge { actual: length, limit })
 	} else {
 		Ok(())
 	}

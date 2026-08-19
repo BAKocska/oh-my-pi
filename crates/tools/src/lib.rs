@@ -8,6 +8,8 @@
 
 mod render;
 
+pub use render::{BuiltinRendererIdentities, register_builtin_renderers};
+
 /// Hashline document transactions with speculative previews.
 pub mod edit;
 /// Persistent Python evaluation.

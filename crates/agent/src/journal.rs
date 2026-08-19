@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, VecDeque},
+	ops::Deref,
 	path::{Path, PathBuf},
 };
 
@@ -9,17 +10,49 @@ use omp_core::Str;
 use omp_proto::{inference::v1::Outcome, thread::v1::Item};
 use omp_storage::transcript::{
 	self, AmendPatch, Event, Header, ItemRecord, JobRegistered, JobSettled, Kind, Log,
-	PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ToolBatchAuthorized, TurnAbort,
-	TurnInputItem, Writer,
+	PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState,
+	ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
 };
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
 use omp_tool::{Abort, JobRef};
+use parking_lot::{Mutex, MutexGuard};
 use thiserror::Error;
 
 use crate::prompt::PromptHash;
 type ActivePrompt = ([u8; 32], Vec<u64>);
 type PendingItem = (u64, Item, Option<[u8; 32]>);
 type PendingItems = Vec<PendingItem>;
+struct CachedReader {
+	transcript:   Reader,
+	writer_stale: bool,
+}
+
+impl CachedReader {
+	fn open(path: &Path) -> Result<Self, transcript::Error> {
+		Ok(Self { transcript: Reader::open(path)?, writer_stale: false })
+	}
+
+	fn refresh_projection(&mut self) -> Result<(), transcript::Error> {
+		let report = self.transcript.refresh()?;
+		self.writer_stale |= !matches!(report.state, RefreshState::Unchanged);
+		Ok(())
+	}
+}
+
+struct JournalLog<'a>(MutexGuard<'a, CachedReader>);
+
+impl Deref for JournalLog<'_> {
+	type Target = Log;
+
+	fn deref(&self) -> &Self::Target {
+		self.0.transcript.log()
+	}
+}
+impl AsRef<transcript::LiveSet> for JournalLog<'_> {
+	fn as_ref(&self) -> &transcript::LiveSet {
+		self.0.transcript.live()
+	}
+}
 /// Durable disposition of a started turn that failed without an outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbortDisposition {
@@ -118,6 +151,7 @@ pub enum JournalError {
 pub struct Journal {
 	path:                    PathBuf,
 	writer:                  Writer,
+	reader:                  Mutex<CachedReader>,
 	receipts:                BTreeMap<Str, TurnReceipt>,
 	starts:                  BTreeMap<Str, (u64, TurnStart)>,
 	aborted:                 BTreeMap<Str, (u64, AbortDisposition)>,
@@ -141,9 +175,11 @@ impl Journal {
 	/// Creates an empty transcript-v4 journal.
 	pub fn create(path: &Path, header: &Header) -> Result<Self, JournalError> {
 		let writer = Writer::create(path, header)?;
+		let reader = Mutex::new(CachedReader::open(path)?);
 		Ok(Self {
 			path: path.to_owned(),
 			writer,
+			reader,
 			receipts: BTreeMap::new(),
 			starts: BTreeMap::new(),
 			aborted: BTreeMap::new(),
@@ -325,9 +361,11 @@ impl Journal {
 			.into_iter()
 			.filter(|index| !claimed_ever.contains(index))
 			.collect();
+		let reader = Mutex::new(CachedReader::open(path)?);
 		Ok(Self {
 			path: path.to_owned(),
 			writer,
+			reader,
 			receipts,
 			starts,
 			aborted,
@@ -348,9 +386,53 @@ impl Journal {
 		})
 	}
 
-	/// Reloads the durable journal for pure projection.
-	pub fn load(&self) -> Result<Log, JournalError> {
-		Ok(transcript::load(&self.path)?)
+	/// Borrows the incrementally refreshed durable journal for pure projection.
+	///
+	/// The returned value holds the journal's reader lock. Callers must drop it
+	/// before mutating or otherwise reading this journal again.
+	pub fn load(
+		&self,
+	) -> Result<impl Deref<Target = Log> + AsRef<transcript::LiveSet> + '_, JournalError> {
+		let mut reader = self.reader.lock();
+		reader.refresh_projection()?;
+		Ok(JournalLog(reader))
+	}
+
+	fn append(&mut self, event: &Event) -> Result<u64, JournalError> {
+		let cached = self.reader.get_mut();
+		let before = cached.transcript.refresh()?;
+		if cached.writer_stale || !matches!(before.state, RefreshState::Unchanged) {
+			self.writer = Writer::open_append(&self.path)?;
+			let repaired = cached.transcript.refresh()?;
+			if !matches!(repaired.state, RefreshState::Unchanged) {
+				return Err(refresh_invariant("reader changed while resynchronizing writer"));
+			}
+			cached.writer_stale = false;
+		}
+		let expected = cached.transcript.next_index();
+		let appended = self.writer.append(event);
+		let refreshed = cached.transcript.refresh();
+		let index = match appended {
+			Ok(index) => index,
+			Err(error) => {
+				if let Ok(report) = &refreshed {
+					cached.writer_stale = !matches!(report.state, RefreshState::Unchanged);
+				}
+				refreshed?;
+				return Err(error.into());
+			},
+		};
+		let report = refreshed?;
+		if index != expected
+			|| report.next_index != expected.saturating_add(1)
+			|| !matches!(report.state, RefreshState::Advanced { records: 1 })
+		{
+			self.writer = Writer::open_append(&self.path)?;
+			cached.transcript.refresh()?;
+			cached.writer_stale = false;
+			return Err(refresh_invariant("writer and incremental reader diverged after append"));
+		}
+		Ok(index)
 	}
 
 	/// Appends one local item optimistically with sequence zero.
@@ -361,7 +443,7 @@ impl Journal {
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
-		let index = self.writer.append(&Event {
+		let index = self.append(&Event {
 			ts,
 			kind: Kind::Item(ItemRecord {
 				item,
@@ -383,7 +465,7 @@ impl Journal {
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
 		let turn_id = Str::from(turn_id);
-		let index = self.writer.append(&Event {
+		let index = self.append(&Event {
 			ts,
 			kind: Kind::TurnInput(TurnInputItem {
 				turn_id: turn_id.clone(),
@@ -417,10 +499,13 @@ impl Journal {
 		head: &[Item],
 		preserved_tail: &[u64],
 	) -> Result<Vec<u64>, JournalError> {
-		let live = self.live_item_events()?;
-		for target in preserved_tail {
-			if !live.contains(target) {
-				return Err(JournalError::InvalidTurnInput(*target));
+		{
+			let mut reader = self.reader.lock();
+			reader.refresh_projection()?;
+			for target in preserved_tail {
+				if !reader.transcript.live().contains(*target) {
+					return Err(JournalError::InvalidTurnInput(*target));
+				}
 			}
 		}
 		let intent = PromptRewriteIntent {
@@ -428,9 +513,7 @@ impl Journal {
 			head:           head.to_vec(),
 			preserved_tail: preserved_tail.to_vec(),
 		};
-		let intent_event = self
-			.writer
-			.append(&Event { ts, kind: Kind::PromptRewriteIntent(intent) })?;
+		let intent_event = self.append(&Event { ts, kind: Kind::PromptRewriteIntent(intent) })?;
 		let mut head_events = Vec::with_capacity(head.len());
 		for (ordinal, item) in head.iter().enumerate() {
 			let stage = PromptRewriteStage {
@@ -438,14 +521,10 @@ impl Journal {
 				ordinal: u64::try_from(ordinal).expect("prompt head length fits in u64"),
 				item:    item.clone(),
 			};
-			head_events.push(
-				self
-					.writer
-					.append(&Event { ts, kind: Kind::PromptRewriteStage(stage) })?,
-			);
+			head_events.push(self.append(&Event { ts, kind: Kind::PromptRewriteStage(stage) })?);
 			self.item_count = self.item_count.saturating_add(1);
 		}
-		self.writer.append(&Event {
+		self.append(&Event {
 			ts,
 			kind: Kind::PromptRewriteCommit(PromptRewriteCommit {
 				intent:      intent_event,
@@ -481,16 +560,18 @@ impl Journal {
 			}
 		}
 
-		let log = self.load()?;
-		for target in start
-			.item_events
-			.iter()
-			.chain(&start.prompt_head_events)
-			.chain(&start.sequence_targets)
 		{
-			if !matches!(log.get(*target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+			let log = self.load()?;
+			for target in start
+				.item_events
+				.iter()
+				.chain(&start.prompt_head_events)
+				.chain(&start.sequence_targets)
 			{
-				return Err(JournalError::InvalidTurnInput(*target));
+				if !matches!(log.get(*target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+				{
+					return Err(JournalError::InvalidTurnInput(*target));
+				}
 			}
 		}
 		for target in &start.item_events {
@@ -508,9 +589,7 @@ impl Journal {
 				self.claims.remove(target);
 			}
 		}
-		let index = self
-			.writer
-			.append(&Event { ts, kind: Kind::TurnStart(start.clone()) })?;
+		let index = self.append(&Event { ts, kind: Kind::TurnStart(start.clone()) })?;
 		for target in &start.item_events {
 			self.claims.insert(*target, start.turn_id.clone());
 		}
@@ -556,7 +635,7 @@ impl Journal {
 		if !self.starts.contains_key(turn_id.as_str()) {
 			return Err(JournalError::MissingTurnStart(turn_id));
 		}
-		let index = self.writer.append(&Event {
+		let index = self.append(&Event {
 			ts,
 			kind: Kind::TurnAbort(TurnAbort {
 				turn_id:     turn_id.clone(),
@@ -577,9 +656,7 @@ impl Journal {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::RewindWhilePending);
 		}
-		Ok(self
-			.writer
-			.append(&Event { ts, kind: Kind::Rewind { to } })?)
+		Ok(self.append(&Event { ts, kind: Kind::Rewind { to } })?)
 	}
 
 	/// Returns the earliest live turn start that lacks a terminal receipt.
@@ -617,12 +694,14 @@ impl Journal {
 
 	/// Returns every live canonical item event in projection order.
 	pub fn live_item_events(&self) -> Result<Vec<u64>, JournalError> {
-		let log = self.load()?;
-		Ok(log
+		let mut reader = self.reader.lock();
+		reader.refresh_projection()?;
+		Ok(reader
+			.transcript
 			.live()
-			.into_iter()
+			.iter()
 			.filter(|index| {
-				matches!(log.get(*index), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+				matches!(reader.transcript.log().get(*index), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 			})
 			.collect())
 	}
@@ -669,7 +748,7 @@ impl Journal {
 				}
 				continue;
 			}
-			let index = self.writer.append(&Event {
+			let index = self.append(&Event {
 				ts,
 				kind: Kind::Item(ItemRecord {
 					item: item.clone(),
@@ -696,9 +775,7 @@ impl Journal {
 			outcome,
 		};
 
-		let receipt_event = self
-			.writer
-			.append(&Event { ts, kind: Kind::TurnReceipt(receipt.clone()) })?;
+		let receipt_event = self.append(&Event { ts, kind: Kind::TurnReceipt(receipt.clone()) })?;
 		self.pending.remove(turn_id.as_str());
 		self.starts.remove(turn_id.as_str());
 		self.claims.retain(|_, claimed| claimed != &turn_id);
@@ -742,9 +819,7 @@ impl Journal {
 			}
 		}
 		let batch = ToolBatchAuthorized { turn_id: Str::from(turn_id), call_ids: call_ids.to_vec() };
-		let index = self
-			.writer
-			.append(&Event { ts, kind: Kind::ToolBatchAuthorized(batch.clone()) })?;
+		let index = self.append(&Event { ts, kind: Kind::ToolBatchAuthorized(batch.clone()) })?;
 		self
 			.authorized_batches
 			.insert(batch.turn_id, (index, batch.call_ids));
@@ -766,7 +841,6 @@ impl Journal {
 			return Ok(*index);
 		}
 		let index = self
-			.writer
 			.append(&Event { ts, kind: Kind::JobRegistered(JobRegistered { job: job.clone() }) })?;
 		self.pending_jobs.insert(job.id.clone(), (index, job));
 		Ok(index)
@@ -789,7 +863,7 @@ impl Journal {
 			return Ok(*index);
 		}
 		let job_id = Str::from(job_id);
-		let index = self.writer.append(&Event {
+		let index = self.append(&Event {
 			ts,
 			kind: Kind::JobSettled(JobSettled {
 				job_id:     job_id.clone(),
@@ -867,13 +941,14 @@ impl Journal {
 		if seq == 0 {
 			return Err(JournalError::ZeroSequence);
 		}
-		let log = self.load()?;
-		if !matches!(log.get(target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 		{
-			return Err(JournalError::InvalidItemTarget(target));
+			let log = self.load()?;
+			if !matches!(log.get(target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+			{
+				return Err(JournalError::InvalidItemTarget(target));
+			}
 		}
 		Ok(self
-			.writer
 			.append(&Event { ts, kind: Kind::Amend { target, patch: AmendPatch::Seq { seq } } })?)
 	}
 
@@ -1204,6 +1279,13 @@ fn recover_prompt_rewrites(
 	Ok((recovered_items, active_prompt))
 }
 
+fn refresh_invariant(message: &'static str) -> JournalError {
+	JournalError::Storage(transcript::Error::Io(std::io::Error::new(
+		std::io::ErrorKind::InvalidData,
+		message,
+	)))
+}
+
 const fn event_item(kind: &Kind) -> Option<&Item> {
 	match kind {
 		Kind::Item(record) => Some(&record.item),
@@ -1216,7 +1298,11 @@ const fn event_item(kind: &Kind) -> Option<&Item> {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::{
+		fs::OpenOptions,
+		io::Write as _,
+		sync::atomic::{AtomicU64, Ordering},
+	};
 
 	use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 	use omp_storage::transcript::{Entry, Header, SessionId};
@@ -1375,6 +1461,7 @@ mod tests {
 			panic!("recovery result text missing");
 		};
 		assert!(text.contains(expected_text));
+		drop(log);
 		let bytes = std::fs::read(&path).expect("read once-recovered journal");
 		drop(reopened);
 
@@ -1640,12 +1727,9 @@ mod tests {
 		let reopened = Journal::open(&path).expect("reopen journal");
 		assert_eq!(reopened.receipt("turn"), Some(&receipt));
 		assert!(reopened.pending_turn().is_none());
-		let projected = project_journal(
-			&reopened.load().expect("load recovered"),
-			&omp_tool::Registry::new(),
-			&caps(),
-		)
-		.expect("project recovered");
+		let view = reopened.load().expect("load recovered");
+		let projected = project_journal(&view, view.as_ref(), &omp_tool::Registry::new(), &caps())
+			.expect("project recovered");
 		assert_eq!(projected.items[1].seq, 2, "reopen must recover the missing sequence patch");
 		std::fs::remove_file(path).expect("remove journal");
 	}
@@ -1696,12 +1780,9 @@ mod tests {
 
 		let reopened = Journal::open(&path).expect("reopen partial turn");
 		assert_eq!(reopened.pending_turn(), Some(&start));
-		let projected = project_journal(
-			&reopened.load().expect("load partial"),
-			&omp_tool::Registry::new(),
-			&caps(),
-		)
-		.expect("project partial");
+		let view = reopened.load().expect("load partial");
+		let projected = project_journal(&view, view.as_ref(), &omp_tool::Registry::new(), &caps())
+			.expect("project partial");
 		assert_eq!(projected.items, vec![message("system"), message("input")]);
 		std::fs::remove_file(path).expect("remove journal");
 	}
@@ -1782,9 +1863,10 @@ mod tests {
 			panic!("target is not an item")
 		};
 		assert_eq!(record.item.seq, 0);
-		let projected =
-			project_journal(&log, &omp_tool::Registry::new(), &caps()).expect("project journal");
+		let projected = project_journal(&log, log.as_ref(), &omp_tool::Registry::new(), &caps())
+			.expect("project journal");
 		assert_eq!(projected.items[0].seq, 9);
+		drop(log);
 		drop(journal);
 		std::fs::remove_file(path).expect("remove journal");
 	}
@@ -1829,9 +1911,12 @@ mod tests {
 			drop(writer);
 
 			let pending = transcript::load(&path).expect("load incomplete rewrite");
-			assert_eq!(pending.live(), vec![old_head, tail]);
-			let pending_thread = project_journal(&pending, &omp_tool::Registry::new(), &caps())
-				.expect("project old live chain");
+			let mut pending_live = transcript::LiveSet::new();
+			pending.live_into(&mut pending_live);
+			assert!(pending_live.iter().eq([old_head, tail]));
+			let pending_thread =
+				project_journal(&pending, &pending_live, &omp_tool::Registry::new(), &caps())
+					.expect("project old live chain");
 			assert_eq!(pending_thread.items, vec![message("old-head"), message("tail")]);
 
 			let recovered = Journal::open(&path).expect("recover rewrite");
@@ -1850,12 +1935,10 @@ mod tests {
 				head[1].clone(),
 				message("tail")
 			]);
-			let projected = project_journal(
-				&recovered.load().expect("load recovered journal"),
-				&omp_tool::Registry::new(),
-				&caps(),
-			)
-			.expect("project recovered rewrite");
+			let view = recovered.load().expect("load recovered journal");
+			let projected = project_journal(&view, view.as_ref(), &omp_tool::Registry::new(), &caps())
+				.expect("project recovered rewrite");
+			drop(view);
 			let projected_bytes = projected.encode_to_vec();
 			drop(recovered);
 			let recovered_bytes = std::fs::read(&path).expect("read recovered bytes");
@@ -1867,12 +1950,11 @@ mod tests {
 					.expect("read stable live indexes"),
 				live
 			);
-			let reprojection = project_journal(
-				&reopened.load().expect("reload journal"),
-				&omp_tool::Registry::new(),
-				&caps(),
-			)
-			.expect("reproject completed rewrite");
+			let view = reopened.load().expect("reload journal");
+			let reprojection =
+				project_journal(&view, view.as_ref(), &omp_tool::Registry::new(), &caps())
+					.expect("reproject completed rewrite");
+			drop(view);
 			assert_eq!(reprojection.encode_to_vec(), projected_bytes);
 			drop(reopened);
 			assert_eq!(
@@ -1938,6 +2020,108 @@ mod tests {
 		std::fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
+	fn repeated_append_projection_cycles_keep_the_complete_live_prefix() {
+		let path = path("incremental-project");
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		let mut indexes = Vec::new();
+		for ordinal in 0..128_u64 {
+			indexes.push(
+				journal
+					.append_optimistic(ordinal.saturating_add(2), message("item"), None)
+					.expect("append item"),
+			);
+			let live = journal.live_item_events().expect("project live items");
+			assert_eq!(live.as_slice(), indexes.as_slice());
+			assert_eq!(journal.items_at(&live).expect("project item values").len(), live.len());
+		}
+		assert_eq!(journal.load().expect("borrow final journal").len(), 128);
+		drop(journal);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+
+	#[test]
+	fn foreign_append_refresh_resynchronizes_the_local_writer_once() {
+		let path = path("foreign-append");
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		let first = journal
+			.append_optimistic(2, message("local"), None)
+			.expect("append local item");
+		let mut foreign = Writer::open_append(&path).expect("open foreign writer");
+		let second = foreign
+			.append(&Event {
+				ts:   3,
+				kind: Kind::Item(ItemRecord {
+					item:        message("foreign"),
+					turn_id:     None,
+					prompt_hash: None,
+				}),
+			})
+			.expect("append foreign item");
+		drop(foreign);
+		assert_eq!(journal.live_item_events().expect("refresh foreign append"), vec![first, second]);
+		let third = journal
+			.append_optimistic(4, message("local again"), None)
+			.expect("append after foreign refresh");
+		assert_eq!(third, second.saturating_add(1));
+		assert_eq!(
+			journal
+				.live_item_events()
+				.expect("project resynchronized journal"),
+			vec![first, second, third]
+		);
+		drop(journal);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+
+	#[test]
+	fn torn_foreign_tail_is_repaired_before_the_next_local_append() {
+		let path = path("torn-tail");
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		let first = journal
+			.append_optimistic(2, message("before tear"), None)
+			.expect("append before tear");
+		let mut file = OpenOptions::new()
+			.append(true)
+			.open(&path)
+			.expect("open journal tail");
+		file
+			.write_all(br#"{"ts":3,"type":"item""#)
+			.expect("write torn foreign tail");
+		drop(file);
+		assert_eq!(journal.live_item_events().expect("read complete prefix"), vec![first]);
+
+		let second = journal
+			.append_optimistic(4, message("after repair"), None)
+			.expect("repair tail and append");
+		assert_eq!(second, first.saturating_add(1));
+		assert_eq!(
+			journal
+				.items_at(&[first, second])
+				.expect("read repaired items"),
+			vec![message("before tear"), message("after repair")]
+		);
+		drop(journal);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+	#[test]
+	fn projection_fails_closed_after_foreign_truncation() {
+		let path = path("foreign-truncate");
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		journal
+			.append_optimistic(2, message("durable"), None)
+			.expect("append durable item");
+		OpenOptions::new()
+			.write(true)
+			.truncate(true)
+			.open(&path)
+			.expect("truncate journal");
+		assert!(matches!(journal.live_item_events(), Err(JournalError::Storage(_))));
+		assert!(matches!(journal.items_at(&[0]), Err(JournalError::Storage(_))));
+		drop(journal);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+
+	#[test]
 	fn rewind_rejects_pending_turn() {
 		let path = path("rewind-pending");
 		let mut journal = Journal::create(&path, &header()).expect("create journal");
@@ -1964,6 +2148,8 @@ mod tests {
 				},
 			})
 			.expect("start pending turn");
+		assert_eq!(journal.live_item_events().expect("project pending journal"), vec![input]);
+		assert!(journal.pending_turn().is_some());
 		assert!(matches!(journal.rewind(4, None), Err(JournalError::RewindWhilePending)));
 		drop(journal);
 		std::fs::remove_file(path).expect("remove journal");

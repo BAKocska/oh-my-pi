@@ -751,10 +751,11 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("xd/"))
 	{
 		let rest = trimmed[3..].trim_start_matches('/');
+		let guidance = device_guidance(Some(rest));
 		return Some(Fault::UriLikeTarget {
 			message: Str::from(format!(
-				"Unknown URI-like write target '{trimmed}'. Did you mean 'xd://{rest}'? Prefix the \
-				 path with './' to write it as a filesystem path."
+				"Unknown retired device target.{guidance} Prefix the path with './' to write it as a \
+				 filesystem path."
 			)),
 		});
 	}
@@ -763,25 +764,49 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 	if !valid_uri_scheme(scheme) {
 		return None;
 	}
+	let is_retired_device_scheme =
+		matches!(scheme.to_ascii_lowercase().as_str(), "xd" | "dx" | "xdd" | "xdt");
 	let suffix = &trimmed[colon + 1..];
-	if let Some(_body) = suffix.strip_prefix("//") {
+	if let Some(body) = suffix.strip_prefix("//") {
+		if is_retired_device_scheme {
+			let rest = body.trim_start_matches('/');
+			let guidance = device_guidance(Some(rest));
+			return Some(Fault::UriLikeTarget {
+				message: Str::from(format!(
+					"Unknown retired device target.{guidance} Prefix the path with './' to write it as \
+					 a filesystem path."
+				)),
+			});
+		}
 		return Some(Fault::UnsupportedScheme { scheme: Str::from(scheme.to_ascii_lowercase()) });
 	}
 	if !suffix.starts_with('/') {
 		return None;
 	}
-	let canonical =
-		matches!(scheme.to_ascii_lowercase().as_str(), "dx" | "xdd" | "xdt").then_some("xd");
-	let suggestion = canonical.map_or_else(
-		|| " Tool devices use 'xd://<tool>'.".to_owned(),
-		|canonical| format!(" Did you mean '{canonical}://{}'?", suffix.trim_start_matches('/')),
-	);
+	let rest = suffix.trim_start_matches('/');
+	let guidance = device_guidance(Some(rest));
+	let prefix = if is_retired_device_scheme {
+		"Unknown retired device target.".to_owned()
+	} else {
+		format!("Unknown URI-like write target '{trimmed}'.")
+	};
 	Some(Fault::UriLikeTarget {
 		message: Str::from(format!(
-			"Unknown URI-like write target '{trimmed}'.{suggestion} Prefix the path with './' to \
-			 write it as a filesystem path."
+			"{prefix}{guidance} Prefix the path with './' to write it as a filesystem path."
 		)),
 	})
+}
+
+fn device_guidance(tool_path: Option<&str>) -> String {
+	match tool_path.filter(|path| !path.is_empty()) {
+		Some(path) => format!(
+			" Tool devices use dyn: discovery via {{\"do_\":\"search\"}}/docs/<path> (docs/{path}) \
+			 and dispatch via {{\"do_\":\"invoke/{path}\",...}}."
+		),
+		None => " Tool devices use dyn: discovery via {{\"do_\":\"search\"}}/docs/<path> and \
+		         dispatch via {{\"do_\":\"invoke/<path>\",...}}."
+			.to_owned(),
+	}
 }
 
 fn valid_uri_scheme(scheme: &str) -> bool {
@@ -1029,5 +1054,35 @@ mod tests {
 			"skill:// targets are not supported yet"
 		);
 		assert!(reject_uri_like_target("C:\\tmp\\x").is_none());
+
+		let guidance_cases = [
+			("xd/report_issue", "docs/report_issue", "invoke/report_issue"),
+			("xd://report_issue", "docs/report_issue", "invoke/report_issue"),
+			("xd:/report_issue", "docs/report_issue", "invoke/report_issue"),
+			("dx:/report_issue", "docs/report_issue", "invoke/report_issue"),
+			("device:/custom", "docs/custom", "invoke/custom"),
+		];
+		for (target, expected_docs, expected_invoke) in guidance_cases {
+			let fault = reject_uri_like_target(target).expect("fault rejected");
+			let message = fault.to_string();
+			assert!(message.contains(r#"{"do_":"search"}"#), "missing search: {message}");
+			assert!(message.contains("docs/<path>"), "missing docs/<path>: {message}");
+			assert!(message.contains(expected_docs), "missing expected docs: {message}");
+			assert!(
+				message.contains(&format!(r#"{{"do_":"{expected_invoke}",...}}"#)),
+				"missing expected invoke: {message}"
+			);
+			// Ensure no retired device URL scheme or xd spelling appears
+			assert!(!message.contains("xd:"), "found retired scheme: {message}");
+			assert!(!message.contains("xd/"), "found retired scheme: {message}");
+		}
+		let generic_fault = reject_uri_like_target("xd/")
+			.expect("fault rejected")
+			.to_string();
+		assert!(generic_fault.contains(r#"{"do_":"search"}"#));
+		assert!(generic_fault.contains("docs/<path>"));
+		assert!(generic_fault.contains(r#"{"do_":"invoke/<path>",...}"#));
+		assert!(!generic_fault.contains("xd:"));
+		assert!(!generic_fault.contains("xd/"));
 	}
 }
