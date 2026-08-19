@@ -876,7 +876,11 @@ fn signed_gemini_visible_text_proof_round_trips_and_cca_lowers_account_project()
 		session: None,
 		server_state: None,
 		account: Some(&account),
-		attempt: EncodeAttempt { index: 0, provisional: false },
+		attempt: EncodeAttempt {
+			index:                    0,
+			provisional:              false,
+			template_effort_rejected: false,
+		},
 	};
 	let encoded =
 		GoogleCcaCodec::gemini_cli(None, CcaHeaders::gemini_cli("fixture-model", "darwin", "arm64"))

@@ -3447,7 +3447,11 @@ mod tests {
 			session: None,
 			server_state: None,
 			account: None,
-			attempt: EncodeAttempt { index: 0, provisional: false },
+			attempt: EncodeAttempt {
+				index:                    0,
+				provisional:              false,
+				template_effort_rejected: false,
+			},
 		};
 		let encoded = OpenAiResponsesCodec::default()
 			.encode_chat(&context, &request_with_tool(input))
@@ -3503,7 +3507,11 @@ mod tests {
 			session: None,
 			server_state: None,
 			account: None,
-			attempt: EncodeAttempt { index: 0, provisional: false },
+			attempt: EncodeAttempt {
+				index:                    0,
+				provisional:              false,
+				template_effort_rejected: false,
+			},
 		};
 		OpenAiResponsesCodec::default()
 			.encode_chat(&context, &request)

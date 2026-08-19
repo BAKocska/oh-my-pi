@@ -838,7 +838,14 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 			session: call.session.as_ref(),
 			server_state: server_state.as_ref(),
 			account: account.as_ref(),
-			attempt: EncodeAttempt { index: attempt, provisional },
+			attempt: EncodeAttempt {
+				index: attempt,
+				provisional,
+				template_effort_rejected: attempt > 0
+					&& execution.provider_error_code_seen(
+						crate::codec::openai_chat::TEMPLATE_EFFORT_REJECTED_CODE,
+					),
+			},
 		};
 		let mut encoded =
 			encode_wire_request(self.codec.as_ref(), &encode_context, &call.operation, execution)?;
@@ -1598,7 +1605,11 @@ mod tests {
 			session:            None,
 			server_state:       None,
 			account:            None,
-			attempt:            EncodeAttempt { index: 0, provisional: false },
+			attempt:            EncodeAttempt {
+				index:                    0,
+				provisional:              false,
+				template_effort_rejected: false,
+			},
 		};
 		let execution = ExecutionContext::new(ExecutionBudget::default());
 		let encoded =

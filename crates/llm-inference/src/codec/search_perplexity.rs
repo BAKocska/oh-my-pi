@@ -619,7 +619,11 @@ mod tests {
 			session:            None,
 			server_state:       None,
 			account:            None,
-			attempt:            EncodeAttempt { index: 0, provisional: false },
+			attempt:            EncodeAttempt {
+				index:                    0,
+				provisional:              false,
+				template_effort_rejected: false,
+			},
 		};
 		let encoded = PerplexitySearchCodec::new()
 			.encode(&context, &OperationCall::Search(Arc::new(search_request())))

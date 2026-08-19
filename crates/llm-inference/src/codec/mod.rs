@@ -177,9 +177,13 @@ impl EncodedRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EncodeAttempt {
 	/// Zero-based attempt index.
-	pub index:       u32,
+	pub index:                    u32,
 	/// Whether output from this attempt is held transactionally.
-	pub provisional: bool,
+	pub provisional:              bool,
+	/// A prior attempt on this route was classified as rejecting the
+	/// `chat_template_kwargs.reasoning_effort` spelling; effort-capable Qwen
+	/// dialects must route the effort onto the top-level field only.
+	pub template_effort_rejected: bool,
 }
 
 /// Credential-free context for canonical-to-wire lowering.

@@ -2277,7 +2277,11 @@ mod tests {
 			session: None,
 			server_state: None,
 			account: None,
-			attempt: EncodeAttempt { index: 0, provisional: false },
+			attempt: EncodeAttempt {
+				index:                    0,
+				provisional:              false,
+				template_effort_rejected: false,
+			},
 		};
 		encode_converse_request(request, &context, options).expect("fixture request encodes")
 	}

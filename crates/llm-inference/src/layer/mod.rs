@@ -255,6 +255,19 @@ impl ExecutionContext {
 		f(&mut self.0.receipt.lock())
 	}
 
+	/// True when any recorded attempt carries the given structured error code;
+	/// consumed by encoders that adapt the next attempt's wire shape after a
+	/// classified rejection.
+	pub fn provider_error_code_seen(&self, code: &str) -> bool {
+		self.0.receipt.lock().attempts.iter().any(|attempt| {
+			attempt
+				.provider_evidence
+				.code
+				.as_ref()
+				.is_some_and(|value| value.as_str() == code)
+		})
+	}
+
 	/// Publishes validator success only to the semantic gate for the current
 	/// hidden attempt.
 	pub(crate) fn mark_structured_output_valid(&self) {
@@ -586,8 +599,12 @@ mod tests {
 
 	use super::ExecutionContext;
 	use crate::{
+		body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
 		error::ErrorKind,
-		receipt::{Cost, ExecutionBudget},
+		receipt::{
+			AttemptOutcome, AttemptReceipt, Cost, ExecutionBudget, ExecutionReceipt, ProviderEvidence,
+			Usage,
+		},
 	};
 
 	#[test]
@@ -630,5 +647,43 @@ mod tests {
 				.kind,
 			ErrorKind::Cancelled
 		);
+	}
+
+	#[test]
+	fn provider_error_codes_from_merged_receipts_are_queryable() {
+		// The retry loop merges each failed attempt's receipt before the next
+		// encode; encoders adapt the wire shape by querying the recorded
+		// structured code (e.g. the openai-chat template-effort rejection).
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		assert!(!context.provider_error_code_seen("openai_chat.template_effort_rejected"));
+		let mut receipt = ExecutionReceipt::default();
+		receipt.record_attempt(AttemptReceipt {
+			index:             0,
+			hidden:            false,
+			provider:          None,
+			route:             None,
+			account:           None,
+			principal:         None,
+			body:              AttemptBodyEvidence {
+				opened:         true,
+				consumed:       false,
+				replayability:  Replayability::Replayable,
+				retry_decision: RetryDecision::Allow,
+				reason:         RetryDecisionReason::ReplayableSource,
+			},
+			outcome:           AttemptOutcome::FailedPreCommit,
+			usage:             Usage::default(),
+			cost:              Cost::default(),
+			provider_evidence: ProviderEvidence {
+				request_id: None,
+				status:     Some(400),
+				code:       Some("openai_chat.template_effort_rejected".into()),
+				summary:    None,
+			},
+			elapsed:           Duration::ZERO,
+		});
+		context.merge_receipt(&receipt);
+		assert!(context.provider_error_code_seen("openai_chat.template_effort_rejected"));
+		assert!(!context.provider_error_code_seen("unknown_parameter"));
 	}
 }

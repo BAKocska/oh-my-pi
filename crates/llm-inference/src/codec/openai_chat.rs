@@ -144,6 +144,12 @@ pub struct OpenAiChatProfile {
 	/// Whether Qwen-style template dialects route the selected effort onto the
 	/// chat template's `reasoning_effort` kwarg.
 	pub template_reasoning_effort: bool,
+	/// Attempt-scoped adaptation: the endpoint rejected the
+	/// `chat_template_kwargs.reasoning_effort` spelling (strict kwargs
+	/// whitelists such as `NInfer`), so the template effort rides the standard
+	/// top-level field only. Set by [`Codec::encode`] from prior-attempt
+	/// evidence, never by catalog policy.
+	pub template_effort_top_level_only: bool,
 	/// Historical reasoning text field.
 	pub reasoning_history: ReasoningHistoryField,
 	/// Whether provider-scoped continuation proofs may be replayed.
@@ -178,6 +184,7 @@ impl Default for OpenAiChatProfile {
 			tool_id: ToolIdWireProfile::Preserve,
 			reasoning: ReasoningWireFormat::OpenAiEffort,
 			template_reasoning_effort: false,
+			template_effort_top_level_only: false,
 			reasoning_history: ReasoningHistoryField::ReasoningContent,
 			reasoning_proofs: false,
 			hosted_tools: HostedToolWireFormat::Unsupported,
@@ -451,6 +458,7 @@ impl Codec for OpenAiChatCodec {
 		validate_thinking_selection(request, context.thinking_selection)?;
 		let mut selected = self.clone();
 		selected.profile.apply_policy(context.policy);
+		selected.profile.template_effort_top_level_only = context.attempt.template_effort_rejected;
 		let wire_model = context
 			.thinking_selection
 			.map_or(&target.wire_model, |selection| &selection.wire_model);
@@ -1407,11 +1415,33 @@ fn lower_reasoning(
 				openrouter: None,
 				zai:        None,
 				qwen:       Some(true),
-				nvidia:     template_effort.map(|effort| ChatTemplateKwargs {
-					enable_thinking:  None,
-					reasoning_effort: Some(effort),
-				}),
+				// After a classified kwargs rejection the top-level twin alone
+				// keeps the effort selection alive.
+				nvidia:     (!profile.template_effort_top_level_only)
+					.then_some(template_effort)
+					.flatten()
+					.map(|effort| ChatTemplateKwargs {
+						enable_thinking:  None,
+						reasoning_effort: Some(effort),
+					}),
 			}
+		},
+		ReasoningWireFormat::Nvidia if profile.template_effort_top_level_only => ReasoningFields {
+			// The kwargs-only dialect hoists the effort onto the top-level
+			// field after the endpoint rejected the kwargs spelling; servers
+			// that reject the kwarg accept the standard OpenAI field, and
+			// kwargs-reading renderers ignore it.
+			effort:     profile
+				.template_reasoning_effort
+				.then_some(effort)
+				.flatten(),
+			openrouter: None,
+			zai:        None,
+			qwen:       None,
+			nvidia:     Some(ChatTemplateKwargs {
+				enable_thinking:  Some(true),
+				reasoning_effort: None,
+			}),
 		},
 		ReasoningWireFormat::Nvidia => ReasoningFields {
 			effort:     None,
@@ -1955,8 +1985,8 @@ struct WireError {
 	code:            Option<ErrorCode>,
 	#[serde(default)]
 	message:         Option<Str>,
-	#[serde(default, rename = "param")]
-	_param:          Option<Str>,
+	#[serde(default)]
+	param:           Option<Str>,
 	#[serde(default)]
 	metadata:        Option<ErrorMetadata>,
 	/// `LiteLLM`'s structured limiter discriminator, e.g.
@@ -2036,6 +2066,13 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 		.rate_limit_type
 		.as_ref()
 		.is_some_and(|value| value.as_str().trim() == "max_parallel_requests");
+	// Strict `chat_template_kwargs` whitelists (e.g. NInfer) reject the
+	// effort's kwargs spelling itself with a deterministic 400. The rejection
+	// is adaptable, not terminal: the retry re-encodes with the effort routed
+	// onto the standard top-level field only (`template_effort_rejected` in
+	// `EncodeAttempt`), keyed off this classification's canonical error code
+	// in the attempt receipt.
+	let template_effort_rejection = template_kwarg_effort_rejection(&error, message);
 	let (kind, action) = if matches!(code_text, "invalid_api_key" | "authentication_error" | "401") {
 		(ErrorKind::Authentication, RetryAction::Never)
 	} else if matches!(code_text, "permission_denied" | "403") {
@@ -2062,6 +2099,8 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: Duration::from_millis(500) })
 	} else if matches!(code_text, "402" | "payment_required") {
 		(ErrorKind::PaymentRequired, RetryAction::Never)
+	} else if template_effort_rejection {
+		(ErrorKind::InvalidRequest, RetryAction::SameRoute { after: Duration::ZERO })
 	} else if matches!(code_text, "400" | "invalid_request_error") {
 		(ErrorKind::InvalidRequest, RetryAction::Never)
 	} else {
@@ -2078,8 +2117,36 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.status(status)
-	.optional_code(error.metadata.and_then(|metadata| metadata.raw).or(code))
+	.optional_code(
+		template_effort_rejection
+			.then(|| Str::new_static(TEMPLATE_EFFORT_REJECTED_CODE))
+			.or_else(|| error.metadata.and_then(|metadata| metadata.raw))
+			.or(code),
+	)
 	.committed(committed)
+}
+
+/// Canonical structured code for a rejected kwargs effort spelling.
+///
+/// Recorded when an endpoint rejects `chat_template_kwargs.reasoning_effort`;
+/// the route encoder reads it back from attempt evidence to hoist the effort
+/// onto the top-level field.
+pub const TEMPLATE_EFFORT_REJECTED_CODE: &str = "openai_chat.template_effort_rejected";
+
+/// True when the error names the `chat_template_kwargs` spelling of
+/// `reasoning_effort` in its message or `param` (`NInfer`:
+/// `chat_template_kwargs.reasoning_effort is not supported`; pydantic-style
+/// validators name the field in `param` alone).
+fn template_kwarg_effort_rejection(error: &WireError, message: &str) -> bool {
+	let names_kwarg = |text: &str| {
+		contains_ascii_case_insensitive(text.as_bytes(), b"chat_template_kwargs")
+			&& contains_ascii_case_insensitive(text.as_bytes(), b"reasoning_effort")
+	};
+	names_kwarg(message)
+		|| error
+			.param
+			.as_ref()
+			.is_some_and(|param| names_kwarg(param.as_str()))
 }
 
 /// True when `error-code` and `#token-limit` occur inside one URL-like token,
@@ -2208,7 +2275,7 @@ fn encoding_error(kind: ErrorKind) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{sync::Arc, time::Duration};
 
 	use bytes::Bytes;
 	use serde::Deserialize;
@@ -2705,7 +2772,7 @@ mod tests {
 				super::WireError {
 					code:            Some(super::ErrorCode::Text("insufficient_quota".into())),
 					message:         Some(message.into()),
-					_param:          None,
+					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
 				},
@@ -2755,7 +2822,7 @@ mod tests {
 				super::WireError {
 					code:            Some(super::ErrorCode::Text(code.into())),
 					message:         Some(message.into()),
-					_param:          None,
+					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
 				},
@@ -2805,7 +2872,7 @@ mod tests {
 				super::WireError {
 					code:            code.map(|value| super::ErrorCode::Text(value.into())),
 					message:         Some("Max parallel request limit reached".into()),
-					_param:          None,
+					param:           None,
 					metadata:        None,
 					rate_limit_type: rate_limit_type.map(Into::into),
 				},
@@ -2871,7 +2938,7 @@ mod tests {
 				super::WireError {
 					code:            Some(super::ErrorCode::Text(code.into())),
 					message:         Some(message.into()),
-					_param:          None,
+					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
 				},
@@ -3112,5 +3179,104 @@ mod tests {
 		assert!(wire.get("enable_thinking").is_none());
 		assert_eq!(wire["chat_template_kwargs"]["enable_thinking"], true);
 		assert_eq!(wire["chat_template_kwargs"]["reasoning_effort"], "xhigh");
+	}
+
+	#[test]
+	fn template_kwarg_effort_rejection_classifies_as_adaptable_same_route_retry() {
+		// NInfer-style strict kwargs whitelists reject the kwargs spelling of
+		// the effort with a deterministic 400. The classification must carry
+		// the canonical adaptation code and a zero-delay same-route retry so
+		// the next encode hoists the effort onto the top-level field.
+		let classify = |code: Option<&str>, message: Option<&str>, param: Option<&str>| {
+			super::classify_error(
+				super::WireError {
+					code:            code.map(|value| super::ErrorCode::Text(value.into())),
+					message:         message.map(Into::into),
+					param:           param.map(Into::into),
+					metadata:        None,
+					rate_limit_type: None,
+				},
+				false,
+			)
+		};
+		// NInfer names the kwarg in the message.
+		let named = classify(
+			Some("unknown_parameter"),
+			Some("chat_template_kwargs.reasoning_effort is not supported"),
+			Some("chat_template_kwargs.reasoning_effort"),
+		);
+		assert_eq!(named.kind, ErrorKind::InvalidRequest);
+		assert_eq!(named.action, RetryAction::SameRoute { after: Duration::ZERO });
+		assert_eq!(
+			named.code.as_ref().map(|value| value.as_str()),
+			Some(super::TEMPLATE_EFFORT_REJECTED_CODE),
+		);
+		assert!(!named.committed);
+		// Pydantic-style validators name the field in `param` alone.
+		let param_only = classify(
+			Some("invalid_request_error"),
+			Some("Extra inputs are not permitted"),
+			Some("chat_template_kwargs.reasoning_effort"),
+		);
+		assert_eq!(param_only.action, RetryAction::SameRoute { after: Duration::ZERO });
+		assert_eq!(
+			param_only.code.as_ref().map(|value| value.as_str()),
+			Some(super::TEMPLATE_EFFORT_REJECTED_CODE),
+		);
+		// Scope guards: an ordinary 400 naming only reasoning_effort, or only
+		// chat_template_kwargs, stays a terminal invalid request.
+		for message in ["reasoning_effort is not supported", "unknown chat_template_kwargs"] {
+			let unrelated = classify(Some("invalid_request_error"), Some(message), None);
+			assert_eq!(unrelated.kind, ErrorKind::InvalidRequest, "{message}");
+			assert_eq!(unrelated.action, RetryAction::Never, "{message}");
+		}
+	}
+
+	#[test]
+	fn rejected_qwen_dialect_keeps_the_top_level_twin_and_drops_the_kwarg() {
+		// After a classified kwargs rejection, the qwen dialect must stop
+		// twin-emitting: the effort stays on the top-level field the same
+		// servers accept, and the kwargs object disappears entirely when the
+		// effort was its only member.
+		let profile = OpenAiChatProfile {
+			reasoning: super::ReasoningWireFormat::Qwen,
+			template_reasoning_effort: true,
+			template_effort_top_level_only: true,
+			..OpenAiChatProfile::default()
+		};
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Medium))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert_eq!(wire["enable_thinking"], true);
+		assert_eq!(wire["reasoning_effort"], "medium");
+		assert!(wire.get("chat_template_kwargs").is_none());
+	}
+
+	#[test]
+	fn rejected_kwargs_dialect_hoists_the_effort_onto_the_top_level_field() {
+		// The kwargs-only dialect carried no top-level effort; after the
+		// rejection the effort selection must survive by hoisting, while
+		// `enable_thinking` keeps riding the kwargs the endpoint accepts.
+		let profile = OpenAiChatProfile {
+			reasoning: super::ReasoningWireFormat::Nvidia,
+			template_reasoning_effort: true,
+			template_effort_top_level_only: true,
+			..OpenAiChatProfile::default()
+		};
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Xhigh))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert_eq!(wire["reasoning_effort"], "xhigh");
+		assert_eq!(wire["chat_template_kwargs"]["enable_thinking"], true);
+		assert!(
+			wire["chat_template_kwargs"]
+				.as_object()
+				.expect("kwargs object")
+				.get("reasoning_effort")
+				.is_none(),
+			"the rejected kwargs spelling must not reappear"
+		);
 	}
 }
