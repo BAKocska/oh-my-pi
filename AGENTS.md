@@ -236,7 +236,15 @@ other.
   - Usually small (≲ a dozen items), hot, or short-lived →
     `smallvec::SmallVec` (inline until spill). Not worth it for cold,
     long-lived, or usually-large collections — spilled SmallVec is just a
-    worse Vec.
+    worse Vec. This workspace pins `smallvec` 2.0-alpha (see root
+    `Cargo.toml`), which dropped the array-generic in favor of two const
+    params: `SmallVec<T, N>`, not the 1.x `SmallVec<[T; N]>`. Agents
+    frequently default to the old syntax from training data — it will not
+    compile here:
+    ```rust
+    SmallVec::<[StateEntry; 8]>::new();  // WRONG — 1.x syntax
+    SmallVec::<StateEntry, 8>::new();    // correct — 2.0-alpha syntax
+    ```
   - Hard upper bound known at compile time → fixed array `[T; N]`
     (`[Option<T>; N]` if slots may be empty).
   - Concurrent append-only log read while written → `omp_core::AppendVec`
