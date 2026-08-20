@@ -1,7 +1,6 @@
-# omp workspace command runner. `just` or `just --list` shows every recipe;
-# `just <recipe>` runs one. Source of truth for these commands is AGENTS.md,
-# .github/workflows/ci.yml, and each crate's README — keep this in sync with
-# them rather than duplicating decisions here.
+# omp workspace command runner — the source of truth for workspace commands.
+# `just` or `just --list` shows every recipe; `just <recipe>` runs one.
+# Keep in sync with .github/workflows/ci.yml and each crate's README.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 

@@ -1,154 +1,81 @@
 # Repository Guidelines
 
-## Project Overview
+`omp`: pre-release Rust impl of Oh My Pi's coding-agent + inference runtime —
+durable agent turns, model routing, project-scoped tools/authorities,
+terminal/native presentation, telemetry, embedded free-threaded Python. Rust
+rewrite of `pi`: port observable behavior, not TS shape.
 
-`omp` is the pre-release Rust implementation of Oh My Pi's coding-agent and
-inference runtime. The `omp` binary composes durable agent turns, model routing,
-project-scoped tools and authorities, terminal/native presentation, telemetry,
-and an embedded free-threaded Python runtime. This is a Rust rewrite of `pi`:
-port observable behavior, not TypeScript implementation shape.
+## Architecture
 
-## Architecture & Data Flow
-
-- **Application boundary:** `crates/app` owns process startup, CLI dispatch, and
-  production composition. Domain crates provide implementations; the app wires
-  them together instead of duplicating them.
-- **Foundations:** `crates/core`, `storage`, `proto`, and `telemetry` provide
-  allocation-aware types, append-only transcript/blob persistence, RPC schemas,
-  and observability.
-- **Agent and inference:** `crates/agent` owns durable turn state, interrupts,
-  event projection, and tool batching. `crates/llm-catalog` supplies model data;
-  `crates/llm-inference` routes typed requests through concrete Tower services
-  and streams `ChatEvent`s.
-- **Project execution:** `crates/tool` defines revisioned tool contracts;
-  `crates/tools` implements them. `crates/env`, `docserver`, `shell*`, `ast`,
-  `walker`, and `hashline` own project processes, documents, shell execution,
-  parsing, and search.
-- **Presentation:** `crates/tui` renders a retained declarative DOM; `crates/gui`
-  provides native presentation. Neither owns agent or provider policy.
-
-A chat turn flows through these boundaries:
-
-1. `crates/app/src/main.rs` handles the worker entry path, initializes telemetry,
-   then dispatches `OmpCli` through `omp_app::run`.
-2. `crates/app/src/chat.rs` starts or connects project authorities, opens the
-   transcript journal, restores pending state, and builds the tool registry and
-   `AgentSnapshot`.
-3. `crates/agent/src/loop.rs` receives input and interrupts through mailboxes,
-   calls a `TurnClient`, executes typed tool batches through the environment
-   boundary, and projects durable `AgentEvent`s.
-4. Inference requests pass through `crates/llm-inference`; streamed model/tool
-   events update storage and reach `crates/app/src/chat_ui.rs`.
-5. The TUI consumes those events, updates its retained component tree, and
-   materializes terminal output once at the final renderer.
-
-## Key Directories
-
-- `crates/app`, `agent`: executable composition and durable agent runtime.
-- `crates/llm-catalog`, `llm-inference`: model data, transports, routing, and
-  recovery middleware.
-- `crates/tool`, `tools`, `env`: tool contracts, implementations, and isolated
-  project execution.
-- `crates/docserver`, `ast`, `walker`, `hashline`: document authority, syntax,
-  filesystem discovery, and anchored edits.
-- `crates/shell`, `shell-engine`, `shell-builtins`: shell facade, parser/runtime,
-  and built-in commands.
-- `crates/core`, `storage`, `proto`, `rpc`, `telemetry`: shared primitives,
-  persistence, wire contracts, RPC support, and observability.
-- `crates/tui`, `tui-macros`, `gui`: terminal and native UI systems.
+- `crates/app`: startup, CLI dispatch, production composition. Domain crates
+  implement; app wires, never duplicates.
+- `crates/core|storage|proto|rpc|telemetry`: allocation-aware primitives,
+  append-only transcript/blob persistence, wire contracts, RPC, observability.
+- `crates/agent`: durable turn state, interrupts, event projection, tool
+  batching. `crates/llm-catalog`: model/provider data (`data/`) + transports.
+  `crates/llm-inference`: typed requests → concrete Tower services, routing,
+  recovery middleware → `ChatEvent` streams.
+- `crates/tool`: revisioned tool contracts; `crates/tools`: implementations;
+  `crates/env`: isolated project processes. `crates/docserver|ast|walker|hashline`:
+  document authority, syntax, fs discovery, anchored edits.
+  `crates/shell|shell-engine|shell-builtins`: facade, parser/runtime, built-ins.
+- `crates/tui`+`tui-macros`: retained declarative DOM; `crates/gui`: native.
+  Neither owns agent/provider policy.
 - `crates/e2e/tests`: authoritative joined-system proofs P1-P8.
-- `PLAN.md` (repo root): the authoritative plan — locked decisions D1-D8, the
-  shared defect ledger, and the eight parts with their checklists.
-- `fixtures`, `.plan/quirks`: conformance data and recorded incompatibilities.
-  Do not treat scratch notes elsewhere under `.plan` (research, port,
-  feature-map) as stronger than production code and tests.
-- `.omp/tools`, `scripts`, `crates/*/scripts`: repository-local agent tooling,
-  release generation, and subsystem setup scripts.
+- `PLAN.md`: authoritative plan — locked decisions D1-D8, defect ledger, 8
+  parts + checklists.
+- `fixtures`, `.plan/quirks`: conformance data, recorded incompatibilities.
+  Other `.plan` scratch (research, port, feature-map) NEVER outranks production
+  code/tests.
+- `.omp/tools`, `scripts`, `crates/*/scripts`: agent tooling, release gen,
+  subsystem setup.
 
-## Development Commands
+Turn flow: `app/src/main.rs` (worker entry, telemetry, `OmpCli` →
+`omp_app::run`; command tree `cli.rs`) → `app/src/chat.rs` (authorities,
+transcript journal, pending state, tool registry + `AgentSnapshot`) →
+`agent/src/loop.rs` (mailbox input/interrupts, `TurnClient`, typed tool batches
+via env boundary, durable `AgentEvent`s) → `llm-inference` (facade + Tower
+spine, `src/lib.rs`; streamed events → storage → `app/src/chat_ui.rs`) → TUI
+retained tree → terminal output materialized once at final renderer.
 
-Use targeted package commands while iterating; broaden only after the changed
-contract passes. Commands that link `omp-py` need its one-time vendored runtime
-setup first:
+## Commands
 
-```sh
-crates/py/scripts/fetch-python.sh
+`justfile` = source of truth; use `just`, not raw cargo. `just --list` shows
+all recipes.
+- One-time before anything linking `omp-py`: `just setup-python`.
+- Iterate targeted (`just check-pkg <pkg>`, `just test-pkg <pkg>`); broaden
+  (`check`, `test`, `lint`) after the changed contract passes.
+- E2E separate + expensive: `just e2e` (or `e2e-build|e2e-core|e2e-p7|e2e-p8|e2e-baseline`).
+- `just ci` ≈ CI format+rust jobs locally.
 
-cargo check -p omp-agent --locked
-cargo test -p omp-agent --locked
-cargo check --workspace --locked
-cargo build -p omp-app --bin omp --locked
-cargo test --workspace --locked
+CI (`.github/workflows/ci.yml`): authoritative Cargo-only gate. Format on
+Linux; lint/tests/P1-P8/baseline on `macos-15` arm64 (CPython bundle
+`aarch64-apple-darwin`-only).
 
-cargo fmt --all -- --check
-cargo fmt --all
-cargo clippy --workspace --locked
+## Conventions
 
-cargo run -p omp-app --bin omp -- --help
-cargo run -p omp-tui --example gallery
-```
+Deps: all in root `[workspace.dependencies]`; members `{ workspace = true }`,
+NEVER pin versions. Extra features fine:
+`serde = { workspace = true, features = ["rc"] }`. `serde_json` always
+`preserve_order` + `raw_value`; `crates/slopjson` (broken/partial/streaming
+JSON) mirrors that surface.
 
-The joined-system suite is intentionally separate and expensive:
+Env vars `OMP_*`, never `PI_*`; ported code strips upstream (`pi`, `uu`, …)
+env vars, context objects, branding — never aliases. Pre-release: rename+move
+(don't copy); clean cutovers; compat shims, old names, deprecated aliases
+PROHIBITED; update every caller + remove obsolete exports/tests same change.
 
-```sh
-cargo test -p omp-e2e --tests --no-run --locked
-cargo test -p omp-e2e --test p1_doc_race --locked
-TERM=xterm-256color cargo test -p omp-e2e --test p7_tui --locked
-cargo test -p omp-e2e --test p8_baselines --locked
-cargo run -p omp-e2e --bin baseline --locked -- \
-  --artifact target/e2e-artifacts/p8-baselines.json
-```
+Unicode/ANSI: `xutf` for ALL Unicode/UTF-8/16/32, grapheme, display-width,
+normalization, ANSI/VT ops. `unicode-normalization` banned. NEVER add utility
+crates for these (`unicode-*`, `utf8-*`, `unicode-segmentation`,
+`unicode-width`, `ansi_*`, `strip-ansi-escapes`); remove redundant deps, don't
+wrap.
 
-`.github/workflows/ci.yml` is the authoritative Cargo-only gate. Formatting runs
-on Linux; lint, workspace tests, P1-P8, and baseline recording run on
-`macos-15` arm64 because the embedded CPython bundle is currently
-`aarch64-apple-darwin`-only.
-
-## Code Conventions & Common Patterns
-
-### Workspace Dependencies
-All dependencies MUST be declared in `[workspace.dependencies]` in the root
-`Cargo.toml`. Member crates reference them with `{ workspace = true }` and
-never pin their own versions:
-
-```toml
-# root Cargo.toml
-[workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-
-# crates/<name>/Cargo.toml
-[dependencies]
-serde = { workspace = true }
-```
-
-Feature additions on top of the workspace entry are fine:
-`serde = { workspace = true, features = ["rc"] }`.
-
-`serde_json` is always consumed with the `preserve_order` + `raw_value` features
-(preserve order, defer parsing of passthrough payloads); `crates/slopjson`
-(broken/partial/streaming JSON) mirrors the same surface.
-
-#### Naming & environment
-- Environment variables are `OMP_*` prefixed, never `PI_*`. Ported code MUST
-  have its upstream (`pi`, `uu`, …) env vars, context objects, and branding
-  stripped, not aliased.
-- The repo is pre-release: rename completely and move (don't copy) when
-  restructuring. Compat shims, old names, and deprecated aliases are
-  PROHIBITED; update every callsite in the same change.
-
-#### Unicode and terminal-text utilities
-Use `xutf` for every workspace-owned Unicode/UTF-8/UTF-16/UTF-32, grapheme,
-display-width, normalization, and ANSI/VT operation. `unicode-normalization` is
-expressly banned. MUST NOT add or import a separate utility crate for any of
-these concerns—including `unicode-*`, `utf8-*`, `unicode-segmentation`,
-`unicode-width`, `ansi_*`, or `strip-ansi-escapes`. Use `xutf` directly; remove
-redundant direct dependencies rather than wrapping or duplicating them.
-
-### Crates
-- Members live under `crates/*` (virtual workspace, resolver 3); directory
-  names are unprefixed (`crates/demo`).
-- Package names MUST be `omp-` prefixed (`name = "omp-demo"`).
-- Every member inherits shared metadata and lints:
+Crates: members `crates/*` (virtual workspace, resolver 3); dirs unprefixed
+(`crates/demo`); package names `omp-` prefixed (`name = "omp-demo"`). Every
+member: real `description` + workspace
+`license`/`authors`/`homepage`/`repository`; README (what it is + structural
+philosophy); inherits
 
 ```toml
 [package]
@@ -160,228 +87,171 @@ edition.workspace = true
 workspace = true
 ```
 
-Every member also fills `[package]` metadata (`license`/`authors`/`homepage`/
-`repository` from workspace, plus a real `description`) and ships a README
-saying what it is and its structural philosophy.
+Taxonomy: domain prefix after `omp-` (`omp-llm-*`, `omp-shell*`).
+**transport** = provider wire protocol ≠ **dialect** = thread rendering to the
+LLM; NEVER conflate. Providers = catalog data entries; code only for genuinely
+distinct wire behavior; routing stays in inference. `omp-tool` defines
+contracts, `omp-tools` implements — never inverted. Daemons = app subcommands,
+never standalone `*-d` crates.
 
-#### Taxonomy
-- Related crates share a domain prefix after `omp-`; current examples are
-  `omp-llm-catalog`/`omp-llm-inference` and
-  `omp-shell`/`omp-shell-engine`/`omp-shell-builtins`.
-- Vocabulary is load-bearing: a **transport** is a provider's wire protocol; a
-  **dialect** is how the thread is rendered to the LLM. NEVER call a transport
-  a dialect.
-- Providers are catalog data entries. Add code only for genuinely distinct wire
-  behavior, and keep provider routing in the inference subsystem.
-- `omp-tool` defines contracts; `omp-tools` contains implementations. Do not
-  invert that dependency.
-- Daemons are subcommands of the app crate, never standalone `*-d` crates.
-### Toolchain & Style
-- Pinned nightly via `rust-toolchain.toml`; edition 2024.
-- Lint policy lives in `[workspace.lints.*]` in the root `Cargo.toml`;
-  `#[allow]` requires a `reason`.
-- Formatting: `cargo fmt` (hard tabs, 3-column, max width 100 — see
-  `rustfmt.toml`). Never hand-format.
-- Enum ↔ string vocabularies: hand-written `match self { … => "…" }` tables
-  (any name — `name()`, `as_str()`, `label()`, `Display` impls) are
-  PROHIBITED, including on private enums. Every variant→string mapping is
-  derived strum: `IntoStaticStr`/`Display` for the emit side, `EnumString`
-  for parsing, `#[strum(serialize_all = "...")]` plus per-variant
-  `to_string`/`serialize` for aliases and irregular names (dotted protobuf
-  paths, multi-word labels — irregular strings are NOT an excuse to
-  hand-write the match), `ascii_case_insensitive` for lax input, and
-  `const_into_str` so `as_str` stays `pub const fn`. A custom public parse
-  error keeps its type — parse via the derive and `map_err`. The ONLY
-  sanctioned escape hatch, when strum can't express the shape (per-arm
-  logic, data variants with dynamic strings, one labeled error shared
-  across many enums), is a local `macro_rules!` that emits both directions
-  from a single variant→string table (see `vocab!` in
-  `crates/telemetry/src/semconv.rs`). Reviewers reject any new bare match
-  table on sight; migrate existing ones on touch.
+Style: pinned nightly (`rust-toolchain.toml`), edition 2024. Lints in root
+`[workspace.lints.*]`; `#[allow]` requires `reason`. `cargo fmt` (hard tabs,
+3-col, width 100 — `rustfmt.toml`); NEVER hand-format.
 
-### Composition, errors, and state
+Enum↔string: hand-written `match self { … => "…" }` tables (any name —
+`name()`, `as_str()`, `label()`, `Display`) PROHIBITED incl. private enums →
+derived strum: `IntoStaticStr`/`Display` emit; `EnumString` parse;
+`#[strum(serialize_all = "...")]` + per-variant `to_string`/`serialize` for
+aliases/irregular names (dotted protobuf paths, multi-word labels —
+irregularity ≠ excuse to hand-write); `ascii_case_insensitive` lax input;
+`const_into_str` keeps `as_str` `pub const fn`. Custom public parse error:
+derive + `map_err`. ONLY escape hatch when strum can't express the shape
+(per-arm logic, data variants w/ dynamic strings, one labeled error across
+many enums): local `macro_rules!` emitting both directions from one
+variant→string table (`vocab!`, `crates/telemetry/src/semconv.rs`). New bare
+match table = reviewer-reject; migrate on touch.
 
-- `crates/app` is the dependency-injection boundary. Compose registries,
-  concrete Tower services, `TurnClient`s, and authorities there; library crates
-  must not build a second production stack.
-- Libraries expose typed domain errors with `thiserror`. Hand-written
-  `impl fmt::Display`/`impl Error` on error types are PROHIBITED — every
-  variant carries `#[error("…")]`; a manual `Display` on an error is a
-  reviewer-reject, same as a bare enum↔string match table. Application
-  orchestration uses `miette` and classifies or redacts untrusted
-  provider diagnostics before the top-level error reaches stderr.
-- Durable state belongs in the append-only transcript journal and blob store.
-  Build turn state from `AgentSnapshot` plus journal projection; do not create a
-  parallel mutable source of truth.
-- State/event loops use one `flume` mailbox; priority lifecycle state uses
-  `tokio::watch`. Keep ownership and cancellation explicit.
-- Every public symbol is documented. `missing_docs` is workspace-warned; every
-  `#[allow]` needs a reason.
-- The repository is pre-release: make clean cutovers, update every caller, and
-  remove obsolete aliases, compatibility shims, exports, and tests.
+Composition/errors/state:
+- `crates/app` = DI boundary (registries, concrete Tower services,
+  `TurnClient`s, authorities). Libraries NEVER build a second production stack.
+- Library errors: `thiserror`, every variant `#[error("…")]`. Hand-written
+  `impl Display`/`impl Error` on errors = reviewer-reject. App orchestration:
+  `miette`; classify/redact untrusted provider diagnostics before stderr.
+- Durable state = append-only transcript journal + blob store; turn state =
+  `AgentSnapshot` + journal projection; NEVER a parallel mutable source of
+  truth.
+- Loops: one `flume` mailbox; priority lifecycle: `tokio::watch`.
+  Ownership/cancellation explicit.
+- Every public symbol documented (`missing_docs` workspace-warned).
 
-The following performance sections are load-bearing and intentionally detailed.
-Do not weaken, summarize away, or bypass them during refactors.
+Performance sections below load-bearing + intentionally detailed. NEVER
+weaken, summarize away, or bypass in refactors.
 
 ### Allocation Discipline (CRITICAL)
-Prefer references (`&T`, `&str`, `&[T]`) and borrows over owned types whenever data lifetime permits — agents should not be afraid of using refs and borrows.
-Think twice before reaching for `String` or `Vec` — both are growable,
-heap-backed general-purpose defaults. `omp-core` ships replacements; each
-is MANDATORY *in the situation it targets*, and explicitly NOT a violation
-to skip outside it. The test is always the same: does the replacement
-remove allocations, copies, or locking on a real code path? If not, the
-default type is the right call — don't churn code to swap one for the
-other.
-- `Vec<T>` alternatives, by growth pattern:
-  - Usually small (≲ a dozen items), hot, or short-lived →
-    `smallvec::SmallVec` (inline until spill). Not worth it for cold,
-    long-lived, or usually-large collections — spilled SmallVec is just a
-    worse Vec. This workspace pins `smallvec` 2.0-alpha (see root
-    `Cargo.toml`), which dropped the array-generic in favor of two const
-    params: `SmallVec<T, N>`, not the 1.x `SmallVec<[T; N]>`. Agents
-    frequently default to the old syntax from training data — it will not
-    compile here:
+Prefer `&T`/`&str`/`&[T]` whenever lifetime permits. Think twice before
+`String`/`Vec`. `omp-core` replacements MANDATORY in their target situation,
+NOT violations to skip outside it. Test: removes allocations/copies/locking on
+a real path? no → default type right; don't churn.
+- `Vec<T>` by growth:
+  - small (≲12), hot, or short-lived → `smallvec::SmallVec` (inline until
+    spill). Cold/long-lived/usually-large → plain Vec (spilled SmallVec =
+    worse Vec). Pinned 2.0-alpha (root `Cargo.toml`): two const params, NOT
+    1.x array-generic (training-data default; won't compile here):
     ```rust
     SmallVec::<[StateEntry; 8]>::new();  // WRONG — 1.x syntax
     SmallVec::<StateEntry, 8>::new();    // correct — 2.0-alpha syntax
     ```
-  - Hard upper bound known at compile time → fixed array `[T; N]`
-    (`[Option<T>; N]` if slots may be empty).
-  - Concurrent append-only log read while written → `omp_core::AppendVec`
-    (lock-free appends, stable indices). Single-threaded or fully built
-    before reading → plain Vec is fine.
-  - Unbounded, built once, moved once (scratch buffers, collect-and-return,
-    channel payloads) → plain `Vec` is correct; none of the above apply.
-- Strings: default to `omp_core::Str` — the in-repo type
-  (`crates/core/src/str.rs`), NOT the smol_str crate. Inline ≤23
-  bytes; heap side is `Bytes`-backed: O(1) clone, zero-copy
-  slice/split/trim. Build with `StrMut` + `freeze()` or
-  `fmts!`; convert via `IntoStr` (`.to_str()`). It pays off
-  for stored, cloned, or sliced strings (ids, names, tokens, messages).
-  `String` remains fine as a transient build buffer that is consumed
-  immediately, and for APIs that require it (`fmt::Write`, FFI, serde
-  sinks). Large/edited text → a rope (`ropey`).
-- Byte buffers: `omp_core::CowBytes` when a buffer is shared, sliced, or
-  cloned — replaces `Cow<'_, [u8]>` (borrowed or `Bytes`-owned, O(1)
-  clone, zero-copy slicing). A buffer produced once and moved to a single
-  consumer is fine as `Vec<u8>`; converting buys nothing.
-- Maps/sets keyed by enums or small dense ints → `omp_core::SparseMap` /
-  `SparseSet` (bitmap presence + packed values). `HashMap` stays correct
-  for sparse/unbounded keys, strings, and anything without a small dense
-  index.
-- Binary↔text: `omp_core::encoding` (`hex`, `base64`, `base32`) with
-  stack-allocated `ArrayStr<N>` outputs; never add an external
-  hex/base64 crate. This one has no exception: external encoding crates
-  are banned outright.
+  - compile-time hard bound → `[T; N]` (`[Option<T>; N]` if slots may be empty).
+  - concurrent append-only log, read while written → `omp_core::AppendVec`
+    (lock-free appends, stable indices); single-threaded / built before read →
+    Vec fine.
+  - unbounded, built once, moved once (scratch, collect-and-return, channel
+    payloads) → Vec correct.
+- Strings: default `omp_core::Str` (`crates/core/src/str.rs`; NOT smol_str).
+  Inline ≤23 bytes; heap `Bytes`-backed: O(1) clone, zero-copy
+  slice/split/trim. Build `StrMut`+`freeze()` or `fmts!`; convert `IntoStr`
+  (`.to_str()`). Pays for stored/cloned/sliced strings (ids, names, tokens,
+  messages). `String` fine as transient build buffer consumed immediately +
+  APIs requiring it (`fmt::Write`, FFI, serde sinks). Large/edited text →
+  rope (`ropey`).
+- Bytes: `omp_core::CowBytes` when shared/sliced/cloned — replaces
+  `Cow<'_, [u8]>` (borrowed | `Bytes`-owned; O(1) clone, zero-copy slicing).
+  Built once, single consumer → `Vec<u8>` fine.
+- Maps/sets keyed by enums/small dense ints → `omp_core::SparseMap`/`SparseSet`
+  (bitmap presence + packed values). `HashMap` correct for sparse/unbounded
+  keys, strings, no small dense index.
+- Binary↔text: `omp_core::encoding` (`hex`/`base64`/`base32`), stack
+  `ArrayStr<N>` outputs. External encoding crates banned outright — no
+  exception.
 
 ### Type Size Discipline (CRITICAL)
-`clippy::result_large_err`, `large_enum_variant`, `large_stack_arrays`, and
-`large_futures` report a *measurement*: some type of ours is fat. They are
-not requests to add a pointer.
-
-- **Boxing to silence a size lint is PROHIBITED** and a reviewer-reject:
+`clippy::result_large_err|large_enum_variant|large_stack_arrays|large_futures`
+= measurement (our type is fat), not a request to add a pointer.
+- Boxing to silence a size lint PROHIBITED, reviewer-reject:
   `Err(Box<MyError>)`, `Variant(Box<MyPayload>)`, `Box<SmallVec<..>>`,
-  `field: Box<MyStruct>`, a fresh wrapper struct that exists only to be
-  boxed, and `#[allow(clippy::result_large_err, reason = "…")]` are all the
-  same defect: the fat type survives, every construction site pays an
-  allocation, and the error path is now the only path that heap-allocates.
-  Same verdict for `Box::new([0u8; N])` when the buffer wants to be a
-  right-sized `Vec`/`BytesMut` instead.
-- **Fix the type.** Measure first (`size_of`), find the fat field, shrink
-  that field. Recurring causes and their fixes:
-  - `SmallVec<T, N>` inline capacity in a cold or cloned type — 4 × `Str`
-    is 136 bytes. Cold and cloned → `Arc<[T]>` (16 bytes, O(1) clone);
-    cold and uniquely owned → `Box<[T]>`. Inline capacity is for hot,
-    short-lived, usually-small collections, not for declarations,
-    identities, or diagnostics.
-  - A set of values that is *always* a contiguous run (physical indexes,
-    sequence ranges) → a two-field run/range struct, not a collection.
-  - An identity struct of several `Str`s cloned into maps, messages, and
-    errors → one `Arc`-backed handle with accessors (8 bytes, O(1) clone,
-    forwarded `Eq`/`Ord`/`Hash`), not N inline `Str`s per copy.
-  - Fields derivable from a sibling field, or duplicated between an error
-    and its source → delete them.
-  - An error variant that carries a whole domain aggregate for a
-    `{:?}` in its message → carry the identifying facts it actually names.
-- **Foreign fat types are the one exception.** A generated prost message,
-  a provider payload, or another crate's struct that we cannot shrink may
-  be boxed — but box that ONE field, never our own error or enum around
-  it, and say why in a comment on the field.
-- **Pin the win.** A type that was shrunk on purpose gets a compile-time
-  guard beside it, so the regression is a build failure and not a later
-  lint:
+  `field: Box<MyStruct>`, box-only wrapper structs,
+  `#[allow(clippy::result_large_err, reason = "…")]` — same defect: fat type
+  survives, every construction pays an allocation, error path = only heap
+  path. Ditto `Box::new([0u8; N])` where a right-sized `Vec`/`BytesMut`
+  belongs.
+- Fix the type: measure (`size_of`) → find fat field → shrink. Recurring:
+  - `SmallVec<T, N>` inline capacity in cold/cloned type (4×`Str` = 136 B):
+    cold+cloned → `Arc<[T]>` (16 B, O(1) clone); cold+uniquely owned →
+    `Box<[T]>`. Inline capacity = hot/short-lived/usually-small only; never
+    declarations, identities, diagnostics.
+  - always-contiguous run (physical indexes, sequence ranges) → two-field
+    run/range struct, not a collection.
+  - identity struct of several `Str`s cloned into maps/messages/errors → one
+    `Arc`-backed handle w/ accessors (8 B, O(1) clone, forwarded
+    `Eq`/`Ord`/`Hash`).
+  - fields derivable from a sibling | duplicated error↔source → delete.
+  - error variant carrying a whole aggregate for a `{:?}` → carry only the
+    identifying facts it names.
+- One exception: foreign fat types (prost message, provider payload,
+  unshrinkable foreign struct) MAY box — that ONE field, never our own
+  error/enum around it; comment why on the field.
+- Pin the win — shrunk type gets a compile-time guard; regression = build
+  failure, not a later lint:
   ```rust
   const _: () = assert!(size_of::<Effects>() <= 96, "Effects must stay compact");
   ```
 
 ### Async, Iterator & Codegen Discipline (CRITICAL)
-House rules, proven in a sibling codebase (tetra). Not suggestions.
-
-- **Nightly features are the point of the pinned toolchain.** A crate MUST
-  gate exactly the features it uses at the top of `lib.rs` — and again in
-  every integration test or example that needs them (test targets are
-  separate crates). The canonical set for trait plumbing:
-  `impl_trait_in_assoc_type` + `type_alias_impl_trait` (impls infer their
-  future/iterator types in associated-type position),
-  `min_specialization` (`default fn` fallbacks), and
-  `const_eval_select` / `core_intrinsics` for codegen hints
-  (`core_intrinsics` additionally requires
-  `#![allow(internal_features, reason = "…")]`). NEVER redesign an API
-  around a missing stable feature when a nightly gate gives the zero-cost
-  shape directly.
-- **Async traits are unboxed by default.** A trait with async behavior MUST
-  NOT allocate per call. Two sanctioned shapes:
-  1. Callers never name the future → plain RPITIT:
+House rules, proven in sibling codebase (tetra). Not suggestions.
+- Nightly features = the point of the pinned toolchain. Crate MUST gate
+  exactly what it uses atop `lib.rs` — and again in every integration
+  test/example (separate crates). Canonical trait-plumbing set:
+  `impl_trait_in_assoc_type` + `type_alias_impl_trait` (impls infer
+  future/iterator types in assoc-type position); `min_specialization`
+  (`default fn` fallbacks); `const_eval_select`/`core_intrinsics` codegen
+  hints (`core_intrinsics` also needs
+  `#![allow(internal_features, reason = "…")]`). NEVER redesign an API around
+  a missing stable feature when a nightly gate gives the zero-cost shape.
+- Async traits unboxed; MUST NOT allocate per call. Two sanctioned shapes:
+  1. callers never name the future → RPITIT:
      `fn run(&mut self) -> impl Future<Output = T> + Send + '_;`
-  2. The future must be nameable (stored, composed, or required by a
-     downstream trait like `tower::Service`) → a (generic) associated type,
-     inferred on the impl side:
+  2. nameable (stored, composed, downstream trait like `tower::Service`) →
+     (generic) associated type, impl-inferred:
      ```rust
      pub trait Deliverable<A: ?Sized>: Send + 'static {
         type Result: Send + 'static;
         type Future<'c>: Future<Output = Self::Result> + Send + 'c;
         fn deliver<'c>(self, target: &'c mut A) -> Self::Future<'c>;
      }
-     // impl side — the concrete type is inferred from the async block:
+     // impl side — concrete type inferred from the async block:
      type Future<'c> = impl Future<Output = Self::Result> + Send + 'c;
      fn deliver<'c>(self, target: &'c mut A) -> Self::Future<'c> {
         async move { /* … */ }
      }
      ```
-  `tower::Service` / hyper service impls follow the same rule:
-  `type Future = impl Future<Output = …>;` — never `BoxFuture`. An impl
-  that answers synchronously returns `future::Ready<T>` / `future::ready(v)`,
-  not an async block and not a box.
-- **`#[async_trait]`, `BoxFuture`, and per-call `Box::pin` are quarantined.**
-  Permitted ONLY at cold `dyn`-dispatch boundaries whose latency is dominated
-  by real I/O (DNS lookup, remote storage, connection establishment) — one
-  allocation per network round trip is noise. On anything invoked per
-  message, per frame, per token, or per byte they are PROHIBITED. Where a
-  hot-ish boundary genuinely needs `dyn`, box ONCE at construction behind an
-  alias (`type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;`),
-  never per poll or per request.
-- **Erase types with enums before reaching for `dyn`.** When one slot must
-  hold several concrete types, define an enum with a variant per common
-  concrete type and a single `Boxed(Pin<Box<dyn Trait>>)` fallback; the
-  constructor fast-paths known types and boxes only in the `else` arm. The
-  common cases then dispatch by `match`, allocation-free.
-- **Inline hints.** Small cross-crate functions on hot paths get `#[inline]`;
-  `#[inline(always)]` is available and lint-sanctioned when measured.
-- **Specialize fallbacks instead of dispatching at runtime.** A blanket impl
-  (e.g. `Display`-based conversion) is written as `default fn`; concrete fast
-  paths (`&str`, integers, …) override it via `min_specialization`. The
-  generic path stays correct, the common path stays allocation- and
-  format-machinery-free — with zero runtime branching.
-- **Iterators are lazy, borrowed, and unboxed.** Accessors return
-  `-> impl Iterator<Item = …> + '_`, declaring every capability the chain
-  actually has (`+ Clone`, `+ DoubleEndedIterator`, `+ FusedIterator`,
-  `+ ExactSizeIterator`) so callers keep it. Yield borrows (`&T`) or O(1)-clone
-  items (`Str`, `Bytes` slices), never freshly allocated ones. NEVER
-  `.collect()` into an intermediate `Vec` just to iterate again — chain
-  adaptors end to end and collect only at the final owner, if at all. When the
-  iterator type must be nameable (an `IntoIterator::IntoIter`, a stored
-  field), alias it with TAIT instead of writing the adaptor tower out or
-  boxing:
+  `tower::Service`/hyper same rule: `type Future = impl Future<Output = …>;` —
+  never `BoxFuture`. Sync answer → `future::Ready<T>`/`future::ready(v)`, not
+  an async block, not a box.
+- `#[async_trait]`, `BoxFuture`, per-call `Box::pin`: quarantined — ONLY cold
+  `dyn` boundaries dominated by real I/O (DNS, remote storage, connection
+  establishment); one allocation per network round trip is noise. Per
+  message/frame/token/byte → PROHIBITED. Hot-ish `dyn` → box ONCE at
+  construction behind an alias
+  (`type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;`),
+  never per poll/request.
+- Enums before `dyn`: one slot, several concrete types → variant per common
+  type + single `Boxed(Pin<Box<dyn Trait>>)` fallback; constructor fast-paths,
+  boxes only in the `else` arm; common cases dispatch by `match`,
+  allocation-free.
+- `#[inline]` on small cross-crate hot-path fns; `#[inline(always)]`
+  lint-sanctioned when measured.
+- Specialize > runtime dispatch: blanket impl (e.g. `Display`-based
+  conversion) as `default fn`; concrete fast paths (`&str`, integers)
+  override via `min_specialization`. Generic path correct, common path
+  allocation- and format-machinery-free, zero branching.
+- Iterators lazy, borrowed, unboxed. Return `-> impl Iterator<Item = …> + '_`
+  declaring every capability the chain has (`+ Clone`,
+  `+ DoubleEndedIterator`, `+ FusedIterator`, `+ ExactSizeIterator`). Yield
+  `&T` | O(1)-clone items (`Str`, `Bytes` slices), never fresh allocations.
+  NEVER `.collect()` an intermediate `Vec` just to re-iterate — chain adaptors
+  end to end, collect only at the final owner, if at all. Nameable iterator
+  type (`IntoIterator::IntoIter`, stored field) → TAIT alias, not a written
+  adaptor tower, not a box:
   ```rust
   pub type Iter<'s, T: 's> = impl DoubleEndedIterator<Item = &'s T> + FusedIterator + 's;
   impl<'a, T> IntoIterator for &'a Container<T> {
@@ -390,253 +260,198 @@ House rules, proven in a sibling codebase (tetra). Not suggestions.
      fn into_iter(self) -> Self::IntoIter { /* plain adaptor chain */ }
   }
   ```
-  Containers implement `IntoIterator` for `&T`, `&mut T`, and `T` with
-  concrete (or TAIT-aliased) iterator types. `Box<dyn Iterator>` falls under
-  the same quarantine as `BoxFuture`: cold, I/O-dominated boundaries only.
-- **Service stacks (`tower`-style) allocate at construction, not per call.**
-  Layers compose ONCE when the stack is built; a request path never
-  assembles middleware. The `poll_ready` → `call` contract MUST be honored
-  on the SAME service instance — readiness observed on one clone says
-  nothing about the clone you then call, and skipping it hides
-  backpressure. Driving that contract over a borrowed service means a
-  hand-rolled pin-projected state-machine future, not a box:
-  `NotReady { svc: &'c mut S, msg } → Pending(#[pin] S::Future) → Done`,
-  where `poll` runs `ready!(svc.poll_ready(cx))?` then `svc.call(msg)` on
-  that same `&mut S`. When an adapter purely delegates, forward the inner
-  future type verbatim (`type Future = <S as Service<Req>>::Future;`) — no
-  wrapper future at all. Narrow, documented exception: a type-erasure
-  handle whose real readiness gate lives INSIDE the erased call may
-  dispatch as `self.clone().oneshot(req)` in an inferred future and report
-  always-`Ready` from its own `poll_ready` — this demands a cheap-clone
-  handle (`Arc`-backed state) and a doc comment on `poll_ready` stating
-  where readiness is actually enforced. Never generalize that shortcut.
-  Second exception, a measured compromise for `async_stream`-based
-  middleware — stream-transforming layers (retry/rotate/repair) returning a
-  wrapped response stream MAY heap-pin one generator per call behind a TAIT
-  alias (`Box::pin(async_stream::stream! { … })` hidden inside
-  `impl Stream + Send + Unpin`). Rationale: composing such generators fully
-  inline embeds every inner layer's state (and its poll frames) in the
-  parent's, and a 7-layer stack was MEASURED to overflow the thread stack
-  at construction in debug builds; the per-layer box keeps each layer's
-  state behind one pointer. This is a property of the current generator
-  implementation, not a law — a hand-written pin-projected state machine
-  avoids the box entirely and is the preferred replacement when a layer is
-  hot enough to justify writing one. Never cite this exception outside
-  stream-returning middleware; dyn erasure still happens at most once, at
-  the stack's outer boundary. Thin wrappers (permit holders, taps) and
-  short-circuit responses (`Either`, one-shot `stream::once`) stay fully
-  unboxed via pin-projection.
-- **Scratch buffers are owned once and recycled — in one of two modes,
-  never conflated.** A hot encode/frame path owns one pre-sized `BytesMut`
-  (`with_capacity` at a measured watermark):
-  1. *True scratch reuse* — the contents are consumed in place (written to
-     I/O, copied into a frame) before the next round: `clear()` between
-     rounds. Capacity genuinely survives; steady state is allocation-free.
-  2. *Zero-copy ownership transfer* — the result must escape:
-     `split().freeze()` hands the filled prefix (and its share of the
-     backing allocation) to the receiver as `Bytes`; only the unfilled tail
-     remains in the `BytesMut`, so later rounds `reserve` (amortized
-     reallocation) as needed. That is the price of not copying — accept it
-     knowingly; don't claim the capacity survived.
-  Derived views (headers, sub-ranges) come from `slice(..)` on the frozen
-  `Bytes`, never a copy. This composes with the Allocation Discipline list
-  above: `CowBytes`/`Str` for storage, `BytesMut` for assembly.
-- **Locks: `parking_lot::{Mutex, RwLock}`, never `std::sync`.** Reach for
-  `tokio::sync::Mutex` ONLY when the guard is genuinely held across an
-  `.await`; if it isn't, a `parking_lot` lock is smaller and faster.
-- **Channels: `flume`, never `tokio::sync::mpsc` or `std::sync::mpsc`.**
-  Actor/messagebox loops take a single flume mailbox; priority signals
-  (resize, shutdown) ride `tokio::watch` + `select!`, not a second queue.
+  Containers impl `IntoIterator` for `&T`/`&mut T`/`T` w/ concrete or TAIT
+  types. `Box<dyn Iterator>`: same quarantine as `BoxFuture`.
+- Tower-style stacks allocate at construction, not per call. Layers compose
+  ONCE at build; a request path never assembles middleware.
+  `poll_ready` → `call` MUST run on the SAME instance — readiness on one clone
+  says nothing about the clone you call; skipping hides backpressure.
+  Borrowed-service contract = hand-rolled pin-projected state-machine future,
+  not a box: `NotReady { svc: &'c mut S, msg } → Pending(#[pin] S::Future) →
+  Done`; `poll` = `ready!(svc.poll_ready(cx))?` then `svc.call(msg)` on that
+  same `&mut S`. Pure delegation forwards the inner future verbatim
+  (`type Future = <S as Service<Req>>::Future;`) — no wrapper.
+  Exception 1 (narrow, documented): type-erasure handle whose readiness gate
+  lives INSIDE the erased call MAY `self.clone().oneshot(req)` in an inferred
+  future + always-`Ready` `poll_ready` — requires cheap-clone (`Arc`-backed)
+  handle + doc comment on `poll_ready` naming where readiness is enforced.
+  Never generalize.
+  Exception 2 (measured; `async_stream` middleware only): stream-transforming
+  layers (retry/rotate/repair) returning a wrapped response stream MAY
+  heap-pin one generator per call behind a TAIT alias
+  (`Box::pin(async_stream::stream! { … })` inside
+  `impl Stream + Send + Unpin`). Fully-inline composition embeds every inner
+  layer's state + poll frames in the parent's; a 7-layer stack MEASURED to
+  overflow the thread stack at construction (debug builds). Property of the
+  current generator impl, not a law — a hand-written pin-projected machine
+  avoids the box; preferred for hot layers. Never cite outside
+  stream-returning middleware; dyn erasure ≤ once, at the stack's outer
+  boundary. Thin wrappers (permit holders, taps) + short-circuits (`Either`,
+  one-shot `stream::once`) stay unboxed via pin-projection.
+- Scratch buffers: owned once, recycled — two modes, never conflated. Hot
+  encode/frame path owns one pre-sized `BytesMut` (`with_capacity` at a
+  measured watermark):
+  1. true scratch reuse — contents consumed in place before next round:
+     `clear()` between rounds; capacity survives; steady state
+     allocation-free.
+  2. zero-copy transfer — result escapes: `split().freeze()` hands the filled
+     prefix (+ its share of the backing allocation) as `Bytes`; unfilled tail
+     remains; later rounds `reserve` (amortized realloc). Price of not
+     copying — accept knowingly; don't claim capacity survived.
+  Derived views (headers, sub-ranges): `slice(..)` on the frozen `Bytes`,
+  never a copy. Storage `CowBytes`/`Str`; assembly `BytesMut`.
+- Locks: `parking_lot::{Mutex, RwLock}`, never `std::sync`.
+  `tokio::sync::Mutex` ONLY when the guard is genuinely held across `.await`.
+- Channels: `flume`, never `tokio::sync::mpsc`/`std::sync::mpsc`. Actor loops:
+  single flume mailbox; priority signals (resize, shutdown) ride
+  `tokio::watch` + `select!`, not a second queue.
 
 ### TUI Rendering Doctrine (crates/tui, CRITICAL)
-The port exists because pi's `string[]` + ANSI + `render()` contract was a
-per-frame heap-grooming machine. These rules are the fix — they are not
-negotiable:
-
-- **Text is parsed ONCE, at the boundary.** ANSI/VT escapes are decomposed
-  (via `xutf`) where external text enters (process output, pastes, files).
-  Every component downstream assumes its text contains ZERO escapes and never
-  stores any. Sinks receive `render(style, text)`; ANSI is re-emitted exactly
-  once, at final materialization into the stdout buffer.
-- **Caches own memory.** A cache holds one pooled text buffer plus
-  `(Style, Range)` spans; re-presenting is re-slicing, not re-parsing.
-  Per-frame allocation of line buffers (`Vec<Line>` built fresh each paint) is
-  a bug, not a style choice.
-- **Markup (TML) degrades like HTML.** An unknown tag becomes a
-  `CustomElement` — forwarded to a registered renderer if one exists, else its
-  children render and it layers like a `div`. A bad tag MUST NOT fail the
-  whole document into raw-text fallback.
-- **Props inherit like CSS.** `<col fg=blue>hi</col>` colors its text without
-  an explicit `<text>`. Any prop applies to any element where it can
-  meaningfully apply. Well-known props are stored typed and non-allocating;
-  arbitrary KV sits beside them. Color fields accept `#xxx`, `#xxxxxx`,
-  `rgb(a)`, `hsl(a)`, `lab`/`oklch`, full HTML names, and gradients as plain
-  `bg`/`fg` values (with angle) — gradients are values, not special elements.
-- **Context threads everywhere.** `UiContext` (charset: ascii | unicode |
-  nerdfont, plus theme) reaches every component; hardcoded colors and
-  hand-emitted glyphs are banned. Icons come from `icons.tsv` (generic name +
-  optional specific alias, mapped across charsets, degrading inline). Border
-  defaults are themed and dim, not `#fff`.
-- **`dom!`/`layout!` is the canonical construction path** (typed props, loops,
-  `if`/`match`, `IntoComponent` for `&str`/`String`/`Str`/`()`/Vec).
-  Building markup by `write!`/`format!` into a `String` and parsing it back is
-  the discouraged path.
-- **Effects are props, not one-offs.** Shimmer, hover gradient + eased lift,
+Port exists because pi's `string[]`+ANSI+`render()` contract was per-frame
+heap-grooming. Non-negotiable:
+- Text parsed ONCE at the boundary: ANSI/VT decomposed (via `xutf`) where
+  external text enters (process output, pastes, files); downstream components
+  assume ZERO escapes, store none. Sinks get `render(style, text)`; ANSI
+  re-emitted exactly once, at final materialization into the stdout buffer.
+- Caches own memory: one pooled text buffer + `(Style, Range)` spans;
+  re-present = re-slice, not re-parse. Per-frame line buffers (`Vec<Line>`
+  fresh each paint) = bug, not style.
+- TML degrades like HTML: unknown tag → `CustomElement` (registered renderer
+  if any, else children render, layers like `div`). Bad tag MUST NOT fail the
+  document into raw-text fallback.
+- Props inherit like CSS: `<col fg=blue>hi</col>` colors w/o explicit
+  `<text>`; any prop applies where meaningful; well-known props typed +
+  non-allocating, arbitrary KV beside. Color fields accept
+  `#xxx`|`#xxxxxx`|`rgb(a)`|`hsl(a)`|`lab`/`oklch`|full HTML names|gradients
+  as plain `bg`/`fg` values (with angle) — gradients are values, not special
+  elements.
+- `UiContext` (charset: ascii | unicode | nerdfont; theme) reaches every
+  component; hardcoded colors + hand-emitted glyphs banned. Icons from
+  `icons.tsv` (generic name + optional specific alias, per-charset, degrading
+  inline). Border defaults themed + dim, not `#fff`.
+- `dom!`/`layout!` = canonical construction (typed props, loops, `if`/`match`,
+  `IntoComponent` for `&str`/`String`/`Str`/`()`/Vec).
+  `write!`/`format!`→`String`→reparse = discouraged path.
+- Effects are props, not one-offs: shimmer, hover gradient + eased lift,
   streaming reveal (`<text reveal>`), truncate-from-start, tree/checklist,
-  clickable scrollbars, non-committed sidebars: if an example needs it, it
-  lands as a reusable prop or component in core FIRST. Never ship a visual
-  feature as example-local code.
-- **Examples stay near-zero boilerplate** (the `App` host, a `start`, done).
-  An example touching kitty image ids, raw escape dispatch, terminal probing,
-  focus routing, or clipboard internals means the ENGINE is missing the
-  primitive — fix the engine, not the example. The editor itself is built
-  from components so users can recompose it.
-- **Alt buffer only where required** (overlays, the welcome scene). Chat and
-  transcripts stay inline and mouse-selectable; quitting restores the
-  terminal cleanly (no stray mouse-tracking spam).
-- **Input is one mailbox.** Decoded `TerminalEvent`s (real input, debug
-  injections, resize) flow through a single async flume mailbox; resize wins
-  via watch + `select!`. No polling `read()` loops, no per-example key
-  dispatch tables. Keyboard input instantly clears mouse-hover state; there is
-  only ever one visible cursor/focus.
+  clickable scrollbars, non-committed sidebars — example needs it → reusable
+  prop/component in core FIRST. Never example-local visual features.
+- Examples near-zero boilerplate (`App` host, a `start`, done). Example
+  touching kitty image ids, raw escape dispatch, terminal probing, focus
+  routing, clipboard internals ⇒ engine missing the primitive — fix engine,
+  not example. The editor itself is built from components for recomposition.
+- Alt buffer only where required (overlays, welcome scene). Chat/transcripts
+  inline + mouse-selectable; quit restores the terminal cleanly (no stray
+  mouse-tracking spam).
+- Input = one mailbox: decoded `TerminalEvent`s (real input, debug injections,
+  resize) through a single async flume mailbox; resize wins via watch +
+  `select!`. No polling `read()` loops, no per-example key tables. Keyboard
+  input instantly clears mouse-hover; only ever one visible cursor/focus.
 
-### Porting Subsystems
-omp is a Rust rewrite of pi. When porting any subsystem:
-
-1. **Read pi's implementation in extreme detail first** — including
-   `crates/natives`, compat shims, support detection, and its tests. Every
-   missed behavior (editor keys, paste/drag-drop, resize-settling, truncation)
-   resurfaces as a user-reported bug within hours.
-2. **Copy pi's tests; drop TS-shaped compensations.** Throttles, GC
-   workarounds, and UTF-16 defenses exist because "ts is slow, rust isn't" —
-   do not port them. Port behavior, not shape: reimplement where the shape is
-   wrong (mermaid, slopjson, the brush parser), never wrap what should be
-   native.
-3. **Generalize while porting.** The port lands as themed, charset-aware,
-   prop-driven engine primitives — not as a feature checkmark that only works
-   in one example.
-4. **Match pi exactly where it's good** (editor UX, telemetry, statusline
-   semantics, alt-buffer resize handling); **exceed it where it's weak**
-   (renderer contract, error taxonomy, providers-as-data).
-5. **Close the gaps pi left** (missing builtins, slash-arg completion, …)
-   while you're in the area.
+### Porting (from pi)
+1. Read pi's impl in extreme detail first — incl. `crates/natives`, compat
+   shims, support detection, tests. Missed behaviors (editor keys,
+   paste/drag-drop, resize-settling, truncation) = user-reported bugs within
+   hours.
+2. Copy pi's tests; drop TS-shaped compensations (throttles, GC workarounds,
+   UTF-16 defenses — "ts is slow, rust isn't"). Port behavior, not shape:
+   reimplement where the shape is wrong (mermaid, slopjson, brush parser);
+   never wrap what should be native.
+3. Generalize while porting: themed, charset-aware, prop-driven engine
+   primitives, not one-example checkmarks.
+4. Match pi where good (editor UX, telemetry, statusline semantics, alt-buffer
+   resize handling); exceed where weak (renderer contract, error taxonomy,
+   providers-as-data).
+5. Close pi's gaps (missing builtins, slash-arg completion, …) while in the
+   area.
 
 ### Working Style
-- **Orchestrate in parallel.** One agent per crate/util/provider/category;
-  `sonic` agents for mechanical moves and renames (use `sd`/bash for bulk
-  renames, never hand edits); scouts only when the affected files are
-  genuinely unknown. Sequential one-agent-at-a-time is a failure mode.
-- **Finish the whole ask.** No scaffolds, no "the rest is trivial", no
-  half-ports handed back. "Done" means compiles, wired, exercised.
-- **Verify by running.** TUI changes are driven on a real PTY via the `tui`
-  tool (below) before claiming done; every input path, resize, and
-  quit-cleanup gets exercised.
-- **Never revert or `git checkout` user edits.** The user edits and renames
-  in flight while agents work — adapt to the tree as it is.
+- Orchestrate in parallel: one agent per crate/util/provider/category; `sonic`
+  for mechanical moves/renames (`sd`/bash bulk renames, never hand edits);
+  scouts only for genuinely unknown files. Sequential one-agent-at-a-time =
+  failure mode.
+- Finish the whole ask: no scaffolds, no "rest is trivial", no half-ports.
+  Done = compiles, wired, exercised.
+- Verify by running: TUI changes get real-PTY proof (Testing & QA) before
+  claiming done — every input path, resize, quit-cleanup.
+- NEVER revert/`git checkout` user edits; user edits/renames in flight —
+  adapt to the tree as is.
 
-## Important Files
+## Key Files
+`Cargo.toml`: members, shared deps, lints, release profile.
+`rust-toolchain.toml`/`rustfmt.toml`/`clippy.toml`/`rust-analyzer.toml`:
+compiler + enforced style/concurrency policy. `.cargo/config.toml`: vendored
+`PYO3_CONFIG_FILE`, required before Cargo resolves `pyo3`. `justfile`: all
+commands (sync w/ CI + crate READMEs). `crates/proto/proto` + `build.rs`:
+protobuf sources, pure-Rust codegen. `crates/tui/README.md` + `icons.tsv`: TUI
+architecture, debug protocol, charset-aware icons. `crates/e2e/README.md`:
+harness contract. `crates/py/README.md` + `build.rs`: embedded Python linkage,
+generated inputs.
 
-- `Cargo.toml`: workspace members, shared dependencies, lints, and release
-  profile.
-- `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml`,
-  `rust-analyzer.toml`: compiler and enforced style/concurrency policy.
-- `.cargo/config.toml`: vendored `PYO3_CONFIG_FILE`; required before Cargo
-  resolves `pyo3`.
-- `crates/app/src/main.rs`, `lib.rs`, `cli.rs`: process entry and public command
-  tree. `chat.rs`/`chat_ui.rs` own interactive composition.
-- `crates/agent/src/loop.rs`: durable agent loop, interrupts, and tool batching.
-- `crates/llm-inference/src/lib.rs`: inference facade and Tower routing spine;
-  `crates/llm-catalog/data` is provider/model data.
-- `crates/core/src/lib.rs`, `crates/storage/src/lib.rs`: shared performance
-  primitives and durable transcript/blob state.
-- `crates/proto/proto`, `crates/proto/build.rs`: protobuf sources and pure-Rust
-  code generation.
-- `crates/tui/README.md`, `crates/tui/icons.tsv`: TUI architecture, debug
-  protocol, and charset-aware icon source.
-- `crates/e2e/README.md`, `crates/e2e/tests/p*.rs`: acceptance harness contract
-  and authoritative cross-crate proofs.
-- `crates/py/README.md`, `crates/py/build.rs`,
-  `crates/py/scripts/fetch-python.sh`: embedded Python linkage and generated
-  inputs.
-- `.github/workflows/ci.yml`: current Cargo formatting, lint, workspace-test,
-  E2E, PTY, and performance-baseline gate.
-
-## Runtime/Tooling Preferences
-
-- Rust is pinned to `nightly-2026-08-08` with `rustfmt`, `clippy`, and
-  `rust-analyzer`; do not redesign nightly-dependent APIs around stable Rust.
-- Cargo is the Rust package manager. Use Bun for repository JS/TS tools and
-  scripts, never Node/npm/pnpm/yarn; use `uv`, never pip, for Python dependency
-  operations.
-- Protobuf builds use `protox`; no system `protoc` is required.
-- Workspace-owned environment variables are `OMP_*` only:
-  `OMP_TUI_DEBUG`, `OMP_TTY`, and `OMP_PY_SITE`. `PYO3_CONFIG_FILE` is the
-  required upstream pyo3 exception.
-- The release profile is deliberate: `opt-level = 2`, thin LTO, one codegen
-  unit, stripped symbols, unwind panics. Change it only with measured evidence.
+## Runtime/Tooling
+- Rust pinned `nightly-2026-08-08` (+ `rustfmt`, `clippy`, `rust-analyzer`);
+  NEVER redesign nightly-dependent APIs around stable.
+- Cargo for Rust; Bun for JS/TS (never Node/npm/pnpm/yarn); `uv` for Python
+  (never pip).
+- Protobuf: `protox`; no system `protoc`.
+- Workspace env vars `OMP_*` only: `OMP_TUI_DEBUG`, `OMP_TTY`, `OMP_PY_SITE`.
+  `PYO3_CONFIG_FILE` = required upstream pyo3 exception.
+- Release profile deliberate (`opt-level = 2`, thin LTO, 1 codegen unit,
+  stripped, unwind panics); change only w/ measured evidence.
 
 ### Embedded Python (omp-py)
-- `omp-py` (`crates/py`) is a library that statically links CPython 3.14t
-  (free-threaded) and boots it in-process: `Engine::builder().init()`, then
-  `engine.attach(|py| ...)`. Native modules register with
-  `pyo3::append_to_inittab!` before `init`. The `omp-demo` bin ships from the
-  same crate. Building requires `crates/py/scripts/fetch-python.sh` once (populates
-  gitignored `vendor/python` with the python-build-standalone archive and
-  derived build inputs).
-- Pure-Python packages frozen into the binary (e.g. cloudpickle) are pinned
-  in `crates/py/requirements.txt`; `crates/py/scripts/fetch-python.sh` resolves them
-  with `uv` into gitignored `vendor/python/bundled/` (skipped while the
-  stamp matches the manifest) and regenerates the tracked
-  `crates/py/THIRD-PARTY-NOTICES.txt` (also available as
-  `omp_py::THIRD_PARTY_LICENSES`) — rerun it after editing the manifest and
-  commit the notices. omp-py's build script only validates the stamp and
-  packs; native wheels are rejected at fetch time — those go into
-  site-packages.
-- pyo3 is configured via `PYO3_CONFIG_FILE` in `.cargo/config.toml` (defaults to
-  `vendor/python/pyo3-config.txt` for fast dev links). Release builds link
-  the `vendor/python-release` tree (`PYO3_CONFIG_FILE="$PWD/vendor/python-release/pyo3-config.txt" cargo build --release`):
-  its pgo+lto pbs variant is LLVM-22 LTO bitcode and automatically routes
-  through Homebrew LLD 22 (`brew install lld`, via `crates/py/scripts/ld64.lld`)
-  because of the `needs-lld` marker in that tree.
-  enforced loudly by omp-py's build script:
-  1. `PYO3_CONFIG_FILE` must point at `vendor/python/pyo3-config.txt` before
-     cargo runs (this repo's `.cargo/config.toml` covers workspace members;
-     external crates set it in their own `[env]` or environment) — otherwise
-     pyo3 silently links a host Python.
-  2. Final-link flags: consumer bin crates replicate `--ld-path=<shim>` and
-     `-Wl,-export_dynamic` in their own build script. `crates/app/build.rs` and
-     `crates/e2e/build.rs` are the working examples.
-- The stdlib is embedded as marshalled bytecode and served from memory; the
-  only real search path is `$OMP_PY_SITE` (default
-  `~/.local/share/omp-py/site-packages`). End users install wheels with any
-  free-threaded 3.14 interpreter — no repo checkout needed:
+- `crates/py`: statically links CPython 3.14t (free-threaded), boots
+  in-process: `Engine::builder().init()` → `engine.attach(|py| ...)`. Native
+  modules: `pyo3::append_to_inittab!` before `init`. `omp-demo` bin ships from
+  the same crate. Requires `just setup-python`
+  (`crates/py/scripts/fetch-python.sh`) once → gitignored `vendor/python`
+  (python-build-standalone archive + derived build inputs).
+- Frozen pure-Python packages (e.g. cloudpickle): pinned
+  `crates/py/requirements.txt`; fetch script resolves via `uv` → gitignored
+  `vendor/python/bundled/` (skipped while stamp matches manifest) +
+  regenerates tracked `crates/py/THIRD-PARTY-NOTICES.txt`
+  (= `omp_py::THIRD_PARTY_LICENSES`) — rerun after manifest edits, commit the
+  notices. Build script only validates stamp + packs; native wheels rejected
+  at fetch — those go into site-packages.
+- pyo3 via `PYO3_CONFIG_FILE` in `.cargo/config.toml` (default
+  `vendor/python/pyo3-config.txt`, fast dev links). Release links
+  `vendor/python-release` (`just build-release`); its pgo+lto pbs variant =
+  LLVM-22 LTO bitcode, auto-routes through Homebrew LLD 22
+  (`brew install lld`, via `crates/py/scripts/ld64.lld`; `needs-lld` marker).
+  Enforced loudly by omp-py's build script:
+  1. `PYO3_CONFIG_FILE` MUST point at `vendor/python/pyo3-config.txt` before
+     cargo runs (repo `.cargo/config.toml` covers members; external crates set
+     their own `[env]`/environment) — else pyo3 silently links a host Python.
+  2. Consumer bin crates replicate final-link flags `--ld-path=<shim>` +
+     `-Wl,-export_dynamic` in their own build script; working examples:
+     `crates/app/build.rs`, `crates/e2e/build.rs`.
+- Stdlib embedded as marshalled bytecode, served from memory; only real search
+  path `$OMP_PY_SITE` (default `~/.local/share/omp-py/site-packages`). End
+  users install wheels w/ any free-threaded 3.14 interpreter, no checkout:
   ```sh
   uv python install 3.14t
   uv pip install --python "$(uv python find 3.14t)" \
       --target "${OMP_PY_SITE:-$HOME/.local/share/omp-py/site-packages}" numpy
   ```
 
-### Debugging the TUI (`tui` tool, `OMP_TUI_DEBUG`, `OMP_TTY`)
-Prefer the project-local `tui` agent tool (`.omp/tools/tui.ts`): it runs an
-example or bin on a Bun-native PTY — a real controlling terminal, so
-SIGWINCH resizes and immediate-mode hosts behave as in production — and
-exposes screenshots (`text`), component trees (`tree`), widget values,
-key/mouse/paste injection, resizes, and raw byte-stream stats as one
-session-based tool. Its structured ops ride the first hook below; the
-second exists for external harnesses without a PTY of their own:
-
-- `OMP_TUI_DEBUG=<unix-socket-path>` — `Terminal::enter` starts a server
-  thread on the socket with line-delimited JSON ops (`text`, `tree`,
-  `values`, `keys`, `event`, `mouse`, `resize`, `quit`, ...); see "Debug a
-  running app" in `crates/tui/README.md`. The wire speaks `TerminalEvent`:
-  injected input rides the same mailbox as decoded terminal bytes,
-  `text`/`info` answer from the last paint on every host, and
-  `frame`/`tree`/`values` are mailbox queries only `App` hosts answer (the
-  server times them out elsewhere); `quit` injects `C-c`.
-- `OMP_TTY=<pty-slave-path>` reroutes ALL terminal I/O — input, rendered
-  frames, capability probes, terminal identity — to that device; hold the
-  master side to script the UI and capture the exact byte stream a terminal
-  would see. stdout stays untouched.
+### TUI Debugging (`tui` tool, `OMP_TUI_DEBUG`, `OMP_TTY`)
+Prefer `.omp/tools/tui.ts`: runs an example/bin on a Bun-native PTY (real
+controlling terminal — SIGWINCH resizes + immediate-mode hosts behave as
+production); screenshots (`text`), component trees (`tree`), widget values,
+key/mouse/paste injection, resizes, raw byte-stream stats as one session-based
+tool. Structured ops ride hook 1; hook 2 for external harnesses w/o their own
+PTY:
+- `OMP_TUI_DEBUG=<unix-socket-path>`: `Terminal::enter` starts a server thread
+  on the socket, line-delimited JSON ops (`text`, `tree`, `values`, `keys`,
+  `event`, `mouse`, `resize`, `quit`, ...) — see "Debug a running app",
+  `crates/tui/README.md`. Wire speaks `TerminalEvent`: injected input rides
+  the same mailbox as decoded terminal bytes; `text`/`info` answer from the
+  last paint on every host; `frame`/`tree`/`values` = mailbox queries only
+  `App` hosts answer (server times out elsewhere); `quit` injects `C-c`.
+- `OMP_TTY=<pty-slave-path>`: reroutes ALL terminal I/O (input, rendered
+  frames, capability probes, terminal identity) to that device; hold the
+  master side to script the UI + capture the exact byte stream a terminal
+  would see. stdout untouched.
 
 ```python
 import fcntl, os, pty, struct, subprocess, termios
@@ -651,31 +466,28 @@ os.write(master, b"\x1b[C")     # keys (write escape sequences)
 os.write(master, b"\x03")       # Ctrl-C quits the examples
 ```
 
-Caveats: set the winsize with `TIOCSWINSZ` before spawning (`SIGWINCH` only
-reaches the controlling terminal, so live resizes don't propagate); the
-capability probe waits for replies — answer DA1 (`\x1b[?62c`) or let it time
-out. Feed the master stream to a VT emulator (e.g. `pyte`) for screen
-assertions.
+Caveats: set winsize via `TIOCSWINSZ` before spawn (`SIGWINCH` only reaches
+the controlling terminal; live resizes don't propagate). Capability probe
+waits for replies — answer DA1 (`\x1b[?62c`) or let it time out. Feed the
+master stream to a VT emulator (e.g. `pyte`) for screen assertions.
 
 ## Testing & QA
-
-- Unit tests are colocated in `src` where private behavior matters; public
-  contracts and cross-module behavior live in `crates/*/tests`.
-- `insta` snapshots protect shell parser/tokenizer behavior. `proptest` covers
-  encoding, zero-copy slicing, transcript replay, and other round-trip
-  invariants. Review snapshots; never accept them blindly.
-- `crates/app/tests` exercises production registry, RPC, daemon, document, and
-  CLI composition. Prefer these seams over mocks of production authority.
-- `crates/e2e/tests/p1_doc_race.rs` through `p8_baselines.rs` are authoritative
-  for concurrency, cancellation, detached jobs, schema isolation, prefix
-  stability, crash/replay, real-PTY lifecycle, and recorded performance data.
-  The harness uses bounded waits and RAII-owned processes; preserve both.
-- P8 is a non-gating recorder. It validates metric math/schema and records p95
-  frame time and token-loop throughput; do not turn noisy host measurements
-  into an unreviewed hard gate.
-- TUI changes MUST be exercised on a real PTY with `.omp/tools/tui.ts` (or the
-  hooks above), including input, resize, and clean quit restoration.
-- No numeric line-coverage target is defined. Coverage means changed observable
-  behavior is defended: branch edges, precedence, state transitions, malformed
-  input, cancellation, and recovery. Run the narrow test first, then the
-  affected crate and relevant E2E proof.
+- Unit tests colocated in `src` where private behavior matters; public
+  contracts + cross-module → `crates/*/tests`.
+- `insta` snapshots: shell parser/tokenizer. `proptest`: encoding, zero-copy
+  slicing, transcript replay, round-trip invariants. Review snapshots; NEVER
+  accept blindly.
+- `crates/app/tests`: production registry, RPC, daemon, document, CLI
+  composition — prefer these seams over mocks of production authority.
+- `crates/e2e/tests/p1_doc_race.rs`…`p8_baselines.rs`: authoritative for
+  concurrency, cancellation, detached jobs, schema isolation, prefix
+  stability, crash/replay, real-PTY lifecycle, recorded perf. Bounded waits +
+  RAII-owned processes; preserve both.
+- P8 = non-gating recorder (metric math/schema, p95 frame time, token-loop
+  throughput). NEVER turn noisy host measurements into an unreviewed hard
+  gate.
+- TUI changes MUST be exercised on a real PTY via `.omp/tools/tui.ts` (or the
+  hooks above): input, resize, clean quit restoration.
+- No numeric coverage target. Coverage = changed observable behavior defended:
+  branch edges, precedence, state transitions, malformed input, cancellation,
+  recovery. Narrow test → affected crate → relevant E2E proof.
