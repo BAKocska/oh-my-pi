@@ -109,8 +109,10 @@ pub fn matrix() -> impl Iterator<Item = MatrixCell> {
 /// Prints command use and the artifact schema expected from a runner.
 fn help() {
 	println!(
-		"pooling-bench --runner PATH --output ARTIFACT.json\n\nRecords the full 4 × 3 × 3 × 3 × 2 × \
-		 3 pooling matrix (648 cells).\nThe runner is invoked once per cell with these environment \
+		"pooling-bench --runner PATH --output ARTIFACT.json [--limit CELLS]\n\nRecords the full 4 × \
+		 3 × 3 × 3 × 2 × 3 pooling matrix (648 cells) by default. --limit records only the first \
+		 CELLS in deterministic matrix order for smoke testing; it does not change cell \
+		 semantics.\nThe runner is invoked once per cell with these environment \
 		 variables:\nOMP_POOL_EXTENSIONS_ACTIVE, OMP_POOL_DEPENDENCY_PROFILE, \
 		 OMP_POOL_LIFECYCLE,\nOMP_POOL_ENVIRONMENT_LINK, OMP_POOL_HOOK_LOAD, \
 		 OMP_POOL_INVOCATION_PATTERN\nIt must write one JSON Measurements object to stdout with: \
@@ -121,10 +123,11 @@ fn help() {
 
 /// Parses the intentionally small command surface without bringing a CLI
 /// dependency into e2e.
-fn arguments() -> Result<(PathBuf, PathBuf)> {
+fn arguments() -> Result<(PathBuf, PathBuf, Option<usize>)> {
 	let mut arguments = std::env::args_os().skip(1);
 	let mut runner = None;
 	let mut output = None;
+	let mut limit = None;
 	while let Some(argument) = arguments.next() {
 		match argument.to_string_lossy().as_ref() {
 			"--help" | "-h" => {
@@ -133,12 +136,24 @@ fn arguments() -> Result<(PathBuf, PathBuf)> {
 			},
 			"--runner" => runner = Some(PathBuf::from(next_value(&mut arguments, "--runner")?)),
 			"--output" => output = Some(PathBuf::from(next_value(&mut arguments, "--output")?)),
+			"--limit" => {
+				let value = next_value(&mut arguments, "--limit")?;
+				let parsed = value
+					.to_string_lossy()
+					.parse::<usize>()
+					.context("--limit must be a positive integer no greater than 648")?;
+				if !(1..=648).contains(&parsed) {
+					bail!("--limit must be a positive integer no greater than 648");
+				}
+				limit = Some(parsed);
+			},
 			unknown => bail!("unknown argument {unknown:?}; pass --help for the matrix schema"),
 		}
 	}
 	Ok((
 		runner.context("--runner is required; pass --help for the matrix schema")?,
 		output.context("--output is required")?,
+		limit,
 	))
 }
 
@@ -171,10 +186,11 @@ fn sample(runner: &Path, cell: MatrixCell) -> Result<Measurements> {
 		.with_context(|| format!("pooling runner emitted invalid measurements for {cell:?}"))
 }
 
-/// Executes all cells and writes one self-describing artifact.
-fn record(runner: &Path) -> Result<Artifact> {
-	let mut records = Vec::with_capacity(648);
-	for cell in matrix() {
+/// Executes the selected cells and writes one self-describing artifact.
+fn record(runner: &Path, limit: Option<usize>) -> Result<Artifact> {
+	let limit = limit.unwrap_or(648);
+	let mut records = Vec::with_capacity(limit);
+	for cell in matrix().take(limit) {
 		records.push(Record { cell, measurements: sample(runner, cell)? });
 	}
 	Ok(Artifact { schema_version: SCHEMA_VERSION, records })
@@ -182,8 +198,8 @@ fn record(runner: &Path) -> Result<Artifact> {
 
 /// Runs the non-gating recorder.
 fn main() -> Result<()> {
-	let (runner, output) = arguments()?;
-	let artifact = record(&runner)?;
+	let (runner, output, limit) = arguments()?;
+	let artifact = record(&runner, limit)?;
 	let file =
 		File::create(&output).with_context(|| format!("could not create {}", output.display()))?;
 	serde_json::to_writer_pretty(file, &artifact)

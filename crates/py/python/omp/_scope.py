@@ -2,13 +2,16 @@
 from __future__ import annotations
 import contextvars
 from dataclasses import dataclass
-from typing import Any
+from _omp import InvocationPhase, Principal
 
 @dataclass(frozen=True, slots=True)
 class Scope:
     """The generation-fenced authority attached to one invocation."""
     invocation: str
     generation: int
+    principal: Principal
+    phase: InvocationPhase
+    deadline: float | None = None
     effects: frozenset[str] = frozenset()
 
 _current: contextvars.ContextVar[Scope | None] = contextvars.ContextVar("omp_scope", default=None)

@@ -6,7 +6,7 @@ use std::{
 	ffi::CString,
 	io::{self, Read, Write},
 	num::NonZeroUsize,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::Stdio,
 	sync::{
 		Arc,
@@ -191,6 +191,17 @@ pub struct JournalRuntime {
 	/// artifacts.
 	pub external: flume::Sender<ExternalJournalCall>,
 }
+#[derive(Clone)]
+struct BoundJournalRuntime {
+	id:      u64,
+	runtime: JournalRuntime,
+}
+
+struct JournalRuntimeSlot {
+	binding:   Option<BoundJournalRuntime>,
+	was_bound: bool,
+}
+
 struct ServiceRouter {
 	broker: Mutex<ServiceBroker>,
 	routes: Mutex<BTreeMap<HostKey, ProviderRoute>>,
@@ -216,6 +227,8 @@ pub struct ExtHostConfig {
 	pub session_generation: u64,
 	/// Session start timestamp used by activation events.
 	pub session_started_at: SystemTime,
+	/// Workspace root inherited by every placed worker process.
+	workspace_root:         Option<PathBuf>,
 	/// Active extensions. An empty set starts no Python process.
 	pub extensions:         Vec<ExtHostSpec>,
 	/// Expected workspace protobuf schema revision.
@@ -261,6 +274,7 @@ impl ExtHostConfig {
 			session_id,
 			session_generation,
 			session_started_at: SystemTime::now(),
+			workspace_root: None,
 			extensions: Vec::new(),
 			schema_rev: omp_proto::SCHEMA_REV,
 			python_rev: Str::new_static(PYTHON_REV),
@@ -283,6 +297,11 @@ impl ExtHostConfig {
 	/// authorization table.
 	pub fn bind_data_authority(&mut self, authority: Arc<AuthorityTable>) {
 		self.data_authority = Some(authority);
+	}
+
+	/// Binds placed worker processes to the Environment's workspace root.
+	pub fn bind_workspace_root(&mut self, root: &Path) {
+		self.workspace_root = Some(root.to_path_buf());
 	}
 
 	/// Installs authenticated journal and scoped-state CONTROL routing.
@@ -616,7 +635,7 @@ pub struct ExtHostSupervisor {
 	next_invocation:      AtomicU64,
 	actors:               Vec<HostActor>,
 	data_authority:       Option<Arc<AuthorityTable>>,
-	journal_runtime:      Arc<Mutex<Option<JournalRuntime>>>,
+	journal_runtime:      Arc<Mutex<JournalRuntimeSlot>>,
 	availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
 	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
 	children_active:      AtomicBool,
@@ -647,7 +666,13 @@ impl ExtHostSupervisor {
 		let resources = Arc::new(Mutex::new(ControlQuotaLedger::new()));
 		let availability_sink = Arc::clone(&config.availability_sink);
 		let availability_pending = Arc::new(Mutex::new(VecDeque::new()));
-		let journal_runtime = Arc::new(Mutex::new(config.journal.clone()));
+		let journal_runtime = Arc::new(Mutex::new(JournalRuntimeSlot {
+			binding:   config
+				.journal
+				.clone()
+				.map(|runtime| BoundJournalRuntime { id: 0, runtime }),
+			was_bound: config.journal.is_some(),
+		}));
 		let children_active = AtomicBool::new(false);
 		for extension in config.extensions.iter().cloned() {
 			validate_extension_spec(&extension)?;
@@ -819,23 +844,37 @@ impl ExtHostSupervisor {
 		&self.registrations
 	}
 
-	/// Installs Agent Journal CONTROL routing before any extension child reaches
-	/// activation.
+	/// Installs sole-owner Agent Journal CONTROL routing.
 	///
 	/// # Errors
-	/// Fails closed once a child is active so authenticated mailbox ownership
-	/// cannot change beneath callbacks already admitted by that generation.
-	pub fn bind_journal_runtime(&self, runtime: JournalRuntime) -> Result<(), WorkerError> {
-		if self.children_active.load(Ordering::Acquire) {
+	/// Fails closed if a binding is already live. The initial binding must be
+	/// installed before activation; a released binding may be replaced between
+	/// agent loops without restarting extension children.
+	pub fn bind_journal_runtime(&self, id: u64, runtime: JournalRuntime) -> Result<(), WorkerError> {
+		let mut slot = self.journal_runtime.lock();
+		if slot.binding.is_some() {
+			return Err(WorkerError::Protocol(Str::new_static("journal runtime is already bound")));
+		}
+		if self.children_active.load(Ordering::Acquire) && !slot.was_bound {
 			return Err(WorkerError::Protocol(Str::new_static(
 				"journal runtime must be bound before the first extension child is active",
 			)));
 		}
-		if self.journal_runtime.lock().is_some() {
-			return Err(WorkerError::Protocol(Str::new_static("journal runtime is already bound")));
-		}
-		*self.journal_runtime.lock() = Some(runtime);
+		slot.binding = Some(BoundJournalRuntime { id, runtime });
+		slot.was_bound = true;
 		Ok(())
+	}
+
+	/// Releases the runtime only when it is still owned by `id`.
+	pub fn unbind_journal_runtime(&self, id: u64) {
+		let mut slot = self.journal_runtime.lock();
+		if slot
+			.binding
+			.as_ref()
+			.is_some_and(|binding| binding.id == id)
+		{
+			slot.binding = None;
+		}
 	}
 
 	/// Binds the active Agent mailbox's device availability destination.
@@ -1090,6 +1129,7 @@ impl ProcessKey {
 struct ProcessConfig {
 	process_id:           ProcessKey,
 	executable:           PathBuf,
+	workspace_root:       Option<PathBuf>,
 	python_site:          Option<PathBuf>,
 	modules:              Vec<Str>,
 	manifests:            BTreeMap<HostKey, ExtensionManifest>,
@@ -1108,7 +1148,7 @@ struct ProcessConfig {
 	healthy_reset:        Duration,
 	session_generation:   u64,
 	scheme_snapshot:      Option<SchemeSnapshot>,
-	journal:              Arc<Mutex<Option<JournalRuntime>>>,
+	journal:              Arc<Mutex<JournalRuntimeSlot>>,
 	resources:            Arc<Mutex<ControlQuotaLedger>>,
 	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
 	availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
@@ -1121,7 +1161,7 @@ impl ProcessConfig {
 		extensions: Vec<ExtHostSpec>,
 		resources: Arc<Mutex<ControlQuotaLedger>>,
 		availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
-		journal: Arc<Mutex<Option<JournalRuntime>>>,
+		journal: Arc<Mutex<JournalRuntimeSlot>>,
 	) -> Result<Self, WorkerError> {
 		let python_site = extensions
 			.first()
@@ -1165,6 +1205,7 @@ impl ProcessConfig {
 		Ok(Self {
 			process_id,
 			executable: root.executable.clone(),
+			workspace_root: root.workspace_root.clone(),
 			python_site,
 			modules,
 			manifests,
@@ -1251,6 +1292,9 @@ impl WorkerProcess {
 			.stdout(Stdio::piped())
 			.stderr(Stdio::inherit())
 			.kill_on_drop(true);
+		if let Some(root) = &config.workspace_root {
+			command.current_dir(root);
+		}
 		if let Some(site) = &config.python_site {
 			command.env("OMP_PY_SITE", site);
 		}
@@ -1920,10 +1964,13 @@ async fn dispatch_journal_control(
 			"journal CONTROL request_id must be nonzero",
 		)));
 	}
-	let runtime =
-		config.journal.lock().clone().ok_or_else(|| {
-			WorkerError::Protocol(Str::new_static("journal CONTROL is not installed"))
-		})?;
+	let runtime = config
+		.journal
+		.lock()
+		.binding
+		.as_ref()
+		.map(|binding| binding.runtime.clone())
+		.ok_or_else(|| WorkerError::Protocol(Str::new_static("journal CONTROL is not installed")))?;
 	let manifest = config.manifests.get(&invocation.owner).ok_or_else(|| {
 		WorkerError::Protocol(Str::new_static("journal CONTROL owner is not admitted"))
 	})?;

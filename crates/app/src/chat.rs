@@ -846,12 +846,15 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			journal,
 			CHAT_CAPS_BASE,
 		);
-		if let Some(environment) = &isolated_environment {
-			environment
+		let _control_binding = if let Some(environment) = &isolated_environment {
+			let binding = environment
 				.bind_agent_control(child.control())
 				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 			environment.bind_device_availability(child.mailbox());
-		}
+			Some(binding)
+		} else {
+			None
+		};
 		let inbox = self
 			.broker
 			.register(&node, child.mailbox())
@@ -1175,7 +1178,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
 		agent.set_continuation_source(modes.clone());
-		environment.bind_agent_control(agent.control())?;
+		let _control_binding = environment.bind_agent_control(agent.control())?;
 		environment.bind_device_availability(agent.mailbox());
 		let tree = parent.tree();
 		let node = tree

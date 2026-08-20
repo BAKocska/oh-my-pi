@@ -621,7 +621,8 @@ fn spawn_invocation_pump(
 						},
 					}
 				},
-				event = invocation.next_event() => match event {
+				event = invocation.next_event() => {
+					match event {
 					Ok(Some(InvocationEvent::Accepted(_))) => {},
 					Ok(Some(InvocationEvent::Admission(query))) => {
 						let maximum = loop {
@@ -682,6 +683,7 @@ fn spawn_invocation_pump(
 						));
 						break;
 					},
+					}
 				},
 			}
 		}

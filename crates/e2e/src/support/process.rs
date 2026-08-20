@@ -1,9 +1,25 @@
-use std::{io, path::PathBuf, process::Stdio, time::Duration};
+use std::{io, path::PathBuf, process::Stdio, sync::Once, time::Duration};
 
 use anyhow::{Context as _, Result};
 use tokio::process::{Child, Command};
 
 use super::within;
+
+static OMP_BINARY_ENV: Once = Once::new();
+
+/// Exposes the Cargo-built acceptance host to production same-binary child
+/// resolvers for the lifetime of this test process.
+pub fn install_omp_binary_env() -> io::Result<()> {
+	let path = omp_binary()?;
+	OMP_BINARY_ENV.call_once(|| {
+		// Every proof installs the same immutable Cargo path before opening an
+		// environment authority, and the value is never changed or removed.
+		unsafe {
+			std::env::set_var("CARGO_BIN_EXE_omp", path);
+		}
+	});
+	Ok(())
+}
 
 /// Resolves the worker-capable application binary Cargo builds with `omp-e2e`
 /// tests.

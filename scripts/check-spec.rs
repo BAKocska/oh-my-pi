@@ -26,11 +26,20 @@ use toml::Value as TomlValue;
 
 const AGENT_ALLOWED_WORLD_EDGES: &[&str] = &["omp-env", "omp-storage"];
 const AGENT_DENIED_DIRECT_EDGES: &[&str] = &["omp-docserver", "omp-shell-engine", "omp-walker"];
+// Pre-existing Python operations awaiting Part 1 rows. This fixed debt baseline
+// may shrink; newly frozen CONTROL operations cannot be added without a row.
+const PYTHON_SPEC_BASELINE: &[&str] = &[
+	"omp.state.cas_get",
+	"omp.state.cas_put",
+	"omp.state_dir",
+	"omp.urls.read",
+];
 
 fn main() {
 	let root = workspace_root();
 	let mut failures = Vec::new();
 	check_symbols(&root, &mut failures);
+	check_python_surface_specs(&root, &mut failures);
 	check_agent_dependencies(&root, &mut failures);
 
 	if !failures.is_empty() {
@@ -231,6 +240,56 @@ fn check_symbols(root: &Path, failures: &mut Vec<String>) {
 		}
 	}
 }
+
+fn check_python_surface_specs(root: &Path, failures: &mut Vec<String>) {
+	let package = root.join("crates/py/python/omp");
+	let mut pending = vec![package];
+	while let Some(path) = pending.pop() {
+		let entries = fs::read_dir(&path)
+			.unwrap_or_else(|error| panic!("cannot read Python package {}: {error}", path.display()));
+		for entry in entries {
+			let entry = entry.expect("Python package entry is unreadable");
+			let path = entry.path();
+			if path.is_dir() {
+				pending.push(path);
+				continue;
+			}
+			if path.extension().and_then(|extension| extension.to_str()) != Some("py") {
+				continue;
+			}
+			let source = fs::read_to_string(&path)
+				.unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+			let mut rest = source.as_str();
+			while let Some(offset) = rest.find("_control_request(") {
+				rest = &rest[offset + "_control_request(".len()..];
+				let Some(start) = rest.find('"') else {
+					break;
+				};
+				let quoted = &rest[start + 1..];
+				let Some(end) = quoted.find('"') else {
+					break;
+				};
+				let operation = &quoted[..end];
+				if operation.starts_with("omp.")
+					&& !operation.ends_with('.')
+					&& operation
+						.bytes()
+						.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+					&& !PYTHON_SPEC_BASELINE.contains(&operation)
+					&& operation_spec(operation).is_none()
+				{
+					let relative = path.strip_prefix(root).unwrap_or(&path);
+					failures.push(format!(
+						"Python CONTROL operation {operation} in {} has no generated spec row",
+						relative.display()
+					));
+				}
+				rest = &quoted[end + 1..];
+			}
+		}
+	}
+}
+
 
 fn check_agent_dependencies(root: &Path, failures: &mut Vec<String>) {
 	let workspace = parse_toml(&root.join("Cargo.toml"));

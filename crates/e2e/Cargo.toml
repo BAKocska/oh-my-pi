@@ -20,6 +20,12 @@ test = false
 name = "pooling-bench"
 path = "src/bin/pooling_bench.rs"
 test = false
+
+[[bin]]
+name = "pooling-runner"
+path = "src/bin/pooling_runner.rs"
+test = false
+
 [[bin]]
 name = "omp_e2e_host"
 path = "src/bin/omp_e2e_host.rs"

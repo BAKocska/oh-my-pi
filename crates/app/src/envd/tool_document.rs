@@ -2498,10 +2498,9 @@ fn write_archive_member_blocking(
 				.map_err(|error| special_fault(error.to_string()))?;
 			Ok(())
 		},
-		(other, _) => Err(special_fault(format!(
-			"{} archives are read-only",
-			<&'static str>::from(other)
-		))),
+		(other, _) => {
+			Err(special_fault(format!("{} archives are read-only", <&'static str>::from(other))))
+		},
 	})?;
 
 	let canonical = std::fs::canonicalize(&final_path).unwrap_or(final_path);

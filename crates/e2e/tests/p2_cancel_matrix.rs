@@ -33,7 +33,7 @@ use omp_app::{
 	},
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, Str};
-use omp_e2e::support::omp_binary;
+use omp_e2e::support::{AllowAdmission, install_omp_binary_env, omp_binary};
 use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_proto::{
 	SCHEMA_REV,
@@ -166,6 +166,7 @@ struct LocalEnv {
 
 impl LocalEnv {
 	async fn start(registry: Registry, worker: ExtHostConfig) -> Self {
+		install_omp_binary_env().expect("expose worker-capable host");
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("environment state scratch directory");
 		let server = Arc::new(
@@ -174,6 +175,7 @@ impl LocalEnv {
 				.expect("open real local environment authority"),
 		);
 		let (client, transport) = EnvClient::in_process(64);
+		client.set_admitter(AllowAdmission);
 		let server_task = {
 			let server = Arc::clone(&server);
 			tokio::spawn(async move { server.serve_in_process(transport).await })

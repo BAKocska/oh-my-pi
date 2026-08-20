@@ -39,6 +39,19 @@ class DialogUnavailable(RuntimeError):
     """An arbitrary overlay has no attached presentation client."""
 
 
+@dataclass(frozen=True, slots=True)
+class StatusFacts:
+    """Read-only session facts used to render retained status chrome."""
+
+    model: str
+    context_tokens: int
+    context_window: int
+    cost_usd: float
+    total_tokens: int
+    tokens_per_second: float
+    dropped: int = 0
+
+
 def _validate(source: str) -> None:
     """Reject structurally malformed TML without admitting a second markup grammar."""
     stack: list[tuple[str, int]] = []
@@ -181,8 +194,12 @@ class Phase(StrEnum):
 
 
 class Level(StrEnum):
-    """Notice severity."""
-    DEBUG = "debug"; INFO = "info"; WARN = "warn"; ERROR = "error"
+    """Notice severity, including the documented ``warning`` string alias."""
+    DEBUG = "debug"; INFO = "info"; WARN = "warn"; WARNING = "warn"; ERROR = "error"
+
+    @classmethod
+    def _missing_(cls, value: object) -> Level | None:
+        return cls.WARN if value == "warning" else None
 
 
 class Urgency(StrEnum):
@@ -486,7 +503,7 @@ def unmount_all() -> None:
 def focus_slot(key: str) -> None: """Synchronously focus an eligible rail."""; _emit("focus_slot", key=key)
 def blur_slot() -> None: """Synchronously return focus to the composer."""; _emit("blur_slot")
 def set_status(key: str, content: Tml | None, *, order: int = 100, side: Slot = Slot.STATUS_RIGHT) -> None: """Synchronously update a status contribution."""; _emit("set_status", key=key, content=content, order=order, side=side)
-def notify(message: str | Tml, *, level: Level = Level.INFO, title: str | None = None, desktop: bool = False, sound: Sound | None = None, urgency: Urgency | None = None) -> None: """Synchronously queue a fail-open notice effect."""; _emit("notify", message=message, level=level, title=title, desktop=desktop, sound=sound, urgency=urgency)
+def notify(message: str | Tml, *, level: Level | str = Level.INFO, title: str | None = None, desktop: bool = False, sound: Sound | None = None, urgency: Urgency | None = None) -> None: """Synchronously queue a fail-open notice effect."""; _emit("notify", message=message, level=Level(level), title=title, desktop=desktop, sound=sound, urgency=urgency)
 def set_working_message(content: Tml | None) -> None: """Synchronously replace the working-message banner."""; _emit("set_working_message", content=content)
 def set_title(title: str | None) -> None: """Synchronously update the terminal title."""; _emit("set_title", title=title)
 def bell() -> None: """Synchronously queue one attention bell."""; _emit("bell")

@@ -32,11 +32,17 @@ use crate::exthost::control::{
 	usage_rows,
 };
 
+#[derive(Clone)]
+struct AgentBinding {
+	id:     u64,
+	sender: ControlSender,
+}
+
 /// Environment-owned endpoint for external Journal CONTROL requests.
 #[derive(Clone)]
 pub struct ExternalJournalActor {
 	sender: flume::Sender<ExternalJournalCall>,
-	agent:  Arc<Mutex<Option<ControlSender>>>,
+	agent:  Arc<Mutex<Option<AgentBinding>>>,
 }
 
 impl ExternalJournalActor {
@@ -104,7 +110,11 @@ impl ExternalJournalActor {
 	/// # Errors
 	///
 	/// Refuses a second binding rather than transferring session authority.
-	pub(crate) fn bind_agent(&self, sender: ControlSender) -> Result<(), super::server::EnvdError> {
+	pub(crate) fn bind_agent(
+		&self,
+		id: u64,
+		sender: ControlSender,
+	) -> Result<(), super::server::EnvdError> {
 		let mut agent = self.agent.lock();
 		if agent.is_some() {
 			return Err(
@@ -114,8 +124,16 @@ impl ExternalJournalActor {
 				.into(),
 			);
 		}
-		*agent = Some(sender);
+		*agent = Some(AgentBinding { id, sender });
 		Ok(())
+	}
+
+	/// Releases a binding only when it is still owned by `id`.
+	pub(crate) fn unbind_agent(&self, id: u64) {
+		let mut agent = self.agent.lock();
+		if agent.as_ref().is_some_and(|binding| binding.id == id) {
+			*agent = None;
+		}
 	}
 }
 
@@ -132,7 +150,7 @@ async fn dispatch(
 	project_scope: &Str,
 	project_path: &Str,
 	catalog: &Mutex<ArtifactCatalog>,
-	agent: &Mutex<Option<ControlSender>>,
+	agent: &Mutex<Option<AgentBinding>>,
 	reply: &flume::Sender<Result<JournalHostEnvelope, Str>>,
 ) -> Result<(), Str> {
 	match request {
@@ -559,10 +577,11 @@ fn state_owner(state: Option<&StateStore>) -> Result<&StateStore, Str> {
 	})
 }
 
-fn bound_agent(agent: &Mutex<Option<ControlSender>>) -> Result<ControlSender, Str> {
+fn bound_agent(agent: &Mutex<Option<AgentBinding>>) -> Result<ControlSender, Str> {
 	agent
 		.lock()
-		.clone()
+		.as_ref()
+		.map(|binding| binding.sender.clone())
 		.ok_or_else(|| Str::new_static("agent journal CONTROL is not bound"))
 }
 
@@ -715,7 +734,7 @@ mod tests {
 		})
 		.expect("journal");
 		let (control, mailbox) = omp_agent::control::channel();
-		actor.bind_agent(control).expect("bind agent owner");
+		actor.bind_agent(1, control).expect("bind agent owner");
 		let owner = tokio::spawn(async move {
 			loop {
 				match mailbox.handle_next(&mut journal).await {
@@ -740,7 +759,28 @@ mod tests {
 			response.body,
 			Some(journal_host_envelope::Body::JournalRow(row)) if row.terminal
 		));
+		let (contender, _contender_mailbox) = omp_agent::control::channel();
+		assert!(
+			actor.bind_agent(2, contender).is_err(),
+			"a concurrent owner must not replace the live binding"
+		);
 		owner.abort();
+		actor.unbind_agent(1);
+
+		let (successor, _successor_mailbox) = omp_agent::control::channel();
+		actor
+			.bind_agent(2, successor)
+			.expect("bind successor after release");
+		actor.unbind_agent(1);
+		let (third, _third_mailbox) = omp_agent::control::channel();
+		assert!(
+			actor.bind_agent(3, third.clone()).is_err(),
+			"a stale release must not clear the successor"
+		);
+		actor.unbind_agent(2);
+		actor
+			.bind_agent(3, third)
+			.expect("bind after successor release");
 	}
 
 	#[tokio::test]

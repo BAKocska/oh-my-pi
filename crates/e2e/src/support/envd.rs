@@ -10,11 +10,11 @@ use std::{
 use anyhow::{Context as _, Result};
 use bytes::BytesMut;
 use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
-use omp_env::{BlobDownloadEvent, EnvClient};
+use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
 use omp_proto::{
 	SCHEMA_REV,
 	blob::v1::GetRequest,
-	env::v1::{ClientFrame, ClientHello, ServerFrame},
+	env::v1::{Admission, AdmitInvocation, ClientFrame, ClientHello, ServerFrame},
 	prost::Message,
 };
 use omp_tool::Registry;
@@ -26,10 +26,27 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{DEFAULT_TIMEOUT, OwnedProcess, Scratch, omp_binary, within};
+use super::{
+	DEFAULT_TIMEOUT, OwnedProcess, Scratch, install_omp_binary_env, omp_binary, within,
+};
 
 const FRAME_LIMIT: usize = 64 * 1024 * 1024;
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Test policy that accepts legitimate invocation admission queries unchanged.
+pub struct AllowAdmission;
+
+impl Admitter for AllowAdmission {
+	type Future<'client> = std::future::Ready<Admission>;
+
+	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client> {
+		std::future::ready(Admission {
+			invocation_id: query.invocation_id,
+			allow: true,
+			..Admission::default()
+		})
+	}
+}
 
 /// Real local environment authority with framed UDS transport and owned
 /// worker/process resources.
@@ -46,6 +63,7 @@ impl EnvHarness {
 	/// Opens all real local environment resources and completes a framed client
 	/// hello.
 	pub async fn spawn(scratch: &Scratch, _registry: Registry) -> Result<Self> {
+		install_omp_binary_env().context("exposing worker-capable host")?;
 		let socket = scratch.socket("env.sock");
 		let ext_host_config = ExtHostConfig::new(
 			omp_binary().context("resolving worker-capable host")?,
@@ -103,6 +121,7 @@ impl EnvHarness {
 		scratch: &Scratch,
 		docserver_socket: &Path,
 	) -> Result<ProcessEnvHarness> {
+		install_omp_binary_env().context("exposing worker-capable host")?;
 		let socket = scratch.socket("env-attached.sock");
 		let mut command = Command::new(omp_binary().context("resolving worker-capable host")?);
 		command
@@ -291,6 +310,7 @@ pub async fn connect_env(path: &Path) -> Result<(EnvClient, JoinHandle<io::Resul
 	let (outgoing, requests) = flume::bounded(64);
 	let (responses, incoming) = flume::bounded(64);
 	let client = EnvClient::from_channels(outgoing, incoming);
+	client.set_admitter(AllowAdmission);
 	let task = tokio::spawn(bridge_frames(stream, requests, responses));
 	Ok((client, task))
 }

@@ -28,10 +28,30 @@ from _omp import (
 _T = TypeVar("_T", bound=type)
 _ToolKey = tuple[str, str, int]
 _HookKey = tuple[str, str]
+_EntryKindKey = tuple[str, str]
 _ServiceKey = tuple[str, int]
+_ProviderKey = str
+_WorkerKey = str
 
 MAX_DECLARATIONS = 256
 """Maximum decorator declarations accepted from one extension."""
+
+@dataclass(frozen=True, slots=True)
+class ManifestTableSchema:
+    """Ratified authoring spelling for one projected manifest table."""
+
+    table: str
+    fields: frozenset[str]
+
+
+TELEMETRY_MANIFEST_SCHEMA = ManifestTableSchema(
+    table="telemetry",
+    fields=frozenset({"kinds", "scope", "queue", "overflow"}),
+)
+"""The ratified ``[[telemetry]]`` authoring row and its required fields."""
+
+SCHEDULES_PROJECT_CAPABILITY = "schedules:project"
+"""The ratified capability key granting project-scoped schedules."""
 
 
 class DeclarationDrift(RuntimeError):
@@ -65,14 +85,72 @@ class ServiceDefinition:
     implementation: type
     methods: tuple[str, ...]
 
+@dataclass(frozen=True, slots=True)
+class EntryKindDefinition:
+    """One import-time ``@omp.entry_kind`` declaration."""
+
+    name: str
+    rev: str
+    display: bool | None
+    spill: bool
+    implementation: type
+@dataclass(frozen=True, slots=True)
+class ProviderDefinition:
+    """One import-time ``@omp.provider`` declaration."""
+
+    id: str
+    spec: object
+    implementation: type
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDefinition:
+    """One import-time ``omp.workers.declare`` declaration."""
+
+    name: str
+    spec: object
+
+
+
+@dataclass(frozen=True, slots=True)
+class TelemetryDefinition:
+    """One import-time ``@omp.telemetry`` subscription declaration."""
+
+    kinds: tuple[str, ...]
+    scope: str
+    queue: int
+    overflow: str
+    batch: int | None
+    replay: bool
+    replay_limit: int
+    handler: object
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSlotDefinition:
+    """One import-time ``@omp.prompt_slot`` contribution declaration."""
+
+    slot: str
+    priority: int
+    cls: str
+    renderer: object
+
+
+
+
 
 @dataclass(frozen=True, slots=True)
 class DeclarationSnapshot:
     """Immutable view of the complete decorator registry."""
 
+    entry_kinds: tuple[EntryKindDefinition, ...]
     tools: frozenset[_ToolKey]
     hooks: frozenset[_HookKey]
     services: frozenset[_ServiceKey]
+    telemetry: tuple[TelemetryDefinition, ...] = ()
+    prompt_slots: tuple[PromptSlotDefinition, ...] = ()
+    providers: tuple[ProviderDefinition, ...] = ()
+    workers: tuple[WorkerDefinition, ...] = ()
 
 
 class DeclarationRegistry:
@@ -80,7 +158,11 @@ class DeclarationRegistry:
 
     __slots__ = (
         "_configured",
+        "_entry_kinds",
+        "_providers",
         "_hooks",
+        "_prompt_slots",
+        "_telemetry",
         "_manifest_hooks",
         "_manifest_requires",
         "_manifest_services",
@@ -89,6 +171,7 @@ class DeclarationRegistry:
         "_service_instances",
         "_services",
         "_tools",
+        "_workers",
         "_verified",
     )
 
@@ -97,8 +180,13 @@ class DeclarationRegistry:
         self._sealed = False
         self._verified = False
         self._tools: dict[_ToolKey, object] = {}
+        self._entry_kinds: dict[_EntryKindKey, EntryKindDefinition] = {}
+        self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookKey, object] = {}
+        self._telemetry: dict[str, TelemetryDefinition] = {}
+        self._prompt_slots: dict[tuple[str, str], PromptSlotDefinition] = {}
         self._services: dict[_ServiceKey, ServiceDefinition] = {}
+        self._workers: dict[_WorkerKey, WorkerDefinition] = {}
         self._service_instances: dict[_ServiceKey, object] = {}
         self._manifest_tools: frozenset[_ToolKey] = frozenset()
         self._manifest_hooks: frozenset[_HookKey] = frozenset()
@@ -158,6 +246,108 @@ class DeclarationRegistry:
         self._insert(self._hooks, key, handler, "hook")
         return handler
 
+    def register_telemetry(
+        self,
+        kinds: Iterable[object],
+        scope: object,
+        queue: int,
+        overflow: object,
+        batch: int | None,
+        replay: bool,
+        replay_limit: int,
+        handler: object,
+    ) -> object:
+        """Records one static telemetry subscription during import."""
+
+        key = f"{getattr(handler, '__module__', '')}.{getattr(handler, '__qualname__', '')}"
+        definition = TelemetryDefinition(
+            tuple(str(kind) for kind in kinds),
+            str(scope),
+            queue,
+            str(overflow),
+            batch,
+            replay,
+            replay_limit,
+            handler,
+        )
+        self._insert(self._telemetry, key, definition, "telemetry")
+        return handler
+
+    def register_prompt_slot(
+        self, slot: str, priority: int, cls: object, renderer: object
+    ) -> object:
+        """Records one static prompt-slot contribution during import."""
+
+        callable_key = (
+            f"{getattr(renderer, '__module__', '')}."
+            f"{getattr(renderer, '__qualname__', '')}"
+        )
+        key = (slot, callable_key)
+        definition = PromptSlotDefinition(slot, priority, str(cls), renderer)
+        self._insert(self._prompt_slots, key, definition, "prompt slot")
+        return renderer
+
+    def register_entry_kind(
+        self,
+        name: str,
+        rev: str,
+        display: bool | None,
+        spill: bool,
+        implementation: type,
+    ) -> type:
+        """Records one typed journal entry declaration during import."""
+
+        key = _entry_kind_key(name, rev)
+        if not isinstance(implementation, type):
+            raise TypeError("@omp.entry_kind may decorate only a class")
+        if display is not None and not isinstance(display, bool):
+            raise TypeError("entry kind display must be bool or None")
+        if not isinstance(spill, bool):
+            raise TypeError("entry kind spill must be bool")
+        definition = EntryKindDefinition(
+            key[0], key[1], display, spill, implementation
+        )
+        self._insert(self._entry_kinds, key, definition, "entry kind")
+        return implementation
+
+
+    def entry_kind_definitions(self) -> tuple[EntryKindDefinition, ...]:
+        """Returns entry-kind rows in deterministic declaration-key order."""
+
+        return tuple(self._entry_kinds[key] for key in sorted(self._entry_kinds))
+    def register_provider(
+        self, provider_id: str, spec: object, implementation: type
+    ) -> type:
+        """Record one pure provider catalog declaration during import."""
+
+        if not isinstance(provider_id, str) or not provider_id:
+            raise ValueError("provider id must be a non-empty string")
+        if not isinstance(implementation, type):
+            raise TypeError("@omp.provider may decorate only a class")
+        definition = ProviderDefinition(provider_id, spec, implementation)
+        self._insert(self._providers, provider_id, definition, "provider")
+        return implementation
+
+    def provider_definitions(self) -> tuple[ProviderDefinition, ...]:
+        """Return provider declarations in deterministic identifier order."""
+
+        return tuple(self._providers[key] for key in sorted(self._providers))
+
+    def register_worker(self, name: str, spec: object) -> None:
+        """Record one worker manifest projection during import."""
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("worker name must be a non-empty string")
+        self._insert(self._workers, name, WorkerDefinition(name, spec), "worker")
+
+    def worker_definitions(self) -> tuple[WorkerDefinition, ...]:
+        """Return worker declarations in deterministic name order."""
+
+        return tuple(self._workers[key] for key in sorted(self._workers))
+
+
+
+
     def register_service(self, name: str, rev: int, implementation: type) -> type:
         """Records and validates an async service implementation."""
 
@@ -197,9 +387,16 @@ class DeclarationRegistry:
         """Returns the current declaration existence sets without mutation."""
 
         return DeclarationSnapshot(
+            entry_kinds=self.entry_kind_definitions(),
             tools=frozenset(self._tools),
             hooks=frozenset(self._hooks),
             services=frozenset(self._services),
+            telemetry=tuple(self._telemetry[key] for key in sorted(self._telemetry)),
+            prompt_slots=tuple(
+                self._prompt_slots[key] for key in sorted(self._prompt_slots)
+            ),
+            providers=self.provider_definitions(),
+            workers=self.worker_definitions(),
         )
 
 
@@ -237,7 +434,17 @@ class DeclarationRegistry:
         kind: str,
     ) -> None:
         self._ensure_open()
-        if len(self._tools) + len(self._hooks) + len(self._services) >= MAX_DECLARATIONS:
+        if (
+            len(self._tools)
+            + len(self._hooks)
+            + len(self._services)
+            + len(self._entry_kinds)
+            + len(self._telemetry)
+            + len(self._prompt_slots)
+            + len(self._providers)
+            + len(self._workers)
+            >= MAX_DECLARATIONS
+        ):
             raise DeclarationLimit(
                 f"extension exceeds the {MAX_DECLARATIONS} declaration limit"
             )
@@ -368,6 +575,26 @@ def service(name: str, *, rev: int) -> Callable[[_T], _T]:
     return decorate
 
 
+def entry_kind(
+    name: str,
+    *,
+    rev: str,
+    display: bool | None = None,
+    spill: bool = True,
+) -> Callable[[_T], _T]:
+    """Declare a typed, versioned session-journal entry kind."""
+
+    key = _entry_kind_key(name, rev)
+
+    def decorate(implementation: _T) -> _T:
+        registry.register_entry_kind(
+            key[0], key[1], display, spill, implementation
+        )
+        return implementation
+
+    return decorate
+
+
 async def dispatch_service(
     request_id: int,
     name: str,
@@ -407,6 +634,17 @@ def _hook_key(event: str, phase: object) -> _HookKey:
     return event, value.lower()
 
 
+def _entry_kind_key(name: str, rev: str) -> _EntryKindKey:
+    if not isinstance(name, str) or "." not in name or name.startswith("omp."):
+        raise ValueError("entry kind name must be a non-core globally qualified name")
+    if not isinstance(rev, str):
+        raise TypeError("entry kind rev must be a string")
+    family, separator, number = rev.rpartition(".")
+    if not separator or not family or not number.isascii() or not number.isdigit():
+        raise ValueError("entry kind rev must have the form '<family>.<n>'")
+    return name, rev
+
+
 def _service_key(name: str, rev: int) -> _ServiceKey:
     if not name or "." not in name:
         raise ValueError("service name must be globally qualified")
@@ -426,11 +664,13 @@ __all__ = (
     "DeclarationSnapshot",
     "MAX_DECLARATIONS",
     "QuotaExceeded",
+    "EntryKindDefinition",
     "QuotaStatus",
     "ResourceReceipt",
     "ServiceClient",
     "ServiceDefinition",
     "Services",
+    "entry_kind",
     "configure_manifest",
     "dispatch_service",
     "freeze_declarations",

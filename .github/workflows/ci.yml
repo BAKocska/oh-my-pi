@@ -7,6 +7,7 @@ on:
       - ".cargo/**"
       - ".github/workflows/ci.yml"
       - "crates/**"
+      - "examples/**"
       - "fixtures/**"
       - "docs/py/**"
       - "scripts/**"
@@ -21,6 +22,7 @@ on:
       - ".cargo/**"
       - ".github/workflows/ci.yml"
       - "crates/**"
+      - "examples/**"
       - "fixtures/**"
       - "scripts/**"
       - "docs/py/**"
@@ -117,6 +119,9 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --exclude omp-e2e --locked
+
+      - name: Gate frozen Python examples
+        run: python3 scripts/check-python-examples.py
 
       - name: Compile acceptance proofs
         run: cargo test -p omp-e2e --tests --no-run --locked

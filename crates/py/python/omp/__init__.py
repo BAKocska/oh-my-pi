@@ -66,8 +66,37 @@ class Fault:
             raise TypeError("Fault is a marker base; instantiate a frozen dataclass subclass")
         return super().__new__(cls)
 
+    def useless(self) -> bool:
+        """Return whether compaction may omit this value's prompt projection."""
+        return False
 
 
+
+
+from ._context import Context
+from ._errors import NotWiredError
+from ._verdicts import (
+    ArtifactLifetime,
+    BlobPart,
+    Budget,
+    Dialect,
+    Faulted,
+    JsonPart,
+    LiftedCall,
+    ModelClass,
+    Ok,
+    Part,
+    Payload,
+    PromptCaps,
+    RecordedCall,
+    Rev,
+    SPILL_INLINE_LIMIT,
+    SpillBudget,
+    TextPart,
+    ToolIdentity,
+    View,
+    prompt,
+)
 
 class StateScopeDenied(OmpError):
     """The authenticated principal may not access a requested state scope."""
@@ -179,11 +208,40 @@ class Capability(_StrEnum):
 
     PLACE_ENV = "place_env"
     PLACE_WORKER = "place_worker"
+    SCHEDULES_PROJECT = "schedules:project"
 
 # Importing these frozen modules only creates declarations and namespace values.
 from . import env as env
 from . import urls as urls
+from . import journal as journal
+from .journal import EntryId, JournalEntry
 from . import ui as ui
+from . import agents as agents
+from . import prompts as prompts
+from . import sessions as sessions
+from . import telemetry as telemetry
+from .prompts import (
+    PromptContext,
+    SlotClass,
+    SlotClassConflict,
+    UnknownSlot,
+    prompt_slot,
+)
+from .sessions import (
+    Bucket,
+    GroupBy,
+    SessionFilter,
+    SessionInfo,
+    SessionKind,
+    SessionStatus,
+    TitleSource,
+    Usage,
+    UsageAccuracy,
+    UsageBucket,
+    UsageQuery,
+    UsageReport,
+)
+from .telemetry import PromptFingerprint
 renderer = ui.renderer
 from .urls import (
     Scheme,
@@ -208,6 +266,7 @@ from ._registry import (
     ServiceDefinition,
     Services,
     resources,
+    entry_kind,
     service,
     services,
     registry as _declarations,
@@ -231,6 +290,58 @@ from .placement import (
     worker_state,
     workers,
 )
+from .devices import (
+    AvailabilityDelta,
+    DynamicDeviceParent,
+    MountSpec,
+    devices,
+)
+from .provider import (
+    AccountScope,
+    Api,
+    AuthMode,
+    AuthSpec,
+    CacheRetention,
+    Cap,
+    ChatCaps,
+    CodecProfile,
+    CompatFlags,
+    Completion,
+    ContextSpec,
+    Cost,
+    CostTier,
+    CredentialSource,
+    Effort,
+    LogprobCaps,
+    ManagementSpec,
+    Modality,
+    ModelSpec,
+    OAuthFlow,
+    OAuthFlowKind,
+    OAuthSpec,
+    Operation,
+    PrincipalResolution,
+    PromptCacheCaps,
+    ProviderSpec,
+    ReasoningCaps,
+    RefreshBehavior,
+    RouteSpec,
+    ServerStateCaps,
+    ServiceTier,
+    ThinkingMode,
+    ThinkingSpec,
+    TokenPlacement,
+    ToolCaps,
+    ToolFeature,
+    ToolSchemaFlavor,
+    Transport,
+    provider,
+)
+from . import hooks as hooks
+from .hooks import *
+from . import events as events
+from .events import *
+
 
 from . import index as index
 from . import packages as packages
@@ -254,6 +365,34 @@ def device(name: str, *, family: str, rev: int, place: str | Place = "host"):
         function.__omp_place__ = parsed
         _declarations.register_tool(name, family, rev, function)
         return function
+    return decorate
+
+
+def tool(
+    name: str | _Any | None = None,
+    *,
+    kind: str = "soft",
+    effects: _Any = None,
+    tier: _Any = None,
+    rev: int = 1,
+):
+    """Declare an ergonomic host leaf on the existing device registry path."""
+    if kind not in {"soft", "hard"}:
+        raise ValueError("tool kind must be 'soft' or 'hard'")
+    if not isinstance(rev, int) or isinstance(rev, bool):
+        raise TypeError("tool rev must be int")
+
+    def decorate(function: _Any) -> _Any:
+        tool_name = function.__name__ if name is None or callable(name) else name
+        function.__omp_place__ = Place.HOST
+        function.__omp_tool_kind__ = kind
+        function.__omp_effects__ = effects
+        function.__omp_tier__ = tier
+        _declarations.register_tool(tool_name, "", rev, function)
+        return function
+
+    if callable(name):
+        return decorate(name)
     return decorate
 urls._bind_scheme_source(_scheme_snapshot)
 
@@ -314,14 +453,72 @@ __all__ = (
     "EffectsNotAuthorized",
     "EnvPath",
     "EnvUnavailable",
+    "EntryId",
+    "ArtifactLifetime",
+    "BlobPart",
+    "Budget",
+    "Context",
     "Fault",
+    "Bucket",
+    "AccountScope",
+    "Api",
+    "AuthMode",
+    "AuthSpec",
+    "AvailabilityDelta",
+    "CacheRetention",
+    "Cap",
+    "ChatCaps",
+    "CodecProfile",
+    "CompatFlags",
+    "Completion",
+    "ContextSpec",
+    "Cost",
+    "CostTier",
+    "CredentialSource",
+    "DynamicDeviceParent",
+    "Effort",
+    "LogprobCaps",
+    "ManagementSpec",
+    "Modality",
+    "ModelSpec",
+    "MountSpec",
+    "OAuthFlow",
+    "OAuthFlowKind",
+    "OAuthSpec",
+    "Operation",
+    "PrincipalResolution",
+    "PromptCacheCaps",
+    "ProviderSpec",
+    "ReasoningCaps",
+    "RefreshBehavior",
+    "RouteSpec",
+    "ServerStateCaps",
+    "ServiceTier",
+    "ThinkingMode",
+    "ThinkingSpec",
+    "TokenPlacement",
+    "ToolCaps",
+    "ToolFeature",
+    "ToolSchemaFlavor",
+    "Transport",
+    "GroupBy",
+    "Dialect",
+    "Faulted",
     "FrameTooLarge",
     "HistoryUrl",
     "HostDisconnected",
+    "JournalEntry",
     "InvocationPhase",
     "PHASE_LEGALITY_MATRIX",
     "LifecyclePhase",
     "ManifestError",
+    "JsonPart",
+    "LiftedCall",
+    "ModelClass",
+    "NotWiredError",
+    "PromptContext",
+    "PromptFingerprint",
+    "Ok",
     "OmpError",
     "OperationSpec",
     "MAX_DECLARATIONS",
@@ -340,14 +537,44 @@ __all__ = (
     "ServiceClient",
     "ServiceDefinition",
     "Services",
+    "Part",
+    "Payload",
+    "PromptCaps",
+    "RecordedCall",
+    "Rev",
+    "SPILL_INLINE_LIMIT",
+    "SpillBudget",
+    "TextPart",
+    "ToolIdentity",
+    "View",
     "StaleGeneration",
     "StateScope",
+    "SessionFilter",
+    "SessionInfo",
+    "SessionKind",
+    "SessionStatus",
+    "SlotClass",
+    "SlotClassConflict",
+    "TitleSource",
+    "UnknownSlot",
+    "Usage",
+    "UsageAccuracy",
+    "UsageBucket",
+    "UsageQuery",
+    "UsageReport",
     "StateScopeDenied",
     "Url",
     "UrlError",
     "TrustError",
     "WorkspaceUri",
     "env",
+    "agents",
+    "entry_kind",
+    "journal",
+    "prompts",
+    "prompt_slot",
+    "sessions",
+    "telemetry",
     "operation_spec",
     "resources",
     "service",
@@ -377,8 +604,12 @@ __all__ = (
     "WorkerState",
     "WorkerUnavailable",
     "device",
+    "prompt",
+    "tool",
     "worker_state",
     "workers",
+    "devices",
+    "provider",
     "DiagnosticCode",
     "Distribution",
     "FailureCode",
@@ -394,3 +625,4 @@ __all__ = (
     "index",
     "packages",
 )
+__all__ += hooks.__all__ + events.__all__ + ("hooks", "events")

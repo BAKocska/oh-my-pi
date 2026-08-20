@@ -294,9 +294,8 @@ impl ProjectEnvironment {
 		let eval_control = server.eval_control();
 		let (client, transport) = EnvClient::in_process(64);
 		let in_process_server = Arc::clone(&server);
-		let in_process = tokio::spawn(async move {
-			in_process_server.serve_in_process(transport).await;
-		});
+		let in_process =
+			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
 		let shutdown = CancellationToken::new();
 		let mut tasks = vec![in_process];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
@@ -333,6 +332,7 @@ impl ProjectEnvironment {
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
 		});
+		hello(&client).await?;
 		let shutdown = CancellationToken::new();
 		let uds_server = Arc::clone(&server);
 		let uds_shutdown = shutdown.clone();
@@ -383,6 +383,7 @@ impl ProjectEnvironment {
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
 		});
+		hello(&client).await?;
 		let shutdown = CancellationToken::new();
 		let owner_server = Arc::clone(&server);
 		let owner_shutdown = shutdown.clone();
@@ -446,16 +447,17 @@ impl ProjectEnvironment {
 		self.lifecycle.server.sessions_index()
 	}
 
-	/// Binds authenticated extension CONTROL to the active Agent Journal.
+	/// Binds authenticated extension CONTROL to the active Agent Journal until
+	/// the returned sole-owner lease is dropped.
 	///
 	/// # Errors
 	///
-	/// Fails if a journal runtime was already bound or child activation already
-	/// began.
+	/// Fails if a journal runtime is concurrently owned or an initial binding
+	/// is attempted after child activation began.
 	pub(crate) fn bind_agent_control(
 		&self,
 		sender: omp_agent::control::ControlSender,
-	) -> Result<(), EnvdError> {
+	) -> Result<server::AgentControlBinding, EnvdError> {
 		self.lifecycle.server.bind_agent_control(sender)
 	}
 

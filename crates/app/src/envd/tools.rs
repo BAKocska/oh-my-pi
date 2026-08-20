@@ -284,25 +284,39 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
 	Ok((registry, eval_host, eval_control, checkpoint_control))
 }
+#[derive(Clone)]
+struct CheckpointBinding {
+	id:     u64,
+	sender: omp_agent::ControlSender,
+}
 
 /// Late-bound bridge from environment-owned checkpoint tools to the active
 /// Agent CONTROL mailbox.
 #[derive(Clone, Default)]
 pub struct AgentCheckpointControl {
-	sender: Arc<RwLock<Option<omp_agent::ControlSender>>>,
+	sender: Arc<RwLock<Option<CheckpointBinding>>>,
 }
 
 impl AgentCheckpointControl {
 	/// Replaces the active session binding.
-	pub fn bind(&self, sender: omp_agent::ControlSender) {
-		*self.sender.write() = Some(sender);
+	pub fn bind(&self, id: u64, sender: omp_agent::ControlSender) {
+		*self.sender.write() = Some(CheckpointBinding { id, sender });
+	}
+
+	/// Releases the binding only when it is still owned by `id`.
+	pub fn unbind(&self, id: u64) {
+		let mut binding = self.sender.write();
+		if binding.as_ref().is_some_and(|binding| binding.id == id) {
+			*binding = None;
+		}
 	}
 
 	fn sender(&self) -> Result<omp_agent::ControlSender, Str> {
 		self
 			.sender
 			.read()
-			.clone()
+			.as_ref()
+			.map(|binding| binding.sender.clone())
 			.ok_or_else(|| Str::new_static("active Agent CONTROL is not bound"))
 	}
 }

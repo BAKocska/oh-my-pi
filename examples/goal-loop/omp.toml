@@ -1,0 +1,17 @@
+id = "examples.goal-loop"
+entry = "goal_loop"
+kind = "extension"
+version = "0.1.0"
+description = "A session-scoped autonomous goal loop with Core-owned stall and continuation accounting."
+requires = []
+capabilities = []
+
+[[tools]]
+name = "goal"
+kind = "soft"
+
+[[hooks]]
+event = "agent_settled"
+phase = "domain"
+order = 0
+failure = "settle"

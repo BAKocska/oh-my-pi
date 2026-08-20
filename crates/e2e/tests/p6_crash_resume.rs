@@ -40,7 +40,9 @@ use omp_app::{
 	envd::{server::EnvServer, worker::ExtHostConfig},
 };
 use omp_core::Str;
-use omp_e2e::support::{Scratch, ScriptedGateway, omp_binary};
+use omp_e2e::support::{
+	AllowAdmission, Scratch, ScriptedGateway, install_omp_binary_env, omp_binary,
+};
 use omp_env::EnvClient;
 use omp_llm_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
@@ -272,7 +274,8 @@ impl Tool for HangingTool {
 						.append(true)
 						.open(&self.effects)
 						.expect("open effects marker");
-					writeln!(file, "{call}").expect("record committed effect");
+					let record = format!("{call}\n");
+					file.write_all(record.as_bytes()).expect("record committed effect");
 					file.sync_data().expect("sync committed effect");
 					futures::future::pending::<()>().await;
 				},
@@ -515,6 +518,7 @@ async fn resume_rejects_changed_toolset_before_opening_any_authority() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	assert_fixed_turn_ids();
+	install_omp_binary_env().expect("expose worker-capable host");
 	let scratch = Scratch::new().expect("binary resume scratch");
 	let project = std::fs::canonicalize(scratch.project()).expect("canonical scratch project");
 	let omp_dir = project.join(".omp");
@@ -566,8 +570,8 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	let first_debug = scratch.socket("binary-first-debug.sock");
 	let mut first = ChatPty::spawn(&binary, &args, &project, &first_debug);
 	let mut first_ui =
-		ChatDebug::connect(&first_debug, Instant::now() + Duration::from_secs(15), &mut first);
-	first_ui.wait_text(BINARY_SESSION, Duration::from_secs(10));
+		ChatDebug::connect(&first_debug, Instant::now() + Duration::from_secs(30), &mut first);
+	first_ui.wait_text("idle", Duration::from_secs(10));
 	first_ui.keys("'exercise binary resume' enter");
 	first_ui.wait_text("exercise binary resume", Duration::from_secs(10));
 	let pending_turn = wait_pending_turn(&journal_path, Duration::from_secs(10)).await;
@@ -604,7 +608,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	let second_debug = scratch.socket("binary-resume-debug.sock");
 	let mut second = ChatPty::spawn(&binary, &args, &project, &second_debug);
 	let mut second_ui =
-		ChatDebug::connect(&second_debug, Instant::now() + Duration::from_secs(15), &mut second);
+		ChatDebug::connect(&second_debug, Instant::now() + Duration::from_secs(30), &mut second);
 	second_ui.wait_text("binary resume outcome", Duration::from_secs(30));
 	second_ui.request(json!({ "op": "quit" }));
 	drop(second_ui);
@@ -617,7 +621,28 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 }
 fn binary_gateway_tools() -> Arc<Registry> {
 	let mut registry = Registry::new();
-	for name in ["edit", "eval", "glob", "grep", "read", "shell", "write"] {
+	for name in [
+		"read",
+		"edit",
+		"shell",
+		"grep",
+		"glob",
+		"write",
+		"eval",
+		"todo",
+		"ask",
+		"fetch",
+		"think",
+		"yield",
+		"checkpoint",
+		"rewind",
+		"hub",
+		"image_gen",
+		"tts",
+		"report_issue",
+		"vibe",
+		"dyn",
+	] {
 		registry
 			.register_worker(
 				ToolSpec {
@@ -737,12 +762,16 @@ impl ChatDebug {
 								.read_to_string(&mut stderr)
 								.expect("read early binary stderr");
 						}
+						let envd = fs::read_to_string(&process.envd_log).unwrap_or_default();
 						panic!(
 							"binary chat exited before debug socket: {status}; connect: \
-							 {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+							 {error}\nstdout:\n{stdout}\nstderr:\n{stderr}\nenvd:\n{envd}"
 						);
 					}
-					assert!(Instant::now() < deadline, "binary chat debug socket timed out: {error}");
+					if Instant::now() >= deadline {
+						let envd = fs::read_to_string(&process.envd_log).unwrap_or_default();
+						panic!("binary chat debug socket timed out: {error}\nenvd:\n{envd}");
+					}
 					std_thread::sleep(Duration::from_millis(20));
 				},
 			}
@@ -793,13 +822,13 @@ impl ChatDebug {
 		}
 	}
 }
-
 struct ChatPty {
 	child:       Child,
 	_master:     std::os::fd::OwnedFd,
 	_slave:      std::os::fd::OwnedFd,
 	stop_reader: Arc<AtomicUsize>,
 	reader:      Option<std_thread::JoinHandle<()>>,
+	envd_log:    PathBuf,
 }
 
 impl ChatPty {
@@ -833,6 +862,9 @@ impl ChatPty {
 			.parent()
 			.expect("project parent")
 			.join("binary-home");
+		let envd_log = omp_app::project_state::directory(&home.join("data"), project)
+			.expect("binary chat project state")
+			.join("envd.log");
 		fs::create_dir_all(&home).expect("create binary chat home");
 		let mut command = Command::new(binary);
 		command
@@ -849,7 +881,14 @@ impl ChatPty {
 			.stderr(Stdio::piped())
 			.process_group(0);
 		let child = command.spawn().expect("spawn real omp chat");
-		Self { child, _master: pty.master, _slave: pty.slave, stop_reader, reader: Some(reader) }
+		Self {
+			child,
+			_master: pty.master,
+			_slave: pty.slave,
+			stop_reader,
+			reader: Some(reader),
+			envd_log,
+		}
 	}
 
 	fn stop(&self) {
@@ -1067,6 +1106,7 @@ fn receipt_child(root: &Path, crash: bool) {
 }
 
 async fn batch_child(root: &Path, create: bool) {
+	install_omp_binary_env().expect("expose worker-capable host");
 	let journal_path = root.join("journal.jsonl");
 	let journal = if create {
 		Journal::create(&journal_path, &header(root, "batch")).expect("create batch journal")
@@ -1105,6 +1145,7 @@ async fn batch_child(root: &Path, create: bool) {
 		.expect("real local environment host"),
 	);
 	let (env, transport) = EnvClient::in_process(64);
+	env.set_admitter(AllowAdmission);
 	let host = Arc::clone(&server);
 	let server_task = tokio::spawn(async move { host.serve_in_process(transport).await });
 	env.hello(ClientHello {

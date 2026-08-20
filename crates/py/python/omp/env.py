@@ -339,12 +339,13 @@ def _local_path(path: EnvPath) -> Path:
 class Doc:
     """A revisioned document lease owned by the Environment."""
 
-    __slots__ = ("_lease", "path", "head")
+    __slots__ = ("_lease", "path", "revision", "uri")
 
-    def __init__(self, lease: Any, path: EnvPath, head: Any = None) -> None:
+    def __init__(self, lease: Any, path: EnvPath, revision: Any = None) -> None:
         self._lease = lease
         self.path = path
-        self.head = head
+        self.revision = revision
+        self.uri = path.uri
 
     async def read_bytes(self, *, revision: Any = None) -> bytes:
         """Read this lease at its head or an explicitly pinned revision."""
@@ -380,8 +381,8 @@ class Doc:
 
     async def refresh(self) -> Any:
         """Refresh and return the current committed revision."""
-        self.head = await _request("omp.env.docs.Doc.refresh", lease=self._lease)
-        return self.head
+        self.revision = await _request("omp.env.docs.Doc.refresh", lease=self._lease)
+        return self.revision
 
     async def close(self) -> None:
         """Close the lease idempotently."""
@@ -464,7 +465,7 @@ class _Docs:
             return result
         if not isinstance(result, Mapping) or "lease" not in result:
             raise TypeError("document backend returned an invalid open receipt")
-        return Doc(result["lease"], path, result.get("head"))
+        return Doc(result["lease"], path, result.get("revision"))
 
     def transaction(self, *, txn_id: bytes | None = None) -> Txn:
         """Create an atomic document transaction handle."""
@@ -552,13 +553,13 @@ class _Lsp:
         """Return servers currently bound to a path."""
         return await _request("omp.env.lsp.bindings", path=_env_path(path))
 
-    async def request(self, server: str, method: str, params: Any, **options: Any) -> Any:
+    async def request(self, server: object, method: str, params: Any, **options: Any) -> Any:
         """Issue a revision-aware LSP request."""
         return await _request(
             "omp.env.lsp.request", server=server, method=method, params=params, **options
         )
 
-    async def notify(self, server: str, method: str, params: Any) -> None:
+    async def notify(self, server: object, method: str, params: Any) -> None:
         """Issue an LSP notification."""
         await _request("omp.env.lsp.notify", server=server, method=method, params=params)
 
@@ -660,9 +661,9 @@ class Process:
         """Yield named-process lifecycle transitions."""
         return _stream("omp.env.Process.states", name=self.name)
 
-    async def write(self, data: bytes) -> None:
-        """Write process stdin."""
-        await _request("omp.env.Process.write", name=self.name, data=data)
+    async def send(self, data: bytes) -> None:
+        """Send bytes to process stdin."""
+        await _request("omp.env.Process.send", name=self.name, data=data)
 
     async def signal(self, signal: str) -> None:
         """Signal the Environment-owned process group."""

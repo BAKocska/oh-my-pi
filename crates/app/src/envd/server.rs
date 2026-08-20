@@ -71,6 +71,7 @@ const INVOCATION_RESPONSE_SEND_GRACE: Duration = Duration::from_millis(250);
 const WORKER_LAYER_CEILING: u64 = 8;
 const MAX_CONCURRENT_SPAWNS: u64 = 4;
 static NEXT_CONNECTION_OWNER: AtomicU64 = AtomicU64::new(1);
+static NEXT_AGENT_CONTROL_BINDING: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default)]
 struct InvocationExecutionPolicy {
@@ -458,6 +459,19 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 	}
 }
 
+/// Sole-owner lease for Agent CONTROL routes installed in one environment.
+#[must_use = "dropping the binding releases Agent CONTROL routing"]
+pub(crate) struct AgentControlBinding {
+	server: Arc<EnvServer>,
+	id:     u64,
+}
+
+impl Drop for AgentControlBinding {
+	fn drop(&mut self) {
+		self.server.release_agent_control(self.id);
+	}
+}
+
 /// Owner-local `env/v1` dispatch state serving one project environment.
 pub struct EnvServer {
 	identity:            ServerIdentity,
@@ -593,6 +607,7 @@ impl EnvServer {
 		let session_id = ext_host_config.session_id.clone();
 		let (sessions_index, state_store) = open_journal_authorities(state_dir, true)?;
 		let authority = Arc::new(AuthorityTable::default());
+		ext_host_config.bind_workspace_root(workspace.root());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
@@ -684,6 +699,7 @@ impl EnvServer {
 		let writer = doc_connections.is_none();
 		let (sessions_index, state_store) = open_journal_authorities(state_dir, writer)?;
 		let authority = Arc::new(AuthorityTable::default());
+		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
@@ -849,23 +865,33 @@ impl EnvServer {
 	}
 
 	/// Binds the active Agent Journal mailbox to authenticated extension
-	/// CONTROL.
+	/// CONTROL until the returned lease is dropped.
 	///
 	/// # Errors
 	///
-	/// Fails if journal routing was already bound or an extension child already
-	/// activated.
+	/// Fails if journal routing is concurrently owned or an initial binding is
+	/// attempted after extension child activation.
 	pub(crate) fn bind_agent_control(
-		&self,
+		self: &Arc<Self>,
 		sender: omp_agent::control::ControlSender,
-	) -> Result<(), EnvdError> {
-		self.journal_external.bind_agent(sender.clone())?;
-		self.ext_hosts.bind_journal_runtime(JournalRuntime {
+	) -> Result<AgentControlBinding, EnvdError> {
+		let id = NEXT_AGENT_CONTROL_BINDING.fetch_add(1, Ordering::Relaxed);
+		self.journal_external.bind_agent(id, sender.clone())?;
+		if let Err(error) = self.ext_hosts.bind_journal_runtime(id, JournalRuntime {
 			agent:    sender.clone(),
 			external: self.journal_external.sender(),
-		})?;
-		self.checkpoint_control.bind(sender);
-		Ok(())
+		}) {
+			self.journal_external.unbind_agent(id);
+			return Err(error.into());
+		}
+		self.checkpoint_control.bind(id, sender);
+		Ok(AgentControlBinding { server: Arc::clone(self), id })
+	}
+
+	fn release_agent_control(&self, id: u64) {
+		self.ext_hosts.unbind_journal_runtime(id);
+		self.journal_external.unbind_agent(id);
+		self.checkpoint_control.unbind(id);
 	}
 
 	/// Binds extension device availability to the active Agent turn boundary.
@@ -4128,10 +4154,15 @@ fn spawn_worker_invocation(
 					break;
 				},
 				Some(WorkerEvent::Aborted(abort)) => {
-					let reason = if abort.effects_unknown {
-						omp_tool::Abort::EffectsUnknown { reason: abort.reason }
+					let reason = if cancel_requested {
+						Str::new_static("environment invocation cancelled")
 					} else {
-						omp_tool::Abort::Skipped { reason: abort.reason }
+						abort.reason
+					};
+					let reason = if abort.effects_unknown {
+						omp_tool::Abort::EffectsUnknown { reason }
+					} else {
+						omp_tool::Abort::Skipped { reason }
 					};
 					send_abort_verdict(&responses, request_id, &invocation_id, reason).await;
 					break;
@@ -5678,7 +5709,7 @@ async fn connect_or_start_docserver(
 		return Ok((documents, None));
 	}
 	if let Some(parent) = socket.parent() {
-		ensure_directory(parent)?;
+		std::fs::create_dir_all(parent)?;
 	}
 
 	let shutdown = CancellationToken::new();

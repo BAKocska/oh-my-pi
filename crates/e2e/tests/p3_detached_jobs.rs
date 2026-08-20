@@ -18,8 +18,9 @@ use omp_agent::{
 use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
 use omp_core::Str;
 use omp_e2e::support::{
-	Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient, omp_binary,
-	outcome_event, tool_call_item, user_item,
+	AllowAdmission, Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
+	accepted_event, install_omp_binary_env, omp_binary, outcome_event, tool_call_item, turn_event,
+	user_item,
 };
 use omp_env::{BlobDownloadEvent, EnvClient, ProcessAttachmentEvent};
 use omp_llm_inference::{
@@ -65,6 +66,7 @@ struct RealEnv {
 
 impl RealEnv {
 	async fn spawn() -> Self {
+		install_omp_binary_env().expect("expose worker-capable host");
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("environment state directory");
 		let server = Arc::new(
@@ -142,6 +144,7 @@ async fn connect_env(
 	name: &str,
 ) -> (EnvClient, tokio::task::JoinHandle<()>) {
 	let (client, transport) = EnvClient::in_process(64);
+	client.set_admitter(AllowAdmission);
 	let host = Arc::clone(server);
 	let task = tokio::spawn(async move { host.serve_in_process(transport).await });
 	client
@@ -184,23 +187,38 @@ fn end_outcome(head: u64) -> inference::Outcome {
 	}
 }
 
-fn shell_call(name: &str, command: String) -> thread::Item {
-	tool_call_item(
-		2,
-		"shell-detached",
-		&ToolIdentity {
-			name: Str::new_static("shell"),
-			rev:  omp_tool::Rev { family: Str::default(), n: 1 },
-		},
-		Bytes::from(
-			serde_json::to_vec(&serde_json::json!({
-				"command": command,
-				"detach": true,
-				"name": name,
-			}))
-			.expect("shell args serialize"),
-		),
-	)
+fn shell_turn(name: &str, command: String) -> ScriptedTurn {
+	let identity = ToolIdentity {
+		name: Str::new_static("shell"),
+		rev:  omp_tool::Rev { family: Str::default(), n: 1 },
+	};
+	let args = Bytes::from(
+		serde_json::to_vec(&serde_json::json!({
+			"command": command,
+			"async": true,
+			"name": name,
+		}))
+		.expect("shell args serialize"),
+	);
+	let call = tool_call_item(2, "shell-detached", &identity, args.clone());
+	ScriptedTurn::events([
+		accepted_event(false),
+		turn_event(inference::turn_event::Event::PartStart(inference::PartStart {
+			index:        0,
+			kind:         inference::part_start::Kind::ToolCall as i32,
+			tool_call_id: "shell-detached".to_owned(),
+			tool_name:    "shell".to_owned(),
+		})),
+		turn_event(inference::turn_event::Event::PartDelta(inference::PartDelta {
+			index: 0,
+			chunk: args,
+		})),
+		turn_event(inference::turn_event::Event::PartEnd(inference::PartEnd {
+			index:     0,
+			signature: Bytes::new(),
+		})),
+		outcome_event(tool_use_outcome(call, 3)),
+	])
 }
 
 fn tool_use_outcome(mut call: thread::Item, head: u64) -> inference::Outcome {
@@ -491,7 +509,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	);
 	let detached_gate = Gate::default();
 	let initial_client = ScriptedTurnClient::new([
-		ScriptedTurn::events([outcome_event(tool_use_outcome(shell_call(process_name, command), 3))]),
+		shell_turn(process_name, command),
 		ScriptedTurn::steps([
 			ScriptedStep::Wait(detached_gate.clone()),
 			ScriptedStep::from(outcome_event(end_outcome(4))),
@@ -506,7 +524,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		CAPS_BASE,
 	);
 	let events = agent.events().subscribe_lossless();
-	let detached_start = tokio::spawn(async move {
+	let mut detached_start = tokio::spawn(async move {
 		tokio::time::timeout(
 			LIMIT,
 			agent.submit(
@@ -516,14 +534,18 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		)
 		.await
 	});
-	detached_gate
-		.wait_arrived(LIMIT)
-		.await
-		.expect("detached result follow-up reached provider");
+	tokio::select! {
+		arrival = detached_gate.wait_arrived(LIMIT) => {
+			arrival.expect("detached result follow-up reached provider");
+		},
+		result = &mut detached_start => {
+			panic!("detached-start submit ended before its follow-up gate: {result:?}");
+		},
+	}
 	let captures = initial_capture.captures();
 	assert_eq!(captures.len(), 2);
 	let result = tool_result(&delta(&captures[1].input).append, "shell-detached");
-	assert!(!result.is_error);
+	assert!(!result.is_error, "detached shell failed: {result:?}");
 	let job = detached_ref(result);
 	assert_eq!(job.id, format!("{process_name}#1").as_str());
 	assert_eq!(job.owner, JobOwner::NamedProcess {

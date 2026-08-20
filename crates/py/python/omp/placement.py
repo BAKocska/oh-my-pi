@@ -2,7 +2,12 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Callable, Iterable, TypeVar, ClassVar
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Mapping, TypeVar
+
+from _omp import Duration
+
+from ._registry import registry
 
 class PlaceKind(StrEnum):
     """Execution locality for a decorated device."""
@@ -64,26 +69,40 @@ Site.LOCAL = Site(SiteKind.LOCAL)  # type: ignore[attr-defined]
 
 @dataclass(frozen=True, slots=True)
 class WorkerResources:
-    """Requested worker resource limits."""
+    """Requested worker limits, projected to Rust ``WorkerLimits``."""
     memory_bytes: int | None = None
     cpu_shares: float | None = None
-    wall_clock: Any = None
+    open_files: int | None = None
+    wall_clock: Duration | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerSpec:
     """Manifest-declared persistent worker; detached is intentionally absent."""
     name: str
     site: Site = Site.ENV
     boot: Any = None
-    idle_ttl: Any = None
+    idle_ttl: Duration = Duration("7m")
     max_concurrency: int = 1
     max_calls: int | None = None
     restart: Restart = Restart.NO
     resources: WorkerResources = field(default_factory=WorkerResources)
     cwd: Any = None
-    env_delta: tuple[tuple[str, str | None], ...] = ()
+    env_delta: Mapping[str, str | None] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     readonly: bool = False
     unmanaged: bool = False
     warm: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("worker name is required")
+        if self.max_concurrency < 1:
+            raise ValueError("worker max_concurrency must be positive")
+        if self.max_calls is not None and self.max_calls < 1:
+            raise ValueError("worker max_calls must be positive")
+        object.__setattr__(self, "env_delta", MappingProxyType(dict(self.env_delta)))
 @dataclass(frozen=True, slots=True)
 class WorkerInfo:
     """A generation-fenced worker observation."""
@@ -104,16 +123,24 @@ class WorkerHandle:
     def __init__(self, name: str, generation: int = 0, site: Site = Site.ENV) -> None: self.name, self.generation, self.site = name, generation, site
     async def call(self, function: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T: return await workers._call(self.name, function, args, kwargs)
     async def map(self, function: Callable[[_T], Any], values: Iterable[_T], *, concurrency: int | None = None) -> list[Any]:
-        """Map calls with bounded worker-side concurrency."""
+        """Map calls serially; ``concurrency`` is reserved until the Part 3 supervisor lands."""
         if concurrency is not None and concurrency < 1: raise ValueError("concurrency must be positive")
         return [await self.call(function, value) for value in values]
 class _Workers:
-    """Host-installed WorkerOp DATA registry."""
+    """Worker declaration table and host-installed WorkerOp DATA registry."""
     RESULT_SPILL_BYTES = 1024 * 1024
+    DEFAULT_IDLE_TTL = Duration("7m")
     __slots__ = ("_transport", "_unmanaged")
     def __init__(self) -> None: self._transport: Any = None; self._unmanaged = False
+    def declare(self, spec: WorkerSpec) -> None:
+        """Record one worker manifest projection during IMPORT."""
+        if not isinstance(spec, WorkerSpec):
+            raise TypeError("omp.workers.declare requires a WorkerSpec")
+        registry.register_worker(spec.name, spec)
     def install(self, transport: Any, *, unmanaged: bool = False) -> None: self._transport, self._unmanaged = transport, unmanaged
-    def get(self, name: str) -> WorkerHandle: return WorkerHandle(name)
+    async def get(self, name: str) -> WorkerHandle:
+        """Resolve a named worker handle through the asynchronous worker surface."""
+        return WorkerHandle(name)
     async def _call(self, name: str, function: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str, Any]) -> _T:
         if self._transport is None:
             from omp_remote import RemoteTraceback
