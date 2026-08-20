@@ -23,6 +23,7 @@ from _omp import (
 from . import limits as _limits
 from . import Fault
 from ._errors import NotWiredError
+from ._verdicts import BlobPart, TextPart
 from .policy import PolicyDenied
 
 
@@ -153,7 +154,7 @@ _DEFAULT = object()
 
 
 async def completion(
-    prompt: object,
+    prompt: str | Sequence[TextPart | BlobPart],
     *,
     role: str = "smol",
     system: str | None = None,
@@ -165,7 +166,14 @@ async def completion(
     deadline: Duration = Duration("10s"),
     labels: Mapping[str, str] | None = None,
 ) -> Completion:
-    """Request a budgeted, stateless completion through the host."""
+    """Request a budgeted stateless completion from text or typed media parts."""
+    if not isinstance(prompt, str):
+        if not isinstance(prompt, Sequence) or any(
+            not isinstance(part, (TextPart, BlobPart)) for part in prompt
+        ):
+            raise TypeError(
+                "completion prompt must be str or a sequence of TextPart and BlobPart values"
+            )
     del prompt, role, system, choices, schema, default, scope, max_output_tokens, deadline, labels
     raise NotWiredError("omp.agents.completion")
 

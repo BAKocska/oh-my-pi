@@ -15,12 +15,14 @@ call form one host transition, one catalog notification, and one journal item.
 ``enable`` and ``disable`` are convenience batch constructors over that same
 operation.  Thus dynamic MCP leaves use the ordinary ``omp.devices`` mounted
 set rather than maintaining a second registry or re-registering on reconnect.
-The Part 2 host arm is not present in this freeze half, so every post-FREEZE
-method raises :class:`omp.NotWiredError` at CALL time.
+The Part 2 host arm is not present in this freeze half, so mutating post-FREEZE
+methods raise :class:`omp.NotWiredError` at CALL time. Catalog listing remains
+a synchronous read over frozen declarations and any installed host view.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import contextvars
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
@@ -33,6 +35,7 @@ from .placement import Place
 from .policy import Tier
 
 
+HARD_SLOT_BUDGET = 8
 EXTERNAL_SUMMARY_CAP = 200
 PER_DEVICE_CAP = 10_000
 
@@ -214,6 +217,74 @@ class DeviceInfo:
     schema_tokens: int
 
 
+_catalog_view: contextvars.ContextVar[tuple[DeviceInfo, ...] | None] = (
+    contextvars.ContextVar("omp_device_catalog_view", default=None)
+)
+
+
+def _install_catalog_view(rows: Iterable[DeviceInfo] | None) -> None:
+    """Install the host's immutable device-catalog view for this invocation."""
+    if rows is None:
+        _catalog_view.set(None)
+        return
+    frozen = tuple(rows)
+    if any(not isinstance(row, DeviceInfo) for row in frozen):
+        raise TypeError("device catalog rows must be DeviceInfo values")
+    _catalog_view.set(frozen)
+
+
+def _declared_rows() -> tuple[DeviceInfo, ...]:
+    snapshot = registry.snapshot()
+    states = {
+        key: (mounted, reason) for key, mounted, reason in snapshot.device_states
+    }
+    extension_id = registry.extension_id or ""
+    provenance = Provenance(
+        publisher="",
+        extension_id=extension_id,
+        version="",
+        artifact_digest="",
+        layer="extension",
+        tier="extension",
+        generation=0,
+    )
+    rows: list[DeviceInfo] = []
+    for definition in snapshot.device_definitions:
+        key = (definition.name, definition.family, definition.rev)
+        mounted, reason = states[key]
+        root, separator, subpath = definition.name.partition("/")
+        body = definition.body
+        rows.append(
+            DeviceInfo(
+                name=definition.name,
+                family=definition.family,
+                rev=definition.rev,
+                identity=(
+                    f"{definition.name}@"
+                    f"{definition.family or definition.name}/{definition.rev}"
+                ),
+                claimant=extension_id,
+                path=ToolPath(root, subpath if separator else None),
+                summary=definition.summary,
+                place=definition.place,
+                precedence=definition.precedence,
+                tier=definition.tier,
+                effects=definition.effects,
+                mounted=mounted,
+                enabled=mounted,
+                available=mounted,
+                reason=reason,
+                shadowed_by=None,
+                source=extension_id,
+                provenance=provenance,
+                slotted=getattr(body, "__omp_tool_kind__", "soft") == "hard",
+                schema_bytes=0,
+                schema_tokens=0,
+            )
+        )
+    return tuple(rows)
+
+
 class Device:
     """Provide the live handle returned by ``@omp.device``."""
 
@@ -257,7 +328,8 @@ class Device:
         self.family = family
         self.rev = rev
         self.identity = f"{name}@{family or name}/{rev}"
-        self.path = ToolPath(name)
+        root, separator, subpath = name.partition("/")
+        self.path = ToolPath(root, subpath if separator else None)
         self.place = place
         self.precedence = precedence
         self.replaces = replaces
@@ -287,13 +359,68 @@ class Device:
         )
         self.enabled = False
 
-    def subtool(self, name: str) -> ToolPath:
-        """Return a typed child path below this device."""
+    def subtool(self, name: str) -> Callable[[Callable[..., Any]], Device]:
+        """Declare a static child device below this device's path."""
         try:
             sub = _subpath(name)
         except (TypeError, ValueError) as error:
             raise DeviceError(str(error)) from error
-        return ToolPath(self.name, sub)
+        child_name = f"{self.name}/{sub}"
+        parent = registry.device_definition(self.name, self.family, self.rev)
+
+        def decorate(body: Callable[..., Any]) -> Device:
+            if not callable(body):
+                raise TypeError("Device.subtool may decorate only a callable")
+            from ._registry import DeviceDefinition
+
+            docs = getattr(body, "__doc__", None)
+            summary = None
+            if isinstance(docs, str):
+                summary = next(
+                    (line.strip() for line in docs.splitlines() if line.strip()),
+                    None,
+                )
+            handle = Device(
+                name=child_name,
+                family=self.family,
+                rev=self.rev,
+                place=self.place,
+                precedence=self.precedence,
+                replaces=None,
+                schema=None,
+                docs=docs,
+                summary=summary,
+                body=body,
+            )
+            definition = DeviceDefinition(
+                name=child_name,
+                family=self.family,
+                rev=self.rev,
+                place=self.place,
+                summary=summary,
+                docs=docs,
+                schema=None,
+                examples=(),
+                available=None,
+                precedence=self.precedence,
+                replaces=None,
+                intents=parent.intents,
+                effects=parent.effects,
+                tier=parent.tier,
+                deadline=parent.deadline,
+                aliases=None,
+                body=body,
+            )
+            registry.register_tool(
+                child_name,
+                self.family,
+                self.rev,
+                handle,
+                definition=definition,
+            )
+            return handle
+
+        return decorate
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Invoke the decorated body directly in process."""
@@ -368,6 +495,7 @@ class DynamicDeviceParent:
 class Devices:
     """Static parent declarations plus the session-scoped mounted-set surface."""
 
+    HARD_SLOT_BUDGET = HARD_SLOT_BUDGET
     EXTERNAL_SUMMARY_CAP = EXTERNAL_SUMMARY_CAP
     PER_DEVICE_CAP = PER_DEVICE_CAP
 
@@ -405,10 +533,25 @@ class Devices:
         """Recompute ordinary availability predicates as one transition."""
         raise NotWiredError("omp.devices.refresh")
 
-    async def list(self, *, mounted_only: bool = True) -> tuple[DeviceInfo, ...]:
+    def list(self, *, mounted_only: bool = True) -> tuple[DeviceInfo, ...]:
         """Return immutable catalog rows, optionally including unmounted claims."""
-        del mounted_only
-        raise NotWiredError("omp.devices.list")
+        declared = _declared_rows()
+        installed = _catalog_view.get()
+        if installed is None:
+            rows = declared
+        else:
+            rows_by_identity = {str(row.path): row for row in installed}
+            rows_by_identity.update(
+                {
+                    str(row.path): row
+                    for row in declared
+                    if str(row.path) not in rows_by_identity
+                }
+            )
+            rows = tuple(rows_by_identity.values())
+        if mounted_only:
+            return tuple(row for row in rows if row.mounted)
+        return rows
 
 
 # One namespace instance ensures every dynamic path uses the ordinary mounted set.
@@ -428,6 +571,7 @@ __all__ = (
     "DocEffects",
     "DynamicDeviceParent",
     "EXTERNAL_SUMMARY_CAP",
+    "HARD_SLOT_BUDGET",
     "Effects",
     "Example",
     "ExecEffects",

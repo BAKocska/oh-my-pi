@@ -25,6 +25,9 @@ from _omp import (
 )
 
 
+from ._errors import SpecError
+
+
 _T = TypeVar("_T", bound=type)
 _ToolKey = tuple[str, str, int]
 _HookKey = tuple[str, str]
@@ -100,7 +103,10 @@ class ProviderDefinition:
 
     id: str
     spec: object
-    implementation: type
+    implementation: type | None
+    priority: int
+    extends: str | None
+    replaces: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +195,7 @@ class TelemetryDefinition:
     scope: str
     queue: int
     overflow: str
+    coalesce_key: object | None
     batch: int | None
     replay: bool
     replay_limit: int
@@ -497,6 +504,7 @@ class DeclarationRegistry:
         scope: object,
         queue: int,
         overflow: object,
+        coalesce_key: object | None,
         batch: int | None,
         replay: bool,
         replay_limit: int,
@@ -510,6 +518,7 @@ class DeclarationRegistry:
             str(scope),
             queue,
             str(overflow),
+            coalesce_key,
             batch,
             replay,
             replay_limit,
@@ -561,16 +570,34 @@ class DeclarationRegistry:
 
         return tuple(self._entry_kinds[key] for key in sorted(self._entry_kinds))
     def register_provider(
-        self, provider_id: str, spec: object, implementation: type
-    ) -> type:
-        """Record one pure provider catalog declaration during import."""
+        self,
+        provider_id: str,
+        spec: object,
+        implementation: type | None = None,
+        *,
+        priority: int = 0,
+        extends: str | None = None,
+        replaces: str | None = None,
+    ) -> type | None:
+        """Record a data-only provider or bind its decorated implementation."""
 
         if not isinstance(provider_id, str) or not provider_id:
-            raise ValueError("provider id must be a non-empty string")
-        if not isinstance(implementation, type):
+            raise SpecError("provider id must be a non-empty string")
+        if implementation is not None and not isinstance(implementation, type):
             raise TypeError("@omp.provider may decorate only a class")
-        definition = ProviderDefinition(provider_id, spec, implementation)
-        self._insert(self._providers, provider_id, definition, "provider")
+        definition = ProviderDefinition(
+            provider_id, spec, implementation, priority, extends, replaces
+        )
+        existing = self._providers.get(provider_id)
+        if (
+            implementation is not None
+            and existing is not None
+            and existing.spec is spec
+            and existing.implementation is None
+        ):
+            self._providers[provider_id] = definition
+        else:
+            self._insert(self._providers, provider_id, definition, "provider")
         return implementation
 
     def provider_definitions(self) -> tuple[ProviderDefinition, ...]:

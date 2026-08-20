@@ -610,7 +610,7 @@ assert tuple(member.value for member in omp.RedirectTrust) == (
     "deny", "same_origin", "public_only",
 )
 expect_raises(
-    ValueError,
+    omp.SpecError,
     lambda: omp.DiscoverySpec(
         omp.DiscoveryKind.SPECIALIZED, "/models", "models",
         interval=omp.Duration("1s"),
@@ -638,7 +638,7 @@ assert https_route.trust.origin == "https://example.test"
 assert in_process_route.trust.origin == "local://synthetic-provider"
 assert loopback_route.trust.origin == "http://127.0.0.1:1234"
 expect_raises(
-    ValueError,
+    omp.SpecError,
     lambda: omp.RouteSpec(
         "remote-plain", "http://example.test/v1", omp.Api.OPENAI_CHAT,
         trust=omp.TrustDomain.loopback(),
@@ -691,7 +691,58 @@ asyncio.run(
     )
 )
 asyncio.run(expect_raises_async(omp.NotWiredError, omp.env.http_get("https://example.test")))
-expect_raises(omp.NotWiredError, lambda: omp.env.Process("p", 1).endpoint)
+process = omp.env.Process("p", 7)
+expect_raises(omp.NotWiredError, lambda: process.endpoint)
+asyncio.run(expect_raises_async(omp.NotWiredError, process.restart()))
+assert hasattr(omp.env.Run, "stdin") and not hasattr(omp.env.Run, "write")
+
+class ProcessProbeBackend:
+    def __init__(self):
+        self.calls = []
+
+    async def request(self, operation, arguments):
+        self.calls.append((operation, arguments))
+        if operation == "omp.env.Process.restart":
+            return {"name": "p", "generation": 8}
+        return process_info
+
+    def stream(self, operation, arguments):
+        self.calls.append((operation, arguments))
+        return ()
+
+async def exercise_process_fence(backend):
+    restarted = await process.restart()
+    assert restarted.name == "p" and restarted.generation == 8
+    await process.info()
+    async for _ in process.output(after=2):
+        pass
+    async for _ in process.states():
+        pass
+    await process.send(b"x")
+    await process.send_secret("token", "secret")
+    await process.signal("SIGTERM")
+    await process.stop(grace=omp.Duration("1s"))
+    await omp.env.Run(b"run").stdin(b"x")
+
+process_backend = ProcessProbeBackend()
+process_binding = omp.env._binding.set((process_backend, None))
+asyncio.run(exercise_process_fence(process_backend))
+omp.env._binding.reset(process_binding)
+process_operations = {
+    operation for operation, _ in process_backend.calls
+    if operation.startswith("omp.env.Process.")
+}
+assert process_operations == {
+    "omp.env.Process.restart", "omp.env.Process.info", "omp.env.Process.output",
+    "omp.env.Process.states", "omp.env.Process.send", "omp.env.Process.send_secret",
+    "omp.env.Process.signal", "omp.env.Process.stop",
+}
+assert all(
+    arguments["generation"] == 7
+    for operation, arguments in process_backend.calls
+    if operation.startswith("omp.env.Process.")
+)
+assert ("omp.env.Run.stdin", {"run": b"run", "data": b"x"}) in process_backend.calls
 
 # Secrets: typed declarations and Core-owned masking fail closed without host arms.
 assert omp.secrets is not None
@@ -710,7 +761,8 @@ devices_module = importlib.import_module("omp.devices")
 assert {"provenance", "slotted", "schema_bytes", "schema_tokens"} <= set(
 	devices_module.DeviceInfo.__dataclass_fields__
 )
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.devices.list()))
+assert not asyncio.iscoroutinefunction(omp.devices.list)
+assert any(row.name == "surface_device" for row in omp.devices.list())
 pty = omp.env.Pty(rows=24, columns=80)
 assert pty.rows == 24 and pty.columns == 80 and pty.terminal == "xterm-256color"
 path_meta = omp.env.PathMeta(
@@ -880,18 +932,18 @@ class OverlayProvider:
 assert overlay_handle(OverlayProvider) is OverlayProvider
 assert OverlayProvider.__omp_provider_extends__ == "overlay-provider"
 expect_raises(
-    ValueError,
+    omp.SpecError,
     lambda: omp.ProviderSpec(
         "overlay-provider", "Conflict", (),
         model_overlays=(model_overlay, model_overlay),
     ),
 )
 expect_raises(
-    ValueError,
+    omp.SpecError,
     lambda: omp.provider(overlay_spec),
 )
 expect_raises(
-    ValueError,
+    omp.SpecError,
     lambda: omp.ProviderSpec(
         "overlay-provider", "Alias Conflict", (),
         aliases=(
@@ -1028,8 +1080,298 @@ asyncio.run(
     )
 )
 
+# Round 5 devices: child declarations, synchronous snapshots, and slot budget.
+@surface_device.subtool("inspect/detail")
+async def inspect_surface_device():
+    """Inspect one nested surface-device leaf."""
+    return None
+
+
+declared_device_rows = omp.devices.list(mounted_only=False)
+assert str(inspect_surface_device.path) == "surface_device/inspect/detail"
+assert any(
+    row.path == inspect_surface_device.path for row in declared_device_rows
+)
+assert omp.devices.HARD_SLOT_BUDGET == 8
+assert omp.HARD_SLOT_BUDGET == 8
+
+host_catalog_row = dataclasses.replace(
+    declared_device_rows[0],
+    name="host_catalog_device",
+    identity="host_catalog_device@host/1",
+    path=omp.ToolPath("host_catalog_device"),
+)
+devices_module._install_catalog_view((host_catalog_row,))
+try:
+    merged_device_rows = omp.devices.list(mounted_only=False)
+finally:
+    devices_module._install_catalog_view(None)
+assert merged_device_rows[0] is host_catalog_row
+assert any(row.path == inspect_surface_device.path for row in merged_device_rows)
+
+# Round 5 merged catalog: resolved cards and a typed host-fed watch stream.
+catalog_card = omp.ModelCard(
+    id="acme/reasoner",
+    provider="acme",
+    model="reasoner",
+    name="Acme Reasoner",
+    family="acme",
+    facets=frozenset({omp.Facet.CHAT}),
+    inputs=frozenset({omp.Modality.TEXT}),
+    outputs=frozenset({omp.Modality.TEXT}),
+    reasoning=True,
+    efforts=(omp.Effort.LOW, omp.Effort.HIGH),
+    context_window=131072,
+    max_output_tokens=8192,
+    pricing=(omp.Price(omp.PriceUnit.MTOK_INPUT, 250_000_000),),
+    availability=provider_module.Availability.AVAILABLE,
+    source=omp.ModelCard.Source.EXTENSION,
+    blocked_until_ms=None,
+    deprecated=False,
+    updated_at_ms=1234,
+    supports_tools=True,
+    props={"acme/tier": "pro"},
+)
+assert catalog_card.id == "acme/reasoner"
+assert catalog_card.source is omp.ModelCard.Source.EXTENSION
+assert catalog_card.pricing[0].unit is omp.PriceUnit.MTOK_INPUT
+catalog_cursor = omp.Cursor(epoch=b"catalog-epoch", generation=7)
+catalog_event = omp.ModelEvent(cursor=catalog_cursor, upserted=catalog_card)
+assert catalog_event.upserted is catalog_card
+asyncio.run(
+    expect_raises_async(omp.NotWiredError, omp.models())
+)
+
+async def collect_unwired_model_events():
+    return [event async for event in omp.watch_models(catalog_cursor)]
+
+asyncio.run(
+    expect_raises_async(omp.NotWiredError, collect_unwired_model_events())
+)
+
+async def catalog_control_request(operation, **arguments):
+    assert operation == "omp.provider.watch_models"
+    assert arguments == {"since": catalog_cursor}
+    async def host_model_events():
+        yield catalog_event
+        yield {
+            "cursor": {"epoch": b"catalog-epoch", "generation": 8},
+            "removed_id": catalog_card.id,
+        }
+    return host_model_events()
+
+async def collect_model_events():
+    return [event async for event in omp.WatchModels(catalog_cursor)]
+
+original_provider_control_request = provider_module._provider_control_request
+provider_module._provider_control_request = catalog_control_request
+try:
+    catalog_events = asyncio.run(collect_model_events())
+finally:
+    provider_module._provider_control_request = original_provider_control_request
+assert catalog_events == [
+    catalog_event,
+    omp.ModelEvent(
+        cursor=omp.Cursor(epoch=b"catalog-epoch", generation=8),
+        removed_id=catalog_card.id,
+    ),
+]
+assert all(isinstance(event, omp.ModelEvent) for event in catalog_events)
+
+# Round 5 UI: typed message folds and host-composed renderer decoration.
+message_view = omp.MessageView(
+    id="message-1",
+    kind="assistant",
+    role="assistant",
+    text="original",
+)
+assert omp.MessageView is omp.ui.MessageView
+assert dataclasses.is_dataclass(message_view)
+assert (message_view.id, message_view.kind, message_view.role, message_view.text) == (
+    "message-1", "assistant", "assistant", "original",
+)
+
+@omp.renderer("__decorated_ui__", family="ui", rev=1, decorates=True)
+def decorated_ui_renderer(view, ctx):
+    return omp.ui.text("augmentation")
+
+decorated_registration = omp.ui._device_renderers[("__decorated_ui__", "ui", 1)]
+assert decorated_registration.function is decorated_ui_renderer
+assert decorated_registration.decorates is True
+assert decorated_registration.reduce is None
+assert decorated_ui_renderer.__omp_renderer_decorates__ is True
+
+# Round 5 telemetry: prompt slot facts, request timings/content, and coalescing survive freeze.
+slot_fingerprint = telemetry_module.PromptSlotFingerprint(
+	digest="ab" * 16,
+	size_bytes=128,
+	band=omp.SlotClass.STABLE,
+)
+prompt_fingerprint = telemetry_module.PromptFingerprint(
+	digest="cd" * 16,
+	slots={"workspace": slot_fingerprint},
+	changed=("workspace",),
+	prefix_stable_bytes=64,
+	cache_key="session-key",
+	retention="short",
+	mode="explicit",
+	ttl="thirty_minutes",
+	breakpoint="latest_stable_message",
+	breakpoint_indices=(0,),
+)
+degradation = telemetry_module.Degradation(
+	what="sampling.top_k",
+	detail="provider omitted top-k",
+	action=telemetry_module.DegradeAction.DROPPED,
+)
+model_request = telemetry_module.ModelRequest(
+	seq=7,
+	usage=telemetry_module.Tokens(input=4, output=2, total=6),
+	prompt=prompt_fingerprint,
+	served_model="acme/reasoner",
+	latency_ms=120,
+	ttft_ms=30,
+	degraded=(degradation,),
+)
+assert prompt_fingerprint.slots["workspace"] == slot_fingerprint
+assert slot_fingerprint.size_bytes == 128 and slot_fingerprint.band is omp.SlotClass.STABLE
+assert model_request.latency_ms == 120 and model_request.ttft_ms == 30
+assert model_request.degraded == (degradation,)
+assert model_request.request_content is None and model_request.response_content is None
+captured_request = dataclasses.replace(
+	model_request,
+	request_content=b"request",
+	response_content=b"response",
+)
+assert captured_request.request_content == b"request"
+assert captured_request.response_content == b"response"
+
+def request_coalesce_key(event):
+	return event.served_model
+
+@telemetry_module(
+	[telemetry_module.Kind.MODEL_REQUEST],
+	overflow=telemetry_module.Overflow.COALESCE_BY_KEY,
+	coalesce_key=request_coalesce_key,
+)
+async def coalesced_request_sink(event, ctx):
+	return None
+
+telemetry_snapshot = registry_module.registry.snapshot()
+coalesced_definition = next(
+	definition
+	for definition in telemetry_snapshot.telemetry
+	if definition.handler is coalesced_request_sink
+)
+assert coalesced_definition.coalesce_key is request_coalesce_key
+assert coalesced_definition.overflow == telemetry_module.Overflow.COALESCE_BY_KEY.value
+
+# Round 5 provider declarations, media operations, and typed completion parts.
+assert issubclass(omp.SpecError, omp.ExtensionError)
+assert not issubclass(omp.SpecError, ValueError)
+assert tuple(omp.CacheRetention) == (
+    omp.CacheRetention.REQUEST,
+    omp.CacheRetention.SESSION,
+    omp.CacheRetention.SHORT,
+    omp.CacheRetention.LONG,
+)
+cache_caps = omp.PromptCacheCaps(
+    frozenset({omp.CacheRetention.SESSION, omp.CacheRetention.SHORT}),
+    min_prefix_tokens=256,
+    max_breakpoints=4,
+)
+assert cache_caps.min_prefix_tokens == 256 and cache_caps.max_breakpoints == 4
+assert not hasattr(cache_caps, "minimum_prefix_tokens")
+
+speech_caps = omp.SpeechCaps(
+    frozenset({omp.SpeechFeature.STREAMING, omp.SpeechFeature.VOICE_SELECTION}),
+    ("alloy",),
+    frozenset({omp.AudioFormat.MP3}),
+    (24_000,),
+)
+transcription_caps = omp.TranscriptionCaps(
+    frozenset({
+        omp.TranscriptionFeature.TIMESTAMPS,
+        omp.TranscriptionFeature.LANGUAGE_HINT,
+    }),
+    frozenset({omp.AudioFormat.MP3, omp.AudioFormat.WAV}),
+    omp.Duration("1h"),
+)
+speech_model = omp.ModelSpec(
+    "round5-speech",
+    "Round 5 Speech",
+    (),
+    operations=frozenset({omp.Operation.SPEAK, omp.Operation.TRANSCRIBE}),
+    speech=speech_caps,
+    transcription=transcription_caps,
+)
+assert typing.get_type_hints(omp.ModelSpec)["speech"] == omp.SpeechCaps | None
+assert typing.get_type_hints(omp.ModelSpec)["transcription"] == omp.TranscriptionCaps | None
+expect_raises(
+    omp.SpecError,
+    lambda: omp.ProviderSpec(
+        "duplicate-models",
+        "Duplicate Models",
+        (),
+        models=(speech_model, speech_model),
+    ),
+)
+
+media_blob = omp.BlobRef(bytes(32), 3)
+speech_request = omp.SpeechRequest(
+    "round5-speech", "hello", "alloy", omp.AudioFormat.MP3,
+)
+speech_result = omp.SpeechResult(media_blob, omp.AudioFormat.MP3, 11)
+transcription_request = omp.TranscriptionRequest("round5-speech", media_blob, "en")
+transcription_result = omp.TranscriptionResult("hello", "en", 13)
+assert speech_result.audio is media_blob and transcription_result.text == "hello"
+
+bare_spec = omp.ProviderSpec(
+    "round5-bare-provider",
+    "Round 5 Bare Provider",
+    (),
+    models=(speech_model,),
+)
+bare_handle = omp.provider(bare_spec)
+bare_definition = next(
+    definition
+    for definition in registry_module.registry.snapshot().providers
+    if definition.id == bare_handle.id
+)
+assert bare_definition.spec is bare_spec and bare_definition.implementation is None
+assert (bare_definition.priority, bare_definition.extends, bare_definition.replaces) == (
+    0, None, None,
+)
+asyncio.run(
+    expect_raises_async(
+        omp.NotWiredError,
+        bare_handle.request(omp.Operation.SPEAK, speech_request),
+    )
+)
+asyncio.run(
+    expect_raises_async(
+        omp.NotWiredError,
+        bare_handle.request(omp.Operation.TRANSCRIBE, transcription_request),
+    )
+)
+completion_parts = (
+    omp.Part.text("describe the image"),
+    omp.Part.blob(media_blob, alt="image"),
+)
+asyncio.run(
+    expect_raises_async(
+        omp.NotWiredError,
+        omp.agents.completion(completion_parts, role="vision"),
+    )
+)
+asyncio.run(
+    expect_raises_async(TypeError, omp.agents.completion((object(),), role="vision"))
+)
+
 # FREEZE evaluates deferred availability exactly once and seals the projection.
 snapshot = registry_module.freeze_declarations()
+assert bare_definition in snapshot.providers
+assert ("surface_device/inspect/detail", "", 1) in snapshot.tools
 assert shortcut_definition in snapshot.shortcuts
 assert approver_definition in snapshot.approvers
 assert availability_calls == 1

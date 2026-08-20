@@ -133,7 +133,7 @@ class Fault:
 
 
 from ._context import Context
-from ._errors import ExtensionError, NotWiredError
+from ._errors import ExtensionError, SpecError, NotWiredError
 from ._scope import Trust
 from ._verdicts import (
     ArtifactLifetime,
@@ -178,7 +178,9 @@ def _install_control_backend(backend: _Any) -> None:
     from . import _context as _context_module
     from . import telemetry as _telemetry
     from . import ui as _ui
+    from .devices import _install_catalog_view
 
+    _install_catalog_view(getattr(backend, "device_catalog", None))
     _ui._install_effect_sink(getattr(backend, "effect", None))
     _telemetry._install_instrument_sink(getattr(backend, "instrument", None))
     _context_module._install_log_sink(getattr(backend, "log", None))
@@ -352,9 +354,11 @@ from .sessions import (
 )
 from .telemetry import PromptFingerprint
 renderer = ui.renderer
+message_renderer = ui.message_renderer
 command = ui.command
 shortcut = ui.shortcut
 DuplicateRenderer = ui.DuplicateRenderer
+MessageView = ui.MessageView
 from .urls import (
     Scheme,
     SchemeInfo,
@@ -493,6 +497,7 @@ from .devices import (
     DocsMode,
     DynamicDeviceParent,
     EXTERNAL_SUMMARY_CAP,
+    HARD_SLOT_BUDGET,
     Effects,
     Example,
     ExecEffects,
@@ -508,6 +513,7 @@ from .devices import (
 from .provider import (
     AccountScope,
     Api,
+    AudioFormat,
     AuthMode,
     AuthSpec,
     CacheRetention,
@@ -520,6 +526,7 @@ from .provider import (
     ContextSpec,
     Cost,
     CostTier,
+    Cursor,
     Credential,
     CredentialKind,
     CredentialSource,
@@ -530,6 +537,7 @@ from .provider import (
     DiscoveryQuery,
     DiscoverySpec,
     ErrorKind,
+    Facet,
     Failover,
     FailoverKind,
     Fallback,
@@ -539,10 +547,16 @@ from .provider import (
     ImageFormat,
     ImageRequest,
     ImageResult,
+    SpeechCaps,
+    SpeechFeature,
+    SpeechRequest,
+    SpeechResult,
     LoginRequest,
     LogprobCaps,
     ManagementSpec,
     Modality,
+    ModelCard,
+    ModelEvent,
     ModelOverlay,
     ModelPatch,
     ModelSpec,
@@ -555,6 +569,8 @@ from .provider import (
     OAuthSpec,
     Pagination,
     Operation,
+    Price,
+    PriceUnit,
     PrincipalResolution,
     PromptCacheCaps,
     ProviderSpec,
@@ -565,6 +581,7 @@ from .provider import (
     RefreshRequest,
     ProviderError,
     Retryability,
+    Role,
     RedirectTrust,
     RouteLimits,
     RouteRef,
@@ -573,6 +590,10 @@ from .provider import (
     ServerStateCaps,
     ServiceTier,
     SignRequest,
+    TranscriptionCaps,
+    TranscriptionFeature,
+    TranscriptionRequest,
+    TranscriptionResult,
     ThinkingMode,
     ThinkingSpec,
     TokenPlacement,
@@ -581,7 +602,10 @@ from .provider import (
     ToolSchemaFlavor,
     Transport,
     TrustDomain,
+    WatchModels,
+    models,
     provider,
+    watch_models,
 )
 from . import hooks as hooks
 from .hooks import *
@@ -851,6 +875,7 @@ __all__ = (
     "Bucket",
     "AccountScope",
     "Api",
+    "AudioFormat",
     "AuthMode",
     "AuthSpec",
     "Availability",
@@ -865,6 +890,7 @@ __all__ = (
     "ContextSpec",
     "Cost",
     "CostTier",
+    "Cursor",
     "Credential",
     "CredentialKind",
     "CredentialMeta",
@@ -885,19 +911,27 @@ __all__ = (
     "DocsMode",
     "DynamicDeviceParent",
     "Effects",
+    "HARD_SLOT_BUDGET",
     "Example",
     "ExecEffects",
     "Effort",
+    "Facet",
     "ImageCaps",
     "ImageFeature",
     "ImageFormat",
     "ImageRequest",
     "ImageResult",
+    "SpeechCaps",
+    "SpeechFeature",
+    "SpeechRequest",
+    "SpeechResult",
     "LoginRequest",
     "LogprobCaps",
     "InferenceEffects",
     "ManagementSpec",
     "Modality",
+    "ModelCard",
+    "ModelEvent",
     "ModelOverlay",
     "ModelPatch",
     "ModelSpec",
@@ -907,6 +941,8 @@ __all__ = (
     "OAuthSpec",
     "Operation",
     "Pagination",
+    "Price",
+    "PriceUnit",
     "PrincipalResolution",
     "Precedence",
     "PrecedenceConflict",
@@ -925,6 +961,11 @@ __all__ = (
     "ServerStateCaps",
     "ServiceTier",
     "SignRequest",
+    "SpecError",
+    "TranscriptionCaps",
+    "TranscriptionFeature",
+    "TranscriptionRequest",
+    "TranscriptionResult",
     "ThinkingMode",
     "ThinkingSpec",
     "TokenPlacement",
@@ -999,6 +1040,7 @@ __all__ = (
     "UsageBucket",
     "UsageQuery",
     "UsageReport",
+    "WatchModels",
     "StateScopeDenied",
     "Url",
     "UrlError",
@@ -1039,7 +1081,9 @@ __all__ = (
     "command",
     "shortcut",
     "DuplicateRenderer",
+    "MessageView",
     "renderer",
+    "message_renderer",
     "WorkerSpec",
     "WorkerState",
     "WorkerUnavailable",
@@ -1052,7 +1096,9 @@ __all__ = (
     "devices",
     "creds",
     "secrets",
+    "models",
     "provider",
+    "watch_models",
     "DiagnosticCode",
     "Distribution",
     "FailureCode",
@@ -1167,6 +1213,7 @@ __all__ += (
     "Replace",
     "ResourceBudget",
     "Retryability",
+    "Role",
     "RouteRef",
     "RuleEffect",
     "RuleRef",

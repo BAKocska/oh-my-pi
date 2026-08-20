@@ -16,6 +16,7 @@ from _omp import Duration, EnvPath
 from ._errors import NotWiredError
 from ._registry import ExportDefinition, registry as _declarations
 from .placement import Place
+from .prompts import SlotClass
 
 QUEUE_DEFAULT = 4096
 BATCH_MAX = 1024
@@ -54,6 +55,13 @@ class StopReason(StrEnum):
     CONTENT_FILTER = "content_filter"
     UNSPECIFIED = "unspecified"
 
+
+class DegradeAction(StrEnum):
+    """Describe how the harness handled an unsupported request feature."""
+
+    DROPPED = "dropped"
+    EMULATED = "emulated"
+    CLAMPED = "clamped"
 
 class Scope(StrEnum):
     """Agent extent visible to a telemetry subscription."""
@@ -106,11 +114,20 @@ class Tokens:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptSlotFingerprint:
+    """Describe one assembler-owned prompt slot contribution."""
+
+    digest: str
+    size_bytes: int
+    band: SlotClass
+
+
+@dataclass(frozen=True, slots=True)
 class PromptFingerprint:
     """Assembler-owned prompt-prefix and cache-breakpoint facts."""
 
     digest: str
-    slots: Mapping[str, str]
+    slots: Mapping[str, PromptSlotFingerprint]
     changed: tuple[str, ...]
     prefix_stable_bytes: int
     cache_key: str
@@ -122,6 +139,15 @@ class PromptFingerprint:
 
 
 @dataclass(frozen=True, slots=True)
+class Degradation:
+    """Describe one requested feature the provider path could not honour."""
+
+    what: str
+    detail: str
+    action: DegradeAction
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRequest:
     """Frozen subset of a settled model request used by telemetry consumers."""
 
@@ -129,6 +155,11 @@ class ModelRequest:
     usage: Tokens
     prompt: PromptFingerprint
     served_model: str
+    latency_ms: int
+    ttft_ms: int | None
+    degraded: tuple[Degradation, ...]
+    request_content: bytes | None = None
+    response_content: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +210,15 @@ def _subscribe(
         if not callable(function):
             raise TypeError("@omp.telemetry may decorate only a callable")
         _declarations.register_telemetry(
-            parsed_kinds, parsed_scope, queue, parsed_overflow, batch, replay, replay_limit, function
+            parsed_kinds,
+            parsed_scope,
+            queue,
+            parsed_overflow,
+            coalesce_key,
+            batch,
+            replay,
+            replay_limit,
+            function,
         )
         return function
 
@@ -725,10 +764,12 @@ class _TelemetryModule(ModuleType):
 sys.modules[__name__].__class__ = _TelemetryModule
 
 __all__ = (
-    "BATCH_MAX", "ContextSnapshot", "Cost", "Counter", "DropStats", "Envelope", "Eq",
+    "BATCH_MAX", "ContextSnapshot", "Cost", "Counter", "Degradation", "DegradeAction",
+    "DropStats", "Envelope", "Eq",
     "ExportError", "ExportHandle", "ExportStats", "ExportTarget", "ExtensionRef", "FileTarget",
     "Histogram", "Kind", "METRIC_PREFIX", "ModelRequest", "OtlpTarget", "Overflow", "Predicate",
-    "ProcessTarget", "PromptFingerprint", "Query", "QueryResult", "QUEUE_DEFAULT", "Row", "Scope",
+    "ProcessTarget", "PromptFingerprint", "PromptSlotFingerprint", "Query", "QueryResult",
+    "QUEUE_DEFAULT", "Row", "Scope",
     "SessionEnd", "SessionStart", "Step", "StopReason", "SubscriptionError", "Tokens", "TraceRef",
     "TurnEnd", "TurnStart", "counter", "dropped", "export", "flush", "histogram", "query",
 )

@@ -739,9 +739,9 @@ class Run:
         """Drain output and return the terminal completion receipt."""
         return await _request("omp.env.Run.wait", run=self.id)
 
-    async def write(self, data: bytes) -> None:
+    async def stdin(self, data: bytes) -> None:
         """Write bytes to stdin or the PTY master."""
-        await _request("omp.env.Run.write", run=self.id, data=data)
+        await _request("omp.env.Run.stdin", run=self.id, data=data)
 
     async def eof(self) -> None:
         """Close command stdin."""
@@ -1047,34 +1047,74 @@ class Process:
 
     async def info(self) -> ProcessInfo:
         """Return the current generation snapshot."""
-        return await _request("omp.env.Process.info", name=self.name)
+        return await _request(
+            "omp.env.Process.info", name=self.name, generation=self.generation
+        )
 
     def output(self, *, after: int = 0) -> AsyncIterator[ProcessOutput]:
         """Yield retained and live ordered process output."""
-        return _stream("omp.env.Process.output", name=self.name, after=after)
+        return _stream(
+            "omp.env.Process.output",
+            name=self.name,
+            generation=self.generation,
+            after=after,
+        )
 
     def states(self) -> AsyncIterator[ProcessInfo]:
         """Yield named-process lifecycle transitions."""
-        return _stream("omp.env.Process.states", name=self.name)
+        return _stream(
+            "omp.env.Process.states", name=self.name, generation=self.generation
+        )
 
     async def send(self, data: bytes) -> None:
         """Send bytes to process stdin."""
-        await _request("omp.env.Process.send", name=self.name, data=data)
+        await _request(
+            "omp.env.Process.send",
+            name=self.name,
+            generation=self.generation,
+            data=data,
+        )
 
     async def send_secret(self, name: str, value: str) -> None:
         """Inject a scoped secret without exposing it through argv or environment."""
         await _request(
-            "omp.env.Process.send_secret", name=self.name, secret_name=name, value=value
+            "omp.env.Process.send_secret",
+            name=self.name,
+            generation=self.generation,
+            secret_name=name,
+            value=value,
         )
-
 
     async def signal(self, signal: str) -> None:
         """Signal the Environment-owned process group."""
-        await _request("omp.env.Process.signal", name=self.name, signal=signal)
+        await _request(
+            "omp.env.Process.signal",
+            name=self.name,
+            generation=self.generation,
+            signal=signal,
+        )
 
     async def stop(self, **options: Any) -> ProcessInfo:
         """Stop the process tree and return its terminal state."""
-        return await _request("omp.env.Process.stop", name=self.name, **options)
+        return await _request(
+            "omp.env.Process.stop",
+            name=self.name,
+            generation=self.generation,
+            **options,
+        )
+
+    async def restart(self) -> Process:
+        """Restart from the retained launch spec and return the next generation."""
+        if _binding.get() is None:
+            raise NotWiredError("omp.env.Process.restart")
+        result = await _request(
+            "omp.env.Process.restart", name=self.name, generation=self.generation
+        )
+        return (
+            result
+            if isinstance(result, Process)
+            else Process(result["name"], result["generation"])
+        )
 
 
 class BlobWriter:

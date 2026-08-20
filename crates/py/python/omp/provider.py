@@ -9,17 +9,17 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from urllib.parse import urlsplit
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol, TypeVar
 
-from _omp import BlobRef, Duration, Secret
+from _omp import BlobRef, Duration, EnvPath, Secret
 
 from ._registry import registry
-from ._errors import NotWiredError
+from ._errors import SpecError, NotWiredError
 
 _T = TypeVar("_T", bound=type)
 _EMPTY_MAP: Mapping[Any, Any] = MappingProxyType({})
@@ -182,8 +182,9 @@ class ToolSchemaFlavor(StrEnum):
 class CacheRetention(StrEnum):
     """Prompt-cache retention classes from Rust ``CacheRetentionBits``."""
 
-    EPHEMERAL = "ephemeral"
-    STANDARD = "standard"
+    REQUEST = "request"
+    SESSION = "session"
+    SHORT = "short"
     LONG = "long"
 
 
@@ -221,7 +222,7 @@ class CredentialSource:
     def env(cls, *names: str) -> "CredentialSource":
         """Read the first populated environment variable from ``names``."""
         if not names or not all(isinstance(name, str) and name for name in names):
-            raise ValueError("credential environment names must be non-empty strings")
+            raise SpecError("credential environment names must be non-empty strings")
         return cls("environment", tuple(names))
 
     @classmethod
@@ -249,7 +250,7 @@ class CredentialSource:
             "location_env": location_env,
         }
         if any(not isinstance(value, str) or not value for value in names.values()):
-            raise ValueError("ADC environment names must be non-empty strings")
+            raise SpecError("ADC environment names must be non-empty strings")
         return cls("application_default", options=MappingProxyType(names))
 
     @classmethod
@@ -463,9 +464,9 @@ class DiscoverySpec:
         """Reject periodic discovery faster than the daemon scheduling floor."""
         if self.interval is not None:
             if not isinstance(self.interval, Duration):
-                raise TypeError("DiscoverySpec.interval must be Duration or None")
+                raise SpecError("DiscoverySpec.interval must be Duration or None")
             if self.interval < Duration("5s"):
-                raise ValueError("DiscoverySpec.interval must be at least 5s")
+                raise SpecError("DiscoverySpec.interval must be at least 5s")
 
 
 class RedirectTrust(StrEnum):
@@ -483,7 +484,7 @@ def _origin(url: str) -> tuple[str, str | None]:
     ):
         return url, None
     if not parsed.scheme or not parsed.netloc:
-        raise ValueError("route base_url must be an absolute URL or Unix socket path")
+        raise SpecError("route base_url must be an absolute URL or Unix socket path")
     return f"{parsed.scheme.lower()}://{parsed.netloc}", parsed.hostname
 
 
@@ -516,7 +517,7 @@ class TrustDomain:
     def __post_init__(self) -> None:
         """Reject plaintext trust for anything except loopback and Unix sockets."""
         if self.allow_plaintext and self.origin and not _is_loopback(self.origin):
-            raise ValueError("plaintext trust is limited to loopback hosts and Unix sockets")
+            raise SpecError("plaintext trust is limited to loopback hosts and Unix sockets")
 
     @classmethod
     def https(
@@ -569,15 +570,15 @@ class RouteSpec:
         route_origin, _ = _origin(self.base_url)
         trust = self.trust
         if not isinstance(trust, TrustDomain):
-            raise TypeError("RouteSpec.trust must be TrustDomain")
+            raise SpecError("RouteSpec.trust must be TrustDomain")
         if self.transport is not Transport.LOCAL:
             if trust.allow_plaintext:
                 if not _is_loopback(self.base_url):
-                    raise ValueError(
+                    raise SpecError(
                         "TrustDomain.loopback() requires a loopback host or Unix socket path"
                     )
             elif urlsplit(self.base_url).scheme.lower() != "https":
-                raise ValueError("plaintext routes require TrustDomain.loopback()")
+                raise SpecError("plaintext routes require TrustDomain.loopback()")
         if not trust.origin:
             object.__setattr__(
                 self,
@@ -585,7 +586,7 @@ class RouteSpec:
                 TrustDomain(route_origin, trust.redirects, trust.allow_plaintext),
             )
         elif route_origin != trust.origin:
-            raise ValueError("RouteSpec.base_url is outside its TrustDomain origin")
+            raise SpecError("RouteSpec.base_url is outside its TrustDomain origin")
 
 
 class Cap(StrEnum):
@@ -618,8 +619,8 @@ class PromptCacheCaps:
     """Prompt-cache retention and breakpoint constraints."""
 
     retention: frozenset[CacheRetention] = frozenset()
-    minimum_prefix_tokens: int | None = None
-    maximum_breakpoints: int | None = None
+    min_prefix_tokens: int | None = None
+    max_breakpoints: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -684,12 +685,12 @@ class ThinkingSpec:
     def __post_init__(self) -> None:
         order = tuple(Effort)
         if Effort.OFF in self.efforts:
-            raise ValueError("ThinkingSpec.efforts must not advertise OFF")
+            raise SpecError("ThinkingSpec.efforts must not advertise OFF")
         positions = tuple(order.index(effort) for effort in self.efforts)
         if any(left >= right for left, right in zip(positions, positions[1:])):
-            raise ValueError("ThinkingSpec.efforts must be strictly ascending")
+            raise SpecError("ThinkingSpec.efforts must be strictly ascending")
         if self.default is not None and self.default not in self.efforts:
-            raise ValueError("ThinkingSpec.default must appear in efforts")
+            raise SpecError("ThinkingSpec.default must appear in efforts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -815,7 +816,7 @@ class Dimensions:
             or not isinstance(self.height, int)
             or self.height <= 0
         ):
-            raise ValueError("image dimensions must be positive integers")
+            raise SpecError("image dimensions must be positive integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -843,6 +844,94 @@ class ImageResult:
     """Blob-backed generated images and their settled nano-USD cost receipt."""
 
     images: tuple[BlobRef, ...]
+    cost_nanos_usd: int
+
+
+class SpeechFeature(StrEnum):
+    """Closed text-to-speech capability vocabulary."""
+
+    STREAMING = "streaming"
+    TIMESTAMPS = "timestamps"
+    SPEED = "speed"
+    VOICE_SELECTION = "voice_selection"
+
+
+class AudioFormat(StrEnum):
+    """Closed audio encoding vocabulary for speech input and output."""
+
+    PCM16 = "pcm16"
+    PCM24 = "pcm24"
+    F32 = "f32"
+    MP3 = "mp3"
+    AAC = "aac"
+    OPUS = "opus"
+    FLAC = "flac"
+    WAV = "wav"
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechCaps:
+    """Speech synthesis features, voices, encodings, and sample rates."""
+
+    features: frozenset[SpeechFeature]
+    voices: tuple[str, ...]
+    formats: frozenset[AudioFormat]
+    sample_rates_hz: tuple[int, ...]
+
+
+class TranscriptionFeature(StrEnum):
+    """Closed speech-transcription capability vocabulary."""
+
+    STREAMING = "streaming"
+    TIMESTAMPS = "timestamps"
+    DIARIZATION = "diarization"
+    TRANSLATION = "translation"
+    LANGUAGE_HINT = "language_hint"
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionCaps:
+    """Transcription features, accepted encodings, and duration ceiling."""
+
+    features: frozenset[TranscriptionFeature]
+    formats: frozenset[AudioFormat]
+    max_duration: Duration | None
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechRequest:
+    """Typed request for host-routed text-to-speech synthesis."""
+
+    model: str
+    text: str
+    voice: str
+    format: AudioFormat | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechResult:
+    """Blob-backed synthesized audio and its settled nano-USD cost receipt."""
+
+    audio: BlobRef
+    format: AudioFormat
+    cost_nanos_usd: int
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionRequest:
+    """Typed request for host-routed speech transcription."""
+
+    model: str
+    audio: EnvPath | BlobRef
+    language: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionResult:
+    """Settled transcription text, detected language, and nano-USD cost receipt."""
+
+    text: str
+    language: str | None
     cost_nanos_usd: int
 
 
@@ -925,8 +1014,8 @@ class ModelSpec:
     embeddings: object | None = None
     image: ImageCaps | None = None
     video: object | None = None
-    speech: object | None = None
-    transcription: object | None = None
+    speech: SpeechCaps | None = None
+    transcription: TranscriptionCaps | None = None
     realtime: object | None = None
     search: object | None = None
     tokenization: object | None = None
@@ -946,31 +1035,39 @@ class ProviderSpec:
     model_overlays: tuple[ModelOverlay, ...] = ()
 
     def __post_init__(self) -> None:
-        """Reject conflicting model patches and aliases before registration."""
+        """Reject duplicate models, conflicting model patches, and aliases."""
+        model_ids: set[str] = set()
+        for model in self.models:
+            if not isinstance(model, ModelSpec):
+                raise SpecError("ProviderSpec.models must contain ModelSpec values")
+            if model.id in model_ids:
+                raise SpecError(f"duplicate model id {model.id!r}")
+            model_ids.add(model.id)
+
         selectors: set[tuple[str, str]] = set()
         for overlay in self.model_overlays:
             if not isinstance(overlay, ModelOverlay):
-                raise TypeError("ProviderSpec.model_overlays must contain ModelOverlay values")
+                raise SpecError("ProviderSpec.model_overlays must contain ModelOverlay values")
             if not isinstance(overlay.selector, ModelRef):
-                raise TypeError("ModelOverlay.selector must be a ModelRef")
+                raise SpecError("ModelOverlay.selector must be a ModelRef")
             key = (overlay.selector.provider, overlay.selector.model)
             if overlay.selector.provider != self.id:
-                raise ValueError("model overlay selector must use the declaring provider")
+                raise SpecError("model overlay selector must use the declaring provider")
             if key in selectors:
-                raise ValueError(f"duplicate model overlay for {key[0]}/{key[1]}")
+                raise SpecError(f"duplicate model overlay for {key[0]}/{key[1]}")
             selectors.add(key)
 
         aliases: dict[tuple[str, str], str] = {}
         for scoped in self.aliases:
             if not isinstance(scoped, ScopedAlias):
-                raise TypeError("ProviderSpec.aliases must contain ScopedAlias values")
+                raise SpecError("ProviderSpec.aliases must contain ScopedAlias values")
             if scoped.provider != self.id:
-                raise ValueError("scoped alias must use the declaring provider")
+                raise SpecError("scoped alias must use the declaring provider")
             key = (scoped.provider, scoped.definition.alias)
             target = scoped.definition.target
             previous = aliases.get(key)
             if previous is not None and previous != target:
-                raise ValueError(
+                raise SpecError(
                     f"alias {key[0]}/{key[1]} targets both {previous!r} and {target!r}"
                 )
             aliases[key] = target
@@ -1001,7 +1098,12 @@ class ProviderHandle:
 
     def __call__(self, implementation: _T) -> _T:
         """Bind a provider-scoped implementation class to this declaration."""
-        registry.register_provider(self.id, self._spec, implementation)
+        registry.register_provider(self.id,
+            self._spec,
+            implementation,
+            priority=self._priority,
+            extends=self._extends,
+            replaces=self._replaces,)
         implementation.__omp_provider_spec__ = self._spec
         implementation.__omp_provider_priority__ = self._priority
         implementation.__omp_provider_extends__ = self._extends
@@ -1029,13 +1131,22 @@ class ProviderHandle:
         )
 
     async def request(
-        self, operation: Operation, request: ImageRequest
-    ) -> ImageResult:
+        self,
+        operation: Operation,
+        request: ImageRequest | SpeechRequest | TranscriptionRequest,
+    ) -> ImageResult | SpeechResult | TranscriptionResult:
         """Route one typed provider operation through the host CONTROL and DATA arm."""
-        if operation is not Operation.GENERATE_IMAGE:
-            raise ValueError("ProviderHandle.request only freezes GENERATE_IMAGE")
-        if not isinstance(request, ImageRequest):
-            raise TypeError("GENERATE_IMAGE requires an ImageRequest")
+        expected = {
+            Operation.GENERATE_IMAGE: ImageRequest,
+            Operation.SPEAK: SpeechRequest,
+            Operation.TRANSCRIBE: TranscriptionRequest,
+        }.get(operation)
+        if expected is None:
+            raise ValueError(
+                "ProviderHandle.request freezes GENERATE_IMAGE, SPEAK, and TRANSCRIBE"
+            )
+        if not isinstance(request, expected):
+            raise TypeError(f"{operation.name} requires {expected.__name__}")
         return await _provider_control_request(
             "omp.provider.request",
             provider=self.id,
@@ -1050,6 +1161,199 @@ async def _provider_control_request(operation: str, /, **arguments: object) -> A
     if _control_backend.get() is None:
         raise NotWiredError(f"{operation} CONTROL dispatch is not wired")
     return await _control_request(operation, **arguments)
+
+class Facet(StrEnum):
+    """Identify an inference facet exposed by a resolved model card."""
+
+    CHAT = "chat"
+    EMBED = "embed"
+    IMAGE_GEN = "image_gen"
+    VIDEO_GEN = "video_gen"
+    SPEAK = "speak"
+    TRANSCRIBE = "transcribe"
+    REALTIME = "realtime"
+    SEARCH = "search"
+
+
+class PriceUnit(StrEnum):
+    """Identify the billing unit of one resolved catalog price."""
+
+    MTOK_INPUT = "mtok_input"
+    MTOK_OUTPUT = "mtok_output"
+    MTOK_CACHE_READ = "mtok_cache_read"
+    MTOK_CACHE_WRITE = "mtok_cache_write"
+    IMAGE = "image"
+    VIDEO_SECOND = "video_second"
+    AUDIO_SECOND = "audio_second"
+    MCHAR_INPUT = "mchar_input"
+    REQUEST = "request"
+
+
+@dataclass(frozen=True, slots=True)
+class Price:
+    """Represent one exact nano-USD price component."""
+
+    unit: PriceUnit
+    nanos_usd: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCard:
+    """Describe one resolved model after catalog overlays and configuration."""
+
+    class Source(IntEnum):
+        """Identify the catalog layer that contributed a resolved model."""
+
+        UNSPECIFIED = 0
+        BUNDLED = 1
+        DISCOVERED = 2
+        CONFIGURED = 3
+        EXTENSION = 4
+
+    id: str
+    provider: str
+    model: str
+    name: str
+    family: str | None = None
+    facets: frozenset[Facet] = frozenset()
+    inputs: frozenset[Modality] = frozenset()
+    outputs: frozenset[Modality] = frozenset()
+    reasoning: bool = False
+    efforts: tuple[Effort, ...] = ()
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    pricing: tuple[Price, ...] = ()
+    availability: Availability = Availability.UNSPECIFIED
+    source: Source = Source.UNSPECIFIED
+    blocked_until_ms: int | None = None
+    deprecated: bool = False
+    updated_at_ms: int | None = None
+    supports_tools: bool | None = None
+    props: Mapping[str, object] = field(default_factory=lambda: _EMPTY_MAP)
+
+
+@dataclass(frozen=True, slots=True)
+class Cursor:
+    """Resume the merged model stream within one host catalog epoch."""
+
+    epoch: bytes
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelEvent:
+    """Carry one typed delta from the host-owned merged model catalog."""
+
+    cursor: Cursor
+    upserted: ModelCard | None = None
+    removed_id: str | None = None
+    reset: bool = False
+
+    def __post_init__(self) -> None:
+        """Require exactly one catalog-delta variant."""
+        variants = (
+            self.upserted is not None,
+            self.removed_id is not None,
+            self.reset,
+        )
+        if sum(variants) != 1:
+            raise ValueError(
+                "ModelEvent requires exactly one of upserted, removed_id, or reset"
+            )
+
+
+def _model_card(value: object) -> ModelCard:
+    if isinstance(value, ModelCard):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("model catalog host returned a non-ModelCard value")
+    fields = dict(value)
+    fields["facets"] = frozenset(Facet(item) for item in fields.get("facets", ()))
+    fields["inputs"] = frozenset(Modality(item) for item in fields.get("inputs", ()))
+    fields["outputs"] = frozenset(Modality(item) for item in fields.get("outputs", ()))
+    fields["efforts"] = tuple(Effort(item) for item in fields.get("efforts", ()))
+    fields["pricing"] = tuple(
+        item
+        if isinstance(item, Price)
+        else Price(PriceUnit(item["unit"]), item["nanos_usd"])
+        for item in fields.get("pricing", ())
+    )
+    if "availability" in fields:
+        fields["availability"] = Availability(fields["availability"])
+    if "source" in fields:
+        fields["source"] = ModelCard.Source(fields["source"])
+    return ModelCard(**fields)
+
+
+def _model_event(value: object) -> ModelEvent:
+    if isinstance(value, ModelEvent):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("model catalog host returned a non-ModelEvent value")
+    raw_cursor = value.get("cursor")
+    if isinstance(raw_cursor, Cursor):
+        cursor = raw_cursor
+    elif isinstance(raw_cursor, Mapping):
+        cursor = Cursor(epoch=raw_cursor["epoch"], generation=raw_cursor["generation"])
+    else:
+        raise TypeError("model catalog event requires a Cursor")
+    upserted = value.get("upserted")
+    return ModelEvent(
+        cursor=cursor,
+        upserted=None if upserted is None else _model_card(upserted),
+        removed_id=value.get("removed_id"),
+        reset=value.get("reset") is True or isinstance(value.get("reset"), Mapping),
+    )
+
+
+async def models() -> tuple[ModelCard, ...]:
+    """Read all resolved cards from the host-owned merged model catalog."""
+    result = await _provider_control_request("omp.provider.models")
+    if not isinstance(result, Iterable) or isinstance(
+        result, (str, bytes, bytearray, Mapping)
+    ):
+        raise TypeError("omp.provider.models host result must be an iterable of ModelCard")
+    return tuple(_model_card(card) for card in result)
+
+
+async def _watch_model_events(
+    since: Cursor | None,
+) -> AsyncIterator[ModelEvent]:
+    source = await _provider_control_request("omp.provider.watch_models", since=since)
+    if hasattr(source, "__aiter__"):
+        async for event in source:
+            yield _model_event(event)
+        return
+    if not isinstance(source, Iterable) or isinstance(
+        source, (str, bytes, bytearray, Mapping)
+    ):
+        raise TypeError("omp.provider.watch_models host result must be an event stream")
+    for event in source:
+        yield _model_event(event)
+
+
+class WatchModels:
+    """Subscribe to typed updates from the host-owned merged model catalog."""
+
+    __slots__ = ("since",)
+
+    def __init__(self, since: Cursor | None = None) -> None:
+        """Create a subscription optionally resuming after ``since``."""
+        self.since = since
+
+    def events(self) -> AsyncIterator[ModelEvent]:
+        """Yield ordered catalog deltas until the host closes the stream."""
+        return _watch_model_events(self.since)
+
+    def __aiter__(self) -> AsyncIterator[ModelEvent]:
+        """Iterate the host-fed model event stream."""
+        return self.events()
+
+
+def watch_models(since: Cursor | None = None) -> WatchModels:
+    """Return a resumable merged-model catalog subscription."""
+    return WatchModels(since)
+
 
 @dataclass(frozen=True, slots=True)
 class ModelRef:
@@ -1519,37 +1823,47 @@ def provider(
     extends: str | None = None,
     replaces: str | None = None,
 ) -> ProviderHandle:
-    """Return the declaration handle used directly or as a class decorator."""
+    """Declare the provider immediately and return its optional decorator handle."""
     if not isinstance(spec, ProviderSpec):
-        raise TypeError("omp.provider requires a ProviderSpec")
+        raise SpecError("omp.provider requires a ProviderSpec")
     if isinstance(priority, bool) or not isinstance(priority, int):
-        raise TypeError("provider priority must be an integer")
+        raise SpecError("provider priority must be an integer")
     if extends is not None and (not isinstance(extends, str) or not extends):
-        raise TypeError("provider extends must be a non-empty provider id")
+        raise SpecError("provider extends must be a non-empty provider id")
     if spec.model_overlays and extends is None:
-        raise ValueError("model overlays require provider(..., extends=...)")
-    return ProviderHandle(
+        raise SpecError("model_overlays require provider(..., extends=...)")
+    handle = ProviderHandle(
         spec, priority=priority, extends=extends, replaces=replaces
     )
+    registry.register_provider(spec.id,
+        spec,
+        priority=priority,
+        extends=extends,
+        replaces=replaces,)
+    return handle
 
 
 __all__ = (
-    "AccountScope", "Api", "AuthMethod", "AuthMode", "AuthSpec", "Availability",
+    "AccountScope", "Api", "AudioFormat", "AuthMethod", "AuthMode", "AuthSpec", "Availability",
     "CacheRetention", "Cap", "CatalogAlias", "ChatCaps", "CodecProfile", "CompatFlags",
     "Completion", "Confidence", "ContextSpec", "Cost", "CostTier", "Credential", "CredentialKind",
+    "Cursor",
     "CredentialSource", "Dimensions", "DiscoveryDefaults", "DiscoveryKind", "DiscoveryPage",
-    "DiscoveryQuery", "DiscoverySpec", "DiscoveryTrigger", "Effort", "ErrorKind", "Failover",
+    "DiscoveryQuery", "DiscoverySpec", "DiscoveryTrigger", "Effort", "ErrorKind", "Facet", "Failover",
     "FailoverKind", "ImageCaps", "ImageFeature", "ImageFormat", "ImageRequest", "ImageResult",
-    "Fallback", "Intent", "IntentKind", "LoginRequest", "LoginUi", "LogprobCaps",
-    "ManagementSpec", "Modality", "ModelFallback", "ModelOverlay", "ModelPatch", "ModelRef",
-    "ModelSpec", "OAuthFlow",
-    "OAuthFlowKind", "OAuthSpec", "Operation", "Pagination", "PrincipalResolution",
-    "PromptCacheCaps", "ProviderError", "ProviderHandle", "ProviderSpec", "ReasoningCaps",
+    "Fallback", "SpeechCaps", "SpeechFeature", "SpeechRequest", "SpeechResult", "Intent", "IntentKind", "LoginRequest", "LoginUi", "LogprobCaps",
+    "ManagementSpec", "Modality", "ModelCard", "ModelEvent", "ModelFallback", "ModelOverlay",
+    "ModelPatch", "ModelRef", "ModelSpec", "OAuthFlow",
+    "OAuthFlowKind", "OAuthSpec", "Operation", "Pagination", "Price", "PriceUnit",
+    "PrincipalResolution", "PromptCacheCaps", "ProviderError", "ProviderHandle", "ProviderSpec",
+    "ReasoningCaps",
     "RedirectTrust", "RefreshBehavior", "RefreshReason", "RefreshRequest", "RequestDraft",
     "RequestMutation", "Retryability", "Role", "RouteLimits", "RouteRef", "RouteSpec",
     "ScopedAlias",
     "SearchPage", "SearchQuery", "SearchResult", "ServerStateCaps", "ServiceTier",
-    "SignRequest", "Signature", "Signer", "ThinkingMode", "ThinkingSpec", "TokenPlacement",
+    "SignRequest", "SpecError", "TranscriptionCaps", "TranscriptionFeature",
+        "TranscriptionRequest", "TranscriptionResult", "Signature", "Signer", "ThinkingMode", "ThinkingSpec", "TokenPlacement",
     "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "TrustDomain", "UsageQuery",
-    "UsageReport", "UsageScope", "UsageUnit", "UsageWindow", "provider",
+    "UsageReport", "UsageScope", "UsageUnit", "UsageWindow", "WatchModels", "models",
+    "provider", "watch_models",
 )

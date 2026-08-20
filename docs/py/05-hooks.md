@@ -322,7 +322,8 @@ behaviour, not today's.
 ### 2.6 Reentrancy — and what approval is not
 
 A hook must be able to consult the world in the middle of forming its decision — read the journal,
-read a file through `omp.env`, run a budgeted completion in REVIEW — without deadlocking anything.
+read a file through `omp.env`, run a budgeted completion in REVIEW or the turn-scoped `turn_start`
+TRANSFORM — without deadlocking anything.
 CONTROL is full-duplex and request-multiplexed: when a handler awaits `omp.journal.state(...)`, the
 host allocates a fresh `request_id` and writes a request frame on the same connection the pending
 decision is riding.
@@ -699,10 +700,16 @@ later one. Within a phase the execution model is fixed per phase, not per subscr
 | Phase | Execution | May return | Intended work | Semantics |
 |---|---|---|---|---|
 | `PRECHECK` | **Parallel** across subscriptions and hosts | `Deny`, `Defer` | Deterministic blocklists, path guards, static shell-AST rules | Pure and deterministic: a function of the event and readable state, no externally visible effects, no paid calls. Deny-only, so parallelism is safe — abstentions cannot conflict and denies compose as OR |
-| `TRANSFORM` | **Totally ordered** by `order`, ties broken by `(layer, publisher, extension_id)` | `Modify`, `Defer` | Argument normalizers, cwd pinning, sandbox-envelope narrowing | Deterministic transforms. Each accepted transform is applied before the next handler runs, and all derived facts (`BashIR`, path resolutions, the effect envelope) are recomputed after every accepted transform, so every later handler and phase sees a consistent call |
+| `TRANSFORM` | **Totally ordered** by `order`, ties broken by `(layer, publisher, extension_id)` | `Modify`, `Defer` | Argument normalizers, cwd pinning, sandbox-envelope narrowing, once-per-turn selection | Deterministic except for the bounded `turn_start` classifier exception below. Each accepted transform is applied before the next handler runs, and all derived facts (`BashIR`, path resolutions, the effect envelope) are recomputed after every accepted transform, so every later handler and phase sees a consistent call |
 | `REVIEW` | **Parallel**, with an explicit aggregate policy | `Allow`, `Deny`, `Defer` | Secondary-model classifiers, lint gates, circuit breakers | Budgeted. **Paid inference is allowed; externally visible effects are not.** Aggregate: any `Deny` denies (all denials journaled); else any `Allow` is an affirmative vote; else defer |
 | `APPROVAL` | Handlers run after REVIEW; tickets merge | `RequireApproval`, `Allow`, `Deny`, `Defer` | "A human must see this" rules, external-approver routing | Never suspends a coroutine (§2.6). Core merges every `RequireApproval` into one durable ticket per invocation — one unspoofable dialog, survives restarts, headless/external approval is a ticket property ([`06-policy.md`](06-policy.md)) |
 | `OBSERVE` | Asynchronous, off the critical path | `None` | Metrics, journal annotation, side dashboards | Cannot change the decision. Runs after the outcome is fixed; a slow or dead observer delays nothing |
+
+**Paid-completion exception.** `omp.agents.completion()` is also legal in a turn-scoped
+`TRANSFORM` hook — today, exactly `turn_start` — so one bounded classifier may select a mutable
+turn field and return `Modify`. This does not generalize to per-call TRANSFORM hooks:
+`tool_call`, `before_call`-class events, and every other CALL-latency event remain ineligible for
+paid inference. REVIEW remains the paid-classifier phase for those events.
 
 A hook registered at `OBSERVE` that returns anything other than `Defer()`/`None` raises
 `omp.HookContractError`. This makes "I only wanted to watch" enforceable instead of aspirational.
@@ -725,8 +732,8 @@ one dialog. The `INTERACTIVE` and `REMOTE` bands are gone entirely — what they
 approval ticket.
 
 **Purity requirement, restated for phases.** `PRECHECK`, `TRANSFORM` and `REVIEW` handlers MUST be
-free of externally visible side effects (REVIEW's budgeted inference is metered and journaled, not
-"external" in this sense); `APPROVAL` handlers describe, in an `ApprovalSpec`, the effectful step
+free of externally visible side effects (budgeted inference is metered and journaled, not
+"external" in this sense, both in REVIEW and under the narrow `turn_start` TRANSFORM exception); `APPROVAL` handlers describe, in an `ApprovalSpec`, the effectful step
 Core will own; `OBSERVE` may write the journal. This is not style advice: PRECHECK and REVIEW
 dispatch concurrently, so a deny-capable handler can run alongside a peer that is about to deny.
 Keeping effects out of every phase that can be short-circuited is what makes "no effect happens
@@ -1210,6 +1217,7 @@ class BeforeAgentStartEvent:
 	prompt_rev: str
 	staged_interrupts: int
 	resuming: bool
+	schedule_id: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class AgentStartEvent:
@@ -1784,7 +1792,7 @@ either.
 
 | Event | Payload | Ret | Ph | Lat | Fail | Re | Def |
 |---|---|---|---|---|---|---|---|
-| `compaction` | `omp.CompactionEvent` — [`08-context.md`](08-context.md) | `HookDecision` | any | TURN | DEFER | yes | `Allow` |
+| `compaction` | `omp.CompactionEvent` — [`08-context.md`](08-context.md) | `omp.CompactionVerdict \| None` | domain | TURN | DEFER | yes | `None` |
 | `compaction_done` | `omp.CompactionOutcome` — [`08-context.md`](08-context.md) | — | OBSERVE | TURN | DEFER | yes | — |
 | `thread_projection` | `omp.ContextView` — [`08-context.md`](08-context.md) | `omp.ContextPatch \| None` | domain | TURN | DEFER | yes | — |
 
@@ -2123,28 +2131,35 @@ handler's `continue` flag wins.
 import omp
 from omp.agents import Continue, Settle
 
+
+def active_goal() -> GoalState | None:
+	entry = omp.journal.latest(GoalState)
+	return entry.value if entry is not None else None
+
+
 @omp.hook("turn_end")
-async def account_tokens(event: omp.TurnEndEvent, ctx: omp.Context) -> None:
-	goal = await omp.journal.state("goal/active")
+def account_tokens(event: omp.TurnEndEvent, ctx: omp.Context) -> None:
+	goal = active_goal()
 	if goal is None:
 		return
 	# reused cache reads are not new spend
 	delta = event.usage.input + event.usage.cache_write + event.usage.output
-	await omp.journal.append(GoalSpend(goal=goal["id"], delta=delta))
+	omp.journal.append(GoalSpend(goal=goal.id, delta=delta))
+
 
 @omp.hook("agent_settled")
-async def continue_or_stop(event: omp.AgentSettledEvent, ctx: omp.Context) -> Continue | Settle:
-	goal = await omp.journal.state("goal/active")
+def continue_or_stop(event: omp.AgentSettledEvent, ctx: omp.Context) -> Continue | Settle:
+	goal = active_goal()
 	if goal is None:
 		return Settle()
 	if event.reason is omp.SettleReason.INTERRUPTED:
-		await omp.journal.append(GoalPaused(goal=goal["id"], reason="interrupted"))
-		return Settle(reason="goal paused by user interrupt")
-	if goal["spent"] >= goal["budget"]:
-		return Settle(reason="goal token budget exhausted")
+		omp.journal.append(GoalPaused(goal=goal.id, reason="interrupted"))
+		return Settle()
+	if goal.spent >= goal.budget:
+		return Settle()
 	if event.continuations_used + 1 >= omp.limits.SETTLE_CONTINUATION_CAP:
-		return Settle(reason="continuation cap reached")
-	return Continue(omp.Item.user_note(goal["continuation_prompt"]))
+		return Settle()
+	return Continue(prompt=goal.continuation_prompt)
 ```
 
 Three things the omp shape gets for free. Resolution is first-`Continue`-wins in the deterministic

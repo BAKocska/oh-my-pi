@@ -62,6 +62,18 @@ pub enum ExecError {
 	/// A process with this name is already registered.
 	#[error("named process {0:?} already exists")]
 	ProcessExists(Str),
+	/// A named-process request targeted a retired generation.
+	#[error(
+		"named process {name:?} generation {requested} is stale; current generation is {current}"
+	)]
+	StaleProcessGeneration {
+		/// Stable process name.
+		name:      Str,
+		/// Generation carried by the request.
+		requested: u64,
+		/// Current retained generation.
+		current:   u64,
+	},
 	/// A request contained an unsupported signal name.
 	#[error("unsupported signal {0:?}")]
 	UnsupportedSignal(Str),
@@ -566,14 +578,7 @@ impl ExecHost {
 
 	/// Attaches to buffered and future named-process output.
 	pub fn attach_output(&self, request: &AttachOutput) -> Result<ProcessAttachment, ExecError> {
-		let name = Str::from(request.name.as_str());
-		let process = self
-			.inner
-			.processes
-			.lock()
-			.get(&name)
-			.cloned()
-			.ok_or_else(|| ExecError::ProcessNotFound(name.clone()))?;
+		let process = self.named_process(&request.name, request.generation)?;
 		let (tx, events) = flume::unbounded();
 		let mut stream = process.stream.lock();
 		let backlog = stream
@@ -601,9 +606,10 @@ impl ExecHost {
 	pub fn send_process_input(
 		&self,
 		name: &str,
+		generation: u64,
 		data: Option<&[u8]>,
 	) -> Result<ProcessCommandAccepted, ExecError> {
-		let process = self.named_process(name)?;
+		let process = self.named_process(name, generation)?;
 		write_input(&process.control, data)?;
 		Ok(ProcessCommandAccepted { name: name.to_owned(), props: Default::default() })
 	}
@@ -612,9 +618,10 @@ impl ExecHost {
 	pub fn signal_process(
 		&self,
 		name: &str,
+		generation: u64,
 		signal: &str,
 	) -> Result<ProcessCommandAccepted, ExecError> {
-		let process = self.named_process(name)?;
+		let process = self.named_process(name, generation)?;
 		if process.control.finished.load(Ordering::Acquire) {
 			return Err(ExecError::RunNotFound);
 		}
@@ -627,8 +634,15 @@ impl ExecHost {
 	pub fn stop_process(
 		&self,
 		name: &str,
+		generation: u64,
 		grace: Duration,
 	) -> Result<ProcessCommandAccepted, ExecError> {
+		let process = self.named_process(name, generation)?;
+		process.control.cancel(grace);
+		Ok(ProcessCommandAccepted { name: name.to_owned(), props: Default::default() })
+	}
+
+	fn named_process(&self, name: &str, generation: u64) -> Result<Arc<NamedProcess>, ExecError> {
 		let key = Str::from(name);
 		let process = self
 			.inner
@@ -636,20 +650,15 @@ impl ExecHost {
 			.lock()
 			.get(&key)
 			.cloned()
-			.ok_or_else(|| ExecError::ProcessNotFound(key))?;
-		process.control.cancel(grace);
-		Ok(ProcessCommandAccepted { name: name.to_owned(), props: Default::default() })
-	}
-
-	fn named_process(&self, name: &str) -> Result<Arc<NamedProcess>, ExecError> {
-		let key = Str::from(name);
-		self
-			.inner
-			.processes
-			.lock()
-			.get(&key)
-			.cloned()
-			.ok_or(ExecError::ProcessNotFound(key))
+			.ok_or_else(|| ExecError::ProcessNotFound(key.clone()))?;
+		if process.generation != generation {
+			return Err(ExecError::StaleProcessGeneration {
+				name:      key,
+				requested: generation,
+				current:   process.generation,
+			});
+		}
+		Ok(process)
 	}
 
 	fn run(&self, exec: &[u8]) -> Result<Arc<RunControl>, ExecError> {

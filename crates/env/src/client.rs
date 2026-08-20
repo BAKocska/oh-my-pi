@@ -700,7 +700,8 @@ impl EnvClient {
 		}
 	}
 
-	/// Attaches to ordered output and state events for a named process.
+	/// Attaches to ordered output and state events for one named-process
+	/// generation.
 	pub async fn attach_output(
 		&self,
 		request: AttachOutput,
@@ -711,7 +712,7 @@ impl EnvClient {
 		Ok(ProcessAttachment { stream })
 	}
 
-	/// Sends bytes or EOF to a server-owned named process.
+	/// Sends bytes or EOF to one generation of a server-owned named process.
 	pub async fn send_process_input(
 		&self,
 		request: SendInput,
@@ -721,7 +722,7 @@ impl EnvClient {
 			.await
 	}
 
-	/// Sends a signal to a server-owned named process.
+	/// Sends a signal to one generation of a server-owned named process.
 	pub async fn signal_process(
 		&self,
 		request: SignalProcess,
@@ -731,7 +732,7 @@ impl EnvClient {
 			.await
 	}
 
-	/// Stops a server-owned named process.
+	/// Stops one generation of a server-owned named process.
 	pub async fn stop_process(
 		&self,
 		request: StopProcess,

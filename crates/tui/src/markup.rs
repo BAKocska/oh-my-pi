@@ -1864,6 +1864,18 @@ mod tests {
 	}
 
 	#[test]
+	fn diff_markup_context_limits_unchanged_lines() {
+		let ctx = UiContext::default();
+		let ui = crate::Ui::from_markup(
+			"<diff context=1>@@ -1 +1 @@\n old far\n old near\n-old\n+new\n new near\n new far</diff>",
+			20,
+			ctx,
+		)
+		.unwrap();
+		assert_eq!(ui.height(), 5);
+	}
+
+	#[test]
 	fn extension_reserved_chrome_degrades_to_custom_element() {
 		let ctx = UiContext::default();
 		let root = parse_with_origin(

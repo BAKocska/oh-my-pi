@@ -526,11 +526,11 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	),
 	symbol!(
 		"docs/py/11-env.md",
-		"omp.env.Run.write",
+		"omp.env.Run.stdin",
 		"(data) -> None",
 		CallbackAbi::None,
 		ENV_EPHEMERAL,
-		"await run.write(data)",
+		"await run.stdin(data)",
 		Some("omp.env.sh.stdin")
 	),
 	symbol!(
@@ -614,11 +614,11 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	),
 	symbol!(
 		"docs/py/11-env.md",
-		"omp.env.Process.write",
+		"omp.env.Process.send",
 		"(data) -> None",
 		CallbackAbi::None,
 		ENV_EPHEMERAL,
-		"await process.write(data)",
+		"await process.send(data)",
 		Some("omp.env.proc.send_input")
 	),
 	symbol!(
@@ -633,11 +633,20 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	symbol!(
 		"docs/py/11-env.md",
 		"omp.env.Process.stop",
-		"() -> None",
+		"() -> ProcessInfo",
 		CallbackAbi::None,
 		ENV_WRITE,
 		"await process.stop()",
 		Some("omp.env.proc.stop")
+	),
+	symbol!(
+		"docs/py/11-env.md",
+		"omp.env.Process.restart",
+		"() -> Process",
+		CallbackAbi::None,
+		ENV_WRITE,
+		"await process.restart()",
+		Some("omp.env.proc.restart")
 	),
 	symbol!(
 		"docs/py/11-env.md",

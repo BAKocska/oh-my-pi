@@ -422,6 +422,14 @@ CORE (1000) → INTEGRATION (700) → ENHANCEMENT (500) → DEFAULT (0) → FALL
   `grep` addresses, while the model-facing `grep` remains exactly the core
   tool.
 
+**Resolved (2026-08-20 ruling):** the sanctioned presentation spelling is
+`@omp.renderer("grep", decorates=True)`. A decoration registration records that mode in
+the frozen renderer snapshot; its fold returns augmentation TML, and the host composes it
+after the winning base render. It does not claim or replace the core tool, and extensions
+never perform composition or cache invalidation themselves. The presentation cache and
+per-verdict-state purity contract are specified in
+[docs/py/07-ui.md](07-ui.md#413-renderers).
+
 ## Reference
 
 Everything below is importable from `omp`.

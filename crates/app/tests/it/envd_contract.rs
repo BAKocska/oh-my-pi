@@ -2627,6 +2627,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 	let mut attachment = client
 		.attach_output(omp_proto::env::v1::AttachOutput {
 			name: "contract-process".into(),
+			generation: 1,
 			..Default::default()
 		})
 		.await
@@ -2639,6 +2640,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 		.stop_process(StopProcess {
 			name: "contract-process".into(),
 			grace_ms: 50,
+			generation: 1,
 			..Default::default()
 		})
 		.await
@@ -2661,6 +2663,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 	let mut exited_attachment = client
 		.attach_output(omp_proto::env::v1::AttachOutput {
 			name: "contract-process".into(),
+			generation: 1,
 			..Default::default()
 		})
 		.await
@@ -2711,6 +2714,7 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 	let mut attachment = client
 		.attach_output(omp_proto::env::v1::AttachOutput {
 			name: "attach-race".into(),
+			generation: 1,
 			..Default::default()
 		})
 		.await

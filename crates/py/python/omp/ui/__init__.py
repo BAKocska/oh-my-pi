@@ -336,6 +336,16 @@ class RenderCtx:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageView:
+    """Read-only transcript message handed to a pure rendering fold."""
+
+    id: str
+    kind: str
+    role: str | None
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class SlotOptions:
     """Responsive layout options for a slot mount."""
     order: int = 100; width: int | None = None; min_width: int = 0; min_height: int = 0; max_height: int | None = None; visible_in: frozenset[Phase] = frozenset(Phase); focusable: bool = False; collapse: Collapse = Collapse.HIDE; title: str | None = None
@@ -469,11 +479,20 @@ class _Limits:
 
 limits = _Limits()
 _effect_sink: ContextVar[Callable[[dict[str, object]], None] | None] = ContextVar("omp_ui_effect_sink", default=None)
+@dataclass(frozen=True, slots=True)
+class _RendererRegistration:
+    """One host-readable device-renderer registration."""
+
+    function: Callable[..., Tml | None]
+    reduce: Callable[[object, object], object] | None
+    decorates: bool
+
+
 _handles: dict[str, "SlotHandle"] = {}
-_message_renderers: dict[str, Callable[..., Tml | None]] = {}
+_message_renderers: dict[str, Callable[[MessageView, RenderCtx], Tml | None]] = {}
 _completion_handlers: dict[str, Callable[..., object]] = {}
 _shortcut_handlers: dict[str, Callable[..., object]] = {}
-_device_renderers: dict[tuple[str, str, int], Callable[..., Tml | None]] = {}
+_device_renderers: dict[tuple[str, str, int], _RendererRegistration] = {}
 _fold_failures: set[tuple[str, str]] = set()
 _command_handlers: dict[str, Callable[..., object]] = {}
 _activation_handlers: dict[str, Callable[..., object]] = {}
@@ -663,9 +682,16 @@ async def form(title: str, fields: Sequence[object], *, options: DialogOptions |
 async def ask_user(questions: AskQuestion | Sequence[AskQuestion], *, options: DialogOptions | None = None) -> DialogOutcome: """Ask a total multi-question request."""; return await _dialog("ask_user", questions=questions, options=options)
 
 
-def message_renderer(kind: str) -> Callable[[Callable[..., Tml | None]], Callable[..., Tml | None]]:
+def message_renderer(
+    kind: str,
+) -> Callable[
+    [Callable[[MessageView, RenderCtx], Tml | None]],
+    Callable[[MessageView, RenderCtx], Tml | None],
+]:
     """Register one synchronous, pure transcript-message fold."""
-    def decorate(function: Callable[..., Tml | None]) -> Callable[..., Tml | None]:
+    def decorate(
+        function: Callable[[MessageView, RenderCtx], Tml | None],
+    ) -> Callable[[MessageView, RenderCtx], Tml | None]:
         if not callable(function) or _inspect.iscoroutinefunction(function):
             raise TypeError("message_renderer folds must be synchronous callables")
         _message_renderers[kind] = function
@@ -674,10 +700,19 @@ def message_renderer(kind: str) -> Callable[[Callable[..., Tml | None]], Callabl
 
 
 
-def renderer(name: str, *, family: str | None = None, rev: int | None = None, reduce: Callable[[object, object], object] | None = None) -> Callable[[Callable[..., Tml | None]], Callable[..., Tml | None]]:
-    """Register one exact-revision device-rendering fold."""
+def renderer(
+    name: str,
+    *,
+    family: str | None = None,
+    rev: int | None = None,
+    reduce: Callable[[object, object], object] | None = None,
+    decorates: bool = False,
+) -> Callable[[Callable[..., Tml | None]], Callable[..., Tml | None]]:
+    """Register one exact-revision base or decoration rendering fold."""
     if not name:
         raise ValueError("renderer name must not be empty")
+    if not isinstance(decorates, bool):
+        raise TypeError("renderer decorates must be a bool")
     key = (name, family or "", 0 if rev is None else rev)
     def decorate(function: Callable[..., Tml | None]) -> Callable[..., Tml | None]:
         if _inspect.iscoroutinefunction(function):
@@ -685,18 +720,19 @@ def renderer(name: str, *, family: str | None = None, rev: int | None = None, re
         if key in _device_renderers:
             raise DuplicateRenderer(f"duplicate renderer: {key!r}")
         function.__omp_renderer_reduce__ = reduce
-        _device_renderers[key] = function
+        function.__omp_renderer_decorates__ = decorates
+        _device_renderers[key] = _RendererRegistration(function, reduce, decorates)
         return function
     return decorate
 
 
 def _dispatch_renderer(name: str, family: str, rev: int, view: object, ctx: RenderCtx) -> Tml | None:
     """Run one exact device fold; failures select the native fallback."""
-    function = _device_renderers.get((name, family, rev))
-    if function is None:
+    registration = _device_renderers.get((name, family, rev))
+    if registration is None:
         return None
     try:
-        value = function(view, ctx)
+        value = registration.function(view, ctx)
         if value is not None and not isinstance(value, Tml):
             raise TypeError("renderer folds must return Tml or None")
         return value
@@ -705,7 +741,7 @@ def _dispatch_renderer(name: str, family: str, rev: int, view: object, ctx: Rend
         return None
 
 
-def _dispatch_message_renderer(kind: str, message: object, ctx: RenderCtx) -> Tml | None:
+def _dispatch_message_renderer(kind: str, message: MessageView, ctx: RenderCtx) -> Tml | None:
     """Run one deadline-owned message fold; ``None`` selects native rendering."""
     function = _message_renderers.get(kind)
     if function is None:

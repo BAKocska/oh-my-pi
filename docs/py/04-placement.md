@@ -901,13 +901,13 @@ The placement namespace. Every function is `async` and rides DATA except
 ```python
 @dataclasses.dataclass(frozen=True, slots=True)
 class Spill:
-    buf: collections.abc.Buffer
+    value: bytes
     media_type: str = "application/octet-stream"
 ```
 
 A marker a worker returns instead of a large buffer.
 
-`Spill` participates in pickle protocol 5: `buf` is emitted as an out-of-band
+`Spill` participates in pickle protocol 5: `value` is emitted as an out-of-band
 `PickleBuffer`, so it leaves the worker as its own length-prefixed frame and never
 enters the pickle stream. The supervisor reads the frame index from the message
 header, streams that frame directly into the content-addressed blob store, drops it

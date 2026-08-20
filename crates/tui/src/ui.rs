@@ -2372,6 +2372,7 @@ mod tests {
 		"shimmer",
 		"reveal",
 		"partial",
+		"context",
 	];
 
 	#[test]

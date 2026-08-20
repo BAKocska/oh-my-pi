@@ -367,7 +367,7 @@ class ProviderHandle:
 	async def replace(self, spec: ProviderSpec) -> None: ...
 	async def models(self) -> tuple[ModelCard, ...]: ...
 	async def is_authenticated(self) -> bool: ...
-	async def request(self, operation: Operation, request: ImageRequest) -> ImageResult: ...
+	async def request(self, operation: Operation, request: ImageRequest | SpeechRequest | TranscriptionRequest) -> ImageResult | SpeechResult | TranscriptionResult: ...
 ```
 
 `retract()` removes the declaration; models vanish from selection at the next catalog generation and
@@ -878,10 +878,46 @@ class ImageRequest:
 class ImageResult:
     images: tuple[BlobRef, ...]
     cost_nanos_usd: int
+
+class AudioFormat(StrEnum):
+    PCM16 = "pcm16"
+    PCM24 = "pcm24"
+    F32 = "f32"
+    MP3 = "mp3"
+    AAC = "aac"
+    OPUS = "opus"
+    FLAC = "flac"
+    WAV = "wav"
+
+@dataclass(frozen=True, slots=True)
+class SpeechRequest:
+    model: str
+    text: str
+    voice: str
+    format: AudioFormat | None = None
+
+@dataclass(frozen=True, slots=True)
+class SpeechResult:
+    audio: BlobRef
+    format: AudioFormat
+    cost_nanos_usd: int
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionRequest:
+    model: str
+    audio: EnvPath | BlobRef
+    language: str | None = None
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionResult:
+    text: str
+    language: str | None
+    cost_nanos_usd: int
 ```
 
-Results are blob-backed so image bytes never expand into Python prose or a generic response mapping;
-`cost_nanos_usd` is Core's settled per-call usage receipt, not an extension estimate.
+Results are blob-backed so generated image and speech bytes never expand into Python prose or a
+generic response mapping; `cost_nanos_usd` is Core's settled per-call usage receipt, not an extension
+estimate.
 
 `.plan/feature-map/voice.md` names the concrete cases these serve: Kokoro-82M and xAI Grok voices for
 `SpeechCaps`, Whisper and Parakeet TDT for `TranscriptionCaps`, `gpt-live-1-codex` over

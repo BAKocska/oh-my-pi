@@ -458,9 +458,10 @@ fn job_event_counts(journal: &Journal, job_id: &str) -> (usize, usize) {
 async fn wait_terminal(client: &EnvClient, name: &str, generation: u64) {
 	let mut attachment = client
 		.attach_output(AttachOutput {
-			name:           name.to_owned(),
+			name: name.to_owned(),
 			after_sequence: 0,
-			props:          None,
+			generation,
+			props: None,
 		})
 		.await
 		.expect("attach to named process");

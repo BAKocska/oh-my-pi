@@ -218,7 +218,11 @@ async fn detach_reparents_the_exact_foreground_process_without_cancelling_it() {
 	drop(run);
 
 	let attachment = host
-		.attach_output(&AttachOutput { name: "retained-job".to_owned(), ..Default::default() })
+		.attach_output(&AttachOutput {
+			name: "retained-job".to_owned(),
+			generation: 1,
+			..Default::default()
+		})
 		.expect("attachment");
 	let mut terminal = attachment.state.status.is_some();
 	let mut output = Vec::new();

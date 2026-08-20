@@ -40,6 +40,7 @@ pub struct DiffView {
 	cached_width:       u16,
 	cached_width_epoch: u64,
 	cached_revision:    u64,
+	cached_context:     Option<u16>,
 }
 
 impl DiffView {
@@ -54,6 +55,7 @@ impl DiffView {
 			cached_width:       0,
 			cached_width_epoch: 0,
 			cached_revision:    0,
+			cached_context:     None,
 		}
 	}
 
@@ -102,13 +104,20 @@ impl DiffView {
 		let width = width.max(1);
 		let width_epoch = width_config_epoch();
 		let revision = ctx.revision;
+		let context = self.props.context();
 
 		if self.cached_width == width
 			&& self.cached_width_epoch == width_epoch
 			&& self.cached_revision == revision
+			&& self.cached_context == context
 		{
 			if self.rendered_lines == self.lines.len() {
 				return;
+			}
+			if context.is_some() {
+				// A newly appended change can make earlier trailing context visible.
+				self.rich.clear();
+				self.rendered_lines = 0;
 			}
 		} else {
 			self.rich.clear();
@@ -116,6 +125,7 @@ impl DiffView {
 			self.cached_width = width;
 			self.cached_width_epoch = width_epoch;
 			self.cached_revision = revision;
+			self.cached_context = context;
 		}
 
 		let (info, muted, ok, err) = (ctx.theme.info, ctx.theme.muted, ctx.theme.ok, ctx.theme.err);
@@ -139,7 +149,30 @@ impl DiffView {
 		let mut c_remove = Prefix::default();
 		c_remove.push(Style::new().fg(err), prefixes.continuation);
 
-		for line in &self.lines[self.rendered_lines..] {
+		let mut context_run = (0, 0, false, false);
+		for (offset, line) in self.lines[self.rendered_lines..].iter().enumerate() {
+			let index = self.rendered_lines + offset;
+			if let Some(count) = context
+				&& line.kind == DiffKind::Context
+			{
+				if index >= context_run.1 {
+					let end = self.lines[index..]
+						.iter()
+						.position(|candidate| candidate.kind != DiffKind::Context)
+						.map_or(self.lines.len(), |offset| index + offset);
+					let changed_before = index > 0
+						&& matches!(self.lines[index - 1].kind, DiffKind::Add | DiffKind::Remove);
+					let changed_after = end < self.lines.len()
+						&& matches!(self.lines[end].kind, DiffKind::Add | DiffKind::Remove);
+					context_run = (index, end, changed_before, changed_after);
+				}
+				let count = usize::from(count);
+				let near_before = context_run.2 && index - context_run.0 < count;
+				let near_after = context_run.3 && context_run.1 - index <= count;
+				if !near_before && !near_after {
+					continue;
+				}
+			}
 			let (prefix, cont, text_style) = match line.kind {
 				DiffKind::Header => (&p_header, &c_header, Style::new().fg(info).bold()),
 				DiffKind::Context => (&p_context, &c_context, Style::new().fg(ctx.theme.fg)),

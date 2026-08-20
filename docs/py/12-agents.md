@@ -284,9 +284,9 @@ two ceilings on the review's list live beside this type rather than in it:
 tree-wide subagent *concurrency* is the session ceiling
 (`DEFAULT_MAX_CONCURRENCY`, counted over the whole tree, not per parent), and
 the recursive *continuation* budget is `ContinuationLedger`'s subtree
-accounting below. Inference-side budgets — per-provider spend, REVIEW-phase
-classifier budgets, role ceilings — are owned by `docs/py/13-inference.md`;
-this type governs subagents only.
+accounting below. Inference-side budgets — per-provider spend, hook classifier
+budgets, role ceilings — are owned by `docs/py/13-inference.md`; this type
+governs subagents only.
 
 #### `@dataclass(frozen=True, slots=True) class omp.agents.SubagentSpec`
 
@@ -342,9 +342,9 @@ able to trigger it. `omp.agents.spawn` carries generated
 and the Core — not the Environment, and not author memory — enforces it for
 this CONTROL operation. In v1 the distinction is invisible from inside a
 device, because a device body only starts at `EFFECTS_AUTHORIZED`
-(`docs/py/03-params.md`); it is load-bearing for hooks, where a REVIEW-phase
-classifier may call `completion()` (paid inference is legal there) but no hook
-phase may spawn.
+(`docs/py/03-params.md`); it is load-bearing for hooks, where a REVIEW
+classifier or the turn-scoped `turn_start` TRANSFORM may call `completion()`
+(paid inference is legal in both) but no hook phase may spawn.
 
 #### `async omp.agents.spawn(spec: SubagentSpec) -> SubagentHandle`
 
@@ -630,7 +630,7 @@ exactly the reason a subagent does: it spends the user's tokens.
 `usage: Usage`, `model: str`, `fell_back: bool`,
 `fault: omp.Fault | None` (why the fallback fired, when it did).
 
-#### `async omp.agents.completion(prompt, *, role="smol", system=None, choices=None, schema=None, default=..., scope="turn", max_output_tokens=None, deadline=omp.Duration("10s"), labels={}) -> Completion`
+#### `async omp.agents.completion(prompt: str | Sequence[omp.TextPart | omp.BlobPart], *, role="smol", system=None, choices=None, schema=None, default=..., scope="turn", max_output_tokens=None, deadline=omp.Duration("10s"), labels={}) -> Completion`
 
 - **Channel** CONTROL. **Latency class** per-call, network-bound. **Failure**
   depends entirely on `default`, below.
@@ -638,6 +638,10 @@ exactly the reason a subagent does: it spends the user's tokens.
   journal item. Use it for classification, extraction, and titling — the
   `ctx.model.call` / `ctx.model.stream` shape from
   `.plan/feature-map/discovery.md:190`.
+- `prompt` is either plain text or an ordered sequence containing only
+  `omp.TextPart` and `omp.BlobPart` values. The typed sequence is the media path
+  for one-shot vision requests; blobs remain typed and are never encoded into
+  prose.
 - `role` is a **role selector** resolved by `docs/py/13-inference.md`, not a
   model string. A policy asks for `"smol"` and lets deployment decide; hardcoding
   a vendor model is how an extension becomes unusable on someone else's setup.
@@ -666,9 +670,21 @@ exactly the reason a subagent does: it spends the user's tokens.
 - Like every inference-triggering CONTROL symbol it carries generated
   `OperationSpec(minimum_phase, durability, cost=PAID, authority)` metadata,
   enforced by the Core (`docs/py/00-overview.md`). Per the phase legality
-  matrix it is legal from REVIEW-phase hooks — the budgeted paid-classifier
-  phase (`docs/py/05-hooks.md`) — and from device bodies, which in v1 begin at
+  matrix it is legal from REVIEW hooks — the general budgeted paid-classifier
+  phase — and from turn-scoped TRANSFORM hooks, today exactly `turn_start`
+  (`docs/py/05-hooks.md`).
+  Per-call TRANSFORM hooks, including `tool_call` and `before_call`-class events,
+  remain illegal. It is also legal from device bodies, which in v1 begin at
   `EFFECTS_AUTHORIZED`. Nothing speculative can trigger it.
+
+  **Resolved (2026-08-20 ruling): the once-per-turn thinking classifier had no
+  legal phase: REVIEW cannot return `Modify`, while TRANSFORM could not call
+  `completion()`. The narrow `turn_start` exception gives that classifier one
+  legal phase without permitting paid inference in per-call transforms. It does
+  not weaken the fail-safe classifier posture required by
+  [`13-inference.md` §Feature-map reconciliation](13-inference.md#feature-map-reconciliation):
+  use a constrained ordered-choice ladder and a caller-chosen deterministic
+  fallback, never unconstrained output or a permissive library default.**
 - **`scope` picks the cancellation lifetime**, and it is the same structural
   choice `SubagentHandle.release()` makes. `scope="turn"` (default) binds the
   call to the caller's invocation guard: turn loss, user interrupt, or deadline
@@ -871,8 +887,8 @@ Four frozen dataclasses, one union alias.
 
 #### Delivery targets
 
-- **`Inject(mode: DeliveryMode = DeliveryMode.NEXT_TURN, visible: bool = False)`**
-  — the prompt goes to *this* agent.
+- **`Inject(prompt: str, mode: DeliveryMode = DeliveryMode.NEXT_TURN, visible: bool = False)`**
+  — `prompt` is required and goes to *this* agent.
 - **`Spawn(spec: SubagentSpec)`** — the firing spawns a child. The spec's
   `background` is forced `True`; a schedule has no invocation to be bracketed
   by. This is the shape `pi-schedule-prompt` called "isolated subagent
@@ -2828,8 +2844,8 @@ Changes this file made for Revision 2, and the review point that drove each:
   Core; reversal recorded at `background` — Revision 1 gated only
   backgrounding and implicitly allowed speculative foreground spawns;
   `SPAWN_REFUSAL_UNCOMMITTED` renamed `SPAWN_REFUSAL_MINIMUM_PHASE`;
-  `completion` stated legal from REVIEW-phase hooks per the phase legality
-  matrix.
+  `completion` stated legal from REVIEW hooks and, narrowly, the turn-scoped
+  `turn_start` TRANSFORM; per-call transforms remain illegal.
 - **Global rename table applied file-wide** (rulings §0, P0#8, smaller
   corrections): hook examples moved to the `(event, ctx)` ABI with
   `phase=omp.HookPhase.*` (domain-return `agent_settled` takes no phase);

@@ -1765,7 +1765,10 @@ impl EnvServer {
 						return;
 					},
 				};
-				match self.exec.send_process_input(&request.name, data.as_deref()) {
+				match self
+					.exec
+					.send_process_input(&request.name, request.generation, data.as_deref())
+				{
 					Ok(response) => {
 						send_body(
 							responses,
@@ -1778,7 +1781,10 @@ impl EnvServer {
 				}
 			},
 			client_frame::Body::SignalProcess(request) => {
-				match self.exec.signal_process(&request.name, &request.signal) {
+				match self
+					.exec
+					.signal_process(&request.name, request.generation, &request.signal)
+				{
 					Ok(response) => {
 						send_body(
 							responses,
@@ -1791,10 +1797,11 @@ impl EnvServer {
 				}
 			},
 			client_frame::Body::StopProcess(request) => {
-				match self
-					.exec
-					.stop_process(&request.name, Duration::from_millis(request.grace_ms))
-				{
+				match self.exec.stop_process(
+					&request.name,
+					request.generation,
+					Duration::from_millis(request.grace_ms),
+				) {
 					Ok(response) => {
 						send_body(
 							responses,
@@ -4996,6 +5003,7 @@ async fn send_exec_error(
 			pb::ProtocolErrorCode::NotFound
 		},
 		ExecError::ProcessExists(_) => pb::ProtocolErrorCode::AlreadyExists,
+		ExecError::StaleProcessGeneration { .. } => pb::ProtocolErrorCode::PreconditionFailed,
 		ExecError::UnsupportedSignal(_) => pb::ProtocolErrorCode::Unsupported,
 		_ => pb::ProtocolErrorCode::Internal,
 	};

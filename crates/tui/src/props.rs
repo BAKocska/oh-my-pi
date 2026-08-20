@@ -440,6 +440,8 @@ define_props! {
 	Reveal("reveal") => reveal: Toggle<Ms<250>> [toggle Duration; "Returns the reveal horizon, with a bare flag selecting 250ms."];
 	/// Marks content as an incomplete stream whose final-only repairs must stay disabled.
 	Partial("partial") => partial: bool [default bool = false; "Returns whether the content is still streaming."];
+	/// Number of unchanged lines retained around each diff change.
+	Context("context") => context: u16 [copy u16; "Returns the configured diff context-line count."];
 }
 
 /// A property value rejected by the key-aware parser.
@@ -1187,7 +1189,7 @@ mod tests {
 			assert_eq!(name.parse(), Ok(prop));
 			count += 1;
 		}
-		assert_eq!(count, 70);
+		assert_eq!(count, 71);
 	}
 
 	#[test]

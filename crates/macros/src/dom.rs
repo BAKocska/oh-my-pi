@@ -1114,6 +1114,7 @@ fn prop_variant(name: &str) -> Option<&'static str> {
 		"status" => "Status",
 		"shimmer" => "Shimmer",
 		"reveal" => "Reveal",
+		"context" => "Context",
 		_ => return None,
 	})
 }
@@ -1187,11 +1188,12 @@ mod tests {
 		"lift",
 		"shimmer",
 		"reveal",
+		"context",
 	];
 
 	#[test]
 	fn known_attributes_match_mirrored_fixture() {
-		assert_eq!(ATTR_FIXTURE.len(), 65);
+		assert_eq!(ATTR_FIXTURE.len(), 66);
 		for &name in ATTR_FIXTURE {
 			assert!(prop_variant(name).is_some(), "missing macro entry for {name:?}");
 		}

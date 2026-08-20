@@ -526,9 +526,15 @@ buckets are `0`, never `None`, so arithmetic never needs a guard.
 the prompt rather than reconstructed by an extension hashing whatever it could reach.
 
 - `digest: str` — BLAKE3-128 hex over the assembled cacheable prefix.
-- `slots: Mapping[str, str]` — per-slot digest, keyed by prompt-slot key (`docs/py/08-context.md`).
-  Covers every contribution: harness sections, `AGENTS.md`, skills, device docs inlined behind
-  the `dyn` catalog (`{"do_": "docs/<path>"}`), and each `@omp.prompt_slot`.
+- `slots: Mapping[str, PromptSlotFingerprint]` — per-slot facts keyed by prompt-slot key
+  (`docs/py/08-context.md`). Each value carries `digest: str`, `size_bytes: int`, and
+  `band: SlotClass`; the band uses the frozen stability vocabulary from that page. Covers every
+  contribution: harness sections, `AGENTS.md`, skills, device docs inlined behind the `dyn` catalog
+  (`{"do_": "docs/<path>"}`), and each `@omp.prompt_slot`.
+
+**Resolved (2026-08-20 ruling): slot fingerprints carry their assembled byte size and frozen
+stability band; extensions never infer either from a slot key.**
+
 - `changed: tuple[str, ...]` — slot keys whose digest differs from the previous request in this
   session, in assembly order. Empty means the prefix was byte-identical.
   `@mrclrchtr/supi-cache`'s `diffFingerprints(prev, cur)` is this field.
@@ -793,11 +799,17 @@ The usage-bearing event, published once per settled request from its `Outcome`.
 - `response_id: str | None` — provider-issued response identifier.
 - `service_tier: str | None` — the tier actually served.
 - `stop: StopReason`, `finish_reason: FinishReason`.
-- `tokens: Tokens`, `cost: Cost | None`, `accuracy: Accuracy`.
+- `usage: Tokens`, `cost: Cost | None`, `accuracy: Accuracy`.
 - `latency_ms: int` — request wall-clock duration.
 - `ttft_ms: int | None` — time to first chunk, `None` for non-streaming requests.
 - `prompt: PromptFingerprint`.
 - `context: ContextSnapshot`.
+- `request_content: bytes | None`, `response_content: bytes | None` — raw request and response
+  content, populated only under `Capture.CONTENT`; both are `None` at lower capture levels.
+
+**Resolved (2026-08-20 ruling): request and response content are separate capture-gated byte
+fields; neither is reconstructed from token detail or tool arguments.**
+
 - `effort: str | None`, `tool_choice: str | None`.
 - `max_tokens: int | None`, `temperature: float | None`, `top_p: float | None`, `top_k: int | None`,
   `seed: int | None`, `stop_sequences: tuple[str, ...]` — the sampling parameters as sent, after
@@ -1506,9 +1518,10 @@ field, not per extension.
   except argument-quality work.
 - `Capture.STRUCTURE` = `"structure"` — adds structured payloads, faults, `decoded_args`, `repairs`,
   and `pulls`, with field-level redaction applied. The default for a trusted-tier extension.
-- `Capture.CONTENT` = `"content"` — adds `args_raw` and `Tokens.detail`, the two fields that can
-  carry verbatim user or provider content. Requires the `telemetry.capture_content` capability
-  **and** an explicit durable user grant; never implied by trust tier.
+- `Capture.CONTENT` = `"content"` — adds `args_raw`, `ModelRequest.request_content`,
+  `ModelRequest.response_content`, and `Tokens.detail`, the content-class fields that can carry
+  verbatim user or provider content. Requires the `telemetry.capture_content` capability **and** an
+  explicit durable user grant; never implied by trust tier.
 
 #### Field classes and redaction
 

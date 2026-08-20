@@ -213,7 +213,12 @@ impl JobBoard {
 		self
 			.inner
 			.env
-			.stop_process(StopProcess { name: name.to_string(), grace_ms, props: None })
+			.stop_process(StopProcess {
+				name: name.to_string(),
+				grace_ms,
+				generation: *generation,
+				props: None,
+			})
 			.await
 			.map_err(|error| JobError::Environment(Str::new(error.to_string())))?;
 		Ok(CancelOutcome::Accepted)
@@ -541,6 +546,7 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, JobSet
 		.attach_output(AttachOutput {
 			name:           name.to_string(),
 			after_sequence: 0,
+			generation:     *generation,
 			props:          None,
 		})
 		.await

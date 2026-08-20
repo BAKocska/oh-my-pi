@@ -98,6 +98,19 @@ impl ChatHubBackend {
 			.map_err(|error| fault(error.to_string()))
 	}
 
+	async fn process_generation(&self, name: &str) -> Result<u64, Fault> {
+		self
+			.env
+			.list_processes(ListProcesses { props: None })
+			.await
+			.map_err(|error| fault(error.to_string()))?
+			.processes
+			.into_iter()
+			.find(|process| process.name == name)
+			.map(|process| process.generation)
+			.ok_or_else(|| fault(format!("process {name:?} was not found")))
+	}
+
 	async fn peer_send(&self, params: &Params) -> Result<Response, Fault> {
 		let to = params
 			.to
@@ -321,12 +334,14 @@ impl ChatHubBackend {
 			.name
 			.as_deref()
 			.ok_or_else(|| fault("process name is required"))?;
+		let generation = self.process_generation(name).await?;
 		let mut attachment = self
 			.env
 			.attach_output(AttachOutput {
-				name:           name.to_owned(),
+				name: name.to_owned(),
 				after_sequence: params.cursor.unwrap_or(0),
-				props:          None,
+				generation,
+				props: None,
 			})
 			.await
 			.map_err(|error| fault(error.to_string()))?;
@@ -356,12 +371,14 @@ impl ChatHubBackend {
 			.name
 			.as_deref()
 			.ok_or_else(|| fault("process name is required"))?;
+		let generation = self.process_generation(name).await?;
 		let mut attachment = self
 			.env
 			.attach_output(AttachOutput {
-				name:           name.to_owned(),
+				name: name.to_owned(),
 				after_sequence: params.cursor.unwrap_or(0),
-				props:          None,
+				generation,
+				props: None,
 			})
 			.await
 			.map_err(|error| fault(error.to_string()))?;
@@ -408,13 +425,15 @@ impl ChatHubBackend {
 			.name
 			.as_deref()
 			.ok_or_else(|| fault("process name is required"))?;
+		let generation = self.process_generation(name).await?;
 		if let Some(signal) = params.signal {
 			self
 				.env
 				.signal_process(SignalProcess {
-					name:   name.to_owned(),
+					name: name.to_owned(),
 					signal: format!("{signal:?}").to_uppercase(),
-					props:  None,
+					generation,
+					props: None,
 				})
 				.await
 				.map_err(|error| fault(error.to_string()))?;
@@ -435,8 +454,9 @@ impl ChatHubBackend {
 			self
 				.env
 				.send_process_input(SendInput {
-					name:  name.to_owned(),
+					name: name.to_owned(),
 					input: Some(send_input::Input::Data(Bytes::from(data))),
+					generation,
 					props: None,
 				})
 				.await
@@ -483,9 +503,15 @@ impl HubBackend for ChatHubBackend {
 					.as_deref()
 					.ok_or_else(|| fault("process name is required"))?;
 				let grace_ms = params.timeout.unwrap_or(5.0).mul_add(1_000.0, 0.0) as u64;
+				let generation = self.process_generation(name).await?;
 				self
 					.env
-					.stop_process(StopProcess { name: name.to_owned(), grace_ms, props: None })
+					.stop_process(StopProcess {
+						name: name.to_owned(),
+						grace_ms,
+						generation,
+						props: None,
+					})
 					.await
 					.map_err(|error| fault(error.to_string()))?;
 				Self::response(json!({ "name": name, "stopping": true }))
@@ -501,12 +527,14 @@ impl HubBackend for ChatHubBackend {
 					.get(name)
 					.cloned()
 					.ok_or_else(|| fault("process launch specification is not retained"))?;
+				let generation = self.process_generation(name).await?;
 				self
 					.env
 					.stop_process(StopProcess {
-						name:     name.to_owned(),
+						name: name.to_owned(),
 						grace_ms: 5_000,
-						props:    None,
+						generation,
+						props: None,
 					})
 					.await
 					.map_err(|error| fault(error.to_string()))?;
