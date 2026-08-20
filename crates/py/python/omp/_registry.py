@@ -18,13 +18,13 @@ from _omp import (
     DeclarationLimit,
     DeclarationSealed,
     DuplicateRegistration,
-    QuotaExceeded,
     QuotaStatus,
     ResourceReceipt,
     resources,
 )
 
 
+from . import QuotaExceeded
 from ._errors import SpecError
 from . import packages as _packages
 

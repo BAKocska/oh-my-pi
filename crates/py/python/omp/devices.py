@@ -31,6 +31,7 @@ from typing import Any
 from _omp import DeclarationSealed, Duration
 from ._errors import ExtensionError, NotWiredError
 from ._registry import registry
+from .journal import JournalError
 from .packages import Provenance
 from .placement import Place
 from .policy import Tier
@@ -118,8 +119,13 @@ class DeviceNameError(DeviceError):
     """Raised when a device name or precedence claim is invalid."""
 
 
-class SchemaError(DeviceError):
-    """Raised when a device schema or example is invalid."""
+class SchemaError(DeviceError, JournalError):
+    """Raised when a device schema or example is invalid.
+
+    Spans both documented taxonomies: schema failures surface while
+    declaring or decoding a device (docs/py/01) and while decoding a
+    journal-recorded call against its schema revision (docs/py/09).
+    """
 
 
 class PrecedenceConflict(DeviceError):

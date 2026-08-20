@@ -1824,6 +1824,60 @@ assert dict(content_row.metadata) == {
     "description": "Review a change.",
 }
 
+# Projection hooks can drop whole result parts without discarding typed verdicts.
+drop_parts = omp.DropParts(
+    ids=("tool-result:42",),
+    reason="historical useless result exceeds the projection budget",
+)
+assert drop_parts.ids == ("tool-result:42",)
+assert drop_parts.reason.startswith("historical")
+assert omp.DropParts.__dataclass_params__.frozen
+assert tuple(field.name for field in dataclasses.fields(omp.DropParts)) == (
+    "ids",
+    "reason",
+)
+assert typing.get_type_hints(omp.ContextPatch)["drop_parts"] == list[omp.DropParts]
+drop_patch = omp.ContextPatch()
+assert drop_patch.is_empty()
+drop_patch.drop_parts.append(drop_parts)
+combined_patch = omp.ContextPatch(
+    prune=[omp.Prune(ids=("stale-message",))],
+    replace=[
+        omp.Replace(
+            ids=("verbose-message",),
+            parts=(omp.Part.text("summary"),),
+        )
+    ],
+).merge(drop_patch)
+assert combined_patch.drop_parts == [drop_parts]
+assert not combined_patch.is_empty()
+
+# Hard-quota faults retain the quota identity and atomic receipt snapshot.
+quota_receipt = omp.resources()
+quota_error = omp.QuotaExceeded(
+	quota="journal.appends",
+	receipt=quota_receipt,
+)
+assert quota_error.quota == "journal.appends"
+assert quota_error.receipt is quota_receipt
+assert "journal.appends" in str(quota_error)
+assert issubclass(omp.QuotaExceeded, omp.OmpError)
+assert "QuotaExceeded" in omp.__all__
+
+# Journal failures preserve their documented family and partial-append detail.
+journal_entry_id = omp.EntryId(session="session-1", index=7)
+journal_error = omp.JournalError(
+    "only a prefix was appended",
+    appended=[journal_entry_id],
+)
+assert omp.JournalError is omp.journal.JournalError
+assert issubclass(omp.JournalError, omp.OmpError)
+assert issubclass(omp.StateScopeDenied, omp.JournalError)
+assert str(journal_error) == "only a prefix was appended"
+assert journal_error.appended == [journal_entry_id]
+assert "JournalError" in omp.__all__
+assert "JournalError" in omp.journal.__all__
+
 # FREEZE evaluates deferred availability exactly once and seals the projection.
 snapshot = registry_module.freeze_declarations()
 assert bare_definition in snapshot.providers

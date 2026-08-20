@@ -1777,14 +1777,14 @@ async def watch_cache(event: omp.telemetry.Event, ctx: omp.Context) -> None:
         case omp.telemetry.Compaction():
             prev = None                       # a compaction legitimately resets the prefix
         case omp.telemetry.ModelRequest() as req:
-            rate = req.tokens.cache_hit_rate
+            rate = req.usage.cache_hit_rate
             hit_rate.record(rate, model=req.served_model)
             omp.journal.append(CacheTurn(
                 rate=rate,
                 stable_prefix_bytes=req.prompt.prefix_stable_bytes,
                 changed_slots=req.prompt.changed,
             ))
-            if prev is not None and prev.tokens.cache_hit_rate - rate > THRESHOLD:
+            if prev is not None and prev.usage.cache_hit_rate - rate > THRESHOLD:
                 cause = (
                     f"prompt slots changed: {', '.join(req.prompt.changed)}"
                     if req.prompt.changed

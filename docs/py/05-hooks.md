@@ -324,7 +324,8 @@ behaviour, not today's.
 A hook must be able to consult the world in the middle of forming its decision — read the journal,
 read a file through `omp.env`, run a budgeted completion in REVIEW or the turn-scoped `turn_start`
 TRANSFORM — without deadlocking anything.
-CONTROL is full-duplex and request-multiplexed: when a handler awaits `omp.journal.state(...)`, the
+CONTROL is full-duplex and request-multiplexed: when a handler awaits `omp.state.latest(DeclaredKind, scope=...)`,
+the
 host allocates a fresh `request_id` and writes a request frame on the same connection the pending
 decision is riding.
 
@@ -2182,20 +2183,34 @@ the toolset costs a prompt-cache miss every transition; and the `context` hook r
 client-side.
 
 ```python
+from dataclasses import dataclass
+
 import omp
 
 PLAN_DEVICES = frozenset({"read", "grep", "glob", "plan"})
 
+@omp.entry_kind("dev.dreki_gg.plan.state", rev="v.1")
+@dataclass(frozen=True, slots=True)
+class PlanState:
+	mode: str
+	model: omp.ModelRef
+
+async def current_plan_state() -> PlanState | None:
+	record = await omp.state.latest(PlanState, scope=omp.StateScope.PROJECT)
+	return None if record is None else record.value
+
 @omp.hook("device_list", phase=omp.HookPhase.TRANSFORM, order=50, on_failure=omp.OnFailure.DENY)
 async def narrow_to_plan_devices(event: omp.DeviceListEvent, ctx: omp.Context) -> omp.HookDecision:
-	if await omp.journal.state("plan/mode") != "plan":
+	state = await current_plan_state()
+	if state is None or state.mode != "plan":
 		return omp.Defer()
 	keep = tuple(d for d in event.devices if d.name in PLAN_DEVICES)
 	return omp.Modify(patch={"devices": keep}, reason="plan mode is read-only")
 
 @omp.hook("tool_call", phase=omp.HookPhase.PRECHECK, on_failure=omp.OnFailure.DENY)
 async def no_writes_while_planning(event: omp.ToolCallEvent, ctx: omp.Context) -> omp.HookDecision:
-	if await omp.journal.state("plan/mode") != "plan":
+	state = await current_plan_state()
+	if state is None or state.mode != "plan":
 		return omp.Defer()
 	match event.target:
 		case omp.CoreTool(name="write" | "edit"):
@@ -2207,9 +2222,10 @@ async def no_writes_while_planning(event: omp.ToolCallEvent, ctx: omp.Context) -
 
 @omp.hook("turn_start", phase=omp.HookPhase.TRANSFORM, order=50)
 async def use_plan_model(event: omp.TurnStartEvent, ctx: omp.Context) -> omp.HookDecision:
-	if await omp.journal.state("plan/mode") != "plan":
+	state = await current_plan_state()
+	if state is None or state.mode != "plan":
 		return omp.Defer()
-	return omp.Modify(patch={"model": await omp.journal.state("plan/model")})
+	return omp.Modify(patch={"model": state.model})
 ```
 
 `device_list` composes `INTERSECT`, so plan mode and a read-only-audit extension narrow
@@ -2232,15 +2248,22 @@ bundles a 1.3 MB `tree-sitter-bash.wasm`, pays 50–200 ms initializing it, and 
 review when parsing fails.
 
 ```python
+from dataclasses import dataclass
+
 import omp
 
 READ_ONLY = frozenset({"ls", "cat", "grep", "rg", "find", "head", "tail", "wc", "git"})
 
+@omp.entry_kind("dev.shinynito.menshen.breaker", rev="v.1")
+@dataclass(frozen=True, slots=True)
+class BreakerState:
+	denials: int
+
 @omp.hook("tool_call", phase=omp.HookPhase.PRECHECK, on_failure=omp.OnFailure.DENY,
           timeout=omp.Duration("100ms"), when=omp.When(name={"bash"}))
 async def breaker_gate(event: omp.ToolCallEvent, ctx: omp.Context) -> omp.HookDecision:
-	breaker = await omp.journal.state("menshen/breaker") or {"denials": 0}
-	if breaker["denials"] >= 3:
+	record = await omp.state.latest(BreakerState, scope=omp.StateScope.PROJECT)
+	if record is not None and record.value.denials >= 3:
 		return omp.Deny("guardian circuit breaker is open", code="breaker_open")
 	return omp.Defer()
 

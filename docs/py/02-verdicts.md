@@ -2084,14 +2084,18 @@ what the ruling resolved, what it did not, and does not claim the residue is saf
    `caps.dialect` already has the same shape and is unambiguously necessary — but this needs
    a real corpus of projections to judge.
 
-3. **Cross-family lift semantics under three-plus families.** The walk jumps straight from a
+3. **Resolved (2026-08-20): a third family shipped (examples/patch-dialect);
+   direct destination-owned pairwise steps sufficed for `rep.1 -> patch.1` and
+   `hl.1 -> patch.1`, so no canonical hub family emerged. The evidence confirms the live
+   destination carries one lift arm per historical foreign family, while the existing
+   all-or-original walk supplies composition and byte-verbatim fallback.**
+   **Cross-family lift semantics under three-plus families.** The walk jumps straight from a
    foreign family to the live rev (`registry.rs:558-575`). With `rep`, `hl`, and `patch` all
    registered, `patch.2 -> hl.5` requires `hl.5` to implement `lift(patch.2, …)` directly.
    That is O(families) lift implementations on the newest revision, and the newest revision
    is exactly the one whose author knows the old families least. An alternative is a
    declared canonical family that every family lifts *into* first, making the graph a star
-   rather than a clique — but that adds a hop and a shape nobody has needed yet. Unresolved;
-   revisit when a third family actually ships.
+   rather than a clique — but that adds a hop and a shape nobody has needed yet. That alternative was left pending the third-family evidence resolved above.
 
 4. **Renderer replay cost on long transcripts.** Scroll-back over a 2000-item session
    re-folds every visible renderer. With `reduce=` this is O(1) per item, but the *verdict*

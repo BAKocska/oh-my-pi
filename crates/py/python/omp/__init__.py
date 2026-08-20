@@ -51,7 +51,6 @@ from _omp import (
     StateScope,
     PlacementError,
     Principal,
-    QuotaExceeded,
     ResourceReceipt,
     Secret,
     StaleGeneration,
@@ -62,6 +61,20 @@ from _omp import (
     _runtime_metadata,
     operation_spec as _native_operation_spec,
 )
+
+
+class QuotaExceeded(OmpError):
+    """Report a hard per-extension quota exhaustion and its receipt snapshot."""
+
+    def __init__(self, quota: str, receipt: ResourceReceipt | None) -> None:
+        self.quota = quota
+        self.receipt = receipt
+        receipt_detail = (
+            "resource receipt unavailable"
+            if receipt is None
+            else "resource receipt attached"
+        )
+        super().__init__(f"quota {quota!r} exceeded; {receipt_detail}")
 
 
 class Coerce(_StrEnum):
@@ -168,7 +181,10 @@ from ._verdicts import (
     prompt,
 )
 
-class StateScopeDenied(OmpError):
+from .journal import JournalError
+
+
+class StateScopeDenied(JournalError):
     """The authenticated principal may not access a requested state scope."""
 
 
@@ -342,6 +358,7 @@ from .context import (
     ContextView,
     CustomSummary,
     DelegateCompaction,
+    DropParts,
     Insert,
     MessageKind,
     MessageRef,
@@ -1053,6 +1070,7 @@ __all__ = (
     "HistoryUrl",
     "HostDisconnected",
     "JournalEntry",
+    "JournalError",
     "JobRef",
     "InvocationPhase",
     "PHASE_LEGALITY_MATRIX",
@@ -1234,6 +1252,7 @@ __all__ += (
     "DelegateCompaction",
     "Devices",
     "DnsPolicy",
+    "DropParts",
     "DomainRule",
     "Dynamism",
     "EXTERNAL_SUMMARY_CAP",

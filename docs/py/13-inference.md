@@ -2084,7 +2084,7 @@ from omp import Api, AuthMode, AuthSpec, CredentialSource, ProviderSpec, RouteSp
 
 
 @omp.hook("extension_activate")
-async def start_proxy(ev: omp.ExtensionActivate, ctx: omp.Context) -> None:
+async def start_proxy(ev: omp.ExtensionActivateEvent, ctx: omp.Context) -> None:
 	# Runs beside the Environment — which may be remote. `socket` is resolved in
 	# the Environment's filesystem, and that is the only place the route can reach.
 	proc = await omp.env.spawn_process(
@@ -2141,7 +2141,8 @@ therefore depends on the bridge persisting them, and omp cannot verify that it d
 Several things above route through `omp.env` — `models_discover` doing its HTTP probe
 (`omp.env.http_get`), the class (c) proxy (`omp.env.spawn_process`, `proc.endpoint`,
 `proc.send_secret`), and the `!command` replacement (`omp.env.exec`). Their Python spellings are
-frozen, but the host operations are not wired; `http_get` fails explicitly with `NotWiredError`.
+frozen, but the host has not installed the Python DATA binding; without that binding each arm fails explicitly
+with `NotWiredError`. The scoped-egress HTTP frame and envd client themselves are implemented.
 
 What exists is one socket, not two. The Python side is a `toolhost/v1` stdio worker: varint-length-
 delimited protobuf over stdin/stdout, whose entire frame vocabulary is
@@ -2160,7 +2161,7 @@ worth stating because it determines what is a wiring task versus a design task:
 | `omp.env.spawn_process` (class (c) proxy) | wire-complete | no Python DATA connection |
 | `omp.env.exec` (credential helper) | wire-complete | no Python DATA connection |
 | `omp.env.put_blob` / `get_blob` | wire-complete | no Python DATA connection |
-| `omp.env.http_get` (discovery probe) | scoped-egress frame and envd client implemented; frozen arm remains explicit | Python DATA bridge wiring outstanding |
+| `omp.env.http_get` (discovery probe) | wire-complete scoped-egress frame and envd client | Python DATA bridge wiring outstanding |
 
 The additive path for the first three is small and specific. `EnvServer::serve_io` already accepts any
 `AsyncRead + AsyncWrite` and differentiates callers per connection through `ConnectionPolicy`, so the

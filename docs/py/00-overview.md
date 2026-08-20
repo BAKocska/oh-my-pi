@@ -574,7 +574,7 @@ class HostInfo:
 
 `(layer, trust, pool)` is the child's key. Two extensions observing different values are in different processes and share nothing.
 
-#### `omp.context() -> Context`
+#### `omp.Context.current() -> Context`
 
 The active `Context`, or raises. Sugar for `Context.current()`.
 

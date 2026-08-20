@@ -10,6 +10,8 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
+from _omp import OmpError
+
 from ._errors import NotWiredError
 
 
@@ -41,6 +43,19 @@ class EntryId:
         """Render this id as ``<session_id>:<index>``."""
 
         return f"{self.session}:{self.index}"
+
+
+class JournalError(OmpError):
+    """Base error for journal operations and partial multi-entry appends."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        appended: Iterable[EntryId] = (),
+    ) -> None:
+        super().__init__(message)
+        self.appended = list(appended)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +148,7 @@ def fold(
 
 __all__ = (
     "EntryId",
+    "JournalError",
     "JournalEntry",
     "MAX_ATOMIC_ENTRIES",
     "MAX_ENTRY_BYTES",

@@ -154,6 +154,14 @@ class Prune:
 
 
 @dataclass(frozen=True, slots=True)
+class DropParts:
+    """Drop parts only from the model-facing projection; retain typed verdict and journal."""
+
+    ids: tuple[str, ...]
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Replace:
     """Replace named context items with one synthetic item."""
 
@@ -232,6 +240,7 @@ class ContextPatch:
     """Collect context projection operations contributed by one handler."""
 
     prune: list[Prune] = field(default_factory=list)
+    drop_parts: list[DropParts] = field(default_factory=list)
     replace: list[Replace] = field(default_factory=list)
     insert: list[Insert] = field(default_factory=list)
     reorder: list[Reorder] = field(default_factory=list)
@@ -240,7 +249,13 @@ class ContextPatch:
     def is_empty(self) -> bool:
         """Return whether this patch contains no operations."""
 
-        return not (self.prune or self.replace or self.insert or self.reorder)
+        return not (
+            self.prune
+            or self.drop_parts
+            or self.replace
+            or self.insert
+            or self.reorder
+        )
 
     def merge(self, other: ContextPatch) -> ContextPatch:
         """Return a patch concatenating this patch's operations with another's."""
@@ -248,6 +263,7 @@ class ContextPatch:
         note = "; ".join(note for note in (self.note, other.note) if note)
         return ContextPatch(
             prune=[*self.prune, *other.prune],
+            drop_parts=[*self.drop_parts, *other.drop_parts],
             replace=[*self.replace, *other.replace],
             insert=[*self.insert, *other.insert],
             reorder=[*self.reorder, *other.reorder],
@@ -445,6 +461,7 @@ __all__ = (
     "ContextView",
     "CustomSummary",
     "DelegateCompaction",
+    "DropParts",
     "Insert",
     "MessageKind",
     "MessageRef",

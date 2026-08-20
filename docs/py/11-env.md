@@ -1621,7 +1621,7 @@ async def broker() -> omp.env.Process:
 		"intercom-broker --socket $OMP_INTERCOM_SOCKET",
 		env={"OMP_INTERCOM_SOCKET": omp.env.info().workspace_id.hex()},
 		restart=omp.env.RestartPolicy(
-			policy=omp.env.Restart.ON_FAILURE,
+			policy=omp.Restart.ON_FAILURE,
 			delay=omp.Duration("500ms"),
 			max_restarts=5,
 		),
@@ -2227,7 +2227,7 @@ synchronization* (100-108), *Atomic text edit and workspace edit application eng
    integration.**
    The discovery-HTTP ownership ruling in `docs/py/13-inference.md` question 2 assigns that future
    transport to `omp.env`; the frozen `omp.env.http_get` seam exists and raises `NotWiredError`
-   until the scoped-egress frame lands.
+   when the host has not installed its Python DATA binding.
    **`env.net`.** Documented above as a capability, but the Environment-side HTTP client with
    manifest allowlist enforcement does not exist yet, and it is the one capability whose
    enforcement point is genuinely ambiguous: allowlisting by hostname is trivially bypassed by

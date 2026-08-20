@@ -51,7 +51,6 @@ create_exception!(
 	OmpError,
 	"The invocation has not authorized effects."
 );
-create_exception!(_omp, QuotaExceeded, OmpError, "A hard per-extension quota is exhausted.");
 create_exception!(_omp, DeadlineExceeded, OmpError, "The active invocation deadline elapsed.");
 create_exception!(_omp, HostDisconnected, OmpError, "The host CONTROL channel disconnected.");
 create_exception!(_omp, FrameTooLarge, OmpError, "An encoded extension frame exceeds its bound.");
@@ -1210,7 +1209,6 @@ fn _omp(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 	add_exception!(DuplicateRegistration);
 	add_exception!(DeclarationSealed);
 	add_exception!(EffectsNotAuthorized);
-	add_exception!(QuotaExceeded);
 	add_exception!(DeadlineExceeded);
 	add_exception!(HostDisconnected);
 	add_exception!(FrameTooLarge);

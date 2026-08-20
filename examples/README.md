@@ -1,6 +1,6 @@
 # Extension examples
 
-One hundred six ports of real pi-ecosystem extensions onto the omp Python
+One hundred twelve ports of real pi-ecosystem extensions onto the omp Python
 layer (`crates/py/python/omp`). Each directory is one extension: an `omp.toml`
 manifest, the Python module(s), and a README stating what the pi original did,
 how the omp shape differs, and — load-bearing — a **Gaps** section listing every
@@ -118,7 +118,13 @@ distance.
 | `native-grounding/` | `@pokutuna/pi-google-genai` | provider-native tools as model caps, not proxy devices | `docs/py/13` |
 | `welcome-chrome/` | `@zeerke/ascet-copilot-ui` | welcome scene, recent-session rows, title set/restore, zero timers | `docs/py/07` |
 | `segment-bus/` | `@juanibiapina/pi-powerbar` | `@omp.service` producer/owner bus with per-publisher quotas | `docs/py/00 §Extension services` |
-| `pr-review/` | `pi-pr-review` | tiered reviewer waves, schema-validated findings, sanitized rail | `docs/py/12` |
+| `pr-review/` | `pi-pr-review` | tiered reviewer waves, schema-validated findings, sanitized rail | `docs/py/12` || `patch-dialect/` | `mitsupi` (edit-surface cohort) | third edit family `patch@1`, 3-family `lift()` chain, 02 q3 evidence | `docs/py/02 §3` |
+| `resource-receipts/` | `@narumitw/pi-usage` + `@sreetej510/pi-usage` (derived) | `omp.resources()` receipt, `QuotaExceeded` degradation, hand-rolled quotas deleted | `docs/py/00`, `docs/py/04` |
+| `trust-gates/` | `pi-sandbox` | `omp.Trust` tier branching, degrade-never-fail | `docs/py/00`, `docs/py/06` |
+| `grant-widening/` | `pi-sandbox` (policy-safety cohort) | `Amend(approval=)` session-scope widening, external approver decision | `docs/py/06 §Approvals` |
+| `org-registry/` | `@7n/rules` (derived) | `StateScope.ORGANIZATION` registry, `StateScopeDenied` fallback overlay | `docs/py/09 §omp.state` |
+| `part-pruner/` | `pai-acp` (context-management cohort) | `AmendPatch::DropParts` lossless prune under headroom pressure | `docs/py/02 §4`, `docs/py/08` |
+
 
 pi extension descriptions:
 `.plan/user-requests/2026-08-10-pi-extension-survey/catalog.md`.
@@ -353,3 +359,20 @@ broker with cross-origin credential stripping; the complete public
 host-materialized `presentation` snapshots on the render-input values; and
 the four docs drifts moved to frozen truth.
 
+
+## Round 7 targeted ports (2026-08-20, six ports)
+
+A narrow round aimed at the surfaces every prior selection passed over, plus
+an exhaustive docs-drift sweep. Four ports came back gap-free
+(`patch-dialect/` — settling `docs/py/02` q3 with three-family evidence:
+pairwise destination lift steps suffice, no hub family emerged —
+`trust-gates/`, `grant-widening/`, and the docs sweep found and fixed
+thirteen residual drift sites the round-5/6 spot fixes missed, notably every
+`omp.journal.state(...)` worked example rewritten onto the frozen typed
+`omp.state` surface).
+
+| Defect | Found by | Frozen file |
+|---|---|---|
+| `StateScopeDenied` derives from `OmpError` while docs specify `omp.JournalError` as its base (and no `JournalError` is exported) | `org-registry/` | `__init__.py:171-172` |
+| `AmendPatch::DropParts` declared by 02 §4 but the frozen `ContextPatch` vocabulary has no arm — the policy is declarable, the amend op is not | `part-pruner/` | `context.py` |
+| `QuotaExceeded` carries neither documented `.quota` nor `.receipt` payload fields (native `create_exception!` supplies no payload) | `resource-receipts/` | `_errors.py` / native |
