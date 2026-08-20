@@ -95,6 +95,9 @@ message ModelCard {
   uint64 blocked_until_ms = 17;
   bool deprecated = 18;
   uint64 updated_at_ms = 19;
+  // Explicit catalog evidence for ordinary function/tool calling. Absent
+  // means the gateway has no negative evidence.
+  optional bool supports_tools = 20;
 
   enum Source {
     SOURCE_UNSPECIFIED = 0;

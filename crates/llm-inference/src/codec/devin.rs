@@ -46,6 +46,7 @@ const DEFAULT_STOP_PATTERNS: [&str; 5] =
 	["<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"];
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const DEFAULT_MAX_OUTPUT: u64 = 64_000;
+const MAX_CONNECT_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 
 const SESSION_TOKEN_PREFIX: &str = "devin-session-token$";
 
@@ -221,7 +222,7 @@ impl Default for DevinClientMetadata {
 			ide_version:       Str::new_static("3.2.23"),
 			extension_name:    Str::new_static("windsurf"),
 			extension_version: Str::new_static("1.48.2"),
-			locale:            Str::default(),
+			locale:            Str::new_static("en"),
 		}
 	}
 }
@@ -399,29 +400,12 @@ impl Codec for DevinCodec {
 					operation: omp_llm_catalog::OperationKind::Chat,
 					method: RequestMethod::Post,
 					uri,
-					headers: Box::new([
-						RequestHeader {
-							name:  Str::new_static("accept"),
-							value: Str::new_static("application/connect+proto"),
-						},
-						RequestHeader {
-							name:  Str::new_static("content-type"),
-							value: Str::new_static("application/connect+proto"),
-						},
-						RequestHeader {
-							name:  Str::new_static("connect-protocol-version"),
-							value: Str::new_static("1"),
-						},
-						RequestHeader {
-							name:  Str::new_static("content-encoding"),
-							value: Str::new_static("gzip"),
-						},
-					]),
+					headers: chat_headers(),
 					body: BodySource::Bytes(connect_gzip_message(&template)?),
 					framing: FramingProtocol::Connect,
 					bounds: SizeBounds {
 						request_body: 32 * 1024 * 1024,
-						frame:        32 * 1024 * 1024,
+						frame:        MAX_CONNECT_FRAME_BYTES,
 						response:     256 * 1024 * 1024,
 					},
 					sealed_body: None,
@@ -1058,6 +1042,35 @@ fn positive_i32(value: i32) -> Option<u64> {
 	u64::try_from(value).ok().filter(|value| *value > 0)
 }
 
+fn chat_headers() -> Box<[RequestHeader]> {
+	Box::new([
+		RequestHeader {
+			name:  Str::new_static("content-type"),
+			value: Str::new_static("application/connect+proto"),
+		},
+		RequestHeader {
+			name:  Str::new_static("connect-protocol-version"),
+			value: Str::new_static("1"),
+		},
+		RequestHeader {
+			name:  Str::new_static("connect-content-encoding"),
+			value: Str::new_static("gzip"),
+		},
+		RequestHeader {
+			name:  Str::new_static("accept-encoding"),
+			value: Str::new_static("identity"),
+		},
+		RequestHeader {
+			name:  Str::new_static("user-agent"),
+			value: Str::new_static("connect-go/1.18.1 (go1.26.3)"),
+		},
+		RequestHeader {
+			name:  Str::new_static("connect-accept-encoding"),
+			value: Str::new_static("gzip"),
+		},
+	])
+}
+
 fn endpoint(base: &str, path: &str) -> Str {
 	let mut uri = base.trim_end_matches('/').to_owned();
 	uri.push_str(path);
@@ -1254,6 +1267,42 @@ mod tests {
 		assert!(models[0].reasoning);
 		assert_eq!(models[1].id.as_str(), "compact_model");
 		assert!(!models[1].reasoning);
+	}
+
+	#[test]
+	fn chat_connect_headers_describe_message_gzip_and_pin_frame_cap() {
+		let headers = chat_headers()
+			.into_vec()
+			.into_iter()
+			.map(|header| (header.name, header.value))
+			.collect::<BTreeMap<_, _>>();
+		assert_eq!(
+			headers.get("content-type").map(Str::as_str),
+			Some("application/connect+proto")
+		);
+		assert_eq!(headers.get("connect-protocol-version").map(Str::as_str), Some("1"));
+		assert_eq!(
+			headers.get("connect-content-encoding").map(Str::as_str),
+			Some("gzip")
+		);
+		assert_eq!(headers.get("connect-accept-encoding").map(Str::as_str), Some("gzip"));
+		assert_eq!(headers.get("accept-encoding").map(Str::as_str), Some("identity"));
+		assert_eq!(
+			headers.get("user-agent").map(Str::as_str),
+			Some("connect-go/1.18.1 (go1.26.3)")
+		);
+		assert!(!headers.contains_key("content-encoding"));
+		assert_eq!(MAX_CONNECT_FRAME_BYTES, 16 * 1024 * 1024);
+	}
+
+	#[test]
+	fn official_client_metadata_includes_the_wire_locale() {
+		let metadata = DevinCodec::new().metadata_wire();
+		assert_eq!(metadata.ide_name, "windsurf");
+		assert_eq!(metadata.ide_version, "3.2.23");
+		assert_eq!(metadata.extension_name, "windsurf");
+		assert_eq!(metadata.extension_version, "1.48.2");
+		assert_eq!(metadata.locale, "en");
 	}
 
 	#[test]

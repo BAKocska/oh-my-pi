@@ -543,6 +543,9 @@ pub struct SourceWirePolicy {
 	/// Omit native reasoning effort.
 	#[serde(alias = "omitReasoningEffort")]
 	pub omit_reasoning_effort: Option<bool>,
+	/// Route selected effort through Qwen chat-template kwargs.
+	#[serde(alias = "templateReasoningEffort")]
+	pub template_reasoning_effort: Option<bool>,
 	/// Reasoning effort spellings.
 	#[serde(alias = "reasoningEffortMap")]
 	pub reasoning_effort_map: BTreeMap<ThinkingEffort, Str>,
@@ -3292,7 +3295,6 @@ fn compile_models(
 					wire_ids.push((route.clone(), WireModelId::new(logical_id.clone())));
 				}
 			}
-			let pricing = compile_pricing(provider.as_str(), logical_id.as_str(), &first.1.cost)?;
 			let capability_override = exact_capability_override(&provider, &logical_id);
 			let resolved = cascade.resolve(&ResolveTarget {
 				provider:  provider.as_str(),
@@ -3302,6 +3304,12 @@ fn compile_models(
 				model:     logical_id.as_str(),
 				reasoning: tier_reasoning || members.iter().any(|(_, row, _)| row.thinking.is_some()),
 			})?;
+			let pricing = compile_pricing(
+				provider.as_str(),
+				logical_id.as_str(),
+				&first.1.cost,
+				resolved.catalog.get("longContext"),
+			)?;
 			if resolved.thinking.contains_key("efforts") {
 				merged_row.reasoning = true;
 			}
@@ -3648,6 +3656,9 @@ fn compile_wire_policy(
 	policy.reasoning.omit_effort = source
 		.omit_reasoning_effort
 		.or(policy.reasoning.omit_effort);
+	policy.reasoning.template_reasoning_effort = source
+		.template_reasoning_effort
+		.or(policy.reasoning.template_reasoning_effort);
 	if !source.reasoning_effort_map.is_empty() {
 		policy
 			.reasoning
@@ -4272,6 +4283,7 @@ fn compile_pricing(
 	provider: &str,
 	model: &str,
 	cost: &SourceCost,
+	authored_long_context: Option<&Value>,
 ) -> Result<Pricing, CompileError> {
 	let mut components =
 		price_components(&cost.input, &cost.output, &cost.cache_read, &cost.cache_write)?;
@@ -4294,8 +4306,18 @@ fn compile_pricing(
 			}
 		}
 	}
+	let authored_long_context = authored_long_context
+		.map(|value| {
+			serde_json::from_value::<SourceLongContextCost>(value.clone()).map_err(|error| {
+				CompileError::Invariant(Str::from(format!(
+					"invalid authored long-context cost for `{provider}/{model}`: {error}"
+				)))
+			})
+		})
+		.transpose()?;
+	let long_context = authored_long_context.as_ref().or(cost.long_context.as_ref());
 	let mut tiers = Vec::new();
-	if let Some(tier) = &cost.long_context {
+	if let Some(tier) = long_context {
 		tiers.push(PriceTier {
 			prompt_tokens_above: tier.input_threshold,
 			components:          price_components(
@@ -4718,6 +4740,53 @@ mod tests {
 	}
 
 	#[test]
+	fn bundled_codex_long_context_cost_compiles_and_prices_exactly() {
+		let resolved = CompatCascade::bundled()
+			.expect("bundled cascade parses")
+			.resolve(&ResolveTarget {
+				provider:  "openai-codex",
+				class:     "openai",
+				family:    None,
+				revision:  Some(omp_core::SemVer::new(5, 6, 0)),
+				model:     "gpt-5.6-sol",
+				reasoning: true,
+			})
+			.expect("Codex pricing row resolves");
+		let cost: SourceCost = serde_json::from_value(serde_json::json!({
+			"input": 5,
+			"output": 30,
+			"cacheRead": 0.5,
+			"cacheWrite": 6.25
+		}))
+		.expect("base pricing parses");
+		let pricing = compile_pricing(
+			"openai-codex",
+			"gpt-5.6-sol",
+			&cost,
+			resolved.catalog.get("longContext"),
+		)
+		.expect("tier compiles");
+		let boundary = pricing
+			.cost(crate::pricing::UsageDimensions {
+				input_tokens:      72_000,
+				output_tokens:     10_000,
+				cache_read_tokens: 200_000,
+				..crate::pricing::UsageDimensions::default()
+			})
+			.expect("boundary price");
+		assert_eq!(boundary, crate::pricing::NanoUsd::from_nanos(760_000_000));
+		let above = pricing
+			.cost(crate::pricing::UsageDimensions {
+				input_tokens:      72_001,
+				output_tokens:     10_000,
+				cache_read_tokens: 200_000,
+				..crate::pricing::UsageDimensions::default()
+			})
+			.expect("premium price");
+		assert_eq!(above, crate::pricing::NanoUsd::from_nanos(1_370_010_000));
+	}
+
+	#[test]
 	fn effort_collapse_requires_siblings() {
 		let single = BTreeMap::from([(
 			Str::from("model-low"),
@@ -4855,6 +4924,37 @@ usage = true
 				.operations
 				.expect("authored route operations")
 				.contains_kind(OperationKind::Usage)
+		);
+	}
+
+	#[test]
+	fn new_reasoning_axes_parse_and_compile_from_kdl() {
+		let cascade = CompatCascade::parse(&[(
+			"reasoning-axes.kdl",
+			r#"class "qwen" {
+				template-reasoning-effort #true
+				thinking-tool-choice-conflict "drop_auto_when_thinking"
+			}"#,
+		)])
+		.expect("KDL grammar accepts the reasoning axes");
+		let resolved = cascade
+			.resolve(&ResolveTarget {
+				provider:  "local",
+				class:     "qwen",
+				family:    None,
+				revision:  None,
+				model:     "qwen3.8-27b",
+				reasoning: true,
+			})
+			.expect("axes resolve");
+		let source =
+			axis_map_to_source_wire_policy(resolved.wire).expect("resolved axes deserialize");
+		let policy =
+			compile_wire_policy(WirePolicy::baseline(), &source).expect("axes compile");
+		assert_eq!(policy.reasoning.template_reasoning_effort, Some(true));
+		assert_eq!(
+			policy.tool.thinking_conflict,
+			Some(crate::policy::ThinkingToolChoiceConflict::DropAutoWhenThinking)
 		);
 	}
 

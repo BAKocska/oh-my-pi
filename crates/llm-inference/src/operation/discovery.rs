@@ -218,12 +218,18 @@ impl CatalogDiscoveryProjector {
 	}
 }
 
-/// Builds the responses-route hint set for a provider in a declared sibling
-/// group (pi #8957): every bundled wire id — this provider's own or a sibling
-/// gateway's — riding an openai-responses route, plus this provider's
-/// deterministic responses materialization target.
+/// Builds the responses-route hint set for a provider with exact route pins or
+/// a declared sibling group (pi #8957): authored gateway-first ids plus every
+/// bundled wire id on this provider or a sibling gateway riding an
+/// openai-responses route, and this provider's deterministic materialization
+/// target.
 fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<ResponsesRouteHints> {
-	let group = taxonomy().responses_hint_group(route.provider.as_str())?;
+	let taxonomy = taxonomy();
+	let group = taxonomy.responses_hint_group(route.provider.as_str());
+	let pinned = taxonomy.responses_route_models(route.provider.as_str());
+	if group.is_none() && pinned.is_none() {
+		return None;
+	}
 	// The materialization target mirrors resolver ordering: highest priority,
 	// then lexicographically smallest route id.
 	let target = catalog
@@ -252,22 +258,28 @@ fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<Response
 		.iter()
 		.map(|definition| (&definition.id, &definition.provider))
 		.collect();
-	let mut wire_ids = BTreeSet::new();
-	for model in catalog.models() {
-		let Some(owner) = model.routes.first().and_then(|id| owners.get(id)) else {
-			continue;
-		};
-		if !group
-			.iter()
-			.any(|member| member.eq_ignore_ascii_case(owner.as_str()))
-		{
-			continue;
-		}
-		if !model.routes.iter().any(|id| responses_routes.contains(id)) {
-			continue;
-		}
-		for (_, wire_model) in &model.wire_ids {
-			wire_ids.insert(wire_model.clone());
+	let mut wire_ids: BTreeSet<WireModelId> = pinned
+		.into_iter()
+		.flatten()
+		.map(|model| WireModelId::from(model.as_str()))
+		.collect();
+	if let Some(group) = group {
+		for model in catalog.models() {
+			let Some(owner) = model.routes.first().and_then(|id| owners.get(id)) else {
+				continue;
+			};
+			if !group
+				.iter()
+				.any(|member| member.eq_ignore_ascii_case(owner.as_str()))
+			{
+				continue;
+			}
+			if !model.routes.iter().any(|id| responses_routes.contains(id)) {
+				continue;
+			}
+			for (_, wire_model) in &model.wire_ids {
+				wire_ids.insert(wire_model.clone());
+			}
 		}
 	}
 	Some(ResponsesRouteHints { wire_ids: Arc::new(wire_ids), target })

@@ -10,6 +10,7 @@ description = "Typed provider, route, model, and capability catalog for OMP infe
 readme = "README.md"
 
 [dependencies]
+arc-swap = { workspace = true }
 omp-core = { workspace = true }
 kdl = { workspace = true }
 postcard = { workspace = true }

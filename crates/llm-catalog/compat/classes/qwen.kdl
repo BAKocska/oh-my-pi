@@ -40,6 +40,7 @@ class "qwen" {
 	on "llama.cpp" "lm-studio" {
 		revision ">=3.8" {
 			supports-reasoning-effort #true
+			template-reasoning-effort #true
 			thinking-efforts "low" "medium" "xhigh"
 			thinking-format "qwen"
 			thinking-requires-effort #true
@@ -48,6 +49,7 @@ class "qwen" {
 	on "vllm" {
 		revision ">=3.8" {
 			supports-reasoning-effort #true
+			template-reasoning-effort #true
 			thinking-efforts "low" "medium" "xhigh"
 			thinking-format "qwen-chat-template"
 			thinking-requires-effort #true

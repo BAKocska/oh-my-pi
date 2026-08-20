@@ -1,6 +1,6 @@
 //! Checked-in model identity taxonomy.
 
-use std::{borrow::Cow, collections::BTreeSet, sync::LazyLock};
+use std::{borrow::Cow, collections::{BTreeMap, BTreeSet}, sync::LazyLock};
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use omp_core::{IntoStr, SemVer, Str};
@@ -204,6 +204,8 @@ struct DiscoveryVocabulary {
 	canonical_recovery:       Vec<Str>,
 	/// Sibling-gateway groups whose bundled catalogs hint the responses route.
 	responses_hint_groups:    Vec<Box<[Str]>>,
+	/// Provider-scoped exact ids pinned to the responses route.
+	responses_route_models:  BTreeMap<Str, Box<[Str]>>,
 	/// Billing-variant suffixes sharing a transport with their base id.
 	billing_variant_suffixes: Vec<Str>,
 }
@@ -337,6 +339,20 @@ impl Taxonomy {
 					.any(|member| member.eq_ignore_ascii_case(provider))
 			})
 			.map(Box::as_ref)
+	}
+
+	/// Returns exact model ids authored onto a provider's responses route.
+	///
+	/// These pins cover gateway-first rows whose static census has no same- or
+	/// sibling-provider card yet. Billing variants inherit a pinned base route
+	/// through [`Self::billing_variant_plain`].
+	pub fn responses_route_models(&self, provider: &str) -> Option<&[Str]> {
+		self
+			.discovery
+			.responses_route_models
+			.iter()
+			.find(|(candidate, _)| candidate.eq_ignore_ascii_case(provider))
+			.map(|(_, models)| models.as_ref())
 	}
 
 	/// Strips a declared billing-variant suffix (`-free`, `-contributor`) from
@@ -981,6 +997,34 @@ fn parse_discovery(file: &str, node: &KdlNode) -> Result<DiscoveryVocabulary, Ca
 					.responses_hint_groups
 					.push(group.into_boxed_slice());
 			},
+			"responses-route-models" => {
+				let [provider, models @ ..] = arguments.as_slice() else {
+					return malformed(file, directive);
+				};
+				if models.is_empty() {
+					return malformed(file, directive);
+				}
+				let provider = provider.to_ascii_lowercase().to_str();
+				let mut unique = BTreeSet::new();
+				let models: Box<[Str]> = models
+					.iter()
+					.map(|model| model.to_ascii_lowercase())
+					.map(|model| {
+						if unique.insert(model.clone()) {
+							Ok(model.to_str())
+						} else {
+							Err(malformed_error(file, directive))
+						}
+					})
+					.collect::<Result<_, _>>()?;
+				if vocabulary
+					.responses_route_models
+					.insert(provider, models)
+					.is_some()
+				{
+					return malformed(file, directive);
+				}
+			},
 			"billing-variant-suffix" => {
 				for suffix in arguments {
 					let suffix = suffix.to_ascii_lowercase();
@@ -1613,6 +1657,12 @@ mod tests {
 			r#"discovery { borrow-responses-route "opencode-go" "OPENCODE-GO" }"#,
 			// A provider may belong to at most one group.
 			r#"discovery { borrow-responses-route "opencode-go" "opencode-zen"; borrow-responses-route "Opencode-Go" }"#,
+			// Exact response-route pins require a provider and at least one model.
+			r#"discovery { responses-route-models "opencode-go" }"#,
+			// Exact pins are unique within a provider.
+			r#"discovery { responses-route-models "opencode-go" "muse" "MUSE" }"#,
+			// A provider's exact pins are declared once.
+			r#"discovery { responses-route-models "opencode-go" "muse"; responses-route-models "OPENCODE-GO" "other" }"#,
 			// Empty suffix.
 			r#"discovery { billing-variant-suffix "" }"#,
 			// Bare dash suffix.
@@ -1648,7 +1698,7 @@ mod tests {
 			("collapse", r#"collapse { thinking-suffix "-thinking" }"#),
 			(
 				"discovery",
-				r#"discovery { borrow-responses-route "opencode-go" "opencode-zen"; billing-variant-suffix "-free" "-contributor" }"#,
+				r#"discovery { borrow-responses-route "opencode-go" "opencode-zen"; responses-route-models "opencode-go" "muse-spark-1.2"; billing-variant-suffix "-free" "-contributor" }"#,
 			),
 		]);
 		let group = taxonomy
@@ -1656,6 +1706,13 @@ mod tests {
 			.expect("declared group");
 		assert!(group.iter().any(|member| member.as_str() == "opencode-zen"));
 		assert!(taxonomy.responses_hint_group("openrouter").is_none());
+		assert_eq!(
+			taxonomy
+				.responses_route_models("OPENCODE-GO")
+				.expect("provider route pins"),
+			["muse-spark-1.2"]
+		);
+		assert!(taxonomy.responses_route_models("openrouter").is_none());
 		assert_eq!(
 			taxonomy.billing_variant_plain("muse-spark-1.2-contributor"),
 			Some("muse-spark-1.2")
@@ -1675,6 +1732,13 @@ mod tests {
 				.expect("bundled OpenCode group")
 				.iter()
 				.any(|member| member.as_str() == "opencode-zen")
+		);
+		assert!(
+			bundled
+				.responses_route_models("opencode-go")
+				.expect("bundled route pins")
+				.iter()
+				.any(|model| model.as_str() == "muse-spark-1.2")
 		);
 		assert_eq!(
 			bundled.billing_variant_plain("muse-spark-1.2-contributor"),

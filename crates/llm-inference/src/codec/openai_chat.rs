@@ -8,7 +8,7 @@ use omp_llm_catalog::{
 	OperationKind, ReasoningEffort, ServiceTier, ThinkingEffort,
 	policy::{
 		MaxTokensField as CatalogMaxTokensField, ReasoningWireFormat as CatalogReasoningWireFormat,
-		ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode,
+		ThinkingToolChoiceConflict, ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode,
 	},
 };
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,8 @@ pub struct OpenAiChatProfile {
 	pub named_tool_choice: bool,
 	/// Whether required/named forcing is accepted.
 	pub forced_tool_choice: bool,
+	/// Resolution when reasoning controls conflict with tool choice.
+	pub thinking_tool_choice_conflict: ThinkingToolChoiceConflict,
 	/// Tool strictness projection.
 	pub tool_strict: ToolStrictWire,
 	/// Whether object-root tool-parameter unions are flattened or withheld.
@@ -179,6 +181,7 @@ impl Default for OpenAiChatProfile {
 			tool_choice: true,
 			named_tool_choice: true,
 			forced_tool_choice: true,
+			thinking_tool_choice_conflict: ThinkingToolChoiceConflict::None,
 			tool_strict: ToolStrictWire::Mixed,
 			flatten_root_unions: false,
 			tool_id: ToolIdWireProfile::Preserve,
@@ -230,6 +233,9 @@ impl OpenAiChatProfile {
 		if let Some(value) = policy.tool.forced_choice {
 			self.forced_tool_choice = value;
 		}
+		if let Some(value) = policy.tool.thinking_conflict {
+			self.thinking_tool_choice_conflict = value;
+		}
 		if let Some(value) = policy.context.max_tokens_field {
 			self.max_tokens_field = match value {
 				CatalogMaxTokensField::MaxTokens => MaxTokensField::MaxTokens,
@@ -264,10 +270,7 @@ impl OpenAiChatProfile {
 				_ => ReasoningWireFormat::Unsupported,
 			};
 		}
-		if let Some(value) = policy.reasoning.supports_effort {
-			// Qwen 3.8+ chat templates expose a `reasoning_effort` kwarg; the
-			// dialect arms consult this flag so older templates never receive
-			// an unknown template variable (pi bf490ae024).
+		if let Some(value) = policy.reasoning.template_reasoning_effort {
 			self.template_reasoning_effort = value;
 		}
 		if let Some(value) = policy.reasoning.include_encrypted {
@@ -353,10 +356,23 @@ impl OpenAiChatCodec {
 		let messages = lower_messages(&self.profile, &request.messages)?;
 		let (mut tools, withheld) = lower_tools(&self.profile, &request.tools)?;
 		tools.extend(lower_hosted_tools(&self.profile, &request.hosted_tools)?);
-		let tool_choice =
+		let mut tool_choice =
 			lower_tool_choice(&self.profile, &mut tools, &request.tool_choice, &withheld)?;
 		let response_format = lower_output(&request.output)?;
 		let reasoning = lower_reasoning(&self.profile, &request.reasoning)?;
+		if self.profile.thinking_tool_choice_conflict
+			== ThinkingToolChoiceConflict::DropAutoWhenThinking
+			&& matches!(
+				&request.reasoning,
+				Setting::Require(_) | Setting::Prefer(_)
+			)
+			&& matches!(
+				&tool_choice,
+				Some(WireToolChoice::Mode(ToolChoiceMode::Auto))
+			)
+		{
+			tool_choice = None;
+		}
 		let sampling = &request.sampling;
 		if !request.safety.is_empty() || !matches!(&request.verbosity, Setting::Unset) {
 			return Err(capability_error());
@@ -2281,7 +2297,10 @@ mod tests {
 	use bytes::Bytes;
 	use serde::Deserialize;
 
-	use super::{OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ToolIdWireProfile};
+	use super::{
+		OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ThinkingToolChoiceConflict,
+		ToolIdWireProfile,
+	};
 	use crate::{
 		call::{
 			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, Role, Sampling, Setting,
@@ -3118,16 +3137,18 @@ mod tests {
 	}
 
 	#[test]
-	fn qwen_template_effort_rides_top_level_and_kwargs() {
+	fn template_effort_rides_top_level_and_kwargs() {
 		// pi bf490ae024: without routing the selected effort onto the Qwen 3.8+
 		// template's `reasoning_effort` kwarg, `enable_thinking` alone leaves
 		// the model reasoning at its xhigh default. Twin emission: top-level
 		// for newer llama.cpp builds, kwargs for older builds.
-		let profile = OpenAiChatProfile {
+		let mut profile = OpenAiChatProfile {
 			reasoning: super::ReasoningWireFormat::Qwen,
-			template_reasoning_effort: true,
 			..OpenAiChatProfile::default()
 		};
+		let mut policy = omp_llm_catalog::policy::WirePolicy::baseline();
+		policy.reasoning.template_reasoning_effort = Some(true);
+		profile.apply_policy(&policy);
 		let body = OpenAiChatCodec::new(profile, None)
 			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Medium))
 			.expect("request encodes");
@@ -3143,6 +3164,66 @@ mod tests {
 				.is_none(),
 			"the qwen dialect keeps enable_thinking top-level only"
 		);
+	}
+
+	#[test]
+	fn reasoning_conflict_drops_only_redundant_auto_tool_choice() {
+		let mut conflict_profile = OpenAiChatProfile::default();
+		let mut policy = omp_llm_catalog::policy::WirePolicy::baseline();
+		policy.tool.thinking_conflict = Some(ThinkingToolChoiceConflict::DropAutoWhenThinking);
+		conflict_profile.apply_policy(&policy);
+		let encode = |profile: OpenAiChatProfile, reasoning: bool, choice| {
+			let mut request = request(Arc::from([text_message("think")]));
+			request.tools = Arc::from([good_tool()]);
+			if reasoning {
+				request.reasoning = Setting::Require(crate::call::ReasoningRequest {
+					visibility:          crate::call::ReasoningVisibility::Visible,
+					effort:              Some(crate::catalog::ReasoningEffort::Medium),
+					max_tokens:          None,
+					preserve_signatures: false,
+				});
+			}
+			request.tool_choice = Setting::Require(choice);
+			let body = OpenAiChatCodec::new(profile, None)
+				.encode_chat("deepseek-reasoner", &request)
+				.expect("request encodes");
+			serde_json::from_slice::<serde_json::Value>(&body).expect("wire body is JSON")
+		};
+
+		let dropped = encode(
+			conflict_profile.clone(),
+			true,
+			crate::call::ToolChoice::Auto,
+		);
+		assert!(dropped.get("tool_choice").is_none());
+
+		let no_reasoning = encode(
+			conflict_profile.clone(),
+			false,
+			crate::call::ToolChoice::Auto,
+		);
+		assert_eq!(no_reasoning["tool_choice"], "auto");
+
+		let no_axis = encode(
+			OpenAiChatProfile::default(),
+			true,
+			crate::call::ToolChoice::Auto,
+		);
+		assert_eq!(no_axis["tool_choice"], "auto");
+
+		let forced = encode(
+			conflict_profile.clone(),
+			true,
+			crate::call::ToolChoice::Required,
+		);
+		assert_eq!(forced["tool_choice"], "required");
+
+		let named = encode(
+			conflict_profile,
+			true,
+			crate::call::ToolChoice::Named("read_file".into()),
+		);
+		assert_eq!(named["tool_choice"]["function"]["name"], "read_file");
 	}
 
 	#[test]

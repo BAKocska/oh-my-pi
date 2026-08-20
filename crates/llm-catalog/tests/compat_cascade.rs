@@ -205,7 +205,7 @@ fn bundled_sources_match_the_compat_tree() {
 }
 
 #[test]
-fn axis_vocabulary_matches_the_oracles_exactly() {
+fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
 	let wire: ProfileDocument =
 		serde_json::from_str(COMPAT_PROFILES).expect("compat profiles parse");
 	let thinking: ProfileDocument =
@@ -226,6 +226,13 @@ fn axis_vocabulary_matches_the_oracles_exactly() {
 				.flat_map(|profile| profile.shape.keys().cloned()),
 		)
 		.collect();
+	// These axes postdate the frozen oracle snapshot. They stay explicit until
+	// the next intentional snapshot refresh; compat KDL may use them without
+	// rewriting source digests in an unrelated port.
+	oracle_axes.extend([
+		"template_reasoning_effort".to_owned(),
+		"thinking_tool_choice_conflict".to_owned(),
+	]);
 	oracle_axes.sort_unstable();
 	oracle_axes.dedup();
 	let mut known: Vec<String> = KNOWN_AXES
@@ -318,6 +325,45 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 				expected.insert("omit_reasoning_effort".into(), Value::from(false));
 				expected.insert("supports_reasoning_effort".into(), Value::from(true));
 			}
+		}
+		if class == "deepseek"
+			&& [
+				"aiand",
+				"aimlapi",
+				"alibaba-token-plan",
+				"baseten",
+				"coreweave",
+				"deepseek",
+				"fireworks",
+				"gmi-cloud",
+				"groq",
+				"huggingface",
+				"kilo",
+				"nanogpt",
+				"novita",
+				"nvidia",
+				"opencode-go",
+				"opencode-zen",
+				"qianfan",
+				"together",
+				"venice",
+				"wafer-serverless",
+				"zenmux",
+			]
+			.contains(&model.provider.as_str())
+		{
+			expected.insert(
+				"thinking_tool_choice_conflict".into(),
+				Value::from("drop_auto_when_thinking"),
+			);
+		}
+		if class == "qwen"
+			&& ["llama.cpp", "lm-studio", "vllm"].contains(&model.provider.as_str())
+			&& classification
+				.revision
+				.is_some_and(|revision| revision >= SemVer::new(3, 8, 0))
+		{
+			expected.insert("template_reasoning_effort".into(), Value::from(true));
 		}
 		let resolved_wire: BTreeMap<String, Value> = resolved
 			.wire

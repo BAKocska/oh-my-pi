@@ -151,6 +151,14 @@ impl Pricing {
 			.map_or(&self.components, |tier| tier.components.as_ref())
 	}
 
+	/// Returns the exclusive threshold where standard pricing ends.
+	///
+	/// A schedule without replacement tiers has no premium-context boundary.
+	#[must_use]
+	pub fn standard_pricing_boundary(&self) -> Option<u64> {
+		self.tiers.first().map(|tier| tier.prompt_tokens_above)
+	}
+
 	/// Computes cost without applying a quota or premium multiplier.
 	pub fn cost(&self, usage: UsageDimensions) -> Result<NanoUsd, CostError> {
 		self.cost_with_multiplier(usage, None)

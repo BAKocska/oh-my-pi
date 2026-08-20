@@ -17,6 +17,10 @@ discovery {
 	// signal is borrowed: anthropic and chat transports genuinely diverge
 	// across the gateways (minimax-m2.5), and pricing never transfers.
 	borrow-responses-route "opencode-go" "opencode-zen"
+	// Exact gateway-first ids verified on responses before either sibling
+	// catalog carried a usable route. The base pin also covers authored
+	// billing variants below.
+	responses-route-models "opencode-go" "deepseek-v4-flash" "muse-spark-1.2"
 	// Billing-variant SKUs sharing a transport with their base id.
 	billing-variant-suffix "-free" "-contributor"
 }

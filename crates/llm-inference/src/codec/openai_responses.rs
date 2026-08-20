@@ -2747,6 +2747,25 @@ impl OpenAiResponsesCodec {
 			},
 			other => other,
 		};
+		// Some DeepSeek reasoning gateways silently disable thinking whenever a
+		// selector is present. `auto` is the provider default and can be omitted
+		// without changing tool semantics; forced and named selectors remain
+		// authoritative.
+		let tool_choice = match tool_choice {
+			Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto))
+				if context.policy.tool.thinking_conflict
+					== Some(
+						omp_llm_catalog::policy::ThinkingToolChoiceConflict::DropAutoWhenThinking,
+					)
+					&& matches!(
+						&request.reasoning,
+						Setting::Require(_) | Setting::Prefer(_)
+					) =>
+			{
+				None
+			},
+			other => other,
+		};
 		let reasoning =
 			match &request.reasoning {
 				Setting::Unset => None,
@@ -3688,6 +3707,62 @@ mod tests {
 			"auto is not a forced selector and stays on the wire"
 		);
 	}
+	#[test]
+	fn reasoning_conflict_drops_only_redundant_auto_tool_choice() {
+		let mut policy = omp_llm_catalog::policy::WirePolicy::baseline();
+		policy.tool.thinking_conflict =
+			Some(omp_llm_catalog::policy::ThinkingToolChoiceConflict::DropAutoWhenThinking);
+		let encode_choice = |policy: &omp_llm_catalog::policy::WirePolicy,
+		                     reasoning: bool,
+		                     choice: crate::call::ToolChoice| {
+			encode_with_policy(policy, |_, _| {
+				let mut request = request_with_tool(ToolInputConstraint::JsonSchema {
+					parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
+					strict:     false,
+				});
+				if reasoning {
+					request.reasoning = Setting::Require(ReasoningRequest {
+						visibility:          ReasoningVisibility::Visible,
+						effort:              Some(ReasoningEffort::Medium),
+						max_tokens:          None,
+						preserve_signatures: false,
+					});
+				}
+				request.tool_choice = Setting::Require(choice);
+				request
+			})
+			.request
+			.tool_choice
+		};
+
+		assert_eq!(encode_choice(&policy, true, crate::call::ToolChoice::Auto), None);
+		assert!(matches!(
+			encode_choice(&policy, false, crate::call::ToolChoice::Auto),
+			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Auto))
+		));
+
+		let baseline = omp_llm_catalog::policy::WirePolicy::baseline();
+		assert!(matches!(
+			encode_choice(&baseline, true, crate::call::ToolChoice::Auto),
+			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Auto))
+		));
+		assert!(matches!(
+			encode_choice(&policy, true, crate::call::ToolChoice::Required),
+			Some(super::ResponsesToolChoice::Mode(
+				super::ResponsesToolChoiceMode::Required
+			))
+		));
+		assert!(matches!(
+			encode_choice(
+				&policy,
+				true,
+				crate::call::ToolChoice::Named(Str::new_static("match_input"))
+			),
+			Some(super::ResponsesToolChoice::Named(named))
+				if named.name.as_deref() == Some("match_input")
+		));
+	}
+
 
 	#[test]
 	fn custom_tool_grammars_preserve_exact_syntax_and_definition_on_wire() {

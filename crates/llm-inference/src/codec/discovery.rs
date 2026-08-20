@@ -3,8 +3,10 @@
 use bytes::Bytes;
 use omp_core::Str;
 use omp_llm_catalog::{
-	ClassId, DiscoveredModel, DiscoveryKind, DiscoveryPagination, DiscoverySpec, ModelAvailability,
-	ModelLimits, OperationBits, OperationKind, ProviderId, RouteId, WireModelId,
+	Availability, ChatCapabilities, ClassId, DiscoveredModel, DiscoveryKind, DiscoveryPagination,
+	DiscoverySpec, ModalityBits, ModelAvailability, ModelLimits, OperationBits, OperationKind,
+	ProviderId, RouteId, ToolCapabilities, ToolFeatureBits, WireModelId,
+	unknown_capabilities,
 };
 use serde::Deserialize;
 
@@ -267,9 +269,51 @@ impl DiscoveryDecoder {
 		let rows = envelope
 			.data
 			.into_iter()
-			.map(|model| self.row(model.id, None, None, None))
+			.map(|model| self.openai_row(model))
 			.collect();
 		Ok((rows, cursor))
+	}
+
+	fn openai_row(&self, model: OpenAiModel) -> DiscoveredModel {
+		let context_length = model.context_length.filter(|tokens| *tokens > 0);
+		let max_output_tokens = model.max_output_tokens.filter(|tokens| *tokens > 0);
+		let limits = (context_length.is_some() || max_output_tokens.is_some()).then_some(ModelLimits {
+			context_window: context_length,
+			maximum_input_tokens: None,
+			maximum_output_tokens: max_output_tokens,
+			maximum_batch: None,
+		});
+		let rich_chat_metadata =
+			model.input_modalities.is_some() || model.supports_tools.is_some();
+		let mut row = self.row(model.id, model.display_name, None, None);
+		row.declared_limits = limits;
+		if rich_chat_metadata {
+			let modalities = model.input_modalities.map_or(ModalityBits::empty(), |values| {
+				values.into_iter().fold(ModalityBits::empty(), |mut bits, modality| {
+					bits.insert(match modality {
+						OpenAiInputModality::Text => ModalityBits::TEXT,
+						OpenAiInputModality::Image => ModalityBits::IMAGE,
+					});
+					bits
+				})
+			});
+			let tools = if model.supports_tools == Some(false) {
+				Availability::Unsupported
+			} else {
+				// OMP's enriched model-list contract omits this field when
+				// tools are usable and emits it only for explicit `false`.
+				Availability::Native(ToolCapabilities {
+					features:      ToolFeatureBits::empty(),
+					maximum_tools: None,
+				})
+			};
+			let mut capabilities = unknown_capabilities();
+			capabilities.operations = OperationBits::for_kind(OperationKind::Chat);
+			capabilities.chat = Some(openai_chat_capabilities(modalities, tools));
+			row.declared_operations = OperationBits::for_kind(OperationKind::Chat);
+			row.declared_capabilities = Some(capabilities);
+		}
+		row
 	}
 
 	fn decode_google(
@@ -420,6 +464,30 @@ impl DiscoveryDecoder {
 	}
 }
 
+fn openai_chat_capabilities(
+	input_modalities: ModalityBits,
+	tools: Availability<ToolCapabilities>,
+) -> ChatCapabilities {
+	ChatCapabilities {
+		roles: Availability::Unknown,
+		mid_session_roles: Availability::Unknown,
+		tools,
+		structured_output: Availability::Unknown,
+		grammar: Availability::Unknown,
+		text_verbosity: Availability::Unknown,
+		reasoning: Availability::Unknown,
+		input_modalities: Availability::Native(input_modalities),
+		hosted_tools: Availability::Unknown,
+		prompt_caching: Availability::Unknown,
+		service_tiers: Availability::Unknown,
+		sampling: Availability::Unknown,
+		safety: Availability::Unknown,
+		determinism: Availability::Unknown,
+		server_state: Availability::Unknown,
+		logprobs: Availability::Unknown,
+	}
+}
+
 #[derive(Default)]
 struct ProviderCursor {
 	next:     Option<Str>,
@@ -452,13 +520,30 @@ impl OpenAiEnvelope {
 
 #[derive(Deserialize)]
 struct OpenAiModel {
-	id:        Str,
+	id: Str,
+	#[serde(default)]
+	display_name: Option<Str>,
+	#[serde(default)]
+	context_length: Option<u64>,
+	#[serde(default)]
+	max_output_tokens: Option<u64>,
+	#[serde(default)]
+	input_modalities: Option<Vec<OpenAiInputModality>>,
+	#[serde(default)]
+	supports_tools: Option<bool>,
 	#[serde(default, rename = "created")]
-	_created:  Option<u64>,
+	_created: Option<u64>,
 	#[serde(default, rename = "owned_by")]
 	_owned_by: Option<Str>,
 	#[serde(default, rename = "object")]
-	_object:   Option<Str>,
+	_object: Option<Str>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenAiInputModality {
+	Text,
+	Image,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +720,54 @@ mod tests {
 		assert!(rows[0].declared_operations.is_empty());
 		assert_eq!(rows[0].declared_class, None);
 		assert_eq!(rows[0].declared_capabilities, None);
+	}
+
+	#[test]
+	fn openai_model_list_preserves_enriched_gateway_card_fields() {
+		let (rows, next) = discovered(
+			DiscoveryFlavor::OpenAi,
+			DiscoveryPagination::SinglePage,
+			br#"{"object":"list","data":[{
+				"id":"openai/gpt-5.6-sol",
+				"object":"model",
+				"owned_by":"openai",
+				"display_name":"GPT-5.6 Sol",
+				"context_length":1000000,
+				"max_output_tokens":128000,
+				"input_modalities":["text","image"],
+				"supports_tools":false
+			}]}"#,
+		);
+		assert_eq!(next, None);
+		let [row] = rows.as_slice() else {
+			panic!("one enriched model row");
+		};
+		assert_eq!(row.wire_model.as_str(), "openai/gpt-5.6-sol");
+		assert_eq!(row.display_name.as_deref(), Some("GPT-5.6 Sol"));
+		assert_eq!(
+			row.declared_limits,
+			Some(ModelLimits {
+				context_window:        Some(1_000_000),
+				maximum_input_tokens:  None,
+				maximum_output_tokens: Some(128_000),
+				maximum_batch:         None,
+			})
+		);
+		assert!(
+			row.declared_operations
+				.contains_kind(OperationKind::Chat)
+		);
+		let chat = row
+			.declared_capabilities
+			.as_ref()
+			.and_then(|capabilities| capabilities.chat.as_ref())
+			.expect("enriched row has chat evidence");
+		assert!(matches!(&chat.tools, Availability::Unsupported));
+		assert!(matches!(
+			&chat.input_modalities,
+			Availability::Native(modalities)
+				if modalities.contains(ModalityBits::TEXT | ModalityBits::IMAGE)
+		));
 	}
 
 	#[test]

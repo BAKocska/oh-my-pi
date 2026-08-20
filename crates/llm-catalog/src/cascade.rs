@@ -97,6 +97,12 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("max-tokens-field", AxisSet::Wire, "max_tokens_field", AxisKind::Scalar),
 	("official-endpoint", AxisSet::Wire, "official_endpoint", AxisKind::Scalar),
 	("omit-reasoning-effort", AxisSet::Wire, "omit_reasoning_effort", AxisKind::Scalar),
+	(
+		"template-reasoning-effort",
+		AxisSet::Wire,
+		"template_reasoning_effort",
+		AxisKind::Scalar,
+	),
 	("reasoning-content-field", AxisSet::Wire, "reasoning_content_field", AxisKind::Scalar),
 	("reasoning-disable-mode", AxisSet::Wire, "reasoning_disable_mode", AxisKind::Scalar),
 	("reasoning-effort-map", AxisSet::Wire, "reasoning_effort_map", AxisKind::Object),
@@ -156,6 +162,12 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("supports-tool-choice", AxisSet::Wire, "supports_tool_choice", AxisKind::Scalar),
 	("supports-usage-in-streaming", AxisSet::Wire, "supports_usage_in_streaming", AxisKind::Scalar),
 	("thinking-format", AxisSet::Wire, "thinking_format", AxisKind::Scalar),
+	(
+		"thinking-tool-choice-conflict",
+		AxisSet::Wire,
+		"thinking_tool_choice_conflict",
+		AxisKind::Scalar,
+	),
 	("when-thinking", AxisSet::Wire, "when_thinking", AxisKind::Object),
 	("thinking-default-level", AxisSet::Thinking, "defaultLevel", AxisKind::Scalar),
 	("thinking-effort-budgets", AxisSet::Thinking, "effortBudgets", AxisKind::Object),
@@ -272,7 +284,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 /// Resolved sparse axis assignments keyed by oracle-spelling axis name.
 pub type AxisMap = BTreeMap<Str, Value>;
 
-/// Wire and thinking assignments resolved for one model.
+/// Wire, thinking, and catalog-data assignments resolved for one model.
 ///
 /// `thinking` describes the reasoning control surface and is only meaningful
 /// for models the catalog marks reasoning-capable; callers apply that gate.
@@ -282,6 +294,8 @@ pub struct Resolved {
 	pub wire:     AxisMap,
 	/// Thinking-profile assignments (`mode`, `efforts`, …).
 	pub thinking: AxisMap,
+	/// Reviewed catalog-data corrections, separate from wire compatibility.
+	pub catalog:  AxisMap,
 }
 
 /// Cascade authoring or resolution failure.
@@ -470,6 +484,8 @@ struct Rule {
 	priority:  i64,
 	wire:      AxisMap,
 	thinking:  AxisMap,
+	/// Reviewed catalog-data corrections.
+	catalog:   AxisMap,
 	/// Human-readable origin for diagnostics.
 	label:     Str,
 }
@@ -570,7 +586,8 @@ impl CompatCascade {
 		Self::parse(BUNDLED_COMPAT)
 	}
 
-	/// Resolves wire and thinking assignments for one structured model target.
+	/// Resolves wire, thinking, and reviewed catalog-data assignments for one
+	/// structured model target.
 	///
 	/// When `target.reasoning` is false, broad thinking rules are not evaluated,
 	/// so family and revision policy cannot leak onto non-reasoning siblings.
@@ -586,6 +603,7 @@ impl CompatCascade {
 		let model_lower = target.model.to_ascii_lowercase();
 		let mut wire: BTreeMap<&Str, ((u8, u8, i64), &Rule)> = BTreeMap::new();
 		let mut thinking: BTreeMap<&Str, ((u8, u8, i64), &Rule)> = BTreeMap::new();
+		let mut catalog: BTreeMap<&Str, ((u8, u8, i64), &Rule)> = BTreeMap::new();
 		let reasoning = target.reasoning
 			|| self.rules.iter().any(|rule| {
 				rule.thinking.contains_key("efforts")
@@ -597,10 +615,11 @@ impl CompatCascade {
 			let Some(rank) = rule.rank(target, &model_lower) else {
 				continue;
 			};
-			if !reasoning && rule.wire.is_empty() {
+			if !reasoning && rule.wire.is_empty() && rule.catalog.is_empty() {
 				continue;
 			}
 			contest(&mut wire, &rule.wire, rank, rule, target.provider, target.model)?;
+			contest(&mut catalog, &rule.catalog, rank, rule, target.provider, target.model)?;
 			if reasoning {
 				contest(&mut thinking, &rule.thinking, rank, rule, target.provider, target.model)?;
 			}
@@ -615,6 +634,7 @@ impl CompatCascade {
 		Ok(Resolved {
 			wire:     collect(wire, |rule| &rule.wire),
 			thinking: collect(thinking, |rule| &rule.thinking),
+			catalog:  collect(catalog, |rule| &rule.catalog),
 		})
 	}
 }
@@ -764,6 +784,7 @@ fn push_rule(
 		priority,
 		wire: axes.wire,
 		thinking: axes.thinking,
+		catalog: axes.catalog,
 		label: fmt_label(file, &[node.name().value()]),
 	});
 }
@@ -815,16 +836,17 @@ fn parse_semver(text: &str) -> Option<SemVer> {
 	(count > 0).then(|| SemVer::new(components[0], components[1], components[2]))
 }
 
-/// Wire and thinking assignments collected from one rule block.
+/// Wire, thinking, and catalog-data assignments collected from one rule block.
 #[derive(Default)]
 struct RuleAxes {
 	wire:     AxisMap,
 	thinking: AxisMap,
+	catalog:  AxisMap,
 }
 
 impl RuleAxes {
 	fn is_empty(&self) -> bool {
-		self.wire.is_empty() && self.thinking.is_empty()
+		self.wire.is_empty() && self.thinking.is_empty() && self.catalog.is_empty()
 	}
 
 	fn collect(&mut self, file: &str, node: &KdlNode) -> Result<(), CascadeError> {
@@ -835,6 +857,20 @@ impl RuleAxes {
 			});
 		}
 		let written = node.name().value();
+		if written == "long-context-cost" {
+			let value =
+				node_value(node, AxisKind::Object).ok_or_else(|| CascadeError::MalformedDirective {
+					file:      file.to_str(),
+					directive: written.to_str(),
+				})?;
+			if self.catalog.insert("longContext".to_str(), value).is_some() {
+				return Err(CascadeError::DuplicateAxis {
+					file: file.to_str(),
+					axis: "longContext".to_str(),
+				});
+			}
+			return Ok(());
+		}
 		let Some(&(_, set, key, kind)) = KNOWN_AXES
 			.iter()
 			.find(|(directive, ..)| *directive == written)
@@ -1000,6 +1036,31 @@ mod tests {
 		reasoning: bool,
 	) -> ResolveTarget<'a> {
 		ResolveTarget { provider, class, family: None, revision: None, model, reasoning }
+	}
+
+	#[test]
+	fn long_context_cost_is_catalog_data_not_wire_policy() {
+		let cascade = parse_one(
+			r#"provider "subscription" {
+				models "model-a" {
+					long-context-cost {
+						inputThreshold 272000
+						input 10.0
+						output 45.0
+						cacheRead 1.0
+						cacheWrite 12.5
+					}
+				}
+			}"#,
+		)
+		.expect("catalog pricing directive parses");
+		let resolved = cascade
+			.resolve(&target("subscription", "openai", "model-a", false))
+			.expect("catalog data resolves without reasoning");
+		assert!(resolved.wire.is_empty());
+		assert!(resolved.thinking.is_empty());
+		assert_eq!(resolved.catalog["longContext"]["inputThreshold"], Value::from(272_000));
+		assert_eq!(resolved.catalog["longContext"]["cacheWrite"], Value::from(12.5));
 	}
 
 	#[test]
@@ -1174,6 +1235,25 @@ mod tests {
 		assert_eq!(resolved.wire["stream_idle_timeout_ms"], Value::from(0));
 		assert_eq!(resolved.thinking["efforts"], serde_json::json!(["low", "high", "max"]));
 	}
+	#[test]
+	fn qwen_effort_and_thinking_tool_conflict_axes_parse_to_wire_policy_keys() {
+		let cascade = parse_one(
+			r#"class "qwen" {
+				template-reasoning-effort #true
+				thinking-tool-choice-conflict "drop_auto_when_thinking"
+			}"#,
+		)
+		.expect("new wire axes parse");
+		let resolved = cascade
+			.resolve(&target("local", "qwen", "qwen3.8-27b", true))
+			.expect("resolves");
+		assert_eq!(resolved.wire["template_reasoning_effort"], Value::Bool(true));
+		assert_eq!(
+			resolved.wire["thinking_tool_choice_conflict"],
+			Value::from("drop_auto_when_thinking")
+		);
+	}
+
 
 	#[test]
 	fn exact_selectors_are_case_sensitive_and_globs_are_not() {

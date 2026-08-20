@@ -14,6 +14,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 use crate::{
 	id::{HeaderProfileId, WirePolicyId},
 	provider::{HeaderProfile, StaticHeader},
+	pricing::Pricing,
 	thinking::ThinkingEffort,
 };
 
@@ -110,6 +111,42 @@ impl ExtendedContextMode {
 	}
 }
 
+policy_enum!(/// Whether premium-priced extended context is available to selection.
+	ExtendedContextPolicy {
+		/// Preserve the model's full declared context window.
+		Enabled,
+		/// Cap effective context at the end of standard pricing.
+		StandardPricingOnly,
+	}
+);
+impl ExtendedContextPolicy {
+	/// Converts the user-facing extended-context setting into typed policy.
+	#[must_use]
+	pub const fn from_enabled(enabled: bool) -> Self {
+		if enabled {
+			Self::Enabled
+		} else {
+			Self::StandardPricingOnly
+		}
+	}
+
+	/// Applies this policy to a declared model context window.
+	///
+	/// Disabling extended context only affects models with a replacement price
+	/// tier. Unknown limits remain unknown rather than being invented.
+	#[must_use]
+	pub fn effective_context_window(
+		self,
+		declared_context_window: Option<u64>,
+		pricing: &Pricing,
+	) -> Option<u64> {
+		match (self, declared_context_window, pricing.standard_pricing_boundary()) {
+			(Self::StandardPricingOnly, Some(window), Some(boundary)) => Some(window.min(boundary)),
+			(_, window, _) => window,
+		}
+	}
+}
+
 policy_enum!(/// Provider-native reasoning request and history representation.
 	ReasoningWireFormat {
 		/// No native reasoning fields.
@@ -154,6 +191,8 @@ policy_enum!(/// Policy for reasoning controls that conflict with tool choice.
 		DropThinkingWhenAny,
 		/// Remove reasoning when an effort is present.
 		DropThinkingWhenEffort,
+		/// Omit a redundant automatic tool choice while reasoning is enabled.
+		DropAutoWhenThinking,
 	}
 );
 policy_enum!(/// Provider constraints on tool-call identifiers.
@@ -416,6 +455,8 @@ pub struct ReasoningPolicy {
 	pub supports_summary: Option<bool>,
 	/// Whether the effort field must be omitted.
 	pub omit_effort: Option<bool>,
+	/// Whether the selected effort rides `chat_template_kwargs.reasoning_effort`.
+	pub template_reasoning_effort: Option<bool>,
 	/// Canonical-to-native effort spelling overrides.
 	pub effort_map: BTreeMap<ThinkingEffort, Str>,
 	/// Explicit disable operation.
@@ -589,6 +630,7 @@ impl WirePolicy {
 				supports_effort: None,
 				supports_summary: None,
 				omit_effort: None,
+				template_reasoning_effort: None,
 				effort_map: BTreeMap::new(),
 				disable_mode: None,
 				content_field: None,
@@ -641,6 +683,7 @@ impl WirePolicy {
 		policy.structured.sampling_params = Some(true);
 		policy.structured.stop_sequences = Some(true);
 		policy.reasoning.wire_format = Some(ReasoningWireFormat::OpenAi);
+		policy.reasoning.template_reasoning_effort = Some(false);
 		policy.reasoning.leaked_healer = Some(LeakedThinkingHealer::None);
 		policy.reasoning.loop_guard = Some(false);
 		policy.cache.control_format = Some(CacheControlFormat::None);
@@ -869,6 +912,33 @@ mod tests {
 	use serde::Deserialize;
 
 	use super::*;
+
+	#[test]
+	fn standard_pricing_policy_caps_only_tiered_known_windows() {
+		use crate::pricing::{PriceTier, Pricing};
+
+		let tiered = Pricing::new(
+			Vec::new(),
+			vec![PriceTier { prompt_tokens_above: 272_000, components: Box::new([]) }],
+		)
+		.expect("tiered pricing");
+		let standard = ExtendedContextPolicy::from_enabled(false);
+		assert_eq!(
+			standard.effective_context_window(Some(1_000_000), &tiered),
+			Some(272_000)
+		);
+		assert_eq!(standard.effective_context_window(Some(128_000), &tiered), Some(128_000));
+		assert_eq!(standard.effective_context_window(None, &tiered), None);
+		assert_eq!(
+			ExtendedContextPolicy::Enabled.effective_context_window(Some(1_000_000), &tiered),
+			Some(1_000_000)
+		);
+		let untiered = Pricing::default();
+		assert_eq!(
+			standard.effective_context_window(Some(1_000_000), &untiered),
+			Some(1_000_000)
+		);
+	}
 
 	#[derive(Deserialize)]
 	struct CompatFixture {

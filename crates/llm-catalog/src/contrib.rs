@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
+use arc_swap::ArcSwap;
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +106,56 @@ impl OverlayStack {
 			overlays:   overlays.into(),
 			sources:    sources.into(),
 			generation: self.generation.saturating_add(1),
+		}
+	}
+}
+
+/// Lock-free publication point for immutable overlay generations.
+///
+/// Writers construct a complete replacement off-path and atomically exchange
+/// it; readers retain their loaded [`Arc`] for the whole resolution, so an
+/// in-flight request can never observe a mixed generation.
+#[derive(Debug)]
+pub struct OverlayStore {
+	current: ArcSwap<OverlayStack>,
+}
+
+impl Default for OverlayStore {
+	fn default() -> Self {
+		Self::new(OverlayStack::empty())
+	}
+}
+
+impl OverlayStore {
+	/// Creates a store with one published immutable stack.
+	#[must_use]
+	pub fn new(initial: OverlayStack) -> Self {
+		Self { current: ArcSwap::from_pointee(initial) }
+	}
+
+	/// Loads one stable generation without locking.
+	#[must_use]
+	pub fn load(&self) -> Arc<OverlayStack> {
+		self.current.load_full()
+	}
+
+	/// Atomically replaces the complete stack.
+	pub fn publish(&self, next: OverlayStack) {
+		self.current.store(Arc::new(next));
+	}
+
+	/// Replaces one source layer from the latest published generation.
+	///
+	/// Concurrent writers are retried against the generation they displaced, so
+	/// no independently published layer is lost.
+	pub fn replace(&self, source: OverlaySource, overlay: CatalogOverlay) -> Arc<OverlayStack> {
+		loop {
+			let current = self.current.load_full();
+			let next = Arc::new(current.with_replaced(source.clone(), overlay.clone()));
+			let previous = self.current.compare_and_swap(&current, next.clone());
+			if Arc::ptr_eq(&*previous, &current) {
+				return next;
+			}
 		}
 	}
 }

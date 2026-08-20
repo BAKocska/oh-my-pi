@@ -16,7 +16,10 @@ use omp_llm_catalog::{
 };
 use parking_lot::Mutex;
 use prost::Message;
-use prost_types::FileDescriptorSet;
+use prost_types::{
+	FileDescriptorSet, ListValue as ProtoList, Struct as ProtoStruct, Value as ProtoValue,
+	value::Kind as ProtoValueKind,
+};
 
 use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
@@ -173,6 +176,7 @@ pub fn for_each_public_header(
 		CursorHeaderProfile::Run => {
 			visit("content-type", "application/connect+proto");
 			visit("connect-protocol-version", "1");
+			visit("te", "trailers");
 		},
 		CursorHeaderProfile::Discovery => {
 			visit("content-type", "application/proto");
@@ -192,8 +196,8 @@ pub struct CursorToolDefinition {
 	pub name:              Str,
 	/// Optional human-readable description.
 	pub description:       Option<Str>,
-	/// Exact JSON Schema text.
-	pub input_schema_json: Str,
+	/// Encoded `google.protobuf.Value` carrying the tool's JSON Schema.
+	pub input_schema: Bytes,
 }
 
 /// Instruction role retained inside Cursor's serialized root prompt messages.
@@ -329,8 +333,8 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 				.description
 				.as_ref()
 				.map_or_else(String::new, |value| value.as_str().to_owned()),
-			input_schema:        Bytes::new(),
-			input_schema_json:   Some(tool.input_schema_json.as_str().to_owned()),
+			input_schema:        tool.input_schema.clone(),
+			input_schema_json:   None,
 		})
 		.collect();
 	let model = wire::ModelDetails {
@@ -406,6 +410,67 @@ fn encode_root_prompt(prompt: &CursorRootPrompt) -> Bytes {
 		.expect("a borrowed string always serializes as JSON"),
 	)
 }
+fn encode_json_value(value: &serde_json::Value) -> Result<Bytes, Error> {
+	Ok(Bytes::from(protobuf_json_value(value)?.encode_to_vec()))
+}
+
+fn protobuf_json_value(value: &serde_json::Value) -> Result<ProtoValue, Error> {
+	let kind = match value {
+		serde_json::Value::Null => ProtoValueKind::NullValue(0),
+		serde_json::Value::Bool(value) => ProtoValueKind::BoolValue(*value),
+		serde_json::Value::Number(value) => ProtoValueKind::NumberValue(
+			value
+				.as_f64()
+				.filter(|value| value.is_finite())
+				.ok_or_else(|| encoding_error("cursor_tool_schema_number_not_representable"))?,
+		),
+		serde_json::Value::String(value) => ProtoValueKind::StringValue(value.clone()),
+		serde_json::Value::Array(values) => ProtoValueKind::ListValue(ProtoList {
+			values: values
+				.iter()
+				.map(protobuf_json_value)
+				.collect::<Result<_, _>>()?,
+		}),
+		serde_json::Value::Object(fields) => ProtoValueKind::StructValue(ProtoStruct {
+			fields: fields
+				.iter()
+				.map(|(name, value)| Ok((name.clone(), protobuf_json_value(value)?)))
+				.collect::<Result<_, Error>>()?,
+		}),
+	};
+	Ok(ProtoValue { kind: Some(kind) })
+}
+
+fn decode_json_value(bytes: &[u8]) -> Option<serde_json::Value> {
+	let value = ProtoValue::decode(bytes).ok()?;
+	protobuf_to_json(value)
+}
+
+fn protobuf_to_json(value: ProtoValue) -> Option<serde_json::Value> {
+	Some(match value.kind {
+		None | Some(ProtoValueKind::NullValue(_)) => serde_json::Value::Null,
+		Some(ProtoValueKind::BoolValue(value)) => serde_json::Value::Bool(value),
+		Some(ProtoValueKind::NumberValue(value)) => {
+			serde_json::Value::Number(serde_json::Number::from_f64(value)?)
+		},
+		Some(ProtoValueKind::StringValue(value)) => serde_json::Value::String(value),
+		Some(ProtoValueKind::ListValue(value)) => serde_json::Value::Array(
+			value
+				.values
+				.into_iter()
+				.map(protobuf_to_json)
+				.collect::<Option<_>>()?,
+		),
+		Some(ProtoValueKind::StructValue(value)) => serde_json::Value::Object(
+			value
+				.fields
+				.into_iter()
+				.map(|(name, value)| Some((name, protobuf_to_json(value)?)))
+				.collect::<Option<_>>()?,
+		),
+	})
+}
+
 
 /// Non-secret model facts observed directly in Cursor discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1009,17 +1074,23 @@ impl CursorDecoder {
 				if let Some(open) = self.open.as_mut()
 					&& !partial.args_text_delta.is_empty()
 				{
-					let bytes = Bytes::from(partial.args_text_delta);
-					open.arguments.extend_from_slice(&bytes);
-					events.push(CursorEvent::Chat(Box::new(ChatEvent::ToolArgumentsDelta {
-						index: open.index,
-						bytes,
-					})));
-					self.committed = true;
+					let snapshot = partial.args_text_delta.as_bytes();
+					let chunk = snapshot
+						.strip_prefix(open.arguments.as_ref())
+						.unwrap_or(snapshot);
+					if !chunk.is_empty() {
+						open.arguments.extend_from_slice(chunk);
+						events.push(CursorEvent::Chat(Box::new(ChatEvent::ToolArgumentsDelta {
+							index: open.index,
+							bytes: Bytes::copy_from_slice(chunk),
+						})));
+						self.committed = true;
+					}
 				}
 			},
 			Some(Message::ToolCallCompleted(completed)) => {
 				let id = call_id(completed.call_id, completed.tool_call.as_ref());
+				let completion_arguments = mcp_tool_arguments(completed.tool_call.as_ref());
 				if let Some(open) = self.open.take() {
 					if open.kind != OpenKind::Tool || (!id.as_str().is_empty() && open.tool_id != id) {
 						self.open = Some(open);
@@ -1029,11 +1100,15 @@ impl CursorDecoder {
 							self.committed,
 						));
 					}
+					let arguments = match completion_arguments {
+						Some(completion) => merge_mcp_arguments(&open.arguments, completion),
+						None => open.arguments.freeze(),
+					};
 					events.push(CursorEvent::ToolCallComplete {
-						index:     open.index,
-						id:        open.tool_id,
-						name:      open.tool_name,
-						arguments: open.arguments.freeze(),
+						index: open.index,
+						id: open.tool_id,
+						name: open.tool_name,
+						arguments,
 					});
 				}
 			},
@@ -1160,6 +1235,60 @@ fn shell_invocation(
 		timeout_ms: args.timeout.max(0) as u32,
 		streaming,
 	})
+}
+
+fn mcp_tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
+	use wire::tool_call::Tool;
+	let Some(Tool::McpToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
+		return None;
+	};
+	let args = call.args.as_ref()?;
+	let fields = args
+		.args
+		.iter()
+		.map(|(name, value)| (name.clone(), decode_mcp_arg_value(value)))
+		.collect();
+	serde_json::to_vec(&serde_json::Value::Object(fields))
+		.ok()
+		.map(Bytes::from)
+}
+
+fn merge_mcp_arguments(streamed: &[u8], completion: Bytes) -> Bytes {
+	let Ok(serde_json::Value::Object(mut merged)) =
+		serde_json::from_slice::<serde_json::Value>(streamed)
+	else {
+		return completion;
+	};
+	let Ok(serde_json::Value::Object(completed)) =
+		serde_json::from_slice::<serde_json::Value>(&completion)
+	else {
+		return completion;
+	};
+	for (name, value) in completed {
+		let downgraded = value.is_string()
+			&& matches!(
+				merged.get(&name),
+				Some(serde_json::Value::Object(_) | serde_json::Value::Array(_))
+			);
+		if !downgraded {
+			merged.insert(name, value);
+		}
+	}
+	Bytes::from(
+		serde_json::to_vec(&serde_json::Value::Object(merged))
+			.expect("serde_json::Value always serializes"),
+	)
+}
+
+fn decode_mcp_arg_value(value: &[u8]) -> serde_json::Value {
+	let value = decode_json_value(value)
+		.or_else(|| serde_json::from_slice(value).ok())
+		.unwrap_or_else(|| serde_json::Value::String(String::from_utf8_lossy(value).into_owned()));
+	if let serde_json::Value::String(text) = value {
+		serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+	} else {
+		value
+	}
 }
 
 fn call_id(call_id: String, tool: Option<&wire::ToolCall>) -> ToolCallId {
@@ -1553,12 +1682,10 @@ fn encode_chat_call(
 			let Some((parameters, _)) = tool.input.json_schema() else {
 				return Err(encoding_error("cursor_tool_grammar_unsupported"));
 			};
-			let schema = serde_json::to_string(parameters.as_value())
-				.map_err(|_| encoding_error("cursor_tool_schema_not_serializable"))?;
 			Ok(CursorToolDefinition {
-				name:              tool.name.clone(),
-				description:       tool.description.clone(),
-				input_schema_json: Str::from(schema),
+				name:         tool.name.clone(),
+				description:  tool.description.clone(),
+				input_schema: encode_json_value(parameters.as_value())?,
 			})
 		})
 		.collect::<Result<Vec<_>, Error>>()?;
@@ -1583,7 +1710,7 @@ fn encode_chat_call(
 			text:       user,
 		},
 	};
-	let mut headers = Vec::with_capacity(5);
+	let mut headers = Vec::with_capacity(6);
 	for_each_public_header(CursorHeaderProfile::Run, |name, value| {
 		headers.push(RequestHeader { name: Str::new_static(name), value: Str::new_static(value) });
 	});
@@ -1965,6 +2092,62 @@ mod tests {
 		assert!(reject_unprojected_chat_options(&request, true).is_ok());
 		assert!(reject_unprojected_chat_options(&request, false).is_err());
 	}
+	#[test]
+	fn mcp_arguments_decode_protobuf_json_values() {
+		let expected = serde_json::json!({
+			"path": "src/lib.rs",
+			"range": { "start": 4, "end": 12 },
+			"strict": true,
+			"encoded": { "depth": 2 }
+		});
+		let mut args: BTreeMap<String, Bytes> = expected
+			.as_object()
+			.expect("object")
+			.iter()
+			.map(|(name, value)| {
+				(
+					name.clone(),
+					encode_json_value(value).expect("encoded protobuf JSON Value"),
+				)
+			})
+			.collect();
+		args.insert(
+			"encoded".to_owned(),
+			encode_json_value(&serde_json::json!(r#"{"depth":2}"#))
+				.expect("encoded protobuf JSON string"),
+		);
+		let tool = wire::ToolCall {
+			tool: Some(wire::tool_call::Tool::McpToolCall(wire::McpToolCall {
+				args: Some(wire::McpArgs { args, ..wire::McpArgs::default() }),
+				..wire::McpToolCall::default()
+			})),
+			..wire::ToolCall::default()
+		};
+		let decoded = mcp_tool_arguments(Some(&tool)).expect("MCP arguments");
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&decoded).expect("JSON object"),
+			expected
+		);
+	}
+	#[test]
+	fn mcp_completion_merges_scalars_without_downgrading_streamed_structures() {
+		let streamed = br#"{"tasks":[{"id":"one"}],"note":"old","streamed":true}"#;
+		let completion = Bytes::from_static(
+			br#"{"tasks":"raw fallback","note":"new","completion":12}"#,
+		);
+		let merged = merge_mcp_arguments(streamed, completion);
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&merged).expect("merged JSON"),
+			serde_json::json!({
+				"tasks": [{ "id": "one" }],
+				"note": "new",
+				"streamed": true,
+				"completion": 12
+			})
+		);
+	}
+
+
 
 	fn update(message: wire::interaction_update::Message) -> Bytes {
 		Bytes::from(
@@ -2032,6 +2215,8 @@ mod tests {
 		assert_eq!(message_field("InteractionQuery", "web_fetch_request_query"), Some(9));
 		assert_eq!(message_field("InteractionResponse", "web_fetch_request_response"), Some(9));
 		assert_eq!(message_field("ToolCall", "web_fetch_tool_call"), Some(37));
+		assert_eq!(message_field("McpToolDefinition", "input_schema"), Some(3));
+		assert_eq!(message_field("McpToolDefinition", "input_schema_json"), Some(6));
 		assert_eq!(message_field("AgentClientMessage", "interaction_response"), Some(6));
 		assert_eq!(message_field("AgentServerMessage", "interaction_query"), Some(7));
 	}
@@ -2386,7 +2571,7 @@ mod tests {
 			update(wire::interaction_update::Message::PartialToolCall(wire::PartialToolCallUpdate {
 				call_id: "call-read".to_owned(),
 				tool_call: Some(tool),
-				args_text_delta: "th\":\"package.json\"}".to_owned(),
+				args_text_delta: r#"{"path":"package.json"}"#.to_owned(),
 				..Default::default()
 			})),
 			update(wire::interaction_update::Message::ToolCallCompleted(
@@ -2892,6 +3077,11 @@ mod tests {
 		assert!(headers.request.url.ends_with(RUN_PATH));
 		assert_eq!(headers.request.headers["x-cursor-client-version"], CLIENT_VERSION);
 		assert_eq!(headers.request.headers["content-type"], "application/connect+proto");
+		let mut public_headers = BTreeMap::new();
+		for_each_public_header(CursorHeaderProfile::Run, |name, value| {
+			public_headers.insert(name, value);
+		});
+		assert_eq!(public_headers.get("te"), Some(&"trailers"));
 
 		#[derive(serde::Deserialize)]
 		struct RequestFixture {
@@ -2908,6 +3098,11 @@ mod tests {
 		}
 		let request: RequestFixture =
 			serde_json::from_slice(&fixture("request.tool_call.json")).expect("typed request fixture");
+		let input_schema = encode_json_value(&serde_json::json!({
+			"type": "object",
+			"properties": { "path": { "type": "string" } }
+		}))
+		.expect("protobuf JSON Value schema");
 		let encoded = encode_run_request(&CursorRunRequest {
 			model_id:        Str::from(request.canonical_intent.model.as_str()),
 			max_mode:        false,
@@ -2919,11 +3114,9 @@ mod tests {
 				.tools
 				.into_iter()
 				.map(|tool| CursorToolDefinition {
-					name:              Str::from(tool.name),
-					description:       None,
-					input_schema_json: Str::from(
-						r#"{"type":"object","properties":{"path":{"type":"string"}}}"#,
-					),
+					name:         Str::from(tool.name),
+					description:  None,
+					input_schema: input_schema.clone(),
 				})
 				.collect(),
 			action:          CursorRunAction::UserMessage {
@@ -2953,6 +3146,12 @@ mod tests {
 				.max_mode
 		);
 		assert_eq!(run.mcp_tools.as_ref().expect("tools").mcp_tools[0].name, "read");
+		let tool = &run.mcp_tools.as_ref().expect("tools").mcp_tools[0];
+		assert_eq!(
+			ProtoValue::decode(tool.input_schema.clone()).expect("protobuf JSON Value"),
+			ProtoValue::decode(input_schema).expect("expected protobuf JSON Value")
+		);
+		assert!(tool.input_schema_json.is_none());
 
 		#[derive(serde::Deserialize)]
 		struct ToolExpectation {

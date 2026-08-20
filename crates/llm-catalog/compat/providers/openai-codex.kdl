@@ -6,4 +6,33 @@ provider "openai-codex" {
 			thinking-mode "effort"
 		}
 	}
+	// Subscription Codex SKUs use the same whole-request premium tier as the
+	// first-party API once prompt input exceeds 272K tokens (pi 6d2bae2c41).
+	models "gpt-5.6-luna" {
+		long-context-cost {
+			inputThreshold 272000
+			input 0.4
+			output 1.8
+			cacheRead 0.04
+			cacheWrite 0.5
+		}
+	}
+	models "gpt-5.6-sol" {
+		long-context-cost {
+			inputThreshold 272000
+			input 10.0
+			output 45.0
+			cacheRead 1.0
+			cacheWrite 12.5
+		}
+	}
+	models "gpt-5.6-terra" {
+		long-context-cost {
+			inputThreshold 272000
+			input 4.0
+			output 18.0
+			cacheRead 0.4
+			cacheWrite 5.0
+		}
+	}
 }

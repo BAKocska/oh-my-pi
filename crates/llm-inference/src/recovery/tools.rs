@@ -8,6 +8,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use serde_json::Value;
+use smallvec::SmallVec;
 use xutf::BufReadCharsExt as _;
 
 use super::{RecoveryError, Stage};
@@ -85,6 +86,14 @@ pub struct SchemaViolation {
 	pub path: Str,
 	/// Stable validation rule identifier.
 	pub rule: &'static str,
+	/// Candidate JSON types reported by a failed `type` check.
+	pub expected_types:    SmallVec<Str, 4>,
+	/// Whether this issue came from a speculative failed union branch.
+	///
+	/// Lossy repair consumers must ignore speculative issues. A branch uniquely
+	/// selected by matching `const`/`enum` discriminators is authoritative and
+	/// reports `false`.
+	pub from_union_branch: bool,
 }
 
 /// One incremental input from a native codec or recovered text tool channel.
@@ -399,35 +408,44 @@ impl<'a> ToolAssembler<'a> {
 						};
 					},
 				};
-				let arguments =
-					match validate_schema(parameters.as_value(), &arguments, *strict, self.limits) {
-						Ok(()) => arguments,
-						Err(reason) => {
-							// Some providers (notably Gemini) serialize array arguments
-							// as flattened property paths (`questions[0].id`) instead of
-							// nested arrays. Rebuild the nested structure and re-validate
-							// before surfacing the original violation.
-							match normalize_flattened_arguments(&arguments).filter(|rebuilt| {
-								validate_schema(parameters.as_value(), rebuilt, *strict, self.limits)
-									.is_ok()
-							}) {
-								Some(rebuilt) => {
-									self.record(
-										"tool.flattened-array-arguments",
-										call.arguments.len() as u64,
-										1,
-									);
-									rebuilt
-								},
-								None => {
-									return ToolAssemblyEvent::Rejected {
-										source_index,
-										reason: ToolRejection::SchemaViolation(reason),
-									};
-								},
-							}
-						},
-					};
+				let arguments = match repair_schema_arguments(
+					parameters.as_value(),
+					&arguments,
+					*strict,
+					self.limits,
+				) {
+					Ok((arguments, repairs)) => {
+						if repairs > 0 {
+							self.record(
+								"tool.schema-directed-argument-repair",
+								call.arguments.len() as u64,
+								repairs,
+							);
+						}
+						arguments
+					},
+					Err(reason) => {
+						match normalize_flattened_arguments(&arguments).filter(|rebuilt| {
+							validate_schema(parameters.as_value(), rebuilt, *strict, self.limits)
+								.is_ok()
+						}) {
+							Some(rebuilt) => {
+								self.record(
+									"tool.flattened-array-arguments",
+									call.arguments.len() as u64,
+									1,
+								);
+								rebuilt
+							},
+							None => {
+								return ToolAssemblyEvent::Rejected {
+									source_index,
+									reason: ToolRejection::SchemaViolation(reason),
+								};
+							},
+						}
+					},
+				};
 				self.record("tool.complete-schema-valid", call.arguments.len() as u64, 1);
 				arguments
 			},
@@ -509,6 +527,126 @@ pub fn validate_schema(
 	let mut budget = limits.max_schema_nodes;
 	validate_node(schema, instance, "", strict, 0, limits.max_schema_depth, &mut budget)
 }
+fn repair_schema_arguments(
+	schema: &Value,
+	instance: &Value,
+	strict: bool,
+	limits: ToolAssemblyLimits,
+) -> Result<(Value, u32), SchemaViolation> {
+	let mut repaired = instance.clone();
+	let mut repairs = 0_u32;
+	loop {
+		match validate_schema(schema, &repaired, strict, limits) {
+			Ok(()) => return Ok((repaired, repairs)),
+			Err(issue)
+				if repairs < 16 && apply_schema_repair(&mut repaired, &issue) =>
+			{
+				repairs = repairs.saturating_add(1);
+			},
+			Err(issue) => return Err(issue),
+		}
+	}
+}
+
+fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
+	if issue.rule == "additionalProperties" {
+		return !issue.from_union_branch && remove_pointer(instance, issue.path.as_str());
+	}
+	if issue.rule != "type" {
+		return false;
+	}
+	let Some(value) = pointer_mut(instance, issue.path.as_str()) else {
+		return false;
+	};
+	if let Value::String(text) = value {
+		let trimmed = text.trim();
+		if (trimmed.starts_with('{') || trimmed.starts_with('['))
+			&& let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+			&& issue
+				.expected_types
+				.iter()
+				.any(|kind| matches_type(&parsed, kind))
+		{
+			*value = parsed;
+			return true;
+		}
+		if issue.expected_types.iter().any(|kind| kind.as_str() == "boolean") {
+			let parsed = match trimmed {
+				"true" | "yes" | "1" => Some(true),
+				"false" | "no" | "0" => Some(false),
+				_ => None,
+			};
+			if let Some(parsed) = parsed {
+				*value = Value::Bool(parsed);
+				return true;
+			}
+		}
+		if issue.expected_types.iter().any(|kind| kind.as_str() == "integer")
+			&& let Ok(parsed) = trimmed.parse::<i64>()
+		{
+			*value = Value::from(parsed);
+			return true;
+		}
+		if issue.expected_types.iter().any(|kind| kind.as_str() == "number")
+			&& let Ok(parsed) = trimmed.parse::<f64>()
+			&& let Some(parsed) = serde_json::Number::from_f64(parsed)
+		{
+			*value = Value::Number(parsed);
+			return true;
+		}
+	}
+	if issue.expected_types.iter().any(|kind| kind.as_str() == "string")
+		&& !matches!(value, Value::String(_))
+	{
+		if matches!(value, Value::Array(_) | Value::Object(_)) && issue.from_union_branch {
+			return false;
+		}
+		*value = Value::String(value.to_string());
+		return true;
+	}
+	if issue.expected_types.iter().any(|kind| kind.as_str() == "array")
+		&& !matches!(value, Value::Array(_))
+		&& !issue.from_union_branch
+	{
+		*value = Value::Array(vec![value.clone()]);
+		return true;
+	}
+	false
+}
+
+fn pointer_mut<'a>(instance: &'a mut Value, path: &str) -> Option<&'a mut Value> {
+	if path == "/" {
+		Some(instance)
+	} else {
+		instance.pointer_mut(path)
+	}
+}
+
+fn remove_pointer(instance: &mut Value, path: &str) -> bool {
+	let Some((parent, key)) = path.rsplit_once('/') else {
+		return false;
+	};
+	let key = key.replace("~1", "/").replace("~0", "~");
+	let parent = if parent.is_empty() {
+		instance
+	} else if let Some(parent) = instance.pointer_mut(parent) {
+		parent
+	} else {
+		return false;
+	};
+	match parent {
+		Value::Object(object) => object.remove(&key).is_some(),
+		Value::Array(array) => key
+			.parse::<usize>()
+			.ok()
+			.filter(|index| *index < array.len())
+			.map(|index| {
+				array.remove(index);
+			})
+			.is_some(),
+		_ => false,
+	}
+}
 
 fn validate_node(
 	schema: &Value,
@@ -556,7 +694,16 @@ fn validate_node(
 			_ => false,
 		};
 		if !valid {
-			return violation(path, "type");
+			let expected_types = match types {
+				Value::String(kind) => std::iter::once(Str::from(kind.as_str())).collect(),
+				Value::Array(kinds) => kinds
+					.iter()
+					.filter_map(Value::as_str)
+					.map(Str::from)
+					.collect(),
+				_ => SmallVec::new(),
+			};
+			return type_violation(path, expected_types);
 		}
 	}
 	if let Some(all) = object.get("allOf").and_then(Value::as_array) {
@@ -566,34 +713,85 @@ fn validate_node(
 	}
 	if let Some(any) = object.get("anyOf").and_then(Value::as_array) {
 		let mut matched = false;
+		let mut first_issue = None;
+		let mut selected_issue = None;
+		let mut selected_count = 0_u32;
 		for branch in any {
 			let mut branch_budget = *budget;
 			let result =
 				validate_node(branch, value, path, strict, depth + 1, max_depth, &mut branch_budget);
 			let consumed = (*budget).saturating_sub(branch_budget);
 			*budget = (*budget).saturating_sub(consumed);
-			if result.is_ok() {
-				matched = true;
-				break;
+			match result {
+				Ok(()) => {
+					matched = true;
+					break;
+				},
+				Err(issue) => {
+					if first_issue.is_none() {
+						first_issue = Some(issue.clone());
+					}
+					if is_tag_selected_branch(branch, value) {
+						selected_count = selected_count.saturating_add(1);
+						if selected_count == 1 {
+							selected_issue = Some(issue);
+						}
+					}
+				},
 			}
 		}
 		if !matched {
+			if selected_count == 1
+				&& let Some(issue) = selected_issue
+			{
+				return Err(issue);
+			}
+			if let Some(mut issue) = first_issue {
+				issue.from_union_branch = true;
+				return Err(issue);
+			}
 			return violation(path, "anyOf");
 		}
 	}
 	if let Some(one) = object.get("oneOf").and_then(Value::as_array) {
 		let mut matches = 0_u32;
+		let mut first_issue = None;
+		let mut selected_issue = None;
+		let mut selected_count = 0_u32;
 		for branch in one {
 			let mut branch_budget = *budget;
 			let result =
 				validate_node(branch, value, path, strict, depth + 1, max_depth, &mut branch_budget);
 			let consumed = (*budget).saturating_sub(branch_budget);
 			*budget = (*budget).saturating_sub(consumed);
-			if result.is_ok() {
-				matches += 1;
+			match result {
+				Ok(()) => matches = matches.saturating_add(1),
+				Err(issue) => {
+					if first_issue.is_none() {
+						first_issue = Some(issue.clone());
+					}
+					if is_tag_selected_branch(branch, value) {
+						selected_count = selected_count.saturating_add(1);
+						if selected_count == 1 {
+							selected_issue = Some(issue);
+						}
+					}
+				},
 			}
 		}
 		if matches != 1 {
+			if matches == 0
+				&& selected_count == 1
+				&& let Some(issue) = selected_issue
+			{
+				return Err(issue);
+			}
+			if matches == 0
+				&& let Some(mut issue) = first_issue
+			{
+				issue.from_union_branch = true;
+				return Err(issue);
+			}
 			return violation(path, "oneOf");
 		}
 	}
@@ -777,11 +975,61 @@ fn matches_type(value: &Value, kind: &str) -> bool {
 	}
 }
 
+fn is_tag_selected_branch(branch: &Value, value: &Value) -> bool {
+	let (Some(branch), Some(value)) = (branch.as_object(), value.as_object()) else {
+		return false;
+	};
+	let Some(properties) = branch.get("properties").and_then(Value::as_object) else {
+		return false;
+	};
+	let mut matched = false;
+	for (key, property) in properties {
+		let Some(property) = property.as_object() else {
+			continue;
+		};
+		let constant = property.get("const");
+		let variants = property.get("enum").and_then(Value::as_array);
+		if constant.is_none() && variants.is_none() {
+			continue;
+		}
+		let Some(candidate) = value.get(key) else {
+			return false;
+		};
+		if let Some(constant) = constant {
+			if candidate != constant {
+				return false;
+			}
+		} else if variants.is_some_and(|variants| !variants.contains(candidate)) {
+			return false;
+		}
+		matched = true;
+	}
+	matched
+}
+
+fn type_violation<T>(
+	path: &str,
+	expected_types: SmallVec<Str, 4>,
+) -> Result<T, SchemaViolation> {
+	Err(SchemaViolation {
+		path: Str::from(if path.is_empty() { "/" } else { path }),
+		rule: "type",
+		expected_types,
+		from_union_branch: false,
+	})
+}
+
+
 fn child_path(parent: &str, child: &str) -> String {
 	format!("{parent}/{}", child.replace('~', "~0").replace('/', "~1"))
 }
 fn violation<T>(path: &str, rule: &'static str) -> Result<T, SchemaViolation> {
-	Err(SchemaViolation { path: Str::from(if path.is_empty() { "/" } else { path }), rule })
+	Err(SchemaViolation {
+		path: Str::from(if path.is_empty() { "/" } else { path }),
+		rule,
+		expected_types: SmallVec::new(),
+		from_union_branch: false,
+	})
 }
 
 // ============================================================================
@@ -1492,6 +1740,182 @@ mod tests {
 			ToolAssemblyEvent::Ready { call, .. } => Some(call.arguments.as_value().clone()),
 			_ => None,
 		})
+	}
+
+	#[test]
+	fn string_type_union_stringifies_container_arguments() {
+		let definition = ToolDefinition {
+			name: Str::from("union_string"),
+			description: None,
+			input: ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(json!({
+					"type": "object",
+					"properties": {"payload": {"type": ["string", "number"]}},
+					"required": ["payload"],
+					"additionalProperties": false
+				})),
+				strict: true,
+			},
+		};
+		let (events, _) = call_with(definition, &json!({"payload": {"a": 1}}));
+		assert_eq!(
+			ready_arguments(&events),
+			Some(json!({"payload": "{\"a\":1}"}))
+		);
+	}
+
+	#[test]
+	fn failed_untagged_union_branch_does_not_apply_lossy_repairs() {
+		let schema = json!({
+			"anyOf": [
+				{
+					"type": "object",
+					"properties": {"payload": {"type": "string"}},
+					"required": ["payload"],
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"properties": {"payload": {"type": "number"}},
+					"required": ["payload"],
+					"additionalProperties": false
+				}
+			]
+		});
+		let value = json!({"payload": {"a": 1}});
+		let issue = validate_schema(&schema, &value, true, ToolAssemblyLimits::default())
+			.expect_err("untagged branch must fail");
+		assert!(issue.from_union_branch);
+		assert_eq!(issue.path.as_str(), "/payload");
+
+		let definition = ToolDefinition {
+			name: Str::from("untagged"),
+			description: None,
+			input: ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(schema),
+				strict: true,
+			},
+		};
+		let (events, _) = call_with(definition, &value);
+		assert!(ready_arguments(&events).is_none());
+	}
+	#[test]
+	fn failed_union_branch_still_allows_lossless_scalar_repair() {
+		let definition = ToolDefinition {
+			name: Str::from("lossless"),
+			description: None,
+			input: ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(json!({
+					"type": "object",
+					"properties": {
+						"payload": {"anyOf": [{"type": "number"}, {"type": "boolean"}]}
+					},
+					"required": ["payload"],
+					"additionalProperties": false
+				})),
+				strict: true,
+			},
+		};
+		let (events, _) = call_with(definition, &json!({"payload": "300"}));
+		assert_eq!(ready_arguments(&events), Some(json!({"payload": 300})));
+	}
+
+	#[test]
+	fn failed_union_branch_does_not_delete_keys_or_wrap_singletons() {
+		for value in [
+			json!({"op": {"kind": "set", "value": 1, "extra": "keep"}}),
+			json!({"op": {"items": "one"}}),
+	] {
+			let property = if value["op"].get("items").is_some() {
+				json!({
+					"anyOf": [
+						{
+							"type": "object",
+							"properties": {"items": {"type": "array"}},
+							"required": ["items"],
+							"additionalProperties": false
+						},
+						{"type": "string"}
+					]
+				})
+			} else {
+				json!({
+					"anyOf": [
+						{
+							"type": "object",
+							"properties": {
+								"kind": {"type": "string"},
+								"value": {"type": "number"}
+							},
+							"required": ["kind", "value"],
+							"additionalProperties": false
+						},
+						{"type": "string"}
+					]
+				})
+			};
+			let definition = ToolDefinition {
+				name: Str::from("lossy"),
+				description: None,
+				input: ToolInputConstraint::JsonSchema {
+					parameters: OpaqueJson::new(json!({
+						"type": "object",
+						"properties": {"op": property},
+						"required": ["op"],
+						"additionalProperties": false
+					})),
+					strict: true,
+				},
+			};
+			let (events, _) = call_with(definition, &value);
+			assert!(ready_arguments(&events).is_none());
+		}
+	}
+
+
+	#[test]
+	fn uniquely_tag_selected_union_branch_allows_lossy_repairs() {
+		let schema = json!({
+			"oneOf": [
+				{
+					"type": "object",
+					"properties": {
+						"kind": {"const": "text"},
+						"payload": {"type": "string"}
+					},
+					"required": ["kind", "payload"],
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"properties": {
+						"kind": {"enum": ["count"]},
+						"payload": {"type": "number"}
+					},
+					"required": ["kind", "payload"],
+					"additionalProperties": false
+				}
+			]
+		});
+		let value = json!({"kind": "text", "payload": {"a": 1}});
+		let issue = validate_schema(&schema, &value, true, ToolAssemblyLimits::default())
+			.expect_err("tag-selected payload still needs repair");
+		assert!(!issue.from_union_branch);
+		assert_eq!(issue.path.as_str(), "/payload");
+
+		let definition = ToolDefinition {
+			name: Str::from("tagged"),
+			description: None,
+			input: ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(schema),
+				strict: true,
+			},
+		};
+		let (events, _) = call_with(definition, &value);
+		assert_eq!(
+			ready_arguments(&events),
+			Some(json!({"kind": "text", "payload": "{\"a\":1}"}))
+		);
 	}
 
 	#[test]

@@ -39,6 +39,15 @@ class "deepseek" {
 			requires-reasoning-content-for-all-assistant-turns #true
 		}
 	}
+	// DeepSeek reasoning gateways disable thinking whenever any tool-choice
+	// selector is present. Omit only the wire-neutral `auto` selector so
+	// reasoning survives; forced and named choices remain authoritative
+	// (pi 7cb504cdb3).
+	on "aiand" "aimlapi" "alibaba-token-plan" "baseten" "coreweave" "deepseek" "fireworks" \
+		"gmi-cloud" "groq" "huggingface" "kilo" "nanogpt" "novita" "nvidia" "opencode-go" \
+		"opencode-zen" "qianfan" "together" "venice" "wafer-serverless" "zenmux" {
+		thinking-tool-choice-conflict "drop_auto_when_thinking"
+	}
 	on "alibaba-token-plan" "deepseek" {
 		supports-developer-role #false
 	}
