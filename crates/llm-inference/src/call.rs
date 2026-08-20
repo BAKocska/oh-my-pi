@@ -186,6 +186,23 @@ pub struct AccountRoutingContext {
 	pub region:                Option<RegionId>,
 }
 
+/// Principal and extension charged for an inference request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceAttribution {
+	/// Authenticated principal whose budget and receipts are charged.
+	pub principal: PrincipalId,
+	/// Extension identity whose per-turn and per-session ceilings apply.
+	pub extension: Str,
+}
+
+impl InferenceAttribution {
+	/// Attribution for harness-owned requests that have no extension caller.
+	#[must_use]
+	pub fn core() -> Self {
+		Self { principal: PrincipalId::from("core"), extension: Str::new_static("core") }
+	}
+}
+
 /// Shared metadata used to construct a closed call.
 #[derive(Clone, Debug)]
 pub struct CallMeta {
@@ -205,20 +222,22 @@ pub struct CallMeta {
 #[derive(Clone, Debug)]
 pub struct Call {
 	/// Logical request identity.
-	pub id:        RequestId,
+	pub id:          RequestId,
 	/// Catalog target and routing constraint.
-	pub target:    Target,
+	pub target:      Target,
 	/// Absolute wall-clock deadline.
-	pub deadline:  Option<Instant>,
+	pub deadline:    Option<Instant>,
 	/// Cross-attempt resource limits.
-	pub budget:    ExecutionBudget,
+	pub budget:      ExecutionBudget,
 	/// Optional append-only conversation context.
-	pub session:   Option<SessionRequest>,
+	pub session:     Option<SessionRequest>,
+	/// Principal and extension charged for this request.
+	pub attribution: InferenceAttribution,
 	/// Immutable selected execution plan; absent only before side-effect-free
 	/// planning.
-	pub execution: Option<Arc<ExecutionPlan>>,
+	pub execution:   Option<Arc<ExecutionPlan>>,
 	/// Shared operation-specific request payload.
-	pub operation: OperationCall,
+	pub operation:   OperationCall,
 }
 
 impl Call {
@@ -230,9 +249,17 @@ impl Call {
 			deadline: meta.deadline,
 			budget: meta.budget,
 			session: meta.session,
+			attribution: InferenceAttribution::core(),
 			operation,
 			execution: None,
 		}
+	}
+
+	/// Replaces the default harness attribution before request dispatch.
+	#[must_use]
+	pub fn with_attribution(mut self, attribution: InferenceAttribution) -> Self {
+		self.attribution = attribution;
+		self
 	}
 }
 

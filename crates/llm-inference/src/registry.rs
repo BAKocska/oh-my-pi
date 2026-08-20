@@ -7,6 +7,7 @@ use std::{
 	time::SystemTime,
 };
 
+use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
 use omp_core::Str;
 use tower::{Service, ServiceExt};
@@ -21,6 +22,7 @@ use crate::{
 	id::RequestId,
 	layer::{
 		ExecutionContext, LayerCall,
+		budget::{InferenceBudget, InferenceBudgetPolicy, InferenceLedger},
 		observe::{NoopObserver, ObserveLayer, Observer},
 		stack::{
 			BuiltinConfig, BuiltinRouteStackFactory, RouteProviderService, RouteStackFactory,
@@ -56,11 +58,12 @@ pub struct Registry {
 }
 
 struct RegistryInner {
-	catalog:       Arc<Catalog>,
-	bindings:      HashMap<RouteId, RouteBinding>,
-	auth_manager:  Option<AuthManager>,
-	usage_manager: Option<ConsoleUsageManager>,
-	generation:    u64,
+	catalog:          Arc<Catalog>,
+	bindings:         HashMap<RouteId, RouteBinding>,
+	auth_manager:     Option<AuthManager>,
+	usage_manager:    Option<ConsoleUsageManager>,
+	inference_ledger: InferenceLedger,
+	generation:       u64,
 }
 
 impl Registry {
@@ -71,6 +74,7 @@ impl Registry {
 			bindings: HashMap::new(),
 			auth_manager: None,
 			usage_manager: None,
+			inference_ledger: InferenceLedger::default(),
 			generation: 1,
 		}
 	}
@@ -121,6 +125,7 @@ impl Registry {
 		ProviderService::new(build_execution_stack(
 			RegistryDispatch { registry: self.clone() },
 			ObserveLayer::new(observer),
+			self.inner.inference_ledger.clone(),
 		))
 	}
 
@@ -162,18 +167,125 @@ impl Registry {
 		}
 	}
 }
+/// Atomically published registry snapshot held for one complete lookup.
+///
+/// A snapshot owns the loaded [`Registry`], so rebuilding the live registry
+/// cannot invalidate catalog or route-service references used by its caller.
+#[derive(Clone)]
+pub struct RegistrySnapshot {
+	registry: Arc<Registry>,
+}
+
+impl std::ops::Deref for RegistrySnapshot {
+	type Target = Registry;
+
+	fn deref(&self) -> &Self::Target {
+		&self.registry
+	}
+}
+
+/// Rebuildable registry publication point.
+///
+/// Readers call [`Self::load`] once, then perform all catalog, generation, and
+/// route-service lookups through the returned [`RegistrySnapshot`]. Rebuilds
+/// publish a wholly preconstructed [`Registry`]; they never construct route
+/// stacks on a request path.
+#[derive(Clone)]
+pub struct RegistryHandle {
+	current: Arc<ArcSwap<Registry>>,
+}
+
+impl RegistryHandle {
+	/// Starts publication from one fully constructed registry.
+	#[must_use]
+	pub fn new(registry: Registry) -> Self {
+		Self { current: Arc::new(ArcSwap::from_pointee(registry)) }
+	}
+
+	/// Loads exactly one immutable registry snapshot for a lookup.
+	#[must_use]
+	pub fn load(&self) -> RegistrySnapshot {
+		RegistrySnapshot { registry: self.current.load_full() }
+	}
+
+	/// Atomically publishes a wholly rebuilt registry and returns the previous
+	/// immutable snapshot for optional draining or inspection.
+	pub fn replace(&self, registry: Registry) -> RegistrySnapshot {
+		RegistrySnapshot { registry: self.current.swap(Arc::new(registry)) }
+	}
+
+	/// Creates a dispatch service that loads the registry once per call.
+	pub fn service(&self) -> ProviderService {
+		self.service_with_observer(NoopObserver)
+	}
+
+	/// Creates a dispatch service with one outer observation boundary per call.
+	pub fn service_with_observer<O: Observer>(&self, observer: O) -> ProviderService {
+		ProviderService::new(build_execution_stack(
+			LiveRegistryDispatch { registry: self.clone() },
+			ObserveLayer::new(observer),
+			InferenceLedger::default(),
+		))
+	}
+}
+
+impl Registry {
+	/// Moves this immutable registry behind an atomic rebuild publication point.
+	#[must_use]
+	pub fn into_handle(self) -> RegistryHandle {
+		RegistryHandle::new(self)
+	}
+}
 
 /// Construction-time builder; mutation ends permanently at
 /// [`RegistryBuilder::build`].
 pub struct RegistryBuilder {
-	catalog:       Arc<Catalog>,
-	bindings:      HashMap<RouteId, RouteBinding>,
-	auth_manager:  Option<AuthManager>,
-	usage_manager: Option<ConsoleUsageManager>,
-	generation:    u64,
+	catalog:          Arc<Catalog>,
+	bindings:         HashMap<RouteId, RouteBinding>,
+	auth_manager:     Option<AuthManager>,
+	usage_manager:    Option<ConsoleUsageManager>,
+	inference_ledger: InferenceLedger,
+	generation:       u64,
 }
 
 impl RegistryBuilder {
+	/// Sets the generation captured by plans after this complete registry is
+	/// rebuilt. Call this after all construction-time registrations so a catalog
+	/// overlay generation is preserved exactly.
+	#[must_use]
+	pub fn with_generation(mut self, generation: u64) -> Self {
+		self.generation = generation;
+		self
+	}
+
+	/// Sets the default inference envelope for extensions without a dedicated
+	/// policy.
+	#[must_use]
+	pub fn with_default_inference_budget(
+		self,
+		per_turn: InferenceBudget,
+		per_session: InferenceBudget,
+	) -> Self {
+		self
+			.inference_ledger
+			.set_default_policy(InferenceBudgetPolicy { per_turn, per_session });
+		self
+	}
+
+	/// Sets hard turn and session ceilings for one extension.
+	#[must_use]
+	pub fn with_inference_budget(
+		self,
+		extension: Str,
+		per_turn: InferenceBudget,
+		per_session: InferenceBudget,
+	) -> Self {
+		self
+			.inference_ledger
+			.set_policy(extension, InferenceBudgetPolicy { per_turn, per_session });
+		self
+	}
+
 	/// Registers one preconstructed route-local service for a catalog route.
 	pub fn register_route(
 		mut self,
@@ -288,11 +400,12 @@ impl RegistryBuilder {
 		}
 		Ok(Registry {
 			inner: Arc::new(RegistryInner {
-				catalog:       self.catalog,
-				bindings:      self.bindings,
-				auth_manager:  self.auth_manager,
-				usage_manager: self.usage_manager,
-				generation:    self.generation,
+				catalog:          self.catalog,
+				bindings:         self.bindings,
+				auth_manager:     self.auth_manager,
+				usage_manager:    self.usage_manager,
+				inference_ledger: self.inference_ledger,
+				generation:       self.generation,
 			}),
 		})
 	}
@@ -302,6 +415,43 @@ impl RegistryBuilder {
 			.catalog
 			.route(route)
 			.ok_or_else(|| target_error(route.as_str()))
+	}
+}
+
+#[derive(Clone)]
+struct LiveRegistryDispatch {
+	registry: RegistryHandle,
+}
+
+impl Service<LayerCall<Call>> for LiveRegistryDispatch {
+	type Error = Error;
+	type Future = BoxFuture<'static, Result<Answer, Error>>;
+	type Response = Answer;
+
+	/// Dispatch readiness is enforced inside each exact selected route service.
+	fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn call(&mut self, call: LayerCall<Call>) -> Self::Future {
+		let registry = self.registry.clone();
+		Box::pin(async move {
+			let snapshot = registry.load();
+			snapshot
+				.registry
+				.inner
+				.inference_ledger
+				.admit(&call.payload, &call.context)?;
+			let accounting_call = call.payload.clone();
+			let context = call.context.clone();
+			let result = dispatch_preplanned(snapshot.registry.as_ref().clone(), call).await;
+			snapshot
+				.registry
+				.inner
+				.inference_ledger
+				.charge(&accounting_call, &context);
+			result
+		})
 	}
 }
 
@@ -701,6 +851,34 @@ mod tests {
 		assert_eq!(specific.route.as_deref().map(RouteId::as_str), Some("specific-route"));
 		assert_eq!(specific.request_id.as_deref().map(RequestId::as_str), Some("specific-request"));
 	}
+	#[test]
+	fn rebuilt_handle_publishes_a_new_plan_generation() {
+		let catalog = Arc::new(Catalog::embedded().clone());
+		let registry = Registry {
+			inner: Arc::new(RegistryInner {
+				catalog:          catalog.clone(),
+				bindings:         HashMap::new(),
+				auth_manager:     None,
+				usage_manager:    None,
+				inference_ledger: InferenceLedger::default(),
+				generation:       7,
+			}),
+		};
+		let handle = registry.into_handle();
+		assert_eq!(handle.load().generation(), 7);
+		let previous = handle.replace(Registry {
+			inner: Arc::new(RegistryInner {
+				catalog,
+				bindings: HashMap::new(),
+				auth_manager: None,
+				usage_manager: None,
+				inference_ledger: InferenceLedger::default(),
+				generation: 8,
+			}),
+		});
+		assert_eq!(previous.generation(), 7);
+		assert_eq!(handle.load().generation(), 8);
+	}
 
 	#[test]
 	fn fallback_requires_precommit_reselect_and_explicit_body_permission() {
@@ -749,11 +927,12 @@ mod tests {
 		}));
 		let registry = Registry {
 			inner: Arc::new(RegistryInner {
-				catalog:       catalog.clone(),
-				bindings:      HashMap::from([(route.id.clone(), RouteBinding::Available(service))]),
-				auth_manager:  Some(manager),
-				usage_manager: None,
-				generation:    1,
+				catalog:          catalog.clone(),
+				bindings:         HashMap::from([(route.id.clone(), RouteBinding::Available(service))]),
+				auth_manager:     Some(manager),
+				usage_manager:    None,
+				inference_ledger: InferenceLedger::default(),
+				generation:       1,
 			}),
 		};
 		let budget = ExecutionBudget::default();
@@ -790,13 +969,14 @@ mod tests {
 			wire_target: None,
 		};
 		let call = Call {
-			id:        RequestId::from("auth-bypass"),
-			target:    Target::ProviderService(provider.id),
-			deadline:  None,
-			budget:    budget.clone(),
-			session:   None,
-			execution: Some(Arc::new(plan)),
-			operation: OperationCall::Auth(Arc::new(AuthRequest::ListAccounts { provider: None })),
+			id:          RequestId::from("auth-bypass"),
+			target:      Target::ProviderService(provider.id),
+			deadline:    None,
+			budget:      budget.clone(),
+			session:     None,
+			attribution: crate::call::InferenceAttribution::core(),
+			execution:   Some(Arc::new(plan)),
+			operation:   OperationCall::Auth(Arc::new(AuthRequest::ListAccounts { provider: None })),
 		};
 		let answer = dispatch_preplanned(registry, LayerCall {
 			payload: call,

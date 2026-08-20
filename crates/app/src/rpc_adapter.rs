@@ -1772,7 +1772,12 @@ fn chat_request(
 		Vec::new()
 	} else {
 		tool_registry
-			.advertise(LoweringCaps { strict_schema: false, grammar: GrammarBits::empty() })
+			.advertise(LoweringCaps {
+				strict_schema:  false,
+				grammar:        GrammarBits::empty(),
+				maximum_tools:  None,
+				maximum_strict: None,
+			})
 			.map_err(|error| Status::failed_precondition(error.to_string()))?
 			.into_iter()
 			.filter(|tool| {

@@ -10,6 +10,10 @@ use std::{
 	},
 };
 
+use pyo3::{
+	prelude::*,
+	types::{PyList, PyModule},
+};
 use thiserror::Error;
 use tokio::{
 	io::AsyncReadExt,
@@ -27,6 +31,8 @@ pub const CONTROL_FD_ENV: &str = "OMP_EXT_CONTROL_FD";
 pub const ENV_SOCKET_ENV: &str = "OMP_EXT_ENV_SOCKET";
 /// Environment variable carrying the extension-private Python site tree.
 pub const PY_SITE_ENV: &str = "OMP_PY_SITE";
+/// Environment variable carrying the verified package snapshot JSON.
+pub const PACKAGE_SNAPSHOT_ENV: &str = "OMP_EXT_PACKAGE_SNAPSHOT";
 
 /// One captured child output fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +68,11 @@ pub struct SpawnSpec {
 	pub host_generation:    u64,
 	/// Session generation shared with the CONTROL parent.
 	pub session_generation: u64,
+	/// Verified package ownership snapshot encoded for the Python bootstrap.
+	///
+	/// `None` identifies an anonymous or development extension and installs an
+	/// explicitly empty package snapshot in the child.
+	pub package_snapshot:   Option<omp_core::Str>,
 }
 
 /// Owned parent ends for an extension-host child.
@@ -152,6 +163,11 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
+	if let Some(snapshot) = &spec.package_snapshot {
+		command.env(PACKAGE_SNAPSHOT_ENV, snapshot.as_str());
+	} else {
+		command.env_remove(PACKAGE_SNAPSHOT_ENV);
+	}
 	#[cfg(unix)]
 	{
 		// The child owns a fresh process group. Its CONTROL peer is duplicated
@@ -235,5 +251,27 @@ pub fn run_ext_host_entry() -> Result<(), SpawnError> {
 	let engine = omp_py::Engine::builder()
 		.init()
 		.map_err(|error| SpawnError::Python(error.to_string()))?;
+	install_package_snapshot(&engine)?;
 	omp_py::bootstrap_extension_host(&engine).map_err(|error| SpawnError::Python(error.to_string()))
+}
+
+/// Installs the private site tree and parent-verified snapshot before any
+/// extension module imports.
+fn install_package_snapshot(engine: &omp_py::Engine) -> Result<(), SpawnError> {
+	let snapshot = std::env::var(PACKAGE_SNAPSHOT_ENV).unwrap_or_else(|_| {
+		String::from(r#"{"distributions":[],"modules":{},"own":null,"tree":null}"#)
+	});
+	engine
+		.attach(|py| -> PyResult<()> {
+			if let Ok(site) = std::env::var(PY_SITE_ENV) {
+				let sys = PyModule::import(py, "sys")?;
+				let value = sys.getattr("path")?;
+				let path = value.cast::<PyList>()?;
+				path.insert(0, site)?;
+			}
+			let packages = PyModule::import(py, "omp.packages")?;
+			packages.call_method1("_install_snapshot_json", (snapshot,))?;
+			Ok(())
+		})
+		.map_err(|error| SpawnError::Python(error.to_string()))
 }

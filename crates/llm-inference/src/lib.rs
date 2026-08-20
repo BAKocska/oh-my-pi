@@ -41,6 +41,8 @@ pub use event::*;
 pub use id::*;
 pub use layer::{
 	answer::AnswerLayer,
+	budget::{InferenceBudget, InferenceBudgetPolicy, InferenceLedger},
+	hook::{HookHandle, NoHookHandle},
 	recover::{DiscoveryProjector, RecoveryLayer},
 };
 pub use omp_llm_catalog::{
@@ -48,7 +50,10 @@ pub use omp_llm_catalog::{
 	id::*,
 	model::{ModelSpec, PolicyModel, WireTarget},
 };
-pub use plan::{ExecutionPlan, Planner};
+pub use plan::{
+	ConstraintAssignment, ConstraintBudget, ConstraintBudgetCaps, ConstraintIntent, ExecutionPlan,
+	ModelFallback, Planner,
+};
 pub use provider::ProviderService;
 pub use receipt::*;
-pub use registry::{Registry, RegistryBuilder, RouteUnavailable};
+pub use registry::{Registry, RegistryBuilder, RegistryHandle, RegistrySnapshot, RouteUnavailable};

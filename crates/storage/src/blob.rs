@@ -25,7 +25,12 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::encoding::hex::{self, ArrayStr};
+use cap_std::{ambient_authority, fs::Dir};
+use omp_ar::{Archive, Format};
+use omp_core::{
+	Str,
+	encoding::hex::{self, ArrayStr},
+};
 use serde::{
 	Deserialize, Deserializer, Serialize, Serializer,
 	de::{self, Visitor},
@@ -108,6 +113,15 @@ pub enum Error {
 	/// An underlying filesystem or stream operation failed.
 	#[error(transparent)]
 	Io(#[from] io::Error),
+	/// A wheel archive was malformed or exceeded extraction limits.
+	#[error(transparent)]
+	Archive(#[from] omp_ar::Error),
+	/// A wheel naming component was empty or unsafe for a store path.
+	#[error("invalid wheel {component} component")]
+	InvalidWheelComponent {
+		/// Component kind rejected by the path validator.
+		component: &'static str,
+	},
 	/// A blob's stored length differs from the referenced length.
 	#[error("corrupt blob: expected {expected} bytes, found {actual} bytes")]
 	Corrupt {
@@ -122,6 +136,48 @@ pub enum Error {
 	/// The referenced blob does not exist.
 	#[error("blob not found")]
 	NotFound,
+}
+
+/// Immutable wheel identity used for unpacked-store directory names.
+///
+/// A directory is named `<distribution>-<version>-<tag>-<blake3-16>`, tying
+/// its contents to the exact wheel blob without relying on a mutable index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WheelName {
+	/// Normalized distribution name.
+	pub distribution: Str,
+	/// Wheel distribution version.
+	pub version:      Str,
+	/// Wheel compatibility tag.
+	pub tag:          Str,
+}
+
+impl WheelName {
+	/// Validates the path-safe components of a wheel store name.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::InvalidWheelComponent`] when a component is empty or
+	/// contains a path separator.
+	pub fn new(
+		distribution: impl Into<Str>,
+		version: impl Into<Str>,
+		tag: impl Into<Str>,
+	) -> Result<Self, Error> {
+		let name = Self {
+			distribution: distribution.into(),
+			version:      version.into(),
+			tag:          tag.into(),
+		};
+		for (component, value) in
+			[("distribution", &name.distribution), ("version", &name.version), ("tag", &name.tag)]
+		{
+			if !is_store_component(value) {
+				return Err(Error::InvalidWheelComponent { component });
+			}
+		}
+		Ok(name)
+	}
 }
 
 /// A filesystem-backed, content-addressed blob store.
@@ -288,6 +344,69 @@ impl BlobStore {
 		}
 
 		Ok(size == reference.size && hasher.finalize().as_bytes() == &reference.hash)
+	}
+
+	/// Returns the immutable unpacked-wheel directory for `wheel`.
+	///
+	/// The path is `<root>/<distribution>-<version>-<tag>-<blake3-16>`, the
+	/// stable store convention shared by every materializer using this store.
+	#[must_use]
+	pub fn unpacked_wheel_path(&self, wheel: &WheelName, reference: &BlobRef) -> PathBuf {
+		let digest = reference.to_hex();
+		self.root.join(format!(
+			"{}-{}-{}-{}",
+			wheel.distribution,
+			wheel.version,
+			wheel.tag,
+			&digest[..16]
+		))
+	}
+
+	/// Unpacks a wheel blob into its immutable content-addressed store
+	/// directory.
+	///
+	/// Existing matching directories are left untouched. Extraction happens in
+	/// the store's temporary area and is renamed into place only after the ZIP
+	/// reader has validated every member, so incomplete wheels are never
+	/// observable.
+	///
+	/// # Errors
+	///
+	/// Returns an error when `reference` is missing or corrupt, the wheel is
+	/// not a valid ZIP archive, or the filesystem cannot stage the directory.
+	pub fn unpack_wheel(&self, wheel: &WheelName, reference: &BlobRef) -> Result<PathBuf, Error> {
+		let destination = self.unpacked_wheel_path(wheel, reference);
+		if destination.is_dir() {
+			return Ok(destination);
+		}
+		let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+		let temporary = self
+			.tmp_dir()
+			.join(format!("{}-{sequence:016x}.wheel", std::process::id()));
+		fs::create_dir(&temporary)?;
+		let extracted = (|| {
+			let bytes = self.get(reference)?;
+			let mut archive = Archive::from_bytes_with_format(&bytes, Format::Zip)?;
+			let directory = Dir::open_ambient_dir(&temporary, ambient_authority())?;
+			archive.extract_to(&directory)?;
+			set_read_only_tree(&temporary)?;
+			Ok::<(), Error>(())
+		})();
+		if let Err(error) = extracted {
+			let _ = fs::remove_dir_all(&temporary);
+			return Err(error);
+		}
+		match fs::rename(&temporary, &destination) {
+			Ok(()) => Ok(destination),
+			Err(_error) if destination.is_dir() => {
+				let _ = fs::remove_dir_all(&temporary);
+				Ok(destination)
+			},
+			Err(error) => {
+				let _ = fs::remove_dir_all(&temporary);
+				Err(error.into())
+			},
+		}
 	}
 
 	fn blobs_dir(&self) -> PathBuf {
@@ -460,6 +579,29 @@ impl Drop for TemporaryPath {
 	}
 }
 
+fn is_store_component(value: &str) -> bool {
+	!value.is_empty()
+		&& value != "."
+		&& value != ".."
+		&& !value.bytes().any(|byte| matches!(byte, b'/' | b'\\' | 0))
+}
+
+fn set_read_only_tree(path: &Path) -> io::Result<()> {
+	for entry in fs::read_dir(path)? {
+		let entry = entry?;
+		let child = entry.path();
+		if entry.file_type()?.is_dir() {
+			set_read_only_tree(&child)?;
+		}
+		let mut permissions = fs::metadata(&child)?.permissions();
+		permissions.set_readonly(true);
+		fs::set_permissions(child, permissions)?;
+	}
+	let mut permissions = fs::metadata(path)?.permissions();
+	permissions.set_readonly(true);
+	fs::set_permissions(path, permissions)
+}
+
 fn parse_hash(hash: &str) -> Result<[u8; 32], Error> {
 	if hash.len() != 64
 		|| !hash
@@ -512,9 +654,10 @@ fn map_read_error(error: io::Error) -> Error {
 #[cfg(test)]
 mod tests {
 
+	use omp_ar::zip::Writer;
 	use tempfile::tempdir;
 
-	use super::{BlobRef, BlobStore, Error};
+	use super::{BlobRef, BlobStore, Error, WheelName};
 
 	#[test]
 	fn put_get_round_trip() {
@@ -578,5 +721,27 @@ mod tests {
 			"{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":7}"
 		);
 		assert_eq!(serde_json::from_str::<BlobRef>(&json).unwrap(), reference);
+	}
+
+	#[test]
+	fn wheel_unpack_uses_content_addressed_store_name_and_is_idempotent() {
+		let directory = tempdir().unwrap();
+		let store = BlobStore::open(directory.path()).unwrap();
+		let mut wheel = Writer::new(Vec::new());
+		wheel
+			.add_file("example/__init__.py", b"value = 1\n")
+			.unwrap();
+		let reference = store.put(&wheel.finish().unwrap()).unwrap();
+		let name = WheelName::new("example", "1.2.3", "py3-none-any").unwrap();
+
+		let first = store.unpack_wheel(&name, &reference).unwrap();
+		let second = store.unpack_wheel(&name, &reference).unwrap();
+
+		assert_eq!(first, second);
+		assert_eq!(
+			first.file_name().unwrap().to_string_lossy(),
+			format!("example-1.2.3-py3-none-any-{}", &reference.to_hex()[..16])
+		);
+		assert_eq!(std::fs::read(first.join("example/__init__.py")).unwrap(), b"value = 1\n");
 	}
 }

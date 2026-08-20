@@ -10,10 +10,12 @@ description = "Append-only session transcripts and content-addressed blob storag
 
 [dependencies]
 blake3 = { workspace = true }
+cap-std = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 fs2 = { workspace = true }
 omp-core = { workspace = true }
+omp-ar = { workspace = true }
 omp-proto = { workspace = true }
 omp-tool = { workspace = true }
 parking_lot = { workspace = true }

@@ -10,10 +10,11 @@ use crate::{
 	AuthSpecId, Availability, CatalogAlias, CatalogRevision, ClassId, CodecId, ContextStrategy,
 	EmbeddingFormatBits, EvidenceConfidence, GrammarBits, HostedToolBits, ModalityBits,
 	ModelAvailability, ModelCapabilities, ModelKey, ModelLimits, ModelRemoteCompaction, ModelSpec,
-	OperationKind, PolicyModel, PremiumMultiplier, Pricing, ProvenanceKind, ProvenanceSource,
-	ProviderDef, ProviderId, ReasoningFeatureBits, RoleBits, RouteDef, RouteId, RouteRestrictions,
-	SamplingControlBits, StructuredOutputBits, TextVerbosityBits, ThinkingPolicyId, ThinkingRouting,
-	ToolFeatureBits, TransportKind, TrustDomain, WireModelId, WirePolicyId,
+	OperationKind, OverlaySource, OverlayStack, PolicyModel, PremiumMultiplier, Pricing,
+	ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, ReasoningFeatureBits, RoleBits,
+	RouteDef, RouteId, RouteRestrictions, SamplingControlBits, StructuredOutputBits,
+	TextVerbosityBits, ThinkingPolicyId, ThinkingRouting, ToolFeatureBits, TransportKind,
+	TrustDomain, WireModelId, WirePolicyId,
 };
 
 /// An exact provider and normalized-model selector.
@@ -253,16 +254,20 @@ pub struct RouteOverlay {
 }
 
 /// One immutable overlay layer.
+///
+/// External contributors construct this through
+/// [`crate::CatalogOverlayBuilder`], which keeps source identity paired with
+/// publication ownership in [`crate::OverlayStack`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogOverlay {
 	/// Evidence source assigned to every field changed by this layer.
-	pub source:  ProvenanceSource,
+	pub(crate) source:  ProvenanceSource,
 	/// Model additions and patches.
-	pub models:  Box<[ModelOverlay]>,
+	pub(crate) models:  Box<[ModelOverlay]>,
 	/// Route additions and patches.
-	pub routes:  Box<[RouteOverlay]>,
+	pub(crate) routes:  Box<[RouteOverlay]>,
 	/// Exact alias additions or replacements.
-	pub aliases: Box<[ScopedAlias]>,
+	pub(crate) aliases: Box<[ScopedAlias]>,
 }
 
 /// Explicit authority for security-sensitive configured route changes.
@@ -428,15 +433,42 @@ pub struct BundledCatalog<'a> {
 
 /// Resolver over an immutable bundled catalog plus ordered immutable overlays.
 pub struct CatalogResolver<'a> {
-	base:      BundledCatalog<'a>,
-	discovery: Vec<CatalogOverlay>,
-	user:      Vec<CatalogOverlay>,
+	base:     BundledCatalog<'a>,
+	overlays: Vec<CatalogOverlay>,
 }
 
 impl<'a> CatalogResolver<'a> {
 	/// Creates a resolver borrowing, but never mutating, the bundled catalog.
 	pub const fn new(base: BundledCatalog<'a>) -> Self {
-		Self { base, discovery: Vec::new(), user: Vec::new() }
+		Self { base, overlays: Vec::new() }
+	}
+
+	/// Adds every layer from an immutable contribution stack in its declared
+	/// precedence order.
+	pub fn add_stack(
+		&mut self,
+		stack: &OverlayStack,
+		scope: UnsafeTrustScope,
+	) -> Result<(), ResolveError> {
+		for (source, overlay) in stack.sources().iter().zip(stack.overlays()) {
+			match source {
+				OverlaySource::Bundled => {
+					if overlay.source.kind != ProvenanceKind::Bundled {
+						return Err(ResolveError::WrongOverlayKind {
+							expected: ProvenanceKind::Bundled,
+							actual:   overlay.source.kind,
+						});
+					}
+					validate_overlay(overlay, UnsafeTrustScope::ALL)?;
+					self.overlays.push(overlay.clone());
+				},
+				OverlaySource::Discovery => self.add_discovery(overlay.clone())?,
+				OverlaySource::UserConfig | OverlaySource::Extension { .. } => {
+					self.add_user(overlay.clone(), scope)?;
+				},
+			}
+		}
+		Ok(())
 	}
 
 	/// Adds a runtime-discovery overlay after validating its precedence class.
@@ -448,12 +480,17 @@ impl<'a> CatalogResolver<'a> {
 			});
 		}
 		validate_overlay(&overlay, UnsafeTrustScope::NONE)?;
-		self.discovery.push(overlay);
+		let index = self
+			.overlays
+			.iter()
+			.position(|existing| existing.source.kind == ProvenanceKind::Configured)
+			.unwrap_or(self.overlays.len());
+		self.overlays.insert(index, overlay);
 		Ok(())
 	}
 
-	/// Adds a user overlay after validating security-sensitive changes against
-	/// `scope`.
+	/// Adds a user or extension overlay after validating security-sensitive
+	/// changes against `scope`.
 	pub fn add_user(
 		&mut self,
 		overlay: CatalogOverlay,
@@ -466,7 +503,7 @@ impl<'a> CatalogResolver<'a> {
 			});
 		}
 		validate_overlay(&overlay, scope)?;
-		self.user.push(overlay);
+		self.overlays.push(overlay);
 		Ok(())
 	}
 
@@ -522,7 +559,7 @@ impl<'a> CatalogResolver<'a> {
 			})
 			.cloned();
 		let mut model_sources = all_model_sources(self.base.source.clone());
-		for overlay in self.discovery.iter().chain(self.user.iter()) {
+		for overlay in &self.overlays {
 			for entry in overlay
 				.models
 				.iter()
@@ -568,7 +605,7 @@ impl<'a> CatalogResolver<'a> {
 				.find(|route| route.id == *route_id)
 				.cloned();
 			let mut sources = all_route_sources(self.base.source.clone());
-			for overlay in self.discovery.iter().chain(self.user.iter()) {
+			for overlay in &self.overlays {
 				for entry in overlay
 					.routes
 					.iter()
@@ -653,7 +690,7 @@ impl<'a> CatalogResolver<'a> {
 			.iter()
 			.find(|entry| entry.alias == selector.alias)
 			.map(|entry| entry.target.clone());
-		for overlay in self.discovery.iter().chain(self.user.iter()) {
+		for overlay in &self.overlays {
 			if let Some(entry) = overlay.aliases.iter().find(|entry| {
 				entry.provider == selector.provider && entry.definition.alias == selector.alias
 			}) {

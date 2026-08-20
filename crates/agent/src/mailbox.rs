@@ -55,6 +55,21 @@ pub enum InterruptSource {
 		/// Stable detached-job identifier.
 		id: Str,
 	},
+	/// A continuation accepted at a settled boundary.
+	Continuation {
+		/// Extension that won the settled-boundary decision.
+		owner: Str,
+	},
+	/// A durable schedule firing.
+	Schedule {
+		/// Stable schedule identifier.
+		id: Str,
+	},
+	/// A message sent by a peer agent or session.
+	Peer {
+		/// Stable sender identity.
+		from: Str,
+	},
 	/// Named producer without a more specific structured source.
 	Producer(Str),
 }
@@ -220,5 +235,39 @@ impl Mailbox {
 				interrupt.class = InterruptClass::TurnBoundary;
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
+
+	use super::*;
+
+	fn item() -> Item {
+		Item {
+			seq:           0,
+			created_at_ms: 0,
+			kind:          Some(item::Kind::Message(Message {
+				role:  Role::User as i32,
+				parts: vec![Part { kind: Some(part::Kind::Text("continue".to_owned())) }],
+			})),
+			props:         None,
+		}
+	}
+
+	#[test]
+	fn deferred_continuation_waits_for_the_turn_boundary() {
+		let mut mailbox = Mailbox::new();
+		mailbox
+			.sender()
+			.try_enqueue(Interrupt {
+				class:  InterruptClass::Immediate,
+				item:   item(),
+				source: InterruptSource::Continuation { owner: Str::from("goal") },
+			})
+			.unwrap();
+		assert!(mailbox.drain(DrainPoint::Immediate, true).is_empty());
+		assert_eq!(mailbox.drain(DrainPoint::TurnBoundary, true).len(), 1);
 	}
 }

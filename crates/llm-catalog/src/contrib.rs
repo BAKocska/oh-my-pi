@@ -1,0 +1,514 @@
+//! Immutable catalog contribution layers and provider declaration activation.
+//!
+//! Contributions are assembled off the request path.  A published
+//! [`OverlayStack`] is immutable, so consumers can rebuild a registry for its
+//! generation and keep executing requests that captured an older generation.
+
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+
+use omp_core::Str;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+	CatalogOverlay, ModelOverlay, ProvenanceSource, ProviderId, RouteOverlay, ScopedAlias,
+};
+
+/// The owner of one replaceable catalog overlay layer.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "id")]
+pub enum OverlaySource {
+	/// Facts compiled into the checked-in catalog.
+	Bundled,
+	/// Explicit user configuration.
+	UserConfig,
+	/// Runtime model discovery.
+	Discovery,
+	/// One extension's catalog declaration.
+	Extension {
+		/// Stable extension identity.
+		id: Str,
+	},
+}
+
+/// Immutable, generation-stamped catalog overlays in increasing precedence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayStack {
+	overlays:   Arc<[CatalogOverlay]>,
+	sources:    Arc<[OverlaySource]>,
+	generation: u64,
+}
+
+impl Default for OverlayStack {
+	fn default() -> Self {
+		Self::empty()
+	}
+}
+
+impl OverlayStack {
+	/// Creates an empty stack at generation zero.
+	#[must_use]
+	pub fn empty() -> Self {
+		Self { overlays: Arc::from([]), sources: Arc::from([]), generation: 0 }
+	}
+
+	/// Creates a stack from layers already ordered from lowest to highest
+	/// precedence. Repeated source identities are collapsed to their final
+	/// supplied layer; use [`Self::with_replaced`] to advance a published
+	/// generation.
+	#[must_use]
+	pub fn from_layers(layers: impl IntoIterator<Item = (OverlaySource, CatalogOverlay)>) -> Self {
+		let mut sources = Vec::new();
+		let mut overlays = Vec::new();
+		for (source, overlay) in layers {
+			if let Some(index) = sources.iter().position(|candidate| candidate == &source) {
+				overlays[index] = overlay;
+			} else {
+				sources.push(source);
+				overlays.push(overlay);
+			}
+		}
+		let generation = u64::try_from(overlays.len()).unwrap_or(u64::MAX);
+		Self { overlays: overlays.into(), sources: sources.into(), generation }
+	}
+
+	/// Returns the monotonically increasing publication generation.
+	#[must_use]
+	pub const fn generation(&self) -> u64 {
+		self.generation
+	}
+
+	/// Returns overlays in increasing precedence order.
+	#[must_use]
+	pub fn overlays(&self) -> &[CatalogOverlay] {
+		&self.overlays
+	}
+
+	/// Returns source identities in the same order as [`Self::overlays`].
+	#[must_use]
+	pub fn sources(&self) -> &[OverlaySource] {
+		&self.sources
+	}
+
+	/// Publishes `overlay` for `source`, replacing that source's prior layer and
+	/// advancing the generation exactly once.
+	#[must_use]
+	pub fn with_replaced(&self, source: OverlaySource, overlay: CatalogOverlay) -> Self {
+		let mut sources = self.sources.to_vec();
+		let mut overlays = self.overlays.to_vec();
+		if let Some(index) = sources.iter().position(|candidate| candidate == &source) {
+			overlays[index] = overlay;
+		} else {
+			sources.push(source);
+			overlays.push(overlay);
+		}
+		Self {
+			overlays:   overlays.into(),
+			sources:    sources.into(),
+			generation: self.generation.saturating_add(1),
+		}
+	}
+}
+/// Public construction path for one immutable [`CatalogOverlay`].
+#[derive(Clone, Debug)]
+pub struct CatalogOverlayBuilder {
+	source:  ProvenanceSource,
+	models:  Vec<ModelOverlay>,
+	routes:  Vec<RouteOverlay>,
+	aliases: Vec<ScopedAlias>,
+}
+
+impl CatalogOverlayBuilder {
+	/// Starts an overlay with one auditable source applied to every changed
+	/// field during resolution.
+	#[must_use]
+	pub fn new(source: ProvenanceSource) -> Self {
+		Self { source, models: Vec::new(), routes: Vec::new(), aliases: Vec::new() }
+	}
+
+	/// Adds one model addition or field-granular patch.
+	#[must_use]
+	pub fn with_model(mut self, overlay: ModelOverlay) -> Self {
+		self.models.push(overlay);
+		self
+	}
+
+	/// Adds one route addition or field-granular patch.
+	#[must_use]
+	pub fn with_route(mut self, overlay: RouteOverlay) -> Self {
+		self.routes.push(overlay);
+		self
+	}
+
+	/// Adds one provider-scoped exact alias.
+	#[must_use]
+	pub fn with_alias(mut self, alias: ScopedAlias) -> Self {
+		self.aliases.push(alias);
+		self
+	}
+
+	/// Adds provider-scoped aliases in their declared order.
+	#[must_use]
+	pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = ScopedAlias>) -> Self {
+		self.aliases.extend(aliases);
+		self
+	}
+
+	/// Freezes the accumulated layer for publication in an [`OverlayStack`].
+	#[must_use]
+	pub fn build(self) -> CatalogOverlay {
+		CatalogOverlay {
+			source:  self.source,
+			models:  self.models.into_boxed_slice(),
+			routes:  self.routes.into_boxed_slice(),
+			aliases: self.aliases.into_boxed_slice(),
+		}
+	}
+}
+
+/// Stable identity named in provider conflict and replacement evidence.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ProviderDeclarationId {
+	/// Publisher identity from the admitted extension manifest.
+	pub publisher:      Str,
+	/// Extension identifier under `publisher`.
+	pub extension_id:   Str,
+	/// Stable declaration identifier within that extension.
+	pub declaration_id: Str,
+}
+
+impl fmt::Display for ProviderDeclarationId {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{}/{}/{}", self.publisher, self.extension_id, self.declaration_id)
+	}
+}
+
+/// Publisher-qualified extension identity accepted by `replaces=`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ProviderPublisher {
+	/// Publisher identity from the admitted extension manifest.
+	pub publisher:    Str,
+	/// Extension identifier under `publisher`.
+	pub extension_id: Str,
+}
+
+impl ProviderPublisher {
+	fn matches(&self, declaration: &ProviderDeclarationId) -> bool {
+		self.publisher == declaration.publisher && self.extension_id == declaration.extension_id
+	}
+}
+
+/// One admitted `@omp.provider` declaration lowered into a catalog overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDeclaration {
+	/// Identity retained in activation evidence, including for losing entries.
+	pub id:        ProviderDeclarationId,
+	/// Provider namespace contributed by this declaration.
+	pub provider:  ProviderId,
+	/// Field-granular model and route contribution.
+	pub overlay:   CatalogOverlay,
+	/// Larger values win among unrelated declarations.
+	pub priority:  i32,
+	/// Named base provider whose active declaration this overlay extends.
+	pub extends:   Option<ProviderId>,
+	/// Publisher-qualified declaration fully replaced by this declaration.
+	pub replaces:  Option<ProviderPublisher>,
+	/// Whether admission and policy allow this declaration to participate.
+	pub available: bool,
+}
+
+/// Activation failure for a provider declaration set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderActivationError {
+	/// Two unrelated declarations had the same winning priority.
+	EqualPriority {
+		/// Contested provider namespace.
+		provider: ProviderId,
+		/// One conflicting declaration.
+		first:    ProviderDeclarationId,
+		/// The other conflicting declaration.
+		second:   ProviderDeclarationId,
+	},
+	/// An extension declaration named a provider base that is unavailable.
+	MissingBase {
+		/// Declaration that requested the base.
+		declaration: ProviderDeclarationId,
+		/// Provider base required by `extends=`.
+		base:        ProviderId,
+	},
+}
+
+impl fmt::Display for ProviderActivationError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::EqualPriority { provider, first, second } => write!(
+				formatter,
+				"provider {provider} has equal-priority declarations {first} and {second}"
+			),
+			Self::MissingBase { declaration, base } => {
+				write!(formatter, "provider declaration {declaration} extends unavailable base {base}")
+			},
+		}
+	}
+}
+
+impl Error for ProviderActivationError {}
+
+/// Active provider layers plus every declaration retained as evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivatedProvider {
+	/// Provider namespace selected for activation.
+	pub provider: ProviderId,
+	/// Only active declaration layers, ordered for field-granular merging.
+	pub overlays: OverlayStack,
+	/// All declarations considered, including losing and replaced declarations.
+	pub evidence: Arc<[ProviderDeclarationId]>,
+}
+
+/// Activates declarations for one provider without a load-order tie-break.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderDeclarations {
+	declarations: Arc<[ProviderDeclaration]>,
+}
+
+impl ProviderDeclarations {
+	/// Captures declarations in deterministic admission order for provenance
+	/// only; it is never used as a conflict tie-break.
+	#[must_use]
+	pub fn new(declarations: impl IntoIterator<Item = ProviderDeclaration>) -> Self {
+		Self { declarations: declarations.into_iter().collect::<Vec<_>>().into() }
+	}
+
+	/// Activates the named provider and returns its field-granular overlay
+	/// stack.
+	pub fn activate(
+		&self,
+		provider: &ProviderId,
+	) -> Result<Option<ActivatedProvider>, ProviderActivationError> {
+		let declarations = self
+			.declarations
+			.iter()
+			.filter(|declaration| declaration.provider == *provider)
+			.collect::<Vec<_>>();
+		if declarations.is_empty() {
+			return Ok(None);
+		}
+		let evidence = declarations
+			.iter()
+			.map(|declaration| declaration.id.clone())
+			.collect::<Vec<_>>()
+			.into();
+		let available = declarations
+			.iter()
+			.copied()
+			.filter(|declaration| declaration.available)
+			.collect::<Vec<_>>();
+		if available.is_empty() {
+			return Ok(None);
+		}
+		let unreplaced = available
+			.iter()
+			.copied()
+			.filter(|candidate| {
+				!available.iter().any(|replacement| {
+					replacement
+						.replaces
+						.as_ref()
+						.is_some_and(|target| target.matches(&candidate.id))
+				})
+			})
+			.collect::<Vec<_>>();
+		let mut roots = unreplaced
+			.iter()
+			.copied()
+			.filter(|declaration| declaration.extends.is_none())
+			.collect::<Vec<_>>();
+		roots.sort_by(|left, right| {
+			right
+				.priority
+				.cmp(&left.priority)
+				.then_with(|| left.id.cmp(&right.id))
+		});
+		let Some(root) = roots.first().copied() else {
+			let declaration = available
+				.first()
+				.expect("available declaration has no root");
+			return Err(ProviderActivationError::MissingBase {
+				declaration: declaration.id.clone(),
+				base:        declaration
+					.extends
+					.clone()
+					.expect("root absence requires extends"),
+			});
+		};
+		if let Some(other) = roots.get(1).filter(|other| other.priority == root.priority) {
+			return Err(ProviderActivationError::EqualPriority {
+				provider: provider.clone(),
+				first:    root.id.clone(),
+				second:   other.id.clone(),
+			});
+		}
+		let mut active = vec![root];
+		let mut extensions = unreplaced
+			.iter()
+			.copied()
+			.filter(|declaration| declaration.extends.as_ref() == Some(provider))
+			.collect::<Vec<_>>();
+		extensions.sort_by(|left, right| {
+			left
+				.priority
+				.cmp(&right.priority)
+				.then_with(|| left.id.cmp(&right.id))
+		});
+		if let Some((first, second)) = extensions
+			.windows(2)
+			.find_map(|pair| (pair[0].priority == pair[1].priority).then_some((pair[0], pair[1])))
+		{
+			return Err(ProviderActivationError::EqualPriority {
+				provider: provider.clone(),
+				first:    first.id.clone(),
+				second:   second.id.clone(),
+			});
+		}
+		active.extend(extensions);
+		let overlays = OverlayStack::from_layers(active.into_iter().map(|declaration| {
+			(
+				OverlaySource::Extension { id: declaration.id.extension_id.clone() },
+				declaration.overlay.clone(),
+			)
+		}));
+		Ok(Some(ActivatedProvider { provider: provider.clone(), overlays, evidence }))
+	}
+
+	/// Activates every declared provider in lexical provider-id order.
+	pub fn activate_all(
+		&self,
+	) -> Result<BTreeMap<ProviderId, ActivatedProvider>, ProviderActivationError> {
+		let providers = self
+			.declarations
+			.iter()
+			.map(|declaration| declaration.provider.clone())
+			.collect::<std::collections::BTreeSet<_>>();
+		let mut activated = BTreeMap::new();
+		for provider in providers {
+			if let Some(value) = self.activate(&provider)? {
+				activated.insert(provider, value);
+			}
+		}
+		Ok(activated)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{EvidenceConfidence, ProvenanceKind, ProvenanceSource};
+
+	fn overlay(origin: &str) -> CatalogOverlay {
+		CatalogOverlay {
+			source:  ProvenanceSource {
+				kind:           ProvenanceKind::Configured,
+				origin:         origin.into(),
+				revision:       None,
+				confidence:     EvidenceConfidence::Declared,
+				observed_at_ms: None,
+			},
+			models:  Box::new([]),
+			routes:  Box::new([]),
+			aliases: Box::new([]),
+		}
+	}
+
+	fn declaration(name: &str, priority: i32) -> ProviderDeclaration {
+		ProviderDeclaration {
+			id: ProviderDeclarationId {
+				publisher:      "publisher".into(),
+				extension_id:   name.into(),
+				declaration_id: "provider".into(),
+			},
+			provider: "provider".into(),
+			overlay: overlay(name),
+			priority,
+			extends: None,
+			replaces: None,
+			available: true,
+		}
+	}
+
+	#[test]
+	fn replacement_bumps_generation_without_reordering_layers() {
+		let first = OverlayStack::empty().with_replaced(OverlaySource::UserConfig, overlay("first"));
+		let second = first.with_replaced(OverlaySource::UserConfig, overlay("second"));
+		assert_eq!(second.generation(), first.generation() + 1);
+		assert_eq!(second.overlays().len(), 1);
+		assert_eq!(second.overlays()[0].source.origin, "second");
+	}
+
+	#[test]
+	fn higher_priority_wins_but_loser_is_retained_as_evidence() {
+		let active = ProviderDeclarations::new([declaration("low", 1), declaration("high", 2)])
+			.activate(&ProviderId::from("provider"))
+			.unwrap()
+			.unwrap();
+		assert_eq!(active.overlays.overlays()[0].source.origin, "high");
+		assert_eq!(active.evidence.len(), 2);
+	}
+
+	#[test]
+	fn equal_priority_unrelated_declarations_name_both_identities() {
+		let error = ProviderDeclarations::new([declaration("first", 1), declaration("second", 1)])
+			.activate(&ProviderId::from("provider"))
+			.unwrap_err();
+		assert!(matches!(
+			error,
+			ProviderActivationError::EqualPriority { first, second, .. }
+				if first.extension_id == "first" && second.extension_id == "second"
+		));
+	}
+
+	#[test]
+	fn extends_applies_after_the_selected_base() {
+		let base = declaration("base", 0);
+		let mut extension = declaration("extension", 0);
+		extension.extends = Some("provider".into());
+		let active = ProviderDeclarations::new([base, extension])
+			.activate(&ProviderId::from("provider"))
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			active
+				.overlays
+				.overlays()
+				.iter()
+				.map(|overlay| overlay.source.origin.as_str())
+				.collect::<Vec<_>>(),
+			vec!["base", "extension"]
+		);
+	}
+
+	#[test]
+	fn denied_replacement_reactivates_the_replaced_declaration() {
+		let base = declaration("base", 0);
+		let mut replacement = declaration("replacement", 0);
+		replacement.replaces =
+			Some(ProviderPublisher { publisher: "publisher".into(), extension_id: "base".into() });
+		replacement.available = false;
+		let active = ProviderDeclarations::new([base, replacement])
+			.activate(&ProviderId::from("provider"))
+			.unwrap()
+			.unwrap();
+		assert_eq!(active.overlays.overlays()[0].source.origin, "base");
+	}
+	#[test]
+	fn publisher_qualified_replacement_supplants_only_its_declared_target() {
+		let base = declaration("base", 0);
+		let mut replacement = declaration("replacement", 0);
+		replacement.replaces =
+			Some(ProviderPublisher { publisher: "publisher".into(), extension_id: "base".into() });
+		let active = ProviderDeclarations::new([base, replacement])
+			.activate(&ProviderId::from("provider"))
+			.unwrap()
+			.unwrap();
+		assert_eq!(active.overlays.overlays()[0].source.origin, "replacement");
+		assert_eq!(active.evidence.len(), 2);
+	}
+}

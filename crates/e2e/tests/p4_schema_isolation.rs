@@ -395,7 +395,12 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 
 	let without_lift = registry(false);
 	let advertised = without_lift
-		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() })
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
 		.expect("live edit advertisement lowers");
 	let [advertised_edit] = advertised.as_slice() else {
 		panic!("registry must advertise exactly one live edit definition")
@@ -491,7 +496,12 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 
 	let with_lift = registry(true);
 	let lifted_advertised = with_lift
-		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() })
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
 		.expect("lifted live edit advertisement lowers");
 	let [lifted_advertised] = lifted_advertised.as_slice() else {
 		panic!("adding a lift must not synthesize a historical registration")

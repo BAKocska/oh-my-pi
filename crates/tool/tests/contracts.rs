@@ -410,7 +410,12 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 	assert_ne!(registry.device_hash(), empty_devices);
 	assert!(
 		registry
-			.advertise(LoweringCaps { strict_schema: false, grammar: GrammarBits::empty() })
+			.advertise(LoweringCaps {
+				strict_schema:  false,
+				grammar:        GrammarBits::empty(),
+				maximum_tools:  None,
+				maximum_strict: None,
+			})
 			.unwrap()
 			.is_empty()
 	);
@@ -438,7 +443,7 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 }
 
 #[test]
-fn route_and_presentation_filter_independently() {
+fn worker_slots_are_catalogued_without_consuming_model_slots() {
 	let mut registry = Registry::new();
 	registry
 		.register(
@@ -456,10 +461,14 @@ fn route_and_presentation_filter_independently() {
 		.unwrap();
 
 	let advertised = registry
-		.advertise(LoweringCaps { strict_schema: false, grammar: GrammarBits::empty() })
+		.advertise(LoweringCaps {
+			strict_schema:  false,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
 		.unwrap();
-	assert_eq!(advertised.len(), 1);
-	assert_eq!(advertised[0].identity.name, "worker_slot");
+	assert!(advertised.is_empty());
 	assert!(matches!(
 		registry.route("worker_slot").unwrap(),
 		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
@@ -472,6 +481,86 @@ fn route_and_presentation_filter_independently() {
 	assert_eq!(device.name, "native_device");
 	assert_eq!(device.route, &omp_tool::ToolRoute::Native);
 	assert!(devices.next().is_none());
+}
+
+#[test]
+fn advertisement_spends_capacity_by_priority_and_receipts_strict_exhaustion() {
+	let mut registry = Registry::new();
+	let calls = Arc::new(AtomicUsize::new(0));
+	for (name, precedence, priority) in
+		[("extension", Precedence::DEFAULT, 255), ("core", Precedence::CORE, 0)]
+	{
+		registry
+			.register(
+				FakeTool::new(
+					1,
+					name,
+					br#"{"type":"object"}"#,
+					Constraint::Schema { priority, on_unsupported: Fallback::Unspecified },
+					Arc::clone(&calls),
+				)
+				.named(name),
+				Presentation::Slot,
+				claims("omp/tests", precedence),
+			)
+			.unwrap();
+	}
+	let advertised = registry
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  Some(1),
+			maximum_strict: Some(1),
+		})
+		.unwrap();
+	assert_eq!(advertised.len(), 1);
+	assert_eq!(advertised[0].identity.name, "core");
+
+	let mut strict_registry = Registry::new();
+	for (name, priority) in [("first", 2), ("second", 1)] {
+		strict_registry
+			.register(
+				FakeTool::new(
+					1,
+					name,
+					br#"{"type":"object"}"#,
+					Constraint::Schema { priority, on_unsupported: Fallback::Unspecified },
+					Arc::clone(&calls),
+				)
+				.named(name),
+				Presentation::Slot,
+				claims("omp/tests", Precedence::CORE),
+			)
+			.unwrap();
+	}
+	let advertised = strict_registry
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: Some(1),
+		})
+		.unwrap();
+	assert!(
+		advertised[0]
+			.definition
+			.input
+			.json_schema()
+			.expect("schema")
+			.1
+	);
+	assert!(
+		!advertised[1]
+			.definition
+			.input
+			.json_schema()
+			.expect("schema")
+			.1
+	);
+	assert!(matches!(
+		advertised[1].adjustments.as_slice(),
+		[Adjustment::Dropped { reason, .. }] if reason.0 == "catalog.strict-schema-budget-exhausted"
+	));
 }
 
 #[test]
@@ -722,7 +811,12 @@ fn advertisement_contains_only_the_live_schema_and_preserves_supported_grammar()
 		.unwrap();
 
 	let advertised = registry
-		.advertise(LoweringCaps { strict_schema: false, grammar: GrammarBits::REGEX })
+		.advertise(LoweringCaps {
+			strict_schema:  false,
+			grammar:        GrammarBits::REGEX,
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
 		.unwrap();
 	let [tool] = advertised.as_slice() else {
 		panic!("historical revisions must not be advertised")
@@ -777,7 +871,12 @@ fn live_identity_and_advertisement_are_the_same_exact_revision() {
 		.live_identity("typed_fake")
 		.expect("registered live identity");
 	let [advertised] = registry
-		.advertise(LoweringCaps { strict_schema: false, grammar: GrammarBits::empty() })
+		.advertise(LoweringCaps {
+			strict_schema:  false,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
 		.unwrap()
 		.try_into()
 		.expect("only one live definition");
@@ -843,7 +942,12 @@ fn unsupported_grammar_degrades_to_live_lenient_schema_with_a_receipt() {
 		.unwrap();
 
 	let [tool] = registry
-		.advertise(LoweringCaps { strict_schema: true, grammar: GrammarBits::empty() })
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
 		.unwrap()
 		.try_into()
 		.expect("one live tool");

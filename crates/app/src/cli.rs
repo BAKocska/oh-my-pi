@@ -34,9 +34,21 @@ use crate::{
 #[derive(Clone, Debug, Parser)]
 #[command(name = "omp", version, about = "OMP coding agent and inference runtime")]
 pub struct OmpCli {
+	/// Enable an extension specification for this invocation.
+	#[arg(long, global = true, value_name = "SPEC", conflicts_with = "no_ext")]
+	pub ext:              Vec<Str>,
+	/// Load only this local extension path for this invocation.
+	#[arg(long = "ext-only", global = true, value_name = "PATH", conflicts_with = "no_ext")]
+	pub ext_only:         Vec<PathBuf>,
+	/// Suppress all configured extensions for this invocation.
+	#[arg(long = "no-ext", global = true, conflicts_with_all = ["ext", "ext_only"])]
+	pub no_ext:           bool,
+	/// Suppress the workspace extension layer for this invocation.
+	#[arg(long = "no-workspace-ext", global = true)]
+	pub no_workspace_ext: bool,
 	/// Operation to run. Defaults to interactive project chat.
 	#[command(subcommand)]
-	pub command: Option<Command>,
+	pub command:          Option<Command>,
 }
 
 /// Production application commands.
@@ -56,6 +68,8 @@ pub enum Command {
 	Catalog(CatalogArgs),
 	/// Run hardware-accelerated local inference.
 	Local(LocalArgs),
+	/// Manage Python extension resolution, trust, and site trees.
+	Ext(crate::ext_cli::ExtArgs),
 }
 
 /// Gateway serving options.
@@ -236,6 +250,7 @@ enum DispatchTarget {
 	Auth,
 	CatalogImport,
 	LocalInfer,
+	Ext,
 }
 
 #[cfg(test)]
@@ -252,6 +267,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Local(LocalArgs { command: LocalCommand::Infer(_) })) => {
 			DispatchTarget::LocalInfer
 		},
+		Some(Command::Ext(_)) => DispatchTarget::Ext,
 	}
 }
 
@@ -274,6 +290,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			catalog_import(&args)
 		},
 		Command::Local(LocalArgs { command: LocalCommand::Infer(args) }) => local_infer(args).await,
+		Command::Ext(args) => crate::ext_cli::run(args).await,
 	}
 }
 
@@ -504,6 +521,7 @@ mod tests {
 				DispatchTarget::CatalogImport,
 			),
 			(&["omp", "local", "infer", "--prompt", "hello"][..], DispatchTarget::LocalInfer),
+			(&["omp", "ext", "list"][..], DispatchTarget::Ext),
 		];
 		for (arguments, expected) in cases {
 			assert_eq!(dispatch_target(parse(arguments).command.as_ref()), expected);
@@ -533,6 +551,79 @@ mod tests {
 		assert_eq!(args.gateway.as_ref().map(LocalEndpoint::as_path), Some(Path::new(TEST_ENDPOINT)));
 		assert_eq!(args.resume, Some(Str::from("01ARZ3NDEKTSV4RRFFQ69G5FAV")));
 		assert!(args.py_eval);
+	}
+
+	#[test]
+	fn parses_ext_group_flags_and_subcommands() {
+		let cli = parse(&[
+			"omp",
+			"--ext=publisher/example",
+			"--ext-only",
+			"local-ext",
+			"--no-workspace-ext",
+			"ext",
+			"install",
+			"--pool=shared",
+			"--tier",
+			"trusted",
+			"--grant",
+			"network",
+			"publisher/example",
+			"--",
+			"literal-spec",
+		]);
+		assert_eq!(cli.ext, vec![Str::from("publisher/example")]);
+		assert_eq!(cli.ext_only, vec![PathBuf::from("local-ext")]);
+		assert!(cli.no_workspace_ext);
+		let Some(Command::Ext(args)) = cli.command else {
+			panic!("ext command");
+		};
+		assert_eq!(args.project, PathBuf::from("."));
+		let crate::ext_cli::ExtCommand::Install(install) = args.command else {
+			panic!("ext install command");
+		};
+		assert_eq!(install.pool, Some(Str::from("shared")));
+		assert_eq!(install.specs, vec![Str::from("publisher/example"), Str::from("literal-spec")]);
+
+		for arguments in [
+			&["omp", "ext", "list"][..],
+			&["omp", "ext", "info", "example"][..],
+			&["omp", "ext", "install", "example"][..],
+			&["omp", "ext", "uninstall", "example"][..],
+			&["omp", "ext", "link", "example-dir"][..],
+			&["omp", "ext", "unlink", "example"][..],
+			&["omp", "ext", "enable", "example"][..],
+			&["omp", "ext", "disable", "example"][..],
+			&["omp", "ext", "features", "example", "--list"][..],
+			&["omp", "ext", "lock"][..],
+			&["omp", "ext", "resolve", "example"][..],
+			&["omp", "ext", "sync"][..],
+			&["omp", "ext", "upgrade"][..],
+			&["omp", "ext", "pin", "example", "1.0.0"][..],
+			&["omp", "ext", "unpin", "example"][..],
+			&["omp", "ext", "gc"][..],
+			&["omp", "ext", "doctor"][..],
+			&["omp", "ext", "trust", "example"][..],
+			&["omp", "ext", "verify"][..],
+			&["omp", "ext", "bundle", "extensions.ompb"][..],
+			&["omp", "ext", "publish"][..],
+			&["omp", "ext", "search", "example"][..],
+			&["omp", "ext", "index", "list"][..],
+			&["omp", "ext", "where"][..],
+			&["omp", "ext", "index", "add", "primary", "https://index.example"][..],
+			&["omp", "ext", "index", "remove", "primary"][..],
+		] {
+			assert!(matches!(parse(arguments).command, Some(Command::Ext(_))), "{arguments:?}");
+		}
+	}
+
+	#[test]
+	fn rejects_unknown_ext_flags_as_usage_errors() {
+		let error = OmpCli::try_parse_from(["omp", "ext", "list", "--unrecognized"])
+			.expect_err("unknown extension flag must be rejected");
+		assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+		assert_eq!(error.exit_code(), 2);
+		assert!(error.to_string().contains("Usage:"));
 	}
 
 	#[test]

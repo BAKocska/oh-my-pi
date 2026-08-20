@@ -13,7 +13,9 @@ use regex::Regex;
 
 const REDACTED: &str = "[REDACTED]";
 
-static CREDENTIAL_REDACTION_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Extension-facing telemetry is redacted unless a core policy explicitly
+/// enables content capture for the materialized subscriber view.
+static CREDENTIAL_REDACTION_ENABLED: AtomicBool = AtomicBool::new(true);
 static SENSITIVE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
 	Regex::new(
 		r"(?i-u)(gh[opusr]_[a-zA-Z0-9_*]{36,}|github_pat_[a-zA-Z0-9_*]{36,}|glpat-[a-zA-Z0-9_*-]{20,}|sk-proj-[a-zA-Z0-9_*-]{36,}|sk-ant-[a-zA-Z0-9_*-]{36,}|sk-[a-zA-Z0-9_*-]{48,})",
@@ -21,10 +23,10 @@ static SENSITIVE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
 	.expect("the static sensitive-token expression is valid")
 });
 
-/// Enables or disables credential redaction.
+/// Sets credential redaction for a materialized telemetry view.
 ///
-/// This mirrors `configureCredentialRedaction(secrets.enabled)` in `pi` and is
-/// deliberately off until the host opts in.
+/// Extension-facing paths start redacted; callers may only disable this after
+/// enforcing the explicit content-capture grant.
 pub fn configure_credential_redaction(enabled: bool) {
 	CREDENTIAL_REDACTION_ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -36,9 +38,8 @@ pub fn credential_redaction_enabled() -> bool {
 
 /// Replaces credential-shaped tokens with the literal `[REDACTED]`.
 ///
-/// When redaction is disabled (the default), this skips all regex work.
-/// Matching is ASCII-case-insensitive, exactly like the `gi`
-/// flags on `pi`'s expression.
+/// Redaction is on by default for extension-facing telemetry. Matching is
+/// ASCII-case-insensitive, exactly like the `gi` flags on `pi`'s expression.
 pub fn redact_sensitive_credentials(text: &str) -> String {
 	if !credential_redaction_enabled() {
 		return text.to_owned();
@@ -86,11 +87,11 @@ mod tests {
 	}
 
 	#[test]
-	fn redaction_is_off_by_default() {
+	fn redaction_is_on_by_default() {
 		let _guard = TEST_LOCK.lock();
-		configure_credential_redaction(false);
+		assert!(credential_redaction_enabled());
 		let token = format!("gho_{}", "A".repeat(36));
-		assert_eq!(redact_sensitive_credentials(&token), token);
+		assert_eq!(redact_sensitive_credentials(&token), REDACTED);
 	}
 
 	#[test]

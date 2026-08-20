@@ -30,6 +30,7 @@ local-tts = [
 ]
 
 [dependencies]
+arc-swap = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 candle-core = { workspace = true, optional = true }

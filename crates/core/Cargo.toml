@@ -21,6 +21,7 @@ smallvec = { workspace = true }
 smol_bitmap = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

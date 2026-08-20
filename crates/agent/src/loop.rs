@@ -15,6 +15,11 @@ use omp_proto::{
 	thread::v1::{self as thread, Item},
 };
 use omp_storage::transcript::{CallId, InvocationTransition};
+use omp_telemetry::firehose::{
+	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
+	ProviderError, ToolCall as FirehoseToolCall, TurnEnd as FirehoseTurnEnd,
+	TurnStart as FirehoseTurnStart,
+};
 use omp_tool::{CapsBase, Registry as ToolRegistry, ToolIdentity};
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
@@ -26,9 +31,11 @@ use crate::{
 		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
 	},
 	context::{ContextProjection, project_context},
+	continuation::{AgentSettledEvent, Continuation, ContinuationLedger, continues_loop, from_hook},
 	control::{ControlMailbox, ControlSender},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
+	hooks::HookGate,
 	jobs::JobBoard,
 	journal::{AbortDisposition, TurnInputRecord, TurnOptionsRecord, TurnStart},
 	mailbox::DrainPoint,
@@ -151,7 +158,10 @@ pub struct Agent<C: TurnClient> {
 	context: Option<ContextRef>,
 	prompt_hash: Option<crate::PromptHash>,
 	prompt_head_events: Vec<u64>,
+	settled_gate: Option<Arc<HookGate>>,
+	continuations: ContinuationLedger,
 	last_toolset_hash: Option<[u8; 32]>,
+	firehose: Arc<Firehose>,
 }
 
 impl<C: TurnClient> Agent<C> {
@@ -227,6 +237,9 @@ impl<C: TurnClient> Agent<C> {
 			context,
 			prompt_hash,
 			prompt_head_events,
+			settled_gate: None,
+			continuations: ContinuationLedger::new(8),
+			firehose: Arc::new(Firehose::new()),
 			last_toolset_hash,
 		}
 	}
@@ -263,6 +276,29 @@ impl<C: TurnClient> Agent<C> {
 		self.control_tx.clone()
 	}
 
+	/// Installs the fail-open `agent_settled` hook gate for this durable loop.
+	pub fn set_agent_settled_gate(&mut self, gate: Arc<HookGate>, cap: u32) {
+		self.settled_gate = Some(gate);
+		self.continuations = ContinuationLedger::new(cap);
+	}
+
+	/// Returns the latest recursive continuation ledger projection.
+	#[must_use]
+	pub const fn continuations(&self) -> &ContinuationLedger {
+		&self.continuations
+	}
+
+	/// Replaces the non-blocking telemetry fan-out used by this loop.
+	pub fn set_firehose(&mut self, firehose: Arc<Firehose>) {
+		self.firehose = firehose;
+	}
+
+	/// Returns the shared non-blocking telemetry fan-out handle.
+	#[must_use]
+	pub fn firehose(&self) -> Arc<Firehose> {
+		Arc::clone(&self.firehose)
+	}
+
 	/// Returns a cloneable out-of-band stop signal.
 	pub fn abort_handle(&self) -> AbortHandle {
 		AbortHandle { tx: Arc::clone(&self.abort_tx) }
@@ -281,7 +317,13 @@ impl<C: TurnClient> Agent<C> {
 	/// Rewinds the durable session to a live prefix and returns the fresh
 	/// projection.
 	pub fn rewind(&mut self, to: Option<u64>) -> Result<Vec<Item>, AgentError> {
-		self.journal.rewind(now_ms(), to)?;
+		let event = self.journal.rewind(now_ms(), to)?;
+		self.firehose.publish(FirehoseEvent::Branch(Branch {
+			envelope:   telemetry_envelope(),
+			op:         Some(BranchOp::Switch),
+			from_entry: to,
+			to_entry:   Some(event),
+		}));
 		self.mailbox.discard_producer_interrupts();
 		self.context = None;
 		self.prompt_hash = None;
@@ -427,6 +469,12 @@ impl<C: TurnClient> Agent<C> {
 		};
 
 		loop {
+			self
+				.firehose
+				.publish(FirehoseEvent::TurnStart(FirehoseTurnStart {
+					envelope: telemetry_envelope(),
+					turn:     u64::from(committed_turns).saturating_add(1),
+				}));
 			let turn = self.run_turn(turn_id.clone(), pending_indexes).await;
 			let (outcome, mut speculative, submitted_context_id, snapshot, enabled_tools) = match turn
 			{
@@ -445,9 +493,9 @@ impl<C: TurnClient> Agent<C> {
 					let drained = self
 						.mailbox
 						.drain(DrainPoint::Idle, snapshot.defer_interrupts);
-					let has_producer = drained.iter().any(|interrupt| {
-						matches!(&interrupt.source, crate::InterruptSource::Producer(_))
-					});
+					let has_producer = drained
+						.iter()
+						.any(|interrupt| continues_loop(&interrupt.source));
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					pending_indexes = self.stage_interrupts(&next_turn_id, drained)?;
 					if has_producer {
@@ -495,8 +543,12 @@ impl<C: TurnClient> Agent<C> {
 					self.context = None;
 					return Err(AgentError::Turn(error));
 				},
-				Err(error) => return Err(error),
+				Err(error) => {
+					self.publish_provider_error("turn_failed", Some(Str::from(error.to_string())));
+					return Err(error);
+				},
 			};
+			self.publish_model_request(&outcome);
 			committed_turns = committed_turns.saturating_add(1);
 			let stop = outcome.stop();
 			self.context = outcome.revision.clone().and_then(|expected| {
@@ -614,6 +666,13 @@ impl<C: TurnClient> Agent<C> {
 				};
 				let mut next = Vec::with_capacity(results.len() + boundary.len());
 				for result in results {
+					self
+						.firehose
+						.publish(FirehoseEvent::ToolCall(Box::new(FirehoseToolCall {
+							envelope: telemetry_envelope(),
+							tool: result.call_id().clone(),
+							..FirehoseToolCall::default()
+						})));
 					if let Some(outcome) = result.outcome().cloned() {
 						let call_id = result.call_id().clone();
 						self
@@ -642,7 +701,7 @@ impl<C: TurnClient> Agent<C> {
 				pending_indexes = self.append_pending(&next_turn_id, next)?;
 				let has_producer = boundary
 					.iter()
-					.any(|interrupt| matches!(&interrupt.source, crate::InterruptSource::Producer(_)));
+					.any(|interrupt| continues_loop(&interrupt.source));
 				pending_indexes
 					.extend(self.stage_interrupts(&next_turn_id, std::mem::take(&mut boundary))?);
 				if deadline_elapsed {
@@ -681,6 +740,19 @@ impl<C: TurnClient> Agent<C> {
 				turn_id = next_turn_id;
 				continue;
 			}
+			if let Some(interrupt) = self.settled_continuation(&turn_id).await {
+				let _ = self.mailbox.sender().try_enqueue(interrupt);
+				boundary = self
+					.mailbox
+					.drain(DrainPoint::Idle, snapshot.defer_interrupts);
+				if !boundary.is_empty() {
+					let next_turn_id = follow_up_id(&turn_id, committed_turns);
+					pending_indexes = self.stage_interrupts(&next_turn_id, boundary)?;
+					last_outcome = Some(outcome);
+					turn_id = next_turn_id;
+					continue;
+				}
+			}
 			if let Some((queued_turn, events)) = self.journal.pending_input_submission() {
 				pending_indexes = events.to_vec();
 				last_outcome = Some(outcome);
@@ -688,12 +760,56 @@ impl<C: TurnClient> Agent<C> {
 				continue;
 			}
 			self.transition(AgentPhase::Idle);
+			self
+				.firehose
+				.publish(FirehoseEvent::TurnEnd(Box::new(FirehoseTurnEnd {
+					envelope: telemetry_envelope(),
+					turn:     u64::from(committed_turns),
+					outcome:  None,
+				})));
 			return Ok(AgentRunSummary {
 				outcome: Some(outcome),
 				committed_turns,
 				interrupted: false,
 			});
 		}
+	}
+
+	/// Publishes post-hoc inference facts without participating in durable
+	/// billing.
+	fn publish_model_request(&self, outcome: &Outcome) {
+		self
+			.firehose
+			.publish(FirehoseEvent::ModelRequest(Box::new(ModelRequest {
+				envelope: telemetry_envelope(),
+				served_model: Str::from(outcome.model.as_str()),
+				provider: Str::from(outcome.provider.as_str()),
+				usage: outcome.usage.clone().unwrap_or_default(),
+				cost: outcome.cost.clone(),
+				..ModelRequest::default()
+			})));
+		for diagnostic in &outcome.diagnostics {
+			if diagnostic.retryability != pb::Retryability::Never as i32 {
+				self
+					.firehose
+					.publish(FirehoseEvent::ModelAttempt(ModelAttempt {
+						envelope: telemetry_envelope(),
+						attempt:  diagnostic.attempt,
+						code:     Str::from(diagnostic.code.as_str()),
+					}));
+			}
+		}
+	}
+
+	/// Publishes a classified provider failure after the durable abort path ran.
+	fn publish_provider_error(&self, code: &'static str, detail: Option<Str>) {
+		self
+			.firehose
+			.publish(FirehoseEvent::ProviderError(Box::new(ProviderError {
+				envelope: telemetry_envelope(),
+				code: Str::new_static(code),
+				detail,
+			})));
 	}
 
 	fn append_pending(
@@ -711,6 +827,28 @@ impl<C: TurnClient> Agent<C> {
 					.map_err(Into::into)
 			})
 			.collect()
+	}
+
+	/// Runs the settled-boundary domain hook and converts an accepted decision
+	/// into a normal mailbox interrupt so `defer_interrupts` remains
+	/// authoritative.
+	async fn settled_continuation(&mut self, turn_id: &TurnId) -> Option<crate::Interrupt> {
+		let gate = self.settled_gate.as_ref()?.clone();
+		let event = AgentSettledEvent {
+			agent_id: Str::new_static("agent"),
+			turn_id:  Str::from(turn_id.as_str()),
+		};
+		let outcome = gate.gate_domain(&event).await;
+		let item = continuation_item();
+		let candidate = from_hook(outcome.winner, Str::new_static("agent_settled"), item);
+		match self.continuations.decide(candidate, now_ms()) {
+			Continuation::Continue { owner, item, .. } => Some(crate::Interrupt {
+				class: crate::InterruptClass::Immediate,
+				item,
+				source: crate::InterruptSource::Continuation { owner },
+			}),
+			Continuation::Settle | Continuation::Refused { .. } => None,
+		}
 	}
 
 	fn stage_interrupts(
@@ -1543,6 +1681,9 @@ fn validate_outcome(outcome: &Outcome) -> Result<(), AgentError> {
 	}
 	Ok(())
 }
+fn telemetry_envelope() -> Envelope {
+	Envelope { occurred_at_ms: now_ms(), ..Envelope::default() }
+}
 
 async fn wait_deadline(deadline: Option<std::time::Instant>) {
 	match deadline {
@@ -1566,7 +1707,34 @@ fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
 		crate::mailbox::InterruptSource::Job { id } => {
 			format!("job {} settled", id.as_str()).to_str()
 		},
+		crate::mailbox::InterruptSource::Continuation { owner } => {
+			format!("continuation from {}", owner.as_str()).to_str()
+		},
+		crate::mailbox::InterruptSource::Schedule { id } => {
+			format!("schedule {} fired", id.as_str()).to_str()
+		},
+		crate::mailbox::InterruptSource::Peer { from } => {
+			format!("peer {} steered", from.as_str()).to_str()
+		},
 		crate::mailbox::InterruptSource::Producer(name) => name.clone(),
+	}
+}
+
+fn continuation_item() -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part {
+				kind: Some(thread::part::Kind::Text(
+					"<system-injection>\nA settled-boundary continuation was accepted. Continue the \
+					 task.\n</system-injection>"
+						.to_owned(),
+				)),
+			}],
+		})),
+		props:         None,
 	}
 }
 

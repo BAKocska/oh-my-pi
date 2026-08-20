@@ -1,5 +1,7 @@
 //! Provider, route, endpoint, authentication, and discovery records.
 
+use std::time::Duration;
+
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -607,6 +609,21 @@ pub struct DiscoverySpec {
 	pub pagination:    DiscoveryPagination,
 	/// Whether absence from a successful listing proves unavailability.
 	pub authoritative: bool,
+	/// Requested periodic poll interval. Runtime scheduling never polls more
+	/// frequently than five seconds.
+	#[serde(default)]
+	pub interval:      Option<Duration>,
+}
+
+impl DiscoverySpec {
+	/// Returns the periodic polling interval after applying the five-second
+	/// floor required for background discovery.
+	#[must_use]
+	pub fn polling_interval(&self) -> Option<Duration> {
+		self
+			.interval
+			.map(|interval| interval.max(Duration::from_secs(5)))
+	}
 }
 
 /// Provider registry relationship for declarative aliases and replacements.

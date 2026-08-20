@@ -1,18 +1,19 @@
 //! Conservative normalization of runtime provider model discovery.
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Instant};
 
 use omp_core::Str;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	Availability, CatalogAlias, CatalogOverlay, ChatCapabilities, ClassId, ClassificationEvidence,
-	ClassificationInput, ClassificationPhase, ContextStrategy, DiscoveryPagination, DiscoverySpec,
-	DiscoverySpecId, EvidenceConfidence, ExactSelector, ExtendedContextMode, ModelAvailability,
-	ModelCapabilities, ModelKey, ModelLimits, ModelOverlay, ModelPatch, ModelProvenance, ModelSpec,
-	OperationBits, OperationKind, Pricing, ProvenanceKind, ProvenanceSource, ProviderDef,
-	ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingPolicyId, ThinkingRouting, WireModelId,
-	WirePolicyId, classify,
+	Availability, CatalogAlias, CatalogOverlay, CatalogOverlayBuilder, ChatCapabilities, ClassId,
+	ClassificationEvidence, ClassificationInput, ClassificationPhase, ContextStrategy,
+	DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EvidenceConfidence, ExactSelector,
+	ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits, ModelOverlay,
+	ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Pricing, ProvenanceKind,
+	ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingPolicyId,
+	ThinkingRouting, WireModelId, WirePolicyId, classify,
 };
 
 /// Provider-declared facts for one remotely discovered wire model.
@@ -182,6 +183,52 @@ pub struct DiscoveryPage {
 	pub authoritative: bool,
 }
 
+/// Daemon-wide identity for one scheduled discovery poll.
+///
+/// Hosts share one gate for this key across every session, so interval polling
+/// cannot multiply with the number of attached sessions.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DiscoveryPollKey {
+	/// Provider namespace being observed.
+	pub provider: ProviderId,
+	/// Exact route whose endpoint is polled through `omp.env`.
+	pub route:    RouteId,
+	/// Discovery response grammar bound to the route.
+	pub spec:     DiscoverySpecId,
+}
+
+/// Clone-cheap daemon-side deduplication gate for host-executor discovery
+/// tasks.
+///
+/// This type schedules no work and owns no runtime. The host background
+/// executor calls [`Self::claim_interval`] before it invokes `models_discover`
+/// or an `omp.env` HTTP probe.
+#[derive(Clone, Default)]
+pub struct DiscoveryPollGate {
+	next_due: Arc<Mutex<BTreeMap<DiscoveryPollKey, Instant>>>,
+}
+
+impl DiscoveryPollGate {
+	/// Claims a due periodic poll. `false` means another session already owns
+	/// the current interval or the specification is refresh-only.
+	pub fn claim_interval(&self, key: DiscoveryPollKey, spec: &DiscoverySpec, now: Instant) -> bool {
+		let Some(interval) = spec.polling_interval() else {
+			return false;
+		};
+		let mut next_due = self.next_due.lock();
+		if next_due.get(&key).is_some_and(|due| *due > now) {
+			return false;
+		}
+		next_due.insert(key, now.checked_add(interval).unwrap_or(now));
+		true
+	}
+
+	/// Releases a failed poll so an explicit refresh can schedule a replacement
+	/// immediately. Successful polls retain their interval lease.
+	pub fn release(&self, key: &DiscoveryPollKey) {
+		self.next_due.lock().remove(key);
+	}
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RouteDiscoveryConfig {
 	provider:   ProviderId,
@@ -356,12 +403,10 @@ impl NormalizedDiscovery {
 				deprecated: Some(model.provenance.deprecated),
 			},
 		};
-		CatalogOverlay {
-			source,
-			models: Box::new([model_overlay]),
-			routes: Box::new([]),
-			aliases: scoped_aliases,
-		}
+		CatalogOverlayBuilder::new(source)
+			.with_model(model_overlay)
+			.with_aliases(scoped_aliases.into_vec())
+			.build()
 	}
 }
 
@@ -759,6 +804,7 @@ mod tests {
 			path: "/models".into(),
 			pagination,
 			authoritative: true,
+			interval: None,
 		};
 		RouteDiscoveryProjector::new(&provider, &route, &spec, defaults())
 			.expect("route-bound projector configuration is valid")
@@ -975,5 +1021,27 @@ mod tests {
 			["a-route", "z-route"]
 		);
 		assert!(normalized[0].model.capabilities.chat.is_none());
+	}
+	#[test]
+	fn periodic_discovery_is_floored_and_deduplicated_across_gate_clones() {
+		let spec = DiscoverySpec {
+			id:            DiscoverySpecId::from("models"),
+			kind:          DiscoveryKind::Specialized,
+			label:         "models".into(),
+			path:          "/models".into(),
+			pagination:    DiscoveryPagination::SinglePage,
+			authoritative: false,
+			interval:      Some(std::time::Duration::from_millis(1)),
+		};
+		assert_eq!(spec.polling_interval(), Some(std::time::Duration::from_secs(5)));
+		let key = DiscoveryPollKey {
+			provider: ProviderId::from("provider"),
+			route:    RouteId::from("route"),
+			spec:     spec.id.clone(),
+		};
+		let gate = DiscoveryPollGate::default();
+		let now = Instant::now();
+		assert!(gate.claim_interval(key.clone(), &spec, now));
+		assert!(!gate.clone().claim_interval(key, &spec, now));
 	}
 }

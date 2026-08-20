@@ -56,19 +56,21 @@ impl RouteIdentity {
 #[derive(Clone, Debug)]
 pub struct OperationRequest<T> {
 	/// Logical request identity.
-	pub id:        RequestId,
+	pub id:          RequestId,
 	/// Resolved model and route constraint.
-	pub target:    Target,
+	pub target:      Target,
 	/// Absolute execution deadline.
-	pub deadline:  Option<Instant>,
+	pub deadline:    Option<Instant>,
 	/// Cross-attempt budget.
-	pub budget:    ExecutionBudget,
+	pub budget:      ExecutionBudget,
 	/// Optional conversation state.
-	pub session:   Option<SessionRequest>,
-	/// Immutable selected execution plan carried into codec/auth composition.
-	pub execution: Option<Arc<ExecutionPlan>>,
+	pub session:     Option<SessionRequest>,
+	/// Principal and extension charged for this request.
+	pub attribution: crate::call::InferenceAttribution,
+	/// Immutable selected execution plan.
+	pub execution:   Option<Arc<ExecutionPlan>>,
 	/// Operation-specific immutable payload.
-	pub payload:   Arc<T>,
+	pub payload:     Arc<T>,
 }
 
 impl<T> OperationRequest<T> {
@@ -81,6 +83,7 @@ impl<T> OperationRequest<T> {
 			deadline: call.deadline,
 			budget: call.budget.clone(),
 			session: call.session.clone(),
+			attribution: call.attribution.clone(),
 			execution: call.execution.clone(),
 			payload,
 		}
@@ -90,13 +93,14 @@ impl<T> OperationRequest<T> {
 	/// entry.
 	pub fn into_call(self, wrap: impl FnOnce(Arc<T>) -> OperationCall) -> Call {
 		Call {
-			id:        self.id,
-			target:    self.target,
-			deadline:  self.deadline,
-			budget:    self.budget,
-			session:   self.session,
-			execution: self.execution,
-			operation: wrap(self.payload),
+			id:          self.id,
+			target:      self.target,
+			deadline:    self.deadline,
+			budget:      self.budget,
+			session:     self.session,
+			attribution: self.attribution,
+			execution:   self.execution,
+			operation:   wrap(self.payload),
 		}
 	}
 }

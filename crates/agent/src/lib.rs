@@ -10,8 +10,10 @@
 
 mod approvals;
 mod batch;
+mod broker;
 mod compact;
 pub mod context;
+mod continuation;
 pub mod control;
 pub(crate) mod duplex;
 mod events;
@@ -22,10 +24,13 @@ mod journal;
 pub mod journal_kinds;
 mod r#loop;
 mod mailbox;
+mod oneshot;
 mod phases;
 mod project;
 mod prompt;
+mod schedule;
 mod state;
+mod tree;
 mod turn;
 
 pub use approvals::{
@@ -35,6 +40,10 @@ pub use approvals::{
 pub use batch::{
 	BatchError, BatchResult, CommittedCall, InvocationAdmission, InvocationHookBus,
 	InvocationHookRequest, SpeculativeCall, ToolBatch, hook_event_mask,
+};
+pub use broker::{
+	Broker, BrokerError, BrokerInbox, DeliveryMode, PeerMessage, Receipt, now_ms as broker_now_ms,
+	peer_item,
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionEvent, CompactionHysteresis,
@@ -46,6 +55,9 @@ pub use compact::{
 pub use context::{
 	Anchor, ContextProjection, ContextView, InheritPosition, MessageKind, MessageRef, PatchOp,
 	PatchRejected, RefFlags, apply_patches, project_context,
+};
+pub use continuation::{
+	AgentSettledEvent, Continuation, ContinuationLedger, continues_loop, from_hook,
 };
 pub use events::{AgentEvent, AgentPhase, EventBus, EventSubscription, LossyEventSubscription};
 pub use hooks::{
@@ -75,6 +87,9 @@ pub use omp_proto::{
 	},
 	thread::v1::{Item, Thread},
 };
+pub use oneshot::{
+	Completion, CompletionError, CompletionRequest, resolve_completion, select_choice,
+};
 pub use phases::{
 	ActivateReason, HookDecision, HookPhase, InvocationPhase, LifecyclePhase, RestartReason,
 };
@@ -88,7 +103,16 @@ pub use prompt::{
 	VcsIdentity, VolatilePrompt, VolatilePromptJournal, WorkspaceInput, WorkspacePromptSource,
 	render_prompt,
 };
+pub use schedule::{
+	Firing, FiringOutcome, MissedRunPolicy, Schedule, ScheduleBudget, ScheduleDelivery,
+	ScheduleError, ScheduleJournal, ScheduleScope, Scheduler, Trigger, UpgradePolicy, firing_key,
+};
 pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError};
+pub use tree::{
+	AgentKind, AgentNode, AgentStatus, AgentTree, Budget, BudgetCeiling, BudgetExceeded,
+	BudgetRemainder, DEFAULT_MAX_ADMISSION_QUEUE, DEFAULT_MAX_CONCURRENCY, EffectsOperation,
+	SpawnPermit, SpawnRefusal, Usage, enforce_minimum_phase,
+};
 pub use turn::{
 	Error, InvokeFrame, Recovery, TurnClient, TurnInput, TurnOptions, TurnSession, empty_stop,
 };

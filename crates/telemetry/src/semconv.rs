@@ -29,11 +29,11 @@ macro_rules! vocab {
 		$(#[$enum_meta])*
 		pub enum $name {
 			$(
+				#[doc = concat!("The `", $wire, "` vocabulary value.")]
 				$(#[$variant_meta])*
 				$variant,
 			)*
 		}
-
 		impl $name {
 			#[doc = $as_str_doc]
 			#[must_use]
@@ -55,6 +55,133 @@ macro_rules! vocab {
 			}
 		}
 	};
+}
+
+vocab! {
+	/// Firehose event kinds accepted by core-side subscriptions.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum Kind("firehose event kind", "Returns the byte-exact firehose event kind.") {
+		SessionStart => "session_start",
+		SessionEnd => "session_end",
+		TurnStart => "turn_start",
+		TurnEnd => "turn_end",
+		ModelRequest => "model_request",
+		ModelAttempt => "model_attempt",
+		ProviderError => "provider_error",
+		ToolCall => "tool_call",
+		CapabilityDegraded => "capability_degraded",
+		Compaction => "compaction",
+		Branch => "branch",
+		ArtifactSpill => "artifact_spill",
+		IssueReport => "issue_report",
+		HostWarning => "host_warning",
+	}
+}
+
+vocab! {
+	/// Charitable argument-decoding repairs recorded by a tool call.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum RepairKind("repair kind", "Returns the byte-exact repair kind.") {
+		Alias => "alias",
+		Coerce => "coerce",
+		TolerantParse => "tolerant_parse",
+		TruncatedTail => "truncated_tail",
+		Defaulted => "defaulted",
+	}
+}
+
+vocab! {
+	/// Action taken when a capability intent could not be honoured natively.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum DegradeAction("degrade action", "Returns the byte-exact degradation action.") {
+		Dropped => "dropped",
+		Emulated => "emulated",
+		Clamped => "clamped",
+	}
+}
+
+vocab! {
+	/// Layer that caused an artifact payload to spill.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum SpillReason("spill reason", "Returns the byte-exact artifact spill reason.") {
+		Render => "render",
+		Verdict => "verdict",
+	}
+}
+
+vocab! {
+	/// Mutation applied to the session branch tree.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum BranchOp("branch operation", "Returns the byte-exact branch operation.") {
+		Create => "create",
+		Switch => "switch",
+		Merge => "merge",
+		Delete => "delete",
+	}
+}
+
+vocab! {
+	/// Cause of an agent-context compaction.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum CompactionReason("compaction reason", "Returns the byte-exact compaction reason.") {
+		ContextLimit => "context_limit",
+		Manual => "manual",
+		Policy => "policy",
+	}
+}
+
+vocab! {
+	/// Framing protocol used by a declarative export target.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum ExportProtocol("export protocol", "Returns the byte-exact export protocol.") {
+		OtlpHttp => "otlp_http",
+		OtlpGrpc => "otlp_grpc",
+		Jsonl => "jsonl",
+	}
+}
+
+vocab! {
+	/// Lifecycle state of a durable AutoQA issue.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum IssueStatus("issue status", "Returns the byte-exact issue status.") {
+		Open => "open",
+		Confirmed => "confirmed",
+		FalsePositive => "false_positive",
+		Fixed => "fixed",
+		Duplicate => "duplicate",
+	}
+}
+
+vocab! {
+	/// User disposition for an AutoQA issue's external submission.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum Consent("consent", "Returns the byte-exact consent state.") {
+		Local => "local",
+		Shared => "shared",
+		Pending => "pending",
+	}
+}
+
+vocab! {
+	/// Core-side data-capture level for a telemetry subscriber.
+	#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
+	pub enum Capture("capture level", "Returns the byte-exact capture level.") {
+		None => "none",
+		Usage => "usage",
+		#[default]
+		Structure => "structure",
+		Content => "content",
+	}
+}
+
+vocab! {
+	/// Durable retention tier enforced by core-side garbage collection.
+	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+	pub enum RetentionTier("retention tier", "Returns the byte-exact retention tier.") {
+		Session => "session",
+		Project => "project",
+		Audit => "audit",
+	}
 }
 
 vocab! {

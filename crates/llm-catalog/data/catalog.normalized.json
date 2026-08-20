@@ -5846,7 +5846,8 @@
       "label": "LM Studio (Local OpenAI-compatible)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-0378457d5a28a403173b00283e06353a335760d6a1848b54206f672e6e13b585",
@@ -5854,7 +5855,8 @@
       "label": "Anthropic",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-04a5685ec828dd3ffcb539266631cf2cbb2cf4e94da6704a15e6460627c4bc26",
@@ -5862,7 +5864,8 @@
       "label": "ChatGPT Plus/Pro (Codex, headless/device)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-065440f373d5a5e63cfc0ddec333fb99b7c0f24146cc916e4f8e4b94774deabb",
@@ -5870,7 +5873,8 @@
       "label": "GMI Cloud",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-153008cb8fa8d03db9fc04902a5aa08540aec87758c8de532d8095d443b45216",
@@ -5878,7 +5882,8 @@
       "label": "Sakana AI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-165bf20e270e951831609a7a0ac42693086be6b5a8dcc668f14c5c652d4b4f52",
@@ -5886,7 +5891,8 @@
       "label": "Cohere",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-167f6c2cd3b48107fe55a600b1adcf07f11c4947cb534cc88cf4663308428fe8",
@@ -5894,7 +5900,8 @@
       "label": "QwenCloud Token Plan",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-18aab6a2faae57086664a0710d42ec18777ff7c22222a00747a9104794e9af34",
@@ -5902,7 +5909,8 @@
       "label": "Xiaomi Token Plan (Singapore)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-1ad50f98aa10080a5ce83188c3f2dc8a410a528a335836c0ff6e12ea44c8c920",
@@ -5910,7 +5918,8 @@
       "label": "Cursor",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-1bb2b70c8e05c3c3c1025a067377b9d318713b804eaeb2302e4f605fe8d4b7e7",
@@ -5918,7 +5927,8 @@
       "label": "Google Gemini",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-1c7d096a1a29c5197bbd4e1f911d0501d22f45b514e783cf41d62b4d15c582b3",
@@ -5926,7 +5936,8 @@
       "label": "Amazon Bedrock",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-25089b521949e4a642bb405e6ebca1c1f851023d12732d9f44acabde41f942e1",
@@ -5934,7 +5945,8 @@
       "label": "xAI API",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-261323993fb8b12e30fbcee4c3f2a24fce4128ec679c829c74885075a67371b7",
@@ -5942,7 +5954,8 @@
       "label": "Moonshot",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-261f2376863950c3f1c3f4a04827f74b052ad0439283bacb5b55e7f3e9f51a2a",
@@ -5950,7 +5963,8 @@
       "label": "Zhipu Coding Plan",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-2b2f05dab32b5fa832012bc1f76786da182d7e66b1ef4362aac972b6c6af5b1b",
@@ -5958,7 +5972,8 @@
       "label": "Vercel AI Gateway",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-2bbc479995dde099ba948c664108a0aa11e7aa3150b61cb1a38b7d0222bb0f73",
@@ -5966,7 +5981,8 @@
       "label": "Alibaba Coding Plan",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-2d8b55819ab4fe9735f0694e36534cabec8f2034455ecd8abcaef5ec3565dc0e",
@@ -5974,7 +5990,8 @@
       "label": "FriendliAI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-33140050393a9dcd06e72ee1b028be3e9a16d35f006847f60e97bf71d4948353",
@@ -5982,7 +5999,8 @@
       "label": "Qianfan",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-3a32d3b93b22bf2b2841316b7f98ff78f2b88eef750ec54f427fb43ef957abed",
@@ -5990,7 +6008,8 @@
       "label": "ai&",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-422d4b7a1ef05728b5e7d3140c1e7a0c66b2495ec4937ec63b81cf1deba24241",
@@ -5998,7 +6017,8 @@
       "label": "OpenCode Go",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-42f179f0391cf043d28f0e84938aa7d8883f706e872462d762712b8746481439",
@@ -6006,7 +6026,8 @@
       "label": "Cloudflare AI Gateway",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-442052750efc77f8bee93e8e2e49173af9ed89a89dae845742563805db325a45",
@@ -6014,7 +6035,8 @@
       "label": "GitLab Duo Agent",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-459fccaf105e3bcc1ad3e2b4d64bbea2a0a128334010ef2805cb1a4c37ab22eb",
@@ -6022,7 +6044,8 @@
       "label": "CrofAI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-489e1ad4c5fa1ae969be5df042ec1b4e4dd6eaf2dc217fe7396e58ddd5dd908b",
@@ -6030,7 +6053,8 @@
       "label": "Meta Model API",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-497c6b7e0f6d1cc73d978f835ff89660c7802d88164c36daaff69fcd149794a3",
@@ -6038,7 +6062,8 @@
       "label": "Novita",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-4b0acc0e09403a0a92ff27c58e47120c73cb1dee26889b82a671c37665f9ecd4",
@@ -6046,7 +6071,8 @@
       "label": "Kilo Gateway",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-4cf242a040c9fdd8d3acb41c41c09e33388f7a42d121493048a1b7d6080ad8f8",
@@ -6054,7 +6080,8 @@
       "label": "Agnes AI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-4e905c1f66c4c09ced78d411e9e4826f79057debd1bfd43fb1dbad61623f53eb",
@@ -6062,7 +6089,8 @@
       "label": "zAI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-55d51cf03d444217b24390f59ebe1a524b8bcc28790af7459b9b435a01437a76",
@@ -6070,7 +6098,8 @@
       "label": "vLLM",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-57d52ab6d0e98aa3d01a65ec9ce29228c266344b856fc4add2d719d9e65e7877",
@@ -6078,7 +6107,8 @@
       "label": "GitHub Copilot",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-58ced37d5b986a9e49ce09be1f9c67e9029db87c9ed41af6529b181d96a055cf",
@@ -6086,7 +6116,8 @@
       "label": "Xiaomi",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-58fff4218c74030c5e34f37461302c95404264998c094941d471bdb6585db1f5",
@@ -6094,7 +6125,8 @@
       "label": "Antigravity (Gemini 3, Claude, GPT-OSS)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-5db75c735269c91fec40181976789f94bc2836792afcc0e9dceffa6a2755d619",
@@ -6102,7 +6134,8 @@
       "label": "OpenAI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-5f348d963545b9a507e372db5f5e43c87a654cf166ea87c9ff4eda5608d9594c",
@@ -6110,7 +6143,8 @@
       "label": "NanoGPT",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-6562ce978d732328c825e76e769f9431d39532b1a3094434f53e59e7f80c6684",
@@ -6118,7 +6152,8 @@
       "label": "xAI Grok OAuth (SuperGrok)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-6907adac4036aa4cc8744accaa70b31cdb3f7d367c225c8cdcca504fd34cf120",
@@ -6126,7 +6161,8 @@
       "label": "Hugging Face",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-6a8ffe173803e7bc3758296d32a683c6dde369c610e8d3e8067efa2b4b6684a3",
@@ -6134,7 +6170,8 @@
       "label": "Sarvam AI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-6b401eac8b8dd7d2c4ddcdafe14adb0fa44a027224cf84244dd7217446429750",
@@ -6142,7 +6179,8 @@
       "label": "Ollama (Local OpenAI-compatible)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-6bd286823990850d025bded3ab18c92bc1ad55a8aac0dc0d58def5f24d4cbf58",
@@ -6150,7 +6188,8 @@
       "label": "Groq",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-6ecdbe703eef963b39b6a604a37f6e65b583c4dfead674172524257db87eb437",
@@ -6158,7 +6197,8 @@
       "label": "Scaleway Generative AI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-7571f05a0eddfd1c7f2993ca49b311143cffe282f00049832484d32c38eb2c8d",
@@ -6166,7 +6206,8 @@
       "label": "StepFun",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-790d185504f674bbb81f87514cc1f48b928feba64c0b6af2fbcb9838ecf2b9df",
@@ -6174,7 +6215,8 @@
       "label": "LiteLLM",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-793a77cda5fe300ea311f29529ed9f0d9364676358d8a3065a6c72c71ec07862",
@@ -6182,7 +6224,8 @@
       "label": "ChatGPT Plus/Pro (Codex Subscription)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-79c04a726c9ed92f7ea55754edede904349a90f65664828a2336c6cdc6b1e935",
@@ -6190,7 +6233,8 @@
       "label": "Wafer Serverless",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-7f3e9a73763a9e33f0f81608b699d274afe1d1b38b029828e6c93e0d90b5c5cd",
@@ -6198,7 +6242,8 @@
       "label": "Venice",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-8313e2c967aacc7ea58a631b3d02a7aee804f6d5087e8aa19094084cfb26a838",
@@ -6206,7 +6251,8 @@
       "label": "NVIDIA",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-875b217694e44dcd7df801d7821a5c864470f864b61e33c317aa9b0fab5ad403",
@@ -6214,7 +6260,8 @@
       "label": "Agnes AI (Token Plan)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-8e53efb7d064fb6e697f2998efdbd03be533bbe75a07078f6f68929974b7747b",
@@ -6222,7 +6269,8 @@
       "label": "StepFun (Step Plan)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-9060ffb58e0cdb683fadd465a92ff9f373677c60b7824d00e7c72813dc346858",
@@ -6230,7 +6278,8 @@
       "label": "SiliconFlow (China)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-90b301131dc489b30258f884e9c71c1232331e5c45dcc25acd24ede75a748b2d",
@@ -6238,7 +6287,8 @@
       "label": "Kimi Code",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-90bd6ccb098e1cbb37157aece7e4082358e27c328656ca0061240311029efcc0",
@@ -6246,7 +6296,8 @@
       "label": "Fireworks",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-9519c64454a0d7a7094ec788915f8513c9fe57bd3576dda61bcc9d859df35e25",
@@ -6254,7 +6305,8 @@
       "label": "Apple Intelligence",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-96fe4307549b08a61d78253198b96347af601e884695ca79a8d7b1726e2adc33",
@@ -6262,7 +6314,8 @@
       "label": "Ollama Cloud",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-97ef6adf334a6968f6b61dae201a106130861934ec33f8405b82f6ca7d8f6536",
@@ -6270,7 +6323,8 @@
       "label": "Baseten",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-9964b3b50ea39cd87f315068ec053f0534e78a3233cff4ac47e2fe3e6efe0279",
@@ -6278,7 +6332,8 @@
       "label": "Devin",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-9c730ea16f9b28d17f8f33bdf01ea03290b68f1c8ca96f7e99fe09d5e9d8d637",
@@ -6286,7 +6341,8 @@
       "label": "Google Vertex AI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-a381fdf23380175f33d5777b4ceb2f157b39ac8d05014b0c4ac1d4cab8df8ca3",
@@ -6294,7 +6350,8 @@
       "label": "DeepSeek",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-a3bd3e89cdad90f23f9d2e8e5797c05046e42e3ce4f98ed5e829c8dfb614b2a9",
@@ -6302,7 +6359,8 @@
       "label": "Synthetic",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-ac91c087a3b5bbacb7f904790b23d98a7022a5849858f5c2c67b558722baa9f9",
@@ -6310,7 +6368,8 @@
       "label": "SiliconFlow",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-acf93eec6d28d1ecf104a785b92753d3c4090c4fd6e0c099643d805e61992ad8",
@@ -6318,7 +6377,8 @@
       "label": "DeepInfra",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-aff95e23abe3e55865069710435429b7d19e33f13670e147f8a8b80d774dfd2e",
@@ -6326,7 +6386,8 @@
       "label": "Cerebras",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-b1c38153e232b0d4b4b90fdf0cbf261147b55c84874878289ea194541a0df63d",
@@ -6334,7 +6395,8 @@
       "label": "Inception Labs",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-b76b2133b8b23a7d9b07f44fb8ff51c36b1bc55b954a3bcbaaab63386fa76d5e",
@@ -6342,7 +6404,8 @@
       "label": "Together",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-b88148cf69b86c5366c775fc1f853f95f48f499da5074751dae354da4b059a1e",
@@ -6350,7 +6413,8 @@
       "label": "Poolside",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-ba50643c55269e8dd05dd083a79e5e970d972c48683c0f69f16d151f90333aa9",
@@ -6358,7 +6422,8 @@
       "label": "OVH AI Endpoints",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-ba63c6ba76abe0a5795a9365d02dad245fb8da9ca2db86d67ad0fe849b41b3ad",
@@ -6366,7 +6431,8 @@
       "label": "ZenMux",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-c0a17b20aff71efd1047ff183f4f4badf72aa348b5af034c2a701c374e7e0d28",
@@ -6374,7 +6440,8 @@
       "label": "GigaChat",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-c14ad351c1a7eb6db81e9e18d8ac61ba9699982e5b5402c83fba5d355f9a4d46",
@@ -6382,7 +6449,8 @@
       "label": "Xiaomi Token Plan (China)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-c4d0529afc98a3269f5c0020850b615702fc341bcb5ed04195324442a0ab66da",
@@ -6390,7 +6458,8 @@
       "label": "OpenRouter",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-c6b1b02f6f5d905f7be3825805a02990f0bf0f974b18e2d8b53200861a2027a7",
@@ -6398,7 +6467,8 @@
       "label": "AIML API",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-c818cb97cf9cde62321b455167656488d7b9ac3ddf4c7126c3a2db418700cd2b",
@@ -6406,7 +6476,8 @@
       "label": "Yandex Cloud AI",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-cb6affc4ece81e94ac895ea9c2f3596b6c0b1ad788e456e6058380cc0eda9129",
@@ -6414,7 +6485,8 @@
       "label": "Umans AI Coding Plan",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-e225f446de1e6bf517c05e12f0b92410e211e27682419f34a6d2c32d7420e496",
@@ -6422,7 +6494,8 @@
       "label": "Qwen Portal",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-ec14f4e7cdfa177200db5744a2b5673a03706d073ab9df6591d1dbf3b2d53b37",
@@ -6430,7 +6503,8 @@
       "label": "CoreWeave Serverless Inference",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-ecaf266ef9636fce4bda74be3089d74160c1f610b18e4e217ffc92c02988327b",
@@ -6438,7 +6512,8 @@
       "label": "Fire Pass (Fireworks Kimi K2.6 Turbo subscription)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-f199b635ab36893851478e34c8dc4643f445ac46205a5cb9aeccf4c17d94308f",
@@ -6446,7 +6521,8 @@
       "label": "Google Cloud Code Assist (Gemini CLI)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-f2f76c0b03758f004dbf7e205b31e4a9fc1a7c8c2790b0e69be5b2b10de90ed9",
@@ -6454,7 +6530,8 @@
       "label": "OpenCode Zen",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     },
     {
       "id": "discovery-f6b9b7d4f7ee51a6eb3f53f7e130d3135efd9d9c7bb0f23ae39c534b746bab93",
@@ -6462,7 +6539,8 @@
       "label": "Mistral",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-f9143a4e360dc4eae42540f2cb205e8be6a64bca99d3ab966cdfcc254581ec69",
@@ -6470,7 +6548,8 @@
       "label": "Xiaomi Token Plan (Europe)",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": false
+      "authoritative": false,
+      "interval": null
     },
     {
       "id": "discovery-fe15209c53c75ce9412548294ebbe8f4ee7fcd3e1237bc5bea33f0235ca10361",
@@ -6478,7 +6557,8 @@
       "label": "Amazon Bedrock Mantle",
       "path": "/models",
       "pagination": "single_page",
-      "authoritative": true
+      "authoritative": true,
+      "interval": null
     }
   ],
   "routes": [

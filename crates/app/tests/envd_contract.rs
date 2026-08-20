@@ -636,8 +636,10 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	assert_eq!(registry.slot_hash(), agent_registry.slot_hash());
 	let advertised = registry
 		.advertise(LoweringCaps {
-			strict_schema: true,
-			grammar:       omp_llm_catalog::GrammarBits::empty(),
+			strict_schema:  true,
+			grammar:        omp_llm_catalog::GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
 		})
 		.expect("advertise production registry");
 	let identities = advertised
@@ -1602,8 +1604,10 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 		.server
 		.registry()
 		.advertise(LoweringCaps {
-			strict_schema: true,
-			grammar:       omp_llm_catalog::GrammarBits::empty(),
+			strict_schema:  true,
+			grammar:        omp_llm_catalog::GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
 		})
 		.expect("advertise UDS registry");
 	assert!(
@@ -1690,8 +1694,10 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 	let registry = harness.server.registry();
 	let advertised = registry
 		.advertise(LoweringCaps {
-			strict_schema: true,
-			grammar:       omp_llm_catalog::GrammarBits::empty(),
+			strict_schema:  true,
+			grammar:        omp_llm_catalog::GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
 	assert_eq!(advertised.len(), 8);

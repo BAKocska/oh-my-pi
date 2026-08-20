@@ -59,6 +59,7 @@ use crate::{
 		admission::{AdmissionController, AdmissionLayer},
 		auth::{AuthLeaseLayer, LeaseProvider},
 		encode::{AttemptEncoder, CredentialApplier, CredentialApplyLayer},
+		hook::ProviderErrorLayer,
 		intent::{IntentLayer, IntentPlanner},
 		operation::{EmbeddingRoutePolicy, OperationPolicyConfig, OperationPolicyLayer},
 		rate::{RateLayer, RateLimiter},
@@ -391,6 +392,7 @@ impl RouteComposer for ProductionRouteComposer {
 			rate: RateLayer::new(PoolRateLimiter { pool: self.dependencies.accounts.clone() }),
 			encode: crate::layer::encode::EncodeLayer::new(encoder, false),
 			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier { auth: runtime_auth }),
+			provider_error: ProviderErrorLayer::new(),
 		});
 		Ok(RouteProviderService::new(stack))
 	}
@@ -902,9 +904,7 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 				provider: plan.provider.clone(),
 				route: plan.route.clone(),
 				account: account.as_ref().and_then(|routing| routing.account.clone()),
-				principal: account
-					.as_ref()
-					.and_then(|routing| routing.principal.clone()),
+				principal: Some(call.attribution.principal.clone()),
 				index: attempt,
 				provisional,
 				capture_limit: call.budget.max_staging_bytes,
@@ -1395,6 +1395,7 @@ mod tests {
 			deadline: None,
 			budget,
 			session: None,
+			attribution: crate::call::InferenceAttribution::core(),
 			execution: Some(Arc::new(plan)),
 			operation,
 		};

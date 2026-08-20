@@ -7,6 +7,12 @@ use rustc_hash::FxHashMap;
 
 use crate::semconv::ToolStatus;
 
+/// The full-fidelity wire shape is the single in-process provider-usage truth.
+///
+/// [`Usage`] below is deliberately only a metrics projection; callers retain
+/// this type for firehose records and durable telemetry rows.
+pub type InferenceUsage = omp_proto::omp::inference::v1::Usage;
+
 /// Raw record for one completed chat step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatRecord {
@@ -125,6 +131,23 @@ pub struct Usage {
 	pub reasoning_output: u64,
 	/// Total tokens.
 	pub total:            u64,
+}
+
+/// Projects full provider usage into the six metrics buckets without
+/// allocating or discarding the source record.
+impl From<&InferenceUsage> for Usage {
+	fn from(value: &InferenceUsage) -> Self {
+		Self {
+			input:            value.input_tokens,
+			output:           value.output_tokens,
+			cached_input:     value.cache_read_tokens,
+			cache_write:      value.cache_write_tokens,
+			reasoning_output: value.reasoning_tokens.unwrap_or_default(),
+			total:            value
+				.total_tokens
+				.unwrap_or_else(|| value.input_tokens.saturating_add(value.output_tokens)),
+		}
+	}
 }
 
 /// Cost portion of a run summary.

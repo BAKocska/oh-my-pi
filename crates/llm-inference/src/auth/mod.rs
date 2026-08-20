@@ -11,6 +11,7 @@ pub mod lease;
 pub mod login;
 pub mod manager;
 pub mod oauth;
+pub mod scope;
 pub mod shape;
 pub mod sigv4;
 pub mod spec;
@@ -56,6 +57,7 @@ pub use oauth::{
 	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthProviderCode, OAuthTokenSet,
 	OAuthTransportError, PkcePending, SystemEntropySource, SystemOAuthClock, SystemOAuthHttpClient,
 };
+pub use scope::{CredentialGrants, CredentialScope, CredentialScopeError};
 pub use shape::{
 	CredentialShaperRegistry, DuplicateShaperError, ProviderShapeFuture, ProviderShaper,
 	ShapedCredential,

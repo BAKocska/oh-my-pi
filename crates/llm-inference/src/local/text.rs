@@ -102,6 +102,87 @@ pub struct TextGeneration {
 	pub receipt:       LocalExecutionReceipt,
 }
 
+/// Bounded vocabulary for a local classifier response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassifierLadder {
+	labels: Arc<[Str]>,
+}
+
+impl ClassifierLadder {
+	/// Validates a non-empty, duplicate-free classifier vocabulary.
+	pub fn new(labels: Arc<[Str]>) -> LocalResult<Self> {
+		if labels.is_empty()
+			|| labels.iter().any(Str::is_empty)
+			|| labels
+				.iter()
+				.enumerate()
+				.any(|(index, label)| labels[..index].contains(label))
+		{
+			return Err(LocalError::new(
+				LocalErrorKind::InvalidInput,
+				"classifier ladder requires unique non-empty labels",
+			));
+		}
+		Ok(Self { labels })
+	}
+
+	/// Borrows the accepted labels in their deterministic ladder order.
+	#[must_use]
+	pub fn labels(&self) -> &[Str] {
+		&self.labels
+	}
+
+	fn instruction(&self) -> Str {
+		let mut instruction = String::from("Reply with exactly one of: ");
+		for (index, label) in self.labels.iter().enumerate() {
+			if index != 0 {
+				instruction.push_str(", ");
+			}
+			instruction.push_str(label);
+		}
+		instruction.push('.');
+		instruction.into()
+	}
+
+	fn parse(&self, output: &str) -> Option<Str> {
+		self
+			.labels
+			.iter()
+			.enumerate()
+			.filter_map(|(index, label)| {
+				output
+					.find(label.as_str())
+					.map(|offset| (offset, index, label))
+			})
+			.min_by_key(|(offset, index, _)| (*offset, *index))
+			.map(|(_, _, label)| label.clone())
+	}
+
+	fn contains(&self, label: &Str) -> bool {
+		self.labels.contains(label)
+	}
+}
+
+/// Provenance of a classifier decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClassifierDecisionSource {
+	/// The constrained local model emitted an accepted label.
+	Model,
+	/// The model did not yield an accepted label, so the prior decision held.
+	Previous,
+	/// The model failed and the caller's deterministic heuristic decided.
+	Heuristic,
+}
+
+/// A classifier result that can never silently fail open.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassifierDecision {
+	/// Accepted ladder label.
+	pub label:  Str,
+	/// Whether the label came from the model or a deterministic fallback.
+	pub source: ClassifierDecisionSource,
+}
+
 struct LlamaEngine {
 	backend:        LlamaBackend,
 	model:          LlamaModel,
@@ -180,6 +261,60 @@ impl TextAdapter {
 			})
 		})?;
 		Ok(TextGeneration { content: content.into(), prompt_tokens, output_tokens, receipt })
+	}
+
+	/// Runs a classifier through a closed output ladder.
+	///
+	/// Any transport, model, or parsing failure retains a valid previous
+	/// decision when available and otherwise uses the caller-provided
+	/// deterministic heuristic. It never substitutes a permissive label.
+	pub fn classify(
+		&self,
+		messages: &[ChatMessage],
+		ladder: &ClassifierLadder,
+		previous: Option<&Str>,
+		heuristic: &Str,
+		cancel: &LocalCancellation,
+	) -> LocalResult<ClassifierDecision> {
+		let fallback = previous
+			.filter(|label| ladder.contains(label))
+			.map(|label| ClassifierDecision {
+				label:  label.clone(),
+				source: ClassifierDecisionSource::Previous,
+			})
+			.or_else(|| {
+				ladder.contains(heuristic).then(|| ClassifierDecision {
+					label:  heuristic.clone(),
+					source: ClassifierDecisionSource::Heuristic,
+				})
+			})
+			.ok_or_else(|| {
+				LocalError::new(
+					LocalErrorKind::InvalidInput,
+					"classifier fallback must be a label in its ladder",
+				)
+			})?;
+		let mut constrained = Vec::with_capacity(messages.len().saturating_add(1));
+		constrained.push(ChatMessage { role: ChatRole::System, content: ladder.instruction() });
+		constrained.extend_from_slice(messages);
+		let output = self.generate(
+			&constrained,
+			GenerationOptions {
+				max_tokens:  16,
+				temperature: None,
+				seed:        0,
+				stop:        Vec::new(),
+			},
+			cancel,
+			|_| true,
+		);
+		Ok(output
+			.ok()
+			.and_then(|response| ladder.parse(response.content.as_str()))
+			.map_or(fallback, |label| ClassifierDecision {
+				label,
+				source: ClassifierDecisionSource::Model,
+			}))
 	}
 
 	/// Unloads the model when no call is active and its idle interval elapsed.
@@ -433,4 +568,29 @@ fn validate_request(messages: &[ChatMessage], options: &GenerationOptions) -> Lo
 		));
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use omp_core::Str;
+
+	use super::ClassifierLadder;
+
+	#[test]
+	fn classifier_ladder_uses_earliest_accepted_label() {
+		let ladder =
+			ClassifierLadder::new([Str::from("deny"), Str::from("allow"), Str::from("review")].into())
+				.expect("valid ladder");
+		assert_eq!(ladder.parse("explain allow, then deny"), Some(Str::from("allow")));
+		assert_eq!(ladder.parse("unrecognized"), None);
+		assert_eq!(ladder.instruction(), "Reply with exactly one of: deny, allow, review.");
+	}
+
+	#[test]
+	fn classifier_ladder_rejects_an_open_vocabulary() {
+		assert!(ClassifierLadder::new(Arc::from([Str::from("allow"), Str::from("allow")])).is_err());
+		assert!(ClassifierLadder::new(Arc::from([])).is_err());
+	}
 }

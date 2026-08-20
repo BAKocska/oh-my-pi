@@ -47,6 +47,7 @@ use super::{
 	exec::{ExecError, ExecEvent, ExecHost, ProcessEvent},
 	journal_runtime::ExternalJournalActor,
 	policy::{AuthorityTable, DataAuthority, Grants, PolicyError, QuotaAccount},
+	site::{SiteError, SiteMaterializer, record_modules},
 	tools::production_registry,
 	worker::{
 		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, JournalRuntime, OpenToolCall,
@@ -372,6 +373,7 @@ pub struct EnvServer {
 	exec:                ExecHost,
 	workspace:           WorkspaceHost,
 	blobs:               BlobHost,
+	sites:               SiteMaterializer,
 	registry:            Arc<Registry>,
 	workspace_ops:       WorkspaceOperations,
 	ext_hosts:           Arc<ExtHostSupervisor>,
@@ -432,6 +434,7 @@ impl EnvServer {
 		exec: ExecHost,
 		workspace: WorkspaceHost,
 		blobs: BlobHost,
+		sites: SiteMaterializer,
 		registry: Arc<Registry>,
 		workspace_ops: WorkspaceOperations,
 		ext_hosts: Arc<ExtHostSupervisor>,
@@ -448,6 +451,7 @@ impl EnvServer {
 			exec,
 			workspace,
 			blobs,
+			sites,
 			registry,
 			workspace_ops,
 			ext_hosts,
@@ -497,6 +501,8 @@ impl EnvServer {
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
+			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
 		let project_path = Str::from(workspace.root().to_string_lossy().as_ref());
 		let journal_external = ExternalJournalActor::spawn(
@@ -539,6 +545,7 @@ impl EnvServer {
 			exec,
 			workspace,
 			blobs,
+			sites,
 			registry,
 			workspace_ops,
 			ext_hosts,
@@ -574,6 +581,8 @@ impl EnvServer {
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
+			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
 		let project_path = Str::from(root.to_string_lossy().as_ref());
 		let journal_external = ExternalJournalActor::spawn(
@@ -616,6 +625,7 @@ impl EnvServer {
 			exec,
 			workspace,
 			blobs,
+			sites,
 			registry,
 			workspace_ops,
 			ext_hosts,
@@ -685,6 +695,17 @@ impl EnvServer {
 			Ok(())
 		});
 		Ok((client, task))
+	}
+
+	/// Enforces persisted RECORD ownership before a trusted extension imports a
+	/// module from its materialized site tree.
+	pub(crate) fn require_record_owner(
+		&self,
+		site_key: &str,
+		module: impl Into<Str>,
+		owner: impl Into<Str>,
+	) -> Result<(), SiteError> {
+		self.sites.require_record_owner(site_key, module, owner)
 	}
 
 	/// Returns the exact registry shared by this server's dispatch paths.
@@ -1778,8 +1799,87 @@ impl EnvServer {
 					.dispatch_worktree(request_id, request, scope, responses, connection)
 					.await;
 			},
-			Some(Body::Site(_)) => {
-				send_unsupported_data(responses, request_id, "site materialization").await;
+			Some(Body::Site(request)) => {
+				if !authorize_data_operation(
+					connection,
+					scope,
+					"omp.env.site.materialize",
+					"env.site",
+					responses,
+					request_id,
+				)
+				.await
+				{
+					return;
+				}
+				if connection.host.is_some() {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::PermissionDenied,
+						"site trees and their store are installer-owned and read-only to extensions",
+					)
+					.await;
+					return;
+				}
+				let module_paths = record_modules(&request.files);
+				match self.sites.materialize(request) {
+					Ok(materialized) => {
+						for module in module_paths {
+							if let Err(error) = self.require_record_owner(
+								&materialized.site_key,
+								module,
+								&materialized.site_key,
+							) {
+								send_error(
+									responses,
+									request_id,
+									pb::ProtocolErrorCode::PermissionDenied,
+									&error.to_string(),
+								)
+								.await;
+								return;
+							}
+						}
+						send_data_response(
+							responses,
+							request_id,
+							pb::data_response::Body::Site(materialized),
+						)
+						.await;
+					},
+					Err(
+						error @ (SiteError::InvalidSiteKey
+						| SiteError::InvalidFilePath(_)
+						| SiteError::InvalidBlobHash),
+					) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							&error.to_string(),
+						)
+						.await;
+					},
+					Err(error @ SiteError::TrustedLoad(_)) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::PermissionDenied,
+							&error.to_string(),
+						)
+						.await;
+					},
+					Err(error) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::Internal,
+							&error.to_string(),
+						)
+						.await;
+					},
+				}
 			},
 			Some(Body::DetachExec(request)) => {
 				if !authorize_data_operation(
@@ -5509,7 +5609,9 @@ mod tests {
 			None,
 			exec,
 			workspace,
-			blobs,
+			blobs.clone(),
+			SiteMaterializer::open(state.path().join("ext"), blobs.store().clone())
+				.expect("site materializer"),
 			Arc::new(Registry::new()),
 			workspace_ops,
 			Arc::new(ext_hosts),
@@ -5587,8 +5689,9 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn data_document_open_read_and_unsupported_are_typed() {
-		let (requests, responses, root, _state) = test_connection(&["env.doc.read"]).await;
+	async fn extension_site_write_is_refused_even_with_grant() {
+		let (requests, responses, root, _state) =
+			test_connection(&["env.doc.read", "env.site"]).await;
 		let path = root.path().join("sample.txt");
 		std::fs::write(&path, b"hello document").expect("write document");
 		let uri = Url::from_file_path(&path)
@@ -5654,12 +5757,12 @@ mod tests {
 		requests
 			.send_async(data_frame(3, pb::data_request::Body::Site(pb::MaterializeSite::default())))
 			.await
-			.expect("send unsupported stat");
-		let unsupported = responses.recv_async().await.expect("unsupported response");
+			.expect("send extension site write");
+		let denied = responses.recv_async().await.expect("site refusal response");
 		assert!(matches!(
-			unsupported.body,
+			denied.body,
 			Some(server_frame::Body::Error(pb::ProtocolError { code, .. }))
-				if code == pb::ProtocolErrorCode::Unsupported as i32
+				if code == pb::ProtocolErrorCode::PermissionDenied as i32
 		));
 	}
 

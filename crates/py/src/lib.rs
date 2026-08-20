@@ -62,6 +62,17 @@ static STDLIB_BLOB: &[u8] = include_bytes!(env!("OMP_STDLIB_BLOB"));
 /// interpreter.
 static OMP_MODULES_BLOB: &[u8] = include_bytes!(env!("OMP_PY_MODULES_BLOB"));
 
+include!(env!("OMP_PY_FROZEN_DISTRIBUTIONS"));
+
+/// Returns the exact distributions frozen into this binary.
+///
+/// Resolver rule R7 reads this runtime metadata rather than duplicating a
+/// requirements list in application code.
+#[must_use]
+pub const fn frozen_distributions() -> &'static [(&'static str, &'static str)] {
+	FROZEN_DISTRIBUTIONS
+}
+
 /// License notices for bundled third-party Python packages
 /// (`crates/py/requirements.txt`).
 ///
@@ -131,14 +142,14 @@ impl Builder {
 		bindings::register();
 		install_frozen_modules();
 		init_python(&site_c);
-		Ok(Engine { _priv: () })
+		Ok(Engine { site_packages: site })
 	}
 }
 
 /// Handle to the booted interpreter; proof that [`Builder::init`] ran.
 #[derive(Debug)]
 pub struct Engine {
-	_priv: (),
+	site_packages: PathBuf,
 }
 
 impl Engine {
@@ -154,6 +165,15 @@ impl Engine {
 		F: for<'py> FnOnce(Python<'py>) -> R,
 	{
 		Python::attach(f)
+	}
+
+	/// Returns the sole resolved filesystem entry on `sys.path`.
+	///
+	/// The returned path is read-only; changing the search path after isolated
+	/// initialization would violate the one-entry embedding contract.
+	#[must_use]
+	pub fn site_packages(&self) -> &std::path::Path {
+		&self.site_packages
 	}
 }
 

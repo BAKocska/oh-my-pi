@@ -5,12 +5,12 @@ use std::{
 	collections::BTreeMap,
 	hash::{Hash, Hasher},
 	str::FromStr,
-	sync::LazyLock,
+	sync::{Arc, LazyLock},
 };
 
 use omp_core::{
 	ActivateReason, AgentUrl, ArtifactUrl, ClientPath, Duration, DurationUnit, EnvPath, HistoryUrl,
-	InvocationPhase, LifecyclePhase, Principal, RestartReason, Str, WorkspaceUri,
+	InvocationPhase, LifecyclePhase, Principal, RestartReason, Secret, Str, WorkspaceUri,
 };
 use omp_env::WorkerEnvClient;
 use omp_storage::state::StateScope;
@@ -21,8 +21,8 @@ use pyo3::{
 	exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError},
 	pyclass, pyfunction, pymethods, pymodule,
 	types::{
-		PyAnyMethods, PyBytes, PyDict, PyList, PyListMethods, PyModule, PyModuleMethods, PyTuple,
-		PyTupleMethods,
+		PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyList, PyListMethods, PyModule,
+		PyModuleMethods, PyTuple, PyTupleMethods,
 	},
 	wrap_pyfunction,
 };
@@ -262,6 +262,62 @@ impl PyDuration {
 /// Creates the immutable Python view of a configured core duration.
 pub fn bind_duration(py: Python<'_>, duration: Duration) -> PyResult<Py<PyAny>> {
 	Ok(Py::new(py, PyDuration(duration))?.into_any())
+}
+
+/// Opaque Python secret whose representation never reveals its bytes.
+///
+/// Raw bytes are available only from the temporary value yielded by
+/// [`Self::use_`]; callers must use that context manager rather than logging
+/// this object.
+#[pyclass(name = "Secret", frozen, module = "_omp")]
+#[derive(Debug)]
+struct PySecret(Arc<Secret>);
+
+#[pymethods]
+impl PySecret {
+	#[new]
+	fn new(bytes: &Bound<'_, PyBytes>) -> Self {
+		Self(Arc::new(Secret::from(bytes.as_bytes().to_vec())))
+	}
+
+	/// Returns a context manager which temporarily yields the secret bytes.
+	#[pyo3(name = "use")]
+	fn use_(&self) -> PySecretUse {
+		PySecretUse(Arc::clone(&self.0))
+	}
+
+	fn __str__(&self) -> &'static str {
+		"<redacted>"
+	}
+
+	fn __repr__(&self) -> &'static str {
+		"Secret(<redacted>)"
+	}
+
+	fn __format__(&self, _format_spec: &str) -> &'static str {
+		"<redacted>"
+	}
+}
+
+/// Short-lived Python context manager for a [`PySecret`] exposure.
+#[pyclass(frozen, module = "_omp")]
+#[derive(Debug)]
+struct PySecretUse(Arc<Secret>);
+
+#[pymethods]
+impl PySecretUse {
+	fn __enter__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+		self.0.expose(|bytes| PyBytes::new(py, bytes))
+	}
+
+	fn __exit__(
+		&self,
+		_exc_type: Option<&Bound<'_, PyAny>>,
+		_exc_value: Option<&Bound<'_, PyAny>>,
+		_traceback: Option<&Bound<'_, PyAny>>,
+	) -> bool {
+		false
+	}
 }
 
 /// Canonical ordered Python invocation phase.
@@ -1109,6 +1165,8 @@ pub fn register() {
 #[pymodule(gil_used = false)]
 fn _omp(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 	module.add_class::<PyDuration>()?;
+	module.add_class::<PySecret>()?;
+	module.add_class::<PySecretUse>()?;
 	module.add_class::<PyInvocationPhase>()?;
 	module.add_class::<PyLifecyclePhase>()?;
 	module.add_class::<PyDurability>()?;

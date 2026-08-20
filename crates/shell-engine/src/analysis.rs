@@ -263,10 +263,7 @@ impl<'a> Analyzer<'a> {
 					// isolated process cwd. Reassert this at the caller boundary as well as
 					// in `compound` so nested lists cannot leak a `cd`.
 					if stage != last
-						|| matches!(
-							command,
-							ast::Command::Compound(ast::CompoundCommand::Subshell(_), _)
-						)
+						|| matches!(command, ast::Command::Compound(ast::CompoundCommand::Subshell(_), _))
 					{
 						self.cwd = saved.clone();
 					}
@@ -399,7 +396,7 @@ impl<'a> Analyzer<'a> {
 			.filter(|sink| sink.command_index == index)
 			.cloned()
 			.collect();
-		self.fold_cd(&command, subshell);
+		self.fold_cd(&command);
 		self.ir.commands.push(command);
 	}
 
@@ -617,9 +614,50 @@ impl<'a> Analyzer<'a> {
 			"sh" | "bash" | "zsh" | "python" | "python3" | "node" | "ruby" | "perl" => {
 				self.interpreter(command)
 			},
+			"cat" | "head" | "tail" | "less" | "more" | "wc" | "ls" | "stat" | "file" | "sort"
+			| "uniq" | "cut" | "readlink" | "realpath" => self.read_operands(command),
+			"grep" => self.grep_read_operands(command),
+			"tr" | "basename" | "dirname" | "which" | "pwd" | "env" | "date" => {},
 			"cd" | "echo" | "printf" | "true" | "false" | "test" | "[" | "]" => {},
 			// Commands outside the colocated coreutils table can have arbitrary effects.
 			_ => self.opaque("unclassified_command"),
+		}
+	}
+
+	fn read_operands(&mut self, command: &CommandIr) {
+		for arg in command
+			.argv
+			.iter()
+			.skip(1)
+			.filter(|arg| !arg.text.starts_with("-"))
+		{
+			self.record_path(self.path(
+				arg.text.clone(),
+				arg.dynamism,
+				READ,
+				command.name.as_deref().unwrap_or_default(),
+				command.index,
+				arg.span,
+			));
+		}
+	}
+
+	fn grep_read_operands(&mut self, command: &CommandIr) {
+		let mut operands = command
+			.argv
+			.iter()
+			.skip(1)
+			.filter(|arg| !arg.text.starts_with("-"));
+		let _pattern = operands.next();
+		for arg in operands {
+			self.record_path(self.path(
+				arg.text.clone(),
+				arg.dynamism,
+				READ,
+				"grep",
+				command.index,
+				arg.span,
+			));
 		}
 	}
 
@@ -692,8 +730,8 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
-	fn fold_cd(&mut self, command: &CommandIr, subshell: bool) {
-		if subshell || command.name.as_deref() != Some("cd") {
+	fn fold_cd(&mut self, command: &CommandIr) {
+		if command.name.as_deref() != Some("cd") {
 			return;
 		}
 		let Some(target) = command.argv.get(1) else {

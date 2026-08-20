@@ -10,7 +10,8 @@ use super::{
 	attempt::{AttemptLayer, AttemptService},
 	auth::{AuthLeaseLayer, AuthLeaseService},
 	budget::{OverallBudgetLayer, OverallBudgetService},
-	encode::{EncodeLayer, EncodeService},
+	encode::{CredentialApplyLayer, CredentialApplyService, EncodeLayer, EncodeService},
+	hook::{HookHandle, NoHookHandle, ProviderErrorLayer, ProviderErrorService},
 	intent::{IntentLayer, IntentService},
 	observe::{ObserveLayer, ObserveService},
 	operation::{OperationPolicyLayer, OperationPolicyService},
@@ -133,7 +134,7 @@ impl RouteStackFactory for BuiltinRouteStackFactory {
 /// Construction inputs for a route-local stack; outer execution state is
 /// supplied by the registry.
 #[derive(Clone)]
-pub struct RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA> {
+pub struct RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA, H = NoHookHandle> {
 	/// Canonical operation-specific planning and response validation.
 	pub operation:        OperationPolicyLayer,
 	/// Intent negotiation.
@@ -154,19 +155,49 @@ pub struct RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA> {
 	pub retry:            TransportRetryLayer,
 	/// Per-transport-attempt rate reservation.
 	pub rate:             RateLayer<RL>,
-	/// Pure codec lowering.
-	pub encode:           EncodeLayer<EN>,
-	/// Credential application immediately before transport.
-	pub credential_apply: CA,
+	/// Pure codec lowering and the pre-encoding hook seam.
+	pub encode:           EncodeLayer<EN, H>,
+	/// Credential application and optional per-attempt signing hook.
+	pub credential_apply: CredentialApplyLayer<CA, H>,
+	/// Classified provider-error interception before registry fallback safety.
+	pub provider_error:   ProviderErrorLayer<H>,
+}
+
+impl<I, SS, SM, AP, AC, RL, EN, CA> RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA> {
+	/// Threads one concrete cold-path hook dispatcher through every inference
+	/// seam without introducing dynamic dispatch.
+	#[must_use]
+	pub fn with_hook<H: HookHandle>(
+		self,
+		hook: H,
+	) -> RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA, H> {
+		RouteStackLayers {
+			operation:        self.operation,
+			intent:           self.intent,
+			session:          self.session,
+			semantic:         self.semantic,
+			recovery:         self.recovery,
+			admission:        self.admission,
+			account:          self.account,
+			auth:             self.auth,
+			retry:            self.retry,
+			rate:             self.rate,
+			encode:           self.encode.with_hook(hook.clone()),
+			credential_apply: self.credential_apply.with_hook(hook.clone()),
+			provider_error:   self.provider_error.with_hook(hook),
+		}
+	}
 }
 
 /// Stack segment from credential application through canonical recovery.
-pub type RecoveryStack<W, CA, EN, RL, AC, AP> = RecoveryService<
+pub type RecoveryStack<W, CA, EN, RL, AC, AP, H> = RecoveryService<
 	AttemptService<
 		AdmissionService<
 			AccountPoolService<
 				AuthLeaseService<
-					TransportRetryService<RateService<EncodeService<<CA as Layer<W>>::Service, EN>, RL>>,
+					TransportRetryService<
+						RateService<EncodeService<CredentialApplyService<W, CA, H>, EN, H>, RL>,
+					>,
 					AC,
 				>,
 				AP,
@@ -175,12 +206,15 @@ pub type RecoveryStack<W, CA, EN, RL, AC, AP> = RecoveryService<
 	>,
 >;
 /// Stack segment through semantic validation and typed answer projection.
-pub type AnswerStack<W, CA, EN, RL, AC, AP, SM> =
-	AnswerService<SemanticService<RecoveryStack<W, CA, EN, RL, AC, AP>, SM>>;
+pub type AnswerStack<W, CA, EN, RL, AC, AP, SM, H> =
+	AnswerService<SemanticService<RecoveryStack<W, CA, EN, RL, AC, AP, H>, SM>>;
 /// Stack segment from intent through session and response processing.
-pub type IntentStack<W, CA, EN, RL, AC, AP, SM, SS, I> = OperationPolicyService<
-	IntentService<SessionService<AnswerStack<W, CA, EN, RL, AC, AP, SM>, SS>, I>,
+pub type IntentStack<W, CA, EN, RL, AC, AP, SM, SS, I, H> = OperationPolicyService<
+	IntentService<SessionService<AnswerStack<W, CA, EN, RL, AC, AP, SM, H>, SS>, I>,
 >;
+/// Full route stack with an error hook enclosing every route-local failure.
+pub type HookedRouteStack<W, CA, EN, RL, AC, AP, SM, SS, I, H> =
+	ProviderErrorService<IntentStack<W, CA, EN, RL, AC, AP, SM, SS, I, H>, H>;
 /// Outer execution service type wrapping the full registry fallback loop
 /// exactly once.
 pub type OuterExecutionService<S, O> = ObserveService<OverallBudgetService<S>, O>;
@@ -191,12 +225,13 @@ pub type OuterExecutionService<S, O> = ObserveService<OverallBudgetService<S>, O
 /// Outer to inner: Intent → Session → Answer → Semantic → Recovery →
 /// Attempt(Admission → `AccountPool` → `AuthLease` → `TransportRetry` → Rate →
 /// Encode → `CredentialApply` → `WireTransport`).
-pub fn build_route_stack<W, I, SS, SM, AP, AC, RL, EN, CA>(
+pub fn build_route_stack<W, I, SS, SM, AP, AC, RL, EN, CA, H>(
 	wire: W,
-	layers: RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA>,
-) -> IntentStack<W, CA, EN, RL, AC, AP, SM, SS, I>
+	layers: RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA, H>,
+) -> HookedRouteStack<W, CA, EN, RL, AC, AP, SM, SS, I, H>
 where
-	CA: Layer<W>,
+	W: Clone,
+	CA: Clone,
 	EN: Clone,
 	RL: Clone,
 	AC: Clone,
@@ -204,6 +239,7 @@ where
 	SM: Clone,
 	SS: Clone,
 	I: Clone,
+	H: HookHandle,
 {
 	let service = layers.credential_apply.layer(wire);
 	let service = layers.encode.layer(service);
@@ -217,7 +253,8 @@ where
 	let service = layers.semantic.layer(service);
 	let service = AnswerLayer.layer(service);
 	let service = layers.session.layer(service);
-	layers.operation.layer(layers.intent.layer(service))
+	let service = layers.operation.layer(layers.intent.layer(service));
+	layers.provider_error.layer(service)
 }
 
 /// Wraps the complete preplanned registry fallback service in one budget and
@@ -225,75 +262,10 @@ where
 pub fn build_execution_stack<S, O>(
 	dispatch: S,
 	observer: ObserveLayer<O>,
+	ledger: crate::layer::budget::InferenceLedger,
 ) -> OuterExecutionService<S, O>
 where
 	O: Clone,
 {
-	observer.layer(OverallBudgetLayer.layer(dispatch))
-}
-
-#[cfg(test)]
-mod tests {
-	use std::sync::Arc;
-
-	use parking_lot::Mutex;
-	use tower::Layer;
-
-	use super::{RouteStackLayers, build_route_stack};
-	use crate::layer::{
-		account::AccountPoolLayer,
-		admission::{AdmissionController, AdmissionLayer},
-		auth::AuthLeaseLayer,
-		encode::EncodeLayer,
-		intent::IntentLayer,
-		operation::{OperationPolicyConfig, OperationPolicyLayer},
-		rate::RateLayer,
-		recover::RecoveryLayer,
-		retry::TransportRetryLayer,
-		semantic::SemanticLayer,
-		session::SessionLayer,
-	};
-
-	#[derive(Clone)]
-	struct CountLayer {
-		name:  &'static str,
-		trace: Arc<Mutex<Vec<&'static str>>>,
-	}
-	impl<S> Layer<S> for CountLayer {
-		type Service = S;
-
-		fn layer(&self, inner: S) -> S {
-			self.trace.lock().push(self.name);
-			inner
-		}
-	}
-
-	#[test]
-	fn stack_is_composed_once_at_construction() {
-		let trace = Arc::new(Mutex::new(Vec::new()));
-		let layers = RouteStackLayers {
-			operation:        OperationPolicyLayer::new(OperationPolicyConfig {
-				embedding:              None,
-				native:                 None,
-				usage:                  crate::operation::usage::UsageServiceConfig::new(
-					std::time::Duration::ZERO,
-				),
-				discovery_maximum_page: None,
-				exact_token_count:      false,
-			}),
-			intent:           IntentLayer::new(()),
-			session:          SessionLayer::new(()),
-			semantic:         SemanticLayer::new(()),
-			recovery:         RecoveryLayer::without_discovery(),
-			admission:        AdmissionLayer::new(AdmissionController::new(1, 0)),
-			account:          AccountPoolLayer::new(()),
-			auth:             AuthLeaseLayer::new(()),
-			retry:            TransportRetryLayer::new(0),
-			rate:             RateLayer::new(()),
-			encode:           EncodeLayer::new((), false),
-			credential_apply: CountLayer { name: "credential", trace: trace.clone() },
-		};
-		let _stack = build_route_stack((), layers);
-		assert_eq!(&*trace.lock(), &["credential"]);
-	}
+	observer.layer(OverallBudgetLayer::new(ledger).layer(dispatch))
 }

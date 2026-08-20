@@ -734,6 +734,14 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 		"await omp.env.worker.list()"
 	),
 	symbol!(
+		"docs/py/14-deploy.md",
+		"omp.env.site.materialize",
+		"(site: SiteManifest, /) -> SiteTree",
+		CallbackAbi::None,
+		ENV_WRITE,
+		"await omp.env.site.materialize(site)"
+	),
+	symbol!(
 		"docs/py/07-ui.md",
 		"omp.ui.tml",
 		"(template: str, /, **fields: object) -> Tml",

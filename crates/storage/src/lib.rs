@@ -12,4 +12,5 @@ pub mod blob;
 pub mod gc;
 pub mod index;
 pub mod state;
+pub mod telemetry_index;
 pub mod transcript;

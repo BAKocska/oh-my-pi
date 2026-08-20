@@ -7,6 +7,7 @@ pub mod attempt;
 pub mod auth;
 pub mod budget;
 pub mod encode;
+pub mod hook;
 pub mod intent;
 pub mod observe;
 pub mod operation;
@@ -75,6 +76,7 @@ struct ExecutionState {
 	cancelled:               AtomicBool,
 	committed:               AtomicBool,
 	attempts:                AtomicU32,
+	sign_budget_exhaustions: AtomicU32,
 	input_tokens:            AtomicU64,
 	output_tokens:           AtomicU64,
 	provisional_bytes:       AtomicU64,
@@ -107,6 +109,7 @@ impl ExecutionContext {
 			input_tokens: AtomicU64::new(0),
 			output_tokens: AtomicU64::new(0),
 			provisional_bytes: AtomicU64::new(0),
+			sign_budget_exhaustions: AtomicU32::new(0),
 			cost_micro_usd: Mutex::new(0),
 			receipt: Mutex::new(ExecutionReceipt::default()),
 			body: Mutex::new(None),
@@ -243,6 +246,19 @@ impl ExecutionContext {
 	/// Returns charged provisional bytes.
 	pub fn provisional_bytes(&self) -> u64 {
 		self.0.provisional_bytes.load(Ordering::Acquire)
+	}
+
+	/// Returns how many provider-sign hooks exceeded their hard attempt budget.
+	pub fn sign_budget_exhaustions(&self) -> u32 {
+		self.0.sign_budget_exhaustions.load(Ordering::Acquire)
+	}
+
+	/// Records one fail-closed provider-sign budget exhaustion.
+	pub(crate) fn record_sign_budget_exhaustion(&self) {
+		self
+			.0
+			.sign_budget_exhaustions
+			.fetch_add(1, Ordering::AcqRel);
 	}
 
 	/// Returns a secret-free accounting snapshot.

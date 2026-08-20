@@ -2,18 +2,24 @@
 //! credentials.
 
 use std::{
+	sync::Arc,
 	task::{Context, Poll},
-	time::SystemTime,
+	time::{Duration, SystemTime},
 };
 
 use omp_core::Str;
+use parking_lot::Mutex;
 use tower::{Layer, Service};
 
 use crate::{
 	auth::{AuthSpec, CredentialLease},
 	codec::{Cancellation, TransportRequest},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	layer::{ExecutionContext, LayerCall, auth::Authorized},
+	layer::{
+		ExecutionContext, LayerCall,
+		auth::Authorized,
+		hook::{HookHandle, NoHookHandle},
+	},
 	receipt::ReasonId,
 };
 
@@ -45,69 +51,96 @@ pub struct EncodedAttempt<A, L> {
 
 /// Adds pure codec lowering.
 #[derive(Clone, Debug)]
-pub struct EncodeLayer<E> {
+pub struct EncodeLayer<E, H = NoHookHandle> {
 	encoder:     E,
+	hook:        Option<H>,
 	provisional: bool,
 }
-impl<E> EncodeLayer<E> {
+impl<E> EncodeLayer<E, NoHookHandle> {
 	/// Creates an encoding layer for visible or transactionally provisional
-	/// attempts.
+	/// attempts without a cold-path hook subscription.
 	pub const fn new(encoder: E, provisional: bool) -> Self {
-		Self { encoder, provisional }
+		Self { encoder, hook: None, provisional }
+	}
+}
+impl<E> EncodeLayer<E, NoHookHandle> {
+	/// Attaches the concrete hook dispatcher for this route stack.
+	#[must_use]
+	pub fn with_hook<T: HookHandle>(self, hook: T) -> EncodeLayer<E, T> {
+		EncodeLayer {
+			encoder:     self.encoder,
+			hook:        Some(hook),
+			provisional: self.provisional,
+		}
 	}
 }
 /// Encoding service.
 #[derive(Clone, Debug)]
-pub struct EncodeService<S, E> {
-	inner:       S,
+pub struct EncodeService<S, E, H = NoHookHandle> {
+	inner:       Arc<Mutex<S>>,
 	encoder:     E,
+	hook:        Option<H>,
 	provisional: bool,
 }
-impl<S, E: Clone> Layer<S> for EncodeLayer<E> {
-	type Service = EncodeService<S, E>;
+impl<S, E: Clone, H: Clone> Layer<S> for EncodeLayer<E, H> {
+	type Service = EncodeService<S, E, H>;
 
 	fn layer(&self, inner: S) -> Self::Service {
-		EncodeService { inner, encoder: self.encoder.clone(), provisional: self.provisional }
+		EncodeService {
+			inner:       Arc::new(Mutex::new(inner)),
+			encoder:     self.encoder.clone(),
+			hook:        self.hook.clone(),
+			provisional: self.provisional,
+		}
 	}
 }
-impl<S, E, R, A, L> Service<LayerCall<Authorized<R, A, L>>> for EncodeService<S, E>
+impl<S, E, R, A, L, H> Service<LayerCall<Authorized<R, A, L>>> for EncodeService<S, E, H>
 where
+	R: Send,
+	A: Send,
+	L: Send,
 	E: AttemptEncoder<R, L>,
-	S: Service<LayerCall<EncodedAttempt<A, L>>, Error = Error>,
+	H: HookHandle,
+	S: Service<LayerCall<EncodedAttempt<A, L>>, Error = Error> + Send,
+	S::Future: Send,
 {
 	type Error = Error;
 	type Response = S::Response;
 
-	type Future = impl Future<Output = Result<S::Response, Error>>;
+	type Future = impl Future<Output = Result<S::Response, Error>> + Send;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-		self.inner.poll_ready(cx)
+		self.inner.lock().poll_ready(cx)
 	}
 
 	fn call(&mut self, request: LayerCall<Authorized<R, A, L>>) -> Self::Future {
 		let Authorized { request: planned, account, lease } = request.payload;
 		let attempt = request.context.attempts().saturating_sub(1);
+		let context = request.context;
+		let hook = self.hook.clone();
+		let encoder = self.encoder.clone();
+		let provisional = self.provisional;
 		let cancel = Cancellation::default();
-		request.context.register_transport_cancel(cancel.clone());
-		let encoded = request
-			.context
-			.checkpoint(ErrorPhase::Encoding)
-			.and_then(|()| {
-				self.encoder.encode(
-					&planned,
-					&lease,
-					&request.context,
-					attempt,
-					self.provisional,
-					cancel,
-				)
-			});
-		let next = encoded.map(|transport| LayerCall {
-			payload: EncodedAttempt { account, transport, lease },
-			context: request.context,
-		});
-		let future = next.map(|request| self.inner.call(request));
-		async move { future?.await }
+		context.register_transport_cancel(cancel.clone());
+		let inner = Arc::clone(&self.inner);
+		async move {
+			context.checkpoint(ErrorPhase::Encoding)?;
+			// This escape hatch is explicitly fail-open: a failed hook leaves the
+			// canonical request untouched and cannot prevent a provider attempt.
+			if let Some(hook) = hook {
+				let _ = hook.before_request(&context).await;
+			}
+			let transport =
+				encoder.encode(&planned, &lease, &context, attempt, provisional, cancel)?;
+			let future = {
+				let mut service = inner.lock();
+				let future = service
+					.call(LayerCall { payload: EncodedAttempt { account, transport, lease }, context });
+				drop(service);
+				future
+			};
+			future.await
+		}
 	}
 }
 
@@ -184,62 +217,116 @@ fn credential_prepare_error(context: &ExecutionContext) -> Error {
 
 /// Adds credential application at the last boundary before wire transport.
 #[derive(Clone, Debug)]
-pub struct CredentialApplyLayer<P> {
+pub struct CredentialApplyLayer<P, H = NoHookHandle> {
 	applier: P,
+	hook:    Option<H>,
 }
-impl<P> CredentialApplyLayer<P> {
-	/// Creates a credential application layer.
+impl<P> CredentialApplyLayer<P, NoHookHandle> {
+	/// Creates a credential application layer without a signing hook.
 	pub const fn new(applier: P) -> Self {
-		Self { applier }
+		Self { applier, hook: None }
+	}
+}
+impl<P> CredentialApplyLayer<P, NoHookHandle> {
+	/// Attaches the concrete hook dispatcher for per-attempt provider signing.
+	#[must_use]
+	pub fn with_hook<T: HookHandle>(self, hook: T) -> CredentialApplyLayer<P, T> {
+		CredentialApplyLayer { applier: self.applier, hook: Some(hook) }
 	}
 }
 /// Credential-finalizing service.
 #[derive(Clone, Debug)]
-pub struct CredentialApplyService<S, P> {
-	inner:   S,
+pub struct CredentialApplyService<S, P, H = NoHookHandle> {
+	inner:   Arc<Mutex<S>>,
 	applier: P,
+	hook:    Option<H>,
 }
-impl<S, P: Clone> Layer<S> for CredentialApplyLayer<P> {
-	type Service = CredentialApplyService<S, P>;
+impl<S, P: Clone, H: Clone> Layer<S> for CredentialApplyLayer<P, H> {
+	type Service = CredentialApplyService<S, P, H>;
 
 	fn layer(&self, inner: S) -> Self::Service {
-		CredentialApplyService { inner, applier: self.applier.clone() }
+		CredentialApplyService {
+			inner:   Arc::new(Mutex::new(inner)),
+			applier: self.applier.clone(),
+			hook:    self.hook.clone(),
+		}
 	}
 }
-impl<S, P, A, L> Service<LayerCall<EncodedAttempt<A, L>>> for CredentialApplyService<S, P>
+impl<S, P, A, L, H> Service<LayerCall<EncodedAttempt<A, L>>> for CredentialApplyService<S, P, H>
 where
+	A: Send,
+	L: Send,
+	H: HookHandle,
 	P: CredentialApplier<A, L>,
-	S: Service<TransportRequest, Error = Error>,
+	S: Service<TransportRequest, Error = Error> + Send,
+	S::Future: Send,
 {
 	type Error = Error;
 	type Response = S::Response;
 
-	type Future = impl Future<Output = Result<S::Response, Error>>;
+	type Future = impl Future<Output = Result<S::Response, Error>> + Send;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-		self.inner.poll_ready(cx)
+		self.inner.lock().poll_ready(cx)
 	}
 
 	fn call(&mut self, request: LayerCall<EncodedAttempt<A, L>>) -> Self::Future {
 		let EncodedAttempt { account, mut transport, lease } = request.payload;
-		let applied = request
-			.context
+		let context = request.context;
+		let hook = self.hook.clone();
+		let applied = context
 			.checkpoint(ErrorPhase::Authentication)
 			.and_then(|()| {
 				self
 					.applier
-					.apply(&account, lease, &mut transport, &request.context)
+					.apply(&account, lease, &mut transport, &context)
 			});
-		let future = applied.map(|()| self.inner.call(transport));
+		let future = applied.map(|()| {
+			let inner = Arc::clone(&self.inner);
+			async move {
+				if let Some(hook) = hook {
+					let budget = hook.sign_budget();
+					match tokio::time::timeout(budget, hook.provider_sign(&transport, &context)).await {
+						Ok(Ok(())) => {},
+						Ok(Err(error)) => return Err(error),
+						Err(_) => return Err(provider_sign_timeout(&context, budget)),
+					}
+				}
+				let future = {
+					let mut service = inner.lock();
+					let future = service.call(transport);
+					drop(service);
+					future
+				};
+				future.await
+			}
+		});
 		async move { future?.await }
 	}
+}
+
+fn provider_sign_timeout(context: &ExecutionContext, budget: Duration) -> Error {
+	context.record_sign_budget_exhaustion();
+	Error::new(
+		ErrorKind::Authentication,
+		ErrorPhase::Authentication,
+		RetryAction::Never,
+		context.receipt(),
+	)
+	.detail(ErrorDetail::budget(
+		Str::new_static("provider_sign"),
+		budget.as_nanos(),
+		budget.as_nanos().saturating_add(1),
+	))
 }
 
 #[cfg(test)]
 mod tests {
 	use std::{
+		future::Future,
 		sync::Arc,
 		task::{Context, Poll},
+		time::Duration,
 	};
 
 	use bytes::Bytes;
@@ -247,15 +334,17 @@ mod tests {
 	use parking_lot::Mutex;
 	use tower::Service;
 
-	use super::{AttemptEncoder, CredentialApplier, CredentialApplyService, EncodeService};
+	use super::{
+		AttemptEncoder, CredentialApplier, CredentialApplyService, EncodeService, EncodedAttempt,
+	};
 	use crate::{
 		body::BodySource,
 		codec::{
 			Cancellation, Decoder, EncodedRequest, RawEvent, RequestMethod, SizeBounds,
 			TransportAttempt, TransportRequest,
 		},
-		error::Error,
-		layer::{ExecutionContext, LayerCall, auth::Authorized},
+		error::{Error, ErrorKind, RetryAction},
+		layer::{ExecutionContext, LayerCall, auth::Authorized, hook::HookHandle},
 		receipt::ExecutionBudget,
 		transport::{Frame, FramingProtocol},
 	};
@@ -345,14 +434,70 @@ mod tests {
 			ready(Ok(()))
 		}
 	}
+	#[derive(Clone, Copy)]
+	struct SlowSigner;
+	impl HookHandle for SlowSigner {
+		fn before_request(
+			&self,
+			_: &ExecutionContext,
+		) -> impl Future<Output = Result<(), Error>> + Send {
+			std::future::ready(Ok(()))
+		}
+
+		fn provider_error(
+			&self,
+			_: &Error,
+			_: &ExecutionContext,
+		) -> impl Future<Output = Option<RetryAction>> + Send {
+			std::future::ready(None)
+		}
+
+		fn provider_sign(
+			&self,
+			_: &TransportRequest,
+			_: &ExecutionContext,
+		) -> impl Future<Output = Result<(), Error>> + Send {
+			std::future::pending()
+		}
+
+		fn sign_budget(&self) -> Duration {
+			Duration::ZERO
+		}
+	}
+
+	#[tokio::test]
+	async fn signing_timeout_fails_closed_before_wire_transport() {
+		let trace = Arc::new(Mutex::new(Vec::new()));
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let mut service = CredentialApplyService {
+			inner:   Arc::new(Mutex::new(Wire(trace.clone()))),
+			applier: Applier(trace.clone()),
+			hook:    Some(SlowSigner),
+		};
+		let error = service
+			.call(LayerCall {
+				payload: EncodedAttempt { account: (), transport: transport(), lease: 7 },
+				context: context.clone(),
+			})
+			.await
+			.expect_err("sign timeout must prevent wire transport");
+		assert_eq!(error.kind, ErrorKind::Authentication);
+		assert_eq!(error.action, RetryAction::Never);
+		assert_eq!(context.sign_budget_exhaustions(), 1);
+		assert_eq!(&*trace.lock(), &["credential"]);
+	}
 	#[tokio::test]
 	async fn credentials_are_applied_only_after_encoding_and_immediately_before_transport() {
 		let trace = Arc::new(Mutex::new(Vec::new()));
-		let credential =
-			CredentialApplyService { inner: Wire(trace.clone()), applier: Applier(trace.clone()) };
+		let credential = CredentialApplyService {
+			inner:   Arc::new(Mutex::new(Wire(trace.clone()))),
+			applier: Applier(trace.clone()),
+			hook:    None::<crate::layer::hook::NoHookHandle>,
+		};
 		let mut service = EncodeService {
-			inner:       credential,
+			inner:       Arc::new(Mutex::new(credential)),
 			encoder:     Encoder(trace.clone()),
+			hook:        None::<crate::layer::hook::NoHookHandle>,
 			provisional: false,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))

@@ -596,6 +596,7 @@ mod tests {
 			path:          Str::from("/models"),
 			pagination:    DiscoveryPagination::SinglePage,
 			authoritative: false,
+			interval:      Some(std::time::Duration::from_secs(5)),
 		};
 		OpenAiModelsDiscoveryCodec::from_spec(&spec).expect("OpenAI models kind");
 		assert_eq!(
@@ -645,6 +646,7 @@ mod tests {
 			path:          "/v1beta/models".into(),
 			pagination:    DiscoveryPagination::Cursor { query_parameter: "pageToken".into() },
 			authoritative: false,
+			interval:      Some(std::time::Duration::from_secs(5)),
 		};
 		GoogleModelsDiscoveryCodec::from_spec(&spec).expect("Google discovery kind constructs");
 		spec.kind = DiscoveryKind::OpenAiModels;

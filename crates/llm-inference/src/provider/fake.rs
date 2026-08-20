@@ -857,6 +857,7 @@ mod tests {
 			deadline: None,
 			budget: ExecutionBudget::default(),
 			session: None,
+			attribution: crate::call::InferenceAttribution::core(),
 			execution: None,
 			operation,
 		}

@@ -1,0 +1,456 @@
+//! Local grant, publisher-key, and revocation state.
+
+use std::{collections::BTreeSet, fs, io, path::Path};
+
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use omp_core::{Str, base64, encoding::hex};
+use serde::{Deserialize, Serialize};
+
+use super::{ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml};
+
+/// An operator-originated capability grant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Grant {
+	/// Extension identity.
+	pub id:                Str,
+	/// TOFU-pinned publisher fingerprint.
+	pub publisher:         Str,
+	/// Layer where the grant applies.
+	pub layer:             Layer,
+	/// Workspace identity, omitted for client-layer grants.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub workspace:         Option<WorkspaceUri>,
+	/// Hash of the canonical declared capability set.
+	pub capability_digest: Str,
+	/// Tier approved by the operator.
+	pub tier:              TrustTier,
+	/// Approved code-shipping level.
+	pub ship:              Str,
+	/// RFC 3339 timestamp.
+	pub granted_at:        Str,
+	/// Operator channel: interactive, flag, or env.
+	pub granted_by:        Str,
+}
+
+/// Local grant file, never committed with a workspace.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GrantsFile {
+	/// File format version.
+	#[serde(default = "one")]
+	pub version: u32,
+	/// Durable grants.
+	#[serde(rename = "grant", default)]
+	pub grants:  Vec<Grant>,
+}
+
+/// Returns whether an existing grant covers exactly this identity and digest.
+#[must_use]
+pub fn grant_covers(
+	grants: &GrantsFile,
+	id: &Str,
+	publisher: &Str,
+	layer: Layer,
+	workspace: Option<&WorkspaceUri>,
+	capability_digest: &Str,
+) -> bool {
+	grants.grants.iter().any(|grant| {
+		grant.id == *id
+			&& grant.publisher == *publisher
+			&& grant.layer == layer
+			&& grant.workspace.as_ref() == workspace
+			&& grant.capability_digest == *capability_digest
+	})
+}
+
+/// A non-interactive grant request parsed from `OMP_EXT_GRANT`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantRequest {
+	/// Extension id named by the operator.
+	pub id:           Str,
+	/// Explicit capabilities, or `*` for all declared capabilities.
+	pub capabilities: BTreeSet<Str>,
+	/// Explicit tier approval when supplied.
+	pub tier:         Option<TrustTier>,
+}
+
+/// Parses the operator-only `OMP_EXT_GRANT` channel.
+///
+/// Each semicolon-separated entry is `id:cap,cap`, `id:*`, or
+/// `id:tier=trusted`; malformed entries fail closed rather than silently
+/// dropping an intended capability grant.
+pub fn parse_grant_requests(value: &str) -> Result<Vec<GrantRequest>, ExtensionError> {
+	value
+		.split(';')
+		.filter(|entry| !entry.is_empty())
+		.map(|entry| {
+			let (id, grants) = entry.split_once(':').ok_or_else(|| {
+				ExtensionError::new(ExtensionCode::EGrantUnknown, "grant entry must be id:capability")
+			})?;
+			if id.is_empty() || grants.is_empty() {
+				return Err(ExtensionError::new(
+					ExtensionCode::EGrantUnknown,
+					"grant entry has an empty id or capability",
+				));
+			}
+			let mut capabilities = BTreeSet::new();
+			let mut tier = None;
+			for grant in grants.split(',') {
+				if let Some(value) = grant.strip_prefix("tier=") {
+					tier = Some(value.parse().map_err(|_| {
+						ExtensionError::new(ExtensionCode::EGrantUnknown, "unknown grant tier")
+					})?);
+				} else if !grant.is_empty() {
+					capabilities.insert(Str::new(grant));
+				}
+			}
+			Ok(GrantRequest { id: Str::new(id), capabilities, tier })
+		})
+		.collect()
+}
+
+/// Returns whether a parsed environment request approves the declared
+/// capability set. Unknown requested capabilities are an error, preserving the
+/// `E-GRANT-UNKNOWN` typo defense.
+pub fn validate_grant_request(
+	request: &GrantRequest,
+	declared: impl IntoIterator<Item = Str>,
+) -> Result<bool, ExtensionError> {
+	let declared: BTreeSet<Str> = declared.into_iter().collect();
+	if request.capabilities.contains(&Str::new_static("*")) {
+		return Ok(true);
+	}
+	if !request.capabilities.is_subset(&declared) {
+		return Err(ExtensionError::new(
+			ExtensionCode::EGrantUnknown,
+			"grant names an undeclared capability",
+		));
+	}
+	Ok(request.capabilities == declared)
+}
+
+impl GrantsFile {
+	/// Reads an absent local grant file as an empty grant set.
+	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
+		read_toml_or_default(path)
+	}
+
+	/// Atomically writes the local grant file.
+	pub fn write(&self, path: &Path) -> io::Result<()> {
+		atomic_toml(path, self)
+	}
+}
+
+/// A TOFU-pinned publisher key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyPin {
+	/// Extension identity protected by this pin.
+	pub id:                 Str,
+	/// Base64 Ed25519 public key.
+	pub key:                Str,
+	/// Exact version first seen under this key.
+	pub introduced_version: Str,
+	/// RFC 3339 pin timestamp.
+	pub introduced_at:      Str,
+}
+
+/// Local TOFU key pins.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeysFile {
+	/// File format version.
+	#[serde(default = "one")]
+	pub version: u32,
+	/// One pin per extension identity.
+	#[serde(rename = "key", default)]
+	pub keys:    Vec<KeyPin>,
+}
+
+/// A publisher rotation signed by the currently pinned key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyRotation {
+	/// Extension identity whose key rotates.
+	pub id:        Str,
+	/// New base64 Ed25519 public key.
+	pub new_key:   Str,
+	/// Detached base64 signature from the old key over `id\nnew_key`.
+	pub signature: Str,
+}
+
+impl KeysFile {
+	/// Reads an absent key file as an empty pin set.
+	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
+		read_toml_or_default(path)
+	}
+
+	/// Atomically writes local key pins.
+	pub fn write(&self, path: &Path) -> io::Result<()> {
+		atomic_toml(path, self)
+	}
+
+	/// Pins a first-seen key, rejects a changed key, or accepts a rotation only
+	/// when its signature verifies against the old pin.
+	pub fn verify_or_pin(
+		&mut self,
+		id: &Str,
+		key: &Str,
+		version: &Str,
+		now: &Str,
+		rotation: Option<&KeyRotation>,
+	) -> Result<Option<ExtensionCode>, ExtensionError> {
+		let Some(pin) = self.keys.iter_mut().find(|pin| pin.id == *id) else {
+			self.keys.push(KeyPin {
+				id:                 id.clone(),
+				key:                key.clone(),
+				introduced_version: version.clone(),
+				introduced_at:      now.clone(),
+			});
+			return Ok(None);
+		};
+		if pin.key == *key {
+			return Ok(None);
+		}
+		let Some(rotation) =
+			rotation.filter(|rotation| rotation.id == *id && rotation.new_key == *key)
+		else {
+			return Err(ExtensionError::new(
+				ExtensionCode::EKeyChanged,
+				"publisher key changed without a signed rotation",
+			));
+		};
+		verify_signature(
+			pin.key.as_str(),
+			format!("{}\n{}", rotation.id, rotation.new_key).as_bytes(),
+			rotation.signature.as_str(),
+		)?;
+		pin.key.clone_from(key);
+		Ok(Some(ExtensionCode::WKeyRotated))
+	}
+}
+
+/// A revoked extension version predicate. Version matching is deliberately
+/// delegated to the resolver; materialization compares exact lock versions.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct RevokedVersion {
+	/// Extension id.
+	pub id:       Str,
+	/// Revoked PEP 440 version expression.
+	pub versions: Str,
+	/// Security rationale.
+	pub reason:   Str,
+	/// Advisory URL.
+	pub advisory: String,
+}
+
+/// Signed revocation snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct RevocationsFile {
+	/// File format version.
+	pub version:     u32,
+	/// RFC 3339 issuance timestamp.
+	pub issued_at:   Str,
+	/// RFC 3339 expiry timestamp.
+	pub valid_until: Str,
+	/// Revoked extension versions.
+	pub revoked:     Vec<RevokedVersion>,
+	/// Index signature over the canonical unsigned JSON payload.
+	pub signature:   Str,
+}
+
+/// Staleness decision for a locally cached revocation snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevocationFreshness {
+	/// Snapshot is still current.
+	Fresh,
+	/// Snapshot is stale but ordinary offline mode proceeds with warning.
+	Warn(ExtensionCode),
+	/// Strict offline mode refuses stale state.
+	Reject(ExtensionCode),
+}
+
+impl RevocationsFile {
+	/// Reads a signed JSON revocation snapshot.
+	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
+		let data = fs::read(path)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ERevoked, error.to_string()))?;
+		serde_json::from_slice(&data)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ERevoked, error.to_string()))
+	}
+
+	/// Verifies the index signature over the canonical unsigned snapshot.
+	pub fn verify(&self, index_key: &str) -> Result<(), ExtensionError> {
+		#[derive(Serialize)]
+		struct Unsigned<'a> {
+			version:     u32,
+			issued_at:   &'a Str,
+			valid_until: &'a Str,
+			revoked:     &'a [RevokedVersion],
+		}
+		let payload = serde_json::to_vec(&Unsigned {
+			version:     self.version,
+			issued_at:   &self.issued_at,
+			valid_until: &self.valid_until,
+			revoked:     &self.revoked,
+		})
+		.map_err(|error| ExtensionError::new(ExtensionCode::ESig, error.to_string()))?;
+		verify_signature(index_key, &payload, self.signature.as_str())
+	}
+
+	/// Returns the matching revocation predicate for an extension id.
+	///
+	/// Resolver integration evaluates the recorded PEP 440 predicate against
+	/// its candidate version; callers must treat any returned predicate as a
+	/// hard R10 exclusion, including for locked candidates.
+	#[must_use]
+	pub fn predicate_for(&self, id: &Str) -> Option<&RevokedVersion> {
+		self.revoked.iter().find(|entry| entry.id == *id)
+	}
+
+	/// Atomically writes a revocation snapshot.
+	pub fn write(&self, path: &Path) -> io::Result<()> {
+		let parent = path.parent().unwrap_or_else(|| Path::new("."));
+		fs::create_dir_all(parent)?;
+		let temporary = path.with_extension("json.tmp");
+		fs::write(&temporary, serde_json::to_vec_pretty(self).map_err(io::Error::other)?)?;
+		fs::rename(temporary, path)
+	}
+
+	/// Returns the documented stale-list decision. RFC 3339 UTC strings sort
+	/// lexicographically, which keeps this policy allocation-free and explicit.
+	#[must_use]
+	pub fn freshness(&self, now: &str, strict_offline: bool) -> RevocationFreshness {
+		if self.valid_until.as_str() >= now {
+			RevocationFreshness::Fresh
+		} else if strict_offline {
+			RevocationFreshness::Reject(ExtensionCode::ERevoked)
+		} else {
+			RevocationFreshness::Warn(ExtensionCode::WRevocationStale)
+		}
+	}
+}
+
+/// Produces the consent digest from normalized capabilities and hard-tool
+/// claims. Sorting makes semantically equal manifests produce one grant key.
+#[must_use]
+pub fn capability_digest(
+	capabilities: impl IntoIterator<Item = Str>,
+	hard_tools: impl IntoIterator<Item = Str>,
+) -> Str {
+	let mut entries: BTreeSet<Str> = capabilities.into_iter().collect();
+	entries.extend(
+		hard_tools
+			.into_iter()
+			.map(|tool| Str::new(format!("tools.hard:{tool}"))),
+	);
+	let mut hasher = blake3::Hasher::new();
+	for entry in entries {
+		hasher.update(entry.as_str().as_bytes());
+		hasher.update(b"\n");
+	}
+	Str::new(format!("b3:{}", hex::encode_n(hasher.finalize().as_bytes())))
+}
+
+/// Verifies an Ed25519 signature over `blake3 || sha256 || capability_digest`.
+pub fn verify_artifact_signature(
+	key: &str,
+	blake3_digest: &str,
+	sha256_digest: &str,
+	capability_digest: &str,
+	signature: &str,
+) -> Result<(), ExtensionError> {
+	let decode_digest = |digest: &str, prefix: &str| {
+		hex::decode(digest.strip_prefix(prefix).unwrap_or(digest).as_bytes())
+			.into_vec()
+			.map_err(|_| ExtensionError::new(ExtensionCode::ESig, format!("invalid {prefix} digest")))
+	};
+	let blake3 = decode_digest(blake3_digest, "b3:")?;
+	let sha256 = decode_digest(sha256_digest, "sha256:")?;
+	let capability = decode_digest(capability_digest, "b3:")?;
+	let mut message = Vec::with_capacity(blake3.len() + sha256.len() + capability.len());
+	message.extend_from_slice(&blake3);
+	message.extend_from_slice(&sha256);
+	message.extend_from_slice(&capability);
+	verify_signature(key, &message, signature)
+}
+
+fn verify_signature(key: &str, message: &[u8], signature: &str) -> Result<(), ExtensionError> {
+	let key = key.strip_prefix("ed25519:").unwrap_or(key);
+	let signature = signature.strip_prefix("ed25519:sig:").unwrap_or(signature);
+	let key = base64::decode(key.as_bytes())
+		.into_vec()
+		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "publisher key is not base64"))?;
+	let signature = base64::decode(signature.as_bytes())
+		.into_vec()
+		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "signature is not base64"))?;
+	let key = VerifyingKey::from_bytes(
+		key.as_slice()
+			.try_into()
+			.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "publisher key is not 32 bytes"))?,
+	)
+	.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "invalid publisher key"))?;
+	let signature = Signature::from_slice(&signature)
+		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "invalid Ed25519 signature"))?;
+	key.verify(message, &signature)
+		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "signature verification failed"))
+}
+
+const fn one() -> u32 {
+	1
+}
+
+fn read_toml_or_default<T: for<'de> Deserialize<'de> + Default>(
+	path: &Path,
+) -> Result<T, ExtensionError> {
+	if !path.exists() {
+		return Ok(T::default());
+	}
+	let text = fs::read_to_string(path)
+		.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))?;
+	toml::from_str(&text)
+		.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn stale_revocation_fails_open_unless_strict() {
+		let list = RevocationsFile {
+			version:     1,
+			issued_at:   Str::new_static("2026-01-01T00:00:00Z"),
+			valid_until: Str::new_static("2026-01-02T00:00:00Z"),
+			revoked:     vec![],
+			signature:   Str::new_static("ed25519:sig:"),
+		};
+		assert_eq!(
+			list.freshness("2026-01-03T00:00:00Z", false),
+			RevocationFreshness::Warn(ExtensionCode::WRevocationStale)
+		);
+		assert_eq!(
+			list.freshness("2026-01-03T00:00:00Z", true),
+			RevocationFreshness::Reject(ExtensionCode::ERevoked)
+		);
+	}
+
+	#[test]
+	fn widened_capabilities_require_a_new_grant() {
+		let id = Str::new_static("acme.reviewer");
+		let publisher = Str::new_static("ed25519:key");
+		let old = capability_digest([Str::new_static("net")], []);
+		let widened = capability_digest([Str::new_static("net"), Str::new_static("exec")], []);
+		let grants = GrantsFile {
+			version: 1,
+			grants:  vec![Grant {
+				id:                id.clone(),
+				publisher:         publisher.clone(),
+				layer:             Layer::Client,
+				workspace:         None,
+				capability_digest: old,
+				tier:              TrustTier::Sandboxed,
+				ship:              Str::new_static("installed"),
+				granted_at:        Str::new_static("now"),
+				granted_by:        Str::new_static("interactive"),
+			}],
+		};
+		assert!(!grant_covers(&grants, &id, &publisher, Layer::Client, None, &widened));
+	}
+}

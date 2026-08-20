@@ -25,13 +25,13 @@ use omp_proto::{
 		CancelRequest, ClientFrame, ClientHello, CloseSessionRequest, CloseSessionResponse,
 		CommitBlobPut, DataEvent, DataRequest, DataResponse, EventStreamError, EventStreamKind,
 		ExecRequest, ExecStarted, ExitEvent, Interrupt, InvocationScope, InvokeAccepted, InvokeTool,
-		ListProcesses, OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame,
-		ProcessCommandAccepted, ProcessList, ProcessOutput, ProcessStarted, ProcessStateEvent,
-		ProtocolError, ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg, SearchRequest,
-		SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest, StartProcess, StdinFrame,
-		StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest, cancel_request,
-		client_frame, data_event, data_request, data_response, document_op, document_result,
-		server_frame,
+		ListProcesses, MaterializeSite, OpenSessionRequest, OpenSessionResponse, OutputAttached,
+		OutputFrame, ProcessCommandAccepted, ProcessList, ProcessOutput, ProcessStarted,
+		ProcessStateEvent, ProtocolError, ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg,
+		SearchRequest, SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest,
+		SiteMaterialized, StartProcess, StdinFrame, StopProcess, Update, Verdict, WalkComplete,
+		WalkEntry, WalkRequest, cancel_request, client_frame, data_event, data_request,
+		data_response, document_op, document_result, server_frame,
 	},
 };
 use parking_lot::Mutex;
@@ -148,15 +148,15 @@ pub struct EnvClient {
 }
 
 struct ClientInner {
-	outgoing:          Sender<ClientFrame>,
-	pending:           Mutex<HashMap<u64, Sender<ServerFrame>>>,
-	hello_waiter:      Mutex<Option<Sender<ServerFrame>>>,
-	info:              Mutex<Option<ServerHello>>,
-	events:            Receiver<ServerFrame>,
-	next_id:           AtomicU64,
-	cancel:            Sender<u64>,
-	lease_close:       Sender<LeaseClose>,
-	admitter:          Mutex<Option<Arc<dyn AdmissionDispatcher>>>,
+	outgoing:     Sender<ClientFrame>,
+	pending:      Mutex<HashMap<u64, Sender<ServerFrame>>>,
+	hello_waiter: Mutex<Option<Sender<ServerFrame>>>,
+	info:         Mutex<Option<ServerHello>>,
+	events:       Receiver<ServerFrame>,
+	next_id:      AtomicU64,
+	cancel:       Sender<u64>,
+	lease_close:  Sender<LeaseClose>,
+	admitter:     Mutex<Option<Arc<dyn AdmissionDispatcher>>>,
 }
 
 trait AdmissionDispatcher: Send + Sync {
@@ -544,6 +544,33 @@ impl EnvClient {
 		{
 			server_frame::Body::RetireStarted(_) => Ok(()),
 			_ => Err(ClientError::UnexpectedResponse { expected: "RetireStarted" }),
+		}
+	}
+
+	/// Materializes one immutable Python site tree through the installer-only
+	/// environment connection.
+	///
+	/// The Environment makes the requested store references available, builds
+	/// the complete symlink farm, and atomically replaces `sites/<site_key>`.
+	/// Repeating a request with the same manifest returns the existing tree.
+	///
+	/// This method is intentionally absent from [`WorkerEnvClient`]: extension
+	/// connections can read their site tree but cannot mutate any site or store.
+	pub async fn materialize_site(
+		&self,
+		request: MaterializeSite,
+	) -> Result<SiteMaterialized, ClientError> {
+		let request =
+			DataRequest { body: Some(data_request::Body::Site(request)), ..DataRequest::default() };
+		match self
+			.one_shot(client_frame::Body::Data(request), None)
+			.await?
+		{
+			server_frame::Body::Data(DataResponse {
+				body: Some(data_response::Body::Site(response)),
+				..
+			}) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "SiteMaterialized" }),
 		}
 	}
 

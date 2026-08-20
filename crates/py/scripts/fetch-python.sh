@@ -103,7 +103,8 @@ prepare_tree() {
 			local TMP
 			TMP=$(mktemp -d "$VENDOR/bundled.XXXXXX")
 			trap 'rm -rf "$TMP"' EXIT
-			uv pip install --link-mode=copy --python "$EXECUTABLE" --target "$TMP" -r "$REQ"
+			uv pip install --link-mode=copy --python "$EXECUTABLE" --target "$TMP" \
+				--only-binary :all: --require-hashes -r "$REQ"
 			local NATIVE
 			NATIVE=$(find "$TMP" -name '*.so' -o -name '*.dylib' -o -name '*.pyd')
 			if [ -n "$NATIVE" ]; then

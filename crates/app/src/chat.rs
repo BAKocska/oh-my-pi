@@ -14,8 +14,9 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use omp_agent::{
-	Agent, AgentSnapshot, AgentState, InProcTurnClient, Journal, RpcTurnClient, TurnClient, TurnId,
-	TurnInput, TurnOptions, TurnSession as _, WorkspaceInput, project_journal,
+	Agent, AgentKind, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget, CompletionError,
+	CompletionRequest, InProcTurnClient, Journal, RpcTurnClient, TurnClient, TurnId, TurnInput,
+	TurnOptions, TurnSession as _, WorkspaceInput, project_journal, resolve_completion,
 };
 use omp_core::{Str, fmts};
 use omp_llm_catalog::GrammarBits;
@@ -56,7 +57,7 @@ const CHAT_CAPS_BASE: CapsBase = CapsBase {
 	media:              false,
 	model_class:        ModelClass::Standard,
 };
-const DEFAULT_EVAL_CONCURRENCY_LIMIT: usize = 32;
+const DEFAULT_EVAL_CONCURRENCY_LIMIT: usize = omp_agent::DEFAULT_MAX_CONCURRENCY;
 
 /// Failures while resolving or running one durable project-chat session.
 #[derive(Debug, Error)]
@@ -440,6 +441,7 @@ struct ChatParentContext {
 	sessions_dir:  PathBuf,
 	root:          PathBuf,
 	session_index: Arc<SessionIndex>,
+	tree:          Arc<AgentTree>,
 }
 
 pub(crate) struct ChatParentHost<C: TurnClient + Clone + 'static> {
@@ -449,7 +451,7 @@ pub(crate) struct ChatParentHost<C: TurnClient + Clone + 'static> {
 }
 
 impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
-	pub(crate) const fn new(
+	pub(crate) fn new(
 		client: C,
 		env: omp_env::EnvClient,
 		state: AgentState,
@@ -467,6 +469,11 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 				sessions_dir,
 				root,
 				session_index,
+				tree: Arc::new(AgentTree::new(
+					8,
+					DEFAULT_EVAL_CONCURRENCY_LIMIT,
+					omp_agent::DEFAULT_MAX_ADMISSION_QUEUE,
+				)),
 			}),
 		}
 	}
@@ -507,6 +514,21 @@ fn bridge_outcome_text(outcome: &inference_pb::Outcome) -> String {
 #[async_trait]
 impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for ChatParentHost<C> {
 	async fn completion(&self, args: Value) -> Result<Value, crate::envd::eval::BridgeHostError> {
+		let choices = args.get("choices").and_then(Value::as_array).map_or_else(
+			smallvec::SmallVec::new,
+			|values| {
+				values
+					.iter()
+					.filter_map(Value::as_str)
+					.map(Str::from)
+					.collect()
+			},
+		);
+		let completion = CompletionRequest {
+			choices,
+			default: args.get("default").and_then(Value::as_str).map(Str::from),
+			max_usd_micros: None,
+		};
 		let prompt = args.get("prompt").and_then(Value::as_str).ok_or_else(|| {
 			crate::envd::eval::BridgeHostError::message("completion prompt is required")
 		})?;
@@ -563,10 +585,30 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 			match event.event {
 				Some(inference_pb::turn_event::Event::Outcome(outcome)) => {
-					return Ok(json!({ "text": bridge_outcome_text(&outcome) }));
+					let text = Str::from(bridge_outcome_text(&outcome));
+					let completion = resolve_completion(&completion, Ok(text)).map_err(|error| {
+						crate::envd::eval::BridgeHostError::message(error.to_string())
+					})?;
+					if completion.choice.is_none() && !completion.fell_back {
+						return Ok(json!({ "text": completion.text }));
+					}
+					return Ok(json!({
+						"text": completion.text,
+						"choice": completion.choice,
+						"fell_back": completion.fell_back,
+					}));
 				},
 				Some(inference_pb::turn_event::Event::Error(error)) => {
-					return Err(crate::envd::eval::BridgeHostError::message(error.detail));
+					let completion = resolve_completion(
+						&completion,
+						Err(CompletionError::Provider(Str::from(error.detail))),
+					)
+					.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+					return Ok(json!({
+						"text": completion.text,
+						"choice": completion.choice,
+						"fell_back": completion.fell_back,
+					}));
 				},
 				_ => {},
 			}
@@ -585,7 +627,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				"agent type '{kind}' is not available in this session"
 			)));
 		}
-		for option in ["label", "isolated", "apply", "merge"] {
+		for option in ["isolated", "apply", "merge"] {
 			if args.get(option).is_some() {
 				return Err(crate::envd::eval::BridgeHostError::message(format!(
 					"agent option '{option}' is not supported by this session"
@@ -600,6 +642,27 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		let context = self.context.lock().clone();
 		let id = Str::from(ulid::Ulid::generate().to_string());
 		let directory = context.sessions_dir.join("eval-agents");
+		let name = args
+			.get("label")
+			.and_then(Value::as_str)
+			.map_or_else(|| id.clone(), Str::from);
+		let _permit = context
+			.tree
+			.admit(1)
+			.await
+			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		let node = context
+			.tree
+			.register(
+				id.clone(),
+				name,
+				AgentKind::Subagent,
+				None,
+				context.session_id.clone(),
+				Budget::default(),
+			)
+			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		node.set_status(AgentStatus::Running);
 		std::fs::create_dir_all(&directory)
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		let parent = SessionId(context.session_id.clone());
@@ -632,13 +695,22 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			journal,
 			CHAT_CAPS_BASE,
 		);
-		let summary = child
+		let summary = match child
 			.submit(
 				[bridge_message(Role::User, prompt)],
 				TurnId::new(format!("eval-agent-{}", ulid::Ulid::generate())),
 			)
 			.await
-			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		{
+			Ok(summary) => {
+				node.set_status(AgentStatus::Completed);
+				summary
+			},
+			Err(error) => {
+				node.set_status(AgentStatus::Failed);
+				return Err(crate::envd::eval::BridgeHostError::message(error.to_string()));
+			},
+		};
 		let text = summary
 			.outcome
 			.as_ref()
@@ -659,7 +731,8 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 	}
 
 	async fn concurrency(&self, _args: Value) -> Result<Value, crate::envd::eval::BridgeHostError> {
-		Ok(json!({ "limit": DEFAULT_EVAL_CONCURRENCY_LIMIT }))
+		let context = self.context.lock();
+		Ok(json!({ "limit": context.tree.max_concurrency() }))
 	}
 
 	async fn budget(&self, _args: Value) -> Result<Value, crate::envd::eval::BridgeHostError> {
@@ -1293,8 +1366,10 @@ fn agent_snapshot(
 		Vec::new()
 	} else {
 		registry.advertise(LoweringCaps {
-			strict_schema: true,
-			grammar:       GrammarBits::LARK | GrammarBits::REGEX | GrammarBits::EBNF,
+			strict_schema:  true,
+			grammar:        GrammarBits::LARK | GrammarBits::REGEX | GrammarBits::EBNF,
+			maximum_tools:  None,
+			maximum_strict: None,
 		})?
 	};
 	let mut enabled_tools = Vec::with_capacity(advertised.len());

@@ -11,12 +11,16 @@ readme = "README.md"
 
 [dependencies]
 bytes = { workspace = true }
+blake3 = { workspace = true }
 flume = { workspace = true }
 omp-core = { workspace = true }
 omp-proto = { workspace = true }
+omp-ar = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

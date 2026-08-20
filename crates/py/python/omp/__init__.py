@@ -45,6 +45,7 @@ from _omp import (
     Principal,
     QuotaExceeded,
     ResourceReceipt,
+    Secret,
     StaleGeneration,
     TrustError,
     WorkspaceUri,
@@ -231,6 +232,20 @@ from .placement import (
     workers,
 )
 
+from . import index as index
+from . import packages as packages
+from .diagnostics import DiagnosticCode, FailureCode, WarningCode
+from .packages import (
+    Distribution,
+    GrantError,
+    IntegrityError,
+    Origin,
+    PackageError,
+    Provenance,
+    ResolutionError,
+    SiteTree,
+)
+
 
 def device(name: str, *, family: str, rev: int, place: str | Place = "host"):
     """Declare a device and record its parsed placement before FREEZE."""
@@ -364,4 +379,18 @@ __all__ = (
     "device",
     "worker_state",
     "workers",
+    "DiagnosticCode",
+    "Distribution",
+    "FailureCode",
+    "GrantError",
+    "IntegrityError",
+    "Origin",
+    "PackageError",
+    "Provenance",
+    "ResolutionError",
+    "SiteTree",
+    "Secret",
+    "WarningCode",
+    "index",
+    "packages",
 )

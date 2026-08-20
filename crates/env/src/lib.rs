@@ -6,12 +6,17 @@
 //! behind the environment service in both in-process and remote deployments.
 
 mod admit;
+mod bundle;
 mod client;
 mod guard;
 #[cfg(windows)]
 pub mod windows;
 
 pub use admit::Admitter;
+pub use bundle::{
+	AirgapBundle, BundleEntry, BundleError, BundleFile, BundleManifest, pack_bundle, pull_bundle,
+	push_bundle, unpack_bundle,
+};
 pub use client::{
 	BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DataScope, DataStream, DataStreamItem,
 	DocumentEvents, DocumentLease, DocumentRead, EnvClient, ExecEvent, ExecRun,

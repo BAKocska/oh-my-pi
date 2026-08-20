@@ -1,0 +1,542 @@
+//! Reproducible extension locks and local installation records.
+
+use std::{collections::BTreeMap, fs, io, path::Path};
+
+use omp_core::Str;
+use serde::{Deserialize, Serialize};
+
+use super::{ExtensionCode, ExtensionError, Layer, TrustTier};
+
+/// Current `omp.lock` format version.
+pub const LOCK_VERSION: u32 = 1;
+
+/// A hash-addressed wheel accepted by a target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Wheel {
+	/// Wheel filename.
+	pub file:   Str,
+	/// Wheel tag.
+	pub tag:    Str,
+	/// Artifact byte count.
+	pub size:   u64,
+	/// BLAKE3 artifact digest.
+	pub blake3: Str,
+	/// SHA-256 artifact digest.
+	pub sha256: Str,
+}
+
+/// A locked extension root.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LockedExtension {
+	/// Stable extension id.
+	pub id:                Str,
+	/// Exact PEP 440 version.
+	pub version:           Str,
+	/// Requested isolation tier.
+	pub tier:              TrustTier,
+	/// Optional explicit sharing group.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pool:              Option<Str>,
+	/// Features enabled while resolving.
+	pub features:          Vec<Str>,
+	/// Reproducible source description, never a link source.
+	pub source:            toml::Value,
+	/// Canonical manifest BLAKE3 digest.
+	pub manifest_digest:   Str,
+	/// Capability digest used for consent.
+	pub capability_digest: Str,
+	/// TOFU publisher key.
+	pub publisher:         Str,
+	/// Publisher signature over both artifact hashes and capability digest.
+	pub signature:         Str,
+	/// Code shipping level.
+	pub ship:              Str,
+	/// Exact direct requirements.
+	pub requires:          Vec<Str>,
+	/// Extension's primary wheel.
+	pub wheel:             Wheel,
+}
+
+/// A package closure node with one wheel per supported target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LockedPackage {
+	/// PEP 503 normalized name.
+	pub name:         Str,
+	/// Exact version.
+	pub version:      Str,
+	/// First index providing the name.
+	pub index:        String,
+	/// Extension ids introducing this package.
+	pub requested_by: Vec<Str>,
+	/// Target-side marker, empty when unconditional.
+	pub marker:       String,
+	/// Target-specific wheels.
+	pub wheels:       Vec<Wheel>,
+}
+
+/// Runtime metadata explaining a frozen-first resolver pin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FrozenDistribution {
+	/// Distribution name.
+	pub name:    Str,
+	/// Exact frozen version.
+	pub version: Str,
+	/// Human-readable frozen-first reason.
+	pub reason:  Str,
+}
+
+/// The committed, portable extension resolution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LockFile {
+	/// Lock format version.
+	pub version:         u32,
+	/// Writer identity.
+	pub generated_by:    String,
+	/// RFC 3339 generation timestamp.
+	pub generated_at:    String,
+	/// Owning layer.
+	pub layer:           Layer,
+	/// Required CPython version.
+	pub requires_python: Str,
+	/// Required CPython ABI.
+	pub abi:             Str,
+	/// Union of resolved target triples.
+	pub targets:         Vec<Str>,
+	/// Optional R9 upload-time clamp.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub exclude_newer:   Option<Str>,
+	/// Ordered configured indexes.
+	pub indexes:         Vec<String>,
+	/// Dependency-confusion-safe index strategy.
+	pub index_strategy:  Str,
+	/// Locked extension roots.
+	#[serde(rename = "extension")]
+	pub extensions:      Vec<LockedExtension>,
+	/// Locked dependency closure.
+	#[serde(rename = "package")]
+	pub packages:        Vec<LockedPackage>,
+	/// Runtime frozen distributions.
+	#[serde(rename = "frozen")]
+	pub frozen:          Vec<FrozenDistribution>,
+}
+
+impl LockFile {
+	/// Validates reader-critical invariants before a lock is consumed.
+	pub fn validate_for(&self, layer: Layer) -> Result<(), ExtensionError> {
+		if self.version > LOCK_VERSION {
+			return Err(ExtensionError::new(
+				ExtensionCode::ELockVersion,
+				"lock format is newer than this binary",
+			));
+		}
+		if self.layer != layer {
+			return Err(ExtensionError::new(
+				ExtensionCode::ELockLayer,
+				"lock belongs to a different layer",
+			));
+		}
+		if self.requires_python.as_str() != "==3.14.*" || self.abi.as_str() != "cp314t" {
+			return Err(ExtensionError::new(
+				ExtensionCode::ELockPython,
+				"lock does not target CPython 3.14t",
+			));
+		}
+		if self.index_strategy.as_str() != "first-index" {
+			return Err(ExtensionError::new(
+				ExtensionCode::EIndexDrift,
+				"lock does not use first-index",
+			));
+		}
+		let mut ids = std::collections::BTreeSet::new();
+		for extension in &self.extensions {
+			if !ids.insert(&extension.id) {
+				return Err(ExtensionError::new(
+					ExtensionCode::ELockDup,
+					format!("duplicate extension id {}", extension.id),
+				));
+			}
+			if extension
+				.source
+				.as_table()
+				.is_some_and(|source| source.contains_key("link"))
+			{
+				return Err(ExtensionError::new(
+					ExtensionCode::ELockLink,
+					"link sources are not reproducible",
+				));
+			}
+		}
+		let mut package_versions = BTreeMap::new();
+		for package in &self.packages {
+			if let Some(version) = package_versions.insert(&package.name, &package.version)
+				&& version != &package.version
+			{
+				return Err(ExtensionError::new(
+					ExtensionCode::EUnsat,
+					format!("multiple versions of {} in one host child", package.name),
+				));
+			}
+		}
+		Ok(())
+	}
+
+	/// Reads and validates one `omp.lock`.
+	pub fn read(path: &Path, layer: Layer) -> Result<Self, ExtensionError> {
+		let text = fs::read_to_string(path)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
+		let lock: Self = toml::from_str(&text)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
+		lock.validate_for(layer)?;
+		Ok(lock)
+	}
+
+	/// Atomically writes a committed `omp.lock`.
+	pub fn write(&self, path: &Path) -> io::Result<()> {
+		atomic_toml(path, self)
+	}
+
+	/// Merges a target-specific resolution into a per-target union lock.
+	/// Existing package metadata remains canonical while unique target wheels
+	/// are appended by filename and tag.
+	pub fn union_target(&mut self, other: &Self) -> Result<(), ExtensionError> {
+		if self.layer != other.layer
+			|| self.requires_python != other.requires_python
+			|| self.abi != other.abi
+		{
+			return Err(ExtensionError::new(
+				ExtensionCode::ELockPython,
+				"cannot union incompatible lock headers",
+			));
+		}
+		for target in &other.targets {
+			if !self.targets.contains(target) {
+				self.targets.push(target.clone());
+			}
+		}
+		for package in &other.packages {
+			if let Some(existing) = self.packages.iter_mut().find(|candidate| {
+				candidate.name == package.name && candidate.version == package.version
+			}) {
+				for wheel in &package.wheels {
+					if !existing
+						.wheels
+						.iter()
+						.any(|candidate| candidate.file == wheel.file && candidate.tag == wheel.tag)
+					{
+						existing.wheels.push(wheel.clone());
+					}
+				}
+			} else {
+				self.packages.push(package.clone());
+			}
+		}
+		Ok(())
+	}
+
+	/// Exports the dependency closure to the PEP 751 `pylock.toml` subset.
+	pub fn export_pylock(&self, path: &Path) -> io::Result<()> {
+		#[derive(Serialize)]
+		struct PyLock<'a> {
+			lock_version:    &'static str,
+			requires_python: &'a Str,
+			#[serde(rename = "package")]
+			packages:        &'a [LockedPackage],
+		}
+		atomic_toml(path, &PyLock {
+			lock_version:    "1.0",
+			requires_python: &self.requires_python,
+			packages:        &self.packages,
+		})
+	}
+}
+
+/// Local-only record of materialized extension selections, including `link`
+/// overlays that are intentionally excluded from `omp.lock`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstalledRecord {
+	/// Install record format version.
+	#[serde(default = "installed_version")]
+	pub version:    u32,
+	/// Local extension selections.
+	#[serde(rename = "extension", default)]
+	pub extensions: Vec<InstalledExtension>,
+}
+
+const fn installed_version() -> u32 {
+	1
+}
+
+/// One local extension selection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InstalledExtension {
+	/// Stable extension id.
+	pub id:      Str,
+	/// Local source, including permitted `{ link = ... }` overlays.
+	pub source:  toml::Value,
+	/// Requested tier.
+	pub tier:    TrustTier,
+	/// Whether this local selection is enabled.
+	pub enabled: bool,
+}
+
+/// The materialized per-host site tree carried into the Python package
+/// snapshot. This is constructed from SiteTree's result, not guessed from a
+/// lock path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedSite {
+	/// Absolute managed site-tree path.
+	pub path:       std::path::PathBuf,
+	/// Content-addressed site-tree key.
+	pub key:        Str,
+	/// Resolution layer.
+	pub layer:      Layer,
+	/// Granted host tier.
+	pub tier:       TrustTier,
+	/// Optional explicit sharing pool.
+	pub pool:       Option<Str>,
+	/// Resolution fingerprint.
+	pub resolution: Str,
+	/// Source lock path when a durable lock produced the tree.
+	pub lock:       Option<std::path::PathBuf>,
+}
+
+/// Builds the verified UTF-8 JSON envelope consumed by
+/// `omp.packages._install_snapshot_json` before extension code starts.
+///
+/// Linked and path-development extensions have no reproducible closure and
+/// return `None`; every non-development extension either yields a complete
+/// snapshot or fails with a typed lock diagnostic.
+pub fn package_snapshot(
+	installed: &InstalledExtension,
+	lock: &LockFile,
+	site: &MaterializedSite,
+	modules: impl IntoIterator<Item = (Str, Str)>,
+) -> Result<Option<Str>, ExtensionError> {
+	if development_source(&installed.source) {
+		return Ok(None);
+	}
+	let extension = lock
+		.extensions
+		.iter()
+		.find(|extension| extension.id == installed.id)
+		.ok_or_else(|| {
+			ExtensionError::new(
+				ExtensionCode::ELockDrift,
+				format!("{} has no locked closure", installed.id),
+			)
+		})?;
+	if extension.publisher.as_str().is_empty()
+		|| extension.publisher.as_str().starts_with("unsigned:")
+	{
+		return Ok(None);
+	}
+	let root_name = distribution_name(&extension.source).ok_or_else(|| {
+		ExtensionError::new(
+			ExtensionCode::ELockDrift,
+			format!("{} has no locked distribution name", installed.id),
+		)
+	})?;
+	#[derive(Serialize)]
+	struct Distribution<'a> {
+		name:         &'a Str,
+		version:      &'a Str,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		extension_id: Option<&'a Str>,
+		origin:       &'static str,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		tag:          Option<&'a Str>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		blake3:       Option<&'a Str>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		root:         Option<String>,
+		files:        Vec<String>,
+		requested_by: Vec<&'a Str>,
+		vendored:     Vec<String>,
+	}
+	#[derive(Serialize)]
+	struct Tree<'a> {
+		path:       String,
+		key:        &'a Str,
+		layer:      Layer,
+		tier:       TrustTier,
+		pool:       Option<&'a Str>,
+		resolution: &'a Str,
+		lock:       Option<String>,
+	}
+	#[derive(Serialize)]
+	struct Envelope<'a> {
+		distributions: Vec<Distribution<'a>>,
+		modules:       BTreeMap<Str, Str>,
+		own:           Option<Str>,
+		tree:          Option<Tree<'a>>,
+	}
+	let root = Some(site.path.display().to_string());
+	let mut distributions = vec![Distribution {
+		name:         &root_name,
+		version:      &extension.version,
+		extension_id: Some(&extension.id),
+		origin:       "store",
+		tag:          Some(&extension.wheel.tag),
+		blake3:       Some(&extension.wheel.blake3),
+		root:         root.clone(),
+		files:        Vec::new(),
+		requested_by: Vec::new(),
+		vendored:     Vec::new(),
+	}];
+	for package in &lock.packages {
+		if !package.requested_by.contains(&installed.id) {
+			continue;
+		}
+		let wheel = package.wheels.first();
+		distributions.push(Distribution {
+			name:         &package.name,
+			version:      &package.version,
+			extension_id: None,
+			origin:       "store",
+			tag:          wheel.map(|wheel| &wheel.tag),
+			blake3:       wheel.map(|wheel| &wheel.blake3),
+			root:         root.clone(),
+			files:        Vec::new(),
+			requested_by: package.requested_by.iter().collect(),
+			vendored:     Vec::new(),
+		});
+	}
+	for frozen in &lock.frozen {
+		if distributions
+			.iter()
+			.any(|distribution| distribution.name == &frozen.name)
+		{
+			continue;
+		}
+		distributions.push(Distribution {
+			name:         &frozen.name,
+			version:      &frozen.version,
+			extension_id: None,
+			origin:       "frozen",
+			tag:          None,
+			blake3:       None,
+			root:         None,
+			files:        Vec::new(),
+			requested_by: Vec::new(),
+			vendored:     Vec::new(),
+		});
+	}
+	let modules: BTreeMap<Str, Str> = modules.into_iter().collect();
+	for owner in modules.values() {
+		if !distributions
+			.iter()
+			.any(|distribution| distribution.name == owner)
+		{
+			return Err(ExtensionError::new(
+				ExtensionCode::EIntegrity,
+				format!("module owner {owner} is outside the locked closure"),
+			));
+		}
+	}
+	let envelope = Envelope {
+		distributions,
+		modules,
+		own: Some(root_name.clone()),
+		tree: Some(Tree {
+			path:       site.path.display().to_string(),
+			key:        &site.key,
+			layer:      site.layer,
+			tier:       site.tier,
+			pool:       site.pool.as_ref(),
+			resolution: &site.resolution,
+			lock:       site.lock.as_ref().map(|path| path.display().to_string()),
+		}),
+	};
+	let envelope = serde_json::to_string(&envelope)
+		.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))?;
+	Ok(Some(Str::new(envelope)))
+}
+
+fn development_source(source: &toml::Value) -> bool {
+	source
+		.as_table()
+		.is_some_and(|source| source.contains_key("link") || source.contains_key("path"))
+}
+
+fn distribution_name(source: &toml::Value) -> Option<Str> {
+	let source = source.as_table()?;
+	source
+		.get("dist")
+		.or_else(|| source.get("pypi"))
+		.and_then(toml::Value::as_str)
+		.map(Str::new)
+}
+
+impl InstalledRecord {
+	/// Reads an absent install record as an empty record.
+	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
+		if !path.exists() {
+			return Ok(Self { version: installed_version(), ..Self::default() });
+		}
+		let text = fs::read_to_string(path)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
+		toml::from_str(&text)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))
+	}
+
+	/// Atomically writes `installed.toml`.
+	pub fn write(&self, path: &Path) -> io::Result<()> {
+		atomic_toml(path, self)
+	}
+}
+
+/// Writes TOML through a sibling temporary file then renames it into place.
+pub(crate) fn atomic_toml<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+	let parent = path.parent().unwrap_or_else(|| Path::new("."));
+	fs::create_dir_all(parent)?;
+	let temporary = path.with_extension(format!(
+		"{}.tmp",
+		path
+			.extension()
+			.and_then(|extension| extension.to_str())
+			.unwrap_or("toml")
+	));
+	let data = toml::to_string_pretty(value).map_err(io::Error::other)?;
+	fs::write(&temporary, data)?;
+	fs::rename(temporary, path)
+}
+
+/// Builds the source table used by reproducible lock entries.
+#[must_use]
+pub fn index_source(index: &str, distribution: &Str) -> toml::Value {
+	let mut source = toml::map::Map::new();
+	source.insert("index".to_owned(), toml::Value::String(index.to_owned()));
+	source.insert("dist".to_owned(), toml::Value::String(distribution.to_string()));
+	toml::Value::Table(source)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn lock() -> LockFile {
+		LockFile {
+			version:         1,
+			generated_by:    "omp test".to_owned(),
+			generated_at:    "2026-08-20T00:00:00Z".to_owned(),
+			layer:           Layer::Workspace,
+			requires_python: Str::new_static("==3.14.*"),
+			abi:             Str::new_static("cp314t"),
+			targets:         vec![Str::new_static("aarch64-apple-darwin")],
+			exclude_newer:   None,
+			indexes:         vec!["https://pypi.org/simple".to_owned()],
+			index_strategy:  Str::new_static("first-index"),
+			extensions:      vec![],
+			packages:        vec![],
+			frozen:          vec![],
+		}
+	}
+
+	#[test]
+	fn lock_round_trip() {
+		let directory = tempfile::tempdir().expect("temporary lock directory");
+		let path = directory.path().join("omp.lock");
+		lock().write(&path).expect("write lock");
+		assert_eq!(LockFile::read(&path, Layer::Workspace).expect("read lock"), lock());
+	}
+}

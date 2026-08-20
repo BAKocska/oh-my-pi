@@ -18,6 +18,8 @@ pub mod daemon;
 pub mod discovery;
 pub mod endpoint;
 pub mod envd;
+pub mod ext;
+pub mod ext_cli;
 pub mod exthost;
 pub mod project_state;
 pub mod rpc_adapter;

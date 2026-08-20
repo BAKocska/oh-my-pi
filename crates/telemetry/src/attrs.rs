@@ -188,6 +188,49 @@ pub mod omp_gen_ai {
 	/// Gateway response-cache status (hit/miss/bypass) on `chat` spans; this
 	/// is not prompt-cache status.
 	pub const GATEWAY_RESPONSE_CACHE_STATUS: &str = "omp.gen_ai.gateway.response_cache.status";
+
+	/// Assembler-computed prompt digest on settled chat spans.
+	pub const PROMPT_DIGEST: &str = "omp.gen_ai.prompt.digest";
+	/// Changed prompt-slot keys on settled chat spans.
+	pub const PROMPT_CHANGED_SLOTS: &str = "omp.gen_ai.prompt.changed_slots";
+	/// Byte length of the cacheable prefix shared with the prior prompt.
+	pub const PROMPT_PREFIX_STABLE_BYTES: &str = "omp.gen_ai.prompt.prefix_stable_bytes";
+	/// Provider cache-affinity key on settled chat spans.
+	pub const CACHE_KEY: &str = "omp.gen_ai.cache.key";
+	/// Cache breakpoint strategy on settled chat spans.
+	pub const CACHE_BREAKPOINT: &str = "omp.gen_ai.cache.breakpoint";
+}
+
+/// Firehose-only facts that have no OpenTelemetry semantic-convention owner.
+pub mod omp_firehose {
+	/// Committed tool revision on tool-call events and execute-tool spans.
+	pub const TOOL_REV: &str = "omp.tool.rev";
+	/// Tool execution placement on tool-call events and execute-tool spans.
+	pub const TOOL_PLACE: &str = "omp.tool.place";
+	/// Tool target discriminant on tool-call events and execute-tool spans.
+	pub const TOOL_TARGET: &str = "omp.tool.target";
+	/// Speculative decoding time on tool-call events and execute-tool spans.
+	pub const TOOL_SPECULATION_MS: &str = "omp.tool.speculation_ms";
+	/// Size of a tool's rendered projection, never its text.
+	pub const TOOL_PROMPT_BYTES: &str = "omp.tool.prompt_bytes";
+	/// Applied charitable repairs on tool-call events and execute-tool spans.
+	pub const TOOL_REPAIRS: &str = "omp.tool.repairs";
+	/// Classified tool fault code on tool-call events and execute-tool spans.
+	pub const TOOL_FAULT_CODE: &str = "omp.tool.fault_code";
+	/// Compaction trigger on compaction events.
+	pub const COMPACTION_REASON: &str = "omp.compaction.reason";
+	/// Structured outcomes preserved by compaction.
+	pub const COMPACTION_OUTCOMES_KEPT: &str = "omp.compaction.outcomes_kept";
+	/// Identifier of a spilled artifact.
+	pub const ARTIFACT_ID: &str = "omp.artifact.id";
+	/// Layer that caused an artifact spill.
+	pub const ARTIFACT_REASON: &str = "omp.artifact.reason";
+	/// Identifier of a durable AutoQA issue.
+	pub const ISSUE_ID: &str = "omp.issue.id";
+	/// Requested capability constraint intent.
+	pub const CONSTRAINT_INTENT: &str = "omp.constraint.intent";
+	/// Granted capability-constraint result.
+	pub const CONSTRAINT_GRANTED: &str = "omp.constraint.granted";
 }
 
 /// omp runtime-duration attributes emitted on metrics and durable receipts.

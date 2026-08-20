@@ -15,7 +15,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use omp_core::Str;
+use omp_core::{EnvPath, Str};
 use opentelemetry::{
 	Key, KeyValue, global,
 	logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity},
@@ -32,8 +32,71 @@ use serde_json::Value as JsonValue;
 
 use crate::{
 	collector::{RunCoverage, RunSummary},
-	semconv::{CaptureMode, METER_NAME},
+	semconv::{CaptureMode, ExportProtocol, METER_NAME},
 };
+
+/// A declarative, Rust-owned destination for post-hoc telemetry events.
+///
+/// Targets never invoke Python for an event. Registration and consent happen
+/// outside the turn; exporters own batching, retries, and flushing.
+#[derive(Clone, Debug)]
+pub enum ExportTarget {
+	/// Direct OTLP egress under an explicit network capability.
+	Otlp(OtlpTarget),
+	/// Framed writes to an environment-managed named process.
+	Process(ProcessTarget),
+	/// Writes inside the declaring environment's filesystem namespace.
+	File(FileTarget),
+}
+
+/// Declarative OTLP destination.
+#[derive(Clone, Debug)]
+pub struct OtlpTarget {
+	/// Network endpoint approved by the durable destination grant.
+	pub endpoint: Str,
+	/// OTLP transport protocol.
+	pub protocol: ExportProtocol,
+	/// Static headers resolved from the extension's capability-scoped
+	/// credentials.
+	pub headers:  Vec<(Str, Str)>,
+}
+
+/// Declarative named-process destination.
+#[derive(Clone, Debug)]
+pub struct ProcessTarget {
+	/// Environment-managed process name.
+	pub process:   Str,
+	/// Framing protocol for records written to the process.
+	pub protocol:  ExportProtocol,
+	/// Optional startup handshake frame owned by the exporter.
+	pub handshake: Option<JsonValue>,
+}
+
+/// Declarative environment-local file destination.
+#[derive(Clone, Debug)]
+pub struct FileTarget {
+	/// Environment-relative output path; never a client-local path.
+	pub path: EnvPath,
+}
+
+/// Non-fatal exporter health counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExportStats {
+	/// Events queued for a target's exporter worker.
+	pub queue_depth: u64,
+	/// Events dropped by that target's bounded exporter queue.
+	pub dropped:     u64,
+	/// Current retry delay after a target failure.
+	pub backoff_ms:  u64,
+}
+
+impl ExportTarget {
+	/// Returns whether this target requires explicit network egress capability.
+	#[must_use]
+	pub const fn requires_network(&self) -> bool {
+		matches!(self, Self::Otlp(_))
+	}
+}
 
 /// Interval at which long-lived hosts force buffered telemetry out.
 pub const FLUSH_INTERVAL_MS: u64 = 30_000;

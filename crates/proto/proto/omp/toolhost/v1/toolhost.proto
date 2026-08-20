@@ -44,23 +44,27 @@ enum GrammarSyntax {
 }
 
 message SchemaConstraint {
+  // Constraint-budget priority; LARGER values are preferred (ratified 2026-08-19).
   uint32 priority = 1;
   omp.inference.v1.Fallback on_unsupported = 2;
 }
 message GrammarConstraint {
   GrammarSyntax syntax = 1;
   string definition = 2;
+  // Constraint-budget priority; LARGER values are preferred (ratified 2026-08-19).
   uint32 priority = 3;
   omp.inference.v1.Fallback on_unsupported = 4;
 }
 message TextualConstraint {
   GrammarSyntax syntax = 1;
   string expression = 2;
+  // Constraint-budget priority; LARGER values are preferred (ratified 2026-08-19).
   uint32 priority = 3;
   omp.inference.v1.Fallback on_unsupported = 4;
 }
 message JsonConstraint {
   bytes schema_json = 1;
+  // Constraint-budget priority; LARGER values are preferred (ratified 2026-08-19).
   uint32 priority = 2;
   omp.inference.v1.Fallback on_unsupported = 3;
 }

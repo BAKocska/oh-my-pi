@@ -36,9 +36,14 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub struct LoweringCaps {
 	/// Whether per-tool strict JSON Schema is supported.
-	pub strict_schema: bool,
+	pub strict_schema:  bool,
 	/// Supported freeform grammar languages.
-	pub grammar:       GrammarBits,
+	pub grammar:        GrammarBits,
+	/// Maximum model-visible tool declarations, when the route declares one.
+	pub maximum_tools:  Option<u16>,
+	/// Maximum native strict JSON Schema declarations, when the route declares
+	/// one.
+	pub maximum_strict: Option<u16>,
 }
 
 /// Strength retained after capability-aware constraint lowering.
@@ -1243,16 +1248,59 @@ impl Registry {
 		Ok(entry.tool.call(params))
 	}
 
-	/// Lowers only policy-resolved model-visible slots.
+	/// Lowers only policy-resolved native model-visible slots in priority order.
+	///
+	/// Larger priorities win. Core slots occupy the upper priority band, so an
+	/// extension declaration can never displace a core intent when a route is
+	/// capacity-constrained.
 	pub fn advertise(&self, caps: LoweringCaps) -> Result<Vec<LoweredTool>, RegistryError> {
-		self
+		let mut entries = self
 			.live
 			.iter()
 			.filter_map(|(name, claim)| {
 				let entry = self.versions.get(name)?.get(&claim.rev)?;
-				(entry.presentation == Presentation::Slot).then(|| lower(entry.tool.as_ref(), caps))
+				(entry.presentation == Presentation::Slot
+					&& matches!(entry.tool.route(), ToolRoute::Native))
+				.then_some(entry)
 			})
-			.collect()
+			.collect::<Vec<_>>();
+		entries.sort_by(|left, right| {
+			advertisement_priority(right)
+				.cmp(&advertisement_priority(left))
+				.then_with(|| left.tool.spec().name.cmp(&right.tool.spec().name))
+		});
+
+		let mut lowered = Vec::with_capacity(entries.len());
+		let mut strict = 0_usize;
+		for entry in entries {
+			if caps
+				.maximum_tools
+				.is_some_and(|limit| lowered.len() >= limit as usize)
+			{
+				if constraint_requires_capacity(entry.tool.spec()) {
+					return Err(budget_constraint_error(entry.tool.spec(), "tool-count-budget"));
+				}
+				continue;
+			}
+			let mut tool = lower(entry.tool.as_ref(), caps)?;
+			tool.priority = constraint_priority(&entry.tool.spec().constraint)
+				.map(|_| advertisement_priority(entry));
+			if is_native_strict(&tool)
+				&& caps
+					.maximum_strict
+					.is_some_and(|limit| strict >= limit as usize)
+			{
+				if constraint_requires_capacity(entry.tool.spec()) {
+					return Err(budget_constraint_error(entry.tool.spec(), "strict-schema-budget"));
+				}
+				downgrade_strict(&mut tool);
+			}
+			if is_native_strict(&tool) {
+				strict = strict.saturating_add(1);
+			}
+			lowered.push(tool);
+		}
+		Ok(lowered)
 	}
 
 	/// Deterministically projects a structured live verdict through its tool.
@@ -1726,6 +1774,52 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, Regi
 		priority,
 		adjustments,
 	})
+}
+const EXTENSION_PRIORITY_MAX: u8 = 127;
+const CORE_PRIORITY_MIN: u8 = 128;
+
+fn constraint_priority(constraint: &Constraint) -> Option<u8> {
+	match constraint {
+		Constraint::None => None,
+		Constraint::Schema { priority, .. } | Constraint::Grammar { priority, .. } => Some(*priority),
+	}
+}
+
+fn advertisement_priority(entry: &RegistryEntry) -> u8 {
+	let requested = constraint_priority(&entry.tool.spec().constraint).unwrap_or_default();
+	if entry.claims.precedence == Precedence::CORE {
+		CORE_PRIORITY_MIN.saturating_add(requested / 2)
+	} else {
+		requested.min(EXTENSION_PRIORITY_MAX)
+	}
+}
+
+fn constraint_requires_capacity(spec: &crate::ToolSpec) -> bool {
+	matches!(
+		&spec.constraint,
+		Constraint::Schema { on_unsupported: omp_proto::inference::v1::Fallback::Error, .. }
+			| Constraint::Grammar { on_unsupported: omp_proto::inference::v1::Fallback::Error, .. }
+	)
+}
+
+fn budget_constraint_error(spec: &crate::ToolSpec, feature: &'static str) -> RegistryError {
+	RegistryError::UnsupportedConstraint { name: spec.name.clone(), rev: spec.rev.clone(), feature }
+}
+
+fn is_native_strict(tool: &LoweredTool) -> bool {
+	matches!(&tool.definition.input, ToolInputConstraint::JsonSchema { strict: true, .. })
+}
+
+fn downgrade_strict(tool: &mut LoweredTool) {
+	if let ToolInputConstraint::JsonSchema { strict, .. } = &mut tool.definition.input {
+		*strict = false;
+	}
+	tool.disposition = Some(ConstraintDisposition::Prefer);
+	tool.adjustments.push(dropped(
+		&tool.definition.name,
+		"schema",
+		"catalog.strict-schema-budget-exhausted",
+	));
 }
 
 fn external_error(spec: &crate::ToolSpec, operation: &'static str) -> RegistryError {

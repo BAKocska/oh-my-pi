@@ -154,6 +154,10 @@ fn main() {
 	println!("cargo::rerun-if-changed={}", py_src.display());
 	println!("cargo::rerun-if-changed={}", requirements.display());
 	println!("cargo::rerun-if-changed={}", packer.display());
+	let frozen_metadata =
+		PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("frozen_distributions.rs");
+	write_frozen_distributions(&requirements, &frozen_metadata);
+	println!("cargo::rustc-env=OMP_PY_FROZEN_DISTRIBUTIONS={}", frozen_metadata.display());
 
 	let url_vocab = manifest.join("../tools/url-vocab.json");
 	println!("cargo::rerun-if-changed={}", url_vocab.display());
@@ -258,4 +262,38 @@ fn bundled_packages(requirements: &Path, vendor: &Path) -> Option<PathBuf> {
 		requirements.display()
 	);
 	Some(dir)
+}
+
+/// Emits the frozen distribution metadata consumed by the extension resolver.
+///
+/// Requirements are intentionally parsed narrowly: bundled distributions must
+/// be exact pins, while one or more `--hash=sha256:` entries may follow the
+/// pin for `uv --require-hashes`.
+fn write_frozen_distributions(requirements: &Path, output: &Path) {
+	let requirements =
+		std::fs::read_to_string(requirements).expect("read frozen Python requirements");
+	let mut rows = Vec::new();
+	for line in requirements.lines().map(str::trim) {
+		if line.is_empty() || line.starts_with('#') {
+			continue;
+		}
+		let pin = line
+			.split_whitespace()
+			.next()
+			.expect("nonempty requirement");
+		let (name, version) = pin
+			.split_once("==")
+			.filter(|(_, version)| !version.is_empty())
+			.unwrap_or_else(|| panic!("frozen requirement must use name==version: {line}"));
+		rows.push((name, version));
+	}
+	let mut source = String::from(
+		"/// Frozen third-party distributions compiled into the embedded runtime.\nconst \
+		 FROZEN_DISTRIBUTIONS: &[(&str, &str)] = &[\n",
+	);
+	for (name, version) in rows {
+		writeln!(&mut source, "\t({name:?}, {version:?}),").expect("write frozen metadata");
+	}
+	source.push_str("];\n");
+	std::fs::write(output, source).expect("write frozen distribution metadata");
 }

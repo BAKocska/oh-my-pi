@@ -568,7 +568,8 @@ pub enum Constraint {
 	None,
 	/// Strict JSON Schema sampling when supported.
 	Schema {
-		/// Relative request priority retained for upstream negotiation.
+		/// Relative request priority; larger values are preferred during
+		/// route-budget arbitration.
 		priority:       u8,
 		/// Required behavior when the selected route lacks strict sampling.
 		#[serde(default)]
@@ -580,7 +581,8 @@ pub enum Constraint {
 		syntax:         GrammarSyntax,
 		/// Complete grammar definition.
 		definition:     Str,
-		/// Relative request priority retained for upstream negotiation.
+		/// Relative request priority; larger values are preferred during
+		/// route-budget arbitration.
 		priority:       u8,
 		/// Required behavior when the selected route lacks this grammar.
 		#[serde(default)]

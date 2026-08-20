@@ -15,6 +15,11 @@ name = "baseline"
 path = "src/bin/baseline.rs"
 test = false
 
+
+[[bin]]
+name = "pooling-bench"
+path = "src/bin/pooling_bench.rs"
+test = false
 [[bin]]
 name = "omp_e2e_host"
 path = "src/bin/omp_e2e_host.rs"

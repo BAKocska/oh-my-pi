@@ -19,6 +19,7 @@ pub mod encoding;
 pub mod location;
 pub mod phase;
 pub mod principal;
+pub mod secret;
 pub mod semver;
 pub mod sparse_index;
 pub mod sparse_map;
@@ -35,6 +36,7 @@ pub use location::{
 };
 pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
 pub use principal::{ArtifactDigest, ArtifactDigestError, Principal, Provenance};
+pub use secret::Secret;
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;
 pub use sparse_set::SparseSet;

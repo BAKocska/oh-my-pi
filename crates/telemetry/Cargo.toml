@@ -10,6 +10,10 @@ description = "OpenTelemetry instrumentation, metrics, export, and redaction for
 
 [dependencies]
 omp-core = { workspace = true }
+blake3 = { workspace = true }
+flume = { workspace = true }
+omp-proto = { workspace = true }
+omp-tool = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 opentelemetry-otlp = { workspace = true }

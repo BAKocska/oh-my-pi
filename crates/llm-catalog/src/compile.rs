@@ -448,6 +448,9 @@ pub struct SourceDiscovery {
 	/// Whether absence proves unavailability.
 	#[serde(default)]
 	pub authoritative: bool,
+	/// Requested periodic polling interval in milliseconds.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub interval_ms:   Option<u64>,
 }
 
 /// Sparse typed provider/model wire-policy source.
@@ -4601,6 +4604,7 @@ fn compile_discovery(source: &SourceDiscovery) -> Result<DiscoverySpec, CompileE
 		path: Str::from("/models"),
 		pagination: DiscoveryPagination::SinglePage,
 		authoritative: source.authoritative,
+		interval: source.interval_ms.map(std::time::Duration::from_millis),
 	})
 }
 

@@ -1,11 +1,13 @@
 //! Credential-free, immutable execution plans and capability negotiation
 //! evidence.
 use std::{
+	collections::BTreeMap,
 	sync::Arc,
 	time::{Duration, Instant},
 };
 
 use omp_core::Str;
+use parking_lot::Mutex;
 
 use crate::{
 	call::Call,
@@ -102,6 +104,219 @@ pub struct PlanningPolicy {
 	pub allow_unknown_preferences: bool,
 	/// Whether unsupported preferences may be dropped with an adjustment.
 	pub allow_dropped_preferences: bool,
+}
+
+/// Per-route ceilings used to assign model-visible constraint slots.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConstraintBudgetCaps {
+	/// Maximum advertised tool declarations, when constrained by the route.
+	pub maximum_tools:  Option<u16>,
+	/// Maximum native strict-schema declarations, when constrained by the
+	/// route.
+	pub maximum_strict: Option<u16>,
+}
+
+/// One already-registered model-visible intent competing for route capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConstraintIntent {
+	/// Declaration priority; larger values are preferred.
+	pub priority: u8,
+	/// Whether this intent consumes a native strict-schema slot.
+	pub strict:   bool,
+}
+
+/// Stable per-route assignment for one registration-set epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstraintAssignment {
+	/// Indices of intents assigned a model-visible tool slot.
+	pub advertised: Arc<[usize]>,
+	/// Indices omitted because the route's bounded capacity was exhausted.
+	pub dropped:    Arc<[usize]>,
+}
+
+#[derive(Default)]
+struct ConstraintBudgetCache {
+	assignments: BTreeMap<([u8; 32], RouteId), Arc<ConstraintAssignment>>,
+}
+
+/// Caches priority-ordered constraint assignments by slot-set epoch and route.
+///
+/// The cache key deliberately uses the core-slot-only hash rather than a
+/// worker-inclusive registry hash: changing a host device must not invalidate
+/// a model prompt prefix.
+#[derive(Default)]
+pub struct ConstraintBudget {
+	cache: Mutex<ConstraintBudgetCache>,
+}
+
+impl ConstraintBudget {
+	/// Assigns a stable set of advertised constraint slots for one route.
+	///
+	/// The same `(slot_hash, route)` reuses its assignment. A changed live set
+	/// supplies a new hash; choosing a different route supplies a new route id.
+	#[must_use]
+	pub fn assign(
+		&self,
+		slot_hash: [u8; 32],
+		route: &RouteId,
+		caps: ConstraintBudgetCaps,
+		intents: &[ConstraintIntent],
+	) -> Arc<ConstraintAssignment> {
+		let key = (slot_hash, route.clone());
+		let mut cache = self.cache.lock();
+		if let Some(assignment) = cache.assignments.get(&key) {
+			return Arc::clone(assignment);
+		}
+
+		let mut ordered = (0..intents.len()).collect::<Vec<_>>();
+		ordered.sort_by(|left, right| {
+			intents[*right]
+				.priority
+				.cmp(&intents[*left].priority)
+				.then_with(|| left.cmp(right))
+		});
+		let mut advertised = Vec::with_capacity(intents.len());
+		let mut dropped = Vec::new();
+		let mut strict = 0_usize;
+		for index in ordered {
+			if caps
+				.maximum_tools
+				.is_some_and(|limit| advertised.len() >= limit as usize)
+				|| (intents[index].strict
+					&& caps
+						.maximum_strict
+						.is_some_and(|limit| strict >= limit as usize))
+			{
+				dropped.push(index);
+				continue;
+			}
+			if intents[index].strict {
+				strict = strict.saturating_add(1);
+			}
+			advertised.push(index);
+		}
+		let assignment = Arc::new(ConstraintAssignment {
+			advertised: advertised.into(),
+			dropped:    dropped.into(),
+		});
+		cache.assignments.insert(key, Arc::clone(&assignment));
+		assignment
+	}
+
+	/// Drops cached assignments retired with an old core-slot registration set.
+	pub fn retain_slot_hash(&self, slot_hash: [u8; 32]) {
+		self
+			.cache
+			.lock()
+			.assignments
+			.retain(|(cached, _), _| *cached == slot_hash);
+	}
+}
+/// Caller-authorized behavior when a pinned model cannot be selected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModelFallback {
+	/// Refuse the request; a pinned model is never silently substituted.
+	#[default]
+	Deny,
+	/// Explicitly substitute the parent session model and receipt the change.
+	Parent,
+	/// Try only the caller's explicit ordered fallback chain.
+	Chain,
+}
+
+/// Stable prompt instruction supplied on every forced-call attempt.
+pub const FORCED_CALL_DIRECTIVE: &str =
+	"Call the requested tool next. Do not answer in text before calling it.";
+
+/// Route facts used to choose a forced-call enforcement rung.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForcedCallCaps {
+	/// Native tool-call capabilities declared by the selected route.
+	pub features:       omp_llm_catalog::ToolFeatureBits,
+	/// Provider-declared price of setting native `tool_choice`.
+	pub native_penalty: Option<crate::receipt::Penalty>,
+}
+
+/// Chosen forced-call enforcement rung for one attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForcedCallDecision {
+	/// Soft prompt insertion is always required for a forced call.
+	pub soft_prompt:   bool,
+	/// Whether the request may carry a native forcing flag this attempt.
+	pub native_choice: bool,
+	/// Evidence of an expensive final-rung escalation.
+	pub escalation:    Option<Adjustment>,
+}
+
+/// Chooses the forced-call ladder without provider-name special cases.
+#[must_use]
+pub fn forced_call_ladder(
+	choice: &crate::call::Setting<crate::call::ToolChoice>,
+	caps: ForcedCallCaps,
+	non_compliant: bool,
+	escalations_left: u8,
+) -> ForcedCallDecision {
+	let forced = matches!(
+		choice,
+		crate::call::Setting::Require(
+			crate::call::ToolChoice::Required | crate::call::ToolChoice::Named(_)
+		) | crate::call::Setting::Prefer(
+			crate::call::ToolChoice::Required | crate::call::ToolChoice::Named(_)
+		)
+	);
+	if !forced {
+		return ForcedCallDecision {
+			soft_prompt:   false,
+			native_choice: false,
+			escalation:    None,
+		};
+	}
+	let native_supported = match choice {
+		crate::call::Setting::Require(crate::call::ToolChoice::Named(_))
+		| crate::call::Setting::Prefer(crate::call::ToolChoice::Named(_)) => caps
+			.features
+			.contains(omp_llm_catalog::ToolFeatureBits::NAMED_CHOICE),
+		_ => caps
+			.features
+			.contains(omp_llm_catalog::ToolFeatureBits::REQUIRED_CHOICE),
+	};
+	let escalation =
+		(non_compliant && escalations_left != 0 && native_supported && caps.native_penalty.is_some())
+			.then(|| Adjustment::Escalated {
+				feature: FeatureId(Str::new_static("tool_choice")),
+				penalty: crate::receipt::Penalty::CacheInvalidated,
+			});
+	ForcedCallDecision {
+		soft_prompt: true,
+		native_choice: native_supported && (caps.native_penalty.is_none() || escalation.is_some()),
+		escalation,
+	}
+}
+
+/// Applies a forced-call decision to canonical chat input before encoding.
+#[must_use]
+pub fn apply_forced_call_decision(
+	request: &crate::call::ChatRequest,
+	decision: &ForcedCallDecision,
+) -> crate::call::ChatRequest {
+	let mut adjusted = request.clone();
+	if decision.soft_prompt {
+		let mut messages = Vec::with_capacity(request.messages.len().saturating_add(1));
+		messages.push(crate::call::Message {
+			role:    crate::call::Role::System,
+			content: Arc::from([crate::call::ContentPart::Text {
+				text:  Str::new_static(FORCED_CALL_DIRECTIVE),
+				proof: None,
+			}]),
+			name:    None,
+		});
+		messages.extend(request.messages.iter().cloned());
+		adjusted.messages = messages.into();
+		if !decision.native_choice {
+			adjusted.tool_choice = crate::call::Setting::Prefer(crate::call::ToolChoice::Auto);
+		}
+	}
+	adjusted
 }
 
 /// A typed codec-specific option requested by an operation.
@@ -485,8 +700,8 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		catalog::{CatalogRevision, CodecId, Emulation},
-		receipt::{Cost, ExecutionBudget, FeatureId, ReasonId},
+		catalog::{CatalogRevision, CodecId, Emulation, RouteId},
+		receipt::{Cost, ExecutionBudget, FeatureId, Penalty, ReasonId},
 	};
 
 	fn requirement(strength: RequirementStrength) -> CapabilityRequirement {
@@ -638,5 +853,60 @@ mod tests {
 		));
 		assert!(!plan_is_current(now, expiry, &revision, &CatalogRevision::from("r2"), 7, 7));
 		assert!(!plan_is_current(now, expiry, &revision, &revision, 7, 8));
+	}
+	#[test]
+	fn constraint_budget_is_priority_stable_and_epoch_cached() {
+		let budget = ConstraintBudget::default();
+		let route = RouteId::from("route");
+		let intents = [
+			ConstraintIntent { priority: 3, strict: false },
+			ConstraintIntent { priority: 250, strict: true },
+			ConstraintIntent { priority: 200, strict: true },
+		];
+		let first = budget.assign(
+			[7; 32],
+			&route,
+			ConstraintBudgetCaps { maximum_tools: Some(2), maximum_strict: Some(1) },
+			&intents,
+		);
+		assert_eq!(first.advertised.as_ref(), &[1, 0]);
+		assert_eq!(first.dropped.as_ref(), &[2]);
+		assert!(Arc::ptr_eq(
+			&first,
+			&budget.assign(
+				[7; 32],
+				&route,
+				ConstraintBudgetCaps { maximum_tools: Some(1), maximum_strict: Some(0) },
+				&intents,
+			)
+		));
+		assert!(!Arc::ptr_eq(
+			&first,
+			&budget.assign(
+				[8; 32],
+				&route,
+				ConstraintBudgetCaps { maximum_tools: Some(2), maximum_strict: Some(1) },
+				&intents,
+			)
+		));
+	}
+	#[test]
+	fn forced_call_ladder_skips_paid_native_choice_then_records_escalation() {
+		let choice =
+			crate::call::Setting::Require(crate::call::ToolChoice::Named(Str::from("lookup")));
+		let caps = ForcedCallCaps {
+			features:       omp_llm_catalog::ToolFeatureBits::NAMED_CHOICE,
+			native_penalty: Some(Penalty::CacheInvalidated),
+		};
+		let soft = forced_call_ladder(&choice, caps.clone(), false, 1);
+		assert!(soft.soft_prompt);
+		assert!(!soft.native_choice);
+		assert_eq!(soft.escalation, None);
+		let escalated = forced_call_ladder(&choice, caps, true, 1);
+		assert!(escalated.native_choice);
+		assert!(matches!(
+			escalated.escalation,
+			Some(Adjustment::Escalated { penalty: Penalty::CacheInvalidated, .. })
+		));
 	}
 }
