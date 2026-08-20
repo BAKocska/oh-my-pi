@@ -12,10 +12,10 @@
 //!   publishes on every paint ([`publish_screen`]).
 //! - `resize` emulates a SIGWINCH so every host's normal geometry recheck
 //!   fires; `quit` injects `C-c`, the conventional quit chord.
-//! - Retained-state ops (`frame`, `tree`, `values`) ride the mailbox as
-//!   [`crate::TerminalEvent::Debug`] queries; [`crate::App`] answers them via
-//!   [`respond_debug_query`], hosts without a retained tree ignore them and the
-//!   server times the request out.
+//! - Retained-state ops (`frame`, `tree`, `values`, `slots`) ride the mailbox
+//!   as [`crate::TerminalEvent::Debug`] queries; [`crate::App`] answers core
+//!   tree ops while chat hosts answer `slots`. `effect` enters the same mailbox
+//!   as a serialized [`crate::TerminalEvent::Effect`].
 //!
 //! Harnesses pair the socket with `OMP_TTY`: the pty master captures the
 //! exact byte stream a terminal would see, while this socket provides
@@ -30,7 +30,8 @@
 //! | `text` | | visible viewport as text (last painted screen) |
 //! | `frame` | | full document frame as text rows (retained hosts) |
 //! | `tree` | | component tree with kinds, ids, rects, focus (retained) |
-//! | `values` | | [`crate::Ui::values`] of the base tree (retained) |
+//! | `slots` | | extension mount keys and resolved rectangles (retained host) |
+//! | `effect` | `effect` | inject one serialized extension `UiEffect` |
 //! | `keys` | `keys` | inject decoded keys, e.g. `"tab C-a enter 'text'"` |
 //! | `event` | `event` | inject one serialized [`crate::TerminalEvent`] |
 //! | `bytes` | `data` | feed raw bytes through the input decoder |
@@ -124,6 +125,14 @@ fn direct_response(request: DebugRequest) -> Result<serde_json::Value, DebugOp> 
 		DebugRequest::Frame => return Err(DebugOp::Frame),
 		DebugRequest::Tree => return Err(DebugOp::Tree),
 		DebugRequest::Values => return Err(DebugOp::Values),
+		DebugRequest::Slots => return Err(DebugOp::Slots),
+		DebugRequest::Effect(effect) => {
+			if crate::pump::send_event(TerminalEvent::Effect(effect)) {
+				json!({ "ok": true, "injected": "effect" })
+			} else {
+				json!({ "ok": false, "error": "no live terminal to inject into" })
+			}
+		},
 		DebugRequest::Resize => return Err(DebugOp::Resize),
 		DebugRequest::Quit => return Err(DebugOp::Quit),
 		DebugRequest::Inject(events) => {
@@ -197,7 +206,7 @@ pub fn terminal_response(op: DebugOp) -> Option<serde_json::Value> {
 			Some(json!({ "ok": true, "signalled": true }))
 		},
 		DebugOp::Quit => Some(json!({ "ok": true, "injected": "C-c" })),
-		DebugOp::Frame | DebugOp::Tree | DebugOp::Values => None,
+		DebugOp::Frame | DebugOp::Tree | DebugOp::Values | DebugOp::Slots => None,
 	}
 }
 
@@ -208,6 +217,10 @@ pub enum DebugRequest {
 	Frame,
 	Tree,
 	Values,
+	/// Lists retained extension slots through the host's scene registry.
+	Slots,
+	/// Serialized extension effect injected into the normal event mailbox.
+	Effect(serde_json::Value),
 	/// Events to inject into the mailbox, already decoded.
 	Inject(Vec<InputEvent>),
 	/// Serialized terminal events to inject verbatim.
@@ -217,7 +230,6 @@ pub enum DebugRequest {
 	Resize,
 	Quit,
 }
-
 /// Parses one request line into a [`DebugRequest`].
 pub fn parse_request(line: &[u8]) -> Result<DebugRequest, String> {
 	let value: serde_json::Value =
@@ -232,6 +244,14 @@ pub fn parse_request(line: &[u8]) -> Result<DebugRequest, String> {
 		"frame" => Ok(DebugRequest::Frame),
 		"tree" => Ok(DebugRequest::Tree),
 		"values" => Ok(DebugRequest::Values),
+		"slots" => Ok(DebugRequest::Slots),
+		"effect" => {
+			let effect = value
+				.get("effect")
+				.cloned()
+				.ok_or_else(|| "effect op needs an \"effect\" object".to_owned())?;
+			Ok(DebugRequest::Effect(effect))
+		},
 		"keys" => {
 			let spec = value
 				.get("keys")
@@ -825,6 +845,11 @@ mod tests {
 		assert!(matches!(
 			parse_request(br#"{"op":"keys","keys":"enter"}"#),
 			Ok(DebugRequest::Inject(events)) if events == vec![InputEvent::Key(Key::Enter)]
+		));
+		assert!(matches!(parse_request(br#"{"op":"slots"}"#), Ok(DebugRequest::Slots)));
+		assert!(matches!(
+			parse_request(br#"{"op":"effect","effect":{"kind":"mount_slot"}}"#),
+			Ok(DebugRequest::Effect(_))
 		));
 		assert!(parse_request(br#"{"op":"warp"}"#).is_err());
 		let mouse = parse_request(br#"{"op":"mouse","x":3,"y":7,"action":"wheel-down"}"#);

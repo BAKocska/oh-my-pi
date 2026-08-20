@@ -14,6 +14,8 @@
 //! (<https://github.com/reubeno/brush>, MIT).
 //!
 //! Implements the shell abstraction, interpreter, and supporting facilities.
+/// Static policy analysis for parsed shell programs.
+pub mod analysis;
 pub mod arithmetic;
 mod braceexpansion;
 pub mod builtins;

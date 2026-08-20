@@ -733,6 +733,326 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 		ENV_EPHEMERAL,
 		"await omp.env.worker.list()"
 	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.tml",
+		"(template: str, /, **fields: object) -> Tml",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.tml(\"<text>{value}</text>\", value=\"safe\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.text",
+		"(value: object) -> Tml",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.text(value)"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.md",
+		"(source: object) -> Tml",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.md(\"# heading\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.join",
+		"(parts, sep='') -> Tml",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.join(parts)"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.icon",
+		"(name: str, *, fg=None) -> Tml",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.icon(\"check\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.mount",
+		"(placement, content, options=None, *, key=None) -> SlotHandle",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.mount(ui.Slot.HEADER, ui.text(\"ready\"))"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.handle",
+		"(key: str) -> SlotHandle",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.handle(\"status\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.unmount",
+		"(key: str) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.unmount(\"status\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.unmount_all",
+		"() -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.unmount_all()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.focus_slot",
+		"(key: str) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.focus_slot(\"rail\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.blur_slot",
+		"() -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.blur_slot()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.set_status",
+		"(key, content, *, order=100, side=Slot.STATUS_RIGHT) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.set_status(\"git\", ui.text(\"main\"))"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.set_working_message",
+		"(content) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.set_working_message(ui.text(\"working\"))"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.set_title",
+		"(title) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.set_title(\"omp\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.set_progress",
+		"(state) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.set_progress(ui.Progress.indeterminate())"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.bell",
+		"() -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.bell()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.set_ghost",
+		"(ghost) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.set_ghost(ui.Ghost(\"next\"))"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.clear_ghost",
+		"() -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.clear_ghost()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.set_editor_text",
+		"(text: str) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.set_editor_text(\"draft\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.paste_to_editor",
+		"(content) -> None",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"ui.paste_to_editor(\"draft\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.presentation",
+		"() -> Presentation",
+		CallbackAbi::None,
+		OPEN_METERED,
+		"await ui.presentation()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.icons",
+		"(prefix='') -> tuple[str, ...]",
+		CallbackAbi::None,
+		OPEN_METERED,
+		"await ui.icons()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.editor_text",
+		"() -> str",
+		CallbackAbi::None,
+		OPEN_METERED,
+		"await ui.editor_text()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.notify",
+		"(message, *, level=Level.INFO, ...) -> None",
+		CallbackAbi::None,
+		CORE_DURABLE,
+		"ui.notify(\"done\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.open_url",
+		"(url: str) -> None",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"ui.open_url(\"https://omp.dev\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.submit",
+		"(text=None) -> None",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"ui.submit()"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.image",
+		"(source, *, w=None, h=None, trim=False) -> Tml",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"ui.image(blob)"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.overlay",
+		"(content, options=None, *, watch=()) -> OverlayHandle",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.overlay(ui.text(\"details\"))"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.confirm",
+		"(title, message='', *, options=None) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.confirm(\"Continue?\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.select",
+		"(title, items, *, options=None) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.select(\"Pick\", [\"one\"])"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.multi_select",
+		"(title, items, *, checked=(), options=None) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.multi_select(\"Pick\", [\"one\"])"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.input",
+		"(title, *, placeholder='', prefill='', ...) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.input(\"Name\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.editor",
+		"(title, *, prefill='', syntax=None, options=None) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.editor(\"Edit\")"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.form",
+		"(title, fields, *, options=None) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.form(\"Edit\", [])"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.ask_user",
+		"(questions, *, options=None) -> DialogOutcome",
+		CallbackAbi::None,
+		CORE_EFFECT,
+		"await ui.ask_user([])"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.message_renderer",
+		"(kind: str) -> Decorator",
+		CallbackAbi::PayloadContext,
+		OPEN_LOCAL,
+		"@ui.message_renderer(\"notice\")\ndef render(message, ctx): return None"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.completion",
+		"(trigger: Trigger) -> Decorator",
+		CallbackAbi::PayloadContext,
+		OPEN_LOCAL,
+		"@ui.completion(ui.Trigger(\"@\"))\nasync def complete(query, ctx): return []"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.shortcut",
+		"(chord: str, *, action_id=None, ...) -> Decorator",
+		CallbackAbi::PayloadContext,
+		OPEN_LOCAL,
+		"@ui.shortcut(\"ctrl+alt+h\")\nasync def action(payload, ctx): pass"
+	),
+	symbol!(
+		"docs/py/07-ui.md",
+		"omp.ui.command",
+		"(name: str, *, aliases=(), ...) -> Decorator",
+		CallbackAbi::PayloadContext,
+		OPEN_LOCAL,
+		"@ui.command(\"hello\")\nasync def command(payload, ctx): return None"
+	),
+	symbol!(
+		"docs/py/02-verdicts.md",
+		"omp.renderer",
+		"(name, *, family=None, rev=None, reduce=None) -> Decorator",
+		CallbackAbi::PayloadContext,
+		OPEN_LOCAL,
+		"@omp.renderer(\"tool\")\ndef render(view, ctx): return None"
+	),
 ];
 
 /// Returns every canonical runtime symbol row without allocation.

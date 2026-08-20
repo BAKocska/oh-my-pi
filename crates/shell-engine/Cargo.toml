@@ -26,9 +26,11 @@ inherent = { workspace = true }
 itertools = { workspace = true }
 normalize-path = { workspace = true }
 omp-core = { workspace = true }
+omp-proto = { workspace = true }
 peg = { workspace = true }
 rand = { workspace = true }
 smallvec = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

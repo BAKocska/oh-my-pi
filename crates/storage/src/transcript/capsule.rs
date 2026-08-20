@@ -6,8 +6,22 @@ use omp_core::Str;
 use serde_json::{Map, Value, json, value::RawValue};
 use smallvec::SmallVec;
 
-use crate::transcript::block::{BlockKind, DialectId};
+use crate::transcript::{
+	block::{BlockKind, DialectId},
+	types::{ModelId, ModelRef, ProviderId},
+};
 
+/// Returns whether provider-native checkpoint residue can be replayed by the
+/// active model selection.
+///
+/// Native checkpoints are opaque provider bytes, unlike textual `Compact`
+/// summaries. They are reusable only by the exact provider and model that
+/// created them; accepting them after a provider switch would silently erase
+/// model context that cannot be reconstructed from the capsule.
+#[must_use]
+pub fn checkpoint_reusable(provider: &ProviderId, model: &ModelId, active: &ModelRef) -> bool {
+	provider == &active.provider && model == &active.model
+}
 /// A revision of the deterministic dialect-default rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rev(

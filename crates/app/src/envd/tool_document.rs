@@ -1683,8 +1683,9 @@ fn mark_executable_for_shebang(_path: &Path, _content: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::fmt::Write as _;
+
+	use super::*;
 
 	#[test]
 	fn rejects_lexical_parent_escape() {

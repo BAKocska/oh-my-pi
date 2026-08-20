@@ -13,9 +13,10 @@ pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceip
 use omp_storage::{
 	index::{EventProjection, IndexedEvent, IndexedWriteError, JournalPosition, SessionIndex},
 	transcript::{
-		self, AmendPatch, Event, Header, ItemRecord, JobRegistered, JobSettled, Kind, Log,
-		PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState,
-		RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
+		self, AmendPatch, ApprovalDecided, ApprovalTicketFiled, Event, Header, HookOutcome,
+		ItemRecord, JobRegistered, JobSettled, Kind, Log, PolicyDecision, PromptRewriteCommit,
+		PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState, RequestAudit,
+		ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
 		event::Custom,
 		msg::Content,
 		writer::{AppendManyError, IndexRun, JournalError as WriterError},
@@ -69,6 +70,26 @@ impl AsRef<transcript::LiveSet> for JournalLog<'_> {
 	fn as_ref(&self) -> &transcript::LiveSet {
 		self.0.transcript.live()
 	}
+}
+
+/// Durable textual summary that replaces a live context prefix.
+///
+/// `summary` is deliberately text rather than provider-native bytes so a
+/// compacted transcript remains usable after a provider or model change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Compact {
+	/// Full summary supplied to subsequent model context.
+	pub summary:       Str,
+	/// Optional concise summary for display.
+	pub short:         Option<Str>,
+	/// First live event retained after the summary event.
+	pub first_kept:    u64,
+	/// Context tokens observed before this compaction.
+	pub tokens_before: u64,
+	/// Optional user-visible compaction warning.
+	pub warning:       Option<Str>,
+	/// Ordered extension-summary losers recorded without their summary bytes.
+	pub superseded:    Vec<transcript::SupersededCompaction>,
 }
 /// Durable disposition of a started turn that failed without an outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -436,6 +457,9 @@ pub enum JournalError {
 	/// Rewind was requested while a durable turn was still pending.
 	#[error("cannot rewind while a turn is pending")]
 	RewindWhilePending,
+	/// Compaction was requested while a durable turn was still pending.
+	#[error("cannot compact while a turn is pending")]
+	CompactWhilePending,
 }
 
 const _: () = assert!(std::mem::size_of::<JournalError>() <= 128, "JournalError must stay compact");
@@ -947,6 +971,42 @@ impl Journal {
 		let index = self.append(&Event { ts, kind: Kind::InvocationTransition(transition) })?;
 		self.invocations.insert(invocation_id, (index, durable));
 		Ok(index)
+	}
+
+	/// Records one Core-attributed hook outcome in the durable transcript.
+	pub fn record_hook_outcome(
+		&mut self,
+		ts: u64,
+		outcome: HookOutcome,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::HookOutcome(outcome) })
+	}
+
+	/// Records the requested/effective policy audit sextet for an invocation.
+	pub fn record_policy_decision(
+		&mut self,
+		ts: u64,
+		decision: PolicyDecision,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::PolicyDecision(decision) })
+	}
+
+	/// Persists a newly filed or merged Core-owned approval ticket.
+	pub fn record_approval_ticket(
+		&mut self,
+		ts: u64,
+		ticket: ApprovalTicketFiled,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::ApprovalTicketFiled(ticket) })
+	}
+
+	/// Persists an idempotent approval decision or guard-drop withdrawal.
+	pub fn record_approval_decision(
+		&mut self,
+		ts: u64,
+		decision: ApprovalDecided,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::ApprovalDecided(decision) })
 	}
 
 	/// Handles exactly one authenticated single-owner mailbox request.
@@ -1982,6 +2042,28 @@ impl Journal {
 			return Err(JournalError::RewindWhilePending);
 		}
 		self.append(&Event { ts, kind: Kind::Rewind { to } })
+	}
+
+	/// Replaces the live context prefix with a durable textual summary.
+	///
+	/// Like [`Self::rewind`], compaction is rejected while a started turn lacks
+	/// a terminal receipt, preventing an authorized batch from being stranded
+	/// outside the resulting live chain.
+	pub fn compact(&mut self, ts: u64, compact: Compact) -> Result<u64, JournalError> {
+		if self.pending_turn().is_some() {
+			return Err(JournalError::CompactWhilePending);
+		}
+		self.append(&Event {
+			ts,
+			kind: Kind::Compact {
+				summary:       compact.summary,
+				short:         compact.short,
+				first_kept:    compact.first_kept,
+				tokens_before: compact.tokens_before,
+				warning:       compact.warning,
+				superseded:    compact.superseded,
+			},
+		})
 	}
 
 	/// Returns the earliest live turn start that lacks a terminal receipt.
@@ -3507,6 +3589,17 @@ mod tests {
 		assert_eq!(journal.live_item_events().expect("project pending journal"), vec![input]);
 		assert!(journal.pending_turn().is_some());
 		assert!(matches!(journal.rewind(4, None), Err(JournalError::RewindWhilePending)));
+		assert!(matches!(
+			journal.compact(4, Compact {
+				summary:       Str::from("summary"),
+				short:         None,
+				first_kept:    input,
+				tokens_before: 100,
+				warning:       None,
+				superseded:    Vec::new(),
+			}),
+			Err(JournalError::CompactWhilePending)
+		));
 		drop(journal);
 		std::fs::remove_file(path).expect("remove journal");
 	}

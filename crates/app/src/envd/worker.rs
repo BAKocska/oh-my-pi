@@ -2849,10 +2849,7 @@ fn validate_manifest_registrations(
 		let actual = actual_declarations(config, tools, owner)?;
 		if actual != manifest.declarations {
 			return Err(WorkerError::Protocol(manifest_registration_diff(
-				owner,
-				manifest,
-				tools,
-				&actual,
+				owner, manifest, tools, &actual,
 			)));
 		}
 	}
@@ -2873,21 +2870,33 @@ fn manifest_registration_diff(
 		.collect::<Vec<_>>();
 	let unexpected = actual
 		.tools()
-		.filter(|registered| !manifest.declarations.tools().any(|expected| *expected == **registered))
+		.filter(|registered| {
+			!manifest
+				.declarations
+				.tools()
+				.any(|expected| *expected == **registered)
+		})
 		.map(|tool| format!("{}@{}:{}", tool.name, tool.family, tool.rev))
 		.collect::<Vec<_>>();
 	let mismatches = manifest
 		.declarations
 		.tools()
 		.filter_map(|expected| {
-			actual.tools().find(|registered| registered.name == expected.name).and_then(|registered| {
-				(registered.rev != expected.rev || registered.family != expected.family).then(|| {
-					format!(
-						"name {} has registered rev {}@{} instead of {}@{}",
-						expected.name, registered.family, registered.rev, expected.family, expected.rev
-					)
+			actual
+				.tools()
+				.find(|registered| registered.name == expected.name)
+				.and_then(|registered| {
+					(registered.rev != expected.rev || registered.family != expected.family).then(|| {
+						format!(
+							"name {} has registered rev {}@{} instead of {}@{}",
+							expected.name,
+							registered.family,
+							registered.rev,
+							expected.family,
+							expected.rev
+						)
+					})
 				})
-			})
 		})
 		.collect::<Vec<_>>();
 	let flags = tools
@@ -2896,7 +2905,10 @@ fn manifest_registration_diff(
 		.map(|tool| {
 			format!(
 				"{}: streams_args={}, effects={}",
-				tool.definition.as_ref().map_or("", |definition| definition.name.as_str()),
+				tool
+					.definition
+					.as_ref()
+					.map_or("", |definition| definition.name.as_str()),
 				tool.streams_args,
 				tool.effects.is_some()
 			)

@@ -25,6 +25,7 @@ use crate::{
 	batch::{
 		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
 	},
+	context::{ContextProjection, project_context},
 	control::{ControlMailbox, ControlSender},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
@@ -128,29 +129,29 @@ impl AbortHandle {
 
 /// Durable agent loop composed from transport-neutral Phase 1 foundations.
 pub struct Agent<C: TurnClient> {
-	client:             C,
-	env:                EnvClient,
-	state:              AgentState,
-	journal:            Journal,
-	caps:               CapsBase,
-	events:             EventBus,
-	hook_bus:           InvocationHookBus,
-	hook_requests:      flume::Receiver<InvocationHookRequest>,
+	client: C,
+	env: EnvClient,
+	state: AgentState,
+	journal: Journal,
+	caps: CapsBase,
+	events: EventBus,
+	hook_bus: InvocationHookBus,
+	hook_requests: flume::Receiver<InvocationHookRequest>,
 	invocation_fact_tx: flume::Sender<InvocationAdmissionFact>,
 	invocation_fact_rx: flume::Receiver<InvocationAdmissionFact>,
-	control_tx:         ControlSender,
-	control_mailbox:    ControlMailbox,
-	mailbox:            Mailbox,
-	jobs:               Arc<JobBoard>,
-	jobs_restored:      bool,
-	abort_tx:           Arc<tokio::sync::watch::Sender<u64>>,
-	abort_rx:           tokio::sync::watch::Receiver<u64>,
-	phase:                         AgentPhase,
-	control_serviced_during_turn:  bool,
-	context:                       Option<ContextRef>,
-	prompt_hash:                   Option<crate::PromptHash>,
-	prompt_head_events:            Vec<u64>,
-	last_toolset_hash:             Option<[u8; 32]>,
+	control_tx: ControlSender,
+	control_mailbox: ControlMailbox,
+	mailbox: Mailbox,
+	jobs: Arc<JobBoard>,
+	jobs_restored: bool,
+	abort_tx: Arc<tokio::sync::watch::Sender<u64>>,
+	abort_rx: tokio::sync::watch::Receiver<u64>,
+	phase: AgentPhase,
+	control_serviced_during_turn: bool,
+	context: Option<ContextRef>,
+	prompt_hash: Option<crate::PromptHash>,
+	prompt_head_events: Vec<u64>,
+	last_toolset_hash: Option<[u8; 32]>,
 }
 
 impl<C: TurnClient> Agent<C> {
@@ -881,12 +882,17 @@ impl<C: TurnClient> Agent<C> {
 				input.clone()
 			} else if full {
 				let journal = self.journal.load()?;
-				TurnInput::Full(project_journal(
-					&journal,
-					journal.as_ref(),
-					snapshot.registry.as_ref(),
-					&self.caps,
-				)?)
+				let projected =
+					project_journal(&journal, journal.as_ref(), snapshot.registry.as_ref(), &self.caps)?;
+				let context_handlers = self.hook_bus.union_mask()
+					& crate::hook_event_mask(
+						omp_proto::toolhost::v1::HookEventId::HookEventThreadProjection,
+					) != 0;
+				match project_context(projected, &all_live, context_handlers) {
+					ContextProjection::Unchanged(thread) | ContextProjection::View { thread, .. } => {
+						TurnInput::Full(thread)
+					},
+				}
 			} else {
 				let held = context
 					.clone()

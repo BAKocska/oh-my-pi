@@ -75,10 +75,10 @@ use strum::{EnumString, IntoStaticStr};
 use crate::{
 	component::{Cached, Component},
 	components::{
-		Boxed, Button, Callout, Col, CustomElement, EditorPane, Field, Form, Hr, Icon, Img, Input,
-		Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment, Select, SelectOption, Spacer,
-		Spinner, Status, Table, TableCell, TableRow, Tabs, TaskStatus, TextLeaf, Todo, TodoTask,
-		Tree, TreeNode, Wizard,
+		Boxed, Button, Col, CustomElement, DiffKind, DiffView, EditorPane, Field, Form, Hr, Icon,
+		Img, Input, Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment, Select,
+		SelectOption, Spacer, Spinner, Status, Table, TableCell, TableRow, Tabs, TaskStatus,
+		TextLeaf, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
 	context::{Charset, UiContext},
 	props::{Prop, PropValue, Props},
@@ -206,9 +206,31 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parses markup into a retained component tree rooted at a [`Col`].
+/// Origin of a TML document.
+///
+/// Extension markup cannot instantiate renderer chrome reserved to the core.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MarkupOrigin {
+	/// Markup produced by omp itself.
+	#[default]
+	Core,
+	/// Markup received from an authenticated extension connection.
+	Extension,
+}
+
+/// Parses core-owned markup into a retained component tree rooted at a [`Col`].
 pub fn parse(source: &Str, ctx: &UiContext) -> Result<Cached, ParseError> {
-	let mut parser = Parser { source, src: source, ctx, fragment: false };
+	parse_with_origin(source, ctx, MarkupOrigin::Core)
+}
+
+/// Parses markup at its trust boundary, retaining unknown elements but refusing
+/// malformed trees.
+pub fn parse_with_origin(
+	source: &Str,
+	ctx: &UiContext,
+	origin: MarkupOrigin,
+) -> Result<Cached, ParseError> {
+	let mut parser = Parser { source, src: source, ctx, fragment: false, origin };
 	let (parts, _) = parser.parse_children(0, None, false, 0, "col", &Props::new())?;
 	let children = cached_children(parts, "col")?;
 	let root = build("col", Props::new(), children, &Str::default())
@@ -225,7 +247,8 @@ pub fn parse_md_fragment_inheriting(
 		return Ok(Vec::new());
 	}
 	let inherited = child_props(host);
-	let mut parser = Parser { source: text, src: text, ctx, fragment: true };
+	let mut parser =
+		Parser { source: text, src: text, ctx, fragment: true, origin: MarkupOrigin::Core };
 	let (first, mut children, _) = parser.scan_md(0, 0, &inherited, false)?;
 	children.insert(0, markdown_part(first, inherited));
 	Ok(children)
@@ -326,6 +349,7 @@ struct Parser<'a> {
 	src:      &'a str,
 	ctx:      &'a UiContext,
 	fragment: bool,
+	origin:   MarkupOrigin,
 }
 
 impl Parser<'_> {
@@ -380,7 +404,8 @@ impl Parser<'_> {
 			let is_closing = self.src[at + 1..].starts_with('/');
 			let raw = &self.src[at + 1..close];
 			let self_closing = raw.ends_with('/');
-			let catalog = is_catalog_tag(name);
+			let catalog = is_catalog_tag(name)
+				&& !(self.origin == MarkupOrigin::Extension && is_reserved_chrome_tag(name));
 			let custom = !catalog
 				&& !is_markdown_html_tag(name)
 				&& if is_closing {
@@ -1027,7 +1052,7 @@ fn is_catalog_tag(name: &str) -> bool {
 			| "field"
 			| "progress"
 			| "img"
-			| "editor"
+			| "diff"
 			| "wizard"
 			| "step"
 			| "callout"
@@ -1037,6 +1062,9 @@ fn is_catalog_tag(name: &str) -> bool {
 	)
 }
 
+fn is_reserved_chrome_tag(name: &str) -> bool {
+	matches!(name, "approval" | "attribution" | "tool-card" | "transcript" | "logo")
+}
 fn is_interactive_tag(name: &str) -> bool {
 	matches!(
 		name,
@@ -1195,9 +1223,15 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		"form" => configured!(Form::new()),
 		"progress" => configured!(Progress::new()),
 		"img" => configured!(Img::new()),
+		"diff" => {
+			let mut diff = DiffView::new();
+			for line in body.lines() {
+				let (kind, text) = unified_diff_line(line);
+				diff.push(kind, text);
+			}
+			configured!(diff)
+		},
 		"editor" => configured!(EditorPane::new()),
-		"wizard" => configured!(Wizard::new().child(children)),
-		"callout" => configured!(Callout::new().text(body.clone())),
 		"icon" => {
 			let name = if body.is_empty() {
 				props.str_of(Prop::Icon).cloned().unwrap_or_default()
@@ -1211,6 +1245,23 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		},
 		_ => return None,
 	})
+}
+
+/// Classifies one unified-diff source line for the retained [`DiffView`].
+fn unified_diff_line(line: &str) -> (DiffKind, &str) {
+	match line.as_bytes().first() {
+		Some(b'+') if !line.starts_with("+++") => (DiffKind::Add, &line[1..]),
+		Some(b'-') if !line.starts_with("---") => (DiffKind::Remove, &line[1..]),
+		Some(b' ') => (DiffKind::Context, &line[1..]),
+		_ if line.starts_with("@@")
+			|| line.starts_with("diff ")
+			|| line.starts_with("+++")
+			|| line.starts_with("---") =>
+		{
+			(DiffKind::Header, line)
+		},
+		_ => (DiffKind::Context, line),
+	}
 }
 
 fn finish_element(
@@ -1799,5 +1850,25 @@ mod tests {
 
 		let custom = parse(&Str::new("<md>before\n<panel/>\nafter</md>"), &ctx).unwrap();
 		assert_eq!(child(&custom, 0).comp().children().len(), 2);
+	}
+
+	#[test]
+	fn diff_markup_classifies_unified_body() {
+		let ctx = UiContext::default();
+		let ui =
+			crate::Ui::from_markup("<diff>@@ -1 +1 @@\n-old\n+new\n same</diff>", 20, ctx).unwrap();
+		assert_eq!(ui.height(), 4);
+	}
+
+	#[test]
+	fn extension_reserved_chrome_degrades_to_custom_element() {
+		let ctx = UiContext::default();
+		let root = parse_with_origin(
+			&Str::new("<approval><text>untrusted</text></approval>"),
+			&ctx,
+			MarkupOrigin::Extension,
+		)
+		.unwrap();
+		assert!(child(&root, 0).comp().is::<CustomElement>());
 	}
 }

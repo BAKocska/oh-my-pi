@@ -18,7 +18,10 @@ use omp_tui::{
 };
 use smallvec::SmallVec;
 
-use crate::{BackendEvent, StatusFacts, SubmitMode};
+use crate::{
+	BackendEvent, StatusFacts, SubmitMode,
+	slots::{Mount, Slots},
+};
 
 const LIVE_PANEL_ROWS: u16 = 12;
 /// Column cap for inline tool-result images inside committed cards.
@@ -39,6 +42,239 @@ pub struct RenderedFrame<'a> {
 	pub stable_rows: u16,
 	/// Half-open logical row ranges changed since the previous render.
 	pub damage:      SmallVec<(u16, u16), 4>,
+}
+
+/// Protocol placements used by [`Bands`] without allocating a per-frame
+/// collection of rendered rows.
+pub mod placement {
+	/// Extension content above the transcript.
+	pub const HEADER: i32 = 1;
+	/// Extension content below the transcript.
+	pub const FOOTER: i32 = 2;
+	/// A left out-of-tree rail.
+	pub const LEFT_RAIL: i32 = 3;
+	/// A right out-of-tree rail.
+	pub const RIGHT_RAIL: i32 = 4;
+	/// Extension content above the editor.
+	pub const ABOVE_EDITOR: i32 = 5;
+	/// Extension content below the editor.
+	pub const BELOW_EDITOR: i32 = 6;
+}
+
+/// Total columns consumed by all visible out-of-tree rails.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RailWidths {
+	/// Sum of left rail widths.
+	pub left:  u16,
+	/// Sum of right rail widths.
+	pub right: u16,
+}
+
+impl RailWidths {
+	/// Adds one rail width to the requested side, saturating at terminal size.
+	pub const fn accumulate(mut self, left: bool, width: u16) -> Self {
+		if left {
+			self.left = self.left.saturating_add(width);
+		} else {
+			self.right = self.right.saturating_add(width);
+		}
+		self
+	}
+
+	/// Returns columns remaining for the transcript.
+	pub const fn content_width(self, viewport: u16) -> u16 {
+		viewport.saturating_sub(self.left.saturating_add(self.right))
+	}
+}
+
+/// Streaming compositor for extension bands and rails.
+///
+/// Each mount owns a retained [`Ui`]. Composition measures it and blits one
+/// row at a time into the supplied [`RenderedFrame`] backing frame without a
+/// frame-local line collection.
+pub struct Bands;
+
+impl Bands {
+	/// Streams all visible extension mounts over `frame` and returns total rail
+	/// reservation. Core callers pass their retained [`Slots`] registry.
+	pub fn compose(frame: &mut Frame, slots: &mut Slots, viewport: Size) -> RailWidths {
+		let mut rails = RailWidths::default();
+		for mount in slots.mounts_at_mut(placement::LEFT_RAIL) {
+			if mount.visible() {
+				rails = rails.accumulate(true, mount.preferred_width().unwrap_or(0));
+			}
+		}
+		for mount in slots.mounts_at_mut(placement::RIGHT_RAIL) {
+			if mount.visible() {
+				rails = rails.accumulate(false, mount.preferred_width().unwrap_or(0));
+			}
+		}
+		let content = Rect::new(
+			rails.left.min(viewport.width),
+			0,
+			rails.content_width(viewport.width),
+			viewport.height,
+		);
+		let mut left = 0;
+		Self::stream_rail(
+			frame,
+			slots.mounts_at_mut(placement::LEFT_RAIL),
+			&mut left,
+			true,
+			viewport,
+		);
+		let mut right = viewport.width;
+		Self::stream_rail(
+			frame,
+			slots.mounts_at_mut(placement::RIGHT_RAIL),
+			&mut right,
+			false,
+			viewport,
+		);
+		let mut top = 0;
+		Self::stream_stack(frame, slots.mounts_at_mut(placement::HEADER), &mut top, content);
+		Self::stream_stack(frame, slots.mounts_at_mut(placement::ABOVE_EDITOR), &mut top, content);
+		let mut bottom = viewport.height;
+		Self::stream_stack_up(frame, slots.mounts_at_mut(placement::FOOTER), &mut bottom, content);
+		Self::stream_stack_up(
+			frame,
+			slots.mounts_at_mut(placement::BELOW_EDITOR),
+			&mut bottom,
+			content,
+		);
+		rails
+	}
+
+	/// Composes extension layers, then paints core attribution in the reserved
+	/// z-band above them.
+	pub fn compose_with_attribution(
+		frame: &mut Frame,
+		slots: &mut Slots,
+		viewport: Size,
+		attribution: &Attribution,
+		theme: Theme,
+	) -> RailWidths {
+		let rails = Self::compose(frame, slots, viewport);
+		attribution.render(frame, viewport.width, theme);
+		rails
+	}
+
+	fn stream_rail<'a>(
+		frame: &mut Frame,
+		mounts: impl Iterator<Item = &'a mut Mount>,
+		cursor: &mut u16,
+		left: bool,
+		viewport: Size,
+	) {
+		for mount in mounts {
+			if !mount.visible() {
+				continue;
+			}
+			let width = mount
+				.preferred_width()
+				.unwrap_or(0)
+				.min(viewport.width.saturating_sub(*cursor));
+			if width == 0 {
+				continue;
+			}
+			let x = if left {
+				*cursor
+			} else {
+				cursor.saturating_sub(width)
+			};
+			mount.ui_mut().resize(width.max(1));
+			let height = mount.ui_mut().frame().size().height.min(viewport.height);
+			let rect = Rect::new(x, 0, width, height);
+			mount.resolve(rect);
+			Self::stream(frame, mount, rect);
+			if left {
+				*cursor = cursor.saturating_add(width);
+			} else {
+				*cursor = x;
+			}
+		}
+	}
+
+	fn stream_stack<'a>(
+		frame: &mut Frame,
+		mounts: impl Iterator<Item = &'a mut Mount>,
+		cursor: &mut u16,
+		content: Rect,
+	) {
+		for mount in mounts {
+			if !mount.visible() || content.width == 0 {
+				continue;
+			}
+			mount.ui_mut().resize(content.width);
+			let height = mount
+				.preferred_height()
+				.unwrap_or(mount.ui_mut().frame().size().height);
+			let height = height.min(content.height.saturating_sub(*cursor));
+			let rect = Rect::new(content.x, *cursor, content.width, height);
+			mount.resolve(rect);
+			Self::stream(frame, mount, rect);
+			*cursor = cursor.saturating_add(height);
+		}
+	}
+
+	fn stream_stack_up<'a>(
+		frame: &mut Frame,
+		mounts: impl Iterator<Item = &'a mut Mount>,
+		cursor: &mut u16,
+		content: Rect,
+	) {
+		for mount in mounts {
+			if !mount.visible() || content.width == 0 {
+				continue;
+			}
+			mount.ui_mut().resize(content.width);
+			let height = mount
+				.preferred_height()
+				.unwrap_or(mount.ui_mut().frame().size().height)
+				.min(*cursor);
+			*cursor = cursor.saturating_sub(height);
+			let rect = Rect::new(content.x, *cursor, content.width, height);
+			mount.resolve(rect);
+			Self::stream(frame, mount, rect);
+		}
+	}
+
+	fn stream(frame: &mut Frame, mount: &mut Mount, rect: Rect) {
+		for row in 0..rect.height {
+			frame.blit(mount.ui_mut().frame(), row, 1, rect.x, rect.y.saturating_add(row));
+		}
+	}
+}
+
+/// Core-owned provenance labels rendered above every extension layer.
+///
+/// This deliberately lives outside extension markup: `<approval>` and
+/// `<attribution>` authored by extensions degrade through `MarkupOrigin`.
+pub struct Attribution {
+	septet: [Str; 7],
+}
+
+impl Attribution {
+	/// Creates the reserved attribution band from its seven provenance fields.
+	#[must_use]
+	pub fn new(septet: [Str; 7]) -> Self {
+		Self { septet }
+	}
+
+	/// Streams the provenance septet into the reserved top z-band.
+	pub fn render(&self, frame: &mut Frame, width: u16, theme: Theme) {
+		let mut line = String::new();
+		for item in &self.septet {
+			if item.is_empty() {
+				continue;
+			}
+			if !line.is_empty() {
+				line.push_str(" · ");
+			}
+			line.push_str(item.as_str());
+		}
+		let _ = draw_line(frame, 0, 0, width, &[Span::new(&line, prose_style(theme))]);
+	}
 }
 
 /// Result of routing one key through the focused composer.
@@ -436,6 +672,8 @@ pub struct Chat {
 	drawn_live:      u64,
 	last_working:    bool,
 	right_inset:     u16,
+	slots:           Slots,
+	attribution:     Option<Attribution>,
 }
 
 impl Chat {
@@ -474,7 +712,33 @@ impl Chat {
 			drawn_live: 0,
 			last_working: false,
 			right_inset: 0,
+			slots: Slots::new(ctx.clone()),
+			attribution: None,
 		}
+	}
+
+	/// Borrows retained extension slots for composition or headless inspection.
+	pub const fn slots_mut(&mut self) -> &mut Slots {
+		&mut self.slots
+	}
+
+	/// Applies an extension UI effect synchronously and repaints its retained
+	/// slot surface on the next frame.
+	pub fn apply_ui_effect(
+		&mut self,
+		effect: &omp_proto::omp::ui::v1::UiEffect,
+	) -> crate::slots::Damage {
+		let damage = self.slots.apply(effect);
+		if !damage.is_empty() {
+			self.bump_live();
+		}
+		damage
+	}
+
+	/// Sets the core-owned provenance septet shown above extension layers.
+	pub fn set_attribution(&mut self, septet: [Str; 7]) {
+		self.attribution = Some(Attribution::new(septet));
+		self.bump_live();
 	}
 
 	/// Routes a key through the composer.
@@ -1002,6 +1266,19 @@ impl Chat {
 				.frame
 				.blit(self.editor_ui.frame(), 0, editor_height, 0, editor_y);
 		}
+		let frame_size = self.frame.size();
+		let rails = if let Some(attribution) = self.attribution.as_ref() {
+			Bands::compose_with_attribution(
+				&mut self.frame,
+				&mut self.slots,
+				frame_size,
+				attribution,
+				self.ctx.theme,
+			)
+		} else {
+			Bands::compose(&mut self.frame, &mut self.slots, frame_size)
+		};
+		self.right_inset = rails.right;
 		let mut damage = SmallVec::new();
 		if repaint_suffix {
 			damage.push((transcript_damage_start, document_height));
@@ -1754,5 +2031,15 @@ mod tests {
 		assert!(
 			(0..settled.size().height).any(|row| row_text(settled, row).contains("fault branch"))
 		);
+	}
+
+	#[test]
+	fn rail_width_accumulates_all_visible_rails() {
+		let rails = RailWidths::default()
+			.accumulate(true, 12)
+			.accumulate(false, 30)
+			.accumulate(true, 8);
+		assert_eq!(rails, RailWidths { left: 20, right: 30 });
+		assert_eq!(rails.content_width(80), 30);
 	}
 }

@@ -1411,12 +1411,19 @@ impl Suggestion {
 	pub fn description(&self) -> Option<&str> {
 		self.description.as_deref()
 	}
+
+	/// Returns the text inserted when this row is accepted.
+	#[must_use]
+	pub const fn value(&self) -> &Str {
+		&self.value
+	}
 }
 
 /// Ranked dropdown rows; inline up to eight before spilling.
 pub type SuggestionList = SmallVec<Suggestion, 8>;
 
 /// Ranked dropdown suggestions returned by [`EditorCompletion::suggest`].
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Suggestions {
 	/// Byte offset where the completed prefix starts; acceptance replaces
 	/// `prefix_start..cursor` with the chosen suggestion's insert text.

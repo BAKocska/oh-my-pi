@@ -17,16 +17,21 @@ use crate::{
 pub enum TaskStatus {
 	/// Not started; renders dim with an empty checkbox.
 	#[default]
-	#[strum(to_string = "pending", serialize = "open")]
+	#[strum(to_string = "pending", serialize = "open", serialize = "queued")]
 	Pending,
 	/// Currently being worked; renders accent.
 	#[strum(to_string = "active", serialize = "in-progress", serialize = "in_progress")]
 	Active,
 	/// Finished; renders ok with a checked box and struck label.
-	#[strum(to_string = "done", serialize = "completed")]
+	#[strum(to_string = "done", serialize = "completed", serialize = "settled")]
 	Done,
-	/// Abandoned; renders err with a struck label.
-	#[strum(to_string = "dropped", serialize = "abandoned")]
+	/// Abandoned, failed, or cancelled; renders err with a struck label.
+	#[strum(
+		to_string = "dropped",
+		serialize = "abandoned",
+		serialize = "failed",
+		serialize = "cancelled"
+	)]
 	Dropped,
 	/// Waiting on something external; renders warn with the blocker note.
 	#[strum(to_string = "blocked")]

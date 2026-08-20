@@ -4,7 +4,7 @@ use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
 	frame::{Rect, Style},
-	props::Props,
+	props::{Prop, PropValue, Props},
 	rich::{Pipeline, Prefix, RichSink, RichText, width_config_epoch},
 };
 
@@ -55,6 +55,13 @@ impl DiffView {
 			cached_width_epoch: 0,
 			cached_revision:    0,
 		}
+	}
+
+	/// Sets one diff property.
+	#[must_use]
+	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
+		self.props.set(prop, value);
+		self
 	}
 
 	/// Appends a new line to the diff view.

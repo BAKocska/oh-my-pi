@@ -82,6 +82,9 @@ class Host:
         if len(raw) > _MAX_FRAME_BYTES:
             raise FrameTooLarge(f"CONTROL frame is {len(raw)} bytes (limit {_MAX_FRAME_BYTES})")
         os.write(self._fd, struct.pack("!I", len(raw)) + raw)
+    def effect(self, effect: dict[str, Any]) -> None:
+        """Write one already-encoded, non-correlated UI effect frame."""
+        self._write({"kind": "UiEffect", "body": effect})
     def log(self, stream: str, text: str) -> None:
         self._write({"kind": "Log", "body": {"stream": stream, "text": text}})
     def install_capture(self) -> None:

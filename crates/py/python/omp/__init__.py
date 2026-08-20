@@ -79,6 +79,8 @@ _control_backend: _contextvars.ContextVar[_Any | None] = _contextvars.ContextVar
 def _install_control_backend(backend: _Any) -> None:
     """Install the host-owned CONTROL bridge in the active invocation context."""
     _control_backend.set(backend)
+    from . import ui as _ui
+    _ui._install_effect_sink(getattr(backend, "effect", None))
 
 async def _control_request(operation: str, /, **arguments: _Any) -> _Any:
     backend = _control_backend.get()
@@ -180,6 +182,8 @@ class Capability(_StrEnum):
 # Importing these frozen modules only creates declarations and namespace values.
 from . import env as env
 from . import urls as urls
+from . import ui as ui
+renderer = ui.renderer
 from .urls import (
     Scheme,
     SchemeInfo,
@@ -338,6 +342,7 @@ __all__ = (
     "state",
     "state_dir",
     "urls",
+    "ui",
     "schemes",
     "BoundaryError",
     "Capability",
@@ -352,6 +357,7 @@ __all__ = (
     "WorkerHandle",
     "WorkerInfo",
     "WorkerResources",
+    "renderer",
     "WorkerSpec",
     "WorkerState",
     "WorkerUnavailable",

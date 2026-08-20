@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	Appearance, CursorStyle, Graphics, InputEvent, Key, OverlayId, PaintStats, ProbeResults,
+	Appearance, Chord, CursorStyle, Graphics, InputEvent, Key, OverlayId, PaintStats, ProbeResults,
 	Renderer, Size, Terminal, TerminalCaps, TerminalOptions, TerminalResponse, Theme, TtyOut, Ui,
 	UiContext, UiEvent,
 	component::Slot,
@@ -426,6 +426,24 @@ pub struct AppEnv {
 	pub ctx:      UiContext,
 }
 
+/// Returns whether a chord is reserved by core terminal, clipboard, or input
+/// handling and therefore unavailable to extension shortcut declarations.
+#[must_use]
+pub const fn is_core_chord(chord: Chord) -> bool {
+	matches!(
+		chord.key,
+		Key::Esc
+			| Key::Backspace
+			| Key::Delete
+			| Key::Paste
+			| Key::PasteRaw
+			| Key::Copy
+			| Key::Cut
+			| Key::Ctrl('c')
+			| Key::Ctrl('v')
+	)
+}
+
 /// Host-level event returned by [`App::next`].
 ///
 /// Input has already been routed into the retained tree.
@@ -776,6 +794,7 @@ impl App {
 						self.resize_wait = Some(tokio::time::Instant::now());
 					},
 					TerminalEvent::Debug(query) => self.answer_debug(query),
+					TerminalEvent::Effect(_) => {},
 					// `Terminal::next` reports closure as an error.
 					TerminalEvent::Closed => return Ok(None),
 					TerminalEvent::Input(event) => {
@@ -1081,6 +1100,10 @@ impl App {
 			},
 			DebugOp::Tree => json!({ "ok": true, "tree": self.ui.debug_tree() }),
 			DebugOp::Values => json!({ "ok": true, "values": self.ui.values() }),
+			DebugOp::Slots => json!({
+				"ok": false,
+				"error": "slots are owned by the chat scene; retained App has no slot registry",
+			}),
 			// Terminal-owned ops are answered inside `Terminal::next` and
 			// never surface here.
 			DebugOp::Info | DebugOp::Text | DebugOp::Resize | DebugOp::Quit => return,

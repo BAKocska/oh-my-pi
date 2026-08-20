@@ -5,7 +5,9 @@
 //! `warn`, …) and structural markup; the context decides what a border,
 //! cursor, or `warn` actually looks like on this terminal.
 
-use crate::{color::SystemColor, component::Elements, frame::Color, markup::Border};
+use crate::{
+	color::SystemColor, component::Elements, frame::Color, markup::Border, runtime::ImageLoader,
+};
 /// Terminal policy for Hangul Compatibility Jamo (`U+3131..=U+318E`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum JamoWidth {
@@ -565,7 +567,7 @@ pub struct UiContext {
 	/// Off-thread image decoder. `None` decodes inline during layout for
 	/// deterministic tests and bare synchronous hosts. [`crate::App`] installs
 	/// one before building the [`crate::Ui`].
-	pub loader:       Option<crate::ImageLoader>,
+	pub loader:       Option<ImageLoader>,
 }
 
 impl Default for UiContext {

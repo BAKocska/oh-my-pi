@@ -1,5 +1,6 @@
 //! Project environment-daemon assembly and production serving.
 
+mod admission;
 pub mod blobs;
 pub mod docs;
 pub(crate) mod eval;

@@ -17,15 +17,15 @@ use omp_core::Str;
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{Adjustment, ToolGrammarSyntax};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
-	ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError,
-	CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint, ConstraintDisposition,
-	DocEffects, Effects, ErasedEv, ErasedOutcome, Ev, ExecEffects, ExpectedArtifact, Fallback,
-	GrammarSyntax, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, JobOwner,
-	JobRef, LiftedCall, LoweringCaps, ModelClass, ParamError, Part, Precedence, Presentation,
-	ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall, RecordedCallOwned, Registry,
-	RegistryError, RepairKind, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal, Usd,
-	call_outcome_details,
+	Abort, AbortKind, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry,
+	ArgSpecRegistryError, ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails,
+	CallOutcomeDetailsError, CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint,
+	ConstraintDisposition, DocEffects, Effects, ErasedEv, ErasedOutcome, Ev, ExecEffects,
+	ExpectedArtifact, Fallback, GrammarSyntax, IncomingParams, InferenceEffects, Interrupt,
+	InterruptWaitError, JobOwner, JobRef, LiftedCall, LoweringCaps, ModelClass, ParamError, Part,
+	PolicyDenied, Precedence, Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind,
+	RecordedCall, RecordedCallOwned, Registry, RegistryError, RepairKind, Rev, Tool, ToolIdentity,
+	ToolSpec, ToolTerminal, Usd, call_outcome_details,
 	render::{Render, RenderRegistryError, ViewState},
 };
 use serde::{Deserialize, Serialize};
@@ -971,9 +971,7 @@ fn prompt_projection_is_exact_and_deterministic_for_the_same_input() {
 	assert_eq!(
 		first,
 		Arc::<[Part]>::from(vec![
-			Part::Text {
-				text: Str::from(format!("renderer|ok:engine:{}|3/256/true", "{value:9}"))
-			},
+			Part::Text { text: Str::from(format!("renderer|ok:engine:{}|3/256/true", "{value:9}")) },
 			Part::Json { json: Bytes::from_static(br#""ok:engine:{value:9}""#) },
 		])
 	);
@@ -1588,6 +1586,31 @@ impl Render for CountRender {
 	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
 		Some(Str::from(format!("count={state};settled={}", outcome.is_some())))
 	}
+}
+
+#[test]
+fn policy_denied_abort_round_trips_and_missing_fields_keep_legacy_abort_kind() {
+	type Outcome = CallOutcome<serde_json::Value, serde_json::Value>;
+	let legacy: Outcome = serde_json::from_value(json!({
+		"kind": "aborted",
+		"value": {"abort": {"kind": "skipped", "reason": "not started"}}
+	}))
+	.expect("legacy abort without additive fields remains readable");
+	assert!(matches!(legacy, CallOutcome::Aborted { kind: AbortKind::Skipped, policy: None, .. }));
+
+	let outcome = Outcome::policy_denied(
+		Abort::Skipped { reason: Str::from("admission refused") },
+		PolicyDenied {
+			reason:      Str::from("workspace policy refused this call"),
+			code:        Some(Str::from("policy.workspace")),
+			decision_id: Str::from("decision-7"),
+			rules:       Arc::from([Str::from("workspace.read-only")]),
+		},
+	);
+	let decoded: Outcome =
+		serde_json::from_slice(&serde_json::to_vec(&outcome).expect("serialize policy denial"))
+			.expect("deserialize policy denial");
+	assert_eq!(decoded, outcome);
 }
 
 #[test]

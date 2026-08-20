@@ -5,12 +5,13 @@
 //! workspace, blob-store, or tool-host implementation: those resources live
 //! behind the environment service in both in-process and remote deployments.
 
+mod admit;
 mod client;
 mod guard;
-
 #[cfg(windows)]
 pub mod windows;
 
+pub use admit::Admitter;
 pub use client::{
 	BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DataScope, DataStream, DataStreamItem,
 	DocumentEvents, DocumentLease, DocumentRead, EnvClient, ExecEvent, ExecRun,

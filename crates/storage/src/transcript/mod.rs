@@ -12,6 +12,8 @@
 pub mod block;
 pub mod capsule;
 pub mod codec;
+#[cfg(test)]
+mod codec_tests;
 pub mod event;
 pub mod msg;
 pub mod patch;
@@ -24,8 +26,9 @@ pub mod writer;
 pub use block::{Block, BlockKind, Replay};
 pub use codec::{Error, Header, read_header, read_line, write_header, write_line};
 pub use event::{
-	Custom, EntryUndecodable, Event, ItemRecord, JobRegistered, JobSettled, Kind,
-	PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ToolBatchAuthorized, TurnAbort,
+	ApprovalDecided, ApprovalReason, ApprovalTicketFiled, Custom, EntryUndecodable, Event,
+	HookOutcome, ItemRecord, JobRegistered, JobSettled, Kind, PolicyDecision, PromptRewriteCommit,
+	PromptRewriteIntent, PromptRewriteStage, SupersededCompaction, ToolBatchAuthorized, TurnAbort,
 	TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 };
 pub use msg::{Content, Msg, UserBlock};

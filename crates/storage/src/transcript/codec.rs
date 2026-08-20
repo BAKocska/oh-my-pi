@@ -10,9 +10,10 @@ use thiserror::Error as ThisError;
 
 use super::{
 	event::{
-		Custom, EntryUndecodable, Event, ItemRecord, JobRegistered, JobSettled, Kind,
-		PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ToolBatchAuthorized, TurnAbort,
-		TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
+		ApprovalDecided, ApprovalTicketFiled, Custom, EntryUndecodable, Event, HookOutcome,
+		ItemRecord, JobRegistered, JobSettled, Kind, PolicyDecision, PromptRewriteCommit,
+		PromptRewriteIntent, PromptRewriteStage, SupersededCompaction, ToolBatchAuthorized,
+		TurnAbort, TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 	},
 	msg::{Content, Msg},
 	patch::Patch,
@@ -185,17 +186,36 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 				object.field("cred_pin", cred_pin)?;
 			}
 		},
+		Kind::HookOutcome(outcome) => {
+			object.field("k", "hook_outcome")?;
+			object.field("value", outcome)?;
+		},
+		Kind::PolicyDecision(decision) => {
+			object.field("k", "policy_decision")?;
+			object.field("value", decision)?;
+		},
+		Kind::ApprovalTicketFiled(ticket) => {
+			object.field("k", "approval_ticket_filed")?;
+			object.field("value", ticket)?;
+		},
+		Kind::ApprovalDecided(decision) => {
+			object.field("k", "approval_decided")?;
+			object.field("value", decision)?;
+		},
 		Kind::Rewind { to } => {
 			object.field("k", "rewind")?;
 			object.field("to", to)?;
 		},
-		Kind::Compact { summary, short, first_kept, tokens_before, warning } => {
+		Kind::Compact { summary, short, first_kept, tokens_before, warning, superseded } => {
 			object.field("k", "compact")?;
 			object.field("summary", summary)?;
 			object.field("short", short)?;
 			object.field("first_kept", first_kept)?;
 			object.field("tokens_before", tokens_before)?;
 			object.field("warning", warning)?;
+			if !superseded.is_empty() {
+				object.field("superseded", superseded)?;
+			}
 		},
 		Kind::Branch { from, summary } => {
 			object.field("k", "branch")?;
@@ -408,10 +428,13 @@ struct Probe {
 }
 
 macro_rules! payload {
-	($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+	($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
 		#[derive(Deserialize)]
 		struct $name {
-			$($field: $ty),*
+			$(
+				$(#[$attr])*
+				$field: $ty,
+			)*
 		}
 	};
 }
@@ -444,6 +467,10 @@ struct InferPayload {
 	#[serde(default, skip_serializing_if = "Patch::is_unchanged")]
 	cred_pin: Patch<Pin>,
 }
+payload!(HookOutcomePayload { value: HookOutcome });
+payload!(PolicyDecisionPayload { value: PolicyDecision });
+payload!(ApprovalTicketFiledPayload { value: ApprovalTicketFiled });
+payload!(ApprovalDecidedPayload { value: ApprovalDecided });
 
 payload!(RewindPayload { to: Option<u64> });
 payload!(CompactPayload {
@@ -452,6 +479,8 @@ payload!(CompactPayload {
 	first_kept: u64,
 	tokens_before: u64,
 	warning: Option<Str>,
+	#[serde(default)]
+	superseded: Vec<SupersededCompaction>,
 });
 payload!(BranchPayload { from: u64, summary: Str });
 payload!(TitlePayload { title: Str, source: TitleSource });
@@ -607,6 +636,22 @@ fn decode_line(line: &[u8]) -> Result<Event, Error> {
 				cred_pin: payload.cred_pin,
 			}
 		},
+		"hook_outcome" => {
+			let payload: HookOutcomePayload = serde_json::from_slice(line)?;
+			Kind::HookOutcome(payload.value)
+		},
+		"policy_decision" => {
+			let payload: PolicyDecisionPayload = serde_json::from_slice(line)?;
+			Kind::PolicyDecision(payload.value)
+		},
+		"approval_ticket_filed" => {
+			let payload: ApprovalTicketFiledPayload = serde_json::from_slice(line)?;
+			Kind::ApprovalTicketFiled(payload.value)
+		},
+		"approval_decided" => {
+			let payload: ApprovalDecidedPayload = serde_json::from_slice(line)?;
+			Kind::ApprovalDecided(payload.value)
+		},
 		"rewind" => {
 			let payload: RewindPayload = serde_json::from_slice(line)?;
 			Kind::Rewind { to: payload.to }
@@ -619,6 +664,7 @@ fn decode_line(line: &[u8]) -> Result<Event, Error> {
 				first_kept:    payload.first_kept,
 				tokens_before: payload.tokens_before,
 				warning:       payload.warning,
+				superseded:    payload.superseded,
 			}
 		},
 		"branch" => {

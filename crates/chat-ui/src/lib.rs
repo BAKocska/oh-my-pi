@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actions;
+pub mod completion;
 pub mod host;
 mod overlays;
 pub mod palette;
@@ -14,6 +16,7 @@ pub mod scene;
 pub mod sidebar;
 pub mod welcome;
 
+pub mod slots;
 use std::time::Instant;
 
 use omp_core::Str;

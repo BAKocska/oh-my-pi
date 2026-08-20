@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex};
+use omp_core::{SparseMap, SparseSet, Str, encoding::hex};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::transcript::{AmendPatch, Entry, Kind, LiveSet, Log};
 use omp_tool::{
@@ -52,37 +52,111 @@ pub fn project_journal(
 	caps: &CapsBase,
 ) -> Result<thread_pb::Thread, ProjectionError> {
 	let mut items = Vec::new();
-	let mut positions = BTreeMap::new();
+	let mut positions = SparseMap::new();
+	let mut amended = SparseSet::new();
+	let mut amendments = SparseMap::new();
 	for index in live.iter() {
 		let Some(Entry::Ok(event)) = log.get(index) else {
 			continue;
 		};
 		match &event.kind {
 			Kind::Item(record) => {
-				positions.insert(index, items.len());
-				items.push(record.item.clone());
+				let position = items.len();
+				let mut item = record.item.clone();
+				if amended.contains(index)
+					&& let Some(amendment) = amendments.get(index)
+				{
+					apply_amendment(&mut item, amendment);
+				}
+				positions.insert(index, position);
+				items.push(item);
 			},
 			Kind::TurnInput(input) => {
-				positions.insert(index, items.len());
-				items.push(input.item.clone());
+				let position = items.len();
+				let mut item = input.item.clone();
+				if amended.contains(index)
+					&& let Some(amendment) = amendments.get(index)
+				{
+					apply_amendment(&mut item, amendment);
+				}
+				positions.insert(index, position);
+				items.push(item);
 			},
 			Kind::PromptRewriteStage(stage) => {
-				positions.insert(index, items.len());
-				items.push(stage.item.clone());
+				let position = items.len();
+				let mut item = stage.item.clone();
+				if amended.contains(index)
+					&& let Some(amendment) = amendments.get(index)
+				{
+					apply_amendment(&mut item, amendment);
+				}
+				positions.insert(index, position);
+				items.push(item);
 			},
 			Kind::JobSettled(settled) => {
-				positions.insert(index, items.len());
-				items.push(settled.settlement.clone());
+				let position = items.len();
+				let mut item = settled.settlement.clone();
+				if amended.contains(index)
+					&& let Some(amendment) = amendments.get(index)
+				{
+					apply_amendment(&mut item, amendment);
+				}
+				positions.insert(index, position);
+				items.push(item);
 			},
-			Kind::Amend { target, patch: AmendPatch::Seq { seq } } => {
-				if let Some(position) = positions.get(target).copied() {
-					items[position].seq = *seq;
+			Kind::Amend { target, patch } => {
+				let amendment = amendments.get_or_insert(*target, ItemAmendment::default());
+				if !amendment.record(patch) {
+					continue;
+				}
+				amended.insert(*target);
+				if let Some(position) = positions.get(*target).copied() {
+					apply_amendment(&mut items[position], amendment);
 				}
 			},
 			_ => {},
 		}
 	}
 	project_thread_history(&thread_pb::Thread { items }, tool_registry, caps)
+}
+
+/// The effective item-affecting portion of an append-only amendment chain.
+#[derive(Default)]
+struct ItemAmendment {
+	seq:        Option<u64>,
+	drop_parts: bool,
+}
+
+impl ItemAmendment {
+	/// Records one amendment, returning whether it changes canonical projection.
+	fn record(&mut self, patch: &AmendPatch) -> bool {
+		match patch {
+			AmendPatch::DropParts => {
+				self.drop_parts = true;
+				true
+			},
+			AmendPatch::Seq { seq } => {
+				self.seq = Some(*seq);
+				true
+			},
+			AmendPatch::Prune { .. } | AmendPatch::RetryRecovery { .. } | AmendPatch::Unknown(_) => {
+				false
+			},
+		}
+	}
+}
+
+/// Applies compacted projection state without mutating durable transcript
+/// bytes.
+fn apply_amendment(item: &mut thread_pb::Item, amendment: &ItemAmendment) {
+	if let Some(seq) = amendment.seq {
+		item.seq = seq;
+	}
+	if amendment.drop_parts
+		&& let Some(thread_pb::item::Kind::ToolResult(result)) = item.kind.as_mut()
+	{
+		result.parts.clear();
+	}
 }
 
 /// Re-expresses historical tool calls through complete live revision lifts.
@@ -393,15 +467,18 @@ fn tool_parts(parts: &[ToolPart]) -> Result<Vec<thread_pb::Part>, ProjectionErro
 
 #[cfg(test)]
 mod tests {
-	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::{
+		collections::BTreeMap,
+		sync::atomic::{AtomicU64, Ordering},
+	};
 
 	use bytes::Bytes;
 	use omp_core::Str;
-	use omp_proto::thread::v1 as thread_pb;
+	use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 	use omp_storage::transcript::{
-		Event, Header, ItemRecord, Kind, LiveSet, SessionId, Writer, load,
+		AmendPatch, Event, Header, ItemRecord, Kind, LiveSet, SessionId, Writer, load,
 	};
-	use omp_tool::{CapsBase, ModelClass};
+	use omp_tool::{CapsBase, ModelClass, TOOL_REV_PROP};
 
 	use super::project_journal;
 
@@ -458,6 +535,78 @@ mod tests {
 		})
 		.expect("project transcript");
 		assert_eq!(projected.items, vec![item]);
+		std::fs::remove_file(path).expect("remove transcript");
+	}
+
+	#[test]
+	fn drop_parts_preserves_tool_result_details_and_revision() {
+		let path = std::env::temp_dir().join(format!(
+			"omp-agent-project-drop-parts-{}-{}.jsonl",
+			std::process::id(),
+			NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+		));
+		let mut writer = Writer::create(&path, &Header {
+			v:       4,
+			id:      SessionId(Str::from("drop-parts")),
+			created: 1,
+			cwd:     std::env::temp_dir(),
+		})
+		.expect("create transcript");
+		let details = pb::Value { kind: Some(pb::value::Kind::String("recorded".to_owned())) };
+		let item = thread_pb::Item {
+			kind: Some(thread_pb::item::Kind::ToolResult(thread_pb::ToolResult {
+				call_id: "call-1".to_owned(),
+				name: "read".to_owned(),
+				parts: vec![thread_pb::Part {
+					kind: Some(thread_pb::part::Kind::Text("large result".to_owned())),
+				}],
+				details: Some(details.clone()),
+				is_error: true,
+				useless: Some(true),
+				..Default::default()
+			})),
+			props: Some(pb::ValueMap {
+				fields: BTreeMap::from([(TOOL_REV_PROP.to_owned(), pb::Value {
+					kind: Some(pb::value::Kind::String("read.1".to_owned())),
+				})]),
+			}),
+			..Default::default()
+		};
+		let target = writer
+			.append(&Event {
+				ts:   2,
+				kind: Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None }),
+			})
+			.expect("append tool result");
+		writer
+			.append(&Event { ts: 3, kind: Kind::Amend { target, patch: AmendPatch::DropParts } })
+			.expect("append content drop");
+		drop(writer);
+
+		let log = load(&path).expect("load transcript");
+		let mut live = LiveSet::new();
+		log.live_into(&mut live);
+		let projected = project_journal(&log, &live, &omp_tool::Registry::new(), &CapsBase {
+			maximum_parts:      8,
+			maximum_text_bytes: 4_096,
+			media:              true,
+			model_class:        ModelClass::Standard,
+		})
+		.expect("project transcript");
+		let Some(thread_pb::item::Kind::ToolResult(result)) = projected.items[0].kind.as_ref() else {
+			panic!("projected item is a tool result");
+		};
+		assert!(result.parts.is_empty());
+		assert_eq!(result.details.as_ref(), Some(&details));
+		assert!(result.is_error);
+		assert_eq!(result.useless, Some(true));
+		assert_eq!(
+			projected.items[0]
+				.props
+				.as_ref()
+				.and_then(|props| props.fields.get(TOOL_REV_PROP)),
+			Some(&pb::Value { kind: Some(pb::value::Kind::String("read.1".to_owned())) })
+		);
 		std::fs::remove_file(path).expect("remove transcript");
 	}
 }

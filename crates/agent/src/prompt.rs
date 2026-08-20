@@ -1,6 +1,7 @@
 //! Deterministic construction of the canonical system-prompt head.
 
 use std::{
+	collections::HashSet,
 	fmt,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -9,6 +10,7 @@ use std::{
 use bytes::Bytes;
 use omp_core::Str;
 use omp_proto::thread::v1::{self as thread, Item};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -105,6 +107,271 @@ impl From<PromptHash> for [u8; 32] {
 		hash.0
 	}
 }
+/// BLAKE3 digest of one semantic prompt stability band.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct BandHash([u8; 32]);
+
+impl BandHash {
+	/// Returns the digest bytes.
+	#[must_use]
+	pub const fn as_bytes(&self) -> &[u8; 32] {
+		&self.0
+	}
+}
+
+/// Semantic stability of a prompt contribution.
+///
+/// Discriminants are assembly order, not a wire vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum SlotClass {
+	/// Immutable for the process lifetime.
+	Frozen   = 0,
+	/// Changes only after an explicit observable configuration event.
+	Stable   = 1,
+	/// Changes at a compaction or reset epoch boundary.
+	Epochal  = 2,
+	/// May change on every turn.
+	Volatile = 3,
+}
+
+/// The fixed prompt-slot catalog.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum SlotId {
+	/// RFC and harness conventions.
+	Conventions = 0,
+	/// Agent identity.
+	Role        = 1,
+	/// Runtime capability announcements.
+	Runtime     = 2,
+	/// Tool and device inventory.
+	Tools       = 3,
+	/// Tool-use policy.
+	Policy      = 4,
+	/// Engineering workflow.
+	Workflow    = 5,
+	/// Installed skills.
+	Skills      = 6,
+	/// Standing rules.
+	Rules       = 7,
+	/// General guidance.
+	Guidance    = 8,
+	/// Workspace identity and files.
+	Workspace   = 9,
+	/// Compaction-epoch memory.
+	Memory      = 10,
+	/// Compaction-epoch standing instructions.
+	Standing    = 11,
+	/// Per-turn recall.
+	Recall      = 12,
+	/// Per-turn runtime status.
+	Status      = 13,
+	/// Delivery contract.
+	Delivery    = 14,
+}
+
+/// A declared prompt contribution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlotDecl {
+	/// Destination slot.
+	pub slot:     SlotId,
+	/// Declared stability band.
+	pub class:    SlotClass,
+	/// Stable extension identity used as a deterministic tie-break.
+	pub owner:    Str,
+	/// Descending order within a slot.
+	pub priority: i16,
+}
+
+/// Streaming byte sink supplied to a synchronous slot source.
+pub trait PromptOut {
+	/// Appends UTF-8 text to this contribution.
+	fn write_str(&mut self, text: &str);
+}
+
+impl PromptOut for String {
+	fn write_str(&mut self, text: &str) {
+		self.push_str(text);
+	}
+}
+
+/// Synchronous source of one registered prompt contribution.
+pub trait SlotSource: Send + Sync + 'static {
+	/// Renders this source from immutable workspace input.
+	fn render(&self, workspace: &WorkspaceInput, out: &mut dyn PromptOut)
+	-> Result<(), PromptError>;
+}
+
+/// Immutable bytes pulled from an extension at activation or invalidation time.
+///
+/// The host is responsible for double-calling an extension before constructing
+/// this value; prompt rendering then never performs socket I/O.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachedContribution {
+	bytes: Str,
+}
+
+impl CachedContribution {
+	/// Creates a contribution from host-validated immutable bytes.
+	#[must_use]
+	pub fn new(bytes: impl Into<Str>) -> Self {
+		Self { bytes: bytes.into() }
+	}
+}
+
+impl SlotSource for CachedContribution {
+	fn render(
+		&self,
+		_workspace: &WorkspaceInput,
+		out: &mut dyn PromptOut,
+	) -> Result<(), PromptError> {
+		out.write_str(self.bytes.as_str());
+		Ok(())
+	}
+}
+
+/// One declaration paired with its immutable or host-cached source.
+#[derive(Clone)]
+pub struct SlotRegistration {
+	/// Registration metadata.
+	pub decl:   SlotDecl,
+	/// Source that provides this declaration's bytes.
+	pub source: Arc<dyn SlotSource>,
+}
+
+/// Journal-facing record for a dropped nondeterministic contribution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolatilePrompt {
+	/// Slot whose source differed on its two renders.
+	pub slot:   SlotId,
+	/// Extension identity of the rejected source.
+	pub owner:  Str,
+	/// Digest of the first bytes.
+	pub first:  BandHash,
+	/// Digest of the second bytes.
+	pub second: BandHash,
+}
+
+/// Receives durable `omp.VolatilePrompt` records.
+pub trait VolatilePromptJournal: Send + Sync + 'static {
+	/// Appends one dropped-contribution record.
+	fn volatile_prompt(&self, record: VolatilePrompt);
+}
+
+/// Composes registered slots into a deterministic canonical prompt source.
+pub struct SlotAssembler {
+	registrations: Vec<SlotRegistration>,
+	dropped:       Mutex<HashSet<Str>>,
+	journal:       Option<Arc<dyn VolatilePromptJournal>>,
+}
+
+impl SlotAssembler {
+	/// Creates an assembler, sorting registrations by class, declared slot,
+	/// priority, and owner.
+	#[must_use]
+	pub fn new(mut registrations: Vec<SlotRegistration>) -> Self {
+		registrations.sort_by(|left, right| {
+			left
+				.decl
+				.class
+				.cmp(&right.decl.class)
+				.then(left.decl.slot.cmp(&right.decl.slot))
+				.then(right.decl.priority.cmp(&left.decl.priority))
+				.then(left.decl.owner.cmp(&right.decl.owner))
+		});
+		Self { registrations, dropped: Mutex::new(HashSet::new()), journal: None }
+	}
+
+	/// Attaches the durable journal sink used for rejected volatile sources.
+	#[must_use]
+	pub fn with_journal(mut self, journal: Arc<dyn VolatilePromptJournal>) -> Self {
+		self.journal = Some(journal);
+		self
+	}
+
+	/// Renders and returns hashes for all four semantic bands.
+	pub fn render_banded(
+		&self,
+		workspace: &WorkspaceInput,
+	) -> Result<(RenderedPrompt, [BandHash; 4]), PromptError> {
+		let (items, bands) = self
+			.banded_render(workspace)?
+			.expect("slot assembler is banded");
+		let mut hasher = blake3::Hasher::new();
+		for band in bands {
+			hasher.update(band.as_bytes());
+		}
+		Ok((
+			RenderedPrompt { items: items.into(), hash: PromptHash(*hasher.finalize().as_bytes()) },
+			bands,
+		))
+	}
+
+	fn assemble(&self, workspace: &WorkspaceInput) -> Result<AssembledSlots, PromptError> {
+		let mut band_bytes = [String::new(), String::new(), String::new(), String::new()];
+		for registration in &self.registrations {
+			if self.dropped.lock().contains(&registration.decl.owner) {
+				continue;
+			}
+			let mut first = String::new();
+			registration.source.render(workspace, &mut first)?;
+			let mut second = String::new();
+			registration.source.render(workspace, &mut second)?;
+			if first != second {
+				let record = VolatilePrompt {
+					slot:   registration.decl.slot,
+					owner:  registration.decl.owner.clone(),
+					first:  hash_band(first.as_bytes()),
+					second: hash_band(second.as_bytes()),
+				};
+				self.dropped.lock().insert(registration.decl.owner.clone());
+				if let Some(journal) = &self.journal {
+					journal.volatile_prompt(record);
+				}
+				continue;
+			}
+			band_bytes[registration.decl.class as usize].push_str(&first);
+		}
+		let bands = band_bytes
+			.each_ref()
+			.map(|bytes| hash_band(bytes.as_bytes()));
+		let items = band_bytes
+			.into_iter()
+			.filter(|bytes| !bytes.is_empty())
+			.map(system_text)
+			.collect();
+		Ok(AssembledSlots { items, bands })
+	}
+}
+
+impl PromptSource for SlotAssembler {
+	fn render(&self, workspace: &WorkspaceInput) -> Result<Vec<Item>, PromptError> {
+		Ok(self.assemble(workspace)?.items)
+	}
+
+	fn banded_render(
+		&self,
+		workspace: &WorkspaceInput,
+	) -> Result<Option<(Vec<Item>, [BandHash; 4])>, PromptError> {
+		let first = self.assemble(workspace)?;
+		let second = self.assemble(workspace)?;
+		if first.items != second.items {
+			return Err(PromptError::Volatile);
+		}
+		Ok(Some((first.items, first.bands)))
+	}
+}
+
+struct AssembledSlots {
+	items: Vec<Item>,
+	bands: [BandHash; 4],
+}
+
+fn hash_band(bytes: &[u8]) -> BandHash {
+	BandHash(*blake3::hash(bytes).as_bytes())
+}
 
 /// A checked canonical prompt head and its content hash.
 #[derive(Clone, Debug, PartialEq)]
@@ -123,6 +390,14 @@ pub struct RenderedPrompt {
 pub trait PromptSource: Send + Sync + 'static {
 	/// Renders one candidate prompt head from immutable input.
 	fn render(&self, workspace: &WorkspaceInput) -> Result<Vec<Item>, PromptError>;
+
+	/// Optionally renders a head whose stability bands have semantic hashes.
+	fn banded_render(
+		&self,
+		_workspace: &WorkspaceInput,
+	) -> Result<Option<(Vec<Item>, [BandHash; 4])>, PromptError> {
+		Ok(None)
+	}
 }
 
 /// Deterministic plain-text renderer for workspace identity and context files.
@@ -193,12 +468,24 @@ pub enum PromptError {
 
 /// Renders, validates, volatility-checks, and hashes one prompt head.
 ///
-/// The source is invoked twice against the same immutable input. Both complete
-/// item sequences must be byte-for-byte equal before either is accepted.
+/// Plain sources are invoked twice against identical immutable input. Banded
+/// sources perform the same check at their contribution boundary before their
+/// four semantic hashes are folded into the wire-compatible prompt hash.
 pub fn render_prompt(
 	source: &dyn PromptSource,
 	workspace: &WorkspaceInput,
 ) -> Result<RenderedPrompt, PromptError> {
+	if let Some((items, bands)) = source.banded_render(workspace)? {
+		validate_items(&items)?;
+		let mut hasher = blake3::Hasher::new();
+		for band in bands {
+			hasher.update(band.as_bytes());
+		}
+		return Ok(RenderedPrompt {
+			items: items.into(),
+			hash:  PromptHash(*hasher.finalize().as_bytes()),
+		});
+	}
 	let first = source.render(workspace)?;
 	validate_items(&first)?;
 	let second = source.render(workspace)?;
@@ -303,5 +590,92 @@ mod tests {
 			render_prompt(&source, &WorkspaceInput::default()),
 			Err(PromptError::Volatile)
 		));
+	}
+	#[derive(Clone)]
+	struct TextSource(&'static str);
+
+	impl SlotSource for TextSource {
+		fn render(
+			&self,
+			_workspace: &WorkspaceInput,
+			out: &mut dyn PromptOut,
+		) -> Result<(), PromptError> {
+			out.write_str(self.0);
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn band_hash_stability_isolated_to_volatile_band() {
+		let stable = SlotRegistration {
+			decl:   SlotDecl {
+				slot:     SlotId::Policy,
+				class:    SlotClass::Stable,
+				owner:    "policy".into(),
+				priority: 0,
+			},
+			source: Arc::new(TextSource("policy")),
+		};
+		let volatile_a = SlotRegistration {
+			decl:   SlotDecl {
+				slot:     SlotId::Status,
+				class:    SlotClass::Volatile,
+				owner:    "status".into(),
+				priority: 0,
+			},
+			source: Arc::new(TextSource("one")),
+		};
+		let volatile_b =
+			SlotRegistration { source: Arc::new(TextSource("two")), ..volatile_a.clone() };
+		let (_, first) = SlotAssembler::new(vec![stable.clone(), volatile_a])
+			.render_banded(&WorkspaceInput::default())
+			.unwrap();
+		let (_, second) = SlotAssembler::new(vec![stable, volatile_b])
+			.render_banded(&WorkspaceInput::default())
+			.unwrap();
+		assert_eq!(first[..3], second[..3]);
+		assert_ne!(first[3], second[3]);
+	}
+
+	#[test]
+	fn volatile_slot_is_dropped_and_journaled() {
+		struct VolatileSlot(AtomicBool);
+		impl SlotSource for VolatileSlot {
+			fn render(
+				&self,
+				_workspace: &WorkspaceInput,
+				out: &mut dyn PromptOut,
+			) -> Result<(), PromptError> {
+				out.write_str(if self.0.fetch_xor(true, Ordering::Relaxed) {
+					"a"
+				} else {
+					"b"
+				});
+				Ok(())
+			}
+		}
+		#[derive(Default)]
+		struct Journal(parking_lot::Mutex<Vec<VolatilePrompt>>);
+		impl VolatilePromptJournal for Journal {
+			fn volatile_prompt(&self, record: VolatilePrompt) {
+				self.0.lock().push(record);
+			}
+		}
+		let journal = Arc::new(Journal::default());
+		let source = SlotRegistration {
+			decl:   SlotDecl {
+				slot:     SlotId::Recall,
+				class:    SlotClass::Volatile,
+				owner:    "recall".into(),
+				priority: 0,
+			},
+			source: Arc::new(VolatileSlot(AtomicBool::new(false))),
+		};
+		let (rendered, _) = SlotAssembler::new(vec![source])
+			.with_journal(journal.clone())
+			.render_banded(&WorkspaceInput::default())
+			.unwrap();
+		assert!(rendered.items.is_empty());
+		assert_eq!(journal.0.lock().len(), 1);
 	}
 }

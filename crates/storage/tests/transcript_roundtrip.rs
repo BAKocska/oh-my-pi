@@ -173,6 +173,7 @@ fn every_kind() -> Vec<Event> {
 				first_kept:    2,
 				tokens_before: 99,
 				warning:       Some(text("warning")),
+				superseded:    Vec::new(),
 			},
 		},
 		Event { ts: 8, kind: Kind::Branch { from: 1, summary: text("branch") } },
@@ -374,6 +375,24 @@ fn unknown_record_is_typed_and_addressable() {
 	assert_eq!(entry.rev.as_ref().map(Str::as_str), Some("future.9"));
 	assert!(entry.value.is_none());
 	assert_eq!(entry.raw.get().as_bytes(), source);
+}
+
+#[test]
+fn unknown_amendment_is_inert_and_round_trips_verbatim() {
+	let source = br#"{"ts":77,"k":"amend","target":4,"patch":{"op":"future_amend","data":{"x":1}}}"#;
+	let event = read_line(source).expect("future amendment is readable");
+	let Kind::Amend { patch: AmendPatch::Unknown(raw), .. } = &event.kind else {
+		panic!("future amendment remains an inert raw operation");
+	};
+	assert_eq!(raw.get(), r#"{"op":"future_amend","data":{"x":1}}"#);
+	let mut encoded = Vec::new();
+	write_line(&event, &mut encoded).expect("future amendment is writable");
+	let decoded = read_line(&encoded).expect("rewritten amendment is readable");
+	assert_eq!(decoded, event);
+	let Kind::Amend { patch: AmendPatch::Unknown(raw), .. } = decoded.kind else {
+		panic!("future amendment remains inert after round trip");
+	};
+	assert_eq!(raw.get(), r#"{"op":"future_amend","data":{"x":1}}"#);
 }
 
 #[test]
@@ -677,6 +696,7 @@ fn forward_fold_applies_rewind_reset_and_compact() {
 				first_kept:    5,
 				tokens_before: 50,
 				warning:       None,
+				superseded:    Vec::new(),
 			},
 		})
 		.expect("compact");
@@ -708,6 +728,7 @@ fn reusable_live_set_matches_live_vectors_for_navigation_and_rewrite() {
 				first_kept:    3,
 				tokens_before: 20,
 				warning:       None,
+				superseded:    Vec::new(),
 			},
 		})
 		.expect("compact");

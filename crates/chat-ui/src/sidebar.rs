@@ -10,12 +10,22 @@ use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent, dom,
 };
 
-use crate::StatusFacts;
+use crate::{StatusFacts, scene::RailWidths};
 
 /// Rail width in cells, vertical rule included.
 const WIDTH: u16 = 30;
 /// Smallest viewport at which the rail is composited.
 const MIN_VIEWPORT: Size = Size::new(96, 20);
+
+/// Sums all visible right rail widths instead of privileging one sidebar.
+#[must_use]
+pub fn reserved_rails(viewport: Size, widths: impl IntoIterator<Item = u16>) -> RailWidths {
+	widths
+		.into_iter()
+		.fold(RailWidths::default(), |rails, width| {
+			rails.accumulate(false, width.min(viewport.width))
+		})
+}
 
 /// Retained session facts composited as a right-anchored viewport layer.
 pub struct Sidebar {

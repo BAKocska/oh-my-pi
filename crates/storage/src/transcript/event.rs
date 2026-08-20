@@ -190,6 +190,121 @@ pub struct JobSettled {
 }
 
 impl Eq for JobSettled {}
+/// Core-attributed outcome of one hook subscription or synthetic failure stub.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookOutcome {
+	/// Invocation under decision, when this was an invocation gate.
+	pub invocation_id:   Option<Str>,
+	/// Stable dense hook event id.
+	pub event_id:        u8,
+	/// Wire dispatch correlation id.
+	pub dispatch_id:     u64,
+	/// Subscription that reported this result; absent for a synthetic stub.
+	pub subscription_id: Option<u32>,
+	/// Wire phase discriminator.
+	pub phase:           u8,
+	/// Canonical decision arm.
+	pub decision:        Str,
+	/// Optional terminal reason.
+	pub reason:          Option<Str>,
+}
+
+/// Durable audit sextet for the effective result of an invocation policy
+/// decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PolicyDecision {
+	/// Environment invocation identity.
+	pub invocation_id:       Str,
+	/// Requested target fixed at ARGS_FINALIZED.
+	pub requested_target:    Str,
+	/// Canonical requested arguments.
+	pub requested_args:      Str,
+	/// Ordered canonical transform overwrite records.
+	pub transformations:     Vec<Str>,
+	/// Effective target after accepted transforms.
+	pub effective_target:    Str,
+	/// Canonical effective arguments.
+	pub effective_args:      Str,
+	/// Derived-fact revision used by the accepted result.
+	pub derived_ir_revision: u32,
+	/// Whether the invocation was admitted.
+	pub allowed:             bool,
+	/// Optional denial reason.
+	pub reason:              Option<Str>,
+}
+
+/// One approval reason filed in a Core-owned durable ticket.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalReason {
+	/// User-visible title.
+	pub title:         Str,
+	/// TML-safe explanatory text.
+	pub body:          Str,
+	/// Exact command, path, or device subject.
+	pub subject:       Str,
+	/// Approval kind vocabulary.
+	pub kind:          Str,
+	/// Offered grant scopes.
+	pub scopes:        Vec<Str>,
+	/// Optional timeout default.
+	pub default:       Option<bool>,
+	/// Requested approver route.
+	pub route:         Str,
+	/// Optional named approver.
+	pub approver:      Option<Str>,
+	/// Maximum wait in milliseconds.
+	pub timeout_ms:    u64,
+	/// Unreachable-route behavior.
+	pub unreachable:   Str,
+	/// Whether only a human may decide.
+	pub require_human: bool,
+	/// Optional scope-bearing pattern.
+	pub pattern:       Option<Str>,
+	/// Rule and derived-fact evidence.
+	pub evidence:      Vec<Str>,
+}
+/// Durable filing of a merged Core-owned approval ticket.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalTicketFiled {
+	/// Stable idempotency key for approvers.
+	pub ticket_id:     Str,
+	/// Invocation blocked by this ticket, if any.
+	pub invocation_id: Option<Str>,
+	/// Every unresolved reason in filing order.
+	pub reasons:       Vec<ApprovalReason>,
+	/// Journal-clock filing time.
+	pub created_at_ms: u64,
+}
+
+/// Durable idempotent resolution or withdrawal of an approval ticket.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalDecided {
+	/// Stable ticket id.
+	pub ticket_id:  Str,
+	/// `decided` or `withdrawn`.
+	pub state:      Str,
+	/// Whether the ticket was approved, absent for withdrawal.
+	pub approved:   Option<bool>,
+	/// Granted scope, absent for withdrawal.
+	pub scope:      Option<Str>,
+	/// Answer source vocabulary.
+	pub source:     Option<Str>,
+	/// Authenticated decider, when present.
+	pub decided_by: Option<Str>,
+	/// Optional rationale.
+	pub reason:     Option<Str>,
+	/// Whether a fail-open result was audited.
+	pub audited:    bool,
+}
+/// A deterministic losing custom-summary proposal retained without its summary
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SupersededCompaction {
+	/// Publisher extension identity ordered after the winning proposal.
+	pub extension_id: Str,
+	/// Stable rejection or supersession reason.
+	pub reason:       Str,
+}
 
 /// One canonically encoded extension-authored journal entry.
 #[derive(Debug, Clone)]
@@ -383,6 +498,16 @@ pub enum Kind {
 		/// Credential-pin update.
 		cred_pin: Patch<Pin>,
 	},
+	/// Record one Core-attributed hook result; never an extension `Custom`
+	/// entry.
+	HookOutcome(HookOutcome),
+	/// Record the requested/effective invocation facts and transform audit
+	/// trail.
+	PolicyDecision(PolicyDecision),
+	/// Persist one Core-owned merged approval ticket.
+	ApprovalTicketFiled(ApprovalTicketFiled),
+	/// Persist an idempotent ticket decision or guard-drop withdrawal.
+	ApprovalDecided(ApprovalDecided),
 	/// Move the implicit chain point to an earlier event or the root.
 	Rewind {
 		/// Target event index, or `None` for the root.
@@ -400,6 +525,8 @@ pub enum Kind {
 		tokens_before: u64,
 		/// Optional compaction warning.
 		warning:       Option<Str>,
+		/// Losing custom-summary proposals in deterministic publisher order.
+		superseded:    Vec<SupersededCompaction>,
 	},
 	/// Summarize a branch before returning to another chain point.
 	Branch {
@@ -535,6 +662,10 @@ impl PartialEq for Kind {
 					cred_pin: b_cred_pin,
 				},
 			) => (a_thinking, a_model, a_tier, a_cred_pin) == (b_thinking, b_model, b_tier, b_cred_pin),
+			(Self::HookOutcome(a), Self::HookOutcome(b)) => a == b,
+			(Self::PolicyDecision(a), Self::PolicyDecision(b)) => a == b,
+			(Self::ApprovalTicketFiled(a), Self::ApprovalTicketFiled(b)) => a == b,
+			(Self::ApprovalDecided(a), Self::ApprovalDecided(b)) => a == b,
 			(Self::Rewind { to: a }, Self::Rewind { to: b }) => a == b,
 			(
 				Self::Compact {
@@ -543,6 +674,7 @@ impl PartialEq for Kind {
 					first_kept: a_first_kept,
 					tokens_before: a_tokens_before,
 					warning: a_warning,
+					superseded: a_superseded,
 				},
 				Self::Compact {
 					summary: b_summary,
@@ -550,10 +682,11 @@ impl PartialEq for Kind {
 					first_kept: b_first_kept,
 					tokens_before: b_tokens_before,
 					warning: b_warning,
+					superseded: b_superseded,
 				},
 			) => {
-				(a_summary, a_short, a_first_kept, a_tokens_before, a_warning)
-					== (b_summary, b_short, b_first_kept, b_tokens_before, b_warning)
+				(a_summary, a_short, a_first_kept, a_tokens_before, a_warning, a_superseded)
+					== (b_summary, b_short, b_first_kept, b_tokens_before, b_warning, b_superseded)
 			},
 			(
 				Self::Branch { from: a_from, summary: a_summary },

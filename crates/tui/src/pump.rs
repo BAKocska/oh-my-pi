@@ -51,6 +51,8 @@ pub enum TerminalEvent {
 	/// answers via [`crate::respond_debug_query`] (hosts without a retained
 	/// tree ignore them and the server times the request out).
 	Debug(DebugQuery),
+	/// A serialized extension UI effect injected by the headless debug socket.
+	Effect(serde_json::Value),
 	/// The terminal input closed or failed; no more input will arrive.
 	/// [`crate::Terminal::next`] surfaces it as an error.
 	Closed,
@@ -87,6 +89,8 @@ pub enum DebugOp {
 	Tree,
 	/// [`crate::Ui::values`] of the base tree (retained hosts).
 	Values,
+	/// Lists extension mounts with their resolved rectangles.
+	Slots,
 }
 /// One command for the event actor.
 enum Ctl {

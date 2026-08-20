@@ -103,7 +103,7 @@ async fn run<'a>(
 						viewport = size;
 					}
 				},
-				TerminalEvent::Debug(_) => {},
+				TerminalEvent::Debug(_) | TerminalEvent::Effect(_) => {},
 				TerminalEvent::Closed => return Ok(()),
 			},
 			() = tokio::time::sleep(FRAME_INTERVAL) => {},

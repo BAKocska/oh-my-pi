@@ -129,6 +129,7 @@ camera-object	object.camera	cam	📷	
 campground	object.campground	camp	🏕	
 cancel	action.cancel	[x]	🚫	
 cancellable	action.cancellable	esc	⎋	󱊷
+cancelled	status.cancelled	[x]	⊘	
 candle	object.candle	candle	🕯	󰗢
 candy	object.candy	candy	🍬	󱥰
 capricorn	object.capricorn	Cap	♑	󰪀
@@ -184,6 +185,7 @@ comment	comm.comment	//	💬	
 comments	comm.comments	///	🗨	
 commit	git.commit	commit	●	
 compass	object.compass	N	🧭	
+completed	status.completed	[x]	✓	
 compress	action.compress	><	🗜	
 conf	lang.conf	conf	⚙	
 config	file.config	[cfg]	⚙	
@@ -297,6 +299,7 @@ eye	object.eye	eye	👁	
 eye-off	object.eyeOff	eye-off	🙈	
 eye-speech-thought	comm.eyeSpeechThought	think	👁️‍🗨️	󰟶
 factory	object.factory	fact	🏭	󰈏
+failed	status.failed	[!]	✗	
 fast	icon.fast	>>	⚡	
 fast-forward-button	action.fastForwardButton	>>	⏩	
 fast-reverse	nav.fastReverse	<<	⏪	
@@ -429,6 +432,7 @@ ice-cream	object.iceCream	icecrm	🍨	
 ice-cube	object.iceCube	ice	🧊	
 ice-skate	object.iceSkate	skate	⛸	󰴵
 identification-card	object.identificationCard	ID	🪪	
+idle	status.idle	[-]	○	
 image	object.image	img	🖼	
 image-file	file.image	[img]	🖼	
 image-language	lang.image	img	🖼	󰈟
@@ -638,6 +642,7 @@ panda	object.panda	panda	🐼	󰏚
 paper-roll	object.paperRoll	roll	🧻	󱅗
 paperclip	object.paperclip	clip	📎	
 parachute	object.parachute	chute	🪂	󰲴
+parked	status.parked	[|]	⏸	
 parrot	object.parrot	parrot	🦜	
 party-popper	object.partyPopper	party	🎉	󱁖
 passenger-ship	object.passengerShip	ship	🛳	
@@ -814,6 +819,7 @@ send	comm.send	send	📤	
 server	device.server	srv	🖥	
 service-dog	object.serviceDog	svcdog	🐕‍🦺	󰪭
 session	icon.session	id	🆔	󰁑
+settled	status.settled	[=]	✓	
 sewing-needle	object.sewingNeedle	needle	🪡	󰎑
 shadowed	status.shadowed	[/]	○	
 share	action.share	shr	📤	

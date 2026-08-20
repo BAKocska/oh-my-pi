@@ -5,8 +5,8 @@ use std::{io, io::Write, time::Duration};
 use flume::{Receiver, Sender};
 use omp_core::Str;
 use omp_tui::{
-	AltScreenUse, CursorStyle, InputEvent, Key, Layer, Mouse, PaintStats, Pasted, Renderer, Size,
-	Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext, detect,
+	AltScreenUse, CursorStyle, DebugOp, DebugQuery, InputEvent, Key, Layer, Mouse, PaintStats,
+	Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext, detect,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
@@ -22,6 +22,31 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
 const PASTE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Answers the chat-owned half of the terminal debug protocol.
+fn answer_debug(query: DebugQuery, chat: &mut Chat) {
+	if query.op != DebugOp::Slots {
+		return;
+	}
+	let slots: Vec<_> = chat
+		.slots_mut()
+		.debug_mounts()
+		.into_iter()
+		.map(|mount| {
+			serde_json::json!({
+				"key": mount.key,
+				"placement": mount.placement,
+				"rect": {
+					"x": mount.rect.x,
+					"y": mount.rect.y,
+					"width": mount.rect.width,
+					"height": mount.rect.height,
+				},
+			})
+		})
+		.collect();
+	omp_tui::respond_debug_query(query.id, serde_json::json!({ "ok": true, "slots": slots }));
+}
 
 struct PasteRead {
 	clipboard:  oneshot::Receiver<Option<Clipboard>>,
@@ -189,7 +214,10 @@ async fn run_welcome(
 		tokio::select! {
 			event = terminal.next() => match event? {
 				TerminalEvent::Resize => if let Some(size) = terminal.take_resize()? { *viewport = size; },
-				TerminalEvent::Debug(_) => {},
+				TerminalEvent::Debug(query) => answer_debug(query, chat),
+				TerminalEvent::Effect(effect) => {
+					let _ = chat.slots_mut().apply_serialized(effect);
+				},
 				TerminalEvent::Closed => return Ok(WelcomeOutcome::Exit(HostExit::Quit)),
 				TerminalEvent::Input(event) => {
 					let Some(event) = user_event(terminal, renderer, event)? else { continue };
@@ -441,7 +469,10 @@ async fn run_chat(
 					host.chat.set_right_inset(host.sidebar.reserved(viewport));
 					if host.overlay.is_some() && resized { overlay_stale = true; }
 				},
-				TerminalEvent::Debug(_) => {},
+				TerminalEvent::Debug(query) => answer_debug(query, &mut host.chat),
+				TerminalEvent::Effect(effect) => {
+					let _ = host.chat.slots_mut().apply_serialized(effect);
+				},
 				TerminalEvent::Closed => return Ok(HostExit::Quit),
 				TerminalEvent::Input(event) => {
 					let Some(event) = user_event(terminal, renderer, event)? else { continue };

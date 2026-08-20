@@ -2842,7 +2842,9 @@ async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
 		loop {
 			if socket.exists()
 				&& std::os::unix::fs::PermissionsExt::mode(
-					&std::fs::metadata(&socket).expect("socket metadata").permissions(),
+					&std::fs::metadata(&socket)
+						.expect("socket metadata")
+						.permissions(),
 				) & 0o077 == 0
 			{
 				break;

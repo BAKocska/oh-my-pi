@@ -38,7 +38,7 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use url::Url;
 
-use crate::guard::RunGuard;
+use crate::{admit::Admitter, guard::RunGuard};
 
 /// A client-side environment protocol failure.
 #[derive(Debug, Error)]
@@ -147,16 +147,53 @@ pub struct EnvClient {
 	inner: Arc<ClientInner>,
 }
 
-#[derive(Debug)]
 struct ClientInner {
-	outgoing:     Sender<ClientFrame>,
-	pending:      Mutex<HashMap<u64, Sender<ServerFrame>>>,
-	hello_waiter: Mutex<Option<Sender<ServerFrame>>>,
-	info:         Mutex<Option<ServerHello>>,
-	events:       Receiver<ServerFrame>,
-	next_id:      AtomicU64,
-	cancel:       Sender<u64>,
-	lease_close:  Sender<LeaseClose>,
+	outgoing:          Sender<ClientFrame>,
+	pending:           Mutex<HashMap<u64, Sender<ServerFrame>>>,
+	hello_waiter:      Mutex<Option<Sender<ServerFrame>>>,
+	info:              Mutex<Option<ServerHello>>,
+	events:            Receiver<ServerFrame>,
+	next_id:           AtomicU64,
+	cancel:            Sender<u64>,
+	lease_close:       Sender<LeaseClose>,
+	admitter:          Mutex<Option<Arc<dyn AdmissionDispatcher>>>,
+}
+
+trait AdmissionDispatcher: Send + Sync {
+	fn dispatch(&self, client: Arc<ClientInner>, request_id: u64, query: AdmitInvocation);
+}
+
+struct AdmitterDispatcher<A> {
+	admitter: Arc<A>,
+	runtime:  tokio::runtime::Handle,
+}
+impl<A: Admitter> AdmissionDispatcher for AdmitterDispatcher<A> {
+	fn dispatch(&self, client: Arc<ClientInner>, request_id: u64, query: AdmitInvocation) {
+		let admitter = Arc::clone(&self.admitter);
+		let invocation_id = query.invocation_id.clone();
+		let task_client = Arc::clone(&client);
+		drop(self.runtime.spawn(async move {
+			let mut admission = admitter.admit(query).await;
+			admission.invocation_id = invocation_id;
+			let _ = task_client
+				.outgoing
+				.send_async(ClientFrame {
+					request_id,
+					body: Some(client_frame::Body::Admission(admission)),
+					..ClientFrame::default()
+				})
+				.await;
+		}));
+	}
+}
+
+impl std::fmt::Debug for ClientInner {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("ClientInner")
+			.field("next_id", &self.next_id.load(Ordering::Relaxed))
+			.finish_non_exhaustive()
+	}
 }
 
 #[derive(Debug)]
@@ -388,9 +425,8 @@ impl EnvClient {
 	/// Builds a client over decoded bidirectional frame channels.
 	///
 	/// `outgoing` carries client frames to the transport and `incoming` carries
-	/// decoded server frames back. A small dispatcher thread performs request
-	/// correlation; no async runtime or world-resource implementation is owned
-	/// by this crate.
+	/// decoded server frames back. A dispatcher thread performs correlation;
+	/// this client owns no async runtime or world resource.
 	#[must_use]
 	pub fn from_channels(outgoing: Sender<ClientFrame>, incoming: Receiver<ServerFrame>) -> Self {
 		let (events_tx, events) = flume::unbounded();
@@ -405,8 +441,8 @@ impl EnvClient {
 			next_id: AtomicU64::new(1),
 			cancel,
 			lease_close,
+			admitter: Mutex::new(None),
 		});
-
 		let router = Arc::downgrade(&inner);
 		let _ = std::thread::spawn(move || route_responses(router, incoming, events_tx));
 		let _ = std::thread::spawn(move || route_cancellations(cancellations, outgoing));
@@ -472,6 +508,17 @@ impl EnvClient {
 	#[must_use]
 	pub fn info(&self) -> Option<ServerHello> {
 		self.inner.info.lock().clone()
+	}
+
+	/// Installs the handler for server-initiated admission queries.
+	///
+	/// The handler must be installed from the async runtime that owns this
+	/// client; the frame router schedules answers on that ambient runtime.
+	pub fn set_admitter<A: Admitter>(&self, admitter: A) {
+		*self.inner.admitter.lock() = Some(Arc::new(AdmitterDispatcher {
+			admitter: Arc::new(admitter),
+			runtime:  tokio::runtime::Handle::current(),
+		}));
 	}
 
 	/// Restricts this connection to one invocation-bound worker authority.
@@ -1930,6 +1977,12 @@ fn route_responses(
 			} else {
 				let _ = events.send(frame);
 			}
+			continue;
+		}
+		if let Some(server_frame::Body::AdmitInvocation(query)) = frame.body.as_ref()
+			&& let Some(admitter) = client.admitter.lock().clone()
+		{
+			admitter.dispatch(Arc::clone(&client), frame.request_id, query.clone());
 			continue;
 		}
 		let target = client.pending.lock().get(&frame.request_id).cloned();

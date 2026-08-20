@@ -221,14 +221,18 @@ pub enum TitleSource {
 }
 
 /// An append-only correction to an earlier transcript event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum AmendPatch {
 	/// Prune an earlier assistant message to a prefix of its blocks.
 	Prune {
 		/// Number of leading blocks that remain live.
 		keep_blocks: u64,
 	},
+	/// Clear the rendered content parts of an earlier tool result.
+	///
+	/// Structured details, error state, uselessness, and revision properties
+	/// remain intact so the result stays attributable and replayable.
+	DropParts,
 	/// Restore the original assistant turn after a failed retry attempt.
 	RetryRecovery {
 		/// Original assistant blocks replaced by the retry.
@@ -245,6 +249,83 @@ pub enum AmendPatch {
 		/// Gateway-assigned dense thread sequence.
 		seq: u64,
 	},
+	/// Preserve an unrecognized amendment operation verbatim.
+	///
+	/// Unknown operations are intentionally inert so newer writers do not make
+	/// older readers reject an otherwise usable transcript.
+	Unknown(Box<RawValue>),
+}
+
+impl PartialEq for AmendPatch {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Self::Prune { keep_blocks: a }, Self::Prune { keep_blocks: b }) => a == b,
+			(Self::DropParts, Self::DropParts) => true,
+			(
+				Self::RetryRecovery {
+					content: a_content,
+					stop: a_stop,
+					usage: a_usage,
+					response_id: a_response_id,
+				},
+				Self::RetryRecovery {
+					content: b_content,
+					stop: b_stop,
+					usage: b_usage,
+					response_id: b_response_id,
+				},
+			) => {
+				a_content == b_content
+					&& a_stop == b_stop
+					&& a_usage == b_usage
+					&& a_response_id == b_response_id
+			},
+			(Self::Seq { seq: a }, Self::Seq { seq: b }) => a == b,
+			(Self::Unknown(a), Self::Unknown(b)) => raw_eq(a, b),
+			_ => false,
+		}
+	}
+}
+
+impl Eq for AmendPatch {}
+
+impl Serialize for AmendPatch {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		use serde::ser::SerializeMap as _;
+
+		if let Self::Unknown(raw) = self {
+			return raw.serialize(serializer);
+		}
+		let mut object = match self {
+			Self::Prune { .. } | Self::Seq { .. } => serializer.serialize_map(Some(2))?,
+			Self::DropParts => serializer.serialize_map(Some(1))?,
+			Self::RetryRecovery { .. } => serializer.serialize_map(Some(5))?,
+			Self::Unknown(_) => unreachable!("unknown amendments return above"),
+		};
+		match self {
+			Self::Prune { keep_blocks } => {
+				object.serialize_entry("op", "prune")?;
+				object.serialize_entry("keep_blocks", keep_blocks)?;
+			},
+			Self::DropParts => object.serialize_entry("op", "drop_parts")?,
+			Self::RetryRecovery { content, stop, usage, response_id } => {
+				object.serialize_entry("op", "retry_recovery")?;
+				object.serialize_entry("content", content)?;
+				object.serialize_entry("stop", stop)?;
+				object.serialize_entry("usage", usage)?;
+				object.serialize_entry("response_id", response_id)?;
+			},
+			Self::Seq { seq } => {
+				object.serialize_entry("op", "seq")?;
+				object.serialize_entry("seq", seq)?;
+			},
+			Self::Unknown(_) => unreachable!("unknown amendments return above"),
+		}
+		object.end()
+	}
 }
 
 #[derive(Deserialize)]
@@ -283,6 +364,7 @@ impl<'de> Deserialize<'de> for AmendPatch {
 					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
 				Ok(Self::Prune { keep_blocks: payload.keep_blocks })
 			},
+			"drop_parts" => Ok(Self::DropParts),
 			"retry_recovery" => {
 				let payload: RetryRecoveryPayload =
 					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
@@ -297,7 +379,7 @@ impl<'de> Deserialize<'de> for AmendPatch {
 				let payload: SeqPayload = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
 				Ok(Self::Seq { seq: payload.seq })
 			},
-			op => Err(D::Error::custom(format_args!("unknown amendment operation `{op}`"))),
+			_ => Ok(Self::Unknown(raw)),
 		}
 	}
 }

@@ -24,8 +24,8 @@ use omp_proto::{
 };
 use omp_storage::{index::SessionIndex, state::StateStore};
 use omp_tool::{
-	Abort, ArgIssue, ArgPath, CallOutcome, ErasedEv, ErasedOutcome, IncomingParams, Interrupt,
-	Registry, RegistryError, ToolRoute, ToolTerminal,
+	Abort, ArgIssue, ArgPath, CallOutcome, Effects, ErasedEv, ErasedOutcome, IncomingParams,
+	Interrupt, Registry, RegistryError, ToolRoute, ToolTerminal,
 };
 use omp_tools::device::{DeviceInvokeRequest, DeviceInvoker};
 use omp_walker::{
@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
+	admission::{AdmissionDecision, AdmissionGate, effects_narrow_or_refuse},
 	blobs::{BlobError, BlobHost},
 	docs::{
 		DocumentError, DocumentEvents, DocumentHost, DocumentLease, LspEvents, LspRegistryEvent,
@@ -165,9 +166,9 @@ pub struct ServerIdentity {
 /// Per-connection transport and exact DATA grant bounds.
 #[derive(Clone)]
 pub(crate) struct ConnectionPolicy {
-	retire: Option<CancellationToken>,
-	grants: Grants,
-	host:   Option<HostKey>,
+	retire:  Option<CancellationToken>,
+	grants:  Grants,
+	host:    Option<HostKey>,
 	ambient: bool,
 }
 
@@ -188,7 +189,12 @@ impl ConnectionPolicy {
 		I: IntoIterator<Item = S>,
 		S: AsRef<str>,
 	{
-		Self { retire: None, grants: Grants::supported(grants), host: Some(host), ambient: false }
+		Self {
+			retire:  None,
+			grants:  Grants::supported(grants),
+			host:    Some(host),
+			ambient: false,
+		}
 	}
 }
 
@@ -981,6 +987,7 @@ impl EnvServer {
 		let mut connection =
 			ConnectionState::new(self.exec.clone(), grants, Arc::clone(&self.authority), &policy);
 		loop {
+			let admission_deadline = connection.next_admission_deadline();
 			let next = tokio::select! {
 				result = requests.recv_async() => match result {
 					Ok(frame) => Some(LoopEvent::Frame(Box::new(frame))),
@@ -990,10 +997,23 @@ impl EnvServer {
 					Ok(done) => Some(LoopEvent::Finished(done)),
 					Err(_) => None,
 				},
+				() = async {
+					if let Some(deadline) = admission_deadline {
+						tokio::time::sleep_until(deadline).await;
+					} else {
+						std::future::pending::<()>().await;
+					}
+				} => Some(LoopEvent::AdmissionDeadline),
 			};
 			let Some(next) = next else { break };
 			match next {
 				LoopEvent::Finished(done) => connection.finish(done),
+				LoopEvent::AdmissionDeadline => {
+					for (request_id, invocation_id, denied) in connection.take_expired_admissions() {
+						connection.abandon_admission(request_id, &invocation_id);
+						send_policy_denied_verdict(&responses, request_id, &invocation_id, denied).await;
+					}
+				},
 				LoopEvent::Frame(frame) => {
 					while let Ok(done) = finished.try_recv() {
 						connection.finish(done);
@@ -1152,6 +1172,7 @@ impl EnvServer {
 		let continuation = matches!(
 			&body,
 			client_frame::Body::ArgText(_)
+				| client_frame::Body::Admission(_)
 				| client_frame::Body::ArgsCommitted(_)
 				| client_frame::Body::Interrupt(_)
 				| client_frame::Body::Stdin(_)
@@ -1206,10 +1227,15 @@ impl EnvServer {
 			},
 			client_frame::Body::ArgText(request) => {
 				let result = connection.invocation_mut(frame.request_id, &request.invocation_id);
-				match result {
-					Ok(InvocationState::Native { feed, lifecycle, .. })
+				let query = match result {
+					Ok(InvocationState::Native { feed, lifecycle, admission, .. })
 						if !lifecycle.is_committed() && !lifecycle.is_terminal() =>
 					{
+						let query = admission.push_fragment(
+							&request.fragment,
+							self.workspace.root(),
+							self.workspace.root(),
+						);
 						if feed.arg_text(Str::from(request.fragment)).is_err() {
 							send_error(
 								responses,
@@ -1218,11 +1244,22 @@ impl EnvServer {
 								"invocation input is closed",
 							)
 							.await;
+							None
+						} else {
+							query
 						}
 					},
-					Ok(InvocationState::Worker { invocation: Some(invocation), committed, .. })
-						if !*committed =>
-					{
+					Ok(InvocationState::Worker {
+						invocation: Some(invocation),
+						committed,
+						admission,
+						..
+					}) if !*committed => {
+						let query = admission.push_fragment(
+							&request.fragment,
+							self.workspace.root(),
+							self.workspace.root(),
+						);
 						if let Err(error) = invocation.arg_text(request) {
 							send_error(
 								responses,
@@ -1231,6 +1268,9 @@ impl EnvServer {
 								&error.to_string(),
 							)
 							.await;
+							None
+						} else {
+							query
 						}
 					},
 					Ok(_) => {
@@ -1241,6 +1281,32 @@ impl EnvServer {
 							"ArgText cannot follow ArgsCommitted",
 						)
 						.await;
+						None
+					},
+					Err((code, message)) => {
+						send_error(responses, frame.request_id, code, message).await;
+						None
+					},
+				};
+				if let Some(query) = query {
+					send_body(responses, frame.request_id, server_frame::Body::AdmitInvocation(query))
+						.await;
+				}
+			},
+			client_frame::Body::Admission(admission) => {
+				let result = connection.invocation_mut(frame.request_id, &admission.invocation_id);
+				match result {
+					Ok(InvocationState::Native { admission: gate, .. })
+					| Ok(InvocationState::Worker { admission: gate, .. }) => {
+						if let Err(error) = gate.answer(admission) {
+							send_error(
+								responses,
+								frame.request_id,
+								pb::ProtocolErrorCode::PreconditionFailed,
+								&error.to_string(),
+							)
+							.await;
+						}
 					},
 					Err((code, message)) => send_error(responses, frame.request_id, code, message).await,
 				}
@@ -1560,15 +1626,6 @@ impl EnvServer {
 				Err(error) => send_blob_error(responses, frame.request_id, &error).await,
 			},
 			client_frame::Body::Cancel(_) => unreachable!("cancel handled before ordinary dispatch"),
-			_ => {
-				send_error(
-					responses,
-					frame.request_id,
-					pb::ProtocolErrorCode::Unsupported,
-					"client frame operation is not supported by this environment",
-				)
-				.await;
-			},
 		}
 	}
 
@@ -2427,23 +2484,30 @@ impl EnvServer {
 		let route = registry
 			.route(&request.name)
 			.expect("a live registry identity always has an execution route");
+		let deadline = if request.deadline_ms == 0 {
+			DEFAULT_TOOL_DEADLINE
+		} else {
+			Duration::from_millis(request.deadline_ms)
+		};
+		let maximum_effects = registry
+			.effects(&request.name)
+			.expect("a routed tool has a declared effect envelope")
+			.clone();
 		let cancel = CancellationToken::new();
 		if route == ToolRoute::Native {
 			let (feed, params) = IncomingParams::owned_channel(connection.owner.clone());
 			let lifecycle = Arc::new(NativeLifecycle::default());
 			let name = Str::from(request.name);
-			let deadline = if request.deadline_ms == 0 {
-				DEFAULT_TOOL_DEADLINE
-			} else {
-				Duration::from_millis(request.deadline_ms)
-			};
+			let admission = AdmissionGate::new(invocation_id.clone(), name.clone(), deadline);
 			connection.requests.insert(
 				request_id,
 				RequestState::Invocation(InvocationState::Native {
-					id:        invocation_id.clone(),
-					feed:      feed.clone(),
+					id: invocation_id.clone(),
+					feed: feed.clone(),
 					lifecycle: Arc::clone(&lifecycle),
-					cancel:    cancel.clone(),
+					admission,
+					maximum_effects: maximum_effects.clone(),
+					cancel: cancel.clone(),
 				}),
 			);
 			connection
@@ -2483,15 +2547,12 @@ impl EnvServer {
 				.await;
 				return;
 			};
+			let name = Str::from(request.name);
 			let invocation = match self.ext_hosts.open(OpenToolCall {
 				invocation_id: invocation_id.clone(),
-				name:          Str::from(request.name),
-				rev:           Str::from(request.rev),
-				deadline:      if request.deadline_ms == 0 {
-					DEFAULT_TOOL_DEADLINE
-				} else {
-					Duration::from_millis(request.deadline_ms)
-				},
+				name: name.clone(),
+				rev: Str::from(request.rev),
+				deadline,
 			}) {
 				Ok(invocation) => invocation,
 				Err(error) => {
@@ -2513,6 +2574,8 @@ impl EnvServer {
 					owner,
 					invocation: Some(invocation),
 					committed: false,
+					admission: AdmissionGate::new(invocation_id.clone(), name, deadline),
+					maximum_effects,
 					interrupt,
 					interrupts: Some(interrupts),
 					cancel,
@@ -2544,11 +2607,52 @@ impl EnvServer {
 	async fn commit_invocation(
 		&self,
 		request_id: u64,
-		request: pb::ArgsCommitted,
+		mut request: pb::ArgsCommitted,
 		responses: &flume::Sender<pb::ServerFrame>,
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
 	) {
+		let (admission, maximum_effects) =
+			match connection.invocation_mut(request_id, &request.invocation_id) {
+				Ok(InvocationState::Native { admission, maximum_effects, .. })
+				| Ok(InvocationState::Worker { admission, maximum_effects, .. }) => (
+					admission
+						.decide(self.workspace.root(), self.workspace.root())
+						.await,
+					maximum_effects.clone(),
+				),
+				Err((code, message)) => {
+					send_error(responses, request_id, code, message).await;
+					return;
+				},
+			};
+		request.raw = match admission {
+			AdmissionDecision::Allowed { raw, bash } => {
+				let _effective_bash = bash;
+				raw
+			},
+			AdmissionDecision::Denied(policy) => {
+				let invocation_id = Str::from(request.invocation_id.as_str());
+				connection.abandon_admission(request_id, &invocation_id);
+				send_policy_denied_verdict(responses, request_id, &invocation_id, policy).await;
+				return;
+			},
+		};
+		let narrowed_effects =
+			match effects_narrow_or_refuse(request.effects.as_ref(), &maximum_effects) {
+				Some(effects) => effects,
+				None => {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::PermissionDenied,
+						"ArgsCommitted effect envelope widens the declared tool authority",
+					)
+					.await;
+					return;
+				},
+			};
+		request.effects = Some((&narrowed_effects).into());
 		let result = connection.invocation_mut(request_id, &request.invocation_id);
 		match result {
 			Ok(InvocationState::Native { feed, lifecycle, .. }) => {
@@ -2789,19 +2893,23 @@ enum RequestState {
 
 enum InvocationState {
 	Native {
-		id:        Str,
-		feed:      omp_tool::InvocationFeed,
-		lifecycle: Arc<NativeLifecycle>,
-		cancel:    CancellationToken,
+		id:              Str,
+		feed:            omp_tool::InvocationFeed,
+		lifecycle:       Arc<NativeLifecycle>,
+		admission:       AdmissionGate,
+		maximum_effects: Effects,
+		cancel:          CancellationToken,
 	},
 	Worker {
-		id:         Str,
-		owner:      HostKey,
-		invocation: Option<super::worker::WorkerInvocation>,
-		committed:  bool,
-		interrupt:  flume::Sender<pb::Interrupt>,
-		interrupts: Option<flume::Receiver<pb::Interrupt>>,
-		cancel:     CancellationToken,
+		id:              Str,
+		owner:           HostKey,
+		invocation:      Option<super::worker::WorkerInvocation>,
+		committed:       bool,
+		admission:       AdmissionGate,
+		maximum_effects: Effects,
+		interrupt:       flume::Sender<pb::Interrupt>,
+		interrupts:      Option<flume::Receiver<pb::Interrupt>>,
+		cancel:          CancellationToken,
 	},
 }
 
@@ -2878,6 +2986,8 @@ enum LoopEvent {
 	/// compact.
 	Frame(Box<pb::ClientFrame>),
 	Finished(Finished),
+	/// The env-owned deadline of at least one pending admission elapsed.
+	AdmissionDeadline,
 }
 
 impl ConnectionState {
@@ -2914,6 +3024,31 @@ impl ConnectionState {
 		}
 	}
 
+	fn next_admission_deadline(&self) -> Option<tokio::time::Instant> {
+		self
+			.requests
+			.values()
+			.filter_map(|state| match state {
+				RequestState::Invocation(invocation) => invocation.pending_admission_deadline(),
+				_ => None,
+			})
+			.min()
+	}
+
+	fn take_expired_admissions(&mut self) -> Vec<(u64, Str, omp_proto::policy::v1::PolicyDenied)> {
+		let now = tokio::time::Instant::now();
+		self
+			.requests
+			.iter_mut()
+			.filter_map(|(request_id, state)| match state {
+				RequestState::Invocation(invocation) => invocation
+					.expire_admission(now)
+					.map(|denied| (*request_id, Str::from(invocation.id()), denied)),
+				_ => None,
+			})
+			.collect()
+	}
+
 	fn grants(&self, capability: &str) -> bool {
 		self.grants.contains(capability)
 	}
@@ -2935,6 +3070,23 @@ impl ConnectionState {
 			)),
 			None => Err((pb::ProtocolErrorCode::NotFound, "invocation is not open")),
 		}
+	}
+
+	/// Removes a denied pre-authorization invocation before its executor sees
+	/// finalized arguments.
+	fn abandon_admission(&mut self, request_id: u64, invocation_id: &Str) {
+		match self.requests.remove(&request_id) {
+			Some(RequestState::Invocation(InvocationState::Native { lifecycle, cancel, .. })) => {
+				lifecycle.claim_precommit_terminal();
+				cancel.cancel();
+			},
+			Some(RequestState::Invocation(InvocationState::Worker { owner, id, cancel, .. })) => {
+				cancel.cancel();
+				self.authority.settle(&owner, &id);
+			},
+			_ => {},
+		}
+		self.invocation_ids.remove(invocation_id);
 	}
 
 	async fn exec_id(
@@ -3218,6 +3370,23 @@ impl InvocationState {
 	fn id(&self) -> &str {
 		match self {
 			Self::Native { id, .. } | Self::Worker { id, .. } => id,
+		}
+	}
+
+	fn pending_admission_deadline(&self) -> Option<tokio::time::Instant> {
+		match self {
+			Self::Native { admission, .. } | Self::Worker { admission, .. } => {
+				admission.pending_deadline()
+			},
+		}
+	}
+
+	fn expire_admission(
+		&mut self,
+		now: tokio::time::Instant,
+	) -> Option<omp_proto::policy::v1::PolicyDenied> {
+		match self {
+			Self::Native { admission, .. } | Self::Worker { admission, .. } => admission.expire(now),
 		}
 	}
 }
@@ -3639,6 +3808,55 @@ async fn send_abort_verdict(
 			request_id,
 			invocation_id,
 			"failed to serialize invocation abort verdict",
+		)
+		.await;
+		return;
+	};
+	send_invocation_terminal_body(
+		responses,
+		request_id,
+		server_frame::Body::Verdict(pb::Verdict {
+			invocation_id: invocation_id.to_string(),
+			json:          Bytes::from(json),
+			details_blob:  None,
+			parts:         Vec::new(),
+			is_error:      true,
+			useless:       false,
+			props:         Default::default(),
+		}),
+	)
+	.await;
+}
+
+async fn send_policy_denied_verdict(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	invocation_id: &Str,
+	denied: omp_proto::policy::v1::PolicyDenied,
+) {
+	let reason = Str::from(denied.reason);
+	let policy = omp_tool::PolicyDenied {
+		reason:      reason.clone(),
+		code:        (!denied.code.is_empty()).then(|| Str::from(denied.code)),
+		decision_id: Str::from(denied.decision_id),
+		rules:       Arc::from(
+			denied
+				.rules
+				.into_iter()
+				.map(|rule| Str::from(rule.as_str()))
+				.collect::<Vec<_>>(),
+		),
+	};
+	let verdict = CallOutcome::<serde_json::Value, serde_json::Value>::policy_denied(
+		omp_tool::Abort::Skipped { reason },
+		policy,
+	);
+	let Ok(json) = serde_json::to_vec(&verdict) else {
+		let _ = send_invocation_stream_error(
+			responses,
+			request_id,
+			invocation_id,
+			"failed to serialize policy denial verdict",
 		)
 		.await;
 		return;
@@ -4492,7 +4710,6 @@ const fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str
 		_ => None,
 	}
 }
-
 
 async fn authorize_data_operation(
 	connection: &ConnectionState,
@@ -5435,10 +5652,7 @@ mod tests {
 			}))
 		));
 		requests
-			.send_async(data_frame(
-				3,
-				pb::data_request::Body::Site(pb::MaterializeSite::default()),
-			))
+			.send_async(data_frame(3, pb::data_request::Body::Site(pb::MaterializeSite::default())))
 			.await
 			.expect("send unsupported stat");
 		let unsupported = responses.recv_async().await.expect("unsupported response");

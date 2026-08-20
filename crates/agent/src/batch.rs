@@ -637,12 +637,9 @@ impl SpeculativeCall {
 			.hooks
 			.set(hooks)
 			.map_err(|_| BatchError::Projection(Str::new_static("invocation hook bus already set")))?;
-		pump
-			.maximum_effects
-			.set(maximum_effects)
-			.map_err(|_| {
-				BatchError::Projection(Str::new_static("invocation effect maximum already set"))
-			})?;
+		pump.maximum_effects.set(maximum_effects).map_err(|_| {
+			BatchError::Projection(Str::new_static("invocation effect maximum already set"))
+		})?;
 		pump
 			.facts
 			.set(facts)
@@ -665,7 +662,13 @@ impl SpeculativeCall {
 
 	/// Returns the admission receipt fixed by the environment, when available.
 	pub(crate) fn admission(&self) -> Option<&Admission> {
-		self.inner.as_ref().expect("live speculative call").pump.admission.get()
+		self
+			.inner
+			.as_ref()
+			.expect("live speculative call")
+			.pump
+			.admission
+			.get()
 	}
 
 	/// Records the durable assistant-item commitment for this invocation.

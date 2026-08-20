@@ -209,6 +209,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argmax"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5135,6 +5144,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "smallvec 2.0.0-alpha.12",
  "strum",
  "thiserror 2.0.20",
  "tokio",
@@ -5304,12 +5314,16 @@ dependencies = [
 name = "omp-chat-ui"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "flume",
  "omp-core",
+ "omp-proto",
  "omp-tui",
+ "serde_json",
  "smallvec 2.0.0-alpha.12",
  "tokio",
  "xutf",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5735,6 +5749,7 @@ dependencies = [
  "nix 0.31.3",
  "normalize-path",
  "omp-core",
+ "omp-proto",
  "peg",
  "pretty_assertions",
  "rand 0.10.2",

@@ -132,6 +132,21 @@ impl Ui {
 		Ok(Self::from_cached(source, root, width, ctx))
 	}
 
+	/// Parses extension-authored runtime markup, degrading core-reserved
+	/// chrome tags into inert custom elements.
+	///
+	/// # Errors
+	/// Returns [`ParseError`] for malformed markup.
+	pub fn from_extension_markup(
+		source: impl Into<Str>,
+		width: u16,
+		ctx: UiContext,
+	) -> Result<Self, ParseError> {
+		let source = source.into();
+		let root = markup::parse_with_origin(&source, &ctx, markup::MarkupOrigin::Extension)?;
+		Ok(Self::from_cached(source, root, width, ctx))
+	}
+
 	/// Builds a retained UI directly from a component tree.
 	pub fn from_root(root: impl IntoComponent, width: u16, ctx: UiContext) -> Self {
 		Self::from_cached(Str::new(""), Cached::new(root.into_component()), width, ctx)

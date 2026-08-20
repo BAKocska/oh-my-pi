@@ -85,7 +85,7 @@ pub use input::{
 	Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,
 };
-pub use markup::{Border, Dim, ParseError};
+pub use markup::{Border, Dim, MarkupOrigin, ParseError, parse_with_origin};
 pub use notify::{
 	Notification, NotificationAction, NotificationBuilder, NotificationSound, Urgency, notify,
 };
@@ -100,7 +100,7 @@ pub use rich::{
 	Clip, Measure, Pipeline, Prefix, Prefixed, Restyle, RichSink, RichText, Rows, Tee, Wrap,
 	decompose,
 };
-pub use runtime::{App, AppEnv, AppEvent, AppOptions, ImageLoader, UiHandle};
+pub use runtime::{App, AppEnv, AppEvent, AppOptions, ImageLoader, UiHandle, is_core_chord};
 pub use terminal::{AltScreenUse, CursorStyle, Progress, Terminal, TerminalOptions};
 pub use tty::TtyOut;
 pub use ui::Ui;
