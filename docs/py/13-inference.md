@@ -834,8 +834,12 @@ Member vocabularies, each mirroring a Rust bitset:
   effort selection, budget selection, and signature preservation; `efforts` is a set of
   `ReasoningEffort`; `modes` is a set of `ReasoningMode` (`PRO`).
 - `Modality`: `TEXT`, `IMAGE`, `AUDIO`, `VIDEO`, `DOCUMENT`.
-- `HostedTool`: `WEB_SEARCH`, `CODE_EXECUTION`, `RETRIEVAL`. Declaring these is how a provider's
-  server-side tools become available *without* occupying a registered schema slot.
+- `HostedTool`: `WEB_SEARCH`, `CODE_EXECUTION`, `RETRIEVAL`, `URL_CONTEXT`, `DEEP_RESEARCH`.
+  Declaring these is how a provider's server-side tools become available *without* occupying a
+  registered schema slot.
+
+**Resolved (2026-08-20 ruling): `URL_CONTEXT` and `DEEP_RESEARCH` are hosted-tool capabilities, not
+function-call `ToolFeature` members.**
 - `PromptCacheCaps(retention: frozenset[CacheRetention], min_prefix_tokens, max_breakpoints)` where
   `CacheRetention` is `REQUEST`, `SESSION`, `SHORT`, `LONG`.
 - `ServiceTier(name: str, priority: int)` — `priority` is a relative scheduling preference, larger
@@ -913,7 +917,85 @@ class TranscriptionResult:
     text: str
     language: str | None
     cost_nanos_usd: int
+
+class RealtimeModality(StrEnum):
+    TEXT = "text"
+    AUDIO = "audio"
+
+class RealtimeEagerness(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    AUTO = "auto"
+
+class RealtimeTurnDetectionMode(StrEnum):
+    MANUAL = "manual"
+    SERVER_VAD = "server_vad"
+    SEMANTIC_VAD = "semantic_vad"
+
+@dataclass(frozen=True, slots=True)
+class TurnDetection:
+    mode: RealtimeTurnDetectionMode
+    threshold: float | None = None
+    silence_ms: int | None = None
+    prefix_padding_ms: int | None = None
+    eagerness: RealtimeEagerness | None = None
+
+class SettingKind(StrEnum):
+    UNSET = "unset"
+    REQUIRE = "require"
+    PREFER = "prefer"
+
+@dataclass(frozen=True, slots=True)
+class Setting[T]:
+    kind: SettingKind = SettingKind.UNSET
+    value: T | None = None
+
+    @classmethod
+    def unset(cls) -> Setting[T]: ...
+    @classmethod
+    def require(cls, value: T) -> Setting[T]: ...
+    @classmethod
+    def prefer(cls, value: T) -> Setting[T]: ...
+
+@dataclass(frozen=True, slots=True)
+class NegotiationPolicy:
+    emulation: EmulationPolicy = EmulationPolicy.FORBID
+    unknown: UnknownCapabilityPolicy = UnknownCapabilityPolicy.REJECT
+    vendor_option_mismatch: MismatchPolicy = MismatchPolicy.REJECT
+
+@dataclass(frozen=True, slots=True)
+class RealtimeRequest:
+    instructions: str | None = None
+    modalities: tuple[RealtimeModality, ...] = ()
+    voice: str | None = None
+    input_audio: Setting[AudioFormat] = Setting()
+    output_audio: Setting[AudioFormat] = Setting()
+    turn_detection: Setting[TurnDetection] = Setting()
+    tools: tuple[str, ...] = ()
+    negotiation: NegotiationPolicy = NegotiationPolicy()
+
+@dataclass(frozen=True, slots=True)
+class RealtimeEndpointRef:
+    id: str
+
+@dataclass(frozen=True, slots=True)
+class RealtimeCredentialRef:
+    id: str
+
+@dataclass(frozen=True, slots=True)
+class RealtimeSession:
+    id: str
+    endpoint: RealtimeEndpointRef
+    credential: RealtimeCredentialRef
+    expires_at_ms: int
+    transport: Transport
 ```
+
+**Resolved (2026-08-20 ruling): `ProviderHandle.request(Operation.REALTIME, RealtimeRequest(...))`
+establishes and returns only a `RealtimeSession` negotiation descriptor. Core retains the WebRTC,
+sideband WebSocket, scoped credential material, and all media; Python receives opaque endpoint and
+credential references, never audio frames, sockets, or provider secrets.**
 
 Results are blob-backed so generated image and speech bytes never expand into Python prose or a
 generic response mapping; `cost_nanos_usd` is Core's settled per-call usage receipt, not an extension

@@ -8,6 +8,4 @@ This port deletes the per-token stopwatch, token estimator, stream hooks, ticker
 
 ## Gaps
 
-- `omp.telemetry.ModelRequest.latency_ms` and `omp.telemetry.ModelRequest.ttft_ms` are absent from the frozen class at `crates/py/python/omp/telemetry.py:125-131`, while `docs/py/10-telemetry.md` §`class ModelRequest(Envelope)` (`:781-800`) requires both typed timing fields. Until the dispatch schema is corrected, the decorated sink cannot receive the data needed for wall time or TTFT.
-- `omp.telemetry.ModelRequest.tokens` in `docs/py/10-telemetry.md:796` diverges from the frozen `omp.telemetry.ModelRequest.usage` field at `crates/py/python/omp/telemetry.py:129`. This port uses the real frozen `usage.output` spelling for TPS.
-- `omp.telemetry(..., coalesce_key=...)` validates the callable but drops it when registering the subscription: `crates/py/python/omp/telemetry.py:148-183` calls `register_telemetry` without the key, and `crates/py/python/omp/_registry.py:184-195,494-517` has no field or parameter for it. This contradicts `docs/py/10-telemetry.md` §`@omp.telemetry` (`:193-211`), so `Overflow.COALESCE_BY_KEY` cannot be wired from the frozen declaration.
+None — every symbol this port needs is frozen.

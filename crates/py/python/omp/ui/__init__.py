@@ -7,12 +7,13 @@ renderer.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator as _AsyncIterator
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 import inspect as _inspect
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
 from string import Formatter
+from types import MappingProxyType
 from typing import Any
 
 from .._errors import ExtensionError as _ExtensionError
@@ -329,10 +330,39 @@ class Presentation:
     charset: Charset = Charset.UNICODE; appearance: Appearance = Appearance.DARK; width: int = 0; height: int = 0; graphics: Graphics = Graphics.CELLS; hyperlinks: bool = False; has_ui: bool = False
 
 
+_EMPTY_PRESENTATION: Mapping[str, object] = MappingProxyType({})
+
+
+def _freeze_presentation(value: Mapping[str, object]) -> Mapping[str, object]:
+    """Copy one host presentation snapshot into a read-only mapping."""
+
+    if value is _EMPTY_PRESENTATION:
+        return value
+    return MappingProxyType(dict(value))
+
+
 @dataclass(frozen=True, slots=True)
 class RenderCtx:
     """Read-only presentation facts handed to a pure rendering fold."""
-    width: int; charset: Charset; appearance: Appearance; graphics: Graphics; hyperlinks: bool; focused: bool; collapsed: bool; place: RenderPlace
+
+    width: int
+    charset: Charset
+    appearance: Appearance
+    graphics: Graphics
+    hyperlinks: bool
+    focused: bool
+    collapsed: bool
+    place: RenderPlace
+    presentation: Mapping[str, object] = field(
+        default_factory=lambda: _EMPTY_PRESENTATION
+    )
+
+    def __post_init__(self) -> None:
+        """Freeze the host-materialized presentation snapshot."""
+
+        object.__setattr__(
+            self, "presentation", _freeze_presentation(self.presentation)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,6 +373,16 @@ class MessageView:
     kind: str
     role: str | None
     text: str
+    presentation: Mapping[str, object] = field(
+        default_factory=lambda: _EMPTY_PRESENTATION
+    )
+
+    def __post_init__(self) -> None:
+        """Freeze the host-materialized presentation snapshot."""
+
+        object.__setattr__(
+            self, "presentation", _freeze_presentation(self.presentation)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +498,39 @@ class Arg:
 class ArgQuery:
     """Dynamic command-argument completion request."""
     prefix: str; argv: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CommandMountSpec:
+    """One slash command discovered after the declaration table was frozen."""
+
+    name: str
+    handler: Callable[..., object]
+    aliases: tuple[str, ...] = ()
+    description: str = ""
+    args: tuple[Arg, ...] = ()
+    hint: str | None = None
+    arg_completions: Callable[..., object] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("dynamic command name must be a non-empty string")
+        if not callable(self.handler):
+            raise TypeError("dynamic command handler must be callable")
+        aliases = tuple(self.aliases)
+        if any(not isinstance(alias, str) or not alias for alias in aliases):
+            raise ValueError("dynamic command aliases must be non-empty strings")
+        object.__setattr__(self, "aliases", aliases)
+        if not isinstance(self.description, str):
+            raise TypeError("dynamic command description must be a string")
+        arguments = tuple(self.args)
+        if any(not isinstance(argument, Arg) for argument in arguments):
+            raise TypeError("dynamic command args must contain only Arg values")
+        object.__setattr__(self, "args", arguments)
+        if self.hint is not None and not isinstance(self.hint, str):
+            raise TypeError("dynamic command hint must be a string or None")
+        if self.arg_completions is not None and not callable(self.arg_completions):
+            raise TypeError("dynamic command arg_completions must be callable or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -815,6 +888,34 @@ def shortcut(chord: str, *, action_id: str | None = None, description: str = "",
         return function
 
     return decorate
+
+
+async def dynamic_mount(*specs: CommandMountSpec) -> tuple[str, ...]:
+    """Mount activate-time-discovered commands through the host CONTROL arm."""
+
+    if any(not isinstance(spec, CommandMountSpec) for spec in specs):
+        raise TypeError("dynamic_mount accepts only CommandMountSpec values")
+    names = tuple(spec.name for spec in specs)
+    if len(set(names)) != len(names):
+        raise ValueError("dynamic command names must be unique within one mount")
+    if any(name in _command_handlers for name in names):
+        raise ValueError("dynamic command name collides with a registered command")
+
+    from .. import _control_backend, _control_request
+    from .._errors import NotWiredError
+
+    if _control_backend.get() is None:
+        raise NotWiredError("omp.ui.dynamic_mount")
+    mounted = await _control_request("omp.ui.dynamic_mount", commands=specs)
+    if (
+        not isinstance(mounted, (tuple, list))
+        or len(mounted) != len(specs)
+        or any(not isinstance(name, str) for name in mounted)
+    ):
+        raise TypeError("omp.ui.dynamic_mount returned invalid command names")
+    for spec in specs:
+        _command_handlers[spec.name] = spec.handler
+    return tuple(mounted)
 
 
 def command(name: str, *, aliases: Sequence[str] = (), description: str = "", args: Sequence[Arg] = (), hint: str | None = None, arg_completions: Callable[..., object] | None = None) -> Callable[[Callable[..., object]], Callable[..., object]]:

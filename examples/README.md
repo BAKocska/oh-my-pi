@@ -1,6 +1,6 @@
 # Extension examples
 
-Eighty-six ports of real pi-ecosystem extensions onto the omp Python extension
+One hundred six ports of real pi-ecosystem extensions onto the omp Python
 layer (`crates/py/python/omp`). Each directory is one extension: an `omp.toml`
 manifest, the Python module(s), and a README stating what the pi original did,
 how the omp shape differs, and — load-bearing — a **Gaps** section listing every
@@ -99,6 +99,26 @@ distance.
 | `grep-heatmap/` | `pi-fovea` | tool_result rewrite prohibited → renderer augmentation + query device | `docs/py/02`, `docs/py/05 §3.11` |
 | `green-loop/` | `pi-green-loop` | affected-test loop: OBSERVE fold, `AfterIdle`, failure dedup | `docs/py/12`, `docs/py/11` |
 | `speech-providers/` | `@p8n.ai/pi-listens` | `Operation.SPEAK`/`TRANSCRIBE`, audio BlobParts, class (b) parsers | `docs/py/13` |
+| `task-graph/` | `@danypops/pi-papyrus` | `Device.subtool` children, graph index, STABLE rule slot | `docs/py/09`, `docs/py/08` |
+| `prompt-templates/` | `pi-prompt-template-model` | markdown templates as content, non-recursive substitution, chain spawns | `docs/py/07 §4.15` |
+| `tool-compose/` | `pi-fabric` | composed steps stay individually gated (no chokepoint bypass) | `docs/py/01`, `docs/py/06` |
+| `browser-cdp/` | `@narumitw/pi-chrome-devtools` | one device + subtools, env-owned browser, streaming, availability-follows-process | `docs/py/11`, `docs/py/01` |
+| `safe-fetch/` | `@juicesharp/rpiv-web-tools` | resolve-then-validate fetch, per-hop redirect revalidation | `docs/py/11` |
+| `knowledge-index/` | `@galvinsan/pi-mentis-knowledge` | detached ingest + TurnBoundary settlement, hybrid index rebuild | `docs/py/03`, `docs/py/12` |
+| `context-report/` | `@mrclrchtr/supi-context` | entry-rendered report invisible to the model, `ContextUsage` fields | `docs/py/09`, `docs/py/08` |
+| `preemptive-compact/` | `pi-preemptive-compact` | pressure trigger + hysteresis, `context.compact`, defer summary | `docs/py/08` |
+| `rules-sync/` | `@7n/rules` | content skills + conformity device + ADR decision capture | `docs/py/14 §3.2.3` |
+| `turn-phases/` | `@yusukeshib/pi-working-status` | event-catalog breadth → one coalesced working status | `docs/py/05 §2.3-2.4` |
+| `calm-mode/` | `pi-calm` | hiding as renderer concern, `RenderCtx.collapsed`, zero context mutation | `docs/py/07 §6.4` |
+| `skill-palette/` | `pi-skill-palette` | `[[skills]]` content rows, palette overlay, `skill://` invocation | `docs/py/14 §3.1.5` |
+| `spec-flow/` | `@mrclrchtr/supi-flow` | journal-held phase machine, artifact-gated transitions, archive spill | `docs/py/09`, `docs/py/11` |
+| `handoff/` | `@noice-tech/pi-cutover` | bounded brief → clean child session, parent→child link journaled | `docs/py/12`, `docs/py/08` |
+| `foreign-commands/` | `pi-unify-cmd` | foreign-root content import, `W-FOREIGN-ROOT`, containment guards | `docs/py/14 §6.6` |
+| `realtime-session/` | `pi-realtime` | `Operation.REALTIME`, streamed partials, cancel-mid-stream | `docs/py/13` |
+| `native-grounding/` | `@pokutuna/pi-google-genai` | provider-native tools as model caps, not proxy devices | `docs/py/13` |
+| `welcome-chrome/` | `@zeerke/ascet-copilot-ui` | welcome scene, recent-session rows, title set/restore, zero timers | `docs/py/07` |
+| `segment-bus/` | `@juanibiapina/pi-powerbar` | `@omp.service` producer/owner bus with per-publisher quotas | `docs/py/00 §Extension services` |
+| `pr-review/` | `pi-pr-review` | tiered reviewer waves, schema-validated findings, sanitized rail | `docs/py/12` |
 
 pi extension descriptions:
 `.plan/user-requests/2026-08-10-pi-extension-survey/catalog.md`.
@@ -259,3 +279,77 @@ the first inverse divergences (frozen ahead of docs). The
 | Devices: `Device.subtool` returns `ToolPath` vs documented child-device decorator (blocks publishing `dyn invoke/github/pr/list` addresses); `devices.list` async vs docs sync; `HARD_SLOT_BUDGET` absent | `github-tools/`, `tool-search/` | `devices.py:290-296,368-415` |
 | UI: `MessageView` missing (renderer takes `object`); message-renderer purity contradiction for pending→cached rewrites (no sanctioned presentation-cache/invalidation); no renderer decoration/augmentation mode though 01 sanctions it; `<diff>` `context` prop unread in TUI props | `legible/`, `grep-heatmap/`, `git-changes/` | `ui/__init__.py:666-720`, `crates/tui/src/props.rs` |
 | env: `Process.restart()` absent (stop+ensure works); `Process` ops dispatch by name without generation fencing despite the contract; `Run.stdin` vs frozen `write`/`eof` | `llama-switch/`, `shell-hooks/` | `env.py:742-748,1033-1077` |
+**Resolved 2026-08-20:** All Round 5 clusters closed. Docs moved to frozen
+truth at every named defect site (05 §4.2 worked example, domain-only
+compaction, shipped `<diff context=N>`, `sessions.current()` recipes,
+`ModelRequest.usage`, `Spill.value`, required `Inject.prompt`,
+`BeforeAgentStartEvent.schedule_id`). Rulings: `completion()` is legal from
+the turn-scoped `turn_start` TRANSFORM (in addition to REVIEW) — per-call
+TRANSFORM stays illegal, closing the auto-thinking saga; `devices.list` is
+synchronous per docs over the declaration snapshot merged with the
+host-installed view; renderer purity is per verdict state with a host-owned
+presentation cache keyed `(identity, call_id, state)` plus the sanctioned
+`decorates=True` composition mode. Frozen closures: the merged-catalog read
+(`ModelCard`/`Price`/`models()`/`watch_models`); telemetry
+`latency_ms`/`ttft_ms`/typed degradations/capture-gated content bytes,
+registered `coalesce_key`, and typed `PromptSlotFingerprint(digest,
+size_bytes, band)`; provider `SpecError`, duplicate-model rejection, bare
+class-(a) registration, docs-exact `CacheRetention`
+(`REQUEST`/`SESSION`/`SHORT`/`LONG`) and `PromptCacheCaps` field names, typed
+speech/transcription caps, the shared `ProviderHandle.request` SPEAK/
+TRANSCRIBE arm, and `TextPart`/`BlobPart` completion prompts; devices
+child-decorator `subtool`, `HARD_SLOT_BUDGET`; UI `MessageView` and the wired
+`<diff>` `context` prop; env `Process.restart()`, generation-fenced Process
+frames (`PreconditionFailed` on stale handles), and the documented
+`Run.stdin`/`Run.eof` spelling. The examples gate now discovers package- and
+multi-module-shaped ports; ports using pre-rename spellings
+(`CacheRetention.STANDARD`/`EPHEMERAL`, `maximum_breakpoints`,
+`minimum_prefix_tokens`) were migrated to the documented contract.
+
+
+## Round 6 residual defects (2026-08-20, twenty ports)
+
+Five ports gap-free (`preemptive-compact/`, `welcome-chrome/`,
+`prompt-templates/`, `turn-phases/`, `browser-cdp/`). Two catalog rows were
+deliberately not ported (offensive-security casefile/audit packages); their
+distinctive mechanics are covered by `spec-flow/` and `pr-review/`.
+
+| Defect | Found by | Where |
+|---|---|---|
+| **Most-hit:** `Device.subtool` accepts only `name` and hard-codes child `schema=None`, so documented per-child schemas and inherited-property overrides are unavailable; 01 also self-contradicts (documents `subtool(name: str)` at :911 then claims overrides at :927) | `task-graph/`, `spec-flow/`, `pr-review/` (+ `github-tools/` in round 5) | `devices.py:362-423`, `docs/py/01:911-929` |
+| **Content declarations have no row spelling:** 14 §3.1.5's kind vocabulary covers only lazy-reachable CODE surfaces; §3.2.3's `kind="skills"` is a *package* kind forbidding code — so a code-bearing extension shipping skills/rules/context-files/prompts has no manifest shape, though PLAN Part 8 §Content discovery M1 puts content discovery on that very table. Also `packages.Distribution` has no `declarations`, so an extension cannot enumerate its own declared content | `skill-palette/`, `rules-sync/` | `docs/py/14 §3.1.5,§3.2.3`, `packages.py:108-121` |
+| Detached tool outcomes absent: no `omp.Detached`/`JobRef`, no JobBoard registration op for an env-placed device coroutine | `knowledge-index/` | `docs/py/03:153-179` |
+| Dynamic COMMAND registration impossible: `command` is import-time only and `RegisterUi` needs predeclared manifest rows, so activate-time discovered commands cannot reach the host (devices got `dynamic_mount`; commands have no equivalent) | `foreign-commands/` | `ui/__init__.py:820-838` |
+| **Needs ruling:** no public extension→device invoke API, and 11:242/04:221 prohibit worker re-entrant device invocation while 01:201-213 describes individually gated inner calls — composition has no legal path | `tool-compose/` | `docs/py/01` vs `docs/py/04`/`11` |
+| Provider caps holes: `HostedTool` missing (`ChatCaps.hosted_tools` is `frozenset[str]`), no `URL_CONTEXT`/`DEEP_RESEARCH` features; `RealtimeCaps`/`RealtimeFeature` missing and `ProviderHandle.request` rejects `REALTIME` (`Operation.REALTIME`/`Api.OPENAI_REALTIME`/`Transport.WEBRTC` DO exist) | `native-grounding/`, `realtime-session/` | `provider.py:161-169,651-670` |
+| `http_get` has no no-follow/one-hop option and `HttpResponse` no final URL, so per-hop redirect revalidation cannot go through the broker | `safe-fetch/` | `env.py:925-983` |
+| Public verdict arms incomplete: `CallOutcome`/`ArgsRejected`/`Aborted` unexported (only `Ok`/`Faulted`); `JournalEntry.artifact` is `object \| None` with no `ArtifactRef`/`omp.artifacts` | `handoff/` | `_verdicts.py:54-73`, `journal.py:45-59` |
+| `ContextUsage.catalog_notice_tokens` missing though the accounting split was ruled; 08:2091 still calls it unresolved | `context-report/` | `context.py:91-106` |
+| Sync folds cannot read async SESSION state — no immutable presentation field on `RenderCtx`/`MessageView`/`View` | `calm-mode/` | `ui/__init__.py` |
+| Docs drift: 00:788 `omp.context()` vs frozen `Context.current()`; 09 uses `omp.ExtensionActivate` vs frozen `ExtensionActivateEvent`; 14 §6.6 lacks the normative content-only-never-code rule; `agent_settled` phase classification reads OBSERVE-able in 05 but is domain-only frozen | `segment-bus/`, `task-graph/`, `foreign-commands/`, `rules-sync/` | docs |
+**Resolved 2026-08-20:** All Round 6 clusters closed. The most-hit defect
+lands as a design ruling — **Device is a router**: `@device.subtool(path,
+**overrides)` is a route decorator (multi-segment paths, child schema from
+the handler's `Annotated`/`omp.Field` signature, inherited-property
+overrides), and `omp.router(prefix)` is a standalone mountable sub-router
+composed via `Device.mount`; docs/py/01's :911/:927 self-contradiction
+resolves into that contract. Content declarations gained their row spelling —
+docs/py/14 §3.1.5 grows `skills`/`rules`/`context-files`/`prompts` content
+rows (distinct from the code-forbidding package kind, §6.6 now states the
+normative content-only-never-code rule) and `packages.Distribution` gained a
+typed `declarations` enumeration. The composition ruling: gated
+`omp.devices.invoke(path, args, *, deadline)` is the public host-placement
+surface (each inner call independently admission-gated, per 01:201-213); the
+04/11 worker re-entrancy prohibition stands and cross-references it. Also
+closed: `Detached`/`JobRef` + the `omp.jobs.register` arm; activate-time
+`ui.dynamic_mount` for commands with full metadata; typed `HostedTool`
+(incl. `URL_CONTEXT`/`DEEP_RESEARCH`) and `RealtimeCaps`/`RealtimeFeature`
+with an establishment-only REALTIME request arm (media never transits
+Python); bounded `redirects=0..10` + `HttpResponse.final_url` through the
+broker with cross-origin credential stripping; the complete public
+`CallOutcome` union (`ArgsRejected`/`Aborted` exported) with `ArtifactRef` +
+`omp.artifacts` and a typed `JournalEntry.artifact`;
+`ContextUsage.catalog_notice_tokens` per the accounting ruling; immutable
+host-materialized `presentation` snapshots on the render-input values; and
+the four docs drifts moved to frozen truth.
+

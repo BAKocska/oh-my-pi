@@ -1334,7 +1334,7 @@ two other "phase" meanings across the set; it is renamed `AgentPhase` (matching 
 with `omp.LifecyclePhase` and `omp.InvocationPhase` owned by [`00-overview.md`](00-overview.md)
 and [`03-params.md`](03-params.md), and `omp.HookPhase` in §3.4.
 
-**`agent_settled` is the goal-loop seam.** It fires at exactly the point the loop drains
+**`agent_settled` is the domain-only goal-loop seam.** It fires at exactly the point the loop drains
 `DrainPoint::Idle` and would otherwise publish `AgentPhase::Idle`
 (`crates/agent/src/loop.rs:580-597`). It returns `omp.agents.Continue | omp.agents.Settle`
 ([`12-agents.md`](12-agents.md)): resolution is first-`Continue`-wins in the deterministic

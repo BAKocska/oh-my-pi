@@ -74,8 +74,8 @@ _MOONSHOT_TOOLS = ToolCaps(
 )
 
 _MOONSHOT_CACHE = PromptCacheCaps(
-    retention=frozenset({CacheRetention.STANDARD}),
-    minimum_prefix_tokens=1_024,
+    retention=frozenset({CacheRetention.SESSION}),
+    min_prefix_tokens=1_024,
 )
 
 _MOONSHOT_SPEC = ProviderSpec(
@@ -113,7 +113,7 @@ _MOONSHOT_SPEC = ProviderSpec(
             ),
             compat=CompatFlags(schema_flavor=ToolSchemaFlavor.MOONSHOT_MFJS),
             context=ContextSpec.prefix_cache(
-                retention=frozenset({CacheRetention.STANDARD}),
+                retention=frozenset({CacheRetention.SESSION}),
                 min_prefix_tokens=1_024,
             ),
             chat=ChatCaps(

@@ -1294,7 +1294,7 @@ def apply_rows(state: omp.EnvPath, rows: list[tuple[int, str]], mark: str) -> No
 omp.workers.declare(omp.WorkerSpec(name="index", site=omp.Site.ENV))
 
 @omp.hook("extension_activate")
-async def rebuild(event: omp.ExtensionActivate, ctx: omp.Context) -> None:
+async def rebuild(event: omp.ExtensionActivateEvent, ctx: omp.Context) -> None:
     state = await omp.state_dir()                     # omp.EnvPath, not a str
     worker = await omp.workers.get("index")
     raw = await worker.call(watermark, state)

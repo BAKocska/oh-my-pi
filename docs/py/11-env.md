@@ -240,7 +240,9 @@ Four rules make that table sound:
    because the supervisor performs the handshake and the worker inherits the scoped session —
    `ClientHello` is not available to it.
 2. **No re-entrant dispatch.** `InvokeTool` is an Agent-Core-side edge. A worker calling devices
-   would be the ambient-authority hole placement exists to avoid.
+   would be the ambient-authority hole placement exists to avoid. Host-placed composition uses
+   `omp.devices.invoke`; each inner call opens a fresh independently admitted and policy-gated
+   invocation (`docs/py/01-devices.md`).
 3. **No named-process ownership.** A worker is disposable; a named process outlives its starter by
    design. A disposable owner is an orphan generator, so the whole `proc` family is host-only.
 4. **Direct reads carry no revision.** Reading bytes off local disk beside the Environment is
@@ -1334,6 +1336,23 @@ the whole file), `text: str`, `before: tuple[str, ...]`, `after: tuple[str, ...]
 
 `class omp.env.Follow` — `NEVER`, `ROOT_ONLY`, `ALWAYS`.
 
+### Scoped HTTP egress
+
+`await omp.env.http_get(url, *, timeout=None, headers={}, redirects=10) -> HttpResponse`,
+`await omp.env.http_post(url, *, body=b"", headers={}, timeout=None, redirects=10) -> HttpResponse`,
+and `await omp.env.http_put(url, *, body=b"", headers={}, timeout=None, redirects=10) -> HttpResponse`
+send one bounded request through the Environment-owned client. `redirects` is the maximum number of
+redirect hops and must be an integer from 0 through 10. Use `redirects=0` for no-follow inspection
+of the first response and `redirects=1` for at most one hop. Hitting the bound returns that redirect
+response rather than following it again. The overall `timeout` covers the whole redirect chain,
+and the existing response-size cap applies to the returned body.
+
+`class omp.env.HttpResponse` — `status: int`, immutable `headers: Mapping[str, str]`, `body: bytes`,
+and `final_url: str`. `final_url` is the URL that produced the returned response. In particular,
+a no-follow redirect response reports the requested URL, allowing callers to inspect `Location`,
+resolve and validate the next target, then issue the next no-follow request without an automatic
+public-to-private redirect bypass.
+
 ### The capability model, as enforced
 
 The manifest declares capability *intents*. The Environment holds the granted set per connection
@@ -2223,6 +2242,12 @@ synchronization* (100-108), *Atomic text edit and workspace edit application eng
    not bypass the capability on wired hosts. This ruling supersedes the 2026-08-19 “ship nothing”
    posture while preserving question 2 in `docs/py/13-inference.md`: discovery HTTP belongs to
    `omp.env`.
+
+   **Resolved (2026-08-20 ruling): redirects are caller-bounded.** The three scoped HTTP verbs
+   accept `redirects=0..10`, where zero returns the first 3xx without following it and one permits
+   at most one hop. `HttpResponse.final_url` identifies the URL that produced the response, so
+   security-sensitive callers can revalidate every hop while remaining on brokered `env.net`
+   egress.
 
 7. **Worker grant negotiation across respawn.** A worker's scope is the declaring extension's grant
    intersected with the invocation's scope, computed env-side. But the supervisor respawns a

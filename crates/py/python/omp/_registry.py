@@ -26,6 +26,7 @@ from _omp import (
 
 
 from ._errors import SpecError
+from . import packages as _packages
 
 
 _T = TypeVar("_T", bound=type)
@@ -177,6 +178,15 @@ class DeviceDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class ChildDeviceDefinition:
+    """One static route projected below a declared parent device."""
+
+    parent: _ToolKey
+    path: str
+    definition: DeviceDefinition
+
+
+@dataclass(frozen=True, slots=True)
 class ExportDefinition:
     """One import-time telemetry export declaration."""
 
@@ -238,6 +248,7 @@ class DeclarationSnapshot:
     providers: tuple[ProviderDefinition, ...] = ()
     workers: tuple[WorkerDefinition, ...] = ()
     device_definitions: tuple[DeviceDefinition, ...] = ()
+    child_device_definitions: tuple[ChildDeviceDefinition, ...] = ()
     exports: tuple[ExportDefinition, ...] = ()
     approvers: tuple[ApproverDefinition, ...] = ()
     device_states: tuple[tuple[_ToolKey, bool, str | None], ...] = ()
@@ -254,6 +265,7 @@ class DeclarationRegistry:
         "_shortcuts",
         "_device_claims",
         "_device_definitions",
+        "_child_device_definitions",
         "_device_states",
         "_entry_kinds",
         "_export_sequence",
@@ -284,6 +296,7 @@ class DeclarationRegistry:
         self._shortcuts: dict[str, ShortcutDefinition] = {}
         self._tools: dict[_ToolKey, object] = {}
         self._device_definitions: dict[_ToolKey, DeviceDefinition] = {}
+        self._child_device_definitions: dict[_ToolKey, ChildDeviceDefinition] = {}
         self._device_claims: dict[
             str, list[tuple[int, str | None, _ToolKey]]
         ] = {}
@@ -328,11 +341,19 @@ class DeclarationRegistry:
         hooks: Iterable[_HookKey] = (),
         services: Iterable[_ServiceKey] = (),
         requires: Iterable[_ServiceKey] = (),
+        declarations: Iterable[
+            _packages.ContentDeclaration | Mapping[str, object]
+        ] | None = None,
         extension: str | None = None,
     ) -> None:
-        """Installs authoritative manifest sets before the first module import."""
+        """Install authoritative manifest sets before the first module import."""
 
         self._ensure_open()
+        content_declarations = (
+            None
+            if declarations is None
+            else _packages._content_declarations(declarations)
+        )
         if self._configured:
             raise RuntimeError("manifest declaration sets are already configured")
         if (
@@ -344,6 +365,10 @@ class DeclarationRegistry:
             or self._approvers
         ):
             raise RuntimeError("manifest must be configured before declaration import")
+        if content_declarations is not None:
+            _packages._configure_own_declarations(
+                extension, content_declarations
+            )
         self._manifest_tools = frozenset(_tool_key(*item) for item in tools)
         self._manifest_hooks = frozenset(_hook_key(*item) for item in hooks)
         self._manifest_services = frozenset(_service_key(*item) for item in services)
@@ -393,6 +418,41 @@ class DeclarationRegistry:
             )
             self._device_states[key] = (True, None)
         return declaration
+
+    def register_child_device(
+        self,
+        parent: _ToolKey,
+        path: str,
+        declaration: object,
+        *,
+        definition: DeviceDefinition,
+    ) -> object:
+        """Record one static child route and its inherited projection."""
+
+        if parent not in self._device_definitions:
+            raise LookupError(f"parent device definition is not registered: {parent!r}")
+        registered = self.register_tool(
+            definition.name,
+            definition.family,
+            definition.rev,
+            declaration,
+            definition=definition,
+        )
+        key = _tool_key(definition.name, definition.family, definition.rev)
+        self._child_device_definitions[key] = ChildDeviceDefinition(
+            parent=parent,
+            path=path,
+            definition=self._device_definitions[key],
+        )
+        return registered
+
+    def child_device_definitions(self) -> tuple[ChildDeviceDefinition, ...]:
+        """Return static child routes in deterministic device-key order."""
+
+        return tuple(
+            self._child_device_definitions[key]
+            for key in sorted(self._child_device_definitions)
+        )
 
     def device_claims(
         self, name: str
@@ -768,6 +828,7 @@ class DeclarationRegistry:
             providers=self.provider_definitions(),
             workers=self.worker_definitions(),
             device_definitions=self.device_definitions(),
+            child_device_definitions=self.child_device_definitions(),
             exports=self.export_definitions(),
             approvers=self.approver_definitions(),
             device_states=tuple(
@@ -928,15 +989,19 @@ def configure_manifest(
     hooks: Iterable[_HookKey] = (),
     services: Iterable[_ServiceKey] = (),
     requires: Iterable[_ServiceKey] = (),
+    declarations: Iterable[
+        _packages.ContentDeclaration | Mapping[str, object]
+    ] | None = None,
     extension: str | None = None,
 ) -> None:
-    """Installs authoritative existence sets before sequential import."""
+    """Install authoritative existence and content sets before sequential import."""
 
     registry.configure_manifest(
         tools=tools,
         hooks=hooks,
         services=services,
         requires=requires,
+        declarations=declarations,
         extension=extension,
     )
 
@@ -1113,6 +1178,7 @@ __all__ = (
     "CommandDefinition",
     "ShortcutDefinition",
     "DeclarationRegistry",
+    "ChildDeviceDefinition",
     "DeviceDefinition",
     "DeclarationSnapshot",
     "MAX_DECLARATIONS",

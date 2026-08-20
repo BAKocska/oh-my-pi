@@ -213,7 +213,20 @@ Four properties of that diagram are load-bearing:
    unchanged. Agent Core is what answers it: Core runs the per-invocation
    decision procedure, the hook phases of
    [docs/py/05-hooks.md](05-hooks.md), while the environment owns the gate
-   and the enforcement. An earlier revision of this passage called Agent
+   and the enforcement.
+
+   **Resolved (2026-08-20 R-invoke ruling):** host-placed composition uses the
+   async `omp.devices.invoke(path: str, args: Mapping[str, object], *,
+   deadline: omp.Duration | None = None) -> object` surface. The CONTROL host
+   arm opens a fresh ordinary device invocation and its DATA dispatch: every
+   inner call receives its own admission and policy decision, and inherits no
+   ambient authority from the parent invocation. The surface is legal only
+   from `place="host"`; the host rejects calls from `place="env"` and
+   `worker:<name>` placements. The worker re-entrancy prohibition remains
+   unchanged ([docs/py/04-placement.md](04-placement.md),
+   [docs/py/11-env.md](11-env.md)).
+
+   An earlier revision of this passage called Agent
    Core "a pure courier"; that is retracted here rather than silently
    edited, because it over-read D6. `PLAN.md` §D6 (D6, *One
    mailbox, no gate chain*) is explicit that a tool batch "runs concurrently
@@ -908,26 +921,59 @@ Methods:
 - `__call__(*args, **kwargs)` — invokes the body directly, in-process, with no
   gate, no journal entry, and no notification. For tests and for one device
   composing another inside the same extension.
-- `subtool(name: str) -> Callable[[DeviceBody], Device]` — declare a leaf
-  under this device's path. New in Rev 2.1, and the only sub-tool spelling:
-  the declarator `omp.device(...)` returns doubles as the subtree handle, so
+- `subtool(path: str, **overrides) -> Callable[[DeviceBody], Device]` —
+  declare a leaf under this device's path. `path` may contain multiple
+  segments. The declarator returned by `omp.device(...)` doubles as the
+  subtree handle:
 
   ```python
   dev = omp.device("jira", tier=omp.Tier.WRITE)
 
 
-  @dev.subtool("create")
-  async def create(args: CreateArgs, ctx: omp.Context) -> omp.Payload: ...
+  @dev.subtool(
+      "issue/create",
+      place=omp.Place.HOST,
+      effects=omp.Effects(),
+      summary="Create a Jira issue.",
+  )
+  async def create(
+      project: Annotated[str, omp.Field(description="Project key.")],
+      ctx: omp.Context,
+  ) -> omp.Payload: ...
   ```
 
-  mounts the path `jira/create` — dispatched as
-  `dyn {"do_": "invoke/jira/create", ...}`, documented via
-  `dyn {"do_": "docs/jira/create"}`, listed under the `jira` node of the
-  search tree. The
-  sub-tool inherits the parent's `family`, `place`, `precedence`, and `tier`
-  unless the `subtool` call overrides them, and each leaf carries its own
-  schema and docs. Sub-trees are an `@omp.device` affordance only —
-  `@omp.tool` is always a leaf.
+  This registers `jira/issue/create`, dispatched as
+  `dyn {"do_": "invoke/jira/issue/create", ...}`, documented via
+  `dyn {"do_": "docs/jira/issue/create"}`, and listed under the `jira` node
+  of the search tree. Each leaf's schema and `omp.Field` argument metadata
+  are derived from its handler signature by the ordinary device declaration
+  extractor. The accepted overrides are `family`, `place`, `precedence`,
+  `tier`, `effects`, `docs`, and `summary`; each property inherits the
+  parent's value when omitted. Sub-trees are an `@omp.device` affordance
+  only — `@omp.tool` is always a leaf.
+- `mount(router: omp.Router) -> tuple[Device, ...]` — register all routes
+  previously declared on a standalone router. `omp.router(prefix)` creates a
+  mountable router without requiring the parent to exist in the same module:
+
+  ```python
+  issues = omp.router("issue")
+
+
+  @issues.subtool("list", summary="List Jira issues.")
+  async def list_issues(args: ListArgs, ctx: omp.Context) -> omp.Payload: ...
+
+
+  dev.mount(issues)  # registers jira/issue/list
+  ```
+
+  Router route paths may also contain multiple segments. Their overrides and
+  inheritance are identical to `Device.subtool`; the parent and router
+  prefixes are concatenated only when mounted. Routes must be mounted during
+  declaration import; mounting after FREEZE raises `DeclarationSealed`.
+
+**Resolved (2026-08-20 ruling):** `Device` is the router. `subtool` is a
+decorator that registers a projected child, while `omp.router(prefix)` is the
+standalone, mountable form; neither API is an address-value constructor.
 
 ```python
 lint = house_lint  # the decorator returned the handle
@@ -1172,6 +1218,12 @@ model-visible *content*, never schema. A device mounting, a docs edit, a
 thousand MCP endpoints appearing: zero cache churn, because nothing in the
 request prefix moved. Anthropic's registered-discovery-tool variant charged a
 cache miss per catalog change; this design charges none.
+
+Static routes declared with `Device.subtool` or mounted from `omp.router` are
+separate frozen child declarations. The host projects each child's derived
+argument schema, docs, summary, placement, effects, tier, family, and
+precedence at its full concatenated address; dispatch does not fall back to
+the parent's schema or policy metadata.
 
 **Reserved namespace.** A device parameter may not be named `do_`, and
 parameter names ending in `_` are reserved for future envelope growth. A

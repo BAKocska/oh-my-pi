@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import builtins as _builtins
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, MappingProxyType
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 from _omp import ManifestError
@@ -39,6 +39,38 @@ class Origin(StrEnum):
     FROZEN = "frozen"
     STORE = "store"
     LINK = "link"
+
+
+class ContentKind(StrEnum):
+    """Closed manifest vocabulary for shipped, non-executable content."""
+
+    SKILLS = "skills"
+    RULES = "rules"
+    CONTEXT_FILES = "context-files"
+    PROMPTS = "prompts"
+
+
+@dataclass(frozen=True, slots=True)
+class ContentDeclaration:
+    """One manifest-declared content path or glob and its author metadata."""
+
+    kind: ContentKind
+    path: str
+    metadata: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the host-supplied manifest row."""
+        if not isinstance(self.kind, ContentKind):
+            object.__setattr__(self, "kind", ContentKind(self.kind))
+        if not isinstance(self.path, str) or not self.path:
+            raise ManifestError("content declaration path must be a non-empty str")
+        if not isinstance(self.metadata, Mapping):
+            raise ManifestError("content declaration metadata must be a mapping")
+        object.__setattr__(
+            self, "metadata", MappingProxyType(dict(self.metadata))
+        )
 
 
 def _normalize(name: str) -> str:
@@ -117,6 +149,7 @@ class Distribution:
     blake3: str | None
     root: Path | None
     files: tuple[Path, ...]
+    declarations: tuple[ContentDeclaration, ...]
     requested_by: tuple[str, ...]
     vendored: tuple[str, ...]
 
@@ -144,6 +177,30 @@ _site_tree: SiteTree | None = None
 _verifier: Callable[[Distribution, bool], None] | None = None
 
 
+def _content_declaration(
+    value: ContentDeclaration | Mapping[str, Any],
+) -> ContentDeclaration:
+    """Decode one verified content row from the uniform manifest table."""
+    if isinstance(value, ContentDeclaration):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "content declaration must be a ContentDeclaration or mapping"
+        )
+    return ContentDeclaration(
+        kind=ContentKind(str(value["kind"])),
+        path=value["path"],
+        metadata=value.get("metadata", {}),
+    )
+
+
+def _content_declarations(
+    values: Iterable[ContentDeclaration | Mapping[str, Any]],
+) -> tuple[ContentDeclaration, ...]:
+    """Decode an extension's verified content declaration inventory."""
+    return tuple(_content_declaration(value) for value in values)
+
+
 def _distribution(value: Distribution | Mapping[str, Any]) -> Distribution:
     """Decode one host-supplied, already-verified metadata record."""
     if isinstance(value, Distribution):
@@ -160,9 +217,43 @@ def _distribution(value: Distribution | Mapping[str, Any]) -> Distribution:
         blake3=value.get("blake3"),
         root=None if value.get("root") is None else Path(value["root"]),
         files=tuple(Path(path) for path in value.get("files", ())),
+        declarations=_content_declarations(value.get("declarations", ())),
         requested_by=tuple(str(item) for item in value.get("requested_by", ())),
         vendored=tuple(str(item) for item in value.get("vendored", ())),
     )
+
+
+def _configure_own_declarations(
+    extension: str | None,
+    declarations: tuple[ContentDeclaration, ...],
+) -> None:
+    """Attach configured manifest content to the calling distribution snapshot."""
+    global _snapshot, _by_name, _module_owners, _own_distribution
+    current = _own_distribution
+    if current is None:
+        if declarations:
+            raise ResolutionError(
+                "content declarations require an installed own distribution"
+            )
+        return
+    if extension is not None and current.extension_id != extension:
+        raise ResolutionError(
+            "configured extension does not match the own distribution"
+        )
+    updated = replace(current, declarations=declarations)
+    _snapshot = tuple(
+        updated if distribution is current else distribution
+        for distribution in _snapshot
+    )
+    _by_name = {
+        _normalize(distribution.name): distribution
+        for distribution in _snapshot
+    }
+    _module_owners = {
+        module: updated if owner is current else owner
+        for module, owner in _module_owners.items()
+    }
+    _own_distribution = updated
 
 
 def _install_snapshot(
@@ -265,7 +356,8 @@ def site() -> SiteTree:
 # remain exactly ``omp.packages.list`` without shadowing Python's list globally.
 
 __all__ = (
-    "Distribution", "GrantError", "IntegrityError", "Origin", "PackageError",
-    "Provenance", "ResolutionError", "SettingSchema", "SiteTree", "get", "list",
+    "ContentDeclaration", "ContentKind", "Distribution", "GrantError",
+    "IntegrityError", "Origin", "PackageError", "Provenance", "ResolutionError",
+    "SettingSchema", "SiteTree", "get", "list",
     "of", "own", "site",
 )

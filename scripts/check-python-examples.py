@@ -348,10 +348,15 @@ def _check_one(module_path: Path) -> dict[str, Any]:
                 errors.append(f"line {node.lineno}: # GAP: import now succeeds; remove its marker")
         gaps += int(marked)
 
+    is_package = module_path.name == "__init__.py"
+    example_dir = module_path.parent.parent if is_package else module_path.parent
     module_error: BaseException | None = None
-    name = f"_omp_example_gate_{module_path.parent.name.replace('-', '_')}"
+    name = f"_omp_example_gate_{example_dir.name.replace('-', '_')}"
     try:
-        spec = importlib.util.spec_from_file_location(name, module_path)
+        locations = [str(module_path.parent)] if is_package else None
+        spec = importlib.util.spec_from_file_location(
+            name, module_path, submodule_search_locations=locations
+        )
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot load {module_path}")
         module = importlib.util.module_from_spec(spec)
@@ -372,11 +377,11 @@ def _check_one(module_path: Path) -> dict[str, Any]:
             f"{type(module_error).__name__}: {module_error}"
         )
 
-    if module_path.parent.name == "bash-guard":
+    if example_dir.name == "bash-guard":
         errors.extend(_stale_readme_exports(omp, _EXAMPLES / "README.md"))
-    errors.extend(_stale_readme_exports(omp, module_path.with_name("README.md")))
+    errors.extend(_stale_readme_exports(omp, example_dir / "README.md"))
     return {
-        "example": module_path.parent.name,
+        "example": example_dir.name,
         "gaps": gaps,
         "errors": errors,
         "stubs": _not_wired_stubs(),
@@ -387,6 +392,16 @@ def _example_modules() -> list[Path]:
     modules: list[Path] = []
     for directory in sorted(path for path in _EXAMPLES.iterdir() if path.is_dir()):
         candidates = sorted(directory.glob("*.py"))
+        if not candidates:
+            # A package-shaped port: exactly one package directory whose
+            # __init__.py is the import root.
+            candidates = sorted(directory.glob("*/__init__.py"))
+        if len(candidates) > 1:
+            # Multi-module ports name their import root after the directory;
+            # sibling modules are companions it imports.
+            named = directory / f"{directory.name.replace('-', '_')}.py"
+            if named in candidates:
+                candidates = [named]
         if len(candidates) != 1:
             raise SystemExit(f"{directory.relative_to(_ROOT)}: expected exactly one Python module, found {len(candidates)}")
         modules.append(candidates[0])

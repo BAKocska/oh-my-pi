@@ -924,16 +924,23 @@ class Lifecycle(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class HttpResponse:
-    """Immutable response returned by scoped Environment HTTP egress."""
+    """Immutable response returned by scoped Environment HTTP egress.
+
+    ``final_url`` identifies the URL that produced this response after any
+    permitted redirect hops.
+    """
 
     status: int
     headers: Mapping[str, str]
     body: bytes
+    final_url: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
         if type(self.body) is not bytes:
             raise TypeError("HttpResponse.body must be bytes")
+        if type(self.final_url) is not str:
+            raise TypeError("HttpResponse.final_url must be a str")
 
     def json(self) -> Any:
         """Decode the response body as JSON."""
@@ -949,7 +956,12 @@ async def _http_request(
     body: bytes,
     headers: Mapping[str, str],
     timeout: Duration | None,
+    redirects: int,
 ) -> HttpResponse:
+    if type(redirects) is not int:
+        raise TypeError("redirects must be an int")
+    if not 0 <= redirects <= 10:
+        raise ValueError("redirects must be between 0 and 10")
     if _binding.get() is None:
         raise NotWiredError(public_name)
     if type(body) is not bytes:
@@ -961,6 +973,7 @@ async def _http_request(
         body=body,
         headers=headers,
         timeout=timeout,
+        redirects=redirects,
     )
     return result if isinstance(result, HttpResponse) else HttpResponse(**result)
 
@@ -970,8 +983,13 @@ async def http_get(
     *,
     timeout: Duration | None = None,
     headers: Mapping[str, str] = MappingProxyType({}),
+    redirects: int = 10,
 ) -> HttpResponse:
-    """Request one URL with GET through scoped Environment HTTP egress."""
+    """Request one URL with GET through scoped Environment HTTP egress.
+
+    ``redirects`` is the maximum number of redirect hops, from 0 through 10.
+    Zero returns the first redirect response without following it.
+    """
     return await _http_request(
         "omp.env.http_get",
         "omp.env.http.get",
@@ -980,6 +998,7 @@ async def http_get(
         body=b"",
         headers=headers,
         timeout=timeout,
+        redirects=redirects,
     )
 
 
@@ -989,8 +1008,13 @@ async def http_post(
     body: bytes = b"",
     headers: Mapping[str, str] = MappingProxyType({}),
     timeout: Duration | None = None,
+    redirects: int = 10,
 ) -> HttpResponse:
-    """Request one URL with POST through scoped Environment HTTP egress."""
+    """Request one URL with POST through scoped Environment HTTP egress.
+
+    ``redirects`` is the maximum number of redirect hops, from 0 through 10.
+    Zero returns the first redirect response without following it.
+    """
     return await _http_request(
         "omp.env.http_post",
         "omp.env.http.post",
@@ -999,6 +1023,7 @@ async def http_post(
         body=body,
         headers=headers,
         timeout=timeout,
+        redirects=redirects,
     )
 
 
@@ -1008,8 +1033,13 @@ async def http_put(
     body: bytes = b"",
     headers: Mapping[str, str] = MappingProxyType({}),
     timeout: Duration | None = None,
+    redirects: int = 10,
 ) -> HttpResponse:
-    """Request one URL with PUT through scoped Environment HTTP egress."""
+    """Request one URL with PUT through scoped Environment HTTP egress.
+
+    ``redirects`` is the maximum number of redirect hops, from 0 through 10.
+    Zero returns the first redirect response without following it.
+    """
     return await _http_request(
         "omp.env.http_put",
         "omp.env.http.put",
@@ -1018,6 +1048,7 @@ async def http_put(
         body=body,
         headers=headers,
         timeout=timeout,
+        redirects=redirects,
     )
 
 

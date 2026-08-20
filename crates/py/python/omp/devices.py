@@ -28,6 +28,7 @@ from enum import IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Any
 
+from _omp import DeclarationSealed, Duration
 from ._errors import ExtensionError, NotWiredError
 from ._registry import registry
 from .packages import Provenance
@@ -217,6 +218,60 @@ class DeviceInfo:
     schema_tokens: int
 
 
+_ROUTE_OVERRIDES = frozenset(
+    {"family", "place", "precedence", "tier", "effects", "docs", "summary"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _Route:
+    path: str
+    body: Callable[..., Any]
+    overrides: Mapping[str, object]
+
+
+class Router:
+    """Collect static child routes for later mounting below a device."""
+
+    __slots__ = ("_routes", "prefix")
+
+    def __init__(self, prefix: str) -> None:
+        """Initialize a standalone router at one relative path prefix."""
+        try:
+            self.prefix = _subpath(prefix)
+        except (TypeError, ValueError) as error:
+            raise DeviceError(str(error)) from error
+        self._routes: list[_Route] = []
+
+    def subtool(
+        self, path: str, **overrides: object
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Declare a route without requiring its parent device to exist yet."""
+        try:
+            route_path = _subpath(path)
+        except (TypeError, ValueError) as error:
+            raise DeviceError(str(error)) from error
+        unknown = overrides.keys() - _ROUTE_OVERRIDES
+        if unknown:
+            raise TypeError(f"unknown subtool override {sorted(unknown)[0]!r}")
+        frozen_overrides = MappingProxyType(dict(overrides))
+
+        def decorate(body: Callable[..., Any]) -> Callable[..., Any]:
+            if not callable(body):
+                raise TypeError("Router.subtool may decorate only a callable")
+            if any(route.path == route_path for route in self._routes):
+                raise DeviceError(f"duplicate router path {route_path!r}")
+            self._routes.append(_Route(route_path, body, frozen_overrides))
+            return body
+
+        return decorate
+
+
+def router(prefix: str) -> Router:
+    """Create a standalone static sub-router for mounting below a device."""
+    return Router(prefix)
+
+
 _catalog_view: contextvars.ContextVar[tuple[DeviceInfo, ...] | None] = (
     contextvars.ContextVar("omp_device_catalog_view", default=None)
 )
@@ -359,68 +414,115 @@ class Device:
         )
         self.enabled = False
 
-    def subtool(self, name: str) -> Callable[[Callable[..., Any]], Device]:
-        """Declare a static child device below this device's path."""
+    def subtool(
+        self, path: str, **overrides: object
+    ) -> Callable[[Callable[..., Any]], Device]:
+        """Declare a static child route below this device's path."""
         try:
-            sub = _subpath(name)
+            route_path = _subpath(path)
         except (TypeError, ValueError) as error:
             raise DeviceError(str(error)) from error
-        child_name = f"{self.name}/{sub}"
-        parent = registry.device_definition(self.name, self.family, self.rev)
+        unknown = overrides.keys() - _ROUTE_OVERRIDES
+        if unknown:
+            raise TypeError(f"unknown subtool override {sorted(unknown)[0]!r}")
+        frozen_overrides = MappingProxyType(dict(overrides))
 
         def decorate(body: Callable[..., Any]) -> Device:
             if not callable(body):
                 raise TypeError("Device.subtool may decorate only a callable")
-            from ._registry import DeviceDefinition
-
-            docs = getattr(body, "__doc__", None)
-            summary = None
-            if isinstance(docs, str):
-                summary = next(
-                    (line.strip() for line in docs.splitlines() if line.strip()),
-                    None,
-                )
-            handle = Device(
-                name=child_name,
-                family=self.family,
-                rev=self.rev,
-                place=self.place,
-                precedence=self.precedence,
-                replaces=None,
-                schema=None,
-                docs=docs,
-                summary=summary,
-                body=body,
-            )
-            definition = DeviceDefinition(
-                name=child_name,
-                family=self.family,
-                rev=self.rev,
-                place=self.place,
-                summary=summary,
-                docs=docs,
-                schema=None,
-                examples=(),
-                available=None,
-                precedence=self.precedence,
-                replaces=None,
-                intents=parent.intents,
-                effects=parent.effects,
-                tier=parent.tier,
-                deadline=parent.deadline,
-                aliases=None,
-                body=body,
-            )
-            registry.register_tool(
-                child_name,
-                self.family,
-                self.rev,
-                handle,
-                definition=definition,
-            )
-            return handle
+            return self._register_route(route_path, body, frozen_overrides)
 
         return decorate
+
+    def mount(self, mounted_router: Router) -> tuple[Device, ...]:
+        """Mount every standalone-router route below this device."""
+        if not isinstance(mounted_router, Router):
+            raise TypeError("Device.mount expects an omp.Router")
+        if registry.sealed:
+            raise DeclarationSealed("declaration registry is sealed")
+        return tuple(
+            self._register_route(
+                f"{mounted_router.prefix}/{route.path}",
+                route.body,
+                route.overrides,
+            )
+            for route in mounted_router._routes
+        )
+
+    def _register_route(
+        self,
+        path: str,
+        body: Callable[..., Any],
+        overrides: Mapping[str, object],
+    ) -> Device:
+        from ._registry import DeviceDefinition
+
+        parent = registry.device_definition(self.name, self.family, self.rev)
+        family = overrides.get("family", parent.family)
+        if not isinstance(family, str):
+            raise TypeError("subtool family must be a string")
+        place_value = overrides.get("place", parent.place)
+        try:
+            place = Place.parse(place_value)
+        except (TypeError, ValueError) as error:
+            raise DeviceError(str(error)) from error
+        precedence = overrides.get("precedence", parent.precedence)
+        if isinstance(precedence, bool) or not isinstance(precedence, int):
+            raise TypeError("subtool precedence must be an int")
+        if precedence >= Precedence.CORE:
+            raise DeviceNameError(
+                f"subtool precedence must be below Precedence.CORE: {precedence}"
+            )
+        tier = overrides.get("tier", parent.tier)
+        if not isinstance(tier, Tier):
+            raise TypeError("subtool tier must be an omp.Tier")
+        effects = overrides.get("effects", parent.effects)
+        if effects is not None and not isinstance(effects, Effects):
+            raise TypeError("subtool effects must be omp.Effects or None")
+        docs = overrides.get("docs", parent.docs)
+        summary = overrides.get("summary", parent.summary)
+        if summary is not None and not isinstance(summary, str):
+            raise TypeError("subtool summary must be a string or None")
+
+        child_name = f"{self.name}/{path}"
+        handle = Device(
+            name=child_name,
+            family=family,
+            rev=self.rev,
+            place=place,
+            precedence=precedence,
+            replaces=None,
+            schema=None,
+            docs=docs,
+            summary=summary,
+            body=body,
+        )
+        definition = DeviceDefinition(
+            name=child_name,
+            family=family,
+            rev=self.rev,
+            place=place,
+            summary=summary,
+            docs=docs,
+            schema=None,
+            examples=(),
+            available=None,
+            precedence=precedence,
+            replaces=None,
+            intents=parent.intents,
+            effects=effects,
+            tier=tier,
+            deadline=parent.deadline,
+            aliases=None,
+            body=body,
+        )
+        registry.register_child_device(
+            (self.name, self.family, self.rev),
+            path,
+            handle,
+            definition=definition,
+        )
+        return handle
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Invoke the decorated body directly in process."""
@@ -533,6 +635,31 @@ class Devices:
         """Recompute ordinary availability predicates as one transition."""
         raise NotWiredError("omp.devices.refresh")
 
+    async def invoke(
+        self,
+        path: str,
+        args: Mapping[str, object],
+        *,
+        deadline: Duration | None = None,
+    ) -> object:
+        """Invoke a device through the independently gated host dispatcher.
+
+        Every inner call receives its own admission and policy decision; it
+        inherits no ambient authority from the parent invocation. This
+        CONTROL+DATA surface is legal only in host placement. The host rejects
+        calls from ``place="env"`` and named-worker placements.
+        """
+        from . import _control_backend, _control_request
+
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.devices.invoke")
+        return await _control_request(
+            "omp.devices.invoke",
+            path=path,
+            args=args,
+            deadline=deadline,
+        )
+
     def list(self, *, mounted_only: bool = True) -> tuple[DeviceInfo, ...]:
         """Return immutable catalog rows, optionally including unmounted claims."""
         declared = _declared_rows()
@@ -580,7 +707,9 @@ __all__ = (
     "PER_DEVICE_CAP",
     "Precedence",
     "PrecedenceConflict",
+    "Router",
     "SchemaError",
     "ToolPath",
+    "router",
     "devices",
 )

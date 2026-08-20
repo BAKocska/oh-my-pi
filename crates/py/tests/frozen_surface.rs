@@ -41,7 +41,7 @@ for name in omp.__all__:
 for suffix in (
     "agents", "context", "policy", "limits", "telemetry", "provider",
     "env", "ui", "hooks", "events", "prompts", "packages",
-    "sessions", "journal", "index", "diagnostics", "urls", "devices",
+    "sessions", "journal", "artifacts", "index", "diagnostics", "urls", "devices",
 ):
     module = importlib.import_module(f"omp.{suffix}")
     for name in module.__all__:
@@ -53,7 +53,30 @@ for suffix in (
                 raise AssertionError(f"unresolved annotations: omp.{suffix}.{name}") from error
 
 registry_module = importlib.import_module("omp._registry")
-registry_module.configure_manifest(extension="acme-ext")
+packages_module = importlib.import_module("omp.packages")
+packages_module._install_snapshot(
+    [
+        {
+            "name": "acme-ext",
+            "version": "1.0.0",
+            "extension_id": "acme-ext",
+        }
+    ],
+    own="acme-ext",
+)
+registry_module.configure_manifest(
+    extension="acme-ext",
+    declarations=(
+        {
+            "kind": "skills",
+            "path": "acme_ext/skills/review/SKILL.md",
+            "metadata": {
+                "name": "review",
+                "description": "Review a change.",
+            },
+        },
+    ),
+)
 
 # Compaction is a domain hook, not a phased observation hook.
 @omp.hook("compaction")
@@ -683,8 +706,14 @@ completed = omp.env.Completed(
 process_info = omp.env.ProcessInfo("p", 1, omp.env.ProcState.RUNNING, completed)
 process_output = omp.env.ProcessOutput(1, omp.env.Channel.STDOUT, b"ok", 1)
 assert process_info.status is completed and process_output.data == b"ok"
-response = omp.env.HttpResponse(200, {"content-type": "application/json"}, b'{"ok": true}')
+response = omp.env.HttpResponse(
+    200,
+    {"content-type": "application/json"},
+    b'{"ok": true}',
+    "https://example.test/final",
+)
 assert response.json() == {"ok": True}
+assert response.final_url == "https://example.test/final"
 asyncio.run(
     expect_raises_async(
         TypeError, omp.env.proc.ensure("invalid-ready", "true", ready=object())
@@ -1368,10 +1397,470 @@ asyncio.run(
     expect_raises_async(TypeError, omp.agents.completion((object(),), role="vision"))
 )
 
+# Dynamic commands retain full static-command metadata and use the host registration arm.
+async def complete_dynamic(query, ctx):
+    return ()
+async def invoke_dynamic(invocation, ctx):
+    return omp.ui.Prompt("dynamic")
+dynamic_spec = omp.ui.CommandMountSpec(
+    "foreign-prompt",
+    invoke_dynamic,
+    aliases=("fp",),
+    description="Imported prompt",
+    args=(omp.ui.Arg("topic", "Prompt topic", "<topic>"),),
+    hint="/foreign-prompt <topic>",
+    arg_completions=complete_dynamic,
+)
+assert dynamic_spec.aliases == ("fp",)
+assert dynamic_spec.args == (omp.ui.Arg("topic", "Prompt topic", "<topic>"),)
+assert dynamic_spec.hint == "/foreign-prompt <topic>"
+assert dynamic_spec.arg_completions is complete_dynamic
+asyncio.run(
+    expect_raises_async(omp.NotWiredError, omp.ui.dynamic_mount(dynamic_spec))
+)
+class DynamicCommandBackend:
+    def __init__(self):
+        self.calls = []
+    async def request(self, operation, arguments):
+        self.calls.append((operation, arguments))
+        return tuple(spec.name for spec in arguments["commands"])
+dynamic_backend = DynamicCommandBackend()
+dynamic_control_token = omp._control_backend.set(dynamic_backend)
+try:
+    assert asyncio.run(omp.ui.dynamic_mount(dynamic_spec)) == ("foreign-prompt",)
+finally:
+    omp._control_backend.reset(dynamic_control_token)
+assert dynamic_backend.calls == [
+    ("omp.ui.dynamic_mount", {"commands": (dynamic_spec,)})
+]
+assert omp.ui._command_handlers["foreign-prompt"] is invoke_dynamic
+
+# R-invoke: host composition opens a fresh, independently gated call.
+assert asyncio.iscoroutinefunction(omp.devices.invoke)
+asyncio.run(
+    expect_raises_async(
+        omp.NotWiredError,
+        omp.devices.invoke(
+            "notes/append",
+            {"value": "draft"},
+            deadline=omp.Duration("2s"),
+        ),
+    )
+)
+
+# Round 6 renderer inputs carry copied, read-only presentation state.
+presentation_source = {"calm.enabled": True}
+render_ctx = omp.ui.RenderCtx(
+    width=80,
+    charset=omp.ui.Charset.UNICODE,
+    appearance=omp.ui.Appearance.DARK,
+    graphics=omp.ui.Graphics.CELLS,
+    hyperlinks=True,
+    focused=False,
+    collapsed=True,
+    place=omp.ui.RenderPlace.TRANSCRIPT,
+    presentation=presentation_source,
+)
+message_input = omp.MessageView(
+    id="calm-message",
+    kind="reasoning",
+    role="assistant",
+    text="thinking",
+    presentation=presentation_source,
+)
+device_input = omp.View(
+    identity=omp.ToolIdentity("read", omp.Rev.parse("1")),
+    call_id="calm-call",
+    updates=(),
+    state=None,
+    verdict=None,
+    elapsed=omp.Duration("1ms"),
+    phase=omp.InvocationPhase.OPEN,
+    presentation=presentation_source,
+)
+presentation_source["calm.enabled"] = False
+def mutate_presentation(render_input):
+    render_input.presentation["calm.enabled"] = False
+for render_input in (render_ctx, message_input, device_input):
+    assert render_input.presentation == {"calm.enabled": True}
+    expect_raises(
+        TypeError,
+        lambda render_input=render_input: mutate_presentation(render_input),
+    )
+assert omp.ui.RenderCtx(
+    width=80,
+    charset=omp.ui.Charset.UNICODE,
+    appearance=omp.ui.Appearance.DARK,
+    graphics=omp.ui.Graphics.CELLS,
+    hyperlinks=False,
+    focused=False,
+    collapsed=False,
+    place=omp.ui.RenderPlace.EXPORT,
+).presentation == {}
+assert omp.MessageView(
+    id="default-message",
+    kind="notice",
+    role=None,
+    text="",
+).presentation == {}
+assert omp.View(
+    identity=omp.ToolIdentity("read", omp.Rev.parse("1")),
+    call_id="default-call",
+    updates=(),
+    state=None,
+    verdict=None,
+    elapsed=omp.Duration("1ms"),
+    phase=omp.InvocationPhase.OPEN,
+).presentation == {}
+
+# Detached outcomes retain the authoritative Environment owner and register through JobBoard.
+job_ref = omp.JobRef(
+	id="process:indexer:7",
+	owner_kind="named_process",
+	owner_name="indexer",
+	owner_generation=7,
+	description="knowledge index",
+	media_type="application/vnd.omp.knowledge-index+json",
+	lifetime="session",
+)
+assert dataclasses.is_dataclass(job_ref)
+assert dataclasses.is_dataclass(omp.Detached(job_ref))
+assert not hasattr(job_ref, "__dict__")
+expect_raises(
+	dataclasses.FrozenInstanceError,
+	lambda: setattr(job_ref, "owner_generation", 8),
+)
+assert omp.Detached(job_ref).job is job_ref
+assert (
+	job_ref.id,
+	job_ref.owner_kind,
+	job_ref.owner_name,
+	job_ref.owner_generation,
+	job_ref.description,
+	job_ref.media_type,
+	job_ref.lifetime,
+) == (
+	"process:indexer:7",
+	"named_process",
+	"indexer",
+	7,
+	"knowledge index",
+	"application/vnd.omp.knowledge-index+json",
+	"session",
+)
+
+async def detached_frames():
+	yield omp.Update(stage="walking")
+	yield omp.Done("settled")
+
+asyncio.run(
+	expect_raises_async(
+		omp.NotWiredError,
+		omp.jobs.register(detached_frames(), ctx),
+	)
+)
+class JobBoardBackend:
+	def __init__(self):
+		self.calls = []
+	async def request(self, operation, arguments):
+		self.calls.append((operation, arguments))
+		return job_ref
+job_board_backend = JobBoardBackend()
+job_board_token = omp._control_backend.set(job_board_backend)
+registered_frames = detached_frames()
+try:
+	assert asyncio.run(omp.jobs.register(registered_frames, ctx)) is job_ref
+finally:
+	omp._control_backend.reset(job_board_token)
+assert job_board_backend.calls == [
+	(
+		"omp.jobs.register",
+		{"frames": registered_frames, "context": ctx},
+	)
+]
+
+# Round 6 router: decorated and mounted routes freeze their own projections.
+surface_route_effects = omp.Effects(documents=omp.DocEffects(read=True))
+
+
+@surface_device.subtool(
+    "inspect/annotated",
+    family="surface-routes",
+    place="env",
+    precedence=omp.Precedence.ENHANCEMENT,
+    tier=omp.Tier.READ,
+    effects=surface_route_effects,
+    docs="Annotated child documentation.",
+    summary="Inspect annotated input.",
+)
+async def inspect_annotated_surface_device(
+    count: typing.Annotated[
+        int,
+        omp.Field(
+            alias=("routeCount",),
+            expected="a route count",
+            description="Number of routes to inspect.",
+        ),
+    ],
+):
+    return count
+
+
+surface_router = omp.router("mounted")
+
+
+@surface_router.subtool("status/detail")
+async def mounted_surface_status():
+    return "mounted"
+
+
+(mounted_surface_status_device,) = surface_device.mount(surface_router)
+late_router = omp.router("late")
+
+
+@late_router.subtool("route")
+async def late_surface_route():
+    return None
+
+
+# Round 6 hosted tools and Core-owned realtime establishment are fully typed.
+hosted_tools = frozenset({
+    omp.HostedTool.WEB_SEARCH,
+    omp.HostedTool.CODE_EXECUTION,
+    omp.HostedTool.RETRIEVAL,
+    omp.HostedTool.URL_CONTEXT,
+    omp.HostedTool.DEEP_RESEARCH,
+})
+hosted_chat = omp.ChatCaps(hosted_tools=hosted_tools)
+assert hosted_chat.hosted_tools == hosted_tools
+assert typing.get_type_hints(omp.ChatCaps)["hosted_tools"] == (
+    omp.Cap | frozenset[omp.HostedTool]
+)
+
+realtime_features = frozenset({
+    omp.RealtimeFeature.AUDIO_IN,
+    omp.RealtimeFeature.AUDIO_OUT,
+    omp.RealtimeFeature.TEXT,
+    omp.RealtimeFeature.TOOLS,
+    omp.RealtimeFeature.SERVER_VAD,
+    omp.RealtimeFeature.SEMANTIC_VAD,
+    omp.RealtimeFeature.INTERRUPTION,
+})
+realtime_caps = omp.RealtimeCaps(
+    realtime_features,
+    ("alloy",),
+    frozenset({omp.Transport.WEBRTC}),
+)
+realtime_model = omp.ModelSpec(
+    "round6-realtime",
+    "Round 6 Realtime",
+    (),
+    operations=frozenset({omp.Operation.REALTIME}),
+    realtime=realtime_caps,
+)
+assert realtime_model.realtime is realtime_caps
+assert typing.get_type_hints(omp.ModelSpec)["realtime"] == omp.RealtimeCaps | None
+
+turn_detection = omp.TurnDetection(
+    omp.RealtimeTurnDetectionMode.SERVER_VAD,
+    threshold=0.5,
+    silence_ms=500,
+    prefix_padding_ms=300,
+)
+realtime_request = omp.RealtimeRequest(
+    instructions="Answer briefly.",
+    modalities=(omp.RealtimeModality.TEXT, omp.RealtimeModality.AUDIO),
+    voice="alloy",
+    input_audio=omp.Setting.require(omp.AudioFormat.PCM16),
+    output_audio=omp.Setting.prefer(omp.AudioFormat.PCM16),
+    turn_detection=omp.Setting.require(turn_detection),
+    tools=("lookup",),
+    negotiation=omp.NegotiationPolicy(
+        emulation=omp.EmulationPolicy.ALLOW_LOSSLESS,
+        unknown=omp.UnknownCapabilityPolicy.ALLOW_PREFERENCES,
+        vendor_option_mismatch=omp.MismatchPolicy.DROP_PREFERRED,
+    ),
+)
+assert realtime_request.input_audio.kind is omp.SettingKind.REQUIRE
+assert realtime_request.output_audio.kind is omp.SettingKind.PREFER
+realtime_session = omp.RealtimeSession(
+    "rtc_round6",
+    omp.RealtimeEndpointRef("endpoint_round6"),
+    omp.RealtimeCredentialRef("credential_round6"),
+    2_000_000_000_000,
+    omp.Transport.WEBRTC,
+)
+assert realtime_session.transport is omp.Transport.WEBRTC
+asyncio.run(
+    expect_raises_async(
+        TypeError,
+        bare_handle.request(omp.Operation.REALTIME, speech_request),
+    )
+)
+asyncio.run(
+    expect_raises_async(
+        omp.NotWiredError,
+        bare_handle.request(omp.Operation.REALTIME, realtime_request),
+    )
+)
+
+# Env HTTP redirects are bounded per verb and every response identifies its final URL.
+assert all(
+    verb.__kwdefaults__["redirects"] == 10
+    for verb in (omp.env.http_get, omp.env.http_post, omp.env.http_put)
+)
+expect_raises(
+    TypeError,
+    lambda: asyncio.run(omp.env.http_get("https://example.test", redirects=True)),
+)
+expect_raises(
+    ValueError,
+    lambda: asyncio.run(omp.env.http_get("https://example.test", redirects=11)),
+)
+assert tuple(field.name for field in dataclasses.fields(omp.env.HttpResponse)) == (
+    "status",
+    "headers",
+    "body",
+    "final_url",
+)
+
+# The durable call outcome is a closed, public four-arm union.
+argument_issue = {"path": ("query",), "expected": "a non-empty string"}
+args_rejected = omp.ArgsRejected(argument_issue)
+cancelled = omp.Aborted({"reason": "user cancelled"}, omp.AbortKind.CANCELLED)
+assert args_rejected.issue is argument_issue
+assert cancelled.kind is omp.AbortKind.CANCELLED
+assert {
+    typing.get_origin(arm) or arm for arm in typing.get_args(omp.CallOutcome)
+} == {omp.Ok, omp.Faulted, omp.ArgsRejected, omp.Aborted}
+expect_raises(
+    ValueError,
+    lambda: omp.Aborted(
+        {"reason": "policy denied"},
+        omp.AbortKind.POLICY_DENIED,
+    ),
+)
+
+# Artifact references are typed throughout the public journal and namespace.
+artifact_ref = omp.ArtifactRef(
+    id="7",
+    hash="blake3-report",
+    media_type="text/plain",
+    byte_len=12,
+)
+assert str(artifact_ref.url) == "artifact://7"
+assert omp.artifacts.url(artifact_ref) == artifact_ref.url
+assert typing.get_type_hints(omp.JournalEntry)["artifact"] == omp.ArtifactRef | None
+assert tuple(field.name for field in dataclasses.fields(omp.ArtifactRef)) == (
+    "id",
+    "hash",
+    "media_type",
+    "byte_len",
+)
+assert {
+    "put",
+    "open_write",
+    "adopt",
+    "get",
+    "open",
+    "read",
+    "stat",
+    "list",
+    "pin",
+    "url",
+}.issubset(omp.artifacts.__all__)
+asyncio.run(
+    expect_raises_async(
+        omp.NotWiredError,
+        omp.artifacts.get(artifact_ref),
+    )
+)
+
+# Catalog notices remain message tokens and expose their ruled explanatory echo.
+context_usage = omp.ContextUsage(
+    total_tokens=120,
+    context_window=1_000,
+    reserve_tokens=100,
+    usable_tokens=900,
+    fraction=120 / 900,
+    prompt_head_tokens=20,
+    device_catalog_tokens=10,
+    message_tokens=80,
+    catalog_notice_tokens=7,
+    media_tokens=10,
+    compaction_epoch=2,
+    threshold_fraction=0.8,
+    in_flight=False,
+)
+assert context_usage.catalog_notice_tokens == 7
+assert (
+    tuple(field.name for field in dataclasses.fields(omp.ContextUsage)).index(
+        "catalog_notice_tokens"
+    )
+    == tuple(field.name for field in dataclasses.fields(omp.ContextUsage)).index(
+        "message_tokens"
+    )
+    + 1
+)
+
+# Configured manifest content is typed, frozen, and enumerable without a walk.
+assert omp.ContentDeclaration.__dataclass_params__.frozen
+assert tuple(field.name for field in dataclasses.fields(omp.ContentDeclaration)) == (
+    "kind",
+    "path",
+    "metadata",
+)
+assert tuple(kind.value for kind in omp.ContentKind) == (
+    "skills",
+    "rules",
+    "context-files",
+    "prompts",
+)
+(content_row,) = omp.packages.own().declarations
+assert content_row.kind is omp.ContentKind.SKILLS
+assert content_row.path == "acme_ext/skills/review/SKILL.md"
+assert dict(content_row.metadata) == {
+    "name": "review",
+    "description": "Review a change.",
+}
+
 # FREEZE evaluates deferred availability exactly once and seals the projection.
 snapshot = registry_module.freeze_declarations()
 assert bare_definition in snapshot.providers
 assert ("surface_device/inspect/detail", "", 1) in snapshot.tools
+assert ("surface_device/inspect/annotated", "surface-routes", 1) in snapshot.tools
+assert ("surface_device/mounted/status/detail", "", 1) in snapshot.tools
+child_definitions = {
+    child.path: child.definition for child in snapshot.child_device_definitions
+}
+bare_child = child_definitions["inspect/detail"]
+assert bare_child.place == omp.Place.HOST
+assert bare_child.family == surface_device.family
+assert bare_child.precedence == surface_device.precedence
+assert bare_child.tier == omp.Tier.WRITE
+assert bare_child.effects is None
+overridden_child = child_definitions["inspect/annotated"]
+assert overridden_child.place == omp.Place.ENV
+assert overridden_child.family == "surface-routes"
+assert overridden_child.precedence == omp.Precedence.ENHANCEMENT
+assert overridden_child.tier == omp.Tier.READ
+assert overridden_child.effects is surface_route_effects
+assert overridden_child.docs == "Annotated child documentation."
+assert overridden_child.summary == "Inspect annotated input."
+(route_count_spec,) = overridden_child.arg_specs
+assert route_count_spec.path == ("count",)
+assert route_count_spec.aliases == ("routeCount",)
+assert route_count_spec.expected == "a route count"
+assert route_count_spec.description == "Number of routes to inspect."
+mounted_child = child_definitions["mounted/status/detail"]
+assert mounted_child.family == surface_device.family
+assert mounted_child.place == omp.Place.HOST
+assert mounted_child.tier == omp.Tier.WRITE
+assert str(mounted_surface_status_device.path) == (
+    "surface_device/mounted/status/detail"
+)
+assert mounted_child.body is mounted_surface_status
+expect_raises(omp.DeclarationSealed, lambda: surface_device.mount(late_router))
 assert shortcut_definition in snapshot.shortcuts
 assert approver_definition in snapshot.approvers
 assert availability_calls == 1

@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum, IntEnum, StrEnum
-from typing import Any, Generic, TypeVar
+from types import MappingProxyType
+from typing import Any, Generic, Mapping, TypeVar
 
-from _omp import Duration, InvocationPhase
+from _omp import ArtifactUrl, Duration, InvocationPhase
 
+from ._context import Context
 from ._errors import NotWiredError
 
 
@@ -59,6 +62,52 @@ class Done(Generic[_R]):
     useless: bool = False
 
 
+
+@dataclass(frozen=True, slots=True)
+class JobRef:
+    """Name detached Environment-owned work and its expected artifact."""
+
+    id: str
+    owner_kind: str
+    owner_name: str
+    owner_generation: int
+    description: str
+    media_type: str | None
+    lifetime: str
+
+
+@dataclass(frozen=True, slots=True)
+class Detached:
+    """Terminate this turn while supervised work continues on the job board."""
+
+    job: JobRef
+
+
+class _Jobs:
+    """Host-backed detached-job registration operations."""
+
+    __slots__ = ()
+
+    async def register(
+        self, frames: AsyncIterator[Update[Any] | Done[Any]], ctx: Context
+    ) -> JobRef:
+        """Register an env-placed device stream as supervised detached work."""
+
+        from . import _control_backend, _control_request
+
+        operation = "omp.jobs.register"
+        if _control_backend.get() is None:
+            raise NotWiredError(operation)
+        return await _control_request(operation, frames=frames, context=ctx)
+
+
+jobs = _Jobs()
+"""Host-backed detached-job registration namespace."""
+
+
+
+
+
 @dataclass(frozen=True, slots=True)
 class Ok(Generic[_P]):
     """A settled successful call and its durable payload."""
@@ -71,6 +120,58 @@ class Faulted(Generic[_F]):
     """A settled expected failure and its durable fault value."""
 
     fault: _F
+
+
+class AbortKind(StrEnum):
+    """Classify why a call settled without a normal device verdict."""
+
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+    POLICY_DENIED = "policy_denied"
+
+
+@dataclass(frozen=True, slots=True)
+class ArgsRejected:
+    """Record a harness-owned structured argument rejection."""
+
+    issue: object
+
+
+@dataclass(frozen=True, slots=True)
+class Aborted:
+    """Record a harness- or Core-owned abnormal call settlement."""
+
+    abort: object
+    kind: AbortKind
+    policy: object | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce that only policy denials carry a structured policy value."""
+        has_policy = self.policy is not None
+        if has_policy != (self.kind is AbortKind.POLICY_DENIED):
+            raise ValueError(
+                "policy must be present exactly when kind is AbortKind.POLICY_DENIED"
+            )
+
+
+CallOutcome = Ok[_P] | Faulted[_F] | ArgsRejected | Aborted
+"""Closed union of the four durable call-outcome arms."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRef:
+    """Reference durable bytes in the session artifact namespace."""
+
+    id: str
+    hash: str
+    media_type: str
+    byte_len: int
+
+    @property
+    def url(self) -> ArtifactUrl:
+        """Return this reference's typed ``artifact://`` address."""
+
+        return ArtifactUrl(f"artifact://{self.id}")
 
 
 class Dialect(StrEnum):
@@ -295,6 +396,9 @@ class ToolIdentity:
         return f"{self.name}@{self.rev}"
 
 
+_EMPTY_PRESENTATION: Mapping[str, object] = MappingProxyType({})
+
+
 @dataclass(frozen=True, slots=True)
 class View(Generic[_U, _P, _F]):
     """Immutable live-or-settled renderer fold input."""
@@ -303,9 +407,22 @@ class View(Generic[_U, _P, _F]):
     call_id: str
     updates: tuple[_U, ...]
     state: object | None
-    verdict: Ok[_P] | Faulted[_F] | object | None
+    verdict: CallOutcome[_P, _F] | None
     elapsed: Duration
     phase: InvocationPhase
+    presentation: Mapping[str, object] = dataclasses.field(
+        default_factory=lambda: _EMPTY_PRESENTATION
+    )
+
+    def __post_init__(self) -> None:
+        """Freeze the host-materialized presentation snapshot."""
+
+        if self.presentation is not _EMPTY_PRESENTATION:
+            object.__setattr__(
+                self,
+                "presentation",
+                MappingProxyType(dict(self.presentation)),
+            )
 
 
 @dataclass(frozen=True, slots=True)

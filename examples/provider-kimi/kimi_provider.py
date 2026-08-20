@@ -81,7 +81,7 @@ _KIMI_SPEC = ProviderSpec(
             ),
             cost=Cost(input="0.60", output="2.50", cache_read="0.15"),
             context=ContextSpec.prefix_cache(
-                retention=frozenset({CacheRetention.STANDARD})
+                retention=frozenset({CacheRetention.SESSION})
             ),
             chat=ChatCaps(
                 tools=ToolCaps(

@@ -73,11 +73,11 @@ _TOOLS = ToolCaps(
     )
 )
 _CACHE = PromptCacheCaps(
-    retention=frozenset({CacheRetention.EPHEMERAL}),
-    maximum_breakpoints=4,
+    retention=frozenset({CacheRetention.SHORT}),
+    max_breakpoints=4,
 )
 _CONTEXT = ContextSpec.prefix_cache(
-    retention=frozenset({CacheRetention.EPHEMERAL}),
+    retention=frozenset({CacheRetention.SHORT}),
     max_breakpoints=4,
 )
 

@@ -10,7 +10,4 @@ A small import-time pack check rejects duplicate provider ids and duplicate bare
 
 ## Gaps
 
-- `omp.SpecError` is missing: frozen `crates/py/python/omp/_errors.py:1-11` defines only `ExtensionError` and `NotWiredError`, while `docs/py/13-inference.md:353-358` requires provider declaration validation to raise `SpecError`.
-- `ProviderSpec.__post_init__` does not reject duplicate `ModelSpec.id` values: frozen `crates/py/python/omp/provider.py:948-976` validates only overlays and aliases, while `docs/py/13-inference.md:353-358,764-769` promises fail-closed spec validation and defines `id` as the model half of the selector. `_validate_pack` supplies the missing declaration-time rejection for this example.
-- Direct class (a) declaration is not wired: frozen `omp.provider` at `crates/py/python/omp/provider.py:1514-1533` only returns a handle, and registration occurs only in `ProviderHandle.__call__` at `crates/py/python/omp/provider.py:1002-1009`; `docs/py/13-inference.md:256-269` documents bare `omp.provider(ProviderSpec(...))` as the class (a) registration form. This example uses empty decorated classes so all four declarations reach the registry.
-- `PromptCacheCaps` and `CacheRetention` disagree with their docs: frozen `crates/py/python/omp/provider.py:182-187,617-622` exposes `EPHEMERAL/STANDARD/LONG` and `minimum_prefix_tokens`/`maximum_breakpoints`; `docs/py/13-inference.md:839-842` documents `REQUEST/SESSION/SHORT/LONG` and `min_prefix_tokens`/`max_breakpoints`.
+None — every symbol this port needs is frozen.

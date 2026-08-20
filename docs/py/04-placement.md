@@ -224,7 +224,9 @@ deletion, or a fresh protocol handshake. A disposable worker owning a supervised
 named process would orphan it on eviction, and a worker able to invoke devices
 would be a re-entrant path into the tool registry — the exact ambient-authority
 hole the leaf rule closes. Enforcement is env-side, in Rust; the handle is never
-wider than the invocation's effect token.
+wider than the invocation's effect token. Host-placed composition instead uses
+`omp.devices.invoke`, whose every inner call opens a fresh independently
+admitted and policy-gated invocation (`docs/py/01-devices.md`).
 
 One rule follows from the table and is easy to get wrong: **a value read directly
 off local disk carries no revision, so it can never be the base of a

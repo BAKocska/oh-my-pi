@@ -100,6 +100,7 @@ class ContextUsage:
     prompt_head_tokens: int
     device_catalog_tokens: int
     message_tokens: int
+    catalog_notice_tokens: int
     media_tokens: int
     compaction_epoch: int
     threshold_fraction: float

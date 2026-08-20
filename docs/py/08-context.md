@@ -347,6 +347,7 @@ class ContextUsage:
     prompt_head_tokens: int
     device_catalog_tokens: int
     message_tokens: int
+    catalog_notice_tokens: int
     media_tokens: int
     compaction_epoch: int
     threshold_fraction: float
@@ -360,6 +361,10 @@ threshold against the *user's* setting rather than a hardcoded 0.8. `in_flight` 
 a turn is streaming, meaning `total_tokens` is an extrapolation. `compaction_epoch`
 increments on every durable `Compact` or `Reset` event.
 
+
+`catalog_notice_tokens` is the subset of `message_tokens` consumed by
+device-catalog mount notifications; it is an explanatory echo and is never
+added again when computing `total_tokens`.
 ### `omp.ContextView`
 
 ```python
@@ -2094,12 +2099,10 @@ The rest are genuine open questions.
    system-notification thread item rather than a tool-array mutation
    (`docs/py/01-devices.md`), which means part of that cost lands in the message list and the
    breakdown users see must say so — otherwise `/context` under-reports after every mount.
-   The accounting split is unresolved: whether a mount notification's tokens are attributed to
-   `device_catalog_tokens` (truthful about cause, but the tokens are not in the head) or to
-   `message_tokens` (truthful about location, but hides why the number moved). Leaning toward
-   reporting both, with the notification tokens counted in `message_tokens` and echoed as a
-   separate `catalog_notice_tokens` field, but that is a fourth number on a screen that
-   already has too many.
+   **Resolved (2026-08-20 ruling):** mount-notification tokens are counted in
+   `message_tokens`, which reports where they live, and echoed in a separate
+   `catalog_notice_tokens` field, which reports why that number moved.
+   `device_catalog_tokens` continues to count only the catalog in the prompt head.
 
    **Correction to an earlier draft of this document.** I proposed hashing the `tools` band
    from `Registry::live_hash()` (`crates/tool/src/registry.rs:458`). That is wrong, and the

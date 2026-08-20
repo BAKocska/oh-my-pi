@@ -13,6 +13,7 @@ from typing import Generic, TypeVar
 from ._errors import NotWiredError
 
 
+from ._verdicts import ArtifactRef
 _T = TypeVar("_T")
 _A = TypeVar("_A")
 
@@ -56,7 +57,7 @@ class JournalEntry(Generic[_T]):
     raw: bytes
     display: bool
     in_context: bool
-    artifact: object | None = None
+    artifact: ArtifactRef | None = None
 
 
 def _unavailable() -> NotWiredError:

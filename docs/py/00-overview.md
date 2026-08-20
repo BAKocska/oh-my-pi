@@ -785,7 +785,7 @@ The typed inter-extension surface (*Extension services*, Concepts).
 
 #### `@omp.service(name: str, *, rev: int)`
 
-Declares a service implementation. The decorated class's public `async def` methods are the service's methods; inside them, `omp.context()` is the **caller-scoped** context — `ctx.extension` names the caller, `ctx.deadline` is the caller's deadline, and cancelling the caller's scope cancels the method. The service must be named in the manifest's `[[services]]` table; a decorator without a manifest row fails VERIFY.
+Declares a service implementation. The decorated class's public `async def` methods are the service's methods; inside them, `omp.Context.current()` is the **caller-scoped** context — `ctx.extension` names the caller, `ctx.deadline` is the caller's deadline, and cancelling the caller's scope cancels the method. The service must be named in the manifest's `[[services]]` table; a decorator without a manifest row fails VERIFY.
 
 #### `omp.services.connect(name: str, *, rev: int) -> ServiceClient`
 

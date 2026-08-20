@@ -12,6 +12,4 @@ The request overlay checks the invocation's actual `telemetry.capture_content` g
 
 ## Gaps
 
-- `omp.telemetry.PromptFingerprint.slots` is only `Mapping[str, str]`, so per-slot byte sizes and stability bands are absent (`crates/py/python/omp/telemetry.py:108-121`; `docs/py/10-telemetry.md` §2 `PromptFingerprint`; stability catalog in `docs/py/08-context.md` §3). The overlay reports byte sizes as unavailable and labels only catalog-recognized bands.
-- Frozen `omp.telemetry.ModelRequest` exposes only `seq`, `usage`, `prompt`, and `served_model`, and therefore lacks `degraded` (`crates/py/python/omp/telemetry.py:124-131`), diverging from `docs/py/10-telemetry.md` §2 `ModelRequest`, which specifies `tokens` and `degraded` among the full event fields. The overlay reports degradations as unavailable.
-- `docs/py/10-telemetry.md` §4 says `Capture.CONTENT` adds `args_raw` and `Tokens.detail`, but its §2 `ModelRequest` has no `args_raw`, request-content, or response-content field, and the frozen `ModelRequest` has none either (`crates/py/python/omp/telemetry.py:124-131`). With the grant, only the frozen `Tokens.detail` field can be shown; without it, the explicit redaction notice is rendered.
+None — every symbol this port needs is frozen.

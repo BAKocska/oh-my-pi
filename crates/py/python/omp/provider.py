@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
-from typing import Any, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 from _omp import BlobRef, Duration, EnvPath, Secret
 
@@ -22,6 +22,7 @@ from ._registry import registry
 from ._errors import SpecError, NotWiredError
 
 _T = TypeVar("_T", bound=type)
+_V = TypeVar("_V")
 _EMPTY_MAP: Mapping[Any, Any] = MappingProxyType({})
 
 
@@ -166,6 +167,16 @@ class ToolFeature(StrEnum):
     NAMED_CHOICE = "named_choice"
     REQUIRED_CHOICE = "required_choice"
     DISABLED_CHOICE = "disabled_choice"
+
+
+class HostedTool(StrEnum):
+    """Provider-hosted tool vocabulary that does not consume schema slots."""
+
+    WEB_SEARCH = "web_search"
+    CODE_EXECUTION = "code_execution"
+    RETRIEVAL = "retrieval"
+    URL_CONTEXT = "url_context"
+    DEEP_RESEARCH = "deep_research"
 
 
 class ToolSchemaFlavor(StrEnum):
@@ -660,7 +671,7 @@ class ChatCaps:
     text_verbosity: Cap | frozenset[str] = Cap.UNKNOWN
     reasoning: Cap | ReasoningCaps = Cap.UNKNOWN
     input_modalities: Cap | frozenset[Modality] = Cap.UNKNOWN
-    hosted_tools: Cap | frozenset[str] = Cap.UNKNOWN
+    hosted_tools: Cap | frozenset[HostedTool] = Cap.UNKNOWN
     prompt_caching: Cap | PromptCacheCaps = Cap.UNKNOWN
     service_tiers: Cap | tuple[ServiceTier, ...] = Cap.UNKNOWN
     sampling: Cap | frozenset[str] = Cap.UNKNOWN
@@ -935,6 +946,163 @@ class TranscriptionResult:
     cost_nanos_usd: int
 
 
+class RealtimeFeature(StrEnum):
+    """Closed bidirectional realtime-session capability vocabulary."""
+
+    AUDIO_IN = "audio_in"
+    AUDIO_OUT = "audio_out"
+    TEXT = "text"
+    TOOLS = "tools"
+    SERVER_VAD = "server_vad"
+    SEMANTIC_VAD = "semantic_vad"
+    INTERRUPTION = "interruption"
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeCaps:
+    """Realtime behaviors, voices, and transports supported by a model."""
+
+    features: frozenset[RealtimeFeature]
+    voices: tuple[str, ...]
+    transports: frozenset[Transport]
+
+
+class RealtimeModality(StrEnum):
+    """Modalities enabled for one bidirectional realtime session."""
+
+    TEXT = "text"
+    AUDIO = "audio"
+
+
+class RealtimeEagerness(StrEnum):
+    """Semantic voice-activity detector responsiveness."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    AUTO = "auto"
+
+
+class RealtimeTurnDetectionMode(StrEnum):
+    """Realtime turn-boundary detection strategy."""
+
+    MANUAL = "manual"
+    SERVER_VAD = "server_vad"
+    SEMANTIC_VAD = "semantic_vad"
+
+
+@dataclass(frozen=True, slots=True)
+class TurnDetection:
+    """Typed realtime turn-detection settings."""
+
+    mode: RealtimeTurnDetectionMode
+    threshold: float | None = None
+    silence_ms: int | None = None
+    prefix_padding_ms: int | None = None
+    eagerness: RealtimeEagerness | None = None
+
+
+class SettingKind(StrEnum):
+    """Whether one canonical request setting is absent, required, or preferred."""
+
+    UNSET = "unset"
+    REQUIRE = "require"
+    PREFER = "prefer"
+
+
+@dataclass(frozen=True, slots=True)
+class Setting(Generic[_V]):
+    """One absent, required, or preferred canonical request setting."""
+
+    kind: SettingKind = SettingKind.UNSET
+    value: _V | None = None
+
+    @classmethod
+    def unset(cls) -> "Setting[_V]":
+        """Construct an unconstrained setting."""
+        return cls()
+
+    @classmethod
+    def require(cls, value: _V) -> "Setting[_V]":
+        """Construct a setting that must be honored."""
+        return cls(SettingKind.REQUIRE, value)
+
+    @classmethod
+    def prefer(cls, value: _V) -> "Setting[_V]":
+        """Construct a setting that may be adjusted with receipt evidence."""
+        return cls(SettingKind.PREFER, value)
+
+
+class EmulationPolicy(StrEnum):
+    """Capability emulation permitted during realtime negotiation."""
+
+    FORBID = "forbid"
+    ALLOW_LOSSLESS = "allow_lossless"
+    ALLOW_DECLARED_LOSSY = "allow_declared_lossy"
+
+
+class UnknownCapabilityPolicy(StrEnum):
+    """Treatment of unknown capabilities during realtime negotiation."""
+
+    REJECT = "reject"
+    ALLOW_PREFERENCES = "allow_preferences"
+
+
+class MismatchPolicy(StrEnum):
+    """Treatment of typed-option and selected-codec mismatches."""
+
+    REJECT = "reject"
+    DROP_PREFERRED = "drop_preferred"
+
+
+@dataclass(frozen=True, slots=True)
+class NegotiationPolicy:
+    """Capability negotiation policy for a canonical realtime request."""
+
+    emulation: EmulationPolicy = EmulationPolicy.FORBID
+    unknown: UnknownCapabilityPolicy = UnknownCapabilityPolicy.REJECT
+    vendor_option_mismatch: MismatchPolicy = MismatchPolicy.REJECT
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeRequest:
+    """Establish a Core-owned bidirectional realtime session."""
+
+    instructions: str | None = None
+    modalities: tuple[RealtimeModality, ...] = ()
+    voice: str | None = None
+    input_audio: Setting[AudioFormat] = Setting()
+    output_audio: Setting[AudioFormat] = Setting()
+    turn_detection: Setting[TurnDetection] = Setting()
+    tools: tuple[str, ...] = ()
+    negotiation: NegotiationPolicy = NegotiationPolicy()
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeEndpointRef:
+    """Opaque reference to a Core-owned realtime transport endpoint."""
+
+    id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeCredentialRef:
+    """Opaque reference to a scoped realtime credential held by Core."""
+
+    id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeSession:
+    """Negotiated descriptor for a Core-owned realtime media session."""
+
+    id: str
+    endpoint: RealtimeEndpointRef
+    credential: RealtimeCredentialRef
+    expires_at_ms: int
+    transport: Transport
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogAlias:
     """Canonical model alias with review rationale and provenance."""
@@ -1016,7 +1184,7 @@ class ModelSpec:
     video: object | None = None
     speech: SpeechCaps | None = None
     transcription: TranscriptionCaps | None = None
-    realtime: object | None = None
+    realtime: RealtimeCaps | None = None
     search: object | None = None
     tokenization: object | None = None
 
@@ -1133,17 +1301,18 @@ class ProviderHandle:
     async def request(
         self,
         operation: Operation,
-        request: ImageRequest | SpeechRequest | TranscriptionRequest,
-    ) -> ImageResult | SpeechResult | TranscriptionResult:
+        request: ImageRequest | SpeechRequest | TranscriptionRequest | RealtimeRequest,
+    ) -> ImageResult | SpeechResult | TranscriptionResult | RealtimeSession:
         """Route one typed provider operation through the host CONTROL and DATA arm."""
         expected = {
             Operation.GENERATE_IMAGE: ImageRequest,
             Operation.SPEAK: SpeechRequest,
             Operation.TRANSCRIBE: TranscriptionRequest,
+            Operation.REALTIME: RealtimeRequest,
         }.get(operation)
         if expected is None:
             raise ValueError(
-                "ProviderHandle.request freezes GENERATE_IMAGE, SPEAK, and TRANSCRIBE"
+                "ProviderHandle.request freezes GENERATE_IMAGE, SPEAK, TRANSCRIBE, and REALTIME"
             )
         if not isinstance(request, expected):
             raise TypeError(f"{operation.name} requires {expected.__name__}")
@@ -1849,21 +2018,30 @@ __all__ = (
     "Completion", "Confidence", "ContextSpec", "Cost", "CostTier", "Credential", "CredentialKind",
     "Cursor",
     "CredentialSource", "Dimensions", "DiscoveryDefaults", "DiscoveryKind", "DiscoveryPage",
-    "DiscoveryQuery", "DiscoverySpec", "DiscoveryTrigger", "Effort", "ErrorKind", "Facet", "Failover",
-    "FailoverKind", "ImageCaps", "ImageFeature", "ImageFormat", "ImageRequest", "ImageResult",
+    "DiscoveryQuery", "DiscoverySpec", "DiscoveryTrigger", "Effort", "EmulationPolicy",
+    "ErrorKind", "Facet", "Failover",
+    "FailoverKind", "HostedTool", "ImageCaps", "ImageFeature", "ImageFormat", "ImageRequest",
+    "ImageResult",
     "Fallback", "SpeechCaps", "SpeechFeature", "SpeechRequest", "SpeechResult", "Intent", "IntentKind", "LoginRequest", "LoginUi", "LogprobCaps",
-    "ManagementSpec", "Modality", "ModelCard", "ModelEvent", "ModelFallback", "ModelOverlay",
+    "ManagementSpec", "MismatchPolicy", "Modality", "ModelCard", "ModelEvent", "ModelFallback",
+    "ModelOverlay",
     "ModelPatch", "ModelRef", "ModelSpec", "OAuthFlow",
-    "OAuthFlowKind", "OAuthSpec", "Operation", "Pagination", "Price", "PriceUnit",
+    "NegotiationPolicy", "OAuthFlowKind", "OAuthSpec", "Operation", "Pagination", "Price",
+    "PriceUnit",
     "PrincipalResolution", "PromptCacheCaps", "ProviderError", "ProviderHandle", "ProviderSpec",
-    "ReasoningCaps",
+    "ReasoningCaps", "RealtimeCaps", "RealtimeCredentialRef", "RealtimeEagerness",
+    "RealtimeEndpointRef", "RealtimeFeature", "RealtimeModality", "RealtimeRequest",
+    "RealtimeSession", "RealtimeTurnDetectionMode",
     "RedirectTrust", "RefreshBehavior", "RefreshReason", "RefreshRequest", "RequestDraft",
     "RequestMutation", "Retryability", "Role", "RouteLimits", "RouteRef", "RouteSpec",
     "ScopedAlias",
-    "SearchPage", "SearchQuery", "SearchResult", "ServerStateCaps", "ServiceTier",
+    "SearchPage", "SearchQuery", "SearchResult", "ServerStateCaps", "ServiceTier", "Setting",
+    "SettingKind",
     "SignRequest", "SpecError", "TranscriptionCaps", "TranscriptionFeature",
         "TranscriptionRequest", "TranscriptionResult", "Signature", "Signer", "ThinkingMode", "ThinkingSpec", "TokenPlacement",
-    "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "TrustDomain", "UsageQuery",
+    "TurnDetection",
+    "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "TrustDomain",
+    "UnknownCapabilityPolicy", "UsageQuery",
     "UsageReport", "UsageScope", "UsageUnit", "UsageWindow", "WatchModels", "models",
     "provider", "watch_models",
 )
