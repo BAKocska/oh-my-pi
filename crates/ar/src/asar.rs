@@ -133,6 +133,7 @@ fn walk_files(
 				directory:             true,
 				size:                  0,
 				modified_unix_seconds: None,
+				mode:                  None,
 				storage:               Storage::Synthetic,
 			});
 			walk_files(children, path.as_str(), data_offset, file_size, limits, entries)?;
@@ -152,7 +153,8 @@ fn walk_files(
 				directory: false,
 				size: 0,
 				modified_unix_seconds: None,
-				storage: Storage::AsarLink { target_path: target },
+				mode: None,
+				storage: Storage::Link { target_path: target, resolve_target: true },
 			});
 			continue;
 		}
@@ -165,6 +167,11 @@ fn walk_files(
 			None | Some(Value::Bool(false)) => false,
 			Some(Value::Bool(true)) => true,
 			Some(_) => return Err(Error::InvalidArchive("ASAR unpacked flag is not boolean")),
+		};
+		let executable = match object.get("executable") {
+			None | Some(Value::Bool(false)) => false,
+			Some(Value::Bool(true)) => true,
+			Some(_) => return Err(Error::InvalidArchive("ASAR executable flag is not boolean")),
 		};
 		let member_offset = if unpacked {
 			0
@@ -191,61 +198,11 @@ fn walk_files(
 			directory: false,
 			size,
 			modified_unix_seconds: None,
+			mode: Some(if executable { 0o100_755 } else { 0o100_644 }),
 			storage: Storage::Asar { data_offset: member_offset, unpacked },
 		});
 	}
 	Ok(())
-}
-
-pub(crate) fn resolve_alias_path(entries: &[Entry], path: Str, limits: Limits) -> Result<Str> {
-	let original = path.clone();
-	let mut resolved = path;
-	let mut rewrites = 0_u64;
-	loop {
-		let Some((end, target)) = find_alias(entries, resolved.as_str()) else {
-			return Ok(resolved);
-		};
-		if rewrites == limits.link_depth {
-			return Err(Error::LinkResolutionDepth { path: original, limit: limits.link_depth });
-		}
-		rewrites += 1;
-		let suffix = resolved.get(end..).unwrap_or("").trim_start_matches('/');
-		resolved = join_target(target, suffix, limits)?;
-	}
-}
-
-fn find_alias<'a>(entries: &'a [Entry], path: &str) -> Option<(usize, &'a str)> {
-	let mut end = path.len();
-	while end > 0 {
-		if let Ok(index) = entries.binary_search_by(|entry| entry.path().cmp(&path[..end]))
-			&& let Storage::AsarLink { target_path } = &entries[index].storage
-		{
-			return Some((end, target_path.as_str()));
-		}
-		end = path[..end].rfind('/').unwrap_or(0);
-	}
-	None
-}
-
-fn join_target(target: &str, suffix: &str, limits: Limits) -> Result<Str> {
-	let separator = usize::from(!target.is_empty() && !suffix.is_empty());
-	let length = target
-		.len()
-		.checked_add(separator)
-		.and_then(|length| length.checked_add(suffix.len()))
-		.ok_or(Error::InvalidArchive("ASAR link path length overflow"))?;
-	if length as u64 > limits.path_size {
-		return Err(Error::PathTooLong { actual: length as u64, limit: limits.path_size });
-	}
-	let mut joined = StrMut::with_capacity(length);
-	joined.push_str(target);
-	if separator != 0 {
-		joined.push('/');
-	}
-	joined.push_str(suffix);
-	let joined = joined.freeze();
-	validate(&joined, limits)?;
-	Ok(joined)
 }
 
 pub(crate) fn read_entry_to<W: Write>(
@@ -267,7 +224,7 @@ pub(crate) fn read_entry_to<W: Write>(
 			let mut file = directory.open(Path::new(entry.path()))?;
 			copy_member(&mut file, entry, output, true)
 		},
-		Storage::AsarLink { target_path } => {
+		Storage::Link { target_path, .. } => {
 			Err(Error::UnreadableLink { path: entry.path.clone(), target: target_path.clone() })
 		},
 		_ => Err(Error::InvalidArchive("non-ASAR storage in ASAR reader")),

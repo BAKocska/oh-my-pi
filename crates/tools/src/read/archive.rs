@@ -180,12 +180,13 @@ pub enum ArchiveError {
 		source: std::io::Error,
 	},
 	/// Container metadata or compressed data is invalid.
-	#[error("Invalid {format} archive: {message}")]
+	#[error("Invalid {} archive: {source}", <&'static str>::from(*.format))]
 	InvalidArchive {
-		/// Display format name.
-		format:  &'static str,
-		/// Parser detail.
-		message: String,
+		/// Archive container format.
+		format: ArchiveFormat,
+		/// Underlying parser error.
+		#[source]
+		source: omp_ar::Error,
 	},
 	/// A tar-family input exceeds the bounded in-memory parser limit.
 	#[error("Archive is too large to read in memory ({size} > {limit} limit)")]
@@ -597,20 +598,10 @@ fn archive_error(error: ArError, format: ArchiveFormat) -> ArchiveError {
 		ArError::LinkResolutionDepth { path, .. } => {
 			ArchiveError::CyclicLink { path: path.to_string() }
 		},
-		other => {
-			ArchiveError::InvalidArchive { format: format_name(format), message: other.to_string() }
-		},
+		other => ArchiveError::InvalidArchive { format, source: other },
 	}
 }
 
-const fn format_name(format: ArchiveFormat) -> &'static str {
-	match format {
-		ArchiveFormat::Zip => "ZIP",
-		ArchiveFormat::Tar => "tar",
-		ArchiveFormat::TarGz => "tar.gz",
-		ArchiveFormat::Asar => "ASAR",
-	}
-}
 
 fn node_from_entry(entry: &Entry, path: String) -> ArchiveNode {
 	ArchiveNode {

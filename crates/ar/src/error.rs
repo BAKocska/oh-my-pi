@@ -16,6 +16,9 @@ pub enum Error {
 	/// The input does not identify a supported archive format.
 	#[error("unsupported or unrecognized archive format")]
 	UnknownFormat,
+	/// A recognized container relies on a capability this build cannot decode.
+	#[error("{0} is not supported")]
+	UnsupportedFeature(&'static str),
 	/// Container metadata is malformed, inconsistent, or truncated.
 	#[error("invalid archive: {0}")]
 	InvalidArchive(&'static str),
@@ -92,8 +95,8 @@ pub enum Error {
 	/// A directory operation targeted a file.
 	#[error("archive member '{0}' is not a directory")]
 	NotDirectory(Str),
-	/// The requested ZIP member is encrypted.
-	#[error("encrypted ZIP member '{0}' is not supported")]
+	/// The requested archive member or protected header stream is encrypted.
+	#[error("encrypted archive data '{0}' is not supported")]
 	Encrypted(Str),
 	/// The requested ZIP member uses an unsupported compression method.
 	#[error("unsupported ZIP compression method {method} for member '{path}'")]
@@ -102,6 +105,26 @@ pub enum Error {
 		path:   Str,
 		/// ZIP compression method number.
 		method: u16,
+	},
+	/// A CAB member belongs to a Quantum-compressed folder.
+	#[error("CAB Quantum compression (level {level}) is not supported")]
+	UnsupportedCabQuantum {
+		/// Quantum compression level recorded by the folder.
+		level: u8,
+	},
+	/// A CAB member uses an unsupported LZX window size.
+	#[error("CAB LZX window size {bits} bits is not supported (expected 15-21)")]
+	UnsupportedCabLzxWindow {
+		/// LZX window-size exponent recorded by the folder.
+		bits: u8,
+	},
+	/// A CAB member belongs to a folder using an unknown compression method.
+	#[error("CAB compression method {method} (parameter {parameter}) is not supported")]
+	UnsupportedCabCompression {
+		/// CAB folder compression method number.
+		method:    u8,
+		/// Method-specific CAB folder parameter.
+		parameter: u8,
 	},
 	/// Decoded bytes disagree with a member's declared size.
 	#[error("archive member '{path}' has size {actual}, expected {expected}")]
@@ -113,14 +136,14 @@ pub enum Error {
 		/// Observed uncompressed size.
 		actual:   u64,
 	},
-	/// Inflated ZIP bytes disagree with the central-directory CRC-32.
-	#[error("ZIP member '{path}' has CRC-32 {actual:08x}, expected {expected:08x}")]
+	/// Decoded bytes disagree with a container-recorded checksum.
+	#[error("archive member '{path}' has checksum {actual:08x}, expected {expected:08x}")]
 	ChecksumMismatch {
 		/// Normalized member path.
 		path:     Str,
-		/// Declared CRC-32.
+		/// Declared checksum value.
 		expected: u32,
-		/// Computed CRC-32.
+		/// Computed checksum value.
 		actual:   u32,
 	},
 	/// A sparse TAR member cannot be reconstructed by this reader.

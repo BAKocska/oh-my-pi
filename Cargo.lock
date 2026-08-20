@@ -5316,12 +5316,14 @@ dependencies = [
  "flate2",
  "omp-core",
  "serde_json",
+ "sha2",
  "smallvec 2.0.0-alpha.12",
  "strum",
  "tempfile",
  "thiserror 2.0.20",
  "xutf",
  "zerocopy",
+ "zstd",
 ]
 
 [[package]]

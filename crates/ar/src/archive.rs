@@ -14,10 +14,11 @@ use omp_core::Str;
 use strum::{EnumString, IntoStaticStr};
 
 use crate::{
-	Entry, Error, Result, asar,
+	Entry, Error, Result, arj, asar, cab, codec, cpio, deb,
 	entry::Storage,
+	iso, links, lzh,
 	path::{normalize, parent, validate},
-	tar, zip,
+	rar, rpm, sevenzip, tar, unix_ar, zip,
 };
 
 const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
@@ -48,23 +49,135 @@ pub enum Format {
 	/// Gzip-compressed tape archive.
 	#[strum(to_string = "tar.gz", serialize = "tgz")]
 	TarGz,
+	/// Bzip2-compressed tape archive.
+	#[strum(to_string = "tar.bz2", serialize = "tbz2", serialize = "tbz")]
+	TarBz2,
+	/// XZ-compressed tape archive.
+	#[strum(to_string = "tar.xz", serialize = "txz")]
+	TarXz,
+	/// Zstandard-compressed tape archive.
+	#[strum(to_string = "tar.zst", serialize = "tzst")]
+	TarZst,
+	/// ncompress (.Z)-compressed tape archive.
+	#[strum(to_string = "tar.Z")]
+	TarZ,
 	/// Read-only Electron ASAR container.
 	#[strum(to_string = "asar")]
 	Asar,
+	/// RAR 4.x/5.x container.
+	#[strum(to_string = "rar", serialize = "cbr")]
+	Rar,
+	/// 7-Zip container.
+	#[strum(to_string = "7z")]
+	SevenZip,
+	/// ISO 9660 disc image.
+	#[strum(to_string = "iso")]
+	Iso,
+	/// Microsoft cabinet.
+	#[strum(to_string = "cab")]
+	Cab,
+	/// cpio archive (newc, crc, odc, or old binary).
+	#[strum(to_string = "cpio")]
+	Cpio,
+	/// RPM package around a compressed cpio payload.
+	#[strum(to_string = "rpm")]
+	Rpm,
+	/// Unix ar archive (`.a`, `.lib`).
+	#[strum(to_string = "ar", serialize = "a", serialize = "lib")]
+	Ar,
+	/// Debian package (ar of control/data tarballs).
+	#[strum(to_string = "deb")]
+	Deb,
+	/// LZH/LHA archive.
+	#[strum(to_string = "lzh", serialize = "lha")]
+	Lzh,
+	/// ARJ archive.
+	#[strum(to_string = "arj")]
+	Arj,
+	/// Single gzip stream exposed as a one-member pseudo-archive.
+	#[strum(to_string = "gz")]
+	Gz,
+	/// Single bzip2 stream exposed as a one-member pseudo-archive.
+	#[strum(to_string = "bz2")]
+	Bz2,
+	/// Single xz stream exposed as a one-member pseudo-archive.
+	#[strum(to_string = "xz")]
+	Xz,
+	/// Single zstd stream exposed as a one-member pseudo-archive.
+	#[strum(to_string = "zst")]
+	Zst,
+	/// Single ncompress `.Z` stream exposed as a one-member pseudo-archive.
+	#[strum(to_string = "Z")]
+	Z,
+	/// Single LZMA-alone stream exposed as a one-member pseudo-archive.
+	#[strum(to_string = "lzma")]
+	Lzma,
 }
+
+/// Every recognized filename extension, longest first so `.tar.gz` wins over
+/// `.gz`. Shared by [`Format::from_path`] and single-member stem naming.
+const EXTENSION_TABLE: &[(&str, Format)] = &[
+	(".tar.bz2", Format::TarBz2),
+	(".tar.gz", Format::TarGz),
+	(".tar.xz", Format::TarXz),
+	(".tar.zst", Format::TarZst),
+	(".nupkg", Format::Zip),
+	(".tar.z", Format::TarZ),
+	(".asar", Format::Asar),
+	(".cpio", Format::Cpio),
+	(".lzma", Format::Lzma),
+	(".tbz2", Format::TarBz2),
+	(".tzst", Format::TarZst),
+	(".vsix", Format::Zip),
+	(".arj", Format::Arj),
+	(".apk", Format::Zip),
+	(".cab", Format::Cab),
+	(".cbr", Format::Rar),
+	(".cbz", Format::Zip),
+	(".deb", Format::Deb),
+	(".ear", Format::Zip),
+	(".ipa", Format::Zip),
+	(".iso", Format::Iso),
+	(".jar", Format::Zip),
+	(".lha", Format::Lzh),
+	(".lib", Format::Ar),
+	(".lzh", Format::Lzh),
+	(".rar", Format::Rar),
+	(".rpm", Format::Rpm),
+	(".tar", Format::Tar),
+	(".tbz", Format::TarBz2),
+	(".tgz", Format::TarGz),
+	(".txz", Format::TarXz),
+	(".war", Format::Zip),
+	(".whl", Format::Zip),
+	(".xpi", Format::Zip),
+	(".zip", Format::Zip),
+	(".bz2", Format::Bz2),
+	(".zst", Format::Zst),
+	(".ar", Format::Ar),
+	(".gz", Format::Gz),
+	(".xz", Format::Xz),
+	(".7z", Format::SevenZip),
+	(".a", Format::Ar),
+	(".z", Format::Z),
+];
 
 impl Format {
 	/// Infers a format from a conventional archive filename.
 	pub fn from_path(path: impl AsRef<Path>) -> Option<Self> {
 		let path = path.as_ref();
 		let name = path.file_name()?.to_str()?;
-		if ends_with_ignore_ascii_case(name, ".tar.gz") {
-			return Some(Self::TarGz);
-		}
-		path.extension()?.to_str()?.parse().ok()
+		let lower = name.to_ascii_lowercase();
+		EXTENSION_TABLE
+			.iter()
+			.find(|(extension, _)| lower.ends_with(extension) && lower.len() > extension.len())
+			.map(|(_, format)| *format)
 	}
 
 	/// Sniffs a format from archive bytes, including a bounded ZIP footer.
+	///
+	/// Compression wrappers report their `tar.*` variant; indexing falls back
+	/// to a single member when the decompressed stream is not a tar.
 	pub fn sniff(bytes: &[u8]) -> Option<Self> {
 		if let Some(signature) = bytes.get(..4) {
 			let signature = u32::from_le_bytes(signature.try_into().expect("four-byte ZIP signature"));
@@ -72,14 +185,56 @@ impl Format {
 				return Some(Self::Zip);
 			}
 		}
-		if bytes.starts_with(&[0x1f, 0x8b]) {
-			return Some(Self::TarGz);
+		if rar::is_header(bytes) {
+			return Some(Self::Rar);
 		}
-		if tar::is_header(bytes) {
-			return Some(Self::Tar);
+		if sevenzip::is_header(bytes) {
+			return Some(Self::SevenZip);
+		}
+		if cab::is_header(bytes) {
+			return Some(Self::Cab);
+		}
+		if rpm::is_header(bytes) {
+			return Some(Self::Rpm);
+		}
+		if arj::is_header(bytes) {
+			return Some(Self::Arj);
+		}
+		if lzh::is_header(bytes) {
+			return Some(Self::Lzh);
+		}
+		if cpio::is_header(bytes) {
+			return Some(Self::Cpio);
+		}
+		if deb::is_header(bytes) {
+			return Some(Self::Deb);
+		}
+		if unix_ar::is_header(bytes) {
+			return Some(Self::Ar);
 		}
 		if asar::is_header(bytes) {
 			return Some(Self::Asar);
+		}
+		if codec::is_gzip(bytes) {
+			return Some(Self::TarGz);
+		}
+		if codec::is_bzip2(bytes) {
+			return Some(Self::TarBz2);
+		}
+		if codec::is_xz(bytes) {
+			return Some(Self::TarXz);
+		}
+		if codec::is_zstd(bytes) {
+			return Some(Self::TarZst);
+		}
+		if codec::is_compress_z(bytes) {
+			return Some(Self::TarZ);
+		}
+		if iso::is_header(bytes) {
+			return Some(Self::Iso);
+		}
+		if tar::is_header(bytes) {
+			return Some(Self::Tar);
 		}
 		let tail_start = bytes.len().saturating_sub(zip::SNIFF_TAIL_SIZE);
 		if zip::has_eocd(&bytes[tail_start..]) {
@@ -92,12 +247,6 @@ impl Format {
 	pub fn extension(self) -> &'static str {
 		self.into()
 	}
-}
-
-fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
-	value
-		.get(value.len().saturating_sub(suffix.len())..)
-		.is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 /// Resource ceilings enforced before archive metadata can drive expensive work.
@@ -227,7 +376,9 @@ pub type Files = BTreeMap<Str, Vec<u8>>;
 /// Indexed, read-only access to one seekable archive source.
 pub struct Archive<R> {
 	source:        R,
-	decoded:       Option<Cursor<Vec<u8>>>,
+	/// Retained decompressed streams referenced by `Storage::Tar` (buffer 0)
+	/// and `Storage::Buffered` entries.
+	decoded:       Vec<Vec<u8>>,
 	unpacked_root: Option<PathBuf>,
 	format:        Format,
 	entries:       Vec<Entry>,
@@ -243,7 +394,7 @@ impl<R: Read + Seek> Archive<R> {
 	/// Sniffs and indexes `source` with explicit resource ceilings.
 	pub fn with_limits(mut source: R, limits: Limits) -> Result<Self> {
 		let format = sniff_source(&mut source)?;
-		Self::with_format_and_limits(source, format, limits)
+		Self::index_source(source, format, limits, None)
 	}
 
 	/// Indexes `source` as an explicit format with [`Limits::DEFAULT`].
@@ -252,26 +403,55 @@ impl<R: Read + Seek> Archive<R> {
 	}
 
 	/// Indexes `source` as an explicit format with explicit resource ceilings.
-	pub fn with_format_and_limits(mut source: R, format: Format, limits: Limits) -> Result<Self> {
+	pub fn with_format_and_limits(source: R, format: Format, limits: Limits) -> Result<Self> {
+		Self::index_source(source, format, limits, None)
+	}
+
+	/// Indexes `source`; `stem` names the single member of a non-tar
+	/// compressed stream when the source filename is known.
+	fn index_source(
+		mut source: R,
+		format: Format,
+		limits: Limits,
+		stem: Option<Str>,
+	) -> Result<Self> {
 		let file_size = source.seek(SeekFrom::End(0))?;
 		source.seek(SeekFrom::Start(0))?;
-		let mut decoded = None;
+		let mut decoded = Vec::new();
 		let raw_entries = match format {
 			Format::Zip => zip::read_entries(&mut source, file_size, limits)?,
 			Format::Tar => {
 				check_archive_size(file_size, limits)?;
 				tar::read_entries(&mut source, file_size, limits)?
 			},
-			Format::TarGz => {
+			Format::TarGz
+			| Format::TarBz2
+			| Format::TarXz
+			| Format::TarZst
+			| Format::TarZ
+			| Format::Gz
+			| Format::Bz2
+			| Format::Xz
+			| Format::Zst
+			| Format::Z
+			| Format::Lzma => {
 				check_archive_size(file_size, limits)?;
-				let bytes = decode_gzip(&mut source, file_size, limits)?;
-				let decoded_size = bytes.len() as u64;
-				let mut cursor = Cursor::new(bytes);
-				let entries = tar::read_entries(&mut cursor, decoded_size, limits)?;
-				decoded = Some(cursor);
+				let bytes = decode_compressed(format, &mut source, file_size, limits)?;
+				let entries = index_decoded_stream(&bytes, stem, limits)?;
+				decoded.push(bytes);
 				entries
 			},
 			Format::Asar => asar::read_entries(&mut source, file_size, limits)?,
+			Format::Rar => rar::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::SevenZip => sevenzip::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Iso => iso::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Cab => cab::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Cpio => cpio::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Rpm => rpm::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Ar => unix_ar::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Deb => deb::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Lzh => lzh::read_entries(&mut source, file_size, limits, &mut decoded)?,
+			Format::Arj => arj::read_entries(&mut source, file_size, limits, &mut decoded)?,
 		};
 		let entries = finalize_entries(raw_entries, limits)?;
 		Ok(Self { source, decoded, unpacked_root: None, format, entries, limits })
@@ -363,13 +543,13 @@ impl<R: Read + Seek> Archive<R> {
 	}
 
 	/// Materializes every readable file member under the aggregate memory limit.
+	///
+	/// Directory aliases materialize nothing; dangling file links fail with
+	/// [`Error::UnreadableLink`] when read.
 	pub fn read_all(&mut self) -> Result<Files> {
 		let mut total = 0_u64;
 		for entry in &self.entries {
 			if entry.is_directory() {
-				if entry.is_link() {
-					return Err(unreadable_link(entry));
-				}
 				continue;
 			}
 			total = total
@@ -401,25 +581,33 @@ impl<R: Read + Seek> Archive<R> {
 
 	/// Extracts validated members beneath a capability-scoped destination.
 	///
-	/// Empty directories are preserved. The returned count includes files only.
+	/// Empty directories are preserved, Unix modes are applied when recorded,
+	/// and symbolic links are recreated (Unix only) after their targets are
+	/// validated to stay inside the destination. Directory aliases
+	/// materialize nothing. The returned count covers files and symlinks.
 	pub fn extract_to(&mut self, destination: &Dir) -> Result<usize> {
 		for entry in &self.entries {
-			if entry.is_directory() {
-				if entry.is_link() {
-					return Err(unreadable_link(entry));
-				}
+			if entry.is_directory() && !entry.is_link() {
 				destination.create_dir_all(Path::new(entry.path()))?;
 			}
 		}
 
-		let paths: Vec<_> = self
-			.entries
-			.iter()
-			.filter(|entry| !entry.is_directory())
-			.map(|entry| entry.path.clone())
-			.collect();
+		let mut files = Vec::new();
+		let mut symlinks = Vec::new();
+		for entry in &self.entries {
+			if entry.is_directory() {
+				continue;
+			}
+			match &entry.storage {
+				Storage::Link { target_path, .. } => {
+					symlinks.push((entry.path.clone(), target_path.clone()));
+				},
+				_ => files.push((entry.path.clone(), entry.mode)),
+			}
+		}
+
 		let mut written = 0;
-		for path in paths {
+		for (path, mode) in files {
 			if let Some(parent) = Path::new(path.as_str()).parent() {
 				destination.create_dir_all(parent)?;
 			}
@@ -429,7 +617,40 @@ impl<R: Read + Seek> Archive<R> {
 				let _ = destination.remove_file(Path::new(path.as_str()));
 				return Err(error);
 			}
+			drop(file);
+			#[cfg(unix)]
+			if let Some(mode) = mode {
+				use std::os::unix::fs::PermissionsExt;
+				let permissions = mode & 0o777;
+				if permissions != 0 {
+					destination.set_permissions(
+						Path::new(path.as_str()),
+						cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(permissions)),
+					)?;
+				}
+			}
 			written += 1;
+		}
+
+		for (path, target) in symlinks {
+			// A symlink target resolves relative to the link's directory; it
+			// must normalize to an in-archive path to be recreated safely.
+			let joined = format!("{}/{}", parent(path.as_str()), target);
+			if normalize(&joined, true).is_none() {
+				return Err(Error::UnreadableLink { path, target });
+			}
+			if let Some(parent) = Path::new(path.as_str()).parent() {
+				destination.create_dir_all(parent)?;
+			}
+			#[cfg(unix)]
+			{
+				destination.symlink(Path::new(target.as_str()), Path::new(path.as_str()))?;
+				written += 1;
+			}
+			#[cfg(not(unix))]
+			{
+				let _ = target;
+			}
 		}
 		Ok(written)
 	}
@@ -449,9 +670,20 @@ impl<R: Read + Seek> Archive<R> {
 
 	fn resolve_path(&self, path: Str) -> Result<Str> {
 		match self.format {
-			Format::Tar | Format::TarGz => tar::resolve_alias_path(&self.entries, path, self.limits),
-			Format::Asar => asar::resolve_alias_path(&self.entries, path, self.limits),
+			Format::Tar
+			| Format::TarGz
+			| Format::TarBz2
+			| Format::TarXz
+			| Format::TarZst
+			| Format::TarZ
+			| Format::Gz
+			| Format::Bz2
+			| Format::Xz
+			| Format::Zst
+			| Format::Z
+			| Format::Lzma => tar::resolve_alias_path(&self.entries, path, self.limits),
 			Format::Zip => Ok(path),
+			_ => links::resolve_alias_path(&self.entries, path, self.limits),
 		}
 	}
 
@@ -474,20 +706,64 @@ impl<R: Read + Seek> Archive<R> {
 	}
 
 	fn read_entry_to<W: Write>(&mut self, entry: &Entry, output: &mut W) -> Result<u64> {
+		// Storage-generic paths first: raw source ranges and retained
+		// decoded buffers are format-independent.
+		match &entry.storage {
+			Storage::Raw { data_offset, stored_size } => {
+				return copy_source_range(&mut self.source, *data_offset, *stored_size, output);
+			},
+			Storage::Buffered { buffer, data_offset, stored_size } => {
+				let decoded = self
+					.decoded
+					.get(*buffer as usize)
+					.ok_or(Error::InvalidArchive("missing decoded archive buffer"))?;
+				let start = usize::try_from(*data_offset)
+					.map_err(|_| Error::InvalidArchive("decoded member offset overflows"))?;
+				let end = usize::try_from(*stored_size)
+					.ok()
+					.and_then(|size| start.checked_add(size))
+					.ok_or(Error::InvalidArchive("decoded member range overflows"))?;
+				let slice = decoded
+					.get(start..end)
+					.ok_or(Error::InvalidArchive("decoded member range out of bounds"))?;
+				output.write_all(slice)?;
+				return Ok(slice.len() as u64);
+			},
+			_ => {},
+		}
 		match self.format {
 			Format::Zip => zip::read_entry_to(&mut self.source, entry, self.limits, output),
 			Format::Tar => tar::read_entry_to(&mut self.source, entry, output),
-			Format::TarGz => tar::read_entry_to(
-				self
+			Format::TarGz
+			| Format::TarBz2
+			| Format::TarXz
+			| Format::TarZst
+			| Format::TarZ
+			| Format::Gz
+			| Format::Bz2
+			| Format::Xz
+			| Format::Zst
+			| Format::Z
+			| Format::Lzma => {
+				let decoded = self
 					.decoded
-					.as_mut()
-					.expect("TAR.GZ archive owns decoded bytes"),
-				entry,
-				output,
-			),
+					.first()
+					.ok_or(Error::InvalidArchive("missing decoded archive buffer"))?;
+				tar::read_entry_to(&mut Cursor::new(decoded.as_slice()), entry, output)
+			},
 			Format::Asar => {
 				asar::read_entry_to(&mut self.source, self.unpacked_root.as_deref(), entry, output)
 			},
+			Format::Rar => rar::read_entry_to(&mut self.source, entry, output),
+			Format::SevenZip => sevenzip::read_entry_to(&mut self.source, entry, output),
+			Format::Iso => iso::read_entry_to(&mut self.source, entry, output),
+			Format::Cab => cab::read_entry_to(&mut self.source, entry, output),
+			Format::Cpio => cpio::read_entry_to(&mut self.source, entry, output),
+			Format::Rpm => rpm::read_entry_to(&mut self.source, entry, output),
+			Format::Ar => unix_ar::read_entry_to(&mut self.source, entry, output),
+			Format::Deb => deb::read_entry_to(&mut self.source, entry, output),
+			Format::Lzh => lzh::read_entry_to(&mut self.source, entry, output),
+			Format::Arj => arj::read_entry_to(&mut self.source, entry, output),
 		}
 	}
 }
@@ -501,11 +777,12 @@ impl Archive<BufReader<File>> {
 	/// Opens and indexes an archive with explicit resource ceilings.
 	pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
 		let path = path.as_ref();
-		let source = BufReader::new(File::open(path)?);
-		let mut archive = match Format::from_path(path) {
-			Some(format) => Self::with_format_and_limits(source, format, limits)?,
-			None => Self::with_limits(source, limits)?,
+		let mut source = BufReader::new(File::open(path)?);
+		let format = match Format::from_path(path) {
+			Some(format) => format,
+			None => sniff_source(&mut source)?,
 		};
+		let mut archive = Self::index_source(source, format, limits, member_stem(path))?;
 		archive.set_filesystem_path(path);
 		Ok(archive)
 	}
@@ -522,8 +799,8 @@ impl Archive<BufReader<File>> {
 		limits: Limits,
 	) -> Result<Self> {
 		let path = path.as_ref();
-		let mut archive =
-			Self::with_format_and_limits(BufReader::new(File::open(path)?), format, limits)?;
+		let source = BufReader::new(File::open(path)?);
+		let mut archive = Self::index_source(source, format, limits, member_stem(path))?;
 		archive.set_filesystem_path(path);
 		Ok(archive)
 	}
@@ -578,7 +855,9 @@ fn sniff_source(source: &mut (impl Read + Seek)) -> Result<Format> {
 	let original_position = source.stream_position()?;
 	let result = (|| {
 		source.seek(SeekFrom::Start(0))?;
-		let mut probe = [0_u8; 512];
+		// 40 KiB covers every head-anchored magic including the ISO 9660
+		// descriptor at byte 32769.
+		let mut probe = [0_u8; 40 * 1024];
 		let mut read = 0;
 		while read < probe.len() {
 			let count = source.read(&mut probe[read..])?;
@@ -691,16 +970,85 @@ fn ensure_parent_directories(entries: &mut HashMap<Str, Entry>, limit: u64) -> R
 	Ok(())
 }
 
-fn unreadable_link(entry: &Entry) -> Error {
-	Error::UnreadableLink {
-		path:   entry.path.clone(),
-		target: match &entry.storage {
-			Storage::TarLink { target_path } | Storage::AsarLink { target_path } => {
-				target_path.clone()
-			},
-			Storage::Synthetic | Storage::Zip { .. } | Storage::Tar { .. } | Storage::Asar { .. } => {
-				Str::new("")
-			},
+/// Decompresses one outer stream for a compressed-tar or single-stream
+/// pseudo-archive, bounded by `limits.archive_size`.
+fn decode_compressed(
+	format: Format,
+	source: &mut (impl Read + Seek),
+	file_size: u64,
+	limits: Limits,
+) -> Result<Vec<u8>> {
+	match format {
+		Format::TarGz | Format::Gz => decode_gzip(source, file_size, limits),
+		Format::TarBz2 | Format::Bz2 => {
+			codec::bzip2_decompress(&read_source(source, file_size)?, limits)
 		},
+		Format::TarXz | Format::Xz => codec::xz_decompress(&read_source(source, file_size)?, limits),
+		Format::TarZst | Format::Zst => {
+			codec::zstd_decompress(&read_source(source, file_size)?, limits)
+		},
+		Format::TarZ | Format::Z => codec::lzw_decompress(&read_source(source, file_size)?, limits),
+		Format::Lzma => codec::lzma_alone_decompress(&read_source(source, file_size)?, limits),
+		_ => Err(Error::InvalidArchive("format is not a compressed stream")),
 	}
+}
+
+/// Reads an entire size-checked source into memory for whole-stream codecs.
+fn read_source(source: &mut (impl Read + Seek), file_size: u64) -> Result<Vec<u8>> {
+	source.seek(SeekFrom::Start(0))?;
+	let capacity = usize::try_from(file_size)
+		.map_err(|_| Error::InvalidArchive("archive does not fit this platform"))?;
+	let mut bytes = Vec::with_capacity(capacity);
+	source.read_to_end(&mut bytes)?;
+	Ok(bytes)
+}
+
+/// Indexes a decompressed stream: a tar when it is one, else a single
+/// stem-named member backed by decoded buffer 0.
+fn index_decoded_stream(bytes: &[u8], stem: Option<Str>, limits: Limits) -> Result<Vec<Entry>> {
+	if tar::is_header(bytes) {
+		let decoded_size = bytes.len() as u64;
+		return tar::read_entries(&mut Cursor::new(bytes), decoded_size, limits);
+	}
+	let path = stem.unwrap_or_else(|| Str::new("data"));
+	validate(&path, limits)?;
+	Ok(vec![Entry {
+		path,
+		directory: false,
+		size: bytes.len() as u64,
+		modified_unix_seconds: None,
+		mode: None,
+		storage: Storage::Buffered {
+			buffer:      0,
+			data_offset: 0,
+			stored_size: bytes.len() as u64,
+		},
+	}])
+}
+
+/// Derives the single-member name for a compressed file: its filename minus
+/// the recognized archive extension (`notes.txt.gz` → `notes.txt`).
+fn member_stem(path: &Path) -> Option<Str> {
+	let name = path.file_name()?.to_str()?;
+	let lower = name.to_ascii_lowercase();
+	let (extension, _) = EXTENSION_TABLE
+		.iter()
+		.find(|(extension, _)| lower.ends_with(extension) && lower.len() > extension.len())?;
+	let stem = &name[..name.len() - extension.len()];
+	normalize(stem, false)
+}
+
+/// Copies one verbatim byte range from the source to `output`.
+fn copy_source_range<W: Write>(
+	source: &mut (impl Read + Seek),
+	data_offset: u64,
+	stored_size: u64,
+	output: &mut W,
+) -> Result<u64> {
+	source.seek(SeekFrom::Start(data_offset))?;
+	let copied = std::io::copy(&mut source.take(stored_size), output)?;
+	if copied != stored_size {
+		return Err(Error::InvalidArchive("truncated member data"));
+	}
+	Ok(copied)
 }

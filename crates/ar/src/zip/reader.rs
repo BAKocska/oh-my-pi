@@ -577,6 +577,15 @@ fn parse_directory(
 				.last()
 				.is_some_and(|byte| *byte == b'/' || *byte == b'\\')
 				|| is_directory_name(decoded.as_str());
+			// Unix (3) and macOS (19) creators store `st_mode` in the external
+			// attributes' high half; other creators carry no Unix mode.
+			let made_by_os = header.version_made_by.get() >> 8;
+			let mode = if matches!(made_by_os, 3 | 19) {
+				let bits = header.external_attributes.get() >> 16;
+				(bits != 0).then_some(bits)
+			} else {
+				None
+			};
 			indexed.push(Entry {
 				path,
 				directory: directory_entry,
@@ -586,6 +595,7 @@ fn parse_directory(
 					values.uncompressed_size
 				},
 				modified_unix_seconds,
+				mode,
 				storage: Storage::Zip {
 					compressed_size: if directory_entry {
 						0

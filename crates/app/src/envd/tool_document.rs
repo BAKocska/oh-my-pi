@@ -2498,7 +2498,10 @@ fn write_archive_member_blocking(
 				.map_err(|error| special_fault(error.to_string()))?;
 			Ok(())
 		},
-		(ArchiveFormat::Asar, _) => Err(special_fault("ASAR archives are read-only")),
+		(other, _) => Err(special_fault(format!(
+			"{} archives are read-only",
+			<&'static str>::from(other)
+		))),
 	})?;
 
 	let canonical = std::fs::canonicalize(&final_path).unwrap_or(final_path);
@@ -2538,14 +2541,12 @@ fn archive_member_exists(
 	format: omp_tools::read::archive::ArchiveFormat,
 	member: &str,
 ) -> Result<bool, omp_tools::write::backends::Fault> {
-	let format = match format {
-		omp_tools::read::archive::ArchiveFormat::Zip => omp_ar::Format::Zip,
-		omp_tools::read::archive::ArchiveFormat::Tar => omp_ar::Format::Tar,
-		omp_tools::read::archive::ArchiveFormat::TarGz => omp_ar::Format::TarGz,
-		omp_tools::read::archive::ArchiveFormat::Asar => {
-			return Err(special_fault("ASAR archives are read-only"));
-		},
-	};
+	if !matches!(format, omp_ar::Format::Zip | omp_ar::Format::Tar | omp_ar::Format::TarGz) {
+		return Err(special_fault(format!(
+			"{} archives are read-only",
+			<&'static str>::from(format)
+		)));
+	}
 	let file = std::fs::File::open(path).map_err(|error| special_fault(error.to_string()))?;
 	let archive = omp_ar::Archive::with_format(file, format)
 		.map_err(|error| special_fault(error.to_string()))?;

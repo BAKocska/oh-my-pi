@@ -133,6 +133,9 @@ pub fn read_entries<R: Read + Seek>(
 		let typeflag = header.typeflag;
 		let header_size = parse_number(&header.size)?;
 		let modified_unix_seconds = parse_mtime(&header.mtime)?;
+		let mode = parse_number(&header.mode)
+			.ok()
+			.and_then(|value| u32::try_from(value).ok());
 		offset = checked_add(offset, BLOCK_SIZE as u64, "TAR offset overflow")?;
 
 		let metadata_end =
@@ -301,17 +304,21 @@ pub fn read_entries<R: Read + Seek>(
 					directory: true,
 					size: 0,
 					modified_unix_seconds,
+					mode,
 					storage: Storage::Synthetic,
 				},
 				None,
 			),
-			b'1' | b'2' => make_link_entry(path, link_name, typeflag, modified_unix_seconds, limits)?,
+			b'1' | b'2' => {
+				make_link_entry(path, link_name, typeflag, modified_unix_seconds, mode, limits)?
+			},
 			_ if raw_directory => (
 				Entry {
 					path,
 					directory: true,
 					size: 0,
 					modified_unix_seconds,
+					mode,
 					storage: Storage::Synthetic,
 				},
 				None,
@@ -327,6 +334,7 @@ pub fn read_entries<R: Read + Seek>(
 						directory: false,
 						size: display_size,
 						modified_unix_seconds,
+						mode,
 						storage: Storage::Tar { data_offset, stored_size, sparse },
 					},
 					None,
@@ -387,7 +395,7 @@ pub fn read_entry_to<R: Read + Seek, W: Write>(
 				Ok(entry.size)
 			},
 		},
-		Storage::TarLink { target_path } => {
+		Storage::Link { target_path, .. } => {
 			Err(Error::UnreadableLink { path: entry.path.clone(), target: target_path.clone() })
 		},
 		_ => Err(Error::InvalidArchive("entry is not a TAR member")),
@@ -1112,6 +1120,7 @@ fn make_link_entry(
 	link_name: Str,
 	typeflag: u8,
 	modified_unix_seconds: Option<u64>,
+	mode: Option<u32>,
 	limits: Limits,
 ) -> Result<(Entry, Option<PendingLink>)> {
 	check_path_size(link_name.len() as u64, limits.path_size)?;
@@ -1145,7 +1154,8 @@ fn make_link_entry(
 							directory: false,
 							size: 0,
 							modified_unix_seconds,
-							storage: Storage::TarLink { target_path: portable },
+							mode,
+							storage: Storage::Link { target_path: portable, resolve_target: false },
 						},
 						None,
 					));
@@ -1160,7 +1170,8 @@ fn make_link_entry(
 			directory: false,
 			size: 0,
 			modified_unix_seconds,
-			storage: Storage::TarLink { target_path: target.clone() },
+			mode,
+			storage: Storage::Link { target_path: target.clone(), resolve_target: false },
 		},
 		Some(PendingLink { kind, target }),
 	))
@@ -1308,7 +1319,8 @@ fn resolve_pending_links(
 					});
 				},
 				LinkKind::Symbolic => {
-					entries[index].storage = Storage::TarLink { target_path: link.target.clone() };
+					entries[index].storage =
+						Storage::Link { target_path: link.target.clone(), resolve_target: false };
 					continue;
 				},
 			}
@@ -1341,7 +1353,8 @@ fn resolve_pending_links(
 				},
 				LinkKind::Symbolic => {
 					entries[index].directory = true;
-					entries[index].storage = Storage::TarLink { target_path: link.target.clone() };
+					entries[index].storage =
+						Storage::Link { target_path: link.target.clone(), resolve_target: false };
 					continue;
 				},
 			}
@@ -1349,7 +1362,8 @@ fn resolve_pending_links(
 
 		match link.kind {
 			LinkKind::Symbolic => {
-				entries[index].storage = Storage::TarLink { target_path: link.target.clone() };
+				entries[index].storage =
+					Storage::Link { target_path: link.target.clone(), resolve_target: false };
 			},
 			LinkKind::Hard => {
 				let reason = if entries_by_path.contains_key(target_path.as_str()) {
@@ -1404,7 +1418,7 @@ fn resolve_alias_path_map(
 		while end > 0 {
 			if let Some(&index) = entries_by_path.get(&resolved[..end])
 				&& entries[index].directory
-				&& let Storage::TarLink { target_path } = &entries[index].storage
+				&& let Storage::Link { target_path, .. } = &entries[index].storage
 			{
 				alias = Some((end, target_path.clone()));
 				break;
@@ -1431,7 +1445,7 @@ fn find_directory_alias<'a>(entries: &'a [Entry], path: &str) -> Option<(usize, 
 		if let Ok(index) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path[..end])) {
 			let entry = &entries[index];
 			if entry.directory
-				&& let Storage::TarLink { target_path } = &entry.storage
+				&& let Storage::Link { target_path, .. } = &entry.storage
 			{
 				return Some((end, target_path));
 			}

@@ -2,6 +2,7 @@
 
 #![allow(dead_code, reason = "each integration crate uses a subset of these fixture builders")]
 
+pub mod fixtures;
 pub mod tar;
 
 pub struct Member<'a> {

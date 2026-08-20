@@ -38,6 +38,14 @@ pub struct TarSparseExtent {
 	pub(crate) offset: u64,
 	pub(crate) length: u64,
 }
+/// One physical extent of an ISO 9660 file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsoExtent {
+	pub(crate) data_offset:       u64,
+	pub(crate) size:              u64,
+	pub(crate) file_unit_blocks:  u8,
+	pub(crate) interleave_blocks: u8,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TarSparse {
@@ -46,9 +54,12 @@ pub enum TarSparse {
 	Unsupported,
 }
 
+/// Where an indexed member's bytes live and how they are decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Storage {
+	/// Directory synthesized from member paths; carries no bytes.
 	Synthetic,
+	/// ZIP member decoded from a local-header-relative range.
 	Zip {
 		compressed_size:     u64,
 		crc32:               u32,
@@ -56,21 +67,45 @@ pub enum Storage {
 		flags:               u16,
 		local_header_offset: u64,
 	},
-	Tar {
+	/// TAR member sliced from the (possibly decompressed) TAR stream.
+	Tar { data_offset: u64, stored_size: u64, sparse: TarSparse },
+	/// ASAR member sliced from the payload region, or an unpacked sibling.
+	Asar { data_offset: u64, unpacked: bool },
+	/// Symbolic link or directory alias resolved lazily by path rewriting.
+	///
+	/// `resolve_target` marks links that must be followed before the target
+	/// kind is known (ASAR link records do not encode it); TAR keeps `false`
+	/// because its reader classifies links while indexing.
+	Link { target_path: Str, resolve_target: bool },
+	/// ISO 9660 member assembled from multiple or interleaved physical extents.
+	Iso { block_size: u64, stored_size: u64, extents: SmallVec<IsoExtent, 2> },
+	/// Compressed LZH or ARJ member decoded from a source range.
+	LegacyDos {
 		data_offset: u64,
 		stored_size: u64,
-		sparse:      TarSparse,
+		format:      u8,
+		method:      u8,
+		checksum:    u32,
 	},
-	TarLink {
-		target_path: Str,
+	/// Non-solid RAR member decoded and checksum-verified on extraction.
+	Rar {
+		data_offset:     u64,
+		packed_size:     u64,
+		dictionary_size: u64,
+		crc32:           Option<u32>,
+		format:          u8,
+		method:          u8,
+		version:         u8,
 	},
-	Asar {
-		data_offset: u64,
-		unpacked:    bool,
-	},
-	AsarLink {
-		target_path: Str,
-	},
+	/// CAB member whose folder compression is intentionally deferred because
+	/// the method or parameter is unsupported.
+	CabUnsupported { method: u8, parameter: u8 },
+	/// Verbatim byte range in the original source (stored members of cpio,
+	/// ar, ISO, and friends).
+	Raw { data_offset: u64, stored_size: u64 },
+	/// Range within one of the archive's retained decoded buffers
+	/// (single-stream pseudo-archives, deb/rpm payloads, solid blocks).
+	Buffered { buffer: u32, data_offset: u64, stored_size: u64 },
 }
 
 /// One normalized file, directory, or unresolved symbolic link in an archive.
@@ -80,6 +115,7 @@ pub struct Entry {
 	pub(crate) directory:             bool,
 	pub(crate) size:                  u64,
 	pub(crate) modified_unix_seconds: Option<u64>,
+	pub(crate) mode:                  Option<u32>,
 	pub(crate) storage:               Storage,
 }
 
@@ -90,6 +126,7 @@ impl Entry {
 			directory: true,
 			size: 0,
 			modified_unix_seconds: None,
+			mode: None,
 			storage: Storage::Synthetic,
 		}
 	}
@@ -118,15 +155,21 @@ impl Entry {
 		self.size
 	}
 
-	/// Returns the stored member size before ZIP decompression or TAR sparse
+	/// Returns the stored member size before decompression or sparse
 	/// expansion.
 	#[inline]
 	pub const fn compressed_size(&self) -> u64 {
 		match &self.storage {
 			Storage::Zip { compressed_size, .. } => *compressed_size,
-			Storage::Tar { stored_size, .. } => *stored_size,
+			Storage::Tar { stored_size, .. }
+			| Storage::Iso { stored_size, .. }
+			| Storage::LegacyDos { stored_size, .. }
+			| Storage::Rar { packed_size: stored_size, .. }
+			| Storage::Raw { stored_size, .. }
+			| Storage::Buffered { stored_size, .. } => *stored_size,
+			Storage::CabUnsupported { .. } => self.size,
 			Storage::Asar { .. } => self.size,
-			Storage::Synthetic | Storage::TarLink { .. } | Storage::AsarLink { .. } => 0,
+			Storage::Synthetic | Storage::Link { .. } => 0,
 		}
 	}
 
@@ -135,11 +178,7 @@ impl Entry {
 	pub const fn zip_compression(&self) -> Option<CompressionMethod> {
 		match &self.storage {
 			Storage::Zip { method, .. } => Some(*method),
-			Storage::Synthetic
-			| Storage::Tar { .. }
-			| Storage::TarLink { .. }
-			| Storage::Asar { .. }
-			| Storage::AsarLink { .. } => None,
+			_ => None,
 		}
 	}
 
@@ -148,11 +187,7 @@ impl Entry {
 	pub const fn crc32(&self) -> Option<u32> {
 		match &self.storage {
 			Storage::Zip { crc32, .. } => Some(*crc32),
-			Storage::Synthetic
-			| Storage::Tar { .. }
-			| Storage::TarLink { .. }
-			| Storage::Asar { .. }
-			| Storage::AsarLink { .. } => None,
+			_ => None,
 		}
 	}
 
@@ -165,19 +200,15 @@ impl Entry {
 	/// Returns whether this entry is an unresolved symbolic-link node.
 	#[inline]
 	pub const fn is_link(&self) -> bool {
-		matches!(&self.storage, Storage::TarLink { .. } | Storage::AsarLink { .. })
+		matches!(&self.storage, Storage::Link { .. })
 	}
 
 	/// Returns an unresolved link target.
 	#[inline]
 	pub fn link_target(&self) -> Option<&str> {
 		match &self.storage {
-			Storage::TarLink { target_path } | Storage::AsarLink { target_path } => {
-				Some(target_path.as_str())
-			},
-			Storage::Synthetic | Storage::Zip { .. } | Storage::Tar { .. } | Storage::Asar { .. } => {
-				None
-			},
+			Storage::Link { target_path, .. } => Some(target_path.as_str()),
+			_ => None,
 		}
 	}
 
@@ -185,5 +216,11 @@ impl Entry {
 	#[inline]
 	pub const fn modified_unix_seconds(&self) -> Option<u64> {
 		self.modified_unix_seconds
+	}
+
+	/// Returns Unix permission/type bits when the container records them.
+	#[inline]
+	pub const fn mode(&self) -> Option<u32> {
+		self.mode
 	}
 }

@@ -473,8 +473,12 @@ fn truncated_payloads_fail_while_clean_boundary_eof_and_one_zero_block_terminate
 	let orphan = fixture(&[TarMember::metadata(b'L', b"future.txt\0")]);
 	assert_error_contains(Archive::from_bytes(&orphan[..orphan.len() - 1024]), "orphaned");
 
+	// A gzip stream that is not a tar indexes as a one-member pseudo-archive
+	// ("data" when no filename is available to derive a stem).
 	let not_tar = gzip_bytes(b"hello world\n");
-	assert_error_contains(Archive::from_bytes(&not_tar), "valid TAR archive");
+	let mut archive = Archive::from_bytes(&not_tar).unwrap();
+	assert_eq!(archive.format(), Format::TarGz);
+	assert_eq!(archive.read("data").unwrap(), b"hello world\n");
 }
 
 #[test]
