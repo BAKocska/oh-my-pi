@@ -12,8 +12,9 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	DocumentId, DocumentStore, EditAdapterRegistry, LeaseId, PathService, Result, ServerConfig,
-	lsp_registry::LspRegistry, summary::SummaryService, transaction::TransactionCoordinator,
+	DapAdapterRegistry, DapSessionRegistry, DocumentId, DocumentStore, EditAdapterRegistry, LeaseId,
+	PathService, Result, ServerConfig, lsp_registry::LspRegistry, summary::SummaryService,
+	transaction::TransactionCoordinator,
 };
 
 /// Opaque workspace reservation identity.
@@ -257,8 +258,7 @@ impl WorkspaceLeaseTable {
 		}
 	}
 }
-
-/// Project-scoped document, transaction, path, summary, and LSP authority.
+/// Project-scoped document, transaction, path, summary, LSP, and DAP authority.
 #[derive(Clone)]
 pub struct Environment {
 	inner: Arc<EnvironmentInner>,
@@ -267,6 +267,8 @@ pub struct Environment {
 struct EnvironmentInner {
 	store:            DocumentStore,
 	lsp:              LspRegistry,
+	dap_adapters:     DapAdapterRegistry,
+	dap_sessions:     DapSessionRegistry,
 	transactions:     TransactionCoordinator<LspRegistry>,
 	paths:            PathService,
 	summaries:        SummaryService,
@@ -303,6 +305,8 @@ impl Environment {
 			inner: Arc::new(EnvironmentInner {
 				store,
 				lsp,
+				dap_adapters: DapAdapterRegistry::with_builtins(),
+				dap_sessions: DapSessionRegistry::default(),
 				transactions,
 				paths,
 				summaries: SummaryService::new(),
@@ -338,6 +342,18 @@ impl Environment {
 	#[must_use]
 	pub fn lsp(&self) -> &LspRegistry {
 		&self.inner.lsp
+	}
+
+	/// Returns the project-scoped DAP adapter registry.
+	#[must_use]
+	pub fn dap_adapters(&self) -> &DapAdapterRegistry {
+		&self.inner.dap_adapters
+	}
+
+	/// Returns the project-scoped live DAP session registry.
+	#[must_use]
+	pub fn dap_sessions(&self) -> &DapSessionRegistry {
+		&self.inner.dap_sessions
 	}
 
 	/// Returns the revisioned transaction coordinator.
@@ -382,8 +398,11 @@ impl Environment {
 		self.inner.server_build.as_str()
 	}
 
-	/// Stops every active document actor after connection sessions are closed.
+	/// Terminates debug sessions before stopping every active document actor.
 	pub async fn shutdown(&self) {
+		for session in self.inner.dap_sessions.list() {
+			let _ = session.terminate().await;
+		}
 		self.inner.store.shutdown().await;
 	}
 }
@@ -590,6 +609,15 @@ mod tests {
 		assert_eq!(session.lease_for_document(document_id), None);
 		assert!(session.start_lease_events(lease_id));
 		assert_eq!(session.lease_for_document(document_id), Some(lease_id));
+	}
+
+	#[test]
+	fn environment_owns_a_second_project_registry_for_dap() {
+		let root = TempDir::new().expect("temporary directory");
+		let environment = Environment::new(ServerConfig::new(root.path()).expect("server config"))
+			.expect("environment");
+		assert!(environment.dap_adapters().list().len() >= 14);
+		assert!(environment.dap_sessions().list().is_empty());
 	}
 
 	#[tokio::test]

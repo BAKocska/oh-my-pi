@@ -231,6 +231,205 @@ impl SlotSource for CachedContribution {
 		Ok(())
 	}
 }
+/// Built-in execution-role prompt selected for one immutable turn snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PromptMode {
+	/// Read-only planning and review.
+	Plan,
+	/// Plan validation that switches on the first justified mutation.
+	Prewalk,
+	/// Capture durable lessons after execution.
+	Autolearn,
+	/// Continue autonomously toward a durable goal.
+	Goal,
+	/// Coordinate a broad agent swarm through one orchestration device.
+	Vibe,
+	/// Refresh compacted memory without performing unrelated work.
+	MemoryPipeline,
+	/// Advise without taking workspace ownership.
+	Advisor,
+	/// Gather external evidence before proposing changes.
+	Autoresearch,
+	/// Audit for exploitable security defects.
+	SecurityAudit,
+	/// Measure a defined scenario and report reproducible evidence.
+	Bench,
+	/// Review a concrete change set.
+	Review,
+	/// Prepare a verified, scoped commit.
+	CommitPipeline,
+	/// Remove generated residue without changing behavior.
+	Cleanse,
+	/// Compress context while preserving active constraints.
+	Compress,
+	/// Coordinate edits with live collaborators.
+	LiveCollab,
+}
+
+impl PromptMode {
+	fn prompt(self) -> &'static str {
+		match self {
+			Self::Plan => {
+				"Plan mode is active. Inspect freely, but do not mutate the workspace or spawn \
+				 isolated agents. Produce an executable plan grounded in repository evidence.\n"
+			},
+			Self::Prewalk => {
+				"Prewalk is active. Validate the proposed path first; mutate only after recording a \
+				 concrete reason to execute. If no work is required, settle as a no-op.\n"
+			},
+			Self::Autolearn => {
+				"Autolearn is active. Capture only durable, generalizable lessons supported by \
+				 completed work; do not turn transient failures into standing rules.\n"
+			},
+			Self::Goal => {
+				"Goal mode is active. Continue toward the stated goal within its live budget, pausing \
+				 only on a real external prerequisite or explicit user control.\n"
+			},
+			Self::Vibe => {
+				"Vibe mode is active. Coordinate the swarm through the single agent device, keep \
+				 ownership explicit, and integrate only observable completed results.\n"
+			},
+			Self::MemoryPipeline => {
+				"Memory-pipeline mode is active. Reconcile durable memory with current evidence, \
+				 preserve provenance, and avoid unrelated workspace changes.\n"
+			},
+			Self::Advisor => {
+				"Advisor mode is active. Return evidence-backed advice and risks without claiming \
+				 workspace mutations you do not own.\n"
+			},
+			Self::Autoresearch => {
+				"Autoresearch mode is active. Prefer primary sources, distinguish observation from \
+				 inference, and retain source links for every material claim.\n"
+			},
+			Self::SecurityAudit => {
+				"Security-audit mode is active. Report exploitable, evidence-backed findings with \
+				 affected boundaries and realistic impact; omit speculative noise.\n"
+			},
+			Self::Bench => {
+				"Bench mode is active. Hold the scenario and measurement method constant, run the \
+				 defined workload, and report reproducible observations.\n"
+			},
+			Self::Review => {
+				"Review mode is active. Prioritize correctness, security, and regressions in the \
+				 supplied change set; cite exact evidence and omit style-only churn.\n"
+			},
+			Self::CommitPipeline => {
+				"Commit-pipeline mode is active. Keep the change scoped, verify its observable \
+				 contract, and exclude unrelated user work from the commit.\n"
+			},
+			Self::Cleanse => {
+				"Cleanse mode is active. Remove generated residue and dead scaffolding while \
+				 preserving observable behavior and user-authored work.\n"
+			},
+			Self::Compress => {
+				"Compress mode is active. Preserve active requirements, decisions, provenance, and \
+				 unresolved blockers while deleting redundant context.\n"
+			},
+			Self::LiveCollab => {
+				"Live-collab mode is active. Announce ownership before overlap, consume peer results \
+				 at clear boundaries, and never overwrite concurrent user work.\n"
+			},
+		}
+	}
+}
+
+/// Immutable built-in [`SlotSource`] for one execution mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModePromptSource {
+	mode: PromptMode,
+}
+
+impl ModePromptSource {
+	/// Creates the prompt source for an active mode.
+	#[must_use]
+	pub const fn new(mode: PromptMode) -> Self {
+		Self { mode }
+	}
+
+	/// Wraps this source in the canonical volatile status slot.
+	#[must_use]
+	pub fn registration(self) -> SlotRegistration {
+		SlotRegistration {
+			decl:   SlotDecl {
+				slot:     SlotId::Status,
+				class:    SlotClass::Volatile,
+				owner:    Str::new_static("omp.mode"),
+				priority: 100,
+			},
+			source: Arc::new(self),
+		}
+	}
+}
+
+impl SlotSource for ModePromptSource {
+	fn render(
+		&self,
+		_workspace: &WorkspaceInput,
+		out: &mut dyn PromptOut,
+	) -> Result<(), PromptError> {
+		out.write_str(self.mode.prompt());
+		Ok(())
+	}
+}
+
+/// Availability snapshot for built-in internal-resource prompt entries.
+///
+/// These are immutable per assembler instance so conditional rendering remains
+/// deterministic across the assembler's double-render check.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConditionalPromptEntries {
+	/// `memory://root` is mounted for durable session memory.
+	pub memory_root:    bool,
+	/// `security://scans` is mounted for retained audit findings.
+	pub security_scans: bool,
+	/// `vault://` is mounted with Obsidian operators.
+	pub obsidian_vault: bool,
+}
+
+impl ConditionalPromptEntries {
+	/// Wraps the available entries in the stable runtime slot.
+	#[must_use]
+	pub fn registration(self) -> SlotRegistration {
+		SlotRegistration {
+			decl:   SlotDecl {
+				slot:     SlotId::Runtime,
+				class:    SlotClass::Stable,
+				owner:    Str::new_static("omp.conditional-entries"),
+				priority: 0,
+			},
+			source: Arc::new(self),
+		}
+	}
+}
+
+impl SlotSource for ConditionalPromptEntries {
+	fn render(
+		&self,
+		_workspace: &WorkspaceInput,
+		out: &mut dyn PromptOut,
+	) -> Result<(), PromptError> {
+		if self.memory_root {
+			out.write_str(
+				"`memory://root` is available for durable memory; read before replacing and preserve \
+				 provenance.\n",
+			);
+		}
+		if self.security_scans {
+			out.write_str(
+				"`security://scans` is available for retained audit findings; treat entries as \
+				 evidence, not automatic truth.\n",
+			);
+		}
+		if self.obsidian_vault {
+			out.write_str(
+				"`vault://` Obsidian operators are available; preserve links and frontmatter when \
+				 editing vault notes.\n",
+			);
+		}
+		Ok(())
+	}
+}
 
 /// One declaration paired with its immutable or host-cached source.
 #[derive(Clone)]
@@ -677,5 +876,27 @@ mod tests {
 			.unwrap();
 		assert!(rendered.items.is_empty());
 		assert_eq!(journal.0.lock().len(), 1);
+	}
+
+	#[test]
+	fn built_in_mode_and_conditional_sources_render_only_selected_entries() {
+		let mut mode = String::new();
+		ModePromptSource::new(PromptMode::Prewalk)
+			.render(&WorkspaceInput::default(), &mut mode)
+			.unwrap();
+		assert!(mode.contains("reason to execute"));
+		assert!(mode.contains("no-op"));
+
+		let mut conditional = String::new();
+		ConditionalPromptEntries {
+			memory_root:    true,
+			security_scans: false,
+			obsidian_vault: true,
+		}
+		.render(&WorkspaceInput::default(), &mut conditional)
+		.unwrap();
+		assert!(conditional.contains("memory://root"));
+		assert!(!conditional.contains("security://scans"));
+		assert!(conditional.contains("vault://"));
 	}
 }

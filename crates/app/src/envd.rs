@@ -6,6 +6,7 @@ pub mod docs;
 pub(crate) mod eval;
 pub mod exec;
 mod journal_runtime;
+mod media_devices;
 pub mod policy;
 pub mod server;
 pub(crate) mod site;
@@ -394,6 +395,27 @@ impl ProjectEnvironment {
 		});
 		let mut tasks = vec![in_process, owner];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
+		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
+	}
+
+	/// Starts an embedded Environment rooted at one isolated worktree.
+	pub(crate) async fn isolated(root: &Path, state_dir: &Path) -> Result<Self, EnvdError> {
+		let (worker_config, data_bindings) =
+			worker_config(state_dir, true, omp_tool::DEFAULT_INTERRUPT_GRACE)?;
+		let server =
+			Arc::new(EnvServer::open_local(root, state_dir, Registry::new(), worker_config).await?);
+		let registry = server.registry();
+		let eval_bridge = server.eval_bridge();
+		let eval_control = server.eval_control();
+		let (client, transport) = EnvClient::in_process(64);
+		let in_process_server = Arc::clone(&server);
+		let in_process =
+			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
+		let shutdown = CancellationToken::new();
+		let mut tasks = vec![in_process];
+		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
+		hello(&client).await?;
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
 		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
 	}

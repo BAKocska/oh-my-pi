@@ -72,6 +72,96 @@ const WORKER_LAYER_CEILING: u64 = 8;
 const MAX_CONCURRENT_SPAWNS: u64 = 4;
 static NEXT_CONNECTION_OWNER: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug, Default)]
+struct InvocationExecutionPolicy {
+	tool:      Str,
+	plan:      bool,
+	plan_yolo: bool,
+}
+
+impl InvocationExecutionPolicy {
+	fn from_request(request: &pb::InvokeTool) -> Self {
+		let props = request.props.as_ref();
+		let mode = props
+			.and_then(|props| props.fields.get(omp_agent::EXECUTION_MODE_PROP))
+			.and_then(|value| value.kind.as_ref())
+			.and_then(|kind| match kind {
+				omp_proto::inference::v1::value::Kind::String(value) => Some(value.as_str()),
+				_ => None,
+			});
+		let plan_yolo = props
+			.and_then(|props| props.fields.get(omp_agent::PLAN_YOLO_PROP))
+			.and_then(|value| value.kind.as_ref())
+			.is_some_and(|kind| matches!(kind, omp_proto::inference::v1::value::Kind::Bool(true)));
+		Self { tool: Str::from(request.name.as_str()), plan: mode == Some("plan"), plan_yolo }
+	}
+
+	fn denial(&self, effects: &Effects, raw: &[u8]) -> Option<Str> {
+		if !self.plan
+			|| !omp_agent::effects_mutate_environment(effects)
+			|| self.plan_yolo
+			|| plan_exempt_target(&self.tool, raw)
+		{
+			return None;
+		}
+		Some(Str::new_static(
+			"plan mode denied a mutating tool call at the Environment boundary; write plan and \
+			 scratch artifacts under local:// (vault:// and sandbox:// are also exempt), or exit \
+			 plan mode before changing the workspace",
+		))
+	}
+}
+
+fn plan_exempt_target(tool: &str, raw: &[u8]) -> bool {
+	let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
+		return false;
+	};
+	let mut targets = Vec::new();
+	collect_plan_targets(tool, &value, &mut targets);
+	!targets.is_empty() && targets.into_iter().all(exempt_plan_path)
+}
+
+fn collect_plan_targets<'a>(tool: &str, value: &'a serde_json::Value, targets: &mut Vec<&'a str>) {
+	match value {
+		serde_json::Value::Object(fields) => {
+			for (key, value) in fields {
+				if matches!(key.as_str(), "path" | "target" | "file" | "cwd")
+					&& let Some(path) = value.as_str()
+				{
+					targets.push(path);
+				} else if tool == "edit"
+					&& key == "input"
+					&& let Some(patch) = value.as_str()
+				{
+					for line in patch.lines() {
+						if let Some(header) = line
+							.strip_prefix('[')
+							.and_then(|line| line.split_once('#'))
+							.map(|(path, _)| path)
+						{
+							targets.push(header);
+						}
+					}
+				} else {
+					collect_plan_targets(tool, value, targets);
+				}
+			}
+		},
+		serde_json::Value::Array(values) => {
+			for value in values {
+				collect_plan_targets(tool, value, targets);
+			}
+		},
+		_ => {},
+	}
+}
+
+fn exempt_plan_path(path: &str) -> bool {
+	["local://", "vault://", "sandbox://"]
+		.iter()
+		.any(|prefix| path.starts_with(prefix))
+}
+
 /// Environment-daemon assembly or serving failure.
 #[derive(Debug, Error)]
 pub enum EnvdError {
@@ -507,6 +597,13 @@ impl EnvServer {
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let telemetry = Arc::new(
+			omp_storage::telemetry_index::TelemetryIndex::open(
+				&state_dir.join("telemetry"),
+				&state_dir.join("telemetry.sqlite3"),
+			)
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
+		);
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
@@ -523,7 +620,7 @@ impl EnvServer {
 			workspace.clone(),
 			documents.clone(),
 			blobs.clone(),
-			state_dir.join("workspace-ops"),
+			crate::worktree_cmd::project_worktree_root(state_dir)?,
 		)?;
 		let tool_settings = crate::settings::Settings::load(state_dir).tools;
 		let (registry, eval_bridge, eval_control, checkpoint_control) = production_registry(
@@ -531,6 +628,7 @@ impl EnvServer {
 			&blobs,
 			&exec,
 			&workspace,
+			&telemetry,
 			&hello.root_uri,
 			ext_hosts.as_ref(),
 			interrupt_grace,
@@ -590,6 +688,13 @@ impl EnvServer {
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let telemetry = Arc::new(
+			omp_storage::telemetry_index::TelemetryIndex::open(
+				&state_dir.join("telemetry"),
+				&state_dir.join("telemetry.sqlite3"),
+			)
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
+		);
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
@@ -606,7 +711,7 @@ impl EnvServer {
 			workspace.clone(),
 			documents.clone(),
 			blobs.clone(),
-			state_dir.join("workspace-ops"),
+			crate::worktree_cmd::project_worktree_root(state_dir)?,
 		)?;
 		let tool_settings = crate::settings::Settings::load(state_dir).tools;
 		let (registry, eval_bridge, eval_control, checkpoint_control) = production_registry(
@@ -614,6 +719,7 @@ impl EnvServer {
 			&blobs,
 			&exec,
 			&workspace,
+			&telemetry,
 			&hello.root_uri,
 			ext_hosts.as_ref(),
 			interrupt_grace,
@@ -1357,6 +1463,27 @@ impl EnvServer {
 				}
 			},
 			client_frame::Body::ArgsCommitted(request) => {
+				let denial =
+					match connection.plan_denial(frame.request_id, &request.invocation_id, &request.raw)
+					{
+						Ok(denial) => denial,
+						Err((code, message)) => {
+							send_error(responses, frame.request_id, code, message).await;
+							return;
+						},
+					};
+				if let Some(denial) = denial {
+					let invocation_id = Str::from(request.invocation_id.as_str());
+					send_invocation_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::PermissionDenied,
+						&denial,
+					)
+					.await;
+					connection.abandon_admission(frame.request_id, &invocation_id);
+					return;
+				}
 				let query = match connection.invocation_mut(frame.request_id, &request.invocation_id) {
 					Ok(InvocationState::Native { admission, .. })
 					| Ok(InvocationState::Worker { admission, .. }) => {
@@ -2153,18 +2280,6 @@ impl EnvServer {
 		{
 			return;
 		}
-		if matches!(
-			&operation,
-			Op::Merge(request) if matches!(request.strategy.as_str(), "patch" | "branch")
-		) {
-			send_unsupported_data(
-				responses,
-				request_id,
-				"worktree patch/branch merge results without a lossless wire arm",
-			)
-			.await;
-			return;
-		}
 		let cancel = CancellationToken::new();
 		let result = match operation {
 			Op::Create(request) => {
@@ -2172,9 +2287,12 @@ impl EnvServer {
 					.workspace_ops
 					.create_worktree(&request, &cancel)
 					.map(|worktree| pb::WorktreeResult {
-						worktree:  Some(worktree),
-						conflicts: Vec::new(),
-						props:     Default::default(),
+						worktree:      Some(worktree),
+						conflicts:     Vec::new(),
+						artifact_hash: Bytes::new(),
+						artifact_size: 0,
+						branch:        None,
+						props:         Default::default(),
 					})
 			},
 			Op::Destroy(request) => {
@@ -2182,18 +2300,26 @@ impl EnvServer {
 					.workspace_ops
 					.destroy_worktree(&request, &cancel)
 					.map(|worktree| pb::WorktreeResult {
-						worktree:  Some(worktree),
-						conflicts: Vec::new(),
-						props:     Default::default(),
+						worktree:      Some(worktree),
+						conflicts:     Vec::new(),
+						artifact_hash: Bytes::new(),
+						artifact_size: 0,
+						branch:        None,
+						props:         Default::default(),
 					})
 			},
 			Op::Merge(request) => self
 				.workspace_ops
 				.merge_worktree(&request, &cancel)
 				.map(|merge| pb::WorktreeResult {
-					worktree:  Some(merge.worktree),
-					conflicts: merge.conflicts,
-					props:     Default::default(),
+					worktree:      Some(merge.worktree),
+					conflicts:     merge.conflicts,
+					artifact_hash: merge
+						.artifact
+						.map_or_else(Bytes::new, |artifact| Bytes::copy_from_slice(&artifact.hash)),
+					artifact_size: merge.artifact.map_or(0, |artifact| artifact.size),
+					branch:        merge.branch.map(|branch| branch.to_string()),
+					props:         Default::default(),
 				}),
 		};
 		match result {
@@ -2647,6 +2773,7 @@ impl EnvServer {
 			.effects(&request.name)
 			.expect("a routed tool has a declared effect envelope")
 			.clone();
+		let execution = InvocationExecutionPolicy::from_request(&request);
 		let cancel = CancellationToken::new();
 		if route == ToolRoute::Native {
 			let (feed, params) = IncomingParams::owned_channel(connection.owner.clone());
@@ -2662,6 +2789,7 @@ impl EnvServer {
 					admission,
 					pending_commit: None,
 					maximum_effects: maximum_effects.clone(),
+					execution: execution.clone(),
 					cancel: cancel.clone(),
 				}),
 			);
@@ -2732,6 +2860,7 @@ impl EnvServer {
 					admission: AdmissionGate::new(invocation_id.clone(), name, deadline),
 					pending_commit: None,
 					maximum_effects,
+					execution,
 					interrupt,
 					interrupts: Some(interrupts),
 					cancel,
@@ -3099,6 +3228,7 @@ enum InvocationState {
 		admission:       AdmissionGate,
 		pending_commit:  Option<pb::ArgsCommitted>,
 		maximum_effects: Effects,
+		execution:       InvocationExecutionPolicy,
 		cancel:          CancellationToken,
 	},
 	Worker {
@@ -3109,6 +3239,7 @@ enum InvocationState {
 		admission:       AdmissionGate,
 		pending_commit:  Option<pb::ArgsCommitted>,
 		maximum_effects: Effects,
+		execution:       InvocationExecutionPolicy,
 		interrupt:       flume::Sender<pb::Interrupt>,
 		interrupts:      Option<flume::Receiver<pb::Interrupt>>,
 		cancel:          CancellationToken,
@@ -3262,6 +3393,32 @@ impl ConnectionState {
 	) -> Result<&mut InvocationState, (pb::ProtocolErrorCode, &'static str)> {
 		match self.requests.get_mut(&request_id) {
 			Some(RequestState::Invocation(state)) if state.id() == invocation_id => Ok(state),
+			Some(RequestState::Invocation(_)) => Err((
+				pb::ProtocolErrorCode::InvalidArgument,
+				"invocation_id does not match the open request",
+			)),
+			Some(_) => Err((
+				pb::ProtocolErrorCode::PreconditionFailed,
+				"request_id is not an invocation stream",
+			)),
+			None => Err((pb::ProtocolErrorCode::NotFound, "invocation is not open")),
+		}
+	}
+
+	fn plan_denial(
+		&self,
+		request_id: u64,
+		invocation_id: &str,
+		raw: &[u8],
+	) -> Result<Option<Str>, (pb::ProtocolErrorCode, &'static str)> {
+		match self.requests.get(&request_id) {
+			Some(RequestState::Invocation(state)) if state.id() == invocation_id => {
+				let (execution, maximum_effects) = match state {
+					InvocationState::Native { execution, maximum_effects, .. }
+					| InvocationState::Worker { execution, maximum_effects, .. } => (execution, maximum_effects),
+				};
+				Ok(execution.denial(maximum_effects, raw))
+			},
 			Some(RequestState::Invocation(_)) => Err((
 				pb::ProtocolErrorCode::InvalidArgument,
 				"invocation_id does not match the open request",
@@ -4659,10 +4816,6 @@ async fn send_workspace_operation_error(
 			send_error(responses, request_id, pb::ProtocolErrorCode::NotFound, &error.to_string())
 				.await;
 		},
-		WorkspaceOperationError::CowUnsupported => {
-			send_error(responses, request_id, pb::ProtocolErrorCode::Unsupported, &error.to_string())
-				.await;
-		},
 		WorkspaceOperationError::OutsideRoot
 		| WorkspaceOperationError::InvalidGeneration(_)
 		| WorkspaceOperationError::InvalidWorktreeName => {
@@ -4674,7 +4827,9 @@ async fn send_workspace_operation_error(
 			)
 			.await;
 		},
-		WorkspaceOperationError::Workspace(_) | WorkspaceOperationError::Io(_) => {
+		WorkspaceOperationError::Workspace(_)
+		| WorkspaceOperationError::Io(_)
+		| WorkspaceOperationError::InvalidWorktreeRecord(_) => {
 			send_error(responses, request_id, pb::ProtocolErrorCode::Internal, &error.to_string())
 				.await;
 		},
@@ -5063,19 +5218,6 @@ async fn send_policy_error(
 		PolicyError::QuotaExceeded { .. } => unreachable!("quota errors returned above"),
 	};
 	send_error(responses, request_id, code, message.as_str()).await;
-}
-async fn send_unsupported_data(
-	responses: &flume::Sender<pb::ServerFrame>,
-	request_id: u64,
-	operation: &str,
-) {
-	send_error(
-		responses,
-		request_id,
-		pb::ProtocolErrorCode::Unsupported,
-		&format!("{operation} are not implemented by this environment"),
-	)
-	.await;
 }
 
 async fn send_data_response(
@@ -6089,5 +6231,58 @@ mod tests {
 			.await
 			.expect("stale authority task")
 			.expect("stale authority shutdown");
+	}
+	#[test]
+	fn plan_guard_denies_workspace_mutation_and_exempts_local_artifacts() {
+		let effects = Effects {
+			documents: Some(omp_tool::DocEffects {
+				read:        true,
+				write_globs: Arc::from([Str::new_static("**")]),
+			}),
+			..Effects::empty()
+		};
+		let policy = InvocationExecutionPolicy {
+			tool:      Str::from("write"),
+			plan:      true,
+			plan_yolo: false,
+		};
+		assert!(
+			policy
+				.denial(&effects, br#"{"path":"src/lib.rs","content":"x"}"#)
+				.is_some()
+		);
+		assert!(
+			policy
+				.denial(&effects, br#"{"path":"local://PLAN.md","content":"x"}"#)
+				.is_none()
+		);
+		assert!(
+			policy
+				.denial(&effects, br#"{"path":"vault://plans/x","content":"x"}"#)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn plan_yolo_authorizes_exactly_the_tagged_invocation() {
+		let effects = Effects {
+			exec: Some(omp_tool::ExecEffects {
+				commands: Arc::from([Str::new_static("*")]),
+				network:  false,
+			}),
+			..Effects::empty()
+		};
+		let yolo = InvocationExecutionPolicy {
+			tool:      Str::from("shell"),
+			plan:      true,
+			plan_yolo: true,
+		};
+		let plan = InvocationExecutionPolicy {
+			tool:      Str::from("shell"),
+			plan:      true,
+			plan_yolo: false,
+		};
+		assert!(yolo.denial(&effects, br#"{"command":"touch x"}"#).is_none());
+		assert!(plan.denial(&effects, br#"{"command":"touch x"}"#).is_some());
 	}
 }

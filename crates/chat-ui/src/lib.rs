@@ -8,6 +8,7 @@
 pub mod actions;
 pub mod ask;
 pub mod completion;
+pub mod gradient;
 pub mod host;
 mod overlays;
 pub mod palette;
@@ -21,6 +22,7 @@ pub mod welcome;
 pub mod slots;
 use std::time::Instant;
 
+pub use gradient::{EditorGradient, EditorHighlight, GradientStop};
 use omp_core::Str;
 pub use omp_tui::components::Attachment;
 pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
@@ -130,6 +132,47 @@ pub enum CompactionSpeculationStatus {
 	Armed,
 }
 
+/// Fixed-capacity activity bands rendered by the `/live` status sparkline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivityWaveform {
+	bands: [u8; 24],
+	len:   u8,
+}
+
+impl ActivityWaveform {
+	/// Creates an empty activity history.
+	#[must_use]
+	pub const fn new() -> Self {
+		Self { bands: [0; 24], len: 0 }
+	}
+
+	/// Appends one normalized activity band, dropping the oldest when full.
+	pub fn push(&mut self, band: u8) {
+		let band = band.min(4);
+		let len = usize::from(self.len);
+		if len < self.bands.len() {
+			self.bands[len] = band;
+			self.len = self.len.saturating_add(1);
+		} else {
+			self.bands.copy_within(1.., 0);
+			let last = self.bands.len() - 1;
+			self.bands[last] = band;
+		}
+	}
+
+	/// Borrows populated bands from oldest to newest.
+	#[must_use]
+	pub fn bands(&self) -> &[u8] {
+		&self.bands[..usize::from(self.len)]
+	}
+}
+
+impl Default for ActivityWaveform {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 /// Complete host-supplied status snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct StatusFacts {
@@ -165,6 +208,8 @@ pub struct StatusFacts {
 	pub dropped:                u64,
 	/// Repository facts, omitted when unavailable.
 	pub git:                    Option<GitFacts>,
+	/// `/live` firehose activity history, absent when live display is disabled.
+	pub live_activity:          Option<ActivityWaveform>,
 }
 
 /// How a composer submission interacts with an active turn.

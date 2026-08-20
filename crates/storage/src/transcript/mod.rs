@@ -15,6 +15,7 @@ pub mod codec;
 #[cfg(test)]
 mod codec_tests;
 pub mod event;
+pub mod import;
 pub mod msg;
 pub mod patch;
 mod raweq;
@@ -30,6 +31,9 @@ pub use event::{
 	HookOutcome, ItemRecord, JobRegistered, JobSettled, Kind, PolicyDecision, PromptRewriteCommit,
 	PromptRewriteIntent, PromptRewriteStage, SupersededCompaction, ToolBatchAuthorized, TurnAbort,
 	TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
+};
+pub use import::{
+	ForeignFormat, ImportDiagnostic, ImportedEntry, ImportedTranscript, parse_foreign_jsonl,
 };
 pub use msg::{Content, Msg, UserBlock};
 pub use patch::Patch;

@@ -1,10 +1,11 @@
 //! Speculative environment invocations and ordered concurrent tool batches.
 
 use std::{
+	collections::BTreeMap,
 	fmt,
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicBool, AtomicU128, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU128, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +16,7 @@ use omp_core::{IntoStr, Str, StrMut};
 use omp_env::{ClientError, EnvClient, Invocation, InvocationEvent};
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation, InvokeTool, Verdict as EnvVerdict},
+	inference::v1 as value_pb,
 	policy::v1::EffectEnvelope,
 	thread::v1::{Item, Part as CanonicalPart},
 	toolhost::v1::HookEventId,
@@ -30,6 +32,133 @@ use crate::{
 	events::{AgentEvent, EventBus},
 	project::{tool_result_item, tool_result_item_canonical_parts},
 };
+
+/// Namespaced invocation property carrying the environment-enforced mode.
+pub const EXECUTION_MODE_PROP: &str = "omp/execution-mode";
+/// Namespaced authorization for the one plan-to-execution transition.
+pub const PLAN_YOLO_PROP: &str = "omp/plan-yolo";
+/// Namespaced explanation for an automatic prewalk transition.
+pub const PREWALK_REASON_PROP: &str = "omp/prewalk-reason";
+
+/// Mutually exclusive application execution mode projected onto each
+/// invocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ExecutionMode {
+	/// Ordinary interactive execution.
+	#[default]
+	Standard = 0,
+	/// Read-only planning enforced by the Environment.
+	Plan     = 1,
+	/// Planning which may make one env-authorized transition on first mutation.
+	PlanYolo = 2,
+	/// Goal auto-continuation.
+	Goal     = 3,
+	/// Director/worker vibe orchestration.
+	Vibe     = 4,
+	/// Cheap prewalk reasoning until the first mutation.
+	Prewalk  = 5,
+}
+
+/// Cloneable atomic mode handle shared by the application and loop.
+#[derive(Clone, Debug, Default)]
+pub struct ExecutionModeHandle(Arc<AtomicU8>);
+
+impl ExecutionModeHandle {
+	/// Replaces the current mutually exclusive execution mode.
+	pub fn set(&self, mode: ExecutionMode) {
+		self.0.store(mode as u8, Ordering::Release);
+	}
+
+	/// Returns the current execution mode.
+	#[must_use]
+	pub fn get(&self) -> ExecutionMode {
+		match self.0.load(Ordering::Acquire) {
+			1 => ExecutionMode::Plan,
+			2 => ExecutionMode::PlanYolo,
+			3 => ExecutionMode::Goal,
+			4 => ExecutionMode::Vibe,
+			5 => ExecutionMode::Prewalk,
+			_ => ExecutionMode::Standard,
+		}
+	}
+
+	/// Builds immutable invocation metadata and performs one-way prewalk/yolo
+	/// automation on the first mutating tool.
+	#[must_use]
+	pub fn invocation_props(&self, effects: &Effects) -> value_pb::ValueMap {
+		let mut mode = self.get();
+		let mut fields = BTreeMap::new();
+		if effects_mutate_environment(effects) {
+			match mode {
+				ExecutionMode::PlanYolo => {
+					if self
+						.0
+						.compare_exchange(
+							ExecutionMode::PlanYolo as u8,
+							ExecutionMode::Standard as u8,
+							Ordering::AcqRel,
+							Ordering::Acquire,
+						)
+						.is_ok()
+					{
+						fields.insert(PLAN_YOLO_PROP.to_owned(), bool_value(true));
+					} else {
+						mode = self.get();
+					}
+				},
+				ExecutionMode::Prewalk => {
+					if self
+						.0
+						.compare_exchange(
+							ExecutionMode::Prewalk as u8,
+							ExecutionMode::Standard as u8,
+							Ordering::AcqRel,
+							Ordering::Acquire,
+						)
+						.is_ok()
+					{
+						fields.insert(
+							PREWALK_REASON_PROP.to_owned(),
+							string_value("first mutating environment effect"),
+						);
+					} else {
+						mode = self.get();
+					}
+				},
+				_ => {},
+			}
+		}
+		let label = match mode {
+			ExecutionMode::Standard => "standard",
+			ExecutionMode::Plan | ExecutionMode::PlanYolo => "plan",
+			ExecutionMode::Goal => "goal",
+			ExecutionMode::Vibe => "vibe",
+			ExecutionMode::Prewalk => "prewalk",
+		};
+		fields.insert(EXECUTION_MODE_PROP.to_owned(), string_value(label));
+		value_pb::ValueMap { fields }
+	}
+}
+
+/// Returns whether an effect envelope may mutate Environment-owned state.
+#[must_use]
+pub fn effects_mutate_environment(effects: &Effects) -> bool {
+	effects
+		.documents
+		.as_ref()
+		.is_some_and(|documents| !documents.write_globs.is_empty())
+		|| effects.exec.as_ref().is_some_and(|exec| !exec.is_empty())
+		|| effects.subagents != 0
+}
+
+fn string_value(value: &'static str) -> value_pb::Value {
+	value_pb::Value { kind: Some(value_pb::value::Kind::String(value.to_owned())) }
+}
+
+fn bool_value(value: bool) -> value_pb::Value {
+	value_pb::Value { kind: Some(value_pb::value::Kind::Bool(value)) }
+}
 
 /// Failure to open, relay, decode, project, or lower a tool invocation.
 #[derive(Debug)]
@@ -587,7 +716,7 @@ struct SpeculativeCallInner {
 }
 
 impl SpeculativeCall {
-	/// Opens an environment invocation without authorizing effects.
+	/// Opens an environment invocation without mode metadata.
 	pub async fn open(
 		env: &EnvClient,
 		events: &EventBus,
@@ -595,13 +724,25 @@ impl SpeculativeCall {
 		identity: ToolIdentity,
 		deadline: Duration,
 	) -> Result<Self, BatchError> {
+		Self::open_with_props(env, events, call_id, identity, deadline, Default::default()).await
+	}
+
+	/// Opens an invocation carrying immutable environment policy metadata.
+	pub async fn open_with_props(
+		env: &EnvClient,
+		events: &EventBus,
+		call_id: Str,
+		identity: ToolIdentity,
+		deadline: Duration,
+		props: value_pb::ValueMap,
+	) -> Result<Self, BatchError> {
 		let invocation = env
 			.invoke(InvokeTool {
 				invocation_id: call_id.to_string(),
 				name:          identity.name.to_string(),
 				rev:           identity.rev.to_string(),
 				deadline_ms:   u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-				props:         Default::default(),
+				props:         Some(props),
 			})
 			.await?;
 		events.publish(AgentEvent::ToolOpened {
@@ -1851,5 +1992,55 @@ mod tests {
 		let results = run_backpressured_commit_race(true).await;
 		assert_eq!(results.len(), 1);
 		assert_eq!(terminal_text(&results[0]), "committed");
+	}
+	#[test]
+	fn prewalk_transitions_once_on_first_mutating_effect() {
+		let mode = ExecutionModeHandle::default();
+		mode.set(ExecutionMode::Prewalk);
+		let read_only = Effects {
+			documents: Some(omp_tool::DocEffects { read: true, write_globs: Arc::default() }),
+			..Effects::empty()
+		};
+		let mutating = Effects {
+			documents: Some(omp_tool::DocEffects {
+				read:        true,
+				write_globs: Arc::from([Str::new_static("**")]),
+			}),
+			..Effects::empty()
+		};
+		let read_props = mode.invocation_props(&read_only);
+		assert_eq!(mode.get(), ExecutionMode::Prewalk);
+		assert!(!read_props.fields.contains_key(PREWALK_REASON_PROP));
+		let write_props = mode.invocation_props(&mutating);
+		assert_eq!(mode.get(), ExecutionMode::Standard);
+		assert!(write_props.fields.contains_key(PREWALK_REASON_PROP));
+		assert!(
+			!mode
+				.invocation_props(&mutating)
+				.fields
+				.contains_key(PREWALK_REASON_PROP)
+		);
+	}
+
+	#[test]
+	fn plan_yolo_is_a_single_env_authorized_transition() {
+		let mode = ExecutionModeHandle::default();
+		mode.set(ExecutionMode::PlanYolo);
+		let mutating = Effects {
+			exec: Some(omp_tool::ExecEffects {
+				commands: Arc::from([Str::new_static("*")]),
+				network:  false,
+			}),
+			..Effects::empty()
+		};
+		let props = mode.invocation_props(&mutating);
+		assert!(props.fields.contains_key(PLAN_YOLO_PROP));
+		assert_eq!(mode.get(), ExecutionMode::Standard);
+		assert!(
+			!mode
+				.invocation_props(&mutating)
+				.fields
+				.contains_key(PLAN_YOLO_PROP)
+		);
 	}
 }

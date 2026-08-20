@@ -17,8 +17,8 @@ use omp_agent::{
 	InterruptSource, RewindTarget, TurnClient,
 };
 use omp_chat_ui::{
-	AgentRow, Attachment, BackendEvent, Chat, Intent, ModelRow, RewindTargetRow, SessionRow,
-	StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
+	ActivityWaveform, AgentRow, Attachment, BackendEvent, Chat, Intent, ModelRow, RewindTargetRow,
+	SessionRow, StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
 	host::{HostExit, HostOptions},
 };
 use omp_core::{Str, encoding::hex, fmts};
@@ -31,12 +31,16 @@ use omp_proto::{
 	inference::v1::{part_start, turn_event::Event, value},
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
+use omp_telemetry::firehose::{
+	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
+};
 use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::ViewState};
 use omp_tui::{UiContext, components::AttachmentContent, detect};
 use secrecy::SecretString;
 
 use crate::{
-	chat_ui::input::{ChatCommand, CommandContribution, CommandRoster},
+	chat_ui::input::{ChatCommand, CommandContribution, CommandRoster, ParsedTurnBudget},
+	modes::{ActiveMode, ExecutionModes, Goal, GoalStatus, GoalUsage},
 	settings::Settings,
 };
 
@@ -184,7 +188,10 @@ pub struct ChatUiSession {
 enum UiCmd {
 	/// Boxes the foreign generated protobuf item; one allocation is paid per
 	/// user submit.
-	Submit(Box<Item>),
+	Submit {
+		item:   Box<Item>,
+		budget: Option<ParsedTurnBudget>,
+	},
 	ListRewind {
 		reply: flume::Sender<Result<Vec<RewindTarget>, String>>,
 	},
@@ -228,6 +235,8 @@ struct BridgeState {
 	tools:             HashMap<Str, ToolDisplay>,
 	rewind_targets:    Vec<RewindTarget>,
 	pending_auth_kind: Option<AuthPromptKind>,
+	live_enabled:      bool,
+	live_activity:     ActivityWaveform,
 	replaying_turn:    bool,
 	settings:          Settings,
 	commands:          CommandRoster,
@@ -243,6 +252,7 @@ pub async fn run<'a, C, R>(
 	session: ChatUiSession,
 	registry: Arc<Registry>,
 	tree: Arc<AgentTree>,
+	modes: Arc<ExecutionModes>,
 	auth: Option<&'a ChatAuth>,
 	data_dir: PathBuf,
 	command_sources: Vec<Vec<CommandContribution>>,
@@ -256,6 +266,17 @@ where
 	let bus = agent.events().clone();
 	let mailbox = agent.mailbox();
 	let agent_events = bus.subscribe_ui(256);
+	let live_events = agent.firehose().subscribe(SubscriptionOptions::new(
+		[
+			FirehoseKind::TurnStart,
+			FirehoseKind::TurnEnd,
+			FirehoseKind::ModelRequest,
+			FirehoseKind::ModelAttempt,
+			FirehoseKind::ProviderError,
+			FirehoseKind::ToolCall,
+		],
+		128,
+	)?)?;
 	let mut roster_events = tree.watch_roster();
 	let mut roster_tick = tokio::time::interval(Duration::from_millis(100));
 	roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -266,6 +287,7 @@ where
 		agent.journal().pending_input_submission().is_some(),
 	);
 
+	let submission_state = agent.state().clone();
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
 	let (error_tx, error_rx) = flume::unbounded::<String>();
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
@@ -286,7 +308,8 @@ where
 		}
 		while let Ok(command) = ui_rx.recv_async().await {
 			match command {
-				UiCmd::Submit(item) => {
+				UiCmd::Submit { item, budget } => {
+					apply_turn_budget(&submission_state, budget.as_ref());
 					let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
 					let ack = match agent.submit([*item], turn_id).await {
 						Ok(summary) => SubmitAck {
@@ -298,6 +321,7 @@ where
 							SubmitAck { interrupted: false, committed_turns: 0 }
 						},
 					};
+					apply_turn_budget(&submission_state, None);
 					let _ = ack_tx.send(ack);
 				},
 				UiCmd::ListRewind { reply } => {
@@ -337,6 +361,8 @@ where
 		active_parts: HashMap::new(),
 		tools: HashMap::new(),
 		rewind_targets: Vec::new(),
+		live_enabled: false,
+		live_activity: ActivityWaveform::new(),
 		pending_auth_kind: None,
 		replaying_turn: false,
 		settings: Settings::load(&data_dir),
@@ -381,6 +407,7 @@ where
 						&mailbox,
 						&abort,
 						&agent_state,
+						&modes,
 						auth,
 						&data_dir,
 						&mut list_sessions,
@@ -425,6 +452,7 @@ where
 							&backend_tx,
 							&mut state,
 							&event,
+							modes.as_ref(),
 							registry.as_ref(),
 							&bus,
 							agent_events.dropped(),
@@ -440,6 +468,9 @@ where
 						bus.publish(AgentEvent::RosterChanged {
 							generation: tree.roster_generation(),
 						});
+					}
+					if drain_live_activity(&live_events, &mut state) {
+						send_status(&backend_tx, &state, &bus, agent_events.dropped());
 					}
 				},
 			}
@@ -462,6 +493,192 @@ where
 	bridge_result?;
 	host_result.map_err(Into::into)
 }
+fn mode_name(mode: ActiveMode) -> &'static str {
+	match mode {
+		ActiveMode::Standard => "standard",
+		ActiveMode::Plan => "plan",
+		ActiveMode::Prewalk => "prewalk",
+		ActiveMode::Goal => "goal",
+		ActiveMode::Vibe => "vibe",
+	}
+}
+
+fn handle_plan_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionModes, args: &str) {
+	let result = match args.trim() {
+		"" | "status" => {
+			send_backend(
+				backend,
+				BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+			);
+			return;
+		},
+		"on" => modes.enter_plan(false),
+		"yolo" => modes.enter_plan(true),
+		"off" => {
+			modes.exit_plan();
+			Ok(())
+		},
+		_ => {
+			send_backend(
+				backend,
+				BackendEvent::Error(Str::new_static("Usage: /plan [on|yolo|off|status]")),
+			);
+			return;
+		},
+	};
+	report_mode_result(backend, result, modes);
+}
+
+fn handle_prewalk_command(
+	backend: &flume::Sender<BackendEvent>,
+	modes: &ExecutionModes,
+	args: &str,
+) {
+	let result = match args.trim() {
+		"" | "status" => {
+			send_backend(
+				backend,
+				BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+			);
+			return;
+		},
+		"on" => modes.arm_prewalk(),
+		"off" => {
+			modes.disarm_prewalk();
+			Ok(())
+		},
+		_ => {
+			send_backend(
+				backend,
+				BackendEvent::Error(Str::new_static("Usage: /prewalk [on|off|status]")),
+			);
+			return;
+		},
+	};
+	report_mode_result(backend, result, modes);
+}
+
+fn handle_vibe_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionModes, args: &str) {
+	let result = match args.trim() {
+		"" | "status" => {
+			send_backend(
+				backend,
+				BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+			);
+			return;
+		},
+		"on" => modes.enter_vibe(),
+		"off" => {
+			modes.exit_vibe();
+			Ok(())
+		},
+		_ => {
+			send_backend(
+				backend,
+				BackendEvent::Error(Str::new_static("Usage: /vibe [on|off|status]")),
+			);
+			return;
+		},
+	};
+	report_mode_result(backend, result, modes);
+}
+
+fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionModes, args: &str) {
+	let args = args.trim();
+	let (op, rest) = args
+		.split_once(char::is_whitespace)
+		.map_or((args, ""), |(op, rest)| (op, rest.trim()));
+	let result = match op {
+		"" => {
+			send_backend(
+				backend,
+				BackendEvent::Notice(Str::new_static(
+					"Use `/goal set <objective> [token-budget]` to start an autonomous goal.",
+				)),
+			);
+			return;
+		},
+		"status" => {
+			send_backend(backend, BackendEvent::Notice(goal_status(modes.goal())));
+			return;
+		},
+		"set" => {
+			let (objective, budget) =
+				rest
+					.rsplit_once(char::is_whitespace)
+					.map_or((rest, None), |(objective, tail)| {
+						tail
+							.trim()
+							.parse::<u64>()
+							.ok()
+							.map_or((rest, None), |budget| (objective.trim(), Some(budget)))
+					});
+			modes.set_goal(objective, budget, now_ms())
+		},
+		"pause" => modes.pause_goal(now_ms()),
+		"resume" => modes.resume_goal(now_ms()),
+		"complete" => modes.complete_goal(now_ms()),
+		"drop" => modes.drop_goal(now_ms()),
+		"budget" => match rest.parse::<u64>() {
+			Ok(budget) => modes.set_goal_budget(budget),
+			Err(_) => {
+				send_backend(
+					backend,
+					BackendEvent::Error(Str::new_static("Usage: /goal budget <positive-tokens>")),
+				);
+				return;
+			},
+		},
+		_ => {
+			send_backend(
+				backend,
+				BackendEvent::Error(Str::new_static(
+					"Usage: /goal [set|pause|resume|complete|drop|budget|status]",
+				)),
+			);
+			return;
+		},
+	};
+	match result {
+		Ok(goal) => send_backend(backend, BackendEvent::Notice(goal_status(Some(goal)))),
+		Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
+	}
+}
+
+fn report_mode_result(
+	backend: &flume::Sender<BackendEvent>,
+	result: Result<(), crate::modes::ModeError>,
+	modes: &ExecutionModes,
+) {
+	match result {
+		Ok(()) => send_backend(
+			backend,
+			BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+		),
+		Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
+	}
+}
+
+fn goal_status(goal: Option<Goal>) -> Str {
+	let Some(goal) = goal else {
+		return Str::new_static("No goal is configured.");
+	};
+	let status = match goal.status {
+		GoalStatus::Active => "active",
+		GoalStatus::Paused => "paused",
+		GoalStatus::BudgetLimited => "budget-limited",
+		GoalStatus::Complete => "complete",
+		GoalStatus::Dropped => "dropped",
+	};
+	let budget = goal.token_budget.map_or_else(
+		|| "unbounded".to_owned(),
+		|budget| format!("{}/{budget} tokens", goal.tokens_used),
+	);
+	Str::from(format!(
+		"**Goal {status}** · {budget} · {}s\n{}",
+		goal.time_used_seconds, goal.objective
+	))
+}
 
 #[allow(clippy::too_many_arguments, reason = "the bridge owns one explicit production seam")]
 async fn handle_intent<R>(
@@ -471,6 +688,7 @@ async fn handle_intent<R>(
 	mailbox: &omp_agent::MailboxSender,
 	abort: &omp_agent::AbortHandle,
 	agent_state: &AgentState,
+	modes: &ExecutionModes,
 	auth: Option<&ChatAuth>,
 	data_dir: &std::path::Path,
 	list_sessions: &mut R,
@@ -559,6 +777,25 @@ where
 				send_backend(backend, BackendEvent::Notice(message));
 			},
 			Ok(ChatCommand::Settings) => send_backend(backend, BackendEvent::OpenSettings),
+			Ok(ChatCommand::Live) => {
+				state.live_enabled = !state.live_enabled;
+				if state.live_enabled {
+					state.live_activity = ActivityWaveform::new();
+				}
+				send_backend(
+					backend,
+					BackendEvent::Notice(Str::new_static(if state.live_enabled {
+						"Live activity waveform enabled."
+					} else {
+						"Live activity waveform disabled."
+					})),
+				);
+				send_status(backend, state, bus, dropped);
+			},
+			Ok(ChatCommand::Plan(args)) => handle_plan_command(backend, modes, args.as_str()),
+			Ok(ChatCommand::Goal(args)) => handle_goal_command(backend, modes, args.as_str()),
+			Ok(ChatCommand::Vibe(args)) => handle_vibe_command(backend, modes, args.as_str()),
+			Ok(ChatCommand::Prewalk(args)) => handle_prewalk_command(backend, modes, args.as_str()),
 			Ok(ChatCommand::Agents) => send_backend(backend, BackendEvent::OpenAgentTree),
 			Ok(ChatCommand::Pause) => send_backend(backend, BackendEvent::Pause),
 			Ok(ChatCommand::Unavailable { command, reason }) => {
@@ -570,7 +807,7 @@ where
 				}
 				return Ok(true);
 			},
-			Ok(ChatCommand::Submit(item)) => {
+			Ok(ChatCommand::Submit { item, text: prompt_text, budget }) => {
 				if auth.is_some_and(ChatAuth::is_active) {
 					send_backend(
 						backend,
@@ -581,7 +818,7 @@ where
 				} else {
 					let active = chat_active(state.submit_pending, bus.phase());
 					let pending_prompt = (!active).then(|| PendingPrompt {
-						text:        Str::from(text.as_str()),
+						text:        prompt_text.clone(),
 						attachments: attachments.clone(),
 					});
 					let mut item = *item;
@@ -589,25 +826,27 @@ where
 						send_backend(backend, BackendEvent::Error(message));
 					});
 					let delivered = if active {
-						mailbox
+						apply_turn_budget(agent_state, budget.as_ref());
+						let delivered = mailbox
 							.try_enqueue(Interrupt {
 								class: active_submit_class(mode),
 								item,
 								source: InterruptSource::Producer(Str::new_static("user")),
 							})
-							.is_ok()
+							.is_ok();
+						if !delivered {
+							apply_turn_budget(agent_state, None);
+						}
+						delivered
 					} else {
 						state.submit_pending = true;
 						commands_tx
-							.send_async(UiCmd::Submit(Box::new(item)))
+							.send_async(UiCmd::Submit { item: Box::new(item), budget })
 							.await
 							.is_ok()
 					};
 					if delivered {
-						send_backend(backend, BackendEvent::UserReplayed {
-							text: Str::from(text),
-							chips,
-						});
+						send_backend(backend, BackendEvent::UserReplayed { text: prompt_text, chips });
 						if active {
 							state.queued = state.queued.saturating_add(1);
 						} else {
@@ -872,6 +1111,7 @@ fn handle_agent_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	event: &AgentEvent,
+	modes: &ExecutionModes,
 	registry: &Registry,
 	bus: &omp_agent::EventBus,
 	dropped: u64,
@@ -899,6 +1139,17 @@ fn handle_agent_event(
 				}
 				if let Some(snapshot) = &outcome.context_snapshot {
 					state.context_tokens = snapshot.prompt_tokens;
+				}
+				if let Some(usage) = &outcome.usage {
+					let _ = modes.record_goal_usage(
+						GoalUsage {
+							input_tokens:        usage.input_tokens,
+							cache_write_tokens:  usage.cache_write_tokens,
+							cached_input_tokens: usage.cache_read_tokens,
+							output_tokens:       usage.output_tokens,
+						},
+						now_ms(),
+					);
 				}
 				for (_, id) in state.active_parts.drain() {
 					send_backend(backend, BackendEvent::AssistantEnd { id });
@@ -1609,12 +1860,38 @@ fn send_status(
 			attempt: state.attempt,
 			dropped,
 			git: None,
+			live_activity: state.live_enabled.then_some(state.live_activity),
 		}),
 	);
 }
 
 fn send_backend(sender: &flume::Sender<BackendEvent>, event: BackendEvent) {
 	let _ = sender.send(event);
+}
+
+fn drain_live_activity(events: &SubscriptionHandle, state: &mut BridgeState) -> bool {
+	let mut changed = false;
+	while let Ok(event) = events.try_recv() {
+		let band = match &*event {
+			FirehoseEvent::TurnStart(_) => 1,
+			FirehoseEvent::TurnEnd(_) => 0,
+			FirehoseEvent::ModelRequest(_) => 3,
+			FirehoseEvent::ModelAttempt(_) | FirehoseEvent::ProviderError(_) => 4,
+			FirehoseEvent::ToolCall(_) => 2,
+			_ => continue,
+		};
+		if state.live_enabled {
+			state.live_activity.push(band);
+			changed = true;
+		}
+	}
+	changed
+}
+
+fn apply_turn_budget(state: &AgentState, budget: Option<&ParsedTurnBudget>) {
+	state.update(|snapshot| {
+		snapshot.turn.params.task_budget = budget.map(|budget| budget.task.clone());
+	});
 }
 
 fn chat_active(submit_pending: bool, phase: AgentPhase) -> bool {

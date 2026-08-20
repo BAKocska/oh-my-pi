@@ -1,9 +1,13 @@
 //! Persisted application settings and layered extension configuration.
 
-use std::{fmt, fs, io, path::Path};
+use std::{
+	fmt, fs, io,
+	path::{Path, PathBuf},
+};
 
 use omp_agent::{CompactionMethodOrder, CompactionTier};
 use omp_core::{Duration, DurationError};
+use omp_llm_inference::{Difficulty, DifficultyBackend};
 use omp_tool::DEFAULT_INTERRUPT_GRACE;
 use omp_tui::components::ComposerStyle;
 use serde::{
@@ -153,6 +157,72 @@ impl CompactionSettings {
 	}
 }
 
+/// Persisted automatic per-turn reasoning classifier policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutoThinkingSettings {
+	/// Backend used for the constrained-output classifier.
+	#[serde(default = "default_difficulty_backend")]
+	pub backend:     DifficultyBackend,
+	/// Provisional `auto` level while classification settles.
+	#[serde(default)]
+	pub provisional: Difficulty,
+	/// Session-wide effort ceiling applied after classification.
+	#[serde(default = "default_difficulty_ceiling")]
+	pub ceiling:     Difficulty,
+	/// Whether the online five-rung ladder may choose `max`.
+	#[serde(default)]
+	pub allow_max:   bool,
+}
+
+const fn default_difficulty_backend() -> DifficultyBackend {
+	DifficultyBackend::Online
+}
+
+const fn default_difficulty_ceiling() -> Difficulty {
+	Difficulty::Max
+}
+
+impl Default for AutoThinkingSettings {
+	fn default() -> Self {
+		Self {
+			backend:     default_difficulty_backend(),
+			provisional: Difficulty::default(),
+			ceiling:     default_difficulty_ceiling(),
+			allow_max:   false,
+		}
+	}
+}
+
+impl AutoThinkingSettings {
+	/// Builds immutable classifier inputs for an ordinary turn.
+	#[must_use]
+	pub const fn for_turn(self) -> omp_llm_inference::AutoDifficulty {
+		omp_llm_inference::AutoDifficulty {
+			provisional:  self.provisional,
+			ceiling:      self.ceiling,
+			allow_max:    self.allow_max,
+			prewalk_noop: false,
+		}
+	}
+
+	/// Builds classifier inputs for a prewalk turn and applies its no-op hook.
+	#[must_use]
+	pub fn for_prewalk_turn(
+		self,
+		reason_to_execute: Option<&str>,
+	) -> omp_llm_inference::AutoDifficulty {
+		self.for_turn().with_prewalk_reason(reason_to_execute)
+	}
+}
+
+/// Placement policy for Environment-owned isolated worktrees.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeSettings {
+	/// Optional base directory. `OMP_WORKTREE_DIR` takes precedence.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub base: Option<PathBuf>,
+}
+
 /// Persisted appearance options for the interactive composer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ComposerSettings {
@@ -176,6 +246,12 @@ pub struct Settings {
 	/// Automatic context-maintenance options.
 	#[serde(default)]
 	pub compaction:    CompactionSettings,
+	/// Automatic per-turn reasoning classification.
+	#[serde(default)]
+	pub auto_thinking: AutoThinkingSettings,
+	/// Isolated worktree placement policy.
+	#[serde(default)]
+	pub worktree:      WorktreeSettings,
 	/// Interactive composer appearance.
 	#[serde(default)]
 	pub composer:      ComposerSettings,
@@ -315,6 +391,21 @@ mod tests {
 		let mut disabled = settings.compaction.clone();
 		disabled.enabled = false;
 		assert!(disabled.method_order().as_slice().is_empty());
+	}
+
+	#[test]
+	fn auto_thinking_backend_and_ceiling_are_configurable() {
+		let settings: Settings = toml::from_str(
+			"[auto_thinking]\nbackend = \"local\"\nprovisional = \"high\"\nceiling = \
+			 \"medium\"\nallow_max = true",
+		)
+		.expect("auto thinking settings parse");
+		assert_eq!(settings.auto_thinking.backend, DifficultyBackend::Local);
+		assert_eq!(settings.auto_thinking.provisional, Difficulty::High);
+		assert_eq!(settings.auto_thinking.ceiling, Difficulty::Medium);
+		assert!(settings.auto_thinking.allow_max);
+		assert!(!settings.auto_thinking.for_turn().prewalk_noop);
+		assert!(settings.auto_thinking.for_prewalk_turn(None).prewalk_noop);
 	}
 
 	#[test]

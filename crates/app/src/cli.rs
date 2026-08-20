@@ -10,7 +10,7 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
@@ -240,7 +240,7 @@ impl FromStr for ToolNames {
 	version,
 	about = "OMP coding agent and inference runtime",
 	after_long_help = "Environment: OMP_DATA_DIR selects application state; OMP_PROFILE selects a \
-	                   profile."
+	                   profile; OMP_WORKTREE_DIR overrides worktree.base."
 )]
 pub struct OmpCli {
 	/// Enable an extension specification for this invocation.
@@ -281,10 +281,15 @@ pub enum Command {
 	Print(PrintArgs),
 	/// Run the stateful Content-Length framed RPC server on standard I/O.
 	Rpc(RpcArgs),
+	/// Run the Agent Client Protocol server over newline-delimited JSON.
+	Acp(AcpArgs),
 	/// Run one typed operation in process.
 	Infer(InferArgs),
 	/// Manage provider credentials.
 	Auth(AuthArgs),
+	/// Import a Claude Code or Codex JSONL session into transcript-v4 storage.
+	#[command(name = "import-session")]
+	ImportSession(ImportSessionArgs),
 	/// Manage generated model-catalog data.
 	Catalog(CatalogArgs),
 	/// Run hardware-accelerated local inference.
@@ -296,10 +301,65 @@ pub enum Command {
 	/// Inspect models from the validated embedded catalog.
 	#[command(alias = "model")]
 	Models(ModelsArgs),
+	/// Inspect or clear Environment-owned worktrees.
+	Worktree(WorktreeArgs),
 	/// Auth-broker verbs are retained as structured errors until a broker
 	/// backend lands.
 	#[command(name = "auth-broker")]
 	AuthBroker(AuthBrokerArgs),
+}
+
+/// Foreign transcript import options.
+#[derive(Clone, Debug, Args)]
+pub struct ImportSessionArgs {
+	/// Claude Code or Codex JSONL file.
+	pub path:   PathBuf,
+	/// Source transcript dialect.
+	#[arg(long, value_enum)]
+	pub format: ImportSessionFormat,
+}
+
+/// Foreign transcript dialect selected at the CLI boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ImportSessionFormat {
+	/// Claude Code session JSONL.
+	ClaudeCode,
+	/// Codex rollout JSONL.
+	Codex,
+}
+
+/// Inspect and prune Environment-owned isolated worktrees.
+#[derive(Clone, Debug, Args)]
+pub struct WorktreeArgs {
+	/// Worktree inventory or cleanup operation.
+	#[command(subcommand)]
+	pub command: WorktreeCommand,
+}
+
+/// Worktree inventory and cleanup verbs.
+#[derive(Clone, Debug, Subcommand)]
+pub enum WorktreeCommand {
+	/// List classified worktrees.
+	List {
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json: bool,
+		/// Include unregistered stray directories.
+		#[arg(long)]
+		all:  bool,
+	},
+	/// Remove orphaned worktrees, or every worktree with `--all`.
+	Clear {
+		/// Remove live worktrees as well as orphans.
+		#[arg(long)]
+		all:     bool,
+		/// Report without deleting.
+		#[arg(long)]
+		dry_run: bool,
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json:    bool,
+	},
 }
 
 /// Declarative root-command metadata shared by help and command normalization.
@@ -319,6 +379,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "print", aliases: &["p"] },
 	CommandSpec { name: "infer", aliases: &[] },
 	CommandSpec { name: "rpc", aliases: &[] },
+	CommandSpec { name: "acp", aliases: &[] },
 	CommandSpec { name: "auth", aliases: &[] },
 	CommandSpec { name: "auth-broker", aliases: &[] },
 	CommandSpec { name: "catalog", aliases: &[] },
@@ -326,11 +387,16 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "ext", aliases: &[] },
 	CommandSpec { name: "config", aliases: &[] },
 	CommandSpec { name: "models", aliases: &["model"] },
+	CommandSpec { name: "import-session", aliases: &[] },
+	CommandSpec { name: "worktree", aliases: &[] },
 ];
 
 /// Returns whether a root command shares the launch option surface.
 fn is_launch_command(argument: &OsString) -> bool {
-	matches!(argument.to_string_lossy().as_ref(), "chat" | "i" | "launch" | "print" | "p" | "rpc")
+	matches!(
+		argument.to_string_lossy().as_ref(),
+		"chat" | "i" | "launch" | "print" | "p" | "rpc" | "acp"
+	)
 }
 
 /// Classifies options accepted by launch-shaped invocations.
@@ -375,6 +441,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--py-eval"
 			| "--print-thoughts"
 			| "--shape-transcript"
+			| "--acp-terminal-auth"
 	)
 	.then_some(false)
 }
@@ -538,6 +605,20 @@ pub struct RpcArgs {
 	/// Optional directory used to discover subagent transcript files.
 	#[arg(long, value_name = "PATH")]
 	pub session_dir: Option<PathBuf>,
+}
+
+/// Agent Client Protocol stdio options.
+#[derive(Clone, Debug, Args)]
+pub struct AcpArgs {
+	/// Catalog model key. Falls back to `config.default_model`.
+	#[arg(long)]
+	pub model:             Option<Str>,
+	/// Project root whose durable sessions ACP exposes.
+	#[arg(long, value_name = "PATH", default_value = ".")]
+	pub project:           PathBuf,
+	/// Advertise and permit terminal-spawned provider authentication.
+	#[arg(long)]
+	pub acp_terminal_auth: bool,
 }
 
 /// Direct typed inference options.
@@ -773,14 +854,17 @@ enum DispatchTarget {
 	Chat,
 	Print,
 	Rpc,
+	Acp,
 	Infer,
 	Auth,
+	ImportSession,
 	CatalogImport,
 	LocalInfer,
 	Ext,
 	Config,
 	Models,
 	AuthBroker,
+	Worktree,
 }
 
 #[cfg(test)]
@@ -789,10 +873,12 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		None | Some(Command::Chat(_)) => DispatchTarget::Chat,
 		Some(Command::Print(_)) => DispatchTarget::Print,
 		Some(Command::Rpc(_)) => DispatchTarget::Rpc,
+		Some(Command::Acp(_)) => DispatchTarget::Acp,
 		Some(Command::Serve(_)) => DispatchTarget::Serve,
 		Some(Command::Envd(_)) => DispatchTarget::Envd,
 		Some(Command::Infer(_)) => DispatchTarget::Infer,
 		Some(Command::Auth(_)) => DispatchTarget::Auth,
+		Some(Command::ImportSession(_)) => DispatchTarget::ImportSession,
 		Some(Command::Catalog(CatalogArgs { command: CatalogCommand::Import(_) })) => {
 			DispatchTarget::CatalogImport
 		},
@@ -802,6 +888,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Ext(_)) => DispatchTarget::Ext,
 		Some(Command::Config(_)) => DispatchTarget::Config,
 		Some(Command::Models(_)) => DispatchTarget::Models,
+		Some(Command::Worktree(_)) => DispatchTarget::Worktree,
 		Some(Command::AuthBroker(_)) => DispatchTarget::AuthBroker,
 	}
 }
@@ -860,8 +947,14 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
 		Command::Rpc(args) => crate::rpc_mode::run(args).await,
+		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
 		Command::Auth(args) => auth(args).await,
+		Command::ImportSession(args) => crate::session_import::run(
+			&data_dir(None)?,
+			&std::env::current_dir().into_diagnostic()?,
+			&args,
+		),
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
 			catalog_import(&args)
 		},
@@ -869,6 +962,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Ext(args) => crate::ext_cli::run(args).await,
 		Command::Config(args) => crate::config_cmd::run(&data_dir(None)?, &args.command),
 		Command::Models(args) => crate::models_cmd::run(&args),
+		Command::Worktree(args) => crate::worktree_cmd::run(&data_dir(None)?, &args),
 		Command::AuthBroker(args) => Err(
 			crate::usage_error::CliUsageError::new(format!(
 				"auth-broker {:?} is unavailable: this build has no auth-broker backend",
@@ -1240,6 +1334,7 @@ mod tests {
 				DispatchTarget::Chat,
 			),
 			(&["omp", "rpc"][..], DispatchTarget::Rpc),
+			(&["omp", "acp"][..], DispatchTarget::Acp),
 			(
 				&["omp", "infer", "--model", "provider/model", "--prompt", "hello"][..],
 				DispatchTarget::Infer,
@@ -1584,6 +1679,35 @@ mod tests {
 		assert!(matches!(
 			parse(&["omp", "auth-broker", "status"]).command,
 			Some(Command::AuthBroker(_))
+		));
+	}
+
+	#[test]
+	fn parses_foreign_session_import_dialect() {
+		let command =
+			parse(&["omp", "import-session", "--format", "claude-code", "session.jsonl"]).command;
+		assert!(matches!(
+			command,
+			Some(Command::ImportSession(ImportSessionArgs {
+				format: ImportSessionFormat::ClaudeCode,
+				..
+			}))
+		));
+	}
+
+	#[test]
+	fn parses_worktree_inventory_and_pruning_flags() {
+		assert!(matches!(
+			parse(&["omp", "worktree", "list", "--json", "--all"]).command,
+			Some(Command::Worktree(WorktreeArgs {
+				command: WorktreeCommand::List { json: true, all: true },
+			}))
+		));
+		assert!(matches!(
+			parse(&["omp", "worktree", "clear", "--dry-run", "--all", "--json"]).command,
+			Some(Command::Worktree(WorktreeArgs {
+				command: WorktreeCommand::Clear { all: true, dry_run: true, json: true },
+			}))
 		));
 	}
 

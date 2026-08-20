@@ -19,7 +19,8 @@ const PICKLE_PREFIX_SIZE: u64 = 8;
 const INNER_PICKLE_PREFIX_SIZE: u64 = 8;
 const JSON_OFFSET: u64 = PICKLE_PREFIX_SIZE + INNER_PICKLE_PREFIX_SIZE;
 
-/// Returns whether bytes begin with a structurally plausible ASAR Pickle header.
+/// Returns whether bytes begin with a structurally plausible ASAR Pickle
+/// header.
 pub fn is_header(bytes: &[u8]) -> bool {
 	let Some(prefix) = bytes.get(..16) else {
 		return false;
@@ -54,9 +55,11 @@ pub(crate) fn read_entries(
 	let inner_size = u64::from(u32::from_le_bytes(prefix[4..8].try_into().expect("four bytes")));
 	let inner_payload = u64::from(u32::from_le_bytes(prefix[8..12].try_into().expect("four bytes")));
 	let json_size = u64::from(u32::from_le_bytes(prefix[12..16].try_into().expect("four bytes")));
-	if inner_size != inner_payload.checked_add(4).ok_or(Error::InvalidArchive(
-		"ASAR Pickle header size overflow",
-	))? {
+	if inner_size
+		!= inner_payload
+			.checked_add(4)
+			.ok_or(Error::InvalidArchive("ASAR Pickle header size overflow"))?
+	{
 		return Err(Error::InvalidArchive("inconsistent ASAR Pickle header sizes"));
 	}
 	if json_size > limits.index_size {
@@ -111,6 +114,9 @@ fn walk_files(
 			return Err(Error::UnsafePath(Str::new(name)));
 		}
 		let path = join_path(parent, name)?;
+		if normalize(path.as_str(), false).as_deref() != Some(path.as_str()) {
+			return Err(Error::UnsafePath(path));
+		}
 		validate(&path, limits)?;
 		let object = value
 			.as_object()
@@ -123,11 +129,11 @@ fn walk_files(
 				.as_object()
 				.ok_or(Error::InvalidArchive("ASAR directory files value is not an object"))?;
 			entries.push(Entry {
-				path: path.clone(),
-				directory: true,
-				size: 0,
+				path:                  path.clone(),
+				directory:             true,
+				size:                  0,
 				modified_unix_seconds: None,
-				storage: Storage::Synthetic,
+				storage:               Storage::Synthetic,
 			});
 			walk_files(children, path.as_str(), data_offset, file_size, limits, entries)?;
 			continue;
@@ -194,14 +200,18 @@ fn walk_files(
 pub(crate) fn resolve_alias_path(entries: &[Entry], path: Str, limits: Limits) -> Result<Str> {
 	let original = path.clone();
 	let mut resolved = path;
-	for _ in 0..=limits.link_depth {
+	let mut rewrites = 0_u64;
+	loop {
 		let Some((end, target)) = find_alias(entries, resolved.as_str()) else {
 			return Ok(resolved);
 		};
+		if rewrites == limits.link_depth {
+			return Err(Error::LinkResolutionDepth { path: original, limit: limits.link_depth });
+		}
+		rewrites += 1;
 		let suffix = resolved.get(end..).unwrap_or("").trim_start_matches('/');
 		resolved = join_target(target, suffix, limits)?;
 	}
-	Err(Error::LinkResolutionDepth { path: original, limit: limits.link_depth })
 }
 
 fn find_alias<'a>(entries: &'a [Entry], path: &str) -> Option<(usize, &'a str)> {
@@ -257,10 +267,9 @@ pub(crate) fn read_entry_to<W: Write>(
 			let mut file = directory.open(Path::new(entry.path()))?;
 			copy_member(&mut file, entry, output, true)
 		},
-		Storage::AsarLink { target_path } => Err(Error::UnreadableLink {
-			path: entry.path.clone(),
-			target: target_path.clone(),
-		}),
+		Storage::AsarLink { target_path } => {
+			Err(Error::UnreadableLink { path: entry.path.clone(), target: target_path.clone() })
+		},
 		_ => Err(Error::InvalidArchive("non-ASAR storage in ASAR reader")),
 	}
 }
@@ -271,15 +280,13 @@ fn copy_member(
 	output: &mut impl Write,
 	reject_trailing_bytes: bool,
 ) -> Result<u64> {
-	let limit = entry.size().saturating_add(u64::from(reject_trailing_bytes));
+	let limit = entry
+		.size()
+		.saturating_add(u64::from(reject_trailing_bytes));
 	let mut limited = source.take(limit);
 	let actual = io::copy(&mut limited, output)?;
 	if actual != entry.size() {
-		return Err(Error::SizeMismatch {
-			path: entry.path.clone(),
-			expected: entry.size(),
-			actual,
-		});
+		return Err(Error::SizeMismatch { path: entry.path.clone(), expected: entry.size(), actual });
 	}
 	Ok(actual)
 }
@@ -307,10 +314,7 @@ fn validate_padding(source: &mut (impl Read + Seek), start: u64, end: u64) -> Re
 }
 
 fn is_safe_name(name: &str) -> bool {
-	!name.is_empty()
-		&& name != "."
-		&& name != ".."
-		&& !name.contains(['/', '\\', '\0'])
+	!name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 fn join_path(parent: &str, name: &str) -> Result<Str> {

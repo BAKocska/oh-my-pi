@@ -1048,18 +1048,9 @@ async fn zip_and_tar_root_member_and_member_range_use_standard_text_formatting()
 async fn asar_root_subdirectory_and_packed_member_use_archive_routing() {
 	let sources = Sources::default();
 	sources.file("bundle.asar", asar_fixture());
-	assert_eq!(
-		text(sources.clone(), r#"{"path":"bundle.asar"}"#).await,
-		"dir/\nroot.txt (4B)"
-	);
-	assert_eq!(
-		text(sources.clone(), r#"{"path":"bundle.asar:dir"}"#).await,
-		"member.txt (7B)"
-	);
-	assert_eq!(
-		text(sources, r#"{"path":"bundle.asar:dir/member.txt"}"#).await,
-		"1:one\n2:two"
-	);
+	assert_eq!(text(sources.clone(), r#"{"path":"bundle.asar"}"#).await, "dir/\nroot.txt (4B)");
+	assert_eq!(text(sources.clone(), r#"{"path":"bundle.asar:dir"}"#).await, "member.txt (7B)");
+	assert_eq!(text(sources, r#"{"path":"bundle.asar:dir/member.txt"}"#).await, "1:one\n2:two");
 }
 
 #[tokio::test]

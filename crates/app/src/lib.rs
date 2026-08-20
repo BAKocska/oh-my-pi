@@ -5,6 +5,7 @@
 //! runtime transport path.
 //! Production application composition and command dispatch.
 
+pub mod acp_mode;
 pub mod auth_backend;
 pub mod auth_rpc;
 pub mod blob_rpc;
@@ -13,6 +14,7 @@ pub mod chat;
 mod chat_ui;
 pub mod cli;
 pub mod config_cmd;
+pub mod cursor_bridge;
 pub mod daemon;
 pub mod discovery;
 pub mod endpoint;
@@ -21,15 +23,19 @@ pub mod ext;
 pub mod ext_cli;
 pub mod exthost;
 pub mod models_cmd;
+pub mod modes;
 pub mod print_mode;
 pub mod project_state;
 pub mod rpc_adapter;
 pub mod rpc_mode;
+pub mod session_import;
 pub mod settings;
 pub mod spec;
 pub mod startup_notice;
 pub mod usage_error;
+pub mod vibe;
 pub mod wizard;
+pub mod worktree_cmd;
 
 pub use miette::{IntoDiagnostic, Report, Result};
 

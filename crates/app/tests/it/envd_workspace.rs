@@ -15,8 +15,8 @@ use omp_docserver::{
 	connection::{ConnectionConfig, serve_connection},
 };
 use omp_proto::env::v1::{
-	AttachOutput, ConflictReason, ExecRequest, OpenSessionRequest, RestoreWorkspace, Script,
-	SnapshotWorkspace,
+	AttachOutput, ConflictReason, CreateWorktree, DestroyWorktree, ExecRequest, MergeMode,
+	MergeWorktree, OpenSessionRequest, RestoreWorkspace, Script, SnapshotWorkspace,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -127,6 +127,62 @@ async fn snapshot_rejects_parent_escape_and_observes_cancellation() {
 			.snapshot(&SnapshotWorkspace::default(), &cancel)
 			.is_err()
 	);
+}
+
+#[tokio::test]
+async fn worktree_isolation_persists_and_emits_patch_or_branch_without_git_worktree() {
+	let root = TempDir::new().expect("workspace");
+	let state = TempDir::new().expect("state");
+	std::fs::write(root.path().join("tracked.txt"), b"parent\n").expect("fixture");
+	let (operations, external) = operations(&root, &state).await;
+	let cancel = CancellationToken::new();
+	let created = operations
+		.create_worktree(&CreateWorktree { name: "agent".to_owned(), ..Default::default() }, &cancel)
+		.expect("create worktree");
+	let worktree_root = url::Url::parse(&created.root_uri)
+		.expect("root URI")
+		.to_file_path()
+		.expect("file URI");
+	std::fs::write(worktree_root.join("tracked.txt"), b"child\n").expect("child mutation");
+	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"parent\n");
+	let reopened = WorkspaceOperations::open(
+		WorkspaceHost::open(root.path()).expect("reopened workspace"),
+		external,
+		BlobHost::open(state.path().join("blobs")).expect("reopened blobs"),
+		state.path().join("worktrees"),
+	)
+	.expect("reopen worktree registry");
+
+	let patch = reopened
+		.merge_worktree(
+			&MergeWorktree {
+				id: created.id.clone(),
+				mode: MergeMode::Patch as i32,
+				..Default::default()
+			},
+			&cancel,
+		)
+		.expect("patch disposition");
+	assert!(patch.artifact.is_some());
+	assert!(patch.branch.is_none());
+	let branch = reopened
+		.merge_worktree(
+			&MergeWorktree {
+				id: created.id.clone(),
+				mode: MergeMode::Branch as i32,
+				..Default::default()
+			},
+			&cancel,
+		)
+		.expect("branch disposition");
+	assert_eq!(branch.branch.as_deref(), Some(format!("omp/agent/{}", created.id).as_str()));
+	reopened
+		.destroy_worktree(
+			&DestroyWorktree { id: created.id, force: true, ..Default::default() },
+			&cancel,
+		)
+		.expect("destroy worktree");
+	assert!(!worktree_root.exists());
 }
 
 #[tokio::test]

@@ -38,8 +38,9 @@ pub use approvals::{
 	TicketState,
 };
 pub use batch::{
-	BatchError, BatchResult, CommittedCall, InvocationAdmission, InvocationHookBus,
-	InvocationHookRequest, SpeculativeCall, ToolBatch, hook_event_mask,
+	BatchError, BatchResult, CommittedCall, EXECUTION_MODE_PROP, ExecutionMode, ExecutionModeHandle,
+	InvocationAdmission, InvocationHookBus, InvocationHookRequest, PLAN_YOLO_PROP,
+	PREWALK_REASON_PROP, SpeculativeCall, ToolBatch, effects_mutate_environment, hook_event_mask,
 };
 pub use broker::{
 	AgentRegistry, Broker, BrokerError, BrokerInbox, DeliveryMode, PeerMessage, Receipt,
@@ -60,7 +61,8 @@ pub use context::{
 	PatchRejected, RefFlags, apply_patches, project_context,
 };
 pub use continuation::{
-	AgentSettledEvent, Continuation, ContinuationLedger, continues_loop, from_hook,
+	AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
+	LoopSignal, continues_loop, from_hook,
 };
 pub use control::{ControlError, ControlSender, RewindAck};
 pub use events::{AgentEvent, AgentPhase, EventBus, EventSubscription, LossyEventSubscription};
@@ -105,10 +107,10 @@ pub use project::{
 	tool_result_item_canonical_parts,
 };
 pub use prompt::{
-	BandHash, CachedContribution, ContextFile, PromptError, PromptHash, PromptOut, PromptSource,
-	RenderedPrompt, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotRegistration, SlotSource,
-	VcsIdentity, VolatilePrompt, VolatilePromptJournal, WorkspaceInput, WorkspacePromptSource,
-	render_prompt,
+	BandHash, CachedContribution, ConditionalPromptEntries, ContextFile, ModePromptSource,
+	PromptError, PromptHash, PromptMode, PromptOut, PromptSource, RenderedPrompt, SlotAssembler,
+	SlotClass, SlotDecl, SlotId, SlotRegistration, SlotSource, VcsIdentity, VolatilePrompt,
+	VolatilePromptJournal, WorkspaceInput, WorkspacePromptSource, render_prompt,
 };
 pub use schedule::{
 	Firing, FiringOutcome, MissedRunPolicy, Schedule, ScheduleBudget, ScheduleDelivery,

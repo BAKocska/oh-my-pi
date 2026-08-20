@@ -992,14 +992,17 @@ async fn reader_loop<R>(
 	}
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+	writer: &mut W,
+	payload: &[u8],
+) -> std::io::Result<()> {
 	let header = format!("Content-Length: {}\r\n\r\n", payload.len());
 	writer.write_all(header.as_bytes()).await?;
 	writer.write_all(payload).await?;
 	writer.flush().await
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 	reader: &mut R,
 	max_header_bytes: usize,
 	max_message_bytes: usize,

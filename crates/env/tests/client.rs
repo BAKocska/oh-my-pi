@@ -789,3 +789,50 @@ fn preauthorization_protocol_error_has_a_distinct_client_variant() {
 	assert!(matches!(error, ClientError::EffectsNotAuthorized(_)));
 	server.join().expect("phase-error server");
 }
+
+#[test]
+fn owner_worktree_api_preserves_typed_merge_disposition() {
+	let (client, transport) = EnvClient::in_process(0);
+	let (requests, responses) = transport.into_parts();
+	let server = thread::spawn(move || {
+		let request = receive(&requests);
+		let request_id = request.request_id;
+		assert!(matches!(
+			request.body,
+			Some(client_frame::Body::Data(frame::DataRequest {
+				body: Some(data_request::Body::Worktree(frame::WorktreeOp {
+					op: Some(frame::worktree_op::Op::Merge(frame::MergeWorktree {
+						mode,
+						..
+					})),
+					..
+				})),
+				..
+			})) if mode == frame::MergeMode::Patch as i32
+		));
+		respond(
+			&responses,
+			request_id,
+			server_frame::Body::Data(frame::DataResponse {
+				body: Some(frame::data_response::Body::Worktree(frame::WorktreeResult {
+					worktree: Some(frame::WorktreeInfo { id: "agent-1".into(), ..Default::default() }),
+					artifact_hash: Bytes::from_static(b"hash"),
+					artifact_size: 42,
+					branch: Some("omp/agent/agent-1".into()),
+					..Default::default()
+				})),
+				..Default::default()
+			}),
+		);
+	});
+	let result = block_on(client.merge_worktree(frame::MergeWorktree {
+		id: "agent-1".into(),
+		mode: frame::MergeMode::Patch as i32,
+		..Default::default()
+	}))
+	.expect("typed worktree response");
+	assert_eq!(result.artifact_hash, Bytes::from_static(b"hash"));
+	assert_eq!(result.artifact_size, 42);
+	assert_eq!(result.branch.as_deref(), Some("omp/agent/agent-1"));
+	server.join().expect("worktree server");
+}

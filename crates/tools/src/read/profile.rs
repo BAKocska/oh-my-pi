@@ -32,9 +32,9 @@ pub fn is_cpu_profile_path(path: &Path) -> bool {
 	path_ends_with(path, ".cpuprofile")
 }
 
-/// Returns whether `path` has the macOS `sample` report suffix.
+/// Returns whether `path` has a conventional macOS `sample` report suffix.
 pub fn is_sample_profile_path(path: &Path) -> bool {
-	path_ends_with(path, ".sample.txt")
+	path_ends_with(path, ".sample") || path_ends_with(path, ".sample.txt")
 }
 
 /// Summarizes a recognized, size-eligible profiler file.
@@ -231,14 +231,18 @@ fn id_array(value: Option<&Value>) -> Option<Vec<i64>> {
 }
 
 fn parse_cpu_profile(text: &str) -> Option<CpuProfile> {
-	let mut data: Value = serde_json::from_str(text).ok()?;
-	if data.get("nodes").is_none()
-		&& let Some(profile) = data.get_mut("profile")
-		&& profile.is_object()
-	{
-		data = profile.take();
-	}
-	let object = data.as_object()?;
+	let data: Value = serde_json::from_str(text).ok()?;
+	let profile = [
+		Some(&data),
+		data.get("profile"),
+		data.get("result").and_then(|result| result.get("profile")),
+		data.get("params").and_then(|params| params.get("profile")),
+		data.get("result"),
+	]
+	.into_iter()
+	.flatten()
+	.find(|value| value.get("nodes").is_some())?;
+	let object = profile.as_object()?;
 	let raw_nodes = object.get("nodes")?.as_array()?;
 	if raw_nodes.is_empty() {
 		return None;
@@ -710,104 +714,14 @@ fn self_of(frame: &SampleFrame) -> u64 {
 		.saturating_sub(frame.children.iter().map(|child| child.count).sum())
 }
 
-const LEGACY_ESCAPES: &[(&str, &str)] = &[
-	("$LT$", "<"),
-	("$GT$", ">"),
-	("$RF$", "&"),
-	("$BP$", "*"),
-	("$C$", ","),
-	("$u20$", " "),
-	("$u27$", "'"),
-	("$u7b$", "{"),
-	("$u7d$", "}"),
-	("..", "::"),
-];
-
 fn demangle_symbol(raw: &str) -> String {
-	if let Some(value) = raw.strip_prefix("_R")
-		&& let Some(result) = demangle_v0(value)
-	{
-		return result;
-	}
-	if let Some(value) = raw.strip_prefix("_ZN").or_else(|| raw.strip_prefix("__ZN"))
-		&& let Some(result) = demangle_legacy(value)
-	{
-		return result;
-	}
-	raw.to_owned()
-}
-
-fn demangle_v0(value: &str) -> Option<String> {
-	let bytes = value.as_bytes();
-	let mut parts = Vec::new();
-	let mut i = 0;
-	while i < bytes.len() {
-		if bytes[i].is_ascii_digit() && bytes[i] != b'0' {
-			let mut j = i;
-			while j < bytes.len() && bytes[j].is_ascii_digit() {
-				j += 1;
-			}
-			let len: usize = value[i..j].parse().ok()?;
-			let mut k = j;
-			if bytes.get(k) == Some(&b'_') {
-				k += 1;
-			}
-			if let Some(ident) = value.get(k..k.saturating_add(len))
-				&& ident.len() == len
-				&& ident
-					.bytes()
-					.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'.' | b'$'))
-			{
-				parts.push(ident.to_owned());
-				i = k + len;
-				continue;
-			}
-			i = j;
-		} else if matches!(bytes[i], b's' | b'B') {
-			let mut j = i + 1;
-			while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
-				j += 1;
-			}
-			if bytes.get(j) == Some(&b'_') {
-				i = j + 1;
-			} else {
-				i += 1;
-			}
-		} else {
-			i += 1;
-		}
-	}
-	(!parts.is_empty()).then(|| parts.join("::"))
-}
-
-fn demangle_legacy(value: &str) -> Option<String> {
-	let bytes = value.as_bytes();
-	let mut parts = Vec::new();
-	let mut i = 0;
-	while i < bytes.len() && bytes[i].is_ascii_digit() {
-		let mut j = i;
-		while j < bytes.len() && bytes[j].is_ascii_digit() {
-			j += 1;
-		}
-		let len: usize = value[i..j].parse().ok()?;
-		let Some(ident) = value.get(j..j.saturating_add(len)) else {
-			break;
-		};
-		let is_hash = ident.len() == 17
-			&& ident.starts_with('h')
-			&& ident[1..]
-				.bytes()
-				.all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase());
-		if !is_hash {
-			let mut unescaped = ident.to_owned();
-			for (from, to) in LEGACY_ESCAPES {
-				unescaped = unescaped.replace(from, to);
-			}
-			parts.push(unescaped);
-		}
-		i = j + len;
-	}
-	(!parts.is_empty()).then(|| parts.join("::"))
+	rustc_demangle::try_demangle(raw)
+		.or_else(|_| {
+			raw.strip_prefix('_')
+				.ok_or(())
+				.and_then(|symbol| rustc_demangle::try_demangle(symbol).map_err(|_| ()))
+		})
+		.map_or_else(|_| raw.to_owned(), |symbol| format!("{symbol:#}"))
 }
 
 fn build_sample_node(
@@ -1086,6 +1000,13 @@ mod tests {
 			None,
 		);
 		assert_eq!(render_profile(Path::new("notes.txt"), CPU_PROFILE), None);
+	}
+
+	#[test]
+	fn unwraps_cdp_payloads_and_demangles_rust_symbols() {
+		let cdp = format!(r#"{{"id":7,"result":{{"profile":{CPU_PROFILE}}}}}"#);
+		assert!(render_cpu_profile(&cdp).is_some());
+		assert_eq!(demangle_symbol("_ZN4test4main17h0123456789abcdefE"), "test::main",);
 	}
 
 	#[test]

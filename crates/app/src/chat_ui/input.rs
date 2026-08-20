@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 
+use omp_agent::Budget;
 use omp_core::Str;
-use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
+use omp_proto::{
+	inference::v1::TaskBudget,
+	thread::v1::{Item, Message, Part, Role, item, part},
+};
 use omp_tui::Command;
 use smallvec::SmallVec;
 
@@ -68,6 +72,59 @@ const COMPACT_SUBCOMMANDS: &[SubcommandSpec] = &[
 		usage:       "[focus]",
 	},
 ];
+const PLAN_SUBCOMMANDS: &[SubcommandSpec] = &[
+	SubcommandSpec { name: "on", description: "Enter read-only planning", usage: "" },
+	SubcommandSpec {
+		name:        "yolo",
+		description: "Plan until the first env-authorized mutation",
+		usage:       "",
+	},
+	SubcommandSpec { name: "off", description: "Exit planning", usage: "" },
+	SubcommandSpec { name: "status", description: "Show active mode", usage: "" },
+];
+const GOAL_SUBCOMMANDS: &[SubcommandSpec] = &[
+	SubcommandSpec {
+		name:        "set",
+		description: "Set an autonomous objective",
+		usage:       "<objective> [token-budget]",
+	},
+	SubcommandSpec { name: "pause", description: "Pause goal continuation", usage: "" },
+	SubcommandSpec {
+		name:        "resume",
+		description: "Resume goal continuation",
+		usage:       "",
+	},
+	SubcommandSpec {
+		name:        "complete",
+		description: "Mark the objective complete",
+		usage:       "",
+	},
+	SubcommandSpec { name: "drop", description: "Abandon the objective", usage: "" },
+	SubcommandSpec {
+		name:        "budget",
+		description: "Replace the hard budget",
+		usage:       "<tokens>",
+	},
+	SubcommandSpec {
+		name:        "status",
+		description: "Show goal status and spend",
+		usage:       "",
+	},
+];
+const VIBE_SUBCOMMANDS: &[SubcommandSpec] = &[
+	SubcommandSpec { name: "on", description: "Enter director/worker mode", usage: "" },
+	SubcommandSpec { name: "off", description: "Exit director/worker mode", usage: "" },
+	SubcommandSpec { name: "status", description: "Show active mode", usage: "" },
+];
+const PREWALK_SUBCOMMANDS: &[SubcommandSpec] = &[
+	SubcommandSpec {
+		name:        "on",
+		description: "Reason cheaply until first mutation",
+		usage:       "",
+	},
+	SubcommandSpec { name: "off", description: "Disarm prewalk", usage: "" },
+	SubcommandSpec { name: "status", description: "Show active mode", usage: "" },
+];
 
 /// Canonical builtin slash-command vocabulary.
 ///
@@ -131,6 +188,34 @@ pub const COMMANDS: &[CommandSpec] = &[
 		subcommands: TODO_SUBCOMMANDS,
 	},
 	CommandSpec {
+		name:        "plan",
+		aliases:     &[],
+		description: "Control read-only plan mode",
+		usage:       "[on|yolo|off|status]",
+		subcommands: PLAN_SUBCOMMANDS,
+	},
+	CommandSpec {
+		name:        "goal",
+		aliases:     &[],
+		description: "Control an autonomous objective",
+		usage:       "[set|pause|resume|complete|drop|budget|status]",
+		subcommands: GOAL_SUBCOMMANDS,
+	},
+	CommandSpec {
+		name:        "vibe",
+		aliases:     &[],
+		description: "Control director/worker vibe mode",
+		usage:       "[on|off|status]",
+		subcommands: VIBE_SUBCOMMANDS,
+	},
+	CommandSpec {
+		name:        "prewalk",
+		aliases:     &[],
+		description: "Control reason-first prewalk",
+		usage:       "[on|off|status]",
+		subcommands: PREWALK_SUBCOMMANDS,
+	},
+	CommandSpec {
 		name:        "jobs",
 		aliases:     &[],
 		description: "List active background jobs",
@@ -155,6 +240,13 @@ pub const COMMANDS: &[CommandSpec] = &[
 		name:        "pause",
 		aliases:     &[],
 		description: "Pause the interactive session",
+		usage:       "",
+		subcommands: &[],
+	},
+	CommandSpec {
+		name:        "live",
+		aliases:     &[],
+		description: "Toggle the firehose activity waveform",
 		usage:       "",
 		subcommands: &[],
 	},
@@ -384,12 +476,41 @@ pub enum ChatCommand {
 	Agents,
 	/// Pause the interactive host.
 	Pause,
+	/// Toggle the firehose-backed activity waveform.
+	Live,
+	/// Control plan mode with raw subcommand arguments.
+	Plan(Str),
+	/// Control goal mode with raw subcommand arguments.
+	Goal(Str),
+	/// Control vibe mode with raw subcommand arguments.
+	Vibe(Str),
+	/// Control prewalk mode with raw subcommand arguments.
+	Prewalk(Str),
 	/// A recognized command whose backend is not available yet.
 	Unavailable { command: Str, reason: Str },
 	/// Exit cleanly.
 	Quit,
 	/// A normal prompt, including unknown slash input which must pass through.
-	Submit(Box<Item>),
+	Submit {
+		/// Canonical user item with the budget prefix removed.
+		item:   Box<Item>,
+		/// Visible prompt text with the budget prefix removed.
+		text:   Str,
+		/// Optional per-turn advisory or hard token budget.
+		budget: Option<ParsedTurnBudget>,
+	},
+}
+
+/// Parsed `+Nk` or `+Nk!` turn-budget directive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedTurnBudget {
+	/// Agent-side output-token budget represented in the landed budget type.
+	pub agent: Budget,
+	/// Provider task-budget representation used by the turn parameters.
+	pub task:  TaskBudget,
+	/// `true` for the hard `!` form; advisory budgets remain visible but do not
+	/// reject work.
+	pub hard:  bool,
 }
 
 /// Parsed `/name args` token. The delimiter is the earliest whitespace or `:`.
@@ -424,12 +545,15 @@ pub fn parse_slash(text: &str) -> Option<ParsedSlash<'_>> {
 pub enum InputError {
 	/// A quoted argument was not terminated.
 	UnterminatedQuote,
+	/// A `+Nk` budget prefix used zero, overflowed, or was malformed.
+	InvalidBudget,
 }
 
 impl std::fmt::Display for InputError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::UnterminatedQuote => f.write_str("unterminated quoted command argument"),
+			Self::InvalidBudget => f.write_str("turn budget must use +Nk or +Nk! with N > 0"),
 		}
 	}
 }
@@ -438,23 +562,38 @@ impl std::error::Error for InputError {}
 /// Parses composer text against the same aggregated roster used for completion.
 /// Unknown slash names intentionally pass through as normal prompt text.
 fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand, InputError> {
+	let (text, budget) = parse_budget_prefix(text)?;
 	if text.trim().is_empty() {
-		return Ok(ChatCommand::Nothing);
+		return if budget.is_some() {
+			Err(InputError::InvalidBudget)
+		} else {
+			Ok(ChatCommand::Nothing)
+		};
 	}
+	let submit = |text: &str| ChatCommand::Submit {
+		item:   Box::new(user_message(text)),
+		text:   Str::from(text),
+		budget: budget.clone(),
+	};
 	let Some(parsed) = parse_slash(text) else {
-		return Ok(ChatCommand::Submit(Box::new(user_message(text))));
+		return Ok(submit(text));
 	};
 	let Some(available) = available.iter().find(|command| {
 		command.name == parsed.name || command.aliases.iter().any(|alias| alias == parsed.name)
 	}) else {
-		return Ok(ChatCommand::Submit(Box::new(user_message(text))));
+		return Ok(submit(text));
 	};
 	if !available.builtin {
 		let Some(template) = &available.template else {
-			return Ok(ChatCommand::Submit(Box::new(user_message(text))));
+			return Ok(submit(text));
 		};
 		let args = tokenize_args(parsed.args)?;
-		return Ok(ChatCommand::Submit(Box::new(user_message(expand_arguments(template, &args)))));
+		let expanded = expand_arguments(template, &args);
+		return Ok(ChatCommand::Submit {
+			item: Box::new(user_message(&expanded)),
+			text: Str::from(expanded),
+			budget,
+		});
 	}
 	let spec = COMMANDS
 		.iter()
@@ -471,6 +610,11 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		"settings" => ChatCommand::Settings,
 		"agents" => ChatCommand::Agents,
 		"pause" => ChatCommand::Pause,
+		"live" => ChatCommand::Live,
+		"plan" => ChatCommand::Plan(Str::from(parsed.args)),
+		"goal" => ChatCommand::Goal(Str::from(parsed.args)),
+		"vibe" => ChatCommand::Vibe(Str::from(parsed.args)),
+		"prewalk" => ChatCommand::Prewalk(Str::from(parsed.args)),
 		"quit" => ChatCommand::Quit,
 		"clear" => unavailable("clear", "the agent backend does not expose in-place context reset"),
 		"compact" => unavailable("compact", "manual compaction is not exposed by the agent backend"),
@@ -478,6 +622,44 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		_ => unreachable!("every builtin has a dispatch arm"),
 	};
 	Ok(command)
+}
+
+/// Splits an optional leading `+Nk` / `+Nk!` directive from prompt text.
+pub fn parse_budget_prefix(text: &str) -> Result<(&str, Option<ParsedTurnBudget>), InputError> {
+	let trimmed = text.trim_start();
+	let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+	let token = &trimmed[..end];
+	if !token
+		.as_bytes()
+		.get(1)
+		.is_some_and(|byte| byte.is_ascii_digit())
+	{
+		return Ok((text, None));
+	}
+	let (body, hard) = token
+		.strip_suffix("k!")
+		.map(|body| (body, true))
+		.or_else(|| token.strip_suffix('k').map(|body| (body, false)))
+		.ok_or(InputError::InvalidBudget)?;
+	let thousands = body
+		.strip_prefix('+')
+		.filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+		.ok_or(InputError::InvalidBudget)?
+		.parse::<u64>()
+		.map_err(|_| InputError::InvalidBudget)?;
+	let tokens = thousands
+		.checked_mul(1_000)
+		.filter(|tokens| *tokens > 0)
+		.ok_or(InputError::InvalidBudget)?;
+	let remainder = trimmed[end..].trim_start();
+	Ok((
+		remainder,
+		Some(ParsedTurnBudget {
+			agent: Budget { max_output_tokens: Some(tokens), ..Budget::default() },
+			task: TaskBudget { total_tokens: tokens, remaining_tokens: hard.then_some(tokens) },
+			hard,
+		}),
+	))
 }
 
 fn unavailable(command: &'static str, reason: &'static str) -> ChatCommand {
@@ -596,7 +778,7 @@ mod tests {
 	use super::*;
 
 	fn submit_text(command: ChatCommand) -> String {
-		let ChatCommand::Submit(item) = command else {
+		let ChatCommand::Submit { item, .. } = command else {
 			panic!("expected passthrough submit")
 		};
 		let Some(item::Kind::Message(message)) = item.kind else {
@@ -631,6 +813,7 @@ mod tests {
 	#[test]
 	fn parses_whitespace_colon_aliases_and_passthrough() {
 		let commands = builtins();
+		assert_eq!(commands.parse_input("/live"), Ok(ChatCommand::Live));
 		assert_eq!(parse_slash("/model: smol"), Some(ParsedSlash { name: "model", args: "smol" }));
 		assert_eq!(commands.parse_input("/model:smol"), Ok(ChatCommand::Model(Str::from("smol"))));
 		assert_eq!(commands.parse_input("/q"), Ok(ChatCommand::Quit));
@@ -638,6 +821,21 @@ mod tests {
 		assert_eq!(
 			submit_text(commands.parse_input("/tmp/pic.png describe").unwrap()),
 			"/tmp/pic.png describe"
+		);
+	}
+
+	#[test]
+	fn parses_execution_mode_commands_without_submitting_text() {
+		let commands = builtins();
+		assert_eq!(commands.parse_input("/plan yolo"), Ok(ChatCommand::Plan(Str::from("yolo"))));
+		assert_eq!(
+			commands.parse_input("/goal set finish migration 12000"),
+			Ok(ChatCommand::Goal(Str::from("set finish migration 12000")))
+		);
+		assert_eq!(commands.parse_input("/vibe on"), Ok(ChatCommand::Vibe(Str::from("on"))));
+		assert_eq!(
+			commands.parse_input("/prewalk status"),
+			Ok(ChatCommand::Prewalk(Str::from("status")))
 		);
 	}
 
@@ -681,6 +879,37 @@ mod tests {
 			submit_text(commands.parse_input("/review 'two words'").unwrap()),
 			"Review two words"
 		);
+	}
+
+	#[test]
+	fn turn_budget_prefixes_map_to_agent_and_provider_budgets() {
+		let commands = builtins();
+		let ChatCommand::Submit { item, text, budget: Some(advisory) } =
+			commands.parse_input("+12k investigate").unwrap()
+		else {
+			panic!("expected budgeted submit")
+		};
+		assert_eq!(text, "investigate");
+		assert_eq!(advisory.agent.max_output_tokens, Some(12_000));
+		assert_eq!(advisory.task.total_tokens, 12_000);
+		assert_eq!(advisory.task.remaining_tokens, None);
+		assert!(!advisory.hard);
+		let Some(item::Kind::Message(message)) = item.kind else {
+			panic!("missing user message")
+		};
+		assert!(matches!(
+			message.parts[0].kind.as_ref(),
+			Some(part::Kind::Text(text)) if text == "investigate"
+		));
+
+		let (_, hard) = parse_budget_prefix("+2k! build").unwrap();
+		let hard = hard.unwrap();
+		assert_eq!(hard.task.remaining_tokens, Some(2_000));
+		assert!(hard.hard);
+		for invalid in ["+0k no", "+2x no", "+2k!"] {
+			assert_eq!(commands.parse_input(invalid), Err(InputError::InvalidBudget));
+		}
+		assert_eq!(submit_text(commands.parse_input("+context please").unwrap()), "+context please");
 	}
 
 	#[test]

@@ -1,5 +1,7 @@
 //! Settled-boundary continuation decisions and recursive ledger accounting.
 
+use std::time::Duration;
+
 use bytes::BytesMut;
 use omp_core::Str;
 use omp_proto::{thread::v1::Item, toolhost::v1::HookEventId};
@@ -24,6 +26,75 @@ pub struct ContinuationLedger {
 	pub refusals:    u32,
 	/// Extension that won the latest continuation decision.
 	pub owner:       Option<Str>,
+}
+/// Per-owner bounds applied before the session-wide continuation ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContinuationPolicy {
+	/// Maximum consecutive continuations since real user input.
+	pub max_consecutive:  u32,
+	/// Optional lifetime continuation ceiling.
+	pub max_total:        Option<u64>,
+	/// Minimum spacing between accepted continuations.
+	pub min_interval:     Duration,
+	/// Whether exhaustion should produce a user-visible notification.
+	pub notify_exhausted: bool,
+}
+
+impl Default for ContinuationPolicy {
+	fn default() -> Self {
+		Self {
+			max_consecutive:  8,
+			max_total:        None,
+			min_interval:     Duration::ZERO,
+			notify_exhausted: true,
+		}
+	}
+}
+
+/// Core-owned repetition and progress evidence consumed by autonomous modes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LoopSignal {
+	/// Consecutive turns with the same committed tool-call digest.
+	pub repeats:              u32,
+	/// Stable digest of the latest committed tool-call shape.
+	pub digest:               Option<Str>,
+	/// Consecutive turns without an environment effect.
+	pub no_progress_turns:    u32,
+	/// Empty-output retries already spent by the core.
+	pub empty_output_retries: u8,
+	/// Conservative composite used to stop autonomous continuation.
+	pub stalled:              bool,
+}
+
+impl LoopSignal {
+	/// Folds one committed turn into bounded loop evidence.
+	pub fn observe(
+		&mut self,
+		digest: Option<Str>,
+		made_environment_effect: bool,
+		empty_output_retries: u8,
+	) {
+		self.repeats = if digest.is_some() && digest == self.digest {
+			self.repeats.saturating_add(1)
+		} else {
+			u32::from(digest.is_some())
+		};
+		self.digest = digest;
+		self.no_progress_turns = if made_environment_effect {
+			0
+		} else {
+			self.no_progress_turns.saturating_add(1)
+		};
+		self.empty_output_retries = empty_output_retries.min(3);
+		self.stalled =
+			self.repeats >= 3 || self.no_progress_turns >= 3 || self.empty_output_retries >= 3;
+	}
+}
+/// Application-owned autonomous-mode decision consumed only at the settled
+/// boundary.
+pub trait ContinuationSource: Send + Sync {
+	/// Returns a candidate and its owner policy from Core loop evidence.
+	fn decide(&self, signal: &LoopSignal, now_ms: u64) -> (Continuation, ContinuationPolicy);
 }
 
 impl ContinuationLedger {
@@ -55,6 +126,28 @@ impl ContinuationLedger {
 			},
 			other => other,
 		}
+	}
+
+	/// Applies one candidate under both an owner policy and the session cap.
+	pub fn decide_with_policy(
+		&mut self,
+		candidate: Continuation,
+		now_ms: u64,
+		policy: ContinuationPolicy,
+	) -> Continuation {
+		let effective_cap = self.cap.min(policy.max_consecutive);
+		let exhausted = self.consecutive >= effective_cap
+			|| policy
+				.max_total
+				.is_some_and(|maximum| self.total >= maximum)
+			|| (self.last_ms != 0
+				&& now_ms.saturating_sub(self.last_ms)
+					< u64::try_from(policy.min_interval.as_millis()).unwrap_or(u64::MAX));
+		if matches!(candidate, Continuation::Continue { .. }) && exhausted {
+			self.refusals = self.refusals.saturating_add(1);
+			return Continuation::Refused { cap: effective_cap };
+		}
+		self.decide(candidate, now_ms)
 	}
 }
 
@@ -138,6 +231,47 @@ pub const fn continues_loop(source: &InterruptSource) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn owner_policy_clamps_and_spaces_continuations() {
+		let mut ledger = ContinuationLedger::new(8);
+		let policy = ContinuationPolicy {
+			max_consecutive:  2,
+			max_total:        Some(4),
+			min_interval:     Duration::from_millis(10),
+			notify_exhausted: true,
+		};
+		let candidate = || Continuation::Continue {
+			owner:          Str::from("goal"),
+			item:           Item::default(),
+			label:          None,
+			collapse_prior: true,
+		};
+		assert!(matches!(
+			ledger.decide_with_policy(candidate(), 100, policy),
+			Continuation::Continue { .. }
+		));
+		assert_eq!(ledger.decide_with_policy(candidate(), 105, policy), Continuation::Refused {
+			cap: 2,
+		});
+		assert!(matches!(
+			ledger.decide_with_policy(candidate(), 110, policy),
+			Continuation::Continue { .. }
+		));
+		assert_eq!(ledger.decide_with_policy(candidate(), 120, policy), Continuation::Refused {
+			cap: 2,
+		});
+	}
+
+	#[test]
+	fn loop_signal_detects_repetition_and_no_progress() {
+		let mut signal = LoopSignal::default();
+		for _ in 0..3 {
+			signal.observe(Some(Str::from("same")), false, 0);
+		}
+		assert_eq!(signal.repeats, 3);
+		assert_eq!(signal.no_progress_turns, 3);
+		assert!(signal.stalled);
+	}
 
 	#[test]
 	fn deferable_continuation_source_continues_the_loop() {

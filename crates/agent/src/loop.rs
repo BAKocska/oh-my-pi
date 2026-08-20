@@ -28,10 +28,14 @@ use crate::{
 	BatchError, Journal, JournalError, Mailbox, MailboxSender, ProjectionError, PromptError,
 	TurnClient, TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	batch::{
-		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
+		ExecutionModeHandle, InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest,
+		SpeculativeCall, ToolBatch,
 	},
 	context::{ContextProjection, project_context},
-	continuation::{AgentSettledEvent, Continuation, ContinuationLedger, continues_loop, from_hook},
+	continuation::{
+		AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
+		LoopSignal, continues_loop, from_hook,
+	},
 	control::{ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
@@ -191,6 +195,9 @@ pub struct Agent<C: TurnClient> {
 	prompt_head_events: Vec<u64>,
 	settled_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
+	execution_mode: ExecutionModeHandle,
+	continuation_source: Option<Arc<dyn ContinuationSource>>,
+	loop_signal: LoopSignal,
 	last_toolset_hash: Option<[u8; 32]>,
 	firehose: Arc<Firehose>,
 }
@@ -271,6 +278,9 @@ impl<C: TurnClient> Agent<C> {
 			prompt_head_events,
 			settled_gate: None,
 			continuations: ContinuationLedger::new(8),
+			execution_mode: ExecutionModeHandle::default(),
+			continuation_source: None,
+			loop_signal: LoopSignal::default(),
 			firehose: Arc::new(Firehose::new()),
 			last_toolset_hash,
 		}
@@ -312,6 +322,23 @@ impl<C: TurnClient> Agent<C> {
 	pub fn set_agent_settled_gate(&mut self, gate: Arc<HookGate>, cap: u32) {
 		self.settled_gate = Some(gate);
 		self.continuations = ContinuationLedger::new(cap);
+	}
+
+	/// Returns the shared mode handle whose invocation metadata is enforced by
+	/// the Environment dispatch boundary.
+	pub fn execution_mode(&self) -> ExecutionModeHandle {
+		self.execution_mode.clone()
+	}
+
+	/// Installs one application-owned autonomous-mode continuation source.
+	pub fn set_continuation_source(&mut self, source: Arc<dyn ContinuationSource>) {
+		self.continuation_source = Some(source);
+	}
+
+	/// Returns Core's latest loop-repetition and progress evidence.
+	#[must_use]
+	pub const fn loop_signal(&self) -> &LoopSignal {
+		&self.loop_signal
 	}
 
 	/// Returns the latest recursive continuation ledger projection.
@@ -623,6 +650,10 @@ impl<C: TurnClient> Agent<C> {
 						return Err(error);
 					},
 				};
+				let made_environment_effect = calls
+					.iter()
+					.any(|call| crate::effects_mutate_environment(call.effects()));
+				let call_digest = tool_call_digest(&outcome.output);
 				let call_ids: Vec<Str> = outcome
 					.output
 					.iter()
@@ -733,6 +764,9 @@ impl<C: TurnClient> Agent<C> {
 						}
 					}
 				}
+				self
+					.loop_signal
+					.observe(call_digest, made_environment_effect, empty_output_retries);
 				if self.execute_scheduled_rewinds()? {
 					self.transition(AgentPhase::Idle);
 					return Ok(AgentRunSummary {
@@ -792,6 +826,7 @@ impl<C: TurnClient> Agent<C> {
 				turn_id = next_turn_id;
 				continue;
 			}
+			self.loop_signal.observe(None, false, empty_output_retries);
 			if let Some(interrupt) = self.settled_continuation(&turn_id).await {
 				let _ = self.mailbox.sender().try_enqueue(interrupt);
 				boundary = self
@@ -885,15 +920,29 @@ impl<C: TurnClient> Agent<C> {
 	/// into a normal mailbox interrupt so `defer_interrupts` remains
 	/// authoritative.
 	async fn settled_continuation(&mut self, turn_id: &TurnId) -> Option<crate::Interrupt> {
-		let gate = self.settled_gate.as_ref()?.clone();
-		let event = AgentSettledEvent {
-			agent_id: Str::new_static("agent"),
-			turn_id:  Str::from(turn_id.as_str()),
-		};
-		let outcome = gate.gate_domain(&event).await;
-		let item = continuation_item();
-		let candidate = from_hook(outcome.winner, Str::new_static("agent_settled"), item);
-		match self.continuations.decide(candidate, now_ms()) {
+		let now = now_ms();
+		let (mut candidate, mut policy) = self
+			.continuation_source
+			.as_ref()
+			.map_or((Continuation::Settle, ContinuationPolicy::default()), |source| {
+				source.decide(&self.loop_signal, now)
+			});
+		if matches!(candidate, Continuation::Settle)
+			&& let Some(gate) = self.settled_gate.as_ref().cloned()
+		{
+			let event = AgentSettledEvent {
+				agent_id: Str::new_static("agent"),
+				turn_id:  Str::from(turn_id.as_str()),
+			};
+			let outcome = gate.gate_domain(&event).await;
+			candidate =
+				from_hook(outcome.winner, Str::new_static("agent_settled"), continuation_item());
+			policy = ContinuationPolicy::default();
+		}
+		match self
+			.continuations
+			.decide_with_policy(candidate, now, policy)
+		{
 			Continuation::Continue { owner, item, .. } => Some(crate::Interrupt {
 				class: crate::InterruptClass::Immediate,
 				item,
@@ -1356,20 +1405,21 @@ impl<C: TurnClient> Agent<C> {
 					let Some((name, rev)) = registry.live_identity(&part.tool_name) else {
 						return Err(TurnError::Protocol("stream named unknown tool"));
 					};
+					let maximum_effects = registry
+						.effects(&part.tool_name)
+						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?
+						.clone();
 					let call_id = part.tool_call_id.as_str().to_str();
-					let opened = SpeculativeCall::open(
+					let opened = SpeculativeCall::open_with_props(
 						&self.env,
 						&self.events,
 						call_id.clone(),
 						ToolIdentity { name: name.clone(), rev: rev.clone() },
 						runtime_duration(TOOL_DEADLINE),
+						self.execution_mode.invocation_props(&maximum_effects),
 					)
 					.await
 					.map_err(|_| TurnError::Protocol("failed to open speculative tool"))?;
-					let maximum_effects = registry
-						.effects(&part.tool_name)
-						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?
-						.clone();
 					opened
 						.attach_runtime(
 							self.hook_bus.clone(),
@@ -1435,18 +1485,19 @@ impl<C: TurnClient> Agent<C> {
 			let Some((name, rev)) = registry.live_identity(&call.name) else {
 				return Err(AgentError::Protocol("outcome names unknown tool"));
 			};
-			let mut opened = SpeculativeCall::open(
+			let maximum_effects = registry
+				.effects(&call.name)
+				.map_err(|_| AgentError::Protocol("committed tool effects missing"))?
+				.clone();
+			let mut opened = SpeculativeCall::open_with_props(
 				&self.env,
 				&self.events,
 				call.id.as_str().to_str(),
 				ToolIdentity { name: name.clone(), rev: rev.clone() },
 				runtime_duration(TOOL_DEADLINE),
+				self.execution_mode.invocation_props(&maximum_effects),
 			)
 			.await?;
-			let maximum_effects = registry
-				.effects(&call.name)
-				.map_err(|_| AgentError::Protocol("committed tool effects missing"))?
-				.clone();
 			opened.attach_runtime(
 				self.hook_bus.clone(),
 				self.invocation_fact_tx.clone(),
@@ -1805,6 +1856,22 @@ fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
 		},
 		crate::mailbox::InterruptSource::Producer(name) => name.clone(),
 	}
+}
+
+fn tool_call_digest(items: &[Item]) -> Option<Str> {
+	let mut hasher = blake3::Hasher::new();
+	let mut calls = 0_u32;
+	for item in items {
+		let Some(thread::item::Kind::ToolCall(call)) = &item.kind else {
+			continue;
+		};
+		calls = calls.saturating_add(1);
+		hasher.update(&(call.name.len() as u64).to_le_bytes());
+		hasher.update(call.name.as_bytes());
+		hasher.update(&(call.args_json.len() as u64).to_le_bytes());
+		hasher.update(&call.args_json);
+	}
+	(calls != 0).then(|| Str::from(hasher.finalize().to_string()))
 }
 
 fn continuation_item() -> Item {

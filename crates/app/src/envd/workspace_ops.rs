@@ -21,6 +21,7 @@ use omp_core::{Str, encoding::hex};
 use omp_proto::{document::v1 as document_pb, env::v1 as pb};
 use omp_walker::{FileType, WalkOrder};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -66,9 +67,9 @@ pub enum WorkspaceOperationError {
 	/// A worktree name is empty or contains path separators.
 	#[error("invalid worktree name")]
 	InvalidWorktreeName,
-	/// The host filesystem cannot create a copy-on-write clone.
-	#[error("the host filesystem does not support copy-on-write worktrees")]
-	CowUnsupported,
+	/// A worktree registry record was malformed.
+	#[error("invalid worktree registry record: {0}")]
+	InvalidWorktreeRecord(Str),
 }
 
 /// Result of merging an isolated worktree without invoking a VCS subprocess.
@@ -122,6 +123,20 @@ struct WorktreeRecord {
 	base:       Str,
 	generation: u64,
 	branch:     Option<Str>,
+	owner_pid:  u32,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DurableWorktreeRecord {
+	version:     u8,
+	id:          String,
+	root:        PathBuf,
+	base:        String,
+	generation:  u64,
+	branch:      Option<String>,
+	owner_pid:   u32,
+	class:       String,
+	source_root: PathBuf,
 }
 
 struct WorktreeBuild {
@@ -160,7 +175,9 @@ impl WorkspaceOperations {
 	) -> Result<Self, WorkspaceOperationError> {
 		fs::create_dir_all(state_root.as_ref())?;
 		fs::create_dir_all(state_root.as_ref().join(".branches"))?;
+		fs::create_dir_all(state_root.as_ref().join(".records"))?;
 		let worktree_root = fs::canonicalize(state_root)?;
+		let (worktrees, next_generation) = load_worktree_records(&worktree_root)?;
 		Ok(Self {
 			inner: Arc::new(OperationsInner {
 				workspace,
@@ -168,8 +185,8 @@ impl WorkspaceOperations {
 				blobs,
 				worktree_root,
 				cache: Mutex::new(HashMap::new()),
-				worktrees: Mutex::new(HashMap::new()),
-				next_generation: AtomicU64::new(1),
+				worktrees: Mutex::new(worktrees),
+				next_generation: AtomicU64::new(next_generation),
 			}),
 		})
 	}
@@ -288,7 +305,13 @@ impl WorkspaceOperations {
 			base: Str::from(snapshot.snapshot_id),
 			generation,
 			branch: None,
+			owner_pid: if request.owner_pid == 0 {
+				std::process::id()
+			} else {
+				request.owner_pid
+			},
 		};
+		self.write_worktree_record(&record)?;
 		build.armed = false;
 		self.inner.worktrees.lock().insert(id, record.clone());
 		worktree_info(&record)
@@ -320,6 +343,14 @@ impl WorkspaceOperations {
 			}
 		}
 		fs::remove_dir_all(&record.root)?;
+		remove_if_exists(&self.record_path(record.id.as_str()))?;
+		remove_if_exists(
+			&self
+				.inner
+				.worktree_root
+				.join(".branches")
+				.join(record.id.as_str()),
+		)?;
 		self.inner.worktrees.lock().remove(&key);
 		worktree_info(&record)
 	}
@@ -343,9 +374,10 @@ impl WorkspaceOperations {
 		let current_snapshot = self.snapshot_at(&record.root, &[], cancel)?;
 		let base = self.load_manifest(record.base.as_str())?;
 		let current = self.load_manifest(&current_snapshot.snapshot_id)?;
-		let (artifact, branch) = match request.strategy.as_str() {
-			"patch" => (Some(self.write_manifest_diff(&base, &current, cancel)?), None),
-			"branch" => {
+		let mode = pb::MergeMode::try_from(request.mode).unwrap_or(pb::MergeMode::Unspecified);
+		let (artifact, branch) = match mode {
+			pb::MergeMode::Patch => (Some(self.write_manifest_diff(&base, &current, cancel)?), None),
+			pb::MergeMode::Branch => {
 				let branch = Str::from(format!("omp/agent/{}", record.id));
 				if !request.dry_run {
 					record.branch = Some(branch.clone());
@@ -357,16 +389,12 @@ impl WorkspaceOperations {
 							.join(record.id.as_str()),
 						current_snapshot.snapshot_id.as_bytes(),
 					)?;
+					self.write_worktree_record(&record)?;
 					self.inner.worktrees.lock().insert(key, record.clone());
 				}
 				(None, Some(branch))
 			},
-			"none" | "" => (None, record.branch.clone()),
-			other => {
-				return Err(WorkspaceOperationError::InvalidGeneration(Str::from(format!(
-					"unknown worktree merge strategy {other:?}",
-				))));
-			},
+			pb::MergeMode::None | pb::MergeMode::Unspecified => (None, record.branch.clone()),
 		};
 		Ok(WorktreeMerge {
 			worktree: worktree_info(&record)?,
@@ -731,6 +759,36 @@ impl WorkspaceOperations {
 		Ok(BlobId::from(stage.finish().map_err(BlobError::from)?))
 	}
 
+	fn record_path(&self, id: &str) -> PathBuf {
+		self
+			.inner
+			.worktree_root
+			.join(".records")
+			.join(format!("{id}.json"))
+	}
+
+	fn write_worktree_record(&self, record: &WorktreeRecord) -> Result<(), WorkspaceOperationError> {
+		let durable = DurableWorktreeRecord {
+			version:     1,
+			id:          record.id.to_string(),
+			root:        record.root.clone(),
+			base:        record.base.to_string(),
+			generation:  record.generation,
+			branch:      record.branch.as_ref().map(ToString::to_string),
+			owner_pid:   record.owner_pid,
+			class:       "task-isolation".to_owned(),
+			source_root: self.inner.workspace.root().to_path_buf(),
+		};
+		let bytes = serde_json::to_vec(&durable).map_err(|error| {
+			WorkspaceOperationError::InvalidWorktreeRecord(Str::from(error.to_string()))
+		})?;
+		let path = self.record_path(record.id.as_str());
+		let temporary = path.with_extension(format!("json.{}.tmp", Ulid::generate()));
+		fs::write(&temporary, bytes)?;
+		fs::rename(temporary, path)?;
+		Ok(())
+	}
+
 	fn ensure_registered_root(&self, root: &Path) -> Result<(), WorkspaceOperationError> {
 		let root = fs::canonicalize(root)?;
 		if !root.starts_with(&self.inner.worktree_root)
@@ -745,6 +803,57 @@ impl WorkspaceOperations {
 			return Err(WorkspaceOperationError::OutsideRoot);
 		}
 		Ok(())
+	}
+}
+
+fn load_worktree_records(
+	worktree_root: &Path,
+) -> Result<(HashMap<Str, WorktreeRecord>, u64), WorkspaceOperationError> {
+	let mut records = HashMap::new();
+	let mut next_generation = 1_u64;
+	for entry in fs::read_dir(worktree_root.join(".records"))? {
+		let entry = entry?;
+		if !entry.file_type()?.is_file()
+			|| entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+		{
+			continue;
+		}
+		let durable: DurableWorktreeRecord = match fs::read(entry.path())
+			.ok()
+			.and_then(|bytes| serde_json::from_slice(&bytes).ok())
+		{
+			Some(record) => record,
+			None => {
+				tracing::warn!(path = %entry.path().display(), "ignoring malformed worktree record");
+				continue;
+			},
+		};
+		if durable.version != 1
+			|| durable.id.is_empty()
+			|| durable.root.parent() != Some(worktree_root)
+			|| !durable.root.exists()
+		{
+			continue;
+		}
+		next_generation = next_generation.max(durable.generation.saturating_add(1));
+		let id = Str::from(durable.id);
+		records.insert(id.clone(), WorktreeRecord {
+			id,
+			root: durable.root,
+			base: Str::from(durable.base),
+			generation: durable.generation,
+			branch: durable.branch.map(Str::from),
+			owner_pid: durable.owner_pid,
+		});
+	}
+	Ok((records, next_generation))
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+	match fs::remove_file(path) {
+		Ok(()) => Ok(()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error),
 	}
 }
 
@@ -1071,50 +1180,91 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 	fs::set_permissions(path, permissions)
 }
 
-#[cfg(target_os = "macos")]
 fn clone_file_cow(source: &Path, destination: &Path) -> Result<(), WorkspaceOperationError> {
+	match try_clone_file_cow(source, destination) {
+		Ok(()) => Ok(()),
+		Err(error) if cow_is_unsupported(&error) => {
+			hardlink_copy_fallback(source, destination).map_err(Into::into)
+		},
+		Err(error) => Err(error.into()),
+	}
+}
+
+#[cfg(target_os = "macos")]
+fn try_clone_file_cow(source: &Path, destination: &Path) -> io::Result<()> {
 	use std::os::unix::ffi::OsStrExt as _;
 	let source = CString::new(source.as_os_str().as_bytes())
-		.map_err(|_| WorkspaceOperationError::OutsideRoot)?;
+		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
 	let destination = CString::new(destination.as_os_str().as_bytes())
-		.map_err(|_| WorkspaceOperationError::OutsideRoot)?;
+		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
 	// SAFETY: both C strings are live, NUL-terminated filesystem paths and flags=0.
 	let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) };
 	if result == 0 {
-		return Ok(());
-	}
-	let error = io::Error::last_os_error();
-	match error.raw_os_error() {
-		Some(libc::ENOTSUP | libc::EXDEV) => Err(WorkspaceOperationError::CowUnsupported),
-		_ => Err(error.into()),
+		Ok(())
+	} else {
+		Err(io::Error::last_os_error())
 	}
 }
 
 #[cfg(target_os = "linux")]
-fn clone_file_cow(source: &Path, destination: &Path) -> Result<(), WorkspaceOperationError> {
+fn try_clone_file_cow(source: &Path, destination: &Path) -> io::Result<()> {
 	let source = File::open(source)?;
-	let destination = OpenOptions::new()
+	let output = OpenOptions::new()
 		.write(true)
 		.create_new(true)
 		.open(destination)?;
 	const FICLONE: libc::c_ulong = 0x4004_9409;
 	// SAFETY: FICLONE reads both valid file descriptors and does not retain them.
-	let result = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+	let result = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, source.as_raw_fd()) };
 	if result == 0 {
 		Ok(())
 	} else {
 		let error = io::Error::last_os_error();
-		drop(destination);
-		match error.raw_os_error() {
-			Some(libc::EOPNOTSUPP | libc::EXDEV | libc::ENOTTY) => {
-				Err(WorkspaceOperationError::CowUnsupported)
-			},
-			_ => Err(error.into()),
-		}
+		drop(output);
+		let _ = fs::remove_file(destination);
+		Err(error)
 	}
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn clone_file_cow(_source: &Path, _destination: &Path) -> Result<(), WorkspaceOperationError> {
-	Err(WorkspaceOperationError::CowUnsupported)
+fn try_clone_file_cow(_source: &Path, _destination: &Path) -> io::Result<()> {
+	Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(target_os = "macos")]
+fn cow_is_unsupported(error: &io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EXDEV))
+}
+
+#[cfg(target_os = "linux")]
+fn cow_is_unsupported(error: &io::Error) -> bool {
+	matches!(
+		error.raw_os_error(),
+		Some(libc::EOPNOTSUPP | libc::EXDEV | libc::ENOTTY | libc::EINVAL)
+	)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn cow_is_unsupported(_error: &io::Error) -> bool {
+	true
+}
+
+fn hardlink_copy_fallback(source: &Path, destination: &Path) -> io::Result<()> {
+	// Probe the cheap same-device path, then immediately break the link before
+	// exposing the worktree. A mutable workspace must never share writable
+	// inodes with its isolated child.
+	if fs::hard_link(source, destination).is_ok() {
+		let temporary = destination.with_extension(format!("omp-copy-{}", Ulid::generate()));
+		let copied = fs::copy(source, &temporary);
+		if let Err(error) = copied {
+			let _ = fs::remove_file(destination);
+			let _ = fs::remove_file(temporary);
+			return Err(error);
+		}
+		#[cfg(windows)]
+		fs::remove_file(destination)?;
+		fs::rename(temporary, destination)
+	} else {
+		fs::copy(source, destination).map(|_| ())
+	}
 }

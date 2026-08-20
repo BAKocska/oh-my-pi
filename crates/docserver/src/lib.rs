@@ -11,6 +11,12 @@ pub mod client;
 pub mod connection;
 /// Long-lived document authority over standard I/O or a Unix-domain socket.
 pub mod daemon;
+/// Project-scoped Debug Adapter Protocol registry and selection.
+pub mod dap_adapter;
+/// Bounded framed Debug Adapter Protocol transport engine.
+pub mod dap_protocol;
+/// Debug session lifecycle, trees, actions, and env-side tiers.
+pub mod dap_session;
 /// Session-scoped lowering of opaque edit-format proposals.
 pub mod edit_adapter;
 /// Project-scoped authority and connection-local sessions.
@@ -43,6 +49,15 @@ pub mod wire;
 pub use actor::{
 	ContentSlice, DocumentEvent, DocumentEventKind, DocumentLocator, DocumentStore, OpenedDocument,
 	ReadBody, ReadResult, ReadSelection,
+};
+pub use dap_adapter::{
+	DapAdapterError, DapAdapterId, DapAdapterInfo, DapAdapterRegistry, DapAdapterSpec, DapTransport,
+	LaunchAdapterSelection,
+};
+pub use dap_protocol::{DapInbound, DapProtocol, DapProtocolError, SpawnedDap};
+pub use dap_session::{
+	DapAction, DapApprovalTier, DapReverseRequestHandler, DapSession, DapSessionError,
+	DapSessionRegistry, DapSessionState,
 };
 pub use edit_adapter::{
 	EditAdapterRegistry, HASHLINE_EDIT_FORMAT, REPLACE_EDIT_FORMAT, TextEditAdapter,

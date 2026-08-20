@@ -23,15 +23,16 @@ use omp_proto::{
 	env::v1::{
 		Admission, AdmitInvocation, ArgText, ArgsCommitted, AttachOutput, BlobGetComplete,
 		CancelRequest, ClientFrame, ClientHello, CloseSessionRequest, CloseSessionResponse,
-		CommitBlobPut, DataEvent, DataRequest, DataResponse, EventStreamError, EventStreamKind,
-		ExecRequest, ExecStarted, ExitEvent, Interrupt, InvocationScope, InvokeAccepted, InvokeTool,
-		ListProcesses, MaterializeSite, OpenSessionRequest, OpenSessionResponse, OutputAttached,
-		OutputFrame, ProcessCommandAccepted, ProcessList, ProcessOutput, ProcessStarted,
-		ProcessStateEvent, ProtocolError, ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg,
-		SearchRequest, SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest,
-		SiteMaterialized, StartProcess, StdinFrame, StopProcess, Update, Verdict, WalkComplete,
-		WalkEntry, WalkRequest, cancel_request, client_frame, data_event, data_request,
-		data_response, document_op, document_result, server_frame,
+		CommitBlobPut, CreateWorktree, DataEvent, DataRequest, DataResponse, DestroyWorktree,
+		EventStreamError, EventStreamKind, ExecRequest, ExecStarted, ExitEvent, Interrupt,
+		InvocationScope, InvokeAccepted, InvokeTool, ListProcesses, MaterializeSite, MergeWorktree,
+		OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame, ProcessCommandAccepted,
+		ProcessList, ProcessOutput, ProcessStarted, ProcessStateEvent, ProtocolError,
+		ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg, SearchRequest, SendInput,
+		ServerFrame, ServerHello, SignalProcess, SignalRequest, SiteMaterialized, StartProcess,
+		StdinFrame, StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest,
+		WorktreeResult, cancel_request, client_frame, data_event, data_request, data_response,
+		document_op, document_result, server_frame, worktree_op,
 	},
 };
 use parking_lot::Mutex;
@@ -571,6 +572,57 @@ impl EnvClient {
 				..
 			}) => Ok(response),
 			_ => Err(ClientError::UnexpectedResponse { expected: "SiteMaterialized" }),
+		}
+	}
+
+	/// Creates an Environment-owned isolated worktree.
+	pub async fn create_worktree(
+		&self,
+		request: CreateWorktree,
+	) -> Result<WorktreeResult, ClientError> {
+		self
+			.worktree_request(worktree_op::Op::Create(request))
+			.await
+	}
+
+	/// Destroys an Environment-owned isolated worktree.
+	pub async fn destroy_worktree(
+		&self,
+		request: DestroyWorktree,
+	) -> Result<WorktreeResult, ClientError> {
+		self
+			.worktree_request(worktree_op::Op::Destroy(request))
+			.await
+	}
+
+	/// Produces the selected Environment-owned worktree disposition.
+	pub async fn merge_worktree(
+		&self,
+		request: MergeWorktree,
+	) -> Result<WorktreeResult, ClientError> {
+		self.worktree_request(worktree_op::Op::Merge(request)).await
+	}
+
+	async fn worktree_request(
+		&self,
+		operation: worktree_op::Op,
+	) -> Result<WorktreeResult, ClientError> {
+		let request = DataRequest {
+			body: Some(data_request::Body::Worktree(omp_proto::env::v1::WorktreeOp {
+				op: Some(operation),
+				..Default::default()
+			})),
+			..Default::default()
+		};
+		match self
+			.one_shot(client_frame::Body::Data(request), None)
+			.await?
+		{
+			server_frame::Body::Data(DataResponse {
+				body: Some(data_response::Body::Worktree(response)),
+				..
+			}) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorktreeResult" }),
 		}
 	}
 

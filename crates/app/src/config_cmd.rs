@@ -1,6 +1,9 @@
 //! Schema-validated settings command handlers.
 
-use std::{path::Path, str::FromStr};
+use std::{
+	path::{Path, PathBuf},
+	str::FromStr,
+};
 
 use miette::IntoDiagnostic as _;
 use omp_core::Duration;
@@ -35,6 +38,14 @@ fn list(data_dir: &Path, json: bool) -> miette::Result<()> {
 	} else {
 		println!("default_model\tstring\t{}", settings.default_model.as_deref().unwrap_or("<unset>"));
 		println!("runtime.interrupt_grace\tduration\t{}", settings.runtime.interrupt_grace);
+		println!(
+			"worktree.base\tpath\t{}",
+			settings
+				.worktree
+				.base
+				.as_deref()
+				.map_or_else(|| "<unset>".to_owned(), |path| path.display().to_string())
+		);
 	}
 	Ok(())
 }
@@ -44,6 +55,14 @@ fn get(data_dir: &Path, key: &str) -> miette::Result<()> {
 	match key {
 		"default_model" => println!("{}", settings.default_model.as_deref().unwrap_or("")),
 		"runtime.interrupt_grace" => println!("{}", settings.runtime.interrupt_grace),
+		"worktree.base" => println!(
+			"{}",
+			settings
+				.worktree
+				.base
+				.as_deref()
+				.map_or_else(String::new, |path| path.display().to_string())
+		),
 		_ => return Err(CliUsageError::new(format!("unknown setting `{key}`")).into()),
 	}
 	Ok(())
@@ -62,6 +81,12 @@ fn set(data_dir: &Path, key: &str, value: &str) -> miette::Result<()> {
 			}
 			settings.runtime.interrupt_grace = duration;
 		},
+		"worktree.base" if !value.trim().is_empty() => {
+			settings.worktree.base = Some(PathBuf::from(value));
+		},
+		"worktree.base" => {
+			return Err(CliUsageError::new("worktree.base must not be empty").into());
+		},
 		_ => return Err(CliUsageError::new(format!("unknown setting `{key}`")).into()),
 	}
 	settings.save(data_dir).into_diagnostic()?;
@@ -73,6 +98,7 @@ fn reset(data_dir: &Path, key: &str) -> miette::Result<()> {
 	match key {
 		"default_model" => settings.default_model = None,
 		"runtime.interrupt_grace" => settings.runtime = Default::default(),
+		"worktree.base" => settings.worktree.base = None,
 		_ => return Err(CliUsageError::new(format!("unknown setting `{key}`")).into()),
 	}
 	settings.save(data_dir).into_diagnostic()?;
@@ -86,6 +112,8 @@ mod tests {
 	fn validates_the_documented_setting_schema() {
 		let state = tempfile::tempdir().expect("state");
 		set(state.path(), "runtime.interrupt_grace", "250ms").expect("duration");
+		set(state.path(), "worktree.base", "isolated").expect("worktree base");
+		assert_eq!(Settings::load(state.path()).worktree.base, Some(PathBuf::from("isolated")));
 		assert!(set(state.path(), "runtime.interrupt_grace", "none").is_err());
 		assert!(set(state.path(), "unknown", "value").is_err());
 	}

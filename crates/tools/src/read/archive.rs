@@ -314,16 +314,15 @@ pub fn open_archive_path(
 	let format = archive_format_from_path(path).ok_or_else(|| ArchiveError::UnsupportedFormat {
 		path: path.to_string_lossy().into_owned(),
 	})?;
-	let archive = Archive::open_with_format_and_limits(path, format, archive_limits()).map_err(
-		|error| match error {
-			ArError::Io(source) => ArchiveError::Io {
-				action: "open",
-				path: path.to_path_buf(),
-				source,
-			},
-			other => archive_error(other, format),
-		},
-	)?;
+	let archive =
+		Archive::open_with_format_and_limits(path, format, archive_limits()).map_err(|error| {
+			match error {
+				ArError::Io(source) => {
+					ArchiveError::Io { action: "open", path: path.to_path_buf(), source }
+				},
+				other => archive_error(other, format),
+			}
+		})?;
 	Ok(ArchiveReader { archive })
 }
 

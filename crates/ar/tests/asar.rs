@@ -22,10 +22,19 @@ fn lists_directories_and_reads_packed_members_and_links_lazily() {
 	assert_eq!(Format::from_path("bundle.ASAR"), Some(Format::Asar));
 	let mut archive = Archive::from_bytes_with_format(&bytes, Format::Asar).unwrap();
 
-	let root: Vec<_> = archive.list("").unwrap().into_iter().map(|entry| entry.path()).collect();
+	let root: Vec<_> = archive
+		.list("")
+		.unwrap()
+		.into_iter()
+		.map(|entry| entry.path())
+		.collect();
 	assert_eq!(root, ["alias.txt", "docs", "top.txt"]);
-	let docs: Vec<_> =
-		archive.list("docs").unwrap().into_iter().map(|entry| entry.path()).collect();
+	let docs: Vec<_> = archive
+		.list("docs")
+		.unwrap()
+		.into_iter()
+		.map(|entry| entry.path())
+		.collect();
 	assert_eq!(docs, ["docs/hello.txt"]);
 	assert_eq!(archive.read("docs/hello.txt").unwrap(), b"hello");
 	assert_eq!(archive.read("top.txt").unwrap(), b"top");
@@ -72,6 +81,7 @@ fn rejects_unsafe_tree_names_and_link_targets() {
 		json!({"..": {"size": 0, "offset": "0"}}),
 		json!({"safe": {"link": "../outside"}}),
 		json!({"nested/name": {"size": 0, "offset": "0"}}),
+		json!({"C:": {"size": 0, "offset": "0"}}),
 	] {
 		let bytes = fixture(files, b"");
 		assert!(matches!(

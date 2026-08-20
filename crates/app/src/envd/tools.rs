@@ -28,6 +28,7 @@ use super::{
 	docs::DocumentHost,
 	eval::{ProcessEvalExec, SessionBridgeHost},
 	exec::ExecHost,
+	media_devices,
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
 	tool_shell::ShellExecHost,
@@ -47,6 +48,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	blobs: &BlobHost,
 	exec: &ExecHost,
 	workspace: &WorkspaceHost,
+	telemetry: &Arc<omp_storage::telemetry_index::TelemetryIndex>,
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
@@ -79,10 +81,23 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		"checkpoint",
 		"rewind",
 		"hub",
+		"image_gen",
+		"tts",
+		"report_issue",
+		"vibe",
 		"dyn",
 	] {
 		ensure_name_absent(&registry, name)?;
 	}
+	for device in [media_devices::image_gen(), media_devices::tts()] {
+		registry.register(device, Presentation::Device, builtin_device_claims())?;
+	}
+	registry.register(
+		media_devices::report_issue(Arc::clone(telemetry)),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
+	registry.register(crate::vibe::tool(), Presentation::Device, builtin_device_claims())?;
 	let checkpoint_control = AgentCheckpointControl::default();
 	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
 	let conflicts = Arc::new(ConflictRegistry::default());
@@ -339,6 +354,14 @@ fn ensure_name_absent(registry: &Registry, name: &str) -> Result<(), EnvdError> 
 const fn core_claims() -> Claims {
 	Claims {
 		precedence: Precedence::CORE,
+		claimant:   Str::new_static("omp/core"),
+		replaces:   None,
+	}
+}
+
+const fn builtin_device_claims() -> Claims {
+	Claims {
+		precedence: Precedence::ENHANCEMENT,
 		claimant:   Str::new_static("omp/core"),
 		replaces:   None,
 	}

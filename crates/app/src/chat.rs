@@ -56,7 +56,7 @@ use crate::{
 	chat_ui::{
 		self, AuthPromptKind, ChatAuth, ChatAuthCommand, ChatAuthEvent, ChatUiSession, ResumeChoice,
 	},
-	cli::ChatArgs,
+	cli::{ChatArgs, ThinkingLevel},
 };
 
 const CHAT_CAPS_BASE: CapsBase = CapsBase {
@@ -540,6 +540,10 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 	pub(crate) fn broker(&self) -> omp_agent::Broker {
 		self.broker.clone()
 	}
+
+	pub(crate) fn session_id(&self) -> Str {
+		self.context.lock().session_id.clone()
+	}
 }
 
 fn bridge_message(role: Role, text: &str) -> Item {
@@ -698,20 +702,63 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				Str::from(format!("{}\n\n{}", definition.description, definition.prompt))
 			},
 		};
-		for option in ["isolated", "apply", "merge"] {
-			if args.get(option).is_some() {
-				return Err(crate::envd::eval::BridgeHostError::message(format!(
-					"agent option '{option}' is not supported by this session"
-				)));
-			}
+		let apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
+		let merge = args.get("merge").and_then(Value::as_bool).unwrap_or(false);
+		if apply && merge {
+			return Err(crate::envd::eval::BridgeHostError::message(
+				"agent options 'apply' and 'merge' are mutually exclusive",
+			));
 		}
+		let explicitly_isolated = args.get("isolated").and_then(Value::as_bool);
+		if explicitly_isolated == Some(false) && (apply || merge) {
+			return Err(crate::envd::eval::BridgeHostError::message(
+				"agent apply/merge requires an isolated worktree",
+			));
+		}
+		let isolated = explicitly_isolated.unwrap_or(apply || merge);
 		if args.get("schema").is_some() || args.get("schemaMode").is_some() {
 			return Err(crate::envd::eval::BridgeHostError::message(
 				"structured subagent output is not supported by this session",
 			));
 		}
-		let id = Str::from(ulid::Ulid::generate().to_string());
+		let id = args
+			.get("_id")
+			.and_then(Value::as_str)
+			.map_or_else(|| Str::from(ulid::Ulid::generate().to_string()), Str::from);
 		let directory = context.sessions_dir.join("eval-agents");
+		let (worktree_id, child_root, isolated_environment) = if isolated {
+			let created = self
+				.env
+				.create_worktree(omp_proto::env::v1::CreateWorktree {
+					name: id.to_string(),
+					owner_pid: std::process::id(),
+					..Default::default()
+				})
+				.await
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			let worktree = created.worktree.ok_or_else(|| {
+				crate::envd::eval::BridgeHostError::message(
+					"Environment omitted the created worktree identity",
+				)
+			})?;
+			let root_url = url::Url::parse(&worktree.root_uri)
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			let root = root_url.to_file_path().map_err(|()| {
+				crate::envd::eval::BridgeHostError::message(
+					"Environment returned a non-file worktree root",
+				)
+			})?;
+			let child_state = context
+				.sessions_dir
+				.join("eval-agents")
+				.join(format!("{id}-env"));
+			let environment = crate::envd::ProjectEnvironment::isolated(&root, &child_state)
+				.await
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			(Some(Str::from(worktree.id)), root, Some(environment))
+		} else {
+			(None, context.root.clone(), None)
+		};
 		let name = args
 			.get("label")
 			.and_then(Value::as_str)
@@ -749,6 +796,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		)
 		.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		let mut child_snapshot = context.state.snapshot().as_ref().clone();
+		child_snapshot.workspace.cwd = child_root.clone();
 		if let Some(model) = definition.effective_model(&BTreeMap::new()) {
 			child_snapshot.turn.params.model = model.to_owned();
 		}
@@ -788,13 +836,22 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 					|| tool.name == "hub"
 					|| declared_tools.iter().any(|allowed| allowed == &tool.name))
 		});
+		let child_env = isolated_environment
+			.as_ref()
+			.map_or_else(|| self.env.clone(), |environment| environment.client().clone());
 		let mut child = Agent::new(
 			self.client.clone(),
-			self.env.clone(),
+			child_env.clone(),
 			AgentState::new(child_snapshot),
 			journal,
 			CHAT_CAPS_BASE,
 		);
+		if let Some(environment) = &isolated_environment {
+			environment
+				.bind_agent_control(child.control())
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			environment.bind_device_availability(child.mailbox());
+		}
 		let inbox = self
 			.broker
 			.register(&node, child.mailbox())
@@ -803,7 +860,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			self.broker.clone(),
 			inbox,
 			Arc::clone(child.jobs()),
-			self.env.clone(),
+			child_env.clone(),
 			id.clone(),
 			context.session_id.clone(),
 		)));
@@ -830,6 +887,49 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			.outcome
 			.as_ref()
 			.map_or_else(|| "(interrupted)".to_owned(), bridge_outcome_text);
+		drop(_hub);
+		drop(child);
+		drop(child_env);
+		drop(isolated_environment);
+		let mut disposition = None;
+		if let Some(worktree_id) = worktree_id.as_ref()
+			&& (apply || merge)
+		{
+			let mode = if apply {
+				omp_proto::env::v1::MergeMode::Patch
+			} else {
+				omp_proto::env::v1::MergeMode::Branch
+			};
+			let merged = self
+				.env
+				.merge_worktree(omp_proto::env::v1::MergeWorktree {
+					id: worktree_id.to_string(),
+					mode: mode as i32,
+					..Default::default()
+				})
+				.await
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			if !merged.conflicts.is_empty() {
+				return Err(crate::envd::eval::BridgeHostError::message(
+					"isolated worktree disposition reported conflicts",
+				));
+			}
+			disposition = Some(json!({
+				"mode": if apply { "patch" } else { "branch" },
+				"artifactHash": omp_core::encoding::hex::encode(&merged.artifact_hash).into_string(),
+				"artifactSize": merged.artifact_size,
+				"branch": merged.branch,
+			}));
+			self
+				.env
+				.destroy_worktree(omp_proto::env::v1::DestroyWorktree {
+					id: worktree_id.to_string(),
+					force: true,
+					..Default::default()
+				})
+				.await
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		}
 		let artifact_dir = context.sessions_dir.join(context.session_id.as_str());
 		std::fs::create_dir_all(&artifact_dir)
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
@@ -841,7 +941,15 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		Ok(json!({
 			"text": text,
-			"details": { "id": id, "agent": kind, "blocking": definition.blocking },
+			"details": {
+				"id": id,
+				"agent": kind,
+				"blocking": definition.blocking,
+				"isolated": isolated,
+				"worktree": worktree_id,
+				"root": isolated.then(|| child_root.to_string_lossy().into_owned()),
+				"disposition": disposition,
+			},
 		}))
 	}
 
@@ -879,6 +987,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 		omp_llm_catalog::snapshot::Catalog::try_embedded().map_err(|e| miette::miette!(e))?;
 	let settings = crate::settings::Settings::load(&data_dir);
 	let interrupt_grace = settings.runtime_durations().interrupt_grace;
+	let auto_thinking = settings.auto_thinking;
 	let model = match args
 		.model
 		.clone()
@@ -923,9 +1032,14 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 		Arc::clone(&session_index),
 	)
 	.map_err(|e| miette::miette!(e))?;
-	let snapshot =
+	let mut snapshot =
 		agent_snapshot(model.as_str(), catalog, &root, &session.id, Arc::clone(&registry))
 			.map_err(|e| miette::miette!(e))?;
+	if let Some(level) = args.thinking {
+		let effort = thinking_effort(level, auto_thinking);
+		snapshot.turn.params.thinking =
+			Some(inference_pb::Reasoning { effort: effort as i32, ..Default::default() });
+	}
 	let state = AgentState::new(snapshot);
 
 	if let Some(endpoint) = args.gateway {
@@ -1054,7 +1168,13 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		};
 		let Session { id, journal, initial_items } = session;
 		let current_id = id.clone();
-		let agent = Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
+		let mut agent =
+			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
+		let modes = Arc::new(crate::modes::ExecutionModes::new(agent.execution_mode()));
+		state.update(|snapshot| {
+			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
+		});
+		agent.set_continuation_source(modes.clone());
 		environment.bind_agent_control(agent.control())?;
 		environment.bind_device_availability(agent.mailbox());
 		let tree = parent.tree();
@@ -1081,11 +1201,13 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			id.clone(),
 			id.clone(),
 		)));
+		let _vibe = crate::vibe::attach_chat(Arc::clone(&parent), Arc::clone(&modes));
 		let exit = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
 			Arc::clone(&scope.registry),
 			parent.tree(),
+			modes,
 			auth.as_ref().map(|worker| &worker.ui),
 			data_dir.clone(),
 			Vec::new(),
@@ -1549,6 +1671,26 @@ fn agent_snapshot(
 	Ok(snapshot)
 }
 
+fn thinking_effort(
+	level: ThinkingLevel,
+	auto: crate::settings::AutoThinkingSettings,
+) -> inference_pb::Effort {
+	match level {
+		ThinkingLevel::Off => inference_pb::Effort::Off,
+		ThinkingLevel::Minimal => inference_pb::Effort::Minimal,
+		ThinkingLevel::Low => inference_pb::Effort::Low,
+		ThinkingLevel::Medium => inference_pb::Effort::Medium,
+		ThinkingLevel::High => inference_pb::Effort::High,
+		ThinkingLevel::Extreme | ThinkingLevel::Max => inference_pb::Effort::Max,
+		ThinkingLevel::XHigh => inference_pb::Effort::Xhigh,
+		ThinkingLevel::Auto => auto
+			.for_turn()
+			.provisional
+			.provisional(auto.ceiling)
+			.effort(),
+	}
+}
+
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -1585,6 +1727,17 @@ mod tests {
 	use omp_storage::transcript::{Event, ItemRecord, TitleSource, Writer};
 
 	use super::*;
+
+	#[test]
+	fn auto_thinking_installs_a_clamped_provisional_effort() {
+		let auto = crate::settings::AutoThinkingSettings {
+			provisional: omp_llm_inference::Difficulty::Max,
+			ceiling: omp_llm_inference::Difficulty::Max,
+			..crate::settings::AutoThinkingSettings::default()
+		};
+		assert_eq!(thinking_effort(ThinkingLevel::Auto, auto), inference_pb::Effort::High);
+		assert_eq!(thinking_effort(ThinkingLevel::XHigh, auto), inference_pb::Effort::Xhigh,);
+	}
 
 	#[test]
 	fn model_selector_resolution_covers_keys_aliases_routes_and_unknowns() {

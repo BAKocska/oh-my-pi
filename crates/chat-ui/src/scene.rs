@@ -25,8 +25,8 @@ use omp_tui::{
 use smallvec::SmallVec;
 
 use crate::{
-	AgentRow, BackendEvent, CompactionSpeculationStatus, StatusFacts, SubmitMode, TranscriptFrame,
-	TranscriptFrameKind,
+	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, StatusFacts, SubmitMode,
+	TranscriptFrame, TranscriptFrameKind,
 	slots::{Mount, Slots},
 };
 
@@ -482,6 +482,23 @@ impl<'a> PreviewEntry<'a> {
 	}
 }
 
+fn activity_waveform_label(waveform: &ActivityWaveform, charset: Charset) -> Str {
+	let glyphs = match charset {
+		Charset::Ascii => ['.', ':', '-', '*', '#'],
+		Charset::Unicode | Charset::NerdFont => ['▁', '▂', '▄', '▆', '█'],
+	};
+	let mut label = String::with_capacity(5 + waveform.bands().len().saturating_mul(3));
+	label.push_str("live ");
+	if waveform.bands().is_empty() {
+		label.push(glyphs[0]);
+	} else {
+		for band in waveform.bands() {
+			label.push(glyphs[usize::from(*band).min(glyphs.len() - 1)]);
+		}
+	}
+	label.into()
+}
+
 struct WorkState {
 	facts: StatusFacts,
 	fade:  Tween<Color>,
@@ -553,6 +570,13 @@ impl ChatStatus {
 		let work = self.work.borrow();
 		let facts = &work.facts;
 		let mut status = self.group().with_str(Prop::Align, "right");
+		if let Some(waveform) = &facts.live_activity {
+			status = status.segment(
+				Segment::new()
+					.label(activity_waveform_label(waveform, self.charset))
+					.with(Prop::Fg, self.theme.accent),
+			);
+		}
 		if let Some(git) = &facts.git {
 			let mut label =
 				StrMut::new(fmts!("{} {}", self.charset.icon(Icon::Branch), git.branch).as_str());
@@ -647,7 +671,8 @@ impl ChatStatus {
 
 	fn has_more(&self) -> bool {
 		let facts = &self.work.borrow().facts;
-		facts.git.is_some()
+		facts.live_activity.is_some()
+			|| facts.git.is_some()
 			|| facts.context_tokens > 0
 			|| facts.cost_nanos > 0
 			|| facts.model_subscription
@@ -2204,6 +2229,16 @@ mod tests {
 
 	fn ctx() -> UiContext {
 		UiContext::default()
+	}
+
+	#[test]
+	fn live_waveform_uses_charset_specific_activity_bands() {
+		let mut waveform = ActivityWaveform::new();
+		for band in 0..=4 {
+			waveform.push(band);
+		}
+		assert_eq!(activity_waveform_label(&waveform, Charset::Ascii), "live .:-*#");
+		assert_eq!(activity_waveform_label(&waveform, Charset::Unicode), "live ▁▂▄▆█");
 	}
 
 	fn row_text(frame: &Frame, row: u16) -> String {

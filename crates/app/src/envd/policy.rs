@@ -29,6 +29,8 @@ pub const CAPABILITIES: &[&str] = &[
 	"env.fs.write",
 	"env.search",
 	"env.lsp",
+	"env.dap.read",
+	"env.dap.execute",
 ];
 
 /// An exact, wildcard-free set of DATA grants.
@@ -93,10 +95,17 @@ impl Grants {
 	/// bounds.
 	#[must_use]
 	pub fn from_effect_envelope(envelope: &omp_proto::policy::v1::EffectEnvelope) -> Self {
-		let mut grants = Vec::with_capacity(8);
+		let mut grants = Vec::with_capacity(10);
 		if let Some(documents) = &envelope.documents {
 			if documents.read {
-				grants.extend(["env.doc.read", "env.fs.read", "env.search", "env.lsp", "env.blob"]);
+				grants.extend([
+					"env.doc.read",
+					"env.fs.read",
+					"env.search",
+					"env.lsp",
+					"env.dap.read",
+					"env.blob",
+				]);
 			}
 			if !documents.write_globs.is_empty() {
 				grants.extend(["env.doc.write", "env.fs.write", "env.blob"]);
@@ -107,9 +116,24 @@ impl Grants {
 			.as_ref()
 			.is_some_and(|exec| !exec.commands.is_empty())
 		{
-			grants.extend(["env.exec", "env.blob"]);
+			grants.extend(["env.exec", "env.dap.read", "env.dap.execute", "env.blob"]);
 		}
 		Self::supported(grants)
+	}
+}
+
+/// Returns the immutable Environment tier for one DAP action.
+#[must_use]
+pub const fn dap_action_tier(action: omp_docserver::DapAction) -> omp_docserver::DapApprovalTier {
+	action.approval_tier()
+}
+
+/// Returns the exact DATA capability required by one DAP action.
+#[must_use]
+pub const fn dap_action_capability(action: omp_docserver::DapAction) -> &'static str {
+	match dap_action_tier(action) {
+		omp_docserver::DapApprovalTier::ReadOnly => "env.dap.read",
+		omp_docserver::DapApprovalTier::Execution => "env.dap.execute",
 	}
 }
 
