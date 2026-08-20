@@ -1,6 +1,6 @@
 # Extension examples
 
-Sixty-six ports of real pi-ecosystem extensions onto the omp Python extension
+Eighty-six ports of real pi-ecosystem extensions onto the omp Python extension
 layer (`crates/py/python/omp`). Each directory is one extension: an `omp.toml`
 manifest, the Python module(s), and a README stating what the pi original did,
 how the omp shape differs, and — load-bearing — a **Gaps** section listing every
@@ -79,6 +79,26 @@ distance.
 | `remote-approve/` | `@agentapprove/pi` | `@omp.approver`, idempotent re-offer, fail-closed unreachable | `docs/py/06 §Approvals` |
 | `provider-vertex/` | `@twogiants/pi-anthropic-vertex` | region-scoped routes, scoped-mint GCP auth | `docs/py/13` |
 | `side-chat/` | `pi-btw` | background side-thread agents, overlay transcript, real journals | `docs/py/12`, `docs/py/07` |
+| `fzf-actions/` | `pi-fzf` | config-driven pickers: env exec candidates, overlay select, quote-safe actions | `docs/py/07`, `docs/py/11` |
+| `esc-steer/` | `pi-esc-steer` | shortcut abort + queued-steer injection, no invented interrupts | `docs/py/03` |
+| `task-queue/` | `pi-true-queue` | hidden work queue, serial `Continue` drain, journal-resumable | `docs/py/05 §4.2`, `docs/py/12` |
+| `git-changes/` | `@joyanhui/pi-ext-git-changes` | first `<diff>` markup, porcelain -z parsing, zero polling | `docs/py/07` |
+| `pulse/` | `pi-pulse` | TPS/TTFT from event fields, EMA footer, DropStats | `docs/py/10` |
+| `vision-describe/` | `@smoose/pi-vision` | vision-role completion with image parts, digest cache | `docs/py/12`, `docs/py/02` |
+| `legible/` | `@nklisch/pi-legible` | assistant-message renderer, rewrite as presentation not mutation | `docs/py/07 §4.13` |
+| `study-commits/` | `@anthnykr/pi-study-commits` | overlay multi-select, single bounded injection, spill fallback | `docs/py/07`, `docs/py/12` |
+| `auto-thinking/` | `@narumitw/pi-auto-thinking` | thinking patch (ruling landed), classifier ladder + heuristic fallback | `docs/py/05 §3.3`, `docs/py/12` |
+| `llama-switch/` | `pi-llama-switch` | named-process argv switch, generation fencing, availability flips | `docs/py/11`, `docs/py/13` |
+| `tool-search/` | `pi-tool-search` | `dyn` subsumes discovery; allowlisted availability promotion | `docs/py/01` |
+| `github-tools/` | `@amitkot/pi-safe-github` | one zero-slot device, typed sub-paths, creds + approval-gated writes | `docs/py/01`, `docs/py/11` |
+| `shell-hooks/` | `@hsingjui/pi-hooks` | config-driven event→shell hooks, OBSERVE default, opt-in gating | `docs/py/05` |
+| `script-tools/` | `@isr4el-silv4/pi-script-tools` | dynamic mount from workspace scan, header-parsed args, rescan refresh | `docs/py/01`, `docs/py/11` |
+| `provider-pack/` | `pi-moonshot` + `pi-zai-glm` + `pi-provider-alibaba` + OVH | four class (a) data providers, zero hooks | `docs/py/13` |
+| `feature-bundle/` | `pi-toolbox` / `@bdsqqq/pi` umbrellas | first `[features]`: 33 entrypoints → one extension, three features | `docs/py/14 §3.1.3` |
+| `dev-inspector/` | `pi-dev-inspector` | prompt-slot breakdown, request telemetry, capture-grant redaction | `docs/py/10 §4`, `docs/py/08` |
+| `grep-heatmap/` | `pi-fovea` | tool_result rewrite prohibited → renderer augmentation + query device | `docs/py/02`, `docs/py/05 §3.11` |
+| `green-loop/` | `pi-green-loop` | affected-test loop: OBSERVE fold, `AfterIdle`, failure dedup | `docs/py/12`, `docs/py/11` |
+| `speech-providers/` | `@p8n.ai/pi-listens` | `Operation.SPEAK`/`TRANSCRIBE`, audio BlobParts, class (b) parsers | `docs/py/13` |
 
 pi extension descriptions:
 `.plan/user-requests/2026-08-10-pi-extension-survey/catalog.md`.
@@ -219,3 +239,23 @@ claims were reconciled (ports whose declarations the docs proved illegal —
 non-TRANSFORM `order`, observation `on_failure`, `@omp.tool` `family=`,
 missing loopback trust — were corrected to the documented contract).
 
+
+## Round 5 residual defects (2026-08-20, twenty ports)
+
+Four ports gap-free (`esc-steer/`, `fzf-actions/`, `script-tools/`,
+`study-commits/`). The character changed this round: no missing namespaces —
+the findings are micro-divergences and, notably, **docs defects**, including
+the first inverse divergences (frozen ahead of docs). The
+`turn_start.thinking` ruling landed; `auto-thinking/` closes that saga.
+
+| Defect | Found by | Where |
+|---|---|---|
+| Docs defects: 05 §4.2's worked example is stale (`Settle(reason=)`, `Continue(prompt=Item.user_note)`, awaited sync `journal.append`, absent `journal.state`); 05:1787 phased `compaction` vs domain-only frozen+08; 07 calls `<diff>` unavailable/proposed while the TUI ships it; 00 `ctx.session: str` vs 07 §5.1 `ctx.session.stats`; 10:796 `tokens` vs frozen `usage`; 04:899 `Spill.buf` vs frozen `value` | `task-queue/`, `shell-hooks/`, `git-changes/`, `feature-bundle/`, `pulse/`, `vision-describe/` | docs |
+| Inverse divergences (frozen ahead of docs): `Inject.prompt` required but undocumented; `BeforeAgentStartEvent.schedule_id` frozen but absent from 05's payload table | `green-loop/` | docs |
+| Needs ruling: paid classifiers from turn-level TRANSFORM — 12's REVIEW-only completion legality vs 05's Modify-is-TRANSFORM-only leaves no legal phase for a single turn_start classifier hook | `auto-thinking/` | `docs/py/05`, `docs/py/12` |
+| No extension-visible merged-catalog read (`models()`/`ModelCard`/WatchModels documented, no frozen Python reader; `ProviderHandle.models()` is declaration-scoped) | `auto-thinking/` | `provider.py:980-1060` |
+| Telemetry: `ModelRequest` lacks `latency_ms`/`ttft_ms`/`degraded`/content fields; `coalesce_key` validated then discarded (registry has no field); `PromptFingerprint.slots` lack byte sizes/bands | `pulse/`, `dev-inspector/` | `telemetry.py:108-183`, `_registry.py:184-195` |
+| Provider: `SpecError` missing; duplicate `ModelSpec.id` not rejected in `__post_init__`; bare class-(a) `provider(spec)` call doesn't register; `PromptCacheCaps`/`CacheRetention` naming divergence; `SpeechCaps`/`AudioFormat`/`TranscriptionCaps` absent (`ModelSpec` fields `object`); `ProviderHandle.request` image-only despite SPEAK/TRANSCRIBE shared-machinery docs; `completion` has no image-part input contract | `provider-pack/`, `speech-providers/`, `vision-describe/` | `provider.py`, `agents.py:155-167` |
+| Devices: `Device.subtool` returns `ToolPath` vs documented child-device decorator (blocks publishing `dyn invoke/github/pr/list` addresses); `devices.list` async vs docs sync; `HARD_SLOT_BUDGET` absent | `github-tools/`, `tool-search/` | `devices.py:290-296,368-415` |
+| UI: `MessageView` missing (renderer takes `object`); message-renderer purity contradiction for pending→cached rewrites (no sanctioned presentation-cache/invalidation); no renderer decoration/augmentation mode though 01 sanctions it; `<diff>` `context` prop unread in TUI props | `legible/`, `grep-heatmap/`, `git-changes/` | `ui/__init__.py:666-720`, `crates/tui/src/props.rs` |
+| env: `Process.restart()` absent (stop+ensure works); `Process` ops dispatch by name without generation fencing despite the contract; `Run.stdin` vs frozen `write`/`eof` | `llama-switch/`, `shell-hooks/` | `env.py:742-748,1033-1077` |
