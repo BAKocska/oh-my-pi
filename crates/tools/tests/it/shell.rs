@@ -4,7 +4,7 @@ use std::{collections::VecDeque, io::Cursor, sync::Arc};
 
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, executor::block_on, pin_mut};
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, sf};
 use omp_proto::inference::v1::invoke_input;
 use omp_tool::{
 	Abort, ArtifactLifetime, CallOutcome, CallOutcomeDetails, CallOutcomeSpill, CapsBase, Claims,
@@ -49,8 +49,8 @@ impl CallOutcomeSpill for RecordingSpill {
 		let bytes = stage.into_inner();
 		*self.bytes.lock() = bytes.clone();
 		Ok(omp_tool::BlobRef {
-			hash:       Str::from("blake3:captured"),
-			media_type: Str::from("application/json"),
+			hash:       sf!("blake3:captured"),
+			media_type: sf!("application/json"),
 			byte_len:   bytes.len() as u64,
 		})
 	}
@@ -87,7 +87,7 @@ impl ShellRun for FakeRun {
 
 	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
 		std::future::ready(Ok(DetachedJob {
-			id:    Str::from(format!("process:{name}:1")),
+			id:    sf!("process:{name}:1"),
 			owner: JobOwner::NamedProcess { name, generation: 1 },
 		}))
 	}
@@ -160,8 +160,8 @@ impl ShellExec for FakeExec {
 				}));
 				let mut terminal = status(ExecOutcome::Exited);
 				terminal.spilled_output = Some(omp_tool::BlobRef {
-					hash:       Str::from("sha256:overflow"),
-					media_type: Str::from("application/octet-stream"),
+					hash:       sf!("sha256:overflow"),
+					media_type: sf!("application/octet-stream"),
 					byte_len:   4096,
 				});
 				events.push_back(RunEvent::Exit(terminal));
@@ -183,7 +183,7 @@ impl ShellExec for FakeExec {
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
 		let pending = request.command == "pending-detach";
-		let id = Str::from(format!("process:{}:1", request.name));
+		let id = sf!("process:{}:1", request.name);
 		let owner_name = request.name.clone();
 		self.state.lock().detaches.push(request);
 		if pending {
@@ -210,7 +210,7 @@ fn registry(exec: FakeExec, _: usize) -> Registry {
 	registry
 		.register(shell::shell(exec), Presentation::Slot, Claims {
 			precedence: Precedence::CORE,
-			claimant:   Str::from("omp/core"),
+			claimant:   sf!("omp/core"),
 			replaces:   None,
 		})
 		.expect("shell schema and revision register");
@@ -219,7 +219,7 @@ fn registry(exec: FakeExec, _: usize) -> Registry {
 
 fn call(registry: &Registry, raw: &str) -> Vec<ErasedEv> {
 	let (feed, params) = IncomingParams::channel();
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 	let stream = registry.invoke("shell", params).unwrap();
 	block_on(stream.map(|event| event.unwrap()).collect())
 }
@@ -237,7 +237,7 @@ fn payload(events: &[ErasedEv]) -> Payload {
 
 fn committed(raw: &str) -> IncomingParams<'static> {
 	let (feed, params) = IncomingParams::channel();
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 	params
 }
 
@@ -265,9 +265,7 @@ fn execution_waits_for_the_explicit_commit_gate() {
 	let exec = FakeExec::default();
 	let registry = registry(exec.clone(), 1024);
 	let (feed, params) = IncomingParams::channel();
-	feed
-		.arg_text(Str::from(r#"{"command":"ordered"}"#))
-		.unwrap();
+	feed.arg_text(sf!(r#"{{"command":"ordered"}}"#)).unwrap();
 	let stream = registry.invoke("shell", params).unwrap();
 	pin_mut!(stream);
 	assert!(stream.next().now_or_never().is_none());
@@ -275,7 +273,7 @@ fn execution_waits_for_the_explicit_commit_gate() {
 	assert_eq!(exec.state.lock().runs, [] as [(bytes::Bytes, omp_tools::shell::RunRequest); 0]);
 
 	feed
-		.args_committed(Str::from(r#"{"command":"ordered"}"#))
+		.args_committed(sf!(r#"{{"command":"ordered"}}"#))
 		.unwrap();
 	let events = block_on(stream.map(|event| event.unwrap()).collect::<Vec<_>>());
 	assert_eq!(payload(&events).status.outcome, ExecOutcome::Exited);
@@ -401,7 +399,7 @@ fn async_returns_a_named_session_lifetime_job_reference() {
 		panic!("async must return a detached outcome")
 	};
 	assert_eq!(job.id, "process:web:1");
-	assert_eq!(job.owner, JobOwner::NamedProcess { name: Str::from("web"), generation: 1 });
+	assert_eq!(job.owner, JobOwner::NamedProcess { name: sf!("web"), generation: 1 });
 	assert_eq!(job.artifact.lifetime, ArtifactLifetime::Session);
 	assert_eq!(
 		job.artifact.media_type.as_deref(),
@@ -418,7 +416,7 @@ async fn foreground_wait_threshold_detaches_the_exact_running_command() {
 		shell::shell(FakeExec::default()).with_auto_background_threshold(std::time::Duration::ZERO);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(r#"{"command":"wait"}"#))
+		.args_committed(sf!(r#"{{"command":"wait"}}"#))
 		.expect("shell invocation remains live");
 	let mut events = Box::pin(tool.call(params));
 	let event = events.next().await.expect("detached terminal");
@@ -426,10 +424,7 @@ async fn foreground_wait_threshold_detaches_the_exact_running_command() {
 		panic!("zero-threshold shell did not detach");
 	};
 	assert_eq!(job.id, "process:shell-bg-1:1");
-	assert_eq!(job.owner, JobOwner::NamedProcess {
-		name:       Str::new_static("shell-bg-1"),
-		generation: 1,
-	},);
+	assert_eq!(job.owner, JobOwner::NamedProcess { name: sf!("shell-bg-1"), generation: 1 },);
 }
 
 #[test]
@@ -438,7 +433,7 @@ fn interrupt_during_async_setup_reports_effect_uncertainty() {
 	let registry = registry(exec.clone(), 1024);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(r#"{"command":"pending-detach","async":true,"name":"pending"}"#))
+		.args_committed(sf!(r#"{{"command":"pending-detach","async":true,"name":"pending"}}"#,))
 		.unwrap();
 	let wait_state = Arc::clone(&exec.state);
 	let interrupter = std::thread::spawn(move || {
@@ -446,7 +441,7 @@ fn interrupt_during_async_setup_reports_effect_uncertainty() {
 			std::thread::yield_now();
 		}
 		feed
-			.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop detach") })
+			.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop detach") })
 			.unwrap();
 	});
 	let stream = registry.invoke("shell", params).unwrap();
@@ -500,11 +495,9 @@ fn interrupt_before_execution_is_skipped_without_poisoning_later_calls() {
 	let exec = FakeExec::default();
 	let registry = registry(exec.clone(), 1024);
 	let (feed, params) = IncomingParams::channel();
+	feed.args_committed(sf!(r#"{{"command":"wait"}}"#)).unwrap();
 	feed
-		.args_committed(Str::from(r#"{"command":"wait"}"#))
-		.unwrap();
-	feed
-		.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop now") })
+		.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop now") })
 		.unwrap();
 	let stream = registry.invoke("shell", params).unwrap();
 	let events = block_on(stream.map(|event| event.unwrap()).collect::<Vec<_>>());
@@ -537,7 +530,7 @@ async fn overlapping_foreground_runs_use_isolated_sessions() {
 	let registry = Arc::new(registry(exec.clone(), 1024));
 	let (active_feed, active_params) = IncomingParams::channel();
 	active_feed
-		.args_committed(Str::from(r#"{"command":"wait"}"#))
+		.args_committed(sf!(r#"{{"command":"wait"}}"#))
 		.unwrap();
 	let active_registry = Arc::clone(&registry);
 	let active = tokio::spawn(async move {
@@ -573,7 +566,7 @@ async fn overlapping_foreground_runs_use_isolated_sessions() {
 	}
 
 	active_feed
-		.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop active") })
+		.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop active") })
 		.unwrap();
 	let active_events = tokio::time::timeout(std::time::Duration::from_secs(1), active)
 		.await

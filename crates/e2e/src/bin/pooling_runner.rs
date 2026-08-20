@@ -1,8 +1,8 @@
 //! One-cell production-topology runner for the deployment pooling matrix.
 //!
 //! The benchmark recorder supplies a cell through `OMP_POOL_*`. This process
-//! also re-enters as the real Python worker, so `cargo run --bin pooling-runner`
-//! does not depend on another pre-built executable.
+//! also re-enters as the real Python worker, so `cargo run --bin
+//! pooling-runner` does not depend on another pre-built executable.
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -25,7 +25,7 @@ use omp_app::{
 	},
 };
 use omp_core::{
-	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str,
+	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
 };
 use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_proto::{
@@ -42,12 +42,12 @@ const CELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 struct Condition {
-	extensions: usize,
-	dependency: Dependency,
-	lifecycle: Lifecycle,
-	link_delay: Duration,
+	extensions:  usize,
+	dependency:  Dependency,
+	lifecycle:   Lifecycle,
+	link_delay:  Duration,
 	hook_phases: usize,
-	invocation: InvocationPattern,
+	invocation:  InvocationPattern,
 }
 
 #[derive(Clone, Copy)]
@@ -73,13 +73,13 @@ enum InvocationPattern {
 
 #[derive(Serialize)]
 struct Measurements {
-	rss_bytes: u64,
-	pss_bytes: u64,
-	boot_micros: u64,
+	rss_bytes:           u64,
+	pss_bytes:           u64,
+	boot_micros:         u64,
 	prompt_start_micros: u64,
 	hook_latency_micros: u64,
-	reload_micros: u64,
-	collateral_loss: u64,
+	reload_micros:       u64,
+	collateral_loss:     u64,
 }
 
 struct AllowAdmission;
@@ -97,10 +97,10 @@ impl Admitter for AllowAdmission {
 }
 
 struct BenchEnvironment {
-	client: EnvClient,
-	server: Arc<EnvServer>,
+	client:     EnvClient,
+	server:     Arc<EnvServer>,
 	serve_task: JoinHandle<()>,
-	_state: TempDir,
+	_state:     TempDir,
 }
 
 impl BenchEnvironment {
@@ -109,8 +109,8 @@ impl BenchEnvironment {
 		let executable = std::env::current_exe().context("resolve pooling runner executable")?;
 		let mut config = ExtHostConfig::new(
 			executable,
-			Principal::new(Str::new_static("pooling-bench"), Str::new_static("Pooling benchmark")),
-			Str::new_static("pooling-bench-session"),
+			Principal::new(sf!("pooling-bench"), sf!("Pooling benchmark")),
+			sf!("pooling-bench-session"),
 			1,
 		);
 		config.interrupt_grace = CoreDuration::new(100, DurationUnit::Milliseconds);
@@ -119,9 +119,9 @@ impl BenchEnvironment {
 			let tool = format!("pooling_probe_{index}");
 			let key = HostKey::new("workspace", "trusted", module.as_str());
 			let provenance = Provenance::new(
-				Str::new_static("omp-benchmark"),
+				sf!("omp-benchmark"),
 				key.extension().clone(),
-				Str::new_static("1.0.0"),
+				sf!("1.0.0"),
 				ArtifactDigest::new([index as u8; 32]),
 				key.layer().clone(),
 				key.tier().clone(),
@@ -194,7 +194,7 @@ async fn async_main() -> Result<()> {
 	if !matches!(condition.lifecycle, Lifecycle::ColdBoot) {
 		drop(environment);
 		let restart_at = Instant::now();
-		let (restarted, _, _) = BenchEnvironment::open(condition, &site).await?;
+		let (restarted, ..) = BenchEnvironment::open(condition, &site).await?;
 		reload = restart_at.elapsed();
 		environment = restarted;
 	}
@@ -218,7 +218,10 @@ async fn async_main() -> Result<()> {
 }
 
 fn main() -> ExitCode {
-	if std::env::args_os().nth(1).is_some_and(|argument| argument == WORKER_ARG) {
+	if std::env::args_os()
+		.nth(1)
+		.is_some_and(|argument| argument == WORKER_ARG)
+	{
 		return match omp_app::envd::run_py_worker_entry() {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
@@ -286,12 +289,19 @@ fn write_extensions(site: &TempDir, condition: Condition) -> Result<()> {
 		Dependency::PurePython => "",
 		Dependency::CommonNative => "import ctypes\nimport hashlib\nimport sqlite3\nimport zlib\n",
 		Dependency::LargeMlWheel => {
-			"import array\n# A touched 8 MiB numeric payload models a resident large-wheel shard.\n_MODEL = array.array('d', [1.0]) * (1024 * 1024)\n"
+			"import array\n# A touched 8 MiB numeric payload models a resident large-wheel \
+			 shard.\n_MODEL = array.array('d', [1.0]) * (1024 * 1024)\n"
 		},
 	};
 	for index in 0..condition.extensions {
 		let source = format!(
-			"import time\n{dependency_setup}\n_STATE = 0\n\ndef pooling_probe_{index}(params):\n    global _STATE\n    _STATE += 1\n    delay = params.get('sleep_ms', 0)\n    if delay:\n        time.sleep(delay / 1000)\n    return {{'parts': [], 'details': {{'state': _STATE}}}}\n\nOMP_TOOLS = [{{\n    'name': 'pooling_probe_{index}',\n    'description': 'measured pooling probe',\n    'schema': {{'type': 'object', 'properties': {{'sleep_ms': {{'type': 'integer'}}}}, 'additionalProperties': False}},\n    'rev': 'pooling.1',\n    'strict': True,\n    'handler': pooling_probe_{index},\n}}]\n"
+			"import time\n{dependency_setup}\n_STATE = 0\n\ndef pooling_probe_{index}(params):\n    \
+			 global _STATE\n    _STATE += 1\n    delay = params.get('sleep_ms', 0)\n    if delay:\n        \
+			 time.sleep(delay / 1000)\n    return {{'parts': [], 'details': {{'state': \
+			 _STATE}}}}\n\nOMP_TOOLS = [{{\n    'name': 'pooling_probe_{index}',\n    'description': \
+			 'measured pooling probe',\n    'schema': {{'type': 'object', 'properties': \
+			 {{'sleep_ms': {{'type': 'integer'}}}}, 'additionalProperties': False}},\n    'rev': \
+			 'pooling.1',\n    'strict': True,\n    'handler': pooling_probe_{index},\n}}]\n"
 		);
 		fs::write(site.path().join(format!("omp_pool_extension_{index}.py")), source)
 			.with_context(|| format!("write extension module {index}"))?;
@@ -331,8 +341,8 @@ async fn exercise_invocation_pattern(client: &EnvClient, condition: Condition) -
 			Ok(0)
 		},
 		InvocationPattern::ConcurrentCalls => {
-			let results = join_all((0..4).map(|index| invoke(client, format!("concurrent-{index}"), 10)))
-				.await;
+			let results =
+				join_all((0..4).map(|index| invoke(client, format!("concurrent-{index}"), 10))).await;
 			for result in results {
 				if !result? {
 					bail!("concurrent probe did not complete successfully");
@@ -424,7 +434,8 @@ fn process_tree_rss(root: u32) -> Result<u64> {
 	let mut rss_kib = HashMap::<u32, u64>::new();
 	for line in text.lines() {
 		let mut fields = line.split_whitespace();
-		let (Some(pid), Some(parent), Some(rss)) = (fields.next(), fields.next(), fields.next()) else {
+		let (Some(pid), Some(parent), Some(rss)) = (fields.next(), fields.next(), fields.next())
+		else {
 			continue;
 		};
 		if let (Ok(pid), Ok(parent), Ok(rss)) = (pid.parse(), parent.parse(), rss.parse()) {
@@ -444,7 +455,11 @@ fn process_tree_rss(root: u32) -> Result<u64> {
 			break;
 		}
 	}
-	Ok(family.into_iter().filter_map(|pid| rss_kib.get(&pid)).sum::<u64>() * 1024)
+	Ok(family
+		.into_iter()
+		.filter_map(|pid| rss_kib.get(&pid))
+		.sum::<u64>()
+		* 1024)
 }
 
 fn micros(duration: Duration) -> u64 {

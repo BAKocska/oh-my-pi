@@ -11,7 +11,7 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_ar::zip::Writer;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
 };
@@ -98,7 +98,7 @@ impl ReadSources for DocumentSources {
 		let result = if path == self.path {
 			Ok(DocumentLease {
 				canonical_path: self.path.clone(),
-				revision:       Str::new_static("document-revision"),
+				revision:       sf!("document-revision"),
 				bytes:          self.bytes.clone(),
 			})
 		} else {
@@ -125,7 +125,7 @@ impl ReadSources for DocumentSources {
 	}
 
 	fn record_snapshot(&self, _record: SnapshotRecord) -> Result<Option<Str>, Fault> {
-		Ok(Some(Str::new_static("A1B2")))
+		Ok(Some(sf!("A1B2")))
 	}
 }
 
@@ -154,11 +154,7 @@ impl ReadBlobs for RecordingBlobs {
 		media_type: Str,
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
 		self.stored.lock().push((bytes.clone(), media_type.clone()));
-		ready(Ok(BlobRef {
-			hash: Str::new_static("document-blob"),
-			media_type,
-			byte_len: bytes.len() as u64,
-		}))
+		ready(Ok(BlobRef { hash: sf!("document-blob"), media_type, byte_len: bytes.len() as u64 }))
 	}
 }
 
@@ -169,12 +165,12 @@ async fn read_document_tool_text_with_blobs<B: ReadBlobs>(
 	blobs: B,
 ) -> String {
 	let tool = read::tool(
-		DocumentSources { path: Str::from(document_path), bytes: Bytes::from(bytes) },
+		DocumentSources { path: Str::new(document_path), bytes: Bytes::from(bytes) },
 		blobs,
 	);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(json!({ "path": path }).to_string()))
+		.args_committed(Str::new(json!({ "path": path }).to_string()))
 		.expect("read invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
 	let [Ev::Done(ToolTerminal::Done { result, .. })] = events.as_slice() else {

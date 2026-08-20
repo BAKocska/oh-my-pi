@@ -8,7 +8,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, sf};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Effects, Ev, ExecEffects,
@@ -367,9 +367,9 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		timeout_bounds: TimeoutBounds::default(),
 		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
 		spec: ToolSpec {
-			name:            Str::from("shell"),
+			name:            sf!("shell"),
 			rev:             Rev { family: Str::default(), n: 1 },
-			description:     Str::from(
+			description:     sf!(
 				"Execute a shell script in a persistent session, or start a named asynchronous job.",
 			),
 			schema:          omp_tool::schema::<Params>(),
@@ -380,7 +380,7 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 			effects:         Effects {
 				documents: None,
 				exec:      Some(ExecEffects {
-					commands: [Str::new_static("*")].into_iter().collect(),
+					commands: [sf!("*")].into_iter().collect(),
 					network:  true,
 				}),
 				inference: None,
@@ -618,11 +618,11 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							let interrupt = match interrupt {
 								Ok(interrupt) => interrupt,
 								Err(InterruptWaitError::Closed) => Interrupt {
-									class: Str::new_static("closed"),
-									reason: Str::from("invocation owner disappeared"),
+									class: sf!("closed"),
+									reason: sf!("invocation owner disappeared"),
 								},
 								Err(InterruptWaitError::Protocol(reason)) => Interrupt {
-									class: Str::new_static("protocol"),
+									class: sf!("protocol"),
 									reason,
 								},
 							};
@@ -693,13 +693,13 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 					Ok(None) => {
 						self.finish_session(&session, persistent, true).await;
 						yield Ev::Aborted(Abort::EffectsUnknown {
-							reason: cancellation_reason.unwrap_or_else(|| Str::from("exec event stream ended before terminal status")),
+							reason: cancellation_reason.unwrap_or_else(|| sf!("exec event stream ended before terminal status")),
 						});
 						return;
 					},
 					Err(fault) => {
 						self.finish_session(&session, persistent, true).await;
-						yield Ev::Aborted(Abort::EffectsUnknown { reason: Str::from(fault_reason(&fault)) });
+						yield Ev::Aborted(Abort::EffectsUnknown { reason: Str::new(fault_reason(&fault)) });
 						return;
 					},
 				}
@@ -760,7 +760,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 }
 
 fn detached_terminal(job: DetachedJob) -> ToolTerminal<Payload, Fault> {
-	managed_job_terminal(job, Str::new_static("named process settlement"))
+	managed_job_terminal(job, sf!("named process settlement"))
 }
 
 fn interrupt_reason(
@@ -769,7 +769,7 @@ fn interrupt_reason(
 ) -> Str {
 	match interrupt {
 		Ok(interrupt) => interrupt.reason,
-		Err(InterruptWaitError::Closed) => Str::from(closed_reason),
+		Err(InterruptWaitError::Closed) => Str::new(closed_reason),
 		Err(InterruptWaitError::Protocol(reason)) => reason,
 	}
 }
@@ -814,7 +814,7 @@ fn extract_leading_cd(command: &Str) -> (Str, Option<Str>) {
 	if cursor == bytes.len() {
 		return (command.clone(), None);
 	}
-	(Str::from(String::from_utf8_lossy(&bytes[cursor..]).into_owned()), Some(Str::from(cwd)))
+	(Str::new(String::from_utf8_lossy(&bytes[cursor..]).into_owned()), Some(Str::new(cwd)))
 }
 
 fn skip_space(bytes: &[u8], mut cursor: usize) -> usize {
@@ -899,9 +899,9 @@ fn commit_event<U, P>(error: CommitError) -> Ev<U, P, Fault> {
 fn protocol_issue(reason: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::from("one complete shell@1 argument object"),
+		expected: sf!("one complete shell@1 argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::from(r#"{"command":"printf hello"}"#)),
+		example:  Some(sf!(r#"{{"command":"printf hello"}}"#)),
 		found:    Some(reason),
 	}
 }

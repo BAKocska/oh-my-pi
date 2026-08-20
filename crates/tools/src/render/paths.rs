@@ -40,11 +40,11 @@ struct BuilderNode {
 
 impl BuilderNode {
 	fn add_file(&mut self, name: &str, key: &str) {
-		let name = Str::from(name);
+		let name = Str::new(name);
 		if !self.file_names.insert(name.clone()) {
 			return;
 		}
-		self.files.push(FileLeaf { name, key: Str::from(key) });
+		self.files.push(FileLeaf { name, key: Str::new(key) });
 	}
 
 	fn child_mut(&mut self, name: &str) -> &mut Self {
@@ -52,7 +52,7 @@ impl BuilderNode {
 			*index
 		} else {
 			let index = self.subdirs.len();
-			let name = Str::from(name);
+			let name = Str::new(name);
 			self.dir_index.insert(name.clone(), index);
 			self
 				.subdirs
@@ -218,7 +218,7 @@ fn finish_directory(mut directory: BuilderDirectory) -> Directory {
 		directory.node = only.node;
 	}
 	if let Some(folded) = folded {
-		directory.name = Str::from(folded);
+		directory.name = Str::new(folded);
 	}
 	Directory { name: directory.name, node: finish_node(directory.node) }
 }

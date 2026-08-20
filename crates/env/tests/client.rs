@@ -10,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use frame::{client_frame, data_event, data_request, document_op, document_result, server_frame};
-use omp_core::{EnvPath, Str};
+use omp_core::{EnvPath, sf};
 use omp_env::{
 	ClientError, DataScope, EnvClient, InvocationEvent, LspStreamEvent, SearchEvent,
 	TransactionOutcome, WalkEvent, frame,
@@ -206,8 +206,8 @@ fn invocation_frames_preserve_commit_and_event_order() {
 	let mut invocation = block_on(client.invoke(invoke_request("ordered"))).expect("invocation");
 	let request_id = expect_invoke(receive(&requests), "ordered");
 
-	block_on(invocation.arg_text(Str::from("{\"path\":"))).expect("first argument fragment");
-	block_on(invocation.arg_text(Str::from("\"a\"}"))).expect("second argument fragment");
+	block_on(invocation.arg_text(sf!("{\"path\":"))).expect("first argument fragment");
+	block_on(invocation.arg_text(sf!("\"a\"}"))).expect("second argument fragment");
 	block_on(invocation.commit_args(
 		Bytes::from_static(b"{\"path\":\"a\"}"),
 		Bytes::from_static(b"effect-token"),
@@ -215,7 +215,7 @@ fn invocation_frames_preserve_commit_and_event_order() {
 		None,
 	))
 	.expect("argument commitment");
-	block_on(invocation.interrupt(Str::from("please stop"))).expect("interrupt");
+	block_on(invocation.interrupt(sf!("please stop"))).expect("interrupt");
 
 	let frames = [receive(&requests), receive(&requests), receive(&requests), receive(&requests)];
 	for frame in &frames {

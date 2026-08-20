@@ -26,6 +26,7 @@ use std::{
 	time::Instant,
 };
 
+use omp_core::Str;
 use parking_lot::Mutex;
 
 use crate::{
@@ -451,7 +452,7 @@ impl ExecutionContext {
 	) -> Error {
 		Error::new(kind, phase, RetryAction::Never, self.receipt())
 			.committed(self.is_committed())
-			.detail(ErrorDetail::budget(dimension.into(), limit, observed))
+			.detail(ErrorDetail::budget(Str::new(dimension), limit, observed))
 	}
 
 	/// Checks cancellation and elapsed time at a cooperative boundary.

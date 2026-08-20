@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use quick_xml::{
 	Reader,
 	events::{BytesStart, Event},
@@ -24,7 +24,7 @@ const NOTES_REL: &str = "/notesSlide";
 
 /// Converts a PPTX document to Markdown in presentation order.
 pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
-	convert_inner(bytes).map(Str::from).map_err(failure)
+	convert_inner(bytes).map(Str::new).map_err(failure)
 }
 
 fn convert_inner(bytes: &[u8]) -> Result<String, String> {
@@ -1195,7 +1195,7 @@ fn escape_alt(value: &str) -> String {
 fn xml_error(error: impl std::fmt::Display) -> String {
 	format!("invalid PPTX XML: {error}")
 }
-fn failure(error: impl Into<Str>) -> MarkitError {
+fn failure(error: impl IntoStr) -> MarkitError {
 	MarkitError::conversion(FORMAT, error)
 }
 

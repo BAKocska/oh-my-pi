@@ -1,6 +1,6 @@
 //! Deterministic empty-completion classification.
 
-use omp_core::Str;
+use omp_core::sf;
 use omp_llm_catalog::id::WirePolicyId;
 
 use super::{RecoveryError, Stage};
@@ -121,7 +121,7 @@ impl Stage<EmptyInput, EmptyEvent> for EmptyCompletionStage {
 		if self.completed {
 			return Err(RecoveryError::InvalidInput {
 				stage:  "empty-completion",
-				reason: Str::new_static("event arrived after completion"),
+				reason: sf!("event arrived after completion"),
 			});
 		}
 		match input {
@@ -134,11 +134,11 @@ impl Stage<EmptyInput, EmptyEvent> for EmptyCompletionStage {
 						recovery: RecoveryRecord {
 							attempt:     self.attempt,
 							kind:        RecoveryKind::EmptyOutput,
-							rule:        ReasonId(Str::from(format!(
+							rule:        ReasonId(sf!(
 								"empty-completion/{}/{}",
 								self.wire_policy.as_str(),
 								kind.as_str()
-							))),
+							)),
 							input_bytes: 0,
 							steps:       0,
 						},
@@ -149,7 +149,7 @@ impl Stage<EmptyInput, EmptyEvent> for EmptyCompletionStage {
 				if matches!(*event, ChatEvent::Completed(_)) {
 					return Err(RecoveryError::InvalidInput {
 						stage:  "empty-completion",
-						reason: Str::new_static(
+						reason: sf!(
 							"authoritative completion must be constructed after empty classification",
 						),
 					});
@@ -231,10 +231,7 @@ mod tests {
 		let mut output = Vec::new();
 		stage
 			.push(
-				EmptyInput::Event(Box::new(ChatEvent::TextDelta {
-					index: 0,
-					text:  Str::new_static("answer"),
-				})),
+				EmptyInput::Event(Box::new(ChatEvent::TextDelta { index: 0, text: sf!("answer") })),
 				&mut |event| output.push(event),
 			)
 			.unwrap();

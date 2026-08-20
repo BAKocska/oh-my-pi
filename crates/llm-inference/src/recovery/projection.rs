@@ -382,7 +382,7 @@ impl<'a> RecoveryProjector<'a> {
 		};
 		output
 			.events
-			.push(ChatEvent::TextDelta { index, text: Str::from(text) });
+			.push(ChatEvent::TextDelta { index, text: Str::new(text) });
 	}
 
 	fn allocate_tool_index(&mut self, channel: ToolChannel, source: u32) -> u32 {
@@ -409,7 +409,7 @@ impl<'a> RecoveryProjector<'a> {
 		RecoveryRecord {
 			attempt: self.attempt,
 			kind,
-			rule: ReasonId(Str::from(rule)),
+			rule: ReasonId(Str::new(rule)),
 			input_bytes,
 			steps: 1,
 		}
@@ -504,7 +504,7 @@ mod tests {
 
 	fn definition() -> ToolDefinition {
 		ToolDefinition {
-			name:        Str::from("echo"),
+			name:        sf!("echo"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(

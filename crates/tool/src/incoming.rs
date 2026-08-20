@@ -13,7 +13,7 @@ use std::{
 
 use flume::{Receiver, Sender};
 use futures::{FutureExt, pin_mut, select_biased};
-use omp_core::{SparseMap, Str};
+use omp_core::{SparseMap, Str, sf};
 use omp_slopjson::{
 	IncomingCursor as SlopCursor, IncomingDoc, IncomingError, IncomingFeed, PullIssue,
 	PullIssueKind, PullMode, PullPathSegment, Pulled, PulledKind, Value,
@@ -127,7 +127,7 @@ impl InvocationFeed {
 		if direct.committed {
 			direct
 				.protocol
-				.get_or_insert_with(|| Str::from("argument text arrived after commitment"));
+				.get_or_insert_with(|| sf!("argument text arrived after commitment"));
 			if let Some(feed) = direct.parser.take() {
 				feed.abort();
 			}
@@ -136,11 +136,11 @@ impl InvocationFeed {
 		if direct
 			.parser
 			.as_mut()
-			.is_none_or(|feed| feed.push(&fragment).is_err())
+			.is_some_and(|feed| feed.push(&fragment).is_err())
 		{
 			direct
 				.protocol
-				.get_or_insert_with(|| Str::from("JSON feed closed before commitment"));
+				.get_or_insert_with(|| sf!("JSON feed closed before commitment"));
 		}
 		direct.byte_len = direct.byte_len.saturating_add(fragment.len());
 		direct.fragments.push(fragment);
@@ -157,18 +157,18 @@ impl InvocationFeed {
 			if direct.committed {
 				direct
 					.protocol
-					.get_or_insert_with(|| Str::from("duplicate argument commitment"));
+					.get_or_insert_with(|| sf!("duplicate argument commitment"));
 			} else if direct.byte_len == 0 && !raw.is_empty() {
 				direct.byte_len = raw.len();
 				direct.fragments.push(raw.clone());
 				if direct
 					.parser
 					.as_mut()
-					.is_none_or(|feed| feed.push(&raw).is_err())
+					.is_some_and(|feed| feed.push(&raw).is_err())
 				{
 					direct
 						.protocol
-						.get_or_insert_with(|| Str::from("JSON feed closed before commitment"));
+						.get_or_insert_with(|| sf!("JSON feed closed before commitment"));
 				}
 			} else if direct.byte_len != raw.len()
 				|| !direct
@@ -177,9 +177,9 @@ impl InvocationFeed {
 					.flat_map(|fragment| fragment.bytes())
 					.eq(raw.bytes())
 			{
-				direct.protocol.get_or_insert_with(|| {
-					Str::from("committed arguments differ from streamed fragments")
-				});
+				direct
+					.protocol
+					.get_or_insert_with(|| sf!("committed arguments differ from streamed fragments"));
 			}
 			direct.committed = true;
 			if let Some(feed) = direct.parser.take() {
@@ -313,7 +313,7 @@ impl IncomingCursor<'_> {
 			.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
 			.is_err()
 		{
-			return Err(ParamError::Protocol(Str::from("concurrent pull")));
+			return Err(ParamError::Protocol(sf!("concurrent pull")));
 		}
 		let _slot = PullSlot(&self.state.active);
 		let declaration = self
@@ -323,9 +323,8 @@ impl IncomingCursor<'_> {
 		let slop_path = declared_pull_path(path, self.rev.zip(self.arg_specs));
 		let mode = match mode {
 			PullMode::Chunk(_) | PullMode::Line(_) => {
-				let (path_id, _) = declaration.ok_or_else(|| {
-					ParamError::Protocol(Str::from("chunk pull requires a declared path"))
-				})?;
+				let (path_id, _) = declaration
+					.ok_or_else(|| ParamError::Protocol(sf!("chunk pull requires a declared path")))?;
 				let emitted = self
 					.state
 					.chunks
@@ -413,21 +412,19 @@ struct AppliedCoercions {
 fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions {
 	let mut applied = AppliedCoercions { steps: SmallVec::new(), elided: false };
 	for coercion in &spec.coerce {
-		let before = Str::from(value.to_string());
+		let before = Str::new(value.to_string());
 		let Some(result) = coerce_once(*coercion, value, !spec.from_union_branch) else {
 			continue;
 		};
 		match result {
 			CoercionResult::Value(next) => {
-				let after = Str::from(next.to_string());
+				let after = Str::new(next.to_string());
 				*value = next;
 				applied.steps.push((*coercion, before, after));
 			},
 			CoercionResult::Elided => {
 				applied.elided = true;
-				applied
-					.steps
-					.push((*coercion, before, Str::from("<absent>")));
+				applied.steps.push((*coercion, before, sf!("<absent>")));
 				break;
 			},
 		}
@@ -482,7 +479,7 @@ fn coerce_once(
 		Coerce::String => match value {
 			Value::Array(_) | Value::Object(_) if !allow_lossy => None,
 			Value::String(_) => None,
-			_ => Some(CoercionResult::Value(Value::String(Str::from(value.to_string())))),
+			_ => Some(CoercionResult::Value(Value::String(Str::new(value.to_string())))),
 		},
 		Coerce::Singleton if !allow_lossy || matches!(value, Value::Array(_)) => None,
 		Coerce::Singleton => Some(CoercionResult::Value(Value::Array(vec![value.clone()]))),
@@ -545,16 +542,14 @@ async fn validate_structure(
 					let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
 					let identity = spec.map_or_else(|| candidate.clone(), |spec| spec.path.clone());
 					if seen.contains(&identity) {
-						let expected = spec.map_or_else(
-							|| Str::from("one unambiguous value"),
-							|spec| spec.expected.clone(),
-						);
+						let expected = spec
+							.map_or_else(|| sf!("one unambiguous value"), |spec| spec.expected.clone());
 						return Err(ParamError::Args(Box::new(ArgIssue {
 							path: identity.into_iter().collect(),
 							expected,
 							kind: ArgIssueKind::Ambiguous,
 							example: spec.and_then(|spec| spec.example.clone()),
-							found: Some(Str::from("multiple values")),
+							found: Some(sf!("multiple values")),
 						})));
 					}
 					seen.push(identity);
@@ -610,7 +605,7 @@ fn canonicalize(
 				} else {
 					crate::RepairKind::Coercion
 				},
-				detail: Str::from(format!("{coercion}: {before} -> {after}")),
+				detail: sf!("{coercion}: {before} -> {after}"),
 			});
 		}
 		if applied.elided {
@@ -631,7 +626,7 @@ fn canonicalize(
 					repairs.push(crate::Repair {
 						path:   candidate,
 						kind:   crate::RepairKind::Elision,
-						detail: Str::from(format!("unrecognized key {key} -> <absent>")),
+						detail: sf!("unrecognized key {key} -> <absent>"),
 					});
 					continue;
 				}
@@ -644,7 +639,7 @@ fn canonicalize(
 						repairs.push(crate::Repair {
 							path:   spec.path.clone(),
 							kind:   crate::RepairKind::Alias,
-							detail: Str::from(format!("{key} -> {canonical_key}")),
+							detail: sf!("{key} -> {canonical_key}"),
 						});
 					}
 					(spec.path.clone(), canonical_key)
@@ -778,17 +773,16 @@ impl<'c> IncomingParams<'c> {
 	/// document. A second take is a protocol error.
 	pub fn cursor(&mut self) -> Result<IncomingCursor<'c>, ParamError> {
 		if self.direct.is_none() {
-			return Err(ParamError::Protocol(Str::from(
-				"path cursor requires an InvocationFeed channel",
-			)));
+			return Err(ParamError::Protocol(sf!("path cursor requires an InvocationFeed channel",)));
 		}
 		self.sync_direct_problem().map_err(ParamError::Protocol)?;
 		if self.cursor_issued {
-			return Err(ParamError::Protocol(Str::from("JSON cursor session was already consumed")));
+			return Err(ParamError::Protocol(sf!("JSON cursor session was already consumed",)));
 		}
-		let doc = self.doc.take().ok_or_else(|| {
-			ParamError::Protocol(Str::from("JSON cursor session was already consumed"))
-		})?;
+		let doc = self
+			.doc
+			.take()
+			.ok_or_else(|| ParamError::Protocol(sf!("JSON cursor session was already consumed")))?;
 		self.cursor_issued = true;
 		let (rev, arg_specs) = self
 			.arg_specs
@@ -893,9 +887,10 @@ impl<'c> IncomingParams<'c> {
 				.drive_commit_raw(observe)
 				.await
 				.map_err(commit_param_error)?;
-			let cursor = self.finalizer.clone().ok_or_else(|| {
-				ParamError::Protocol(Str::from("argument finalizer cursor is unavailable"))
-			})?;
+			let cursor = self
+				.finalizer
+				.clone()
+				.ok_or_else(|| ParamError::Protocol(sf!("argument finalizer cursor is unavailable")))?;
 			let pulled = cursor
 				.pull_at(&[], PullMode::Complete, "an argument object")
 				.await
@@ -911,7 +906,7 @@ impl<'c> IncomingParams<'c> {
 				.await
 				.map_err(|error| param_error(error, self.arg_specs))?;
 			if observed_raw != raw {
-				return Err(ParamError::Protocol(Str::from(
+				return Err(ParamError::Protocol(sf!(
 					"finalized arguments differ from streamed fragments",
 				)));
 			}
@@ -931,16 +926,13 @@ impl<'c> IncomingParams<'c> {
 					repairs.push(crate::Repair {
 						path,
 						kind: crate::RepairKind::Tolerance,
-						detail: Str::from(format!(
-							"{:?}: {} -> {}",
-							repair.kind, repair.before, repair.after
-						)),
+						detail: sf!("{:?}: {} -> {}", repair.kind, repair.before, repair.after),
 					});
 				}
 			}
 			let effective = canonicalize(root, &SmallVec::new(), self.arg_specs, &mut repairs)
 				.expect("the root argument object cannot be elided");
-			let effective_json = Str::from(effective.to_string());
+			let effective_json = Str::new(effective.to_string());
 			self.finalized = Some(FinalizedArgs { raw, effective, effective_json, repairs });
 		}
 		Ok(self
@@ -961,9 +953,10 @@ impl<'c> IncomingParams<'c> {
 		if observe && let Some(interrupt) = self.interrupts.pop_front() {
 			return Err(ParamError::Interrupted(interrupt));
 		}
-		let doc = self.doc.take().ok_or_else(|| {
-			ParamError::Protocol(Str::from("JSON cursor session was already consumed"))
-		})?;
+		let doc = self
+			.doc
+			.take()
+			.ok_or_else(|| ParamError::Protocol(sf!("JSON cursor session was already consumed")))?;
 		let arg_specs = self.arg_specs;
 		let events = self.events.clone();
 		let pull = operation(doc).fuse();
@@ -1028,7 +1021,7 @@ impl<'c> IncomingParams<'c> {
 				if let Some(feed) = &mut self.feed {
 					feed
 						.push(&fragment)
-						.map_err(|_| Str::from("JSON feed closed before commitment"))?;
+						.map_err(|_| sf!("JSON feed closed before commitment"))?;
 				}
 				Ok(None)
 			},
@@ -1040,7 +1033,7 @@ impl<'c> IncomingParams<'c> {
 					if let Some(feed) = &mut self.feed {
 						feed
 							.push(&raw)
-							.map_err(|_| Str::from("JSON feed closed before commitment"))?;
+							.map_err(|_| sf!("JSON feed closed before commitment"))?;
 					}
 					self.assembled.push_str(&raw);
 				}
@@ -1061,7 +1054,7 @@ impl<'c> IncomingParams<'c> {
 	}
 
 	fn protocol<T>(&mut self, message: &'static str) -> Result<T, Str> {
-		let problem = Str::from(message);
+		let problem = Str::new(message);
 		self.protocol = Some(problem.clone());
 		if let Some(feed) = self.feed.take() {
 			feed.abort();
@@ -1140,7 +1133,7 @@ fn commit_param_error(error: CommitError) -> ParamError {
 fn param_commit_error(error: ParamError) -> CommitError {
 	match error {
 		ParamError::Args(_) => {
-			CommitError::Protocol(Str::from("argument finalization failed before authorization"))
+			CommitError::Protocol(sf!("argument finalization failed before authorization"))
 		},
 		ParamError::Interrupted(interrupt) => CommitError::Interrupted(interrupt),
 		ParamError::Protocol(problem) => CommitError::Protocol(problem),
@@ -1158,10 +1151,10 @@ fn malformed_issue_with_kind(
 ) -> ParamError {
 	ParamError::Args(Box::new(ArgIssue {
 		path: Vec::new(),
-		expected: Str::from(expected),
+		expected: Str::new(expected),
 		kind,
 		example: None,
-		found: found.map(Str::from),
+		found: found.map(Str::new),
 	}))
 }
 
@@ -1181,14 +1174,14 @@ fn param_error(error: IncomingError, arg_specs: Option<(&Rev, &ArgSpecRegistry)>
 		IncomingError::Pull(issue) => ParamError::Args(Box::new(arg_issue(issue, arg_specs))),
 		IncomingError::Aborted => ParamError::Args(Box::new(ArgIssue {
 			path:     Vec::new(),
-			expected: "complete JSON arguments".into(),
+			expected: sf!("complete JSON arguments"),
 			kind:     ArgIssueKind::Aborted,
 			example:  None,
 			found:    None,
 		})),
 		IncomingError::Parse(_) => ParamError::Args(Box::new(ArgIssue {
 			path:     Vec::new(),
-			expected: "valid JSON arguments".into(),
+			expected: sf!("valid JSON arguments"),
 			kind:     ArgIssueKind::Malformed,
 			example:  None,
 			found:    None,
@@ -1202,7 +1195,7 @@ fn arg_issue(issue: PullIssue, arg_specs: Option<(&Rev, &ArgSpecRegistry)>) -> A
 		PullIssueKind::Incomplete => (ArgIssueKind::Incomplete, None),
 		PullIssueKind::Aborted => (ArgIssueKind::Aborted, None),
 		PullIssueKind::Malformed => (ArgIssueKind::Malformed, None),
-		PullIssueKind::TypeMismatch { found } => (ArgIssueKind::TypeMismatch, Some(Str::from(found))),
+		PullIssueKind::TypeMismatch { found } => (ArgIssueKind::TypeMismatch, Some(Str::new(found))),
 	};
 	let path = issue
 		.path
@@ -1215,7 +1208,7 @@ fn arg_issue(issue: PullIssue, arg_specs: Option<(&Rev, &ArgSpecRegistry)>) -> A
 		.collect::<Vec<_>>();
 	let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &path));
 	let expected =
-		spec.map_or_else(|| Str::from(issue.expected), |declared| declared.expected.clone());
+		spec.map_or_else(|| Str::new(issue.expected), |declared| declared.expected.clone());
 	let example = spec.and_then(|declared| declared.example.clone());
 	ArgIssue { path, expected, kind, example, found }
 }
@@ -1231,16 +1224,16 @@ mod tests {
 	const EXAMPLE: &str = r#"{"path":"résumé/💾"}"#;
 
 	fn declarations() -> (Rev, ArgSpecRegistry) {
-		let rev = Rev { family: Str::from("native"), n: 7 };
+		let rev = Rev { family: sf!("native"), n: 7 };
 		let mut specs = ArgSpecRegistry::new();
 		specs
 			.register(rev.clone(), ArgSpec {
-				path:                  smallvec![ArgPath::Key(Str::from("path"))],
-				aliases:               smallvec![Str::from("file_path")],
+				path:                  smallvec![ArgPath::Key(sf!("path"))],
+				aliases:               smallvec![sf!("file_path")],
 				coerce:                smallvec![],
 				from_union_branch:     false,
-				expected:              Str::from("declared numeric path"),
-				example:               Some(Str::from(EXAMPLE)),
+				expected:              sf!("declared numeric path"),
+				example:               Some(Str::new(EXAMPLE)),
 				additional_properties: false,
 			})
 			.expect("argument declaration registers");
@@ -1277,11 +1270,11 @@ mod tests {
 		for key in ["path", "file_path"] {
 			let (feed, mut params) = bound_params(&rev, &specs);
 			feed
-				.args_committed(Str::from(format!(r#"{{"{key}":"wrong"}}"#)))
+				.args_committed(sf!(r#"{{"{key}":"wrong"}}"#))
 				.expect("arguments remain connected");
 
 			let issue = number_issue(&mut params, key);
-			assert_eq!(issue.path, vec![ArgPath::Key(Str::from(key))]);
+			assert_eq!(issue.path, vec![ArgPath::Key(Str::new(key))]);
 			assert_eq!(issue.expected, "declared numeric path");
 			assert_eq!(issue.example.as_deref(), Some(EXAMPLE));
 		}
@@ -1292,11 +1285,10 @@ mod tests {
 		let (rev, specs) = declarations();
 		let (feed, mut params) = bound_params(&rev, &specs);
 		feed
-			.args_committed(Str::from(r#"{"other":"wrong"}"#))
+			.args_committed(sf!(r#"{{"other":"wrong"}}"#))
 			.expect("arguments remain connected");
-
 		let issue = number_issue(&mut params, "other");
-		assert_eq!(issue.path, vec![ArgPath::Key(Str::from("other"))]);
+		assert_eq!(issue.path, vec![ArgPath::Key(sf!("other"))]);
 		assert_eq!(issue.example, None);
 	}
 
@@ -1304,13 +1296,12 @@ mod tests {
 	fn declared_example_survives_interrupt_then_pull_reentry() {
 		let (rev, specs) = declarations();
 		let (feed, mut params) = bound_params(&rev, &specs);
-		let interrupt =
-			Interrupt { class: Str::from("steering"), reason: Str::from("change direction") };
+		let interrupt = Interrupt { class: sf!("steering"), reason: sf!("change direction") };
 		feed
 			.interrupt(interrupt.clone())
 			.expect("interrupt remains connected");
 		feed
-			.args_committed(Str::from(r#"{"file_path":"wrong"}"#))
+			.args_committed(sf!(r#"{{"file_path":"wrong"}}"#))
 			.expect("arguments remain connected");
 		block_on(params.committed()).expect("commit buffers the earlier interrupt");
 
@@ -1325,7 +1316,7 @@ mod tests {
 		));
 
 		let issue = number_issue(&mut params, "file_path");
-		assert_eq!(issue.path, vec![ArgPath::Key(Str::from("file_path"))]);
+		assert_eq!(issue.path, vec![ArgPath::Key(sf!("file_path"))]);
 		assert_eq!(issue.example.as_deref().map(str::as_bytes), Some(EXAMPLE.as_bytes()));
 	}
 }

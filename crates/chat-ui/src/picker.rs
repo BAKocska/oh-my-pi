@@ -1,6 +1,6 @@
 //! Provider-scoped model hub backed exclusively by host-supplied catalog rows.
 
-use omp_core::{Str, StrMut, fmts};
+use omp_core::{Str, StrMut, sf};
 use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent,
 	assets::provider_logo, dom,
@@ -242,7 +242,7 @@ impl ModelPicker {
 	fn show_detail(&mut self, model: Option<usize>) {
 		let text = model
 			.and_then(|index| self.rows.get(index))
-			.map_or_else(|| Str::new_static(" "), facts);
+			.map_or_else(|| sf!(" "), facts);
 		self.ui.set_text("model-facts", text);
 	}
 }
@@ -292,11 +292,11 @@ fn build(
 			active_provider.is_none_or(|provider| row.provider_id.as_str() == provider)
 		})
 		.map(|(index, row)| DisplayRow {
-			value:    fmts!("{index}"),
-			label:    fmts!("{} {} {}", row.provider, row.name, row.key),
+			value:    sf!("{index}"),
+			label:    sf!("{} {} {}", row.provider, row.name, row.key),
 			logo_src: provider_logo(row.provider_id.as_str())
 				.is_some()
-				.then(|| fmts!("asset://login/{}", row.provider_id)),
+				.then(|| sf!("asset://login/{}", row.provider_id)),
 			provider: if row.provider.is_empty() {
 				row.provider_id.clone()
 			} else {
@@ -310,13 +310,13 @@ fn build(
 			current:  index == current,
 			context:  row
 				.context
-				.map_or_else(Str::default, |tokens| fmts!("{} ctx", compact_count(tokens))),
+				.map_or_else(Str::default, |tokens| sf!("{} ctx", compact_count(tokens))),
 			input:    row
 				.input_mtok
-				.map_or_else(Str::default, |cost| fmts!("${cost} in")),
+				.map_or_else(Str::default, |cost| sf!("${cost} in")),
 			output:   row
 				.output_mtok
-				.map_or_else(Str::default, |cost| fmts!("${cost} out")),
+				.map_or_else(Str::default, |cost| sf!("${cost} out")),
 		})
 		.collect();
 	let mut providers = Vec::<ProviderChoice>::new();
@@ -338,8 +338,8 @@ fn build(
 		});
 	}
 	let all_active = active_provider.is_none();
-	let seed = Str::from(query);
-	let current_mark = Str::new_static(" current");
+	let seed = Str::new(query);
+	let current_mark = sf!(" current");
 	let height = list_rows.saturating_add(1);
 	let hint = match focus {
 		PickerFocus::Sidebar => SIDEBAR_HINT,
@@ -402,19 +402,19 @@ fn facts(row: &ModelRow) -> Str {
 	);
 	push_fact(&mut line, &row.provider);
 	if let Some(context) = row.context {
-		push_fact(&mut line, &fmts!("{} context", compact_count(context)));
+		push_fact(&mut line, &sf!("{} context", compact_count(context)));
 	}
 	if let Some(price) = price(row) {
-		push_fact(&mut line, &fmts!("{price} per Mtok"));
+		push_fact(&mut line, &sf!("{price} per Mtok"));
 	}
 	line.freeze()
 }
 
 fn price(row: &ModelRow) -> Option<Str> {
 	match (row.input_mtok, row.output_mtok) {
-		(Some(input), Some(output)) => Some(fmts!("${input}/${output}")),
-		(Some(input), None) => Some(fmts!("${input} in")),
-		(None, Some(output)) => Some(fmts!("${output} out")),
+		(Some(input), Some(output)) => Some(sf!("${input}/${output}")),
+		(Some(input), None) => Some(sf!("${input} in")),
+		(None, Some(output)) => Some(sf!("${output} out")),
 		(None, None) => None,
 	}
 }
@@ -428,11 +428,11 @@ fn push_fact(line: &mut StrMut, text: &str) {
 
 fn compact_count(value: u64) -> Str {
 	if value >= 1_000_000 {
-		fmts!("{:.1}m", value as f64 / 1_000_000.0)
+		sf!("{:.1}m", value as f64 / 1_000_000.0)
 	} else if value >= 1_000 {
-		fmts!("{:.0}k", value as f64 / 1_000.0)
+		sf!("{:.0}k", value as f64 / 1_000.0)
 	} else {
-		fmts!("{value}")
+		sf!("{value}")
 	}
 }
 
@@ -441,10 +441,10 @@ mod tests {
 	use super::*;
 	fn row(provider: &'static str, name: &'static str) -> ModelRow {
 		ModelRow {
-			key:         fmts!("{provider}/{name}"),
-			name:        Str::new_static(name),
-			provider_id: Str::new_static(provider),
-			provider:    Str::new_static(provider),
+			key:         sf!("{provider}/{name}"),
+			name:        sf!(name),
+			provider_id: sf!(provider),
+			provider:    sf!(provider),
 			context:     None,
 			input_mtok:  None,
 			output_mtok: None,
@@ -454,10 +454,10 @@ mod tests {
 	#[test]
 	fn absent_facts_are_omitted() {
 		let row = ModelRow {
-			key:         Str::from("p/m"),
-			name:        Str::from("Model"),
-			provider_id: Str::from("p"),
-			provider:    Str::from("Provider"),
+			key:         sf!("p/m"),
+			name:        sf!("Model"),
+			provider_id: sf!("p"),
+			provider:    sf!("Provider"),
 			context:     None,
 			input_mtok:  None,
 			output_mtok: None,

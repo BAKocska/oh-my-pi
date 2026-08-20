@@ -14,7 +14,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_core::base64_url;
+use omp_core::{Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -95,7 +95,7 @@ impl CursorHandler {
 			}
 		}
 
-		Ok(CursorPending { verifier, uuid, authorize_url: url.as_str().into() })
+		Ok(CursorPending { verifier, uuid, authorize_url: Str::new(url.as_str()) })
 	}
 
 	async fn poll(
@@ -290,7 +290,7 @@ fn cursor_token_response(
 	Ok(OAuthTokenSet {
 		access_token,
 		refresh_token: Some(refresh_token),
-		token_type: "Bearer".into(),
+		token_type: sf!("Bearer"),
 		expires_in,
 		identity_response: response.body,
 	})

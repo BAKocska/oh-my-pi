@@ -333,24 +333,24 @@ fn no_match_error(
 		ReplaceError::ExactMismatch {
 			similarity_percent,
 			line: closest.start_line,
-			expected_line: expected_line.into(),
-			actual_line: actual_line.into(),
+			expected_line: Str::new(expected_line),
+			actual_line: Str::new(actual_line),
 		}
 	} else if let Some(matches) = outcome.fuzzy_matches.filter(|count| *count > 1) {
 		ReplaceError::AmbiguousFuzzy {
 			matches,
 			similarity_percent,
 			line: closest.start_line,
-			expected_line: expected_line.into(),
-			actual_line: actual_line.into(),
+			expected_line: Str::new(expected_line),
+			actual_line: Str::new(actual_line),
 		}
 	} else {
 		ReplaceError::FuzzyBelowThreshold {
 			similarity_percent,
 			threshold_percent: options.threshold * 100.0,
 			line: closest.start_line,
-			expected_line: expected_line.into(),
-			actual_line: actual_line.into(),
+			expected_line: Str::new(expected_line),
+			actual_line: Str::new(actual_line),
 		}
 	}
 }

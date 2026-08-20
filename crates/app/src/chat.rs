@@ -26,7 +26,7 @@ use omp_agent::{
 	CompletionRequest, InProcTurnClient, Journal, RpcTurnClient, TurnClient, TurnId, TurnInput,
 	TurnOptions, TurnSession as _, WorkspaceInput, project_journal, resolve_completion,
 };
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{
 	Client, Registry as InferenceRegistry, ToolInputConstraint,
@@ -249,11 +249,11 @@ fn auth_error_message(error: &omp_llm_inference::Error) -> Str {
 	};
 	match (detail, error.status, error.code.as_deref()) {
 		(Some(detail), Some(status), Some(code)) => {
-			fmts!("{error}: {detail} ({status}, {code})")
+			sf!("{error}: {detail} ({status}, {code})")
 		},
-		(Some(detail), Some(status), None) => fmts!("{error}: {detail} ({status})"),
-		(Some(detail), None, Some(code)) => fmts!("{error}: {detail} ({code})"),
-		(Some(detail), None, None) => fmts!("{error}: {detail}"),
+		(Some(detail), Some(status), None) => sf!("{error}: {detail} ({status})"),
+		(Some(detail), None, Some(code)) => sf!("{error}: {detail} ({code})"),
+		(Some(detail), None, None) => sf!("{error}: {detail}"),
 		(None, ..) => Str::from(error.to_string()),
 	}
 }
@@ -264,7 +264,7 @@ fn chat_login_failure(
 	if error.kind == ErrorKind::CredentialStorageUnavailable {
 		ChatLoginFailure::CredentialStorageLocked
 	} else {
-		ChatLoginFailure::Message(fmts!(
+		ChatLoginFailure::Message(sf!(
 			"Authentication failed for provider `{provider}`. Use `/login {provider}` to try again. \
 			 {}",
 			auth_error_message(error)
@@ -294,7 +294,7 @@ async fn run_chat_login(
 		.map_err(|error| chat_login_failure(&provider, &error))?;
 	let AuthAnswer::Session(session) = answer else {
 		return Err(
-			fmts!(
+			sf!(
 				"Provider `{provider}` did not start an interactive login. Use `/login {provider}` to \
 				 try again."
 			)
@@ -307,7 +307,7 @@ async fn run_chat_login(
 			event = session.events.recv_async() => {
 				let event = event
 					.map_err(|_| {
-						fmts!(
+						sf!(
 							"Authentication for provider `{provider}` ended without completing. Use \
 							 `/login {provider}` to try again."
 						)
@@ -317,7 +317,7 @@ async fn run_chat_login(
 					AuthEvent::OpenUrl(url) => {
 						events
 							.send(ChatAuthEvent::Url(url))
-							.map_err(|_| Str::new_static("chat authentication view closed"))?;
+							.map_err(|_| sf!("chat authentication view closed"))?;
 					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => {
 						events
@@ -325,7 +325,7 @@ async fn run_chat_login(
 								code: Str::from(code.expose_secret()),
 								url:  verification_url,
 							})
-							.map_err(|_| Str::new_static("chat authentication view closed"))?;
+							.map_err(|_| sf!("chat authentication view closed"))?;
 					},
 					AuthEvent::Prompt(prompt) => {
 						let kind = match prompt.input {
@@ -340,18 +340,18 @@ async fn run_chat_login(
 						};
 						events
 							.send(ChatAuthEvent::Prompt { message: prompt.message, kind })
-							.map_err(|_| Str::new_static("chat authentication view closed"))?;
+							.map_err(|_| sf!("chat authentication view closed"))?;
 						awaiting_prompt = true;
 					},
 					AuthEvent::Waiting => {
 						events
-							.send(ChatAuthEvent::Notice(fmts!(
+							.send(ChatAuthEvent::Notice(sf!(
 								"Waiting for `{provider}` authorization…"
 							)))
-							.map_err(|_| Str::new_static("chat authentication view closed"))?;
+							.map_err(|_| sf!("chat authentication view closed"))?;
 					},
 					AuthEvent::Complete(account) => {
-						return Ok(fmts!(
+						return Ok(sf!(
 							"Authenticated `{}` for `{}`.",
 							account.account,
 							account.provider
@@ -363,7 +363,7 @@ async fn run_chat_login(
 				Ok(ChatAuthCommand::Cancel) => {
 					send_auth_response(&session, AuthInput::Cancel, &provider).await?;
 					return Err(
-						fmts!("Authentication for provider `{provider}` was cancelled.").into()
+						sf!("Authentication for provider `{provider}` was cancelled.").into()
 					);
 				},
 				Ok(ChatAuthCommand::Answer(input)) if awaiting_prompt => {
@@ -372,7 +372,7 @@ async fn run_chat_login(
 				},
 				Ok(ChatAuthCommand::Answer(_) | ChatAuthCommand::Start(_)) => {},
 				Err(_) => {
-					return Err(Str::new_static("chat authentication view closed").into());
+					return Err(sf!("chat authentication view closed").into());
 				},
 			},
 		}
@@ -389,7 +389,7 @@ async fn send_auth_response(
 		.send_async(AuthResponse { session: session.id.clone(), input })
 		.await
 		.map_err(|_| {
-			fmts!(
+			sf!(
 				"Authentication provider `{provider}` stopped accepting input. Use `/login \
 				 {provider}` to try again."
 			)
@@ -433,7 +433,7 @@ mod auth_worker_tests {
 		assert!(matches!(receiver.try_recv(), Err(flume::TryRecvError::Empty)));
 
 		commands
-			.send(ChatAuthCommand::Start(Str::from("next-provider")))
+			.send(ChatAuthCommand::Start(sf!("next-provider")))
 			.expect("next login");
 		assert!(matches!(
 			receiver.try_recv(),
@@ -445,14 +445,14 @@ fn discover_chat_agents(root: &Path) -> Arc<BTreeMap<Str, omp_agent::AgentDefini
 	use crate::discovery::manifest::{CapabilityDeclaration, CapabilityKind};
 
 	let mut declarations = vec![CapabilityDeclaration {
-		id:       Str::new_static("project-agents"),
+		id:       sf!("project-agents"),
 		kind:     CapabilityKind::Agents,
 		root:     root.join(".omp/agents"),
 		priority: 100,
 	}];
 	if let Some(home) = std::env::var_os("HOME") {
 		declarations.push(CapabilityDeclaration {
-			id:       Str::new_static("user-agents"),
+			id:       sf!("user-agents"),
 			kind:     CapabilityKind::Agents,
 			root:     PathBuf::from(home).join(".omp/agent/agents"),
 			priority: 50,
@@ -463,16 +463,16 @@ fn discover_chat_agents(root: &Path) -> Arc<BTreeMap<Str, omp_agent::AgentDefini
 		.into_iter()
 		.collect::<BTreeMap<_, _>>();
 	definitions
-		.entry(Str::new_static("task"))
+		.entry(sf!("task"))
 		.or_insert_with(|| omp_agent::AgentDefinition {
-			name:           Str::new_static("task"),
-			description:    Str::new_static("General-purpose subagent"),
+			name:           sf!("task"),
+			description:    sf!("General-purpose subagent"),
 			tools:          Box::default(),
 			spawns:         omp_agent::SpawnPolicy::Any,
 			model:          None,
 			thinking_level: None,
 			blocking:       false,
-			prompt:         Str::new_static("Complete the delegated task and report the result."),
+			prompt:         sf!("Complete the delegated task and report the result."),
 		});
 	Arc::new(definitions)
 }
@@ -695,7 +695,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				))
 			})?;
 		let system_prompt = match (definition.description.is_empty(), definition.prompt.is_empty()) {
-			(true, true) => Str::new_static("Complete the delegated task."),
+			(true, true) => sf!("Complete the delegated task."),
 			(false, true) => definition.description.clone(),
 			(true, false) => definition.prompt.clone(),
 			(false, false) => {
@@ -1182,14 +1182,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		environment.bind_device_availability(agent.mailbox());
 		let tree = parent.tree();
 		let node = tree
-			.register(
-				id.clone(),
-				Str::new_static("Main"),
-				AgentKind::Main,
-				None,
-				id.clone(),
-				Budget::default(),
-			)
+			.register(id.clone(), sf!("Main"), AgentKind::Main, None, id.clone(), Budget::default())
 			.map_err(|error| ChatError::EvalBridge(Str::from(error.to_string())))?;
 		node.set_status(AgentStatus::Running);
 		let broker = parent.broker();
@@ -1333,9 +1326,9 @@ fn resolve_model_selector(
 				.collect();
 		}
 		let hint = match candidates.as_slice() {
-			[] => Str::new_static(""),
-			[only] => fmts!("; use `--model {only}`"),
-			many => fmts!(
+			[] => Default::default(),
+			[only] => sf!("; use `--model {only}`"),
+			many => sf!(
 				"; provider `{}` serves: {}{}",
 				route.provider,
 				many[..many.len().min(4)].join(", "),
@@ -1357,9 +1350,9 @@ fn resolve_model_selector(
 		.take(4)
 		.peekable();
 	let suggestions = if near.peek().is_some() {
-		fmts!("; closest: {}", near.collect::<Vec<_>>().join(", "))
+		sf!("; closest: {}", near.collect::<Vec<_>>().join(", "))
 	} else {
-		Str::new_static("")
+		Default::default()
 	};
 	Err(ChatError::UnknownModel { selector: selector.into(), suggestions })
 }
@@ -1509,13 +1502,11 @@ fn resume_choices(
 			.and_then(|metadata| metadata.modified())
 			.unwrap_or(UNIX_EPOCH);
 		let age = relative_time(modified);
-		let label = metadata
-			.label
-			.unwrap_or_else(|| Str::new_static("Untitled session"));
+		let label = metadata.label.unwrap_or_else(|| sf!("Untitled session"));
 		let detail = if current_id.is_some_and(|current| current == &id) {
-			fmts!("current · {age} · {id}")
+			sf!("current · {age} · {id}")
 		} else {
-			fmts!("{age} · {id}")
+			sf!("{age} · {id}")
 		};
 		choices.push((modified, ResumeChoice { id, label, detail }));
 	}
@@ -1602,11 +1593,11 @@ fn relative_time(modified: SystemTime) -> Str {
 		.unwrap_or_default()
 		.as_secs();
 	match seconds {
-		0..60 => Str::new_static("just now"),
-		60..3_600 => fmts!("{}m ago", seconds / 60),
-		3_600..86_400 => fmts!("{}h ago", seconds / 3_600),
-		86_400..604_800 => fmts!("{}d ago", seconds / 86_400),
-		_ => fmts!("{}w ago", seconds / 604_800),
+		0..60 => sf!("just now"),
+		60..3_600 => sf!("{}m ago", seconds / 60),
+		3_600..86_400 => sf!("{}h ago", seconds / 3_600),
+		86_400..604_800 => sf!("{}d ago", seconds / 86_400),
+		_ => sf!("{}w ago", seconds / 604_800),
 	}
 }
 
@@ -1978,8 +1969,8 @@ mod tests {
 			ExecutionReceipt::default(),
 		)
 		.status(Some(401))
-		.code(Str::from("invalid_grant"))
-		.detail(ErrorDetail::provider(Str::from("device authorization expired")));
+		.code(sf!("invalid_grant"))
+		.detail(ErrorDetail::provider(sf!("device authorization expired")));
 		let ChatLoginFailure::Message(message) = chat_login_failure(&provider, &error) else {
 			panic!("an authentication error is a plain login failure message");
 		};
@@ -2095,10 +2086,7 @@ mod tests {
 		omp_storage::transcript::write_line(
 			&Event {
 				ts:   4,
-				kind: Kind::Title {
-					title:  Str::new_static("Recovered title"),
-					source: TitleSource::User,
-				},
+				kind: Kind::Title { title: sf!("Recovered title"), source: TitleSource::User },
 			},
 			&mut fixture,
 		)
@@ -2222,14 +2210,14 @@ mod tests {
 			WorkspaceInput::new(&root, Arc::from([])),
 			registry,
 		);
-		snapshot.enabled_tools = Arc::from([Str::new_static("eval")]);
+		snapshot.enabled_tools = Arc::from([sf!("eval")]);
 		let state = AgentState::new(snapshot);
 		let (env, _transport) = EnvClient::in_process(1);
 		let host = ChatParentHost::new(
 			client,
 			env,
 			state,
-			Str::new_static("parent-session"),
+			sf!("parent-session"),
 			sessions_dir,
 			root,
 			Arc::new(

@@ -20,7 +20,7 @@ use omp_app::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_env::{
 	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
 };
@@ -56,18 +56,14 @@ impl Admitter for AllowAdmission {
 }
 
 const fn test_claims() -> Claims {
-	Claims {
-		precedence: Precedence::CORE,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 }
 
 fn file_write_effects() -> Effects {
 	Effects {
 		documents: Some(DocEffects {
 			read:        false,
-			write_globs: [Str::new_static("**")].into_iter().collect(),
+			write_globs: [sf!("**")].into_iter().collect(),
 		}),
 		exec:      None,
 		inference: None,
@@ -88,9 +84,9 @@ impl EffectTool {
 	fn named(name: &'static str, marker: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static(name),
-				rev:             Rev { family: Str::new_static("test"), n: 1 },
-				description:     Str::new_static("records a committed invocation"),
+				name:            sf!(name),
+				rev:             Rev { family: sf!("test"), n: 1 },
+				description:     sf!("records a committed invocation"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
 				effects:         file_write_effects(),
@@ -153,9 +149,9 @@ impl StreamingTool {
 	fn new(lease: PathBuf, effect: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static("streaming_probe"),
-				rev:             Rev { family: Str::new_static("test"), n: 1 },
-				description:     Str::new_static("prepares from streamed arguments before commitment"),
+				name:            sf!("streaming_probe"),
+				rev:             Rev { family: sf!("test"), n: 1 },
+				description:     sf!("prepares from streamed arguments before commitment"),
 				schema:          Bytes::from_static(
 					br#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
 				),
@@ -220,9 +216,9 @@ impl BlockingTool {
 	fn new(started: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static("native_block"),
-				rev:             Rev { family: Str::new_static("test"), n: 1 },
-				description:     Str::new_static("waits until the environment cancels it"),
+				name:            sf!("native_block"),
+				rev:             Rev { family: sf!("test"), n: 1 },
+				description:     sf!("waits until the environment cancels it"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
 				effects:         file_write_effects(),
@@ -272,9 +268,9 @@ impl CooperativeInterruptTool {
 	const fn new() -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static("cooperative_interrupt"),
-				rev:             Rev { family: Str::new_static("test"), n: 1 },
-				description:     Str::new_static("reports cooperative interrupt truth"),
+				name:            sf!("cooperative_interrupt"),
+				rev:             Rev { family: sf!("test"), n: 1 },
+				description:     sf!("reports cooperative interrupt truth"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
 				effects:         Effects::empty(),
@@ -393,9 +389,9 @@ OMP_TOOLS = [
 "#;
 fn test_provenance(key: &HostKey) -> Provenance {
 	Provenance::new(
-		Str::new_static("test-publisher"),
+		sf!("test-publisher"),
 		key.extension().clone(),
-		Str::new_static("1.0.0"),
+		sf!("1.0.0"),
 		ArtifactDigest::new([0; 32]),
 		key.layer().clone(),
 		key.tier().clone(),
@@ -422,8 +418,8 @@ fn test_manifest(
 fn test_config() -> ExtHostConfig {
 	ExtHostConfig::new(
 		PathBuf::from(env!("CARGO_BIN_EXE_omp")),
-		Principal::new(Str::new_static("test"), Str::new_static("Test")),
-		Str::new_static("test-session"),
+		Principal::new(sf!("test"), sf!("Test")),
+		sf!("test-session"),
 		1,
 	)
 }
@@ -1427,7 +1423,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	assert_eq!(eval_output(&continued, omp_tools::eval::OutputChannel::Stdout), b"cell=42\n");
 	assert_eq!(
 		continued.result,
-		Some(omp_tools::eval::CellValue { text: Str::from("42"), json: Some(json!(42)) })
+		Some(omp_tools::eval::CellValue { text: sf!("42"), json: Some(json!(42)) })
 	);
 
 	let reset = invoke_builtin(
@@ -1549,7 +1545,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	assert!(recovered.reset, "queued respawn after timeout was not reported as a reset");
 	assert_eq!(
 		recovered.result,
-		Some(omp_tools::eval::CellValue { text: Str::from("42"), json: Some(json!(42)) })
+		Some(omp_tools::eval::CellValue { text: sf!("42"), json: Some(json!(42)) })
 	);
 
 	let started = harness.root.path().join("eval-cancel-started");
@@ -1626,7 +1622,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	assert!(after_cancel.reset, "respawn after cancellation was not reported as a reset");
 	assert_eq!(
 		after_cancel.result,
-		Some(omp_tools::eval::CellValue { text: Str::from("49"), json: Some(json!(49)) })
+		Some(omp_tools::eval::CellValue { text: sf!("49"), json: Some(json!(49)) })
 	);
 
 	let crashed = invoke_builtin(
@@ -1809,11 +1805,11 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		Some(InvocationEvent::Accepted(_))
 	));
 	cancelled
-		.arg_text(Str::new_static(r#"{"pa"#))
+		.arg_text(sf!(r#"{{"pa"#))
 		.await
 		.expect("first cancellable argument fragment");
 	cancelled
-		.arg_text(Str::new_static(r#"th":"cancel"}"#))
+		.arg_text(sf!(r#"th":"cancel"}"#))
 		.await
 		.expect("second cancellable argument fragment");
 	let update = tokio::time::timeout(Duration::from_secs(1), cancelled.next_event())
@@ -1870,11 +1866,11 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		Some(InvocationEvent::Accepted(_))
 	));
 	committed
-		.arg_text(Str::new_static(r#"{"path":"comm"#))
+		.arg_text(sf!(r#"{{"path":"comm"#))
 		.await
 		.expect("first committed argument fragment");
 	committed
-		.arg_text(Str::new_static(r#"itted"}"#))
+		.arg_text(sf!(r#"itted"}"#))
 		.await
 		.expect("second committed argument fragment");
 	assert!(matches!(
@@ -1919,7 +1915,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		Some(InvocationEvent::Accepted(_))
 	));
 	duplicate
-		.arg_text(Str::new_static(r#"{"path":"duplicate"}"#))
+		.arg_text(sf!(r#"{{"path":"duplicate"}}"#))
 		.await
 		.expect("duplicate argument fragment");
 	assert!(matches!(
@@ -2116,7 +2112,7 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 		Some(InvocationEvent::Update(_))
 	));
 	invocation
-		.interrupt(Str::new_static("steer cooperatively"))
+		.interrupt(sf!("steer cooperatively"))
 		.await
 		.expect("send cooperative interrupt");
 	let terminal = tokio::time::timeout(Duration::from_secs(1), invocation.next_event())

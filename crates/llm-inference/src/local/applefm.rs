@@ -30,7 +30,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tower::Service;
@@ -70,10 +70,7 @@ mod platform {
 	};
 
 	pub(super) fn availability() -> AppleFmAvailability {
-		AppleFmAvailability {
-			available: false,
-			reason:    Some(Str::from("unsupported_operating_system")),
-		}
+		AppleFmAvailability { available: false, reason: Some(sf!("unsupported_operating_system")) }
 	}
 
 	pub(super) fn os_version() -> Option<Str> {
@@ -173,8 +170,8 @@ impl AppleFmError {
 		self.message.as_str()
 	}
 
-	fn new(code: AppleFmErrorCode, message: impl Into<Str>) -> Self {
-		Self { code, message: message.into() }
+	fn new(code: AppleFmErrorCode, message: impl IntoStr) -> Self {
+		Self { code, message: message.into_str() }
 	}
 
 	fn cancelled() -> Self {
@@ -188,7 +185,7 @@ impl AppleFmError {
 		)
 	}
 
-	fn runtime(message: impl Into<Str>) -> Self {
+	fn runtime(message: impl IntoStr) -> Self {
 		Self::new(AppleFmErrorCode::Runtime, message)
 	}
 }
@@ -389,7 +386,7 @@ impl AppleFm {
 		}
 		let reason = availability
 			.reason
-			.unwrap_or_else(|| "model_unavailable".into());
+			.unwrap_or_else(|| sf!("model_unavailable"));
 		Err(AppleFmError::new(availability_error_code(reason.as_str()), reason))
 	}
 
@@ -575,7 +572,7 @@ impl Codec for AppleFmCodec {
 			return Ok(EncodedRequest::new(
 				OperationKind::DiscoverModels,
 				RequestMethod::Get,
-				"local://apple-intelligence/models".into(),
+				sf!("local://apple-intelligence/models"),
 				Box::new([]),
 				BodySource::Bytes(Bytes::new()),
 				FramingProtocol::Raw,
@@ -627,7 +624,7 @@ impl Codec for AppleFmCodec {
 		Ok(EncodedRequest::new(
 			crate::catalog::OperationKind::Chat,
 			RequestMethod::Post,
-			"local://apple-intelligence".into(),
+			sf!("local://apple-intelligence"),
 			Box::new([]),
 			BodySource::Bytes(Bytes::from(body)),
 			FramingProtocol::Raw,
@@ -690,7 +687,7 @@ impl AppleFmTransport {
 	/// Model availability is intentionally checked per request so discovery can
 	/// report a temporarily blocked system model and later observe it becoming
 	/// available without rebuilding the registry.
-	pub fn new() -> std::result::Result<Self, AppleFmAvailabilityEvidence> {
+	pub const fn new() -> std::result::Result<Self, AppleFmAvailabilityEvidence> {
 		#[cfg(target_os = "macos")]
 		{
 			Ok(Self { ready: None })
@@ -1172,7 +1169,7 @@ fn apple_discovered_model(
 		route:                 route.clone(),
 		wire_model:            WireModelId::new("apple-intelligence"),
 		aliases:               Box::new([]),
-		display_name:          Some("Apple Intelligence (on-device)".into()),
+		display_name:          Some(sf!("Apple Intelligence (on-device)")),
 		declared_class:        None,
 		declared_operations:   operations,
 		declared_capabilities: None,
@@ -1188,7 +1185,7 @@ fn apple_discovered_model(
 		} else {
 			ModelAvailability::Blocked
 		}),
-		source:                "apple-foundation-models-runtime".into(),
+		source:                sf!("apple-foundation-models-runtime"),
 		observed_at_ms:        None,
 		updated_at_ms:         None,
 		deprecated:            Some(false),
@@ -1373,7 +1370,7 @@ fn codec_route_error(
 		.provider(provider.clone())
 		.route(route.clone())
 		.request_id(request_id.clone())
-		.detail(ErrorDetail::capability("apple-foundation-models".into(), ReasonId(message.into())))
+		.detail(ErrorDetail::capability(sf!("apple-foundation-models"), ReasonId::new(message)))
 }
 
 fn transport_error(
@@ -1398,7 +1395,7 @@ fn transport_attempt_error(
 		.route(attempt.route.clone())
 		.request_id(attempt.request_id.clone())
 		.committed(committed)
-		.detail(ErrorDetail::provider(message.into()))
+		.detail(ErrorDetail::provider(Str::new(message)))
 }
 
 fn native_transport_error(
@@ -1416,7 +1413,7 @@ fn native_attempt_error(
 ) -> Error {
 	let (kind, phase) = apple_native_error(error.code(), committed);
 	transport_attempt_error(kind, phase, error.message(), attempt, committed)
-		.code(Str::new_static(error.code().as_str()))
+		.code(sf!(error.code().as_str()))
 }
 
 const fn apple_native_error(code: AppleFmErrorCode, committed: bool) -> (ErrorKind, ErrorPhase) {
@@ -1631,7 +1628,7 @@ mod tests {
 		let attempt = attempt();
 		let mut request = chat_request(&[(Role::User, "hello")]);
 		request.tools = [ToolDefinition {
-			name:        omp_core::Str::new_static("read"),
+			name:        omp_core::sf!("read"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: crate::call::OpaqueJson::new(serde_json::json!({"type": "object"})),

@@ -1,7 +1,7 @@
 //! Typed OpenAI-compatible embeddings request and unary response codec.
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	Availability, DimensionRange, EmbeddingCapabilities, EmbeddingFormatBits, EmbeddingInputBits,
 	ModalityBits, ModelLimits, OperationKind, PolicyModel,
@@ -50,7 +50,7 @@ pub struct OpenAiEmbeddingProfile {
 
 fn openai_protocol_profile() -> OpenAiEmbeddingProfile {
 	OpenAiEmbeddingProfile {
-		path:               Str::from("/embeddings"),
+		path:               sf!("/embeddings"),
 		encoding_format:    OpenAiEmbeddingEncodingFormat::Float,
 		max_request_bytes:  16 * 1024 * 1024,
 		max_frame_bytes:    256 * 1024 * 1024,
@@ -307,12 +307,9 @@ impl Codec for OpenAiEmbeddingCodec {
 		Ok(EncodedRequest::new(
 			OperationKind::Embed,
 			RequestMethod::Post,
-			Str::from(join_uri(target.endpoint.base_url.as_str(), self.profile.path.as_str())),
-			vec![RequestHeader {
-				name:  Str::from("content-type"),
-				value: Str::from("application/json"),
-			}]
-			.into_boxed_slice(),
+			Str::new(join_uri(target.endpoint.base_url.as_str(), self.profile.path.as_str())),
+			vec![RequestHeader { name: sf!("content-type"), value: sf!("application/json") }]
+				.into_boxed_slice(),
 			BodySource::Bytes(body),
 			FramingProtocol::Raw,
 			SizeBounds {
@@ -589,8 +586,8 @@ fn provider_error(error: WireError) -> Error {
 	let _ = (error.message, error.param);
 	Error::new(error_kind, ErrorPhase::Handshake, RetryAction::Never, ExecutionReceipt::default())
 		.status(status)
-		.code(Str::from(stable_code))
-		.detail(ErrorDetail::provider(Str::from("OpenAI embeddings request failed")))
+		.code(Str::new(stable_code))
+		.detail(ErrorDetail::provider(sf!("OpenAI embeddings request failed")))
 }
 
 fn join_uri(base: &str, path: &str) -> String {
@@ -621,7 +618,7 @@ fn protocol_error(reason: &'static str) -> Error {
 
 fn structured_error(kind: ErrorKind, phase: ErrorPhase, reason: &'static str) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]
@@ -696,10 +693,7 @@ mod tests {
 		let text_capabilities = capabilities(EmbeddingInputBits::TEXT);
 		let token_capabilities = text_and_token_capabilities();
 		let text = request(
-			Arc::from([
-				EmbeddingInput::Text(Str::from("alpha")),
-				EmbeddingInput::Text(Str::from("beta")),
-			]),
+			Arc::from([EmbeddingInput::Text(sf!("alpha")), EmbeddingInput::Text(sf!("beta"))]),
 			Setting::Unset,
 		);
 		assert_eq!(
@@ -723,7 +717,7 @@ mod tests {
 		);
 
 		let dimensioned =
-			request(Arc::from([EmbeddingInput::Text(Str::from("alpha"))]), Setting::Require(256));
+			request(Arc::from([EmbeddingInput::Text(sf!("alpha"))]), Setting::Require(256));
 		assert_eq!(
 			encode(&codec, "exact-model", &text_capabilities, &limits, &dimensioned).expect("dimension request"),
 			Bytes::from_static(br#"{"model":"exact-model","input":["alpha"],"dimensions":256,"encoding_format":"float"}"#),
@@ -745,30 +739,27 @@ mod tests {
 		let limits = ModelLimits::default();
 		for invalid in [
 			request(Arc::from([]), Setting::Unset),
-			request(Arc::from([EmbeddingInput::Text(Str::from(""))]), Setting::Unset),
+			request(Arc::from([EmbeddingInput::Text(Default::default())]), Setting::Unset),
 			request(Arc::from([EmbeddingInput::Tokens(Arc::from([]))]), Setting::Unset),
-			request(Arc::from([EmbeddingInput::Text(Str::from("x"))]), Setting::Require(0)),
+			request(Arc::from([EmbeddingInput::Text(sf!("x"))]), Setting::Require(0)),
 		] {
 			assert!(encode(&codec, "model", &supported, &limits, &invalid).is_err());
 		}
 
-		let mut normalized =
-			request(Arc::from([EmbeddingInput::Text(Str::from("x"))]), Setting::Unset);
+		let mut normalized = request(Arc::from([EmbeddingInput::Text(sf!("x"))]), Setting::Unset);
 		normalized.normalize = Setting::Require(true);
 		assert!(encode(&codec, "model", &supported, &limits, &normalized).is_err());
-		let mut truncated =
-			request(Arc::from([EmbeddingInput::Text(Str::from("x"))]), Setting::Unset);
+		let mut truncated = request(Arc::from([EmbeddingInput::Text(sf!("x"))]), Setting::Unset);
 		truncated.truncation = TruncationPolicy::End;
 		assert!(encode(&codec, "model", &supported, &limits, &truncated).is_err());
 
 		let mut no_dimensions = supported.clone();
 		no_dimensions.dimensions = Availability::Unsupported;
-		let dimensioned =
-			request(Arc::from([EmbeddingInput::Text(Str::from("x"))]), Setting::Prefer(64));
+		let dimensioned = request(Arc::from([EmbeddingInput::Text(sf!("x"))]), Setting::Prefer(64));
 		assert!(encode(&codec, "model", &no_dimensions, &limits, &dimensioned).is_err());
 		let mut no_float = supported.clone();
 		no_float.formats = EmbeddingFormatBits::BASE64;
-		let plain = request(Arc::from([EmbeddingInput::Text(Str::from("x"))]), Setting::Unset);
+		let plain = request(Arc::from([EmbeddingInput::Text(sf!("x"))]), Setting::Unset);
 		assert!(encode(&codec, "model", &no_float, &limits, &plain).is_err());
 
 		let tokens = request(Arc::from([EmbeddingInput::Tokens(Arc::from([1, 2]))]), Setting::Unset);
@@ -779,7 +770,7 @@ mod tests {
 		bounded_capabilities.maximum_batch = Some(1);
 		let bounded_limits = ModelLimits { maximum_input_tokens: Some(2), ..ModelLimits::default() };
 		let oversized_batch = request(
-			Arc::from([EmbeddingInput::Text(Str::from("x")), EmbeddingInput::Text(Str::from("y"))]),
+			Arc::from([EmbeddingInput::Text(sf!("x")), EmbeddingInput::Text(sf!("y"))]),
 			Setting::Unset,
 		);
 		assert!(

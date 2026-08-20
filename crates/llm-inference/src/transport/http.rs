@@ -538,7 +538,7 @@ pub(crate) fn request_id(headers: &HeaderMap) -> Option<Str> {
 		&& value
 			.bytes()
 			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
-	.then(|| Str::from(value))
+	.then(|| Str::new(value))
 }
 
 pub(crate) fn sanitize_headers(headers: &HeaderMap) -> Box<[RequestHeader]> {
@@ -551,10 +551,7 @@ pub(crate) fn sanitize_headers(headers: &HeaderMap) -> Box<[RequestHeader]> {
 				return None;
 			}
 			let value = value.to_str().ok()?.trim().parse::<u64>().ok()?;
-			Some(RequestHeader {
-				name:  Str::from(name.as_str()),
-				value: Str::from(value.to_string()),
-			})
+			Some(RequestHeader { name: Str::new(name.as_str()), value: Str::new(value.to_string()) })
 		})
 		.take(MAX_CAPTURED_HEADERS)
 		.collect::<Vec<_>>()
@@ -960,7 +957,7 @@ fn framing_error(error: FramingError, committed: bool) -> Error {
 	} else {
 		ErrorPhase::Handshake
 	};
-	let mut error = structured_error(kind, phase, committed, reason).code(Str::from(reason));
+	let mut error = structured_error(kind, phase, committed, reason).code(Str::new(reason));
 	if !committed && error.kind != ErrorKind::Cancelled {
 		error.action = RetryAction::SameRoute { after: std::time::Duration::ZERO };
 	}
@@ -1069,7 +1066,7 @@ fn structured_error(
 ) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default())
 		.committed(committed)
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]
@@ -1149,7 +1146,7 @@ mod tests {
 			RetryAction::SameRoute { after: std::time::Duration::from_secs(3) },
 			ExecutionReceipt::default(),
 		)
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static("factory-rate-window"))));
+		.detail(ErrorDetail::protocol(ReasonId(sf!("factory-rate-window"))));
 		let mapped = map_body_open_error(BodyOpenError::Factory(inner.clone()));
 		assert_eq!(mapped.kind, inner.kind);
 		assert_eq!(mapped.phase, inner.phase);
@@ -1177,7 +1174,7 @@ mod tests {
 		assert_eq!(committed.action, RetryAction::Never, "committed output is never blind-retried");
 		assert_eq!(
 			committed.detail_ref(),
-			Some(&ErrorDetail::protocol(ReasonId(Str::new_static("http-response-body")))),
+			Some(&ErrorDetail::protocol(ReasonId(sf!("http-response-body")))),
 			"the stable reason survives for resume classification"
 		);
 	}

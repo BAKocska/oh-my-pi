@@ -13,7 +13,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, task::AtomicWaker};
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use omp_llm_catalog::{
 	AuthSpecId, CodecId, CodecProfile, CodexTransportPreference, DiscoveredModel, EndpointSpec,
 	HeaderProfileId, OperationKind, PolicyModel, ProviderId, RedirectTrust, RouteDef, RouteId,
@@ -84,6 +84,20 @@ pub struct RequestHeader {
 	pub name:  Str,
 	/// Header value; credentials are prohibited here.
 	pub value: Str,
+}
+
+impl RequestHeader {
+	/// Construct a header.
+	#[inline]
+	pub fn new(name: impl IntoStr, value: impl IntoStr) -> Self {
+		Self { name: name.into_str(), value: value.into_str() }
+	}
+
+	/// Construct a static header.
+	#[inline]
+	pub const fn new_static(name: &'static str, value: &'static str) -> Self {
+		Self { name: sf!(name), value: sf!(value) }
+	}
 }
 
 /// Explicit request and response byte limits enforced by the transport.
@@ -277,19 +291,19 @@ pub struct EncodeContext<'a> {
 	pub attempt:            EncodeAttempt,
 }
 
-static DEFAULT_REQUEST_ID: RequestId = RequestId::new_static("");
+static DEFAULT_REQUEST_ID: RequestId = RequestId::empty();
 static DEFAULT_WIRE_POLICY: WirePolicy = WirePolicy::baseline();
 /// Neutral deny-everything route placeholder backing
 /// [`EncodeContext::default`].
 static DEFAULT_ROUTE: RouteDef = RouteDef {
-	id:                 RouteId::new_static(""),
-	provider:           ProviderId::new_static(""),
+	id:                 RouteId::empty(),
+	provider:           ProviderId::empty(),
 	codec_profile:      CodecProfile::Standard,
-	codec:              CodecId::new_static(""),
+	codec:              CodecId::empty(),
 	transport:          TransportKind::Http,
-	endpoint:           EndpointSpec { base_url: Str::new_static(""), region: None },
-	auth:               AuthSpecId::new_static(""),
-	headers:            HeaderProfileId::new_static(""),
+	endpoint:           EndpointSpec { base_url: Str::empty(), region: None },
+	auth:               AuthSpecId::empty(),
+	headers:            HeaderProfileId::empty(),
 	discovery:          None,
 	capability_limits:  RouteRestrictions {
 		operations:             None,
@@ -299,7 +313,7 @@ static DEFAULT_ROUTE: RouteDef = RouteDef {
 		disable_prompt_caching: false,
 	},
 	trust_domain:       TrustDomain {
-		origin:          Str::new_static(""),
+		origin:          Str::empty(),
 		redirects:       RedirectTrust::Deny,
 		allow_plaintext: false,
 	},

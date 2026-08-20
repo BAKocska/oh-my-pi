@@ -176,7 +176,7 @@ where
 				Ok(AdcResolution {
 					lease:         token.into_lease(meta, issued_at),
 					source:        AdcSourceKind::AuthorizedUser,
-					quota_project: quota_project_id.as_deref().map(Str::from),
+					quota_project: quota_project_id.as_deref().map(Str::new),
 				})
 			},
 			CredentialFile::ServiceAccount {
@@ -199,7 +199,7 @@ where
 				Ok(AdcResolution {
 					lease:         token.into_lease(meta, issued_at),
 					source:        AdcSourceKind::ServiceAccount,
-					quota_project: quota_project_id.as_deref().map(Str::from),
+					quota_project: quota_project_id.as_deref().map(Str::new),
 				})
 			},
 			CredentialFile::ExternalAccount {
@@ -228,7 +228,7 @@ where
 				Ok(AdcResolution {
 					lease:         token.into_lease(meta, issued_at),
 					source:        AdcSourceKind::ExternalAccount,
-					quota_project: quota_project_id.as_deref().map(Str::from),
+					quota_project: quota_project_id.as_deref().map(Str::new),
 				})
 			},
 		}

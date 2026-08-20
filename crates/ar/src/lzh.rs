@@ -470,7 +470,7 @@ fn process_extended(
 	Ok(())
 }
 
-fn method_code(bytes: &[u8]) -> Option<u8> {
+const fn method_code(bytes: &[u8]) -> Option<u8> {
 	match bytes {
 		b"-lh0-" => Some(METHOD_LH0),
 		b"-lh1-" => Some(METHOD_LH1),
@@ -532,11 +532,10 @@ pub(crate) fn decompress_lh_static(
 		if distance >= dictionary_size || distance >= output_position {
 			return Err(Error::InvalidArchive("legacy Huffman history distance is out of range"));
 		}
-		let mut source_position = output_position - distance - 1;
-		for _ in 0..length {
+		let source_start = output_position - distance - 1;
+		for source_position in source_start..source_start + length {
 			output[output_position] = output[source_position];
 			output_position += 1;
-			source_position += 1;
 		}
 	}
 	if block_remaining != 0 {
@@ -621,7 +620,7 @@ struct Huffman {
 }
 
 impl Huffman {
-	fn single(symbol: usize, symbol_count: usize) -> Result<Self> {
+	const fn single(symbol: usize, symbol_count: usize) -> Result<Self> {
 		if symbol >= symbol_count {
 			return Err(Error::InvalidArchive("legacy Huffman symbol is out of range"));
 		}
@@ -881,7 +880,9 @@ fn decode_utf16(bytes: &[u8]) -> Result<String> {
 		end -= 2;
 	}
 	let units: Vec<u16> = bytes[..end]
-		.chunks_exact(2)
+		.as_chunks::<2>()
+		.0
+		.iter()
 		.map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
 		.collect();
 	Ok(String::from_units(xutf::transcode::<Utf16Le, Utf8>(&units)))
@@ -919,7 +920,7 @@ fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
 	era * 146_097 + day_of_era - 719_468
 }
 
-fn filetime_to_unix(ticks: u64) -> Option<u64> {
+const fn filetime_to_unix(ticks: u64) -> Option<u64> {
 	(ticks / 10_000_000).checked_sub(11_644_473_600)
 }
 
@@ -960,21 +961,21 @@ fn read_vec(
 	Ok(bytes)
 }
 
-fn check_index_size(actual: u64, limits: Limits) -> Result<()> {
+const fn check_index_size(actual: u64, limits: Limits) -> Result<()> {
 	if actual > limits.max_index_size() {
 		return Err(Error::IndexTooLarge { actual, limit: limits.max_index_size() });
 	}
 	Ok(())
 }
 
-fn check_path_size(actual: u64, limits: Limits) -> Result<()> {
+const fn check_path_size(actual: u64, limits: Limits) -> Result<()> {
 	if actual > limits.max_path_size() {
 		return Err(Error::PathTooLong { actual, limit: limits.max_path_size() });
 	}
 	Ok(())
 }
 
-fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+const fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 	u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 

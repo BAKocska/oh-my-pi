@@ -574,23 +574,22 @@ fn validate_request(messages: &[ChatMessage], options: &GenerationOptions) -> Lo
 mod tests {
 	use std::sync::Arc;
 
-	use omp_core::Str;
+	
 
 	use super::ClassifierLadder;
 
 	#[test]
 	fn classifier_ladder_uses_earliest_accepted_label() {
-		let ladder =
-			ClassifierLadder::new([Str::from("deny"), Str::from("allow"), Str::from("review")].into())
-				.expect("valid ladder");
-		assert_eq!(ladder.parse("explain allow, then deny"), Some(Str::from("allow")));
+		let ladder = ClassifierLadder::new([sf!("deny"), sf!("allow"), sf!("review")].into())
+			.expect("valid ladder");
+		assert_eq!(ladder.parse("explain allow, then deny"), Some(sf!("allow")));
 		assert_eq!(ladder.parse("unrecognized"), None);
 		assert_eq!(ladder.instruction(), "Reply with exactly one of: deny, allow, review.");
 	}
 
 	#[test]
 	fn classifier_ladder_rejects_an_open_vocabulary() {
-		assert!(ClassifierLadder::new(Arc::from([Str::from("allow"), Str::from("allow")])).is_err());
+		assert!(ClassifierLadder::new(Arc::from([sf!("allow"), sf!("allow")])).is_err());
 		assert!(ClassifierLadder::new(Arc::from([])).is_err());
 	}
 }

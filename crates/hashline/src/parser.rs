@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 
 use crate::{
 	format::HL_RANGE_SEP,
@@ -431,7 +431,7 @@ impl Executor {
 			return;
 		}
 		pending.deferred_blanks.push(PayloadRow {
-			text: text.into(),
+			text: Str::new(text),
 			line_num,
 			bare: true,
 			minus: false,
@@ -685,7 +685,7 @@ impl Executor {
 		code: DiagnosticCode,
 		line_num: usize,
 		authored_index: usize,
-		message: impl Into<Str>,
+		message: impl IntoStr,
 	) {
 		if self
 			.diagnostics
@@ -706,7 +706,7 @@ impl Executor {
 		code: DiagnosticCode,
 		line_num: usize,
 		authored_index: usize,
-		message: impl Into<Str>,
+		message: impl IntoStr,
 	) -> Result<T, ParseError> {
 		Err(ParseError::new(Diagnostic::error(code, Some(line_num), Some(authored_index), message)))
 	}
@@ -971,7 +971,7 @@ fn parse_top_level_snapshot_row(text: &str) -> Option<(usize, Str)> {
 	let trimmed = text.trim_start();
 	let separator = trimmed.find([':', '|'])?;
 	let line = parse_positive(&trimmed[..separator])?;
-	Some((line, trimmed[separator + 1..].into()))
+	Some((line, Str::new(&trimmed[separator + 1..])))
 }
 
 fn markdown_bullet(text: &str) -> bool {
@@ -1003,7 +1003,7 @@ fn strip_bare_prefixes_if_uniform(payloads: &mut [PayloadRow]) {
 			&& !row.text.trim().is_empty()
 			&& let Some(stripped) = strip_one_read_prefix(&row.text)
 		{
-			row.text = stripped.into();
+			row.text = Str::new(stripped);
 		}
 	}
 }
@@ -1066,35 +1066,29 @@ fn foreign_patch_message(text: &str) -> Option<Str> {
 		.iter()
 		.any(|prefix| trimmed.starts_with(prefix))
 	{
-		return Some(
+		return Some(sf!(
 			"apply_patch sentinel is not valid in hashline. File sections start with `[path#HASH]`; \
-			 use `PUT`, `CUT`, `REM`, or `MV`."
-				.into(),
-		);
+			 use `PUT`, `CUT`, `REM`, or `MV`.",
+		));
 	}
 	if trimmed.starts_with("@@") {
-		return Some(
+		return Some(sf!(
 			"unified-diff hunk header is not valid in hashline. Drop the `@@ ... @@` wrapper and \
-			 write `PUT N.=M:` or `CUT N.=M`."
-				.into(),
-		);
+			 write `PUT N.=M:` or `CUT N.=M`.",
+		));
 	}
 	if parse_positive(trimmed).is_some() {
-		return Some(
-			format!(
-				"hunk headers need a verb and both endpoints. Use `PUT {trimmed}.={trimmed}:` to \
-				 replace or `CUT {trimmed}.={trimmed}` to delete."
-			)
-			.into(),
-		);
+		return Some(sf!(
+			"hunk headers need a verb and both endpoints. Use `PUT {trimmed}.={trimmed}:` to replace \
+			 or `CUT {trimmed}.={trimmed}` to delete."
+		));
 	}
 	let parts: Vec<_> = trimmed.trim_end_matches(':').split_whitespace().collect();
 	if parts.len() == 2 && parts.iter().all(|part| parse_positive(part).is_some()) {
-		return Some(
+		return Some(sf!(
 			"bare range hunk header is not valid. Hunk headers need a verb: use `PUT N.=M:` or `CUT \
-			 N.=M`."
-				.into(),
-		);
+			 N.=M`.",
+		));
 	}
 	None
 }

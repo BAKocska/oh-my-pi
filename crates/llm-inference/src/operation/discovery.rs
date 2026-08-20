@@ -8,7 +8,7 @@ use std::{
 	task::{Context, Poll},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 
 use crate::{
@@ -201,7 +201,7 @@ impl CatalogDiscoveryProjector {
 						continue;
 					}
 					index
-						.entry(Str::from(relative.to_ascii_lowercase()))
+						.entry(Str::new(relative.to_ascii_lowercase()))
 						.or_insert_with(|| model.clone());
 				}
 				Arc::new(index)
@@ -647,8 +647,8 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		Str::from(OperationKind::DiscoverModels.to_string()),
-		ReasonId(Str::from("operation_service_mismatch")),
+		Str::new(OperationKind::DiscoverModels.to_string()),
+		ReasonId(sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
@@ -656,7 +656,7 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 fn request_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::InvalidRequest,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -664,7 +664,7 @@ fn request_error(feature: &'static str, reason: &'static str) -> Error {
 fn capability_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::CapabilityMismatch,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -676,7 +676,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]
@@ -1096,7 +1096,7 @@ mod tests {
 		)
 		.expect("valid canonical pricing");
 		let mut index = BTreeMap::new();
-		index.insert(Str::from("deepseek-ai/deepseek-v4-pro"), canonical);
+		index.insert(sf!("deepseek-ai/deepseek-v4-pro"), canonical);
 		(provider, route, normalizer, index)
 	}
 
@@ -1193,7 +1193,7 @@ mod tests {
 			.get("deepseek-ai/deepseek-v4-pro")
 			.expect("fixture entry")
 			.clone();
-		canonical.insert(Str::from("deepseek-v4"), stray);
+		canonical.insert(sf!("deepseek-v4"), stray);
 		let request = DiscoveryRequest {
 			provider:  Some(provider.clone()),
 			route:     Some(route.clone()),

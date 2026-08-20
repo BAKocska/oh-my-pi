@@ -20,7 +20,7 @@ use std::{
 };
 
 use futures::{future::BoxFuture, stream, task::AtomicWaker};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use tower::Service;
 
@@ -158,7 +158,7 @@ impl Service<crate::call::Call> for FakeProvider {
 								RetryAction::Never,
 								receipt,
 							)
-							.detail(ErrorDetail::protocol(ReasonId(Str::from(
+							.detail(ErrorDetail::protocol(ReasonId(sf!(
 								"fake scripted answer body mismatches operation",
 							)))),
 						)
@@ -801,7 +801,7 @@ fn contract_error(request_id: RequestId, reason: &'static str, receipt: Executio
 		receipt,
 	)
 	.request_id(request_id)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]
@@ -887,7 +887,7 @@ mod tests {
 				accuracy: CountAccuracy::Exact,
 			})),
 			OperationCall::Tokenize(Arc::new(TokenizeRequest {
-				text:          Str::from("secret text"),
+				text:          sf!("secret text"),
 				allow_special: false,
 			})),
 			OperationCall::Detokenize(Arc::new(DetokenizeRequest {
@@ -902,7 +902,7 @@ mod tests {
 				negotiation: NegotiationPolicy::default(),
 			})),
 			OperationCall::GenerateImage(Arc::new(ImageRequest {
-				prompt:      Str::from("private prompt"),
+				prompt:      sf!("private prompt"),
 				references:  Arc::from([]),
 				mask:        None,
 				count:       1,
@@ -916,7 +916,7 @@ mod tests {
 				negotiation: NegotiationPolicy::default(),
 			})),
 			OperationCall::GenerateVideo(Arc::new(VideoRequest {
-				prompt:            Str::from("private prompt"),
+				prompt:            sf!("private prompt"),
 				reference:         None,
 				duration_ms:       Setting::default(),
 				dimensions:        Setting::default(),
@@ -927,8 +927,8 @@ mod tests {
 				negotiation:       NegotiationPolicy::default(),
 			})),
 			OperationCall::Speak(Arc::new(SpeechRequest {
-				text:           Str::from("private speech"),
-				voice:          Str::from("voice"),
+				text:           sf!("private speech"),
+				voice:          sf!("voice"),
 				format:         Setting::default(),
 				sample_rate_hz: Setting::default(),
 				speed:          Setting::default(),
@@ -937,7 +937,7 @@ mod tests {
 			})),
 			OperationCall::Transcribe(Arc::new(TranscriptionRequest {
 				audio:                MediaInput::Bytes {
-					media_type: Str::from("audio/pcm"),
+					media_type: sf!("audio/pcm"),
 					data:       Bytes::from_static(b"private audio"),
 				},
 				language:             None,
@@ -958,7 +958,7 @@ mod tests {
 				negotiation:    NegotiationPolicy::default(),
 			})),
 			OperationCall::Search(Arc::new(SearchRequest {
-				query:             Str::from("private query"),
+				query:             sf!("private query"),
 				include_domains:   Arc::from([]),
 				exclude_domains:   Arc::from([]),
 				recency:           None,
@@ -1015,10 +1015,10 @@ mod tests {
 
 	fn detokenized(text: &str) -> DetokenizedText {
 		DetokenizedText {
-			text:       Str::from(text),
+			text:       Str::new(text),
 			provenance: TokenizerProvenance {
-				tokenizer: Str::from("fake-tokenizer"),
-				revision:  Str::from("1"),
+				tokenizer: sf!("fake-tokenizer"),
+				revision:  sf!("1"),
 				exact:     true,
 			},
 		}
@@ -1191,7 +1191,7 @@ mod tests {
 		let stream_error = failure().committed(true);
 		fake.extend([
 			FakeScript::chat(vec![
-				Ok(ChatEvent::TextDelta { index: 0, text: Str::from("delta") }),
+				Ok(ChatEvent::TextDelta { index: 0, text: sf!("delta") }),
 				Err(stream_error),
 			]),
 			FakeScript::images(vec![Ok(crate::answer::GenerationEvent::Progress {
@@ -1209,7 +1209,7 @@ mod tests {
 				final_chunk: true,
 			})]),
 			FakeScript::transcript(vec![Ok(crate::answer::TranscriptEvent::Started {
-				language: Some(Str::from("en")),
+				language: Some(sf!("en")),
 			})]),
 			FakeScript::realtime(crate::answer::RealtimeSession::from_channels(
 				outbound,

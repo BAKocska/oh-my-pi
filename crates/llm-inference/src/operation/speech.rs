@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::Str;
+use omp_core::sf;
 use tower::Service;
 
 use crate::{
@@ -224,14 +224,11 @@ where
 				return Err(wrong_operation(&call, OperationKind::Speak));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(
-					OperationKind::Speak,
-					Str::from(format!("{error:?}")),
-				));
+				return Err(media_validation_error(OperationKind::Speak, sf!("{error:?}")));
 			}
 			let response = pending
 				.ok_or_else(|| {
-					media_validation_error(OperationKind::Speak, "speech_request_not_dispatched")
+					media_validation_error(OperationKind::Speak, sf!("speech_request_not_dispatched"))
 				})?
 				.await?;
 			let mut state = SpeechStreamState::new(max_chunk_bytes);
@@ -239,7 +236,7 @@ where
 				let stream = async_stream::stream! {
 					while let Some(chunk) = output.next().await {
 						match chunk.and_then(|chunk| {
-							state.observe(&chunk).map_err(|error| media_protocol_error(OperationKind::Speak, Str::from(format!("{error:?}"))))?;
+							state.observe(&chunk).map_err(|error| media_protocol_error(OperationKind::Speak, sf!("{error:?}")))?;
 							Ok(chunk)
 						}) {
 							Ok(chunk) => yield Ok(chunk),
@@ -247,7 +244,8 @@ where
 						}
 					}
 					if let Err(error) = state.finish() {
-						yield Err(media_protocol_error(OperationKind::Speak, Str::from(format!("{error:?}"))));
+						let detail = sf!("{error:?}");
+						yield Err(media_protocol_error(OperationKind::Speak, detail));
 					}
 				};
 				Box::pin(stream) as AudioStream

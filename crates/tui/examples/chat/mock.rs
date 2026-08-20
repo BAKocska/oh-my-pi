@@ -12,7 +12,7 @@ use flume::{Receiver, Sender};
 use omp_chat_ui::{
 	BackendEvent, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 pub fn start() -> (Receiver<BackendEvent>, Sender<Intent>) {
 	let (event_tx, event_rx) = flume::unbounded();
@@ -86,8 +86,7 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 			},
 			Intent::AuthAnswer { value: _ } => {
 				let _ = events.send(BackendEvent::AuthPromptClose);
-				let _ = events
-					.send(BackendEvent::Notice(Str::new_static("Credential accepted by mock backend.")));
+				let _ = events.send(BackendEvent::Notice(sf!("Credential accepted by mock backend.")));
 			},
 			Intent::AuthCancel => {
 				let _ = events.send(BackendEvent::AuthPromptClose);
@@ -99,17 +98,17 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				let _ = events.send(BackendEvent::HistoryCleared);
 				let _ = events.send(BackendEvent::SessionTitle(Str::from(format!("Resumed {id}"))));
 				let _ = events.send(BackendEvent::UserReplayed {
-					text:  Str::new_static("Continue from the last checkpoint."),
+					text:  sf!("Continue from the last checkpoint."),
 					chips: Vec::new(),
 				});
 			},
 			Intent::NewSession => {
 				messages.clear();
 				let _ = events.send(BackendEvent::HistoryCleared);
-				let _ = events.send(BackendEvent::SessionTitle(Str::new_static("New local session")));
+				let _ = events.send(BackendEvent::SessionTitle(sf!("New local session")));
 			},
 			Intent::Help => {
-				let _ = events.send(BackendEvent::Notice(Str::new_static(
+				let _ = events.send(BackendEvent::Notice(sf!(
 					"Ctrl+P models · Ctrl+K commands · Ctrl+B sidebar · Esc Esc rewind",
 				)));
 			},
@@ -139,10 +138,8 @@ async fn stream_turn(
 		if !active() {
 			return;
 		}
-		let _ = events.send(BackendEvent::AssistantDelta {
-			id:   assistant.clone(),
-			text: Str::new_static(delta),
-		});
+		let _ =
+			events.send(BackendEvent::AssistantDelta { id: assistant.clone(), text: sf!(delta) });
 		tokio::time::sleep(Duration::from_millis(180)).await;
 	}
 	if !active() {
@@ -150,15 +147,14 @@ async fn stream_turn(
 	}
 	let _ = events.send(BackendEvent::ToolStarted {
 		id:    tool.clone(),
-		name:  Str::new_static("shell"),
-		title: Str::new_static("Inspect chat scene"),
+		name:  sf!("shell"),
+		title: sf!("Inspect chat scene"),
 	});
 	for chunk in ["reading scene modules\n", "checking damage ranges\n", "done\n"] {
 		if !active() {
 			return;
 		}
-		let _ = events
-			.send(BackendEvent::ToolOutput { id: tool.clone(), chunk: Str::new_static(chunk) });
+		let _ = events.send(BackendEvent::ToolOutput { id: tool.clone(), chunk: sf!(chunk) });
 		tokio::time::sleep(Duration::from_millis(160)).await;
 	}
 	if !active() {
@@ -167,11 +163,11 @@ async fn stream_turn(
 	let _ = events.send(BackendEvent::ToolFinished {
 		id:   tool,
 		ok:   true,
-		view: Str::new_static("Host seam verified\n3 files inspected"),
+		view: sf!("Host seam verified\n3 files inspected"),
 	});
 	let _ = events.send(BackendEvent::AssistantDelta {
 		id:   assistant.clone(),
-		text: Str::new_static("The immediate-mode scene is ready."),
+		text: sf!("The immediate-mode scene is ready."),
 	});
 	let _ = events.send(BackendEvent::AssistantEnd { id: assistant });
 	let _ = events.send(BackendEvent::Ack { interrupted: false });
@@ -190,7 +186,7 @@ fn status(model: &Str, working: bool) -> StatusFacts {
 		jobs: usize::from(working),
 		attempt: 0,
 		dropped: 0,
-		git: Some(GitFacts { branch: Str::new_static("main"), dirty: 5, staged: 9 }),
+		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
 		..StatusFacts::default()
 	}
 }

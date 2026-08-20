@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::base64};
+use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -51,10 +51,10 @@ pub struct OpenAiMediaProfile {
 impl Default for OpenAiMediaProfile {
 	fn default() -> Self {
 		Self {
-			images_path:              Str::from("/v1/images/generations"),
-			speech_path:              Str::from("/v1/audio/speech"),
-			transcription_path:       Str::from("/v1/audio/transcriptions"),
-			translation_path:         Str::from("/v1/audio/translations"),
+			images_path:              sf!("/v1/images/generations"),
+			speech_path:              sf!("/v1/audio/speech"),
+			transcription_path:       sf!("/v1/audio/transcriptions"),
+			translation_path:         sf!("/v1/audio/translations"),
 			max_request_bytes:        128 * 1024 * 1024,
 			max_frame_bytes:          32 * 1024 * 1024,
 			max_response_bytes:       128 * 1024 * 1024,
@@ -103,7 +103,7 @@ impl Codec for OpenAiMediaCodec {
 					OperationKind::Speak,
 					target.endpoint.base_url.as_str(),
 					self.profile.speech_path.as_str(),
-					Str::from("application/json"),
+					sf!("application/json"),
 					BodySource::Bytes(body),
 					FramingProtocol::RawChunks,
 					&self.profile,
@@ -165,9 +165,8 @@ fn encoded(
 	EncodedRequest::new(
 		operation,
 		RequestMethod::Post,
-		Str::from(join_uri(base, path)),
-		vec![RequestHeader { name: Str::from("content-type"), value: content_type }]
-			.into_boxed_slice(),
+		Str::new(join_uri(base, path)),
+		vec![RequestHeader { name: sf!("content-type"), value: content_type }].into_boxed_slice(),
 		body,
 		FramingProtocol::Raw,
 		SizeBounds {
@@ -216,11 +215,7 @@ fn encode_image(
 		let body = serde_json::to_vec(&wire)
 			.map(Bytes::from)
 			.map_err(|_| encoding_error(ErrorKind::InvalidRequest))?;
-		return Ok((
-			BodySource::Bytes(body),
-			Str::from("application/json"),
-			profile.images_path.clone(),
-		));
+		return Ok((BodySource::Bytes(body), sf!("application/json"), profile.images_path.clone()));
 	}
 	let boundary = boundary(request_id);
 	let mut parts = Vec::new();
@@ -251,8 +246,8 @@ fn encode_image(
 	parts.push(BodySource::Bytes(Bytes::from(format!("--{boundary}--\r\n"))));
 	Ok((
 		BodySource::multipart(Arc::<[BodySource]>::from(parts)),
-		Str::from(format!("multipart/form-data; boundary={boundary}")),
-		Str::from("/v1/images/edits"),
+		sf!("multipart/form-data; boundary={boundary}"),
+		sf!("/v1/images/edits"),
 	))
 }
 
@@ -331,7 +326,7 @@ fn encode_transcription(
 	parts.push(BodySource::Bytes(Bytes::from(format!("--{boundary}--\r\n"))));
 	Ok((
 		BodySource::multipart(Arc::<[BodySource]>::from(parts)),
-		Str::from(format!("multipart/form-data; boundary={boundary}")),
+		sf!("multipart/form-data; boundary={boundary}"),
 	))
 }
 
@@ -414,7 +409,7 @@ impl Decoder for ImageDecoder {
 			};
 			emit(RawEvent::ImageGeneration(GenerationEvent::Artifact(ImageArtifact {
 				artifact:       Artifact {
-					media_type: Str::from(media_type),
+					media_type: Str::new(media_type),
 					size:       Some(bytes.len() as u64),
 					digest:     None,
 					body:       ArtifactBody::Bytes(bytes),
@@ -689,11 +684,11 @@ mod tests {
 		let body =
 			BodySource::OneShot(Arc::new(OneShotBody::new(byte_stream(Bytes::from_static(b"image")))));
 		let request = ImageRequest {
-			prompt:      Str::from("edit"),
+			prompt:      sf!("edit"),
 			references:  Arc::from([MediaInput::Body {
-				media_type: Str::from("image/png"),
+				media_type: sf!("image/png"),
 				body,
-				name: Some(Str::from("input.png")),
+				name: Some(sf!("input.png")),
 			}]),
 			mask:        None,
 			count:       1,

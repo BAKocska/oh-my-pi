@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
 /// Complete data-only authentication description attached to a catalog route.
@@ -475,7 +475,7 @@ impl HeaderPlacement {
 	/// Standard `Authorization: Bearer …` placement.
 	#[must_use]
 	pub fn bearer() -> Self {
-		Self { name: "authorization".into(), prefix: "Bearer ".into() }
+		Self { name: sf!("authorization"), prefix: sf!("Bearer ") }
 	}
 
 	fn validate(&self) -> Result<(), AuthSpecError> {

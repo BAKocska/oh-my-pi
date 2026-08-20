@@ -21,7 +21,7 @@ use omp_chat_ui::{
 	SessionRow, StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
 	host::{HostExit, HostOptions},
 };
-use omp_core::{Str, encoding::hex, fmts};
+use omp_core::{Str, encoding::hex, sf};
 use omp_llm_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, provider::AuthSpecKind,
 	snapshot::Catalog,
@@ -380,10 +380,9 @@ where
 	if welcome {
 		match list_sessions() {
 			Ok(choices) => send_backend(&backend_tx, BackendEvent::Sessions(session_rows(choices))),
-			Err(error) => send_backend(
-				&backend_tx,
-				BackendEvent::Error(fmts!("Could not list sessions: {error}")),
-			),
+			Err(error) => {
+				send_backend(&backend_tx, BackendEvent::Error(sf!("Could not list sessions: {error}")))
+			},
 		}
 	}
 	replay_items(
@@ -510,7 +509,7 @@ fn handle_plan_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		"" | "status" => {
 			send_backend(
 				backend,
-				BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+				BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
 			);
 			return;
 		},
@@ -521,10 +520,7 @@ fn handle_plan_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 			Ok(())
 		},
 		_ => {
-			send_backend(
-				backend,
-				BackendEvent::Error(Str::new_static("Usage: /plan [on|yolo|off|status]")),
-			);
+			send_backend(backend, BackendEvent::Error(sf!("Usage: /plan [on|yolo|off|status]")));
 			return;
 		},
 	};
@@ -540,7 +536,7 @@ fn handle_prewalk_command(
 		"" | "status" => {
 			send_backend(
 				backend,
-				BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+				BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
 			);
 			return;
 		},
@@ -550,10 +546,7 @@ fn handle_prewalk_command(
 			Ok(())
 		},
 		_ => {
-			send_backend(
-				backend,
-				BackendEvent::Error(Str::new_static("Usage: /prewalk [on|off|status]")),
-			);
+			send_backend(backend, BackendEvent::Error(sf!("Usage: /prewalk [on|off|status]")));
 			return;
 		},
 	};
@@ -565,7 +558,7 @@ fn handle_vibe_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		"" | "status" => {
 			send_backend(
 				backend,
-				BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+				BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
 			);
 			return;
 		},
@@ -575,10 +568,7 @@ fn handle_vibe_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 			Ok(())
 		},
 		_ => {
-			send_backend(
-				backend,
-				BackendEvent::Error(Str::new_static("Usage: /vibe [on|off|status]")),
-			);
+			send_backend(backend, BackendEvent::Error(sf!("Usage: /vibe [on|off|status]")));
 			return;
 		},
 	};
@@ -594,7 +584,7 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		"" => {
 			send_backend(
 				backend,
-				BackendEvent::Notice(Str::new_static(
+				BackendEvent::Notice(sf!(
 					"Use `/goal set <objective> [token-budget]` to start an autonomous goal.",
 				)),
 			);
@@ -626,7 +616,7 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 			Err(_) => {
 				send_backend(
 					backend,
-					BackendEvent::Error(Str::new_static("Usage: /goal budget <positive-tokens>")),
+					BackendEvent::Error(sf!("Usage: /goal budget <positive-tokens>")),
 				);
 				return;
 			},
@@ -634,9 +624,9 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		_ => {
 			send_backend(
 				backend,
-				BackendEvent::Error(Str::new_static(
-					"Usage: /goal [set|pause|resume|complete|drop|budget|status]",
-				)),
+				BackendEvent::Error(
+					sf!("Usage: /goal [set|pause|resume|complete|drop|budget|status]",),
+				),
 			);
 			return;
 		},
@@ -655,7 +645,7 @@ fn report_mode_result(
 	match result {
 		Ok(()) => send_backend(
 			backend,
-			BackendEvent::Notice(fmts!("Execution mode: **{}**", mode_name(modes.active()))),
+			BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
 		),
 		Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
 	}
@@ -663,7 +653,7 @@ fn report_mode_result(
 
 fn goal_status(goal: Option<Goal>) -> Str {
 	let Some(goal) = goal else {
-		return Str::new_static("No goal is configured.");
+		return sf!("No goal is configured.");
 	};
 	let status = match goal.status {
 		GoalStatus::Active => "active",
@@ -716,9 +706,9 @@ where
 				if chat_active(state.submit_pending, bus.phase()) {
 					send_backend(
 						backend,
-						BackendEvent::Error(Str::new_static(
-							"Wait for the active turn to finish before logging in.",
-						)),
+						BackendEvent::Error(
+							sf!("Wait for the active turn to finish before logging in.",),
+						),
 					);
 				} else {
 					handle_login(backend, auth, provider, state);
@@ -732,7 +722,7 @@ where
 				if chat_active(state.submit_pending, bus.phase()) {
 					send_backend(
 						backend,
-						BackendEvent::Error(Str::new_static(
+						BackendEvent::Error(sf!(
 							"Wait for the active turn to finish before resuming another session.",
 						)),
 					);
@@ -743,7 +733,7 @@ where
 						},
 						Err(error) => send_backend(
 							backend,
-							BackendEvent::Error(fmts!("Could not list sessions: {error}")),
+							BackendEvent::Error(sf!("Could not list sessions: {error}")),
 						),
 					}
 				}
@@ -752,7 +742,7 @@ where
 				if chat_active(state.submit_pending, bus.phase()) {
 					send_backend(
 						backend,
-						BackendEvent::Error(Str::new_static(
+						BackendEvent::Error(sf!(
 							"Wait for the active turn to finish before starting a new session.",
 						)),
 					);
@@ -764,7 +754,7 @@ where
 				let mut jobs: Vec<_> = state.jobs.iter().map(Str::as_str).collect();
 				jobs.sort_unstable();
 				let message = if jobs.is_empty() {
-					Str::new_static("No active background jobs.")
+					sf!("No active background jobs.")
 				} else {
 					Str::from(format!(
 						"**Active jobs ({})**\n{}",
@@ -786,7 +776,7 @@ where
 				}
 				send_backend(
 					backend,
-					BackendEvent::Notice(Str::new_static(if state.live_enabled {
+					BackendEvent::Notice(sf!(if state.live_enabled {
 						"Live activity waveform enabled."
 					} else {
 						"Live activity waveform disabled."
@@ -801,7 +791,7 @@ where
 			Ok(ChatCommand::Agents) => send_backend(backend, BackendEvent::OpenAgentTree),
 			Ok(ChatCommand::Pause) => send_backend(backend, BackendEvent::Pause),
 			Ok(ChatCommand::Unavailable { command, reason }) => {
-				send_backend(backend, BackendEvent::Error(fmts!("/{command} unavailable: {reason}")))
+				send_backend(backend, BackendEvent::Error(sf!("/{command} unavailable: {reason}")))
 			},
 			Ok(ChatCommand::Quit) => {
 				if chat_active(state.submit_pending, bus.phase()) {
@@ -813,7 +803,7 @@ where
 				if auth.is_some_and(ChatAuth::is_active) {
 					send_backend(
 						backend,
-						BackendEvent::Error(Str::new_static(
+						BackendEvent::Error(sf!(
 							"Wait for provider authentication to finish before submitting.",
 						)),
 					);
@@ -833,7 +823,7 @@ where
 							.try_enqueue(Interrupt {
 								class: active_submit_class(mode),
 								item,
-								source: InterruptSource::Producer(Str::new_static("user")),
+								source: InterruptSource::Producer(sf!("user")),
 							})
 							.is_ok();
 						if !delivered {
@@ -858,10 +848,7 @@ where
 					} else {
 						state.submit_pending = false;
 						state.pending_prompt = None;
-						send_backend(
-							backend,
-							BackendEvent::Error(Str::new_static("Agent input channel is closed.")),
-						);
+						send_backend(backend, BackendEvent::Error(sf!("Agent input channel is closed.")));
 					}
 				}
 			},
@@ -876,9 +863,7 @@ where
 			if chat_active(state.submit_pending, bus.phase()) {
 				send_backend(
 					backend,
-					BackendEvent::Error(Str::new_static(
-						"Wait for the active turn to finish before rewinding.",
-					)),
+					BackendEvent::Error(sf!("Wait for the active turn to finish before rewinding.",)),
 				);
 			} else {
 				let (reply_tx, reply_rx) = flume::bounded(1);
@@ -887,10 +872,7 @@ where
 					.await
 					.is_err()
 				{
-					send_backend(
-						backend,
-						BackendEvent::Error(Str::new_static("Agent input channel is closed.")),
-					);
+					send_backend(backend, BackendEvent::Error(sf!("Agent input channel is closed.")));
 				} else {
 					match reply_rx.recv_async().await {
 						Ok(Ok(targets)) => {
@@ -912,7 +894,7 @@ where
 						Ok(Err(error)) => send_backend(backend, BackendEvent::Error(Str::from(error))),
 						Err(_) => send_backend(
 							backend,
-							BackendEvent::Error(Str::new_static("Agent rewind reply channel is closed.")),
+							BackendEvent::Error(sf!("Agent rewind reply channel is closed.")),
 						),
 					}
 				}
@@ -931,10 +913,7 @@ where
 					.await
 					.is_err()
 				{
-					send_backend(
-						backend,
-						BackendEvent::Error(Str::new_static("Agent input channel is closed.")),
-					);
+					send_backend(backend, BackendEvent::Error(sf!("Agent input channel is closed.")));
 				} else {
 					match reply_rx.recv_async().await {
 						Ok(Ok(items)) => {
@@ -952,16 +931,14 @@ where
 						Ok(Err(error)) => send_backend(backend, BackendEvent::Error(Str::from(error))),
 						Err(_) => send_backend(
 							backend,
-							BackendEvent::Error(Str::new_static("Agent rewind reply channel is closed.")),
+							BackendEvent::Error(sf!("Agent rewind reply channel is closed.")),
 						),
 					}
 				}
 			} else {
 				send_backend(
 					backend,
-					BackendEvent::Error(Str::new_static(
-						"The selected rewind target is no longer available.",
-					)),
+					BackendEvent::Error(sf!("The selected rewind target is no longer available.",)),
 				);
 			}
 		},
@@ -972,9 +949,7 @@ where
 			if chat_active(state.submit_pending, bus.phase()) {
 				send_backend(
 					backend,
-					BackendEvent::Error(Str::new_static(
-						"Wait for the active turn to finish before logging in.",
-					)),
+					BackendEvent::Error(sf!("Wait for the active turn to finish before logging in.",)),
 				);
 			} else {
 				handle_login(backend, auth, provider, state);
@@ -984,7 +959,7 @@ where
 			if chat_active(state.submit_pending, bus.phase()) {
 				send_backend(
 					backend,
-					BackendEvent::Error(Str::new_static(
+					BackendEvent::Error(sf!(
 						"Wait for the active turn to finish before resuming another session.",
 					)),
 				);
@@ -995,7 +970,7 @@ where
 					},
 					Err(error) => send_backend(
 						backend,
-						BackendEvent::Error(fmts!("Could not list sessions: {error}")),
+						BackendEvent::Error(sf!("Could not list sessions: {error}")),
 					),
 				}
 			}
@@ -1007,10 +982,7 @@ where
 					send_backend(backend, BackendEvent::Error(Str::from(error)));
 				}
 			} else {
-				send_backend(
-					backend,
-					BackendEvent::Error(Str::new_static("No authentication prompt is active.")),
-				);
+				send_backend(backend, BackendEvent::Error(sf!("No authentication prompt is active.")));
 			}
 		},
 		Intent::AuthCancel => {
@@ -1042,7 +1014,7 @@ fn handle_login(
 	state: &BridgeState,
 ) {
 	let Some(auth) = auth else {
-		send_backend(backend, BackendEvent::Error(Str::new_static(GATEWAY_LOGIN_MESSAGE)));
+		send_backend(backend, BackendEvent::Error(sf!(GATEWAY_LOGIN_MESSAGE)));
 		return;
 	};
 	if let Some(requested) = requested {
@@ -1050,7 +1022,7 @@ fn handle_login(
 			Ok(provider) => match auth.start(provider.clone()) {
 				Ok(()) => send_backend(
 					backend,
-					BackendEvent::Notice(fmts!("Starting authentication for `{provider}`…")),
+					BackendEvent::Notice(sf!("Starting authentication for `{provider}`…")),
 				),
 				Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error))),
 			},
@@ -1072,13 +1044,10 @@ fn handle_auth_event(
 ) {
 	match event {
 		ChatAuthEvent::Url(url) => {
-			send_backend(backend, BackendEvent::Notice(fmts!("[open to authorize]({url})")));
+			send_backend(backend, BackendEvent::Notice(sf!("[open to authorize]({url})")));
 		},
 		ChatAuthEvent::DeviceCode { code, url } => {
-			send_backend(
-				backend,
-				BackendEvent::Notice(fmts!("Enter code `{code}` at [{url}]({url})")),
-			);
+			send_backend(backend, BackendEvent::Notice(sf!("Enter code `{code}` at [{url}]({url})")));
 		},
 		ChatAuthEvent::Prompt { message, kind } => {
 			state.pending_auth_kind = Some(kind);
@@ -1096,10 +1065,7 @@ fn handle_auth_event(
 		ChatAuthEvent::CredentialStorageLocked => {
 			state.pending_auth_kind = None;
 			send_backend(backend, BackendEvent::AuthPromptClose);
-			send_backend(
-				backend,
-				BackendEvent::Error(Str::new_static(CREDENTIAL_STORAGE_LOCKED_MESSAGE)),
-			);
+			send_backend(backend, BackendEvent::Error(sf!(CREDENTIAL_STORAGE_LOCKED_MESSAGE)));
 		},
 		ChatAuthEvent::Failed(message) => {
 			state.pending_auth_kind = None;
@@ -1161,7 +1127,7 @@ fn handle_agent_event(
 						backend,
 						BackendEvent::TranscriptFrame(TranscriptFrame {
 							kind:   TranscriptFrameKind::Recovery,
-							title:  fmts!("Recovered on attempt {}", state.attempt),
+							title:  sf!("Recovered on attempt {}", state.attempt),
 							detail: None,
 						}),
 					);
@@ -1175,7 +1141,7 @@ fn handle_agent_event(
 						backend,
 						BackendEvent::TranscriptFrame(TranscriptFrame {
 							kind:   TranscriptFrameKind::Recovery,
-							title:  fmts!("Retry attempt {}", attempt.number),
+							title:  sf!("Retry attempt {}", attempt.number),
 							detail: None,
 						}),
 					);
@@ -1189,7 +1155,7 @@ fn handle_agent_event(
 					if start.kind == part_start::Kind::Thinking as i32 {
 						send_backend(backend, BackendEvent::AssistantDelta {
 							id:   id.clone(),
-							text: Str::new_static("*Thinking:* "),
+							text: sf!("*Thinking:* "),
 						});
 					}
 					state.active_parts.insert(start.index, id);
@@ -1293,7 +1259,7 @@ fn handle_agent_event(
 				backend,
 				BackendEvent::TranscriptFrame(TranscriptFrame {
 					kind:   TranscriptFrameKind::Error,
-					title:  Str::new_static("Agent error"),
+					title:  sf!("Agent error"),
 					detail: Some(message.clone()),
 				}),
 			);
@@ -1385,7 +1351,7 @@ fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, seri
 					.and_then(|text| text.strip_suffix("</attachment>"))
 				{
 					let lines = attachment.bytes().filter(|byte| *byte == b'\n').count() + 1;
-					chips.push(fmts!("paste · {lines} lines"));
+					chips.push(sf!("paste · {lines} lines"));
 				} else {
 					text_parts.push(text.as_str());
 				}
@@ -1431,18 +1397,18 @@ fn lower_attachments(
 				let bytes = match std::fs::read(source.as_str()) {
 					Ok(bytes) => bytes,
 					Err(error) => {
-						report(fmts!("Could not attach image `{source}`: {error}"));
+						report(sf!("Could not attach image `{source}`: {error}"));
 						continue;
 					},
 				};
 				if bytes.len() > MAX_ATTACHMENT_BYTES {
-					report(fmts!(
+					report(sf!(
 						"Image `{source}` is larger than the 8 MiB attachment limit and was skipped."
 					));
 					continue;
 				}
 				let Some(mime) = image_mime(source.as_str()) else {
-					report(fmts!("Image `{source}` has an unsupported file type and was skipped."));
+					report(sf!("Image `{source}` has an unsupported file type and was skipped."));
 					continue;
 				};
 				let size = bytes.len() as u64;
@@ -1458,7 +1424,7 @@ fn lower_attachments(
 				parts.push(Part { kind: Some(part::Kind::Blob(blob)) });
 			},
 			AttachmentContent::Text { text, lines, .. } => {
-				chips.push(fmts!("paste · {lines} lines"));
+				chips.push(sf!("paste · {lines} lines"));
 				parts.push(Part {
 					kind: Some(part::Kind::Text(format!("<attachment>{text}</attachment>"))),
 				});
@@ -1487,7 +1453,7 @@ fn image_mime(path: &str) -> Option<&'static str> {
 }
 
 fn blob_label(blob: &Blob) -> Str {
-	fmts!("image {} · {} KB", blob.mime, blob.size.div_ceil(1024))
+	sf!("image {} · {} KB", blob.mime, blob.size.div_ceil(1024))
 }
 
 fn item_tool_identity(item: &Item, name: &str) -> Option<ToolIdentity> {
@@ -1513,7 +1479,7 @@ fn durable_tool_identity(item: &Item) -> Option<ToolIdentity> {
 }
 
 fn missing_identity(name: &str) -> ToolIdentity {
-	ToolIdentity { name: Str::from(name), rev: Rev { family: Str::new_static(""), n: 0 } }
+	ToolIdentity { name: Str::from(name), rev: Rev { family: Default::default(), n: 0 } }
 }
 
 fn missing_tool_identity(item: &Item) -> ToolIdentity {
@@ -1606,7 +1572,7 @@ fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
 				.and_then(|header| header.strip_prefix('['))
 				.and_then(|header| header.split_once('#').map(|(path, _)| path))
 		});
-	detail.map_or_else(|| name.clone(), |detail| fmts!("{name} · {detail}"))
+	detail.map_or_else(|| name.clone(), |detail| sf!("{name} · {detail}"))
 }
 
 fn send_tool_result_images(backend: &flume::Sender<BackendEvent>, call_id: &Str, item: &Item) {
@@ -1742,7 +1708,7 @@ fn provider_rows(catalog: &Catalog, current: Option<&str>) -> Vec<SessionRow> {
 		.map(|(provider, oauth, _)| SessionRow {
 			id:     Str::from(provider.id.as_str()),
 			label:  provider.name.clone(),
-			detail: Str::new_static(if oauth { "OAuth" } else { "API key" }),
+			detail: sf!(if oauth { "OAuth" } else { "API key" }),
 		})
 		.collect()
 }
@@ -1786,12 +1752,12 @@ fn switch_model(
 			if let Err(error) = state.settings.save(data_dir) {
 				send_backend(
 					backend,
-					BackendEvent::Error(fmts!("Could not save the default model: {error}")),
+					BackendEvent::Error(sf!("Could not save the default model: {error}")),
 				);
 			}
 			send_models_updated(backend, state);
 		},
-		None => send_backend(backend, BackendEvent::Error(fmts!("Unknown model: {selector}"))),
+		None => send_backend(backend, BackendEvent::Error(sf!("Unknown model: {selector}"))),
 	}
 }
 
@@ -1829,12 +1795,12 @@ fn model_uses_subscription(catalog: &Catalog, selector: &str) -> bool {
 fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str> {
 	let provider_id = ProviderId::from(requested.as_str());
 	let Some(provider) = catalog.provider(&provider_id) else {
-		return Err(fmts!(
+		return Err(sf!(
 			"Unknown provider `{requested}`. Use `/login` to choose an available provider."
 		));
 	};
 	if !provider_supports_login(catalog, provider) {
-		return Err(fmts!(
+		return Err(sf!(
 			"Provider `{}` does not support interactive authentication. Use `/login` to choose \
 			 another provider.",
 			provider.id
@@ -2034,8 +2000,8 @@ mod tests {
 		let mut item = input::user_message("typed");
 		let attachment = Attachment {
 			content: AttachmentContent::Text {
-				text:    Str::from("pasted"),
-				snippet: Str::from("pasted"),
+				text:    sf!("pasted"),
+				snippet: sf!("pasted"),
 				lines:   1,
 				chars:   6,
 			},
@@ -2109,7 +2075,7 @@ mod tests {
 			})),
 			..Default::default()
 		};
-		send_tool_result_images(&tx, &Str::from("call-1"), &item);
+		send_tool_result_images(&tx, &sf!("call-1"), &item);
 		let events: Vec<_> = rx.drain().collect();
 		let Some(BackendEvent::ToolImage { id, source }) = events.first() else {
 			panic!("PNG blob produces a ToolImage event");
@@ -2141,7 +2107,7 @@ mod tests {
 			})),
 			..Default::default()
 		};
-		send_tool_result_images(&tx, &Str::from("call-2"), &item);
+		send_tool_result_images(&tx, &sf!("call-2"), &item);
 		assert!(rx.is_empty());
 	}
 
@@ -2179,12 +2145,12 @@ mod tests {
 				.and_then(|outcome| outcome.get("kind"))
 				.and_then(serde_json::Value::as_str)
 				.unwrap_or("live");
-			Some(fmts!("<row>{}:{}:{branch}</row>", self.0, state.updates))
+			Some(sf!("<row>{}:{}:{branch}</row>", self.0, state.updates))
 		}
 	}
 
 	fn test_identity(rev: &str) -> ToolIdentity {
-		ToolIdentity { name: Str::from("same"), rev: rev.parse().expect("valid test revision") }
+		ToolIdentity { name: sf!("same"), rev: rev.parse().expect("valid test revision") }
 	}
 
 	fn json_proto(value: serde_json::Value) -> omp_proto::inference::v1::Value {

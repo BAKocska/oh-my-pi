@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, iter::FusedIterator};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::{Map, Value, json, value::RawValue};
 use smallvec::SmallVec;
 
@@ -133,7 +133,7 @@ pub struct Oai;
 
 impl Dialect for Oai {
 	fn id(&self) -> DialectId {
-		DialectId(Str::new_static("oai"))
+		DialectId(sf!("oai"))
 	}
 
 	fn default_item(&self, ctx: DefaultCtx<'_>, rev: Rev) -> Value {
@@ -193,7 +193,7 @@ pub struct Ant;
 
 impl Dialect for Ant {
 	fn id(&self) -> DialectId {
-		DialectId(Str::new_static("ant"))
+		DialectId(sf!("ant"))
 	}
 
 	fn default_item(&self, ctx: DefaultCtx<'_>, rev: Rev) -> Value {
@@ -274,7 +274,7 @@ pub fn diff(default: &Value, actual: &Value) -> BTreeMap<Str, Box<RawValue>> {
 			.map(Str::new)
 			.collect::<SmallVec<Str, 4>>();
 		if !omit.is_empty() {
-			fields.insert(Str::new_static("~omit"), to_raw(&omit));
+			fields.insert(sf!("~omit"), to_raw(&omit));
 		}
 	}
 	fields
@@ -306,7 +306,7 @@ pub(crate) fn insert_marker<T: serde::Serialize>(
 	key: &'static str,
 	value: &T,
 ) {
-	fields.insert(Str::new_static(key), to_raw(value));
+	fields.insert(sf!(key), to_raw(value));
 }
 
 fn to_raw<T: serde::Serialize + ?Sized>(value: &T) -> Box<RawValue> {

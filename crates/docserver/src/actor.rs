@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use parking_lot::{Mutex, MutexGuard};
 use rand::RngExt as _;
 use tokio::sync::{Mutex as AsyncMutex, broadcast, oneshot};
@@ -449,7 +449,7 @@ impl DocumentStore {
 		if maps.rebind_reservations.contains_key(&canonical) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(canonical.to_string_lossy()),
-				reason: Str::new_static("document path is reserved by an in-flight move"),
+				reason: sf!("document path is reserved by an in-flight move"),
 			});
 		}
 		if let Some(document_id) = maps.by_path.get(&canonical).copied() {
@@ -485,9 +485,7 @@ impl DocumentStore {
 						.copied()
 						.ok_or_else(|| Error::InvalidTarget {
 							target: Str::new(path.to_string_lossy()),
-							reason: Str::new_static(
-								"path reads require an already-canonical active document path",
-							),
+							reason: sf!("path reads require an already-canonical active document path",),
 						})?;
 				maps
 					.by_id
@@ -531,7 +529,7 @@ impl DocumentStore {
 		if !new_path.is_absolute() || !new_path.starts_with(self.inner.config.environment_root()) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(new_path.to_string_lossy()),
-				reason: Str::new_static("rebind path must be canonical and confined"),
+				reason: sf!("rebind path must be canonical and confined"),
 			});
 		}
 		let mut maps = self.inner.lock_maps();
@@ -543,7 +541,7 @@ impl DocumentStore {
 		{
 			return Err(Error::InvalidTarget {
 				target: Str::new(new_path.to_string_lossy()),
-				reason: Str::new_static("rebind destination is already active or reserved"),
+				reason: sf!("rebind destination is already active or reserved"),
 			});
 		}
 		maps
@@ -581,7 +579,7 @@ impl DocumentStore {
 		if matches!(expectation, DestinationExpectation::Revision(_)) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(path.to_string_lossy()),
-				reason: Str::new_static("move destination revision is not active"),
+				reason: sf!("move destination revision is not active"),
 			});
 		}
 		self.reserve_rebind_path(document_id, path)
@@ -705,7 +703,7 @@ impl RegistryInner {
 		{
 			return Err(Error::InvalidTarget {
 				target: Str::new(path.to_string_lossy()),
-				reason: Str::new_static("move destination became active or changed"),
+				reason: sf!("move destination became active or changed"),
 			});
 		}
 		maps.by_id.remove(&incumbent);
@@ -1710,7 +1708,7 @@ impl DocumentActor {
 		if current.head().presence() != DocumentPresence::Present {
 			let _ = reply.send(Err(Error::InvalidTarget {
 				target: Str::new(self.path.to_string_lossy()),
-				reason: Str::new_static("cannot set permissions on a missing document"),
+				reason: sf!("cannot set permissions on a missing document"),
 			}));
 			return;
 		}
@@ -1802,7 +1800,7 @@ impl DocumentActor {
 				.sequence()
 				.checked_add(1)
 				.ok_or_else(|| Error::InvalidContent {
-					reason: Str::new_static("document revision sequence exhausted"),
+					reason: sf!("document revision sequence exhausted"),
 				})?;
 		let (snapshot, fingerprint) = snapshot_from_disk(self.document_id, sequence, disk, None)?;
 		let presence = snapshot.head().presence();
@@ -2095,9 +2093,7 @@ impl DocumentActor {
 		{
 			return Err(Error::InvalidTarget {
 				target: Str::new(path.to_string_lossy()),
-				reason: Str::new_static(
-					"move destination is active or does not match its precondition",
-				),
+				reason: sf!("move destination is active or does not match its precondition",),
 			});
 		}
 		let registry = self.registry.upgrade().ok_or_else(actor_unavailable)?;
@@ -2413,7 +2409,7 @@ impl DocumentActor {
 				.sequence()
 				.checked_add(1)
 				.ok_or_else(|| Error::InvalidContent {
-					reason: Str::new_static("document revision sequence exhausted"),
+					reason: sf!("document revision sequence exhausted"),
 				})?;
 		let (snapshot, fingerprint) =
 			snapshot_from_disk(self.document_id, sequence, disk, Some(metadata.kind))?;
@@ -2539,7 +2535,7 @@ fn random_id_bytes() -> [u8; 16] {
 }
 
 fn join_error(error: tokio::task::JoinError) -> Error {
-	Error::Protocol { reason: fmts!("document worker failed: {error}") }
+	Error::Protocol { reason: sf!("document worker failed: {error}") }
 }
 
 const fn actor_unavailable() -> Error {

@@ -16,7 +16,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{CowBytes, Duration as CoreDuration, DurationUnit, RestartReason, Str};
+use omp_core::{CowBytes, Duration as CoreDuration, DurationUnit, RestartReason, Str, sf};
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt},
 	prost::Message,
@@ -277,7 +277,7 @@ impl ExtHostConfig {
 			workspace_root: None,
 			extensions: Vec::new(),
 			schema_rev: omp_proto::SCHEMA_REV,
-			python_rev: Str::new_static(PYTHON_REV),
+			python_rev: sf!(PYTHON_REV),
 			max_frame_bytes: NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES)
 				.expect("the default worker frame limit is nonzero"),
 			health_timeout: Duration::from_secs(5),
@@ -486,12 +486,10 @@ impl WorkerInvocation {
 	pub fn arg_text(&self, frame: ArgText) -> Result<(), WorkerError> {
 		self.validate_environment_id(frame.invocation_id.as_str())?;
 		if !self.streams_args {
-			return Err(WorkerError::Protocol(Str::new_static(
-				"tool declaration did not enable streams_args",
-			)));
+			return Err(WorkerError::Protocol(sf!("tool declaration did not enable streams_args",)));
 		}
 		if self.committed {
-			return Err(WorkerError::Protocol(Str::new_static("ArgText arrived after ArgsCommitted")));
+			return Err(WorkerError::Protocol(sf!("ArgText arrived after ArgsCommitted")));
 		}
 		self
 			.commands
@@ -510,17 +508,17 @@ impl WorkerInvocation {
 	pub fn args_committed(&mut self, frame: ArgsCommitted) -> Result<(), WorkerError> {
 		self.validate_environment_id(frame.invocation_id.as_str())?;
 		if self.committed {
-			return Err(WorkerError::Protocol(Str::new_static("ArgsCommitted was already forwarded")));
+			return Err(WorkerError::Protocol(sf!("ArgsCommitted was already forwarded")));
 		}
 		let narrowed = frame
 			.effects
 			.as_ref()
 			.map(omp_tool::Effects::try_from)
 			.transpose()
-			.map_err(|_| WorkerError::Protocol(Str::new_static("ArgsCommitted effects are invalid")))?
+			.map_err(|_| WorkerError::Protocol(sf!("ArgsCommitted effects are invalid")))?
 			.unwrap_or_default();
 		if !narrowed.is_subset_of(&self.maximum_effects) {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"ArgsCommitted effects exceed the registered tool maximum",
 			)));
 		}
@@ -556,7 +554,7 @@ impl WorkerInvocation {
 	pub fn interrupt(&self, frame: Interrupt) -> Result<(), WorkerError> {
 		self.validate_environment_id(frame.invocation_id.as_str())?;
 		if self.terminal || self.cancel_requested {
-			return Err(WorkerError::Protocol(Str::new_static("invocation is already terminal")));
+			return Err(WorkerError::Protocol(sf!("invocation is already terminal")));
 		}
 		self
 			.commands
@@ -570,9 +568,7 @@ impl WorkerInvocation {
 	/// Returns a typed protocol error for a stale call id or stopped actor.
 	pub fn reply_pull(&self, reply: PullReply) -> Result<(), WorkerError> {
 		if reply.call_id != self.invocation_id.as_str() {
-			return Err(WorkerError::Protocol(Str::new_static(
-				"PullReply call id does not match invocation",
-			)));
+			return Err(WorkerError::Protocol(sf!("PullReply call id does not match invocation",)));
 		}
 		self
 			.commands
@@ -584,9 +580,7 @@ impl WorkerInvocation {
 		if invocation_id == self.invocation_id.as_str() {
 			Ok(())
 		} else {
-			Err(WorkerError::Protocol(Str::new_static(
-				"stale invocation id does not match worker handle",
-			)))
+			Err(WorkerError::Protocol(sf!("stale invocation id does not match worker handle",)))
 		}
 	}
 
@@ -610,7 +604,7 @@ impl Drop for WorkerInvocation {
 		if !self.terminal && !self.cancel_requested {
 			let _ = self.commands.send(SupervisorCommand::Cancel {
 				id:     self.id,
-				reason: Str::new_static("invocation guard dropped"),
+				reason: sf!("invocation guard dropped"),
 			});
 		}
 		if let Some(authority) = &self.data_authority {
@@ -677,7 +671,7 @@ impl ExtHostSupervisor {
 		for extension in config.extensions.iter().cloned() {
 			validate_extension_spec(&extension)?;
 			if !identities.insert(extension.key.clone()) {
-				return Err(WorkerError::Protocol(Str::new_static(
+				return Err(WorkerError::Protocol(sf!(
 					"extension host identity is configured more than once",
 				)));
 			}
@@ -741,9 +735,8 @@ impl ExtHostSupervisor {
 				{
 					effects.unwrap_or_default()
 				} else {
-					registration_error = Some(WorkerError::Protocol(Str::new_static(
-						"registered tool effects are invalid",
-					)));
+					registration_error =
+						Some(WorkerError::Protocol(sf!("registered tool effects are invalid",)));
 					break 'registration;
 				};
 				let route = (Str::from(definition.name.as_str()), Str::from(declaration.rev.as_str()));
@@ -759,7 +752,7 @@ impl ExtHostSupervisor {
 					)
 					.is_some()
 				{
-					registration_error = Some(WorkerError::Protocol(Str::new_static(
+					registration_error = Some(WorkerError::Protocol(sf!(
 						"two extension hosts registered the same tool name and revision",
 					)));
 					break 'registration;
@@ -853,10 +846,10 @@ impl ExtHostSupervisor {
 	pub fn bind_journal_runtime(&self, id: u64, runtime: JournalRuntime) -> Result<(), WorkerError> {
 		let mut slot = self.journal_runtime.lock();
 		if slot.binding.is_some() {
-			return Err(WorkerError::Protocol(Str::new_static("journal runtime is already bound")));
+			return Err(WorkerError::Protocol(sf!("journal runtime is already bound")));
 		}
 		if self.children_active.load(Ordering::Acquire) && !slot.was_bound {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"journal runtime must be bound before the first extension child is active",
 			)));
 		}
@@ -1170,7 +1163,7 @@ impl ProcessConfig {
 			.iter()
 			.any(|extension| extension.python_site != python_site)
 		{
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"extensions in an explicit pool must use the same Python site",
 			)));
 		}
@@ -1181,7 +1174,7 @@ impl ProcessConfig {
 			.iter()
 			.any(|extension| extension.data_socket != data_socket)
 		{
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"extensions in an explicit pool must use the same scoped DATA socket",
 			)));
 		}
@@ -1194,7 +1187,7 @@ impl ProcessConfig {
 				.chain(extension.manifest.declaration_modules.iter().cloned())
 			{
 				if !modules_seen.insert(module.clone()) {
-					return Err(WorkerError::Protocol(Str::new_static(
+					return Err(WorkerError::Protocol(sf!(
 						"an extension declaration module is configured more than once in one host",
 					)));
 				}
@@ -1221,7 +1214,7 @@ impl ProcessConfig {
 			interrupt_grace: root
 				.interrupt_grace
 				.to_std()
-				.map_err(|_| WorkerError::Protocol(Str::new_static("interrupt grace is too large")))?,
+				.map_err(|_| WorkerError::Protocol(sf!("interrupt grace is too large")))?,
 			initial_backoff: root.initial_backoff,
 			max_backoff: root.max_backoff,
 			healthy_reset: root.healthy_reset,
@@ -1241,7 +1234,7 @@ impl ProcessConfig {
 			.find(|owner| owner.extension().as_str() == declaration.extension_id)
 			.cloned()
 			.ok_or_else(|| {
-				WorkerError::Protocol(Str::new_static(
+				WorkerError::Protocol(sf!(
 					"worker registered a declaration for an unconfigured extension",
 				))
 			})
@@ -1255,7 +1248,7 @@ fn validate_extension_spec(spec: &ExtHostSpec) -> Result<(), WorkerError> {
 		|| spec.manifest.entry.is_empty()
 		|| spec.pool.as_ref().is_some_and(Str::is_empty)
 	{
-		return Err(WorkerError::Protocol(Str::new_static(
+		return Err(WorkerError::Protocol(sf!(
 			"extension host identity, manifest entry, and explicit pool names must be nonempty",
 		)));
 	}
@@ -1263,7 +1256,7 @@ fn validate_extension_spec(spec: &ExtHostSpec) -> Result<(), WorkerError> {
 		|| spec.manifest.provenance.layer() != spec.key.layer().as_str()
 		|| spec.manifest.provenance.tier() != spec.key.tier().as_str()
 	{
-		return Err(WorkerError::Protocol(Str::new_static(
+		return Err(WorkerError::Protocol(sf!(
 			"extension manifest provenance does not match its authenticated host key",
 		)));
 	}
@@ -1361,11 +1354,11 @@ impl WorkerProcess {
 		let stdin = child
 			.stdin
 			.take()
-			.ok_or_else(|| WorkerError::Protocol(Str::new_static("worker stdin unavailable")))?;
+			.ok_or_else(|| WorkerError::Protocol(sf!("worker stdin unavailable")))?;
 		let stdout = child
 			.stdout
 			.take()
-			.ok_or_else(|| WorkerError::Protocol(Str::new_static("worker stdout unavailable")))?;
+			.ok_or_else(|| WorkerError::Protocol(sf!("worker stdout unavailable")))?;
 		let mut process = Self {
 			child,
 			stdin,
@@ -1389,10 +1382,10 @@ impl WorkerProcess {
 	) -> Result<(), WorkerError> {
 		let hello_frame = self.read_timeout(config).await?;
 		let Some(worker_frame::Body::Hello(hello)) = hello_frame.body else {
-			return Err(WorkerError::Protocol(Str::new_static("WorkerHello must be the first frame")));
+			return Err(WorkerError::Protocol(sf!("WorkerHello must be the first frame")));
 		};
 		if hello.worker_id.is_empty() {
-			return Err(WorkerError::Protocol(Str::new_static("WorkerHello has no worker id")));
+			return Err(WorkerError::Protocol(sf!("WorkerHello has no worker id")));
 		}
 		if hello.schema_rev != config.schema_rev {
 			return Err(WorkerError::SchemaRevision {
@@ -1414,7 +1407,7 @@ impl WorkerProcess {
 			|| hello.host_generation != generation
 			|| hello.session_generation != config.session_generation
 		{
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"WorkerHello identity or generation did not match the spawned host",
 			)));
 		}
@@ -1456,12 +1449,10 @@ impl WorkerProcess {
 			..
 		})) = registrations.body
 		else {
-			return Err(WorkerError::Protocol(Str::new_static(
-				"RegisterTools must follow WorkerHello",
-			)));
+			return Err(WorkerError::Protocol(sf!("RegisterTools must follow WorkerHello",)));
 		};
 		if registration_generation != generation {
-			return Err(WorkerError::Protocol(Str::new_static("RegisterTools generation is stale")));
+			return Err(WorkerError::Protocol(sf!("RegisterTools generation is stale")));
 		}
 		let registered_extensions = extensions
 			.iter()
@@ -1473,7 +1464,7 @@ impl WorkerProcess {
 				.keys()
 				.any(|owner| !registered_extensions.contains(owner.extension().as_str()))
 		{
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"RegisterTools extension set did not match the spawned host",
 			)));
 		}
@@ -1620,10 +1611,10 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 			let session_started_at_ms = event
 				.session_started_at
 				.duration_since(SystemTime::UNIX_EPOCH)
-				.map_err(|_| Str::new_static("session start precedes the Unix epoch"))?
+				.map_err(|_| sf!("session start precedes the Unix epoch"))?
 				.as_millis()
 				.try_into()
-				.map_err(|_| Str::new_static("session start does not fit the lifecycle wire"))?;
+				.map_err(|_| sf!("session start does not fit the lifecycle wire"))?;
 			self
 				.process
 				.write(
@@ -1663,7 +1654,7 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 					.await
 					.map_err(|error| Str::from(error.to_string()))?;
 				let Some(worker_frame::Body::Lifecycle(envelope)) = reply.body else {
-					return Err(Str::new_static("activation did not return a lifecycle envelope"));
+					return Err(sf!("activation did not return a lifecycle envelope"));
 				};
 				match envelope.body {
 					Some(lifecycle_worker_envelope::Body::ResourceQuery(query))
@@ -1683,9 +1674,7 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 							|| activated.extension_id != self.extension_id.as_str()
 							|| activated.generation != self.generation
 						{
-							return Err(Str::new_static(
-								"activation reply correlation or generation is stale",
-							));
+							return Err(sf!("activation reply correlation or generation is stale",));
 						}
 						if activated.degraded {
 							return Err(Str::from(
@@ -1697,9 +1686,7 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 						return Ok(());
 					},
 					_ => {
-						return Err(Str::new_static(
-							"activation returned an unsupported lifecycle frame",
-						));
+						return Err(sf!("activation returned an unsupported lifecycle frame",));
 					},
 				}
 			}
@@ -1717,7 +1704,7 @@ async fn send_resource_update(
 		.manifests
 		.keys()
 		.find(|owner| owner.extension().as_str() == extension_id)
-		.ok_or_else(|| WorkerError::Protocol(Str::new_static("resource query is not admitted")))?;
+		.ok_or_else(|| WorkerError::Protocol(sf!("resource query is not admitted")))?;
 	let receipt = config
 		.resources
 		.lock()
@@ -1731,10 +1718,10 @@ async fn send_resource_update(
 				.window
 				.map(CoreDuration::to_std)
 				.transpose()
-				.map_err(|_| WorkerError::Protocol(Str::new_static("quota window is too large")))?
+				.map_err(|_| WorkerError::Protocol(sf!("quota window is too large")))?
 				.map(|window| window.as_millis().try_into())
 				.transpose()
-				.map_err(|_| WorkerError::Protocol(Str::new_static("quota window is too large")))?;
+				.map_err(|_| WorkerError::Protocol(sf!("quota window is too large")))?;
 			Ok(QuotaStatus {
 				name: name.to_string(),
 				limit: status.limit,
@@ -1883,19 +1870,19 @@ async fn run_supervisor(
 							.await?;
 						let response = process.read_timeout(&config).await?;
 						let Some(worker_frame::Body::Lifecycle(envelope)) = response.body else {
-							return Err(WorkerError::Protocol(Str::new_static(
+							return Err(WorkerError::Protocol(sf!(
 								"provider did not return a lifecycle envelope",
 							)));
 						};
 						let Some(lifecycle_worker_envelope::Body::ServiceResult(result)) =
 							envelope.body
 						else {
-							return Err(WorkerError::Protocol(Str::new_static(
+							return Err(WorkerError::Protocol(sf!(
 								"provider did not return ServiceResult",
 							)));
 						};
 						if response.request_id != request_id {
-							return Err(WorkerError::Protocol(Str::new_static(
+							return Err(WorkerError::Protocol(sf!(
 								"provider ServiceResult correlation is stale",
 							)));
 						}
@@ -1960,9 +1947,7 @@ async fn dispatch_journal_control(
 	envelope: omp_proto::toolhost::v1::JournalWorkerEnvelope,
 ) -> Result<(), WorkerError> {
 	if request_id == 0 {
-		return Err(WorkerError::Protocol(Str::new_static(
-			"journal CONTROL request_id must be nonzero",
-		)));
+		return Err(WorkerError::Protocol(sf!("journal CONTROL request_id must be nonzero",)));
 	}
 	let runtime = config
 		.journal
@@ -1970,12 +1955,13 @@ async fn dispatch_journal_control(
 		.binding
 		.as_ref()
 		.map(|binding| binding.runtime.clone())
-		.ok_or_else(|| WorkerError::Protocol(Str::new_static("journal CONTROL is not installed")))?;
-	let manifest = config.manifests.get(&invocation.owner).ok_or_else(|| {
-		WorkerError::Protocol(Str::new_static("journal CONTROL owner is not admitted"))
-	})?;
+		.ok_or_else(|| WorkerError::Protocol(sf!("journal CONTROL is not installed")))?;
+	let manifest = config
+		.manifests
+		.get(&invocation.owner)
+		.ok_or_else(|| WorkerError::Protocol(sf!("journal CONTROL owner is not admitted")))?;
 	let committed = invocation.committed.as_ref().ok_or_else(|| {
-		WorkerError::Protocol(Str::new_static("journal CONTROL cannot run before ArgsCommitted"))
+		WorkerError::Protocol(sf!("journal CONTROL cannot run before ArgsCommitted"))
 	})?;
 	let identity = JournalConnectionIdentity {
 		principal: config.principal.clone(),
@@ -2056,9 +2042,7 @@ async fn dispatch_service_call(
 		|| call.host_generation != host_generation
 		|| call.session_generation != config.session_generation
 	{
-		return Err(WorkerError::Protocol(Str::new_static(
-			"service call identity or generation is stale",
-		)));
+		return Err(WorkerError::Protocol(sf!("service call identity or generation is stale",)));
 	}
 	let service = ServiceKey::new(call.service.as_str(), call.rev);
 	let (dispatch, pending) = {
@@ -2067,9 +2051,7 @@ async fn dispatch_service_call(
 			.connect(&invocation.owner, service)
 			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 		let ServiceConnection::Active(route) = connection else {
-			return Err(WorkerError::Protocol(Str::new_static(
-				"service provider requires activation",
-			)));
+			return Err(WorkerError::Protocol(sf!("service provider requires activation",)));
 		};
 		broker
 			.begin_call(
@@ -2089,15 +2071,15 @@ async fn dispatch_service_call(
 		.lock()
 		.get(&dispatch.route.provider)
 		.cloned()
-		.ok_or_else(|| WorkerError::Protocol(Str::new_static("service provider is unavailable")))?;
+		.ok_or_else(|| WorkerError::Protocol(sf!("service provider is unavailable")))?;
 	if provider.process_id == config.process_id {
-		return Err(WorkerError::Protocol(Str::new_static(
+		return Err(WorkerError::Protocol(sf!(
 			"reentrant service callback into the active worker is disabled",
 		)));
 	}
 	let provider_generation = provider.generation.load(Ordering::Acquire);
 	if provider_generation != dispatch.route.provider_generation {
-		return Err(WorkerError::Protocol(Str::new_static("service provider generation is stale")));
+		return Err(WorkerError::Protocol(sf!("service provider generation is stale")));
 	}
 	let provider_id = dispatch.id.0;
 	let provider_host = dispatch.route.provider.clone();
@@ -2127,16 +2109,14 @@ async fn dispatch_service_call(
 	let result =
 		tokio::time::timeout(Duration::from_millis(call.deadline_ms), response.recv_async())
 			.await
-			.map_err(|_| WorkerError::Protocol(Str::new_static("service call deadline elapsed")))?
+			.map_err(|_| WorkerError::Protocol(sf!("service call deadline elapsed")))?
 			.map_err(|_| WorkerError::Unavailable)??;
 	if result.caller_request_id != request_id || result.provider_generation != provider_generation {
-		return Err(WorkerError::Protocol(Str::new_static(
-			"provider ServiceResult identity is stale",
-		)));
+		return Err(WorkerError::Protocol(sf!("provider ServiceResult identity is stale",)));
 	}
 	let response = if let Some(error) = result.error {
 		if !result.payload.is_empty() {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"provider ServiceResult carries both payload and error",
 			)));
 		}
@@ -2659,7 +2639,7 @@ async fn cancel_worker(
 fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorCommand) {
 	let command = match command {
 		SupervisorCommand::ServiceDispatch { reply, .. } => {
-			let _ = reply.send(Err(WorkerError::Protocol(Str::new_static(
+			let _ = reply.send(Err(WorkerError::Protocol(sf!(
 				"provider worker is busy; reentrant callbacks are disabled",
 			))));
 			return;
@@ -2825,14 +2805,14 @@ impl TryFrom<ToolComplete> for WorkerCompletion {
 
 	fn try_from(complete: ToolComplete) -> Result<Self, Self::Error> {
 		if complete.parts.iter().any(|part| part.kind.is_none()) {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"ToolComplete contains a part without its presence discriminator",
 			)));
 		}
 		let has_json = !complete.details_json.is_empty();
 		let has_blob = complete.details_blob.is_some();
 		if has_json == has_blob {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"ToolComplete must carry exactly one of details_json or details_blob",
 			)));
 		}
@@ -2845,7 +2825,7 @@ impl TryFrom<ToolComplete> for WorkerCompletion {
 			OutcomeKind::Aborted => WorkerOutcomeKind::Aborted,
 		};
 		if matches!(kind, WorkerOutcomeKind::ArgsRejected) != complete.args_issue.is_some() {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"ToolComplete args_issue presence does not match ArgsRejected",
 			)));
 		}
@@ -2865,10 +2845,10 @@ fn validate_registrations(tools: &[ToolDecl]) -> Result<(), WorkerError> {
 	let mut names = HashSet::with_capacity(tools.len());
 	for tool in tools {
 		let Some(definition) = &tool.definition else {
-			return Err(WorkerError::Protocol(Str::new_static("registered tool has no definition")));
+			return Err(WorkerError::Protocol(sf!("registered tool has no definition")));
 		};
 		if definition.name.is_empty() || tool.rev.is_empty() {
-			return Err(WorkerError::Protocol(Str::new_static(
+			return Err(WorkerError::Protocol(sf!(
 				"registered tool name and revision must be nonempty",
 			)));
 		}
@@ -2981,12 +2961,14 @@ fn actual_declarations(
 		.iter()
 		.filter(|tool| tool.extension_id == owner.extension().as_str())
 		.map(|tool| {
-			let definition = tool.definition.as_ref().ok_or_else(|| {
-				WorkerError::Protocol(Str::new_static("registered tool has no definition"))
-			})?;
-			let rev = tool.rev.parse::<omp_tool::Rev>().map_err(|_| {
-				WorkerError::Protocol(Str::new_static("registered tool revision is not canonical"))
-			})?;
+			let definition = tool
+				.definition
+				.as_ref()
+				.ok_or_else(|| WorkerError::Protocol(sf!("registered tool has no definition")))?;
+			let rev = tool
+				.rev
+				.parse::<omp_tool::Rev>()
+				.map_err(|_| WorkerError::Protocol(sf!("registered tool revision is not canonical")))?;
 			Ok(ToolDeclarationKey::new(definition.name.as_str(), rev.family, rev.n))
 		})
 		.collect::<Result<Vec<_>, WorkerError>>()?;
@@ -3079,47 +3061,48 @@ fn install_scheme_snapshot() -> Result<(), WorkerError> {
 	let hash_values = value
 		.get("device_hash")
 		.and_then(serde_json::Value::as_array)
-		.ok_or_else(|| WorkerError::Protocol(Str::new_static("scheme snapshot has no hash")))?;
+		.ok_or_else(|| WorkerError::Protocol(sf!("scheme snapshot has no hash")))?;
 	let hash = <[u8; 32]>::try_from(
 		hash_values
 			.iter()
 			.map(|value| value.as_u64().and_then(|value| u8::try_from(value).ok()))
 			.collect::<Option<Vec<_>>>()
-			.ok_or_else(|| WorkerError::Protocol(Str::new_static("scheme snapshot hash is invalid")))?
+			.ok_or_else(|| WorkerError::Protocol(sf!("scheme snapshot hash is invalid")))?
 			.as_slice(),
 	)
-	.map_err(|_| WorkerError::Protocol(Str::new_static("scheme snapshot hash is invalid")))?;
-	let entries = value
-		.get("entries")
-		.and_then(serde_json::Value::as_array)
-		.ok_or_else(|| WorkerError::Protocol(Str::new_static("scheme snapshot has no entries")))?
-		.iter()
-		.map(|entry| {
-			let entry = entry.as_array().ok_or_else(|| {
-				WorkerError::Protocol(Str::new_static("scheme snapshot entry is invalid"))
-			})?;
-			let [member, readable, mintable, selectors, description] = entry.as_slice() else {
-				return Err(WorkerError::Protocol(Str::new_static("scheme snapshot entry is invalid")));
-			};
-			Ok((
-				Str::from(member.as_str().ok_or_else(|| {
-					WorkerError::Protocol(Str::new_static("scheme snapshot member is invalid"))
-				})?),
-				readable.as_bool().ok_or_else(|| {
-					WorkerError::Protocol(Str::new_static("scheme snapshot readable bit is invalid"))
-				})?,
-				mintable.as_bool().ok_or_else(|| {
-					WorkerError::Protocol(Str::new_static("scheme snapshot mintable bit is invalid"))
-				})?,
-				selectors.as_bool().ok_or_else(|| {
-					WorkerError::Protocol(Str::new_static("scheme snapshot selector bit is invalid"))
-				})?,
-				Str::from(description.as_str().ok_or_else(|| {
-					WorkerError::Protocol(Str::new_static("scheme snapshot description is invalid"))
-				})?),
-			))
-		})
-		.collect::<Result<Vec<_>, WorkerError>>()?;
+	.map_err(|_| WorkerError::Protocol(sf!("scheme snapshot hash is invalid")))?;
+	let entries =
+		value
+			.get("entries")
+			.and_then(serde_json::Value::as_array)
+			.ok_or_else(|| WorkerError::Protocol(sf!("scheme snapshot has no entries")))?
+			.iter()
+			.map(|entry| {
+				let entry = entry
+					.as_array()
+					.ok_or_else(|| WorkerError::Protocol(sf!("scheme snapshot entry is invalid")))?;
+				let [member, readable, mintable, selectors, description] = entry.as_slice() else {
+					return Err(WorkerError::Protocol(sf!("scheme snapshot entry is invalid")));
+				};
+				Ok((
+					Str::from(member.as_str().ok_or_else(|| {
+						WorkerError::Protocol(sf!("scheme snapshot member is invalid"))
+					})?),
+					readable.as_bool().ok_or_else(|| {
+						WorkerError::Protocol(sf!("scheme snapshot readable bit is invalid"))
+					})?,
+					mintable.as_bool().ok_or_else(|| {
+						WorkerError::Protocol(sf!("scheme snapshot mintable bit is invalid"))
+					})?,
+					selectors.as_bool().ok_or_else(|| {
+						WorkerError::Protocol(sf!("scheme snapshot selector bit is invalid"))
+					})?,
+					Str::from(description.as_str().ok_or_else(|| {
+						WorkerError::Protocol(sf!("scheme snapshot description is invalid"))
+					})?),
+				))
+			})
+			.collect::<Result<Vec<_>, WorkerError>>()?;
 	omp_py::set_scheme_snapshot(hash, entries);
 	Ok(())
 }
@@ -3182,12 +3165,10 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 		..
 	} = admit_frame
 	else {
-		return Err(WorkerError::Protocol(Str::new_static(
-			"AdmitExtensions must follow WorkerHello",
-		)));
+		return Err(WorkerError::Protocol(sf!("AdmitExtensions must follow WorkerHello",)));
 	};
 	if admitted.generation != host_generation {
-		return Err(WorkerError::Protocol(Str::new_static("AdmitExtensions generation is stale")));
+		return Err(WorkerError::Protocol(sf!("AdmitExtensions generation is stale")));
 	}
 	let admitted_modules = admitted
 		.extensions
@@ -3199,7 +3180,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			.iter()
 			.any(|module| !admitted_modules.contains_key(module.as_str()))
 	{
-		return Err(WorkerError::Protocol(Str::new_static(
+		return Err(WorkerError::Protocol(sf!(
 			"AdmitExtensions modules differ from the spawned worker configuration",
 		)));
 	}
@@ -3255,9 +3236,8 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 		request_id: u64,
 		dispatch: &WireServiceDispatch,
 	) -> Result<Vec<u8>, WorkerError> {
-		let payload = std::str::from_utf8(&dispatch.payload).map_err(|_| {
-			WorkerError::Protocol(Str::new_static("service payload is not UTF-8 JSON"))
-		})?;
+		let payload = std::str::from_utf8(&dispatch.payload)
+			.map_err(|_| WorkerError::Protocol(sf!("service payload is not UTF-8 JSON")))?;
 		engine
 			.attach(|py| -> PyResult<Vec<u8>> {
 				let json = PyModule::import(py, "json")?;
@@ -3302,7 +3282,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 				if freeze.generation != host_generation
 					|| !entry_modules.contains_key(freeze.extension_id.as_str())
 				{
-					return Err(WorkerError::Protocol(Str::new_static(
+					return Err(WorkerError::Protocol(sf!(
 						"FreezeDeclarations carries stale extension identity or generation",
 					)));
 				}
@@ -3370,7 +3350,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					|| dispatch.session_generation != session_generation
 					|| !entry_modules.contains_key(dispatch.provider_extension_id.as_str())
 				{
-					Err(WorkerError::Protocol(Str::new_static(
+					Err(WorkerError::Protocol(sf!(
 						"ServiceDispatch carries stale provider identity or generation",
 					)))
 				} else {
@@ -3517,13 +3497,11 @@ fn activate_python_extension(
 	activate: &ActivateExtension,
 ) -> Result<(), WorkerError> {
 	if activate.generation == 0 {
-		return Err(WorkerError::Protocol(Str::new_static(
-			"ActivateExtension generation must be nonzero",
-		)));
+		return Err(WorkerError::Protocol(sf!("ActivateExtension generation must be nonzero",)));
 	}
 	let module = entry_modules
 		.get(activate.extension_id.as_str())
-		.ok_or_else(|| WorkerError::Protocol(Str::new_static("ActivateExtension is not admitted")))?
+		.ok_or_else(|| WorkerError::Protocol(sf!("ActivateExtension is not admitted")))?
 		.clone();
 	engine
 		.attach(|py| -> PyResult<()> {
@@ -3698,7 +3676,7 @@ fn serve_invocation<W: Write>(
 	let result = engine.attach(|py| -> Result<PythonCompletion, WorkerError> {
 		let json = PyModule::import(py, "json")?;
 		let args = std::str::from_utf8(invoke.args_json.as_ref())
-			.map_err(|_| WorkerError::Python(Str::new_static("committed args are not UTF-8")))?;
+			.map_err(|_| WorkerError::Python(sf!("committed args are not UTF-8")))?;
 		let params = json.getattr("loads")?.call1((args,))?;
 		let mut value = tool.handler.bind(py).call1((params,))?;
 		let inspect = PyModule::import(py, "inspect")?;
@@ -3843,7 +3821,7 @@ fn completion_from_dict(
 		.map(|issue| {
 			let issue = issue
 				.cast::<PyDict>()
-				.map_err(|_| WorkerError::Python(Str::new_static("args_issue must be a dictionary")))?;
+				.map_err(|_| WorkerError::Python(sf!("args_issue must be a dictionary")))?;
 			python_arg_issue(issue)
 		})
 		.transpose()?;

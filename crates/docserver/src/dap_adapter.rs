@@ -5,7 +5,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::RwLock;
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -58,7 +58,7 @@ impl DapAdapterSpec {
 		let name = name.as_ref();
 		let command = command.as_ref();
 		if name.is_empty() || command.is_empty() {
-			return Err(DapAdapterError::InvalidSpec(Str::new_static(
+			return Err(DapAdapterError::InvalidSpec(sf!(
 				"adapter name and command must be non-empty",
 			)));
 		}
@@ -345,10 +345,10 @@ fn builtin_adapters() -> Vec<DapAdapterSpec> {
 			}
 			if *name == "dlv" {
 				spec.accepts_directory_program = true;
-				spec.root_markers = vec![Str::new_static("go.mod"), Str::new_static("go.work")];
+				spec.root_markers = vec![sf!("go.mod"), sf!("go.work")];
 			}
 			if *name == "debugpy" {
-				spec.root_markers = vec![Str::new_static("pyproject.toml")];
+				spec.root_markers = vec![sf!("pyproject.toml")];
 			}
 			spec
 		})

@@ -3,7 +3,7 @@
 use std::{collections::BTreeSet, fs, io, path::Path};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use omp_core::{Str, base64, encoding::hex};
+use omp_core::{Str, base64, encoding::hex, sf};
 use serde::{Deserialize, Serialize};
 
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml};
@@ -116,7 +116,7 @@ pub fn validate_grant_request(
 	declared: impl IntoIterator<Item = Str>,
 ) -> Result<bool, ExtensionError> {
 	let declared: BTreeSet<Str> = declared.into_iter().collect();
-	if request.capabilities.contains(&Str::new_static("*")) {
+	if request.capabilities.contains(&sf!("*")) {
 		return Ok(true);
 	}
 	if !request.capabilities.is_subset(&declared) {
@@ -335,17 +335,13 @@ pub fn capability_digest(
 	hard_tools: impl IntoIterator<Item = Str>,
 ) -> Str {
 	let mut entries: BTreeSet<Str> = capabilities.into_iter().collect();
-	entries.extend(
-		hard_tools
-			.into_iter()
-			.map(|tool| Str::new(format!("tools.hard:{tool}"))),
-	);
+	entries.extend(hard_tools.into_iter().map(|tool| sf!("tools.hard:{tool}")));
 	let mut hasher = blake3::Hasher::new();
 	for entry in entries {
 		hasher.update(entry.as_str().as_bytes());
 		hasher.update(b"\n");
 	}
-	Str::new(format!("b3:{}", hex::encode_n(hasher.finalize().as_bytes())))
+	sf!("b3:{}", hex::encode_n(hasher.finalize().as_bytes()))
 }
 
 /// Verifies an Ed25519 signature over `blake3 || sha256 || capability_digest`.
@@ -416,10 +412,10 @@ mod tests {
 	fn stale_revocation_fails_open_unless_strict() {
 		let list = RevocationsFile {
 			version:     1,
-			issued_at:   Str::new_static("2026-01-01T00:00:00Z"),
-			valid_until: Str::new_static("2026-01-02T00:00:00Z"),
+			issued_at:   sf!("2026-01-01T00:00:00Z"),
+			valid_until: sf!("2026-01-02T00:00:00Z"),
 			revoked:     vec![],
-			signature:   Str::new_static("ed25519:sig:"),
+			signature:   sf!("ed25519:sig:"),
 		};
 		assert_eq!(
 			list.freshness("2026-01-03T00:00:00Z", false),
@@ -433,10 +429,10 @@ mod tests {
 
 	#[test]
 	fn widened_capabilities_require_a_new_grant() {
-		let id = Str::new_static("acme.reviewer");
-		let publisher = Str::new_static("ed25519:key");
-		let old = capability_digest([Str::new_static("net")], []);
-		let widened = capability_digest([Str::new_static("net"), Str::new_static("exec")], []);
+		let id = sf!("acme.reviewer");
+		let publisher = sf!("ed25519:key");
+		let old = capability_digest([sf!("net")], []);
+		let widened = capability_digest([sf!("net"), sf!("exec")], []);
 		let grants = GrantsFile {
 			version: 1,
 			grants:  vec![Grant {
@@ -446,9 +442,9 @@ mod tests {
 				workspace:         None,
 				capability_digest: old,
 				tier:              TrustTier::Sandboxed,
-				ship:              Str::new_static("installed"),
-				granted_at:        Str::new_static("now"),
-				granted_by:        Str::new_static("interactive"),
+				ship:              sf!("installed"),
+				granted_at:        sf!("now"),
+				granted_by:        sf!("interactive"),
 			}],
 		};
 		assert!(!grant_covers(&grants, &id, &publisher, Layer::Client, None, &widened));

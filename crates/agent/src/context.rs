@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::thread::v1::{self as thread, Item, Thread};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -423,7 +423,7 @@ fn synthetic_item(text: Str, role: thread::Role) -> Item {
 }
 
 fn placeholder_item() -> Item {
-	synthetic_item("[tool result omitted by context projection]".into(), thread::Role::User)
+	synthetic_item(sf!("[tool result omitted by context projection]"), thread::Role::User)
 }
 
 #[cfg(test)]

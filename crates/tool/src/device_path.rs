@@ -46,7 +46,7 @@ impl FromStr for DevicePath {
 	type Err = DevicePathError;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		let invalid = || DevicePathError { value: Str::from(value) };
+		let invalid = || DevicePathError { value: Str::new(value) };
 		let (path, claimant) = match value.split_once('@') {
 			Some((path, claimant)) => {
 				if path.is_empty()
@@ -56,7 +56,7 @@ impl FromStr for DevicePath {
 				{
 					return Err(invalid());
 				}
-				(path, Some(Str::from(claimant)))
+				(path, Some(Str::new(claimant)))
 			},
 			None => (value, None),
 		};
@@ -69,7 +69,7 @@ impl FromStr for DevicePath {
 		{
 			return Err(invalid());
 		}
-		Ok(Self { name: Str::from(name), sub: sub.map(Str::from), claimant })
+		Ok(Self { name: Str::new(name), sub: sub.map(Str::new), claimant })
 	}
 }
 
@@ -88,7 +88,7 @@ impl fmt::Display for DevicePath {
 
 impl From<DevicePath> for Str {
 	fn from(value: DevicePath) -> Self {
-		Str::from(value.to_string())
+		Self::new(value.to_string())
 	}
 }
 

@@ -427,7 +427,7 @@ impl AccountPool {
 			})
 			.transpose()
 			.map_err(|error| AccountRegistrationError::StateStore {
-				summary: Str::from(error.to_string()),
+				summary: Str::new(error.to_string()),
 			})?;
 		let account = record.account.clone();
 		state.accounts.insert(account.clone(), record);

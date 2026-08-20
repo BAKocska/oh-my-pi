@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex, fmts};
+use omp_core::{Str, encoding::hex, sf};
 use omp_hashline::{
 	Clipboard, MismatchDetails, MismatchError, RevisionToken, compute_snapshot_tag,
 };
@@ -426,13 +426,13 @@ async fn rollback_partial_commit(
 		}
 		let source = prepared
 			.get(section)
-			.ok_or_else(|| Str::new_static("partial transaction named an unknown section"))?;
+			.ok_or_else(|| sf!("partial transaction named an unknown section"))?;
 		let source_uri = source
 			.lease
 			.head()
 			.document
 			.as_ref()
-			.ok_or_else(|| Str::new_static("prepared document omitted its source URI"))?
+			.ok_or_else(|| sf!("prepared document omitted its source URI"))?
 			.uri
 			.clone();
 		affected_paths.insert(source.path.to_string());
@@ -441,13 +441,13 @@ async fn rollback_partial_commit(
 				let head = operation
 					.head
 					.as_ref()
-					.ok_or_else(|| Str::new_static("landed write omitted its current head"))?;
+					.ok_or_else(|| sf!("landed write omitted its current head"))?;
 				compensation.push(pb::DocumentMutation {
 					document:  Some(uri_target(
 						head
 							.document
 							.as_ref()
-							.ok_or_else(|| Str::new_static("landed write omitted its URI"))?
+							.ok_or_else(|| sf!("landed write omitted its URI"))?
 							.uri
 							.clone(),
 					)),
@@ -456,7 +456,7 @@ async fn rollback_partial_commit(
 						head
 							.revision
 							.clone()
-							.ok_or_else(|| Str::new_static("landed write omitted its revision"))?,
+							.ok_or_else(|| sf!("landed write omitted its revision"))?,
 					))),
 				});
 			},
@@ -474,11 +474,11 @@ async fn rollback_partial_commit(
 				let head = operation
 					.head
 					.as_ref()
-					.ok_or_else(|| Str::new_static("landed move omitted its destination head"))?;
+					.ok_or_else(|| sf!("landed move omitted its destination head"))?;
 				let destination = head
 					.document
 					.as_ref()
-					.ok_or_else(|| Str::new_static("landed move omitted its destination URI"))?
+					.ok_or_else(|| sf!("landed move omitted its destination URI"))?
 					.uri
 					.clone();
 				if let Ok(uri) = Url::parse(&destination)
@@ -501,7 +501,7 @@ async fn rollback_partial_commit(
 							head
 								.revision
 								.clone()
-								.ok_or_else(|| Str::new_static("landed move omitted its revision"))?,
+								.ok_or_else(|| sf!("landed move omitted its revision"))?,
 						),
 					})),
 				});
@@ -516,7 +516,7 @@ async fn rollback_partial_commit(
 		.commit_transaction(rollback_id.clone(), compensation, &CancellationToken::new())
 		.await
 		.map_err(|error| {
-			fmts!(
+			sf!(
 				"rollback failed for paths {}: {}",
 				affected_paths
 					.iter()
@@ -532,7 +532,7 @@ async fn rollback_partial_commit(
 		{
 			Ok(())
 		},
-		Some(pb::commit_transaction_response::Outcome::Rejected(rejected)) => Err(fmts!(
+		Some(pb::commit_transaction_response::Outcome::Rejected(rejected)) => Err(sf!(
 			"rollback rejected for paths {}: {}",
 			affected_paths
 				.iter()
@@ -541,7 +541,7 @@ async fn rollback_partial_commit(
 				.join(", "),
 			rejected.message
 		)),
-		Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(rollback)) => Err(fmts!(
+		Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(rollback)) => Err(sf!(
 			"rollback partially failed for paths {} before operation {}: {}",
 			affected_paths
 				.iter()
@@ -551,7 +551,7 @@ async fn rollback_partial_commit(
 			rollback.failed_operation_index,
 			rollback.message
 		)),
-		Some(_) | None => Err(fmts!(
+		Some(_) | None => Err(sf!(
 			"rollback returned an invalid outcome for paths {}",
 			affected_paths
 				.iter()
@@ -602,7 +602,7 @@ pub(super) async fn read_whole(
 		.await?;
 	match response.body {
 		Some(pb::read_document_response::Body::Content(content)) => Ok(content),
-		_ => Err(super::docs::DocumentError::MalformedResponse(Str::new_static(
+		_ => Err(super::docs::DocumentError::MalformedResponse(sf!(
 			"whole document read did not return content",
 		))),
 	}
@@ -817,7 +817,7 @@ fn revision_identity(head: &pb::DocumentHead) -> Result<Str, String> {
 		.as_ref()
 		.try_into()
 		.map_err(|_| "document revision hash is not 32 bytes".to_owned())?;
-	Ok(fmts!("{}:{}", revision.sequence, hex::encode_n(hash).as_str()))
+	Ok(sf!("{}:{}", revision.sequence, hex::encode_n(hash).as_str()))
 }
 
 fn document_path(head: &pb::DocumentHead) -> Result<Str, String> {
@@ -1083,16 +1083,16 @@ fn map_rejection(rejected: &pb::TransactionRejected, base: &[u8]) -> EditFault {
 			RejectionReason::InvalidPatch { message: Str::from(rejected.message.as_str()) }
 		},
 		Ok(pb::TransactionRejectReason::PersistFailed) => RejectionReason::InvalidPatch {
-			message: fmts!("document persistence failed: {}", rejected.message),
+			message: sf!("document persistence failed: {}", rejected.message),
 		},
 		Ok(pb::TransactionRejectReason::PreconditionFailed) => RejectionReason::InvalidPatch {
-			message: fmts!("document precondition failed: {}", rejected.message),
+			message: sf!("document precondition failed: {}", rejected.message),
 		},
 		Ok(pb::TransactionRejectReason::Cancelled) => RejectionReason::InvalidPatch {
-			message: fmts!("document transaction was cancelled: {}", rejected.message),
+			message: sf!("document transaction was cancelled: {}", rejected.message),
 		},
 		Ok(pb::TransactionRejectReason::Unspecified) | Err(_) => RejectionReason::InvalidPatch {
-			message: fmts!("document transaction returned an unknown rejection: {}", rejected.message),
+			message: sf!("document transaction returned an unknown rejection: {}", rejected.message),
 		},
 	};
 	let conflicts = rejected
@@ -1316,7 +1316,7 @@ impl WriteDocuments for DocumentHost {
 				if partial.transaction_id == transaction_id =>
 			{
 				return Err(WriteCommitError::EffectsUnknown {
-					reason: fmts!(
+					reason: sf!(
 						"document transaction partially committed before operation {}: {}",
 						partial.failed_operation_index,
 						partial.message
@@ -1653,7 +1653,7 @@ async fn splice_conflict_document(
 			if partial.transaction_id == transaction_id =>
 		{
 			return Err(WriteCommitError::EffectsUnknown {
-				reason: fmts!(
+				reason: sf!(
 					"conflict splice partially committed before operation {}: {}",
 					partial.failed_operation_index,
 					partial.message

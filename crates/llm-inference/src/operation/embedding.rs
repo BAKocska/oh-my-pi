@@ -7,7 +7,7 @@ use std::{
 	task::{Context, Poll},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 
 use crate::{
@@ -279,14 +279,13 @@ fn negotiate_dimensions(
 		.constraints()
 		.is_some_and(|range| value >= range.minimum && value <= range.maximum);
 	if supported {
-		adjustments
-			.push(Adjustment::Native { feature: FeatureId(Str::from("embedding.dimensions")) });
+		adjustments.push(Adjustment::Native { feature: FeatureId(sf!("embedding.dimensions")) });
 		return Ok(setting.clone());
 	}
 	if !required && request.negotiation.vendor_option_mismatch == MismatchPolicy::DropPreferred {
 		adjustments.push(Adjustment::Dropped {
-			feature: FeatureId(Str::from("embedding.dimensions")),
-			reason:  ReasonId(Str::from("unsupported_preferred_dimensions")),
+			feature: FeatureId(sf!("embedding.dimensions")),
+			reason:  ReasonId(sf!("unsupported_preferred_dimensions")),
 		});
 		return Ok(Setting::Unset);
 	}
@@ -314,14 +313,14 @@ fn negotiate_normalization(
 		| (true, NormalizationSupport::Always)
 		| (false, NormalizationSupport::Never) => {
 			adjustments
-				.push(Adjustment::Native { feature: FeatureId(Str::from("embedding.normalization")) });
+				.push(Adjustment::Native { feature: FeatureId(sf!("embedding.normalization")) });
 			Ok((request.normalize.clone(), false))
 		},
 		(true, NormalizationSupport::Never)
 			if request.negotiation.emulation != EmulationPolicy::Forbid =>
 		{
 			adjustments.push(Adjustment::Emulated {
-				feature: FeatureId(Str::from("embedding.normalization")),
+				feature: FeatureId(sf!("embedding.normalization")),
 				method:  Emulation::ResponseTransform,
 			});
 			Ok((Setting::Unset, true))
@@ -330,8 +329,8 @@ fn negotiate_normalization(
 			&& request.negotiation.vendor_option_mismatch == MismatchPolicy::DropPreferred =>
 		{
 			adjustments.push(Adjustment::Dropped {
-				feature: FeatureId(Str::from("embedding.normalization")),
-				reason:  ReasonId(Str::from("unsupported_preferred_normalization")),
+				feature: FeatureId(sf!("embedding.normalization")),
+				reason:  ReasonId(sf!("unsupported_preferred_normalization")),
 			});
 			Ok((Setting::Unset, false))
 		},
@@ -443,8 +442,8 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		Str::from(OperationKind::Embed.to_string()),
-		ReasonId(Str::from("operation_service_mismatch")),
+		Str::new(OperationKind::Embed.to_string()),
+		ReasonId(sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
@@ -452,7 +451,7 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 fn request_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::InvalidRequest,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -460,7 +459,7 @@ fn request_error(feature: &'static str, reason: &'static str) -> Error {
 fn planning_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::CapabilityMismatch,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -472,7 +471,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]

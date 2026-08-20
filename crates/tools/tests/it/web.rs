@@ -9,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_ar::zip::Writer;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
 };
@@ -140,11 +140,7 @@ impl ReadBlobs for NoBlobs {
 		bytes: Bytes,
 		media_type: Str,
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
-		ready(Ok(BlobRef {
-			hash: Str::new_static("unused-web-blob"),
-			media_type,
-			byte_len: bytes.len() as u64,
-		}))
+		ready(Ok(BlobRef { hash: sf!("unused-web-blob"), media_type, byte_len: bytes.len() as u64 }))
 	}
 }
 
@@ -152,7 +148,7 @@ async fn read_tool_text(path: &str, responses: impl IntoIterator<Item = HttpResp
 	let tool = read::tool(WebSources(CannedHttp::from_responses(responses)), NoBlobs);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(json!({ "path": path }).to_string()))
+		.args_committed(Str::new(json!({ "path": path }).to_string()))
 		.expect("read invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
 	let [Ev::Done(ToolTerminal::Done { result, .. })] = events.as_slice() else {
@@ -178,9 +174,9 @@ async fn read_tool_text(path: &str, responses: impl IntoIterator<Item = HttpResp
 
 fn response(status: u16, content_type: &str, body: impl Into<Bytes>) -> HttpResponse {
 	HttpResponse {
-		final_url: Str::new_static("https://fixture.invalid/final"),
+		final_url: sf!("https://fixture.invalid/final"),
 		status,
-		content_type: Some(Str::from(content_type)),
+		content_type: Some(Str::new(content_type)),
 		headers: SmallVec::new(),
 		body: body.into(),
 	}
@@ -369,7 +365,7 @@ async fn raw_binary_urls_keep_image_archive_and_sqlite_specialized_dispatch() {
 	);
 	assert_eq!(image.render.content_type.as_deref(), Some("image/webp"));
 	assert_eq!(image.render.method, "image");
-	assert_eq!(image.render.notes.as_slice(), [Str::new_static("Fetched image binary")]);
+	assert_eq!(image.render.notes.as_slice(), [sf!("Fetched image binary")]);
 	let processed = image
 		.image
 		.expect("raw image retains processed media bytes");

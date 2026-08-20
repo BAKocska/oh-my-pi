@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{IntoStr, Str, encoding::base64};
+use omp_core::{IntoStr, Str, encoding::base64, sf};
 use omp_llm_catalog::{
 	OperationKind, ReasoningEffort, ServiceTier, ThinkingEffort,
 	policy::{
@@ -172,7 +172,7 @@ pub struct OpenAiChatProfile {
 impl Default for OpenAiChatProfile {
 	fn default() -> Self {
 		Self {
-			path: Str::from("/v1/chat/completions"),
+			path: sf!("/v1/chat/completions"),
 			system_role: WireRole::System,
 			multiple_system_messages: true,
 			sampling: true,
@@ -412,7 +412,7 @@ impl OpenAiChatCodec {
 			return Err(capability_error());
 		}
 		Ok(WireRequest {
-			model: Str::from(model),
+			model: Str::new(model),
 			messages,
 			stream: true,
 			stream_options: self
@@ -491,10 +491,10 @@ impl Codec for OpenAiChatCodec {
 		Ok(EncodedRequest {
 			operation:   OperationKind::Chat,
 			method:      RequestMethod::Post,
-			uri:         Str::from(uri),
+			uri:         Str::new(uri),
 			headers:     vec![RequestHeader {
-				name:  Str::from("content-type"),
-				value: Str::from("application/json"),
+				name:  sf!("content-type"),
+				value: sf!("application/json"),
 			}]
 			.into_boxed_slice(),
 			body:        crate::body::BodySource::Bytes(body),
@@ -925,8 +925,8 @@ fn lower_messages(
 			(None, None)
 		} else {
 			match profile.reasoning_history {
-				ReasoningHistoryField::ReasoningContent => (Some(Str::from(reasoning)), None),
-				ReasoningHistoryField::ReasoningText => (None, Some(Str::from(reasoning))),
+				ReasoningHistoryField::ReasoningContent => (Some(Str::new(reasoning)), None),
+				ReasoningHistoryField::ReasoningText => (None, Some(Str::new(reasoning))),
 				ReasoningHistoryField::Unsupported => return Err(capability_error()),
 			}
 		};
@@ -999,7 +999,7 @@ fn lower_tool_result_content(content: &[ToolResultContent]) -> Result<Str, Error
 			},
 		}
 	}
-	Ok(Str::from(output))
+	Ok(Str::new(output))
 }
 
 fn validate_thinking_selection(
@@ -1045,14 +1045,14 @@ fn proof_detail(value: &[u8], id: Option<Str>) -> WireReasoningReplay {
 
 fn project_call_id(profile: ToolIdWireProfile, value: &str) -> Str {
 	match profile {
-		ToolIdWireProfile::Preserve => Str::from(value),
+		ToolIdWireProfile::Preserve => Str::new(value),
 		ToolIdWireProfile::OpenAi40 => {
 			let projected: String = value
 				.chars()
 				.filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 				.take(40)
 				.collect();
-			Str::from(projected)
+			Str::new(projected)
 		},
 		ToolIdWireProfile::Mistral9 => {
 			let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -1070,7 +1070,7 @@ fn project_call_id(profile: ToolIdWireProfile, value: &str) -> Str {
 				};
 				hash /= 36;
 			}
-			Str::from(std::str::from_utf8(&output).expect("ASCII identifier"))
+			Str::new(std::str::from_utf8(&output).expect("ASCII identifier"))
 		},
 	}
 }
@@ -1097,7 +1097,7 @@ fn coalesce_system_messages(messages: &mut Vec<WireMessage>, role: WireRole) -> 
 		}
 	}
 	if let Some(index) = first {
-		messages[index].content = Some(NullableContent::Text(Str::from(text)));
+		messages[index].content = Some(NullableContent::Text(Str::new(text)));
 		for index in remove.into_iter().rev() {
 			messages.remove(index);
 		}
@@ -1682,7 +1682,7 @@ impl OpenAiChatDecoder {
 				let id = call
 					.id
 					.clone()
-					.unwrap_or_else(|| Str::from(format!("tool-{index}-{wire_index}")));
+					.unwrap_or_else(|| sf!("tool-{index}-{wire_index}"));
 				e.insert(PendingTool {
 					block,
 					id: ToolCallId::from(id.as_str()),
@@ -1865,7 +1865,7 @@ impl WireDeltaContent {
 				for part in parts {
 					output.push_str(part.text.as_str());
 				}
-				Str::from(output)
+				Str::new(output)
 			},
 		}
 	}
@@ -2140,7 +2140,7 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 	.status(status)
 	.optional_code(
 		template_effort_rejection
-			.then(|| Str::new_static(TEMPLATE_EFFORT_REJECTED_CODE))
+			.then(|| sf!(TEMPLATE_EFFORT_REJECTED_CODE))
 			.or_else(|| error.metadata.and_then(|metadata| metadata.raw))
 			.or(code),
 	)
@@ -2207,7 +2207,7 @@ fn incomplete_stream_error() -> Error {
 		RetryAction::SemanticRetry,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::new_static("openai_chat.incomplete_stream"))
+	.code(sf!("openai_chat.incomplete_stream"))
 	.committed(true)
 }
 
@@ -2222,7 +2222,7 @@ fn resource_finish_error(committed: bool) -> Error {
 		RetryAction::SemanticRetry,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::new_static("insufficient_system_resource"))
+	.code(sf!("insufficient_system_resource"))
 	.committed(committed)
 }
 
@@ -2287,7 +2287,7 @@ fn capability_error() -> Error {
 }
 
 fn tool_capability_error(reason: &'static str) -> Error {
-	capability_error().code(Str::new_static(reason))
+	capability_error().code(sf!(reason))
 }
 
 fn encoding_error(kind: ErrorKind) -> Error {

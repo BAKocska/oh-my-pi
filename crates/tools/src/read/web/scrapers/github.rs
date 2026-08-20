@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use omp_core::{Str, base64};
+use omp_core::{Str, base64, sf};
 use serde::Deserialize;
 use smallvec::SmallVec;
 use url::Url;
@@ -148,14 +148,14 @@ async fn render_blob<C: HttpClient + Sync>(
 	};
 	let (content, truncated) = finalize_output(response.text().as_ref());
 	let mut notes = SmallVec::<Str, 4>::new();
-	notes.push(Str::from(format!("Fetched raw: {raw_url}")));
+	notes.push(sf!("Fetched raw: {raw_url}"));
 	if truncated {
-		notes.push(Str::new_static("Output truncated to 500000 characters"));
+		notes.push(sf!("Output truncated to 500000 characters"));
 	}
 	Ok(Some(RenderResult {
 		content,
-		content_type: Some(Str::new_static("text/plain")),
-		method: Str::new_static("github-raw"),
+		content_type: Some(sf!("text/plain")),
+		method: sf!("github-raw"),
 		notes,
 	}))
 }
@@ -549,7 +549,7 @@ fn repo_endpoint(target: &Target, suffix: &str) -> String {
 
 fn markdown_result(content: String, method: &'static str, note: &'static str) -> RenderResult {
 	let mut result = build_result(&content, method);
-	result.notes.insert(0, Str::new_static(note));
+	result.notes.insert(0, sf!(note));
 	result
 }
 

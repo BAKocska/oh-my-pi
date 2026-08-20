@@ -5,7 +5,7 @@ use std::{fmt, sync::Arc};
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, ExecEffects,
 	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -74,9 +74,9 @@ pub fn tool<C: web::types::HttpClient + Send + Sync + 'static>(client: C) -> Fet
 	Fetch {
 		client,
 		spec: ToolSpec {
-			name:            Str::new_static("fetch"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(
+			name:            sf!("fetch"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(
 				"Fetches a URL as reader-mode clean text or Markdown. Append `:raw` to bypass HTML \
 				 and document conversion; line selectors use the read syntax.",
 			),
@@ -135,7 +135,7 @@ impl<C: web::types::HttpClient + Send + Sync + 'static> Tool for Fetch<C> {
 			end -= 1;
 		}
 		(end != 0)
-			.then(|| Part::Text { text: Str::from(&text[..end]) })
+			.then(|| Part::Text { text: Str::new(&text[..end]) })
 			.into_iter()
 			.collect()
 	}
@@ -147,7 +147,7 @@ async fn execute<C: web::types::HttpClient + Sync>(
 ) -> Result<Payload, Fault> {
 	let target = web::parse_target(authored)
 		.map_err(fetch_fault)?
-		.ok_or_else(|| Fault::Fetch { message: Str::new_static("fetch requires an HTTP(S) URL") })?;
+		.ok_or_else(|| Fault::Fetch { message: sf!("fetch requires an HTTP(S) URL") })?;
 	let raw = target.selector.is_raw();
 	let fetched = web::read_resource(client, &target.url, raw)
 		.await
@@ -167,7 +167,7 @@ async fn execute<C: web::types::HttpClient + Sync>(
 
 fn select_lines(content: &str, selector: &ParsedSelector) -> Result<Str, Fault> {
 	let ParsedSelector::Lines { ranges, .. } = selector else {
-		return Err(Fault::Fetch { message: Str::new_static("unsupported fetch selector") });
+		return Err(Fault::Fetch { message: sf!("unsupported fetch selector") });
 	};
 	let lines = content.lines().collect::<Vec<_>>();
 	let mut selected = String::new();
@@ -213,9 +213,9 @@ fn commit_event(error: CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"url":"https://example.com"}"#)),
+		example:  Some(sf!(r#"{{"url":"https://example.com"}}"#)),
 		found:    Some(message),
 	}
 }
@@ -255,7 +255,7 @@ mod tests {
 			Ok(web::types::HttpResponse {
 				final_url:    request.url,
 				status:       200,
-				content_type: Some(Str::new_static("text/html")),
+				content_type: Some(sf!("text/html")),
 				headers:      smallvec::SmallVec::new(),
 				body:         bytes::Bytes::from_static(b"<html><body>verbatim</body></html>"),
 			})

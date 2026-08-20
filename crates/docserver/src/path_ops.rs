@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc};
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -321,7 +321,7 @@ impl PathService {
 					.copy_source_bytes(&source, follow_source, cancellation)
 					.await?;
 				let bytes_copied = u64::try_from(bytes.len()).map_err(|_| Error::InvalidContent {
-					reason: Str::new_static("copy source length exceeds the protocol limit"),
+					reason: sf!("copy source length exceeds the protocol limit"),
 				})?;
 				ensure_not_cancelled(cancellation, &destination_metadata.path, "copy path")?;
 				let outcome = self
@@ -718,7 +718,7 @@ fn path_io_error(
 	message: &'static str,
 ) -> Error {
 	Error::Io {
-		operation: Str::new_static(operation),
+		operation: sf!(operation),
 		path:      path.to_path_buf(),
 		source:    std::io::Error::new(kind, message),
 	}

@@ -148,7 +148,7 @@ impl std::str::FromStr for Rev {
 	type Err = RevParseError;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		let invalid = || RevParseError { value: Str::from(value) };
+		let invalid = || RevParseError { value: Str::new(value) };
 		let (family, number) = match value.split_once('.') {
 			Some((family, number))
 				if !family.is_empty() && !number.is_empty() && !number.contains('.') =>
@@ -162,7 +162,7 @@ impl std::str::FromStr for Rev {
 			return Err(invalid());
 		}
 		let n = number.parse().map_err(|_| invalid())?;
-		Ok(Self { family: Str::from(family), n })
+		Ok(Self { family: Str::new(family), n })
 	}
 }
 
@@ -199,8 +199,12 @@ impl std::str::FromStr for Usd {
 	type Err = UsdParseError;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		let invalid = || UsdParseError { value: Str::from(value) };
-		let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+		let invalid = || UsdParseError { value: Str::new(value) };
+		let (whole, fraction) = match value.split_once('.') {
+			Some((whole, fraction)) if fraction.is_empty() => return Err(invalid()),
+			Some((whole, fraction)) => (whole, fraction),
+			None => (value, ""),
+		};
 		if whole.is_empty()
 			|| !whole.bytes().all(|byte| byte.is_ascii_digit())
 			|| (whole.len() > 1 && whole.starts_with('0'))
@@ -474,7 +478,7 @@ impl TryFrom<&omp_proto::policy::v1::EffectEnvelope> for Effects {
 					documents
 						.write_globs
 						.iter()
-						.map(|glob| Str::from(glob.as_str()))
+						.map(|glob| Str::new(glob.as_str()))
 						.collect::<Vec<_>>(),
 				),
 			}),
@@ -483,7 +487,7 @@ impl TryFrom<&omp_proto::policy::v1::EffectEnvelope> for Effects {
 					exec
 						.commands
 						.iter()
-						.map(|command| Str::from(command.as_str()))
+						.map(|command| Str::new(command.as_str()))
 						.collect::<Vec<_>>(),
 				),
 				network:  exec.network,
@@ -1741,6 +1745,8 @@ where
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]
@@ -1749,13 +1755,13 @@ mod tests {
 			path:  "lint@publisher/extension"
 				.parse()
 				.expect("valid device path"),
-			rev:   Rev { family: Str::new_static("device"), n: 3 },
+			rev:   Rev { family: sf!("device"), n: 3 },
 			issue: DeviceIssue {
 				path:     Vec::new(),
-				expected: Str::new_static("mounted device"),
+				expected: sf!("mounted device"),
 				kind:     ArgIssueKind::Missing,
 				example:  None,
-				found:    Some(Str::new_static("lint")),
+				found:    Some(sf!("lint")),
 			},
 		});
 		let encoded = serde_json::to_vec(&outcome).expect("fault serializes");

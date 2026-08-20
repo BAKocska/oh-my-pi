@@ -4,7 +4,7 @@ use std::{fmt, sync::Arc};
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	ArgIssue, ArgIssueKind, Constraint, Effects, Ev, IncomingParams, ParamError, Part, PromptCaps,
 	Rev, Tool, ToolSpec, ToolTerminal,
@@ -171,9 +171,9 @@ pub fn tool() -> Todo {
 	Todo {
 		phases: Arc::new(Mutex::new(Vec::new())),
 		spec:   ToolSpec {
-			name:            Str::new_static("todo"),
+			name:            sf!("todo"),
 			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     Str::new_static(
+			description:     sf!(
 				"Tracks a phased task list. Use `init` once, then `start`, `done`, `drop`, `block`, \
 				 `append`, or `view` as work changes.",
 			),
@@ -209,14 +209,14 @@ impl Tool for Todo {
 		stream! {
 			let arguments = match params.whole::<Params>().await { Ok(value) => value, Err(error) => { yield param_event(error); return; } };
 			if let Err(error) = params.interruptable().committed().await { yield commit_event(error); return; }
-			let result = apply(&mut self.phases.lock(), arguments).map(|phases| Payload { rendered: Str::from(render(&phases)), phases });
+			let result = apply(&mut self.phases.lock(), arguments).map(|phases| Payload { rendered: Str::new(render(&phases)), phases });
 			yield done(result);
 		}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
 		vec![Part::Text {
-			text: Str::from(match view {
+			text: Str::new(match view {
 				Ok(payload) => payload.rendered.to_string(),
 				Err(fault) => fault.to_string(),
 			}),
@@ -307,10 +307,10 @@ fn required(value: Option<Str>, name: &str) -> Result<Str, Fault> {
 	value.ok_or_else(|| invalid(&format!("`{name}` is required")))
 }
 fn invalid(message: &str) -> Fault {
-	Fault::Invalid { message: Str::from(message) }
+	Fault::Invalid { message: Str::new(message) }
 }
 fn missing(kind: &str, value: &str) -> Fault {
-	Fault::Missing { message: Str::from(format!("{kind} not found: {value}")) }
+	Fault::Missing { message: sf!("{kind} not found: {value}") }
 }
 /// Formats the durable state as a Markdown checklist.
 pub fn render(phases: &[Phase]) -> String {
@@ -370,9 +370,9 @@ fn commit_event(error: omp_tool::CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"op":"view"}"#)),
+		example:  Some(sf!(r#"{{"op":"view"}}"#)),
 		found:    Some(message),
 	}
 }
@@ -382,8 +382,8 @@ mod tests {
 	use super::*;
 	fn init() -> Vec<Phase> {
 		vec![Phase {
-			phase: Str::from("Build"),
-			items: vec![Item { text: Str::from("port"), status: Status::Pending, reason: None }],
+			phase: sf!("Build"),
+			items: vec![Item { text: sf!("port"), status: Status::Pending, reason: None }],
 		}]
 	}
 	#[test]
@@ -401,8 +401,8 @@ mod tests {
 		apply(&mut phases, Params {
 			op:     Op::Start,
 			list:   None,
-			phase:  Some(Str::from("Build")),
-			item:   Some(Str::from("port")),
+			phase:  Some(sf!("Build")),
+			item:   Some(sf!("port")),
 			items:  None,
 			reason: None,
 		})
@@ -410,9 +410,9 @@ mod tests {
 		apply(&mut phases, Params {
 			op:     Op::Append,
 			list:   None,
-			phase:  Some(Str::from("Build")),
+			phase:  Some(sf!("Build")),
 			item:   None,
-			items:  Some(vec![Str::from("test")]),
+			items:  Some(vec![sf!("test")]),
 			reason: None,
 		})
 		.unwrap();
@@ -426,8 +426,8 @@ mod tests {
 			apply(&mut phases, Params {
 				op:     Op::Block,
 				list:   None,
-				phase:  Some(Str::from("Build")),
-				item:   Some(Str::from("port")),
+				phase:  Some(sf!("Build")),
+				item:   Some(sf!("port")),
 				items:  None,
 				reason: None,
 			})
@@ -436,17 +436,17 @@ mod tests {
 		apply(&mut phases, Params {
 			op:     Op::Block,
 			list:   None,
-			phase:  Some(Str::from("Build")),
-			item:   Some(Str::from("port")),
+			phase:  Some(sf!("Build")),
+			item:   Some(sf!("port")),
 			items:  None,
-			reason: Some(Str::from("blocked")),
+			reason: Some(sf!("blocked")),
 		})
 		.unwrap();
 		apply(&mut phases, Params {
 			op:     Op::Unblock,
 			list:   None,
-			phase:  Some(Str::from("Build")),
-			item:   Some(Str::from("port")),
+			phase:  Some(sf!("Build")),
+			item:   Some(sf!("port")),
 			items:  None,
 			reason: None,
 		})

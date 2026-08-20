@@ -7,7 +7,7 @@
 use std::{cell::Cell, cmp::Reverse, collections::HashMap, ops::Range, sync::LazyLock};
 
 use im::Vector;
-use omp_core::{Str, fmts, str::IntoStr};
+use omp_core::{Str, sf, str::IntoStr};
 use smallvec::SmallVec;
 use xutf::Text;
 
@@ -921,7 +921,7 @@ impl EditBuffer {
 		let Some(range) = self.selection() else {
 			return BufferOutcome::Ignored;
 		};
-		self.copied = Some(Str::from(&self.text[range]));
+		self.copied = Some(Str::new(&self.text[range]));
 		BufferOutcome::Changed
 	}
 
@@ -929,7 +929,7 @@ impl EditBuffer {
 		let Some(range) = self.selection() else {
 			return BufferOutcome::Ignored;
 		};
-		self.copied = Some(Str::from(&self.text[range.clone()]));
+		self.copied = Some(Str::new(&self.text[range.clone()]));
 		self.delete_range(range.start, range.end, true)
 	}
 
@@ -1390,10 +1390,10 @@ pub struct Suggestion {
 impl Suggestion {
 	/// Builds a row: on acceptance `insert` replaces the completion's
 	/// prefix range verbatim; `label` is shown in the dropdown.
-	pub fn new(insert: impl Into<Str>, label: impl Into<Str>) -> Self {
+	pub fn new(insert: impl IntoStr, label: impl IntoStr) -> Self {
 		Self {
-			value:       insert.into(),
-			display:     SuggestionDisplay::Text(label.into()),
+			value:       insert.into_str(),
+			display:     SuggestionDisplay::Text(label.into_str()),
 			description: None,
 			hint:        None,
 		}
@@ -1401,15 +1401,15 @@ impl Suggestion {
 
 	/// Explanatory text shown beside the label.
 	#[must_use]
-	pub fn with_description(mut self, description: impl Into<Str>) -> Self {
-		self.description = Some(description.into());
+	pub fn with_description(mut self, description: impl IntoStr) -> Self {
+		self.description = Some(description.into_str());
 		self
 	}
 
 	/// Ghost text shown after the cursor while this row is selected.
 	#[must_use]
-	pub fn with_hint(mut self, hint: impl Into<Str>) -> Self {
-		self.hint = Some(hint.into());
+	pub fn with_hint(mut self, hint: impl IntoStr) -> Self {
+		self.hint = Some(hint.into_str());
 		self
 	}
 
@@ -1576,13 +1576,12 @@ impl Editor {
 			hint: None,
 			history: Vec::new(),
 			history_index: None,
-			history_draft: Str::new_static(""),
+			history_draft: Default::default(),
 			last_layout_width: Cell::new(80),
 		}
 	}
 
-	/// Registers the completion engine driving the dropdown, ghost text,
-	/// and Tab behavior; replaces any previous one.
+	/// Installs a completion handler, replacing any previous one.
 	pub fn set_completion(&mut self, completion: Box<dyn EditorCompletion>) {
 		self.completion = Some(completion);
 		self.refresh();
@@ -2174,7 +2173,7 @@ impl SlashCommands {
 			score = score.max(description_score);
 			if score > 0 {
 				ranked.push((score, Suggestion {
-					value:       fmts!("/{selected_name} "),
+					value:       sf!("/{selected_name} "),
 					display:     SuggestionDisplay::Text(selected_name.clone()),
 					description: Some(command.description.clone()),
 					hint:        command.hint.clone(),
@@ -2211,7 +2210,7 @@ impl SlashCommands {
 			let score = command_score(&query, &arg.name);
 			if score > 0 {
 				ranked.push((score, Suggestion {
-					value:       fmts!("{} ", arg.name),
+					value:       sf!("{} ", arg.name),
 					display:     SuggestionDisplay::Text(arg.name.clone()),
 					description: Some(arg.description.clone()),
 					hint:        None,
@@ -2262,7 +2261,7 @@ impl EditorCompletion for SlashCommands {
 					.find(|arg| arg.name.starts_with(&prefix))?;
 				let remaining = &matched.name.as_str()[prefix.len()..];
 				match &matched.usage {
-					Some(usage) => Some(fmts!("{remaining} {usage}")),
+					Some(usage) => Some(sf!("{remaining} {usage}")),
 					None if remaining.is_empty() => None,
 					None => Some(Str::new(remaining)),
 				}
@@ -2296,7 +2295,7 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 		}
 		if pattern.len() >= wanted.len() && pattern[..wanted.len()].eq_ignore_ascii_case(&wanted) {
 			suggestions.push(Suggestion {
-				value:       Str::new_static(emoji),
+				value:       sf!(emoji),
 				display:     SuggestionDisplay::Emoji { emoji, shortcode: pattern },
 				description: None,
 				hint:        None,
@@ -2311,7 +2310,7 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				break;
 			}
 			suggestions.push(Suggestion {
-				value:       Str::new_static(entry[1]),
+				value:       sf!(entry[1]),
 				display:     SuggestionDisplay::Emoji { emoji: entry[1], shortcode: entry[0] },
 				description: None,
 				hint:        None,
@@ -3018,7 +3017,7 @@ mod tests {
 			let items = ["alice", "bob"]
 				.iter()
 				.filter(|name| !query.is_empty() && name.starts_with(query))
-				.map(|name| Suggestion::new(fmts!("@{name} "), *name))
+				.map(|name| Suggestion::new(sf!("@{name} "), *name))
 				.collect::<SuggestionList>();
 			(!items.is_empty()).then_some(Suggestions { prefix_start: at, items })
 		}

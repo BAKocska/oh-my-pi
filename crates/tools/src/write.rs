@@ -12,7 +12,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt as _, Stream, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_hashline::format_hashline_header;
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
@@ -432,9 +432,9 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 		documents,
 		conflicts,
 		spec: ToolSpec {
-			name:            "write".into(),
+			name:            sf!("write"),
 			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     DESCRIPTION.into(),
+			description:     sf!(DESCRIPTION),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
 				priority:       100,
@@ -443,7 +443,7 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: [Str::new_static("**")].into_iter().collect(),
+					write_globs: [sf!("**")].into_iter().collect(),
 				}),
 				exec:      None,
 				inference: None,
@@ -480,12 +480,12 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 					return;
 				},
 			};
-			let path = Str::from(unwrap_hashline_header_path(&arguments.path));
+			let path = Str::new(unwrap_hashline_header_path(&arguments.path));
 			let conflict_request = match parse_uri(&path) {
 				Ok(Some(uri)) if uri.scheme == Scheme::Conflict => {
 					if uri.selector_text.is_some() || uri.resource.contains('/') {
 						yield done(Err(Fault::UriLikeTarget {
-							message: Str::new_static(
+							message: sf!(
 								"Conflict splices target conflict://<id> without a scope or read selector",
 							),
 						}));
@@ -500,10 +500,10 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 					};
 					let Some(entry) = self.conflicts.get(address.id) else {
 						yield done(Err(Fault::Document {
-							message: Str::from(format!(
+							message: sf!(
 								"Conflict #{} is no longer registered",
 								address.id
-							)),
+							),
 						}));
 						return;
 					};
@@ -514,7 +514,7 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 				},
 				Ok(_) => None,
 				Err(error) => {
-					yield done(Err(Fault::UriLikeTarget { message: Str::from(error.to_string()) }));
+					yield done(Err(Fault::UriLikeTarget { message: Str::new(error.to_string()) }));
 					return;
 				},
 			};
@@ -560,7 +560,7 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 							}));
 						},
 						Ok(None) => yield done(Err(Fault::Document {
-							message: Str::new_static(
+							message: sf!(
 								"conflict:// writes are unavailable in this deployment",
 							),
 						})),
@@ -661,7 +661,7 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 				}
 				if stripped.text.is_empty() {
 					let split = crate::read::selector::split_path_and_selector(&path);
-					if let Some(selector) = split.selector.map(Str::from) {
+					if let Some(selector) = split.selector.map(Str::new) {
 						yield done(Err(Fault::ReadSelectorMisfire {
 							target: path.clone(),
 							selector,
@@ -727,21 +727,21 @@ struct StrippedContent {
 fn strip_write_content(content: &str) -> StrippedContent {
 	let lines: Vec<&str> = content.split('\n').collect();
 	if let Some(cleaned) = strip_hashline_prefixes(&lines) {
-		return StrippedContent { text: Str::from(cleaned.join("\n")), stripped: true };
+		return StrippedContent { text: Str::new(cleaned.join("\n")), stripped: true };
 	}
 	let Some(header_index) = lines.iter().position(|line| !line.trim().is_empty()) else {
-		return StrippedContent { text: Str::from(content), stripped: false };
+		return StrippedContent { text: Str::new(content), stripped: false };
 	};
 	if !is_loose_hashline_header(lines[header_index]) {
-		return StrippedContent { text: Str::from(content), stripped: false };
+		return StrippedContent { text: Str::new(content), stripped: false };
 	}
 	let mut without_header = Vec::with_capacity(lines.len().saturating_sub(1));
 	without_header.extend_from_slice(&lines[..header_index]);
 	without_header.extend_from_slice(&lines[header_index + 1..]);
 	if let Some(cleaned) = strip_hashline_prefixes(&without_header) {
-		return StrippedContent { text: Str::from(cleaned.join("\n")), stripped: true };
+		return StrippedContent { text: Str::new(cleaned.join("\n")), stripped: true };
 	}
-	StrippedContent { text: Str::from(content), stripped: false }
+	StrippedContent { text: Str::new(content), stripped: false }
 }
 
 fn strip_hashline_prefixes(lines: &[&str]) -> Option<Vec<String>> {
@@ -901,10 +901,10 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 		let rest = trimmed[3..].trim_start_matches('/');
 		let guidance = device_guidance(Some(rest));
 		return Some(Fault::UriLikeTarget {
-			message: Str::from(format!(
+			message: sf!(
 				"Unknown retired device target.{guidance} Prefix the path with './' to write it as a \
 				 filesystem path."
-			)),
+			),
 		});
 	}
 	let colon = trimmed.find(':')?;
@@ -920,13 +920,13 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 			let rest = body.trim_start_matches('/');
 			let guidance = device_guidance(Some(rest));
 			return Some(Fault::UriLikeTarget {
-				message: Str::from(format!(
+				message: sf!(
 					"Unknown retired device target.{guidance} Prefix the path with './' to write it as \
 					 a filesystem path."
-				)),
+				),
 			});
 		}
-		return Some(Fault::UnsupportedScheme { scheme: Str::from(scheme.to_ascii_lowercase()) });
+		return Some(Fault::UnsupportedScheme { scheme: Str::new(scheme.to_ascii_lowercase()) });
 	}
 	if !suffix.starts_with('/') {
 		return None;
@@ -939,9 +939,9 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 		format!("Unknown URI-like write target '{trimmed}'.")
 	};
 	Some(Fault::UriLikeTarget {
-		message: Str::from(format!(
+		message: sf!(
 			"{prefix}{guidance} Prefix the path with './' to write it as a filesystem path."
-		)),
+		),
 	})
 }
 
@@ -1078,9 +1078,9 @@ fn interrupt_event(
 	let reason = match interrupt {
 		Ok(interrupt) => interrupt.reason,
 		Err(InterruptWaitError::Closed) if effects_started => {
-			"invocation owner disappeared during write transaction".into()
+			sf!("invocation owner disappeared during write transaction")
 		},
-		Err(InterruptWaitError::Closed) => "write resource owner disappeared".into(),
+		Err(InterruptWaitError::Closed) => sf!("write resource owner disappeared"),
 		Err(InterruptWaitError::Protocol(message)) => return Ev::Args(protocol_issue(message)),
 	};
 	if effects_started {
@@ -1093,9 +1093,9 @@ fn interrupt_event(
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: "one committed JSON argument object".into(),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some("{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\\n\"}".into()),
+		example:  Some(sf!(r#"{{"path":"src/main.rs","content":"fn main() {{}}\n"}}"#)),
 		found:    Some(message),
 	}
 }

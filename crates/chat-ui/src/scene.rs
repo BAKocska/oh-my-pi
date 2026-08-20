@@ -9,7 +9,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{Str, StrMut, fmts};
+use omp_core::{IntoStr, Str, StrMut, sf};
 use omp_tui::{
 	Border, Charset, Color, Command, Component, Decor, DecorKind, Frame, Icon, Key, MouseReport,
 	PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot, Style, Theme, Ui, UiContext, UiEvent,
@@ -382,7 +382,7 @@ impl ToolView {
 	fn append_plain(&mut self, chunk: &str, ctx: &UiContext) {
 		let mut source = self.source.to_string();
 		source.push_str(chunk);
-		let source = Str::from(source);
+		let source = Str::new(source);
 		self.rendered =
 			Ui::from_root(TextLeaf::new().text(source.clone()), self.width.max(1), ctx.clone());
 		self.source = source;
@@ -543,9 +543,9 @@ impl ChatStatus {
 				.facts
 				.turn_started
 				.map_or(Duration::ZERO, |started| Instant::now().saturating_duration_since(started));
-			fmts!("{} {}", self.charset.spinner().at(now), elapsed_label(elapsed))
+			sf!("{} {}", self.charset.spinner().at(now), elapsed_label(elapsed))
 		} else {
-			fmts!("{} omp", self.charset.icon(Icon::Omp))
+			sf!("{} omp", self.charset.icon(Icon::Omp))
 		};
 		Segment::new()
 			.label(label)
@@ -556,7 +556,7 @@ impl ChatStatus {
 		let work = self.work.borrow();
 		let facts = &work.facts;
 		let mut model =
-			StrMut::new(fmts!("{} {}", self.charset.icon(Icon::Model), facts.model).as_str());
+			StrMut::new(sf!("{} {}", self.charset.icon(Icon::Model), facts.model).as_str());
 		if let Some(advisor) = &facts.advisor_model {
 			let _ = write!(model, " {} {advisor}", self.charset.icon(Icon::Advisor));
 		}
@@ -579,7 +579,7 @@ impl ChatStatus {
 		}
 		if let Some(git) = &facts.git {
 			let mut label =
-				StrMut::new(fmts!("{} {}", self.charset.icon(Icon::Branch), git.branch).as_str());
+				StrMut::new(sf!("{} {}", self.charset.icon(Icon::Branch), git.branch).as_str());
 			if git.dirty > 0 {
 				let _ = write!(label, " *{}", git.dirty);
 			}
@@ -592,8 +592,7 @@ impl ChatStatus {
 			&& (facts.context_tokens > 0 || facts.context_window.is_some())
 		{
 			let (usage, overflow) = context_usage_label(facts.context_tokens, facts.context_window);
-			let mut label =
-				StrMut::new(fmts!("{} {usage}", self.charset.icon(Icon::Context)).as_str());
+			let mut label = StrMut::new(sf!("{} {usage}", self.charset.icon(Icon::Context)).as_str());
 			let color = if overflow {
 				self.theme.err
 			} else {
@@ -641,28 +640,28 @@ impl ChatStatus {
 		if facts.queued > 0 {
 			status = status.segment(
 				Segment::new()
-					.label(fmts!("queued {}", facts.queued))
+					.label(sf!("queued {}", facts.queued))
 					.with(Prop::Fg, self.theme.warn),
 			);
 		}
 		if facts.jobs > 0 {
 			status = status.segment(
 				Segment::new()
-					.label(fmts!("jobs {}", facts.jobs))
+					.label(sf!("jobs {}", facts.jobs))
 					.with(Prop::Fg, self.theme.info),
 			);
 		}
 		if facts.attempt > 0 {
 			status = status.segment(
 				Segment::new()
-					.label(fmts!("retry {}", facts.attempt))
+					.label(sf!("retry {}", facts.attempt))
 					.with(Prop::Fg, self.theme.warn),
 			);
 		}
 		if facts.dropped > 0 {
 			status = status.segment(
 				Segment::new()
-					.label(fmts!("dropped {}", facts.dropped))
+					.label(sf!("dropped {}", facts.dropped))
 					.with(Prop::Fg, self.theme.err),
 			);
 		}
@@ -980,7 +979,7 @@ impl Chat {
 		};
 		let items = if text.trim_start().starts_with('/') {
 			vec![crate::queue::QueueItem {
-				text:             Str::from(text.as_str()),
+				text:             Str::new(text.as_str()),
 				yield_after_turn: false,
 			}]
 		} else {
@@ -1132,7 +1131,7 @@ impl Chat {
 			name: name.into(),
 			title,
 			view: ToolView::structured(
-				Str::new_static(""),
+				Default::default(),
 				Self::tool_view_width(self.last_viewport.width),
 				&self.ctx,
 			),
@@ -1238,8 +1237,7 @@ impl Chat {
 			.filter(|title| !title.trim().is_empty())
 			.or_else(|| summary.lines().find(|line| !line.trim().is_empty()));
 		let method = compaction_method_label(method.as_deref());
-		let mut label =
-			StrMut::new(fmts!("{} {method}", self.ctx.charset.icon(Icon::Camera)).as_str());
+		let mut label = StrMut::new(sf!("{} {method}", self.ctx.charset.icon(Icon::Camera)).as_str());
 		if let Some(tokens_after) = tokens_after.filter(|_| tokens_before > 0) {
 			let arrow = if self.ctx.charset == Charset::Ascii {
 				"->"
@@ -1262,17 +1260,17 @@ impl Chat {
 	}
 
 	/// Appends an informational transcript notice.
-	pub fn push_notice(&mut self, text: impl Into<Str>) {
+	pub fn push_notice(&mut self, text: impl IntoStr) {
 		self
 			.transcript
-			.push(Entry::Notice { text: text.into(), error: false });
+			.push(Entry::Notice { text: text.into_str(), error: false });
 	}
 
 	/// Appends an error transcript notice.
-	pub fn push_error(&mut self, text: impl Into<Str>) {
+	pub fn push_error(&mut self, text: impl IntoStr) {
 		self
 			.transcript
-			.push(Entry::Notice { text: text.into(), error: true });
+			.push(Entry::Notice { text: text.into_str(), error: true });
 	}
 
 	/// Appends a semantic transcript boundary with core-owned styling.
@@ -1286,8 +1284,8 @@ impl Chat {
 			TranscriptFrameKind::Error => "error",
 		};
 		let text = match frame.detail {
-			Some(detail) if !detail.is_empty() => fmts!("{marker} · {} — {detail}", frame.title),
-			_ => fmts!("{marker} · {}", frame.title),
+			Some(detail) if !detail.is_empty() => sf!("{marker} · {} — {detail}", frame.title),
+			_ => sf!("{marker} · {}", frame.title),
 		};
 		if frame.kind == TranscriptFrameKind::Error {
 			self.push_error(text);
@@ -1699,7 +1697,7 @@ impl Chat {
 			Entry::Assistant(body) => draw_rich(frame, y, body, 0, width, ctx.theme).saturating_add(1),
 			Entry::Tool(tool) => draw_tool(frame, y, width, tool, ctx).saturating_add(1),
 			Entry::ToolGroup(tools) => {
-				let label = fmts!("Read {} files", tools.len());
+				let label = sf!("Read {} files", tools.len());
 				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
 					&label,
 					ink(ctx.theme.muted).bold(),
@@ -1825,11 +1823,11 @@ fn draw_live_panel_impl(
 		let tool = agent
 			.tool
 			.as_deref()
-			.map_or_else(Str::default, |tool| fmts!(" · {tool}"));
+			.map_or_else(Str::default, |tool| sf!(" · {tool}"));
 		let tokens = agent
 			.tokens
-			.map_or_else(Str::default, |tokens| fmts!(" · {}", compact_count(tokens)));
-		let label = fmts!(
+			.map_or_else(Str::default, |tokens| sf!(" · {}", compact_count(tokens)));
+		let label = sf!(
 			"{indent}{} {} · {}{tool}{tokens}",
 			ctx.charset.icon(Icon::Task),
 			agent.name,
@@ -1858,7 +1856,7 @@ fn draw_live_panel_impl(
 		if y >= bottom {
 			break;
 		}
-		let prefix = fmts!("{} {}", ctx.charset.spinner().at(elapsed), tool.title);
+		let prefix = sf!("{} {}", ctx.charset.spinner().at(elapsed), tool.title);
 		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
 			&prefix,
 			ink(ctx.theme.info),
@@ -1954,7 +1952,7 @@ fn draw_user_body(
 		}
 		at = at.saturating_add(1);
 	}
-	let gutter = fmts!("{} ", ctx.charset.cursor());
+	let gutter = sf!("{} ", ctx.charset.cursor());
 	frame.put(0, at, &gutter, ink(ctx.theme.ok));
 	let used = draw_rich(frame, at, body, 3, body.width, ctx.theme);
 	at.saturating_sub(y).saturating_add(used).saturating_add(1)
@@ -1983,7 +1981,7 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 	} else {
 		ctx.charset.icon(Icon::Error)
 	};
-	let title = fmts!("{icon} {}", tool.title);
+	let title = sf!("{icon} {}", tool.title);
 	draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
 		&title,
 		ink(state).bold(),
@@ -2164,7 +2162,7 @@ fn compaction_method_label(method: Option<&str>) -> &'static str {
 fn hud_line(text: Str, charset: Charset) -> Str {
 	match collapse_hud_line(&text, charset) {
 		std::borrow::Cow::Borrowed(_) => text,
-		std::borrow::Cow::Owned(collapsed) => Str::from(collapsed),
+		std::borrow::Cow::Owned(collapsed) => Str::new(collapsed),
 	}
 }
 
@@ -2175,21 +2173,21 @@ fn explicit_line_count(text: &str) -> u16 {
 fn elapsed_label(elapsed: Duration) -> Str {
 	let seconds = elapsed.as_secs();
 	if seconds < 60 {
-		fmts!("{seconds}s")
+		sf!("{seconds}s")
 	} else if seconds < 3_600 {
-		fmts!("{}m", seconds / 60)
+		sf!("{}m", seconds / 60)
 	} else {
-		fmts!("{}h", (seconds / 3_600).min(99))
+		sf!("{}h", (seconds / 3_600).min(99))
 	}
 }
 
 fn compact_count(value: u64) -> Str {
 	if value >= 1_000_000 {
-		fmts!("{:.1}m", value as f64 / 1_000_000.0)
+		sf!("{:.1}m", value as f64 / 1_000_000.0)
 	} else if value >= 1_000 {
-		fmts!("{:.0}k", value as f64 / 1_000.0)
+		sf!("{:.0}k", value as f64 / 1_000.0)
 	} else {
-		fmts!("{value}")
+		sf!("{value}")
 	}
 }
 fn context_usage_label(tokens: u64, window: Option<u64>) -> (Str, bool) {
@@ -2200,9 +2198,9 @@ fn context_usage_label(tokens: u64, window: Option<u64>) -> (Str, bool) {
 	let percent = tokens as f64 / window as f64 * 100.0;
 	let window = compact_count(window);
 	let label = if percent > 0.0 && percent < 1.0 {
-		fmts!("{percent:.1}%/{window}")
+		sf!("{percent:.1}%/{window}")
 	} else {
-		fmts!("{percent:.0}%/{window}")
+		sf!("{percent:.0}%/{window}")
 	};
 	(label, overflow)
 }
@@ -2283,7 +2281,7 @@ mod tests {
 	fn composer_status_moves_between_embedded_split_and_standalone_rows() {
 		let mut chat = Chat::new(&ctx());
 		chat.set_status(StatusFacts {
-			model: Str::from("model-a"),
+			model: sf!("model-a"),
 			context_tokens: 50,
 			context_window: Some(100),
 			..StatusFacts::default()
@@ -2329,7 +2327,7 @@ mod tests {
 	#[test]
 	fn mutation_api_commits_stable_rows_and_keeps_tail_anchored() {
 		let mut chat = Chat::new(&ctx());
-		chat.set_status(StatusFacts { model: Str::from("model-a"), ..StatusFacts::default() });
+		chat.set_status(StatusFacts { model: sf!("model-a"), ..StatusFacts::default() });
 		chat.push_user("hello", vec![]);
 		chat.begin_assistant("a");
 		chat.append_assistant("a", "world");
@@ -2383,15 +2381,15 @@ mod tests {
 	fn consecutive_reads_group_until_another_transcript_entry() {
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("read-a", "read", "src/a.rs");
-		chat.tool_finished("read-a", true, Str::new_static("a"));
+		chat.tool_finished("read-a", true, sf!("a"));
 		chat.tool_started("read-b", "read", "src/b.rs");
-		chat.tool_finished("read-b", true, Str::new_static("b"));
+		chat.tool_finished("read-b", true, sf!("b"));
 		assert!(matches!(&chat.transcript[..], [Entry::ToolGroup(group)] if group.len() == 2));
 
 		chat.tool_started("shell", "bash", "cargo metadata");
-		chat.tool_finished("shell", true, Str::new_static("ok"));
+		chat.tool_finished("shell", true, sf!("ok"));
 		chat.tool_started("read-c", "read", "src/c.rs");
-		chat.tool_finished("read-c", true, Str::new_static("c"));
+		chat.tool_finished("read-c", true, sf!("c"));
 		assert!(matches!(
 			&chat.transcript[..],
 			[Entry::ToolGroup(_), Entry::Tool(shell), Entry::Tool(read)]
@@ -2421,7 +2419,7 @@ mod tests {
 	#[test]
 	fn status_uses_only_supplied_facts_and_git_is_optional() {
 		let mut chat = Chat::new(&ctx());
-		chat.set_status(StatusFacts { model: Str::from("real/model"), ..StatusFacts::default() });
+		chat.set_status(StatusFacts { model: sf!("real/model"), ..StatusFacts::default() });
 		let composer_rows = chat.composer_rows();
 		let frame = chat.render(Size::new(100, 24)).frame;
 		let bottom = frame.size().height;
@@ -2444,9 +2442,9 @@ mod tests {
 	fn compaction_preview_renders_method_token_badge_and_title() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_compaction(
-			Str::new_static("full summary body"),
-			Some(Str::new_static("Fixing login TTL")),
-			Some(Str::new_static("remote")),
+			sf!("full summary body"),
+			Some(sf!("Fixing login TTL")),
+			Some(sf!("remote")),
 			256_000,
 			Some(20_000),
 		);
@@ -2466,7 +2464,7 @@ mod tests {
 		let mut chat = Chat::new(&context);
 		chat.set_composer_style(ComposerStyle::Claude);
 		chat.set_status(StatusFacts {
-			model: Str::new_static("model"),
+			model: sf!("model"),
 			context_tokens: 42,
 			context_window: Some(1_000),
 			compaction_speculation: CompactionSpeculationStatus::Running,
@@ -2489,7 +2487,7 @@ mod tests {
 	#[test]
 	fn chips_are_rendered_from_public_user_mutation() {
 		let mut chat = Chat::new(&ctx());
-		chat.push_user("inspect", vec![Str::from("image.png")]);
+		chat.push_user("inspect", vec![sf!("image.png")]);
 		let frame = chat.render(Size::new(80, 24)).frame;
 		assert!((0..frame.size().height).any(|row| row_text(frame, row).contains("image.png")));
 	}
@@ -2596,8 +2594,8 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		chat.push_transcript_frame(TranscriptFrame {
 			kind:   TranscriptFrameKind::Handoff,
-			title:  Str::from("Transferred session"),
-			detail: Some(Str::from("focus on UI")),
+			title:  sf!("Transferred session"),
+			detail: Some(sf!("focus on UI")),
 		});
 		let Some(Entry::Notice { text, error }) = chat.transcript.last() else {
 			panic!("notice")
@@ -2612,7 +2610,7 @@ mod tests {
 		let mut context = ctx();
 		context.theme = Theme::for_appearance(omp_tui::Appearance::Light);
 		let mut frame = Frame::new(Size::new(20, 5));
-		let assistant = Some(LiveAssistant { id: Str::from("a"), text: StrMut::new("stream") });
+		let assistant = Some(LiveAssistant { id: sf!("a"), text: StrMut::new("stream") });
 		draw_live_panel_impl(
 			&mut frame,
 			Rect::new(0, 0, 20, 5),
@@ -2646,12 +2644,12 @@ mod tests {
 		let path =
 			std::env::temp_dir().join(format!("omp-chat-tool-image-{}.png", std::process::id()));
 		omp_tui::test_support::write_test_png(&path, 8, 8, [255, 0, 0]);
-		let source = Str::from(path.to_string_lossy().as_ref());
+		let source = Str::new(path.to_string_lossy().as_ref());
 
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("t1", "read", "read page.pdf:p1.png");
 		chat.tool_image("t1", source);
-		chat.tool_finished("t1", true, Str::from("<row>rendered page 1</row>"));
+		chat.tool_finished("t1", true, sf!("<row>rendered page 1</row>"));
 		let frame = chat.render(Size::new(80, 40)).frame;
 		std::fs::remove_file(&path).ok();
 		assert!(
@@ -2669,7 +2667,7 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("t1", "shell", "shell ls");
 		chat.tool_image("t1", "/nonexistent/omp-tool-image.png");
-		chat.tool_finished("t1", true, Str::from("<row>done</row>"));
+		chat.tool_finished("t1", true, sf!("<row>done</row>"));
 		let frame = chat.render(Size::new(80, 24)).frame;
 		assert!((0..frame.size().height).any(|row| row_text(frame, row).contains("done")));
 		assert!((0..frame.size().height).all(|row| !row_text(frame, row).contains('▀')));
@@ -2679,13 +2677,13 @@ mod tests {
 	fn live_tool_view_replaces_retained_markup_without_line_vectors() {
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("t1", "same-name", "same-name");
-		chat.tool_view("t1", Str::from("<row>first update</row>"));
-		chat.tool_view("t1", Str::from("<row>second update</row>"));
+		chat.tool_view("t1", sf!("<row>first update</row>"));
+		chat.tool_view("t1", sf!("<row>second update</row>"));
 		let live = chat.render(Size::new(80, 24)).frame;
 		assert!((0..live.size().height).any(|row| row_text(live, row).contains("second update")));
 		assert!((0..live.size().height).all(|row| !row_text(live, row).contains("first update")));
 
-		chat.tool_finished("t1", false, Str::from("<row>fault branch</row>"));
+		chat.tool_finished("t1", false, sf!("<row>fault branch</row>"));
 		let settled = chat.render(Size::new(80, 24)).frame;
 		assert!(
 			(0..settled.size().height).any(|row| row_text(settled, row).contains("fault branch"))
@@ -2710,7 +2708,7 @@ mod tests {
 		let mut chat = Chat::new(&context);
 		chat.set_composer_style(ComposerStyle::Claude);
 		chat.set_status(StatusFacts {
-			model: Str::new_static("model"),
+			model: sf!("model"),
 			context_tokens: 42,
 			context_window: Some(1_000),
 			..StatusFacts::default()
@@ -2734,13 +2732,13 @@ mod tests {
 		assert_eq!(chat.handle_key(Key::Enter), ChatKey::Consumed);
 		let (text, attachments, _) = chat.take_submission().expect("submission staged");
 		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
-			text:  Str::from(text.as_str()),
-			chips: vec![Str::new_static("#1 pasted text")],
+			text:  Str::new(text.as_str()),
+			chips: vec![sf!("#1 pasted text")],
 		});
 		assert_eq!(chat.transcript.len(), 1);
 
 		let _ = chat.apply_backend_event(BackendEvent::PromptDropped {
-			text: Str::from(text.as_str()),
+			text: Str::new(text.as_str()),
 			attachments,
 		});
 
@@ -2756,7 +2754,7 @@ mod tests {
 		chat.set_composer_text("new draft");
 
 		let _ = chat.apply_backend_event(BackendEvent::PromptDropped {
-			text:        Str::new_static("old prompt"),
+			text:        sf!("old prompt"),
 			attachments: Vec::new(),
 		});
 

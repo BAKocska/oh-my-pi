@@ -14,5 +14,5 @@ pub trait Admitter: Send + Sync + 'static {
 		Self: 'client;
 
 	/// Decides one invocation without blocking the frame dispatcher.
-	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client>;
+	fn admit(&self, query: AdmitInvocation) -> Self::Future<'_>;
 }

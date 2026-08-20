@@ -36,7 +36,7 @@ impl Fake {
 			files: Arc::new(
 				files
 					.iter()
-					.map(|(path, bytes)| (Str::from(*path), Bytes::from_static(bytes)))
+					.map(|(path, bytes)| (Str::new(*path), Bytes::from_static(bytes)))
 					.collect(),
 			),
 			state: Arc::default(),

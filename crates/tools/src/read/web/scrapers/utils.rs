@@ -1,7 +1,7 @@
 //! Shared, allocation-conscious helpers for site-specific web scrapers.
 
 use html_to_markdown_rs::convert;
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use serde::de::DeserializeOwned;
 
 use crate::read::web::types::{HttpResponse, RenderResult, WebError};
@@ -67,7 +67,7 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 
 /// Builds a cleaned, capped markdown render result.
 #[must_use]
-pub(super) fn build_result(content: &str, method: impl Into<Str>) -> RenderResult {
+pub(super) fn build_result(content: &str, method: impl IntoStr) -> RenderResult {
 	RenderResult::markdown(content, method)
 }
 
@@ -76,7 +76,7 @@ pub(super) fn html_to_basic_markdown(html: &str) -> Result<Str, WebError> {
 	let without_scripts = strip_element_blocks(html, b"<script", b"</script>");
 	let cleaned = strip_element_blocks(&without_scripts, b"<style", b"</style>");
 	let result = convert(&cleaned, None).map_err(|error| WebError::render(error.to_string()))?;
-	Ok(result.content.unwrap_or_default().trim().into())
+	Ok(Str::new(result.content.unwrap_or_default().trim()))
 }
 
 fn strip_element_blocks(html: &str, opening: &[u8], closing: &[u8]) -> String {
@@ -115,7 +115,7 @@ pub(super) fn format_iso_date(value: &str) -> Str {
 		&& bytes[7] == b'-'
 		&& bytes[8..10].iter().all(u8::is_ascii_digit)
 	{
-		value[..10].into()
+		Str::new(&value[..10])
 	} else {
 		Str::default()
 	}

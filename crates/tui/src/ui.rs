@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use serde_json::Value;
 use smallvec::SmallVec;
 
@@ -123,11 +123,11 @@ impl Ui {
 	/// # Errors
 	/// Returns [`ParseError`] for malformed markup.
 	pub fn from_markup(
-		source: impl Into<Str>,
+		source: impl IntoStr,
 		width: u16,
 		ctx: UiContext,
 	) -> Result<Self, ParseError> {
-		let source = source.into();
+		let source = source.into_str();
 		let root = markup::parse(&source, &ctx)?;
 		Ok(Self::from_cached(source, root, width, ctx))
 	}
@@ -138,11 +138,11 @@ impl Ui {
 	/// # Errors
 	/// Returns [`ParseError`] for malformed markup.
 	pub fn from_extension_markup(
-		source: impl Into<Str>,
+		source: impl IntoStr,
 		width: u16,
 		ctx: UiContext,
 	) -> Result<Self, ParseError> {
-		let source = source.into();
+		let source = source.into_str();
 		let root = markup::parse_with_origin(&source, &ctx, markup::MarkupOrigin::Extension)?;
 		Ok(Self::from_cached(source, root, width, ctx))
 	}
@@ -288,11 +288,11 @@ impl Ui {
 	}
 
 	/// Replaces a named component's text and refreshes the smallest safe region.
-	pub fn set_text(&mut self, id: &str, text: impl Into<Str>) -> bool {
+	pub fn set_text(&mut self, id: &str, text: impl IntoStr) -> bool {
 		let Some((slot, old_measure, old_rect, presented)) = self.snapshot_id(id) else {
 			return false;
 		};
-		let text = text.into();
+		let text = text.into_str();
 		let ctx = &self.ctx;
 		let Some(changed) = self.root.update_id(id, |cached| {
 			let changed = cached.comp_mut().set_text(ctx, text);
@@ -4606,7 +4606,7 @@ cd</pre>"##,
 		);
 		assert_eq!(
 			ui.handle_mouse(right_hit.rect.x, right_hit.rect.y, Mouse::Click),
-			UiEvent::Pressed(Str::from("right")),
+			UiEvent::Pressed(sf!("right")),
 			"click outside the layer falls through to the base tree"
 		);
 		ui.close_overlay(id);

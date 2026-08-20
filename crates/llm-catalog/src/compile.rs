@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use omp_core::{Str, hex};
+use omp_core::{Str, hex, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, value::RawValue};
 use sha2::{Digest, Sha256};
@@ -2487,7 +2487,7 @@ fn inherit_source_references(models: &mut BTreeMap<Str, BTreeMap<Str, SourceMode
 						reference.provenance,
 						reference.expires_at_ms,
 					));
-					(Str::from(reference.reference_provider), Str::from(reference.reference_model))
+					(Str::new(reference.reference_provider), Str::new(reference.reference_model))
 				})
 				.or_else(|| select_reference(&current.1, &current.0, &current.1, &exact, &suffix))
 			{
@@ -2562,7 +2562,7 @@ fn select_reference(
 		(override_.provider == "*" || override_.provider == provider)
 			&& override_.model.eq_ignore_ascii_case(model)
 	}) {
-		return Some((Str::from(override_.reference_provider), Str::from(override_.reference_model)));
+		return Some((Str::new(override_.reference_provider), Str::new(override_.reference_model)));
 	}
 	let mut candidates = reference_keys(model);
 	let prefer_suffix = source_inheritance_override(provider, model)
@@ -2813,8 +2813,8 @@ fn compile_oauth_specs(
 			scopes: source.scopes.into_boxed_slice(),
 			audience: None,
 			placement: OAuthTokenPlacement::Header {
-				name:   Str::from("authorization"),
-				prefix: Str::from("Bearer "),
+				name:   sf!("authorization"),
+				prefix: sf!("Bearer "),
 			},
 			token_parameters,
 			flow,
@@ -3085,7 +3085,7 @@ fn compile_model_routes(
 			.iter()
 			.find(|route| &route.id == primary_id)
 			.cloned()
-			.ok_or_else(|| CompileError::Invariant(Str::from("provider primary route is missing")))?;
+			.ok_or_else(|| CompileError::Invariant(sf!("provider primary route is missing")))?;
 		for (model, row) in rows {
 			let embedding_override = exact_capability_override(provider, model)
 				.is_some_and(|override_| override_.correction == CapabilityCorrection::Embedding);
@@ -3201,7 +3201,7 @@ fn compile_models(
 			CompileError::Invariant(Str::from(format!("provider `{provider}` has no wire policy")))
 		})?;
 		if !policies.contains_key(provider_policy_id) {
-			return Err(CompileError::Invariant(Str::from("provider wire policy was not interned")));
+			return Err(CompileError::Invariant(sf!("provider wire policy was not interned",)));
 		}
 		let facets = provider_facets
 			.get(&provider)
@@ -3414,7 +3414,7 @@ fn compile_models(
 			}
 			let mut provenance_sources = vec![ProvenanceSource {
 				kind:           ProvenanceKind::Bundled,
-				origin:         Str::from("catalog-oracle/models.json.zst"),
+				origin:         sf!("catalog-oracle/models.json.zst"),
 				revision:       None,
 				confidence:     EvidenceConfidence::Declared,
 				observed_at_ms: None,
@@ -3437,7 +3437,7 @@ fn compile_models(
 			{
 				provenance_sources.push(ProvenanceSource {
 					kind:           ProvenanceKind::Bundled,
-					origin:         Str::from("catalog-oracle:omit:dynamic-pricing-sentinel"),
+					origin:         sf!("catalog-oracle:omit:dynamic-pricing-sentinel"),
 					revision:       None,
 					confidence:     EvidenceConfidence::Inferred,
 					observed_at_ms: None,
@@ -3539,7 +3539,7 @@ fn collapsible_groups(classified: &BTreeMap<Str, ModelClassification>) -> BTreeS
 	}
 	for (logical, count) in tiers {
 		if count >= 2 {
-			result.insert(Str::from(logical));
+			result.insert(Str::new(logical));
 		}
 	}
 	result
@@ -3858,7 +3858,7 @@ fn compile_thinking(
 			CompileError::Invariant(Str::from(format!("invalid thinking routing: {error}")))
 		})?;
 	} else if !routing.effort_map.is_empty() || !routing.effort_routing.is_empty() {
-		return Err(CompileError::Invariant(Str::from(
+		return Err(CompileError::Invariant(sf!(
 			"thinking routing exists without a thinking profile",
 		)));
 	}
@@ -4381,29 +4381,29 @@ fn decimal_scaled(number: &Number, scale: usize) -> Result<u64, CompileError> {
 	let digits = format!("{whole}{fraction}");
 	let coefficient: u128 = digits
 		.parse()
-		.map_err(|_| CompileError::Invariant(Str::from("decimal is out of range")))?;
+		.map_err(|_| CompileError::Invariant(sf!("decimal is out of range")))?;
 	let shift = exponent + i32::try_from(scale).expect("small fixed decimal scale")
 		- i32::try_from(fraction.len())
-			.map_err(|_| CompileError::Invariant(Str::from("decimal is out of range")))?;
+			.map_err(|_| CompileError::Invariant(sf!("decimal is out of range")))?;
 	let scaled = if shift >= 0 {
 		coefficient
 			.checked_mul(
 				10_u128
 					.checked_pow(shift as u32)
-					.ok_or_else(|| CompileError::Invariant(Str::from("decimal is out of range")))?,
+					.ok_or_else(|| CompileError::Invariant(sf!("decimal is out of range")))?,
 			)
-			.ok_or_else(|| CompileError::Invariant(Str::from("decimal is out of range")))?
+			.ok_or_else(|| CompileError::Invariant(sf!("decimal is out of range")))?
 	} else {
 		let divisor = 10_u128
 			.checked_pow((-shift) as u32)
-			.ok_or_else(|| CompileError::Invariant(Str::from("decimal is out of range")))?;
+			.ok_or_else(|| CompileError::Invariant(sf!("decimal is out of range")))?;
 		let quotient = coefficient / divisor;
 		let remainder = coefficient % divisor;
 		quotient
 			.checked_add(u128::from(remainder >= divisor.div_ceil(2)))
-			.ok_or_else(|| CompileError::Invariant(Str::from("decimal is out of range")))?
+			.ok_or_else(|| CompileError::Invariant(sf!("decimal is out of range")))?
 	};
-	u64::try_from(scaled).map_err(|_| CompileError::Invariant(Str::from("decimal is out of range")))
+	u64::try_from(scaled).map_err(|_| CompileError::Invariant(sf!("decimal is out of range")))
 }
 fn zero_number() -> Number {
 	Number::from(0)
@@ -4442,9 +4442,9 @@ fn compile_auth(
 				credential_sources.push(CredentialSourceSpec::Stored);
 				(
 					AuthSpecKind::Bearer,
-					Some(Str::from("authorization")),
+					Some(sf!("authorization")),
 					None,
-					Some(Str::from("Bearer ")),
+					Some(sf!("Bearer ")),
 					None,
 					AccountScope::Provider,
 					None,
@@ -4516,10 +4516,7 @@ fn compile_auth(
 					None,
 					AccountScope::Region,
 					None,
-					Some(SigV4Spec {
-						service: Str::from("bedrock"),
-						region:  RegionSource::RouteEndpoint,
-					}),
+					Some(SigV4Spec { service: sf!("bedrock"), region: RegionSource::RouteEndpoint }),
 				)
 			},
 			SourceAuth::GoogleAdc { api_key_env, project_env, location_env } => {
@@ -4532,10 +4529,10 @@ fn compile_auth(
 					.map(|variable| ApplicationDefaultSource::EnvironmentAccessToken { variable })
 					.collect::<Vec<_>>();
 				sources.push(ApplicationDefaultSource::CredentialFile {
-					path_environment: Some(Str::from("OMP_GOOGLE_APPLICATION_CREDENTIALS")),
+					path_environment: Some(sf!("OMP_GOOGLE_APPLICATION_CREDENTIALS")),
 					default_path:     None,
 				});
-				sources.push(ApplicationDefaultSource::Metadata { url: Str::from("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"), headers: Box::new([StaticHeader { name: Str::from("metadata-flavor"), value: Str::from("Google") }]) });
+				sources.push(ApplicationDefaultSource::Metadata { url: sf!("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"), headers: Box::new([StaticHeader { name: sf!("metadata-flavor"), value: sf!("Google") }]) });
 				credential_sources.push(CredentialSourceSpec::ApplicationDefault {
 					api_key_env,
 					project_env,
@@ -4544,9 +4541,9 @@ fn compile_auth(
 				});
 				(
 					AuthSpecKind::GcpAdc,
-					Some(Str::from("authorization")),
+					Some(sf!("authorization")),
 					None,
-					Some(Str::from("Bearer ")),
+					Some(sf!("Bearer ")),
 					None,
 					AccountScope::Provider,
 					None,
@@ -4561,9 +4558,9 @@ fn compile_auth(
 				credential_sources.push(CredentialSourceSpec::Stored);
 				(
 					AuthSpecKind::Oauth,
-					Some(Str::from("authorization")),
+					Some(sf!("authorization")),
 					None,
-					Some(Str::from("Bearer ")),
+					Some(sf!("Bearer ")),
 					None,
 					AccountScope::Provider,
 					Some(oauth),
@@ -4625,7 +4622,7 @@ fn compile_discovery(source: &SourceDiscovery) -> Result<DiscoverySpec, CompileE
 		id: DiscoverySpecId::new(content_id("discovery", &canonical)),
 		kind,
 		label: source.label.clone(),
-		path: Str::from("/models"),
+		path: sf!("/models"),
 		pagination: DiscoveryPagination::SinglePage,
 		authoritative: source.authoritative,
 		interval: source.interval_ms.map(std::time::Duration::from_millis),
@@ -4719,13 +4716,8 @@ mod tests {
 
 	#[test]
 	fn rejects_header_injection_and_credentials() {
-		assert!(
-			compile_headers(&BTreeMap::from([(Str::from("x-ok"), Str::from("a\r\nb"))])).is_err()
-		);
-		assert!(
-			compile_headers(&BTreeMap::from([(Str::from("authorization"), Str::from("secret"))]))
-				.is_err()
-		);
+		assert!(compile_headers(&BTreeMap::from([(sf!("x-ok"), sf!("a\r\nb"))])).is_err());
+		assert!(compile_headers(&BTreeMap::from([(sf!("authorization"), sf!("secret"))])).is_err());
 	}
 
 	#[test]
@@ -4787,7 +4779,7 @@ mod tests {
 	#[test]
 	fn effort_collapse_requires_siblings() {
 		let single = BTreeMap::from([(
-			Str::from("model-low"),
+			sf!("model-low"),
 			classify(ClassificationInput {
 				phase:          ClassificationPhase::CatalogCompiler,
 				provider:       "p",
@@ -4798,7 +4790,7 @@ mod tests {
 		assert!(collapsible_groups(&single).is_empty());
 		let siblings = BTreeMap::from([
 			(
-				Str::from("model-low"),
+				sf!("model-low"),
 				classify(ClassificationInput {
 					phase:          ClassificationPhase::CatalogCompiler,
 					provider:       "p",
@@ -4807,7 +4799,7 @@ mod tests {
 				}),
 			),
 			(
-				Str::from("model-high"),
+				sf!("model-high"),
 				classify(ClassificationInput {
 					phase:          ClassificationPhase::CatalogCompiler,
 					provider:       "p",

@@ -731,17 +731,17 @@ mod tests {
 			None,
 			b"system\nuser",
 			b"system\nuser",
-			[(Str::from("system"), b"system".to_vec()), (Str::from("user"), b"user".to_vec())],
+			[(sf!("system"), b"system".to_vec()), (sf!("user"), b"user".to_vec())],
 			None,
 		);
 		let current = PromptFingerprint::compute(
 			Some(&previous),
 			b"system\nuser",
 			b"system\nassistant",
-			[(Str::from("system"), b"system".to_vec()), (Str::from("user"), b"assistant".to_vec())],
+			[(sf!("system"), b"system".to_vec()), (sf!("user"), b"assistant".to_vec())],
 			None,
 		);
-		assert_eq!(current.changed.as_slice(), [Str::from("user")]);
+		assert_eq!(current.changed.as_slice(), [sf!("user")]);
 		assert_eq!(current.prefix_stable_bytes, b"system\n".len());
 	}
 }

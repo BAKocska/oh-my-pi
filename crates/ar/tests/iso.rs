@@ -280,7 +280,7 @@ fn record(
 	gap: u8,
 	system_use: &[u8],
 ) -> Vec<u8> {
-	let padding = usize::from(name.len() % 2 == 0);
+	let padding = usize::from(name.len().is_multiple_of(2));
 	let length = 33 + name.len() + padding + system_use.len();
 	let mut record = vec![0_u8; length];
 	record[0] = length as u8;

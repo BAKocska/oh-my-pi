@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{FutureExt as _, StreamExt as _, stream};
-use omp_core::Str;
+use omp_core::sf;
 use omp_llm_catalog::{OperationKind, ProviderId, RouteId};
 use serde::Deserialize;
 use tower::{Service as _, ServiceExt as _};
@@ -71,7 +71,7 @@ struct EmitDecoder;
 
 impl Decoder for EmitDecoder {
 	fn push(&mut self, _frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
-		emit(RawEvent::Chat(ChatEvent::TextDelta { index: 0, text: Str::from("visible") }));
+		emit(RawEvent::Chat(ChatEvent::TextDelta { index: 0, text: sf!("visible") }));
 		Ok(())
 	}
 
@@ -84,8 +84,8 @@ struct PreambleThenVisibleDecoder;
 
 impl Decoder for PreambleThenVisibleDecoder {
 	fn push(&mut self, _frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
-		emit(RawEvent::Metadata(ProviderMetadataEvent::ResponseId(Str::from("response"))));
-		emit(RawEvent::Chat(ChatEvent::TextDelta { index: 0, text: Str::from("visible") }));
+		emit(RawEvent::Metadata(ProviderMetadataEvent::ResponseId(sf!("response"))));
+		emit(RawEvent::Chat(ChatEvent::TextDelta { index: 0, text: sf!("visible") }));
 		Ok(())
 	}
 
@@ -98,7 +98,7 @@ struct MetadataOnlyDecoder;
 
 impl Decoder for MetadataOnlyDecoder {
 	fn push(&mut self, _frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
-		emit(RawEvent::Metadata(ProviderMetadataEvent::ResponseId(Str::from("response"))));
+		emit(RawEvent::Metadata(ProviderMetadataEvent::ResponseId(sf!("response"))));
 		Ok(())
 	}
 
@@ -112,7 +112,7 @@ struct StateThenExpiredDecoder;
 impl Decoder for StateThenExpiredDecoder {
 	fn push(&mut self, _frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
 		emit(RawEvent::ProviderState(ProviderStateEvent::Checkpoint {
-			id:   Some(Str::from("checkpoint")),
+			id:   Some(sf!("checkpoint")),
 			data: Bytes::from_static(b"opaque"),
 		}));
 		let error = Error::new(
@@ -158,7 +158,7 @@ impl Decoder for FailDecoder {
 				RetryAction::Never,
 				ExecutionReceipt::default(),
 			)
-			.detail(ErrorDetail::protocol(ReasonId(Str::from("fixture-first-frame")))),
+			.detail(ErrorDetail::protocol(ReasonId(sf!("fixture-first-frame")))),
 		)
 	}
 
@@ -176,7 +176,7 @@ fn request(
 		encoded: EncodedRequest {
 			operation: OperationKind::Chat,
 			method: RequestMethod::Post,
-			uri: Str::from("https://provider.invalid/v1/stream"),
+			uri: sf!("https://provider.invalid/v1/stream"),
 			headers: Box::new([]),
 			body,
 			framing: FramingProtocol::Raw,
@@ -209,7 +209,7 @@ fn attempt(
 	CassetteAttempt {
 		status: Some(200),
 		headers: Box::new([]),
-		provider_request_id: Some(Str::from("provider-request")),
+		provider_request_id: Some(sf!("provider-request")),
 		body,
 		frames: (0..frame_count)
 			.map(|_| Frame::Raw(Bytes::from_static(b"secret-frame")))
@@ -557,7 +557,7 @@ async fn factory_error_is_preserved_and_captured_with_exact_evidence() {
 			RetryAction::Never,
 			ExecutionReceipt::default(),
 		)
-		.detail(ErrorDetail::protocol(ReasonId(Str::from("factory-terminal"))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!("factory-terminal"))))
 	};
 	let factory = BodyFactoryHandle::new(move || {
 		let error = expected.clone();
@@ -935,7 +935,7 @@ async fn openai_realtime_cassette_preserves_normal_response_through_done() {
 	let scripted = CassetteAttempt {
 		status:              Some(101),
 		headers:             Box::new([]),
-		provider_request_id: Some(Str::from("realtime-request")),
+		provider_request_id: Some(sf!("realtime-request")),
 		body:                CassetteBodyAction::Unopened,
 		frames:              provider_frames
 			.into_iter()
@@ -1014,7 +1014,7 @@ async fn websocket_upgrade_sends_initial_frame_before_first_decodable_event() {
 	let mut call = request(BodySource::Bytes(Bytes::new()), EmitDecoder, Cancellation::default());
 	call.encoded.operation = OperationKind::Realtime;
 	call.encoded.framing = FramingProtocol::WebSocket;
-	call.encoded.uri = Str::from(format!("ws://{address}/realtime"));
+	call.encoded.uri = sf!("ws://{address}/realtime");
 	call.decoder = None;
 	call.realtime = Some(Box::new(RealtimeEchoCodec));
 	let response = service.call(call).await.expect("websocket handshake");
@@ -1045,7 +1045,7 @@ async fn stalled_http_connect_or_headers_honors_attempt_timeout() {
 		EmitDecoder,
 		Cancellation::default(),
 	);
-	call.encoded.uri = Str::from(format!("http://{address}/stall"));
+	call.encoded.uri = sf!("http://{address}/stall");
 	call.attempt.timeout = std::time::Duration::from_millis(10);
 	let error = service.call(call).await.err().expect("headers timeout");
 	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
@@ -1071,7 +1071,7 @@ async fn stalled_http_headers_honor_in_flight_cancellation() {
 	let cancellation = Cancellation::default();
 	let mut call =
 		request(BodySource::Bytes(Bytes::from_static(b"request")), EmitDecoder, cancellation.clone());
-	call.encoded.uri = Str::from(format!("http://{address}/stall"));
+	call.encoded.uri = sf!("http://{address}/stall");
 	call.attempt.timeout = std::time::Duration::from_secs(5);
 	let response = service.call(call);
 	tokio::pin!(response);

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use quick_xml::{
 	Reader, XmlVersion,
 	events::{BytesStart, Event},
@@ -55,11 +55,11 @@ pub(super) async fn render<C: HttpClient + Sync>(
 		let markdown = render_tweet(&tweet);
 		let (content, _) = finalize_output(&markdown);
 		let mut notes = SmallVec::new();
-		notes.push(Str::from(format!("Via Nitter: {instance}")));
+		notes.push(sf!("Via Nitter: {instance}"));
 		return Ok(Some(RenderResult {
 			content,
-			content_type: Some(Str::from("text/markdown")),
-			method: Str::from("twitter-nitter"),
+			content_type: Some(sf!("text/markdown")),
+			method: sf!("twitter-nitter"),
 			notes,
 		}));
 	}
@@ -69,15 +69,15 @@ pub(super) async fn render<C: HttpClient + Sync>(
 
 fn blocked_result() -> RenderResult {
 	let mut notes = SmallVec::new();
-	notes.push(Str::from("X.com blocks bots; Nitter instances unavailable"));
+	notes.push(sf!("X.com blocks bots; Nitter instances unavailable"));
 	RenderResult {
-		content: Str::from(
+		content: sf!(
 			"Twitter/X blocks automated access. Nitter instances were unavailable.\n\nTry:\n- \
 			 Opening the link in a browser\n- Using a different Nitter instance manually\n- Checking \
 			 if the tweet is available via an archive service",
 		),
-		content_type: Some(Str::from("text/plain")),
-		method: Str::from("twitter-blocked"),
+		content_type: Some(sf!("text/plain")),
+		method: sf!("twitter-blocked"),
 		notes,
 	}
 }
@@ -665,9 +665,9 @@ mod tests {
 		) -> impl Future<Output = Result<HttpResponse, WebError>> + Send + '_ {
 			self.requests.lock().push(request.url);
 			ready(Ok(HttpResponse {
-				final_url:    Str::from("https://nitter.privacyredirect.com/omp/status/42"),
+				final_url:    sf!("https://nitter.privacyredirect.com/omp/status/42"),
 				status:       200,
-				content_type: Some(Str::from("text/html")),
+				content_type: Some(sf!("text/html")),
 				headers:      SmallVec::new(),
 				body:         self.body.clone(),
 			}))
@@ -707,9 +707,9 @@ mod tests {
 		) -> impl Future<Output = Result<HttpResponse, WebError>> + Send + '_ {
 			self.requests.lock().push(request.url);
 			ready(Ok(HttpResponse {
-				final_url:    Str::from("https://nitter.invalid/"),
+				final_url:    sf!("https://nitter.invalid/"),
 				status:       503,
-				content_type: Some(Str::from("text/html")),
+				content_type: Some(sf!("text/html")),
 				headers:      SmallVec::new(),
 				body:         Bytes::new(),
 			}))

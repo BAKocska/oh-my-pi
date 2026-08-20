@@ -585,6 +585,7 @@ impl Drop for SocketCleanup {
 #[cfg(all(test, unix))]
 mod tests {
 	use bytes::{Bytes, BytesMut};
+	use omp_core::sf;
 	use omp_proto::document::v1 as proto;
 	use tempfile::TempDir;
 	use tokio::sync::watch;
@@ -744,7 +745,7 @@ mod tests {
 		let task = tokio::spawn(serve(project, Transport::Socket(socket.clone()), ServeOptions {
 			lsp_config_paths: Vec::new(),
 			shutdown:         Some(shutdown.clone()),
-			server_build:     Str::new_static("test-build"),
+			server_build:     sf!("test-build"),
 			connections:      Some(connection_tx),
 		}));
 		wait_for_connection_count(&mut connection_rx, 0).await;

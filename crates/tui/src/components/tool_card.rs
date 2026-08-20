@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use crate::{
 	component::{Cached, Component, IntoChildren, PaintCtx, Slot, next_slot},
@@ -56,8 +56,8 @@ impl ToolCard {
 	}
 
 	/// In-place update: tool name.
-	pub fn set_name(&mut self, name: impl Into<Str>) -> bool {
-		let name = name.into();
+	pub fn set_name(&mut self, name: impl IntoStr) -> bool {
+		let name = name.into_str();
 		if self.name == name {
 			return false;
 		}
@@ -66,7 +66,7 @@ impl ToolCard {
 	}
 
 	/// Sets the tool name (e.g. `read`).
-	pub fn name(mut self, name: impl Into<Str>) -> Self {
+	pub fn name(mut self, name: impl IntoStr) -> Self {
 		self.set_name(name);
 		self
 	}
@@ -87,8 +87,8 @@ impl ToolCard {
 	}
 
 	/// In-place update: intent/summary text.
-	pub fn set_intent(&mut self, intent: impl Into<Str>) -> bool {
-		let intent = intent.into();
+	pub fn set_intent(&mut self, intent: impl IntoStr) -> bool {
+		let intent = intent.into_str();
 		if self.intent == intent {
 			return false;
 		}
@@ -97,14 +97,14 @@ impl ToolCard {
 	}
 
 	/// Sets the intent or summary text.
-	pub fn intent(mut self, intent: impl Into<Str>) -> Self {
+	pub fn intent(mut self, intent: impl IntoStr) -> Self {
 		self.set_intent(intent);
 		self
 	}
 
 	/// In-place update: badge text.
-	pub fn set_badge(&mut self, badge: impl Into<Str>) -> bool {
-		let badge = badge.into();
+	pub fn set_badge(&mut self, badge: impl IntoStr) -> bool {
+		let badge = badge.into_str();
 		if self.badge == badge {
 			return false;
 		}
@@ -113,7 +113,7 @@ impl ToolCard {
 	}
 
 	/// Sets the right-aligned badge text (e.g. elapsed time).
-	pub fn badge(mut self, badge: impl Into<Str>) -> Self {
+	pub fn badge(mut self, badge: impl IntoStr) -> Self {
 		self.set_badge(badge);
 		self
 	}

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use omp_agent::Journal;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::{
 	index::{NewSession, SessionFilter, SessionIndex, SessionKind},
@@ -23,7 +23,7 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 		SessionIndex::open(scratch.path().join("sessions.sqlite3"))
 			.expect("authoritative project index"),
 	);
-	let id = SessionId(Str::from("01K3CHATINDEX00000000000000"));
+	let id = SessionId(sf!("01K3CHATINDEX00000000000000"));
 	let path = sessions.join("01K3CHATINDEX00000000000000.jsonl");
 	let root_text = root.to_string_lossy();
 	let mut journal = index
@@ -52,11 +52,11 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 	journal.attach_session_index(Arc::clone(&index), id);
 
 	journal
-		.append_title(2, Str::from("Indexed chat"), TitleSource::Assistant)
+		.append_title(2, sf!("Indexed chat"), TitleSource::Assistant)
 		.expect("title and index commit");
 	journal
 		.start_turn(3, TurnStart {
-			turn_id:            Str::from("turn-1"),
+			turn_id:            sf!("turn-1"),
 			item_events:        Vec::new(),
 			prompt_hash:        [7; 32],
 			prompt_head_events: Vec::new(),
@@ -111,5 +111,5 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 	assert_eq!(session.usage.input_tokens, 120);
 	assert_eq!(session.usage.reasoning_tokens, Some(9));
 	assert_eq!(session.cost.nanos_usd, 42_000);
-	assert_eq!(session.models.as_slice(), [Str::from("anthropic/claude-opus")]);
+	assert_eq!(session.models.as_slice(), [sf!("anthropic/claude-opus")]);
 }

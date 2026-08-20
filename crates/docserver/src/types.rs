@@ -11,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use cap_std::{ambient_authority, fs::Dir};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -150,9 +150,7 @@ impl LanguageId {
 	pub fn new(value: impl AsRef<str>) -> Result<Self> {
 		let value = value.as_ref();
 		if value.is_empty() {
-			return Err(Error::InvalidContent {
-				reason: Str::new_static("language id must not be empty"),
-			});
+			return Err(Error::InvalidContent { reason: sf!("language id must not be empty") });
 		}
 		Ok(Self(Str::new(value)))
 	}
@@ -210,7 +208,7 @@ impl DocumentHead {
 	) -> Result<Self> {
 		if presence == DocumentPresence::Missing && byte_length != 0 {
 			return Err(Error::InvalidContent {
-				reason: Str::new_static("a missing document cannot have content"),
+				reason: sf!("a missing document cannot have content"),
 			});
 		}
 		Ok(Self { document_id, revision, presence, kind, byte_length })
@@ -260,22 +258,22 @@ impl DocumentSnapshot {
 	pub fn new(head: DocumentHead, content: Bytes) -> Result<Self> {
 		if content.len() as u64 != head.byte_length {
 			return Err(Error::InvalidContent {
-				reason: Str::new_static("snapshot byte length does not match its head"),
+				reason: sf!("snapshot byte length does not match its head"),
 			});
 		}
 		if !head.revision.matches(&content) {
 			return Err(Error::InvalidContent {
-				reason: Str::new_static("snapshot bytes do not match their revision"),
+				reason: sf!("snapshot bytes do not match their revision"),
 			});
 		}
 		if head.presence == DocumentPresence::Missing && !content.is_empty() {
 			return Err(Error::InvalidContent {
-				reason: Str::new_static("a missing document cannot have content"),
+				reason: sf!("a missing document cannot have content"),
 			});
 		}
 		if matches!(&head.kind, DocumentKind::Text(_)) && std::str::from_utf8(&content).is_err() {
 			return Err(Error::InvalidContent {
-				reason: Str::new_static("text document content is not valid UTF-8"),
+				reason: sf!("text document content is not valid UTF-8"),
 			});
 		}
 		Ok(Self { head, content })
@@ -500,7 +498,7 @@ impl ServerConfig {
 		let unresolved = environment_root.as_ref();
 		let root =
 			Dir::open_ambient_dir(unresolved, ambient_authority()).map_err(|source| Error::Io {
-				operation: Str::new_static("open Environment capability root"),
+				operation: sf!("open Environment capability root"),
 				path: unresolved.to_path_buf(),
 				source,
 			})?;
@@ -508,30 +506,30 @@ impl ServerConfig {
 			.try_clone()
 			.and_then(|root| root.into_std_file().metadata())
 			.map_err(|source| Error::Io {
-				operation: Str::new_static("inspect Environment capability root"),
+				operation: sf!("inspect Environment capability root"),
 				path: unresolved.to_path_buf(),
 				source,
 			})?;
 		let canonical = fs::canonicalize(unresolved).map_err(|source| Error::Io {
-			operation: Str::new_static("canonicalize Environment root"),
+			operation: sf!("canonicalize Environment root"),
 			path: unresolved.to_path_buf(),
 			source,
 		})?;
 		let metadata = fs::metadata(&canonical).map_err(|source| Error::Io {
-			operation: Str::new_static("verify Environment root"),
+			operation: sf!("verify Environment root"),
 			path: canonical.clone(),
 			source,
 		})?;
 		if !metadata.is_dir() {
 			return Err(Error::InvalidTarget {
 				target: Str::new(canonical.to_string_lossy()),
-				reason: Str::new_static("Environment root is not a directory"),
+				reason: sf!("Environment root is not a directory"),
 			});
 		}
 		if !same_directory_identity(&metadata, &opened) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(canonical.to_string_lossy()),
-				reason: Str::new_static("Environment root changed while it was opened"),
+				reason: sf!("Environment root changed while it was opened"),
 			});
 		}
 		Ok(Self {
@@ -573,7 +571,7 @@ impl ServerConfig {
 			.is_err()
 		{
 			return Err(Error::Io {
-				operation: Str::new_static("lock Environment authority"),
+				operation: sf!("lock Environment authority"),
 				path:      self.environment_root.clone(),
 				source:    io::Error::new(
 					io::ErrorKind::WouldBlock,
@@ -587,12 +585,12 @@ impl ServerConfig {
 				.try_clone()
 				.map(cap_std::fs::Dir::into_std_file)
 				.map_err(|source| Error::Io {
-					operation: Str::new_static("clone Environment authority handle"),
+					operation: sf!("clone Environment authority handle"),
 					path: self.environment_root.clone(),
 					source,
 				})?;
 			fs2::FileExt::try_lock_exclusive(&root).map_err(|source| Error::Io {
-				operation: Str::new_static("lock Environment authority"),
+				operation: sf!("lock Environment authority"),
 				path: self.environment_root.clone(),
 				source,
 			})?;
@@ -609,7 +607,7 @@ impl ServerConfig {
 
 	pub(crate) fn clone_root(&self) -> Result<Dir> {
 		self.root.try_clone().map_err(|source| Error::Io {
-			operation: Str::new_static("clone Environment capability root"),
+			operation: sf!("clone Environment capability root"),
 			path: self.environment_root.clone(),
 			source,
 		})
@@ -651,14 +649,14 @@ impl ServerConfig {
 			self.environment_root.join(path)
 		};
 		let canonical = fs::canonicalize(&candidate).map_err(|source| Error::Io {
-			operation: Str::new_static("canonicalize document target"),
+			operation: sf!("canonicalize document target"),
 			path: candidate,
 			source,
 		})?;
 		if !canonical.starts_with(&self.environment_root) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(canonical.to_string_lossy()),
-				reason: Str::new_static("target escapes the Environment root"),
+				reason: sf!("target escapes the Environment root"),
 			});
 		}
 		Ok(canonical)
@@ -684,24 +682,24 @@ impl ServerConfig {
 		let Some(file_name) = candidate.file_name() else {
 			return Err(Error::InvalidTarget {
 				target: Str::new(candidate.to_string_lossy()),
-				reason: Str::new_static("target has no final path component"),
+				reason: sf!("target has no final path component"),
 			});
 		};
 		let Some(parent) = candidate.parent() else {
 			return Err(Error::InvalidTarget {
 				target: Str::new(candidate.to_string_lossy()),
-				reason: Str::new_static("target has no parent directory"),
+				reason: sf!("target has no parent directory"),
 			});
 		};
 		let canonical_parent = fs::canonicalize(parent).map_err(|source| Error::Io {
-			operation: Str::new_static("canonicalize target parent"),
+			operation: sf!("canonicalize target parent"),
 			path: parent.to_path_buf(),
 			source,
 		})?;
 		if !canonical_parent.starts_with(&self.environment_root) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(candidate.to_string_lossy()),
-				reason: Str::new_static("target escapes the Environment root"),
+				reason: sf!("target escapes the Environment root"),
 			});
 		}
 		Ok(canonical_parent.join(file_name))
@@ -719,7 +717,7 @@ impl ServerConfig {
 				if !canonical.starts_with(&self.environment_root) {
 					return Err(Error::InvalidTarget {
 						target: Str::new(canonical.to_string_lossy()),
-						reason: Str::new_static("target escapes the Environment root"),
+						reason: sf!("target escapes the Environment root"),
 					});
 				}
 				Ok(canonical)
@@ -729,16 +727,14 @@ impl ServerConfig {
 				{
 					return Err(Error::InvalidTarget {
 						target: Str::new(entry.to_string_lossy()),
-						reason: Str::new_static("document target is a dangling symbolic link"),
+						reason: sf!("document target is a dangling symbolic link"),
 					});
 				}
 				Ok(entry)
 			},
-			Err(source) => Err(Error::Io {
-				operation: Str::new_static("canonicalize document target"),
-				path: entry,
-				source,
-			}),
+			Err(source) => {
+				Err(Error::Io { operation: sf!("canonicalize document target"), path: entry, source })
+			},
 		}
 	}
 
@@ -749,7 +745,7 @@ impl ServerConfig {
 	pub fn resolve_file_uri(&self, uri: &Url) -> Result<PathBuf> {
 		let path = uri.to_file_path().map_err(|()| Error::InvalidTarget {
 			target: Str::new(uri.as_str()),
-			reason: Str::new_static("target is not a local file URI"),
+			reason: sf!("target is not a local file URI"),
 		})?;
 		self.resolve_entry(path)
 	}
@@ -759,7 +755,7 @@ impl ServerConfig {
 	pub fn resolve_document_uri(&self, uri: &Url) -> Result<PathBuf> {
 		let path = uri.to_file_path().map_err(|()| Error::InvalidTarget {
 			target: Str::new(uri.as_str()),
-			reason: Str::new_static("target is not a local file URI"),
+			reason: sf!("target is not a local file URI"),
 		})?;
 		self.resolve_target(path)
 	}
@@ -770,12 +766,12 @@ impl ServerConfig {
 		if resolved != canonical_path {
 			return Err(Error::InvalidTarget {
 				target: Str::new(canonical_path.to_string_lossy()),
-				reason: Str::new_static("path does not have a canonical confined parent"),
+				reason: sf!("path does not have a canonical confined parent"),
 			});
 		}
 		Url::from_file_path(&resolved).map_err(|()| Error::InvalidTarget {
 			target: Str::new(resolved.to_string_lossy()),
-			reason: Str::new_static("path cannot be represented as a file URI"),
+			reason: sf!("path cannot be represented as a file URI"),
 		})
 	}
 }

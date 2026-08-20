@@ -7,7 +7,7 @@ use std::{
 
 use futures::FutureExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
 
@@ -51,7 +51,7 @@ impl MiniMaxCodeUsageFetcher {
 	}
 
 	fn with_provider(http: Arc<dyn OAuthHttpClient>, provider: &str, base: &str) -> Self {
-		Self { provider: ProviderId::from(provider), http, base_url: Str::from(normalize(base)) }
+		Self { provider: ProviderId::from(provider), http, base_url: Str::new(normalize(base)) }
 	}
 }
 impl ConsoleUsageFetcher for MiniMaxCodeUsageFetcher {
@@ -81,7 +81,7 @@ impl ConsoleUsageFetcher for MiniMaxCodeUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta,
 				plan: None,
-				source_label: Some(Str::new_static("minimax-token-plan")),
+				source_label: Some(sf!("minimax-token-plan")),
 				notes: Box::default(),
 				reset_credits: None,
 				windows,
@@ -102,7 +102,7 @@ fn credential_parts(raw: &str) -> Result<(String, UsageAccountMetadata), UsageFe
 			.and_then(Value::as_str)
 			.ok_or(UsageFetchError::Protocol)?
 			.to_owned();
-		let f = |n| v.get(n).and_then(Value::as_str).map(Str::from);
+		let f = |n| v.get(n).and_then(Value::as_str).map(Str::new);
 		Ok((key, UsageAccountMetadata {
 			provider_account_id: f("accountId"),
 			email: f("email"),
@@ -241,12 +241,8 @@ fn bucket_window(
 	let id = format!("{model}:{window_id}");
 	let label = format!("{title} {window_label}");
 	let notes = if total > 0 {
-		vec![Str::from(format!(
-			"Requests: {}/{}",
-			b.get(used_key).and_then(uint).unwrap_or(0),
-			total
-		))]
-		.into_boxed_slice()
+		vec![sf!("Requests: {}/{}", b.get(used_key).and_then(uint).unwrap_or(0), total)]
+			.into_boxed_slice()
 	} else {
 		Box::default()
 	};
@@ -259,14 +255,14 @@ fn bucket_window(
 		UsageStatus::Ok
 	};
 	Some(UsageWindow {
-		id: Str::from(id),
+		id: Str::new(id),
 		kind: UsageWindowKind::Quota,
-		dimension: Str::new_static("percent"),
-		label: Some(Str::from(label)),
+		dimension: sf!("percent"),
+		label: Some(Str::new(label)),
 		scope: Some(if shared {
-			Str::new_static("shared")
+			sf!("shared")
 		} else {
-			Str::from(model)
+			Str::new(model)
 		}),
 		amount: UsageAmount {
 			unit:      UsageUnit::Percent,

@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use omp_agent::{JournalQuery, SessionStateWatchEvent, control::ControlSender};
-use omp_core::{ArtifactUrl, Str};
+use omp_core::{ArtifactUrl, Str, sf};
 use omp_proto::toolhost::v1::{
 	ArtifactRow, JournalHostEnvelope, SessionRow, StateChanged as WireStateChanged,
 	StateValue as WireStateValue, UsageReport, journal_host_envelope,
@@ -118,10 +118,8 @@ impl ExternalJournalActor {
 		let mut agent = self.agent.lock();
 		if agent.is_some() {
 			return Err(
-				super::worker::WorkerError::Protocol(Str::new_static(
-					"agent journal CONTROL is already bound",
-				))
-				.into(),
+				super::worker::WorkerError::Protocol(sf!("agent journal CONTROL is already bound",))
+					.into(),
 			);
 		}
 		*agent = Some(AgentBinding { id, sender });
@@ -385,7 +383,7 @@ async fn dispatch(
 					.map_err(artifact_error)?
 			};
 			let row = artifact_row(&record, &current_session)
-				.ok_or_else(|| Str::new_static("artifact is not visible from this session"))?;
+				.ok_or_else(|| sf!("artifact is not visible from this session"))?;
 			emit(reply, artifact_rows([row]));
 		},
 		ExternalJournalRequest::StatArtifact { request, .. } => {
@@ -396,7 +394,7 @@ async fn dispatch(
 				.stat_url(&current_session, &url)
 				.map_err(display_error)?;
 			let row = artifact_row(&record, &current_session)
-				.ok_or_else(|| Str::new_static("artifact is not visible from this session"))?;
+				.ok_or_else(|| sf!("artifact is not visible from this session"))?;
 			emit(reply, artifact_rows([row]));
 		},
 		ExternalJournalRequest::ListArtifacts { request, .. } => {
@@ -408,9 +406,9 @@ async fn dispatch(
 				.as_ref()
 				.map_or_else(|| SessionId(session_id.clone()), |session| SessionId(session.clone()));
 			if requested_session.0.as_str() != session_id.as_str() {
-				return Err(Str::new_static(
-					"Denied: non-durable cross-session artifact listing is not permitted",
-				));
+				return Err(
+					sf!("Denied: non-durable cross-session artifact listing is not permitted",),
+				);
 			}
 			let cursor = request
 				.cursor
@@ -452,7 +450,7 @@ async fn dispatch(
 				.pin_url_once(durable_request, &url, lifetime)
 				.map_err(artifact_error)?;
 			let row = artifact_row(&record, &current_session)
-				.ok_or_else(|| Str::new_static("artifact is not visible from this session"))?;
+				.ok_or_else(|| sf!("artifact is not visible from this session"))?;
 			emit(reply, artifact_rows([row]));
 		},
 	}
@@ -461,7 +459,7 @@ async fn dispatch(
 fn parse_blob_source(source: &str) -> Result<([u8; 32], Option<u64>), Str> {
 	let source = source
 		.strip_prefix("blob://")
-		.ok_or_else(|| Str::new_static("invalid blob source URL"))?;
+		.ok_or_else(|| sf!("invalid blob source URL"))?;
 	let (resource, query) = source
 		.split_once('?')
 		.map_or((source, None), |(resource, query)| (resource, Some(query)));
@@ -483,7 +481,7 @@ fn parse_blob_source(source: &str) -> Result<([u8; 32], Option<u64>), Str> {
 fn parse_artifact_url(value: &str) -> Result<ArtifactUrl, Str> {
 	let url = ArtifactUrl::new(value).map_err(display_error)?;
 	if url.selector().is_some() {
-		return Err(Str::new_static("artifact CONTROL URLs cannot carry read selectors"));
+		return Err(sf!("artifact CONTROL URLs cannot carry read selectors"));
 	}
 	Ok(url)
 }
@@ -553,7 +551,7 @@ fn state_scope(scope: i32) -> Result<StateScope, Str> {
 		Ok(omp_proto::toolhost::v1::StateScope::Project) => Ok(StateScope::Project),
 		Ok(omp_proto::toolhost::v1::StateScope::User) => Ok(StateScope::User),
 		Ok(omp_proto::toolhost::v1::StateScope::Organization) => Ok(StateScope::Organization),
-		_ => Err(Str::new_static("Unsupported: invalid durable state scope")),
+		_ => Err(sf!("Unsupported: invalid durable state scope")),
 	}
 }
 
@@ -565,16 +563,12 @@ fn require_own_namespace(requested: &str, own: &str) -> Result<(), Str> {
 	if requested == own {
 		Ok(())
 	} else {
-		Err(Str::new_static(
-			"Denied: state writes and SESSION state reads require the authenticated namespace",
-		))
+		Err(sf!("Denied: state writes and SESSION state reads require the authenticated namespace",))
 	}
 }
 
 fn state_owner(state: Option<&StateStore>) -> Result<&StateStore, Str> {
-	state.ok_or_else(|| {
-		Str::new_static("Unsupported: this environment is not the durable state authority")
-	})
+	state.ok_or_else(|| sf!("Unsupported: this environment is not the durable state authority"))
 }
 
 fn bound_agent(agent: &Mutex<Option<AgentBinding>>) -> Result<ControlSender, Str> {
@@ -582,7 +576,7 @@ fn bound_agent(agent: &Mutex<Option<AgentBinding>>) -> Result<ControlSender, Str
 		.lock()
 		.as_ref()
 		.map(|binding| binding.sender.clone())
-		.ok_or_else(|| Str::new_static("agent journal CONTROL is not bound"))
+		.ok_or_else(|| sf!("agent journal CONTROL is not bound"))
 }
 
 fn state_value(value: Option<(u64, Bytes)>) -> JournalHostEnvelope {
@@ -644,14 +638,14 @@ mod tests {
 
 	fn identity() -> JournalConnectionIdentity {
 		JournalConnectionIdentity {
-			principal:          Principal::new(Str::from("os:test"), Str::from("Test User")),
+			principal:          Principal::new(sf!("os:test"), sf!("Test User")),
 			provenance:         Provenance::new(
-				Str::from("publisher"),
-				Str::from("dev.example"),
-				Str::from("1.0.0"),
+				sf!("publisher"),
+				sf!("dev.example"),
+				sf!("1.0.0"),
 				ArtifactDigest::new([7; 32]),
-				Str::from("workspace"),
-				Str::from("trusted"),
+				sf!("workspace"),
+				sf!("trusted"),
 				1,
 			),
 			host_generation:    1,
@@ -662,7 +656,7 @@ mod tests {
 	fn query() -> ExternalJournalRequest {
 		ExternalJournalRequest::Query {
 			request_id: 1,
-			extension:  Str::from("dev.example"),
+			extension:  sf!("dev.example"),
 			query:      QueryJournal { session: "session".to_owned(), ..QueryJournal::default() },
 		}
 	}
@@ -705,9 +699,9 @@ mod tests {
 			sessions,
 			Some(state),
 			blobs,
-			Str::from("session"),
-			Str::from("project"),
-			Str::from("/project"),
+			sf!("session"),
+			sf!("project"),
+			sf!("/project"),
 		)
 		.expect("external actor");
 
@@ -728,7 +722,7 @@ mod tests {
 		let journal_path = state_dir.path().join("session.jsonl");
 		let mut journal = Journal::create(&journal_path, &Header {
 			v:       4,
-			id:      SessionId(Str::from("session")),
+			id:      SessionId(sf!("session")),
 			created: 1,
 			cwd:     state_dir.path().to_path_buf(),
 		})
@@ -797,9 +791,9 @@ mod tests {
 			sessions,
 			Some(state),
 			blobs,
-			Str::from("session"),
-			Str::from("project"),
-			Str::from("/project"),
+			sf!("session"),
+			sf!("project"),
+			sf!("/project"),
 		)
 		.expect("external actor");
 

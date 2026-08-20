@@ -10,7 +10,7 @@ use std::{
 	time::Instant,
 };
 
-use omp_core::{AppendVec, InvocationPhase, Str};
+use omp_core::{AppendVec, InvocationPhase, Str, sf};
 use omp_llm_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -101,7 +101,7 @@ impl YieldPayloadValidator {
 		let result =
 			resolve_result_record(raw, kind.is_some()).ok_or(YieldPayloadError::InvalidEnvelope)?;
 		let error = match result.get("error") {
-			Some(Value::String(error)) => Some(Str::from(error.as_str())),
+			Some(Value::String(error)) => Some(Str::new(error.as_str())),
 			Some(_) => return Err(YieldPayloadError::InvalidError),
 			None => None,
 		};
@@ -375,7 +375,7 @@ impl AgentDefinition {
 			return Err(AgentDefinitionError::MissingFrontmatter);
 		};
 		let prompt = prompt.strip_prefix('\n').unwrap_or(prompt);
-		let mut description = Str::new_static("");
+		let mut description = Default::default();
 		let mut tools = Box::<[Str]>::default();
 		let mut spawns = SpawnPolicy::Disabled;
 		let mut model = None;
@@ -387,20 +387,20 @@ impl AgentDefinition {
 				continue;
 			}
 			let Some((key, value)) = line.split_once(':') else {
-				return Err(AgentDefinitionError::InvalidField(Str::from(line)));
+				return Err(AgentDefinitionError::InvalidField(Str::new(line)));
 			};
 			let value = value.trim();
 			match key.trim() {
-				"description" => description = Str::from(unquote(value)),
+				"description" => description = Str::new(unquote(value)),
 				"tools" => tools = parse_string_list(value)?.into_boxed_slice(),
 				"spawns" => spawns = parse_spawn_policy(value)?,
-				"model" if !value.is_empty() => model = Some(Str::from(unquote(value))),
+				"model" if !value.is_empty() => model = Some(Str::new(unquote(value))),
 				"thinkingLevel" | "thinking_level" if !value.is_empty() => {
-					thinking_level = Some(Str::from(unquote(value)));
+					thinking_level = Some(Str::new(unquote(value)));
 				},
 				"blocking" => {
 					blocking = parse_bool(value)
-						.ok_or_else(|| AgentDefinitionError::InvalidField("blocking".into()))?;
+						.ok_or_else(|| AgentDefinitionError::InvalidField(sf!("blocking")))?;
 				},
 				_ => {},
 			}
@@ -413,7 +413,7 @@ impl AgentDefinition {
 			model,
 			thinking_level,
 			blocking,
-			prompt: Str::from(prompt),
+			prompt: Str::new(prompt),
 		})
 	}
 
@@ -454,11 +454,11 @@ fn parse_string_list(value: &str) -> Result<Vec<Str>, AgentDefinitionError> {
 	}
 	let values = value
 		.split(',')
-		.map(|part| Str::from(unquote(part.trim())))
+		.map(|part| Str::new(unquote(part.trim())))
 		.filter(|part| !part.is_empty())
 		.collect::<Vec<_>>();
 	if values.is_empty() {
-		Err(AgentDefinitionError::InvalidField(Str::from(value)))
+		Err(AgentDefinitionError::InvalidField(Str::new(value)))
 	} else {
 		Ok(values)
 	}
@@ -855,7 +855,7 @@ impl AgentTree {
 			depth,
 			session,
 			status: AtomicU8::new(AgentStatus::Pending as u8),
-			activity: Mutex::new(Str::new_static("")),
+			activity: Mutex::new(Default::default()),
 			budget: Mutex::new(BudgetAccount {
 				budget,
 				usage: Usage::default(),
@@ -1025,14 +1025,10 @@ mod tests {
 	fn child_budget_clamps_to_ancestor_remainder() {
 		let tree = AgentTree::standard(2);
 		tree
-			.register(
-				Str::from("root"),
-				Str::from("Main"),
-				AgentKind::Main,
-				None,
-				Str::from("s"),
-				Budget { max_requests: Some(4), ..Budget::default() },
-			)
+			.register(sf!("root"), sf!("Main"), AgentKind::Main, None, sf!("s"), Budget {
+				max_requests: Some(4),
+				..Budget::default()
+			})
 			.unwrap();
 		tree
 			.debit_receipt("root", Usage { requests: 3, ..Usage::default() })
@@ -1097,7 +1093,7 @@ mod tests {
 				.validate(&json!({"error": "blocked"}))
 				.unwrap()
 				.error,
-			Some(Str::from("blocked"))
+			Some(sf!("blocked"))
 		);
 		assert_eq!(
 			validator

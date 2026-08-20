@@ -5,7 +5,7 @@ use std::sync::{
 	atomic::{AtomicU64, Ordering},
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use omp_proto::omp::ui::v1::{Dialog, UiRequest, ui_request};
 use omp_tools::ask::{Answer, AskPresenter, Fault, HeadlessPresenter, Presentation, Question};
 use omp_tui::{
@@ -40,10 +40,10 @@ impl AskRequest {
 	}
 
 	/// Resolves the blocked tool invocation with a presentation fault.
-	pub fn fail(self, message: impl Into<Str>) {
+	pub fn fail(self, message: impl IntoStr) {
 		let _ = self
 			.reply
-			.send(Err(Fault::Presenter { message: message.into() }));
+			.send(Err(Fault::Presenter { message: message.into_str() }));
 	}
 }
 
@@ -136,7 +136,7 @@ fn dialog_request(question: &Question) -> UiRequest {
 }
 
 fn presenter_fault(message: &'static str) -> Fault {
-	Fault::Presenter { message: Str::new_static(message) }
+	Fault::Presenter { message: sf!(message) }
 }
 
 /// Result of routing input through an Ask dialog.
@@ -237,10 +237,7 @@ impl AskDialog {
 }
 
 fn build_dialog(question: &Question, width: u16, ctx: &UiContext) -> Ui {
-	let title = question
-		.header
-		.clone()
-		.unwrap_or_else(|| Str::new_static("Ask"));
+	let title = question.header.clone().unwrap_or_else(|| sf!("Ask"));
 	let prompt = question.question.clone();
 	let multi = question.multi;
 	let rows = u16::try_from(question.options.len())
@@ -280,12 +277,12 @@ mod tests {
 
 	fn question(multi: bool) -> Question {
 		Question {
-			id: Str::from("language"),
-			question: Str::from("Choose a language"),
-			header: Some(Str::from("Language")),
+			id: sf!("language"),
+			question: sf!("Choose a language"),
+			header: Some(sf!("Language")),
 			options: vec![
-				OptionItem { label: Str::from("Rust"), description: None, preview: None },
-				OptionItem { label: Str::from("Python"), description: None, preview: None },
+				OptionItem { label: sf!("Rust"), description: None, preview: None },
+				OptionItem { label: sf!("Python"), description: None, preview: None },
 			],
 			multi,
 			recommended: Some(0),

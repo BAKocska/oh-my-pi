@@ -4,7 +4,7 @@ use std::fmt;
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
 	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -55,9 +55,9 @@ pub struct Think {
 pub fn tool() -> Think {
 	Think {
 		spec: ToolSpec {
-			name:            Str::new_static("think"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(
+			name:            sf!("think"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(
 				"Records a private reasoning scratch note. It has no external effect and returns only \
 				 an acknowledgement.",
 			),
@@ -96,7 +96,7 @@ impl Tool for Think {
 				Err(error) => { yield param_event(error); return; }
 			};
 			if params.thoughts.trim().is_empty() {
-				yield Ev::Done(ToolTerminal::Done { result: Err(Fault { message: Str::new_static("thoughts must not be empty") }), useless: true });
+				yield Ev::Done(ToolTerminal::Done { result: Err(Fault { message: sf!("thoughts must not be empty") }), useless: true });
 				return;
 			}
 			if let Err(error) = incoming.interruptable().committed().await { yield commit_event(error); return; }
@@ -107,8 +107,8 @@ impl Tool for Think {
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
 		vec![Part::Text {
 			text: match view {
-				Ok(_) => Str::new_static("------"),
-				Err(fault) => Str::from(fault.to_string()),
+				Ok(_) => sf!("------"),
+				Err(fault) => Str::new(fault.to_string()),
 			},
 		}]
 	}
@@ -135,9 +135,9 @@ fn commit_event(error: CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"thoughts":"reasoning"}"#)),
+		example:  Some(sf!(r#"{{"thoughts":"reasoning"}}"#)),
 		found:    Some(message),
 	}
 }

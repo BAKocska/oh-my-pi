@@ -9,7 +9,7 @@
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
 use bytes::{BufMut as _, Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	Availability, ChatCapabilities, DiscoveredModel, ExtendedContextMode, ModelCapabilities,
 	OperationBits, OperationKind, ReasoningCapabilities, ReasoningFeatureBits, WireModelId,
@@ -127,7 +127,7 @@ pub struct CursorProtocolError {
 
 impl CursorProtocolError {
 	const fn new(kind: CursorErrorKind, reason: &'static str, committed: bool) -> Self {
-		Self { kind, reason: Str::new_static(reason), committed, status: None }
+		Self { kind, reason: sf!(reason), committed, status: None }
 	}
 }
 
@@ -518,9 +518,9 @@ pub fn decode_discovery_response(
 			model.display_name.trim()
 		};
 		models.insert(id.to_owned(), CursorDiscoveredModel {
-			id:        Str::from(id),
-			name:      Str::from(name),
-			aliases:   model.aliases.into_iter().map(Str::from).collect(),
+			id:        Str::new(id),
+			name:      Str::new(name),
+			aliases:   model.aliases.into_iter().map(Str::new).collect(),
 			reasoning: model.thinking_details.is_some(),
 			max_mode:  model.max_mode.unwrap_or(false),
 		});
@@ -1183,7 +1183,7 @@ impl CursorDecoder {
 		if text.is_empty() {
 			return;
 		}
-		let text = Str::from(text);
+		let text = Str::new(text);
 		events.push(CursorEvent::Chat(Box::new(if kind == OpenKind::Text {
 			ChatEvent::TextDelta { index, text }
 		} else {
@@ -1235,10 +1235,10 @@ fn shell_invocation(
 	};
 	Ok(CursorShellInvocation {
 		id: exec.id,
-		exec_id: Str::from(exec.exec_id),
+		exec_id: Str::new(exec.exec_id),
 		call_id: ToolCallId::from(args.tool_call_id),
-		command: Str::from(args.command),
-		working_directory: Str::from(args.working_directory),
+		command: Str::new(args.command),
+		working_directory: Str::new(args.working_directory),
 		timeout_ms: args.timeout.max(0) as u32,
 		streaming,
 	})
@@ -1328,7 +1328,7 @@ fn tool_name(tool: Option<&wire::ToolCall>) -> Str {
 		Tool::ReadLintsToolCall(_) => "read_lints",
 		Tool::McpToolCall(call) => {
 			return call.args.as_ref().map_or_else(Str::default, |args| {
-				Str::from(if args.tool_name.is_empty() {
+				Str::new(if args.tool_name.is_empty() {
 					args.name.as_str()
 				} else {
 					args.tool_name.as_str()
@@ -1361,7 +1361,7 @@ fn tool_name(tool: Option<&wire::ToolCall>) -> Str {
 		Tool::ConnectScmToolCall(_) => "connect_scm",
 		Tool::SearchConversationsToolCall(_) => "search_conversations",
 	};
-	Str::new_static(name)
+	sf!(name)
 }
 
 /// Rejection-reason suffix answered for interactive queries this client does
@@ -1574,7 +1574,7 @@ impl CursorConversationRotations {
 			.pending
 			.insert(request.clone(), CursorConversationAttempt {
 				base: base.clone(),
-				seed: Str::from(request.as_str()),
+				seed: Str::new(request.as_str()),
 			});
 		wire
 	}
@@ -1589,7 +1589,7 @@ impl CursorConversationRotations {
 		}
 		self
 			.rotated
-			.insert(base.clone(), Str::from(format!("cursor-rotated-{seed}")));
+			.insert(base.clone(), sf!("cursor-rotated-{seed}"));
 		true
 	}
 }
@@ -1615,10 +1615,7 @@ impl Codec for CursorCodec {
 				}
 				let mut headers = Vec::with_capacity(6);
 				for_each_public_header(CursorHeaderProfile::Discovery, |name, value| {
-					headers.push(RequestHeader {
-						name:  Str::new_static(name),
-						value: Str::new_static(value),
-					});
+					headers.push(RequestHeader { name: sf!(name), value: sf!(value) });
 				});
 				Ok(EncodedRequest::new(
 					OperationKind::DiscoverModels,
@@ -1702,24 +1699,24 @@ fn encode_chat_call(
 		None => return Err(encoding_error("cursor_extended_context_mode_unknown")),
 	};
 	let run = CursorRunRequest {
-		model_id: Str::from(target.wire_model.as_str()),
+		model_id: Str::new(target.wire_model.as_str()),
 		max_mode,
 		conversation_id: context.session.map(|session| {
 			conversations
 				.lock()
-				.begin(context.request_id, &Str::from(session.conversation.as_str()))
+				.begin(context.request_id, &Str::new(session.conversation.as_str()))
 		}),
 		checkpoint: None,
 		root_prompts: roots.into_boxed_slice(),
 		tools: tools.into_boxed_slice(),
 		action: CursorRunAction::UserMessage {
-			message_id: Str::from(context.request_id.as_str()),
+			message_id: Str::new(context.request_id.as_str()),
 			text:       user,
 		},
 	};
 	let mut headers = Vec::with_capacity(6);
 	for_each_public_header(CursorHeaderProfile::Run, |name, value| {
-		headers.push(RequestHeader { name: Str::new_static(name), value: Str::new_static(value) });
+		headers.push(RequestHeader { name: sf!(name), value: sf!(value) });
 	});
 	Ok(EncodedRequest::new(
 		OperationKind::Chat,
@@ -1759,7 +1756,7 @@ fn cursor_message_text(context: &EncodeContext<'_>, content: &[ContentPart]) -> 
 			},
 		}
 	}
-	Ok(Str::from(text))
+	Ok(Str::new(text))
 }
 
 fn reject_unprojected_chat_options(
@@ -1793,7 +1790,7 @@ fn endpoint_uri(base: &str, path: &str) -> Str {
 	let mut uri = String::with_capacity(base.len() + path.len());
 	uri.push_str(base.trim_end_matches('/'));
 	uri.push_str(path);
-	Str::from(uri)
+	Str::new(uri)
 }
 
 const fn cursor_bounds() -> SizeBounds {
@@ -1874,7 +1871,7 @@ impl Decoder for CursorWireDecoder {
 						declared_limits:       None,
 						extended_context_mode: Some(ExtendedContextMode::from_enabled(model.max_mode)),
 						availability:          None,
-						source:                Str::new_static("cursor_get_usable_models"),
+						source:                sf!("cursor_get_usable_models"),
 						observed_at_ms:        None,
 						updated_at_ms:         None,
 						deprecated:            None,
@@ -1977,7 +1974,7 @@ fn cursor_raw_event(event: CursorEvent) -> RawEvent {
 		},
 		CursorEvent::ShellInvoke(invocation) => {
 			RawEvent::Control(ProviderControlEvent::ShellInvoke {
-				invocation: Str::from(invocation.id.to_string()),
+				invocation: Str::new(invocation.id.to_string()),
 				exec:       (!invocation.exec_id.is_empty()).then_some(invocation.exec_id),
 				call:       invocation.call_id,
 				command:    invocation.command,
@@ -1996,7 +1993,7 @@ fn cursor_raw_event(event: CursorEvent) -> RawEvent {
 		CursorEvent::InteractionQuery { id, query, reply } => {
 			let kind = query
 				.as_ref()
-				.map_or(Str::new_static("unknown"), interaction_query_kind);
+				.map_or(sf!("unknown"), interaction_query_kind);
 			let payload = Bytes::from(wire::InteractionQuery { id, query }.encode_to_vec());
 			RawEvent::Control(ProviderControlEvent::InteractionQuery { id, kind, payload, reply })
 		},
@@ -2008,7 +2005,7 @@ fn cursor_raw_event(event: CursorEvent) -> RawEvent {
 
 const fn interaction_query_kind(query: &wire::interaction_query::Query) -> Str {
 	use wire::interaction_query::Query;
-	Str::new_static(match query {
+	sf!(match query {
 		Query::WebSearchRequestQuery(_) => "web_search",
 		Query::WebFetchRequestQuery(_) => "web_fetch",
 		Query::AskQuestionInteractionQuery(_) => "ask_question",
@@ -2042,7 +2039,7 @@ fn inference_error(error: CursorProtocolError) -> Error {
 }
 
 fn encoding_error(reason: &'static str) -> Error {
-	let reason = Str::new_static(reason);
+	let reason = sf!(reason);
 	Error::new(
 		ErrorKind::CapabilityMismatch,
 		ErrorPhase::Encoding,
@@ -2330,7 +2327,7 @@ mod tests {
 			assert_eq!(*id, case.id);
 			let kind = query
 				.as_ref()
-				.map_or(Str::new_static("unknown"), interaction_query_kind);
+				.map_or(sf!("unknown"), interaction_query_kind);
 			assert_eq!(Some(kind.as_str()), case.kind.as_deref());
 
 			match case.disposition.as_str() {
@@ -2474,7 +2471,7 @@ mod tests {
 		// A bare resource_exhausted end-stream with zero generated tokens is a
 		// poisoned conversation: the wire id rotates so the caller's retry
 		// starts a fresh conversation, exactly like /fork.
-		let base = Str::from("conversation-poisoned");
+		let base = sf!("conversation-poisoned");
 		let (mut decoder, wire_id) = wire_decoder(&conversations, "request-1", &base);
 		assert_eq!(wire_id, base, "first attempt sends the caller's conversation id");
 		let error = decoder
@@ -2496,7 +2493,7 @@ mod tests {
 
 		// A conversation that already produced tokens is exhausted, not
 		// poisoned: its id is preserved.
-		let billed = Str::from("conversation-billed");
+		let billed = sf!("conversation-billed");
 		let (mut decoder, _) = wire_decoder(&conversations, "request-3", &billed);
 		decoder
 			.push(
@@ -2814,7 +2811,7 @@ mod tests {
 		assert_eq!(resource.kind, CursorErrorKind::ResourceExhausted);
 
 		let mut rotations = CursorConversationRotations::default();
-		let base = Str::from("session-poisoned");
+		let base = sf!("session-poisoned");
 		assert_eq!(rotations.resolve(&base), base);
 		assert!(rotations.rotate_once(&base, "request-one"));
 		let rotated = rotations.resolve(&base);
@@ -2863,7 +2860,7 @@ mod tests {
 			checkpoint
 		);
 		let reconnect =
-			encode_reconnect_request(&CursorReconnectRequest { request_id: Str::from("request-7") });
+			encode_reconnect_request(&CursorReconnectRequest { request_id: sf!("request-7") });
 		assert_eq!(
 			wire::BidiRequestId::decode(reconnect)
 				.expect("reconnect request")
@@ -2924,10 +2921,10 @@ mod tests {
 
 		let invocation = CursorShellInvocation {
 			id:                17,
-			exec_id:           Str::from("exec-17"),
+			exec_id:           sf!("exec-17"),
 			call_id:           ToolCallId::from("call-shell"),
-			command:           Str::from("printf colours"),
-			working_directory: Str::from("/work/project"),
+			command:           sf!("printf colours"),
+			working_directory: sf!("/work/project"),
 			timeout_ms:        750,
 			streaming:         true,
 		};
@@ -2964,7 +2961,7 @@ mod tests {
 		}
 		for completion in [
 			CursorShellCompletion::Exited {
-				stdout:                  Str::from("committed output"),
+				stdout:                  sf!("committed output"),
 				stderr:                  Str::default(),
 				local_execution_time_ms: 41,
 			},
@@ -2974,12 +2971,9 @@ mod tests {
 				stderr:                  Str::default(),
 				local_execution_time_ms: 41,
 			},
-			CursorShellCompletion::Rejected {
-				reason:      Str::from("policy detail"),
-				is_readonly: true,
-			},
+			CursorShellCompletion::Rejected { reason: sf!("policy detail"), is_readonly: true },
 			CursorShellCompletion::PermissionDenied {
-				reason:      Str::from("policy detail"),
+				reason:      sf!("policy detail"),
 				is_readonly: true,
 			},
 			CursorShellCompletion::TimedOut { timeout_ms: 750 },
@@ -3105,7 +3099,7 @@ mod tests {
 		}))
 		.expect("protobuf JSON Value schema");
 		let encoded = encode_run_request(&CursorRunRequest {
-			model_id:        Str::from(request.canonical_intent.model.as_str()),
+			model_id:        Str::new(request.canonical_intent.model.as_str()),
 			max_mode:        false,
 			conversation_id: None,
 			checkpoint:      None,
@@ -3115,14 +3109,14 @@ mod tests {
 				.tools
 				.into_iter()
 				.map(|tool| CursorToolDefinition {
-					name:         Str::from(tool.name),
+					name:         Str::new(tool.name),
 					description:  None,
 					input_schema: input_schema.clone(),
 				})
 				.collect(),
 			action:          CursorRunAction::UserMessage {
-				message_id: Str::from("request-fixture"),
-				text:       Str::from("Inspect package.json"),
+				message_id: sf!("request-fixture"),
+				text:       sf!("Inspect package.json"),
 			},
 		})
 		.expect("typed run request");

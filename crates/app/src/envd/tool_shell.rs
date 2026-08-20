@@ -5,7 +5,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::{CowBytes, Str, encoding::hex, fmts};
+use omp_core::{CowBytes, Str, encoding::hex, sf};
 use omp_proto::env::v1::{
 	EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
 	OutputChannel as EnvOutputChannel, ProcessSpec, PtySpec, RestartPolicy, RestartSpec, Script,
@@ -133,7 +133,7 @@ fn hardened_environment(user: std::collections::BTreeMap<Str, Str>, pty: bool) -
 }
 
 fn named_process(started: omp_proto::env::v1::ProcessStarted) -> DetachedJob {
-	let id = fmts!("{}#{}", started.name, started.generation);
+	let id = sf!("{}#{}", started.name, started.generation);
 	DetachedJob {
 		id,
 		owner: JobOwner::NamedProcess {
@@ -144,7 +144,7 @@ fn named_process(started: omp_proto::env::v1::ProcessStarted) -> DetachedJob {
 }
 
 fn cwd_fault(message: impl Into<Str>) -> Fault {
-	Fault::Resource { operation: Str::new_static("cwd"), message: message.into() }
+	Fault::Resource { operation: sf!("cwd"), message: message.into() }
 }
 /// Foreground shell run retaining the concrete host's process-tree guard.
 pub struct HostShellRun {
@@ -271,7 +271,7 @@ fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 				Ok(EnvOutputChannel::Unspecified) | Err(_) => {
 					return Err(protocol_fault(
 						"next_event",
-						fmts!("invalid output channel {}", frame.channel),
+						sf!("invalid output channel {}", frame.channel),
 					));
 				},
 			};
@@ -294,7 +294,7 @@ fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 				Ok(EnvExecOutcome::Unspecified) | Err(_) => {
 					return Err(protocol_fault(
 						"next_event",
-						fmts!("invalid execution outcome {}", status.outcome),
+						sf!("invalid execution outcome {}", status.outcome),
 					));
 				},
 			};
@@ -318,9 +318,9 @@ fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 }
 
 fn resource_fault(operation: &'static str, error: ExecError) -> Fault {
-	protocol_fault(operation, fmts!("{error}"))
+	protocol_fault(operation, sf!("{error}"))
 }
 
 fn protocol_fault(operation: &'static str, message: impl Into<Str>) -> Fault {
-	Fault::Resource { operation: Str::new_static(operation), message: message.into() }
+	Fault::Resource { operation: sf!(operation), message: message.into() }
 }

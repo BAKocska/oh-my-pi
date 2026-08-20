@@ -96,17 +96,15 @@ mod tests {
 
 	#[test]
 	fn leftmost_match_wins_the_choice_ladder() {
-		let choices: smallvec::SmallVec<Str, 4> =
-			smallvec::smallvec![Str::from("later"), Str::from("first")];
+		let choices: smallvec::SmallVec<Str, 4> = smallvec::smallvec![sf!("later"), sf!("first")];
 		assert_eq!(select_choice("first then later", &choices), Some(&choices[1]));
 	}
 
 	#[test]
 	fn default_marks_fallback_for_provider_failure() {
-		let request = CompletionRequest { default: Some(Str::from("unknown")), ..Default::default() };
+		let request = CompletionRequest { default: Some(sf!("unknown")), ..Default::default() };
 		let completion =
-			resolve_completion(&request, Err(CompletionError::Provider(Str::from("offline"))))
-				.unwrap();
+			resolve_completion(&request, Err(CompletionError::Provider(sf!("offline")))).unwrap();
 		assert!(completion.fell_back);
 		assert_eq!(completion.choice.as_deref(), Some("unknown"));
 	}

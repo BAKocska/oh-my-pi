@@ -22,7 +22,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{Str, base64, fmts, hex};
+use omp_core::{Str, base64, hex, sf};
 use smallvec::SmallVec;
 
 use crate::{Key, imagefmt::ImageFormat};
@@ -169,9 +169,9 @@ impl PasteEvents {
 					self.phase = Some(PastePhase::Listing {
 						mimes:     SmallVec::new(),
 						kitty_dot: false,
-						pw:        metadata_value(&metadata, "pw").map(Str::from),
+						pw:        metadata_value(&metadata, "pw").map(Str::new),
 						loc:       (metadata_value(&metadata, "loc") == Some("primary"))
-							.then(|| Str::from("primary")),
+							.then(|| sf!("primary")),
 					});
 				}
 				PasteProgress::Consumed
@@ -216,13 +216,13 @@ impl PasteEvents {
 						.split_ascii_whitespace()
 						.filter(|candidate| !candidate.is_empty() && *candidate != ".")
 						.take(MAX_LISTED_MIMES.saturating_sub(mimes.len()))
-						.map(Str::from),
+						.map(Str::new),
 				);
 				false
 			},
 			Some(PastePhase::Listing { mimes, .. }) => {
 				if mimes.len() < MAX_LISTED_MIMES {
-					mimes.push(Str::from(mime));
+					mimes.push(Str::new(mime));
 				}
 				false
 			},
@@ -233,7 +233,7 @@ impl PasteEvents {
 				if *bytes > MAX_READ_PAYLOAD_BYTES {
 					true
 				} else {
-					chunks.push(Str::from(payload));
+					chunks.push(Str::new(payload));
 					false
 				}
 			},
@@ -288,7 +288,7 @@ impl PasteEvents {
 					return PasteProgress::Consumed;
 				}
 				if mime == "text/plain" {
-					return PasteProgress::Done(Pasted::Text(Str::from(
+					return PasteProgress::Done(Pasted::Text(Str::new(
 						String::from_utf8_lossy(&bytes).as_ref(),
 					)));
 				}
@@ -305,7 +305,7 @@ fn parse_metadata(raw: &str) -> SmallVec<(Str, Str), 6> {
 	raw.split(':')
 		.filter_map(|part| {
 			let (key, value) = part.split_once('=')?;
-			(!key.is_empty()).then(|| (Str::from(key), Str::from(value)))
+			(!key.is_empty()).then(|| (Str::new(key), Str::new(value)))
 		})
 		.collect()
 }
@@ -327,7 +327,7 @@ fn choose_mime(mimes: &[Str]) -> Option<Str> {
 		.into_iter()
 		.chain(["text/plain"])
 		.find(|candidate| mimes.iter().any(|mime| mime == candidate))
-		.map(Str::from)
+		.map(Str::new_static)
 }
 
 fn mime_format(mime: &str) -> Option<ImageFormat> {
@@ -444,7 +444,7 @@ fn normalize_path(raw: &str) -> Option<Str> {
 	if let Some(rest) = unescaped.strip_prefix("~/") {
 		#[allow(deprecated, reason = "the standard-library home lookup matches shell path expansion")]
 		let home = std::env::home_dir()?;
-		return Some(fmts!("{}/{}", home.display(), rest));
+		return Some(sf!("{}/{}", home.display(), rest));
 	}
 	Some(unescaped)
 }
@@ -981,7 +981,7 @@ fn read_file_urls() -> Option<Vec<Str>> {
 		.lines()
 		.map(str::trim)
 		.filter(|line| !line.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 		.collect();
 	(!paths.is_empty()).then_some(paths)
 }
@@ -1087,7 +1087,7 @@ mod tests {
 		);
 		assert_eq!(
 			events.handle_osc_at("5522;type=read:status=DONE", later),
-			PasteProgress::Done(Pasted::Text(Str::from("back")))
+			PasteProgress::Done(Pasted::Text(sf!("back")))
 		);
 	}
 
@@ -1106,7 +1106,7 @@ mod tests {
 		);
 		assert_eq!(
 			complete_text_read(&mut events, "next"),
-			PasteProgress::Done(Pasted::Text(Str::from("next")))
+			PasteProgress::Done(Pasted::Text(sf!("next")))
 		);
 	}
 
@@ -1171,7 +1171,7 @@ mod tests {
 		));
 		assert_eq!(
 			events.handle_osc("5522;type=read:status=DONE"),
-			PasteProgress::Done(Pasted::Text(Str::from("hello")))
+			PasteProgress::Done(Pasted::Text(sf!("hello")))
 		);
 
 		events.handle_osc("5522;type=read:status=OK");
@@ -1196,7 +1196,7 @@ mod tests {
 		}
 		assert_eq!(
 			events.handle_osc("5522;type=read:status=DONE"),
-			PasteProgress::Done(Pasted::Text(Str::from("ab")))
+			PasteProgress::Done(Pasted::Text(sf!("ab")))
 		);
 	}
 
@@ -1251,10 +1251,7 @@ mod tests {
 	fn expands_home_path_when_available() {
 		#[allow(deprecated, reason = "the production path expansion uses the same standard lookup")]
 		if let Some(home) = std::env::home_dir() {
-			assert_eq!(dropped_paths("~/image.png").as_slice(), [fmts!(
-				"{}/image.png",
-				home.display()
-			)]);
+			assert_eq!(dropped_paths("~/image.png").as_slice(), [sf!("{}/image.png", home.display())]);
 		}
 	}
 
@@ -1294,14 +1291,11 @@ mod tests {
 		// URL and a generated icon bitmap; the file path must win so vision
 		// models receive the copied image, not a generic document icon.
 		let clipboard = smart_clipboard(
-			Some(vec![Str::from("/Users/me/Desktop/screenshot.png")]),
+			Some(vec![sf!("/Users/me/Desktop/screenshot.png")]),
 			|| Some(icon_bitmap()),
 			|| unreachable!("text is never consulted when an image path resolves"),
 		);
-		assert_eq!(
-			clipboard,
-			Some(Clipboard::Paths(vec![Str::from("/Users/me/Desktop/screenshot.png")]))
-		);
+		assert_eq!(clipboard, Some(Clipboard::Paths(vec![sf!("/Users/me/Desktop/screenshot.png")])));
 	}
 
 	#[test]
@@ -1314,18 +1308,15 @@ mod tests {
 	fn non_image_file_url_falls_to_the_bitmap_then_to_paths() {
 		// A non-image Finder selection: the bitmap representation wins …
 		let clipboard = smart_clipboard(
-			Some(vec![Str::from("/Users/me/Documents/report.pdf")]),
+			Some(vec![sf!("/Users/me/Documents/report.pdf")]),
 			|| Some(icon_bitmap()),
 			|| None,
 		);
 		assert_eq!(clipboard, Some(Clipboard::Image(icon_bitmap())));
 		// … and without a bitmap the copied paths still paste.
 		let clipboard =
-			smart_clipboard(Some(vec![Str::from("/Users/me/Documents/report.pdf")]), || None, || None);
-		assert_eq!(
-			clipboard,
-			Some(Clipboard::Paths(vec![Str::from("/Users/me/Documents/report.pdf")]))
-		);
+			smart_clipboard(Some(vec![sf!("/Users/me/Documents/report.pdf")]), || None, || None);
+		assert_eq!(clipboard, Some(Clipboard::Paths(vec![sf!("/Users/me/Documents/report.pdf")])));
 	}
 
 	#[test]

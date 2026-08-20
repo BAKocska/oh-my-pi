@@ -10,7 +10,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -43,8 +43,8 @@ pub struct LocalError {
 
 impl LocalError {
 	/// Constructs a local failure.
-	pub fn new(kind: LocalErrorKind, message: impl Into<Str>) -> Self {
-		Self { kind, message: message.into() }
+	pub fn new(kind: LocalErrorKind, message: impl IntoStr) -> Self {
+		Self { kind, message: message.into_str() }
 	}
 
 	/// Constructs a cancellation failure.
@@ -69,13 +69,13 @@ pub struct AvailabilityEvidence {
 
 impl AvailabilityEvidence {
 	/// Constructs positive availability evidence.
-	pub fn available(detail: impl Into<Str>) -> Self {
-		Self { available: true, code: "available".into(), detail: detail.into() }
+	pub fn available(detail: impl IntoStr) -> Self {
+		Self { available: true, code: sf!("available"), detail: detail.into_str() }
 	}
 
 	/// Constructs negative availability evidence.
-	pub fn unavailable(code: impl Into<Str>, detail: impl Into<Str>) -> Self {
-		Self { available: false, code: code.into(), detail: detail.into() }
+	pub fn unavailable(code: impl IntoStr, detail: impl IntoStr) -> Self {
+		Self { available: false, code: code.into_str(), detail: detail.into_str() }
 	}
 }
 

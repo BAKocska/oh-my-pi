@@ -14,7 +14,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_env::{EnvClient, InProcessEnvTransport};
 use omp_proto::{
 	blob::v1 as blob_pb,
@@ -45,6 +45,7 @@ use super::{
 	},
 	eval::SessionBridgeHost,
 	exec::{ExecError, ExecEvent, ExecHost, ProcessEvent},
+	http_egress::{HttpEgressError, HttpEgressHost},
 	journal_runtime::ExternalJournalActor,
 	policy::{AuthorityTable, DataAuthority, Grants, PolicyError, QuotaAccount},
 	site::{SiteError, SiteMaterializer, record_modules},
@@ -105,7 +106,7 @@ impl InvocationExecutionPolicy {
 		{
 			return None;
 		}
-		Some(Str::new_static(
+		Some(sf!(
 			"plan mode denied a mutating tool call at the Environment boundary; write plan and \
 			 scratch artifacts under local:// (vault:// and sandbox:// are also exempt), or exit \
 			 plan mode before changing the workspace",
@@ -450,7 +451,7 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 						return;
 					},
 					WorkerEvent::Pull(_) | WorkerEvent::ProtocolError(_) => {
-						yield Err(RegistryError::VerdictShape(Str::new_static("worker device protocol rejected final invocation")));
+						yield Err(RegistryError::VerdictShape(sf!("worker device protocol rejected final invocation")));
 						return;
 					},
 				}
@@ -478,6 +479,7 @@ pub struct EnvServer {
 	documents:           DocumentHost,
 	_document_authority: Option<DocumentAuthority>,
 	exec:                ExecHost,
+	http_egress:         HttpEgressHost,
 	workspace:           WorkspaceHost,
 	blobs:               BlobHost,
 	sites:               SiteMaterializer,
@@ -558,6 +560,7 @@ impl EnvServer {
 			documents,
 			_document_authority: document_authority,
 			exec,
+			http_egress: HttpEgressHost::new(),
 			workspace,
 			blobs,
 			sites,
@@ -1671,6 +1674,19 @@ impl EnvServer {
 					Err(error) => send_exec_error(responses, frame.request_id, &error).await,
 				}
 			},
+			client_frame::Body::HttpRequest(request) => {
+				match self.http_egress.request(request).await {
+					Ok(response) => {
+						send_body(
+							responses,
+							frame.request_id,
+							server_frame::Body::HttpResponse(response),
+						)
+						.await;
+					},
+					Err(error) => send_http_error(responses, frame.request_id, &error).await,
+				}
+			},
 			client_frame::Body::ListProcesses(_) => {
 				send_body(
 					responses,
@@ -2136,9 +2152,9 @@ impl EnvServer {
 		let result = match request.op {
 			Some(Op::Open(open)) => {
 				let key = WorkerKey {
-					extension: Str::new_static("env"),
+					extension: sf!("env"),
 					name:      Str::from(open.name.as_str()),
-					site:      Str::new_static("env"),
+					site:      sf!("env"),
 				};
 				match self.workers.open(key) {
 					Ok((route, lease)) => {
@@ -3579,15 +3595,15 @@ impl ConnectionState {
 				InvocationState::Native { id, feed, lifecycle, cancel, .. } => {
 					if lifecycle.is_committed() {
 						let _ = feed.interrupt(Interrupt {
-							class:  Str::new_static("cancel"),
-							reason: Str::new_static("invocation cancelled by client"),
+							class:  sf!("cancel"),
+							reason: sf!("invocation cancelled by client"),
 						});
 						cancel.cancel();
 						None
 					} else if lifecycle.claim_precommit_terminal() {
 						cancel.cancel();
 						Some((id.clone(), omp_tool::Abort::Skipped {
-							reason: Str::new_static("invocation cancelled before argument commitment"),
+							reason: sf!("invocation cancelled before argument commitment"),
 						}))
 					} else {
 						cancel.cancel();
@@ -3599,7 +3615,7 @@ impl ConnectionState {
 					(!*committed).then(|| {
 						self.authority.settle(owner, id);
 						(id.clone(), omp_tool::Abort::Skipped {
-							reason: Str::new_static("invocation cancelled before argument commitment"),
+							reason: sf!("invocation cancelled before argument commitment"),
 						})
 					})
 				},
@@ -3652,10 +3668,7 @@ impl ConnectionState {
 		let terminal = match result {
 			Ok(InvocationState::Native { id, feed, lifecycle, cancel, .. }) => {
 				let reason = Str::from(request.reason);
-				let _ = feed.interrupt(Interrupt {
-					class:  Str::new_static("immediate"),
-					reason: reason.clone(),
-				});
+				let _ = feed.interrupt(Interrupt { class: sf!("immediate"), reason: reason.clone() });
 				if lifecycle.is_committed() {
 					None
 				} else if lifecycle.claim_precommit_terminal() {
@@ -3706,8 +3719,8 @@ impl ConnectionState {
 				}) => {
 					if lifecycle.is_committed() {
 						let _ = feed.interrupt(Interrupt {
-							class:  Str::new_static("disconnect"),
-							reason: Str::new_static("environment connection closed"),
+							class:  sf!("disconnect"),
+							reason: sf!("environment connection closed"),
 						});
 					}
 					lifecycle.claim_terminal();
@@ -3862,9 +3875,9 @@ async fn spawn_native_invocation(
 						tokio::select! {
 							biased;
 							() = deadline.as_mut() => {
-								let reason = Str::new_static("native invocation deadline exceeded");
+								let reason = sf!("native invocation deadline exceeded");
 								let _ = feed.interrupt(Interrupt {
-									class: Str::new_static("deadline"),
+									class: sf!("deadline"),
 									reason: reason.clone(),
 								});
 								if lifecycle.is_committed() {
@@ -3910,8 +3923,8 @@ async fn spawn_native_invocation(
 									NativeForward::Terminal => break,
 									NativeForward::Backpressure => {
 										let _ = feed.interrupt(Interrupt {
-											class: Str::new_static("backpressure"),
-											reason: Str::new_static(
+											class: sf!("backpressure"),
+											reason: sf!(
 												"invocation response consumer stopped reading",
 											),
 										});
@@ -3932,11 +3945,9 @@ async fn spawn_native_invocation(
 				if grace_expired && lifecycle.is_committed() && lifecycle.claim_terminal() {
 					drop(stream);
 					let reason = if timed_out {
-						Str::new_static(
-							"native invocation exceeded its deadline and did not stop within grace",
-						)
+						sf!("native invocation exceeded its deadline and did not stop within grace",)
 					} else {
-						Str::new_static("native invocation did not stop within cancellation grace")
+						sf!("native invocation did not stop within cancellation grace")
 					};
 					send_abort_verdict(
 						&responses,
@@ -4131,7 +4142,7 @@ fn spawn_worker_invocation(
 							request_id,
 							&invocation_id,
 							omp_tool::Abort::EffectsUnknown {
-								reason: Str::new_static("worker returned invalid structured result JSON"),
+								reason: sf!("worker returned invalid structured result JSON"),
 							},
 						)
 						.await;
@@ -4155,7 +4166,7 @@ fn spawn_worker_invocation(
 				},
 				Some(WorkerEvent::Aborted(abort)) => {
 					let reason = if cancel_requested {
-						Str::new_static("environment invocation cancelled")
+						sf!("environment invocation cancelled")
 					} else {
 						abort.reason
 					};
@@ -4753,7 +4764,7 @@ fn worker_completion_json(
 	let details = complete
 		.details_json
 		.clone()
-		.ok_or_else(|| Str::new_static("worker completion omitted structured details"))?;
+		.ok_or_else(|| sf!("worker completion omitted structured details"))?;
 	let json = match complete.kind {
 		WorkerOutcomeKind::Ok | WorkerOutcomeKind::Faulted => {
 			worker_verdict_json(details, is_error).map_err(|error| Str::from(error.to_string()))?
@@ -4762,11 +4773,11 @@ fn worker_completion_json(
 			let issue = complete
 				.args_issue
 				.as_ref()
-				.ok_or_else(|| Str::new_static("worker omitted its argument issue"))?;
+				.ok_or_else(|| sf!("worker omitted its argument issue"))?;
 			let kind = issue
 				.kind
 				.parse()
-				.map_err(|_| Str::new_static("worker argument issue kind is invalid"))?;
+				.map_err(|_| sf!("worker argument issue kind is invalid"))?;
 			let issue = ArgIssue {
 				path: issue
 					.path
@@ -4994,6 +5005,7 @@ async fn send_exec_error(
 fn worker_operation_allowed(operation: &str) -> bool {
 	operation.starts_with("omp.env.docs.")
 		|| operation.starts_with("omp.env.find.")
+		|| operation.starts_with("omp.env.http.")
 		|| matches!(
 			operation,
 			"omp.env.blobs.stat"
@@ -5076,7 +5088,21 @@ async fn send_document_error(
 	send_error(responses, request_id, code, &error.to_string()).await;
 }
 
-const fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str, &'static str)> {
+async fn send_http_error(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	error: &HttpEgressError,
+) {
+	let code = match error {
+		HttpEgressError::InvalidArgument(_) => pb::ProtocolErrorCode::InvalidArgument,
+		HttpEgressError::TimedOut => pb::ProtocolErrorCode::DeadlineExceeded,
+		HttpEgressError::ResponseTooLarge => pb::ProtocolErrorCode::ResourceExhausted,
+		HttpEgressError::Transport(_) => pb::ProtocolErrorCode::Internal,
+	};
+	send_error(responses, request_id, code, &error.to_string()).await;
+}
+
+fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str, &'static str)> {
 	match body {
 		client_frame::Body::OpenSession(_) => Some(("omp.env.sh.open_session", "env.exec")),
 		client_frame::Body::CloseSession(_) => Some(("omp.env.sh.close_session", "env.exec")),
@@ -5085,6 +5111,14 @@ const fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str
 		client_frame::Body::Signal(_) => Some(("omp.env.sh.signal", "env.exec")),
 		client_frame::Body::Resize(_) => Some(("omp.env.sh.resize", "env.exec")),
 		client_frame::Body::StartProcess(_) => Some(("omp.env.proc.start", "env.process")),
+		client_frame::Body::HttpRequest(request) => Some((
+			match request.method.as_str() {
+				"POST" => "omp.env.http.post",
+				"PUT" => "omp.env.http.put",
+				_ => "omp.env.http.get",
+			},
+			"env.net",
+		)),
 		client_frame::Body::ListProcesses(_) => Some(("omp.env.proc.list", "env.process")),
 		client_frame::Body::AttachOutput(_) => Some(("omp.env.proc.attach", "env.process")),
 		client_frame::Body::SendInput(_) => Some(("omp.env.proc.send_input", "env.process")),
@@ -5218,7 +5252,7 @@ async fn send_policy_error(
 	let (code, message) = match error {
 		PolicyError::EffectsNotAuthorized => (
 			pb::ProtocolErrorCode::Uncommitted,
-			Str::new_static("omp.EffectsNotAuthorized: invocation has not reached EFFECTS_AUTHORIZED"),
+			sf!("omp.EffectsNotAuthorized: invocation has not reached EFFECTS_AUTHORIZED"),
 		),
 		PolicyError::Denied { capability } => (
 			pb::ProtocolErrorCode::PermissionDenied,
@@ -5228,23 +5262,19 @@ async fn send_policy_error(
 		),
 		PolicyError::InvalidEffectToken => (
 			pb::ProtocolErrorCode::PermissionDenied,
-			Str::new_static(
-				"Denied: effect token is absent, mismatched, revoked, or connection-bound",
-			),
+			sf!("Denied: effect token is absent, mismatched, revoked, or connection-bound",),
 		),
 		PolicyError::StaleGeneration => (
 			pb::ProtocolErrorCode::PreconditionFailed,
-			Str::new_static("StaleGeneration: host or session generation is stale"),
+			sf!("StaleGeneration: host or session generation is stale"),
 		),
 		PolicyError::LeaseNotOwned => (
 			pb::ProtocolErrorCode::PermissionDenied,
-			Str::new_static("Denied: document lease belongs to another connection"),
+			sf!("Denied: document lease belongs to another connection"),
 		),
 		PolicyError::EnforcementUnavailable => (
 			pb::ProtocolErrorCode::Unsupported,
-			Str::new_static(
-				"EnforcementUnavailable: sandbox ENFORCE is deferred; refusing instead of degrading",
-			),
+			sf!("EnforcementUnavailable: sandbox ENFORCE is deferred; refusing instead of degrading",),
 		),
 		PolicyError::QuotaExceeded { .. } => unreachable!("quota errors returned above"),
 	};
@@ -5544,12 +5574,12 @@ pub async fn run_with_registry(args: EnvdArgs, registry: Registry) -> Result<(),
 		digest.update(env!("CARGO_PKG_VERSION").as_bytes());
 		digest.update(crate::envd::worker::PY_EVAL_MODULE.as_bytes());
 		let provenance = omp_core::Provenance::new(
-			Str::new_static("omp-first-party"),
-			Str::new_static(crate::envd::worker::PY_EVAL_MODULE),
-			Str::new_static(env!("CARGO_PKG_VERSION")),
+			sf!("omp-first-party"),
+			sf!(crate::envd::worker::PY_EVAL_MODULE),
+			sf!(env!("CARGO_PKG_VERSION")),
 			omp_core::ArtifactDigest::new(*digest.finalize().as_bytes()),
-			Str::new_static("workspace"),
-			Str::new_static("trusted"),
+			sf!("workspace"),
+			sf!("trusted"),
 			1,
 		);
 		let manifest = crate::exthost::ExtensionManifest::py_eval(provenance, []);
@@ -5849,9 +5879,9 @@ mod tests {
 			Arc::clone(&sessions_index),
 			Some(Arc::clone(&state_store)),
 			blobs.clone(),
-			Str::new_static("test-session"),
-			Str::new_static("test-project"),
-			Str::new_static("/test-project"),
+			sf!("test-session"),
+			sf!("test-project"),
+			sf!("/test-project"),
 		)
 		.expect("external journal actor");
 		let workspace_ops = WorkspaceOperations::open(
@@ -5863,11 +5893,8 @@ mod tests {
 		.expect("workspace operations");
 		let ext_hosts = ExtHostSupervisor::spawn(ExtHostConfig::new(
 			PathBuf::from("unused"),
-			omp_core::Principal::new(
-				Str::new_static("test-principal"),
-				Str::new_static("Test Principal"),
-			),
-			Str::new_static("test-session"),
+			omp_core::Principal::new(sf!("test-principal"), sf!("Test Principal")),
+			sf!("test-session"),
 			1,
 		))
 		.await
@@ -5877,8 +5904,8 @@ mod tests {
 				workspace_id:   hello.workspace_id,
 				root_uri:       hello.root_uri,
 				server_epoch:   hello.server_epoch,
-				server_version: Str::new_static("test"),
-				server_build:   Str::new_static("envd-test"),
+				server_version: sf!("test"),
+				server_build:   sf!("envd-test"),
 			},
 			documents,
 			None,
@@ -5900,9 +5927,7 @@ mod tests {
 		let host = HostKey::new("workspace", "sandboxed", "envd-test");
 		let grants = Grants::supported(capabilities.iter().copied());
 		server.authority.register_host(host.clone(), grants.clone());
-		server
-			.authority
-			.open(host.clone(), Str::new_static("test-invocation"));
+		server.authority.open(host.clone(), sf!("test-invocation"));
 		server
 			.authority
 			.authorize(
@@ -6231,7 +6256,7 @@ mod tests {
 				omp_docserver::daemon::ServeOptions {
 					lsp_config_paths: Vec::new(),
 					shutdown:         Some(serve_shutdown),
-					server_build:     Str::new_static("stale-build"),
+					server_build:     sf!("stale-build"),
 					connections:      None,
 				},
 			)
@@ -6268,15 +6293,12 @@ mod tests {
 		let effects = Effects {
 			documents: Some(omp_tool::DocEffects {
 				read:        true,
-				write_globs: Arc::from([Str::new_static("**")]),
+				write_globs: Arc::from([sf!("**")]),
 			}),
 			..Effects::empty()
 		};
-		let policy = InvocationExecutionPolicy {
-			tool:      Str::from("write"),
-			plan:      true,
-			plan_yolo: false,
-		};
+		let policy =
+			InvocationExecutionPolicy { tool: sf!("write"), plan: true, plan_yolo: false };
 		assert!(
 			policy
 				.denial(&effects, br#"{"path":"src/lib.rs","content":"x"}"#)
@@ -6297,22 +6319,13 @@ mod tests {
 	#[test]
 	fn plan_yolo_authorizes_exactly_the_tagged_invocation() {
 		let effects = Effects {
-			exec: Some(omp_tool::ExecEffects {
-				commands: Arc::from([Str::new_static("*")]),
-				network:  false,
-			}),
+			exec: Some(omp_tool::ExecEffects { commands: Arc::from([sf!("*")]), network: false }),
 			..Effects::empty()
 		};
-		let yolo = InvocationExecutionPolicy {
-			tool:      Str::from("shell"),
-			plan:      true,
-			plan_yolo: true,
-		};
-		let plan = InvocationExecutionPolicy {
-			tool:      Str::from("shell"),
-			plan:      true,
-			plan_yolo: false,
-		};
+		let yolo =
+			InvocationExecutionPolicy { tool: sf!("shell"), plan: true, plan_yolo: true };
+		let plan =
+			InvocationExecutionPolicy { tool: sf!("shell"), plan: true, plan_yolo: false };
 		assert!(yolo.denial(&effects, br#"{"command":"touch x"}"#).is_none());
 		assert!(plan.denial(&effects, br#"{"command":"touch x"}"#).is_some());
 	}

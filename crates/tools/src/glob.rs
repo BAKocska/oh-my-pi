@@ -4,7 +4,7 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use async_stream::stream;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
 	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
@@ -235,9 +235,9 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 		workspace,
 		blobs,
 		spec: ToolSpec {
-			name:            Str::from("glob"),
+			name:            sf!("glob"),
 			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     Str::from(
+			description:     sf!(
 				"Globs files and directories with fast pattern matching.\n\n<instruction>\n- `path`: \
 				 glob, file, or directory; separate targets with `;` (`src/**/*.ts; \
 				 test/**/*.ts`).\n- `gitignore` defaults `true`. Set `false` for ignored files such \
@@ -302,7 +302,7 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 					return;
 				},
 			};
-			let path = arguments.path.unwrap_or_else(|| Str::from("."));
+			let path = arguments.path.unwrap_or_else(|| sf!("."));
 			if path.trim().is_empty() {
 				yield done(Err(Fault::EmptyPath));
 				return;
@@ -381,7 +381,7 @@ fn unsupported_scheme(path: &str) -> Option<Str> {
 		let mut chars = scheme.bytes();
 		let valid = matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
 			&& chars.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'));
-		valid.then(|| Str::from(scheme.to_ascii_lowercase()))
+		valid.then(|| Str::new(scheme.to_ascii_lowercase()))
 	})
 }
 
@@ -390,9 +390,9 @@ fn payload(mut result: WalkResult, limit: u64, timeout_ms: u64) -> Payload {
 		let normalized = entry.path.replace('\\', "/");
 		let normalized = normalized.trim_end_matches('/');
 		entry.path = if entry.is_dir {
-			Str::from(format!("{normalized}/"))
+			sf!("{normalized}/")
 		} else {
-			Str::from(normalized)
+			Str::new(normalized)
 		};
 	}
 	result.matches.sort_by(|left, right| {
@@ -548,7 +548,7 @@ fn interrupt_event(
 	match interrupt {
 		Ok(interrupt) => Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }),
 		Err(InterruptWaitError::Closed) => {
-			Ev::Aborted(Abort::Interrupted { reason: Str::from(closed_reason) })
+			Ev::Aborted(Abort::Interrupted { reason: Str::new(closed_reason) })
 		},
 		Err(InterruptWaitError::Protocol(message)) => Ev::Args(protocol_issue(message)),
 	}
@@ -557,9 +557,9 @@ fn interrupt_event(
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::from("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::from("{\"path\":\"crates/**/*.rs\"}")),
+		example:  Some(sf!(r#"{{"path":"crates/**/*.rs"}}"#)),
 		found:    Some(message),
 	}
 }
@@ -569,7 +569,7 @@ mod tests {
 	use super::*;
 
 	fn walk_match(path: &str, modified_ms: u64, is_dir: bool) -> WalkMatch {
-		WalkMatch { path: Str::from(path), modified_ms, is_dir }
+		WalkMatch { path: Str::new(path), modified_ms, is_dir }
 	}
 
 	#[test]
@@ -589,7 +589,7 @@ mod tests {
 
 	#[test]
 	fn walk_request_preserves_multi_root_path_and_toggles() {
-		let request = walk_request(Str::from("src; tests"), false, false, 17);
+		let request = walk_request(sf!("src; tests"), false, false, 17);
 		assert_eq!(request.path, "src; tests");
 		assert!(!request.hidden);
 		assert!(!request.gitignore);

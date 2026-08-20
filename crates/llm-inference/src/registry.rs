@@ -9,7 +9,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::{Service, ServiceExt};
 
 use crate::{
@@ -135,7 +135,7 @@ impl Registry {
 		let plan = call.execution.as_ref().ok_or_else(|| {
 			Error::planning(
 				ErrorKind::InvalidRequest,
-				ErrorDetail::target(Str::from("call-has-no-execution-plan")),
+				ErrorDetail::target(sf!("call-has-no-execution-plan")),
 				ExecutionReceipt::default(),
 			)
 		})?;
@@ -144,8 +144,8 @@ impl Registry {
 			return Err(Error::planning(
 				ErrorKind::ProviderContractMismatch,
 				ErrorDetail::capability(
-					Str::from(call.operation.kind().to_string()),
-					ReasonId(Str::from("planned-operation-mismatch")),
+					Str::new(call.operation.kind().to_string()),
+					ReasonId(sf!("planned-operation-mismatch")),
 				),
 				ExecutionReceipt::default(),
 			));
@@ -253,7 +253,7 @@ impl RegistryBuilder {
 	/// rebuilt. Call this after all construction-time registrations so a catalog
 	/// overlay generation is preserved exactly.
 	#[must_use]
-	pub fn with_generation(mut self, generation: u64) -> Self {
+	pub const fn with_generation(mut self, generation: u64) -> Self {
 		self.generation = generation;
 		self
 	}
@@ -375,8 +375,8 @@ impl RegistryBuilder {
 				return Err(Error::planning(
 					ErrorKind::RouteUnavailable,
 					ErrorDetail::capability(
-						Str::from(route.id.as_str()),
-						ReasonId(Str::from("route-has-no-service-or-unavailability-evidence")),
+						Str::new(route.id.as_str()),
+						ReasonId(sf!("route-has-no-service-or-unavailability-evidence")),
 					),
 					ExecutionReceipt::default(),
 				));
@@ -392,8 +392,8 @@ impl RegistryBuilder {
 			return Err(Error::planning(
 				ErrorKind::RouteUnavailable,
 				ErrorDetail::capability(
-					Str::from(OperationKind::Auth.to_string()),
-					ReasonId(Str::from("auth-manager-not-constructed")),
+					Str::new(OperationKind::Auth.to_string()),
+					ReasonId(sf!("auth-manager-not-constructed")),
 				),
 				ExecutionReceipt::default(),
 			));
@@ -493,8 +493,8 @@ async fn dispatch_preplanned(
 			Error::planning(
 				ErrorKind::RouteUnavailable,
 				ErrorDetail::capability(
-					Str::from(OperationKind::Auth.to_string()),
-					ReasonId(Str::from("auth-manager-not-constructed")),
+					Str::new(OperationKind::Auth.to_string()),
+					ReasonId(sf!("auth-manager-not-constructed")),
 				),
 				layered.context.receipt(),
 			)
@@ -525,8 +525,8 @@ async fn dispatch_preplanned(
 			Error::planning(
 				ErrorKind::RouteUnavailable,
 				ErrorDetail::capability(
-					Str::from(OperationKind::Usage.to_string()),
-					ReasonId(Str::from("usage-manager-not-constructed")),
+					Str::new(OperationKind::Usage.to_string()),
+					ReasonId(sf!("usage-manager-not-constructed")),
 				),
 				layered.context.receipt(),
 			)
@@ -654,11 +654,11 @@ fn route_unavailable_error(evidence: &RouteUnavailable, operation: OperationKind
 	let reason = if evidence.operation.is_none() || evidence.operation == Some(operation) {
 		evidence.reason.clone()
 	} else {
-		ReasonId(Str::from("route-operation-not-constructed"))
+		ReasonId(sf!("route-operation-not-constructed"))
 	};
 	Error::planning(
 		ErrorKind::RouteUnavailable,
-		ErrorDetail::capability(Str::from(operation.to_string()), reason),
+		ErrorDetail::capability(Str::new(operation.to_string()), reason),
 		ExecutionReceipt::default(),
 	)
 	.route(evidence.route.clone())
@@ -667,7 +667,7 @@ fn route_unavailable_error(evidence: &RouteUnavailable, operation: OperationKind
 fn target_error(selector: &str) -> Error {
 	Error::planning(
 		ErrorKind::TargetNotFound,
-		ErrorDetail::target(Str::from(selector)),
+		ErrorDetail::target(Str::new(selector)),
 		ExecutionReceipt::default(),
 	)
 }
@@ -676,8 +676,8 @@ fn duplicate_route_error(route: &RouteId) -> Error {
 	Error::planning(
 		ErrorKind::ProviderContractMismatch,
 		ErrorDetail::capability(
-			Str::from(route.as_str()),
-			ReasonId(Str::from("duplicate-route-registration")),
+			Str::new(route.as_str()),
+			ReasonId(sf!("duplicate-route-registration")),
 		),
 		ExecutionReceipt::default(),
 	)

@@ -322,17 +322,14 @@ mod tests {
 			max_bytes:        NonZeroU64::new(8).unwrap(),
 			max_chunk_bytes:  NonZeroU64::new(4).unwrap(),
 			max_inline_bytes: 4,
-			media_types:      [Str::from("image/png")].into(),
+			media_types:      [sf!("image/png")].into(),
 		}
 	}
 
 	#[test]
 	fn meter_rejects_oversize_without_buffering() {
-		let descriptor = ArtifactDescriptor {
-			media_type: Str::from("image/png"),
-			size:       None,
-			digest:     None,
-		};
+		let descriptor =
+			ArtifactDescriptor { media_type: sf!("image/png"), size: None, digest: None };
 		let mut meter = ArtifactMeter::new(&descriptor, limits()).unwrap();
 		meter.observe(&Bytes::from_static(b"1234")).unwrap();
 		let failure = meter.observe(&Bytes::from_static(b"56789")).unwrap_err();
@@ -342,11 +339,8 @@ mod tests {
 
 	#[test]
 	fn declared_size_is_checked_at_completion() {
-		let descriptor = ArtifactDescriptor {
-			media_type: Str::from("image/png"),
-			size:       Some(3),
-			digest:     None,
-		};
+		let descriptor =
+			ArtifactDescriptor { media_type: sf!("image/png"), size: Some(3), digest: None };
 		let mut meter = ArtifactMeter::new(&descriptor, limits()).unwrap();
 		meter.observe(&Bytes::from_static(b"12")).unwrap();
 		assert_eq!(meter.finish(), Err(ArtifactViolation::SizeMismatch { declared: 3, observed: 2 }));

@@ -11,7 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION},
 };
-use omp_core::{Str, base64_url, parse_rfc3339};
+use omp_core::{Str, base64_url, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
@@ -124,11 +124,11 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 		account_id: envelope
 			.account_id
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 		email:      envelope
 			.email
 			.filter(|v| !v.trim().is_empty())
-			.map(|v| Str::from(v.to_ascii_lowercase())),
+			.map(|v| Str::new(v.to_ascii_lowercase())),
 	})
 }
 
@@ -171,9 +171,9 @@ async fn fetch_xai_oauth_usage_until(
 		email = root
 			.get("email")
 			.and_then(Value::as_str)
-			.map(|v| Str::from(v.to_ascii_lowercase()));
+			.map(|v| Str::new(v.to_ascii_lowercase()));
 		if account_id.is_none() {
-			account_id = root.get("sub").and_then(Value::as_str).map(Str::from);
+			account_id = root.get("sub").and_then(Value::as_str).map(Str::new);
 		}
 	}
 	let credits_url =
@@ -237,7 +237,7 @@ async fn fetch_xai_oauth_usage_until(
 			..UsageAccountMetadata::default()
 		},
 		plan: None,
-		source_label: Some(Str::new_static("cli-chat-proxy.grok.com/v1/billing")),
+		source_label: Some(sf!("cli-chat-proxy.grok.com/v1/billing")),
 		notes: Box::default(),
 		reset_credits: None,
 		windows,
@@ -255,7 +255,7 @@ fn jwt_subject(token: &str) -> Option<Str> {
 		.ok()?
 		.get("sub")?
 		.as_str()
-		.map(Str::from)
+		.map(Str::new)
 }
 fn auth_header(token: &str) -> Result<HeaderValue, UsageFetchError> {
 	let mut bytes = Zeroizing::new(Vec::with_capacity(7 + token.len()));
@@ -321,7 +321,7 @@ fn percent_window(
 	UsageWindow {
 		id,
 		kind: UsageWindowKind::Quota,
-		dimension: Str::new_static("credits"),
+		dimension: sf!("credits"),
 		label: Some(label),
 		scope,
 		amount: UsageAmount {
@@ -348,11 +348,11 @@ fn unknown_window(
 ) -> UsageWindow {
 	let ratio = used / limit;
 	UsageWindow {
-		id:          Str::new_static(id),
+		id:          sf!(id),
 		kind:        UsageWindowKind::Billing,
-		dimension:   Str::new_static("on-demand"),
-		label:       Some(Str::new_static(label)),
-		scope:       Some(Str::new_static("shared")),
+		dimension:   sf!("on-demand"),
+		label:       Some(sf!(label)),
+		scope:       Some(sf!("shared")),
 		amount:      UsageAmount {
 			unit:      UsageUnit::Unknown,
 			consumed:  q(used),
@@ -406,11 +406,10 @@ fn parse_weekly(config: &Value, account: Option<&str>, now: SystemTime) -> Optio
 		None if end > now => (0.0, true),
 		None => return None,
 	};
-	let scope =
-		Some(Str::from(format!("shared{}", account.map_or_else(String::new, |v| format!(":{v}")))));
+	let scope = Some(sf!("shared{}", account.map_or_else(String::new, |v| format!(":{v}"))));
 	let mut windows = vec![percent_window(
-		Str::new_static("xai-oauth:credits:1w"),
-		Str::new_static("SuperGrok Weekly Credits"),
+		sf!("xai-oauth:credits:1w"),
+		sf!("SuperGrok Weekly Credits"),
 		percent,
 		Some(Duration::from_days(7)),
 		Some(end),
@@ -439,12 +438,12 @@ fn parse_weekly(config: &Value, account: Option<&str>, now: SystemTime) -> Optio
 				continue;
 			}
 			let label = match name {
-				"GrokBuild" => Str::new_static("Grok Build (Weekly)"),
-				"Api" => Str::new_static("API (Weekly)"),
-				_ => Str::from(format!("{name} (Weekly)")),
+				"GrokBuild" => sf!("Grok Build (Weekly)"),
+				"Api" => sf!("API (Weekly)"),
+				_ => sf!("{name} (Weekly)"),
 			};
 			windows.push(percent_window(
-				Str::from(format!("xai-oauth:product:{slug}:1w")),
+				sf!("xai-oauth:product:{slug}:1w"),
 				label,
 				used,
 				Some(Duration::from_days(7)),
@@ -468,13 +467,12 @@ fn parse_monthly(config: &Value, account: Option<&str>, now: SystemTime) -> Opti
 		return None;
 	}
 	let used = config.get("used")?.get("val")?.as_f64()?;
-	let scope =
-		Some(Str::from(format!("shared{}", account.map_or_else(String::new, |v| format!(":{v}")))));
+	let scope = Some(sf!("shared{}", account.map_or_else(String::new, |v| format!(":{v}"))));
 	let mut windows = vec![UsageWindow {
-		id: Str::new_static("xai-oauth:included:1mo"),
+		id: sf!("xai-oauth:included:1mo"),
 		kind: UsageWindowKind::Quota,
-		dimension: Str::new_static("included"),
-		label: Some(Str::new_static("SuperGrok Monthly Included")),
+		dimension: sf!("included"),
+		label: Some(sf!("SuperGrok Monthly Included")),
 		scope,
 		amount: UsageAmount {
 			unit:      UsageUnit::Unknown,

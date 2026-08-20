@@ -7,7 +7,7 @@ use omp_agent::{
 	LoopSignal, ModePromptSource, PromptError, PromptMode, PromptSource, SlotAssembler,
 	WorkspaceInput,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -342,7 +342,7 @@ impl ExecutionModes {
 			return Continuation::Settle;
 		}
 		Continuation::Continue {
-			owner:          Str::new_static("goal"),
+			owner:          sf!("goal"),
 			item:           system_item(
 				format!(
 					"<system-injection>\nContinue working autonomously toward this \

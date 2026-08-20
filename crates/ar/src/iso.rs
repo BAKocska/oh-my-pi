@@ -335,9 +335,9 @@ fn walk_tree(
 			}
 			if total_size > limits.member_size {
 				return Err(Error::MemberTooLarge {
-					path:   path.clone(),
+					path,
 					actual: total_size,
-					limit:  limits.member_size,
+					limit: limits.member_size,
 				});
 			}
 			// Zero-length members never read their extents, and writers record
@@ -538,7 +538,7 @@ fn parse_record(
 		return Err(Error::InvalidArchive(error));
 	}
 	let identifier_length = bytes[offset + 32] as usize;
-	let padding = usize::from(identifier_length % 2 == 0);
+	let padding = usize::from(identifier_length.is_multiple_of(2));
 	let system_use_offset = 33_usize
 		.checked_add(identifier_length)
 		.and_then(|value| value.checked_add(padding))
@@ -837,11 +837,11 @@ fn join_member_path(parent: &str, name: &str) -> Result<Str> {
 
 fn decode_identifier(identifier: &[u8], joliet: bool) -> Result<String> {
 	let mut name = if joliet {
-		if identifier.len() % 2 != 0 {
+		if !identifier.len().is_multiple_of(2) {
 			return Err(Error::InvalidArchive("Joliet identifier has an odd byte length"));
 		}
 		let mut units = Vec::with_capacity(identifier.len() / 2);
-		for bytes in identifier.chunks_exact(2) {
+		for bytes in identifier.as_chunks::<2>().0 {
 			units.push(u16::from_be_bytes([bytes[0], bytes[1]]));
 		}
 		let bytes = xutf::transcode::<Utf16, Utf8>(&units);
@@ -937,7 +937,7 @@ fn recording_time(bytes: &[u8]) -> Option<u64> {
 	u64::try_from(seconds).ok()
 }
 
-fn check_path_bytes(actual: u64, limits: Limits) -> Result<()> {
+const fn check_path_bytes(actual: u64, limits: Limits) -> Result<()> {
 	if actual > limits.path_size {
 		return Err(Error::PathTooLong { actual, limit: limits.path_size });
 	}

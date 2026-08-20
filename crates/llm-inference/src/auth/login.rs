@@ -13,6 +13,7 @@ use futures::{
 	FutureExt,
 	future::{Either, select},
 };
+use omp_core::sf;
 
 use super::{
 	lease::{CredentialLease, LeaseMeta},
@@ -217,13 +218,13 @@ pub async fn prompt_for_secret(
 ) -> Result<(), SecretLoginError> {
 	let prompt = match spec {
 		AuthSpec::ApiKey { .. } => AuthPrompt {
-			id:      "api-key".into(),
-			message: "Enter the API key".into(),
+			id:      sf!("api-key"),
+			message: sf!("Enter the API key"),
 			input:   AuthPromptKind::ApiKey,
 		},
 		AuthSpec::SessionToken(_) => AuthPrompt {
-			id:      "session-token".into(),
-			message: "Enter the session token".into(),
+			id:      sf!("session-token"),
+			message: sf!("Enter the session token"),
 			input:   AuthPromptKind::SessionToken,
 		},
 		_ => return Err(SecretLoginError::UnsupportedSpec),

@@ -159,7 +159,7 @@ impl KokoroAdapter {
 				let tensor = tensors.into_values().next().ok_or_else(|| {
 					LocalError::new(LocalErrorKind::Artifact, "Kokoro voice pack contains no tensors")
 				})?;
-				engine.voices.insert(voice.into(), tensor);
+				engine.voices.insert(Str::new(voice), tensor);
 			}
 			let voice_tensor = engine.voices.get(voice).expect("inserted above").clone();
 			let samples = synthesize_text(engine, &voice_tensor, text, options, cancel)?;

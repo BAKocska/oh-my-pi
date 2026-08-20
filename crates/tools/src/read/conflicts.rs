@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, sf};
 use parking_lot::Mutex;
 
 use super::{Fault, resolver::Resolve, selector::ParsedSelector};
@@ -555,7 +555,7 @@ pub struct ConflictAddress {
 pub fn parse_conflict_address(resource: &str) -> Result<ConflictAddress, Fault> {
 	if resource == "*" {
 		return Err(Fault::Invalid {
-			message: Str::new_static("conflict://* is write-only; read one conflict ID"),
+			message: sf!("conflict://* is write-only; read one conflict ID"),
 		});
 	}
 	let (id, scope) = resource.split_once('/').unwrap_or((resource, ""));
@@ -564,7 +564,7 @@ pub fn parse_conflict_address(resource: &str) -> Result<ConflictAddress, Fault> 
 		.ok()
 		.filter(|id| *id > 0)
 		.ok_or_else(|| Fault::Invalid {
-			message: Str::from(format!("Invalid conflict address 'conflict://{resource}'")),
+			message: sf!("Invalid conflict address 'conflict://{resource}'"),
 		})?;
 	let scope = match scope.to_ascii_lowercase().as_str() {
 		"" => ConflictScope::All,
@@ -574,9 +574,7 @@ pub fn parse_conflict_address(resource: &str) -> Result<ConflictAddress, Fault> 
 		"both" => ConflictScope::Both,
 		_ => {
 			return Err(Fault::Invalid {
-				message: Str::from(format!(
-					"Unknown conflict scope '{scope}'; use ours, base, theirs, or both"
-				)),
+				message: sf!("Unknown conflict scope '{scope}'; use ours, base, theirs, or both"),
 			});
 		},
 	};
@@ -605,14 +603,14 @@ impl Resolve for ConflictResolver {
 	) -> Result<CowBytes<'static>, Fault> {
 		if !matches!(selector, ParsedSelector::None | ParsedSelector::Raw) {
 			return Err(Fault::Invalid {
-				message: Str::new_static(
+				message: sf!(
 					"conflict:// reads accept only :raw; choose /ours, /base, /theirs, or /both",
 				),
 			});
 		}
 		let address = parse_conflict_address(resource)?;
 		let entry = self.registry.get(address.id).ok_or_else(|| Fault::Source {
-			message: Str::from(format!("Conflict #{} is no longer registered", address.id)),
+			message: sf!("Conflict #{} is no longer registered", address.id),
 		})?;
 		Ok(CowBytes::from(render_registered(&entry, address.scope).into_bytes()))
 	}
@@ -674,7 +672,7 @@ pub fn splice_registered(
 		})
 		.or_else(|| (candidates.len() == 1).then(|| &candidates[0]))
 		.ok_or_else(|| Fault::Source {
-			message: Str::from(if candidates.is_empty() {
+			message: Str::new(if candidates.is_empty() {
 				format!("Conflict #{} is stale; its marker block no longer exists", entry.id)
 			} else {
 				format!(
@@ -697,7 +695,7 @@ pub fn splice_registered(
 	output.push_str(&current[..range.start]);
 	output.push_str(&replacement_text);
 	output.push_str(&current[range.end..]);
-	Ok(ConflictSplice { text: Str::from(output), range: (selected.start_line, selected.end_line) })
+	Ok(ConflictSplice { text: Str::new(output), range: (selected.start_line, selected.end_line) })
 }
 
 fn render_registered(entry: &RegisteredConflict, scope: ConflictScope) -> String {
@@ -760,7 +758,7 @@ fn replacement_text(
 			.base_lines
 			.as_ref()
 			.ok_or_else(|| Fault::Invalid {
-				message: Str::new_static("@base requires a three-way conflict with a base section"),
+				message: sf!("@base requires a three-way conflict with a base section"),
 			})?
 			.join("\n"),
 		ConflictReplacement::Theirs => block.theirs_lines.join("\n"),
@@ -792,7 +790,7 @@ fn line_byte_range(
 	}
 	if start_line == 0 || end_line < start_line || end_line > starts.len() {
 		return Err(Fault::Source {
-			message: Str::from(format!("Conflict line range L{start_line}-L{end_line} is stale")),
+			message: sf!("Conflict line range L{start_line}-L{end_line} is stale"),
 		});
 	}
 	let start = starts[start_line - 1];

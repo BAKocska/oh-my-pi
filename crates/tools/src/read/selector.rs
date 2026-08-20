@@ -7,7 +7,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 
 use super::resolver::Scheme;
 
@@ -71,8 +71,8 @@ pub struct SelectorError(Str);
 
 impl SelectorError {
 	/// Constructs a selector error with model-facing text.
-	pub fn from_message(message: impl Into<Str>) -> Self {
-		Self(message.into())
+	pub fn from_message(message: impl IntoStr) -> Self {
+		Self(message.into_str())
 	}
 
 	/// Model-facing error text.
@@ -446,7 +446,7 @@ pub fn split_delimited_targets(input: &str) -> Vec<Str> {
 		.split([';', ','])
 		.map(normalize_path_input)
 		.filter(|part| !part.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 		.collect()
 }
 
@@ -457,7 +457,7 @@ pub fn split_semicolon_targets(input: &str) -> Vec<Str> {
 		.split(';')
 		.map(normalize_path_input)
 		.filter(|part| !part.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 		.collect()
 }
 
@@ -475,7 +475,7 @@ pub fn parse_json_path_array(input: &str) -> Result<Option<Vec<Str>>, SelectorEr
 	}
 	let paths = paths
 		.into_iter()
-		.map(|path| Str::from(normalize_path_input(&path).to_owned()))
+		.map(|path| Str::new(normalize_path_input(&path).to_owned()))
 		.collect::<Vec<_>>();
 	if paths.iter().any(|path| path.is_empty()) {
 		return Err(SelectorError::from_message("JSON path arrays must not contain empty paths."));
@@ -490,7 +490,7 @@ pub fn split_delimited_targets_preferring_literal(
 	mut probe: impl FnMut(&str) -> LiteralPathProbe,
 ) -> Vec<Str> {
 	if !input.contains([';', ',']) || probe(input) != LiteralPathProbe::Missing {
-		return vec![Str::from(normalize_path_input(input))];
+		return vec![Str::new(normalize_path_input(input))];
 	}
 	split_delimited_targets(input)
 }
@@ -644,7 +644,7 @@ pub fn unique_suffix_match<'a>(
 			} else {
 				cwd.join(candidate)
 			},
-			display_path:  Str::from(candidate_normalized),
+			display_path:  Str::new(candidate_normalized),
 		};
 		if found
 			.as_ref()
@@ -832,18 +832,18 @@ mod tests {
 	fn parses_json_and_delimited_target_lists_without_losing_literals() {
 		assert_eq!(
 			parse_json_path_array(r#"["src/a.rs", "src/b.rs:5-16"]"#).unwrap(),
-			Some(vec![Str::from("src/a.rs"), Str::from("src/b.rs:5-16")])
+			Some(vec![sf!("src/a.rs"), sf!("src/b.rs:5-16")])
 		);
 		assert_eq!(split_delimited_targets("src/a.rs; src/b.rs, \"src/c.rs\""), vec![
-			Str::from("src/a.rs"),
-			Str::from("src/b.rs"),
-			Str::from("src/c.rs"),
+			sf!("src/a.rs"),
+			sf!("src/b.rs"),
+			sf!("src/c.rs"),
 		]);
 		assert_eq!(
 			split_delimited_targets_preferring_literal("report,final.txt", |_| {
 				LiteralPathProbe::Exists
 			}),
-			vec![Str::from("report,final.txt")]
+			vec![sf!("report,final.txt")]
 		);
 	}
 }

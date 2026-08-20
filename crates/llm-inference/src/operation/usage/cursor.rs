@@ -10,7 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, COOKIE},
 };
-use omp_core::{Str, base64_url, parse_rfc3339};
+use omp_core::{Str, base64_url, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
@@ -99,7 +99,7 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 		return Some(Credential {
 			token:      Zeroizing::new(raw.to_owned()),
 			is_oauth:   true,
-			base_url:   Str::new_static(DEFAULT_CURSOR_BASE_URL),
+			base_url:   sf!(DEFAULT_CURSOR_BASE_URL),
 			email:      None,
 			account_id: None,
 			project_id: None,
@@ -126,19 +126,19 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 	Some(Credential {
 		token: Zeroizing::new(token),
 		is_oauth,
-		base_url: Str::from(base.trim_end_matches('/')),
+		base_url: Str::new(base.trim_end_matches('/')),
 		email: envelope
 			.email
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 		account_id: envelope
 			.account_id
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 		project_id: envelope
 			.project_id
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 	})
 }
 
@@ -205,7 +205,7 @@ async fn fetch_cursor_usage_until(
 			..UsageAccountMetadata::default()
 		},
 		plan: None,
-		source_label: Some(Str::new_static("cursor-usage")),
+		source_label: Some(sf!("cursor-usage")),
 		notes: Box::default(),
 		reset_credits: None,
 		windows,
@@ -225,7 +225,7 @@ fn extract_cursor_access_token_user_id(token: &str) -> Option<Str> {
 		.next()
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 }
 fn cursor_cookie(user_id: &str, token: &str) -> Zeroizing<String> {
 	let raw = Zeroizing::new(format!("{user_id}::{token}"));
@@ -307,7 +307,7 @@ fn window(
 	UsageWindow {
 		id,
 		kind: UsageWindowKind::Quota,
-		dimension: Str::from(match unit {
+		dimension: Str::new(match unit {
 			UsageUnit::Usd => "usd",
 			UsageUnit::Percent => "percent",
 			_ => "requests",
@@ -403,12 +403,8 @@ fn parse_cursor_usage(body: &str, now: SystemTime) -> Option<Vec<UsageWindow>> {
 		};
 		let remaining = limit.zip(used).map(|(limit, used)| (limit - used).max(0.0));
 		windows.push(window(
-			Str::from(format!(
-				"cursor:{}:{}",
-				if usd { "usd" } else { "requests" },
-				key.trim().to_ascii_lowercase()
-			)),
-			Str::from(format!("{key} {}", if usd { "spend" } else { "requests" })),
+			sf!("cursor:{}:{}", if usd { "usd" } else { "requests" }, key.trim().to_ascii_lowercase()),
+			sf!("{key} {}", if usd { "spend" } else { "requests" }),
 			unit,
 			used,
 			remaining,
@@ -442,8 +438,8 @@ fn parse_cursor_individual_usage(body: &str, now: SystemTime) -> Option<Vec<Usag
 	let overall = individual.get("overall").and_then(cents_bucket);
 	if let Some((used, remaining, limit)) = overall {
 		windows.push(window(
-			Str::new_static("cursor:usd:individual-overall"),
-			Str::new_static("Personal Usage"),
+			sf!("cursor:usd:individual-overall"),
+			sf!("Personal Usage"),
 			UsageUnit::Usd,
 			used,
 			remaining,
@@ -455,8 +451,8 @@ fn parse_cursor_individual_usage(body: &str, now: SystemTime) -> Option<Vec<Usag
 		let limit = plan.get("limit").and_then(Value::as_f64).map(|v| v / 100.0);
 		if let Some(percent) = plan.get("autoPercentUsed").and_then(Value::as_f64) {
 			windows.push(window(
-				Str::new_static("cursor:usd:individual-auto"),
-				Str::new_static("Cursor Models"),
+				sf!("cursor:usd:individual-auto"),
+				sf!("Cursor Models"),
 				UsageUnit::Percent,
 				Some(percent),
 				Some((100.0 - percent).max(0.0)),
@@ -468,8 +464,8 @@ fn parse_cursor_individual_usage(body: &str, now: SystemTime) -> Option<Vec<Usag
 		if let Some(percent) = plan.get("apiPercentUsed").and_then(Value::as_f64) {
 			let used = limit.map_or(percent, |limit| limit * percent / 100.0);
 			windows.push(window(
-				Str::new_static("cursor:usd:individual-api"),
-				Str::new_static("Other Models"),
+				sf!("cursor:usd:individual-api"),
+				sf!("Other Models"),
 				UsageUnit::Usd,
 				Some(used),
 				limit.map(|v| (v - used).max(0.0)),
@@ -481,8 +477,8 @@ fn parse_cursor_individual_usage(body: &str, now: SystemTime) -> Option<Vec<Usag
 		if windows.is_empty() {
 			if let Some(percent) = plan.get("totalPercentUsed").and_then(Value::as_f64) {
 				windows.push(window(
-					Str::new_static("cursor:usd:individual-plan"),
-					Str::new_static("Personal Usage"),
+					sf!("cursor:usd:individual-plan"),
+					sf!("Personal Usage"),
 					UsageUnit::Percent,
 					Some(percent),
 					Some((100.0 - percent).max(0.0)),
@@ -492,8 +488,8 @@ fn parse_cursor_individual_usage(body: &str, now: SystemTime) -> Option<Vec<Usag
 				));
 			} else if let Some((used, remaining, limit)) = cents_bucket(&Value::Object(plan.clone())) {
 				windows.push(window(
-					Str::new_static("cursor:usd:individual-plan"),
-					Str::new_static("Personal Usage"),
+					sf!("cursor:usd:individual-plan"),
+					sf!("Personal Usage"),
 					UsageUnit::Usd,
 					used,
 					remaining,
@@ -510,8 +506,8 @@ fn parse_cursor_individual_usage(body: &str, now: SystemTime) -> Option<Vec<Usag
 		.filter(|(_, _, limit)| limit.is_some_and(|v| v > 0.0))
 	{
 		windows.push(window(
-			Str::new_static("cursor:usd:individual-ondemand"),
-			Str::new_static("On-Demand Usage"),
+			sf!("cursor:usd:individual-ondemand"),
+			sf!("On-Demand Usage"),
 			UsageUnit::Usd,
 			used,
 			remaining,
@@ -528,7 +524,7 @@ fn parse_profile_email(body: &str, expected_sub: Option<&str>) -> Option<Str> {
 		return None;
 	}
 	let email = root.get("email")?.as_str()?.trim();
-	(!email.is_empty()).then(|| Str::from(email.to_ascii_lowercase()))
+	(!email.is_empty()).then(|| Str::new(email.to_ascii_lowercase()))
 }
 
 #[cfg(test)]

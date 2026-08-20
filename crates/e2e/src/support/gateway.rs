@@ -14,7 +14,7 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonError, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -338,7 +338,7 @@ fn scripted_registry(
 		} else {
 			builder.register_unavailable(RouteUnavailable {
 				route:     candidate.id.clone(),
-				reason:    ReasonId(Str::from("e2e-route-unavailable")),
+				reason:    ReasonId(sf!("e2e-route-unavailable")),
 				operation: None,
 			})?
 		};

@@ -857,7 +857,7 @@ fn sniff_source(source: &mut (impl Read + Seek)) -> Result<Format> {
 		source.seek(SeekFrom::Start(0))?;
 		// 40 KiB covers every head-anchored magic including the ISO 9660
 		// descriptor at byte 32769.
-		let mut probe = [0_u8; 40 * 1024];
+		let mut probe = vec![0_u8; 40 * 1024];
 		let mut read = 0;
 		while read < probe.len() {
 			let count = source.read(&mut probe[read..])?;

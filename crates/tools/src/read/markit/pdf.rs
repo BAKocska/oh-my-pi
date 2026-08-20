@@ -1,6 +1,6 @@
 //! PDF-to-Markdown conversion through `pdf-inspector`.
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use pdf_inspector::{MarkdownOptions, PdfOptions, PdfType, process_pdf_mem_with_options};
 
 use super::{Conversion, MarkitError};
@@ -20,7 +20,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Conversion, MarkitError> {
 
 	let scanned = matches!(result.pdf_type, PdfType::Scanned | PdfType::ImageBased);
 	let note = if scanned {
-		Some(Str::new_static(TEXT_LAYER_NOTE))
+		Some(sf!(TEXT_LAYER_NOTE))
 	} else {
 		extraction_note(result.pages_needing_ocr.len(), result.page_count, result.has_encoding_issues)
 	};
@@ -29,7 +29,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Conversion, MarkitError> {
 			if !text.ends_with('\n') {
 				text.push('\n');
 			}
-			Str::from(text)
+			Str::new(text)
 		},
 		// `pdf-inspector` intentionally has no Markdown for an image-only
 		// document. Preserve that typed classification as a successful empty
@@ -46,7 +46,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Conversion, MarkitError> {
 		},
 	};
 
-	Ok(Conversion { text, note, title: result.title.map(Str::from) })
+	Ok(Conversion { text, note, title: result.title.map(Str::new) })
 }
 
 fn extraction_note(
@@ -56,14 +56,14 @@ fn extraction_note(
 ) -> Option<Str> {
 	match (pages_needing_ocr, has_encoding_issues) {
 		(0, false) => None,
-		(0, true) => Some(Str::new_static(ENCODING_NOTE)),
-		(count, false) => Some(Str::from(format!(
+		(0, true) => Some(sf!(ENCODING_NOTE)),
+		(count, false) => Some(sf!(
 			"{count} of {page_count} PDF pages may need OCR; extracted text may be incomplete."
-		))),
-		(count, true) => Some(Str::from(format!(
+		)),
+		(count, true) => Some(sf!(
 			"{count} of {page_count} PDF pages may need OCR, and broken font encodings were \
 			 detected; extracted text may be incomplete or garbled."
-		))),
+		)),
 	}
 }
 

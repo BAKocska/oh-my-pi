@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 
 	use super::super::{
 		ApprovalDecided, ApprovalReason, ApprovalTicketFiled, Event, HookOutcome, Kind,
@@ -18,51 +18,51 @@ mod tests {
 	#[test]
 	fn hook_policy_and_approval_kinds_round_trip() {
 		round_trip(Kind::HookOutcome(HookOutcome {
-			invocation_id:   Some(Str::new_static("invoke")),
+			invocation_id:   Some(sf!("invoke")),
 			event_id:        23,
 			dispatch_id:     9,
 			subscription_id: Some(2),
 			phase:           3,
-			decision:        Str::new_static("Deny"),
-			reason:          Some(Str::new_static("rule")),
+			decision:        sf!("Deny"),
+			reason:          Some(sf!("rule")),
 		}));
 		round_trip(Kind::PolicyDecision(PolicyDecision {
-			invocation_id:       Str::new_static("invoke"),
-			requested_target:    Str::new_static("bash"),
+			invocation_id:       sf!("invoke"),
+			requested_target:    sf!("bash"),
 			requested_args:      Str::new_static("{}"),
-			transformations:     vec![Str::new_static("replace")],
-			effective_target:    Str::new_static("bash"),
+			transformations:     vec![sf!("replace")],
+			effective_target:    sf!("bash"),
 			effective_args:      Str::new_static("{}"),
 			derived_ir_revision: 1,
 			allowed:             true,
 			reason:              None,
 		}));
 		round_trip(Kind::ApprovalTicketFiled(ApprovalTicketFiled {
-			ticket_id:     Str::new_static("ticket"),
-			invocation_id: Some(Str::new_static("invoke")),
+			ticket_id:     sf!("ticket"),
+			invocation_id: Some(sf!("invoke")),
 			reasons:       vec![ApprovalReason {
-				title:         Str::new_static("Run"),
-				body:          Str::new_static("run"),
-				subject:       Str::new_static("ls"),
-				kind:          Str::new_static("exec"),
-				scopes:        vec![Str::new_static("once")],
+				title:         sf!("Run"),
+				body:          sf!("run"),
+				subject:       sf!("ls"),
+				kind:          sf!("exec"),
+				scopes:        vec![sf!("once")],
 				default:       None,
-				route:         Str::new_static("local"),
+				route:         sf!("local"),
 				approver:      None,
 				timeout_ms:    1,
-				unreachable:   Str::new_static("fail_closed"),
+				unreachable:   sf!("fail_closed"),
 				require_human: false,
 				pattern:       None,
-				evidence:      vec![Str::new_static("rule")],
+				evidence:      vec![sf!("rule")],
 			}],
 			created_at_ms: 7,
 		}));
 		round_trip(Kind::ApprovalDecided(ApprovalDecided {
-			ticket_id:  Str::new_static("ticket"),
-			state:      Str::new_static("decided"),
+			ticket_id:  sf!("ticket"),
+			state:      sf!("decided"),
 			approved:   Some(true),
-			scope:      Some(Str::new_static("once")),
-			source:     Some(Str::new_static("user")),
+			scope:      Some(sf!("once")),
+			source:     Some(sf!("user")),
 			decided_by: None,
 			reason:     None,
 			audited:    false,

@@ -8,7 +8,7 @@ use std::{
 };
 
 use omp_ast::block::{EnclosingBoundaryOptions, LineRange, enclosing_block_boundaries};
-use omp_core::{Str, StrMut, fmts};
+use omp_core::{Str, StrMut, sf};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 
 use crate::{
@@ -220,7 +220,7 @@ fn structural_boundaries(code: &str, visible: &BTreeSet<i64>, path: &str) -> BTr
 		.filter_map(|line| {
 			let number = i64::from(line);
 			(!visible.contains(&number))
-				.then(|| (number, Str::from(lines.get(line as usize - 1).copied().unwrap_or(""))))
+				.then(|| (number, Str::new(lines.get(line as usize - 1).copied().unwrap_or(""))))
 		})
 		.collect()
 }
@@ -316,10 +316,10 @@ fn lexical_boundaries(lines: &[&str], visible: &BTreeSet<i64>) -> BTreeMap<i64, 
 			{
 				let (_, open_line, open_visible) = stack.remove(match_index);
 				if line_visible && !open_visible {
-					context.insert(open_line, Str::from(lines[open_line as usize - 1]));
+					context.insert(open_line, Str::new(lines[open_line as usize - 1]));
 				}
 				if open_visible && !line_visible {
-					context.insert(line_number, Str::from(*line));
+					context.insert(line_number, Str::new(*line));
 				}
 			}
 			index += 1;
@@ -479,7 +479,7 @@ pub fn build_compact_diff_preview(diff: &str, options: CompactDiffOptions) -> Co
 			match parsed.kind {
 				b'+' => {
 					added_lines += 1;
-					added_run.push(fmts!("{}:{}", parsed.number, parsed.content));
+					added_run.push(sf!("{}:{}", parsed.number, parsed.content));
 				},
 				b'-' => {
 					flush(&mut formatted, &mut added_run);
@@ -491,7 +491,7 @@ pub fn build_compact_diff_preview(diff: &str, options: CompactDiffOptions) -> Co
 						- i64::try_from(removed_lines).unwrap_or(i64::MAX);
 					append_formatted_line(
 						&mut formatted,
-						fmts!("{}:{}", parsed.number.saturating_add(offset), parsed.content),
+						sf!("{}:{}", parsed.number.saturating_add(offset), parsed.content),
 					);
 				},
 			}
@@ -560,7 +560,7 @@ fn append_line(output: &mut Vec<Str>, line: &str) {
 	{
 		return;
 	}
-	output.push(normalized.into());
+	output.push(Str::new(normalized));
 }
 
 fn append_formatted_line(output: &mut Vec<Str>, line: Str) {

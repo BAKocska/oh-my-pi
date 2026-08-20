@@ -36,7 +36,7 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -79,15 +79,12 @@ impl ProofTool {
 			"edit" => Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: [Str::new_static("**")].into_iter().collect(),
+					write_globs: [sf!("**")].into_iter().collect(),
 				}),
 				..Effects::empty()
 			},
 			"shell" => Effects {
-				exec: Some(ExecEffects {
-					commands: [Str::new_static("*")].into_iter().collect(),
-					network:  true,
-				}),
+				exec: Some(ExecEffects { commands: [sf!("*")].into_iter().collect(), network: true }),
 				..Effects::empty()
 			},
 			_ => Effects::empty(),
@@ -260,7 +257,7 @@ impl ScriptedGateway {
 			tools
 				.register(ProofTool::new(name, family), Presentation::Slot, Claims {
 					precedence: Precedence::CORE,
-					claimant:   Str::new_static("omp/core"),
+					claimant:   sf!("omp/core"),
 					replaces:   None,
 				})
 				.expect("proof tool registers");
@@ -372,7 +369,7 @@ fn scripted_registry(
 			builder
 				.register_unavailable(RouteUnavailable {
 					route:     candidate.id.clone(),
-					reason:    ReasonId(Str::from("p7-scripted-route-only")),
+					reason:    ReasonId(sf!("p7-scripted-route-only")),
 					operation: None,
 				})
 				.expect("unavailable route registers")
@@ -442,7 +439,7 @@ fn streaming_edit_script() -> FakeScript {
 	let arguments = json!({ "input": "[scratch.txt#5C9F]\nPUT 1.=1:\n+new" });
 	let call = ToolCall {
 		id:        ToolCallId::from("edit-1"),
-		name:      Str::from("edit"),
+		name:      sf!("edit"),
 		arguments: OpaqueJson::new(arguments),
 	};
 	FakeScript::chat(vec![

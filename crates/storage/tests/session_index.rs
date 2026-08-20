@@ -8,7 +8,7 @@ use std::{
 	},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::inference::v1 as pb;
 use omp_storage::{
 	index::{
@@ -188,7 +188,7 @@ fn receipt_persists_canonical_usage_and_sql_groups_every_scalar_field() {
 		.expect("list from index rows");
 	assert_eq!(sessions.sessions[0].usage.input_tokens, 47);
 	assert_eq!(sessions.sessions[0].cost.nanos_usd, 2_000);
-	assert_eq!(sessions.sessions[0].models.as_slice(), [Str::from("anthropic/claude-opus")]);
+	assert_eq!(sessions.sessions[0].models.as_slice(), [sf!("anthropic/claude-opus")]);
 
 	let buckets = index
 		.usage(&UsageQuery {
@@ -309,10 +309,7 @@ fn title_and_contains_kind_are_updated_only_after_journal_success() {
 		.expect("append durable title");
 
 	let page = index
-		.list(&SessionFilter {
-			contains_kind: Some(Str::from("omp.title")),
-			..SessionFilter::default()
-		})
+		.list(&SessionFilter { contains_kind: Some(sf!("omp.title")), ..SessionFilter::default() })
 		.expect("query indexed kind");
 	assert_eq!(page.sessions.len(), 1);
 	assert_eq!(page.sessions[0].title.as_deref(), Some("Durable"));

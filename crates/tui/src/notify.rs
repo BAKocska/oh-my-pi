@@ -10,7 +10,7 @@ use std::{
 	sync::atomic::{AtomicU64, Ordering},
 };
 
-use omp_core::{Str, encoding::base64};
+use omp_core::{IntoStr, Str, encoding::base64};
 use smallvec::SmallVec;
 
 use crate::{NotifyProtocol, TerminalCaps, escape::esc, kitty::append_tmux_passthrough};
@@ -175,29 +175,29 @@ pub struct NotificationBuilder {
 impl NotificationBuilder {
 	/// Sets the notification title.
 	#[must_use]
-	pub fn title(mut self, title: impl Into<Str>) -> Self {
-		self.notification.title = Some(title.into());
+	pub fn title(mut self, title: impl IntoStr) -> Self {
+		self.notification.title = Some(title.into_str());
 		self
 	}
 
 	/// Sets the notification body.
 	#[must_use]
-	pub fn body(mut self, body: impl Into<Str>) -> Self {
-		self.notification.body = Some(body.into());
+	pub fn body(mut self, body: impl IntoStr) -> Self {
+		self.notification.body = Some(body.into_str());
 		self
 	}
 
 	/// Sets the stable OSC 99 identifier.
 	#[must_use]
-	pub fn id(mut self, id: impl Into<Str>) -> Self {
-		self.notification.id = Some(id.into());
+	pub fn id(mut self, id: impl IntoStr) -> Self {
+		self.notification.id = Some(id.into_str());
 		self
 	}
 
 	/// Appends one notification category.
 	#[must_use]
-	pub fn notification_type(mut self, notification_type: impl Into<Str>) -> Self {
-		self.notification.types.push(notification_type.into());
+	pub fn notification_type(mut self, notification_type: impl IntoStr) -> Self {
+		self.notification.types.push(notification_type.into_str());
 		self
 	}
 
@@ -224,8 +224,8 @@ impl NotificationBuilder {
 
 	/// Sets the icon name.
 	#[must_use]
-	pub fn icon_name(mut self, icon_name: impl Into<Str>) -> Self {
-		self.notification.icon_name = Some(icon_name.into());
+	pub fn icon_name(mut self, icon_name: impl IntoStr) -> Self {
+		self.notification.icon_name = Some(icon_name.into_str());
 		self
 	}
 

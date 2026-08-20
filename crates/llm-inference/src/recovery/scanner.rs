@@ -1,7 +1,7 @@
 //! Allocation-conscious incremental UTF-8 and delimiter scanners.
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 use super::{DiagnosticContext, RecoveryError, Stage};
 
@@ -55,10 +55,7 @@ impl Utf8Scanner {
 					let diagnostic = DiagnosticContext::capture(&self.pending, self.diagnostic_bytes);
 					return Err(RecoveryError::InvalidInput {
 						stage:  "utf8-scanner",
-						reason: Str::from(format!(
-							"invalid UTF-8 ({} bytes retained)",
-							diagnostic.input_bytes()
-						)),
+						reason: sf!("invalid UTF-8 ({} bytes retained)", diagnostic.input_bytes()),
 					});
 				}
 				if self.pending.len() > self.max_pending {
@@ -246,7 +243,7 @@ fn valid_utf8_prefix(input: &[u8], final_chunk: bool) -> Result<usize, RecoveryE
 		Err(error) if error.error_len().is_none() && !final_chunk => Ok(error.valid_up_to()),
 		Err(_) => Err(RecoveryError::InvalidInput {
 			stage:  "tag-scanner",
-			reason: Str::new_static("input is not valid UTF-8"),
+			reason: sf!("input is not valid UTF-8"),
 		}),
 	}
 }

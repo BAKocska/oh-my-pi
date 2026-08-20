@@ -4,7 +4,7 @@ use std::{future::Future, sync::Arc};
 
 use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	BlobRef, CallOutcome, CapsBase, Claims, ErasedEv, ErasedOutcome, IncomingParams, ModelClass,
 	Part, Precedence, Presentation, PromptCaps, Registry, Tool,
@@ -40,9 +40,7 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		&self,
 		_request: glob::WalkRequest,
 	) -> impl Future<Output = Result<glob::WalkResult, glob::Fault>> + Send + '_ {
-		std::future::ready(Err(glob::Fault::Workspace {
-			message: Str::from("unused fake glob boundary"),
-		}))
+		std::future::ready(Err(glob::Fault::Workspace { message: sf!("unused fake glob boundary") }))
 	}
 }
 
@@ -61,7 +59,7 @@ impl ReadBlobs for RecordingBlobs {
 		async move {
 			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 			stored.lock().push(bytes);
-			Ok(BlobRef { hash: Str::new_static("grep-full"), media_type, byte_len })
+			Ok(BlobRef { hash: sf!("grep-full"), media_type, byte_len })
 		}
 	}
 }
@@ -81,15 +79,15 @@ fn failed(fault: grep::Fault) -> FakeWorkspace {
 
 fn matched(path: &str, line_number: u32, line: &str, tag: Option<&str>) -> grep::SearchMatch {
 	grep::SearchMatch {
-		source_key: Str::from(path),
-		path: Str::from(path),
+		source_key: Str::new(path),
+		path: Str::new(path),
 		root_index: 0,
 		line_number,
-		line: Str::from(line),
+		line: Str::new(line),
 		truncated: false,
 		context_before: Vec::new(),
 		context_after: Vec::new(),
-		snapshot_tag: tag.map(Str::from),
+		snapshot_tag: tag.map(Str::new),
 	}
 }
 
@@ -98,13 +96,13 @@ fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs
 	registry
 		.register(grep::tool(workspace.clone(), blobs), Presentation::Slot, Claims {
 			precedence: Precedence::CORE,
-			claimant:   Str::from("omp/core"),
+			claimant:   sf!("omp/core"),
 			replaces:   None,
 		})
 		.expect("grep schema and revision register");
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(raw))
+		.args_committed(Str::new(raw))
 		.expect("invocation consumer remains live");
 	let events = block_on(
 		registry
@@ -266,7 +264,7 @@ fn no_matches_projects_the_pi_message_and_is_useless() {
 
 #[test]
 fn invalid_regex_is_mapped_to_the_pi_fault_text() {
-	let workspace = failed(grep::Fault::InvalidRegex { message: Str::from("unclosed group") });
+	let workspace = failed(grep::Fault::InvalidRegex { message: sf!("unclosed group") });
 	let (text, useless) = invoke_prompt(&workspace, r#"{"pattern":"(","path":"src"}"#);
 	assert_eq!(text, "Invalid regex: unclosed group");
 	assert!(!useless);
@@ -300,7 +298,7 @@ fn range_overfetch_and_output_truncation_authorize_only_emitted_rows() {
 	let workspace = fake(grep::SearchResult {
 		matches,
 		snapshots: vec![grep::SearchSnapshot {
-			source_key: Str::from("src/range.rs"),
+			source_key: sf!("src/range.rs"),
 			revision:   Bytes::from_static(b"range-revision"),
 			bytes:      Bytes::from(vec![b'x'; 80 * 1024]),
 		}],
@@ -335,7 +333,7 @@ fn explicit_oversized_file_note_is_appended_verbatim() {
 	let workspace = fake(grep::SearchResult {
 		matches: vec![matched("large.log", 1, "needle", None)],
 		multi_scope: false,
-		oversized_files: vec![Str::from("large.log")],
+		oversized_files: vec![sf!("large.log")],
 		..grep::SearchResult::default()
 	});
 	let (text, useless) = invoke_prompt(&workspace, r#"{"pattern":"needle","path":"large.log"}"#);

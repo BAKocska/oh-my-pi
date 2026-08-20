@@ -21,7 +21,7 @@ pub fn split(text: &str) -> Vec<QueueItem> {
 		.or_else(|| trimmed.strip_prefix("=>"))
 		.filter(|body| body.starts_with(char::is_whitespace))
 	{
-		return vec![QueueItem { text: Str::from(body.trim()), yield_after_turn: true }];
+		return vec![QueueItem { text: Str::new(body.trim()), yield_after_turn: true }];
 	}
 	let delimited = split_delimiters(trimmed);
 	if delimited.len() > 1 {
@@ -34,7 +34,7 @@ pub fn split(text: &str) -> Vec<QueueItem> {
 }
 
 fn item(text: &str) -> QueueItem {
-	QueueItem { text: Str::from(text.trim()), yield_after_turn: false }
+	QueueItem { text: Str::new(text.trim()), yield_after_turn: false }
 }
 
 fn split_delimiters(text: &str) -> Vec<&str> {

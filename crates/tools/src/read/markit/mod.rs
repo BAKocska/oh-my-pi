@@ -2,7 +2,7 @@
 
 use std::{fmt, path::Path};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use strum::EnumString;
 
 mod doc;
@@ -75,8 +75,8 @@ pub enum MarkitError {
 
 impl MarkitError {
 	/// Build a failure reported by a specific document converter.
-	pub fn conversion(format: &'static str, message: impl Into<Str>) -> Self {
-		Self::Conversion { format, message: message.into() }
+	pub fn conversion(format: &'static str, message: impl IntoStr) -> Self {
+		Self::Conversion { format, message: message.into_str() }
 	}
 
 	/// Stable name of the converter that failed.
@@ -108,7 +108,7 @@ fn convert_with_anydoc(
 	format_name: &'static str,
 ) -> Result<Str, MarkitError> {
 	anydoc::to_markdown_bytes(bytes, format)
-		.map(Str::from)
+		.map(Str::new)
 		.map_err(|error| MarkitError::conversion(format_name, error.to_string()))
 }
 
@@ -167,7 +167,7 @@ pub fn convert(path: &Path, bytes: &[u8]) -> Result<Option<Conversion>, MarkitEr
 				.map_err(|error| MarkitError::conversion("html/xml", error.to_string()))?;
 			let converted = html_to_markdown_rs::convert(source, None)
 				.map_err(|error| MarkitError::conversion("html/xml", error.to_string()))?;
-			let text = Str::from(converted.content.unwrap_or_default());
+			let text = Str::new(converted.content.unwrap_or_default());
 			Conversion::plain(text)
 		},
 	};

@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt as _, stream};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use ring::{
 	aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
@@ -449,11 +449,8 @@ pub async fn stage_body(
 		};
 		let observed = total.saturating_add(bytes.len() as u64);
 		if observed > effective_limit {
-			let detail = ErrorDetail::budget(
-				Str::from("staging_bytes"),
-				effective_limit as u128,
-				observed as u128,
-			);
+			let detail =
+				ErrorDetail::budget(sf!("staging_bytes"), effective_limit as u128, observed as u128);
 			return Err(finish_failure(
 				receipt,
 				failed_evidence(total, started, disk.as_ref(), false),
@@ -617,7 +614,7 @@ fn finish_failure(
 fn staging_error(kind: ErrorKind, code: &'static str, detail: Option<ErrorDetail>) -> Error {
 	let error =
 		Error::new(kind, ErrorPhase::Artifact, RetryAction::Never, ExecutionReceipt::default())
-			.code(Str::from(code));
+			.code(Str::new(code));
 	match detail {
 		Some(detail) => error.detail(detail),
 		None => error,
@@ -1034,7 +1031,7 @@ fn aad(index: u64, plain_len: u32) -> [u8; 20] {
 }
 
 fn tamper_error() -> Error {
-	let detail = ErrorDetail::protocol(ReasonId(Str::from("staged_chunk_authentication_failed")));
+	let detail = ErrorDetail::protocol(ReasonId(sf!("staged_chunk_authentication_failed")));
 	staging_error(ErrorKind::StreamCorruption, "staged_chunk_authentication_failed", Some(detail))
 }
 
@@ -1465,10 +1462,10 @@ mod tests {
 		.unwrap();
 		let path = spool.temporary_path().unwrap();
 		spool
-			.push(ChatEvent::TextDelta { index: 1, text: Str::from("first") }, 10)
+			.push(ChatEvent::TextDelta { index: 1, text: sf!("first") }, 10)
 			.unwrap();
 		spool
-			.push(ChatEvent::ThinkingDelta { index: 2, text: Str::from("second") }, 11)
+			.push(ChatEvent::ThinkingDelta { index: 2, text: sf!("second") }, 11)
 			.unwrap();
 		let encrypted = std::fs::read(&path).unwrap();
 		assert!(
@@ -1513,7 +1510,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(
 			spool
-				.push(ChatEvent::TextDelta { index: 0, text: Str::from("large") }, 5)
+				.push(ChatEvent::TextDelta { index: 0, text: sf!("large") }, 5)
 				.unwrap_err(),
 			GateSpoolError::Capacity { limit: 4, observed: 5 },
 		);
@@ -1528,7 +1525,7 @@ mod tests {
 		let event = ChatEvent::Artifact {
 			index:    0,
 			artifact: Artifact {
-				media_type: Str::from("audio/raw"),
+				media_type: sf!("audio/raw"),
 				size:       None,
 				digest:     None,
 				body:       ArtifactBody::Stream(Box::pin(stream::pending())),
@@ -1818,11 +1815,11 @@ fn gate_aad(index: u64, event_bytes: u64, plain_len: u32) -> [u8; 28] {
 }
 
 fn gate_unavailable(reason: &'static str) -> GateSpoolError {
-	GateSpoolError::Unavailable { reason: ReasonId(Str::from(reason)) }
+	GateSpoolError::Unavailable { reason: ReasonId(Str::new(reason)) }
 }
 
 fn gate_corrupt(reason: &'static str) -> GateSpoolError {
-	GateSpoolError::Corrupt { reason: ReasonId(Str::from(reason)) }
+	GateSpoolError::Corrupt { reason: ReasonId(Str::new(reason)) }
 }
 
 fn encode_chat_event(event: &ChatEvent, out: &mut Vec<u8>) -> Result<(), GateSpoolError> {
@@ -1912,7 +1909,7 @@ fn decode_chat_event(input: &[u8]) -> Result<ChatEvent, GateSpoolError> {
 			provider:            crate::catalog::ProviderId::from(cursor.string()?),
 			route:               crate::catalog::RouteId::from(cursor.string()?),
 			model:               cursor.option_string()?.map(crate::catalog::ModelKey::from),
-			provider_request_id: cursor.option_string()?.map(Str::from),
+			provider_request_id: cursor.option_string()?.map(Str::new),
 			created_at:          cursor.system_time()?,
 		}),
 		1 => ChatEvent::BlockStarted {
@@ -1925,12 +1922,12 @@ fn decode_chat_event(input: &[u8]) -> Result<ChatEvent, GateSpoolError> {
 				_ => return Err(gate_corrupt("secure_gate_event_tag_corrupt")),
 			},
 		},
-		2 => ChatEvent::TextDelta { index: cursor.u32()?, text: Str::from(cursor.string()?) },
-		3 => ChatEvent::ThinkingDelta { index: cursor.u32()?, text: Str::from(cursor.string()?) },
+		2 => ChatEvent::TextDelta { index: cursor.u32()?, text: Str::new(cursor.string()?) },
+		3 => ChatEvent::ThinkingDelta { index: cursor.u32()?, text: Str::new(cursor.string()?) },
 		4 => ChatEvent::ToolCallStarted {
 			index: cursor.u32()?,
 			id:    ToolCallId::from(cursor.string()?),
-			name:  Str::from(cursor.string()?),
+			name:  Str::new(cursor.string()?),
 		},
 		5 => ChatEvent::ToolArgumentsDelta {
 			index: cursor.u32()?,
@@ -1939,7 +1936,7 @@ fn decode_chat_event(input: &[u8]) -> Result<ChatEvent, GateSpoolError> {
 		6 => {
 			let index = cursor.u32()?;
 			let id = ToolCallId::from(cursor.string()?);
-			let name = Str::from(cursor.string()?);
+			let name = Str::new(cursor.string()?);
 			let arguments = serde_json::from_slice(cursor.bytes()?)
 				.map_err(|_| gate_corrupt("secure_gate_json_corrupt"))?;
 			ChatEvent::ToolCallReady {
@@ -2004,7 +2001,7 @@ fn encode_artifact(artifact: &Artifact, out: &mut Vec<u8>) -> Result<(), GateSpo
 }
 
 fn decode_artifact(cursor: &mut GateCursor<'_>) -> Result<Artifact, GateSpoolError> {
-	let media_type = Str::from(cursor.string()?);
+	let media_type = Str::new(cursor.string()?);
 	let size = cursor.option_u64()?;
 	let digest = if cursor.bool()? {
 		Some(Digest {
@@ -2021,9 +2018,9 @@ fn decode_artifact(cursor: &mut GateCursor<'_>) -> Result<Artifact, GateSpoolErr
 	let body = match cursor.u8()? {
 		0 => ArtifactBody::Bytes(Bytes::copy_from_slice(cursor.bytes()?)),
 		1 => ArtifactBody::Stored(ArtifactRef {
-			store:    Str::from(cursor.string()?),
-			id:       Str::from(cursor.string()?),
-			revision: Str::from(cursor.string()?),
+			store:    Str::new(cursor.string()?),
+			id:       Str::new(cursor.string()?),
+			revision: Str::new(cursor.string()?),
 		}),
 		_ => return Err(gate_corrupt("secure_gate_artifact_tag_corrupt")),
 	};
@@ -2225,7 +2222,7 @@ impl<'a> GateCursor<'a> {
 			2 => FinishReason::ToolCalls,
 			3 => FinishReason::ContentFilter,
 			4 => FinishReason::Cancelled,
-			5 => FinishReason::Other(Str::from(self.string()?)),
+			5 => FinishReason::Other(Str::new(self.string()?)),
 			_ => return Err(gate_corrupt("secure_gate_finish_reason_corrupt")),
 		})
 	}

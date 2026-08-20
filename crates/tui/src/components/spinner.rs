@@ -1,6 +1,6 @@
 //! Indeterminate activity indicator backing the `<spinner>` markup tag.
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
@@ -29,8 +29,8 @@ impl Spinner {
 	}
 
 	/// Sets the text following the spinner glyph.
-	pub fn label(mut self, label: impl Into<Str>) -> Self {
-		self.label = label.into();
+	pub fn label(mut self, label: impl IntoStr) -> Self {
+		self.label = label.into_str();
 		self
 	}
 

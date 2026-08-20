@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Duration, Str, fmts};
+use omp_core::{Duration, Str, sf};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
 use omp_proto::{
 	blob::v1::Chunk,
@@ -190,7 +190,7 @@ impl JobBoard {
 			.env
 			.list_processes(ListProcesses { props: None })
 			.await
-			.map_err(|error| JobError::Environment(Str::from(error.to_string())))?;
+			.map_err(|error| JobError::Environment(Str::new(error.to_string())))?;
 		let Some(process) = processes
 			.processes
 			.iter()
@@ -206,7 +206,7 @@ impl JobBoard {
 		}
 		let grace_ms = grace
 			.to_std()
-			.map_err(|error| JobError::InvalidGrace(Str::from(error.to_string())))?
+			.map_err(|error| JobError::InvalidGrace(Str::new(error.to_string())))?
 			.as_millis()
 			.try_into()
 			.unwrap_or(u64::MAX);
@@ -215,7 +215,7 @@ impl JobBoard {
 			.env
 			.stop_process(StopProcess { name: name.to_string(), grace_ms, props: None })
 			.await
-			.map_err(|error| JobError::Environment(Str::from(error.to_string())))?;
+			.map_err(|error| JobError::Environment(Str::new(error.to_string())))?;
 		Ok(CancelOutcome::Accepted)
 	}
 
@@ -481,18 +481,20 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 			props:          None,
 		})
 		.await
-		.map_err(|error| fmts!("could not attach to named process: {error}"))?;
+		.map_err(|error| sf!("could not attach to named process: {error}"))?;
 	let attached = match attachment
 		.next_event()
 		.await
-		.map_err(|error| fmts!("named-process attachment failed: {error}"))?
+		.map_err(|error| sf!("named-process attachment failed: {error}"))?
 	{
 		Some(ProcessAttachmentEvent::Attached(attached)) => attached,
-		Some(_) => return Err(Str::from("named-process attachment omitted acknowledgement")),
-		None => return Err(Str::from("named-process attachment closed before acknowledgement")),
+		Some(_) => return Err(sf!("named-process attachment omitted acknowledgement")),
+		None => {
+			return Err(sf!("named-process attachment closed before acknowledgement"));
+		},
 	};
 	if attached.name != name.as_str() || attached.generation != *generation {
-		return Err(fmts!(
+		return Err(sf!(
 			"named-process attachment generation mismatch: expected {name}@{generation}, got {}@{}",
 			attached.name,
 			attached.generation
@@ -501,7 +503,7 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 
 	let upload = env
 		.blob_put()
-		.map_err(|error| fmts!("could not open settlement artifact upload: {error}"))?;
+		.map_err(|error| sf!("could not open settlement artifact upload: {error}"))?;
 	let mut header = serde_json::to_vec(&ArtifactHeader {
 		job_id:            job.id.as_str(),
 		owner:             OwnerRecord { name: name.as_str(), generation: *generation },
@@ -511,9 +513,9 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 			lifetime:    job.artifact.lifetime,
 		},
 	})
-	.map_err(|error| fmts!("could not encode settlement header: {error}"))?;
+	.map_err(|error| sf!("could not encode settlement header: {error}"))?;
 	if header.pop() != Some(b'}') {
-		return Err(Str::from("settlement header was not a JSON object"));
+		return Err(sf!("settlement header was not a JSON object"));
 	}
 	header.extend_from_slice(b",\"output\":[");
 	upload_bytes(&upload, &header).await?;
@@ -523,11 +525,11 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 		let event = attachment
 			.next_event()
 			.await
-			.map_err(|error| fmts!("named-process attachment failed: {error}"))?
-			.ok_or_else(|| Str::from("named-process attachment closed before terminal state"))?;
+			.map_err(|error| sf!("named-process attachment failed: {error}"))?
+			.ok_or_else(|| sf!("named-process attachment closed before terminal state"))?;
 		match event {
 			ProcessAttachmentEvent::Attached(_) => {
-				return Err(Str::from("named-process attachment repeated acknowledgement"));
+				return Err(sf!("named-process attachment repeated acknowledgement"));
 			},
 			ProcessAttachmentEvent::Output(output) => {
 				validate_output(&output, name, *generation)?;
@@ -536,7 +538,7 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 					channel:  output.channel,
 					data:     &output.data,
 				})
-				.map_err(|error| fmts!("could not encode process output: {error}"))?;
+				.map_err(|error| sf!("could not encode process output: {error}"))?;
 				if !first_output {
 					encoded.insert(0, b',');
 				}
@@ -546,7 +548,7 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 			ProcessAttachmentEvent::State(state) => {
 				let info = state
 					.process
-					.ok_or_else(|| Str::from("named-process state omitted process info"))?;
+					.ok_or_else(|| sf!("named-process state omitted process info"))?;
 				validate_state(&info, name, *generation)?;
 				if terminal_state(&info) {
 					return finish_settlement(upload, job, info).await;
@@ -563,13 +565,13 @@ async fn finish_settlement(
 ) -> Result<thread::Item, Str> {
 	let mut suffix = Vec::from(&b"],\"state\":"[..]);
 	serde_json::to_writer(&mut suffix, &StateRecord::from(&info))
-		.map_err(|error| fmts!("could not encode terminal process state: {error}"))?;
+		.map_err(|error| sf!("could not encode terminal process state: {error}"))?;
 	suffix.push(b'}');
 	upload_bytes(&upload, &suffix).await?;
 	let stored = upload
 		.commit()
 		.await
-		.map_err(|error| fmts!("could not commit settlement artifact: {error}"))?;
+		.map_err(|error| sf!("could not commit settlement artifact: {error}"))?;
 	let state = ProcessState::try_from(info.state)
 		.map_or_else(|_| format!("state {}", info.state), |state| format!("{state:?}"));
 	let text = format!("Detached job {} settled: {}.", job.id, state.to_lowercase());
@@ -593,7 +595,7 @@ async fn upload_bytes(upload: &omp_env::BlobUpload, bytes: &[u8]) -> Result<(), 
 		upload
 			.send_chunk(Chunk { data: Bytes::copy_from_slice(data), hash: Bytes::new(), size: None })
 			.await
-			.map_err(|error| fmts!("could not stream settlement artifact: {error}"))?;
+			.map_err(|error| sf!("could not stream settlement artifact: {error}"))?;
 	}
 	Ok(())
 }
@@ -602,7 +604,7 @@ fn validate_output(output: &ProcessOutput, name: &str, generation: u64) -> Resul
 	if output.name == name && output.generation == generation {
 		Ok(())
 	} else {
-		Err(fmts!(
+		Err(sf!(
 			"named-process output generation mismatch: expected {name}@{generation}, got {}@{}",
 			output.name,
 			output.generation
@@ -614,7 +616,7 @@ fn validate_state(info: &ProcessInfo, name: &str, generation: u64) -> Result<(),
 	if info.name == name && info.generation == generation {
 		Ok(())
 	} else {
-		Err(fmts!(
+		Err(sf!(
 			"named-process state generation mismatch: expected {name}@{generation}, got {}@{}",
 			info.name,
 			info.generation
@@ -724,10 +726,10 @@ mod tests {
 
 	fn job(id: &str, lifetime: ArtifactLifetime) -> JobRef {
 		JobRef {
-			id:       Str::from(id),
-			owner:    JobOwner::NamedProcess { name: Str::from(id), generation: 1 },
+			id:       Str::new(id),
+			owner:    JobOwner::NamedProcess { name: Str::new(id), generation: 1 },
 			artifact: ExpectedArtifact {
-				description: Str::from("detached output"),
+				description: sf!("detached output"),
 				media_type: None,
 				lifetime,
 			},
@@ -781,7 +783,7 @@ mod tests {
 		let interrupts = mailbox.drain(DrainPoint::TurnBoundary, false);
 		assert_eq!(interrupts.len(), 1);
 		assert_eq!(interrupts[0].class, InterruptClass::TurnBoundary);
-		assert_eq!(interrupts[0].source, InterruptSource::Job { id: Str::from("job-1") });
+		assert_eq!(interrupts[0].source, InterruptSource::Job { id: sf!("job-1") });
 		assert!(!board.settle("job-1", thread::Item::default()).unwrap());
 		assert!(mailbox.is_empty());
 	}
@@ -796,10 +798,10 @@ mod watch_tests {
 
 	fn watched_job(id: &str) -> JobRef {
 		JobRef {
-			id:       Str::from(id),
-			owner:    JobOwner::NamedProcess { name: Str::from(id), generation: 1 },
+			id:       Str::new(id),
+			owner:    JobOwner::NamedProcess { name: Str::new(id), generation: 1 },
 			artifact: ExpectedArtifact {
-				description: Str::from("detached output"),
+				description: sf!("detached output"),
 				media_type:  None,
 				lifetime:    ArtifactLifetime::Session,
 			},

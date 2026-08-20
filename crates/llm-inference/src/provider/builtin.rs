@@ -8,7 +8,7 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	OperationBits, OperationKind,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
@@ -631,7 +631,7 @@ fn discovery_codec(
 			{
 				return Err(RouteUnavailable {
 					route:     route.id.clone(),
-					reason:    ReasonId(Str::from("specialized-discovery-codec-not-implemented")),
+					reason:    ReasonId(sf!("specialized-discovery-codec-not-implemented")),
 					operation: Some(OperationKind::DiscoverModels),
 				});
 			}
@@ -696,7 +696,7 @@ impl RouteCodecSet {
 			if !binding.supported.contains_kind(operation) {
 				return Err(RouteUnavailable {
 					route:     route.id.clone(),
-					reason:    ReasonId(Str::from("advertised-operation-codec-not-implemented")),
+					reason:    ReasonId(sf!("advertised-operation-codec-not-implemented")),
 					operation: Some(operation),
 				});
 			}
@@ -718,8 +718,8 @@ impl RouteCodecSet {
 			Error::planning(
 				ErrorKind::CapabilityMismatch,
 				ErrorDetail::capability(
-					Str::from(operation.to_string()),
-					ReasonId(Str::from("operation-not-advertised-on-route")),
+					Str::new(operation.to_string()),
+					ReasonId(sf!("operation-not-advertised-on-route")),
 				),
 				ExecutionReceipt::default(),
 			)
@@ -810,7 +810,7 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 			route.endpoint.base_url = endpoint_override.clone();
 			route.trust_domain.origin = url::Url::parse(endpoint_override).map_or_else(
 				|_| endpoint_override.clone(),
-				|url| Str::from(url.origin().ascii_serialization()),
+				|url| Str::new(url.origin().ascii_serialization()),
 			);
 			effective_route = Some(route);
 			effective_target = plan.wire_target().cloned().map(|mut target| {
@@ -1206,14 +1206,14 @@ impl IntentPlanner for PlannedIntent {
 		let Some(plan) = &call.execution else {
 			return Err(Error::planning(
 				ErrorKind::ProviderContractMismatch,
-				ErrorDetail::protocol(ReasonId(Str::from("execution-plan-missing"))),
+				ErrorDetail::protocol(ReasonId(sf!("execution-plan-missing"))),
 				ExecutionReceipt::default(),
 			));
 		};
 		if plan.route != self.route {
 			return Err(Error::planning(
 				ErrorKind::ProviderContractMismatch,
-				ErrorDetail::protocol(ReasonId(Str::from("planned-route-mismatch"))),
+				ErrorDetail::protocol(ReasonId(sf!("planned-route-mismatch"))),
 				ExecutionReceipt::default(),
 			));
 		}
@@ -1247,7 +1247,7 @@ impl SemanticPolicy<Call> for CanonicalSemantic {
 fn unavailable(route: &RouteDef, reason: &'static str) -> RouteUnavailable {
 	RouteUnavailable {
 		route:     route.id.clone(),
-		reason:    ReasonId(Str::from(reason)),
+		reason:    ReasonId(Str::new(reason)),
 		operation: None,
 	}
 }
@@ -1259,7 +1259,7 @@ fn authentication_error(context: &ExecutionContext, reason: &'static str) -> Err
 		RetryAction::Never,
 		context.receipt(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn contract_error(context: &ExecutionContext, reason: &'static str) -> Error {
@@ -1269,7 +1269,7 @@ fn contract_error(context: &ExecutionContext, reason: &'static str) -> Error {
 		RetryAction::Never,
 		context.receipt(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn session_trust_error(context: &ExecutionContext) -> Error {
@@ -1279,9 +1279,7 @@ fn session_trust_error(context: &ExecutionContext) -> Error {
 		RetryAction::ReseedSession,
 		context.receipt(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(
-		"dynamic-endpoint-trust-domain-changed",
-	))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!("dynamic-endpoint-trust-domain-changed",))))
 }
 
 #[cfg(test)]
@@ -1327,8 +1325,8 @@ mod tests {
 			.clone();
 		let provider = catalog.provider(&route.provider).expect("provider");
 		let cca = GoogleCcaConfig {
-			gemini_cli_platform: Str::from("test"),
-			gemini_cli_arch:     Str::from("test"),
+			gemini_cli_platform: sf!("test"),
+			gemini_cli_arch:     sf!("test"),
 			antigravity_headers: CcaHeaders::antigravity(
 				&crate::codec::google_cca::AntigravityFingerprint::default(),
 				false,
@@ -1457,7 +1455,7 @@ mod tests {
 		let raw = lease(&provider, "raw");
 		let shaped = raw.with_shape(ShapedCredential {
 			secret:            Some(SecretString::from("shaped".to_owned())),
-			endpoint_override: Some(Str::from("https://override.example")),
+			endpoint_override: Some(sf!("https://override.example")),
 		});
 		let context = ExecutionContext::new(call.budget.clone());
 		let transport = encoder
@@ -1499,7 +1497,7 @@ mod tests {
 		let raw = lease(&provider, "raw");
 		let shaped = raw.with_shape(ShapedCredential {
 			secret:            Some(SecretString::from("shaped".to_owned())),
-			endpoint_override: Some(Str::from("https://override.example")),
+			endpoint_override: Some(sf!("https://override.example")),
 		});
 		let context = ExecutionContext::new(call.budget.clone());
 		let binding = PendingServerStateBinding {
@@ -1558,8 +1556,8 @@ mod tests {
 		let mut route = route;
 		route.transport = TransportKind::Websocket;
 		let cca = GoogleCcaConfig {
-			gemini_cli_platform: Str::from("test"),
-			gemini_cli_arch:     Str::from("test"),
+			gemini_cli_platform: sf!("test"),
+			gemini_cli_arch:     sf!("test"),
 			antigravity_headers: CcaHeaders::antigravity(
 				&crate::codec::google_cca::AntigravityFingerprint::default(),
 				false,

@@ -278,7 +278,7 @@ impl ChatEvent {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use omp_core::Str;
+	
 	use serde_json::json;
 
 	use super::{ChatEvent, ToolCall};
@@ -289,7 +289,7 @@ mod tests {
 		let started = ChatEvent::ToolCallStarted {
 			index: 0,
 			id:    ToolCallId::from("call"),
-			name:  Str::from("lookup"),
+			name:  sf!("lookup"),
 		};
 		let partial =
 			ChatEvent::ToolArgumentsDelta { index: 0, bytes: Bytes::from_static(b"{\"q\":") };
@@ -299,7 +299,7 @@ mod tests {
 			index: 0,
 			call:  ToolCall {
 				id:        ToolCallId::from("call"),
-				name:      Str::from("lookup"),
+				name:      sf!("lookup"),
 				arguments: OpaqueJson::new(json!({"q": "rust"})),
 			},
 		};

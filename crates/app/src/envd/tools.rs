@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
 
-use omp_core::{Duration, Str};
+use omp_core::{Duration, Str, sf};
 use omp_proto::{
 	prost::Message as _,
 	toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint},
@@ -276,9 +276,9 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		)?;
 	}
 	let registry = Arc::new(registry);
-	catalog.bind(Arc::clone(&registry)).map_err(|_| {
-		EnvdError::WorkerDeclaration(Str::new_static("dynamic device catalog bound twice"))
-	})?;
+	catalog
+		.bind(Arc::clone(&registry))
+		.map_err(|_| EnvdError::WorkerDeclaration(sf!("dynamic device catalog bound twice")))?;
 	eval_host
 		.bind_registry(Arc::clone(&registry))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
@@ -317,7 +317,7 @@ impl AgentCheckpointControl {
 			.read()
 			.as_ref()
 			.map(|binding| binding.sender.clone())
-			.ok_or_else(|| Str::new_static("active Agent CONTROL is not bound"))
+			.ok_or_else(|| sf!("active Agent CONTROL is not bound"))
 	}
 }
 
@@ -366,19 +366,11 @@ fn ensure_name_absent(registry: &Registry, name: &str) -> Result<(), EnvdError> 
 }
 
 const fn core_claims() -> Claims {
-	Claims {
-		precedence: Precedence::CORE,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 }
 
 const fn builtin_device_claims() -> Claims {
-	Claims {
-		precedence: Precedence::ENHANCEMENT,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::ENHANCEMENT, claimant: sf!("omp/core"), replaces: None }
 }
 
 fn shell_timeout_bounds(settings: &ToolSettings) -> omp_tools::shell::TimeoutBounds {
@@ -401,7 +393,7 @@ fn shell_timeout_bounds(settings: &ToolSettings) -> omp_tools::shell::TimeoutBou
 
 fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 	let definition = declaration.definition.as_ref().ok_or_else(|| {
-		EnvdError::WorkerDeclaration(Str::new_static("worker tool declaration has no definition"))
+		EnvdError::WorkerDeclaration(sf!("worker tool declaration has no definition"))
 	})?;
 	if declaration.extension_id.is_empty() {
 		return Err(worker_declaration_error("worker tool declaration has no extension id"));
@@ -490,5 +482,5 @@ fn constraint_priority(priority: u32) -> Result<u8, EnvdError> {
 }
 
 const fn worker_declaration_error(message: &'static str) -> EnvdError {
-	EnvdError::WorkerDeclaration(Str::new_static(message))
+	EnvdError::WorkerDeclaration(sf!(message))
 }

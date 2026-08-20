@@ -391,23 +391,23 @@ impl AgentRegistry {
 		let (id, child) = resource.split_once('/').unwrap_or((resource, ""));
 		let (record, _) = self
 			.record(id)
-			.ok_or_else(|| RegistryError::ResourceNotFound(Str::from(id)))?;
+			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
 		let path = if child.is_empty() {
 			record.history.output_path
 		} else {
 			let child = child.replace('/', ".");
 			if !valid_artifact_component(&child) {
-				return Err(RegistryError::ResourceNotFound(Str::from(resource)));
+				return Err(RegistryError::ResourceNotFound(Str::new(resource)));
 			}
 			let parent = record
 				.history
 				.output_path
 				.as_ref()
 				.and_then(|path| path.parent())
-				.ok_or_else(|| RegistryError::ResourceNotFound(Str::from(resource)))?;
+				.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(resource)))?;
 			Some(parent.join(format!("{}.{}.md", record.id, child)))
 		}
-		.ok_or_else(|| RegistryError::ResourceNotFound(Str::from(resource)))?;
+		.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(resource)))?;
 		Ok(fs::read(path)?)
 	}
 
@@ -420,10 +420,10 @@ impl AgentRegistry {
 		}
 		let (record, _) = self
 			.record(id)
-			.ok_or_else(|| RegistryError::ResourceNotFound(Str::from(id)))?;
+			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
 		let path = record
 			.transcript
-			.ok_or_else(|| RegistryError::ResourceNotFound(Str::from(id)))?;
+			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
 		Ok(fs::read(path)?)
 	}
 
@@ -465,7 +465,7 @@ impl AgentRegistry {
 			.keys()
 			.find(|candidate| candidate.as_str().eq_ignore_ascii_case(id))
 			.cloned()
-			.ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+			.ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		let entry = records.get_mut(&key).expect("key selected from same map");
 		if let Some(expected) = expected
 			&& expected != entry.revision
@@ -683,7 +683,7 @@ impl Broker {
 	) -> Result<BrokerInbox, RegistryError> {
 		let mut nodes = self.inner.nodes.lock();
 		let (_, node) =
-			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		node.mailbox = Some(mailbox);
 		node.idle = true;
 		let state = Arc::clone(&node.inbox);
@@ -691,7 +691,7 @@ impl Broker {
 			.keys()
 			.find(|key| key.as_str().eq_ignore_ascii_case(id))
 			.cloned()
-			.ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+			.ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		drop(nodes);
 		self
 			.inner
@@ -726,7 +726,7 @@ impl Broker {
 	pub fn park(&self, id: &str) -> Result<(), RegistryError> {
 		let mut nodes = self.inner.nodes.lock();
 		let (_, node) =
-			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		node.mailbox = None;
 		node.idle = true;
 		drop(nodes);
@@ -742,7 +742,7 @@ impl Broker {
 	pub fn set_idle(&self, id: &str, idle: bool) -> Result<(), RegistryError> {
 		let mut nodes = self.inner.nodes.lock();
 		let (_, node) =
-			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		node.idle = idle;
 		drop(nodes);
 		self.inner.registry.set_status(
@@ -832,16 +832,14 @@ impl Broker {
 	/// Drains or peeks at one agent's bounded FIFO inbox.
 	pub fn inbox(&self, id: &str, peek: bool) -> Result<Vec<PeerMessage>, RegistryError> {
 		let nodes = self.inner.nodes.lock();
-		let (_, node) =
-			find_node(&nodes, id).ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+		let (_, node) = find_node(&nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		Ok(node.inbox.read(peek))
 	}
 
 	/// Returns one agent's unread bounded-inbox count.
 	pub fn unread_count(&self, id: &str) -> Result<usize, RegistryError> {
 		let nodes = self.inner.nodes.lock();
-		let (_, node) =
-			find_node(&nodes, id).ok_or_else(|| RegistryError::NotFound(Str::from(id)))?;
+		let (_, node) = find_node(&nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		Ok(node.inbox.queue.lock().len())
 	}
 
@@ -1067,7 +1065,7 @@ fn sanitize_activity(activity: &str) -> Str {
 			sanitized.push(character);
 		}
 	}
-	Str::from(sanitized.trim())
+	Str::new(sanitized.trim())
 }
 
 fn tombstone_path(transcript: &Path) -> PathBuf {
@@ -1093,7 +1091,7 @@ fn cold_record(path: &Path) -> Result<Option<AgentRecord>, RegistryError> {
 	let name = path
 		.file_stem()
 		.and_then(std::ffi::OsStr::to_str)
-		.map_or_else(|| id.clone(), Str::from);
+		.map_or_else(|| id.clone(), Str::new);
 	Ok(Some(AgentRecord {
 		id,
 		name,
@@ -1102,7 +1100,7 @@ fn cold_record(path: &Path) -> Result<Option<AgentRecord>, RegistryError> {
 		session: header.id.0,
 		depth: 1,
 		status: RegistryStatus::Parked,
-		activity: Str::new_static(""),
+		activity: Default::default(),
 		last_activity_ms: header.created,
 		transcript: Some(path.to_path_buf()),
 		definition: None,
@@ -1121,6 +1119,8 @@ fn valid_artifact_component(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 	use crate::{AgentTree, Budget, Mailbox};
 
@@ -1139,10 +1139,10 @@ mod tests {
 
 	fn message(from: &str, to: &str, index: usize) -> PeerMessage {
 		PeerMessage {
-			id:         Str::from(format!("message-{index}")),
+			id:         sf!("message-{index}"),
 			from:       from.into(),
 			to:         to.into(),
-			text:       Str::from(format!("body-{index}")),
+			text:       sf!("body-{index}"),
 			mode:       DeliveryMode::Aside,
 			reply_to:   None,
 			sent_ms:    now_ms(),

@@ -5,7 +5,7 @@ use std::{borrow::Cow, future::Future, path::Path, sync::Arc};
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt as _, Stream, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
 	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -383,9 +383,9 @@ pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolv
 		resolvers,
 		conflicts,
 		spec: ToolSpec {
-			name:            Str::new_static("read"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(DESCRIPTION),
+			name:            sf!("read"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(DESCRIPTION),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
 				priority:       10,
@@ -445,7 +445,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 			pin_mut!(work, cancel);
 			let result = select_biased! {
 				interrupt = cancel => {
-					let reason = interrupt.map_or_else(|_| Str::new_static("invocation owner dropped"), |value| value.reason);
+					let reason = interrupt.map_or_else(|_| sf!("invocation owner dropped"), |value| value.reason);
 					yield Ev::Aborted(Abort::Interrupted { reason });
 					return;
 				},
@@ -479,7 +479,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 						end -= 1;
 					}
 					if end != 0 {
-						output.push(Part::Text { text: Str::from(&text[..end]) });
+						output.push(Part::Text { text: Str::new(&text[..end]) });
 						remaining_text -= end;
 					}
 				},
@@ -492,7 +492,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 						end -= 1;
 					}
 					if end != 0 {
-						output.push(Part::Text { text: Str::from(&alt[..end]) });
+						output.push(Part::Text { text: Str::new(&alt[..end]) });
 						remaining_text -= end;
 					}
 				},
@@ -515,7 +515,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				.collect::<Vec<_>>()
 				.join(", ");
 			push_payload_part(&mut parts, PayloadPart::Text {
-				text: Str::from(format!("Note: interpreted as {} paths: {}", targets.len(), names)),
+				text: sf!("Note: interpreted as {} paths: {}", targets.len(), names),
 			});
 		}
 		for target in &targets {
@@ -527,7 +527,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				},
 				Err(fault) if multiple => {
 					push_payload_part(&mut parts, PayloadPart::Text {
-						text: Str::from(format!("[Could not read {}: {}]", target, fault.message())),
+						text: sf!("[Could not read {}: {}]", target, fault.message()),
 					});
 				},
 				Err(fault) => return Err(fault),
@@ -538,27 +538,27 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 
 	async fn split_targets(&self, authored: &str) -> Result<Vec<Str>, Fault> {
 		// An exact file name always wins over syntactic target-list encodings.
-		if self.sources.stat(Str::from(authored)).await.is_ok() {
-			return Ok(vec![Str::from(authored)]);
+		if self.sources.stat(Str::new(authored)).await.is_ok() {
+			return Ok(vec![Str::new(authored)]);
 		}
 		if let Some(paths) = selector::parse_json_path_array(authored)
-			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+			.map_err(|error| Fault::Invalid { message: Str::new(error.to_string()) })?
 		{
 			return Ok(paths);
 		}
 		if selector::parse_uri(authored)
-			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+			.map_err(|error| Fault::Invalid { message: Str::new(error.to_string()) })?
 			.is_some()
 			|| !matches!(web::parse_target(authored), Ok(None))
 		{
-			return Ok(vec![Str::from(authored)]);
+			return Ok(vec![Str::new(authored)]);
 		}
 		if !authored.contains([';', ',']) {
-			return Ok(vec![Str::from(authored)]);
+			return Ok(vec![Str::new(authored)]);
 		}
 		let targets = selector::split_delimited_targets(authored);
 		if targets.is_empty() {
-			return Err(Fault::Invalid { message: Str::new_static("Path must not be empty") });
+			return Err(Fault::Invalid { message: sf!("Path must not be empty") });
 		}
 		// Delimiters only become a list when every member resolves directly;
 		// otherwise retain the authored text as one literal path.
@@ -573,7 +573,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		{
 			Ok(targets)
 		} else {
-			Ok(vec![Str::from(authored)])
+			Ok(vec![Str::new(authored)])
 		}
 	}
 
@@ -586,7 +586,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}
 
 		let file_authored = match selector::parse_uri(authored)
-			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+			.map_err(|error| Fault::Invalid { message: Str::new(error.to_string()) })?
 		{
 			Some(uri) if uri.scheme == resolver::Scheme::File => {
 				let mut path = uri.resource.to_owned();
@@ -598,8 +598,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			},
 			Some(uri) if uri.scheme == resolver::Scheme::Unknown => {
 				return Err(Fault::UnknownScheme {
-					scheme:  Str::from(uri.raw_scheme),
-					message: Str::from(format!("Unknown URL scheme '{}'", uri.raw_scheme)),
+					scheme:  Str::new(uri.raw_scheme),
+					message: sf!("Unknown URL scheme '{}'", uri.raw_scheme),
 				});
 			},
 			Some(uri) => {
@@ -610,26 +610,23 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				else {
 					return Err(Fault::SchemeNotReadable {
 						scheme:  uri.scheme,
-						message: Str::from(format!(
+						message: sf!(
 							"{}:// is not readable in this deployment",
 							uri.raw_scheme.to_ascii_lowercase()
-						)),
+						),
 					});
 				};
 				let bytes = result?;
 				let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
-					message: Str::from(format!(
-						"{}://{} did not resolve to UTF-8 text",
-						uri.raw_scheme, uri.resource
-					)),
+					message: sf!("{}://{} did not resolve to UTF-8 text", uri.raw_scheme, uri.resource),
 				})?;
-				return Ok(vec![PayloadPart::Text { text: Str::from(text) }]);
+				return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
 			},
 			None => None,
 		};
 		let authored = file_authored.as_deref().unwrap_or(authored);
 
-		let literal = self.sources.stat(Str::from(authored)).await.ok();
+		let literal = self.sources.stat(Str::new(authored)).await.ok();
 		let parsed_split = selector::split_path_and_selector(authored);
 		let literal_wins = literal.is_some() && parsed_split.selector.is_some();
 		let split = if literal_wins {
@@ -640,10 +637,10 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		if !literal_wins {
 			for candidate in archive::parse_archive_path_candidates(authored) {
 				let archive_path = candidate.archive_path.as_str();
-				let (stat, suffix_from) = match self.sources.stat(Str::from(archive_path)).await {
+				let (stat, suffix_from) = match self.sources.stat(Str::new(archive_path)).await {
 					Ok(stat) => (Some(stat), None),
 					Err(_) => {
-						(self.sources.resolve_suffix(Str::from(archive_path)).await?, Some(archive_path))
+						(self.sources.resolve_suffix(Str::new(archive_path)).await?, Some(archive_path))
 					},
 				};
 				if let Some(stat) = stat {
@@ -655,17 +652,17 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}
 
 		let parsed = selector::parse_selector(split.selector)
-			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?;
+			.map_err(|error| Fault::Invalid { message: Str::new(error.to_string()) })?;
 
 		if !literal_wins {
 			for candidate in sqlite::parse_path_candidates(authored) {
 				let database = candidate.sqlite_path.to_string_lossy();
-				let (stat, suffix_from) = match self.sources.stat(Str::from(database.as_ref())).await {
+				let (stat, suffix_from) = match self.sources.stat(Str::new(database.as_ref())).await {
 					Ok(stat) => (Some(stat), None),
 					Err(_) => (
 						self
 							.sources
-							.resolve_suffix(Str::from(database.as_ref()))
+							.resolve_suffix(Str::new(database.as_ref()))
 							.await?,
 						Some(database.as_ref()),
 					),
@@ -695,10 +692,10 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			}
 			if let Some(pdf) = pdf_image_member(split.path) {
 				return Err(Fault::Unsupported {
-					message: Str::from(format!(
+					message: sf!(
 						"PDF page-image members are not supported by the pdf-inspector backend; read \
 						 {pdf} for the extracted text"
-					)),
+					),
 				});
 			}
 		}
@@ -706,12 +703,12 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		let mut recovered_from = None;
 		let mut stat = if literal_wins {
 			literal.expect("literal path was checked above")
-		} else if let Ok(stat) = self.sources.stat(Str::from(split.path)).await {
+		} else if let Ok(stat) = self.sources.stat(Str::new(split.path)).await {
 			stat
 		} else {
 			let stat = self
 				.sources
-				.resolve_suffix(Str::from(split.path))
+				.resolve_suffix(Str::new(split.path))
 				.await?
 				.ok_or_else(|| Fault::source(format!("Path '{}' not found", split.path)))?;
 			recovered_from = Some(split.path);
@@ -741,7 +738,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				&rendered.text,
 				suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 			);
-			return Ok(vec![PayloadPart::Text { text: Str::from(text) }]);
+			return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
 		}
 
 		let raw = parsed.is_raw();
@@ -778,7 +775,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			let lease = self.sources.open(stat.canonical_path.clone()).await?;
 			let source_bytes = lease.read_all().await?;
 			let rendered = notebook::render(&source_bytes, &stat.display_path)
-				.map_err(|error| Fault::Source { message: Str::from(error.message().to_owned()) })?;
+				.map_err(|error| Fault::Source { message: Str::new(error.message().to_owned()) })?;
 			let rendered_bytes = Bytes::copy_from_slice(rendered.text.as_bytes());
 			return self.text_parts(
 				&stat,
@@ -805,7 +802,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						&notice,
 						suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 					);
-					return Ok(vec![PayloadPart::Text { text: Str::from(text) }]);
+					return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
 				},
 			}
 		}
@@ -818,13 +815,13 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		// UTF-8 validation is refused instead of rendering as mojibake. `:raw`
 		// stays the explicit escape hatch for reading bytes verbatim.
 		if !raw && is_probably_binary_header(&bytes[..bytes.len().min(BINARY_SNIFF_BYTES)]) {
-			return Err(Fault::Source { message: Str::from(binary_notice(&stat)) });
+			return Err(Fault::Source { message: Str::new(binary_notice(&stat)) });
 		}
 		let text: Cow<'_, str> = match std::str::from_utf8(&bytes) {
 			Ok(text) => Cow::Borrowed(text),
 			Err(_) if raw => String::from_utf8_lossy(&bytes),
 			Err(_) => {
-				return Err(Fault::Source { message: Str::from(binary_notice(&stat)) });
+				return Err(Fault::Source { message: Str::new(binary_notice(&stat)) });
 			},
 		};
 		if !raw
@@ -881,7 +878,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			&target.selector,
 			selector::ParsedSelector::None | selector::ParsedSelector::Raw
 		) {
-			vec![PayloadPart::Text { text: Str::from(framed) }]
+			vec![PayloadPart::Text { text: Str::new(framed) }]
 		} else {
 			Self::virtual_text_parts(&framed, &target.selector)
 		};
@@ -900,9 +897,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	) -> Result<Vec<PayloadPart>, Fault> {
 		if parsed.is_multi_range() {
 			return Err(Fault::Invalid {
-				message: Str::new_static(
-					"Multi-range line selectors are not supported for directory listings.",
-				),
+				message: sf!("Multi-range line selectors are not supported for directory listings.",),
 			});
 		}
 		let source = self
@@ -941,7 +936,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				Some(format::SuffixResolution { from, to: &stat.display_path }),
 			);
 		}
-		Ok(vec![PayloadPart::Text { text: Str::from(text) }])
+		Ok(vec![PayloadPart::Text { text: Str::new(text) }])
 	}
 
 	async fn read_archive(
@@ -958,10 +953,10 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				Err(archive::ArchiveError::Io { .. }) => {
 					let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
 					archive::read_archive_bytes(bytes, archive::ArchiveFormat::Asar, target)
-						.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?
+						.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?
 				},
 				Err(error) => {
-					return Err(Fault::Source { message: Str::from(error.to_string()) });
+					return Err(Fault::Source { message: Str::new(error.to_string()) });
 				},
 			}
 		} else {
@@ -970,7 +965,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				.or_else(|| archive::sniff_archive_format(&bytes))
 				.ok_or_else(|| Fault::source(format!("Unsupported archive format: {archive_path}")))?;
 			archive::read_archive_bytes(bytes, archive_format, target)
-				.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?
+				.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?
 		};
 		match result.content {
 			archive::ArchiveContent::Directory(listing) => {
@@ -978,13 +973,13 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 					&listing.render(),
 					suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 				);
-				Ok(vec![PayloadPart::Text { text: Str::from(text) }])
+				Ok(vec![PayloadPart::Text { text: Str::new(text) }])
 			},
 			archive::ArchiveContent::Text(member_text) => {
 				let display_path = if member_text.node.path.is_empty() {
 					stat.display_path.clone()
 				} else {
-					Str::from(format!("{}:{}", stat.display_path, member_text.node.path))
+					sf!("{}:{}", stat.display_path, member_text.node.path)
 				};
 				let member_stat = SourceStat { display_path, ..stat.clone() };
 				let mut parts =
@@ -994,7 +989,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						.iter_mut()
 						.find(|part| matches!(part, PayloadPart::Text { .. }))
 				{
-					*text = Str::from(format::prepend_suffix_resolution_notice(
+					*text = Str::new(format::prepend_suffix_resolution_notice(
 						text,
 						Some(format::SuffixResolution { from, to: &stat.display_path }),
 					));
@@ -1006,7 +1001,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 					&member_binary.notice,
 					suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 				);
-				Ok(vec![PayloadPart::Text { text: Str::from(text) }])
+				Ok(vec![PayloadPart::Text { text: Str::new(text) }])
 			},
 		}
 	}
@@ -1029,12 +1024,12 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		interrupt_on_drop.disarm();
 		let rendered = result
 			.map_err(|error| Fault::source(format!("SQLite read task failed: {error}")))?
-			.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?;
+			.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?;
 		let text = format::prepend_suffix_resolution_notice(
 			&rendered,
 			suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 		);
-		Ok(vec![PayloadPart::Text { text: Str::from(text) }])
+		Ok(vec![PayloadPart::Text { text: Str::new(text) }])
 	}
 
 	async fn read_image(&self, stat: &SourceStat) -> Result<Option<Vec<PayloadPart>>, Fault> {
@@ -1092,7 +1087,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			let remove_end = end + usize::from(summary.text.as_bytes().get(end) == Some(&b'\n'));
 			summary.text.replace_range(header_at..remove_end, "");
 		}
-		Ok(vec![PayloadPart::Text { text: Str::from(summary.text) }])
+		Ok(vec![PayloadPart::Text { text: Str::new(summary.text) }])
 	}
 
 	fn text_parts(
@@ -1146,14 +1141,14 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				1,
 			);
 		}
-		Ok(vec![PayloadPart::Text { text: Str::from(projection) }])
+		Ok(vec![PayloadPart::Text { text: Str::new(projection) }])
 	}
 
 	fn virtual_text_parts(text: &str, parsed: &selector::ParsedSelector) -> Vec<PayloadPart> {
 		let formatted =
 			format::format_text(text, parsed, format::TextFormatOptions::new("URL output"));
 		let (projection, _) = formatted.into_projection();
-		vec![PayloadPart::Text { text: Str::from(projection) }]
+		vec![PayloadPart::Text { text: Str::new(projection) }]
 	}
 
 	async fn finalize_text_parts(&self, parts: Vec<PayloadPart>) -> Result<Payload, Fault> {
@@ -1178,14 +1173,11 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}
 		let blob = self
 			.blobs
-			.store(
-				Bytes::copy_from_slice(text.as_bytes()),
-				Str::new_static("text/plain; charset=utf-8"),
-			)
+			.store(Bytes::copy_from_slice(text.as_bytes()), sf!("text/plain; charset=utf-8"))
 			.await?;
 		let mut visible = truncated.content.to_owned();
 		append_blob_truncation_notice(&mut visible, &truncated, &blob.hash);
-		Ok(Str::from(visible))
+		Ok(Str::new(visible))
 	}
 }
 fn format_read_projection<'a>(
@@ -1269,7 +1261,7 @@ fn append_visible_conflict_warning(
 	if visible_blocks.is_empty() {
 		return;
 	}
-	let registered = registry.refresh(Str::from(display_path), source);
+	let registered = registry.refresh(Str::new(display_path), source);
 	let total = registered.len();
 	let visible = visible_blocks
 		.into_iter()
@@ -1436,7 +1428,7 @@ fn push_payload_part(parts: &mut Vec<PayloadPart>, part: PayloadPart) {
 			combined.push_str(previous);
 			combined.push_str("\n\n");
 			combined.push_str(&text);
-			*previous = Str::from(combined);
+			*previous = Str::new(combined);
 		},
 		(_, part) => parts.push(part),
 	}
@@ -1449,7 +1441,7 @@ const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 const fn args_issue() -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("read@1 arguments"),
+		expected: sf!("read@1 arguments"),
 		kind:     ArgIssueKind::Malformed,
 		example:  None,
 		found:    None,
@@ -1459,7 +1451,7 @@ const fn args_issue() -> ArgIssue {
 const fn protocol_issue(reason: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("linear invocation frames"),
+		expected: sf!("linear invocation frames"),
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(reason),
 		found:    None,

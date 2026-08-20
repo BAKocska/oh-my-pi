@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use bytes::BytesMut;
 use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
+use omp_core::sf;
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
 use omp_proto::{
 	SCHEMA_REV,
@@ -26,9 +27,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-	DEFAULT_TIMEOUT, OwnedProcess, Scratch, install_omp_binary_env, omp_binary, within,
-};
+use super::{DEFAULT_TIMEOUT, OwnedProcess, Scratch, install_omp_binary_env, omp_binary, within};
 
 const FRAME_LIMIT: usize = 64 * 1024 * 1024;
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -67,11 +66,8 @@ impl EnvHarness {
 		let socket = scratch.socket("env.sock");
 		let ext_host_config = ExtHostConfig::new(
 			omp_binary().context("resolving worker-capable host")?,
-			omp_core::Principal::new(
-				omp_core::Str::new_static("e2e-tester"),
-				omp_core::Str::new_static("E2E Tester"),
-			),
-			omp_core::Str::new_static("e2e-session"),
+			omp_core::Principal::new(omp_core::sf!("e2e-tester"), omp_core::sf!("E2E Tester")),
+			omp_core::sf!("e2e-session"),
 			1,
 		);
 		let server = Arc::new(

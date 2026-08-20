@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures::{FutureExt, future::BoxFuture};
-use omp_core::{Str, base64_url};
+use omp_core::{Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -82,7 +82,7 @@ impl GitlabExternalRedirectHandler {
 		entropy.fill(&mut verifier_bytes[..])?;
 		entropy.fill(&mut state_bytes[..])?;
 		let verifier = SecretString::from(base64_url::encode_raw(&verifier_bytes[..]).into_string());
-		let state = Str::from(base64_url::encode_raw(&state_bytes[..]).into_string());
+		let state = Str::new(base64_url::encode_raw(&state_bytes[..]).into_string());
 		let challenge =
 			base64_url::encode_raw(&Sha256::digest(verifier.expose_secret().as_bytes())).into_string();
 
@@ -115,17 +115,17 @@ impl GitlabExternalRedirectHandler {
 		}
 
 		driver
-			.emit(AuthEvent::OpenUrl(authorization_url.as_str().into()))
+			.emit(AuthEvent::OpenUrl(Str::new(authorization_url.as_str())))
 			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
-				id:      "oauth-callback-url".into(),
-				message: CALLBACK_PROMPT.into(),
+				id:      sf!("oauth-callback-url"),
+				message: sf!(CALLBACK_PROMPT),
 				input:   AuthPromptKind::AuthorizationCode,
 			}))
 			.await?;
 
-		Ok(ExternalRedirectPending { verifier, state, redirect_uri: redirect_uri.into() })
+		Ok(ExternalRedirectPending { verifier, state, redirect_uri: Str::new(redirect_uri) })
 	}
 
 	async fn run(
@@ -287,7 +287,7 @@ fn gitlab_token_response(
 	Ok(OAuthTokenSet {
 		access_token,
 		refresh_token: Some(refresh_token),
-		token_type: "Bearer".into(),
+		token_type: sf!("Bearer"),
 		expires_in: Some(expires_in),
 		identity_response: response.body,
 	})

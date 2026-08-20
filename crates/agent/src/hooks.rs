@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::toolhost::v1::HookEventId;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
@@ -487,11 +487,7 @@ impl HookGate {
 				let replies = self.dispatch_phase(&event, phase).await;
 				for (subscription, decision) in replies {
 					if decision.arm().is_none_or(|arm| !arm.is_legal_in(phase)) {
-						return GateOutcome::Deny {
-							event,
-							reason: Str::new_static("illegal hook decision"),
-							trail,
-						};
+						return GateOutcome::Deny { event, reason: sf!("illegal hook decision"), trail };
 					}
 					match decision {
 						GateDecision::Deny(reason) => return GateOutcome::Deny { event, reason, trail },
@@ -614,10 +610,8 @@ impl HookGate {
 			if self.dispatch.send_async(dispatch).await.is_err() {
 				self.pending.lock().remove(id);
 				if subscription.on_failure == OnFailure::Deny {
-					replies.push((
-						subscription,
-						GateDecision::Deny(Str::new_static("required hook host unavailable")),
-					));
+					replies
+						.push((subscription, GateDecision::Deny(sf!("required hook host unavailable"))));
 				}
 				continue;
 			}
@@ -629,17 +623,14 @@ impl HookGate {
 						} else {
 							replies.push((
 								subscription.clone(),
-								GateDecision::Deny(Str::new_static(
-									"hook reported a different subscription",
-								)),
+								GateDecision::Deny(sf!("hook reported a different subscription",)),
 							));
 						}
 					}
 				},
-				Err(_) if subscription.on_failure == OnFailure::Deny => replies.push((
-					subscription,
-					GateDecision::Deny(Str::new_static("required hook host failed")),
-				)),
+				Err(_) if subscription.on_failure == OnFailure::Deny => {
+					replies.push((subscription, GateDecision::Deny(sf!("required hook host failed"))))
+				},
 				Err(_) => {},
 			}
 		}
@@ -684,11 +675,11 @@ mod tests {
 
 	fn subscription(phase: HookPhase, id: u32) -> Subscription {
 		Subscription {
-			host: Str::new_static("test"),
+			host: sf!("test"),
 			source: SourceRef {
 				layer:        0,
-				publisher:    Str::new_static("test"),
-				extension_id: Str::new_static("test"),
+				publisher:    sf!("test"),
+				extension_id: sf!("test"),
 			},
 			id,
 			event: HookEventId::HookEventToolCall,
@@ -717,8 +708,7 @@ mod tests {
 		let mut second = subscription(HookPhase::Transform, 2);
 		second.order = 2;
 		gate.subscribe("test", [first, second]).unwrap();
-		let gate_future =
-			gate.gate(GateEvent::new(Str::new_static("bash"), Bytes::from_static(b"{}")));
+		let gate_future = gate.gate(GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")));
 		let driver = async {
 			for expected in [1, 2] {
 				let dispatch = receiver.recv_async().await.unwrap();
@@ -748,11 +738,11 @@ mod tests {
 				subscription(HookPhase::Review, 2),
 			])
 			.unwrap();
-		let work = gate.gate(GateEvent::new(Str::new_static("bash"), Bytes::from_static(b"{}")));
+		let work = gate.gate(GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")));
 		let driver = async {
 			let dispatch = rx.recv_async().await.unwrap();
 			gate
-				.answer(dispatch.dispatch_id, vec![(1, GateDecision::Deny(Str::new_static("no")))])
+				.answer(dispatch.dispatch_id, vec![(1, GateDecision::Deny(sf!("no")))])
 				.unwrap();
 		};
 		let (outcome, ()) = tokio::join!(work, driver);
@@ -768,7 +758,7 @@ mod tests {
 		drop(receiver);
 		assert!(matches!(
 			gate
-				.gate(GateEvent::new(Str::new_static("bash"), Bytes::from_static(b"{}")))
+				.gate(GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")))
 				.await,
 			super::GateOutcome::Deny { .. }
 		));

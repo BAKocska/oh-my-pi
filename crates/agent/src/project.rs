@@ -218,7 +218,7 @@ pub fn project_thread_history(
 			continue;
 		};
 		let original = RecordedCallOwned {
-			identity: ToolIdentity { name: Str::from(name.as_str()), rev: rev.clone() },
+			identity: ToolIdentity { name: Str::new(name.as_str()), rev: rev.clone() },
 			raw_args: Bytes::copy_from_slice(&raw_args),
 			verdict,
 		};
@@ -270,7 +270,7 @@ pub fn recovery_tool_result_item(
 		return Err(ProjectionError::ExpectedToolCall);
 	};
 	let rev = tool_revision(call_item)?.ok_or(ProjectionError::MissingRevision)?;
-	let identity = ToolIdentity { name: Str::from(call.name.as_str()), rev };
+	let identity = ToolIdentity { name: Str::new(call.name.as_str()), rev };
 	let text = match &abort {
 		Abort::Skipped { reason } => format!("skipped: {reason}"),
 		Abort::Interrupted { reason } => format!("interrupted: {reason}"),
@@ -281,7 +281,7 @@ pub fn recovery_tool_result_item(
 	let outcome = CallOutcome::<serde_json::Value, serde_json::Value>::aborted(abort);
 	let raw = serde_json::to_vec(&outcome)?;
 	tool_result_item(created_at_ms, &call.id, &identity, &raw, true, false, &[ToolPart::Text {
-		text: Str::from(text),
+		text: Str::new(text),
 	}])
 }
 
@@ -493,7 +493,7 @@ mod tests {
 		));
 		let mut writer = Writer::create(&path, &Header {
 			v:       4,
-			id:      SessionId(Str::from("user-blob")),
+			id:      SessionId(sf!("user-blob")),
 			created: 1,
 			cwd:     std::env::temp_dir(),
 		})
@@ -547,7 +547,7 @@ mod tests {
 		));
 		let mut writer = Writer::create(&path, &Header {
 			v:       4,
-			id:      SessionId(Str::from("drop-parts")),
+			id:      SessionId(sf!("drop-parts")),
 			created: 1,
 			cwd:     std::env::temp_dir(),
 		})

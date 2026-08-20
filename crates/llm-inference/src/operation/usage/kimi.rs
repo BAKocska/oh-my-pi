@@ -11,7 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
@@ -51,8 +51,8 @@ impl KimiUsageFetcher {
 		Self {
 			provider: ProviderId::from(PROVIDER),
 			http,
-			base_url: Str::from(base.trim().trim_end_matches('/')),
-			device_id: Str::from(device_id()),
+			base_url: Str::new(base.trim().trim_end_matches('/')),
+			device_id: Str::new(device_id()),
 		}
 	}
 }
@@ -87,7 +87,7 @@ impl ConsoleUsageFetcher for KimiUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta,
 				plan: None,
-				source_label: Some(Str::new_static("kimi-code")),
+				source_label: Some(sf!("kimi-code")),
 				notes: Box::default(),
 				reset_credits: None,
 				windows,
@@ -106,7 +106,7 @@ fn credential_parts(
 			.and_then(Value::as_str)
 			.ok_or(UsageFetchError::Protocol)?
 			.to_owned();
-		let f = |n| v.get(n).and_then(Value::as_str).map(Str::from);
+		let f = |n| v.get(n).and_then(Value::as_str).map(Str::new);
 		let expires = v
 			.get("expiresAt")
 			.and_then(|v| v.as_u64())
@@ -282,11 +282,11 @@ fn row(
 		("default", data.get("name").and_then(Value::as_str).unwrap_or("Quota"), Duration::ZERO)
 	});
 	Some(UsageWindow {
-		id:          Str::from(id),
+		id:          Str::new(id),
 		kind:        UsageWindowKind::Quota,
-		dimension:   Str::new_static("quota"),
-		label:       Some(Str::from(label)),
-		scope:       Some(Str::from(window_id)),
+		dimension:   sf!("quota"),
+		label:       Some(Str::new(label)),
+		scope:       Some(Str::new(window_id)),
 		amount:      UsageAmount { unit: UsageUnit::Unknown, consumed, remaining, limit },
 		status:      Some(status),
 		duration:    (!duration.is_zero()).then_some(duration),

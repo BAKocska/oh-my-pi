@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::{FutureExt, pin_mut};
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobOwner, JobRef, ToolTerminal};
 
 /// Default time a managed tool waits in the foreground before detaching.
@@ -34,7 +34,7 @@ pub fn managed_job_terminal<P, F>(
 		owner:    job.owner,
 		artifact: ExpectedArtifact {
 			description: description.into(),
-			media_type:  Some(Str::new_static("application/vnd.omp.process-settlement+json")),
+			media_type:  Some(sf!("application/vnd.omp.process-settlement+json")),
 			lifetime:    ArtifactLifetime::Session,
 		},
 	})
@@ -43,13 +43,13 @@ pub fn managed_job_terminal<P, F>(
 /// Formats the model-facing notice for a newly detached job.
 #[must_use]
 pub fn format_background_notice(job_id: &str) -> Str {
-	fmts!("Backgrounded as job {job_id}; result will be delivered automatically.")
+	sf!("Backgrounded as job {job_id}; result will be delivered automatically.")
 }
 
 /// Allocates the next stable managed-job name for one tool instance.
 #[must_use]
 pub fn next_background_name(prefix: &str, sequence: &AtomicU64) -> Str {
-	fmts!("{prefix}-bg-{}", sequence.fetch_add(1, Ordering::Relaxed))
+	sf!("{prefix}-bg-{}", sequence.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Resolves the foreground wait against the invocation's own timeout.

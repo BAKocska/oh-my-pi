@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::OperationKind;
 use serde::{Deserialize, Serialize};
 
@@ -158,16 +158,10 @@ fn encode_search(base_url: &str, request: &SearchRequest) -> Result<EncodedReque
 		OperationKind::Search,
 		RequestMethod::Post,
 		join_uri(base_url, SEARCH_PATH)?,
-		vec![
-			RequestHeader {
-				name:  Str::new_static("accept"),
-				value: Str::new_static("application/json"),
-			},
-			RequestHeader {
-				name:  Str::new_static("content-type"),
-				value: Str::new_static("application/json"),
-			},
-		]
+		vec![RequestHeader { name: sf!("accept"), value: sf!("application/json") }, RequestHeader {
+			name:  sf!("content-type"),
+			value: sf!("application/json"),
+		}]
 		.into_boxed_slice(),
 		BodySource::Bytes(Bytes::from(body)),
 		FramingProtocol::Raw,
@@ -188,7 +182,7 @@ fn join_uri(base: &str, suffix: &str) -> Result<Str, Error> {
 	let mut path = url.path().trim_end_matches('/').to_owned();
 	path.push_str(suffix);
 	url.set_path(&path);
-	Ok(Str::from(url.as_str().to_owned()))
+	Ok(Str::new(url.as_str()))
 }
 
 /// Bounded unary decoder for Tavily search responses.
@@ -441,7 +435,7 @@ fn encoding_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 fn protocol_error(reason: &'static str) -> Error {
@@ -451,7 +445,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 fn provider_error() -> Error {
@@ -461,8 +455,8 @@ fn provider_error() -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::new_static("tavily_provider_error"))
-	.detail(ErrorDetail::provider(Str::new_static("Tavily rejected the search request")))
+	.code(sf!("tavily_provider_error"))
+	.detail(ErrorDetail::provider(sf!("Tavily rejected the search request")))
 }
 
 #[cfg(test)]
@@ -474,9 +468,9 @@ mod tests {
 
 	fn request(synthesize_answer: Setting<bool>) -> SearchRequest {
 		SearchRequest {
-			query: Str::from("latest Rust release"),
-			include_domains: Arc::from([Str::from("rust-lang.org")]),
-			exclude_domains: Arc::from([Str::from("example.com")]),
+			query: sf!("latest Rust release"),
+			include_domains: Arc::from([sf!("rust-lang.org")]),
+			exclude_domains: Arc::from([sf!("example.com")]),
 			recency: Some(SearchRecency::Week),
 			locale: None,
 			max_results: 3,
@@ -506,7 +500,7 @@ mod tests {
 	#[test]
 	fn residual_unsupported_options_are_typed_encoding_failures() {
 		let mut locale = request(Setting::Unset);
-		locale.locale = Some(Str::from("en-US"));
+		locale.locale = Some(sf!("en-US"));
 		assert_eq!(
 			encode_search("https://api.tavily.com", &locale)
 				.err()

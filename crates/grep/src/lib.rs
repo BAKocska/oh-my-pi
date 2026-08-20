@@ -1113,7 +1113,7 @@ impl GrepSink for AggregateGrepCollector {
 
 	fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
 		if self.current_path.as_str() != matched.path {
-			self.current_path = Str::from(matched.path);
+			self.current_path = Str::new(matched.path);
 			self.current_line = None;
 			self.current_file_count = 0;
 		}
@@ -1271,8 +1271,8 @@ fn truncate_line(line: Str, max_columns: Option<usize>) -> (Str, bool) {
 
 fn bytes_to_trimmed_str(bytes: &[u8]) -> Str {
 	match std::str::from_utf8(bytes) {
-		Ok(text) => Str::from(text.trim_end()),
-		Err(_) => Str::from(String::from_utf8_lossy(bytes).trim_end()),
+		Ok(text) => Str::new(text.trim_end()),
+		Err(_) => Str::new(String::from_utf8_lossy(bytes).trim_end()),
 	}
 }
 
@@ -1294,7 +1294,7 @@ mod tests {
 	use super::*;
 
 	fn options(pattern: &str) -> GrepOptions {
-		GrepOptions { pattern: Str::from(pattern), timeout_ms: None, ..GrepOptions::default() }
+		GrepOptions { pattern: Str::new(pattern), timeout_ms: None, ..GrepOptions::default() }
 	}
 
 	struct TempDir(PathBuf);
@@ -1330,7 +1330,7 @@ mod tests {
 
 		fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
 			self.records.push((
-				Str::from(matched.path),
+				Str::new(matched.path),
 				matched.line_number,
 				matched.byte_offset,
 				matched.match_end,

@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent,
 	components::compaction_threshold_color, dom,
@@ -167,20 +167,20 @@ impl Sidebar {
 }
 
 fn elapsed_label(seconds: u64) -> Str {
-	fmts!("{}:{:02}", seconds / 60, seconds % 60)
+	sf!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 fn context_label(facts: &StatusFacts) -> Str {
 	match facts.context_window {
 		Some(window) if window > 0 => {
-			fmts!("{} / {}%", facts.context_tokens, facts.context_tokens.saturating_mul(100) / window)
+			sf!("{} / {}%", facts.context_tokens, facts.context_tokens.saturating_mul(100) / window)
 		},
-		_ => fmts!("{}", facts.context_tokens),
+		_ => sf!("{}", facts.context_tokens),
 	}
 }
 
 fn cost_label(nanos: u64) -> Str {
-	fmts!("${}.{:02}", nanos / 1_000_000_000, (nanos / 10_000_000) % 100)
+	sf!("${}.{:02}", nanos / 1_000_000_000, (nanos / 10_000_000) % 100)
 }
 
 fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
@@ -193,11 +193,11 @@ fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
 		CompactionSpeculationStatus::Running => Some("running"),
 		CompactionSpeculationStatus::Armed => Some("armed"),
 	};
-	let activity = fmts!("q{} · jobs {}", facts.queued, facts.jobs);
+	let activity = sf!("q{} · jobs {}", facts.queued, facts.jobs);
 	let git = facts
 		.git
 		.as_ref()
-		.map(|git| fmts!("{} *{} +{}", git.branch, git.dirty, git.staged));
+		.map(|git| sf!("{} *{} +{}", git.branch, git.dirty, git.staged));
 	Ui::from_root(
 		dom! {
 			<row id="rail" h=24>
@@ -239,7 +239,7 @@ fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
 						if facts.attempt > 0 || facts.dropped > 0 {
 							<row gap=1>
 								<text fg=muted w=8>{"attempt"}</text>
-								<text>{fmts!("{} · drop {}", facts.attempt, facts.dropped)}</text>
+								<text>{sf!("{} · drop {}", facts.attempt, facts.dropped)}</text>
 							</row>
 						}
 					</col>
@@ -265,7 +265,7 @@ mod tests {
 
 	fn facts() -> StatusFacts {
 		StatusFacts {
-			model: Str::new_static("Claude Fable 5"),
+			model: sf!("Claude Fable 5"),
 			working: false,
 			turn_started: None,
 			context_tokens: 42,
@@ -275,7 +275,7 @@ mod tests {
 			jobs: 0,
 			attempt: 0,
 			dropped: 0,
-			git: Some(GitFacts { branch: Str::new_static("main"), dirty: 1, staged: 0 }),
+			git: Some(GitFacts { branch: sf!("main"), dirty: 1, staged: 0 }),
 			..StatusFacts::default()
 		}
 	}

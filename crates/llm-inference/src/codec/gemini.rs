@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::base64};
+use omp_core::{IntoStr, Str, encoding::base64, sf};
 use omp_llm_catalog::{
 	CodecId, OperationKind, ProviderId, ReasoningEffort, ThinkingEffort, ThinkingMode,
 	ThinkingPolicy, ThinkingSelection,
@@ -127,7 +127,7 @@ impl From<&SafetySetting> for GoogleSafetySetting {
 			SafetyThreshold::Medium => "BLOCK_MEDIUM_AND_ABOVE",
 			SafetyThreshold::High | SafetyThreshold::BlockMost => "BLOCK_LOW_AND_ABOVE",
 		};
-		Self { category: value.category.clone(), threshold: threshold.into() }
+		Self { category: value.category.clone(), threshold: sf!(threshold) }
 	}
 }
 
@@ -560,7 +560,7 @@ impl GoogleSchema {
 				.enum_values
 				.first()
 				.and_then(|value| infer_json_scalar(value.get()))
-				.map(|kind| GoogleSchemaType::Single(kind.into()));
+				.map(|kind| GoogleSchemaType::Single(Str::new(kind)));
 		}
 		if matches!(
 			&self.schema_type,
@@ -626,6 +626,20 @@ pub struct GoogleAdjustment {
 	pub what:   Str,
 	/// Stable explanation.
 	pub detail: Str,
+}
+
+impl GoogleAdjustment {
+	/// Creates an adjustment from dynamic strings.
+	#[inline]
+	pub fn new(what: impl IntoStr, detail: impl IntoStr) -> Self {
+		Self { what: what.into_str(), detail: detail.into_str() }
+	}
+
+	/// Creates an adjustment from static strings.
+	#[inline]
+	pub const fn new_static(what: &'static str, detail: &'static str) -> Self {
+		Self { what: sf!(what), detail: sf!(detail) }
+	}
 }
 
 /// Successful Google request projection and its explicit adjustments.
@@ -827,10 +841,10 @@ impl GeminiCodec {
 		adjustments: &mut Vec<GoogleAdjustment>,
 	) -> Result<(), GoogleCodecError> {
 		if message.name.is_some() {
-			adjustments.push(GoogleAdjustment {
-				what:   "thread.message.name".into(),
-				detail: "Gemini GenerateContent does not expose portable author names".into(),
-			});
+			adjustments.push(GoogleAdjustment::new_static(
+				"thread.message.name",
+				"Gemini GenerateContent does not expose portable author names",
+			));
 		}
 		let is_system = matches!(message.role, Role::System | Role::Developer);
 		let mut parts = Vec::new();
@@ -847,18 +861,18 @@ impl GeminiCodec {
 							"Google continuation proofs cannot be attached to systemInstruction text",
 						));
 					},
-					_ => adjustments.push(GoogleAdjustment {
-						what:   "thread.system.parts".into(),
-						detail: "Gemini systemInstruction accepts text parts only".into(),
-					}),
+					_ => adjustments.push(GoogleAdjustment::new_static(
+						"thread.system.parts",
+						"Gemini systemInstruction accepts text parts only",
+					)),
 				}
 				continue;
 			}
 			if matches!(part, ContentPart::CachePoint(_)) {
-				adjustments.push(GoogleAdjustment {
-					what:   "cache".into(),
-					detail: "a session key is not a Google cachedContent resource name".into(),
-				});
+				adjustments.push(GoogleAdjustment::new_static(
+					"cache",
+					"a session key is not a Google cachedContent resource name",
+				));
 				continue;
 			}
 			if options.drop_unsigned_reasoning
@@ -876,10 +890,10 @@ impl GeminiCodec {
 				.remote_files
 				.contains_key(&(message_index, part_index))
 			{
-				adjustments.push(GoogleAdjustment {
-					what:   "thread.parts.blob.inline".into(),
-					detail: "Google inlineData requires payload bytes".into(),
-				});
+				adjustments.push(GoogleAdjustment::new_static(
+					"thread.parts.blob.inline",
+					"Google inlineData requires payload bytes",
+				));
 				continue;
 			}
 			parts.push(self.project_part(part, message_index, part_index, options)?);
@@ -896,7 +910,7 @@ impl GeminiCodec {
 		} else {
 			"user"
 		};
-		append_content(contents, role.into(), parts, matches!(message.role, Role::Tool));
+		append_content(contents, Str::new(role), parts, matches!(message.role, Role::Tool));
 		Ok(())
 	}
 
@@ -933,7 +947,7 @@ impl GeminiCodec {
 					id:   self
 						.endpoint
 						.preserves_function_ids()
-						.then(|| call.as_str().into()),
+						.then(|| Str::new(call.as_str())),
 					name: name.clone(),
 					args: opaque_raw(arguments, "tool arguments")?,
 				}),
@@ -960,7 +974,7 @@ impl GeminiCodec {
 						id: self
 							.endpoint
 							.preserves_function_ids()
-							.then(|| call.as_str().into()),
+							.then(|| Str::new(call.as_str())),
 						name,
 						response,
 						parts,
@@ -993,10 +1007,10 @@ impl GeminiCodec {
 					schema.normalize_for_cca();
 				}
 				if strict {
-					adjustments.push(GoogleAdjustment {
-						what:   format!("tools.{}.strict", tool.name).into(),
-						detail: "Gemini function declarations do not expose a strict boolean".into(),
-					});
+					adjustments.push(GoogleAdjustment::new(
+						format!("tools.{}.strict", tool.name),
+						sf!("Gemini function declarations do not expose a strict boolean"),
+					));
 				}
 				let (parameters_json_schema, parameters) = match self.endpoint.schema_key() {
 					GoogleSchemaKey::Parameters => (None, Some(schema)),
@@ -1020,11 +1034,10 @@ impl GeminiCodec {
 						|| !blocked_domains.is_empty()
 						|| recency_days.is_some()
 					{
-						adjustments.push(GoogleAdjustment {
-							what:   "hosted_tools.web_search.filters".into(),
-							detail: "Google Search does not expose portable domain or recency filters"
-								.into(),
-						});
+						adjustments.push(GoogleAdjustment::new_static(
+							"hosted_tools.web_search.filters",
+							"Google Search does not expose portable domain or recency filters",
+						));
 					}
 					output.tools.push(GoogleTool {
 						google_search: Some(GoogleEmptyObject {}),
@@ -1035,11 +1048,10 @@ impl GeminiCodec {
 					code_execution: Some(GoogleEmptyObject {}),
 					..GoogleTool::default()
 				}),
-				HostedTool::Retrieval { .. } => adjustments.push(GoogleAdjustment {
-					what:   "hosted_tools.retrieval".into(),
-					detail: "Gemini GenerateContent has no portable named-store retrieval projection"
-						.into(),
-				}),
+				HostedTool::Retrieval { .. } => adjustments.push(GoogleAdjustment::new_static(
+					"hosted_tools.retrieval",
+					"Gemini GenerateContent has no portable named-store retrieval projection",
+				)),
 			}
 		}
 		if options.google_search {
@@ -1065,29 +1077,28 @@ impl GeminiCodec {
 		adjustments: &mut Vec<GoogleAdjustment>,
 	) -> Result<Option<GoogleGenerationConfig>, GoogleCodecError> {
 		if !matches!(request.verbosity, Setting::Unset) {
-			adjustments.push(GoogleAdjustment {
-				what:   "verbosity".into(),
-				detail: "Gemini GenerateContent has no portable text verbosity control".into(),
-			});
+			adjustments.push(GoogleAdjustment::new_static(
+				"verbosity",
+				"Gemini GenerateContent has no portable text verbosity control",
+			));
 		}
 		if !matches!(request.cache_retention, Setting::Unset) {
-			adjustments.push(GoogleAdjustment {
-				what:   "cache".into(),
-				detail: "a cache retention request is not a Google cachedContent resource name".into(),
-			});
+			adjustments.push(GoogleAdjustment::new_static(
+				"cache",
+				"a cache retention request is not a Google cachedContent resource name",
+			));
 		}
 		if !matches!(request.service_tier, Setting::Unset) {
-			adjustments.push(GoogleAdjustment {
-				what:   "service_tier".into(),
-				detail: "Google service tier is selected by route policy, not the GenerateContent body"
-					.into(),
-			});
+			adjustments.push(GoogleAdjustment::new_static(
+				"service_tier",
+				"Google service tier is selected by route policy, not the GenerateContent body",
+			));
 		}
 		if request.top_logprobs.is_some() {
-			adjustments.push(GoogleAdjustment {
-				what:   "top_logprobs".into(),
-				detail: "Gemini GenerateContent has no portable token-logprob projection".into(),
-			});
+			adjustments.push(GoogleAdjustment::new_static(
+				"top_logprobs",
+				"Gemini GenerateContent has no portable token-logprob projection",
+			));
 		}
 		let temperature = request
 			.sampling
@@ -1110,20 +1121,20 @@ impl GeminiCodec {
 			(request.sampling.seed.is_some(), "sampling.seed"),
 		] {
 			if present {
-				adjustments.push(GoogleAdjustment {
-					what:   what.into(),
-					detail: "control has no portable Google GenerateContent projection".into(),
-				});
+				adjustments.push(GoogleAdjustment::new(
+					what,
+					sf!("control has no portable Google GenerateContent projection"),
+				));
 			}
 		}
 		match &request.output {
 			Setting::Require(StructuredOutput::JsonObject)
 			| Setting::Prefer(StructuredOutput::JsonObject) => {
-				generation.response_mime_type = Some("application/json".into());
+				generation.response_mime_type = Some(sf!("application/json"));
 			},
 			Setting::Require(StructuredOutput::JsonSchema { schema, .. })
 			| Setting::Prefer(StructuredOutput::JsonSchema { schema, .. }) => {
-				generation.response_mime_type = Some("application/json".into());
+				generation.response_mime_type = Some(sf!("application/json"));
 				generation.response_json_schema = Some(GoogleSchema::from_opaque(schema)?);
 			},
 			Setting::Require(_) => {
@@ -1131,11 +1142,10 @@ impl GeminiCodec {
 					"Gemini GenerateContent does not accept the required portable response format",
 				));
 			},
-			Setting::Prefer(_) => adjustments.push(GoogleAdjustment {
-				what:   "response_format.grammar".into(),
-				detail: "Gemini GenerateContent does not accept portable grammar response formats"
-					.into(),
-			}),
+			Setting::Prefer(_) => adjustments.push(GoogleAdjustment::new_static(
+				"response_format.grammar",
+				"Gemini GenerateContent does not accept portable grammar response formats",
+			)),
 			Setting::Unset => {},
 		}
 		match &request.reasoning {
@@ -1217,18 +1227,17 @@ const fn generation_config_is_empty(generation: &GoogleGenerationConfig) -> bool
 
 fn thinking_level(effort: ReasoningEffort) -> Str {
 	match effort {
-		ReasoningEffort::Off | ReasoningEffort::Minimal => "MINIMAL",
-		ReasoningEffort::Low => "LOW",
-		ReasoningEffort::Medium => "MEDIUM",
-		ReasoningEffort::High | ReasoningEffort::Max => "HIGH",
-		ReasoningEffort::Xhigh => "THINKING_LEVEL_UNSPECIFIED",
+		ReasoningEffort::Off | ReasoningEffort::Minimal => sf!("MINIMAL"),
+		ReasoningEffort::Low => sf!("LOW"),
+		ReasoningEffort::Medium => sf!("MEDIUM"),
+		ReasoningEffort::High | ReasoningEffort::Max => sf!("HIGH"),
+		ReasoningEffort::Xhigh => sf!("THINKING_LEVEL_UNSPECIFIED"),
 	}
-	.into()
 }
 
 /// Spells a resolved catalog wire effort as Google's `thinkingLevel` value.
 const fn selection_thinking_level(effort: ThinkingEffort) -> Str {
-	Str::new_static(match effort {
+	sf!(match effort {
 		ThinkingEffort::Off | ThinkingEffort::Minimal => "MINIMAL",
 		ThinkingEffort::Low => "LOW",
 		ThinkingEffort::Medium => "MEDIUM",
@@ -1320,7 +1329,7 @@ fn proof_string(
 		));
 	}
 	std::str::from_utf8(&proof.value)
-		.map(Str::from)
+		.map(Str::new)
 		.map_err(|error| {
 			GoogleCodecError::encoding(format!("Google thought signature is not UTF-8: {error}"))
 		})
@@ -1806,7 +1815,7 @@ impl GeminiDecoder {
 		let index = *self
 			.thinking_index
 			.get_or_insert_with(|| take_index(&mut self.next_index));
-		events.push(GoogleDecodedEvent::Thinking { index, text: Str::from(tail), signature: None });
+		events.push(GoogleDecodedEvent::Thinking { index, text: Str::new(tail), signature: None });
 	}
 
 	/// Decodes one already typed embedded response envelope.
@@ -1840,7 +1849,7 @@ impl GeminiDecoder {
 			let detail = feedback
 				.block_reason_message
 				.or(feedback.block_reason)
-				.unwrap_or_else(|| "Google blocked the prompt".into());
+				.unwrap_or_else(|| sf!("Google blocked the prompt"));
 			events.push(GoogleDecodedEvent::Error(GoogleCodecError::upstream(detail)));
 			return Ok(events);
 		}
@@ -1929,7 +1938,7 @@ impl GeminiDecoder {
 						.get_or_insert_with(|| take_index(&mut self.next_index));
 					events.push(GoogleDecodedEvent::Thinking {
 						index,
-						text: Str::from(cleaned),
+						text: Str::new(cleaned),
 						signature: part.thought_signature,
 					});
 				}
@@ -1950,9 +1959,7 @@ impl GeminiDecoder {
 				index,
 				kind: GoogleAuxiliaryKind::ExecutableCode,
 				text: code.code,
-				label: code
-					.language
-					.unwrap_or_else(|| "LANGUAGE_UNSPECIFIED".into()),
+				label: code.language.unwrap_or_else(|| sf!("LANGUAGE_UNSPECIFIED")),
 			});
 		}
 		if let Some(result) = part.code_execution_result {
@@ -1961,9 +1968,7 @@ impl GeminiDecoder {
 				index,
 				kind: GoogleAuxiliaryKind::CodeExecutionResult,
 				text: result.output,
-				label: result
-					.outcome
-					.unwrap_or_else(|| "OUTCOME_UNSPECIFIED".into()),
+				label: result.outcome.unwrap_or_else(|| sf!("OUTCOME_UNSPECIFIED")),
 			});
 		}
 		Ok(())
@@ -2081,8 +2086,8 @@ impl Codec for GeminiCodec {
 			method: RequestMethod::Post,
 			uri,
 			headers: vec![
-				RequestHeader { name: "content-type".into(), value: "application/json".into() },
-				RequestHeader { name: "accept".into(), value: "text/event-stream".into() },
+				RequestHeader::new_static("content-type", "application/json"),
+				RequestHeader::new_static("accept", "text/event-stream"),
 			]
 			.into_boxed_slice(),
 			body: BodySource::Bytes(body),
@@ -2141,11 +2146,10 @@ impl Codec for GeminiCodec {
 					)
 					.into(),
 					revision: match self.endpoint {
-						GoogleEndpointKind::GenerativeLanguage => "v1beta",
-						GoogleEndpointKind::Vertex => "v1",
-						GoogleEndpointKind::CloudCodeAssist => "v1internal",
-					}
-					.into(),
+						GoogleEndpointKind::GenerativeLanguage => sf!("v1beta"),
+						GoogleEndpointKind::Vertex => sf!("v1"),
+						GoogleEndpointKind::CloudCodeAssist => sf!("v1internal"),
+					},
 					expected_embeddings,
 					requested_dimensions,
 					done: false,
@@ -2331,8 +2335,8 @@ fn encode_google_unary(
 		method: RequestMethod::Post,
 		uri,
 		headers: vec![
-			RequestHeader { name: "content-type".into(), value: "application/json".into() },
-			RequestHeader { name: "accept".into(), value: "application/json".into() },
+			RequestHeader::new_static("content-type", "application/json"),
+			RequestHeader::new_static("accept", "application/json"),
 		]
 		.into_boxed_slice(),
 		body: BodySource::Bytes(Bytes::from(body)),
@@ -2652,7 +2656,7 @@ impl CanonicalGeminiDecoder {
 					};
 					emit(RawEvent::Metadata(ProviderMetadataEvent::AuxiliaryPart {
 						index,
-						kind: kind.into(),
+						kind: Str::new(kind),
 						label: Some(label),
 					}));
 					self.open(index, BlockKind::Text, emit);
@@ -2807,40 +2811,40 @@ pub struct GoogleCodecError {
 }
 
 impl GoogleCodecError {
-	fn encoding(detail: impl Into<Str>) -> Self {
+	fn encoding(detail: impl IntoStr) -> Self {
 		Self {
 			kind:           GoogleCodecErrorKind::Encoding,
-			detail:         detail.into(),
+			detail:         detail.into_str(),
 			status:         None,
 			code:           None,
 			retry_after_ms: 0,
 		}
 	}
 
-	fn capability(detail: impl Into<Str>) -> Self {
+	fn capability(detail: impl IntoStr) -> Self {
 		Self {
 			kind:           GoogleCodecErrorKind::Capability,
-			detail:         detail.into(),
+			detail:         detail.into_str(),
 			status:         None,
 			code:           None,
 			retry_after_ms: 0,
 		}
 	}
 
-	fn decode(detail: impl Into<Str>) -> Self {
+	fn decode(detail: impl IntoStr) -> Self {
 		Self {
 			kind:           GoogleCodecErrorKind::Decode,
-			detail:         detail.into(),
+			detail:         detail.into_str(),
 			status:         None,
 			code:           None,
 			retry_after_ms: 0,
 		}
 	}
 
-	fn upstream(detail: impl Into<Str>) -> Self {
+	fn upstream(detail: impl IntoStr) -> Self {
 		Self {
 			kind:           GoogleCodecErrorKind::Upstream,
-			detail:         detail.into(),
+			detail:         detail.into_str(),
 			status:         None,
 			code:           None,
 			retry_after_ms: 0,
@@ -2864,7 +2868,7 @@ impl GoogleCodecError {
 						detail.type_url == GOOGLE_RPC_ERROR_INFO_TYPE && detail.reason.is_some()
 					})
 					.and_then(|detail| detail.reason.as_deref())
-					.map(|reason| Str::from(reason.trim().to_ascii_uppercase()))
+					.map(|reason| Str::new(reason.trim().to_ascii_uppercase()))
 			})
 			.flatten();
 		let structured_retry_after_ms = (kind == GoogleCodecErrorKind::RateLimited)
@@ -2902,7 +2906,7 @@ impl GoogleCodecError {
 		};
 		Self {
 			kind,
-			detail: message.unwrap_or_else(|| "Google provider error".into()),
+			detail: message.unwrap_or_else(|| sf!("Google provider error")),
 			status: code,
 			code: structured_reason.or(status),
 			retry_after_ms,
@@ -3266,7 +3270,7 @@ mod tests {
 		assert_eq!(cases.len(), 2);
 		for case in cases {
 			let (mode, native_effort, budget) = match case.policy_mode.as_str() {
-				"google_level" => (ThinkingMode::GoogleLevel, Some(Str::from("LOW")), None),
+				"google_level" => (ThinkingMode::GoogleLevel, Some(sf!("LOW")), None),
 				"budget" => (ThinkingMode::Budget, None, Some(0)),
 				other => panic!("unknown CCA thinking mode {other}"),
 			};

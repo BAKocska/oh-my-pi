@@ -1,7 +1,7 @@
 //! Context compaction tiers, usage accounting, and deterministic hook verdicts.
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_proto::{
 	prost::Message as _,
 	toolhost::v1::{CompactionRequest, CompactionVerdict as WireCompactionVerdict, HookEventId},
@@ -322,7 +322,7 @@ impl CompactionCoordinator {
 		if *request != result.request {
 			return false;
 		}
-		result.compact.method = Some(Str::new_static(result.request.method.setting_name()));
+		result.compact.method = Some(sf!(result.request.method.setting_name()));
 		self.slot = SpeculationSlot::Armed(result);
 		true
 	}
@@ -455,7 +455,7 @@ impl CompactionCoordinator {
 			method,
 			snapshot: SpeculationSnapshot {
 				session_id: live_session_id.clone(),
-				isolated_session_id: fmts!("{live_session_id}:spec:{run_id}"),
+				isolated_session_id: sf!("{live_session_id}:spec:{run_id}"),
 				branch_leaf,
 				compaction_epoch: usage.compaction_epoch,
 			},
@@ -849,7 +849,7 @@ impl DomainReturn for Option<CompactionVerdict> {
 		match (wire.kind.as_str(), details) {
 			("cancel", Some(WireVerdictDetails::Cancel { suppress_for_turns })) => {
 				Some(Some(CompactionVerdict::Cancel(CancelCompaction {
-					reason: Str::from(wire.reason?),
+					reason: Str::new(wire.reason?),
 					suppress_for_turns,
 				})))
 			},
@@ -858,7 +858,7 @@ impl DomainReturn for Option<CompactionVerdict> {
 				Some(WireVerdictDetails::Custom { short, tokens_before, warning, details, preserve }),
 			) => Some(Some(CompactionVerdict::Custom(CustomSummary {
 				compact: Compact {
-					summary: Str::from(wire.summary?),
+					summary: Str::new(wire.summary?),
 					short,
 					first_kept: wire.first_kept_id?.parse().ok()?,
 					tokens_before,
@@ -986,11 +986,7 @@ fn compose_delegate(current: &mut DelegateCompaction, next: &DelegateCompaction)
 		current.extra_instructions = if current.extra_instructions.is_empty() {
 			next.extra_instructions.clone()
 		} else {
-			Str::from(format!(
-				"{}\n{}",
-				current.extra_instructions.as_str(),
-				next.extra_instructions.as_str()
-			))
+			sf!("{}\n{}", current.extra_instructions.as_str(), next.extra_instructions.as_str())
 		};
 	}
 	for id in &next.focus_ids {
@@ -1058,7 +1054,7 @@ pub fn resolve_verdicts(
 				} else {
 					losers.push(SupersededCompaction {
 						extension_id: source.extension_id.clone(),
-						reason:       Str::new_static("custom_summary_superseded"),
+						reason:       sf!("custom_summary_superseded"),
 					});
 				}
 			},
@@ -1106,7 +1102,7 @@ impl RemoteCheckpoint {
 #[cfg(test)]
 mod tests {
 
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 
 	use super::{
 		COMPACTION_RECOVERY_BAND, Compact, CompactionCoordinator, CompactionDecision,
@@ -1136,8 +1132,8 @@ mod tests {
 		SpeculationResult {
 			request: request.clone(),
 			compact: Compact {
-				summary:       Str::new_static(summary),
-				short:         Some(Str::new_static("preview title")),
+				summary:       sf!(summary),
+				short:         Some(sf!("preview title")),
 				first_kept:    1,
 				tokens_before: request.tokens_at_start,
 				tokens_after:  Some(20_000),
@@ -1152,7 +1148,7 @@ mod tests {
 	fn speculation_starts_at_lead_edge_on_an_isolated_session() {
 		let mut coordinator = CompactionCoordinator::default();
 		let order = CompactionMethodOrder::resolve(&[CompactionTier::Remote]);
-		let session = Str::new_static("live");
+		let session = sf!("live");
 		let below = ContextUsage::new(41_807, 100_000, 0, 0.5);
 		assert_eq!(
 			coordinator.evaluate(
@@ -1193,7 +1189,7 @@ mod tests {
 	fn armed_summary_commits_in_place_with_method_and_token_metadata() {
 		let mut coordinator = CompactionCoordinator::default();
 		let order = CompactionMethodOrder::resolve(&[CompactionTier::Remote]);
-		let session = Str::new_static("live");
+		let session = sf!("live");
 		let usage = ContextUsage::new(42_000, 100_000, 0, 0.5);
 		let CompactionDecision::Launch { request, .. } = coordinator.evaluate(
 			usage,
@@ -1230,7 +1226,7 @@ mod tests {
 	fn local_snapshot_method_discards_an_armed_llm_summary() {
 		let mut coordinator = CompactionCoordinator::default();
 		let remote = CompactionMethodOrder::resolve(&[CompactionTier::Remote]);
-		let session = Str::new_static("live");
+		let session = sf!("live");
 		let usage = ContextUsage::new(42_000, 100_000, 0, 0.5);
 		let CompactionDecision::Launch { request, .. } = coordinator.evaluate(
 			usage,
@@ -1266,7 +1262,7 @@ mod tests {
 	fn reset_epoch_discards_armed_summary_and_launches_a_fresh_snapshot() {
 		let mut coordinator = CompactionCoordinator::default();
 		let order = CompactionMethodOrder::resolve(&[CompactionTier::Remote]);
-		let session = Str::new_static("live");
+		let session = sf!("live");
 		let usage = ContextUsage::new(42_000, 100_000, 0, 0.5);
 		let CompactionDecision::Launch { request, .. } = coordinator.evaluate(
 			usage,
@@ -1303,7 +1299,7 @@ mod tests {
 	fn grace_band_defers_running_work_then_rearms_blocking_at_cap() {
 		let mut coordinator = CompactionCoordinator::default();
 		let order = CompactionMethodOrder::resolve(&[CompactionTier::Remote]);
-		let session = Str::new_static("live");
+		let session = sf!("live");
 		let jumped = ContextUsage::new(51_000, 100_000, 0, 0.5);
 		let CompactionDecision::Launch { request, defer_blocking, .. } = coordinator.evaluate(
 			jumped,
@@ -1366,7 +1362,7 @@ mod tests {
 				ContextUsage::new(90, 100, 0, 0.5),
 				&CompactionMethodOrder::resolve(&[]),
 				CompactionSpeculationOptions::default(),
-				&Str::new_static("live"),
+				&sf!("live"),
 				1,
 				true,
 			),
@@ -1406,7 +1402,7 @@ mod tests {
 		let summary = |text: &'static str, first_kept| {
 			CompactionVerdict::Custom(CustomSummary {
 				compact:  Compact {
-					summary: Str::new_static(text),
+					summary: sf!(text),
 					short: None,
 					first_kept,
 					tokens_before: 100,
@@ -1421,19 +1417,11 @@ mod tests {
 		};
 		let mut verdicts = [
 			(
-				SourceRef {
-					layer:        1,
-					publisher:    Str::new_static("z"),
-					extension_id: Str::new_static("late"),
-				},
+				SourceRef { layer: 1, publisher: sf!("z"), extension_id: sf!("late") },
 				Some(summary("late", 8)),
 			),
 			(
-				SourceRef {
-					layer:        1,
-					publisher:    Str::new_static("a"),
-					extension_id: Str::new_static("early"),
-				},
+				SourceRef { layer: 1, publisher: sf!("a"), extension_id: sf!("early") },
 				Some(summary("early", 4)),
 			),
 		];

@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
@@ -65,8 +65,8 @@ impl DiffView {
 	}
 
 	/// Appends a new line to the diff view.
-	pub fn push(&mut self, kind: DiffKind, text: impl Into<Str>) {
-		self.lines.push(DiffLine { kind, text: text.into() });
+	pub fn push(&mut self, kind: DiffKind, text: impl IntoStr) {
+		self.lines.push(DiffLine { kind, text: text.into_str() });
 	}
 
 	/// Clears all lines from the diff view.
@@ -254,7 +254,7 @@ mod tests {
 			assert!(!diff.rich.row_soft_wrap(i), "wrapped DiffView rows should not be soft");
 		}
 
-		diff.replace(vec![DiffLine { kind: DiffKind::Remove, text: Str::from("c") }]);
+		diff.replace(vec![DiffLine { kind: DiffKind::Remove, text: sf!("c") }]);
 		let frame3 = paint(&mut diff, 10, 2);
 		assert_eq!(frame_row_text(&frame3, 0).trim_end(), "- c");
 		assert_eq!(frame_row_text(&frame3, 1).trim_end(), "");
@@ -292,8 +292,8 @@ mod tests {
 		let _ = paint_with_ctx(&mut incremental, ctx.clone(), 20, 10);
 
 		incremental.extend(vec![
-			DiffLine { kind: DiffKind::Context, text: Str::from("line 1") },
-			DiffLine { kind: DiffKind::Remove, text: Str::from("line 2") },
+			DiffLine { kind: DiffKind::Context, text: sf!("line 1") },
+			DiffLine { kind: DiffKind::Remove, text: sf!("line 2") },
 		]);
 		let _ = paint_with_ctx(&mut incremental, ctx.clone(), 20, 10);
 
@@ -301,10 +301,10 @@ mod tests {
 		let frame_incremental = paint_with_ctx(&mut incremental, ctx.clone(), 20, 10);
 
 		fresh.extend(vec![
-			DiffLine { kind: DiffKind::Header, text: Str::from("file.txt") },
-			DiffLine { kind: DiffKind::Context, text: Str::from("line 1") },
-			DiffLine { kind: DiffKind::Remove, text: Str::from("line 2") },
-			DiffLine { kind: DiffKind::Add, text: Str::from("line 3") },
+			DiffLine { kind: DiffKind::Header, text: sf!("file.txt") },
+			DiffLine { kind: DiffKind::Context, text: sf!("line 1") },
+			DiffLine { kind: DiffKind::Remove, text: sf!("line 2") },
+			DiffLine { kind: DiffKind::Add, text: sf!("line 3") },
 		]);
 		let frame_fresh = paint_with_ctx(&mut fresh, ctx, 20, 10);
 
@@ -318,7 +318,7 @@ mod tests {
 	fn clear_and_extend_return_semantic_changes() {
 		let mut diff = DiffView::new();
 		assert!(!diff.clear());
-		assert!(diff.extend(vec![DiffLine { kind: DiffKind::Add, text: Str::from("x") }]));
+		assert!(diff.extend(vec![DiffLine { kind: DiffKind::Add, text: sf!("x") }]));
 		assert!(!diff.extend(vec![]));
 		assert!(diff.clear());
 	}

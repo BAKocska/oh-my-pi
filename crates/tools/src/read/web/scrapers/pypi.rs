@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use futures::join;
+use omp_core::{Str, sf};
 use serde::Deserialize;
 use url::Url;
 
@@ -112,7 +113,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	}
 
 	let mut rendered = RenderResult::markdown(&markdown, "pypi");
-	rendered.notes.push("Fetched via PyPI JSON API".into());
+	rendered.notes.push(sf!("Fetched via PyPI JSON API"));
 	Ok(Some(rendered))
 }
 

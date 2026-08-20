@@ -4,7 +4,7 @@ use std::fmt;
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
 	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -90,9 +90,9 @@ pub struct Yield {
 pub fn tool() -> Yield {
 	Yield {
 		spec: ToolSpec {
-			name:            Str::new_static("yield"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(
+			name:            sf!("yield"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(
 				"Submits terminal or incremental subagent output. Structured success uses \
 				 `result.data`; failure uses `result.error`. A terminal typed yield may omit result \
 				 to use the last assistant turn.",
@@ -135,12 +135,12 @@ impl Tool for Yield {
 			if let Some(YieldType::Sections(parts)) = &params.kind
 				&& (parts.is_empty() || parts.iter().any(|part| part.trim().is_empty()))
 			{
-				yield done(Err(Fault { message: Str::new_static("type sections must be non-empty strings") }));
+				yield done(Err(Fault { message: sf!("type sections must be non-empty strings") }));
 				return;
 			}
 			let use_last_turn = params.result.is_none();
 			if use_last_turn && (params.kind.is_none() || incremental) {
-				yield done(Err(Fault { message: Str::new_static("result is required unless a terminal type requests last-turn fallback") }));
+				yield done(Err(Fault { message: sf!("result is required unless a terminal type requests last-turn fallback") }));
 				return;
 			}
 			if let Err(error) = incoming.interruptable().committed().await { yield commit_event(error); return; }
@@ -151,9 +151,9 @@ impl Tool for Yield {
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
 		vec![Part::Text {
 			text: match view {
-				Ok(payload) if payload.incremental => Str::new_static("Incremental section accepted."),
-				Ok(_) => Str::new_static("Result accepted."),
-				Err(fault) => Str::from(fault.to_string()),
+				Ok(payload) if payload.incremental => sf!("Incremental section accepted."),
+				Ok(_) => sf!("Result accepted."),
+				Err(fault) => Str::new(fault.to_string()),
 			},
 		}]
 	}
@@ -183,9 +183,9 @@ fn commit_event(error: CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"result":{"data":{}}}"#)),
+		example:  Some(sf!(r#"{{"result":{{"data":{{}}}}}}"#)),
 		found:    Some(message),
 	}
 }

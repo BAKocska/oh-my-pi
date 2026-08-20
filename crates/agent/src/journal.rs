@@ -7,7 +7,7 @@ use std::{
 	sync::Arc,
 };
 
-use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str, sf};
 use omp_proto::{inference::v1::Outcome, thread::v1::Item};
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
 use omp_storage::{
@@ -712,7 +712,7 @@ impl Journal {
 			}
 		}
 		let released_turn_id =
-			(!released_inputs.is_empty()).then(|| Str::from(ulid::Ulid::generate().to_string()));
+			(!released_inputs.is_empty()).then(|| Str::new(ulid::Ulid::generate().to_string()));
 		for turn_id in starts.keys().chain(receipts.keys()).chain(aborted.keys()) {
 			turn_inputs.remove(turn_id.as_str());
 		}
@@ -1272,7 +1272,7 @@ impl Journal {
 			.into_iter()
 			.collect();
 		self.query_custom(&JournalQuery {
-			caller_extension: Str::from(authority.namespace()),
+			caller_extension: Str::new(authority.namespace()),
 			granted_extensions,
 			kind: Some(kind),
 			rev: None,
@@ -1298,15 +1298,15 @@ impl Journal {
 		}
 		let (stamp, author) = self.session_state_request(authority, request)?;
 		let record = SessionCasRecord {
-			namespace: Str::from(authority.namespace()),
+			namespace: Str::new(authority.namespace()),
 			key:       key.clone(),
 			value:     value.clone(),
 		};
 		let data = serde_json::value::to_raw_value(&record).map_err(transcript::Error::from)?;
 		let custom = Custom::new(
-			Str::new_static("omp.state.session.cas"),
-			Some(Str::new_static("state.1")),
-			Some(Str::from(authority.namespace())),
+			sf!("omp.state.session.cas"),
+			Some(sf!("state.1")),
+			Some(Str::new(authority.namespace())),
 			author.principal.clone(),
 			author.provenance.clone(),
 			Some(data),
@@ -1388,7 +1388,7 @@ impl Journal {
 		self
 			.state_subscribers
 			.insert(subscriber, SessionStateSubscriber {
-				namespace: Str::from(authority.namespace()),
+				namespace: Str::new(authority.namespace()),
 				key,
 				last,
 				sender,
@@ -1505,12 +1505,12 @@ impl Journal {
 			return Err(omp_storage::state::Error::MissingIdempotencyKey.into());
 		}
 		let (stamp, author) = self.session_state_request(authority, request)?;
-		let record = SessionContentRecord { namespace: Str::from(authority.namespace()), reference };
+		let record = SessionContentRecord { namespace: Str::new(authority.namespace()), reference };
 		let data = serde_json::value::to_raw_value(&record).map_err(transcript::Error::from)?;
 		let custom = Custom::new(
-			Str::new_static("omp.state.session.content"),
-			Some(Str::new_static("state.1")),
-			Some(Str::from(authority.namespace())),
+			sf!("omp.state.session.content"),
+			Some(sf!("state.1")),
+			Some(Str::new(authority.namespace())),
 			author.principal.clone(),
 			author.provenance.clone(),
 			Some(data),
@@ -1590,8 +1590,8 @@ impl Journal {
 		}
 		let generation = request.generation();
 		let stamp = JournalRequestStamp {
-			request_id:         Str::from(request.request_id()),
-			idempotency_key:    Str::from(
+			request_id:         Str::new(request.request_id()),
+			idempotency_key:    Str::new(
 				request
 					.idempotency_key()
 					.unwrap_or_else(|| request.request_id()),
@@ -1644,7 +1644,7 @@ impl Journal {
 		author: &JournalAuthor,
 	) -> Result<Event, JournalError> {
 		let record = self.entry_kinds.require_declared(entry.kind.as_str())?;
-		let live_rev = Str::from(record.rev.to_string());
+		let live_rev = Str::new(record.rev.to_string());
 		if entry.rev != live_rev {
 			return Err(JournalError::RevisionMismatch {
 				kind:     entry.kind,
@@ -1655,7 +1655,7 @@ impl Journal {
 		if record.extension != author.provenance.extension_id() {
 			return Err(
 				EntryKindError::AccessDenied {
-					extension: Str::from(author.provenance.extension_id()),
+					extension: Str::new(author.provenance.extension_id()),
 					kind:      entry.kind,
 				}
 				.into(),
@@ -1730,10 +1730,10 @@ impl Journal {
 			kind: Kind::RequestAudit(RequestAudit {
 				request_id:         stamp.request_id.clone(),
 				idempotency_key:    stamp.idempotency_key.clone(),
-				extension_id:       Str::from(author.provenance.extension_id()),
+				extension_id:       Str::new(author.provenance.extension_id()),
 				host_generation:    stamp.host_generation,
 				session_generation: stamp.session_generation,
-				operation:          Str::from(operation.to_string()),
+				operation:          Str::new(operation.to_string()),
 				indexes:            indexes.iter().copied().collect(),
 			}),
 		}
@@ -1793,9 +1793,9 @@ impl Journal {
 	) {
 		self.request_replays.insert(
 			(
-				Str::from(author.provenance.extension_id()),
+				Str::new(author.provenance.extension_id()),
 				stamp.idempotency_key.clone(),
-				Str::from(operation.to_string()),
+				Str::new(operation.to_string()),
 			),
 			indexes.to_vec(),
 		);
@@ -1864,7 +1864,7 @@ impl Journal {
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
-		let turn_id = Str::from(turn_id);
+		let turn_id = Str::new(turn_id);
 		let index = self.append(&Event {
 			ts,
 			kind: Kind::TurnInput(TurnInputItem {
@@ -2030,11 +2030,11 @@ impl Journal {
 	) -> Result<u64, JournalError> {
 		if let Some((index, durable)) = self.aborted.get(turn_id) {
 			if *durable != disposition {
-				return Err(JournalError::TurnAbortMismatch(Str::from(turn_id)));
+				return Err(JournalError::TurnAbortMismatch(Str::new(turn_id)));
 			}
 			return Ok(*index);
 		}
-		let turn_id = Str::from(turn_id);
+		let turn_id = Str::new(turn_id);
 		if !self.starts.contains_key(turn_id.as_str()) {
 			return Err(JournalError::MissingTurnStart(turn_id));
 		}
@@ -2076,14 +2076,14 @@ impl Journal {
 			session_generation: self.generations.session,
 		};
 		let author = JournalAuthor {
-			principal:  Principal::new(Str::new_static("omp.core"), Str::new_static("OMP Core")),
+			principal:  Principal::new(sf!("omp.core"), sf!("OMP Core")),
 			provenance: Provenance::new(
-				Str::new_static("omp"),
-				Str::new_static(EXTENSION),
-				Str::new_static(env!("CARGO_PKG_VERSION")),
+				sf!("omp"),
+				sf!(EXTENSION),
+				sf!(env!("CARGO_PKG_VERSION")),
 				ArtifactDigest::new([0; 32]),
-				Str::new_static("core"),
-				Str::new_static("builtin"),
+				sf!("core"),
+				sf!("builtin"),
 				0,
 			),
 		};
@@ -2092,8 +2092,8 @@ impl Journal {
 			stamp,
 			author,
 			operation: JournalOperation::Append(PendingCustomEntry {
-				kind:    Str::new_static(KIND),
-				rev:     Str::new_static("core.1"),
+				kind:    sf!(KIND),
+				rev:     sf!("core.1"),
 				data:    Some(data),
 				context: None,
 				display: Some(false),
@@ -2203,12 +2203,12 @@ impl Journal {
 	) -> Result<(TurnReceipt, bool), JournalError> {
 		if let Some(receipt) = self.receipts.get(turn_id) {
 			if receipt.outcome != outcome {
-				return Err(JournalError::TurnReplayMismatch(Str::from(turn_id)));
+				return Err(JournalError::TurnReplayMismatch(Str::new(turn_id)));
 			}
 			return Ok((receipt.clone(), true));
 		}
 
-		let turn_id = Str::from(turn_id);
+		let turn_id = Str::new(turn_id);
 		let Some((_, start)) = self.starts.get(turn_id.as_str()).cloned() else {
 			return Err(JournalError::MissingTurnStart(turn_id));
 		};
@@ -2291,10 +2291,10 @@ impl Journal {
 			if durable == call_ids {
 				return Ok(*index);
 			}
-			return Err(JournalError::ToolBatchReplayMismatch(Str::from(turn_id)));
+			return Err(JournalError::ToolBatchReplayMismatch(Str::new(turn_id)));
 		}
 		let Some(receipt) = self.receipts.get(turn_id) else {
-			return Err(JournalError::ToolBatchWithoutReceipt(Str::from(turn_id)));
+			return Err(JournalError::ToolBatchWithoutReceipt(Str::new(turn_id)));
 		};
 		for call_id in call_ids {
 			let present = receipt.outcome.output.iter().any(|item| {
@@ -2306,12 +2306,12 @@ impl Journal {
 			});
 			if !present {
 				return Err(JournalError::UnknownReceiptCall {
-					turn_id: Str::from(turn_id),
+					turn_id: Str::new(turn_id),
 					call_id: call_id.clone(),
 				});
 			}
 		}
-		let batch = ToolBatchAuthorized { turn_id: Str::from(turn_id), call_ids: call_ids.to_vec() };
+		let batch = ToolBatchAuthorized { turn_id: Str::new(turn_id), call_ids: call_ids.to_vec() };
 		let index = self.append(&Event { ts, kind: Kind::ToolBatchAuthorized(batch.clone()) })?;
 		self
 			.authorized_batches
@@ -2351,11 +2351,11 @@ impl Journal {
 	) -> Result<u64, JournalError> {
 		if let Some((index, durable)) = self.settled_jobs.get(job_id) {
 			if durable != &settlement {
-				return Err(JournalError::JobReplayMismatch(Str::from(job_id)));
+				return Err(JournalError::JobReplayMismatch(Str::new(job_id)));
 			}
 			return Ok(*index);
 		}
-		let job_id = Str::from(job_id);
+		let job_id = Str::new(job_id);
 		let index = self.append(&Event {
 			ts,
 			kind: Kind::JobSettled(JobSettled {
@@ -2547,7 +2547,7 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 				_ => None,
 			};
 			results
-				.entry(Str::from(result.call_id.as_str()))
+				.entry(Str::new(result.call_id.as_str()))
 				.or_insert(recovery_turn);
 		}
 		match &event.kind {
@@ -2579,22 +2579,18 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 			.find_map(|(_, call)| results.get(call.id.as_str()).and_then(Clone::clone));
 		let authorized_calls = authorized.get(receipt.turn_id.as_str());
 		for (item, call) in calls {
-			let call_id = Str::from(call.id.as_str());
+			let call_id = Str::new(call.id.as_str());
 			if results.contains_key(&call_id) {
 				continue;
 			}
 			let abort = if authorized_calls.is_some_and(|calls| calls.contains(&call_id)) {
-				Abort::EffectsUnknown {
-					reason: Str::new_static("agent restarted after invocation authorization"),
-				}
+				Abort::EffectsUnknown { reason: sf!("agent restarted after invocation authorization") }
 			} else {
-				Abort::Skipped {
-					reason: Str::new_static("agent restarted before invocation authorization"),
-				}
+				Abort::Skipped { reason: sf!("agent restarted before invocation authorization") }
 			};
 			let result = crate::project::recovery_tool_result_item(ts, item, abort)?;
 			let recovery_turn =
-				recovery_turn.get_or_insert_with(|| Str::from(ulid::Ulid::generate().to_string()));
+				recovery_turn.get_or_insert_with(|| Str::new(ulid::Ulid::generate().to_string()));
 			let index = writer.append(&Event {
 				ts,
 				kind: Kind::TurnInput(TurnInputItem {
@@ -2835,7 +2831,7 @@ mod tests {
 	fn header() -> Header {
 		Header {
 			v:       4,
-			id:      SessionId(Str::from("journal-test")),
+			id:      SessionId(sf!("journal-test")),
 			created: 1,
 			cwd:     std::env::temp_dir(),
 		}
@@ -2922,12 +2918,12 @@ mod tests {
 			.expect("append turn input");
 		journal
 			.start_turn(3, TurnStart {
-				turn_id:            Str::from("turn"),
+				turn_id:            sf!("turn"),
 				item_events:        vec![input],
 				prompt_hash:        hash.into_bytes(),
 				prompt_head_events: Vec::new(),
 				toolset_hash:       [3; 32],
-				enabled_tools:      vec![Str::from("read")],
+				enabled_tools:      vec![sf!("read")],
 				sequence_targets:   vec![input],
 				input:              TurnInputRecord::Full {
 					thread: thread_pb::Thread { items: vec![message("input")] },
@@ -2945,7 +2941,7 @@ mod tests {
 			.expect("append tool outcome");
 		if authorized {
 			journal
-				.authorize_tool_batch(5, "turn", &[Str::from("call-1")])
+				.authorize_tool_batch(5, "turn", &[sf!("call-1")])
 				.expect("authorize tool batch");
 		}
 		drop(journal);
@@ -3018,12 +3014,12 @@ mod tests {
 			.expect("append turn input");
 		journal
 			.start_turn(3, TurnStart {
-				turn_id:            Str::from("turn"),
+				turn_id:            sf!("turn"),
 				item_events:        vec![input],
 				prompt_hash:        hash.into_bytes(),
 				prompt_head_events: Vec::new(),
 				toolset_hash:       [3; 32],
-				enabled_tools:      vec![Str::from("read")],
+				enabled_tools:      vec![sf!("read")],
 				sequence_targets:   vec![input],
 				input:              TurnInputRecord::Full {
 					thread: thread_pb::Thread { items: vec![message("input")] },
@@ -3049,12 +3045,12 @@ mod tests {
 			.append_gateway_outcome(4, "turn", outcome.clone())
 			.expect("append tool outcome");
 		journal
-			.authorize_tool_batch(5, "turn", &[Str::from("call-1"), Str::from("call-2")])
+			.authorize_tool_batch(5, "turn", &[sf!("call-1"), sf!("call-2")])
 			.expect("authorize tool batch");
 		let follow_up = ulid::Ulid::generate().to_string();
 		let first_result =
 			crate::project::recovery_tool_result_item(6, &outcome.output[0], Abort::Interrupted {
-				reason: Str::new_static("fixture terminal result"),
+				reason: sf!("fixture terminal result"),
 			})
 			.expect("build first terminal result");
 		journal
@@ -3104,12 +3100,12 @@ mod tests {
 		let mut journal = Journal::open(&path).expect("first reopen");
 		assert_eq!(
 			journal.pending_input_submission(),
-			Some((&Str::from(first_turn.as_str()), [first].as_slice()))
+			Some((&Str::new(first_turn.as_str()), [first].as_slice()))
 		);
 		assert_eq!(journal.recoverable_settlement_events(), &[settlement]);
 		journal
 			.start_turn(5, TurnStart {
-				turn_id:            Str::from(first_turn.as_str()),
+				turn_id:            Str::new(first_turn.as_str()),
 				item_events:        vec![first, settlement],
 				prompt_hash:        [0; 32],
 				prompt_head_events: Vec::new(),
@@ -3139,7 +3135,7 @@ mod tests {
 		assert_eq!(journal.recoverable_settlement_events(), no_events);
 		journal
 			.start_turn(7, TurnStart {
-				turn_id:            Str::from(second_turn.as_str()),
+				turn_id:            Str::new(second_turn.as_str()),
 				item_events:        vec![second],
 				prompt_hash:        [0; 32],
 				prompt_head_events: Vec::new(),
@@ -3186,7 +3182,7 @@ mod tests {
 			.expect("append input");
 		journal
 			.start_turn(4, TurnStart {
-				turn_id:            Str::from("turn"),
+				turn_id:            sf!("turn"),
 				item_events:        vec![input_event],
 				prompt_hash:        prompt_hash.into_bytes(),
 				prompt_head_events: vec![prompt_event],
@@ -3258,7 +3254,7 @@ mod tests {
 			.append_optimistic(3, input.clone(), Some(prompt_hash))
 			.expect("append input");
 		let start = TurnStart {
-			turn_id:            Str::from("turn"),
+			turn_id:            sf!("turn"),
 			item_events:        vec![input_event],
 			prompt_hash:        prompt_hash.into_bytes(),
 			prompt_head_events: vec![prompt_event],
@@ -3269,7 +3265,7 @@ mod tests {
 				thread: thread_pb::Thread { items: vec![message("system"), input] },
 			},
 			options:            TurnOptionsRecord {
-				context_id: Some(Str::from("seed")),
+				context_id: Some(sf!("seed")),
 				params:     pb::ChatParams { model: "provider/model".to_owned(), ..Default::default() },
 				executor:   None,
 				props:      None,
@@ -3302,7 +3298,7 @@ mod tests {
 		let path = path("turn-abort");
 		let mut journal = Journal::create(&path, &header()).expect("create journal");
 		let start = TurnStart {
-			turn_id:            Str::from("failed-turn-1"),
+			turn_id:            sf!("failed-turn-1"),
 			item_events:        Vec::new(),
 			prompt_hash:        [3; 32],
 			prompt_head_events: Vec::new(),
@@ -3324,7 +3320,7 @@ mod tests {
 			.abort_turn(3, "failed-turn-1", AbortDisposition::Continue)
 			.expect("abort first turn");
 		let mut second = start.clone();
-		second.turn_id = Str::from("failed-turn-2");
+		second.turn_id = sf!("failed-turn-2");
 		journal.start_turn(4, second).expect("start second turn");
 		let abort = journal
 			.abort_turn(5, "failed-turn-2", AbortDisposition::Continue)
@@ -3344,7 +3340,7 @@ mod tests {
 		assert!(reopened.pending_turn().is_none());
 		assert_eq!(reopened.trailing_aborts(), 2);
 		let mut success = start;
-		success.turn_id = Str::from("successful-turn");
+		success.turn_id = sf!("successful-turn");
 		reopened
 			.start_turn(7, success)
 			.expect("start successful turn");
@@ -3482,11 +3478,11 @@ mod tests {
 		let path = path("jobs");
 		let mut journal = Journal::create(&path, &header()).expect("create journal");
 		let job = |id: &'static str| JobRef {
-			id:       Str::new_static(id),
-			owner:    JobOwner::NamedProcess { name: Str::new_static(id), generation: 1 },
+			id:       sf!(id),
+			owner:    JobOwner::NamedProcess { name: sf!(id), generation: 1 },
 			artifact: ExpectedArtifact {
-				description: Str::new_static("artifact"),
-				media_type:  Some(Str::new_static("text/plain")),
+				description: sf!("artifact"),
+				media_type:  Some(sf!("text/plain")),
 				lifetime:    ArtifactLifetime::Session,
 			},
 		};
@@ -3641,7 +3637,7 @@ mod tests {
 			.expect("stage pending input");
 		journal
 			.start_turn(3, TurnStart {
-				turn_id:            Str::from("pending"),
+				turn_id:            sf!("pending"),
 				item_events:        vec![input],
 				prompt_hash:        [1; 32],
 				prompt_head_events: Vec::new(),
@@ -3664,12 +3660,12 @@ mod tests {
 		assert!(matches!(journal.rewind(4, None), Err(JournalError::RewindWhilePending)));
 		assert!(matches!(
 			journal.compact(4, Compact {
-				summary:       Str::from("summary"),
+				summary:       sf!("summary"),
 				short:         None,
 				first_kept:    input,
 				tokens_before: 100,
 				tokens_after:  Some(20),
-				method:        Some(Str::from("remote")),
+				method:        Some(sf!("remote")),
 				warning:       None,
 				superseded:    Vec::new(),
 			}),

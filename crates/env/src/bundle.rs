@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use omp_ar::{Archive, Format, zip::Writer};
-use omp_core::{Str, encoding::hex};
+use omp_core::{Str, encoding::hex, sf};
 use omp_proto::blob::v1::{Chunk, GetRequest, StatRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -99,18 +99,18 @@ pub fn pack_bundle(
 	for file in &files {
 		validate_payload_path(&file.path)?;
 		if previous == Some(file.path.as_str()) {
-			return Err(BundleError::Layout(Str::from("duplicate bundle member")));
+			return Err(BundleError::Layout(sf!("duplicate bundle member")));
 		}
 		previous = Some(file.path.as_str());
 		let digest = hex::encode_n(blake3::hash(&file.contents).as_bytes());
 		if !payload_name_matches_digest(&file.path, digest.as_str()) {
-			return Err(BundleError::Layout(Str::from("artifact pathname does not match its digest")));
+			return Err(BundleError::Layout(sf!("artifact pathname does not match its digest",)));
 		}
 		contents.push(BundleEntry {
 			path:   file.path.clone(),
-			blake3: Str::from(digest.as_str()),
+			blake3: Str::new(digest.as_str()),
 			size:   u64::try_from(file.contents.len())
-				.map_err(|_| BundleError::Layout(Str::from("payload length exceeds u64")))?,
+				.map_err(|_| BundleError::Layout(sf!("payload length exceeds u64")))?,
 		});
 	}
 	let manifest =
@@ -134,13 +134,13 @@ pub fn unpack_bundle(bytes: &[u8]) -> Result<AirgapBundle, BundleError> {
 	let mut files = archive.read_all()?;
 	let manifest = files
 		.remove("bundle.toml")
-		.ok_or_else(|| BundleError::Layout(Str::from("bundle.toml is missing")))?;
+		.ok_or_else(|| BundleError::Layout(sf!("bundle.toml is missing")))?;
 	let manifest = toml::from_str::<BundleManifest>(
 		std::str::from_utf8(&manifest)
-			.map_err(|_| BundleError::Layout(Str::from("bundle.toml is not UTF-8")))?,
+			.map_err(|_| BundleError::Layout(sf!("bundle.toml is not UTF-8")))?,
 	)?;
 	if manifest.format != BUNDLE_FORMAT {
-		return Err(BundleError::Layout(Str::from("unsupported bundle format")));
+		return Err(BundleError::Layout(sf!("unsupported bundle format")));
 	}
 	let mut decoded = Vec::with_capacity(manifest.contents.len());
 	for entry in &manifest.contents {
@@ -155,7 +155,7 @@ pub fn unpack_bundle(bytes: &[u8]) -> Result<AirgapBundle, BundleError> {
 		decoded.push(BundleFile { path: entry.path.clone(), contents: Bytes::from(contents) });
 	}
 	if !files.is_empty() {
-		return Err(BundleError::Layout(Str::from("bundle contains an unindexed member")));
+		return Err(BundleError::Layout(sf!("bundle contains an unindexed member")));
 	}
 	Ok(AirgapBundle { manifest, files: decoded })
 }
@@ -173,11 +173,11 @@ pub async fn push_bundle(client: &EnvClient, bundle: &AirgapBundle) -> Result<()
 	if bundle.manifest.format != BUNDLE_FORMAT
 		|| bundle.manifest.contents.len() != bundle.files.len()
 	{
-		return Err(BundleError::Layout(Str::from("bundle manifest and payloads differ")));
+		return Err(BundleError::Layout(sf!("bundle manifest and payloads differ")));
 	}
 	for (entry, file) in bundle.manifest.contents.iter().zip(&bundle.files) {
 		if entry.path != file.path {
-			return Err(BundleError::Layout(Str::from("bundle payload order differs from manifest")));
+			return Err(BundleError::Layout(sf!("bundle payload order differs from manifest",)));
 		}
 		validate_payload_path(&entry.path)?;
 		if !payload_name_matches_digest(&entry.path, &entry.blake3) {
@@ -230,7 +230,7 @@ pub async fn pull_bundle(
 	manifest: BundleManifest,
 ) -> Result<AirgapBundle, BundleError> {
 	if manifest.format != BUNDLE_FORMAT {
-		return Err(BundleError::Layout(Str::from("unsupported bundle format")));
+		return Err(BundleError::Layout(sf!("unsupported bundle format")));
 	}
 	let mut files = Vec::with_capacity(manifest.contents.len());
 	for entry in &manifest.contents {
@@ -278,7 +278,7 @@ fn validate_payload_path(path: &str) -> Result<(), BundleError> {
 			.split('/')
 			.any(|part| part.is_empty() || part == "." || part == "..")
 	{
-		return Err(BundleError::Layout(Str::from("member path is outside the fixed bundle layout")));
+		return Err(BundleError::Layout(sf!("member path is outside the fixed bundle layout",)));
 	}
 	Ok(())
 }
@@ -319,11 +319,11 @@ fn hash_bytes(value: &str) -> Result<Bytes, BundleError> {
 			.bytes()
 			.all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 	{
-		return Err(BundleError::Layout(Str::from("bundle digest is not lowercase BLAKE3 hex")));
+		return Err(BundleError::Layout(sf!("bundle digest is not lowercase BLAKE3 hex",)));
 	}
 	let hash = hex::decode(value)
 		.into_array::<32>()
-		.map_err(|_| BundleError::Layout(Str::from("bundle digest is not BLAKE3-256")))?;
+		.map_err(|_| BundleError::Layout(sf!("bundle digest is not BLAKE3-256")))?;
 	Ok(Bytes::copy_from_slice(&hash))
 }
 
@@ -338,11 +338,8 @@ mod tests {
 	fn bundle_round_trip_preserves_content_addressed_layout() {
 		let wheel = Bytes::from_static(b"wheel");
 		let digest = omp_core::encoding::hex::encode_n(blake3::hash(&wheel).as_bytes());
-		let archive = pack_bundle("omp-test", vec![Str::from("aarch64-apple-darwin")], vec![
-			BundleFile {
-				path:     Str::from("omp.lock"),
-				contents: Bytes::from_static(b"version = 1\n"),
-			},
+		let archive = pack_bundle("omp-test", vec![sf!("aarch64-apple-darwin")], vec![
+			BundleFile { path: sf!("omp.lock"), contents: Bytes::from_static(b"version = 1\n") },
 			BundleFile {
 				path:     Str::from(format!("wheels/{}.whl", digest.as_str())),
 				contents: wheel,

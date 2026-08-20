@@ -57,7 +57,7 @@ impl ProviderErrorLayer<NoHookHandle> {
 impl ProviderErrorLayer<NoHookHandle> {
 	/// Attaches a concrete dispatcher to this route stack.
 	#[must_use]
-	pub fn with_hook<T: HookHandle>(self, hook: T) -> ProviderErrorLayer<T> {
+	pub const fn with_hook<T: HookHandle>(self, hook: T) -> ProviderErrorLayer<T> {
 		ProviderErrorLayer { hook: Some(hook) }
 	}
 }

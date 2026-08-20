@@ -7,7 +7,7 @@ use std::{
 	task::{Context, Poll},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 
 use crate::{
@@ -275,8 +275,8 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		Str::from(OperationKind::Native.to_string()),
-		ReasonId(Str::from("operation_service_mismatch")),
+		Str::new(OperationKind::Native.to_string()),
+		ReasonId(sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
@@ -284,7 +284,7 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 fn rejected(reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::NativeRequestRejected,
-		ErrorDetail::capability(Str::from("native"), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(sf!("native"), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -296,7 +296,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]

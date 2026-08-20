@@ -207,7 +207,7 @@ fn discovery_uri(
 				.append_pair(query_parameter.as_str(), &page.to_string());
 		},
 	}
-	Ok(Str::from(uri.to_string()))
+	Ok(Str::new(&uri))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -352,7 +352,7 @@ impl DiscoveryDecoder {
 					maximum_output_tokens: model.output_token_limit,
 					maximum_batch:         None,
 				});
-			let mut row = self.row(wire_model.into(), model.display_name, None, None);
+			let mut row = self.row(Str::new(wire_model), model.display_name, None, None);
 			if let Some(base_model) = model.base_model_id {
 				let alias = base_model
 					.as_str()
@@ -460,14 +460,14 @@ impl DiscoveryDecoder {
 					.unwrap_or(*first_page);
 				current
 					.checked_add(1)
-					.map(|page| Some(Str::from(page.to_string())))
+					.map(|page| Some(Str::new(page.to_string())))
 					.ok_or_else(protocol_error)
 			},
 		}
 	}
 }
 
-fn openai_chat_capabilities(
+const fn openai_chat_capabilities(
 	input_modalities: ModalityBits,
 	tools: Availability<ToolCapabilities>,
 ) -> ChatCapabilities {
@@ -640,7 +640,7 @@ mod tests {
 		DiscoveryRequest {
 			provider:  None,
 			route:     None,
-			cursor:    cursor.map(Str::from),
+			cursor:    cursor.map(Str::new),
 			page_size: 100,
 			operation: None,
 		}
@@ -650,7 +650,7 @@ mod tests {
 		DiscoveryDecoder {
 			provider: ProviderId::from("provider"),
 			route: RouteId::from("route"),
-			source: Str::from("fixture"),
+			source: sf!("fixture"),
 			pagination,
 			request_cursor: None,
 			flavor,
@@ -680,8 +680,8 @@ mod tests {
 		let mut spec = DiscoverySpec {
 			id:            omp_llm_catalog::DiscoverySpecId::from("fixture"),
 			kind:          DiscoveryKind::OpenAiModels,
-			label:         Str::from("fixture"),
-			path:          Str::from("/models"),
+			label:         sf!("fixture"),
+			path:          sf!("/models"),
 			pagination:    DiscoveryPagination::SinglePage,
 			authoritative: false,
 			interval:      Some(std::time::Duration::from_secs(5)),
@@ -806,7 +806,7 @@ mod tests {
 	fn google_list_models_fixture_preserves_declared_operations_limits_and_cursor() {
 		let (rows, next) = discovered(
 			DiscoveryFlavor::Google,
-			DiscoveryPagination::Cursor { query_parameter: Str::from("pageToken") },
+			DiscoveryPagination::Cursor { query_parameter: sf!("pageToken") },
 			include_bytes!("fixtures/google_list_models.json"),
 		);
 		assert_eq!(next.as_ref().map(Str::as_str), Some("page-token-REDACTED"));
@@ -865,7 +865,7 @@ mod tests {
 	fn account_models_fixture_preserves_provider_fields_and_cursor() {
 		let (rows, next) = discovered(
 			DiscoveryFlavor::Account,
-			DiscoveryPagination::Cursor { query_parameter: Str::from("after") },
+			DiscoveryPagination::Cursor { query_parameter: sf!("after") },
 			include_bytes!("../../../../fixtures/llm-oracle/openai/chat/response.account_models.json"),
 		);
 		assert_eq!(next.as_ref().map(Str::as_str), Some("retired-account-model"));
@@ -895,7 +895,7 @@ mod tests {
 		let cursor_uri = discovery_uri(
 			"https://example.test/v1",
 			"models",
-			&DiscoveryPagination::Cursor { query_parameter: Str::from("after") },
+			&DiscoveryPagination::Cursor { query_parameter: sf!("after") },
 			&request(Some("opaque +/% cursor")),
 		)
 		.expect("cursor URI");
@@ -906,10 +906,7 @@ mod tests {
 		let page_uri = discovery_uri(
 			"https://example.test",
 			"/models",
-			&DiscoveryPagination::PageNumber {
-				query_parameter: Str::from("page"),
-				first_page:      1,
-			},
+			&DiscoveryPagination::PageNumber { query_parameter: sf!("page"), first_page: 1 },
 			&request(Some("7")),
 		)
 		.expect("page URI");

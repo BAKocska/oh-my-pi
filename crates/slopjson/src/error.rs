@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 
 use crate::parser::MAX_DEPTH;
 
@@ -58,6 +58,6 @@ pub enum ParseError {
 
 impl serde::de::Error for ParseError {
 	fn custom<T: fmt::Display>(msg: T) -> Self {
-		Self::Custom(fmts!("{msg}"))
+		Self::Custom(sf!("{msg}"))
 	}
 }

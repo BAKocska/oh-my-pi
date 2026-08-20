@@ -1,6 +1,6 @@
 //! Command palette whose rows and actions are injected by the host.
 
-use omp_core::{Str, fmts};
+use omp_core::{IntoStr, Str, sf};
 use omp_tui::{
 	Color, Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext,
 	UiEvent, dom,
@@ -39,10 +39,10 @@ pub struct PaletteEntry {
 
 impl PaletteEntry {
 	/// Creates an executable palette row.
-	pub fn new(label: impl Into<Str>, detail: impl Into<Str>, action: PaletteAction) -> Self {
+	pub fn new(label: impl IntoStr, detail: impl IntoStr, action: PaletteAction) -> Self {
 		Self {
-			label: label.into(),
-			detail: detail.into(),
+			label: label.into_str(),
+			detail: detail.into_str(),
 			key: Str::default(),
 			action,
 			accent: false,
@@ -51,8 +51,8 @@ impl PaletteEntry {
 
 	/// Adds a right-aligned shortcut hint.
 	#[must_use]
-	pub fn key(mut self, key: impl Into<Str>) -> Self {
-		self.key = key.into();
+	pub fn key(mut self, key: impl IntoStr) -> Self {
+		self.key = key.into_str();
 		self
 	}
 
@@ -117,11 +117,11 @@ impl CommandPalette {
 		commands: &[omp_tui::Command],
 	) -> Vec<PaletteEntry> {
 		builtins.extend(commands.iter().map(|command| {
-			let slash = fmts!("/{}", command.name());
+			let slash = sf!("/{}", command.name());
 			PaletteEntry::new(
 				slash.clone(),
 				command.description(),
-				PaletteAction::Insert(fmts!("{slash} ")),
+				PaletteAction::Insert(sf!("{slash} ")),
 			)
 			.accent(true)
 		}));
@@ -204,7 +204,7 @@ fn build(entries: &[PaletteEntry], query: &str, rows: u16, width: u16, ctx: &UiC
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| DisplayEntry {
-			value:  fmts!("{index}"),
+			value:  sf!("{index}"),
 			label:  entry.label.clone(),
 			detail: entry.detail.clone(),
 			key:    entry.key.clone(),
@@ -215,7 +215,7 @@ fn build(entries: &[PaletteEntry], query: &str, rows: u16, width: u16, ctx: &UiC
 			},
 		})
 		.collect();
-	let seed = Str::from(query);
+	let seed = Str::new(query);
 	let height = rows.saturating_add(1);
 	Ui::from_root(
 		OverlayPanel::new("Commands").child(dom! {

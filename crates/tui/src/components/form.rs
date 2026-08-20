@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use serde_json::{Map, Value};
 use smallvec::SmallVec;
 
@@ -58,8 +58,8 @@ impl Field {
 	}
 
 	/// Sets the field's visible label.
-	pub fn label(mut self, label: impl Into<Str>) -> Self {
-		self.label = label.into();
+	pub fn label(mut self, label: impl IntoStr) -> Self {
+		self.label = label.into_str();
 		self
 	}
 

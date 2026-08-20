@@ -7,7 +7,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use tower::{Layer, Service};
 
@@ -222,11 +222,11 @@ fn budget_error(
 		RetryAction::Never,
 		context.receipt(),
 	)
-	.code(Str::new_static("inference.budget_exhausted"))
-	.detail(ErrorDetail::budget(Str::new_static(dimension), limit, observed))
+	.code(sf!("inference.budget_exhausted"))
+	.detail(ErrorDetail::budget(sf!(dimension), limit, observed))
 }
 
-fn accumulate(target: &mut InferenceSpend, charge: InferenceSpend) {
+const fn accumulate(target: &mut InferenceSpend, charge: InferenceSpend) {
 	target.input_tokens = target.input_tokens.saturating_add(charge.input_tokens);
 	target.output_tokens = target.output_tokens.saturating_add(charge.output_tokens);
 	target.wall_time = target.wall_time.saturating_add(charge.wall_time);
@@ -352,14 +352,14 @@ mod tests {
 		)
 		.with_attribution(InferenceAttribution {
 			principal: crate::id::PrincipalId::from("schedule-owner"),
-			extension: omp_core::Str::new_static("extension"),
+			extension: omp_core::sf!("extension"),
 		})
 	}
 
 	#[tokio::test]
 	async fn request_budget_exhaustion_rejects_before_dispatch() {
 		let ledger = InferenceLedger::default();
-		ledger.set_policy(omp_core::Str::new_static("extension"), InferenceBudgetPolicy {
+		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
 			per_turn:    InferenceBudget { max_requests: Some(1), ..InferenceBudget::default() },
 			per_session: InferenceBudget::default(),
 		});

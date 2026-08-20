@@ -13,7 +13,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{IntoStr, Str, encoding::base64, fmts};
+use omp_core::{IntoStr, Str, encoding::base64, sf};
 use serde_json::{Value, json};
 use tokio::{
 	process::Child,
@@ -127,8 +127,8 @@ async fn connect_window(
 	if page.incognito {
 		extra.push("--incognito".to_str());
 	}
-	extra.push(fmts!("--window-size={},{}", config.width, config.height));
-	extra.push(fmts!("--app={initial}"));
+	extra.push(sf!("--window-size={},{}", config.width, config.height));
+	extra.push(sf!("--app={initial}"));
 	let (link, mut child) = connect(binary, profile.path(), page, &extra).await?;
 	let mut cdp = Cdp::new(link, events, state, None);
 	if let Err(err) = wire_window(&mut cdp, page).await {
@@ -183,7 +183,7 @@ fn spawn_browser(
 		"--hide-crash-restore-bubble",
 	]);
 	if let Some(ua) = &page.user_agent {
-		cmd.arg(&*fmts!("--user-agent={ua}"));
+		cmd.arg(&*sf!("--user-agent={ua}"));
 	}
 	for arg in extra {
 		cmd.arg(&**arg);
@@ -207,7 +207,7 @@ async fn wait_devtools_port(profile: &Path) -> Result<Str> {
 			if let (Some(port), Some(path)) = (lines.next(), lines.next())
 				&& let Ok(port) = port.trim().parse::<u16>()
 			{
-				return Ok(fmts!("ws://127.0.0.1:{port}{}", path.trim()));
+				return Ok(sf!("ws://127.0.0.1:{port}{}", path.trim()));
 			}
 		}
 		if Instant::now() >= deadline {
@@ -442,7 +442,7 @@ impl Cdp {
 							.get("message")
 							.and_then(Value::as_str)
 							.unwrap_or("unknown");
-						return Err(Error::Protocol(fmts!("{method}: {text}")));
+						return Err(Error::Protocol(sf!("{method}: {text}")));
 					}
 					return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
 				},
@@ -548,7 +548,7 @@ impl Cdp {
 				let text = if let Some(details) = value.get("exceptionDetails") {
 					exception_text(details)
 				} else {
-					fmts!("{}", value.pointer("/result/value").unwrap_or(&Value::Null))
+					sf!("{}", value.pointer("/result/value").unwrap_or(&Value::Null))
 				};
 				reply(text);
 				Ok(())
@@ -835,7 +835,7 @@ impl Cdp {
 		}
 		let bytes = base64::decode(data)
 			.into_vec()
-			.map_err(|err| Error::Protocol(fmts!("screencast frame base64: {err}")))?;
+			.map_err(|err| Error::Protocol(sf!("screencast frame base64: {err}")))?;
 		let format = self.frame_cfg.map_or(FrameFormat::Png, |cfg| cfg.format);
 		let mut frame = decode_frame(format, &bytes)?;
 		match &self.last_pixels {
@@ -894,7 +894,7 @@ fn exception_text(details: &Value) -> Str {
 /// CDP `Input.dispatchKeyEvent` name for a key identity.
 fn key_name(key: Key) -> Str {
 	match key {
-		Key::Char(c) => fmts!("{c}"),
+		Key::Char(c) => sf!("{c}"),
 		Key::Enter => "Enter".to_str(),
 		Key::Tab => "Tab".to_str(),
 		Key::Backspace => "Backspace".to_str(),
@@ -908,7 +908,7 @@ fn key_name(key: Key) -> Str {
 		Key::End => "End".to_str(),
 		Key::PageUp => "PageUp".to_str(),
 		Key::PageDown => "PageDown".to_str(),
-		Key::F(n) => fmts!("F{n}"),
+		Key::F(n) => sf!("F{n}"),
 	}
 }
 

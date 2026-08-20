@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -46,8 +46,8 @@ pub struct AliasSelector {
 impl AliasSelector {
 	/// Creates a provider-scoped alias selector without normalizing its
 	/// spelling.
-	pub fn new(provider: impl Into<ProviderId>, alias: impl Into<Str>) -> Self {
-		Self { provider: provider.into(), alias: alias.into() }
+	pub fn new(provider: impl Into<ProviderId>, alias: impl IntoStr) -> Self {
+		Self { provider: provider.into(), alias: alias.into_str() }
 	}
 }
 
@@ -935,7 +935,7 @@ fn check_limit(
 	if let Some(required) = required
 		&& available.is_none_or(|available| available < required)
 	{
-		failures.push(ConstraintFailure::Limit { field: field.into(), required, available });
+		failures.push(ConstraintFailure::Limit { field: Str::new(field), required, available });
 	}
 }
 
@@ -1022,13 +1022,10 @@ fn capability_support(
 
 /// Creates a provenance source suitable for a synthetic bundled catalog in
 /// tests or builders.
-pub fn bundled_source(
-	origin: impl Into<Str>,
-	revision: Option<CatalogRevision>,
-) -> ProvenanceSource {
+pub fn bundled_source(origin: impl IntoStr, revision: Option<CatalogRevision>) -> ProvenanceSource {
 	ProvenanceSource {
 		kind: ProvenanceKind::Bundled,
-		origin: origin.into(),
+		origin: origin.into_str(),
 		revision,
 		confidence: EvidenceConfidence::Verified,
 		observed_at_ms: None,
@@ -1046,7 +1043,7 @@ mod tests {
 	fn source(kind: ProvenanceKind, origin: &str) -> ProvenanceSource {
 		ProvenanceSource {
 			kind,
-			origin: origin.into(),
+			origin: origin.into_str(),
 			revision: None,
 			confidence: EvidenceConfidence::Declared,
 			observed_at_ms: None,
@@ -1056,7 +1053,7 @@ mod tests {
 	fn provider(id: &str, routes: &[&str]) -> ProviderDef {
 		ProviderDef {
 			id:                 id.into(),
-			name:               id.into(),
+			name:               id.into_str(),
 			auth:               Box::new([AuthSpecId::from("auth")]),
 			management:         ManagementCapabilities {
 				operations:        crate::OperationBits::empty(),
@@ -1127,7 +1124,7 @@ mod tests {
 		ModelSpec {
 			key: key.into(),
 			class: ClassId::from("class"),
-			display_name: key.into(),
+			display_name: key.into_str(),
 			wire_ids: route_ids
 				.iter()
 				.map(|route| (RouteId::from(*route), WireModelId::from(key)))
@@ -1203,7 +1200,7 @@ mod tests {
 					selector: ExactSelector::new("p", "m"),
 					added:    None,
 					patch:    ModelPatch {
-						display_name: Some("discovered".into()),
+						display_name: Some("discovered".into_str()),
 						limits: Some(ModelLimits { context_window: Some(32_000), ..models[0].limits }),
 						wire_policy: Some(WirePolicyId::from("discovery-wire")),
 						..ModelPatch::default()
@@ -1225,7 +1222,7 @@ mod tests {
 						selector: ExactSelector::new("p", "m"),
 						added:    None,
 						patch:    ModelPatch {
-							display_name: Some("configured".into()),
+							display_name: Some("configured".into_str()),
 							limits: Some(ModelLimits { context_window: Some(64_000), ..models[0].limits }),
 							..ModelPatch::default()
 						},
@@ -1270,7 +1267,7 @@ mod tests {
 				added: None,
 				patch: RoutePatch {
 					endpoint: Some(EndpointSpec {
-						base_url: "https://changed.test".into(),
+						base_url: "https://changed.test".into_str(),
 						region:   None,
 					}),
 					auth: Some(AuthSpecId::from("other-auth")),
@@ -1319,10 +1316,10 @@ mod tests {
 		let routes = [route("r", "p", 1)];
 		let models = [model("gpt", &["r"], true), model("gpt-malicious-thinking", &["r"], true)];
 		let aliases = [CatalogAlias {
-			alias:      "safe".into(),
+			alias:      "safe".into_str(),
 			target:     ModelKey::from("gpt"),
-			rationale:  "test".into(),
-			provenance: "test".into(),
+			rationale:  "test".into_str(),
+			provenance: "test".into_str(),
 		}];
 		let resolver = CatalogResolver::new(BundledCatalog {
 			providers: &providers,
@@ -1375,10 +1372,10 @@ mod tests {
 			model("user", &["r"], true),
 		];
 		let aliases = [CatalogAlias {
-			alias:      "current".into(),
+			alias:      "current".into_str(),
 			target:     ModelKey::from("bundled"),
-			rationale:  "test".into(),
-			provenance: "test".into(),
+			rationale:  "test".into_str(),
+			provenance: "test".into_str(),
 		}];
 		let mut resolver = CatalogResolver::new(BundledCatalog {
 			providers: &providers,
@@ -1395,10 +1392,10 @@ mod tests {
 				aliases: Box::new([ScopedAlias {
 					provider:   ProviderId::from("p"),
 					definition: CatalogAlias {
-						alias:      "current".into(),
+						alias:      "current".into_str(),
 						target:     ModelKey::from("discovered"),
-						rationale:  "test".into(),
-						provenance: "discovery".into(),
+						rationale:  "test".into_str(),
+						provenance: "discovery".into_str(),
 					},
 				}]),
 			})
@@ -1412,10 +1409,10 @@ mod tests {
 					aliases: Box::new([ScopedAlias {
 						provider:   ProviderId::from("p"),
 						definition: CatalogAlias {
-							alias:      "current".into(),
+							alias:      "current".into_str(),
 							target:     ModelKey::from("user"),
-							rationale:  "test".into(),
-							provenance: "user".into(),
+							rationale:  "test".into_str(),
+							provenance: "user".into_str(),
 						},
 					}]),
 				},

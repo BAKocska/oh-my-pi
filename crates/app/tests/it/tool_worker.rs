@@ -22,7 +22,7 @@ use omp_app::{
 	},
 };
 use omp_core::{
-	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str,
+	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
 };
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
@@ -229,7 +229,7 @@ fn completion_preserves_all_outcome_branches_and_presence_rules() {
 fn control_mapping_fences_stale_frames_and_one_pull_slot() {
 	let mut requests = HostRequestMap::new();
 	let ordinary = requests
-		.open(Str::new_static("ordinary"), Str::new_static("ordinary-call"), false)
+		.open(sf!("ordinary"), sf!("ordinary-call"), false)
 		.expect("map ordinary invocation");
 	assert_eq!(ordinary.request_id, 1);
 	assert_eq!(
@@ -250,7 +250,7 @@ fn control_mapping_fences_stale_frames_and_one_pull_slot() {
 	));
 
 	let streaming = requests
-		.open(Str::new_static("stream"), Str::new_static("stream-call"), true)
+		.open(sf!("stream"), sf!("stream-call"), true)
 		.expect("map streaming invocation");
 	let pull = PullRequest {
 		call_id:     "stream-call".into(),
@@ -344,6 +344,8 @@ fn worker_connection_rejects_nested_counts_before_decode() {
 #[tokio::test]
 async fn supervisor_rejects_stale_host_generation() {
 	use std::os::unix::fs::PermissionsExt as _;
+
+	use omp_core::sf;
 
 	let scratch = tempfile::tempdir().expect("stale generation scratch");
 	let wrapper = scratch.path().join("stale-worker");
@@ -696,9 +698,9 @@ struct TestCall {
 fn py_eval_call(call_id: &'static str, code: &'static str, deadline: Duration) -> TestCall {
 	TestCall {
 		open: OpenToolCall {
-			invocation_id: Str::new_static(call_id),
-			name: Str::new_static("py_eval"),
-			rev: Str::new_static("1"),
+			invocation_id: sf!(call_id),
+			name: sf!("py_eval"),
+			rev: sf!("1"),
 			deadline,
 		},
 		raw:  Bytes::from(
@@ -728,12 +730,7 @@ async fn py_eval_roundtrip(
 
 fn call(call_id: &'static str, name: &'static str, args: Value, deadline: Duration) -> TestCall {
 	TestCall {
-		open: OpenToolCall {
-			invocation_id: Str::new_static(call_id),
-			name: Str::new_static(name),
-			rev: Str::new_static("1"),
-			deadline,
-		},
+		open: OpenToolCall { invocation_id: sf!(call_id), name: sf!(name), rev: sf!("1"), deadline },
 		raw:  Bytes::from(serde_json::to_vec(&args).expect("serialize committed arguments")),
 	}
 }
@@ -829,12 +826,7 @@ async fn wait_for_marker(path: &Path) -> i32 {
 }
 
 fn test_config(executable: std::path::PathBuf) -> ExtHostConfig {
-	ExtHostConfig::new(
-		executable,
-		Principal::new(Str::new_static("test"), Str::new_static("Test")),
-		Str::new_static("test-session"),
-		1,
-	)
+	ExtHostConfig::new(executable, Principal::new(sf!("test"), sf!("Test")), sf!("test-session"), 1)
 }
 
 fn py_eval_manifest(key: &HostKey) -> ExtensionManifest {
@@ -864,9 +856,9 @@ fn test_manifest<const N: usize>(
 
 fn test_provenance(key: &HostKey) -> Provenance {
 	Provenance::new(
-		Str::new_static("test-publisher"),
+		sf!("test-publisher"),
 		key.extension().clone(),
-		Str::new_static("1.0.0"),
+		sf!("1.0.0"),
 		ArtifactDigest::new([0; 32]),
 		key.layer().clone(),
 		key.tier().clone(),

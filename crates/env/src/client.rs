@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use flume::{Receiver, Sender};
-use omp_core::{EnvPath, Str};
+use omp_core::{EnvPath, Str, sf};
 use omp_proto::{
 	blob::v1::{
 		Chunk, DeleteRequest, DeleteResponse, GetRequest, PutResponse, StatRequest, StatResponse,
@@ -637,7 +637,7 @@ impl EnvClient {
 
 	/// Opens a tool invocation before its arguments have committed.
 	pub async fn invoke(&self, request: InvokeTool) -> Result<Invocation, ClientError> {
-		let id = Str::from(request.invocation_id.as_str());
+		let id = Str::new(request.invocation_id.as_str());
 		let (stream, guard) = self
 			.open_guarded(client_frame::Body::InvokeTool(request), None)
 			.await?;
@@ -890,7 +890,7 @@ impl EnvClient {
 			let url = Url::parse(path)
 				.map_err(|error| ClientError::InvalidEnvPath(Str::from(error.to_string())))?;
 			if url.scheme() != "file" {
-				return Err(ClientError::InvalidEnvPath(Str::new_static(
+				return Err(ClientError::InvalidEnvPath(sf!(
 					"environment paths must use the file scheme",
 				)));
 			}
@@ -914,15 +914,15 @@ impl EnvClient {
 		if path.starts_with('/') {
 			url.set_path(path);
 		} else {
-			let mut segments = url.path_segments_mut().map_err(|()| {
-				ClientError::InvalidEnvPath(Str::new_static("workspace root is not hierarchical"))
-			})?;
+			let mut segments = url
+				.path_segments_mut()
+				.map_err(|()| ClientError::InvalidEnvPath(sf!("workspace root is not hierarchical")))?;
 			segments.pop_if_empty();
 			for component in path.split('/') {
 				match component {
 					"" | "." => {},
 					".." => {
-						return Err(ClientError::InvalidEnvPath(Str::new_static(
+						return Err(ClientError::InvalidEnvPath(sf!(
 							"relative environment paths cannot escape the workspace root",
 						)));
 					},

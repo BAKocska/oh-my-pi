@@ -20,7 +20,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, sf};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
@@ -413,8 +413,8 @@ pub trait EvalRun: Send {
 	/// foreground.
 	fn detach(&self, _name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
 		std::future::ready(Err(Fault::Resource {
-			operation: Str::new_static("detach"),
-			message:   Str::new_static("eval resource does not support managed detachment"),
+			operation: sf!("detach"),
+			message:   sf!("eval resource does not support managed detachment"),
 		}))
 	}
 }
@@ -600,9 +600,9 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 		next_background_name: AtomicU64::new(1),
 		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
 		spec: ToolSpec {
-			name:            Str::from("eval"),
+			name:            sf!("eval"),
 			rev:             Rev { family: Str::default(), n: 1 },
-			description:     Str::from(EVAL_DESCRIPTION),
+			description:     Str::new(EVAL_DESCRIPTION),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
 				priority:       100,
@@ -611,10 +611,10 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: [Str::new_static("**")].into_iter().collect(),
+					write_globs: [sf!("**")].into_iter().collect(),
 				}),
 				exec:      Some(ExecEffects {
-					commands: [Str::new_static("*")].into_iter().collect(),
+					commands: [sf!("*")].into_iter().collect(),
 					network:  true,
 				}),
 				inference: Some(InferenceEffects {
@@ -659,7 +659,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 		let owner = params
 			.owner()
 			.cloned()
-			.unwrap_or_else(|| Str::new_static("__direct_eval_owner__"));
+			.unwrap_or_else(|| sf!("__direct_eval_owner__"));
 		stream! {
 			let args = match params.whole::<Params>().await {
 				Ok(args) => args,
@@ -769,11 +769,11 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 							let interrupt = match interrupt {
 								Ok(interrupt) => interrupt,
 								Err(InterruptWaitError::Closed) => Interrupt {
-									class: Str::new_static("closed"),
-									reason: Str::from("invocation owner disappeared"),
+									class: sf!("closed"),
+									reason: sf!("invocation owner disappeared"),
 								},
 								Err(InterruptWaitError::Protocol(reason)) => Interrupt {
-									class: Str::new_static("protocol"),
+									class: sf!("protocol"),
 									reason,
 								},
 							};
@@ -832,7 +832,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 					},
 					Ok(None) => {
 						yield Ev::Aborted(Abort::EffectsUnknown {
-							reason: cancellation_reason.unwrap_or_else(|| Str::from("eval event stream ended before terminal status")),
+							reason: cancellation_reason.unwrap_or_else(|| sf!("eval event stream ended before terminal status")),
 						});
 						return;
 					},
@@ -986,7 +986,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 					image_index += 1;
 					parts.push(Part::Blob {
 						blob: blob.clone(),
-						alt:  Some(Str::from(format!("display image {image_index}"))),
+						alt:  Some(sf!("display image {image_index}")),
 					});
 				}
 			}
@@ -1010,7 +1010,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 }
 
 fn detached_terminal(job: DetachedJob) -> ToolTerminal<Payload, Fault> {
-	managed_job_terminal(job, Str::new_static("eval cell settlement"))
+	managed_job_terminal(job, sf!("eval cell settlement"))
 }
 
 fn param_event<U, P>(error: ParamError) -> Ev<U, P, Fault> {
@@ -1036,9 +1036,9 @@ fn commit_event<U, P>(error: CommitError) -> Ev<U, P, Fault> {
 fn protocol_issue(reason: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::from("one complete eval@1 Python cell object"),
+		expected: sf!("one complete eval@1 Python cell object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::from(r#"{"language":"py","code":"1 + 1"}"#)),
+		example:  Some(sf!(r#"{{"language":"py","code":"1 + 1"}}"#)),
 		found:    Some(reason),
 	}
 }

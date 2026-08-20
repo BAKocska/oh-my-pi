@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
 /// Content capability kinds supported by the static declaration table.
@@ -169,6 +169,6 @@ mod tests {
 		let entries = dispatch_first(&declarations, CapabilityKind::Skills, |declaration| {
 			vec![("same".into(), declaration.id.clone())]
 		});
-		assert_eq!(entries, vec![("same".into(), Str::from("high"))]);
+		assert_eq!(entries, vec![("same".into(), sf!("high"))]);
 	}
 }

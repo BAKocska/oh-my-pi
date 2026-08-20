@@ -34,7 +34,7 @@ impl<W: Write> Writer<W> {
 	/// Adds a regular file at `path` with the supplied bytes.
 	pub fn add_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
 		if is_directory_name(path) {
-			return Err(Error::UnsafePath(path.into()));
+			return Err(Error::UnsafePath(Str::new(path)));
 		}
 		let path = normalize_bounded(path, Limits::DEFAULT)?;
 		self.add_entry(path, false, data)
@@ -55,7 +55,7 @@ impl<W: Write> Writer<W> {
 	/// refuses targets that cannot be resolved inside the archive.
 	pub fn add_symlink(&mut self, path: &str, target: &str) -> Result<()> {
 		if is_directory_name(path) {
-			return Err(Error::UnsafePath(path.into()));
+			return Err(Error::UnsafePath(Str::new(path)));
 		}
 		let path = normalize_bounded(path, Limits::DEFAULT)?;
 		let target = portable_link_target(target)?;
@@ -65,7 +65,7 @@ impl<W: Write> Writer<W> {
 	/// Adds a hard-link entry targeting another archive-relative member path.
 	pub fn add_hard_link(&mut self, path: &str, target: &str) -> Result<()> {
 		if is_directory_name(path) {
-			return Err(Error::UnsafePath(path.into()));
+			return Err(Error::UnsafePath(Str::new(path)));
 		}
 		let path = normalize_bounded(path, Limits::DEFAULT)?;
 		let target = normalize_bounded(target, Limits::DEFAULT)?;
@@ -245,7 +245,7 @@ fn make_header(
 
 fn portable_link_target(target: &str) -> Result<Cow<'_, str>> {
 	if target.is_empty() || target.contains('\0') {
-		return Err(Error::UnsafePath(target.into()));
+		return Err(Error::UnsafePath(Str::new(target)));
 	}
 	let limit = Limits::DEFAULT.max_path_size();
 	if target.len() as u64 > limit {

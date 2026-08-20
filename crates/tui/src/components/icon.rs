@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
@@ -21,8 +21,8 @@ impl Icon {
 	}
 
 	/// Creates an icon with the requested theme glyph name.
-	pub fn named(name: impl Into<Str>) -> Self {
-		Self { name: name.into(), ..Self::new() }
+	pub fn named(name: impl IntoStr) -> Self {
+		Self { name: name.into_str(), ..Self::new() }
 	}
 
 	/// Sets one icon property.

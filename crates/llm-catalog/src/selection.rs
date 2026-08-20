@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -55,10 +55,10 @@ pub fn role_assignment_selector(
 	let selector = selector.trim();
 	let parsed = parse_selector(selector)?;
 	let Some(thinking) = thinking else {
-		return Ok(selector.into());
+		return Ok(Str::new(selector));
 	};
 	if !is_thinking_level(thinking) || parsed.route.is_some() {
-		return Err(SelectionError::Invalid(selector.into()));
+		return Err(SelectionError::Invalid(Str::new(selector)));
 	}
 	let mut formatted = String::with_capacity(
 		parsed.model.len()
@@ -180,22 +180,23 @@ pub fn parse_selector(input: &str) -> Result<ParsedSelector, SelectionError> {
 		.rsplit_once(':')
 		.unwrap_or((before_upstream, ""));
 	if model.is_empty() || model.ends_with(':') {
-		return Err(SelectionError::Invalid(input.into()));
+		return Err(SelectionError::Invalid(Str::new(input)));
 	}
-	let mut parsed = ParsedSelector { model: model.into(), upstream, thinking: None, route: None };
+	let mut parsed =
+		ParsedSelector { model: Str::new(model), upstream, thinking: None, route: None };
 	if !suffix.is_empty() {
 		if is_thinking_level(suffix) {
-			parsed.thinking = Some(suffix.into());
+			parsed.thinking = Some(Str::new(suffix));
 		} else if suffix
 			.chars()
 			.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 		{
-			parsed.route = Some(suffix.into());
+			parsed.route = Some(RouteId::new(suffix));
 		} else {
-			return Err(SelectionError::Invalid(input.into()));
+			return Err(SelectionError::Invalid(Str::new(input)));
 		}
 	} else if before_upstream.ends_with(':') {
-		return Err(SelectionError::Invalid(input.into()));
+		return Err(SelectionError::Invalid(Str::new(input)));
 	}
 	Ok(parsed)
 }
@@ -204,26 +205,28 @@ fn split_upstream(input: &str) -> Result<(&str, Option<Str>), SelectionError> {
 	if let Some(rest) = input.strip_prefix('@') {
 		let (upstream, model) = rest
 			.split_once('/')
-			.ok_or_else(|| SelectionError::Invalid(input.into()))?;
+			.ok_or_else(|| SelectionError::Invalid(Str::new(input)))?;
 		if upstream.is_empty() || model.is_empty() || model.contains('@') {
-			return Err(SelectionError::Invalid(input.into()));
+			return Err(SelectionError::Invalid(Str::new(input)));
 		}
-		return Ok((model, Some(upstream.into())));
+		return Ok((model, Some(Str::new(upstream))));
 	}
 	match input.rsplit_once('@') {
 		None => Ok((input, None)),
 		Some((model, upstream))
 			if !model.is_empty() && !upstream.is_empty() && !upstream.contains('/') =>
 		{
-			Ok((model, Some(upstream.into())))
+			Ok((model, Some(Str::new(upstream))))
 		},
-		Some(_) => Err(SelectionError::Invalid(input.into())),
+		Some(_) => Err(SelectionError::Invalid(Str::new(input))),
 	}
 }
 
 /// Matches a selector by pi's ordered cascade: exact provider/id, bare id,
-/// alias, provider-scoped fuzzy match, then substring. Ambiguity is ranked by
-/// MRU, route priority, and canonical identity, never iteration order.
+/// alias, provider-scoped fuzzy match, then substring.
+///
+/// Ambiguity is ranked by MRU, route priority, and canonical identity, never
+/// iteration order.
 pub fn select_model(
 	models: &[ModelSpec],
 	routes: &[RouteDef],
@@ -249,22 +252,22 @@ fn select_inner(
 		.or_else(|| selector.strip_prefix("pi/"))
 	{
 		if role.contains('/') || role.contains(':') {
-			return Err(SelectionError::Invalid(selector.into()));
+			return Err(SelectionError::Invalid(Str::new(selector)));
 		}
-		if !visiting.insert(role.into()) {
-			return Err(SelectionError::RoleCycle(role.into()));
+		if !visiting.insert(Str::new(role)) {
+			return Err(SelectionError::RoleCycle(Str::new(role)));
 		}
 		let found = roles
 			.iter()
 			.find(|candidate| candidate.id == role)
-			.ok_or_else(|| SelectionError::UnknownRole(role.into()))?;
+			.ok_or_else(|| SelectionError::UnknownRole(Str::new(role)))?;
 		let result = found
 			.selectors
 			.iter()
 			.find_map(|pattern| {
 				select_inner(models, routes, aliases, roles, mru, pattern, visiting).ok()
 			})
-			.ok_or_else(|| SelectionError::NotFound(selector.into()));
+			.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
 		visiting.remove(role);
 		return result;
 	}
@@ -283,7 +286,7 @@ fn select_inner(
 		.split_once('/')
 		.map_or((None, parsed.model.as_str()), |(provider, id)| (Some(provider), id));
 	if id.is_empty() {
-		return Err(SelectionError::Invalid(selector.into()));
+		return Err(SelectionError::Invalid(Str::new(selector)));
 	}
 	// Catalog keys are `provider/logical` composites; a provider-qualified
 	// selector reconstructs the composite while a bare selector matches the
@@ -305,22 +308,20 @@ fn select_inner(
 	) {
 		return Ok(with_annotations(found, parsed));
 	}
-	if provider.is_none() {
-		if let Some(alias) = aliases.iter().find(|alias| alias.alias == parsed.model) {
-			if let Ok(found) = choose(
-				models,
-				routes,
-				mru,
-				alias.target.as_str(),
-				None,
-				parsed.route.as_ref(),
-				parsed.upstream.clone(),
-				&alias.target,
-				selector,
-			) {
-				return Ok(with_annotations(found, parsed));
-			}
-		}
+	if provider.is_none()
+		&& let Some(alias) = aliases.iter().find(|alias| alias.alias == parsed.model)
+		&& let Ok(found) = choose(
+			models,
+			routes,
+			mru,
+			alias.target.as_str(),
+			None,
+			parsed.route.as_ref(),
+			parsed.upstream.clone(),
+			&alias.target,
+			selector,
+		) {
+		return Ok(with_annotations(found, parsed));
 	}
 	let mut matches = candidates(models, routes, provider, id, parsed.route.as_ref());
 	if matches.is_empty() && provider.is_some() {
@@ -411,7 +412,7 @@ fn choose_candidates(
 		.into_iter()
 		.max_by(|left, right| rank(left, routes, mru).cmp(&rank(right, routes, mru)))
 	else {
-		return Err(SelectionError::NotFound(original.into()));
+		return Err(SelectionError::NotFound(Str::new(original)));
 	};
 	Ok(SelectedModel {
 		provider,
@@ -474,7 +475,7 @@ pub fn select_initial(
 		Some(selector) => select_model(models, routes, aliases, roles, mru, selector).map(Some),
 		None => pick_default(models, routes, mru)
 			.map(Some)
-			.ok_or_else(|| SelectionError::NotFound("default".into())),
+			.ok_or_else(|| SelectionError::NotFound(sf!("default"))),
 	}
 }
 
@@ -605,17 +606,17 @@ mod tests {
 	#[test]
 	fn non_default_role_retains_explicit_auto_thinking() {
 		let mut roles = vec![
-			ModelRole::assignment("default", "openai/primary", Some("high"))
+			ModelRole::assignment(Str::new_static("default"), "openai/primary", Some("high"))
 				.expect("default assignment"),
 		];
 		assert!(
-			upsert_role_assignment(&mut roles, "task", "openai-codex/worker", Some("auto"))
+			upsert_role_assignment(&mut roles, Str::new_static("task"), "openai-codex/worker", Some("auto"))
 				.expect("task assignment")
 		);
 		assert_eq!(roles[0].selectors[0].as_str(), "openai/primary:high");
 		assert_eq!(roles[1].selectors[0].as_str(), "openai-codex/worker:auto");
 		assert!(
-			!upsert_role_assignment(&mut roles, "task", "openai-codex/worker", Some("auto"))
+			!upsert_role_assignment(&mut roles, Str::new_static("task"), "openai-codex/worker", Some("auto"))
 				.expect("unchanged task assignment")
 		);
 	}

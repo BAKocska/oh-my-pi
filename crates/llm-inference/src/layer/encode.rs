@@ -7,7 +7,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use omp_core::Str;
+use omp_core::sf;
 use parking_lot::Mutex;
 use tower::{Layer, Service};
 
@@ -212,7 +212,7 @@ fn credential_prepare_error(context: &ExecutionContext) -> Error {
 		RetryAction::Never,
 		context.receipt(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static("credential-application-contract"))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!("credential-application-contract"))))
 }
 
 /// Adds credential application at the last boundary before wire transport.
@@ -314,7 +314,7 @@ fn provider_sign_timeout(context: &ExecutionContext, budget: Duration) -> Error 
 		context.receipt(),
 	)
 	.detail(ErrorDetail::budget(
-		Str::new_static("provider_sign"),
+		sf!("provider_sign"),
 		budget.as_nanos(),
 		budget.as_nanos().saturating_add(1),
 	))

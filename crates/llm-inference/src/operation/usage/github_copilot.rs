@@ -10,7 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
@@ -156,12 +156,12 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 		.as_deref()
 		.or(metadata_username)
 		.filter(|value| !value.trim().is_empty())
-		.map(|value| Str::from(value.trim()));
+		.map(|value| Str::new(value.trim()));
 	let enterprise_url = envelope
 		.enterprise_url
 		.as_deref()
 		.filter(|value| !value.trim().is_empty())
-		.map(|value| Str::from(value.trim()))
+		.map(|value| Str::new(value.trim()))
 		.or_else(|| nested_api_key.and_then(|nested| nested.enterprise_url));
 	Some(Credential {
 		token,
@@ -171,12 +171,12 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 			.account_id
 			.as_deref()
 			.filter(|value| !value.trim().is_empty())
-			.map(|value| Str::from(value.trim())),
+			.map(|value| Str::new(value.trim())),
 		email: envelope
 			.email
 			.as_deref()
 			.filter(|value| !value.trim().is_empty())
-			.map(|value| Str::from(value.trim())),
+			.map(|value| Str::new(value.trim())),
 		username,
 	})
 }
@@ -186,15 +186,15 @@ fn github_api_base(enterprise_url: Option<&str>) -> Str {
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
 	else {
-		return Str::new_static(PUBLIC_GITHUB_API);
+		return sf!(PUBLIC_GITHUB_API);
 	};
 	if value.starts_with("http://") || value.starts_with("https://") {
-		return Str::from(value.trim_end_matches('/'));
+		return Str::new(value.trim_end_matches('/'));
 	}
 	if value.starts_with("api.") {
-		Str::from(format!("https://{value}"))
+		sf!("https://{value}")
 	} else {
-		Str::from(format!("https://api.{value}"))
+		sf!("https://api.{value}")
 	}
 }
 
@@ -276,7 +276,7 @@ fn observation(
 			..UsageAccountMetadata::default()
 		},
 		plan,
-		source_label: Some(Str::new_static(source)),
+		source_label: Some(sf!(source)),
 		notes: Box::default(),
 		reset_credits: None,
 		windows,
@@ -299,7 +299,7 @@ async fn resolve_username(
 		.get("login")?
 		.as_str()
 		.filter(|value| !value.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 }
 
 fn authorization(scheme: &[u8], token: &str) -> Result<HeaderValue, UsageFetchError> {
@@ -373,9 +373,9 @@ fn request_window(
 	UsageWindow {
 		id,
 		kind: UsageWindowKind::Quota,
-		dimension: Str::new_static("requests"),
+		dimension: sf!("requests"),
 		label: Some(label),
-		scope: Some(Str::new_static("shared")),
+		scope: Some(sf!("shared")),
 		amount: UsageAmount {
 			unit:      UsageUnit::Requests,
 			consumed:  used.and_then(quantity),
@@ -421,10 +421,10 @@ fn parse_snapshots(body: &str, now: SystemTime) -> Option<(Option<Str>, Vec<Usag
 			.unwrap_or(0.0);
 		let mut notes = Vec::new();
 		if unlimited {
-			notes.push(Str::new_static("Unlimited"));
+			notes.push(sf!("Unlimited"));
 		}
 		if overage > 0.0 {
-			notes.push(Str::from(format!("Overage requests: {}", overage as u64)));
+			notes.push(sf!("Overage requests: {}", overage as u64));
 		}
 		let (used, remaining, limit) = if unlimited {
 			(None, None, None)
@@ -433,8 +433,8 @@ fn parse_snapshots(body: &str, now: SystemTime) -> Option<(Option<Str>, Vec<Usag
 			(Some(used), Some((entitlement - used).max(0.0)), Some(entitlement))
 		};
 		windows.push(request_window(
-			Str::new_static(id),
-			Str::new_static(label),
+			sf!(id),
+			sf!(label),
 			used,
 			remaining,
 			limit,
@@ -448,7 +448,7 @@ fn parse_snapshots(body: &str, now: SystemTime) -> Option<(Option<Str>, Vec<Usag
 			root
 				.get("copilot_plan")
 				.and_then(Value::as_str)
-				.map(Str::from),
+				.map(Str::new),
 			windows,
 		)
 	})
@@ -462,9 +462,9 @@ fn parse_billing(body: &str, now: SystemTime) -> Option<Vec<UsageWindow>> {
 		period.and_then(|p| p.get("year")).and_then(Value::as_u64),
 		period.and_then(|p| p.get("month")).and_then(Value::as_u64),
 	) {
-		(Some(year), Some(month)) => Str::from(format!("{year:04}-{month:02}")),
-		(Some(year), None) => Str::from(year.to_string()),
-		_ => Str::new_static("Billing period"),
+		(Some(year), Some(month)) => sf!("{year:04}-{month:02}"),
+		(Some(year), None) => Str::new(year.to_string()),
+		_ => sf!("Billing period"),
 	};
 	let premium: Vec<&Value> = items
 		.iter()
@@ -489,8 +489,8 @@ fn parse_billing(body: &str, now: SystemTime) -> Option<Vec<UsageWindow>> {
 	let limit = (total_limit > 0.0).then_some(total_limit);
 	let mut windows = Vec::with_capacity(1 + premium.len());
 	let mut premium_window = request_window(
-		Str::new_static("copilot:premium"),
-		Str::new_static("Premium Requests"),
+		sf!("copilot:premium"),
+		sf!("Premium Requests"),
 		Some(used),
 		limit.map(|value| (value - used).max(0.0)),
 		limit,
@@ -512,8 +512,8 @@ fn parse_billing(body: &str, now: SystemTime) -> Option<Vec<UsageWindow>> {
 		let used = item.get("grossQuantity").and_then(Value::as_f64);
 		let limit = item.get("limit").and_then(Value::as_f64);
 		let mut model_window = request_window(
-			Str::from(format!("copilot:model:{model}")),
-			Str::from(format!("Model {model}")),
+			sf!("copilot:model:{model}"),
+			sf!("Model {model}"),
 			used,
 			limit.zip(used).map(|(limit, used)| (limit - used).max(0.0)),
 			limit,

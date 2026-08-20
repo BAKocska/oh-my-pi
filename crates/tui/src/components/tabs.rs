@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 
 use super::Col;
@@ -53,7 +53,7 @@ impl Tabs {
 	}
 
 	/// Appends a pane with the supplied title.
-	pub fn pane(mut self, title: impl Into<Str>, children: impl IntoChildren) -> Self {
+	pub fn pane(mut self, title: impl IntoStr, children: impl IntoChildren) -> Self {
 		let mut pane = Vec::new();
 		children.extend_children(&mut pane);
 		let pane = if pane.len() == 1 {
@@ -61,7 +61,7 @@ impl Tabs {
 		} else {
 			Cached::new(Box::new(Col::new().child(pane)))
 		};
-		self.state.titles.push(title.into());
+		self.state.titles.push(title.into_str());
 		self.state.panes.push(pane);
 		self
 	}

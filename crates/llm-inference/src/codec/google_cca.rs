@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use omp_llm_catalog::{
 	Availability, ChatCapabilities, DiscoveredModel, ModalityBits, ModelAvailability,
 	ModelCapabilities, ModelLimits, OperationBits, OperationKind, ProviderId, ReasoningCapabilities,
@@ -193,7 +193,7 @@ pub fn wrap_antigravity_request(
 		// The caller's prompt is forwarded unmodified: Cloud Code Assist accepts
 		// arbitrary system instructions on gemini-3.x and Claude routes, so no
 		// identity prompt is injected.
-		system.role = Some("user".into());
+		system.role = Some(sf!("user"));
 	}
 	if metadata.validated_tool_config {
 		request.tool_config = Some(super::gemini::GoogleToolConfig {
@@ -205,9 +205,9 @@ pub fn wrap_antigravity_request(
 	}
 	if metadata.append_forced_tool_directive {
 		request.contents.push(super::gemini::GoogleContent {
-			role:  "user".into(),
+			role:  sf!("user"),
 			parts: vec![super::gemini::GooglePart {
-				text: Some(ANTIGRAVITY_FORCED_TOOL_DIRECTIVE.into()),
+				text: Some(sf!(ANTIGRAVITY_FORCED_TOOL_DIRECTIVE)),
 				..Default::default()
 			}],
 		});
@@ -216,8 +216,8 @@ pub fn wrap_antigravity_request(
 	AntigravityRequestEnvelope {
 		model,
 		project,
-		request_type: "agent".into(),
-		user_agent: "antigravity".into(),
+		request_type: sf!("agent"),
+		user_agent: sf!("antigravity"),
 		request_id: metadata.request_id.clone(),
 		request: AntigravityGenerateContentRequest {
 			generate:   request,
@@ -256,7 +256,7 @@ impl CcaHeaders {
 	pub fn gemini_cli(model: &str, platform: &str, arch: &str) -> Self {
 		Self {
 			user_agent:      format!("GeminiCLI/0.46.0/{model} ({platform}; {arch}; terminal)").into(),
-			client_metadata: Some(GEMINI_CLI_CLIENT_METADATA.into()),
+			client_metadata: Some(sf!(GEMINI_CLI_CLIENT_METADATA)),
 			anthropic_beta:  None,
 			quota_project:   None,
 		}
@@ -272,7 +272,7 @@ impl CcaHeaders {
 		Self {
 			user_agent: fingerprint.user_agent(),
 			client_metadata: None,
-			anthropic_beta: interleaved_thinking.then(|| CLAUDE_THINKING_BETA.into()),
+			anthropic_beta: interleaved_thinking.then(|| sf!(CLAUDE_THINKING_BETA)),
 			quota_project,
 		}
 	}
@@ -303,10 +303,10 @@ pub struct AntigravityFingerprint {
 impl Default for AntigravityFingerprint {
 	fn default() -> Self {
 		Self {
-			version: Str::new_static(DEFAULT_ANTIGRAVITY_VERSION),
-			cl:      Str::new_static(DEFAULT_ANTIGRAVITY_CL),
-			os:      Str::new_static(DEFAULT_ANTIGRAVITY_OS),
-			arch:    Str::new_static(DEFAULT_ANTIGRAVITY_ARCH),
+			version: sf!(DEFAULT_ANTIGRAVITY_VERSION),
+			cl:      sf!(DEFAULT_ANTIGRAVITY_CL),
+			os:      sf!(DEFAULT_ANTIGRAVITY_OS),
+			arch:    sf!(DEFAULT_ANTIGRAVITY_ARCH),
 		}
 	}
 }
@@ -315,7 +315,7 @@ impl AntigravityFingerprint {
 	/// Renders the `User-Agent` value expected by Cloud Code Assist.
 	#[must_use]
 	pub fn user_agent(&self) -> Str {
-		omp_core::fmts!(
+		omp_core::sf!(
 			"antigravity/hub/{} (aidev_client; os_type={}; arch={}; cl={})",
 			self.version,
 			self.os,
@@ -342,7 +342,7 @@ pub fn parse_antigravity_manifest_version(manifest: &str) -> Option<Str> {
 		let Some(value) = manifest_scalar(rest) else {
 			continue;
 		};
-		return is_release_triple(value).then(|| Str::from(value));
+		return is_release_triple(value).then(|| Str::new(value));
 	}
 	None
 }
@@ -451,7 +451,7 @@ impl GoogleCcaCodec {
 			flavor:                 CcaFlavor::GeminiCli,
 			headers:                CcaHeaders {
 				user_agent:      Str::default(),
-				client_metadata: Some(GEMINI_CLI_CLIENT_METADATA.into()),
+				client_metadata: Some(sf!(GEMINI_CLI_CLIENT_METADATA)),
 				anthropic_beta:  None,
 				quota_project:   None,
 			},
@@ -468,38 +468,38 @@ impl GoogleCcaCodec {
 			},
 		);
 		let mut headers = vec![
-			RequestHeader { name: "content-type".into(), value: "application/json".into() },
-			RequestHeader { name: "accept".into(), value: "text/event-stream".into() },
-			RequestHeader { name: "user-agent".into(), value: user_agent },
+			RequestHeader::new_static("content-type", "application/json"),
+			RequestHeader::new_static("accept", "text/event-stream"),
+			RequestHeader::new(sf!("user-agent"), user_agent),
 		];
 		if let Some(value) = &self.headers.client_metadata {
-			headers.push(RequestHeader { name: "client-metadata".into(), value: value.clone() });
+			headers.push(RequestHeader::new(sf!("client-metadata"), value.clone()));
 		}
 		if let Some(value) = &self.headers.anthropic_beta {
-			headers.push(RequestHeader { name: "anthropic-beta".into(), value: value.clone() });
+			headers.push(RequestHeader::new(sf!("anthropic-beta"), value.clone()));
 		}
 		if let Some(value) = &self.headers.quota_project {
-			headers.push(RequestHeader { name: "x-goog-user-project".into(), value: value.clone() });
+			headers.push(RequestHeader::new(sf!("x-goog-user-project"), value.clone()));
 		}
 		headers.into_boxed_slice()
 	}
 
 	fn discovery_headers(&self) -> Box<[RequestHeader]> {
 		let mut headers = vec![
-			RequestHeader { name: "content-type".into(), value: "application/json".into() },
-			RequestHeader { name: "accept".into(), value: "application/json".into() },
+			RequestHeader::new_static("content-type", "application/json"),
+			RequestHeader::new_static("accept", "application/json"),
 		];
 		if !self.headers.user_agent.is_empty() {
 			headers.push(RequestHeader {
-				name:  "user-agent".into(),
+				name:  sf!("user-agent"),
 				value: self.headers.user_agent.clone(),
 			});
 		}
 		if let Some(value) = &self.headers.client_metadata {
-			headers.push(RequestHeader { name: "client-metadata".into(), value: value.clone() });
+			headers.push(RequestHeader::new(sf!("client-metadata"), value.clone()));
 		}
 		if let Some(value) = &self.headers.quota_project {
-			headers.push(RequestHeader { name: "x-goog-user-project".into(), value: value.clone() });
+			headers.push(RequestHeader::new(sf!("x-goog-user-project"), value.clone()));
 		}
 		headers.into_boxed_slice()
 	}
@@ -622,8 +622,8 @@ impl Codec for GoogleCcaCodec {
 				.into_inference(false),
 			);
 		}
-		let model: Str = target.wire_model.as_str().into();
-		let project: Str = project.as_str().into();
+		let model: Str = Str::new(target.wire_model.as_str());
+		let project: Str = Str::new(project.as_str());
 		let body = match self.flavor {
 			CcaFlavor::GeminiCli => {
 				serde_json::to_vec(&wrap_request(projection.request, model, project))
@@ -634,15 +634,15 @@ impl Codec for GoogleCcaCodec {
 						.into_inference(false)
 				})?;
 				let trajectory_id = context.session.map_or_else(
-					|| context.request_id.as_str().into(),
-					|session| session.conversation.as_str().into(),
+					|| Str::new(context.request_id.as_str()),
+					|session| Str::new(session.conversation.as_str()),
 				);
 				let metadata = AntigravityRequestMetadata {
 					trajectory_id,
-					request_id: context.request_id.as_str().into(),
+					request_id: Str::new(context.request_id.as_str()),
 					session_id: context
 						.session
-						.map(|session| session.conversation.as_str().into()),
+						.map(|session| Str::new(session.conversation.as_str())),
 					last_execution_id: None,
 					last_step_index: None,
 					model_enum: policy.model_enum.clone(),
@@ -801,7 +801,7 @@ pub fn unwrap_response(data: &[u8]) -> Result<GenerateContentResponse, GoogleCod
 /// representation.
 pub fn thought_signature_to_wire(signature: &Bytes) -> Result<Str, GoogleCodecError> {
 	std::str::from_utf8(signature)
-		.map(Str::from)
+		.map(Str::new)
 		.map_err(|error| cca_provider_error(format!("CCA thought signature is not UTF-8: {error}")))
 }
 
@@ -955,7 +955,7 @@ fn cca_discovered_rows(
 				} else {
 					ModelAvailability::Available
 				}),
-				source: "cca-fetch-available-models".into(),
+				source: sf!("cca-fetch-available-models"),
 				observed_at_ms: None,
 				updated_at_ms: None,
 				deprecated: None,
@@ -1227,7 +1227,7 @@ impl CcaVisibleTextFilter {
 }
 
 fn cca_discovery_error(kind: ErrorKind, phase: ErrorPhase, code: &'static str) -> Error {
-	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default()).code(Str::from(code))
+	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default()).code(Str::new(code))
 }
 
 fn longest_suffix_prefix(value: &str, marker: &str) -> usize {
@@ -1268,20 +1268,20 @@ fn json_object_end(input: &[u8]) -> Option<usize> {
 	None
 }
 
-fn cca_provider_error(detail: impl Into<Str>) -> GoogleCodecError {
+fn cca_provider_error(detail: impl IntoStr) -> GoogleCodecError {
 	GoogleCodecError {
 		kind:           GoogleCodecErrorKind::Upstream,
-		detail:         detail.into(),
+		detail:         detail.into_str(),
 		status:         None,
 		code:           None,
 		retry_after_ms: 0,
 	}
 }
 
-fn cca_decode_error(detail: impl Into<Str>) -> GoogleCodecError {
+fn cca_decode_error(detail: impl IntoStr) -> GoogleCodecError {
 	GoogleCodecError {
 		kind:           GoogleCodecErrorKind::Decode,
-		detail:         detail.into(),
+		detail:         detail.into_str(),
 		status:         None,
 		code:           None,
 		retry_after_ms: 0,
@@ -1298,7 +1298,7 @@ mod tests {
 	fn request_and_response_envelopes_match_oracle() {
 		let request = GenerateContentRequest {
 			contents: vec![super::super::gemini::GoogleContent {
-				role:  "user".into(),
+				role:  sf!("user"),
 				parts: vec![super::super::gemini::GooglePart {
 					text: Some("hello".into()),
 					..Default::default()
@@ -1384,7 +1384,7 @@ mod tests {
 			serde_json::from_str(r#"{"type":"object"}"#).expect("typed schema");
 		let request = GenerateContentRequest {
 			contents: vec![super::super::gemini::GoogleContent {
-				role:  "user".into(),
+				role:  sf!("user"),
 				parts: vec![super::super::gemini::GooglePart {
 					text: Some("inspect the repository".into()),
 					..Default::default()

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::{Str, USER_AGENT};
+use omp_core::{Str, USER_AGENT, sf};
 use serde::Deserialize;
 use url::Url;
 
@@ -180,7 +180,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	}
 
 	let mut rendered = RenderResult::markdown(&markdown, "crates.io");
-	rendered.notes.push(Str::from("Fetched via crates.io API"));
+	rendered.notes.push(sf!("Fetched via crates.io API"));
 	Ok(Some(rendered))
 }
 

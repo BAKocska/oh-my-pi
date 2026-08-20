@@ -61,5 +61,5 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
 			),
 		));
 	}
-	Ok(Str::from(markdown))
+	Ok(Str::new(markdown))
 }

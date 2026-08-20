@@ -143,7 +143,7 @@ impl AttemptRepetitionGuard {
 		};
 		self
 			.history
-			.push_back(Unit { normalized: Str::from(normalized), fingerprint });
+			.push_back(Unit { normalized: Str::new(normalized), fingerprint });
 		while self.history.len() > self.limits.history_limit {
 			self.history.pop_front();
 		}
@@ -357,7 +357,7 @@ pub fn recovery_record(attempt: u32, signal: &LoopSignal) -> RecoveryRecord {
 	RecoveryRecord {
 		attempt,
 		kind,
-		rule: ReasonId(Str::from(rule)),
+		rule: ReasonId(Str::new(rule)),
 		input_bytes: signal.evidence.input_bytes,
 		steps: signal.evidence.repetitions,
 	}
@@ -590,7 +590,7 @@ mod tests {
 		let make = |arguments| TurnRecoveryObservation {
 			tool_exchanges:        vec![ToolExchangeObservation {
 				call_id:   ToolCallId::new("ignored"),
-				name:      Str::from("search"),
+				name:      sf!("search"),
 				arguments: OpaqueJson::new(arguments),
 				result:    OpaqueJson::new(json!({"ok":true})),
 				is_error:  false,

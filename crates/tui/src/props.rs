@@ -2,7 +2,7 @@
 
 use std::{fmt, str::FromStr, time::Duration};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use strum::{Display, EnumIter, EnumString};
 
 use crate::{
@@ -621,14 +621,14 @@ impl Props {
 	}
 
 	/// Returns this collection with a custom property assigned.
-	pub fn with_custom(mut self, name: impl Into<Str>, value: impl Into<PropValue>) -> Self {
+	pub fn with_custom(mut self, name: impl IntoStr, value: impl Into<PropValue>) -> Self {
 		self.set_custom(name, value);
 		self
 	}
 
 	/// Assigns or replaces a custom property.
-	pub fn set_custom(&mut self, name: impl Into<Str>, value: impl Into<PropValue>) {
-		let name = name.into();
+	pub fn set_custom(&mut self, name: impl IntoStr, value: impl Into<PropValue>) {
+		let name = name.into_str();
 		let value = value.into();
 		if let Some((_, stored)) = self.rest.iter_mut().find(|(key, _)| key == &name) {
 			*stored = value;
@@ -1023,18 +1023,18 @@ fn display_value(value: &PropValue) -> Str {
 		PropValue::U16(value) => Str::from(value.to_string()),
 		PropValue::F32(value) => Str::from(value.to_string()),
 		PropValue::I64(value) => Str::from(value.to_string()),
-		PropValue::Color(Color::Default) => Str::new_static("default"),
+		PropValue::Color(Color::Default) => sf!("default"),
 		PropValue::Color(Color::Indexed(value)) => Str::from(value.to_string()),
 		PropValue::Color(Color::Rgb(r, g, b)) => Str::from(format!("#{r:02x}{g:02x}{b:02x}")),
 		PropValue::Token(value) | PropValue::Gradient(value) | PropValue::Str(value) => value.clone(),
-		PropValue::Easing(value) => Str::new_static((*value).into()),
+		PropValue::Easing(value) => sf!((*value).into()),
 		PropValue::Dim(Dim::Cells(value)) => Str::from(value.to_string()),
 		PropValue::Dim(Dim::Pct(value)) => Str::from(format!("{value}%")),
-		PropValue::Border(value) => Str::new_static((*value).into()),
-		PropValue::Align(value) => Str::new_static((*value).into()),
-		PropValue::VAlign(value) => Str::new_static((*value).into()),
-		PropValue::Justify(value) => Str::new_static((*value).into()),
-		PropValue::Wrap(value) => Str::new_static((*value).into()),
+		PropValue::Border(value) => sf!((*value).into()),
+		PropValue::Align(value) => sf!((*value).into()),
+		PropValue::VAlign(value) => sf!((*value).into()),
+		PropValue::Justify(value) => sf!((*value).into()),
+		PropValue::Wrap(value) => sf!((*value).into()),
 	}
 }
 

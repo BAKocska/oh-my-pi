@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use html_to_markdown_rs::{ConversionOptions, PreprocessingOptions, TierStrategy};
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use quick_xml::{Reader, XmlVersion, events::Event};
 
 use super::{
@@ -82,7 +82,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<(Str, Option<Str>), MarkitError> {
 	let opf_xml = read_xml_member(&mut archive, &opf_path)?
 		.ok_or_else(|| failure("Invalid EPUB: missing content.opf"))?;
 	let package = parse_package(&opf_xml, &opf_path)?;
-	let title = package.metadata.title.clone().map(Str::from);
+	let title = package.metadata.title.clone().map(Str::new);
 
 	let mut sections = metadata_sections(&package.metadata);
 	let options = epub_html_options();
@@ -113,7 +113,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<(Str, Option<Str>), MarkitError> {
 		return Err(failure("Invalid EPUB: no spine document could be read"));
 	}
 
-	Ok((Str::from(sections.join("\n\n").trim().to_owned()), title))
+	Ok((Str::new(sections.join("\n\n").trim().to_owned()), title))
 }
 
 fn epub_html_options() -> ConversionOptions {
@@ -634,7 +634,7 @@ fn local(name: &str) -> &str {
 	name.rsplit_once(':').map_or(name, |(_, local)| local)
 }
 
-fn failure(message: impl Into<Str>) -> MarkitError {
+fn failure(message: impl IntoStr) -> MarkitError {
 	MarkitError::conversion(FORMAT, message)
 }
 

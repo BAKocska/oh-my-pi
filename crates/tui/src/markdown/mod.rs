@@ -1,6 +1,6 @@
 //! Width-aware Markdown rendering into styled terminal lines.
 
-use omp_core::{Str, StrMut, fmts};
+use omp_core::{Str, StrMut, sf};
 use smallvec::SmallVec;
 
 use crate::{
@@ -656,9 +656,9 @@ fn render_fenced_code(
 	};
 
 	let top = if language.is_empty() {
-		Str::new_static("```")
+		sf!("```")
 	} else {
-		fmts!("```{language}")
+		sf!("```{language}")
 	};
 	clipped_row(sink, width, theme.code_border, top.as_str());
 
@@ -767,7 +767,7 @@ fn bare_math_end(lines: &[&str], index: usize) -> Option<usize> {
 	if !crate::latex::is_bare_math_environment(environment) {
 		return None;
 	}
-	let end_token = fmts!("\\end{{{environment}}}");
+	let end_token = sf!("\\end{{{environment}}}");
 	for (offset, candidate) in lines[index..].iter().enumerate() {
 		if offset > 0 && candidate.trim().is_empty() {
 			return None;
@@ -942,9 +942,9 @@ fn render_list(
 		let marker_text = if ordered {
 			let value = ordinal;
 			ordinal = ordinal.saturating_add(1);
-			fmts!("{value}. ")
+			sf!("{value}. ")
 		} else {
-			Str::new_static("- ")
+			sf!("- ")
 		};
 		let indent = depth.saturating_mul(2);
 		let mut first_prefix = Prefix::default();
@@ -1088,9 +1088,9 @@ fn render_list_fenced_code(
 	};
 
 	let top = if language.is_empty() {
-		Str::new_static("```")
+		sf!("```")
 	} else {
-		fmts!("```{language}")
+		sf!("```{language}")
 	};
 	{
 		let clipped = (&mut *sink).clip(width, None);
@@ -1499,7 +1499,7 @@ fn normalize_html_chunk(raw: &str, output: &mut StrMut) {
 							}
 							if let Some(list) = lists.last_mut() {
 								if list.ordered {
-									output.push_str(fmts!("{}. ", list.next).as_str());
+									output.push_str(sf!("{}. ", list.next).as_str());
 									list.next = list.next.saturating_add(1);
 								} else {
 									output.push_str("- ");

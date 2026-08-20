@@ -6,16 +6,16 @@ use std::{
 	mem::size_of,
 };
 
-use omp_core::{ArtifactDigest, Provenance, Str};
+use omp_core::{ArtifactDigest, Provenance, sf};
 
 fn provenance(generation: u64) -> Provenance {
 	Provenance::new(
-		Str::new_static("publisher"),
-		Str::new_static("example.extension"),
-		Str::new_static("1.2.3"),
+		sf!("publisher"),
+		sf!("example.extension"),
+		sf!("1.2.3"),
 		ArtifactDigest::new([0xabu8; 32]),
-		Str::new_static("user"),
-		Str::new_static("trusted"),
+		sf!("user"),
+		sf!("trusted"),
 		generation,
 	)
 }

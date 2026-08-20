@@ -236,12 +236,12 @@ mod tests {
 		let original_registry = state.snapshot().registry.clone();
 		let replacement_registry = Arc::new(Registry::new());
 		state.update(|snapshot| {
-			snapshot.enabled_tools = Arc::from([Str::from("read")]);
+			snapshot.enabled_tools = Arc::from([sf!("read")]);
 			snapshot.registry = replacement_registry.clone();
 		});
 		let published = state.update(|snapshot| snapshot.defer_interrupts = true);
 
-		assert_eq!(published.enabled_tools.as_ref(), &[Str::from("read")]);
+		assert_eq!(published.enabled_tools.as_ref(), &[sf!("read")]);
 		assert!(!Arc::ptr_eq(&original_registry, &published.registry));
 		assert!(Arc::ptr_eq(&replacement_registry, &published.registry));
 		assert!(published.defer_interrupts);

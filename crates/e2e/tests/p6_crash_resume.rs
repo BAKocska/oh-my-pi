@@ -39,7 +39,7 @@ use omp_app::{
 	endpoint::LocalEndpoint,
 	envd::{server::EnvServer, worker::ExtHostConfig},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_e2e::support::{
 	AllowAdmission, Scratch, ScriptedGateway, install_omp_binary_env, omp_binary,
 };
@@ -80,7 +80,7 @@ fn file_write_effects() -> Effects {
 	Effects {
 		documents: Some(DocEffects {
 			read:        false,
-			write_globs: std::iter::once(Str::new_static("**")).collect(),
+			write_globs: std::iter::once(sf!("**")).collect(),
 		}),
 		exec:      None,
 		inference: None,
@@ -340,7 +340,7 @@ async fn rpc_host(
 	if first {
 		fake.extend([FakeScript::chat(vec![
 			Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
-			Ok(ChatEvent::TextDelta { index: 0, text: Str::from("the durable RPC outcome") }),
+			Ok(ChatEvent::TextDelta { index: 0, text: sf!("the durable RPC outcome") }),
 			Ok(ChatEvent::Completed(Completion {
 				reason:  FinishReason::Stop,
 				blocks:  1,
@@ -360,7 +360,7 @@ async fn rpc_host(
 			builder
 				.register_unavailable(RouteUnavailable {
 					route:     candidate.id.clone(),
-					reason:    ReasonId(Str::from("p6-route-unavailable")),
+					reason:    ReasonId(sf!("p6-route-unavailable")),
 					operation: None,
 				})
 				.expect("register unavailable route")
@@ -554,7 +554,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 
 	let script = FakeScript::chat(vec![
 		Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
-		Ok(ChatEvent::TextDelta { index: 0, text: Str::from("binary resume outcome") }),
+		Ok(ChatEvent::TextDelta { index: 0, text: sf!("binary resume outcome") }),
 		Ok(ChatEvent::Completed(Completion {
 			reason:  FinishReason::Stop,
 			blocks:  1,
@@ -646,9 +646,9 @@ fn binary_gateway_tools() -> Arc<Registry> {
 		registry
 			.register_worker(
 				ToolSpec {
-					name:            Str::new_static(name),
-					rev:             Rev { family: Str::new_static("fixture"), n: 1 },
-					description:     Str::new_static("binary crash-resume fixture"),
+					name:            sf!(name),
+					rev:             Rev { family: sf!("fixture"), n: 1 },
+					description:     sf!("binary crash-resume fixture"),
 					schema:          Bytes::from_static(br#"{"type":"object"}"#),
 					constraint:      Constraint::None,
 					effects:         Effects::empty(),
@@ -1133,11 +1133,8 @@ async fn batch_child(root: &Path, create: bool) {
 			environment_registry,
 			ExtHostConfig::new(
 				omp_binary().expect("worker-capable host binary"),
-				omp_core::Principal::new(
-					omp_core::Str::new_static("e2e-tester"),
-					omp_core::Str::new_static("E2E Tester"),
-				),
-				omp_core::Str::new_static("p6-session"),
+				omp_core::Principal::new(omp_core::sf!("e2e-tester"), omp_core::sf!("E2E Tester")),
+				omp_core::sf!("p6-session"),
 				1,
 			),
 		)
@@ -1562,19 +1559,11 @@ const fn caps() -> CapsBase {
 }
 
 const fn core_claims() -> Claims {
-	Claims {
-		precedence: Precedence::CORE,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 }
 
 const fn worker_claims() -> Claims {
-	Claims {
-		precedence: Precedence::DEFAULT,
-		claimant:   Str::new_static("test/worker"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::DEFAULT, claimant: sf!("test/worker"), replaces: None }
 }
 
 fn header(root: &Path, id: &str) -> Header {

@@ -21,7 +21,7 @@ use crate::dap_protocol::{DapInbound, DapProtocol, DapProtocolError};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Stable DAP lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,8 +230,8 @@ pub struct DapSession {
 	capabilities:        RwLock<Value>,
 	output:              Mutex<VecDeque<u8>>,
 	last_activity_ms:    AtomicU64,
-	parent:              Mutex<Option<Weak<DapSession>>>,
-	children:            Mutex<Vec<Weak<DapSession>>>,
+	parent:              Mutex<Option<Weak<Self>>>,
+	children:            Mutex<Vec<Weak<Self>>>,
 	breakpoint_mutation: AsyncMutex<()>,
 	source_breakpoints:  Mutex<BTreeMap<Str, Vec<Value>>>,
 	handler:             Arc<dyn DapReverseRequestHandler>,
@@ -310,7 +310,7 @@ impl DapSession {
 			loop {
 				let Some(session) = weak.upgrade() else { break };
 				tokio::select! {
-					_ = session.protocol.closed() => {
+					() = session.protocol.closed() => {
 						*session.state.lock() = DapSessionState::Terminated;
 						break;
 					},
@@ -365,13 +365,12 @@ impl DapSession {
 		let mut state = self.state.lock();
 		let valid = matches!(
 			(*state, to),
-			(DapSessionState::Launching, DapSessionState::Configuring)
+			(DapSessionState::Launching, DapSessionState::Configuring | DapSessionState::Terminated)
 				| (
 					DapSessionState::Configuring,
 					DapSessionState::Running | DapSessionState::Stopped | DapSessionState::Terminated
 				) | (DapSessionState::Running, DapSessionState::Stopped | DapSessionState::Terminated)
 				| (DapSessionState::Stopped, DapSessionState::Running | DapSessionState::Terminated)
-				| (DapSessionState::Launching, DapSessionState::Terminated)
 		);
 		if !valid {
 			return Err(DapSessionError::InvalidTransition { from: *state, to });
@@ -598,6 +597,8 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]
@@ -612,8 +613,8 @@ mod tests {
 		let (stream, _) = tokio::io::duplex(64);
 		let (reader, writer) = tokio::io::split(stream);
 		let session = DapSession {
-			id:                  Str::new_static("test"),
-			adapter:             Str::new_static("test"),
+			id:                  sf!("test"),
+			adapter:             sf!("test"),
 			protocol:            DapProtocol::from_streams(reader, writer),
 			state:               Mutex::new(DapSessionState::Running),
 			capabilities:        RwLock::new(Value::Null),

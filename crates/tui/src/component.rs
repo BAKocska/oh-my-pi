@@ -12,7 +12,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 
 use crate::{
@@ -1613,8 +1613,8 @@ pub struct ElementsBuilder {
 
 impl ElementsBuilder {
 	/// Registers or replaces the factory for `name`.
-	pub fn with(mut self, name: impl Into<Str>, factory: impl ElementFactory + 'static) -> Self {
-		let name = name.into();
+	pub fn with(mut self, name: impl IntoStr, factory: impl ElementFactory + 'static) -> Self {
+		let name = name.into_str();
 		if let Some((_, stored)) = self
 			.factories
 			.iter_mut()

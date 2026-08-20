@@ -189,15 +189,15 @@ impl WhisperAdapter {
 				text.push_str(segment_text);
 				if options.timestamps {
 					segments.push(TranscriptionSegment {
-						text:                  segment_text.into(),
+						text:                  Str::new(segment_text),
 						start:                 whisper_timestamp(segment.start_timestamp()),
 						end:                   whisper_timestamp(segment.end_timestamp()),
 						no_speech_probability: segment.no_speech_probability(),
 					});
 				}
 			}
-			let language = whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(Into::into);
-			Ok((Str::from(text.trim()), segments, language))
+			let language = whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(Str::new);
+			Ok((Str::new(text.trim()), segments, language))
 		})?;
 		Ok(Transcription { text, segments, language, receipt })
 	}

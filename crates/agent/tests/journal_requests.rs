@@ -9,7 +9,7 @@ use omp_agent::{
 	EntryKindDecl, EntryKindError, Journal, JournalAuthor, JournalError, JournalGenerations,
 	JournalRequestStamp, PendingCustomEntry, SessionStateWatchEvent, SessionStateWatchTerminal,
 };
-use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str, sf};
 use omp_storage::{
 	state::{DurableRequest, GenerationFence, StateAuthority, StateRevision},
 	transcript::{
@@ -32,21 +32,21 @@ fn path(name: &str) -> PathBuf {
 fn header() -> Header {
 	Header {
 		v:       4,
-		id:      SessionId(Str::from("session")),
+		id:      SessionId(sf!("session")),
 		created: 1,
 		cwd:     PathBuf::from("/tmp"),
 	}
 }
 fn author(extension: &str, generation: u64) -> JournalAuthor {
 	JournalAuthor {
-		principal:  Principal::new(Str::from("os:test"), Str::from("Test User")),
+		principal:  Principal::new(sf!("os:test"), sf!("Test User")),
 		provenance: Provenance::new(
-			Str::from("publisher"),
-			Str::from(extension),
-			Str::from("1.0.0"),
+			sf!("publisher"),
+			Str::new(extension),
+			sf!("1.0.0"),
 			ArtifactDigest::new([7; 32]),
-			Str::from("workspace"),
-			Str::from("trusted"),
+			sf!("workspace"),
+			sf!("trusted"),
 			generation,
 		),
 	}
@@ -54,8 +54,8 @@ fn author(extension: &str, generation: u64) -> JournalAuthor {
 
 fn stamp(key: &str, generation: u64) -> JournalRequestStamp {
 	JournalRequestStamp {
-		request_id:         Str::from(format!("request-{key}")),
-		idempotency_key:    Str::from(key),
+		request_id:         sf!("request-{key}"),
+		idempotency_key:    Str::new(key),
 		host_generation:    generation,
 		session_generation: 3,
 	}
@@ -63,8 +63,8 @@ fn stamp(key: &str, generation: u64) -> JournalRequestStamp {
 
 fn entry(value: i64) -> PendingCustomEntry {
 	PendingCustomEntry {
-		kind:    Str::from("dev.example.fact"),
-		rev:     Str::from("v.2"),
+		kind:    sf!("dev.example.fact"),
+		rev:     sf!("v.2"),
 		data:    Some(to_raw_value(&json!({ "value": value })).expect("raw JSON")),
 		context: None,
 		display: None,
@@ -130,14 +130,14 @@ fn atomic_replay_returns_recorded_indexes_and_core_stamps_authorship() {
 }
 fn state_authority() -> StateAuthority {
 	StateAuthority::new_core(
-		Principal::new(Str::from("os:test"), Str::from("Test User")),
+		Principal::new(sf!("os:test"), sf!("Test User")),
 		Provenance::new(
-			Str::from("publisher"),
-			Str::from("dev.example"),
-			Str::from("1.0.0"),
+			sf!("publisher"),
+			sf!("dev.example"),
+			sf!("1.0.0"),
 			ArtifactDigest::new([7; 32]),
-			Str::from("workspace"),
-			Str::from("trusted"),
+			sf!("workspace"),
+			sf!("trusted"),
 			7,
 		),
 		"dev.example",
@@ -154,26 +154,18 @@ fn session_state_cas_uses_physical_journal_revision_and_replays() {
 	let mut journal = Journal::create(&path, &header()).expect("create journal");
 	journal.set_generations(JournalGenerations { host: 7, session: 3 });
 	let authority = state_authority();
-	let request =
-		DurableRequest::new("state-request", Some(Str::from("state-key")), GenerationFence {
-			host:    7,
-			session: 3,
-		})
-		.expect("durable request");
+	let request = DurableRequest::new("state-request", Some(sf!("state-key")), GenerationFence {
+		host:    7,
+		session: 3,
+	})
+	.expect("durable request");
 	let value = to_raw_value(&json!({ "enabled": true })).expect("state value");
 	let installed = journal
-		.compare_exchange_session_state(
-			10,
-			&authority,
-			Str::from("feature"),
-			None,
-			value.clone(),
-			&request,
-		)
+		.compare_exchange_session_state(10, &authority, sf!("feature"), None, value.clone(), &request)
 		.expect("install state");
 	assert_eq!(installed.revision, StateRevision::new(1));
 	let replayed = journal
-		.compare_exchange_session_state(11, &authority, Str::from("feature"), None, value, &request)
+		.compare_exchange_session_state(11, &authority, sf!("feature"), None, value, &request)
 		.expect("replay state");
 	assert_eq!(replayed.revision, installed.revision);
 	assert_eq!(
@@ -185,14 +177,14 @@ fn session_state_cas_uses_physical_journal_revision_and_replays() {
 		installed.revision,
 	);
 	let watch = journal
-		.subscribe_session_state(&authority, Str::from("feature"), None)
+		.subscribe_session_state(&authority, sf!("feature"), None)
 		.expect("subscribe state");
 	assert!(matches!(
 		watch.recv().expect("catch-up value"),
 		SessionStateWatchEvent::Value(value) if value.revision == installed.revision
 	));
 	let request_two =
-		DurableRequest::new("state-request-two", Some(Str::from("state-key-two")), GenerationFence {
+		DurableRequest::new("state-request-two", Some(sf!("state-key-two")), GenerationFence {
 			host:    7,
 			session: 3,
 		})
@@ -201,7 +193,7 @@ fn session_state_cas_uses_physical_journal_revision_and_replays() {
 		.compare_exchange_session_state(
 			12,
 			&authority,
-			Str::from("feature"),
+			sf!("feature"),
 			Some(installed.revision),
 			to_raw_value(&json!({ "enabled": false })).expect("second value"),
 			&request_two,
@@ -213,35 +205,35 @@ fn session_state_cas_uses_physical_journal_revision_and_replays() {
 	));
 
 	let lagged = journal
-		.subscribe_session_state(&authority, Str::from("feature"), Some(second.revision))
+		.subscribe_session_state(&authority, sf!("feature"), Some(second.revision))
 		.expect("lag subscription");
-	let request_three = DurableRequest::new(
-		"state-request-three",
-		Some(Str::from("state-key-three")),
-		GenerationFence { host: 7, session: 3 },
-	)
-	.expect("third durable request");
+	let request_three =
+		DurableRequest::new("state-request-three", Some(sf!("state-key-three")), GenerationFence {
+			host:    7,
+			session: 3,
+		})
+		.expect("third durable request");
 	let third = journal
 		.compare_exchange_session_state(
 			13,
 			&authority,
-			Str::from("feature"),
+			sf!("feature"),
 			Some(second.revision),
 			to_raw_value(&json!({ "n": 3 })).expect("third value"),
 			&request_three,
 		)
 		.expect("third state");
-	let request_four = DurableRequest::new(
-		"state-request-four",
-		Some(Str::from("state-key-four")),
-		GenerationFence { host: 7, session: 3 },
-	)
-	.expect("fourth durable request");
+	let request_four =
+		DurableRequest::new("state-request-four", Some(sf!("state-key-four")), GenerationFence {
+			host:    7,
+			session: 3,
+		})
+		.expect("fourth durable request");
 	let fourth = journal
 		.compare_exchange_session_state(
 			14,
 			&authority,
-			Str::from("feature"),
+			sf!("feature"),
 			Some(third.revision),
 			to_raw_value(&json!({ "n": 4 })).expect("fourth value"),
 			&request_four,
@@ -258,7 +250,7 @@ fn session_state_cas_uses_physical_journal_revision_and_replays() {
 		}) if revision == third.revision
 	));
 	let closed = journal
-		.subscribe_session_state(&authority, Str::from("feature"), Some(fourth.revision))
+		.subscribe_session_state(&authority, sf!("feature"), Some(fourth.revision))
 		.expect("close subscription");
 	drop(journal);
 	assert!(matches!(
@@ -318,7 +310,7 @@ fn pending_turn_target_and_generation_guards_run_before_staging() {
 
 	journal
 		.start_turn(3, TurnStart {
-			turn_id:            Str::from("turn"),
+			turn_id:            sf!("turn"),
 			item_events:        Vec::new(),
 			prompt_hash:        [0; 32],
 			prompt_head_events: Vec::new(),
@@ -342,8 +334,8 @@ fn pending_turn_target_and_generation_guards_run_before_staging() {
 
 fn transition(id: &str, phase: InvocationPhase) -> InvocationTransition {
 	InvocationTransition {
-		invocation_id: Str::from(id),
-		call_id: CallId(Str::from("call")),
+		invocation_id: Str::new(id),
+		call_id: CallId(sf!("call")),
 		phase,
 		requested_args: (phase == InvocationPhase::ArgsFinalized)
 			.then(|| to_raw_value(&json!({ "x": 1 })).expect("raw args")),

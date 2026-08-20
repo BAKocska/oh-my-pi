@@ -301,7 +301,7 @@ fn is_metadata_name(name: &str) -> bool {
 	matches!(name, "/" | "//" | "/SYM64/" | "__.SYMDEF" | "__.SYMDEF SORTED")
 }
 
-fn check_index_size(actual: u64, limits: Limits) -> Result<()> {
+const fn check_index_size(actual: u64, limits: Limits) -> Result<()> {
 	if actual > limits.index_size {
 		return Err(Error::IndexTooLarge { actual, limit: limits.index_size });
 	}
@@ -332,7 +332,7 @@ fn read_exact_at(
 }
 
 /// `Raw` storage is served by the archive core.
-pub(crate) fn read_entry_to<W: Write>(
+pub(crate) const fn read_entry_to<W: Write>(
 	_source: &mut (impl Read + Seek),
 	_entry: &Entry,
 	_output: &mut W,

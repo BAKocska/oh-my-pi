@@ -11,7 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -120,16 +120,16 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 	Some(Credential {
 		token:      Zeroizing::new(token),
 		expires_at: envelope.expires_at,
-		project_id: Str::from(project),
+		project_id: Str::new(project),
 		account_id: envelope
 			.account_id
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 		email:      envelope
 			.email
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
-		base_url:   Str::from(base.trim_end_matches('/')),
+			.map(Str::new),
+		base_url:   Str::new(base.trim_end_matches('/')),
 	})
 }
 
@@ -193,7 +193,7 @@ async fn fetch_google_antigravity_usage_until(
 			..UsageAccountMetadata::default()
 		},
 		plan,
-		source_label: Some(Str::new_static("daily-cloudcode-pa")),
+		source_label: Some(sf!("daily-cloudcode-pa")),
 		notes: Box::default(),
 		reset_credits: None,
 		windows,
@@ -395,12 +395,12 @@ fn parse_response(
 			let (window_id, duration) = classify(info, hint, resets_at, now);
 			let key = format!("{counter_key}|{tier}|{window_id}");
 			let candidate = Candidate {
-				counter: Str::from(if counter_name.is_empty() {
+				counter: Str::new(if counter_name.is_empty() {
 					counter_key
 				} else {
 					counter_name
 				}),
-				tier: Str::from(tier),
+				tier: Str::new(tier),
 				window_id,
 				duration,
 				remaining,
@@ -431,23 +431,24 @@ fn parse_response(
 			let counter_key = candidate.counter.to_ascii_lowercase();
 			let used = (1.0 - candidate.remaining) * 100.0;
 			let label = if candidate.counter == "default" {
-				Str::new_static("Usage")
+				sf!("Usage")
 			} else {
-				Str::from(format!("Usage ({})", candidate.counter))
+				sf!("Usage ({})", candidate.counter)
 			};
-			let scope = Str::from(format!(
+			let scope = sf!(
 				"counter={counter_key};tier={};project={project};account={};window={}",
 				candidate.tier,
 				account.unwrap_or(""),
 				candidate.window_id
-			));
+			);
 			UsageWindow {
-				id:          Str::from(format!(
+				id:          sf!(
 					"google-antigravity:{counter_key}:{}:{}",
-					candidate.tier, candidate.window_id
-				)),
+					candidate.tier,
+					candidate.window_id
+				),
 				kind:        UsageWindowKind::Quota,
-				dimension:   Str::new_static("quota"),
+				dimension:   sf!("quota"),
 				label:       Some(label),
 				scope:       Some(scope),
 				amount:      UsageAmount {

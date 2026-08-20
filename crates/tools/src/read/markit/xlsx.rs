@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, btree_map::Entry};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use quick_xml::events::Event;
 
 use super::{
@@ -74,7 +74,7 @@ struct CellRange {
 
 /// Converts an XLSX workbook into one Markdown table per non-empty worksheet.
 pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
-	convert_inner(bytes).map(Str::from).map_err(failure)
+	convert_inner(bytes).map(Str::new).map_err(failure)
 }
 
 fn convert_inner(bytes: &[u8]) -> Result<String, String> {
@@ -882,7 +882,7 @@ fn xml_error(error: impl std::fmt::Display) -> String {
 	format!("invalid XML: {error}")
 }
 
-fn failure(error: impl Into<Str>) -> MarkitError {
+fn failure(error: impl IntoStr) -> MarkitError {
 	MarkitError::conversion(FORMAT, error)
 }
 

@@ -32,7 +32,7 @@ use omp_app::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_e2e::support::{AllowAdmission, install_omp_binary_env, omp_binary};
 use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_proto::{
@@ -57,7 +57,7 @@ fn file_write_effects() -> Effects {
 	Effects {
 		documents: Some(DocEffects {
 			read:        false,
-			write_globs: [Str::new_static("**")].into_iter().collect(),
+			write_globs: [sf!("**")].into_iter().collect(),
 		}),
 		exec:      None,
 		inference: None,
@@ -125,8 +125,8 @@ OMP_TOOLS = [
 fn test_config() -> ExtHostConfig {
 	ExtHostConfig::new(
 		omp_binary().expect("resolve worker-capable omp binary"),
-		Principal::new(Str::new_static("e2e-tester"), Str::new_static("E2E Tester")),
-		Str::new_static("p2-session"),
+		Principal::new(sf!("e2e-tester"), sf!("E2E Tester")),
+		sf!("p2-session"),
 		1,
 	)
 }
@@ -134,15 +134,15 @@ fn test_config() -> ExtHostConfig {
 fn test_manifest(key: &HostKey) -> ExtensionManifest {
 	ExtensionManifest::new(
 		Provenance::new(
-			Str::new_static("test-publisher"),
+			sf!("test-publisher"),
 			key.extension().clone(),
-			Str::new_static("1.0.0"),
+			sf!("1.0.0"),
 			ArtifactDigest::new([0; 32]),
 			key.layer().clone(),
 			key.tier().clone(),
 			1,
 		),
-		Str::new_static("cancel_matrix_tools"),
+		sf!("cancel_matrix_tools"),
 		[],
 		DeclarationSet::new(
 			[
@@ -217,9 +217,9 @@ impl CancellableSleeper {
 	fn new(started: PathBuf, marker: PathBuf, dropped: Arc<AtomicBool>) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static("matrix_sleeper"),
-				rev:             Rev { family: Str::new_static("e2e"), n: 1 },
-				description:     Str::new_static("sleeps before attempting a marker mutation"),
+				name:            sf!("matrix_sleeper"),
+				rev:             Rev { family: sf!("e2e"), n: 1 },
+				description:     sf!("sleeps before attempting a marker mutation"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
 				effects:         file_write_effects(),
@@ -294,11 +294,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 		.register(
 			CancellableSleeper::new(started.clone(), marker.clone(), Arc::clone(&dropped)),
 			Presentation::Slot,
-			Claims {
-				precedence: Precedence::CORE,
-				claimant:   Str::new_static("omp/core"),
-				replaces:   None,
-			},
+			Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None },
 		)
 		.expect("register cancellable sleeper");
 	let worker = test_config();
@@ -321,7 +317,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 	assert_eq!(
 		decode_verdict(&skipped_terminal),
 		CallOutcome::<Value, Value>::aborted(Abort::Skipped {
-			reason: Str::new_static("invocation cancelled before argument commitment"),
+			reason: sf!("invocation cancelled before argument commitment"),
 		})
 	);
 	assert_eq!(
@@ -361,7 +357,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 	assert_eq!(
 		decode_verdict(&interrupted_terminal),
 		CallOutcome::<Value, Value>::aborted(Abort::Interrupted {
-			reason: Str::new_static("invocation cancelled by client"),
+			reason: sf!("invocation cancelled by client"),
 		})
 	);
 	assert_eq!(
@@ -509,7 +505,7 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 
 	// This is deliberately weaker than cancellation. The worker cannot read the
 	// protocol frame while ctypes holds its thread, and SIGINT is ignored.
-	within(EVENT_DEADLINE, blocked.interrupt(Str::new_static("courtesy interpreter interrupt")))
+	within(EVENT_DEADLINE, blocked.interrupt(sf!("courtesy interpreter interrupt")))
 		.await
 		.expect("send courtesy worker interrupt");
 	tokio::time::sleep(hard_kill_grace + Duration::from_millis(75)).await;

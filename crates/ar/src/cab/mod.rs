@@ -94,24 +94,24 @@ pub(crate) fn read_entries(
 		return Err(Error::InvalidArchive("CAB files exist without a folder"));
 	}
 
-	let mut folder_reserve_size = 0_u64;
-	let mut data_reserve_size = 0_usize;
-	let mut folder_table_offset = FIXED_HEADER_SIZE;
-	if flags & 0x0004 != 0 {
+	let (folder_reserve_size, data_reserve_size, folder_table_offset) = if flags & 0x0004 != 0 {
 		let reserve_end = FIXED_HEADER_SIZE
 			.checked_add(4)
 			.ok_or(Error::InvalidArchive("CAB reserve header range overflows"))?;
 		let reserve = read_exact_range(source, FIXED_HEADER_SIZE, reserve_end, cabinet_size)?;
 		let header_reserve_size = u64::from(le_u16(&reserve, 0)?);
-		folder_reserve_size = u64::from(reserve[2]);
-		data_reserve_size = usize::from(reserve[3]);
+		let folder_reserve_size = u64::from(reserve[2]);
+		let data_reserve_size = usize::from(reserve[3]);
 		if header_reserve_size > 60_000 {
 			return Err(Error::InvalidArchive("CAB CFHEADER reserve area exceeds 60000 bytes"));
 		}
-		folder_table_offset = reserve_end
+		let folder_table_offset = reserve_end
 			.checked_add(header_reserve_size)
 			.ok_or(Error::InvalidArchive("CAB reserve area overflows"))?;
-	}
+		(folder_reserve_size, data_reserve_size, folder_table_offset)
+	} else {
+		(0, 0, FIXED_HEADER_SIZE)
+	};
 	let folder_record_size = 8_u64 + folder_reserve_size;
 	let folder_table_end = folder_table_offset
 		.checked_add(
@@ -211,7 +211,7 @@ pub(crate) fn read_entries(
 		let raw_name = decode_name(name_bytes, attributes & ATTRIBUTE_UTF8_NAME != 0)?;
 		if size > limits.max_member_size() {
 			return Err(Error::MemberTooLarge {
-				path:   raw_name.clone(),
+				path:   raw_name,
 				actual: size,
 				limit:  limits.max_member_size(),
 			});
@@ -312,7 +312,7 @@ pub(crate) fn read_entries(
 }
 
 /// Reports deferred unsupported CAB folder methods during member extraction.
-pub(crate) fn read_entry_to<W: Write>(
+pub(crate) const fn read_entry_to<W: Write>(
 	_source: &mut (impl Read + Seek),
 	entry: &Entry,
 	_output: &mut W,
@@ -491,11 +491,10 @@ fn le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 
 fn cab_checksum(bytes: &[u8], initial: u32) -> u32 {
 	let mut checksum = initial;
-	let mut chunks = bytes.chunks_exact(4);
-	for chunk in &mut chunks {
-		checksum ^= u32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
+	let (chunks, remaining) = bytes.as_chunks::<4>();
+	for chunk in chunks {
+		checksum ^= u32::from_le_bytes(*chunk);
 	}
-	let remaining = chunks.remainder();
 	let remainder = match remaining {
 		[a, b, c] => u32::from(*a) << 16 | u32::from(*b) << 8 | u32::from(*c),
 		[a, b] => u32::from(*a) << 8 | u32::from(*b),

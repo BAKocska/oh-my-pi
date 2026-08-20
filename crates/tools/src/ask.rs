@@ -4,7 +4,7 @@ use std::{fmt, sync::Arc};
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, Constraint, Effects, Ev, IncomingParams, ParamError, Part,
 	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -150,9 +150,9 @@ pub fn headless_tool() -> Ask {
 }
 fn spec() -> ToolSpec {
 	ToolSpec {
-		name:            Str::new_static("ask"),
+		name:            sf!("ask"),
 		rev:             Rev { family: Str::new(""), n: 1 },
-		description:     Str::new_static(
+		description:     sf!(
 			"Asks the user one or more picker questions. Options may include descriptions and \
 			 previews; use `multi` for multi-selection and `recommended` for headless defaults.",
 		),
@@ -188,7 +188,7 @@ impl Tool for Ask {
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
 		vec![Part::Text {
-			text: Str::from(match view {
+			text: Str::new(match view {
 				Ok(payload) => serde_json::to_string(&payload.answers).expect("answers serialize"),
 				Err(fault) => fault.to_string(),
 			}),
@@ -236,7 +236,7 @@ fn headless_answer(question: &Question) -> Result<Answer, Fault> {
 	})
 }
 fn invalid(message: &str) -> Fault {
-	Fault::Invalid { message: Str::from(message) }
+	Fault::Invalid { message: Str::new(message) }
 }
 fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
@@ -262,9 +262,9 @@ fn commit_event(error: omp_tool::CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"questions":[...] }"#)),
+		example:  Some(sf!(r#"{{"questions":[...] }}"#)),
 		found:    Some(message),
 	}
 }
@@ -274,15 +274,15 @@ mod tests {
 	use super::*;
 	fn question(recommended: Option<usize>) -> Question {
 		Question {
-			id: Str::from("format"),
-			question: Str::from("Which?"),
+			id: sf!("format"),
+			question: sf!("Which?"),
 			header: None,
 			options: vec![
-				OptionItem { label: Str::from("Markdown"), description: None, preview: None },
+				OptionItem { label: sf!("Markdown"), description: None, preview: None },
 				OptionItem {
-					label:       Str::from("Text"),
+					label:       sf!("Text"),
 					description: None,
-					preview:     Some(Str::from("plain")),
+					preview:     Some(sf!("plain")),
 				},
 			],
 			multi: false,
@@ -292,13 +292,13 @@ mod tests {
 	#[test]
 	fn headless_selection_uses_recommended_index() {
 		let answer = headless_answer(&question(Some(1))).unwrap();
-		assert_eq!(answer.selected, [Str::from("Text")]);
+		assert_eq!(answer.selected, [sf!("Text")]);
 		assert!(answer.timed_out);
 	}
 	#[test]
 	fn rejects_reserved_labels_and_missing_headless_default() {
 		let mut reserved = question(Some(0));
-		reserved.options[0].label = Str::from("Next →");
+		reserved.options[0].label = sf!("Next →");
 		assert!(validate(&[reserved]).is_err());
 		assert!(headless_answer(&question(None)).is_err());
 	}

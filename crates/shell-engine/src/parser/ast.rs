@@ -1815,12 +1815,12 @@ impl AsRef<str> for Word {
 impl Word {
 	/// Constructs a new `Word` from a given string.
 	pub fn new(s: &str) -> Self {
-		Self { value: s.into(), loc: None }
+		Self { value: Str::new(s), loc: None }
 	}
 
 	/// Constructs a new `Word` from a given string and location.
 	pub fn with_location(s: &str, loc: &SourceSpan) -> Self {
-		Self { value: s.into(), loc: Some(loc.to_owned()) }
+		Self { value: Str::new(s), loc: Some(loc.to_owned()) }
 	}
 
 	/// Returns the raw text of the word, consuming the `Word`.

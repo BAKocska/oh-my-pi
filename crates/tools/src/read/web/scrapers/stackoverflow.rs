@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::Deserialize;
 use url::Url;
 
@@ -136,7 +136,7 @@ async fn render_inner<C: HttpClient + Sync>(
 	let mut result = build_result(&markdown, "stackexchange");
 	result
 		.notes
-		.push(Str::from(format!("Fetched via Stack Exchange API (site={})", target.site)));
+		.push(sf!("Fetched via Stack Exchange API (site={})", target.site));
 	Ok(Some(result))
 }
 
@@ -341,9 +341,7 @@ mod tests {
 
 		assert_eq!(result.method.as_str(), "stackexchange");
 		assert_eq!(result.content_type.as_deref(), Some("text/markdown"));
-		assert_eq!(result.notes.as_slice(), [Str::new_static(
-			"Fetched via Stack Exchange API (site=unix)"
-		)]);
+		assert_eq!(result.notes.as_slice(), [sf!("Fetched via Stack Exchange API (site=unix)")]);
 		assert_eq!(
 			result.content.as_str(),
 			"# How to test?\n\n**Score:** 42 · **Answers:** 6 (Answered)\n**Tags:** rust, \
@@ -397,8 +395,8 @@ mod tests {
 
 		assert_eq!(result.content.chars().count(), MAX_OUTPUT_CHARS);
 		assert_eq!(result.notes.as_slice(), [
-			Str::new_static("Output truncated to 500000 characters"),
-			Str::new_static("Fetched via Stack Exchange API (site=stackoverflow)")
+			sf!("Output truncated to 500000 characters"),
+			sf!("Fetched via Stack Exchange API (site=stackoverflow)")
 		]);
 	}
 
@@ -424,7 +422,7 @@ mod tests {
 			"# How to test?\n\n**Score:** 42 · **Answers:** 6 (Answered)\n**Tags:** rust, \
 			 testing\n**Asked by:** Ada · 1970-01-01\n\n---\n\n## Question\n\nQuestion **body**."
 		);
-		assert_eq!(result.notes.as_slice(), [Str::new_static(
+		assert_eq!(result.notes.as_slice(), [sf!(
 			"Fetched via Stack Exchange API (site=stackoverflow)"
 		)]);
 

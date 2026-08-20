@@ -32,7 +32,7 @@ use std::{
 
 use bytes::Bytes;
 use flume::{Receiver, Sender};
-use omp_core::{CowBytes, Duration, DurationError, Str};
+use omp_core::{CowBytes, Duration, DurationError, Str, sf};
 use omp_py::{
 	Engine,
 	interrupt::{current_thread_id, interrupt},
@@ -517,8 +517,8 @@ impl WorkerState {
 			return Ok(());
 		}
 		Err(Fault::Resource {
-			operation: Str::from("cancel"),
-			message:   Str::from("CPython did not identify exactly one active eval thread"),
+			operation: sf!("cancel"),
+			message:   sf!("CPython did not identify exactly one active eval thread"),
 		})
 	}
 }
@@ -812,7 +812,7 @@ impl DisplayCollector {
 				outputs.push(super::DisplayOutput::Json { data });
 			} else {
 				outputs.push(super::DisplayOutput::Markdown {
-					text: Str::from(bound.repr()?.extract::<String>()?),
+					text: Str::new(bound.repr()?.extract::<String>()?),
 				});
 			}
 		}
@@ -835,19 +835,17 @@ fn display_bundle(
 	for mime in ["text/markdown", "text/html", "image/svg+xml"] {
 		if let Some(text) = bundle.get_item(mime)? {
 			return Ok(Some(super::DisplayOutput::Markdown {
-				text: Str::from(text.extract::<String>()?),
+				text: Str::new(text.extract::<String>()?),
 			}));
 		}
 	}
 	if let Some(text) = bundle.get_item("text/latex")? {
 		let text = text.extract::<String>()?;
-		return Ok(Some(super::DisplayOutput::Markdown {
-			text: Str::from(format!("$$\n{text}\n$$")),
-		}));
+		return Ok(Some(super::DisplayOutput::Markdown { text: sf!("$$\n{text}\n$$") }));
 	}
 	if let Some(text) = bundle.get_item("text/plain")? {
 		return Ok(Some(super::DisplayOutput::Markdown {
-			text: Str::from(text.extract::<String>()?),
+			text: Str::new(text.extract::<String>()?),
 		}));
 	}
 	Ok(None)
@@ -997,7 +995,7 @@ impl EmbeddedPython {
 		let current = workers
 			.get(&session.id)
 			.cloned()
-			.ok_or_else(|| Fault::SessionLost { message: Str::from("unknown Python session") })?;
+			.ok_or_else(|| Fault::SessionLost { message: sf!("unknown Python session") })?;
 		if current.state.alive.load(Ordering::Acquire) {
 			return Ok(current);
 		}
@@ -1026,8 +1024,8 @@ impl EmbeddedPython {
 			.name(format!("omp-eval-py-{label}"))
 			.spawn(move || worker_main(&engine, &state, receiver, installer.as_ref()))
 			.map_err(|error| Fault::Resource {
-				operation: Str::from("open_session"),
-				message:   Str::from(error.to_string()),
+				operation: sf!("open_session"),
+				message:   Str::new(error.to_string()),
 			})?;
 		Ok(worker)
 	}
@@ -1060,8 +1058,8 @@ impl EvalExec for EmbeddedPython {
 		let runtime = Handle::try_current().ok();
 		if runtime.is_none() && request.timeout.is_some() {
 			return Err(Fault::Resource {
-				operation: Str::from("run"),
-				message:   Str::from("cell timeout enforcement requires a Tokio runtime context"),
+				operation: sf!("run"),
+				message:   sf!("cell timeout enforcement requires a Tokio runtime context"),
 			});
 		}
 		let worker = self.worker(session)?;
@@ -1097,7 +1095,7 @@ impl EvalExec for EmbeddedPython {
 			.send_async(command)
 			.await
 			.map_err(|_| Fault::SessionLost {
-				message: Str::from("Python worker stopped before accepting the cell"),
+				message: sf!("Python worker stopped before accepting the cell"),
 			})?;
 		Ok(EmbeddedRun { events: receiver, state: Arc::clone(&worker.state), cancelled, reset })
 	}
@@ -1150,7 +1148,7 @@ fn worker_main(
 		let setup = match prepare_python(py) {
 			Ok(setup) => setup,
 			Err(error) => {
-				fail_worker(&commands, Str::from(format_python_error(py, error)));
+				fail_worker(&commands, Str::new(format_python_error(py, error)));
 				return;
 			},
 		};
@@ -1158,7 +1156,7 @@ fn worker_main(
 		let mut namespace = match new_namespace(py, &namespace_factory, installer) {
 			Ok(namespace) => namespace,
 			Err(error) => {
-				fail_worker(&commands, Str::from(format_python_error(py, error)));
+				fail_worker(&commands, Str::new(format_python_error(py, error)));
 				return;
 			},
 		};
@@ -1190,8 +1188,8 @@ fn worker_main(
 					Err(error) => {
 						clear_active(state, &command.cancelled);
 						let _ = command.events.send(Err(Fault::Resource {
-							operation: Str::from("reset"),
-							message:   Str::from(format_python_error(py, error)),
+							operation: sf!("reset"),
+							message:   Str::new(format_python_error(py, error)),
 						}));
 						continue;
 					},
@@ -1224,8 +1222,8 @@ fn worker_main(
 				Err(error) => {
 					state.alive.store(false, Ordering::Release);
 					let _ = command.events.send(Err(Fault::Resource {
-						operation: Str::from("execute"),
-						message:   Str::from(format_python_error(py, error)),
+						operation: sf!("execute"),
+						message:   Str::new(format_python_error(py, error)),
 					}));
 					break;
 				},
@@ -1277,8 +1275,8 @@ fn timed_out_completion(mut completion: RunCompletion) -> RunCompletion {
 		exit_code:   Some(1),
 		duration_ms: completion.status.duration_ms,
 		exception:   Some(PythonException {
-			name:      Str::new_static("TimeoutError"),
-			message:   Str::new_static("OMP eval cell timed out"),
+			name:      sf!("TimeoutError"),
+			message:   sf!("OMP eval cell timed out"),
 			traceback: Vec::new(),
 		}),
 	};
@@ -1434,7 +1432,7 @@ fn execute_cell(
 		.map(|json| serde_json::from_str::<Value>(&json))
 		.transpose()
 		.map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-	let cell_value = result_text.map(|text| CellValue { text: Str::from(text), json: result_json });
+	let cell_value = result_text.map(|text| CellValue { text: Str::new(text), json: result_json });
 	let error_name = get_optional_string(result, "error_name")?;
 	let exception = if let Some(name) = error_name {
 		let message = get_optional_string(result, "error_message")?.unwrap_or_default();
@@ -1443,9 +1441,9 @@ fn execute_cell(
 			.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("error_traceback"))?
 			.extract::<Vec<String>>()?
 			.into_iter()
-			.map(Str::from)
+			.map(Str::new)
 			.collect();
-		Some(PythonException { name: Str::from(name), message: Str::from(message), traceback })
+		Some(PythonException { name: Str::new(name), message: Str::new(message), traceback })
 	} else {
 		None
 	};
@@ -1509,10 +1507,9 @@ fn python_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<V
 
 fn fail_worker(commands: &Receiver<Command>, message: Str) {
 	while let Ok(command) = commands.try_recv() {
-		let _ = command.events.send(Err(Fault::Resource {
-			operation: Str::from("initialize"),
-			message:   message.clone(),
-		}));
+		let _ = command
+			.events
+			.send(Err(Fault::Resource { operation: sf!("initialize"), message: message.clone() }));
 	}
 }
 
@@ -1561,7 +1558,7 @@ mod tests {
 	) -> (Vec<Update>, RunCompletion) {
 		let mut run = runtime
 			.run(session, RunRequest {
-				code: Str::from(code),
+				code: Str::new(code),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset,
 			})
@@ -1810,7 +1807,7 @@ print("right")"#
 		let session = runtime.open_session().await.expect("session opens");
 		let mut active = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("while True: pass"),
+				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
@@ -1820,7 +1817,7 @@ print("right")"#
 
 		let mut queued = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("queued_effect = True"),
+				code:    sf!("queued_effect = True"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
@@ -1843,7 +1840,7 @@ print("right")"#
 		run_to_completion(&runtime, &session, "kept = 7", false).await;
 		let mut active = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("while True: pass"),
+				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
@@ -1852,7 +1849,7 @@ print("right")"#
 		assert!(matches!(active.next_event().await.unwrap(), Some(RunEvent::Started { .. })));
 		let mut stale = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("stale_effect = True"),
+				code:    sf!("stale_effect = True"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
@@ -1860,7 +1857,7 @@ print("right")"#
 			.expect("stale cell queues");
 		let mut reset = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("('kept' in globals(), 'stale_effect' in globals())"),
+				code:    sf!("('kept' in globals(), 'stale_effect' in globals())"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   true,
 			})
@@ -1879,7 +1876,7 @@ print("right")"#
 		let session = runtime.open_session().await.expect("session opens");
 		let mut timed_out = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("while True: pass"),
+				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_millis(25)),
 				reset:   false,
 			})
@@ -1889,7 +1886,7 @@ print("right")"#
 
 		let mut dropped = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("while True: pass"),
+				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
@@ -1946,7 +1943,7 @@ print("right")"#
 		let session = runtime.open_session().await.expect("session opens");
 		let mut run = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static(concat!(
+				code:    sf!(concat!(
 					"import time\n",
 					"__omp_timeout_pause__()\n",
 					"time.sleep(0.2)\n",
@@ -2010,7 +2007,7 @@ print("right")"#
 		let session = runtime.open_session().await.expect("session opens");
 		let mut failed = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("1"),
+				code:    sf!("1"),
 				timeout: Some(StdDuration::from_secs(1)),
 				reset:   false,
 			})
@@ -2030,7 +2027,7 @@ print("right")"#
 		run_to_completion(&runtime, &session, "old_state = 1", false).await;
 		let mut active = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("while True: pass"),
+				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
@@ -2039,7 +2036,7 @@ print("right")"#
 		assert!(matches!(active.next_event().await.unwrap(), Some(RunEvent::Started { .. })));
 		let mut reset = runtime
 			.run(&session, RunRequest {
-				code:    Str::new_static("'old_state' in globals()"),
+				code:    sf!("'old_state' in globals()"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   true,
 			})
@@ -2059,7 +2056,7 @@ print("right")"#
 		let first_session = runtime.open_session().await.expect("first session opens");
 		let second_session = runtime.open_session().await.expect("second session opens");
 		let request = || RunRequest {
-			code:    Str::new_static("while True: pass"),
+			code:    sf!("while True: pass"),
 			timeout: Some(StdDuration::from_secs(2)),
 			reset:   false,
 		};

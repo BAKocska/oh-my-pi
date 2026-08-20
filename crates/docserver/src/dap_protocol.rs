@@ -11,7 +11,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -204,7 +204,7 @@ impl DapProtocol {
 		}
 		let seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
 		if seq <= 0 {
-			return Err(DapProtocolError::InvalidFrame(Str::new_static("sequence space exhausted")));
+			return Err(DapProtocolError::InvalidFrame(sf!("sequence space exhausted")));
 		}
 		let (response, receiver) = oneshot::channel();
 		self
@@ -411,7 +411,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
 ) -> Result<(), DapProtocolError> {
 	let body = serde_json::to_vec(message)?;
 	if body.len() > MAX_DAP_MESSAGE_BYTES {
-		return Err(DapProtocolError::InvalidFrame(Str::new_static("message exceeds size bound")));
+		return Err(DapProtocolError::InvalidFrame(sf!("message exceeds size bound")));
 	}
 	let write = crate::lsp_process::write_frame(writer, &body);
 	tokio::time::timeout(WRITE_TIMEOUT, write)

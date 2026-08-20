@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use globset::{Glob, GlobMatcher};
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -160,7 +160,7 @@ impl LspCapabilities {
 		let object = value
 			.as_object()
 			.ok_or_else(|| LspError::InvalidCapabilities {
-				reason: Str::new_static("server capabilities must be a JSON object"),
+				reason: sf!("server capabilities must be a JSON object"),
 			})?;
 		let mut base = SyncPolicy::default();
 		if let Some(sync) = object.get("textDocumentSync") {
@@ -202,7 +202,7 @@ impl LspCapabilities {
 			Some("utf-32") => PositionEncoding::Utf32,
 			Some(encoding) => {
 				return Err(LspError::InvalidCapabilities {
-					reason: fmts!("unsupported position encoding {encoding}"),
+					reason: sf!("unsupported position encoding {encoding}"),
 				});
 			},
 		};
@@ -255,7 +255,7 @@ impl LspCapabilities {
 			.get("registrations")
 			.and_then(Value::as_array)
 			.ok_or_else(|| LspError::InvalidRegistration {
-				reason: Str::new_static("registerCapability requires a registrations array"),
+				reason: sf!("registerCapability requires a registrations array"),
 			})?;
 		let mut compiled = Vec::with_capacity(registrations.len());
 		for registration in registrations {
@@ -293,7 +293,7 @@ impl LspCapabilities {
 			.or_else(|| value.get("unregisterations"))
 			.and_then(Value::as_array)
 			.ok_or_else(|| LspError::InvalidRegistration {
-				reason: Str::new_static("unregisterCapability requires an unregistrations array"),
+				reason: sf!("unregisterCapability requires an unregistrations array"),
 			})?;
 		let removals = entries
 			.iter()
@@ -329,7 +329,7 @@ fn required_string(value: &Value, field: &'static str) -> Result<Str, LspError> 
 		.and_then(Value::as_str)
 		.map(Str::new)
 		.ok_or_else(|| LspError::InvalidRegistration {
-			reason: fmts!("registration field {field} must be a string"),
+			reason: sf!("registration field {field} must be a string"),
 		})
 }
 
@@ -359,14 +359,14 @@ impl DocumentSelector {
 		let entries = value
 			.as_array()
 			.ok_or_else(|| LspError::InvalidRegistration {
-				reason: Str::new_static("documentSelector must be an array or null"),
+				reason: sf!("documentSelector must be an array or null"),
 			})?;
 		let mut filters = Vec::with_capacity(entries.len());
 		for entry in entries {
 			let object = entry
 				.as_object()
 				.ok_or_else(|| LspError::InvalidRegistration {
-					reason: Str::new_static("document selector entries must be objects"),
+					reason: sf!("document selector entries must be objects"),
 				})?;
 			let language = object.get("language").and_then(Value::as_str).map(Str::new);
 			let scheme = object.get("scheme").and_then(Value::as_str).map(Str::new);
@@ -426,18 +426,18 @@ impl SelectorPattern {
 					.get("pattern")
 					.and_then(Value::as_str)
 					.ok_or_else(|| LspError::InvalidRegistration {
-						reason: Str::new_static("relative pattern requires a string pattern"),
+						reason: sf!("relative pattern requires a string pattern"),
 					})?;
 				let base = relative
 					.get("baseUri")
 					.ok_or_else(|| LspError::InvalidRegistration {
-						reason: Str::new_static("relative pattern requires baseUri"),
+						reason: sf!("relative pattern requires baseUri"),
 					})?;
 				let base = base
 					.as_str()
 					.or_else(|| base.get("uri").and_then(Value::as_str))
 					.ok_or_else(|| LspError::InvalidRegistration {
-						reason: Str::new_static("relative pattern baseUri must contain a URI"),
+						reason: sf!("relative pattern baseUri must contain a URI"),
 					})?;
 				let base = Url::parse(base).map_err(|error| LspError::InvalidRegistration {
 					reason: Str::new(error.to_string()),
@@ -446,7 +446,7 @@ impl SelectorPattern {
 			},
 			_ => {
 				return Err(LspError::InvalidRegistration {
-					reason: Str::new_static("selector pattern must be a string or relative pattern"),
+					reason: sf!("selector pattern must be a string or relative pattern"),
 				});
 			},
 		};
@@ -777,7 +777,7 @@ impl LspServer {
 			resolved_for(&state, document)
 		};
 		if !policy.public.will_save {
-			return Err(LspError::CapabilityNotAdvertised { method: Str::new_static(WILL_SAVE) });
+			return Err(LspError::CapabilityNotAdvertised { method: sf!(WILL_SAVE) });
 		}
 		self
 			.send_notification(
@@ -804,9 +804,7 @@ impl LspServer {
 			resolved_for(&state, document)
 		};
 		if !policy.public.will_save_wait_until {
-			return Err(LspError::CapabilityNotAdvertised {
-				method: Str::new_static(WILL_SAVE_WAIT_UNTIL),
-			});
+			return Err(LspError::CapabilityNotAdvertised { method: sf!(WILL_SAVE_WAIT_UNTIL) });
 		}
 		let result = self
 			.send_request(
@@ -833,7 +831,7 @@ impl LspServer {
 			resolved_for(&state, document)
 		};
 		if !policy.public.save {
-			return Err(LspError::CapabilityNotAdvertised { method: Str::new_static(DID_SAVE) });
+			return Err(LspError::CapabilityNotAdvertised { method: sf!(DID_SAVE) });
 		}
 		let mut params = json!({ "textDocument": { "uri": document.uri.as_str() } });
 		if policy.public.save_include_text {
@@ -852,9 +850,7 @@ impl LspServer {
 	) -> Result<Bytes, LspError> {
 		let options: Value = serde_json::from_slice(&options_json).map_err(invalid_json)?;
 		if !options.is_object() {
-			return Err(LspError::InvalidJson {
-				reason: Str::new_static("formatting options must be an object"),
-			});
+			return Err(LspError::InvalidJson { reason: sf!("formatting options must be an object") });
 		}
 		let _lane = self.enter_lane(&cancel).await?;
 		self
@@ -865,7 +861,7 @@ impl LspServer {
 			resolved_for(&state, document)
 		};
 		if !policy.formatting {
-			return Err(LspError::CapabilityNotAdvertised { method: Str::new_static(FORMATTING) });
+			return Err(LspError::CapabilityNotAdvertised { method: sf!(FORMATTING) });
 		}
 		let result = self
 			.send_request(
@@ -1318,7 +1314,7 @@ fn initial_change_params(
 			"text": text
 		}]),
 		TextDocumentSyncKind::None => {
-			return Err(LspError::CapabilityNotAdvertised { method: Str::new_static(DID_CHANGE) });
+			return Err(LspError::CapabilityNotAdvertised { method: sf!(DID_CHANGE) });
 		},
 	};
 	Ok(json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": changes }))
@@ -1344,7 +1340,7 @@ fn change_params(
 			json!([{ "range": range, "text": &new[start..new_end] }])
 		},
 		TextDocumentSyncKind::None => {
-			return Err(LspError::CapabilityNotAdvertised { method: Str::new_static(DID_CHANGE) });
+			return Err(LspError::CapabilityNotAdvertised { method: sf!(DID_CHANGE) });
 		},
 	};
 	Ok(json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": changes }))
@@ -1604,7 +1600,7 @@ mod tests {
 			self
 				.messages
 				.lock()
-				.push((Str::new_static("request"), Str::new(method), params));
+				.push((sf!("request"), Str::new(method), params));
 			if self.block_next.swap(false, Ordering::SeqCst) {
 				self.started.notify_one();
 				self.release.notified().await;
@@ -1626,7 +1622,7 @@ mod tests {
 			self
 				.messages
 				.lock()
-				.push((Str::new_static("notify"), Str::new(method), params));
+				.push((sf!("notify"), Str::new(method), params));
 			if self.block_next.swap(false, Ordering::SeqCst) {
 				self.started.notify_one();
 				self.release.notified().await;
@@ -1647,7 +1643,7 @@ mod tests {
 		) -> Result<Bytes, LspTransportError> {
 			Err(LspTransportError::JsonRpc {
 				code:    -32_601,
-				message: Str::new_static("application failure"),
+				message: sf!("application failure"),
 				data:    Some(Bytes::from_static(br#"{"retry":false}"#)),
 			})
 		}
@@ -2043,7 +2039,7 @@ mod tests {
 	async fn formatting_uses_encoding_and_can_be_rolled_back() {
 		let transport = Arc::new(RecordingTransport::default());
 		transport.responses.lock().insert(
-			Str::new_static(FORMATTING),
+			sf!(FORMATTING),
 			Bytes::from_static(br#"[{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"!"}]"#),
 		);
 		let server = LspServer::new(transport.clone(), Bytes::from_static(br#"{"positionEncoding":"utf-16","documentFormattingProvider":true,"textDocumentSync":{"openClose":true,"change":2}}"#)).unwrap();

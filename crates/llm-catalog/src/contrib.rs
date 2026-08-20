@@ -4,7 +4,7 @@
 //! [`OverlayStack`] is immutable, so consumers can rebuild a registry for its
 //! generation and keep executing requests that captured an older generation.
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{collections::BTreeMap, error::Error, fmt, mem::size_of, sync::Arc};
 
 use arc_swap::ArcSwap;
 use omp_core::Str;
@@ -173,7 +173,7 @@ impl CatalogOverlayBuilder {
 	/// Starts an overlay with one auditable source applied to every changed
 	/// field during resolution.
 	#[must_use]
-	pub fn new(source: ProvenanceSource) -> Self {
+	pub const fn new(source: ProvenanceSource) -> Self {
 		Self { source, models: Vec::new(), routes: Vec::new(), aliases: Vec::new() }
 	}
 
@@ -219,18 +219,50 @@ impl CatalogOverlayBuilder {
 
 /// Stable identity named in provider conflict and replacement evidence.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct ProviderDeclarationId {
-	/// Publisher identity from the admitted extension manifest.
-	pub publisher:      Str,
-	/// Extension identifier under `publisher`.
-	pub extension_id:   Str,
-	/// Stable declaration identifier within that extension.
-	pub declaration_id: Str,
+pub struct ProviderDeclarationId(Arc<ProviderDeclarationIdentity>);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+struct ProviderDeclarationIdentity {
+	publisher:      Str,
+	extension_id:   Str,
+	declaration_id: Str,
+}
+
+impl ProviderDeclarationId {
+	/// Creates a stable identity for one admitted extension declaration.
+	#[must_use]
+	pub fn new(publisher: Str, extension_id: Str, declaration_id: Str) -> Self {
+		Self(Arc::new(ProviderDeclarationIdentity { publisher, extension_id, declaration_id }))
+	}
+
+	/// Returns the publisher identity from the admitted extension manifest.
+	#[must_use]
+	pub fn publisher(&self) -> &Str {
+		&self.0.publisher
+	}
+
+	/// Returns the extension identifier under [`Self::publisher`].
+	#[must_use]
+	pub fn extension_id(&self) -> &Str {
+		&self.0.extension_id
+	}
+
+	/// Returns the declaration identifier within the extension.
+	#[must_use]
+	pub fn declaration_id(&self) -> &Str {
+		&self.0.declaration_id
+	}
 }
 
 impl fmt::Display for ProviderDeclarationId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{}/{}/{}", self.publisher, self.extension_id, self.declaration_id)
+		write!(
+			formatter,
+			"{}/{}/{}",
+			self.publisher(),
+			self.extension_id(),
+			self.declaration_id()
+		)
 	}
 }
 
@@ -245,7 +277,7 @@ pub struct ProviderPublisher {
 
 impl ProviderPublisher {
 	fn matches(&self, declaration: &ProviderDeclarationId) -> bool {
-		self.publisher == declaration.publisher && self.extension_id == declaration.extension_id
+		self.publisher == *declaration.publisher() && self.extension_id == *declaration.extension_id()
 	}
 }
 
@@ -324,6 +356,11 @@ impl fmt::Display for ProviderActivationError {
 }
 
 impl Error for ProviderActivationError {}
+
+const _: () = assert!(
+	size_of::<ProviderActivationError>() <= 64,
+	"ProviderActivationError must remain compact"
+);
 
 /// Active provider layers plus every declaration retained as evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -446,7 +483,7 @@ impl ProviderDeclarations {
 		active.extend(extensions);
 		let overlays = OverlayStack::from_layers(active.into_iter().map(|declaration| {
 			(
-				OverlaySource::Extension { id: declaration.id.extension_id.clone() },
+				OverlaySource::Extension { id: declaration.id.extension_id().clone() },
 				declaration.overlay.clone(),
 			)
 		}));
@@ -480,13 +517,15 @@ impl ProviderDeclarations {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use omp_core::IntoStr;
+
 	use crate::{EvidenceConfidence, ProvenanceKind, ProvenanceSource};
 
 	fn overlay(origin: &str) -> CatalogOverlay {
 		CatalogOverlay {
 			source:  ProvenanceSource {
 				kind:           ProvenanceKind::Configured,
-				origin:         origin.into(),
+				origin:         origin.to_str(),
 				revision:       None,
 				confidence:     EvidenceConfidence::Declared,
 				observed_at_ms: None,
@@ -499,11 +538,11 @@ mod tests {
 
 	fn declaration(name: &str, priority: i32) -> ProviderDeclaration {
 		ProviderDeclaration {
-			id: ProviderDeclarationId {
-				publisher:      "publisher".into(),
-				extension_id:   name.into(),
-				declaration_id: "provider".into(),
-			},
+			id: ProviderDeclarationId::new(
+				"publisher".to_str(),
+				name.to_str(),
+				"provider".to_str(),
+			),
 			provider: "provider".into(),
 			overlay: overlay(name),
 			priority,
@@ -541,7 +580,7 @@ mod tests {
 		assert!(matches!(
 			error,
 			ProviderActivationError::EqualPriority { first, second, .. }
-				if first.extension_id == "first" && second.extension_id == "second"
+				if first.extension_id() == "first" && second.extension_id() == "second"
 		));
 	}
 
@@ -569,8 +608,10 @@ mod tests {
 	fn denied_replacement_reactivates_the_replaced_declaration() {
 		let base = declaration("base", 0);
 		let mut replacement = declaration("replacement", 0);
-		replacement.replaces =
-			Some(ProviderPublisher { publisher: "publisher".into(), extension_id: "base".into() });
+		replacement.replaces = Some(ProviderPublisher {
+			publisher: "publisher".to_str(),
+			extension_id: "base".to_str(),
+		});
 		replacement.available = false;
 		let active = ProviderDeclarations::new([base, replacement])
 			.activate(&ProviderId::from("provider"))
@@ -582,8 +623,10 @@ mod tests {
 	fn publisher_qualified_replacement_supplants_only_its_declared_target() {
 		let base = declaration("base", 0);
 		let mut replacement = declaration("replacement", 0);
-		replacement.replaces =
-			Some(ProviderPublisher { publisher: "publisher".into(), extension_id: "base".into() });
+		replacement.replaces = Some(ProviderPublisher {
+			publisher: "publisher".to_str(),
+			extension_id: "base".to_str(),
+		});
 		let active = ProviderDeclarations::new([base, replacement])
 			.activate(&ProviderId::from("provider"))
 			.unwrap()

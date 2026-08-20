@@ -1,6 +1,6 @@
 use std::mem;
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use super::layout::{stack_height, stack_measure, stack_place};
 use crate::{
@@ -26,11 +26,11 @@ pub struct CustomElement {
 
 impl CustomElement {
 	/// Creates an unresolved custom element for the supplied tag name.
-	pub fn new(name: impl Into<Str>) -> Self {
+	pub fn new(name: impl IntoStr) -> Self {
 		Self {
 			props:    Props::new(),
 			slot:     next_slot(),
-			name:     name.into(),
+			name:     name.into_str(),
 			children: Vec::new(),
 			resolved: None,
 			tried:    false,

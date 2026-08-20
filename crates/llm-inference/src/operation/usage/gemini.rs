@@ -10,7 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -115,7 +115,7 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 			project_id: None,
 			account_id: None,
 			email:      None,
-			base_url:   Str::new_static(DEFAULT_ENDPOINT),
+			base_url:   sf!(DEFAULT_ENDPOINT),
 		});
 	}
 	let envelope: Envelope = serde_json::from_str(raw).ok()?;
@@ -140,16 +140,16 @@ fn parse_credential(raw: &str) -> Option<Credential> {
 		project_id: envelope
 			.project_id
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 		account_id: envelope
 			.account_id
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
+			.map(Str::new),
 		email:      envelope
 			.email
 			.filter(|v| !v.trim().is_empty())
-			.map(Str::from),
-		base_url:   Str::from(base.trim_end_matches('/')),
+			.map(Str::new),
+		base_url:   Str::new(base.trim_end_matches('/')),
 	})
 }
 
@@ -224,7 +224,7 @@ async fn fetch_gemini_usage_until(
 		.and_then(Value::as_object)
 		.and_then(|tier| tier.get("name").or_else(|| tier.get("id")))
 		.and_then(Value::as_str)
-		.map(Str::from);
+		.map(Str::new);
 	Ok(ConsoleUsageObservation {
 		account_meta: UsageAccountMetadata {
 			provider_account_id: credential.account_id,
@@ -233,7 +233,7 @@ async fn fetch_gemini_usage_until(
 			..UsageAccountMetadata::default()
 		},
 		plan,
-		source_label: Some(Str::new_static("cloudcode-pa")),
+		source_label: Some(sf!("cloudcode-pa")),
 		notes: Box::default(),
 		reset_credits: None,
 		windows,
@@ -290,8 +290,8 @@ async fn execute(
 }
 fn project_id(load: &Value) -> Option<Str> {
 	match load.get("cloudaicompanionProject")? {
-		Value::String(value) => Some(Str::from(value.as_str())),
-		Value::Object(value) => value.get("id").and_then(Value::as_str).map(Str::from),
+		Value::String(value) => Some(Str::new(value.as_str())),
+		Value::Object(value) => value.get("id").and_then(Value::as_str).map(Str::new),
 		_ => None,
 	}
 }
@@ -342,21 +342,18 @@ fn parse_quota(
 			.map_or_else(|| "quota".to_owned(), |duration| format!("reset-{}", duration.as_millis()));
 		let id =
 			model.map_or_else(|| format!("unknown:{index}"), |model| format!("{model}:{window_id}"));
-		let label = model.map_or_else(
-			|| Str::new_static("Gemini quota"),
-			|model| Str::from(format!("Gemini {model}")),
-		);
-		let scope = Str::from(format!(
+		let label = model.map_or_else(|| sf!("Gemini quota"), |model| sf!("Gemini {model}"));
+		let scope = sf!(
 			"account={};project={};model={};tier={};window={window_id}",
 			account.unwrap_or(""),
 			project.unwrap_or(""),
 			model.unwrap_or(""),
 			tier.unwrap_or("")
-		));
+		);
 		windows.push(UsageWindow {
-			id: Str::from(id),
+			id: Str::new(id),
 			kind: UsageWindowKind::Quota,
-			dimension: Str::new_static("quota"),
+			dimension: sf!("quota"),
 			label: Some(label),
 			scope: Some(scope),
 			amount: UsageAmount {

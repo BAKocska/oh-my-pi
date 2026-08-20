@@ -1,4 +1,4 @@
-use omp_core::str::IntoStr;
+use omp_core::IntoStr;
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},

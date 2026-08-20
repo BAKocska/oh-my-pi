@@ -22,7 +22,7 @@ use hyper_util::{
 	client::legacy::{Client, connect::HttpConnector},
 	rt::TokioExecutor,
 };
-use omp_core::{Str, base64_url};
+use omp_core::{Str, base64_url, sf};
 use omp_llm_catalog::provider::PrincipalResolution;
 use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -391,7 +391,7 @@ where
 		self.entropy.fill(&mut verifier_bytes[..])?;
 		self.entropy.fill(&mut state_bytes[..])?;
 		let verifier = SecretString::from(base64_url::encode_raw(&verifier_bytes[..]).into_string());
-		let state = Str::from(base64_url::encode_raw(&state_bytes[..]).into_string());
+		let state = Str::new(base64_url::encode_raw(&state_bytes[..]).into_string());
 		let challenge =
 			base64_url::encode_raw(&Sha256::digest(verifier.expose_secret().as_bytes())).into_string();
 		let mut url = parse_http_url(&spec.authorize_url)?;
@@ -421,7 +421,9 @@ where
 				query.append_pair(&parameter.name, &parameter.value);
 			}
 		}
-		driver.emit(AuthEvent::OpenUrl(url.as_str().into())).await?;
+		driver
+			.emit(AuthEvent::OpenUrl(Str::new(url.as_str())))
+			.await?;
 		let (id, message, input) = match spec.completion {
 			PkceCompletion::CallbackUrl => (
 				"oauth-callback",
@@ -438,7 +440,11 @@ where
 			},
 		};
 		driver
-			.emit(AuthEvent::Prompt(AuthPrompt { id: id.into(), message: message.into(), input }))
+			.emit(AuthEvent::Prompt(AuthPrompt {
+				id: Str::new(id),
+				message: Str::new(message),
+				input,
+			}))
 			.await?;
 		Ok(PkcePending {
 			verifier,
@@ -599,7 +605,7 @@ where
 			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
-				id:      "oauth-paste-code".into(),
+				id:      sf!("oauth-paste-code"),
 				message: spec.prompt.clone(),
 				input:   AuthPromptKind::AuthorizationCode,
 			}))
@@ -812,14 +818,14 @@ where
 						.map_err(refresh_store_operation)?;
 					if stored.metadata.generation != rejected_generation {
 						return Err(RefreshOperationError {
-							code:    "generation-changed".into(),
-							summary: "credential generation changed before refresh".into(),
+							code:    sf!("generation-changed"),
+							summary: sf!("credential generation changed before refresh"),
 						});
 					}
 					if stored.metadata.principal_id != principal {
 						return Err(RefreshOperationError {
-							code:    "principal-changed".into(),
-							summary: "credential principal changed before refresh".into(),
+							code:    sf!("principal-changed"),
+							summary: sf!("credential principal changed before refresh"),
 						});
 					}
 					let bundle =
@@ -1311,8 +1317,8 @@ fn system_time_from_millis(millis: u64) -> Result<SystemTime, OAuthCredentialMan
 
 fn refresh_store_operation(_: StoreError) -> RefreshOperationError {
 	RefreshOperationError {
-		code:    "credential-store".into(),
-		summary: "encrypted credential persistence failed".into(),
+		code:    sf!("credential-store"),
+		summary: sf!("encrypted credential persistence failed"),
 	}
 }
 
@@ -1323,13 +1329,16 @@ fn refresh_oauth_operation(error: OAuthError) -> RefreshOperationError {
 		OAuthError::Transport(_) => "transport",
 		_ => "oauth-protocol",
 	};
-	RefreshOperationError { code: code.into(), summary: "OAuth credential refresh failed".into() }
+	RefreshOperationError {
+		code:    Str::new(code),
+		summary: sf!("OAuth credential refresh failed"),
+	}
 }
 
 fn refresh_manager_operation(_: OAuthCredentialManagerError) -> RefreshOperationError {
 	RefreshOperationError {
-		code:    "credential-time".into(),
-		summary: "OAuth credential timestamp is invalid".into(),
+		code:    sf!("credential-time"),
+		summary: sf!("OAuth credential timestamp is invalid"),
 	}
 }
 
@@ -1390,7 +1399,7 @@ fn json_string_at(document: &str, pointer: &str) -> Result<Str, OAuthError> {
 		.pointer(pointer)
 		.and_then(serde_json::Value::as_str)
 		.filter(|value| !value.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 		.ok_or(OAuthError::PrincipalUnresolved)
 }
 
@@ -1405,7 +1414,7 @@ fn json_object_string(document: &str, field: &str) -> Result<Str, OAuthError> {
 		.and_then(|object| object.get(field))
 		.and_then(serde_json::Value::as_str)
 		.filter(|value| !value.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 		.ok_or(OAuthError::PrincipalUnresolved)
 }
 
@@ -1447,7 +1456,7 @@ fn provider_error(status: u16, body: &SecretString, refresh: bool) -> OAuthError
 		return OAuthError::RefreshRejected(AuthRejection {
 			kind:        AuthRejectionKind::RefreshRejected,
 			status:      Some(status),
-			code:        Some(Str::new_static(code.as_str())),
+			code:        Some(sf!(code.as_str())),
 			refreshable: false,
 		});
 	}

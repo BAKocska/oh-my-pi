@@ -24,7 +24,7 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use secrecy::SecretString;
 use tower::Service;
 
@@ -225,7 +225,7 @@ impl ConsoleUsageManager {
 						.reject(lease, AuthRejection {
 							kind:        AuthRejectionKind::Invalid,
 							status:      None,
-							code:        Some(Str::new_static("usage-auth-rejected")),
+							code:        Some(sf!("usage-auth-rejected")),
 							refreshable: false,
 						})
 						.await
@@ -265,7 +265,7 @@ fn usage_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn usage_fetch_error(error: UsageFetchError) -> Error {
@@ -290,7 +290,7 @@ fn usage_fetch_error(error: UsageFetchError) -> Error {
 		),
 	};
 	Error::new(kind, phase, retry, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 /// Configures stale-observation enforcement for a usage service.
@@ -647,8 +647,8 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		Str::from(OperationKind::Usage.to_string()),
-		ReasonId(Str::from("operation_service_mismatch")),
+		Str::new(OperationKind::Usage.to_string()),
+		ReasonId(sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
@@ -660,7 +660,7 @@ fn stale_error(dimension: &str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(format!("stale_usage_window:{dimension}")))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!("stale_usage_window:{dimension}"))))
 }
 
 fn protocol_error(reason: &'static str) -> Error {
@@ -670,14 +670,14 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]
 mod tests {
 	use std::time::{Duration, UNIX_EPOCH};
 
-	use omp_core::Str;
+	
 
 	use super::{UsageServiceConfig, normalize_report, report_from_account_state};
 	use crate::{
@@ -832,10 +832,10 @@ mod tests {
 			)]);
 		report.windows[0].amount.unit = UsageUnit::Usd;
 		report.windows[0].amount.consumed = Some(UsageQuantity::new(100, 2));
-		report.windows[0].scope = Some(Str::new_static("model:z"));
+		report.windows[0].scope = Some(sf!("model:z"));
 		let mut earlier_scope = report.windows[0].clone();
-		earlier_scope.id = Str::new_static("credits:a");
-		earlier_scope.scope = Some(Str::new_static("model:a"));
+		earlier_scope.id = sf!("credits:a");
+		earlier_scope.scope = Some(sf!("model:a"));
 		report.windows.push(earlier_scope);
 		normalize_report(&mut report, &request, UsageServiceConfig {
 			maximum_age: Duration::from_secs(30),
@@ -844,7 +844,7 @@ mod tests {
 		.expect("valid fixed-point report");
 		assert_eq!(report.windows[0].scope.as_deref(), Some("model:a"));
 
-		report.windows[0].scope = Some(Str::new_static(""));
+		report.windows[0].scope = Some(Default::default());
 		assert!(
 			normalize_report(&mut report, &request, UsageServiceConfig {
 				maximum_age: Duration::from_secs(30),
@@ -852,7 +852,7 @@ mod tests {
 			},)
 			.is_err()
 		);
-		report.windows[0].scope = Some(Str::new_static("model:a"));
+		report.windows[0].scope = Some(sf!("model:a"));
 		report.windows[0].amount.consumed = Some(UsageQuantity::new(100, 19));
 		assert!(
 			normalize_report(&mut report, &request, UsageServiceConfig {

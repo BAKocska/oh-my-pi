@@ -5,6 +5,7 @@ pub mod blobs;
 pub mod docs;
 pub(crate) mod eval;
 pub mod exec;
+mod http_egress;
 mod journal_runtime;
 mod media_devices;
 pub mod policy;
@@ -26,7 +27,7 @@ use std::{io, path::Path, sync::Arc};
 #[doc(hidden)]
 pub use eval::{EVAL_CHILD_ARG, run_eval_child_entry};
 use miette::IntoDiagnostic as _;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_env::EnvClient;
 use omp_proto::env::v1::{ClientHello, ServerHello};
 use omp_tool::Registry;
@@ -493,12 +494,12 @@ fn worker_config(
 		digest.update(env!("CARGO_PKG_VERSION").as_bytes());
 		digest.update(PY_EVAL_MODULE.as_bytes());
 		let provenance = omp_core::Provenance::new(
-			Str::new_static("omp-first-party"),
-			Str::new_static(PY_EVAL_MODULE),
-			Str::new_static(env!("CARGO_PKG_VERSION")),
+			sf!("omp-first-party"),
+			sf!(PY_EVAL_MODULE),
+			sf!(env!("CARGO_PKG_VERSION")),
 			omp_core::ArtifactDigest::new(*digest.finalize().as_bytes()),
-			Str::new_static("workspace"),
-			Str::new_static("trusted"),
+			sf!("workspace"),
+			sf!("trusted"),
 			1,
 		);
 		let manifest = crate::exthost::ExtensionManifest::py_eval(provenance, []);

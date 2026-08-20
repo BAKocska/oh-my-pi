@@ -6,7 +6,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 
 use crate::{
@@ -283,7 +283,7 @@ pub fn forced_call_ladder(
 	let escalation =
 		(non_compliant && escalations_left != 0 && native_supported && caps.native_penalty.is_some())
 			.then(|| Adjustment::Escalated {
-				feature: FeatureId(Str::new_static("tool_choice")),
+				feature: FeatureId(sf!("tool_choice")),
 				penalty: crate::receipt::Penalty::CacheInvalidated,
 			});
 	ForcedCallDecision {
@@ -305,7 +305,7 @@ pub fn apply_forced_call_decision(
 		messages.push(crate::call::Message {
 			role:    crate::call::Role::System,
 			content: Arc::from([crate::call::ContentPart::Text {
-				text:  Str::new_static(FORCED_CALL_DIRECTIVE),
+				text:  sf!(FORCED_CALL_DIRECTIVE),
 				proof: None,
 			}]),
 			name:    None,
@@ -517,13 +517,13 @@ impl ExecutionPlan {
 		Err(Error::planning(
 			ErrorKind::StalePlan,
 			ErrorDetail::stale_plan(
-				Str::from(self.catalog_revision.as_str()),
+				Str::new(self.catalog_revision.as_str()),
 				if now > self.expires_at {
-					Str::from("expired")
+					sf!("expired")
 				} else if &self.catalog_revision != catalog_revision {
-					Str::from(catalog_revision.as_str())
+					Str::new(catalog_revision.as_str())
 				} else {
-					Str::from("registry-state-changed")
+					sf!("registry-state-changed")
 				},
 			),
 			ExecutionReceipt::default(),
@@ -563,8 +563,8 @@ pub fn negotiate(
 			.iter()
 			.find(|item| item.feature == requirement.feature);
 		let availability = observed.map_or(CapabilityAvailability::Unknown, |item| item.availability);
-		let reason = observed
-			.map_or_else(|| ReasonId(Str::from("no-route-evidence")), |item| item.reason.clone());
+		let reason =
+			observed.map_or_else(|| ReasonId(sf!("no-route-evidence")), |item| item.reason.clone());
 
 		match availability {
 			CapabilityAvailability::Native => {
@@ -625,14 +625,14 @@ pub fn negotiate_native_option(
 	if requirement.strength == RequirementStrength::Preferred && allow_drop_preferred {
 		return Ok(Some(NegotiationDecision::Dropped {
 			feature: requirement.feature.clone(),
-			reason:  ReasonId(Str::from("native-option-codec-mismatch")),
+			reason:  ReasonId(sf!("native-option-codec-mismatch")),
 		}));
 	}
 	Err(Error::planning(
 		ErrorKind::CodecMismatch,
 		ErrorDetail::capability(
-			Str::from(requirement.feature.0.as_str()),
-			ReasonId(Str::from("native-option-codec-mismatch")),
+			Str::new(requirement.feature.0.as_str()),
+			ReasonId(sf!("native-option-codec-mismatch")),
 		),
 		ExecutionReceipt::default(),
 	))
@@ -675,7 +675,7 @@ fn capability_error(
 ) -> Error {
 	Error::planning(
 		kind,
-		ErrorDetail::capability(Str::from(requirement.feature.0.as_str()), reason),
+		ErrorDetail::capability(Str::new(requirement.feature.0.as_str()), reason),
 		ExecutionReceipt::default(),
 	)
 }
@@ -683,7 +683,7 @@ fn capability_error(
 fn replay_error(kind: ErrorKind, reason: &'static str) -> Error {
 	Error::planning(
 		kind,
-		ErrorDetail::replay(ReasonId(Str::from(reason))),
+		ErrorDetail::replay(ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -696,7 +696,7 @@ const fn emulation_is_lossless(method: Emulation) -> bool {
 mod tests {
 	use std::time::{Duration, Instant};
 
-	use omp_core::Str;
+	
 
 	use super::*;
 	use crate::{
@@ -705,7 +705,7 @@ mod tests {
 	};
 
 	fn requirement(strength: RequirementStrength) -> CapabilityRequirement {
-		CapabilityRequirement { feature: FeatureId(Str::from("structured-output")), strength }
+		CapabilityRequirement { feature: FeatureId(sf!("structured-output")), strength }
 	}
 
 	fn budget(attempts: u32, staging: u64) -> ExecutionBudget {
@@ -725,9 +725,9 @@ mod tests {
 		let unknown = negotiate(
 			&[requirement(RequirementStrength::Required)],
 			&[CapabilityEvidence {
-				feature:      FeatureId(Str::from("structured-output")),
+				feature:      FeatureId(sf!("structured-output")),
 				availability: CapabilityAvailability::Unknown,
-				reason:       ReasonId(Str::from("not-observed")),
+				reason:       ReasonId(sf!("not-observed")),
 			}],
 			PlanningPolicy::default(),
 		)
@@ -737,9 +737,9 @@ mod tests {
 		let unsupported = negotiate(
 			&[requirement(RequirementStrength::Required)],
 			&[CapabilityEvidence {
-				feature:      FeatureId(Str::from("structured-output")),
+				feature:      FeatureId(sf!("structured-output")),
 				availability: CapabilityAvailability::Unsupported,
-				reason:       ReasonId(Str::from("proven-absent")),
+				reason:       ReasonId(sf!("proven-absent")),
 			}],
 			PlanningPolicy::default(),
 		)
@@ -750,9 +750,9 @@ mod tests {
 	#[test]
 	fn native_and_emulated_features_require_explicit_policy() {
 		let native = CapabilityEvidence {
-			feature:      FeatureId(Str::from("structured-output")),
+			feature:      FeatureId(sf!("structured-output")),
 			availability: CapabilityAvailability::Native,
-			reason:       ReasonId(Str::from("route-native")),
+			reason:       ReasonId(sf!("route-native")),
 		};
 		let (decisions, _) = negotiate(
 			&[requirement(RequirementStrength::Required)],
@@ -763,9 +763,9 @@ mod tests {
 		assert!(matches!(decisions.as_slice(), [NegotiationDecision::Native { .. }]));
 
 		let emulated = CapabilityEvidence {
-			feature:      FeatureId(Str::from("structured-output")),
+			feature:      FeatureId(sf!("structured-output")),
 			availability: CapabilityAvailability::Emulated(Emulation::ResponseTransform),
-			reason:       ReasonId(Str::from("bounded-validator")),
+			reason:       ReasonId(sf!("bounded-validator")),
 		};
 		assert_eq!(
 			negotiate(
@@ -792,7 +792,7 @@ mod tests {
 		let option = NativeOptionRequirement {
 			codec:    CodecId::from("openai"),
 			strength: RequirementStrength::Required,
-			feature:  FeatureId(Str::from("openai-prediction")),
+			feature:  FeatureId(sf!("openai-prediction")),
 		};
 		assert_eq!(
 			negotiate_native_option(Some(&option), &CodecId::from("anthropic"), true)
@@ -892,8 +892,7 @@ mod tests {
 	}
 	#[test]
 	fn forced_call_ladder_skips_paid_native_choice_then_records_escalation() {
-		let choice =
-			crate::call::Setting::Require(crate::call::ToolChoice::Named(Str::from("lookup")));
+		let choice = crate::call::Setting::Require(crate::call::ToolChoice::Named(sf!("lookup")));
 		let caps = ForcedCallCaps {
 			features:       omp_llm_catalog::ToolFeatureBits::NAMED_CHOICE,
 			native_penalty: Some(Penalty::CacheInvalidated),

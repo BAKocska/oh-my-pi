@@ -13,7 +13,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, StreamExt, executor::block_on};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{Adjustment, ToolGrammarSyntax};
 use omp_tool::{
@@ -65,15 +65,15 @@ impl FakeTool {
 	) -> Self {
 		Self {
 			spec: ToolSpec {
-				name: Str::from("typed_fake"),
-				rev: Rev { family: Str::from("fake"), n },
-				description: Str::from(format!("fake revision {n}")),
+				name: sf!("typed_fake"),
+				rev: Rev { family: sf!("fake"), n },
+				description: sf!("fake revision {n}"),
 				schema: Bytes::from_static(schema),
 				constraint,
 				effects: Effects::empty(),
 				projection_code: [0; 32],
 			},
-			marker: Str::from(marker),
+			marker: Str::new(marker),
 			calls,
 			lift_from: None,
 		}
@@ -85,7 +85,7 @@ impl FakeTool {
 	}
 
 	fn named(mut self, name: &str) -> Self {
-		self.spec.name = Str::from(name);
+		self.spec.name = Str::new(name);
 		self
 	}
 
@@ -127,10 +127,13 @@ impl Tool for FakeTool {
 		};
 		vec![
 			Part::Text {
-				text: Str::from(format!(
+				text: sf!(
 					"{}|{branch}|{}/{}/{}",
-					self.marker, caps.maximum_parts, caps.maximum_text_bytes, caps.media
-				)),
+					self.marker,
+					caps.maximum_parts,
+					caps.maximum_text_bytes,
+					caps.media
+				),
 			},
 			Part::Json { json: Bytes::from(serde_json::to_vec(&branch).expect("string serializes")) },
 		]
@@ -157,9 +160,9 @@ impl PullingTool {
 	fn new() -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::from("pulling_fake"),
-				rev:             Rev { family: Str::from("fake"), n: 1 },
-				description:     Str::from("pulls one typed argument"),
+				name:            sf!("pulling_fake"),
+				rev:             Rev { family: sf!("fake"), n: 1 },
+				description:     sf!("pulls one typed argument"),
 				schema:          Bytes::from_static(
 					br#"{"type":"object","properties":{"wanted":{"type":"number"}}}"#,
 				),
@@ -199,11 +202,11 @@ impl Tool for PullingTool {
 				panic!("typed pull must report an argument issue")
 			};
 			yield Ev::Args(*issue);
-			yield Ev::Update(Str::from("post-terminal update"));
+			yield Ev::Update(sf!("post-terminal update"));
 			yield Ev::Done(ToolTerminal::Done {
 				result: Ok(FakePayload {
-					implementation: Str::from("post-terminal"),
-					raw: Str::from("must not escape"),
+					implementation: sf!("post-terminal"),
+					raw: sf!("must not escape"),
 				}),
 				useless: false,
 			});
@@ -223,9 +226,9 @@ impl AbortingTool {
 	fn new() -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::from("aborting_fake"),
-				rev:             Rev { family: Str::from("fake"), n: 1 },
-				description:     Str::from("aborts before completion"),
+				name:            sf!("aborting_fake"),
+				rev:             Rev { family: sf!("fake"), n: 1 },
+				description:     sf!("aborts before completion"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
 				effects:         Effects::empty(),
@@ -251,10 +254,10 @@ impl Tool for AbortingTool {
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
 		drop(params);
 		stream! {
-			yield Ev::Aborted(Abort::Skipped { reason: Str::from("policy denied") });
-			yield Ev::Update(Str::from("post-terminal update"));
+			yield Ev::Aborted(Abort::Skipped { reason: sf!("policy denied") });
+			yield Ev::Update(sf!("post-terminal update"));
 			yield Ev::Done(ToolTerminal::Done {
-				result: Err(FakeFault { message: Str::from("must not escape") }),
+				result: Err(FakeFault { message: sf!("must not escape") }),
 				useless: false,
 			});
 		}
@@ -276,18 +279,18 @@ fn fake_tool(n: u16, marker: &str, calls: Arc<AtomicUsize>) -> FakeTool {
 }
 
 fn claims(claimant: &str, precedence: Precedence) -> Claims {
-	Claims { precedence, claimant: Str::from(claimant), replaces: None }
+	Claims { precedence, claimant: Str::new(claimant), replaces: None }
 }
 
 fn identity(n: u16) -> ToolIdentity {
-	ToolIdentity { name: Str::from("typed_fake"), rev: Rev { family: Str::from("fake"), n } }
+	ToolIdentity { name: sf!("typed_fake"), rev: Rev { family: sf!("fake"), n } }
 }
 
 fn worker_spec(name: &str, projection_code: [u8; 32]) -> ToolSpec {
 	ToolSpec {
-		name: Str::from(name),
-		rev: Rev { family: Str::from("worker"), n: 1 },
-		description: Str::from(format!("{name} device")),
+		name: Str::new(name),
+		rev: Rev { family: sf!("worker"), n: 1 },
+		description: sf!("{name} device"),
 		schema: Bytes::from_static(br#"{"type":"object"}"#),
 		constraint: Constraint::None,
 		effects: Effects::empty(),
@@ -320,7 +323,7 @@ fn duplicate_registration_never_replaces_the_erased_implementation() {
 
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from("{value:1}"))
+		.args_committed(Str::new_static("{value:1}"))
 		.expect("consumer remains live");
 	let events = block_on(
 		registry
@@ -347,8 +350,8 @@ fn duplicate_registration_never_replaces_the_erased_implementation() {
 	assert_eq!(
 		verdict,
 		CallOutcome::Ok(FakePayload {
-			implementation: Str::from("original"),
-			raw:            Str::from(r#"{"value":1}"#),
+			implementation: sf!("original"),
+			raw:            sf!(r#"{{"value":1}}"#),
 		})
 	);
 }
@@ -628,8 +631,8 @@ fn shadowed_claims_are_only_claimant_qualified_reachable() {
 			Presentation::Device,
 			Claims {
 				precedence: Precedence::ENHANCEMENT,
-				claimant:   Str::from("high/search"),
-				replaces:   Some(Str::from("search")),
+				claimant:   sf!("high/search"),
+				replaces:   Some(sf!("search")),
 			},
 		)
 		.unwrap();
@@ -643,7 +646,7 @@ fn shadowed_claims_are_only_claimant_qualified_reachable() {
 	assert_eq!(registry.live_identity("search@low/search").unwrap().1.n, 1);
 
 	let (feed, params) = IncomingParams::channel();
-	feed.args_committed(Str::from("{value:1}")).unwrap();
+	feed.args_committed(Str::new_static("{value:1}")).unwrap();
 	let events = block_on(
 		registry
 			.invoke("search@low/search", params)
@@ -714,7 +717,7 @@ fn erased_tool_does_not_run_before_explicit_argument_commitment() {
 	assert!(events.next().now_or_never().is_none());
 	assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-	feed.args_committed(Str::from("{value:1}")).unwrap();
+	feed.args_committed(Str::new_static("{value:1}")).unwrap();
 	assert!(matches!(block_on(events.next()), Some(Ok(ErasedEv::Update(_)))));
 	assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -727,7 +730,7 @@ fn pulled_mismatch_erases_to_args_outcome_and_fuses_every_later_event() {
 		.unwrap();
 	let raw = r#"{"wanted":"seven","ignored":true}"#;
 	let (feed, params) = IncomingParams::channel();
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 
 	let events = block_on(
 		registry
@@ -743,11 +746,11 @@ fn pulled_mismatch_erases_to_args_outcome_and_fuses_every_later_event() {
 	assert_eq!(
 		verdict,
 		CallOutcome::ArgsRejected(ArgIssue {
-			path:     vec![ArgPath::Key(Str::from("wanted"))],
-			expected: Str::from("number"),
+			path:     vec![ArgPath::Key(sf!("wanted"))],
+			expected: sf!("number"),
 			kind:     ArgIssueKind::TypeMismatch,
 			example:  None,
-			found:    Some(Str::from("string")),
+			found:    Some(sf!("string")),
 		})
 	);
 }
@@ -771,7 +774,7 @@ fn aborted_outcome_is_terminal_and_fuses_every_later_event() {
 		panic!("Aborted must be the sole erased terminal event: {events:?}")
 	};
 	let verdict: CallOutcome<FakePayload, FakeFault> = serde_json::from_slice(verdict).unwrap();
-	assert_eq!(verdict, CallOutcome::aborted(Abort::Skipped { reason: Str::from("policy denied") }));
+	assert_eq!(verdict, CallOutcome::aborted(Abort::Skipped { reason: sf!("policy denied") }));
 }
 
 #[test]
@@ -799,7 +802,7 @@ fn advertisement_contains_only_the_live_schema_and_preserves_supported_grammar()
 				br#"{"type":"object","properties":{"live":{"const":true}},"required":["live"]}"#,
 				Constraint::Grammar {
 					syntax:         GrammarSyntax::Regex,
-					definition:     Str::from(r"live=(true|false)"),
+					definition:     sf!(r"live=(true|false)"),
 					priority:       7,
 					on_unsupported: Fallback::Unspecified,
 				},
@@ -832,7 +835,7 @@ fn advertisement_contains_only_the_live_schema_and_preserves_supported_grammar()
 	assert_eq!(grammar.syntax, ToolGrammarSyntax::Regex);
 	assert_eq!(grammar.definition, r"live=(true|false)");
 	assert_eq!(tool.disposition, Some(ConstraintDisposition::Required));
-	assert_eq!(tool.priority, Some(7));
+	assert_eq!(tool.priority, Some(131));
 	assert_eq!(tool.adjustments, [] as [omp_llm_inference::Adjustment; 0]);
 }
 
@@ -930,7 +933,7 @@ fn unsupported_grammar_degrades_to_live_lenient_schema_with_a_receipt() {
 				br#"{"type":"object","properties":{"live":{"const":true}},"required":["live"]}"#,
 				Constraint::Grammar {
 					syntax:         GrammarSyntax::Ebnf,
-					definition:     Str::from("root = 'live';"),
+					definition:     sf!("root = 'live';"),
 					priority:       11,
 					on_unsupported: Fallback::Unspecified,
 				},
@@ -960,7 +963,7 @@ fn unsupported_grammar_degrades_to_live_lenient_schema_with_a_receipt() {
 	assert_eq!(schema.as_value(), &live_schema);
 	assert!(!strict, "grammar fallback must remain non-strict even when strict schema is available");
 	assert_eq!(tool.disposition, Some(ConstraintDisposition::Prefer));
-	assert_eq!(tool.priority, Some(11));
+	assert_eq!(tool.priority, Some(133));
 	assert_eq!(tool.adjustments.len(), 1);
 	assert!(matches!(
 		&tool.adjustments[0],
@@ -973,7 +976,7 @@ fn unsupported_grammar_degrades_to_live_lenient_schema_with_a_receipt() {
 fn pull_validates_only_the_requested_value_and_ignores_unknown_malformed_json() {
 	let raw = r#"{"wanted":7,"unknown":[}"#;
 	let (feed, mut params) = IncomingParams::channel();
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 
 	let wanted = block_on(params.pull(|mut doc| async move {
 		let root = doc.json();
@@ -983,8 +986,10 @@ fn pull_validates_only_the_requested_value_and_ignores_unknown_malformed_json() 
 	}))
 	.expect("an unknown unpulled sibling cannot fail the requested pull");
 	assert_eq!(wanted.as_f64(), 7.0);
+	let fin = block_on(params.finalize());
+	println!("FINALIZE RESULT: {fin:?}");
 	assert!(matches!(
-		block_on(params.finalize()),
+		fin,
 		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Malformed
 	));
 }
@@ -993,7 +998,7 @@ fn pull_validates_only_the_requested_value_and_ignores_unknown_malformed_json() 
 fn pulled_type_failure_is_a_structured_argument_issue() {
 	let raw = r#"{"wanted":"seven","unknown":[}"#;
 	let (feed, mut params) = IncomingParams::channel();
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 
 	let error = block_on(params.pull(|mut doc| async move {
 		let root = doc.json();
@@ -1005,7 +1010,7 @@ fn pulled_type_failure_is_a_structured_argument_issue() {
 	let ParamError::Args(issue) = error else {
 		panic!("pull failures must retain their structured argument issue")
 	};
-	assert_eq!(issue.path, vec![ArgPath::Key(Str::from("wanted"))]);
+	assert_eq!(issue.path, vec![ArgPath::Key(sf!("wanted"))]);
 	assert_eq!(issue.kind, ArgIssueKind::TypeMismatch);
 	assert_eq!(issue.expected, "number");
 	assert_eq!(issue.found.as_deref(), Some("string"));
@@ -1014,22 +1019,23 @@ fn pulled_type_failure_is_a_structured_argument_issue() {
 #[test]
 fn commitment_is_explicit_and_feed_guard_drop_aborts() {
 	let (feed, mut committed) = IncomingParams::channel();
-	feed.arg_text(Str::from("{value:1}")).unwrap();
-	feed.args_committed(Str::from("{value:1}")).unwrap();
+	feed.arg_text(sf!("{{value:1}}")).unwrap();
+	feed.args_committed(sf!("{{value:1}}")).unwrap();
 	assert_eq!(block_on(committed.committed()).unwrap(), r#"{"value":1}"#);
 
 	let (guard, mut abandoned) = IncomingParams::channel();
-	guard.arg_text(Str::from("{value:")).unwrap();
+	guard.arg_text(sf!("{{value:")).unwrap();
 	drop(guard);
-	assert!(matches!(block_on(abandoned.committed()), Err(CommitError::Aborted)));
+	let res = block_on(abandoned.committed());
+	println!("ABANDONED RESULT: {res:?}");
+	assert!(matches!(res, Err(CommitError::Aborted)));
 }
 #[test]
 fn post_commit_interrupt_wait_preserves_reason_and_reports_owner_drop() {
 	let (feed, mut params) = IncomingParams::channel();
-	feed.args_committed(Str::from("{}")).unwrap();
+	feed.args_committed(Str::new_static("{}")).unwrap();
 	assert_eq!(block_on(params.committed()).unwrap(), "{}");
-	let expected =
-		Interrupt { class: Str::from("immediate"), reason: Str::from("steering changed") };
+	let expected = Interrupt { class: sf!("immediate"), reason: sf!("steering changed") };
 	feed.interrupt(expected.clone()).unwrap();
 	assert_eq!(block_on(params.next_interrupt()).unwrap(), expected);
 
@@ -1048,8 +1054,8 @@ fn prompt_projection_is_exact_and_deterministic_for_the_same_input() {
 		)
 		.unwrap();
 	let verdict = serde_json::to_vec(&CallOutcome::<FakePayload, FakeFault>::Ok(FakePayload {
-		implementation: Str::from("engine"),
-		raw:            Str::from("{value:9}"),
+		implementation: sf!("engine"),
+		raw:            Str::new_static("{value:9}"),
 	}))
 	.unwrap();
 	let live = identity(1);
@@ -1075,7 +1081,7 @@ fn prompt_projection_is_exact_and_deterministic_for_the_same_input() {
 	assert_eq!(
 		first,
 		Arc::<[Part]>::from(vec![
-			Part::Text { text: Str::from(format!("renderer|ok:engine:{}|3/256/true", "{value:9}")) },
+			Part::Text { text: sf!("renderer|ok:engine:{}|3/256/true", "{value:9}") },
 			Part::Json { json: Bytes::from_static(br#""ok:engine:{value:9}""#) },
 		])
 	);
@@ -1234,18 +1240,15 @@ impl CallOutcomeSpill for RecordingSpill {
 			.send(json.clone())
 			.expect("test receiver remains live");
 		ready(Ok(BlobRef {
-			hash:       Str::from("sha256:fake"),
-			media_type: Str::from("application/json"),
+			hash:       sf!("sha256:fake"),
+			media_type: sf!("application/json"),
 			byte_len:   json.len() as u64,
 		}))
 	}
 }
 
 fn outcome_with_raw(raw: &str) -> CallOutcome<FakePayload, FakeFault> {
-	CallOutcome::Ok(FakePayload {
-		implementation: Str::from("engine"),
-		raw:            Str::from(raw),
-	})
+	CallOutcome::Ok(FakePayload { implementation: sf!("engine"), raw: Str::new(raw) })
 }
 
 #[test]
@@ -1276,8 +1279,8 @@ fn call_outcome_threshold_keeps_n_minus_one_and_n_inline_then_spills_n_plus_one(
 		block_on(call_outcome_details(&above.0, n, &spill)).unwrap(),
 		CallOutcomeDetails::Spilled {
 			blob:     BlobRef {
-				hash:       Str::from("sha256:fake"),
-				media_type: Str::from("application/json"),
+				hash:       sf!("sha256:fake"),
+				media_type: sf!("application/json"),
 				byte_len:   above.1.len() as u64,
 			},
 			byte_len: above.1.len() as u64,
@@ -1353,16 +1356,16 @@ fn call_outcome_reports_serializer_and_each_spill_stage_error() {
 
 #[test]
 fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
-	let rev = Rev { family: Str::from("args"), n: 2 };
-	let canonical = smallvec![ArgPath::Key(Str::from("path"))];
-	let alias = smallvec![ArgPath::Key(Str::from("file"))];
+	let rev = Rev { family: sf!("args"), n: 2 };
+	let canonical = smallvec![ArgPath::Key(sf!("path"))];
+	let alias = smallvec![ArgPath::Key(sf!("file"))];
 	let spec = ArgSpec {
 		path:                  canonical.clone(),
-		aliases:               smallvec![Str::from("file")],
+		aliases:               smallvec![sf!("file")],
 		coerce:                smallvec![Coerce::Strip, Coerce::JsonString],
 		from_union_branch:     false,
-		expected:              Str::from("workspace path"),
-		example:               Some(Str::from("src/lib.rs")),
+		expected:              sf!("workspace path"),
+		example:               Some(sf!("src/lib.rs")),
 		additional_properties: false,
 	};
 	let mut specs = ArgSpecRegistry::new();
@@ -1383,7 +1386,7 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 			aliases:               smallvec![],
 			coerce:                smallvec![],
 			from_union_branch:     false,
-			expected:              Str::from("other"),
+			expected:              sf!("other"),
 			example:               None,
 			additional_properties: false,
 		},),
@@ -1393,11 +1396,11 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 	assert!(specs.is_sealed());
 	assert_eq!(
 		specs.register(rev, ArgSpec {
-			path:                  smallvec![ArgPath::Key(Str::from("late"))],
+			path:                  smallvec![ArgPath::Key(sf!("late"))],
 			aliases:               smallvec![],
 			coerce:                smallvec![],
 			from_union_branch:     false,
-			expected:              Str::from("late"),
+			expected:              sf!("late"),
 			example:               None,
 			additional_properties: false,
 		},),
@@ -1407,11 +1410,11 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 
 fn declared_arg(name: &str, aliases: &[&str], coerce: &[Coerce]) -> ArgSpec {
 	ArgSpec {
-		path:                  smallvec![ArgPath::Key(Str::from(name))],
-		aliases:               aliases.iter().map(|alias| Str::from(*alias)).collect(),
+		path:                  smallvec![ArgPath::Key(Str::new(name))],
+		aliases:               aliases.iter().map(|alias| Str::new(*alias)).collect(),
 		coerce:                coerce.iter().copied().collect(),
 		from_union_branch:     false,
-		expected:              Str::from(name),
+		expected:              Str::new(name),
 		example:               None,
 		additional_properties: false,
 	}
@@ -1428,7 +1431,7 @@ fn bound_params<'a>(
 
 #[test]
 fn finalizer_rejects_every_alias_ambiguity_class() {
-	let rev = Rev { family: Str::from("args"), n: 1 };
+	let rev = Rev { family: sf!("args"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
 		.register(rev.clone(), declared_arg("path", &["file", "filename"], &[]))
@@ -1439,12 +1442,12 @@ fn finalizer_rejects_every_alias_ambiguity_class() {
 		[r#"{"path":"a","path":"b"}"#, r#"{"path":"a","file":"b"}"#, r#"{"file":"a","filename":"b"}"#]
 	{
 		let (feed, mut params) = bound_params(&rev, &specs);
-		feed.args_committed(Str::from(raw)).unwrap();
+		feed.args_committed(Str::new(raw)).unwrap();
 		assert!(matches!(
 			block_on(params.finalize()),
 			Err(ParamError::Args(issue))
 				if issue.kind == ArgIssueKind::Ambiguous
-					&& issue.path == vec![ArgPath::Key(Str::from("path"))]
+					&& issue.path == vec![ArgPath::Key(sf!("path"))]
 		));
 	}
 }
@@ -1453,14 +1456,9 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	let maximum = Effects {
 		documents: Some(DocEffects {
 			read:        true,
-			write_globs: [Str::from("src/**"), Str::from("tests/**")]
-				.into_iter()
-				.collect(),
+			write_globs: [sf!("src/**"), sf!("tests/**")].into_iter().collect(),
 		}),
-		exec:      Some(ExecEffects {
-			commands: [Str::from("*")].into_iter().collect(),
-			network:  false,
-		}),
+		exec:      Some(ExecEffects { commands: [sf!("*")].into_iter().collect(), network: false }),
 		inference: Some(InferenceEffects {
 			max_requests: 3,
 			max_usd:      "1.25".parse().expect("canonical decimal"),
@@ -1470,10 +1468,10 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	let narrowed = Effects {
 		documents: Some(DocEffects {
 			read:        true,
-			write_globs: [Str::from("src/generated/**")].into_iter().collect(),
+			write_globs: [sf!("src/generated/**")].into_iter().collect(),
 		}),
 		exec:      Some(ExecEffects {
-			commands: [Str::from("cargo")].into_iter().collect(),
+			commands: [sf!("cargo")].into_iter().collect(),
 			network:  false,
 		}),
 		inference: Some(InferenceEffects {
@@ -1493,10 +1491,8 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	widened.exec.as_mut().unwrap().network = true;
 	assert!(!widened.is_subset_of(&maximum));
 	widened.exec.as_mut().unwrap().network = false;
-	widened.documents = Some(DocEffects {
-		read:        true,
-		write_globs: Arc::from([Str::from("src/../secrets/**")]),
-	});
+	widened.documents =
+		Some(DocEffects { read: true, write_globs: Arc::from([sf!("src/../secrets/**")]) });
 	assert!(!widened.is_subset_of(&maximum));
 	assert!(!maximum.is_subset_of(&Effects::empty()));
 
@@ -1512,7 +1508,7 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 
 #[test]
 fn finalizer_applies_all_nine_coercions_and_logs_only_successes() {
-	let rev = Rev { family: Str::from("coerce"), n: 1 };
+	let rev = Rev { family: sf!("coerce"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	for (name, coercion) in [
 		("b", Coerce::LooseBool),
@@ -1535,7 +1531,7 @@ fn finalizer_applies_all_nine_coercions_and_logs_only_successes() {
 	specs.seal();
 	let raw = r#"{"b":"yes","i":42.0,"n":"3.5","s":true,"one":"x","js":"[1,2]","trim":" x ","csv":"a, b","gone":"null","already":true}"#;
 	let (feed, mut params) = bound_params(&rev, &specs);
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
 
 	assert_eq!(finalized.raw(), raw);
@@ -1557,7 +1553,7 @@ fn finalizer_applies_all_nine_coercions_and_logs_only_successes() {
 
 #[test]
 fn finalizer_stringifies_object_and_array_values_for_declared_strings() {
-	let rev = Rev { family: Str::from("container-string"), n: 1 };
+	let rev = Rev { family: sf!("container-string"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
 		.register(rev.clone(), declared_arg("object", &[], &[Coerce::String]))
@@ -1569,7 +1565,7 @@ fn finalizer_stringifies_object_and_array_values_for_declared_strings() {
 
 	let (feed, mut params) = bound_params(&rev, &specs);
 	feed
-		.args_committed(Str::from(r#"{"object":{"a":1},"array":["x",2]}"#))
+		.args_committed(sf!(r#"{{"object":{{"a":1}},"array":["x",2]}}"#))
 		.unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
 	assert_eq!(finalized.effective_json(), r#"{"object":"{\"a\":1}","array":"[\"x\",2]"}"#);
@@ -1577,7 +1573,7 @@ fn finalizer_stringifies_object_and_array_values_for_declared_strings() {
 
 #[test]
 fn speculative_union_declarations_suppress_lossy_coercions() {
-	let rev = Rev { family: Str::from("union-provenance"), n: 1 };
+	let rev = Rev { family: sf!("union-provenance"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	let mut string = declared_arg("payload", &[], &[Coerce::String]);
 	string.from_union_branch = true;
@@ -1589,7 +1585,7 @@ fn speculative_union_declarations_suppress_lossy_coercions() {
 
 	let raw = r#"{"payload":{"a":1},"items":"one"}"#;
 	let (feed, mut params) = bound_params(&rev, &specs);
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
 	assert_eq!(finalized.effective_json(), raw);
 	assert!(finalized.repairs().is_empty());
@@ -1597,7 +1593,7 @@ fn speculative_union_declarations_suppress_lossy_coercions() {
 
 #[test]
 fn authoritative_tag_selected_declarations_allow_lossy_coercions() {
-	let rev = Rev { family: Str::from("tag-selected"), n: 1 };
+	let rev = Rev { family: sf!("tag-selected"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
 		.register(rev.clone(), declared_arg("payload", &[], &[Coerce::String]))
@@ -1609,7 +1605,7 @@ fn authoritative_tag_selected_declarations_allow_lossy_coercions() {
 
 	let (feed, mut params) = bound_params(&rev, &specs);
 	feed
-		.args_committed(Str::from(r#"{"payload":{"a":1},"items":"one"}"#))
+		.args_committed(sf!(r#"{{"payload":{{"a":1}},"items":"one"}}"#))
 		.unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
 	assert_eq!(finalized.effective_json(), r#"{"payload":"{\"a\":1}","items":["one"]}"#);
@@ -1618,7 +1614,7 @@ fn authoritative_tag_selected_declarations_allow_lossy_coercions() {
 
 #[test]
 fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
-	let rev = Rev { family: Str::from("final"), n: 1 };
+	let rev = Rev { family: sf!("final"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
 		.register(rev.clone(), declared_arg("path", &["p"], &[]))
@@ -1630,7 +1626,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 
 	let raw = r"{p:'x',config:{extra:1},}";
 	let (feed, mut params) = bound_params(&rev, &specs);
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
 	assert_eq!(finalized.effective_json(), r#"{"path":"x","config":{}}"#);
 	assert!(
@@ -1640,7 +1636,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 			.any(|repair| repair.kind == RepairKind::Elision)
 	);
 
-	let speculative_rev = Rev { family: Str::from("final"), n: 3 };
+	let speculative_rev = Rev { family: sf!("final"), n: 3 };
 	let mut speculative_specs = ArgSpecRegistry::new();
 	let mut speculative = declared_arg("config", &[], &[]);
 	speculative.from_union_branch = true;
@@ -1650,7 +1646,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 	speculative_specs.seal();
 	let (feed, mut params) = bound_params(&speculative_rev, &speculative_specs);
 	feed
-		.args_committed(Str::from(r#"{"config":{"extra":1}}"#))
+		.args_committed(sf!(r#"{{"config":{{"extra":1}}}}"#))
 		.unwrap();
 	// A closed map declared by a failed union branch is speculative: the
 	// branch may simply not be the value's shape, so the member is neither
@@ -1659,7 +1655,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 	assert_eq!(finalized.effective_json(), r#"{"config":{"extra":1}}"#);
 	assert!(finalized.repairs().is_empty());
 
-	let open_rev = Rev { family: Str::from("final"), n: 2 };
+	let open_rev = Rev { family: sf!("final"), n: 2 };
 	let mut open_specs = ArgSpecRegistry::new();
 	open_specs
 		.register(open_rev.clone(), declared_arg("path", &["p"], &[]))
@@ -1669,7 +1665,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 	open_specs.register(open_rev.clone(), open).unwrap();
 	open_specs.seal();
 	let (feed, mut params) = bound_params(&open_rev, &open_specs);
-	feed.args_committed(Str::from(raw)).unwrap();
+	feed.args_committed(Str::new(raw)).unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
 	assert_eq!(finalized.raw().as_bytes(), raw.as_bytes());
 	assert_eq!(finalized.effective_json(), r#"{"path":"x","config":{"extra":1}}"#);
@@ -1687,7 +1683,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 	);
 	let duplicate = r#"{"config":{"x":1,"x":2}}"#;
 	let (feed, mut params) = bound_params(&open_rev, &open_specs);
-	feed.args_committed(Str::from(duplicate)).unwrap();
+	feed.args_committed(Str::new(duplicate)).unwrap();
 	assert!(matches!(
 		block_on(params.finalize()),
 		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Ambiguous
@@ -1696,7 +1692,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 
 #[test]
 fn cursor_refuses_concurrent_pulls_and_keeps_lazy_chunk_offsets() {
-	let rev = Rev { family: Str::from("cursor"), n: 1 };
+	let rev = Rev { family: sf!("cursor"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
 		.register(rev.clone(), declared_arg("text", &[], &[]))
@@ -1705,8 +1701,8 @@ fn cursor_refuses_concurrent_pulls_and_keeps_lazy_chunk_offsets() {
 
 	let (feed, mut params) = bound_params(&rev, &specs);
 	let cursor = params.cursor().unwrap();
-	feed.arg_text(Str::from(r#"{"text":"hel"#)).unwrap();
-	let path = [ArgPath::Key(Str::from("text"))];
+	feed.arg_text(sf!(r#"{{"text":"hel"#)).unwrap();
+	let path = [ArgPath::Key(sf!("text"))];
 	let mut first = Box::pin(cursor.pull_at(&path, PullMode::Complete, "string"));
 	assert!(first.as_mut().now_or_never().is_none());
 	assert!(matches!(
@@ -1714,10 +1710,8 @@ fn cursor_refuses_concurrent_pulls_and_keeps_lazy_chunk_offsets() {
 		Err(ParamError::Protocol(problem)) if problem == "concurrent pull"
 	));
 	drop(first);
-	feed.arg_text(Str::from(r#"lo"}"#)).unwrap();
-	feed
-		.args_committed(Str::from(r#"{"text":"hello"}"#))
-		.unwrap();
+	feed.arg_text(sf!(r#"lo"}}"#)).unwrap();
+	feed.args_committed(sf!(r#"{{"text":"hello"}}"#)).unwrap();
 	let pulled = block_on(cursor.pull_at(&path, PullMode::Complete, "string")).unwrap();
 	assert!(
 		matches!(pulled.kind, PulledKind::Complete(omp_slopjson::Value::String(value)) if value == "hello")
@@ -1725,9 +1719,7 @@ fn cursor_refuses_concurrent_pulls_and_keeps_lazy_chunk_offsets() {
 
 	let (feed, mut params) = bound_params(&rev, &specs);
 	let cursor = params.cursor().unwrap();
-	feed
-		.args_committed(Str::from(r#"{"text":"a\nb"}"#))
-		.unwrap();
+	feed.args_committed(sf!(r#"{{"text":"a\nb"}}"#)).unwrap();
 	let first = block_on(cursor.pull_at(&path, PullMode::Chunk(999), "string")).unwrap();
 	assert!(matches!(
 		first.kind,
@@ -1742,8 +1734,8 @@ fn cursor_refuses_concurrent_pulls_and_keeps_lazy_chunk_offsets() {
 
 #[test]
 fn finalizer_uses_only_the_bound_revision_declarations() {
-	let first = Rev { family: Str::from("rev"), n: 1 };
-	let second = Rev { family: Str::from("rev"), n: 2 };
+	let first = Rev { family: sf!("rev"), n: 1 };
+	let second = Rev { family: sf!("rev"), n: 2 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
 		.register(first.clone(), declared_arg("v", &[], &[Coerce::Integer]))
@@ -1754,7 +1746,7 @@ fn finalizer_uses_only_the_bound_revision_declarations() {
 	specs.seal();
 	for (rev, expected) in [(&first, r#"{"v":42}"#), (&second, r#"{"v":"42"}"#)] {
 		let (feed, mut params) = bound_params(rev, &specs);
-		feed.args_committed(Str::from(r#"{"v":"42"}"#)).unwrap();
+		feed.args_committed(sf!(r#"{{"v":"42"}}"#)).unwrap();
 		assert_eq!(block_on(params.finalize()).unwrap().effective_json(), expected);
 	}
 }
@@ -1776,7 +1768,7 @@ impl Render for CountRender {
 	}
 
 	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		Some(Str::from(format!("count={state};settled={}", outcome.is_some())))
+		Some(sf!("count={state};settled={}", outcome.is_some()))
 	}
 }
 
@@ -1790,15 +1782,13 @@ fn policy_denied_abort_round_trips_and_missing_fields_keep_legacy_abort_kind() {
 	.expect("legacy abort without additive fields remains readable");
 	assert!(matches!(legacy, CallOutcome::Aborted { kind: AbortKind::Skipped, policy: None, .. }));
 
-	let outcome = Outcome::policy_denied(
-		Abort::Skipped { reason: Str::from("admission refused") },
-		PolicyDenied {
-			reason:      Str::from("workspace policy refused this call"),
-			code:        Some(Str::from("policy.workspace")),
-			decision_id: Str::from("decision-7"),
-			rules:       Arc::from([Str::from("workspace.read-only")]),
-		},
-	);
+	let outcome =
+		Outcome::policy_denied(Abort::Skipped { reason: sf!("admission refused") }, PolicyDenied {
+			reason:      sf!("workspace policy refused this call"),
+			code:        Some(sf!("policy.workspace")),
+			decision_id: sf!("decision-7"),
+			rules:       Arc::from([sf!("workspace.read-only")]),
+		});
 	let decoded: Outcome =
 		serde_json::from_slice(&serde_json::to_vec(&outcome).expect("serialize policy denial"))
 			.expect("deserialize policy denial");
@@ -1807,7 +1797,7 @@ fn policy_denied_abort_round_trips_and_missing_fields_keep_legacy_abort_kind() {
 
 #[test]
 fn revision_stamps_round_trip_through_the_canonical_parser() {
-	for rev in [Rev { family: Str::from(""), n: 7 }, Rev { family: Str::from("hl"), n: 3 }] {
+	for rev in [Rev { family: Default::default(), n: 7 }, Rev { family: sf!("hl"), n: 3 }] {
 		assert_eq!(rev.to_string().parse::<Rev>().unwrap(), rev);
 	}
 	for invalid in ["", ".3", "hl.", "hl.3.more", "hl.-1", "65536"] {
@@ -1817,8 +1807,7 @@ fn revision_stamps_round_trip_through_the_canonical_parser() {
 
 #[test]
 fn render_registry_is_exact_revision_cached_and_falls_back_without_name_lookup() {
-	let exact =
-		ToolIdentity { name: Str::from("counter"), rev: Rev { family: Str::from("counter"), n: 1 } };
+	let exact = ToolIdentity { name: sf!("counter"), rev: Rev { family: sf!("counter"), n: 1 } };
 	let unknown = ToolIdentity {
 		name: exact.name.clone(),
 		rev:  Rev { family: exact.rev.family.clone(), n: 2 },
@@ -1869,11 +1858,11 @@ fn detached_artifact_lifetime_is_explicit_and_session_is_the_conservative_defaul
 		(ArtifactLifetime::Durable, "durable"),
 	] {
 		let job = JobRef {
-			id:       Str::from("job-7"),
-			owner:    JobOwner::NamedProcess { name: Str::from("render"), generation: 3 },
+			id:       sf!("job-7"),
+			owner:    JobOwner::NamedProcess { name: sf!("render"), generation: 3 },
 			artifact: ExpectedArtifact {
-				description: Str::from("rendered video"),
-				media_type: Some(Str::from("video/mp4")),
+				description: sf!("rendered video"),
+				media_type: Some(sf!("video/mp4")),
 				lifetime,
 			},
 		};

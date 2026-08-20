@@ -10,7 +10,7 @@ const NUM_STATES: usize = 12;
 const NUM_POS_STATES_MAX: usize = 16;
 const MATCH_MIN_LEN: usize = 2;
 
-fn invalid(message: &'static str) -> Error {
+const fn invalid(message: &'static str) -> Error {
 	Error::InvalidArchive(message)
 }
 
@@ -296,7 +296,7 @@ impl LzmaDecoder {
 		Ok(())
 	}
 
-	fn assert_distance(&self, distance: usize) -> Result<()> {
+	const fn assert_distance(&self, distance: usize) -> Result<()> {
 		let available = self.output_pos - self.dictionary_start;
 		if distance == 0 || distance > available || distance > self.dictionary_size {
 			return Err(invalid("invalid LZMA match distance"));
@@ -453,11 +453,7 @@ impl LzmaDecoder {
 }
 
 /// Decompresses a raw LZMA1 stream with standard five-byte properties.
-pub(crate) fn lzma_decompress(
-	properties: &[u8],
-	bytes: &[u8],
-	output_size: usize,
-) -> Result<Vec<u8>> {
+pub fn lzma_decompress(properties: &[u8], bytes: &[u8], output_size: usize) -> Result<Vec<u8>> {
 	let mut decoder = LzmaDecoder::new(output_size, parse_properties(properties)?)?;
 	decoder.decode_chunk(bytes, output_size, false)?;
 	if decoder.output_pos != output_size {
@@ -467,11 +463,7 @@ pub(crate) fn lzma_decompress(
 }
 
 /// Decompresses a stateful LZMA2 stream under an exact output ceiling.
-pub(crate) fn lzma2_decompress(
-	dictionary_property: u8,
-	bytes: &[u8],
-	limit: usize,
-) -> Result<Vec<u8>> {
+pub fn lzma2_decompress(dictionary_property: u8, bytes: &[u8], limit: usize) -> Result<Vec<u8>> {
 	if dictionary_property > 40 {
 		return Err(invalid("unsupported LZMA2 dictionary property"));
 	}
@@ -578,7 +570,7 @@ pub(crate) fn lzma2_decompress(
 }
 
 /// Decompresses one LZMA-alone stream bounded by `limits.archive_size`.
-pub(crate) fn lzma_alone_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
+pub fn lzma_alone_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
 	if bytes.len() < 13 {
 		return Err(invalid("truncated LZMA-alone header"));
 	}

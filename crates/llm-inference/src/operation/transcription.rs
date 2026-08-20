@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 
 use crate::{
@@ -344,10 +344,7 @@ where
 				return Err(wrong_operation(&call, OperationKind::Transcribe));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(
-					OperationKind::Transcribe,
-					Str::from(format!("{error:?}")),
-				));
+				return Err(media_validation_error(OperationKind::Transcribe, sf!("{error:?}")));
 			}
 			let response = pending
 				.ok_or_else(|| {
@@ -362,7 +359,7 @@ where
 				let stream = async_stream::stream! {
 					while let Some(event) = output.next().await {
 						match event.and_then(|event| {
-							state.observe(&event).map_err(|error| media_protocol_error(OperationKind::Transcribe, Str::from(format!("{error:?}"))))?;
+							state.observe(&event).map_err(|error| media_protocol_error(OperationKind::Transcribe, sf!("{error:?}")))?;
 							Ok(event)
 						}) {
 							Ok(event) => yield Ok(event),
@@ -370,7 +367,8 @@ where
 						}
 					}
 					if let Err(error) = state.finish() {
-						yield Err(media_protocol_error(OperationKind::Transcribe, Str::from(format!("{error:?}"))));
+						let detail = sf!("{error:?}");
+						yield Err(media_protocol_error(OperationKind::Transcribe, detail));
 					}
 				};
 				Box::pin(stream) as TranscriptStream

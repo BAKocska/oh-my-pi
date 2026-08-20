@@ -16,7 +16,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use omp_core::{CowBytes, Duration as OmpDuration, DurationError, Str};
+use omp_core::{CowBytes, Duration as OmpDuration, DurationError, Str, sf};
 use omp_tool::BlobRef;
 use omp_tools::eval::{
 	CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, OutputChannel,
@@ -218,7 +218,7 @@ impl ProcessEvalExec {
 			sessions.get(&session.id).cloned()
 		}
 		.ok_or_else(|| Fault::SessionLost {
-			message: Str::from("unknown supervised Python process session"),
+			message: sf!("unknown supervised Python process session"),
 		})?;
 		let gate = Arc::clone(&owned.run_gate).lock_owned().await;
 		let forced_reset = owned.needs_reset.swap(false, Ordering::AcqRel);
@@ -373,7 +373,7 @@ impl OutputSpill {
 		let hash = omp_core::encoding::hex::encode_n(&reference.hash);
 		Ok(Some(BlobRef {
 			hash:       Str::from(hash.as_str()),
-			media_type: Str::new_static("text/plain; charset=utf-8"),
+			media_type: sf!("text/plain; charset=utf-8"),
 			byte_len:   reference.size,
 		}))
 	}
@@ -430,11 +430,11 @@ impl EvalChild {
 		let stdin = child
 			.stdin
 			.take()
-			.ok_or_else(|| ProcessError::Protocol(Str::from("eval child stdin unavailable")))?;
+			.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdin unavailable")))?;
 		let stdout = child
 			.stdout
 			.take()
-			.ok_or_else(|| ProcessError::Protocol(Str::from("eval child stdout unavailable")))?;
+			.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdout unavailable")))?;
 		let mut process = Self {
 			child,
 			stdin,
@@ -455,12 +455,12 @@ impl EvalChild {
 		match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut process.stdout)).await {
 			Ok(Ok(Some(ChildFrame::Ready))) => Ok(process),
 			Ok(Ok(Some(ChildFrame::Fatal { message }))) => Err(ProcessError::Protocol(message)),
-			Ok(Ok(Some(_))) => Err(ProcessError::Protocol(Str::from(
-				"eval child did not send Ready as its first frame",
-			))),
+			Ok(Ok(Some(_))) => {
+				Err(ProcessError::Protocol(sf!("eval child did not send Ready as its first frame",)))
+			},
 			Ok(Ok(None)) => Err(ProcessError::Exited),
 			Ok(Err(error)) => Err(error),
-			Err(_) => Err(ProcessError::Protocol(Str::from("eval child startup timed out"))),
+			Err(_) => Err(ProcessError::Protocol(sf!("eval child startup timed out"))),
 		}
 	}
 
@@ -542,7 +542,7 @@ impl EvalChild {
 							events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
 					} else {
 						let _ = events.send(Err(Fault::SessionLost {
-							message: Str::from("Python eval child exited during the active cell"),
+							message: sf!("Python eval child exited during the active cell"),
 						}));
 					}
 					return false;
@@ -672,7 +672,7 @@ impl EvalChild {
 					{
 						needs_reset.store(true, Ordering::Release);
 						let _ = events.send(Err(Fault::SessionLost {
-							message: Str::from("Python eval child exited during a host bridge response"),
+							message: sf!("Python eval child exited during a host bridge response",),
 						}));
 						return false;
 					}
@@ -684,7 +684,7 @@ impl EvalChild {
 				_ => {
 					needs_reset.store(true, Ordering::Release);
 					let _ = events.send(Err(Fault::SessionLost {
-						message: Str::from("Python eval child sent an invalid or out-of-order frame"),
+						message: sf!("Python eval child sent an invalid or out-of-order frame",),
 					}));
 
 					return false;
@@ -1121,9 +1121,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 				interrupt_grace,
 			}) => (token, capabilities, config, interrupt_grace.parse::<OmpDuration>()?),
 			Some(_) => {
-				return Err(ProcessError::Protocol(Str::from(
-					"Init must be the first eval child frame",
-				)));
+				return Err(ProcessError::Protocol(sf!("Init must be the first eval child frame",)));
 			},
 			None => return Ok(()),
 		};
@@ -1165,7 +1163,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 					child_host
 						.outgoing
 						.send(ChildFrame::Fatal {
-							message: Str::from("eval child received overlapping Run frames"),
+							message: sf!("eval child received overlapping Run frames"),
 						})
 						.map_err(|_| ProcessError::Exited)?;
 					continue;
@@ -1248,7 +1246,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 								run_route.active_run.store(0, Ordering::Release);
 								active_flag.store(false, Ordering::Release);
 								let _ = outgoing.send(ChildFrame::Fatal {
-									message: Str::from("embedded eval stream ended without completion"),
+									message: sf!("embedded eval stream ended without completion",),
 								});
 								break;
 							},
@@ -1267,12 +1265,12 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 				let result = match (value, error) {
 					(Some(value), None) => Ok(value),
 					(None, Some(error)) => Err(error),
-					_ => Err(Str::from("malformed eval parent bridge response")),
+					_ => Err(sf!("malformed eval parent bridge response")),
 				};
 				child_host.resolve(request_id, result);
 			},
 			Some(ParentFrame::Init { .. }) => {
-				return Err(ProcessError::Protocol(Str::from("duplicate eval child Init frame")));
+				return Err(ProcessError::Protocol(sf!("duplicate eval child Init frame")));
 			},
 			Some(ParentFrame::Exit) => break,
 			None => break,
@@ -1443,7 +1441,7 @@ async fn read_frame<R: AsyncBufRead + Unpin + Send, T: DeserializeOwned>(
 			if encoded.is_empty() {
 				return Ok(None);
 			}
-			return Err(ProcessError::Protocol(Str::from("unterminated NDJSON frame")));
+			return Err(ProcessError::Protocol(sf!("unterminated NDJSON frame")));
 		}
 		let newline = available.iter().position(|byte| *byte == b'\n');
 		let take = newline.map_or(available.len(), |index| index + 1);
@@ -1462,7 +1460,7 @@ async fn read_frame<R: AsyncBufRead + Unpin + Send, T: DeserializeOwned>(
 		encoded.pop();
 	}
 	if encoded.is_empty() {
-		return Err(ProcessError::Protocol(Str::from("empty NDJSON frame")));
+		return Err(ProcessError::Protocol(sf!("empty NDJSON frame")));
 	}
 	serde_json::from_slice(&encoded)
 		.map(Some)
@@ -1512,8 +1510,8 @@ const fn cancelled_completion(duration_ms: u64) -> RunCompletion {
 			exit_code: None,
 			duration_ms,
 			exception: Some(PythonException {
-				name:      Str::new_static("KeyboardInterrupt"),
-				message:   Str::new_static("OMP eval cell interrupted"),
+				name:      sf!("KeyboardInterrupt"),
+				message:   sf!("OMP eval cell interrupted"),
 				traceback: Vec::new(),
 			}),
 		},
@@ -1533,8 +1531,8 @@ const fn timeout_completion(duration_ms: u64) -> RunCompletion {
 			exit_code: Some(1),
 			duration_ms,
 			exception: Some(PythonException {
-				name:      Str::new_static("TimeoutError"),
-				message:   Str::new_static("OMP eval cell timed out"),
+				name:      sf!("TimeoutError"),
+				message:   sf!("OMP eval cell timed out"),
 				traceback: Vec::new(),
 			}),
 		},
@@ -1548,10 +1546,7 @@ const fn timeout_completion(duration_ms: u64) -> RunCompletion {
 }
 
 fn resource_fault(operation: &'static str, error: ProcessError) -> Fault {
-	Fault::Resource {
-		operation: Str::new_static(operation),
-		message:   Str::from(error.to_string()),
-	}
+	Fault::Resource { operation: sf!(operation), message: Str::from(error.to_string()) }
 }
 
 fn session_lost(error: ProcessError) -> Fault {

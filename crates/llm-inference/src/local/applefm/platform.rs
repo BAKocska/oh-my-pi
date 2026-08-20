@@ -11,7 +11,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::{Condvar, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -844,7 +844,7 @@ fn start_generation(
 	if !model_availability.available {
 		let reason = model_availability
 			.reason
-			.unwrap_or_else(|| "model_unavailable".into());
+			.unwrap_or_else(|| sf!("model_unavailable"));
 		let code = match reason.as_str() {
 			"device_not_eligible" => "device_not_eligible",
 			"apple_intelligence_not_enabled" => "apple_intelligence_not_enabled",
@@ -1030,7 +1030,7 @@ fn availability_for_model(
 	} else {
 		"model_unavailable"
 	};
-	Ok(AppleFmAvailability { available: false, reason: Some(reason.into()) })
+	Ok(AppleFmAvailability { available: false, reason: Some(Str::new(reason)) })
 }
 
 fn create_session(
@@ -1296,7 +1296,7 @@ impl Request {
 		let text = self
 			.snapshot_strings
 			.to_rust(unsafe { content.assume_init() })
-			.map(Str::from);
+			.map(Str::new);
 		self.snapshot.destroy();
 		match text {
 			Ok(text) => loop {

@@ -100,7 +100,7 @@ use objc2_web_kit::{
 	WKContentWorld, WKScriptMessage, WKScriptMessageHandler, WKSnapshotConfiguration,
 	WKUserContentController, WKWebView,
 };
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 
 use super::{
@@ -331,7 +331,7 @@ define_class!(
 			let _ = self
 				.ivars()
 				.events
-				.send(WebViewEvent::Crashed(fmts!("{}", error.localizedDescription())));
+				.send(WebViewEvent::Crashed(sf!("{}", error.localizedDescription())));
 		}
 	}
 );
@@ -687,7 +687,7 @@ impl WkFrames {
 				self.send_mouse(kind, x, y, 1, 0.0)?;
 			},
 			Input::Scroll { x, y, dx, dy } => {
-				let js = fmts!(
+				let js = sf!(
 					"(()=>{{const \
 					 t=document.elementFromPoint({x},{y})||document.documentElement;if(t.\
 					 dispatchEvent(new \
@@ -843,7 +843,7 @@ fn key_params(key: Key) -> (u16, Str) {
 	/// `kVK_F1..kVK_F12` in order.
 	const F_CODES: [u16; 12] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111];
 	match key {
-		Key::Char(c) => (0, fmts!("{c}")),
+		Key::Char(c) => (0, sf!("{c}")),
 		Key::Enter => (36, Str::new("\r")),
 		Key::Tab => (48, Str::new("\t")),
 		Key::Backspace => (51, Str::new("\u{7f}")),
@@ -860,7 +860,7 @@ fn key_params(key: Key) -> (u16, Str) {
 		Key::F(n) => {
 			let index = usize::from(n.clamp(1, 12) - 1);
 			let chars = char::from_u32(0xf704 + u32::from(n.clamp(1, 12)) - 1)
-				.map(|c| fmts!("{c}"))
+				.map(|c| sf!("{c}"))
 				.unwrap_or_default();
 			(F_CODES[index], chars)
 		},

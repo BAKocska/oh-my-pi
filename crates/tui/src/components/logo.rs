@@ -1,7 +1,7 @@
 //! Provider logo cell backed by packaged `asset://login/<provider>` PNGs,
 //! degrading to a themed monogram card when no logo is packaged.
 
-use omp_core::str::IntoStr;
+use omp_core::IntoStr;
 
 use crate::{
 	Component, Dim, Graphics, PaintCtx, Prop, Props, Rect, Slot, UiContext,

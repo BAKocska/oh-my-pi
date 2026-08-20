@@ -2474,6 +2474,7 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 	use async_trait::async_trait;
+	use omp_core::sf;
 	use tokio::sync::Notify;
 
 	use super::*;
@@ -2750,7 +2751,7 @@ mod tests {
 			_: Bytes,
 			_: CancellationToken,
 		) -> Result<(), LspTransportError> {
-			Err(LspTransportError::Closed { message: Str::new_static("injected failure") })
+			Err(LspTransportError::Closed { message: sf!("injected failure") })
 		}
 	}
 
@@ -2794,7 +2795,7 @@ mod tests {
 		) -> Result<(), LspTransportError> {
 			self.params.lock().push(params);
 			if self.fail.load(Ordering::Relaxed) {
-				Err(LspTransportError::Closed { message: Str::new_static("injected failure") })
+				Err(LspTransportError::Closed { message: sf!("injected failure") })
 			} else {
 				Ok(())
 			}
@@ -2839,9 +2840,7 @@ mod tests {
 			_: CancellationToken,
 		) -> Result<(), LspTransportError> {
 			if self.notifications.fetch_add(1, Ordering::Relaxed) == 1 {
-				Err(LspTransportError::Closed {
-					message: Str::new_static("injected second notification failure"),
-				})
+				Err(LspTransportError::Closed { message: sf!("injected second notification failure") })
 			} else {
 				Ok(())
 			}
@@ -2923,12 +2922,11 @@ mod tests {
 
 	#[test]
 	fn selector_requires_every_declared_dimension() {
-		let selector = LspSelector::new(
-			vec![LanguageId::new("rust").unwrap()],
-			vec![Str::new_static("file")],
-			vec![Str::new_static("**/*.rs")],
-		)
-		.unwrap();
+		let selector =
+			LspSelector::new(vec![LanguageId::new("rust").unwrap()], vec![sf!("file")], vec![sf!(
+				"**/*.rs"
+			)])
+			.unwrap();
 		let rust = LanguageId::new("rust").unwrap();
 		let python = LanguageId::new("python").unwrap();
 		assert!(selector.matches(&Url::parse("file:///project/src/lib.rs").unwrap(), Some(&rust)));
@@ -3013,10 +3011,7 @@ mod tests {
 				LspBindingSpec::new(
 					"formatter",
 					0,
-					LspSelector::new(Vec::new(), vec![Str::new_static("file")], vec![Str::new_static(
-						"**/file.txt",
-					)])
-					.unwrap(),
+					LspSelector::new(Vec::new(), vec![sf!("file")], vec![sf!("**/file.txt",)]).unwrap(),
 				)
 				.unwrap(),
 				server,

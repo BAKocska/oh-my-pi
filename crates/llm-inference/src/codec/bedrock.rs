@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::base64};
+use omp_core::{Str, encoding::base64, sf};
 use omp_llm_catalog::{
 	Availability, ChatCapabilities, ClassId, DiscoveredModel, ModalityBits, ModelAvailability,
 	ModelCapabilities, OperationBits, OperationKind, ReasoningEffort, ThinkingEffort, ThinkingMode,
@@ -137,15 +137,12 @@ impl Codec for BedrockConverseCodec {
 				Ok(EncodedRequest::new(
 					OperationKind::Chat,
 					RequestMethod::Post,
-					Str::from(uri),
+					Str::new(uri),
 					vec![
+						RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 						RequestHeader {
-							name:  Str::new_static("content-type"),
-							value: Str::new_static("application/json"),
-						},
-						RequestHeader {
-							name:  Str::new_static("accept"),
-							value: Str::new_static("application/vnd.amazon.eventstream"),
+							name:  sf!("accept"),
+							value: sf!("application/vnd.amazon.eventstream"),
 						},
 					]
 					.into_boxed_slice(),
@@ -169,11 +166,8 @@ impl Codec for BedrockConverseCodec {
 					OperationKind::DiscoverModels,
 					RequestMethod::Get,
 					bedrock_discovery_uri(context)?,
-					vec![RequestHeader {
-						name:  Str::new_static("accept"),
-						value: Str::new_static("application/json"),
-					}]
-					.into_boxed_slice(),
+					vec![RequestHeader { name: sf!("accept"), value: sf!("application/json") }]
+						.into_boxed_slice(),
 					BodySource::Bytes(Bytes::new()),
 					FramingProtocol::Raw,
 					SizeBounds {
@@ -690,8 +684,8 @@ fn encode_message(
 				*history_has_tools = true;
 				let wire_id = proof
 					.as_ref()
-					.map_or_else(|| Ok(Str::from(call.as_str())), |proof| proof_text(proof, context))?;
-				wire_tool_ids.insert(Str::from(call.as_str()), wire_id.clone());
+					.map_or_else(|| Ok(Str::new(call.as_str())), |proof| proof_text(proof, context))?;
+				wire_tool_ids.insert(Str::new(call.as_str()), wire_id.clone());
 				content.push(WireContentBlock::ToolUse {
 					tool_use: ToolUseBlock {
 						tool_use_id: wire_id,
@@ -716,7 +710,7 @@ fn encode_message(
 						tool_use_id: wire_tool_ids
 							.get(call.as_str())
 							.cloned()
-							.unwrap_or_else(|| Str::from(call.as_str())),
+							.unwrap_or_else(|| Str::new(call.as_str())),
 						content:     if result.is_empty() {
 							vec![WireToolResultContent::Text { text: Str::default() }]
 						} else {
@@ -769,7 +763,7 @@ fn proof_text(proof: &ProviderProof, context: &EncodeContext<'_>) -> Result<Str,
 		return Err(encoding_error(ErrorKind::CodecMismatch, "bedrock.proof.scope_mismatch"));
 	}
 	std::str::from_utf8(&proof.value)
-		.map(Str::from)
+		.map(Str::new)
 		.map_err(|_| encoding_error(ErrorKind::InvalidRequest, "bedrock.proof.not_utf8"))
 }
 
@@ -784,7 +778,7 @@ fn document_block(media: &MediaInput) -> Result<DocumentBlock, Error> {
 		MediaInput::Remote { name: Some(name), .. } | MediaInput::Body { name: Some(name), .. } => {
 			name.clone()
 		},
-		_ => Str::new_static("document"),
+		_ => sf!("document"),
 	};
 	Ok(DocumentBlock { format, name, source })
 }
@@ -844,7 +838,7 @@ fn media_format(media_type: &str, kind: MediaKind) -> Result<Str, Error> {
 			));
 		},
 	};
-	Ok(Str::new_static(format))
+	Ok(sf!(format))
 }
 
 fn tool_result_content(content: &ToolResultContent) -> Result<WireToolResultContent, Error> {
@@ -918,8 +912,8 @@ fn tool_config(
 		);
 		tools.push(ToolSpecEnvelope {
 			tool_spec: ToolSpec {
-				name:         Str::new_static(NO_TOOLS_SENTINEL_NAME),
-				description:  Some(Str::new_static(
+				name:         sf!(NO_TOOLS_SENTINEL_NAME),
+				description:  Some(sf!(
 					"Placeholder required by Bedrock validation. Do not call; answer with text.",
 				)),
 				input_schema: InputSchema { json: WireJson::from(&empty_schema) },
@@ -1010,7 +1004,7 @@ fn reasoning_config(
 	let native_effort = selection
 		.native_effort
 		.clone()
-		.unwrap_or_else(|| Str::new_static(thinking_effort_name(requested)));
+		.unwrap_or_else(|| sf!(thinking_effort_name(requested)));
 	let mode = if selection.budget.is_some() && policy.mode == ThinkingMode::AnthropicAdaptive {
 		ThinkingMode::Budget
 	} else {
@@ -1085,7 +1079,7 @@ const fn thinking_effort_name(effort: ThinkingEffort) -> &'static str {
 
 fn wire_tool_name(name: &Str, context: &EncodeContext<'_>) -> Str {
 	if context.policy.tool.escape_builtin_names == Some(true) {
-		Str::from(format!("_{name}"))
+		sf!("_{name}")
 	} else {
 		name.clone()
 	}
@@ -1150,7 +1144,7 @@ fn bedrock_discovery_endpoint(base: &str, region: &str) -> Result<Str, Error> {
 	uri.set_path("/foundation-models");
 	uri.set_query(None);
 	uri.set_fragment(None);
-	Ok(Str::from(uri.to_string()))
+	Ok(Str::new(&uri))
 }
 
 fn bedrock_endpoint_region(base: &str) -> Option<&str> {
@@ -1320,7 +1314,7 @@ impl FoundationModelSummary {
 			declared_limits: None,
 			extended_context_mode: None,
 			availability: Some(ModelAvailability::Available),
-			source: Str::new_static("bedrock-list-foundation-models"),
+			source: sf!("bedrock-list-foundation-models"),
 			observed_at_ms: None,
 			updated_at_ms: None,
 			deprecated: Some(false),
@@ -1431,14 +1425,14 @@ impl BedrockDecoder {
 	) {
 		let exception = serde_json::from_slice::<WireException>(payload).unwrap_or_default();
 		let payload_message = (!payload.is_empty())
-			.then(|| std::str::from_utf8(payload).ok().map(Str::from))
+			.then(|| std::str::from_utf8(payload).ok().map(Str::new))
 			.flatten();
 		let message = exception
 			.message
 			.or(exception.original_message)
-			.or_else(|| header_message.map(Str::from))
+			.or_else(|| header_message.map(Str::new))
 			.or(payload_message)
-			.unwrap_or_else(|| Str::new_static("Bedrock stream exception"));
+			.unwrap_or_else(|| sf!("Bedrock stream exception"));
 		let status = exception
 			.original_status_code
 			.and_then(|status| u16::try_from(status).ok());
@@ -1918,7 +1912,7 @@ impl WireAssessment {
 			for finding in word.custom_words.into_iter().chain(word.managed_word_lists) {
 				findings.push(SafetyFinding {
 					kind:                 SafetyFindingKind::Word,
-					label:                finding.kind.unwrap_or_else(|| Str::new_static("word")),
+					label:                finding.kind.unwrap_or_else(|| sf!("word")),
 					policy:               policy.clone(),
 					action:               safety_action(finding.action.as_deref()),
 					detected:             finding.detected,
@@ -1937,7 +1931,7 @@ impl WireAssessment {
 					label:                finding
 						.kind
 						.or(finding.name)
-						.unwrap_or_else(|| Str::new_static("sensitive")),
+						.unwrap_or_else(|| sf!("sensitive")),
 					policy:               policy.clone(),
 					action:               safety_action(finding.action.as_deref()),
 					detected:             finding.detected,
@@ -2111,7 +2105,7 @@ fn map_stop(reason: &str, sentinel_seen: bool) -> Result<FinishReason, Error> {
 		"tool_use" => FinishReason::ToolCalls,
 		"max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
 		"content_filtered" | "guardrail_intervened" => FinishReason::ContentFilter,
-		other if !other.is_empty() => FinishReason::Other(Str::from(other)),
+		other if !other.is_empty() => FinishReason::Other(Str::new(other)),
 		_ => {
 			return Err(stream_error(
 				ErrorKind::ProviderContractMismatch,
@@ -2151,7 +2145,7 @@ fn aws_exception_error(code: &str, message: Str, status: Option<u16>, committed:
 	};
 	Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
 		.status(status)
-		.code(Str::from(code))
+		.code(Str::new(code))
 		.committed(committed)
 		.detail(ErrorDetail::provider(bounded_message(message)))
 }
@@ -2165,18 +2159,18 @@ fn bounded_message(message: Str) -> Str {
 	while !message.is_char_boundary(end) {
 		end -= 1;
 	}
-	Str::from(&message[..end])
+	Str::new(&message[..end])
 }
 
 fn encoding_error(kind: ErrorKind, reason: &'static str) -> Error {
 	Error::new(kind, ErrorPhase::Encoding, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 fn stream_error(kind: ErrorKind, reason: &'static str, committed: bool) -> Error {
 	Error::new(kind, ErrorPhase::Streaming, RetryAction::Never, ExecutionReceipt::default())
 		.committed(committed)
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 #[cfg(test)]
@@ -2300,7 +2294,7 @@ mod tests {
 	fn text_message(role: Role, text: &'static str) -> Message {
 		Message {
 			role,
-			content: vec![ContentPart::Text { text: Str::new_static(text), proof: None }].into(),
+			content: vec![ContentPart::Text { text: sf!(text), proof: None }].into(),
 			name: None,
 		}
 	}
@@ -2337,7 +2331,7 @@ mod tests {
 		request.max_output_tokens = Some(128);
 		request.sampling.temperature = Some(0.2);
 		request.sampling.top_p = Some(0.9);
-		request.sampling.stop = vec![Str::new_static("<END>")].into();
+		request.sampling.stop = vec![sf!("<END>")].into();
 		assert_fixture(encode_fixture(&request, &BedrockOptions::default()), "plain");
 	}
 
@@ -2345,8 +2339,8 @@ mod tests {
 	fn encodes_tools_and_adaptive_thinking_exactly() {
 		let mut request = base_request(vec![text_message(Role::User, "Calculate 2 + 2.")]);
 		request.tools = vec![ToolDefinition {
-			name:        Str::new_static("calculator"),
-			description: Some(Str::new_static("Evaluate a mathematical expression.")),
+			name:        sf!("calculator"),
+			description: Some(sf!("Evaluate a mathematical expression.")),
 			input: ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(
 					serde_json::from_str(
@@ -2390,13 +2384,10 @@ mod tests {
 			Message {
 				role:    Role::Assistant,
 				content: vec![
-					ContentPart::Reasoning {
-						text:  Str::new_static("I should look it up."),
-						proof: Some(proof),
-					},
+					ContentPart::Reasoning { text: sf!("I should look it up."), proof: Some(proof) },
 					ContentPart::ToolCall {
 						call:      call.clone(),
-						name:      Str::new_static("lookup"),
+						name:      sf!("lookup"),
 						arguments: OpaqueJson::new(
 							serde_json::from_str(r#"{"q":"x"}"#).expect("arguments"),
 						),
@@ -2410,8 +2401,8 @@ mod tests {
 				role:    Role::Tool,
 				content: vec![ContentPart::ToolResult {
 					call,
-					name: Some(Str::new_static("lookup")),
-					content: vec![ToolResultContent::Text(Str::new_static("x is 4"))].into(),
+					name: Some(sf!("lookup")),
+					content: vec![ToolResultContent::Text(sf!("x is 4"))].into(),
 					is_error: false,
 				}]
 				.into(),
@@ -2448,8 +2439,8 @@ mod tests {
 		let request = base_request(vec![text_message(Role::User, "Check this.")]);
 		let options = BedrockOptions {
 			guardrail: Some(BedrockGuardrail {
-				identifier:  Str::new_static("guardrail-1"),
-				version:     Str::new_static("7"),
+				identifier:  sf!("guardrail-1"),
+				version:     sf!("7"),
 				trace:       GuardrailTraceMode::EnabledFull,
 				stream_mode: GuardrailStreamMode::Async,
 			}),

@@ -26,7 +26,7 @@ const FILE_TYPE_FIFO: u32 = 0o010000;
 
 #[derive(Clone, Copy)]
 struct Header {
-	header_size: usize,
+	len:         usize,
 	alignment:   u64,
 	inode:       u32,
 	mode:        u32,
@@ -59,7 +59,7 @@ pub fn is_header(bytes: &[u8]) -> bool {
 	if header.mode > u16::MAX as u32 || header.name_size == 0 {
 		return false;
 	}
-	let Some(name_end) = header.header_size.checked_add(header.name_size as usize) else {
+	let Some(name_end) = header.len.checked_add(header.name_size as usize) else {
 		return false;
 	};
 	name_end <= bytes.len() && bytes[name_end - 1] == 0
@@ -140,7 +140,7 @@ fn read_entries_impl(
 		}
 
 		let name_start = offset
-			.checked_add(header.header_size as u64)
+			.checked_add(header.len as u64)
 			.ok_or(Error::InvalidArchive("CPIO name offset overflows"))?;
 		let name_end = name_start
 			.checked_add(u64::from(header.name_size))
@@ -329,7 +329,7 @@ fn materialize_records(
 	Ok(entries)
 }
 
-fn member_storage(buffer: Option<u32>, data_offset: u64, stored_size: u64) -> Storage {
+const fn member_storage(buffer: Option<u32>, data_offset: u64, stored_size: u64) -> Storage {
 	match buffer {
 		Some(buffer) => Storage::Buffered { buffer, data_offset, stored_size },
 		None => Storage::Raw { data_offset, stored_size },
@@ -407,7 +407,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
 		};
 		let words32 = |offset: usize| u32::from(word(offset)) << 16 | u32::from(word(offset + 2));
 		return Ok(Header {
-			header_size: BINARY_HEADER_SIZE,
+			len:         BINARY_HEADER_SIZE,
 			alignment:   2,
 			dev_major:   0,
 			dev_minor:   u32::from(word(2)),
@@ -433,7 +433,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
 			return Err(Error::InvalidArchive("newc CPIO checksum field is non-zero"));
 		}
 		return Ok(Header {
-			header_size: NEWC_HEADER_SIZE,
+			len:         NEWC_HEADER_SIZE,
 			alignment:   4,
 			inode:       field(0)?,
 			mode:        field(1)?,
@@ -451,7 +451,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
 			return Err(Error::InvalidArchive("truncated portable-ASCII CPIO header"));
 		}
 		return Ok(Header {
-			header_size: ODC_HEADER_SIZE,
+			len:         ODC_HEADER_SIZE,
 			alignment:   1,
 			dev_major:   0,
 			dev_minor:   parse_digits(&bytes[6..12], 8)?,
@@ -563,7 +563,7 @@ fn checksum_range(source: &mut (impl Read + Seek), offset: u64, size: u64) -> Re
 }
 
 /// `Raw` and `Buffered` storage are served by the archive core.
-pub(crate) fn read_entry_to<W: Write>(
+pub(crate) const fn read_entry_to<W: Write>(
 	_source: &mut (impl Read + Seek),
 	_entry: &Entry,
 	_output: &mut W,

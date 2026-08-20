@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1231,13 +1231,13 @@ impl OpenAiResponsesDecoder {
 					message:      envelope
 						.error
 						.message
-						.unwrap_or_else(|| Str::from("Responses request failed")),
+						.unwrap_or_else(|| sf!("Responses request failed")),
 					continuation: ResponsesContinuationFailure::NotStale,
 				})];
 			}
 			return vec![ResponsesProjection::Error(ResponsesErrorEvidence {
-				code:         Some(Str::from("invalid_responses_event")),
-				message:      Str::from("invalid Responses event"),
+				code:         Some(sf!("invalid_responses_event")),
+				message:      sf!("invalid Responses event"),
 				continuation: ResponsesContinuationFailure::Malformed,
 			})];
 		};
@@ -1306,7 +1306,7 @@ impl OpenAiResponsesDecoder {
 					message:      nested
 						.and_then(|error| error.message.clone())
 						.or(event.message)
-						.unwrap_or_else(|| Str::from("Responses request failed")),
+						.unwrap_or_else(|| sf!("Responses request failed")),
 					continuation: ResponsesContinuationFailure::NotStale,
 				}));
 			},
@@ -1348,8 +1348,8 @@ impl OpenAiResponsesDecoder {
 		}
 		self.terminal = true;
 		vec![ResponsesProjection::Error(ResponsesErrorEvidence {
-			code:         Some(Str::from("premature_end")),
-			message:      Str::from("Responses stream ended before an authoritative terminal event"),
+			code:         Some(sf!("premature_end")),
+			message:      sf!("Responses stream ended before an authoritative terminal event",),
 			continuation: ResponsesContinuationFailure::NotStale,
 		})]
 	}
@@ -1423,8 +1423,8 @@ impl OpenAiResponsesDecoder {
 		{
 			self.terminal = true;
 			out.push(ResponsesProjection::Error(ResponsesErrorEvidence {
-				code:         Some(Str::from("missing_tool_call_identity")),
-				message:      Str::from("Responses tool call omitted required identity"),
+				code:         Some(sf!("missing_tool_call_identity")),
+				message:      sf!("Responses tool call omitted required identity"),
 				continuation: ResponsesContinuationFailure::NotStale,
 			}));
 			return;
@@ -1502,7 +1502,7 @@ impl OpenAiResponsesDecoder {
 			OutputSlot::Tool { call_id, .. } | OutputSlot::Computer { call_id, .. } => {
 				let name = match &slot {
 					OutputSlot::Tool { name, .. } => name.clone(),
-					OutputSlot::Computer { .. } => Str::from("computer"),
+					OutputSlot::Computer { .. } => sf!("computer"),
 					_ => unreachable!("tool arm only"),
 				};
 				out.push(ResponsesProjection::Canonical(ChatEvent::BlockStarted {
@@ -1708,7 +1708,7 @@ impl OpenAiResponsesDecoder {
 				out.push(ResponsesProjection::ToolCallComplete {
 					index,
 					id: call_id.clone(),
-					name: Str::from("computer"),
+					name: sf!("computer"),
 					arguments: arguments.clone(),
 					custom: false,
 				});
@@ -1722,7 +1722,7 @@ impl OpenAiResponsesDecoder {
 					out.push(ResponsesProjection::Canonical(ChatEvent::Artifact {
 						index,
 						artifact: Artifact {
-							media_type: Str::from("image/png"),
+							media_type: sf!("image/png"),
 							size:       Some(bytes.len() as u64),
 							digest:     None,
 							body:       ArtifactBody::Bytes(bytes),
@@ -1863,7 +1863,7 @@ fn error_from_response(
 			})
 		})
 		.unwrap_or_else(|| {
-			Str::from(match event {
+			Str::new(match event {
 				ResponsesStreamEventKind::Cancelled => "caller cancelled",
 				_ => "Responses request failed",
 			})
@@ -1894,7 +1894,7 @@ pub fn classify_continuation_error(status: u16, body: &[u8]) -> ResponsesErrorEv
 		.error
 		.message
 		.clone()
-		.unwrap_or_else(|| Str::from("Responses request failed"));
+		.unwrap_or_else(|| sf!("Responses request failed"));
 	let stale_previous = matches!(status, 400 | 404)
 		&& code.as_deref() == Some("previous_response_not_found")
 		|| status == 404
@@ -2272,8 +2272,8 @@ impl OpenAiResponsesCodec {
 				value.committed_items
 			} else {
 				adjustments.push(ResponsesAdjustment::Dropped {
-					field:  Str::from("previous_response_item_count"),
-					reason: Str::from("continuation boundary exceeds canonical history"),
+					field:  sf!("previous_response_item_count"),
+					reason: sf!("continuation boundary exceeds canonical history"),
 				});
 				0
 			}
@@ -2339,8 +2339,8 @@ impl OpenAiResponsesCodec {
 						let Some(proof) = proof else {
 							if !text.is_empty() {
 								adjustments.push(ResponsesAdjustment::Dropped {
-									field:  Str::from("reasoning_history"),
-									reason: Str::from("Responses reasoning replay requires provider proof"),
+									field:  sf!("reasoning_history"),
+									reason: sf!("Responses reasoning replay requires provider proof",),
 								});
 							}
 							continue;
@@ -2366,10 +2366,7 @@ impl OpenAiResponsesCodec {
 							summary: if text.is_empty() {
 								Vec::new()
 							} else {
-								vec![ResponsesSummaryPart {
-									kind: Str::from("summary_text"),
-									text: text.clone(),
-								}]
+								vec![ResponsesSummaryPart { kind: sf!("summary_text"), text: text.clone() }]
 							},
 							encrypted_content: decoded.encrypted_reasoning,
 							actions: Vec::new(),
@@ -2417,7 +2414,7 @@ impl OpenAiResponsesCodec {
 							let call_id = decoded
 								.as_ref()
 								.and_then(|value| value.call_id.clone())
-								.unwrap_or_else(|| Str::from(call.as_str()));
+								.unwrap_or_else(|| Str::new(call.as_str()));
 							let serialized = serde_json::to_string(arguments.as_value())
 								.map_err(|_| ResponsesEncodeError::MissingCallIdentity)?;
 							input.push(ResponsesInputItem {
@@ -2472,7 +2469,7 @@ impl OpenAiResponsesCodec {
 							role: None,
 							content: ResponsesInputContent::default(),
 							name: None,
-							call_id: Some(Str::from(call.as_str())),
+							call_id: Some(Str::new(call.as_str())),
 							arguments: None,
 							input: None,
 							output: Some(ResponsesToolOutput::Text(output.into())),
@@ -2496,10 +2493,10 @@ impl OpenAiResponsesCodec {
 						};
 						if !content.is_empty() {
 							let mut item = ResponsesInputItem::message(role, std::mem::take(&mut content));
-							item.cache_control = Some(ResponsesCacheControl { kind: Str::from(kind) });
+							item.cache_control = Some(ResponsesCacheControl { kind: Str::new(kind) });
 							input.push(item);
 						} else if let Some(item) = input.last_mut() {
-							item.cache_control = Some(ResponsesCacheControl { kind: Str::from(kind) });
+							item.cache_control = Some(ResponsesCacheControl { kind: Str::new(kind) });
 						}
 					},
 				}
@@ -2513,7 +2510,7 @@ impl OpenAiResponsesCodec {
 		let instructions = if instructions.is_empty() {
 			None
 		} else {
-			let joined = Str::from(instructions.join("\n\n"));
+			let joined = Str::new(instructions.join("\n\n"));
 			if context.policy.role.supports_developer_role == Some(true) {
 				let mut item = ResponsesInputItem::message(ResponsesRole::Developer, Vec::new());
 				item.content = ResponsesInputContent::Text(joined);
@@ -2565,8 +2562,8 @@ impl OpenAiResponsesCodec {
 						None,
 						None,
 						Some(ResponsesCustomToolFormat {
-							kind:       Str::new_static("grammar"),
-							syntax:     Some(Str::new_static(match grammar.syntax {
+							kind:       sf!("grammar"),
+							syntax:     Some(sf!(match grammar.syntax {
 								crate::call::ToolGrammarSyntax::Lark => "lark",
 								crate::call::ToolGrammarSyntax::Regex => "regex",
 								crate::call::ToolGrammarSyntax::Ebnf => "ebnf",
@@ -2626,8 +2623,8 @@ impl OpenAiResponsesCodec {
 				HostedTool::WebSearch { allowed_domains, blocked_domains, recency_days } => {
 					if recency_days.is_some() {
 						adjustments.push(ResponsesAdjustment::Dropped {
-							field:  Str::from("hosted_tools.web_search.recency_days"),
-							reason: Str::from("Responses web search has no exact recency-days field"),
+							field:  sf!("hosted_tools.web_search.recency_days"),
+							reason: sf!("Responses web search has no exact recency-days field",),
 						});
 					}
 					ResponsesTool {
@@ -2661,7 +2658,7 @@ impl OpenAiResponsesCodec {
 					allowed_domains:     Vec::new(),
 					blocked_domains:     Vec::new(),
 					vector_store_ids:    Vec::new(),
-					container:           Some(ResponsesCodeContainer { kind: Str::from("auto") }),
+					container:           Some(ResponsesCodeContainer { kind: sf!("auto") }),
 				},
 				HostedTool::Retrieval { stores } => ResponsesTool {
 					kind:                ResponsesToolKind::FileSearch,
@@ -2723,8 +2720,8 @@ impl OpenAiResponsesCodec {
 		let tool_choice = match tool_choice {
 			Some(_) if context.policy.tool.supports_tool_choice == Some(false) => {
 				adjustments.push(ResponsesAdjustment::Dropped {
-					field:  Str::from("tool_choice"),
-					reason: Str::from("route policy rejects tool-choice selectors"),
+					field:  sf!("tool_choice"),
+					reason: sf!("route policy rejects tool-choice selectors"),
 				});
 				None
 			},
@@ -2733,15 +2730,15 @@ impl OpenAiResponsesCodec {
 				| ResponsesToolChoice::Named(_),
 			) if context.policy.tool.forced_choice == Some(false) => {
 				adjustments.push(ResponsesAdjustment::Dropped {
-					field:  Str::from("tool_choice"),
-					reason: Str::from("route policy rejects forced tool choice"),
+					field:  sf!("tool_choice"),
+					reason: sf!("route policy rejects forced tool choice"),
 				});
 				None
 			},
 			Some(ResponsesToolChoice::Named(_)) if context.policy.tool.named_choice == Some(false) => {
 				adjustments.push(ResponsesAdjustment::Dropped {
-					field:  Str::from("tool_choice"),
-					reason: Str::from("route policy rejects named tool choice"),
+					field:  sf!("tool_choice"),
+					reason: sf!("route policy rejects named tool choice"),
 				});
 				None
 			},
@@ -2766,8 +2763,8 @@ impl OpenAiResponsesCodec {
 				Setting::Require(value) | Setting::Prefer(value) => {
 					if value.max_tokens.is_some() {
 						adjustments.push(ResponsesAdjustment::Dropped {
-							field:  Str::from("reasoning.max_tokens"),
-							reason: Str::from("Responses accepts qualitative effort only"),
+							field:  sf!("reasoning.max_tokens"),
+							reason: sf!("Responses accepts qualitative effort only"),
 						});
 					}
 					// Routes without an effort dial (grok-build,
@@ -2794,7 +2791,7 @@ impl OpenAiResponsesCodec {
 							.or_else(|| match value.visibility {
 								ReasoningVisibility::Hidden => Some(None),
 								ReasoningVisibility::Summary | ReasoningVisibility::Visible => {
-									Some(Some(Str::from("auto")))
+									Some(Some(sf!("auto")))
 								},
 							})
 					};
@@ -2808,7 +2805,7 @@ impl OpenAiResponsesCodec {
 		let text = {
 			let verbosity = match &request.verbosity {
 				Setting::Unset => None,
-				Setting::Require(value) | Setting::Prefer(value) => Some(Str::from(match value {
+				Setting::Require(value) | Setting::Prefer(value) => Some(Str::new(match value {
 					TextVerbosity::Low => "low",
 					TextVerbosity::Medium => "medium",
 					TextVerbosity::High => "high",
@@ -2845,9 +2842,9 @@ impl OpenAiResponsesCodec {
 				.or_else(|| match &request.cache_retention {
 					Setting::Unset => None,
 					Setting::Require(CacheRetention::Long) | Setting::Prefer(CacheRetention::Long) => {
-						Some(Str::from("24h"))
+						Some(sf!("24h"))
 					},
-					Setting::Require(_) | Setting::Prefer(_) => Some(Str::from("in_memory")),
+					Setting::Require(_) | Setting::Prefer(_) => Some(sf!("in_memory")),
 				});
 		let service_tier = match &request.service_tier {
 			Setting::Unset => None,
@@ -2855,32 +2852,32 @@ impl OpenAiResponsesCodec {
 		};
 		if request.sampling.top_k.is_some() {
 			adjustments.push(ResponsesAdjustment::Dropped {
-				field:  Str::from("sampling.top_k"),
-				reason: Str::from("Responses has no top-k field"),
+				field:  sf!("sampling.top_k"),
+				reason: sf!("Responses has no top-k field"),
 			});
 		}
 		if request.sampling.seed.is_some() {
 			adjustments.push(ResponsesAdjustment::Dropped {
-				field:  Str::from("sampling.seed"),
-				reason: Str::from("Responses has no deterministic seed field"),
+				field:  sf!("sampling.seed"),
+				reason: sf!("Responses has no deterministic seed field"),
 			});
 		}
 		if !request.sampling.stop.is_empty() {
 			adjustments.push(ResponsesAdjustment::Dropped {
-				field:  Str::from("sampling.stop"),
-				reason: Str::from("Responses has no stop-sequence field"),
+				field:  sf!("sampling.stop"),
+				reason: sf!("Responses has no stop-sequence field"),
 			});
 		}
 		if request.top_logprobs.is_some() {
 			adjustments.push(ResponsesAdjustment::Dropped {
-				field:  Str::from("top_logprobs"),
-				reason: Str::from("Responses streaming projection does not expose logprobs"),
+				field:  sf!("top_logprobs"),
+				reason: sf!("Responses streaming projection does not expose logprobs"),
 			});
 		}
 		if !request.safety.is_empty() {
 			adjustments.push(ResponsesAdjustment::Dropped {
-				field:  Str::from("safety"),
-				reason: Str::from("Responses has no per-request safety thresholds"),
+				field:  sf!("safety"),
+				reason: sf!("Responses has no per-request safety thresholds"),
 			});
 		}
 		// xAI `/v1/responses` rejects presence/frequency penalties for every
@@ -2901,7 +2898,7 @@ impl OpenAiResponsesCodec {
 					.iter()
 					.any(|value| value == "reasoning.encrypted_content")
 			{
-				values.push(Str::from("reasoning.encrypted_content"));
+				values.push(sf!("reasoning.encrypted_content"));
 			}
 			values
 		};
@@ -2910,15 +2907,15 @@ impl OpenAiResponsesCodec {
 		} else {
 			if continuation_id.is_some() {
 				adjustments.push(ResponsesAdjustment::Dropped {
-					field:  Str::from("previous_response_id"),
-					reason: Str::from("stateful Responses is disabled"),
+					field:  sf!("previous_response_id"),
+					reason: sf!("stateful Responses is disabled"),
 				});
 			}
 			None
 		};
 		Ok(EncodedResponses {
 			request: ResponsesRequest {
-				model: Str::from(target.wire_model.as_str()),
+				model: Str::new(target.wire_model.as_str()),
 				input,
 				stream: true,
 				store: self.options.stateful,
@@ -3021,7 +3018,7 @@ fn encode_media_content(
 	match media {
 		MediaInput::Bytes { media_type, data } => {
 			let encoded = omp_core::encoding::base64::encode(data).into_string();
-			let url = Str::from(format!("data:{media_type};base64,{encoded}"));
+			let url = sf!("data:{media_type};base64,{encoded}");
 			Ok(ResponsesContent {
 				kind,
 				text: None,
@@ -3173,7 +3170,7 @@ impl ResponsesDecoderAdapter {
 			}
 		};
 		let code = if model_policy_denial {
-			Some(Str::new_static("codex_chatgpt_account_model_policy"))
+			Some(sf!("codex_chatgpt_account_model_policy"))
 		} else {
 			evidence.code
 		};
@@ -3204,8 +3201,8 @@ impl super::Decoder for ResponsesDecoderAdapter {
 			) => return Ok(()),
 			Frame::Connect(_) | Frame::EventStream(_) => {
 				return Err(self.error_from_evidence(ResponsesErrorEvidence {
-					code:         Some(Str::from("wrong_framing_protocol")),
-					message:      Str::from("Responses decoder received incompatible framing"),
+					code:         Some(sf!("wrong_framing_protocol")),
+					message:      sf!("Responses decoder received incompatible framing"),
 					continuation: ResponsesContinuationFailure::Malformed,
 				}));
 			},
@@ -3235,17 +3232,17 @@ fn encoding_error(code: &'static str) -> crate::error::Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::from(code))
+	.code(Str::new(code))
 }
 
 fn responses_uri(base_url: &str) -> Str {
 	let base = base_url.trim_end_matches('/');
 	if base.ends_with("/responses") {
-		Str::from(base)
+		Str::new(base)
 	} else if base.ends_with("/v1") {
-		Str::from(format!("{base}/responses"))
+		sf!("{base}/responses")
 	} else {
-		Str::from(format!("{base}/v1/responses"))
+		sf!("{base}/v1/responses")
 	}
 }
 
@@ -3310,14 +3307,8 @@ impl super::Codec for OpenAiResponsesCodec {
 					.as_str(),
 			),
 			headers:     vec![
-				super::RequestHeader {
-					name:  Str::from("content-type"),
-					value: Str::from("application/json"),
-				},
-				super::RequestHeader {
-					name:  Str::from("accept"),
-					value: Str::from("text/event-stream"),
-				},
+				super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+				super::RequestHeader { name: sf!("accept"), value: sf!("text/event-stream") },
 			]
 			.into_boxed_slice(),
 			body:        crate::body::BodySource::Bytes(body),
@@ -3347,7 +3338,7 @@ impl super::Codec for OpenAiResponsesCodec {
 			route:      context.route.clone(),
 			wire_model: context
 				.target
-				.map(|target| Str::from(target.wire_model.as_str())),
+				.map(|target| Str::new(target.wire_model.as_str())),
 		}))
 	}
 }
@@ -3394,7 +3385,7 @@ mod tests {
 		ChatRequest {
 			messages:          Arc::from([]),
 			tools:             Arc::from([ToolDefinition {
-				name: Str::new_static("match_input"),
+				name: sf!("match_input"),
 				description: None,
 				input,
 			}]),
@@ -3522,14 +3513,14 @@ mod tests {
 		policy
 			.reasoning
 			.effort_map
-			.insert(ThinkingEffort::Minimal, Str::new_static("low"));
+			.insert(ThinkingEffort::Minimal, sf!("low"));
 		policy
 	}
 
 	fn xai_replay_request(route: &RouteDef, target: &WireTarget) -> ChatRequest {
 		let proof = encode_provider_proof(&ResponsesProviderProof {
-			item_id: Some(Str::new_static("rs_1")),
-			encrypted_reasoning: Some(Str::new_static("enc_BLOB")),
+			item_id: Some(sf!("rs_1")),
+			encrypted_reasoning: Some(sf!("enc_BLOB")),
 			..ResponsesProviderProof::default()
 		})
 		.expect("proof encodes");
@@ -3543,7 +3534,7 @@ mod tests {
 				Message {
 					role:    Role::Assistant,
 					content: Arc::from([ContentPart::Reasoning {
-						text:  Str::new_static("Inspect first."),
+						text:  sf!("Inspect first."),
 						proof: Some(ProviderProof {
 							provider: route.provider.clone(),
 							codec:    target.codec.clone(),
@@ -3656,8 +3647,7 @@ mod tests {
 				parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
 				strict:     false,
 			});
-			request.tool_choice =
-				Setting::Require(crate::call::ToolChoice::Named(Str::new_static("match_input")));
+			request.tool_choice = Setting::Require(crate::call::ToolChoice::Named(sf!("match_input")));
 			request
 		});
 		assert_eq!(encoded.request.tool_choice, None, "rejected selector is omitted");
@@ -3747,7 +3737,7 @@ mod tests {
 			encode_choice(
 				&policy,
 				true,
-				crate::call::ToolChoice::Named(Str::new_static("match_input"))
+				crate::call::ToolChoice::Named(sf!("match_input"))
 			),
 			Some(super::ResponsesToolChoice::Named(named))
 				if named.name.as_deref() == Some("match_input")
@@ -3777,7 +3767,7 @@ mod tests {
 			assert_eq!(
 				encode_tool(ToolInputConstraint::Grammar(ToolGrammar {
 					syntax,
-					definition: Str::from(definition),
+					definition: Str::new(definition),
 				})),
 				expected,
 			);
@@ -4003,11 +3993,11 @@ mod tests {
 			request_id: RequestId::new("request"),
 			provider:   crate::catalog::ProviderId::from("openai-codex"),
 			route:      crate::catalog::RouteId::from("openai-codex/primary"),
-			wire_model: Some(Str::from("gpt-daybreak-blue-latest")),
+			wire_model: Some(sf!("gpt-daybreak-blue-latest")),
 		};
 		let denial = adapter.error_from_evidence(super::ResponsesErrorEvidence {
 			code:         None,
-			message:      Str::from(CODEX_DENIAL),
+			message:      Str::new(CODEX_DENIAL),
 			continuation: ResponsesContinuationFailure::NotStale,
 		});
 		assert_eq!(denial.kind, ErrorKind::Authorization);
@@ -4019,7 +4009,7 @@ mod tests {
 		// error with no rotation.
 		let unrelated = adapter.error_from_evidence(super::ResponsesErrorEvidence {
 			code:         None,
-			message:      Str::from(
+			message:      sf!(
 				"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
 			),
 			continuation: ResponsesContinuationFailure::NotStale,
@@ -4074,7 +4064,7 @@ mod tests {
 	fn read_call(id: &str, path: &str) -> ContentPart {
 		ContentPart::ToolCall {
 			call:      ToolCallId::new(id),
-			name:      Str::from("read"),
+			name:      sf!("read"),
 			arguments: OpaqueJson::new(serde_json::json!({ "path": path })),
 			proof:     None,
 		}
@@ -4087,8 +4077,8 @@ mod tests {
 				.iter()
 				.map(|(id, output)| ContentPart::ToolResult {
 					call:     ToolCallId::new(*id),
-					name:     Some(Str::from("read")),
-					content:  Arc::from([ToolResultContent::Text(Str::from(*output))]),
+					name:     Some(sf!("read")),
+					content:  Arc::from([ToolResultContent::Text(Str::new(*output))]),
 					is_error: false,
 				})
 				.collect(),
@@ -4127,14 +4117,14 @@ mod tests {
 					read_call("call_a", "a"),
 					read_call("call_b", "b"),
 					read_call("call_c", "c"),
-					ContentPart::Text { text: Str::from(trailing), proof: None },
+					ContentPart::Text { text: Str::new(trailing), proof: None },
 				]),
 				name:    None,
 			},
 			read_results(&[("call_a", "out a"), ("call_b", "out b"), ("call_c", "out c")]),
 			Message {
 				role:    Role::User,
-				content: Arc::from([ContentPart::Text { text: Str::from("continue"), proof: None }]),
+				content: Arc::from([ContentPart::Text { text: sf!("continue"), proof: None }]),
 				name:    None,
 			},
 		]);
@@ -4157,7 +4147,7 @@ mod tests {
 			Message {
 				role:    Role::Assistant,
 				content: Arc::from([
-					ContentPart::Text { text: Str::from("calling read on two files"), proof: None },
+					ContentPart::Text { text: sf!("calling read on two files"), proof: None },
 					read_call("call_a", "a"),
 					read_call("call_b", "b"),
 				]),
@@ -4183,10 +4173,10 @@ mod tests {
 			Message {
 				role:    Role::Assistant,
 				content: Arc::from([
-					ContentPart::Reasoning { text: Str::from("planning"), proof: None },
+					ContentPart::Reasoning { text: sf!("planning"), proof: None },
 					read_call("call_a", "a"),
 					read_call("call_b", "b"),
-					ContentPart::Text { text: Str::from("<think>\n</thinking\n</think>"), proof: None },
+					ContentPart::Text { text: sf!("<think>\n</thinking\n</think>"), proof: None },
 				]),
 				name:    None,
 			},

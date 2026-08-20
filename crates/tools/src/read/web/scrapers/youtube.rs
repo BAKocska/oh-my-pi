@@ -1,6 +1,6 @@
 //! Anonymous `YouTube` metadata and transcript renderer.
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::Value;
 use smallvec::SmallVec;
 use url::Url;
@@ -67,11 +67,11 @@ pub(super) async fn render<C: HttpClient + Sync>(
 
 	let transcript = fetch_transcript(client, &caption_tracks).await;
 	match transcript.as_ref().map(|value| value.kind) {
-		Some(TranscriptKind::Manual) => notes.push(Str::new_static("Using manual subtitles")),
+		Some(TranscriptKind::Manual) => notes.push(sf!("Using manual subtitles")),
 		Some(TranscriptKind::Automatic) => {
-			notes.push(Str::new_static("Using auto-generated captions"));
+			notes.push(sf!("Using auto-generated captions"));
 		},
-		None => notes.push(Str::new_static("No subtitles/captions available")),
+		None => notes.push(sf!("No subtitles/captions available")),
 	}
 
 	let content = render_markdown(&target.video_id, &metadata, transcript.as_ref());

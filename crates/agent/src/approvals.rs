@@ -5,7 +5,7 @@ use std::{
 	sync::atomic::{AtomicU64, Ordering},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 
 /// One requirement merged into an invocation's single approval ticket.
@@ -142,8 +142,8 @@ impl ApprovalTicket {
 	pub fn decision_record(&self) -> Option<omp_storage::transcript::ApprovalDecided> {
 		let state = match self.state {
 			TicketState::Pending => return None,
-			TicketState::Decided => Str::new_static("decided"),
-			TicketState::Withdrawn => Str::new_static("withdrawn"),
+			TicketState::Decided => sf!("decided"),
+			TicketState::Withdrawn => sf!("withdrawn"),
 		};
 		let decision = self.decision.as_ref();
 		Some(omp_storage::transcript::ApprovalDecided {
@@ -161,13 +161,13 @@ impl ApprovalTicket {
 
 fn approval_source_name(source: ApprovalSource) -> Str {
 	match source {
-		ApprovalSource::User => Str::new_static("user"),
-		ApprovalSource::External => Str::new_static("external"),
-		ApprovalSource::Forwarded => Str::new_static("forwarded"),
-		ApprovalSource::Config => Str::new_static("config"),
-		ApprovalSource::Extension => Str::new_static("extension"),
-		ApprovalSource::Timeout => Str::new_static("timeout"),
-		ApprovalSource::Unavailable => Str::new_static("unavailable"),
+		ApprovalSource::User => sf!("user"),
+		ApprovalSource::External => sf!("external"),
+		ApprovalSource::Forwarded => sf!("forwarded"),
+		ApprovalSource::Config => sf!("config"),
+		ApprovalSource::Extension => sf!("extension"),
+		ApprovalSource::Timeout => sf!("timeout"),
+		ApprovalSource::Unavailable => sf!("unavailable"),
 	}
 }
 
@@ -233,8 +233,7 @@ impl ApprovalBook {
 			}
 			return ticket.clone();
 		}
-		let ticket_id =
-			Str::from(format!("approval-{}", self.next_id.fetch_add(1, Ordering::Relaxed)));
+		let ticket_id = sf!("approval-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
 		let ticket = ApprovalTicket {
 			ticket_id: ticket_id.clone(),
 			invocation_id: invocation_id.clone(),
@@ -372,7 +371,7 @@ impl ApprovalBook {
 			.tickets
 			.lock()
 			.contains_key(ticket_id)
-			.then(|| ApprovalGuard { book: self, ticket_id: Str::from(ticket_id) })
+			.then(|| ApprovalGuard { book: self, ticket_id: Str::new(ticket_id) })
 	}
 }
 
@@ -389,16 +388,16 @@ mod tests {
 	use super::{ApprovalBook, ApprovalDecision, ApprovalSource, ApprovalSpec, TicketState};
 	fn spec() -> ApprovalSpec {
 		ApprovalSpec {
-			title:         Str::new_static("Run"),
-			body:          Str::new_static("run"),
-			subject:       Str::new_static("cmd"),
-			kind:          Str::new_static("exec"),
-			scopes:        vec![Str::new_static("once")],
+			title:         sf!("Run"),
+			body:          sf!("run"),
+			subject:       sf!("cmd"),
+			kind:          sf!("exec"),
+			scopes:        vec![sf!("once")],
 			default:       None,
-			route:         Str::new_static("local"),
+			route:         sf!("local"),
 			approver:      None,
 			timeout_ms:    1,
-			unreachable:   Str::new_static("fail_closed"),
+			unreachable:   sf!("fail_closed"),
 			require_human: false,
 			pattern:       None,
 			evidence:      Vec::new(),
@@ -407,17 +406,11 @@ mod tests {
 	#[test]
 	fn tickets_merge_answer_idempotently_and_withdraw() {
 		let book = ApprovalBook::new();
-		let ticket = book.file(Some(Str::new_static("i")), vec![spec()], 1);
-		assert_eq!(
-			book
-				.file(Some(Str::new_static("i")), vec![spec()], 2)
-				.reasons
-				.len(),
-			2
-		);
+		let ticket = book.file(Some(sf!("i")), vec![spec()], 1);
+		assert_eq!(book.file(Some(sf!("i")), vec![spec()], 2).reasons.len(), 2);
 		let decision = ApprovalDecision {
 			approved:   true,
-			scope:      Str::new_static("once"),
+			scope:      sf!("once"),
 			source:     ApprovalSource::User,
 			decided_by: None,
 			reason:     None,
@@ -431,7 +424,7 @@ mod tests {
 			Some(decision)
 		);
 		assert_eq!(book.withdraw(ticket.ticket_id.as_str()).unwrap().state, TicketState::Decided);
-		let withdrawn = book.file(Some(Str::new_static("j")), vec![spec()], 3);
+		let withdrawn = book.file(Some(sf!("j")), vec![spec()], 3);
 		assert_eq!(
 			book.withdraw(withdrawn.ticket_id.as_str()).unwrap().state,
 			TicketState::Withdrawn
@@ -440,7 +433,7 @@ mod tests {
 	#[test]
 	fn guard_withdraws_unanswered_ticket() {
 		let book = ApprovalBook::new();
-		let ticket = book.file(Some(Str::new_static("guarded")), vec![spec()], 1);
+		let ticket = book.file(Some(sf!("guarded")), vec![spec()], 1);
 		{
 			let _guard = book.guard(ticket.ticket_id.as_str()).unwrap();
 		}

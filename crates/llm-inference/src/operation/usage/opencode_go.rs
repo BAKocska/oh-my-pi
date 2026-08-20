@@ -7,7 +7,7 @@ use std::{
 
 use futures::FutureExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 
@@ -76,7 +76,7 @@ impl OpenCodeGoUsageFetcher {
 		Self {
 			provider: ProviderId::from(PROVIDER),
 			http,
-			base_url: Str::from(normalize_base_url(base_url)),
+			base_url: Str::new(normalize_base_url(base_url)),
 		}
 	}
 }
@@ -110,7 +110,7 @@ impl ConsoleUsageFetcher for OpenCodeGoUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta: UsageAccountMetadata::default(),
 				plan: None,
-				source_label: Some(Str::new_static("opencode-go")),
+				source_label: Some(sf!("opencode-go")),
 				notes: Box::default(),
 				reset_credits: None,
 				windows,
@@ -192,11 +192,11 @@ fn parse_windows(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageF
 				UsageStatus::Ok
 			};
 			Ok(UsageWindow {
-				id:          Str::new_static(descriptor.id),
+				id:          sf!(descriptor.id),
 				kind:        UsageWindowKind::Quota,
-				dimension:   Str::new_static("percent"),
-				label:       Some(Str::new_static(descriptor.label)),
-				scope:       Some(Str::new_static("shared")),
+				dimension:   sf!("percent"),
+				label:       Some(sf!(descriptor.label)),
+				scope:       Some(sf!("shared")),
 				amount:      UsageAmount {
 					unit:      UsageUnit::Percent,
 					consumed:  Some(consumed),

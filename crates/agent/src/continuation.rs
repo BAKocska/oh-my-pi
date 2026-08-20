@@ -241,7 +241,7 @@ mod tests {
 			notify_exhausted: true,
 		};
 		let candidate = || Continuation::Continue {
-			owner:          Str::from("goal"),
+			owner:          sf!("goal"),
 			item:           Item::default(),
 			label:          None,
 			collapse_prior: true,
@@ -266,7 +266,7 @@ mod tests {
 	fn loop_signal_detects_repetition_and_no_progress() {
 		let mut signal = LoopSignal::default();
 		for _ in 0..3 {
-			signal.observe(Some(Str::from("same")), false, 0);
+			signal.observe(Some(sf!("same")), false, 0);
 		}
 		assert_eq!(signal.repeats, 3);
 		assert_eq!(signal.no_progress_turns, 3);
@@ -275,16 +275,16 @@ mod tests {
 
 	#[test]
 	fn deferable_continuation_source_continues_the_loop() {
-		assert!(continues_loop(&InterruptSource::Continuation { owner: Str::from("goal") }));
+		assert!(continues_loop(&InterruptSource::Continuation { owner: sf!("goal") }));
 	}
 
 	#[test]
 	fn schedule_source_continues_the_loop() {
-		assert!(continues_loop(&InterruptSource::Schedule { id: Str::from("nightly") }));
+		assert!(continues_loop(&InterruptSource::Schedule { id: sf!("nightly") }));
 	}
 
 	#[test]
 	fn peer_source_continues_the_loop() {
-		assert!(continues_loop(&InterruptSource::Peer { from: Str::from("reviewer") }));
+		assert!(continues_loop(&InterruptSource::Peer { from: sf!("reviewer") }));
 	}
 }

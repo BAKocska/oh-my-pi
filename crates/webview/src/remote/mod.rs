@@ -20,7 +20,7 @@ pub mod ws;
 use std::{io::Cursor, path::Path, sync::Arc, thread::JoinHandle, time::Duration};
 
 use bytes::Bytes;
-use omp_core::{IntoStr, Str, encoding::base64, fmts};
+use omp_core::{IntoStr, Str, encoding::base64, sf};
 
 use crate::{
 	Error, Result,
@@ -147,7 +147,7 @@ where
 					let _ = evt_tx.send(WebViewEvent::Closed);
 				},
 				Err(err) => {
-					let _ = evt_tx.send(WebViewEvent::Crashed(fmts!("{err}")));
+					let _ = evt_tx.send(WebViewEvent::Crashed(sf!("{err}")));
 				},
 			}
 		})
@@ -205,7 +205,7 @@ pub fn resolve_profile(page: &PageOptions) -> Result<ProfileDir> {
 /// Encode an HTML document as a `data:` URL — the natural inline-load path
 /// for a protocol-driven engine.
 pub fn data_url(html: &str) -> Str {
-	fmts!("data:text/html;base64,{}", base64::encode(html))
+	sf!("data:text/html;base64,{}", base64::encode(html))
 }
 
 /// Decode one captured frame (screencast or screenshot) into tightly packed
@@ -265,7 +265,7 @@ fn decode_jpeg(data: &[u8]) -> Result<Frame> {
 	let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), options);
 	let pixels = decoder
 		.decode()
-		.map_err(|err| Error::Protocol(fmts!("jpeg: {err:?}")))?;
+		.map_err(|err| Error::Protocol(sf!("jpeg: {err:?}")))?;
 	let (width, height) = decoder
 		.dimensions()
 		.ok_or_else(|| Error::Protocol("jpeg: missing dimensions".to_str()))?;
@@ -276,7 +276,7 @@ fn decode_jpeg(data: &[u8]) -> Result<Frame> {
 /// Decode a PNG into RGBA8, expanding RGB/grayscale and normalizing
 /// palette/16-bit inputs.
 fn decode_png(data: &[u8]) -> Result<Frame> {
-	let protocol = |err: png::DecodingError| Error::Protocol(fmts!("png: {err}"));
+	let protocol = |err: png::DecodingError| Error::Protocol(sf!("png: {err}"));
 	let mut decoder = png::Decoder::new(Cursor::new(data));
 	// Expand palette/low-bit images and strip 16-bit samples down to 8.
 	decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -311,7 +311,7 @@ fn decode_png(data: &[u8]) -> Result<Frame> {
 			}
 			out
 		},
-		other => return Err(Error::Protocol(fmts!("png: unsupported color type {other:?}"))),
+		other => return Err(Error::Protocol(sf!("png: unsupported color type {other:?}"))),
 	};
 	Ok(Frame {
 		width:  info.width,

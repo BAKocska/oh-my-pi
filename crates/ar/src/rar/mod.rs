@@ -300,14 +300,16 @@ fn parse_rar5_file(
 		return Err(Error::UnsupportedFeature("RAR5 member with unknown unpacked size"));
 	}
 	let attributes = read_vint(header, cursor, extra_start, "RAR5 file attributes")?;
-	let mut mtime = None;
-	if file_flags & 2 != 0 {
-		mtime = Some(u64::from(read_u32_at(header, cursor, extra_start, "RAR5 modification time")?));
-	}
-	let mut data_crc = None;
-	if file_flags & 4 != 0 {
-		data_crc = Some(read_u32_at(header, cursor, extra_start, "RAR5 data CRC32")?);
-	}
+	let mut mtime = if file_flags & 2 != 0 {
+		Some(u64::from(read_u32_at(header, cursor, extra_start, "RAR5 modification time")?))
+	} else {
+		None
+	};
+	let data_crc = if file_flags & 4 != 0 {
+		Some(read_u32_at(header, cursor, extra_start, "RAR5 data CRC32")?)
+	} else {
+		None
+	};
 	let compression = read_vint(header, cursor, extra_start, "RAR5 compression information")?;
 	let mut version = (compression & 0x3f) as u8;
 	if version == 1 && compression & 0x10_0000 != 0 {
@@ -455,11 +457,11 @@ fn parse_rar4(
 			return invalid("RAR4 header CRC mismatch");
 		}
 		let mut cursor = 7usize;
-		let mut data_size = 0u64;
-		if flags & 0x8000 != 0 {
-			data_size =
-				u64::from(read_u32_at(&header, &mut cursor, header.len(), "RAR4 additional size")?);
-		}
+		let data_size = if flags & 0x8000 != 0 {
+			u64::from(read_u32_at(&header, &mut cursor, header.len(), "RAR4 additional size")?)
+		} else {
+			0
+		};
 		let data_start = header_end;
 		let mut data_end = checked_end(data_start, data_size, file_size, "RAR4 data area")?;
 		match kind {
@@ -619,9 +621,9 @@ fn parse_rar4_file(
 			read_at(source, data_start, usize_from_u64(packed_size, "RAR4 link target")?)?;
 		if crc32fast::hash(&target_bytes) != data_crc {
 			return Err(Error::ChecksumMismatch {
-				path:     path.clone(),
+				path,
 				expected: data_crc,
-				actual:   crc32fast::hash(&target_bytes),
+				actual: crc32fast::hash(&target_bytes),
 			});
 		}
 		Some(canonical_link_target(path.as_str(), &decode_latin1(&target_bytes)))
@@ -811,14 +813,14 @@ fn check_member_size(size: u64, path: &str, limits: Limits) -> Result<()> {
 	Ok(())
 }
 
-fn check_entry_count(count: usize, limits: Limits) -> Result<()> {
+const fn check_entry_count(count: usize, limits: Limits) -> Result<()> {
 	if count as u64 > limits.entries {
 		return Err(Error::TooManyEntries { actual: count as u64, limit: limits.entries });
 	}
 	Ok(())
 }
 
-fn check_index_size(size: u64, limits: Limits) -> Result<()> {
+const fn check_index_size(size: u64, limits: Limits) -> Result<()> {
 	if size > limits.index_size {
 		return Err(Error::IndexTooLarge { actual: size, limit: limits.index_size });
 	}
@@ -844,7 +846,7 @@ fn canonical_link_target(record_path: &str, raw_target: &str) -> (Str, bool) {
 			parts.push(part);
 		}
 	}
-	(Str::new(&parts.join("/")), true)
+	(Str::new(parts.join("/")), true)
 }
 
 fn decode_rar4_unicode_name(bytes: &[u8]) -> Result<String> {
@@ -1055,6 +1057,6 @@ fn usize_from_u64(value: u64, _what: &'static str) -> Result<usize> {
 	usize::try_from(value).map_err(|_| Error::InvalidArchive("RAR size overflows platform limits"))
 }
 
-fn invalid<T>(reason: &'static str) -> Result<T> {
+const fn invalid<T>(reason: &'static str) -> Result<T> {
 	Err(Error::InvalidArchive(reason))
 }

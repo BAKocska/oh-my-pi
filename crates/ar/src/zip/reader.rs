@@ -665,10 +665,7 @@ fn decode_entry_metadata(raw_name: &[u8], extra: &[u8], utf8: bool) -> Result<(S
 		}
 		fields = next;
 	}
-	Ok((
-		unicode_name.map_or_else(|| decode_name(raw_name, utf8), |name| name.into()),
-		modified_unix_seconds,
-	))
+	Ok((unicode_name.map_or_else(|| decode_name(raw_name, utf8), Str::new), modified_unix_seconds))
 }
 
 fn read_zip64_values(

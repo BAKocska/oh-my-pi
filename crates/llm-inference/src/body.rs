@@ -915,7 +915,7 @@ mod tests {
 
 	use bytes::Bytes;
 	use futures::{Stream, StreamExt, poll};
-	use omp_core::Str;
+	use omp_core::sf;
 
 	use super::{
 		ArtifactLease, ArtifactReadGuarantee, AttemptBodyEvidence, BodyFactory, BodyFactoryHandle,
@@ -1275,9 +1275,9 @@ mod tests {
 		let drops = Arc::new(AtomicUsize::new(0));
 		let stored = StoredBody::new(MockLease {
 			artifact: ArtifactRef {
-				store:    Str::from("media"),
-				id:       Str::from("object"),
-				revision: Str::from("sha256:abc"),
+				store:    sf!("media"),
+				id:       sf!("object"),
+				revision: sf!("sha256:abc"),
 			},
 			drops:    Arc::clone(&drops),
 		});

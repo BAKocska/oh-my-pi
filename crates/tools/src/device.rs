@@ -15,7 +15,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_slopjson::{Object, Value};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, Constraint, DeviceIssue, DevicePath, DeviceTarget,
@@ -92,7 +92,7 @@ pub fn flatten_slots(
 ) -> Result<BTreeMap<Str, Str>, FlattenCollision> {
 	let mut slots = BTreeMap::new();
 	for (path, claimant) in paths {
-		let slot = Str::from(path.as_str().replace('/', "_"));
+		let slot = Str::new(path.as_str().replace('/', "_"));
 		if let Some(first) = slots.insert(slot.clone(), claimant.clone()) {
 			return Err(FlattenCollision { first, second: claimant, slot });
 		}
@@ -113,7 +113,7 @@ pub fn reserved_parameter(schema: &SchemaValue) -> Option<Str> {
 	properties
 		.keys()
 		.find(|name| name.as_str() == "do_" || name.ends_with('_'))
-		.map(|name| Str::from(name.as_str()))
+		.map(|name| Str::new(name.as_str()))
 }
 
 /// Late-bound immutable registry access for the self-referential `dyn` slot.
@@ -205,24 +205,24 @@ pub fn parse_operation(value: &str) -> Result<Operation, OperationError> {
 		return match value {
 			"" => Err(OperationError::Empty),
 			"search" => Ok(Operation::Search(None)),
-			"docs" | "invoke" => Err(OperationError::MissingPath { op: Str::from(value) }),
-			_ => Err(OperationError::Unknown { op: Str::from(value) }),
+			"docs" | "invoke" => Err(OperationError::MissingPath { op: Str::new(value) }),
+			_ => Err(OperationError::Unknown { op: Str::new(value) }),
 		};
 	};
 	match op {
 		"search" => {
 			if path.is_empty() {
-				Err(OperationError::MissingPath { op: Str::from(op) })
+				Err(OperationError::MissingPath { op: Str::new(op) })
 			} else {
-				Ok(Operation::Search(Some(Str::from(path))))
+				Ok(Operation::Search(Some(Str::new(path))))
 			}
 		},
 		"docs" | "invoke" if path.is_empty() || path.ends_with('/') => {
-			Err(OperationError::MissingPath { op: Str::from(op) })
+			Err(OperationError::MissingPath { op: Str::new(op) })
 		},
-		"docs" => Ok(Operation::Docs(Str::from(path))),
-		"invoke" => Ok(Operation::Invoke(Str::from(path))),
-		_ => Err(OperationError::Unknown { op: Str::from(op) }),
+		"docs" => Ok(Operation::Docs(Str::new(path))),
+		"invoke" => Ok(Operation::Invoke(Str::new(path))),
+		_ => Err(OperationError::Unknown { op: Str::new(op) }),
 	}
 }
 
@@ -235,10 +235,10 @@ pub fn operation_issue(error: OperationError) -> DeviceIssue {
 		OperationError::Unknown { .. } => "one of search, docs, invoke",
 	};
 	ArgIssue {
-		path:     vec![ArgPath::Key(Str::new_static("do_"))],
-		expected: Str::from(expected),
+		path:     vec![ArgPath::Key(sf!("do_"))],
+		expected: Str::new(expected),
 		kind:     ArgIssueKind::Malformed,
-		example:  Some(Str::new_static(r#"{"do_":"search"}"#)),
+		example:  Some(sf!(r#"{{"do_":"search"}}"#)),
 		found:    None,
 	}
 }
@@ -254,13 +254,11 @@ pub fn resolve_operation<'a>(
 	let raw = match operation {
 		Operation::Docs(path) | Operation::Invoke(path) => path,
 		Operation::Search(_) => {
-			return Err(operation_issue(OperationError::MissingPath {
-				op: Str::new_static("search"),
-			}));
+			return Err(operation_issue(OperationError::MissingPath { op: sf!("search") }));
 		},
 	};
 	let path = DevicePath::parse(raw.as_str())
-		.map_err(|_| operation_issue(OperationError::MissingPath { op: Str::new_static("path") }))?;
+		.map_err(|_| operation_issue(OperationError::MissingPath { op: sf!("path") }))?;
 	let target = registry.resolve_device(&path)?;
 	Ok((path, target))
 }
@@ -325,7 +323,7 @@ pub fn render_catalog_query<'a>(
 		rendered.push_str(&total.to_string());
 		rendered.push_str(" total)\n");
 	}
-	Str::from(rendered)
+	Str::new(rendered)
 }
 
 /// Renders prompt documentation under the selected inlining mode and budgets.
@@ -363,7 +361,7 @@ pub fn render_prompt_docs<'a>(
 		used_chars += block_chars;
 		rendered.push_str(&block);
 	}
-	Str::from(rendered)
+	Str::new(rendered)
 }
 
 /// Renders a bounded nearest-match fragment from deterministic catalog rows.
@@ -386,7 +384,7 @@ pub fn render_near_miss<'a>(path: &str, devices: impl Iterator<Item = MountedDev
 		rendered.push_str("  ");
 		append_catalog_row(&mut rendered, &device);
 	}
-	Str::from(rendered)
+	Str::new(rendered)
 }
 
 fn append_catalog_row(rendered: &mut String, device: &MountedDevice<'_>) {
@@ -685,9 +683,9 @@ pub fn dyn_tool<I: DeviceInvoker + 'static>(
 		catalog_cache: Mutex::new(None),
 		next_invocation_id: AtomicU64::new(0),
 		spec: ToolSpec {
-			name:            Str::new_static("dyn"),
+			name:            sf!("dyn"),
 			rev:             Rev { family: Str::default(), n: 1 },
-			description:     Str::new_static(
+			description:     sf!(
 				"Discover documented devices and invoke one through the stable dynamic transport.",
 			),
 			schema:          Bytes::from_static(
@@ -741,10 +739,10 @@ impl<I: DeviceInvoker + 'static> DynTool<I> {
 	fn unknown_path_fault(&self, raw: &str, registry: &Registry) -> Verdict {
 		let path = DevicePath::parse(raw).unwrap_or_else(|_| Self::dyn_path());
 		let issue = ArgIssue {
-			path:     vec![ArgPath::Key(Str::new_static("do_"))],
+			path:     vec![ArgPath::Key(sf!("do_"))],
 			expected: render_near_miss(raw, registry.devices()),
 			kind:     ArgIssueKind::Malformed,
-			example:  Some(Str::new_static(r#"{"do_":"search"}"#)),
+			example:  Some(sf!(r#"{{"do_":"search"}}"#)),
 			found:    None,
 		};
 		self.fault(path, self.spec.rev.clone(), issue)
@@ -755,8 +753,8 @@ impl<I: DeviceInvoker + 'static> DynTool<I> {
 			.devices()
 			.find(|device| device.name.as_str() == path.root().as_str())
 			.map_or_else(
-				|| Str::new_static("The resolved device is no longer mounted."),
-				|device| Str::from(render_device_docs(&device, path.to_string().as_str())),
+				|| sf!("The resolved device is no longer mounted."),
+				|device| Str::new(render_device_docs(&device, path.to_string().as_str())),
 			);
 		slice_rendered(&rendered, flat_offset(flat), flat_limit(flat))
 	}
@@ -768,12 +766,12 @@ impl<I: DeviceInvoker + 'static> DynTool<I> {
 			 tags, provenance, offset, limit, depth.\n\nSchema:\n",
 		);
 		output.push_str(std::str::from_utf8(&self.spec.schema).unwrap_or("{}"));
-		Str::from(output)
+		Str::new(output)
 	}
 
 	fn next_invocation_id(&self) -> Str {
 		let sequence = self.next_invocation_id.fetch_add(1, Ordering::Relaxed);
-		Str::from(format!("dyn-{sequence}"))
+		sf!("dyn-{sequence}")
 	}
 }
 
@@ -801,7 +799,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 			};
 			let Some(flat) = finalized.effective().as_object() else {
 				yield omp_tool::Ev::Args(ArgIssue {
-					path: vec![], expected: Str::new_static("an argument object"), kind: ArgIssueKind::Malformed,
+					path: vec![], expected: sf!("an argument object"), kind: ArgIssueKind::Malformed,
 					example: None, found: None,
 				});
 				return;
@@ -828,7 +826,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 				},
 			};
 			let Some(registry) = self.catalog.registry() else {
-				yield done(Err(self.fault(Self::dyn_path(), self.spec.rev.clone(), operation_issue(OperationError::Unknown { op: Str::new_static("catalog") }))));
+				yield done(Err(self.fault(Self::dyn_path(), self.spec.rev.clone(), operation_issue(OperationError::Unknown { op: sf!("catalog") }))));
 				return;
 			};
 			match operation {
@@ -866,7 +864,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 					let args_json = match renest_args(flat, declares_intent) {
 						Ok(args) => args,
 						Err(_) => {
-							yield done(Err(self.fault(path, target.rev.clone(), operation_issue(OperationError::MissingPath { op: Str::new_static("arguments") }))));
+							yield done(Err(self.fault(path, target.rev.clone(), operation_issue(OperationError::MissingPath { op: sf!("arguments") }))));
 							return;
 						},
 					};
@@ -874,7 +872,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 					let mut events = match target.route {
 						ToolRoute::Native => {
 							let (feed, nested) = IncomingParams::channel();
-							let raw = Str::from(std::str::from_utf8(&args_json).expect("serialized JSON is UTF-8"));
+							let raw = Str::new(std::str::from_utf8(&args_json).expect("serialized JSON is UTF-8"));
 							if feed.args_committed(raw).is_err() {
 								yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
 								return;
@@ -890,7 +888,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 						ToolRoute::Worker { site, name } => self.invoker.invoke(DeviceInvokeRequest {
 							path: path.clone(),
 							name: target.name.clone(),
-							rev: Str::from(target.rev.to_string()),
+							rev: Str::new(target.rev.to_string()),
 							claimant: Some(target.claimant.clone()),
 							site: Some(*site),
 							worker: Some(name.clone()),
@@ -934,7 +932,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 				.registry()
 				.and_then(|registry| registry.prompt(identity, verdict, caps).ok().flatten())
 				.map_or_else(
-					|| vec![Part::Text { text: Str::new_static("Device result unavailable.") }],
+					|| vec![Part::Text { text: sf!("Device result unavailable.") }],
 					|parts| parts.to_vec(),
 				),
 			Err(Verdict::Device { issue, .. }) => vec![Part::Text { text: issue.expected.clone() }],
@@ -981,13 +979,13 @@ fn catalog_query(flat: &Object) -> CatalogQuery {
 		.and_then(Value::as_str)
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(Str::from);
+		.map(Str::new);
 	let provenance = ["provenance", "claimant", "source"]
 		.into_iter()
 		.find_map(|key| flat.get(key).and_then(Value::as_str))
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(Str::from);
+		.map(Str::new);
 	let mut tags = SmallVec::new();
 	if let Some(value) = flat.get("tags") {
 		if let Some(authored) = value.as_str() {
@@ -996,7 +994,7 @@ fn catalog_query(flat: &Object) -> CatalogQuery {
 					.split([',', ' '])
 					.map(str::trim)
 					.filter(|tag| !tag.is_empty())
-					.map(Str::from),
+					.map(Str::new),
 			);
 		} else if let Some(authored) = value.as_array() {
 			tags.extend(
@@ -1005,7 +1003,7 @@ fn catalog_query(flat: &Object) -> CatalogQuery {
 					.filter_map(Value::as_str)
 					.map(str::trim)
 					.filter(|tag| !tag.is_empty())
-					.map(Str::from),
+					.map(Str::new),
 			);
 		}
 	}
@@ -1046,7 +1044,7 @@ fn slice_rendered(text: &str, offset: usize, limit: Option<usize>) -> Str {
 	while end != start && !text.is_char_boundary(end) {
 		end -= 1;
 	}
-	Str::from(&text[start..end])
+	Str::new(&text[start..end])
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -1072,7 +1070,7 @@ mod tests {
 	use async_stream::stream;
 	use bytes::Bytes;
 	use futures::StreamExt as _;
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 	use omp_slopjson::Value;
 	use omp_tool::{
 		Claims, Constraint, Effects, ErasedEv, ErasedOutcome, Ev, IncomingParams, MountedDevice,
@@ -1109,9 +1107,9 @@ mod tests {
 		registry
 			.register_worker(
 				ToolSpec {
-					name:            Str::new_static("fixture"),
+					name:            sf!("fixture"),
 					rev:             Rev { family: Str::default(), n: 1 },
-					description:     Str::new_static("Fixture device."),
+					description:     sf!("Fixture device."),
 					schema:          Bytes::from_static(
 						br#"{"type":"object","properties":{"title":{"type":"string"}},"additionalProperties":false}"#,
 					),
@@ -1122,7 +1120,7 @@ mod tests {
 				Presentation::Device,
 				Claims {
 					precedence: Precedence::DEFAULT,
-					claimant:   Str::new_static("test/fixture"),
+					claimant:   sf!("test/fixture"),
 					replaces:   None,
 				},
 			)
@@ -1146,7 +1144,7 @@ mod tests {
 	{
 		let (feed, params) = IncomingParams::channel();
 		feed
-			.args_committed(Str::from(args))
+			.args_committed(Str::new(args))
 			.expect("arguments commit");
 		tool.call(params).collect().await
 	}
@@ -1281,12 +1279,12 @@ mod tests {
 
 	#[test]
 	fn catalog_search_ranks_filters_and_paginates() {
-		let first_name = Str::from("lint");
-		let second_name = Str::from("format");
-		let first_claimant = Str::from("acme/lint");
-		let second_claimant = Str::from("other/format");
-		let first_summary = Str::from("Pending proposal: resolve or reject the lint rewrite.");
-		let second_summary = Str::from("Format files and lint imports.");
+		let first_name = sf!("lint");
+		let second_name = sf!("format");
+		let first_claimant = sf!("acme/lint");
+		let second_claimant = sf!("other/format");
+		let first_summary = sf!("Pending proposal: resolve or reject the lint rewrite.");
+		let second_summary = sf!("Format files and lint imports.");
 		let rev = Rev { family: Str::default(), n: 1 };
 		let effects = Effects::default();
 		let route = ToolRoute::Native;
@@ -1319,12 +1317,12 @@ mod tests {
 
 	#[test]
 	fn docs_modes_honor_allowlist_and_external_summary_budget() {
-		let builtin_name = Str::from("builtin");
-		let external_name = Str::from("external");
-		let builtin_claimant = Str::from("omp/core");
-		let external_claimant = Str::from("acme/tools");
-		let builtin_summary = Str::from("Built-in summary.");
-		let external_summary = Str::from(format!("{}\nignored", "é".repeat(150)));
+		let builtin_name = sf!("builtin");
+		let external_name = sf!("external");
+		let builtin_claimant = sf!("omp/core");
+		let external_claimant = sf!("acme/tools");
+		let builtin_summary = sf!("Built-in summary.");
+		let external_summary = sf!("{}\nignored", "é".repeat(150));
 		let rev = Rev { family: Str::default(), n: 1 };
 		let effects = Effects::default();
 		let route = ToolRoute::Native;

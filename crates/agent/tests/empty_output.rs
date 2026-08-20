@@ -17,7 +17,7 @@ use omp_agent::{
 	Journal, RetryPolicy, TurnClient, TurnId, TurnInput, TurnInputRecord, TurnOptions,
 	TurnOptionsRecord, TurnSession, TurnStart,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_env::EnvClient;
 use omp_proto::{
 	inference::v1 as pb,
@@ -232,7 +232,7 @@ fn build_agent(
 
 fn turn_start(id: &str) -> TurnStart {
 	TurnStart {
-		turn_id:            Str::from(id),
+		turn_id:            Str::new(id),
 		item_events:        Vec::new(),
 		prompt_hash:        [0; 32],
 		prompt_head_events: Vec::new(),
@@ -251,7 +251,7 @@ fn turn_start(id: &str) -> TurnStart {
 fn exhausted_journal(path: &std::path::Path) -> Journal {
 	let mut journal = Journal::create(path, &Header {
 		v:       4,
-		id:      SessionId(Str::from("empty-output-exhausted-test")),
+		id:      SessionId(sf!("empty-output-exhausted-test")),
 		created: 1,
 		cwd:     std::env::temp_dir(),
 	})
@@ -302,7 +302,7 @@ fn agent(
 	));
 	let journal = Journal::create(&path, &Header {
 		v:       4,
-		id:      SessionId(Str::from("empty-output-test")),
+		id:      SessionId(sf!("empty-output-test")),
 		created: 1,
 		cwd:     std::env::temp_dir(),
 	})
@@ -387,7 +387,7 @@ async fn retry_count_survives_journal_reopen() {
 	));
 	let mut journal = Journal::create(&path, &Header {
 		v:       4,
-		id:      SessionId(Str::from("empty-output-reopen-test")),
+		id:      SessionId(sf!("empty-output-reopen-test")),
 		created: 1,
 		cwd:     std::env::temp_dir(),
 	})
@@ -464,14 +464,14 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 	));
 	let mut journal = Journal::create(&path, &Header {
 		v:       4,
-		id:      SessionId(Str::from("empty-output-abort-gap-test")),
+		id:      SessionId(sf!("empty-output-abort-gap-test")),
 		created: 1,
 		cwd:     std::env::temp_dir(),
 	})
 	.expect("create journal");
 	let prior_revision = thread::Revision { head: 0, token: vec![1].into() };
 	let mut prior = turn_start("prior-success");
-	prior.options.context_id = Some(Str::from("context"));
+	prior.options.context_id = Some(sf!("context"));
 	journal
 		.start_turn(2, prior)
 		.expect("start prior successful turn");
@@ -496,7 +496,7 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 		},
 		delta:   pb::ThreadDelta { truncate_to: None, append: vec![original] },
 	};
-	failed.options.context_id = Some(Str::from("context"));
+	failed.options.context_id = Some(sf!("context"));
 	journal.start_turn(5, failed).expect("start failed turn");
 	journal
 		.abort_turn(6, "failed", AbortDisposition::Continue)
@@ -635,7 +635,7 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 	));
 	let mut journal = Journal::create(&path, &Header {
 		v:       4,
-		id:      SessionId(Str::from("empty-output-crash-test")),
+		id:      SessionId(sf!("empty-output-crash-test")),
 		created: 1,
 		cwd:     std::env::temp_dir(),
 	})
@@ -723,7 +723,7 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 	));
 	let journal = Journal::create(&path, &Header {
 		v:       4,
-		id:      SessionId(Str::from("upstream-recovery-test")),
+		id:      SessionId(sf!("upstream-recovery-test")),
 		created: 1,
 		cwd:     std::env::temp_dir(),
 	})

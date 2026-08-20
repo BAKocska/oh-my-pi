@@ -2,7 +2,7 @@
 
 use std::{borrow::Borrow, fmt, ops::Deref};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_id {
@@ -16,15 +16,21 @@ macro_rules! string_id {
 		impl $name {
 			/// Creates an identifier from stored catalog text.
 			#[inline]
-			pub fn new(value: impl Into<Str>) -> Self {
-				Self(value.into())
+			pub fn new(value: impl IntoStr) -> Self {
+				Self(value.into_str())
+			}
+
+			/// Creates an empty identifier without allocating.
+			#[inline]
+			pub const fn empty() -> Self {
+				Self(Str::empty())
 			}
 
 			/// Creates an identifier from static text without allocating;
 			/// `const` so identifiers can back `static` placeholders.
 			#[inline]
 			pub const fn new_static(value: &'static str) -> Self {
-				Self(Str::new_static(value))
+				Self(sf!(value))
 			}
 
 			/// Borrows the identifier as text.
@@ -85,7 +91,7 @@ macro_rules! string_id {
 		impl From<&str> for $name {
 			#[inline]
 			fn from(value: &str) -> Self {
-				Self(Str::from(value))
+				Self(Str::new(value))
 			}
 		}
 

@@ -423,7 +423,7 @@ fn read_vec_at(
 }
 
 /// `Buffered` storage is served by the archive core.
-pub(crate) fn read_entry_to<W: Write>(
+pub(crate) const fn read_entry_to<W: Write>(
 	_source: &mut (impl Read + Seek),
 	_entry: &Entry,
 	_output: &mut W,

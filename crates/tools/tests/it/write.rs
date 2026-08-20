@@ -4,7 +4,7 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use futures::{StreamExt, executor::block_on};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
 };
@@ -132,7 +132,7 @@ fn invoke(documents: FakeDocuments, raw: &str) -> Invocation {
 	let tool = write::tool(documents);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(raw))
+		.args_committed(Str::new(raw))
 		.expect("invocation consumer remains live");
 	let events = block_on(tool.call(params).collect::<Vec<_>>());
 	let [Ev::Done(ToolTerminal::Done { result, useless })] = events.as_slice() else {
@@ -475,22 +475,16 @@ async fn interrupt_stalled_special_write(
 	let (started, observed) = flume::bounded(1);
 	let tool = write::tool(StalledSpecialDocuments { phase, started });
 	let (feed, params) = IncomingParams::channel();
-	feed
-		.args_committed(Str::new_static(
-			r#"{"path":"fixture.zip:member.txt","content":"replacement"}"#,
-		))
-		.expect("write invocation remains live");
-	let events = tool.call(params).collect::<Vec<_>>();
+	f	feed
+		.args_committed(sf!(r#"{{"path":"fixture.zip:member.txt","content":"replacement"}}"#,))
+		.expect("write invocation remains live");et events = tool.call(params).collect::<Vec<_>>();
 	tokio::pin!(events);
 	tokio::select! {
 		result = &mut events => panic!("stalled special write completed unexpectedly: {result:?}"),
 		started = observed.recv_async() => started.expect("special write reports its phase"),
 	}
 	feed
-		.interrupt(Interrupt {
-			class:  Str::new_static("immediate"),
-			reason: Str::new_static("stop special write"),
-		})
+		.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop special write") })
 		.expect("write invocation accepts interruption");
 	tokio::time::timeout(Duration::from_secs(1), &mut events)
 		.await

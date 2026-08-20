@@ -12,7 +12,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-use omp_core::{SparseMap, Str};
+use omp_core::{SparseMap, Str, sf};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
@@ -1235,7 +1235,7 @@ impl Registry {
 	) -> Result<ErasedStream<'a>, RegistryError> {
 		let target = self
 			.resolve_device(path)
-			.map_err(|_| RegistryError::UnknownTool(Str::from(path.to_string())))?;
+			.map_err(|_| RegistryError::UnknownTool(Str::new(path.to_string())))?;
 		let entry = self
 			.versions
 			.get(target.name)
@@ -1478,14 +1478,14 @@ impl Registry {
 		let claim = self
 			.live
 			.get(name)
-			.ok_or_else(|| RegistryError::UnknownTool(Str::from(path)))?;
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(path)))?;
 		let rev = claim_revision(claim, claimant)
-			.ok_or_else(|| RegistryError::UnknownTool(Str::from(path)))?;
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(path)))?;
 		self
 			.versions
 			.get(name)
 			.and_then(|versions| versions.get(rev))
-			.ok_or_else(|| RegistryError::UnknownTool(Str::from(path)))
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(path)))
 	}
 }
 
@@ -1595,10 +1595,10 @@ fn claim_entries(claim: &Claim) -> impl Iterator<Item = ClaimRef<'_>> {
 fn device_issue(path: &DevicePath) -> DeviceIssue {
 	DeviceIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("a mounted device path"),
+		expected: sf!("a mounted device path"),
 		kind:     ArgIssueKind::Missing,
 		example:  None,
-		found:    Some(Str::from(path.to_string())),
+		found:    Some(Str::new(path.to_string())),
 	}
 }
 
@@ -1679,19 +1679,19 @@ fn render_arg_issue(issue: &crate::ArgIssue) -> Str {
 		text.push_str("; example ");
 		text.push_str(example);
 	}
-	Str::from(text)
+	Str::new(text)
 }
 
 fn render_abort(abort: &Abort) -> Str {
 	match abort {
-		Abort::Skipped { reason } => Str::from(format!("skipped: {reason}")),
-		Abort::Interrupted { reason } => Str::from(format!("interrupted: {reason}")),
+		Abort::Skipped { reason } => sf!("skipped: {reason}"),
+		Abort::Interrupted { reason } => sf!("interrupted: {reason}"),
 		Abort::EffectsUnknown { reason } => {
-			Str::from(format!("aborted with effects unknown: {reason}"))
+			sf!("aborted with effects unknown: {reason}")
 		},
-		Abort::InputDropped => Str::new_static("aborted: invocation input dropped before commit"),
+		Abort::InputDropped => sf!("aborted: invocation input dropped before commit"),
 		Abort::MissingOutcome => {
-			Str::new_static("aborted: executor ended without a terminal outcome")
+			sf!("aborted: executor ended without a terminal outcome")
 		},
 	}
 }
@@ -1778,7 +1778,7 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, Regi
 const EXTENSION_PRIORITY_MAX: u8 = 127;
 const CORE_PRIORITY_MIN: u8 = 128;
 
-fn constraint_priority(constraint: &Constraint) -> Option<u8> {
+const fn constraint_priority(constraint: &Constraint) -> Option<u8> {
 	match constraint {
 		Constraint::None => None,
 		Constraint::Schema { priority, .. } | Constraint::Grammar { priority, .. } => Some(*priority),
@@ -1794,7 +1794,7 @@ fn advertisement_priority(entry: &RegistryEntry) -> u8 {
 	}
 }
 
-fn constraint_requires_capacity(spec: &crate::ToolSpec) -> bool {
+const fn constraint_requires_capacity(spec: &crate::ToolSpec) -> bool {
 	matches!(
 		&spec.constraint,
 		Constraint::Schema { on_unsupported: omp_proto::inference::v1::Fallback::Error, .. }
@@ -1806,7 +1806,7 @@ fn budget_constraint_error(spec: &crate::ToolSpec, feature: &'static str) -> Reg
 	RegistryError::UnsupportedConstraint { name: spec.name.clone(), rev: spec.rev.clone(), feature }
 }
 
-fn is_native_strict(tool: &LoweredTool) -> bool {
+const fn is_native_strict(tool: &LoweredTool) -> bool {
 	matches!(&tool.definition.input, ToolInputConstraint::JsonSchema { strict: true, .. })
 }
 
@@ -1852,8 +1852,8 @@ const fn grammar_name(syntax: GrammarSyntax) -> &'static str {
 
 fn dropped(name: &Str, feature: &str, reason: &'static str) -> Adjustment {
 	Adjustment::Dropped {
-		feature: FeatureId(Str::from(format!("tool.{name}.{feature}"))),
-		reason:  ReasonId(Str::from(reason)),
+		feature: FeatureId(sf!("tool.{name}.{feature}")),
+		reason:  ReasonId(Str::new(reason)),
 	}
 }
 
@@ -1900,7 +1900,7 @@ mod tests {
 	}
 
 	fn identity(n: u16) -> ToolIdentity {
-		ToolIdentity { name: Str::new_static("lift"), rev: Rev { family: Str::new_static("x"), n } }
+		ToolIdentity { name: sf!("lift"), rev: Rev { family: sf!("x"), n } }
 	}
 
 	fn caps() -> PromptCaps {
@@ -1916,9 +1916,9 @@ mod tests {
 	fn tool(n: u16) -> LiftTool {
 		LiftTool {
 			spec: ToolSpec {
-				name:            Str::new_static("lift"),
+				name:            sf!("lift"),
 				rev:             identity(n).rev,
-				description:     Str::new_static("lift test"),
+				description:     sf!("lift test"),
 				schema:          Bytes::from_static(b"{}"),
 				constraint:      Constraint::None,
 				effects:         Effects::empty(),
@@ -1946,11 +1946,8 @@ mod tests {
 	#[test]
 	fn registered_lift_runs_byte_stably() {
 		let mut registry = Registry::new();
-		let claims = Claims {
-			precedence: Precedence::DEFAULT,
-			claimant:   Str::new_static("test/lift"),
-			replaces:   None,
-		};
+		let claims =
+			Claims { precedence: Precedence::DEFAULT, claimant: sf!("test/lift"), replaces: None };
 		registry
 			.register(tool(1), Presentation::Device, claims.clone())
 			.expect("first revision registers");

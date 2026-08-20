@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::base64};
+use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -36,8 +36,8 @@ pub fn encode_handshake(
 	Ok(EncodedRequest::new(
 		OperationKind::Realtime,
 		RequestMethod::Get,
-		Str::from(uri.to_string()),
-		vec![RequestHeader { name: Str::from("openai-beta"), value: Str::from("realtime=v1") }]
+		Str::new(&uri),
+		vec![RequestHeader { name: sf!("openai-beta"), value: sf!("realtime=v1") }]
 			.into_boxed_slice(),
 		crate::body::BodySource::Bytes(Bytes::new()),
 		FramingProtocol::WebSocket,
@@ -530,7 +530,7 @@ fn encode_tool_content(content: &[ToolResultContent], is_error: bool) -> Result<
 		});
 	}
 	serde_json::to_string(&ToolOutput { is_error, content: &wire })
-		.map(Str::from)
+		.map(Str::new)
 		.map_err(|_| protocol_error())
 }
 fn one_json(value: &impl Serialize) -> Result<RealtimeWireFrames, Error> {

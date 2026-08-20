@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::future::join_all;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::Deserialize;
 use url::Url;
 
@@ -398,16 +398,14 @@ fn item_id_text(item: &HnItem) -> String {
 
 fn markdown_result(content: &str, note: String) -> RenderResult {
 	let mut result = RenderResult::markdown(content, "hackernews");
-	result.notes.insert(0, Str::from(note));
+	result.notes.insert(0, Str::new(note));
 	result
 }
 
 fn error_result(message: &str) -> RenderResult {
 	let content = format!("# Error fetching Hacker News content\n\n{message}");
 	let mut result = RenderResult::markdown(&content, "hackernews");
-	result
-		.notes
-		.insert(0, Str::from(format!("Error: {message}")));
+	result.notes.insert(0, sf!("Error: {message}"));
 	result
 }
 

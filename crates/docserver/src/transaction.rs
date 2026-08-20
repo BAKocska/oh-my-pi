@@ -7,7 +7,7 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -2126,9 +2126,7 @@ fn finalized_ranges(base: &Bytes, finalized: &Bytes) -> Result<Vec<ByteRange>> {
 fn validate_text(content: &Bytes) -> Result<()> {
 	std::str::from_utf8(content)
 		.map(|_| ())
-		.map_err(|_| Error::InvalidContent {
-			reason: Str::new_static("text content is not valid UTF-8"),
-		})
+		.map_err(|_| Error::InvalidContent { reason: sf!("text content is not valid UTF-8") })
 }
 
 fn classify_error(error: &Error) -> (TransactionRejectReason, Str) {
@@ -2440,7 +2438,7 @@ mod tests {
 		) -> impl Future<Output = Result<FormatResult>> + Send + '_ {
 			self.calls.fetch_add(1, Ordering::SeqCst);
 			let result = if self.fail {
-				Err(Error::Protocol { reason: Str::new_static("formatter failed") })
+				Err(Error::Protocol { reason: sf!("formatter failed") })
 			} else {
 				if self.cancel_after_format {
 					cancel.cancel();

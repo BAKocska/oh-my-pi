@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::env::v1 as pb;
 use omp_storage::blob::{BlobRef, BlobStore};
 use serde::{Deserialize, Serialize};
@@ -428,7 +428,7 @@ mod tests {
 	#[test]
 	fn record_ownership_membership_is_exact() {
 		let ownership = OwnershipMap::from_records("reviewer", [(
-			Str::from("reviewer-1.0.dist-info/RECORD"),
+			sf!("reviewer-1.0.dist-info/RECORD"),
 			Bytes::from_static(b"reviewer/__init__.py,,\nreviewer/check.py,,\n"),
 		)])
 		.unwrap();

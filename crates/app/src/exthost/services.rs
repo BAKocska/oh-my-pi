@@ -8,7 +8,7 @@ use std::{
 	},
 };
 
-use omp_core::{CowBytes, Duration, SparseMap, Str};
+use omp_core::{CowBytes, Duration, SparseMap, Str, sf};
 use parking_lot::Mutex;
 use thiserror::Error;
 
@@ -273,9 +273,7 @@ impl PendingServiceCall {
 			Ok(ServiceResponse::Success(payload)) => Ok(payload),
 			Ok(ServiceResponse::Failure(message)) => Err(ServiceCallError::Provider(message)),
 			Ok(ServiceResponse::Unavailable(message)) => Err(ServiceCallError::Unavailable(message)),
-			Err(_) => {
-				Err(ServiceCallError::Unavailable(Str::new_static("provider response channel closed")))
-			},
+			Err(_) => Err(ServiceCallError::Unavailable(sf!("provider response channel closed"))),
 		}
 	}
 }

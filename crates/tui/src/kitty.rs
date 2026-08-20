@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 
 use crate::{Color, Style, escape::esc};
 
@@ -335,7 +335,7 @@ pub fn placeholder_cell(id: u32, row: u16, col: u16, rows: u16, cols: u16) -> (S
 		.get(usize::from(col))
 		.copied()
 		.unwrap_or(DIACRITICS[0]);
-	let text = fmts!("\u{10eeee}{row_mark}{col_mark}");
+	let text = sf!("\u{10eeee}{row_mark}{col_mark}");
 	let placement = placement_id(rows, cols);
 	let style = Style::new()
 		.fg(Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8))

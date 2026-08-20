@@ -216,7 +216,7 @@ pub(crate) fn read_entry_to<W: Write>(
 	Ok(bytes.len() as u64)
 }
 
-fn arj_method_error(method: u8) -> &'static str {
+const fn arj_method_error(method: u8) -> &'static str {
 	match method {
 		5 => "ARJ compression method 5",
 		6 => "ARJ compression method 6",
@@ -341,12 +341,13 @@ fn decompress_method4(packed: &[u8], out_size: usize) -> Result<Vec<u8>> {
 		if position_code >= 26_624 || position_code >= output_position {
 			return Err(Error::InvalidArchive("ARJ method-4 history distance is out of range"));
 		}
-		let mut source_position = output_position - position_code - 1;
-		for _ in 0..length {
-			output[output_position] = output[source_position];
-			output_position += 1;
-			source_position += 1;
+		let source_start = output_position - position_code - 1;
+		for (source_position, destination_position) in
+			(source_start..source_start + length).zip(output_position..output_position + length)
+		{
+			output[destination_position] = output[source_position];
 		}
+		output_position += length;
 	}
 	reader.assert_zero_padding()?;
 	Ok(output)
@@ -524,21 +525,21 @@ fn read_vec(
 	Ok(bytes)
 }
 
-fn check_index_size(actual: u64, limits: Limits) -> Result<()> {
+const fn check_index_size(actual: u64, limits: Limits) -> Result<()> {
 	if actual > limits.max_index_size() {
 		return Err(Error::IndexTooLarge { actual, limit: limits.max_index_size() });
 	}
 	Ok(())
 }
 
-fn check_path_size(actual: u64, limits: Limits) -> Result<()> {
+const fn check_path_size(actual: u64, limits: Limits) -> Result<()> {
 	if actual > limits.max_path_size() {
 		return Err(Error::PathTooLong { actual, limit: limits.max_path_size() });
 	}
 	Ok(())
 }
 
-fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+const fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 	u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 

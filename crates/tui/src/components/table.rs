@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use smallvec::SmallVec;
 
 use super::{
@@ -288,7 +288,7 @@ impl TableCell {
 			};
 			for (index, line) in text.as_str().split('\n').enumerate() {
 				if index > 0 {
-					runs.push((style, Str::new_static(" ")));
+					runs.push((style, sf!(" ")));
 				}
 				runs.push((style, text.slice_ref(line)));
 			}

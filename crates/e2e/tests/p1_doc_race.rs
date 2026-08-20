@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, anyhow, ensure};
 use bytes::Bytes;
 use omp_agent::{Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnId};
 use omp_app::envd::docs::{DocumentHost, DocumentLease};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_e2e::support::{
 	DocServerTask, EnvHarness, Gate, Scratch, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
 	accepted_event, outcome_event, tool_call_item, turn_event, user_item, within,
@@ -95,19 +95,12 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 		)
 		.await??;
 
-		let identity = ToolIdentity {
-			name: Str::new_static("edit"),
-			rev:  Rev { family: Str::new_static("hl"), n: 1 },
-		};
+		let identity = ToolIdentity { name: sf!("edit"), rev: Rev { family: sf!("hl"), n: 1 } };
 		let mut registry = Registry::new();
 		registry.register(
 			edit::tool(direct_a.clone(), FormatPolicy::Configured),
 			Presentation::Slot,
-			Claims {
-				precedence: Precedence::CORE,
-				claimant:   Str::new_static("omp/core"),
-				replaces:   None,
-			},
+			Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None },
 		)?;
 		let registry = Arc::new(registry);
 
@@ -226,7 +219,7 @@ fn agent(
 		cwd:     scratch.project().to_owned(),
 	})?;
 	let mut snapshot = AgentSnapshot::new(Default::default(), Default::default(), registry);
-	snapshot.enabled_tools = Arc::from([Str::new_static("edit")]);
+	snapshot.enabled_tools = Arc::from([sf!("edit")]);
 	let agent = Agent::new(client, env, AgentState::new(snapshot), journal, CapsBase {
 		maximum_parts:      16,
 		maximum_text_bytes: 128 * 1024,
@@ -676,13 +669,9 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 }
 
 async fn open(host: &DocumentHost, uri: &str, cancel: &CancellationToken) -> Result<DocumentLease> {
-	within(
-		"open pinned document",
-		TEST_TIMEOUT,
-		host.open(Str::new(uri), Some(Str::new_static("rust")), cancel),
-	)
-	.await?
-	.context("open pinned document")
+	within("open pinned document", TEST_TIMEOUT, host.open(Str::new(uri), Some(sf!("rust")), cancel))
+		.await?
+		.context("open pinned document")
 }
 
 async fn read_whole(host: &DocumentHost, lease: &DocumentLease) -> Result<Bytes> {

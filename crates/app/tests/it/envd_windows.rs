@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use omp_app::envd::{server::EnvServer, windows::OwnerPipeListener, worker::ExtHostConfig};
-use omp_core::{Principal, Str};
+use omp_core::{Principal, Str, sf};
 use omp_env::windows::{
 	connect_owner_pipe, read_client_frame, read_server_frame, write_client_frame, write_server_frame,
 };
@@ -104,12 +104,8 @@ async fn unknown_frame_receives_the_same_protocol_error_as_stream_dispatch() {
 			root.path(),
 			state.path(),
 			Registry::new(),
-			ExtHostConfig::current(
-				Principal::new(Str::new_static("test"), Str::new_static("Test")),
-				Str::new_static("test-session"),
-				1,
-			)
-			.expect("host config"),
+			ExtHostConfig::current(Principal::new(sf!("test"), sf!("Test")), sf!("test-session"), 1)
+				.expect("host config"),
 		)
 		.await
 		.expect("environment server"),

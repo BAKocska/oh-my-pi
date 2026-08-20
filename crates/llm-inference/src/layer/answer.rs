@@ -9,7 +9,7 @@ use std::{
 
 use bytes::BytesMut;
 use futures::StreamExt;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::{Layer, Service};
 
 use crate::{
@@ -243,7 +243,7 @@ fn chat_stream(
 				None => {
 					let error = Error::new(ErrorKind::StreamCorruption, ErrorPhase::Streaming, RetryAction::Never, context.receipt())
 						.committed(context.is_committed())
-						.detail(ErrorDetail::protocol(ReasonId("chat.missing-terminal-completion".into())));
+						.detail(ErrorDetail::protocol(ReasonId::new_static("chat.missing-terminal-completion")));
 					context.abort_session(); abort.disarm();
 					yield Err(error);
 					break;
@@ -297,7 +297,7 @@ fn chat_stream(
 					yield Ok(ChatEvent::WorkflowAction(WorkflowAction {
 						invocation,
 						call: Some(call),
-						name: Str::new_static("exec.shell"),
+						name: sf!("exec.shell"),
 						arguments,
 						response_kind: WorkflowResponseKind::Invoke,
 						timeout: timeout_ms.map(std::time::Duration::from_millis),
@@ -585,7 +585,7 @@ fn invariant(reason: &'static str, context: &crate::layer::ExecutionContext) -> 
 		RetryAction::Never,
 		context.receipt(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(reason.into())))
+	.detail(ErrorDetail::protocol(ReasonId::new(reason)))
 }
 fn limit_error(limit: u64, observed: u64, context: &crate::layer::ExecutionContext) -> Error {
 	Error::new(
@@ -595,7 +595,7 @@ fn limit_error(limit: u64, observed: u64, context: &crate::layer::ExecutionConte
 		context.receipt(),
 	)
 	.committed(context.is_committed())
-	.detail(ErrorDetail::budget("native_response_bytes".into(), limit as u128, observed as u128))
+	.detail(ErrorDetail::budget(sf!("native_response_bytes"), limit as u128, observed as u128))
 }
 fn content_type(headers: &[crate::codec::RequestHeader]) -> Option<Str> {
 	headers

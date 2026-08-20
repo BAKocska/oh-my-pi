@@ -2,7 +2,7 @@
 
 use std::fmt::{self, Write as _};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::Value;
 use smallvec::SmallVec;
 use url::Url;
@@ -51,9 +51,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	};
 
 	let mut result = RenderResult::markdown(&content, "reddit");
-	result
-		.notes
-		.insert(0, Str::from("Fetched via Reddit JSON API"));
+	result.notes.insert(0, sf!("Fetched via Reddit JSON API"));
 	Ok(Some(result))
 }
 
@@ -274,9 +272,9 @@ mod tests {
 			Self {
 				requests: Mutex::new(Vec::new()),
 				response: Mutex::new(Some(Ok(HttpResponse {
-					final_url:    Str::from("https://www.reddit.com/result.json"),
+					final_url:    sf!("https://www.reddit.com/result.json"),
 					status:       200,
-					content_type: Some(Str::from("application/json")),
+					content_type: Some(sf!("application/json")),
 					headers:      SmallVec::new(),
 					body:         body.into(),
 				}))),
@@ -319,7 +317,7 @@ mod tests {
 			 Comments\n\n### u/bob · 7 points\n\nUseful answer.\n\n---\n\n### u/carol · 3 \
 			 points\n\nAnother answer.\n\n---"
 		);
-		assert_eq!(result.notes.as_slice(), [Str::from("Fetched via Reddit JSON API")].as_slice());
+		assert_eq!(result.notes.as_slice(), [sf!("Fetched via Reddit JSON API")].as_slice());
 	}
 
 	#[tokio::test]

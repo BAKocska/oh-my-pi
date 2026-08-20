@@ -4,9 +4,9 @@
 use std::str;
 use std::{fmt, sync::Arc};
 
-use omp_core::Str;
 #[cfg(target_os = "macos")]
 use omp_core::hex;
+use omp_core::{IntoStr, Str};
 use parking_lot::RwLock;
 #[cfg(target_os = "macos")]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -21,8 +21,8 @@ pub struct KeyId(Str);
 impl KeyId {
 	/// Creates a key identifier from stored text.
 	#[must_use]
-	pub fn new(value: impl Into<Str>) -> Self {
-		Self(value.into())
+	pub fn new(value: impl IntoStr) -> Self {
+		Self(value.into_str())
 	}
 
 	/// Borrows the identifier as text.
@@ -257,7 +257,7 @@ impl OsCredentialKeySource {
 				.fill(key_bytes.as_mut())
 				.map_err(|_| KeyError::Random)?;
 			let encoded = hex::encode_n(&id_bytes);
-			let id = KeyId::new(&*encoded);
+			let id = KeyId::new(&encoded);
 			set_generic_password(&self.service, &self.key_account(&id), key_bytes.as_ref())
 				.map_err(|_| KeyError::OsCredential)?;
 			set_generic_password(&self.service, &self.active_account(), id.as_str().as_bytes())

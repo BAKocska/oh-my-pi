@@ -95,7 +95,7 @@ pub fn supported_lang_list() -> String {
 /// Resolves a language alias or returns a descriptive error.
 pub fn resolve_supported_lang(value: &str) -> Result<SupportLang> {
 	SupportLang::from_alias(value).ok_or_else(|| AstError::UnsupportedLanguage {
-		value:     Str::from(value),
+		value:     Str::new(value),
 		supported: Str::from(supported_lang_list()),
 	})
 }

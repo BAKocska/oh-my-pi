@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fs, io, path::Path};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier};
@@ -520,12 +520,12 @@ mod tests {
 			generated_by:    "omp test".to_owned(),
 			generated_at:    "2026-08-20T00:00:00Z".to_owned(),
 			layer:           Layer::Workspace,
-			requires_python: Str::new_static("==3.14.*"),
-			abi:             Str::new_static("cp314t"),
-			targets:         vec![Str::new_static("aarch64-apple-darwin")],
+			requires_python: sf!("==3.14.*"),
+			abi:             sf!("cp314t"),
+			targets:         vec![sf!("aarch64-apple-darwin")],
 			exclude_newer:   None,
 			indexes:         vec!["https://pypi.org/simple".to_owned()],
-			index_strategy:  Str::new_static("first-index"),
+			index_strategy:  sf!("first-index"),
 			extensions:      vec![],
 			packages:        vec![],
 			frozen:          vec![],

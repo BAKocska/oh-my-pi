@@ -17,7 +17,7 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -44,11 +44,7 @@ use omp_tool::{
 use tower::Service;
 
 const fn test_claims() -> Claims {
-	Claims {
-		precedence: Precedence::CORE,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 }
 
 struct RegisteredTestTool {
@@ -83,9 +79,9 @@ fn tool_registry() -> Arc<omp_tool::Registry> {
 		.register(
 			RegisteredTestTool {
 				spec: ToolSpec {
-					name:            Str::from("exec.shell"),
-					rev:             Rev { family: Str::from("shell"), n: 2 },
-					description:     Str::from("test shell"),
+					name:            sf!("exec.shell"),
+					rev:             Rev { family: sf!("shell"), n: 2 },
+					description:     sf!("test shell"),
 					schema:          Bytes::from_static(br#"{"type":"object"}"#),
 					constraint:      Constraint::None,
 					effects:         Effects::empty(),
@@ -160,11 +156,11 @@ fn scripted_registry(
 	fake.extend([
 		FakeScript::chat(vec![
 			Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
-			Ok(ChatEvent::TextDelta { index: 0, text: Str::from("I will inspect it. ") }),
+			Ok(ChatEvent::TextDelta { index: 0, text: sf!("I will inspect it. ") }),
 			Ok(ChatEvent::ToolCallStarted {
 				index: 1,
 				id:    ToolCallId::from("call-1"),
-				name:  Str::from("exec.shell"),
+				name:  sf!("exec.shell"),
 			}),
 			Ok(ChatEvent::ToolArgumentsDelta {
 				index: 1,
@@ -174,7 +170,7 @@ fn scripted_registry(
 				index: 1,
 				call:  ToolCall {
 					id:        ToolCallId::from("call-1"),
-					name:      Str::from("exec.shell"),
+					name:      sf!("exec.shell"),
 					arguments: OpaqueJson::new(serde_json::json!({"command": "pwd"})),
 				},
 			}),
@@ -182,23 +178,20 @@ fn scripted_registry(
 		]),
 		FakeScript::chat(vec![
 			Ok(ChatEvent::WorkflowAction(WorkflowAction {
-				invocation:    Str::from("invoke-2"),
+				invocation:    sf!("invoke-2"),
 				call:          Some(ToolCallId::from("call-2")),
-				name:          Str::from("exec.shell"),
+				name:          sf!("exec.shell"),
 				arguments:     Bytes::from_static(br#"{"command":"echo live"}"#),
 				timeout:       Some(Duration::from_secs(2)),
 				response_kind: WorkflowResponseKind::Invoke,
 			})),
 			Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
-			Ok(ChatEvent::TextDelta { index: 0, text: Str::from("The live result arrived.") }),
+			Ok(ChatEvent::TextDelta { index: 0, text: sf!("The live result arrived.") }),
 			Ok(completion(FinishReason::Stop, 1)),
 		]),
 		FakeScript::chat(vec![
 			Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
-			Ok(ChatEvent::TextDelta {
-				index: 0,
-				text:  Str::from("Forked from the retained prefix."),
-			}),
+			Ok(ChatEvent::TextDelta { index: 0, text: sf!("Forked from the retained prefix.") }),
 			Ok(completion(FinishReason::Stop, 1)),
 		]),
 		FakeScript::precommit(
@@ -222,7 +215,7 @@ fn scripted_registry(
 			builder
 				.register_unavailable(RouteUnavailable {
 					route:     candidate.id.clone(),
-					reason:    ReasonId(Str::from("turn-rpc-test-route-unavailable")),
+					reason:    ReasonId(sf!("turn-rpc-test-route-unavailable")),
 					operation: None,
 				})
 				.expect("register unavailable route")
@@ -304,7 +297,7 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	let client = RpcTurnClient::new(channel);
 	let thread = user_thread();
 	let options = TurnOptions {
-		context_id: Some(Str::from("context-1")),
+		context_id: Some(sf!("context-1")),
 		params:     pb::ChatParams { model, ..Default::default() },
 		executor:   Some(pb::Executor { tools: vec!["exec.shell".to_owned()] }),
 		props:      None,
@@ -629,15 +622,15 @@ fn history_tool(n: u16, lifts_hl1: bool) -> HistoryTool {
 	};
 	HistoryTool {
 		spec:      ToolSpec {
-			name: Str::from("history_law"),
-			rev: Rev { family: Str::from("hl"), n },
+			name: sf!("history_law"),
+			rev: Rev { family: sf!("hl"), n },
 			description: Str::from(format!("history law revision {n}")),
 			schema,
 			constraint: Constraint::None,
 			effects: Effects::empty(),
 			projection_code: [0; 32],
 		},
-		lift_from: lifts_hl1.then(|| Rev { family: Str::from("hl"), n: 1 }),
+		lift_from: lifts_hl1.then(|| Rev { family: sf!("hl"), n: 1 }),
 	}
 }
 

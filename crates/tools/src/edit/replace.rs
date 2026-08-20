@@ -3,7 +3,7 @@
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_hashline::{
 	ReplaceError, ReplaceOptions, apply_replace,
 	diff_preview::{CompactDiffOptions, build_compact_diff_preview},
@@ -78,9 +78,9 @@ pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy)
 		documents,
 		format_policy,
 		spec: ToolSpec {
-			name:            "edit".into(),
-			rev:             Rev { family: "rep".into(), n: 1 },
-			description:     DESCRIPTION.into(),
+			name:            sf!("edit"),
+			rev:             Rev { family: sf!("rep"), n: 1 },
+			description:     sf!(DESCRIPTION),
 			schema:          omp_tool::schema::<ReplaceParams>(),
 			constraint:      Constraint::Schema {
 				priority:       100,
@@ -89,7 +89,7 @@ pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy)
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: [Str::new_static("**")].into_iter().collect(),
+					write_globs: [sf!("**")].into_iter().collect(),
 				}),
 				exec:      None,
 				inference: None,
@@ -248,7 +248,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					result = commit => Some(result),
 					interrupted = interrupt => { yield Ev::Aborted(match interrupted {
 						Ok(value) => Abort::EffectsUnknown { reason: value.reason },
-						Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: "invocation owner disappeared during transaction".into() },
+						Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
 						Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
 					}); None },
 				}
@@ -259,7 +259,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					for work in &works { self.documents.reset_noop(work.prepared.path()); }
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, Some(&result.sections))), useless: false });
 				},
-				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: "document transaction returned the wrong section count".into() }),
+				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
 				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
 				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
 			}
@@ -337,7 +337,7 @@ fn payload<P: EditPrepared>(
 						.iter()
 						.enumerate()
 						.map(|(index, edit)| AppliedOp {
-							kind: "replace".into(),
+							kind: sf!("replace"),
 							patch_line: edit.start,
 							index,
 						})
@@ -400,7 +400,7 @@ fn replacement_body(text: &[u8]) -> Vec<Str> {
 		.strip_suffix('\n')
 		.unwrap_or(&text)
 		.split('\n')
-		.map(Str::from)
+		.map(Str::new)
 		.collect()
 }
 

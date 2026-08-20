@@ -58,7 +58,7 @@ impl Bits {
 		Ok(value)
 	}
 
-	fn align(&mut self) {
+	const fn align(&mut self) {
 		if self.bit != 0 {
 			self.pos += 1;
 			self.bit = 0;
@@ -77,7 +77,7 @@ impl Bits {
 		Ok(byte)
 	}
 
-	fn at_block_end(&self) -> bool {
+	const fn at_block_end(&self) -> bool {
 		self.pos > self.block_end || (self.pos == self.block_end && self.bit >= self.block_end_bit)
 	}
 }
@@ -179,7 +179,7 @@ struct Filter {
 }
 
 /// Stateful RAR5 LZSS decoder. Reuse one instance for a solid chain.
-pub(crate) struct Rar5Decoder {
+pub struct Rar5Decoder {
 	history:   Vec<u8>,
 	reps:      [usize; 4],
 	last_len:  usize,
@@ -537,6 +537,6 @@ fn write_i32(bytes: &mut [u8], offset: usize, value: i32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn invalid<T>(reason: &'static str) -> Result<T> {
+const fn invalid<T>(reason: &'static str) -> Result<T> {
 	Err(Error::InvalidArchive(reason))
 }

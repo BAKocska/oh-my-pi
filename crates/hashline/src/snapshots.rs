@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 
 use crate::format::normalized_file_xxh32;
 
@@ -397,15 +397,15 @@ impl SnapshotStore {
 		if let Some(revision) = revision {
 			let Some(snapshot) = self.by_revision(path, revision) else {
 				return Err(Box::new(SnapshotLookupError::RevisionMissing {
-					path:     path.into(),
-					tag:      tag.into(),
+					path:     Str::new(path),
+					tag:      Str::new(tag),
 					revision: revision.clone(),
 				}));
 			};
 			if snapshot.tag != tag {
 				return Err(Box::new(SnapshotLookupError::RevisionTagMismatch {
-					path:          path.into(),
-					requested_tag: tag.into(),
+					path:          Str::new(path),
+					requested_tag: Str::new(tag),
 					retained_tag:  snapshot.tag.clone(),
 					revision:      revision.clone(),
 				}));
@@ -414,11 +414,14 @@ impl SnapshotStore {
 		}
 		let mut candidates = self.tag_candidates(path, tag);
 		match candidates.len() {
-			0 => Err(Box::new(SnapshotLookupError::Missing { path: path.into(), tag: tag.into() })),
+			0 => Err(Box::new(SnapshotLookupError::Missing {
+				path: Str::new(path),
+				tag:  Str::new(tag),
+			})),
 			1 => Ok(candidates.pop().expect("length checked")),
 			count => Err(Box::new(SnapshotLookupError::Ambiguous {
-				path:       path.into(),
-				tag:        tag.into(),
+				path:       Str::new(path),
+				tag:        Str::new(tag),
 				candidates: count,
 			})),
 		}
@@ -478,7 +481,7 @@ impl SnapshotStore {
 			})
 		});
 		if let Some(revision) = conflict {
-			self.histories.insert(from.into(), source);
+			self.histories.insert(Str::new(from), source);
 			return Err(SnapshotStoreError::RevisionConflict { path: to, revision });
 		}
 
@@ -569,7 +572,7 @@ impl SnapshotStore {
 #[must_use]
 pub fn compute_snapshot_tag(exact: &[u8]) -> Str {
 	let exact = exact.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(exact);
-	fmts!("{:04X}", normalized_file_xxh32(exact) & 0xffff)
+	sf!("{:04X}", normalized_file_xxh32(exact) & 0xffff)
 }
 
 #[cfg(test)]
@@ -616,11 +619,11 @@ mod tests {
 			.record(PATH, first_revision.clone(), Bytes::from_static(b"first\n"), [])
 			.unwrap();
 		for index in 0..100 {
-			let revision = fmts!("other-{index}");
-			let content = fmts!("content {index}\n");
+			let revision = sf!("other-{index}");
+			let content = sf!("content {index}\n");
 			store
 				.record(
-					fmts!("/tmp/other-{index}.rs"),
+					sf!("/tmp/other-{index}.rs"),
 					token(&revision),
 					Bytes::copy_from_slice(content.as_bytes()),
 					[],

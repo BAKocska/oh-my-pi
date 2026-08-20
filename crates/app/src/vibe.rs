@@ -11,7 +11,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use omp_agent::AgentStatus;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
 	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -188,9 +188,9 @@ pub struct Vibe {
 pub fn tool() -> Vibe {
 	Vibe {
 		spec: ToolSpec {
-			name:            Str::new_static("vibe"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(
+			name:            sf!("vibe"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(
 				"Runs a goal-directed worker swarm through one device. Use op=spawn with a wave of \
 				 briefs, op=status to inspect workers, op=steer with id/message, op=collect to return \
 				 settled results, and op=stop to cancel workers. ids omitted means all workers in \
@@ -501,9 +501,9 @@ fn commit_event(error: CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed vibe operation object"),
+		expected: sf!("one committed vibe operation object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"op":"status"}"#)),
+		example:  Some(sf!(r#"{{"op":"status"}}"#)),
 		found:    Some(message),
 	}
 }

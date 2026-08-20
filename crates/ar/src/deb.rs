@@ -3,7 +3,7 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use flate2::read::MultiGzDecoder;
-use omp_core::Str;
+use omp_core::sf;
 
 use crate::{
 	Entry, Error, Limits, Result, codec,
@@ -90,10 +90,9 @@ pub(crate) fn read_entries(
 fn classify_tar(path: &str) -> Option<(TarKind, Compression)> {
 	let (kind, suffix) = if let Some(suffix) = path.strip_prefix("control.tar") {
 		(TarKind::Control, suffix)
-	} else if let Some(suffix) = path.strip_prefix("data.tar") {
-		(TarKind::Data, suffix)
 	} else {
-		return None;
+		let suffix = path.strip_prefix("data.tar")?;
+		(TarKind::Data, suffix)
 	};
 	let compression = match suffix {
 		"" => Compression::None,
@@ -192,16 +191,16 @@ fn map_inner_storage(entry: &mut Entry, buffer: u32) -> Result<()> {
 }
 
 fn prefix_control(entry: &mut Entry, limits: Limits) -> Result<()> {
-	entry.path = Str::new(&format!("control/{}", entry.path));
+	entry.path = sf!("control/{}", entry.path);
 	validate(&entry.path, limits)?;
 	if let Storage::Link { target_path, .. } = &mut entry.storage {
 		let target = target_path.as_str();
 		let prefix = if target.is_empty() {
-			Some(Str::new("control"))
+			Some(sf!("control"))
 		} else {
 			normalize(target, false)
 				.filter(|normalized| normalized.as_str() == target)
-				.map(|normalized| Str::new(&format!("control/{normalized}")))
+				.map(|normalized| sf!("control/{normalized}"))
 		};
 		if let Some(prefixed) = prefix {
 			validate(&prefixed, limits)?;
@@ -269,7 +268,7 @@ fn read_exact_at(
 }
 
 /// `Raw` and `Buffered` storage are served by the archive core.
-pub(crate) fn read_entry_to<W: Write>(
+pub(crate) const fn read_entry_to<W: Write>(
 	_source: &mut (impl Read + Seek),
 	_entry: &Entry,
 	_output: &mut W,

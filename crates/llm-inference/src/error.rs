@@ -476,7 +476,7 @@ impl std::error::Error for Error {}
 mod tests {
 	use std::mem::size_of;
 
-	use omp_core::Str;
+	
 
 	use super::{Error, ErrorKind, ErrorPhase, RetryAction};
 	use crate::receipt::ExecutionReceipt;
@@ -489,7 +489,7 @@ mod tests {
 			RetryAction::Never,
 			ExecutionReceipt::default(),
 		)
-		.code(Str::from("invalid_credential"));
+		.code(sf!("invalid_credential"));
 		let debug = format!("{error:?}");
 		assert!(debug.contains("invalid_credential"));
 		assert!(!debug.contains("Authorization:"));

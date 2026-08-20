@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::OperationKind;
 use serde::{Deserialize, Serialize};
 
@@ -101,14 +101,8 @@ impl Codec for ParallelSearchCodec {
 
 fn request_headers() -> Box<[RequestHeader]> {
 	Box::new([
-		RequestHeader {
-			name:  Str::new_static("content-type"),
-			value: Str::new_static("application/json"),
-		},
-		RequestHeader {
-			name:  Str::new_static("parallel-beta"),
-			value: Str::new_static(BETA_HEADER_VALUE),
-		},
+		RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+		RequestHeader { name: sf!("parallel-beta"), value: sf!(BETA_HEADER_VALUE) },
 	])
 }
 
@@ -141,9 +135,9 @@ fn encode_request(request: &SearchRequest) -> Result<Bytes, Error> {
 fn join_uri(base: &str, path: &str) -> Str {
 	let base = base.trim_end_matches('/');
 	if base.ends_with(path) {
-		Str::from(base)
+		Str::new(base)
 	} else {
-		Str::from(format!("{base}{path}"))
+		sf!("{base}{path}")
 	}
 }
 
@@ -278,7 +272,7 @@ fn project(response: WireResponse) -> Result<SearchResults, Error> {
 		results.push(SearchResult {
 			rank,
 			url,
-			title: title.unwrap_or_else(|| Str::new_static("")),
+			title: title.unwrap_or_else(Default::default),
 			snippet: bounded_snippet(excerpts.unwrap_or_default()),
 			score,
 			published_at: publish_date.as_deref().and_then(parse_date),
@@ -316,7 +310,7 @@ fn bounded_snippet(excerpts: Vec<Str>) -> Option<Str> {
 			break;
 		}
 	}
-	(!output.is_empty()).then(|| Str::from(output))
+	(!output.is_empty()).then(|| Str::new(output))
 }
 
 fn push_bounded(output: &mut String, value: &str, limit: usize) {
@@ -373,13 +367,13 @@ fn provider_error(_error: WireErrorEnvelope) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::new_static("parallel_search_error"))
-	.detail(ErrorDetail::provider(Str::new_static("Parallel Search request failed")))
+	.code(sf!("parallel_search_error"))
+	.detail(ErrorDetail::provider(sf!("Parallel Search request failed")))
 }
 
 fn encoding_error(kind: ErrorKind, reason: &'static str) -> Error {
 	Error::new(kind, ErrorPhase::Encoding, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 fn protocol_error(reason: &'static str) -> Error {
@@ -389,7 +383,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 #[cfg(test)]
@@ -401,9 +395,9 @@ mod tests {
 
 	fn request() -> SearchRequest {
 		SearchRequest {
-			query:             Str::from("parallel web systems"),
-			include_domains:   Arc::from([Str::from("parallel.ai")]),
-			exclude_domains:   Arc::from([Str::from("example.invalid")]),
+			query:             sf!("parallel web systems"),
+			include_domains:   Arc::from([sf!("parallel.ai")]),
+			exclude_domains:   Arc::from([sf!("example.invalid")]),
 			recency:           None,
 			locale:            None,
 			max_results:       4,
@@ -416,14 +410,8 @@ mod tests {
 	fn exact_beta_header_and_body_contract() {
 		let headers = request_headers();
 		assert_eq!(headers.as_ref(), [
-			RequestHeader {
-				name:  Str::new_static("content-type"),
-				value: Str::new_static("application/json"),
-			},
-			RequestHeader {
-				name:  Str::new_static("parallel-beta"),
-				value: Str::new_static("search-extract-2025-10-10"),
-			},
+			RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+			RequestHeader { name: sf!("parallel-beta"), value: sf!("search-extract-2025-10-10") },
 		]);
 		assert!(
 			headers
@@ -500,7 +488,7 @@ mod tests {
 		let oversized = Bytes::from(vec![b'x'; MAX_RESPONSE_BYTES as usize + 1]);
 		assert!(decoder.push(Frame::Raw(oversized), &mut |_| {}).is_err());
 		let snippet =
-			bounded_snippet(vec![Str::from("é".repeat(MAX_SNIPPET_BYTES))]).expect("snippet");
+			bounded_snippet(vec![Str::new("é".repeat(MAX_SNIPPET_BYTES))]).expect("snippet");
 		assert!(snippet.len() <= MAX_SNIPPET_BYTES);
 		assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
 	}

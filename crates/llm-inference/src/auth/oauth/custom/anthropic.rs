@@ -5,7 +5,7 @@ use http::{
 	HeaderMap, HeaderName, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, base64_url};
+use omp_core::{Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::{ExposeSecret, SecretString};
@@ -91,7 +91,7 @@ async fn exchange(
 		.fill(&mut state_bytes[..])
 		.map_err(|_| OAuthError::Entropy)?;
 	let verifier = SecretString::from(base64_url::encode_raw(&verifier_bytes[..]).into_string());
-	let state = Str::from(base64_url::encode_raw(&state_bytes[..]).into_string());
+	let state = Str::new(base64_url::encode_raw(&state_bytes[..]).into_string());
 	let challenge =
 		base64_url::encode_raw(&Sha256::digest(verifier.expose_secret().as_bytes())).into_string();
 
@@ -123,12 +123,12 @@ async fn exchange(
 			.append_pair("state", &state);
 	}
 	driver
-		.emit(AuthEvent::OpenUrl(authorize_url.as_str().into()))
+		.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
 		.await?;
 	driver
 		.emit(AuthEvent::Prompt(AuthPrompt {
-			id:      "oauth-callback-url".into(),
-			message: PROMPT.into(),
+			id:      sf!("oauth-callback-url"),
+			message: sf!(PROMPT),
 			input:   AuthPromptKind::AuthorizationCode,
 		}))
 		.await?;
@@ -230,7 +230,7 @@ fn token_response(
 	Ok(OAuthTokenSet {
 		access_token: SecretString::from(access_token.to_owned()),
 		refresh_token,
-		token_type: "Bearer".into(),
+		token_type: sf!("Bearer"),
 		expires_in: Some(Duration::from_secs(expires_in.saturating_sub(5 * 60))),
 		identity_response: response.body,
 	})

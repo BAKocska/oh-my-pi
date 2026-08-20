@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, fmt};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use omp_tool::{Rev, RevParseError};
 use thiserror::Error;
 
@@ -43,13 +43,13 @@ impl fmt::Debug for EntryKindDecl {
 impl EntryKindDecl {
 	/// Parses a declaration's canonical revision spelling.
 	pub fn parse(
-		name: impl Into<Str>,
+		name: impl IntoStr,
 		rev: &str,
 		display: bool,
 		projects: bool,
 		lift: Option<LiftHook>,
 	) -> Result<Self, RevParseError> {
-		Ok(Self { name: name.into(), rev: rev.parse()?, display, projects, lift })
+		Ok(Self { name: name.into_str(), rev: rev.parse()?, display, projects, lift })
 	}
 }
 
@@ -164,7 +164,7 @@ impl EntryKindRegistry {
 					rev:       declaration.rev,
 					display:   declaration.display,
 					projects:  declaration.projects,
-					extension: Str::from(extension),
+					extension: Str::new(extension),
 					lift:      declaration.lift,
 				});
 		}
@@ -176,7 +176,7 @@ impl EntryKindRegistry {
 		self
 			.kinds
 			.get(kind)
-			.ok_or_else(|| EntryKindError::Unknown(Str::from(kind)))
+			.ok_or_else(|| EntryKindError::Unknown(Str::new(kind)))
 	}
 
 	/// Returns a kind record when the caller may read its namespace.
@@ -199,8 +199,8 @@ impl EntryKindRegistry {
 			return Ok(record);
 		}
 		Err(EntryKindError::AccessDenied {
-			extension: Str::from(caller_extension),
-			kind:      Str::from(kind),
+			extension: Str::new(caller_extension),
+			kind:      Str::new(kind),
 		})
 	}
 

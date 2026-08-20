@@ -981,7 +981,7 @@ fn transport_error(phase: ErrorPhase, committed: bool, reason: &'static str) -> 
 	};
 	Error::new(ErrorKind::Connectivity, phase, action, ExecutionReceipt::default())
 		.committed(committed)
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 struct CassetteEventStream {

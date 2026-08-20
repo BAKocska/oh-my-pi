@@ -14,7 +14,7 @@ use http::{
 	HeaderMap, HeaderName, HeaderValue, StatusCode,
 	header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_hashline::RevisionToken;
 use omp_tools::read::{
 	DirectoryEntry, DirectorySource, Fault, ReadLease, ReadSources, SNAPSHOT_MAX_BYTES,
@@ -663,7 +663,7 @@ fn resolve_authored_path(root: &Path, authored: &str) -> PathBuf {
 fn display_path(root: &Path, canonical: &Path) -> Result<Str, Fault> {
 	if let Ok(relative) = canonical.strip_prefix(root) {
 		return if relative.as_os_str().is_empty() {
-			Ok(Str::new_static("."))
+			Ok(sf!("."))
 		} else {
 			utf8_slash_path(relative)
 		};
@@ -673,7 +673,7 @@ fn display_path(root: &Path, canonical: &Path) -> Result<Str, Fault> {
 	{
 		let suffix = utf8_slash_path(relative)?;
 		return Ok(if suffix.is_empty() {
-			Str::new_static("~")
+			sf!("~")
 		} else {
 			Str::from(format!("~/{suffix}"))
 		});

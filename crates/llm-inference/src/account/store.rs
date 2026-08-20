@@ -121,7 +121,7 @@ impl std::error::Error for AccountStateStoreError {}
 
 impl From<rusqlite::Error> for AccountStateStoreError {
 	fn from(error: rusqlite::Error) -> Self {
-		Self::Database { summary: Str::from(error.to_string()) }
+		Self::Database { summary: Str::new(error.to_string()) }
 	}
 }
 
@@ -384,7 +384,7 @@ impl AccountStateStore {
 					reason:  CooldownReason::from_str(&reason).map_err(|_| {
 						AccountStateStoreError::InvalidVocabulary {
 							field: "cooldown reason",
-							value: Str::from(reason),
+							value: Str::new(reason),
 						}
 					})?,
 				})
@@ -465,7 +465,7 @@ impl AccountStateStore {
 				provenance: QuotaProvenance::from_str(&provenance).map_err(|_| {
 					AccountStateStoreError::InvalidVocabulary {
 						field: "quota provenance",
-						value: Str::from(provenance),
+						value: Str::new(provenance),
 					}
 				})?,
 				observed_at: from_millis(observed_at)?,

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use quick_xml::{
 	Reader,
 	escape::{resolve_xml_entity, unescape},
@@ -108,7 +108,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	if target.pdf
 		&& let Some(pdf_link) = entry.pdf_link
 	{
-		notes.push(Str::new_static("Fetching PDF for full content..."));
+		notes.push(sf!("Fetching PDF for full content..."));
 		if let Ok(pdf) = client.get(HttpRequest::new(pdf_link)).await
 			&& pdf.is_success()
 			&& let Ok(Some(converted)) = markit::convert(Path::new("paper.pdf"), &pdf.body)
@@ -117,15 +117,13 @@ pub(super) async fn render<C: HttpClient + Sync>(
 			markdown.push_str("---\n\n## Full Paper\n\n");
 			markdown.push_str(&converted.text);
 			markdown.push('\n');
-			notes.push(Str::new_static("PDF converted via markit"));
+			notes.push(sf!("PDF converted via markit"));
 		}
 	}
 
 	let mut result = RenderResult::markdown(&markdown, "arxiv");
 	if notes.is_empty() {
-		result
-			.notes
-			.insert(0, Str::new_static("Fetched via arXiv API"));
+		result.notes.insert(0, sf!("Fetched via arXiv API"));
 	} else {
 		result.notes.extend(notes);
 	}

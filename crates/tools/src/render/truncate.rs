@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fmt::Write as _};
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::BlobRef;
 use xutf::{Encoding as _, Utf8, Utf16};
 
@@ -90,7 +90,7 @@ pub async fn spill_truncated_text<B: ReadBlobs>(
 	let total_lines = u64::try_from(truncation.total_lines).unwrap_or(u64::MAX);
 	if !truncation.truncated {
 		return Ok(SpilledText {
-			content: Str::from(full_text),
+			content: Str::new(full_text),
 			blob: None,
 			shown_lines,
 			total_lines,
@@ -99,12 +99,10 @@ pub async fn spill_truncated_text<B: ReadBlobs>(
 
 	let content = truncation.content.to_owned();
 	let bytes = Bytes::from(full_text);
-	let blob = blobs
-		.store(bytes, Str::new_static("text/plain; charset=utf-8"))
-		.await?;
+	let blob = blobs.store(bytes, sf!("text/plain; charset=utf-8")).await?;
 	let mut content = content;
 	append_blob_truncation_notice_counts(&mut content, shown_lines, total_lines, &blob.hash);
-	Ok(SpilledText { content: Str::from(content), blob: Some(blob), shown_lines, total_lines })
+	Ok(SpilledText { content: Str::new(content), blob: Some(blob), shown_lines, total_lines })
 }
 
 /// A borrowed result from [`truncate_head_bytes`].

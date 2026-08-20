@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 
 use super::hr::truncate_to_width;
@@ -94,7 +94,7 @@ pub const fn compaction_threshold_color(theme: &Theme) -> Color {
 pub fn spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> Str {
 	if amount_nanos == 0 {
 		return if subscription {
-			Str::from(charset.icon(Icon::Subscription))
+			Str::new(charset.icon(Icon::Subscription))
 		} else {
 			Str::default()
 		};
@@ -137,8 +137,8 @@ impl Segment {
 	}
 
 	/// Appends label text.
-	pub fn label(mut self, label: impl Into<Str>) -> Self {
-		let label = label.into();
+	pub fn label(mut self, label: impl IntoStr) -> Self {
+		let label = label.into_str();
 		if self.label.is_empty() {
 			self.label = label;
 		} else {
@@ -154,7 +154,7 @@ impl Segment {
 	}
 
 	/// Sets one custom segment property.
-	pub fn with_custom(mut self, name: impl Into<Str>, value: impl Into<PropValue>) -> Self {
+	pub fn with_custom(mut self, name: impl IntoStr, value: impl Into<PropValue>) -> Self {
 		self.props.set_custom(name, value);
 		self
 	}

@@ -40,5 +40,5 @@ pub use secret::Secret;
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;
 pub use sparse_set::SparseSet;
-pub use str::{CowStr, IntoStr, Str, StrMut};
+pub use str::{CowStr, IntoStr, Str, StrExt, StrMut};
 pub use time::{Duration, DurationError, DurationUnit, format_rfc3339, parse_rfc3339};

@@ -13,7 +13,7 @@ use image::{
 	},
 	imageops::FilterType,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 /// Largest image accepted by the read tool (20 MiB).
 pub const MAX_IMAGE_INPUT_BYTES: usize = 20 * 1024 * 1024;
@@ -120,11 +120,11 @@ impl ImageFault {
 	/// Exact model-facing failure text used by pi.
 	pub fn message(&self) -> Str {
 		match *self {
-			Self::TooLarge { bytes, max_bytes } => Str::from(format!(
+			Self::TooLarge { bytes, max_bytes } => sf!(
 				"Image file too large: {} exceeds {} limit.",
 				format_bytes(bytes),
 				format_bytes(max_bytes)
-			)),
+			),
 		}
 	}
 }
@@ -236,7 +236,7 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 	);
 	Ok(Some(ProcessedImage {
 		data: Bytes::from(encoded.data),
-		media_type: Str::new_static(encoded.kind.media_type()),
+		media_type: sf!(encoded.kind.media_type()),
 		bytes,
 		original_width: Some(original_width),
 		original_height: Some(original_height),
@@ -264,7 +264,7 @@ fn unchanged_image(input: Bytes, metadata: ImageMetadata, was_animated: bool) ->
 	let dimensions = metadata.width.zip(metadata.height);
 	ProcessedImage {
 		data: input,
-		media_type: Str::new_static(metadata.kind.media_type()),
+		media_type: sf!(metadata.kind.media_type()),
 		bytes,
 		original_width: metadata.width,
 		original_height: metadata.height,
@@ -289,7 +289,7 @@ fn unchanged_decoded_image(
 	let bytes = input.len();
 	ProcessedImage {
 		data: input,
-		media_type: Str::new_static(kind.media_type()),
+		media_type: sf!(kind.media_type()),
 		bytes,
 		original_width: Some(width),
 		original_height: Some(height),
@@ -328,7 +328,7 @@ fn image_description(
 		description.push('\n');
 		description.push_str(note);
 	}
-	Str::from(description)
+	Str::new(description)
 }
 
 fn decode_image(input: &[u8], kind: ImageKind) -> image::ImageResult<(DynamicImage, bool)> {

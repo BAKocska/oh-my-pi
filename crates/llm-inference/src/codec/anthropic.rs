@@ -1,7 +1,7 @@
 //! Typed Anthropic Messages projection and incremental event decoding.
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, encoding::base64};
+use omp_core::{Str, encoding::base64, sf};
 use omp_llm_catalog::{
 	CodecId, OperationKind, ProviderId, ServiceTier, ThinkingEffort, ThinkingSelection,
 };
@@ -665,14 +665,14 @@ pub fn project(
 			let beta = (!intent.betas.as_slice().is_empty()).then(|| intent.betas.header_value());
 			serialize_body(&intent.body).map(|body| ProjectedMessages {
 				body,
-				anthropic_version_header: Some(Str::new_static(DIRECT_VERSION)),
+				anthropic_version_header: Some(sf!(DIRECT_VERSION)),
 				anthropic_beta_header: beta,
 			})
 		},
 		AnthropicAdapter::Vertex | AnthropicAdapter::Bedrock => {
 			intent.body.model = None;
 			intent.body.stream = false;
-			intent.body.anthropic_version = Some(Str::new_static(match adapter {
+			intent.body.anthropic_version = Some(sf!(match adapter {
 				AnthropicAdapter::Vertex => VERTEX_VERSION,
 				AnthropicAdapter::Bedrock => BEDROCK_VERSION,
 				AnthropicAdapter::Direct => unreachable!(),
@@ -758,8 +758,8 @@ pub fn lower_chat(
 					return Err(capability_error("anthropic.web_search.recency_unsupported"));
 				}
 				body.tools.push(Tool::Hosted(HostedToolDefinition {
-					kind:            Str::new_static("web_search_20250305"),
-					name:            Str::new_static("web_search"),
+					kind:            sf!("web_search_20250305"),
+					name:            sf!("web_search"),
 					max_uses:        None,
 					citations:       None,
 					allowed_domains: allowed_domains.iter().cloned().collect(),
@@ -768,8 +768,8 @@ pub fn lower_chat(
 				}));
 			},
 			HostedTool::CodeExecution => body.tools.push(Tool::Hosted(HostedToolDefinition {
-				kind:            Str::new_static("code_execution_20250522"),
-				name:            Str::new_static("code_execution"),
+				kind:            sf!("code_execution_20250522"),
+				name:            sf!("code_execution"),
 				max_uses:        None,
 				citations:       None,
 				allowed_domains: Vec::new(),
@@ -813,7 +813,7 @@ fn append_message(messages: &mut Vec<Message>, role: &'static str, mut blocks: V
 	if let Some(last) = messages.last_mut().filter(|last| last.role == role) {
 		last.content.append(&mut blocks);
 	} else {
-		messages.push(Message { role: Str::new_static(role), content: blocks });
+		messages.push(Message { role: sf!(role), content: blocks });
 	}
 }
 
@@ -1026,8 +1026,8 @@ fn lower_thinking(
 		return (!selection.suppress_when_off).then_some(Thinking::Disabled);
 	}
 	let display = setting_value(request).and_then(|reasoning| match reasoning.visibility {
-		ReasoningVisibility::Hidden => Some(Str::new_static("omitted")),
-		ReasoningVisibility::Summary => Some(Str::new_static("summarized")),
+		ReasoningVisibility::Hidden => Some(sf!("omitted")),
+		ReasoningVisibility::Summary => Some(sf!("summarized")),
 		ReasoningVisibility::Visible => None,
 	});
 	if let Some(tokens) = selection.budget {
@@ -1046,7 +1046,7 @@ fn lower_output_config(
 			return None;
 		}
 		Some(selection.native_effort.clone().unwrap_or_else(|| {
-			Str::new_static(match selection.effort {
+			sf!(match selection.effort {
 				ThinkingEffort::Off => "low",
 				ThinkingEffort::Minimal => "minimal",
 				ThinkingEffort::Low => "low",
@@ -1135,20 +1135,11 @@ fn encoded_count_tokens(
 		request,
 	)?;
 	let mut headers = vec![
-		RequestHeader {
-			name:  Str::new_static("content-type"),
-			value: Str::new_static("application/json"),
-		},
-		RequestHeader {
-			name:  Str::new_static("anthropic-version"),
-			value: Str::new_static(DIRECT_VERSION),
-		},
+		RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+		RequestHeader { name: sf!("anthropic-version"), value: sf!(DIRECT_VERSION) },
 	];
 	if !betas.as_slice().is_empty() {
-		headers.push(RequestHeader {
-			name:  Str::new_static("anthropic-beta"),
-			value: betas.header_value(),
-		});
+		headers.push(RequestHeader { name: sf!("anthropic-beta"), value: betas.header_value() });
 	}
 	Ok(EncodedRequest {
 		operation:   OperationKind::CountTokens,
@@ -1192,16 +1183,13 @@ impl Codec for AnthropicCodec {
 			MessagesIntent { body, fallbacks: Vec::new(), betas: self.betas.clone() },
 			self.adapter,
 		)?;
-		let mut headers = vec![RequestHeader {
-			name:  Str::new_static("content-type"),
-			value: Str::new_static("application/json"),
-		}];
+		let mut headers =
+			vec![RequestHeader { name: sf!("content-type"), value: sf!("application/json") }];
 		if let Some(version) = projected.anthropic_version_header {
-			headers
-				.push(RequestHeader { name: Str::new_static("anthropic-version"), value: version });
+			headers.push(RequestHeader { name: sf!("anthropic-version"), value: version });
 		}
 		if let Some(beta) = projected.anthropic_beta_header {
-			headers.push(RequestHeader { name: Str::new_static("anthropic-beta"), value: beta });
+			headers.push(RequestHeader { name: sf!("anthropic-beta"), value: beta });
 		}
 		let uri = match self.adapter {
 			AnthropicAdapter::Direct => direct_uri(target.endpoint.base_url.as_str()),
@@ -1276,12 +1264,12 @@ pub fn vertex_endpoint(project: &str, location: &str, model: &str) -> Result<Str
 	} else {
 		format!("https://{location}-aiplatform.googleapis.com")
 	};
-	Ok(Str::new(format!(
+	Ok(sf!(
 		"{host}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:streamRawPredict",
 		path_segment(project),
 		path_segment(location),
 		path_segment(model),
-	)))
+	))
 }
 
 /// Resolves the AWS signing region for a Bedrock Anthropic model.
@@ -1293,7 +1281,7 @@ pub fn resolve_bedrock_region(explicit: &str, model: &str, base_url: &str) -> St
 		if !explicit.is_empty() && region_serves_geo(explicit, geo) {
 			return Str::new(explicit);
 		}
-		return Str::new_static(fallback);
+		return sf!(fallback);
 	}
 	if !explicit.is_empty() {
 		return Str::new(explicit);
@@ -1301,7 +1289,7 @@ pub fn resolve_bedrock_region(explicit: &str, model: &str, base_url: &str) -> St
 	if let Some(region) = endpoint_region(base_url) {
 		return Str::new(region);
 	}
-	Str::new_static("us-east-1")
+	sf!("us-east-1")
 }
 
 /// Builds a Bedrock `InvokeModelWithResponseStream` endpoint for Anthropic
@@ -1324,7 +1312,7 @@ pub fn bedrock_endpoint(base_url: &str, region: &str, model: &str) -> Result<Str
 	} else {
 		base_url.trim_end_matches('/').to_owned()
 	};
-	Ok(Str::new(format!("{base}/model/{}/invoke-with-response-stream", path_segment(model))))
+	Ok(sf!("{base}/model/{}/invoke-with-response-stream", path_segment(model)))
 }
 
 fn valid_region(value: &str) -> bool {
@@ -1371,7 +1359,7 @@ impl Decoder for CountTokensDecoder {
 		emit(RawEvent::Answer(AnswerBody::Tokens(TokenCount {
 			tokens:     response.input_tokens,
 			provenance: TokenizerProvenance {
-				tokenizer: Str::new_static("anthropic-messages-count-tokens"),
+				tokenizer: sf!("anthropic-messages-count-tokens"),
 				revision:  self.wire_model.clone(),
 				exact:     true,
 			},
@@ -1558,9 +1546,9 @@ fn bedrock_payload(message: &crate::transport::EventStreamMessage) -> Result<Opt
 			.or_else(|| message.string_header(":error-code"))
 			.unwrap_or("api_error");
 		let body = serde_json::from_slice::<BedrockException>(&message.payload)
-			.unwrap_or(BedrockException { message: Str::new_static("") });
+			.unwrap_or(BedrockException { message: Default::default() });
 		return Err(provider_error(
-			Str::new_static(match exception {
+			sf!(match exception {
 				"accessDeniedException" | "AccessDeniedException" | "notAuthorized" => {
 					"authentication_error"
 				},
@@ -1726,7 +1714,7 @@ impl AnthropicDecoder {
 						.context_edits
 						.extend(context.applied_edits.into_iter().map(|edit| match edit {
 							IncomingAppliedEdit::ClearThinking20251015 => {
-								Str::new_static("clear_thinking_20251015")
+								sf!("clear_thinking_20251015")
 							},
 						}));
 				}
@@ -2151,8 +2139,8 @@ fn unsupported_fallbacks() -> Error {
 	Error::planning(
 		ErrorKind::CapabilityMismatch,
 		ErrorDetail::capability(
-			Str::new_static("request.fallbacks"),
-			ReasonId(Str::new_static("anthropic.messages.root_fallbacks_unrepresentable")),
+			sf!("request.fallbacks"),
+			ReasonId(sf!("anthropic.messages.root_fallbacks_unrepresentable")),
 		),
 		ExecutionReceipt::default(),
 	)
@@ -2161,7 +2149,7 @@ fn unsupported_fallbacks() -> Error {
 fn capability_error(reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::CapabilityMismatch,
-		ErrorDetail::capability(Str::new_static(reason), ReasonId(Str::new_static(reason))),
+		ErrorDetail::capability(sf!(reason), ReasonId(sf!(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -2173,7 +2161,7 @@ fn encoding_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 fn protocol_error(reason: &'static str, committed: bool) -> Error {
@@ -2184,7 +2172,7 @@ fn protocol_error(reason: &'static str, committed: bool) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.committed(committed)
-	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 fn provider_error(kind: Str, _message: Str, committed: bool) -> Error {
@@ -2424,7 +2412,7 @@ mod tests {
 		let direct = project(
 			MessagesIntent {
 				body:      MessagesRequest {
-					model: Some(Str::new_static("model")),
+					model: Some(sf!("model")),
 					stream: true,
 					..MessagesRequest::default()
 				},
@@ -2446,7 +2434,7 @@ mod tests {
 			let cloud = project(
 				MessagesIntent {
 					body:      MessagesRequest {
-						model: Some(Str::new_static("model")),
+						model: Some(sf!("model")),
 						stream: true,
 						..MessagesRequest::default()
 					},
@@ -2460,7 +2448,7 @@ mod tests {
 			assert!(cloud_body.model.is_none());
 			assert!(!cloud_body.stream);
 			assert_eq!(cloud_body.anthropic_version.as_deref(), Some(version));
-			assert_eq!(cloud_body.anthropic_beta, [Str::new_static("one"), Str::new_static("two")]);
+			assert_eq!(cloud_body.anthropic_beta, [sf!("one"), sf!("two")]);
 			assert!(cloud.anthropic_version_header.is_none());
 			assert!(cloud.anthropic_beta_header.is_none());
 		}
@@ -2559,7 +2547,7 @@ mod tests {
 				CanonicalPart::ToolResult {
 					call:     ToolCallId::new("toolu_text"),
 					name:     None,
-					content:  vec![ToolResultContent::Text(Str::new_static("ok"))].into(),
+					content:  vec![ToolResultContent::Text(sf!("ok"))].into(),
 					is_error: false,
 				},
 			],
@@ -2602,7 +2590,7 @@ mod tests {
 			})
 			.collect();
 		assert_eq!(deltas, ["Summary prefix", " summary tail"]);
-		assert_eq!(decoder.outcome().signatures, vec![(0, Str::new_static("sig_tail"))]);
+		assert_eq!(decoder.outcome().signatures, vec![(0, sf!("sig_tail"))]);
 	}
 
 	#[test]
@@ -2624,10 +2612,7 @@ mod tests {
 		let error = project(
 			MessagesIntent {
 				body:      MessagesRequest::default(),
-				fallbacks: vec![RequestFallback {
-					from: Str::new_static("a"),
-					to:   Str::new_static("b"),
-				}],
+				fallbacks: vec![RequestFallback { from: sf!("a"), to: sf!("b") }],
 				betas:     BetaSet::default(),
 			},
 			AnthropicAdapter::Direct,
@@ -2873,7 +2858,7 @@ mod tests {
 	#[test]
 	fn count_tokens_response_is_exact_and_provenanced() {
 		let mut decoder =
-			CountTokensDecoder { done: false, wire_model: Str::new_static("claude-sonnet-4-6") };
+			CountTokensDecoder { done: false, wire_model: sf!("claude-sonnet-4-6") };
 		let mut events = Vec::new();
 		decoder
 			.push(Frame::Raw(Bytes::from_static(br#"{"input_tokens":42}"#)), &mut |event| {
@@ -2892,7 +2877,7 @@ mod tests {
 		}
 		assert!(decoder.finish(&mut |_| {}).is_ok());
 		let mut truncated =
-			CountTokensDecoder { done: false, wire_model: Str::new_static("claude-sonnet-4-6") };
+			CountTokensDecoder { done: false, wire_model: sf!("claude-sonnet-4-6") };
 		assert_eq!(truncated.finish(&mut |_| {}).unwrap_err().kind, ErrorKind::StreamCorruption);
 	}
 
@@ -2914,7 +2899,7 @@ mod tests {
 		);
 		assert_eq!(
 			serde_json::to_string(&WireToolChoice::Tool {
-				name: Str::new_static("bash"),
+				name: sf!("bash"),
 				disable_parallel_tool_use: None,
 			})
 			.unwrap(),
@@ -2925,7 +2910,7 @@ mod tests {
 			serde_json::from_str(r#"{"type":"tool","name":"eval","disable_parallel_tool_use":true}"#)
 				.unwrap();
 		assert_eq!(decoded, WireToolChoice::Tool {
-			name: Str::new_static("eval"),
+			name: sf!("eval"),
 			disable_parallel_tool_use: Some(true),
 		});
 	}

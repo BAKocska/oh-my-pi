@@ -12,7 +12,7 @@ use crate::{Entry, Error, Limits, Result, entry::Storage, path::validate};
 ///
 /// Bounded by [`Limits::link_depth`]; exceeding it fails with
 /// [`Error::LinkResolutionDepth`] rather than looping on cyclic aliases.
-pub(crate) fn resolve_alias_path(entries: &[Entry], path: Str, limits: Limits) -> Result<Str> {
+pub fn resolve_alias_path(entries: &[Entry], path: Str, limits: Limits) -> Result<Str> {
 	let original = path.clone();
 	let mut resolved = path;
 	let mut rewrites = 0_u64;

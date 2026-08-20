@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::Value;
 use smallvec::SmallVec;
 use xutf::BufReadCharsExt as _;
@@ -248,7 +248,7 @@ impl<'a> ToolAssembler<'a> {
 				source_index,
 				reason: ToolRejection::MalformedArguments {
 					offset: 0,
-					reason: Str::from("incomplete tool call"),
+					reason: sf!("incomplete tool call"),
 				},
 			});
 		}
@@ -308,7 +308,7 @@ impl<'a> ToolAssembler<'a> {
 			});
 		let complete_name = decode_utf8(&name)
 			.filter(|value| !value.is_empty())
-			.map(Str::from);
+			.map(Str::new);
 		self.open.insert(source_index, PartialCall {
 			id:              id.clone(),
 			name:            BytesMut::from(name.as_ref()),
@@ -356,7 +356,7 @@ impl<'a> ToolAssembler<'a> {
 			return Vec::new();
 		}
 		call.started_emitted = true;
-		vec![ToolAssemblyEvent::Started { source_index, id: call.id.clone(), name: Str::from(name) }]
+		vec![ToolAssemblyEvent::Started { source_index, id: call.id.clone(), name: Str::new(name) }]
 	}
 
 	fn arguments_delta(&mut self, source_index: u32, bytes: Bytes) -> Vec<ToolAssemblyEvent> {
@@ -403,7 +403,7 @@ impl<'a> ToolAssembler<'a> {
 							source_index,
 							reason: ToolRejection::MalformedArguments {
 								offset: error.column(),
-								reason: Str::from(error.to_string()),
+								reason: Str::new(error.to_string()),
 							},
 						};
 					},
@@ -454,7 +454,7 @@ impl<'a> ToolAssembler<'a> {
 						source_index,
 						reason: ToolRejection::MalformedArguments {
 							offset: 0,
-							reason: Str::new_static("freeform tool input is not UTF-8"),
+							reason: sf!("freeform tool input is not UTF-8"),
 						},
 					};
 				};
@@ -466,7 +466,7 @@ impl<'a> ToolAssembler<'a> {
 			source_index,
 			call: ToolCall {
 				id:        call.id,
-				name:      Str::from(name),
+				name:      Str::new(name),
 				arguments: OpaqueJson::new(arguments),
 			},
 		}
@@ -477,7 +477,7 @@ impl<'a> ToolAssembler<'a> {
 			self.evidence.push(RecoveryRecord {
 				attempt: self.attempt,
 				kind: RecoveryKind::ToolAssembly,
-				rule: ReasonId(Str::from(rule)),
+				rule: ReasonId(Str::new(rule)),
 				input_bytes,
 				steps,
 			});
@@ -716,11 +716,11 @@ fn validate_node(
 		};
 		if !valid {
 			let expected_types = match types {
-				Value::String(kind) => std::iter::once(Str::from(kind.as_str())).collect(),
+				Value::String(kind) => std::iter::once(Str::new(kind.as_str())).collect(),
 				Value::Array(kinds) => kinds
 					.iter()
 					.filter_map(Value::as_str)
-					.map(Str::from)
+					.map(Str::new)
 					.collect(),
 				_ => SmallVec::new(),
 			};
@@ -1030,7 +1030,7 @@ fn is_tag_selected_branch(branch: &Value, value: &Value) -> bool {
 
 fn type_violation<T>(path: &str, expected_types: SmallVec<Str, 4>) -> Result<T, SchemaViolation> {
 	Err(SchemaViolation {
-		path: Str::from(if path.is_empty() { "/" } else { path }),
+		path: Str::new(if path.is_empty() { "/" } else { path }),
 		rule: "type",
 		expected_types,
 		from_union_branch: false,
@@ -1042,7 +1042,7 @@ fn child_path(parent: &str, child: &str) -> String {
 }
 fn violation<T>(path: &str, rule: &'static str) -> Result<T, SchemaViolation> {
 	Err(SchemaViolation {
-		path: Str::from(if path.is_empty() { "/" } else { path }),
+		path: Str::new(if path.is_empty() { "/" } else { path }),
 		rule,
 		expected_types: SmallVec::new(),
 		from_union_branch: false,
@@ -1408,7 +1408,7 @@ mod tests {
 
 	fn definition() -> ToolDefinition {
 		ToolDefinition {
-			name:        Str::from("search"),
+			name:        sf!("search"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(
@@ -1552,7 +1552,7 @@ mod tests {
 	fn fabricated_and_duplicate_results_are_rejected() {
 		let call = ToolCall {
 			id:        ToolCallId::new("call-1"),
-			name:      Str::from("search"),
+			name:      sf!("search"),
 			arguments: OpaqueJson::new(json!({"query":"rust"})),
 		};
 		let mut pairer = ToolResultPairer::default();
@@ -1571,7 +1571,7 @@ mod tests {
 	#[test]
 	fn truncated_nested_arguments_repair_privately_before_authorization() {
 		let nested = ToolDefinition {
-			name:        Str::from("search"),
+			name:        sf!("search"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
@@ -1670,12 +1670,12 @@ mod tests {
 	fn pairing_bound_rejects_calls_instead_of_forgetting_duplicates() {
 		let first = ToolCall {
 			id:        ToolCallId::new("first"),
-			name:      Str::from("search"),
+			name:      sf!("search"),
 			arguments: OpaqueJson::new(json!({"query":"one"})),
 		};
 		let second = ToolCall {
 			id:        ToolCallId::new("second"),
-			name:      Str::from("search"),
+			name:      sf!("search"),
 			arguments: OpaqueJson::new(json!({"query":"two"})),
 		};
 		let mut pairer = ToolResultPairer::new(1);
@@ -1691,7 +1691,7 @@ mod tests {
 	/// Mirrors the shape of the `ask` tool that motivated pi issue #8886.
 	fn ask_definition() -> ToolDefinition {
 		ToolDefinition {
-			name:        Str::from("ask"),
+			name:        sf!("ask"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
@@ -1762,7 +1762,7 @@ mod tests {
 	#[test]
 	fn string_type_union_stringifies_container_arguments() {
 		let definition = ToolDefinition {
-			name:        Str::from("union_string"),
+			name:        sf!("union_string"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
@@ -1803,7 +1803,7 @@ mod tests {
 		assert_eq!(issue.path.as_str(), "/payload");
 
 		let definition = ToolDefinition {
-			name:        Str::from("untagged"),
+			name:        sf!("untagged"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(schema),
@@ -1816,7 +1816,7 @@ mod tests {
 	#[test]
 	fn failed_union_branch_still_allows_lossless_scalar_repair() {
 		let definition = ToolDefinition {
-			name:        Str::from("lossless"),
+			name:        sf!("lossless"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
@@ -1869,7 +1869,7 @@ mod tests {
 				})
 			};
 			let definition = ToolDefinition {
-				name:        Str::from("lossy"),
+				name:        sf!("lossy"),
 				description: None,
 				input:       ToolInputConstraint::JsonSchema {
 					parameters: OpaqueJson::new(json!({
@@ -1917,7 +1917,7 @@ mod tests {
 		assert_eq!(issue.path.as_str(), "/payload");
 
 		let definition = ToolDefinition {
-			name:        Str::from("tagged"),
+			name:        sf!("tagged"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(schema),
@@ -1985,7 +1985,7 @@ mod tests {
 	#[test]
 	fn flattened_bare_leaf_array_elements_rebuild() {
 		let tags = ToolDefinition {
-			name:        Str::from("tag"),
+			name:        sf!("tag"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
@@ -2046,7 +2046,7 @@ mod tests {
 	#[test]
 	fn non_array_dotted_keys_are_untouched() {
 		let dotted = ToolDefinition {
-			name:        Str::from("dot"),
+			name:        sf!("dot"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({

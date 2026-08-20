@@ -15,7 +15,7 @@ use flume::{Receiver, Sender};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{ApprovalBook, ApprovalDecision, ApprovalSource, ApprovalSpec, Journal};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{ModelKey, ReasoningEffort};
 use omp_llm_inference::{
 	Client, Registry,
@@ -437,13 +437,13 @@ impl Runtime {
 					.get("subject")
 					.and_then(Value::as_str)
 					.map_or_else(|| Str::from(title), Str::from),
-				kind:          Str::new_static("acp_elicitation"),
-				scopes:        vec![Str::new_static("once")],
+				kind:          sf!("acp_elicitation"),
+				scopes:        vec![sf!("once")],
 				default:       None,
-				route:         Str::new_static("acp"),
+				route:         sf!("acp"),
 				approver:      None,
 				timeout_ms:    0,
-				unreachable:   Str::new_static("deny"),
+				unreachable:   sf!("deny"),
 				require_human: true,
 				pattern:       None,
 				evidence:      Vec::new(),
@@ -475,7 +475,7 @@ impl Runtime {
 			.approvals
 			.decide(ticket_id, ApprovalDecision {
 				approved,
-				scope: Str::new_static("once"),
+				scope: sf!("once"),
 				source: ApprovalSource::External,
 				decided_by: params
 					.get("decidedBy")
@@ -826,7 +826,7 @@ fn convert_blocks(value: &Value) -> miette::Result<(Vec<ContentPart>, Vec<Value>
 						.decode(data)
 						.map_err(|error| miette!("invalid image base64: {error}"))?;
 					MediaInput::Bytes {
-						media_type: media_type.unwrap_or_else(|| Str::new_static("image/png")),
+						media_type: media_type.unwrap_or_else(|| sf!("image/png")),
 						data:       Bytes::from(data),
 					}
 				} else {
@@ -858,7 +858,7 @@ fn convert_blocks(value: &Value) -> miette::Result<(Vec<ContentPart>, Vec<Value>
 			},
 			"audio" => {
 				parts.push(ContentPart::Text {
-					text:  Str::new_static("[Audio attachment unavailable in ACP]"),
+					text:  sf!("[Audio attachment unavailable in ACP]"),
 					proof: None,
 				});
 				replay.push(json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"[Audio attachment]"}}));
@@ -1025,9 +1025,8 @@ mod tests {
 
 	#[test]
 	fn remote_terminal_requests_stream_without_url_dispatch() {
-		let request =
-			RemoteOperation::StartTerminal { command: Str::new_static("pwd"), cwd: None }
-				.request(json!(7), "session");
+		let request = RemoteOperation::StartTerminal { command: sf!("pwd"), cwd: None }
+			.request(json!(7), "session");
 		assert_eq!(request["method"], "terminal/create");
 		assert_eq!(request["params"]["stream"], true);
 	}

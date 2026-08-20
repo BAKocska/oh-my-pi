@@ -567,7 +567,7 @@ macro_rules! typed_location {
 		impl $rust {
 			#[new]
 			fn new(value: &str) -> PyResult<Self> {
-				<$inner>::new(Str::from(value))
+				<$inner>::new(Str::new(value))
 					.map(Self)
 					.map_err(value_error)
 			}
@@ -613,7 +613,7 @@ macro_rules! typed_url_location {
 		impl $rust {
 			#[new]
 			fn new(value: &str) -> PyResult<Self> {
-				<$inner>::new(Str::from(value))
+				<$inner>::new(Str::new(value))
 					.map(Self)
 					.map_err(value_error)
 			}
@@ -643,7 +643,7 @@ macro_rules! typed_url_location {
 				value.push_str(&self.0.as_str()[..base_len]);
 				value.push(':');
 				value.push_str(selector);
-				<$inner>::new(Str::from(value))
+				<$inner>::new(Str::new(value))
 					.map(Self)
 					.map_err(value_error)
 			}
@@ -728,9 +728,7 @@ struct PyEnvPath(EnvPath);
 impl PyEnvPath {
 	#[new]
 	fn new(value: &str) -> PyResult<Self> {
-		EnvPath::new(Str::from(value))
-			.map(Self)
-			.map_err(value_error)
+		EnvPath::new(Str::new(value)).map(Self).map_err(value_error)
 	}
 
 	#[getter]
@@ -804,7 +802,7 @@ struct PyClientPath(ClientPath);
 impl PyClientPath {
 	#[new]
 	fn new(value: &str) -> PyResult<Self> {
-		ClientPath::new(Str::from(value))
+		ClientPath::new(Str::new(value))
 			.map(Self)
 			.map_err(value_error)
 	}
@@ -848,7 +846,7 @@ impl PyClientPath {
 
 fn join_env_path<'a>(base: &str, parts: impl Iterator<Item = &'a str>) -> PyResult<PyEnvPath> {
 	let joined = join_path(base, parts)?;
-	EnvPath::new(Str::from(joined))
+	EnvPath::new(Str::new(joined))
 		.map(PyEnvPath)
 		.map_err(value_error)
 }
@@ -858,7 +856,7 @@ fn join_client_path<'a>(
 	parts: impl Iterator<Item = &'a str>,
 ) -> PyResult<PyClientPath> {
 	let joined = join_path(base, parts)?;
-	ClientPath::new(Str::from(joined))
+	ClientPath::new(Str::new(joined))
 		.map(PyClientPath)
 		.map_err(value_error)
 }

@@ -5,7 +5,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use serde::{Deserialize, Serialize};
 
 pub use crate::body::{AttemptBodyEvidence, Replayability};
@@ -21,10 +21,49 @@ use crate::{
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct FeatureId(pub Str);
 
+impl FeatureId {
+	/// Creates a feature identifier.
+	#[inline]
+	pub fn new(value: impl IntoStr) -> Self {
+		Self(value.into_str())
+	}
+
+	/// Creates a static feature identifier.
+	#[inline]
+	pub const fn new_static(value: &'static str) -> Self {
+		Self(sf!(value))
+	}
+}
+impl From<&str> for FeatureId {
+	#[inline]
+	fn from(value: &str) -> Self {
+		Self(Str::new(value))
+	}
+}
+
 /// Identifies a catalog or policy reason.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ReasonId(pub Str);
 
+impl ReasonId {
+	/// Creates a reason identifier.
+	#[inline]
+	pub fn new(value: impl IntoStr) -> Self {
+		Self(value.into_str())
+	}
+
+	/// Creates a static reason identifier.
+	#[inline]
+	pub const fn new_static(value: &'static str) -> Self {
+		Self(sf!(value))
+	}
+}
+impl From<&str> for ReasonId {
+	#[inline]
+	fn from(value: &str) -> Self {
+		Self(Str::new(value))
+	}
+}
 /// Describes an execution penalty introduced while satisfying intent.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Penalty {

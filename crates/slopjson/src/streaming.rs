@@ -91,7 +91,7 @@ impl PartialParser<'_> {
 				Some(quote @ (b'"' | b'\'')) => {
 					Str::from(self.p.string(quote).expect("lenient string never fails"))
 				},
-				_ => Str::from(self.p.unquoted_key()),
+				_ => Str::new(self.p.unquoted_key()),
 			};
 			self.p.ws();
 			if self.p.peek() == Some(b':') {

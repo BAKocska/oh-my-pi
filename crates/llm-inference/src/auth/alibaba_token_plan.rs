@@ -14,7 +14,7 @@ use futures::{
 	future::{BoxFuture, Either, ready},
 };
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{AuthSpecId, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
@@ -156,7 +156,7 @@ fn nonempty(value: Option<&str>) -> Option<Str> {
 	value
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 }
 
 fn valid_token(token: &str) -> bool {
@@ -354,7 +354,7 @@ async fn run_login_inner(
 	emit_prompt(driver, "region", REGION_PROMPT, AuthPromptKind::PlainText).await?;
 	let region = receive_text(driver, AuthPromptKind::PlainText).await?;
 	let (base_url, auth_url) = match region.trim() {
-		"2" => (Str::from(ALIBABA_TOKEN_PLAN_CN_BASE_URL), CHINA_AUTH_URL),
+		"2" => (sf!(ALIBABA_TOKEN_PLAN_CN_BASE_URL), CHINA_AUTH_URL),
 		"3" => {
 			emit_prompt(driver, "custom-url", CUSTOM_URL_PROMPT, AuthPromptKind::PlainText).await?;
 			let custom = receive_text(driver, AuthPromptKind::PlainText).await?;
@@ -362,12 +362,12 @@ async fn run_login_inner(
 			if custom.is_empty() {
 				return Err(AlibabaTokenPlanLoginError::CustomUrlRequired);
 			}
-			(Str::from(custom), INTERNATIONAL_AUTH_URL)
+			(Str::new(custom), INTERNATIONAL_AUTH_URL)
 		},
-		_ => (Str::from(ALIBABA_TOKEN_PLAN_BASE_URL), INTERNATIONAL_AUTH_URL),
+		_ => (sf!(ALIBABA_TOKEN_PLAN_BASE_URL), INTERNATIONAL_AUTH_URL),
 	};
 	driver
-		.emit(AuthEvent::OpenUrl(Str::from(auth_url)))
+		.emit(AuthEvent::OpenUrl(Str::new(auth_url)))
 		.await
 		.map_err(|_| AlibabaTokenPlanLoginError::InvalidResponse)?;
 	emit_prompt(driver, "api-key", API_KEY_PROMPT, AuthPromptKind::ApiKey).await?;
@@ -438,7 +438,7 @@ async fn run_login_inner(
 			account,
 			provider: provider_id,
 			principal: Some(principal),
-			label: Some(Str::from(PROVIDER)),
+			label: Some(sf!(PROVIDER)),
 			state: AccountState::Active,
 		}))
 		.await
@@ -452,7 +452,7 @@ async fn emit_prompt(
 	input: AuthPromptKind,
 ) -> Result<(), AlibabaTokenPlanLoginError> {
 	driver
-		.emit(AuthEvent::Prompt(AuthPrompt { id: Str::from(id), message: Str::from(message), input }))
+		.emit(AuthEvent::Prompt(AuthPrompt { id: Str::new(id), message: Str::new(message), input }))
 		.await
 		.map_err(|_| AlibabaTokenPlanLoginError::InvalidResponse)
 }
@@ -538,7 +538,7 @@ fn credential_store_error(error: StoreError) -> AlibabaTokenPlanLoginError {
 }
 
 fn login_error(error: AlibabaTokenPlanLoginError) -> Error {
-	let message = Str::from(error.to_string());
+	let message = Str::new(error.to_string());
 	Error::new(
 		match error {
 			AlibabaTokenPlanLoginError::ValidationStatus(_)
@@ -733,14 +733,14 @@ mod tests {
 		};
 		assert_eq!(prompt.message, REGION_PROMPT);
 		assert_eq!(prompt.input, AuthPromptKind::PlainText);
-		respond(&session, AuthInput::PlainText(Str::from(region))).await;
+		respond(&session, AuthInput::PlainText(Str::new(region))).await;
 		if let Some(custom_url) = custom_url {
 			let AuthEvent::Prompt(prompt) = next_event(&session).await else {
 				panic!("custom URL prompt");
 			};
 			assert_eq!(prompt.message, CUSTOM_URL_PROMPT);
 			assert_eq!(prompt.input, AuthPromptKind::PlainText);
-			respond(&session, AuthInput::PlainText(Str::from(custom_url))).await;
+			respond(&session, AuthInput::PlainText(Str::new(custom_url))).await;
 		}
 		let AuthEvent::OpenUrl(open_url) = next_event(&session).await else {
 			panic!("authorization URL");
@@ -833,7 +833,7 @@ mod tests {
 			.await
 		});
 		assert!(matches!(next_event(&session).await, AuthEvent::Prompt(_)));
-		respond(&session, AuthInput::PlainText(Str::from("2"))).await;
+		respond(&session, AuthInput::PlainText(sf!("2"))).await;
 		assert!(matches!(next_event(&session).await, AuthEvent::OpenUrl(_)));
 		assert!(matches!(next_event(&session).await, AuthEvent::Prompt(_)));
 		respond(&session, AuthInput::ApiKey(SecretString::from("sk-sp-test".to_owned()))).await;

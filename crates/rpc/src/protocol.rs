@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-fn is_false(value: &bool) -> bool {
+const fn is_false(value: &bool) -> bool {
 	!*value
 }
 
@@ -60,7 +60,7 @@ impl fmt::Display for RequestId {
 }
 
 /// Server startup handshake emitted before any request is accepted.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadyFrame {
 	/// Frame discriminator. A conforming peer sends `"ready"`.
@@ -95,7 +95,7 @@ impl ReadyFrame {
 }
 
 /// Generic request envelope and escape hatch for commands added after this SDK.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcRequest {
 	/// Correlation identifier. Notifications may omit it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,7 +196,7 @@ impl fmt::Display for RpcErrorCode {
 }
 
 /// Response envelope shared by every command.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcResponse {
 	/// Correlation identifier copied from the request.
@@ -325,7 +325,7 @@ pub enum EventCategory {
 }
 
 /// Generic event envelope retaining all application-owned fields.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcEvent {
 	/// Event discriminator encoded in the JSON `type` field.
 	#[serde(rename = "type")]
@@ -380,7 +380,7 @@ impl RpcEvent {
 }
 
 /// A typed notification that still accepts application-specific payloads.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationFrame {
 	/// Notification discriminator such as `session_info_update` or
 	/// `config_update`.
@@ -392,7 +392,7 @@ pub struct NotificationFrame {
 }
 
 /// Parameters used by prompt-like commands.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptParams {
 	/// User-authored message.
@@ -406,7 +406,7 @@ pub struct PromptParams {
 }
 
 /// Parameters used to create a new session.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionParams {
 	/// Optional parent session path for lineage tracking.
@@ -415,7 +415,7 @@ pub struct NewSessionParams {
 }
 
 /// Stable transcript page returned by `get_messages_page`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptPage {
 	/// Messages in this page.
@@ -452,7 +452,7 @@ pub struct OAuthProvider {
 }
 
 /// Host-owned tool advertised to the agent.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostToolDefinition {
 	/// Tool name used in model calls.
@@ -473,7 +473,7 @@ pub struct HostToolDefinition {
 }
 
 /// Server request to execute a host-owned tool.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostToolCall {
 	/// Frame discriminator.
@@ -503,7 +503,7 @@ pub struct HostToolCancel {
 }
 
 /// Streaming update sent while a host tool runs.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostToolUpdate {
 	/// Frame discriminator.
@@ -516,7 +516,7 @@ pub struct HostToolUpdate {
 }
 
 /// Terminal result of a host tool invocation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostToolResult {
 	/// Frame discriminator.
@@ -532,7 +532,7 @@ pub struct HostToolResult {
 }
 
 /// One subagent entry in the current in-memory snapshot.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentSnapshot {
 	/// Stable subagent identifier.
@@ -549,7 +549,7 @@ pub struct SubagentSnapshot {
 }
 
 /// Incremental persisted transcript read for a subagent.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentMessages {
 	/// Session file backing the transcript.
@@ -567,7 +567,7 @@ pub struct SubagentMessages {
 }
 
 /// Extension UI request forwarded to the embedding host.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionUiRequest {
 	/// Frame discriminator.
 	#[serde(rename = "type")]
@@ -582,7 +582,7 @@ pub struct ExtensionUiRequest {
 }
 
 /// Extension UI response sent by the embedding host.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionUiResponse {
 	/// Frame discriminator.
 	#[serde(rename = "type")]

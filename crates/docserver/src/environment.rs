@@ -6,7 +6,7 @@ use std::{
 	sync::Arc,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -115,7 +115,7 @@ impl WorkspaceLeaseTable {
 					if Some(lease.owner) != owner.or(mutation_owner) {
 						return Err(crate::Error::InvalidTarget {
 							target: Str::new(path.to_string_lossy()),
-							reason: Str::new_static("path is held by an exclusive workspace lease"),
+							reason: sf!("path is held by an exclusive workspace lease"),
 						});
 					}
 				}
@@ -139,7 +139,7 @@ impl WorkspaceLeaseTable {
 				{
 					return Err(crate::Error::InvalidTarget {
 						target: Str::new(path.to_string_lossy()),
-						reason: Str::new_static("path is held by an exclusive workspace lease"),
+						reason: sf!("path is held by an exclusive workspace lease"),
 					});
 				}
 			}
@@ -148,7 +148,7 @@ impl WorkspaceLeaseTable {
 				if overlaps && *mutation_owner != owner {
 					return Err(crate::Error::InvalidTarget {
 						target: Str::new(path.to_string_lossy()),
-						reason: Str::new_static("path has an in-flight workspace mutation"),
+						reason: sf!("path has an in-flight workspace mutation"),
 					});
 				}
 			}

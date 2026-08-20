@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use smallvec::SmallVec;
 
@@ -275,7 +275,7 @@ fn repair_replacement_indentation(
 			if let Edit::Insert { text, .. } = edit
 				&& !text.trim().is_empty()
 			{
-				*text = fmts!("{shift}{text}");
+				*text = sf!("{shift}{text}");
 			}
 		}
 		let bodies = edits[insert_start..insert_end]
@@ -333,7 +333,7 @@ fn body_is_relocatable_construct(edits: &[Edit], members: &[usize], path: &str) 
 		if end == 0 {
 			return false;
 		}
-		if end >= last + 1 {
+		if end > last {
 			return end > line;
 		}
 		line = end + 1;

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use omp_core::{Str, fmts};
+use omp_core::{IntoStr, Str, sf};
 use smallvec::SmallVec;
 use strum::{EnumString, IntoStaticStr};
 
@@ -110,12 +110,12 @@ impl TodoTask {
 	}
 
 	/// Appends label text.
-	pub fn label(mut self, label: impl Into<Str>) -> Self {
-		let suffix = label.into();
+	pub fn label(mut self, label: impl IntoStr) -> Self {
+		let suffix = label.into_str();
 		if self.label.is_empty() {
 			self.label = suffix;
 		} else {
-			self.label = fmts!("{}{}", self.label, suffix);
+			self.label = sf!("{}{}", self.label, suffix);
 		}
 		self
 	}
@@ -334,11 +334,11 @@ impl Component for Todo {
 		let content_rows = self.visible_row_count();
 		let (closed, total) = self.counts();
 		let path_cells = content_rows.saturating_add(SPINE_TAIL_CELLS);
-		let mut filled = if total == 0 {
-			0
-		} else {
-			closed.saturating_mul(path_cells).saturating_add(total / 2) / total
-		};
+		let mut filled = closed
+			.saturating_mul(path_cells)
+			.saturating_add(total / 2)
+			.checked_div(total)
+			.unwrap_or(0);
 		if closed > 0 {
 			filled = filled.max(1);
 		}
@@ -382,7 +382,7 @@ impl Component for Todo {
 					"…"
 				};
 				let summary =
-					fmts!("{ellipsis} {hidden} more stage{}", if hidden == 1 { "" } else { "s" });
+					sf!("{ellipsis} {hidden} more stage{}", if hidden == 1 { "" } else { "s" });
 				pc.frame
 					.put(x, y, &summary, Style::new().fg(pc.ctx.theme.muted));
 				y = y.saturating_add(1);
@@ -507,10 +507,10 @@ fn paint_tasks(
 			};
 			x = pc.frame.put(x, *y, label, label_style);
 			if status == TaskStatus::Blocked {
-				let note = task.props.str_of(Prop::Desc).map_or_else(
-					|| Str::new_static(" (blocked)"),
-					|reason| fmts!(" (blocked: {reason})"),
-				);
+				let note = task
+					.props
+					.str_of(Prop::Desc)
+					.map_or_else(|| sf!(" (blocked)"), |reason| sf!(" (blocked: {reason})"));
 				pc.frame.put(x, *y, &note, Style::new().dim());
 			}
 		} else {
@@ -520,7 +520,7 @@ fn paint_tasks(
 			x = pc
 				.frame
 				.put(x, *y, label, Style::new().fg(pc.ctx.theme.fg).bold());
-			let counter = fmts!(" {closed}/{total}");
+			let counter = sf!(" {closed}/{total}");
 			pc.frame.put(x, *y, &counter, Style::new().dim());
 		}
 		*y = y.saturating_add(1);

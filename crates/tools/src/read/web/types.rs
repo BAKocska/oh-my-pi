@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use smallvec::SmallVec;
 use xutf::{TextBuf as _, Utf8};
 
@@ -34,14 +34,14 @@ pub struct HttpRequest {
 impl HttpRequest {
 	/// Creates a GET request with the web reader's default size limit.
 	#[must_use]
-	pub fn new(url: impl Into<Str>) -> Self {
-		Self { url: url.into(), headers: SmallVec::new(), max_bytes: MAX_BYTES }
+	pub fn new(url: impl IntoStr) -> Self {
+		Self { url: url.into_str(), headers: SmallVec::new(), max_bytes: MAX_BYTES }
 	}
 
 	/// Adds a request header.
 	#[must_use]
-	pub fn with_header(mut self, name: impl Into<Str>, value: impl Into<Str>) -> Self {
-		self.headers.push((name.into(), value.into()));
+	pub fn with_header(mut self, name: impl IntoStr, value: impl IntoStr) -> Self {
+		self.headers.push((name.into_str(), value.into_str()));
 		self
 	}
 
@@ -108,13 +108,13 @@ pub struct RenderResult {
 impl RenderResult {
 	/// Builds a markdown result and applies the shared cleanup and size cap.
 	#[must_use]
-	pub fn markdown(content: &str, method: impl Into<Str>) -> Self {
+	pub fn markdown(content: &str, method: impl IntoStr) -> Self {
 		let (content, truncated) = finalize_output(content);
 		let mut notes = SmallVec::new();
 		if truncated {
-			notes.push("Output truncated to 500000 characters".into());
+			notes.push(sf!("Output truncated to 500000 characters"));
 		}
-		Self { content, content_type: Some("text/markdown".into()), method: method.into(), notes }
+		Self { content, content_type: Some(sf!("text/markdown")), method: method.into_str(), notes }
 	}
 }
 

@@ -25,7 +25,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{IntoStr, Str, encoding::base64, fmts};
+use omp_core::{IntoStr, Str, encoding::base64, sf};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 
@@ -201,9 +201,9 @@ async fn setup(
 		},
 		Surface::Window(config) => {
 			cmd.arg("-width")
-				.arg(fmts!("{}", config.width).as_str())
+				.arg(sf!("{}", config.width).as_str())
 				.arg("-height")
-				.arg(fmts!("{}", config.height).as_str());
+				.arg(sf!("{}", config.height).as_str());
 		},
 	}
 	// Explicit start page keeps a fresh profile off about:home/about:welcome.
@@ -281,7 +281,7 @@ async fn setup(
 			.call(
 				&mut link,
 				"script.addPreloadScript",
-				json!({ "functionDeclaration": fmts!("()=>{{{script}}}") }),
+				json!({ "functionDeclaration": sf!("()=>{{{script}}}") }),
 			)
 			.await?;
 	}
@@ -336,7 +336,7 @@ fn write_prefs(profile: &Path, page: &PageOptions) -> Result<()> {
 	));
 	if let Some(ua) = &page.user_agent {
 		let escaped = ua.replace('\\', "\\\\").replace('"', "\\\"");
-		prefs.push_str(&fmts!("user_pref(\"general.useragent.override\", \"{escaped}\");\n"));
+		prefs.push_str(&sf!("user_pref(\"general.useragent.override\", \"{escaped}\");\n"));
 	}
 	std::fs::write(profile.join("user.js"), prefs)?;
 	Ok(())
@@ -357,10 +357,10 @@ async fn discover_endpoint(port_file: &Path, child: &mut tokio::process::Child) 
 			&& port != 0
 		{
 			let host = value["ws_host"].as_str().unwrap_or("127.0.0.1");
-			return Ok(fmts!("ws://{host}:{port}/session"));
+			return Ok(sf!("ws://{host}:{port}/session"));
 		}
 		if let Some(status) = child.try_wait()? {
-			return Err(Error::Protocol(fmts!("firefox exited during startup: {status}")));
+			return Err(Error::Protocol(sf!("firefox exited during startup: {status}")));
 		}
 		if tokio::time::Instant::now() >= deadline {
 			return Err(Error::Timeout("waiting for the firefox BiDi endpoint"));
@@ -422,7 +422,7 @@ impl Driver {
 			}
 			return match msg["type"].as_str() {
 				Some("success") => Ok(msg.get_mut("result").map_or(Value::Null, Value::take)),
-				_ => Err(Error::Protocol(fmts!(
+				_ => Err(Error::Protocol(sf!(
 					"{method}: {}: {}",
 					msg["error"].as_str().unwrap_or("unknown error"),
 					msg["message"].as_str().unwrap_or(""),
@@ -542,7 +542,7 @@ impl Driver {
 		reply: Option<Box<dyn FnOnce(Str) + Send>>,
 	) -> Result<()> {
 		let expression = match reply {
-			Some(_) => fmts!("JSON.stringify((()=>{{ return ({js}); }})())"),
+			Some(_) => sf!("JSON.stringify((()=>{{ return ({js}); }})())"),
 			None => js.to_str(),
 		};
 		let result = self
@@ -665,7 +665,7 @@ impl Driver {
 		};
 		let raw = base64::decode(data.as_bytes())
 			.into_vec()
-			.map_err(|err| Error::Protocol(fmts!("screenshot base64: {err}")))?;
+			.map_err(|err| Error::Protocol(sf!("screenshot base64: {err}")))?;
 		let mut frame = decode_frame(self.format, &raw)?;
 		match &self.last_frame {
 			Some(prev) if prev.len() == frame.data.len() => {

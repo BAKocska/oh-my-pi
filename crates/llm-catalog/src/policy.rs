@@ -6,7 +6,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::{Str, hex};
+use omp_core::{Str, hex, sf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -798,7 +798,7 @@ impl HeaderProfile {
 	) -> Result<Self, HeaderPolicyError> {
 		let headers = canonicalize_headers(headers)?;
 		let bytes = serde_json::to_vec(&headers)
-			.map_err(|_| HeaderPolicyError::InvalidValue(Str::from("<serialization>")))?;
+			.map_err(|_| HeaderPolicyError::InvalidValue(sf!("<serialization>")))?;
 		Ok(Self {
 			id:      HeaderProfileId::from(content_id("headers", &bytes)),
 			headers: headers.into_iter().collect(),
@@ -809,7 +809,7 @@ impl HeaderProfile {
 	pub fn canonical_bytes(&self) -> Result<Vec<u8>, HeaderPolicyError> {
 		let headers = canonicalize_headers(self.headers.iter().cloned())?;
 		serde_json::to_vec(&headers)
-			.map_err(|_| HeaderPolicyError::InvalidValue(Str::from("<serialization>")))
+			.map_err(|_| HeaderPolicyError::InvalidValue(sf!("<serialization>")))
 	}
 
 	/// Returns the stable content-derived header profile identifier.
@@ -1178,23 +1178,21 @@ mod tests {
 		))
 		.expect("header fixture parses");
 		for case in fixture.resolved_policy.cases {
-			let result = HeaderProfile::try_new([StaticHeader {
-				name:  case.name,
-				value: Str::from("fixture"),
-			}]);
+			let result =
+				HeaderProfile::try_new([StaticHeader { name: case.name, value: sf!("fixture") }]);
 			assert_eq!(result.is_ok(), case.accepted);
 		}
 
 		let left = HeaderProfile::try_new([
-			StaticHeader { name: "X-Model-Test".into(), value: "a".into() },
-			StaticHeader { name: "User-Agent".into(), value: "b".into() },
+			StaticHeader { name: sf!("X-Model-Test"), value: sf!("a") },
+			StaticHeader { name: sf!("User-Agent"), value: sf!("b") },
 		])
 		.expect("safe headers");
 		let right = HeaderProfile::try_new([
-			StaticHeader { name: "user-agent".into(), value: "b".into() },
-			StaticHeader { name: "x-model-test".into(), value: "a".into() },
+			StaticHeader { name: sf!("user-agent"), value: sf!("b") },
+			StaticHeader { name: sf!("x-model-test"), value: sf!("a") },
 		])
-		.expect("safe headers");
+		.expect("safe headers"); 
 		assert_eq!(left, right);
 		assert_eq!(left.id, left.content_id().expect("valid content id"));
 	}

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use omp_core::{Str, StrMut};
+use omp_core::{IntoStr, Str, StrMut, sf};
 use smallvec::SmallVec;
 use xutf::Text;
 
@@ -63,8 +63,8 @@ impl TextLeaf {
 	}
 
 	/// Appends plain text content.
-	pub fn text(mut self, text: impl Into<Str>) -> Self {
-		append(&mut self.text, text.into());
+	pub fn text(mut self, text: impl IntoStr) -> Self {
+		append(&mut self.text, text.into_str());
 		self.version = self.version.wrapping_add(1);
 		self
 	}
@@ -106,7 +106,7 @@ impl TextLeaf {
 				let mut runs: SmallVec<(Style, Str), 8> = SmallVec::new();
 				for (index, line) in visible.split('\n').enumerate() {
 					if index > 0 {
-						runs.push((style, Str::new_static(" ")));
+						runs.push((style, sf!(" ")));
 					}
 					if !line.is_empty() {
 						runs.push((style, self.text.slice_ref(line)));
@@ -374,8 +374,8 @@ impl Pre {
 	}
 
 	/// Appends preformatted text content.
-	pub fn text(mut self, text: impl Into<Str>) -> Self {
-		append(&mut self.text, text.into());
+	pub fn text(mut self, text: impl IntoStr) -> Self {
+		append(&mut self.text, text.into_str());
 		self
 	}
 
@@ -549,7 +549,7 @@ pub(super) fn truncate_rich(
 			for row in 0..RichText::rows(rich) {
 				if row > 0 {
 					let style = joined.last().map_or(fallback, |(style, _)| *style);
-					joined.push((style, Str::new_static(" ")));
+					joined.push((style, sf!(" ")));
 				}
 				for (style, text) in rich.row_runs(row) {
 					joined.push((style, Str::new(text)));

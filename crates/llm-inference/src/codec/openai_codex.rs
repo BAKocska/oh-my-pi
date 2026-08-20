@@ -1,7 +1,7 @@
 //! Typed `ChatGPT` Codex Responses Lite, WebSocket, continuation, and
 //! discovery shapes.
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
 use super::openai_responses::{
@@ -82,19 +82,17 @@ pub fn transform_codex_request(
 		.iter()
 		.any(|value| value == "reasoning.encrypted_content")
 	{
-		request
-			.include
-			.push(Str::from("reasoning.encrypted_content"));
+		request.include.push(sf!("reasoning.encrypted_content"));
 	}
 	if let Some(reasoning) = request.reasoning.as_mut()
 		&& reasoning.effort.is_some()
 		&& reasoning.summary.is_none()
 	{
-		reasoning.summary = Some(Some(Str::from("auto")));
+		reasoning.summary = Some(Some(sf!("auto")));
 	}
 	if concurrent_summaries {
 		request.stream_options = Some(ResponsesStreamOptions {
-			reasoning_summary_delivery: Some(Str::from("sequential_cutoff")),
+			reasoning_summary_delivery: Some(sf!("sequential_cutoff")),
 		});
 	}
 	if !responses_lite {
@@ -109,13 +107,13 @@ pub fn transform_codex_request(
 	request.parallel_tool_calls = Some(false);
 	request.prompt_cache_retention = None;
 	if let Some(reasoning) = request.reasoning.as_mut() {
-		reasoning.context = Some(Str::from("all_turns"));
+		reasoning.context = Some(sf!("all_turns"));
 	} else {
 		request.reasoning = Some(ResponsesReasoning {
 			effort:  None,
 			summary: None,
 			mode:    None,
-			context: Some(Str::from("all_turns")),
+			context: Some(sf!("all_turns")),
 		});
 	}
 	for item in &mut request.input {
@@ -254,21 +252,19 @@ pub fn apply_codex_client_metadata(
 	turn_metadata: &ResponsesMetadata,
 ) {
 	let mut metadata = turn_metadata.clone();
-	metadata
-		.insert(Str::from("session_id"), ResponsesMetadataValue::String(identity.session_id.clone()));
-	metadata.insert(Str::from("turn_id"), ResponsesMetadataValue::String(identity.turn_id.clone()));
-	metadata.insert(Str::from("responses_lite"), ResponsesMetadataValue::Bool(responses_lite));
+	metadata.insert(sf!("session_id"), ResponsesMetadataValue::String(identity.session_id.clone()));
+	metadata.insert(sf!("turn_id"), ResponsesMetadataValue::String(identity.turn_id.clone()));
+	metadata.insert(sf!("responses_lite"), ResponsesMetadataValue::Bool(responses_lite));
 	if let Some(account) = &identity.account_id {
-		metadata.insert(Str::from("account_id"), ResponsesMetadataValue::String(account.clone()));
+		metadata.insert(sf!("account_id"), ResponsesMetadataValue::String(account.clone()));
 	}
 	if let Some(originator) = &identity.originator {
-		metadata.insert(Str::from("originator"), ResponsesMetadataValue::String(originator.clone()));
+		metadata.insert(sf!("originator"), ResponsesMetadataValue::String(originator.clone()));
 	}
 	if transport == CodexWireTransport::WebSocket {
-		metadata
-			.insert(Str::from("transport"), ResponsesMetadataValue::String(Str::from("websocket")));
+		metadata.insert(sf!("transport"), ResponsesMetadataValue::String(sf!("websocket")));
 		if let Some(state) = turn_state {
-			metadata.insert(Str::from("turn_state"), ResponsesMetadataValue::String(Str::from(state)));
+			metadata.insert(sf!("turn_state"), ResponsesMetadataValue::String(Str::new(state)));
 		}
 	}
 	request.client_metadata = Some(metadata);
@@ -279,22 +275,22 @@ pub fn apply_codex_client_metadata(
 pub fn resolve_codex_responses_url(base_url: &str) -> Str {
 	let base = base_url.trim_end_matches('/');
 	if base.ends_with("/codex/responses") {
-		Str::from(base)
+		Str::new(base)
 	} else if base.ends_with("/codex") {
-		Str::from(format!("{base}/responses"))
+		sf!("{base}/responses")
 	} else {
-		Str::from(format!("{base}/codex/responses"))
+		sf!("{base}/codex/responses")
 	}
 }
 
 /// Converts a Codex HTTP endpoint to a WebSocket endpoint.
 pub fn codex_websocket_url(url: &str) -> Result<Str, CodexWebSocketProtocolError> {
 	if let Some(rest) = url.strip_prefix("https://") {
-		Ok(Str::from(format!("wss://{rest}")))
+		Ok(sf!("wss://{rest}"))
 	} else if let Some(rest) = url.strip_prefix("http://") {
-		Ok(Str::from(format!("ws://{rest}")))
+		Ok(sf!("ws://{rest}"))
 	} else if url.starts_with("wss://") || url.starts_with("ws://") {
-		Ok(Str::from(url))
+		Ok(Str::new(url))
 	} else {
 		Err(CodexWebSocketProtocolError::InvalidEndpoint)
 	}
@@ -669,7 +665,7 @@ impl CodexModelsDecoder {
 		)
 		.provider(self.provider.clone())
 		.route(self.route.clone())
-		.code(Str::from(code))
+		.code(Str::new(code))
 	}
 
 	fn capabilities(row: &CodexModelRow) -> crate::catalog::ModelCapabilities {
@@ -822,7 +818,7 @@ impl super::Decoder for CodexModelsDecoder {
 				}),
 				extended_context_mode: None,
 				availability:          Some(ModelAvailability::Available),
-				source:                Str::from(CODEX_DISCOVERY_SOURCE),
+				source:                Str::new(CODEX_DISCOVERY_SOURCE),
 				observed_at_ms:        None,
 				updated_at_ms:         None,
 				deprecated:            None,
@@ -864,7 +860,7 @@ impl super::Codec for OpenAiCodexCodec {
 				RetryAction::Never,
 				ExecutionReceipt::default(),
 			)
-			.code(Str::from(code))
+			.code(Str::new(code))
 		};
 		if let crate::call::OperationCall::DiscoverModels(request) = operation {
 			if request.cursor.is_some() {
@@ -876,29 +872,20 @@ impl super::Codec for OpenAiCodexCodec {
 				.base_url
 				.as_str()
 				.trim_end_matches('/');
-			let uri = Str::from(format!("{base}/codex/models?client_version={CODEX_CLIENT_VERSION}"));
+			let uri = sf!("{base}/codex/models?client_version={CODEX_CLIENT_VERSION}");
 			let mut headers = vec![
+				super::RequestHeader { name: sf!("accept"), value: sf!("application/json") },
 				super::RequestHeader {
-					name:  Str::from("accept"),
-					value: Str::from("application/json"),
+					name:  sf!("openai-beta"),
+					value: sf!("responses=experimental"),
 				},
-				super::RequestHeader {
-					name:  Str::from("openai-beta"),
-					value: Str::from("responses=experimental"),
-				},
-				super::RequestHeader {
-					name:  Str::from("originator"),
-					value: Str::from(CODEX_ORIGINATOR),
-				},
-				super::RequestHeader {
-					name:  Str::from("version"),
-					value: Str::from(CODEX_CLIENT_VERSION),
-				},
+				super::RequestHeader { name: sf!("originator"), value: Str::new(CODEX_ORIGINATOR) },
+				super::RequestHeader { name: sf!("version"), value: Str::new(CODEX_CLIENT_VERSION) },
 			];
 			let account_id = context
 				.account
 				.and_then(|account| account.account.as_ref())
-				.map(|account| Str::from(account.as_str()))
+				.map(|account| Str::new(account.as_str()))
 				.or_else(|| {
 					self
 						.options
@@ -907,10 +894,8 @@ impl super::Codec for OpenAiCodexCodec {
 						.and_then(|identity| identity.account_id.clone())
 				});
 			if let Some(account_id) = account_id {
-				headers.push(super::RequestHeader {
-					name:  Str::from("chatgpt-account-id"),
-					value: account_id,
-				});
+				headers
+					.push(super::RequestHeader { name: sf!("chatgpt-account-id"), value: account_id });
 			}
 			return Ok(super::EncodedRequest {
 				operation: crate::catalog::OperationKind::DiscoverModels,
@@ -993,11 +978,8 @@ impl super::Codec for OpenAiCodexCodec {
 			method,
 			uri,
 			headers: vec![
-				super::RequestHeader {
-					name:  Str::from("content-type"),
-					value: Str::from("application/json"),
-				},
-				super::RequestHeader { name: Str::from("accept"), value: Str::from(accept) },
+				super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+				super::RequestHeader { name: sf!("accept"), value: Str::new(accept) },
 			]
 			.into_boxed_slice(),
 			body: BodySource::Bytes(body),

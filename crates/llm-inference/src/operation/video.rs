@@ -9,7 +9,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 
 use super::{
@@ -260,8 +260,8 @@ impl VideoProgress {
 			GenerationEvent::Completed(summary) => {
 				if summary.artifacts != self.artifacts {
 					return Err(VideoError::Job(JobError::Provider {
-						code:    Str::from("artifact_count_mismatch"),
-						message: Str::from("completion artifact count differs from streamed artifacts"),
+						code:    sf!("artifact_count_mismatch"),
+						message: sf!("completion artifact count differs from streamed artifacts",),
 					}));
 				}
 				self.finished = true;
@@ -338,14 +338,14 @@ where
 				return Err(wrong_operation(&call, OperationKind::GenerateVideo));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(
-					OperationKind::GenerateVideo,
-					Str::from(format!("{error:?}")),
-				));
+				return Err(media_validation_error(OperationKind::GenerateVideo, sf!("{error:?}")));
 			}
 			let response = pending
 				.ok_or_else(|| {
-					media_validation_error(OperationKind::GenerateVideo, "video_request_not_dispatched")
+					media_validation_error(
+						OperationKind::GenerateVideo,
+						sf!("video_request_not_dispatched"),
+					)
 				})?
 				.await?;
 			let mut progress = VideoProgress::default();
@@ -354,7 +354,7 @@ where
 				let stream = async_stream::stream! {
 					while let Some(event) = output.next().await {
 						match event.and_then(|event| {
-							progress.observe(&event, &artifact_limits).map_err(|error| media_protocol_error(OperationKind::GenerateVideo, Str::from(format!("{error:?}"))))?;
+							progress.observe(&event, &artifact_limits).map_err(|error| media_protocol_error(OperationKind::GenerateVideo, sf!("{error:?}")))?;
 							Ok(event)
 						}) {
 							Ok(event) => yield Ok(event),
@@ -362,7 +362,8 @@ where
 						}
 					}
 					if let Err(error) = progress.finish() {
-						yield Err(media_protocol_error(OperationKind::GenerateVideo, Str::from(format!("{error:?}"))));
+						let detail = sf!("{error:?}");
+						yield Err(media_protocol_error(OperationKind::GenerateVideo, detail));
 					}
 				};
 				*session.events_mut() = Box::pin(stream) as GenerationStream<VideoArtifact>;
@@ -418,7 +419,7 @@ mod tests {
 	#[test]
 	fn validates_media_controls() {
 		let request = VideoRequest {
-			prompt:            Str::from("clip"),
+			prompt:            sf!("clip"),
 			reference:         None,
 			duration_ms:       Setting::Require(2_000),
 			dimensions:        Setting::Require(Dimensions { width: 64, height: 64 }),

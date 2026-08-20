@@ -164,15 +164,15 @@ pub(crate) fn wrong_operation(call: &Call, expected: OperationKind) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		omp_core::Str::from(expected.to_string()),
-		ReasonId(omp_core::Str::from("operation_service_mismatch")),
+		omp_core::Str::new(expected.to_string()),
+		ReasonId(omp_core::sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
 
 pub(crate) fn media_validation_error(
 	operation: OperationKind,
-	reason: impl Into<omp_core::Str>,
+	reason: impl omp_core::IntoStr,
 ) -> Error {
 	Error::new(
 		ErrorKind::InvalidRequest,
@@ -181,14 +181,14 @@ pub(crate) fn media_validation_error(
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		omp_core::Str::from(operation.to_string()),
-		ReasonId(reason.into()),
+		omp_core::Str::new(operation.to_string()),
+		ReasonId(reason.into_str()),
 	))
 }
 
 pub(crate) fn media_protocol_error(
 	operation: OperationKind,
-	reason: impl Into<omp_core::Str>,
+	reason: impl omp_core::IntoStr,
 ) -> Error {
 	Error::new(
 		ErrorKind::ProviderContractMismatch,
@@ -198,7 +198,7 @@ pub(crate) fn media_protocol_error(
 	)
 	.committed(true)
 	.detail(ErrorDetail::capability(
-		omp_core::Str::from(operation.to_string()),
-		ReasonId(reason.into()),
+		omp_core::Str::new(operation.to_string()),
+		ReasonId(reason.into_str()),
 	))
 }

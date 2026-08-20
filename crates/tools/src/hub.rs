@@ -4,7 +4,7 @@ use std::{collections::HashMap, future::Future, sync::Arc};
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, Constraint, Effects, Ev, IncomingParams, ParamError, Part,
 	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -281,9 +281,7 @@ impl<B: HubBackend> HubBackend for HubRouter<B> {
 			.get(caller_id)
 			.cloned()
 			.ok_or_else(|| Fault {
-				message: Str::from(format!(
-					"hub owner '{caller_id}' is not attached; the session may have retired"
-				)),
+				message: sf!("hub owner '{caller_id}' is not attached; the session may have retired"),
 			})?;
 		backend.execute(caller_id, request).await
 	}
@@ -300,9 +298,9 @@ pub fn tool<B: HubBackend>(backend: B) -> Hub<B> {
 	Hub {
 		backend,
 		spec: ToolSpec {
-			name:            Str::new_static("hub"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(DESCRIPTION),
+			name:            sf!("hub"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(DESCRIPTION),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
 				priority:       100,
@@ -454,7 +452,7 @@ const fn valid_name_byte(byte: u8) -> bool {
 }
 
 fn invalid(message: &'static str) -> Fault {
-	Fault { message: Str::new_static(message) }
+	Fault { message: sf!(message) }
 }
 
 fn done(result: Result<Response, Fault>, useless: bool) -> Ev<(), Response, Fault> {
@@ -483,9 +481,9 @@ fn commit_event(error: omp_tool::CommitError) -> Ev<(), Response, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed hub@1 argument object"),
+		expected: sf!("one committed hub@1 argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::new_static(r#"{"op":"list"}"#)),
+		example:  Some(sf!(r#"{{"op":"list"}}"#)),
 		found:    Some(message),
 	}
 }

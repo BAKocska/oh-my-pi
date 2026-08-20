@@ -12,7 +12,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{Str, base64, fmts};
+use omp_core::{Str, base64, sf};
 use smallvec::SmallVec;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
@@ -1964,7 +1964,7 @@ impl Terminal {
 			// enables the mouse capture the hold contract promises.
 			if purpose == AltScreenUse::Interactive && !self.alt_mouse && !self.mouse {
 				self.alt_mouse = true;
-				return Some(Str::new_static(esc!(mouse_vt200, mouse_any_event, mouse_sgr)));
+				return Some(sf!(esc!(mouse_vt200, mouse_any_event, mouse_sgr)));
 			}
 			return None;
 		}
@@ -1978,8 +1978,8 @@ impl Terminal {
 			""
 		};
 		Some(match self.keyboard {
-			KeyboardMode::Kitty(push) => fmts!("{}{}{}", esc!(alt_screen), push, tracking),
-			KeyboardMode::ModifyOtherKeys => fmts!("{}{}", esc!(alt_screen), tracking),
+			KeyboardMode::Kitty(push) => sf!("{}{}{}", esc!(alt_screen), push, tracking),
+			KeyboardMode::ModifyOtherKeys => sf!("{}{}", esc!(alt_screen), tracking),
 		})
 	}
 

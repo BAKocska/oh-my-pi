@@ -1,7 +1,7 @@
 //! Typed Ollama `/api/chat` and `/api/tags` wire shapes and sans-I/O decoding.
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::base64};
+use omp_core::{Str, encoding::base64, sf};
 use omp_llm_catalog::{
 	ClassId, OperationBits, OperationKind, ProviderId, RouteId, WireModelId,
 	discover::DiscoveredModel,
@@ -344,11 +344,8 @@ fn encode_embed(
 		OperationKind::Embed,
 		RequestMethod::Post,
 		join_uri(context.route.endpoint.base_url.as_str(), "/api/embed"),
-		vec![RequestHeader {
-			name:  Str::from("content-type"),
-			value: Str::from("application/json"),
-		}]
-		.into_boxed_slice(),
+		vec![RequestHeader { name: sf!("content-type"), value: sf!("application/json") }]
+			.into_boxed_slice(),
 		BodySource::Bytes(body),
 		FramingProtocol::Raw,
 		SizeBounds {
@@ -473,8 +470,8 @@ fn encode_chat(
 		method:      RequestMethod::Post,
 		uri:         join_uri(context.route.endpoint.base_url.as_str(), "/api/chat"),
 		headers:     vec![RequestHeader {
-			name:  Str::from("content-type"),
-			value: Str::from("application/json"),
+			name:  sf!("content-type"),
+			value: sf!("application/json"),
 		}]
 		.into_boxed_slice(),
 		body:        BodySource::Bytes(body),
@@ -622,7 +619,7 @@ fn reject_proof(
 fn join_uri(base: &str, path: &str) -> Str {
 	let base = base.trim_end_matches('/');
 	let base = base.strip_suffix("/api").unwrap_or(base);
-	Str::from(format!("{base}{path}"))
+	sf!("{base}{path}")
 }
 
 struct OllamaDecoder {
@@ -641,7 +638,7 @@ struct OllamaDecoder {
 impl OllamaDecoder {
 	fn new(context: &DecodeContext<'_>) -> Self {
 		Self {
-			request_id: Str::from(context.request_id.as_str()),
+			request_id: Str::new(context.request_id.as_str()),
 			provider:   context.provider.clone(),
 			route:      context.route.clone(),
 			operation:  context.operation,
@@ -703,7 +700,7 @@ impl OllamaDecoder {
 					Some("length") => FinishReason::Length,
 					Some("tool_calls") => FinishReason::ToolCalls,
 					Some("stop") | None => FinishReason::Stop,
-					Some(other) => FinishReason::Other(Str::from(other)),
+					Some(other) => FinishReason::Other(Str::new(other)),
 				}
 			};
 			emit(RawEvent::Completion(RawCompletion {
@@ -842,7 +839,7 @@ impl Decoder for OllamaDecoder {
 							declared_capabilities: None,
 							declared_limits:       None,
 							availability:          None,
-							source:                Str::from("ollama:/api/tags"),
+							source:                sf!("ollama:/api/tags"),
 							observed_at_ms:        None,
 							updated_at_ms:         None,
 							deprecated:            None,
@@ -873,7 +870,7 @@ fn invalid_request(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn capability_error(reason: &'static str) -> Error {
@@ -884,7 +881,7 @@ fn capability_error(reason: &'static str) -> Error {
 
 fn protocol_error(reason: &'static str, phase: ErrorPhase) -> Error {
 	Error::new(ErrorKind::Protocol, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn provider_error(code: &'static str) -> Error {
@@ -894,8 +891,8 @@ fn provider_error(code: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::from(code))
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(code))))
+	.code(Str::new(code))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(code))))
 }
 
 #[cfg(test)]
@@ -903,7 +900,7 @@ mod tests {
 	use super::*;
 	fn decoder() -> OllamaDecoder {
 		OllamaDecoder {
-			request_id: Str::from("fixture"),
+			request_id: sf!("fixture"),
 			provider:   ProviderId::new("ollama-cloud"),
 			route:      RouteId::new("ollama-cloud"),
 			operation:  OperationKind::Chat,

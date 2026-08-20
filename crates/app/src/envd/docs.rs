@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_docserver::{
 	client::{TerminalEventReceiver, terminal_event_channel},
 	connection::{PROTOCOL_MAJOR, PROTOCOL_MINOR},
@@ -146,9 +146,7 @@ impl DocumentLease {
 			.head
 			.revision
 			.clone()
-			.ok_or(DocumentError::MalformedResponse(Str::new_static(
-				"document head omitted its revision",
-			)))
+			.ok_or(DocumentError::MalformedResponse(sf!("document head omitted its revision",)))
 	}
 }
 /// Connection-owned exclusive workspace reservation.
@@ -288,13 +286,13 @@ impl DocumentHost {
 				});
 			},
 			_ => {
-				return Err(DocumentError::MalformedResponse(Str::new_static(
+				return Err(DocumentError::MalformedResponse(sf!(
 					"expected ServerHello as the first server frame",
 				)));
 			},
 		};
 		if hello.protocol_major != PROTOCOL_MAJOR || hello.protocol_minor > PROTOCOL_MINOR {
-			return Err(DocumentError::MalformedResponse(Str::new_static(
+			return Err(DocumentError::MalformedResponse(sf!(
 				"document server negotiated an unsupported protocol version",
 			)));
 		}
@@ -995,7 +993,7 @@ impl DocumentHost {
 		if Arc::ptr_eq(&self.inner, &lease.host) {
 			Ok(())
 		} else {
-			Err(DocumentError::MalformedResponse(Str::new_static(
+			Err(DocumentError::MalformedResponse(sf!(
 				"document lease belongs to another document connection",
 			)))
 		}
@@ -1071,7 +1069,7 @@ fn ensure_pinned_head(
 		return Err(unexpected("response head"));
 	};
 	if head.revision != lease.head.revision {
-		return Err(DocumentError::MalformedResponse(Str::new_static(
+		return Err(DocumentError::MalformedResponse(sf!(
 			"document server returned a revision other than the requested pin",
 		)));
 	}
@@ -1167,7 +1165,7 @@ const fn closed_stream_error(stream: pb::EventStreamKind) -> EventStreamError {
 		stream,
 		failure: pb::EventStreamFailure::Closed,
 		skipped_events: 0,
-		message: Str::new_static("document-server connection closed"),
+		message: sf!("document-server connection closed"),
 	}
 }
 

@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Instant};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -471,9 +471,9 @@ impl DiscoveryNormalizer {
 			.iter()
 			.filter(|alias| *alias != &row.wire_model)
 			.map(|alias| CatalogAlias {
-				alias:      alias.as_str().into(),
+				alias:      Str::new(alias.as_str()),
 				target:     ModelKey::new(classification.logical_model.clone()),
-				rationale:  "provider discovery declared an alternate wire model identifier".into(),
+				rationale:  sf!("provider discovery declared an alternate wire model identifier",),
 				provenance: row.source.clone(),
 			})
 			.collect::<Vec<_>>()
@@ -751,7 +751,7 @@ mod tests {
 			declared_limits:       None,
 			extended_context_mode: None,
 			availability:          None,
-			source:                "provider-list".into(),
+			source:                sf!("provider-list"),
 			observed_at_ms:        Some(7),
 			updated_at_ms:         None,
 			deprecated:            None,
@@ -761,7 +761,7 @@ mod tests {
 	fn projector(pagination: DiscoveryPagination) -> RouteDiscoveryProjector {
 		let provider = ProviderDef {
 			id:                 ProviderId::from("provider"),
-			name:               "Provider".into(),
+			name:               sf!("Provider"),
 			auth:               Box::new([AuthSpecId::from("auth")]),
 			management:         ManagementCapabilities {
 				operations:        OperationBits::empty(),
@@ -781,7 +781,7 @@ mod tests {
 			codec:              CodecId::from("codec"),
 			transport:          TransportKind::Http,
 			endpoint:           EndpointSpec {
-				base_url: "https://provider.test".into(),
+				base_url: sf!("https://provider.test"),
 				region:   None,
 			},
 			auth:               AuthSpecId::from("auth"),
@@ -789,7 +789,7 @@ mod tests {
 			discovery:          Some(DiscoverySpecId::from("models")),
 			capability_limits:  RouteRestrictions::default(),
 			trust_domain:       TrustDomain {
-				origin:          "https://provider.test".into(),
+				origin:          sf!("https://provider.test"),
 				redirects:       RedirectTrust::SameOrigin,
 				allow_plaintext: false,
 			},
@@ -800,8 +800,8 @@ mod tests {
 		let spec = DiscoverySpec {
 			id: DiscoverySpecId::from("models"),
 			kind: DiscoveryKind::Specialized,
-			label: "models".into(),
-			path: "/models".into(),
+			label: sf!("models"),
+			path: sf!("/models"),
 			pagination,
 			authoritative: true,
 			interval: None,
@@ -812,13 +812,13 @@ mod tests {
 
 	#[test]
 	fn route_projector_preserves_cursor_provenance_unknowns_and_alias_order() {
-		let projector = projector(DiscoveryPagination::Cursor { query_parameter: "after".into() });
+		let projector = projector(DiscoveryPagination::Cursor { query_parameter: sf!("after") });
 		let mut z = row("z-model");
 		z.aliases = Box::new([WireModelId::from("z-alias")]);
 		let mut a = row("a-model");
 		a.aliases = Box::new([WireModelId::from("a-alias")]);
 		let page = projector
-			.project(&[z, a], Some(Str::from("opaque +/% cursor")))
+			.project(&[z, a], Some(sf!("opaque +/% cursor")))
 			.expect("route-bound page projects");
 		assert_eq!(
 			page
@@ -837,8 +837,8 @@ mod tests {
 			["a-alias", "z-alias"]
 		);
 		assert_eq!(page.continuation, DiscoveryContinuation::Cursor {
-			query_parameter: "after".into(),
-			value:           "opaque +/% cursor".into(),
+			query_parameter: sf!("after"),
+			value:           sf!("opaque +/% cursor"),
 		});
 		assert!(page.authoritative);
 		assert!(page.models.iter().all(|model| {
@@ -850,7 +850,7 @@ mod tests {
 
 	#[test]
 	fn route_projector_rejects_scope_alias_and_pagination_ambiguity() {
-		let cursor = projector(DiscoveryPagination::Cursor { query_parameter: "after".into() });
+		let cursor = projector(DiscoveryPagination::Cursor { query_parameter: sf!("after") });
 		let mut wrong = row("wrong");
 		wrong.route = RouteId::from("other-route");
 		assert!(matches!(
@@ -869,24 +869,24 @@ mod tests {
 
 		let single = projector(DiscoveryPagination::SinglePage);
 		assert_eq!(
-			single.project(&[], Some("unexpected".into())),
+			single.project(&[], Some(sf!("unexpected"))),
 			Err(DiscoveryError::UnexpectedContinuation(Box::new(DiscoverySpecId::from("models"))))
 		);
 
 		let numbered = projector(DiscoveryPagination::PageNumber {
-			query_parameter: "page".into(),
+			query_parameter: sf!("page"),
 			first_page:      1,
 		});
 		assert!(matches!(
-			numbered.project(&[], Some("01".into())),
+			numbered.project(&[], Some(sf!("01"))),
 			Err(DiscoveryError::InvalidPageNumber { value, .. }) if value.as_str() == "01"
 		));
 		assert_eq!(
 			numbered
-				.project(&[], Some("2".into()))
+				.project(&[], Some(sf!("2")))
 				.expect("canonical page number")
 				.continuation,
-			DiscoveryContinuation::PageNumber { query_parameter: "page".into(), page: 2 }
+			DiscoveryContinuation::PageNumber { query_parameter: sf!("page"), page: 2 }
 		);
 	}
 
@@ -1027,8 +1027,8 @@ mod tests {
 		let spec = DiscoverySpec {
 			id:            DiscoverySpecId::from("models"),
 			kind:          DiscoveryKind::Specialized,
-			label:         "models".into(),
-			path:          "/models".into(),
+			label:         sf!("models"),
+			path:          sf!("/models"),
 			pagination:    DiscoveryPagination::SinglePage,
 			authoritative: false,
 			interval:      Some(std::time::Duration::from_millis(1)),

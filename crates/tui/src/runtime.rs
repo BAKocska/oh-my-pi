@@ -26,7 +26,7 @@
 
 use std::{fmt, io, time::Duration};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
 
@@ -206,17 +206,17 @@ impl UiHandle {
 	}
 
 	/// Queues replacement text for the component named by `id`.
-	pub fn set_text(&self, id: impl Into<Str>, text: impl Into<Str>) {
-		let id = id.into();
-		let text = text.into();
+	pub fn set_text(&self, id: impl IntoStr, text: impl IntoStr) {
+		let id = id.into_str();
+		let text = text.into_str();
 		self.update(move |ui| {
 			ui.set_text(&id, text);
 		});
 	}
 
 	/// Queues invalidation of the component named by `id`.
-	pub fn invalidate(&self, id: impl Into<Str>) {
-		let id = id.into();
+	pub fn invalidate(&self, id: impl IntoStr) {
+		let id = id.into_str();
 		self.update(move |ui| {
 			ui.invalidate(&id);
 		});
@@ -439,8 +439,7 @@ pub const fn is_core_chord(chord: Chord) -> bool {
 			| Key::PasteRaw
 			| Key::Copy
 			| Key::Cut
-			| Key::Ctrl('c')
-			| Key::Ctrl('v')
+			| Key::Ctrl('c' | 'v')
 	)
 }
 

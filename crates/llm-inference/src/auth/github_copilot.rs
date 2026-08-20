@@ -20,7 +20,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, USER_AGENT},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::ProviderId;
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret as _, SecretString};
@@ -73,7 +73,7 @@ pub fn normalize_domain(input: &str) -> Option<Str> {
 		.ok()?
 		.host_str()
 		.filter(|host| !host.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 }
 
 /// Normalizes an enterprise GitHub domain, rejecting public GitHub hosts.
@@ -84,7 +84,7 @@ pub fn normalize_enterprise_domain(input: &str) -> Option<Str> {
 		return None;
 	}
 	let normalized =
-		normalize_domain(trimmed).unwrap_or_else(|| Str::from(trimmed.to_ascii_lowercase()));
+		normalize_domain(trimmed).unwrap_or_else(|| Str::new(trimmed.to_ascii_lowercase()));
 	if normalized.is_empty() || is_public_github_host(&normalized) {
 		None
 	} else {
@@ -103,19 +103,19 @@ pub fn normalize_api_endpoint(input: &str) -> Option<Str> {
 	if url.scheme() != "https" || url.host_str().is_none_or(str::is_empty) {
 		return None;
 	}
-	Some(Str::from(trimmed.trim_end_matches('/')))
+	Some(Str::new(trimmed.trim_end_matches('/')))
 }
 
 /// Resolves the Copilot API base URL for an optional enterprise domain.
 #[must_use]
 pub fn copilot_base_url(enterprise_domain: Option<&str>) -> Str {
 	let Some(domain) = enterprise_domain.and_then(normalize_enterprise_domain) else {
-		return Str::new_static(PERSONAL_GITHUB_COPILOT_BASE_URL);
+		return sf!(PERSONAL_GITHUB_COPILOT_BASE_URL);
 	};
 	if domain.starts_with("copilot-api.") {
-		Str::from(format!("https://{domain}"))
+		sf!("https://{domain}")
 	} else {
-		Str::from(format!("https://copilot-api.{domain}"))
+		sf!("https://copilot-api.{domain}")
 	}
 }
 

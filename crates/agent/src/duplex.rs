@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
-use omp_core::{IntoStr, Str};
+use omp_core::{IntoStr, Str, sf};
 use omp_env::EnvClient;
 use omp_proto::{
 	inference::v1::{ExecStatus, Invoke, InvokeComplete, exec_status},
@@ -111,7 +111,7 @@ impl DuplexManager {
 		if let Some(previous) = self.active.remove(&invocation_id) {
 			let _ = previous
 				.interrupt
-				.send(Some(Str::from("superseded duplicate invocation")));
+				.send(Some(sf!("superseded duplicate invocation")));
 		}
 
 		let token = self.next_token;
@@ -153,7 +153,7 @@ impl DuplexManager {
 		if let Some(active) = self.active.remove(invocation_id) {
 			let _ = active
 				.interrupt
-				.send(Some(Str::from("gateway cancelled invocation")));
+				.send(Some(sf!("gateway cancelled invocation")));
 		}
 	}
 
@@ -184,7 +184,7 @@ impl Drop for DuplexManager {
 		for (_, active) in self.active.drain() {
 			let _ = active
 				.interrupt
-				.send(Some(Str::from("duplex manager shutting down")));
+				.send(Some(sf!("duplex manager shutting down")));
 		}
 	}
 }
@@ -231,7 +231,7 @@ async fn run_invocation(
 	};
 	let deadline = Duration::from_millis(invoke.timeout_ms);
 	let mut speculative =
-		SpeculativeCall::open(&env, &events, Str::from(call.id.as_str()), identity, deadline).await?;
+		SpeculativeCall::open(&env, &events, Str::new(call.id.as_str()), identity, deadline).await?;
 	speculative.relay_fragment(fragment).await?;
 	let committed = speculative.commit(raw_args);
 	let (updates_tx, updates_rx) = flume::unbounded();

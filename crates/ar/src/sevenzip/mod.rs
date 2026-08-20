@@ -18,7 +18,7 @@ use crate::{
 const SIGNATURE: &[u8; 6] = b"7z\xbc\xaf'\x1c";
 const FILETIME_EPOCH_SECONDS: u64 = 11_644_473_600;
 
-fn invalid(message: &'static str) -> Error {
+const fn invalid(message: &'static str) -> Error {
 	Error::InvalidArchive(message)
 }
 
@@ -32,7 +32,7 @@ impl<'a> HeaderReader<'a> {
 		Self { bytes, pos: 0 }
 	}
 
-	fn remaining(&self) -> usize {
+	const fn remaining(&self) -> usize {
 		self.bytes.len() - self.pos
 	}
 
@@ -135,7 +135,7 @@ struct Streams {
 }
 
 impl Streams {
-	fn empty() -> Self {
+	const fn empty() -> Self {
 		Self {
 			pack_position: 0,
 			pack_sizes:    Vec::new(),
@@ -160,7 +160,7 @@ struct FileMetadata {
 }
 
 impl FileMetadata {
-	fn empty() -> Self {
+	const fn empty() -> Self {
 		Self {
 			names:         Vec::new(),
 			empty_streams: Vec::new(),
@@ -172,21 +172,21 @@ impl FileMetadata {
 	}
 }
 
-fn check_index_size(size: u64, limits: Limits) -> Result<()> {
+const fn check_index_size(size: u64, limits: Limits) -> Result<()> {
 	if size > limits.max_index_size() {
 		return Err(Error::IndexTooLarge { actual: size, limit: limits.max_index_size() });
 	}
 	Ok(())
 }
 
-fn check_entry_count(count: u64, limits: Limits) -> Result<()> {
+const fn check_entry_count(count: u64, limits: Limits) -> Result<()> {
 	if count > limits.max_entries() {
 		return Err(Error::TooManyEntries { actual: count, limit: limits.max_entries() });
 	}
 	Ok(())
 }
 
-fn check_memory_size(size: u64, limits: Limits) -> Result<()> {
+const fn check_memory_size(size: u64, limits: Limits) -> Result<()> {
 	if size > limits.max_in_memory_size() {
 		return Err(Error::ArchiveTooLargeInMemory {
 			actual: size,
@@ -602,7 +602,7 @@ fn read_range(source: &mut (impl Read + Seek), offset: u64, size: u64) -> Result
 	Ok(bytes)
 }
 
-fn coder_error(id: u64) -> Error {
+const fn coder_error(id: u64) -> Error {
 	match id {
 		0x30401 => Error::UnsupportedFeature("7z coder PPMd"),
 		0x303011b => Error::UnsupportedFeature("7z coder BCJ2 (multi-input folder)"),
@@ -783,7 +783,7 @@ fn decode_utf16_le(bytes: &[u8]) -> Result<String> {
 		return Err(invalid("odd-length 7z UTF-16 file name"));
 	}
 	let mut units = Vec::with_capacity(bytes.len() / 2);
-	for pair in bytes.chunks_exact(2) {
+	for pair in bytes.as_chunks::<2>().0 {
 		units.push(u16::from_le_bytes([pair[0], pair[1]]));
 	}
 	let mut index = 0;
@@ -1178,8 +1178,8 @@ pub(crate) fn read_entries(
 		.ok_or_else(|| invalid("7z next-header offset overflow"))?;
 	if header_start
 		.checked_add(next_size)
-		.filter(|end| *end <= file_size)
-		.is_none()
+		.as_ref()
+		.is_none_or(|end| *end > file_size)
 	{
 		return Err(invalid("invalid 7z next-header range"));
 	}
@@ -1213,7 +1213,7 @@ pub(crate) fn read_entries(
 
 /// Rejects format-specific extraction; 7z members always use generic buffered
 /// storage.
-pub(crate) fn read_entry_to<W: Write>(
+pub(crate) const fn read_entry_to<W: Write>(
 	_source: &mut (impl Read + Seek),
 	_entry: &Entry,
 	_output: &mut W,

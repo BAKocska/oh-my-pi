@@ -189,7 +189,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
 	let mut blocks = Vec::new();
 	render_block_children(body, &mut context, &mut blocks)?;
 	render_notes(&mut archive, &main_part, &mut context, &mut blocks)?;
-	Ok(Str::from(blocks.join("\n\n").trim_end().to_owned()))
+	Ok(Str::new(blocks.join("\n\n").trim_end().to_owned()))
 }
 
 fn read_member(archive: &mut Archive<'_>, path: &str) -> Result<Option<String>, MarkitError> {

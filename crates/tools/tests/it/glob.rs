@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
 };
@@ -27,12 +27,12 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		_request: grep::SearchRequest,
 	) -> impl Future<Output = Result<grep::SearchResult, grep::Fault>> + Send + '_ {
 		std::future::ready(Err(grep::Fault::Workspace {
-			message: Str::from("unused fake search boundary"),
+			message: sf!("unused fake search boundary"),
 		}))
 	}
 
 	fn record_snapshots(&self, _records: Vec<grep::SnapshotRecord>) -> Result<(), grep::Fault> {
-		Err(grep::Fault::Workspace { message: Str::from("unused fake snapshot boundary") })
+		Err(grep::Fault::Workspace { message: sf!("unused fake snapshot boundary") })
 	}
 
 	fn glob(
@@ -63,7 +63,7 @@ impl ReadBlobs for RecordingBlobs {
 		async move {
 			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 			stored.lock().push(bytes);
-			Ok(BlobRef { hash: Str::new_static("glob-full"), media_type, byte_len })
+			Ok(BlobRef { hash: sf!("glob-full"), media_type, byte_len })
 		}
 	}
 }
@@ -87,18 +87,18 @@ const fn walk(matches: Vec<glob::WalkMatch>) -> glob::WalkResult {
 }
 
 const fn matched(path: &'static str, modified_ms: u64) -> glob::WalkMatch {
-	glob::WalkMatch { path: Str::new_static(path), modified_ms, is_dir: false }
+	glob::WalkMatch { path: sf!(path), modified_ms, is_dir: false }
 }
 
 const fn directory(path: &'static str, modified_ms: u64) -> glob::WalkMatch {
-	glob::WalkMatch { path: Str::new_static(path), modified_ms, is_dir: true }
+	glob::WalkMatch { path: sf!(path), modified_ms, is_dir: true }
 }
 
 fn invoke_with_blobs(workspace: FakeWorkspace, raw: &str, blobs: RecordingBlobs) -> Invocation {
 	let tool = glob::tool(workspace, blobs);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(raw))
+		.args_committed(Str::new(raw))
 		.expect("invocation consumer remains live");
 	let events = block_on(tool.call(params).collect::<Vec<_>>());
 	let [Ev::Done(ToolTerminal::Done { result, useless })] = events.as_slice() else {
@@ -238,7 +238,7 @@ fn root_search_is_rejected_before_workspace_traversal() {
 #[test]
 fn missing_paths_fault_only_when_no_target_survives() {
 	let invocation = invoke(
-		faulty(glob::Fault::PathNotFound { paths: vec![Str::new_static("missing")] }),
+		faulty(glob::Fault::PathNotFound { paths: vec![sf!("missing")] }),
 		r#"{"path":"missing"}"#,
 	);
 	assert!(invocation.result.is_err());
@@ -246,9 +246,7 @@ fn missing_paths_fault_only_when_no_target_survives() {
 	assert!(!invocation.useless);
 
 	let invocation = invoke(
-		faulty(glob::Fault::PathNotFound {
-			paths: vec![Str::new_static("one"), Str::new_static("two")],
-		}),
+		faulty(glob::Fault::PathNotFound { paths: vec![sf!("one"), sf!("two")] }),
 		r#"{"path":"one; two"}"#,
 	);
 	assert!(invocation.result.is_err());
@@ -259,7 +257,7 @@ fn missing_paths_fault_only_when_no_target_survives() {
 #[test]
 fn surviving_multi_target_appends_the_missing_path_note() {
 	let mut result = walk(vec![matched("src/lib.rs", 1)]);
-	result.missing_paths = vec![Str::new_static("gone"), Str::new_static("also-gone")];
+	result.missing_paths = vec![sf!("gone"), sf!("also-gone")];
 	let invocation = invoke(fake(result), r#"{"path":"src; gone; also-gone"}"#);
 	assert_eq!(invocation.text, "# src/\nlib.rs\n\nSkipped missing paths: gone, also-gone");
 	assert!(!invocation.useless);
@@ -342,7 +340,7 @@ fn timeout_without_matches_is_not_reported_as_proof_of_absence() {
 fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	let matches = (0..200)
 		.map(|index| glob::WalkMatch {
-			path:        Str::from(format!("dir/{index:03}-{}.rs", "x".repeat(400))),
+			path:        sf!("dir/{index:03}-{}.rs", "x".repeat(400)),
 			modified_ms: index,
 			is_dir:      false,
 		})

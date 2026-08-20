@@ -5,7 +5,7 @@ use std::{
 	path::{Component, Path, PathBuf},
 };
 
-use omp_core::{Str, StrMut};
+use omp_core::{IntoStr, Str, StrMut, sf};
 
 use crate::{
 	format::{ABORT_MARKER, BEGIN_PATCH_MARKER, END_PATCH_MARKER, HL_FILE_HASH_LENGTH},
@@ -180,16 +180,16 @@ fn split_raw_sections(input: &str, options: &SplitOptions) -> Result<Vec<RawSect
 	if parse_header_line(first, 1, options)?.is_none() {
 		let trimmed = first.trim_end();
 		let message: Str = if trimmed.starts_with("@@") {
-			"unified-diff hunk header is not valid in hashline. File sections start with \
-			 `[path#HASH]`; use `PUT`, `CUT`, `REM`, or `MV`."
-				.into()
+			sf!(
+				"unified-diff hunk header is not valid in hashline. File sections start with \
+				 `[path#HASH]`; use `PUT`, `CUT`, `REM`, or `MV`.",
+			)
 		} else {
-			format!(
+			sf!(
 				"input must begin with \"[PATH#HASH]\" on the first non-blank line for anchored \
 				 edits; got {:?}. Example: \"[src/foo.ts#1A2B]\" then edit ops.",
 				first.chars().take(120).collect::<String>()
 			)
-			.into()
 		};
 		return Err(ParseError::new(Diagnostic::error(
 			DiagnosticCode::InvalidSectionHeader,
@@ -290,7 +290,7 @@ fn parse_header_line(
 			return Err(invalid_header(line_num, "Input header `[]` is empty; provide a file path."));
 		}
 		return Ok(Some(RawSection {
-			path: path.into(),
+			path: Str::new(path),
 			file_hash,
 			diff: Str::default(),
 			interleaved: false,
@@ -409,7 +409,7 @@ fn path_to_slashes(path: &Path) -> String {
 		.replace(std::path::MAIN_SEPARATOR, "/")
 }
 
-fn invalid_header(line_num: usize, message: impl Into<Str>) -> ParseError {
+fn invalid_header(line_num: usize, message: impl IntoStr) -> ParseError {
 	ParseError::new(Diagnostic::error(
 		DiagnosticCode::InvalidSectionHeader,
 		Some(line_num),

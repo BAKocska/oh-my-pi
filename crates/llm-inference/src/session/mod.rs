@@ -21,7 +21,7 @@ pub use conversation::{
 	ConversationError, MessagePersistenceError, StoredCacheRetention, StoredContent, StoredMedia,
 	StoredMessage, StoredProof, StoredRole, StoredToolResult, TurnDraft,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 pub use revision::{CommittedRevision, HistoryDelta};
 pub use store::{
@@ -104,7 +104,7 @@ where
 		}),
 		ContextStrategy::PrefixCache(_) => {
 			let history = store.delta(None, head)?;
-			let key = Str::from(format!("prefix:{}", head.as_str()));
+			let key = sf!("prefix:{}", head.as_str());
 			Ok(ContextPlan::PrefixCache {
 				history,
 				cache: PrefixCacheIdentity { revision: head.clone(), key },
@@ -533,7 +533,7 @@ impl ConversationSessionPlanner {
 						receipt.recoveries.push(RecoveryRecord {
 							attempt:     context.attempts(),
 							kind:        RecoveryKind::SessionReseed,
-							rule:        ReasonId(Str::from(format!("{reseed_reason:?}"))),
+							rule:        ReasonId(sf!("{reseed_reason:?}")),
 							input_bytes: 0,
 							steps:       1,
 						});
@@ -774,7 +774,7 @@ impl SessionCompletion for DurableCompletion {
 						let block = match block {
 							AssistantBlock::Reasoning(text) => {
 								AssistantBlock::Tool(StoredContent::Reasoning {
-									text:  Str::from(text),
+									text:  Str::new(text),
 									proof: Some(proof(signature.clone())),
 								})
 							},
@@ -787,12 +787,12 @@ impl SessionCompletion for DurableCompletion {
 					if let Some(block) = blocks.remove(index) {
 						let block = match block {
 							AssistantBlock::Text(text) => AssistantBlock::Tool(StoredContent::Text {
-								text:  Str::from(text),
+								text:  Str::new(text),
 								proof: Some(proof(data.clone())),
 							}),
 							AssistantBlock::Reasoning(text) => {
 								AssistantBlock::Tool(StoredContent::Reasoning {
-									text:  Str::from(text),
+									text:  Str::new(text),
 									proof: Some(proof(data.clone())),
 								})
 							},
@@ -834,10 +834,10 @@ impl SessionCompletion for DurableCompletion {
 			.into_values()
 			.map(|block| match block {
 				AssistantBlock::Text(text) => {
-					StoredContent::Text { text: Str::from(text), proof: None }
+					StoredContent::Text { text: Str::new(text), proof: None }
 				},
 				AssistantBlock::Reasoning(text) => {
-					StoredContent::Reasoning { text: Str::from(text), proof: None }
+					StoredContent::Reasoning { text: Str::new(text), proof: None }
 				},
 				AssistantBlock::Tool(content) => content,
 			})
@@ -1005,7 +1005,7 @@ mod tests {
 
 	fn trust(origin: &str) -> TrustDomain {
 		TrustDomain {
-			origin:          Str::from(origin),
+			origin:          Str::new(origin),
 			redirects:       RedirectTrust::SameOrigin,
 			allow_plaintext: false,
 		}
@@ -1058,7 +1058,7 @@ mod tests {
 		let message = Message {
 			role:    Role::Assistant,
 			content: Arc::from([ContentPart::Text {
-				text:  Str::from("answer"),
+				text:  sf!("answer"),
 				proof: Some(ProviderProof {
 					provider: ProviderId::new("provider"),
 					codec:    CodecId::new("codec"),
@@ -1087,11 +1087,11 @@ mod tests {
 		let message = Message {
 			role:    Role::User,
 			content: Arc::from([ContentPart::Image(MediaInput::Body {
-				media_type: Str::from("image/png"),
+				media_type: sf!("image/png"),
 				body:       BodySource::multipart(Arc::from([BodySource::bytes(Bytes::from_static(
 					b"wire",
 				))])),
-				name:       Some(Str::from("input.png")),
+				name:       Some(sf!("input.png")),
 			})]),
 			name:    None,
 		};

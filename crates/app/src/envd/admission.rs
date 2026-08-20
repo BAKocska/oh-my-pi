@@ -3,7 +3,7 @@
 use std::{io::Cursor, path::Path, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation},
 	policy::v1::{BashIr, EffectEnvelope, PolicyDenied},
@@ -302,7 +302,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn deadline_synthesizes_a_structured_denial() {
-		let gate = AdmissionGate::new(Str::from("call"), Str::from("shell"), Duration::ZERO);
+		let gate = AdmissionGate::new(sf!("call"), sf!("shell"), Duration::ZERO);
 		let AdmissionDecision::Denied(denied) =
 			gate.decide(Path::new("/work"), Path::new("/work")).await
 		else {
@@ -329,7 +329,7 @@ mod tests {
 	#[test]
 	fn widened_effect_envelope_is_refused() {
 		let maximum = Effects {
-			exec: Some(ToolExecEffects { commands: [Str::from("git")].into(), network: false }),
+			exec: Some(ToolExecEffects { commands: [sf!("git")].into(), network: false }),
 			..Effects::empty()
 		};
 		let requested = EffectEnvelope {

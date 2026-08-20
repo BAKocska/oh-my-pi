@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -101,11 +101,11 @@ pub fn decode_discovery_response(payload: &[u8]) -> Result<Vec<GitLabDiscoveredM
 		if model.reference.trim().is_empty() {
 			continue;
 		}
-		let provider_model_id = Str::from(model.reference.trim());
+		let provider_model_id = Str::new(model.reference.trim());
 		let name = if model.name.trim().is_empty() {
 			provider_model_id.clone()
 		} else {
-			Str::from(model.name.trim())
+			Str::new(model.name.trim())
 		};
 		models.insert(provider_model_id.clone(), GitLabDiscoveredModel {
 			provider_model_id,
@@ -178,8 +178,8 @@ impl GitLabDirectRoute {
 			method:      RequestMethod::Post,
 			uri:         self.exchange_endpoint.clone(),
 			headers:     Box::new([RequestHeader {
-				name:  Str::new_static("content-type"),
-				value: Str::new_static("application/json"),
+				name:  sf!("content-type"),
+				value: sf!("application/json"),
 			}]),
 			body:        BodySource::Bytes(body),
 			framing:     FramingProtocol::Raw,
@@ -313,18 +313,18 @@ pub struct WorkflowSession {
 
 impl WorkflowSession {
 	/// Creates initial workflow state.
-	pub fn new(workflow_id: impl Into<Str>, session_id: impl Into<Str>) -> Self {
+	pub fn new(workflow_id: impl IntoStr, session_id: impl IntoStr) -> Self {
 		Self {
-			workflow_id:   workflow_id.into(),
-			session_id:    session_id.into(),
+			workflow_id:   workflow_id.into_str(),
+			session_id:    session_id.into_str(),
 			last_event_id: None,
 			reconnects:    0,
 		}
 	}
 
 	/// Records an acknowledged checkpoint without changing session identity.
-	pub fn checkpoint(&mut self, event_id: impl Into<Str>) {
-		self.last_event_id = Some(event_id.into());
+	pub fn checkpoint(&mut self, event_id: impl IntoStr) {
+		self.last_event_id = Some(event_id.into_str());
 	}
 
 	/// Encodes the exact typed resume frame and advances reconnect evidence.
@@ -418,19 +418,19 @@ impl Codec for GitLabWorkflowCodec {
 					uri:         context.route.endpoint.base_url.clone(),
 					headers:     Box::new([
 						RequestHeader {
-							name:  Str::new_static("user-agent"),
-							value: Str::from(format!("omp/{}", env!("CARGO_PKG_VERSION"))),
+							name:  sf!("user-agent"),
+							value: sf!("omp/{}", env!("CARGO_PKG_VERSION")),
 						},
 						RequestHeader {
-							name:  Str::new_static("x-gitlab-client-type"),
-							value: Str::new_static("node-websocket"),
+							name:  sf!("x-gitlab-client-type"),
+							value: sf!("node-websocket"),
 						},
 						RequestHeader {
-							name:  Str::new_static("x-gitlab-language-server-version"),
-							value: Str::new_static("8.104.0"),
+							name:  sf!("x-gitlab-language-server-version"),
+							value: sf!("8.104.0"),
 						},
 						RequestHeader {
-							name:  Str::new_static("origin"),
+							name:  sf!("origin"),
 							value: websocket_origin(&context.route.endpoint.base_url)?,
 						},
 					]),
@@ -454,14 +454,8 @@ impl Codec for GitLabWorkflowCodec {
 					method:      RequestMethod::Post,
 					uri:         endpoint(&context.route.endpoint.base_url, "/api/graphql"),
 					headers:     Box::new([
-						RequestHeader {
-							name:  Str::new_static("accept"),
-							value: Str::new_static("application/json"),
-						},
-						RequestHeader {
-							name:  Str::new_static("content-type"),
-							value: Str::new_static("application/json"),
-						},
+						RequestHeader { name: sf!("accept"), value: sf!("application/json") },
+						RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 					]),
 					body:        BodySource::Bytes(encode_discovery_request(namespace)?),
 					framing:     FramingProtocol::Raw,
@@ -647,7 +641,7 @@ fn build_start_request(
 	let workflow_metadata = serde_json::to_string(&WorkflowMetadata {
 		environment:               "ide",
 		client_type:               "node-websocket",
-		selected_model_identifier: Str::from(wire_target(context)?.wire_model.as_str()),
+		selected_model_identifier: Str::new(wire_target(context)?.wire_model.as_str()),
 	})
 	.map_err(|_| protocol_error(ErrorPhase::Encoding, "gitlab.metadata.serialization"))?;
 	Ok(StartFrame {
@@ -906,7 +900,7 @@ impl Decoder for GitLabDiscoveryDecoder {
 				declared_limits:       None,
 				extended_context_mode: None,
 				availability:          Some(omp_llm_catalog::ModelAvailability::Available),
-				source:                Str::new_static("gitlab.ai-chat-available-models"),
+				source:                sf!("gitlab.ai-chat-available-models"),
 				observed_at_ms:        None,
 				updated_at_ms:         None,
 				deprecated:            None,
@@ -971,7 +965,7 @@ impl Decoder for WorkflowDecoder {
 			.map_err(|_| protocol_error(ErrorPhase::Streaming, "gitlab.action_response.utf8"))?;
 		WorkflowActionResult {
 			request_id: response.invocation,
-			text:       Str::from(text),
+			text:       Str::new(text),
 			is_error:   response.is_error,
 		}
 		.encode()
@@ -1015,7 +1009,7 @@ impl WorkflowDecoder {
 		let message = inbound.message.clone().or_else(|| {
 			checkpoint
 				.and_then(WorkflowCheckpoint::message)
-				.map(Str::from)
+				.map(Str::new)
 		});
 		let usage = inbound
 			.agent_context_usage
@@ -1045,7 +1039,7 @@ impl WorkflowDecoder {
 					emit(RawEvent::Chat(ChatEvent::BlockStarted { index, kind: BlockKind::Text }));
 					index
 				});
-				emit(RawEvent::Chat(ChatEvent::TextDelta { index, text: Str::from(delta) }));
+				emit(RawEvent::Chat(ChatEvent::TextDelta { index, text: Str::new(delta) }));
 			}
 			self.checkpoint_text.clear();
 			self.checkpoint_text.push_str(checkpoint);
@@ -1246,7 +1240,7 @@ impl McpArguments {
 			.unwrap_or(tool_name.as_str());
 		Ok(DecodedAction {
 			request_id,
-			tool_name: Str::from(tool_name),
+			tool_name: Str::new(tool_name),
 			arguments: self.arguments.or(self.args),
 		})
 	}
@@ -1302,7 +1296,7 @@ fn websocket_origin(endpoint: &str) -> Result<Str, Error> {
 	if authority.is_empty() || authority.contains('@') {
 		return Err(invalid_request("gitlab.workflow.websocket_authority"));
 	}
-	Ok(Str::from(format!("{scheme}{authority}")))
+	Ok(sf!("{scheme}{authority}"))
 }
 
 fn gitlab_root_namespace(context: &EncodeContext<'_>) -> Result<Str, Error> {
@@ -1312,14 +1306,14 @@ fn gitlab_root_namespace(context: &EncodeContext<'_>) -> Result<Str, Error> {
 		.ok_or_else(|| invalid_request("gitlab.discovery.organization_required"))?
 		.as_str();
 	if namespace.bytes().all(|byte| byte.is_ascii_digit()) {
-		Ok(Str::from(format!("gid://gitlab/Group/{namespace}")))
+		Ok(sf!("gid://gitlab/Group/{namespace}"))
 	} else {
-		Ok(Str::from(namespace))
+		Ok(Str::new(namespace))
 	}
 }
 
 fn endpoint(base: &str, path: &str) -> Str {
-	Str::from(format!("{}{}", base.trim_end_matches('/'), path))
+	sf!("{}{}", base.trim_end_matches('/'), path)
 }
 
 fn wire_target<'a>(
@@ -1338,8 +1332,7 @@ fn select_usage(usage: &BTreeMap<String, ContextUsage>) -> Option<&ContextUsage>
 }
 
 fn malformed_action(action: &str, detail: &str) -> Error {
-	protocol_error(ErrorPhase::Streaming, "gitlab.malformed_action")
-		.code(Str::from(format!("{action}: {detail}")))
+	protocol_error(ErrorPhase::Streaming, "gitlab.malformed_action").code(sf!("{action}: {detail}"))
 }
 
 fn invalid_request(reason: &'static str) -> Error {
@@ -1356,12 +1349,12 @@ fn capability_error(reason: &'static str) -> Error {
 
 fn protocol_error_dynamic(phase: ErrorPhase, reason: String) -> Error {
 	Error::new(ErrorKind::Protocol, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn protocol_error(phase: ErrorPhase, reason: &'static str) -> Error {
 	Error::new(ErrorKind::Protocol, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 /// Default action invocation timeout carried by workflow orchestration.
@@ -1456,8 +1449,8 @@ mod tests {
 	#[test]
 	fn action_and_resume_frames_match_protocol_fixture() {
 		let response = WorkflowActionResult {
-			request_id: Str::new_static("req-9"),
-			text:       Str::new_static("tool-ok"),
+			request_id: sf!("req-9"),
+			text:       sf!("tool-ok"),
 			is_error:   false,
 		}
 		.encode()
@@ -1679,7 +1672,7 @@ mod tests {
 		];
 		for (delegation, expected) in routes {
 			let route = GitLabDirectRoute {
-				exchange_endpoint: Str::new_static("https://gitlab.example/direct_access"),
+				exchange_endpoint: sf!("https://gitlab.example/direct_access"),
 				delegation,
 			};
 			let selected = match GitLabDelegatingCodec::from_route(&route) {
@@ -1874,11 +1867,11 @@ mod tests {
 		let request = ChatRequest {
 			messages:          Arc::from([]),
 			tools:             Arc::from([ToolDefinition {
-				name:        Str::new_static("match_input"),
+				name:        sf!("match_input"),
 				description: None,
 				input:       ToolInputConstraint::Grammar(ToolGrammar {
 					syntax:     ToolGrammarSyntax::Lark,
-					definition: Str::new_static("start: WORD"),
+					definition: sf!("start: WORD"),
 				}),
 			}]),
 			hosted_tools:      Arc::from([]),

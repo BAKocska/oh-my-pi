@@ -283,7 +283,7 @@ async fn lower_workspace_edit(
 				"delete" => lower_delete(environment, &change, cancellation, &mut operations).await?,
 				_ => {
 					return Err(ApplyWorkspaceEditError::UnsupportedResourceOperation {
-						kind: Str::from(kind),
+						kind: Str::new(kind),
 					});
 				},
 			}
@@ -486,15 +486,13 @@ fn parse_required_uri(value: &Value, field: &str) -> Result<Url, ApplyWorkspaceE
 	let uri = value
 		.get(field)
 		.and_then(Value::as_str)
-		.ok_or_else(|| ApplyWorkspaceEditError::MissingResourceField { field: Str::from(field) })?;
+		.ok_or_else(|| ApplyWorkspaceEditError::MissingResourceField { field: Str::new(field) })?;
 	parse_uri(uri)
 }
 
 fn parse_uri(uri: &str) -> Result<Url, ApplyWorkspaceEditError> {
-	Url::parse(uri).map_err(|error| ApplyWorkspaceEditError::InvalidUri {
-		uri:    Str::from(uri),
-		source: error,
-	})
+	Url::parse(uri)
+		.map_err(|error| ApplyWorkspaceEditError::InvalidUri { uri: Str::new(uri), source: error })
 }
 fn option(value: &Value, name: &str) -> bool {
 	value
@@ -533,6 +531,8 @@ fn apply_response(applied: bool, reason: Option<&str>, failed_change: Option<u32
 }
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]
@@ -546,8 +546,7 @@ mod tests {
 		let err = ApplyWorkspaceEditError::InteractiveConfirmationRequired;
 		assert_eq!(err.to_string(), "workspace edit requires interactive confirmation");
 
-		let err =
-			ApplyWorkspaceEditError::UnsupportedResourceOperation { kind: Str::from("unknown") };
+		let err = ApplyWorkspaceEditError::UnsupportedResourceOperation { kind: sf!("unknown") };
 		assert_eq!(err.to_string(), "unsupported workspace resource operation unknown");
 
 		let err = ApplyWorkspaceEditError::RecursiveDeleteUnsupported;

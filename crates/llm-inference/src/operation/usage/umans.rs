@@ -7,7 +7,7 @@ use std::{
 
 use futures::FutureExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 
@@ -46,7 +46,7 @@ impl UmansUsageFetcher {
 		Self {
 			provider: ProviderId::from(PROVIDER),
 			http,
-			base_url: Str::from(normalize_base_url(base_url)),
+			base_url: Str::new(normalize_base_url(base_url)),
 		}
 	}
 }
@@ -80,7 +80,7 @@ impl ConsoleUsageFetcher for UmansUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta,
 				plan,
-				source_label: Some(Str::new_static("umans-usage")),
+				source_label: Some(sf!("umans-usage")),
 				notes,
 				reset_credits: None,
 				windows,
@@ -104,7 +104,7 @@ fn parse_credential(raw: &str) -> Result<(String, UsageAccountMetadata), UsageFe
 			.and_then(Value::as_str)
 			.ok_or(UsageFetchError::Protocol)?
 			.to_owned();
-		let str_field = |name| value.get(name).and_then(Value::as_str).map(Str::from);
+		let str_field = |name| value.get(name).and_then(Value::as_str).map(Str::new);
 		Ok((key, UsageAccountMetadata {
 			provider_account_id: str_field("accountId"),
 			email: str_field("email"),
@@ -148,13 +148,13 @@ fn parse_response(body: &str, now: SystemTime) -> Result<ParsedResponse, UsageFe
 	let plan = payload
 		.pointer("/plan/display_name")
 		.and_then(Value::as_str)
-		.map(Str::from);
+		.map(Str::new);
 	let low = payload
 		.pointer("/usage/priority/low")
 		.and_then(Value::as_bool)
 		== Some(true);
 	let notes = if low {
-		vec![Str::new_static("Requests deprioritized after a rate-limit burst.")].into_boxed_slice()
+		vec![sf!("Requests deprioritized after a rate-limit burst.")].into_boxed_slice()
 	} else {
 		Box::default()
 	};
@@ -270,10 +270,10 @@ fn window(
 		UsageStatus::Ok
 	};
 	UsageWindow {
-		id: Str::new_static(id),
+		id: sf!(id),
 		kind: UsageWindowKind::RateLimit,
-		dimension: Str::new_static(dimension),
-		label: Some(Str::new_static(label)),
+		dimension: sf!(dimension),
+		label: Some(sf!(label)),
 		scope: scope.map(Str::new_static),
 		amount: UsageAmount {
 			unit:      UsageUnit::Requests,
@@ -284,7 +284,7 @@ fn window(
 		status: Some(status),
 		duration,
 		resets_at,
-		reset_label: resets_at.is_some().then(|| Str::new_static("tick")),
+		reset_label: resets_at.is_some().then(|| sf!("tick")),
 		notes: Box::default(),
 		source: UsageSource::Provider,
 		observed_at: now,

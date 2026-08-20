@@ -4,7 +4,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{Str, fmts};
+use omp_core::{IntoStr, Str, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smallvec::SmallVec;
@@ -281,7 +281,7 @@ impl EditInput {
 		self.editor.set_completion(completion);
 	}
 
-	fn text_width(&self, width: u16, charset: Charset) -> u16 {
+	const fn text_width(&self, width: u16, charset: Charset) -> u16 {
 		self.style.text_width(width, charset)
 	}
 
@@ -802,7 +802,7 @@ pub fn chip_label(attachment: &Attachment, charset: Charset) -> Str {
 		AttachmentContent::Image { .. } => crate::Icon::Image,
 		AttachmentContent::Text { .. } => crate::Icon::TextFile,
 	});
-	fmts!("{icon} #{}", attachment.marker)
+	sf!("{icon} #{}", attachment.marker)
 }
 
 /// Chip style for an atomic marker: a trailing `#N` selects the marker's
@@ -950,8 +950,8 @@ impl Attachments {
 
 	/// Stages an image source, probing its pixel dimensions from the file
 	/// header, and returns the staged descriptor.
-	pub fn push_image(&self, source: impl Into<Str>) -> Attachment {
-		let source = source.into();
+	pub fn push_image(&self, source: impl IntoStr) -> Attachment {
+		let source = source.into_str();
 		let dimensions = probe_dimensions(source.as_str());
 		self.stage(AttachmentContent::Image { source, dimensions })
 	}
@@ -969,7 +969,7 @@ impl Attachments {
 			snippet.push_str(&line[..byte_at_column(line, PREVIEW_COLS)]);
 		}
 		self.stage(AttachmentContent::Text {
-			text: Str::from(text),
+			text: Str::new(text),
 			snippet: Str::from(snippet),
 			lines,
 			chars,
@@ -1214,18 +1214,18 @@ impl EditorPane {
 			let (icon, size) = match &attachment.content {
 				AttachmentContent::Image { dimensions, .. } => (
 					pc.ctx.charset.icon(crate::Icon::Image),
-					dimensions.map(|(width, height)| fmts!("{width}x{height}")),
+					dimensions.map(|(width, height)| sf!("{width}x{height}")),
 				),
 				AttachmentContent::Text { lines, chars, .. } => (
 					pc.ctx.charset.icon(crate::Icon::TextFile),
 					Some(if *lines > 1 {
-						fmts!("+{lines} lines")
+						sf!("+{lines} lines")
 					} else {
-						fmts!("{chars} chars")
+						sf!("{chars} chars")
 					}),
 				),
 			};
-			let name = fmts!("{icon} #{}", attachment.marker);
+			let name = sf!("{icon} #{}", attachment.marker);
 			frame_caption_row(pc, x, top, PREVIEW_BOX_COLS, (tl, tr, horizontal), &name, line, label);
 			frame_caption_row(
 				pc,

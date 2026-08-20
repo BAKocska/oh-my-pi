@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
 use url::Url;
@@ -152,7 +152,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	}
 
 	let mut result = RenderResult::markdown(&markdown, "github-gist");
-	result.notes.insert(0, Str::from("Fetched via GitHub API"));
+	result.notes.insert(0, sf!("Fetched via GitHub API"));
 	Ok(Some(result))
 }
 

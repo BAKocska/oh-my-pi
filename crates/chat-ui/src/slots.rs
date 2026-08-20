@@ -268,7 +268,7 @@ impl Slots {
 		let options = wire.options.as_ref().cloned().unwrap_or_default();
 		let width = options.width.and_then(|width| u16::try_from(width).ok());
 		let ui = match Ui::from_extension_markup(
-			Str::from(source),
+			Str::new(source),
 			width.unwrap_or(1).max(1),
 			self.ctx.clone(),
 		) {

@@ -272,7 +272,7 @@ mod tests {
 
 	use bytes::Bytes;
 	use futures::stream;
-	use omp_core::Str;
+	use omp_core::sf;
 	use tower::{Layer, Service, service_fn};
 
 	use super::{SemanticLayer, SemanticPolicy, exhausted_action};
@@ -367,7 +367,7 @@ mod tests {
 					events: Some(Box::pin(stream::iter([
 						Ok(RawEvent::Chat(ChatEvent::ThinkingDelta {
 							index: 0,
-							text:  Str::new_static("private reasoning"),
+							text:  sf!("private reasoning"),
 						})),
 						Err(error),
 					]))),

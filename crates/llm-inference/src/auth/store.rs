@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures::future::{BoxFuture, FutureExt};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
@@ -170,7 +170,7 @@ impl PersistentLease {
 			.map_err(|_| StoreError::MalformedLease)?;
 		Ok(Self {
 			account_id: lease.account.clone(),
-			kind: Str::from("refresh"),
+			kind: sf!("refresh"),
 			owner: lease.owner.clone(),
 			epoch,
 			expires_at_ms: unix_ms(lease.expires_at)?,
@@ -493,7 +493,7 @@ impl CredentialStore {
 		Ok(CredentialMetadata {
 			account_id: write.account_id.clone(),
 			principal_id: write.principal_id.clone(),
-			kind: Str::from(write.kind),
+			kind: Str::new(write.kind),
 			generation,
 			created_at_ms,
 			updated_at_ms: write.now_ms,
@@ -550,7 +550,7 @@ impl CredentialStore {
 			metadata: CredentialMetadata {
 				account_id:    account_id.clone(),
 				principal_id:  PrincipalId::new(row.0),
-				kind:          Str::from(row.1),
+				kind:          Str::new(row.1),
 				generation:    row.2,
 				created_at_ms: row.3,
 				updated_at_ms: row.4,
@@ -723,7 +723,7 @@ impl CredentialStore {
 			&& held_owner != owner
 		{
 			return Ok(LeaseOutcome::Held {
-				owner:         Str::from(held_owner.as_str()),
+				owner:         Str::new(held_owner.as_str()),
 				epoch:         *epoch,
 				expires_at_ms: *held_until,
 			});
@@ -740,8 +740,8 @@ impl CredentialStore {
 		transaction.commit()?;
 		Ok(LeaseOutcome::Acquired(PersistentLease {
 			account_id: account_id.clone(),
-			kind: Str::from(kind),
-			owner: Str::from(owner),
+			kind: Str::new(kind),
+			owner: Str::new(owner),
 			epoch,
 			expires_at_ms,
 		}))
@@ -942,7 +942,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 			match outcome {
 				LeaseOutcome::Acquired(lease) => Ok(crate::account::RefreshLeaseAcquire::Acquired(
 					crate::account::PersistentRefreshLease {
-						id:         Str::from(lease.epoch.to_string()),
+						id:         Str::new(lease.epoch.to_string()),
 						account:    lease.account_id,
 						owner:      lease.owner,
 						expires_at: system_time_from_ms(lease.expires_at_ms)
@@ -1032,7 +1032,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 				.map_err(|_| refresh_contract_error("refresh lease identity is malformed"))?;
 			let mut persistent = PersistentLease {
 				account_id: lease.account.clone(),
-				kind: Str::from("refresh"),
+				kind: sf!("refresh"),
 				owner: lease.owner.clone(),
 				epoch,
 				expires_at_ms: unix_ms(lease.expires_at).map_err(refresh_store_error)?,
@@ -1103,7 +1103,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 			let expires_at_ms = unix_ms(lease.expires_at).map_err(refresh_store_error)?;
 			let persistent = PersistentLease {
 				account_id: lease.account.clone(),
-				kind: Str::from("refresh"),
+				kind: sf!("refresh"),
 				owner: lease.owner.clone(),
 				epoch,
 				expires_at_ms,
@@ -1182,7 +1182,7 @@ fn metadata_from_row(
 	Ok(CredentialMetadata {
 		account_id,
 		principal_id: PrincipalId::new(row.get::<_, String>(offset)?),
-		kind: Str::from(row.get::<_, String>(offset + 1)?),
+		kind: Str::new(row.get::<_, String>(offset + 1)?),
 		generation: row.get(offset + 2)?,
 		created_at_ms: row.get(offset + 3)?,
 		updated_at_ms: row.get(offset + 4)?,
@@ -1222,13 +1222,13 @@ fn refresh_store_error(error: StoreError) -> crate::account::RefreshStoreError {
 		StoreError::BackupIo(_) => "backup",
 	};
 	crate::account::RefreshStoreError {
-		code:    Str::from(code),
-		summary: Str::from("persistent credential coordination failed"),
+		code:    Str::new(code),
+		summary: sf!("persistent credential coordination failed"),
 	}
 }
 
 fn refresh_contract_error(summary: &'static str) -> crate::account::RefreshStoreError {
-	crate::account::RefreshStoreError { code: Str::from("contract"), summary: Str::from(summary) }
+	crate::account::RefreshStoreError { code: sf!("contract"), summary: Str::new(summary) }
 }
 
 #[cfg(test)]

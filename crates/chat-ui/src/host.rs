@@ -3,7 +3,7 @@
 use std::{io, io::Write, time::Duration};
 
 use flume::{Receiver, Sender};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tui::{
 	AltScreenUse, CursorStyle, DebugOp, DebugQuery, InputEvent, Key, Layer, Mouse, PaintStats,
 	Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext, detect,
@@ -796,29 +796,29 @@ fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &U
 fn open_settings(host: &mut ChatHost, ctx: &UiContext) {
 	let rows = vec![
 		ListRow {
-			key:    Str::new_static("appearance"),
-			label:  Str::new_static("Appearance"),
-			detail: Str::new_static("Theme and glyph presentation"),
+			key:    sf!("appearance"),
+			label:  sf!("Appearance"),
+			detail: sf!("Theme and glyph presentation"),
 		},
 		ListRow {
-			key:    Str::new_static("model"),
-			label:  Str::new_static("Model"),
-			detail: Str::new_static("Model and provider selection"),
+			key:    sf!("model"),
+			label:  sf!("Model"),
+			detail: sf!("Model and provider selection"),
 		},
 		ListRow {
-			key:    Str::new_static("interaction"),
-			label:  Str::new_static("Interaction"),
-			detail: Str::new_static("Queue, steering, and hotkeys"),
+			key:    sf!("interaction"),
+			label:  sf!("Interaction"),
+			detail: sf!("Queue, steering, and hotkeys"),
 		},
 		ListRow {
-			key:    Str::new_static("tools"),
-			label:  Str::new_static("Tools"),
-			detail: Str::new_static("Tool visibility and behavior"),
+			key:    sf!("tools"),
+			label:  sf!("Tools"),
+			detail: sf!("Tool visibility and behavior"),
 		},
 		ListRow {
-			key:    Str::new_static("tasks"),
-			label:  Str::new_static("Tasks"),
-			detail: Str::new_static("Agent and background-job settings"),
+			key:    sf!("tasks"),
+			label:  sf!("Tasks"),
+			detail: sf!("Agent and background-job settings"),
 		},
 	];
 	let picker = ListPicker::open("Settings", &rows, 0, ctx);
@@ -835,15 +835,15 @@ fn open_agents(host: &mut ChatHost, ctx: &UiContext) {
 			let indent = "  ".repeat(usize::from(agent.depth));
 			let detail = match (&agent.tool, agent.tokens) {
 				(Some(tool), Some(tokens)) => {
-					Str::from(format!("{} · {tool} · {tokens} tokens", agent.status))
+					Str::new(format!("{} · {tool} · {tokens} tokens", agent.status))
 				},
-				(Some(tool), None) => Str::from(format!("{} · {tool}", agent.status)),
-				(None, Some(tokens)) => Str::from(format!("{} · {tokens} tokens", agent.status)),
+				(Some(tool), None) => Str::new(format!("{} · {tool}", agent.status)),
+				(None, Some(tokens)) => Str::new(format!("{} · {tokens} tokens", agent.status)),
 				(None, None) => agent.status.clone(),
 			};
 			ListRow {
 				key: agent.id.clone(),
-				label: Str::from(format!("{indent}{}", agent.name)),
+				label: Str::new(format!("{indent}{}", agent.name)),
 				detail,
 			}
 		})
@@ -855,9 +855,9 @@ fn open_agents(host: &mut ChatHost, ctx: &UiContext) {
 
 fn open_pause(host: &mut ChatHost, ctx: &UiContext) {
 	let rows = vec![ListRow {
-		key:    Str::new_static("resume"),
-		label:  Str::new_static("Resume"),
-		detail: Str::new_static("Press Enter or Esc to return to the session"),
+		key:    sf!("resume"),
+		label:  sf!("Resume"),
+		detail: sf!("Press Enter or Esc to return to the session"),
 	}];
 	let picker = ListPicker::open("Paused", &rows, 0, ctx);
 	host.overlay =
@@ -872,9 +872,9 @@ fn open_rewind(host: &mut ChatHost, targets: Vec<RewindTargetRow>, ctx: &UiConte
 		.map(|row| {
 			prefill.push(row.text.clone());
 			ListRow {
-				key:    Str::from(row.event.to_string()),
-				label:  Str::from(row.text.lines().next().unwrap_or("")),
-				detail: Str::from("rewind here"),
+				key:    Str::new(row.event.to_string()),
+				label:  Str::new(row.text.lines().next().unwrap_or("")),
+				detail: sf!("rewind here"),
 			}
 		})
 		.collect();

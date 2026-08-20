@@ -4,7 +4,7 @@
 use std::io::{Read, Seek, Write};
 
 use omp_ar::{Archive, Format, tar::Writer as TarWriter, zip::Writer as ZipWriter};
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use serde_json::{Map, Value};
 
@@ -25,8 +25,8 @@ pub struct Fault {
 }
 
 impl Fault {
-	fn new(message: impl Into<Str>) -> Self {
-		Self { message: message.into() }
+	fn new(message: impl IntoStr) -> Self {
+		Self { message: message.into_str() }
 	}
 }
 
@@ -311,7 +311,7 @@ pub fn mutate_sqlite_row(
 		SqliteMutation {
 			operation:   WriteOperation::SqliteDelete {
 				table:   target.table.clone().into(),
-				key:     key.into(),
+				key:     Str::new(key),
 				changed: changed > 0,
 			},
 			disposition: WriteDisposition::Overwrote,
@@ -335,7 +335,7 @@ pub fn mutate_sqlite_row(
 			SqliteMutation {
 				operation:   WriteOperation::SqliteUpdate {
 					table:   target.table.clone().into(),
-					key:     key.into(),
+					key:     Str::new(key),
 					changed: changed > 0,
 				},
 				disposition: WriteDisposition::Overwrote,

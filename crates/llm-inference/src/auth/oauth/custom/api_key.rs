@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, future::BoxFuture};
-use omp_core::Str;
+use omp_core::sf;
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
@@ -43,10 +43,10 @@ impl OAuthCustomHandler for ApiKeyPasteHandler {
 				.filter(|name| !name.is_empty());
 			driver
 				.emit(AuthEvent::Prompt(AuthPrompt {
-					id:      "oauth-api-key".into(),
+					id:      sf!("oauth-api-key"),
 					message: provider_name.map_or_else(
-						|| Str::new_static("Paste your API key"),
-						|name| Str::from(format!("Paste your {name} API key")),
+						|| sf!("Paste your API key"),
+						|name| sf!("Paste your {name} API key"),
 					),
 					input:   AuthPromptKind::ApiKey,
 				}))
@@ -72,7 +72,7 @@ impl OAuthCustomHandler for ApiKeyPasteHandler {
 			Ok(OAuthTokenSet {
 				access_token,
 				refresh_token: None,
-				token_type: "Bearer".into(),
+				token_type: sf!("Bearer"),
 				expires_in: None,
 				identity_response: SecretString::from("{}".to_owned()),
 			})

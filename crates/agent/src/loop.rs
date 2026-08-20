@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::{IntoStr, InvocationPhase, Str};
+use omp_core::{IntoStr, InvocationPhase, Str, sf};
 use omp_env::EnvClient;
 use omp_llm_inference::TurnId;
 use omp_proto::{
@@ -424,7 +424,7 @@ impl<C: TurnClient> Agent<C> {
 				}
 			}
 			if !synthetic && !text.starts_with("<system-injection>") {
-				targets.push(RewindTarget { event, keep: previous, text: Str::from(text) });
+				targets.push(RewindTarget { event, keep: previous, text: Str::new(text) });
 			}
 			previous = Some(event);
 		}
@@ -605,7 +605,7 @@ impl<C: TurnClient> Agent<C> {
 					return Err(AgentError::Turn(error));
 				},
 				Err(error) => {
-					self.publish_provider_error("turn_failed", Some(Str::from(error.to_string())));
+					self.publish_provider_error("turn_failed", Some(Str::new(error.to_string())));
 					return Err(error);
 				},
 			};
@@ -689,7 +689,7 @@ impl<C: TurnClient> Agent<C> {
 				let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(None);
 				let mut aborted = self.abort_rx.has_changed().unwrap_or(false);
 				if aborted {
-					interrupt_tx.send_replace(Some(Str::new_static("user interrupt")));
+					interrupt_tx.send_replace(Some(sf!("user interrupt")));
 				}
 				let mut deadline_elapsed = false;
 				let mut abort_rx = self.abort_rx.clone();
@@ -707,11 +707,11 @@ impl<C: TurnClient> Agent<C> {
 							results = &mut drive => break results,
 							() = wait_deadline(snapshot.deadline), if !deadline_elapsed => {
 								deadline_elapsed = true;
-								interrupt_tx.send_replace(Some(Str::from("agent deadline elapsed")));
+								interrupt_tx.send_replace(Some(sf!("agent deadline elapsed")));
 							},
 							_ = abort_rx.changed(), if !aborted => {
 								aborted = true;
-								interrupt_tx.send_replace(Some(Str::new_static("user interrupt")));
+								interrupt_tx.send_replace(Some(sf!("user interrupt")));
 							},
 							event = self.control_mailbox.handle_next(&mut self.journal) => {
 								match event {
@@ -869,8 +869,8 @@ impl<C: TurnClient> Agent<C> {
 			.firehose
 			.publish(FirehoseEvent::ModelRequest(Box::new(ModelRequest {
 				envelope: telemetry_envelope(),
-				served_model: Str::from(outcome.model.as_str()),
-				provider: Str::from(outcome.provider.as_str()),
+				served_model: Str::new(outcome.model.as_str()),
+				provider: Str::new(outcome.provider.as_str()),
 				usage: outcome.usage.clone().unwrap_or_default(),
 				cost: outcome.cost.clone(),
 				..ModelRequest::default()
@@ -882,7 +882,7 @@ impl<C: TurnClient> Agent<C> {
 					.publish(FirehoseEvent::ModelAttempt(ModelAttempt {
 						envelope: telemetry_envelope(),
 						attempt:  diagnostic.attempt,
-						code:     Str::from(diagnostic.code.as_str()),
+						code:     Str::new(diagnostic.code.as_str()),
 					}));
 			}
 		}
@@ -894,7 +894,7 @@ impl<C: TurnClient> Agent<C> {
 			.firehose
 			.publish(FirehoseEvent::ProviderError(Box::new(ProviderError {
 				envelope: telemetry_envelope(),
-				code: Str::new_static(code),
+				code: sf!(code),
 				detail,
 			})));
 	}
@@ -930,13 +930,10 @@ impl<C: TurnClient> Agent<C> {
 		if matches!(candidate, Continuation::Settle)
 			&& let Some(gate) = self.settled_gate.as_ref().cloned()
 		{
-			let event = AgentSettledEvent {
-				agent_id: Str::new_static("agent"),
-				turn_id:  Str::from(turn_id.as_str()),
-			};
+			let event =
+				AgentSettledEvent { agent_id: sf!("agent"), turn_id: Str::new(turn_id.as_str()) };
 			let outcome = gate.gate_domain(&event).await;
-			candidate =
-				from_hook(outcome.winner, Str::new_static("agent_settled"), continuation_item());
+			candidate = from_hook(outcome.winner, sf!("agent_settled"), continuation_item());
 			policy = ContinuationPolicy::default();
 		}
 		match self
@@ -1889,7 +1886,7 @@ fn tool_call_digest(items: &[Item]) -> Option<Str> {
 		hasher.update(&(call.args_json.len() as u64).to_le_bytes());
 		hasher.update(&call.args_json);
 	}
-	(calls != 0).then(|| Str::from(hasher.finalize().to_string()))
+	(calls != 0).then(|| Str::new(hasher.finalize().to_string()))
 }
 
 fn continuation_item() -> Item {
@@ -2167,7 +2164,7 @@ mod tests {
 		));
 		let journal = Journal::create(&path, &Header {
 			v:       4,
-			id:      SessionId(Str::from(name)),
+			id:      SessionId(Str::new(name)),
 			created: 1,
 			cwd:     std::env::temp_dir(),
 		})
@@ -2215,9 +2212,9 @@ mod tests {
 
 	fn worker(name: &str) -> ToolSpec {
 		ToolSpec {
-			name:            Str::from(name),
-			rev:             Rev { family: Str::from("test"), n: 1 },
-			description:     Str::from("test worker"),
+			name:            Str::new(name),
+			rev:             Rev { family: sf!("test"), n: 1 },
+			description:     sf!("test worker"),
 			schema:          Bytes::from_static(br#"{"type":"object"}"#),
 			constraint:      Constraint::None,
 			effects:         Effects::empty(),
@@ -2226,11 +2223,7 @@ mod tests {
 	}
 
 	fn worker_claims() -> Claims {
-		Claims {
-			precedence: Precedence::DEFAULT,
-			claimant:   Str::new_static("test/worker"),
-			replaces:   None,
-		}
+		Claims { precedence: Precedence::DEFAULT, claimant: sf!("test/worker"), replaces: None }
 	}
 
 	#[tokio::test]
@@ -2250,7 +2243,7 @@ mod tests {
 		new_options.params.model = "fresh-model".to_owned();
 		let state = AgentState::new(crate::AgentSnapshot {
 			turn: new_options.clone(),
-			enabled_tools: Arc::from([Str::from("new")]),
+			enabled_tools: Arc::from([sf!("new")]),
 			registry: Arc::clone(&registry),
 			..crate::AgentSnapshot::default()
 		});
@@ -2262,7 +2255,7 @@ mod tests {
 		));
 		let mut journal = Journal::create(&path, &Header {
 			v:       4,
-			id:      SessionId(Str::from("allowlist-test")),
+			id:      SessionId(sf!("allowlist-test")),
 			created: 1,
 			cwd:     std::env::temp_dir(),
 		})
@@ -2270,12 +2263,12 @@ mod tests {
 		let durable_input = thread::Thread::default();
 		journal
 			.start_turn(1, TurnStart {
-				turn_id:            Str::from("durable-turn"),
+				turn_id:            sf!("durable-turn"),
 				item_events:        Vec::new(),
 				prompt_hash:        [7; 32],
 				prompt_head_events: Vec::new(),
 				toolset_hash:       registry.slot_hash(),
-				enabled_tools:      vec![Str::from("old")],
+				enabled_tools:      vec![sf!("old")],
 				sequence_targets:   Vec::new(),
 				input:              TurnInputRecord::Full { thread: durable_input.clone() },
 				options:            TurnOptionsRecord {
@@ -2313,8 +2306,8 @@ mod tests {
 			.await
 			.expect("run fresh turn");
 
-		assert_eq!(resumed_tools.as_ref(), &[Str::from("old")]);
-		assert_eq!(fresh_tools.as_ref(), &[Str::from("new")]);
+		assert_eq!(resumed_tools.as_ref(), &[sf!("old")]);
+		assert_eq!(fresh_tools.as_ref(), &[sf!("new")]);
 		let opened = opened.lock();
 		assert_eq!(opened.len(), 2);
 		assert_eq!(opened[0].0.as_str(), "durable-turn");
@@ -2328,7 +2321,7 @@ mod tests {
 				.latest_turn_start()
 				.expect("fresh durable start")
 				.enabled_tools,
-			vec![Str::from("new")]
+			vec![sf!("new")]
 		);
 		drop(opened);
 		drop(agent);
@@ -2421,7 +2414,7 @@ mod tests {
 				.try_enqueue(crate::Interrupt {
 					class:  crate::InterruptClass::Immediate,
 					item:   message(thread::Role::User, "queued user input"),
-					source: crate::InterruptSource::Producer(Str::from("user")),
+					source: crate::InterruptSource::Producer(sf!("user")),
 				})
 				.expect("enqueue producer input");
 			abort.abort();
@@ -2448,8 +2441,7 @@ mod tests {
 	#[tokio::test]
 	async fn caller_abort_interrupts_tool_batch_and_stages_results() {
 		let (journal, path) = test_journal("batch-abort");
-		let identity =
-			ToolIdentity { name: Str::from("pending"), rev: Rev { family: Str::from("test"), n: 1 } };
+		let identity = ToolIdentity { name: sf!("pending"), rev: Rev { family: sf!("test"), n: 1 } };
 		let mut registry = ToolRegistry::new();
 		registry
 			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
@@ -2608,7 +2600,7 @@ mod tests {
 			.try_enqueue(crate::Interrupt {
 				class:  crate::InterruptClass::Immediate,
 				item:   message(thread::Role::User, "stale steering"),
-				source: crate::InterruptSource::Producer(Str::from("user")),
+				source: crate::InterruptSource::Producer(sf!("user")),
 			})
 			.expect("enqueue stale steering");
 
@@ -2687,8 +2679,7 @@ mod tests {
 	#[tokio::test]
 	async fn scheduled_rewind_waits_for_active_tool_batch_boundary() {
 		let (journal, path) = test_journal("scheduled-rewind-boundary");
-		let identity =
-			ToolIdentity { name: Str::from("pending"), rev: Rev { family: Str::from("test"), n: 1 } };
+		let identity = ToolIdentity { name: sf!("pending"), rev: Rev { family: sf!("test"), n: 1 } };
 		let mut registry = ToolRegistry::new();
 		registry
 			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
@@ -2712,7 +2703,7 @@ mod tests {
 		let control = agent.control();
 		let checkpoint = tokio::spawn({
 			let control = control.clone();
-			async move { control.checkpoint(Str::from("before batch")).await }
+			async move { control.checkpoint(sf!("before batch")).await }
 		});
 		tokio::task::yield_now().await;
 		agent.drain_control();
@@ -2729,7 +2720,7 @@ mod tests {
 				if matches!(event.as_ref(), AgentEvent::PhaseChanged { to: AgentPhase::ToolBatch, .. })
 				{
 					let ack = control
-						.schedule_rewind(checkpoint, Str::from("thread"))
+						.schedule_rewind(checkpoint, sf!("thread"))
 						.await
 						.expect("schedule rewind");
 					assert_eq!(ack.target, checkpoint);
@@ -2788,7 +2779,7 @@ mod tests {
 	#[test]
 	fn run_summary_extracts_yield_arguments_verbatim() {
 		let call = thread::ToolCall {
-			id: Str::from("yield-call").to_string(),
+			id: sf!("yield-call").to_string(),
 			name: "yield".to_owned(),
 			args_json: Bytes::from_static(
 				br#"{"result":{"data":{"summary":{"purge":13,"keep":20}}}}"#,

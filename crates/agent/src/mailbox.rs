@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::thread::v1::Item;
 
 /// Earliest loop point at which an interrupt may be observed.
@@ -94,7 +94,7 @@ pub fn device_availability_interrupt(item: Item) -> Interrupt {
 	Interrupt {
 		class: InterruptClass::TurnBoundary,
 		item,
-		source: InterruptSource::Producer(Str::new_static("device availability")),
+		source: InterruptSource::Producer(sf!("device availability")),
 	}
 }
 
@@ -264,7 +264,7 @@ mod tests {
 			.try_enqueue(Interrupt {
 				class:  InterruptClass::Immediate,
 				item:   item(),
-				source: InterruptSource::Continuation { owner: Str::from("goal") },
+				source: InterruptSource::Continuation { owner: sf!("goal") },
 			})
 			.unwrap();
 		assert!(mailbox.drain(DrainPoint::Immediate, true).is_empty());

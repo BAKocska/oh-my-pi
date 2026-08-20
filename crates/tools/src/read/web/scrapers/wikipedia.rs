@@ -1,6 +1,6 @@
 //! Wikipedia article renderer backed by the public REST API.
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::Deserialize;
 use url::Url;
 
@@ -88,9 +88,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	}
 
 	let mut result = RenderResult::markdown(&markdown, "wikipedia");
-	result
-		.notes
-		.insert(0, Str::from("Fetched via Wikipedia API"));
+	result.notes.insert(0, sf!("Fetched via Wikipedia API"));
 	Ok(Some(result))
 }
 
@@ -447,9 +445,9 @@ mod tests {
 
 	fn response(status: u16, content_type: &str, body: &'static str) -> HttpResponse {
 		HttpResponse {
-			final_url: Str::new_static("https://en.wikipedia.org/wiki/Canonical_title"),
+			final_url: sf!("https://en.wikipedia.org/wiki/Canonical_title"),
 			status,
-			content_type: Some(Str::from(content_type)),
+			content_type: Some(Str::new(content_type)),
 			headers: SmallVec::new(),
 			body: Bytes::from_static(body.as_bytes()),
 		}
@@ -508,7 +506,7 @@ mod tests {
 		);
 		assert_eq!(result.content_type.as_deref(), Some("text/markdown"));
 		assert_eq!(result.method.as_str(), "wikipedia");
-		assert_eq!(result.notes.as_slice(), [Str::new_static("Fetched via Wikipedia API")]);
+		assert_eq!(result.notes.as_slice(), [sf!("Fetched via Wikipedia API")]);
 		assert_eq!(client.requested_urls(), vec![
 			String::from("https://en.wikipedia.org/api/rest_v1/page/summary/C%2B%2B"),
 			String::from("https://en.wikipedia.org/api/rest_v1/page/mobile-html/C%2B%2B"),
@@ -570,7 +568,7 @@ mod tests {
 			result.content.as_str(),
 			"## Available section\n\nThe mobile article body remains available without its summary."
 		);
-		assert_eq!(result.notes.as_slice(), [Str::new_static("Fetched via Wikipedia API")]);
+		assert_eq!(result.notes.as_slice(), [sf!("Fetched via Wikipedia API")]);
 	}
 
 	#[tokio::test]

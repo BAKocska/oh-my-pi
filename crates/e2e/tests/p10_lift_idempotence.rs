@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use omp_agent::{Journal, project_journal};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_e2e::support::{DocServerTask, Scratch, tool_call_item, tool_result_item};
 use omp_proto::thread::v1 as thread;
 use omp_storage::transcript::{Header, SessionId};
@@ -26,11 +26,7 @@ const CAPS: CapsBase = CapsBase {
 };
 
 fn claims() -> Claims {
-	Claims {
-		precedence: Precedence::CORE,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 }
 
 fn projected_pair(projected: &thread::Thread) -> (&thread::ToolCall, &thread::ToolResult) {
@@ -49,12 +45,9 @@ fn projected_pair(projected: &thread::Thread) -> (&thread::ToolCall, &thread::To
 #[tokio::test]
 async fn p10_edit_lift_is_idempotent_across_journal_projections() -> Result<()> {
 	let scratch = Scratch::new().context("create P10 project")?;
-	let docserver = DocServerTask::spawn(
-		scratch.project(),
-		scratch.socket("p10-docserver.sock"),
-		Vec::new(),
-	)
-	.await?;
+	let docserver =
+		DocServerTask::spawn(scratch.project(), scratch.socket("p10-docserver.sock"), Vec::new())
+			.await?;
 	let documents = docserver.connect().await?;
 
 	let mut registry = Registry::new();
@@ -70,33 +63,25 @@ async fn p10_edit_lift_is_idempotent_across_journal_projections() -> Result<()> 
 	)?;
 	let registry = Arc::new(registry);
 
-	let historical = ToolIdentity {
-		name: Str::new_static("edit"),
-		rev:  Rev { family: Str::new_static("rep"), n: 1 },
-	};
+	let historical = ToolIdentity { name: sf!("edit"), rev: Rev { family: sf!("rep"), n: 1 } };
 	let source_args = serde_json::to_vec(&ReplaceParams { edits: Vec::new() })?;
 	let source_verdict = CallOutcome::<Payload, Fault>::Faulted(Fault {
-		reason:    RejectionReason::InvalidPatch { message: Str::new_static("no match") },
+		reason:    RejectionReason::InvalidPatch { message: sf!("no match") },
 		conflicts: Vec::new(),
 	});
 	let source_verdict_json = to_value(&source_verdict)?;
 	let call = tool_call_item(2, "p10-edit", &historical, Bytes::from(source_args));
-	let result = tool_result_item(
-		3,
-		"p10-edit",
-		&historical,
-		&source_verdict_json,
-		true,
-		false,
-		vec![thread::Part {
-			kind: Some(thread::part::Kind::Text("recorded rep.1 rendering".to_owned())),
-		}],
-	)?;
+	let result =
+		tool_result_item(3, "p10-edit", &historical, &source_verdict_json, true, false, vec![
+			thread::Part {
+				kind: Some(thread::part::Kind::Text("recorded rep.1 rendering".to_owned())),
+			},
+		])?;
 
 	let transcript = scratch.state().join("p10-lift.jsonl");
 	let header = Header {
 		v:       4,
-		id:      SessionId(Str::new_static("p10-lift-idempotence")),
+		id:      SessionId(sf!("p10-lift-idempotence")),
 		created: 1,
 		cwd:     scratch.project().to_path_buf(),
 	};

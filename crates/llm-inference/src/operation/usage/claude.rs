@@ -11,7 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{IntoStr, Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
@@ -82,14 +82,14 @@ impl ConsoleUsageFetcher for ClaudeUsageFetcher {
 #[must_use]
 pub fn normalize_claude_base_url(base_url: Option<&str>) -> Str {
 	let Some(trimmed) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
-		return Str::new_static(DEFAULT_ENDPOINT);
+		return sf!(DEFAULT_ENDPOINT);
 	};
 	let trimmed = trimmed.trim_end_matches('/');
 	if trimmed.to_ascii_lowercase().ends_with("/api/oauth") {
-		return Str::from(trimmed);
+		return Str::new(trimmed);
 	}
 	let Ok(mut url) = url::Url::parse(trimmed) else {
-		return Str::new_static(DEFAULT_ENDPOINT);
+		return sf!(DEFAULT_ENDPOINT);
 	};
 	let mut path = url.path().trim_end_matches('/').to_owned();
 	if path == "/" {
@@ -102,9 +102,9 @@ pub fn normalize_claude_base_url(base_url: Option<&str>) -> Str {
 	url.set_fragment(None);
 	let origin = url.origin().ascii_serialization();
 	if path.is_empty() {
-		Str::from(format!("{origin}/api/oauth"))
+		sf!("{origin}/api/oauth")
 	} else {
-		Str::from(format!("{origin}{path}/api/oauth"))
+		sf!("{origin}{path}/api/oauth")
 	}
 }
 
@@ -160,7 +160,7 @@ async fn fetch_claude_usage_until(
 			..UsageAccountMetadata::default()
 		},
 		plan: None,
-		source_label: Some(Str::new_static("anthropic-oauth")),
+		source_label: Some(sf!("anthropic-oauth")),
 		notes: Box::default(),
 		reset_credits: None,
 		windows,
@@ -288,9 +288,9 @@ fn parse_windows(root: &Map<String, Value>, now: SystemTime) -> Vec<UsageWindow>
 			continue;
 		}
 		if let Some(window) = percent_window(
-			Str::from(format!("anthropic:7d:{slug}")),
-			Str::from(format!("Claude 7 Day ({display_name})")),
-			Str::from(slug),
+			sf!("anthropic:7d:{slug}"),
+			sf!("Claude 7 Day ({display_name})"),
+			Str::new(slug),
 			SEVEN_DAYS,
 			Some(entry.bucket),
 			now,
@@ -349,9 +349,9 @@ fn parse_api_limit_entries(value: Option<&Value>) -> Vec<ParsedApiLimit> {
 				.and_then(Value::as_str)
 				.map(str::trim)
 				.filter(|value| !value.is_empty())
-				.map(Str::from);
+				.map(Str::new);
 			Some(ParsedApiLimit {
-				kind: Str::from(kind),
+				kind: Str::new(kind),
 				bucket: ParsedBucket { utilization, resets_at },
 				display_name,
 			})
@@ -360,9 +360,9 @@ fn parse_api_limit_entries(value: Option<&Value>) -> Vec<ParsedApiLimit> {
 }
 
 fn percent_window(
-	id: impl Into<Str>,
-	label: impl Into<Str>,
-	scope: impl Into<Str>,
+	id: impl IntoStr,
+	label: impl IntoStr,
+	scope: impl IntoStr,
 	duration: Duration,
 	bucket: Option<ParsedBucket>,
 	now: SystemTime,
@@ -372,11 +372,11 @@ fn percent_window(
 	let consumed = decimal_quantity(used)?;
 	let remaining = decimal_quantity(100.0 - used)?;
 	Some(UsageWindow {
-		id:          id.into(),
+		id:          id.into_str(),
 		kind:        UsageWindowKind::Quota,
-		dimension:   Str::new_static("percent"),
-		label:       Some(label.into()),
-		scope:       Some(scope.into()),
+		dimension:   sf!("percent"),
+		label:       Some(label.into_str()),
+		scope:       Some(scope.into_str()),
 		amount:      UsageAmount {
 			unit:      UsageUnit::Percent,
 			consumed:  Some(consumed),
@@ -408,11 +408,11 @@ fn extra_usage_window(root: &Map<String, Value>, now: SystemTime) -> Option<Usag
 		}
 	});
 	Some(UsageWindow {
-		id: Str::new_static("anthropic:extra"),
+		id: sf!("anthropic:extra"),
 		kind: UsageWindowKind::Billing,
-		dimension: Str::new_static("usd"),
-		label: Some(Str::new_static("Claude Extra Usage")),
-		scope: Some(Str::new_static("extra")),
+		dimension: sf!("usd"),
+		label: Some(sf!("Claude Extra Usage")),
+		scope: Some(sf!("extra")),
 		amount: UsageAmount { unit: UsageUnit::Usd, consumed: Some(used), remaining, limit },
 		status,
 		duration: None,
@@ -595,7 +595,7 @@ fn first_string(root: &Map<String, Value>, keys: &[&str]) -> Option<Str> {
 			.and_then(Value::as_str)
 			.map(str::trim)
 			.filter(|value| !value.is_empty())
-			.map(Str::from)
+			.map(Str::new)
 	})
 }
 

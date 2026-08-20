@@ -1,4 +1,4 @@
-use omp_core::{Str, StrMut, fmts};
+use omp_core::{Str, StrMut, sf};
 use smallvec::SmallVec;
 
 use super::MdTheme;
@@ -685,7 +685,7 @@ fn render_html_tag(
 			sink.run(style, "  ");
 		}
 		if let Some(HtmlList::Ordered(next)) = state.lists.last_mut() {
-			let marker = fmts!("{next}. ");
+			let marker = sf!("{next}. ");
 			sink.run(style, marker.as_str());
 			*next = next.saturating_add(1);
 		} else {

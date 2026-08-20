@@ -619,7 +619,7 @@ fn replay_record(
 		return Ok(None);
 	};
 	if recorded.as_slice() != fingerprint.as_slice() {
-		return Err(Error::IdempotencyConflict(Str::from(request.idempotency_key)));
+		return Err(Error::IdempotencyConflict(Str::new(request.idempotency_key)));
 	}
 	decode_artifact(encoded).map(Some)
 }
@@ -724,7 +724,7 @@ fn decode_artifact(encoded: EncodedArtifact) -> Result<ArtifactRecord, Error> {
 		.map_err(|_| Error::CorruptArtifactCatalog)?;
 	Ok(ArtifactRecord {
 		catalog_id,
-		session: SessionId(Str::from(session)),
+		session: SessionId(Str::new(session)),
 		ordinal,
 		reference: BlobRef { hash, size },
 		lifetime,
@@ -1035,7 +1035,7 @@ fn mark_artifact_url(
 	if !text.starts_with("artifact://") {
 		return;
 	}
-	let Ok(url) = ArtifactUrl::new(Str::from(text)) else {
+	let Ok(url) = ArtifactUrl::new(Str::new(text)) else {
 		return;
 	};
 	match url.address() {

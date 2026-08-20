@@ -13,7 +13,7 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{ModelKey, compile::compile_oracle};
 #[cfg(feature = "local-applefm")]
 use omp_llm_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
@@ -1382,10 +1382,10 @@ mod tests {
 		else {
 			panic!("chat command");
 		};
-		assert_eq!(args.model, Some(Str::from("provider/model")));
+		assert_eq!(args.model, Some(sf!("provider/model")));
 		assert_eq!(args.project, PathBuf::from("workspace"));
 		assert_eq!(args.gateway.as_ref().map(LocalEndpoint::as_path), Some(Path::new(TEST_ENDPOINT)));
-		assert_eq!(args.resume, Some(Str::from("01ARZ3NDEKTSV4RRFFQ69G5FAV")));
+		assert_eq!(args.resume, Some(sf!("01ARZ3NDEKTSV4RRFFQ69G5FAV")));
 		assert!(args.py_eval);
 	}
 
@@ -1408,7 +1408,7 @@ mod tests {
 			"--",
 			"literal-spec",
 		]);
-		assert_eq!(cli.ext, vec![Str::from("publisher/example")]);
+		assert_eq!(cli.ext, vec![sf!("publisher/example")]);
 		assert_eq!(cli.ext_only, vec![PathBuf::from("local-ext")]);
 		assert!(cli.no_workspace_ext);
 		let Some(Command::Ext(args)) = cli.command else {
@@ -1418,8 +1418,8 @@ mod tests {
 		let crate::ext_cli::ExtCommand::Install(install) = args.command else {
 			panic!("ext install command");
 		};
-		assert_eq!(install.pool, Some(Str::from("shared")));
-		assert_eq!(install.specs, vec![Str::from("publisher/example"), Str::from("literal-spec")]);
+		assert_eq!(install.pool, Some(sf!("shared")));
+		assert_eq!(install.specs, vec![sf!("publisher/example"), sf!("literal-spec")]);
 
 		for arguments in [
 			&["omp", "ext", "list"][..],
@@ -1493,7 +1493,7 @@ mod tests {
 			else {
 				panic!("print command");
 			};
-			assert_eq!(args.prompt[0], Str::from("explain"));
+			assert_eq!(args.prompt[0], sf!("explain"));
 		}
 	}
 
@@ -1512,10 +1512,10 @@ mod tests {
 		else {
 			panic!("print command");
 		};
-		assert_eq!(args.model, Some(Str::from("provider/model")));
+		assert_eq!(args.model, Some(sf!("provider/model")));
 		assert_eq!(args.mode, "json");
 		assert!(args.print_thoughts);
-		assert_eq!(args.prompt, vec![Str::from("--literal")]);
+		assert_eq!(args.prompt, vec![sf!("--literal")]);
 	}
 
 	#[test]
@@ -1552,7 +1552,7 @@ mod tests {
 			let Some(Command::Chat(args)) = cli.command else {
 				panic!("chat command");
 			};
-			assert_eq!(args.model, Some(Str::from("provider/model")));
+			assert_eq!(args.model, Some(sf!("provider/model")));
 		}
 	}
 
@@ -1595,7 +1595,7 @@ mod tests {
 		else {
 			panic!("chat command");
 		};
-		assert_eq!(args.continue_session, Some(Str::from("550e8400-e29b-41d4-a716-446655440000")));
+		assert_eq!(args.continue_session, Some(sf!("550e8400-e29b-41d4-a716-446655440000")));
 		assert_eq!(args.session_dir, Some(PathBuf::from("sessions")));
 		assert!(matches!(
 			parse(&["omp", "chat", "--no-session"]).command,
@@ -1624,8 +1624,8 @@ mod tests {
 		assert_eq!(args.service_tier, Some(ServiceTier::Priority));
 		assert_eq!(args.approval_mode, Some(ApprovalMode::Write));
 		assert_eq!(args.max_time, Some(CliDuration(Duration::from_secs(120))));
-		assert_eq!(args.follow_ups, vec![Str::from("then summarize")]);
-		assert_eq!(args.tools, Some(ToolNames(vec![Str::from("read"), Str::from("write")])));
+		assert_eq!(args.follow_ups, vec![sf!("then summarize")]);
+		assert_eq!(args.tools, Some(ToolNames(vec![sf!("read"), sf!("write")])));
 		for arguments in [
 			["omp", "print", "--thinking=inherit", "prompt"],
 			["omp", "print", "--thinking=m", "prompt"],
@@ -1655,7 +1655,7 @@ mod tests {
 		else {
 			panic!("print command");
 		};
-		assert_eq!(args.prompt, vec![Str::from("explain")]);
+		assert_eq!(args.prompt, vec![sf!("explain")]);
 		let Some(Command::Chat(args)) =
 			parse_from_os([OsString::from("omp"), OsString::from("resume")])
 				.expect("resume")
@@ -1663,7 +1663,7 @@ mod tests {
 		else {
 			panic!("chat command");
 		};
-		assert_eq!(args.resume, Some(Str::from("__omp_picker__")));
+		assert_eq!(args.resume, Some(sf!("__omp_picker__")));
 	}
 
 	#[test]

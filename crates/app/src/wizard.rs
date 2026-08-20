@@ -7,7 +7,7 @@ use omp_chat_ui::{
 	OverlayPanel, panel_divider,
 	provider_picker::{ProviderCard, provider_card_grid},
 };
-use omp_core::{Str, fmts};
+use omp_core::{IntoStr, Str, sf};
 use omp_llm_catalog::{ProviderDef, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 use omp_llm_inference::{
 	Client, Registry as InferenceRegistry,
@@ -120,7 +120,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 							Err(error) => {
 								let _ = app.ui_mut().close_top_overlay();
 								show_welcome(app.ui_mut());
-								set_status(app.ui_mut(), fmts!("Setup error: {error}"));
+								set_status(app.ui_mut(), sf!("Setup error: {error}"));
 								open_setup_provider_step(app.ui_mut(), catalog);
 								step = Step::Provider;
 							},
@@ -151,13 +151,13 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 							show_authenticating(app.ui_mut());
 							set_status(
 								app.ui_mut(),
-								fmts!("Authenticating `{value}`… Esc to cancel"),
+								sf!("Authenticating `{value}`… Esc to cancel"),
 							);
 							step = Step::Authenticating;
 						},
 						Err(error) => {
 							show_welcome(app.ui_mut());
-							set_status(app.ui_mut(), fmts!("Setup error: {error}"));
+							set_status(app.ui_mut(), sf!("Setup error: {error}"));
 							open_setup_provider_step(app.ui_mut(), catalog);
 							step = Step::Provider;
 						},
@@ -218,7 +218,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				{
 					set_status(
 						app.ui_mut(),
-						fmts!("[Open to authorize]({url}) · Esc to cancel"),
+						sf!("[Open to authorize]({url}) · Esc to cancel"),
 					);
 				},
 				Some(ChatAuthEvent::DeviceCode { code, url })
@@ -226,7 +226,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				{
 					set_status(
 						app.ui_mut(),
-						fmts!("Enter code `{code}` at [{url}]({url}) · Esc to cancel"),
+						sf!("Enter code `{code}` at [{url}]({url}) · Esc to cancel"),
 					);
 				},
 				Some(ChatAuthEvent::Prompt { message, kind })
@@ -238,7 +238,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(ChatAuthEvent::Notice(message))
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
-					set_status(app.ui_mut(), fmts!("{message} · Esc to cancel"));
+					set_status(app.ui_mut(), sf!("{message} · Esc to cancel"));
 				},
 				Some(ChatAuthEvent::Complete(_))
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
@@ -260,11 +260,11 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) {
 						close_auth_scene(app.ui_mut(), step);
 						show_welcome(app.ui_mut());
-						set_status(app.ui_mut(), fmts!("Setup error: {message}"));
+						set_status(app.ui_mut(), sf!("Setup error: {message}"));
 						open_setup_provider_step(app.ui_mut(), catalog);
 						step = Step::Provider;
 					} else {
-						set_status(app.ui_mut(), fmts!("Setup error: {message}"));
+						set_status(app.ui_mut(), sf!("Setup error: {message}"));
 					}
 				},
 				Some(_) => {},
@@ -338,12 +338,12 @@ fn open_setup_provider_step(ui: &mut Ui, catalog: &Catalog) {
 	let cards: Vec<ProviderCard> = providers
 		.into_iter()
 		.map(|(provider, _)| ProviderCard {
-			press_id:    fmts!("{PROVIDER_CARD_PREFIX}{}", provider.id),
+			press_id:    sf!("{PROVIDER_CARD_PREFIX}{}", provider.id),
 			provider_id: Str::from(provider.id.as_str()),
 			label:       provider.name.clone(),
 		})
 		.collect();
-	let counter = fmts!("{count} providers");
+	let counter = sf!("{count} providers");
 	let picker = OverlayPanel::new("Provider Login").child(provider_card_grid(
 		cards,
 		counter,
@@ -451,8 +451,8 @@ fn close_auth_scene(ui: &mut Ui, step: Step) {
 	let _ = ui.close_top_overlay();
 }
 
-fn set_status(ui: &mut Ui, message: impl Into<Str>) {
-	ui.set_text(STATUS_ID, message.into());
+fn set_status(ui: &mut Ui, message: impl IntoStr) {
+	ui.set_text(STATUS_ID, message.into_str());
 }
 
 async fn has_active_account(registry: &InferenceRegistry) -> miette::Result<bool> {

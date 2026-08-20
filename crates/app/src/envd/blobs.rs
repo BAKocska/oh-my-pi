@@ -3,7 +3,7 @@
 use std::{io, path::Path};
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex};
+use omp_core::{Str, encoding::hex, sf};
 use omp_proto::{blob::v1 as blob_pb, thread::v1 as thread_pb};
 use omp_storage::blob::{BlobRef, BlobStage, BlobStore};
 use thiserror::Error;
@@ -241,7 +241,7 @@ fn call_outcome_reference(reference: BlobRef) -> omp_tool::BlobRef {
 	let hash = hex::encode_n(&reference.hash);
 	omp_tool::BlobRef {
 		hash:       Str::from(hash.as_str()),
-		media_type: Str::from("application/json"),
+		media_type: sf!("application/json"),
 		byte_len:   reference.size,
 	}
 }
@@ -296,7 +296,7 @@ mod tests {
 	#[tokio::test]
 	async fn spilled_outcome_retains_exact_bytes_digest_and_size() {
 		let (_root, host) = open_host();
-		let outcome = CallOutcome::<omp_core::Str, omp_core::Str>::Ok(omp_core::Str::from(
+		let outcome = CallOutcome::<omp_core::Str, omp_core::Str>::Ok(omp_core::sf!(
 			"payload beyond the inline limit",
 		));
 		let expected = serde_json::to_vec(&outcome).expect("serialize expected outcome");

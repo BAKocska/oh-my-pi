@@ -13,7 +13,7 @@ use std::{
 
 use bytes::Bytes;
 use cap_std::fs::{Dir, Metadata, OpenOptions};
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 #[cfg(test)]
 use parking_lot::Mutex;
 
@@ -402,7 +402,7 @@ impl LocalFs {
 	fn ensure_document_size(&self, path: &Path, byte_length: u64) -> Result<()> {
 		if byte_length > self.inner.max_document_bytes {
 			return Err(Error::InvalidContent {
-				reason: fmts!(
+				reason: sf!(
 					"document {} is {byte_length} bytes; the configured limit is {} bytes",
 					path.display(),
 					self.inner.max_document_bytes
@@ -495,7 +495,7 @@ impl LocalFs {
 		if !Arc::ptr_eq(&self.inner, &prepared.owner) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(prepared.destination_path.to_string_lossy()),
-				reason: Str::new_static("prepared write belongs to another filesystem root"),
+				reason: sf!("prepared write belongs to another filesystem root"),
 			});
 		}
 		if !self.prepared_parent_is_current(&prepared)? {
@@ -908,7 +908,7 @@ impl LocalFs {
 			let Some(name) = file_name.to_str() else {
 				return Err(Error::InvalidTarget {
 					target: Str::new(resolved.absolute.to_string_lossy()),
-					reason: Str::new_static("directory contains a non-Unicode entry name"),
+					reason: sf!("directory contains a non-Unicode entry name"),
 				});
 			};
 			let child_relative = resolved.relative.join(&file_name);
@@ -1380,7 +1380,7 @@ impl LocalFs {
 						{
 							Error::InvalidTarget {
 								target: Str::new(entry.absolute.to_string_lossy()),
-								reason: Str::new_static("document target is a dangling symbolic link"),
+								reason: sf!("document target is a dangling symbolic link"),
 							}
 						},
 						error => error,
@@ -1403,7 +1403,7 @@ impl LocalFs {
 				if resolved.pop().is_none() {
 					return Err(Error::InvalidTarget {
 						target: Str::new(identity.to_string_lossy()),
-						reason: Str::new_static("target escapes the Environment root"),
+						reason: sf!("target escapes the Environment root"),
 					});
 				}
 				continue;
@@ -1423,7 +1423,7 @@ impl LocalFs {
 				if symlinks > 40 {
 					return Err(Error::InvalidTarget {
 						target: Str::new(identity.to_string_lossy()),
-						reason: Str::new_static("symbolic-link resolution exceeded the traversal limit"),
+						reason: sf!("symbolic-link resolution exceeded the traversal limit"),
 					});
 				}
 				let target = self
@@ -1471,7 +1471,7 @@ impl LocalFs {
 					.strip_prefix(&self.inner.root_path)
 					.map_err(|_| Error::InvalidTarget {
 						target: Str::new(identity.to_string_lossy()),
-						reason: Str::new_static("symbolic-link target escapes the Environment root"),
+						reason: sf!("symbolic-link target escapes the Environment root"),
 					})?;
 			if let Some(resolved) = resolved {
 				resolved.clear();
@@ -1489,7 +1489,7 @@ impl LocalFs {
 				Component::Prefix(_) | Component::RootDir => {
 					return Err(Error::InvalidTarget {
 						target: Str::new(identity.to_string_lossy()),
-						reason: Str::new_static("symbolic-link target escapes the Environment root"),
+						reason: sf!("symbolic-link target escapes the Environment root"),
 					});
 				},
 			}
@@ -1507,7 +1507,7 @@ impl LocalFs {
 		{
 			return Err(Error::InvalidTarget {
 				target: Str::new(identity.to_string_lossy()),
-				reason: Str::new_static("recursive directory creation requires a normalized target"),
+				reason: sf!("recursive directory creation requires a normalized target"),
 			});
 		}
 		let components: Vec<OsString> = relative
@@ -1579,7 +1579,7 @@ impl LocalFs {
 			}
 		}
 		Err(Error::Io {
-			operation: Str::new_static("read a stable file snapshot"),
+			operation: sf!("read a stable file snapshot"),
 			path:      path.to_path_buf(),
 			source:    io::Error::new(
 				io::ErrorKind::Interrupted,
@@ -1621,7 +1621,7 @@ impl LocalFs {
 			}
 		}
 		Err(Error::Io {
-			operation: Str::new_static("read a stable open file snapshot"),
+			operation: sf!("read a stable open file snapshot"),
 			path:      path.to_path_buf(),
 			source:    io::Error::new(
 				io::ErrorKind::Interrupted,
@@ -1785,7 +1785,7 @@ impl LocalFs {
 				.strip_prefix(&self.inner.root_path)
 				.map_err(|_| Error::InvalidTarget {
 					target: Str::new(path.to_string_lossy()),
-					reason: Str::new_static("target escapes the Environment root"),
+					reason: sf!("target escapes the Environment root"),
 				})?
 		} else {
 			path
@@ -1799,7 +1799,7 @@ impl LocalFs {
 				Component::Prefix(_) | Component::RootDir => {
 					return Err(Error::InvalidTarget {
 						target: Str::new(path.to_string_lossy()),
-						reason: Str::new_static("target is not relative to the Environment root"),
+						reason: sf!("target is not relative to the Environment root"),
 					});
 				},
 			}
@@ -1824,7 +1824,7 @@ impl LocalFs {
 				.strip_prefix(&self.inner.root_path)
 				.map_err(|_| Error::InvalidTarget {
 					target: Str::new(identity.to_string_lossy()),
-					reason: Str::new_static("symbolic-link target escapes the Environment root"),
+					reason: sf!("symbolic-link target escapes the Environment root"),
 				})?;
 		Self::normalize_from(Path::new("."), relative, identity)
 	}
@@ -1845,7 +1845,7 @@ impl LocalFs {
 					if components.pop().is_none() {
 						return Err(Error::InvalidTarget {
 							target: Str::new(identity.to_string_lossy()),
-							reason: Str::new_static("symbolic-link target escapes the Environment root"),
+							reason: sf!("symbolic-link target escapes the Environment root"),
 						});
 					}
 				},
@@ -1939,7 +1939,7 @@ impl LocalFs {
 		}
 		Err(Error::InvalidTarget {
 			target: Str::new(path.to_string_lossy()),
-			reason: fmts!("prepared {operation} belongs to another filesystem root"),
+			reason: sf!("prepared {operation} belongs to another filesystem root"),
 		})
 	}
 
@@ -2602,7 +2602,7 @@ impl LocalFs {
 	}
 
 	fn io_error(operation: &'static str, path: &Path, source: io::Error) -> Error {
-		Error::Io { operation: Str::new_static(operation), path: path.to_path_buf(), source }
+		Error::Io { operation: sf!(operation), path: path.to_path_buf(), source }
 	}
 
 	fn persistence_error(path: &Path, source: io::Error) -> Error {
@@ -3041,11 +3041,7 @@ mod tests {
 			.into_iter()
 			.map(|entry| entry.name)
 			.collect();
-		assert_eq!(names, [
-			Str::new_static("hard"),
-			Str::new_static("renamed"),
-			Str::new_static("source")
-		]);
+		assert_eq!(names, [sf!("hard"), sf!("renamed"), sf!("source")]);
 		filesystem
 			.remove(directory.join("renamed"), false)
 			.expect("remove file");

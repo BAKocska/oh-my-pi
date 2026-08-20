@@ -34,7 +34,7 @@ use objc2_web_kit::{
 	WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView,
 	WKWebViewConfiguration, WKWebsiteDataStore,
 };
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 
 pub use self::child::WkView;
@@ -94,7 +94,7 @@ fn current_url(webview: &WKWebView) -> Str {
 	// SAFETY: `WKWebView::URL` only reads the webview's current navigation state.
 	unsafe { webview.URL() }
 		.and_then(|url| url.absoluteString())
-		.map(|s| fmts!("{s}"))
+		.map(|s| sf!("{s}"))
 		.unwrap_or_default()
 }
 
@@ -102,7 +102,7 @@ fn current_url(webview: &WKWebView) -> Str {
 fn current_title(webview: &WKWebView) -> Str {
 	// SAFETY: `WKWebView::title` only reads the webview's current document title.
 	unsafe { webview.title() }
-		.map(|s| fmts!("{s}"))
+		.map(|s| sf!("{s}"))
 		.unwrap_or_default()
 }
 
@@ -254,7 +254,7 @@ pub fn install_observers(
 /// Navigate `webview` to `url`.
 pub fn navigate(webview: &WKWebView, url: &str) -> Result<()> {
 	let ns_url = NSURL::URLWithString(&NSString::from_str(url))
-		.ok_or_else(|| Error::Protocol(fmts!("invalid url: {url}")))?;
+		.ok_or_else(|| Error::Protocol(sf!("invalid url: {url}")))?;
 	let request = NSURLRequest::requestWithURL(&ns_url);
 	// SAFETY: starting a load with a valid request; returned navigation
 	// token is unused.
@@ -338,7 +338,7 @@ define_class!(
 			// the main thread; `body` returns a retained plist object.
 			let body = unsafe { msg.body() };
 			if let Ok(body) = body.downcast::<NSString>() {
-				let _ = self.ivars().events.send(WebViewEvent::Ipc(fmts!("{body}")));
+				let _ = self.ivars().events.send(WebViewEvent::Ipc(sf!("{body}")));
 			}
 		}
 	}
@@ -547,6 +547,6 @@ unsafe fn json_of_eval_result(val: *mut AnyObject) -> Str {
 		return Str::default();
 	};
 	NSString::initWithData_encoding(NSString::alloc(), &data, NSUTF8StringEncoding)
-		.map(|s| fmts!("{s}"))
+		.map(|s| sf!("{s}"))
 		.unwrap_or_default()
 }

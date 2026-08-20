@@ -7,7 +7,7 @@ use crate::{Error, Limits, Result};
 
 const XZ_MAGIC: &[u8; 6] = b"\xfd7zXZ\0";
 
-fn invalid(message: &'static str) -> Error {
+const fn invalid(message: &'static str) -> Error {
 	Error::InvalidArchive(message)
 }
 
@@ -218,7 +218,7 @@ fn delta_decode(bytes: &mut [u8], distance: usize) {
 	}
 }
 
-pub(crate) fn x86_decode(bytes: &mut [u8], start_offset: u32) {
+pub fn x86_decode(bytes: &mut [u8], start_offset: u32) {
 	const MASK_TO_BIT_NUMBER: [u32; 5] = [0, 1, 2, 2, 3];
 	if bytes.len() < 5 {
 		return;
@@ -682,7 +682,7 @@ fn decode_block(bytes: &[u8], offset: usize, record: Record, check_id: u8) -> Re
 
 /// Decompresses all concatenated `.xz` streams bounded by archive and memory
 /// limits.
-pub(crate) fn xz_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
+pub fn xz_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
 	let streams = discover_streams(bytes)?;
 	let maximum = limits.max_archive_size().min(limits.max_in_memory_size());
 	let mut total_size = 0_u64;

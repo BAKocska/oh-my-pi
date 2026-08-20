@@ -1,4 +1,4 @@
-use omp_core::{Str, StrMut};
+use omp_core::{IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 
 use crate::{
@@ -36,8 +36,8 @@ impl TreeNode {
 	}
 
 	/// Appends node label text.
-	pub fn label(mut self, label: impl Into<Str>) -> Self {
-		append(&mut self.label, label.into());
+	pub fn label(mut self, label: impl IntoStr) -> Self {
+		append(&mut self.label, label.into_str());
 		self
 	}
 

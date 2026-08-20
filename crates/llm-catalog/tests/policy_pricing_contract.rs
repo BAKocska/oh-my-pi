@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use omp_core::Str;
+use omp_core::sf;
 use omp_llm_catalog::{
 	ApplyPatchWireKind, CatalogSource, ComputerUseConfigSupport, ComputerUseWireSupport,
 	ExtendedContextMode, MaxOutputTokensEmission, NanoUsd, PremiumMultiplier, Price, PriceTier,
@@ -50,10 +50,10 @@ fn source_model() -> SourceModelRecord {
 #[test]
 fn compiler_preserves_policy_provenance_interning_extended_context_and_wire_routing() {
 	let compiled = compile(CatalogSource {
-		providers: BTreeMap::from([(Str::from("cursor"), source_provider())]),
+		providers: BTreeMap::from([(sf!("cursor"), source_provider())]),
 		models:    BTreeMap::from([(
-			Str::from("cursor"),
-			BTreeMap::from([(Str::from("gpt-5.1"), source_model())]),
+			sf!("cursor"),
+			BTreeMap::from([(sf!("gpt-5.1"), source_model())]),
 		)]),
 	})
 	.expect("fixture catalog compiles");
@@ -106,10 +106,10 @@ fn baseten_kimi_k3_exposes_reasoning_with_max_as_the_default_effort() {
 	)
 	.expect("typed Baseten model source");
 	let compiled = compile(CatalogSource {
-		providers: BTreeMap::from([(Str::from("baseten"), source_provider())]),
+		providers: BTreeMap::from([(sf!("baseten"), source_provider())]),
 		models:    BTreeMap::from([(
-			Str::from("baseten"),
-			BTreeMap::from([(Str::from("moonshotai/Kimi-K3"), model)]),
+			sf!("baseten"),
+			BTreeMap::from([(sf!("moonshotai/Kimi-K3"), model)]),
 		)]),
 	})
 	.expect("Baseten catalog compiles");
@@ -152,12 +152,12 @@ fn opencode_go_deepseek_v4_omits_tool_choice_without_hiding_tools() {
 		.expect("typed OpenCode model source")
 	};
 	let compiled = compile(CatalogSource {
-		providers: BTreeMap::from([(Str::from("opencode-go"), source_provider())]),
+		providers: BTreeMap::from([(sf!("opencode-go"), source_provider())]),
 		models:    BTreeMap::from([(
-			Str::from("opencode-go"),
+			sf!("opencode-go"),
 			BTreeMap::from([
-				(Str::from("deepseek-v4-flash"), source("DeepSeek V4 Flash")),
-				(Str::from("deepseek-v4-pro"), source("DeepSeek V4 Pro")),
+				(sf!("deepseek-v4-flash"), source("DeepSeek V4 Flash")),
+				(sf!("deepseek-v4-pro"), source("DeepSeek V4 Pro")),
 			]),
 		)]),
 	})
@@ -196,12 +196,12 @@ fn xai_oauth_grok_45_and_46_default_to_mandatory_high_effort() {
 		.expect("typed xAI OAuth model source")
 	};
 	let compiled = compile(CatalogSource {
-		providers: BTreeMap::from([(Str::from("xai-oauth"), source_provider())]),
+		providers: BTreeMap::from([(sf!("xai-oauth"), source_provider())]),
 		models:    BTreeMap::from([(
-			Str::from("xai-oauth"),
+			sf!("xai-oauth"),
 			BTreeMap::from([
-				(Str::from("grok-4.5"), source("Grok 4.5")),
-				(Str::from("grok-4.6"), source("Grok 4.6")),
+				(sf!("grok-4.5"), source("Grok 4.5")),
+				(sf!("grok-4.6"), source("Grok 4.6")),
 			]),
 		)]),
 	})

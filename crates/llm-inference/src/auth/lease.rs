@@ -755,7 +755,7 @@ mod tests {
 		let original = Arc::clone(&lease.inner);
 		let shaped = lease.with_shape(crate::auth::ShapedCredential {
 			secret:            None,
-			endpoint_override: Some(Str::from("https://override.example")),
+			endpoint_override: Some(sf!("https://override.example")),
 		});
 		assert!(Arc::ptr_eq(&original, &shaped.inner));
 		assert_eq!(shaped.endpoint_override().map(Str::as_str), Some("https://override.example"),);

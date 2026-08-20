@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tools::eval::idle_timeout::TimeoutHandle;
 use pyo3::{
 	prelude::*,
@@ -99,18 +99,13 @@ fn complete_prelude_persists_and_bridges_host_helpers() {
 	let host = Arc::new(PreludeHost::default());
 	let registration = dispatcher
 		.register(
-			Str::new_static("session"),
-			Str::new_static("run"),
-			BridgeCapabilities::new([
-				Str::new_static("echo"),
-				Str::new_static("read"),
-				Str::new_static("updates"),
-				Str::new_static("fail"),
-			])
-			.with_completion()
-			.with_agent()
-			.with_concurrency()
-			.with_budget(),
+			sf!("session"),
+			sf!("run"),
+			BridgeCapabilities::new([sf!("echo"), sf!("read"), sf!("updates"), sf!("fail")])
+				.with_completion()
+				.with_agent()
+				.with_concurrency()
+				.with_budget(),
 			host.clone(),
 			TimeoutHandle::new(None),
 		)
@@ -261,9 +256,9 @@ fn python_bridge_propagates_host_errors_and_capability_denial() {
 	let dispatcher = BridgeDispatcher::new();
 	let registration = dispatcher
 		.register(
-			Str::new_static("session-errors"),
-			Str::new_static("run-errors"),
-			BridgeCapabilities::new([Str::new_static("fail")]),
+			sf!("session-errors"),
+			sf!("run-errors"),
+			BridgeCapabilities::new([sf!("fail")]),
 			Arc::new(PreludeHost::default()),
 			TimeoutHandle::new(None),
 		)

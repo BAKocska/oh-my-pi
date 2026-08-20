@@ -8,7 +8,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -74,12 +74,12 @@ impl ZaiApiKeyHandler {
 				.append_pair("state", &state);
 		}
 		driver
-			.emit(AuthEvent::OpenUrl(authorize_url.as_str().into()))
+			.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
 			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
-				id:      "oauth-callback-url".into(),
-				message: CALLBACK_PROMPT.into(),
+				id:      sf!("oauth-callback-url"),
+				message: sf!(CALLBACK_PROMPT),
 				input:   AuthPromptKind::AuthorizationCode,
 			}))
 			.await?;
@@ -119,7 +119,7 @@ impl ZaiApiKeyHandler {
 		Ok(OAuthTokenSet {
 			access_token: durable_key,
 			refresh_token: None,
-			token_type: "Bearer".into(),
+			token_type: sf!("Bearer"),
 			expires_in: None,
 			identity_response,
 		})

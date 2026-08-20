@@ -10,7 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, format_rfc3339};
+use omp_core::{Str, format_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
 
@@ -51,7 +51,7 @@ impl ZaiUsageFetcher {
 		let origin = url::Url::parse(base.trim())
 			.ok()
 			.map_or_else(|| BASE.to_owned(), |url| url.origin().ascii_serialization());
-		Self { provider: ProviderId::from(PROVIDER), http, base_url: Str::from(origin) }
+		Self { provider: ProviderId::from(PROVIDER), http, base_url: Str::new(origin) }
 	}
 }
 
@@ -94,7 +94,7 @@ impl ConsoleUsageFetcher for ZaiUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta,
 				plan: None,
-				source_label: Some(Str::new_static("zai-monitor")),
+				source_label: Some(sf!("zai-monitor")),
 				notes: Box::default(),
 				reset_credits: None,
 				windows,
@@ -113,7 +113,7 @@ fn credential_parts(raw: &str) -> Result<(String, UsageAccountMetadata), UsageFe
 			.and_then(Value::as_str)
 			.ok_or(UsageFetchError::Protocol)?
 			.to_owned();
-		let field = |name| value.get(name).and_then(Value::as_str).map(Str::from);
+		let field = |name| value.get(name).and_then(Value::as_str).map(Str::new);
 		Ok((token, UsageAccountMetadata {
 			provider_account_id: field("accountId"),
 			email: field("email"),
@@ -221,11 +221,11 @@ fn parse(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageFetchErro
 			}
 		});
 		windows.push(UsageWindow {
-			id: Str::from(id),
+			id: Str::new(id),
 			kind: UsageWindowKind::Quota,
-			dimension: Str::new_static(dimension),
-			label: Some(Str::from(label)),
-			scope: Some(Str::from(scope)),
+			dimension: sf!(dimension),
+			label: Some(Str::new(label)),
+			scope: Some(Str::new(scope)),
 			amount: UsageAmount { unit, consumed, remaining, limit },
 			status: Some(status),
 			duration,

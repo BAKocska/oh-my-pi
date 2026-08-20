@@ -1,7 +1,7 @@
 //! Sans-I/O codec for Kagi's standalone v1 Search API.
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use omp_llm_catalog::OperationKind;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -83,8 +83,8 @@ fn encode_search(
 		RequestMethod::Post,
 		join_search_uri(context.route.endpoint.base_url.as_str())?,
 		vec![
-			RequestHeader { name: Str::from("content-type"), value: Str::from("application/json") },
-			RequestHeader { name: Str::from("accept"), value: Str::from("application/json") },
+			RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+			RequestHeader { name: sf!("accept"), value: sf!("application/json") },
 		]
 		.into_boxed_slice(),
 		BodySource::Bytes(body),
@@ -134,7 +134,7 @@ fn join_search_uri(base: &str) -> Result<Str, Error> {
 		.map_err(|()| encoding_error("kagi_search_base_url_invalid"))?
 		.pop_if_empty()
 		.push(SEARCH_PATH_SEGMENT);
-	Ok(Str::from(url.to_string()))
+	Ok(Str::new(&url))
 }
 
 /// Bounded unary decoder for Kagi v1 Search API responses.
@@ -346,7 +346,7 @@ fn codec_mismatch(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn encoding_error(reason: &'static str) -> Error {
@@ -356,7 +356,7 @@ fn encoding_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn protocol_error(reason: &'static str) -> Error {
@@ -366,7 +366,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn api_error(_provider_code: &str) -> Error {
@@ -376,8 +376,8 @@ fn api_error(_provider_code: &str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::from("kagi_api_error"))
-	.detail(ErrorDetail::provider(Str::from("Kagi Search request failed")))
+	.code(sf!("kagi_api_error"))
+	.detail(ErrorDetail::provider(sf!("Kagi Search request failed")))
 }
 
 #[cfg(test)]
@@ -392,7 +392,7 @@ mod tests {
 
 	fn request() -> SearchRequest {
 		SearchRequest {
-			query:             Str::from("rust sans-I/O"),
+			query:             sf!("rust sans-I/O"),
 			include_domains:   Arc::from([]),
 			exclude_domains:   Arc::from([]),
 			recency:           None,

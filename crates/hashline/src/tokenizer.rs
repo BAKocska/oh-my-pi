@@ -363,7 +363,7 @@ fn classify_line(line: &str, line_num: usize) -> Token {
 		return Token::Abort { line_num };
 	}
 	if is_read_metadata_line(line) {
-		return Token::Raw { line_num, text: line.into() };
+		return Token::Raw { line_num, text: Str::new(line) };
 	}
 	if let Some((path, file_hash)) = try_parse_header(line) {
 		return Token::Header { line_num, path, file_hash };
@@ -372,9 +372,9 @@ fn classify_line(line: &str, line_num: usize) -> Token {
 		return Token::Operation { line_num, target, had_colon };
 	}
 	if let Some(text) = line.strip_prefix('+') {
-		return Token::PayloadLiteral { line_num, text: text.into() };
+		return Token::PayloadLiteral { line_num, text: Str::new(text) };
 	}
-	Token::Raw { line_num, text: line.into() }
+	Token::Raw { line_num, text: Str::new(line) }
 }
 
 fn try_parse_header(line: &str) -> Option<(Str, Option<Str>)> {
@@ -395,9 +395,9 @@ fn try_parse_header(line: &str) -> Option<(Str, Option<Str>)> {
 		for byte in tag.bytes() {
 			uppercase.push(char::from(byte.to_ascii_uppercase()));
 		}
-		return Some((path.into(), Some(uppercase.freeze())));
+		return Some((Str::new(path), Some(uppercase.freeze())));
 	}
-	Some((body.into(), None))
+	Some((Str::new(body), None))
 }
 
 fn try_parse_hunk_header(line: &str) -> Option<(BlockTarget, bool)> {
@@ -407,7 +407,7 @@ fn try_parse_hunk_header(line: &str) -> Option<(BlockTarget, bool)> {
 	}
 	if let Some(rest) = keyword_rest(trimmed, HL_MOVE_KEYWORD) {
 		let dest = parse_move_dest(rest)?;
-		return Some((BlockTarget::Move { dest: dest.into() }, false));
+		return Some((BlockTarget::Move { dest: Str::new(dest) }, false));
 	}
 	if let Some(rest) = keyword_rest(trimmed, HL_PUT_KEYWORD) {
 		return parse_put_target(rest);
@@ -438,7 +438,7 @@ fn split_colon_register(rest: &str) -> Option<(&str, Option<Str>, bool)> {
 		if !valid_register(name) {
 			return None;
 		}
-		(without_colon[..split].trim_end(), Some(name.into()))
+		(without_colon[..split].trim_end(), Some(Str::new(name)))
 	} else {
 		(without_colon, None)
 	};

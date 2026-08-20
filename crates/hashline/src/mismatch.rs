@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 /// Lines of context displayed on either side of a rejected anchor.
 pub const MISMATCH_CONTEXT: usize = 2;
@@ -96,7 +96,7 @@ pub fn format_anchored_context(anchor_lines: &[usize], file_lines: &[Str]) -> Ve
 	let mut previous = None;
 	for line in display_lines {
 		if previous.is_some_and(|prior| line > prior + 1) {
-			rows.push("...".into());
+			rows.push(sf!("..."));
 		}
 		previous = Some(line);
 		let marker = if anchor_lines.contains(&line) {
@@ -104,7 +104,7 @@ pub fn format_anchored_context(anchor_lines: &[usize], file_lines: &[Str]) -> Ve
 		} else {
 			' '
 		};
-		rows.push(format!("{marker}{line}:{}", file_lines[line - 1]).into());
+		rows.push(sf!("{marker}{line}:{}", file_lines[line - 1]));
 	}
 	rows
 }

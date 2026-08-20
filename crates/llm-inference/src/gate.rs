@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, io, mem::size_of};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 use crate::{
 	answer::{Artifact, ArtifactBody, ArtifactRef, ResponseMeta},
@@ -491,7 +491,7 @@ impl OutputGate {
 			self.receipt.clone(),
 		)
 		.detail(ErrorDetail::budget(
-			Str::from("provisional_bytes"),
+			sf!("provisional_bytes"),
 			u128::from(limit),
 			u128::from(observed),
 		))
@@ -516,7 +516,7 @@ impl OutputGate {
 			)
 			.committed(self.is_committed())
 			.detail(ErrorDetail::budget(
-				Str::from("provisional_spool_bytes"),
+				sf!("provisional_spool_bytes"),
 				u128::from(limit),
 				u128::from(observed),
 			)),
@@ -543,7 +543,7 @@ impl OutputGate {
 			self.receipt.clone(),
 		)
 		.committed(self.is_committed())
-		.detail(ErrorDetail::protocol(ReasonId(Str::from("output_gate_not_active"))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!("output_gate_not_active"))))
 	}
 
 	fn condition_evidence_error(&self) -> Error {
@@ -553,12 +553,12 @@ impl OutputGate {
 			RetryAction::Never,
 			self.receipt.clone(),
 		)
-		.detail(ErrorDetail::protocol(ReasonId(Str::from("gate_evidence_condition_mismatch"))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!("gate_evidence_condition_mismatch"))))
 	}
 }
 
 fn missing_spool() -> GateSpoolError {
-	GateSpoolError::Unavailable { reason: ReasonId(Str::from("secure_spool_missing")) }
+	GateSpoolError::Unavailable { reason: ReasonId(sf!("secure_spool_missing")) }
 }
 
 /// Returns the conservative number of bytes charged while an event is
@@ -750,14 +750,14 @@ mod tests {
 	};
 
 	fn text(value: &str) -> ChatEvent {
-		ChatEvent::TextDelta { index: 0, text: Str::from(value) }
+		ChatEvent::TextDelta { index: 0, text: Str::new(value) }
 	}
 
 	fn partial_tool(name: &str) -> ChatEvent {
 		ChatEvent::ToolCallStarted {
 			index: 0,
 			id:    ToolCallId::from("call-partial"),
-			name:  Str::from(name),
+			name:  Str::new(name),
 		}
 	}
 
@@ -766,7 +766,7 @@ mod tests {
 			index: 0,
 			call:  ToolCall {
 				id:        ToolCallId::from("call-ready"),
-				name:      Str::from(name),
+				name:      Str::new(name),
 				arguments: OpaqueJson::new(Value::Object(Map::new())),
 			},
 		}
@@ -831,7 +831,7 @@ mod tests {
 	#[test]
 	fn named_tool_gate_rejects_wrong_tool_without_exposing_authorization() {
 		let mut gate =
-			OutputGate::new(GateCondition::ToolCallReady { tool: Str::from("required") }, u64::MAX);
+			OutputGate::new(GateCondition::ToolCallReady { tool: sf!("required") }, u64::MAX);
 		let mut public = Vec::new();
 
 		assert_eq!(
@@ -852,7 +852,7 @@ mod tests {
 			bytes: Bytes::from_static(br#"{"unterminated":"#),
 		};
 		let bound = event_size(&started).saturating_add(event_size(&malformed));
-		let condition = GateCondition::ToolCallReady { tool: Str::from("required") };
+		let condition = GateCondition::ToolCallReady { tool: sf!("required") };
 		let mut gate = OutputGate::new(condition.clone(), bound);
 		let mut public = Vec::new();
 
@@ -872,8 +872,7 @@ mod tests {
 	fn matching_schema_valid_ready_call_flushes_in_order_then_passes_through() {
 		let prefix = text("explanation");
 		let bound = event_size(&prefix);
-		let mut gate =
-			OutputGate::new(GateCondition::ToolCallReady { tool: Str::from("required") }, bound);
+		let mut gate = OutputGate::new(GateCondition::ToolCallReady { tool: sf!("required") }, bound);
 		let mut public = Vec::new();
 
 		gate.push(prefix, &mut |event| public.push(event)).unwrap();
@@ -950,7 +949,7 @@ mod tests {
 	#[test]
 	fn hidden_attempt_usage_and_cost_survive_discard() {
 		let mut gate =
-			OutputGate::new(GateCondition::ToolCallReady { tool: Str::from("required") }, u64::MAX);
+			OutputGate::new(GateCondition::ToolCallReady { tool: sf!("required") }, u64::MAX);
 		let usage = Usage { input_tokens: 11, output_tokens: 7, ..Usage::default() };
 		let cost = Cost::from_micro_usd(29);
 		gate.record_attempt(hidden_attempt(usage, cost));

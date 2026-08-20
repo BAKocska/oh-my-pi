@@ -46,7 +46,7 @@ use std::{
 	task::{Poll, Waker},
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use parking_lot::{Mutex, MutexGuard};
 use serde::de::DeserializeOwned;
 use smallvec::SmallVec;
@@ -426,7 +426,7 @@ impl IncomingCursor {
 						_ => stable_len,
 					};
 					PulledKind::Chunk {
-						value:    Str::from(
+						value:    Str::new(
 							value
 								.get(emitted..upper)
 								.expect("validated decoded string boundaries"),
@@ -443,7 +443,7 @@ impl IncomingCursor {
 	/// Copy one valid UTF-8 source span from the append-only buffer.
 	pub fn raw(&self, span: Range<usize>) -> Option<Str> {
 		let state = self.shared.state.lock();
-		state.text.get(span).map(Str::from)
+		state.text.get(span).map(Str::new)
 	}
 
 	/// Borrow parser repairs observed by any cursor scan so far.
@@ -454,7 +454,7 @@ impl IncomingCursor {
 	/// Await successful completion and copy the exact original document.
 	pub async fn raw_document(&self) -> Result<Str, IncomingError> {
 		wait_until_finished(&self.shared).await?;
-		Ok(Str::from(self.shared.state.lock().text.as_str()))
+		Ok(Str::new(self.shared.state.lock().text.as_str()))
 	}
 
 	/// Return every object key occurrence in source order, preserving
@@ -501,7 +501,7 @@ impl IncomingCursor {
 					}
 					Str::from(progress.value)
 				},
-				Some(_) => Str::from(parser.unquoted_key()),
+				Some(_) => Str::new(parser.unquoted_key()),
 				None => {
 					return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
 				},
@@ -644,7 +644,7 @@ impl IncomingString<'_> {
 			return Err(type_mismatch(&self.json.path, "string", located.kind.name()));
 		};
 		if stable_len > self.emitted {
-			let chunk = Str::from(&value[self.emitted..stable_len]);
+			let chunk = Str::new(&value[self.emitted..stable_len]);
 			self.emitted = stable_len;
 			return Ok(Some(chunk));
 		}
@@ -674,7 +674,7 @@ impl IncomingString<'_> {
 				.map_or(self.emitted, |offset| self.emitted + offset + 1)
 		};
 		if upper > self.emitted {
-			let line = Str::from(&value[self.emitted..upper]);
+			let line = Str::new(&value[self.emitted..upper]);
 			self.emitted = upper;
 			return Ok(Some(line));
 		}
@@ -745,9 +745,9 @@ impl IncomingObject<'_> {
 	/// The returned cursor mutably reborrows this object. Awaiting it resolves
 	/// as soon as the key's value starts; consuming or cancelling it permits
 	/// the next keyed pull.
-	pub fn key(&mut self, name: impl Into<Str>) -> IncomingJson<'_> {
+	pub fn key(&mut self, name: impl IntoStr) -> IncomingJson<'_> {
 		let mut path = self.json.path.clone();
-		path.push(PullPathSegment::Key(name.into()));
+		path.push(PullPathSegment::Key(name.into_str()));
 		IncomingJson { shared: Arc::clone(&self.json.shared), path, _linear: PhantomData }
 	}
 
@@ -1169,7 +1169,7 @@ fn select_key_from(
 				if key.is_empty() {
 					return Probe::Pending;
 				}
-				Str::from(key)
+				Str::new(key)
 			},
 			None => return Probe::Pending,
 		};
@@ -1356,7 +1356,7 @@ fn scan_value(parser: &mut Parser<'_>, ended: bool, depth: u32) -> Probe {
 				Probe::Located(Located {
 					start,
 					end: complete.then_some(end),
-					kind: Kind::String { value: Str::from(word), stable_len: word.len() },
+					kind: Kind::String { value: Str::new(word), stable_len: word.len() },
 					matched_key: None,
 				})
 			} else {
@@ -1414,7 +1414,7 @@ fn scan_object(parser: &mut Parser<'_>, ended: bool, depth: u32, start: usize) -
 				if key.is_empty() {
 					return incomplete_container(start, Kind::Object);
 				}
-				Str::from(key)
+				Str::new(key)
 			},
 			None => return incomplete_container(start, Kind::Object),
 		};
@@ -1561,7 +1561,7 @@ mod tests {
 
 	#[test]
 	fn locate_checkpoint_resumes_at_the_append_boundary() {
-		let path = [PullPathSegment::Key(Str::from("target"))];
+		let path = [PullPathSegment::Key(sf!("target"))];
 		let prefix = "{\"a\":0,\"b\":1,";
 		let (probe, repairs, checkpoint) = locate(prefix, &path, false, None);
 		assert!(matches!(probe, Probe::Pending));

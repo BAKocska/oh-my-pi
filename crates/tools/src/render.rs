@@ -1,6 +1,6 @@
 use std::fmt::{self, Write as _};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	CallOutcome, Part, PromptCaps, ToolIdentity,
 	render::{Render, RenderRegistry, RenderRegistryError},
@@ -244,7 +244,7 @@ fn live_view(name: &str, status: &str) -> Str {
 	output.push_str("</text><text fg=muted>");
 	push_text(&mut output, status);
 	output.push_str("</text></row>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn stream_live_view(name: &str, state: &StreamState) -> Str {
@@ -262,7 +262,7 @@ fn fault_view(name: &str, message: &str) -> Str {
 	output.push_str("</text><text fg=error>");
 	push_text(&mut output, message);
 	output.push_str("</text></row>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn render_edit_live(update: Option<&crate::edit::EditUpdate>) -> Str {
@@ -279,7 +279,7 @@ fn render_edit_live(update: Option<&crate::edit::EditUpdate>) -> Str {
 	output.push_str("</text></row><diff>");
 	push_text(&mut output, &update.preview);
 	output.push_str("</diff></col>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn render_edit_payload(payload: &crate::edit::Payload) -> Str {
@@ -310,7 +310,7 @@ fn render_edit_payload(payload: &crate::edit::Payload) -> Str {
 		output.push_str("</diff>");
 	}
 	output.push_str("</col>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn edit_fault(fault: &crate::edit::Fault) -> String {
@@ -358,7 +358,7 @@ fn render_grep_payload(payload: &crate::grep::Payload) -> Str {
 		output.push_str("</text>");
 	}
 	output.push_str("</col>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn render_glob_payload(payload: &crate::glob::Payload) -> Str {
@@ -382,7 +382,7 @@ fn render_glob_payload(payload: &crate::glob::Payload) -> Str {
 		output.push_str("</text>");
 	}
 	output.push_str("</col>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn shell_fault(fault: &crate::shell::Fault) -> String {
@@ -427,7 +427,7 @@ fn render_shell_payload(payload: &crate::shell::Payload) -> Str {
 		output.push_str("</text><text fg=muted>ctrl+o to expand</text>");
 	}
 	output.push_str("</col>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn render_write_payload(payload: &crate::write::Payload) -> Str {
@@ -445,7 +445,7 @@ fn render_write_payload(payload: &crate::write::Payload) -> Str {
 		output.push_str(" · stripped wrapper");
 	}
 	output.push_str("</text></row>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn render_read_payload(payload: &crate::read::Payload) -> Str {
@@ -471,7 +471,7 @@ fn render_read_payload(payload: &crate::read::Payload) -> Str {
 			.expect("writing to String cannot fail");
 	}
 	output.push_str("</text></row>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn eval_fault(fault: &crate::eval::Fault) -> String {
@@ -522,7 +522,7 @@ fn render_eval_payload(payload: &crate::eval::Payload) -> Str {
 		output.push_str("<text fg=muted>output truncated</text>");
 	}
 	output.push_str("</col>");
-	Str::from(output)
+	Str::new(output)
 }
 
 fn debug_label(value: impl fmt::Debug) -> String {
@@ -575,7 +575,7 @@ impl TextProjection {
 		if self.text.is_empty() {
 			Vec::new()
 		} else {
-			vec![Part::Text { text: Str::from(self.text) }]
+			vec![Part::Text { text: Str::new(self.text) }]
 		}
 	}
 }
@@ -583,7 +583,7 @@ impl TextProjection {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 	use omp_tool::{
 		Abort, ArgIssue, ArgIssueKind, CallOutcome, Rev, ToolIdentity,
 		render::{RenderRegistry, ViewState},
@@ -592,7 +592,7 @@ mod tests {
 	use super::{BuiltinRendererIdentities, register_builtin_renderers};
 
 	fn identity(name: &str, revision: u16) -> ToolIdentity {
-		ToolIdentity { name: Str::from(name), rev: Rev { family: Str::from("test"), n: revision } }
+		ToolIdentity { name: Str::new(name), rev: Rev { family: sf!("test"), n: revision } }
 	}
 
 	fn identities() -> BuiltinRendererIdentities {
@@ -665,7 +665,7 @@ mod tests {
 		let (registry, identities) = registry(identities());
 		let update = crate::edit::EditUpdate {
 			applied_ops:   2,
-			preview:       Str::from("+&lt;already-markup"),
+			preview:       sf!("+&lt;already-markup"),
 			added_lines:   3,
 			removed_lines: 1,
 		};
@@ -707,7 +707,7 @@ mod tests {
 		let (registry, identities) = registry(identities());
 		let state = ViewState::new();
 		let fault = CallOutcome::<crate::read::Payload, crate::read::Fault>::Faulted(
-			crate::read::Fault::Source { message: Str::from("missing <file> & owner") },
+			crate::read::Fault::Source { message: sf!("missing <file> & owner") },
 		);
 		let encoded_fault = serde_json::to_vec(&fault).expect("fault serializes");
 		assert_eq!(
@@ -721,9 +721,9 @@ mod tests {
 
 		let args = CallOutcome::<crate::read::Payload, crate::read::Fault>::ArgsRejected(ArgIssue {
 			path:     Vec::new(),
-			expected: Str::from("path"),
+			expected: sf!("path"),
 			kind:     ArgIssueKind::Missing,
-			example:  Some(Str::from(r#"{"path":"src/lib.rs"}"#)),
+			example:  Some(sf!(r#"{{"path":"src/lib.rs"}}"#)),
 			found:    None,
 		});
 		let encoded_args = serde_json::to_vec(&args).expect("argument issue serializes");
@@ -737,7 +737,7 @@ mod tests {
 
 		let abort =
 			CallOutcome::<crate::read::Payload, crate::read::Fault>::aborted(Abort::Interrupted {
-				reason: Str::from("cancelled"),
+				reason: sf!("cancelled"),
 			});
 		let encoded_abort = serde_json::to_vec(&abort).expect("abort serializes");
 		assert_eq!(
@@ -754,14 +754,14 @@ mod tests {
 		let (registry, identities) = registry(identities());
 		let outcome =
 			CallOutcome::<crate::write::Payload, crate::write::Fault>::Ok(crate::write::Payload {
-				resolved_path:    Str::from("/tmp/a<&.txt"),
-				display_path:     Str::from("a<&.txt"),
+				resolved_path:    sf!("/tmp/a<&.txt"),
+				display_path:     sf!("a<&.txt"),
 				byte_len:         9,
 				reported_len:     9,
 				disposition:      crate::write::WriteDisposition::Created,
 				stripped_wrapper: false,
 				made_executable:  true,
-				snapshot_tag:     Some(Str::from("ABCD")),
+				snapshot_tag:     Some(sf!("ABCD")),
 				operation:        crate::write::WriteOperation::Plain,
 			});
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");

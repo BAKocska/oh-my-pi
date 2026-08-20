@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use xxhash_rust::xxh32::Xxh32;
 
 use crate::types::Cursor;
@@ -76,47 +76,47 @@ pub(crate) fn normalized_file_xxh32(exact: &[u8]) -> u32 {
 
 /// Computes the uppercase four-hex xxHash32 snapshot tag.
 pub fn compute_file_hash(text: &str) -> Str {
-	fmts!("{:04X}", normalized_file_xxh32(text.as_bytes()) & 0xffff)
+	sf!("{:04X}", normalized_file_xxh32(text.as_bytes()) & 0xffff)
 }
 
 /// Formats a concrete replacement header such as `PUT 5.=9:`.
 pub fn format_replace_header(start: usize, end: usize) -> Str {
-	fmts!("PUT {start}.={end}:")
+	sf!("PUT {start}.={end}:")
 }
 
 /// Formats a concrete cut header such as `CUT 5.=9`.
 pub fn format_cut_header(start: usize, end: usize) -> Str {
-	fmts!("CUT {start}.={end}")
+	sf!("CUT {start}.={end}")
 }
 
 /// Formats a gap locator such as `<5`, `>5`, `<1`, or `>$`.
 pub fn format_gap_locator(cursor: Cursor) -> Str {
 	match cursor {
-		Cursor::Bof => Str::from("<1"),
-		Cursor::Eof => Str::from(">$"),
-		Cursor::BeforeAnchor { anchor } => fmts!("<{}", anchor.line),
-		Cursor::AfterAnchor { anchor } => fmts!(">{}", anchor.line),
+		Cursor::Bof => sf!("<1"),
+		Cursor::Eof => sf!(">$"),
+		Cursor::BeforeAnchor { anchor } => sf!("<{}", anchor.line),
+		Cursor::AfterAnchor { anchor } => sf!(">{}", anchor.line),
 	}
 }
 
 /// Formats an insertion header for a cursor.
 pub fn format_insert_header(cursor: Cursor) -> Str {
-	fmts!("PUT {}:", format_gap_locator(cursor))
+	sf!("PUT {}:", format_gap_locator(cursor))
 }
 
 /// Formats a named register reference.
 pub fn format_register(name: &str) -> Str {
-	fmts!("@{name}")
+	sf!("@{name}")
 }
 
 /// Formats a section header from a path and snapshot tag.
 pub fn format_hashline_header(path: &str, tag: &str) -> Str {
-	fmts!("[{path}#{tag}]")
+	sf!("[{path}#{tag}]")
 }
 
 /// Formats one displayed source row as `LINE:TEXT`.
 pub fn format_numbered_line(line: usize, text: &str) -> Str {
-	fmts!("{line}:{text}")
+	sf!("{line}:{text}")
 }
 
 /// Splits LF-delimited text into rows that hashline anchors can address.

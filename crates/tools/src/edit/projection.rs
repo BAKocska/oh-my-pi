@@ -1,6 +1,6 @@
 //! Pure pi-compatible model-facing edit response projection.
 
-use omp_core::{Str, StrMut};
+use omp_core::{Str, StrMut, sf};
 
 use super::ResolvedBlock;
 
@@ -40,8 +40,8 @@ pub struct SectionView<'a> {
 #[must_use]
 pub fn render_section(view: SectionView<'_>) -> Str {
 	match view.op {
-		SectionOp::Delete => return format!("Deleted {}", view.path).into(),
-		SectionOp::Noop => return view.noop_diagnostic.into(),
+		SectionOp::Delete => return sf!("Deleted {}", view.path),
+		SectionOp::Noop => return Str::new(view.noop_diagnostic),
 		SectionOp::Update => {},
 	}
 

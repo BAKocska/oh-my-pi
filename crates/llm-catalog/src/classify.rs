@@ -1,7 +1,7 @@
 //! Offline model identity classification for catalog compilation and discovery
 //! normalization.
 
-use omp_core::{SemVer, Str};
+use omp_core::{SemVer, Str, sf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -123,7 +123,7 @@ fn classify_with_taxonomy(
 		let (inferred_family, inferred_revision) =
 			ranks_in_class(taxonomy, input.phase, &class, logical);
 		return ModelClassification {
-			logical_model: Str::from(logical),
+			logical_model: Str::new(logical),
 			class,
 			family: identity.family.clone().or(inferred_family),
 			revision: identity.revision.or(inferred_revision),
@@ -131,7 +131,7 @@ fn classify_with_taxonomy(
 			thinking_variant: identity.thinking_variant.unwrap_or(false),
 			evidence: ClassificationEvidence {
 				method:        ClassificationMethod::ExactOverride,
-				rule:          Str::from(identity.id.as_str()),
+				rule:          Str::new(identity.id.as_str()),
 				rationale:     identity.rationale.clone(),
 				provenance:    identity.provenance.clone(),
 				expires_at_ms: identity.expires_at_ms,
@@ -156,7 +156,7 @@ fn classify_with_taxonomy(
 		ClassificationMethod::ClassRule
 	};
 	ModelClassification {
-		logical_model:    Str::from(logical.as_ref()),
+		logical_model:    Str::new(logical.as_ref()),
 		class:            inferred_class,
 		family:           inferred_family,
 		revision:         inferred_revision,
@@ -164,20 +164,20 @@ fn classify_with_taxonomy(
 		thinking_variant: collapsed_thinking,
 		evidence:         ClassificationEvidence {
 			method,
-			rule: Str::from(if structural {
-				"effort-suffix-v1"
+			rule: if structural {
+				sf!("effort-suffix-v1")
 			} else {
-				"family-segments-v1"
-			}),
-			rationale: Str::from(if structural {
-				"provider row is a structurally named effort route of one logical model"
+				sf!("family-segments-v1")
+			},
+			rationale: if structural {
+				sf!("provider row is a structurally named effort route of one logical model",)
 			} else {
-				"bounded vendor and model-family segments establish lineage"
-			}),
-			provenance: Str::from(match input.phase {
-				ClassificationPhase::CatalogCompiler => "catalog-compiler",
-				ClassificationPhase::DiscoveryNormalizer => "provider-discovery",
-			}),
+				sf!("bounded vendor and model-family segments establish lineage")
+			},
+			provenance: match input.phase {
+				ClassificationPhase::CatalogCompiler => sf!("catalog-compiler"),
+				ClassificationPhase::DiscoveryNormalizer => sf!("provider-discovery"),
+			},
 			expires_at_ms: None,
 		},
 	}

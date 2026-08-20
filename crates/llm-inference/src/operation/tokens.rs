@@ -8,7 +8,7 @@ use std::{
 	task::{Context, Poll},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 use xutf::BufReadCharsExt as _;
 
@@ -241,7 +241,7 @@ impl Utf8ByteTokenizer {
 	/// Constructs the pinned byte tokenizer with an immutable catalog revision.
 	pub fn new(identity: RouteIdentity, revision: Str) -> Result<Self, Error> {
 		let provenance =
-			TokenizerProvenance { tokenizer: Str::from("omp/utf8-bytes"), revision, exact: true };
+			TokenizerProvenance { tokenizer: sf!("omp/utf8-bytes"), revision, exact: true };
 		validate_provenance(&provenance)?;
 		Ok(Self { identity, provenance })
 	}
@@ -457,8 +457,8 @@ fn wrong_operation(call: &crate::call::Call, expected: OperationKind) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		Str::from(expected.to_string()),
-		ReasonId(Str::from("operation_service_mismatch")),
+		Str::new(expected.to_string()),
+		ReasonId(sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
@@ -466,7 +466,7 @@ fn wrong_operation(call: &crate::call::Call, expected: OperationKind) -> Error {
 fn request_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::InvalidRequest,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -474,7 +474,7 @@ fn request_error(feature: &'static str, reason: &'static str) -> Error {
 fn capability_error(reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::CapabilityMismatch,
-		ErrorDetail::capability(Str::from("tokenization"), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(sf!("tokenization"), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -486,7 +486,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]

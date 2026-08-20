@@ -14,7 +14,7 @@ use std::{
 
 use bytes::{Buf as _, Bytes, BytesMut};
 use futures::future::try_join_all;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::{
 	env::v1::{
 		AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecOutcome, ExecRequest, ExecStarted,
@@ -353,7 +353,7 @@ impl ExecHost {
 			.ok_or(ExecError::SessionNotFound)?;
 		let source = request
 			.source
-			.ok_or_else(|| ExecError::Shell(Str::from("missing script")))?;
+			.ok_or_else(|| ExecError::Shell(sf!("missing script")))?;
 		let exec = self.new_id();
 		let (events_tx, events) = flume::unbounded();
 		let (cancel_tx, cancel_rx) = flume::bounded(1);
@@ -437,7 +437,7 @@ impl ExecHost {
 		let ready = request.ready;
 		let spec = request
 			.spec
-			.ok_or_else(|| ExecError::Shell(Str::from("missing process spec")))?;
+			.ok_or_else(|| ExecError::Shell(sf!("missing process spec")))?;
 		let opened = self
 			.open_session(OpenSessionRequest {
 				cwd_uri:   spec.cwd_uri,
@@ -509,7 +509,7 @@ impl ExecHost {
 		if terminal {
 			process.control.cancel(CANCEL_GRACE);
 			self.inner.processes.lock().remove(&name);
-			return Err(ExecError::Readiness(Str::new_static(
+			return Err(ExecError::Readiness(sf!(
 				"process exited while readiness probes were running",
 			)));
 		}
@@ -996,28 +996,26 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 							}
 						},
 						ProcessEvent::State(info) if process_state_is_terminal(info.state) => {
-							return Err(ExecError::Readiness(Str::new_static(
+							return Err(ExecError::Readiness(sf!(
 								"process exited before its log probe passed",
 							)));
 						},
 						_ => {},
 					}
 				}
-				Err(ExecError::Readiness(Str::new_static(
-					"process output closed before its log probe passed",
-				)))
+				Err(ExecError::Readiness(sf!("process output closed before its log probe passed",)))
 			};
 			tokio::time::timeout(timeout, wait)
 				.await
-				.map_err(|_| ExecError::Readiness(Str::new_static("log probe timed out")))?
+				.map_err(|_| ExecError::Readiness(sf!("log probe timed out")))?
 		},
 		Some(ready_probe::Probe::Tcp(tcp)) => {
 			let port = u16::try_from(tcp.port)
-				.map_err(|_| ExecError::Readiness(Str::new_static("TCP probe port is out of range")))?;
+				.map_err(|_| ExecError::Readiness(sf!("TCP probe port is out of range")))?;
 			let wait = async {
 				loop {
 					if process.control.finished.load(Ordering::Acquire) {
-						return Err(ExecError::Readiness(Str::new_static(
+						return Err(ExecError::Readiness(sf!(
 							"process exited before its TCP probe passed",
 						)));
 					}
@@ -1032,7 +1030,7 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 			};
 			tokio::time::timeout(timeout, wait)
 				.await
-				.map_err(|_| ExecError::Readiness(Str::new_static("TCP probe timed out")))?
+				.map_err(|_| ExecError::Readiness(sf!("TCP probe timed out")))?
 		},
 		Some(ready_probe::Probe::Ping(ping)) => {
 			let (_, events) = readiness_events(&process);
@@ -1059,22 +1057,20 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 							}
 						},
 						ProcessEvent::State(info) if process_state_is_terminal(info.state) => {
-							return Err(ExecError::Readiness(Str::new_static(
+							return Err(ExecError::Readiness(sf!(
 								"process exited before its Ping probe passed",
 							)));
 						},
 						_ => {},
 					}
 				}
-				Err(ExecError::Readiness(Str::new_static(
-					"process output closed before its Ping probe passed",
-				)))
+				Err(ExecError::Readiness(sf!("process output closed before its Ping probe passed",)))
 			};
 			tokio::time::timeout(timeout, wait)
 				.await
-				.map_err(|_| ExecError::Readiness(Str::new_static("Ping probe timed out")))?
+				.map_err(|_| ExecError::Readiness(sf!("Ping probe timed out")))?
 		},
-		None => Err(ExecError::Readiness(Str::new_static("readiness probe has no kind"))),
+		None => Err(ExecError::Readiness(sf!("readiness probe has no kind"))),
 	}
 }
 
@@ -1098,9 +1094,7 @@ fn take_worker_frame(buffer: &mut BytesMut) -> Result<Option<WorkerFrame>, ExecE
 	let mut prefix = None;
 	for (index, byte) in buffer.iter().copied().take(10).enumerate() {
 		if index == 9 && byte > 1 {
-			return Err(ExecError::Readiness(Str::new_static(
-				"Ping probe received an invalid frame length",
-			)));
+			return Err(ExecError::Readiness(sf!("Ping probe received an invalid frame length",)));
 		}
 		length |= u64::from(byte & 0x7f) << (index * 7);
 		if byte & 0x80 == 0 {
@@ -1110,17 +1104,15 @@ fn take_worker_frame(buffer: &mut BytesMut) -> Result<Option<WorkerFrame>, ExecE
 	}
 	let Some(prefix) = prefix else {
 		if buffer.len() >= 10 {
-			return Err(ExecError::Readiness(Str::new_static(
-				"Ping probe received an invalid frame length",
-			)));
+			return Err(ExecError::Readiness(sf!("Ping probe received an invalid frame length",)));
 		}
 		return Ok(None);
 	};
 	let length = usize::try_from(length)
-		.map_err(|_| ExecError::Readiness(Str::new_static("Ping probe frame is too large")))?;
+		.map_err(|_| ExecError::Readiness(sf!("Ping probe frame is too large")))?;
 	let total = prefix
 		.checked_add(length)
-		.ok_or_else(|| ExecError::Readiness(Str::new_static("Ping probe frame length overflow")))?;
+		.ok_or_else(|| ExecError::Readiness(sf!("Ping probe frame length overflow")))?;
 	if buffer.len() < total {
 		return Ok(None);
 	}

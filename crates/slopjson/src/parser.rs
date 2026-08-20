@@ -23,7 +23,7 @@
 
 use std::ops::Range;
 
-use omp_core::{CowStr, Str, StrMut};
+use omp_core::{CowStr, IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 
 use crate::{
@@ -328,14 +328,14 @@ impl<'a> Parser<'a> {
 		}
 	}
 
-	fn record(&mut self, span: Range<usize>, kind: RepairKind, after: impl Into<Str>) {
-		let before = Str::from(&self.src[span.clone()]);
+	fn record(&mut self, span: Range<usize>, kind: RepairKind, after: impl IntoStr) {
+		let before = Str::new(&self.src[span.clone()]);
 		self.repairs.0.push(Repair {
 			span,
 			path: self.repair_path.clone(),
 			kind,
 			before,
-			after: after.into(),
+			after: after.into_str(),
 		});
 	}
 
@@ -460,7 +460,7 @@ impl<'a> Parser<'a> {
 						let value = finish(out, &self.src[run_start..i]);
 						let stable_len = value.len();
 						if quote == b'\'' {
-							let after = Value::String(Str::from(value.as_str())).to_string();
+							let after = Value::String(Str::new(value.as_str())).to_string();
 							self.record(string_start..self.i, RepairKind::SingleQuotedString, after);
 						}
 						return Ok(StringProgress { value, stable_len, complete: true });
@@ -680,7 +680,7 @@ impl<'a> Parser<'a> {
 			self.i += 1;
 		}
 		if self.i > start {
-			let after = Value::String(Str::from(&self.src[start..self.i])).to_string();
+			let after = Value::String(Str::new(&self.src[start..self.i])).to_string();
 			self.record(start..self.i, RepairKind::UnquotedKey, after);
 		}
 		&self.src[start..self.i]
@@ -726,7 +726,7 @@ impl<'a> Parser<'a> {
 			return Err(ParseError::UnexpectedToken(start));
 		}
 		self.i = i;
-		let after = Value::String(Str::from(word)).to_string();
+		let after = Value::String(Str::new(word)).to_string();
 		self.record(start..end, RepairKind::BarewordValue, after);
 		Ok(word)
 	}

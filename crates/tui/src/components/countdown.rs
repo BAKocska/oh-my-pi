@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use omp_core::{Str, fmts};
+use omp_core::{IntoStr, Str, sf};
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
@@ -23,8 +23,8 @@ pub struct Countdown {
 impl Countdown {
 	/// Creates a countdown beginning at presentation time `started`.
 	#[must_use]
-	pub fn new(label: impl Into<Str>, started: Duration, duration: Duration) -> Self {
-		Self { props: Props::new(), slot: next_slot(), label: label.into(), started, duration }
+	pub fn new(label: impl IntoStr, started: Duration, duration: Duration) -> Self {
+		Self { props: Props::new(), slot: next_slot(), label: label.into_str(), started, duration }
 	}
 
 	/// Returns the remaining whole seconds, rounding a partial second up.
@@ -72,7 +72,7 @@ impl Component for Countdown {
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		let remaining = self.remaining(pc.ctx.now);
-		let text = fmts!("{} · {remaining}s", self.label);
+		let text = sf!("{} · {remaining}s", self.label);
 		let color = if remaining <= 5 {
 			pc.ctx.theme.err
 		} else {

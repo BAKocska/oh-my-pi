@@ -2,7 +2,7 @@
 
 use std::{ffi::OsString, path::Path};
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 
 #[cfg(unix)]
 mod platform {
@@ -72,9 +72,9 @@ pub fn terminal_id_with(
 	if let Some(pane) = nonempty_env(&mut env, "ZELLIJ_PANE_ID") {
 		if let Some(session) = nonempty_env(&mut env, "ZELLIJ_SESSION_NAME") {
 			let session = session.replace(['/', '\\'], "-");
-			return fmts!("zellij-{session}-{pane}");
+			return sf!("zellij-{session}-{pane}");
 		}
-		return fmts!("zellij-{pane}");
+		return sf!("zellij-{pane}");
 	}
 
 	for (name, prefix) in [
@@ -86,11 +86,11 @@ pub fn terminal_id_with(
 		("WT_SESSION", "wt"),
 	] {
 		if let Some(value) = nonempty_env(&mut env, name) {
-			return fmts!("{prefix}-{value}");
+			return sf!("{prefix}-{value}");
 		}
 	}
 
-	UNKNOWN_TERMINAL_ID.into()
+	sf!(UNKNOWN_TERMINAL_ID)
 }
 
 fn normalize_tty_path(path: &Path) -> Option<Str> {

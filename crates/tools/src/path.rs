@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 /// A colon selector split from its path without mistaking Windows drive syntax.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,10 +24,10 @@ pub fn split_colon_selector(input: &str) -> PathSelector {
 		.filter(|index| !input[index + 1..].is_empty());
 	match selector {
 		Some(index) => PathSelector {
-			path:     Str::from(&input[..index]),
-			selector: Some(Str::from(&input[index + 1..])),
+			path:     Str::new(&input[..index]),
+			selector: Some(Str::new(&input[index + 1..])),
 		},
-		None => PathSelector { path: Str::from(input), selector: None },
+		None => PathSelector { path: Str::new(input), selector: None },
 	}
 }
 /// Resolves a model-facing workspace path without permitting traversal outside
@@ -70,8 +70,8 @@ mod tests {
 	#[test]
 	fn preserves_windows_drive_while_splitting_selector() {
 		assert_eq!(split_colon_selector("C:\\repo\\a.rs:4-8"), PathSelector {
-			path:     Str::from("C:\\repo\\a.rs"),
-			selector: Some(Str::from("4-8")),
+			path:     sf!("C:\\repo\\a.rs"),
+			selector: Some(sf!("4-8")),
 		});
 	}
 	#[test]

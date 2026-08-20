@@ -4,7 +4,7 @@
 //! selects only closed method/path pairs and never acts as an arbitrary proxy.
 
 use bytes::{BufMut as _, Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::OperationKind;
 
 use crate::{
@@ -168,7 +168,7 @@ fn encode_native(
 	let headers = content_type.map_or_else(
 		|| Box::new([]) as Box<[RequestHeader]>,
 		|value| {
-			vec![RequestHeader { name: Str::from("content-type"), value: Str::from(value) }]
+			vec![RequestHeader { name: sf!("content-type"), value: Str::new(value) }]
 				.into_boxed_slice()
 		},
 	);
@@ -232,7 +232,7 @@ fn validate_request_size(bytes: u64) -> Result<(), Error> {
 }
 
 fn join_uri(base: &str, path: &str) -> Str {
-	Str::from(format!("{}{path}", base.trim_end_matches('/')))
+	sf!("{}{path}", base.trim_end_matches('/'))
 }
 
 /// Incremental lossless projector for native response frames.
@@ -302,7 +302,7 @@ fn rejected(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn protocol_error(reason: &'static str) -> Error {
@@ -312,7 +312,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, format_rfc3339, parse_rfc3339};
+use omp_core::{Str, format_rfc3339, parse_rfc3339, sf};
 use omp_llm_catalog::OperationKind;
 use serde::{Deserialize, Serialize};
 
@@ -147,14 +147,8 @@ impl Codec for ExaSearchCodec {
 			RequestMethod::Post,
 			search_uri(context.route.endpoint.base_url.as_str())?,
 			Box::new([
-				RequestHeader {
-					name:  Str::new_static("accept"),
-					value: Str::new_static("application/json"),
-				},
-				RequestHeader {
-					name:  Str::new_static("content-type"),
-					value: Str::new_static("application/json"),
-				},
+				RequestHeader { name: sf!("accept"), value: sf!("application/json") },
+				RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 			]),
 			BodySource::Bytes(Bytes::from(body)),
 			FramingProtocol::Raw,
@@ -307,8 +301,8 @@ impl ExaDecoder {
 		};
 		self
 			.error(kind, action, status, "exa.api_error")
-			.code(Str::new_static(code))
-			.detail(ErrorDetail::provider(Str::new_static("Exa Search request failed")))
+			.code(sf!(code))
+			.detail(ErrorDetail::provider(sf!("Exa Search request failed")))
 	}
 
 	fn error(
@@ -323,7 +317,7 @@ impl ExaDecoder {
 			.route(self.route.clone())
 			.request_id(self.request_id.clone())
 			.status(status)
-			.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+			.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 	}
 }
 
@@ -378,7 +372,7 @@ fn search_uri(base: &str) -> Result<Str, Error> {
 		path.push_str(SEARCH_PATH);
 	}
 	url.set_path(&path);
-	Ok(Str::from(url.to_string()))
+	Ok(Str::new(&url))
 }
 
 fn snippet(highlights: Vec<Str>, text: Option<Str>) -> Option<Str> {
@@ -390,7 +384,7 @@ fn snippet(highlights: Vec<Str>, text: Option<Str>) -> Option<Str> {
 
 fn protocol_error(kind: ErrorKind, phase: ErrorPhase, reason: &'static str) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 #[cfg(test)]
@@ -407,9 +401,9 @@ mod tests {
 
 	fn request() -> SearchRequest {
 		SearchRequest {
-			query:             Str::from("rust inference"),
-			include_domains:   Arc::from([Str::from("docs.rs"), Str::from("rust-lang.org/book")]),
-			exclude_domains:   Arc::from([Str::from("spam.example")]),
+			query:             sf!("rust inference"),
+			include_domains:   Arc::from([sf!("docs.rs"), sf!("rust-lang.org/book")]),
+			exclude_domains:   Arc::from([sf!("spam.example")]),
 			recency:           Some(SearchRecency::Week),
 			locale:            None,
 			max_results:       7,
@@ -437,13 +431,10 @@ mod tests {
 			r#"{"query":"rust inference","numResults":7,"contents":{"text":true},"includeDomains":["docs.rs","rust-lang.org/book"],"excludeDomains":["spam.example"],"startPublishedDate":"2023-12-25T00:00:00Z"}"#
 		);
 		assert!(!body.windows(6).any(|window| window == b"locale"));
-		assert_eq!(
-			search_uri("https://api.exa.ai/").expect("uri"),
-			Str::from("https://api.exa.ai/search")
-		);
+		assert_eq!(search_uri("https://api.exa.ai/").expect("uri"), sf!("https://api.exa.ai/search"));
 		assert_eq!(
 			search_uri("https://api.exa.ai/search/").expect("uri"),
-			Str::from("https://api.exa.ai/search")
+			sf!("https://api.exa.ai/search")
 		);
 	}
 

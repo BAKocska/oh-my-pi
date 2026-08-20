@@ -6,7 +6,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use parking_lot::{Condvar, Mutex};
 
 const STALL_THRESHOLD: Duration = Duration::from_millis(250);
@@ -97,7 +97,7 @@ impl LoopWatchdogCore {
 		Self {
 			last_tick:     now,
 			last_cpu_time: cpu_time,
-			phase:         "unknown".into(),
+			phase:         sf!("unknown"),
 			reported:      false,
 		}
 	}
@@ -110,8 +110,8 @@ impl LoopWatchdogCore {
 	}
 
 	/// Set the label attached to a subsequently detected stall.
-	pub fn set_phase(&mut self, phase: impl Into<Str>) {
-		self.phase = phase.into();
+	pub fn set_phase(&mut self, phase: impl IntoStr) {
+		self.phase = phase.into_str();
 	}
 
 	/// Check for a newly detected stall at the current wall and process CPU
@@ -205,7 +205,7 @@ impl LoopWatchdog {
 	}
 
 	/// Set the phase label attached to a subsequently detected stall.
-	pub fn set_phase(&self, phase: impl Into<Str>) {
+	pub fn set_phase(&self, phase: impl IntoStr) {
 		let (lock, _) = &*self.shared;
 		let mut shared = lock.lock();
 		shared.core.set_phase(phase);

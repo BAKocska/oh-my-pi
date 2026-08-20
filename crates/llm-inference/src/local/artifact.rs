@@ -6,7 +6,7 @@ use std::{
 	path::{Component, Path, PathBuf},
 };
 
-use omp_core::Str;
+use omp_core::IntoStr;
 use sha2::{Digest, Sha256};
 
 use super::runtime::{LocalCancellation, LocalError, LocalErrorKind, LocalResult};
@@ -198,6 +198,6 @@ impl std::fmt::Debug for VerifiedArtifact {
 }
 
 /// Describes an artifact failure without exposing untrusted path input.
-pub fn artifact_failure(message: impl Into<Str>) -> LocalError {
+pub fn artifact_failure(message: impl IntoStr) -> LocalError {
 	LocalError::new(LocalErrorKind::Artifact, message)
 }

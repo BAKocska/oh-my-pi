@@ -4,7 +4,7 @@
 //! TeX Math — by @thatmagicalcat (<https://github.com/thatmagicalcat/txm>,
 //! MIT/Apache-2.0), reimplemented for styled terminal segments.
 
-use omp_core::{Str, StrMut, fmts};
+use omp_core::{IntoStr, Str, StrMut, sf};
 use smallvec::SmallVec;
 
 use super::unicode::{MathFont, Row, apply_math_font, latex_row, math_font, resolve_color};
@@ -55,8 +55,8 @@ struct DelimPieces {
 	axis:   Option<&'static str>,
 }
 
-fn owned_line(style: Style, text: impl Into<Str>) -> Row {
-	let text = text.into();
+fn owned_line(style: Style, text: impl IntoStr) -> Row {
+	let text = text.into_str();
 	if text.is_empty() {
 		Row::new()
 	} else {
@@ -322,7 +322,7 @@ fn radical_box(inner: MathBox, degree: Option<&str>, ctx: Context) -> MathBox {
 	}
 	let radical = MathBox { lines, baseline: inner.baseline + 1, width };
 	let Some(degree) = degree else { return radical };
-	let degree = fmts!("^{{{degree}}}");
+	let degree = sf!("^{{{degree}}}");
 	let rendered = flat_box(degree.as_str(), ctx);
 	let mut degree_lines = rendered.lines;
 	degree_lines.push(spaces(ctx.style, rendered.width));
@@ -1120,12 +1120,12 @@ fn command_name(src: &str, start: usize) -> (&str, usize) {
 }
 
 fn apply_color(ctx: Context, model: Option<&str>, spec: &str) -> Context {
-	let key = model.map_or_else(|| Str::new(spec), |model| fmts!("{model}:{spec}"));
+	let key = model.map_or_else(|| Str::new(spec), |model| sf!("{model}:{spec}"));
 	resolve_color(key.as_str()).map_or(ctx, |color| Context { style: ctx.style.fg(color), ..ctx })
 }
 
 fn apply_background(ctx: Context, model: Option<&str>, spec: &str) -> Context {
-	let key = model.map_or_else(|| Str::new(spec), |model| fmts!("{model}:{spec}"));
+	let key = model.map_or_else(|| Str::new(spec), |model| sf!("{model}:{spec}"));
 	resolve_color(key.as_str()).map_or(ctx, |color| Context { style: ctx.style.bg(color), ..ctx })
 }
 
@@ -1340,7 +1340,7 @@ fn parse_expr(src: &str, initial: Context) -> MathBox {
 					}
 					if sub.is_some() || sup.is_some() {
 						flush(&mut inline, &mut boxes, ctx);
-						let command = fmts!("\\{name}");
+						let command = sf!("\\{name}");
 						boxes.push(limits_box(
 							flat_box(command.as_str(), ctx),
 							sub.map(|text| parse_expr(text, ctx)),

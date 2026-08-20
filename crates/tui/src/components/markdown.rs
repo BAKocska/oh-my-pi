@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use super::text::{append, paint_rich, truncate_rich};
 use crate::{
@@ -41,7 +41,7 @@ impl Markdown {
 	}
 
 	/// Creates a Markdown block containing the supplied source.
-	pub fn text_of(text: impl Into<Str>) -> Self {
+	pub fn text_of(text: impl IntoStr) -> Self {
 		Self::new().text(text)
 	}
 
@@ -58,8 +58,8 @@ impl Markdown {
 	}
 
 	/// Appends Markdown source text.
-	pub fn text(mut self, text: impl Into<Str>) -> Self {
-		let text = text.into();
+	pub fn text(mut self, text: impl IntoStr) -> Self {
+		let text = text.into_str();
 		append(&mut self.source, text.clone());
 		append(&mut self.text, text);
 		self.version = self.version.wrapping_add(1);

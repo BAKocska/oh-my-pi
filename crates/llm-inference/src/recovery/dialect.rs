@@ -3,7 +3,7 @@
 use std::fmt;
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::id::WirePolicyId;
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
@@ -237,11 +237,7 @@ fn project_event(
 				let record = RecoveryRecord {
 					attempt,
 					kind: RecoveryKind::DialectNormalization,
-					rule: ReasonId(Str::from(format!(
-						"dialect/{}/{}",
-						wire_policy.as_str(),
-						dialect.rule()
-					))),
+					rule: ReasonId(sf!("dialect/{}/{}", wire_policy.as_str(), dialect.rule())),
 					input_bytes: raw.len() as u64,
 					steps: recovered,
 				};
@@ -375,7 +371,7 @@ fn parse_glm(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
 	)
 	.ok()?;
 	let (name, mut rest) = body.split_once('\n')?;
-	let name = Str::from(name.trim());
+	let name = Str::new(name.trim());
 	if name.is_empty() {
 		return None;
 	}
@@ -424,7 +420,7 @@ fn python_calls(body: &[u8]) -> Vec<(Str, Map<String, Value>)> {
 			break;
 		};
 		if let Some(args) = parse_python_arguments(&text[name_end + 1..end]) {
-			calls.push((Str::from(&text[start..name_end]), args));
+			calls.push((Str::new(&text[start..name_end]), args));
 		}
 		at = end + 1;
 	}
@@ -543,7 +539,7 @@ fn parse_gemma(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
 	if !body[end + 1..].trim().is_empty() {
 		return None;
 	}
-	let name = Str::from(body[..brace].trim());
+	let name = Str::new(body[..brace].trim());
 	let args = parse_gemma_object(&body[brace + 1..end])?;
 	Some(((!name.is_empty()).then_some(name), Bytes::from(serde_json::to_vec(&args).ok()?)))
 }
@@ -686,7 +682,7 @@ fn parse_xml(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
 		);
 		rest = after;
 	}
-	Some((Some(Str::from(name)), Bytes::from(serde_json::to_vec(&args).ok()?)))
+	Some((Some(Str::new(name)), Bytes::from(serde_json::to_vec(&args).ok()?)))
 }
 
 fn split_top_level(text: &str, separator: u8) -> Option<Vec<&str>> {

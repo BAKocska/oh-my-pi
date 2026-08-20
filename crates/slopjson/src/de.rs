@@ -105,7 +105,7 @@ impl<'de> Deserializer<'de> {
 		if let Some(quote @ (b'"' | b'\'')) = self.p.peek() {
 			match self.p.string(quote)? {
 				CowStr::Borrowed(key) => {
-					let path_key = Str::from(key);
+					let path_key = Str::new(key);
 					self
 						.p
 						.retarget_repairs_from(start, RepairPathSegment::Key(path_key.clone()));
@@ -113,7 +113,7 @@ impl<'de> Deserializer<'de> {
 					seed.deserialize(BorrowedStrDeserializer::<ParseError>::new(key))
 				},
 				CowStr::Owned(key) => {
-					let path_key = Str::from(key.as_str());
+					let path_key = Str::new(key.as_str());
 					self
 						.p
 						.retarget_repairs_from(start, RepairPathSegment::Key(path_key.clone()));
@@ -126,7 +126,7 @@ impl<'de> Deserializer<'de> {
 			if key.is_empty() {
 				return Err(ParseError::ExpectedKey(start));
 			}
-			let path_key = Str::from(key);
+			let path_key = Str::new(key);
 			self
 				.p
 				.retarget_repairs_from(start, RepairPathSegment::Key(path_key.clone()));

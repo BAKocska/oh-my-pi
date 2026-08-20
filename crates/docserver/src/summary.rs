@@ -6,7 +6,7 @@ use omp_ast::{
 	SupportLang,
 	summary::{SummaryResult as AstSummary, SummarySettings as AstSettings, summarize_source},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::{Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -356,9 +356,9 @@ fn infer_language(language: Option<&str>, path: &Path) -> Option<Str> {
 		.map(str::trim)
 		.filter(|language| !language.is_empty())
 	{
-		return SupportLang::from_alias(language).map(|lang| Str::new_static(lang.canonical_name()));
+		return SupportLang::from_alias(language).map(|lang| sf!(lang.canonical_name()));
 	}
-	SupportLang::from_path(path).map(|lang| Str::new_static(lang.canonical_name()))
+	SupportLang::from_path(path).map(|lang| sf!(lang.canonical_name()))
 }
 
 fn is_prose_summary_path(path: &Path) -> bool {

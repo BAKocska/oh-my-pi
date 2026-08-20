@@ -19,7 +19,7 @@ use std::{
 
 use bytes::Bytes;
 use flume::{Receiver, TryRecvError};
-use omp_core::{CowBytes, Principal, Provenance, Str, base64, hex};
+use omp_core::{CowBytes, IntoStr, Principal, Provenance, Str, base64, hex, sf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -1230,7 +1230,7 @@ fn replay_file(path: &Path, replay: &mut ReplayState) -> Result<(), Error> {
 			return corrupt(number, "record checksum mismatch");
 		}
 		let canonical = serde_json::to_vec(&RecordEnvelope {
-			codec:    Str::new_static(CODEC),
+			codec:    sf!(CODEC),
 			body:     envelope.body,
 			checksum: envelope.checksum.clone(),
 		})?;
@@ -1362,7 +1362,7 @@ fn persist(state: &mut StoreState, body: &RecordBody) -> Result<Str, Error> {
 	let encoded_body = serde_json::to_vec(body)?;
 	let checksum = checksum(&encoded_body);
 	let envelope = RecordEnvelope {
-		codec:    Str::new_static(CODEC),
+		codec:    sf!(CODEC),
 		body:     RecordBody {
 			scope:              body.scope.clone(),
 			namespace:          body.namespace.clone(),
@@ -1540,9 +1540,9 @@ fn validate_key(label: &'static str, value: &str) -> Result<(), Error> {
 }
 
 const fn corrupt<T>(line: u64, reason: &'static str) -> Result<T, Error> {
-	Err(Error::CorruptRecord { line, reason: Str::new_static(reason) })
+	Err(Error::CorruptRecord { line, reason: sf!(reason) })
 }
 
-fn corrupt_error(line: u64, reason: impl Into<Str>) -> Error {
-	Error::CorruptRecord { line, reason: reason.into() }
+fn corrupt_error(line: u64, reason: impl IntoStr) -> Error {
+	Error::CorruptRecord { line, reason: reason.into_str() }
 }

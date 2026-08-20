@@ -7,7 +7,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 use crate::{
 	call::{Call, ContentPart, OperationCall, Role, Target},
@@ -356,7 +356,7 @@ impl Router {
 		let Some(primary) = request.selection.primary_model() else {
 			return Err(Error::planning(
 				ErrorKind::InvalidRequest,
-				ErrorDetail::target(Str::from("model-less-target-requires-service-planning")),
+				ErrorDetail::target(sf!("model-less-target-requires-service-planning")),
 				ExecutionReceipt::default(),
 			));
 		};
@@ -731,14 +731,14 @@ fn push_setting<T>(
 		crate::call::Setting::Prefer(_) => crate::plan::RequirementStrength::Preferred,
 	};
 	output.push(CapabilityRequirement {
-		feature: crate::receipt::FeatureId(Str::from(feature)),
+		feature: crate::receipt::FeatureId(Str::new(feature)),
 		strength,
 	});
 }
 
 fn push_required(output: &mut Vec<CapabilityRequirement>, feature: &'static str) {
 	output.push(CapabilityRequirement {
-		feature:  crate::receipt::FeatureId(Str::from(feature)),
+		feature:  crate::receipt::FeatureId(Str::new(feature)),
 		strength: crate::plan::RequirementStrength::Required,
 	});
 }
@@ -816,7 +816,7 @@ fn catalog_capability_evidence(
 	crate::plan::CapabilityEvidence {
 		feature: requirement.feature.clone(),
 		availability,
-		reason: ReasonId(Str::from("catalog-capability-evidence")),
+		reason: ReasonId(sf!("catalog-capability-evidence")),
 	}
 }
 
@@ -1160,7 +1160,7 @@ fn target_not_found(target: &Target) -> Error {
 	};
 	Error::planning(
 		ErrorKind::TargetNotFound,
-		ErrorDetail::target(Str::from(selector)),
+		ErrorDetail::target(Str::new(selector)),
 		ExecutionReceipt::default(),
 	)
 }
@@ -1168,7 +1168,7 @@ fn target_not_found(target: &Target) -> Error {
 fn target_route_not_found(route: &RouteId) -> Error {
 	Error::planning(
 		ErrorKind::TargetNotFound,
-		ErrorDetail::target(Str::from(route.as_str())),
+		ErrorDetail::target(Str::new(route.as_str())),
 		ExecutionReceipt::default(),
 	)
 }
@@ -1176,7 +1176,7 @@ fn target_route_not_found(route: &RouteId) -> Error {
 fn capability_error(kind: ErrorKind, operation: OperationKind, reason: &'static str) -> Error {
 	Error::planning(
 		kind,
-		ErrorDetail::capability(Str::from(operation.to_string()), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(operation.to_string()), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -1184,7 +1184,7 @@ fn capability_error(kind: ErrorKind, operation: OperationKind, reason: &'static 
 fn route_contract_error(route: &RouteId, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::RouteUnavailable,
-		ErrorDetail::capability(Str::from(route.as_str()), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(route.as_str()), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 	.route(route.clone())
@@ -1285,7 +1285,7 @@ mod tests {
 			}
 			messages.push(Message {
 				role:    Role::User,
-				content: Arc::from([ContentPart::Text { text: Str::from("continue"), proof: None }]),
+				content: Arc::from([ContentPart::Text { text: sf!("continue"), proof: None }]),
 				name:    None,
 			});
 			OperationCall::Chat(Arc::new(ChatRequest {
@@ -1305,9 +1305,8 @@ mod tests {
 				negotiation:       NegotiationPolicy::default(),
 			}))
 		};
-		let signed =
-			vec![ContentPart::Reasoning { text: Str::from("signed plan"), proof: Some(proof) }];
-		let unsigned = vec![ContentPart::Text { text: Str::from("plain answer"), proof: None }];
+		let signed = vec![ContentPart::Reasoning { text: sf!("signed plan"), proof: Some(proof) }];
+		let unsigned = vec![ContentPart::Text { text: sf!("plain answer"), proof: None }];
 
 		// Signed latest assistant binds same-provider Anthropic candidates.
 		let bound = chat(signed.clone(), None);

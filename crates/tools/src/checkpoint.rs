@@ -4,7 +4,7 @@ use std::{fmt, future::Future};
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
 	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -130,9 +130,9 @@ pub fn tools<C: CheckpointControl>(control: C) -> (Checkpoint<C>, Rewind<C>) {
 
 fn spec(name: &'static str, description: &'static str, schema: bytes::Bytes) -> ToolSpec {
 	ToolSpec {
-		name: Str::new_static(name),
-		rev: Rev { family: Str::new_static(""), n: 1 },
-		description: Str::new_static(description),
+		name: sf!(name),
+		rev: Rev { family: Default::default(), n: 1 },
+		description: sf!(description),
 		schema,
 		constraint: Constraint::Schema {
 			priority:       255,
@@ -177,7 +177,7 @@ impl<C: CheckpointControl> Tool for Checkpoint<C> {
 		vec![Part::Text {
 			text: match view {
 				Ok(payload) => {
-					Str::from(format!("Checkpoint {} created for: {}", payload.checkpoint, payload.goal))
+					sf!("Checkpoint {} created for: {}", payload.checkpoint, payload.goal)
 				},
 				Err(fault) => fault.message.clone(),
 			},
@@ -214,10 +214,11 @@ impl<C: CheckpointControl> Tool for Rewind<C> {
 	fn prompt(&self, view: Result<&RewindPayload, &Fault>, _: &PromptCaps) -> Vec<Part> {
 		vec![Part::Text {
 			text: match view {
-				Ok(payload) => Str::from(format!(
+				Ok(payload) => sf!(
 					"Rewind to checkpoint {} scheduled at turn boundary (receipt {}).",
-					payload.target, payload.receipt
-				)),
+					payload.target,
+					payload.receipt
+				),
 				Err(fault) => fault.message.clone(),
 			},
 		}]
@@ -225,7 +226,7 @@ impl<C: CheckpointControl> Tool for Rewind<C> {
 }
 
 fn fault(message: &'static str) -> Fault {
-	Fault { message: Str::new_static(message) }
+	Fault { message: sf!(message) }
 }
 const fn done_checkpoint(
 	result: Result<CheckpointPayload, Fault>,
@@ -262,7 +263,7 @@ fn commit_event<P>(error: CommitError) -> Ev<Update, P, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
 		example:  None,
 		found:    Some(message),
@@ -285,7 +286,7 @@ mod tests {
 			target: u64,
 			_: Str,
 		) -> impl Future<Output = Result<RewindAck, Str>> + Send {
-			std::future::ready(Ok(RewindAck { target, receipt: Str::new_static("rewind-1") }))
+			std::future::ready(Ok(RewindAck { target, receipt: sf!("rewind-1") }))
 		}
 	}
 

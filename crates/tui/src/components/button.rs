@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use super::radio::pill;
 use crate::{
@@ -47,8 +47,8 @@ impl Button {
 	}
 
 	/// Sets the button's text child.
-	pub fn child(mut self, label: impl Into<Str>) -> Self {
-		let label = label.into();
+	pub fn child(mut self, label: impl IntoStr) -> Self {
+		let label = label.into_str();
 		if self.label.is_empty() {
 			self.label = label;
 		} else {
@@ -198,7 +198,7 @@ mod tests {
 		let mut plain = Button::new().with(Prop::Id, "again").child("Again");
 		assert_eq!(
 			plain.key(&mut event_ctx(&ctx), Key::Enter),
-			Flow::Event(UiEvent::Pressed(Str::from("again")))
+			Flow::Event(UiEvent::Pressed(sf!("again")))
 		);
 	}
 

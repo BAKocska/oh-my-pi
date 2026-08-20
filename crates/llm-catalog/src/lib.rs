@@ -45,6 +45,8 @@ mod tests {
 		hash::{Hash, Hasher},
 	};
 
+	use omp_core::IntoStr;
+
 	use super::*;
 
 	#[test]
@@ -116,8 +118,8 @@ mod tests {
 		assert_eq!(decoded, capability);
 
 		let endpoint = EndpointSpec {
-			base_url: "https://example.test/v1".into(),
-			region:   Some("test-1".into()),
+			base_url: "https://example.test/v1".to_str(),
+			region:   Some("test-1".to_str()),
 		};
 		let encoded = serde_json::to_vec(&endpoint).expect("record serializes");
 		let decoded: EndpointSpec = serde_json::from_slice(&encoded).expect("record deserializes");
@@ -129,17 +131,17 @@ mod tests {
 		let oauth_id = OAuthSpecId::from("oauth-test");
 		let oauth = OAuthSpec {
 			id:                   oauth_id.clone(),
-			client_id:            "public-client".into(),
-			token_url:            "https://auth.example.test/token".into(),
-			scopes:               Box::from(["profile".into(), "offline_access".into()]),
-			audience:             Some("https://api.example.test".into()),
+			client_id:            "public-client".to_str(),
+			token_url:            "https://auth.example.test/token".to_str(),
+			scopes:               Box::from(["profile".to_str(), "offline_access".to_str()]),
+			audience:             Some("https://api.example.test".to_str()),
 			placement:            OAuthTokenPlacement::Header {
-				name:   "authorization".into(),
-				prefix: "Bearer ".into(),
+				name:   "authorization".to_str(),
+				prefix: "Bearer ".to_str(),
 			},
 			token_parameters:     Box::new([]),
 			flow:                 OAuthFlowSpec::DeviceCode {
-				device_authorization_url: "https://auth.example.test/device".into(),
+				device_authorization_url: "https://auth.example.test/device".to_str(),
 				polling:                  OAuthPollingSpec {
 					maximum_polls:       60,
 					default_interval_ms: 5_000,
@@ -147,7 +149,9 @@ mod tests {
 				},
 			},
 			refresh:              OAuthRefreshBehavior::TokenEndpoint,
-			principal_resolution: Some(PrincipalResolution::IdTokenClaim { claim: "sub".into() }),
+			principal_resolution: Some(PrincipalResolution::IdTokenClaim {
+				claim: "sub".to_str(),
+			}),
 		};
 		let encoded = serde_json::to_vec(&oauth).expect("OAuth spec serializes");
 		let decoded: OAuthSpec = serde_json::from_slice(&encoded).expect("OAuth spec deserializes");
@@ -155,7 +159,7 @@ mod tests {
 
 		let sources: Box<[CredentialSourceSpec]> = Box::from([
 			CredentialSourceSpec::Environment {
-				ordered_names: Box::from(["OMP_TOKEN".into(), "OMP_TOKEN_FALLBACK".into()]),
+				ordered_names: Box::from(["OMP_TOKEN".to_str(), "OMP_TOKEN_FALLBACK".to_str()]),
 			},
 			CredentialSourceSpec::Stored,
 			CredentialSourceSpec::Oauth { flow: oauth_id.clone() },
@@ -168,12 +172,12 @@ mod tests {
 		let auth = AuthSpec {
 			id:                 AuthSpecId::from("auth-test"),
 			kind:               AuthSpecKind::Oauth,
-			header_name:        Some("authorization".into()),
+			header_name:        Some("authorization".to_str()),
 			query_parameter:    None,
-			prefix:             Some("Bearer ".into()),
+			prefix:             Some("Bearer ".to_str()),
 			sealed_body:        None,
-			scopes:             Box::from(["profile".into()]),
-			audience:           Some("https://api.example.test".into()),
+			scopes:             Box::from(["profile".to_str()]),
+			audience:           Some("https://api.example.test".to_str()),
 			account_scope:      AccountScope::Provider,
 			credential_sources: sources,
 			oauth:              Some(oauth_id),

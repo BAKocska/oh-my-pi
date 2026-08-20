@@ -313,10 +313,10 @@ impl ClientState {
 		}
 		if value.get("type").and_then(Value::as_str) == Some("response") {
 			let response: RpcResponse = serde_json::from_value(value)?;
-			if let Some(id) = response.id.clone() {
-				if let Some(sender) = self.pending.lock().await.remove(&id) {
-					let _ = sender.send(Ok(response));
-				}
+			if let Some(id) = response.id.clone()
+				&& let Some(sender) = self.pending.lock().await.remove(&id)
+			{
+				let _ = sender.send(Ok(response));
 			}
 			return Ok(());
 		}
@@ -402,8 +402,7 @@ impl ClientState {
 				.lock()
 				.await
 				.remove(&invocation_id)
-				.map(|sender| *sender.borrow())
-				.unwrap_or(true);
+				.is_none_or(|sender| *sender.borrow());
 			if cancelled {
 				return;
 			}
@@ -1174,14 +1173,11 @@ impl RpcClient {
 			Some(child) => child,
 			None => return Ok(()),
 		};
-		match tokio::time::timeout(self.termination_grace, child.wait()).await {
-			Ok(status) => {
-				status?;
-			},
-			Err(_) => {
-				child.start_kill()?;
-				child.wait().await?;
-			},
+		if let Ok(status) = tokio::time::timeout(self.termination_grace, child.wait()).await {
+			status?;
+		} else {
+			child.start_kill()?;
+			child.wait().await?;
 		}
 		self.reader_task.abort();
 		self.writer_task.abort();

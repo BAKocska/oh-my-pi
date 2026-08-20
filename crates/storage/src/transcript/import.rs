@@ -4,7 +4,7 @@
 //! diagnostics while later complete records retain their source line identity.
 
 use chrono::{DateTime, Utc};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::Value;
 
 use super::{
@@ -81,10 +81,7 @@ impl ImportedTranscript {
 				.map_or_else(|| entry.source_line.to_string(), ToOwned::to_owned);
 			events.push(Event {
 				ts,
-				kind: Kind::Label {
-					target,
-					label: Some(Str::from(format!("imported:{}:{id}", format.marker()))),
-				},
+				kind: Kind::Label { target, label: Some(sf!("imported:{}:{id}", format.marker())) },
 			});
 		}
 		events
@@ -106,8 +103,8 @@ pub fn parse_foreign_jsonl(format: ForeignFormat, input: &str) -> ImportedTransc
 			Err(error) => {
 				output.diagnostics.push(ImportDiagnostic {
 					line:   source_line,
-					code:   Str::new_static("invalid_json"),
-					reason: Str::from(error.to_string()),
+					code:   sf!("invalid_json"),
+					reason: Str::new(error.to_string()),
 				});
 				continue;
 			},
@@ -117,7 +114,7 @@ pub fn parse_foreign_jsonl(format: ForeignFormat, input: &str) -> ImportedTransc
 			Ok(None) => {},
 			Err(reason) => output.diagnostics.push(ImportDiagnostic {
 				line: source_line,
-				code: Str::new_static("invalid_message"),
+				code: sf!("invalid_message"),
 				reason,
 			}),
 		}
@@ -132,12 +129,12 @@ fn parse_record(
 ) -> Result<Option<ImportedEntry>, Str> {
 	let object = value
 		.as_object()
-		.ok_or_else(|| Str::new_static("record is not an object"))?;
+		.ok_or_else(|| sf!("record is not an object"))?;
 	let source_id = object
 		.get("uuid")
 		.or_else(|| object.get("id"))
 		.and_then(Value::as_str)
-		.map(Str::from);
+		.map(Str::new);
 	let ts = parse_timestamp(object.get("timestamp")).unwrap_or_default();
 	let message = match format {
 		ForeignFormat::ClaudeCode => parse_claude(value)?,
@@ -221,10 +218,10 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 			return Ok(Some(assistant_message(
 				vec![Block {
 					kind: BlockKind::Tool {
-						id:   CallId(Str::from(id)),
-						name: Str::from(name),
+						id:   CallId(Str::new(id)),
+						name: Str::new(name),
 						wire: None,
-						args: Str::from(args),
+						args: Str::new(args),
 					},
 					re:   None,
 				}],
@@ -243,9 +240,9 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 					.map_or_else(|| value.to_string(), ToOwned::to_owned)
 			});
 			return Ok(Some(Msg::ToolResult {
-				call:          CallId(Str::from(call)),
-				tool:          Str::new_static("unknown"),
-				content:       vec![UserBlock::Text { text: Str::from(output) }],
+				call:          CallId(Str::new(call)),
+				tool:          sf!("unknown"),
+				content:       vec![UserBlock::Text { text: Str::new(output) }],
 				details:       None,
 				error:         false,
 				useless:       false,
@@ -264,9 +261,9 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 fn claude_assistant_block(part: &Value) -> Option<Block> {
 	let object = part.as_object()?;
 	let kind = match object.get("type").and_then(Value::as_str)? {
-		"text" => BlockKind::Text { text: Str::from(object.get("text")?.as_str()?) },
+		"text" => BlockKind::Text { text: Str::new(object.get("text")?.as_str()?) },
 		"thinking" => BlockKind::Think {
-			text: Str::from(
+			text: Str::new(
 				object
 					.get("thinking")
 					.or_else(|| object.get("text"))?
@@ -278,10 +275,10 @@ fn claude_assistant_block(part: &Value) -> Option<Block> {
 				.get("input")
 				.map_or_else(|| "{}".to_owned(), Value::to_string);
 			BlockKind::Tool {
-				id:   CallId(Str::from(object.get("id")?.as_str()?)),
-				name: Str::from(object.get("name")?.as_str()?),
+				id:   CallId(Str::new(object.get("id")?.as_str()?)),
+				name: Str::new(object.get("name")?.as_str()?),
 				wire: None,
-				args: Str::from(input),
+				args: Str::new(input),
 			}
 		},
 		_ => return None,
@@ -293,9 +290,9 @@ fn assistant_message(blocks: Vec<Block>, provider: &str, model: Option<&Value>) 
 	Msg::Assistant {
 		content:     blocks,
 		model:       ModelRef {
-			provider: ProviderId(Str::from(provider)),
-			api:      Str::from(provider),
-			model:    ModelId(Str::from(model.and_then(Value::as_str).unwrap_or("imported"))),
+			provider: ProviderId(Str::new(provider)),
+			api:      Str::new(provider),
+			model:    ModelId(Str::new(model.and_then(Value::as_str).unwrap_or("imported"))),
 		},
 		stop:        Stop::EndTurn,
 		usage:       Usage::default(),
@@ -316,8 +313,7 @@ fn parse_message(
 	if texts.is_empty() {
 		return Ok(None);
 	}
-	let imported =
-		Some(Attribution { source: Str::from(format!("imported.{provider}")), id: None });
+	let imported = Some(Attribution { source: sf!("imported.{provider}"), id: None });
 	match role {
 		"user" => Ok(Some(Msg::User {
 			content:     texts
@@ -349,12 +345,12 @@ fn parse_message(
 
 fn extract_text(content: Option<&Value>) -> Vec<Str> {
 	match content {
-		Some(Value::String(text)) => vec![Str::from(text.as_str())],
+		Some(Value::String(text)) => vec![Str::new(text.as_str())],
 		Some(Value::Array(parts)) => parts
 			.iter()
 			.flat_map(|part| {
 				if let Some(text) = part.as_str() {
-					return vec![Str::from(text)];
+					return vec![Str::new(text)];
 				}
 				let Some(object) = part.as_object() else {
 					return Vec::new();
@@ -364,7 +360,7 @@ fn extract_text(content: Option<&Value>) -> Vec<Str> {
 					return object
 						.get("text")
 						.and_then(Value::as_str)
-						.map_or_else(Vec::new, |text| vec![Str::from(text)]);
+						.map_or_else(Vec::new, |text| vec![Str::new(text)]);
 				}
 				if kind == "tool_result" {
 					return extract_text(object.get("content"));

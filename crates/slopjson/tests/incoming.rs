@@ -1,6 +1,7 @@
 //! Behavioral coverage for the growing-document cursor.
 
 use futures::{FutureExt, executor::block_on};
+use omp_core::sf;
 use omp_slopjson::{
 	IncomingDoc, IncomingError, PullIssueKind, PullMode, PullPathSegment, PulledKind, RepairKind,
 	Str, Value, json, parse,
@@ -290,10 +291,7 @@ fn pulled_string_does_not_swallow_a_sibling_through_quote_recovery() {
 	let (mut feed, mut args) = IncomingDoc::channel();
 	feed.push(text).unwrap();
 	feed.finish();
-	assert_eq!(
-		block_on(args.json().object().key("a").string().finish()).unwrap(),
-		Str::from("x' 'y")
-	);
+	assert_eq!(block_on(args.json().object().key("a").string().finish()).unwrap(), sf!("x' 'y"));
 }
 
 #[test]
@@ -308,7 +306,7 @@ fn truncated_string_has_distinct_incomplete_end() {
 	let IncomingError::Pull(issue) = error else {
 		panic!("expected structured pull issue")
 	};
-	assert_eq!(issue.path, vec![PullPathSegment::Key(Str::from("message"))]);
+	assert_eq!(issue.path, vec![PullPathSegment::Key(sf!("message"))]);
 	assert_eq!(issue.expected, "string");
 	assert_eq!(issue.kind, PullIssueKind::Incomplete);
 }
@@ -330,7 +328,7 @@ fn pulling_defines_required_keys_and_unpulled_members_are_ignored() {
 	feed.push("{path:'ok', unknown:[unfinished").unwrap();
 	feed.finish();
 	let path = block_on(params.json().object().key("path").string().finish()).unwrap();
-	assert_eq!(path, Str::from("ok"));
+	assert_eq!(path, sf!("ok"));
 	assert!(matches!(block_on(params.whole::<Value>()), Err(IncomingError::Parse(_))));
 
 	let (mut feed, mut params) = IncomingDoc::channel();
@@ -340,7 +338,7 @@ fn pulling_defines_required_keys_and_unpulled_members_are_ignored() {
 	let IncomingError::Pull(missing) = missing else {
 		panic!("expected structured pull issue")
 	};
-	assert_eq!(missing.path, vec![PullPathSegment::Key(Str::from("missing"))]);
+	assert_eq!(missing.path, vec![PullPathSegment::Key(sf!("missing"))]);
 	assert_eq!(missing.expected, "value");
 	assert_eq!(missing.kind, PullIssueKind::Missing);
 
@@ -348,7 +346,7 @@ fn pulling_defines_required_keys_and_unpulled_members_are_ignored() {
 	let IncomingError::Pull(mistyped) = mistyped else {
 		panic!("expected structured pull issue")
 	};
-	assert_eq!(mistyped.path, vec![PullPathSegment::Key(Str::from("path"))]);
+	assert_eq!(mistyped.path, vec![PullPathSegment::Key(sf!("path"))]);
 	assert_eq!(mistyped.expected, "number");
 	assert_eq!(mistyped.kind, PullIssueKind::TypeMismatch { found: "string" });
 
@@ -369,8 +367,8 @@ fn pulling_defines_required_keys_and_unpulled_members_are_ignored() {
 		panic!("expected structured pull issue")
 	};
 	assert_eq!(mistyped.path, vec![
-		PullPathSegment::Key(Str::from("meta")),
-		PullPathSegment::Key(Str::from("count")),
+		PullPathSegment::Key(sf!("meta")),
+		PullPathSegment::Key(sf!("count")),
 	]);
 	assert_eq!(mistyped.expected, "number");
 	assert_eq!(mistyped.kind, PullIssueKind::TypeMismatch { found: "string" });
@@ -418,7 +416,7 @@ fn typed_subtree_pull_is_path_scoped() {
 	let IncomingError::Pull(issue) = error else {
 		panic!("expected structured pull issue")
 	};
-	assert_eq!(issue.path, vec![PullPathSegment::Key(Str::from("payload"))]);
+	assert_eq!(issue.path, vec![PullPathSegment::Key(sf!("payload"))]);
 	assert_eq!(issue.expected, std::any::type_name::<Payload>());
 	assert_eq!(issue.kind, PullIssueKind::Malformed);
 }
@@ -462,7 +460,7 @@ fn finished_and_aborted_are_distinct_terminal_states() {
 	let IncomingError::Pull(issue) = error else {
 		panic!("expected structured pull issue")
 	};
-	assert_eq!(issue.path, vec![PullPathSegment::Key(Str::from("missing"))]);
+	assert_eq!(issue.path, vec![PullPathSegment::Key(sf!("missing"))]);
 	assert_eq!(issue.expected, "value");
 	assert_eq!(issue.kind, PullIssueKind::Aborted);
 	assert!(matches!(block_on(doc.whole::<Value>()), Err(IncomingError::Aborted)));
@@ -473,8 +471,8 @@ fn path_cursor_rounds_lines_and_reports_the_alias_that_matched() {
 	let (mut feed, doc) = IncomingDoc::channel();
 	let cursor = doc.cursor();
 	let mut names = SmallVec::<Str, 4>::new();
-	names.push(Str::from("message"));
-	names.push(Str::from("text"));
+	names.push(sf!("message"));
+	names.push(sf!("text"));
 	let path = [PullPathSegment::Keys(names)];
 
 	feed.push("{\"text\":\"a\\nb").unwrap();
@@ -509,8 +507,8 @@ fn finished_object_key_scan_preserves_alias_collisions_and_duplicates() {
 	feed.finish();
 
 	let mut names = SmallVec::<Str, 4>::new();
-	names.push(Str::from("path"));
-	names.push(Str::from("file"));
+	names.push(sf!("path"));
+	names.push(sf!("file"));
 	let pulled =
 		block_on(cursor.pull_at(&[PullPathSegment::Keys(names)], PullMode::Complete, "number"))
 			.unwrap();
@@ -521,7 +519,7 @@ fn finished_object_key_scan_preserves_alias_collisions_and_duplicates() {
 	));
 
 	let keys = block_on(cursor.object_keys(&[])).unwrap();
-	assert_eq!(keys.as_slice(), [Str::from("path"), Str::from("file"), Str::from("path")]);
+	assert_eq!(keys.as_slice(), [sf!("path"), sf!("file"), sf!("path")]);
 }
 
 #[test]
@@ -553,7 +551,7 @@ fn parser_repairs_are_lossless_and_strict_json_stays_empty() {
 	}
 	assert!(repairs.iter().any(|repair| {
 		repair.kind == RepairKind::SingleQuotedString
-			&& repair.path.as_slice() == [omp_slopjson::RepairPathSegment::Key(Str::from("unquoted"))]
+			&& repair.path.as_slice() == [omp_slopjson::RepairPathSegment::Key(sf!("unquoted"))]
 	}));
 	drop(repairs);
 

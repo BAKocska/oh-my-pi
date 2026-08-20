@@ -392,7 +392,7 @@ fn repetition_error(
 		context.receipt(),
 	)
 	.committed(context.is_committed())
-	.detail(ErrorDetail::protocol(ReasonId("reasoning.loop-detected".into())))
+	.detail(ErrorDetail::protocol(ReasonId::new_static("reasoning.loop-detected")))
 }
 
 fn observe_empty(
@@ -450,7 +450,7 @@ fn finish_empty(
 	Err(
 		Error::new(kind, ErrorPhase::Recovery, action, context.receipt())
 			.committed(context.is_committed())
-			.detail(ErrorDetail::protocol(ReasonId(reason.into()))),
+			.detail(ErrorDetail::protocol(ReasonId::new(reason))),
 	)
 }
 
@@ -504,7 +504,7 @@ fn structured_error(reason: &'static str, context: &crate::layer::ExecutionConte
 		context.receipt(),
 	)
 	.committed(context.is_committed())
-	.detail(ErrorDetail::protocol(ReasonId(reason.into())))
+	.detail(ErrorDetail::protocol(ReasonId::new(reason)))
 }
 fn finalize_completion(
 	terminal: RawCompletion,
@@ -659,7 +659,7 @@ fn recovery_error(reason: &'static str, context: &crate::layer::ExecutionContext
 		context.receipt(),
 	)
 	.committed(context.is_committed())
-	.detail(ErrorDetail::protocol(ReasonId(reason.into())))
+	.detail(ErrorDetail::protocol(ReasonId::new(reason)))
 }
 
 #[cfg(test)]

@@ -106,14 +106,14 @@ fn malformed_pickle_and_json_headers_are_recoverable_errors() {
 			bytes
 		},
 		{
-			let mut bytes = valid.clone();
+			let mut bytes = valid;
 			bytes.truncate(16);
 			bytes
 		},
 	] {
 		assert!(matches!(
 			Archive::from_bytes_with_format(&bytes, Format::Asar),
-			Err(Error::InvalidArchive(_)) | Err(Error::Io(_))
+			Err(Error::InvalidArchive(_) | Error::Io(_))
 		));
 	}
 }

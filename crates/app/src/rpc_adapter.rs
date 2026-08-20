@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _, stream};
 use im::OrdMap;
 use omp_agent::{empty_stop, project_thread_history};
-use omp_core::{Str, encoding::hex};
+use omp_core::{Str, encoding::hex, sf};
 use omp_llm_catalog::{
 	Availability, GrammarBits, ModalityBits, ModelAvailability, ModelKey, ModelSpec, OperationKind,
 	ProviderDef, ProviderId,
@@ -1752,7 +1752,7 @@ fn media_input(blob: &thread_pb::Blob) -> Result<MediaInput, Status> {
 	}
 	let id = hex::encode(&blob.hash).into_string();
 	Ok(MediaInput::Stored(omp_llm_inference::answer::ArtifactRef {
-		store:    Str::from("omp-rpc-blobs"),
+		store:    sf!("omp-rpc-blobs"),
 		id:       id.as_str().into(),
 		revision: id.as_str().into(),
 	}))
@@ -3139,7 +3139,7 @@ mod tests {
 			.find(|model| model.capabilities.chat.is_some())
 			.expect("embedded chat model")
 			.clone();
-		model.display_name = Str::new_static("Fixture Display");
+		model.display_name = sf!("Fixture Display");
 		model.limits.context_window = Some(1_000_000);
 		model.limits.maximum_output_tokens = Some(128_000);
 		let chat = model
@@ -3167,14 +3167,14 @@ mod tests {
 			RecoveryRecord {
 				attempt:     2,
 				kind:        RecoveryKind::SessionReseed,
-				rule:        ReasonId(Str::new_static("expired-session")),
+				rule:        ReasonId(sf!("expired-session")),
 				input_bytes: 128,
 				steps:       1,
 			},
 			RecoveryRecord {
 				attempt:     3,
 				kind:        RecoveryKind::JsonRepair,
-				rule:        ReasonId(Str::new_static("bounded-json-repair")),
+				rule:        ReasonId(sf!("bounded-json-repair")),
 				input_bytes: 64,
 				steps:       2,
 			},
@@ -3226,7 +3226,7 @@ mod tests {
 		receipt.recoveries.push(RecoveryRecord {
 			attempt:     1,
 			kind:        RecoveryKind::SessionReseed,
-			rule:        ReasonId(Str::new_static("Fork")),
+			rule:        ReasonId(sf!("Fork")),
 			input_bytes: 0,
 			steps:       1,
 		});
@@ -3355,7 +3355,7 @@ mod tests {
 			ExecutionReceipt::default(),
 		)
 		.provider(ProviderId::from("kimi-code"))
-		.detail(ErrorDetail::provider(Str::from("device authorization expired")));
+		.detail(ErrorDetail::provider(sf!("device authorization expired")));
 		let Some(pb::turn_event::Event::Error(error)) = inference_turn_error(authentication).event
 		else {
 			panic!("authentication failure must project a turn error");

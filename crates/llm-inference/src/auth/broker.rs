@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use futures::future::{BoxFuture, FutureExt as _};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{AuthSpecId, Catalog, provider::AuthSpecKind};
 use secrecy::SecretString;
 
@@ -210,7 +210,7 @@ impl CredentialBroker {
 				CredentialKind::SessionToken => CredentialLease::session_token(meta, secret),
 				CredentialKind::AwsSigV4 => return Err(CredentialError::InvalidSource),
 			};
-			return Ok(lease.with_source_tag(ENVIRONMENT_TAG.into()));
+			return Ok(lease.with_source_tag(sf!(ENVIRONMENT_TAG)));
 		}
 		Err(CredentialError::Unavailable)
 	}
@@ -238,7 +238,7 @@ impl CredentialBroker {
 		if lease.is_expired_at(need.valid_after) {
 			return Err(CredentialError::Expired);
 		}
-		Ok(lease.with_source_tag(tag.into()))
+		Ok(lease.with_source_tag(Str::new(tag)))
 	}
 }
 
@@ -392,7 +392,7 @@ mod tests {
 			plans:       Arc::new(BTreeMap::from([(spec.clone(), BrokerPlan {
 				kind:    CredentialKind::ApiKey,
 				sources: vec![BrokerSource::Environment(
-					vec![Str::from("OMP_FIRST"), Str::from("OMP_SECOND")].into_boxed_slice(),
+					vec![sf!("OMP_FIRST"), sf!("OMP_SECOND")].into_boxed_slice(),
 				)]
 				.into_boxed_slice(),
 			})])),
@@ -409,7 +409,7 @@ mod tests {
 			.await
 			.expect("second source");
 		assert_eq!(lease.kind(), CredentialKind::ApiKey);
-		assert_eq!(*environment.calls.lock(), vec![Str::from("OMP_FIRST"), Str::from("OMP_SECOND")]);
+		assert_eq!(*environment.calls.lock(), vec![sf!("OMP_FIRST"), sf!("OMP_SECOND")]);
 		assert!(!format!("{broker:?} {lease:?}").contains("secret"));
 	}
 }

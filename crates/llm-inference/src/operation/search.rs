@@ -9,7 +9,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use tower::Service;
 
 use crate::{
@@ -266,8 +266,8 @@ pub fn plan_search(
 			if request.negotiation.vendor_option_mismatch == MismatchPolicy::DropPreferred =>
 		{
 			adjustments.push(Adjustment::Dropped {
-				feature: FeatureId(Str::from("search.answer_synthesis")),
-				reason:  ReasonId(Str::from("answer_synthesis_unsupported")),
+				feature: FeatureId(sf!("search.answer_synthesis")),
+				reason:  ReasonId(sf!("answer_synthesis_unsupported")),
 			});
 			(false, true, Setting::Unset)
 		},
@@ -408,14 +408,14 @@ fn negotiate_filter(
 		return Ok(());
 	}
 	if native {
-		adjustments.push(Adjustment::Native { feature: FeatureId(Str::from(feature)) });
+		adjustments.push(Adjustment::Native { feature: FeatureId(Str::new(feature)) });
 		return Ok(());
 	}
 	if request.negotiation.emulation == EmulationPolicy::Forbid {
 		return Err(planning_error(feature, "search_filter_requires_lossless_post_filter"));
 	}
 	adjustments.push(Adjustment::Emulated {
-		feature: FeatureId(Str::from(feature)),
+		feature: FeatureId(Str::new(feature)),
 		method:  Emulation::ResponseTransform,
 	});
 	Ok(())
@@ -534,8 +534,8 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		Str::from(OperationKind::Search.to_string()),
-		ReasonId(Str::from("operation_service_mismatch")),
+		Str::new(OperationKind::Search.to_string()),
+		ReasonId(sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
 }
@@ -543,7 +543,7 @@ fn wrong_operation(call: &crate::call::Call) -> Error {
 fn request_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::InvalidRequest,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -551,7 +551,7 @@ fn request_error(feature: &'static str, reason: &'static str) -> Error {
 fn planning_error(feature: &'static str, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::CapabilityMismatch,
-		ErrorDetail::capability(Str::from(feature), ReasonId(Str::from(reason))),
+		ErrorDetail::capability(Str::new(feature), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
 }
@@ -563,7 +563,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]

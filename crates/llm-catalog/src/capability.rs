@@ -533,7 +533,7 @@ impl ServiceTier {
 			(ProviderFamily::Google, "priority") => 1,
 			(ProviderFamily::Other, _) | (..) => return None,
 		};
-		Some(Self { name: Str::from(name), priority })
+		Some(Self { name: Str::new(name), priority })
 	}
 }
 

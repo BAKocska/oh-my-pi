@@ -507,7 +507,7 @@ mod tests {
 		let mut routing = ThinkingRouting::default();
 		routing
 			.effort_map
-			.insert(ThinkingEffort::Low, "low-native".into());
+			.insert(ThinkingEffort::Low, Str::new_static("low-native"));
 		routing
 			.effort_routing
 			.insert(ThinkingEffort::Low, "model-low".into());

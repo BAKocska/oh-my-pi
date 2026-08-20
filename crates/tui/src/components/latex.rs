@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 use super::text::{append, paint_rich, truncate_rich};
 use crate::{
@@ -46,8 +46,8 @@ impl Latex {
 	}
 
 	/// Appends LaTeX source text.
-	pub fn text(mut self, text: impl Into<Str>) -> Self {
-		append(&mut self.text, text.into());
+	pub fn text(mut self, text: impl IntoStr) -> Self {
+		append(&mut self.text, text.into_str());
 		self.version = self.version.wrapping_add(1);
 		self
 	}

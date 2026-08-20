@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::thread::v1::{self as thread, Item};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -354,7 +354,7 @@ impl ModePromptSource {
 			decl:   SlotDecl {
 				slot:     SlotId::Status,
 				class:    SlotClass::Volatile,
-				owner:    Str::new_static("omp.mode"),
+				owner:    sf!("omp.mode"),
 				priority: 100,
 			},
 			source: Arc::new(self),
@@ -395,7 +395,7 @@ impl ConditionalPromptEntries {
 			decl:   SlotDecl {
 				slot:     SlotId::Runtime,
 				class:    SlotClass::Stable,
-				owner:    Str::new_static("omp.conditional-entries"),
+				owner:    sf!("omp.conditional-entries"),
 				priority: 0,
 			},
 			source: Arc::new(self),

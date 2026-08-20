@@ -11,6 +11,7 @@ use std::{
 	convert::Infallible,
 	fmt,
 	hash::{self, Hash, Hasher},
+	intrinsics,
 	iter::FromIterator,
 	mem::{self, ManuallyDrop},
 	ops::{Add, Deref, DerefMut, Index},
@@ -109,6 +110,14 @@ impl Str {
 	#[inline]
 	pub fn new_inline(text: &str) -> Self {
 		Self(Repr::inline(text).expect("len <= INLINE_CAP"))
+	}
+
+	/// Constructs an empty `Str`.
+	///
+	/// This is a `const fn` and never allocates.
+	#[inline(always)]
+	pub const fn empty() -> Self {
+		Self(Repr::empty())
 	}
 
 	/// Constructs a `Str` from a statically allocated string.
@@ -1410,17 +1419,53 @@ impl MutRepr {
 // Extend / Format
 // ============================
 
+/// Internal helper for [`sf!`] compile-time vs runtime formatting dispatch.
+#[doc(hidden)]
+#[inline(always)]
+pub const fn sf_fmt(args: fmt::Arguments<'_>) -> Str {
+	intrinsics::const_eval_select((args,), sf_fmt_const, sf_fmt_runtime)
+}
+
+/// Internal helper for [`sf!`] const-eval formatting.
+#[doc(hidden)]
+pub const fn sf_fmt_const(args: fmt::Arguments<'_>) -> Str {
+	match args.as_str() {
+		Some(s) => Str::new_static(s),
+		None => panic!("cannot format dynamic arguments in a const context"),
+	}
+}
+
+/// Internal helper for [`sf!`] runtime formatting.
+#[doc(hidden)]
+#[inline]
+pub fn sf_fmt_runtime(args: fmt::Arguments<'_>) -> Str {
+	if let Some(s) = args.as_str() {
+		Str::new_static(s)
+	} else {
+		let mut w = StrMut::default();
+		fmt::Write::write_fmt(&mut w, args)
+			.expect("a formatting trait implementation returned an error");
+		w.freeze()
+	}
+}
+
 /// Formats arguments to a [`Str`], potentially without allocating.
 ///
 /// See [`std::format!`] or [`format_args!`] for syntax documentation.
 #[macro_export]
-macro_rules! fmts {
-    ($($tt:tt)*) => {{
-        let mut w = $crate::str::StrMut::default();
-        ::std::fmt::Write::write_fmt(&mut w, format_args!($($tt)*))
-         .expect("a formatting trait implementation returned an error");
-        w.freeze()
-    }};
+macro_rules! sf {
+	() => {
+		$crate::Str::empty()
+	};
+	($fmt:literal, $($tt:tt)*) => {{
+		$crate::str::sf_fmt(::core::format_args!($fmt, $($tt)*))
+	}};
+	($lit:literal) => {{
+		$crate::str::sf_fmt(::core::format_args!($lit))
+	}};
+	($expr:expr) => {
+		$crate::Str::new_static($expr)
+	};
 }
 
 /// Formats arguments to a [`StrMut`], potentially without allocating.
@@ -1851,7 +1896,7 @@ pub trait IntoStr: fmt::Display {
 
 	/// Convert value to [`Str`].
 	fn to_str(&self) -> Str {
-		fmts!("{self}")
+		sf!("{self}")
 	}
 
 	/// Convert value to [`StrMut`].
@@ -1993,7 +2038,7 @@ impl IntoStr for String {
 
 	#[inline]
 	fn to_str(&self) -> Str {
-		self.as_str().into()
+		Str::new(self.as_str())
 	}
 
 	#[inline]
@@ -2116,7 +2161,7 @@ where
 	T: fmt::Display + ?Sized,
 {
 	default fn into_str(self) -> Str {
-		fmts!("{}", self)
+		sf!("{}", self)
 	}
 
 	#[inline]
@@ -2126,7 +2171,7 @@ where
 
 	#[inline]
 	default fn to_str(&self) -> Str {
-		fmts!("{}", *self)
+		sf!("{}", *self)
 	}
 
 	#[inline]
@@ -2144,7 +2189,7 @@ impl str::FromStr for Str {
 
 	#[inline]
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		Ok(Self::from(s))
+		Ok(Self::new(s))
 	}
 }
 
@@ -2155,19 +2200,7 @@ impl From<fmt::Arguments<'_>> for Str {
 	}
 }
 
-impl From<&str> for Str {
-	#[inline]
-	fn from(s: &str) -> Self {
-		Self::new(s)
-	}
-}
-
-impl From<&mut str> for Str {
-	#[inline]
-	fn from(s: &mut str) -> Self {
-		Self::new(s)
-	}
-}
+/* removed From<&str> and From<&mut str> for Str */
 
 impl From<&str> for StrMut {
 	#[inline]
@@ -2179,6 +2212,13 @@ impl From<&str> for StrMut {
 impl From<&mut str> for StrMut {
 	#[inline]
 	fn from(s: &mut str) -> Self {
+		Self::new(s)
+	}
+}
+
+impl From<&str> for Str {
+	#[inline]
+	fn from(s: &str) -> Self {
 		Self::new(s)
 	}
 }
@@ -2263,10 +2303,10 @@ impl From<BytesStrMut> for StrMut {
 
 impl<'a> From<Cow<'a, str>> for Str {
 	#[inline]
-	fn from(s: Cow<'a, str>) -> Self {
-		match s {
-			Cow::Borrowed(borrowed) => Self::new(borrowed),
-			Cow::Owned(owned) => Self(Repr::spilled(owned.into())),
+	fn from(cow: Cow<'a, str>) -> Self {
+		match cow {
+			Cow::Borrowed(s) => Self::new(s),
+			Cow::Owned(s) => Self::from(s),
 		}
 	}
 }
@@ -2456,7 +2496,7 @@ impl<'de> serde::Deserialize<'de> for Str {
 			}
 
 			fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
-				Ok(Str::from(v))
+				Ok(Str::new(v))
 			}
 
 			fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
@@ -2465,7 +2505,7 @@ impl<'de> serde::Deserialize<'de> for Str {
 
 			fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
 				match str::from_utf8(v) {
-					Ok(s) => Ok(Str::from(s)),
+					Ok(s) => Ok(Str::new(s)),
 					Err(_) => Err(Error::invalid_value(Unexpected::Bytes(v), &self)),
 				}
 			}
@@ -2901,7 +2941,7 @@ impl<'a> From<CowStr<'a>> for Str {
 	#[inline]
 	fn from(cow: CowStr<'a>) -> Self {
 		match cow {
-			CowStr::Borrowed(s) => Self::from(s),
+			CowStr::Borrowed(s) => Self::new(s),
 			CowStr::Owned(s) => Self::from(s),
 		}
 	}
@@ -4216,25 +4256,26 @@ mod tests {
 	// ============================
 
 	#[test]
-	fn test_fmts_basic() {
-		let s = fmts!("hello {}", "world");
+	fn test_sf_basic() {
+		let s = sf!("hello {}", "world");
 		assert_eq!(s.as_str(), "hello world");
 	}
 
 	#[test]
-	fn test_fmts_numbers() {
-		let s = fmts!("count: {}, pi: {:.2}", 42, std::f64::consts::PI);
+	fn test_sf_numbers() {
+		let s = sf!("count: {}, pi: {:.2}", 42, std::f64::consts::PI);
 		assert_eq!(s.as_str(), "count: 42, pi: 3.14");
 	}
 
 	#[test]
-	fn test_fmts_no_args() {
-		let s = fmts!("static text");
+	fn test_sf_no_args() {
+		let s = sf!("static text");
 		assert_eq!(s.as_str(), "static text");
+		assert!(s.is_spilled());
 	}
 
 	#[test]
-	fn test_fmts_mut_basic() {
+	fn test_sf_mut_basic() {
 		let mut s = fmts_mut!("hello {}", "world");
 		assert_eq!(s.as_str(), "hello world");
 		s.push('!');
@@ -4242,8 +4283,8 @@ mod tests {
 	}
 
 	#[test]
-	fn test_fmts_heap_allocation() {
-		let s = fmts!("{}", "123456789012345678901234");
+	fn test_sf_heap_allocation() {
+		let s = sf!("{}", "123456789012345678901234");
 		assert!(s.is_spilled());
 		assert_eq!(s.as_str(), "123456789012345678901234");
 	}

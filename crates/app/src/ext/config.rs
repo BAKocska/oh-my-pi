@@ -6,7 +6,7 @@ use std::{
 	path::PathBuf,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
 use super::{ExtensionCode, ExtensionError, Layer};
@@ -448,7 +448,7 @@ pub fn lower_tools(tools: impl IntoIterator<Item = ToolManifestEntry>) -> Vec<De
 			kind:    tool.intent,
 			module:  tool.module,
 			key:     tool.key,
-			trigger: Str::new_static("lazy"),
+			trigger: sf!("lazy"),
 			api:     tool.api,
 		})
 		.collect()
@@ -460,7 +460,7 @@ mod tests {
 
 	#[test]
 	fn p7_negative_dominates_later_positive() {
-		let id = Str::new_static("acme.reviewer");
+		let id = sf!("acme.reviewer");
 		let client = ScopedOverlay {
 			scope:   Scope::Client,
 			overlay: ExtensionOverlay {

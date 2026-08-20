@@ -51,7 +51,7 @@ pub fn intern(source: &str) -> Option<InternedImage> {
 	}
 	registry
 		.by_source
-		.insert(Str::from(source), interned.clone());
+		.insert(Str::new(source), interned.clone());
 	if let Some(entry) = &interned {
 		registry.by_id.insert(entry.id, entry.png.clone());
 	}

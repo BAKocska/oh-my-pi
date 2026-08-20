@@ -1166,9 +1166,9 @@ mod tests {
 
 	fn workflow_action(invocation: &'static str, timeout: Option<Duration>) -> ChatEvent {
 		ChatEvent::WorkflowAction(WorkflowAction {
-			invocation: Str::new_static(invocation),
+			invocation: sf!(invocation),
 			call: None,
-			name: Str::new_static("host_action"),
+			name: sf!("host_action"),
 			arguments: Bytes::from_static(b"request"),
 			timeout,
 			response_kind: WorkflowResponseKind::Action,
@@ -1177,7 +1177,7 @@ mod tests {
 
 	fn workflow_response(invocation: &'static str) -> WorkflowResponse {
 		WorkflowResponse::WorkflowActionResponse(WorkflowActionResponse {
-			invocation: Str::new_static(invocation),
+			invocation: sf!(invocation),
 			response:   Bytes::from_static(b"response"),
 			is_error:   false,
 		})
@@ -1190,7 +1190,7 @@ mod tests {
 			yield Ok(workflow_action("invoke-1", None));
 			let response = received.recv_async().await.expect("same live response sink");
 			assert_eq!(response.invocation().as_str(), "invoke-1");
-			yield Ok(ChatEvent::TextDelta { index: 0, text: Str::new_static("resumed") });
+			yield Ok(ChatEvent::TextDelta { index: 0, text: sf!("resumed") });
 		});
 		let mut stream = ChatStream::duplex(events, responses);
 		let control = stream.control().expect("duplex control");
@@ -1220,7 +1220,7 @@ mod tests {
 		let (responses, _received) = flume::unbounded();
 		let events = futures::stream::iter([
 			Ok(workflow_action("cancelled", None)),
-			Ok(ChatEvent::WorkflowCancelled { invocation: Str::new_static("cancelled") }),
+			Ok(ChatEvent::WorkflowCancelled { invocation: sf!("cancelled") }),
 			Ok(workflow_action("expired", Some(Duration::ZERO))),
 		]);
 		let mut stream = ChatStream::duplex(Box::pin(events), responses);
@@ -1243,7 +1243,7 @@ mod tests {
 		let mut stream =
 			ChatStream::ordinary(Box::pin(futures::stream::iter([Ok(ChatEvent::TextDelta {
 				index: 0,
-				text:  Str::new_static("ordinary"),
+				text:  sf!("ordinary"),
 			})])));
 		assert!(stream.control().is_none());
 		assert!(matches!(

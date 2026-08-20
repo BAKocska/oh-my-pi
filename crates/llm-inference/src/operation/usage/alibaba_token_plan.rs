@@ -11,7 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
@@ -210,9 +210,9 @@ pub(crate) async fn fetch_alibaba_token_plan_usage_until(
 	}
 	let windows = parse_usage_windows(gateway.body.expose_secret(), now)?;
 	let source_label = if is_china {
-		Str::new_static("bailian-console")
+		sf!("bailian-console")
 	} else {
-		Str::new_static("qwencloud-console")
+		sf!("qwencloud-console")
 	};
 	Some(AlibabaTokenPlanUsage { account_id, source_label, windows })
 }
@@ -335,8 +335,8 @@ fn international_session(body: &str) -> Option<(String, Option<Str>)> {
 	let account_id = ["accountId", "userId", "aliyunId", "loginId"]
 		.into_iter()
 		.find_map(|key| match data.get(key) {
-			Some(Value::String(value)) => Some(Str::from(value.as_str())),
-			Some(Value::Number(value)) => Some(Str::from(value.to_string())),
+			Some(Value::String(value)) => Some(Str::new(value.as_str())),
+			Some(Value::Number(value)) => Some(Str::new(value.to_string())),
 			_ => None,
 		});
 	Some((sec_token, account_id))
@@ -451,16 +451,16 @@ fn quota_window(
 	let fraction = parse_used_fraction(percentage?)?;
 	let consumed = ((fraction * 100.0).round() as u64).min(100);
 	let (label, duration) = if id.ends_with("5h") {
-		(Str::new_static("5 Hour Credits"), Duration::from_hours(5))
+		(sf!("5 Hour Credits"), Duration::from_hours(5))
 	} else {
-		(Str::new_static("7 Day Credits"), Duration::from_days(7))
+		(sf!("7 Day Credits"), Duration::from_days(7))
 	};
 	Some(UsageWindow {
-		id:          Str::new_static(id),
+		id:          sf!(id),
 		kind:        UsageWindowKind::Quota,
-		dimension:   Str::new_static(id),
+		dimension:   sf!(id),
 		label:       Some(label),
-		scope:       Some(Str::new_static("shared")),
+		scope:       Some(sf!("shared")),
 		amount:      UsageAmount {
 			unit:      UsageUnit::Percent,
 			consumed:  Some(UsageQuantity::new(consumed, 0)),

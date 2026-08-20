@@ -8,7 +8,7 @@ use omp_app::envd::{
 	docs::DocumentHost,
 	workspace::{WorkspaceError, WorkspaceHost},
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_docserver::{
 	Environment, ServerConfig,
 	connection::{ConnectionConfig, PROTOCOL_MAJOR, PROTOCOL_MINOR, serve_connection},
@@ -91,10 +91,10 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	assert_eq!(host.hello().root_uri.as_str(), expected_root_uri);
 
 	let cancel = CancellationToken::new();
-	let mut writer = within(host.open(Str::new(&uri), Some(Str::new_static("rust")), &cancel))
+	let mut writer = within(host.open(Str::new(&uri), Some(sf!("rust")), &cancel))
 		.await
 		.expect("writer lease");
-	let mut stale_writer = within(host.open(Str::new(&uri), Some(Str::new_static("rust")), &cancel))
+	let mut stale_writer = within(host.open(Str::new(&uri), Some(sf!("rust")), &cancel))
 		.await
 		.expect("stale-writer lease");
 	let pinned_revision = writer.head().revision.clone().expect("pinned revision");
@@ -180,7 +180,7 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	assert_eq!(rejected.reason, document_pb::TransactionRejectReason::StaleBase as i32);
 	assert_eq!(stale_writer.head().revision.as_ref(), Some(&pinned_revision));
 
-	let observer = within(host.open(Str::new(&uri), Some(Str::new_static("rust")), &cancel))
+	let observer = within(host.open(Str::new(&uri), Some(sf!("rust")), &cancel))
 		.await
 		.expect("observer lease");
 	assert_eq!(observer.head().revision, writer.head().revision);

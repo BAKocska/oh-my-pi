@@ -1,7 +1,7 @@
 //! Incremental synthesis of leaked in-band reasoning blocks.
 
 use bytes::{Buf, Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	id::{ThinkingPolicyId, WirePolicyId},
 	policy::LeakedThinkingHealer,
@@ -344,11 +344,11 @@ impl LeakedThinkingStage {
 			.thinking_policy
 			.as_ref()
 			.map_or("none", ThinkingPolicyId::as_str);
-		let rule = ReasonId(Str::from(format!(
+		let rule = ReasonId(sf!(
 			"thinking-leak/{}/{thinking}/{}",
 			self.config.wire_policy.as_str(),
 			pattern.id
-		)));
+		));
 		emit(ThinkingEvent::RecoveryApplied {
 			wire_policy:     self.config.wire_policy.clone(),
 			thinking_policy: self.config.thinking_policy.clone(),
@@ -428,7 +428,7 @@ fn valid_prefix(buffer: &[u8], final_chunk: bool) -> Result<usize, RecoveryError
 		Err(error) if error.error_len().is_none() && !final_chunk => Ok(error.valid_up_to()),
 		Err(_) => Err(RecoveryError::InvalidInput {
 			stage:  "thinking",
-			reason: Str::new_static("input is not valid UTF-8"),
+			reason: sf!("input is not valid UTF-8"),
 		}),
 	}
 }

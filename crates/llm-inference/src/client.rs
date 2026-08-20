@@ -164,7 +164,7 @@ where
 		if plan.operation != O::KIND {
 			return Err(Error::planning(
 				ErrorKind::InternalInvariant,
-				ErrorDetail::protocol(ReasonId(omp_core::Str::from("planner-operation-mismatch"))),
+				ErrorDetail::protocol(ReasonId(omp_core::sf!("planner-operation-mismatch",))),
 				ExecutionReceipt::default(),
 			));
 		}
@@ -214,7 +214,7 @@ mod tests {
 	};
 
 	use futures::stream;
-	use omp_core::Str;
+	use omp_core::sf;
 	use tower::Service;
 
 	use super::*;
@@ -272,11 +272,8 @@ mod tests {
 
 	#[test]
 	fn every_operation_extracts_its_body_without_casts() {
-		let provenance = TokenizerProvenance {
-			tokenizer: Str::from("tok"),
-			revision:  Str::from("1"),
-			exact:     true,
-		};
+		let provenance =
+			TokenizerProvenance { tokenizer: sf!("tok"), revision: sf!("1"), exact: true };
 		assert!(
 			ChatRequest::extract(answer(AnswerBody::Chat(ChatStream::ordinary(empty_stream()))))
 				.is_ok()
@@ -297,7 +294,7 @@ mod tests {
 		);
 		assert!(
 			DetokenizeRequest::extract(answer(AnswerBody::Text(DetokenizedText {
-				text: Str::from("text"),
+				text: sf!("text"),
 				provenance,
 			})))
 			.is_ok()
@@ -343,7 +340,7 @@ mod tests {
 		assert!(
 			DiscoveryRequest::extract(answer(AnswerBody::Models(ModelDiscoveryPage {
 				models:      Vec::new(),
-				next_cursor: Some(Str::from("next")),
+				next_cursor: Some(sf!("next")),
 			})))
 			.is_ok()
 		);
@@ -373,10 +370,10 @@ mod tests {
 	#[test]
 	fn body_mismatch_is_a_structured_internal_protocol_error() {
 		let error = ChatRequest::extract(answer(AnswerBody::Text(DetokenizedText {
-			text:       Str::from("wrong"),
+			text:       sf!("wrong"),
 			provenance: TokenizerProvenance {
-				tokenizer: Str::from("tok"),
-				revision:  Str::from("1"),
+				tokenizer: sf!("tok"),
+				revision:  sf!("1"),
 				exact:     true,
 			},
 		})))
@@ -399,7 +396,7 @@ mod tests {
 		fn plan(&self, _: &Call, _: Instant) -> Result<ExecutionPlan, Error> {
 			Err(Error::planning(
 				ErrorKind::CapabilityMismatch,
-				ErrorDetail::protocol(ReasonId(Str::from("unsupported-test-operation"))),
+				ErrorDetail::protocol(ReasonId(sf!("unsupported-test-operation"))),
 				ExecutionReceipt::default(),
 			))
 		}
@@ -438,8 +435,8 @@ mod tests {
 			ready(Ok(answer(AnswerBody::Tokens(TokenCount {
 				tokens:     7,
 				provenance: TokenizerProvenance {
-					tokenizer: Str::from("tok"),
-					revision:  Str::from("1"),
+					tokenizer: sf!("tok"),
+					revision:  sf!("1"),
 					exact:     true,
 				},
 			}))))

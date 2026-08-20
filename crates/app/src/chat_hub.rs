@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use omp_agent::{Broker, BrokerInbox, CancelOutcome, DeliveryMode, JobBoard, PeerMessage};
-use omp_core::{Duration, DurationUnit, Str};
+use omp_core::{Duration, DurationUnit, Str, sf};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
 use omp_proto::env::v1::{
 	AttachOutput, EnvironmentDelta, ListProcesses, ProcessSpec, PtySpec, ReadyLog, ReadyProbe,
@@ -30,7 +30,7 @@ pub(crate) fn tool() -> impl Tool {
 
 /// Installs one live chat composition, restoring the prior one on drop.
 pub(crate) fn attach(backend: Arc<ChatHubBackend>) -> HubAttachment {
-	let previous = ROUTER.attach(Str::new_static(DEFAULT_ROUTE), backend);
+	let previous = ROUTER.attach(sf!(DEFAULT_ROUTE), backend);
 	HubAttachment { previous }
 }
 
@@ -42,7 +42,7 @@ impl Drop for HubAttachment {
 	fn drop(&mut self) {
 		ROUTER.detach(DEFAULT_ROUTE);
 		if let Some(previous) = self.previous.take() {
-			ROUTER.attach(Str::new_static(DEFAULT_ROUTE), previous);
+			ROUTER.attach(sf!(DEFAULT_ROUTE), previous);
 		}
 	}
 }

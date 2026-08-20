@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use smallvec::SmallVec;
 use xutf::Text;
 
@@ -51,8 +51,8 @@ impl SelectOption {
 	}
 
 	/// Appends label text.
-	pub fn label(mut self, label: impl Into<Str>) -> Self {
-		let label = label.into();
+	pub fn label(mut self, label: impl IntoStr) -> Self {
+		let label = label.into_str();
 		if self.label.is_empty() {
 			self.label = label;
 		} else {
@@ -286,7 +286,7 @@ impl Select {
 			(true, None) => {
 				let end = self.children.len();
 				self.insert_option(self.state.options.len(), OptionData {
-					label:       Str::from("Other (type your own)"),
+					label:       sf!("Other (type your own)"),
 					value:       Str::default(),
 					desc:        None,
 					recommended: false,
@@ -389,7 +389,7 @@ impl Select {
 		let &index = visible.get(usize::from(self.state.cursor))?;
 		let option = &self.state.options[usize::from(index)];
 		Some(if option.custom {
-			Str::from(self.state.custom_text.as_str())
+			Str::new(self.state.custom_text.as_str())
 		} else {
 			option.value.clone()
 		})
@@ -411,7 +411,7 @@ impl Select {
 		match self.props.id() {
 			Some(id) => Flow::Event(UiEvent::Filtered {
 				id:    id.clone(),
-				query: Str::from(self.state.filter_q.as_str()),
+				query: Str::new(self.state.filter_q.as_str()),
 				value: self.cursor_value(),
 			}),
 			None => Flow::Consumed,
@@ -596,7 +596,7 @@ impl Select {
 			Some(id) => {
 				let option = &self.state.options[usize::from(index)];
 				let value = if option.custom {
-					Str::from(self.state.custom_text.as_str())
+					Str::new(self.state.custom_text.as_str())
 				} else {
 					option.value.clone()
 				};

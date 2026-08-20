@@ -16,7 +16,7 @@ use omp_app::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_e2e::support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, omp_binary, within};
 use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_proto::{
@@ -74,10 +74,10 @@ impl Admitter for AllowAdmission {
 }
 
 struct ChildEnvironment {
-	client: EnvClient,
-	_task:  JoinHandle<()>,
+	client:  EnvClient,
+	_task:   JoinHandle<()>,
 	_server: Arc<EnvServer>,
-	_state: tempfile::TempDir,
+	_state:  tempfile::TempDir,
 }
 
 impl ChildEnvironment {
@@ -85,15 +85,15 @@ impl ChildEnvironment {
 		let state = tempfile::tempdir().context("create isolated environment state")?;
 		let mut config = ExtHostConfig::new(
 			omp_binary().context("resolve worker-capable host")?,
-			Principal::new(Str::new_static("p9-e2e"), Str::new_static("P9 E2E")),
-			Str::new_static("p9-isolated-session"),
+			Principal::new(sf!("p9-e2e"), sf!("P9 E2E")),
+			sf!("p9-isolated-session"),
 			1,
 		);
 		let key = HostKey::new("workspace", "trusted", MODULE);
 		let provenance = Provenance::new(
-			Str::new_static("omp-e2e"),
+			sf!("omp-e2e"),
 			key.extension().clone(),
-			Str::new_static("1.0.0"),
+			sf!("1.0.0"),
 			ArtifactDigest::new([9; 32]),
 			key.layer().clone(),
 			key.tier().clone(),
@@ -101,7 +101,7 @@ impl ChildEnvironment {
 		);
 		let manifest = ExtensionManifest::new(
 			provenance,
-			Str::new_static(MODULE),
+			sf!(MODULE),
 			[],
 			DeclarationSet::new([ToolDeclarationKey::new("prove_isolated_root", "p9", 1)], []),
 			ServiceManifest::default(),
@@ -199,7 +199,9 @@ async fn p9_env_worker_is_rooted_in_the_isolated_worktree() -> Result<()> {
 		}),
 	)
 	.await??;
-	let worktree = created.worktree.context("environment omitted worktree identity")?;
+	let worktree = created
+		.worktree
+		.context("environment omitted worktree identity")?;
 	let root = url::Url::parse(&worktree.root_uri)
 		.context("parse worktree root URI")?
 		.to_file_path()

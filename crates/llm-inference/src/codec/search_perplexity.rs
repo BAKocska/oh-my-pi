@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::OperationKind;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -67,11 +67,8 @@ impl Codec for PerplexitySearchCodec {
 			RequestMethod::Post,
 			join_uri(context.route.endpoint.base_url.as_str(), CHAT_COMPLETIONS_PATH)?,
 			vec![
-				RequestHeader { name: Str::from("accept"), value: Str::from("application/json") },
-				RequestHeader {
-					name:  Str::from("content-type"),
-					value: Str::from("application/json"),
-				},
+				RequestHeader { name: sf!("accept"), value: sf!("application/json") },
+				RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 			]
 			.into_boxed_slice(),
 			BodySource::Bytes(Bytes::from(body)),
@@ -176,7 +173,7 @@ fn join_uri(base: &str, path: &str) -> Result<Str, Error> {
 	let joined = base
 		.join(path)
 		.map_err(|_| encoding_error("perplexity_search_endpoint_join_failed"))?;
-	Ok(Str::from(joined.to_string()))
+	Ok(Str::new(&joined))
 }
 
 /// Bounded unary decoder for one Perplexity Sonar response.
@@ -432,8 +429,8 @@ fn provider_error(error: PerplexityWireError) -> Error {
 	};
 	Error::new(classified.0, ErrorPhase::Handshake, RetryAction::Never, ExecutionReceipt::default())
 		.status(status)
-		.code(Str::from(classified.1))
-		.detail(ErrorDetail::provider(Str::from("Perplexity API request failed")))
+		.code(Str::new(classified.1))
+		.detail(ErrorDetail::provider(sf!("Perplexity API request failed")))
 }
 
 fn validation_error(envelope: PerplexityValidationErrorEnvelope) -> Error {
@@ -446,8 +443,8 @@ fn validation_error(envelope: PerplexityValidationErrorEnvelope) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.code(Str::from("perplexity.validation_error"))
-	.detail(ErrorDetail::provider(Str::from("Perplexity rejected the request")))
+	.code(sf!("perplexity.validation_error"))
+	.detail(ErrorDetail::provider(sf!("Perplexity rejected the request")))
 }
 
 fn codec_error(reason: &'static str) -> Error {
@@ -457,7 +454,7 @@ fn codec_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn encoding_error(reason: &'static str) -> Error {
@@ -467,7 +464,7 @@ fn encoding_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn protocol_error(reason: &'static str) -> Error {
@@ -477,7 +474,7 @@ fn protocol_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn contract_error(reason: &'static str) -> Error {
@@ -487,7 +484,7 @@ fn contract_error(reason: &'static str) -> Error {
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 fn parse_date(value: &str) -> Option<SystemTime> {
@@ -561,11 +558,11 @@ mod tests {
 
 	fn search_request() -> SearchRequest {
 		SearchRequest {
-			query:             Str::from("latest Rust release"),
-			include_domains:   Arc::from([Str::from("rust-lang.org")]),
-			exclude_domains:   Arc::from([Str::from("spam.example")]),
+			query:             sf!("latest Rust release"),
+			include_domains:   Arc::from([sf!("rust-lang.org")]),
+			exclude_domains:   Arc::from([sf!("spam.example")]),
 			recency:           Some(SearchRecency::Week),
-			locale:            Some(Str::from("en-US")),
+			locale:            Some(sf!("en-US")),
 			max_results:       5,
 			synthesize_answer: Setting::Require(true),
 			negotiation:       NegotiationPolicy::default(),
@@ -584,7 +581,7 @@ mod tests {
 			codec:              CodecId::new(CODEC_ID),
 			transport:          TransportKind::Http,
 			endpoint:           EndpointSpec {
-				base_url: Str::from("https://api.perplexity.ai/"),
+				base_url: sf!("https://api.perplexity.ai/"),
 				region:   None,
 			},
 			auth:               AuthSpecId::new("perplexity-bearer"),
@@ -592,7 +589,7 @@ mod tests {
 			discovery:          Option::<DiscoverySpecId>::None,
 			capability_limits:  RouteRestrictions::default(),
 			trust_domain:       TrustDomain {
-				origin:          Str::from("https://api.perplexity.ai"),
+				origin:          sf!("https://api.perplexity.ai"),
 				redirects:       RedirectTrust::Deny,
 				allow_plaintext: false,
 			},

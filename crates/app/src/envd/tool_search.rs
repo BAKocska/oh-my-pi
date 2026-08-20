@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_hashline::{RevisionToken, compute_snapshot_tag};
 use omp_tools::{
 	glob::{self, WalkMatch, WalkResult},
@@ -1132,7 +1132,7 @@ mod tests {
 	) -> grep::SearchRequest {
 		let path = path.into();
 		grep::SearchRequest {
-			pattern: Str::from("needle"),
+			pattern: sf!("needle"),
 			roots: vec![SearchRoot { original: path.clone(), path, kind, ranges: Box::default() }],
 			ignore_case: false,
 			multiline: false,
@@ -1193,7 +1193,7 @@ mod tests {
 			panic!("external file resolved to memory");
 		};
 		let result = omp_grep::grep(&omp_grep::GrepOptions {
-			pattern: Str::from("needle"),
+			pattern: sf!("needle"),
 			path: Str::from(path.to_string_lossy().into_owned()),
 			..omp_grep::GrepOptions::default()
 		})
@@ -1300,8 +1300,8 @@ mod tests {
 		.expect("write ZIP");
 		let bytes = Bytes::from(std::fs::read(&archive_path).expect("read ZIP"));
 		let root = SearchRoot {
-			original: Str::from("fixture.zip:docs"),
-			path:     Str::from("fixture.zip:docs"),
+			original: sf!("fixture.zip:docs"),
+			path:     sf!("fixture.zip:docs"),
 			kind:     SearchRootKind::Archive,
 			ranges:   Box::default(),
 		};
@@ -1321,9 +1321,9 @@ mod tests {
 
 		assert_eq!(targets.len(), 1);
 		assert_eq!(targets[0].path, "fixture.zip:docs/readme.txt");
-		assert_eq!(unreadable, vec![Str::from("fixture.zip:docs/blob.bin (binary archive entry)")]);
+		assert_eq!(unreadable, vec![sf!("fixture.zip:docs/blob.bin (binary archive entry)")]);
 		let result = omp_grep::search(&targets[0].content, &omp_grep::GrepOptions {
-			pattern: Str::from("needle"),
+			pattern: sf!("needle"),
 			path: targets[0].path.clone(),
 			..omp_grep::GrepOptions::default()
 		})
@@ -1346,7 +1346,7 @@ mod tests {
 			std::future::ready(Ok(web::types::HttpResponse {
 				final_url:    request.url,
 				status:       200,
-				content_type: Some(Str::from("text/plain")),
+				content_type: Some(sf!("text/plain")),
 				headers:      Default::default(),
 				body:         Bytes::from_static(b"alpha\nneedle\nomega\n"),
 			}))
@@ -1356,8 +1356,8 @@ mod tests {
 	#[tokio::test]
 	async fn url_root_round_trips_canned_http_into_memory_search() {
 		let root = SearchRoot {
-			original: Str::from("https://example.test/data.txt"),
-			path:     Str::from("https://example.test/data.txt"),
+			original: sf!("https://example.test/data.txt"),
+			path:     sf!("https://example.test/data.txt"),
 			kind:     SearchRootKind::Url,
 			ranges:   Box::default(),
 		};
@@ -1365,7 +1365,7 @@ mod tests {
 			.await
 			.expect("materialize URL");
 		let result = omp_grep::search(&target.content, &omp_grep::GrepOptions {
-			pattern: Str::from("needle"),
+			pattern: sf!("needle"),
 			path: target.path.clone(),
 			..omp_grep::GrepOptions::default()
 		})
@@ -1403,7 +1403,7 @@ mod tests {
 		assert_eq!(result.matches[0].line, "needle");
 		assert!(result.matches[0].source_key.starts_with("archive:"));
 		assert!(result.matches[0].source_key.ends_with(":docs/readme.txt"));
-		assert_eq!(result.archive_unreadable, vec![Str::from(
+		assert_eq!(result.archive_unreadable, vec![sf!(
 			"fixture.zip:docs/blob.bin (binary archive entry)"
 		)]);
 	}
@@ -1512,7 +1512,7 @@ mod tests {
 		std::fs::write(&source, "fn external() {}\n").expect("external source");
 		let adapter = connected_search_adapter(&workspace).await;
 		let result = WorkspaceSearch::glob(&adapter, glob::WalkRequest {
-			path:       Str::from("../external/**/*.rs"),
+			path:       sf!("../external/**/*.rs"),
 			hidden:     true,
 			gitignore:  false,
 			limit:      200,
@@ -1607,7 +1607,7 @@ mod tests {
 			glob_blocking(
 				&host,
 				glob::WalkRequest {
-					path:       Str::from("."),
+					path:       sf!("."),
 					hidden:     true,
 					gitignore:  false,
 					limit:      200,
@@ -1621,7 +1621,7 @@ mod tests {
 		let timed_out = glob_blocking(
 			&host,
 			glob::WalkRequest {
-				path:       Str::from("."),
+				path:       sf!("."),
 				hidden:     true,
 				gitignore:  false,
 				limit:      200,

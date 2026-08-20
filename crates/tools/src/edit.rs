@@ -9,7 +9,7 @@ use std::{fmt::Write as _, future::Future};
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use omp_hashline::{
 	ApplyMode, ApplyOptions, BlockMode, Clipboard, FileOp, MismatchDetails, MismatchError, Patch,
 	apply_parsed_patch, compute_snapshot_tag,
@@ -117,7 +117,7 @@ pub fn resolve_edit_revision(
 			_ => {},
 		}
 	}
-	registered_revision(&Rev { family: "hl".into(), n: 1 }, EditRevisionSource::Default)
+	registered_revision(&Rev { family: sf!("hl"), n: 1 }, EditRevisionSource::Default)
 }
 
 /// Checks that projection capabilities came from the selected dialect family.
@@ -413,16 +413,16 @@ pub struct Fault {
 }
 
 impl Fault {
-	fn invalid(message: impl Into<Str>) -> Self {
+	fn invalid(message: impl IntoStr) -> Self {
 		Self {
-			reason:    RejectionReason::InvalidPatch { message: message.into() },
+			reason:    RejectionReason::InvalidPatch { message: message.into_str() },
 			conflicts: Vec::new(),
 		}
 	}
 
-	fn stale(message: impl Into<Str>) -> Self {
+	fn stale(message: impl IntoStr) -> Self {
 		Self {
-			reason:    RejectionReason::StaleUnrecoverable { message: message.into() },
+			reason:    RejectionReason::StaleUnrecoverable { message: message.into_str() },
 			conflicts: Vec::new(),
 		}
 	}
@@ -493,9 +493,9 @@ pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> Edit
 		documents,
 		format_policy,
 		spec: ToolSpec {
-			name:            "edit".into(),
-			rev:             Rev { family: "hl".into(), n: 1 },
-			description:     DESCRIPTION.into(),
+			name:            sf!("edit"),
+			rev:             Rev { family: sf!("hl"), n: 1 },
+			description:     sf!(DESCRIPTION),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
 				priority:       100,
@@ -504,7 +504,7 @@ pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> Edit
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: [Str::new_static("**")].into_iter().collect(),
+					write_globs: [sf!("**")].into_iter().collect(),
 				}),
 				exec:      None,
 				inference: None,
@@ -552,10 +552,10 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 				},
 				Err(error) => {
 					yield Ev::Args(ArgIssue {
-						path: vec![ArgPath::Key("input".into())],
-						expected: "complete hashline input beginning with [PATH#TAG]".into(),
+						path: vec![ArgPath::Key(sf!("input"))],
+						expected: sf!("complete hashline input beginning with [PATH#TAG]"),
 						kind: ArgIssueKind::Malformed,
-						example: Some("[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement".into()),
+						example: Some(sf!("[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement")),
 						found: Some(error.to_string().into()),
 					});
 					return;
@@ -644,13 +644,15 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					block_resolutions: applied.block_resolutions.into_iter().map(|resolution| ResolvedBlock {
 						anchor_line: resolution.anchor_line, start: resolution.start, end: resolution.end,
 						operation: match resolution.mode {
-							BlockMode::Replace => "replace", BlockMode::InsertAfter => "insert_after",
-							BlockMode::Cut => "cut", BlockMode::PasteAfter => "paste_after",
-						}.into(),
+							BlockMode::Replace => sf!("replace"),
+							BlockMode::InsertAfter => sf!("insert_after"),
+							BlockMode::Cut => sf!("cut"),
+							BlockMode::PasteAfter => sf!("paste_after"),
+						},
 					}).collect(),
 					warnings: work.prepared.warnings().iter().cloned()
 						.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
-						.chain(applied.warnings.iter().map(|warning| warning.to_string().into())).collect(),
+						.chain(applied.warnings.iter().map(|warning| Str::from(warning.to_string()))).collect(),
 				});
 			}
 
@@ -724,7 +726,7 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					interrupted = interrupt => {
 						yield Ev::Aborted(match interrupted {
 							Ok(value) => Abort::EffectsUnknown { reason: value.reason },
-							Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: "invocation owner disappeared during transaction".into() },
+							Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
 							Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
 						});
 						None
@@ -741,7 +743,7 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					let payload = build_payload(&parsed_sections, &projections, Some(&result.sections));
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
 				},
-				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: "document transaction returned the wrong section count".into() }),
+				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
 				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
 				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
 			}
@@ -870,7 +872,7 @@ fn recovery_edits(edits: &[omp_hashline::ByteEdit]) -> Result<Vec<RecoveryEdit>,
 fn stale_message<P: EditPrepared>(work: &PreparedWork<P>, recognized: bool) -> Str {
 	let lines = String::from_utf8_lossy(work.prepared.base_bytes())
 		.lines()
-		.map(Str::from)
+		.map(Str::new)
 		.collect();
 	let anchors = work
 		.parsed
@@ -966,13 +968,12 @@ fn op_details(edits: &[omp_hashline::Edit]) -> Vec<AppliedOp> {
 		.iter()
 		.map(|edit| AppliedOp {
 			kind:       match edit {
-				omp_hashline::Edit::Insert { .. } => "insert",
-				omp_hashline::Edit::Delete { .. } => "delete",
-				omp_hashline::Edit::Cut { .. } => "cut",
-				omp_hashline::Edit::Paste { .. } => "paste",
-				omp_hashline::Edit::Block { .. } => "block",
-			}
-			.into(),
+				omp_hashline::Edit::Insert { .. } => sf!("insert"),
+				omp_hashline::Edit::Delete { .. } => sf!("delete"),
+				omp_hashline::Edit::Cut { .. } => sf!("cut"),
+				omp_hashline::Edit::Paste { .. } => sf!("paste"),
+				omp_hashline::Edit::Block { .. } => sf!("block"),
+			},
 			patch_line: edit.line_num(),
 			index:      edit.index(),
 		})

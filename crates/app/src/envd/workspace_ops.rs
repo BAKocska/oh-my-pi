@@ -17,7 +17,7 @@ use std::{
 use std::{fs::OpenOptions, os::fd::AsRawFd as _};
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex};
+use omp_core::{Str, encoding::hex, sf};
 use omp_proto::{document::v1 as document_pb, env::v1 as pb};
 use omp_walker::{FileType, WalkOrder};
 use parking_lot::Mutex;
@@ -230,7 +230,7 @@ impl WorkspaceOperations {
 			return Ok(restored);
 		}
 		let Some(workspace_lease) = workspace_lease else {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 				"document authority omitted an uncontested workspace lease",
 			)));
 		};
@@ -270,7 +270,7 @@ impl WorkspaceOperations {
 			.as_deref()
 			.is_some_and(|base| base != snapshot.snapshot_id)
 		{
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 				"copy-on-write creation requires the live workspace generation",
 			)));
 		}
@@ -337,7 +337,7 @@ impl WorkspaceOperations {
 			let current = self.load_manifest(&current.snapshot_id)?;
 			let base = self.load_manifest(record.base.as_str())?;
 			if current.entries != base.entries {
-				return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+				return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 					"worktree has unmerged changes",
 				)));
 			}
@@ -512,12 +512,12 @@ impl WorkspaceOperations {
 	}
 
 	fn load_manifest(&self, snapshot_id: &str) -> Result<Manifest, WorkspaceOperationError> {
-		let hash = hex::decode(snapshot_id).into_array::<32>().map_err(|_| {
-			WorkspaceOperationError::InvalidGeneration(Str::new_static("invalid manifest hash"))
-		})?;
+		let hash = hex::decode(snapshot_id)
+			.into_array::<32>()
+			.map_err(|_| WorkspaceOperationError::InvalidGeneration(sf!("invalid manifest hash")))?;
 		let stat = self.inner.blobs.stat(&hash)?;
 		if !stat.present || stat.size > MAX_MANIFEST_BYTES {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 				"manifest is missing or exceeds the size bound",
 			)));
 		}
@@ -719,9 +719,7 @@ impl WorkspaceOperations {
 	fn read_entry_blob(&self, entry: &ManifestEntry) -> Result<Bytes, WorkspaceOperationError> {
 		let stat = self.inner.blobs.stat(&entry.hash)?;
 		if !stat.present {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
-				"file blob is missing",
-			)));
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!("file blob is missing",)));
 		}
 		Ok(self
 			.inner
@@ -941,13 +939,11 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, WorkspaceOperationError> {
 	let mut magic = [0_u8; MANIFEST_MAGIC.len()];
 	input.read_exact(&mut magic).map_err(invalid_manifest)?;
 	if &magic != MANIFEST_MAGIC {
-		return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
-			"manifest magic mismatch",
-		)));
+		return Err(WorkspaceOperationError::InvalidGeneration(sf!("manifest magic mismatch",)));
 	}
 	let prefix_count = read_u32(&mut input)?;
 	if u64::from(prefix_count) > (bytes.len() as u64).saturating_sub(input.position()) / 4 {
-		return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+		return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 			"manifest prefix count exceeds remaining bytes",
 		)));
 	}
@@ -955,14 +951,14 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, WorkspaceOperationError> {
 	for _ in 0..prefix_count {
 		let prefix = Str::from(read_string(&mut input)?);
 		if normalize_relative(prefix.as_str())? != prefix {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 				"manifest prefix is not canonical",
 			)));
 		}
 		prefixes.push(prefix);
 	}
 	if !prefixes.windows(2).all(|pair| pair[0] < pair[1]) {
-		return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+		return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 			"manifest prefixes are not strictly sorted",
 		)));
 	}
@@ -970,7 +966,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, WorkspaceOperationError> {
 	while input.position() < bytes.len() as u64 {
 		let path = Str::from(read_string(&mut input)?);
 		if normalize_relative(path.as_str())? != path {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!(
 				"manifest path is not canonical",
 			)));
 		}
@@ -978,17 +974,13 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, WorkspaceOperationError> {
 		input.read_exact(&mut mode).map_err(invalid_manifest)?;
 		let mode = u32::from_be_bytes(mode);
 		if mode & !0o7777 != 0 {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
-				"manifest mode is invalid",
-			)));
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!("manifest mode is invalid",)));
 		}
 		let mut hash = [0_u8; 32];
 		input.read_exact(&mut hash).map_err(invalid_manifest)?;
 		let entry = ManifestEntry { path: path.clone(), mode, hash };
 		if entries.insert(path, entry).is_some() {
-			return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
-				"duplicate manifest path",
-			)));
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!("duplicate manifest path",)));
 		}
 	}
 	Ok(Manifest { prefixes, entries })
@@ -1015,15 +1007,12 @@ fn read_u32(reader: &mut impl Read) -> Result<u32, WorkspaceOperationError> {
 fn read_string(reader: &mut impl Read) -> Result<String, WorkspaceOperationError> {
 	let length = read_u32(reader)? as usize;
 	if length > MAX_MANIFEST_BYTES as usize {
-		return Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
-			"manifest path exceeds bound",
-		)));
+		return Err(WorkspaceOperationError::InvalidGeneration(sf!("manifest path exceeds bound",)));
 	}
 	let mut bytes = vec![0_u8; length];
 	reader.read_exact(&mut bytes).map_err(invalid_manifest)?;
-	String::from_utf8(bytes).map_err(|_| {
-		WorkspaceOperationError::InvalidGeneration(Str::new_static("manifest path is not UTF-8"))
-	})
+	String::from_utf8(bytes)
+		.map_err(|_| WorkspaceOperationError::InvalidGeneration(sf!("manifest path is not UTF-8")))
 }
 
 fn invalid_manifest(error: io::Error) -> WorkspaceOperationError {
@@ -1032,9 +1021,7 @@ fn invalid_manifest(error: io::Error) -> WorkspaceOperationError {
 
 const fn check_manifest_bound(bytes: u64) -> Result<(), WorkspaceOperationError> {
 	if bytes > MAX_MANIFEST_BYTES {
-		Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
-			"manifest exceeds size bound",
-		)))
+		Err(WorkspaceOperationError::InvalidGeneration(sf!("manifest exceeds size bound",)))
 	} else {
 		Ok(())
 	}

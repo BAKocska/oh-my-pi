@@ -32,7 +32,7 @@ use std::{
 	sync::Arc,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use opentelemetry::{KeyValue, Value, global::BoxedTracer, trace::Span as _};
 use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
@@ -355,7 +355,7 @@ impl Default for TelemetryConfig {
 	fn default() -> Self {
 		Self {
 			tracer: None,
-			tracer_name: Str::new_static(DEFAULT_TRACER_NAME),
+			tracer_name: sf!(DEFAULT_TRACER_NAME),
 			capture_message_content: CaptureMode::from_env_value(
 				std::env::var("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
 					.ok()
@@ -688,8 +688,7 @@ impl TelemetryConfig {
 	}
 
 	fn warn(&self, code: TelemetryWarningCode, message: &'static str, error: Str) {
-		let warning =
-			TelemetryWarning { code, message: Str::new_static(message), error: Some(error) };
+		let warning = TelemetryWarning { code, message: sf!(message), error: Some(error) };
 		self.telemetry_warning(&warning);
 	}
 }
@@ -718,7 +717,7 @@ fn panic_message(payload: Box<dyn Any + Send>) -> Str {
 	} else if let Some(message) = payload.downcast_ref::<String>() {
 		Str::new(message)
 	} else {
-		Str::new_static("telemetry hook panicked")
+		sf!("telemetry hook panicked")
 	}
 }
 
@@ -796,7 +795,7 @@ mod tests {
 		let _ = config.attributes_for_span(&context());
 		assert_eq!(
 			*seen.lock(),
-			Some((TelemetrySpanKind::Chat, Some(Str::new_static("claude-sonnet-4")), Some(3)))
+			Some((TelemetrySpanKind::Chat, Some(sf!("claude-sonnet-4")), Some(3)))
 		);
 	}
 
@@ -805,7 +804,7 @@ mod tests {
 		let warnings = Arc::new(Mutex::new(Vec::new()));
 		let capture = Arc::clone(&warnings);
 		let config = TelemetryConfig {
-			cost_estimator: Some(Arc::new(|_| Err(Str::new_static("pricing offline")))),
+			cost_estimator: Some(Arc::new(|_| Err(sf!("pricing offline")))),
 			on_telemetry_warning: Some(Arc::new(move |warning| {
 				capture.lock().push(warning.code);
 				Ok(())
@@ -832,23 +831,21 @@ mod tests {
 	fn custom_content_serializer_overrides_default() {
 		let config = TelemetryConfig {
 			content_serializer: TelemetryContentSerializer {
-				tool_call_arguments: Some(Arc::new(|_| Ok(Some(Str::new_static("custom"))))),
+				tool_call_arguments: Some(Arc::new(|_| Ok(Some(sf!("custom"))))),
 				..TelemetryContentSerializer::default()
 			},
 			..TelemetryConfig::default()
 		};
 		assert_eq!(
 			config.serialize_tool_call_arguments(&serde_json::json!({"secret": true})),
-			Some(Str::new_static("custom"))
+			Some(sf!("custom"))
 		);
 	}
 
 	#[test]
 	fn tracer_name_override_is_honored() {
-		let config = TelemetryConfig {
-			tracer_name: Str::new_static("host-tracer"),
-			..TelemetryConfig::default()
-		};
+		let config =
+			TelemetryConfig { tracer_name: sf!("host-tracer"), ..TelemetryConfig::default() };
 		assert_eq!(config.tracer_name(), "host-tracer");
 	}
 
@@ -879,8 +876,8 @@ mod tests {
 	#[test]
 	fn erroring_warning_hook_is_swallowed() {
 		let config = TelemetryConfig {
-			cost_estimator: Some(Arc::new(|_| Err(Str::new_static("failed")))),
-			on_telemetry_warning: Some(Arc::new(|_| Err(Str::new_static("also failed")))),
+			cost_estimator: Some(Arc::new(|_| Err(sf!("failed")))),
+			on_telemetry_warning: Some(Arc::new(|_| Err(sf!("also failed")))),
 			..TelemetryConfig::default()
 		};
 		let input = CostEstimatorContext {

@@ -1,6 +1,6 @@
 //! npm package metadata renderer backed by the public registry APIs.
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
 use url::Url;
@@ -131,7 +131,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 	}
 
 	let mut result = RenderResult::markdown(&markdown, "npm");
-	result.notes.push(Str::from("Fetched via npm registry"));
+	result.notes.push(sf!("Fetched via npm registry"));
 	Ok(Some(result))
 }
 

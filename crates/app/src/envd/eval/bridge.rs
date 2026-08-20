@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use im::OrdSet;
-use omp_core::Str;
+use omp_core::{IntoStr, Str, sf};
 use omp_tool::{
 	CapsBase, ErasedEv, ErasedOutcome, IncomingParams, ModelClass, Part, PromptCaps, Registry,
 	ToolIdentity, ToolRoute,
@@ -87,16 +87,16 @@ impl BridgeCapabilities {
 	pub(super) fn allowed_names(&self) -> Vec<Str> {
 		let mut names = self.tools.iter().cloned().collect::<Vec<_>>();
 		if self.completion {
-			names.push(Str::new_static(COMPLETION));
+			names.push(sf!(COMPLETION));
 		}
 		if self.agent {
-			names.push(Str::new_static(AGENT));
+			names.push(sf!(AGENT));
 		}
 		if self.concurrency {
-			names.push(Str::new_static(CONCURRENCY));
+			names.push(sf!(CONCURRENCY));
 		}
 		if self.budget {
-			names.push(Str::new_static(BUDGET));
+			names.push(sf!(BUDGET));
 		}
 		names
 	}
@@ -145,8 +145,8 @@ pub enum BridgeHostError {
 }
 
 impl BridgeHostError {
-	pub(crate) fn message(message: impl Into<Str>) -> Self {
-		Self::Message(message.into())
+	pub(crate) fn message(message: impl IntoStr) -> Self {
+		Self::Message(message.into_str())
 	}
 }
 
@@ -947,9 +947,9 @@ mod tests {
 		fn new(name: &'static str, invalid: bool) -> Self {
 			Self {
 				spec: ToolSpec {
-					name:            Str::new_static(name),
+					name:            sf!(name),
 					rev:             Rev { family: Str::default(), n: 1 },
-					description:     Str::new_static("eval bridge update probe"),
+					description:     sf!("eval bridge update probe"),
 					schema:          Bytes::from_static(
 						br#"{"type":"object","additionalProperties":false}"#,
 					),
@@ -1015,9 +1015,9 @@ mod tests {
 		let host = Arc::new(RecordingHost { calls: AtomicUsize::new(0), fail: false });
 		let registration = dispatcher
 			.register(
-				Str::new_static("session"),
-				Str::new_static("run"),
-				BridgeCapabilities::new([Str::new_static("read")]).with_budget(),
+				sf!("session"),
+				sf!("run"),
+				BridgeCapabilities::new([sf!("read")]).with_budget(),
 				host.clone(),
 				TimeoutHandle::new(None),
 			)
@@ -1033,7 +1033,7 @@ mod tests {
 		assert_eq!(host.calls.load(Ordering::Relaxed), 1);
 		assert_eq!(
 			client.call("write", json!({})).await,
-			Err(BridgeCallError::CapabilityDenied { name: Str::new_static("write") })
+			Err(BridgeCallError::CapabilityDenied { name: sf!("write") })
 		);
 		assert_eq!(host.calls.load(Ordering::Relaxed), 1, "denied calls never reach host");
 	}
@@ -1044,9 +1044,9 @@ mod tests {
 		let host = Arc::new(RecordingHost { calls: AtomicUsize::new(0), fail: false });
 		let registration = dispatcher
 			.register(
-				Str::new_static("session"),
-				Str::new_static("run"),
-				BridgeCapabilities::new([Str::new_static("read")]),
+				sf!("session"),
+				sf!("run"),
+				BridgeCapabilities::new([sf!("read")]),
 				host,
 				TimeoutHandle::new(None),
 			)
@@ -1107,16 +1107,16 @@ mod tests {
 		let dispatcher = dispatcher();
 		let registration = dispatcher
 			.register(
-				Str::new_static("session"),
-				Str::new_static("run"),
-				BridgeCapabilities::new([Str::new_static("read")]),
+				sf!("session"),
+				sf!("run"),
+				BridgeCapabilities::new([sf!("read")]),
 				Arc::new(RecordingHost { calls: AtomicUsize::new(0), fail: true }),
 				TimeoutHandle::new(None),
 			)
 			.expect("register bridge");
 		assert_eq!(
 			registration.client().call("read", json!({})).await,
-			Err(BridgeCallError::Host { message: Str::new_static("host exploded") })
+			Err(BridgeCallError::Host { message: sf!("host exploded") })
 		);
 	}
 
@@ -1130,13 +1130,7 @@ mod tests {
 		host.bind_parent(parent.clone()).expect("bind parent");
 		let capabilities = host.capabilities().expect("bound capabilities");
 		let registration = dispatcher()
-			.register(
-				Str::new_static("owner"),
-				Str::new_static("cell"),
-				capabilities,
-				host,
-				TimeoutHandle::new(None),
-			)
+			.register(sf!("owner"), sf!("cell"), capabilities, host, TimeoutHandle::new(None))
 			.expect("register owner");
 		let client = registration.client();
 		for (name, operation) in [
@@ -1164,26 +1158,16 @@ mod tests {
 			.expect("bind registry");
 		let capabilities = host.capabilities().expect("bound capabilities");
 		let registration = dispatcher()
-			.register(
-				Str::new_static("owner"),
-				Str::new_static("cell"),
-				capabilities,
-				host,
-				TimeoutHandle::new(None),
-			)
+			.register(sf!("owner"), sf!("cell"), capabilities, host, TimeoutHandle::new(None))
 			.expect("register owner");
 		assert_eq!(
 			registration.client().call(COMPLETION, json!({})).await,
-			Err(BridgeCallError::CapabilityDenied { name: Str::new_static(COMPLETION) })
+			Err(BridgeCallError::CapabilityDenied { name: sf!(COMPLETION) })
 		);
 	}
 
 	fn test_claims() -> Claims {
-		Claims {
-			precedence: Precedence::CORE,
-			claimant:   Str::new_static("omp/core"),
-			replaces:   None,
-		}
+		Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 	}
 
 	#[tokio::test]

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use omp_agent::Budget;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::{
 	inference::v1::TaskBudget,
 	thread::v1::{Item, Message, Part, Role, item, part},
@@ -378,11 +378,11 @@ fn builtin_available() -> Vec<AvailableCommand> {
 	COMMANDS
 		.iter()
 		.map(|spec| AvailableCommand {
-			name:        Str::new_static(spec.name),
+			name:        sf!(spec.name),
 			aliases:     spec.aliases.iter().copied().map(Str::new_static).collect(),
-			description: Str::new_static(spec.description),
-			hint:        (!spec.usage.is_empty()).then(|| Str::new_static(spec.usage)),
-			origin:      Str::new_static("builtin"),
+			description: sf!(spec.description),
+			hint:        (!spec.usage.is_empty()).then(|| sf!(spec.usage)),
+			origin:      sf!("builtin"),
 			template:    None,
 			builtin:     true,
 		})
@@ -663,7 +663,7 @@ pub fn parse_budget_prefix(text: &str) -> Result<(&str, Option<ParsedTurnBudget>
 }
 
 fn unavailable(command: &'static str, reason: &'static str) -> ChatCommand {
-	ChatCommand::Unavailable { command: Str::new_static(command), reason: Str::new_static(reason) }
+	ChatCommand::Unavailable { command: sf!(command), reason: sf!(reason) }
 }
 
 /// Splits arguments on unquoted whitespace. Single/double quotes group values;
@@ -801,12 +801,12 @@ mod tests {
 		template: &'static str,
 	) -> CommandContribution {
 		CommandContribution {
-			name:        Str::new_static(name),
+			name:        sf!(name),
 			aliases:     SmallVec::new(),
-			description: Str::new_static(description),
+			description: sf!(description),
 			hint:        None,
-			origin:      Str::new_static(origin),
-			template:    Some(Str::new_static(template)),
+			origin:      sf!(origin),
+			template:    Some(sf!(template)),
 		}
 	}
 
@@ -815,7 +815,7 @@ mod tests {
 		let commands = builtins();
 		assert_eq!(commands.parse_input("/live"), Ok(ChatCommand::Live));
 		assert_eq!(parse_slash("/model: smol"), Some(ParsedSlash { name: "model", args: "smol" }));
-		assert_eq!(commands.parse_input("/model:smol"), Ok(ChatCommand::Model(Str::from("smol"))));
+		assert_eq!(commands.parse_input("/model:smol"), Ok(ChatCommand::Model(sf!("smol"))));
 		assert_eq!(commands.parse_input("/q"), Ok(ChatCommand::Quit));
 		assert_eq!(submit_text(commands.parse_input("/unknown arg").unwrap()), "/unknown arg");
 		assert_eq!(
@@ -827,16 +827,13 @@ mod tests {
 	#[test]
 	fn parses_execution_mode_commands_without_submitting_text() {
 		let commands = builtins();
-		assert_eq!(commands.parse_input("/plan yolo"), Ok(ChatCommand::Plan(Str::from("yolo"))));
+		assert_eq!(commands.parse_input("/plan yolo"), Ok(ChatCommand::Plan(sf!("yolo"))));
 		assert_eq!(
 			commands.parse_input("/goal set finish migration 12000"),
-			Ok(ChatCommand::Goal(Str::from("set finish migration 12000")))
+			Ok(ChatCommand::Goal(sf!("set finish migration 12000")))
 		);
-		assert_eq!(commands.parse_input("/vibe on"), Ok(ChatCommand::Vibe(Str::from("on"))));
-		assert_eq!(
-			commands.parse_input("/prewalk status"),
-			Ok(ChatCommand::Prewalk(Str::from("status")))
-		);
+		assert_eq!(commands.parse_input("/vibe on"), Ok(ChatCommand::Vibe(sf!("on"))));
+		assert_eq!(commands.parse_input("/prewalk status"), Ok(ChatCommand::Prewalk(sf!("status"))));
 	}
 
 	#[test]
@@ -929,8 +926,8 @@ mod tests {
 		assert_eq!(
 			builtins().parse_input("/compact summary"),
 			Ok(ChatCommand::Unavailable {
-				command: Str::from("compact"),
-				reason:  Str::from("manual compaction is not exposed by the agent backend"),
+				command: sf!("compact"),
+				reason:  sf!("manual compaction is not exposed by the agent backend"),
 			})
 		);
 	}

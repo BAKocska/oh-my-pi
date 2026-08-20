@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 use bytes::Bytes;
 use futures::{Stream, stream};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_env::{EnvClient, frame};
 use omp_proto::{
 	inference::v1::{Invoke, InvokeComplete, InvokeInput, exec_status, invoke_input},
@@ -50,9 +50,9 @@ impl ScriptTool {
 	fn new(project_inputs: bool) -> Self {
 		Self {
 			spec: ToolSpec {
-				name: Str::from("script"),
-				rev: Rev { family: Str::from("script"), n: 1 },
-				description: Str::from("scripted duplex tool"),
+				name: sf!("script"),
+				rev: Rev { family: sf!("script"), n: 1 },
+				description: sf!("scripted duplex tool"),
 				schema: Bytes::from_static(
 					br#"{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}"#,
 				),
@@ -110,7 +110,7 @@ fn manager_with_projection(
 	registry
 		.register(ScriptTool::new(project_inputs), Presentation::Slot, Claims {
 			precedence: Precedence::CORE,
-			claimant:   Str::new_static("omp/core"),
+			claimant:   sf!("omp/core"),
 			replaces:   None,
 		})
 		.expect("register scripted tool");
@@ -217,10 +217,8 @@ async fn successful_invocation_preserves_canonical_result() {
 	let (mut manager, requests, responses) = manager();
 	let args = Bytes::from_static(br#"{"value":7}"#);
 	let verdict = Bytes::from(
-		serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload {
-			answer: Str::from("seven"),
-		}))
-		.expect("serialize verdict"),
+		serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload { answer: sf!("seven") }))
+			.expect("serialize verdict"),
 	);
 	let server = serve_one(requests, responses, "call-1", args, verdict, false);
 	manager.start(invoke("invoke-1", "call-1", 7));
@@ -243,10 +241,8 @@ async fn typed_fault_completes_as_failed_without_losing_result_fields() {
 	let (mut manager, requests, responses) = manager();
 	let args = Bytes::from_static(br#"{"value":9}"#);
 	let verdict = Bytes::from(
-		serde_json::to_vec(&CallOutcome::<Payload, Fault>::Faulted(Fault {
-			message: Str::from("boom"),
-		}))
-		.expect("serialize verdict"),
+		serde_json::to_vec(&CallOutcome::<Payload, Fault>::Faulted(Fault { message: sf!("boom") }))
+			.expect("serialize verdict"),
 	);
 	let server = serve_one(requests, responses, "call-f", args, verdict, true);
 	manager.start(invoke("invoke-f", "call-f", 9));
@@ -280,7 +276,7 @@ async fn two_invocations_remain_concurrent_and_complete_independently() {
 		}
 		assert_eq!(ids.len(), 2, "both invocations opened before either completed");
 		for call_id in ["call-b", "call-a"] {
-			let verdict = CallOutcome::<Payload, Fault>::Ok(Payload { answer: Str::from(call_id) });
+			let verdict = CallOutcome::<Payload, Fault>::Ok(Payload { answer: Str::new(call_id) });
 			respond(
 				&responses,
 				ids[call_id],
@@ -447,7 +443,7 @@ async fn typed_updates_are_ordered_before_completion() {
 				}),
 			);
 		}
-		let verdict = CallOutcome::<Payload, Fault>::Ok(Payload { answer: Str::from("done") });
+		let verdict = CallOutcome::<Payload, Fault>::Ok(Payload { answer: sf!("done") });
 		respond(
 			&responses,
 			request_id,
@@ -496,7 +492,7 @@ async fn default_update_projection_yields_only_completion() {
 				..Default::default()
 			}),
 		);
-		let verdict = CallOutcome::<Payload, Fault>::Ok(Payload { answer: Str::from("done") });
+		let verdict = CallOutcome::<Payload, Fault>::Ok(Payload { answer: sf!("done") });
 		respond(
 			&responses,
 			request_id,

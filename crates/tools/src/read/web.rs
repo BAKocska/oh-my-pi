@@ -8,7 +8,7 @@ use html_to_markdown_rs::{
 	ConversionOptions, PreprocessingOptions, PreprocessingPreset, TierStrategy, WarningKind,
 	convert as convert_html,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use quick_xml::{Reader, events::Event};
 use rusqlite::{Connection, MAIN_DB};
 use smallvec::SmallVec;
@@ -64,16 +64,16 @@ pub fn parse_target(input: &str) -> Result<Option<ParsedTarget>, WebError> {
 	if split.selector.is_some() {
 		let nested = selector::split_path_and_selector(path);
 		if nested.selector.is_some() {
-			return Err(WebError::InvalidUrl(Str::new_static(
+			return Err(WebError::InvalidUrl(sf!(
 				"URL selector has multiple range groups; combine them with commas (e.g. \
 				 `:5-10,20-30`).",
 			)));
 		}
 	}
 	let parsed_selector = selector::parse_selector(split.selector)
-		.map_err(|error| WebError::InvalidUrl(Str::from(error.to_string())))?;
+		.map_err(|error| WebError::InvalidUrl(Str::new(error.to_string())))?;
 	if matches!(parsed_selector, selector::ParsedSelector::Conflicts) {
-		return Err(WebError::InvalidUrl(Str::new_static(
+		return Err(WebError::InvalidUrl(sf!(
 			"The :conflicts selector is only valid for local text files",
 		)));
 	}
@@ -111,7 +111,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 ) -> Result<WebRead, WebError> {
 	if !raw && let Some(render) = scrapers::render(client, url).await? {
 		return Ok(WebRead {
-			final_url: url.as_str().into(),
+			final_url: Str::new(url.as_str()),
 			render:    finish(render),
 			image:     None,
 		});
@@ -122,13 +122,13 @@ pub async fn read_resource<C: HttpClient + Sync>(
 	let content_type = normalized_content_type(&response);
 	if !response.is_success() {
 		let mut notes = SmallVec::new();
-		notes.push(Str::from(format!("Failed to fetch URL (HTTP {})", response.status)));
+		notes.push(sf!("Failed to fetch URL (HTTP {})", response.status));
 		return Ok(WebRead {
 			final_url,
 			render: RenderResult {
-				content: Str::new_static(""),
+				content: Default::default(),
 				content_type: Some(content_type),
-				method: Str::new_static("failed"),
+				method: sf!("failed"),
 				notes,
 			},
 			image: None,
@@ -141,7 +141,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 			render: finish(RenderResult {
 				content:      decode_response(&response),
 				content_type: Some(content_type),
-				method:       Str::new_static("raw"),
+				method:       sf!("raw"),
 				notes:        SmallVec::new(),
 			}),
 			image: None,
@@ -159,8 +159,8 @@ pub async fn read_resource<C: HttpClient + Sync>(
 			render: finish(RenderResult {
 				content,
 				content_type: Some(processed.media_type.clone()),
-				method: Str::new_static("image"),
-				notes: smallvec::smallvec![Str::new_static("Fetched image binary")],
+				method: sf!("image"),
+				notes: smallvec::smallvec![sf!("Fetched image binary")],
 			}),
 			image: Some(processed),
 		});
@@ -171,7 +171,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 		match markit::convert(&path, &response.body) {
 			Ok(Some(converted)) => {
 				let mut notes = SmallVec::new();
-				notes.push(Str::new_static("Converted with markit"));
+				notes.push(sf!("Converted with markit"));
 				if let Some(note) = converted.note {
 					notes.push(note);
 				}
@@ -180,7 +180,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 					render: finish(RenderResult {
 						content: converted.text,
 						content_type: Some(content_type),
-						method: Str::new_static("markit"),
+						method: sf!("markit"),
 						notes,
 					}),
 					image: None,
@@ -192,7 +192,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 					final_url,
 					content_type,
 					response.body.len(),
-					Str::from(format!("markit conversion failed: {error}")),
+					sf!("markit conversion failed: {error}"),
 				));
 			},
 		}
@@ -205,7 +205,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				render: finish(RenderResult {
 					content:      rendered.text.into(),
 					content_type: Some(content_type),
-					method:       Str::new_static("notebook"),
+					method:       sf!("notebook"),
 					notes:        SmallVec::new(),
 				}),
 				image: None,
@@ -214,7 +214,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				final_url,
 				content_type,
 				response.body.len(),
-				Str::from(format!("Notebook rendering failed: {}", error.message())),
+				sf!("Notebook rendering failed: {}", error.message()),
 			)),
 		};
 	}
@@ -226,7 +226,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				render: finish(RenderResult {
 					content:      content.into(),
 					content_type: Some(content_type),
-					method:       Str::new_static("sqlite"),
+					method:       sf!("sqlite"),
 					notes:        SmallVec::new(),
 				}),
 				image: None,
@@ -235,7 +235,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				final_url,
 				content_type,
 				response.body.len(),
-				Str::from(format!("SQLite rendering failed: {error}")),
+				sf!("SQLite rendering failed: {error}"),
 			)),
 		};
 	}
@@ -249,7 +249,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				render: finish(RenderResult {
 					content:      content.into(),
 					content_type: Some(content_type),
-					method:       Str::new_static("archive"),
+					method:       sf!("archive"),
 					notes:        SmallVec::new(),
 				}),
 				image: None,
@@ -258,7 +258,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				final_url,
 				content_type,
 				response.body.len(),
-				Str::from(format!("Archive rendering failed: {error}")),
+				sf!("Archive rendering failed: {error}"),
 			)),
 		};
 	}
@@ -332,12 +332,9 @@ async fn render_html<C: HttpClient + Sync>(
 		if usable_alternate(&content, ALTERNATE_MIN_CHARS) {
 			let render = RenderResult {
 				content,
-				content_type: Some(Str::new_static("text/markdown")),
-				method: Str::new_static("alternate-markdown"),
-				notes: smallvec::smallvec![Str::from(format!(
-					"Used markdown alternate: {}",
-					alternate.url
-				))],
+				content_type: Some(sf!("text/markdown")),
+				method: sf!("alternate-markdown"),
+				notes: smallvec::smallvec![sf!("Used markdown alternate: {}", alternate.url)],
 			};
 			return Ok(WebRead { final_url, render: finish(render), image: None });
 		}
@@ -352,9 +349,9 @@ async fn render_html<C: HttpClient + Sync>(
 				final_url,
 				render: finish(RenderResult {
 					content,
-					content_type: Some(Str::new_static("text/markdown")),
-					method: Str::new_static("md-suffix"),
-					notes: smallvec::smallvec![Str::new_static("Found .md suffix version")],
+					content_type: Some(sf!("text/markdown")),
+					method: sf!("md-suffix"),
+					notes: smallvec::smallvec![sf!("Found .md suffix version")],
 				}),
 				image: None,
 			});
@@ -374,10 +371,8 @@ async fn render_html<C: HttpClient + Sync>(
 				render: finish(RenderResult {
 					content,
 					content_type: Some(negotiated_type.clone()),
-					method: Str::new_static("content-negotiation"),
-					notes: smallvec::smallvec![Str::from(format!(
-						"Content negotiation returned {negotiated_type}"
-					))],
+					method: sf!("content-negotiation"),
+					notes: smallvec::smallvec![sf!("Content negotiation returned {negotiated_type}")],
 				}),
 				image: None,
 			});
@@ -398,12 +393,9 @@ async fn render_html<C: HttpClient + Sync>(
 					final_url,
 					render: finish(RenderResult {
 						content:      render_feed(&content).into(),
-						content_type: Some(Str::new_static("application/feed")),
-						method:       Str::new_static("alternate-feed"),
-						notes:        smallvec::smallvec![Str::from(format!(
-							"Used feed alternate: {}",
-							alternate.url
-						))],
+						content_type: Some(sf!("application/feed")),
+						method:       sf!("alternate-feed"),
+						notes:        smallvec::smallvec![sf!("Used feed alternate: {}", alternate.url)],
 					}),
 					image: None,
 				});
@@ -417,7 +409,7 @@ async fn render_html<C: HttpClient + Sync>(
 			render: finish(RenderResult {
 				content:      markdown,
 				content_type: Some(content_type),
-				method:       Str::new_static("native"),
+				method:       sf!("native"),
 				notes:        SmallVec::new(),
 			}),
 			image: None,
@@ -425,20 +417,19 @@ async fn render_html<C: HttpClient + Sync>(
 		converted => {
 			let mut notes = SmallVec::new();
 			match converted {
-				Ok(_) => notes
-					.push(Str::new_static("Page appears to require JavaScript or is mostly navigation")),
-				Err(_) => notes.push(Str::new_static(
-					"html rendering failed (no reader backend produced usable output)",
-				)),
+				Ok(_) => notes.push(sf!("Page appears to require JavaScript or is mostly navigation")),
+				Err(_) => {
+					notes.push(sf!("html rendering failed (no reader backend produced usable output)",))
+				},
 			}
 			if let Some((endpoint, content)) = try_llms(client, &final_parsed).await {
-				notes.push(Str::from(format!("Used llms.txt fallback: {endpoint}")));
+				notes.push(sf!("Used llms.txt fallback: {endpoint}"));
 				return Ok(WebRead {
 					final_url,
 					render: finish(RenderResult {
 						content,
-						content_type: Some(Str::new_static("text/plain")),
-						method: Str::new_static("llms.txt"),
+						content_type: Some(sf!("text/plain")),
+						method: sf!("llms.txt"),
 						notes,
 					}),
 					image: None,
@@ -447,9 +438,9 @@ async fn render_html<C: HttpClient + Sync>(
 			Ok(WebRead {
 				final_url,
 				render: finish(RenderResult {
-					content: html.into(),
+					content: Str::new(html),
 					content_type: Some(content_type),
-					method: Str::new_static("raw-html"),
+					method: sf!("raw-html"),
 					notes,
 				}),
 				image: None,
@@ -480,7 +471,7 @@ fn finish(mut result: RenderResult) -> RenderResult {
 	if truncated {
 		result
 			.notes
-			.push(Str::new_static("Output truncated to 500000 characters"));
+			.push(sf!("Output truncated to 500000 characters"));
 	}
 	result
 }
@@ -496,7 +487,7 @@ fn text_result(
 		render: finish(RenderResult {
 			content:      content.into(),
 			content_type: Some(content_type),
-			method:       Str::new_static(method),
+			method:       sf!(method),
 			notes:        SmallVec::new(),
 		}),
 		image: None,
@@ -506,14 +497,14 @@ fn text_result(
 fn binary_fallback(final_url: Str, content_type: Str, bytes: usize, note: Str) -> WebRead {
 	WebRead {
 		render: RenderResult {
-			content:      Str::from(format!(
+			content:      sf!(
 				"[Binary content: {}, {}] {}",
 				content_type,
 				format_bytes(bytes),
 				final_url
-			)),
+			),
 			content_type: Some(content_type),
-			method:       Str::new_static("binary"),
+			method:       sf!("binary"),
 			notes:        smallvec::smallvec![note],
 		},
 		final_url,
@@ -570,7 +561,7 @@ fn normalized_content_type(response: &HttpResponse) -> Str {
 		.as_deref()
 		.or_else(|| response.header("content-type"))
 		.unwrap_or("application/octet-stream");
-	Str::from(normalize_mime(value).to_ascii_lowercase())
+	Str::new(normalize_mime(value).to_ascii_lowercase())
 }
 
 fn normalize_mime(value: &str) -> &str {

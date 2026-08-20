@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt as _};
 use omp_agent::{
 	Journal, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession, project_journal,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_e2e::support::{DEFAULT_TIMEOUT, Scratch, ScriptedGateway, within};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{
@@ -49,9 +49,9 @@ impl LiveEdit {
 	const fn new(allow_lift: bool) -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static("edit"),
-				rev:             Rev { family: Str::new_static("hl"), n: 2 },
-				description:     Str::new_static("apply a hashline edit"),
+				name:            sf!("edit"),
+				rev:             Rev { family: sf!("hl"), n: 2 },
+				description:     sf!("apply a hashline edit"),
 				schema:          Bytes::from_static(HL2_SCHEMA),
 				constraint:      Constraint::Schema {
 					priority:       1,
@@ -72,9 +72,9 @@ impl HistoricalEdit {
 	const fn new() -> Self {
 		Self {
 			spec: ToolSpec {
-				name:            Str::new_static("edit"),
-				rev:             Rev { family: Str::new_static("hl"), n: 1 },
-				description:     Str::new_static("historical hashline edit"),
+				name:            sf!("edit"),
+				rev:             Rev { family: sf!("hl"), n: 1 },
+				description:     sf!("historical hashline edit"),
 				schema:          Bytes::from_static(HL1_SCHEMA),
 				constraint:      Constraint::Schema {
 					priority:       1,
@@ -187,11 +187,7 @@ fn registry(allow_lift: bool) -> Registry {
 }
 
 fn core_claims() -> Claims {
-	Claims {
-		precedence: Precedence::CORE,
-		claimant:   Str::new_static("omp/core"),
-		replaces:   None,
-	}
+	Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 }
 
 fn json_proto_value(value: Value) -> pb::Value {
@@ -305,7 +301,7 @@ fn persisted_fixture() -> (TempDir, Journal, thread_pb::Thread) {
 	let path = directory.path().join("schema-isolation.jsonl");
 	let header = Header {
 		v:       4,
-		id:      SessionId(Str::new_static("p4-schema-isolation")),
+		id:      SessionId(sf!("p4-schema-isolation")),
 		created: 1,
 		cwd:     directory.path().to_owned(),
 	};
@@ -406,7 +402,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		panic!("registry must advertise exactly one live edit definition")
 	};
 	assert_eq!(advertised_edit.identity.name.as_str(), "edit");
-	assert_eq!(advertised_edit.identity.rev, Rev { family: Str::new_static("hl"), n: 2 });
+	assert_eq!(advertised_edit.identity.rev, Rev { family: sf!("hl"), n: 2 });
 	let (advertised_schema, strict) = advertised_edit
 		.definition
 		.input
@@ -423,10 +419,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 	);
 
 	let recorded = RecordedCallOwned {
-		identity: ToolIdentity {
-			name: Str::new_static("edit"),
-			rev:  Rev { family: Str::new_static("hl"), n: 1 },
-		},
+		identity: ToolIdentity { name: sf!("edit"), rev: Rev { family: sf!("hl"), n: 1 } },
 		raw_args: Bytes::from_static(br#"{"legacy_patch":"alpha","recorded_arg_nonce":"args-one"}"#),
 		verdict:  Bytes::from(
 			serde_json::to_vec(&recorded_verdict("faulted", "verdict-one", 7))

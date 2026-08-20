@@ -16,7 +16,7 @@ use omp_agent::{
 	TurnInput, TurnOptions, TurnSession, WorkspaceInput,
 };
 use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_e2e::support::{
 	AllowAdmission, Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
 	accepted_event, install_omp_binary_env, omp_binary, outcome_event, tool_call_item, turn_event,
@@ -76,11 +76,8 @@ impl RealEnv {
 				Registry::new(),
 				ExtHostConfig::new(
 					omp_binary().expect("Cargo-built e2e host"),
-					omp_core::Principal::new(
-						omp_core::Str::new_static("e2e-tester"),
-						omp_core::Str::new_static("E2E Tester"),
-					),
-					omp_core::Str::new_static("p3-session"),
+					omp_core::Principal::new(omp_core::sf!("e2e-tester"), omp_core::sf!("E2E Tester")),
+					omp_core::sf!("p3-session"),
 					1,
 				),
 			)
@@ -157,7 +154,7 @@ async fn connect_env(
 fn journal(path: &Path, root: &Path) -> Journal {
 	Journal::create(path, &Header {
 		v:       4,
-		id:      SessionId(Str::new_static("p3-detached-jobs")),
+		id:      SessionId(sf!("p3-detached-jobs")),
 		created: 1,
 		cwd:     root.to_owned(),
 	})
@@ -165,9 +162,9 @@ fn journal(path: &Path, root: &Path) -> Journal {
 }
 
 fn state(root: &Path, registry: Arc<Registry>) -> AgentState {
-	let turn = TurnOptions { context_id: Some(Str::new_static("p3-context")), ..Default::default() };
+	let turn = TurnOptions { context_id: Some(sf!("p3-context")), ..Default::default() };
 	let snapshot = AgentSnapshot {
-		enabled_tools: Arc::from([Str::new_static("shell")]),
+		enabled_tools: Arc::from([sf!("shell")]),
 		..AgentSnapshot::new(turn, WorkspaceInput::new(root, Arc::from([])), registry)
 	};
 	AgentState::new(snapshot)
@@ -188,10 +185,8 @@ fn end_outcome(head: u64) -> inference::Outcome {
 }
 
 fn shell_turn(name: &str, command: String) -> ScriptedTurn {
-	let identity = ToolIdentity {
-		name: Str::new_static("shell"),
-		rev:  omp_tool::Rev { family: Str::default(), n: 1 },
-	};
+	let identity =
+		ToolIdentity { name: sf!("shell"), rev: omp_tool::Rev { family: Str::default(), n: 1 } };
 	let args = Bytes::from(
 		serde_json::to_vec(&serde_json::json!({
 			"command": command,
@@ -677,8 +672,8 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 			generation: started.generation,
 		},
 		artifact: ExpectedArtifact {
-			description: Str::new_static("expected PNG render"),
-			media_type:  Some(Str::new_static("image/png")),
+			description: sf!("expected PNG render"),
+			media_type:  Some(sf!("image/png")),
 			lifetime:    ArtifactLifetime::Session,
 		},
 	};
@@ -740,7 +735,7 @@ async fn detached_replay_acceptance_comes_from_real_gateway_authority() {
 	let scratch = Scratch::new().expect("gateway replay scratch");
 	let script = FakeScript::chat(vec![
 		Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
-		Ok(ChatEvent::TextDelta { index: 0, text: Str::new_static("durable replay") }),
+		Ok(ChatEvent::TextDelta { index: 0, text: sf!("durable replay") }),
 		Ok(ChatEvent::Completed(Completion {
 			reason:  FinishReason::Stop,
 			blocks:  1,
@@ -752,7 +747,7 @@ async fn detached_replay_acceptance_comes_from_real_gateway_authority() {
 		.await
 		.expect("real scripted gateway");
 	let options = TurnOptions {
-		context_id: Some(Str::new_static("p3-replay-context")),
+		context_id: Some(sf!("p3-replay-context")),
 		params: inference::ChatParams { model: gateway.model().to_owned(), ..Default::default() },
 		..Default::default()
 	};

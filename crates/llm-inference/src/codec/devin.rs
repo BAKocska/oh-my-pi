@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use omp_core::{Str, encoding::base64};
+use omp_core::{IntoStr, Str, encoding::base64, sf};
 use prost::Message as _;
 use prost_types::FileDescriptorSet;
 use serde::Deserialize;
@@ -218,11 +218,11 @@ pub struct DevinClientMetadata {
 impl Default for DevinClientMetadata {
 	fn default() -> Self {
 		Self {
-			ide_name:          Str::new_static("windsurf"),
-			ide_version:       Str::new_static("3.2.23"),
-			extension_name:    Str::new_static("windsurf"),
-			extension_version: Str::new_static("1.48.2"),
-			locale:            Str::new_static("en"),
+			ide_name:          sf!("windsurf"),
+			ide_version:       sf!("3.2.23"),
+			extension_name:    sf!("windsurf"),
+			extension_version: sf!("1.48.2"),
+			locale:            sf!("en"),
 		}
 	}
 }
@@ -240,10 +240,10 @@ pub struct CascadeSession {
 
 impl CascadeSession {
 	/// Creates the first wire attempt for a logical Cascade turn.
-	pub fn new(cascade_id: impl Into<Str>, execution_id: impl Into<Str>) -> Self {
+	pub fn new(cascade_id: impl IntoStr, execution_id: impl IntoStr) -> Self {
 		Self {
-			cascade_id:        cascade_id.into(),
-			execution_id:      execution_id.into(),
+			cascade_id:        cascade_id.into_str(),
+			execution_id:      execution_id.into_str(),
 			reconnect_attempt: 0,
 		}
 	}
@@ -341,12 +341,12 @@ impl DevinCodec {
 				.as_ref()
 				.map(|info| info.model_family_uid.trim())
 				.filter(|class| !class.is_empty())
-				.map(Str::from);
-			let id = Str::from(id);
+				.map(Str::new);
+			let id = Str::new(id);
 			let name = if config.label.trim().is_empty() {
 				id.clone()
 			} else {
-				Str::from(config.label.trim())
+				Str::new(config.label.trim())
 			};
 			models.insert(id.clone(), DevinDiscoveredModel {
 				id,
@@ -419,15 +419,9 @@ impl Codec for DevinCodec {
 					method:      RequestMethod::Post,
 					uri:         endpoint(&context.route.endpoint.base_url, DISCOVERY_PATH),
 					headers:     Box::new([
-						RequestHeader { name: Str::new_static("accept"), value: Str::new_static("*/*") },
-						RequestHeader {
-							name:  Str::new_static("content-type"),
-							value: Str::new_static("application/proto"),
-						},
-						RequestHeader {
-							name:  Str::new_static("connect-protocol-version"),
-							value: Str::new_static("1"),
-						},
+						RequestHeader { name: sf!("accept"), value: sf!("*/*") },
+						RequestHeader { name: sf!("content-type"), value: sf!("application/proto") },
+						RequestHeader { name: sf!("connect-protocol-version"), value: sf!("1") },
 					]),
 					body:        BodySource::Bytes(template.clone()),
 					framing:     FramingProtocol::Raw,
@@ -766,7 +760,7 @@ impl Decoder for DiscoveryDecoder {
 				}),
 				extended_context_mode: None,
 				availability:          Some(omp_llm_catalog::ModelAvailability::Available),
-				source:                Str::new_static("devin.get-cli-model-configs"),
+				source:                sf!("devin.get-cli-model-configs"),
 				observed_at_ms:        None,
 				updated_at_ms:         None,
 				deprecated:            Some(false),
@@ -898,7 +892,7 @@ impl CascadeDecoder {
 		let state = self.tools.entry(key.clone()).or_insert_with(|| {
 			let index = self.next_index;
 			self.next_index = self.next_index.saturating_add(1);
-			let name = Str::from(call.name.as_str());
+			let name = Str::new(call.name.as_str());
 			emit(RawEvent::Chat(ChatEvent::ToolCallStarted {
 				index,
 				id: ToolCallId::new(key.as_str()),
@@ -943,7 +937,7 @@ impl CascadeDecoder {
 				StopReason::MaxTokens => FinishReason::Length,
 				StopReason::ContentFilter => FinishReason::ContentFilter,
 				StopReason::StopPattern => FinishReason::Stop,
-				other => FinishReason::Other(Str::from(other.as_str_name())),
+				other => FinishReason::Other(Str::new(other.as_str_name())),
 			}
 		} else {
 			FinishReason::ToolCalls
@@ -1001,7 +995,7 @@ pub fn classify_cascade_error(code: &str, evidence: CascadeRequestEvidence) -> E
 	} else {
 		protocol_error(ErrorPhase::Streaming, "devin.connect.status")
 	};
-	error.code(Str::from(code))
+	error.code(Str::new(code))
 }
 
 fn connect_gzip_message(payload: &[u8]) -> Result<Bytes, Error> {
@@ -1044,37 +1038,19 @@ fn positive_i32(value: i32) -> Option<u64> {
 
 fn chat_headers() -> Box<[RequestHeader]> {
 	Box::new([
-		RequestHeader {
-			name:  Str::new_static("content-type"),
-			value: Str::new_static("application/connect+proto"),
-		},
-		RequestHeader {
-			name:  Str::new_static("connect-protocol-version"),
-			value: Str::new_static("1"),
-		},
-		RequestHeader {
-			name:  Str::new_static("connect-content-encoding"),
-			value: Str::new_static("gzip"),
-		},
-		RequestHeader {
-			name:  Str::new_static("accept-encoding"),
-			value: Str::new_static("identity"),
-		},
-		RequestHeader {
-			name:  Str::new_static("user-agent"),
-			value: Str::new_static("connect-go/1.18.1 (go1.26.3)"),
-		},
-		RequestHeader {
-			name:  Str::new_static("connect-accept-encoding"),
-			value: Str::new_static("gzip"),
-		},
+		RequestHeader { name: sf!("content-type"), value: sf!("application/connect+proto") },
+		RequestHeader { name: sf!("connect-protocol-version"), value: sf!("1") },
+		RequestHeader { name: sf!("connect-content-encoding"), value: sf!("gzip") },
+		RequestHeader { name: sf!("accept-encoding"), value: sf!("identity") },
+		RequestHeader { name: sf!("user-agent"), value: sf!("connect-go/1.18.1 (go1.26.3)") },
+		RequestHeader { name: sf!("connect-accept-encoding"), value: sf!("gzip") },
 	])
 }
 
 fn endpoint(base: &str, path: &str) -> Str {
 	let mut uri = base.trim_end_matches('/').to_owned();
 	uri.push_str(path);
-	Str::from(uri)
+	Str::new(uri)
 }
 
 fn invalid_request(reason: &'static str) -> Error {
@@ -1087,7 +1063,7 @@ fn protocol_error(phase: ErrorPhase, reason: &'static str) -> Error {
 
 fn protocol_error_with_kind(kind: ErrorKind, phase: ErrorPhase, reason: &'static str) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }
 
 /// RPC path used by credential middleware for model discovery.

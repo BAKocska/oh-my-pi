@@ -13,7 +13,7 @@ use std::{
 	},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_storage::{
 	state::{DurableRequest, StateAuthority, StateRevision},
 	transcript::InvocationTransition,
@@ -104,7 +104,7 @@ impl ControlSender {
 	/// # Errors
 	pub async fn checkpoint(&self, label: Str) -> Result<u64, ControlError> {
 		let sequence = self.next_receipt.fetch_add(1, Ordering::Relaxed);
-		let request_id = Str::from(format!("checkpoint-{sequence}"));
+		let request_id = sf!("checkpoint-{sequence}");
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
@@ -292,7 +292,7 @@ impl ControlSender {
 	/// Returns [`ControlError::Closed`] if the agent loop stopped receiving.
 	pub async fn schedule_rewind(&self, target: u64, scope: Str) -> Result<RewindAck, ControlError> {
 		let sequence = self.next_receipt.fetch_add(1, Ordering::Relaxed);
-		let receipt = Str::from(format!("rewind-{sequence}"));
+		let receipt = sf!("rewind-{sequence}");
 		let (ack, response) = flume::bounded(1);
 		self
 			.commands

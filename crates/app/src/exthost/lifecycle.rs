@@ -3,7 +3,7 @@
 use std::{collections::BTreeSet, future::Future, sync::Arc, time::SystemTime};
 
 use omp_agent::{HookPhase, MailboxSender, device_availability_interrupt};
-pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason};
+pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{Provenance, Str};
 use omp_proto::{
 	thread::v1::{Item, Message, Part, Role, item, part},
@@ -423,7 +423,7 @@ impl ExtensionManifest {
 	) -> Self {
 		Self::new(
 			provenance,
-			Str::new_static("omp_py_eval"),
+			sf!("omp_py_eval"),
 			[],
 			DeclarationSet::new([ToolDeclarationKey::new("py_eval", "", 1)], []),
 			ServiceManifest::default(),

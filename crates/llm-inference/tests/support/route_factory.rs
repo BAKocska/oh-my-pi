@@ -8,7 +8,7 @@ use std::{
 	time::SystemTime,
 };
 
-use omp_core::Str;
+use omp_core::sf;
 use omp_llm_catalog::{OperationKind, provider::RouteDef, snapshot::Catalog};
 use omp_llm_inference::{
 	answer::{Answer, AnswerBody, ResponseMeta},
@@ -83,7 +83,7 @@ impl Service<LayerCall<Call>> for CountingRoute {
 			provider:            self.provider.clone(),
 			route:               self.route.clone(),
 			model:               call.execution.as_ref().and_then(|plan| plan.model.clone()),
-			provider_request_id: Some(Str::from("route-probe")),
+			provider_request_id: Some(sf!("route-probe")),
 			created_at:          SystemTime::UNIX_EPOCH,
 		};
 		let body = AnswerBody::Chat(omp_llm_inference::answer::ChatStream::ordinary(Box::pin(

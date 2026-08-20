@@ -100,7 +100,7 @@ impl DeferredCompletion {
 		if after.chars().any(char::is_whitespace) {
 			return None;
 		}
-		Some(CompletionQuery { prefix_start: offset, query: Str::from(after) })
+		Some(CompletionQuery { prefix_start: offset, query: Str::new(after) })
 	}
 
 	fn drain(&mut self) {
@@ -116,7 +116,7 @@ impl DeferredCompletion {
 						.strip_prefix(result.query.query.as_str())
 						.filter(|hint| !hint.is_empty())
 				});
-				self.ghost.store(hint.map(|hint| Arc::new(Str::from(hint))));
+				self.ghost.store(hint.map(|hint| Arc::new(Str::new(hint))));
 				self.shown = Some(Suggestions {
 					prefix_start: result.query.prefix_start,
 					items:        result.items,

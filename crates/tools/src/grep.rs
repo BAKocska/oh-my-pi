@@ -10,7 +10,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_hashline::format_hashline_header;
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
@@ -376,9 +376,9 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W,
 		workspace,
 		blobs,
 		spec: ToolSpec {
-			name:            Str::from("grep"),
+			name:            sf!("grep"),
 			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     Str::new_static(
+			description:     sf!(
 				"Searches files/internal URLs: Rust regex, PCRE2 fallback.\n\n<instruction>\n- \
 				 `path`: known files, directories, globs, internal URLs; roots `;`-separated.\n- \
 				 Broad searches may time out → narrow scope or use `glob` first.\n- One-file line \
@@ -520,7 +520,7 @@ fn normalize_skip(skip: Option<f64>) -> Result<u64, Fault> {
 fn parse_roots(path: Option<&str>) -> Result<Vec<SearchRoot>, Fault> {
 	let entries = path.map(split_semicolon_targets).unwrap_or_default();
 	let entries = if entries.is_empty() {
-		vec![Str::from(".")]
+		vec![sf!(".")]
 	} else {
 		entries
 	};
@@ -532,9 +532,9 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 	let mut ranges = Box::<[LineRange]>::default();
 	if let Some(selector) = split.selector {
 		let parsed = parse_selector(Some(selector)).map_err(|error| Fault::InvalidSelector {
-			message: Str::from(format!(
+			message: sf!(
 				"path entry \"{original}\" has an invalid selector \":{selector}\" — {error}"
-			)),
+			),
 		})?;
 		match parsed {
 			ParsedSelector::Lines { ranges: selected, raw: false } => ranges = selected,
@@ -542,10 +542,10 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 			| ParsedSelector::Raw
 			| ParsedSelector::Conflicts => {
 				return Err(Fault::InvalidSelector {
-					message: Str::from(format!(
+					message: sf!(
 						"path entry \"{original}\" — only line-range selectors like \":50-100\" are \
 						 supported (no \":raw\"/\":conflicts\")"
-					)),
+					),
 				});
 			},
 			ParsedSelector::None => {},
@@ -554,27 +554,25 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 	let clean = split.path;
 	if !ranges.is_empty() && has_glob_chars(clean) {
 		return Err(Fault::InvalidSelector {
-			message: Str::from(format!(
-				"Line-range selector requires a single file, not a glob: {original}"
-			)),
+			message: sf!("Line-range selector requires a single file, not a glob: {original}"),
 		});
 	}
 	let kind = match parse_uri(clean).map_err(|error| Fault::InvalidSelector {
-		message: Str::from(format!("path entry \"{original}\" has an invalid URL — {error}")),
+		message: sf!("path entry \"{original}\" has an invalid URL — {error}"),
 	})? {
 		Some(uri) if uri.scheme == Scheme::Http => SearchRootKind::Url,
 		Some(uri) => {
 			return Err(Fault::UnsupportedTarget {
-				message: Str::from(format!(
+				message: sf!(
 					"{}:// targets are not supported yet",
 					uri.raw_scheme.to_ascii_lowercase()
-				)),
+				),
 			});
 		},
 		None if looks_like_archive_member(clean) => SearchRootKind::Archive,
 		None => SearchRootKind::Filesystem,
 	};
-	Ok(SearchRoot { original: Str::from(original.as_str()), path: Str::from(clean), kind, ranges })
+	Ok(SearchRoot { original: Str::new(original.as_str()), path: Str::new(clean), kind, ranges })
 }
 
 fn has_glob_chars(path: &str) -> bool {
@@ -697,25 +695,25 @@ fn make_payload(result: SearchResult, roots: &[SearchRoot], requested_skip: u64)
 	let files = groups.drain(start..end).collect();
 	let mut notes = Vec::new();
 	if !result.missing_paths.is_empty() {
-		notes.push(Str::from(format!("Skipped missing paths: {}", join_strs(&result.missing_paths))));
+		notes.push(sf!("Skipped missing paths: {}", join_strs(&result.missing_paths)));
 	}
 	if !result.archive_unreadable.is_empty() {
-		notes.push(Str::from(format!(
+		notes.push(sf!(
 			"Skipped archive entries (search supports text members only): {}",
 			join_strs(&result.archive_unreadable)
-		)));
+		));
 	}
 	if !result.oversized_files.is_empty() {
-		notes.push(Str::from(format!(
+		notes.push(sf!(
 			"Searched only the first 4MB of large files (matches past the 4MB window are not shown; \
 			 use `read` for the rest): {}",
 			join_strs(&result.oversized_files)
-		)));
+		));
 	} else if result.skipped_oversized > 0 {
-		notes.push(Str::from(format!(
+		notes.push(sf!(
 			"Skipped {} unreadable large file(s); target them directly with `read`",
 			result.skipped_oversized
-		)));
+		));
 	}
 	Payload {
 		files,
@@ -1019,7 +1017,7 @@ fn interrupt_event(
 	match interrupt {
 		Ok(interrupt) => Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }),
 		Err(InterruptWaitError::Closed) => {
-			Ev::Aborted(Abort::Interrupted { reason: Str::from(closed_reason) })
+			Ev::Aborted(Abort::Interrupted { reason: Str::new(closed_reason) })
 		},
 		Err(InterruptWaitError::Protocol(message)) => Ev::Args(protocol_issue(message)),
 	}
@@ -1028,9 +1026,9 @@ fn interrupt_event(
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::from("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(Str::from("{\"pattern\":\"TODO\",\"path\":\"src\"}")),
+		example:  Some(sf!(r#"{{"pattern":"TODO","path":"src"}}"#)),
 		found:    Some(message),
 	}
 }
@@ -1046,7 +1044,7 @@ mod tests {
 			path,
 			root_index,
 			line_number: 1,
-			line: Str::from("needle"),
+			line: sf!("needle"),
 			truncated: false,
 			context_before: Vec::new(),
 			context_after: Vec::new(),
@@ -1072,7 +1070,7 @@ mod tests {
 		let roots = parse_roots(Some("src; tests")).unwrap();
 		let request = build_request(
 			Params {
-				pattern:   Str::from(r"alpha\nbeta"),
+				pattern:   sf!(r"alpha\nbeta"),
 				path:      None,
 				case:      Some(false),
 				gitignore: Some(false),
@@ -1087,7 +1085,7 @@ mod tests {
 
 		let default_case = build_request(
 			Params {
-				pattern:   Str::from("alpha"),
+				pattern:   sf!("alpha"),
 				path:      None,
 				case:      None,
 				gitignore: None,

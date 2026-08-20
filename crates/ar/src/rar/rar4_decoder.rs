@@ -59,7 +59,7 @@ impl Bits {
 		Ok(value)
 	}
 
-	fn align(&mut self) {
+	const fn align(&mut self) {
 		if self.bit != 0 {
 			self.pos += 1;
 			self.bit = 0;
@@ -144,7 +144,7 @@ struct PendingFilter {
 }
 
 /// Stateful decoder for the RAR 2.9 LZ/Huffman algorithm used by RAR3/4.
-pub(crate) struct Rar4Decoder {
+pub struct Rar4Decoder {
 	history:               Vec<u8>,
 	old_distances:         [usize; 4],
 	last_distance:         usize,
@@ -494,7 +494,7 @@ struct VmBits<'a> {
 }
 
 impl<'a> VmBits<'a> {
-	fn new(bytes: &'a [u8]) -> Self {
+	const fn new(bytes: &'a [u8]) -> Self {
 		Self { bytes, position: 0 }
 	}
 
@@ -694,6 +694,6 @@ fn write_i32(bytes: &mut [u8], offset: usize, value: i32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn invalid<T>(reason: &'static str) -> Result<T> {
+const fn invalid<T>(reason: &'static str) -> Result<T> {
 	Err(Error::InvalidArchive(reason))
 }

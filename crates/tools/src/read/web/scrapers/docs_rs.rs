@@ -1,7 +1,7 @@
 use std::{fmt::Write as _, io::Read as _};
 
 use flate2::read::GzDecoder;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::{Map, Value};
 use smallvec::SmallVec;
 use url::Url;
@@ -63,7 +63,7 @@ fn render_response(body: &[u8], target: &Target) -> Option<RenderResult> {
 	let crate_doc = decode_rustdoc_crate(body)?;
 	let content = render_target(&crate_doc, target)?;
 	let mut result = build_result(&content, "docs.rs");
-	result.notes.push("Fetched via docs.rs rustdoc JSON".into());
+	result.notes.push(sf!("Fetched via docs.rs rustdoc JSON"));
 	Some(result)
 }
 
@@ -93,14 +93,14 @@ fn parse_target(url: &Url) -> Option<Target> {
 		&& !name.is_empty()
 		&& ITEM_KINDS.contains(&kind)
 	{
-		item_name = Some(Str::from(name));
+		item_name = Some(Str::new(name));
 		module_path.pop();
 	}
 
 	Some(Target {
 		crate_name: crate_name.into(),
 		version: version.into(),
-		module_path: module_path.into_iter().map(Str::from).collect(),
+		module_path: module_path.into_iter().map(Str::new).collect(),
 		item_name,
 	})
 }

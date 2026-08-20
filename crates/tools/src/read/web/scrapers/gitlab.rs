@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde::Deserialize;
 use smallvec::SmallVec;
 use url::Url;
@@ -114,7 +114,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 					let Some(out) = get_text(client, endpoint).await else {
 						return Ok(None);
 					};
-					(out, Some(Str::from("text/plain")), "gitlab-raw", "Fetched raw file via GitLab API")
+					(out, Some(sf!("text/plain")), "gitlab-raw", "Fetched raw file via GitLab API")
 				},
 				Kind::Tree => {
 					let endpoint = format!(
@@ -249,11 +249,11 @@ pub(super) async fn render<C: HttpClient + Sync>(
 		let (content, truncated) = finalize_output(&content);
 		let mut notes = SmallVec::new();
 		if truncated {
-			notes.push(Str::from("Output truncated to 500000 characters"));
+			notes.push(sf!("Output truncated to 500000 characters"));
 		}
-		RenderResult { content, content_type, method: Str::from(method), notes }
+		RenderResult { content, content_type, method: Str::new(method), notes }
 	};
-	rendered.notes.insert(0, Str::from(note));
+	rendered.notes.insert(0, Str::new(note));
 	Ok(Some(rendered))
 }
 
@@ -434,7 +434,7 @@ mod tests {
 	};
 
 	use bytes::Bytes;
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 	use parking_lot::Mutex;
 	use smallvec::SmallVec;
 	use url::Url;
@@ -473,9 +473,9 @@ mod tests {
 
 	fn response(status: u16, body: &'static str) -> HttpResponse {
 		HttpResponse {
-			final_url: Str::from("https://gitlab.com/fixture"),
+			final_url: sf!("https://gitlab.com/fixture"),
 			status,
-			content_type: Some(Str::from("application/json")),
+			content_type: Some(sf!("application/json")),
 			headers: SmallVec::new(),
 			body: Bytes::from_static(body.as_bytes()),
 		}

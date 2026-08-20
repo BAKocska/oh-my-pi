@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use omp_core::{Duration, DurationUnit, Str};
+use omp_core::{Duration, DurationUnit, Str, sf};
 use omp_tool::{
 	BlobRef, CapsBase, Ev, IncomingParams, Interrupt, JobOwner, ModelClass, Part, PromptCaps, Tool,
 	ToolTerminal,
@@ -78,7 +78,7 @@ impl EvalRun for DetachingRun {
 
 	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
 		ready(Ok(DetachedJob {
-			id:    Str::from(format!("eval:{name}:1")),
+			id:    sf!("eval:{name}:1"),
 			owner: JobOwner::NamedProcess { name, generation: 1 },
 		}))
 	}
@@ -121,7 +121,7 @@ async fn execute_owned(
 	owner: &str,
 	code: &str,
 ) -> Payload {
-	execute_params(tool, IncomingParams::owned_channel(Str::from(owner)), code).await
+	execute_params(tool, IncomingParams::owned_channel(Str::new(owner)), code).await
 }
 
 async fn execute_params(
@@ -131,7 +131,7 @@ async fn execute_params(
 ) -> Payload {
 	let raw = json!({"language":"py","code":code}).to_string();
 	feed
-		.args_committed(Str::from(raw))
+		.args_committed(Str::new(raw))
 		.expect("eval invocation remains live");
 	let mut events = Box::pin(tool.call(params));
 	while let Some(event) = events.next().await {
@@ -304,7 +304,7 @@ async fn eval_auto_backgrounds_through_the_managed_job_contract() {
 	let tool = eval::eval(DetachingExec).with_auto_background_threshold(std::time::Duration::ZERO);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(r#"{"language":"py","code":"slow()"}"#))
+		.args_committed(sf!(r#"{{"language":"py","code":"slow()"}}"#))
 		.expect("eval invocation remains live");
 	let event = Box::pin(tool.call(params))
 		.next()
@@ -314,10 +314,7 @@ async fn eval_auto_backgrounds_through_the_managed_job_contract() {
 		panic!("zero-threshold eval did not detach");
 	};
 	assert_eq!(job.id, "eval:eval-bg-1:1");
-	assert_eq!(job.owner, JobOwner::NamedProcess {
-		name:       Str::new_static("eval-bg-1"),
-		generation: 1,
-	},);
+	assert_eq!(job.owner, JobOwner::NamedProcess { name: sf!("eval-bg-1"), generation: 1 },);
 }
 
 #[tokio::test]
@@ -325,13 +322,10 @@ async fn steering_detaches_eval_instead_of_cancelling_the_cell() {
 	let tool = eval::eval(DetachingExec);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(r#"{"language":"py","code":"slow()"}"#))
+		.args_committed(sf!(r#"{{"language":"py","code":"slow()"}}"#))
 		.expect("eval invocation remains live");
 	feed
-		.interrupt(Interrupt {
-			class:  Str::new_static(Interrupt::STEERING),
-			reason: Str::new_static("new direction"),
-		})
+		.interrupt(Interrupt { class: sf!(Interrupt::STEERING), reason: sf!("new direction") })
 		.expect("steering remains live");
 	let event = Box::pin(tool.call(params))
 		.next()
@@ -389,8 +383,8 @@ fn oversized_display_json_and_spilled_output_lookup_are_exact() {
 	value.total_lines = 40;
 	value.total_bytes = 20_000;
 	value.spilled_output = Some(BlobRef {
-		hash:       Str::from("sha256:full-eval-output"),
-		media_type: Str::from("text/plain"),
+		hash:       sf!("sha256:full-eval-output"),
+		media_type: sf!("text/plain"),
 		byte_len:   20_000,
 	});
 	let rendered = text(&project(&value, false));
@@ -408,11 +402,11 @@ fn image_display_projects_blob_without_base64_text() {
 	let mut value = payload();
 	value.display_outputs = vec![DisplayOutput::Image {
 		blob:      BlobRef {
-			hash:       Str::from("sha256:image"),
-			media_type: Str::from("image/png"),
+			hash:       sf!("sha256:image"),
+			media_type: sf!("image/png"),
 			byte_len:   68,
 		},
-		mime_type: Str::from("image/png"),
+		mime_type: sf!("image/png"),
 	}];
 	let parts = project(&value, true);
 	assert_eq!(text(&parts), "(displayed 1 image; no text output)");
@@ -448,28 +442,19 @@ async fn external_session_reset_separates_chat_state_and_preserves_the_new_sessi
 	let (tool, control) = eval::eval_controlled(runtime);
 
 	let session_a = execute(&tool, "session_value = 'A'\nsession_value").await;
-	assert_eq!(session_a.result, Some(CellValue { text: Str::from("'A'"), json: Some(json!("A")) }));
+	assert_eq!(session_a.result, Some(CellValue { text: sf!("'A'"), json: Some(json!("A")) }));
 	let persisted_a = execute(&tool, "session_value").await;
-	assert_eq!(
-		persisted_a.result,
-		Some(CellValue { text: Str::from("'A'"), json: Some(json!("A")) })
-	);
+	assert_eq!(persisted_a.result, Some(CellValue { text: sf!("'A'"), json: Some(json!("A")) }));
 
 	control.request_reset();
 	let session_b = execute(&tool, "'session_value' in globals()").await;
 	assert!(session_b.reset, "session-owner reset was not consumed by the next cell");
-	assert_eq!(
-		session_b.result,
-		Some(CellValue { text: Str::from("False"), json: Some(json!(false)) })
-	);
+	assert_eq!(session_b.result, Some(CellValue { text: sf!("False"), json: Some(json!(false)) }));
 
 	execute(&tool, "session_value = 'B'").await;
 	let persisted_b = execute(&tool, "session_value").await;
 	assert!(!persisted_b.reset, "external reset leaked into later session-B cells");
-	assert_eq!(
-		persisted_b.result,
-		Some(CellValue { text: Str::from("'B'"), json: Some(json!("B")) })
-	);
+	assert_eq!(persisted_b.result, Some(CellValue { text: sf!("'B'"), json: Some(json!("B")) }));
 }
 
 #[tokio::test]
@@ -482,11 +467,8 @@ async fn authenticated_owners_have_isolated_persistent_namespaces() {
 	let absent_from_b = execute_owned(&tool, "chat-b", "'private_value' in globals()").await;
 	assert_eq!(
 		absent_from_b.result,
-		Some(CellValue { text: Str::from("False"), json: Some(json!(false)) })
+		Some(CellValue { text: sf!("False"), json: Some(json!(false)) })
 	);
 	let persisted_in_a = execute_owned(&tool, "chat-a", "private_value").await;
-	assert_eq!(
-		persisted_in_a.result,
-		Some(CellValue { text: Str::from("'A'"), json: Some(json!("A")) })
-	);
+	assert_eq!(persisted_in_a.result, Some(CellValue { text: sf!("'A'"), json: Some(json!("A")) }));
 }

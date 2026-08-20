@@ -8,7 +8,7 @@ use std::{
 
 use async_stream::stream;
 use futures::Stream;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_storage::telemetry_index::{StoredIssue, TelemetryIndex};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
@@ -110,9 +110,9 @@ pub fn tts() -> MediaDevice {
 fn media_device(name: &'static str, description: &'static str, kind: MediaKind) -> MediaDevice {
 	MediaDevice {
 		spec: ToolSpec {
-			name:            Str::new_static(name),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(description),
+			name:            sf!(name),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(description),
 			schema:          omp_tool::schema::<MediaParams>(),
 			constraint:      Constraint::Schema {
 				priority:       100,
@@ -158,7 +158,7 @@ impl Tool for MediaDevice {
 			};
 			if !valid {
 				let field = match self.kind { MediaKind::Image => "prompt", MediaKind::Speech => "text" };
-				yield media_done(Err(MediaFault { code: Str::new_static("invalid_media_request"), backend: Str::new_static("none"), message: Str::from(format!("{field} must not be empty")) }));
+				yield media_done(Err(MediaFault { code: sf!("invalid_media_request"), backend: sf!("none"), message: Str::from(format!("{field} must not be empty")) }));
 				return;
 			}
 			if let Err(error) = incoming.interruptable().committed().await { yield media_commit_event(error); return; }
@@ -235,9 +235,9 @@ pub struct ReportIssue {
 pub fn report_issue(store: Arc<TelemetryIndex>) -> ReportIssue {
 	ReportIssue {
 		spec: ToolSpec {
-			name:            Str::new_static("report_issue"),
-			rev:             Rev { family: Str::new_static(""), n: 1 },
-			description:     Str::new_static(
+			name:            sf!("report_issue"),
+			rev:             Rev { family: Default::default(), n: 1 },
+			description:     sf!(
 				"Records a structured AutoQA verdict against an exact device revision in the durable \
 				 local issue store.",
 			),
@@ -277,13 +277,13 @@ impl Tool for ReportIssue {
 				Err(error) => { yield report_param_event(error); return; },
 			};
 			if params.session_id.trim().is_empty() || params.device.trim().is_empty() || params.rev.trim().is_empty() || !params.verdict.is_object() {
-				yield report_done(Err(MediaFault { code: Str::new_static("invalid_issue_report"), backend: Str::new_static("autoqa"), message: Str::new_static("session_id, device, and rev are required and verdict must be an object") }));
+				yield report_done(Err(MediaFault { code: sf!("invalid_issue_report"), backend: sf!("autoqa"), message: sf!("session_id, device, and rev are required and verdict must be an object") }));
 				return;
 			}
 			if let Err(error) = incoming.interruptable().committed().await { yield report_commit_event(error); return; }
 			let now = now_ms();
 			let issue_id = Str::from(ulid::Ulid::generate().to_string());
-			let consent = params.consent.unwrap_or_else(|| Str::new_static("local_only"));
+			let consent = params.consent.unwrap_or_else(|| sf!("local_only"));
 			let issue = StoredIssue { id: issue_id.clone(), session_id: params.session_id.clone(), device: params.device.clone(), rev: Some(params.rev.clone()), consent, created_at_ms: now };
 			if let Err(error) = self.store.store_issue(&issue) {
 				yield report_done(Err(store_fault(error.to_string()))); return;
@@ -293,7 +293,7 @@ impl Tool for ReportIssue {
 				yield report_done(Err(store_fault(error.to_string()))); return;
 			}
 			let target = format!("{}@{}", issue.device, params.rev);
-			yield report_done(Ok(ReportPayload { issue_id, target: Str::from(target), kind: Str::new_static("issue_report") }));
+			yield report_done(Ok(ReportPayload { issue_id, target: Str::from(target), kind: sf!("issue_report") }));
 		}
 	}
 
@@ -321,8 +321,8 @@ fn now_ms() -> u64 {
 }
 fn store_fault(message: String) -> MediaFault {
 	MediaFault {
-		code:    Str::new_static("autoqa_store_failed"),
-		backend: Str::new_static("sqlite"),
+		code:    sf!("autoqa_store_failed"),
+		backend: sf!("sqlite"),
 		message: Str::from(message),
 	}
 }
@@ -369,7 +369,7 @@ fn map_commit<U, P, F>(error: CommitError) -> Ev<U, P, F> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: Str::new_static("one committed JSON argument object"),
+		expected: sf!("one committed JSON argument object"),
 		kind:     ArgIssueKind::Protocol,
 		example:  None,
 		found:    Some(message),
@@ -402,11 +402,11 @@ mod tests {
 		let root = tempdir().unwrap();
 		let store = TelemetryIndex::open(root.path(), &root.path().join("telemetry.sqlite")).unwrap();
 		let issue = StoredIssue {
-			id:            Str::from("i"),
-			session_id:    Str::from("s"),
-			device:        Str::from("read"),
-			rev:           Some(Str::from("2")),
-			consent:       Str::from("local_only"),
+			id:            sf!("i"),
+			session_id:    sf!("s"),
+			device:        sf!("read"),
+			rev:           Some(sf!("2")),
+			consent:       sf!("local_only"),
 			created_at_ms: 1,
 		};
 		store.store_issue(&issue).unwrap();

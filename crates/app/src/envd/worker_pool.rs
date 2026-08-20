@@ -11,7 +11,7 @@ use std::{
 };
 
 use flume::{Receiver, Sender};
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, sf};
 use omp_env::WorkerLease;
 use omp_proto::env::v1::WorkerData;
 use omp_storage::blob::BlobStore;
@@ -436,11 +436,7 @@ mod tests {
 	fn stale_generation_never_delivers() {
 		let supervisor = WorkerSupervisor::new(1, 1);
 		let (route, _lease) = supervisor
-			.open(WorkerKey {
-				extension: Str::new_static("x"),
-				name:      Str::new_static("w"),
-				site:      Str::new_static("env"),
-			})
+			.open(WorkerKey { extension: sf!("x"), name: sf!("w"), site: sf!("env") })
 			.unwrap();
 		let frame = WorkerData {
 			name: route.key.name.to_string(),
@@ -457,11 +453,7 @@ mod tests {
 	fn lease_drop_queues_termination() {
 		let supervisor = WorkerSupervisor::new(1, 1);
 		let (route, lease) = supervisor
-			.open(WorkerKey {
-				extension: Str::new_static("x"),
-				name:      Str::new_static("w"),
-				site:      Str::new_static("env"),
-			})
+			.open(WorkerKey { extension: sf!("x"), name: sf!("w"), site: sf!("env") })
 			.unwrap();
 		drop(lease);
 		assert_eq!(supervisor.try_termination(), Some((route.key.name, route.generation)));
@@ -471,17 +463,13 @@ mod tests {
 	fn ceiling_refuses_without_queueing() {
 		let supervisor = WorkerSupervisor::new(1, 1);
 		let _ = supervisor
-			.open(WorkerKey {
-				extension: Str::new_static("x"),
-				name:      Str::new_static("a"),
-				site:      Str::new_static("env"),
-			})
+			.open(WorkerKey { extension: sf!("x"), name: sf!("a"), site: sf!("env") })
 			.unwrap();
 		assert!(matches!(
 			supervisor.open(WorkerKey {
-				extension: Str::new_static("x"),
-				name:      Str::new_static("b"),
-				site:      Str::new_static("env"),
+				extension: sf!("x"),
+				name:      sf!("b"),
+				site:      sf!("env"),
 			}),
 			Err(WorkerUnavailable::LayerCeiling)
 		));

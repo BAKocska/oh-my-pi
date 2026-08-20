@@ -2759,8 +2759,7 @@ fn paid_xai_responses_policy(key: &str) -> WirePolicy {
 	policy.reasoning.filter_history = Some(false);
 	policy.tool.flatten_root_unions = Some(true);
 	policy.reasoning.include_encrypted = Some(true);
-	policy.reasoning.effort_map =
-		BTreeMap::from([(ThinkingEffort::Minimal, omp_core::Str::from("low"))]);
+	policy.reasoning.effort_map = BTreeMap::from([(ThinkingEffort::Minimal, omp_core::sf!("low"))]);
 	policy.reasoning.supports_summary = Some(false);
 	let bare = key.trim_start_matches("xai/").to_ascii_lowercase();
 	if bare.ends_with("reasoning")

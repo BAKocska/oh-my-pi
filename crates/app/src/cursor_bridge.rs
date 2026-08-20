@@ -10,7 +10,7 @@ use std::{
 	path::{Component, Path, PathBuf},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -61,7 +61,7 @@ pub enum BridgeError {
 pub fn translate(frame: &str, arguments: &Value) -> Result<DynDispatch, BridgeError> {
 	let args = arguments
 		.as_object()
-		.ok_or_else(|| BridgeError::Invalid(Str::new_static("arguments must be an object")))?;
+		.ok_or_else(|| BridgeError::Invalid(sf!("arguments must be an object")))?;
 	let (device, mut translated) = match frame {
 		"read" | "piRead" => ("read", translate_read(args)?),
 		"ls" | "piLs" => ("read", translate_list(args)?),
@@ -79,7 +79,7 @@ pub fn translate(frame: &str, arguments: &Value) -> Result<DynDispatch, BridgeEr
 		.as_object_mut()
 		.expect("translations return objects");
 	object.insert("do_".into(), Value::String(format!("invoke/{device}")));
-	Ok(DynDispatch { tool: Str::new_static("dyn"), arguments: translated })
+	Ok(DynDispatch { tool: sf!("dyn"), arguments: translated })
 }
 
 /// Translates a frame and enforces mutation policy before returning a write
@@ -96,7 +96,7 @@ pub fn translate_checked(
 			.arguments
 			.get("path")
 			.and_then(Value::as_str)
-			.ok_or_else(|| BridgeError::Invalid(Str::new_static("write has no path")))?;
+			.ok_or_else(|| BridgeError::Invalid(sf!("write has no path")))?;
 		let safe = validate_write(root, Path::new(raw), policy)?;
 		call.arguments["path"] = Value::String(safe.to_string_lossy().into_owned());
 	}
@@ -223,13 +223,13 @@ pub fn validate_write(
 	policy: WritePolicy,
 ) -> Result<PathBuf, BridgeError> {
 	if policy == WritePolicy::ReadOnly {
-		return Err(BridgeError::WriteRejected(Str::new_static("workspace is read-only")));
+		return Err(BridgeError::WriteRejected(sf!("workspace is read-only")));
 	}
 	if requested
 		.components()
 		.any(|part| matches!(part, Component::ParentDir))
 	{
-		return Err(BridgeError::WriteRejected(Str::new_static("parent traversal is forbidden")));
+		return Err(BridgeError::WriteRejected(sf!("parent traversal is forbidden")));
 	}
 	let root =
 		fs::canonicalize(root).map_err(|source| BridgeError::Io { path: root.to_owned(), source })?;
@@ -240,7 +240,7 @@ pub fn validate_write(
 	};
 	let relative = joined
 		.strip_prefix(&root)
-		.map_err(|_| BridgeError::WriteRejected(Str::new_static("target escapes workspace")))?;
+		.map_err(|_| BridgeError::WriteRejected(sf!("target escapes workspace")))?;
 	let mut cursor = root.clone();
 	let component_count = relative.components().count();
 	for (index, component) in relative.components().enumerate() {
@@ -251,57 +251,45 @@ pub fn validate_write(
 		let metadata = fs::symlink_metadata(&cursor)
 			.map_err(|source| BridgeError::Io { path: cursor.clone(), source })?;
 		if metadata.file_type().is_symlink() {
-			return Err(BridgeError::WriteRejected(Str::new_static(
-				"symlink path components are forbidden",
-			)));
+			return Err(BridgeError::WriteRejected(sf!("symlink path components are forbidden",)));
 		}
 		if !metadata.is_dir() {
-			return Err(BridgeError::WriteRejected(Str::new_static(
-				"write parent is not a directory",
-			)));
+			return Err(BridgeError::WriteRejected(sf!("write parent is not a directory",)));
 		}
 	}
 	let parent = joined
 		.parent()
-		.ok_or_else(|| BridgeError::WriteRejected(Str::new_static("target has no parent")))?;
+		.ok_or_else(|| BridgeError::WriteRejected(sf!("target has no parent")))?;
 	let parent = fs::canonicalize(parent)
 		.map_err(|source| BridgeError::Io { path: parent.to_owned(), source })?;
 	if !parent.starts_with(&root) {
-		return Err(BridgeError::WriteRejected(Str::new_static("target escapes workspace")));
+		return Err(BridgeError::WriteRejected(sf!("target escapes workspace")));
 	}
 	let target = parent.join(
 		joined
 			.file_name()
-			.ok_or_else(|| BridgeError::WriteRejected(Str::new_static("target has no filename")))?,
+			.ok_or_else(|| BridgeError::WriteRejected(sf!("target has no filename")))?,
 	);
 	match fs::symlink_metadata(&target) {
 		Ok(metadata) => {
 			if metadata.file_type().is_symlink() {
-				return Err(BridgeError::WriteRejected(Str::new_static(
-					"symlink targets are forbidden",
-				)));
+				return Err(BridgeError::WriteRejected(sf!("symlink targets are forbidden",)));
 			}
 			if !metadata.file_type().is_file() {
-				return Err(BridgeError::WriteRejected(Str::new_static(
-					"target is not a regular file",
-				)));
+				return Err(BridgeError::WriteRejected(sf!("target is not a regular file",)));
 			}
 			#[cfg(unix)]
 			{
 				use std::os::unix::fs::MetadataExt as _;
 				if metadata.nlink() != 1 {
-					return Err(BridgeError::WriteRejected(Str::new_static(
-						"hard-linked targets are forbidden",
-					)));
+					return Err(BridgeError::WriteRejected(sf!("hard-linked targets are forbidden",)));
 				}
 			}
 		},
 		Err(error)
 			if error.kind() == std::io::ErrorKind::NotFound && policy == WritePolicy::Workspace => {},
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-			return Err(BridgeError::WriteRejected(Str::new_static(
-				"policy permits existing files only",
-			)));
+			return Err(BridgeError::WriteRejected(sf!("policy permits existing files only",)));
 		},
 		Err(source) => return Err(BridgeError::Io { path: target, source }),
 	}
@@ -402,7 +390,7 @@ mod tests {
 	#[test]
 	fn todo_errors_receive_synthetic_settlement() {
 		let mut sync = TodoSync::default();
-		sync.update(Str::new_static("call"), json!([{"text":"work"}]));
+		sync.update(sf!("call"), json!([{"text":"work"}]));
 		let settled = sync.settle("call", Some("failed")).unwrap();
 		assert_eq!(settled["settled"], true);
 		assert_eq!(settled["error"], "failed");

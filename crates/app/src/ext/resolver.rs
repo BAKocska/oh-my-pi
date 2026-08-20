@@ -7,7 +7,7 @@ use std::{
 	process::{Command, Output},
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 use super::{ExtensionCode, ExtensionError};
 
@@ -303,9 +303,9 @@ mod tests {
 	fn uv_argv_enforces_nonnegotiable_flags() {
 		let request = UvRequest {
 			executable:        PathBuf::from("uv"),
-			target:            Str::new_static("aarch64-apple-darwin"),
+			target:            sf!("aarch64-apple-darwin"),
 			indexes:           vec!["https://ext.omp.dev/simple".to_owned()],
-			exclude_newer:     Some(Str::new_static("2026-08-20T00:00:00Z")),
+			exclude_newer:     Some(sf!("2026-08-20T00:00:00Z")),
 			requirements_file: PathBuf::from("requirements.txt"),
 			requirements:      vec![],
 		};

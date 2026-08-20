@@ -5,7 +5,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use thiserror::Error;
 
@@ -270,7 +270,7 @@ impl Scheduler {
 	{
 		let schedule = self
 			.schedule(schedule_id)
-			.ok_or_else(|| ScheduleError::InvalidTrigger(Str::from("unknown schedule")))?;
+			.ok_or_else(|| ScheduleError::InvalidTrigger(sf!("unknown schedule")))?;
 		let key = firing_key(schedule.id.as_str(), at_ms);
 		let mut firing = Firing {
 			schedule_id: schedule.id.clone(),
@@ -340,7 +340,7 @@ fn validate(schedule: &Schedule) -> Result<(), ScheduleError> {
 	if let Trigger::Every { interval, .. } = &schedule.trigger
 		&& interval.is_zero()
 	{
-		return Err(ScheduleError::InvalidTrigger(Str::from("Every interval is zero")));
+		return Err(ScheduleError::InvalidTrigger(sf!("Every interval is zero")));
 	}
 	Ok(())
 }
@@ -348,7 +348,7 @@ fn validate(schedule: &Schedule) -> Result<(), ScheduleError> {
 /// Constructs the stable idempotency key for an occurrence.
 #[must_use]
 pub fn firing_key(schedule_id: &str, at_ms: u64) -> Str {
-	Str::from(format!("{schedule_id}:{at_ms}"))
+	sf!("{schedule_id}:{at_ms}")
 }
 
 #[cfg(test)]
@@ -369,14 +369,14 @@ mod tests {
 	}
 	fn schedule() -> Schedule {
 		Schedule {
-			id:              Str::from("s"),
-			name:            Str::from("s"),
+			id:              sf!("s"),
+			name:            sf!("s"),
 			trigger:         Trigger::At { epoch_ms: 1 },
-			delivery:        ScheduleDelivery::Inject { prompt: Str::from("go") },
+			delivery:        ScheduleDelivery::Inject { prompt: sf!("go") },
 			scope:           ScheduleScope::Session,
-			owner:           Str::from("ext"),
-			principal:       Str::from("p"),
-			artifact_digest: Str::from("d"),
+			owner:           sf!("ext"),
+			principal:       sf!("p"),
+			artifact_digest: sf!("d"),
 			upgrade:         UpgradePolicy::Pinned,
 			missed:          MissedRunPolicy::Coalesce,
 			budget:          None,

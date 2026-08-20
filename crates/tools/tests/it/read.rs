@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, sf};
 use omp_tool::{
 	Abort, ArtifactLifetime, BlobRef, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part,
 	PromptCaps, Tool, ToolTerminal,
@@ -139,7 +139,7 @@ impl ReadSources for Sources {
 
 	fn record_snapshot(&self, record: SnapshotRecord) -> Result<Option<Str>, Fault> {
 		self.snapshots.lock().push(record);
-		Ok(Some(Str::new_static("A1B2")))
+		Ok(Some(sf!("A1B2")))
 	}
 }
 
@@ -170,11 +170,7 @@ impl ReadBlobs for Blobs {
 		media_type: Str,
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
 		self.stored.lock().push((bytes.clone(), media_type.clone()));
-		ready(Ok(BlobRef {
-			hash: Str::new_static("blob-hash"),
-			media_type,
-			byte_len: bytes.len() as u64,
-		}))
+		ready(Ok(BlobRef { hash: sf!("blob-hash"), media_type, byte_len: bytes.len() as u64 }))
 	}
 }
 
@@ -201,7 +197,7 @@ impl Resolve for StaticResolver {
 				self
 					.lines
 					.slice("artifact-7", &self.bytes, *range)
-					.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })
+					.map_err(|error| Fault::Invalid { message: Str::new(error.to_string()) })
 			},
 			_ => Ok(self.bytes.clone()),
 		};
@@ -267,14 +263,14 @@ impl Sources {
 		let bytes = bytes.into();
 		let source = FileSource {
 			stat: SourceStat {
-				canonical_path: Str::from(canonical),
-				display_path:   Str::from(display),
+				canonical_path: Str::new(canonical),
+				display_path:   Str::new(display),
 				kind:           SourceKind::File,
 				byte_len:       bytes.len() as u64,
 				modified_ms:    Some(u64::MAX),
 			},
 			bytes,
-			revision: Str::new_static("revision-7"),
+			revision: sf!("revision-7"),
 		};
 		let mut files = self.files.lock();
 		files.insert(authored.to_owned(), source.clone());
@@ -283,15 +279,15 @@ impl Sources {
 
 	fn directory(&self, path: &str, entries: Vec<DirectoryEntry>) {
 		let stat = SourceStat {
-			canonical_path: Str::from(path),
-			display_path:   Str::from(path),
+			canonical_path: Str::new(path),
+			display_path:   Str::new(path),
 			kind:           SourceKind::Directory,
 			byte_len:       0,
 			modified_ms:    Some(u64::MAX),
 		};
 		self.dirs.lock().insert(
 			path.to_owned(),
-			(stat, DirectorySource { root: Str::from(path), entries, truncated: false }),
+			(stat, DirectorySource { root: Str::new(path), entries, truncated: false }),
 		);
 	}
 
@@ -306,7 +302,7 @@ impl Sources {
 		self.files.lock().insert(authored.to_owned(), FileSource {
 			stat:     SourceStat { kind: SourceKind::Symlink, ..target_stat },
 			bytes:    Bytes::new(),
-			revision: Str::new_static("symlink"),
+			revision: sf!("symlink"),
 		});
 	}
 
@@ -326,7 +322,7 @@ async fn project(sources: Sources, blobs: Blobs, raw: &str, media: bool) -> Vec<
 	let tool = read::tool(sources, blobs);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(raw))
+		.args_committed(Str::new(raw))
 		.expect("read invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
 	let [Ev::Done(ToolTerminal::Done { result, .. })] = events.as_slice() else {
@@ -520,19 +516,19 @@ fn special_source_fixture_workspace_is_complete_and_self_contained() {
 async fn directory_listing_is_depth_two_and_elides_nested_children() {
 	let sources = Sources::default();
 	let mut entries = vec![DirectoryEntry {
-		path:        Str::new_static("dir"),
+		path:        sf!("dir"),
 		kind:        SourceKind::Directory,
 		byte_len:    0,
 		modified_ms: Some(u64::MAX),
 	}];
 	entries.extend((0..14).map(|index| DirectoryEntry {
-		path:        Str::from(format!("dir/child-{index:02}.txt")),
+		path:        sf!("dir/child-{index:02}.txt"),
 		kind:        SourceKind::File,
 		byte_len:    index,
 		modified_ms: Some(u64::MAX),
 	}));
 	entries.push(DirectoryEntry {
-		path:        Str::new_static("dir/nested/too-deep.txt"),
+		path:        sf!("dir/nested/too-deep.txt"),
 		kind:        SourceKind::File,
 		byte_len:    1,
 		modified_ms: Some(u64::MAX),
@@ -568,7 +564,7 @@ async fn oversized_directory_listing_spills_the_complete_rendered_tree() {
 	for index in 0..4_000 {
 		let name = format!("entry-{index:04}-abcdefghijklmnop.txt");
 		entries.push(DirectoryEntry {
-			path:        Str::from(name.clone()),
+			path:        Str::new(name.clone()),
 			kind:        SourceKind::File,
 			byte_len:    1,
 			modified_ms: Some(u64::MAX),
@@ -584,7 +580,7 @@ async fn oversized_directory_listing_spills_the_complete_rendered_tree() {
 async fn directory_symlink_is_reclassified_before_special_dispatch() {
 	let sources = Sources::default();
 	sources.directory("tree", vec![DirectoryEntry {
-		path:        Str::new_static("leaf.txt"),
+		path:        sf!("leaf.txt"),
 		kind:        SourceKind::File,
 		byte_len:    4,
 		modified_ms: Some(u64::MAX),
@@ -945,7 +941,7 @@ async fn long_sqlite_query_is_interrupted_without_blocking_the_runtime() {
 	let tool = read::tool(sources, Blobs::default());
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::new_static(
+		.args_committed(sf!(
 			r#"{"path":"data.sqlite?q=WITH%20RECURSIVE%20count(x)%20AS%20(VALUES(0)%20UNION%20ALL%20SELECT%20x%2B1%20FROM%20count)%20SELECT%20sum(x)%20FROM%20count"}"#,
 		))
 		.expect("read invocation remains live");
@@ -957,10 +953,7 @@ async fn long_sqlite_query_is_interrupted_without_blocking_the_runtime() {
 		() = tokio::time::sleep(Duration::from_millis(50)) => {},
 	}
 	feed
-		.interrupt(Interrupt {
-			class:  Str::new_static("deadline"),
-			reason: Str::new_static("test deadline exceeded"),
-		})
+		.interrupt(Interrupt { class: sf!("deadline"), reason: sf!("test deadline exceeded") })
 		.expect("read invocation accepts its deadline interrupt");
 	let events = tokio::time::timeout(Duration::from_secs(1), &mut events)
 		.await
@@ -1385,14 +1378,10 @@ async fn macos_sample_profile_uses_the_checked_in_call_tree_fixture() {
 async fn checked_in_url_mock_drives_the_network_free_html_pipeline() {
 	let sources = Sources::default();
 	sources.responses.lock().push_back(Ok(HttpResponse {
-		final_url:    Str::new_static("https://fixture.invalid/final"),
+		final_url:    sf!("https://fixture.invalid/final"),
 		status:       200,
-		content_type: Some(Str::new_static("text/html")),
-		headers:      vec![(
-			Str::new_static("content-type"),
-			Str::new_static("text/html; charset=utf-8"),
-		)]
-		.into(),
+		content_type: Some(sf!("text/html")),
+		headers:      vec![(sf!("content-type"), sf!("text/html; charset=utf-8"))].into(),
 		body:         Bytes::from_static(include_bytes!("../fixtures/special-sources/web/page.html")),
 	}));
 	let output = text(sources, r#"{"path":"https://fixture.invalid/page"}"#).await;
@@ -1459,7 +1448,7 @@ async fn dense_resolver_dispatch_applies_the_shared_selector_without_copying_the
 	let tool = read::tool_with_resolvers(Sources::default(), Blobs::default(), table);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::new_static(r#"{"path":"artifact://7:2-3"}"#))
+		.args_committed(sf!(r#"{{"path":"artifact://7:2-3"}}"#))
 		.expect("resolver invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
 	let [Ev::Done(ToolTerminal::Done { result: Ok(payload), .. })] = events.as_slice() else {
@@ -1481,7 +1470,7 @@ async fn dense_resolver_dispatch_applies_the_shared_selector_without_copying_the
 }
 #[tokio::test]
 async fn artifact_resolver_stats_authority_caches_offsets_and_gates_digest_form_to_durable() {
-	let digest = Str::from("a".repeat(64));
+	let digest = Str::new("a".repeat(64));
 	let bytes = CowBytes::from_static(b"one\ntwo\nthree\n");
 	let stats = Arc::new(AtomicU64::new(0));
 	let ranges = Arc::new(Mutex::new(Vec::new()));
@@ -1532,7 +1521,7 @@ async fn unknown_scheme_is_a_typed_fault() {
 	let tool = read::tool(Sources::default(), Blobs::default());
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::new_static(r#"{"path":"xd://pending"}"#))
+		.args_committed(sf!(r#"{{"path":"xd://pending"}}"#))
 		.expect("unknown-scheme invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
 	let [Ev::Done(ToolTerminal::Done { result: Err(Fault::UnknownScheme { scheme, .. }), .. })] =

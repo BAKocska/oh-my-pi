@@ -486,21 +486,22 @@ mod tests {
 	use super::{
 		AgentUrl, ArtifactAddress, ArtifactUrl, HistoryUrl, LocationError, ToolPath, WorkspaceUri,
 	};
+	use crate::IntoStr;
 
 	#[test]
 	fn typed_urls_refuse_relabeling_other_schemes() {
-		assert!(ArtifactUrl::new("artifact://17").is_ok());
+		assert!(ArtifactUrl::new("artifact://17".into_str()).is_ok());
 		assert_eq!(
-			ArtifactUrl::new("history://17"),
+			ArtifactUrl::new("history://17".into_str()),
 			Err(LocationError::WrongScheme { expected: "artifact" })
 		);
-		assert!(HistoryUrl::new("agent://child").is_err());
-		assert!(AgentUrl::new("artifact://17").is_err());
+		assert!(HistoryUrl::new("agent://child".into_str()).is_err());
+		assert!(AgentUrl::new("artifact://17".into_str()).is_err());
 	}
 
 	#[test]
 	fn artifact_url_accessors_borrow_resource_and_parse_selectors_separately() {
-		let url = ArtifactUrl::new("artifact://18446744073709551615:20-40").unwrap();
+		let url = ArtifactUrl::new("artifact://18446744073709551615:20-40".into_str()).unwrap();
 		assert_eq!(url.resource(), "18446744073709551615");
 		assert_eq!(url.selector(), Some("20-40"));
 		assert_eq!(url.address(), ArtifactAddress::Ordinal(u64::MAX));
@@ -517,7 +518,7 @@ mod tests {
 			"artifact://b3/",
 			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 			":raw"
-		))
+		).into_str())
 		.unwrap();
 		assert_eq!(url.address(), ArtifactAddress::Digest(DIGEST));
 		assert_eq!(url.digest(), Some(DIGEST));
@@ -544,13 +545,13 @@ mod tests {
 			"artifact://b3/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 			"artifact://1:",
 		] {
-			assert_eq!(ArtifactUrl::new(value), Err(LocationError::InvalidArtifactAddress));
+			assert_eq!(ArtifactUrl::new(value.into_str()), Err(LocationError::InvalidArtifactAddress));
 		}
 	}
 
 	#[test]
 	fn tool_path_parses_subtool_and_claimant_without_component_storage() {
-		let path = ToolPath::new("jira/create@ed25519:abcdef/acme.reviewer").unwrap();
+		let path = ToolPath::new("jira/create@ed25519:abcdef/acme.reviewer".into_str()).unwrap();
 		assert_eq!(path.name(), "jira");
 		assert_eq!(path.sub(), Some("create"));
 		assert_eq!(path.claimant(), Some("ed25519:abcdef/acme.reviewer"));
@@ -564,7 +565,7 @@ mod tests {
 	fn tool_path_rejects_invalid_segments_and_claimants() {
 		for value in ["", "UPPER", "jira/", "jira/create/more", "jira@publisher", "jira@/ext"] {
 			assert!(matches!(
-				ToolPath::new(value),
+				ToolPath::new(value.into_str()),
 				Err(LocationError::Empty | LocationError::InvalidToolPath)
 			));
 		}
@@ -572,7 +573,7 @@ mod tests {
 
 	#[test]
 	fn workspace_uri_requires_an_absolute_uri() {
-		assert!(WorkspaceUri::new("git+ssh://git@github.com/corp/repo.git").is_ok());
-		assert_eq!(WorkspaceUri::new("/work/repo"), Err(LocationError::InvalidUri));
+		assert!(WorkspaceUri::new("git+ssh://git@github.com/corp/repo.git".into_str()).is_ok());
+		assert_eq!(WorkspaceUri::new("/work/repo".into_str()), Err(LocationError::InvalidUri));
 	}
 }

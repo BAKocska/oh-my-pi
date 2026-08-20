@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::ModelKey;
 use omp_llm_inference::{
 	Client,
@@ -299,7 +299,7 @@ mod tests {
 		std::fs::write(cwd.join(".omp/SYSTEM.md"), "project instructions").expect("system");
 		assert_eq!(
 			discover_system_prompt_from(&cwd, tree.path()).expect("discover"),
-			Some(Str::from("project instructions"))
+			Some(sf!("project instructions"))
 		);
 	}
 }

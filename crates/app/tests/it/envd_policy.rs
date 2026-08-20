@@ -9,7 +9,7 @@ use omp_app::envd::{
 	},
 	worker::HostKey,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 
 fn host() -> HostKey {
 	HostKey::new("workspace", "sandboxed", "dev.example.policy")
@@ -57,7 +57,7 @@ fn data_is_fail_closed_until_exact_token_and_generations_are_authorized() {
 	let table = AuthorityTable::default();
 	let host = host();
 	table.register_host(host.clone(), Grants::supported(["env.doc.read"]));
-	table.open(host.clone(), Str::from("call-1"));
+	table.open(host.clone(), sf!("call-1"));
 	let owner = table.connection_owner();
 	let authority = || DataAuthority {
 		invocation_id:      "call-1",
@@ -97,7 +97,7 @@ fn effect_tokens_and_leases_are_connection_bound_and_revoked_at_settle() {
 	let table = AuthorityTable::default();
 	let host = host();
 	table.register_host(host.clone(), Grants::supported(["env.doc.read"]));
-	table.open(host.clone(), Str::from("call-2"));
+	table.open(host.clone(), sf!("call-2"));
 	table
 		.authorize(
 			&host,
@@ -137,7 +137,7 @@ fn envelope_escalation_quota_and_deferred_enforce_are_typed_refusals() {
 	let table = Arc::new(AuthorityTable::default());
 	let host = host();
 	table.register_host(host.clone(), Grants::supported(["env.doc.read"]));
-	table.open(host.clone(), Str::from("call-3"));
+	table.open(host.clone(), sf!("call-3"));
 	table
 		.authorize(
 			&host,

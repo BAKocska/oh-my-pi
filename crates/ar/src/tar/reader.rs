@@ -1265,7 +1265,7 @@ fn resolve_pending_links(
 	for entry in entries.iter() {
 		let mut prefix = parent(entry.path.as_str());
 		while !prefix.is_empty() {
-			if !directory_prefixes.insert(prefix.into()) {
+			if !directory_prefixes.insert(Str::new(prefix)) {
 				break;
 			}
 			prefix = parent(prefix);
@@ -1464,10 +1464,10 @@ fn join_alias_target(target: &str, suffix: &str, limits: Limits) -> Result<Str> 
 		.ok_or(Error::InvalidArchive("TAR alias path length overflow"))?;
 	check_path_size(length as u64, limits.path_size)?;
 	if target.is_empty() {
-		return Ok(suffix.into());
+		return Ok(Str::new(suffix));
 	}
 	if suffix.is_empty() {
-		return Ok(target.into());
+		return Ok(Str::new(target));
 	}
 	let mut joined = StrMut::with_capacity(length);
 	joined.push_str(target);

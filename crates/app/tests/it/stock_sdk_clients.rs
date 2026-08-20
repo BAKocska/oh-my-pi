@@ -3,7 +3,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::OperationKind;
 use omp_llm_inference::{
 	Client,
@@ -40,7 +40,7 @@ fn chat_request() -> ChatRequest {
 		messages:          Arc::from([Message {
 			role:    Role::User,
 			content: Arc::from([ContentPart::Text {
-				text:  Str::from("typed integration smoke"),
+				text:  sf!("typed integration smoke"),
 				proof: None,
 			}]),
 			name:    None,

@@ -6,7 +6,7 @@
 
 use std::path::{Component, Path};
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_proto::omp::policy::v1 as proto;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -240,9 +240,9 @@ enum EffectiveCwd {
 impl<'a> Analyzer<'a> {
 	fn new(cwd: &str, root: &'a str) -> Self {
 		Self {
-			cwd: EffectiveCwd::Known(cwd.into()),
+			cwd: EffectiveCwd::Known(Str::new(cwd)),
 			root,
-			ir: ScriptIr { rev: "omp.policy.v1".into(), ..ScriptIr::default() },
+			ir: ScriptIr { rev: sf!("omp.policy.v1"), ..ScriptIr::default() },
 			depth: 0,
 		}
 	}
@@ -445,33 +445,33 @@ impl<'a> Analyzer<'a> {
 					ast::IoFileRedirectTarget::Filename(word) => (
 						*fd,
 						format!("{kind}").into(),
-						"filename".into(),
+						sf!("filename"),
 						Some(word.value.clone()),
 						None,
 						dynamism(&word.value),
 						access,
 					),
 					ast::IoFileRedirectTarget::Fd(target) => {
-						(*fd, format!("{kind}").into(), "fd".into(), None, Some(*target), 0, access)
+						(*fd, format!("{kind}").into(), sf!("fd"), None, Some(*target), 0, access)
 					},
 					ast::IoFileRedirectTarget::Duplicate(word) => (
 						*fd,
 						format!("{kind}").into(),
-						"duplicate".into(),
+						sf!("duplicate"),
 						Some(word.value.clone()),
 						None,
 						dynamism(&word.value),
 						0,
 					),
 					ast::IoFileRedirectTarget::ProcessSubstitution(..) => {
-						(*fd, format!("{kind}").into(), "process_substitution".into(), None, None, 0, 0)
+						(*fd, format!("{kind}").into(), sf!("process_substitution"), None, None, 0, 0)
 					},
 				}
 			},
 			ast::IoRedirect::OutputAndError(word, append) => (
 				None,
-				if *append { ">&>>" } else { "&>" }.into(),
-				"filename".into(),
+				if *append { sf!(">&>>") } else { sf!("&>") },
+				sf!("filename"),
 				Some(word.value.clone()),
 				None,
 				dynamism(&word.value),
@@ -671,10 +671,10 @@ impl<'a> Analyzer<'a> {
 				let (scheme, rest) = arg.text.split_once("://").unwrap_or(("", ""));
 				let host = rest.split('/').next().filter(|host| !host.is_empty());
 				self.ir.net.push(NetRefIr {
-					kind:          "url".into(),
-					direction:     "outbound".into(),
-					host:          host.map(Into::into),
-					scheme:        Some(scheme.into()),
+					kind:          sf!("url"),
+					direction:     sf!("outbound"),
+					host:          host.map(Str::new),
+					scheme:        Some(Str::new(scheme)),
 					url:           Some(arg.text.clone()),
 					command_index: command.index,
 					dynamic:       arg.dynamism != 0,
@@ -690,8 +690,8 @@ impl<'a> Analyzer<'a> {
 				.find(|arg| !arg.text.starts_with("-"))
 			{
 				self.ir.net.push(NetRefIr {
-					kind:          "network".into(),
-					direction:     "outbound".into(),
+					kind:          sf!("network"),
+					direction:     sf!("outbound"),
 					host:          Some(arg.text.clone()),
 					scheme:        None,
 					url:           None,
@@ -770,7 +770,7 @@ impl<'a> Analyzer<'a> {
 			lexical,
 			resolved,
 			access,
-			origin: origin.into(),
+			origin: Str::new(origin),
 			command_index,
 			outside_workspace,
 			dynamic: dynamism != 0,
@@ -788,7 +788,7 @@ impl<'a> Analyzer<'a> {
 	}
 
 	fn opaque(&mut self, reason: &str) {
-		self.ir.opaque.push(reason.into());
+		self.ir.opaque.push(Str::new(reason));
 	}
 }
 

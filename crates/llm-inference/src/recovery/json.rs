@@ -1,7 +1,7 @@
 //! Deterministic bounded JSON syntax recovery.
 
 use bytes::{Bytes, BytesMut};
-use omp_core::Str;
+use omp_core::sf;
 use omp_llm_catalog::id::WirePolicyId;
 use serde_json::Value;
 
@@ -140,7 +140,7 @@ impl JsonRepairStage {
 			let bytes =
 				Bytes::from(serde_json::to_vec(&value).map_err(|_| RecoveryError::InvalidInput {
 					stage:  "json",
-					reason: Str::new_static("valid JSON could not be serialized"),
+					reason: sf!("valid JSON could not be serialized"),
 				})?);
 			self.reset();
 			return Ok(JsonDocument { bytes, value, recovery: None });
@@ -154,19 +154,19 @@ impl JsonRepairStage {
 		let value = serde_json::from_slice::<Value>(&repaired).map_err(|_| {
 			RecoveryError::InvalidDocument {
 				stage:      "json",
-				reason:     Str::new_static("bounded deterministic repair did not produce valid JSON"),
+				reason:     sf!("bounded deterministic repair did not produce valid JSON"),
 				diagnostic: diagnostic.clone(),
 			}
 		})?;
 		let bytes =
 			Bytes::from(serde_json::to_vec(&value).map_err(|_| RecoveryError::InvalidInput {
 				stage:  "json",
-				reason: Str::new_static("repaired JSON could not be serialized"),
+				reason: sf!("repaired JSON could not be serialized"),
 			})?);
 		let recovery = RecoveryRecord {
 			attempt: self.attempt,
 			kind: RecoveryKind::JsonRepair,
-			rule: ReasonId(Str::from(format!("json-repair/{}", self.wire_policy.as_str()))),
+			rule: ReasonId(sf!("json-repair/{}", self.wire_policy.as_str())),
 			input_bytes: diagnostic.input_bytes() as u64,
 			steps,
 		};

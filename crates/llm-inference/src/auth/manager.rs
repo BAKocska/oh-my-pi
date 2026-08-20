@@ -12,7 +12,7 @@ use std::{
 
 use flume::Sender;
 use futures::future::{BoxFuture, FutureExt as _};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	AuthSpecId, Catalog,
 	provider::{AuthSpecKind, OAuthFlowSpec},
@@ -135,12 +135,12 @@ impl AuthLoginEngine for SecretLoginEngine {
 				let result = async {
 					let prompt = AuthPrompt {
 						id:      match method {
-							AuthMethod::ApiKey => "api-key".into(),
-							_ => "session-token".into(),
+							AuthMethod::ApiKey => sf!("api-key"),
+							_ => sf!("session-token"),
 						},
 						message: match method {
-							AuthMethod::ApiKey => "Enter the API key".into(),
-							_ => "Enter the session token".into(),
+							AuthMethod::ApiKey => sf!("Enter the API key"),
+							_ => sf!("Enter the session token"),
 						},
 						input:   match method {
 							AuthMethod::ApiKey => AuthPromptKind::ApiKey,
@@ -401,7 +401,7 @@ where
 				// (or wrong) one. Gated to the paste exchange because other custom
 				// handlers forward catalog parameters onto wire URLs.
 				spec.parameters.push(OAuthParameter {
-					name:  PROVIDER_NAME_PARAMETER.into(),
+					name:  sf!(PROVIDER_NAME_PARAMETER),
 					value: provider.name.clone(),
 				});
 			}
@@ -481,7 +481,7 @@ where
 						account,
 						provider: provider_id,
 						principal: Some(principal.clone()),
-						label: Some(Str::from(principal.as_str())),
+						label: Some(Str::new(principal.as_str())),
 						state: AccountState::Active,
 					};
 					driver
@@ -1024,7 +1024,7 @@ fn principal_unresolved() -> Error {
 }
 
 fn oauth_error(error: OAuthError) -> Error {
-	let detail = ErrorDetail::provider(Str::from(error.to_string()));
+	let detail = ErrorDetail::provider(Str::new(error.to_string()));
 	match error {
 		OAuthError::Cancelled => Error::new(
 			ErrorKind::Cancelled,
@@ -1035,7 +1035,7 @@ fn oauth_error(error: OAuthError) -> Error {
 		OAuthError::PrincipalUnresolved => principal_unresolved().detail(detail),
 		OAuthError::Provider { status, code, .. } => auth_unavailable()
 			.status(Some(status))
-			.code(Str::from(code.as_str()))
+			.code(Str::new(code.as_str()))
 			.detail(detail),
 		_ => auth_unavailable().detail(detail),
 	}

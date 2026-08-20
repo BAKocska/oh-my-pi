@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use secrecy::SecretString;
 use serde_json::{Value, value::RawValue};
 
@@ -199,7 +199,7 @@ impl InferenceAttribution {
 	/// Attribution for harness-owned requests that have no extension caller.
 	#[must_use]
 	pub fn core() -> Self {
-		Self { principal: PrincipalId::from("core"), extension: Str::new_static("core") }
+		Self { principal: PrincipalId::from("core"), extension: sf!("core") }
 	}
 }
 

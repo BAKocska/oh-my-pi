@@ -75,7 +75,7 @@ impl ReasoningStallGuard {
 		} else {
 			1
 		};
-		let unit = Str::from(normalized);
+		let unit = Str::new(normalized);
 		self.no_progress = self.no_progress.saturating_add(1);
 		self.last = Some((fingerprint, unit));
 		let repetitions = if self.repeated >= self.limits.repeated_delta_limit {

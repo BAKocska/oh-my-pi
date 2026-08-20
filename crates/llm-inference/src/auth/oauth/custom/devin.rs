@@ -10,7 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, CONTENT_TYPE},
 };
-use omp_core::{Str, base64_url};
+use omp_core::{Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -95,11 +95,13 @@ impl DevinCliTokenHandler {
 				.append_pair("code_challenge_method", "S256");
 		}
 
-		driver.emit(AuthEvent::OpenUrl(url.as_str().into())).await?;
+		driver
+			.emit(AuthEvent::OpenUrl(Str::new(url.as_str())))
+			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
-				id:      "oauth-callback-url".into(),
-				message: "Paste the complete authorization callback URL".into(),
+				id:      sf!("oauth-callback-url"),
+				message: sf!("Paste the complete authorization callback URL"),
 				input:   AuthPromptKind::AuthorizationCode,
 			}))
 			.await?;
@@ -107,7 +109,7 @@ impl DevinCliTokenHandler {
 		Ok(PkcePending {
 			verifier,
 			state,
-			redirect_uri: redirect_uri.into(),
+			redirect_uri: Str::new(redirect_uri),
 			completion: PkceCompletion::PasteCallbackUrl,
 		})
 	}
@@ -147,7 +149,7 @@ impl DevinCliTokenHandler {
 		Ok(OAuthTokenSet {
 			access_token,
 			refresh_token: Some(refresh_token),
-			token_type: "Bearer".into(),
+			token_type: sf!("Bearer"),
 			expires_in: Some(expires_in),
 			identity_response: response.body,
 		})

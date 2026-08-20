@@ -414,7 +414,7 @@ impl From<bool> for Value {
 
 impl From<&str> for Value {
 	fn from(value: &str) -> Self {
-		Self::String(Str::from(value))
+		Self::String(Str::new(value))
 	}
 }
 
@@ -565,7 +565,7 @@ impl<'de> serde::Deserialize<'de> for Value {
 			}
 
 			fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-				Ok(Value::String(Str::from(v)))
+				Ok(Value::String(Str::new(v)))
 			}
 
 			fn visit_string<E>(self, v: String) -> Result<Value, E> {

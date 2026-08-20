@@ -22,7 +22,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_tui::{
 	Border, Charset,
 	Color::{self, Rgb as RgbColor},
@@ -225,7 +225,7 @@ impl Welcome {
 			theme:          ctx.theme,
 			palette:        AperturePalette::new(ctx.theme),
 			frame:          Frame::new(Size::new(0, 0)),
-			title:          fmts!(
+			title:          sf!(
 				" {} omp v{} ",
 				ctx.charset.icon(Icon::Omp),
 				env!("CARGO_PKG_VERSION")
@@ -444,7 +444,7 @@ impl Welcome {
 		frame.put(left + 2, top, self.title.as_str(), on_card(theme, theme.fg).bold());
 		if full {
 			frame.put(left + 39, top, " SESSION INDEX ", on_card(theme, theme.border));
-			let live = fmts!(" {} LIVE ", self.charset.icon(Icon::Enabled));
+			let live = sf!(" {} LIVE ", self.charset.icon(Icon::Enabled));
 			frame.put(left + cols - 11, top, &live, on_card(theme, theme.secondary));
 			draw_sessions(frame, left, top, self.charset, theme, &self.sessions, self.selected);
 		}
@@ -487,12 +487,12 @@ fn draw_sessions(
 	let mut glyph = [0_u8; 4];
 	let panel_x = left + 40;
 	frame.put(panel_x, top + 2, "RECENT SESSIONS", on_card(theme, theme.muted));
-	let count = fmts!("{:02} / LOCAL", sessions.len());
+	let count = sf!("{:02} / LOCAL", sessions.len());
 	frame.put(left + CARD_COLS - 15, top + 2, &count, on_card(theme, theme.border));
 	for y in top + 4..=top + 11 {
 		frame.put(panel_x, y, vertical.encode_utf8(&mut glyph), on_card(theme, theme.border));
 	}
-	let rows = std::iter::once((Str::new_static("New session"), Str::new_static("NEW"))).chain(
+	let rows = std::iter::once((sf!("New session"), sf!("NEW"))).chain(
 		sessions
 			.iter()
 			.take(3)
@@ -1003,9 +1003,9 @@ mod tests {
 		]
 		.into_iter()
 		.map(|(id, label, detail)| SessionRow {
-			id:     Str::from(id),
-			label:  Str::from(label),
-			detail: Str::from(detail),
+			id:     Str::new(id),
+			label:  Str::new(label),
+			detail: Str::new(detail),
 		})
 		.collect()
 	}

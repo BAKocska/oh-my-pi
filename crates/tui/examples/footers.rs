@@ -22,7 +22,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_tui::{
 	AltScreenUse, Charset, Color, Frame, Icon, InputEvent, Key, Mouse, Rect, Renderer, Size, Style,
 	Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext, anim::Shimmer, detect,
@@ -136,9 +136,9 @@ impl Scene {
 	fn timer(&self) -> Str {
 		let seconds = self.elapsed.as_secs();
 		if seconds < 60 {
-			fmts!("{seconds}s")
+			sf!("{seconds}s")
 		} else {
-			fmts!("{}m", seconds / 60)
+			sf!("{}m", seconds / 60)
 		}
 	}
 
@@ -215,7 +215,7 @@ fn compose(scene: &Scene) -> Frame {
 
 	let mut y = 3_u16;
 	for (index, study) in STUDIES.iter().enumerate() {
-		let number = fmts!("{:>2} ", index + 1);
+		let number = sf!("{:>2} ", index + 1);
 		let mut column = frame.put(1, y, &number, ink(GOLD).bold());
 		column = frame.put(column, y, study.title, ink(TEXT).bold());
 		column = frame.put(column, y, "  ", ink(FAINT));
@@ -334,27 +334,27 @@ impl Seg {
 }
 
 fn brand(scene: &Scene) -> Seg {
-	Seg::new(fmts!("{} {}", scene.spinner(), scene.timer()), GREEN)
+	Seg::new(sf!("{} {}", scene.spinner(), scene.timer()), GREEN)
 }
 
 fn omp_brand(scene: &Scene) -> Seg {
-	Seg::new(fmts!("{} omp", scene.charset.icon(Icon::Omp)), MUTED)
+	Seg::new(sf!("{} omp", scene.charset.icon(Icon::Omp)), MUTED)
 }
 
 fn model(scene: &Scene) -> Seg {
-	Seg::new(fmts!("{} {MODEL}", scene.charset.icon(Icon::Model)), GREEN)
+	Seg::new(sf!("{} {MODEL}", scene.charset.icon(Icon::Model)), GREEN)
 }
 
 fn git(scene: &Scene) -> Seg {
-	Seg::new(fmts!("{} {GIT}", scene.charset.icon(Icon::Branch)), CYAN)
+	Seg::new(sf!("{} {GIT}", scene.charset.icon(Icon::Branch)), CYAN)
 }
 
 fn context(scene: &Scene) -> Seg {
-	Seg::new(fmts!("{} {CONTEXT}", scene.charset.icon(Icon::Context)), GOLD)
+	Seg::new(sf!("{} {CONTEXT}", scene.charset.icon(Icon::Context)), GOLD)
 }
 
 fn cost() -> Seg {
-	Seg::new(Str::new_static(COST), PURPLE)
+	Seg::new(sf!(COST), PURPLE)
 }
 
 fn full_band(scene: &Scene) -> [Seg; 5] {
@@ -407,7 +407,7 @@ fn width_of(text: &str) -> u16 {
 /// fit whole.
 fn fit_title(scene: &Scene, max: u16) -> Str {
 	if width_of(TITLE) <= max {
-		return Str::new_static(TITLE);
+		return sf!(TITLE);
 	}
 	let ellipsis = match scene.charset {
 		Charset::Ascii => "...",
@@ -427,7 +427,7 @@ fn fit_title(scene: &Scene, max: u16) -> Str {
 	if end == 0 {
 		return Str::default();
 	}
-	fmts!("{}{ellipsis}", TITLE[..end].trim_end())
+	sf!("{}{ellipsis}", TITLE[..end].trim_end())
 }
 
 /// Total cells a powerline band with `segments` occupies, mirroring the

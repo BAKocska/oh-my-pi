@@ -562,6 +562,33 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	),
 	symbol!(
 		"docs/py/11-env.md",
+		"omp.env.http_get",
+		"(url, *, timeout=None, headers=...) -> HttpResponse",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.http_get(\"https://example.test\")",
+		Some("omp.env.http.get")
+	),
+	symbol!(
+		"docs/py/11-env.md",
+		"omp.env.http_post",
+		"(url, *, body=b\"\", headers=..., timeout=None) -> HttpResponse",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.http_post(\"https://example.test\", body=b\"{}\")",
+		Some("omp.env.http.post")
+	),
+	symbol!(
+		"docs/py/11-env.md",
+		"omp.env.http_put",
+		"(url, *, body=b\"\", headers=..., timeout=None) -> HttpResponse",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.http_put(\"https://example.test\", body=b\"{}\")",
+		Some("omp.env.http.put")
+	),
+	symbol!(
+		"docs/py/11-env.md",
 		"omp.env.proc.start",
 		"(name, script, *, cwd=None, env=None, pty=None, restart=None, ready=None) -> Process",
 		CallbackAbi::None,

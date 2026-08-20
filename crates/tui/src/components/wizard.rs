@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, fmt::Write};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use serde_json::Value;
 
 use crate::{
@@ -63,9 +63,9 @@ impl Wizard {
 	}
 
 	/// Appends a titled step pane.
-	pub fn step(mut self, title: impl Into<Str>, children: impl IntoChildren) -> Self {
+	pub fn step(mut self, title: impl IntoStr, children: impl IntoChildren) -> Self {
 		let pane = super::Col::new()
-			.with(Prop::Title, title.into())
+			.with(Prop::Title, title.into_str())
 			.child(children);
 		self.steps.push(Cached::new(pane.into_component()));
 		self

@@ -801,7 +801,7 @@ fn simple_error(
 ) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default())
 		.committed(committed)
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 struct WebSocketCancelOnDrop(crate::codec::Cancellation);

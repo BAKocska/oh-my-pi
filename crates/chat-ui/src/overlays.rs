@@ -1,4 +1,4 @@
-use omp_core::{Str, fmts};
+use omp_core::{IntoStr, Str, sf};
 use omp_tui::{
 	Border, Cached, Component, Dim, IntoChildren, Key, Layer, Mouse, OverlayAnchor, OverlayOptions,
 	PaintCtx, Prop, Props, Rect, Size, Slot, Ui, UiContext, UiEvent,
@@ -20,8 +20,8 @@ pub struct OverlayPanel {
 
 impl OverlayPanel {
 	/// Creates an empty titled panel with the standard horizontal inset.
-	pub fn new(title: impl Into<Str>) -> Self {
-		let title: Str = title.into();
+	pub fn new(title: impl IntoStr) -> Self {
+		let title: Str = title.into_str();
 		Self {
 			inner: Boxed::new()
 				.with(Prop::Border, Border::Round)
@@ -113,8 +113,8 @@ pub struct ListPicker {
 
 impl ListPicker {
 	/// Opens a titled picker over host-supplied rows.
-	pub fn open(title: impl Into<Str>, rows: &[ListRow], current: usize, ctx: &UiContext) -> Self {
-		let title = title.into();
+	pub fn open(title: impl IntoStr, rows: &[ListRow], current: usize, ctx: &UiContext) -> Self {
+		let title = title.into_str();
 		let rows = rows.to_vec();
 		let current = current.min(rows.len().saturating_sub(1));
 		Self {
@@ -220,16 +220,16 @@ fn build_list(
 		.enumerate()
 		.map(|(index, row)| {
 			(
-				fmts!("{index}"),
-				fmts!("{} {}", row.label, row.detail),
+				sf!("{index}"),
+				sf!("{} {}", row.label, row.detail),
 				row.label.clone(),
 				row.detail.clone(),
 				index == current,
 			)
 		})
 		.collect();
-	let title = Str::from(title);
-	let seed = Str::from(query);
+	let title = Str::new(title);
+	let seed = Str::new(query);
 	let height = list_rows.saturating_add(1);
 	Ui::from_root(
 		OverlayPanel::new(title).child(dom! {
@@ -272,8 +272,8 @@ pub struct PromptOverlay {
 
 impl PromptOverlay {
 	/// Opens a plain or masked prompt and focuses its input.
-	pub fn open(title: impl Into<Str>, masked: bool, ctx: &UiContext) -> Self {
-		let title = title.into();
+	pub fn open(title: impl IntoStr, masked: bool, ctx: &UiContext) -> Self {
+		let title = title.into_str();
 		let mut ui = build_prompt(&title, masked, 56, ctx);
 		ui.focus_first();
 		Self {
@@ -331,7 +331,7 @@ impl PromptOverlay {
 	fn route(&self, event: UiEvent) -> PromptEvent {
 		match event {
 			UiEvent::Cancel => PromptEvent::Cancel,
-			UiEvent::Submit => PromptEvent::Submit(Str::from(self.value())),
+			UiEvent::Submit => PromptEvent::Submit(Str::new(self.value())),
 			UiEvent::None
 			| UiEvent::Changed { .. }
 			| UiEvent::Highlighted { .. }
@@ -350,7 +350,7 @@ impl PromptOverlay {
 }
 
 fn build_prompt(title: &str, masked: bool, width: u16, ctx: &UiContext) -> Ui {
-	let title = Str::from(title);
+	let title = Str::new(title);
 	Ui::from_root(
 		OverlayPanel::new(title).pad_y(1).child(dom! {
 			<col>
@@ -379,9 +379,9 @@ mod tests {
 	#[test]
 	fn list_picker_keeps_host_keys_out_of_option_values() {
 		let rows = vec![ListRow {
-			key:    Str::from("session/opaque"),
-			label:  Str::from("Session"),
-			detail: Str::from("today"),
+			key:    sf!("session/opaque"),
+			label:  sf!("Session"),
+			detail: sf!("today"),
 		}];
 		let picker = ListPicker::open("Resume", &rows, 0, &UiContext::default());
 		assert_eq!(picker.key(0).map(Str::as_str), Some("session/opaque"));

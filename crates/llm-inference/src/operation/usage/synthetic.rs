@@ -10,7 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_core::{Str, parse_rfc3339};
+use omp_core::{Str, parse_rfc3339, sf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 
@@ -69,7 +69,7 @@ impl ConsoleUsageFetcher for SyntheticUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta,
 				plan: None,
-				source_label: Some(Str::new_static("synthetic-quotas")),
+				source_label: Some(sf!("synthetic-quotas")),
 				notes: Box::default(),
 				reset_credits: None,
 				windows,
@@ -86,7 +86,7 @@ fn parse_credential(raw: &str) -> Result<(String, UsageAccountMetadata), UsageFe
 			.and_then(Value::as_str)
 			.ok_or(UsageFetchError::Protocol)?
 			.to_owned();
-		let field = |n| v.get(n).and_then(Value::as_str).map(Str::from);
+		let field = |n| v.get(n).and_then(Value::as_str).map(Str::new);
 		Ok((key, UsageAccountMetadata {
 			provider_account_id: field("accountId"),
 			email: field("email"),
@@ -137,11 +137,11 @@ fn parse_windows(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageF
 			status(used, max, 90)
 		};
 		out.push(UsageWindow {
-			id:          Str::new_static("synthetic:requests:5h"),
+			id:          sf!("synthetic:requests:5h"),
 			kind:        UsageWindowKind::RateLimit,
-			dimension:   Str::new_static("requests"),
-			label:       Some(Str::new_static("Synthetic Requests")),
-			scope:       Some(Str::new_static("shared")),
+			dimension:   sf!("requests"),
+			label:       Some(sf!("Synthetic Requests")),
+			scope:       Some(sf!("shared")),
 			amount:      UsageAmount {
 				unit:      UsageUnit::Requests,
 				consumed:  Some(UsageQuantity::new(used, 0)),
@@ -154,7 +154,7 @@ fn parse_windows(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageF
 				.get("nextTickAt")
 				.and_then(Value::as_str)
 				.and_then(parse_rfc3339),
-			reset_label: Some(Str::new_static("tick")),
+			reset_label: Some(sf!("tick")),
 			notes:       Box::default(),
 			source:      UsageSource::Provider,
 			observed_at: now,
@@ -181,11 +181,11 @@ fn parse_windows(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageF
 				.and_then(Value::as_str)
 				.and_then(dollars);
 			out.push(UsageWindow {
-				id:          Str::new_static("synthetic:usd:7d"),
+				id:          sf!("synthetic:usd:7d"),
 				kind:        UsageWindowKind::Quota,
-				dimension:   Str::new_static("credits"),
-				label:       Some(Str::new_static("Synthetic Credits")),
-				scope:       Some(Str::new_static("shared")),
+				dimension:   sf!("credits"),
+				label:       Some(sf!("Synthetic Credits")),
+				scope:       Some(sf!("shared")),
 				amount:      UsageAmount { unit: UsageUnit::Usd, consumed, remaining, limit: max },
 				status:      Some(if consumed_percent >= 100.0 {
 					UsageStatus::Exhausted
@@ -199,7 +199,7 @@ fn parse_windows(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageF
 					.get("nextRegenAt")
 					.and_then(Value::as_str)
 					.and_then(parse_rfc3339),
-				reset_label: Some(Str::new_static("regen")),
+				reset_label: Some(sf!("regen")),
 				notes:       Box::default(),
 				source:      UsageSource::Provider,
 				observed_at: now,

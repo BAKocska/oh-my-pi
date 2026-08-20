@@ -8,7 +8,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_inference::{
 	Client, ProviderService, Registry,
 	account::{
@@ -298,7 +298,7 @@ async fn production_assembly(
 	.map_err(|_| {
 		DaemonError::Inference(Box::new(omp_llm_inference::Error::planning(
 			omp_llm_inference::ErrorKind::InvalidRequest,
-			omp_llm_inference::ErrorDetail::target(Str::from("catalog-credential-broker-invalid")),
+			omp_llm_inference::ErrorDetail::target(sf!("catalog-credential-broker-invalid",)),
 			Default::default(),
 		)))
 	})?;
@@ -324,28 +324,28 @@ async fn production_assembly(
 		)),
 		Arc::new(SecretLoginEngine::new(
 			AuthMethod::ApiKey,
-			Str::from("api-key"),
+			sf!("api-key"),
 			catalog.clone(),
 			credential_store.clone(),
 			accounts.clone(),
 		)?),
 		Arc::new(SecretLoginEngine::new(
 			AuthMethod::SessionToken,
-			Str::from("session-token"),
+			sf!("session-token"),
 			catalog.clone(),
 			credential_store.clone(),
 			accounts.clone(),
 		)?),
 		Arc::new(CredentialAcquisitionLoginEngine::new(
 			AuthMethod::ApplicationDefault,
-			Str::from("application-default"),
+			sf!("application-default"),
 			catalog.clone(),
 			credentials.clone(),
 			accounts.clone(),
 		)?),
 		Arc::new(CredentialAcquisitionLoginEngine::new(
 			AuthMethod::AwsCredentialChain,
-			Str::from("aws-credential-chain"),
+			sf!("aws-credential-chain"),
 			catalog.clone(),
 			credentials.clone(),
 			accounts.clone(),
@@ -423,12 +423,9 @@ async fn production_assembly(
 	let auth_application = AuthApplicationConfig { signing_regions: Arc::new(BTreeMap::new()) };
 	let antigravity_fingerprint = AntigravityFingerprint {
 		version: antigravity_version.await,
-		cl:      env_override(ANTIGRAVITY_CL_ENV)
-			.unwrap_or_else(|| Str::new_static(DEFAULT_ANTIGRAVITY_CL)),
-		os:      env_override(ANTIGRAVITY_OS_ENV)
-			.unwrap_or_else(|| Str::new_static(DEFAULT_ANTIGRAVITY_OS)),
-		arch:    env_override(ANTIGRAVITY_ARCH_ENV)
-			.unwrap_or_else(|| Str::new_static(DEFAULT_ANTIGRAVITY_ARCH)),
+		cl:      env_override(ANTIGRAVITY_CL_ENV).unwrap_or_else(|| sf!(DEFAULT_ANTIGRAVITY_CL)),
+		os:      env_override(ANTIGRAVITY_OS_ENV).unwrap_or_else(|| sf!(DEFAULT_ANTIGRAVITY_OS)),
+		arch:    env_override(ANTIGRAVITY_ARCH_ENV).unwrap_or_else(|| sf!(DEFAULT_ANTIGRAVITY_ARCH)),
 	};
 	let google_cca = GoogleCcaConfig {
 		gemini_cli_platform: Str::from(std::env::consts::OS),
@@ -522,7 +519,7 @@ fn antigravity_version_task(
 		let pinned = release_ordinal(DEFAULT_ANTIGRAVITY_VERSION).unwrap_or_default();
 		match cached {
 			Some((version, ordinal)) if ordinal > pinned => version,
-			_ => Str::new_static(DEFAULT_ANTIGRAVITY_VERSION),
+			_ => sf!(DEFAULT_ANTIGRAVITY_VERSION),
 		}
 	}
 }

@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::future::join_all;
-use omp_core::{IntoStr, Str, StrMut};
+use omp_core::{IntoStr, Str, StrMut, sf};
 use omp_env::{ClientError, EnvClient, Invocation, InvocationEvent};
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation, InvokeTool, Verdict as EnvVerdict},
@@ -779,14 +779,15 @@ impl SpeculativeCall {
 		pump
 			.hooks
 			.set(hooks)
-			.map_err(|_| BatchError::Projection(Str::new_static("invocation hook bus already set")))?;
-		pump.maximum_effects.set(maximum_effects).map_err(|_| {
-			BatchError::Projection(Str::new_static("invocation effect maximum already set"))
-		})?;
+			.map_err(|_| BatchError::Projection(sf!("invocation hook bus already set")))?;
+		pump
+			.maximum_effects
+			.set(maximum_effects)
+			.map_err(|_| BatchError::Projection(sf!("invocation effect maximum already set")))?;
 		pump
 			.facts
 			.set(facts)
-			.map_err(|_| BatchError::Projection(Str::new_static("invocation fact bus already set")))?;
+			.map_err(|_| BatchError::Projection(sf!("invocation fact bus already set")))?;
 		pump.maximum_ready.notify_one();
 		Ok(())
 	}
@@ -1138,7 +1139,7 @@ async fn run_call(
 				lower_abort_total(&call, Abort::EffectsUnknown { reason })
 			} else if authorization_indeterminate {
 				lower_abort_total(&call, Abort::EffectsUnknown {
-					reason: Str::new_static(
+					reason: sf!(
 						"effect authorization delivery became indeterminate during interruption",
 					),
 				})
@@ -1147,9 +1148,7 @@ async fn run_call(
 			}
 		},
 		PumpTerminal::CancelUnobserved => lower_abort_total(&call, Abort::EffectsUnknown {
-			reason: Str::new_static(
-				"environment owner did not report terminal truth after cancellation",
-			),
+			reason: sf!("environment owner did not report terminal truth after cancellation",),
 		}),
 		PumpTerminal::ClientError(error) => lower_abort_total(&call, Abort::EffectsUnknown {
 			reason: format!("environment invocation failed: {error}").to_str(),
@@ -1433,9 +1432,9 @@ fn render_abort(abort: &Abort) -> Str {
 		Abort::EffectsUnknown { reason } => {
 			format!("aborted with effects unknown: {reason}").to_str()
 		},
-		Abort::InputDropped => Str::new_static("aborted: invocation input dropped before commit"),
+		Abort::InputDropped => sf!("aborted: invocation input dropped before commit"),
 		Abort::MissingOutcome => {
-			Str::new_static("aborted: executor ended without a terminal outcome")
+			sf!("aborted: executor ended without a terminal outcome")
 		},
 	}
 }
@@ -1451,10 +1450,7 @@ mod tests {
 	use super::*;
 
 	fn identity(name: &'static str) -> ToolIdentity {
-		ToolIdentity {
-			name: Str::new_static(name),
-			rev:  Rev { family: Str::new_static("test"), n: 1 },
-		}
+		ToolIdentity { name: sf!(name), rev: Rev { family: sf!("test"), n: 1 } }
 	}
 
 	fn caps() -> CapsBase {
@@ -1480,8 +1476,8 @@ mod tests {
 	#[test]
 	fn hook_mask_zero_path_does_not_clone_or_enqueue_argument_text() {
 		let (bus, requests) = InvocationHookBus::channel();
-		let invocation_id = Str::from("call");
-		let fragment = Str::from("{\"value\":");
+		let invocation_id = sf!("call");
+		let fragment = sf!("{{\"value\":");
 		bus.arg_text(&invocation_id, &fragment);
 		assert!(requests.try_recv().is_err());
 
@@ -1530,7 +1526,7 @@ mod tests {
 	fn durable_outcome_preserves_all_four_terminal_arms() {
 		let issue = ArgIssue {
 			path:     Vec::new(),
-			expected: Str::new_static("object"),
+			expected: sf!("object"),
 			kind:     ArgIssueKind::Malformed,
 			example:  None,
 			found:    None,
@@ -1609,7 +1605,7 @@ mod tests {
 		let first = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("first"),
+			sf!("first"),
 			identity("first_tool"),
 			Duration::from_secs(1),
 		)
@@ -1618,7 +1614,7 @@ mod tests {
 		let second = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("second"),
+			sf!("second"),
 			identity("second_tool"),
 			Duration::from_secs(1),
 		)
@@ -1652,7 +1648,7 @@ mod tests {
 		let call = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("skipped"),
+			sf!("skipped"),
 			identity("skipped_tool"),
 			Duration::from_secs(1),
 		)
@@ -1661,7 +1657,7 @@ mod tests {
 		let opened = requests.recv_async().await.expect("invoke frame");
 		assert!(matches!(opened.body, Some(client_frame::Body::InvokeTool(_))));
 
-		let (_interrupt_tx, interrupt_rx) = watch::channel(Some(Str::new_static("user interrupted")));
+		let (_interrupt_tx, interrupt_rx) = watch::channel(Some(sf!("user interrupted")));
 		let results = ToolBatch::new(vec![call.commit(Bytes::from_static(b"{}"))])
 			.drive_interruptible(&Registry::new(), &caps(), interrupt_rx, Duration::from_millis(10))
 			.await;
@@ -1683,7 +1679,7 @@ mod tests {
 		let call = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("abandoned"),
+			sf!("abandoned"),
 			identity("abandoned_tool"),
 			Duration::from_secs(1),
 		)
@@ -1736,7 +1732,7 @@ mod tests {
 		let mut call = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("partial"),
+			sf!("partial"),
 			identity("partial_tool"),
 			Duration::from_secs(1),
 		)
@@ -1746,7 +1742,7 @@ mod tests {
 		assert!(matches!(opened.body, Some(client_frame::Body::InvokeTool(_))));
 
 		call
-			.relay_fragment(Str::new_static(r#"{"path":"src/main.rs","#))
+			.relay_fragment(sf!(r#"{{"path":"src/main.rs","#))
 			.await
 			.expect("relay path fragment");
 		let first_wire = requests.recv_async().await.expect("first ArgText");
@@ -1756,7 +1752,7 @@ mod tests {
 				if args.fragment == r#"{"path":"src/main.rs","#
 		));
 		call
-			.relay_fragment(Str::new_static(r#""command":"cargo ch"#))
+			.relay_fragment(sf!(r#""command":"cargo ch"#))
 			.await
 			.expect("relay command fragment");
 		let second_wire = requests.recv_async().await.expect("second ArgText");
@@ -1789,7 +1785,7 @@ mod tests {
 		let mut call = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("preview"),
+			sf!("preview"),
 			identity("preview_tool"),
 			Duration::from_secs(1),
 		)
@@ -1800,7 +1796,7 @@ mod tests {
 		assert!(matches!(opened.body, Some(client_frame::Body::InvokeTool(_))));
 
 		call
-			.relay_fragment(Str::new_static(r#"{"path":"src/lib.rs"}"#))
+			.relay_fragment(sf!(r#"{{"path":"src/lib.rs"}}"#))
 			.await
 			.expect("relay speculative arguments");
 		let fragment = requests.recv_async().await.expect("ArgText frame");
@@ -1885,7 +1881,7 @@ mod tests {
 		let call = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("raced-commit"),
+			sf!("raced-commit"),
 			identity("raced_tool"),
 			Duration::from_secs(1),
 		)
@@ -1901,7 +1897,7 @@ mod tests {
 		let blocker = SpeculativeCall::open(
 			&client,
 			&events,
-			Str::new_static("channel-blocker"),
+			sf!("channel-blocker"),
 			identity("blocker_tool"),
 			Duration::from_secs(1),
 		)
@@ -1926,7 +1922,7 @@ mod tests {
 				if committed.invocation_id == "raced-commit"
 		));
 		interrupt_tx
-			.send(Some(Str::new_static("interrupt after receiver took commit")))
+			.send(Some(sf!("interrupt after receiver took commit")))
 			.expect("interrupt batch");
 		if send_verdict {
 			responses
@@ -1964,7 +1960,7 @@ mod tests {
 			coordinate_interrupts(&mut source_rx, &targets, Duration::from_secs(1)).await;
 		});
 		source_tx
-			.send(Some(Str::new_static("stop every call")))
+			.send(Some(sf!("stop every call")))
 			.expect("interrupt coordinator");
 
 		let third = receivers[2].recv_async().await.expect("third interrupt");
@@ -2006,7 +2002,7 @@ mod tests {
 		let mutating = Effects {
 			documents: Some(omp_tool::DocEffects {
 				read:        true,
-				write_globs: Arc::from([Str::new_static("**")]),
+				write_globs: Arc::from([sf!("**")]),
 			}),
 			..Effects::empty()
 		};
@@ -2029,10 +2025,7 @@ mod tests {
 		let mode = ExecutionModeHandle::default();
 		mode.set(ExecutionMode::PlanYolo);
 		let mutating = Effects {
-			exec: Some(omp_tool::ExecEffects {
-				commands: Arc::from([Str::new_static("*")]),
-				network:  false,
-			}),
+			exec: Some(omp_tool::ExecEffects { commands: Arc::from([sf!("*")]), network: false }),
 			..Effects::empty()
 		};
 		let props = mode.invocation_props(&mutating);

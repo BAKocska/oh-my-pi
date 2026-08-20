@@ -11,7 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, base64_url, parse_rfc3339};
+use omp_core::{Str, base64_url, parse_rfc3339, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
@@ -83,20 +83,20 @@ impl ConsoleUsageFetcher for OpenAiCodexUsageFetcher {
 #[must_use]
 pub fn normalize_codex_base_url(base_url: Option<&str>) -> Str {
 	let Some(trimmed) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
-		return Str::new_static(CODEX_BASE_URL);
+		return sf!(CODEX_BASE_URL);
 	};
 	let Ok(url) = url::Url::parse(trimmed.trim_end_matches('/')) else {
-		return Str::new_static(CODEX_BASE_URL);
+		return sf!(CODEX_BASE_URL);
 	};
 	let Some(host) = url.host_str() else {
-		return Str::new_static(CODEX_BASE_URL);
+		return sf!(CODEX_BASE_URL);
 	};
 	if url.port().is_some()
 		|| !(host.eq_ignore_ascii_case("chatgpt.com") || host.eq_ignore_ascii_case("chat.openai.com"))
 	{
-		return Str::new_static(CODEX_BASE_URL);
+		return sf!(CODEX_BASE_URL);
 	}
-	Str::from(format!("{}/backend-api", url.origin().ascii_serialization()))
+	sf!("{}/backend-api", url.origin().ascii_serialization())
 }
 
 /// Extracts `ChatGPT` account id and normalized email claims from a JWT.
@@ -124,7 +124,7 @@ pub fn parse_codex_jwt_identity(token: &str) -> (Option<Str>, Option<Str>) {
 		.and_then(Value::as_str)
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(Str::from);
+		.map(Str::new);
 	let email = root
 		.get(JWT_PROFILE_CLAIM)
 		.and_then(Value::as_object)
@@ -132,7 +132,7 @@ pub fn parse_codex_jwt_identity(token: &str) -> (Option<Str>, Option<Str>) {
 		.and_then(Value::as_str)
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(|value| Str::from(value.to_ascii_lowercase()));
+		.map(|value| Str::new(value.to_ascii_lowercase()));
 	(account_id, email)
 }
 
@@ -212,7 +212,7 @@ async fn fetch_openai_codex_usage_until(
 			..UsageAccountMetadata::default()
 		},
 		plan,
-		source_label: Some(Str::new_static("chatgpt-backend")),
+		source_label: Some(sf!("chatgpt-backend")),
 		notes: Box::default(),
 		reset_credits,
 		windows,
@@ -317,17 +317,15 @@ fn build_window(
 				} else {
 					"Secondary window"
 				};
-				(Str::new_static(label), None)
+				(sf!(label), None)
 			},
 			window_description,
 		);
 	let (id, label, scope) = match additional {
-		Some((slug, display_name)) => (
-			Str::from(format!("openai-codex:{slug}:{key}")),
-			Str::from(format!("{label} ({display_name})")),
-			Str::from(slug),
-		),
-		None => (Str::from(format!("openai-codex:{key}")), label, Str::new_static("shared")),
+		Some((slug, display_name)) => {
+			(sf!("openai-codex:{slug}:{key}"), sf!("{label} ({display_name})"), Str::new(slug))
+		},
+		None => (sf!("openai-codex:{key}"), label, sf!("shared")),
 	};
 	let used = window.used_percent.map(|value| value.clamp(0.0, 100.0));
 	let status = used.map_or(UsageStatus::Unknown, |used| {
@@ -343,13 +341,12 @@ fn build_window(
 			UsageStatus::Ok
 		}
 	});
-	let notes = model_id.map_or_else(Box::default, |model_id| {
-		Box::new([Str::from(format!("model:{model_id}"))]) as Box<[Str]>
-	});
+	let notes = model_id
+		.map_or_else(Box::default, |model_id| Box::new([sf!("model:{model_id}")]) as Box<[Str]>);
 	UsageWindow {
 		id,
 		kind: UsageWindowKind::RateLimit,
-		dimension: Str::new_static("percent"),
+		dimension: sf!("percent"),
 		label: Some(label),
 		scope: Some(scope),
 		amount: UsageAmount {
@@ -373,11 +370,11 @@ fn window_description(seconds: f64) -> (Str, Option<Duration>) {
 	if seconds >= 86_400.0 {
 		let days = (seconds / 86_400.0).round().max(1.0) as u64;
 		let suffix = if days == 1 { "day" } else { "days" };
-		(Str::from(format!("{days} {suffix}")), duration)
+		(sf!("{days} {suffix}"), duration)
 	} else {
 		let hours = (seconds / 3_600.0).round().max(1.0) as u64;
 		let suffix = if hours == 1 { "hour" } else { "hours" };
-		(Str::from(format!("{hours} {suffix}")), duration)
+		(sf!("{hours} {suffix}"), duration)
 	}
 }
 
@@ -431,10 +428,10 @@ fn additional_slug(limit_name: Option<&str>, metered_feature: Option<&str>) -> S
 
 fn additional_display_name(slug: &str, limit_name: Option<&str>) -> Str {
 	if slug == "spark" {
-		return Str::new_static("Spark");
+		return sf!("Spark");
 	}
 	if let Some(limit_name) = limit_name {
-		return Str::from(limit_name);
+		return Str::new(limit_name);
 	}
 	let mut display = String::with_capacity(slug.len());
 	for (index, part) in slug.split('-').enumerate() {
@@ -447,7 +444,7 @@ fn additional_display_name(slug: &str, limit_name: Option<&str>) -> Str {
 			display.extend(chars);
 		}
 	}
-	Str::from(display)
+	Str::new(display)
 }
 
 fn parse_reset_credit_count(root: &Map<String, Value>) -> Option<UsageResetCredits> {
@@ -640,9 +637,9 @@ pub async fn consume_codex_reset_credit(
 		.and_then(|root| string(root.get("code")))
 		.unwrap_or_else(|| {
 			if (200..300).contains(&response.status) {
-				Str::new_static("reset")
+				sf!("reset")
 			} else {
-				Str::from(format!("http_{}", response.status))
+				sf!("http_{}", response.status)
 			}
 		});
 	Ok(CodexResetConsumeResult { ok: code == "reset", code, status: response.status })
@@ -744,7 +741,7 @@ fn string(value: Option<&Value>) -> Option<Str> {
 		.and_then(Value::as_str)
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
-		.map(Str::from)
+		.map(Str::new)
 }
 
 fn number(value: Option<&Value>) -> Option<f64> {
@@ -776,7 +773,7 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
-	use omp_core::{Str, base64_url, parse_rfc3339};
+	use omp_core::{base64_url, parse_rfc3339};
 	use parking_lot::Mutex;
 	use secrecy::{ExposeSecret as _, SecretString};
 
@@ -1010,20 +1007,20 @@ mod tests {
 	async fn consume_posts_exact_idempotent_body_and_picker_uses_soonest_expiry() {
 		let credits = [
 			CodexResetCredit {
-				id:         Str::from("later"),
-				status:     Some(Str::from("available")),
+				id:         sf!("later"),
+				status:     Some(sf!("available")),
 				granted_at: None,
 				expires_at: parse_rfc3339("2026-09-01T00:00:00Z"),
 			},
 			CodexResetCredit {
-				id:         Str::from("soon"),
-				status:     Some(Str::from("available")),
+				id:         sf!("soon"),
+				status:     Some(sf!("available")),
 				granted_at: None,
 				expires_at: parse_rfc3339("2026-08-20T00:00:00Z"),
 			},
 			CodexResetCredit {
-				id:         Str::from("redeemed"),
-				status:     Some(Str::from("redeemed")),
+				id:         sf!("redeemed"),
+				status:     Some(sf!("redeemed")),
 				granted_at: None,
 				expires_at: parse_rfc3339("2026-08-19T00:00:00Z"),
 			},

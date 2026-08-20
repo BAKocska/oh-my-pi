@@ -359,9 +359,9 @@ fn generic_view(
 		FoldState::Reduced(_) => None,
 	});
 	let Some(data) = data else {
-		return Ok(Str::from("{}"));
+		return Ok(Str::new_static("{}"));
 	};
 	let data = std::str::from_utf8(data)
 		.map_err(|source| RenderRegistryError::Utf8 { identity: identity.clone(), source })?;
-	Ok(Str::from(data))
+	Ok(Str::new(data))
 }

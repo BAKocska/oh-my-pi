@@ -97,7 +97,7 @@ impl ThemePatch {
 				if let Some(value) = &self.$field {
 					theme.$field = Color::parse(value).ok_or_else(|| ThemeError::Color {
 						token: stringify!($field),
-						value: Str::from(value.as_str()),
+						value: Str::new(value.as_str()),
 					})?;
 				}
 			};

@@ -147,7 +147,7 @@ impl ContentLengthDecoder {
 			let length = parse_content_length(&self.buffer[..header_end]);
 			match length {
 				Some(length) if length <= MAX_FRAME_BYTES => {
-					self.body_length = Some((block_end, length))
+					self.body_length = Some((block_end, length));
 				},
 				Some(length) => {
 					self.buffer.drain(..block_end);
@@ -185,7 +185,7 @@ impl ContentLengthDecoder {
 
 	/// Returns the lifetime number of non-fatal resynchronizations.
 	#[must_use]
-	pub fn resync_count(&self) -> u64 {
+	pub const fn resync_count(&self) -> u64 {
 		self.resync_count
 	}
 }
@@ -324,7 +324,7 @@ impl RpcFrameDecoder {
 		if count < 2 || count > MAX_REASSEMBLED_BYTES.div_ceil(RPC_CHUNK_BYTES) {
 			return Err(FramingError::InvalidChunk("invalid chunk count"));
 		}
-		if byte_length < MAX_FRAME_BYTES || byte_length > MAX_REASSEMBLED_BYTES {
+		if !(MAX_FRAME_BYTES..=MAX_REASSEMBLED_BYTES).contains(&byte_length) {
 			return Err(FramingError::LogicalFrameTooLarge { bytes: byte_length });
 		}
 		if index >= count {

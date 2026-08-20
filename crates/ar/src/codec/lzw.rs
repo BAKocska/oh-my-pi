@@ -18,11 +18,11 @@ impl<'a> LsbCodeReader<'a> {
 		Self { bytes, bit_position: 0, group_start: 0 }
 	}
 
-	fn total_bits(&self) -> usize {
+	const fn total_bits(&self) -> usize {
 		self.bytes.len().saturating_mul(8)
 	}
 
-	fn remaining_bits(&self) -> usize {
+	const fn remaining_bits(&self) -> usize {
 		self.total_bits().saturating_sub(self.bit_position)
 	}
 
@@ -92,7 +92,7 @@ impl BoundedOutput {
 }
 
 /// Decompresses one ncompress `.Z` stream bounded by `limits.archive_size`.
-pub(crate) fn lzw_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
+pub fn lzw_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
 	if bytes.len() < 3 {
 		return Err(Error::InvalidArchive("truncated compress (.Z) header"));
 	}

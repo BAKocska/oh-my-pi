@@ -442,15 +442,14 @@ mod tests {
 
 	#[test]
 	fn sql_and_backfill_predicates_agree() {
-		let predicate =
-			Where { field: Str::from("kind"), op: WhereOp::Eq, value: Str::from("tool_call") };
+		let predicate = Where { field: sf!("kind"), op: WhereOp::Eq, value: sf!("tool_call") };
 		assert_eq!(predicate.to_sql().unwrap(), "kind = ?");
 		assert!(
 			predicate
 				.matches(&IndexedEvent {
-					session_id:     Str::from("s"),
+					session_id:     sf!("s"),
 					offset:         TelemetryWatermark(0),
-					kind:           Str::from("tool_call"),
+					kind:           sf!("tool_call"),
 					occurred_at_ms: 1,
 					backfilled:     true,
 				})

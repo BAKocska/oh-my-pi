@@ -5,7 +5,7 @@
 //! owning transport, authentication, retry, or conversation storage.
 
 use bytes::{BufMut as _, Bytes, BytesMut};
-use omp_core::{Str, encoding::base64};
+use omp_core::{Str, encoding::base64, sf};
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 
 use crate::{
@@ -322,7 +322,7 @@ impl OmpNativeDecoder {
 				return Err(protocol_error("omp_tool_identity_missing", ErrorPhase::Streaming));
 			}
 			let id = ToolCallId::new(part.tool_call_id);
-			let name = Str::from(part.tool_name);
+			let name = Str::new(part.tool_name);
 			self.parts.insert(part.index, OmpOpenPart::Tool {
 				id:        id.clone(),
 				name:      name.clone(),
@@ -396,7 +396,7 @@ impl OmpNativeDecoder {
 			pb::StopReason::StopToolUse => FinishReason::ToolCalls,
 			pb::StopReason::StopMaxTokens => FinishReason::Length,
 			pb::StopReason::StopContentFilter => FinishReason::ContentFilter,
-			pb::StopReason::StopUnspecified => FinishReason::Other(Str::from("unspecified")),
+			pb::StopReason::StopUnspecified => FinishReason::Other(sf!("unspecified")),
 		};
 		if let Some(revision) = outcome.revision.as_ref() {
 			emit(RawEvent::ProviderState(ProviderStateEvent::Checkpoint {
@@ -430,12 +430,12 @@ impl OmpNativeDecoder {
 			let actual_revision = failure
 				.actual
 				.as_ref()
-				.map_or_else(|| Str::from("missing"), revision_id);
+				.map_or_else(|| sf!("missing"), revision_id);
 			emit(RawEvent::Control(ProviderControlEvent::RevisionConflict { actual_revision }));
 		} else {
 			emit(RawEvent::Control(ProviderControlEvent::RolledBack { revision: None }));
 		}
-		let mut error = protocol_error(code, ErrorPhase::Streaming).code(Str::from(code));
+		let mut error = protocol_error(code, ErrorPhase::Streaming).code(Str::new(code));
 		error.kind = kind;
 		emit(RawEvent::Failure(error));
 	}
@@ -443,7 +443,7 @@ impl OmpNativeDecoder {
 
 fn revision_id(revision: &thread_pb::Revision) -> Str {
 	let token = base64::encode(&revision.token).into_string();
-	Str::from(format!("{}:{token}", revision.head))
+	sf!("{}:{token}", revision.head)
 }
 
 impl Decoder for OmpNativeDecoder {
@@ -488,7 +488,7 @@ fn proto_usage(usage: &pb::Usage) -> Usage {
 
 fn protocol_error(reason: &'static str, phase: ErrorPhase) -> Error {
 	Error::new(ErrorKind::Protocol, phase, RetryAction::Never, ExecutionReceipt::default())
-		.detail(ErrorDetail::protocol(ReasonId(Str::from(reason))))
+		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
 #[cfg(test)]

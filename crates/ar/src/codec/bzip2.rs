@@ -77,7 +77,7 @@ impl<'a> BitReader<'a> {
 		Self { bytes, bit_position: 0 }
 	}
 
-	fn done(&self) -> bool {
+	const fn done(&self) -> bool {
 		self.bit_position == self.bytes.len().saturating_mul(8)
 	}
 
@@ -461,7 +461,7 @@ fn append_rle1(decoded: &[u8], randomized: bool, output: &mut BoundedOutput) -> 
 }
 
 /// Decompresses concatenated bzip2 streams bounded by `limits.archive_size`.
-pub(crate) fn bzip2_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
+pub fn bzip2_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
 	let mut reader = BitReader::new(bytes);
 	let mut output = BoundedOutput::new(limits.archive_size, bytes.len());
 

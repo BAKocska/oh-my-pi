@@ -45,6 +45,7 @@ use std::sync::{
 	atomic::{AtomicBool, Ordering},
 };
 
+use omp_core::Str;
 use parking_lot::Mutex;
 
 use crate::{
@@ -271,7 +272,7 @@ pub fn parse_request(line: &[u8]) -> Result<DebugRequest, String> {
 				.get("text")
 				.and_then(serde_json::Value::as_str)
 				.ok_or_else(|| "paste op needs a \"text\" string".to_owned())?;
-			Ok(DebugRequest::Inject(vec![InputEvent::Paste(text.into())]))
+			Ok(DebugRequest::Inject(vec![InputEvent::Paste(Str::new(text))]))
 		},
 		"mouse" => Ok(DebugRequest::Inject(vec![InputEvent::Mouse(parse_mouse(&value)?)])),
 		"event" | "events" => {

@@ -384,15 +384,11 @@ impl Decoder {
 			let match_offset = if slot == 0 {
 				self.r0
 			} else if slot == 1 {
-				let offset = self.r1;
-				self.r1 = self.r0;
-				self.r0 = offset;
-				offset
+				std::mem::swap(&mut self.r1, &mut self.r0);
+				self.r0
 			} else if slot == 2 {
-				let offset = self.r2;
-				self.r2 = self.r0;
-				self.r0 = offset;
-				offset
+				std::mem::swap(&mut self.r2, &mut self.r0);
+				self.r0
 			} else {
 				let (&base, &extra) = self
 					.position_base

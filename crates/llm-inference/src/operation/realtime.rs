@@ -10,7 +10,7 @@ use std::{
 	time::SystemTime,
 };
 
-use omp_core::Str;
+use omp_core::sf;
 use tower::Service;
 
 use crate::{
@@ -364,14 +364,14 @@ where
 				return Err(wrong_operation(&call, OperationKind::Realtime));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(
-					OperationKind::Realtime,
-					Str::from(format!("{error:?}")),
-				));
+				return Err(media_validation_error(OperationKind::Realtime, sf!("{error:?}")));
 			}
 			let response = pending
 				.ok_or_else(|| {
-					media_validation_error(OperationKind::Realtime, "realtime_request_not_dispatched")
+					media_validation_error(
+						OperationKind::Realtime,
+						sf!("realtime_request_not_dispatched"),
+					)
 				})?
 				.await?;
 			Ok(response.into_answer(AnswerBody::Realtime))

@@ -10,7 +10,7 @@ use omp_agent::{
 	TurnInput, TurnOptions, WorkspaceInput,
 };
 use omp_app::rpc_adapter::InferenceRpc;
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_e2e::support::{Scratch, user_item, within};
 use omp_llm_catalog::{
 	CompiledCatalog,
@@ -230,7 +230,7 @@ fn cassette_attempt() -> CassetteAttempt {
 	CassetteAttempt {
 		status: Some(200),
 		headers: Box::new([]),
-		provider_request_id: Some(Str::from("p5-cassette")),
+		provider_request_id: Some(sf!("p5-cassette")),
 		body: CassetteBodyAction::Drain,
 		frames: vec![
 			Frame::Sse(SseEvent {
@@ -341,7 +341,7 @@ async fn gateway(
 fn journal(scratch: &Scratch) -> Journal {
 	Journal::create(&scratch.state().join("p5.jsonl"), &Header {
 		v:       4,
-		id:      SessionId(Str::from("p5-prefix-stability")),
+		id:      SessionId(sf!("p5-prefix-stability")),
 		created: 0,
 		cwd:     scratch.project().to_owned(),
 	})
@@ -411,7 +411,7 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 	let client = Instrumented::new(gateway(&scratch, cassette, Arc::clone(&tools_v1)).await);
 	let probe = client.clone();
 	let options = TurnOptions {
-		context_id: Some(Str::from("p5-context")),
+		context_id: Some(sf!("p5-context")),
 		params:     pb::ChatParams {
 			model: MODEL.to_owned(),
 			tools: vec![tool_def(1)],

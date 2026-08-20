@@ -18,7 +18,7 @@ use omp_chat_ui::{
 	PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, SessionRow, Sidebar, StatusFacts,
 	Welcome, WelcomeEvent,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
 use omp_tui::{
 	Frame, Graphics, Key, Layer, Mouse, MouseReport, Size, UiContext, paste::ClipboardRead,
@@ -447,27 +447,25 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					if generation.load(Ordering::SeqCst) != turn {
 						break;
 					}
-					let _ = events.send(BackendEvent::AssistantDelta {
-						id:   id.clone(),
-						text: Str::new_static(text),
-					});
+					let _ =
+						events.send(BackendEvent::AssistantDelta { id: id.clone(), text: sf!(text) });
 					std::thread::sleep(Duration::from_millis(120));
 				}
 				let tool = Str::from(format!("tool-{turn}"));
 				if generation.load(Ordering::SeqCst) == turn {
 					let _ = events.send(BackendEvent::ToolStarted {
 						id:    tool.clone(),
-						name:  Str::new_static("shell"),
-						title: Str::new_static("Inspect chat scene"),
+						name:  sf!("shell"),
+						title: sf!("Inspect chat scene"),
 					});
 					let _ = events.send(BackendEvent::ToolOutput {
 						id:    tool.clone(),
-						chunk: Str::new_static("checking damage ranges\n"),
+						chunk: sf!("checking damage ranges\n"),
 					});
 					let _ = events.send(BackendEvent::ToolFinished {
 						id:   tool,
 						ok:   true,
-						view: Str::new_static("Host seam verified"),
+						view: sf!("Host seam verified"),
 					});
 				}
 				if generation.load(Ordering::SeqCst) == turn {
@@ -492,12 +490,12 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 			},
 			Intent::Resume(_) => {
 				let _ = events.send(BackendEvent::UserReplayed {
-					text:  Str::new_static("Continue the previous session."),
+					text:  sf!("Continue the previous session."),
 					chips: Vec::new(),
 				});
 			},
 			Intent::Help => {
-				let _ = events.send(BackendEvent::Notice(Str::new_static(
+				let _ = events.send(BackendEvent::Notice(sf!(
 					"Ctrl+P models · Ctrl+K commands · Ctrl+B sidebar",
 				)));
 			},
@@ -557,7 +555,7 @@ fn mock_status(model: &str, working: bool) -> StatusFacts {
 		jobs: usize::from(working),
 		attempt: 0,
 		dropped: 0,
-		git: Some(GitFacts { branch: Str::new_static("main"), dirty: 5, staged: 9 }),
+		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
 		..StatusFacts::default()
 	}
 }

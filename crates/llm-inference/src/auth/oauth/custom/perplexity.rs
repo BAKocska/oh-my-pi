@@ -13,7 +13,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{CONTENT_TYPE, COOKIE, SET_COOKIE, USER_AGENT},
 };
-use omp_core::{Str, base64_url};
+use omp_core::{base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
@@ -178,8 +178,8 @@ impl OAuthCustomHandler for PerplexityEmailOtp {
 async fn prompt_email(driver: &LoginDriver) -> Result<SecretString, OAuthError> {
 	driver
 		.emit(AuthEvent::Prompt(AuthPrompt {
-			id:      Str::new_static("perplexity-email"),
-			message: Str::new_static("Enter your Perplexity email address"),
+			id:      sf!("perplexity-email"),
+			message: sf!("Enter your Perplexity email address"),
 			input:   AuthPromptKind::PlainText,
 		}))
 		.await?;
@@ -202,8 +202,8 @@ async fn prompt_email(driver: &LoginDriver) -> Result<SecretString, OAuthError> 
 async fn prompt_otp(driver: &LoginDriver) -> Result<SecretString, OAuthError> {
 	driver
 		.emit(AuthEvent::Prompt(AuthPrompt {
-			id:      Str::new_static("perplexity-otp"),
-			message: Str::new_static("Enter the code sent to your email"),
+			id:      sf!("perplexity-otp"),
+			message: sf!("Enter the code sent to your email"),
 			input:   AuthPromptKind::AuthorizationCode,
 		}))
 		.await?;
@@ -373,7 +373,7 @@ fn token_set(
 	Ok(OAuthTokenSet {
 		access_token: token,
 		refresh_token: Some(refresh_token),
-		token_type: "Bearer".into(),
+		token_type: sf!("Bearer"),
 		expires_in: Some(expires_in),
 		identity_response,
 	})

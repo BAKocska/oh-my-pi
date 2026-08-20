@@ -3,7 +3,7 @@
 use std::time::{Instant, SystemTime};
 
 use futures::FutureExt as _;
-use omp_core::Str;
+use omp_core::sf;
 use secrecy::SecretString;
 
 use crate::{
@@ -67,8 +67,8 @@ impl ConsoleUsageFetcher for OllamaUsageFetcher {
 			Ok(ConsoleUsageObservation {
 				account_meta:  UsageAccountMetadata::default(),
 				plan:          None,
-				source_label:  Some(Str::new_static("ollama-runtime")),
-				notes:         vec![Str::new_static(NO_QUOTA_NOTE)].into_boxed_slice(),
+				source_label:  Some(sf!("ollama-runtime")),
+				notes:         vec![sf!(NO_QUOTA_NOTE)].into_boxed_slice(),
 				reset_credits: None,
 				windows:       Vec::new(),
 			})

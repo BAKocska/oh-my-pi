@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, collections::HashSet, fmt};
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 use serde_json::Value;
 
 /// A supported Jupyter notebook cell kind.
@@ -62,8 +62,8 @@ pub struct RenderedNotebook {
 pub struct NotebookError(Str);
 
 impl NotebookError {
-	fn new(message: impl Into<Str>) -> Self {
-		Self(message.into())
+	fn new(message: impl IntoStr) -> Self {
+		Self(message.into_str())
 	}
 
 	/// Model-facing error text.

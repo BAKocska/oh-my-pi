@@ -14,7 +14,7 @@ pub struct CredentialScope {
 impl CredentialScope {
 	/// Builds a scope from manifest `credentials.*` provider globs.
 	#[must_use]
-	pub fn new(allow: Arc<[Str]>) -> Self {
+	pub const fn new(allow: Arc<[Str]>) -> Self {
 		Self { allow }
 	}
 
@@ -32,7 +32,7 @@ impl CredentialScope {
 		if self.allows(provider) {
 			Ok(())
 		} else {
-			Err(CredentialScopeError::Denied { provider: Str::from(provider) })
+			Err(CredentialScopeError::Denied { provider: Str::new(provider) })
 		}
 	}
 }
@@ -59,7 +59,7 @@ pub enum CredentialScopeError {
 	},
 }
 
-fn glob_matches(pattern: &str, value: &str) -> bool {
+const fn glob_matches(pattern: &str, value: &str) -> bool {
 	let pattern = pattern.as_bytes();
 	let value = value.as_bytes();
 	let (mut pattern_index, mut value_index) = (0, 0);
@@ -90,13 +90,13 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use omp_core::Str;
+	
 
 	use super::CredentialScope;
 
 	#[test]
 	fn scope_glob_refuses_unlisted_provider() {
-		let scope = CredentialScope::new([Str::from("anthropic/*"), Str::from("local")].into());
+		let scope = CredentialScope::new([sf!("anthropic/*"), sf!("local")].into());
 		assert!(scope.enforce("anthropic/claude").is_ok());
 		assert!(scope.enforce("openai/gpt").is_err());
 	}

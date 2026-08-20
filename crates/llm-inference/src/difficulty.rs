@@ -6,7 +6,7 @@ use std::{
 	future::Future,
 };
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -272,14 +272,12 @@ impl DifficultyClassifier {
 		if let Some(decision) = self.short_circuit(&sanitized, DifficultyBackend::Local, auto) {
 			return Ok(decision);
 		}
-		let ladder = ClassifierLadder::new(
-			[Str::new_static("low"), Str::new_static("medium"), Str::new_static("high")].into(),
-		)?;
+		let ladder = ClassifierLadder::new([sf!("low"), sf!("medium"), sf!("high")].into())?;
 		let fallback = self.fallback_level(auto);
 		let local_fallback = match fallback {
-			Difficulty::Minimal | Difficulty::Low => Str::new_static("low"),
-			Difficulty::Medium => Str::new_static("medium"),
-			Difficulty::High | Difficulty::Max => Str::new_static("high"),
+			Difficulty::Minimal | Difficulty::Low => sf!("low"),
+			Difficulty::Medium => sf!("medium"),
+			Difficulty::High | Difficulty::Max => sf!("high"),
 		};
 		let response = adapter.classify(
 			&[ChatMessage { role: ChatRole::User, content: sanitized.clone() }],
@@ -399,7 +397,7 @@ fn online_request(input: Str, allow_max: bool) -> OnlineDifficultyRequest {
 	let labels = Difficulty::ONLINE_LABELS
 		.iter()
 		.filter(|(_, level)| allow_max || *level != Difficulty::Max)
-		.map(|(label, _)| Str::new_static(label))
+		.map(|(label, _)| sf!(label))
 		.collect::<SmallVec<_, 5>>();
 	let mut instruction = String::from("Classify task difficulty. Reply with exactly one of: ");
 	for (index, label) in labels.iter().enumerate() {
@@ -410,7 +408,7 @@ fn online_request(input: Str, allow_max: bool) -> OnlineDifficultyRequest {
 	}
 	instruction.push('.');
 	OnlineDifficultyRequest {
-		model: Str::new_static("@tiny"),
+		model: sf!("@tiny"),
 		input,
 		labels,
 		instruction: instruction.into(),
@@ -465,7 +463,7 @@ mod tests {
 				std::future::ready(if attempts == 1 {
 					Err(OnlineDifficultyError::new("busy", true))
 				} else {
-					Ok(Str::new_static("high after low"))
+					Ok(sf!("high after low"))
 				})
 			})
 			.await;

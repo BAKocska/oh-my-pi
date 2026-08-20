@@ -1,6 +1,6 @@
 //! Pure domain types shared by hashline parsing and later application stages.
 
-use omp_core::Str;
+use omp_core::{IntoStr, Str};
 
 /// A one-indexed source line anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -468,14 +468,14 @@ impl Diagnostic {
 		code: DiagnosticCode,
 		patch_line: Option<usize>,
 		authored_index: Option<usize>,
-		message: impl Into<Str>,
+		message: impl IntoStr,
 	) -> Self {
 		Self {
 			code,
 			severity: DiagnosticSeverity::Error,
 			patch_line,
 			authored_index,
-			message: message.into(),
+			message: message.into_str(),
 		}
 	}
 
@@ -484,14 +484,14 @@ impl Diagnostic {
 		code: DiagnosticCode,
 		patch_line: Option<usize>,
 		authored_index: Option<usize>,
-		message: impl Into<Str>,
+		message: impl IntoStr,
 	) -> Self {
 		Self {
 			code,
 			severity: DiagnosticSeverity::Warning,
 			patch_line,
 			authored_index,
-			message: message.into(),
+			message: message.into_str(),
 		}
 	}
 }

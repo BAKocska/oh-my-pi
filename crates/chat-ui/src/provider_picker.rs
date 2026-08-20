@@ -1,7 +1,7 @@
 //! Provider login picker: a reflowing grid of focusable logo cards with
 //! incremental type-to-filter, modeled on the `companies` roster example.
 
-use omp_core::{Str, fmts};
+use omp_core::{Str, sf};
 use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Size, Ui, UiContext, UiEvent, dom,
 };
@@ -132,7 +132,7 @@ impl ProviderPicker {
 			.enumerate()
 			.filter(|(_, row)| self.matches(row))
 			.map(|(index, row)| ProviderCard {
-				press_id:    fmts!("{index}"),
+				press_id:    sf!("{index}"),
 				provider_id: row.id.clone(),
 				label:       row.label.clone(),
 			})
@@ -140,9 +140,9 @@ impl ProviderPicker {
 		let shown = cards.len();
 		let total = self.rows.len();
 		let counter = if self.query.is_empty() {
-			fmts!("{total} providers")
+			sf!("{total} providers")
 		} else {
-			fmts!("{shown}/{total} · filter: {}", self.query)
+			sf!("{shown}/{total} · filter: {}", self.query)
 		};
 		self.ui = Ui::from_root(
 			OverlayPanel::new("Provider Login").child(provider_card_grid(
@@ -228,11 +228,7 @@ mod tests {
 	fn rows() -> Vec<SessionRow> {
 		["anthropic", "github-copilot", "deepseek"]
 			.into_iter()
-			.map(|id| SessionRow {
-				id:     Str::new_static(id),
-				label:  Str::new_static(id),
-				detail: Str::default(),
-			})
+			.map(|id| SessionRow { id: sf!(id), label: sf!(id), detail: Str::default() })
 			.collect()
 	}
 

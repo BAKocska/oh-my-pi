@@ -3,7 +3,7 @@
 use std::{collections::HashMap, future::Future, ops::Range, str::FromStr as _, sync::Arc};
 
 use omp_core::{
-	CowBytes, Str, sparse_index::TrySparseIndex, sparse_map::SparseMap, sparse_set::SparseSet,
+	CowBytes, Str, sf, sparse_index::TrySparseIndex, sparse_map::SparseMap, sparse_set::SparseSet,
 };
 use omp_tool::ArtifactLifetime;
 use parking_lot::RwLock;
@@ -167,7 +167,7 @@ impl SchemeEntry {
 	pub fn new(scheme: Scheme, readable: bool, mintable: bool, description: impl Into<Str>) -> Self {
 		Self {
 			scheme,
-			member: Str::from(format!("{scheme:?}").to_ascii_uppercase()),
+			member: Str::new(format!("{scheme:?}").to_ascii_uppercase()),
 			readable,
 			mintable,
 			selectors: scheme.accepts_selectors(),
@@ -424,7 +424,7 @@ impl LineOffsetCache {
 		self
 			.0
 			.write()
-			.entry(Str::from(key))
+			.entry(Str::new(key))
 			.or_insert_with(|| offsets.clone())
 			.clone()
 	}
@@ -465,10 +465,10 @@ impl<C: ArtifactCatalog, B: BlobAuthority> ArtifactResolver<C, B> {
 			record.filter(|entry| entry.lifetime == ArtifactLifetime::Durable)
 		} else {
 			let ordinal = resource.parse::<u64>().map_err(|_| Fault::Invalid {
-				message: Str::from(format!(
+				message: sf!(
 					"Invalid artifact address '{resource}'; use a session ordinal or 64-hex durable \
 					 digest"
-				)),
+				),
 			})?;
 			self.catalog.by_ordinal(ordinal).await?
 		};
@@ -492,7 +492,7 @@ impl<C: ArtifactCatalog, B: BlobAuthority> ArtifactResolver<C, B> {
 		let Some(offsets) = self.lines.get(&record.digest) else {
 			let bytes = self.all_bytes(record, size).await?;
 			std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
-				message: Str::new_static("Artifact selectors require UTF-8 text"),
+				message: sf!("Artifact selectors require UTF-8 text"),
 			})?;
 			let offsets = self.lines.index(&record.digest, &bytes);
 			if ranges.len() == 1 {
@@ -554,15 +554,15 @@ impl<C: ArtifactCatalog, B: BlobAuthority> Resolve for ArtifactResolver<C, B> {
 }
 
 fn selector_fault(error: SelectorError) -> Fault {
-	Fault::Invalid { message: Str::from(error.to_string()) }
+	Fault::Invalid { message: Str::new(error.to_string()) }
 }
 
 fn usize_range_to_u64(range: Range<usize>) -> Result<Range<u64>, Fault> {
 	let start = u64::try_from(range.start).map_err(|_| Fault::Invalid {
-		message: Str::new_static("Artifact line offset exceeds the blob protocol range"),
+		message: sf!("Artifact line offset exceeds the blob protocol range"),
 	})?;
 	let end = u64::try_from(range.end).map_err(|_| Fault::Invalid {
-		message: Str::new_static("Artifact line offset exceeds the blob protocol range"),
+		message: sf!("Artifact line offset exceeds the blob protocol range"),
 	})?;
 	Ok(start..end)
 }

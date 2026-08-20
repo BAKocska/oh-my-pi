@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt as _, stream};
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{
 	Catalog, CodecId, ModelKey, OperationKind, PolicyModel, ProviderId, RouteId, WireTarget,
 };
@@ -94,7 +94,7 @@ fn response_meta() -> ResponseMeta {
 		provider:            ProviderId::from("offline-provider"),
 		route:               RouteId::from("offline-route"),
 		model:               Some(ModelKey::from("offline-model")),
-		provider_request_id: Some(Str::from("provider-request-fixture")),
+		provider_request_id: Some(sf!("provider-request-fixture")),
 		created_at:          SystemTime::UNIX_EPOCH,
 	}
 }
@@ -162,8 +162,8 @@ fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
 	}
 
 	let provenance = TokenizerProvenance {
-		tokenizer: Str::from("fixture-tokenizer"),
-		revision:  Str::from("1"),
+		tokenizer: sf!("fixture-tokenizer"),
+		revision:  sf!("1"),
 		exact:     true,
 	};
 	assert!(
@@ -185,7 +185,7 @@ fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
 	);
 	assert_eq!(
 		DetokenizeRequest::extract(answer(AnswerBody::Text(DetokenizedText {
-			text: Str::from("decoded"),
+			text: sf!("decoded"),
 			provenance
 		})))
 		.unwrap()
@@ -248,7 +248,7 @@ fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
 	assert!(
 		DiscoveryRequest::extract(answer(AnswerBody::Models(ModelDiscoveryPage {
 			models:      Vec::new(),
-			next_cursor: Some(Str::from("next")),
+			next_cursor: Some(sf!("next")),
 		})))
 		.is_ok()
 	);
@@ -273,10 +273,10 @@ fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
 	);
 
 	let mismatch = ChatRequest::extract(answer(AnswerBody::Text(DetokenizedText {
-		text:       Str::from("wrong"),
+		text:       sf!("wrong"),
 		provenance: TokenizerProvenance {
-			tokenizer: Str::from("fixture-tokenizer"),
-			revision:  Str::from("1"),
+			tokenizer: sf!("fixture-tokenizer"),
+			revision:  sf!("1"),
 			exact:     true,
 		},
 	})))
@@ -292,9 +292,7 @@ async fn realtime_session_public_api_is_bounded_and_has_one_shared_terminal_tran
 
 	let (session, mut provider) = RealtimeSession::bounded(1).unwrap();
 	assert!(!session.is_closed());
-	let first = session
-		.try_send(RealtimeInput::Text(Str::from("one")))
-		.unwrap();
+	let first = session.try_send(RealtimeInput::Text(sf!("one"))).unwrap();
 	assert_eq!(first.kind, RealtimeInputKind::Text);
 	assert_eq!(
 		session.try_send(RealtimeInput::Commit).unwrap_err(),
@@ -319,7 +317,7 @@ async fn realtime_session_public_api_is_bounded_and_has_one_shared_terminal_tran
 	assert!(matches!(provider.recv().await.unwrap(), RealtimeInput::Close));
 	assert_eq!(
 		session
-			.try_send(RealtimeInput::Text(Str::from("late")))
+			.try_send(RealtimeInput::Text(sf!("late")))
 			.unwrap_err(),
 		RealtimeSessionError::AlreadyClosed,
 	);
@@ -418,7 +416,7 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 	let mut emitted = Vec::new();
 	let partial = ChatEvent::ToolArgumentsDelta { index: 0, bytes: Bytes::from_static(b"{\"q\":") };
 	let mut tool_gate = OutputGate::new(
-		GateCondition::ToolCallReady { tool: Str::from("lookup") },
+		GateCondition::ToolCallReady { tool: sf!("lookup") },
 		event_size(&partial) * 4,
 	);
 	assert_eq!(
@@ -432,7 +430,7 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 		index: 0,
 		call:  ToolCall {
 			id:        ToolCallId::from("call-fixture"),
-			name:      Str::from("lookup"),
+			name:      sf!("lookup"),
 			arguments: omp_llm_inference::call::OpaqueJson::new(serde_json::json!({"q":"rust"})),
 		},
 	};
@@ -447,7 +445,7 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 	let mut structured = OutputGate::new(GateCondition::ValidStructuredOutput, 4096);
 	let mut structured_output = Vec::new();
 	structured
-		.push(ChatEvent::TextDelta { index: 0, text: Str::from("{\"ok\":true}") }, &mut |event| {
+		.push(ChatEvent::TextDelta { index: 0, text: sf!("{\"ok\":true}") }, &mut |event| {
 			structured_output.push(event);
 		})
 		.unwrap();
@@ -467,7 +465,7 @@ fn provisional_cancellation_hides_events_but_preserves_usage_and_cost_receipts()
 	let mut gate = OutputGate::new(GateCondition::WholeAttempt, 4096);
 	let mut output = Vec::new();
 	gate
-		.push(ChatEvent::TextDelta { index: 0, text: Str::from("private") }, &mut |event| {
+		.push(ChatEvent::TextDelta { index: 0, text: sf!("private") }, &mut |event| {
 			output.push(event);
 		})
 		.unwrap();
@@ -579,18 +577,18 @@ fn session_forks_are_immutable_and_reseed_is_strictly_one_shot() {
 	let root = store.create().unwrap();
 	let main = root.conversation().clone();
 	let first = store
-		.begin(&main, root.revision(), TurnId::from("turn-1"), Arc::from([Str::from("one")]))
+		.begin(&main, root.revision(), TurnId::from("turn-1"), Arc::from([sf!("one")]))
 		.unwrap()
 		.commit()
 		.unwrap();
 	let fork = store.fork(first.revision()).unwrap();
 	let main_head = store
-		.begin(&main, first.revision(), TurnId::from("turn-main"), Arc::from([Str::from("main")]))
+		.begin(&main, first.revision(), TurnId::from("turn-main"), Arc::from([sf!("main")]))
 		.unwrap()
 		.commit()
 		.unwrap();
 	let fork_head = store
-		.begin(&fork, first.revision(), TurnId::from("turn-fork"), Arc::from([Str::from("fork")]))
+		.begin(&fork, first.revision(), TurnId::from("turn-fork"), Arc::from([sf!("fork")]))
 		.unwrap()
 		.commit()
 		.unwrap();
@@ -688,7 +686,7 @@ fn cassette_request(body: BodySource, format: NativeResponseFormat) -> Transport
 		encoded:     EncodedRequest::new(
 			OperationKind::Native,
 			RequestMethod::Post,
-			Str::from("https://offline.invalid/v1/responses"),
+			sf!("https://offline.invalid/v1/responses"),
 			Box::new([]),
 			body,
 			FramingProtocol::Raw,
@@ -722,7 +720,7 @@ async fn cassette_transport_uses_real_decoder_and_retains_exact_replay_evidence(
 	let attempt = CassetteAttempt {
 		status:              Some(200),
 		headers:             Box::new([]),
-		provider_request_id: Some(Str::from("provider-request-fixture")),
+		provider_request_id: Some(sf!("provider-request-fixture")),
 		body:                CassetteBodyAction::Drain,
 		frames:              vec![Frame::Raw(Bytes::from(payload.clone()))].into_boxed_slice(),
 		terminal:            CassetteTerminal::Complete,
@@ -763,7 +761,7 @@ async fn cassette_first_frame_failure_carries_last_attempt_body_evidence() {
 	let attempt = CassetteAttempt {
 		status:              Some(502),
 		headers:             Box::new([]),
-		provider_request_id: Some(Str::from("provider-request-fixture")),
+		provider_request_id: Some(sf!("provider-request-fixture")),
 		body:                CassetteBodyAction::Drain,
 		frames:              vec![Frame::Raw(Bytes::from_static(b"{"))].into_boxed_slice(),
 		terminal:            CassetteTerminal::Complete,
@@ -825,7 +823,7 @@ fn signed_gemini_visible_text_proof_round_trips_and_cca_lowers_account_project()
 	let request = chat_request(vec![Message {
 		role:    Role::Assistant,
 		content: Arc::from([ContentPart::Text {
-			text:  Str::from("visible signed text"),
+			text:  sf!("visible signed text"),
 			proof: Some(ProviderProof {
 				provider: provider.clone(),
 				codec:    codec_id.clone(),
@@ -1005,7 +1003,7 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 		(
 			"gitlab-openai-chat",
 			Box::new(GitLabDelegatingCodec::from_route(&GitLabDirectRoute {
-				exchange_endpoint: Str::from("https://offline.invalid/token"),
+				exchange_endpoint: sf!("https://offline.invalid/token"),
 				delegation:        GitLabDelegationTarget::OpenAiChat,
 			})),
 			FramingProtocol::Sse,
@@ -1015,7 +1013,7 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 		(
 			"gitlab-openai-responses",
 			Box::new(GitLabDelegatingCodec::from_route(&GitLabDirectRoute {
-				exchange_endpoint: Str::from("https://offline.invalid/token"),
+				exchange_endpoint: sf!("https://offline.invalid/token"),
 				delegation:        GitLabDelegationTarget::OpenAiResponses,
 			})),
 			FramingProtocol::Sse,
@@ -1025,7 +1023,7 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 		(
 			"gitlab-anthropic",
 			Box::new(GitLabDelegatingCodec::from_route(&GitLabDirectRoute {
-				exchange_endpoint: Str::from("https://offline.invalid/token"),
+				exchange_endpoint: sf!("https://offline.invalid/token"),
 				delegation:        GitLabDelegationTarget::AnthropicMessages,
 			})),
 			FramingProtocol::Sse,
