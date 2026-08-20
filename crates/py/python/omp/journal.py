@@ -6,7 +6,7 @@ until the host installs the CONTROL journal implementation.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -14,6 +14,7 @@ from ._errors import NotWiredError
 
 
 _T = TypeVar("_T")
+_A = TypeVar("_A")
 
 MAX_INLINE_BYTES = 65_536
 """Largest entry encoded inline before artifact spilling is required."""
@@ -105,6 +106,30 @@ def entries(
     raise _unavailable()
 
 
+def latest(kind: str | type[_T]) -> JournalEntry[_T] | None:
+    """Return the highest-index live entry of one declared kind."""
+
+    rows = entries(kind, limit=1)
+    return rows[0] if rows else None
+
+
+def fold(
+    kind: str | type[_T],
+    reducer: Callable[[_A, JournalEntry[_T]], _A],
+    initial: _A,
+    *,
+    since: EntryId | None = None,
+) -> tuple[_A, EntryId | None]:
+    """Fold live entries left-to-right and return the last folded watermark."""
+
+    accumulator = initial
+    watermark = None
+    for entry in entries(kind, since=since):
+        accumulator = reducer(accumulator, entry)
+        watermark = entry.id
+    return accumulator, watermark
+
+
 __all__ = (
     "EntryId",
     "JournalEntry",
@@ -116,4 +141,6 @@ __all__ = (
     "append_atomic",
     "append_many",
     "entries",
+    "fold",
+    "latest",
 )

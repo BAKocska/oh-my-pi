@@ -8,7 +8,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 
-from _omp import AgentUrl, ArtifactUrl, HistoryUrl
+from _omp import AgentUrl, ArtifactUrl, EnvPath, HistoryUrl
 from _omp_url_vocab import (
     SCHEMES as _SCHEMES,
     SELECTOR_GRAMMAR,
@@ -52,7 +52,7 @@ class Selector:
 
 
 
-TypedUrl = ArtifactUrl | HistoryUrl | AgentUrl
+TypedUrl = ArtifactUrl | HistoryUrl | AgentUrl | EnvPath
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +323,23 @@ def _is_range_list(text: str) -> bool:
 
 
 
+async def read(
+    url: str | Url | TypedUrl,
+    selector: str | None = None,
+) -> str:
+    """Read a URL through the package's existing host resolver."""
+
+    from . import _read_url
+
+    target = url.text if isinstance(url, Url) else str(url)
+    if selector is not None:
+        parsed_selector = parse_selector(selector)
+        if parsed_selector is None:
+            raise SelectorError("selector must not be empty")
+        target = f"{target}:{selector}"
+    return await _read_url(target)
+
+
 def _invalid_selector(text: str) -> str:
     return (
         f"Invalid selector ':{text}'. Use :N, :N-M, :N+K, :N- (open-ended), "
@@ -344,5 +361,6 @@ __all__ = (
     "UrlError",
     "parse",
     "parse_selector",
+    "read",
     "schemes",
 )

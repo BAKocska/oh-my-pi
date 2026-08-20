@@ -1046,7 +1046,7 @@ Types owned elsewhere and referenced here: `Role`, `StopReason`, `omp.Item`, `Me
 `omp.WorkerInfo` ([`04-placement.md`](04-placement.md)); `omp.ui.InvocationMode`,
 `omp.ui.DialogOutcome` ([`07-ui.md`](07-ui.md)); `BashIR`, `ApprovalSpec`, `ApprovalTicket`,
 `PolicyDenied` ([`06-policy.md`](06-policy.md));
-`DeviceRef` ([`01-devices.md`](01-devices.md)); `ModelRef`, `RouteRef`, `RequestError`,
+`DeviceRef` ([`01-devices.md`](01-devices.md)); `ModelRef`, `RouteRef`, `Effort`, `RequestError`,
 `CapabilityIntent`, `omp.Failover` ([`13-inference.md`](13-inference.md));
 `omp.agents.Continue`, `omp.agents.Settle`, `omp.agents.SubagentSpec`, `omp.agents.Usage`
 ([`12-agents.md`](12-agents.md)); `TrustTier` ([`00-overview.md`](00-overview.md));
@@ -1227,6 +1227,7 @@ class TurnStartEvent:
 	input_mode: TurnInputMode
 	model: ModelRef
 	route: RouteRef
+	thinking: Effort
 	deadline: Duration | None
 	attempt: int
 	prompt_changed: bool
@@ -1337,7 +1338,13 @@ spin the loop. `omp.limits.SETTLE_CONTINUATION_CAP` bounds consecutive continuat
 the core refuses, journals the refusal, and settles.
 
 Mutable fields: `before_agent_start.{text, items}` (REPLACE, APPEND),
-`turn_start.enabled_tools` (INTERSECT), `turn_start.{model, route, deadline}` (REPLACE).
+`turn_start.enabled_tools` (INTERSECT), `turn_start.{model, route, thinking, deadline}` (REPLACE).
+
+**Resolved (2026-08-20 ruling): `turn_start.thinking` uses the portable `Effort` vocabulary and
+is patchable alongside the model and route. Three independent extensions — plan-mode, profiles,
+and project-model-pin — required that selection across three review rounds; the former restriction
+to model, route, and deadline was ruled wrong.**
+
 `agent_settled` has no mutable payload fields; its outcome is the domain return.
 
 ---

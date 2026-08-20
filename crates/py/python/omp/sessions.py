@@ -1,4 +1,4 @@
-"""Frozen historical session index and usage-query surface."""
+"""Frozen historical session index, usage, and management surface."""
 
 from __future__ import annotations
 
@@ -7,9 +7,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from _omp import Duration, EnvPath
+from _omp import Duration, EnvPath, OmpError
 
 from ._errors import NotWiredError
+
+
+class SessionNotFound(OmpError):
+    """The requested session does not exist or is not visible to the caller."""
 
 
 class SessionStatus(StrEnum):
@@ -81,12 +85,15 @@ class Usage:
 
 
 @dataclass(frozen=True, slots=True)
-class UsageCost:
+class Cost:
     """Nano-USD cost aggregate with a display-only USD projection."""
 
     nanos_usd: int = 0
     estimated: bool = False
 
+    input_nanos_usd: int | None = None
+    output_nanos_usd: int | None = None
+    
     @property
     def usd(self) -> float:
         """Return the display value in USD."""
@@ -111,9 +118,18 @@ class SessionInfo:
     entries: int
     turns: int
     usage: Usage
-    cost: UsageCost
+    cost: Cost
     models: Sequence[str]
     remote: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLink:
+    """One durable parent relation in a session lineage chain."""
+
+    id: str
+    parent: str | None
+    at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +164,7 @@ class UsageBucket:
     key: Mapping[str, str]
     start_ms: int | None
     usage: Usage
-    cost: UsageCost
+    cost: Cost
     requests: int
     errors: int
     duration: Duration
@@ -178,6 +194,50 @@ async def list(filter: SessionFilter | None = None) -> Sequence[SessionInfo]:
     raise NotWiredError("omp.sessions.list")
 
 
+async def _request(operation: str, /, **arguments: object) -> Any:
+    """Dispatch one session operation through the installed CONTROL bridge."""
+
+    from . import _control_backend, _control_request
+
+    if _control_backend.get() is None:
+        raise NotWiredError(operation)
+    return await _control_request(operation, **arguments)
+
+
+async def get(session_id: str) -> SessionInfo:
+    """Return one visible session's indexed metadata."""
+
+    return await _request("omp.sessions.get", session_id=session_id)
+
+
+async def lineage(session_id: str) -> Sequence[SessionLink]:
+    """Return the durable lineage reaching a session, oldest first."""
+
+    return await _request("omp.sessions.lineage", session_id=session_id)
+
+
+async def resume(session_id: str) -> SessionInfo:
+    """Resume an interactive session and journal the host transition receipt."""
+
+    return await _request("omp.sessions.resume", session_id=session_id)
+
+
+async def rename(session_id: str, title: str) -> SessionInfo:
+    """Assign a user title and journal the durable rename receipt."""
+
+    return await _request("omp.sessions.rename", session_id=session_id, title=title)
+
+
+async def delete(session_id: str) -> None:
+    """Delete only through a Core-approved policy ticket.
+
+    This operation never bypasses approval.  Without the approval grant the
+    Core rejects the request with :class:`omp.PermissionDenied`.
+    """
+
+    await _request("omp.sessions.delete", session_id=session_id)
+
+
 async def usage(query: UsageQuery) -> UsageReport:
     """Aggregate token and cost usage from the write-time index."""
 
@@ -201,7 +261,8 @@ async def journal(
 
 
 __all__ = (
-    "Bucket", "GroupBy", "SessionFilter", "SessionInfo", "SessionKind", "SessionStatus",
-    "TitleSource", "Usage", "UsageAccuracy", "UsageBucket", "UsageCost", "UsageQuery",
-    "UsageReport", "current", "journal", "list", "usage",
+    "Bucket", "Cost", "GroupBy", "SessionFilter", "SessionInfo", "SessionKind",
+    "SessionLink", "SessionNotFound", "SessionStatus", "TitleSource", "Usage",
+    "UsageAccuracy", "UsageBucket", "UsageQuery", "UsageReport", "current", "delete",
+    "get", "journal", "lineage", "list", "rename", "resume", "usage",
 )

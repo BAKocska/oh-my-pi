@@ -6,6 +6,7 @@ renderer.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator as _AsyncIterator
 from collections.abc import Callable, Iterable, Sequence
 from contextvars import ContextVar
 import inspect as _inspect
@@ -36,6 +37,45 @@ class CommandDenied(PermissionError):
 
 class ShortcutError(ValueError):
     """A shortcut is malformed or unavailable."""
+
+
+_SHORTCUT_MODIFIERS = ("ctrl", "alt", "shift", "super")
+_SHORTCUT_KEYS = frozenset(
+    (
+        "enter", "tab", "backspace", "delete", "insert", "escape", "space",
+        "up", "down", "left", "right", "home", "end", "pageup", "pagedown",
+        *(f"f{number}" for number in range(1, 25)),
+    )
+)
+
+
+def _normalize_shortcut_chord(chord: str) -> str:
+    if not isinstance(chord, str):
+        raise ShortcutError("shortcut chord must be a string")
+    if not chord or chord != chord.strip():
+        raise ShortcutError(f"malformed shortcut chord: {chord!r}")
+    normalized = chord.lower()
+    if normalized == "+":
+        modifiers, key = [], "+"
+    elif normalized.endswith("++") and normalized[:-2]:
+        modifiers, key = normalized[:-2].split("+"), "+"
+    else:
+        parts = normalized.split("+")
+        modifiers, key = parts[:-1], parts[-1]
+    if (
+        not key
+        or any(not modifier or modifier not in _SHORTCUT_MODIFIERS for modifier in modifiers)
+        or len(set(modifiers)) != len(modifiers)
+    ):
+        raise ShortcutError(f"malformed shortcut chord: {chord!r}")
+    if key not in _SHORTCUT_KEYS and not (
+        len(key) == 1 and key.isprintable() and not key.isspace()
+    ):
+        raise ShortcutError(f"malformed shortcut chord: {chord!r}")
+    ordered_modifiers = (
+        modifier for modifier in _SHORTCUT_MODIFIERS if modifier in modifiers
+    )
+    return "+".join((*ordered_modifiers, key))
 
 
 class DialogUnavailable(RuntimeError):
@@ -331,6 +371,16 @@ class OverlayEvent:
     kind: EventKind; id: str | None = None; value: str | None = None; query: str | None = None; values: dict[str, object] = field(default_factory=dict)
 
 
+def _overlay_event(value: object) -> OverlayEvent:
+    if isinstance(value, OverlayEvent):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError("overlay event frames must be OverlayEvent or dict values")
+    body = dict(value)
+    body["kind"] = EventKind(body["kind"])
+    return OverlayEvent(**body)
+
+
 @dataclass(frozen=True, slots=True)
 class DialogOutcome:
     """Total result of a UI dialog request."""
@@ -476,9 +526,18 @@ class OverlayHandle:
         return result if isinstance(result, dict) else {}
     async def close(self) -> None: await _request("overlay_close", id=self.id)
     async def wait(self) -> DialogOutcome: return await _dialog("overlay_wait", id=self.id)
-    async def events(self) -> AsyncIterator[OverlayEvent]:
-        outcome = await self.wait()
-        yield OverlayEvent(EventKind.CANCEL if outcome.cancelled else EventKind.SUBMIT)
+    async def events(self) -> _AsyncIterator[OverlayEvent]:
+        """Yield only the watched and terminal interactions fed by the host."""
+
+        source = await _request("overlay_events", id=self.id)
+        if hasattr(source, "__aiter__"):
+            async for event in source:
+                yield _overlay_event(event)
+        elif isinstance(source, Iterable) and not isinstance(
+            source, (str, bytes, bytearray, dict)
+        ):
+            for event in source:
+                yield _overlay_event(event)
     async def __aenter__(self) -> "OverlayHandle": return self
     async def __aexit__(self, *_: object) -> None: await self.close()
 
@@ -537,6 +596,7 @@ def image(source: object, *, w: int | None = None, h: int | None = None, trim: b
 def set_ghost(ghost: Ghost | None) -> None: """Synchronously replace the inline ghost suggestion."""; _emit("set_ghost", ghost=ghost)
 def clear_ghost() -> None: """Synchronously clear the inline ghost suggestion."""; set_ghost(None)
 def set_editor_text(text: str) -> None: """Synchronously replace composer text."""; _emit("set_editor_text", text=text)
+def set_clipboard(text: str) -> None: """Synchronously queue a client-owned clipboard write."""; _emit("set_clipboard", text=text)
 def paste_to_editor(content: object) -> None: """Synchronously route content through the composer paste pipeline."""; _emit("paste_to_editor", content=content)
 def submit(text: str | None = None) -> None: """Synchronously submit the composer, optionally after replacement."""; _emit("submit", text=text)
 def open_url(url: str) -> None: """Synchronously request a validated client-side URL open."""; _emit("open_url", url=url)
@@ -702,8 +762,22 @@ async def _dispatch_activation(
 
 
 def shortcut(chord: str, *, action_id: str | None = None, description: str = "", when: frozenset[Phase] | None = None) -> Callable[[Callable[..., object]], Callable[..., object]]:
-    """Declare one shortcut and retain its host callback."""
-    def decorate(function: Callable[..., object]) -> Callable[..., object]: _shortcut_handlers[action_id or function.__name__] = function; return function
+    """Declare one validated shortcut with static dispatch metadata."""
+
+    normalized_chord = _normalize_shortcut_chord(chord)
+
+    def decorate(function: Callable[..., object]) -> Callable[..., object]:
+        resolved_action_id = action_id or function.__name__
+        _declarations.register_shortcut(
+            normalized_chord,
+            resolved_action_id,
+            description,
+            when,
+            function,
+        )
+        _shortcut_handlers[resolved_action_id] = function
+        return function
+
     return decorate
 
 

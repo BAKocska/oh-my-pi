@@ -10,6 +10,9 @@ host.  Each example is checked in an isolated interpreter so declaration-table
 state cannot leak between ports.  A ``# GAP:`` import must still be unresolved
 (and a module containing gaps must fail to import), every ordinary import must
 succeed, and an export claimed missing by a README ``Gaps`` section is an error.
+The report also tracks public functions and methods whose frozen implementation
+is an unconditional ``NotWiredError`` stub; these are informational and do not
+affect the gate result.
 """
 
 from __future__ import annotations
@@ -166,6 +169,124 @@ def _stale_readme_exports(omp: Any, readme: Path) -> list[str]:
     return stale
 
 
+def _function_statements(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.stmt]:
+    statements = node.body
+    if (
+        statements
+        and isinstance(statements[0], ast.Expr)
+        and isinstance(statements[0].value, ast.Constant)
+        and isinstance(statements[0].value.value, str)
+    ):
+        statements = statements[1:]
+    return [statement for statement in statements if not isinstance(statement, ast.Delete)]
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _routes_to_host(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, armed_names: set[str]
+) -> bool:
+    body = ast.Module(body=_function_statements(node), type_ignores=[])
+    backend_aliases = {
+        target.id
+        for child in ast.walk(body)
+        if isinstance(child, (ast.Assign, ast.AnnAssign))
+        for target in (
+            child.targets
+            if isinstance(child, ast.Assign)
+            else (child.target,)
+        )
+        if isinstance(target, ast.Name)
+        and isinstance(child.value, ast.Attribute)
+        and isinstance(child.value.value, ast.Name)
+        and "backend" in child.value.value.id
+    }
+
+    def routed(expression: ast.expr | None) -> bool:
+        if isinstance(expression, ast.Await):
+            expression = expression.value
+        if not isinstance(expression, ast.Call):
+            return False
+        name = _call_name(expression)
+        if name == "_control_request" or name in armed_names or name in backend_aliases:
+            return True
+        return (
+            isinstance(expression.func, ast.Attribute)
+            and isinstance(expression.func.value, ast.Name)
+            and "backend" in expression.func.value.id
+        )
+
+    return any(
+        (isinstance(child, ast.Await) and routed(child))
+        or (isinstance(child, ast.Return) and routed(child.value))
+        for child in ast.walk(body)
+    )
+
+
+def _function_kind(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, armed_names: set[str]
+) -> str | None:
+    statements = _function_statements(node)
+    if len(statements) == 1 and isinstance(statements[0], ast.Raise):
+        exception = statements[0].exc
+        if isinstance(exception, ast.Call) and _call_name(exception) == "NotWiredError":
+            return "stub"
+    if _routes_to_host(node, armed_names):
+        return "host-armed"
+    return None
+
+
+def _module_functions(
+    tree: ast.Module,
+) -> list[tuple[tuple[str, ...], ast.FunctionDef | ast.AsyncFunctionDef]]:
+    result: list[tuple[tuple[str, ...], ast.FunctionDef | ast.AsyncFunctionDef]] = []
+
+    def visit(statements: list[ast.stmt], scope: tuple[str, ...]) -> None:
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                result.append((scope, statement))
+            elif isinstance(statement, ast.ClassDef):
+                visit(statement.body, (*scope, statement.name))
+
+    visit(tree.body, ())
+    return result
+
+
+def _not_wired_stubs() -> list[str]:
+    stubs: list[str] = []
+    package = _PYTHON / "omp"
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        functions = _module_functions(tree)
+        armed_names: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for _scope, node in functions:
+                if node.name not in armed_names and _routes_to_host(node, armed_names):
+                    armed_names.add(node.name)
+                    changed = True
+
+        relative = path.relative_to(package)
+        parts = relative.with_suffix("").parts
+        module_parts = parts[:-1] if parts[-1] == "__init__" else parts
+        module = ".".join(("omp", *module_parts))
+        for scope, node in functions:
+            if node.name.startswith("_") or any(name.startswith("_") for name in scope):
+                continue
+            if _function_kind(node, armed_names) == "stub":
+                stubs.append(".".join((module, *scope, node.name)))
+    return stubs
+
+
 def _check_one(module_path: Path) -> dict[str, Any]:
     _install_native_stubs()
     sys.path.insert(0, str(_PYTHON))
@@ -224,7 +345,12 @@ def _check_one(module_path: Path) -> dict[str, Any]:
     if module_path.parent.name == "bash-guard":
         errors.extend(_stale_readme_exports(omp, _EXAMPLES / "README.md"))
     errors.extend(_stale_readme_exports(omp, module_path.with_name("README.md")))
-    return {"example": module_path.parent.name, "gaps": gaps, "errors": errors}
+    return {
+        "example": module_path.parent.name,
+        "gaps": gaps,
+        "errors": errors,
+        "stubs": _not_wired_stubs(),
+    }
 
 
 def _example_modules() -> list[Path]:
@@ -240,6 +366,7 @@ def _example_modules() -> list[Path]:
 def _run_parent() -> int:
     failures = 0
     modules = _example_modules()
+    stubs = _not_wired_stubs()
     for module in modules:
         completed = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--check-one", str(module)],
@@ -262,6 +389,9 @@ def _run_parent() -> int:
         for error in errors:
             print(f"     {error}", file=sys.stderr)
         failures += bool(errors) or completed.returncode != 0
+    print("stubs:")
+    for symbol in stubs:
+        print(f"  {symbol}")
     print(f"checked {len(modules)} example modules; {failures} failed")
     return int(failures != 0)
 

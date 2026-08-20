@@ -294,6 +294,55 @@ tie-break:
   base must exist at activation — extending an absent provider is the same activation-time error —
   and both declarations stay visible in provenance, each field attributed to the declaration that
   set it.
+Overlay declarations carry model and alias contributions in the same provider record:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ModelPatch:
+    class_: str | None = None
+    display_name: str | None = None
+    wire_ids: Mapping[str, str] | None = None
+    routes: tuple[str, ...] | None = None
+    capabilities: object | None = None
+    limits: object | None = None
+    thinking: object | None = None
+    thinking_routing: object | None = None
+    wire_policy: object | None = None
+    context: ContextSpec | None = None
+    pricing: Cost | None = None
+    availability: Availability | None = None
+    context_promotion_target: str | None = None
+    remote_compaction: object | None = None
+    premium_multiplier_millionths: int | None = None
+    updated_at_ms: int | None = None
+    blocked_until_ms: int | None = None
+    deprecated: bool | None = None
+
+@dataclass(frozen=True, slots=True)
+class ModelOverlay:
+    selector: ModelRef
+    added: ModelSpec | None = None
+    patch: ModelPatch = ModelPatch()
+
+@dataclass(frozen=True, slots=True)
+class CatalogAlias:
+    alias: str
+    target: str
+    rationale: str
+    provenance: str
+
+@dataclass(frozen=True, slots=True)
+class ScopedAlias:
+    provider: str
+    definition: CatalogAlias
+```
+
+`ProviderSpec.model_overlays` and `ProviderSpec.aliases` hold these tuples. Model selectors and scoped
+aliases must name the declaring provider. Duplicate model selectors, or one alias spelling assigned
+to different targets, fail during declaration before the provider reaches activation. A declaration
+with model overlays must use `extends=`, keeping partial records out of standalone provider
+declarations.
+
 - `replaces="<publisher>/<extension-id>"` declares a **full replacement** of that publisher's
   declaration for the same provider id. Replacement is governed by the identity rules in
   `docs/py/14-deploy.md`: publisher-qualified, explicitly declared in the workspace manifest,
@@ -318,6 +367,7 @@ class ProviderHandle:
 	async def replace(self, spec: ProviderSpec) -> None: ...
 	async def models(self) -> tuple[ModelCard, ...]: ...
 	async def is_authenticated(self) -> bool: ...
+	async def request(self, operation: Operation, request: ImageRequest) -> ImageResult: ...
 ```
 
 `retract()` removes the declaration; models vanish from selection at the next catalog generation and
@@ -326,6 +376,12 @@ this is the supported shape for reconciliation, and it is why `pi-lmstudio`'s
 `registerProvider`/`unregisterProvider` churn collapses into one call. `models()` returns the
 *resolved* cards, after overlay merge and user configuration, which is not necessarily what was
 declared. `is_authenticated()` answers without revealing anything.
+
+**Resolved (2026-08-20 ruling): GENERATE_IMAGE uses a named provider request seam.**
+`ProviderHandle.request(Operation.GENERATE_IMAGE, ImageRequest(...))` is the extension-visible
+CONTROL + DATA host arm; Core owns selection, credential application, wire encoding, decoding, blob
+storage, and the settled cost receipt. The frozen request seam is deliberately typed rather than a
+generic mapping, and an unwired host raises `NotWiredError`.
 
 #### Activation: eager, before model selection
 
@@ -364,19 +420,21 @@ class ProviderSpec:
 	management: ManagementSpec = ManagementSpec()
 	discovery_defaults: DiscoveryDefaults | None = None
 	mapping: RegistryMapping = RegistryMapping.CONCRETE
-	aliases: tuple[str, ...] = ()
+	aliases: tuple[ScopedAlias, ...] = ()
+	model_overlays: tuple[ModelOverlay, ...] = ()
 ```
 
 | Field | Semantics |
 |---|---|
 | `id` | Stable provider identifier; the `provider` half of a `provider/model` selector. Must match the manifest's `catalog` grant. Lowercase, `[a-z0-9-]`. |
 | `name` | Human-readable label for pickers and the login list. |
-| `routes` | One or more concrete endpoints. A provider with three regions is one provider with three routes, not three providers. Non-empty. |
+| `routes` | One or more concrete endpoints. A provider with three regions is one provider with three routes, not three providers. Non-empty except for an `extends=` overlay that only patches inherited facts. |
 | `models` | Statically known models. May be empty when every model arrives from `models_discover`. |
 | `management` | Which provider-level operations exist (see `ManagementSpec`). |
 | `discovery_defaults` | Policy defaults applied to a newly discovered model whose facts the provider does not report. Required if any route sets `discovery=`. |
 | `mapping` | `CONCRETE`, `RegistryMapping.alias(target, reason)`, or `RegistryMapping.replacement(component, reason)`. Aliasing is declarative and auditable; the `reason` is not decorative — it appears in `omp models --json`. |
-| `aliases` | Additional selector spellings resolving to this provider. |
+| `aliases` | Provider-scoped model selector aliases contributed by this declaration. |
+| `model_overlays` | Additions and field-granular patches applied to inherited model records; requires `extends=`. |
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -797,12 +855,33 @@ put any of them.
 |---|---|
 | `EmbeddingCaps` | `inputs: frozenset[EmbeddingInput]` (`TEXT`, `TOKEN_IDS`, `IMAGE`), `formats: frozenset[EmbeddingFormat]` (`FLOAT32`, `BASE64`, `INT8`, `BINARY`), `dimensions: DimensionRange \| None`, `default_dimensions: int \| None`, `max_batch: int \| None`, `normalizes: bool` |
 | `ImageCaps` | `features: frozenset[ImageFeature]` (`GENERATE`, `EDIT`, `MASK`, `REFERENCE_IMAGES`, `TRANSPARENCY`), `sizes: tuple[Dimensions, ...]`, `formats: frozenset[ImageFormat]`, `max_references: int \| None` |
+| `Dimensions` | `width: int`, `height: int`; both are positive pixel counts |
+| `ImageFormat` | `PNG`, `JPEG`, `WEBP` |
 | `VideoCaps` | `features: frozenset[VideoFeature]` (`GENERATE`, `EDIT`, `IMAGE_TO_VIDEO`, `AUDIO`), `max_duration: omp.Duration \| None`, `fps: tuple[int, ...]`, `sizes: tuple[Dimensions, ...]` |
 | `SpeechCaps` | `features: frozenset[SpeechFeature]` (`STREAMING`, `TIMESTAMPS`, `SPEED`, `VOICE_SELECTION`), `voices: tuple[str, ...]`, `formats: frozenset[AudioFormat]`, `sample_rates_hz: tuple[int, ...]` |
 | `TranscriptionCaps` | `features: frozenset[TranscriptionFeature]` (`STREAMING`, `TIMESTAMPS`, `DIARIZATION`, `TRANSLATION`, `LANGUAGE_HINT`), `formats: frozenset[AudioFormat]`, `max_duration: omp.Duration \| None` |
 | `RealtimeCaps` | `features: frozenset[RealtimeFeature]` (`AUDIO_IN`, `AUDIO_OUT`, `TEXT`, `TOOLS`, `SERVER_VAD`, `SEMANTIC_VAD`, `INTERRUPTION`), `voices: tuple[str, ...]`, `transports: frozenset[Transport]` |
 | `SearchCaps` | `features: frozenset[SearchFeature]` (`DOMAIN_ALLOW`, `DOMAIN_DENY`, `RECENCY`, `SYNTHESIZED_ANSWER`), `max_results: int \| None` |
 | `TokenizationCaps` | `features: frozenset[TokenizationFeature]` (`COUNT`, `TOKENIZE`, `DETOKENIZE`, `EXACT_COUNT`, `SPECIAL_TOKENS`), `vocabulary: str \| None` |
+
+The typed extension operation values are:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ImageRequest:
+    prompt: str
+    dimensions: Dimensions
+    format: ImageFormat
+    count: int = 1
+
+@dataclass(frozen=True, slots=True)
+class ImageResult:
+    images: tuple[BlobRef, ...]
+    cost_nanos_usd: int
+```
+
+Results are blob-backed so image bytes never expand into Python prose or a generic response mapping;
+`cost_nanos_usd` is Core's settled per-call usage receipt, not an extension estimate.
 
 `.plan/feature-map/voice.md` names the concrete cases these serve: Kokoro-82M and xAI Grok voices for
 `SpeechCaps`, Whisper and Parakeet TDT for `TranscriptionCaps`, `gpt-live-1-codex` over
@@ -1311,6 +1390,10 @@ and lives only for the call, so no `reveal()` grant is needed. `Secret` redacts 
 tracebacks, in the journal, and refuses `str()`; it is consumable exactly once via
 `secret.use()` inside an `omp.env` HTTP call.
 
+**Resolved (2026-08-20 ruling): `provider_refresh` is a phase-free domain-return hook.**
+Like `models_discover` and `provider_usage`, it accepts no admission `HookPhase`; it returns
+`Credential` directly and remains fail-closed.
+
 The harness holds a per-credential refresh lease across every omp process on the machine before
 invoking this hook, so concurrent sessions produce one refresh, not N. Returning a `Credential` with
 an unchanged `identity` keeps server-state handles valid; changing `identity` invalidates them and
@@ -1469,7 +1552,7 @@ class Failover:
 	@staticmethod
 	def refresh_credential() -> Failover: ...
 	@staticmethod
-	def rotate_account(*, cooldown: omp.Duration | None = None) -> Failover: ...
+	def rotate_account(successor: str, *, cooldown: omp.Duration | None = None) -> Failover: ...
 	@staticmethod
 	def reselect_route(*, route: str | None = None, cooldown: omp.Duration | None = None) -> Failover: ...
 	@staticmethod
@@ -1483,7 +1566,9 @@ class Failover:
 ```
 
 These map onto the seven `RetryAction` variants the spine already implements; the hook chooses, Rust
-executes. `cooldown` marks the current (provider, route, identity) triple ineligible for that
+executes. `rotate_account(successor, ...)` names the stable identity that must become the next principal; Core
+validates it against the provider's eligible credential pool rather than silently choosing pool
+order. `cooldown` marks the current (provider, route, identity) triple ineligible for that
 duration and is persisted, so a rate-limit block survives a restart — `pi-model-fallback` maintained
 `~/.pi/agent/model-fallback-state.json` by hand for exactly this. `switch_model` accepts
 `provider/model` and crosses provider boundaries; the harness validates the target's capabilities
@@ -1764,8 +1849,9 @@ async def discover(q: omp.DiscoveryQuery, ctx: omp.Context) -> DiscoveryPage:
 	)
 ```
 
-The frozen API reserves that exact `omp.env.http_get` call shape, but v1 raises
-`omp.NotWiredError` until the scoped-egress frame deferred by `docs/py/11-env.md` question 6 lands.
+The frozen API reserves that exact `omp.env.http_get` call shape. The scoped-egress frame and envd
+client now exist under the 2026-08-20 ruling in `docs/py/11-env.md` question 6; the pure-Python arm
+continues to raise `omp.NotWiredError` until the host DATA bridge installs it.
 
 The differences that matter: the poll is a background job on a declared interval rather than a
 per-turn round-trip, so turns do not pay for it; a raised exception retains the previous rows instead
@@ -1956,7 +2042,7 @@ worth stating because it determines what is a wiring task versus a design task:
 | `omp.env.spawn_process` (class (c) proxy) | wire-complete | no Python DATA connection |
 | `omp.env.exec` (credential helper) | wire-complete | no Python DATA connection |
 | `omp.env.put_blob` / `get_blob` | wire-complete | no Python DATA connection |
-| `omp.env.http_get` (discovery probe) | frozen `NotWiredError` arm, **no frame** | scoped egress deferred by `docs/py/11-env.md` question 6 |
+| `omp.env.http_get` (discovery probe) | scoped-egress frame and envd client implemented; frozen arm remains explicit | Python DATA bridge wiring outstanding |
 
 The additive path for the first three is small and specific. `EnvServer::serve_io` already accepts any
 `AsyncRead + AsyncWrite` and differentiates callers per connection through `ConnectionPolicy`, so the
@@ -1969,10 +2055,10 @@ connection rather than per call. `docs/py/11-env.md` owns the method-level surfa
 types a worker-scoped client may issue; this section only records that the inference-facing uses above
 depend on it.
 
-The fourth has a settled owner but a deliberately deferred transport. Open question 2 assigns
-discovery HTTP to `omp.env`; v1 still ships no Environment-side HTTP client or `env/v1` scoped-egress
-request type, as reconciled with `docs/py/11-env.md` question 6. The inference transport therefore
-grows no credential-free alternative.
+The fourth has a settled owner and, under the 2026-08-20 ruling in `docs/py/11-env.md` question 6,
+now has an `env.net`-gated scoped-egress request and an Environment-side HTTP client. The remaining
+gap is wiring the frozen Python arm through the host's DATA connection; discovery still grows no
+credential-free alternative.
 
 Nothing else in this document depends on DATA. Provider declaration, every cold-path hook payload
 and return value, `omp.creds`, and `omp.intents` are all CONTROL traffic, and CONTROL is the socket

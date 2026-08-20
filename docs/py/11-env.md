@@ -350,7 +350,7 @@ runtime check spell the same thing.
 | `BLOB` | `env.blob` | `blobs.put`, `blobs.get`, `blobs.stream`, `blobs.stat`, `blobs.delete`, `blobs.writer` |
 | `SEARCH` | `env.search` | `find.files`, `find.walk`, `find.grep` |
 | `LSP` | `env.lsp` | `lsp.bindings`, `lsp.request`, `lsp.notify`, `lsp.events` |
-| `NET` | `env.net` | Environment-brokered outbound HTTP against the manifest allowlist |
+| `NET` | `env.net` | `http_get`, `http_post`, `http_put` through Environment-brokered scoped egress |
 | `WORKSPACE_SNAPSHOT` | `env.workspace.snapshot` | `omp.agents.snapshot`, `.snapshots`, `.restore` — the methods live in `docs/py/12-agents.md`; no `env/v1` frame exists yet |
 | `WORKTREE` | `env.worktree` | Isolated-worktree creation, destruction, and merge for subagents — `docs/py/12-agents.md`; no `env/v1` frame exists yet |
 
@@ -1351,7 +1351,7 @@ and checks it on the dispatch arm before the resource owner is ever reached. Ref
 | `blobs.*` | `BLOB` | Environment dispatch → `BlobHost` | `Denied` |
 | `find.*` | `SEARCH` | Environment dispatch → `WorkspaceHost` (root containment checked by canonicalization) | `Denied` |
 | `lsp.*` | `LSP` | Environment dispatch → docserver `LspRegistry` | `Denied` |
-| outbound HTTP | `NET` | Environment-side client against the manifest allowlist | `Denied` |
+| `http_get` / `http_post` / `http_put` | `NET` | Environment dispatch → bounded scoped-egress client | `Denied` |
 
 Four properties follow, and they are the point:
 
@@ -2215,6 +2215,15 @@ synchronization* (100-108), *Atomic text edit and workspace edit application eng
    DNS, and allowlisting by resolved address breaks CDNs. Until this is settled, trusted-tier
    extensions using direct sockets is the honest status quo, and it should be labelled as such
    rather than papered over with an unenforceable Python-side check.
+
+   **Resolved (2026-08-20 ruling): env-brokered HTTP ships; scoped-egress frames land on the wire,
+   the Environment-side client requires `env.net` and returns `Denied` without it, and the extension
+   verbs are `omp.env.http_get`, `omp.env.http_post`, and `omp.env.http_put`.** Direct sockets remain
+   the labelled fallback only for hosts whose Python DATA bridge has not wired these arms; they do
+   not bypass the capability on wired hosts. This ruling supersedes the 2026-08-19 “ship nothing”
+   posture while preserving question 2 in `docs/py/13-inference.md`: discovery HTTP belongs to
+   `omp.env`.
+
 7. **Worker grant negotiation across respawn.** A worker's scope is the declaring extension's grant
    intersected with the invocation's scope, computed env-side. But the supervisor respawns a
    crashed worker with bounded backoff and asserts registration equality on restart — it does not

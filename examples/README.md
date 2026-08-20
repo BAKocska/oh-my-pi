@@ -1,6 +1,6 @@
 # Extension examples
 
-Forty-six ports of real pi-ecosystem extensions onto the omp Python extension
+Sixty-six ports of real pi-ecosystem extensions onto the omp Python extension
 layer (`crates/py/python/omp`). Each directory is one extension: an `omp.toml`
 manifest, the Python module(s), and a README stating what the pi original did,
 how the omp shape differs, and — load-bearing — a **Gaps** section listing every
@@ -59,6 +59,26 @@ distance.
 | `workflows/` | `pi-extensible-workflows` | DAG waves over `spawn_all`, journal-resumable, subtree failure | `docs/py/12` |
 | `search-provider/` | web.md API-key search cohort | `Operation.SEARCH` declaration + class (b) Python parser | `docs/py/13 q1 ruling` |
 | `verdict-details/` | `@eleboucher/pi-memini` | D4 three-channel: terse parts, full details, renderer expand | `docs/py/02` |
+| `unified-exec/` | `pi-unified-exec` | env-owned PTY sessions, cursor polling, stdin/keys | `docs/py/11` |
+| `profiles/` | `@danypops/pi-packed` | atomic profile switch: availability deltas + turn patch, byte-identical tool array | `docs/py/01`, `docs/py/05` |
+| `canary/` | `pi-canary` | STABLE-band slot, KV-safe awareness checks, ext counters | `docs/py/08`, `docs/py/10` |
+| `session-titler/` | `@agnishc/edb-auto-name-session` | smol-role completion, SetTitle, once-per-session latch | `docs/py/12`, `docs/py/08` |
+| `multi-account/` | `pi-multi-account` | account rotation via `Failover`, core cooldowns, `omp.creds` | `docs/py/13` |
+| `fireplace/` | `@jpodivin/pi-fireplace` | declarative animation props, charset degradation, zero timers | `docs/py/07` |
+| `chat-bridge/` | `pi-lark-notify` | webhook out, schedule-polled replies, `Inject` dedup | `docs/py/11`, `docs/py/12` |
+| `project-model-pin/` | `pi-set-model` | PROJECT state pin, `turn_start` patch, override latch | `docs/py/09`, `docs/py/05` |
+| `model-alias/` | `@zigai/pi-model-alias` | catalog overlays via `extends=`, declaration-time conflict | `docs/py/13` |
+| `secret-guard/` | `@josephyoung/pi-heimdall` | `omp.secrets` rules + BashIR path denials, core-side masking | `docs/py/06` |
+| `tool-toggle/` | `pi-tbox` | device catalog overlay, availability deltas, slot-vs-device cost | `docs/py/01`, `docs/py/08` |
+| `session-browser/` | `@vanillagreen/pi-session-manager` | sessions overlay, approval-gated deletion | `docs/py/09`, `docs/py/07` |
+| `worktree-guard/` | `avtc-pi-parallel-work-guardrail` | git-op classification, ticket-borne timeout/default | `docs/py/06` |
+| `fresh-loop/` | `@cjvnjde/pi-fresh-loop` | fresh-session iteration, stop classifier, journal resume | `docs/py/12` |
+| `image-gen/` | `@amaster.ai/pi-image-gen` | image operation route, media BlobPart, `omp.Field` args | `docs/py/13`, `docs/py/02` |
+| `settings-sync/` | `@narumitw/pi-sync` | USER CAS sync, `AfterIdle` push, conflict journaling | `docs/py/09`, `docs/py/12` |
+| `copy-cut/` | `@shelken/copy-cut` | shortcut chord, clipboard, composer edit | `docs/py/07 §4.14` |
+| `remote-approve/` | `@agentapprove/pi` | `@omp.approver`, idempotent re-offer, fail-closed unreachable | `docs/py/06 §Approvals` |
+| `provider-vertex/` | `@twogiants/pi-anthropic-vertex` | region-scoped routes, scoped-mint GCP auth | `docs/py/13` |
+| `side-chat/` | `pi-btw` | background side-thread agents, overlay transcript, real journals | `docs/py/12`, `docs/py/07` |
 
 pi extension descriptions:
 `.plan/user-requests/2026-08-10-pi-extension-survey/catalog.md`.
@@ -146,3 +166,25 @@ the class-(b) search seam is named — `Api.SEARCH_HTTP` plus the provider-scope
 `search_parse` hook; `omp.env.http_get` is frozen as a `NotWired` seam
 reconciling 13 §q2 (omp.env owns discovery HTTP) with 11 §q6 (no env-side HTTP
 client ships in v1); `RESULT_SPILL_BYTES` follows the documented 262 144.
+
+## Round 4 residual defects (2026-08-20, twenty ports)
+
+Three ports gap-free (`session-titler/`, `fireplace/`, `canary/`). A new
+finding class appeared this round: **frozen-but-NotWired stubs** — symbols
+that exist and typecheck but unconditionally raise, which the import-level
+gate cannot catch. Exact citations in each example's README.
+
+| Defect | Found by | Frozen file |
+|---|---|---|
+| Sessions mutation verbs absent entirely: no resume/switch, no rename/title-update, no delete (approval emits correctly, nothing can execute it); `sessions.get`/`lineage`, `SessionNotFound`/`SessionLink` missing; `Cost` vs unexported `UsageCost`; `SessionKind` in `__all__` but never imported (import bug) — docs also lack a mutation section: needs design + ruling | `session-browser/` | `sessions.py:168-200` |
+| HTTP verbs: no `http_post`/`http_put`; `http_get` is a NotWired stub — and docs/py/11's no-HTTP posture vs 13's usage still needs the ruling | `chat-bridge/`, `settings-sync/`, `remote-approve/` | `env.py:887-913` |
+| NotWired stubs behind real signatures: `omp.agents.schedule`, `policy.pending()`; `Inject` has no prompt payload, `Every` no callback delivery, `BeforeAgentStartEvent` no `schedule_id` | `chat-bridge/`, `settings-sync/`, `remote-approve/` | `agents.py:818-950`, `policy.py:736-752` |
+| Approver surface: `@omp.approver` absent; no decide/answer verb (only `pending()`) | `remote-approve/` | `policy.py` |
+| `omp.secrets` namespace entirely absent (`declare`/`mask`/`SecretRule`/`SecretKind`/`SecretMode`) | `secret-guard/` | no `secrets.py` |
+| UI: `set_clipboard` absent (from docs too — doc gap); top-level `shortcut` absent; `ui.shortcut` neither validates nor registers its declaration; `OverlayHandle.events` yields only synthetic SUBMIT/CANCEL, not watched interactions | `copy-cut/`, `side-chat/` | `ui/__init__.py:479-481,704-707` |
+| Provider/catalog: `ModelPatch`/`ModelOverlay`/`ScopedAlias` absent; `Failover.rotate_account` cannot target a successor identity; `provider_refresh` gateable vs docs' no-phase Credential callback; `CredentialSource.application_default` absent; `ImageCaps`/`ImageFormat`/`Dimensions` absent (`ModelSpec.image: object`); no `ProviderHandle.request` seam for GENERATE_IMAGE (same needs-ruling class as the SEARCH seam) | `model-alias/`, `multi-account/`, `provider-vertex/`, `image-gen/` | `provider.py` |
+| Devices catalog: `omp.devices.list` absent; `DeviceInfo` lacks `provenance`/`slotted`/`schema_bytes`/`schema_tokens` | `tool-toggle/` | `devices.py:189-209,356-394` |
+| env: `Pty` value type absent (`proc.ensure` takes `pty: object`); `PathMeta`/`FileKind` absent (`lstat` returns `Any`); `Capability.WORKTREE` declared but no topology query | `unified-exec/`, `worktree-guard/` | `env.py:600-602,1037-1047` |
+| `omp.journal.latest`/`fold` helpers absent | `fresh-loop/` | `journal.py:94-119` |
+| `Context` exposes no current `RouteRef` and no thinking selection — third round in a row the turn_start `thinking` patchability ruling surfaces (`plan-mode`, `profiles`, `project-model-pin`) | `project-model-pin/`, `profiles/` | `_context.py:32-54`, `events.py:399-414` |
+| Async `omp.urls.read` absent (typed `HistoryUrl.read` works via bindings) | `side-chat/` | `urls.py:334-348` |

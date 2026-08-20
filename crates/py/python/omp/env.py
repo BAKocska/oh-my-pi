@@ -211,6 +211,44 @@ class Rank(StrEnum):
     PATH = "path"
 
 
+class FileKind(StrEnum):
+    """Discriminate the host-reported kind of a filesystem entry."""
+
+    REGULAR_FILE = "regular_file"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+    OTHER = "other"
+
+
+@dataclass(frozen=True, slots=True)
+class PathMeta:
+    """Describe one filesystem entry without reading its contents."""
+
+    path: EnvPath
+    kind: FileKind
+    byte_length: int
+    read_only: bool | None = None
+    executable: bool | None = None
+    modified: float | None = None
+    accessed: float | None = None
+    created: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeInfo:
+    """Describe the Environment worktree containing the current workspace."""
+
+    id: str
+    root: EnvPath
+    base: str
+    generation: int
+
+
+async def worktree() -> WorktreeInfo | None:
+    """Return current worktree topology through the capability-gated host arm."""
+    raise NotWiredError("omp.env.worktree")
+
+
 @dataclass(frozen=True, slots=True)
 class Entry:
     """One workspace walk result."""
@@ -593,11 +631,11 @@ class _Docs:
 class _Fs:
     """Raw metadata and namespace operations over typed Environment paths."""
 
-    async def stat(self, path: EnvPath) -> Any:
+    async def stat(self, path: EnvPath) -> PathMeta:
         """Stat a path while following symbolic links."""
         return await _request("omp.env.fs.stat", path=_env_path(path))
 
-    async def lstat(self, path: EnvPath) -> Any:
+    async def lstat(self, path: EnvPath) -> PathMeta:
         """Stat a path without following its final symbolic link."""
         return await _request("omp.env.fs.lstat", path=_env_path(path))
 
@@ -902,15 +940,94 @@ class HttpResponse:
         return json.loads(self.body)
 
 
+async def _http_request(
+    public_name: str,
+    operation: str,
+    method: str,
+    url: str,
+    *,
+    body: bytes,
+    headers: Mapping[str, str],
+    timeout: Duration | None,
+) -> HttpResponse:
+    if _binding.get() is None:
+        raise NotWiredError(public_name)
+    if type(body) is not bytes:
+        raise TypeError("HTTP request body must be bytes")
+    result = await _request(
+        operation,
+        method=method,
+        url=url,
+        body=body,
+        headers=headers,
+        timeout=timeout,
+    )
+    return result if isinstance(result, HttpResponse) else HttpResponse(**result)
+
+
 async def http_get(
     url: str,
     *,
     timeout: Duration | None = None,
     headers: Mapping[str, str] = MappingProxyType({}),
 ) -> HttpResponse:
-    """Request one URL through scoped Environment HTTP egress."""
-    del url, timeout, headers
-    raise NotWiredError("omp.env.http_get")
+    """Request one URL with GET through scoped Environment HTTP egress."""
+    return await _http_request(
+        "omp.env.http_get",
+        "omp.env.http.get",
+        "GET",
+        url,
+        body=b"",
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+async def http_post(
+    url: str,
+    *,
+    body: bytes = b"",
+    headers: Mapping[str, str] = MappingProxyType({}),
+    timeout: Duration | None = None,
+) -> HttpResponse:
+    """Request one URL with POST through scoped Environment HTTP egress."""
+    return await _http_request(
+        "omp.env.http_post",
+        "omp.env.http.post",
+        "POST",
+        url,
+        body=body,
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+async def http_put(
+    url: str,
+    *,
+    body: bytes = b"",
+    headers: Mapping[str, str] = MappingProxyType({}),
+    timeout: Duration | None = None,
+) -> HttpResponse:
+    """Request one URL with PUT through scoped Environment HTTP egress."""
+    return await _http_request(
+        "omp.env.http_put",
+        "omp.env.http.put",
+        "PUT",
+        url,
+        body=body,
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Pty:
+    """Configure terminal dimensions and emulation for an exec process."""
+
+    rows: int = 24
+    columns: int = 80
+    terminal: str = "xterm-256color"
 
 
 class Process:
@@ -1041,7 +1158,7 @@ class _Proc:
         *,
         cwd: EnvPath | None = None,
         env: Mapping[str, str] | None = None,
-        pty: object | None = None,
+        pty: Pty | None = None,
         restart: RestartPolicy | None = None,
         ready: Ready | None = None,
     ) -> Process:
@@ -1165,6 +1282,7 @@ __all__ = (
     "Edit",
     "EditPlan",
     "EditResult",
+    "FileKind",
     "Follow",
     "Format",
     "HttpResponse",
@@ -1174,6 +1292,7 @@ __all__ = (
     "Lifecycle",
     "OnStale",
     "Overwrite",
+    "PathMeta",
     "NotFound",
     "Partial",
     "Presence",
@@ -1182,6 +1301,7 @@ __all__ = (
     "ProcessInfo",
     "ProcessOutput",
     "ProcState",
+    "Pty",
     "PreconditionFailed",
     "QuotaExceeded",
     "Rank",
@@ -1200,15 +1320,19 @@ __all__ = (
     "TimedOut",
     "Unsupported",
     "Txn",
+    "WorktreeInfo",
     "blobs",
     "docs",
     "find",
     "fs",
     "has",
     "http_get",
+    "http_post",
+    "http_put",
     "info",
     "lsp",
     "proc",
     "require",
     "sh",
+    "worktree",
 )

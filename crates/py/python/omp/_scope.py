@@ -45,6 +45,8 @@ class Scope:
     has_ui: bool = False
     headless: bool = True
     model: object | None = None
+    route: object | None = None
+    thinking: object | None = None
     settings: Mapping[str, object] = field(
         default_factory=lambda: MappingProxyType({})
     )

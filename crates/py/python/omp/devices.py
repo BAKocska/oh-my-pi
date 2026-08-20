@@ -28,6 +28,7 @@ from typing import Any
 
 from ._errors import ExtensionError, NotWiredError
 from ._registry import registry
+from .packages import Provenance
 from .placement import Place
 from .policy import Tier
 
@@ -207,6 +208,10 @@ class DeviceInfo:
     reason: str | None
     shadowed_by: str | None
     source: str
+    provenance: Provenance
+    slotted: bool
+    schema_bytes: int
+    schema_tokens: int
 
 
 class Device:
@@ -392,6 +397,11 @@ class Devices:
     async def refresh(self) -> tuple[object, ...]:
         """Recompute ordinary availability predicates as one transition."""
         raise NotWiredError("omp.devices.refresh")
+
+    async def list(self, *, mounted_only: bool = True) -> tuple[DeviceInfo, ...]:
+        """Return immutable catalog rows, optionally including unmounted claims."""
+        del mounted_only
+        raise NotWiredError("omp.devices.list")
 
 
 # One namespace instance ensures every dynamic path uses the ordinary mounted set.

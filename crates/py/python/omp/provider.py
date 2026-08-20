@@ -16,7 +16,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol, TypeVar
 
-from _omp import Duration, Secret
+from _omp import BlobRef, Duration, Secret
 
 from ._registry import registry
 from ._errors import NotWiredError
@@ -233,6 +233,24 @@ class CredentialSource:
     def oauth(cls) -> "CredentialSource":
         """Run the OAuth flow linked by the enclosing authentication spec."""
         return cls("oauth")
+
+    @classmethod
+    def application_default(
+        cls,
+        *,
+        api_key_env: str = "GOOGLE_API_KEY",
+        project_env: str = "GOOGLE_CLOUD_PROJECT",
+        location_env: str = "GOOGLE_CLOUD_LOCATION",
+    ) -> "CredentialSource":
+        """Resolve Google application-default credentials through the host ADC chain."""
+        names = {
+            "api_key_env": api_key_env,
+            "project_env": project_env,
+            "location_env": location_env,
+        }
+        if any(not isinstance(value, str) or not value for value in names.values()):
+            raise ValueError("ADC environment names must be non-empty strings")
+        return cls("application_default", options=MappingProxyType(names))
 
     @classmethod
     def aws_chain(cls) -> "CredentialSource":
@@ -761,6 +779,123 @@ class ContextSpec:
         return cls("prefix_cache", retention, min_prefix_tokens, max_breakpoints)
 
 
+class ImageFeature(StrEnum):
+    """Closed image-operation capability vocabulary."""
+
+    GENERATE = "generate"
+    EDIT = "edit"
+    MASK = "mask"
+    REFERENCE_IMAGES = "reference_images"
+    TRANSPARENCY = "transparency"
+
+
+class ImageFormat(StrEnum):
+    """Closed generated-image encoding vocabulary."""
+
+    PNG = "png"
+    JPEG = "jpeg"
+    WEBP = "webp"
+
+
+@dataclass(frozen=True, slots=True)
+class Dimensions:
+    """Raster width and height in pixels."""
+
+    width: int
+    height: int
+
+    def __post_init__(self) -> None:
+        """Reject non-positive or non-integral raster dimensions."""
+        if (
+            isinstance(self.width, bool)
+            or not isinstance(self.width, int)
+            or self.width <= 0
+            or isinstance(self.height, bool)
+            or not isinstance(self.height, int)
+            or self.height <= 0
+        ):
+            raise ValueError("image dimensions must be positive integers")
+
+
+@dataclass(frozen=True, slots=True)
+class ImageCaps:
+    """Image operations, output dimensions, and encodings supported by a model."""
+
+    features: frozenset[ImageFeature]
+    sizes: tuple[Dimensions, ...]
+    formats: frozenset[ImageFormat]
+    max_references: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImageRequest:
+    """Typed request for host-routed image generation."""
+
+    prompt: str
+    dimensions: Dimensions
+    format: ImageFormat
+    count: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ImageResult:
+    """Blob-backed generated images and their settled nano-USD cost receipt."""
+
+    images: tuple[BlobRef, ...]
+    cost_nanos_usd: int
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogAlias:
+    """Canonical model alias with review rationale and provenance."""
+
+    alias: str
+    target: str
+    rationale: str
+    provenance: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedAlias:
+    """One canonical alias visible only inside a provider namespace."""
+
+    provider: str
+    definition: CatalogAlias
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPatch:
+    """Field-granular changes to an existing catalog model."""
+
+    class_: str | None = None
+    display_name: str | None = None
+    wire_ids: Mapping[str, str] | None = None
+    routes: tuple[str, ...] | None = None
+    capabilities: object | None = None
+    limits: object | None = None
+    thinking: object | None = None
+    thinking_routing: object | None = None
+    wire_policy: object | None = None
+    context: ContextSpec | None = None
+    pricing: Cost | None = None
+    availability: Availability | None = None
+    context_promotion_target: str | None = None
+    remote_compaction: object | None = None
+    premium_multiplier_millionths: int | None = None
+    updated_at_ms: int | None = None
+    blocked_until_ms: int | None = None
+    deprecated: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOverlay:
+    """One model addition or field-granular patch in an overlay declaration."""
+
+    selector: ModelRef
+    added: ModelSpec | None = None
+    patch: ModelPatch = ModelPatch()
+
+
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
     """One normalized selectable model and its route/capability facts."""
@@ -787,7 +922,7 @@ class ModelSpec:
     remote_compaction: object | None = None
     chat: ChatCaps = ChatCaps()
     embeddings: object | None = None
-    image: object | None = None
+    image: ImageCaps | None = None
     video: object | None = None
     speech: object | None = None
     transcription: object | None = None
@@ -806,7 +941,38 @@ class ProviderSpec:
     management: ManagementSpec = ManagementSpec()
     discovery_defaults: DiscoveryDefaults | None = None
     mapping: object = "concrete"
-    aliases: tuple[str, ...] = ()
+    aliases: tuple[ScopedAlias, ...] = ()
+    model_overlays: tuple[ModelOverlay, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Reject conflicting model patches and aliases before registration."""
+        selectors: set[tuple[str, str]] = set()
+        for overlay in self.model_overlays:
+            if not isinstance(overlay, ModelOverlay):
+                raise TypeError("ProviderSpec.model_overlays must contain ModelOverlay values")
+            if not isinstance(overlay.selector, ModelRef):
+                raise TypeError("ModelOverlay.selector must be a ModelRef")
+            key = (overlay.selector.provider, overlay.selector.model)
+            if overlay.selector.provider != self.id:
+                raise ValueError("model overlay selector must use the declaring provider")
+            if key in selectors:
+                raise ValueError(f"duplicate model overlay for {key[0]}/{key[1]}")
+            selectors.add(key)
+
+        aliases: dict[tuple[str, str], str] = {}
+        for scoped in self.aliases:
+            if not isinstance(scoped, ScopedAlias):
+                raise TypeError("ProviderSpec.aliases must contain ScopedAlias values")
+            if scoped.provider != self.id:
+                raise ValueError("scoped alias must use the declaring provider")
+            key = (scoped.provider, scoped.definition.alias)
+            target = scoped.definition.target
+            previous = aliases.get(key)
+            if previous is not None and previous != target:
+                raise ValueError(
+                    f"alias {key[0]}/{key[1]} targets both {previous!r} and {target!r}"
+                )
+            aliases[key] = target
 
 class ProviderHandle:
     """Refer to one provider declaration and its host-owned CONTROL operations."""
@@ -859,6 +1025,21 @@ class ProviderHandle:
         """Return whether an eligible provider principal is available."""
         return await _provider_control_request(
             "omp.provider.is_authenticated", provider=self.id
+        )
+
+    async def request(
+        self, operation: Operation, request: ImageRequest
+    ) -> ImageResult:
+        """Route one typed provider operation through the host CONTROL and DATA arm."""
+        if operation is not Operation.GENERATE_IMAGE:
+            raise ValueError("ProviderHandle.request only freezes GENERATE_IMAGE")
+        if not isinstance(request, ImageRequest):
+            raise TypeError("GENERATE_IMAGE requires an ImageRequest")
+        return await _provider_control_request(
+            "omp.provider.request",
+            provider=self.id,
+            operation=operation,
+            request=request,
         )
 
 
@@ -997,9 +1178,15 @@ class Failover:
         return Failover(FailoverKind.REFRESH_CREDENTIAL)
 
     @staticmethod
-    def rotate_account(*, cooldown: Duration | None = None) -> Failover:
-        """Rotate to another account before retrying."""
-        return Failover(FailoverKind.ROTATE_ACCOUNT, cooldown=cooldown)
+    def rotate_account(
+        successor: str, *, cooldown: Duration | None = None
+    ) -> Failover:
+        """Rotate to the named successor identity before retrying."""
+        if not isinstance(successor, str) or not successor:
+            raise ValueError("successor identity must be a non-empty string")
+        return Failover(
+            FailoverKind.ROTATE_ACCOUNT, cooldown=cooldown, target=successor
+        )
 
     @staticmethod
     def reselect_route(
@@ -1336,6 +1523,10 @@ def provider(
         raise TypeError("omp.provider requires a ProviderSpec")
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise TypeError("provider priority must be an integer")
+    if extends is not None and (not isinstance(extends, str) or not extends):
+        raise TypeError("provider extends must be a non-empty provider id")
+    if spec.model_overlays and extends is None:
+        raise ValueError("model overlays require provider(..., extends=...)")
     return ProviderHandle(
         spec, priority=priority, extends=extends, replaces=replaces
     )
@@ -1343,16 +1534,19 @@ def provider(
 
 __all__ = (
     "AccountScope", "Api", "AuthMethod", "AuthMode", "AuthSpec", "Availability",
-    "CacheRetention", "Cap", "ChatCaps", "CodecProfile", "CompatFlags", "Completion",
-    "Confidence", "ContextSpec", "Cost", "CostTier", "Credential", "CredentialKind",
-    "CredentialSource", "DiscoveryDefaults", "DiscoveryKind", "DiscoveryPage", "DiscoveryQuery",
-    "DiscoverySpec", "DiscoveryTrigger", "Effort", "ErrorKind", "Failover", "FailoverKind",
+    "CacheRetention", "Cap", "CatalogAlias", "ChatCaps", "CodecProfile", "CompatFlags",
+    "Completion", "Confidence", "ContextSpec", "Cost", "CostTier", "Credential", "CredentialKind",
+    "CredentialSource", "Dimensions", "DiscoveryDefaults", "DiscoveryKind", "DiscoveryPage",
+    "DiscoveryQuery", "DiscoverySpec", "DiscoveryTrigger", "Effort", "ErrorKind", "Failover",
+    "FailoverKind", "ImageCaps", "ImageFeature", "ImageFormat", "ImageRequest", "ImageResult",
     "Fallback", "Intent", "IntentKind", "LoginRequest", "LoginUi", "LogprobCaps",
-    "ManagementSpec", "Modality", "ModelFallback", "ModelRef", "ModelSpec", "OAuthFlow",
+    "ManagementSpec", "Modality", "ModelFallback", "ModelOverlay", "ModelPatch", "ModelRef",
+    "ModelSpec", "OAuthFlow",
     "OAuthFlowKind", "OAuthSpec", "Operation", "Pagination", "PrincipalResolution",
     "PromptCacheCaps", "ProviderError", "ProviderHandle", "ProviderSpec", "ReasoningCaps",
     "RedirectTrust", "RefreshBehavior", "RefreshReason", "RefreshRequest", "RequestDraft",
     "RequestMutation", "Retryability", "Role", "RouteLimits", "RouteRef", "RouteSpec",
+    "ScopedAlias",
     "SearchPage", "SearchQuery", "SearchResult", "ServerStateCaps", "ServiceTier",
     "SignRequest", "Signature", "Signer", "ThinkingMode", "ThinkingSpec", "TokenPlacement",
     "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "TrustDomain", "UsageQuery",

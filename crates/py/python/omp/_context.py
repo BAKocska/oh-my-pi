@@ -15,7 +15,7 @@ from _omp import CapabilityError, Duration, LifecyclePhase, Principal, Workspace
 
 from . import _scope
 from .placement import Place
-from .provider import ModelRef
+from .provider import Effort, ModelRef, RouteRef
 
 
 _EMPTY_SETTINGS: Mapping[str, object] = MappingProxyType({})
@@ -51,6 +51,8 @@ class Context:
     has_ui: bool = False
     headless: bool = True
     model: ModelRef | None = None
+    route: RouteRef | None = None
+    thinking: Effort | None = None
     settings: Mapping[str, object] = field(default_factory=lambda: _EMPTY_SETTINGS)
     deadline: float | None = None
     _scope: _scope.Scope | None = field(default=None, repr=False, compare=False)
@@ -77,6 +79,8 @@ class Context:
             has_ui=scope.has_ui,
             headless=scope.headless,
             model=scope.model,
+            route=scope.route,
+            thinking=scope.thinking,
             settings=scope.settings,
             deadline=scope.deadline,
             _scope=scope,

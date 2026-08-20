@@ -683,6 +683,35 @@ The fork/handoff chain reaching a session, oldest first. Backed by
 inference from filenames — which is what pi's advisor/subagent classifier had to
 do, keying off `__advisor.jsonl` basenames and path layout.
 
+#### Session mutation
+
+Historical-session management uses named CONTROL requests; the extension never
+opens, rewrites, renames, or removes journal files itself.
+
+| Signature | Semantics | Effect channel | Failure modes |
+|---|---|---|---|
+| `async get(session_id) -> omp.SessionInfo` | Return the visible indexed row for one stable id. | CONTROL request; no mutation. | `omp.SessionNotFound`; access and host failures fail closed. |
+| `async lineage(session_id) -> Sequence[omp.SessionLink]` | Return the durable parent chain, oldest first. | CONTROL request; no mutation. | `omp.SessionNotFound`; access and host failures fail closed. |
+| `async resume(session_id) -> omp.SessionInfo` | Make the historical interactive session current and return its refreshed index row. | CONTROL request; the Core journals a resume receipt before acknowledging. | `omp.SessionNotFound`; non-interactive, access, and host failures fail closed. |
+| `async rename(session_id, title) -> omp.SessionInfo` | Assign a user title and return the refreshed immutable index row. | CONTROL request; the Core journals the rename receipt before acknowledging. | `omp.SessionNotFound`; invalid titles, access, and host failures fail closed. |
+| `async delete(session_id) -> None` | Permanently remove the session selected by an approved deletion ticket. | Approval-gated CONTROL request. | `omp.PermissionDenied` without the matching approval grant; `omp.SessionNotFound`; host failures fail closed. |
+
+`delete` never bypasses policy. An extension offering deletion emits the durable
+human-approval ticket, and the Core executes the storage mutation only after that
+ticket is approved. Calling `delete` without the matching grant raises
+`omp.PermissionDenied`; there is no force flag, implicit confirmation, or
+extension-owned filesystem fallback.
+
+`SessionLink` is a frozen value with `id: str`, `parent: str | None`, and
+`at: int | None`. `id` uses the same stable identifier as `SessionInfo.id`,
+`parent` uses the same immediate-parent projection as `SessionInfo.parent`, and
+`at` is the source journal index recorded by `Kind::ForkedFrom`.
+
+**Resolved (2026-08-20 ruling):** These CONTROL verbs, typed lineage links, and
+the approval-gated deletion contract resolve the Round 4 session-mutation design
+gap. Resume and rename are durable acknowledged requests: their receipts are
+journaled before their refreshed rows are returned.
+
 #### `omp.SessionInfo`
 
 | Field | Type | Meaning |
@@ -700,7 +729,7 @@ do, keying off `__advisor.jsonl` basenames and path layout.
 | `entries` | `int` | Physical entry count, tombstones included. |
 | `turns` | `int` | Completed turn receipts. |
 | `usage` | `omp.Usage` | Rolled-up token counts. |
-| `cost` | `omp.Cost` | Rolled-up cost. |
+| `cost` | `omp.sessions.Cost` | Rolled-up cost. |
 | `models` | `Sequence[str]` | Distinct `provider/model` used. |
 | `remote` | `bool` | Whether the session's environment was remote. |
 
@@ -747,7 +776,7 @@ able to see that it is wrong.
 | `key` | `Mapping[str, str]` | Grouping key values (`{"model": "anthropic/claude-opus-5"}`). |
 | `start_ms` | `int \| None` | Bucket start, for series rows. |
 | `usage` | `omp.Usage` | Token counts. |
-| `cost` | `omp.Cost` | Cost. |
+| `cost` | `omp.sessions.Cost` | Cost. |
 | `requests` | `int` | Inference requests. |
 | `errors` | `int` | Failed requests. |
 | `duration` | `omp.Duration` | Summed wall time. `omp.Duration` is the single duration value type (`docs/py/00-overview.md`); millisecond ints and float seconds are gone from public signatures. |
@@ -788,7 +817,7 @@ Mirrors `omp.inference.v1.Usage.Accuracy`.
 | `ESTIMATED` | Every contributing count was computed locally. |
 | `MIXED` | Both, so the aggregate is neither. |
 
-#### `omp.Cost`
+#### `omp.sessions.Cost`
 
 Mirrors `omp.inference.v1.Cost` (`common.proto:108-117`). Cost is carried as
 **integer nano-USD**, not a float, because a summed corpus of millions of
@@ -857,7 +886,7 @@ Mirrors `omp_storage::transcript::TitleSource`.
 | Exception | Base | Raised when |
 |---|---|---|
 | `omp.SessionError` | `omp.Error` | Base for this namespace. |
-| `omp.SessionNotFound` | `omp.SessionError` | No such session, or not visible to the caller. |
+| `omp.SessionNotFound` | `omp.OmpError` | No such session, or not visible to the caller. |
 | `omp.SessionAccessDenied` | `omp.SessionError` | The manifest does not grant historical reads. |
 
 ### `omp.artifacts`

@@ -819,6 +819,7 @@ Trigger: TypeAlias = Cron | Every | At | AfterIdle
 class Inject:
     """Deliver a scheduled prompt to the declaring agent."""
 
+    prompt: str
     mode: DeliveryMode = DeliveryMode.NEXT_TURN
     visible: bool = False
 

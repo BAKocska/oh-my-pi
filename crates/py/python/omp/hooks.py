@@ -303,6 +303,7 @@ _DOMAIN_EVENTS = frozenset(
         "agent_settled",
         "compaction",
         "models_discover",
+        "provider_refresh",
         "provider_error",
         "provider_usage",
         "search_parse",

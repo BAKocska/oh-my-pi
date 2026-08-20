@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import fnmatch
-from collections.abc import Iterable, Iterator
+import inspect
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import IntFlag, StrEnum
 from typing import Final, TypeAlias
@@ -11,7 +12,8 @@ from typing import Final, TypeAlias
 from _omp import Duration, EnvPath, OmpError, WorkspaceUri
 
 from ._errors import NotWiredError
-from .hooks import ApprovalSpec, PolicyScope
+from ._registry import registry as _declarations
+from .hooks import ApprovalKind, ApprovalSpec, PolicyScope, Unreachable
 
 
 class ParseFailure(StrEnum):
@@ -733,9 +735,50 @@ async def amend(patch: SandboxProfile, *, scope: PolicyScope, reason: str, appro
     del patch, scope, reason, approval
     raise NotWiredError("omp.policy.amend")
 
+def approver(
+    name: str,
+    *,
+    kinds: Iterable[ApprovalKind] = (),
+    timeout: Duration = APPROVAL_DEADLINE,
+    unreachable: Unreachable = Unreachable.FAIL_CLOSED,
+) -> Callable[[Callable[..., object]], Callable[..., object]]:
+    """Declare an idempotent external approver without performing host I/O."""
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("approver name must be a non-empty string")
+    try:
+        frozen_kinds = tuple(kinds)
+    except TypeError as error:
+        raise TypeError("approver kinds must be an iterable of ApprovalKind") from error
+    if any(not isinstance(kind, ApprovalKind) for kind in frozen_kinds):
+        raise TypeError("approver kinds must contain only ApprovalKind values")
+    if not isinstance(timeout, Duration):
+        raise TypeError("approver timeout must be Duration")
+    if not isinstance(unreachable, Unreachable):
+        raise TypeError("approver unreachable must be Unreachable")
+
+    def decorate(handler: Callable[..., object]) -> Callable[..., object]:
+        if not callable(handler) or not inspect.iscoroutinefunction(handler):
+            raise TypeError("@omp.approver may decorate only an async callable")
+        _declarations.register_approver(
+            name, frozen_kinds, timeout, unreachable, handler
+        )
+        return handler
+
+    return decorate
+
+
 async def pending() -> tuple[ApprovalTicket, ...]:
     """Return pending approval tickets in filing order."""
     raise NotWiredError("omp.policy.pending")
+
+
+async def decide(ticket_id: str, decision: ApprovalDecision) -> None:
+    """Resolve a ticket; an identical decision after an idempotent re-offer is a no-op."""
+
+    del ticket_id, decision
+    raise NotWiredError("omp.policy.decide")
+
 
 __all__ = (
     "APPROVAL_DEADLINE", "Access", "Amend", "AndOrOp", "ApprovalDecision", "ApprovalSource", "ApprovalTicket",
@@ -748,5 +791,5 @@ __all__ = (
     "ProfileHandle", "ProfileRejected", "ProfileWidened", "Quoting", "RedirectOp", "RedirectTarget", "ResourceBudget", "RuleEffect",
     "RuleRef", "SandboxBackend", "SandboxCapabilities", "SandboxEnforcement", "SandboxMode", "SandboxProfile", "SandboxRequest",
     "Separator", "SessionKind", "Span", "TicketState", "Tier", "VIOLATION_COALESCE", "Violation", "ViolationKind",
-    "amend", "capabilities", "effective_profile", "enforcement", "install", "match_paths", "parse", "pending",
+    "amend", "approver", "capabilities", "decide", "effective_profile", "enforcement", "install", "match_paths", "parse", "pending",
 )

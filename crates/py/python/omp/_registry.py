@@ -116,6 +116,17 @@ class CommandDefinition:
     handler: object
 
 @dataclass(frozen=True, slots=True)
+class ShortcutDefinition:
+    """One import-time shortcut declaration and its dispatch callback."""
+
+    chord: str
+    action_id: str
+    description: str
+    when: frozenset[object] | None
+    handler: object
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerDefinition:
     """One import-time ``omp.workers.declare`` declaration."""
 
@@ -194,7 +205,15 @@ class PromptSlotDefinition:
     renderer: object
 
 
+@dataclass(frozen=True, slots=True)
+class ApproverDefinition:
+    """One import-time ``@omp.approver`` declaration."""
 
+    name: str
+    kinds: tuple[object, ...]
+    timeout: object
+    unreachable: object
+    handler: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,11 +226,13 @@ class DeclarationSnapshot:
     services: frozenset[_ServiceKey]
     telemetry: tuple[TelemetryDefinition, ...] = ()
     commands: tuple[CommandDefinition, ...] = ()
+    shortcuts: tuple[ShortcutDefinition, ...] = ()
     prompt_slots: tuple[PromptSlotDefinition, ...] = ()
     providers: tuple[ProviderDefinition, ...] = ()
     workers: tuple[WorkerDefinition, ...] = ()
     device_definitions: tuple[DeviceDefinition, ...] = ()
     exports: tuple[ExportDefinition, ...] = ()
+    approvers: tuple[ApproverDefinition, ...] = ()
     device_states: tuple[tuple[_ToolKey, bool, str | None], ...] = ()
     arg_specs: tuple[tuple[_ToolKey, tuple[ArgSpec, ...]], ...] = ()
 
@@ -220,8 +241,10 @@ class DeclarationRegistry:
     """Process-local declaration authority sealed exactly once at FREEZE."""
 
     __slots__ = (
+        "_approvers",
         "_configured",
         "_commands",
+        "_shortcuts",
         "_device_claims",
         "_device_definitions",
         "_device_states",
@@ -249,7 +272,9 @@ class DeclarationRegistry:
         self._configured = False
         self._sealed = False
         self._verified = False
+        self._approvers: dict[str, ApproverDefinition] = {}
         self._commands: dict[str, CommandDefinition] = {}
+        self._shortcuts: dict[str, ShortcutDefinition] = {}
         self._tools: dict[_ToolKey, object] = {}
         self._device_definitions: dict[_ToolKey, DeviceDefinition] = {}
         self._device_claims: dict[
@@ -303,7 +328,14 @@ class DeclarationRegistry:
         self._ensure_open()
         if self._configured:
             raise RuntimeError("manifest declaration sets are already configured")
-        if self._tools or self._hooks or self._services or self._commands:
+        if (
+            self._tools
+            or self._hooks
+            or self._services
+            or self._commands
+            or self._shortcuts
+            or self._approvers
+        ):
             raise RuntimeError("manifest must be configured before declaration import")
         self._manifest_tools = frozenset(_tool_key(*item) for item in tools)
         self._manifest_hooks = frozenset(_hook_key(*item) for item in hooks)
@@ -439,6 +471,25 @@ class DeclarationRegistry:
         key = _hook_key(event, phase)
         self._insert(self._hooks, key, handler, "hook")
         return handler
+
+    def register_approver(
+        self,
+        name: str,
+        kinds: tuple[object, ...],
+        timeout: object,
+        unreachable: object,
+        handler: object,
+    ) -> object:
+        """Record one external approver declaration during import."""
+
+        definition = ApproverDefinition(name, kinds, timeout, unreachable, handler)
+        self._insert(self._approvers, name, definition, "approver")
+        return handler
+
+    def approver_definitions(self) -> tuple[ApproverDefinition, ...]:
+        """Return approver declarations in deterministic name order."""
+
+        return tuple(self._approvers[key] for key in sorted(self._approvers))
 
     def register_telemetry(
         self,
@@ -583,6 +634,34 @@ class DeclarationRegistry:
 
 
 
+    def register_shortcut(
+        self,
+        chord: str,
+        action_id: str,
+        description: str,
+        when: frozenset[object] | None,
+        handler: object,
+    ) -> object:
+        """Record one normalized shortcut and its static dispatch metadata."""
+
+        if not isinstance(chord, str) or not chord:
+            raise ValueError("shortcut chord must be a non-empty string")
+        if not isinstance(action_id, str) or not action_id:
+            raise ValueError("shortcut action_id must be a non-empty string")
+        if not isinstance(description, str):
+            raise TypeError("shortcut description must be a string")
+        if not callable(handler):
+            raise TypeError("@omp.shortcut may decorate only a callable")
+        definition = ShortcutDefinition(chord, action_id, description, when, handler)
+        self._insert(self._shortcuts, chord, definition, "shortcut")
+        return handler
+
+    def shortcut_definitions(self) -> tuple[ShortcutDefinition, ...]:
+        """Return shortcut declarations in deterministic chord order."""
+
+        return tuple(self._shortcuts[key] for key in sorted(self._shortcuts))
+
+
     def register_service(self, name: str, rev: int, implementation: type) -> type:
         """Records and validates an async service implementation."""
 
@@ -654,6 +733,7 @@ class DeclarationRegistry:
             hooks=frozenset(self._hooks),
             services=frozenset(self._services),
             commands=self.command_definitions(),
+            shortcuts=self.shortcut_definitions(),
             telemetry=tuple(self._telemetry[key] for key in sorted(self._telemetry)),
             prompt_slots=tuple(
                 self._prompt_slots[key] for key in sorted(self._prompt_slots)
@@ -662,6 +742,7 @@ class DeclarationRegistry:
             workers=self.worker_definitions(),
             device_definitions=self.device_definitions(),
             exports=self.export_definitions(),
+            approvers=self.approver_definitions(),
             device_states=tuple(
                 (key, *self._device_states[key]) for key in sorted(self._device_states)
             ),
@@ -709,7 +790,9 @@ class DeclarationRegistry:
         if (
             len(self._tools)
             + len(self._commands)
+            + len(self._shortcuts)
             + len(self._hooks)
+            + len(self._approvers)
             + len(self._services)
             + len(self._entry_kinds)
             + len(self._telemetry)
@@ -996,10 +1079,12 @@ def _service_key(name: str, rev: int) -> _ServiceKey:
 
 
 __all__ = (
+    "ApproverDefinition",
     "ArgSpec",
     "ControlServiceTransport",
     "DeclarationDrift",
     "CommandDefinition",
+    "ShortcutDefinition",
     "DeclarationRegistry",
     "DeviceDefinition",
     "DeclarationSnapshot",

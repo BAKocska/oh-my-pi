@@ -21,7 +21,7 @@ from .hooks import CallOrigin, CallTarget, TargetKind
 from .devices import DeviceInfo
 from .placement import Place
 from .policy import BashIR
-from .provider import Intent, ModelRef, Role, RouteRef
+from .provider import Effort, Intent, ModelRef, Role, RouteRef
 from ._verdicts import ArtifactLifetime
 from ._scope import Trust
 from .ui import InvocationMode
@@ -385,6 +385,7 @@ class BeforeAgentStartEvent:
     prompt_rev: str
     staged_interrupts: int
     resuming: bool
+    schedule_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +409,7 @@ class TurnStartEvent:
     input_mode: TurnInputMode
     model: ModelRef
     route: RouteRef
+    thinking: Effort
     deadline: Duration | None
     attempt: int
     prompt_changed: bool
