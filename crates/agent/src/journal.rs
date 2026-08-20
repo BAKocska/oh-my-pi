@@ -86,6 +86,11 @@ pub struct Compact {
 	pub first_kept:    u64,
 	/// Context tokens observed before this compaction.
 	pub tokens_before: u64,
+	/// Estimated context tokens after the rewrite, when available.
+	pub tokens_after:  Option<u64>,
+	/// Ladder method that produced the summary; absent for extension and legacy
+	/// entries.
+	pub method:        Option<Str>,
 	/// Optional user-visible compaction warning.
 	pub warning:       Option<Str>,
 	/// Ordered extension-summary losers recorded without their summary bytes.
@@ -2060,6 +2065,8 @@ impl Journal {
 				short:         compact.short,
 				first_kept:    compact.first_kept,
 				tokens_before: compact.tokens_before,
+				tokens_after:  compact.tokens_after,
+				method:        compact.method,
 				warning:       compact.warning,
 				superseded:    compact.superseded,
 			},
@@ -3595,6 +3602,8 @@ mod tests {
 				short:         None,
 				first_kept:    input,
 				tokens_before: 100,
+				tokens_after:  Some(20),
+				method:        Some(Str::from("remote")),
 				warning:       None,
 				superseded:    Vec::new(),
 			}),

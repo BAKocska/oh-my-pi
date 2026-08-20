@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use omp_core::Str;
 pub use omp_tui::components::Attachment;
-pub use overlays::{ListPicker, ListRow, PromptEvent, PromptOverlay};
+pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
@@ -70,31 +70,53 @@ pub struct GitFacts {
 	pub staged: u32,
 }
 
+/// Background compaction state rendered by status surfaces.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CompactionSpeculationStatus {
+	/// No background compaction exists.
+	#[default]
+	Idle,
+	/// A detached snapshot is being compacted.
+	Running,
+	/// A speculative summary is ready for the threshold boundary.
+	Armed,
+}
+
 /// Complete host-supplied status snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct StatusFacts {
 	/// Model label shown in the status line.
-	pub model:          Str,
+	pub model:                  Str,
+	/// Whether the primary model uses subscription billing.
+	pub model_subscription:     bool,
+	/// Advisor model label, when an advisor is configured or active.
+	pub advisor_model:          Option<Str>,
+	/// Whether the advisor model uses subscription billing.
+	pub advisor_subscription:   bool,
 	/// Whether a backend turn is active.
-	pub working:        bool,
+	pub working:                bool,
 	/// Wall-clock start of the active turn, when available.
-	pub turn_started:   Option<Instant>,
+	pub turn_started:           Option<Instant>,
 	/// Context tokens currently in use.
-	pub context_tokens: u64,
+	pub context_tokens:         u64,
 	/// Model context window, when known.
-	pub context_window: Option<u64>,
+	pub context_window:         Option<u64>,
+	/// Background speculative-compaction lifecycle.
+	pub compaction_speculation: CompactionSpeculationStatus,
 	/// Accumulated cost in billionths of a dollar.
-	pub cost_nanos:     u64,
+	pub cost_nanos:             u64,
+	/// Accumulated advisor-model cost in billionths of a dollar.
+	pub advisor_cost_nanos:     u64,
 	/// Number of queued user submissions.
-	pub queued:         usize,
+	pub queued:                 usize,
 	/// Number of active background jobs.
-	pub jobs:           usize,
+	pub jobs:                   usize,
 	/// Current retry attempt.
-	pub attempt:        u32,
+	pub attempt:                u32,
 	/// Number of dropped backend events.
-	pub dropped:        u64,
+	pub dropped:                u64,
 	/// Repository facts, omitted when unavailable.
-	pub git:            Option<GitFacts>,
+	pub git:                    Option<GitFacts>,
 }
 
 /// How a composer submission interacts with an active turn.
@@ -170,6 +192,13 @@ pub enum BackendEvent {
 		/// Display labels for replayed attachments.
 		chips: Vec<Str>,
 	},
+	/// Return a user prompt that was dropped before the first turn committed.
+	PromptDropped {
+		/// Prompt text exactly as submitted.
+		text:        Str,
+		/// Attachments submitted with the prompt.
+		attachments: Vec<Attachment>,
+	},
 	/// Begin a streamed assistant message.
 	AssistantBegin {
 		/// Stable message identifier.
@@ -229,6 +258,19 @@ pub enum BackendEvent {
 		ok:   bool,
 		/// Renderer-produced TML or structured generic fallback text.
 		view: Str,
+	},
+	/// Append an in-place compaction summary divider.
+	Compacted {
+		/// Full summary used when no short preview title was recorded.
+		summary:       Str,
+		/// Optional short preview title.
+		title:         Option<Str>,
+		/// Ladder method that produced the entry.
+		method:        Option<Str>,
+		/// Context tokens before the rewrite.
+		tokens_before: u64,
+		/// Estimated context tokens after the rewrite.
+		tokens_after:  Option<u64>,
 	},
 	/// Append an informational notice.
 	Notice(Str),

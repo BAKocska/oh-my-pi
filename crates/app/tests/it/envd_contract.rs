@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! End-to-end environment daemon contract tests.
 
 use std::{
@@ -22,13 +21,15 @@ use omp_app::{
 	},
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, Str};
-use omp_env::{BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent};
+use omp_env::{
+	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
+};
 use omp_proto::{
 	SCHEMA_REV,
 	blob::v1::{Chunk, GetRequest},
 	env::v1::{
-		ClientHello, ExecOutcome, ExecRequest, InvokeTool, ListProcesses, OpenSessionRequest,
-		ProcessSpec, Script, StartProcess, StopProcess,
+		Admission, AdmitInvocation, ClientHello, ExecOutcome, ExecRequest, InvokeTool, ListProcesses,
+		OpenSessionRequest, ProcessSpec, Script, StartProcess, StopProcess,
 	},
 };
 use omp_tool::{
@@ -39,6 +40,20 @@ use omp_tool::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+
+struct AllowAdmission;
+
+impl Admitter for AllowAdmission {
+	type Future<'client> = std::future::Ready<Admission>;
+
+	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client> {
+		std::future::ready(Admission {
+			invocation_id: query.invocation_id,
+			allow: true,
+			..Admission::default()
+		})
+	}
+}
 
 const fn test_claims() -> Claims {
 	Claims {
@@ -453,6 +468,7 @@ impl Harness {
 				.expect("real local environment host"),
 		);
 		let (client, transport) = EnvClient::in_process(64);
+		client.set_admitter(AllowAdmission);
 		let host = Arc::clone(&server);
 		let server_task = tokio::spawn(async move { host.serve_in_process(transport).await });
 		client
@@ -472,6 +488,7 @@ impl Harness {
 
 	async fn connect(&self, name: &str) -> (EnvClient, tokio::task::JoinHandle<()>) {
 		let (client, transport) = EnvClient::in_process(64);
+		client.set_admitter(AllowAdmission);
 		let host = Arc::clone(&self.server);
 		let task = tokio::spawn(async move { host.serve_in_process(transport).await });
 		client
@@ -647,14 +664,16 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		.map(|tool| (tool.identity.name.as_str(), tool.identity.rev.to_string()))
 		.collect::<Vec<_>>();
 	assert_eq!(identities, [
+		("ask", "1".to_owned()),
 		("dyn", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
-		("read", "1".to_owned()),
 		("shell", "1".to_owned()),
+		("todo", "1".to_owned()),
 		("write", "1".to_owned()),
+		("read", "1".to_owned()),
 	]);
 	let write_definition = advertised
 		.iter()
@@ -801,24 +820,40 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 				},
 				"timeout_ms": {
 					"type": "integer",
-					"minimum": 1,
-					"description": "Host-enforced execution timeout in milliseconds."
+					"minimum": 0,
+					"description": "Host-enforced execution timeout in milliseconds; zero disables the deadline."
 				},
-				"detach": {
+				"env": {
+					"type": "object",
+					"additionalProperties": {"type": "string"},
+					"description": "Environment additions scoped to this command.",
+					"default": {}
+				},
+				"cwd": {
+					"type": "string",
+					"minLength": 1,
+					"description": "Command working directory, relative to the workspace when not absolute."
+				},
+				"pty": {
 					"type": "boolean",
 					"default": false,
-					"description": "Run as a persistent named process."
+					"description": "Allocate a pseudo-terminal for this command."
+				},
+				"async": {
+					"type": "boolean",
+					"default": false,
+					"description": "Run as a named asynchronous job."
 				},
 				"name": {
 					"type": "string",
 					"minLength": 1,
-					"description": "Required stable process name when detach is true."
+					"description": "Required stable job name when async is true."
 				}
 			},
 			"allOf": [{
 				"if": {
-					"properties": {"detach": {"const": true}},
-					"required": ["detach"]
+					"properties": {"async": {"const": true}},
+					"required": ["async"]
 				},
 				"then": {"required": ["name"]}
 			}]
@@ -989,7 +1024,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 	let harness = Harness::start(Registry::new()).await;
 	std::fs::write(
 		harness.root.path().join("bundle.zip"),
-		include_bytes!("../../tools/tests/fixtures/special-sources/archives/bundle.zip"),
+		include_bytes!("../../../tools/tests/fixtures/special-sources/archives/bundle.zip"),
 	)
 	.expect("copy archive fixture");
 	let archive = invoke_builtin(
@@ -1019,7 +1054,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 
 	std::fs::write(
 		harness.root.path().join("catalog.sqlite"),
-		include_bytes!("../../tools/tests/fixtures/special-sources/database/catalog.sqlite"),
+		include_bytes!("../../../tools/tests/fixtures/special-sources/database/catalog.sqlite"),
 	)
 	.expect("copy SQLite fixture");
 	let insert = invoke_builtin(
@@ -1644,6 +1679,7 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 	let (remote, bridge_task) = EnvServer::connect_owner_uds(&socket)
 		.await
 		.expect("connect owner UDS client");
+	remote.set_admitter(AllowAdmission);
 	remote
 		.hello(ClientHello {
 			client: "envd-contract-uds".into(),
@@ -1700,7 +1736,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 8);
+	assert_eq!(advertised.len(), 10);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
@@ -1837,6 +1873,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 	assert!(matches!(terminal, InvocationEvent::Verdict(_)));
 	assert_eq!(std::fs::read(&effect).expect("committed effect marker"), b"committed");
 	assert!(!lease.exists(), "committed speculative lease was not released");
+	std::fs::remove_file(&effect).expect("clear committed effect marker");
 
 	let mut duplicate = harness
 		.client()
@@ -1872,6 +1909,13 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		)
 		.await
 		.expect("first duplicate commit");
+	tokio::time::timeout(Duration::from_secs(1), async {
+		while !std::fs::read(&effect).is_ok_and(|contents| contents == b"duplicate") {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("first duplicate commit did not enter execution");
 	duplicate
 		.commit_args(
 			Bytes::from_static(br#"{"path":"duplicate"}"#),

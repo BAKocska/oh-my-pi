@@ -706,6 +706,9 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 }
 fn update_models(host: &mut ChatHost, rows: Vec<ModelRow>, current: usize) {
 	host.current_model = current.min(rows.len().saturating_sub(1));
+	if let Some(Overlay::Models(picker)) = &mut host.overlay {
+		picker.update_rows(&rows, host.current_model);
+	}
 	host.models = rows;
 	if let Some(model) = host.models.get(host.current_model) {
 		let mut facts = host.chat.status();

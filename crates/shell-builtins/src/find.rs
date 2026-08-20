@@ -2832,7 +2832,12 @@ pub mod matchers {
 				// retries alternatives that stop short).
 				self
 					.regex
-					.match_with_options(path.as_ref(), 0, SearchOptions::SEARCH_OPTION_WHOLE_STRING, None)
+					.match_with_options(
+						path.as_ref(),
+						0,
+						SearchOptions::SEARCH_OPTION_WHOLE_STRING,
+						None,
+					)
 					.is_some()
 			}
 		}
@@ -2929,8 +2934,8 @@ pub mod matchers {
 					"P" => Self::PebiByte,
 					_ => {
 						return Err(From::from(format!(
-							"Invalid suffix {s} for -size. Only allowed values are <nothing>, b, c, w, k, M, G, \
-							 T or P"
+							"Invalid suffix {s} for -size. Only allowed values are <nothing>, b, c, w, \
+							 k, M, G, T or P"
 						)));
 					},
 				})
@@ -3203,10 +3208,7 @@ pub mod matchers {
 
 				// duration_since returns Err when x_option_time is strictly
 				// newer than the reference time.
-				Ok(self
-					.reference_time
-					.duration_since(x_option_time)
-					.is_err())
+				Ok(self.reference_time.duration_since(x_option_time).is_err())
 			}
 		}
 
@@ -3972,13 +3974,11 @@ pub mod matchers {
 	///
 	/// Accepts, in order:
 	/// - `@N[.N]` seconds since the epoch (GNU extension)
-	/// - RFC 3339 datetimes with an explicit offset, e.g.
-	///   "2026-01-01T00:00:00Z"
-	/// - ISO-style naive dates/datetimes ("2026-01-01",
-	///   "2026-01-01 12:30[:45]", with ` ` or `T` separators), interpreted in
-	///   local time like GNU find
-	/// - "(month abbreviation) (date), (year) (time)" strings, e.g.
-	///   "jan 01, 2025 00:00:01" (time defaults to 00:00:00)
+	/// - RFC 3339 datetimes with an explicit offset, e.g. "2026-01-01T00:00:00Z"
+	/// - ISO-style naive dates/datetimes ("2026-01-01", "2026-01-01 12:30[:45]",
+	///   with ` ` or `T` separators), interpreted in local time like GNU find
+	/// - "(month abbreviation) (date), (year) (time)" strings, e.g. "jan 01,
+	///   2025 00:00:01" (time defaults to 00:00:00)
 	fn parse_date_str_to_timestamps(date_str: &str) -> Option<i64> {
 		if let Some(epoch) = date_str.strip_prefix('@')
 			&& let Ok(seconds) = epoch.parse::<f64>()
@@ -3998,7 +3998,12 @@ pub mod matchers {
 			.or_else(|| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M").ok())
 			.or_else(|| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M").ok());
 		if let Some(naive) = naive {
-			return Some(Local.from_local_datetime(&naive).earliest()?.timestamp_millis());
+			return Some(
+				Local
+					.from_local_datetime(&naive)
+					.earliest()?
+					.timestamp_millis(),
+			);
 		}
 
 		let regex_pattern =
@@ -5273,7 +5278,11 @@ mod tests {
 			fs::write(&path, b"x").unwrap();
 			let file = fs::File::options().write(true).open(&path).unwrap();
 			file
-				.set_times(FileTimes::new().set_accessed(accessed).set_modified(modified))
+				.set_times(
+					FileTimes::new()
+						.set_accessed(accessed)
+						.set_modified(modified),
+				)
 				.unwrap();
 		};
 
@@ -5284,16 +5293,13 @@ mod tests {
 		// atime older than ref's mtime: -neweram must not match.
 		write_with_times("miss", old, now);
 
-		let (code, capture) = run(
-			&root,
-			&[
-				root.display().to_string(),
-				"-type".into(),
-				"f".into(),
-				"-neweram".into(),
-				"ref".into(),
-			],
-		);
+		let (code, capture) = run(&root, &[
+			root.display().to_string(),
+			"-type".into(),
+			"f".into(),
+			"-neweram".into(),
+			"ref".into(),
+		]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		assert_eq!(capture.out(), format!("{}\n", root.join("hit").display()));
@@ -5304,28 +5310,19 @@ mod tests {
 	#[test]
 	fn newermt_accepts_iso_dates() {
 		let (_dir, root) = fixture();
-		let (code, capture) = run(
-			&root,
-			&[
-				root.display().to_string(),
-				"-name".into(),
-				"a.txt".into(),
-				"-newermt".into(),
-				"2000-01-01".into(),
-			],
-		);
+		let (code, capture) = run(&root, &[
+			root.display().to_string(),
+			"-name".into(),
+			"a.txt".into(),
+			"-newermt".into(),
+			"2000-01-01".into(),
+		]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		assert_eq!(capture.out(), format!("{}\n", root.join("a.txt").display()));
 
-		let (code, capture) = run(
-			&root,
-			&[
-				root.display().to_string(),
-				"-newermt".into(),
-				"3000-01-01".into(),
-			],
-		);
+		let (code, capture) =
+			run(&root, &[root.display().to_string(), "-newermt".into(), "3000-01-01".into()]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		assert_eq!(capture.out(), "");
@@ -5342,16 +5339,13 @@ mod tests {
 		fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o755)).unwrap();
 		fs::set_permissions(root.join("b.md"), fs::Permissions::from_mode(0o644)).unwrap();
 		fs::set_permissions(root.join("c.rs"), fs::Permissions::from_mode(0o600)).unwrap();
-		let (code, capture) = run(
-			&root,
-			&[
-				root.display().to_string(),
-				"-type".into(),
-				"f".into(),
-				"-perm".into(),
-				"+111".into(),
-			],
-		);
+		let (code, capture) = run(&root, &[
+			root.display().to_string(),
+			"-type".into(),
+			"f".into(),
+			"-perm".into(),
+			"+111".into(),
+		]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		assert_eq!(capture.out(), format!("{}\n", root.join("a.txt").display()));
@@ -5409,16 +5403,13 @@ mod tests {
 	#[test]
 	fn regex_full_match_prefers_longest_alternative() {
 		let (_dir, root) = fixture();
-		let (code, capture) = run(
-			&root,
-			&[
-				root.display().to_string(),
-				"-regextype".into(),
-				"posix-extended".into(),
-				"-regex".into(),
-				r".*/c|.*/c\.rs".into(),
-			],
-		);
+		let (code, capture) = run(&root, &[
+			root.display().to_string(),
+			"-regextype".into(),
+			"posix-extended".into(),
+			"-regex".into(),
+			r".*/c|.*/c\.rs".into(),
+		]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		assert_eq!(capture.out(), format!("{}\n", root.join("c.rs").display()));
@@ -5429,24 +5420,20 @@ mod tests {
 	#[test]
 	fn size_accepts_t_and_p_suffixes() {
 		let (_dir, root) = fixture();
-		let (code, capture) = run(
-			&root,
-			&[
-				root.display().to_string(),
-				"-type".into(),
-				"f".into(),
-				"-size".into(),
-				"-2T".into(),
-			],
-		);
+		let (code, capture) = run(&root, &[
+			root.display().to_string(),
+			"-type".into(),
+			"f".into(),
+			"-size".into(),
+			"-2T".into(),
+		]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		let mut matches: Vec<PathBuf> = capture.out().lines().map(PathBuf::from).collect();
 		matches.sort();
 		assert_eq!(matches, vec![root.join("a.txt"), root.join("b.md"), root.join("c.rs")]);
 
-		let (code, capture) =
-			run(&root, &[root.display().to_string(), "-size".into(), "+1P".into()]);
+		let (code, capture) = run(&root, &[root.display().to_string(), "-size".into(), "+1P".into()]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		assert_eq!(capture.out(), "");
@@ -5457,16 +5444,13 @@ mod tests {
 	#[test]
 	fn bsd_leading_flags_x_and_s_parse() {
 		let (_dir, root) = fixture();
-		let (code, capture) = run(
-			&root,
-			&[
-				"-s".into(),
-				"-x".into(),
-				root.display().to_string(),
-				"-type".into(),
-				"f".into(),
-			],
-		);
+		let (code, capture) = run(&root, &[
+			"-s".into(),
+			"-x".into(),
+			root.display().to_string(),
+			"-type".into(),
+			"f".into(),
+		]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.err(), "");
 		// -s guarantees lexicographically sorted output.

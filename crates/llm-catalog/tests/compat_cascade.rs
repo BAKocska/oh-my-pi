@@ -229,10 +229,8 @@ fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
 	// These axes postdate the frozen oracle snapshot. They stay explicit until
 	// the next intentional snapshot refresh; compat KDL may use them without
 	// rewriting source digests in an unrelated port.
-	oracle_axes.extend([
-		"template_reasoning_effort".to_owned(),
-		"thinking_tool_choice_conflict".to_owned(),
-	]);
+	oracle_axes
+		.extend(["template_reasoning_effort".to_owned(), "thinking_tool_choice_conflict".to_owned()]);
 	oracle_axes.sort_unstable();
 	oracle_axes.dedup();
 	let mut known: Vec<String> = KNOWN_AXES
@@ -325,37 +323,6 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 				expected.insert("omit_reasoning_effort".into(), Value::from(false));
 				expected.insert("supports_reasoning_effort".into(), Value::from(true));
 			}
-		}
-		if class == "deepseek"
-			&& [
-				"aiand",
-				"aimlapi",
-				"alibaba-token-plan",
-				"baseten",
-				"coreweave",
-				"deepseek",
-				"fireworks",
-				"gmi-cloud",
-				"groq",
-				"huggingface",
-				"kilo",
-				"nanogpt",
-				"novita",
-				"nvidia",
-				"opencode-go",
-				"opencode-zen",
-				"qianfan",
-				"together",
-				"venice",
-				"wafer-serverless",
-				"zenmux",
-			]
-			.contains(&model.provider.as_str())
-		{
-			expected.insert(
-				"thinking_tool_choice_conflict".into(),
-				Value::from("drop_auto_when_thinking"),
-			);
 		}
 		if class == "qwen"
 			&& ["llama.cpp", "lm-studio", "vllm"].contains(&model.provider.as_str())

@@ -435,8 +435,23 @@ fn home_dir() -> Option<PathBuf> {
 		.map(PathBuf::from)
 }
 
-/// Split documented semicolon-delimited targets after trimming whitespace and
-/// outer double quotes.
+/// Split documented semicolon- or comma-delimited targets after trimming
+/// whitespace and outer double quotes.
+///
+/// Callers must first prefer an exact literal path and confirm every split
+/// member is addressable. This deliberately keeps commas in range selectors
+/// from becoming target separators.
+pub fn split_delimited_targets(input: &str) -> Vec<Str> {
+	input
+		.split([';', ','])
+		.map(normalize_path_input)
+		.filter(|part| !part.is_empty())
+		.map(Str::from)
+		.collect()
+}
+
+/// Split semicolon-delimited targets for tools whose path grammar reserves
+/// commas for another purpose.
 pub fn split_semicolon_targets(input: &str) -> Vec<Str> {
 	input
 		.split(';')
@@ -446,16 +461,38 @@ pub fn split_semicolon_targets(input: &str) -> Vec<Str> {
 		.collect()
 }
 
-/// Split semicolon targets unless the entire input is an existing or ambiguous
-/// literal path.
-pub fn split_semicolon_targets_preferring_literal(
+/// Parse a JSON-encoded path array, preserving ordinary path strings that do
+/// not begin with an array delimiter.
+pub fn parse_json_path_array(input: &str) -> Result<Option<Vec<Str>>, SelectorError> {
+	let input = input.trim();
+	if !input.starts_with('[') {
+		return Ok(None);
+	}
+	let paths: Vec<String> = serde_json::from_str(input)
+		.map_err(|error| SelectorError::from_message(format!("Invalid JSON path array: {error}")))?;
+	if paths.is_empty() {
+		return Err(SelectorError::from_message("JSON path array must not be empty."));
+	}
+	let paths = paths
+		.into_iter()
+		.map(|path| Str::from(normalize_path_input(&path).to_owned()))
+		.collect::<Vec<_>>();
+	if paths.iter().any(|path| path.is_empty()) {
+		return Err(SelectorError::from_message("JSON path arrays must not contain empty paths."));
+	}
+	Ok(Some(paths))
+}
+
+/// Split documented delimited targets unless the entire input is an existing
+/// or ambiguous literal path.
+pub fn split_delimited_targets_preferring_literal(
 	input: &str,
 	mut probe: impl FnMut(&str) -> LiteralPathProbe,
 ) -> Vec<Str> {
-	if !input.contains(';') || probe(input) != LiteralPathProbe::Missing {
+	if !input.contains([';', ',']) || probe(input) != LiteralPathProbe::Missing {
 		return vec![Str::from(normalize_path_input(input))];
 	}
-	split_semicolon_targets(input)
+	split_delimited_targets(input)
 }
 
 fn normalize_path_input(input: &str) -> &str {
@@ -730,5 +767,74 @@ mod tests {
 		assert_eq!(&*matched.display_path, "src/foo.rs");
 		let ambiguous = [Path::new("/workspace/a/src/foo.rs"), Path::new("/workspace/b/src/foo.rs")];
 		assert!(unique_suffix_match("src/foo.rs", cwd, ambiguous).is_none());
+	}
+	#[test]
+	fn documented_selectors_parse_and_split_round_trip() {
+		let cases = [
+			("1", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 1, end_line: None }]),
+				raw:    false,
+			}),
+			("5-16", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 5, end_line: Some(16) }]),
+				raw:    false,
+			}),
+			("960+14", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 960, end_line: Some(973) }]),
+				raw:    false,
+			}),
+			("5-", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 5, end_line: None }]),
+				raw:    false,
+			}),
+			("5..16", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 5, end_line: Some(16) }]),
+				raw:    false,
+			}),
+			("5-16,960-973", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 5, end_line: Some(16) }, LineRange {
+					start_line: 960,
+					end_line:   Some(973),
+				}]),
+				raw:    false,
+			}),
+			("raw", ParsedSelector::Raw),
+			("conflicts", ParsedSelector::Conflicts),
+			("raw:5-16", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 5, end_line: Some(16) }]),
+				raw:    true,
+			}),
+			("5-16:raw", ParsedSelector::Lines {
+				ranges: Box::from([LineRange { start_line: 5, end_line: Some(16) }]),
+				raw:    true,
+			}),
+		];
+		for (suffix, expected) in cases {
+			assert_eq!(parse_selector(Some(suffix)).unwrap(), expected, ":{suffix}");
+			let input = format!("src/lib.rs:{suffix}");
+			let split = split_path_and_selector(&input);
+			assert_eq!(split.path, "src/lib.rs", ":{suffix}");
+			assert_eq!(split.selector, Some(suffix), ":{suffix}");
+			assert_eq!(format!("{}:{}", split.path, split.selector.unwrap()), input);
+		}
+	}
+
+	#[test]
+	fn parses_json_and_delimited_target_lists_without_losing_literals() {
+		assert_eq!(
+			parse_json_path_array(r#"["src/a.rs", "src/b.rs:5-16"]"#).unwrap(),
+			Some(vec![Str::from("src/a.rs"), Str::from("src/b.rs:5-16")])
+		);
+		assert_eq!(split_delimited_targets("src/a.rs; src/b.rs, \"src/c.rs\""), vec![
+			Str::from("src/a.rs"),
+			Str::from("src/b.rs"),
+			Str::from("src/c.rs"),
+		]);
+		assert_eq!(
+			split_delimited_targets_preferring_literal("report,final.txt", |_| {
+				LiteralPathProbe::Exists
+			}),
+			vec![Str::from("report,final.txt")]
+		);
 	}
 }

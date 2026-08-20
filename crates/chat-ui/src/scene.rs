@@ -13,13 +13,18 @@ use omp_tui::{
 	Border, Charset, Color, Command, Component, Decor, DecorKind, Frame, Icon, Key, MouseReport,
 	PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot, Style, Theme, Ui, UiContext, UiEvent,
 	anim::{Easing, Shimmer, Tween},
-	components::{Attachment, Attachments, EditorPane, Segment, Status, TextLeaf},
+	components::{
+		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
+		ContextGaugeMode, EditorPane, Segment, Status, TextLeaf, advisor_spend_label,
+		boundary_layout, collapse_hud_line, compaction_threshold_color, context_gauge_cells,
+		hr::truncate_to_width, spend_label,
+	},
 	next_slot,
 };
 use smallvec::SmallVec;
 
 use crate::{
-	BackendEvent, StatusFacts, SubmitMode,
+	BackendEvent, CompactionSpeculationStatus, StatusFacts, SubmitMode,
 	slots::{Mount, Slots},
 };
 
@@ -31,6 +36,7 @@ const TOOL_IMAGE_MAX_ROWS: u16 = 12;
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1900);
 const BRAND_FADE: Duration = Duration::from_millis(450);
 const FADE_FRAME: Duration = Duration::from_millis(40);
+const SPECULATION_PULSE: Duration = Duration::from_millis(600);
 const STATUS_ID: &str = "status";
 const INPUT_ID: &str = "input";
 
@@ -400,6 +406,10 @@ struct ToolEntry {
 	images: Vec<ToolImageEntry>,
 }
 
+struct CompactionEntry {
+	label: Str,
+}
+
 struct LiveAssistant {
 	id:   Str,
 	text: StrMut,
@@ -415,6 +425,7 @@ enum Entry {
 	User(UserEntry),
 	Assistant(RichText),
 	Tool(ToolEntry),
+	Compaction(CompactionEntry),
 	Notice { text: Str, error: bool },
 }
 
@@ -434,7 +445,7 @@ impl<'a> PreviewEntry<'a> {
 			Entry::Assistant(body) => {
 				Self::Assistant(RichText::new(body.text.as_str(), width.max(1), ctx))
 			},
-			Entry::Tool(_) | Entry::Notice { .. } => Self::Other(entry),
+			Entry::Tool(_) | Entry::Compaction(_) | Entry::Notice { .. } => Self::Other(entry),
 		}
 	}
 
@@ -475,14 +486,24 @@ struct ChatStatus {
 	work:    Rc<RefCell<WorkState>>,
 	charset: Charset,
 	theme:   Theme,
+	style:   ComposerStyle,
 }
 
 impl ChatStatus {
-	fn new(work: Rc<RefCell<WorkState>>, charset: Charset, theme: Theme) -> Self {
+	fn new(
+		work: Rc<RefCell<WorkState>>,
+		charset: Charset,
+		theme: Theme,
+		style: ComposerStyle,
+	) -> Self {
 		let mut props = Props::new();
 		props.set(Prop::Id, STATUS_ID);
 		props.set(Prop::NoSelect, true);
-		Self { props, slot: next_slot(), work, charset, theme }
+		Self { props, slot: next_slot(), work, charset, theme, style }
+	}
+
+	fn set_composer_style(&mut self, style: ComposerStyle) {
+		self.style = style;
 	}
 
 	fn group(&self) -> Status {
@@ -508,15 +529,20 @@ impl ChatStatus {
 	}
 
 	fn left_group(&self, now: Duration) -> Status {
-		let model = self.work.borrow().facts.model.clone();
-		self.group().segment(self.brand_segment(now)).segment(
-			Segment::new()
-				.label(fmts!("{} {model}", self.charset.icon(Icon::Model)))
-				.with(Prop::Fg, self.theme.ok),
-		)
+		let work = self.work.borrow();
+		let facts = &work.facts;
+		let mut model =
+			StrMut::new(fmts!("{} {}", self.charset.icon(Icon::Model), facts.model).as_str());
+		if let Some(advisor) = &facts.advisor_model {
+			let _ = write!(model, " {} {advisor}", self.charset.icon(Icon::Advisor));
+		}
+		self
+			.group()
+			.segment(self.brand_segment(now))
+			.segment(Segment::new().label(model).with(Prop::Fg, self.theme.ok))
 	}
 
-	fn right_group(&self) -> Status {
+	fn right_group(&self, context_gauge: ContextGaugeMode, now: Duration) -> Status {
 		let work = self.work.borrow();
 		let facts = &work.facts;
 		let mut status = self.group().with_str(Prop::Align, "right");
@@ -531,24 +557,53 @@ impl ChatStatus {
 			}
 			status = status.segment(Segment::new().label(label).with(Prop::Fg, self.theme.info));
 		}
-		if facts.context_tokens > 0 || facts.context_window.is_some() {
-			let label = match facts.context_window {
-				Some(window) if window > 0 => fmts!(
-					"{} {:.1}%/{}",
-					self.charset.icon(Icon::Context),
-					facts.context_tokens as f64 * 100.0 / window as f64,
-					compact_count(window)
-				),
-				_ => {
-					fmts!("{} {}", self.charset.icon(Icon::Context), compact_count(facts.context_tokens))
+		if matches!(context_gauge, ContextGaugeMode::Numeric)
+			&& (facts.context_tokens > 0 || facts.context_window.is_some())
+		{
+			let (usage, overflow) = context_usage_label(facts.context_tokens, facts.context_window);
+			let mut label =
+				StrMut::new(fmts!("{} {usage}", self.charset.icon(Icon::Context)).as_str());
+			let color = if overflow {
+				self.theme.err
+			} else {
+				compaction_threshold_color(&self.theme)
+			};
+			let speculation_color = match facts.compaction_speculation {
+				CompactionSpeculationStatus::Idle => None,
+				CompactionSpeculationStatus::Running => {
+					let _ = write!(label, " {}", self.charset.icon(Icon::Auto));
+					let phase = (now.as_millis() / SPECULATION_PULSE.as_millis()) % 2 == 0;
+					Some(if phase {
+						self.theme.accent
+					} else {
+						self.theme.muted
+					})
+				},
+				CompactionSpeculationStatus::Armed => {
+					let _ = write!(label, " {}", self.charset.icon(Icon::Auto));
+					Some(self.theme.accent)
 				},
 			};
-			status = status.segment(Segment::new().label(label).with(Prop::Fg, self.theme.warn));
-		}
-		if facts.cost_nanos > 0 {
 			status = status.segment(
 				Segment::new()
-					.label(fmts!("${:.4}", facts.cost_nanos as f64 / 1_000_000_000.0))
+					.label(label)
+					.with(Prop::Fg, speculation_color.unwrap_or(color)),
+			);
+		}
+		let spend = spend_label(facts.cost_nanos, facts.model_subscription, self.charset);
+		if !spend.is_empty() {
+			status = status.segment(
+				Segment::new()
+					.label(spend)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		let advisor_spend =
+			advisor_spend_label(facts.advisor_cost_nanos, facts.advisor_subscription, self.charset);
+		if !advisor_spend.is_empty() {
+			status = status.segment(
+				Segment::new()
+					.label(advisor_spend)
 					.with(Prop::Fg, self.theme.secondary),
 			);
 		}
@@ -582,6 +637,68 @@ impl ChatStatus {
 		}
 		status
 	}
+
+	fn has_more(&self) -> bool {
+		let facts = &self.work.borrow().facts;
+		facts.git.is_some()
+			|| facts.context_tokens > 0
+			|| facts.cost_nanos > 0
+			|| facts.model_subscription
+			|| facts.advisor_cost_nanos > 0
+			|| facts.advisor_subscription
+	}
+
+	fn paint_left(&self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		let mut left = self.left_group(pc.now);
+		let (_, width) = left.measure(pc.ctx);
+		left.paint(pc, Rect::new(rect.x, rect.y, width.min(rect.width), 1));
+	}
+
+	fn paint_right(&self, pc: &mut PaintCtx<'_>, rect: Rect, gauge: ContextGaugeMode) {
+		let mut right = self.right_group(gauge, pc.now);
+		let (_, width) = right.measure(pc.ctx);
+		let width = width.min(rect.width);
+		let x = rect.x.saturating_add(rect.width.saturating_sub(width));
+		right.paint(pc, Rect::new(x, rect.y, width, 1));
+	}
+
+	fn paint_full(&self, pc: &mut PaintCtx<'_>, rect: Rect, gauge: ContextGaugeMode) {
+		let mut left = self.left_group(pc.now);
+		let mut right = self.right_group(gauge, pc.now);
+		let (_, left_width) = left.measure(pc.ctx);
+		let (_, right_width) = right.measure(pc.ctx);
+		if let Some(layout) = boundary_layout(rect.x, rect.width, left_width, right_width, 2) {
+			left.paint(pc, Rect::new(layout.left_x, rect.y, left_width, 1));
+			if matches!(gauge, ContextGaugeMode::Bar) {
+				let facts = &self.work.borrow().facts;
+				let total = facts.context_window.unwrap_or_default();
+				let used = context_gauge_cells(layout.boundary_width, facts.context_tokens, total);
+				let (_, _, _, _, horizontal, _) = pc.ctx.charset.border(Border::Round);
+				let mut bytes = [0_u8; 4];
+				let glyph = horizontal.encode_utf8(&mut bytes);
+				for offset in 0..layout.boundary_width {
+					let color = if offset < used {
+						compaction_threshold_color(&self.theme)
+					} else {
+						self.theme.border
+					};
+					pc.frame.put(
+						layout.boundary_x.saturating_add(offset),
+						rect.y,
+						glyph,
+						Style::new().fg(color),
+					);
+				}
+			}
+			right.paint(pc, Rect::new(layout.right_x, rect.y, right_width, 1));
+		} else {
+			let mut combined = self.left_group(pc.now);
+			if self.has_more() {
+				combined = combined.segment(Segment::new().label("…").with(Prop::Fg, self.theme.muted));
+			}
+			combined.paint(pc, rect);
+		}
+	}
 }
 
 impl Component for ChatStatus {
@@ -607,40 +724,66 @@ impl Component for ChatStatus {
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
-		let mut left = self.left_group(pc.now);
-		let mut right = self.right_group();
-		let (_, left_width) = left.measure(pc.ctx);
-		let (_, right_width) = right.measure(pc.ctx);
-		if left_width.saturating_add(2).saturating_add(right_width) <= rect.width {
-			left.paint(pc, Rect::new(rect.x, rect.y, left_width, 1));
-			let dock = rect
-				.x
-				.saturating_add(rect.width)
-				.saturating_sub(right_width);
-			right.paint(pc, Rect::new(dock, rect.y, right_width, 1));
-		} else {
-			let mut combined = self.left_group(pc.now);
-			let has_more = {
-				let work = self.work.borrow();
-				work.facts.git.is_some() || work.facts.context_tokens > 0 || work.facts.cost_nanos > 0
-			};
-			if has_more {
-				combined = combined.segment(Segment::new().label("…").with(Prop::Fg, self.theme.muted));
-			}
-			combined.paint(pc, rect);
+		if rect.width == 0 || rect.height == 0 {
+			return;
+		}
+		let layout = self.style.layout(self.charset);
+		match layout.status_attachment {
+			ComposerStatusAttachment::TopBorder => {
+				self.paint_full(
+					pc,
+					Rect::new(rect.x.saturating_add(1), rect.y, rect.width.saturating_sub(2), 1),
+					layout.context_gauge,
+				);
+			},
+			ComposerStatusAttachment::TopRuleChip => {
+				self.paint_right(
+					pc,
+					Rect::new(rect.x, rect.y, rect.width.saturating_sub(1), 1),
+					ContextGaugeMode::Numeric,
+				);
+				self.paint_left(
+					pc,
+					Rect::new(
+						rect.x,
+						rect.y.saturating_add(rect.height.saturating_sub(1)),
+						rect.width,
+						1,
+					),
+				);
+			},
+			ComposerStatusAttachment::Standalone => {
+				self.paint_full(
+					pc,
+					Rect::new(
+						rect.x,
+						rect.y.saturating_add(rect.height.saturating_sub(1)),
+						rect.width,
+						1,
+					),
+					ContextGaugeMode::Numeric,
+				);
+			},
 		}
 		let work = self.work.borrow();
 		let fade_frame = work
 			.fade
 			.settles_at()
 			.min(pc.now.saturating_add(FADE_FRAME));
-		let deadline = match (work.facts.working, work.fade.is_settled(pc.now)) {
+		let animation_deadline = match (work.facts.working, work.fade.is_settled(pc.now)) {
 			(true, true) => Some(pc.ctx.charset.spinner().next_change(pc.now)),
 			(true, false) => Some(pc.ctx.charset.spinner().next_change(pc.now).min(fade_frame)),
 			(false, false) => Some(fade_frame),
 			(false, true) => None,
 		};
-		if let Some(at) = deadline {
+		let speculation_deadline =
+			matches!(work.facts.compaction_speculation, CompactionSpeculationStatus::Running)
+				.then(|| pc.now.saturating_add(SPECULATION_PULSE));
+		if let Some(at) = match (animation_deadline, speculation_deadline) {
+			(Some(animation), Some(speculation)) => Some(animation.min(speculation)),
+			(Some(animation), None) => Some(animation),
+			(None, speculation) => speculation,
+		} {
 			pc.wake(self.slot, at);
 		}
 	}
@@ -683,11 +826,13 @@ impl Chat {
 			facts: StatusFacts::default(),
 			fade:  Tween::settled(ctx.theme.muted),
 		}));
+		let style = ComposerStyle::default();
 		let pane = EditorPane::new()
+			.composer_style(style)
 			.with(Prop::Id, INPUT_ID)
 			.with(Prop::Submit, true)
 			.with(Prop::Placeholder, "Ask anything…")
-			.status(ChatStatus::new(Rc::clone(&work), ctx.charset, ctx.theme));
+			.status(ChatStatus::new(Rc::clone(&work), ctx.charset, ctx.theme, style));
 		let attachments = pane.attachments();
 		let mut editor_ui = Ui::from_root(pane, 0, ctx.clone());
 		editor_ui.focus_first();
@@ -715,6 +860,23 @@ impl Chat {
 			slots: Slots::new(ctx.clone()),
 			attribution: None,
 		}
+	}
+
+	/// Switches the built-in composer chrome and its status attachment.
+	pub fn set_composer_style(&mut self, style: ComposerStyle) {
+		self
+			.editor_ui
+			.update_component::<EditorPane>(INPUT_ID, |pane| {
+				pane.set_composer_style(style);
+				true
+			});
+		self
+			.editor_ui
+			.update_component::<ChatStatus>(STATUS_ID, |status| {
+				status.set_composer_style(style);
+				true
+			});
+		self.refresh_composer();
 	}
 
 	/// Borrows retained extension slots for composition or headless inspection.
@@ -911,10 +1073,11 @@ impl Chat {
 		_name: impl Into<Str>,
 		title: impl Into<Str>,
 	) {
+		let title = hud_line(title.into(), self.ctx.charset);
 		self.live_tools.push(LiveTool {
-			id:     id.into(),
-			title:  title.into(),
-			view:   ToolView::structured(
+			id: id.into(),
+			title,
+			view: ToolView::structured(
 				Str::new_static(""),
 				Self::tool_view_width(self.last_viewport.width),
 				&self.ctx,
@@ -990,6 +1153,44 @@ impl Chat {
 		}
 	}
 
+	/// Appends an in-place compaction divider with method, token delta, and
+	/// optional preview title.
+	pub fn push_compaction(
+		&mut self,
+		summary: Str,
+		title: Option<Str>,
+		method: Option<Str>,
+		tokens_before: u64,
+		tokens_after: Option<u64>,
+	) {
+		let preview = title
+			.as_deref()
+			.filter(|title| !title.trim().is_empty())
+			.or_else(|| summary.lines().find(|line| !line.trim().is_empty()));
+		let method = compaction_method_label(method.as_deref());
+		let mut label =
+			StrMut::new(fmts!("{} {method}", self.ctx.charset.icon(Icon::Camera)).as_str());
+		if let Some(tokens_after) = tokens_after.filter(|_| tokens_before > 0) {
+			let arrow = if self.ctx.charset == Charset::Ascii {
+				"->"
+			} else {
+				"→"
+			};
+			let _ = write!(
+				label,
+				" · {}{arrow}{}",
+				compact_count(tokens_before),
+				compact_count(tokens_after),
+			);
+		}
+		if let Some(preview) = preview {
+			let _ = write!(label, " · {preview}");
+		}
+		self
+			.transcript
+			.push(Entry::Compaction(CompactionEntry { label: label.freeze() }));
+	}
+
 	/// Appends an informational transcript notice.
 	pub fn push_notice(&mut self, text: impl Into<Str>) {
 		self
@@ -1028,8 +1229,37 @@ impl Chat {
 
 	/// Replaces the session title shown in the air row.
 	pub fn set_session_title(&mut self, title: impl Into<Str>) {
-		self.session_title = title.into();
+		self.session_title = hud_line(title.into(), self.ctx.charset);
 		self.bump_live();
+	}
+
+	/// Restores a prompt that the backend dropped before committing its first
+	/// turn, without overwriting a draft started while cancellation settled.
+	pub fn restore_dropped_prompt(&mut self, text: Str, attachments: Vec<Attachment>) {
+		if let Some(index) = self.transcript.iter().rposition(
+			|entry| matches!(entry, Entry::User(user) if user.body.text.as_str() == text.as_str()),
+		) {
+			self.transcript.remove(index);
+			self.drawn_entries = 0;
+			self.transcript_rows = 0;
+			self.height_floor = 0;
+			self.last_viewport = Size::new(0, 0);
+			self.bump_live();
+		}
+		if !self.composer_empty() || !self.attachments.is_empty() {
+			return;
+		}
+		for attachment in attachments {
+			match attachment.content {
+				AttachmentContent::Image { source, .. } => {
+					self.attachments.push_image(source);
+				},
+				AttachmentContent::Text { text, .. } => {
+					self.attachments.push_text(text.as_str());
+				},
+			}
+		}
+		self.set_composer_text(text.as_str());
 	}
 
 	/// Removes committed and live transcript content.
@@ -1050,6 +1280,9 @@ impl Chat {
 	pub fn apply_backend_event(&mut self, event: BackendEvent) -> Option<BackendEvent> {
 		match event {
 			BackendEvent::UserReplayed { text, chips } => self.push_user(text.as_str(), chips),
+			BackendEvent::PromptDropped { text, attachments } => {
+				self.restore_dropped_prompt(text, attachments);
+			},
 			BackendEvent::AssistantBegin { id } => self.begin_assistant(id),
 			BackendEvent::AssistantDelta { id, text } => {
 				self.append_assistant(id.as_str(), text.as_str());
@@ -1060,6 +1293,9 @@ impl Chat {
 			BackendEvent::ToolView { id, view } => self.tool_view(id.as_str(), view),
 			BackendEvent::ToolImage { id, source } => self.tool_image(id.as_str(), source),
 			BackendEvent::ToolFinished { id, ok, view } => self.tool_finished(id.as_str(), ok, view),
+			BackendEvent::Compacted { summary, title, method, tokens_before, tokens_after } => {
+				self.push_compaction(summary, title, method, tokens_before, tokens_after)
+			},
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
@@ -1319,7 +1555,7 @@ impl Chat {
 			Entry::User(user) => user.body.resize(message_width, ctx),
 			Entry::Assistant(body) => body.resize(width.max(1), ctx),
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
-			Entry::Notice { .. } => {},
+			Entry::Compaction(_) | Entry::Notice { .. } => {},
 		}
 	}
 
@@ -1332,6 +1568,9 @@ impl Chat {
 				.saturating_add(1),
 			Entry::Assistant(body) => body.height().saturating_add(1),
 			Entry::Tool(tool) => tool_height(tool, width).saturating_add(1),
+			Entry::Compaction(compaction) => {
+				flowed_height(&compaction.label, width.saturating_sub(2)).saturating_add(1)
+			},
 			Entry::Notice { text, .. } => flowed_height(text, width).saturating_add(1),
 		}
 	}
@@ -1341,6 +1580,12 @@ impl Chat {
 			Entry::User(user) => draw_user(frame, y, user, ctx),
 			Entry::Assistant(body) => draw_rich(frame, y, body, 0, width, ctx.theme).saturating_add(1),
 			Entry::Tool(tool) => draw_tool(frame, y, width, tool, ctx).saturating_add(1),
+			Entry::Compaction(compaction) => draw_flowed(
+				frame,
+				Rect::new(1, y, width.saturating_sub(2), frame.size().height.saturating_sub(y)),
+				&[Span::new(&compaction.label, ink(ctx.theme.info).bold())],
+			)
+			.saturating_add(1),
 			Entry::Notice { text, error } => {
 				let style = if *error {
 					ink(ctx.theme.err)
@@ -1516,15 +1761,20 @@ fn draw_working_impl(
 }
 
 fn draw_session_title_impl(frame: &mut Frame, y: u16, right_inset: u16, title: &str, theme: Theme) {
-	if title.is_empty() {
+	if title.is_empty() || y >= frame.size().height {
 		return;
 	}
 	let width = frame.size().width.saturating_sub(right_inset);
-	let title_width = visible_width(title);
-	if y < frame.size().height && width >= title_width.saturating_add(2) {
-		let x = width.saturating_sub(title_width.saturating_add(1));
-		draw_line(frame, x, y, title_width, &[Span::new(title, ink(theme.border).italic())]);
+	let title = truncate_to_width(title, width.saturating_sub(2));
+	if title.width == 0 {
+		return;
 	}
+	let x = width.saturating_sub(title.width.saturating_add(1));
+	let style = ink(theme.border).italic();
+	draw_line(frame, x, y, title.width, &[
+		Span::new(title.text, style),
+		Span::new(if title.ellipsis { "…" } else { "" }, style),
+	]);
 }
 
 fn draw_user(frame: &mut Frame, y: u16, user: &UserEntry, ctx: &UiContext) -> u16 {
@@ -1725,6 +1975,7 @@ fn flowed_height(text: &str, width: u16) -> u16 {
 		return 0;
 	}
 	let mut rows = 1_u16;
+
 	let mut column = 0_u16;
 	for grapheme in xutf::graphemes_str(text) {
 		if grapheme == "\n" {
@@ -1740,6 +1991,24 @@ fn flowed_height(text: &str, width: u16) -> u16 {
 		column = column.saturating_add(size);
 	}
 	rows
+}
+fn compaction_method_label(method: Option<&str>) -> &'static str {
+	match method {
+		Some("prune") => "pruned",
+		Some("drop_media") => "media-dropped",
+		Some("elide") => "elided",
+		Some("local") => "locally-compacted",
+		Some("remote") => "remote-compacted",
+		Some("handoff") => "handed-off",
+		Some(_) | None => "compacted",
+	}
+}
+
+fn hud_line(text: Str, charset: Charset) -> Str {
+	match collapse_hud_line(&text, charset) {
+		std::borrow::Cow::Borrowed(_) => text,
+		std::borrow::Cow::Owned(collapsed) => Str::from(collapsed),
+	}
 }
 
 fn explicit_line_count(text: &str) -> u16 {
@@ -1765,6 +2034,20 @@ fn compact_count(value: u64) -> Str {
 	} else {
 		fmts!("{value}")
 	}
+}
+fn context_usage_label(tokens: u64, window: Option<u64>) -> (Str, bool) {
+	let Some(window) = window.filter(|window| *window > 0) else {
+		return (compact_count(tokens), false);
+	};
+	let overflow = tokens > window;
+	let percent = tokens as f64 / window as f64 * 100.0;
+	let window = compact_count(window);
+	let label = if percent > 0.0 && percent < 1.0 {
+		fmts!("{percent:.1}%/{window}")
+	} else {
+		fmts!("{percent:.0}%/{window}")
+	};
+	(label, overflow)
 }
 
 fn visible_width(text: &str) -> u16 {
@@ -1793,6 +2076,87 @@ mod tests {
 
 	fn row_text(frame: &Frame, row: u16) -> String {
 		omp_tui::test_support::frame_row_text(frame, row)
+	}
+
+	fn text_color(frame: &Frame, needle: &str) -> Option<Color> {
+		(0..frame.size().height).find_map(|row| {
+			let text = row_text(frame, row);
+			let byte = text.find(needle)?;
+			let column = visible_width(&text[..byte]);
+			Some(frame.cell(column, row).style().foreground_color())
+		})
+	}
+
+	#[test]
+	fn composer_style_switch_updates_editor_and_status_geometry() {
+		let mut chat = Chat::new(&ctx());
+		let _ = chat.render(Size::new(80, 24));
+		let cases = [
+			(ComposerStyle::Box, 6),
+			(ComposerStyle::Claude, 7),
+			(ComposerStyle::Pi, 7),
+			(ComposerStyle::Borderless, 5),
+			(ComposerStyle::Rule, 7),
+			(ComposerStyle::Field, 6),
+			(ComposerStyle::Rail, 6),
+		];
+		for (style, rows) in cases {
+			chat.set_composer_style(style);
+			let pane = chat
+				.editor_ui
+				.root()
+				.comp()
+				.downcast_ref::<EditorPane>()
+				.expect("chat root is editor pane");
+			assert_eq!(pane.style(), style);
+			assert_eq!(chat.composer_rows(), rows, "{style}");
+		}
+	}
+	#[test]
+	fn composer_status_moves_between_embedded_split_and_standalone_rows() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_status(StatusFacts {
+			model: Str::from("model-a"),
+			context_tokens: 50,
+			context_window: Some(100),
+			..StatusFacts::default()
+		});
+		let viewport = Size::new(80, 24);
+		let _ = chat.render(viewport);
+
+		chat.set_composer_style(ComposerStyle::Box);
+		let rows = chat.composer_rows();
+		let embedded = {
+			let rendered = chat.render(viewport);
+			row_text(rendered.frame, viewport.height - rows)
+		};
+		assert!(embedded.contains("omp"));
+		assert!(!embedded.contains('%'), "box uses its boundary as the context gauge");
+
+		chat.set_composer_style(ComposerStyle::Borderless);
+		let rows = chat.composer_rows();
+		let (top, bottom) = {
+			let rendered = chat.render(viewport);
+			(
+				row_text(rendered.frame, viewport.height - rows),
+				row_text(rendered.frame, viewport.height - 1),
+			)
+		};
+		assert!(!top.contains("omp"));
+		assert!(bottom.contains("omp"));
+		assert!(bottom.contains('%'));
+
+		chat.set_composer_style(ComposerStyle::Claude);
+		let rows = chat.composer_rows();
+		let (top, bottom) = {
+			let rendered = chat.render(viewport);
+			(
+				row_text(rendered.frame, viewport.height - rows),
+				row_text(rendered.frame, viewport.height - 1),
+			)
+		};
+		assert!(top.contains('%'), "claude docks the right group onto its top rule");
+		assert!(bottom.contains("omp"), "claude leaves the left group standalone");
 	}
 
 	#[test]
@@ -1828,6 +2192,27 @@ mod tests {
 	}
 
 	#[test]
+	fn hud_titles_collapse_multiline_previews_with_return_glyph() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started(
+			"tool",
+			"task",
+			"Complete assignment thoroughly:\n\n  # Target\nFiles: src/foo.rs",
+		);
+		chat.set_session_title("First line\n\nSecond line");
+		let rendered = chat.render(Size::new(100, 30));
+		let text = (0..rendered.frame.size().height)
+			.map(|row| row_text(rendered.frame, row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(
+			text.contains("Complete assignment thoroughly: ↵ # Target ↵ Files: src/foo.rs"),
+			"{text}",
+		);
+		assert!(text.contains("First line ↵ Second line"), "{text}");
+	}
+
+	#[test]
 	fn resize_preview_does_not_mutate_retained_geometry() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_user("a line that wraps when narrow", vec![]);
@@ -1859,6 +2244,59 @@ mod tests {
 			.join(" ");
 		assert!(status.contains("real/model"));
 		assert!(!status.contains("main"));
+	}
+
+	#[test]
+	fn context_usage_label_preserves_overflow_past_one_hundred_percent() {
+		let (label, overflow) = context_usage_label(240_000, Some(200_000));
+		assert_eq!(label, "120%/200k");
+		assert!(overflow);
+	}
+
+	#[test]
+	fn compaction_preview_renders_method_token_badge_and_title() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_compaction(
+			Str::new_static("full summary body"),
+			Some(Str::new_static("Fixing login TTL")),
+			Some(Str::new_static("remote")),
+			256_000,
+			Some(20_000),
+		);
+		let frame = chat.render(Size::new(100, 24)).frame;
+		let rendered = (0..frame.size().height)
+			.map(|row| row_text(frame, row))
+			.collect::<Vec<_>>()
+			.join(" ");
+		assert!(rendered.contains("remote-compacted"));
+		assert!(rendered.contains("256k→20k"));
+		assert!(rendered.contains("Fixing login TTL"));
+	}
+
+	#[test]
+	fn status_pulses_running_speculation_and_holds_armed_in_accent() {
+		let context = ctx();
+		let mut chat = Chat::new(&context);
+		chat.set_composer_style(ComposerStyle::Claude);
+		chat.set_status(StatusFacts {
+			model: Str::new_static("model"),
+			context_tokens: 42,
+			context_window: Some(1_000),
+			compaction_speculation: CompactionSpeculationStatus::Running,
+			..StatusFacts::default()
+		});
+		let icon = context.charset.icon(Icon::Auto);
+		let frame = chat.render_at(Size::new(100, 24), Duration::ZERO).frame;
+		assert_eq!(text_color(frame, icon), Some(context.theme.accent));
+		let frame = chat.render_at(Size::new(100, 24), SPECULATION_PULSE).frame;
+		assert_eq!(text_color(frame, icon), Some(context.theme.muted));
+
+		chat.set_status(StatusFacts {
+			compaction_speculation: CompactionSpeculationStatus::Armed,
+			..chat.status()
+		});
+		let frame = chat.render_at(Size::new(100, 24), SPECULATION_PULSE).frame;
+		assert_eq!(text_color(frame, icon), Some(context.theme.accent));
 	}
 
 	#[test]
@@ -2031,6 +2469,78 @@ mod tests {
 		assert!(
 			(0..settled.size().height).any(|row| row_text(settled, row).contains("fault branch"))
 		);
+	}
+
+	#[test]
+	fn session_title_truncates_between_boundary_cells() {
+		for (width, expected) in [(7, " alph…"), (3, " …")] {
+			let mut frame = Frame::new(Size::new(width, 1));
+			draw_session_title_impl(&mut frame, 0, 0, "alphabet", Theme::default());
+			assert_eq!(row_text(&frame, 0), expected);
+			assert!(visible_width(&row_text(&frame, 0)) < width);
+		}
+	}
+
+	#[test]
+	fn context_status_uses_the_themed_compaction_threshold_color() {
+		let accent = Color::Rgb(12, 34, 56);
+		let mut context = ctx();
+		context.theme.accent = accent;
+		let mut chat = Chat::new(&context);
+		chat.set_composer_style(ComposerStyle::Claude);
+		chat.set_status(StatusFacts {
+			model: Str::new_static("model"),
+			context_tokens: 42,
+			context_window: Some(1_000),
+			..StatusFacts::default()
+		});
+		let frame = chat.render(Size::new(100, 24)).frame;
+		let (row, column) = (0..frame.size().height)
+			.find_map(|row| {
+				let text = row_text(frame, row);
+				let byte = text.find("4%/1k")?;
+				Some((row, visible_width(&text[..byte])))
+			})
+			.expect("context status visible");
+		assert_eq!(frame.cell(column, row).style().foreground_color(), accent);
+	}
+
+	#[test]
+	fn dropped_prompt_restores_text_and_attachments_without_history_row() {
+		let mut chat = Chat::new(&ctx());
+		chat.attachments.push_text("attached payload");
+		chat.set_composer_text("retry this #1");
+		assert_eq!(chat.handle_key(Key::Enter), ChatKey::Consumed);
+		let (text, attachments, _) = chat.take_submission().expect("submission staged");
+		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
+			text:  Str::from(text.as_str()),
+			chips: vec![Str::new_static("#1 pasted text")],
+		});
+		assert_eq!(chat.transcript.len(), 1);
+
+		let _ = chat.apply_backend_event(BackendEvent::PromptDropped {
+			text: Str::from(text.as_str()),
+			attachments,
+		});
+
+		assert_eq!(chat.composer_text(), text);
+		assert_eq!(chat.attachments.len(), 1);
+		assert!(chat.transcript.is_empty());
+	}
+
+	#[test]
+	fn dropped_prompt_does_not_overwrite_a_new_draft() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_user("old prompt", Vec::new());
+		chat.set_composer_text("new draft");
+
+		let _ = chat.apply_backend_event(BackendEvent::PromptDropped {
+			text:        Str::new_static("old prompt"),
+			attachments: Vec::new(),
+		});
+
+		assert_eq!(chat.composer_text(), "new draft");
+		assert!(chat.transcript.is_empty());
 	}
 
 	#[test]

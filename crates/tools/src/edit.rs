@@ -2,6 +2,7 @@
 //! transaction.
 
 pub mod projection;
+pub mod replace;
 
 use std::{fmt::Write as _, future::Future};
 
@@ -17,15 +18,130 @@ use omp_hashline::{
 	recovery::{ByteRange, RecoveryEdit, recover_exact},
 };
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, ArgPath, CommitError, Constraint, DocEffects, Effects, Ev,
-	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
-	ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, ArgPath, CallOutcome, CommitError, Constraint, Dialect,
+	DocEffects, Effects, Ev, IncomingParams, InterruptWaitError, LiftedCall, ParamError, Part,
+	PromptCaps, RecordedCall, Rev, Tool, ToolSpec, ToolTerminal,
 };
+pub use replace::{ReplaceParams, ReplaceTool, replace_tool};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::render::TextProjection;
 
+/// One registered edit argument dialect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditDialectRegistration {
+	/// Revision family.
+	pub family:   &'static str,
+	/// Revision number within `family`.
+	pub revision: u16,
+	/// Capability dialect advertised to a model.
+	pub dialect:  Dialect,
+}
+
+/// Every built-in edit revision which may be selected or lifted.
+pub const EDIT_DIALECTS: &[EditDialectRegistration] = &[
+	EditDialectRegistration { family: "rep", revision: 1, dialect: Dialect::Replace },
+	EditDialectRegistration { family: "hl", revision: 1, dialect: Dialect::Hashline },
+];
+
+/// Provenance of an edit revision decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditRevisionSource {
+	/// An embedder fixed the tool dialect for its protocol bridge.
+	EmbedderPin,
+	/// The model catalog selected a known-compatible dialect.
+	ModelRule,
+	/// The process-level `OMP_EDIT_DIALECT` selection won.
+	Environment,
+	/// The layered `edit.revision` setting won.
+	Setting,
+	/// The built-in hashline dialect won.
+	Default,
+}
+
+/// Inputs for the data-only edit dialect cascade.
+///
+/// Model classification stays outside this module: callers resolve their
+/// catalog rule to a registered `family.rev`, then this cascade validates and
+/// records its precedence without coupling edit behavior to model names.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EditRevisionCandidates<'a> {
+	/// Catalog-selected revision such as `rep.1`.
+	pub model_rule:  Option<&'a Rev>,
+	/// Optional `OMP_EDIT_DIALECT` value.
+	pub environment: Option<&'a str>,
+	/// Optional layered `edit.revision` value.
+	pub setting:     Option<&'a str>,
+	/// Embedder-fixed revision, which cannot be overridden.
+	pub pin:         Option<&'a Rev>,
+	/// Reject an unrecognized configured revision instead of falling through.
+	pub strict:      bool,
+}
+
+/// One validated result from [`resolve_edit_revision`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedEditRevision {
+	/// Selected registered revision.
+	pub revision: Rev,
+	/// Winning source in the cascade.
+	pub source:   EditRevisionSource,
+}
+
+/// Resolves edit mode as a registered revision, never as a mutable mode flag.
+///
+/// The caller may then derive [`PromptCaps::dialect`] with
+/// `PromptCaps::for_tool`; [`revision_matches_caps`] validates that no
+/// projection was paired with an incompatible dialect.
+pub fn resolve_edit_revision(
+	candidates: EditRevisionCandidates<'_>,
+) -> Result<ResolvedEditRevision, Str> {
+	if let Some(pin) = candidates.pin {
+		return registered_revision(pin, EditRevisionSource::EmbedderPin);
+	}
+	if let Some(rule) = candidates.model_rule {
+		return registered_revision(rule, EditRevisionSource::ModelRule);
+	}
+	for (value, source) in [
+		(candidates.environment, EditRevisionSource::Environment),
+		(candidates.setting, EditRevisionSource::Setting),
+	] {
+		let Some(value) = value else { continue };
+		match value.parse::<Rev>() {
+			Ok(revision) if is_registered_edit_revision(&revision) => {
+				return Ok(ResolvedEditRevision { revision, source });
+			},
+			_ if candidates.strict => {
+				return Err(format!("unknown edit revision {value:?}; use rep.1 or hl.1").into());
+			},
+			_ => {},
+		}
+	}
+	registered_revision(&Rev { family: "hl".into(), n: 1 }, EditRevisionSource::Default)
+}
+
+/// Checks that projection capabilities came from the selected dialect family.
+#[must_use]
+pub fn revision_matches_caps(revision: &Rev, caps: &PromptCaps) -> bool {
+	is_registered_edit_revision(revision) && Dialect::for_rev(revision) == caps.dialect
+}
+
+fn registered_revision(
+	revision: &Rev,
+	source: EditRevisionSource,
+) -> Result<ResolvedEditRevision, Str> {
+	if is_registered_edit_revision(revision) {
+		Ok(ResolvedEditRevision { revision: revision.clone(), source })
+	} else {
+		Err(format!("unregistered edit revision {revision}").into())
+	}
+}
+
+fn is_registered_edit_revision(revision: &Rev) -> bool {
+	EDIT_DIALECTS
+		.iter()
+		.any(|entry| entry.family == revision.family.as_str() && entry.revision == revision.n)
+}
 const DESCRIPTION: &str = include_str!("edit_prompt.txt");
 
 /// Streaming arguments for `edit@hl.1`.
@@ -90,6 +206,21 @@ pub struct ResolvedBlock {
 	pub operation:   Str,
 }
 
+/// One resolved replacement retained independently of its authored dialect.
+///
+/// Byte-oriented engines retain these concrete line ranges and bodies so a
+/// historical call can be re-expressed in another edit dialect without
+/// guessing from model-authored search text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolvedEdit {
+	/// Inclusive one-indexed source line.
+	pub start: usize,
+	/// Inclusive one-indexed source line.
+	pub end:   usize,
+	/// Replacement body without dialect sigils.
+	pub body:  Vec<Str>,
+}
+
 /// Durable successful truth for one file section.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SectionPayload {
@@ -107,6 +238,9 @@ pub struct SectionPayload {
 	pub new_revision:       Option<Str>,
 	/// Sequence of applied operations.
 	pub applied_ops:        Vec<AppliedOp>,
+	/// Concrete edits sufficient to lift this outcome into another dialect.
+	#[serde(default)]
+	pub resolved_edits:     Vec<ResolvedEdit>,
 	/// Whether the document host rebased the committed transition.
 	pub rebased:            bool,
 	/// Exact pre-edit bytes.
@@ -154,11 +288,14 @@ pub enum StalePolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrepareRequest {
 	/// Authored path from the section header.
-	pub path:         Str,
-	/// Four-hex snapshot tag from the section header.
-	pub file_hash:    Option<Str>,
+	pub path:           Str,
+	/// Optional four-hex snapshot tag from the section header.
+	pub file_hash:      Option<Str>,
 	/// Concrete one-indexed anchors used for stale mismatch context.
-	pub anchor_lines: Vec<usize>,
+	pub anchor_lines:   Vec<usize>,
+	/// Whether this dialect may operate against the current document without a
+	/// displayed snapshot tag.
+	pub allow_unpinned: bool,
 }
 
 /// Borrowed view exposed by an opaque, revision-pinned prepared lease.
@@ -436,7 +573,10 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
 				};
 				let request = PrepareRequest {
-					path: section.path.clone(), file_hash: section.file_hash.clone(), anchor_lines: anchors,
+					path: section.path.clone(),
+					file_hash: section.file_hash.clone(),
+					anchor_lines: anchors,
+					allow_unpinned: false,
 				};
 				let prepared = match self.documents.prepare(request).await {
 					Ok(prepared) => prepared,
@@ -649,6 +789,52 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 		}
 		out.finish()
 	}
+
+	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+		lift_replace_to_hashline(from, call)
+	}
+}
+
+fn lift_replace_to_hashline(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+	if from.family.as_str() != "rep" || from.n != 1 {
+		return None;
+	}
+	// Decode the historical arguments to prove the source dialect. Anchors
+	// come from the dialect-neutral resolved outcome, never from old search
+	// strings, which may have matched fuzzily.
+	serde_json::from_slice::<ReplaceParams>(call.raw_args).ok()?;
+	let outcome = serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
+	let input = match outcome {
+		CallOutcome::Ok(payload) => payload
+			.sections
+			.iter()
+			.filter(|section| !section.resolved_edits.is_empty())
+			.map(|section| {
+				let mut section_input = format!(
+					"{}\n",
+					format_hashline_header(&section.path, &compute_snapshot_tag(&section.before))
+				);
+				for edit in &section.resolved_edits {
+					if edit.body.is_empty() {
+						let _ = writeln!(section_input, "CUT {}.={}", edit.start, edit.end);
+					} else {
+						let _ = writeln!(section_input, "PUT {}.={}:", edit.start, edit.end);
+						for line in &edit.body {
+							let _ = writeln!(section_input, "+{line}");
+						}
+					}
+				}
+				section_input
+			})
+			.collect::<String>(),
+		CallOutcome::Faulted(_) | CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => {
+			String::new()
+		},
+	};
+	Some(LiftedCall {
+		raw_args: Bytes::from(serde_json::to_vec(&Params { input: input.into() }).ok()?),
+		verdict:  Bytes::copy_from_slice(call.verdict),
+	})
 }
 
 struct PreparedWork<P> {
@@ -759,6 +945,7 @@ fn build_payload<P: EditPrepared>(
 				old_revision: work.prepared.base_revision().clone(),
 				new_revision: committed_section.and_then(|section| section.new_revision.clone()),
 				applied_ops: projection.applied_ops.clone(),
+				resolved_edits: Vec::new(),
 				rebased: committed_section.is_some_and(|section| section.rebased),
 				before: work.prepared.base_bytes().clone(),
 				after,
@@ -826,5 +1013,233 @@ fn rejection_text(fault: &Fault) -> Str {
 		RejectionReason::StaleUnrecoverable { message }
 		| RejectionReason::Format { message }
 		| RejectionReason::InvalidPatch { message } => message.clone(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn revision_cascade_is_registered_and_caps_derived() {
+		let model = Rev { family: "rep".into(), n: 1 };
+		let pinned = Rev { family: "hl".into(), n: 1 };
+		let resolved = resolve_edit_revision(EditRevisionCandidates {
+			model_rule:  Some(&model),
+			environment: Some("hl.1"),
+			setting:     Some("rep.1"),
+			pin:         Some(&pinned),
+			strict:      true,
+		})
+		.expect("registered pinned revision");
+		assert_eq!(resolved.revision, pinned);
+		assert_eq!(resolved.source, EditRevisionSource::EmbedderPin);
+		assert_eq!(
+			resolve_edit_revision(EditRevisionCandidates {
+				model_rule: Some(&model),
+				environment: Some("hl.1"),
+				setting: Some("hl.1"),
+				..EditRevisionCandidates::default()
+			})
+			.expect("model rule"),
+			ResolvedEditRevision { revision: model.clone(), source: EditRevisionSource::ModelRule }
+		);
+		assert_eq!(
+			resolve_edit_revision(EditRevisionCandidates {
+				environment: Some("rep.1"),
+				setting: Some("hl.1"),
+				..EditRevisionCandidates::default()
+			})
+			.expect("environment revision")
+			.source,
+			EditRevisionSource::Environment
+		);
+		assert_eq!(
+			resolve_edit_revision(EditRevisionCandidates {
+				setting: Some("rep.1"),
+				..EditRevisionCandidates::default()
+			})
+			.expect("setting revision")
+			.source,
+			EditRevisionSource::Setting
+		);
+		let caps = PromptCaps::for_tool(
+			omp_tool::CapsBase {
+				maximum_parts:      1,
+				maximum_text_bytes: 1024,
+				media:              false,
+				model_class:        omp_tool::ModelClass::Standard,
+			},
+			&resolved.revision,
+		);
+		assert!(revision_matches_caps(&resolved.revision, &caps));
+		assert_eq!(
+			resolve_edit_revision(EditRevisionCandidates {
+				environment: Some("unknown.7"),
+				strict: true,
+				..EditRevisionCandidates::default()
+			}),
+			Err("unknown edit revision \"unknown.7\"; use rep.1 or hl.1".into())
+		);
+	}
+
+	#[test]
+	fn replace_outcome_lifts_to_hashline_from_resolved_edits() {
+		let before = Bytes::from_static(b"one\ntwo\n");
+		let payload = Payload {
+			sections: vec![SectionPayload {
+				path:               "a.txt".into(),
+				canonical_path:     "a.txt".into(),
+				op:                 SectionOp::Update,
+				move_dest:          None,
+				old_revision:       "r1".into(),
+				new_revision:       Some("r2".into()),
+				applied_ops:        vec![AppliedOp {
+					kind:       "replace".into(),
+					patch_line: 2,
+					index:      0,
+				}],
+				resolved_edits:     vec![ResolvedEdit {
+					start: 2,
+					end:   2,
+					body:  vec!["TWO".into()],
+				}],
+				rebased:            false,
+				before:             before.clone(),
+				after:              Bytes::from_static(b"one\nTWO\n"),
+				header:             Some(format_hashline_header(
+					"a.txt",
+					&compute_snapshot_tag(b"one\nTWO\n"),
+				)),
+				diff:               Str::default(),
+				preview:            Str::default(),
+				first_changed_line: Some(2),
+				block_resolutions:  Vec::new(),
+				warnings:           Vec::new(),
+			}],
+		};
+		let args = ReplaceParams {
+			edits: vec![replace::ReplaceOperation {
+				path:        "a.txt".into(),
+				old:         "two".into(),
+				new:         "TWO".into(),
+				replace_all: false,
+				allow_fuzzy: true,
+				threshold:   None,
+			}],
+		};
+		let verdict = serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(payload))
+			.expect("serializable dialect-neutral outcome");
+		let lifted = lift_replace_to_hashline(&Rev { family: "rep".into(), n: 1 }, RecordedCall {
+			raw_args: &serde_json::to_vec(&args).expect("serializable replacement args"),
+			verdict:  &verdict,
+		})
+		.expect("registered replacement revision lifts to hashline");
+		let lifted_args: Params =
+			serde_json::from_slice(&lifted.raw_args).expect("hashline lift arguments");
+		assert_eq!(
+			lifted_args.input,
+			format!("[a.txt#{}]\nPUT 2.=2:\n+TWO\n", compute_snapshot_tag(&before))
+		);
+		assert_eq!(lifted.verdict.as_ref(), verdict.as_slice());
+	}
+
+	struct NoDocuments;
+	struct NoPrepared;
+
+	impl EditPrepared for NoPrepared {
+		fn path(&self) -> &Str {
+			panic!("registry lift never prepares documents")
+		}
+
+		fn base_revision(&self) -> &Str {
+			panic!("registry lift never prepares documents")
+		}
+
+		fn base_bytes(&self) -> &Bytes {
+			panic!("registry lift never prepares documents")
+		}
+
+		fn authored_bytes(&self) -> &Bytes {
+			panic!("registry lift never prepares documents")
+		}
+	}
+
+	impl EditDocuments for NoDocuments {
+		type Prepared = NoPrepared;
+
+		fn prepare(
+			&self,
+			_request: PrepareRequest,
+		) -> impl Future<Output = Result<Self::Prepared, Fault>> + Send + '_ {
+			std::future::ready(Err(Fault::invalid("not invoked by registry lift test")))
+		}
+
+		fn start_clipboard_batch(&self) -> Clipboard {
+			Clipboard::default()
+		}
+
+		fn record_noop(
+			&self,
+			_canonical_path: &str,
+			_display_path: &str,
+			_input: Bytes,
+		) -> NoopResult {
+			NoopResult { diagnostic: "not invoked".into(), escalate: false }
+		}
+
+		fn reset_noop(&self, _canonical_path: &str) {}
+
+		fn commit<'a>(
+			&'a self,
+			_prepared: Vec<&'a mut Self::Prepared>,
+			_proposals: Vec<EditProposal>,
+			_clipboard: Clipboard,
+		) -> impl Future<Output = Result<CommitResult, EditCommitError>> + Send + 'a {
+			std::future::ready(Err(EditCommitError::EffectsUnknown {
+				reason: "not invoked by registry lift test".into(),
+			}))
+		}
+	}
+
+	#[test]
+	fn registry_lifts_registered_replace_history_into_live_hashline() {
+		use omp_tool::{
+			Claims, Precedence, Presentation, ProjectedCall, RecordedCallOwned, Registry, ToolIdentity,
+		};
+
+		let claims =
+			Claims { precedence: Precedence::CORE, claimant: "omp/core".into(), replaces: None };
+		let mut registry = Registry::new();
+		registry
+			.register(
+				replace_tool(NoDocuments, FormatPolicy::Configured),
+				Presentation::Slot,
+				claims.clone(),
+			)
+			.expect("register replacement lift source");
+		registry
+			.register(tool(NoDocuments, FormatPolicy::Configured), Presentation::Slot, claims)
+			.expect("register live hashline destination");
+		let source_args = serde_json::to_vec(&ReplaceParams { edits: Vec::new() })
+			.expect("serialize replacement source args");
+		let source_verdict =
+			serde_json::to_vec(&CallOutcome::<Payload, Fault>::Faulted(Fault::invalid("no match")))
+				.expect("serialize dialect-neutral outcome");
+		let ProjectedCall::Live(lifted) = registry.project(RecordedCallOwned {
+			identity: ToolIdentity { name: "edit".into(), rev: Rev { family: "rep".into(), n: 1 } },
+			raw_args: Bytes::from(source_args),
+			verdict:  Bytes::from(source_verdict.clone()),
+		}) else {
+			panic!("registered rep.1 must lift through live hl.1");
+		};
+		assert_eq!(lifted.identity.rev, Rev { family: "hl".into(), n: 1 });
+		assert_eq!(lifted.verdict.as_ref(), source_verdict.as_slice());
+		assert_eq!(
+			serde_json::from_slice::<Params>(&lifted.raw_args)
+				.expect("hashline dialect arguments after registry lift")
+				.input,
+			""
+		);
 	}
 }

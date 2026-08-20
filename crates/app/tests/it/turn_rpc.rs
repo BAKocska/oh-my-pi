@@ -1,7 +1,5 @@
 //! Integration coverage for daemon-backed RPC turn sessions.
 
-#![cfg(unix)]
-
 use std::{
 	collections::BTreeMap,
 	sync::Arc,
@@ -133,7 +131,7 @@ fn scripted_registry(
 	database: &std::path::Path,
 ) -> (Registry, ConversationSessionPlanner, FakeProvider, String) {
 	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../llm-catalog/data/catalog.normalized.json"))
+		serde_json::from_str(include_str!("../../../llm-catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog");
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {

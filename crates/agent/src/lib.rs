@@ -46,11 +46,14 @@ pub use broker::{
 	peer_item,
 };
 pub use compact::{
-	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionEvent, CompactionHysteresis,
-	CompactionReason, CompactionResolution, CompactionTier, CompactionVerdict, ContextUsage,
-	CustomSummary, DelegateCompaction, ItemUsage, LosslessPlan, ProjectionItem, RemoteCheckpoint,
-	SNAPCOMPACT_RESERVED_TIER, SupersededCompaction, back_project_provider_usage, dispatch_tier,
-	encode_domain_verdict, plan_lossless, resolve_verdicts,
+	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionCoordinator, CompactionDecision,
+	CompactionEvent, CompactionHysteresis, CompactionMethodOrder, CompactionReason,
+	CompactionResolution, CompactionSpeculationOptions, CompactionTier, CompactionVerdict,
+	ContextUsage, CustomSummary, DelegateCompaction, ItemUsage, LosslessPlan, ProjectionItem,
+	RemoteCheckpoint, SNAPCOMPACT_RESERVED_TIER, SPECULATION_LEAD_FRACTION,
+	SPECULATION_LEAD_MAX_TOKENS, SPECULATION_LEAD_MIN_TOKENS, SpeculationRequest, SpeculationResult,
+	SpeculationSnapshot, SpeculationState, SupersededCompaction, back_project_provider_usage,
+	dispatch_tier, encode_domain_verdict, plan_lossless, resolve_verdicts, speculation_lead_tokens,
 };
 pub use context::{
 	Anchor, ContextProjection, ContextView, InheritPosition, MessageKind, MessageRef, PatchOp,
@@ -111,7 +114,8 @@ pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError};
 pub use tree::{
 	AgentKind, AgentNode, AgentStatus, AgentTree, Budget, BudgetCeiling, BudgetExceeded,
 	BudgetRemainder, DEFAULT_MAX_ADMISSION_QUEUE, DEFAULT_MAX_CONCURRENCY, EffectsOperation,
-	SpawnPermit, SpawnRefusal, Usage, enforce_minimum_phase,
+	SpawnPermit, SpawnRefusal, Usage, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	enforce_minimum_phase,
 };
 pub use turn::{
 	Error, InvokeFrame, Recovery, TurnClient, TurnInput, TurnOptions, TurnSession, empty_stop,

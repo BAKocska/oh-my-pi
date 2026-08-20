@@ -2,8 +2,15 @@
 
 use std::process::ExitCode;
 
+fn install_panic_hook() {
+	std::panic::set_hook(Box::new(|info| {
+		eprintln!("\x1b[31momp internal error:\x1b[0m {info}");
+	}));
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+	install_panic_hook();
 	if std::env::args_os()
 		.nth(1)
 		.is_some_and(|arg| arg == omp_app::envd::EVAL_CHILD_ARG)
@@ -46,10 +53,17 @@ async fn main() -> ExitCode {
 	match result {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) => {
-			// Errors that reach this point are top-level execution failures;
-			// formatted via miette's diagnostic handler.
+			// Usage diagnostics are intentionally stack-free and follow the
+			// conventional exit status 2; other execution failures remain 1.
 			eprintln!("{error:?}");
-			ExitCode::FAILURE
+			if error
+				.downcast_ref::<omp_app::usage_error::CliUsageError>()
+				.is_some()
+			{
+				ExitCode::from(2)
+			} else {
+				ExitCode::FAILURE
+			}
 		},
 	}
 }

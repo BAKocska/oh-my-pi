@@ -1463,7 +1463,9 @@ mod follow {
 						self.header_printer.print(display_name.as_str(), writer);
 					}
 
-					chunks.print(writer).map_err(crate::tail::map_output_error)?;
+					chunks
+						.print(writer)
+						.map_err(crate::tail::map_output_error)?;
 					writer.flush().map_err(crate::tail::map_output_error)?;
 
 					self.last.replace(path.to_owned());
@@ -1542,13 +1544,12 @@ mod follow {
 
 		use notify::{RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 		use omp_shell_engine::openfiles::OpenFile;
-		use crate::host::StreamWriter;
 		use uucore::display::Quotable;
 		#[cfg(target_os = "linux")]
 		use uucore::signals::ensure_stdout_not_broken;
 
 		use crate::{
-			host::Host,
+			host::{Host, StreamWriter},
 			tail::{
 				TailError, TailResult,
 				args::{FollowMode, Settings},
@@ -2926,8 +2927,7 @@ fn rewrite_tail_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 			continue;
 		}
 		let bytes = token.as_bytes();
-		let candidate =
-			bytes.first() == Some(&b'+') || matches!(bytes, [b'-', b'0'..=b'9', ..]);
+		let candidate = bytes.first() == Some(&b'+') || matches!(bytes, [b'-', b'0'..=b'9', ..]);
 		if candidate {
 			match parse::parse_obsolete(&arg) {
 				Some(Ok(obsolete)) => {
@@ -2962,7 +2962,11 @@ fn rewrite_tail_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 	if follow {
 		rewritten.insert(
 			1,
-			OsString::from(if has_operand { "--follow=name" } else { "--follow=descriptor" }),
+			OsString::from(if has_operand {
+				"--follow=name"
+			} else {
+				"--follow=descriptor"
+			}),
 		);
 	}
 	Ok(rewritten)
@@ -3698,10 +3702,7 @@ mod tests {
 		assert_eq!(rewritten(&["tail", "-5", "-q", "f"]), ["tail", "-n", "5", "-q", "f"]);
 		assert_eq!(rewritten(&["tail", "+10", "f"]), ["tail", "-n", "+10", "f"]);
 		assert_eq!(rewritten(&["tail", "-5c", "f"]), ["tail", "-c", "5", "f"]);
-		assert_eq!(
-			rewritten(&["tail", "-20f", "f"]),
-			["tail", "--follow=name", "-n", "20", "f"]
-		);
+		assert_eq!(rewritten(&["tail", "-20f", "f"]), ["tail", "--follow=name", "-n", "20", "f"]);
 		assert_eq!(rewritten(&["tail", "-20f"]), ["tail", "--follow=descriptor", "-n", "20"]);
 	}
 

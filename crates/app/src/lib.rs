@@ -5,8 +5,6 @@
 //! runtime transport path.
 //! Production application composition and command dispatch.
 
-use clap::Parser as _;
-
 pub mod auth_backend;
 pub mod auth_rpc;
 pub mod blob_rpc;
@@ -14,6 +12,7 @@ pub mod build_id;
 pub mod chat;
 mod chat_ui;
 pub mod cli;
+pub mod config_cmd;
 pub mod daemon;
 pub mod discovery;
 pub mod endpoint;
@@ -21,10 +20,14 @@ pub mod envd;
 pub mod ext;
 pub mod ext_cli;
 pub mod exthost;
+pub mod models_cmd;
+pub mod print_mode;
 pub mod project_state;
 pub mod rpc_adapter;
 pub mod settings;
 pub mod spec;
+pub mod startup_notice;
+pub mod usage_error;
 pub mod wizard;
 
 pub use miette::{IntoDiagnostic, Report, Result};
@@ -35,5 +38,9 @@ pub use miette::{IntoDiagnostic, Report, Result};
 	reason = "the chat command runs a thread-confined terminal UI future"
 )]
 pub async fn run() -> Result<()> {
-	cli::dispatch(cli::OmpCli::parse()).await
+	let cli = match cli::parse_from_os(std::env::args_os()) {
+		Ok(cli) => cli,
+		Err(error) => error.exit(),
+	};
+	cli::dispatch(cli).await
 }

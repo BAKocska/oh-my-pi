@@ -1,18 +1,23 @@
 use std::{
+	collections::BTreeMap,
 	future::{self, Future},
+	path::Path,
 	time::Duration,
 };
 
 use omp_core::{CowBytes, Str, encoding::hex, fmts};
 use omp_proto::env::v1::{
-	ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
-	OutputChannel as EnvOutputChannel, ProcessSpec, RestartPolicy, RestartSpec, Script,
+	EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
+	OutputChannel as EnvOutputChannel, ProcessSpec, PtySpec, RestartPolicy, RestartSpec, Script,
 	StartProcess,
 };
 use omp_tool::{BlobRef, JobOwner};
-use omp_tools::shell::{
-	DetachRequest, DetachedJob, ExecOutcome, ExecStatus, Fault, OutputChannel, RunEvent, RunRequest,
-	Session, ShellExec, ShellRun, Update,
+use omp_tools::{
+	auto_background::DetachedJob,
+	shell::{
+		DetachRequest, ExecOutcome, ExecStatus, Fault, OutputChannel, RunEvent, RunRequest, Session,
+		SessionOptions, ShellExec, ShellRun, Update,
+	},
 };
 
 use super::exec::{ExecError, ExecEvent, ExecHost, ExecRun};
@@ -31,10 +36,120 @@ impl ShellExecHost {
 		Self { host, cwd_uri }
 	}
 }
+impl ShellExecHost {
+	fn resolve_cwd(&self, requested: Option<&str>) -> Result<Str, Fault> {
+		let root = url::Url::parse(&self.cwd_uri)
+			.map_err(|error| cwd_fault(format!("workspace root URI is invalid: {error}")))?;
+		let root_path = root
+			.to_file_path()
+			.map_err(|()| cwd_fault("workspace root is not a local file URI"))?;
+		let path = match requested {
+			None => root_path,
+			Some(value) if value.contains("://") => url::Url::parse(value)
+				.map_err(|error| cwd_fault(format!("working-directory URI is invalid: {error}")))?
+				.to_file_path()
+				.map_err(|()| cwd_fault("working-directory URI is not a local file URI"))?,
+			Some(value) => {
+				let path = Path::new(value);
+				if path.is_absolute() {
+					path.into()
+				} else {
+					root_path.join(path)
+				}
+			},
+		};
+		if !path.is_dir() {
+			return Err(cwd_fault(format!(
+				"working directory is not an existing directory: {}",
+				path.display()
+			)));
+		}
+		let uri = url::Url::from_file_path(path)
+			.map_err(|()| cwd_fault("working directory cannot be represented as a file URI"))?;
+		Ok(Str::from(uri.to_string()))
+	}
+}
 
+fn hardened_environment(user: std::collections::BTreeMap<Str, Str>, pty: bool) -> EnvironmentDelta {
+	let mut set: BTreeMap<String, String> = [
+		("PAGER", "cat"),
+		("GIT_PAGER", "cat"),
+		("MANPAGER", "cat"),
+		("SYSTEMD_PAGER", "cat"),
+		("BAT_PAGER", "cat"),
+		("DELTA_PAGER", "cat"),
+		("GH_PAGER", "cat"),
+		("GLAB_PAGER", "cat"),
+		("AWS_PAGER", ""),
+		("PSQL_PAGER", "cat"),
+		("MYSQL_PAGER", "cat"),
+		("HOMEBREW_PAGER", "cat"),
+		("LESS", "FRX"),
+		("NO_COLOR", "1"),
+		("PYTHONUNBUFFERED", "1"),
+		("GIT_EDITOR", "true"),
+		("VISUAL", "true"),
+		("EDITOR", "true"),
+		("GIT_TERMINAL_PROMPT", "0"),
+		("SSH_ASKPASS", "false"),
+		("CI", "true"),
+		("AGENT", "1"),
+		("npm_config_yes", "true"),
+		("npm_config_update_notifier", "false"),
+		("npm_config_fund", "false"),
+		("npm_config_audit", "false"),
+		("PNPM_DISABLE_SELF_UPDATE_CHECK", "true"),
+		("YARN_ENABLE_TELEMETRY", "0"),
+		("PNPM_UPDATE_NOTIFIER", "false"),
+		("YARN_ENABLE_PROGRESS_BARS", "0"),
+		("CARGO_TERM_PROGRESS_WHEN", "never"),
+		("PIP_NO_INPUT", "1"),
+		("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+		("GH_PROMPT_DISABLED", "1"),
+		("DEBIAN_FRONTEND", "noninteractive"),
+		("TF_INPUT", "0"),
+		("TF_IN_AUTOMATION", "1"),
+		("COMPOSER_NO_INTERACTION", "1"),
+		("CLOUDSDK_CORE_DISABLE_PROMPTS", "1"),
+	]
+	.into_iter()
+	.map(|(key, value)| (String::from(key), String::from(value)))
+	.collect();
+	if !pty {
+		set.insert(String::from("TERM"), String::from("dumb"));
+	}
+	if std::env::var_os("OMP_BASH_NO_CI").is_some_and(|value| {
+		let value = value.to_string_lossy();
+		!value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+	}) {
+		set.remove("CI");
+	}
+	set.extend(
+		user
+			.into_iter()
+			.map(|(key, value)| (key.to_string(), value.to_string())),
+	);
+	EnvironmentDelta { set, ..Default::default() }
+}
+
+fn named_process(started: omp_proto::env::v1::ProcessStarted) -> DetachedJob {
+	let id = fmts!("{}#{}", started.name, started.generation);
+	DetachedJob {
+		id,
+		owner: JobOwner::NamedProcess {
+			name:       Str::from(started.name),
+			generation: started.generation,
+		},
+	}
+}
+
+fn cwd_fault(message: impl Into<Str>) -> Fault {
+	Fault::Resource { operation: Str::new_static("cwd"), message: message.into() }
+}
 /// Foreground shell run retaining the concrete host's process-tree guard.
 pub struct HostShellRun {
-	run: ExecRun,
+	host: ExecHost,
+	run:  ExecRun,
 }
 
 impl ShellRun for HostShellRun {
@@ -49,22 +164,50 @@ impl ShellRun for HostShellRun {
 		self.run.cancel();
 		future::ready(Ok(()))
 	}
+
+	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
+		future::ready(
+			self
+				.host
+				.detach_exec(self.run.id(), &name)
+				.map(named_process)
+				.map_err(|error| resource_fault("detach_running", error)),
+		)
+	}
 }
 
 impl ShellExec for ShellExecHost {
 	type Run = HostShellRun;
 
-	async fn open_session(&self) -> Result<Session, Fault> {
+	async fn open_session(&self, options: SessionOptions) -> Result<Session, Fault> {
+		let cwd_uri = self.resolve_cwd(options.cwd.as_deref())?;
+		let pty = options.pty;
+		let environment = hardened_environment(options.env, pty);
 		let opened = self
 			.host
 			.open_session(OpenSessionRequest {
-				cwd_uri: self.cwd_uri.to_string(),
-				pty: None,
+				cwd_uri: cwd_uri.to_string(),
+				env_delta: Some(environment),
+				pty: pty
+					.then(|| PtySpec { terminal: String::from("xterm-256color"), ..Default::default() }),
 				..Default::default()
 			})
 			.await
 			.map_err(|error| resource_fault("open_session", error))?;
 		Ok(Session { id: opened.session })
+	}
+
+	fn close_session(
+		&self,
+		session: &Session,
+	) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
+		future::ready(
+			self
+				.host
+				.close_session(&session.id)
+				.map(|_| ())
+				.map_err(|error| resource_fault("close_session", error)),
+		)
 	}
 
 	async fn run<'a>(
@@ -84,17 +227,25 @@ impl ShellExec for ShellExecHost {
 			)
 			.await
 			.map_err(|error| resource_fault("run", error))?;
-		Ok(HostShellRun { run })
+		Ok(HostShellRun { host: self.host.clone(), run })
 	}
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
+		let cwd_uri = self.resolve_cwd(request.options.cwd.as_deref())?;
+		let pty = request.options.pty;
+		let environment = hardened_environment(request.options.env, pty);
 		let started = self
 			.host
 			.start_process(StartProcess {
 				name: request.name.to_string(),
 				spec: Some(ProcessSpec {
 					source: Some(Script { text: request.command.to_string(), ..Default::default() }),
-					cwd_uri: self.cwd_uri.to_string(),
+					cwd_uri: cwd_uri.to_string(),
+					env_delta: Some(environment),
+					pty: pty.then(|| PtySpec {
+						terminal: String::from("xterm-256color"),
+						..Default::default()
+					}),
 					restart: Some(RestartSpec {
 						policy: RestartPolicy::Never as i32,
 						..Default::default()
@@ -105,14 +256,7 @@ impl ShellExec for ShellExecHost {
 			})
 			.await
 			.map_err(|error| resource_fault("detach", error))?;
-		let id = fmts!("{}#{}", started.name, started.generation);
-		Ok(DetachedJob {
-			id,
-			owner: JobOwner::NamedProcess {
-				name:       Str::from(started.name),
-				generation: started.generation,
-			},
-		})
+		Ok(named_process(started))
 	}
 }
 

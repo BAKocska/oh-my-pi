@@ -1,0 +1,152 @@
+//! Shared foreground-wait policy for tools that can detach long-running work.
+
+use std::{
+	future::Future,
+	sync::atomic::{AtomicU64, Ordering},
+	time::Duration,
+};
+
+use futures::{FutureExt, pin_mut};
+use omp_core::{Str, fmts};
+use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobOwner, JobRef, ToolTerminal};
+
+/// Default time a managed tool waits in the foreground before detaching.
+pub const DEFAULT_AUTO_BACKGROUND_THRESHOLD: Duration = Duration::from_secs(60);
+const TIMEOUT_BUFFER: Duration = Duration::from_secs(1);
+
+/// Detached work returned by a resource adapter after ownership transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetachedJob {
+	/// Stable environment job identifier.
+	pub id:    Str,
+	/// Resource generation that authoritatively reports settlement.
+	pub owner: JobOwner,
+}
+
+/// Builds the canonical session-lifetime terminal for managed detached work.
+#[must_use]
+pub fn managed_job_terminal<P, F>(
+	job: DetachedJob,
+	description: impl Into<Str>,
+) -> ToolTerminal<P, F> {
+	ToolTerminal::Detached(JobRef {
+		id:       job.id,
+		owner:    job.owner,
+		artifact: ExpectedArtifact {
+			description: description.into(),
+			media_type:  Some(Str::new_static("application/vnd.omp.process-settlement+json")),
+			lifetime:    ArtifactLifetime::Session,
+		},
+	})
+}
+
+/// Formats the model-facing notice for a newly detached job.
+#[must_use]
+pub fn format_background_notice(job_id: &str) -> Str {
+	fmts!("Backgrounded as job {job_id}; result will be delivered automatically.")
+}
+
+/// Allocates the next stable managed-job name for one tool instance.
+#[must_use]
+pub fn next_background_name(prefix: &str, sequence: &AtomicU64) -> Str {
+	fmts!("{prefix}-bg-{}", sequence.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Resolves the foreground wait against the invocation's own timeout.
+///
+/// A one-second buffer lets a short invocation settle inline instead of being
+/// detached immediately before its deadline. A zero threshold backgrounds
+/// immediately.
+#[must_use]
+pub fn resolve_auto_background_wait(threshold: Duration, timeout: Option<Duration>) -> Duration {
+	let Some(timeout) = timeout else {
+		return threshold;
+	};
+	threshold.min(timeout.saturating_sub(TIMEOUT_BUFFER))
+}
+
+/// Result of racing one resource event against interruption and backgrounding.
+pub enum JobWait<S, I> {
+	/// The resource emitted its next event.
+	Settled(S),
+	/// The invocation owner supplied an interrupt.
+	Interrupted(I),
+	/// The foreground wait threshold elapsed.
+	Background,
+}
+
+/// One absolute foreground deadline reused while a streaming job emits output.
+///
+/// Reusing the absolute deadline prevents each output frame from restarting the
+/// threshold.
+pub struct ForegroundWait {
+	deadline: std::time::Instant,
+}
+
+impl ForegroundWait {
+	/// Starts a foreground wait using the shared threshold/timeout policy.
+	#[must_use]
+	pub fn new(threshold: Duration, timeout: Option<Duration>) -> Self {
+		Self {
+			deadline: std::time::Instant::now() + resolve_auto_background_wait(threshold, timeout),
+		}
+	}
+
+	/// Races the next resource event, invocation interrupt, and absolute
+	/// foreground deadline without allocating or leaving a live timer behind.
+	pub async fn race<S, I>(&self, settled: S, interrupted: I) -> JobWait<S::Output, I::Output>
+	where
+		S: Future,
+		I: Future,
+	{
+		if std::time::Instant::now() >= self.deadline {
+			return JobWait::Background;
+		}
+		let settled = settled.fuse();
+		let interrupted = interrupted.fuse();
+		pin_mut!(settled, interrupted);
+		if tokio::runtime::Handle::try_current().is_err() {
+			return futures::select_biased! {
+				value = settled => JobWait::Settled(value),
+				value = interrupted => JobWait::Interrupted(value),
+			};
+		}
+		let threshold =
+			tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)).fuse();
+		pin_mut!(threshold);
+		futures::select_biased! {
+			value = settled => JobWait::Settled(value),
+			value = interrupted => JobWait::Interrupted(value),
+			() = threshold => JobWait::Background,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn wait_budget_keeps_timeout_buffer() {
+		assert_eq!(
+			resolve_auto_background_wait(Duration::from_secs(60), Some(Duration::from_secs(30))),
+			Duration::from_secs(29),
+		);
+		assert_eq!(
+			resolve_auto_background_wait(Duration::from_secs(60), Some(Duration::from_millis(500))),
+			Duration::ZERO,
+		);
+		assert_eq!(
+			resolve_auto_background_wait(Duration::from_secs(60), None),
+			Duration::from_secs(60),
+		);
+	}
+
+	#[test]
+	fn notice_names_automatic_delivery() {
+		assert_eq!(
+			format_background_notice("eval-bg-7"),
+			"Backgrounded as job eval-bg-7; result will be delivered automatically.",
+		);
+	}
+}

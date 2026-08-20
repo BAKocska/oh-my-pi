@@ -372,10 +372,13 @@ fn render_glob_payload(payload: &crate::glob::Payload) -> Str {
 
 fn shell_fault(fault: &crate::shell::Fault) -> String {
 	match fault {
-		crate::shell::Fault::Resource { operation, message } => {
-			format!("{operation}: {message}")
+		crate::shell::Fault::Resource { operation, message } => format!("{operation}: {message}"),
+		crate::shell::Fault::InvalidEnvironmentKey { key } => {
+			format!("invalid shell environment key {key:?}")
 		},
-		crate::shell::Fault::DetachNameRequired => String::from("detached execution requires a name"),
+		crate::shell::Fault::AsyncNameRequired => {
+			String::from("async shell execution requires a name")
+		},
 	}
 }
 
@@ -397,11 +400,16 @@ fn render_shell_payload(payload: &crate::shell::Payload) -> Str {
 	output.push_str("</text><text fg=muted>");
 	write!(output, "{retained} bytes · {} ms", payload.status.wall_clock_ms)
 		.expect("writing to String cannot fail");
+	if payload.status.spilled_output.is_some() {
+		output.push_str(" · full verdict stored as blob");
+	}
 	output.push_str("</text></row><text truncate>");
 	push_text(&mut output, &payload.command);
 	output.push_str("</text>");
-	if payload.transcript_truncated {
-		output.push_str("<text fg=muted>output truncated</text>");
+	if let Some(frame) = payload.transcript.last() {
+		output.push_str("<text fg=muted truncate>");
+		push_text(&mut output, &String::from_utf8_lossy(&frame.data));
+		output.push_str("</text><text fg=muted>ctrl+o to expand</text>");
 	}
 	output.push_str("</col>");
 	Str::from(output)

@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::{
 	BatchError, Journal, JournalError, Mailbox, MailboxSender, ProjectionError, PromptError,
-	TurnClient, TurnInput, TurnSession,
+	TurnClient, TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	batch::{
 		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
 	},
@@ -64,6 +64,36 @@ pub struct AgentRunSummary {
 	pub committed_turns: u32,
 	/// Whether the submission stopped on a caller abort.
 	pub interrupted:     bool,
+}
+
+impl AgentRunSummary {
+	/// Extracts and verbatim-validates the terminal `yield` call from the last
+	/// subagent turn.
+	///
+	/// The raw argument bytes are decoded directly here, bypassing generic tool
+	/// coercion so the structured deliverable cannot be stringified, wrapped,
+	/// or stripped before its own retryable validation path sees it.
+	pub fn yield_payload(
+		&self,
+		validator: &mut YieldPayloadValidator,
+	) -> Result<Option<YieldPayload>, YieldPayloadError> {
+		let Some(outcome) = self.outcome.as_ref() else {
+			return Ok(None);
+		};
+		let mut payload = None;
+		for item in &outcome.output {
+			let Some(thread::item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+				continue;
+			};
+			if call.name != "yield" {
+				continue;
+			}
+			let raw = serde_json::from_slice::<Value>(&call.args_json)
+				.map_err(|_| YieldPayloadError::InvalidEnvelope)?;
+			payload = Some(validator.validate(&raw)?);
+		}
+		Ok(payload)
+	}
 }
 /// A live user message that can be rewound and edited.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2501,5 +2531,40 @@ mod tests {
 		let deadline = std::time::Instant::now() + Duration::from_millis(1);
 		let result = sleep_with_deadline(Duration::from_secs(60), Some(deadline)).await;
 		assert!(matches!(result, Err(AgentError::Deadline)));
+	}
+
+	#[test]
+	fn run_summary_extracts_yield_arguments_verbatim() {
+		let call = thread::ToolCall {
+			id: Str::from("yield-call").to_string(),
+			name: "yield".to_owned(),
+			args_json: Bytes::from_static(
+				br#"{"result":{"data":{"summary":{"purge":13,"keep":20}}}}"#,
+			),
+			..thread::ToolCall::default()
+		};
+		let summary = AgentRunSummary {
+			outcome:         Some(Outcome {
+				output: vec![Item {
+					kind: Some(thread::item::Kind::ToolCall(call)),
+					..Item::default()
+				}],
+				..Outcome::default()
+			}),
+			committed_turns: 1,
+			interrupted:     false,
+		};
+		let schema = serde_json::json!({
+			"type": "object",
+			"properties": {"summary": {"type": "string"}},
+			"required": ["summary"],
+			"additionalProperties": false
+		});
+		let mut validator = YieldPayloadValidator::new(Some(schema), true);
+		assert!(matches!(
+			summary.yield_payload(&mut validator),
+			Err(YieldPayloadError::SchemaViolation { path, rule: "type" })
+				if path.as_str() == "/summary"
+		));
 	}
 }

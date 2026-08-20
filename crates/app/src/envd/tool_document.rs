@@ -118,18 +118,23 @@ impl EditDocuments for DocumentHost {
 	type Prepared = PreparedDocument;
 
 	async fn prepare(&self, request: PrepareRequest) -> Result<Self::Prepared, EditFault> {
-		let tag = request.file_hash.clone().ok_or_else(|| {
-			edit_invalid(format!(
+		if request.file_hash.is_none() && !request.allow_unpinned {
+			return Err(edit_invalid(format!(
 				"Missing hashline snapshot tag for {}; use `[{}#tag]` from your latest read/search \
 				 output. To create a new file, use the write tool.",
 				request.path, request.path
-			))
-		})?;
+			)));
+		}
 		let (resolved, warnings, display_path) = match resolve_document(self, &request.path) {
 			Ok(resolved) => (resolved, Vec::new(), request.path.clone()),
-			Err(error) => match recover_edit_path(self, &request.path, &tag) {
-				Some(recovered) => recovered,
-				None => return Err(edit_invalid(error)),
+			Err(error) => {
+				let Some(tag) = request.file_hash.as_deref() else {
+					return Err(edit_invalid(error));
+				};
+				match recover_edit_path(self, &request.path, tag) {
+					Some(recovered) => recovered,
+					None => return Err(edit_invalid(error)),
+				}
 			},
 		};
 		let lease = Self::open(self, resolved.uri, None, &CancellationToken::new())
@@ -151,9 +156,9 @@ impl EditDocuments for DocumentHost {
 		} else {
 			raw_base_bytes.clone()
 		};
-		let authored_bytes = {
+		let authored_bytes = if let Some(tag) = &request.file_hash {
 			let mut snapshots = self.snapshot_store().lock();
-			let Ok(snapshot) = snapshots.resolve(&canonical_path, &tag, None) else {
+			let Ok(snapshot) = snapshots.resolve(&canonical_path, tag, None) else {
 				let lines = String::from_utf8_lossy(&base_bytes)
 					.lines()
 					.map(Str::from)
@@ -168,14 +173,10 @@ impl EditDocuments for DocumentHost {
 				});
 				return Err(edit_stale(message.to_string()));
 			};
-			validate_seen_lines(
-				&mut snapshots,
-				&snapshot,
-				&request.path,
-				&tag,
-				&request.anchor_lines,
-			)?;
+			validate_seen_lines(&mut snapshots, &snapshot, &request.path, tag, &request.anchor_lines)?;
 			snapshot.bytes().clone()
+		} else {
+			base_bytes.clone()
 		};
 		Ok(PreparedDocument {
 			lease,

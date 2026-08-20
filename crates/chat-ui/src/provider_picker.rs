@@ -6,7 +6,10 @@ use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Size, Ui, UiContext, UiEvent, dom,
 };
 
-use crate::PickerEvent;
+use crate::{
+	PickerEvent,
+	overlays::{OverlayPanel, panel_divider},
+};
 
 const HINT: &str = "type to filter · ↹/←→/↑↓ pick · ↵ login · Esc close";
 /// Card cell: rounded border (2) + 1-cell side padding around a 12-wide body
@@ -142,11 +145,12 @@ impl ProviderPicker {
 			fmts!("{shown}/{total} · filter: {}", self.query)
 		};
 		self.ui = Ui::from_root(
-			dom! {
-				<box border=round title="Provider Login" pad-x=1>
-					{provider_card_grid(cards, counter, HINT, self.grid_rows)}
-				</box>
-			},
+			OverlayPanel::new("Provider Login").child(provider_card_grid(
+				cards,
+				counter,
+				HINT,
+				self.grid_rows,
+			)),
 			self.width,
 			self.ctx.clone(),
 		);
@@ -210,6 +214,7 @@ pub fn provider_card_grid(
 					}
 				</row>
 			</scroll>
+			{panel_divider()}
 			<text dim truncate>{hint}</text>
 		</col>
 	}

@@ -1570,7 +1570,11 @@ mod tests {
 				return Ok(len);
 			}
 			if !self.snapped {
-				let stdout = self.stdout.lock().clone().expect("stdout buffer is initialized");
+				let stdout = self
+					.stdout
+					.lock()
+					.clone()
+					.expect("stdout buffer is initialized");
 				*self.snapshot.lock() = stdout.lock().clone();
 				self.snapped = true;
 			}
@@ -1591,9 +1595,9 @@ mod tests {
 	impl openfiles::Stream for SnapshottingStdin {
 		fn clone_box(&self) -> Box<dyn openfiles::Stream> {
 			Box::new(Self {
-				pos: self.pos,
-				snapped: self.snapped,
-				stdout: Arc::clone(&self.stdout),
+				pos:      self.pos,
+				snapped:  self.snapped,
+				stdout:   Arc::clone(&self.stdout),
 				snapshot: Arc::clone(&self.snapshot),
 			})
 		}
@@ -1604,9 +1608,7 @@ mod tests {
 		}
 
 		#[cfg(unix)]
-		fn try_borrow_as_fd(
-			&self,
-		) -> Result<std::os::fd::BorrowedFd<'_>, omp_shell_engine::Error> {
+		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, omp_shell_engine::Error> {
 			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 	}
@@ -1616,9 +1618,9 @@ mod tests {
 		let stdout = Arc::new(Mutex::new(None));
 		let snapshot = Arc::new(Mutex::new(Vec::new()));
 		let stdin = Box::new(SnapshottingStdin {
-			pos: 0,
-			snapped: false,
-			stdout: Arc::clone(&stdout),
+			pos:      0,
+			snapped:  false,
+			stdout:   Arc::clone(&stdout),
 			snapshot: Arc::clone(&snapshot),
 		});
 		let (mut host, capture) = Host::for_test_with_stdin("grep", stdin, "/");

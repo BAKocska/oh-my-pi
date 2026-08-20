@@ -27,3 +27,4 @@ pub mod redact;
 pub mod semconv;
 pub mod semconv_gen;
 pub mod span;
+pub mod stats;

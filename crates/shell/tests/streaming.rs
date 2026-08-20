@@ -48,7 +48,10 @@ fn assert_streams_before_exit(script: &str) {
 		},
 	};
 	assert!(first_line < Duration::from_millis(1_200), "first line arrived at {first_line:?}");
-	assert!(child.try_wait().expect("poll omp-sh").is_none(), "`{script}` exited before observation");
+	assert!(
+		child.try_wait().expect("poll omp-sh").is_none(),
+		"`{script}` exited before observation"
+	);
 	let deadline = Instant::now() + Duration::from_secs(10);
 	let status = loop {
 		if let Some(status) = child.try_wait().expect("poll omp-sh") {

@@ -266,7 +266,10 @@ for details about the options it supports.";
 		Unsigned(u64),
 		UnsignedHex(u64),
 		UnsignedOct(u32),
-		Timestamp { sec: i64, nsec: u32 },
+		Timestamp {
+			sec:  i64,
+			nsec: u32,
+		},
 		Unknown,
 	}
 
@@ -1104,7 +1107,10 @@ for details about the options it supports.";
 		/// The `strftime` format for human-readable time directives; BSD `-t`
 		/// overrides the GNU default.
 		fn time_fmt(&self) -> &str {
-			self.time_format.as_deref().unwrap_or(PRETTY_DATETIME_FORMAT)
+			self
+				.time_format
+				.as_deref()
+				.unwrap_or(PRETTY_DATETIME_FORMAT)
 		}
 
 		#[cfg(unix)]
@@ -1241,7 +1247,9 @@ for details about the options it supports.";
 						},
 
 						// time of file birth, human-readable; - if unknown
-						'w' => OutputType::Str(pretty_time(meta, MetadataTimeField::Birth, self.time_fmt())),
+						'w' => {
+							OutputType::Str(pretty_time(meta, MetadataTimeField::Birth, self.time_fmt()))
+						},
 						// time of file birth, seconds since Epoch; 0 if unknown
 						'W' => {
 							let (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Birth)
@@ -1249,7 +1257,9 @@ for details about the options it supports.";
 							OutputType::Timestamp { sec, nsec }
 						},
 						// time of last access, human-readable
-						'x' => OutputType::Str(pretty_time(meta, MetadataTimeField::Access, self.time_fmt())),
+						'x' => {
+							OutputType::Str(pretty_time(meta, MetadataTimeField::Access, self.time_fmt()))
+						},
 						// time of last access, seconds since Epoch
 						'X' => {
 							let (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Access)
@@ -1257,7 +1267,11 @@ for details about the options it supports.";
 							OutputType::Timestamp { sec, nsec }
 						},
 						// time of last data modification, human-readable
-						'y' => OutputType::Str(pretty_time(meta, MetadataTimeField::Modification, self.time_fmt())),
+						'y' => OutputType::Str(pretty_time(
+							meta,
+							MetadataTimeField::Modification,
+							self.time_fmt(),
+						)),
 						// time of last data modification, seconds since Epoch
 						'Y' => {
 							let (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Modification)
@@ -1265,7 +1279,9 @@ for details about the options it supports.";
 							OutputType::Timestamp { sec, nsec }
 						},
 						// time of last status change, human-readable
-						'z' => OutputType::Str(pretty_time(meta, MetadataTimeField::Change, self.time_fmt())),
+						'z' => {
+							OutputType::Str(pretty_time(meta, MetadataTimeField::Change, self.time_fmt()))
+						},
 						// time of last status change, seconds since Epoch
 						'Z' => {
 							let (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Change)
@@ -1553,7 +1569,11 @@ for details about the options it supports.";
 			Some(BsdStyle::Verbose) => {
 				out.push("--bsd-timefmt".into());
 				out.push(timefmt.unwrap_or_else(|| BSD_VERBOSE_TIMEFMT.into()).into());
-				out.push(if no_newline { "--printf".into() } else { "-c".into() });
+				out.push(if no_newline {
+					"--printf".into()
+				} else {
+					"-c".into()
+				});
 				out.push(BSD_VERBOSE_FORMAT.into());
 			},
 			Some(BsdStyle::Custom(format)) => {
@@ -1565,7 +1585,11 @@ for details about the options it supports.";
 				// `--printf` suppresses the mandatory trailing newline (BSD
 				// `-n`); the translator escapes literal backslashes so text
 				// survives printf mode.
-				out.push(if no_newline { "--printf".into() } else { "-c".into() });
+				out.push(if no_newline {
+					"--printf".into()
+				} else {
+					"-c".into()
+				});
 				out.push(translated.into());
 			},
 			None => return Err("BSD-style '-f' expects a format string".to_string()),
@@ -1795,12 +1819,12 @@ for details about the options it supports.";
 		let flags = std::os::macos::fs::MetadataExt::st_flags(meta);
 		#[cfg(not(target_os = "macos"))]
 		let flags = 0u32;
-		let birth = metadata_get_time(meta, MetadataTimeField::Birth)
-			.map_or(0, |t| system_time_to_sec(t).0);
+		let birth =
+			metadata_get_time(meta, MetadataTimeField::Birth).map_or(0, |t| system_time_to_sec(t).0);
 		format!(
-			"st_dev={} st_ino={} st_mode=0{:o} st_nlink={} st_uid={} st_gid={} st_rdev={} \
-			 st_size={} st_atime={} st_mtime={} st_ctime={} st_birthtime={birth} st_blksize={} \
-			 st_blocks={} st_flags={flags}",
+			"st_dev={} st_ino={} st_mode=0{:o} st_nlink={} st_uid={} st_gid={} st_rdev={} st_size={} \
+			 st_atime={} st_mtime={} st_ctime={} st_birthtime={birth} st_blksize={} st_blocks={} \
+			 st_flags={flags}",
 			meta.dev(),
 			meta.ino(),
 			meta.mode(),
@@ -1884,7 +1908,6 @@ for details about the options it supports.";
 			},
 		}
 	}
-
 
 	/// Parsed `stat` invocation.
 	pub(crate) struct Stat {
@@ -1995,14 +2018,7 @@ for details about the options it supports.";
 	fn pretty_time(meta: &Metadata, md_time_field: MetadataTimeField, fmt: &str) -> String {
 		if let Some(time) = metadata_get_time(meta, md_time_field) {
 			let mut tmp = Vec::new();
-			if format_system_time(
-				&mut tmp,
-				time,
-				fmt,
-				FormatSystemTimeFallback::Float,
-			)
-			.is_ok()
-			{
+			if format_system_time(&mut tmp, time, fmt, FormatSystemTimeFallback::Float).is_ok() {
 				return String::from_utf8(tmp).unwrap();
 			}
 		}
@@ -2095,7 +2111,10 @@ for details about the options it supports.";
 		#[test]
 		fn test_timestamp_string() {
 			// `stat -c %Y` must yield integers so shell arithmetic works.
-			assert_eq!(timestamp_string(1712345678, 999_999_999, Precision::NotSpecified), "1712345678");
+			assert_eq!(
+				timestamp_string(1712345678, 999_999_999, Precision::NotSpecified),
+				"1712345678"
+			);
 			assert_eq!(timestamp_string(1712345678, 123_456_789, Precision::Number(0)), "1712345678");
 			// `%.Y` prints all nine fractional digits; explicit precision
 			// truncates (GNU semantics) or zero-pads past nine.
@@ -2103,7 +2122,10 @@ for details about the options it supports.";
 				timestamp_string(1712345678, 123_456_789, Precision::NoNumber),
 				"1712345678.123456789"
 			);
-			assert_eq!(timestamp_string(1712345678, 123_456_789, Precision::Number(3)), "1712345678.123");
+			assert_eq!(
+				timestamp_string(1712345678, 123_456_789, Precision::Number(3)),
+				"1712345678.123"
+			);
 			assert_eq!(timestamp_string(1712345678, 5, Precision::Number(3)), "1712345678.000");
 			assert_eq!(
 				timestamp_string(1712345678, 123_456_789, Precision::Number(11)),
@@ -2370,14 +2392,7 @@ for details about the options it supports.";
 	fn pretty_time(meta: &Metadata, field: win::TimeField, fmt: &str) -> String {
 		if let Some(time) = win::md_time(meta, field) {
 			let mut tmp = Vec::new();
-			if format_system_time(
-				&mut tmp,
-				time,
-				fmt,
-				FormatSystemTimeFallback::Float,
-			)
-			.is_ok()
-			{
+			if format_system_time(&mut tmp, time, fmt, FormatSystemTimeFallback::Float).is_ok() {
 				return String::from_utf8(tmp).unwrap();
 			}
 		}
@@ -2520,7 +2535,9 @@ for details about the options it supports.";
 							OutputType::Timestamp { sec, nsec }
 						},
 						// time of last access, human-readable
-						'x' => OutputType::Str(pretty_time(meta, win::TimeField::Access, self.time_fmt())),
+						'x' => {
+							OutputType::Str(pretty_time(meta, win::TimeField::Access, self.time_fmt()))
+						},
 						// time of last access, seconds since Epoch
 						'X' => {
 							let (sec, nsec) = win::md_time(meta, win::TimeField::Access)
@@ -2528,7 +2545,11 @@ for details about the options it supports.";
 							OutputType::Timestamp { sec, nsec }
 						},
 						// time of last data modification, human-readable
-						'y' => OutputType::Str(pretty_time(meta, win::TimeField::Modification, self.time_fmt())),
+						'y' => OutputType::Str(pretty_time(
+							meta,
+							win::TimeField::Modification,
+							self.time_fmt(),
+						)),
 						// time of last data modification, seconds since Epoch
 						'Y' => {
 							let (sec, nsec) = win::md_time(meta, win::TimeField::Modification)
@@ -2536,7 +2557,9 @@ for details about the options it supports.";
 							OutputType::Timestamp { sec, nsec }
 						},
 						// time of last status change, human-readable (write time)
-						'z' => OutputType::Str(pretty_time(meta, win::TimeField::Change, self.time_fmt())),
+						'z' => {
+							OutputType::Str(pretty_time(meta, win::TimeField::Change, self.time_fmt()))
+						},
 						// time of last status change, seconds since Epoch
 						'Z' => {
 							let (sec, nsec) = win::md_time(meta, win::TimeField::Change)
@@ -2840,12 +2863,18 @@ mod tests {
 		// `%.3Y` keeps three fractional digits; bare `%.Y` prints all nine.
 		let (code, stdout, _) = run_in(root.clone(), vec!["-c", "%.3Y", "data.bin"]);
 		assert_eq!(code, 0);
-		let (sec, frac) = stdout.trim_end().split_once('.').expect("fraction expected");
+		let (sec, frac) = stdout
+			.trim_end()
+			.split_once('.')
+			.expect("fraction expected");
 		assert!(sec.parse::<i64>().is_ok(), "unexpected stdout: {stdout:?}");
 		assert_eq!(frac.len(), 3, "unexpected stdout: {stdout:?}");
 
 		let (_, stdout, _) = run_in(root, vec!["-c", "%.Y", "data.bin"]);
-		let (_, frac) = stdout.trim_end().split_once('.').expect("fraction expected");
+		let (_, frac) = stdout
+			.trim_end()
+			.split_once('.')
+			.expect("fraction expected");
 		assert_eq!(frac.len(), 9, "unexpected stdout: {stdout:?}");
 	}
 

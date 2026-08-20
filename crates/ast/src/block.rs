@@ -375,18 +375,16 @@ mod tests {
 		.expect("language recognized and line non-blank")
 	}
 
-	const RUST_ANNOTATED: &str = "mod m {\n\timpl S {\n\t\t#[napi]\n\t\tfn f(&self) -> u32 \
-	                              {\n\t\t\t1\n\t\t}\n\t}\n}\n";
+	const RUST_ANNOTATED: &str =
+		"mod m {\n\timpl S {\n\t\t#[napi]\n\t\tfn f(&self) -> u32 {\n\t\t\t1\n\t\t}\n\t}\n}\n";
 
 	#[test]
 	fn chain_names_rust_attribute_row() {
 		let spans = chain(RUST_ANNOTATED, "x.rs", 3);
 		assert!(
-			spans
-				.iter()
-				.any(|span| span.kind == "attribute_item"
-					&& span.start_line == 3
-					&& span.end_line == 3),
+			spans.iter().any(|span| span.kind == "attribute_item"
+				&& span.start_line == 3
+				&& span.end_line == 3),
 			"{spans:?}"
 		);
 	}
@@ -409,9 +407,7 @@ mod tests {
 		assert!(
 			spans
 				.iter()
-				.any(|span| span.kind == "decorator"
-					&& span.start_line == 2
-					&& span.end_line == 2),
+				.any(|span| span.kind == "decorator" && span.start_line == 2 && span.end_line == 2),
 			"{spans:?}"
 		);
 	}

@@ -1572,10 +1572,7 @@ fn finalizer_stringifies_object_and_array_values_for_declared_strings() {
 		.args_committed(Str::from(r#"{"object":{"a":1},"array":["x",2]}"#))
 		.unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
-	assert_eq!(
-		finalized.effective_json(),
-		r#"{"object":"{\"a\":1}","array":"[\"x\",2]"}"#
-	);
+	assert_eq!(finalized.effective_json(), r#"{"object":"{\"a\":1}","array":"[\"x\",2]"}"#);
 }
 
 #[test]
@@ -1615,10 +1612,7 @@ fn authoritative_tag_selected_declarations_allow_lossy_coercions() {
 		.args_committed(Str::from(r#"{"payload":{"a":1},"items":"one"}"#))
 		.unwrap();
 	let finalized = block_on(params.finalize()).unwrap();
-	assert_eq!(
-		finalized.effective_json(),
-		r#"{"payload":"{\"a\":1}","items":["one"]}"#
-	);
+	assert_eq!(finalized.effective_json(), r#"{"payload":"{\"a\":1}","items":["one"]}"#);
 	assert_eq!(finalized.repairs().len(), 2);
 }
 
@@ -1658,10 +1652,12 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 	feed
 		.args_committed(Str::from(r#"{"config":{"extra":1}}"#))
 		.unwrap();
-	assert!(matches!(
-		block_on(params.finalize()),
-		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Malformed
-	));
+	// A closed map declared by a failed union branch is speculative: the
+	// branch may simply not be the value's shape, so the member is neither
+	// deleted nor rejected — union adjudication happens upstream.
+	let finalized = block_on(params.finalize()).unwrap();
+	assert_eq!(finalized.effective_json(), r#"{"config":{"extra":1}}"#);
+	assert!(finalized.repairs().is_empty());
 
 	let open_rev = Rev { family: Str::from("final"), n: 2 };
 	let mut open_specs = ArgSpecRegistry::new();

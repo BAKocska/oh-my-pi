@@ -857,7 +857,10 @@ enum DateSource {
 	Stdin,
 	Human(String),
 	/// BSD `date -j -f FMT VALUE`: VALUE parsed with the strptime format FMT.
-	Strptime { format: String, value: String },
+	Strptime {
+		format: String,
+		value:  String,
+	},
 	Resolution,
 }
 
@@ -1223,15 +1226,15 @@ fn apply_bsd_adjustments(mut date: Zoned, adjustments: &[BsdAdjustment]) -> Resu
 							69..=99 => value + 1900,
 							_ => value,
 						};
-						let year = i16::try_from(year)
-							.map_err(|_| format!("invalid adjustment: '{value}y'"))?;
+						let year =
+							i16::try_from(year).map_err(|_| format!("invalid adjustment: '{value}y'"))?;
 						with.year(year)
 					},
 					BsdAdjustUnit::Month => with.month(narrow('m')?),
 					BsdAdjustUnit::Week => {
 						return Err(format!(
-							"unsupported adjustment: '{value}w' (setting the week is not \
-							 implemented; use an offset like '+{value}w')"
+							"unsupported adjustment: '{value}w' (setting the week is not implemented; \
+							 use an offset like '+{value}w')"
 						));
 					},
 					BsdAdjustUnit::Day => with.day(narrow('d')?),
@@ -1254,8 +1257,9 @@ fn apply_bsd_adjustments(mut date: Zoned, adjustments: &[BsdAdjustment]) -> Resu
 /// matching BSD `date`, which seeds the broken-down time from
 /// `localtime(now)` before calling strptime(3).
 fn parse_bsd_strptime(format: &str, value: &str, now: &Zoned) -> Result<Zoned, String> {
-	let convert_error =
-		|error: jiff::Error| format!("failed conversion of '{value}' using format '{format}' ({error})");
+	let convert_error = |error: jiff::Error| {
+		format!("failed conversion of '{value}' using format '{format}' ({error})")
+	};
 	let broken = BrokenDownTime::parse(format, value).map_err(convert_error)?;
 	// `%s` (or a complete civil datetime plus an offset) pins an instant.
 	if let Ok(timestamp) = broken.to_timestamp() {
@@ -1276,7 +1280,9 @@ fn parse_bsd_strptime(format: &str, value: &str, now: &Zoned) -> Result<Zoned, S
 		broken.hour().unwrap_or(base.hour()),
 		broken.minute().unwrap_or(base.minute()),
 		broken.second().unwrap_or(base.second()),
-		broken.subsec_nanosecond().unwrap_or(base.subsec_nanosecond()),
+		broken
+			.subsec_nanosecond()
+			.unwrap_or(base.subsec_nanosecond()),
 	)
 	.map_err(convert_error)?;
 	date
@@ -1284,7 +1290,6 @@ fn parse_bsd_strptime(format: &str, value: &str, now: &Zoned) -> Result<Zoned, S
 		.to_zoned(now.time_zone().clone())
 		.map_err(convert_error)
 }
-
 
 /// Parsed `date` invocation.
 pub(crate) struct Date {
@@ -1382,7 +1387,10 @@ fn date_main(host: &mut Host, matches: &ArgMatches) -> Result<(), DateError> {
 		None
 	};
 	let strptime_value = if strptime_format.is_some() {
-		if operands.first().is_some_and(|operand| !operand.starts_with('+')) {
+		if operands
+			.first()
+			.is_some_and(|operand| !operand.starts_with('+'))
+		{
 			Some(operands.remove(0))
 		} else {
 			return Err(DateError::new(1, "'-j -f FORMAT' requires a date operand to parse"));
@@ -1740,8 +1748,8 @@ fn uu_app() -> Command {
 				.value_hint(clap::ValueHint::FilePath)
 				.conflicts_with(OPT_DATE)
 				.help(
-					"like --date; once for each line of DATEFILE\n(BSD: with -j, the strptime(3) \
-					 input format for the date operand)",
+					"like --date; once for each line of DATEFILE\n(BSD: with -j, the strptime(3) input \
+					 format for the date operand)",
 				),
 		)
 		.arg(
@@ -1808,8 +1816,8 @@ fn uu_app() -> Command {
 				.allow_hyphen_values(true)
 				.conflicts_with_all([OPT_DATE, OPT_FILE, OPT_RESOLUTION])
 				.help(
-					"display the last modification time of FILE\n(BSD: when FILE is numeric and \
-					 no such file exists,\ndisplay the date at that many seconds since the epoch)",
+					"display the last modification time of FILE\n(BSD: when FILE is numeric and no \
+					 such file exists,\ndisplay the date at that many seconds since the epoch)",
 				),
 		)
 		.arg(
@@ -1834,8 +1842,8 @@ fn uu_app() -> Command {
 			Arg::new(OPT_BSD_PARSE_ONLY)
 				.short('j')
 				.help(
-					"BSD compatibility: do not try to set the system clock;\nwith -f, parse the \
-					 date operand using the strptime(3)\nformat given to -f",
+					"BSD compatibility: do not try to set the system clock;\nwith -f, parse the date \
+					 operand using the strptime(3)\nformat given to -f",
 				)
 				.action(ArgAction::SetTrue),
 		)
@@ -1846,8 +1854,8 @@ fn uu_app() -> Command {
 				.allow_hyphen_values(true)
 				.action(ArgAction::Append)
 				.help(
-					"BSD compatibility: adjust ('+'/'-') or set (no sign) the\ndisplayed date; \
-					 may be given multiple times, applied in order",
+					"BSD compatibility: adjust ('+'/'-') or set (no sign) the\ndisplayed date; may be \
+					 given multiple times, applied in order",
 				),
 		)
 		.arg(Arg::new(OPT_FORMAT).num_args(0..))
@@ -2319,11 +2327,8 @@ mod tests {
 		let file = dir.join("1700000000");
 		std::fs::write(&file, b"x").unwrap();
 
-		let (code, capture) = run_util::<Date>(
-			&["-u", "-r", "1700000000", "+%s"],
-			"",
-			dir.to_str().unwrap(),
-		);
+		let (code, capture) =
+			run_util::<Date>(&["-u", "-r", "1700000000", "+%s"], "", dir.to_str().unwrap());
 		let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
 		let expected = Timestamp::try_from(mtime).unwrap().as_second();
 		std::fs::remove_dir_all(&dir).unwrap();
@@ -2336,11 +2341,8 @@ mod tests {
 	/// order instead of being rejected as unknown options.
 	#[test]
 	fn bsd_adjustments_apply_in_order() {
-		let (code, capture) = run_util::<Date>(
-			&["-u", "-r", "1700000000", "-v+1d", "-v-2m", "+%F %T"],
-			"",
-			"/",
-		);
+		let (code, capture) =
+			run_util::<Date>(&["-u", "-r", "1700000000", "-v+1d", "-v-2m", "+%F %T"], "", "/");
 
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "2023-09-15 22:13:20\n");
@@ -2351,11 +2353,8 @@ mod tests {
 	/// of the month) rather than offsetting.
 	#[test]
 	fn bsd_adjustment_sets_fields_absolutely() {
-		let (code, capture) = run_util::<Date>(
-			&["-u", "-r", "1700000000", "-v1d", "-v5H", "+%F %T"],
-			"",
-			"/",
-		);
+		let (code, capture) =
+			run_util::<Date>(&["-u", "-r", "1700000000", "-v1d", "-v5H", "+%F %T"], "", "/");
 
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "2023-11-01 05:13:20\n");
@@ -2406,11 +2405,7 @@ mod tests {
 		let (code, capture) = run_util::<Date>(&["-j", "-f", "%Y", "+%F"], "", "/");
 
 		assert_eq!(code, 1);
-		assert!(
-			capture.err().contains("requires a date operand"),
-			"stderr: {}",
-			capture.err()
-		);
+		assert!(capture.err().contains("requires a date operand"), "stderr: {}", capture.err());
 	}
 
 	/// Defends: bare `-j` parses as a no-op (never sets the clock) instead of
@@ -2466,7 +2461,10 @@ mod tests {
 			rewrite_date_argv(argv(&["date", "-I", "+%s"])),
 			argv(&["date", "--iso-8601=date", "+%s"])
 		);
-		assert_eq!(rewrite_date_argv(argv(&["date", "-Ihours"])), argv(&["date", "--iso-8601=hours"]));
+		assert_eq!(
+			rewrite_date_argv(argv(&["date", "-Ihours"])),
+			argv(&["date", "--iso-8601=hours"])
+		);
 		assert_eq!(
 			rewrite_date_argv(argv(&["date", "--iso-8601", "+%s"])),
 			argv(&["date", "--iso-8601=date", "+%s"])

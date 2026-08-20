@@ -175,7 +175,9 @@ fn compare(
 					break;
 				}
 				if !opts.get_flag(options::COLUMN_1) {
-					stdout.write_all(&ra).map_err(|e| format!("write error: {e}"))?;
+					stdout
+						.write_all(&ra)
+						.map_err(|e| format!("write error: {e}"))?;
 				}
 				ra.clear();
 				na = read_context(a, &mut ra, name1)?;

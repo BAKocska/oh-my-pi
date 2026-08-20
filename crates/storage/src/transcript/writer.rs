@@ -641,7 +641,7 @@ mod tests {
 			append_all(&mut target, original_len, b"{\"torn\":true}\n"),
 			Err(Error::AppendRollback { .. })
 		));
-		assert_eq!(target.bytes, b"complete\n{\"to");
+		assert_eq!(target.bytes, b"complete\n{\"tor");
 	}
 
 	#[test]

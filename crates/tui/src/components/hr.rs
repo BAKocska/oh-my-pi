@@ -1,5 +1,7 @@
 //! Horizontal and vertical rules, including width-safe docked labels.
 
+use xutf::Text as _;
+
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
@@ -7,7 +9,6 @@ use crate::{
 	markup::Border,
 	props::{Prop, PropValue, Props},
 };
-use xutf::Text as _;
 
 /// A display-width-limited string prefix.
 ///
@@ -17,9 +18,9 @@ use xutf::Text as _;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TruncatedText<'a> {
 	/// Grapheme-boundary prefix of the original text.
-	pub text:      &'a str,
+	pub text:     &'a str,
 	/// Display width of the prefix plus its optional ellipsis.
-	pub width:     u16,
+	pub width:    u16,
 	/// Whether a one-cell ellipsis must follow the prefix.
 	pub ellipsis: bool,
 }
@@ -44,8 +45,8 @@ pub fn truncate_to_width(text: &str, max_width: u16) -> TruncatedText<'_> {
 				return TruncatedText { text: "", width: 0, ellipsis: false };
 			}
 			return TruncatedText {
-				text:      &text[..prefix_end],
-				width:     u16::try_from(prefix_width + 1).unwrap_or(u16::MAX),
+				text:     &text[..prefix_end],
+				width:    u16::try_from(prefix_width + 1).unwrap_or(u16::MAX),
 				ellipsis: true,
 			};
 		}
@@ -55,11 +56,7 @@ pub fn truncate_to_width(text: &str, max_width: u16) -> TruncatedText<'_> {
 			prefix_end += grapheme.len();
 		}
 	}
-	TruncatedText {
-		text,
-		width: u16::try_from(full_width).unwrap_or(u16::MAX),
-		ellipsis: false,
-	}
+	TruncatedText { text, width: u16::try_from(full_width).unwrap_or(u16::MAX), ellipsis: false }
 }
 
 /// A horizontal or vertical divider backing the `<hr>` markup tag.
@@ -305,14 +302,16 @@ mod tests {
 
 	#[test]
 	fn title_truncation_respects_wide_grapheme_boundaries() {
-		assert_eq!(
-			truncate_to_width("界ab", 3),
-			super::TruncatedText { text: "界", width: 3, ellipsis: true },
-		);
-		assert_eq!(
-			truncate_to_width("界a", 3),
-			super::TruncatedText { text: "界a", width: 3, ellipsis: false },
-		);
+		assert_eq!(truncate_to_width("界ab", 3), super::TruncatedText {
+			text:     "界",
+			width:    3,
+			ellipsis: true,
+		},);
+		assert_eq!(truncate_to_width("界a", 3), super::TruncatedText {
+			text:     "界a",
+			width:    3,
+			ellipsis: false,
+		},);
 	}
 
 	#[test]

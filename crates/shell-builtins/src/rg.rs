@@ -833,7 +833,11 @@ fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
 }
 
 /// Writes a display path, substituting `separator` for `/` when requested.
-fn write_display_bytes<W: Write>(out: &mut W, bytes: &[u8], separator: Option<u8>) -> io::Result<()> {
+fn write_display_bytes<W: Write>(
+	out: &mut W,
+	bytes: &[u8],
+	separator: Option<u8>,
+) -> io::Result<()> {
 	let Some(separator) = separator else {
 		return out.write_all(bytes);
 	};
@@ -851,7 +855,8 @@ fn parse_path_separator(spec: Option<&str>) -> Result<Option<u8>, String> {
 		None | Some("") => Ok(None),
 		Some(separator) if separator.len() == 1 => Ok(Some(separator.as_bytes()[0])),
 		Some(separator) => Err(format!(
-			"error parsing flag --path-separator: a path separator must be exactly one byte, but the given separator is {} bytes",
+			"error parsing flag --path-separator: a path separator must be exactly one byte, but the \
+			 given separator is {} bytes",
 			separator.len()
 		)),
 	}
@@ -2047,7 +2052,7 @@ mod tests {
 		let (code, out, _) = run(&["-i", "-s", "HIT", "-"], "hit\n");
 		assert_eq!(code, 1);
 		assert_eq!(out, "");
-		let (code, _, _) = run(&["-i", "-S", "HIT", "-"], "hit\n");
+		let (code, ..) = run(&["-i", "-S", "HIT", "-"], "hit\n");
 		assert_eq!(code, 1);
 	}
 
@@ -2067,8 +2072,7 @@ mod tests {
 		let tree = tempfile::tempdir().unwrap();
 		std::fs::create_dir(tree.path().join("sub")).unwrap();
 		std::fs::write(tree.path().join("sub/a.txt"), "hit\n").unwrap();
-		let (code, capture) =
-			run_util::<Rg>(&["--path-separator", "|", "hit", "."], "", tree.path());
+		let (code, capture) = run_util::<Rg>(&["--path-separator", "|", "hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "sub|a.txt:hit\n");
 		let (code, capture) =

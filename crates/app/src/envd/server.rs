@@ -106,6 +106,9 @@ pub enum EnvdError {
 	/// identity.
 	#[error("invalid worker tool declaration: {0}")]
 	WorkerDeclaration(Str),
+	/// The selected edit dialect was not a registered built-in revision.
+	#[error("invalid edit dialect: {0}")]
+	EditDialect(Str),
 	/// Production assembly encountered a second live declaration for one name.
 	#[error("duplicate production tool name: {0}")]
 	DuplicateToolName(Str),
@@ -519,6 +522,7 @@ impl EnvServer {
 			blobs.clone(),
 			state_dir.join("workspace-ops"),
 		)?;
+		let tool_settings = crate::settings::Settings::load(state_dir).tools;
 		let (registry, eval_bridge, eval_control) = production_registry(
 			&documents,
 			&blobs,
@@ -527,6 +531,7 @@ impl EnvServer {
 			&hello.root_uri,
 			ext_hosts.as_ref(),
 			interrupt_grace,
+			&tool_settings,
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
@@ -599,6 +604,7 @@ impl EnvServer {
 			blobs.clone(),
 			state_dir.join("workspace-ops"),
 		)?;
+		let tool_settings = crate::settings::Settings::load(state_dir).tools;
 		let (registry, eval_bridge, eval_control) = production_registry(
 			&documents,
 			&blobs,
@@ -607,6 +613,7 @@ impl EnvServer {
 			&hello.root_uri,
 			ext_hosts.as_ref(),
 			interrupt_grace,
+			&tool_settings,
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
@@ -1316,9 +1323,9 @@ impl EnvServer {
 			},
 			client_frame::Body::Admission(admission) => {
 				let result = connection.invocation_mut(frame.request_id, &admission.invocation_id);
-				match result {
-					Ok(InvocationState::Native { admission: gate, .. })
-					| Ok(InvocationState::Worker { admission: gate, .. }) => {
+				let pending = match result {
+					Ok(InvocationState::Native { admission: gate, pending_commit, .. })
+					| Ok(InvocationState::Worker { admission: gate, pending_commit, .. }) => {
 						if let Err(error) = gate.answer(admission) {
 							send_error(
 								responses,
@@ -1327,12 +1334,53 @@ impl EnvServer {
 								&error.to_string(),
 							)
 							.await;
+							None
+						} else {
+							pending_commit.take()
 						}
 					},
-					Err((code, message)) => send_error(responses, frame.request_id, code, message).await,
+					Err((code, message)) => {
+						send_error(responses, frame.request_id, code, message).await;
+						None
+					},
+				};
+				if let Some(request) = pending {
+					self
+						.commit_invocation(frame.request_id, request, responses, finished, connection)
+						.await;
 				}
 			},
 			client_frame::Body::ArgsCommitted(request) => {
+				let query = match connection.invocation_mut(frame.request_id, &request.invocation_id) {
+					Ok(InvocationState::Native { admission, .. })
+					| Ok(InvocationState::Worker { admission, .. }) => {
+						match admission.finalize(
+							&request.raw,
+							self.workspace.root(),
+							self.workspace.root(),
+						) {
+							Ok(query) => query,
+							Err(error) => {
+								send_error(
+									responses,
+									frame.request_id,
+									pb::ProtocolErrorCode::InvalidArgument,
+									&error.to_string(),
+								)
+								.await;
+								return;
+							},
+						}
+					},
+					Err((code, message)) => {
+						send_error(responses, frame.request_id, code, message).await;
+						return;
+					},
+				};
+				if let Some(query) = query {
+					send_body(responses, frame.request_id, server_frame::Body::AdmitInvocation(query))
+						.await;
+				}
 				self
 					.commit_invocation(frame.request_id, request, responses, finished, connection)
 					.await;
@@ -2606,6 +2654,7 @@ impl EnvServer {
 					feed: feed.clone(),
 					lifecycle: Arc::clone(&lifecycle),
 					admission,
+					pending_commit: None,
 					maximum_effects: maximum_effects.clone(),
 					cancel: cancel.clone(),
 				}),
@@ -2675,6 +2724,7 @@ impl EnvServer {
 					invocation: Some(invocation),
 					committed: false,
 					admission: AdmissionGate::new(invocation_id.clone(), name, deadline),
+					pending_commit: None,
 					maximum_effects,
 					interrupt,
 					interrupts: Some(interrupts),
@@ -2712,6 +2762,50 @@ impl EnvServer {
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
 	) {
+		let already_committed = match connection.invocation_mut(request_id, &request.invocation_id) {
+			Ok(InvocationState::Native { lifecycle, .. }) => lifecycle.is_committed(),
+			Ok(InvocationState::Worker { committed, .. }) => *committed,
+			Err((code, message)) => {
+				send_error(responses, request_id, code, message).await;
+				return;
+			},
+		};
+		if already_committed {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::AlreadyExists,
+				"ArgsCommitted was already received",
+			)
+			.await;
+			return;
+		}
+
+		match connection.invocation_mut(request_id, &request.invocation_id) {
+			Ok(InvocationState::Native { admission, pending_commit, .. })
+			| Ok(InvocationState::Worker { admission, pending_commit, .. })
+				if !admission.is_answered() =>
+			{
+				if pending_commit.is_some() {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::AlreadyExists,
+						"ArgsCommitted was already received",
+					)
+					.await;
+				} else {
+					*pending_commit = Some(request);
+				}
+				return;
+			},
+			Ok(_) => {},
+			Err((code, message)) => {
+				send_error(responses, request_id, code, message).await;
+				return;
+			},
+		}
+
 		let (admission, maximum_effects) =
 			match connection.invocation_mut(request_id, &request.invocation_id) {
 				Ok(InvocationState::Native { admission, maximum_effects, .. })
@@ -2997,6 +3091,7 @@ enum InvocationState {
 		feed:            omp_tool::InvocationFeed,
 		lifecycle:       Arc<NativeLifecycle>,
 		admission:       AdmissionGate,
+		pending_commit:  Option<pb::ArgsCommitted>,
 		maximum_effects: Effects,
 		cancel:          CancellationToken,
 	},
@@ -3006,6 +3101,7 @@ enum InvocationState {
 		invocation:      Option<super::worker::WorkerInvocation>,
 		committed:       bool,
 		admission:       AdmissionGate,
+		pending_commit:  Option<pb::ArgsCommitted>,
 		maximum_effects: Effects,
 		interrupt:       flume::Sender<pb::Interrupt>,
 		interrupts:      Option<flume::Receiver<pb::Interrupt>>,

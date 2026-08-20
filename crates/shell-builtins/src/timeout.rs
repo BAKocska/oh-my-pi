@@ -1,10 +1,6 @@
 //! `timeout` builtin, moved from `pi-shell`.
 
-use std::{
-	io::Write,
-	sync::Arc,
-	time::Duration,
-};
+use std::{io::Write, sync::Arc, time::Duration};
 
 use clap::Parser;
 use omp_shell_engine::{
@@ -31,29 +27,29 @@ struct TimeoutArgs {
 	/// Signal to send on expiry: a name with or without the `SIG` prefix, or
 	/// a number. Defaults to TERM.
 	#[arg(short = 's', long = "signal", value_name = "SIGNAL")]
-	signal: Option<String>,
+	signal:          Option<String>,
 	/// Also send SIGKILL if the command is still running this long after the
 	/// initial signal.
 	#[arg(short = 'k', long = "kill-after", value_name = "DURATION")]
-	kill_after: Option<String>,
+	kill_after:      Option<String>,
 	/// Exit with the command's own status even when the time limit expired.
 	#[arg(long)]
 	preserve_status: bool,
 	/// GNU compatibility: don't put the command in a separate process group,
 	/// and signal only the direct children rather than a whole group.
 	#[arg(long)]
-	foreground: bool,
+	foreground:      bool,
 	/// Diagnose each signal sent to the command on stderr.
 	#[arg(short = 'v', long)]
-	verbose: bool,
+	verbose:         bool,
 	// Hyphenated operands must reach `parse_duration` so `timeout -1 cmd`
 	// reports an invalid time interval (exit 125) like GNU, instead of a
 	// clap unknown-option error.
 	#[arg(required = true, allow_hyphen_values = true)]
-	duration: String,
+	duration:        String,
 	// The command's own options belong to the command: `timeout 5 grep -v x`.
 	#[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
-	command: Vec<String>,
+	command:         Vec<String>,
 }
 
 /// Holds the raw argument vector so parse failures surface as GNU timeout's
@@ -88,9 +84,9 @@ impl clap::Parser for TimeoutCommand {}
 /// Records the external children spawned while running the timed command.
 ///
 /// brush's cancellation token can only SIGKILL a child (see
-/// `omp_shell_engine::processes::Process::wait`), so delivering the *configured*
-/// signal requires knowing the child's pid/pgid; the shell reports those
-/// through its [`SpawnObserver`] hook.
+/// `omp_shell_engine::processes::Process::wait`), so delivering the
+/// *configured* signal requires knowing the child's pid/pgid; the shell reports
+/// those through its [`SpawnObserver`] hook.
 #[derive(Default)]
 struct SpawnRecorder(Mutex<Vec<(i32, Option<i32>)>>);
 
@@ -131,7 +127,8 @@ fn parse_signal(spec: &str) -> Option<TrapSignal> {
 	matches!(parsed, TrapSignal::Signal(_)).then_some(parsed)
 }
 
-/// Renders a signal the way GNU timeout's diagnostics do: `TERM`, not `SIGTERM`.
+/// Renders a signal the way GNU timeout's diagnostics do: `TERM`, not
+/// `SIGTERM`.
 fn signal_display(signal: TrapSignal) -> &'static str {
 	let name = signal.as_str();
 	name.strip_prefix("SIG").unwrap_or(name)
@@ -169,19 +166,14 @@ impl builtins::Command for TimeoutCommand {
 			},
 		};
 		let Some(limit) = parse_duration(&args.duration) else {
-			let _ = writeln!(
-				context.stderr(),
-				"timeout: invalid time interval '{}'",
-				args.duration
-			);
+			let _ = writeln!(context.stderr(), "timeout: invalid time interval '{}'", args.duration);
 			return Ok(ExecutionResult::new(EXIT_TIMEOUT_FAILURE));
 		};
 		let kill_after = match &args.kill_after {
 			Some(spec) => match parse_duration(spec) {
 				Some(duration) => Some(duration),
 				None => {
-					let _ =
-						writeln!(context.stderr(), "timeout: invalid time interval '{spec}'");
+					let _ = writeln!(context.stderr(), "timeout: invalid time interval '{spec}'");
 					return Ok(ExecutionResult::new(EXIT_TIMEOUT_FAILURE));
 				},
 			},
@@ -225,7 +217,9 @@ impl builtins::Command for TimeoutCommand {
 		let mut stderr = context.stderr();
 		let outer_cancel = context.cancel_token();
 		let source_info = SourceInfo::from("pi-natives:timeout");
-		let run_future = context.shell.run_string(command_line, &source_info, &params);
+		let run_future = context
+			.shell
+			.run_string(command_line, &source_info, &params);
 		tokio::pin!(run_future);
 
 		let outer_cancelled = async {
@@ -281,7 +275,9 @@ impl builtins::Command for TimeoutCommand {
 		// operand's result; that is expected retirement, not a fault.
 		let reap = |result: Result<ExecutionResult, omp_shell_engine::Error>| match result {
 			Ok(result) => Ok(Some(result)),
-			Err(err) if !signalled && matches!(err.kind(), omp_shell_engine::ErrorKind::Interrupted) => {
+			Err(err)
+				if !signalled && matches!(err.kind(), omp_shell_engine::ErrorKind::Interrupted) =>
+			{
 				Ok(None)
 			},
 			Err(err) => Err(err),
@@ -485,10 +481,9 @@ mod tests {
 	#[tokio::test]
 	async fn gnu_flag_spellings_parse() {
 		// Failure mode: a real-world GNU invocation dying in clap.
-		let args = TimeoutArgs::try_parse_from([
-			"timeout", "-s", "INT", "-k", "2s", "10s", "cmd", "arg",
-		])
-		.expect("-s/-k spellings must parse");
+		let args =
+			TimeoutArgs::try_parse_from(["timeout", "-s", "INT", "-k", "2s", "10s", "cmd", "arg"])
+				.expect("-s/-k spellings must parse");
 		assert_eq!(args.signal.as_deref(), Some("INT"));
 		assert_eq!(args.kill_after.as_deref(), Some("2s"));
 		assert_eq!(args.duration, "10s");
@@ -572,11 +567,10 @@ mod tests {
 		// stubborn-test ignores the initial (cancellation-based) signal; the
 		// -k deadline must escalate and report the SIGKILL status.
 		let mut shell = test_shell().await;
-		shell
-			.register_builtin(
-				"stubborn-test",
-				builtins::builtin::<StubbornCommand, DefaultShellExtensions>(),
-			);
+		shell.register_builtin(
+			"stubborn-test",
+			builtins::builtin::<StubbornCommand, DefaultShellExtensions>(),
+		);
 		let mut params = shell.default_exec_params();
 		// Keep the inner shell's interrupted notice off the test runner's
 		// terminal, like run_with_deadline does.
@@ -585,11 +579,7 @@ mod tests {
 		}
 		let result = tokio::time::timeout(
 			Duration::from_secs(1),
-			shell.run_string(
-				"timeout -k 0.075 0.010 stubborn-test",
-				&SourceInfo::default(),
-				&params,
-			),
+			shell.run_string("timeout -k 0.075 0.010 stubborn-test", &SourceInfo::default(), &params),
 		)
 		.await
 		.expect("escalation test exceeded its safety deadline")
@@ -625,10 +615,7 @@ mod tests {
 		let mut shell = test_shell().await;
 		let mut stderr = tempfile::tempfile().expect("create stderr capture");
 		let mut params = shell.default_exec_params();
-		params.set_fd(
-			OpenFiles::STDERR_FD,
-			stderr.try_clone().expect("clone stderr capture").into(),
-		);
+		params.set_fd(OpenFiles::STDERR_FD, stderr.try_clone().expect("clone stderr capture").into());
 
 		let result = tokio::time::timeout(
 			Duration::from_secs(1),
@@ -637,9 +624,13 @@ mod tests {
 		.await
 		.expect("verbose test exceeded its safety deadline")
 		.expect("execute verbose command");
-		stderr.seek(SeekFrom::Start(0)).expect("rewind stderr capture");
+		stderr
+			.seek(SeekFrom::Start(0))
+			.expect("rewind stderr capture");
 		let mut diagnostic = String::new();
-		stderr.read_to_string(&mut diagnostic).expect("read stderr capture");
+		stderr
+			.read_to_string(&mut diagnostic)
+			.expect("read stderr capture");
 
 		assert_eq!(u8::from(result.exit_code), 124);
 		// The cancel-fallback may race the inner shell's own cancellation
@@ -658,8 +649,7 @@ mod tests {
 		let result = run_with_deadline("timeout -s TERM 0.050 /bin/sleep 5").await;
 		assert_eq!(u8::from(result.exit_code), 124);
 
-		let result =
-			run_with_deadline("timeout --preserve-status 0.050 /bin/sleep 5").await;
+		let result = run_with_deadline("timeout --preserve-status 0.050 /bin/sleep 5").await;
 		assert_eq!(u8::from(result.exit_code), 143, "SIGTERM death is 128+15");
 	}
 }

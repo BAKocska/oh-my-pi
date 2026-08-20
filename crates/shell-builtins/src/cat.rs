@@ -19,7 +19,6 @@ use uucore::{display::Quotable, fast_inc::fast_inc_one};
 
 use crate::host::{Host, Utility, format_usage, matches_parser, util};
 
-
 // Allocate 32 digits for the line number. An estimate is that we can print
 // about 1e8 lines/second, so 32 digits lasts for billions of universe
 // lifetimes.
@@ -146,7 +145,6 @@ struct OutputState {
 	skipped_carriage_return: bool,
 	one_blank_kept:          bool,
 }
-
 
 /// An input stream and whether it is connected to an interactive terminal.
 struct InputHandle<R: Read> {
@@ -427,10 +425,7 @@ fn get_input_type(path: &OsString, resolved: &Path) -> CatResult<InputType> {
 }
 
 /// Writes a handle to stdout with no output transformation.
-fn write_fast<R: Read>(
-	handle: &mut InputHandle<R>,
-	stdout: &mut impl Write,
-) -> CatResult<()> {
+fn write_fast<R: Read>(handle: &mut InputHandle<R>, stdout: &mut impl Write) -> CatResult<()> {
 	let mut buf = [0; 1024 * 64];
 	loop {
 		match handle.reader.read(&mut buf) {
@@ -489,11 +484,7 @@ fn write_lines<R: Read>(
 				state.skipped_carriage_return = true;
 			} else {
 				assert_eq!(in_buf[pos + offset], b'\n');
-				write_end_of_line(
-					stdout,
-					options.end_of_line().as_bytes(),
-					handle.is_interactive,
-				)?;
+				write_end_of_line(stdout, options.end_of_line().as_bytes(), handle.is_interactive)?;
 				state.at_line_start = true;
 			}
 			pos += offset + 1;

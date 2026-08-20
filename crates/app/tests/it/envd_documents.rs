@@ -1,7 +1,5 @@
 //! Unix document-daemon integration tests.
 
-#![cfg(unix)]
-
 use std::{future::Future, sync::mpsc, time::Duration};
 
 use bytes::Bytes;

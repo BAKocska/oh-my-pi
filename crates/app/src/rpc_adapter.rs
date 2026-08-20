@@ -13,7 +13,8 @@ use im::OrdMap;
 use omp_agent::{empty_stop, project_thread_history};
 use omp_core::{Str, encoding::hex};
 use omp_llm_catalog::{
-	GrammarBits, ModelAvailability, ModelKey, ModelSpec, OperationKind, ProviderDef, ProviderId,
+	Availability, GrammarBits, ModalityBits, ModelAvailability, ModelKey, ModelSpec, OperationKind,
+	ProviderDef, ProviderId,
 };
 use omp_llm_inference::{
 	Client, Registry,
@@ -1370,7 +1371,7 @@ fn model_card(model: &ModelSpec, provider: &str, facets: Vec<i32>) -> pb::ModelC
 		name: model.display_name.as_str().to_owned(),
 		family: model.class.as_str().to_owned(),
 		facets,
-		inputs: Vec::new(),
+		inputs: model_input_modalities(model),
 		outputs: Vec::new(),
 		reasoning: model.thinking.is_some(),
 		efforts: Vec::new(),
@@ -1389,7 +1390,37 @@ fn model_card(model: &ModelSpec, provider: &str, facets: Vec<i32>) -> pb::ModelC
 		deprecated: model.provenance.deprecated,
 		updated_at_ms: model.provenance.updated_at_ms.unwrap_or_default(),
 		props: None,
+		supports_tools: model_supports_tools(model),
 	}
+}
+
+fn model_input_modalities(model: &ModelSpec) -> Vec<i32> {
+	let Some(modalities) = model
+		.capabilities
+		.chat
+		.as_ref()
+		.and_then(|chat| chat.input_modalities.constraints())
+	else {
+		return Vec::new();
+	};
+	[
+		(ModalityBits::TEXT, pb::Modality::Text),
+		(ModalityBits::IMAGE, pb::Modality::Image),
+		(ModalityBits::AUDIO, pb::Modality::Audio),
+		(ModalityBits::VIDEO, pb::Modality::Video),
+		(ModalityBits::DOCUMENT, pb::Modality::Pdf),
+	]
+	.into_iter()
+	.filter_map(|(bit, modality)| modalities.contains(bit).then_some(modality as i32))
+	.collect()
+}
+
+fn model_supports_tools(model: &ModelSpec) -> Option<bool> {
+	model
+		.capabilities
+		.chat
+		.as_ref()
+		.and_then(|chat| matches!(&chat.tools, Availability::Unsupported).then_some(false))
 }
 
 fn model_facets(model: &ModelSpec) -> Vec<i32> {
@@ -3099,6 +3130,33 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[test]
+	fn model_card_exposes_gateway_discovery_metadata() {
+		let mut model = omp_llm_catalog::snapshot::Catalog::embedded()
+			.models()
+			.iter()
+			.find(|model| model.capabilities.chat.is_some())
+			.expect("embedded chat model")
+			.clone();
+		model.display_name = Str::new_static("Fixture Display");
+		model.limits.context_window = Some(1_000_000);
+		model.limits.maximum_output_tokens = Some(128_000);
+		let chat = model
+			.capabilities
+			.chat
+			.as_mut()
+			.expect("selected chat model");
+		chat.input_modalities = Availability::Native(ModalityBits::TEXT | ModalityBits::IMAGE);
+		chat.tools = Availability::Unsupported;
+
+		let card = model_card(&model, "fixture", Vec::new());
+		assert_eq!(card.name, "Fixture Display");
+		assert_eq!(card.context_window, 1_000_000);
+		assert_eq!(card.max_output_tokens, 128_000);
+		assert_eq!(card.inputs, vec![pb::Modality::Text as i32, pb::Modality::Image as i32]);
+		assert_eq!(card.supports_tools, Some(false));
+	}
 
 	#[test]
 	fn turn_outcome_preserves_ordered_recovery_diagnostics() {

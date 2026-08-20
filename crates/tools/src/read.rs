@@ -43,6 +43,7 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - `:50` / `:50-` — from line 50 | `:50-200` — inclusive | `:50+150` — 150 lines from 50 | `:5-16,960-973` — multiple ranges
 - `:raw` — verbatim, no anchors/prefixes | `:2-4:raw` / `:raw:2-4` — range + verbatim
 - `:conflicts` — one line per unresolved git merge conflict block
+- Multiple local paths: semicolon/comma lists or a JSON string array. An existing literal path always wins over splitting.
 
 ## Source kinds
 - Parseable code, no selector → structural summary (declarations only, body elided). Footer names recovery selector — re-issue ONLY those ranges.
@@ -513,20 +514,44 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	}
 
 	async fn split_targets(&self, authored: &str) -> Result<Vec<Str>, Fault> {
-		if !authored.contains(';')
-			|| selector::parse_uri(authored)
-				.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
-				.is_some()
+		// An exact file name always wins over syntactic target-list encodings.
+		if self.sources.stat(Str::from(authored)).await.is_ok() {
+			return Ok(vec![Str::from(authored)]);
+		}
+		if let Some(paths) = selector::parse_json_path_array(authored)
+			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+		{
+			return Ok(paths);
+		}
+		if selector::parse_uri(authored)
+			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+			.is_some()
 			|| !matches!(web::parse_target(authored), Ok(None))
-			|| self.sources.stat(Str::from(authored)).await.is_ok()
 		{
 			return Ok(vec![Str::from(authored)]);
 		}
-		let targets = selector::split_semicolon_targets(authored);
+		if !authored.contains([';', ',']) {
+			return Ok(vec![Str::from(authored)]);
+		}
+		let targets = selector::split_delimited_targets(authored);
 		if targets.is_empty() {
 			return Err(Fault::Invalid { message: Str::new_static("Path must not be empty") });
 		}
-		Ok(targets)
+		// Delimiters only become a list when every member resolves directly;
+		// otherwise retain the authored text as one literal path.
+		if futures::future::try_join_all(
+			targets
+				.iter()
+				.cloned()
+				.map(|target| async move { self.sources.stat(target).await }),
+		)
+		.await
+		.is_ok()
+		{
+			Ok(targets)
+		} else {
+			Ok(vec![Str::from(authored)])
+		}
 	}
 
 	async fn execute_target(&self, authored: &str) -> Result<Vec<PayloadPart>, Fault> {
@@ -1296,7 +1321,9 @@ fn structural_summary(path: &str, text: &str) -> Option<StructuralRender> {
 		{
 			rows.push(format::format_merged_brace_line(*start, *end, head, tail).model);
 			source_lines.push(smallvec::smallvec![*start, *end]);
-			elided.push(format::ElidedRange { start: *start, end: *end });
+			if end.saturating_sub(*start) > 1 {
+				elided.push(format::ElidedRange { start: *start + 1, end: *end - 1 });
+			}
 			elided_lines += end.saturating_sub(*start).saturating_sub(1);
 			index += 3;
 			continue;

@@ -596,21 +596,14 @@ pub fn format_summary_elision_footer(
 	if elided_ranges.is_empty() {
 		return String::new();
 	}
-	let sample_count = elided_ranges.len().min(2);
 	let mut selector = String::new();
-	for (index, range) in elided_ranges[..sample_count].iter().enumerate() {
+	for (index, range) in elided_ranges.iter().enumerate() {
 		if index > 0 {
 			selector.push(',');
 		}
 		let _ = write!(selector, "{}-{}", range.start, range.end);
 	}
-	let example = format!("{read_path}:{selector}");
-	let tail = if elided_ranges.len() > sample_count {
-		format!(", e.g. {example}")
-	} else {
-		format!(" with {example}")
-	};
-	format!("[…{elided_lines}ln elided; re-read needed ranges{tail}]")
+	format!("[…{elided_lines}ln elided; re-read needed ranges with {read_path}:{selector}]")
 }
 
 /// Decide whether an elided structural body can collapse its brace endpoints.
@@ -928,4 +921,21 @@ fn normalize_display_separators(mut path: String) -> String {
 		path = path.replace(MAIN_SEPARATOR, "/");
 	}
 	path
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn summary_footer_names_the_exact_multi_range_recovery_selector() {
+		assert_eq!(
+			format_summary_elision_footer(
+				"src/lib.rs",
+				&[ElidedRange { start: 5, end: 16 }, ElidedRange { start: 960, end: 973 }],
+				26,
+			),
+			"[…26ln elided; re-read needed ranges with src/lib.rs:5-16,960-973]"
+		);
+	}
 }

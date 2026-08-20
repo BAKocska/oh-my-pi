@@ -234,6 +234,8 @@ fn registers_all_utility_and_process_builtins() {
 		"base64",
 		"basename",
 		"cat",
+		"cksum",
+		#[cfg(feature = "util.cmp")]
 		"cmp",
 		"combine",
 		"comm",

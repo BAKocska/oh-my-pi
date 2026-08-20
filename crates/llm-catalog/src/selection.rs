@@ -63,7 +63,10 @@ pub fn role_assignment_selector(
 	let mut formatted = String::with_capacity(
 		parsed.model.len()
 			+ thinking.len()
-			+ parsed.upstream.as_ref().map_or(1, |upstream| upstream.len().saturating_add(2)),
+			+ parsed
+				.upstream
+				.as_ref()
+				.map_or(1, |upstream| upstream.len().saturating_add(2)),
 	);
 	formatted.push_str(&parsed.model);
 	formatted.push(':');
@@ -96,7 +99,6 @@ pub fn upsert_role_assignment(
 	roles.push(replacement);
 	Ok(true)
 }
-
 
 /// The built-in role vocabulary.  Values remain user-configurable; these ids
 /// are the stable public contract used by selectors and persisted settings.
@@ -177,7 +179,7 @@ pub fn parse_selector(input: &str) -> Result<ParsedSelector, SelectionError> {
 	let (model, suffix) = before_upstream
 		.rsplit_once(':')
 		.unwrap_or((before_upstream, ""));
-	if model.is_empty() {
+	if model.is_empty() || model.ends_with(':') {
 		return Err(SelectionError::Invalid(input.into()));
 	}
 	let mut parsed = ParsedSelector { model: model.into(), upstream, thinking: None, route: None };
@@ -270,7 +272,9 @@ fn select_inner(
 	// Guard `:max`/`:auto`: catalog literals win over suffix interpretation.
 	let literal = ModelKey::from(selector);
 	if matches!(parsed.thinking.as_deref(), Some("max" | "auto"))
-		&& models.iter().any(|model| model.key == literal)
+		&& models
+			.iter()
+			.any(|model| model.key == literal || logical_id(&model.key) == selector)
 	{
 		return choose(models, routes, mru, selector, None, None, None, &literal, selector);
 	}
@@ -281,7 +285,13 @@ fn select_inner(
 	if id.is_empty() {
 		return Err(SelectionError::Invalid(selector.into()));
 	}
-	let exact = ModelKey::from(id);
+	// Catalog keys are `provider/logical` composites; a provider-qualified
+	// selector reconstructs the composite while a bare selector matches the
+	// logical portion exactly (see `choose`).
+	let exact = match provider {
+		Some(provider) => ModelKey::new(format!("{provider}/{id}")),
+		None => ModelKey::from(id),
+	};
 	if let Ok(found) = choose(
 		models,
 		routes,
@@ -343,7 +353,7 @@ fn choose(
 ) -> Result<SelectedModel, SelectionError> {
 	let candidates = candidates(models, routes, provider, exact.as_str(), route)
 		.into_iter()
-		.filter(|(_, model)| model.key == *exact)
+		.filter(|(_, model)| model.key == *exact || logical_id(&model.key) == exact.as_str())
 		.collect();
 	choose_candidates(
 		candidates,
@@ -381,6 +391,13 @@ fn candidates<'a>(
 		})
 		.filter(|(_, model)| model.availability != ModelAvailability::Disabled)
 		.collect()
+}
+
+/// The key's logical portion, without its provider prefix.
+fn logical_id(key: &ModelKey) -> &str {
+	key.as_str()
+		.split_once('/')
+		.map_or(key.as_str(), |(_, rest)| rest)
 }
 
 fn choose_candidates(
@@ -587,8 +604,10 @@ mod tests {
 
 	#[test]
 	fn non_default_role_retains_explicit_auto_thinking() {
-		let mut roles = vec![ModelRole::assignment("default", "openai/primary", Some("high"))
-			.expect("default assignment")];
+		let mut roles = vec![
+			ModelRole::assignment("default", "openai/primary", Some("high"))
+				.expect("default assignment"),
+		];
 		assert!(
 			upsert_role_assignment(&mut roles, "task", "openai-codex/worker", Some("auto"))
 				.expect("task assignment")
@@ -615,27 +634,31 @@ mod tests {
 	#[test]
 	fn matching_cascade_is_table_driven() {
 		let catalog = crate::Catalog::embedded();
-		let model = catalog
-			.models()
+		let models = catalog.models();
+		// Catalog keys are `provider/logical` composites. Pick a model whose
+		// logical id is unambiguous and whose key prefix owns a real route, so
+		// both the bare and provider-qualified rungs resolve deterministically.
+		let model = models
 			.iter()
-			.find(|model| !model.key.as_str().contains('/'))
-			.expect("simple catalog key");
-		let route = catalog
-			.route(model.routes.first().expect("model route"))
-			.expect("catalog route");
+			.find(|model| {
+				let Some((prefix, rest)) = model.key.as_str().split_once('/') else {
+					return false;
+				};
+				!rest.contains('/')
+					&& models
+						.iter()
+						.filter(|other| logical_id(&other.key) == rest)
+						.count() == 1
+					&& model.routes.iter().any(|id| {
+						catalog
+							.route(id)
+							.is_some_and(|route| route.provider == prefix)
+					})
+			})
+			.expect("uniquely keyed catalog model");
+		let (provider, bare) = model.key.as_str().split_once('/').expect("composite key");
 		let mru = BTreeMap::new();
-		for (selector, expected_provider, expected_model) in [
-			(
-				model.key.as_str().to_owned(),
-				route.provider.as_str().to_owned(),
-				model.key.as_str().to_owned(),
-			),
-			(
-				format!("{}/{}", route.provider, model.key),
-				route.provider.as_str().to_owned(),
-				model.key.as_str().to_owned(),
-			),
-		] {
+		for selector in [bare.to_owned(), model.key.as_str().to_owned()] {
 			let selected = select_model(
 				catalog.models(),
 				catalog.routes(),
@@ -645,8 +668,8 @@ mod tests {
 				&selector,
 			)
 			.expect(&selector);
-			assert_eq!(selected.provider.as_str(), expected_provider);
-			assert_eq!(selected.model.as_str(), expected_model);
+			assert_eq!(selected.provider.as_str(), provider, "{selector}");
+			assert_eq!(selected.model, model.key, "{selector}");
 		}
 	}
 }

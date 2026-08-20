@@ -1,7 +1,5 @@
 //! Workspace-generation and detach-in-place integration contracts.
 
-#![cfg(unix)]
-
 use std::{future::Future, time::Duration};
 
 use bytes::Bytes;

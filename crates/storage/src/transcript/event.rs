@@ -523,6 +523,10 @@ pub enum Kind {
 		first_kept:    u64,
 		/// Token count before compaction.
 		tokens_before: u64,
+		/// Estimated token count after compaction, when measured.
+		tokens_after:  Option<u64>,
+		/// Ladder method that produced this compaction.
+		method:        Option<Str>,
 		/// Optional compaction warning.
 		warning:       Option<Str>,
 		/// Losing custom-summary proposals in deterministic publisher order.
@@ -673,6 +677,8 @@ impl PartialEq for Kind {
 					short: a_short,
 					first_kept: a_first_kept,
 					tokens_before: a_tokens_before,
+					tokens_after: a_tokens_after,
+					method: a_method,
 					warning: a_warning,
 					superseded: a_superseded,
 				},
@@ -681,12 +687,31 @@ impl PartialEq for Kind {
 					short: b_short,
 					first_kept: b_first_kept,
 					tokens_before: b_tokens_before,
+					tokens_after: b_tokens_after,
+					method: b_method,
 					warning: b_warning,
 					superseded: b_superseded,
 				},
 			) => {
-				(a_summary, a_short, a_first_kept, a_tokens_before, a_warning, a_superseded)
-					== (b_summary, b_short, b_first_kept, b_tokens_before, b_warning, b_superseded)
+				(
+					a_summary,
+					a_short,
+					a_first_kept,
+					a_tokens_before,
+					a_tokens_after,
+					a_method,
+					a_warning,
+					a_superseded,
+				) == (
+					b_summary,
+					b_short,
+					b_first_kept,
+					b_tokens_before,
+					b_tokens_after,
+					b_method,
+					b_warning,
+					b_superseded,
+				)
 			},
 			(
 				Self::Branch { from: a_from, summary: a_summary },

@@ -4315,7 +4315,9 @@ fn compile_pricing(
 			})
 		})
 		.transpose()?;
-	let long_context = authored_long_context.as_ref().or(cost.long_context.as_ref());
+	let long_context = authored_long_context
+		.as_ref()
+		.or(cost.long_context.as_ref());
 	let mut tiers = Vec::new();
 	if let Some(tier) = long_context {
 		tiers.push(PriceTier {
@@ -4759,17 +4761,13 @@ mod tests {
 			"cacheWrite": 6.25
 		}))
 		.expect("base pricing parses");
-		let pricing = compile_pricing(
-			"openai-codex",
-			"gpt-5.6-sol",
-			&cost,
-			resolved.catalog.get("longContext"),
-		)
-		.expect("tier compiles");
+		let pricing =
+			compile_pricing("openai-codex", "gpt-5.6-sol", &cost, resolved.catalog.get("longContext"))
+				.expect("tier compiles");
 		let boundary = pricing
 			.cost(crate::pricing::UsageDimensions {
-				input_tokens:      72_000,
-				output_tokens:     10_000,
+				input_tokens: 72_000,
+				output_tokens: 10_000,
 				cache_read_tokens: 200_000,
 				..crate::pricing::UsageDimensions::default()
 			})
@@ -4777,8 +4775,8 @@ mod tests {
 		assert_eq!(boundary, crate::pricing::NanoUsd::from_nanos(760_000_000));
 		let above = pricing
 			.cost(crate::pricing::UsageDimensions {
-				input_tokens:      72_001,
-				output_tokens:     10_000,
+				input_tokens: 72_001,
+				output_tokens: 10_000,
 				cache_read_tokens: 200_000,
 				..crate::pricing::UsageDimensions::default()
 			})
@@ -4933,7 +4931,7 @@ usage = true
 			"reasoning-axes.kdl",
 			r#"class "qwen" {
 				template-reasoning-effort #true
-				thinking-tool-choice-conflict "drop_auto_when_thinking"
+				thinking-tool-choice-conflict "drop_thinking_when_any"
 			}"#,
 		)])
 		.expect("KDL grammar accepts the reasoning axes");
@@ -4949,12 +4947,11 @@ usage = true
 			.expect("axes resolve");
 		let source =
 			axis_map_to_source_wire_policy(resolved.wire).expect("resolved axes deserialize");
-		let policy =
-			compile_wire_policy(WirePolicy::baseline(), &source).expect("axes compile");
+		let policy = compile_wire_policy(WirePolicy::baseline(), &source).expect("axes compile");
 		assert_eq!(policy.reasoning.template_reasoning_effort, Some(true));
 		assert_eq!(
 			policy.tool.thinking_conflict,
-			Some(crate::policy::ThinkingToolChoiceConflict::DropAutoWhenThinking)
+			Some(crate::policy::ThinkingToolChoiceConflict::DropThinkingWhenAny)
 		);
 	}
 

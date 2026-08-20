@@ -108,11 +108,7 @@ mod tests {
 			.await
 			.expect("test shell should build");
 		let command = SleepCommand { durations: vec!["infinity".into()] };
-		let context = ExecutionContext {
-			shell: &mut shell,
-			command_name: "sleep".into(),
-			params,
-		};
+		let context = ExecutionContext { shell: &mut shell, command_name: "sleep".into(), params };
 		let execution = async {
 			let (result, ()) = tokio::join!(command.execute(context), async {
 				tokio::task::yield_now().await;
@@ -140,11 +136,7 @@ mod tests {
 			.build()
 			.await
 			.expect("test shell should build");
-		let context = ExecutionContext {
-			shell: &mut shell,
-			command_name: "sleep".into(),
-			params,
-		};
+		let context = ExecutionContext { shell: &mut shell, command_name: "sleep".into(), params };
 		let result = command
 			.execute(context)
 			.await

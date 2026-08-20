@@ -50,6 +50,7 @@ impl NohupCommand {
 
 impl builtins::Command for NohupCommand {
 	type Error = omp_shell_engine::Error;
+
 	fn new<I>(args: I) -> std::result::Result<Self, clap::Error>
 	where
 		I: IntoIterator<Item = String>,
@@ -57,7 +58,6 @@ impl builtins::Command for NohupCommand {
 		// The first element is the command name itself.
 		Ok(Self::from_argv(args.into_iter().skip(1).collect()))
 	}
-
 
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,

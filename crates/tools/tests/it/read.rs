@@ -803,7 +803,7 @@ fn sqlite_fixture() -> TempDb {
 		std::process::id(),
 		NEXT.fetch_add(1, Ordering::Relaxed),
 	));
-	std::fs::write(&path, include_bytes!("fixtures/special-sources/database/catalog.sqlite"))
+	std::fs::write(&path, include_bytes!("../fixtures/special-sources/database/catalog.sqlite"))
 		.expect("copy checked-in SQLite fixture");
 	TempDb(path)
 }
@@ -975,11 +975,11 @@ async fn long_sqlite_query_is_interrupted_without_blocking_the_runtime() {
 }
 
 const fn zip_fixture() -> Bytes {
-	Bytes::from_static(include_bytes!("fixtures/special-sources/archives/bundle.zip"))
+	Bytes::from_static(include_bytes!("../fixtures/special-sources/archives/bundle.zip"))
 }
 
 const fn tar_fixture() -> Bytes {
-	Bytes::from_static(include_bytes!("fixtures/special-sources/archives/bundle.tar.gz"))
+	Bytes::from_static(include_bytes!("../fixtures/special-sources/archives/bundle.tar.gz"))
 }
 
 fn encoded_zip(entries: &[(&str, &str)]) -> Bytes {
@@ -1127,7 +1127,7 @@ async fn suffix_resolved_archive_container_dispatches_with_exact_notice() {
 #[tokio::test]
 async fn notebook_cells_are_projected_with_editable_markers() {
 	let sources = Sources::default();
-	let notebook = include_str!("fixtures/special-sources/notebooks/book.ipynb");
+	let notebook = include_str!("../fixtures/special-sources/notebooks/book.ipynb");
 	sources.file("book.ipynb", notebook);
 	assert_eq!(
 		text(sources.clone(), r#"{"path":"book.ipynb"}"#).await,
@@ -1161,7 +1161,7 @@ async fn notebook_cells_are_projected_with_editable_markers() {
 #[tokio::test]
 async fn conflicted_notebook_selector_runs_before_notebook_json_conversion() {
 	let sources = Sources::default();
-	sources.file("merge.ipynb", include_str!("fixtures/special-sources/conflicts/merge.ipynb"));
+	sources.file("merge.ipynb", include_str!("../fixtures/special-sources/conflicts/merge.ipynb"));
 	let output = text(sources, r#"{"path":"merge.ipynb:conflicts"}"#).await;
 	assert!(
 		output.starts_with(
@@ -1178,7 +1178,7 @@ async fn document_raw_selector_returns_converted_markdown_without_line_projectio
 	let sources = Sources::default();
 	sources.file(
 		"report.docx",
-		Bytes::from_static(include_bytes!("fixtures/special-sources/documents/report.docx")),
+		Bytes::from_static(include_bytes!("../fixtures/special-sources/documents/report.docx")),
 	);
 	assert_eq!(
 		text(sources.clone(), r#"{"path":"report.docx:raw"}"#).await,
@@ -1187,7 +1187,7 @@ async fn document_raw_selector_returns_converted_markdown_without_line_projectio
 	assert!(sources.snapshots.lock().is_empty());
 }
 
-const CONFLICTED: &str = include_str!("fixtures/special-sources/conflicts/merge.txt");
+const CONFLICTED: &str = include_str!("../fixtures/special-sources/conflicts/merge.txt");
 
 #[tokio::test]
 async fn conflict_selector_is_a_compact_index_and_normal_read_appends_warning() {
@@ -1281,7 +1281,7 @@ async fn ordinary_conflict_warning_requires_a_complete_emitted_marker_block() {
 }
 
 const fn png_fixture() -> Bytes {
-	Bytes::from_static(include_bytes!("fixtures/special-sources/images/pixel.png"))
+	Bytes::from_static(include_bytes!("../fixtures/special-sources/images/pixel.png"))
 }
 
 #[tokio::test]
@@ -1295,6 +1295,7 @@ async fn image_read_emits_description_and_blob_and_rejects_over_twenty_mibibytes
 	};
 	let expected = concat!(
 		"Read image file [image/jpeg]\n",
+		"[Inspection: MIME image/jpeg; dimensions 8x6; channels 3; alpha no]\n",
 		"[Image: original 8x6, displayed at 267x200. Multiply coordinates by 0.03 to map to \
 		 original image.]",
 	);
@@ -1314,7 +1315,7 @@ async fn image_read_emits_description_and_blob_and_rejects_over_twenty_mibibytes
 #[tokio::test]
 async fn cpu_profile_is_summarized_instead_of_dumping_json() {
 	let sources = Sources::default();
-	let profile = include_str!("fixtures/special-sources/profiles/run.cpuprofile");
+	let profile = include_str!("../fixtures/special-sources/profiles/run.cpuprofile");
 	sources.file("run.cpuprofile", profile);
 	assert_eq!(
 		text(sources.clone(), r#"{"path":"run.cpuprofile"}"#).await,
@@ -1334,8 +1335,10 @@ async fn cpu_profile_is_summarized_instead_of_dumping_json() {
 #[tokio::test]
 async fn macos_sample_profile_uses_the_checked_in_call_tree_fixture() {
 	let sources = Sources::default();
-	sources
-		.file("trace.sample.txt", include_str!("fixtures/special-sources/profiles/trace.sample.txt"));
+	sources.file(
+		"trace.sample.txt",
+		include_str!("../fixtures/special-sources/profiles/trace.sample.txt"),
+	);
 	let output = text(sources.clone(), r#"{"path":"trace.sample.txt"}"#).await;
 	assert!(
 		output.starts_with("1:macOS sample profile: fixture (pid 123), sampled every 1 ms\n"),
@@ -1364,7 +1367,7 @@ async fn checked_in_url_mock_drives_the_network_free_html_pipeline() {
 			Str::new_static("text/html; charset=utf-8"),
 		)]
 		.into(),
-		body:         Bytes::from_static(include_bytes!("fixtures/special-sources/web/page.html")),
+		body:         Bytes::from_static(include_bytes!("../fixtures/special-sources/web/page.html")),
 	}));
 	let output = text(sources, r#"{"path":"https://fixture.invalid/page"}"#).await;
 	assert!(

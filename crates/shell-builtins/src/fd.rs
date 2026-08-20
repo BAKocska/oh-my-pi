@@ -17,7 +17,7 @@ use std::{
 
 use clap::{ArgAction, Parser, ValueEnum};
 use globset::{GlobBuilder, GlobMatcher};
-use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
+use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use omp_walker::CollectedEntry;
 use regex::{Regex, RegexBuilder};
 

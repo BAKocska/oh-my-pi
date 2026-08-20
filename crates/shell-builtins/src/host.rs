@@ -37,12 +37,12 @@ use std::{
 };
 
 use im::HashMap;
-use parking_lot::Mutex;
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, ShellExtensions,
 	builtins::{self, Registration},
 	openfiles::{self, OpenFile, OpenFiles},
 };
+use parking_lot::Mutex;
 
 /// A command-line utility implemented as a shell builtin.
 ///
@@ -343,6 +343,7 @@ impl Write for StreamWriter {
 			Self::Shared(shared) => shared.lock().write(buf),
 		}
 	}
+
 	fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
 		match self {
 			Self::Block(writer) => writer.write_all(buf),
@@ -358,7 +359,6 @@ impl Write for StreamWriter {
 			Self::Shared(shared) => shared.lock().write_fmt(args),
 		}
 	}
-
 
 	fn flush(&mut self) -> io::Result<()> {
 		match self {
@@ -975,11 +975,11 @@ mod testing {
 		pub fn stdout(&self) -> Vec<u8> {
 			self.stdout.lock().clone()
 		}
+
 		/// Shares stdout's backing buffer for mid-execution observations.
 		pub(crate) fn stdout_buffer(&self) -> Arc<Mutex<Vec<u8>>> {
 			Arc::clone(&self.stdout)
 		}
-
 
 		/// Raw bytes the utility wrote to stderr.
 		pub fn stderr(&self) -> Vec<u8> {
@@ -1007,11 +1007,7 @@ mod testing {
 			stdin: impl Into<Vec<u8>>,
 			cwd: impl Into<PathBuf>,
 		) -> (Self, Capture) {
-			Self::for_test_with_stdin(
-				name,
-				Box::new(MemStream::reader(stdin.into())),
-				cwd,
-			)
+			Self::for_test_with_stdin(name, Box::new(MemStream::reader(stdin.into())), cwd)
 		}
 
 		/// Builds a host backed by arbitrary in-memory stdin.
@@ -1026,7 +1022,11 @@ mod testing {
 			};
 			let cancel = Arc::new(AtomicBool::new(false));
 			let host = Self {
-				stdin: Stdin { file: OpenFile::Stream(stdin), fd: None, cancel: Arc::clone(&cancel) },
+				stdin: Stdin {
+					file:   OpenFile::Stream(stdin),
+					fd:     None,
+					cancel: Arc::clone(&cancel),
+				},
 				stdout: OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stdout)))),
 				stderr: StreamWriter::new(OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(
 					&capture.stderr,
@@ -1197,9 +1197,8 @@ mod testing {
 		#[test]
 		fn shared_handles_preserve_write_order() {
 			let buffer = Arc::new(Mutex::new(Vec::new()));
-			let inner = StreamWriter::line(OpenFile::Stream(Box::new(MemStream::writer(
-				Arc::clone(&buffer),
-			))));
+			let inner =
+				StreamWriter::line(OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&buffer)))));
 			let shared = Arc::new(Mutex::new(inner));
 			let mut out = StreamWriter::Shared(Arc::clone(&shared));
 			let mut err = StreamWriter::Shared(shared);
@@ -1223,8 +1222,7 @@ mod testing {
 			assert!(same_destination(&a, &b));
 
 			let (other_reader, other_writer) = std::io::pipe().unwrap();
-			let other =
-				OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(other_writer)));
+			let other = OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(other_writer)));
 			assert!(!same_destination(&a, &other));
 
 			let dir = tempfile::tempdir().unwrap();

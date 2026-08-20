@@ -1,12 +1,92 @@
 use omp_core::{Str, fmts};
 use omp_tui::{
-	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent, dom,
+	Border, Cached, Component, Dim, IntoChildren, Key, Layer, Mouse, OverlayAnchor, OverlayOptions,
+	PaintCtx, Prop, Props, Rect, Size, Slot, Ui, UiContext, UiEvent,
+	components::{Boxed, Hr},
+	dom,
 };
 
 use crate::PickerEvent;
 
 const LIST_HINT: &str = "↑/↓ choose · Enter select · type to search · Esc close";
 const PROMPT_HINT: &str = "Enter submit · Esc cancel";
+/// Shared rounded overlay chrome with a title inset into its top rule.
+///
+/// Dialogs and pickers add their content through [`OverlayPanel::child`]
+/// instead of constructing their own outer border.
+pub struct OverlayPanel {
+	inner: Boxed,
+}
+
+impl OverlayPanel {
+	/// Creates an empty titled panel with the standard horizontal inset.
+	pub fn new(title: impl Into<Str>) -> Self {
+		let title: Str = title.into();
+		Self {
+			inner: Boxed::new()
+				.with(Prop::Border, Border::Round)
+				.with(Prop::Title, title)
+				.with(Prop::PadX, 1_u16),
+		}
+	}
+
+	/// Adds vertical padding inside the shared border.
+	#[must_use]
+	pub fn pad_y(mut self, rows: u16) -> Self {
+		self.inner.props_mut().set(Prop::PadY, rows);
+		self
+	}
+
+	/// Appends panel content.
+	#[must_use]
+	pub fn child(mut self, children: impl IntoChildren) -> Self {
+		self.inner = self.inner.child(children);
+		self
+	}
+}
+
+impl Component for OverlayPanel {
+	fn props(&self) -> &Props {
+		self.inner.props()
+	}
+
+	fn props_mut(&mut self) -> &mut Props {
+		self.inner.props_mut()
+	}
+
+	fn slot(&self) -> Slot {
+		self.inner.slot()
+	}
+
+	fn children(&self) -> &[Cached] {
+		self.inner.children()
+	}
+
+	fn children_mut(&mut self) -> &mut [Cached] {
+		self.inner.children_mut()
+	}
+
+	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
+		self.inner.measure(ctx)
+	}
+
+	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
+		self.inner.height(ctx, width)
+	}
+
+	fn place(&mut self, ctx: &UiContext, content: Rect) {
+		self.inner.place(ctx, content);
+	}
+
+	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		self.inner.paint(pc, rect);
+	}
+}
+
+/// Creates the standard rounded horizontal section rule for an overlay panel.
+pub fn panel_divider() -> Hr {
+	Hr::new().with(Prop::Border, Border::Round)
+}
 
 /// One host-supplied row for [`ListPicker`].
 #[derive(Clone, Debug)]
@@ -152,21 +232,20 @@ fn build_list(
 	let seed = Str::from(query);
 	let height = list_rows.saturating_add(1);
 	Ui::from_root(
-		dom! {
-			<box border=round title={title} pad-x=1>
-				<col>
-					<select id="list-picker" filter={seed} h={height}>
-						for (value, haystack, label, detail, selected) in display {
-							<option value={value} label={haystack} recommended={selected}>
-								<td truncate><pre fg=fg>{label}</pre></td>
-								<td truncate grow><pre fg=muted>{detail}</pre></td>
-							</option>
-						}
-					</select>
-					<text dim truncate>{LIST_HINT}</text>
-				</col>
-			</box>
-		},
+		OverlayPanel::new(title).child(dom! {
+			<col>
+				<select id="list-picker" filter={seed} h={height}>
+					for (value, haystack, label, detail, selected) in display {
+						<option value={value} label={haystack} recommended={selected}>
+							<td truncate><pre fg=fg>{label}</pre></td>
+							<td truncate grow><pre fg=muted>{detail}</pre></td>
+						</option>
+					}
+				</select>
+				{panel_divider()}
+				<text dim truncate>{LIST_HINT}</text>
+			</col>
+		}),
 		width,
 		ctx.clone(),
 	)
@@ -273,15 +352,13 @@ impl PromptOverlay {
 fn build_prompt(title: &str, masked: bool, width: u16, ctx: &UiContext) -> Ui {
 	let title = Str::from(title);
 	Ui::from_root(
-		dom! {
-			<box border=round title={title} pad-x=1 pad-y=1>
-				<col>
-					<input id="prompt-input" submit mask={masked} placeholder="Enter value"/>
-					<spacer h=1/>
-					<text dim truncate>{PROMPT_HINT}</text>
-				</col>
-			</box>
-		},
+		OverlayPanel::new(title).pad_y(1).child(dom! {
+			<col>
+				<input id="prompt-input" submit mask={masked} placeholder="Enter value"/>
+				{panel_divider()}
+				<text dim truncate>{PROMPT_HINT}</text>
+			</col>
+		}),
 		width,
 		ctx.clone(),
 	)
@@ -290,6 +367,14 @@ fn build_prompt(title: &str, masked: bool, width: u16, ctx: &UiContext) -> Ui {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn overlay_panel_owns_standard_chrome() {
+		let panel = OverlayPanel::new("Models");
+		assert_eq!(panel.props().border(), Some(Border::Round));
+		assert_eq!(panel.props().title().map(Str::as_str), Some("Models"));
+		assert_eq!(panel.props().pad(), (0, 1));
+		assert_eq!(panel_divider().props().border(), Some(Border::Round));
+	}
 
 	#[test]
 	fn list_picker_keeps_host_keys_out_of_option_values() {

@@ -1276,21 +1276,12 @@ mod tests {
 			.into_iter()
 			.map(|header| (header.name, header.value))
 			.collect::<BTreeMap<_, _>>();
-		assert_eq!(
-			headers.get("content-type").map(Str::as_str),
-			Some("application/connect+proto")
-		);
+		assert_eq!(headers.get("content-type").map(Str::as_str), Some("application/connect+proto"));
 		assert_eq!(headers.get("connect-protocol-version").map(Str::as_str), Some("1"));
-		assert_eq!(
-			headers.get("connect-content-encoding").map(Str::as_str),
-			Some("gzip")
-		);
+		assert_eq!(headers.get("connect-content-encoding").map(Str::as_str), Some("gzip"));
 		assert_eq!(headers.get("connect-accept-encoding").map(Str::as_str), Some("gzip"));
 		assert_eq!(headers.get("accept-encoding").map(Str::as_str), Some("identity"));
-		assert_eq!(
-			headers.get("user-agent").map(Str::as_str),
-			Some("connect-go/1.18.1 (go1.26.3)")
-		);
+		assert_eq!(headers.get("user-agent").map(Str::as_str), Some("connect-go/1.18.1 (go1.26.3)"));
 		assert!(!headers.contains_key("content-encoding"));
 		assert_eq!(MAX_CONNECT_FRAME_BYTES, 16 * 1024 * 1024);
 	}

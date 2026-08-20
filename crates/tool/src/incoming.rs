@@ -558,21 +558,6 @@ async fn validate_structure(
 						})));
 					}
 					seen.push(identity);
-					if !node.canonical.is_empty()
-						&& let Some((rev, specs)) = arg_specs
-						&& let Some(parent) = specs.get(rev, &node.canonical)
-						&& !parent.additional_properties
-						&& spec.is_none()
-						&& parent.from_union_branch
-					{
-						return Err(ParamError::Args(Box::new(ArgIssue {
-							path:     candidate.into_iter().collect(),
-							expected: Str::from("a declared object member"),
-							kind:     ArgIssueKind::Malformed,
-							example:  parent.example.clone(),
-							found:    Some(Str::from("undeclared open-map member")),
-						})));
-					}
 				}
 				for (key, value) in object {
 					let candidate = child_path(&node.canonical, ArgPath::Key(key.clone()));
@@ -640,9 +625,8 @@ fn canonicalize(
 				let candidate = child_path(path, ArgPath::Key(key.clone()));
 				let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
 				if spec.is_none()
-					&& parent.is_some_and(|parent| {
-						!parent.additional_properties && !parent.from_union_branch
-					})
+					&& parent
+						.is_some_and(|parent| !parent.additional_properties && !parent.from_union_branch)
 				{
 					repairs.push(crate::Repair {
 						path:   candidate,

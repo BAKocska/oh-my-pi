@@ -11,13 +11,190 @@ use std::{
 };
 
 use omp_core::{AppendVec, InvocationPhase, Str};
+use omp_llm_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use parking_lot::{Mutex, RwLock};
+use serde_json::Value;
 use thiserror::Error;
 
 /// Default tree-wide number of concurrently running agent turns.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 32;
 /// Default number of whole spawn waves allowed to await admission.
 pub const DEFAULT_MAX_ADMISSION_QUEUE: usize = 128;
+
+/// Validated terminal or incremental subagent yield.
+#[derive(Clone, Debug, PartialEq)]
+pub struct YieldPayload {
+	/// Verbatim structured success payload after lossless string-container
+	/// salvage, when present.
+	pub data:          Option<Value>,
+	/// Caller-reported terminal failure.
+	pub error:         Option<Str>,
+	/// String terminal label or array incremental section path.
+	pub kind:          Option<Value>,
+	/// Whether finalization should consume the child's last assistant turn.
+	pub use_last_turn: bool,
+	/// Whether this call submitted an incremental section.
+	pub incremental:   bool,
+}
+
+/// Retryable malformed-yield reason returned in-band to the child.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum YieldPayloadError {
+	/// `type` was neither a string nor a non-empty string array.
+	#[error("type must be a string or non-empty array of strings")]
+	InvalidType,
+	/// No object-shaped result envelope could be recovered.
+	#[error("result must be an object containing either data or error")]
+	InvalidEnvelope,
+	/// A success envelope carried explicit null data.
+	#[error("data is required when yield indicates success")]
+	MissingData,
+	/// A failure envelope did not carry a string error.
+	#[error("error must be a string when yield indicates failure")]
+	InvalidError,
+	/// Structured tasks cannot use prose-only last-turn finalization.
+	#[error(
+		"this task requires structured output matching the declared schema; submit the full object \
+		 as result.data"
+	)]
+	SchemaBoundLastTurn,
+	/// The recovered payload did not match the declared output schema.
+	#[error("yield payload violates output schema at {path} ({rule})")]
+	SchemaViolation {
+		/// JSON Pointer-like failing payload path.
+		path: Str,
+		/// Stable schema rule identifier.
+		rule: &'static str,
+	},
+}
+
+/// Stateful, verbatim validator for one subagent's yield calls.
+///
+/// Generic argument coercion must never run before this validator: accepted
+/// payloads are the child's deliverable, not tool plumbing. Only reversible
+/// wrapper recovery and JSON-container parsing are performed here.
+pub struct YieldPayloadValidator {
+	schema:                   Option<Value>,
+	strict:                   bool,
+	has_incremental_sections: bool,
+}
+
+impl YieldPayloadValidator {
+	/// Creates a validator for an optional declared output schema.
+	#[must_use]
+	pub fn new(schema: Option<Value>, strict: bool) -> Self {
+		Self { schema, strict, has_incremental_sections: false }
+	}
+
+	/// Validates and losslessly salvages one raw yield argument object.
+	pub fn validate(&mut self, raw: &Value) -> Result<YieldPayload, YieldPayloadError> {
+		let raw = raw.as_object().ok_or(YieldPayloadError::InvalidEnvelope)?;
+		let kind = parse_yield_kind(raw.get("type"))?;
+		let incremental = kind.as_ref().is_some_and(Value::is_array);
+		let result =
+			resolve_result_record(raw, kind.is_some()).ok_or(YieldPayloadError::InvalidEnvelope)?;
+		let error = match result.get("error") {
+			Some(Value::String(error)) => Some(Str::from(error.as_str())),
+			Some(_) => return Err(YieldPayloadError::InvalidError),
+			None => None,
+		};
+		let has_data = result.contains_key("data");
+		let mut data = result.get("data").cloned();
+		let use_last_turn = error.is_none() && !has_data && kind.is_some();
+		if error.is_none() && matches!(data, Some(Value::Null)) {
+			return Err(YieldPayloadError::MissingData);
+		}
+		if error.is_none() && !has_data && !use_last_turn {
+			return Err(YieldPayloadError::InvalidEnvelope);
+		}
+		if use_last_turn && self.schema.is_some() && !self.has_incremental_sections && !incremental {
+			return Err(YieldPayloadError::SchemaBoundLastTurn);
+		}
+		if error.is_none()
+			&& !use_last_turn
+			&& !incremental
+			&& let Some(schema) = self.schema.as_ref()
+			&& let Some(value) = data.as_mut()
+		{
+			if let Err(issue) =
+				validate_schema(schema, value, self.strict, ToolAssemblyLimits::default())
+			{
+				let mut salvaged = false;
+				if let Value::String(encoded) = value
+					&& let Some(parsed) = parse_container_string(encoded)
+					&& validate_schema(schema, &parsed, self.strict, ToolAssemblyLimits::default())
+						.is_ok()
+				{
+					*value = parsed;
+					salvaged = true;
+				}
+				if !salvaged {
+					return Err(YieldPayloadError::SchemaViolation {
+						path: issue.path,
+						rule: issue.rule,
+					});
+				}
+			}
+		}
+		if error.is_none() && incremental {
+			self.has_incremental_sections = true;
+		}
+		Ok(YieldPayload { data, error, kind, use_last_turn, incremental })
+	}
+
+	/// Returns whether at least one incremental section was accepted.
+	#[must_use]
+	pub const fn has_incremental_sections(&self) -> bool {
+		self.has_incremental_sections
+	}
+}
+
+fn parse_yield_kind(kind: Option<&Value>) -> Result<Option<Value>, YieldPayloadError> {
+	match kind {
+		None => Ok(None),
+		Some(Value::String(kind)) => Ok(Some(Value::String(kind.clone()))),
+		Some(Value::Array(kinds)) if !kinds.is_empty() && kinds.iter().all(Value::is_string) => {
+			Ok(Some(Value::Array(kinds.clone())))
+		},
+		Some(_) => Err(YieldPayloadError::InvalidType),
+	}
+}
+
+fn resolve_result_record(
+	raw: &serde_json::Map<String, Value>,
+	has_kind: bool,
+) -> Option<serde_json::Map<String, Value>> {
+	let result = match raw.get("result") {
+		Some(Value::String(encoded)) => parse_container_string(encoded),
+		Some(value) => Some(value.clone()),
+		None => None,
+	};
+	if let Some(Value::Object(result)) = result {
+		return Some(result);
+	}
+	if raw.get("result").is_some_and(|result| !result.is_null()) {
+		return None;
+	}
+	if raw.contains_key("data") || raw.contains_key("error") {
+		let mut result = serde_json::Map::new();
+		if let Some(data) = raw.get("data") {
+			result.insert("data".to_owned(), data.clone());
+		}
+		if let Some(error) = raw.get("error") {
+			result.insert("error".to_owned(), error.clone());
+		}
+		return Some(result);
+	}
+	has_kind.then(serde_json::Map::new)
+}
+
+fn parse_container_string(encoded: &str) -> Option<Value> {
+	let encoded = encoded.trim();
+	if !(encoded.starts_with('{') || encoded.starts_with('[')) {
+		return None;
+	}
+	serde_json::from_str(encoded).ok()
+}
 
 /// CONTROL operation whose generated metadata requires effects authorization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
@@ -595,6 +772,8 @@ impl AgentTree {
 
 #[cfg(test)]
 mod tests {
+	use serde_json::json;
+
 	use super::*;
 
 	#[tokio::test]
@@ -631,5 +810,100 @@ mod tests {
 				.max_requests,
 			Some(1)
 		);
+	}
+
+	#[test]
+	fn wrapperless_terminal_yield_uses_last_turn_without_schema() {
+		let mut validator = YieldPayloadValidator::new(None, true);
+		let payload = validator.validate(&json!({"type": "result"})).unwrap();
+		assert!(payload.use_last_turn);
+		assert_eq!(payload.kind, Some(json!("result")));
+		assert!(payload.data.is_none());
+	}
+
+	#[test]
+	fn schema_bound_last_turn_is_retryable_until_a_section_exists() {
+		let schema = json!({
+			"type": "object",
+			"properties": {"summary": {"type": "string"}},
+			"required": ["summary"]
+		});
+		let mut validator = YieldPayloadValidator::new(Some(schema), true);
+		assert_eq!(
+			validator.validate(&json!({"type": "result"})),
+			Err(YieldPayloadError::SchemaBoundLastTurn)
+		);
+		validator
+			.validate(&json!({
+				"type": ["summary"],
+				"result": {"data": "done"}
+			}))
+			.unwrap();
+		assert!(validator.has_incremental_sections());
+		assert!(
+			validator
+				.validate(&json!({"type": "result"}))
+				.unwrap()
+				.use_last_turn
+		);
+	}
+
+	#[test]
+	fn weak_yield_envelopes_are_salvaged_losslessly() {
+		let mut validator = YieldPayloadValidator::new(None, true);
+		assert_eq!(
+			validator
+				.validate(&json!({"data": {"ok": true}}))
+				.unwrap()
+				.data,
+			Some(json!({"ok": true}))
+		);
+		assert_eq!(
+			validator
+				.validate(&json!({"error": "blocked"}))
+				.unwrap()
+				.error,
+			Some(Str::from("blocked"))
+		);
+		assert_eq!(
+			validator
+				.validate(&json!({"result": "{\"data\":{\"ok\":true}}"}))
+				.unwrap()
+				.data,
+			Some(json!({"ok": true}))
+		);
+	}
+
+	#[test]
+	fn schema_payload_parses_container_string_but_never_stringifies_objects() {
+		let object_schema = json!({
+			"type": "object",
+			"properties": {"n": {"type": "number"}},
+			"required": ["n"],
+			"additionalProperties": false
+		});
+		let mut validator = YieldPayloadValidator::new(Some(object_schema), true);
+		assert_eq!(
+			validator
+				.validate(&json!({"result": {"data": "{\"n\":4}"}}))
+				.unwrap()
+				.data,
+			Some(json!({"n": 4}))
+		);
+
+		let string_field_schema = json!({
+			"type": "object",
+			"properties": {"summary": {"type": "string"}},
+			"required": ["summary"],
+			"additionalProperties": false
+		});
+		let mut validator = YieldPayloadValidator::new(Some(string_field_schema), true);
+		assert!(matches!(
+			validator.validate(&json!({
+				"result": {"data": {"summary": {"purge": 13, "keep": 20}}}
+			})),
+			Err(YieldPayloadError::SchemaViolation { path, rule: "type" })
+				if path.as_str() == "/summary"
+		));
 	}
 }

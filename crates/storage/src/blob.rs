@@ -122,6 +122,10 @@ pub enum Error {
 		/// Component kind rejected by the path validator.
 		component: &'static str,
 	},
+	/// A wheel directory exists without the completion marker written before
+	/// its atomic adoption.
+	#[error("incomplete unpacked wheel directory")]
+	IncompleteWheel,
 	/// A blob's stored length differs from the referenced length.
 	#[error("corrupt blob: expected {expected} bytes, found {actual} bytes")]
 	Corrupt {
@@ -376,8 +380,12 @@ impl BlobStore {
 	/// not a valid ZIP archive, or the filesystem cannot stage the directory.
 	pub fn unpack_wheel(&self, wheel: &WheelName, reference: &BlobRef) -> Result<PathBuf, Error> {
 		let destination = self.unpacked_wheel_path(wheel, reference);
-		if destination.is_dir() {
+		let complete = destination.join(".complete");
+		if complete.is_file() {
 			return Ok(destination);
+		}
+		if destination.try_exists()? {
+			return Err(Error::IncompleteWheel);
 		}
 		let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 		let temporary = self
@@ -389,6 +397,7 @@ impl BlobStore {
 			let mut archive = Archive::from_bytes_with_format(&bytes, Format::Zip)?;
 			let directory = Dir::open_ambient_dir(&temporary, ambient_authority())?;
 			archive.extract_to(&directory)?;
+			fs::write(temporary.join(".complete"), b"")?;
 			set_read_only_tree(&temporary)?;
 			Ok::<(), Error>(())
 		})();

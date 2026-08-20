@@ -1533,10 +1533,7 @@ mod tests {
 		assert_eq!(rewritten(&["head", "-q", "-5", "f"]), ["head", "-q", "-n", "5", "f"]);
 		assert_eq!(rewritten(&["head", "-v", "-20", "f"]), ["head", "-v", "-n", "20", "f"]);
 		assert_eq!(rewritten(&["head", "f", "-5"]), ["head", "f", "-n", "5"]);
-		assert_eq!(
-			rewritten(&["head", "-5", "-20", "f"]),
-			["head", "-n", "5", "-n", "20", "f"]
-		);
+		assert_eq!(rewritten(&["head", "-5", "-20", "f"]), ["head", "-n", "5", "-n", "20", "f"]);
 		assert_eq!(rewritten(&["head", "-5qz", "f"]), ["head", "-q", "-z", "-n", "5", "f"]);
 	}
 

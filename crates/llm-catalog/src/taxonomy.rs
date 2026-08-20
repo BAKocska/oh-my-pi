@@ -1,6 +1,10 @@
 //! Checked-in model identity taxonomy.
 
-use std::{borrow::Cow, collections::{BTreeMap, BTreeSet}, sync::LazyLock};
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, BTreeSet},
+	sync::LazyLock,
+};
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use omp_core::{IntoStr, SemVer, Str};
@@ -205,7 +209,7 @@ struct DiscoveryVocabulary {
 	/// Sibling-gateway groups whose bundled catalogs hint the responses route.
 	responses_hint_groups:    Vec<Box<[Str]>>,
 	/// Provider-scoped exact ids pinned to the responses route.
-	responses_route_models:  BTreeMap<Str, Box<[Str]>>,
+	responses_route_models:   BTreeMap<Str, Box<[Str]>>,
 	/// Billing-variant suffixes sharing a transport with their base id.
 	billing_variant_suffixes: Vec<Str>,
 }

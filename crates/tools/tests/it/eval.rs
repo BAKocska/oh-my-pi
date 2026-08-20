@@ -9,11 +9,15 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use omp_core::{Duration, DurationUnit, Str};
 use omp_tool::{
-	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
+	BlobRef, CapsBase, Ev, IncomingParams, Interrupt, JobOwner, ModelClass, Part, PromptCaps, Tool,
+	ToolTerminal,
 };
-use omp_tools::eval::{
-	self, CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, Language,
-	OutputChannel, OutputFrame, Payload, RunEvent, RunRequest, Session,
+use omp_tools::{
+	auto_background::DetachedJob,
+	eval::{
+		self, CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, Language,
+		OutputChannel, OutputFrame, Payload, RunEvent, RunRequest, Session,
+	},
 };
 use serde_json::json;
 
@@ -51,6 +55,48 @@ impl EvalExec for UnusedExec {
 		_request: RunRequest,
 	) -> impl Future<Output = Result<Self::Run, Fault>> + Send + 'a {
 		ready(Err(Fault::SessionLost { message: "unused".into() }))
+	}
+}
+
+#[derive(Clone)]
+struct DetachingExec;
+
+struct DetachingRun;
+
+impl EvalRun for DetachingRun {
+	fn reset(&self) -> bool {
+		false
+	}
+
+	async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
+		std::future::pending().await
+	}
+
+	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
+		ready(Ok(()))
+	}
+
+	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
+		ready(Ok(DetachedJob {
+			id:    Str::from(format!("eval:{name}:1")),
+			owner: JobOwner::NamedProcess { name, generation: 1 },
+		}))
+	}
+}
+
+impl EvalExec for DetachingExec {
+	type Run = DetachingRun;
+
+	fn open_session(&self) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
+		ready(Ok(Session { id: Bytes::from_static(b"eval-session") }))
+	}
+
+	fn run<'a>(
+		&'a self,
+		_session: &'a Session,
+		_request: RunRequest,
+	) -> impl Future<Output = Result<Self::Run, Fault>> + Send + 'a {
+		ready(Ok(DetachingRun))
 	}
 }
 
@@ -211,6 +257,7 @@ fn python_model_description_is_exact_and_has_no_javascript_branch() {
 	let expected = r#"Run one step of code in a persistent kernel. State persists across calls and subagents.
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
+Cells exceeding the foreground wait threshold continue as managed jobs; their results are delivered automatically.
 Parallelize *within* a cell with `parallel(thunks)`, not by batching.
 
 Top-level `await` works; `asyncio.run(…)` raises error.
@@ -251,6 +298,46 @@ Prior top-level names survive into the next cell — reuse; NEVER re-import/re-d
 	assert_eq!(tool().spec().description, expected);
 	assert!(!tool().spec().description.contains("JavaScript"));
 	assert!(!tool().spec().description.contains("Bun"));
+}
+#[tokio::test]
+async fn eval_auto_backgrounds_through_the_managed_job_contract() {
+	let tool = eval::eval(DetachingExec).with_auto_background_threshold(std::time::Duration::ZERO);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::from(r#"{"language":"py","code":"slow()"}"#))
+		.expect("eval invocation remains live");
+	let event = Box::pin(tool.call(params))
+		.next()
+		.await
+		.expect("detached terminal");
+	let Ev::Done(ToolTerminal::Detached(job)) = event else {
+		panic!("zero-threshold eval did not detach");
+	};
+	assert_eq!(job.id, "eval:eval-bg-1:1");
+	assert_eq!(job.owner, JobOwner::NamedProcess {
+		name:       Str::new_static("eval-bg-1"),
+		generation: 1,
+	},);
+}
+
+#[tokio::test]
+async fn steering_detaches_eval_instead_of_cancelling_the_cell() {
+	let tool = eval::eval(DetachingExec);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::from(r#"{"language":"py","code":"slow()"}"#))
+		.expect("eval invocation remains live");
+	feed
+		.interrupt(Interrupt {
+			class:  Str::new_static(Interrupt::STEERING),
+			reason: Str::new_static("new direction"),
+		})
+		.expect("steering remains live");
+	let event = Box::pin(tool.call(params))
+		.next()
+		.await
+		.expect("detached terminal");
+	assert!(matches!(event, Ev::Done(ToolTerminal::Detached(_))));
 }
 
 #[test]

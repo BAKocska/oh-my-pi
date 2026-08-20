@@ -1,8 +1,7 @@
-use super::hr::truncate_to_width;
-
 use omp_core::Str;
 use smallvec::SmallVec;
 
+use super::hr::truncate_to_width;
 use crate::{
 	Icon,
 	component::{Component, PaintCtx, Slot, next_slot},
@@ -35,13 +34,13 @@ pub enum ContextGaugeMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundaryLayout {
 	/// First column of the left group.
-	pub left_x:    u16,
+	pub left_x:         u16,
 	/// First column of the flexible boundary.
-	pub boundary_x: u16,
+	pub boundary_x:     u16,
 	/// Width of the flexible boundary.
 	pub boundary_width: u16,
 	/// First column of the right group.
-	pub right_x:   u16,
+	pub right_x:        u16,
 }
 
 /// Fits left and right status groups around a flexible boundary.
@@ -105,9 +104,7 @@ pub fn spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> S
 		return Str::from(format!("${amount:.4}"));
 	}
 	match charset {
-		Charset::NerdFont => {
-			Str::from(format!("{} {amount:.4}", charset.icon(Icon::Subscription)))
-		},
+		Charset::NerdFont => Str::from(format!("{} {amount:.4}", charset.icon(Icon::Subscription))),
 		Charset::Unicode | Charset::Ascii => Str::from(format!("S{amount:.4}")),
 	}
 }
@@ -333,12 +330,8 @@ impl Component for Status {
 				pc.frame.put(rect.x, rect.y, left_cap, edge_style);
 			}
 			if left_width.saturating_add(cap_width) <= rect.width {
-				pc.frame.put(
-					rect.x.saturating_add(rect.width - cap_width),
-					rect.y,
-					cap,
-					edge_style,
-				);
+				pc.frame
+					.put(rect.x.saturating_add(rect.width - cap_width), rect.y, cap, edge_style);
 			}
 			return;
 		}
@@ -481,7 +474,8 @@ mod tests {
 
 	#[test]
 	fn status_truncates_its_last_chip_at_boundary_widths() {
-		for (width, expected) in [(7, " alp… ›"), (4, " … ›"), (3, " …›"), (2, "…›")] {
+		for (width, expected) in [(7, " alp… ›"), (4, " … ›"), (3, " …›"), (2, "…›")]
+		{
 			let status = Status::new().segment(Segment::new().label("alphabet"));
 			let (frame, _) = paint(status, width);
 			assert_eq!(frame_row_text(&frame, 0), expected);
@@ -544,26 +538,16 @@ mod tests {
 		assert_eq!(spend_label(250_000_000, false, Charset::Ascii), "$0.2500");
 		assert_eq!(spend_label(250_000_000, true, Charset::Ascii), "S0.2500");
 		assert_eq!(spend_label(0, true, Charset::Unicode), "(sub)");
-		assert_eq!(
-			spend_label(250_000_000, true, Charset::NerdFont),
-			"\u{f067a} 0.2500",
-		);
+		assert_eq!(spend_label(250_000_000, true, Charset::NerdFont), "\u{f067a} 0.2500",);
 	}
 
 	#[test]
 	fn advisor_billing_uses_semantic_glyphs() {
-		assert_eq!(
-			advisor_spend_label(250_000_000, false, Charset::Ascii),
-			"$0.2500 (adv)",
-		);
-		assert_eq!(
-			advisor_spend_label(250_000_000, true, Charset::Unicode),
-			"👁 S0.2500",
-		);
+		assert_eq!(advisor_spend_label(250_000_000, false, Charset::Ascii), "$0.2500 (adv)",);
+		assert_eq!(advisor_spend_label(250_000_000, true, Charset::Unicode), "👁 S0.2500",);
 		assert_eq!(
 			advisor_spend_label(250_000_000, true, Charset::NerdFont),
 			"\u{ea70} \u{f067a} 0.2500",
 		);
 	}
-
 }

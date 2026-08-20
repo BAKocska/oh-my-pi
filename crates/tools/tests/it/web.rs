@@ -363,8 +363,9 @@ async fn raw_binary_urls_keep_image_archive_and_sqlite_specialized_dispatch() {
 	.expect("raw image dispatch succeeds");
 	assert_eq!(
 		image.render.content,
-		"Read image file [image/webp]\n[Image: original 1x1, displayed at 200x200. Multiply \
-		 coordinates by 0.01 to map to original image.]"
+		"Read image file [image/webp]\n[Inspection: MIME image/webp; dimensions 1x1; channels 4; \
+		 alpha yes]\n[Image: original 1x1, displayed at 200x200. Multiply coordinates by 0.01 to \
+		 map to original image.]"
 	);
 	assert_eq!(image.render.content_type.as_deref(), Some("image/webp"));
 	assert_eq!(image.render.method, "image");

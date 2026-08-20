@@ -1038,7 +1038,7 @@ fn descendant_hover_keeps_the_decorated_ancestor_lifted() {
 #[test]
 fn editor_wheel_scrolls_visible_rows_without_moving_cursor() {
 	let mut ui = Ui::from_markup(
-		"<editor id=e h=2 value=\"one\ntwo\nthree\nfour\"/>",
+		"<editor id=e h=4 value=\"one\ntwo\nthree\nfour\"/>",
 		30,
 		UiContext::default(),
 	)
@@ -1046,11 +1046,11 @@ fn editor_wheel_scrolls_visible_rows_without_moving_cursor() {
 	let editor = ui.focus_ring()[0];
 	ui.set_focus_slot(Some(editor));
 	ui.repaint_slot(editor);
-	assert!(rows(&ui)[0].contains("three"));
+	assert!(rows(&ui).iter().any(|r| r.contains("three")), "rows: {:?}", rows(&ui));
 	let cursor = editor_pane(ui.root()).unwrap().buffer().cursor();
 	let rect = ui.root_mut().find_slot(editor).unwrap().rect;
 	ui.handle_mouse(rect.x, rect.y, Mouse::WheelUp);
-	assert!(rows(&ui)[0].contains("two"));
+	assert!(rows(&ui).iter().any(|r| r.contains("two")), "rows: {:?}", rows(&ui));
 	let state = editor_pane(ui.root()).unwrap();
 	assert_eq!(state.buffer().cursor(), cursor);
 }

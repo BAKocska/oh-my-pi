@@ -1,7 +1,5 @@
 //! Windows-only behavioral coverage for the environment DATA named pipe.
 
-#![cfg(windows)]
-
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::BytesMut;

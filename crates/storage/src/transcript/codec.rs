@@ -206,12 +206,27 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 			object.field("k", "rewind")?;
 			object.field("to", to)?;
 		},
-		Kind::Compact { summary, short, first_kept, tokens_before, warning, superseded } => {
+		Kind::Compact {
+			summary,
+			short,
+			first_kept,
+			tokens_before,
+			tokens_after,
+			method,
+			warning,
+			superseded,
+		} => {
 			object.field("k", "compact")?;
 			object.field("summary", summary)?;
 			object.field("short", short)?;
 			object.field("first_kept", first_kept)?;
 			object.field("tokens_before", tokens_before)?;
+			if let Some(tokens_after) = tokens_after {
+				object.field("tokens_after", tokens_after)?;
+			}
+			if let Some(method) = method {
+				object.field("method", method)?;
+			}
 			object.field("warning", warning)?;
 			if !superseded.is_empty() {
 				object.field("superseded", superseded)?;
@@ -478,6 +493,10 @@ payload!(CompactPayload {
 	short: Option<Str>,
 	first_kept: u64,
 	tokens_before: u64,
+	#[serde(default)]
+	tokens_after: Option<u64>,
+	#[serde(default)]
+	method: Option<Str>,
 	warning: Option<Str>,
 	#[serde(default)]
 	superseded: Vec<SupersededCompaction>,
@@ -663,6 +682,8 @@ fn decode_line(line: &[u8]) -> Result<Event, Error> {
 				short:         payload.short,
 				first_kept:    payload.first_kept,
 				tokens_before: payload.tokens_before,
+				tokens_after:  payload.tokens_after,
+				method:        payload.method,
 				warning:       payload.warning,
 				superseded:    payload.superseded,
 			}

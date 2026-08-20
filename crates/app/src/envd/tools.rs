@@ -16,7 +16,7 @@ use omp_tool::{
 use omp_tools::{
 	BuiltinRendererIdentities,
 	device::{DeviceCatalog, dyn_enabled, dyn_tool, flatten_slots},
-	edit::FormatPolicy,
+	edit::{EditRevisionCandidates, FormatPolicy, resolve_edit_revision},
 	register_builtin_renderers,
 };
 
@@ -32,6 +32,7 @@ use super::{
 	worker::ExtHostSupervisor,
 	workspace::WorkspaceHost,
 };
+use crate::settings::ToolSettings;
 
 /// Builds the complete registry shared by environment dispatch and the agent.
 ///
@@ -46,58 +47,114 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
+	tool_settings: &ToolSettings,
 	device_invoker: I,
 	policy: ToolsPolicy,
 	mut registry: Registry,
 ) -> Result<(Arc<Registry>, Arc<SessionBridgeHost>, omp_tools::eval::EvalSessionControl), EnvdError>
 {
-	for name in ["read", "edit", "shell", "grep", "glob", "write", "eval", "dyn"] {
+	for name in ["read", "edit", "shell", "grep", "glob", "write", "eval", "todo", "ask", "dyn"] {
 		ensure_name_absent(&registry, name)?;
 	}
 	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
 	let read = omp_tools::read::tool(read_sources, blobs.clone());
 	let read_identity = read.spec().identity();
-	registry.register(read, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("read") {
+		registry.register(read, Presentation::Slot, core_claims())?;
+	}
+	let edit_pin = tool_settings
+		.edit_dialect
+		.as_deref()
+		.map(str::parse::<Rev>)
+		.transpose()
+		.map_err(|error| EnvdError::EditDialect(error.to_string().into()))?;
+	let environment_edit_dialect = std::env::var("OMP_EDIT_DIALECT").ok();
+	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
+		environment: environment_edit_dialect.as_deref(),
+		pin: edit_pin.as_ref(),
+		..EditRevisionCandidates::default()
+	})
+	.map_err(EnvdError::EditDialect)?
+	.revision;
+	let replace_edit = omp_tools::edit::replace_tool(documents.clone(), FormatPolicy::Configured);
+	let replace_identity = replace_edit.spec().identity();
 	let edit = omp_tools::edit::tool(documents.clone(), FormatPolicy::Configured);
-	let edit_identity = edit.spec().identity();
-	registry.register(edit, Presentation::Slot, core_claims())?;
+	let hashline_identity = edit.spec().identity();
+	let edit_identity = if selected_edit == replace_identity.rev {
+		replace_identity.clone()
+	} else {
+		hashline_identity.clone()
+	};
+	if tool_settings.enabled("edit") {
+		if selected_edit == replace_identity.rev {
+			registry.register(edit, Presentation::Slot, core_claims())?;
+			registry.register(replace_edit, Presentation::Slot, core_claims())?;
+		} else {
+			registry.register(replace_edit, Presentation::Slot, core_claims())?;
+			registry.register(edit, Presentation::Slot, core_claims())?;
+		}
+	}
 	let write = omp_tools::write::tool(documents.clone());
 	let write_identity = write.spec().identity();
-	registry.register(write, Presentation::Slot, core_claims())?;
-	let shell = omp_tools::shell::shell(ShellExecHost::new(exec.clone(), root_uri.clone()));
+	if tool_settings.enabled("write") {
+		registry.register(write, Presentation::Slot, core_claims())?;
+	}
+	let shell = omp_tools::shell::shell_with_timeout_bounds(
+		ShellExecHost::new(exec.clone(), root_uri.clone()),
+		shell_timeout_bounds(tool_settings),
+	);
 	let shell_identity = shell.spec().identity();
-	registry.register(shell, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("shell") {
+		registry.register(shell, Presentation::Slot, core_claims())?;
+	}
 	let search = WorkspaceSearchAdapter::new(workspace.clone(), documents.clone());
 	let grep = omp_tools::grep::tool(search.clone(), blobs.clone());
 	let grep_identity = grep.spec().identity();
-	registry.register(grep, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("grep") {
+		registry.register(grep, Presentation::Slot, core_claims())?;
+	}
 	let glob = omp_tools::glob::tool(search, blobs.clone());
 	let glob_identity = glob.spec().identity();
-	registry.register(glob, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("glob") {
+		registry.register(glob, Presentation::Slot, core_claims())?;
+	}
 	let eval_host = Arc::new(SessionBridgeHost::new());
 	let eval_exec = ProcessEvalExec::production(Arc::clone(&eval_host), interrupt_grace)
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
 	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
 	let eval_identity = eval_tool.spec().identity();
-	registry.register(eval_tool, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("eval") {
+		registry.register(eval_tool, Presentation::Slot, core_claims())?;
+	}
+	if tool_settings.enabled("todo") {
+		registry.register(omp_tools::todo::tool(), Presentation::Slot, core_claims())?;
+	}
+	if tool_settings.enabled("ask") {
+		registry.register(omp_tools::ask::headless_tool(), Presentation::Slot, core_claims())?;
+	}
 	let catalog = DeviceCatalog::default();
-	if dyn_enabled(policy) {
+	if tool_settings.enabled("dyn") && dyn_enabled(policy) {
 		registry.register(
 			dyn_tool(device_invoker, catalog.clone(), policy),
 			Presentation::Slot,
 			core_claims(),
 		)?;
 	}
-	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
-		edit:  edit_identity,
-		grep:  grep_identity,
-		glob:  glob_identity,
-		shell: shell_identity,
-		write: write_identity,
-		read:  read_identity,
-		eval:  eval_identity,
-	})
-	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
+	if ["read", "edit", "shell", "grep", "glob", "write", "eval"]
+		.into_iter()
+		.all(|name| tool_settings.enabled(name))
+	{
+		register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
+			edit:  edit_identity,
+			grep:  grep_identity,
+			glob:  glob_identity,
+			shell: shell_identity,
+			write: write_identity,
+			read:  read_identity,
+			eval:  eval_identity,
+		})
+		.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
+	}
 	let flattened_slots = if policy == ToolsPolicy::ToolOnly {
 		Some(
 			flatten_slots(
@@ -185,6 +242,24 @@ const fn core_claims() -> Claims {
 		claimant:   Str::new_static("omp/core"),
 		replaces:   None,
 	}
+}
+
+fn shell_timeout_bounds(settings: &ToolSettings) -> omp_tools::shell::TimeoutBounds {
+	let mut bounds = omp_tools::shell::TimeoutBounds::default();
+	let Some(maximum) = settings.max_timeout else {
+		return bounds;
+	};
+	let milliseconds = maximum
+		.to_std()
+		.ok()
+		.and_then(|duration| u64::try_from(duration.as_millis()).ok())
+		.unwrap_or(bounds.ceiling_ms);
+	bounds.ceiling_ms = milliseconds.max(bounds.floor_ms).min(bounds.ceiling_ms);
+	bounds.default_ms = bounds
+		.default_ms
+		.min(bounds.ceiling_ms)
+		.max(bounds.floor_ms);
+	bounds
 }
 
 fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {

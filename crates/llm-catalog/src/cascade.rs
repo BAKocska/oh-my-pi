@@ -97,12 +97,7 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("max-tokens-field", AxisSet::Wire, "max_tokens_field", AxisKind::Scalar),
 	("official-endpoint", AxisSet::Wire, "official_endpoint", AxisKind::Scalar),
 	("omit-reasoning-effort", AxisSet::Wire, "omit_reasoning_effort", AxisKind::Scalar),
-	(
-		"template-reasoning-effort",
-		AxisSet::Wire,
-		"template_reasoning_effort",
-		AxisKind::Scalar,
-	),
+	("template-reasoning-effort", AxisSet::Wire, "template_reasoning_effort", AxisKind::Scalar),
 	("reasoning-content-field", AxisSet::Wire, "reasoning_content_field", AxisKind::Scalar),
 	("reasoning-disable-mode", AxisSet::Wire, "reasoning_disable_mode", AxisKind::Scalar),
 	("reasoning-effort-map", AxisSet::Wire, "reasoning_effort_map", AxisKind::Object),
@@ -1240,7 +1235,7 @@ mod tests {
 		let cascade = parse_one(
 			r#"class "qwen" {
 				template-reasoning-effort #true
-				thinking-tool-choice-conflict "drop_auto_when_thinking"
+				thinking-tool-choice-conflict "drop_thinking_when_any"
 			}"#,
 		)
 		.expect("new wire axes parse");
@@ -1250,10 +1245,9 @@ mod tests {
 		assert_eq!(resolved.wire["template_reasoning_effort"], Value::Bool(true));
 		assert_eq!(
 			resolved.wire["thinking_tool_choice_conflict"],
-			Value::from("drop_auto_when_thinking")
+			Value::from("drop_thinking_when_any")
 		);
 	}
-
 
 	#[test]
 	fn exact_selectors_are_case_sensitive_and_globs_are_not() {

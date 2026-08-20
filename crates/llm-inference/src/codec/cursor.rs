@@ -193,9 +193,9 @@ pub fn for_each_public_header(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CursorToolDefinition {
 	/// Canonical tool name.
-	pub name:              Str,
+	pub name:         Str,
 	/// Optional human-readable description.
-	pub description:       Option<Str>,
+	pub description:  Option<Str>,
 	/// Encoded `google.protobuf.Value` carrying the tool's JSON Schema.
 	pub input_schema: Bytes,
 }
@@ -451,7 +451,15 @@ fn protobuf_to_json(value: ProtoValue) -> Option<serde_json::Value> {
 		None | Some(ProtoValueKind::NullValue(_)) => serde_json::Value::Null,
 		Some(ProtoValueKind::BoolValue(value)) => serde_json::Value::Bool(value),
 		Some(ProtoValueKind::NumberValue(value)) => {
-			serde_json::Value::Number(serde_json::Number::from_f64(value)?)
+			// protobuf `Value` carries every number as a double; JSON tool
+			// arguments distinguish 12 from 12.0, so whole in-range doubles
+			// decode as integers (matching the JS decoder's output).
+			const SAFE: f64 = 9_007_199_254_740_992.0; // 2^53
+			if value.fract() == 0.0 && value.abs() <= SAFE {
+				serde_json::Value::Number(serde_json::Number::from(value as i64))
+			} else {
+				serde_json::Value::Number(serde_json::Number::from_f64(value)?)
+			}
 		},
 		Some(ProtoValueKind::StringValue(value)) => serde_json::Value::String(value),
 		Some(ProtoValueKind::ListValue(value)) => serde_json::Value::Array(
@@ -470,7 +478,6 @@ fn protobuf_to_json(value: ProtoValue) -> Option<serde_json::Value> {
 		),
 	})
 }
-
 
 /// Non-secret model facts observed directly in Cursor discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2105,10 +2112,7 @@ mod tests {
 			.expect("object")
 			.iter()
 			.map(|(name, value)| {
-				(
-					name.clone(),
-					encode_json_value(value).expect("encoded protobuf JSON Value"),
-				)
+				(name.clone(), encode_json_value(value).expect("encoded protobuf JSON Value"))
 			})
 			.collect();
 		args.insert(
@@ -2132,9 +2136,8 @@ mod tests {
 	#[test]
 	fn mcp_completion_merges_scalars_without_downgrading_streamed_structures() {
 		let streamed = br#"{"tasks":[{"id":"one"}],"note":"old","streamed":true}"#;
-		let completion = Bytes::from_static(
-			br#"{"tasks":"raw fallback","note":"new","completion":12}"#,
-		);
+		let completion =
+			Bytes::from_static(br#"{"tasks":"raw fallback","note":"new","completion":12}"#);
 		let merged = merge_mcp_arguments(streamed, completion);
 		assert_eq!(
 			serde_json::from_slice::<serde_json::Value>(&merged).expect("merged JSON"),
@@ -2146,8 +2149,6 @@ mod tests {
 			})
 		);
 	}
-
-
 
 	fn update(message: wire::interaction_update::Message) -> Bytes {
 		Bytes::from(

@@ -94,10 +94,35 @@ impl AdmissionGate {
 		if !value.is_object() {
 			return None;
 		}
+		Some(self.finish_query(value, cwd, root))
+	}
+
+	/// Finalizes a call that supplied its complete arguments only with
+	/// `ArgsCommitted`, replacing any incomplete speculative fragments.
+	pub(crate) fn finalize(
+		&mut self,
+		raw: &[u8],
+		cwd: &Path,
+		root: &Path,
+	) -> Result<Option<AdmitInvocation>, AdmissionError> {
+		if self.query_emitted {
+			return Ok(None);
+		}
+		let value =
+			serde_json::from_slice::<Value>(raw).map_err(|_| AdmissionError::ArgumentsNotObject)?;
+		if !value.is_object() {
+			return Err(AdmissionError::ArgumentsNotObject);
+		}
+		self.fragments.clear();
+		self.fragments.extend_from_slice(raw);
+		Ok(Some(self.finish_query(value, cwd, root)))
+	}
+
+	fn finish_query(&mut self, value: Value, cwd: &Path, root: &Path) -> AdmitInvocation {
 		let bash = bash_ir(&self.tool_name, &value, cwd, root);
 		self.requested = Some(value);
 		self.query_emitted = true;
-		Some(AdmitInvocation {
+		AdmitInvocation {
 			invocation_id: self.invocation_id.to_string(),
 			bash,
 			deadline_ms: self
@@ -107,7 +132,7 @@ impl AdmissionGate {
 				.try_into()
 				.unwrap_or(u64::MAX),
 			props: Default::default(),
-		})
+		}
 	}
 
 	/// Accepts Core's one answer without allowing it to block the dispatcher.
@@ -124,6 +149,11 @@ impl AdmissionGate {
 		answer_tx
 			.send(admission)
 			.map_err(|_| AdmissionError::AlreadyAnswered)
+	}
+
+	/// Reports whether Core's one admission answer has arrived.
+	pub(crate) fn is_answered(&self) -> bool {
+		self.query_emitted && self.answer_tx.is_none()
 	}
 
 	/// Returns the deadline for a query that is waiting on Core.

@@ -608,7 +608,6 @@ impl EditBuffer {
 		self.segments(width.max(1)).len().min(max_rows)
 	}
 
-
 	#[must_use]
 	/// Reports whether the cursor is at the document's visual start.
 	pub fn at_visual_start(&self) -> bool {

@@ -7,10 +7,11 @@ use std::time::Instant;
 
 use omp_core::{Str, fmts};
 use omp_tui::{
-	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent, dom,
+	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent,
+	components::compaction_threshold_color, dom,
 };
 
-use crate::{StatusFacts, scene::RailWidths};
+use crate::{CompactionSpeculationStatus, StatusFacts, scene::RailWidths};
 
 /// Rail width in cells, vertical rule included.
 const WIDTH: u16 = 30;
@@ -185,7 +186,13 @@ fn cost_label(nanos: u64) -> Str {
 fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
 	let state = if facts.working { "working" } else { "idle" };
 	let context = context_label(facts);
+	let context_color = compaction_threshold_color(&ctx.theme);
 	let cost = cost_label(facts.cost_nanos);
+	let compaction = match facts.compaction_speculation {
+		CompactionSpeculationStatus::Idle => None,
+		CompactionSpeculationStatus::Running => Some("running"),
+		CompactionSpeculationStatus::Armed => Some("armed"),
+	};
 	let activity = fmts!("q{} · jobs {}", facts.queued, facts.jobs);
 	let git = facts
 		.git
@@ -220,7 +227,13 @@ fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
 					<hr/>
 					<text bold fg=info>{"usage"}</text>
 					<col>
-						<row gap=1><text fg=muted w=8>{"context"}</text><text truncate>{context}</text></row>
+						<row gap=1><text fg=muted w=8>{"context"}</text><text fg={context_color} truncate>{context}</text></row>
+						if let Some(compaction) = compaction {
+							<row gap=1>
+								<text fg=muted w=8>{"compact"}</text>
+								<text fg=accent>{compaction}</text>
+							</row>
+						}
 						<row gap=1><text fg=muted w=8>{"cost"}</text><text>{cost}</text></row>
 						<row gap=1><text fg=muted w=8>{"activity"}</text><text truncate>{activity}</text></row>
 						if facts.attempt > 0 || facts.dropped > 0 {
@@ -245,25 +258,42 @@ mod tests {
 	use std::time::{Duration, Instant};
 
 	use omp_core::Str;
-	use omp_tui::{Size, UiContext, test_support::frame_row_text};
+	use omp_tui::{Color, Size, UiContext, test_support::frame_row_text};
 
 	use super::Sidebar;
-	use crate::{GitFacts, StatusFacts};
+	use crate::{CompactionSpeculationStatus, GitFacts, StatusFacts};
 
 	fn facts() -> StatusFacts {
 		StatusFacts {
-			model:          Str::new_static("Claude Fable 5"),
-			working:        false,
-			turn_started:   None,
+			model: Str::new_static("Claude Fable 5"),
+			working: false,
+			turn_started: None,
 			context_tokens: 42,
 			context_window: Some(1_000),
-			cost_nanos:     250_000_000,
-			queued:         0,
-			jobs:           0,
-			attempt:        0,
-			dropped:        0,
-			git:            Some(GitFacts { branch: Str::new_static("main"), dirty: 1, staged: 0 }),
+			cost_nanos: 250_000_000,
+			queued: 0,
+			jobs: 0,
+			attempt: 0,
+			dropped: 0,
+			git: Some(GitFacts { branch: Str::new_static("main"), dirty: 1, staged: 0 }),
+			..StatusFacts::default()
 		}
+	}
+
+	#[test]
+	fn rail_surfaces_armed_compaction() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(120, 30);
+		let mut facts = facts();
+		facts.compaction_speculation = CompactionSpeculationStatus::Armed;
+		let mut sidebar = Sidebar::new(&facts, &ctx);
+		let layer = sidebar
+			.layer(viewport, Instant::now())
+			.expect("rail visible");
+		assert!((0..30).any(|row| {
+			let text = frame_row_text(layer.frame, row);
+			text.contains("compact") && text.contains("armed")
+		}));
 	}
 
 	#[test]
@@ -289,5 +319,25 @@ mod tests {
 			.layer(viewport, Instant::now() + Duration::from_secs(1))
 			.expect("rail reopened");
 		assert!(layer.active);
+	}
+
+	#[test]
+	fn context_usage_uses_the_themed_compaction_threshold_color() {
+		let accent = Color::Rgb(12, 34, 56);
+		let mut ctx = UiContext::default();
+		ctx.theme.accent = accent;
+		let viewport = Size::new(120, 30);
+		let mut sidebar = Sidebar::new(&facts(), &ctx);
+		let layer = sidebar
+			.layer(viewport, Instant::now())
+			.expect("rail visible");
+		let (row, column) = (0..layer.frame.size().height)
+			.find_map(|row| {
+				let text = frame_row_text(layer.frame, row);
+				let byte = text.find("42 / 4%")?;
+				Some((row, u16::try_from(xutf::width_str(&text[..byte])).unwrap_or(u16::MAX)))
+			})
+			.expect("context usage visible");
+		assert_eq!(layer.frame.cell(column, row).style().foreground_color(), accent);
 	}
 }

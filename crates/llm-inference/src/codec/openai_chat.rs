@@ -135,6 +135,9 @@ pub struct OpenAiChatProfile {
 	pub forced_tool_choice: bool,
 	/// Resolution when reasoning controls conflict with tool choice.
 	pub thinking_tool_choice_conflict: ThinkingToolChoiceConflict,
+	/// Whether this route disables reasoning when a tool choice is present
+	/// (census `disable_reasoning_on_tool_choice`).
+	pub disable_reasoning_on_tool_choice: bool,
 	/// Tool strictness projection.
 	pub tool_strict: ToolStrictWire,
 	/// Whether object-root tool-parameter unions are flattened or withheld.
@@ -182,6 +185,7 @@ impl Default for OpenAiChatProfile {
 			named_tool_choice: true,
 			forced_tool_choice: true,
 			thinking_tool_choice_conflict: ThinkingToolChoiceConflict::None,
+			disable_reasoning_on_tool_choice: false,
 			tool_strict: ToolStrictWire::Mixed,
 			flatten_root_unions: false,
 			tool_id: ToolIdWireProfile::Preserve,
@@ -235,6 +239,9 @@ impl OpenAiChatProfile {
 		}
 		if let Some(value) = policy.tool.thinking_conflict {
 			self.thinking_tool_choice_conflict = value;
+		}
+		if let Some(value) = policy.tool.disable_reasoning_on_choice {
+			self.disable_reasoning_on_tool_choice = value;
 		}
 		if let Some(value) = policy.context.max_tokens_field {
 			self.max_tokens_field = match value {
@@ -360,16 +367,13 @@ impl OpenAiChatCodec {
 			lower_tool_choice(&self.profile, &mut tools, &request.tool_choice, &withheld)?;
 		let response_format = lower_output(&request.output)?;
 		let reasoning = lower_reasoning(&self.profile, &request.reasoning)?;
-		if self.profile.thinking_tool_choice_conflict
-			== ThinkingToolChoiceConflict::DropAutoWhenThinking
-			&& matches!(
-				&request.reasoning,
-				Setting::Require(_) | Setting::Prefer(_)
-			)
-			&& matches!(
-				&tool_choice,
-				Some(WireToolChoice::Mode(ToolChoiceMode::Auto))
-			)
+		// The gateway disables thinking whenever a tool-choice selector is
+		// present. `auto` is the provider default and can be omitted without
+		// changing tool semantics, so reasoning survives; forced and named
+		// selectors remain authoritative (pi 7cb504cdb3).
+		if self.profile.disable_reasoning_on_tool_choice
+			&& matches!(&request.reasoning, Setting::Require(_) | Setting::Prefer(_))
+			&& matches!(&tool_choice, Some(WireToolChoice::Mode(ToolChoiceMode::Auto)))
 		{
 			tool_choice = None;
 		}
@@ -3146,7 +3150,7 @@ mod tests {
 			reasoning: super::ReasoningWireFormat::Qwen,
 			..OpenAiChatProfile::default()
 		};
-		let mut policy = omp_llm_catalog::policy::WirePolicy::baseline();
+		let mut policy = omp_llm_catalog::policy::WirePolicy::overrides();
 		policy.reasoning.template_reasoning_effort = Some(true);
 		profile.apply_policy(&policy);
 		let body = OpenAiChatCodec::new(profile, None)
@@ -3170,7 +3174,7 @@ mod tests {
 	fn reasoning_conflict_drops_only_redundant_auto_tool_choice() {
 		let mut conflict_profile = OpenAiChatProfile::default();
 		let mut policy = omp_llm_catalog::policy::WirePolicy::baseline();
-		policy.tool.thinking_conflict = Some(ThinkingToolChoiceConflict::DropAutoWhenThinking);
+		policy.tool.disable_reasoning_on_choice = Some(true);
 		conflict_profile.apply_policy(&policy);
 		let encode = |profile: OpenAiChatProfile, reasoning: bool, choice| {
 			let mut request = request(Arc::from([text_message("think")]));
@@ -3190,39 +3194,20 @@ mod tests {
 			serde_json::from_slice::<serde_json::Value>(&body).expect("wire body is JSON")
 		};
 
-		let dropped = encode(
-			conflict_profile.clone(),
-			true,
-			crate::call::ToolChoice::Auto,
-		);
+		let dropped = encode(conflict_profile.clone(), true, crate::call::ToolChoice::Auto);
 		assert!(dropped.get("tool_choice").is_none());
 
-		let no_reasoning = encode(
-			conflict_profile.clone(),
-			false,
-			crate::call::ToolChoice::Auto,
-		);
+		let no_reasoning = encode(conflict_profile.clone(), false, crate::call::ToolChoice::Auto);
 		assert_eq!(no_reasoning["tool_choice"], "auto");
 
-		let no_axis = encode(
-			OpenAiChatProfile::default(),
-			true,
-			crate::call::ToolChoice::Auto,
-		);
+		let no_axis = encode(OpenAiChatProfile::default(), true, crate::call::ToolChoice::Auto);
 		assert_eq!(no_axis["tool_choice"], "auto");
 
-		let forced = encode(
-			conflict_profile.clone(),
-			true,
-			crate::call::ToolChoice::Required,
-		);
+		let forced = encode(conflict_profile.clone(), true, crate::call::ToolChoice::Required);
 		assert_eq!(forced["tool_choice"], "required");
 
-		let named = encode(
-			conflict_profile,
-			true,
-			crate::call::ToolChoice::Named("read_file".into()),
-		);
+		let named =
+			encode(conflict_profile, true, crate::call::ToolChoice::Named("read_file".into()));
 		assert_eq!(named["tool_choice"]["function"]["name"], "read_file");
 	}
 

@@ -5,8 +5,7 @@ use omp_core::Str;
 use omp_llm_catalog::{
 	Availability, ChatCapabilities, ClassId, DiscoveredModel, DiscoveryKind, DiscoveryPagination,
 	DiscoverySpec, ModalityBits, ModelAvailability, ModelLimits, OperationBits, OperationKind,
-	ProviderId, RouteId, ToolCapabilities, ToolFeatureBits, WireModelId,
-	unknown_capabilities,
+	ProviderId, RouteId, ToolCapabilities, ToolFeatureBits, WireModelId, unknown_capabilities,
 };
 use serde::Deserialize;
 
@@ -277,26 +276,30 @@ impl DiscoveryDecoder {
 	fn openai_row(&self, model: OpenAiModel) -> DiscoveredModel {
 		let context_length = model.context_length.filter(|tokens| *tokens > 0);
 		let max_output_tokens = model.max_output_tokens.filter(|tokens| *tokens > 0);
-		let limits = (context_length.is_some() || max_output_tokens.is_some()).then_some(ModelLimits {
-			context_window: context_length,
-			maximum_input_tokens: None,
-			maximum_output_tokens: max_output_tokens,
-			maximum_batch: None,
-		});
-		let rich_chat_metadata =
-			model.input_modalities.is_some() || model.supports_tools.is_some();
+		let limits =
+			(context_length.is_some() || max_output_tokens.is_some()).then_some(ModelLimits {
+				context_window:        context_length,
+				maximum_input_tokens:  None,
+				maximum_output_tokens: max_output_tokens,
+				maximum_batch:         None,
+			});
+		let rich_chat_metadata = model.input_modalities.is_some() || model.supports_tools.is_some();
 		let mut row = self.row(model.id, model.display_name, None, None);
 		row.declared_limits = limits;
 		if rich_chat_metadata {
-			let modalities = model.input_modalities.map_or(ModalityBits::empty(), |values| {
-				values.into_iter().fold(ModalityBits::empty(), |mut bits, modality| {
-					bits.insert(match modality {
-						OpenAiInputModality::Text => ModalityBits::TEXT,
-						OpenAiInputModality::Image => ModalityBits::IMAGE,
-					});
-					bits
-				})
-			});
+			let modalities = model
+				.input_modalities
+				.map_or(ModalityBits::empty(), |values| {
+					values
+						.into_iter()
+						.fold(ModalityBits::empty(), |mut bits, modality| {
+							bits.insert(match modality {
+								OpenAiInputModality::Text => ModalityBits::TEXT,
+								OpenAiInputModality::Image => ModalityBits::IMAGE,
+							});
+							bits
+						})
+				});
 			let tools = if model.supports_tools == Some(false) {
 				Availability::Unsupported
 			} else {
@@ -520,23 +523,23 @@ impl OpenAiEnvelope {
 
 #[derive(Deserialize)]
 struct OpenAiModel {
-	id: Str,
+	id:                Str,
 	#[serde(default)]
-	display_name: Option<Str>,
+	display_name:      Option<Str>,
 	#[serde(default)]
-	context_length: Option<u64>,
+	context_length:    Option<u64>,
 	#[serde(default)]
 	max_output_tokens: Option<u64>,
 	#[serde(default)]
-	input_modalities: Option<Vec<OpenAiInputModality>>,
+	input_modalities:  Option<Vec<OpenAiInputModality>>,
 	#[serde(default)]
-	supports_tools: Option<bool>,
+	supports_tools:    Option<bool>,
 	#[serde(default, rename = "created")]
-	_created: Option<u64>,
+	_created:          Option<u64>,
 	#[serde(default, rename = "owned_by")]
-	_owned_by: Option<Str>,
+	_owned_by:         Option<Str>,
 	#[serde(default, rename = "object")]
-	_object: Option<Str>,
+	_object:           Option<Str>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -753,10 +756,7 @@ mod tests {
 				maximum_batch:         None,
 			})
 		);
-		assert!(
-			row.declared_operations
-				.contains_kind(OperationKind::Chat)
-		);
+		assert!(row.declared_operations.contains_kind(OperationKind::Chat));
 		let chat = row
 			.declared_capabilities
 			.as_ref()

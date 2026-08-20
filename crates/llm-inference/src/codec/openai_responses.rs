@@ -2750,17 +2750,11 @@ impl OpenAiResponsesCodec {
 		// Some DeepSeek reasoning gateways silently disable thinking whenever a
 		// selector is present. `auto` is the provider default and can be omitted
 		// without changing tool semantics; forced and named selectors remain
-		// authoritative.
+		// authoritative (pi 7cb504cdb3).
 		let tool_choice = match tool_choice {
 			Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto))
-				if context.policy.tool.thinking_conflict
-					== Some(
-						omp_llm_catalog::policy::ThinkingToolChoiceConflict::DropAutoWhenThinking,
-					)
-					&& matches!(
-						&request.reasoning,
-						Setting::Require(_) | Setting::Prefer(_)
-					) =>
+				if context.policy.tool.disable_reasoning_on_choice == Some(true)
+					&& matches!(&request.reasoning, Setting::Require(_) | Setting::Prefer(_)) =>
 			{
 				None
 			},
@@ -3710,8 +3704,7 @@ mod tests {
 	#[test]
 	fn reasoning_conflict_drops_only_redundant_auto_tool_choice() {
 		let mut policy = omp_llm_catalog::policy::WirePolicy::baseline();
-		policy.tool.thinking_conflict =
-			Some(omp_llm_catalog::policy::ThinkingToolChoiceConflict::DropAutoWhenThinking);
+		policy.tool.disable_reasoning_on_choice = Some(true);
 		let encode_choice = |policy: &omp_llm_catalog::policy::WirePolicy,
 		                     reasoning: bool,
 		                     choice: crate::call::ToolChoice| {
@@ -3748,9 +3741,7 @@ mod tests {
 		));
 		assert!(matches!(
 			encode_choice(&policy, true, crate::call::ToolChoice::Required),
-			Some(super::ResponsesToolChoice::Mode(
-				super::ResponsesToolChoiceMode::Required
-			))
+			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Required))
 		));
 		assert!(matches!(
 			encode_choice(
@@ -3762,7 +3753,6 @@ mod tests {
 				if named.name.as_deref() == Some("match_input")
 		));
 	}
-
 
 	#[test]
 	fn custom_tool_grammars_preserve_exact_syntax_and_definition_on_wire() {

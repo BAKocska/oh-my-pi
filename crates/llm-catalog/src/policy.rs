@@ -13,8 +13,8 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::{
 	id::{HeaderProfileId, WirePolicyId},
-	provider::{HeaderProfile, StaticHeader},
 	pricing::Pricing,
+	provider::{HeaderProfile, StaticHeader},
 	thinking::ThinkingEffort,
 };
 
@@ -191,8 +191,6 @@ policy_enum!(/// Policy for reasoning controls that conflict with tool choice.
 		DropThinkingWhenAny,
 		/// Remove reasoning when an effort is present.
 		DropThinkingWhenEffort,
-		/// Omit a redundant automatic tool choice while reasoning is enabled.
-		DropAutoWhenThinking,
 	}
 );
 policy_enum!(/// Provider constraints on tool-call identifiers.
@@ -455,7 +453,8 @@ pub struct ReasoningPolicy {
 	pub supports_summary: Option<bool>,
 	/// Whether the effort field must be omitted.
 	pub omit_effort: Option<bool>,
-	/// Whether the selected effort rides `chat_template_kwargs.reasoning_effort`.
+	/// Whether the selected effort rides
+	/// `chat_template_kwargs.reasoning_effort`.
 	pub template_reasoning_effort: Option<bool>,
 	/// Canonical-to-native effort spelling overrides.
 	pub effort_map: BTreeMap<ThinkingEffort, Str>,
@@ -917,16 +916,13 @@ mod tests {
 	fn standard_pricing_policy_caps_only_tiered_known_windows() {
 		use crate::pricing::{PriceTier, Pricing};
 
-		let tiered = Pricing::new(
-			Vec::new(),
-			vec![PriceTier { prompt_tokens_above: 272_000, components: Box::new([]) }],
-		)
+		let tiered = Pricing::new(Vec::new(), vec![PriceTier {
+			prompt_tokens_above: 272_000,
+			components:          Box::new([]),
+		}])
 		.expect("tiered pricing");
 		let standard = ExtendedContextPolicy::from_enabled(false);
-		assert_eq!(
-			standard.effective_context_window(Some(1_000_000), &tiered),
-			Some(272_000)
-		);
+		assert_eq!(standard.effective_context_window(Some(1_000_000), &tiered), Some(272_000));
 		assert_eq!(standard.effective_context_window(Some(128_000), &tiered), Some(128_000));
 		assert_eq!(standard.effective_context_window(None, &tiered), None);
 		assert_eq!(
@@ -934,10 +930,7 @@ mod tests {
 			Some(1_000_000)
 		);
 		let untiered = Pricing::default();
-		assert_eq!(
-			standard.effective_context_window(Some(1_000_000), &untiered),
-			Some(1_000_000)
-		);
+		assert_eq!(standard.effective_context_window(Some(1_000_000), &untiered), Some(1_000_000));
 	}
 
 	#[derive(Deserialize)]

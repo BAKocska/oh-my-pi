@@ -25,6 +25,7 @@ matches_parser!(Yes, app);
 
 impl Utility for Yes {
 	const NAME: &'static str = "yes";
+
 	fn rewrite_argv(mut argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 		// GNU yes recognizes `--help`/`--version` only as the sole argument;
 		// everything else is echoed verbatim. Insert `--` so clap treats every
@@ -41,7 +42,6 @@ impl Utility for Yes {
 		argv.insert(1, OsString::from("--"));
 		Ok(argv)
 	}
-
 
 	fn run(self, host: &mut Host) -> i32 {
 		let mut buffer = Vec::with_capacity(BUF_SIZE);

@@ -6,7 +6,10 @@ use omp_tui::{
 	UiEvent, dom,
 };
 
-use crate::Intent;
+use crate::{
+	Intent,
+	overlays::{OverlayPanel, panel_divider},
+};
 
 const HINT: &str = "↑/↓ commands · Enter run · type to search · Esc close";
 const FRAME_ROWS: u16 = 4;
@@ -215,22 +218,21 @@ fn build(entries: &[PaletteEntry], query: &str, rows: u16, width: u16, ctx: &UiC
 	let seed = Str::from(query);
 	let height = rows.saturating_add(1);
 	Ui::from_root(
-		dom! {
-			<box border=round title="Commands" pad-x=1>
-				<col>
-					<select id="commands" filter={seed} h={height}>
-						for entry in display {
-							<option value={entry.value} label={entry.label.clone()}>
-								<td><pre fg={entry.color}>{entry.label}</pre></td>
-								<td truncate grow><pre fg=muted>{entry.detail}</pre></td>
-								if !entry.key.is_empty() { <td align=end><pre fg=muted>{entry.key}</pre></td> }
-							</option>
-						}
-					</select>
-					<text dim truncate>{HINT}</text>
-				</col>
-			</box>
-		},
+		OverlayPanel::new("Commands").child(dom! {
+			<col>
+				<select id="commands" filter={seed} h={height}>
+					for entry in display {
+						<option value={entry.value} label={entry.label.clone()}>
+							<td><pre fg={entry.color}>{entry.label}</pre></td>
+							<td truncate grow><pre fg=muted>{entry.detail}</pre></td>
+							if !entry.key.is_empty() { <td align=end><pre fg=muted>{entry.key}</pre></td> }
+						</option>
+					}
+				</select>
+				{panel_divider()}
+				<text dim truncate>{HINT}</text>
+			</col>
+		}),
 		width,
 		ctx.clone(),
 	)

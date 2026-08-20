@@ -3,7 +3,10 @@
 use std::{path::Path, time::Duration};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_chat_ui::provider_picker::{ProviderCard, provider_card_grid};
+use omp_chat_ui::{
+	OverlayPanel, panel_divider,
+	provider_picker::{ProviderCard, provider_card_grid},
+};
 use omp_core::{Str, fmts};
 use omp_llm_catalog::{ProviderDef, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 use omp_llm_inference::{
@@ -15,9 +18,8 @@ use omp_llm_inference::{
 	router::Router,
 };
 use omp_tui::{
-	AppEvent, AppOptions, Border, Dim, Key, OverlayAnchor, OverlayMargin, OverlayOptions, Prop,
-	Size, Ui,
-	components::{Boxed, Button, Col, Input, Markdown, Select, SelectOption, Shader, TextLeaf},
+	AppEvent, AppOptions, Dim, Key, OverlayAnchor, OverlayMargin, OverlayOptions, Prop, Size, Ui,
+	components::{Button, Col, Input, Markdown, Select, SelectOption, Shader, TextLeaf},
 	shader::Eclipse,
 };
 
@@ -302,11 +304,7 @@ fn show_welcome(ui: &mut Ui) {
 				.with(Prop::Align, "center")
 				.text("Enter continue · Ctrl+C quit"),
 		);
-	let card = Boxed::new()
-		.with(Prop::Border, Border::Round)
-		.with(Prop::PadX, 2_u16)
-		.with(Prop::PadY, 1_u16)
-		.child(content);
+	let card = OverlayPanel::new("Welcome").pad_y(1).child(content);
 	let scene = Col::new().with(Prop::Gap, 1_u16).child(card).child(
 		Markdown::new()
 			.with(Prop::Id, STATUS_ID)
@@ -318,24 +316,12 @@ fn show_welcome(ui: &mut Ui) {
 }
 
 fn show_authenticating(ui: &mut Ui) {
-	let content = Col::new()
-		.with(Prop::Gap, 1_u16)
-		.child(
-			TextLeaf::new()
-				.with(Prop::Bold, true)
-				.with(Prop::Align, "center")
-				.text("Provider authentication"),
-		)
-		.child(
-			Markdown::new()
-				.with(Prop::Id, STATUS_ID)
-				.with(Prop::Align, "center")
-				.text("Authenticating… Esc to cancel"),
-		);
-	let card = Boxed::new()
-		.with(Prop::Border, Border::Round)
-		.with(Prop::PadX, 2_u16)
-		.with(Prop::PadY, 1_u16)
+	let content = Markdown::new()
+		.with(Prop::Id, STATUS_ID)
+		.with(Prop::Align, "center")
+		.text("Authenticating… Esc to cancel");
+	let card = OverlayPanel::new("Provider authentication")
+		.pad_y(1)
 		.child(content);
 	show_scene(ui, card);
 }
@@ -358,11 +344,12 @@ fn open_setup_provider_step(ui: &mut Ui, catalog: &Catalog) {
 		})
 		.collect();
 	let counter = fmts!("{count} providers");
-	let picker = Boxed::new()
-		.with(Prop::Border, Border::Round)
-		.with(Prop::Title, "Provider Login")
-		.with(Prop::PadX, 1_u16)
-		.child(provider_card_grid(cards, counter, "↹/←→/↑↓ pick · ↵ login · Esc back", 18));
+	let picker = OverlayPanel::new("Provider Login").child(provider_card_grid(
+		cards,
+		counter,
+		"↹/←→/↑↓ pick · ↵ login · Esc back",
+		18,
+	));
 	show_scene(ui, picker);
 }
 
@@ -390,17 +377,13 @@ fn open_setup_model_step(ui: &mut Ui, catalog: &Catalog, current: &str) {
 				.with_str(Prop::Desc, model.display_name.as_str()),
 		);
 	}
-	let picker = Boxed::new()
-		.with(Prop::Border, Border::Round)
-		.with(Prop::Title, "Choose Model")
-		.with(Prop::PadX, 1_u16)
-		.child(
-			Col::new().child(select).child(
-				TextLeaf::new()
-					.with(Prop::Dim, true)
-					.text("Type to filter · Enter select · Esc cancel"),
-			),
-		);
+	let picker = OverlayPanel::new("Choose Model").child(
+		Col::new().child(select).child(panel_divider()).child(
+			TextLeaf::new()
+				.with(Prop::Dim, true)
+				.text("Type to filter · Enter select · Esc cancel"),
+		),
+	);
 	show_scene(ui, picker);
 }
 
@@ -410,27 +393,24 @@ fn show_auth_prompt(ui: &mut Ui, message: Str, kind: AuthPromptKind) {
 		AuthPromptKind::OptionalSecret => "Enter optional response or press Enter to skip",
 		_ => "Enter provider response",
 	};
-	let prompt = Boxed::new()
-		.with(Prop::Border, Border::Round)
-		.with(Prop::Title, "Provider Authentication")
-		.with(Prop::PadX, 1_u16)
-		.child(
-			Col::new()
-				.with(Prop::Gap, 1_u16)
-				.child(TextLeaf::new().text(message))
-				.child(
-					Input::new()
-						.with(Prop::Id, "auth-secret")
-						.with(Prop::Placeholder, placeholder)
-						.with(Prop::Mask, prompt_masks_input(kind))
-						.with(Prop::Submit, true),
-				)
-				.child(
-					TextLeaf::new()
-						.with(Prop::Dim, true)
-						.text("Enter submit · Esc cancel"),
-				),
-		);
+	let prompt = OverlayPanel::new("Provider Authentication").child(
+		Col::new()
+			.with(Prop::Gap, 1_u16)
+			.child(TextLeaf::new().text(message))
+			.child(
+				Input::new()
+					.with(Prop::Id, "auth-secret")
+					.with(Prop::Placeholder, placeholder)
+					.with(Prop::Mask, prompt_masks_input(kind))
+					.with(Prop::Submit, true),
+			)
+			.child(panel_divider())
+			.child(
+				TextLeaf::new()
+					.with(Prop::Dim, true)
+					.text("Enter submit · Esc cancel"),
+			),
+	);
 	show_scene(ui, prompt);
 }
 

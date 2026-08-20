@@ -1,4 +1,15 @@
-//! Runtime model-discovery normalization for the production registry.
+//! Filesystem capability discovery and runtime model-discovery normalization.
+
+#[path = "discovery/at_path.rs"]
+pub mod at_path;
+#[path = "discovery/manifest.rs"]
+pub mod manifest;
+#[path = "discovery/models.rs"]
+pub mod models;
+#[path = "discovery/native.rs"]
+pub mod native;
+#[path = "discovery/roles.rs"]
+pub mod roles;
 
 use omp_llm_catalog::{
 	ContextStrategy, Pricing, RouteId, ThinkingPolicyId, WirePolicyId,

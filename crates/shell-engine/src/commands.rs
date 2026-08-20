@@ -531,8 +531,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 				let cancel_token = params.cancel_token();
 				let join_handle = tokio::spawn(async move {
 					let cmd_context = ExecutionContext { shell: &mut shell, command_name, params };
-					let result =
-						invoke_shell_function(func_registration, cmd_context, &args[1..]).await;
+					let result = invoke_shell_function(func_registration, cmd_context, &args[1..]).await;
 
 					// The invocation's last argument replaces any value set by
 					// the function body, matching the parent-shell path.
@@ -546,11 +545,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 				Ok(ExecutionSpawnResult::StartedTask(join_handle))
 			},
 			mut shell => {
-				let cmd_context = ExecutionContext {
-					shell:        &mut shell,
-					command_name: self.command_name,
-					params,
-				};
+				let cmd_context =
+					ExecutionContext { shell: &mut shell, command_name: self.command_name, params };
 
 				// Strip the function name off args.
 				let result =

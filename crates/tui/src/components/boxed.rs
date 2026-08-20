@@ -165,12 +165,8 @@ mod tests {
 	#[test]
 	fn box_title_truncates_between_corner_cells_at_boundary_widths() {
 		let ctx = UiContext::default();
-		for (width, expected) in [
-			(7, "╭ al… ╮"),
-			(5, "╭ … ╮"),
-			(4, "╭ …╮"),
-			(3, "╭…╮"),
-		] {
+		for (width, expected) in [(7, "╭ al… ╮"), (5, "╭ … ╮"), (4, "╭ …╮"), (3, "╭…╮")]
+		{
 			let mut root = Cached::new(Box::new(
 				Boxed::new()
 					.with(Prop::Border, Border::Round)

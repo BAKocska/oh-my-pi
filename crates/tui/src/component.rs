@@ -197,8 +197,8 @@ impl dyn Component {
 		(self as &dyn Any).is::<T>()
 	}
 
-	#[cfg(test)]
-	pub(crate) fn downcast_ref<T: Component>(&self) -> Option<&T> {
+	/// Borrows the concrete component type when it matches `T`.
+	pub fn downcast_ref<T: Component>(&self) -> Option<&T> {
 		(self as &dyn Any).downcast_ref()
 	}
 

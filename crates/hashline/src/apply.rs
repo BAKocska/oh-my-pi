@@ -308,9 +308,9 @@ fn insertion_body(edits: &[Edit], members: &[usize]) -> String {
 }
 
 fn body_is_relocatable_construct(edits: &[Edit], members: &[usize], path: &str) -> bool {
-	let Some(last) = members.iter().rposition(|index| {
-		matches!(&edits[*index], Edit::Insert { text, .. } if has_non_whitespace(text))
-	}) else {
+	let Some(last) = members.iter().rposition(
+		|index| matches!(&edits[*index], Edit::Insert { text, .. } if has_non_whitespace(text)),
+	) else {
 		return false;
 	};
 	let body = insertion_body(edits, members);
@@ -358,7 +358,10 @@ fn repair_landings(
 			..
 		} = edit
 		{
-			groups.entry((anchor.line, *line_num)).or_default().push(index);
+			groups
+				.entry((anchor.line, *line_num))
+				.or_default()
+				.push(index);
 		}
 	}
 	for ((anchor, _), members) in groups {
@@ -412,8 +415,7 @@ fn repair_landings(
 			if landing != anchor {
 				for &index in &members {
 					if let Edit::Insert { cursor, .. } = &mut edits[index] {
-						*cursor =
-							Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
+						*cursor = Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
 					}
 				}
 				warnings.push(ApplyWarning::AfterLineLandingShifted {
@@ -463,8 +465,7 @@ fn repair_landings(
 			let mut trial = edits.to_vec();
 			for &index in &members {
 				if let Edit::Insert { cursor, .. } = &mut trial[index] {
-					*cursor =
-						Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
+					*cursor = Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
 				}
 			}
 			let trial_text = materialize_for_probe(lines, &trial);
@@ -633,11 +634,13 @@ const ANNOTATION_NODE_KINDS: &[&str] = &[
 ];
 
 fn is_annotation_line(source: &str, path: &str, line: usize) -> bool {
-	crate::syntax::node_chain(source, path, line).iter().any(|node| {
-		node.start_line as usize == line
-			&& node.end_line as usize == line
-			&& ANNOTATION_NODE_KINDS.contains(&node.kind.as_str())
-	})
+	crate::syntax::node_chain(source, path, line)
+		.iter()
+		.any(|node| {
+			node.start_line as usize == line
+				&& node.end_line as usize == line
+				&& ANNOTATION_NODE_KINDS.contains(&node.kind.as_str())
+		})
 }
 
 fn is_annotation_echo_run(
@@ -705,8 +708,7 @@ fn normalize_textual_boundary_echoes(
 					path,
 					group.start_line - leading,
 					group.start_line - 1,
-				))
-		{
+				)) {
 			if group.payload.len() - leading >= range_len {
 				drop_leading = leading;
 			} else {
@@ -719,12 +721,7 @@ fn normalize_textual_boundary_echoes(
 			}
 		} else if trailing > 0
 			&& (range_len > 1
-				|| is_annotation_echo_run(
-					source,
-					path,
-					group.end_line + 1,
-					group.end_line + trailing,
-				))
+				|| is_annotation_echo_run(source, path, group.end_line + 1, group.end_line + trailing))
 		{
 			if group.payload.len() - trailing >= range_len {
 				drop_trailing = trailing;
@@ -1467,13 +1464,7 @@ pub fn apply_parsed_patch(
 	let mut concrete = clip.edits;
 	validate(&concrete, addressable_lines)?;
 	repair_replacement_indentation(&mut concrete, addressable_lines, &mut warnings);
-	repair_landings(
-		&mut concrete,
-		addressable_lines,
-		&normalized,
-		options.path,
-		&mut warnings,
-	);
+	repair_landings(&mut concrete, addressable_lines, &normalized, options.path, &mut warnings);
 	let baseline_parses = crate::syntax::parses_cleanly(options.path, &normalized);
 	repair_boundaries(
 		&mut concrete,
@@ -1634,10 +1625,12 @@ mod tests {
 				  structured_patch_hunks() {}\n"
 			)
 		);
-		assert!(result.warnings.iter().any(|warning| matches!(
-			warning,
-			ApplyWarning::BoundaryEchoDropped { trailing: 1, .. }
-		)));
+		assert!(
+			result.warnings.iter().any(|warning| matches!(
+				warning,
+				ApplyWarning::BoundaryEchoDropped { trailing: 1, .. }
+			))
+		);
 	}
 
 	#[test]
@@ -1646,10 +1639,12 @@ mod tests {
 		let result = apply_patch(source, "PUT 2.=2:\n+#[napi]\n+/// New summary.", "fixture.rs")
 			.expect("annotation echo is repaired");
 		assert_eq!(result.bytes, Bytes::from_static(b"#[napi]\n/// New summary.\npub fn f() {}\n"));
-		assert!(result.warnings.iter().any(|warning| matches!(
-			warning,
-			ApplyWarning::BoundaryEchoDropped { leading: 1, .. }
-		)));
+		assert!(
+			result
+				.warnings
+				.iter()
+				.any(|warning| matches!(warning, ApplyWarning::BoundaryEchoDropped { leading: 1, .. }))
+		);
 	}
 
 	#[test]
@@ -1679,17 +1674,20 @@ mod tests {
 		let result = apply_patch(source, "PUT 2.=2:\n+fresh();\n+bar();", "fixture.ts")
 			.expect("literal duplicate remains valid");
 		assert_eq!(result.bytes, Bytes::from_static(b"foo();\nfresh();\nbar();\nbar();\n"));
-		assert!(!result
-			.warnings
-			.iter()
-			.any(|warning| matches!(warning, ApplyWarning::BoundaryEchoDropped { .. })));
+		assert!(
+			!result
+				.warnings
+				.iter()
+				.any(|warning| matches!(warning, ApplyWarning::BoundaryEchoDropped { .. }))
+		);
 	}
 
 	const OPENER_RUST: &str = "mod testing {\n   struct MemStream;\n\n   impl Stream for MemStream \
-	                           {\n      fn clone_box(&self) -> u32 {\n         1\n      }\n\n      fn \
-	                           try_borrow(&self) -> u32 {\n         7\n      }\n   }\n}\n";
+	                           {\n      fn clone_box(&self) -> u32 {\n         1\n      }\n\n      \
+	                           fn try_borrow(&self) -> u32 {\n         7\n      }\n   }\n}\n";
 	const OPENER_MOD_PATCH: &str = "PUT >5:\n+\n+\tmod stdout_policy {\n+\t\tuse \
-	                                super::MemStream;\n+\n+\t\t#[test]\n+\t\tfn line_policy() {\n+\t\t\tassert!(true);\n+\t\t}\n+\t}";
+	                                super::MemStream;\n+\n+\t\t#[test]\n+\t\tfn line_policy() \
+	                                {\n+\t\t\tassert!(true);\n+\t\t}\n+\t}";
 
 	#[test]
 	fn escapes_construct_insert_from_an_opening_line() {
@@ -1708,9 +1706,11 @@ mod tests {
 	fn opener_escape_keeps_bare_and_equal_depth_bodies_literal() {
 		let bare = apply_patch(OPENER_RUST, "PUT >5:\n+   let x = 1;", "fixture.rs")
 			.expect("bare statement stays at the adjacent gap");
-		assert!(std::str::from_utf8(&bare.bytes)
-			.unwrap()
-			.contains("fn clone_box(&self) -> u32 {\n   let x = 1;"));
+		assert!(
+			std::str::from_utf8(&bare.bytes)
+				.unwrap()
+				.contains("fn clone_box(&self) -> u32 {\n   let x = 1;")
+		);
 
 		let equal = apply_patch(
 			OPENER_RUST,
@@ -1718,22 +1718,22 @@ mod tests {
 			"fixture.rs",
 		)
 		.expect("equal-depth item stays inside the opener");
-		assert!(std::str::from_utf8(&equal.bytes)
-			.unwrap()
-			.contains("fn clone_box(&self) -> u32 {\n      fn extra"));
+		assert!(
+			std::str::from_utf8(&equal.bytes)
+				.unwrap()
+				.contains("fn clone_box(&self) -> u32 {\n      fn extra")
+		);
 	}
 
 	#[test]
 	fn opener_escape_requires_a_parseable_relocation_and_path() {
-		let invalid = apply_patch(
-			OPENER_RUST,
-			"PUT >5:\n+   Some(1) => {\n+   }",
-			"fixture.rs",
-		)
-		.expect("unparseable relocation remains literal");
-		assert!(std::str::from_utf8(&invalid.bytes)
-			.unwrap()
-			.contains("fn clone_box(&self) -> u32 {\n   Some(1) => {"));
+		let invalid = apply_patch(OPENER_RUST, "PUT >5:\n+   Some(1) => {\n+   }", "fixture.rs")
+			.expect("unparseable relocation remains literal");
+		assert!(
+			std::str::from_utf8(&invalid.bytes)
+				.unwrap()
+				.contains("fn clone_box(&self) -> u32 {\n   Some(1) => {")
+		);
 
 		let parsed = crate::parser::parse_patch(OPENER_MOD_PATCH).unwrap();
 		let no_path = apply_parsed_patch(
@@ -1743,9 +1743,11 @@ mod tests {
 			ApplyOptions::default(),
 		)
 		.expect("missing syntax evidence leaves authored placement literal");
-		assert!(std::str::from_utf8(&no_path.bytes)
-			.unwrap()
-			.contains("fn clone_box(&self) -> u32 {\n\n\tmod stdout_policy"));
+		assert!(
+			std::str::from_utf8(&no_path.bytes)
+				.unwrap()
+				.contains("fn clone_box(&self) -> u32 {\n\n\tmod stdout_policy")
+		);
 	}
 
 	#[test]

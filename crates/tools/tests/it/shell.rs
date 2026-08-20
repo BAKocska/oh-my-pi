@@ -1,30 +1,59 @@
 //! Behavioral contracts for the persistent native `shell@1` executor.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, io::Cursor, sync::Arc};
 
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, executor::block_on, pin_mut};
 use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::invoke_input;
 use omp_tool::{
-	Abort, ArtifactLifetime, CallOutcome, CapsBase, Claims, ErasedEv, ErasedOutcome, IncomingParams,
-	Interrupt, JobOwner, ModelClass, Part, Precedence, Presentation, PromptCaps, Registry, Tool,
-	ToolIdentity,
+	Abort, ArtifactLifetime, CallOutcome, CallOutcomeDetails, CallOutcomeSpill, CapsBase, Claims,
+	ErasedEv, ErasedOutcome, Ev, IncomingParams, Interrupt, JobOwner, ModelClass, Part, Precedence,
+	Presentation, PromptCaps, Registry, Tool, ToolIdentity, ToolTerminal,
 };
-use omp_tools::shell::{
-	self, DetachRequest, DetachedJob, ExecOutcome, ExecStatus, Fault, OutputChannel, Payload,
-	RunEvent, RunRequest, Session, ShellExec, ShellRun, Update,
+use omp_tools::{
+	auto_background::DetachedJob,
+	shell::{
+		self, AdjustmentReceipt, DetachRequest, ExecOutcome, ExecStatus, Fault, OutputChannel,
+		Payload, RunEvent, RunRequest, Session, SessionOptions, ShellExec, ShellRun, Update,
+	},
 };
 use parking_lot::Mutex;
 
 #[derive(Default)]
 struct State {
-	opens:     usize,
-	runs:      Vec<(Bytes, RunRequest)>,
-	detaches:  Vec<DetachRequest>,
-	cancels:   usize,
-	cwd:       String,
-	env_value: String,
+	opens:           usize,
+	closes:          usize,
+	session_options: Vec<SessionOptions>,
+	runs:            Vec<(Bytes, RunRequest)>,
+	detaches:        Vec<DetachRequest>,
+	cancels:         usize,
+	cwd:             String,
+	env_value:       String,
+}
+
+#[derive(Default)]
+struct RecordingSpill {
+	bytes: Mutex<Vec<u8>>,
+}
+
+impl CallOutcomeSpill for RecordingSpill {
+	type Error = std::convert::Infallible;
+	type Stage<'a> = Cursor<Vec<u8>>;
+
+	fn open(&self) -> Result<Self::Stage<'_>, Self::Error> {
+		Ok(Cursor::new(Vec::new()))
+	}
+
+	async fn finish<'a>(&'a self, stage: Self::Stage<'a>) -> Result<omp_tool::BlobRef, Self::Error> {
+		let bytes = stage.into_inner();
+		*self.bytes.lock() = bytes.clone();
+		Ok(omp_tool::BlobRef {
+			hash:       Str::from("blake3:captured"),
+			media_type: Str::from("application/json"),
+			byte_len:   bytes.len() as u64,
+		})
+	}
 }
 
 #[derive(Clone, Default)]
@@ -55,18 +84,34 @@ impl ShellRun for FakeRun {
 		*self.cancelled.lock() = Some(RunEvent::Exit(status(ExecOutcome::Cancelled)));
 		std::future::ready(Ok(()))
 	}
+
+	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
+		std::future::ready(Ok(DetachedJob {
+			id:    Str::from(format!("process:{name}:1")),
+			owner: JobOwner::NamedProcess { name, generation: 1 },
+		}))
+	}
 }
 
 impl ShellExec for FakeExec {
 	type Run = FakeRun;
 
-	fn open_session(&self) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
+	fn open_session(
+		&self,
+		options: SessionOptions,
+	) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
 		let mut state = self.state.lock();
 		state.opens += 1;
+		state.session_options.push(options);
 		if state.cwd.is_empty() {
 			state.cwd = "/workspace".into();
 		}
-		std::future::ready(Ok(Session { id: Bytes::from_static(b"session-41") }))
+		std::future::ready(Ok(Session { id: Bytes::from(format!("session-{}", state.opens)) }))
+	}
+
+	fn close_session(&self, _: &Session) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
+		self.state.lock().closes += 1;
+		std::future::ready(Ok(()))
 	}
 
 	fn run<'a>(
@@ -160,18 +205,14 @@ fn status(outcome: ExecOutcome) -> ExecStatus {
 	}
 }
 
-fn registry(exec: FakeExec, transcript_limit: usize) -> Registry {
+fn registry(exec: FakeExec, _: usize) -> Registry {
 	let mut registry = Registry::new();
 	registry
-		.register(
-			shell::shell(exec).with_transcript_limit(transcript_limit),
-			Presentation::Slot,
-			Claims {
-				precedence: Precedence::CORE,
-				claimant:   Str::from("omp/core"),
-				replaces:   None,
-			},
-		)
+		.register(shell::shell(exec), Presentation::Slot, Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::from("omp/core"),
+			replaces:   None,
+		})
 		.expect("shell schema and revision register");
 	registry
 }
@@ -194,52 +235,22 @@ fn payload(events: &[ErasedEv]) -> Payload {
 	payload
 }
 
+fn committed(raw: &str) -> IncomingParams<'static> {
+	let (feed, params) = IncomingParams::channel();
+	feed.args_committed(Str::from(raw)).unwrap();
+	params
+}
+
 #[test]
 fn constructed_tool_spec_preserves_the_shell_schema_contract() {
 	let tool = shell::shell(FakeExec::default());
 	let actual: serde_json::Value = serde_json::from_slice(&tool.spec().schema).unwrap();
-	assert_eq!(
-		tool.spec().schema.as_ref(),
-		omp_tool::schema::<shell::Params>().as_ref(),
-		"tool schema must be generated directly from Params",
-	);
-	assert_eq!(
-		actual,
-		serde_json::json!({
-			"type": "object",
-			"additionalProperties": false,
-			"properties": {
-				"command": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Shell script to execute."
-				},
-				"timeout_ms": {
-					"type": "integer",
-					"minimum": 1,
-					"description": "Host-enforced execution timeout in milliseconds."
-				},
-				"detach": {
-					"type": "boolean",
-					"default": false,
-					"description": "Run as a persistent named process."
-				},
-				"name": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Required stable process name when detach is true."
-				}
-			},
-			"required": ["command"],
-			"allOf": [{
-				"if": {
-					"properties": { "detach": { "const": true } },
-					"required": ["detach"]
-				},
-				"then": { "required": ["name"] }
-			}]
-		})
-	);
+	assert_eq!(tool.spec().schema.as_ref(), omp_tool::schema::<shell::Params>().as_ref());
+	let properties = actual["properties"].as_object().unwrap();
+	for key in ["command", "timeout_ms", "env", "cwd", "pty", "async", "name"] {
+		assert!(properties.contains_key(key), "shell schema must expose {key}");
+	}
+	assert_eq!(actual["properties"]["timeout_ms"]["minimum"], 0);
 	assert!(
 		serde_json::from_value::<shell::Params>(serde_json::json!({
 			"command": "echo ok",
@@ -277,10 +288,10 @@ fn one_session_is_reused_with_its_cwd_and_environment_state() {
 	let registry = registry(exec.clone(), 1024);
 	assert_eq!(
 		payload(&call(&registry, r#"{"command":"set-state"}"#)).session_id,
-		Bytes::from_static(b"session-41"),
+		Bytes::from_static(b"session-1"),
 	);
 	let shown = payload(&call(&registry, r#"{"command":"show-state"}"#));
-	assert_eq!(shown.session_id, Bytes::from_static(b"session-41"));
+	assert_eq!(shown.session_id, Bytes::from_static(b"session-1"));
 	assert_eq!(shown.transcript[0].data, b"/workspace/subdir\npreserved\n");
 	let state = exec.state.lock();
 	assert_eq!(state.opens, 1);
@@ -288,7 +299,7 @@ fn one_session_is_reused_with_its_cwd_and_environment_state() {
 		state
 			.runs
 			.iter()
-			.all(|run| run.0 == Bytes::from_static(b"session-41"))
+			.all(|run| run.0 == Bytes::from_static(b"session-1"))
 	);
 }
 
@@ -321,35 +332,73 @@ fn live_updates_and_durable_transcript_preserve_host_order() {
 }
 
 #[test]
-fn timeout_status_is_not_rewritten_as_a_generic_failure() {
+fn timeout_clamp_journals_a_receipt_without_rewriting_timeout_status() {
 	let exec = FakeExec::default();
 	let events = call(&registry(exec.clone(), 1024), r#"{"command":"timeout","timeout_ms":23}"#);
 	let result = payload(&events);
 	assert_eq!(result.status.outcome, ExecOutcome::Timeout);
 	assert!(result.status.aborted);
-	assert_eq!(exec.state.lock().runs[0].1.timeout_ms, Some(23));
+	assert_eq!(exec.state.lock().runs[0].1.timeout_ms, Some(1_000));
+	assert_eq!(result.adjustments, [AdjustmentReceipt::TimeoutClamped {
+		requested_ms: 23,
+		effective_ms: 1_000,
+	}],);
 }
 
 #[test]
-fn transcript_overflow_preserves_the_host_blob_reference() {
+fn aborted_foreground_run_quarantines_its_pooled_session() {
+	let exec = FakeExec::default();
+	let registry = registry(exec.clone(), 1024);
+	let timed_out = payload(&call(&registry, r#"{"command":"timeout"}"#));
+	assert_eq!(timed_out.status.outcome, ExecOutcome::Timeout);
+	let later = payload(&call(&registry, r#"{"command":"show-state"}"#));
+	assert_eq!(later.session_id, Bytes::from_static(b"session-2"));
+	let state = exec.state.lock();
+	assert_eq!(state.opens, 2);
+	assert_eq!(state.closes, 1);
+}
+
+#[test]
+fn spill_threshold_keeps_complete_output_for_the_central_blob_gate() {
 	let exec = FakeExec::default();
 	let events = call(&registry(exec, 4), r#"{"command":"overflow"}"#);
 	let result = payload(&events);
-	assert!(result.transcript_truncated);
-	assert_eq!(result.transcript, [] as [omp_tools::shell::TranscriptFrame; 0]);
+	assert_eq!(result.transcript[0].data, b"xxxxxxxxxxxxxxxx");
 	assert_eq!(result.status.spilled_output.as_ref().unwrap().hash, "sha256:overflow");
 	assert!(matches!(events.first(), Some(ErasedEv::Update(_))), "live output is never capped");
 }
 
+#[tokio::test]
+async fn shell_spills_whole_verdict_through_the_central_blob_gate_at_threshold() {
+	let result = payload(&call(&registry(FakeExec::default(), 1024), r#"{"command":"overflow"}"#));
+	let spill = RecordingSpill::default();
+	let outcome = CallOutcome::<Payload, Fault>::Ok(result);
+	let details = omp_tool::call_outcome_details(&outcome, 8, &spill)
+		.await
+		.unwrap();
+	assert!(matches!(
+		details,
+		CallOutcomeDetails::Spilled { blob, .. } if blob.hash == "blake3:captured"
+	));
+	assert!(
+		spill
+			.bytes
+			.lock()
+			.windows(16)
+			.any(|window| window == b"xxxxxxxxxxxxxxxx"),
+		"spill stage receives complete output rather than a truncated replacement"
+	);
+}
+
 #[test]
-fn detach_returns_a_named_session_lifetime_job_reference() {
+fn async_returns_a_named_session_lifetime_job_reference() {
 	let exec = FakeExec::default();
 	let events = call(
 		&registry(exec.clone(), 1024),
-		r#"{"command":"serve","detach":true,"name":"web","timeout_ms":50}"#,
+		r#"{"command":"serve","async":true,"name":"web","timeout_ms":50}"#,
 	);
 	let ErasedEv::Done(ErasedOutcome::Detached(job)) = events.last().unwrap() else {
-		panic!("detach must return a detached outcome")
+		panic!("async must return a detached outcome")
 	};
 	assert_eq!(job.id, "process:web:1");
 	assert_eq!(job.owner, JobOwner::NamedProcess { name: Str::from("web"), generation: 1 });
@@ -359,17 +408,37 @@ fn detach_returns_a_named_session_lifetime_job_reference() {
 		Some("application/vnd.omp.process-settlement+json")
 	);
 	let state = exec.state.lock();
-	assert_eq!(state.opens, 0, "detach does not open the foreground session");
-	assert_eq!(state.detaches[0].timeout_ms, Some(50));
+	assert_eq!(state.opens, 0, "async does not open the foreground session");
+	assert_eq!(state.detaches[0].timeout_ms, Some(1_000));
+}
+
+#[tokio::test]
+async fn foreground_wait_threshold_detaches_the_exact_running_command() {
+	let tool =
+		shell::shell(FakeExec::default()).with_auto_background_threshold(std::time::Duration::ZERO);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::from(r#"{"command":"wait"}"#))
+		.expect("shell invocation remains live");
+	let mut events = Box::pin(tool.call(params));
+	let event = events.next().await.expect("detached terminal");
+	let Ev::Done(ToolTerminal::Detached(job)) = event else {
+		panic!("zero-threshold shell did not detach");
+	};
+	assert_eq!(job.id, "process:shell-bg-1:1");
+	assert_eq!(job.owner, JobOwner::NamedProcess {
+		name:       Str::new_static("shell-bg-1"),
+		generation: 1,
+	},);
 }
 
 #[test]
-fn interrupt_during_detach_reports_effect_uncertainty() {
+fn interrupt_during_async_setup_reports_effect_uncertainty() {
 	let exec = FakeExec::default();
 	let registry = registry(exec.clone(), 1024);
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(Str::from(r#"{"command":"pending-detach","detach":true,"name":"pending"}"#))
+		.args_committed(Str::from(r#"{"command":"pending-detach","async":true,"name":"pending"}"#))
 		.unwrap();
 	let wait_state = Arc::clone(&exec.state);
 	let interrupter = std::thread::spawn(move || {
@@ -384,7 +453,7 @@ fn interrupt_during_detach_reports_effect_uncertainty() {
 	let events = block_on(stream.map(|event| event.unwrap()).collect::<Vec<_>>());
 	interrupter.join().unwrap();
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
-		panic!("interrupted detach must produce a verdict")
+		panic!("interrupted async setup must produce a verdict")
 	};
 	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
 	assert!(matches!(outcome, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
@@ -459,11 +528,11 @@ fn interrupt_before_execution_is_skipped_without_poisoning_later_calls() {
 	let state = exec.state.lock();
 	assert_eq!(state.opens, 1);
 	assert_eq!(state.runs.len(), 1);
-	assert_eq!(state.runs[0].0, Bytes::from_static(b"session-41"));
+	assert_eq!(state.runs[0].0, Bytes::from_static(b"session-1"));
 }
 
 #[tokio::test]
-async fn queued_foreground_interrupt_skips_before_starting_host_execution() {
+async fn overlapping_foreground_runs_use_isolated_sessions() {
 	let exec = FakeExec::default();
 	let registry = Arc::new(registry(exec.clone(), 1024));
 	let (active_feed, active_params) = IncomingParams::channel();
@@ -472,40 +541,36 @@ async fn queued_foreground_interrupt_skips_before_starting_host_execution() {
 		.unwrap();
 	let active_registry = Arc::clone(&registry);
 	let active = tokio::spawn(async move {
-		let stream = active_registry.invoke("shell", active_params).unwrap();
-		stream.map(|event| event.unwrap()).collect::<Vec<_>>().await
+		active_registry
+			.invoke("shell", active_params)
+			.unwrap()
+			.map(|event| event.unwrap())
+			.collect::<Vec<_>>()
+			.await
 	});
 	while exec.state.lock().runs.is_empty() {
 		tokio::task::yield_now().await;
 	}
 
-	let (queued_feed, queued_params) = IncomingParams::channel();
-	queued_feed
-		.args_committed(Str::from(r#"{"command":"show-state"}"#))
-		.unwrap();
-	let queued_registry = Arc::clone(&registry);
-	let queued = tokio::spawn(async move {
-		let stream = queued_registry.invoke("shell", queued_params).unwrap();
-		stream.map(|event| event.unwrap()).collect::<Vec<_>>().await
+	let isolated_registry = Arc::clone(&registry);
+	let isolated = tokio::spawn(async move {
+		isolated_registry
+			.invoke("shell", committed(r#"{"command":"show-state"}"#))
+			.unwrap()
+			.map(|event| event.unwrap())
+			.collect::<Vec<_>>()
+			.await
 	});
-	tokio::task::yield_now().await;
-	assert_eq!(exec.state.lock().runs.len(), 1);
-	queued_feed
-		.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop queued") })
-		.unwrap();
-	let queued_events = tokio::time::timeout(std::time::Duration::from_secs(1), queued)
+	let isolated_events = tokio::time::timeout(std::time::Duration::from_secs(1), isolated)
 		.await
-		.expect("queued interrupt timeout")
-		.expect("queued invocation");
-	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = queued_events.last().unwrap() else {
-		panic!("queued interrupt must produce a verdict")
-	};
-	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(
-		outcome,
-		CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop queued"
-	));
-	assert_eq!(exec.state.lock().runs.len(), 1);
+		.expect("isolated execution timeout")
+		.expect("isolated invocation");
+	assert_eq!(payload(&isolated_events).session_id, Bytes::from_static(b"session-2"));
+	{
+		let state = exec.state.lock();
+		assert_eq!(state.runs.len(), 2);
+		assert_eq!(state.closes, 1);
+	}
 
 	active_feed
 		.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop active") })
@@ -516,55 +581,6 @@ async fn queued_foreground_interrupt_skips_before_starting_host_execution() {
 		.expect("active invocation");
 	assert_eq!(payload(&active_events).status.outcome, ExecOutcome::Cancelled);
 	assert_eq!(exec.state.lock().cancels, 1);
-}
-
-#[tokio::test]
-async fn foreground_queue_keeps_invocation_order_when_streams_poll_in_reverse() {
-	let exec = FakeExec::default();
-	let registry = registry(exec.clone(), 1024);
-	let (first_feed, first_params) = IncomingParams::channel();
-	first_feed
-		.args_committed(Str::from(r#"{"command":"wait"}"#))
-		.unwrap();
-	let (second_feed, second_params) = IncomingParams::channel();
-	second_feed
-		.args_committed(Str::from(r#"{"command":"show-state"}"#))
-		.unwrap();
-
-	let first = registry.invoke("shell", first_params).unwrap();
-	let second = registry.invoke("shell", second_params).unwrap();
-	let second_call = second.map(|event| event.unwrap()).collect::<Vec<_>>();
-	let first_call = first.map(|event| event.unwrap()).collect::<Vec<_>>();
-	let control = async {
-		while exec.state.lock().runs.is_empty() {
-			tokio::task::yield_now().await;
-		}
-		{
-			let state = exec.state.lock();
-			assert_eq!(state.runs.len(), 1);
-			assert_eq!(state.runs[0].1.command, "wait");
-		}
-		second_feed
-			.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop queued") })
-			.unwrap();
-		first_feed
-			.interrupt(Interrupt { class: Str::from("immediate"), reason: Str::from("stop active") })
-			.unwrap();
-	};
-	let (second_events, first_events, ()) = tokio::join!(second_call, first_call, control);
-
-	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = second_events.last().unwrap() else {
-		panic!("queued interrupt must produce a verdict")
-	};
-	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(
-		outcome,
-		CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop queued"
-	));
-	assert_eq!(payload(&first_events).status.outcome, ExecOutcome::Cancelled);
-	let state = exec.state.lock();
-	assert_eq!(state.runs.len(), 1);
-	assert_eq!(state.cancels, 1);
 }
 
 #[test]
@@ -582,14 +598,25 @@ fn malformed_whole_arguments_are_a_structured_args_verdict() {
 }
 
 #[test]
-fn missing_detach_name_is_a_typed_fault() {
+fn missing_async_name_is_a_typed_fault() {
 	let exec = FakeExec::default();
-	let events = call(&registry(exec, 1024), r#"{"command":"serve","detach":true}"#);
+	let events = call(&registry(exec, 1024), r#"{"command":"serve","async":true}"#);
 	let ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) = events.last().unwrap() else {
-		panic!("invalid detach policy must produce a verdict")
+		panic!("invalid async policy must produce a verdict")
 	};
 	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(outcome, CallOutcome::Faulted(Fault::DetachNameRequired)));
+	assert!(matches!(outcome, CallOutcome::Faulted(Fault::AsyncNameRequired)));
+}
+
+#[test]
+fn leading_cd_and_extracts_an_isolated_structured_cwd() {
+	let exec = FakeExec::default();
+	let events = call(&registry(exec.clone(), 1024), r#"{"command":"cd 'work dir' && printf ok"}"#);
+	assert_eq!(payload(&events).command, "printf ok");
+	let state = exec.state.lock();
+	assert_eq!(state.runs[0].1.command, "printf ok");
+	assert_eq!(state.session_options[0].cwd.as_deref(), Some("work dir"));
+	assert_eq!(state.closes, 1, "cwd-scoped sessions are isolated and closed");
 }
 
 #[test]

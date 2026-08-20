@@ -1047,11 +1047,9 @@ fn real_main(cli: &Cli, host: &mut Host) -> Result<i32, Error> {
 	let mut stdout = host.stdout_writer();
 	if let Some(test_files) = &cli.run_tests {
 		return Ok(match test_files.last() {
-			Some(file) => run_tests(
-				io::BufReader::new(std::fs::File::open(file)?),
-				&mut stdout,
-				&mut host.stderr,
-			),
+			Some(file) => {
+				run_tests(io::BufReader::new(std::fs::File::open(file)?), &mut stdout, &mut host.stderr)
+			},
 			None => run_tests(io::BufReader::new(&mut host.stdin), &mut stdout, &mut host.stderr),
 		});
 	}

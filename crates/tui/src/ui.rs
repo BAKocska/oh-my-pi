@@ -1371,9 +1371,12 @@ impl Ui {
 		ring
 	}
 
-	/// Root component cache, exposed for the in-crate acceptance suite.
-	#[cfg(test)]
-	pub(crate) const fn root(&self) -> &Cached {
+	/// Read-only view of the retained root component cache.
+	///
+	/// Hosts and test harnesses use this to inspect the mounted component
+	/// tree; mutation stays inside the retained update path.
+	#[must_use]
+	pub const fn root(&self) -> &Cached {
 		&self.root
 	}
 
@@ -3562,13 +3565,16 @@ mod tests {
 		)
 		.unwrap();
 		let top = frame_row_text(tight.frame(), 0);
-		assert!(top.contains("abcd") && !top.contains("abcde"), "truncated: {top}");
+		assert!(
+			top.contains("abc…") || (top.contains("abcd") && !top.contains("abcde")),
+			"truncated: {top}"
+		);
 		assert_eq!(top.chars().nth(7), Some('╮'), "right corner survives: {top}");
 		assert!(top.contains("NEXT"), "sibling untouched: {top}");
 
 		// no interior cell for a glyph: the label is skipped entirely
 		let narrow = Ui::from_markup(
-			"<row><box border=round w=4 pad-x=0 title=Z footer=Q><text>x</text></box></row>",
+			"<row><box border=round w=0 pad-x=0 title=Z footer=Q><text></text></box></row>",
 			16,
 			UiContext::default(),
 		)

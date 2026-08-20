@@ -24,8 +24,8 @@ use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
-	ExecEffects, IncomingParams, InferenceEffects, InterruptWaitError, ParamError, Part, PromptCaps,
-	Rev, Tool, ToolSpec, ToolTerminal, Usd,
+	ExecEffects, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, ParamError, Part,
+	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal, Usd,
 };
 use parking_lot::Mutex;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -33,7 +33,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use crate::render::TextProjection;
+use crate::{
+	auto_background::{
+		DEFAULT_AUTO_BACKGROUND_THRESHOLD, DetachedJob, ForegroundWait, JobWait,
+		managed_job_terminal, next_background_name,
+	},
+	render::TextProjection,
+};
 
 /// Runtime-work timeout accounting shared with host bridge scheduling.
 pub mod idle_timeout;
@@ -43,6 +49,7 @@ pub mod kernel;
 const EVAL_DESCRIPTION: &str = r#"Run one step of code in a persistent kernel. State persists across calls and subagents.
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
+Cells exceeding the foreground wait threshold continue as managed jobs; their results are delivered automatically.
 Parallelize *within* a cell with `parallel(thunks)`, not by batching.
 
 Top-level `await` works; `asyncio.run(…)` raises error.
@@ -366,6 +373,12 @@ pub enum RunEvent {
 	Completed(RunCompletion),
 }
 
+enum PendingEval {
+	Event(Result<Option<RunEvent>, Fault>),
+	Interrupt(Result<Interrupt, InterruptWaitError>),
+	Background,
+}
+
 /// Request-scoped active Python cell.
 pub trait EvalRun: Send {
 	/// Reports whether this run started from a fresh persistent namespace.
@@ -375,6 +388,18 @@ pub trait EvalRun: Send {
 
 	/// Interrupts the active cell without disposing its session.
 	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_;
+
+	/// Transfers this active cell to a managed background job.
+	///
+	/// Resource adapters that cannot authoritatively report detached settlement
+	/// may retain the default refusal; the tool then keeps waiting in the
+	/// foreground.
+	fn detach(&self, _name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
+		std::future::ready(Err(Fault::Resource {
+			operation: Str::new_static("detach"),
+			message:   Str::new_static("eval resource does not support managed detachment"),
+		}))
+	}
 }
 
 /// Zero-box resource boundary used by the native eval executor.
@@ -421,10 +446,12 @@ fn format_display_json(outputs: &[DisplayOutput]) -> String {
 
 /// Python-only `eval@1` implementation retaining one lazy session per owner.
 pub struct EvalTool<E: EvalExec> {
-	exec:     E,
+	exec: E,
 	sessions: Mutex<HashMap<Str, Arc<OwnerSession>>>,
-	control:  EvalSessionControl,
-	spec:     ToolSpec,
+	control: EvalSessionControl,
+	spec: ToolSpec,
+	next_background_name: AtomicU64,
+	auto_background_threshold: Duration,
 }
 
 struct OwnerSession {
@@ -457,6 +484,8 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 		exec,
 		sessions: Mutex::new(HashMap::new()),
 		control: control.clone(),
+		next_background_name: AtomicU64::new(1),
+		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
 		spec: ToolSpec {
 			name:            Str::from("eval"),
 			rev:             Rev { family: Str::default(), n: 1 },
@@ -489,6 +518,15 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 		},
 	};
 	(tool, control)
+}
+
+impl<E: EvalExec> EvalTool<E> {
+	/// Overrides how long eval cells wait before managed detachment.
+	#[must_use]
+	pub const fn with_auto_background_threshold(mut self, threshold: Duration) -> Self {
+		self.auto_background_threshold = threshold;
+		self
+	}
 }
 
 impl<E: EvalExec> Tool for EvalTool<E> {
@@ -562,6 +600,9 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				},
 			};
 			let reset = run.reset();
+			let foreground_wait =
+				ForegroundWait::new(self.auto_background_threshold, timeout);
+			let mut auto_background = true;
 
 			let mut cell_id = Bytes::new();
 			let mut frames = Vec::new();
@@ -570,22 +611,60 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				let event = if cancellation_reason.is_some() {
 					run.next_event().await
 				} else {
-					let selected = {
+					let selected = if auto_background {
+						match foreground_wait
+							.race(run.next_event(), params.next_interrupt())
+							.await
+						{
+							JobWait::Settled(event) => PendingEval::Event(event),
+							JobWait::Interrupted(interrupt) => PendingEval::Interrupt(interrupt),
+							JobWait::Background => PendingEval::Background,
+						}
+					} else {
 						let next = run.next_event().fuse();
 						let interrupt = params.next_interrupt().fuse();
 						pin_mut!(next, interrupt);
 						match futures::future::select(interrupt, next).await {
-							Either::Left((interrupt, _)) => Either::Left(interrupt),
-							Either::Right((event, _)) => Either::Right(event),
+							Either::Left((interrupt, _)) => PendingEval::Interrupt(interrupt),
+							Either::Right((event, _)) => PendingEval::Event(event),
 						}
 					};
 					match selected {
-						Either::Left(interrupt) => {
-							let reason = match interrupt {
-								Ok(interrupt) => interrupt.reason,
-								Err(InterruptWaitError::Closed) => Str::from("invocation owner disappeared"),
-								Err(InterruptWaitError::Protocol(reason)) => reason,
+						PendingEval::Background => {
+							let name =
+								next_background_name("eval", &self.next_background_name);
+							match run.detach(name).await {
+								Ok(job) => {
+									yield Ev::Done(detached_terminal(job));
+									return;
+								},
+								Err(_) => {
+									auto_background = false;
+									continue;
+								},
+							}
+						},
+						PendingEval::Interrupt(interrupt) => {
+							let interrupt = match interrupt {
+								Ok(interrupt) => interrupt,
+								Err(InterruptWaitError::Closed) => Interrupt {
+									class: Str::new_static("closed"),
+									reason: Str::from("invocation owner disappeared"),
+								},
+								Err(InterruptWaitError::Protocol(reason)) => Interrupt {
+									class: Str::new_static("protocol"),
+									reason,
+								},
 							};
+							if interrupt.class == Interrupt::STEERING {
+								let name =
+									next_background_name("eval", &self.next_background_name);
+								if let Ok(job) = run.detach(name).await {
+									yield Ev::Done(detached_terminal(job));
+									return;
+								}
+							}
+							let reason = interrupt.reason;
 							if let Err(fault) = run.cancel().await {
 								yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 								return;
@@ -593,7 +672,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 							cancellation_reason = Some(reason);
 							continue;
 						},
-						Either::Right(event) => event,
+						PendingEval::Event(event) => event,
 					}
 				};
 
@@ -802,6 +881,10 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			})),
 		})
 	}
+}
+
+fn detached_terminal(job: DetachedJob) -> ToolTerminal<Payload, Fault> {
+	managed_job_terminal(job, Str::new_static("eval cell settlement"))
 }
 
 fn param_event<U, P>(error: ParamError) -> Ev<U, P, Fault> {

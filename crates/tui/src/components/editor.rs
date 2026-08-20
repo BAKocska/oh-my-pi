@@ -5,12 +5,11 @@ use std::{
 };
 
 use omp_core::{Str, fmts};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smallvec::SmallVec;
-use xutf::Text;
-use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString};
-
+use xutf::Text;
 
 use super::Img;
 use crate::{
@@ -32,17 +31,7 @@ use crate::{
 /// dispatch through [`ComposerStyle::layout`].
 #[non_exhaustive]
 #[derive(
-	Clone,
-	Copy,
-	Debug,
-	Default,
-	Display,
-	EnumIter,
-	EnumString,
-	Eq,
-	PartialEq,
-	Serialize,
-	Deserialize,
+	Clone, Copy, Debug, Default, Display, EnumIter, EnumString, Eq, PartialEq, Serialize, Deserialize,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -79,23 +68,23 @@ pub enum ComposerStatusAttachment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComposerLayout {
 	/// Rows above the editable content.
-	pub top_rows:         u16,
+	pub top_rows:          u16,
 	/// Rows below the editable content.
-	pub bottom_rows:      u16,
+	pub bottom_rows:       u16,
 	/// Horizontal padding between the gutter/text and side chrome.
-	pub horizontal_pad:   u16,
+	pub horizontal_pad:    u16,
 	/// Chrome cells consumed on each side, excluding the prompt gutter.
-	pub side_chrome:      u16,
+	pub side_chrome:       u16,
 	/// Visible cells consumed by the first-row prompt gutter.
-	pub gutter_width:     u16,
+	pub gutter_width:      u16,
 	/// Status attachment used by the host scene.
 	pub status_attachment: ComposerStatusAttachment,
 	/// Whether the primary status line owns a separate row.
-	pub status_placement: super::StatusPlacement,
+	pub status_placement:  super::StatusPlacement,
 	/// Context presentation appropriate for this status placement.
-	pub context_gauge:    super::ContextGaugeMode,
+	pub context_gauge:     super::ContextGaugeMode,
 	/// Whether a blank row separates the input from standalone status.
-	pub status_gap:       bool,
+	pub status_gap:        bool,
 }
 
 impl ComposerStyle {
@@ -203,7 +192,6 @@ const fn scrollbar_thumb(charset: Charset) -> char {
 	}
 }
 
-
 /// Focusable editable leaf used by [`EditorPane`].
 pub struct EditInput {
 	props:       Props,
@@ -248,7 +236,6 @@ impl EditInput {
 	pub const fn set_composer_style(&mut self, style: ComposerStyle) {
 		self.style = style;
 	}
-
 
 	/// Hides staged attachments whose chip left the buffer (an undo that
 	/// restores the chip re-shows them), returning whether anything
@@ -407,7 +394,8 @@ impl Component for EditInput {
 		let thumb = if total > visible && visible > 0 {
 			let track = usize::from(content_height);
 			let size = (visible.saturating_mul(track).saturating_add(total - 1) / total).max(1);
-			let start = first.saturating_mul(track.saturating_sub(size)) / total.saturating_sub(visible);
+			let start =
+				first.saturating_mul(track.saturating_sub(size)) / total.saturating_sub(visible);
 			Some((start, start.saturating_add(size)))
 		} else {
 			None
@@ -424,7 +412,8 @@ impl Component for EditInput {
 		if layout.top_rows > 0 && rect.y < pc.clip {
 			match self.style {
 				ComposerStyle::Box | ComposerStyle::Pi => {
-					pc.frame.put(rect.x, rect.y, tl.encode_utf8(&mut [0; 4]), edge);
+					pc.frame
+						.put(rect.x, rect.y, tl.encode_utf8(&mut [0; 4]), edge);
 					paint_glyphs(
 						pc.frame,
 						rect.x.saturating_add(1),
@@ -433,7 +422,8 @@ impl Component for EditInput {
 						horizontal,
 						edge,
 					);
-					pc.frame.put(right, rect.y, tr.encode_utf8(&mut [0; 4]), edge);
+					pc.frame
+						.put(right, rect.y, tr.encode_utf8(&mut [0; 4]), edge);
 				},
 				ComposerStyle::Claude | ComposerStyle::Rule => {
 					paint_glyphs(pc.frame, rect.x, rect.y, rect.width, horizontal, edge);
@@ -449,11 +439,14 @@ impl Component for EditInput {
 			}
 			match self.style {
 				ComposerStyle::Box => {
-					pc.frame.put(rect.x, y, vertical.encode_utf8(&mut [0; 4]), edge);
-					pc.frame.put(right, y, vertical.encode_utf8(&mut [0; 4]), edge);
+					pc.frame
+						.put(rect.x, y, vertical.encode_utf8(&mut [0; 4]), edge);
+					pc.frame
+						.put(right, y, vertical.encode_utf8(&mut [0; 4]), edge);
 				},
 				ComposerStyle::Pi => {
-					pc.frame.put(rect.x, y, vertical.encode_utf8(&mut [0; 4]), edge);
+					pc.frame
+						.put(rect.x, y, vertical.encode_utf8(&mut [0; 4]), edge);
 					let glyph = if thumb
 						.is_some_and(|(start, end)| usize::from(row) >= start && usize::from(row) < end)
 					{
@@ -471,14 +464,16 @@ impl Component for EditInput {
 				ComposerStyle::Field => {
 					pc.frame.fill(Rect::new(rect.x, y, rect.width, 1), surface);
 					let (left, right_cap) = field_caps(pc.ctx.charset);
-					pc.frame.put(rect.x, y, left.encode_utf8(&mut [0; 4]), accent);
+					pc.frame
+						.put(rect.x, y, left.encode_utf8(&mut [0; 4]), accent);
 					pc.frame
 						.put(right, y, right_cap.encode_utf8(&mut [0; 4]), accent);
 				},
 				ComposerStyle::Rail => {
 					pc.frame.fill(Rect::new(rect.x, y, rect.width, 1), surface);
 					let rail = accent_rail(pc.ctx.charset);
-					pc.frame.put(rect.x, y, rail.encode_utf8(&mut [0; 4]), accent);
+					pc.frame
+						.put(rect.x, y, rail.encode_utf8(&mut [0; 4]), accent);
 				},
 				ComposerStyle::Claude | ComposerStyle::Borderless | ComposerStyle::Rule => {},
 			}
@@ -520,7 +515,9 @@ impl Component for EditInput {
 			let mut x = rect.x.saturating_add(layout.side_chrome);
 			if layout.gutter_width > 0 {
 				if row == 0 {
-					x = pc.frame.put(x, y, self.style.prompt_gutter(pc.ctx.charset), accent);
+					x = pc
+						.frame
+						.put(x, y, self.style.prompt_gutter(pc.ctx.charset), accent);
 				} else {
 					x = x.saturating_add(layout.gutter_width);
 				}
@@ -640,11 +637,7 @@ impl Component for EditInput {
 					cell == at && now.duration_since(then) <= Duration::from_millis(400)
 				});
 				let layout = self.style.layout(ec.ctx.charset);
-				let row = usize::from(
-					at.1
-						.saturating_sub(rect.y)
-						.saturating_sub(layout.top_rows),
-				);
+				let row = usize::from(at.1.saturating_sub(rect.y).saturating_sub(layout.top_rows));
 				let text_x = rect
 					.x
 					.saturating_add(layout.side_chrome)
@@ -668,11 +661,7 @@ impl Component for EditInput {
 					.saturating_add(layout.side_chrome)
 					.saturating_add(layout.gutter_width);
 				self.editor.extend_selection_visual_row(
-					usize::from(
-						at.1
-							.saturating_sub(rect.y)
-							.saturating_sub(layout.top_rows),
-					),
+					usize::from(at.1.saturating_sub(rect.y).saturating_sub(layout.top_rows)),
 					at.0.saturating_sub(text_x),
 					self.text_width(rect.width, ec.ctx.charset),
 				);
@@ -1399,22 +1388,14 @@ impl Component for EditorPane {
 			.saturating_sub(band)
 			.saturating_sub(status_height);
 		let editor_y = rect.y.saturating_add(band);
-		self.children[0].place(
-			ctx,
-			Rect::new(rect.x, editor_y, rect.width, editor_height),
-		);
+		self.children[0].place(ctx, Rect::new(rect.x, editor_y, rect.width, editor_height));
 		if self.has_status {
 			let status = &mut self.children[1];
 			let _ = status.measure(ctx);
 			let _ = status.height(ctx, rect.width);
 			status.place(
 				ctx,
-				Rect::new(
-					rect.x,
-					editor_y,
-					rect.width,
-					editor_height.saturating_add(status_height),
-				),
+				Rect::new(rect.x, editor_y, rect.width, editor_height.saturating_add(status_height)),
 			);
 		}
 		self.band =
@@ -1622,30 +1603,12 @@ mod tests {
 	fn composer_layouts_define_row_chrome_and_gutter_widths() {
 		let cases = [
 			(ComposerStyle::Box, (1, 1, 2, 3, 0, ComposerStatusAttachment::TopBorder)),
-			(
-				ComposerStyle::Claude,
-				(1, 1, 0, 0, 2, ComposerStatusAttachment::TopRuleChip),
-			),
-			(
-				ComposerStyle::Pi,
-				(1, 1, 1, 2, 2, ComposerStatusAttachment::Standalone),
-			),
-			(
-				ComposerStyle::Borderless,
-				(0, 0, 0, 0, 2, ComposerStatusAttachment::Standalone),
-			),
-			(
-				ComposerStyle::Rule,
-				(1, 0, 0, 0, 2, ComposerStatusAttachment::TopRuleChip),
-			),
-			(
-				ComposerStyle::Field,
-				(0, 0, 1, 2, 0, ComposerStatusAttachment::Standalone),
-			),
-			(
-				ComposerStyle::Rail,
-				(0, 0, 1, 2, 0, ComposerStatusAttachment::Standalone),
-			),
+			(ComposerStyle::Claude, (1, 1, 0, 0, 2, ComposerStatusAttachment::TopRuleChip)),
+			(ComposerStyle::Pi, (1, 1, 1, 2, 2, ComposerStatusAttachment::Standalone)),
+			(ComposerStyle::Borderless, (0, 0, 0, 0, 2, ComposerStatusAttachment::Standalone)),
+			(ComposerStyle::Rule, (1, 0, 0, 0, 2, ComposerStatusAttachment::TopRuleChip)),
+			(ComposerStyle::Field, (0, 0, 1, 2, 0, ComposerStatusAttachment::Standalone)),
+			(ComposerStyle::Rail, (0, 0, 1, 2, 0, ComposerStatusAttachment::Standalone)),
 		];
 		for (style, expected) in cases {
 			let layout = style.layout(Charset::Unicode);
@@ -1694,10 +1657,7 @@ mod tests {
 		let claude = render(ComposerStyle::Claude);
 		assert_eq!(frame_row_text(claude.frame(), 0), "─".repeat(20));
 		assert!(frame_row_text(claude.frame(), 1).starts_with("❯ hello"));
-		assert_eq!(
-			frame_row_text(claude.frame(), claude.frame().size().height - 1),
-			"─".repeat(20),
-		);
+		assert_eq!(frame_row_text(claude.frame(), claude.frame().size().height - 1), "─".repeat(20),);
 
 		let pi = render(ComposerStyle::Pi);
 		assert!(frame_row_text(pi.frame(), 0).starts_with('╭'));
@@ -1765,7 +1725,6 @@ mod tests {
 			"overflowing pi input should paint a thumb in its right border",
 		);
 	}
-
 
 	#[test]
 	fn selection_paint_replaces_only_the_glyph_background() {
@@ -1952,16 +1911,21 @@ mod tests {
 
 		let mut renderer = crate::Renderer::new(Vec::new());
 		ui.present(&mut renderer, 10, 0).unwrap();
+		let frame_text = (0..ui.height())
+			.map(|y| crate::test_support::frame_row_text(ui.frame(), y))
+			.collect::<Vec<_>>();
 		assert!(
-			crate::test_support::frame_row_text(ui.frame(), 0).contains("Ask anything"),
-			"empty focused editor should paint its placeholder"
+			frame_text.iter().any(|r| r.contains("Ask anything")),
+			"empty focused editor should paint its placeholder, got: {frame_text:?}"
 		);
 
 		ui.handle_key(Key::Char('x'));
 		ui.present(&mut renderer, 10, 0).unwrap();
-		let painted = crate::test_support::frame_row_text(ui.frame(), 0);
-		assert!(painted.contains('x'));
-		assert!(!painted.contains("Ask anything"));
+		let painted = (0..ui.height())
+			.map(|y| crate::test_support::frame_row_text(ui.frame(), y))
+			.collect::<Vec<_>>();
+		assert!(painted.iter().any(|r| r.contains('x')));
+		assert!(!painted.iter().any(|r| r.contains("Ask anything")));
 	}
 
 	#[test]
@@ -1993,11 +1957,13 @@ mod tests {
 	#[test]
 	fn editor_status_embeds_in_rounded_top_border() {
 		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
-		let mut editor = Cached::new(Box::new(EditorPane::new().status(
-			Status::new()
-				.with(Prop::Bg, "yellow")
-				.segment(Segment::new().label("ready")),
-		)));
+		let mut editor = Cached::new(Box::new(
+			EditorPane::new().status(
+				Status::new()
+					.with(Prop::Bg, "yellow")
+					.segment(Segment::new().label("ready")),
+			),
+		));
 		let height = editor.height(&ctx, 20);
 		editor.place(&ctx, Rect::new(0, 0, 20, height));
 		let mut frame = Frame::new(Size::new(20, height));

@@ -1,5 +1,4 @@
 //! Worker process contract tests.
-#![cfg(unix)]
 
 use std::{
 	fs,

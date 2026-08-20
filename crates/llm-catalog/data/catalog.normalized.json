@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "catalog-2afb6affc84324cd3ea404f193a773c6078dbf00949c8132d84fefafa7da767d",
+  "revision": "catalog-295f4aa0d0a7c7764cf590dac8fcabb32f05df9e936857e8392350a48af1b53b",
   "census": {
     "raw_models": 4302,
     "logical_models": 4225,
@@ -13136,7 +13136,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-029d42ef7e3c20f620208b690b923c9c4220481af15fa3ac6a5f4e7a784f71b0",
+      "wire_policy": "wire-sha256-b3917fe5d259661d3e357a7c28b409d7ff9029622a6065ddf8e95b85071c63be",
       "context": "replay",
       "pricing": {
         "components": [
@@ -13241,7 +13241,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-029d42ef7e3c20f620208b690b923c9c4220481af15fa3ac6a5f4e7a784f71b0",
+      "wire_policy": "wire-sha256-b3917fe5d259661d3e357a7c28b409d7ff9029622a6065ddf8e95b85071c63be",
       "context": "replay",
       "pricing": {
         "components": [
@@ -25584,7 +25584,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -25689,7 +25689,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -25787,7 +25787,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -25885,7 +25885,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -25983,7 +25983,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -26088,7 +26088,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -26193,7 +26193,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -26298,7 +26298,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -26403,7 +26403,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -50014,7 +50014,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-84ae16df449f0848027f6a82a842b94c052642bb88e6a2370dcee4c8c2c2a522",
+      "wire_policy": "wire-sha256-a73f1fe99219fa5f9e507641bae9eff440e4fcdf5a5e8b3d83866314ee83ca66",
       "context": "replay",
       "pricing": {
         "components": [
@@ -71252,7 +71252,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -71357,7 +71357,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -80338,7 +80338,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -80443,7 +80443,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -80548,7 +80548,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -80653,7 +80653,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -94670,7 +94670,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-2397763db80272ae987f0577ca7ec751b6f0baa5360bd70ea2feb1e1cd4bda0e",
+      "wire_policy": "wire-sha256-fd3c245471915791a06d74843dd3dcbc1a4e1559cfebe744c2a7e0b3186aba87",
       "context": "replay",
       "pricing": {
         "components": [
@@ -94775,7 +94775,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-2397763db80272ae987f0577ca7ec751b6f0baa5360bd70ea2feb1e1cd4bda0e",
+      "wire_policy": "wire-sha256-fd3c245471915791a06d74843dd3dcbc1a4e1559cfebe744c2a7e0b3186aba87",
       "context": "replay",
       "pricing": {
         "components": [
@@ -95081,7 +95081,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-dff0c0d05386c8d9a49c4e441f64bc065c2e539ed2d1770647f34711cdbb61eb",
+      "wire_policy": "wire-sha256-fa4e1d79c3b043a195974a024bc10f967d4abe581ca37555d829a50b5f8a6ad2",
       "context": "replay",
       "pricing": {
         "components": [
@@ -95179,7 +95179,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-029d42ef7e3c20f620208b690b923c9c4220481af15fa3ac6a5f4e7a784f71b0",
+      "wire_policy": "wire-sha256-b3917fe5d259661d3e357a7c28b409d7ff9029622a6065ddf8e95b85071c63be",
       "context": "replay",
       "pricing": {
         "components": [
@@ -95277,7 +95277,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-dff0c0d05386c8d9a49c4e441f64bc065c2e539ed2d1770647f34711cdbb61eb",
+      "wire_policy": "wire-sha256-fa4e1d79c3b043a195974a024bc10f967d4abe581ca37555d829a50b5f8a6ad2",
       "context": "replay",
       "pricing": {
         "components": [
@@ -104751,7 +104751,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -113996,7 +113996,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -118439,7 +118439,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -118544,7 +118544,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -118642,7 +118642,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -118747,7 +118747,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -118852,7 +118852,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -118957,7 +118957,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -119062,7 +119062,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -119167,7 +119167,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -129807,7 +129807,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -129912,7 +129912,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130010,7 +130010,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130108,7 +130108,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130213,7 +130213,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130318,7 +130318,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-884f637223b9ed070f75a085ac2bac4a84871eb6a182122425d1ade32be21f48",
+      "wire_policy": "wire-sha256-c9413779118de554e3728b12690a5e7a03f710ab7815d938ef36f922af3660f8",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130521,7 +130521,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130626,7 +130626,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130731,7 +130731,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130836,7 +130836,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -130941,7 +130941,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -131039,7 +131039,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -131144,7 +131144,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -131249,7 +131249,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -131354,7 +131354,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -131459,7 +131459,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -131564,7 +131564,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -146665,7 +146665,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -168456,7 +168456,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -173146,7 +173146,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -201716,7 +201716,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -201821,7 +201821,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -201926,7 +201926,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -202031,7 +202031,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -202136,7 +202136,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -202241,7 +202241,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -218457,7 +218457,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -218562,7 +218562,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -218667,7 +218667,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -218772,7 +218772,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -218877,7 +218877,7 @@
         },
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-473e51988b2e061e23c5cbd3c21f6e00d7fa574d9d9442340648bf3604947d8d",
+      "wire_policy": "wire-sha256-44f75816cbab472c3510695a4dfd28a2355a5bf3acc0ef9dbef5c1dc03e4ec37",
       "context": "replay",
       "pricing": {
         "components": [
@@ -218975,7 +218975,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219073,7 +219073,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219171,7 +219171,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219269,7 +219269,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219367,7 +219367,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219465,7 +219465,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219570,7 +219570,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219668,7 +219668,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219766,7 +219766,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219864,7 +219864,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -219962,7 +219962,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220067,7 +220067,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220172,7 +220172,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220277,7 +220277,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220382,7 +220382,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220487,7 +220487,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220585,7 +220585,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220683,7 +220683,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220781,7 +220781,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220886,7 +220886,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -220984,7 +220984,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -221089,7 +221089,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -221187,7 +221187,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -221285,7 +221285,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -230944,7 +230944,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -242181,7 +242181,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -259408,7 +259408,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -267282,7 +267282,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -267380,7 +267380,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -267483,7 +267483,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -267593,7 +267593,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -267796,7 +267796,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -267906,7 +267906,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268009,7 +268009,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268112,7 +268112,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268222,7 +268222,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268325,7 +268325,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268435,7 +268435,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268545,7 +268545,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268655,7 +268655,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268765,7 +268765,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268875,7 +268875,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -268985,7 +268985,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -269095,7 +269095,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -269205,7 +269205,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-736c8e63c69ac9b7a8bcf8b6f45718858fb7f53629078c2df2ddf81304bcfa7d",
+      "wire_policy": "wire-sha256-1e452fab8b14ea36eb76f50b056a7f3c684392dacb9479ee0c1f726fed7f39ef",
       "context": "replay",
       "pricing": {
         "components": [
@@ -279774,7 +279774,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -279872,7 +279872,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -279977,7 +279977,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -280082,7 +280082,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -280187,7 +280187,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -280292,7 +280292,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -280397,7 +280397,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -307051,7 +307051,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-3ba365507b52e98e2435089500bbf57ea37ffd13c24c46b14b9698ea7f9284f1",
+      "wire_policy": "wire-sha256-931421dee704244911cb7b9403ee16f32c32448988cb1e2599e7a4b62cd92dfc",
       "context": "replay",
       "pricing": {
         "components": [
@@ -307156,7 +307156,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-6b2446eee80d63be1adbc356b159681a5be674404327db3e9b4986e3c9ebda10",
+      "wire_policy": "wire-sha256-c9874000f73978fae328bcc269350dbefbaf6975cceee36eecf7496a471ff41a",
       "context": "replay",
       "pricing": {
         "components": [
@@ -310998,7 +310998,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -311103,7 +311103,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -311208,7 +311208,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -365523,7 +365523,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -370832,7 +370832,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -370937,7 +370937,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -371042,7 +371042,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -371140,7 +371140,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -371245,7 +371245,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -371350,7 +371350,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -376140,7 +376140,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -376245,7 +376245,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -376350,7 +376350,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -376455,7 +376455,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -376560,7 +376560,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-8806a83bfd92bfca00d8db9afdb7bd08b81e706eac0c1007eb2bb0ad1ddb9147",
+      "wire_policy": "wire-sha256-d45032e83998130ace27bd9a29c2f0049171376bcec7f32d1d77e4c336b7aa73",
       "context": "replay",
       "pricing": {
         "components": [
@@ -412338,7 +412338,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-06318ce98b1fee7fab3239c9f4b47f7619d53e3d6e71f7a3be161aac01af1dec",
+      "wire_policy": "wire-sha256-bf10497635a2e7c93be5bc34a8f51fe5731ac3ab5851786626fe2d3d30d4300e",
       "context": "replay",
       "pricing": {
         "components": [
@@ -412436,7 +412436,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-4832b899ad1531f337379036650e2cc9240eff7315975be94169fbea1f247b0a",
+      "wire_policy": "wire-sha256-0adb1d5c0d6fcc601664c6f49c5bacf96138c330b77a57aa99511519115e178e",
       "context": "replay",
       "pricing": {
         "components": [
@@ -413460,7 +413460,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -413565,7 +413565,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -424653,7 +424653,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-43eb4b4bdfc7bbb7238b24b3e2f9208311c4e63c6fe85131b3b6e66a970e184b",
+      "wire_policy": "wire-sha256-21f0f89739680f6f1a3ec9dc91004429721124a55509ce6bb0b6e2581fa459b1",
       "context": "replay",
       "pricing": {
         "components": [
@@ -424758,7 +424758,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-029d42ef7e3c20f620208b690b923c9c4220481af15fa3ac6a5f4e7a784f71b0",
+      "wire_policy": "wire-sha256-b3917fe5d259661d3e357a7c28b409d7ff9029622a6065ddf8e95b85071c63be",
       "context": "replay",
       "pricing": {
         "components": [
@@ -424863,7 +424863,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-029d42ef7e3c20f620208b690b923c9c4220481af15fa3ac6a5f4e7a784f71b0",
+      "wire_policy": "wire-sha256-b3917fe5d259661d3e357a7c28b409d7ff9029622a6065ddf8e95b85071c63be",
       "context": "replay",
       "pricing": {
         "components": [
@@ -424968,7 +424968,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -425073,7 +425073,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -425178,7 +425178,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -425283,7 +425283,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -425388,7 +425388,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-029d42ef7e3c20f620208b690b923c9c4220481af15fa3ac6a5f4e7a784f71b0",
+      "wire_policy": "wire-sha256-b3917fe5d259661d3e357a7c28b409d7ff9029622a6065ddf8e95b85071c63be",
       "context": "replay",
       "pricing": {
         "components": [
@@ -425493,7 +425493,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-0bf1de524b2cbe3730d0d076cd2129745134123a21d0faaf75066be04d84130b",
+      "wire_policy": "wire-sha256-6d670d5cb3546699795ffd6eb92cf22f5626dc4a3394a3e31d253b238193b058",
       "context": "replay",
       "pricing": {
         "components": [
@@ -425598,7 +425598,7 @@
         "effortRouting": {},
         "reasoningMode": null
       },
-      "wire_policy": "wire-sha256-55155623d2598655d471df169332d4d6876542fad01419674d550c1c0c7015e7",
+      "wire_policy": "wire-sha256-9d41dc51b06a94ec52394f737435a3ed874b2e639b2e5bdd1f5447ffa8d1c1b3",
       "context": "replay",
       "pricing": {
         "components": [
@@ -444612,168 +444612,6 @@
     },
     {
       "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": false,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": "reasoning_content",
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
         "supports_developer_role": false,
         "multiple_system_messages": null,
         "supports_mid_conversation_system": null
@@ -444855,7 +444693,7 @@
     },
     {
       "role": {
-        "supports_developer_role": null,
+        "supports_developer_role": false,
         "multiple_system_messages": null,
         "supports_mid_conversation_system": null
       },
@@ -444870,10 +444708,10 @@
         "requires_result_id": null,
         "eager_input_streaming": null,
         "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
+        "thinking_conflict": null,
         "apply_patch": null,
-        "computer_use": null,
-        "computer_use_config": null,
+        "computer_use": "unsupported",
+        "computer_use_config": "unsupported",
         "disable_reasoning_on_choice": null,
         "flatten_root_unions": null
       },
@@ -444891,7 +444729,7 @@
         "template_reasoning_effort": null,
         "effort_map": {},
         "disable_mode": null,
-        "content_field": null,
+        "content_field": "reasoning_content",
         "requires_content_for_tool_calls": null,
         "requires_content_for_all_assistant_turns": true,
         "allows_synthetic_content_for_tool_calls": null,
@@ -445599,92 +445437,6 @@
         "supports_mid_conversation_system": null
       },
       "tool": {
-        "supports_tool_choice": false,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": true,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": null,
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": true,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": "reasoning_content",
-        "requires_content_for_tool_calls": true,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": {
-          "thinking": {
-            "type": "enabled"
-          },
-          "enable_thinking": null
-        },
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": "max_tokens",
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": false,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
         "supports_tool_choice": null,
         "named_choice": null,
         "forced_choice": null,
@@ -446086,87 +445838,6 @@
     {
       "role": {
         "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": false,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": null,
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
         "multiple_system_messages": false,
         "supports_mid_conversation_system": null
       },
@@ -446343,88 +446014,7 @@
         "requires_result_id": null,
         "eager_input_streaming": null,
         "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": null,
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": null,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
+        "thinking_conflict": null,
         "apply_patch": null,
         "computer_use": "unsupported",
         "computer_use_config": "unsupported",
@@ -446652,87 +446242,6 @@
     },
     {
       "role": {
-        "supports_developer_role": false,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": "unsupported",
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": "reasoning_content",
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
         "supports_developer_role": null,
         "multiple_system_messages": null,
         "supports_mid_conversation_system": null
@@ -446934,87 +446443,6 @@
         "content_field": null,
         "requires_content_for_tool_calls": null,
         "requires_content_for_all_assistant_turns": null,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": "unsupported",
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
         "allows_synthetic_content_for_tool_calls": null,
         "filter_history": null,
         "include_encrypted": null,
@@ -447803,87 +447231,6 @@
         "supports_mid_conversation_system": null
       },
       "tool": {
-        "supports_tool_choice": false,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": null,
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": "reasoning_content",
-        "requires_content_for_tool_calls": true,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": "max_tokens",
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
         "supports_tool_choice": null,
         "named_choice": null,
         "forced_choice": null,
@@ -448015,87 +447362,6 @@
       },
       "cache": {
         "control_format": "anthropic",
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": "unsupported",
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": null,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
         "supports_long_retention": null
       },
       "context": {
@@ -448446,87 +447712,6 @@
     },
     {
       "role": {
-        "supports_developer_role": false,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": null,
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": "qwen",
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
         "supports_developer_role": null,
         "multiple_system_messages": null,
         "supports_mid_conversation_system": null
@@ -448645,168 +447830,6 @@
         "effort_map": {},
         "disable_mode": null,
         "content_field": "reasoning_content",
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": null,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": "unsupported",
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": null,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": false
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
-        "supports_tool_choice": null,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": null,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
         "requires_content_for_tool_calls": null,
         "requires_content_for_all_assistant_turns": null,
         "allows_synthetic_content_for_tool_calls": null,
@@ -449073,6 +448096,87 @@
       "context": {
         "max_tokens_field": null,
         "max_output_tokens": "omit",
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
+        "supports_developer_role": null,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
+        "supports_tool_choice": false,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": null,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": null,
+        "computer_use_config": null,
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": null,
+        "supports_effort": null,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": null,
+        "requires_content_for_tool_calls": null,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": null,
+        "max_output_tokens": null,
         "supports_store": null,
         "stateful_response_chaining": null,
         "extended_mode": null
@@ -449499,6 +448603,87 @@
     },
     {
       "role": {
+        "supports_developer_role": null,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
+        "supports_tool_choice": null,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": null,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": "unsupported",
+        "computer_use_config": "unsupported",
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": null,
+        "supports_effort": null,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": null,
+        "requires_content_for_tool_calls": null,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": null,
+        "max_output_tokens": null,
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
         "supports_developer_role": false,
         "multiple_system_messages": null,
         "supports_mid_conversation_system": null
@@ -449639,6 +448824,87 @@
       },
       "context": {
         "max_tokens_field": "max_tokens",
+        "max_output_tokens": null,
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
+        "supports_developer_role": false,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
+        "supports_tool_choice": null,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": null,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": null,
+        "computer_use_config": null,
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": "qwen",
+        "supports_effort": null,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": null,
+        "requires_content_for_tool_calls": null,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": null,
         "max_output_tokens": null,
         "supports_store": null,
         "stateful_response_chaining": null,
@@ -450478,6 +449744,87 @@
     },
     {
       "role": {
+        "supports_developer_role": false,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
+        "supports_tool_choice": null,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": null,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": "unsupported",
+        "computer_use_config": null,
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": null,
+        "supports_effort": null,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": "reasoning_content",
+        "requires_content_for_tool_calls": null,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": null,
+        "max_output_tokens": null,
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
         "supports_developer_role": null,
         "multiple_system_messages": null,
         "supports_mid_conversation_system": null
@@ -450864,6 +450211,87 @@
       },
       "context": {
         "max_tokens_field": null,
+        "max_output_tokens": null,
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
+        "supports_developer_role": null,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
+        "supports_tool_choice": false,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": null,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": null,
+        "computer_use_config": null,
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": null,
+        "supports_effort": null,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": "reasoning_content",
+        "requires_content_for_tool_calls": true,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": "max_tokens",
         "max_output_tokens": null,
         "supports_store": null,
         "stateful_response_chaining": null,
@@ -451782,87 +451210,6 @@
         "supports_mid_conversation_system": null
       },
       "tool": {
-        "supports_tool_choice": false,
-        "named_choice": null,
-        "forced_choice": null,
-        "strict_mode": null,
-        "schema_flavor": null,
-        "id_profile": null,
-        "escape_builtin_names": null,
-        "requires_result_id": null,
-        "eager_input_streaming": null,
-        "requires_assistant_content": true,
-        "thinking_conflict": "drop_auto_when_thinking",
-        "apply_patch": null,
-        "computer_use": "unsupported",
-        "computer_use_config": null,
-        "disable_reasoning_on_choice": null,
-        "flatten_root_unions": null
-      },
-      "structured": {
-        "penalties": null,
-        "sampling_params": null,
-        "stop_sequences": null
-      },
-      "reasoning": {
-        "wire_format": null,
-        "thinking_format": null,
-        "supports_effort": null,
-        "supports_summary": null,
-        "omit_effort": null,
-        "template_reasoning_effort": null,
-        "effort_map": {},
-        "disable_mode": null,
-        "content_field": null,
-        "requires_content_for_tool_calls": null,
-        "requires_content_for_all_assistant_turns": true,
-        "allows_synthetic_content_for_tool_calls": null,
-        "filter_history": null,
-        "include_encrypted": null,
-        "replay_unsigned": null,
-        "requires_enabled": null,
-        "disable_adaptive": null,
-        "interleaved_thinking": null,
-        "official_endpoint": null,
-        "signing_endpoint": null,
-        "extra_body": null,
-        "when_thinking": null,
-        "leaked_healer": null,
-        "loop_guard": null
-      },
-      "cache": {
-        "control_format": null,
-        "supports_long_retention": null
-      },
-      "context": {
-        "max_tokens_field": null,
-        "max_output_tokens": null,
-        "supports_store": null,
-        "stateful_response_chaining": null,
-        "extended_mode": null
-      },
-      "streaming": {
-        "protocol": null,
-        "watchdog": null
-      },
-      "usage": {
-        "in_streaming": null
-      },
-      "image": {
-        "encoding": null,
-        "supports_detail_original": null
-      },
-      "audio": {
-        "api_version": null
-      }
-    },
-    {
-      "role": {
-        "supports_developer_role": null,
-        "multiple_system_messages": null,
-        "supports_mid_conversation_system": null
-      },
-      "tool": {
         "supports_tool_choice": null,
         "named_choice": null,
         "forced_choice": null,
@@ -452681,6 +452028,87 @@
         "supports_mid_conversation_system": null
       },
       "tool": {
+        "supports_tool_choice": false,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": true,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": "unsupported",
+        "computer_use_config": null,
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": null,
+        "supports_effort": null,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": null,
+        "requires_content_for_tool_calls": null,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": null,
+        "max_output_tokens": null,
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
+        "supports_developer_role": null,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
         "supports_tool_choice": null,
         "named_choice": null,
         "forced_choice": null,
@@ -452725,6 +452153,92 @@
         "official_endpoint": null,
         "signing_endpoint": null,
         "extra_body": null,
+        "when_thinking": null,
+        "leaked_healer": null,
+        "loop_guard": null
+      },
+      "cache": {
+        "control_format": null,
+        "supports_long_retention": null
+      },
+      "context": {
+        "max_tokens_field": "max_tokens",
+        "max_output_tokens": null,
+        "supports_store": null,
+        "stateful_response_chaining": null,
+        "extended_mode": null
+      },
+      "streaming": {
+        "protocol": null,
+        "watchdog": null
+      },
+      "usage": {
+        "in_streaming": null
+      },
+      "image": {
+        "encoding": null,
+        "supports_detail_original": null
+      },
+      "audio": {
+        "api_version": null
+      }
+    },
+    {
+      "role": {
+        "supports_developer_role": false,
+        "multiple_system_messages": null,
+        "supports_mid_conversation_system": null
+      },
+      "tool": {
+        "supports_tool_choice": false,
+        "named_choice": null,
+        "forced_choice": null,
+        "strict_mode": null,
+        "schema_flavor": null,
+        "id_profile": null,
+        "escape_builtin_names": null,
+        "requires_result_id": null,
+        "eager_input_streaming": null,
+        "requires_assistant_content": true,
+        "thinking_conflict": null,
+        "apply_patch": null,
+        "computer_use": null,
+        "computer_use_config": null,
+        "disable_reasoning_on_choice": null,
+        "flatten_root_unions": null
+      },
+      "structured": {
+        "penalties": null,
+        "sampling_params": null,
+        "stop_sequences": null
+      },
+      "reasoning": {
+        "wire_format": null,
+        "thinking_format": null,
+        "supports_effort": true,
+        "supports_summary": null,
+        "omit_effort": null,
+        "template_reasoning_effort": null,
+        "effort_map": {},
+        "disable_mode": null,
+        "content_field": "reasoning_content",
+        "requires_content_for_tool_calls": true,
+        "requires_content_for_all_assistant_turns": true,
+        "allows_synthetic_content_for_tool_calls": null,
+        "filter_history": null,
+        "include_encrypted": null,
+        "replay_unsigned": null,
+        "requires_enabled": null,
+        "disable_adaptive": null,
+        "interleaved_thinking": null,
+        "official_endpoint": null,
+        "signing_endpoint": null,
+        "extra_body": {
+          "thinking": {
+            "type": "enabled"
+          },
+          "enable_thinking": null
+        },
         "when_thinking": null,
         "leaked_healer": null,
         "loop_guard": null

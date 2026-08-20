@@ -242,7 +242,11 @@ fn file_truncate(
 	}
 
 	let create = !no_create;
-	let file = match OpenOptions::new().write(true).create(create).open(&resolved) {
+	let file = match OpenOptions::new()
+		.write(true)
+		.create(create)
+		.open(&resolved)
+	{
 		Ok(file) => file,
 		Err(error) if error.kind() == ErrorKind::NotFound && !create => return Ok(()),
 		Err(error) => {
@@ -275,10 +279,7 @@ fn file_truncate(
 	};
 
 	file.set_len(truncate_size).map_err(|error| {
-		format!(
-			"failed to truncate {} at {truncate_size} bytes: {error}",
-			filename.quote()
-		)
+		format!("failed to truncate {} at {truncate_size} bytes: {error}", filename.quote())
 	})
 }
 
@@ -328,8 +329,7 @@ fn truncate(
 	}
 
 	for filename in filenames {
-		if let Err(error) =
-			file_truncate(host, no_create, io_blocks, reference_size, &mode, filename)
+		if let Err(error) = file_truncate(host, no_create, io_blocks, reference_size, &mode, filename)
 		{
 			host.error(error, 1);
 		}
@@ -572,10 +572,7 @@ mod tests {
 			let (code, _, stderr) = run_in(root.clone(), &["-s", size, "missing"]);
 			assert_eq!(code, 1, "size {size} must fail");
 			assert!(stderr.contains("division by zero"), "size {size}: {stderr}");
-			assert!(
-				!root.join("missing").exists(),
-				"size {size} must not create the operand"
-			);
+			assert!(!root.join("missing").exists(), "size {size} must not create the operand");
 		}
 	}
 

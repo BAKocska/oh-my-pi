@@ -83,9 +83,9 @@ pub enum ToolRejection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaViolation {
 	/// JSON Pointer-like location in the argument document.
-	pub path: Str,
+	pub path:              Str,
 	/// Stable validation rule identifier.
-	pub rule: &'static str,
+	pub rule:              &'static str,
 	/// Candidate JSON types reported by a failed `type` check.
 	pub expected_types:    SmallVec<Str, 4>,
 	/// Whether this issue came from a speculative failed union branch.
@@ -426,8 +426,7 @@ impl<'a> ToolAssembler<'a> {
 					},
 					Err(reason) => {
 						match normalize_flattened_arguments(&arguments).filter(|rebuilt| {
-							validate_schema(parameters.as_value(), rebuilt, *strict, self.limits)
-								.is_ok()
+							validate_schema(parameters.as_value(), rebuilt, *strict, self.limits).is_ok()
 						}) {
 							Some(rebuilt) => {
 								self.record(
@@ -538,9 +537,7 @@ fn repair_schema_arguments(
 	loop {
 		match validate_schema(schema, &repaired, strict, limits) {
 			Ok(()) => return Ok((repaired, repairs)),
-			Err(issue)
-				if repairs < 16 && apply_schema_repair(&mut repaired, &issue) =>
-			{
+			Err(issue) if repairs < 16 && apply_schema_repair(&mut repaired, &issue) => {
 				repairs = repairs.saturating_add(1);
 			},
 			Err(issue) => return Err(issue),
@@ -570,7 +567,11 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 			*value = parsed;
 			return true;
 		}
-		if issue.expected_types.iter().any(|kind| kind.as_str() == "boolean") {
+		if issue
+			.expected_types
+			.iter()
+			.any(|kind| kind.as_str() == "boolean")
+		{
 			let parsed = match trimmed {
 				"true" | "yes" | "1" => Some(true),
 				"false" | "no" | "0" => Some(false),
@@ -581,21 +582,38 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 				return true;
 			}
 		}
-		if issue.expected_types.iter().any(|kind| kind.as_str() == "integer")
+		if issue
+			.expected_types
+			.iter()
+			.any(|kind| kind.as_str() == "integer")
 			&& let Ok(parsed) = trimmed.parse::<i64>()
 		{
 			*value = Value::from(parsed);
 			return true;
 		}
-		if issue.expected_types.iter().any(|kind| kind.as_str() == "number")
-			&& let Ok(parsed) = trimmed.parse::<f64>()
-			&& let Some(parsed) = serde_json::Number::from_f64(parsed)
+		if issue
+			.expected_types
+			.iter()
+			.any(|kind| kind.as_str() == "number")
 		{
-			*value = Value::Number(parsed);
-			return true;
+			// "300" repairs to the integer 300, not 300.0 — schema "number"
+			// admits both and integer keeps the value's spelled fidelity.
+			if let Ok(parsed) = trimmed.parse::<i64>() {
+				*value = Value::from(parsed);
+				return true;
+			}
+			if let Ok(parsed) = trimmed.parse::<f64>()
+				&& let Some(parsed) = serde_json::Number::from_f64(parsed)
+			{
+				*value = Value::Number(parsed);
+				return true;
+			}
 		}
 	}
-	if issue.expected_types.iter().any(|kind| kind.as_str() == "string")
+	if issue
+		.expected_types
+		.iter()
+		.any(|kind| kind.as_str() == "string")
 		&& !matches!(value, Value::String(_))
 	{
 		if matches!(value, Value::Array(_) | Value::Object(_)) && issue.from_union_branch {
@@ -604,7 +622,10 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 		*value = Value::String(value.to_string());
 		return true;
 	}
-	if issue.expected_types.iter().any(|kind| kind.as_str() == "array")
+	if issue
+		.expected_types
+		.iter()
+		.any(|kind| kind.as_str() == "array")
 		&& !matches!(value, Value::Array(_))
 		&& !issue.from_union_branch
 	{
@@ -1007,10 +1028,7 @@ fn is_tag_selected_branch(branch: &Value, value: &Value) -> bool {
 	matched
 }
 
-fn type_violation<T>(
-	path: &str,
-	expected_types: SmallVec<Str, 4>,
-) -> Result<T, SchemaViolation> {
+fn type_violation<T>(path: &str, expected_types: SmallVec<Str, 4>) -> Result<T, SchemaViolation> {
 	Err(SchemaViolation {
 		path: Str::from(if path.is_empty() { "/" } else { path }),
 		rule: "type",
@@ -1018,7 +1036,6 @@ fn type_violation<T>(
 		from_union_branch: false,
 	})
 }
-
 
 fn child_path(parent: &str, child: &str) -> String {
 	format!("{parent}/{}", child.replace('~', "~0").replace('/', "~1"))
@@ -1745,23 +1762,20 @@ mod tests {
 	#[test]
 	fn string_type_union_stringifies_container_arguments() {
 		let definition = ToolDefinition {
-			name: Str::from("union_string"),
+			name:        Str::from("union_string"),
 			description: None,
-			input: ToolInputConstraint::JsonSchema {
+			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
 					"type": "object",
 					"properties": {"payload": {"type": ["string", "number"]}},
 					"required": ["payload"],
 					"additionalProperties": false
 				})),
-				strict: true,
+				strict:     true,
 			},
 		};
 		let (events, _) = call_with(definition, &json!({"payload": {"a": 1}}));
-		assert_eq!(
-			ready_arguments(&events),
-			Some(json!({"payload": "{\"a\":1}"}))
-		);
+		assert_eq!(ready_arguments(&events), Some(json!({"payload": "{\"a\":1}"})));
 	}
 
 	#[test]
@@ -1789,11 +1803,11 @@ mod tests {
 		assert_eq!(issue.path.as_str(), "/payload");
 
 		let definition = ToolDefinition {
-			name: Str::from("untagged"),
+			name:        Str::from("untagged"),
 			description: None,
-			input: ToolInputConstraint::JsonSchema {
+			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(schema),
-				strict: true,
+				strict:     true,
 			},
 		};
 		let (events, _) = call_with(definition, &value);
@@ -1802,9 +1816,9 @@ mod tests {
 	#[test]
 	fn failed_union_branch_still_allows_lossless_scalar_repair() {
 		let definition = ToolDefinition {
-			name: Str::from("lossless"),
+			name:        Str::from("lossless"),
 			description: None,
-			input: ToolInputConstraint::JsonSchema {
+			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(json!({
 					"type": "object",
 					"properties": {
@@ -1813,7 +1827,7 @@ mod tests {
 					"required": ["payload"],
 					"additionalProperties": false
 				})),
-				strict: true,
+				strict:     true,
 			},
 		};
 		let (events, _) = call_with(definition, &json!({"payload": "300"}));
@@ -1825,7 +1839,7 @@ mod tests {
 		for value in [
 			json!({"op": {"kind": "set", "value": 1, "extra": "keep"}}),
 			json!({"op": {"items": "one"}}),
-	] {
+		] {
 			let property = if value["op"].get("items").is_some() {
 				json!({
 					"anyOf": [
@@ -1855,23 +1869,22 @@ mod tests {
 				})
 			};
 			let definition = ToolDefinition {
-				name: Str::from("lossy"),
+				name:        Str::from("lossy"),
 				description: None,
-				input: ToolInputConstraint::JsonSchema {
+				input:       ToolInputConstraint::JsonSchema {
 					parameters: OpaqueJson::new(json!({
 						"type": "object",
 						"properties": {"op": property},
 						"required": ["op"],
 						"additionalProperties": false
 					})),
-					strict: true,
+					strict:     true,
 				},
 			};
 			let (events, _) = call_with(definition, &value);
 			assert!(ready_arguments(&events).is_none());
 		}
 	}
-
 
 	#[test]
 	fn uniquely_tag_selected_union_branch_allows_lossy_repairs() {
@@ -1904,18 +1917,15 @@ mod tests {
 		assert_eq!(issue.path.as_str(), "/payload");
 
 		let definition = ToolDefinition {
-			name: Str::from("tagged"),
+			name:        Str::from("tagged"),
 			description: None,
-			input: ToolInputConstraint::JsonSchema {
+			input:       ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(schema),
-				strict: true,
+				strict:     true,
 			},
 		};
 		let (events, _) = call_with(definition, &value);
-		assert_eq!(
-			ready_arguments(&events),
-			Some(json!({"kind": "text", "payload": "{\"a\":1}"}))
-		);
+		assert_eq!(ready_arguments(&events), Some(json!({"kind": "text", "payload": "{\"a\":1}"})));
 	}
 
 	#[test]

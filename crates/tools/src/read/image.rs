@@ -192,6 +192,8 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 	};
 	let original_width = image.width();
 	let original_height = image.height();
+	let channels = image.color().channel_count();
+	let has_alpha = image.color().has_alpha();
 	let within_dimensions = original_width >= MIN_IMAGE_DIMENSION
 		&& original_height >= MIN_IMAGE_DIMENSION
 		&& original_width <= MAX_IMAGE_WIDTH
@@ -205,6 +207,8 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 			metadata.kind,
 			original_width,
 			original_height,
+			channels,
+			has_alpha,
 			was_animated,
 		)));
 	}
@@ -215,16 +219,21 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 			metadata.kind,
 			original_width,
 			original_height,
+			channels,
+			has_alpha,
 			was_animated,
 		)));
 	};
 	let bytes = encoded.data.len();
 	let dimension_note =
 		dimension_note(original_width, original_height, encoded.width, encoded.height);
-	let description = match dimension_note {
-		Some(note) => Str::from(format!("Read image file [{}]\n{note}", encoded.kind.media_type())),
-		None => Str::from(format!("Read image file [{}]", encoded.kind.media_type())),
-	};
+	let description = image_description(
+		encoded.kind.media_type(),
+		Some((original_width, original_height)),
+		Some(channels),
+		Some(has_alpha),
+		dimension_note.as_deref(),
+	);
 	Ok(Some(ProcessedImage {
 		data: Bytes::from(encoded.data),
 		media_type: Str::new_static(encoded.kind.media_type()),
@@ -252,6 +261,7 @@ struct EncodedImage {
 
 fn unchanged_image(input: Bytes, metadata: ImageMetadata, was_animated: bool) -> ProcessedImage {
 	let bytes = input.len();
+	let dimensions = metadata.width.zip(metadata.height);
 	ProcessedImage {
 		data: input,
 		media_type: Str::new_static(metadata.kind.media_type()),
@@ -263,7 +273,7 @@ fn unchanged_image(input: Bytes, metadata: ImageMetadata, was_animated: bool) ->
 		was_resized: false,
 		was_animated,
 		animation_preserved: was_animated,
-		description: Str::from(format!("Read image file [{}]", metadata.kind.media_type())),
+		description: image_description(metadata.kind.media_type(), dimensions, None, None, None),
 	}
 }
 
@@ -272,13 +282,53 @@ fn unchanged_decoded_image(
 	kind: ImageKind,
 	width: u32,
 	height: u32,
+	channels: u8,
+	has_alpha: bool,
 	was_animated: bool,
 ) -> ProcessedImage {
-	unchanged_image(
-		input,
-		ImageMetadata { kind, width: Some(width), height: Some(height) },
+	let bytes = input.len();
+	ProcessedImage {
+		data: input,
+		media_type: Str::new_static(kind.media_type()),
+		bytes,
+		original_width: Some(width),
+		original_height: Some(height),
+		width: Some(width),
+		height: Some(height),
+		was_resized: false,
 		was_animated,
-	)
+		animation_preserved: was_animated,
+		description: image_description(
+			kind.media_type(),
+			Some((width, height)),
+			Some(channels),
+			Some(has_alpha),
+			None,
+		),
+	}
+}
+
+fn image_description(
+	media_type: &str,
+	dimensions: Option<(u32, u32)>,
+	channels: Option<u8>,
+	has_alpha: Option<bool>,
+	dimension_note: Option<&str>,
+) -> Str {
+	let dimensions = dimensions
+		.map(|(width, height)| format!("{width}x{height}"))
+		.unwrap_or_else(|| "unknown".to_owned());
+	let channels = channels.map_or_else(|| "unknown".to_owned(), |count| count.to_string());
+	let alpha = has_alpha.map_or("unknown", |present| if present { "yes" } else { "no" });
+	let mut description = format!(
+		"Read image file [{media_type}]\n[Inspection: MIME {media_type}; dimensions {dimensions}; \
+		 channels {channels}; alpha {alpha}]"
+	);
+	if let Some(note) = dimension_note {
+		description.push('\n');
+		description.push_str(note);
+	}
+	Str::from(description)
 }
 
 fn decode_image(input: &[u8], kind: ImageKind) -> image::ImageResult<(DynamicImage, bool)> {

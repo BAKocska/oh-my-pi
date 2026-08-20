@@ -195,9 +195,14 @@ enum UiCmd {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SubmitAck {
-	Done,
-	Interrupted,
+struct SubmitAck {
+	interrupted:     bool,
+	committed_turns: u32,
+}
+
+struct PendingPrompt {
+	text:        Str,
+	attachments: Vec<Attachment>,
 }
 
 struct ToolDisplay {
@@ -217,6 +222,7 @@ struct BridgeState {
 	attempt:           u32,
 	turn_started:      Option<Instant>,
 	submit_pending:    bool,
+	pending_prompt:    Option<PendingPrompt>,
 	part_serial:       u64,
 	active_parts:      HashMap<u32, Str>,
 	tools:             HashMap<Str, ToolDisplay>,
@@ -261,11 +267,13 @@ where
 		if startup_pending {
 			let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
 			let ack = match agent.submit(Vec::new(), turn_id).await {
-				Ok(summary) if summary.interrupted => SubmitAck::Interrupted,
-				Ok(_) => SubmitAck::Done,
+				Ok(summary) => SubmitAck {
+					interrupted:     summary.interrupted,
+					committed_turns: summary.committed_turns,
+				},
 				Err(error) => {
 					let _ = error_tx.send(format!("Startup resume error: {error}"));
-					SubmitAck::Done
+					SubmitAck { interrupted: false, committed_turns: 0 }
 				},
 			};
 			let _ = ack_tx.send(ack);
@@ -275,11 +283,13 @@ where
 				UiCmd::Submit(item) => {
 					let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
 					let ack = match agent.submit([*item], turn_id).await {
-						Ok(summary) if summary.interrupted => SubmitAck::Interrupted,
-						Ok(_) => SubmitAck::Done,
+						Ok(summary) => SubmitAck {
+							interrupted:     summary.interrupted,
+							committed_turns: summary.committed_turns,
+						},
 						Err(error) => {
 							let _ = error_tx.send(format!("Submit error: {error}"));
-							SubmitAck::Done
+							SubmitAck { interrupted: false, committed_turns: 0 }
 						},
 					};
 					let _ = ack_tx.send(ack);
@@ -315,6 +325,7 @@ where
 		attempt: 0,
 		turn_started: startup_pending.then(Instant::now),
 		submit_pending: startup_pending,
+		pending_prompt: None,
 		part_serial: 0,
 		active_parts: HashMap::new(),
 		tools: HashMap::new(),
@@ -323,6 +334,7 @@ where
 		replaying_turn: false,
 		settings: Settings::load(&data_dir),
 	};
+	chat.set_composer_style(state.settings.composer.shape);
 
 	send_backend(&backend_tx, BackendEvent::SessionTitle(session.session_id));
 	send_backend(&backend_tx, BackendEvent::ModelsUpdated {
@@ -377,8 +389,18 @@ where
 					state.submit_pending = false;
 					state.turn_started = None;
 					state.queued = 0;
+					if ack.interrupted && ack.committed_turns == 0
+						&& let Some(prompt) = state.pending_prompt.take()
+					{
+						send_backend(&backend_tx, BackendEvent::PromptDropped {
+							text: prompt.text,
+							attachments: prompt.attachments,
+						});
+					} else {
+						state.pending_prompt = None;
+					}
 					send_backend(&backend_tx, BackendEvent::Ack {
-						interrupted: ack == SubmitAck::Interrupted,
+						interrupted: ack.interrupted,
 					});
 					send_status(&backend_tx, &state, &bus, agent_events.dropped());
 				},
@@ -496,11 +518,15 @@ where
 						)),
 					);
 				} else {
+					let active = chat_active(state.submit_pending, bus.phase());
+					let pending_prompt = (!active).then(|| PendingPrompt {
+						text:        Str::from(text.as_str()),
+						attachments: attachments.clone(),
+					});
 					let mut item = *item;
 					let chips = lower_attachments(&mut item, attachments, |message| {
 						send_backend(backend, BackendEvent::Error(message));
 					});
-					let active = chat_active(state.submit_pending, bus.phase());
 					let delivered = if active {
 						mailbox
 							.try_enqueue(Interrupt {
@@ -525,9 +551,11 @@ where
 							state.queued = state.queued.saturating_add(1);
 						} else {
 							state.turn_started.get_or_insert_with(Instant::now);
+							state.pending_prompt = pending_prompt;
 						}
 					} else {
 						state.submit_pending = false;
+						state.pending_prompt = None;
 						send_backend(
 							backend,
 							BackendEvent::Error(Str::new_static("Agent input channel is closed.")),
@@ -1405,6 +1433,14 @@ fn model_provider(catalog: &Catalog, selector: &str) -> Option<Str> {
 	Some(Str::from(route.provider.as_str()))
 }
 
+fn model_uses_subscription(catalog: &Catalog, selector: &str) -> bool {
+	resolve_model(catalog, selector)
+		.and_then(|model| model.routes.first())
+		.and_then(|route| catalog.route(route))
+		.and_then(|route| catalog.provider(&route.provider))
+		.is_some_and(|provider| provider_uses_oauth(catalog, provider))
+}
+
 fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str> {
 	let provider_id = ProviderId::from(requested.as_str());
 	let Some(provider) = catalog.provider(&provider_id) else {
@@ -1432,11 +1468,16 @@ fn send_status(
 		backend,
 		BackendEvent::Status(StatusFacts {
 			model: Str::from(state.model.as_str()),
+			model_subscription: model_uses_subscription(Catalog::embedded(), &state.model),
+			advisor_model: None,
+			advisor_subscription: false,
 			working: chat_active(state.submit_pending, bus.phase()),
 			turn_started: state.turn_started,
 			context_tokens: state.context_tokens,
 			context_window: state.context_window,
+			compaction_speculation: omp_chat_ui::CompactionSpeculationStatus::Idle,
 			cost_nanos: state.cost_nanos,
+			advisor_cost_nanos: 0,
 			queued: state.queued,
 			jobs: state.jobs.len(),
 			attempt: state.attempt,

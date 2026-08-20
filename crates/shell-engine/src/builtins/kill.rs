@@ -32,13 +32,13 @@ pub(crate) struct KillCommand {
 
 impl builtins::Command for KillCommand {
 	type Error = crate::Error;
+
 	fn new<I>(args: I) -> std::result::Result<Self, clap::Error>
 	where
 		I: IntoIterator<Item = String>,
 	{
 		Self::try_parse_from(rewrite_attached_short_options(args))
 	}
-
 
 	#[allow(unknown_lints, reason = "unused_async_trait_impl is unknown to the pinned CI nightly")]
 	#[allow(
@@ -363,7 +363,10 @@ fn printed_signal(value: &str) -> std::result::Result<PrintedSignal, crate::Erro
 			}
 		})?;
 		Ok(PrintedSignal::Name(
-			signal.as_str().strip_prefix("SIG").unwrap_or(signal.as_str()),
+			signal
+				.as_str()
+				.strip_prefix("SIG")
+				.unwrap_or(signal.as_str()),
 		))
 	} else {
 		let signal = TrapSignal::try_from(value)?;
@@ -458,12 +461,10 @@ mod tests {
 
 	#[test]
 	fn rewrite_leaves_operand_region_alone() {
-		let rewritten =
-			rewrite_attached_short_options(["kill", "--", "-s9"].map(String::from));
+		let rewritten = rewrite_attached_short_options(["kill", "--", "-s9"].map(String::from));
 		assert_eq!(rewritten, ["kill", "--", "-s9"]);
 
-		let rewritten =
-			rewrite_attached_short_options(["kill", "-9", "-s9"].map(String::from));
+		let rewritten = rewrite_attached_short_options(["kill", "-9", "-s9"].map(String::from));
 		assert_eq!(rewritten, ["kill", "-9", "-s9"]);
 
 		let rewritten =

@@ -558,6 +558,7 @@ fn mock_status(model: &str, working: bool) -> StatusFacts {
 		attempt: 0,
 		dropped: 0,
 		git: Some(GitFacts { branch: Str::new_static("main"), dirty: 5, staged: 9 }),
+		..StatusFacts::default()
 	}
 }
 /// Renders one scripted scene to a PNG without a window, for pixel-level

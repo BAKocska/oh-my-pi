@@ -202,13 +202,13 @@ fn normalize_top_flag(arg: String) -> String {
 
 impl builtins::Command for TopCommand {
 	type Error = omp_shell_engine::Error;
+
 	fn new<I>(args: I) -> Result<Self, clap::Error>
 	where
 		I: IntoIterator<Item = String>,
 	{
 		Self::try_parse_from(args.into_iter().map(normalize_top_flag))
 	}
-
 
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
@@ -500,7 +500,11 @@ fn render_top_snapshot(
 					let _ = write!(output, "{:>width$}", "?");
 				},
 				TopStat::Command => {
-					output.push_str(if row.command.is_empty() { "?" } else { &row.command });
+					output.push_str(if row.command.is_empty() {
+						"?"
+					} else {
+						&row.command
+					});
 				},
 			}
 		}

@@ -122,6 +122,14 @@ const REVIEWED_THINKING_DEFAULTS: &[&str] = &["xai-oauth/grok-4.5"];
 const REVIEWED_WIRE_TOOL_CHOICE_DISABLED: &[&str] =
 	&["opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"];
 
+/// Authored long-context tiers for subscription Codex SKUs (pi 6d2bae2c41);
+/// input/output/cache-read/cache-write USD per Mtok above 272K prompt tokens.
+const LONG_CONTEXT_TIERED: &[(&str, [f64; 4])] = &[
+	("openai-codex/gpt-5.6-luna", [0.4, 1.8, 0.04, 0.5]),
+	("openai-codex/gpt-5.6-sol", [10.0, 45.0, 1.0, 12.5]),
+	("openai-codex/gpt-5.6-terra", [4.0, 18.0, 0.4, 5.0]),
+];
+
 fn inferred_cursor_efforts(model: &str) -> Option<&'static [ThinkingEffort]> {
 	INFERRED_CURSOR_THINKING
 		.iter()
@@ -1588,33 +1596,60 @@ fn every_normalized_logical_model_matches_typed_semantic_oracle_fields() {
 				expected.id
 			));
 		}
-		assert_eq!(
-			actual.pricing.tiers.len(),
-			expected.pricing_tiers.len(),
-			"{} price tiers",
-			expected.id
-		);
-		for (actual_tier, expected_tier) in actual.pricing.tiers.iter().zip(&expected.pricing_tiers) {
-			assert_eq!(
-				actual_tier.prompt_tokens_above, expected_tier.prompt_tokens_above,
-				"{} tier threshold",
-				expected.id
-			);
-			assert_eq!(
-				actual_tier
-					.components
-					.iter()
-					.map(|price| (price.unit, price.nanos_usd))
-					.collect::<Vec<_>>(),
-				expected_tier
-					.pricing
-					.iter()
-					.map(|price| (price.unit, price.nanos_usd))
-					.collect::<Vec<_>>(),
-				"{} tier prices",
-				expected.id
-			);
+		// Authored long-context tiers for subscription Codex SKUs
+		// (pi 6d2bae2c41, `compat/providers/openai-codex.kdl`); the frozen
+		// census predates the premium tier.
+		let mut expected_tiers = expected
+			.pricing_tiers
+			.iter()
+			.map(|tier| {
+				(
+					tier.prompt_tokens_above,
+					tier
+						.pricing
+						.iter()
+						.map(|price| (price.unit, price.nanos_usd))
+						.collect::<Vec<_>>(),
+				)
+			})
+			.collect::<Vec<_>>();
+		if let Some((_, prices)) = LONG_CONTEXT_TIERED
+			.iter()
+			.find(|(key, _)| *key == expected.id)
+		{
+			expected_tiers.push((
+				272_000,
+				[
+					PriceUnit::MtokInput,
+					PriceUnit::MtokOutput,
+					PriceUnit::MtokCacheRead,
+					PriceUnit::MtokCacheWrite,
+				]
+				.into_iter()
+				.zip(
+					prices
+						.iter()
+						.map(|value| (value * 1_000_000_000.0).round() as u64),
+				)
+				.collect(),
+			));
 		}
+		let actual_tiers = actual
+			.pricing
+			.tiers
+			.iter()
+			.map(|tier| {
+				(
+					tier.prompt_tokens_above,
+					tier
+						.components
+						.iter()
+						.map(|price| (price.unit, price.nanos_usd))
+						.collect::<Vec<_>>(),
+				)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(actual_tiers, expected_tiers, "{} price tiers", expected.id);
 
 		let route = compiled
 			.routes
