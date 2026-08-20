@@ -1,6 +1,8 @@
 //! Facilities for configuring trap handlers.
 
-use std::{collections::HashMap, fmt::Display, str::FromStr};
+use std::{fmt::Display, str::FromStr};
+
+use im::HashMap;
 
 use itertools::Itertools as _;
 
@@ -168,7 +170,6 @@ impl TrapHandlerConfig {
 		&self,
 	) -> impl Iterator<Item = (TrapSignal, &TrapHandler)>
 	+ ExactSizeIterator
-	+ Clone
 	+ std::iter::FusedIterator
 	+ '_ {
 		self

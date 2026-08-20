@@ -1,6 +1,8 @@
 //! Structures for managing function registrations and calls.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
+
+use im::HashMap;
 
 /// An environment for defined, named functions.
 #[derive(Clone, Default)]
@@ -57,7 +59,6 @@ impl FunctionEnv {
 		&self,
 	) -> impl Iterator<Item = (&String, &Registration)>
 	+ ExactSizeIterator
-	+ Clone
 	+ std::iter::FusedIterator
 	+ '_ {
 		self.functions.iter()

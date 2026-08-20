@@ -5,6 +5,8 @@ use std::{
 	collections::{HashMap, hash_map},
 };
 
+use im::HashMap as ImHashMap;
+
 use crate::{
 	Shell, error, extensions,
 	variables::{self, ShellValue, ShellValueUnsetType, ShellVariable},
@@ -598,7 +600,7 @@ impl ShellEnvironment {
 /// Represents a map from names to shell variables.
 #[derive(Clone, Debug, Default)]
 pub struct ShellVariableMap {
-	variables: HashMap<String, ShellVariable>,
+	variables: ImHashMap<String, ShellVariable>,
 }
 
 impl ShellVariableMap {
@@ -611,7 +613,6 @@ impl ShellVariableMap {
 		&self,
 	) -> impl Iterator<Item = (&String, &ShellVariable)>
 	+ ExactSizeIterator
-	+ Clone
 	+ std::iter::FusedIterator
 	+ '_ {
 		self.variables.iter()

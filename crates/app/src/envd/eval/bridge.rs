@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::BTreeMap,
 	ffi::CString,
 	fmt,
 	sync::{
@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
+use im::OrdSet;
 use omp_core::Str;
 use omp_tool::{
 	CapsBase, ErasedEv, ErasedOutcome, IncomingParams, ModelClass, Part, PromptCaps, Registry,
@@ -41,7 +42,7 @@ const BUDGET: &str = "__budget__";
 /// bridge grant never implies access to every tool registered in the session.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BridgeCapabilities {
-	tools:       BTreeSet<Str>,
+	tools:       OrdSet<Str>,
 	completion:  bool,
 	agent:       bool,
 	concurrency: bool,

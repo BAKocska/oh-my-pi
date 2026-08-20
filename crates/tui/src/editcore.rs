@@ -6,6 +6,7 @@
 
 use std::{cell::Cell, cmp::Reverse, collections::HashMap, ops::Range, sync::LazyLock};
 
+use im::Vector;
 use omp_core::{Str, fmts, str::IntoStr};
 use smallvec::SmallVec;
 use xutf::Text;
@@ -89,8 +90,8 @@ pub struct EditBuffer {
 	kill_index:    usize,
 	last_yank:     Option<(usize, usize)>,
 	last_action:   Action,
-	undo:          Vec<(String, usize, Vec<Atom>)>,
-	atoms:         Vec<Atom>,
+	undo:          Vec<(String, usize, Vector<Atom>)>,
+	atoms:         Vector<Atom>,
 	jump:          Option<Jump>,
 	layout_width:  u16,
 	xml:           bool,
@@ -121,7 +122,7 @@ impl EditBuffer {
 			last_yank: None,
 			last_action: Action::Other,
 			undo: Vec::new(),
-			atoms: Vec::new(),
+			atoms: Vector::new(),
 			jump: None,
 			layout_width: 80,
 			view_offset: Cell::new(0),
@@ -331,17 +332,13 @@ impl EditBuffer {
 	/// edit and dropping any atom the edit tears through.
 	fn splice(&mut self, range: std::ops::Range<usize>, replacement: &str) {
 		let inserted = replacement.len();
-		self.atoms.retain_mut(|atom| {
-			if atom.end <= range.start {
-				return true;
-			}
-			if atom.start >= range.end {
-				atom.start = atom.start - range.len() + inserted;
-				atom.end = atom.end - range.len() + inserted;
-				return true;
-			}
-			false
-		});
+		self
+			.atoms
+			.retain(|atom| atom.end <= range.start || atom.start >= range.end);
+		for atom in self.atoms.iter_mut().filter(|atom| atom.start >= range.end) {
+			atom.start = atom.start - range.len() + inserted;
+			atom.end = atom.end - range.len() + inserted;
+		}
 		self.text.replace_range(range, replacement);
 	}
 
@@ -400,7 +397,7 @@ impl EditBuffer {
 		self.anchor = None;
 		self
 			.atoms
-			.push(Atom { start, end: start + marker.len(), payload: Str::new(payload) });
+			.push_back(Atom { start, end: start + marker.len(), payload: Str::new(payload) });
 		self.desired = None;
 		BufferOutcome::Changed
 	}

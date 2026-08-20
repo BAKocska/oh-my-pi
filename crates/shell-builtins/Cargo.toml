@@ -38,6 +38,7 @@ grep-printer = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 hifijson = { workspace = true }
+im = { workspace = true }
 ignore = { workspace = true }
 indicatif = { workspace = true }
 itertools = { workspace = true }

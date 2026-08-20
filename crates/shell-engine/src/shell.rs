@@ -2,9 +2,10 @@
 
 use std::{
 	borrow::Cow,
-	collections::HashMap,
 	path::{Path, PathBuf},
 };
+
+use im::HashMap;
 
 use crate::{
 	ExecutionControlFlow, ExecutionResult, builtins, env::ShellEnvironment, error, extensions,

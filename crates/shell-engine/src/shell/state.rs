@@ -2,9 +2,10 @@
 
 use std::{
 	borrow::Cow,
-	collections::HashMap,
 	path::{Path, PathBuf},
 };
+
+use im::HashMap;
 
 use crate::{env::ShellEnvironment, jobs, openfiles, options::RuntimeOptions, pathcache};
 

@@ -2,13 +2,15 @@
 
 use std::path::PathBuf;
 
+use im::HashMap;
+
 use crate::{error, variables};
 
 /// A cache of paths associated with names.
 #[derive(Clone, Default)]
 pub struct PathCache {
 	/// The cache itself.
-	cache: std::collections::HashMap<String, PathBuf>,
+	cache: HashMap<String, PathBuf>,
 }
 
 impl PathCache {

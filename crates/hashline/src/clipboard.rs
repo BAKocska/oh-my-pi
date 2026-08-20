@@ -1,6 +1,6 @@
 //! In-memory clipboard lowering for `CUT` and register-backed `PUT` edits.
 
-use std::collections::BTreeMap;
+use im::{OrdMap, Vector};
 
 use omp_core::Str;
 
@@ -9,8 +9,8 @@ use crate::types::{Anchor, ApplyWarning, Cursor, Edit, InsertMode, ParsedRange, 
 /// Clipboard state shared by sections in one transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Clipboard {
-	anonymous:              Option<Vec<Str>>,
-	named:                  BTreeMap<Str, Vec<Str>>,
+	anonymous:              Option<Vector<Str>>,
+	named:                  OrdMap<Str, Vector<Str>>,
 	pending_anonymous_cuts: Vec<ParsedRange>,
 }
 
@@ -22,8 +22,8 @@ impl Clipboard {
 	}
 
 	/// Returns a named register.
-	pub fn named(&self, name: &str) -> Option<&[Str]> {
-		self.named.get(name).map(Vec::as_slice)
+	pub fn named(&self, name: &str) -> Option<&Vector<Str>> {
+		self.named.get(name)
 	}
 
 	/// Publishes named registers from a transactional fork.
@@ -147,7 +147,7 @@ fn read_register(
 	line_num: usize,
 	mode: EmptyPasteMode,
 	warnings: &mut Vec<ApplyWarning>,
-) -> Result<Option<Vec<Str>>, ClipboardError> {
+) -> Result<Option<Vector<Str>>, ClipboardError> {
 	if let Some(name) = register {
 		if let Some(lines) = clipboard.named.get(name) {
 			return Ok(Some(lines.clone()));
@@ -163,7 +163,7 @@ fn read_register(
 		}
 		warnings
 			.push(ApplyWarning::EmptyRegisterPaste { patch_line: line_num, register: name.clone() });
-		return Ok(Some(Vec::new()));
+		return Ok(Some(Vector::new()));
 	}
 	if clipboard.pending_anonymous_cuts.len() > 1 {
 		if mode == EmptyPasteMode::Drop {
@@ -209,7 +209,10 @@ pub fn resolve_clipboard_edits(
 						total:      original_lines.len(),
 					});
 				}
-				let captured = original_lines[range.start.line - 1..range.end.line].to_vec();
+				let captured = original_lines[range.start.line - 1..range.end.line]
+					.iter()
+					.cloned()
+					.collect();
 				if let Some(name) = register {
 					clipboard.named.insert(name.clone(), captured);
 				} else {
@@ -289,9 +292,9 @@ pub fn validate_clipboard_sequence(
 		match edit {
 			Edit::Cut { range, register, .. } => {
 				if let Some(name) = register {
-					fork.named.insert(name.clone(), Vec::new());
+					fork.named.insert(name.clone(), Vector::new());
 				} else {
-					fork.anonymous = Some(Vec::new());
+					fork.anonymous = Some(Vector::new());
 					fork.pending_anonymous_cuts.push(*range);
 				}
 			},

@@ -9,6 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _, stream};
+use im::OrdMap;
 use omp_agent::{empty_stop, project_thread_history};
 use omp_core::{Str, encoding::hex};
 use omp_llm_catalog::{
@@ -83,7 +84,7 @@ struct RpcContext {
 	messages:              Vec<Message>,
 	provider_conversation: Option<ConversationId>,
 	provider_revision:     Option<ProviderRevision>,
-	provider_heads:        BTreeMap<u64, ProviderRevision>,
+	provider_heads:        OrdMap<u64, ProviderRevision>,
 }
 
 struct ResolvedTurn {
@@ -92,7 +93,7 @@ struct ResolvedTurn {
 	context_id:            Option<String>,
 	provider_session:      Option<SessionRequest>,
 	provider_conversation: Option<ConversationId>,
-	provider_heads:        BTreeMap<u64, ProviderRevision>,
+	provider_heads:        OrdMap<u64, ProviderRevision>,
 }
 
 #[derive(Default)]
@@ -304,7 +305,7 @@ impl InferenceRpc {
 						context_id:            None,
 						provider_session:      None,
 						provider_conversation: None,
-						provider_heads:        BTreeMap::new(),
+						provider_heads:        OrdMap::new(),
 					});
 				}
 				if self.contexts.lock().contains_key(&seed.context_id) {
@@ -317,7 +318,7 @@ impl InferenceRpc {
 						context_id:            Some(seed.context_id.clone()),
 						provider_session:      None,
 						provider_conversation: None,
-						provider_heads:        BTreeMap::new(),
+						provider_heads:        OrdMap::new(),
 					});
 				}
 				let root = self
@@ -339,7 +340,7 @@ impl InferenceRpc {
 					context_id:            Some(seed.context_id.clone()),
 					provider_session:      Some(provider_session),
 					provider_conversation: Some(conversation),
-					provider_heads:        BTreeMap::from([(0, revision)]),
+					provider_heads:        [(0, revision)].into_iter().collect(),
 				})
 			},
 			Some(pb::turn_request::Input::Incremental(incremental)) => {
@@ -383,7 +384,7 @@ impl InferenceRpc {
 						context_id: Some(context.context_id.clone()),
 						provider_session: None,
 						provider_conversation: None,
-						provider_heads: BTreeMap::new(),
+						provider_heads: OrdMap::new(),
 					});
 				}
 				let (request_messages, conversation, revision, provider_heads, forked) =
@@ -427,7 +428,7 @@ impl InferenceRpc {
 							committed_messages.clone(),
 							root.conversation().clone(),
 							root.revision().clone(),
-							BTreeMap::from([(0, root.revision().clone())]),
+							[(0, root.revision().clone())].into_iter().collect(),
 							true,
 						)
 					};
@@ -692,12 +693,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let provider_heads = if provider_revision.is_some() {
 			source
 				.provider_heads
-				.iter()
-				.filter(|(head, _)| **head <= at)
+				.range(..=at)
 				.map(|(head, revision)| (*head, revision.clone()))
 				.collect()
 		} else {
-			BTreeMap::new()
+			OrdMap::new()
 		};
 		let fork = RpcContext {
 			revision: at,

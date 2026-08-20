@@ -147,6 +147,14 @@ a real path? no → default type right; don't churn.
     Vec fine.
   - unbounded, built once, moved once (scratch, collect-and-return, channel
     payloads) → Vec correct.
+  - cloned repeatedly (snapshots, per-turn/per-event state, values fanned to
+    tasks/channels) → `im::Vector` (Arc-backed structural sharing, O(1)
+    clone, cheap mutation of shared copies). Requires `T: Clone`; NOT
+    contiguous — consumers needing `&[T]`/`as_slice`/FFI stay on Vec. Only
+    pays when the O(1) clone survives to the consumer: small (≲12) vectors of
+    cheap-clone items stay SmallVec, and if every consumer flattens back into
+    a Vec/SmallVec anyway, the persistent tree is pure overhead — don't
+    convert.
 - Strings: default `omp_core::Str` (`crates/core/src/str.rs`; NOT smol_str).
   Inline ≤23 bytes; heap `Bytes`-backed: O(1) clone, zero-copy
   slice/split/trim. Build `StrMut`+`freeze()` or `fmts!`; convert `IntoStr`
@@ -158,8 +166,10 @@ a real path? no → default type right; don't churn.
   `Cow<'_, [u8]>` (borrowed | `Bytes`-owned; O(1) clone, zero-copy slicing).
   Built once, single consumer → `Vec<u8>` fine.
 - Maps/sets keyed by enums/small dense ints → `omp_core::SparseMap`/`SparseSet`
-  (bitmap presence + packed values). `HashMap` correct for sparse/unbounded
-  keys, strings, no small dense index.
+  (bitmap presence + packed values). Clone-heavy maps (state snapshots cloned
+  per event/turn, shared caches) → `im::HashMap`/`im::OrdMap` (O(1)
+  structural-sharing clone). Plain `HashMap` correct for sparse/unbounded
+  keys, strings, no small dense index, and no repeated clones.
 - Binary↔text: `omp_core::encoding` (`hex`/`base64`/`base32`), stack
   `ArrayStr<N>` outputs. External encoding crates banned outright — no
   exception.

@@ -1,11 +1,11 @@
 //! Independent request-rate windows and retry timing.
 
 use std::{
-	collections::BTreeMap,
 	fmt,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use im::OrdMap;
 use omp_core::Str;
 
 /// Identifies one independently enforced rate window.
@@ -135,7 +135,7 @@ pub enum RateAvailability {
 /// Independent rate state for one account.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RateState {
-	windows: BTreeMap<RateWindowId, RateWindow>,
+	windows: OrdMap<RateWindowId, RateWindow>,
 }
 
 impl RateState {

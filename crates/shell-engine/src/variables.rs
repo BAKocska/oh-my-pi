@@ -2,10 +2,11 @@
 
 use std::{
 	borrow::Cow,
-	collections::BTreeMap,
 	ffi::OsString,
 	fmt::{Display, Write},
 };
+
+use im::OrdMap;
 
 use crate::{
 	error, escape, extensions,
@@ -197,7 +198,7 @@ impl ShellVariable {
 				Err(error::ErrorKind::ConvertingAssociativeArrayToIndexedArray.into())
 			},
 			_ => {
-				let mut new_values = BTreeMap::new();
+				let mut new_values = OrdMap::new();
 				new_values.insert(0, self.value.to_cow_str_without_dynamic_support().to_string());
 				self.value = ShellValue::IndexedArray(new_values);
 				Ok(())
@@ -213,7 +214,7 @@ impl ShellVariable {
 				Err(error::ErrorKind::ConvertingIndexedArrayToAssociativeArray.into())
 			},
 			_ => {
-				let mut new_values: BTreeMap<String, String> = BTreeMap::new();
+				let mut new_values: OrdMap<String, String> = OrdMap::new();
 				new_values.insert(
 					String::from("0"),
 					self.value.to_cow_str_without_dynamic_support().to_string(),
@@ -582,9 +583,9 @@ pub enum ShellValue {
 	/// A string.
 	String(String),
 	/// An associative array.
-	AssociativeArray(BTreeMap<String, String>),
+	AssociativeArray(OrdMap<String, String>),
 	/// An indexed array.
-	IndexedArray(BTreeMap<u64, String>),
+	IndexedArray(OrdMap<u64, String>),
 	/// A value that is dynamically computed.
 	Dynamic {
 		/// Function that can query the value.
@@ -709,7 +710,7 @@ impl ShellValue {
 	where
 		S: IntoIterator<Item = String>,
 	{
-		let mut owned_values = BTreeMap::new();
+		let mut owned_values = OrdMap::new();
 		for (i, value) in values.into_iter().enumerate() {
 			owned_values.insert(i as u64, value);
 		}
@@ -724,7 +725,7 @@ impl ShellValue {
 	///
 	/// * `values` - The slice of strings to construct the indexed array from.
 	pub fn indexed_array_from_strs(values: &[&str]) -> Self {
-		let mut owned_values = BTreeMap::new();
+		let mut owned_values = OrdMap::new();
 		for (i, value) in values.iter().enumerate() {
 			owned_values.insert(i as u64, (*value).to_string());
 		}
@@ -738,17 +739,17 @@ impl ShellValue {
 	///
 	/// * `literals` - The literals to construct the indexed array from.
 	pub fn indexed_array_from_literals(literals: ArrayLiteral) -> Self {
-		let mut values = BTreeMap::new();
+		let mut values = OrdMap::new();
 		Self::update_indexed_array_from_literals(&mut values, literals);
 
 		Self::IndexedArray(values)
 	}
 
 	fn update_indexed_array_from_literals(
-		existing_values: &mut BTreeMap<u64, String>,
+		existing_values: &mut OrdMap<u64, String>,
 		literal_values: ArrayLiteral,
 	) {
-		let mut new_key = if let Some((largest_index, _)) = existing_values.last_key_value() {
+		let mut new_key = if let Some((largest_index, _)) = existing_values.get_max() {
 			largest_index + 1
 		} else {
 			0
@@ -771,14 +772,14 @@ impl ShellValue {
 	///
 	/// * `literals` - The literals to construct the associative array from.
 	pub fn associative_array_from_literals(literals: ArrayLiteral) -> Result<Self, error::Error> {
-		let mut values = BTreeMap::new();
+		let mut values = OrdMap::new();
 		Self::update_associative_array_from_literals(&mut values, literals)?;
 
 		Ok(Self::AssociativeArray(values))
 	}
 
 	fn update_associative_array_from_literals(
-		existing_values: &mut BTreeMap<String, String>,
+		existing_values: &mut OrdMap<String, String>,
 		literal_values: ArrayLiteral,
 	) -> Result<(), error::Error> {
 		let mut literal_values = literal_values.0.into_iter();
@@ -1012,7 +1013,7 @@ impl ShellValue {
 }
 
 fn get_key_for_indexed_array(
-	values: &BTreeMap<u64, String>,
+	values: &OrdMap<u64, String>,
 	index_str: &str,
 ) -> Result<u64, error::Error> {
 	let mut index_value = index_str.parse::<i64>().unwrap_or(0);

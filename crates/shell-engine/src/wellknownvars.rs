@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
+
+use im::OrdMap;
 
 use rand::RngExt as _;
 
@@ -100,7 +102,7 @@ pub(crate) fn init_well_known_vars(
 				);
 
 				ShellValue::associative_array_from_literals(values)
-					.unwrap_or_else(|_error| ShellValue::AssociativeArray(BTreeMap::new()))
+					.unwrap_or_else(|_error| ShellValue::AssociativeArray(OrdMap::new()))
 			},
 			setter: |_| (),
 		}),
@@ -145,7 +147,7 @@ pub(crate) fn init_well_known_vars(
 				shell
 					.program_location_cache()
 					.to_value()
-					.unwrap_or_else(|_error| ShellValue::AssociativeArray(BTreeMap::new()))
+					.unwrap_or_else(|_error| ShellValue::AssociativeArray(OrdMap::new()))
 			},
 			setter: |_| (),
 		}),

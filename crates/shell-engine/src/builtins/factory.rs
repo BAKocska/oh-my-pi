@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use im::HashMap;
 
 use super::*;
 use crate::builtins::{self, builtin, decl_builtin, raw_arg_builtin, simple_builtin};
@@ -7,7 +7,7 @@ use crate::builtins::{self, builtin, decl_builtin, raw_arg_builtin, simple_built
 #[allow(clippy::too_many_lines, reason = "one registration per builtin")]
 pub fn default_builtins<SE: crate::ShellExtensions>() -> HashMap<String, builtins::Registration<SE>>
 {
-	let mut builtins = HashMap::with_capacity(52);
+	let mut builtins = HashMap::new();
 
 	builtins.insert("break".into(), builtin::<break_::BreakCommand, SE>().special());
 	builtins.insert(":".into(), simple_builtin::<colon::ColonCommand, SE>().special());

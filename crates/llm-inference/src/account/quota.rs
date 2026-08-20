@@ -1,7 +1,8 @@
 //! Account quota windows kept separate from request-rate throttling.
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::time::SystemTime;
 
+use im::OrdMap;
 use omp_core::Str;
 
 use super::rate::Sample;
@@ -154,7 +155,7 @@ pub enum QuotaAvailability {
 /// Quota state for one account, independent of request-rate state.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QuotaState {
-	windows: BTreeMap<QuotaWindowId, QuotaWindow>,
+	windows: OrdMap<QuotaWindowId, QuotaWindow>,
 }
 
 impl QuotaState {

@@ -1,25 +1,34 @@
 //! One-time type erasure, live advertisement, and historical lift composition.
 
-use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+use std::{
+	collections::BTreeMap,
+	future::Future,
+	mem::size_of,
+	pin::Pin,
+	sync::Arc,
+	task::{Context, Poll},
+};
 
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-use omp_core::Str;
+use omp_core::{SparseMap, Str};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 	ToolInputConstraint,
 };
+use serde::{Deserialize, Serialize};
 use omp_proto::inference::v1::InvokeInput;
 use serde_json::Value;
+use parking_lot::Mutex;
 use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-	Abort, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError, CallOutcome, Constraint, GrammarSyntax,
-	IncomingParams, LiftedCall, Part, Presentation, PromptCaps, RecordedCall, RecordedCallOwned,
-	Rev, Tool, ToolIdentity,
+	Abort, ArgIssueKind, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError, CallOutcome, Constraint,
+	DeviceIssue, DevicePath, GrammarSyntax, IncomingParams, LiftedCall, Part, Presentation,
+	PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool, ToolIdentity,
 	render::{Render, RenderEntry, RenderRegistry, RenderRegistryError, ViewState},
 };
 
@@ -40,13 +49,43 @@ pub enum ConstraintDisposition {
 	/// Request remains a preference and is receipted when unavailable.
 	Prefer,
 }
+/// Worker placement site used by a supervised device route.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WorkerSiteKind {
+	/// The environment-local worker site.
+	Env,
+	/// The client-local worker site.
+	Local,
+	/// A pre-attached external worker site.
+	Attached,
+}
+
 /// Execution route associated with a live registry entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolRoute {
 	/// In-process typed Rust executor erased at registration.
 	Native,
-	/// Externally supervised worker executor.
-	Worker,
+	/// Externally supervised worker executor and its resolved placement.
+	Worker {
+		/// Worker site kind.
+		site: WorkerSiteKind,
+		/// Named worker target at that site.
+		name: Str,
+	},
 }
 
 /// Declared priority for resolving competing claims on one tool name.
@@ -123,7 +162,44 @@ pub struct MountedDevice<'a> {
 	/// Long-form documentation, when supplied by the declaration surface.
 	pub docs:     Option<&'a str>,
 	/// Execution placement, independent of device presentation.
-	pub route:    ToolRoute,
+	pub route:    &'a ToolRoute,
+}
+/// Resolved device dispatch target.
+///
+/// This borrows registry provenance while keeping a device's semantic
+/// revision separate from its claimant-qualified tool-tree address.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceTarget<'a> {
+	/// Stable root device token.
+	pub name:     &'a Str,
+	/// Semantic revision selected for this claimant.
+	pub rev:      &'a Rev,
+	/// Publisher-qualified implementation identity and worker extension key.
+	pub claimant: &'a Str,
+	/// Execution placement selected by the declaration.
+	pub route:    &'a ToolRoute,
+}
+
+impl DeviceTarget<'_> {
+	/// Returns the durable identity selected by this device address.
+	#[must_use]
+	pub fn identity(&self) -> ToolIdentity {
+		ToolIdentity { name: self.name.clone(), rev: self.rev.clone() }
+	}
+}
+/// One worker-reported availability transition.
+///
+/// The registry accepts only unmount transitions from this transport. A later
+/// registration or explicit refresh may mount a declaration again; a stale
+/// worker can never make an unavailable device reachable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityDelta {
+	/// Root device name whose live mount state changed.
+	pub name:    Str,
+	/// Reported reachability state.
+	pub mounted: bool,
+	/// Human-readable explanation for an unavailable device.
+	pub reason:  Option<Str>,
 }
 
 /// One live tool declaration ready for inference request construction.
@@ -178,15 +254,208 @@ pub enum ProjectedCall {
 	Data(RecordedCallOwned),
 }
 
+/// Stable cache identity for one verdict projection.
+///
+/// The digest includes every input which may change model-facing parts:
+/// verdict bytes, projection caps, semantic revision, and projection-code
+/// identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectionKey {
+	/// Exact tool revision whose typed verdict decoder is selected.
+	pub identity:        ToolIdentity,
+	/// Digest of the model projection budget.
+	pub caps_hash:       [u8; 32],
+	/// Registry-wide identity of projection implementations.
+	pub projection_hash: [u8; 32],
+	cache_hash:          [u8; 32],
+}
+
+impl ProjectionKey {
+	/// Creates the content-addressed key for one exact verdict and projection
+	/// context.
+	#[must_use]
+	pub fn new(
+		identity: &ToolIdentity,
+		verdict: &[u8],
+		caps: &PromptCaps,
+		projection_hash: [u8; 32],
+	) -> Self {
+		let caps_hash = projection_caps_hash(caps);
+		let mut hasher = blake3::Hasher::new();
+		hash_field(&mut hasher, verdict);
+		hash_field(&mut hasher, &caps.maximum_parts.to_le_bytes());
+		hash_field(&mut hasher, &caps.maximum_text_bytes.to_le_bytes());
+		hash_field(&mut hasher, &[u8::from(caps.media)]);
+		hash_field(&mut hasher, &[caps.dialect as u8]);
+		hash_field(&mut hasher, &[caps.model_class as u8]);
+		hash_identity(&mut hasher, &identity.name, &identity.rev);
+		hash_field(&mut hasher, &projection_hash);
+		Self {
+			identity: identity.clone(),
+			caps_hash,
+			projection_hash,
+			cache_hash: *hasher.finalize().as_bytes(),
+		}
+	}
+
+	/// Returns the opaque cache digest.
+	#[must_use]
+	pub const fn digest(&self) -> [u8; 32] {
+		self.cache_hash
+	}
+}
+
+/// One verdict projection which must be materialized during a turn's warm
+/// pre-pass.
+#[derive(Clone, Debug)]
+pub struct ProjectionRequest<'a> {
+	/// Cache identity and target tool revision.
+	pub key:             ProjectionKey,
+	/// Projection budget represented by [`ProjectionKey::caps_hash`].
+	pub caps:            PromptCaps,
+	/// Exact canonical structured verdict bytes.
+	pub verdict:         &'a [u8],
+	/// Durable compaction hint recorded with this call.
+	pub recorded_useless: bool,
+}
+
 /// Authoritative model projection and branch metadata decoded from one verdict.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectedVerdict {
 	/// Model-facing parts under the supplied current-model capabilities.
-	pub parts:    Vec<Part>,
+	///
+	/// Shared ownership avoids copying immutable parts into each projected
+	/// thread item.
+	pub parts:    Arc<[Part]>,
 	/// Whether the decoded verdict branch is a fault, argument error, or abort.
 	pub is_error: bool,
 	/// Durable compaction hint, forced false for argument errors and aborts.
 	pub useless:  bool,
+}
+
+struct ProjectionCache {
+	inner: Mutex<ProjectionCacheInner>,
+}
+
+struct ProjectionCacheInner {
+	by_device: SparseMap<u32, ProjectionLru>,
+	bytes:     usize,
+	clock:     u64,
+}
+
+struct ProjectionLru {
+	entries: SmallVec<ProjectionCacheEntry, 4>,
+}
+
+struct ProjectionCacheEntry {
+	hash:  [u8; 32],
+	value: Arc<ProjectedVerdict>,
+	bytes: usize,
+	used:  u64,
+}
+
+impl Default for ProjectionCache {
+	fn default() -> Self {
+		Self {
+			inner: Mutex::new(ProjectionCacheInner {
+				by_device: SparseMap::new(),
+				bytes:     0,
+				clock:     0,
+			}),
+		}
+	}
+}
+
+impl ProjectionCache {
+	const MAX_PART_BYTES: usize = 4 * 1024 * 1024;
+
+	fn get(&self, device_id: u32, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>> {
+		let mut inner = self.inner.lock();
+		inner.clock = inner.clock.wrapping_add(1);
+		let used = inner.clock;
+		let entry = inner
+			.by_device
+			.get_mut(device_id)?
+			.entries
+			.iter_mut()
+			.find(|entry| entry.hash == key.cache_hash)?;
+		entry.used = used;
+		Some(Arc::clone(&entry.value))
+	}
+
+	fn insert(&self, device_id: u32, key: &ProjectionKey, value: ProjectedVerdict) {
+		let bytes = projected_part_bytes(&value.parts);
+		if bytes > Self::MAX_PART_BYTES {
+			return;
+		}
+		let value = Arc::new(value);
+		let mut inner = self.inner.lock();
+		inner.clock = inner.clock.wrapping_add(1);
+		let used = inner.clock;
+		let previous_bytes = {
+			let lru = inner
+				.by_device
+				.get_or_insert_with(device_id, || ProjectionLru { entries: SmallVec::new() });
+			if let Some(entry) = lru.entries.iter_mut().find(|entry| entry.hash == key.cache_hash)
+			{
+				let previous = entry.bytes;
+				*entry = ProjectionCacheEntry { hash: key.cache_hash, value, bytes, used };
+				Some(previous)
+			} else {
+				lru.entries.push(ProjectionCacheEntry { hash: key.cache_hash, value, bytes, used });
+				None
+			}
+		};
+		let current_bytes = inner.bytes;
+		inner.bytes = previous_bytes.map_or_else(
+			|| current_bytes.saturating_add(bytes),
+			|previous| current_bytes.saturating_sub(previous).saturating_add(bytes),
+		);
+		while inner.bytes > Self::MAX_PART_BYTES {
+			let victim = inner
+				.by_device
+				.iter()
+				.flat_map(|(device_id, lru)| {
+					lru.entries
+						.iter()
+						.enumerate()
+						.map(move |(index, entry)| (device_id, index, entry.used))
+				})
+				.min_by_key(|(_, _, used)| *used);
+			let Some((device_id, index, _)) = victim else {
+				break;
+			};
+			let removed = inner
+				.by_device
+				.get_mut(device_id)
+				.expect("selected projection-cache device remains present")
+				.entries
+				.remove(index);
+			inner.bytes = inner.bytes.saturating_sub(removed.bytes);
+		}
+	}
+}
+
+struct ProjectionWarm {
+	result: Option<Result<(), RegistryError>>,
+}
+
+impl ProjectionWarm {
+	const fn ready(result: Result<(), RegistryError>) -> Self {
+		Self { result: Some(result) }
+	}
+
+	fn into_ready(mut self) -> Result<(), RegistryError> {
+		self.result.take().expect("projection warm future is consumed once")
+	}
+}
+
+impl Future for ProjectionWarm {
+	type Output = Result<(), RegistryError>;
+
+	fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+		Poll::Ready(self.result.take().expect("projection warm future polled after completion"))
+	}
 }
 
 /// Registry construction, dispatch, serialization, or projection failure.
@@ -195,6 +464,14 @@ pub enum RegistryError {
 	/// `(name, revision)` was registered twice.
 	#[error("tool revision already registered: {0}@{1}")]
 	Duplicate(Str, Rev),
+	/// Registered tool revisions exhausted the dense projection-cache id
+	/// space.
+	#[error("too many registered tool revisions for the projection cache")]
+	ProjectionCacheIdLimit,
+	/// A synchronous caller requested a projection which failed to warm its
+	/// cache entry.
+	#[error("projection cache remained cold for {0:?}")]
+	ProjectionCacheMiss(ToolIdentity),
 	/// Tool name is not registered.
 	#[error("unknown tool: {0}")]
 	UnknownTool(Str),
@@ -269,15 +546,12 @@ pub enum RegistryError {
 
 trait ErasedTool: Send + Sync {
 	fn spec(&self) -> &crate::ToolSpec;
-	fn route(&self) -> ToolRoute;
+	fn route(&self) -> &ToolRoute;
 	fn schema(&self) -> &OpaqueJson;
 	fn call<'a>(&'a self, params: IncomingParams<'a>) -> ErasedStream<'a>;
-	fn project_verdict(
-		&self,
-		verdict: &[u8],
-		recorded_useless: bool,
-		caps: PromptCaps,
-	) -> Result<ProjectedVerdict, RegistryError>;
+	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>>;
+	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict);
+	fn warm(&self, requests: &[ProjectionRequest<'_>]) -> ProjectionWarm;
 	fn invoke_input(
 		&self,
 		invocation_id: &str,
@@ -285,10 +559,15 @@ trait ErasedTool: Send + Sync {
 	) -> Result<Option<InvokeInput>, RegistryError>;
 	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall>;
 }
+static NATIVE_TOOL_ROUTE: ToolRoute = ToolRoute::Native;
+
 
 struct Worker {
-	spec:   crate::ToolSpec,
-	schema: OpaqueJson,
+	spec:     crate::ToolSpec,
+	schema:   OpaqueJson,
+	route:    ToolRoute,
+	cache:    Arc<ProjectionCache>,
+	cache_id: u32,
 }
 
 impl ErasedTool for Worker {
@@ -296,8 +575,8 @@ impl ErasedTool for Worker {
 		&self.spec
 	}
 
-	fn route(&self) -> ToolRoute {
-		ToolRoute::Worker
+	fn route(&self) -> &ToolRoute {
+		&self.route
 	}
 
 	fn schema(&self) -> &OpaqueJson {
@@ -309,13 +588,15 @@ impl ErasedTool for Worker {
 		Box::pin(futures::stream::once(async move { Err(error) }))
 	}
 
-	fn project_verdict(
-		&self,
-		_verdict: &[u8],
-		_recorded_useless: bool,
-		_caps: PromptCaps,
-	) -> Result<ProjectedVerdict, RegistryError> {
-		Err(external_error(&self.spec, "project_verdict"))
+	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>> {
+		self.cache.get(self.cache_id, key)
+	}
+	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict) {
+		self.cache.insert(self.cache_id, key, projected);
+	}
+
+	fn warm(&self, _requests: &[ProjectionRequest<'_>]) -> ProjectionWarm {
+		ProjectionWarm::ready(Err(external_error(&self.spec, "warm")))
 	}
 
 	fn invoke_input(
@@ -332,8 +613,44 @@ impl ErasedTool for Worker {
 }
 
 struct Registered<T> {
-	tool:   T,
-	schema: OpaqueJson,
+	tool:     T,
+	schema:   OpaqueJson,
+	cache:    Arc<ProjectionCache>,
+	cache_id: u32,
+}
+
+impl<T: Tool> Registered<T> {
+	fn project_fresh(
+		&self,
+		verdict: &[u8],
+		recorded_useless: bool,
+		caps: PromptCaps,
+	) -> Result<ProjectedVerdict, RegistryError> {
+		let verdict: CallOutcome<T::Payload, T::Fault> = serde_json::from_slice(verdict)
+			.map_err(|_| RegistryError::VerdictShape(self.tool.spec().name.clone()))?;
+		Ok(match &verdict {
+			CallOutcome::Ok(payload) => ProjectedVerdict {
+				parts:    self.tool.prompt(Ok(payload), &caps).into(),
+				is_error: false,
+				useless:  recorded_useless,
+			},
+			CallOutcome::Faulted(fault) => ProjectedVerdict {
+				parts:    self.tool.prompt(Err(fault), &caps).into(),
+				is_error: true,
+				useless:  recorded_useless,
+			},
+			CallOutcome::ArgsRejected(issue) => ProjectedVerdict {
+				parts:    vec![Part::Text { text: render_arg_issue(issue) }].into(),
+				is_error: true,
+				useless:  false,
+			},
+			CallOutcome::Aborted { abort, .. } => ProjectedVerdict {
+				parts:    vec![Part::Text { text: render_abort(abort) }].into(),
+				is_error: true,
+				useless:  false,
+			},
+		})
+	}
 }
 
 impl<T: Tool> ErasedTool for Registered<T> {
@@ -341,8 +658,8 @@ impl<T: Tool> ErasedTool for Registered<T> {
 		self.tool.spec()
 	}
 
-	fn route(&self) -> ToolRoute {
-		ToolRoute::Native
+	fn route(&self) -> &ToolRoute {
+		&NATIVE_TOOL_ROUTE
 	}
 
 	fn schema(&self) -> &OpaqueJson {
@@ -427,36 +744,26 @@ impl<T: Tool> ErasedTool for Registered<T> {
 		})
 	}
 
-	fn project_verdict(
-		&self,
-		verdict: &[u8],
-		recorded_useless: bool,
-		caps: PromptCaps,
-	) -> Result<ProjectedVerdict, RegistryError> {
-		let verdict: CallOutcome<T::Payload, T::Fault> = serde_json::from_slice(verdict)
-			.map_err(|_| RegistryError::VerdictShape(self.tool.spec().name.clone()))?;
-		Ok(match &verdict {
-			CallOutcome::Ok(payload) => ProjectedVerdict {
-				parts:    self.tool.prompt(Ok(payload), &caps),
-				is_error: false,
-				useless:  recorded_useless,
-			},
-			CallOutcome::Faulted(fault) => ProjectedVerdict {
-				parts:    self.tool.prompt(Err(fault), &caps),
-				is_error: true,
-				useless:  recorded_useless,
-			},
-			CallOutcome::ArgsRejected(issue) => ProjectedVerdict {
-				parts:    vec![Part::Text { text: render_arg_issue(issue) }],
-				is_error: true,
-				useless:  false,
-			},
-			CallOutcome::Aborted { abort, .. } => ProjectedVerdict {
-				parts:    vec![Part::Text { text: render_abort(abort) }],
-				is_error: true,
-				useless:  false,
-			},
-		})
+	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>> {
+		self.cache.get(self.cache_id, key)
+	}
+	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict) {
+		self.cache.insert(self.cache_id, key, projected);
+	}
+
+	fn warm(&self, requests: &[ProjectionRequest<'_>]) -> ProjectionWarm {
+		let identity = self.tool.spec().identity();
+		let result = requests
+			.iter()
+			.filter(|request| request.key.identity == identity)
+			.filter(|request| self.cache.get(self.cache_id, &request.key).is_none())
+			.try_for_each(|request| {
+				let value =
+					self.project_fresh(request.verdict, request.recorded_useless, request.caps)?;
+				self.cache.insert(self.cache_id, &request.key, value);
+				Ok(())
+			});
+		ProjectionWarm::ready(result)
 	}
 
 	fn invoke_input(
@@ -492,10 +799,12 @@ struct RegistryEntry {
 /// revision per stable name.
 #[derive(Default)]
 pub struct Registry {
-	versions:  BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
-	live:      BTreeMap<Str, Claim>,
-	arg_specs: ArgSpecRegistry,
-	renderers: RenderRegistry,
+	versions:         BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
+	live:             BTreeMap<Str, Claim>,
+	unmounted:        BTreeMap<Str, Option<Str>>,
+	arg_specs:        ArgSpecRegistry,
+	renderers:        RenderRegistry,
+	projection_cache: Arc<ProjectionCache>,
 }
 
 impl Registry {
@@ -572,6 +881,11 @@ impl Registry {
 	) -> Result<Str, RenderRegistryError> {
 		self.renderers.view(identity, state, outcome)
 	}
+	fn next_projection_cache_id(&self) -> Result<u32, RegistryError> {
+		let count = self.versions.values().map(BTreeMap::len).sum::<usize>();
+		u32::try_from(count).map_err(|_| RegistryError::ProjectionCacheIdLimit)
+	}
+
 
 	/// Registers a typed tool under one presentation and claimant.
 	///
@@ -589,31 +903,56 @@ impl Registry {
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
 			RegistryError::InvalidSchema { name: name.clone(), rev: rev.clone(), source }
 		})?;
+		let cache_id = self.next_projection_cache_id()?;
 		let entry = RegistryEntry {
-			tool: Arc::new(Registered { tool, schema: OpaqueJson::new(value) }),
+			tool: Arc::new(Registered {
+				tool,
+				schema: OpaqueJson::new(value),
+				cache: Arc::clone(&self.projection_cache),
+				cache_id,
+			}),
 			presentation,
 			claims,
 		};
 		self.insert(name, rev, entry)
 	}
 
-	/// Registers an externally supervised declaration under one presentation
-	/// and claimant.
-	///
-	/// Worker execution and typed projection remain owned by the worker route.
+	/// Registers an externally supervised declaration under the default
+	/// environment worker whose name matches the device token.
 	pub fn register_worker(
 		&mut self,
 		spec: crate::ToolSpec,
 		presentation: Presentation,
 		claims: Claims,
 	) -> Result<(), RegistryError> {
+		let worker_name = spec.name.clone();
+		self.register_worker_at(spec, presentation, claims, WorkerSiteKind::Env, worker_name)
+	}
+
+	/// Registers an externally supervised declaration with its resolved worker
+	/// placement.
+	pub fn register_worker_at(
+		&mut self,
+		spec: crate::ToolSpec,
+		presentation: Presentation,
+		claims: Claims,
+		site: WorkerSiteKind,
+		worker_name: Str,
+	) -> Result<(), RegistryError> {
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
 			RegistryError::InvalidSchema { name: name.clone(), rev: rev.clone(), source }
 		})?;
+		let cache_id = self.next_projection_cache_id()?;
 		let entry = RegistryEntry {
-			tool: Arc::new(Worker { spec, schema: OpaqueJson::new(value) }),
+			tool: Arc::new(Worker {
+				spec,
+				schema: OpaqueJson::new(value),
+				route: ToolRoute::Worker { site, name: worker_name },
+				cache: Arc::clone(&self.projection_cache),
+				cache_id,
+			}),
 			presentation,
 			claims,
 		};
@@ -686,30 +1025,103 @@ impl Registry {
 
 	/// Returns the execution route of a winning or claimant-qualified entry.
 	pub fn route(&self, name: &str) -> Result<ToolRoute, RegistryError> {
-		Ok(self.live_entry(name)?.tool.route())
+		Ok(self.live_entry(name)?.tool.route().clone())
 	}
 
 	/// Returns the presentation of a winning or claimant-qualified entry.
 	pub fn presentation(&self, name: &str) -> Result<Presentation, RegistryError> {
 		Ok(self.live_entry(name)?.presentation)
 	}
+	/// Resolves a typed device path without admitting it to the model slot
+	/// catalog.
+	///
+	/// The optional sub-tool component remains owned by the `dyn` router; the
+	/// registry resolves the root claim and its live semantic revision.
+	pub fn resolve_device(
+		&self,
+		path: &DevicePath,
+	) -> Result<DeviceTarget<'_>, DeviceIssue> {
+		if self.unmounted.contains_key(path.root()) {
+			return Err(device_issue(path));
+		}
+		let Some((name, claim)) = self.live.get_key_value(path.root()) else {
+			return Err(device_issue(path));
+		};
+		let Some(selected) = claim_entries(claim).find(|candidate| {
+			path
+				.claimant
+				.as_ref()
+				.is_none_or(|claimant| candidate.claimant == claimant)
+		}) else {
+			return Err(device_issue(path));
+		};
+		let Some(entry) = self
+			.versions
+			.get(name)
+			.and_then(|versions| versions.get(selected.rev))
+		else {
+			return Err(device_issue(path));
+		};
+		if entry.presentation != Presentation::Device {
+			return Err(device_issue(path));
+		}
+		Ok(DeviceTarget {
+			name,
+			rev: selected.rev,
+			claimant: selected.claimant,
+			route: entry.tool.route(),
+		})
+	}
+	/// Conservatively applies worker availability reports and returns the
+	/// transitions that actually unmounted live devices.
+	///
+	/// `mounted=true` is deliberately ignored: only a fresh registry
+	/// composition may make a device reachable after a worker report.
+	pub fn apply_availability(
+		&mut self,
+		deltas: &[AvailabilityDelta],
+	) -> SmallVec<AvailabilityDelta, 2> {
+		let mut applied = SmallVec::new();
+		for delta in deltas {
+			if delta.mounted
+				|| self.unmounted.contains_key(&delta.name)
+				|| !self
+					.live
+					.get(&delta.name)
+					.is_some_and(|claim| {
+						self
+							.versions
+							.get(&delta.name)
+							.and_then(|versions| versions.get(&claim.rev))
+							.is_some_and(|entry| entry.presentation == Presentation::Device)
+					})
+			{
+				continue;
+			}
+			self.unmounted.insert(delta.name.clone(), delta.reason.clone());
+			applied.push(delta.clone());
+		}
+		applied
+	}
 
 	/// Iterates mounted catalog devices without allocating.
 	///
-	/// Shadowed devices remain claimant-qualified but are intentionally absent.
+	/// Shadowed and conservatively unmounted devices are intentionally absent.
 	pub fn devices(&self) -> impl DoubleEndedIterator<Item = MountedDevice<'_>> + '_ {
 		self.live.iter().filter_map(|(name, claim)| {
 			let entry = self.versions.get(name)?.get(&claim.rev)?;
-			(entry.presentation == Presentation::Device).then(|| MountedDevice {
-				name,
-				rev: &claim.rev,
-				claimant: &claim.claimant,
-				summary: &entry.tool.spec().description,
-				schema: entry.tool.spec().schema.as_ref(),
-				effects: &entry.tool.spec().effects,
-				docs: None,
-				route: entry.tool.route(),
-			})
+			(!self.unmounted.contains_key(name) && entry.presentation == Presentation::Device).then(
+				|| MountedDevice {
+					name,
+					rev: &claim.rev,
+					claimant: &claim.claimant,
+					summary: &entry.tool.spec().description,
+					schema: entry.tool.spec().schema.as_ref(),
+					effects: &entry.tool.spec().effects,
+					docs: None,
+					route: entry.tool.route(),
+				},
+			)
 		})
 	}
 
@@ -739,6 +1151,9 @@ impl Registry {
 		let mut hasher = blake3::Hasher::new();
 		hasher.update(b"omp-tool/devices/v1\0");
 		for (name, claim) in &self.live {
+			if self.unmounted.contains_key(name) {
+				continue;
+			}
 			for shadow in claim_entries(claim) {
 				let Some(entry) = self
 					.versions
@@ -759,7 +1174,7 @@ impl Registry {
 						.map_or(&[][..], |replacement| replacement.as_bytes()),
 				);
 				hasher.update(&shadow.precedence.0.to_le_bytes());
-				hasher.update(&[entry.tool.route() as u8]);
+				hash_tool_route(&mut hasher, entry.tool.route());
 			}
 		}
 		*hasher.finalize().as_bytes()
@@ -786,8 +1201,33 @@ impl Registry {
 		mut params: IncomingParams<'a>,
 	) -> Result<ErasedStream<'a>, RegistryError> {
 		let entry = self.live_entry(name)?;
-		if entry.tool.route() == ToolRoute::Worker {
+		if matches!(entry.tool.route(), ToolRoute::Worker { .. }) {
 			return Err(external_error(entry.tool.spec(), "invoke"));
+		}
+		params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
+		Ok(entry.tool.call(params))
+	}
+	/// Dispatches one resolved native device while preserving the normal slot
+	/// invocation path unchanged.
+	///
+	/// Worker-routed devices are intentionally rejected here: the environment
+	/// router owns their `InvokeTool` transport after inspecting
+	/// [`DeviceTarget::route`] from [`Self::resolve_device`].
+	pub fn invoke_device<'a>(
+		&'a self,
+		path: &DevicePath,
+		mut params: IncomingParams<'a>,
+	) -> Result<ErasedStream<'a>, RegistryError> {
+		let target = self
+			.resolve_device(path)
+			.map_err(|_| RegistryError::UnknownTool(Str::from(path.to_string())))?;
+		let entry = self
+			.versions
+			.get(target.name)
+			.and_then(|versions| versions.get(target.rev))
+			.expect("resolved device target must retain its registered entry");
+		if matches!(entry.tool.route(), ToolRoute::Worker { .. }) {
+			return Err(external_error(entry.tool.spec(), "invoke_device"));
 		}
 		params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
 		Ok(entry.tool.call(params))
@@ -811,8 +1251,63 @@ impl Registry {
 		identity: &ToolIdentity,
 		verdict: &[u8],
 		caps: &PromptCaps,
-	) -> Result<Option<Vec<Part>>, RegistryError> {
-		Ok(Some(self.project_verdict(identity, verdict, false, caps)?.parts))
+	) -> Result<Option<Arc<[Part]>>, RegistryError> {
+		let projected = self.project_verdict(identity, verdict, false, caps)?;
+		Ok(Some(Arc::clone(&projected.parts)))
+	}
+
+	/// Builds one cache-addressed projection request for a complete turn
+	/// pre-pass.
+	pub fn projection_request<'a>(
+		&self,
+		identity: &ToolIdentity,
+		verdict: &'a [u8],
+		recorded_useless: bool,
+		caps: &PromptCaps,
+	) -> Result<ProjectionRequest<'a>, RegistryError> {
+		self.projection_entry(identity)?;
+		Ok(ProjectionRequest {
+			key: ProjectionKey::new(identity, verdict, caps, self.projection_hash()),
+			caps: *caps,
+			verdict,
+			recorded_useless,
+		})
+	}
+
+	/// Probes the projection cache without allocating or invoking a worker.
+	pub fn project_cached(
+		&self,
+		key: &ProjectionKey,
+	) -> Result<Option<Arc<ProjectedVerdict>>, RegistryError> {
+		Ok(self.projection_entry(&key.identity)?.tool.project_cached(key))
+	}
+	/// Stores a projection returned by a worker batch in the matching cache
+	/// partition.
+	pub fn cache_projected(
+		&self,
+		key: &ProjectionKey,
+		projected: ProjectedVerdict,
+	) -> Result<(), RegistryError> {
+		self
+			.projection_entry(&key.identity)?
+			.tool
+			.cache_projected(key, projected);
+		Ok(())
+	}
+
+	/// Warms every cache miss for one turn before prompt assembly.
+	pub async fn warm(&self, requests: &[ProjectionRequest<'_>]) -> Result<(), RegistryError> {
+		for (index, request) in requests.iter().enumerate() {
+			if requests[..index]
+				.iter()
+				.any(|earlier| earlier.key.identity == request.key.identity)
+			{
+				continue;
+			}
+			let entry = self.projection_entry(&request.key.identity)?;
+			entry.tool.warm(requests).await?;
+		}
+		Ok(())
 	}
 
 	/// Decodes one recorded verdict into current model parts and branch
@@ -827,13 +1322,17 @@ impl Registry {
 		verdict: &[u8],
 		recorded_useless: bool,
 		caps: &PromptCaps,
-	) -> Result<ProjectedVerdict, RegistryError> {
-		let entry = self
-			.versions
-			.get(&identity.name)
-			.and_then(|versions| versions.get(&identity.rev))
-			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))?;
-		entry.tool.project_verdict(verdict, recorded_useless, *caps)
+	) -> Result<Arc<ProjectedVerdict>, RegistryError> {
+		let request = self.projection_request(identity, verdict, recorded_useless, caps)?;
+		let entry = self.projection_entry(identity)?;
+		if let Some(projected) = entry.tool.project_cached(&request.key) {
+			return Ok(projected);
+		}
+		entry.tool.warm(std::slice::from_ref(&request)).into_ready()?;
+		entry
+			.tool
+			.project_cached(&request.key)
+			.ok_or_else(|| RegistryError::ProjectionCacheMiss(identity.clone()))
 	}
 
 	/// Projects one exact serialized update through its registered typed tool.
@@ -843,11 +1342,7 @@ impl Registry {
 		invocation_id: &str,
 		json: &[u8],
 	) -> Result<Option<InvokeInput>, RegistryError> {
-		let entry = self
-			.versions
-			.get(&identity.name)
-			.and_then(|versions| versions.get(&identity.rev))
-			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))?;
+		let entry = self.projection_entry(identity)?;
 		entry.tool.invoke_input(invocation_id, json)
 	}
 
@@ -856,17 +1351,31 @@ impl Registry {
 	/// Failure of any step returns the exact original bytes as `Data`; partially
 	/// migrated history is never exposed or mistaken for a live schema.
 	pub fn project(&self, original: RecordedCallOwned) -> ProjectedCall {
-		let Some(live_claim) = self.live.get(&original.identity.name) else {
-			return ProjectedCall::Data(original);
-		};
+		let lifted = self.project_lift_chain(&original);
+		#[cfg(debug_assertions)]
+		if let Some(first) = &lifted {
+			let second = self
+				.project_lift_chain(&original)
+				.expect("a successful lift chain must remain successful on identical input");
+			debug_assert_eq!(
+				first.raw_args, second.raw_args,
+				"lift chains must re-express arguments byte-identically"
+			);
+			debug_assert_eq!(
+				first.verdict, second.verdict,
+				"lift chains must re-express verdicts byte-identically"
+			);
+		}
+		lifted.map_or(ProjectedCall::Data(original), ProjectedCall::Live)
+	}
+
+	fn project_lift_chain(&self, original: &RecordedCallOwned) -> Option<RecordedCallOwned> {
+		let live_claim = self.live.get(&original.identity.name)?;
 		let live_rev = &live_claim.rev;
 		if &original.identity.rev == live_rev {
-			return ProjectedCall::Live(original);
+			return Some(original.clone());
 		}
-		let Some(versions) = self.versions.get(&original.identity.name) else {
-			return ProjectedCall::Data(original);
-		};
-
+		let versions = self.versions.get(&original.identity.name)?;
 		let mut current_rev = original.identity.rev.clone();
 		let mut current =
 			LiftedCall { raw_args: original.raw_args.clone(), verdict: original.verdict.clone() };
@@ -876,23 +1385,27 @@ impl Registry {
 			} else {
 				live_rev.clone()
 			};
-			let Some(step) = versions.get(&next_rev) else {
-				return ProjectedCall::Data(original);
-			};
-			let Some(lifted) = step.tool.lift(&current_rev, RecordedCall {
+			let step = versions.get(&next_rev)?;
+			let lifted = step.tool.lift(&current_rev, RecordedCall {
 				raw_args: &current.raw_args,
 				verdict:  &current.verdict,
-			}) else {
-				return ProjectedCall::Data(original);
-			};
+			})?;
 			current = lifted;
 			current_rev = next_rev;
 		}
-		ProjectedCall::Live(RecordedCallOwned {
-			identity: ToolIdentity { name: original.identity.name, rev: current_rev },
+		Some(RecordedCallOwned {
+			identity: ToolIdentity { name: original.identity.name.clone(), rev: current_rev },
 			raw_args: current.raw_args,
 			verdict:  current.verdict,
 		})
+	}
+
+	fn projection_entry(&self, identity: &ToolIdentity) -> Result<&RegistryEntry, RegistryError> {
+		self
+			.versions
+			.get(&identity.name)
+			.and_then(|versions| versions.get(&identity.rev))
+			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))
 	}
 
 	fn live_entry(&self, path: &str) -> Result<&RegistryEntry, RegistryError> {
@@ -1014,10 +1527,57 @@ fn claim_entries(claim: &Claim) -> impl Iterator<Item = ClaimRef<'_>> {
 	}))
 }
 
+fn device_issue(path: &DevicePath) -> DeviceIssue {
+	DeviceIssue {
+		path:     Vec::new(),
+		expected: Str::new_static("a mounted device path"),
+		kind:     ArgIssueKind::Missing,
+		example:  None,
+		found:    Some(Str::from(path.to_string())),
+	}
+}
+
 fn hash_identity(hasher: &mut blake3::Hasher, name: &Str, rev: &Rev) {
 	hash_field(hasher, name.as_bytes());
 	hash_field(hasher, rev.family.as_bytes());
 	hash_field(hasher, &rev.n.to_le_bytes());
+}
+
+fn projection_caps_hash(caps: &PromptCaps) -> [u8; 32] {
+	let mut hasher = blake3::Hasher::new();
+	hash_field(&mut hasher, &caps.maximum_parts.to_le_bytes());
+	hash_field(&mut hasher, &caps.maximum_text_bytes.to_le_bytes());
+	hash_field(&mut hasher, &[u8::from(caps.media)]);
+	hash_field(&mut hasher, &[caps.dialect as u8]);
+	hash_field(&mut hasher, &[caps.model_class as u8]);
+	*hasher.finalize().as_bytes()
+}
+
+fn hash_tool_route(hasher: &mut blake3::Hasher, route: &ToolRoute) {
+	match route {
+		ToolRoute::Native => hash_field(hasher, &[0]),
+		ToolRoute::Worker { site, name } => {
+			hash_field(hasher, &[1]);
+			hash_field(hasher, &[*site as u8]);
+			hash_field(hasher, name.as_bytes());
+		},
+	}
+}
+
+fn projected_part_bytes(parts: &[Part]) -> usize {
+	parts.iter().fold(0, |bytes, part| {
+		let part_bytes = match part {
+			Part::Text { text } => text.len(),
+			Part::Json { json } => json.len(),
+			Part::Blob { blob, alt } => {
+				blob.hash.len()
+					.saturating_add(blob.media_type.len())
+					.saturating_add(alt.as_ref().map_or(0, Str::len))
+					.saturating_add(size_of::<u64>())
+			},
+		};
+		bytes.saturating_add(part_bytes)
+	})
 }
 
 fn hash_field(hasher: &mut blake3::Hasher, field: &[u8]) {
@@ -1183,5 +1743,120 @@ fn dropped(name: &Str, feature: &str, reason: &'static str) -> Adjustment {
 	Adjustment::Dropped {
 		feature: FeatureId(Str::from(format!("tool.{name}.{feature}"))),
 		reason:  ReasonId(Str::from(reason)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use crate::{Effects, Ev, ToolSpec};
+
+	struct LiftTool {
+		spec: ToolSpec,
+	}
+
+	impl Tool for LiftTool {
+		type Params = Value;
+		type Update = Value;
+		type Payload = Value;
+		type Fault = Value;
+
+		fn spec(&self) -> &ToolSpec {
+			&self.spec
+		}
+
+		fn call<'c>(
+			&'c self,
+			_params: IncomingParams<'c>,
+		) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+			futures::stream::empty()
+		}
+
+		fn prompt(
+			&self,
+			_view: Result<&Self::Payload, &Self::Fault>,
+			_caps: &PromptCaps,
+		) -> Vec<Part> {
+			Vec::new()
+		}
+
+		fn lift(&self, _from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+			Some(LiftedCall {
+				raw_args: Bytes::copy_from_slice(call.raw_args),
+				verdict:  Bytes::copy_from_slice(call.verdict),
+			})
+		}
+	}
+
+	fn identity(n: u16) -> ToolIdentity {
+		ToolIdentity { name: Str::new_static("lift"), rev: Rev { family: Str::new_static("x"), n } }
+	}
+
+	fn caps() -> PromptCaps {
+		PromptCaps {
+			maximum_parts:      1,
+			maximum_text_bytes: 1,
+			media:              false,
+			dialect:            crate::Dialect::Native,
+			model_class:        crate::ModelClass::Standard,
+		}
+	}
+
+	fn tool(n: u16) -> LiftTool {
+		LiftTool {
+			spec: ToolSpec {
+				name:            Str::new_static("lift"),
+				rev:             identity(n).rev,
+				description:     Str::new_static("lift test"),
+				schema:          Bytes::from_static(b"{}"),
+				constraint:      Constraint::None,
+				effects:         Effects::empty(),
+				projection_code: [n as u8; 32],
+			},
+		}
+	}
+
+	#[test]
+	fn projection_cache_returns_the_same_arc_only_for_the_same_key() {
+		let cache = ProjectionCache::default();
+		let key = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [1; 32]);
+		let different = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [2; 32]);
+		assert!(cache.get(0, &key).is_none());
+		cache.insert(
+			0,
+			&key,
+			ProjectedVerdict { parts: Arc::<[Part]>::from([]), is_error: false, useless: false },
+		);
+		let hit = cache.get(0, &key).expect("matching key hits");
+		assert!(Arc::ptr_eq(&hit, &cache.get(0, &key).expect("second matching key hits")));
+		assert!(cache.get(0, &different).is_none());
+	}
+
+	#[test]
+	fn registered_lift_runs_byte_stably() {
+		let mut registry = Registry::new();
+		let claims = Claims {
+			precedence: Precedence::DEFAULT,
+			claimant:   Str::new_static("test/lift"),
+			replaces:   None,
+		};
+		registry
+			.register(tool(1), Presentation::Device, claims.clone())
+			.expect("first revision registers");
+		registry
+			.register(tool(2), Presentation::Device, claims)
+			.expect("live revision registers");
+		let original = RecordedCallOwned {
+			identity: identity(1),
+			raw_args: Bytes::from_static(br#"{"old":true}"#),
+			verdict:  Bytes::from_static(br#"{"kind":"ok","value":null}"#),
+		};
+		let ProjectedCall::Live(lifted) = registry.project(original.clone()) else {
+			panic!("registered lift must dispatch");
+		};
+		assert_eq!(lifted.identity, identity(2));
+		assert_eq!(lifted.raw_args, original.raw_args);
+		assert_eq!(lifted.verdict, original.verdict);
 	}
 }

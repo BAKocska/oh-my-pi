@@ -1,6 +1,6 @@
 //! Builtin command management for shell instances.
 
-use std::collections::HashMap;
+use im::HashMap;
 
 use crate::{builtins, extensions};
 

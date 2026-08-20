@@ -2,6 +2,8 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
+use im::HashMap as ImHashMap;
+
 pub use shell_builder::State as ShellBuilderState;
 
 use super::Shell;
@@ -141,7 +143,7 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
 	pub enabled_shopt_options: Vec<String>,
 	/// Registered builtins.
 	#[builder(field)]
-	pub builtins: HashMap<String, builtins::Registration<SE>>,
+	pub builtins: ImHashMap<String, builtins::Registration<SE>>,
 	/// Provides a set of variables to be initialized in the shell. If present,
 	/// they are assigned *after* inherited or well-known variables are set
 	/// (when applicable).
@@ -241,7 +243,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
 			funcs: functions::FunctionEnv::default(),
 			options: options::RuntimeOptions::default(),
 			jobs: jobs::JobManager::default(),
-			aliases: HashMap::default(),
+			aliases: ImHashMap::default(),
 			last_exit_status: 0,
 			last_exit_status_change_count: 0,
 			last_pipeline_statuses: vec![0],
@@ -252,7 +254,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
 			product_display_str: None,
 			call_stack: callstack::CallStack::new(),
 			directory_stack: vec![],
-			builtins: HashMap::default(),
+			builtins: ImHashMap::default(),
 			program_location_cache: pathcache::PathCache::default(),
 			last_stopwatch_time: std::time::SystemTime::now(),
 			last_stopwatch_offset: 0,

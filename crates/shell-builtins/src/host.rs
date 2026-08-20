@@ -24,7 +24,6 @@
 
 use std::{
 	cell::Cell,
-	collections::HashMap,
 	ffi::OsString,
 	io::{self, Read, Write},
 	marker::PhantomData,
@@ -36,6 +35,8 @@ use std::{
 	},
 	time::Duration,
 };
+
+use im::HashMap;
 
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, ShellExtensions,
@@ -142,9 +143,7 @@ impl Host {
 
 	/// The exported shell environment, for building a child process
 	/// environment (`env_clear().envs(host.env())`).
-	pub fn env(
-		&self,
-	) -> impl Iterator<Item = (&str, &str)> + Clone + ExactSizeIterator + std::iter::FusedIterator {
+	pub fn env(&self) -> impl Iterator<Item = (&str, &str)> + ExactSizeIterator + std::iter::FusedIterator {
 		self.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
 	}
 

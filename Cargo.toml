@@ -82,6 +82,7 @@ hyper = { version = "1.11", features = ["client", "http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-tokio"] }
 hyper-util = "0.1"
 ignore = "0.4"
+im = { version = "15.1", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 indicatif = "0.18"
 indenter = "0.3"
