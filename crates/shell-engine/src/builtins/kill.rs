@@ -32,6 +32,13 @@ pub(crate) struct KillCommand {
 
 impl builtins::Command for KillCommand {
 	type Error = crate::Error;
+	fn new<I>(args: I) -> std::result::Result<Self, clap::Error>
+	where
+		I: IntoIterator<Item = String>,
+	{
+		Self::try_parse_from(rewrite_attached_short_options(args))
+	}
+
 
 	#[allow(unknown_lints, reason = "unused_async_trait_impl is unknown to the pinned CI nightly")]
 	#[allow(
@@ -244,6 +251,55 @@ impl builtins::Command for KillCommand {
 	}
 }
 
+/// Splits attached short-option values before clap sees argv while leaving
+/// whole signal specs and negative-PID operands intact.
+fn rewrite_attached_short_options(args: impl IntoIterator<Item = String>) -> Vec<String> {
+	let mut out: Vec<String> = Vec::new();
+	let mut args = args.into_iter();
+	out.extend(args.next());
+	let mut skip_value = false;
+	for arg in &mut args {
+		if skip_value {
+			skip_value = false;
+			out.push(arg);
+			continue;
+		}
+		if arg == "--" {
+			out.push(arg);
+			break;
+		}
+		if arg == "-s" || arg == "-n" {
+			skip_value = true;
+			out.push(arg);
+			continue;
+		}
+		if arg == "-l" || arg == "-L" {
+			out.push(arg);
+			continue;
+		}
+		if let Some((option, value)) = split_attached(&arg) {
+			out.push(option);
+			out.push(value);
+			continue;
+		}
+		out.push(arg);
+		break;
+	}
+	out.extend(args);
+	out
+}
+
+fn split_attached(arg: &str) -> Option<(String, String)> {
+	let rest = arg.get(2..).filter(|rest| !rest.is_empty())?;
+	let split = match arg.get(..2)? {
+		"-l" | "-L" => true,
+		"-s" => KillSignal::parse(&arg[1..]).is_err(),
+		"-n" => rest.bytes().all(|byte| byte.is_ascii_digit()),
+		_ => false,
+	};
+	split.then(|| (arg[..2].to_string(), rest.to_string()))
+}
+
 #[cfg(windows)]
 fn process_exists(pid: i32) -> bool {
 	use windows_sys::Win32::{
@@ -279,26 +335,7 @@ fn print_kill_signals<'a>(
 		.map(|()| ExecutionResult::success());
 	}
 	for value in signals {
-		enum PrintedSignal {
-			Name(&'static str),
-			Number(i32),
-		}
-		let signal = if let Ok(number) = value.parse::<i32>() {
-			TrapSignal::try_from(number).map(|signal| {
-				PrintedSignal::Name(
-					signal
-						.as_str()
-						.strip_prefix("SIG")
-						.unwrap_or(signal.as_str()),
-				)
-			})
-		} else {
-			TrapSignal::try_from(value.as_str()).map(|signal| {
-				i32::try_from(signal)
-					.map_or(PrintedSignal::Name(signal.as_str()), PrintedSignal::Number)
-			})
-		};
-		match signal {
+		match printed_signal(value) {
 			Ok(PrintedSignal::Name(name)) => writeln!(context.stdout(), "{name}")?,
 			Ok(PrintedSignal::Number(number)) => writeln!(context.stdout(), "{number}")?,
 			Err(err) => {
@@ -308,6 +345,30 @@ fn print_kill_signals<'a>(
 		}
 	}
 	Ok(result)
+}
+
+/// How `kill -l <operand>` renders one operand.
+enum PrintedSignal {
+	Name(&'static str),
+	Number(i32),
+}
+
+fn printed_signal(value: &str) -> std::result::Result<PrintedSignal, crate::Error> {
+	if let Ok(number) = value.parse::<i32>() {
+		let signal = TrapSignal::try_from(number).or_else(|err| {
+			if number > 128 {
+				TrapSignal::try_from(number - 128).map_err(|_| err)
+			} else {
+				Err(err)
+			}
+		})?;
+		Ok(PrintedSignal::Name(
+			signal.as_str().strip_prefix("SIG").unwrap_or(signal.as_str()),
+		))
+	} else {
+		let signal = TrapSignal::try_from(value)?;
+		Ok(i32::try_from(signal).map_or(PrintedSignal::Name(signal.as_str()), PrintedSignal::Number))
+	}
 }
 
 #[cfg(test)]
@@ -334,7 +395,8 @@ mod tests {
 	use super::*;
 
 	fn listed(args: &[&str]) -> Vec<String> {
-		let cmd = KillCommand::try_parse_from(args).unwrap();
+		use crate::builtins::Command as _;
+		let cmd = KillCommand::new(args.iter().map(ToString::to_string)).unwrap();
 		cmd.listed_signals().cloned().collect()
 	}
 
@@ -351,6 +413,71 @@ mod tests {
 	#[test]
 	fn lists_pre_marker_operands_without_marker() {
 		assert_eq!(listed(&["kill", "-l", "TERM", "HUP"]), ["TERM", "HUP"]);
+	}
+
+	fn parsed(args: &[&str]) -> KillCommand {
+		use crate::builtins::Command as _;
+		KillCommand::new(args.iter().map(ToString::to_string)).unwrap()
+	}
+
+	#[test]
+	fn attached_signal_name_values_split() {
+		let cmd = parsed(&["kill", "-s9", "123"]);
+		assert_eq!(cmd.signal_name.as_deref(), Some("9"));
+		assert_eq!(cmd.args, ["123"]);
+
+		let cmd = parsed(&["kill", "-sKILL", "123"]);
+		assert_eq!(cmd.signal_name.as_deref(), Some("KILL"));
+		assert_eq!(cmd.args, ["123"]);
+	}
+
+	#[test]
+	fn sig_prefixed_spec_stays_whole() {
+		let cmd = parsed(&["kill", "-sigkill", "123"]);
+		assert_eq!(cmd.signal_name, None);
+		assert_eq!(cmd.args, ["-sigkill", "123"]);
+	}
+
+	#[test]
+	fn attached_signal_number_splits() {
+		let cmd = parsed(&["kill", "-n9", "123"]);
+		assert_eq!(cmd.signal_number, Some(9));
+		assert_eq!(cmd.args, ["123"]);
+	}
+
+	#[test]
+	fn attached_list_operand_splits() {
+		let cmd = parsed(&["kill", "-l9"]);
+		assert!(cmd.list_signals);
+		assert_eq!(cmd.listed_signals().cloned().collect::<Vec<_>>(), ["9"]);
+
+		let cmd = parsed(&["kill", "-L137"]);
+		assert!(cmd.list_signals);
+		assert_eq!(cmd.listed_signals().cloned().collect::<Vec<_>>(), ["137"]);
+	}
+
+	#[test]
+	fn rewrite_leaves_operand_region_alone() {
+		let rewritten =
+			rewrite_attached_short_options(["kill", "--", "-s9"].map(String::from));
+		assert_eq!(rewritten, ["kill", "--", "-s9"]);
+
+		let rewritten =
+			rewrite_attached_short_options(["kill", "-9", "-s9"].map(String::from));
+		assert_eq!(rewritten, ["kill", "-9", "-s9"]);
+
+		let rewritten =
+			rewrite_attached_short_options(["kill", "-s", "KILL", "-123"].map(String::from));
+		assert_eq!(rewritten, ["kill", "-s", "KILL", "-123"]);
+	}
+
+	#[test]
+	fn list_maps_exit_statuses_above_128() {
+		assert!(matches!(printed_signal("137"), Ok(PrintedSignal::Name("KILL"))));
+		assert!(matches!(printed_signal("9"), Ok(PrintedSignal::Name("KILL"))));
+		assert!(matches!(printed_signal("129"), Ok(PrintedSignal::Name("HUP"))));
+		assert!(printed_signal("128").is_err());
+		assert!(printed_signal("265").is_err());
 	}
 }
 

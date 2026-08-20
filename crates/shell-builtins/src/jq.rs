@@ -860,11 +860,10 @@ mod output {
 		}
 	}
 
-	/// Runs `f` with buffered standard output.
+	/// Runs `f` with standard output and flushes at the operation boundary.
 	pub fn with_stdout<T>(stdout: &mut dyn Write, f: impl FnOnce(&mut dyn Write) -> T) -> T {
-		let mut out = io::BufWriter::new(stdout);
-		let res = f(&mut out);
-		let _ = out.flush();
+		let res = f(stdout);
+		let _ = stdout.flush();
 		res
 	}
 }
@@ -978,7 +977,7 @@ fn resolve_cli_paths(cli: &mut Cli, host: &Host) {
 }
 
 struct Runtime {
-	stdout: OpenFile,
+	stdout: crate::host::StreamWriter,
 	stderr: OpenFile,
 	env:    Vec<(String, String)>,
 	cancel: Arc<AtomicBool>,
@@ -993,7 +992,7 @@ struct RuntimeGuard;
 impl RuntimeGuard {
 	fn install(host: &Host) -> Self {
 		let runtime = Runtime {
-			stdout: host.stdout_clone(),
+			stdout: host.stdout_writer(),
 			stderr: host.stderr_clone(),
 			env:    host
 				.env()
@@ -1045,14 +1044,15 @@ fn runtime_cancelled() -> bool {
 }
 
 fn real_main(cli: &Cli, host: &mut Host) -> Result<i32, Error> {
+	let mut stdout = host.stdout_writer();
 	if let Some(test_files) = &cli.run_tests {
 		return Ok(match test_files.last() {
 			Some(file) => run_tests(
 				io::BufReader::new(std::fs::File::open(file)?),
-				&mut host.stdout,
+				&mut stdout,
 				&mut host.stderr,
 			),
-			None => run_tests(io::BufReader::new(&mut host.stdin), &mut host.stdout, &mut host.stderr),
+			None => run_tests(io::BufReader::new(&mut host.stdin), &mut stdout, &mut host.stderr),
 		});
 	}
 
@@ -1072,7 +1072,7 @@ fn real_main(cli: &Cli, host: &mut Host) -> Result<i32, Error> {
 
 	let last = if cli.files.is_empty() {
 		let inputs = read::buffered(cli, io::BufReader::new(&mut host.stdin));
-		output::with_stdout(&mut host.stdout, |out| {
+		output::with_stdout(&mut stdout, |out| {
 			filter::run(cli, &filter, ctx, inputs, |v| output::print(out, cli, &v))
 		})?
 	} else {
@@ -1104,7 +1104,7 @@ fn real_main(cli: &Cli, host: &mut Host) -> Result<i32, Error> {
 				tmp.persist(path).map_err(Error::Persist)?;
 				std::fs::set_permissions(path, perms)?;
 			} else {
-				last = output::with_stdout(&mut host.stdout, |out| {
+				last = output::with_stdout(&mut stdout, |out| {
 					filter::run(cli, &filter, ctx.clone(), inputs, |v| output::print(out, cli, &v))
 				})?;
 			}

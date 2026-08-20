@@ -22,6 +22,8 @@ pub fn utility_builtins<SE: omp_shell_engine::ShellExtensions>()
 	m.push(("base64", base64::base64_builtin::<SE>()));
 	m.push(("basename", basename::basename_builtin::<SE>()));
 	m.push(("cat", cat::cat_builtin::<SE>()));
+	m.push(("cksum", cksum::cksum_builtin::<SE>()));
+	#[cfg(feature = "util.cmp")]
 	m.push(("cmp", cmp::cmp_builtin::<SE>()));
 	m.push(("comm", comm::comm_builtin::<SE>()));
 	m.push(("combine", combine::combine_builtin::<SE>()));

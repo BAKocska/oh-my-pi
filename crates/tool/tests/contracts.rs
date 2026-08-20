@@ -1360,6 +1360,7 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 		path:                  canonical.clone(),
 		aliases:               smallvec![Str::from("file")],
 		coerce:                smallvec![Coerce::Strip, Coerce::JsonString],
+		from_union_branch:     false,
 		expected:              Str::from("workspace path"),
 		example:               Some(Str::from("src/lib.rs")),
 		additional_properties: false,
@@ -1381,6 +1382,7 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 			path:                  alias,
 			aliases:               smallvec![],
 			coerce:                smallvec![],
+			from_union_branch:     false,
 			expected:              Str::from("other"),
 			example:               None,
 			additional_properties: false,
@@ -1394,6 +1396,7 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 			path:                  smallvec![ArgPath::Key(Str::from("late"))],
 			aliases:               smallvec![],
 			coerce:                smallvec![],
+			from_union_branch:     false,
 			expected:              Str::from("late"),
 			example:               None,
 			additional_properties: false,
@@ -1407,6 +1410,7 @@ fn declared_arg(name: &str, aliases: &[&str], coerce: &[Coerce]) -> ArgSpec {
 		path:                  smallvec![ArgPath::Key(Str::from(name))],
 		aliases:               aliases.iter().map(|alias| Str::from(*alias)).collect(),
 		coerce:                coerce.iter().copied().collect(),
+		from_union_branch:     false,
 		expected:              Str::from(name),
 		example:               None,
 		additional_properties: false,
@@ -1552,7 +1556,74 @@ fn finalizer_applies_all_nine_coercions_and_logs_only_successes() {
 }
 
 #[test]
-fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_enforces_open_maps() {
+fn finalizer_stringifies_object_and_array_values_for_declared_strings() {
+	let rev = Rev { family: Str::from("container-string"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	specs
+		.register(rev.clone(), declared_arg("object", &[], &[Coerce::String]))
+		.unwrap();
+	specs
+		.register(rev.clone(), declared_arg("array", &[], &[Coerce::String]))
+		.unwrap();
+	specs.seal();
+
+	let (feed, mut params) = bound_params(&rev, &specs);
+	feed
+		.args_committed(Str::from(r#"{"object":{"a":1},"array":["x",2]}"#))
+		.unwrap();
+	let finalized = block_on(params.finalize()).unwrap();
+	assert_eq!(
+		finalized.effective_json(),
+		r#"{"object":"{\"a\":1}","array":"[\"x\",2]"}"#
+	);
+}
+
+#[test]
+fn speculative_union_declarations_suppress_lossy_coercions() {
+	let rev = Rev { family: Str::from("union-provenance"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	let mut string = declared_arg("payload", &[], &[Coerce::String]);
+	string.from_union_branch = true;
+	specs.register(rev.clone(), string).unwrap();
+	let mut singleton = declared_arg("items", &[], &[Coerce::Singleton]);
+	singleton.from_union_branch = true;
+	specs.register(rev.clone(), singleton).unwrap();
+	specs.seal();
+
+	let raw = r#"{"payload":{"a":1},"items":"one"}"#;
+	let (feed, mut params) = bound_params(&rev, &specs);
+	feed.args_committed(Str::from(raw)).unwrap();
+	let finalized = block_on(params.finalize()).unwrap();
+	assert_eq!(finalized.effective_json(), raw);
+	assert!(finalized.repairs().is_empty());
+}
+
+#[test]
+fn authoritative_tag_selected_declarations_allow_lossy_coercions() {
+	let rev = Rev { family: Str::from("tag-selected"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	specs
+		.register(rev.clone(), declared_arg("payload", &[], &[Coerce::String]))
+		.unwrap();
+	specs
+		.register(rev.clone(), declared_arg("items", &[], &[Coerce::Singleton]))
+		.unwrap();
+	specs.seal();
+
+	let (feed, mut params) = bound_params(&rev, &specs);
+	feed
+		.args_committed(Str::from(r#"{"payload":{"a":1},"items":"one"}"#))
+		.unwrap();
+	let finalized = block_on(params.finalize()).unwrap();
+	assert_eq!(
+		finalized.effective_json(),
+		r#"{"payload":"{\"a\":1}","items":["one"]}"#
+	);
+	assert_eq!(finalized.repairs().len(), 2);
+}
+
+#[test]
+fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_repairs_open_maps() {
 	let rev = Rev { family: Str::from("final"), n: 1 };
 	let mut specs = ArgSpecRegistry::new();
 	specs
@@ -1566,6 +1637,27 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_enforces_open_maps() 
 	let raw = r"{p:'x',config:{extra:1},}";
 	let (feed, mut params) = bound_params(&rev, &specs);
 	feed.args_committed(Str::from(raw)).unwrap();
+	let finalized = block_on(params.finalize()).unwrap();
+	assert_eq!(finalized.effective_json(), r#"{"path":"x","config":{}}"#);
+	assert!(
+		finalized
+			.repairs()
+			.iter()
+			.any(|repair| repair.kind == RepairKind::Elision)
+	);
+
+	let speculative_rev = Rev { family: Str::from("final"), n: 3 };
+	let mut speculative_specs = ArgSpecRegistry::new();
+	let mut speculative = declared_arg("config", &[], &[]);
+	speculative.from_union_branch = true;
+	speculative_specs
+		.register(speculative_rev.clone(), speculative)
+		.unwrap();
+	speculative_specs.seal();
+	let (feed, mut params) = bound_params(&speculative_rev, &speculative_specs);
+	feed
+		.args_committed(Str::from(r#"{"config":{"extra":1}}"#))
+		.unwrap();
 	assert!(matches!(
 		block_on(params.finalize()),
 		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Malformed

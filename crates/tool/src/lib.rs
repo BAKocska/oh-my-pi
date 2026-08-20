@@ -1060,7 +1060,7 @@ pub enum Coerce {
 	Integer,
 	/// Converts a numeric string to a real.
 	Number,
-	/// Converts a scalar JSON value to its string spelling.
+	/// Converts a JSON value to text, encoding arrays and objects as JSON.
 	String,
 	/// Wraps one non-array value in a one-element array.
 	Singleton,
@@ -1096,7 +1096,7 @@ pub enum RepairKind {
 	Coercion,
 	/// The tolerant parser accepted non-standard surface syntax.
 	Tolerance,
-	/// A declared optional null-like field was removed.
+	/// An optional null-like or unrecognized closed-object field was removed.
 	Elision,
 }
 
@@ -1120,6 +1120,13 @@ pub struct ArgSpec {
 	pub aliases:               SmallVec<Str, 4>,
 	/// Coercions applied in declaration order.
 	pub coerce:                SmallVec<Coerce, 2>,
+	/// Whether this declaration came from a speculative failed union branch.
+	///
+	/// Lossy coercions are suppressed for speculative branches. A branch
+	/// uniquely selected by a matching `const`/`enum` discriminator is
+	/// authoritative and must set this to `false`.
+	#[serde(default)]
+	pub from_union_branch:     bool,
 	/// Human-readable requested shape used by structured argument faults.
 	pub expected:              Str,
 	/// Optional valid example borrowed into a structured argument fault.

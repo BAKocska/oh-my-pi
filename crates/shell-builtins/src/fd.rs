@@ -665,12 +665,13 @@ fn search(
 		prune: cli.prune,
 	};
 
+	let mut stdout = host.stdout_writer();
 	if let Some(state) = try_search_fast(
 		&cli,
 		&search_paths,
 		&config,
 		max_results,
-		&mut host.stdout,
+		&mut stdout,
 		&mut host.stderr,
 		cancelled,
 	)? {
@@ -678,7 +679,7 @@ fn search(
 	}
 
 	let use_gitignore = !(no_ignore(&cli) || no_ignore_vcs(&cli));
-	let mut out = BufWriter::new(&mut host.stdout);
+	let mut out = stdout;
 	let mut state = SearchState { matches: 0, had_error: false };
 	for search_path in &search_paths {
 		if cancelled.load(Ordering::Relaxed) || max_results.is_some_and(|max| state.matches >= max) {
@@ -743,8 +744,8 @@ fn try_search_fast(
 	search_paths: &[SearchPath],
 	config: &SearchConfig,
 	max_results: Option<usize>,
-	stdout: &mut OpenFile,
-	stderr: &mut OpenFile,
+	stdout: &mut impl Write,
+	stderr: &mut impl Write,
 	cancelled: &AtomicBool,
 ) -> io::Result<Option<SearchState>> {
 	if !can_use_fast_search(cli, config) {

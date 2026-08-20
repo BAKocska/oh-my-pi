@@ -286,10 +286,71 @@ fn repair_replacement_indentation(
 	}
 }
 
-fn repair_landings(edits: &mut [Edit], lines: &[Str], warnings: &mut Vec<ApplyWarning>) {
+fn insertion_body(edits: &[Edit], members: &[usize]) -> String {
+	let capacity = members
+		.iter()
+		.filter_map(|index| match &edits[*index] {
+			Edit::Insert { text, .. } => Some(text.len()),
+			_ => None,
+		})
+		.sum::<usize>()
+		.saturating_add(members.len().saturating_sub(1));
+	let mut body = String::with_capacity(capacity);
+	for (offset, index) in members.iter().enumerate() {
+		if offset > 0 {
+			body.push('\n');
+		}
+		if let Edit::Insert { text, .. } = &edits[*index] {
+			body.push_str(text);
+		}
+	}
+	body
+}
+
+fn body_is_relocatable_construct(edits: &[Edit], members: &[usize], path: &str) -> bool {
+	let Some(last) = members.iter().rposition(|index| {
+		matches!(&edits[*index], Edit::Insert { text, .. } if has_non_whitespace(text))
+	}) else {
+		return false;
+	};
+	let body = insertion_body(edits, members);
+	let mut line = 1;
+	while line <= last + 1 {
+		let Some(index) = members.get(line - 1) else {
+			return false;
+		};
+		if matches!(&edits[*index], Edit::Insert { text, .. } if !has_non_whitespace(text)) {
+			line += 1;
+			continue;
+		}
+		let mut end = 0;
+		let spans = crate::syntax::node_chain(&body, path, line);
+		for span in &*spans {
+			if span.start_line as usize == line {
+				end = end.max(span.end_line as usize);
+			}
+		}
+		if end == 0 {
+			return false;
+		}
+		if end >= last + 1 {
+			return end > line;
+		}
+		line = end + 1;
+	}
+	false
+}
+
+fn repair_landings(
+	edits: &mut [Edit],
+	lines: &[Str],
+	source: &str,
+	path: Option<&str>,
+	warnings: &mut Vec<ApplyWarning>,
+) {
 	let mut groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
 	let targeted: BTreeSet<usize> = edits.iter().filter_map(anchor_line).collect();
-	for (i, edit) in edits.iter().enumerate() {
+	for (index, edit) in edits.iter().enumerate() {
 		if let Edit::Insert {
 			cursor: Cursor::AfterAnchor { anchor },
 			line_num,
@@ -297,14 +358,14 @@ fn repair_landings(edits: &mut [Edit], lines: &[Str], warnings: &mut Vec<ApplyWa
 			..
 		} = edit
 		{
-			groups.entry((anchor.line, *line_num)).or_default().push(i);
+			groups.entry((anchor.line, *line_num)).or_default().push(index);
 		}
 	}
 	for ((anchor, _), members) in groups {
 		let mut target: Option<&str> = None;
 		let mut comparable = true;
-		for &i in &members {
-			let Edit::Insert { text, .. } = &edits[i] else {
+		for &index in &members {
+			let Edit::Insert { text, .. } = &edits[index] else {
 				continue;
 			};
 			if text.trim().is_empty() || closer(text) {
@@ -330,36 +391,96 @@ fn repair_landings(edits: &mut [Edit], lines: &[Str], warnings: &mut Vec<ApplyWa
 		let Some(anchor_text) = lines.get(anchor - 1) else {
 			continue;
 		};
-		if !indent(anchor_text).starts_with(target) || indent(anchor_text) == target {
-			continue;
-		}
-		let mut landing = anchor;
-		let mut crossed = 0;
-		for line in anchor + 1..=lines.len() {
-			let text = &lines[line - 1];
-			if text.trim().is_empty() {
-				continue;
-			}
-			if !closer(text) || !indent(text).starts_with(target) || targeted.contains(&line) {
-				break;
-			}
-			landing = line;
-			crossed += 1;
-			if indent(text) == target {
-				break;
-			}
-		}
-		if landing != anchor {
-			for i in members {
-				if let Edit::Insert { cursor, .. } = &mut edits[i] {
-					*cursor = Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
+
+		if indent(anchor_text).starts_with(target) && indent(anchor_text) != target {
+			let mut landing = anchor;
+			let mut crossed = 0;
+			for line in anchor + 1..=lines.len() {
+				let text = &lines[line - 1];
+				if text.trim().is_empty() {
+					continue;
+				}
+				if !closer(text) || !indent(text).starts_with(target) || targeted.contains(&line) {
+					break;
+				}
+				landing = line;
+				crossed += 1;
+				if indent(text) == target {
+					break;
 				}
 			}
-			warnings.push(ApplyWarning::AfterLineLandingShifted {
-				from: anchor,
-				to: landing,
-				crossed,
-			});
+			if landing != anchor {
+				for &index in &members {
+					if let Edit::Insert { cursor, .. } = &mut edits[index] {
+						*cursor =
+							Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
+					}
+				}
+				warnings.push(ApplyWarning::AfterLineLandingShifted {
+					from: anchor,
+					to: landing,
+					crossed,
+				});
+				continue;
+			}
+		}
+
+		let Some(path) = path else {
+			continue;
+		};
+		let target_columns = indent_columns(target);
+		if target_columns >= indent_columns(anchor_text) {
+			continue;
+		}
+		let chain = crate::syntax::node_chain(source, path, anchor);
+		if !chain
+			.iter()
+			.any(|node| node.start_line as usize == anchor && node.end_line as usize > anchor)
+			|| !body_is_relocatable_construct(edits, &members, path)
+		{
+			continue;
+		}
+		let mut candidates = BTreeSet::new();
+		for node in &*chain {
+			let start = node.start_line as usize;
+			let end = node.end_line as usize;
+			if end > anchor
+				&& lines
+					.get(start.saturating_sub(1))
+					.is_some_and(|line| indent_columns(line) <= target_columns)
+			{
+				candidates.insert(end);
+			}
+		}
+		for landing in candidates {
+			if targeted
+				.range(anchor.saturating_add(1)..=landing)
+				.next()
+				.is_some()
+			{
+				break;
+			}
+			let mut trial = edits.to_vec();
+			for &index in &members {
+				if let Edit::Insert { cursor, .. } = &mut trial[index] {
+					*cursor =
+						Cursor::AfterAnchor { anchor: crate::types::Anchor { line: landing } };
+				}
+			}
+			let trial_text = materialize_for_probe(lines, &trial);
+			if crate::syntax::parses_cleanly(Some(path), &trial_text) {
+				edits.clone_from_slice(&trial);
+				let crossed = lines[anchor..landing]
+					.iter()
+					.filter(|line| closer(line))
+					.count();
+				warnings.push(ApplyWarning::AfterLineLandingShifted {
+					from: anchor,
+					to: landing,
+					crossed,
+				});
+				break;
+			}
 		}
 	}
 }
@@ -502,6 +623,33 @@ fn count_duplicate_trailing(group: &ReplacementGroup, lines: &[Str]) -> usize {
 	0
 }
 
+const ANNOTATION_NODE_KINDS: &[&str] = &[
+	"attribute_item",
+	"inner_attribute_item",
+	"decorator",
+	"annotation",
+	"marker_annotation",
+	"attribute_list",
+];
+
+fn is_annotation_line(source: &str, path: &str, line: usize) -> bool {
+	crate::syntax::node_chain(source, path, line).iter().any(|node| {
+		node.start_line as usize == line
+			&& node.end_line as usize == line
+			&& ANNOTATION_NODE_KINDS.contains(&node.kind.as_str())
+	})
+}
+
+fn is_annotation_echo_run(
+	source: &str,
+	path: Option<&str>,
+	first_line: usize,
+	last_line: usize,
+) -> bool {
+	let Some(path) = path else { return false };
+	(first_line..=last_line).all(|line| is_annotation_line(source, path, line))
+}
+
 #[derive(Clone)]
 struct BoundaryAmbiguity {
 	start_line: usize,
@@ -524,7 +672,12 @@ const fn textual_boundary_warning(
 	ApplyWarning::BoundaryEchoDropped { line: start_line, leading, trailing }
 }
 
-fn normalize_textual_boundary_echoes(edits: &[Edit], lines: &[Str]) -> BoundaryNormalization {
+fn normalize_textual_boundary_echoes(
+	edits: &[Edit],
+	lines: &[Str],
+	source: &str,
+	path: Option<&str>,
+) -> BoundaryNormalization {
 	let mut out = Vec::with_capacity(edits.len());
 	let mut warnings = Vec::new();
 	let mut ambiguities = Vec::new();
@@ -545,7 +698,15 @@ fn normalize_textual_boundary_echoes(edits: &[Edit], lines: &[Str]) -> BoundaryN
 				drop_leading = leading;
 				drop_trailing = trailing;
 			}
-		} else if leading > 0 && range_len > 1 {
+		} else if leading > 0
+			&& (range_len > 1
+				|| is_annotation_echo_run(
+					source,
+					path,
+					group.start_line - leading,
+					group.start_line - 1,
+				))
+		{
 			if group.payload.len() - leading >= range_len {
 				drop_leading = leading;
 			} else {
@@ -556,7 +717,15 @@ fn normalize_textual_boundary_echoes(edits: &[Edit], lines: &[Str]) -> BoundaryN
 					count:      leading,
 				});
 			}
-		} else if trailing > 0 && range_len > 1 {
+		} else if trailing > 0
+			&& (range_len > 1
+				|| is_annotation_echo_run(
+					source,
+					path,
+					group.end_line + 1,
+					group.end_line + trailing,
+				))
+		{
 			if group.payload.len() - trailing >= range_len {
 				drop_trailing = trailing;
 			} else {
@@ -1002,18 +1171,7 @@ fn splice_boundary_combo(
 }
 
 fn materialize_for_probe(lines: &[Str], edits: &[Edit]) -> String {
-	if !edits.iter().any(|edit| {
-		matches!(edit, Edit::Insert {
-			cursor: Cursor::AfterAnchor { .. },
-			mode: InsertMode::Literal,
-			..
-		})
-	}) {
-		return materialize(lines, edits).0;
-	}
-	let mut landed = edits.to_vec();
-	repair_landings(&mut landed, lines, &mut Vec::new());
-	materialize(lines, &landed).0
+	materialize(lines, edits).0
 }
 
 const fn ambiguous_placement(group: &ReplacementGroup) -> ApplyError {
@@ -1148,7 +1306,7 @@ fn repair_boundaries(
 	baseline_parses: bool,
 	warnings: &mut Vec<ApplyWarning>,
 ) -> Result<(), ApplyError> {
-	let normalized = normalize_textual_boundary_echoes(edits, lines);
+	let normalized = normalize_textual_boundary_echoes(edits, lines, source, path);
 	warnings.extend(normalized.warnings);
 	*edits = normalized.edits;
 	let authored = materialize_for_probe(lines, edits);
@@ -1309,6 +1467,13 @@ pub fn apply_parsed_patch(
 	let mut concrete = clip.edits;
 	validate(&concrete, addressable_lines)?;
 	repair_replacement_indentation(&mut concrete, addressable_lines, &mut warnings);
+	repair_landings(
+		&mut concrete,
+		addressable_lines,
+		&normalized,
+		options.path,
+		&mut warnings,
+	);
 	let baseline_parses = crate::syntax::parses_cleanly(options.path, &normalized);
 	repair_boundaries(
 		&mut concrete,
@@ -1318,7 +1483,6 @@ pub fn apply_parsed_patch(
 		baseline_parses,
 		&mut warnings,
 	)?;
-	repair_landings(&mut concrete, addressable_lines, &mut warnings);
 	let (model, first_changed_line) = materialize(&lines, &concrete);
 	if baseline_parses
 		&& !crate::syntax::parses_cleanly(options.path, &model)
@@ -1455,6 +1619,148 @@ mod tests {
 			ApplyWarning::SyntaxBreak { path, line: 3 }
 				if path.as_deref() == Some("fixture.rs")
 		)));
+	}
+
+	#[test]
+	fn drops_trailing_annotation_echo_on_single_line_replacement() {
+		let source =
+			"/// Unified-diff hunks\n/// Old details.\n#[napi]\npub fn structured_patch_hunks() {}\n";
+		let patch = "PUT 2.=2:\n+/// New details.\n+#[napi]";
+		let result = apply_patch(source, patch, "fixture.rs").expect("annotation echo is repaired");
+		assert_eq!(
+			result.bytes,
+			Bytes::from_static(
+				b"/// Unified-diff hunks\n/// New details.\n#[napi]\npub fn \
+				  structured_patch_hunks() {}\n"
+			)
+		);
+		assert!(result.warnings.iter().any(|warning| matches!(
+			warning,
+			ApplyWarning::BoundaryEchoDropped { trailing: 1, .. }
+		)));
+	}
+
+	#[test]
+	fn drops_leading_annotation_echo_on_single_line_replacement() {
+		let source = "#[napi]\n/// Old summary.\npub fn f() {}\n";
+		let result = apply_patch(source, "PUT 2.=2:\n+#[napi]\n+/// New summary.", "fixture.rs")
+			.expect("annotation echo is repaired");
+		assert_eq!(result.bytes, Bytes::from_static(b"#[napi]\n/// New summary.\npub fn f() {}\n"));
+		assert!(result.warnings.iter().any(|warning| matches!(
+			warning,
+			ApplyWarning::BoundaryEchoDropped { leading: 1, .. }
+		)));
+	}
+
+	#[test]
+	fn rejects_underfilled_single_line_annotation_echo() {
+		let source = "/// Old doc.\n#[napi]\npub fn f() {}\n";
+		let error = apply_patch(source, "PUT 1.=1:\n+#[napi]", "fixture.rs")
+			.expect_err("echo-only replacement must not become a deletion");
+		assert!(matches!(error, ApplyError::TrailingBoundaryEchoTooShort { count: 1, .. }));
+	}
+
+	#[test]
+	fn classifies_typescript_decorator_echo_through_grammar() {
+		let source = "/** Old summary. */\n@Injectable()\nclass Service {}\n";
+		let patch = "PUT 1.=1:\n+/** Creates request-scoped services. */\n+@Injectable()";
+		let result = apply_patch(source, patch, "fixture.ts").expect("decorator echo is repaired");
+		assert_eq!(
+			result.bytes,
+			Bytes::from_static(
+				b"/** Creates request-scoped services. */\n@Injectable()\nclass Service {}\n"
+			)
+		);
+	}
+
+	#[test]
+	fn keeps_statement_echo_literal_on_single_line_replacement() {
+		let source = "foo();\nold();\nbar();\n";
+		let result = apply_patch(source, "PUT 2.=2:\n+fresh();\n+bar();", "fixture.ts")
+			.expect("literal duplicate remains valid");
+		assert_eq!(result.bytes, Bytes::from_static(b"foo();\nfresh();\nbar();\nbar();\n"));
+		assert!(!result
+			.warnings
+			.iter()
+			.any(|warning| matches!(warning, ApplyWarning::BoundaryEchoDropped { .. })));
+	}
+
+	const OPENER_RUST: &str = "mod testing {\n   struct MemStream;\n\n   impl Stream for MemStream \
+	                           {\n      fn clone_box(&self) -> u32 {\n         1\n      }\n\n      fn \
+	                           try_borrow(&self) -> u32 {\n         7\n      }\n   }\n}\n";
+	const OPENER_MOD_PATCH: &str = "PUT >5:\n+\n+\tmod stdout_policy {\n+\t\tuse \
+	                                super::MemStream;\n+\n+\t\t#[test]\n+\t\tfn line_policy() {\n+\t\t\tassert!(true);\n+\t\t}\n+\t}";
+
+	#[test]
+	fn escapes_construct_insert_from_an_opening_line() {
+		let result = apply_patch(OPENER_RUST, OPENER_MOD_PATCH, "fixture.rs")
+			.expect("construct is relocated past its enclosing implementation");
+		let text = std::str::from_utf8(&result.bytes).unwrap();
+		assert!(text.contains("      }\n   }\n\n\tmod stdout_policy {"));
+		assert!(!text.contains("fn clone_box(&self) -> u32 {\n\n\tmod stdout_policy"));
+		assert!(result.warnings.iter().any(|warning| matches!(
+			warning,
+			ApplyWarning::AfterLineLandingShifted { from: 5, to: 12, .. }
+		)));
+	}
+
+	#[test]
+	fn opener_escape_keeps_bare_and_equal_depth_bodies_literal() {
+		let bare = apply_patch(OPENER_RUST, "PUT >5:\n+   let x = 1;", "fixture.rs")
+			.expect("bare statement stays at the adjacent gap");
+		assert!(std::str::from_utf8(&bare.bytes)
+			.unwrap()
+			.contains("fn clone_box(&self) -> u32 {\n   let x = 1;"));
+
+		let equal = apply_patch(
+			OPENER_RUST,
+			"PUT >5:\n+      fn extra(&self) -> u32 {\n+         2\n+      }",
+			"fixture.rs",
+		)
+		.expect("equal-depth item stays inside the opener");
+		assert!(std::str::from_utf8(&equal.bytes)
+			.unwrap()
+			.contains("fn clone_box(&self) -> u32 {\n      fn extra"));
+	}
+
+	#[test]
+	fn opener_escape_requires_a_parseable_relocation_and_path() {
+		let invalid = apply_patch(
+			OPENER_RUST,
+			"PUT >5:\n+   Some(1) => {\n+   }",
+			"fixture.rs",
+		)
+		.expect("unparseable relocation remains literal");
+		assert!(std::str::from_utf8(&invalid.bytes)
+			.unwrap()
+			.contains("fn clone_box(&self) -> u32 {\n   Some(1) => {"));
+
+		let parsed = crate::parser::parse_patch(OPENER_MOD_PATCH).unwrap();
+		let no_path = apply_parsed_patch(
+			Bytes::copy_from_slice(OPENER_RUST.as_bytes()),
+			&parsed,
+			&mut Clipboard::default(),
+			ApplyOptions::default(),
+		)
+		.expect("missing syntax evidence leaves authored placement literal");
+		assert!(std::str::from_utf8(&no_path.bytes)
+			.unwrap()
+			.contains("fn clone_box(&self) -> u32 {\n\n\tmod stdout_policy"));
+	}
+
+	#[test]
+	fn escapes_shallower_function_past_typescript_class() {
+		let source = "class A {\n   method() {\n      return 1;\n   }\n}\n";
+		let patch = "PUT >2:\n+function helper() {\n+   return 2;\n+}";
+		let result =
+			apply_patch(source, patch, "fixture.ts").expect("function relocates past the class");
+		assert_eq!(
+			result.bytes,
+			Bytes::from_static(
+				b"class A {\n   method() {\n      return 1;\n   }\n}\nfunction helper() {\n   return \
+				  2;\n}\n"
+			)
+		);
 	}
 
 	#[test]

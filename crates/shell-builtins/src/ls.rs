@@ -10,7 +10,7 @@ use std::{
 	cmp::Reverse,
 	ffi::{OsStr, OsString},
 	fs::{self, DirEntry, FileType, Metadata, ReadDir},
-	io::{BufWriter, ErrorKind, Write},
+	io::{ErrorKind, Write},
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	rc::Rc,
@@ -34,7 +34,9 @@ use uucore::{
 	parser::shortcut_value_parser::ShortcutValueParser, version_cmp::version_cmp,
 };
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes_lossy, util};
+use crate::host::{
+	Host, StreamWriter, Utility, format_usage, matches_parser, os_bytes_lossy, util,
+};
 
 mod colors {
 	//! Color handling for the `ls` builtin.
@@ -2005,7 +2007,7 @@ mod dired {
 
 	use std::{
 		fmt,
-		io::{self, BufWriter, Write},
+		io::{self, Write},
 	};
 
 	/// `dired` Module Documentation
@@ -2082,7 +2084,7 @@ mod dired {
 		(start, end)
 	}
 
-	pub fn indent<W: Write>(out: &mut BufWriter<W>) -> io::Result<()> {
+	pub fn indent<W: Write>(out: &mut W) -> io::Result<()> {
 		write!(out, "  ")?;
 		Ok(())
 	}
@@ -2099,7 +2101,7 @@ mod dired {
 	pub fn print_dired_output<W: Write>(
 		config: &Config,
 		dired: &DiredOutput,
-		out: &mut BufWriter<W>,
+		out: &mut W,
 	) -> io::Result<()> {
 		out.flush()?;
 		if !dired.dired_positions.is_empty() {
@@ -2116,7 +2118,7 @@ mod dired {
 
 	/// Helper function to print positions with a given prefix.
 	fn print_positions<W: Write>(
-		out: &mut BufWriter<W>,
+		out: &mut W,
 		prefix: &str,
 		positions: &[BytePosition],
 	) -> io::Result<()> {
@@ -2338,7 +2340,7 @@ mod display {
 		ffi::{OsStr, OsString},
 		fmt::Write as FmtWrite,
 		fs::{self, DirEntry, FileType, Metadata},
-		io::{BufWriter, Write},
+		io::Write,
 		sync::LazyLock,
 		time::SystemTime,
 	};
@@ -2351,7 +2353,6 @@ mod display {
 			strtime::{BrokenDownTime, Config as TimeFormatConfig},
 		},
 	};
-	use omp_shell_engine::openfiles::OpenFile;
 	#[cfg(unix)]
 	use rustc_hash::FxHashMap;
 	#[cfg(unix)]
@@ -2456,9 +2457,9 @@ mod display {
 	/// dir1:               <- This as well
 	/// file11
 	/// ```
-	pub fn show_dir_name(
+	pub fn show_dir_name<W: Write>(
 		path_data: &PathData,
-		out: &mut BufWriter<OpenFile>,
+		out: &mut W,
 		config: &Config,
 	) -> std::io::Result<()> {
 		let escaped_name = escape_dir_name_with_locale(path_data.path().as_os_str(), config);
@@ -2908,11 +2909,11 @@ mod display {
 		Ok(())
 	}
 
-	fn display_grid(
+	fn display_grid<W: Write>(
 		names: impl Iterator<Item = OsString>,
 		width: u16,
 		direction: Direction,
-		out: &mut BufWriter<OpenFile>,
+		out: &mut W,
 		quoted: bool,
 		tab_size: usize,
 	) -> std::io::Result<()> {
@@ -3284,8 +3285,7 @@ mod display {
 		DisplayItemName { displayed: name, dired_name_len }
 	}
 
-	/// This writes to the [`BufWriter`] `state.out` a single string of the
-	/// output of `ls -l`.
+	/// This writes to `state.out` a single string of the output of `ls -l`.
 	///
 	/// It writes the following keys, in order:
 	/// * `inode` ([`display_inode`], config-optional)
@@ -4928,7 +4928,7 @@ type DirData = (PathBuf, bool);
 // A struct to encapsulate state that is passed around from `list` functions.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct ListState<'a> {
-	out:               BufWriter<OpenFile>,
+	out:               StreamWriter,
 	style_manager:     Option<StyleManager<'a>>,
 	// TODO: More benchmarking with different use cases is required here.
 	// From experiments, BTreeMap may be faster than HashMap, especially as the
@@ -4959,7 +4959,7 @@ pub fn list(locs: Vec<&Path>, config: &Config, stdout: OpenFile) -> std::io::Res
 	let now = SystemTime::now();
 
 	let mut state = ListState {
-		out: BufWriter::new(stdout),
+		out: StreamWriter::new(stdout),
 		style_manager: config
 			.color
 			.as_ref()
@@ -5315,10 +5315,10 @@ fn get_metadata_with_deref_opt(path: &Path, dereference: bool) -> std::io::Resul
 	}
 }
 
-fn write_total(
+fn write_total<W: Write>(
 	items: &[PathData],
 	config: &Config,
-	out: &mut BufWriter<OpenFile>,
+	out: &mut W,
 ) -> std::io::Result<usize> {
 	let mut total_size = 0;
 	for item in items {

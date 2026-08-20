@@ -2,16 +2,20 @@
 
 use std::{
 	collections::{HashMap, VecDeque},
-	sync::LazyLock,
+	sync::{Arc, LazyLock},
 };
 
-use omp_ast::block::{EnclosingBoundaryOptions, LineRange, enclosing_block_boundaries};
+use omp_ast::block::{
+	BlockRangeOptions, EnclosingBoundaryOptions, LineRange, NodeSpan, enclosing_block_boundaries,
+	node_chain_at,
+};
 use omp_core::Str;
 use parking_lot::Mutex;
 
 const CACHE_LIMIT: usize = 256;
 type ContentKey = ([u8; 32], Str);
 type BoundaryKey = ([u8; 32], Str, u32, u32);
+type ChainKey = ([u8; 32], Str, u32);
 
 #[derive(Default)]
 struct ProbeCache {
@@ -19,6 +23,8 @@ struct ProbeCache {
 	parse_order:    VecDeque<ContentKey>,
 	boundaries:     HashMap<BoundaryKey, Vec<u32>>,
 	boundary_order: VecDeque<BoundaryKey>,
+	chains:         HashMap<ChainKey, Arc<[NodeSpan]>>,
+	chain_order:    VecDeque<ChainKey>,
 }
 
 static CACHE: LazyLock<Mutex<ProbeCache>> = LazyLock::new(|| Mutex::new(ProbeCache::default()));
@@ -55,6 +61,37 @@ pub fn parses_cleanly(path: Option<&str>, text: &str) -> bool {
 	guard.parse_order.push_back(key.clone());
 	guard.parses.insert(key, ok);
 	ok
+}
+
+/// Returns the named syntax-node chain containing `line`, innermost first.
+///
+/// Unknown languages, blank or out-of-range lines, and parse failures produce
+/// an empty chain, so callers treat absence as no structural evidence.
+pub fn node_chain(text: &str, path: &str, line: usize) -> Arc<[NodeSpan]> {
+	let line = u32::try_from(line).unwrap_or(u32::MAX);
+	let key = (*blake3::hash(text.as_bytes()).as_bytes(), Str::new(path), line);
+	if let Some(value) = CACHE.lock().chains.get(&key) {
+		return value.clone();
+	}
+	let chain: Arc<[NodeSpan]> = node_chain_at(BlockRangeOptions {
+		code: text.to_owned(),
+		lang: None,
+		path: Some(path.to_owned()),
+		line,
+	})
+	.ok()
+	.flatten()
+	.unwrap_or_default()
+	.into();
+	let mut guard = CACHE.lock();
+	if guard.chains.len() >= CACHE_LIMIT
+		&& let Some(oldest) = guard.chain_order.pop_front()
+	{
+		guard.chains.remove(&oldest);
+	}
+	guard.chain_order.push_back(key.clone());
+	guard.chains.insert(key, chain.clone());
+	chain
 }
 
 /// Returns whether a syntax-node boundary outside a visible range is the

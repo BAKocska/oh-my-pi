@@ -5594,6 +5594,7 @@ dependencies = [
 name = "omp-llm-catalog"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "kdl",
  "omp-core",
  "parking_lot",

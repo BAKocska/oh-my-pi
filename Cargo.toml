@@ -431,6 +431,15 @@ missing_panics_doc = "allow" # Not every panic needs docs, especially assert!
 too_many_arguments = "allow" # Argument count is rarely the real complexity signal
 too_many_lines = "allow"     # Arbitrary limits don't account for necessary complexity
 
+# Dev links statically embed CPython (652 MB images, 39 test binaries); full
+# debuginfo made every relink the bottleneck. Workspace crates keep line
+# tables for backtraces; external dependencies carry none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 2
 debug = false

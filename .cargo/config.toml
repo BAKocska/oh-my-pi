@@ -8,3 +8,9 @@
 
 [env]
 PYO3_CONFIG_FILE = { value = "vendor/python/pyo3-config.txt", relative = true }
+
+# Dev links go through ld64.lld as well: the 652 MB statically-linked CPython
+# images overflow ld64's compact-unwind fast path (__eh_frame > 16 MB), and
+# lld links them several times faster. Same shim the release tree uses.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/bin/ld64.lld"]

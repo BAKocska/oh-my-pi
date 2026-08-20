@@ -25,7 +25,7 @@
 use std::{
 	cell::Cell,
 	ffi::OsString,
-	io::{self, Read, Write},
+	io::{self, BufWriter, LineWriter, Read, Write},
 	marker::PhantomData,
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
@@ -37,6 +37,7 @@ use std::{
 };
 
 use im::HashMap;
+use parking_lot::Mutex;
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, ShellExtensions,
 	builtins::{self, Registration},
@@ -84,10 +85,13 @@ pub(crate) struct Host {
 	/// Standard input. Reads observe cancellation, so a blocked pipe read
 	/// returns EOF on abort instead of hanging the shell.
 	pub stdin:  Stdin,
-	/// Standard output; the null device when fd 1 is closed.
+	/// Standard output; the null device when fd 1 is closed. Utilities with
+	/// progressive output buffer it through [`Host::stdout_writer`].
 	pub stdout: OpenFile,
-	/// Standard error; the null device when fd 2 is closed.
-	pub stderr: OpenFile,
+	/// Standard error, buffered according to its destination; the null device
+	/// when fd 2 is closed. When fd 2 shares fd 1's destination, both streams
+	/// serialize through one writer so `2>&1` preserves write order.
+	pub stderr: StreamWriter,
 
 	name:                  String,
 	cwd:                   PathBuf,
@@ -95,6 +99,9 @@ pub(crate) struct Host {
 	cancel:                Arc<AtomicBool>,
 	exit_code:             i32,
 	stdin_is_search_input: bool,
+	/// Shared stdout/stderr writer when both descriptors target one
+	/// non-seekable destination.
+	merged_out:            Option<Arc<Mutex<StreamWriter>>>,
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -193,9 +200,23 @@ impl Host {
 		self.stdout.clone()
 	}
 
-	/// Duplicates stderr, for utilities that hand a writer to a helper thread.
+	/// Duplicates stderr as a raw [`OpenFile`], for utilities that hand a
+	/// writer to a helper thread. Any partial line buffered by this handle is
+	/// not copied.
 	pub fn stderr_clone(&self) -> OpenFile {
-		self.stderr.clone()
+		self.stderr.dup_file()
+	}
+
+	/// Returns a buffered stdout whose policy follows fd 1's destination.
+	///
+	/// Regular files use block buffering. Pipes, captures, terminals, and
+	/// custom streams use line buffering so complete lines are observable
+	/// while the utility is still running.
+	pub fn stdout_writer(&self) -> StreamWriter {
+		match &self.merged_out {
+			Some(shared) => StreamWriter::Shared(Arc::clone(shared)),
+			None => StreamWriter::new(self.stdout.clone()),
+		}
 	}
 
 	/// A launcher for child processes started by this utility.
@@ -213,7 +234,7 @@ impl Host {
 					.map(|(k, v)| (k.clone(), v.clone()))
 					.collect(),
 			),
-			stderr: self.stderr.clone(),
+			stderr: self.stderr.dup_file(),
 		}
 	}
 
@@ -256,6 +277,144 @@ impl Host {
 		}
 		status
 	}
+}
+/// A destination-aware buffered writer for utility output.
+///
+/// The standard library writers own and recycle their buffers for the
+/// lifetime of this value: writes do not allocate scratch storage per call.
+/// A shared variant serializes stdout and stderr through that same owned
+/// buffer when shell redirection merges the descriptors.
+pub(crate) enum StreamWriter {
+	/// Block-buffered output for regular files.
+	Block(BufWriter<OpenFile>),
+	/// Line-buffered output for pipes, captures, terminals, and streams.
+	Line(LineWriter<OpenFile>),
+	/// Serialized access to a writer shared by stdout and stderr.
+	Shared(Arc<Mutex<StreamWriter>>),
+}
+
+impl StreamWriter {
+	const BLOCK_CAPACITY: usize = 64 * 1024;
+	const LINE_CAPACITY: usize = 16 * 1024;
+
+	/// Selects block buffering for a regular file and line buffering otherwise.
+	pub fn new(file: OpenFile) -> Self {
+		if is_regular_file(&file) {
+			Self::block(file)
+		} else {
+			Self::line(file)
+		}
+	}
+
+	/// Forces line buffering regardless of destination.
+	pub fn line(file: OpenFile) -> Self {
+		Self::Line(LineWriter::with_capacity(Self::LINE_CAPACITY, file))
+	}
+
+	/// Forces block buffering regardless of destination.
+	pub fn block(file: OpenFile) -> Self {
+		Self::Block(BufWriter::with_capacity(Self::BLOCK_CAPACITY, file))
+	}
+
+	/// Duplicates the underlying descriptor without copying buffered bytes.
+	pub fn dup_file(&self) -> OpenFile {
+		match self {
+			Self::Block(writer) => writer.get_ref().clone(),
+			Self::Line(writer) => writer.get_ref().clone(),
+			Self::Shared(shared) => shared.lock().dup_file(),
+		}
+	}
+
+	/// Reports whether the destination is a terminal.
+	pub fn is_terminal(&self) -> bool {
+		match self {
+			Self::Block(writer) => writer.get_ref().is_terminal(),
+			Self::Line(writer) => writer.get_ref().is_terminal(),
+			Self::Shared(shared) => shared.lock().is_terminal(),
+		}
+	}
+}
+
+impl Write for StreamWriter {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		match self {
+			Self::Block(writer) => writer.write(buf),
+			Self::Line(writer) => writer.write(buf),
+			Self::Shared(shared) => shared.lock().write(buf),
+		}
+	}
+	fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+		match self {
+			Self::Block(writer) => writer.write_all(buf),
+			Self::Line(writer) => writer.write_all(buf),
+			Self::Shared(shared) => shared.lock().write_all(buf),
+		}
+	}
+
+	fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+		match self {
+			Self::Block(writer) => writer.write_fmt(args),
+			Self::Line(writer) => writer.write_fmt(args),
+			Self::Shared(shared) => shared.lock().write_fmt(args),
+		}
+	}
+
+
+	fn flush(&mut self) -> io::Result<()> {
+		match self {
+			Self::Block(writer) => writer.flush(),
+			Self::Line(writer) => writer.flush(),
+			Self::Shared(shared) => shared.lock().flush(),
+		}
+	}
+
+	fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+		match self {
+			Self::Block(writer) => writer.write_vectored(bufs),
+			Self::Line(writer) => writer.write_vectored(bufs),
+			Self::Shared(shared) => shared.lock().write_vectored(bufs),
+		}
+	}
+}
+
+/// Returns whether `file` is a regular file suitable for block buffering.
+///
+/// A pipe wrapped in [`std::fs::File`] reports a FIFO file type, while an
+/// uninspectable destination safely falls back to line buffering.
+pub(crate) fn is_regular_file(file: &OpenFile) -> bool {
+	match file {
+		OpenFile::File(file) => file.metadata().is_ok_and(|metadata| metadata.is_file()),
+		_ => false,
+	}
+}
+
+/// Returns whether two descriptors share one non-seekable destination.
+///
+/// Regular files are excluded because separate opens have independent offsets,
+/// even when their device and inode match.
+#[cfg(unix)]
+fn same_destination(a: &OpenFile, b: &OpenFile) -> bool {
+	use std::os::unix::fs::MetadataExt;
+
+	fn identity(file: &OpenFile) -> Option<(u64, u64)> {
+		let fd = file.try_borrow_as_fd().ok()?;
+		let owned = fd.try_clone_to_owned().ok()?;
+		let metadata = std::fs::File::from(owned).metadata().ok()?;
+		if metadata.file_type().is_file() {
+			return None;
+		}
+		Some((metadata.dev(), metadata.ino()))
+	}
+
+	match (identity(a), identity(b)) {
+		(Some(a), Some(b)) => a == b,
+		_ => false,
+	}
+}
+
+#[cfg(not(unix))]
+fn same_destination(_a: &OpenFile, _b: &OpenFile) -> bool {
+	false
 }
 
 /// A shell-faithful launcher for child processes started by a utility builtin.
@@ -436,10 +595,19 @@ pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u
 
 /// Parses a GNU-style duration: a decimal number with an optional
 /// `s`/`m`/`h`/`d` suffix, as accepted by `sleep` and `timeout`.
+///
+/// GNU also accepts `inf`/`infinity` (optionally signed `+`, any case);
+/// infinite and overflowing values saturate to [`Duration::MAX`]. Callers
+/// treat such durations as "sleep until cancelled". Sub-millisecond precision
+/// is preserved: GNU `sleep 0.0001` really sleeps 100 microseconds.
 pub(crate) fn parse_duration(input: &str) -> Option<Duration> {
 	let trimmed = input.trim();
 	if trimmed.is_empty() {
 		return None;
+	}
+	let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
+	if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+		return Some(Duration::MAX);
 	}
 	let (number, multiplier) = match trimmed.chars().last()? {
 		's' => (&trimmed[..trimmed.len() - 1], 1.0),
@@ -450,14 +618,13 @@ pub(crate) fn parse_duration(input: &str) -> Option<Duration> {
 		_ => (trimmed, 1.0),
 	};
 	let value = number.parse::<f64>().ok()?;
-	if value.is_sign_negative() {
+	if value.is_nan() || value.is_sign_negative() {
 		return None;
 	}
-	let millis = value * multiplier * 1000.0;
-	if !millis.is_finite() || millis < 0.0 {
-		return None;
+	if value.is_infinite() {
+		return Some(Duration::MAX);
 	}
-	Some(Duration::from_millis(millis.round() as u64))
+	Duration::try_from_secs_f64(value * multiplier).map_or(Some(Duration::MAX), Some)
 }
 
 /// Shell-quotes `arg` when rebuilding a command line for a child process.
@@ -618,7 +785,7 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 /// the long-lived host process. With `panic = "unwind"` the panic unwinds to
 /// here, where it becomes a non-zero exit plus a concise note on the command's
 /// own stderr.
-fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
+pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 	struct Guard;
 	impl Drop for Guard {
 		fn drop(&mut self) {
@@ -677,16 +844,26 @@ fn build_host<SE: ShellExtensions>(
 	// `Stdin::read` must observe the very same flag or it never wakes.
 	let cancel = Arc::new(AtomicBool::new(false));
 
+	let stdout = or_null(context.try_fd(OpenFiles::STDOUT_FD))?;
+	let stderr_file = or_null(context.try_fd(OpenFiles::STDERR_FD))?;
+	let (merged_out, stderr) = if same_destination(&stdout, &stderr_file) {
+		let shared = Arc::new(Mutex::new(StreamWriter::new(stderr_file)));
+		(Some(Arc::clone(&shared)), StreamWriter::Shared(shared))
+	} else {
+		(None, StreamWriter::new(stderr_file))
+	};
+
 	Ok(Host {
 		stdin: Stdin { file: or_null(stdin)?, fd: stdin_fd, cancel: Arc::clone(&cancel) },
-		stdout: or_null(context.try_fd(OpenFiles::STDOUT_FD))?,
-		stderr: or_null(context.try_fd(OpenFiles::STDERR_FD))?,
+		stdout,
+		stderr,
 		name: invoked,
 		cwd: context.shell.working_dir().to_path_buf(),
 		env,
 		cancel,
 		exit_code: 0,
 		stdin_is_search_input,
+		merged_out,
 	})
 }
 
@@ -783,8 +960,8 @@ mod testing {
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AtomicBool, HashMap, Host, OpenFile, OsString, PathBuf, Read, Stdin, Utility, Write, io,
-		openfiles, run_caught,
+		Arc, AtomicBool, HashMap, Host, OpenFile, OsString, PathBuf, Read, Stdin, StreamWriter,
+		Utility, Write, io, openfiles, run_caught,
 	};
 
 	/// Captured in-memory output from [`Host::for_test`].
@@ -798,6 +975,11 @@ mod testing {
 		pub fn stdout(&self) -> Vec<u8> {
 			self.stdout.lock().clone()
 		}
+		/// Shares stdout's backing buffer for mid-execution observations.
+		pub(crate) fn stdout_buffer(&self) -> Arc<Mutex<Vec<u8>>> {
+			Arc::clone(&self.stdout)
+		}
+
 
 		/// Raw bytes the utility wrote to stderr.
 		pub fn stderr(&self) -> Vec<u8> {
@@ -825,25 +1007,37 @@ mod testing {
 			stdin: impl Into<Vec<u8>>,
 			cwd: impl Into<PathBuf>,
 		) -> (Self, Capture) {
+			Self::for_test_with_stdin(
+				name,
+				Box::new(MemStream::reader(stdin.into())),
+				cwd,
+			)
+		}
+
+		/// Builds a host backed by arbitrary in-memory stdin.
+		pub(crate) fn for_test_with_stdin(
+			name: &str,
+			stdin: Box<dyn openfiles::Stream>,
+			cwd: impl Into<PathBuf>,
+		) -> (Self, Capture) {
 			let capture = Capture {
 				stdout: Arc::new(Mutex::new(Vec::new())),
 				stderr: Arc::new(Mutex::new(Vec::new())),
 			};
 			let cancel = Arc::new(AtomicBool::new(false));
 			let host = Self {
-				stdin: Stdin {
-					file:   OpenFile::Stream(Box::new(MemStream::reader(stdin.into()))),
-					fd:     None,
-					cancel: Arc::clone(&cancel),
-				},
+				stdin: Stdin { file: OpenFile::Stream(stdin), fd: None, cancel: Arc::clone(&cancel) },
 				stdout: OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stdout)))),
-				stderr: OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stderr)))),
+				stderr: StreamWriter::new(OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(
+					&capture.stderr,
+				))))),
 				name: name.to_string(),
 				cwd: cwd.into(),
 				env: HashMap::new(),
 				cancel,
 				exit_code: 0,
 				stdin_is_search_input: false,
+				merged_out: None,
 			};
 			(host, capture)
 		}
@@ -953,6 +1147,93 @@ mod testing {
 		#[cfg(unix)]
 		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, super::Error> {
 			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		}
+	}
+
+	mod stdout_policy {
+		use super::{Arc, MemStream, Mutex, OpenFile, StreamWriter, Write};
+
+		#[test]
+		fn non_file_flushes_complete_lines_without_flushing_partials() {
+			let buffer = Arc::new(Mutex::new(Vec::new()));
+			let stream = OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&buffer))));
+			let mut out = StreamWriter::new(stream);
+			assert!(matches!(out, StreamWriter::Line(_)));
+
+			out.write_all(b"hit\n").unwrap();
+			assert_eq!(buffer.lock().as_slice(), b"hit\n");
+
+			out.write_all(b"partial").unwrap();
+			assert_eq!(buffer.lock().as_slice(), b"hit\n");
+
+			out.flush().unwrap();
+			assert_eq!(buffer.lock().as_slice(), b"hit\npartial");
+		}
+
+		#[test]
+		fn regular_file_is_block_buffered() {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("out.txt");
+			let file = std::fs::File::create(&path).unwrap();
+			let mut out = StreamWriter::new(OpenFile::File(file));
+			assert!(matches!(out, StreamWriter::Block(_)));
+
+			out.write_all(b"hit\n").unwrap();
+			assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+			out.flush().unwrap();
+			assert_eq!(std::fs::read(&path).unwrap(), b"hit\n");
+		}
+
+		#[cfg(unix)]
+		#[test]
+		fn pipe_wrapped_as_file_is_line_buffered() {
+			let (reader, writer) = std::io::pipe().unwrap();
+			let file = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+			assert!(matches!(StreamWriter::new(OpenFile::File(file)), StreamWriter::Line(_)));
+			drop(reader);
+		}
+
+		#[test]
+		fn shared_handles_preserve_write_order() {
+			let buffer = Arc::new(Mutex::new(Vec::new()));
+			let inner = StreamWriter::line(OpenFile::Stream(Box::new(MemStream::writer(
+				Arc::clone(&buffer),
+			))));
+			let shared = Arc::new(Mutex::new(inner));
+			let mut out = StreamWriter::Shared(Arc::clone(&shared));
+			let mut err = StreamWriter::Shared(shared);
+
+			writeln!(out, "out 1").unwrap();
+			writeln!(err, "err 1").unwrap();
+			writeln!(out, "out 2").unwrap();
+
+			assert_eq!(buffer.lock().as_slice(), b"out 1\nerr 1\nout 2\n");
+		}
+
+		#[cfg(unix)]
+		#[test]
+		fn same_destination_detects_duplicated_pipe_only() {
+			use crate::host::same_destination;
+
+			let (reader, writer) = std::io::pipe().unwrap();
+			let duplicate = writer.try_clone().unwrap();
+			let a = OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(writer)));
+			let b = OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(duplicate)));
+			assert!(same_destination(&a, &b));
+
+			let (other_reader, other_writer) = std::io::pipe().unwrap();
+			let other =
+				OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(other_writer)));
+			assert!(!same_destination(&a, &other));
+
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("out.txt");
+			let first = OpenFile::File(std::fs::File::create(&path).unwrap());
+			let second = OpenFile::File(std::fs::File::create(&path).unwrap());
+			assert!(!same_destination(&first, &second));
+
+			drop((reader, other_reader));
 		}
 	}
 }

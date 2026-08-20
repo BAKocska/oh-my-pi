@@ -12,7 +12,7 @@
 use std::{
 	ffi::{OsStr, OsString},
 	fs::File,
-	io::{self, BufWriter, Read, Write},
+	io::{self, Read, Write},
 	path::{Path, PathBuf},
 };
 
@@ -31,9 +31,8 @@ use ignore::{
 	overrides::{Override, OverrideBuilder},
 	types::{Types, TypesBuilder},
 };
-use omp_shell_engine::openfiles::OpenFile;
 
-use crate::host::{Host, Utility};
+use crate::host::{Host, StreamWriter, Utility};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -113,15 +112,15 @@ pub(crate) struct Rg {
 	no_fixed_strings: bool,
 
 	/// Search case-insensitively.
-	#[arg(short = 'i', long = "ignore-case")]
+	#[arg(short = 'i', long = "ignore-case", overrides_with_all = ["case_sensitive", "smart_case"])]
 	ignore_case: bool,
 
 	/// Search case-sensitively.
-	#[arg(short = 's', long = "case-sensitive")]
+	#[arg(short = 's', long = "case-sensitive", overrides_with_all = ["ignore_case", "smart_case"])]
 	case_sensitive: bool,
 
 	/// Search case-insensitively when the pattern is all lowercase.
-	#[arg(short = 'S', long = "smart-case")]
+	#[arg(short = 'S', long = "smart-case", overrides_with_all = ["ignore_case", "case_sensitive"])]
 	smart_case: bool,
 
 	/// Invert matching.
@@ -297,16 +296,20 @@ pub(crate) struct Rg {
 	context: Option<usize>,
 
 	/// Show line numbers.
-	#[arg(short = 'n', long = "line-number")]
+	#[arg(short = 'n', long = "line-number", overrides_with = "no_line_number")]
 	line_number: bool,
 
 	/// Suppress line numbers.
-	#[arg(short = 'N', long = "no-line-number")]
+	#[arg(short = 'N', long = "no-line-number", overrides_with = "line_number")]
 	no_line_number: bool,
 
 	/// Show column numbers.
-	#[arg(long = "column")]
+	#[arg(long = "column", overrides_with = "no_column")]
 	column: bool,
+
+	/// Do not show column numbers.
+	#[arg(long = "no-column", overrides_with = "column")]
+	no_column: bool,
 
 	/// Show the zero-based byte offset for each result.
 	#[arg(short = 'b', long = "byte-offset", overrides_with = "no_byte_offset")]
@@ -464,6 +467,18 @@ pub(crate) struct Rg {
 	#[arg(long = "no-stats")]
 	_no_stats: bool,
 
+	/// Never read configuration files (accepted; this builtin never reads any).
+	#[arg(long = "no-config")]
+	_no_config: bool,
+
+	/// Number of search threads (accepted; this builtin searches serially).
+	#[arg(short = 'j', long = "threads", value_name = "NUM")]
+	_threads: Option<usize>,
+
+	/// Print SEPARATOR instead of '/' in printed file paths.
+	#[arg(long = "path-separator", value_name = "SEPARATOR")]
+	path_separator: Option<String>,
+
 	/// Arguments: PATTERN followed by PATHs unless -e/-f/--files is used.
 	#[arg(value_name = "ARGS")]
 	args: Vec<OsString>,
@@ -481,27 +496,24 @@ enum CompiledMatcher {
 	Pcre(PcreMatcher),
 }
 
-enum RgOutput {
-	Buffered(BufWriter<OpenFile>),
-	Direct(OpenFile),
+struct RgOutput {
+	output:      StreamWriter,
+	eager_flush: bool,
 }
 
 impl Write for RgOutput {
 	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-		match self {
-			Self::Buffered(output) => output.write(bytes),
-			Self::Direct(output) => output.write(bytes),
+		let written = self.output.write(bytes)?;
+		if self.eager_flush {
+			self.output.flush()?;
 		}
+		Ok(written)
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
-		match self {
-			Self::Buffered(output) => output.flush(),
-			Self::Direct(output) => output.flush(),
-		}
+		self.output.flush()
 	}
 }
-
 struct SearchOptions {
 	line_number:         bool,
 	column:              bool,
@@ -520,6 +532,7 @@ struct SearchOptions {
 	max_columns:         Option<usize>,
 	max_columns_preview: bool,
 	null_paths:          bool,
+	path_separator:      Option<u8>,
 	no_messages:         bool,
 	replacement:         Option<Vec<u8>>,
 	json:                bool,
@@ -545,7 +558,7 @@ struct RgSink<'a, M: Matcher, W: Write> {
 impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 	fn write_path(&mut self) -> io::Result<()> {
 		if let Some(name) = self.display {
-			self.out.write_all(name)?;
+			write_display_bytes(&mut *self.out, name, self.opts.path_separator)?;
 			if self.opts.null_paths {
 				self.out.write_all(b"\0")?;
 			}
@@ -562,7 +575,9 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 	) -> io::Result<()> {
 		if self.display.is_some() {
 			self.write_path()?;
-			self.out.write_all(&[separator])?;
+			if !self.opts.null_paths {
+				self.out.write_all(&[separator])?;
+			}
 		}
 		if self.opts.line_number
 			&& let Some(number) = line_number
@@ -780,17 +795,23 @@ impl<M: Matcher, W: Write> Sink for RgSink<'_, M, W> {
 		if self.opts.files_with_matches {
 			if self.any_match {
 				self.write_path()?;
-				self.out.write_all(b"\n")?;
+				if !self.opts.null_paths {
+					self.out.write_all(b"\n")?;
+				}
 			}
 		} else if self.opts.files_without_match {
 			if !self.any_match {
 				self.write_path()?;
-				self.out.write_all(b"\n")?;
+				if !self.opts.null_paths {
+					self.out.write_all(b"\n")?;
+				}
 			}
 		} else if self.opts.count || self.opts.count_matches {
 			if self.display.is_some() {
 				self.write_path()?;
-				self.out.write_all(b":")?;
+				if !self.opts.null_paths {
+					self.out.write_all(b":")?;
+				}
 			}
 			let count = if self.opts.count_matches {
 				self.match_count
@@ -809,6 +830,38 @@ fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
 		.position(|b| !b.is_ascii_whitespace() || *b == b'\n' || *b == b'\r')
 		.unwrap_or(bytes.len());
 	&bytes[start..]
+}
+
+/// Writes a display path, substituting `separator` for `/` when requested.
+fn write_display_bytes<W: Write>(out: &mut W, bytes: &[u8], separator: Option<u8>) -> io::Result<()> {
+	let Some(separator) = separator else {
+		return out.write_all(bytes);
+	};
+	let mut rest = bytes;
+	while let Some(pos) = rest.iter().position(|&byte| byte == b'/') {
+		out.write_all(&rest[..pos])?;
+		out.write_all(&[separator])?;
+		rest = &rest[pos + 1..];
+	}
+	out.write_all(rest)
+}
+
+fn parse_path_separator(spec: Option<&str>) -> Result<Option<u8>, String> {
+	match spec {
+		None | Some("") => Ok(None),
+		Some(separator) if separator.len() == 1 => Ok(Some(separator.as_bytes()[0])),
+		Some(separator) => Err(format!(
+			"error parsing flag --path-separator: a path separator must be exactly one byte, but the given separator is {} bytes",
+			separator.len()
+		)),
+	}
+}
+
+fn effective_line_number(cli: &Rg) -> bool {
+	if cli.no_line_number {
+		return false;
+	}
+	cli.line_number || cli.column || cli.vimgrep
 }
 
 fn first_column<M: Matcher>(matcher: &M, line: &[u8]) -> io::Result<Option<usize>> {
@@ -843,8 +896,8 @@ fn build_rust_matcher(patterns: &[String], cli: &Rg) -> Result<RegexMatcher, gre
 	let crlf = cli.crlf && !cli.no_crlf && !cli.null_data;
 	let mut builder = RegexMatcherBuilder::new();
 	builder
-		.case_insensitive(cli.ignore_case && !cli.case_sensitive)
-		.case_smart(cli.smart_case && !cli.ignore_case && !cli.case_sensitive)
+		.case_insensitive(cli.ignore_case)
+		.case_smart(cli.smart_case)
 		.word(cli.word_regexp && !cli.line_regexp)
 		.whole_line(cli.line_regexp)
 		.fixed_strings(cli.fixed_strings && !cli.no_fixed_strings)
@@ -864,8 +917,8 @@ fn build_pcre_matcher(host: &Host, patterns: &[String], cli: &Rg) -> Result<Pcre
 	let unicode = !cli.no_unicode;
 	let mut builder = PcreMatcherBuilder::new();
 	builder
-		.caseless(cli.ignore_case && !cli.case_sensitive)
-		.case_smart(cli.smart_case && !cli.ignore_case && !cli.case_sensitive)
+		.caseless(cli.ignore_case)
+		.case_smart(cli.smart_case)
 		.word(cli.word_regexp && !cli.line_regexp)
 		.whole_line(cli.line_regexp)
 		.fixed_strings(cli.fixed_strings && !cli.no_fixed_strings)
@@ -982,7 +1035,7 @@ fn resolve_patterns(host: &mut Host, cli: &Rg) -> Result<(Vec<String>, Vec<OsStr
 fn search_options(cli: &Rg) -> SearchOptions {
 	let context = cli.context.unwrap_or(0);
 	let count_matches = cli.count_matches || (cli.count && cli.only_matching);
-	let line_number = (cli.line_number || cli.column || cli.vimgrep) && !cli.no_line_number;
+	let line_number = effective_line_number(cli);
 	SearchOptions {
 		line_number,
 		column: cli.column || cli.vimgrep,
@@ -1001,6 +1054,7 @@ fn search_options(cli: &Rg) -> SearchOptions {
 		max_columns: cli.max_columns,
 		max_columns_preview: cli.max_columns_preview && !cli.no_max_columns_preview,
 		null_paths: cli.null,
+		path_separator: None,
 		no_messages: cli.no_messages && !cli.messages,
 		replacement: cli
 			.replacement
@@ -1510,6 +1564,7 @@ fn list_files<W: Write>(
 	host: &mut Host,
 	cli: &Rg,
 	paths: &[OsString],
+	path_separator: Option<u8>,
 	out: &mut W,
 ) -> SearchOutcome {
 	let mut any = false;
@@ -1541,13 +1596,14 @@ fn list_files<W: Write>(
 				}
 				for path in files {
 					let display = display_path(operand.as_os_str(), &resolved, &path);
-					let _ = out.write_all(display.as_os_str().as_encoded_bytes());
+					let _ =
+						write_display_bytes(out, display.as_os_str().as_encoded_bytes(), path_separator);
 					let _ = out.write_all(if cli.null { b"\0" } else { b"\n" });
 					any = true;
 				}
 			},
 			Ok(meta) if meta.is_file() => {
-				let _ = out.write_all(operand.as_encoded_bytes());
+				let _ = write_display_bytes(out, operand.as_encoded_bytes(), path_separator);
 				let _ = out.write_all(if cli.null { b"\0" } else { b"\n" });
 				any = true;
 			},
@@ -1751,7 +1807,14 @@ impl Utility for Rg {
 
 	fn run(self, host: &mut Host) -> i32 {
 		let cli = self;
-		let opts = search_options(&cli);
+		let mut opts = search_options(&cli);
+		match parse_path_separator(cli.path_separator.as_deref()) {
+			Ok(separator) => opts.path_separator = separator,
+			Err(error) => {
+				let _ = writeln!(host.stderr, "rg: {error}");
+				return 2;
+			},
+		}
 		if opts.json
 			&& (cli.files
 				|| cli.type_list
@@ -1766,10 +1829,9 @@ impl Utility for Rg {
 			let _ = writeln!(host.stderr, "rg: --json cannot be combined with summary modes");
 			return 2;
 		}
-		let mut out = if cli.line_buffered && !cli.no_line_buffered {
-			RgOutput::Direct(host.stdout_clone())
-		} else {
-			RgOutput::Buffered(BufWriter::new(host.stdout_clone()))
+		let mut out = RgOutput {
+			output:      host.stdout_writer(),
+			eager_flush: cli.line_buffered && !cli.no_line_buffered,
 		};
 		let (patterns, mut paths) = match resolve_patterns(host, &cli) {
 			Ok(resolved) => resolved,
@@ -1793,7 +1855,7 @@ impl Utility for Rg {
 			!cli.files && !pattern_stdin_consumed && host.stdin_is_search_input(),
 		);
 		if cli.files {
-			let outcome = list_files(host, &cli, &paths, &mut out);
+			let outcome = list_files(host, &cli, &paths, opts.path_separator, &mut out);
 			let _ = out.flush();
 			return if outcome.had_error {
 				2
@@ -1942,6 +2004,77 @@ mod tests {
 		let (code, capture) = run_util::<Rg>(&["--search-zip", "hit", "sample.gz"], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "hit\n");
+	}
+
+	#[test]
+	fn line_numbers_stay_off_when_piped_unless_requested() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("a.txt"), "miss\nhit\n").unwrap();
+		let (code, capture) = run_util::<Rg>(&["hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a.txt:hit\n");
+		let (code, capture) = run_util::<Rg>(&["-n", "hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a.txt:2:hit\n");
+		let (code, capture) = run_util::<Rg>(&["-n", "-N", "hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a.txt:hit\n");
+	}
+
+	#[test]
+	fn null_terminates_paths_without_trailing_newline() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("a.txt"), "hit\n").unwrap();
+		let (code, capture) = run_util::<Rg>(&["-l0", "hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a.txt\0");
+		let (code, capture) = run_util::<Rg>(&["-0", "hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a.txt\0hit\n");
+		let (code, capture) = run_util::<Rg>(&["-n0", "hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a.txt\01:hit\n");
+		let (_code, capture) =
+			run_util::<Rg>(&["--files-without-match", "-0", "nope", "."], "", tree.path());
+		assert_eq!(capture.out(), "a.txt\0");
+	}
+
+	#[test]
+	fn last_case_flag_wins() {
+		let (code, out, err) = run(&["-s", "-i", "HIT", "-"], "hit\n");
+		assert_eq!(code, 0, "{err}");
+		assert_eq!(out, "hit\n");
+		let (code, out, _) = run(&["-i", "-s", "HIT", "-"], "hit\n");
+		assert_eq!(code, 1);
+		assert_eq!(out, "");
+		let (code, _, _) = run(&["-i", "-S", "HIT", "-"], "hit\n");
+		assert_eq!(code, 1);
+	}
+
+	#[test]
+	fn compat_flags_are_accepted() {
+		let (code, out, err) = run(&["--no-config", "-j2", "-S", "hit", "-"], "hit\n");
+		assert_eq!(code, 0, "{err}");
+		assert_eq!(out, "hit\n");
+		let (code, out, err) =
+			run(&["--threads", "4", "-n", "--column", "--no-column", "hit", "-"], "hit\n");
+		assert_eq!(code, 0, "{err}");
+		assert_eq!(out, "1:hit\n");
+	}
+
+	#[test]
+	fn path_separator_replaces_slash() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::create_dir(tree.path().join("sub")).unwrap();
+		std::fs::write(tree.path().join("sub/a.txt"), "hit\n").unwrap();
+		let (code, capture) =
+			run_util::<Rg>(&["--path-separator", "|", "hit", "."], "", tree.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "sub|a.txt:hit\n");
+		let (code, capture) =
+			run_util::<Rg>(&["--path-separator", "::", "hit", "."], "", tree.path());
+		assert_eq!(code, 2);
+		assert!(capture.err().contains("exactly one byte"));
 	}
 }
 

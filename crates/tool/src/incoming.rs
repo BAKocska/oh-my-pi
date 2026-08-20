@@ -414,7 +414,7 @@ fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions
 	let mut applied = AppliedCoercions { steps: SmallVec::new(), elided: false };
 	for coercion in &spec.coerce {
 		let before = Str::from(value.to_string());
-		let Some(result) = coerce_once(*coercion, value) else {
+		let Some(result) = coerce_once(*coercion, value, !spec.from_union_branch) else {
 			continue;
 		};
 		match result {
@@ -435,7 +435,11 @@ fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions
 	applied
 }
 
-fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<CoercionResult> {
+fn coerce_once(
+	coercion: crate::Coerce,
+	value: &Value,
+	allow_lossy: bool,
+) -> Option<CoercionResult> {
 	use crate::Coerce;
 	match coercion {
 		Coerce::LooseBool => match value {
@@ -476,15 +480,12 @@ fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<CoercionResult>
 			_ => None,
 		},
 		Coerce::String => match value {
-			Value::Number(_) | Value::Bool(_) | Value::Null => {
-				Some(CoercionResult::Value(Value::String(Str::from(value.to_string()))))
-			},
-			_ => None,
+			Value::Array(_) | Value::Object(_) if !allow_lossy => None,
+			Value::String(_) => None,
+			_ => Some(CoercionResult::Value(Value::String(Str::from(value.to_string())))),
 		},
-		Coerce::Singleton if !matches!(value, Value::Array(_)) => {
-			Some(CoercionResult::Value(Value::Array(vec![value.clone()])))
-		},
-		Coerce::Singleton => None,
+		Coerce::Singleton if !allow_lossy || matches!(value, Value::Array(_)) => None,
+		Coerce::Singleton => Some(CoercionResult::Value(Value::Array(vec![value.clone()]))),
 		Coerce::JsonString => match value {
 			Value::String(value) => omp_slopjson::parse(value).ok().map(CoercionResult::Value),
 			_ => None,
@@ -562,6 +563,7 @@ async fn validate_structure(
 						&& let Some(parent) = specs.get(rev, &node.canonical)
 						&& !parent.additional_properties
 						&& spec.is_none()
+						&& parent.from_union_branch
 					{
 						return Err(ParamError::Args(Box::new(ArgIssue {
 							path:     candidate.into_iter().collect(),
@@ -633,9 +635,22 @@ fn canonicalize(
 	match value {
 		Value::Object(object) => {
 			let mut canonical = omp_slopjson::Object::with_capacity(object.len());
+			let parent = arg_specs.and_then(|(rev, specs)| specs.get(rev, path));
 			for (key, value) in object {
 				let candidate = child_path(path, ArgPath::Key(key.clone()));
 				let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
+				if spec.is_none()
+					&& parent.is_some_and(|parent| {
+						!parent.additional_properties && !parent.from_union_branch
+					})
+				{
+					repairs.push(crate::Repair {
+						path:   candidate,
+						kind:   crate::RepairKind::Elision,
+						detail: Str::from(format!("unrecognized key {key} -> <absent>")),
+					});
+					continue;
+				}
 				let (canonical_path, canonical_key) = if let Some(spec) = spec {
 					let canonical_key = match spec.path.last() {
 						Some(ArgPath::Key(key)) => key.clone(),
@@ -1239,6 +1254,7 @@ mod tests {
 				path:                  smallvec![ArgPath::Key(Str::from("path"))],
 				aliases:               smallvec![Str::from("file_path")],
 				coerce:                smallvec![],
+				from_union_branch:     false,
 				expected:              Str::from("declared numeric path"),
 				example:               Some(Str::from(EXAMPLE)),
 				additional_properties: false,

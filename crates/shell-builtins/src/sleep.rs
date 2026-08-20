@@ -12,7 +12,7 @@ use crate::host::parse_duration;
 #[derive(Parser)]
 #[command(disable_help_flag = true)]
 pub(crate) struct SleepCommand {
-	#[arg(required = true)]
+	#[arg(required = true, allow_hyphen_values = true)]
 	durations: Vec<String>,
 }
 
@@ -29,13 +29,13 @@ impl builtins::Command for SleepCommand {
 			if context.is_cancelled() {
 				return Ok(ExecutionExitCode::Interrupted.into());
 			}
-			let mut total = Duration::from_millis(0);
+			let mut total = Duration::ZERO;
 			for duration in &durations {
 				let Some(parsed) = parse_duration(duration) else {
 					let _ = writeln!(context.stderr(), "sleep: invalid time interval '{duration}'");
 					return Ok(ExecutionResult::new(1));
 				};
-				total += parsed;
+				total = total.saturating_add(parsed);
 			}
 			let sleep = time::sleep(total);
 			tokio::pin!(sleep);
@@ -70,8 +70,9 @@ mod tests {
 		assert_eq!(parse_duration("0.001"), Some(Duration::from_millis(1)));
 		assert_eq!(parse_duration("0.001s"), Some(Duration::from_millis(1)));
 		assert_eq!(parse_duration("0.001m"), Some(Duration::from_millis(60)));
-		assert_eq!(parse_duration("0.000001h"), Some(Duration::from_millis(4)));
-		assert_eq!(parse_duration("0.00000001d"), Some(Duration::from_millis(1)));
+		assert_eq!(parse_duration("0.0001"), Some(Duration::from_micros(100)));
+		assert_eq!(parse_duration("0.000001h"), Some(Duration::from_micros(3600)));
+		assert_eq!(parse_duration("0.00000001d"), Some(Duration::from_micros(864)));
 
 		let mut shell = Shell::builder()
 			.build()
@@ -89,6 +90,72 @@ mod tests {
 			.expect("sleep execution should succeed");
 
 		assert!(result.is_success());
+	}
+
+	#[tokio::test]
+	async fn infinity_operand_parses_and_sleep_is_cancellable() {
+		for spec in ["infinity", "inf", "INFINITY", "Inf", "+infinity", "+inf"] {
+			assert_eq!(parse_duration(spec), Some(Duration::MAX), "spec {spec:?}");
+		}
+		assert_eq!(parse_duration("nan"), None);
+		assert_eq!(parse_duration("-inf"), None);
+
+		let token = CancellationToken::new();
+		let mut params = ExecutionParameters::default();
+		params.set_cancel_token(token.clone());
+		let mut shell = Shell::builder()
+			.build()
+			.await
+			.expect("test shell should build");
+		let command = SleepCommand { durations: vec!["infinity".into()] };
+		let context = ExecutionContext {
+			shell: &mut shell,
+			command_name: "sleep".into(),
+			params,
+		};
+		let execution = async {
+			let (result, ()) = tokio::join!(command.execute(context), async {
+				tokio::task::yield_now().await;
+				token.cancel();
+			});
+			result
+		};
+		let result = time::timeout(Duration::from_millis(100), execution)
+			.await
+			.expect("cancelled infinite sleep should return promptly")
+			.expect("sleep execution should succeed");
+
+		assert_eq!(u8::from(result.exit_code), u8::from(ExecutionExitCode::Interrupted));
+	}
+
+	#[tokio::test]
+	async fn hyphenated_operand_is_an_invalid_interval_not_an_unknown_flag() {
+		let command = <SleepCommand as Command>::new(["sleep".into(), "-1".into()])
+			.expect("hyphenated operand should reach the builtin");
+
+		let (mut stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe should open");
+		let mut params = ExecutionParameters::default();
+		params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(stderr_writer));
+		let mut shell = Shell::builder()
+			.build()
+			.await
+			.expect("test shell should build");
+		let context = ExecutionContext {
+			shell: &mut shell,
+			command_name: "sleep".into(),
+			params,
+		};
+		let result = command
+			.execute(context)
+			.await
+			.expect("sleep execution should succeed");
+		let mut stderr = String::new();
+		stderr_reader
+			.read_to_string(&mut stderr)
+			.expect("stderr should be readable");
+
+		assert_eq!(u8::from(result.exit_code), 1);
+		assert_eq!(stderr, "sleep: invalid time interval '-1'\n");
 	}
 
 	#[tokio::test]

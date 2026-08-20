@@ -9,6 +9,7 @@ use std::{
 };
 
 use clap::Parser;
+use omp_core::Str;
 use omp_shell_engine::{ExecutionContext, ExecutionExitCode, ExecutionResult, builtins};
 use tokio::time;
 
@@ -24,6 +25,78 @@ enum TopSortKey {
 	Mem,
 	#[value(alias = "time+")]
 	Time,
+}
+
+/// Column keys accepted by macOS-style `-stats` (comma-separated).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TopStat {
+	Pid,
+	#[value(alias = "uid")]
+	User,
+	#[value(name = "pstate", alias = "state")]
+	State,
+	#[value(name = "nice", alias = "ni")]
+	Nice,
+	#[value(name = "th", alias = "threads")]
+	Threads,
+	#[value(name = "vsize", alias = "virt")]
+	Virt,
+	#[value(name = "mem", alias = "rsize", alias = "res")]
+	Res,
+	#[value(alias = "time+")]
+	Time,
+	#[value(alias = "%cpu")]
+	Cpu,
+	#[value(name = "%mem", alias = "pmem")]
+	PctMem,
+	#[value(alias = "comm")]
+	Command,
+}
+
+const DEFAULT_TOP_STATS: &[TopStat] = &[
+	TopStat::Pid,
+	TopStat::User,
+	TopStat::State,
+	TopStat::Nice,
+	TopStat::Threads,
+	TopStat::Virt,
+	TopStat::Res,
+	TopStat::Time,
+	TopStat::Cpu,
+	TopStat::PctMem,
+	TopStat::Command,
+];
+
+impl TopStat {
+	fn header(self) -> &'static str {
+		match self {
+			Self::Pid => "PID",
+			Self::User => "USER",
+			Self::State => "S",
+			Self::Nice => "NI",
+			Self::Threads => "TH",
+			Self::Virt => "VIRT",
+			Self::Res => "RES",
+			Self::Time => "TIME+",
+			Self::Cpu => "%CPU",
+			Self::PctMem => "%MEM",
+			Self::Command => "COMMAND",
+		}
+	}
+
+	fn width(self) -> usize {
+		match self {
+			Self::Pid => 7,
+			Self::User => 8,
+			Self::State => 2,
+			Self::Nice => 3,
+			Self::Threads => 4,
+			Self::Virt | Self::Res => 9,
+			Self::Time => 10,
+			Self::Cpu | Self::PctMem => 4,
+			Self::Command => 0,
+		}
+	}
 }
 
 /// Display processes.
@@ -80,6 +153,10 @@ pub(crate) struct TopCommand {
 	/// Show the complete command line instead of the executable name.
 	#[arg(short = 'c', long = "full-command")]
 	full_command: bool,
+
+	/// Columns to display, in order (comma-separated, macOS `-stats` style).
+	#[arg(long = "stats", value_enum, value_delimiter = ',', ignore_case = true)]
+	stats: Vec<TopStat>,
 }
 
 #[derive(Clone)]
@@ -93,11 +170,45 @@ struct TopProcessRow {
 	resident_size: Option<u64>,
 	threads:       Option<u32>,
 	nice:          Option<i32>,
-	command:       String,
+	command:       Str,
+}
+
+const TOP_LONG_OPTIONS: &[&str] = &[
+	"batch",
+	"samples",
+	"iterations",
+	"delay",
+	"rows",
+	"pid",
+	"user",
+	"sort",
+	"full-command",
+	"stats",
+	"help",
+	"version",
+];
+
+fn normalize_top_flag(arg: String) -> String {
+	if let Some(rest) = arg.strip_prefix('-')
+		&& !rest.starts_with('-')
+	{
+		let name = rest.split('=').next().unwrap_or(rest);
+		if name.len() > 1 && TOP_LONG_OPTIONS.contains(&name) {
+			return format!("-{arg}");
+		}
+	}
+	arg
 }
 
 impl builtins::Command for TopCommand {
 	type Error = omp_shell_engine::Error;
+	fn new<I>(args: I) -> Result<Self, clap::Error>
+	where
+		I: IntoIterator<Item = String>,
+	{
+		Self::try_parse_from(args.into_iter().map(normalize_top_flag))
+	}
+
 
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
@@ -112,6 +223,11 @@ impl builtins::Command for TopCommand {
 		let sort = self.sort;
 		let full_command = self.full_command;
 		let _ = self.batch;
+		let stats = if self.stats.is_empty() {
+			DEFAULT_TOP_STATS.to_vec()
+		} else {
+			self.stats.clone()
+		};
 		async move {
 			if !delay.is_finite() || delay < 0.0 || delay > Duration::MAX.as_secs_f64() {
 				writeln!(context.stderr(), "top: invalid delay '{delay}'")?;
@@ -179,7 +295,7 @@ impl builtins::Command for TopCommand {
 						next_previous.insert(process.pid(), (start_time, cpu_time));
 					}
 
-					let command = sanitize_process_command(if full_command {
+					let command: Str = sanitize_process_command(if full_command {
 						let args = process.args();
 						if args.is_empty() {
 							process.command_name().into_owned()
@@ -188,7 +304,8 @@ impl builtins::Command for TopCommand {
 						}
 					} else {
 						process.command_name().into_owned()
-					});
+					})
+					.into();
 					rows.push(TopProcessRow {
 						pid: process.pid(),
 						user: effective_user.or(real_user),
@@ -203,7 +320,7 @@ impl builtins::Command for TopCommand {
 					});
 				}
 				sort_top_rows(&mut rows, sort);
-				render_top_snapshot(&mut output, &rows, row_limit, sample + 1);
+				render_top_snapshot(&mut output, &rows, row_limit, sample + 1, &stats);
 				if let Err(err) = write!(context.stdout(), "{output}") {
 					if err.kind() == io::ErrorKind::BrokenPipe {
 						return Ok(ExecutionResult::success());
@@ -253,6 +370,7 @@ fn render_top_snapshot(
 	rows: &[TopProcessRow],
 	row_limit: Option<usize>,
 	sample: u64,
+	stats: &[TopStat],
 ) {
 	output.clear();
 	let mut running = 0_usize;
@@ -303,50 +421,90 @@ fn render_top_snapshot(
 		format_top_bytes(resident),
 		format_top_bytes(virtual_size)
 	);
-	let _ = writeln!(
-		output,
-		"{:>7} {:>8} {:>2} {:>3} {:>4} {:>9} {:>9} {:>10} {:>4} {:>4} COMMAND",
-		"PID", "USER", "S", "NI", "TH", "VIRT", "RES", "TIME+", "%CPU", "%MEM"
-	);
+	for (index, stat) in stats.iter().enumerate() {
+		if index > 0 {
+			output.push(' ');
+		}
+		let _ = write!(output, "{:>width$}", stat.header(), width = stat.width());
+	}
+	output.push('\n');
 
 	for row in rows.iter().take(row_limit.unwrap_or(usize::MAX)) {
-		let user = row
-			.user
-			.map_or_else(|| "?".to_string(), |value| value.to_string());
-		let nice = row
-			.nice
-			.map_or_else(|| "?".to_string(), |value| value.to_string());
-		let threads = row
-			.threads
-			.map_or_else(|| "?".to_string(), |value| value.to_string());
-		let virtual_size = row
-			.virtual_size
-			.map_or_else(|| "?".to_string(), format_top_bytes);
-		let resident_size = row
-			.resident_size
-			.map_or_else(|| "?".to_string(), format_top_bytes);
-		let cpu_time = row
-			.cpu_time
-			.map_or_else(|| "?".to_string(), format_top_time);
-		let _ = writeln!(
-			output,
-			"{:>7} {:>8} {:>2} {:>3} {:>4} {:>9} {:>9} {:>10} {:>4.1} {:>4} {}",
-			row.pid,
-			user,
-			row.state,
-			nice,
-			threads,
-			virtual_size,
-			resident_size,
-			cpu_time,
-			row.cpu_percent,
-			"?",
-			if row.command.is_empty() {
-				"?"
-			} else {
-				&row.command
+		for (index, stat) in stats.iter().enumerate() {
+			if index > 0 {
+				output.push(' ');
 			}
-		);
+			let width = stat.width();
+			match stat {
+				TopStat::Pid => {
+					let _ = write!(output, "{:>width$}", row.pid);
+				},
+				TopStat::User => match row.user {
+					Some(value) => {
+						let _ = write!(output, "{value:>width$}");
+					},
+					None => {
+						let _ = write!(output, "{:>width$}", "?");
+					},
+				},
+				TopStat::State => {
+					let _ = write!(output, "{:>width$}", row.state);
+				},
+				TopStat::Nice => match row.nice {
+					Some(value) => {
+						let _ = write!(output, "{value:>width$}");
+					},
+					None => {
+						let _ = write!(output, "{:>width$}", "?");
+					},
+				},
+				TopStat::Threads => match row.threads {
+					Some(value) => {
+						let _ = write!(output, "{value:>width$}");
+					},
+					None => {
+						let _ = write!(output, "{:>width$}", "?");
+					},
+				},
+				TopStat::Virt => match row.virtual_size {
+					Some(bytes) => {
+						let value = format_top_bytes(bytes);
+						let _ = write!(output, "{value:>width$}");
+					},
+					None => {
+						let _ = write!(output, "{:>width$}", "?");
+					},
+				},
+				TopStat::Res => match row.resident_size {
+					Some(bytes) => {
+						let value = format_top_bytes(bytes);
+						let _ = write!(output, "{value:>width$}");
+					},
+					None => {
+						let _ = write!(output, "{:>width$}", "?");
+					},
+				},
+				TopStat::Time => match row.cpu_time {
+					Some(duration) => {
+						let value = format_top_time(duration);
+						let _ = write!(output, "{value:>width$}");
+					},
+					None => {
+						let _ = write!(output, "{:>width$}", "?");
+					},
+				},
+				TopStat::Cpu => {
+					let _ = write!(output, "{:>width$.1}", row.cpu_percent);
+				},
+				TopStat::PctMem => {
+					let _ = write!(output, "{:>width$}", "?");
+				},
+				TopStat::Command => {
+					output.push_str(if row.command.is_empty() { "?" } else { &row.command });
+				},
+			}
+		}
+		output.push('\n');
 	}
 	output.push('\n');
 }
@@ -396,7 +554,7 @@ mod tests {
 			resident_size: Some(resident_size),
 			threads: Some(2),
 			nice: Some(0),
-			command: command.to_string(),
+			command: Str::new(command),
 		}
 	}
 
@@ -441,10 +599,57 @@ mod tests {
 			row(1, "hidden-one", 0.0, 0, 0),
 		];
 		let mut output = String::new();
-		render_top_snapshot(&mut output, &rows, Some(2), 7);
+		render_top_snapshot(&mut output, &rows, Some(2), 7, DEFAULT_TOP_STATS);
 		assert!(output.contains("top - snapshot 7"));
 		assert!(output.contains("visible-three"));
 		assert!(output.contains("visible-two"));
 		assert!(!output.contains("hidden-one"));
+	}
+
+	#[test]
+	fn parses_macos_single_dash_long_options() {
+		use omp_shell_engine::builtins::Command as _;
+		let cmd = TopCommand::new(
+			["top", "-pid", "56943,101", "-stats", "pid,cpu,th,mem,pstate"]
+				.into_iter()
+				.map(String::from),
+		)
+		.expect("macOS-style flags must parse");
+		assert_eq!(cmd.pids, vec![56943, 101]);
+		assert_eq!(cmd.stats, vec![
+			TopStat::Pid,
+			TopStat::Cpu,
+			TopStat::Threads,
+			TopStat::Res,
+			TopStat::State
+		]);
+	}
+
+	#[test]
+	fn snapshot_renders_selected_stats_in_order() {
+		let rows = vec![row(42, "worker", 12.3, 4096, 61)];
+		let mut output = String::new();
+		render_top_snapshot(&mut output, &rows, None, 1, &[
+			TopStat::Pid,
+			TopStat::Cpu,
+			TopStat::Threads,
+			TopStat::Res,
+			TopStat::State,
+		]);
+		let header = output
+			.lines()
+			.find(|line| line.contains("PID"))
+			.expect("header line");
+		assert_eq!(header.split_whitespace().collect::<Vec<_>>(), vec![
+			"PID", "%CPU", "TH", "RES", "S"
+		]);
+		let row_line = output
+			.lines()
+			.find(|line| line.contains("42"))
+			.expect("process row");
+		assert_eq!(row_line.split_whitespace().collect::<Vec<_>>(), vec![
+			"42", "12.3", "2", "4.0k", "S"
+		]);
+		assert!(!output.contains("worker"));
 	}
 }

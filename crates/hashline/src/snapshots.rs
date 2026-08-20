@@ -11,7 +11,10 @@ use omp_core::{Str, fmts};
 
 use crate::format::normalized_file_xxh32;
 
-const DEFAULT_MAX_PATHS: usize = 30;
+// Wide sessions routinely touch more than a few dozen files. Retention remains
+// bounded by the global byte ceiling, so a generous path count avoids aging
+// valid in-session tags out at little cost.
+const DEFAULT_MAX_PATHS: usize = 256;
 const DEFAULT_MAX_REVISIONS_PER_PATH: usize = 4;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
@@ -603,6 +606,29 @@ mod tests {
 		assert_eq!(second.bytes(), &Bytes::from_static(COLLIDE_B));
 		assert_eq!(first.seen_lines(), &BTreeSet::from([1]));
 		assert_eq!(second.seen_lines(), &BTreeSet::from([2]));
+	}
+
+	#[test]
+	fn default_capacity_retains_an_early_tag_across_a_wide_session() {
+		let mut store = SnapshotStore::default();
+		let first_revision = token("first");
+		let tag = store
+			.record(PATH, first_revision.clone(), Bytes::from_static(b"first\n"), [])
+			.unwrap();
+		for index in 0..100 {
+			let revision = fmts!("other-{index}");
+			let content = fmts!("content {index}\n");
+			store
+				.record(
+					fmts!("/tmp/other-{index}.rs"),
+					token(&revision),
+					Bytes::copy_from_slice(content.as_bytes()),
+					[],
+				)
+				.unwrap();
+		}
+		let retained = store.resolve(PATH, &tag, Some(&first_revision)).unwrap();
+		assert_eq!(retained.bytes(), &Bytes::from_static(b"first\n"));
 	}
 
 	#[test]

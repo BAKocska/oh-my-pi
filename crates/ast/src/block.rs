@@ -8,6 +8,7 @@
 //! full span; pointing at a continuation line or a lone closing delimiter
 //! resolves to nothing.
 
+use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Point, TreeCursor};
 
@@ -121,6 +122,65 @@ pub fn block_range_at(options: BlockRangeOptions) -> Result<Option<BlockRange>> 
 		start_line: node_start_line(node),
 		end_line:   node_content_end_line(node),
 	}))
+}
+
+/// Inclusive span and grammar kind of one named syntax node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeSpan {
+	/// 1-indexed inclusive first line of the node.
+	pub start_line: u32,
+	/// 1-indexed inclusive last content line of the node.
+	pub end_line:   u32,
+	/// Tree-sitter grammar node kind (for example, `attribute_item`).
+	pub kind:       Str,
+}
+
+/// Returns the named-node chain containing `options.line`, innermost first.
+///
+/// The whole-file root is excluded. The chain descends through the line's
+/// first content character, so a single-line attribute or decorator comes
+/// before its enclosing declaration. Error-recovery and missing nodes are
+/// skipped without discarding healthy ancestors.
+///
+/// Returns `None` when the language is unrecognized, the line is out of range
+/// or blank, or the source cannot be parsed.
+pub fn node_chain_at(options: BlockRangeOptions) -> Result<Option<Vec<NodeSpan>>> {
+	let BlockRangeOptions { code, lang, path, line } = options;
+	if line == 0 || code.is_empty() {
+		return Ok(None);
+	}
+	let Some(language) = resolve_language(lang.as_deref(), path.as_deref()) else {
+		return Ok(None);
+	};
+	let row = (line - 1) as usize;
+	let Some(col) = first_content_column(&code, row) else {
+		return Ok(None);
+	};
+	let Some(tree) = parse_cached(&code, language)? else {
+		return Ok(None);
+	};
+	let root = tree.root_node();
+	let point = Point::new(row, col);
+	let point_end = Point::new(row, col + 1);
+	let Some(leaf) = root.named_descendant_for_point_range(point, point_end) else {
+		return Ok(None);
+	};
+	let mut chain = Vec::new();
+	let mut node = Some(leaf);
+	while let Some(current) = node {
+		if current.id() == root.id() {
+			break;
+		}
+		if current.is_named() && !current.is_error() && !current.is_missing() {
+			chain.push(NodeSpan {
+				start_line: node_start_line(current),
+				end_line:   node_content_end_line(current),
+				kind:       Str::new(current.kind()),
+			});
+		}
+		node = current.parent();
+	}
+	Ok(Some(chain))
 }
 
 /// Inclusive source line range.
@@ -302,6 +362,78 @@ mod tests {
 			line,
 		})
 		.expect("block resolution succeeds")
+	}
+
+	fn chain(code: &str, path: &str, line: u32) -> Vec<NodeSpan> {
+		node_chain_at(BlockRangeOptions {
+			code: code.to_owned(),
+			lang: None,
+			path: Some(path.to_owned()),
+			line,
+		})
+		.expect("chain resolution succeeds")
+		.expect("language recognized and line non-blank")
+	}
+
+	const RUST_ANNOTATED: &str = "mod m {\n\timpl S {\n\t\t#[napi]\n\t\tfn f(&self) -> u32 \
+	                              {\n\t\t\t1\n\t\t}\n\t}\n}\n";
+
+	#[test]
+	fn chain_names_rust_attribute_row() {
+		let spans = chain(RUST_ANNOTATED, "x.rs", 3);
+		assert!(
+			spans
+				.iter()
+				.any(|span| span.kind == "attribute_item"
+					&& span.start_line == 3
+					&& span.end_line == 3),
+			"{spans:?}"
+		);
+	}
+
+	#[test]
+	fn chain_orders_enclosing_ends_innermost_first() {
+		let spans = chain(RUST_ANNOTATED, "x.rs", 4);
+		let mut ends: Vec<u32> = spans
+			.iter()
+			.filter(|span| span.end_line > 4)
+			.map(|span| span.end_line)
+			.collect();
+		ends.dedup();
+		assert_eq!(ends, vec![6, 7, 8]);
+	}
+
+	#[test]
+	fn chain_names_typescript_decorator_row() {
+		let spans = chain("/** d */\n@Injectable()\nclass Service {}\n", "x.ts", 2);
+		assert!(
+			spans
+				.iter()
+				.any(|span| span.kind == "decorator"
+					&& span.start_line == 2
+					&& span.end_line == 2),
+			"{spans:?}"
+		);
+	}
+
+	#[test]
+	fn chain_declines_blank_lines_and_unknown_languages() {
+		let blank = node_chain_at(BlockRangeOptions {
+			code: "a\n\nb\n".to_owned(),
+			lang: None,
+			path: Some("x.ts".to_owned()),
+			line: 2,
+		})
+		.unwrap();
+		assert_eq!(blank, None);
+		let unknown = node_chain_at(BlockRangeOptions {
+			code: "a\n".to_owned(),
+			lang: None,
+			path: Some("x.unknownext".to_owned()),
+			line: 1,
+		})
+		.unwrap();
+		assert_eq!(unknown, None);
 	}
 
 	const TS_EXAMPLE: &str = "function x() {\n  if (y) {\n  }\n}\n";
@@ -907,7 +1039,16 @@ mod tests {
 
 	#[test]
 	fn pruned_walk_matches_unpruned_on_repo_corpus_sample() {
+		let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+		if !root.join("npm").is_dir() {
+			eprintln!("skipping: repository corpus unavailable at {}", root.display());
+			return;
+		}
 		let files = repo_files(Some(768 * 1024));
+		if files.is_empty() {
+			eprintln!("skipping: repository corpus scan found no sources at {}", root.display());
+			return;
+		}
 		assert!(files.len() > 40, "corpus sample too small to be evidence: {}", files.len());
 		let (comparisons, _) = sweep_corpus(&files);
 		assert!(comparisons > 300, "expected a broad sweep, got {comparisons} comparisons");
