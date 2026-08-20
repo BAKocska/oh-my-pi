@@ -5,7 +5,7 @@ use std::{
 	collections::{BTreeMap, HashMap, hash_map::Entry as MapEntry},
 	fs::File,
 	io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
-	path::Path,
+	path::{Path, PathBuf},
 };
 
 use cap_std::fs::Dir;
@@ -14,7 +14,7 @@ use omp_core::Str;
 use strum::{EnumString, IntoStaticStr};
 
 use crate::{
-	Entry, Error, Result,
+	Entry, Error, Result, asar,
 	entry::Storage,
 	path::{normalize, parent, validate},
 	tar, zip,
@@ -48,6 +48,9 @@ pub enum Format {
 	/// Gzip-compressed tape archive.
 	#[strum(to_string = "tar.gz", serialize = "tgz")]
 	TarGz,
+	/// Read-only Electron ASAR container.
+	#[strum(to_string = "asar")]
+	Asar,
 }
 
 impl Format {
@@ -74,6 +77,9 @@ impl Format {
 		}
 		if tar::is_header(bytes) {
 			return Some(Self::Tar);
+		}
+		if asar::is_header(bytes) {
+			return Some(Self::Asar);
 		}
 		let tail_start = bytes.len().saturating_sub(zip::SNIFF_TAIL_SIZE);
 		if zip::has_eocd(&bytes[tail_start..]) {
@@ -220,11 +226,12 @@ pub type Files = BTreeMap<Str, Vec<u8>>;
 
 /// Indexed, read-only access to one seekable archive source.
 pub struct Archive<R> {
-	source:  R,
-	decoded: Option<Cursor<Vec<u8>>>,
-	format:  Format,
-	entries: Vec<Entry>,
-	limits:  Limits,
+	source:        R,
+	decoded:       Option<Cursor<Vec<u8>>>,
+	unpacked_root: Option<PathBuf>,
+	format:        Format,
+	entries:       Vec<Entry>,
+	limits:        Limits,
 }
 
 impl<R: Read + Seek> Archive<R> {
@@ -264,9 +271,10 @@ impl<R: Read + Seek> Archive<R> {
 				decoded = Some(cursor);
 				entries
 			},
+			Format::Asar => asar::read_entries(&mut source, file_size, limits)?,
 		};
 		let entries = finalize_entries(raw_entries, limits)?;
-		Ok(Self { source, decoded, format, entries, limits })
+		Ok(Self { source, decoded, unpacked_root: None, format, entries, limits })
 	}
 
 	/// Returns this archive's detected or selected format.
@@ -299,10 +307,9 @@ impl<R: Read + Seek> Archive<R> {
 	/// returning the indexed target.
 	pub fn resolve_entry(&self, path: &str) -> Result<&Entry> {
 		let normalized = normalize(path, false).ok_or_else(|| Error::UnsafePath(Str::new(path)))?;
-		let resolved = if self.entry_normalized(normalized.as_str()).is_some() {
-			normalized
-		} else {
-			self.resolve_path(normalized)?
+		let resolved = match self.entry_normalized(normalized.as_str()) {
+			Some(entry) if !entry.is_link() => normalized,
+			Some(_) | None => self.resolve_path(normalized)?,
 		};
 		self
 			.entry_normalized(resolved.as_str())
@@ -441,10 +448,11 @@ impl<R: Read + Seek> Archive<R> {
 	}
 
 	fn resolve_path(&self, path: Str) -> Result<Str> {
-		if matches!(self.format, Format::Tar | Format::TarGz) {
-			return tar::resolve_alias_path(&self.entries, path, self.limits);
+		match self.format {
+			Format::Tar | Format::TarGz => tar::resolve_alias_path(&self.entries, path, self.limits),
+			Format::Asar => asar::resolve_alias_path(&self.entries, path, self.limits),
+			Format::Zip => Ok(path),
 		}
-		Ok(path)
 	}
 
 	fn file_entry(&self, path: &str) -> Result<Entry> {
@@ -477,6 +485,9 @@ impl<R: Read + Seek> Archive<R> {
 				entry,
 				output,
 			),
+			Format::Asar => {
+				asar::read_entry_to(&mut self.source, self.unpacked_root.as_deref(), entry, output)
+			},
 		}
 	}
 }
@@ -491,10 +502,12 @@ impl Archive<BufReader<File>> {
 	pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
 		let path = path.as_ref();
 		let source = BufReader::new(File::open(path)?);
-		match Format::from_path(path) {
-			Some(format) => Self::with_format_and_limits(source, format, limits),
-			None => Self::with_limits(source, limits),
-		}
+		let mut archive = match Format::from_path(path) {
+			Some(format) => Self::with_format_and_limits(source, format, limits)?,
+			None => Self::with_limits(source, limits)?,
+		};
+		archive.set_filesystem_path(path);
+		Ok(archive)
 	}
 
 	/// Opens a path as an explicit archive format.
@@ -508,7 +521,19 @@ impl Archive<BufReader<File>> {
 		format: Format,
 		limits: Limits,
 	) -> Result<Self> {
-		Self::with_format_and_limits(BufReader::new(File::open(path)?), format, limits)
+		let path = path.as_ref();
+		let mut archive =
+			Self::with_format_and_limits(BufReader::new(File::open(path)?), format, limits)?;
+		archive.set_filesystem_path(path);
+		Ok(archive)
+	}
+
+	fn set_filesystem_path(&mut self, path: &Path) {
+		if self.format == Format::Asar {
+			let mut root = path.as_os_str().to_owned();
+			root.push(".unpacked");
+			self.unpacked_root = Some(PathBuf::from(root));
+		}
 	}
 }
 
@@ -670,8 +695,12 @@ fn unreadable_link(entry: &Entry) -> Error {
 	Error::UnreadableLink {
 		path:   entry.path.clone(),
 		target: match &entry.storage {
-			Storage::TarLink { target_path } => target_path.clone(),
-			Storage::Synthetic | Storage::Zip { .. } | Storage::Tar { .. } => Str::new(""),
+			Storage::TarLink { target_path } | Storage::AsarLink { target_path } => {
+				target_path.clone()
+			},
+			Storage::Synthetic | Storage::Zip { .. } | Storage::Tar { .. } | Storage::Asar { .. } => {
+				Str::new("")
+			},
 		},
 	}
 }

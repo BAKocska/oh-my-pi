@@ -993,6 +993,26 @@ fn encoded_zip(entries: &[(&str, &str)]) -> Bytes {
 	)
 }
 
+fn asar_fixture() -> Bytes {
+	let json = br#"{"files":{"dir":{"files":{"member.txt":{"size":7,"offset":"0"}}},"root.txt":{"size":4,"offset":"7"}}}"#;
+	let payload_size = 4 + json.len() + 1;
+	let padded_payload_size = (payload_size + 3) & !3;
+	let inner_size = 4 + padded_payload_size;
+	let mut bytes = Vec::with_capacity(8 + inner_size + 11);
+	for value in [
+		4,
+		u32::try_from(inner_size).unwrap(),
+		u32::try_from(padded_payload_size).unwrap(),
+		u32::try_from(json.len()).unwrap(),
+	] {
+		bytes.extend_from_slice(&value.to_le_bytes());
+	}
+	bytes.extend_from_slice(json);
+	bytes.resize(8 + inner_size, 0);
+	bytes.extend_from_slice(b"one\ntworoot");
+	Bytes::from(bytes)
+}
+
 #[tokio::test]
 async fn zip_and_tar_root_member_and_member_range_use_standard_text_formatting() {
 	let sources = Sources::default();
@@ -1021,6 +1041,24 @@ async fn zip_and_tar_root_member_and_member_range_use_standard_text_formatting()
 	assert_eq!(
 		text(sources, r#"{"path":"bundle.tar.gz:dir/member.txt:raw:2-3"}"#).await,
 		"two\nthree"
+	);
+}
+
+#[tokio::test]
+async fn asar_root_subdirectory_and_packed_member_use_archive_routing() {
+	let sources = Sources::default();
+	sources.file("bundle.asar", asar_fixture());
+	assert_eq!(
+		text(sources.clone(), r#"{"path":"bundle.asar"}"#).await,
+		"dir/\nroot.txt (4B)"
+	);
+	assert_eq!(
+		text(sources.clone(), r#"{"path":"bundle.asar:dir"}"#).await,
+		"member.txt (7B)"
+	);
+	assert_eq!(
+		text(sources, r#"{"path":"bundle.asar:dir/member.txt"}"#).await,
+		"1:one\n2:two"
 	);
 }
 

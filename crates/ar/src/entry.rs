@@ -64,6 +64,13 @@ pub enum Storage {
 	TarLink {
 		target_path: Str,
 	},
+	Asar {
+		data_offset: u64,
+		unpacked:    bool,
+	},
+	AsarLink {
+		target_path: Str,
+	},
 }
 
 /// One normalized file, directory, or unresolved symbolic link in an archive.
@@ -118,25 +125,34 @@ impl Entry {
 		match &self.storage {
 			Storage::Zip { compressed_size, .. } => *compressed_size,
 			Storage::Tar { stored_size, .. } => *stored_size,
-			Storage::Synthetic | Storage::TarLink { .. } => 0,
+			Storage::Asar { .. } => self.size,
+			Storage::Synthetic | Storage::TarLink { .. } | Storage::AsarLink { .. } => 0,
 		}
 	}
 
-	/// Returns the ZIP compression method, or `None` for TAR members.
+	/// Returns the ZIP compression method, or `None` for other formats.
 	#[inline]
 	pub const fn zip_compression(&self) -> Option<CompressionMethod> {
 		match &self.storage {
 			Storage::Zip { method, .. } => Some(*method),
-			Storage::Synthetic | Storage::Tar { .. } | Storage::TarLink { .. } => None,
+			Storage::Synthetic
+			| Storage::Tar { .. }
+			| Storage::TarLink { .. }
+			| Storage::Asar { .. }
+			| Storage::AsarLink { .. } => None,
 		}
 	}
 
-	/// Returns the declared ZIP CRC-32, or `None` for TAR members.
+	/// Returns the declared ZIP CRC-32, or `None` for other formats.
 	#[inline]
 	pub const fn crc32(&self) -> Option<u32> {
 		match &self.storage {
 			Storage::Zip { crc32, .. } => Some(*crc32),
-			Storage::Synthetic | Storage::Tar { .. } | Storage::TarLink { .. } => None,
+			Storage::Synthetic
+			| Storage::Tar { .. }
+			| Storage::TarLink { .. }
+			| Storage::Asar { .. }
+			| Storage::AsarLink { .. } => None,
 		}
 	}
 
@@ -146,18 +162,22 @@ impl Entry {
 		matches!(&self.storage, Storage::Zip { flags, .. } if flags & 1 != 0)
 	}
 
-	/// Returns whether this entry is an unresolved TAR symbolic-link node.
+	/// Returns whether this entry is an unresolved symbolic-link node.
 	#[inline]
 	pub const fn is_link(&self) -> bool {
-		matches!(&self.storage, Storage::TarLink { .. })
+		matches!(&self.storage, Storage::TarLink { .. } | Storage::AsarLink { .. })
 	}
 
-	/// Returns an unresolved TAR link target.
+	/// Returns an unresolved link target.
 	#[inline]
 	pub fn link_target(&self) -> Option<&str> {
 		match &self.storage {
-			Storage::TarLink { target_path } => Some(target_path.as_str()),
-			Storage::Synthetic | Storage::Zip { .. } | Storage::Tar { .. } => None,
+			Storage::TarLink { target_path } | Storage::AsarLink { target_path } => {
+				Some(target_path.as_str())
+			},
+			Storage::Synthetic | Storage::Zip { .. } | Storage::Tar { .. } | Storage::Asar { .. } => {
+				None
+			},
 		}
 	}
 

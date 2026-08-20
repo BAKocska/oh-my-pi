@@ -50,7 +50,7 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.
 - Directory → depth-limited dirent listing.
 - SQLite (`.sqlite`, `.sqlite3`, `.db`, `.db3`): `file.db` (tables), `file.db:table` (schema+rows), `file.db:table:key` (by PK), `?limit=`/`?where=`/`?q=SELECT`.
-- Archives (`.tar`, `.tar.gz`, `.tgz`, `.zip`, plus ZIP-based `.jar`/`.war`/`.ear`/`.apk`): `archive.ext:path/inside/archive` reads a member.
+- Archives (`.tar`, `.tar.gz`, `.tgz`, `.zip`, `.asar`, plus ZIP-based `.jar`/`.war`/`.ear`/`.apk`): `archive.ext:path/inside/archive` reads a member.
 - Documents → extracted text. Notebooks → editable cells. Images → decoded inline. `:raw` bypasses converters.
 - URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
 - Literal `:`, `?`, `#` in URI-like member paths → percent-encode (`%3A`/`%3F`/`%23`).
@@ -951,12 +951,27 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		stat: &SourceStat,
 		suffix_from: Option<&str>,
 	) -> Result<Vec<PayloadPart>, Fault> {
-		let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-		let archive_format = archive::archive_format_from_path(archive_path)
-			.or_else(|| archive::sniff_archive_format(&bytes))
-			.ok_or_else(|| Fault::source(format!("Unsupported archive format: {archive_path}")))?;
-		let result = archive::read_archive_bytes(bytes, archive_format, target)
-			.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?;
+		let hinted_format = archive::archive_format_from_path(archive_path);
+		let result = if hinted_format == Some(archive::ArchiveFormat::Asar) {
+			match archive::read_archive_path(stat.canonical_path.as_str(), target) {
+				Ok(result) => result,
+				Err(archive::ArchiveError::Io { .. }) => {
+					let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
+					archive::read_archive_bytes(bytes, archive::ArchiveFormat::Asar, target)
+						.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?
+				},
+				Err(error) => {
+					return Err(Fault::Source { message: Str::from(error.to_string()) });
+				},
+			}
+		} else {
+			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
+			let archive_format = hinted_format
+				.or_else(|| archive::sniff_archive_format(&bytes))
+				.ok_or_else(|| Fault::source(format!("Unsupported archive format: {archive_path}")))?;
+			archive::read_archive_bytes(bytes, archive_format, target)
+				.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?
+		};
 		match result.content {
 			archive::ArchiveContent::Directory(listing) => {
 				let text = format::prepend_suffix_resolution_notice(

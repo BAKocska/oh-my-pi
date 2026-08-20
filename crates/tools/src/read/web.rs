@@ -526,6 +526,7 @@ fn render_archive(bytes: Bytes, extension: &str) -> Result<String, archive::Arch
 		".zip" | ".jar" | ".war" | ".ear" | ".apk" => Some(archive::ArchiveFormat::Zip),
 		".tar" => Some(archive::ArchiveFormat::Tar),
 		".tar.gz" | ".tgz" | ".gz" => Some(archive::ArchiveFormat::TarGz),
+		".asar" => Some(archive::ArchiveFormat::Asar),
 		_ => None,
 	};
 	let format = hinted

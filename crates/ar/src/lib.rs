@@ -1,9 +1,10 @@
-//! Bounded ZIP, TAR, and TAR.GZ reading with deterministic archive writing.
+//! Bounded ZIP, TAR, TAR.GZ, and Electron ASAR reading with deterministic
+//! ZIP/TAR writing.
 //!
-//! [`Archive`] indexes a seekable source without materializing ordinary ZIP or
-//! TAR member payloads. TAR.GZ is decompressed once under [`Limits`] because
-//! random member reads require the decoded TAR byte stream. Format-specific
-//! writers live in [`zip`] and [`tar`].
+//! [`Archive`] indexes a seekable source without materializing ordinary ZIP,
+//! TAR, or packed ASAR member payloads. TAR.GZ is decompressed once under
+//! [`Limits`] because random member reads require the decoded TAR byte stream.
+//! Format-specific writers live in [`zip`] and [`tar`]; ASAR is read-only.
 //!
 //! # Example
 //!
@@ -17,6 +18,7 @@
 //! ```
 
 mod archive;
+pub mod asar;
 mod entry;
 mod error;
 mod path;

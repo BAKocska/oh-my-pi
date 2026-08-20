@@ -1,8 +1,8 @@
 //! Archive read behavior for selectors, text classification, and presentation.
 //!
-//! ZIP, TAR, and TAR.GZ parsing, limits, link resolution, and member decoding
-//! live in `omp-ar`. This module translates that format-neutral API into the
-//! read tool's selector and model-facing contracts.
+//! ZIP, TAR, TAR.GZ, and ASAR parsing, limits, link resolution, and member
+//! decoding live in `omp-ar`. This module translates that format-neutral API
+//! into the read tool's selector and model-facing contracts.
 
 use std::{
 	fs::File,
@@ -265,8 +265,8 @@ pub fn archive_format_from_path(path: impl AsRef<Path>) -> Option<ArchiveFormat>
 	ArchiveFormat::from_path(path)
 }
 
-/// Sniffs ZIP records, gzip headers, or checksum-valid TAR headers from
-/// in-memory bytes.
+/// Sniffs ZIP records, gzip headers, checksum-valid TAR headers, or an ASAR
+/// Pickle header from in-memory bytes.
 pub fn sniff_archive_format(bytes: &[u8]) -> Option<ArchiveFormat> {
 	ArchiveFormat::sniff(bytes)
 }
@@ -274,7 +274,8 @@ pub fn sniff_archive_format(bytes: &[u8]) -> Option<ArchiveFormat> {
 /// Split every plausible archive extension boundary, longest archive prefix
 /// first. Only an extension followed by `:` or end-of-input is a boundary.
 pub fn parse_archive_path_candidates(path: &str) -> Vec<ArchivePathCandidate> {
-	const EXTENSIONS: [&str; 7] = [".tar.gz", ".tgz", ".zip", ".tar", ".jar", ".war", ".ear"];
+	const EXTENSIONS: [&str; 8] =
+		[".tar.gz", ".tgz", ".zip", ".tar", ".asar", ".jar", ".war", ".ear"];
 	const APK: &str = ".apk";
 
 	let normalized = path.replace('\\', "/");
@@ -313,13 +314,16 @@ pub fn open_archive_path(
 	let format = archive_format_from_path(path).ok_or_else(|| ArchiveError::UnsupportedFormat {
 		path: path.to_string_lossy().into_owned(),
 	})?;
-	let file = File::open(path).map_err(|source| ArchiveError::Io {
-		action: "open",
-		path: path.to_path_buf(),
-		source,
-	})?;
-	let archive = Archive::with_format_and_limits(BufReader::new(file), format, archive_limits())
-		.map_err(|error| archive_error(error, format))?;
+	let archive = Archive::open_with_format_and_limits(path, format, archive_limits()).map_err(
+		|error| match error {
+			ArError::Io(source) => ArchiveError::Io {
+				action: "open",
+				path: path.to_path_buf(),
+				source,
+			},
+			other => archive_error(other, format),
+		},
+	)?;
 	Ok(ArchiveReader { archive })
 }
 
@@ -605,6 +609,7 @@ const fn format_name(format: ArchiveFormat) -> &'static str {
 		ArchiveFormat::Zip => "ZIP",
 		ArchiveFormat::Tar => "tar",
 		ArchiveFormat::TarGz => "tar.gz",
+		ArchiveFormat::Asar => "ASAR",
 	}
 }
 
