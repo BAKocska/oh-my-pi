@@ -398,7 +398,7 @@ impl BlobStore {
 			let directory = Dir::open_ambient_dir(&temporary, ambient_authority())?;
 			archive.extract_to(&directory)?;
 			fs::write(temporary.join(".complete"), b"")?;
-			set_read_only_tree(&temporary)?;
+			set_read_only_contents(&temporary)?;
 			Ok::<(), Error>(())
 		})();
 		if let Err(error) = extracted {
@@ -406,7 +406,10 @@ impl BlobStore {
 			return Err(error);
 		}
 		match fs::rename(&temporary, &destination) {
-			Ok(()) => Ok(destination),
+			Ok(()) => {
+				set_read_only(&destination)?;
+				Ok(destination)
+			},
 			Err(_error) if destination.is_dir() => {
 				let _ = fs::remove_dir_all(&temporary);
 				Ok(destination)
@@ -596,16 +599,24 @@ fn is_store_component(value: &str) -> bool {
 }
 
 fn set_read_only_tree(path: &Path) -> io::Result<()> {
+	set_read_only_contents(path)?;
+	set_read_only(path)
+}
+
+fn set_read_only_contents(path: &Path) -> io::Result<()> {
 	for entry in fs::read_dir(path)? {
 		let entry = entry?;
 		let child = entry.path();
 		if entry.file_type()?.is_dir() {
 			set_read_only_tree(&child)?;
+		} else {
+			set_read_only(&child)?;
 		}
-		let mut permissions = fs::metadata(&child)?.permissions();
-		permissions.set_readonly(true);
-		fs::set_permissions(child, permissions)?;
 	}
+	Ok(())
+}
+
+fn set_read_only(path: &Path) -> io::Result<()> {
 	let mut permissions = fs::metadata(path)?.permissions();
 	permissions.set_readonly(true);
 	fs::set_permissions(path, permissions)

@@ -201,10 +201,11 @@ fn generated_schema_definition_and_revision_are_exact() {
 		 complex\n- Supports `.tar`, `.tar.gz`, `.tgz`, `.zip`, and ZIP-based \
 		 `.jar`/`.war`/`.ear`/`.apk` archive entries via `archive.ext:path/inside/archive`\n- \
 		 Supports SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` \
-		 (update with JSON content, delete with empty content)\n</conditions>\n\n<critical>\n- You \
-		 SHOULD use Edit tool for modifying existing files\n- You NEVER create documentation files \
-		 (*.md, README) unless explicitly requested\n- You NEVER use emojis unless \
-		 requested\n</critical>"
+		 (update with JSON content, delete with empty content)\n- Supports registered \
+		 merge-conflict splices via `conflict://<id>` and \
+		 `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit tool \
+		 for modifying existing files\n- You NEVER create documentation files (*.md, README) unless \
+		 explicitly requested\n- You NEVER use emojis unless requested\n</critical>"
 	);
 }
 

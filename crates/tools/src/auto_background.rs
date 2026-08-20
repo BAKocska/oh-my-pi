@@ -62,7 +62,12 @@ pub fn resolve_auto_background_wait(threshold: Duration, timeout: Option<Duratio
 	let Some(timeout) = timeout else {
 		return threshold;
 	};
-	threshold.min(timeout.saturating_sub(TIMEOUT_BUFFER))
+	let wait = if timeout <= TIMEOUT_BUFFER {
+		timeout
+	} else {
+		timeout - TIMEOUT_BUFFER
+	};
+	threshold.min(wait)
 }
 
 /// Result of racing one resource event against interruption and backgrounding.
@@ -134,7 +139,7 @@ mod tests {
 		);
 		assert_eq!(
 			resolve_auto_background_wait(Duration::from_secs(60), Some(Duration::from_millis(500))),
-			Duration::ZERO,
+			Duration::from_millis(500),
 		);
 		assert_eq!(
 			resolve_auto_background_wait(Duration::from_secs(60), None),

@@ -560,14 +560,16 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		if targets.is_empty() {
 			return Err(Fault::Invalid { message: sf!("Path must not be empty") });
 		}
-		// Delimiters only become a list when every member resolves directly;
-		// otherwise retain the authored text as one literal path.
-		if futures::future::try_join_all(
-			targets
-				.iter()
-				.cloned()
-				.map(|target| async move { self.sources.stat(target).await }),
-		)
+		// Delimiters only become a list when every member resolves directly,
+		// with an inline selector resolved against its underlying local path.
+		// Otherwise retain the authored text as one literal path.
+		if futures::future::try_join_all(targets.iter().cloned().map(|target| async move {
+			if self.sources.stat(target.clone()).await.is_ok() {
+				return Ok(());
+			}
+			let split = selector::split_path_and_selector(&target);
+			self.sources.stat(Str::new(split.path)).await.map(|_| ())
+		}))
 		.await
 		.is_ok()
 		{

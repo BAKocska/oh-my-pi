@@ -229,7 +229,7 @@ fn constructed_tool_spec_has_exact_python_only_schema() {
 				"language": {
 					"type": "string",
 					"enum": ["py"],
-					"description": "runtime: \"py\" for the IPython kernel"
+					"description": "runtime: \"py\" for the Python kernel"
 				},
 				"code": {
 					"type": "string",
@@ -247,14 +247,35 @@ fn constructed_tool_spec_has_exact_python_only_schema() {
 					"type": "boolean",
 					"description": "wipe this language's kernel before running. Other languages are untouched."
 				}
-			}
+			,
+							"kernel_mode": {
+								"anyOf": [
+									{
+										"oneOf": [
+											{
+												"type": "string",
+												"const": "persistent",
+												"description": "Reuse the owner-scoped Python kernel."
+											},
+											{
+												"type": "string",
+												"const": "per-call",
+												"description": "Spawn a clean Python kernel for this call and dispose it at settlement."
+											}
+										],
+										"description": "Lifetime policy for the Python kernel."
+									},
+									{"type": "null"}
+								],
+								"description": "Select a persistent kernel or an isolated one-shot process."
+							}}
 		})
 	);
 }
 
 #[test]
 fn python_model_description_is_exact_and_has_no_javascript_branch() {
-	let expected = r#"Run one step of code in a persistent kernel. State persists across calls and subagents.
+	let expected = r#"Run one step of code in a persistent Python kernel. State persists across calls and subagents.
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
 Cells exceeding the foreground wait threshold continue as managed jobs; their results are delivered automatically.

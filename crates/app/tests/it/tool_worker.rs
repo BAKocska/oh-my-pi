@@ -21,9 +21,7 @@ use omp_app::{
 		control::{ControlError, HostRequestMap},
 	},
 };
-use omp_core::{
-	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, sf,
-};
+use omp_core::{ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, sf};
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
 	prost::Message as _,
@@ -344,8 +342,6 @@ fn worker_connection_rejects_nested_counts_before_decode() {
 #[tokio::test]
 async fn supervisor_rejects_stale_host_generation() {
 	use std::os::unix::fs::PermissionsExt as _;
-
-	
 
 	let scratch = tempfile::tempdir().expect("stale generation scratch");
 	let wrapper = scratch.path().join("stale-worker");

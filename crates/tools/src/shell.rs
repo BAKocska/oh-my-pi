@@ -491,6 +491,14 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				yield commit_event(error);
 				return;
 			}
+			if let Some(interrupt) = params.take_interrupt() {
+				yield Ev::Aborted(Abort::Skipped { reason: interrupt.reason });
+				return;
+			}
+			if let Some(Ok(interrupt)) = params.next_interrupt().now_or_never() {
+				yield Ev::Aborted(Abort::Skipped { reason: interrupt.reason });
+				return;
+			}
 			if let Some(key) = args.env.keys().find(|key| !valid_env_key(key)).cloned() {
 				yield Ev::Done(ToolTerminal::Done {
 					result: Err(Fault::InvalidEnvironmentKey { key }),
@@ -880,7 +888,7 @@ fn param_event<U, P>(error: ParamError) -> Ev<U, P, Fault> {
 	match error {
 		ParamError::Args(issue) => Ev::Args(*issue),
 		ParamError::Interrupted(interrupt) => {
-			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+			Ev::Aborted(Abort::Skipped { reason: interrupt.reason })
 		},
 		ParamError::Protocol(reason) => Ev::Args(protocol_issue(reason)),
 	}
@@ -890,7 +898,7 @@ fn commit_event<U, P>(error: CommitError) -> Ev<U, P, Fault> {
 	match error {
 		CommitError::Aborted => Ev::Aborted(Abort::InputDropped),
 		CommitError::Interrupted(interrupt) => {
-			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+			Ev::Aborted(Abort::Skipped { reason: interrupt.reason })
 		},
 		CommitError::Protocol(reason) => Ev::Args(protocol_issue(reason)),
 	}

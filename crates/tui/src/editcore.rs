@@ -1559,6 +1559,7 @@ pub struct Editor {
 	history:           Vec<Str>,
 	history_index:     Option<usize>,
 	history_draft:     Str,
+	history_query:     Option<Str>,
 	last_layout_width: Cell<u16>,
 }
 
@@ -1577,6 +1578,7 @@ impl Editor {
 			history: Vec::new(),
 			history_index: None,
 			history_draft: Default::default(),
+			history_query: None,
 			last_layout_width: Cell::new(80),
 		}
 	}
@@ -1759,10 +1761,9 @@ impl Editor {
 				self.history_newer()
 			},
 			_ => {
-				if matches!(key, Key::Char(_) | Key::Space | Key::Backspace | Key::Delete)
-					&& self.history_index.is_some()
-				{
+				if matches!(key, Key::Char(_) | Key::Space | Key::Backspace | Key::Delete) {
 					self.history_index = None;
+					self.history_query = None;
 				}
 				let outcome = self
 					.buffer
@@ -1830,6 +1831,7 @@ impl Editor {
 		if self.history_index.is_none() {
 			self.history_draft = Str::new(self.buffer.text());
 		}
+		self.history_query = None;
 		self.history_index = Some(next);
 		self.buffer.replace_external(&self.history[next], true);
 		self.refresh();
@@ -1843,7 +1845,13 @@ impl Editor {
 		if self.history_index.is_none() {
 			self.history_draft = Str::new(self.buffer.text());
 		}
-		let query = self.history_draft.trim().to_ascii_lowercase();
+		if self.history_query.is_none() {
+			self.history_query = Some(self.history_draft.trim().to_ascii_lowercase().into());
+		}
+		let query = self
+			.history_query
+			.as_ref()
+			.map_or("", |query| query.as_str());
 		let start = self
 			.history_index
 			.map_or(0, |index| index.saturating_add(1));
@@ -1852,12 +1860,7 @@ impl Editor {
 			.iter()
 			.enumerate()
 			.skip(start)
-			.find_map(|(index, entry)| {
-				(query.is_empty()
-					|| entry.to_ascii_lowercase().contains(&query)
-					|| fuzzy_score(&query, &entry.to_ascii_lowercase()) > 0)
-					.then_some(index)
-			});
+			.find_map(|(index, entry)| history_entry_matches(query, entry).then_some(index));
 		let Some(index) = found else {
 			return EditOutcome::Ignored;
 		};
@@ -1871,14 +1874,20 @@ impl Editor {
 		let Some(index) = self.history_index else {
 			return EditOutcome::Ignored;
 		};
-		if index == 0 {
-			self.history_index = None;
-			self.buffer.replace_external(&self.history_draft, false);
+		let next = if let Some(query) = &self.history_query {
+			(0..index)
+				.rev()
+				.find(|&candidate| history_entry_matches(query, &self.history[candidate]))
 		} else {
-			self.history_index = Some(index - 1);
-			self
-				.buffer
-				.replace_external(&self.history[index - 1], false);
+			index.checked_sub(1)
+		};
+		if let Some(next) = next {
+			self.history_index = Some(next);
+			self.buffer.replace_external(&self.history[next], false);
+		} else {
+			self.history_index = None;
+			self.history_query = None;
+			self.buffer.replace_external(&self.history_draft, false);
 		}
 		self.refresh();
 		EditOutcome::Changed
@@ -1887,6 +1896,7 @@ impl Editor {
 	/// Inserts sanitized text at the cursor (pastes, programmatic prefill).
 	pub fn insert_text(&mut self, text: &str) -> EditOutcome {
 		self.history_index = None;
+		self.history_query = None;
 		if matches!(self.buffer.insert_text(text), BufferOutcome::Changed) {
 			self.refresh();
 			EditOutcome::Changed
@@ -1899,6 +1909,7 @@ impl Editor {
 	/// [`EditBuffer::insert_reference`].
 	pub fn insert_reference(&mut self, marker: &str, payload: &str) -> EditOutcome {
 		self.history_index = None;
+		self.history_query = None;
 		if matches!(self.buffer.insert_reference(marker, payload), BufferOutcome::Changed) {
 			self.refresh();
 			EditOutcome::Changed
@@ -1927,6 +1938,7 @@ impl Editor {
 			self.history.truncate(HISTORY_CAPACITY);
 		}
 		self.history_index = None;
+		self.history_query = None;
 		self.picker = None;
 		self.hint = None;
 		EditOutcome::Submitted(self.buffer.clear_after_submit())
@@ -2368,6 +2380,14 @@ fn command_score(query: &str, target: &str) -> u16 {
 	} else {
 		fuzzy_score(query, target)
 	}
+}
+
+fn history_entry_matches(query: &str, entry: &str) -> bool {
+	if query.is_empty() {
+		return true;
+	}
+	let entry = entry.to_ascii_lowercase();
+	entry.contains(query) || fuzzy_score(query, &entry) > 0
 }
 
 fn fuzzy_score(query: &str, target: &str) -> u16 {

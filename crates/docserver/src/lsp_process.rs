@@ -915,7 +915,12 @@ async fn reader_loop<R>(
 		let payload = match read_frame(&mut reader, max_header_bytes, max_message_bytes).await {
 			Ok(payload) => payload,
 			Err(source) => {
-				transport.fail_all(LspTransportError::Frame { source: Arc::new(source) });
+				transport.fail_all(match source {
+					LspFrameError::Eof => {
+						LspTransportError::Closed { message: sf!("LSP standard output reached EOF") }
+					},
+					source => LspTransportError::Frame { source: Arc::new(source) },
+				});
 				break;
 			},
 		};

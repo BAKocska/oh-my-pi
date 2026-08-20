@@ -2626,7 +2626,11 @@ mod tests {
 			.height
 			.saturating_sub(composer_rows)
 			.saturating_add(1);
-		assert_eq!(frame.cell(2, input_y).style().background_color(), context.theme.selection);
+		let input_x = row_text(frame, input_y)
+			.find('<')
+			.and_then(|column| u16::try_from(column).ok())
+			.expect("selected XML opening tag is visible");
+		assert_eq!(frame.cell(input_x, input_y).style().background_color(), context.theme.selection,);
 	}
 
 	#[test]

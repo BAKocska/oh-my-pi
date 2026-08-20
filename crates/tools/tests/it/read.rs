@@ -766,7 +766,7 @@ async fn structural_summary_has_a_concrete_recovery_footer() {
 		concat!(
 			"[big.rs#A1B2]\n",
 			"1-122:pub fn giant() { … }\n\n",
-			"[…120ln elided; re-read needed ranges with big.rs:1-122]",
+			"[…120ln elided; re-read needed ranges with big.rs:2-121]",
 		)
 	);
 }

@@ -779,33 +779,6 @@ fn wait_info(debug: &mut DebugClient, label: &str, mut ready: impl FnMut(&Value)
 	}
 }
 
-fn wait_raw_sequence(
-	raw: &Arc<Mutex<Vec<u8>>>,
-	start: usize,
-	sequence: &[u8],
-	label: &str,
-) -> Vec<u8> {
-	let deadline = Instant::now() + CHECKPOINT_TIMEOUT;
-	loop {
-		let captured = raw.lock();
-		let segment = &captured[start.min(captured.len())..];
-		if segment
-			.windows(sequence.len())
-			.any(|window| window == sequence)
-		{
-			return segment.to_vec();
-		}
-		assert!(
-			Instant::now() < deadline,
-			"raw checkpoint {label:?} timed out waiting for {}\nraw PTY:\n{}",
-			visible(sequence),
-			visible(&captured),
-		);
-		drop(captured);
-		thread::sleep(Duration::from_millis(15));
-	}
-}
-
 fn assert_surface(snapshot: &Snapshot, label: &str) {
 	assert!(!snapshot.text.trim().is_empty(), "{label}: published terminal surface is empty");
 }
@@ -1198,10 +1171,11 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		},
 	);
 	assert_surface(&second_session, "second session retained content");
-	let second_idle = wait_snapshot(&mut resume_debug, &resumed_raw, "second session idle", |snapshot| {
-		snapshot.frame.contains("Second session retained content.")
-			&& snapshot.frame.contains("state    idle")
-	});
+	let second_idle =
+		wait_snapshot(&mut resume_debug, &resumed_raw, "second session idle", |snapshot| {
+			snapshot.frame.contains("Second session retained content.")
+				&& snapshot.frame.contains("state    idle")
+		});
 	assert_surface(&second_idle, "second session idle");
 
 	resume_debug.keys("'/resume' enter");

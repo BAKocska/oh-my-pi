@@ -173,21 +173,21 @@ pub(crate) fn wrong_operation(call: &Call, expected: OperationKind) -> Error {
 /// Typed operation-policy or media-lifecycle failure carried through [`Error`].
 #[allow(missing_docs, reason = "crate-private variants are documented by their error messages")]
 #[derive(Clone, Debug, strum::IntoStaticStr, thiserror::Error)]
-#[strum(serialize_all = "snake_case", const_into_str)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum MediaOperationError {
-	#[error(transparent)]
+	#[error("{0}")]
 	#[strum(serialize = "image_operation_failed")]
 	Image(#[from] image::ImageError),
-	#[error(transparent)]
+	#[error("{0}")]
 	#[strum(serialize = "speech_operation_failed")]
 	Speech(#[from] speech::SpeechError),
-	#[error(transparent)]
+	#[error("{0}")]
 	#[strum(serialize = "transcription_operation_failed")]
 	Transcription(#[from] transcription::TranscriptionError),
-	#[error(transparent)]
+	#[error("{0}")]
 	#[strum(serialize = "video_operation_failed")]
 	Video(#[from] video::VideoError),
-	#[error(transparent)]
+	#[error("{0}")]
 	#[strum(serialize = "realtime_operation_failed")]
 	Realtime(#[from] realtime::RealtimeSessionError),
 	#[error("operation policy requires an execution plan")]
@@ -243,7 +243,8 @@ pub(crate) fn media_validation_error(
 	failure: impl Into<MediaOperationError>,
 ) -> Error {
 	let failure = failure.into();
-	let reason = ReasonId(omp_core::Str::new_static(failure.into_str()));
+	let reason: &'static str = failure.clone().into();
+	let reason = ReasonId(omp_core::Str::new_static(reason));
 	Error::new(
 		ErrorKind::InvalidRequest,
 		ErrorPhase::Planning,
@@ -259,7 +260,8 @@ pub(crate) fn media_protocol_error(
 	failure: impl Into<MediaOperationError>,
 ) -> Error {
 	let failure = failure.into();
-	let reason = ReasonId(omp_core::Str::new_static(failure.into_str()));
+	let reason: &'static str = failure.clone().into();
+	let reason = ReasonId(omp_core::Str::new_static(reason));
 	Error::new(
 		ErrorKind::ProviderContractMismatch,
 		ErrorPhase::Streaming,

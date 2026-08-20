@@ -378,12 +378,13 @@ async fn shell_spills_whole_verdict_through_the_central_blob_gate_at_threshold()
 		details,
 		CallOutcomeDetails::Spilled { blob, .. } if blob.hash == "blake3:captured"
 	));
-	assert!(
-		spill
-			.bytes
-			.lock()
-			.windows(16)
-			.any(|window| window == b"xxxxxxxxxxxxxxxx"),
+	let spilled: CallOutcome<Payload, Fault> =
+		serde_json::from_slice(&spill.bytes.lock()).expect("spilled verdict remains valid JSON");
+	let CallOutcome::Ok(spilled) = spilled else {
+		panic!("spilled verdict remains successful");
+	};
+	assert_eq!(
+		spilled.transcript[0].data, b"xxxxxxxxxxxxxxxx",
 		"spill stage receives complete output rather than a truncated replacement"
 	);
 }
@@ -505,10 +506,13 @@ fn interrupt_before_execution_is_skipped_without_poisoning_later_calls() {
 		panic!("interrupted call must produce a verdict")
 	};
 	let outcome: CallOutcome<Payload, Fault> = serde_json::from_slice(verdict).unwrap();
-	assert!(matches!(
-		outcome,
-		CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop now"
-	));
+	assert!(
+		matches!(
+			outcome,
+			CallOutcome::Aborted { abort: Abort::Skipped { ref reason }, .. } if reason == "stop now"
+		),
+		"{outcome:?}"
+	);
 	{
 		let state = exec.state.lock();
 		assert_eq!(state.opens, 0);

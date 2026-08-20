@@ -75,8 +75,8 @@ use strum::{EnumString, IntoStaticStr};
 use crate::{
 	component::{Cached, Component},
 	components::{
-		Boxed, Button, Col, CustomElement, DiffKind, DiffView, EditorPane, Field, Form, Hr, Icon,
-		Img, Input, Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment, Select,
+		Boxed, Button, Callout, Col, CustomElement, DiffKind, DiffView, EditorPane, Field, Form, Hr,
+		Icon, Img, Input, Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment, Select,
 		SelectOption, Spacer, Spinner, Status, Table, TableCell, TableRow, Tabs, TaskStatus,
 		TextLeaf, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
@@ -492,11 +492,12 @@ impl Parser<'_> {
 			return finish_element(name, props, Vec::new(), Str::default(), at)
 				.map(|part| (part, body_start));
 		}
-		if matches!(name, "pre" | "latex" | "callout") {
+		if matches!(name, "pre" | "latex" | "callout" | "diff") {
 			let closer = match name {
 				"pre" => "</pre>",
 				"latex" => "</latex>",
 				"callout" => "</callout>",
+				"diff" => "</diff>",
 				_ => unreachable!(),
 			};
 			let end = self.src[body_start..]
@@ -1053,6 +1054,7 @@ fn is_catalog_tag(name: &str) -> bool {
 			| "progress"
 			| "img"
 			| "diff"
+			| "editor"
 			| "wizard"
 			| "step"
 			| "callout"
@@ -1231,6 +1233,7 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 			}
 			configured!(diff)
 		},
+		"callout" => configured!(Callout::new().text(body.clone())),
 		"editor" => configured!(EditorPane::new()),
 		"icon" => {
 			let name = if body.is_empty() {

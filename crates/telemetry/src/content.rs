@@ -695,9 +695,9 @@ mod tests {
 	}
 
 	#[test]
-	fn captured_content_is_not_redacted_by_default() {
+	fn captured_content_is_redacted_by_default() {
 		if run_redaction_test_isolated(
-			"content::tests::captured_content_is_not_redacted_by_default",
+			"content::tests::captured_content_is_redacted_by_default",
 			None,
 		) {
 			return;
@@ -708,6 +708,9 @@ mod tests {
 			system_prompt: None,
 			messages:      &messages,
 		});
-		assert_eq!(attribute_json(&captured, omp_gen_ai::REQUEST_MESSAGES)[0]["content"], token);
+		assert_eq!(
+			attribute_json(&captured, omp_gen_ai::REQUEST_MESSAGES)[0]["content"],
+			"[REDACTED]"
+		);
 	}
 }
