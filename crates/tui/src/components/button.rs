@@ -183,6 +183,8 @@ impl Component for Button {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 	use crate::{Frame, Size, test_support::frame_row_text};
 

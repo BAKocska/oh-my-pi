@@ -13,7 +13,7 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_llm_catalog::{ModelKey, compile::compile_oracle};
 #[cfg(feature = "local-applefm")]
 use omp_llm_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
@@ -1290,6 +1290,7 @@ fn local_infer(_args: LocalInferArgs) -> std::future::Ready<miette::Result<()>> 
 #[cfg(test)]
 mod tests {
 	use clap::error::ErrorKind;
+	use omp_core::sf;
 
 	use super::*;
 

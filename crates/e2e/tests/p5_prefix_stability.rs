@@ -10,7 +10,7 @@ use omp_agent::{
 	TurnInput, TurnOptions, WorkspaceInput,
 };
 use omp_app::rpc_adapter::InferenceRpc;
-use omp_core::{Str, sf};
+use omp_core::sf;
 use omp_e2e::support::{Scratch, user_item, within};
 use omp_llm_catalog::{
 	CompiledCatalog,

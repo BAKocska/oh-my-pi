@@ -263,9 +263,7 @@ fn decode_jpeg(data: &[u8]) -> Result<Frame> {
 	let options = zune_jpeg::zune_core::options::DecoderOptions::default()
 		.jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
 	let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), options);
-	let pixels = decoder
-		.decode()
-		.map_err(|err| Error::Protocol(sf!("jpeg: {err:?}")))?;
+	let pixels = decoder.decode().map_err(Error::Jpeg)?;
 	let (width, height) = decoder
 		.dimensions()
 		.ok_or_else(|| Error::Protocol("jpeg: missing dimensions".to_str()))?;
@@ -276,16 +274,15 @@ fn decode_jpeg(data: &[u8]) -> Result<Frame> {
 /// Decode a PNG into RGBA8, expanding RGB/grayscale and normalizing
 /// palette/16-bit inputs.
 fn decode_png(data: &[u8]) -> Result<Frame> {
-	let protocol = |err: png::DecodingError| Error::Protocol(sf!("png: {err}"));
 	let mut decoder = png::Decoder::new(Cursor::new(data));
 	// Expand palette/low-bit images and strip 16-bit samples down to 8.
 	decoder.set_transformations(png::Transformations::normalize_to_color8());
-	let mut reader = decoder.read_info().map_err(protocol)?;
+	let mut reader = decoder.read_info().map_err(Error::Png)?;
 	let size = reader
 		.output_buffer_size()
 		.ok_or_else(|| Error::Protocol("png: oversized image".to_str()))?;
 	let mut buf = vec![0u8; size];
-	let info = reader.next_frame(&mut buf).map_err(protocol)?;
+	let info = reader.next_frame(&mut buf).map_err(Error::Png)?;
 	buf.truncate(info.buffer_size());
 	let data = match info.color_type {
 		png::ColorType::Rgba => buf,

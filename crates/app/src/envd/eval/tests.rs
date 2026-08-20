@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use omp_core::{Str, sf};
+use omp_core::sf;
 use omp_tools::eval::idle_timeout::TimeoutHandle;
 use pyo3::{
 	prelude::*,

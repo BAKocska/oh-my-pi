@@ -1,8 +1,6 @@
 //! Kitty graphics protocol image transmission and Unicode placeholders.
 
-use std::fmt::Write as _;
-
-use omp_core::{Str, sf};
+use std::{fmt::Write as _, ops::Deref};
 
 use crate::{Color, Style, escape::esc};
 
@@ -324,9 +322,32 @@ pub const fn placement_id(rows: u16, cols: u16) -> u32 {
 	(rows as u32) << 9 | cols as u32
 }
 
+/// One stack-resident Kitty Unicode-placeholder grapheme.
+pub struct Placeholder {
+	bytes: [u8; 12],
+	len:   u8,
+}
+
+impl Placeholder {
+	/// Returns the placeholder as UTF-8 text.
+	pub fn as_str(&self) -> &str {
+		// SAFETY: `placeholder_cell` fills the prefix exclusively through
+		// `char::encode_utf8`.
+		unsafe { std::str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
+	}
+}
+
+impl Deref for Placeholder {
+	type Target = str;
+
+	fn deref(&self) -> &Self::Target {
+		self.as_str()
+	}
+}
+
 /// Builds one Kitty Unicode-placeholder grapheme and its style: the image ID
 /// rides the foreground color, the placement ID the underline color.
-pub fn placeholder_cell(id: u32, row: u16, col: u16, rows: u16, cols: u16) -> (Str, Style) {
+pub fn placeholder_cell(id: u32, row: u16, col: u16, rows: u16, cols: u16) -> (Placeholder, Style) {
 	let row_mark = DIACRITICS
 		.get(usize::from(row))
 		.copied()
@@ -335,7 +356,11 @@ pub fn placeholder_cell(id: u32, row: u16, col: u16, rows: u16, cols: u16) -> (S
 		.get(usize::from(col))
 		.copied()
 		.unwrap_or(DIACRITICS[0]);
-	let text = sf!("\u{10eeee}{row_mark}{col_mark}");
+	let mut bytes = [0; 12];
+	let mut len = '\u{10eeee}'.encode_utf8(&mut bytes).len();
+	len += row_mark.encode_utf8(&mut bytes[len..]).len();
+	len += col_mark.encode_utf8(&mut bytes[len..]).len();
+	let text = Placeholder { bytes, len: len as u8 };
 	let placement = placement_id(rows, cols);
 	let style = Style::new()
 		.fg(Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8))

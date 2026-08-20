@@ -445,7 +445,7 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 	let mut structured = OutputGate::new(GateCondition::ValidStructuredOutput, 4096);
 	let mut structured_output = Vec::new();
 	structured
-		.push(ChatEvent::TextDelta { index: 0, text: sf!("{\"ok\":true}") }, &mut |event| {
+		.push(ChatEvent::TextDelta { index: 0, text: sf!("{{\"ok\":true}}") }, &mut |event| {
 			structured_output.push(event);
 		})
 		.unwrap();

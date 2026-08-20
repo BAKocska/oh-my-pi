@@ -19,6 +19,7 @@
 //! observed on the next load.
 
 use std::{
+	fmt::Write,
 	path::{Path, PathBuf},
 	process::Stdio,
 	time::{Duration, Instant},
@@ -201,9 +202,9 @@ async fn setup(
 		},
 		Surface::Window(config) => {
 			cmd.arg("-width")
-				.arg(sf!("{}", config.width).as_str())
+				.arg(config.width.to_string())
 				.arg("-height")
-				.arg(sf!("{}", config.height).as_str());
+				.arg(config.height.to_string());
 		},
 	}
 	// Explicit start page keeps a fresh profile off about:home/about:welcome.
@@ -336,7 +337,8 @@ fn write_prefs(profile: &Path, page: &PageOptions) -> Result<()> {
 	));
 	if let Some(ua) = &page.user_agent {
 		let escaped = ua.replace('\\', "\\\\").replace('"', "\\\"");
-		prefs.push_str(&sf!("user_pref(\"general.useragent.override\", \"{escaped}\");\n"));
+		write!(prefs, "user_pref(\"general.useragent.override\", \"{escaped}\");\n")
+			.expect("writing to a String cannot fail");
 	}
 	std::fs::write(profile.join("user.js"), prefs)?;
 	Ok(())
@@ -665,7 +667,7 @@ impl Driver {
 		};
 		let raw = base64::decode(data.as_bytes())
 			.into_vec()
-			.map_err(|err| Error::Protocol(sf!("screenshot base64: {err}")))?;
+			.map_err(|source| Error::ScreenshotBase64 { source })?;
 		let mut frame = decode_frame(self.format, &raw)?;
 		match &self.last_frame {
 			Some(prev) if prev.len() == frame.data.len() => {

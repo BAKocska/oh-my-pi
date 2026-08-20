@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_llm_catalog::ModelKey;
 use omp_llm_inference::{
 	Client,
@@ -271,6 +271,8 @@ fn json_string(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 	#[test]
 	fn classifies_text_documents_and_images_by_content() {

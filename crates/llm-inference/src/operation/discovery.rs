@@ -687,7 +687,7 @@ mod tests {
 		sync::Arc,
 	};
 
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 
 	use super::{
 		CatalogDiscoveryProjector, DiscoveryService, RawDiscoveryPage, ResponsesRouteHints,

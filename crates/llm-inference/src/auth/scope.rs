@@ -90,7 +90,8 @@ const fn glob_matches(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	
+
+	use omp_core::sf;
 
 	use super::CredentialScope;
 

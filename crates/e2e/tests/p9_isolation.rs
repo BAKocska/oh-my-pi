@@ -16,7 +16,7 @@ use omp_app::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
+use omp_core::{ArtifactDigest, Principal, Provenance, sf};
 use omp_e2e::support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, omp_binary, within};
 use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_proto::{

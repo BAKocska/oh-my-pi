@@ -256,13 +256,7 @@ impl ProviderDeclarationId {
 
 impl fmt::Display for ProviderDeclarationId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"{}/{}/{}",
-			self.publisher(),
-			self.extension_id(),
-			self.declaration_id()
-		)
+		write!(formatter, "{}/{}/{}", self.publisher(), self.extension_id(), self.declaration_id())
 	}
 }
 
@@ -516,9 +510,9 @@ impl ProviderDeclarations {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use omp_core::IntoStr;
 
+	use super::*;
 	use crate::{EvidenceConfidence, ProvenanceKind, ProvenanceSource};
 
 	fn overlay(origin: &str) -> CatalogOverlay {
@@ -538,11 +532,7 @@ mod tests {
 
 	fn declaration(name: &str, priority: i32) -> ProviderDeclaration {
 		ProviderDeclaration {
-			id: ProviderDeclarationId::new(
-				"publisher".to_str(),
-				name.to_str(),
-				"provider".to_str(),
-			),
+			id: ProviderDeclarationId::new("publisher".to_str(), name.to_str(), "provider".to_str()),
 			provider: "provider".into(),
 			overlay: overlay(name),
 			priority,
@@ -609,7 +599,7 @@ mod tests {
 		let base = declaration("base", 0);
 		let mut replacement = declaration("replacement", 0);
 		replacement.replaces = Some(ProviderPublisher {
-			publisher: "publisher".to_str(),
+			publisher:    "publisher".to_str(),
 			extension_id: "base".to_str(),
 		});
 		replacement.available = false;
@@ -624,7 +614,7 @@ mod tests {
 		let base = declaration("base", 0);
 		let mut replacement = declaration("replacement", 0);
 		replacement.replaces = Some(ProviderPublisher {
-			publisher: "publisher".to_str(),
+			publisher:    "publisher".to_str(),
 			extension_id: "base".to_str(),
 		});
 		let active = ProviderDeclarations::new([base, replacement])

@@ -473,7 +473,6 @@ mod tests {
 	};
 
 	use bytes::Bytes;
-	use omp_core::Str;
 	use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 	use omp_storage::transcript::{
 		AmendPatch, Event, Header, ItemRecord, Kind, LiveSet, SessionId, Writer, load,

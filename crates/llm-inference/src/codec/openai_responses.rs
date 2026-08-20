@@ -2563,11 +2563,7 @@ impl OpenAiResponsesCodec {
 						None,
 						Some(ResponsesCustomToolFormat {
 							kind:       sf!("grammar"),
-							syntax:     Some(sf!(match grammar.syntax {
-								crate::call::ToolGrammarSyntax::Lark => "lark",
-								crate::call::ToolGrammarSyntax::Regex => "regex",
-								crate::call::ToolGrammarSyntax::Ebnf => "ebnf",
-							})),
+							syntax:     Some(sf!(<&'static str>::from(grammar.syntax))),
 							definition: Some(grammar.definition.clone()),
 						}),
 					),
@@ -3347,7 +3343,7 @@ impl super::Codec for OpenAiResponsesCodec {
 mod tests {
 	use std::sync::Arc;
 
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 	use omp_llm_catalog::{Catalog, ReasoningEffort, RouteDef, ThinkingEffort, WireTarget};
 
 	use super::{

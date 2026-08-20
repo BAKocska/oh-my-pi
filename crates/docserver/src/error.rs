@@ -1,4 +1,4 @@
-use std::{fmt, io, path::PathBuf};
+use std::{fmt, io, path::PathBuf, str::Utf8Error};
 
 use omp_core::Str;
 use thiserror::Error as ThisError;
@@ -166,6 +166,94 @@ pub enum Error {
 	Protocol {
 		/// The protocol violation.
 		reason: Str,
+	},
+
+	/// A document worker task failed.
+	#[error("document worker failed")]
+	Worker {
+		/// The worker task failure.
+		#[source]
+		source: tokio::task::JoinError,
+	},
+
+	/// Retaining a hashline read snapshot failed.
+	#[error("could not retain hashline read snapshot")]
+	HashlineSnapshot {
+		/// The snapshot-store failure.
+		#[source]
+		source: omp_hashline::SnapshotStoreError,
+	},
+
+	/// A hashline edit payload was not UTF-8.
+	#[error("omp.hashline payload is not UTF-8")]
+	HashlinePayloadUtf8 {
+		/// The UTF-8 decoding failure.
+		#[source]
+		source: Utf8Error,
+	},
+
+	/// An `omp.replace` payload was malformed JSON.
+	#[error("malformed omp.replace payload JSON")]
+	ReplacePayloadJson {
+		/// The JSON decoding failure.
+		#[source]
+		source: serde_json::Error,
+	},
+
+	/// `omp.replace` options were malformed JSON.
+	#[error("malformed omp.replace options JSON")]
+	ReplaceOptionsJson {
+		/// The JSON decoding failure.
+		#[source]
+		source: serde_json::Error,
+	},
+
+	/// Hashline adapter options were malformed JSON.
+	#[error("malformed omp.hashline options JSON")]
+	HashlineOptionsJson {
+		/// The JSON decoding failure.
+		#[source]
+		source: serde_json::Error,
+	},
+
+	/// Applying an `omp.replace` edit failed.
+	#[error("omp.replace could not be applied")]
+	Replace {
+		/// The replacement failure.
+		#[source]
+		source: omp_hashline::ReplaceError,
+	},
+
+	/// Parsing an `omp.hashline` edit failed.
+	#[error("omp.hashline could not be applied")]
+	HashlineParse {
+		/// The hashline syntax failure.
+		#[source]
+		source: omp_hashline::ParseError,
+	},
+
+	/// Resolving an `omp.hashline` snapshot failed.
+	#[error("omp.hashline could not be applied")]
+	HashlineLookup {
+		/// The snapshot lookup failure.
+		#[source]
+		source: Box<omp_hashline::SnapshotLookupError>,
+	},
+
+	/// Applying an `omp.hashline` patch failed.
+	#[error("omp.hashline could not be applied")]
+	HashlineApply {
+		/// The patch application failure.
+		#[source]
+		source: omp_hashline::ApplyError,
+	},
+
+	/// Recovering an `omp.hashline` edit failed.
+	#[error("omp.hashline could not be applied")]
+	HashlineRecovery {
+		/// The edit recovery failure.
+		#[source]
+		source: omp_hashline::RecoveryError,
 	},
 
 	/// A local filesystem operation failed.

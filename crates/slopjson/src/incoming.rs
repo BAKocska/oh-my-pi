@@ -1557,6 +1557,8 @@ impl fmt::Debug for IncomingJson<'_> {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]

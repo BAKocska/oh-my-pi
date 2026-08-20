@@ -16,6 +16,8 @@ pub struct Countdown {
 	props:    Props,
 	slot:     Slot,
 	label:    Str,
+	text:     Str,
+	shown:    u64,
 	started:  Duration,
 	duration: Duration,
 }
@@ -24,7 +26,11 @@ impl Countdown {
 	/// Creates a countdown beginning at presentation time `started`.
 	#[must_use]
 	pub fn new(label: impl IntoStr, started: Duration, duration: Duration) -> Self {
-		Self { props: Props::new(), slot: next_slot(), label: label.into_str(), started, duration }
+		let label = label.into_str();
+		let millis = duration.as_millis();
+		let shown = u64::try_from(millis.saturating_add(999) / 1000).unwrap_or(u64::MAX);
+		let text = sf!("{} · {shown}s", label);
+		Self { props: Props::new(), slot: next_slot(), label, text, shown, started, duration }
 	}
 
 	/// Returns the remaining whole seconds, rounding a partial second up.
@@ -72,14 +78,17 @@ impl Component for Countdown {
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		let remaining = self.remaining(pc.ctx.now);
-		let text = sf!("{} · {remaining}s", self.label);
+		if remaining != self.shown {
+			self.shown = remaining;
+			self.text = sf!("{} · {remaining}s", self.label);
+		}
 		let color = if remaining <= 5 {
 			pc.ctx.theme.err
 		} else {
 			pc.ctx.theme.warn
 		};
 		pc.frame
-			.put(rect.x, rect.y, &text, self.props.style(&pc.ctx.theme).fg(color));
+			.put(rect.x, rect.y, &self.text, self.props.style(&pc.ctx.theme).fg(color));
 	}
 }
 

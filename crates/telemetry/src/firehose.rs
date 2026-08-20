@@ -687,6 +687,8 @@ impl Drop for SubscriptionHandle {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	fn event(turn: u64) -> Arc<Event> {

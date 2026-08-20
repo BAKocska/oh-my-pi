@@ -1137,6 +1137,8 @@ pub struct NativeResponse {
 #[cfg(test)]
 mod tests {
 
+	use omp_core::sf;
+
 	use super::*;
 	use crate::{
 		catalog::OperationKind,

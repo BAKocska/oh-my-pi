@@ -2534,8 +2534,8 @@ fn random_id_bytes() -> [u8; 16] {
 	rand::rng().random()
 }
 
-fn join_error(error: tokio::task::JoinError) -> Error {
-	Error::Protocol { reason: sf!("document worker failed: {error}") }
+fn join_error(source: tokio::task::JoinError) -> Error {
+	Error::Worker { source }
 }
 
 const fn actor_unavailable() -> Error {

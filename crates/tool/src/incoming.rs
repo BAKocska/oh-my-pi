@@ -1132,6 +1132,7 @@ fn commit_param_error(error: CommitError) -> ParamError {
 
 fn param_commit_error(error: ParamError) -> CommitError {
 	match error {
+		ParamError::Args(issue) if issue.kind == ArgIssueKind::Aborted => CommitError::Aborted,
 		ParamError::Args(_) => {
 			CommitError::Protocol(sf!("argument finalization failed before authorization"))
 		},

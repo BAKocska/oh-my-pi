@@ -26,17 +26,17 @@ const FILE_TYPE_FIFO: u32 = 0o010000;
 
 #[derive(Clone, Copy)]
 struct Header {
-	len:         usize,
-	alignment:   u64,
-	inode:       u32,
-	mode:        u32,
-	nlink:       u32,
-	mtime:       u32,
-	file_size:   u32,
-	dev_major:   u32,
-	dev_minor:   u32,
-	name_size:   u32,
-	checksum:    Option<u32>,
+	len:       usize,
+	alignment: u64,
+	inode:     u32,
+	mode:      u32,
+	nlink:     u32,
+	mtime:     u32,
+	file_size: u32,
+	dev_major: u32,
+	dev_minor: u32,
+	name_size: u32,
+	checksum:  Option<u32>,
 }
 
 struct Record {
@@ -407,17 +407,17 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
 		};
 		let words32 = |offset: usize| u32::from(word(offset)) << 16 | u32::from(word(offset + 2));
 		return Ok(Header {
-			len:         BINARY_HEADER_SIZE,
-			alignment:   2,
-			dev_major:   0,
-			dev_minor:   u32::from(word(2)),
-			inode:       u32::from(word(4)),
-			mode:        u32::from(word(6)),
-			nlink:       u32::from(word(12)),
-			mtime:       words32(16),
-			name_size:   u32::from(word(20)),
-			file_size:   words32(22),
-			checksum:    None,
+			len:       BINARY_HEADER_SIZE,
+			alignment: 2,
+			dev_major: 0,
+			dev_minor: u32::from(word(2)),
+			inode:     u32::from(word(4)),
+			mode:      u32::from(word(6)),
+			nlink:     u32::from(word(12)),
+			mtime:     words32(16),
+			name_size: u32::from(word(20)),
+			file_size: words32(22),
+			checksum:  None,
 		});
 	}
 	if bytes.len() < 6 {
@@ -433,17 +433,17 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
 			return Err(Error::InvalidArchive("newc CPIO checksum field is non-zero"));
 		}
 		return Ok(Header {
-			len:         NEWC_HEADER_SIZE,
-			alignment:   4,
-			inode:       field(0)?,
-			mode:        field(1)?,
-			nlink:       field(4)?,
-			mtime:       field(5)?,
-			file_size:   field(6)?,
-			dev_major:   field(7)?,
-			dev_minor:   field(8)?,
-			name_size:   field(11)?,
-			checksum:    (&bytes[..6] == b"070702").then_some(checksum),
+			len:       NEWC_HEADER_SIZE,
+			alignment: 4,
+			inode:     field(0)?,
+			mode:      field(1)?,
+			nlink:     field(4)?,
+			mtime:     field(5)?,
+			file_size: field(6)?,
+			dev_major: field(7)?,
+			dev_minor: field(8)?,
+			name_size: field(11)?,
+			checksum:  (&bytes[..6] == b"070702").then_some(checksum),
 		});
 	}
 	if &bytes[..6] == b"070707" {
@@ -451,17 +451,17 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
 			return Err(Error::InvalidArchive("truncated portable-ASCII CPIO header"));
 		}
 		return Ok(Header {
-			len:         ODC_HEADER_SIZE,
-			alignment:   1,
-			dev_major:   0,
-			dev_minor:   parse_digits(&bytes[6..12], 8)?,
-			inode:       parse_digits(&bytes[12..18], 8)?,
-			mode:        parse_digits(&bytes[18..24], 8)?,
-			nlink:       parse_digits(&bytes[36..42], 8)?,
-			mtime:       parse_digits(&bytes[48..59], 8)?,
-			name_size:   parse_digits(&bytes[59..65], 8)?,
-			file_size:   parse_digits(&bytes[65..76], 8)?,
-			checksum:    None,
+			len:       ODC_HEADER_SIZE,
+			alignment: 1,
+			dev_major: 0,
+			dev_minor: parse_digits(&bytes[6..12], 8)?,
+			inode:     parse_digits(&bytes[12..18], 8)?,
+			mode:      parse_digits(&bytes[18..24], 8)?,
+			nlink:     parse_digits(&bytes[36..42], 8)?,
+			mtime:     parse_digits(&bytes[48..59], 8)?,
+			name_size: parse_digits(&bytes[59..65], 8)?,
+			file_size: parse_digits(&bytes[65..76], 8)?,
+			checksum:  None,
 		});
 	}
 	Err(Error::InvalidArchive("unsupported or corrupt CPIO magic"))

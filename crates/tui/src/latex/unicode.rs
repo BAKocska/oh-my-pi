@@ -1271,7 +1271,7 @@ pub fn resolve_color(spec: &str) -> Option<Color> {
 	Some(Color::Rgb(rgb.0, rgb.1, rgb.2))
 }
 
-fn resolve_latex_color(model: Option<&str>, spec: &str) -> Option<Color> {
+pub(super) fn resolve_latex_color(model: Option<&str>, spec: &str) -> Option<Color> {
 	let unescaped = unescape_text(spec);
 	let spec = unescaped.trim();
 	if spec.is_empty() {
@@ -2171,6 +2171,11 @@ fn unescape_text(text: &str) -> String {
 
 /// Converts one-dimensional LaTeX math to a flat styled row. Total: degrades
 /// gracefully, never fails.
+pub(super) fn latex_superscript_row(expr: &str, base: Style) -> Row {
+	let row = latex_row(expr, base);
+	script_or_fallback(&row, true, base, true)
+}
+
 pub(super) fn latex_row(expr: &str, base: Style) -> Row {
 	if expr.is_empty() {
 		return Row::new();

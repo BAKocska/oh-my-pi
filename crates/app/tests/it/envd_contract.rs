@@ -1809,7 +1809,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		.await
 		.expect("first cancellable argument fragment");
 	cancelled
-		.arg_text(sf!(r#"th":"cancel"}"#))
+		.arg_text(sf!(r#"th":"cancel"}}"#))
 		.await
 		.expect("second cancellable argument fragment");
 	let update = tokio::time::timeout(Duration::from_secs(1), cancelled.next_event())
@@ -1870,7 +1870,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		.await
 		.expect("first committed argument fragment");
 	committed
-		.arg_text(sf!(r#"itted"}"#))
+		.arg_text(sf!(r#"itted"}}"#))
 		.await
 		.expect("second committed argument fragment");
 	assert!(matches!(

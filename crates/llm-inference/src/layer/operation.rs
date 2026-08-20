@@ -14,6 +14,7 @@ use crate::{
 	error::Error,
 	layer::LayerCall,
 	operation::{
+		MediaOperationError,
 		embedding::{
 			EmbeddingServiceConfig, normalize_vector, plan_embedding, validate_embedding_batch,
 		},
@@ -164,7 +165,7 @@ fn prepare(
 	let execution = request.payload.execution.as_ref().ok_or_else(|| {
 		crate::operation::media_validation_error(
 			request.payload.operation.kind(),
-			"operation_policy_requires_execution_plan",
+			MediaOperationError::OperationPolicyRequiresExecutionPlan,
 		)
 	})?;
 	if execution.operation != request.payload.operation.kind() {
@@ -180,7 +181,7 @@ fn prepare(
 			let Some(route_policy) = config.embedding else {
 				return Err(crate::operation::media_validation_error(
 					request.payload.operation.kind(),
-					"embedding_policy_not_constructed",
+					MediaOperationError::EmbeddingPolicyNotConstructed,
 				));
 			};
 			let capabilities = execution
@@ -190,7 +191,7 @@ fn prepare(
 				.ok_or_else(|| {
 					crate::operation::media_validation_error(
 						request.payload.operation.kind(),
-						"selected_model_has_no_embedding_capabilities",
+						MediaOperationError::SelectedModelHasNoEmbeddingCapabilities,
 					)
 				})?;
 			let embedding = EmbeddingServiceConfig {
@@ -203,7 +204,7 @@ fn prepare(
 				.ok_or_else(|| {
 					crate::operation::media_validation_error(
 						request.payload.operation.kind(),
-						"zero_embedding_batch_capacity",
+						MediaOperationError::ZeroEmbeddingBatchCapacity,
 					)
 				})?;
 			let plan = plan_embedding(embed, &embedding, maximum)?;
@@ -212,7 +213,7 @@ fn prepare(
 			{
 				return Err(crate::operation::media_validation_error(
 					request.payload.operation.kind(),
-					"one_shot_embedding_cannot_open_multiple_batches",
+					MediaOperationError::OneShotEmbeddingCannotOpenMultipleBatches,
 				));
 			}
 			embedding_normalize = plan.normalize_locally;
@@ -230,7 +231,7 @@ fn prepare(
 				.ok_or_else(|| {
 					crate::operation::media_validation_error(
 						request.payload.operation.kind(),
-						"selected_model_has_no_search_capabilities",
+						MediaOperationError::SelectedModelHasNoSearchCapabilities,
 					)
 				})?;
 			let plan = plan_search(search_request, capabilities, execution.planned_at)?;
@@ -244,20 +245,20 @@ fn prepare(
 		{
 			return Err(crate::operation::media_validation_error(
 				request.payload.operation.kind(),
-				"exact_token_count_not_constructed",
+				MediaOperationError::ExactTokenCountNotConstructed,
 			));
 		},
 		OperationCall::DiscoverModels(discovery) => {
 			let Some(maximum) = config.discovery_maximum_page else {
 				return Err(crate::operation::media_validation_error(
 					request.payload.operation.kind(),
-					"discovery_policy_not_constructed",
+					MediaOperationError::DiscoveryPolicyNotConstructed,
 				));
 			};
 			if discovery.page_size == 0 || discovery.page_size > maximum.get() {
 				return Err(crate::operation::media_validation_error(
 					request.payload.operation.kind(),
-					"invalid_discovery_page_size",
+					MediaOperationError::InvalidDiscoveryPageSize,
 				));
 			}
 		},
@@ -265,7 +266,7 @@ fn prepare(
 			let Some(policy) = &config.native else {
 				return Err(crate::operation::media_validation_error(
 					request.payload.operation.kind(),
-					"native_policy_not_constructed",
+					MediaOperationError::NativePolicyNotConstructed,
 				));
 			};
 			policy.authorize(native)?;
@@ -285,7 +286,7 @@ fn merge_embedding_answer(target: &mut Answer, next: Answer) -> Result<(), Error
 	{
 		return Err(crate::operation::media_protocol_error(
 			crate::catalog::OperationKind::Embed,
-			"embedding_batch_route_changed",
+			MediaOperationError::EmbeddingBatchRouteChanged,
 		));
 	}
 	let target_kind = target.body.kind();
@@ -307,7 +308,7 @@ fn merge_embedding_answer(target: &mut Answer, next: Answer) -> Result<(), Error
 	if target_batch.dimensions != next_batch.dimensions {
 		return Err(crate::operation::media_protocol_error(
 			crate::catalog::OperationKind::Embed,
-			"embedding_page_dimensions_changed",
+			MediaOperationError::EmbeddingPageDimensionsChanged,
 		));
 	}
 	let offset = target_batch.embeddings.len() as u32;
@@ -331,7 +332,7 @@ fn finish(
 			if request.accuracy == CountAccuracy::Exact && !count.provenance.exact {
 				return Err(crate::operation::media_protocol_error(
 					operation.kind(),
-					"exact_token_count_returned_estimate",
+					MediaOperationError::ExactTokenCountReturnedEstimate,
 				));
 			}
 		},
@@ -340,7 +341,7 @@ fn finish(
 			if !sequence.provenance.exact {
 				return Err(crate::operation::media_protocol_error(
 					operation.kind(),
-					"tokenize_returned_estimate",
+					MediaOperationError::TokenizeReturnedEstimate,
 				));
 			}
 		},
@@ -349,7 +350,7 @@ fn finish(
 			if !text.provenance.exact {
 				return Err(crate::operation::media_protocol_error(
 					operation.kind(),
-					"detokenize_returned_estimate",
+					MediaOperationError::DetokenizeReturnedEstimate,
 				));
 			}
 		},
@@ -360,7 +361,7 @@ fn finish(
 			{
 				return Err(crate::operation::media_protocol_error(
 					operation.kind(),
-					"required_embedding_dimensions_not_returned",
+					MediaOperationError::RequiredEmbeddingDimensionsNotReturned,
 				));
 			}
 			batch.embeddings.sort_by_key(|embedding| embedding.index);
@@ -430,7 +431,7 @@ fn validate_discovery_page(
 	{
 		return Err(crate::operation::media_protocol_error(
 			crate::catalog::OperationKind::DiscoverModels,
-			"invalid_normalized_discovery_page",
+			MediaOperationError::InvalidNormalizedDiscoveryPage,
 		));
 	}
 	if let Some(operation) = request.operation
@@ -441,7 +442,7 @@ fn validate_discovery_page(
 	{
 		return Err(crate::operation::media_protocol_error(
 			crate::catalog::OperationKind::DiscoverModels,
-			"discovery_page_contains_unrequested_operation",
+			MediaOperationError::DiscoveryPageContainsUnrequestedOperation,
 		));
 	}
 	Ok(())

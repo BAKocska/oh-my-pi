@@ -3,7 +3,7 @@
 use std::{io::Cursor, path::Path, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation},
 	policy::v1::{BashIr, EffectEnvelope, PolicyDenied},
@@ -294,7 +294,7 @@ mod tests {
 	use std::{path::Path, time::Duration};
 
 	use bytes::Bytes;
-	use omp_core::Str;
+	use omp_core::sf;
 	use omp_proto::policy::v1::{EffectEnvelope, ExecEffects};
 	use omp_tool::{Effects, ExecEffects as ToolExecEffects};
 

@@ -2,7 +2,6 @@
 
 use std::{
 	collections::BTreeMap,
-	fmt,
 	sync::{
 		Arc, OnceLock,
 		atomic::{AtomicBool, AtomicU8, AtomicU128, Ordering},
@@ -161,34 +160,26 @@ fn bool_value(value: bool) -> value_pb::Value {
 }
 
 /// Failure to open, relay, decode, project, or lower a tool invocation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BatchError {
 	/// The environment channel rejected an operation.
-	Environment(ClientError),
+	#[error("environment invocation failed: {0}")]
+	Environment(#[source] ClientError),
 	/// A terminal environment payload was not a supported structured outcome.
-	InvalidOutcome(serde_json::Error),
+	#[error("invalid tool outcome: {0}")]
+	InvalidOutcome(#[source] serde_json::Error),
 	/// Canonical result construction failed.
+	#[error("canonical tool result failed: {0}")]
 	Projection(Str),
-}
-
-impl fmt::Display for BatchError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Environment(error) => write!(formatter, "environment invocation failed: {error}"),
-			Self::InvalidOutcome(error) => write!(formatter, "invalid tool outcome: {error}"),
-			Self::Projection(error) => write!(formatter, "canonical tool result failed: {error}"),
-		}
-	}
-}
-
-impl std::error::Error for BatchError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		match self {
-			Self::Environment(error) => Some(error),
-			Self::InvalidOutcome(error) => Some(error),
-			Self::Projection(_) => None,
-		}
-	}
+	/// The invocation hook bus was already installed.
+	#[error("canonical tool result failed: invocation hook bus already set")]
+	HookBusAlreadySet,
+	/// The invocation effect maximum was already installed.
+	#[error("canonical tool result failed: invocation effect maximum already set")]
+	EffectMaximumAlreadySet,
+	/// The invocation fact bus was already installed.
+	#[error("canonical tool result failed: invocation fact bus already set")]
+	FactBusAlreadySet,
 }
 
 impl From<ClientError> for BatchError {
@@ -779,15 +770,15 @@ impl SpeculativeCall {
 		pump
 			.hooks
 			.set(hooks)
-			.map_err(|_| BatchError::Projection(sf!("invocation hook bus already set")))?;
+			.map_err(|_| BatchError::HookBusAlreadySet)?;
 		pump
 			.maximum_effects
 			.set(maximum_effects)
-			.map_err(|_| BatchError::Projection(sf!("invocation effect maximum already set")))?;
+			.map_err(|_| BatchError::EffectMaximumAlreadySet)?;
 		pump
 			.facts
 			.set(facts)
-			.map_err(|_| BatchError::Projection(sf!("invocation fact bus already set")))?;
+			.map_err(|_| BatchError::FactBusAlreadySet)?;
 		pump.maximum_ready.notify_one();
 		Ok(())
 	}

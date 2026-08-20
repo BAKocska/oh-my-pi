@@ -696,8 +696,6 @@ const fn emulation_is_lossless(method: Emulation) -> bool {
 mod tests {
 	use std::time::{Duration, Instant};
 
-	
-
 	use super::*;
 	use crate::{
 		catalog::{CatalogRevision, CodecId, Emulation, RouteId},

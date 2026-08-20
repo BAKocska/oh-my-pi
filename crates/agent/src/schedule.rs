@@ -198,9 +198,12 @@ pub enum ScheduleError {
 	/// A project spawn lacks the mandatory hard schedule budget.
 	#[error("project-scoped spawn schedules require ScheduleBudget")]
 	MissingProjectBudget,
-	/// A trigger is invalid or too small for durable scheduling.
-	#[error("invalid schedule trigger: {0}")]
-	InvalidTrigger(Str),
+	/// A requested schedule is not declared.
+	#[error("invalid schedule trigger: unknown schedule")]
+	UnknownSchedule,
+	/// An every trigger has a zero interval.
+	#[error("invalid schedule trigger: Every interval is zero")]
+	ZeroInterval,
 	/// A firing would spend outside an installed hard budget.
 	#[error("schedule budget refused the firing")]
 	BudgetRefused,
@@ -270,7 +273,7 @@ impl Scheduler {
 	{
 		let schedule = self
 			.schedule(schedule_id)
-			.ok_or_else(|| ScheduleError::InvalidTrigger(sf!("unknown schedule")))?;
+			.ok_or_else(|| ScheduleError::UnknownSchedule)?;
 		let key = firing_key(schedule.id.as_str(), at_ms);
 		let mut firing = Firing {
 			schedule_id: schedule.id.clone(),
@@ -340,7 +343,7 @@ fn validate(schedule: &Schedule) -> Result<(), ScheduleError> {
 	if let Trigger::Every { interval, .. } = &schedule.trigger
 		&& interval.is_zero()
 	{
-		return Err(ScheduleError::InvalidTrigger(sf!("Every interval is zero")));
+		return Err(ScheduleError::ZeroInterval);
 	}
 	Ok(())
 }

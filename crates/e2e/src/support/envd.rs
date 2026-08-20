@@ -10,7 +10,6 @@ use std::{
 use anyhow::{Context as _, Result};
 use bytes::BytesMut;
 use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
-use omp_core::sf;
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
 use omp_proto::{
 	SCHEMA_REV,

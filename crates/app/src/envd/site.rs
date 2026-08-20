@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_proto::env::v1 as pb;
 use omp_storage::blob::{BlobRef, BlobStore};
 use serde::{Deserialize, Serialize};
@@ -420,7 +420,7 @@ fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use omp_core::Str;
+	use omp_core::sf;
 	use omp_storage::blob::BlobStore;
 
 	use super::{OwnershipMap, SiteError};

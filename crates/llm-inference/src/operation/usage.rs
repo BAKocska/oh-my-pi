@@ -677,7 +677,7 @@ fn protocol_error(reason: &'static str) -> Error {
 mod tests {
 	use std::time::{Duration, UNIX_EPOCH};
 
-	
+	use omp_core::sf;
 
 	use super::{UsageServiceConfig, normalize_report, report_from_account_state};
 	use crate::{

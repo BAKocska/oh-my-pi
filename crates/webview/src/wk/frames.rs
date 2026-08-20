@@ -128,6 +128,12 @@ const DIRTY_SCRIPT: &str =
 	 ['scroll','input','pointermove','pointerdown','keydown','wheel','transitionrun','\
 	 animationstart','load','resize'])addEventListener(ev,mark,{capture:true,passive:true})})();";
 
+/// Invariant wheel-event setup surrounding the event coordinates and deltas.
+const SCROLL_EVENT_TEMPLATE: &str =
+	"||document.documentElement;if(t.dispatchEvent(new WheelEvent('wheel',{clientX:";
+/// Invariant wheel-event tail and default scrolling action.
+const SCROLL_ACTION_TEMPLATE: &str = ",bubbles:true,cancelable:true})))window.scrollBy(";
+
 /// Idle safety-net poll period for the snapshot path, catching silent changes
 /// (canvas, WebGL, video) that fire no DOM events; one damaged capture
 /// re-arms full rate. Mirrors the firefox backend.
@@ -687,12 +693,12 @@ impl WkFrames {
 				self.send_mouse(kind, x, y, 1, 0.0)?;
 			},
 			Input::Scroll { x, y, dx, dy } => {
+				// Scroll is one event per host gesture update. Keep all dynamic
+				// values in one format pass; pointer movement takes a different path.
 				let js = sf!(
 					"(()=>{{const \
-					 t=document.elementFromPoint({x},{y})||document.documentElement;if(t.\
-					 dispatchEvent(new \
-					 WheelEvent('wheel',{{clientX:{x},clientY:{y},deltaX:{dx},deltaY:{dy},bubbles:true,\
-					 cancelable:true}})))window.scrollBy({dx},{dy})}})()"
+					 t=document.elementFromPoint({x},{y}){SCROLL_EVENT_TEMPLATE}{x},clientY:{y},deltaX:\
+					 {dx},deltaY:{dy}{SCROLL_ACTION_TEMPLATE}{dx},{dy})}})()"
 				);
 				super::eval(&self.webview, &js, None);
 			},
@@ -843,7 +849,7 @@ fn key_params(key: Key) -> (u16, Str) {
 	/// `kVK_F1..kVK_F12` in order.
 	const F_CODES: [u16; 12] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111];
 	match key {
-		Key::Char(c) => (0, sf!("{c}")),
+		Key::Char(c) => (0, char_str(c)),
 		Key::Enter => (36, Str::new("\r")),
 		Key::Tab => (48, Str::new("\t")),
 		Key::Backspace => (51, Str::new("\u{7f}")),
@@ -860,11 +866,17 @@ fn key_params(key: Key) -> (u16, Str) {
 		Key::F(n) => {
 			let index = usize::from(n.clamp(1, 12) - 1);
 			let chars = char::from_u32(0xf704 + u32::from(n.clamp(1, 12)) - 1)
-				.map(|c| sf!("{c}"))
+				.map(char_str)
 				.unwrap_or_default();
 			(F_CODES[index], chars)
 		},
 	}
+}
+
+/// Convert one character to inline `Str` storage without invoking a formatter.
+fn char_str(c: char) -> Str {
+	let mut buf = [0; 4];
+	Str::new(c.encode_utf8(&mut buf))
 }
 
 /// Everything the deferred capture start needs, captured by the arming hook.

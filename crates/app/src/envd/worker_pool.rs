@@ -11,7 +11,7 @@ use std::{
 };
 
 use flume::{Receiver, Sender};
-use omp_core::{CowBytes, Str, sf};
+use omp_core::{CowBytes, Str};
 use omp_env::WorkerLease;
 use omp_proto::env::v1::WorkerData;
 use omp_storage::blob::BlobStore;
@@ -404,6 +404,8 @@ fn reserve(counter: &AtomicU64, limit: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]

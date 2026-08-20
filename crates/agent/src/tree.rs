@@ -10,7 +10,7 @@ use std::{
 	time::Instant,
 };
 
-use omp_core::{AppendVec, InvocationPhase, Str, sf};
+use omp_core::{AppendVec, InvocationPhase, Str};
 use omp_llm_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -357,7 +357,7 @@ pub enum AgentDefinitionError {
 	MissingFrontmatter,
 	/// A supported field had an invalid value.
 	#[error("invalid agent frontmatter field {0}")]
-	InvalidField(Str),
+	InvalidField(&'static str),
 }
 
 impl AgentDefinition {
@@ -387,12 +387,12 @@ impl AgentDefinition {
 				continue;
 			}
 			let Some((key, value)) = line.split_once(':') else {
-				return Err(AgentDefinitionError::InvalidField(Str::new(line)));
+				return Err(AgentDefinitionError::InvalidField("frontmatter"));
 			};
 			let value = value.trim();
 			match key.trim() {
 				"description" => description = Str::new(unquote(value)),
-				"tools" => tools = parse_string_list(value)?.into_boxed_slice(),
+				"tools" => tools = parse_string_list("tools", value)?.into_boxed_slice(),
 				"spawns" => spawns = parse_spawn_policy(value)?,
 				"model" if !value.is_empty() => model = Some(Str::new(unquote(value))),
 				"thinkingLevel" | "thinking_level" if !value.is_empty() => {
@@ -400,7 +400,7 @@ impl AgentDefinition {
 				},
 				"blocking" => {
 					blocking = parse_bool(value)
-						.ok_or_else(|| AgentDefinitionError::InvalidField(sf!("blocking")))?;
+						.ok_or_else(|| AgentDefinitionError::InvalidField("blocking"))?;
 				},
 				_ => {},
 			}
@@ -433,7 +433,7 @@ fn parse_spawn_policy(value: &str) -> Result<SpawnPolicy, AgentDefinitionError> 
 		"*" | "true" => Ok(SpawnPolicy::Any),
 		"" | "false" => Ok(SpawnPolicy::Disabled),
 		_ => {
-			let allowed = parse_string_list(value)?;
+			let allowed = parse_string_list("spawns", value)?;
 			if allowed.is_empty() {
 				Ok(SpawnPolicy::Disabled)
 			} else {
@@ -443,7 +443,7 @@ fn parse_spawn_policy(value: &str) -> Result<SpawnPolicy, AgentDefinitionError> 
 	}
 }
 
-fn parse_string_list(value: &str) -> Result<Vec<Str>, AgentDefinitionError> {
+fn parse_string_list(field: &'static str, value: &str) -> Result<Vec<Str>, AgentDefinitionError> {
 	let value = value.trim();
 	let value = value
 		.strip_prefix('[')
@@ -458,7 +458,7 @@ fn parse_string_list(value: &str) -> Result<Vec<Str>, AgentDefinitionError> {
 		.filter(|part| !part.is_empty())
 		.collect::<Vec<_>>();
 	if values.is_empty() {
-		Err(AgentDefinitionError::InvalidField(Str::new(value)))
+		Err(AgentDefinitionError::InvalidField(field))
 	} else {
 		Ok(values)
 	}

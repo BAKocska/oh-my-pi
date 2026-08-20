@@ -665,7 +665,6 @@ const fn event_bit(event: HookEventId) -> u64 {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use omp_core::Str;
 	use omp_proto::toolhost::v1::HookEventId;
 
 	use super::{

@@ -1,5 +1,7 @@
 //! Provider-scoped model hub backed exclusively by host-supplied catalog rows.
 
+use std::fmt::{self, Write as _};
+
 use omp_core::{Str, StrMut, sf};
 use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent,
@@ -392,38 +394,32 @@ fn build(
 
 fn facts(row: &ModelRow) -> Str {
 	let mut line = StrMut::with_capacity(96);
-	push_fact(
-		&mut line,
-		if row.name.is_empty() {
-			&row.key
-		} else {
-			&row.name
-		},
-	);
-	push_fact(&mut line, &row.provider);
+	let name = if row.name.is_empty() {
+		&row.key
+	} else {
+		&row.name
+	};
+	push_fact(&mut line, format_args!("{name}"));
+	push_fact(&mut line, format_args!("{}", row.provider));
 	if let Some(context) = row.context {
-		push_fact(&mut line, &sf!("{} context", compact_count(context)));
+		push_fact(&mut line, format_args!("{} context", compact_count(context)));
 	}
-	if let Some(price) = price(row) {
-		push_fact(&mut line, &sf!("{price} per Mtok"));
+	match (row.input_mtok, row.output_mtok) {
+		(Some(input), Some(output)) => {
+			push_fact(&mut line, format_args!("${input}/${output} per Mtok"));
+		},
+		(Some(input), None) => push_fact(&mut line, format_args!("${input} in per Mtok")),
+		(None, Some(output)) => push_fact(&mut line, format_args!("${output} out per Mtok")),
+		(None, None) => {},
 	}
 	line.freeze()
 }
 
-fn price(row: &ModelRow) -> Option<Str> {
-	match (row.input_mtok, row.output_mtok) {
-		(Some(input), Some(output)) => Some(sf!("${input}/${output}")),
-		(Some(input), None) => Some(sf!("${input} in")),
-		(None, Some(output)) => Some(sf!("${output} out")),
-		(None, None) => None,
-	}
-}
-
-fn push_fact(line: &mut StrMut, text: &str) {
+fn push_fact(line: &mut StrMut, fact: fmt::Arguments<'_>) {
 	if !line.is_empty() {
 		line.push_str(" · ");
 	}
-	line.push_str(text);
+	let _ = write!(line, "{fact}");
 }
 
 fn compact_count(value: u64) -> Str {

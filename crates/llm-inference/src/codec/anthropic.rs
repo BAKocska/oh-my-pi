@@ -7,6 +7,7 @@ use omp_llm_catalog::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
+use strum::IntoStaticStr;
 
 use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
@@ -38,13 +39,16 @@ pub const BEDROCK_VERSION: &str = "bedrock-2023-05-31";
 pub const DIRECT_PATH: &str = "/v1/messages";
 
 /// Anthropic Messages hosting envelope.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
 pub enum AnthropicAdapter {
 	/// Anthropic's direct Messages API.
+	#[strum(serialize = "2023-06-01")]
 	Direct,
 	/// Anthropic Messages hosted by Google Vertex `rawPredict`.
+	#[strum(serialize = "vertex-2023-10-16")]
 	Vertex,
 	/// Anthropic Messages hosted by Amazon Bedrock `InvokeModel`.
+	#[strum(serialize = "bedrock-2023-05-31")]
 	Bedrock,
 }
 
@@ -672,11 +676,7 @@ pub fn project(
 		AnthropicAdapter::Vertex | AnthropicAdapter::Bedrock => {
 			intent.body.model = None;
 			intent.body.stream = false;
-			intent.body.anthropic_version = Some(sf!(match adapter {
-				AnthropicAdapter::Vertex => VERTEX_VERSION,
-				AnthropicAdapter::Bedrock => BEDROCK_VERSION,
-				AnthropicAdapter::Direct => unreachable!(),
-			}));
+			intent.body.anthropic_version = Some(sf!(<&'static str>::from(adapter)));
 			intent.body.anthropic_beta = intent.betas.0;
 			serialize_body(&intent.body).map(|body| ProjectedMessages {
 				body,
@@ -1025,10 +1025,9 @@ fn lower_thinking(
 	if selection.effort == ThinkingEffort::Off {
 		return (!selection.suppress_when_off).then_some(Thinking::Disabled);
 	}
-	let display = setting_value(request).and_then(|reasoning| match reasoning.visibility {
-		ReasoningVisibility::Hidden => Some(sf!("omitted")),
-		ReasoningVisibility::Summary => Some(sf!("summarized")),
-		ReasoningVisibility::Visible => None,
+	let display = setting_value(request).and_then(|reasoning| {
+		(reasoning.visibility != ReasoningVisibility::Visible)
+			.then(|| sf!(<&'static str>::from(reasoning.visibility)))
 	});
 	if let Some(tokens) = selection.budget {
 		Some(Thinking::Enabled { budget_tokens: tokens, display })
@@ -1037,25 +1036,39 @@ fn lower_thinking(
 	}
 }
 
+#[derive(Clone, Copy, IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+enum AnthropicThinkingEffort {
+	Low,
+	Minimal,
+	Medium,
+	High,
+	Max,
+}
+
+const fn anthropic_thinking_effort(effort: ThinkingEffort) -> AnthropicThinkingEffort {
+	match effort {
+		ThinkingEffort::Off | ThinkingEffort::Low => AnthropicThinkingEffort::Low,
+		ThinkingEffort::Minimal => AnthropicThinkingEffort::Minimal,
+		ThinkingEffort::Medium => AnthropicThinkingEffort::Medium,
+		ThinkingEffort::High | ThinkingEffort::XHigh => AnthropicThinkingEffort::High,
+		ThinkingEffort::Max => AnthropicThinkingEffort::Max,
+	}
+}
+
 fn lower_output_config(
 	selection: Option<&ThinkingSelection>,
 	output: &Setting<StructuredOutput>,
 ) -> Result<Option<OutputConfig>, Error> {
-	let effort = selection.and_then(|selection| {
-		if selection.effort == ThinkingEffort::Off && selection.suppress_when_off {
-			return None;
-		}
-		Some(selection.native_effort.clone().unwrap_or_else(|| {
-			sf!(match selection.effort {
-				ThinkingEffort::Off => "low",
-				ThinkingEffort::Minimal => "minimal",
-				ThinkingEffort::Low => "low",
-				ThinkingEffort::Medium => "medium",
-				ThinkingEffort::High | ThinkingEffort::XHigh => "high",
-				ThinkingEffort::Max => "max",
-			})
-		}))
-	});
+	let effort =
+		selection.and_then(|selection| {
+			if selection.effort == ThinkingEffort::Off && selection.suppress_when_off {
+				return None;
+			}
+			Some(selection.native_effort.clone().unwrap_or_else(|| {
+				sf!(<&'static str>::from(anthropic_thinking_effort(selection.effort)))
+			}))
+		});
 	let format = match setting_value(output) {
 		None => None,
 		Some(StructuredOutput::JsonObject) => Some(

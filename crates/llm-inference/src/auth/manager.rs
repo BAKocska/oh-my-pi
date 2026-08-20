@@ -133,15 +133,13 @@ impl AuthLoginEngine for SecretLoginEngine {
 			let routes = provider.routes.iter().cloned().collect();
 			tokio::spawn(async move {
 				let result = async {
+					let prompt_message = match method {
+						AuthMethod::ApiKey => "Enter the API key",
+						_ => "Enter the session token",
+					};
 					let prompt = AuthPrompt {
-						id:      match method {
-							AuthMethod::ApiKey => sf!("api-key"),
-							_ => sf!("session-token"),
-						},
-						message: match method {
-							AuthMethod::ApiKey => sf!("Enter the API key"),
-							_ => sf!("Enter the session token"),
-						},
+						id:      sf!(<&'static str>::from(method)),
+						message: sf!(prompt_message),
 						input:   match method {
 							AuthMethod::ApiKey => AuthPromptKind::ApiKey,
 							_ => AuthPromptKind::SessionToken,

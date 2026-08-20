@@ -12,6 +12,7 @@ use omp_llm_catalog::{
 	provider::TrustDomain,
 };
 use serde::{Deserialize, Serialize};
+use strum::IntoStaticStr;
 
 use crate::{
 	account::AccountChangeEvidence,
@@ -208,30 +209,41 @@ pub struct BindingContext<'a> {
 }
 
 /// Deterministic reason canonical history must reseed provider-side state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
 pub enum ReseedReason {
 	/// No provider-side state has been captured yet.
+	#[strum(serialize = "FirstTurn")]
 	FirstTurn,
 	/// Execution moved to another conversation branch.
+	#[strum(serialize = "Fork")]
 	Fork,
 	/// Route selection changed.
+	#[strum(serialize = "RouteChanged")]
 	RouteChanged,
 	/// Model selection changed.
+	#[strum(serialize = "ModelChanged")]
 	ModelChanged,
 	/// Route trust configuration changed.
+	#[strum(serialize = "TrustDomainChanged")]
 	TrustDomainChanged,
 	/// Authenticated principal changed.
+	#[strum(serialize = "PrincipalChanged")]
 	PrincipalChanged,
 	/// Execution rotated to a different account, even if it represents the same
 	/// principal.
+	#[strum(serialize = "AccountChanged")]
 	AccountChanged,
 	/// Route policy binds state to a replaced credential generation.
+	#[strum(serialize = "CredentialGenerationChanged")]
 	CredentialGenerationChanged,
 	/// Provider-declared expiry elapsed.
+	#[strum(serialize = "ProviderExpired")]
 	ProviderExpired,
 	/// Caller maximum-age policy elapsed.
+	#[strum(serialize = "MaximumAgeExceeded")]
 	MaximumAgeExceeded,
 	/// Binding base is not an ancestor of the requested revision.
+	#[strum(serialize = "DivergedHistory")]
 	DivergedHistory,
 }
 

@@ -10,7 +10,6 @@ use std::{
 	time::SystemTime,
 };
 
-use omp_core::sf;
 use tower::Service;
 
 use crate::{
@@ -18,31 +17,44 @@ use crate::{
 	call::{OperationCall, RealtimeModality, RealtimeRequest},
 	catalog::OperationKind,
 	error::Error,
-	operation::{OperationRequest, OperationResponse, media_validation_error, wrong_operation},
+	operation::{
+		MediaOperationError, OperationRequest, OperationResponse, media_validation_error,
+		wrong_operation,
+	},
 };
 
 /// Realtime channel construction failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RealtimeSessionError {
 	/// Capacity must be non-zero.
+	#[error("realtime channel capacity is zero")]
 	ZeroCapacity,
 	/// The bounded outbound queue is full.
+	#[error("realtime outbound queue is full")]
 	Backpressure,
 	/// Provider input is disconnected.
+	#[error("realtime provider input is disconnected")]
 	OutboundClosed,
 	/// Provider output is disconnected.
+	#[error("realtime provider output is disconnected")]
 	InboundClosed,
 	/// Session was already closed.
+	#[error("realtime session is already closed")]
 	AlreadyClosed,
 	/// No realtime modality was requested.
+	#[error("realtime request has no modality")]
 	MissingModality,
 	/// A modality was requested more than once.
+	#[error("realtime request contains a duplicate modality")]
 	DuplicateModality,
 	/// Tool count exceeds the negotiated bound.
+	#[error("realtime tool count exceeds the negotiated bound")]
 	TooManyTools,
 	/// Initial instructions exceed the negotiated bound.
+	#[error("realtime instructions exceed the negotiated bound")]
 	InstructionsTooLarge,
 	/// A voice was selected without audio output.
+	#[error("realtime voice requires audio output")]
 	VoiceWithoutAudio,
 }
 
@@ -364,13 +376,13 @@ where
 				return Err(wrong_operation(&call, OperationKind::Realtime));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(OperationKind::Realtime, sf!("{error:?}")));
+				return Err(media_validation_error(OperationKind::Realtime, error));
 			}
 			let response = pending
 				.ok_or_else(|| {
 					media_validation_error(
 						OperationKind::Realtime,
-						sf!("realtime_request_not_dispatched"),
+						MediaOperationError::RealtimeRequestNotDispatched,
 					)
 				})?
 				.await?;

@@ -9,7 +9,7 @@ use omp_app::envd::{
 	},
 	worker::HostKey,
 };
-use omp_core::{Str, sf};
+use omp_core::sf;
 
 fn host() -> HostKey {
 	HostKey::new("workspace", "sandboxed", "dev.example.policy")

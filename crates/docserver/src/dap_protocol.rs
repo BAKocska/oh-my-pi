@@ -61,6 +61,13 @@ pub enum DapProtocolError {
 	/// A message violated DAP framing.
 	#[error("invalid DAP frame: {0}")]
 	InvalidFrame(Str),
+	/// Decoding a Content-Length-framed message failed.
+	#[error("invalid DAP frame")]
+	Frame {
+		/// The underlying frame decoding failure.
+		#[source]
+		source: crate::lsp_process::LspFrameError,
+	},
 	/// The adapter returned `success: false`.
 	#[error("DAP adapter rejected {command}: {message}")]
 	Adapter {
@@ -401,7 +408,7 @@ fn dispatch_message(
 async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Value, DapProtocolError> {
 	let body = crate::lsp_process::read_frame(reader, MAX_DAP_HEADER_BYTES, MAX_DAP_MESSAGE_BYTES)
 		.await
-		.map_err(DapProtocolError::InvalidFrame)?;
+		.map_err(|source| DapProtocolError::Frame { source })?;
 	Ok(serde_json::from_slice(&body)?)
 }
 

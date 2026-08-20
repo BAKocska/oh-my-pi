@@ -533,7 +533,7 @@ impl ConversationSessionPlanner {
 						receipt.recoveries.push(RecoveryRecord {
 							attempt:     context.attempts(),
 							kind:        RecoveryKind::SessionReseed,
-							rule:        ReasonId(sf!("{reseed_reason:?}")),
+							rule:        ReasonId(sf!(<&'static str>::from(reseed_reason))),
 							input_bytes: 0,
 							steps:       1,
 						});
@@ -968,7 +968,7 @@ mod tests {
 	};
 
 	use bytes::Bytes;
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 	use omp_llm_catalog::{
 		OperationKind,
 		id::{CodecId, ModelKey, ProviderId, RouteId},

@@ -8,6 +8,10 @@
 //! this boundary. [`Agent`] is the durable policy loop tying these foundations
 //! into complete N-turn conversations.
 
+#[allow(unused_imports)]
+#[macro_use]
+extern crate omp_core;
+
 mod approvals;
 mod batch;
 mod broker;

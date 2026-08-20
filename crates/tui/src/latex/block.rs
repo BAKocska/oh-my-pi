@@ -4,10 +4,12 @@
 //! TeX Math — by @thatmagicalcat (<https://github.com/thatmagicalcat/txm>,
 //! MIT/Apache-2.0), reimplemented for styled terminal segments.
 
-use omp_core::{IntoStr, Str, StrMut, sf};
+use omp_core::{IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 
-use super::unicode::{MathFont, Row, apply_math_font, latex_row, math_font, resolve_color};
+use super::unicode::{
+	MathFont, Row, apply_math_font, latex_row, latex_superscript_row, math_font, resolve_latex_color,
+};
 #[cfg(test)]
 use crate::rich::RichText;
 use crate::{
@@ -322,8 +324,13 @@ fn radical_box(inner: MathBox, degree: Option<&str>, ctx: Context) -> MathBox {
 	}
 	let radical = MathBox { lines, baseline: inner.baseline + 1, width };
 	let Some(degree) = degree else { return radical };
-	let degree = sf!("^{{{degree}}}");
-	let rendered = flat_box(degree.as_str(), ctx);
+	let mut degree_line = latex_superscript_row(degree, ctx.style);
+	if let Some(font) = ctx.font {
+		for (_, text) in &mut degree_line {
+			*text = Str::from(apply_math_font(font, text.as_str()));
+		}
+	}
+	let rendered = text_box(degree_line);
 	let mut degree_lines = rendered.lines;
 	degree_lines.push(spaces(ctx.style, rendered.width));
 	hconcat(
@@ -1120,13 +1127,13 @@ fn command_name(src: &str, start: usize) -> (&str, usize) {
 }
 
 fn apply_color(ctx: Context, model: Option<&str>, spec: &str) -> Context {
-	let key = model.map_or_else(|| Str::new(spec), |model| sf!("{model}:{spec}"));
-	resolve_color(key.as_str()).map_or(ctx, |color| Context { style: ctx.style.fg(color), ..ctx })
+	resolve_latex_color(model, spec)
+		.map_or(ctx, |color| Context { style: ctx.style.fg(color), ..ctx })
 }
 
 fn apply_background(ctx: Context, model: Option<&str>, spec: &str) -> Context {
-	let key = model.map_or_else(|| Str::new(spec), |model| sf!("{model}:{spec}"));
-	resolve_color(key.as_str()).map_or(ctx, |color| Context { style: ctx.style.bg(color), ..ctx })
+	resolve_latex_color(model, spec)
+		.map_or(ctx, |color| Context { style: ctx.style.bg(color), ..ctx })
 }
 
 fn parse_expr(src: &str, initial: Context) -> MathBox {
@@ -1340,9 +1347,8 @@ fn parse_expr(src: &str, initial: Context) -> MathBox {
 					}
 					if sub.is_some() || sup.is_some() {
 						flush(&mut inline, &mut boxes, ctx);
-						let command = sf!("\\{name}");
 						boxes.push(limits_box(
-							flat_box(command.as_str(), ctx),
+							flat_box(&src[at..end_name], ctx),
 							sub.map(|text| parse_expr(text, ctx)),
 							sup.map(|text| parse_expr(text, ctx)),
 							ctx.style,

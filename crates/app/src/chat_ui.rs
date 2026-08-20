@@ -1998,16 +1998,16 @@ mod tests {
 	#[test]
 	fn text_attachment_lowers_after_typed_text() {
 		let mut item = input::user_message("typed");
-		let attachment = Attachment {
-			content: AttachmentContent::Text {
+		let attachment = Attachment::new(
+			AttachmentContent::Text {
 				text:    sf!("pasted"),
 				snippet: sf!("pasted"),
 				lines:   1,
 				chars:   6,
 			},
-			marker:  1,
-			color:   Color::Default,
-		};
+			1,
+			Color::Default,
+		);
 		let chips = lower_attachments(&mut item, vec![attachment], |_| {});
 		let Some(item::Kind::Message(message)) = item.kind else {
 			panic!("message")
@@ -2027,14 +2027,14 @@ mod tests {
 		let bytes = b"not-a-decoded-image";
 		std::fs::write(&path, bytes).expect("write attachment fixture");
 		let mut item = input::user_message("inspect");
-		let attachment = Attachment {
-			content: AttachmentContent::Image {
+		let attachment = Attachment::new(
+			AttachmentContent::Image {
 				source:     Str::from(path.to_string_lossy().as_ref()),
 				dimensions: None,
 			},
-			marker:  1,
-			color:   Color::Default,
-		};
+			1,
+			Color::Default,
+		);
 		let mut errors = Vec::new();
 		let chips = lower_attachments(&mut item, vec![attachment], |error| errors.push(error));
 		std::fs::remove_file(path).expect("remove attachment fixture");

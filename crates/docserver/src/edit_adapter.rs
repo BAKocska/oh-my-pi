@@ -227,9 +227,7 @@ impl TextEditAdapter for HashlineAdapter {
 			.lock()
 			.snapshots
 			.record(path, revision, snapshot.content().clone(), seen_lines)
-			.map_err(|error| Error::Protocol {
-				reason: sf!("could not retain hashline read snapshot: {error}"),
-			})?;
+			.map_err(|source| Error::HashlineSnapshot { source })?;
 		Ok(())
 	}
 
@@ -242,10 +240,9 @@ impl TextEditAdapter for HashlineAdapter {
 	) -> Result<Vec<ByteEdit>> {
 		parse_hashline_options(&options_json)?;
 		let path = path_key(path)?;
-		let text = std::str::from_utf8(&payload).map_err(|error| Error::Protocol {
-			reason: sf!("omp.hashline payload is not UTF-8: {error}"),
-		})?;
-		let patch = Patch::parse_default(text).map_err(hashline_content_error)?;
+		let text =
+			std::str::from_utf8(&payload).map_err(|source| Error::HashlinePayloadUtf8 { source })?;
+		let patch = Patch::parse_default(text).map_err(|source| Error::HashlineParse { source })?;
 		if patch.sections.len() != 1 {
 			return Err(Error::InvalidContent {
 				reason: sf!("omp.hashline payload must contain exactly one file section"),
@@ -264,7 +261,9 @@ impl TextEditAdapter for HashlineAdapter {
 			.ok_or_else(|| Error::InvalidContent {
 				reason: sf!("omp.hashline section must include an exact snapshot tag"),
 			})?;
-		let parsed = section.parse().map_err(hashline_content_error)?;
+		let parsed = section
+			.parse()
+			.map_err(|source| Error::HashlineParse { source })?;
 		if parsed.file_op.is_some() {
 			return Err(Error::InvalidContent {
 				reason: sf!("omp.hashline text intents cannot contain filesystem operations",),
@@ -272,13 +271,13 @@ impl TextEditAdapter for HashlineAdapter {
 		}
 		let anchor_lines = section
 			.collect_anchor_lines()
-			.map_err(hashline_content_error)?;
+			.map_err(|source| Error::HashlineParse { source })?;
 
 		let mut state = self.state.lock();
 		let retained = state
 			.snapshots
 			.resolve(&path, tag, None)
-			.map_err(hashline_content_error)?;
+			.map_err(|source| Error::HashlineLookup { source })?;
 		if let Some(unseen) = anchor_lines
 			.iter()
 			.find(|line| !retained.seen_lines().contains(line))
@@ -297,7 +296,7 @@ impl TextEditAdapter for HashlineAdapter {
 				mode: ApplyMode::Strict,
 				path: Some(&path),
 			})
-			.map_err(hashline_content_error)?;
+			.map_err(|source| Error::HashlineApply { source })?;
 		let authored = applied
 			.edits
 			.iter()
@@ -308,12 +307,13 @@ impl TextEditAdapter for HashlineAdapter {
 				let end = u64::try_from(edit.end).map_err(|_| Error::InvalidContent {
 					reason: sf!("hashline edit end exceeds byte coordinates"),
 				})?;
-				let range = RecoveryByteRange::new(start, end).map_err(hashline_content_error)?;
+				let range = RecoveryByteRange::new(start, end)
+					.map_err(|source| Error::HashlineRecovery { source })?;
 				Ok(RecoveryEdit::new(range, edit.replacement.clone()))
 			})
 			.collect::<Result<Vec<_>>>()?;
 		let recovered = recover_exact(retained.bytes(), base_snapshot.content(), &authored)
-			.map_err(hashline_content_error)?;
+			.map_err(|source| Error::HashlineRecovery { source })?;
 		let edits = recovered
 			.canonical_edits()
 			.iter()
@@ -376,15 +376,13 @@ impl TextEditAdapter for ReplaceAdapter {
 		payload: Bytes,
 		options_json: Bytes,
 	) -> Result<Vec<ByteEdit>> {
-		let payload: ReplacePayload = serde_json::from_slice(&payload).map_err(|error| {
-			Error::Protocol { reason: sf!("malformed omp.replace payload JSON: {error}") }
-		})?;
+		let payload: ReplacePayload =
+			serde_json::from_slice(&payload).map_err(|source| Error::ReplacePayloadJson { source })?;
 		let options = if options_json.is_empty() {
 			ReplaceAdapterOptions::default()
 		} else {
-			serde_json::from_slice(&options_json).map_err(|error| Error::Protocol {
-				reason: sf!("malformed omp.replace options JSON: {error}"),
-			})?
+			serde_json::from_slice(&options_json)
+				.map_err(|source| Error::ReplaceOptionsJson { source })?
 		};
 		let result = apply_replace(
 			base_snapshot.content(),
@@ -396,9 +394,7 @@ impl TextEditAdapter for ReplaceAdapter {
 				threshold:   options.threshold,
 			},
 		)
-		.map_err(|error| Error::InvalidContent {
-			reason: sf!("omp.replace could not be applied: {error}"),
-		})?;
+		.map_err(|source| Error::Replace { source })?;
 		result
 			.edits
 			.into_iter()
@@ -421,9 +417,7 @@ fn parse_hashline_options(options: &[u8]) -> Result<()> {
 	}
 	serde_json::from_slice::<HashlineOptions>(options)
 		.map(|_| ())
-		.map_err(|error| Error::Protocol {
-			reason: sf!("malformed omp.hashline options JSON: {error}"),
-		})
+		.map_err(|source| Error::HashlineOptionsJson { source })
 }
 
 fn path_key(path: &Path) -> Result<Str> {
@@ -466,10 +460,6 @@ fn selected_lines(content: &Bytes, selection: &ReadSelection) -> Result<Vec<usiz
 			Ok(lines)
 		},
 	}
-}
-
-fn hashline_content_error(error: impl std::fmt::Display) -> Error {
-	Error::InvalidContent { reason: sf!("omp.hashline could not be applied: {error}") }
 }
 
 #[cfg(test)]

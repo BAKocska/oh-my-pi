@@ -733,6 +733,8 @@ pub const fn ephemeral_meta(
 mod tests {
 	use std::time::UNIX_EPOCH;
 
+	use omp_core::sf;
+
 	use super::*;
 	use crate::{
 		auth::spec::{BodyPlacement, CredentialSourceSpec, SessionTokenSpec},

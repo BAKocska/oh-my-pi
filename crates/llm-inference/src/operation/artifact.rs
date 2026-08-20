@@ -315,6 +315,8 @@ pub trait ArtifactStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	fn limits() -> ArtifactLimits {

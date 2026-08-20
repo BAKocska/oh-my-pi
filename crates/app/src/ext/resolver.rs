@@ -7,7 +7,7 @@ use std::{
 	process::{Command, Output},
 };
 
-use omp_core::{Str, sf};
+use omp_core::Str;
 
 use super::{ExtensionCode, ExtensionError};
 
@@ -297,6 +297,8 @@ pub fn validate_target(target: &Str, available_targets: &[Str]) -> Result<(), Ex
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]

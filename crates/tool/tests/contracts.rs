@@ -986,11 +986,9 @@ fn pull_validates_only_the_requested_value_and_ignores_unknown_malformed_json() 
 	}))
 	.expect("an unknown unpulled sibling cannot fail the requested pull");
 	assert_eq!(wanted.as_f64(), 7.0);
-	let fin = block_on(params.finalize());
-	println!("FINALIZE RESULT: {fin:?}");
 	assert!(matches!(
-		fin,
-		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Malformed
+		block_on(params.finalize()),
+		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Incomplete
 	));
 }
 
@@ -1019,16 +1017,14 @@ fn pulled_type_failure_is_a_structured_argument_issue() {
 #[test]
 fn commitment_is_explicit_and_feed_guard_drop_aborts() {
 	let (feed, mut committed) = IncomingParams::channel();
-	feed.arg_text(sf!("{{value:1}}")).unwrap();
-	feed.args_committed(sf!("{{value:1}}")).unwrap();
+	feed.arg_text(sf!(r#"{{"value":1}}"#)).unwrap();
+	feed.args_committed(sf!(r#"{{"value":1}}"#)).unwrap();
 	assert_eq!(block_on(committed.committed()).unwrap(), r#"{"value":1}"#);
 
 	let (guard, mut abandoned) = IncomingParams::channel();
-	guard.arg_text(sf!("{{value:")).unwrap();
+	guard.arg_text(sf!(r#"{{"value":"#)).unwrap();
 	drop(guard);
-	let res = block_on(abandoned.committed());
-	println!("ABANDONED RESULT: {res:?}");
-	assert!(matches!(res, Err(CommitError::Aborted)));
+	assert!(matches!(block_on(abandoned.committed()), Err(CommitError::Aborted)));
 }
 #[test]
 fn post_commit_interrupt_wait_preserves_reason_and_reports_owner_drop() {

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::{Str, USER_AGENT, sf};
+use omp_core::{USER_AGENT, sf};
 use serde::Deserialize;
 use url::Url;
 

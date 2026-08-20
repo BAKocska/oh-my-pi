@@ -201,7 +201,7 @@ impl std::str::FromStr for Usd {
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		let invalid = || UsdParseError { value: Str::new(value) };
 		let (whole, fraction) = match value.split_once('.') {
-			Some((whole, fraction)) if fraction.is_empty() => return Err(invalid()),
+			Some((_whole, fraction)) if fraction.is_empty() => return Err(invalid()),
 			Some((whole, fraction)) => (whole, fraction),
 			None => (value, ""),
 		};

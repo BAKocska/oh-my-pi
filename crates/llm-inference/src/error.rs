@@ -8,6 +8,7 @@ use crate::{
 	answer::AnswerKind,
 	catalog::{OperationKind, ProviderId, RouteId},
 	id::RequestId,
+	operation::MediaOperationError,
 	receipt::{ExecutionReceipt, ReasonId},
 };
 
@@ -278,6 +279,7 @@ impl ErrorDetail {
 struct ErrorEvidence {
 	receipt: ExecutionReceipt,
 	detail:  Option<ErrorDetail>,
+	source:  Option<MediaOperationError>,
 }
 
 /// Concrete, cloneable, secret-free inference error.
@@ -353,7 +355,7 @@ impl Error {
 			status: None,
 			code: None,
 			committed: false,
-			evidence: Box::new(ErrorEvidence { receipt, detail: None }),
+			evidence: Box::new(ErrorEvidence { receipt, detail: None, source: None }),
 		}
 	}
 
@@ -438,6 +440,12 @@ impl Error {
 		self
 	}
 
+	#[must_use]
+	pub(crate) fn typed_source(mut self, source: MediaOperationError) -> Self {
+		self.evidence.source = Some(source);
+		self
+	}
+
 	/// Constructs a terminal planning error with typed evidence.
 	pub fn planning(kind: ErrorKind, detail: ErrorDetail, receipt: ExecutionReceipt) -> Self {
 		Self::new(kind, ErrorPhase::Planning, RetryAction::Never, receipt).detail(detail)
@@ -470,13 +478,21 @@ impl fmt::Display for Error {
 	}
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		self
+			.evidence
+			.source
+			.as_ref()
+			.map(|source| source as &(dyn std::error::Error + 'static))
+	}
+}
 
 #[cfg(test)]
 mod tests {
 	use std::mem::size_of;
 
-	
+	use omp_core::sf;
 
 	use super::{Error, ErrorKind, ErrorPhase, RetryAction};
 	use crate::receipt::ExecutionReceipt;

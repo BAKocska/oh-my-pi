@@ -1,6 +1,6 @@
 use std::fmt::{self, Write as _};
 
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_tool::{
 	CallOutcome, Part, PromptCaps, ToolIdentity,
 	render::{Render, RenderRegistry, RenderRegistryError},

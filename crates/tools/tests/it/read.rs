@@ -942,7 +942,7 @@ async fn long_sqlite_query_is_interrupted_without_blocking_the_runtime() {
 	let (feed, params) = IncomingParams::channel();
 	feed
 		.args_committed(sf!(
-			r#"{"path":"data.sqlite?q=WITH%20RECURSIVE%20count(x)%20AS%20(VALUES(0)%20UNION%20ALL%20SELECT%20x%2B1%20FROM%20count)%20SELECT%20sum(x)%20FROM%20count"}"#,
+			r#"{{"path":"data.sqlite?q=WITH%20RECURSIVE%20count(x)%20AS%20(VALUES(0)%20UNION%20ALL%20SELECT%20x%2B1%20FROM%20count)%20SELECT%20sum(x)%20FROM%20count"}}"#,
 		))
 		.expect("read invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>();

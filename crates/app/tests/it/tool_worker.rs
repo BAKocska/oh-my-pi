@@ -22,7 +22,7 @@ use omp_app::{
 	},
 };
 use omp_core::{
-	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
+	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, sf,
 };
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
@@ -345,7 +345,7 @@ fn worker_connection_rejects_nested_counts_before_decode() {
 async fn supervisor_rejects_stale_host_generation() {
 	use std::os::unix::fs::PermissionsExt as _;
 
-	use omp_core::sf;
+	
 
 	let scratch = tempfile::tempdir().expect("stale generation scratch");
 	let wrapper = scratch.path().join("stale-worker");

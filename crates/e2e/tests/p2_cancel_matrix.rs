@@ -32,7 +32,7 @@ use omp_app::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
+use omp_core::{ArtifactDigest, Principal, Provenance, sf};
 use omp_e2e::support::{AllowAdmission, install_omp_binary_env, omp_binary};
 use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_proto::{

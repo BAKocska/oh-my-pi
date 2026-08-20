@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
-use omp_core::{Str, sf};
+use omp_core::{Str, StrMut};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use smallvec::SmallVec;
 
@@ -275,7 +275,9 @@ fn repair_replacement_indentation(
 			if let Edit::Insert { text, .. } = edit
 				&& !text.trim().is_empty()
 			{
-				*text = sf!("{shift}{text}");
+				let mut shifted = StrMut::from(std::mem::take(text));
+				shifted.insert(0, &shift);
+				*text = shifted.freeze();
 			}
 		}
 		let bodies = edits[insert_start..insert_end]

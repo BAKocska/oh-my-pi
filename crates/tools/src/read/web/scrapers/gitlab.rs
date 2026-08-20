@@ -434,7 +434,7 @@ mod tests {
 	};
 
 	use bytes::Bytes;
-	use omp_core::{Str, sf};
+	use omp_core::sf;
 	use parking_lot::Mutex;
 	use smallvec::SmallVec;
 	use url::Url;

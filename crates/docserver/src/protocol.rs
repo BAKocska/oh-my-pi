@@ -2051,7 +2051,18 @@ impl Failure {
 				proto::ProtocolErrorCode::Cancelled
 			},
 			Error::Persistence { source, .. } | Error::Io { source, .. } => io_code(source.kind()),
-			Error::Protocol { .. } => proto::ProtocolErrorCode::Internal,
+			Error::Protocol { .. }
+			| Error::Worker { .. }
+			| Error::HashlineSnapshot { .. }
+			| Error::HashlinePayloadUtf8 { .. }
+			| Error::ReplacePayloadJson { .. }
+			| Error::ReplaceOptionsJson { .. }
+			| Error::HashlineOptionsJson { .. }
+			| Error::Replace { .. }
+			| Error::HashlineParse { .. }
+			| Error::HashlineLookup { .. }
+			| Error::HashlineApply { .. }
+			| Error::HashlineRecovery { .. } => proto::ProtocolErrorCode::Internal,
 		};
 		Self::new(code, error.to_string())
 	}
@@ -2089,11 +2100,17 @@ impl Failure {
 	fn from_lsp(error: &LspError) -> Self {
 		let code = match error {
 			LspError::Transport(LspTransportError::Cancelled) => proto::ProtocolErrorCode::Cancelled,
-			LspError::Transport(LspTransportError::Closed { .. }) => proto::ProtocolErrorCode::Io,
+			LspError::Transport(
+				LspTransportError::Closed { .. }
+				| LspTransportError::Io { .. }
+				| LspTransportError::Frame { .. },
+			) => proto::ProtocolErrorCode::Io,
 			LspError::Transport(LspTransportError::JsonRpc { .. }) => {
 				proto::ProtocolErrorCode::Internal
 			},
-			LspError::Transport(LspTransportError::InvalidResponse { .. })
+			LspError::Transport(
+				LspTransportError::InvalidResponse { .. } | LspTransportError::InvalidJson { .. },
+			)
 			| LspError::InvalidCapabilities { .. }
 			| LspError::InvalidRegistration { .. } => proto::ProtocolErrorCode::Internal,
 			LspError::InvalidJson { .. } | LspError::Position(_) | LspError::InvalidUtf8 => {

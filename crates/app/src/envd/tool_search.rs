@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_hashline::{RevisionToken, compute_snapshot_tag};
 use omp_tools::{
 	glob::{self, WalkMatch, WalkResult},
@@ -1105,6 +1105,7 @@ fn cancelled_glob() -> glob::Fault {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
 	use omp_docserver::{
 		Environment, ServerConfig,
 		connection::{ConnectionConfig, serve_connection},

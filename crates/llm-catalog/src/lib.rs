@@ -149,9 +149,7 @@ mod tests {
 				},
 			},
 			refresh:              OAuthRefreshBehavior::TokenEndpoint,
-			principal_resolution: Some(PrincipalResolution::IdTokenClaim {
-				claim: "sub".to_str(),
-			}),
+			principal_resolution: Some(PrincipalResolution::IdTokenClaim { claim: "sub".to_str() }),
 		};
 		let encoded = serde_json::to_vec(&oauth).expect("OAuth spec serializes");
 		let decoded: OAuthSpec = serde_json::from_slice(&encoded).expect("OAuth spec deserializes");

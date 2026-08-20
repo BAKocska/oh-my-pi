@@ -257,7 +257,7 @@ fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
 mod tests {
 	use std::time::{Duration, Instant};
 
-	use omp_core::Str;
+	use omp_core::sf;
 	use omp_tui::{Color, Size, UiContext, test_support::frame_row_text};
 
 	use super::Sidebar;

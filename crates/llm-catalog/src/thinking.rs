@@ -1,5 +1,6 @@
 //! Typed reasoning effort, budget, display, and wire-routing policies.
 
+#![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 use std::{
 	collections::{BTreeMap, btree_map},
 	fmt,
@@ -32,7 +33,7 @@ use crate::{
 	Deserialize,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
 pub enum ThinkingEffort {
 	/// Explicitly disable reasoning.
 	Off,
@@ -50,22 +51,6 @@ pub enum ThinkingEffort {
 	XHigh,
 	/// Provider-defined maximum reasoning.
 	Max,
-}
-
-impl ThinkingEffort {
-	/// Returns the canonical static spelling for this effort.
-	#[must_use]
-	pub const fn into_str(&self) -> &'static str {
-		match self {
-			Self::Off => "off",
-			Self::Minimal => "minimal",
-			Self::Low => "low",
-			Self::Medium => "medium",
-			Self::High => "high",
-			Self::XHigh => "xhigh",
-			Self::Max => "max",
-		}
-	}
 }
 
 /// Provider-native control used to select reasoning intensity.

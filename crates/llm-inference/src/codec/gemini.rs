@@ -13,6 +13,7 @@ use omp_llm_catalog::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use strum::IntoStaticStr;
 
 use crate::{
 	answer::{AnswerBody, Embedding, EmbeddingBatch, TokenCount, TokenizerProvenance},
@@ -42,16 +43,19 @@ pub const GENERATIVE_LANGUAGE_BASE: &str = "https://generativelanguage.googleapi
 pub const GENERATIVE_LANGUAGE_STREAM_PATH: &str = ":streamGenerateContent?alt=sse";
 
 /// `GenerateContent` endpoint behavior that affects the JSON body.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, IntoStaticStr, PartialEq)]
 pub enum GoogleEndpointKind {
 	/// Public Generative Language endpoint, which preserves function-part IDs.
 	#[default]
+	#[strum(serialize = "v1beta")]
 	GenerativeLanguage,
 	/// Vertex endpoint, which rejects function-part IDs and therefore strips
 	/// them.
+	#[strum(serialize = "v1")]
 	Vertex,
 	/// Cloud Code Assist endpoint, which preserves IDs and uses legacy schema
 	/// keys.
+	#[strum(serialize = "v1internal")]
 	CloudCodeAssist,
 }
 
@@ -1225,25 +1229,51 @@ const fn generation_config_is_empty(generation: &GoogleGenerationConfig) -> bool
 		&& generation.thinking_config.is_none()
 }
 
-fn thinking_level(effort: ReasoningEffort) -> Str {
-	match effort {
-		ReasoningEffort::Off | ReasoningEffort::Minimal => sf!("MINIMAL"),
-		ReasoningEffort::Low => sf!("LOW"),
-		ReasoningEffort::Medium => sf!("MEDIUM"),
-		ReasoningEffort::High | ReasoningEffort::Max => sf!("HIGH"),
-		ReasoningEffort::Xhigh => sf!("THINKING_LEVEL_UNSPECIFIED"),
+#[derive(Clone, Copy, IntoStaticStr)]
+enum GoogleThinkingLevel {
+	#[strum(serialize = "MINIMAL")]
+	Minimal,
+	#[strum(serialize = "LOW")]
+	Low,
+	#[strum(serialize = "MEDIUM")]
+	Medium,
+	#[strum(serialize = "HIGH")]
+	High,
+	#[strum(serialize = "THINKING_LEVEL_UNSPECIFIED")]
+	Unspecified,
+}
+
+impl From<ReasoningEffort> for GoogleThinkingLevel {
+	fn from(effort: ReasoningEffort) -> Self {
+		match effort {
+			ReasoningEffort::Off | ReasoningEffort::Minimal => Self::Minimal,
+			ReasoningEffort::Low => Self::Low,
+			ReasoningEffort::Medium => Self::Medium,
+			ReasoningEffort::High | ReasoningEffort::Max => Self::High,
+			ReasoningEffort::Xhigh => Self::Unspecified,
+		}
 	}
 }
 
+impl From<ThinkingEffort> for GoogleThinkingLevel {
+	fn from(effort: ThinkingEffort) -> Self {
+		match effort {
+			ThinkingEffort::Off | ThinkingEffort::Minimal => Self::Minimal,
+			ThinkingEffort::Low => Self::Low,
+			ThinkingEffort::Medium => Self::Medium,
+			ThinkingEffort::High | ThinkingEffort::Max => Self::High,
+			ThinkingEffort::XHigh => Self::Unspecified,
+		}
+	}
+}
+
+fn thinking_level(effort: ReasoningEffort) -> Str {
+	sf!(<&'static str>::from(GoogleThinkingLevel::from(effort)))
+}
+
 /// Spells a resolved catalog wire effort as Google's `thinkingLevel` value.
-const fn selection_thinking_level(effort: ThinkingEffort) -> Str {
-	sf!(match effort {
-		ThinkingEffort::Off | ThinkingEffort::Minimal => "MINIMAL",
-		ThinkingEffort::Low => "LOW",
-		ThinkingEffort::Medium => "MEDIUM",
-		ThinkingEffort::High | ThinkingEffort::Max => "HIGH",
-		ThinkingEffort::XHigh => "THINKING_LEVEL_UNSPECIFIED",
-	})
+fn selection_thinking_level(effort: ThinkingEffort) -> Str {
+	sf!(<&'static str>::from(GoogleThinkingLevel::from(effort)))
 }
 
 const fn thinking_budget(effort: ReasoningEffort, budgets: GoogleThinkingBudgets) -> u64 {
@@ -2145,11 +2175,7 @@ impl Codec for GeminiCodec {
 						target.wire_model.as_str(),
 					)
 					.into(),
-					revision: match self.endpoint {
-						GoogleEndpointKind::GenerativeLanguage => sf!("v1beta"),
-						GoogleEndpointKind::Vertex => sf!("v1"),
-						GoogleEndpointKind::CloudCodeAssist => sf!("v1internal"),
-					},
+					revision: sf!(<&'static str>::from(self.endpoint)),
 					expected_embeddings,
 					requested_dimensions,
 					done: false,

@@ -1,7 +1,6 @@
 //! Minimal JSON-over-websocket link used by the CDP and `BiDi` drivers.
 
 use futures::{SinkExt, StreamExt};
-use omp_core::sf;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
@@ -31,9 +30,7 @@ impl WsLink {
 		while let Some(msg) = self.inner.next().await {
 			match msg? {
 				Message::Text(text) => {
-					return serde_json::from_str(&text)
-						.map(Some)
-						.map_err(|err| Error::Protocol(sf!("malformed message: {err}")));
+					return serde_json::from_str(&text).map(Some).map_err(Error::from);
 				},
 				Message::Close(_) => return Ok(None),
 				_ => {},

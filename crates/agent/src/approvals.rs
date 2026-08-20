@@ -40,7 +40,8 @@ pub struct ApprovalSpec {
 }
 
 /// Durable state of an approval ticket.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[repr(u8)]
 pub enum TicketState {
 	/// Awaiting a single idempotent answer.
@@ -52,7 +53,8 @@ pub enum TicketState {
 }
 
 /// The source that supplied an approval result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[repr(u8)]
 pub enum ApprovalSource {
 	/// A local user answered.
@@ -142,8 +144,7 @@ impl ApprovalTicket {
 	pub fn decision_record(&self) -> Option<omp_storage::transcript::ApprovalDecided> {
 		let state = match self.state {
 			TicketState::Pending => return None,
-			TicketState::Decided => sf!("decided"),
-			TicketState::Withdrawn => sf!("withdrawn"),
+			state => sf!(<&'static str>::from(state)),
 		};
 		let decision = self.decision.as_ref();
 		Some(omp_storage::transcript::ApprovalDecided {
@@ -151,23 +152,11 @@ impl ApprovalTicket {
 			state,
 			approved: decision.map(|value| value.approved),
 			scope: decision.map(|value| value.scope.clone()),
-			source: decision.map(|value| approval_source_name(value.source)),
+			source: decision.map(|value| sf!(<&'static str>::from(value.source))),
 			decided_by: decision.and_then(|value| value.decided_by.clone()),
 			reason: decision.and_then(|value| value.reason.clone()),
 			audited: decision.is_some_and(|value| value.audited),
 		})
-	}
-}
-
-fn approval_source_name(source: ApprovalSource) -> Str {
-	match source {
-		ApprovalSource::User => sf!("user"),
-		ApprovalSource::External => sf!("external"),
-		ApprovalSource::Forwarded => sf!("forwarded"),
-		ApprovalSource::Config => sf!("config"),
-		ApprovalSource::Extension => sf!("extension"),
-		ApprovalSource::Timeout => sf!("timeout"),
-		ApprovalSource::Unavailable => sf!("unavailable"),
 	}
 }
 
@@ -383,8 +372,6 @@ impl Default for ApprovalBook {
 
 #[cfg(test)]
 mod tests {
-	use omp_core::Str;
-
 	use super::{ApprovalBook, ApprovalDecision, ApprovalSource, ApprovalSpec, TicketState};
 	fn spec() -> ApprovalSpec {
 		ApprovalSpec {

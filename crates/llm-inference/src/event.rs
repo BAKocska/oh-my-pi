@@ -278,7 +278,7 @@ impl ChatEvent {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	
+	use omp_core::sf;
 	use serde_json::json;
 
 	use super::{ChatEvent, ToolCall};

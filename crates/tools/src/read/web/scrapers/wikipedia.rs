@@ -1,6 +1,6 @@
 //! Wikipedia article renderer backed by the public REST API.
 
-use omp_core::{Str, sf};
+use omp_core::sf;
 use serde::Deserialize;
 use url::Url;
 
@@ -397,6 +397,7 @@ mod tests {
 	};
 
 	use bytes::Bytes;
+	use omp_core::Str;
 	use parking_lot::Mutex;
 	use smallvec::SmallVec;
 

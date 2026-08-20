@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::{IntoStr, Str, sf};
 use omp_hashline::{
-	ApplyMode, ApplyOptions, BlockMode, Clipboard, FileOp, MismatchDetails, MismatchError, Patch,
+	ApplyMode, ApplyOptions, Clipboard, FileOp, MismatchDetails, MismatchError, Patch,
 	apply_parsed_patch, compute_snapshot_tag,
 	diff_preview::{CompactDiffOptions, build_compact_diff_preview},
 	format_hashline_header, numbered_diff,
@@ -643,12 +643,7 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					first_changed_line: applied.first_changed_line,
 					block_resolutions: applied.block_resolutions.into_iter().map(|resolution| ResolvedBlock {
 						anchor_line: resolution.anchor_line, start: resolution.start, end: resolution.end,
-						operation: match resolution.mode {
-							BlockMode::Replace => sf!("replace"),
-							BlockMode::InsertAfter => sf!("insert_after"),
-							BlockMode::Cut => sf!("cut"),
-							BlockMode::PasteAfter => sf!("paste_after"),
-						},
+						operation: Str::new_static(resolution.mode.into()),
 					}).collect(),
 					warnings: work.prepared.warnings().iter().cloned()
 						.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
@@ -967,13 +962,7 @@ fn op_details(edits: &[omp_hashline::Edit]) -> Vec<AppliedOp> {
 	edits
 		.iter()
 		.map(|edit| AppliedOp {
-			kind:       match edit {
-				omp_hashline::Edit::Insert { .. } => sf!("insert"),
-				omp_hashline::Edit::Delete { .. } => sf!("delete"),
-				omp_hashline::Edit::Cut { .. } => sf!("cut"),
-				omp_hashline::Edit::Paste { .. } => sf!("paste"),
-				omp_hashline::Edit::Block { .. } => sf!("block"),
-			},
+			kind:       Str::new_static(edit.into()),
 			patch_line: edit.line_num(),
 			index:      edit.index(),
 		})

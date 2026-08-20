@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use omp_agent::{Journal, project_journal};
-use omp_core::{Str, sf};
+use omp_core::sf;
 use omp_e2e::support::{DocServerTask, Scratch, tool_call_item, tool_result_item};
 use omp_proto::thread::v1 as thread;
 use omp_storage::transcript::{Header, SessionId};

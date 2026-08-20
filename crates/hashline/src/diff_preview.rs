@@ -8,7 +8,7 @@ use std::{
 };
 
 use omp_ast::block::{EnclosingBoundaryOptions, LineRange, enclosing_block_boundaries};
-use omp_core::{Str, StrMut, sf};
+use omp_core::{Str, StrMut};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 
 use crate::{
@@ -451,6 +451,12 @@ struct ParsedLine<'a> {
 	content: &'a str,
 }
 
+#[derive(Clone, Copy)]
+enum PreviewLine<'a> {
+	Literal(&'a str),
+	Formatted { number: i64, content: &'a str },
+}
+
 /// Builds a compact preview from `+N|text`, `-N|text`, and ` N|text` rows.
 ///
 /// Added rows already use post-edit numbers. Context rows are renumbered by the
@@ -459,55 +465,59 @@ struct ParsedLine<'a> {
 #[must_use]
 pub fn build_compact_diff_preview(diff: &str, options: CompactDiffOptions) -> CompactDiffPreview {
 	let edge_lines = options.max_added_run_context.max(1);
-	let mut formatted = Vec::<Str>::new();
-	let mut added_run = Vec::<Str>::new();
+	let mut formatted = Vec::<PreviewLine<'_>>::new();
+	let mut added_run = Vec::<PreviewLine<'_>>::new();
 	let mut added_lines = 0usize;
 	let mut removed_lines = 0usize;
-
-	let flush = |formatted: &mut Vec<Str>, added_run: &mut Vec<Str>| {
-		append_added_run(formatted, added_run, edge_lines);
-		added_run.clear();
-	};
 
 	if !diff.is_empty() {
 		for line in diff.split('\n') {
 			let Some(parsed) = parse_line(line) else {
-				flush(&mut formatted, &mut added_run);
+				append_added_run(&mut formatted, &mut added_run, edge_lines);
 				append_line(&mut formatted, line);
 				continue;
 			};
 			match parsed.kind {
 				b'+' => {
 					added_lines += 1;
-					added_run.push(sf!("{}:{}", parsed.number, parsed.content));
+					push_formatted_line(&mut added_run, parsed.number, parsed.content);
 				},
 				b'-' => {
-					flush(&mut formatted, &mut added_run);
+					append_added_run(&mut formatted, &mut added_run, edge_lines);
 					removed_lines += 1;
 				},
 				_ => {
-					flush(&mut formatted, &mut added_run);
+					append_added_run(&mut formatted, &mut added_run, edge_lines);
 					let offset = i64::try_from(added_lines).unwrap_or(i64::MAX)
 						- i64::try_from(removed_lines).unwrap_or(i64::MAX);
-					append_formatted_line(
+					push_formatted_line(
 						&mut formatted,
-						sf!("{}:{}", parsed.number.saturating_add(offset), parsed.content),
+						parsed.number.saturating_add(offset),
+						parsed.content,
 					);
 				},
 			}
 		}
 	}
-	flush(&mut formatted, &mut added_run);
-	while formatted.last().is_some_and(|line| is_separator(line)) {
+	append_added_run(&mut formatted, &mut added_run, edge_lines);
+	while formatted.last().is_some_and(PreviewLine::is_separator) {
 		formatted.pop();
 	}
-	let mut preview =
-		StrMut::with_capacity(formatted.iter().map(Str::len).sum::<usize>() + formatted.len());
-	for (index, line) in formatted.iter().enumerate() {
+	let mut preview = StrMut::with_capacity(
+		diff
+			.len()
+			.saturating_add(formatted.len().saturating_mul(21)),
+	);
+	for (index, line) in formatted.into_iter().enumerate() {
 		if index > 0 {
 			preview.push('\n');
 		}
-		preview.push_str(line);
+		match line {
+			PreviewLine::Literal(line) => preview.push_str(line),
+			PreviewLine::Formatted { number, content } => {
+				append_formatted_line(&mut preview, number, content);
+			},
+		}
 	}
 	CompactDiffPreview { preview: preview.freeze(), added_lines, removed_lines }
 }
@@ -529,47 +539,56 @@ fn parse_line(line: &str) -> Option<ParsedLine<'_>> {
 	Some(ParsedLine { kind, number, content: &body[separator + 1..] })
 }
 
-fn append_added_run(output: &mut Vec<Str>, run: &[Str], edge_lines: usize) {
+fn append_added_run<'a>(
+	output: &mut Vec<PreviewLine<'a>>,
+	run: &mut Vec<PreviewLine<'a>>,
+	edge_lines: usize,
+) {
 	if run.is_empty() {
 		return;
 	}
 	let threshold = edge_lines.saturating_mul(2).saturating_add(1);
 	if run.len() <= threshold {
-		for line in run {
-			append_line(output, line);
-		}
+		output.append(run);
 		return;
 	}
-	for line in &run[..edge_lines] {
-		append_line(output, line);
-	}
+	let mut tail = run.split_off(run.len() - edge_lines);
+	run.truncate(edge_lines);
+	output.append(run);
 	append_line(output, ELISION);
-	for line in &run[run.len() - edge_lines..] {
-		append_line(output, line);
-	}
+	output.append(&mut tail);
 }
 
-fn append_line(output: &mut Vec<Str>, line: &str) {
+fn append_line<'a>(output: &mut Vec<PreviewLine<'a>>, line: &'a str) {
 	let normalized = if matches!(line, "..." | "…" | "+…") {
 		ELISION
 	} else {
 		line
 	};
 	if is_separator(normalized)
-		&& (output.is_empty() || output.last().is_some_and(|prior| is_separator(prior)))
+		&& (output.is_empty() || output.last().is_some_and(PreviewLine::is_separator))
 	{
 		return;
 	}
-	output.push(Str::new(normalized));
+	output.push(PreviewLine::Literal(normalized));
 }
 
-fn append_formatted_line(output: &mut Vec<Str>, line: Str) {
-	if is_separator(&line)
-		&& (output.is_empty() || output.last().is_some_and(|prior| is_separator(prior)))
-	{
-		return;
+fn push_formatted_line<'a>(output: &mut Vec<PreviewLine<'a>>, number: i64, content: &'a str) {
+	output.push(PreviewLine::Formatted { number, content });
+}
+
+fn append_formatted_line(output: &mut StrMut, number: i64, content: &str) {
+	write!(output, "{number}:").expect("writing to StrMut cannot fail");
+	output.push_str(content);
+}
+
+impl PreviewLine<'_> {
+	fn is_separator(&self) -> bool {
+		match self {
+			Self::Literal(line) => is_separator(line),
+			Self::Formatted { .. } => false,
+		}
 	}
-	output.push(line);
 }
 
 fn is_separator(line: &str) -> bool {

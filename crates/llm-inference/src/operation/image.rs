@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::{Str, sf};
+use omp_core::Str;
 use tower::Service;
 
 use crate::{
@@ -17,8 +17,8 @@ use crate::{
 	catalog::OperationKind,
 	error::Error,
 	operation::{
-		OperationRequest, OperationResponse, media_protocol_error, media_validation_error,
-		wrong_operation,
+		MediaOperationError, OperationRequest, OperationResponse, media_protocol_error,
+		media_validation_error, wrong_operation,
 	},
 };
 
@@ -36,13 +36,16 @@ pub struct ImageLimits {
 }
 
 /// Typed image request validation failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ImageError {
 	/// Prompt contains no non-whitespace content.
+	#[error("image prompt is empty")]
 	EmptyPrompt,
 	/// Explicit style contains no non-whitespace content.
+	#[error("image style is empty")]
 	EmptyStyle,
 	/// Requested artifact count is zero or exceeds the bound.
+	#[error("requested {requested} images, but the maximum is {maximum}")]
 	Count {
 		/// Requested final artifact count.
 		requested: u32,
@@ -50,6 +53,7 @@ pub enum ImageError {
 		maximum:   u32,
 	},
 	/// Reference count exceeds the bound.
+	#[error("supplied {requested} image references, but the maximum is {maximum}")]
 	References {
 		/// Number of supplied edit references.
 		requested: u32,
@@ -57,12 +61,22 @@ pub enum ImageError {
 		maximum:   u32,
 	},
 	/// Mask was supplied without an image to edit.
+	#[error("image mask requires an edit reference")]
 	MaskWithoutReference,
 	/// A mask is not a supported raster type.
-	InvalidMaskType(Str),
+	#[error("image mask media type {media_type} is unsupported")]
+	InvalidMaskType {
+		/// Unsupported media type.
+		media_type: Str,
+	},
 	/// A reference is not a supported raster type.
-	InvalidReferenceType(Str),
+	#[error("image reference media type {media_type} is unsupported")]
+	InvalidReferenceType {
+		/// Unsupported media type.
+		media_type: Str,
+	},
 	/// Inline edit inputs exceed their aggregate bound.
+	#[error("inline image inputs contain {observed} bytes, but the maximum is {limit}")]
 	InputsTooLarge {
 		/// Maximum permitted aggregate inline input bytes.
 		limit:    u64,
@@ -70,6 +84,7 @@ pub enum ImageError {
 		observed: u64,
 	},
 	/// Dimensions are zero or exceed the pixel bound.
+	#[error("image dimensions {width}x{height} exceed the {maximum_pixels}-pixel limit")]
 	Dimensions {
 		/// Requested image width.
 		width:          u32,
@@ -79,13 +94,16 @@ pub enum ImageError {
 		maximum_pixels: u64,
 	},
 	/// Generation progress moved backwards or changed a known total.
+	#[error("image generation progress is not monotonic")]
 	NonMonotonicProgress,
 	/// More final artifacts arrived than requested.
+	#[error("image generation returned more than the requested {requested} artifacts")]
 	TooManyArtifacts {
 		/// Final artifact count requested by the caller.
 		requested: u32,
 	},
 	/// A final image has invalid dimensions.
+	#[error("generated image has invalid dimensions {width}x{height}")]
 	InvalidArtifactDimensions {
 		/// Returned image width.
 		width:  u32,
@@ -93,6 +111,9 @@ pub enum ImageError {
 		height: u32,
 	},
 	/// Completion summary disagrees with observed final artifacts.
+	#[error(
+		"image completion reported {reported} artifacts after {observed} artifacts were observed"
+	)]
 	CompletionMismatch {
 		/// Final artifact count observed before completion.
 		observed: u32,
@@ -100,8 +121,10 @@ pub enum ImageError {
 		reported: u32,
 	},
 	/// Stream ended before a completion event.
+	#[error("image stream ended before completion")]
 	MissingCompletion,
 	/// Event arrived after completion.
+	#[error("image event arrived after completion")]
 	AlreadyCompleted,
 }
 
@@ -165,9 +188,9 @@ fn validate_media(input: &MediaInput, mask: bool) -> Result<u64, ImageError> {
 	};
 	if !matches!(media_type.as_str(), "image/png" | "image/jpeg" | "image/webp") {
 		return Err(if mask {
-			ImageError::InvalidMaskType(media_type.clone())
+			ImageError::InvalidMaskType { media_type: media_type.clone() }
 		} else {
-			ImageError::InvalidReferenceType(media_type.clone())
+			ImageError::InvalidReferenceType { media_type: media_type.clone() }
 		});
 	}
 	Ok(match input {
@@ -318,35 +341,38 @@ where
 				return Err(wrong_operation(&call, OperationKind::GenerateImage));
 			};
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(OperationKind::GenerateImage, sf!("{error:?}")));
+				return Err(media_validation_error(OperationKind::GenerateImage, error));
 			}
 			let response = pending
 				.ok_or_else(|| {
 					media_validation_error(
 						OperationKind::GenerateImage,
-						sf!("image_request_not_dispatched"),
+						MediaOperationError::ImageRequestNotDispatched,
 					)
 				})?
 				.await?;
 			let mut progress = ImageProgress::new(request.count);
-			Ok(response.map(move |mut output| {
-				let stream = async_stream::stream! {
-					while let Some(event) = output.next().await {
-						match event.and_then(|event| {
-							progress.observe(&event).map_err(|error| media_protocol_error(OperationKind::GenerateImage, sf!("{error:?}")))?;
-							Ok(event)
-						}) {
-							Ok(event) => yield Ok(event),
-							Err(error) => { yield Err(error); return; }
+			Ok(response
+				.map(move |mut output| {
+					let stream = async_stream::stream! {
+						while let Some(event) = output.next().await {
+							match event.and_then(|event| {
+								progress.observe(&event).map_err(|error| {
+									media_protocol_error(OperationKind::GenerateImage, error)
+								})?;
+								Ok(event)
+							}) {
+								Ok(event) => yield Ok(event),
+								Err(error) => { yield Err(error); return; }
+							}
 						}
-					}
-					if let Err(error) = progress.finish() {
-						let detail = sf!("{error:?}");
-						yield Err(media_protocol_error(OperationKind::GenerateImage, detail));
-					}
-				};
-				Box::pin(stream) as GenerationStream<ImageArtifact>
-			}).into_answer(AnswerBody::Images))
+						if let Err(error) = progress.finish() {
+							yield Err(media_protocol_error(OperationKind::GenerateImage, error));
+						}
+					};
+					Box::pin(stream) as GenerationStream<ImageArtifact>
+				})
+				.into_answer(AnswerBody::Images))
 		}
 	}
 }
@@ -356,6 +382,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use bytes::Bytes;
+	use omp_core::sf;
 
 	use super::*;
 	use crate::call::{Background, Dimensions, ImageFormat, ImageQuality, NegotiationPolicy};
@@ -382,6 +409,19 @@ mod tests {
 			negotiation: NegotiationPolicy::default(),
 		}
 	}
+
+	#[test]
+	fn validation_error_preserves_typed_source_chain() {
+		let error = media_validation_error(OperationKind::GenerateImage, ImageError::EmptyPrompt);
+		let media = std::error::Error::source(&error)
+			.and_then(|source| source.downcast_ref::<MediaOperationError>())
+			.expect("typed media operation source");
+		let image = std::error::Error::source(media)
+			.and_then(|source| source.downcast_ref::<ImageError>())
+			.expect("typed image source");
+		assert_eq!(image, &ImageError::EmptyPrompt);
+	}
+
 	#[test]
 	fn validates_edit_inputs_and_aggregate_bound() {
 		assert!(

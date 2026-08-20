@@ -387,13 +387,12 @@ fn unsupported_scheme(path: &str) -> Option<Str> {
 
 fn payload(mut result: WalkResult, limit: u64, timeout_ms: u64) -> Payload {
 	for entry in &mut result.matches {
-		let normalized = entry.path.replace('\\', "/");
-		let normalized = normalized.trim_end_matches('/');
-		entry.path = if entry.is_dir {
-			sf!("{normalized}/")
-		} else {
-			Str::new(normalized)
-		};
+		let mut normalized = entry.path.replace('\\', "/");
+		normalized.truncate(normalized.trim_end_matches('/').len());
+		if entry.is_dir {
+			normalized.push('/');
+		}
+		entry.path = normalized.into();
 	}
 	result.matches.sort_by(|left, right| {
 		right

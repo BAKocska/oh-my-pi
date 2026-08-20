@@ -62,7 +62,8 @@ pub enum InsertMode {
 }
 
 /// The operation deferred until a syntactic block can be resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum BlockMode {
 	/// Replace the resolved block.
 	Replace,
@@ -278,9 +279,10 @@ pub struct SplitOptions {
 }
 
 /// A low-level edit emitted in authored order by the parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, strum::IntoStaticStr)]
 pub enum Edit {
 	/// Insert one row at a stable cursor.
+	#[strum(serialize = "insert")]
 	Insert {
 		/// The pre-edit insertion cursor.
 		cursor:      Cursor,
@@ -296,6 +298,7 @@ pub enum Edit {
 		block_start: Option<usize>,
 	},
 	/// Delete one anchored source row.
+	#[strum(serialize = "delete")]
 	Delete {
 		/// The row to delete.
 		anchor:   Anchor,
@@ -305,6 +308,7 @@ pub enum Edit {
 		index:    usize,
 	},
 	/// Capture an inclusive span into a clipboard register.
+	#[strum(serialize = "cut")]
 	Cut {
 		/// The span captured before deletion.
 		range:    ParsedRange,
@@ -316,6 +320,7 @@ pub enum Edit {
 		index:    usize,
 	},
 	/// Paste a clipboard register at a gap or over a span.
+	#[strum(serialize = "paste")]
 	Paste {
 		/// The paste destination.
 		at:          PasteTarget,
@@ -329,6 +334,7 @@ pub enum Edit {
 		block_start: Option<usize>,
 	},
 	/// An edit whose concrete span requires syntax-aware block resolution.
+	#[strum(serialize = "block")]
 	Block {
 		/// The authored block opener line.
 		anchor:   Anchor,

@@ -206,8 +206,8 @@ fn invocation_frames_preserve_commit_and_event_order() {
 	let mut invocation = block_on(client.invoke(invoke_request("ordered"))).expect("invocation");
 	let request_id = expect_invoke(receive(&requests), "ordered");
 
-	block_on(invocation.arg_text(sf!("{\"path\":"))).expect("first argument fragment");
-	block_on(invocation.arg_text(sf!("\"a\"}"))).expect("second argument fragment");
+	block_on(invocation.arg_text(sf!("{{\"path\":"))).expect("first argument fragment");
+	block_on(invocation.arg_text(sf!("\"a\"}}"))).expect("second argument fragment");
 	block_on(invocation.commit_args(
 		Bytes::from_static(b"{\"path\":\"a\"}"),
 		Bytes::from_static(b"effect-token"),

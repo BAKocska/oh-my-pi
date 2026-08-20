@@ -25,8 +25,8 @@ use crate::{
 	catalog::OperationKind,
 	error::Error,
 	operation::{
-		OperationRequest, OperationResponse, media_protocol_error, media_validation_error,
-		wrong_operation,
+		MediaOperationError, OperationRequest, OperationResponse, media_protocol_error,
+		media_validation_error, wrong_operation,
 	},
 };
 
@@ -44,11 +44,13 @@ pub struct VideoLimits {
 }
 
 /// Typed video request or output failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum VideoError {
 	/// Prompt contains no non-whitespace content.
+	#[error("video prompt is empty")]
 	EmptyPrompt,
 	/// Duration is zero or exceeds the capability bound.
+	#[error("video duration {requested_ms} ms exceeds the {maximum_ms} ms limit")]
 	Duration {
 		/// Requested duration.
 		requested_ms: u64,
@@ -56,6 +58,7 @@ pub enum VideoError {
 		maximum_ms:   u64,
 	},
 	/// Dimensions are zero or exceed the capability bound.
+	#[error("video dimensions {width}x{height} exceed the {maximum_pixels}-pixel limit")]
 	Dimensions {
 		/// Requested frame width.
 		width:          u32,
@@ -65,6 +68,7 @@ pub enum VideoError {
 		maximum_pixels: u64,
 	},
 	/// Frame rate is zero or exceeds the capability bound.
+	#[error("video frame rate {requested} exceeds the {maximum} fps limit")]
 	FrameRate {
 		/// Requested frames per second.
 		requested: u32,
@@ -72,8 +76,13 @@ pub enum VideoError {
 		maximum:   u32,
 	},
 	/// Reference image media type is unsupported.
-	ReferenceType(Str),
+	#[error("video reference media type {media_type} is unsupported")]
+	ReferenceType {
+		/// Unsupported media type.
+		media_type: Str,
+	},
 	/// Inline reference image exceeds the request bound.
+	#[error("video reference contains {observed} bytes, but the maximum is {limit}")]
 	ReferenceTooLarge {
 		/// Inline reference size limit.
 		limit:    u64,
@@ -81,12 +90,16 @@ pub enum VideoError {
 		observed: u64,
 	},
 	/// Artifact metadata or streaming representation is invalid.
+	#[error("video artifact violates the output contract")]
 	Artifact(ArtifactViolation),
 	/// Returned duration is zero.
+	#[error("generated video duration is zero")]
 	InvalidArtifactDuration,
 	/// Generation event stream ended before explicit completion.
+	#[error("video stream ended before completion")]
 	MissingCompletion,
 	/// Shared polling state rejected a transition.
+	#[error("video polling state rejected a transition")]
 	Job(JobError),
 }
 
@@ -143,7 +156,7 @@ pub fn validate_request(request: &VideoRequest, limits: VideoLimits) -> Result<(
 		if let Some(media_type) = media_type
 			&& !matches!(media_type.as_str(), "image/png" | "image/jpeg" | "image/webp")
 		{
-			return Err(VideoError::ReferenceType(media_type.clone()));
+			return Err(VideoError::ReferenceType { media_type: media_type.clone() });
 		}
 		if bytes > limits.max_reference_bytes {
 			return Err(VideoError::ReferenceTooLarge {
@@ -338,37 +351,41 @@ where
 				return Err(wrong_operation(&call, OperationKind::GenerateVideo));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(OperationKind::GenerateVideo, sf!("{error:?}")));
+				return Err(media_validation_error(OperationKind::GenerateVideo, error));
 			}
 			let response = pending
 				.ok_or_else(|| {
 					media_validation_error(
 						OperationKind::GenerateVideo,
-						sf!("video_request_not_dispatched"),
+						MediaOperationError::VideoRequestNotDispatched,
 					)
 				})?
 				.await?;
 			let mut progress = VideoProgress::default();
-			Ok(response.map(move |mut session| {
-				let mut output = std::mem::replace(session.events_mut(), Box::pin(futures::stream::empty()));
-				let stream = async_stream::stream! {
-					while let Some(event) = output.next().await {
-						match event.and_then(|event| {
-							progress.observe(&event, &artifact_limits).map_err(|error| media_protocol_error(OperationKind::GenerateVideo, sf!("{error:?}")))?;
-							Ok(event)
-						}) {
-							Ok(event) => yield Ok(event),
-							Err(error) => { yield Err(error); return; }
+			Ok(response
+				.map(move |mut session| {
+					let mut output =
+						std::mem::replace(session.events_mut(), Box::pin(futures::stream::empty()));
+					let stream = async_stream::stream! {
+						while let Some(event) = output.next().await {
+							match event.and_then(|event| {
+								progress.observe(&event, &artifact_limits).map_err(|error| {
+									media_protocol_error(OperationKind::GenerateVideo, error)
+								})?;
+								Ok(event)
+							}) {
+								Ok(event) => yield Ok(event),
+								Err(error) => { yield Err(error); return; }
+							}
 						}
-					}
-					if let Err(error) = progress.finish() {
-						let detail = sf!("{error:?}");
-						yield Err(media_protocol_error(OperationKind::GenerateVideo, detail));
-					}
-				};
-				*session.events_mut() = Box::pin(stream) as GenerationStream<VideoArtifact>;
-				session
-			}).into_answer(AnswerBody::Video))
+						if let Err(error) = progress.finish() {
+							yield Err(media_protocol_error(OperationKind::GenerateVideo, error));
+						}
+					};
+					*session.events_mut() = Box::pin(stream) as GenerationStream<VideoArtifact>;
+					session
+				})
+				.into_answer(AnswerBody::Video))
 		}
 	}
 }

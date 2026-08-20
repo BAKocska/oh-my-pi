@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fs, io, path::Path};
 
-use omp_core::{Str, sf};
+use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier};
@@ -512,6 +512,8 @@ pub fn index_source(index: &str, distribution: &Str) -> toml::Value {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	fn lock() -> LockFile {

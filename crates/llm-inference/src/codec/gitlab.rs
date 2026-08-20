@@ -419,7 +419,7 @@ impl Codec for GitLabWorkflowCodec {
 					headers:     Box::new([
 						RequestHeader {
 							name:  sf!("user-agent"),
-							value: sf!("omp/{}", env!("CARGO_PKG_VERSION")),
+							value: sf!(concat!("omp/", env!("CARGO_PKG_VERSION"))),
 						},
 						RequestHeader {
 							name:  sf!("x-gitlab-client-type"),
@@ -1331,8 +1331,10 @@ fn select_usage(usage: &BTreeMap<String, ContextUsage>) -> Option<&ContextUsage>
 		.or_else(|| usage.values().next())
 }
 
-fn malformed_action(action: &str, detail: &str) -> Error {
-	protocol_error(ErrorPhase::Streaming, "gitlab.malformed_action").code(sf!("{action}: {detail}"))
+fn malformed_action(action: &str, detail: &'static str) -> Error {
+	protocol_error(ErrorPhase::Streaming, "gitlab.malformed_action")
+		.code(Str::new(action))
+		.detail(ErrorDetail::provider(sf!(detail)))
 }
 
 fn invalid_request(reason: &'static str) -> Error {
@@ -1613,6 +1615,17 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	#[test]
+	fn malformed_action_separates_machine_code_from_human_detail() {
+		let error = malformed_action("runMCPTool", "missing requestID");
+		assert_eq!(error.code.as_deref(), Some("runMCPTool"));
+		assert!(matches!(
+			error.detail_ref(),
+			Some(ErrorDetail::Provider { sanitized_message })
+				if sanitized_message.as_str() == "missing requestID"
+		));
 	}
 
 	#[test]

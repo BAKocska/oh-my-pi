@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use omp_core::{Str, sf};
+use omp_core::sf;
 use quick_xml::{
 	Reader,
 	escape::{resolve_xml_entity, unescape},

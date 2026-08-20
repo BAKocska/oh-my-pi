@@ -11,27 +11,45 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
+use strum::IntoStaticStr;
+
 const INPUT_LIMIT: usize = 16 * 1024;
 const MEMO_LIMIT: usize = 256;
 const ONLINE_ATTEMPTS: usize = 2;
 
 /// Ordered reasoning difficulty selected for one turn.
 #[derive(
-	Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Difficulty {
 	/// Trivial lookup or mechanical response.
+	#[strum(serialize = "low")]
 	Minimal = 0,
 	/// Small, well-scoped task.
+	#[strum(serialize = "low")]
 	Low     = 1,
 	/// Normal multi-step task.
 	#[default]
+	#[strum(serialize = "medium")]
 	Medium  = 2,
 	/// Difficult analysis or broad implementation.
+	#[strum(serialize = "high")]
 	High    = 3,
 	/// Maximum supported reasoning effort.
+	#[strum(serialize = "high")]
 	Max     = 4,
 }
 
@@ -59,13 +77,7 @@ impl Difficulty {
 	/// Stable lowercase classifier label.
 	#[must_use]
 	pub const fn label(self) -> &'static str {
-		match self {
-			Self::Minimal => "minimal",
-			Self::Low => "low",
-			Self::Medium => "medium",
-			Self::High => "high",
-			Self::Max => "max",
-		}
+		Self::ONLINE_LABELS[self as usize].0
 	}
 
 	/// Converts this classifier rung to the canonical reasoning effort.
@@ -274,11 +286,7 @@ impl DifficultyClassifier {
 		}
 		let ladder = ClassifierLadder::new([sf!("low"), sf!("medium"), sf!("high")].into())?;
 		let fallback = self.fallback_level(auto);
-		let local_fallback = match fallback {
-			Difficulty::Minimal | Difficulty::Low => sf!("low"),
-			Difficulty::Medium => sf!("medium"),
-			Difficulty::High | Difficulty::Max => sf!("high"),
-		};
+		let local_fallback = sf!(<&'static str>::from(fallback));
 		let response = adapter.classify(
 			&[ChatMessage { role: ChatRole::User, content: sanitized.clone() }],
 			&ladder,

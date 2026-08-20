@@ -1071,6 +1071,8 @@ fn structured_error(
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]

@@ -610,14 +610,24 @@ mod tests {
 				.expect("default assignment"),
 		];
 		assert!(
-			upsert_role_assignment(&mut roles, Str::new_static("task"), "openai-codex/worker", Some("auto"))
-				.expect("task assignment")
+			upsert_role_assignment(
+				&mut roles,
+				Str::new_static("task"),
+				"openai-codex/worker",
+				Some("auto")
+			)
+			.expect("task assignment")
 		);
 		assert_eq!(roles[0].selectors[0].as_str(), "openai/primary:high");
 		assert_eq!(roles[1].selectors[0].as_str(), "openai-codex/worker:auto");
 		assert!(
-			!upsert_role_assignment(&mut roles, Str::new_static("task"), "openai-codex/worker", Some("auto"))
-				.expect("unchanged task assignment")
+			!upsert_role_assignment(
+				&mut roles,
+				Str::new_static("task"),
+				"openai-codex/worker",
+				Some("auto")
+			)
+			.expect("unchanged task assignment")
 		);
 	}
 

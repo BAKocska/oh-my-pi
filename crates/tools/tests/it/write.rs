@@ -475,9 +475,10 @@ async fn interrupt_stalled_special_write(
 	let (started, observed) = flume::bounded(1);
 	let tool = write::tool(StalledSpecialDocuments { phase, started });
 	let (feed, params) = IncomingParams::channel();
-	f	feed
+	feed
 		.args_committed(sf!(r#"{{"path":"fixture.zip:member.txt","content":"replacement"}}"#,))
-		.expect("write invocation remains live");et events = tool.call(params).collect::<Vec<_>>();
+		.expect("write invocation remains live");
+	let events = tool.call(params).collect::<Vec<_>>();
 	tokio::pin!(events);
 	tokio::select! {
 		result = &mut events => panic!("stalled special write completed unexpectedly: {result:?}"),

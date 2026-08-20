@@ -115,7 +115,14 @@ Composition/errors/state:
 - `crates/app` = DI boundary (registries, concrete Tower services,
   `TurnClient`s, authorities). Libraries NEVER build a second production stack.
 - Library errors: `thiserror`, every variant `#[error("…")]`. Hand-written
-  `impl Display`/`impl Error` on errors = reviewer-reject. App orchestration:
+  `impl Display`/`impl Error` on errors = reviewer-reject. Errors NEVER pass
+  through formatters: string-payload variants (`Variant(Str)`,
+  `Variant(String)`, `reason: Str` catch-alls) and stringified inner errors
+  (`sf!("…: {error}")`, `format!`, `{error:?}`, `.to_string()`) =
+  reviewer-reject — carry the typed inner error via `#[source]`/`#[from]` and
+  the identifying facts as named fields; render once, at the app/miette
+  boundary. Static-message errors are unit variants with the text in
+  `#[error("…")]`, never a `Str` payload. App orchestration:
   `miette`; classify/redact untrusted provider diagnostics before stderr.
 - Durable state = append-only transcript journal + blob store; turn state =
   `AgentSnapshot` + journal projection; NEVER a parallel mutable source of
@@ -174,6 +181,19 @@ a real path? no → default type right; don't churn.
   `ArrayStr<N>` outputs. External encoding crates banned outright — no
   exception.
 
+- `sf!`: literal/expr arms (`sf!("lit")`, `sf!(STATIC)`) = `Str::new_static`,
+  free — the formatting arm allocates. Three formatting-arm bans, each
+  reviewer-reject:
+  1. statically-known text: `sf!("{}", CONST)`, `sf!("{}{}", ESC_A, ESC_B)`,
+     enum→string match arms — use the literal/expr arm, `concat!`, a
+     precomputed const, or derived strum (`IntoStaticStr`); a `Str`-returning
+     fn whose every arm is static returns `&'static str` instead.
+  2. `sf!(…)` immediately copied into an existing sink
+     (`push_str(&sf!(…))`, `StrMut::new(sf!(…).as_str())`) — `write!` into
+     the `StrMut`/`String` directly; one buffer, zero intermediates.
+  3. per-frame/per-key/per-line/per-cell paths — format on state change and
+     cache, or format into a stack `ArrayStr<N>`; paint re-slices, never
+     re-formats. Errors NEVER go through formatters (see errors bullet).
 ### Type Size Discipline (CRITICAL)
 `clippy::result_large_err|large_enum_variant|large_stack_arrays|large_futures`
 = measurement (our type is fat), not a request to add a pointer.

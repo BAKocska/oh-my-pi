@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use omp_core::{Str, sf};
+use omp_core::{Str, encoding::ArrayStr, hex, sf};
 use xxhash_rust::xxh32::Xxh32;
 
 use crate::types::Cursor;
@@ -74,9 +74,14 @@ pub(crate) fn normalized_file_xxh32(exact: &[u8]) -> u32 {
 	hasher.digest()
 }
 
+/// Formats the low 16 bits of a hash as four uppercase hexadecimal digits.
+pub(crate) const fn hash_tag16(hash: u32) -> ArrayStr<2> {
+	hex::UPPER.encode_n(&(hash as u16).to_be_bytes())
+}
+
 /// Computes the uppercase four-hex xxHash32 snapshot tag.
 pub fn compute_file_hash(text: &str) -> Str {
-	sf!("{:04X}", normalized_file_xxh32(text.as_bytes()) & 0xffff)
+	Str::new_inline(hash_tag16(normalized_file_xxh32(text.as_bytes())).as_str())
 }
 
 /// Formats a concrete replacement header such as `PUT 5.=9:`.

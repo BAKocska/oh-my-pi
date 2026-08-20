@@ -9,7 +9,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use omp_core::{IntoStr, Str, StrMut, sf};
+use omp_core::{IntoStr, Str, StrMut, fmts_mut, sf};
 use omp_tui::{
 	Border, Charset, Color, Command, Component, Decor, DecorKind, Frame, Icon, Key, MouseReport,
 	PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot, Style, Theme, Ui, UiContext, UiEvent,
@@ -403,10 +403,27 @@ impl ToolView {
 
 struct ToolEntry {
 	name:   Str,
-	title:  Str,
+	label:  Str,
 	ok:     bool,
 	view:   ToolView,
 	images: Vec<ToolImageEntry>,
+}
+
+struct ToolGroup {
+	label: Str,
+	tools: Vec<ToolEntry>,
+}
+
+impl ToolGroup {
+	fn new(tools: Vec<ToolEntry>) -> Self {
+		let label = read_group_label(tools.len());
+		Self { label, tools }
+	}
+
+	fn push(&mut self, tool: ToolEntry) {
+		self.tools.push(tool);
+		self.label = read_group_label(self.tools.len());
+	}
 }
 
 struct CompactionEntry {
@@ -429,7 +446,7 @@ enum Entry {
 	User(UserEntry),
 	Assistant(RichText),
 	Tool(ToolEntry),
-	ToolGroup(Vec<ToolEntry>),
+	ToolGroup(ToolGroup),
 	Compaction(CompactionEntry),
 	Notice { text: Str, error: bool },
 }
@@ -499,18 +516,100 @@ fn activity_waveform_label(waveform: &ActivityWaveform, charset: Charset) -> Str
 	label.into()
 }
 
+struct StatusLabels {
+	model:    Str,
+	activity: Option<Str>,
+	git:      Option<Str>,
+	context:  Option<(Str, bool)>,
+	queued:   Option<Str>,
+	jobs:     Option<Str>,
+	attempt:  Option<Str>,
+	dropped:  Option<Str>,
+}
+
+impl StatusLabels {
+	fn new(facts: &StatusFacts, charset: Charset) -> Self {
+		let mut model = fmts_mut!("{} {}", charset.icon(Icon::Model), facts.model);
+		if let Some(advisor) = &facts.advisor_model {
+			let _ = write!(model, " {} {advisor}", charset.icon(Icon::Advisor));
+		}
+		let activity = facts
+			.live_activity
+			.as_ref()
+			.map(|waveform| activity_waveform_label(waveform, charset));
+		let git = facts.git.as_ref().map(|git| {
+			let mut label = fmts_mut!("{} {}", charset.icon(Icon::Branch), git.branch);
+			if git.dirty > 0 {
+				let _ = write!(label, " *{}", git.dirty);
+			}
+			if git.staged > 0 {
+				let _ = write!(label, " +{}", git.staged);
+			}
+			label.freeze()
+		});
+		let context = (facts.context_tokens > 0 || facts.context_window.is_some()).then(|| {
+			let (usage, overflow) = context_usage_label(facts.context_tokens, facts.context_window);
+			let mut label = fmts_mut!("{} {usage}", charset.icon(Icon::Context));
+			if !matches!(facts.compaction_speculation, CompactionSpeculationStatus::Idle) {
+				let _ = write!(label, " {}", charset.icon(Icon::Auto));
+			}
+			(label.freeze(), overflow)
+		});
+		Self {
+			model: model.freeze(),
+			activity,
+			git,
+			context,
+			queued: (facts.queued > 0).then(|| fmts_mut!("queued {}", facts.queued).freeze()),
+			jobs: (facts.jobs > 0).then(|| fmts_mut!("jobs {}", facts.jobs).freeze()),
+			attempt: (facts.attempt > 0).then(|| fmts_mut!("retry {}", facts.attempt).freeze()),
+			dropped: (facts.dropped > 0).then(|| fmts_mut!("dropped {}", facts.dropped).freeze()),
+		}
+	}
+}
+
 struct WorkState {
-	facts: StatusFacts,
-	fade:  Tween<Color>,
+	facts:         StatusFacts,
+	labels:        StatusLabels,
+	elapsed_label: Option<(u64, Str)>,
+	active_brand:  StrMut,
+	fade:          Tween<Color>,
+}
+
+impl WorkState {
+	fn update_active_brand(&mut self, now: Duration, charset: Charset) {
+		if !self.facts.working {
+			return;
+		}
+		let elapsed = self
+			.facts
+			.turn_started
+			.map_or(Duration::ZERO, |started| Instant::now().saturating_duration_since(started));
+		let key = elapsed_label_key(elapsed);
+		if self
+			.elapsed_label
+			.as_ref()
+			.is_none_or(|(cached, _)| *cached != key)
+		{
+			self.elapsed_label = Some((key, elapsed_label(elapsed)));
+		}
+		self.active_brand.truncate(0);
+		self.active_brand.push_str(charset.spinner().at(now));
+		self.active_brand.push(' ');
+		if let Some((_, label)) = &self.elapsed_label {
+			self.active_brand.push_str(label);
+		}
+	}
 }
 
 struct ChatStatus {
-	props:   Props,
-	slot:    Slot,
-	work:    Rc<RefCell<WorkState>>,
-	charset: Charset,
-	theme:   Theme,
-	style:   ComposerStyle,
+	props:      Props,
+	slot:       Slot,
+	work:       Rc<RefCell<WorkState>>,
+	idle_brand: Str,
+	charset:    Charset,
+	theme:      Theme,
+	style:      ComposerStyle,
 }
 
 impl ChatStatus {
@@ -523,7 +622,8 @@ impl ChatStatus {
 		let mut props = Props::new();
 		props.set(Prop::Id, STATUS_ID);
 		props.set(Prop::NoSelect, true);
-		Self { props, slot: next_slot(), work, charset, theme, style }
+		let idle_brand = fmts_mut!("{} omp", charset.icon(Icon::Omp)).freeze();
+		Self { props, slot: next_slot(), work, idle_brand, charset, theme, style }
 	}
 
 	fn set_composer_style(&mut self, style: ComposerStyle) {
@@ -539,13 +639,9 @@ impl ChatStatus {
 	fn brand_segment(&self, now: Duration) -> Segment {
 		let work = self.work.borrow();
 		let label = if work.facts.working {
-			let elapsed = work
-				.facts
-				.turn_started
-				.map_or(Duration::ZERO, |started| Instant::now().saturating_duration_since(started));
-			sf!("{} {}", self.charset.spinner().at(now), elapsed_label(elapsed))
+			work.active_brand.clone().freeze()
 		} else {
-			sf!("{} omp", self.charset.icon(Icon::Omp))
+			self.idle_brand.clone()
 		};
 		Segment::new()
 			.label(label)
@@ -554,12 +650,8 @@ impl ChatStatus {
 
 	fn left_group(&self, now: Duration) -> Status {
 		let work = self.work.borrow();
-		let facts = &work.facts;
-		let mut model =
-			StrMut::new(sf!("{} {}", self.charset.icon(Icon::Model), facts.model).as_str());
-		if let Some(advisor) = &facts.advisor_model {
-			let _ = write!(model, " {} {advisor}", self.charset.icon(Icon::Advisor));
-		}
+		let model = work.labels.model.clone();
+		drop(work);
 		self
 			.group()
 			.segment(self.brand_segment(now))
@@ -570,30 +662,27 @@ impl ChatStatus {
 		let work = self.work.borrow();
 		let facts = &work.facts;
 		let mut status = self.group().with_str(Prop::Align, "right");
-		if let Some(waveform) = &facts.live_activity {
+		if let Some(activity) = &work.labels.activity {
 			status = status.segment(
 				Segment::new()
-					.label(activity_waveform_label(waveform, self.charset))
+					.label(activity.clone())
 					.with(Prop::Fg, self.theme.accent),
 			);
 		}
-		if let Some(git) = &facts.git {
-			let mut label =
-				StrMut::new(sf!("{} {}", self.charset.icon(Icon::Branch), git.branch).as_str());
-			if git.dirty > 0 {
-				let _ = write!(label, " *{}", git.dirty);
-			}
-			if git.staged > 0 {
-				let _ = write!(label, " +{}", git.staged);
-			}
-			status = status.segment(Segment::new().label(label).with(Prop::Fg, self.theme.info));
+		if let Some(git) = &work.labels.git {
+			status = status.segment(
+				Segment::new()
+					.label(git.clone())
+					.with(Prop::Fg, self.theme.info),
+			);
 		}
 		if matches!(context_gauge, ContextGaugeMode::Numeric)
 			&& (facts.context_tokens > 0 || facts.context_window.is_some())
 		{
-			let (usage, overflow) = context_usage_label(facts.context_tokens, facts.context_window);
-			let mut label = StrMut::new(sf!("{} {usage}", self.charset.icon(Icon::Context)).as_str());
-			let color = if overflow {
+			let Some((label, overflow)) = &work.labels.context else {
+				unreachable!("visible numeric context has a cached label")
+			};
+			let color = if *overflow {
 				self.theme.err
 			} else {
 				compaction_threshold_color(&self.theme)
@@ -601,7 +690,6 @@ impl ChatStatus {
 			let speculation_color = match facts.compaction_speculation {
 				CompactionSpeculationStatus::Idle => None,
 				CompactionSpeculationStatus::Running => {
-					let _ = write!(label, " {}", self.charset.icon(Icon::Auto));
 					let phase = (now.as_millis() / SPECULATION_PULSE.as_millis()) % 2 == 0;
 					Some(if phase {
 						self.theme.accent
@@ -609,14 +697,11 @@ impl ChatStatus {
 						self.theme.muted
 					})
 				},
-				CompactionSpeculationStatus::Armed => {
-					let _ = write!(label, " {}", self.charset.icon(Icon::Auto));
-					Some(self.theme.accent)
-				},
+				CompactionSpeculationStatus::Armed => Some(self.theme.accent),
 			};
 			status = status.segment(
 				Segment::new()
-					.label(label)
+					.label(label.clone())
 					.with(Prop::Fg, speculation_color.unwrap_or(color)),
 			);
 		}
@@ -637,31 +722,31 @@ impl ChatStatus {
 					.with(Prop::Fg, self.theme.secondary),
 			);
 		}
-		if facts.queued > 0 {
+		if let Some(queued) = &work.labels.queued {
 			status = status.segment(
 				Segment::new()
-					.label(sf!("queued {}", facts.queued))
+					.label(queued.clone())
 					.with(Prop::Fg, self.theme.warn),
 			);
 		}
-		if facts.jobs > 0 {
+		if let Some(jobs) = &work.labels.jobs {
 			status = status.segment(
 				Segment::new()
-					.label(sf!("jobs {}", facts.jobs))
+					.label(jobs.clone())
 					.with(Prop::Fg, self.theme.info),
 			);
 		}
-		if facts.attempt > 0 {
+		if let Some(attempt) = &work.labels.attempt {
 			status = status.segment(
 				Segment::new()
-					.label(sf!("retry {}", facts.attempt))
+					.label(attempt.clone())
 					.with(Prop::Fg, self.theme.warn),
 			);
 		}
-		if facts.dropped > 0 {
+		if let Some(dropped) = &work.labels.dropped {
 			status = status.segment(
 				Segment::new()
-					.label(sf!("dropped {}", facts.dropped))
+					.label(dropped.clone())
 					.with(Prop::Fg, self.theme.err),
 			);
 		}
@@ -758,6 +843,10 @@ impl Component for ChatStatus {
 		if rect.width == 0 || rect.height == 0 {
 			return;
 		}
+		self
+			.work
+			.borrow_mut()
+			.update_active_brand(pc.now, self.charset);
 		let layout = self.style.layout(self.charset);
 		match layout.status_attachment {
 			ComposerStatusAttachment::TopBorder => {
@@ -848,15 +937,21 @@ pub struct Chat {
 	right_inset:     u16,
 	slots:           Slots,
 	agents:          Vec<AgentRow>,
+	agent_labels:    Vec<Str>,
 	attribution:     Option<Attribution>,
 }
 
 impl Chat {
 	/// Creates an empty scene using the host's detected presentation context.
 	pub fn new(ctx: &UiContext) -> Self {
+		let facts = StatusFacts::default();
+		let labels = StatusLabels::new(&facts, ctx.charset);
 		let work = Rc::new(RefCell::new(WorkState {
-			facts: StatusFacts::default(),
-			fade:  Tween::settled(ctx.theme.muted),
+			facts,
+			labels,
+			elapsed_label: None,
+			active_brand: StrMut::new(""),
+			fade: Tween::settled(ctx.theme.muted),
 		}));
 		let style = ComposerStyle::default();
 		let pane = EditorPane::new()
@@ -890,6 +985,7 @@ impl Chat {
 			last_working: false,
 			right_inset: 0,
 			agents: Vec::new(),
+			agent_labels: Vec::new(),
 			slots: Slots::new(ctx.clone()),
 			attribution: None,
 		}
@@ -1196,13 +1292,13 @@ impl Chat {
 		{
 			let mut tool = self.live_tools.remove(index);
 			tool.view.replace(view, &self.ctx);
-			let entry = ToolEntry {
-				name: tool.name,
-				title: tool.title,
-				ok,
-				view: tool.view,
-				images: tool.images,
+			let icon = if ok {
+				self.ctx.charset.check()
+			} else {
+				self.ctx.charset.icon(Icon::Error)
 			};
+			let label = fmts_mut!("{icon} {}", tool.title).freeze();
+			let entry = ToolEntry { name: tool.name, label, ok, view: tool.view, images: tool.images };
 			if entry.name.as_str() == "read" {
 				let prior_is_read = matches!(self.transcript.last(), Some(Entry::Tool(prior)) if prior.name.as_str() == "read");
 				if let Some(Entry::ToolGroup(group)) = self.transcript.last_mut() {
@@ -1211,7 +1307,9 @@ impl Chat {
 					let Some(Entry::Tool(prior)) = self.transcript.pop() else {
 						unreachable!("matched a read tool entry")
 					};
-					self.transcript.push(Entry::ToolGroup(vec![prior, entry]));
+					self
+						.transcript
+						.push(Entry::ToolGroup(ToolGroup::new(vec![prior, entry])));
 				} else {
 					self.transcript.push(Entry::Tool(entry));
 				}
@@ -1237,7 +1335,7 @@ impl Chat {
 			.filter(|title| !title.trim().is_empty())
 			.or_else(|| summary.lines().find(|line| !line.trim().is_empty()));
 		let method = compaction_method_label(method.as_deref());
-		let mut label = StrMut::new(sf!("{} {method}", self.ctx.charset.icon(Icon::Camera)).as_str());
+		let mut label = fmts_mut!("{} {method}", self.ctx.charset.icon(Icon::Camera));
 		if let Some(tokens_after) = tokens_after.filter(|_| tokens_before > 0) {
 			let arrow = if self.ctx.charset == Charset::Ascii {
 				"->"
@@ -1296,6 +1394,10 @@ impl Chat {
 
 	/// Replaces the anchored AgentTree HUD projection.
 	pub fn set_agent_roster(&mut self, rows: Vec<AgentRow>) {
+		self.agent_labels = rows
+			.iter()
+			.map(|agent| agent_label(agent, self.ctx.charset))
+			.collect();
 		self.agents = rows;
 		self.bump_live();
 	}
@@ -1308,6 +1410,7 @@ impl Chat {
 	/// Replaces the complete status snapshot.
 	pub fn set_status(&mut self, facts: StatusFacts) {
 		let now = self.started_at.elapsed();
+		let labels = StatusLabels::new(&facts, self.ctx.charset);
 		let mut work = self.work.borrow_mut();
 		if work.facts.working != facts.working {
 			work.fade.retarget(
@@ -1322,6 +1425,9 @@ impl Chat {
 			);
 		}
 		work.facts = facts;
+		work.labels = labels;
+		work.elapsed_label = None;
+		work.update_active_brand(now, self.ctx.charset);
 		drop(work);
 		self.editor_ui.invalidate(STATUS_ID);
 		self.bump_live();
@@ -1661,8 +1767,8 @@ impl Chat {
 			Entry::User(user) => user.body.resize(message_width, ctx),
 			Entry::Assistant(body) => body.resize(width.max(1), ctx),
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
-			Entry::ToolGroup(tools) => {
-				for tool in tools {
+			Entry::ToolGroup(group) => {
+				for tool in &mut group.tools {
 					tool.view.resize(Self::tool_view_width(width), ctx);
 				}
 			},
@@ -1679,7 +1785,7 @@ impl Chat {
 				.saturating_add(1),
 			Entry::Assistant(body) => body.height().saturating_add(1),
 			Entry::Tool(tool) => tool_height(tool, width).saturating_add(1),
-			Entry::ToolGroup(tools) => tools.iter().fold(1_u16, |height, tool| {
+			Entry::ToolGroup(group) => group.tools.iter().fold(1_u16, |height, tool| {
 				height
 					.saturating_add(tool_height(tool, width))
 					.saturating_add(1)
@@ -1696,13 +1802,12 @@ impl Chat {
 			Entry::User(user) => draw_user(frame, y, user, ctx),
 			Entry::Assistant(body) => draw_rich(frame, y, body, 0, width, ctx.theme).saturating_add(1),
 			Entry::Tool(tool) => draw_tool(frame, y, width, tool, ctx).saturating_add(1),
-			Entry::ToolGroup(tools) => {
-				let label = sf!("Read {} files", tools.len());
+			Entry::ToolGroup(group) => {
 				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
-					&label,
+					&group.label,
 					ink(ctx.theme.muted).bold(),
 				)]);
-				tools.iter().fold(1_u16, |rows, tool| {
+				group.tools.iter().fold(1_u16, |rows, tool| {
 					rows
 						.saturating_add(draw_tool(frame, y.saturating_add(rows), width, tool, ctx))
 						.saturating_add(1)
@@ -1737,7 +1842,7 @@ impl Chat {
 			rect,
 			self.live_assistant.as_ref(),
 			&self.live_tools,
-			&self.agents,
+			&self.agent_labels,
 			&ctx,
 			elapsed,
 		);
@@ -1749,7 +1854,7 @@ impl Chat {
 			rect,
 			self.live_assistant.as_ref(),
 			&self.live_tools,
-			&self.agents,
+			&self.agent_labels,
 			&self.ctx,
 			elapsed,
 		);
@@ -1797,12 +1902,12 @@ fn draw_live_panel_impl(
 	rect: Rect,
 	assistant: Option<&LiveAssistant>,
 	tools: &[LiveTool],
-	agents: &[AgentRow],
+	agent_labels: &[Str],
 	ctx: &UiContext,
 	elapsed: Duration,
 ) {
 	frame.fill(rect, base_style(ctx.theme));
-	if assistant.is_none() && tools.is_empty() && agents.is_empty() {
+	if assistant.is_none() && tools.is_empty() && agent_labels.is_empty() {
 		return;
 	}
 	draw_box(
@@ -1815,26 +1920,12 @@ fn draw_live_panel_impl(
 	);
 	let mut y = rect.y.saturating_add(1);
 	let bottom = rect.y.saturating_add(rect.height).saturating_sub(1);
-	for agent in agents.iter().take(8) {
+	for label in agent_labels.iter().take(8) {
 		if y >= bottom {
 			break;
 		}
-		let indent = "  ".repeat(usize::from(agent.depth.min(4)));
-		let tool = agent
-			.tool
-			.as_deref()
-			.map_or_else(Str::default, |tool| sf!(" · {tool}"));
-		let tokens = agent
-			.tokens
-			.map_or_else(Str::default, |tokens| sf!(" · {}", compact_count(tokens)));
-		let label = sf!(
-			"{indent}{} {} · {}{tool}{tokens}",
-			ctx.charset.icon(Icon::Task),
-			agent.name,
-			agent.status
-		);
 		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
-			&label,
+			label,
 			ink(ctx.theme.secondary),
 		)]);
 		y = y.saturating_add(1);
@@ -1856,11 +1947,12 @@ fn draw_live_panel_impl(
 		if y >= bottom {
 			break;
 		}
-		let prefix = sf!("{} {}", ctx.charset.spinner().at(elapsed), tool.title);
-		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
-			&prefix,
-			ink(ctx.theme.info),
-		)]);
+		let style = ink(ctx.theme.info);
+		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[
+			Span::new(ctx.charset.spinner().at(elapsed), style),
+			Span::new(" ", style),
+			Span::new(&tool.title, style),
+		]);
 		y = y.saturating_add(1);
 		let available = bottom.saturating_sub(y);
 		let height = tool.view.height().min(available);
@@ -1952,8 +2044,8 @@ fn draw_user_body(
 		}
 		at = at.saturating_add(1);
 	}
-	let gutter = sf!("{} ", ctx.charset.cursor());
-	frame.put(0, at, &gutter, ink(ctx.theme.ok));
+	let x = frame.put(0, at, ctx.charset.cursor(), ink(ctx.theme.ok));
+	frame.put(x, at, " ", ink(ctx.theme.ok));
 	let used = draw_rich(frame, at, body, 3, body.width, ctx.theme);
 	at.saturating_sub(y).saturating_add(used).saturating_add(1)
 }
@@ -1976,14 +2068,8 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 	let rect = Rect::new(margin, y, width.saturating_sub(margin * 2), height);
 	let state = if tool.ok { ctx.theme.ok } else { ctx.theme.err };
 	draw_box(frame, rect, ink(state), panel_style(ctx.theme), ctx.charset, ctx.native_decor);
-	let icon = if tool.ok {
-		ctx.charset.check()
-	} else {
-		ctx.charset.icon(Icon::Error)
-	};
-	let title = sf!("{icon} {}", tool.title);
 	draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
-		&title,
+		&tool.label,
 		ink(state).bold(),
 	)]);
 	let mut row = y.saturating_add(1);
@@ -2170,14 +2256,45 @@ fn explicit_line_count(text: &str) -> u16 {
 	u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX)
 }
 
+fn read_group_label(count: usize) -> Str {
+	fmts_mut!("Read {count} files").freeze()
+}
+
+fn agent_label(agent: &AgentRow, charset: Charset) -> Str {
+	let mut label = StrMut::with_capacity(64);
+	for _ in 0..agent.depth.min(4) {
+		label.push_str("  ");
+	}
+	let _ = write!(label, "{} {} · {}", charset.icon(Icon::Task), agent.name, agent.status);
+	if let Some(tool) = &agent.tool {
+		let _ = write!(label, " · {tool}");
+	}
+	if let Some(tokens) = agent.tokens {
+		let _ = write!(label, " · {}", compact_count(tokens));
+	}
+	label.freeze()
+}
+
+const fn elapsed_label_key(elapsed: Duration) -> u64 {
+	let seconds = elapsed.as_secs();
+	if seconds < 60 {
+		seconds
+	} else if seconds < 3_600 {
+		60 + seconds / 60
+	} else {
+		let hours = seconds / 3_600;
+		3_600 + if hours > 99 { 99 } else { hours }
+	}
+}
+
 fn elapsed_label(elapsed: Duration) -> Str {
 	let seconds = elapsed.as_secs();
 	if seconds < 60 {
-		sf!("{seconds}s")
+		fmts_mut!("{seconds}s").freeze()
 	} else if seconds < 3_600 {
-		sf!("{}m", seconds / 60)
+		fmts_mut!("{}m", seconds / 60).freeze()
 	} else {
-		sf!("{}h", (seconds / 3_600).min(99))
+		fmts_mut!("{}h", (seconds / 3_600).min(99)).freeze()
 	}
 }
 
@@ -2384,7 +2501,7 @@ mod tests {
 		chat.tool_finished("read-a", true, sf!("a"));
 		chat.tool_started("read-b", "read", "src/b.rs");
 		chat.tool_finished("read-b", true, sf!("b"));
-		assert!(matches!(&chat.transcript[..], [Entry::ToolGroup(group)] if group.len() == 2));
+		assert!(matches!(&chat.transcript[..], [Entry::ToolGroup(group)] if group.tools.len() == 2));
 
 		chat.tool_started("shell", "bash", "cargo metadata");
 		chat.tool_finished("shell", true, sf!("ok"));

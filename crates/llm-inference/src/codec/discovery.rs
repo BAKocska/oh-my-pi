@@ -634,6 +634,8 @@ fn protocol_error() -> Error {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	fn request(cursor: Option<&str>) -> DiscoveryRequest {

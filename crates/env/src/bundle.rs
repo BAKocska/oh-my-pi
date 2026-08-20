@@ -330,7 +330,7 @@ fn hash_bytes(value: &str) -> Result<Bytes, BundleError> {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 
 	use super::{BundleFile, pack_bundle, unpack_bundle};
 

@@ -497,6 +497,7 @@ fn partial_opener_suffix(bytes: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
 	use serde_json::json;
 
 	use super::*;

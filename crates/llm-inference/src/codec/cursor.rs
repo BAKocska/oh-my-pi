@@ -1993,7 +1993,7 @@ fn cursor_raw_event(event: CursorEvent) -> RawEvent {
 		CursorEvent::InteractionQuery { id, query, reply } => {
 			let kind = query
 				.as_ref()
-				.map_or(sf!("unknown"), interaction_query_kind);
+				.map_or_else(|| sf!("unknown"), |query| sf!(interaction_query_kind(query)));
 			let payload = Bytes::from(wire::InteractionQuery { id, query }.encode_to_vec());
 			RawEvent::Control(ProviderControlEvent::InteractionQuery { id, kind, payload, reply })
 		},
@@ -2003,9 +2003,9 @@ fn cursor_raw_event(event: CursorEvent) -> RawEvent {
 	}
 }
 
-const fn interaction_query_kind(query: &wire::interaction_query::Query) -> Str {
+const fn interaction_query_kind(query: &wire::interaction_query::Query) -> &'static str {
 	use wire::interaction_query::Query;
-	sf!(match query {
+	match query {
 		Query::WebSearchRequestQuery(_) => "web_search",
 		Query::WebFetchRequestQuery(_) => "web_fetch",
 		Query::AskQuestionInteractionQuery(_) => "ask_question",
@@ -2014,7 +2014,7 @@ const fn interaction_query_kind(query: &wire::interaction_query::Query) -> Str {
 		Query::ExaFetchRequestQuery(_) => "exa_fetch",
 		Query::CreatePlanRequestQuery(_) => "create_plan",
 		Query::SetupVmEnvironmentArgs(_) => "setup_vm_environment",
-	})
+	}
 }
 
 fn inference_error(error: CursorProtocolError) -> Error {
@@ -2327,7 +2327,7 @@ mod tests {
 			assert_eq!(*id, case.id);
 			let kind = query
 				.as_ref()
-				.map_or(sf!("unknown"), interaction_query_kind);
+				.map_or_else(|| sf!("unknown"), |query| sf!(interaction_query_kind(query)));
 			assert_eq!(Some(kind.as_str()), case.kind.as_deref());
 
 			match case.disposition.as_str() {

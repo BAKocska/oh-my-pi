@@ -7,7 +7,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use omp_core::{IntoStr, Str, sf};
+use omp_core::{IntoStr, Str};
 
 use super::resolver::Scheme;
 
@@ -698,8 +698,9 @@ pub fn prepend_suffix_resolution_notice(text: &str, from: &str, resolved: &Suffi
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use omp_core::sf;
 
+	use super::*;
 	#[test]
 	fn parses_and_merges_ranges() {
 		let parsed = parse_selector(Some("9-10,5+4,20-")).unwrap();

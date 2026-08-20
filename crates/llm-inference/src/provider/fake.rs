@@ -814,7 +814,7 @@ mod tests {
 
 	use bytes::Bytes;
 	use futures::{StreamExt, future::poll_fn};
-	use omp_core::Str;
+	use omp_core::{Str, sf};
 	use tower::Service;
 
 	use super::{FakeProvider, FakeScript};

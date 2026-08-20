@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::{Str, sf};
+use omp_core::Str;
 use tower::Service;
 
 use crate::{
@@ -17,8 +17,8 @@ use crate::{
 	catalog::OperationKind,
 	error::Error,
 	operation::{
-		OperationRequest, OperationResponse, media_protocol_error, media_validation_error,
-		wrong_operation,
+		MediaOperationError, OperationRequest, OperationResponse, media_protocol_error,
+		media_validation_error, wrong_operation,
 	},
 };
 
@@ -40,11 +40,16 @@ pub struct TranscriptionLimits {
 }
 
 /// Typed transcription validation or stream failure.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TranscriptionError {
 	/// Input media type is not accepted.
-	MediaType(Str),
+	#[error("transcription media type {media_type} is unsupported")]
+	MediaType {
+		/// Unsupported media type.
+		media_type: Str,
+	},
 	/// Inline immutable input exceeds its bound.
+	#[error("transcription input contains {observed} bytes, but the maximum is {limit}")]
 	InputTooLarge {
 		/// Configured maximum inline byte count.
 		limit:    u64,
@@ -52,22 +57,31 @@ pub enum TranscriptionError {
 		observed: u64,
 	},
 	/// Translation was required but is unsupported.
+	#[error("transcription translation is unsupported")]
 	TranslationUnsupported,
 	/// A language hint was supplied but is unsupported.
+	#[error("transcription language hints are unsupported")]
 	LanguageHintUnsupported,
 	/// Speaker diarization was required but is unsupported.
+	#[error("transcription speaker diarization is unsupported")]
 	DiarizationUnsupported,
 	/// Required timestamp granularity is unsupported.
+	#[error("transcription timestamp granularity is unsupported")]
 	TimestampsUnsupported,
 	/// Transcript did not begin with a Started event.
+	#[error("transcript did not begin with a start event")]
 	MissingStart,
 	/// An event arrived after completion.
+	#[error("transcript event arrived after completion")]
 	AfterCompletion,
 	/// Segment or word timestamps are inverted or moved backwards.
+	#[error("transcript timestamp interval is invalid")]
 	InvalidTimestamp,
 	/// Segment index did not increase monotonically.
+	#[error("transcript segment index is not monotonic")]
 	SegmentOrder,
 	/// Completed text disagrees with finalized segment text.
+	#[error("transcript completion disagrees with finalized segments")]
 	CompletionMismatch,
 }
 
@@ -137,7 +151,7 @@ fn validate_media_type(
 	limits: &TranscriptionLimits,
 ) -> Result<(), TranscriptionError> {
 	if !limits.media_types.is_empty() && !limits.media_types.contains(media_type) {
-		return Err(TranscriptionError::MediaType(media_type.clone()));
+		return Err(TranscriptionError::MediaType { media_type: media_type.clone() });
 	}
 	Ok(())
 }
@@ -344,35 +358,38 @@ where
 				return Err(wrong_operation(&call, OperationKind::Transcribe));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(OperationKind::Transcribe, sf!("{error:?}")));
+				return Err(media_validation_error(OperationKind::Transcribe, error));
 			}
 			let response = pending
 				.ok_or_else(|| {
 					media_validation_error(
 						OperationKind::Transcribe,
-						"transcription_request_not_dispatched",
+						MediaOperationError::TranscriptionRequestNotDispatched,
 					)
 				})?
 				.await?;
 			let mut state = TranscriptState::default();
-			Ok(response.map(move |mut output| {
-				let stream = async_stream::stream! {
-					while let Some(event) = output.next().await {
-						match event.and_then(|event| {
-							state.observe(&event).map_err(|error| media_protocol_error(OperationKind::Transcribe, sf!("{error:?}")))?;
-							Ok(event)
-						}) {
-							Ok(event) => yield Ok(event),
-							Err(error) => { yield Err(error); return; }
+			Ok(response
+				.map(move |mut output| {
+					let stream = async_stream::stream! {
+						while let Some(event) = output.next().await {
+							match event.and_then(|event| {
+								state.observe(&event).map_err(|error| {
+									media_protocol_error(OperationKind::Transcribe, error)
+								})?;
+								Ok(event)
+							}) {
+								Ok(event) => yield Ok(event),
+								Err(error) => { yield Err(error); return; }
+							}
 						}
-					}
-					if let Err(error) = state.finish() {
-						let detail = sf!("{error:?}");
-						yield Err(media_protocol_error(OperationKind::Transcribe, detail));
-					}
-				};
-				Box::pin(stream) as TranscriptStream
-			}).into_answer(AnswerBody::Transcript))
+						if let Err(error) = state.finish() {
+							yield Err(media_protocol_error(OperationKind::Transcribe, error));
+						}
+					};
+					Box::pin(stream) as TranscriptStream
+				})
+				.into_answer(AnswerBody::Transcript))
 		}
 	}
 }

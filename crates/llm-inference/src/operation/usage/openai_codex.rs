@@ -773,7 +773,7 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
-	use omp_core::{base64_url, parse_rfc3339};
+	use omp_core::{base64_url, parse_rfc3339, sf};
 	use parking_lot::Mutex;
 	use secrecy::{ExposeSecret as _, SecretString};
 

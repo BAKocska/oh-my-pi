@@ -3,7 +3,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use omp_core::{Str, sf};
+use omp_core::sf;
 use omp_llm_catalog::OperationKind;
 use omp_llm_inference::{
 	Client,

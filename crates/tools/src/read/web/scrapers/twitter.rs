@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use omp_core::{Str, sf};
+use omp_core::sf;
 use quick_xml::{
 	Reader, XmlVersion,
 	events::{BytesStart, Event},
@@ -543,6 +543,7 @@ mod tests {
 	use std::future::{Future, ready};
 
 	use bytes::Bytes;
+	use omp_core::Str;
 	use parking_lot::Mutex;
 
 	use super::*;

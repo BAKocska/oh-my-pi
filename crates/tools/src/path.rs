@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use omp_core::{Str, sf};
+use omp_core::Str;
 
 /// A colon selector split from its path without mistaking Windows drive syntax.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +66,8 @@ pub enum PathError {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 	#[test]
 	fn preserves_windows_drive_while_splitting_selector() {

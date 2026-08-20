@@ -33,6 +33,34 @@ pub enum Error {
 	#[error("protocol error: {0}")]
 	Protocol(Str),
 
+	/// A Chromium screencast frame contained invalid base64.
+	#[error("screencast frame base64: {source}")]
+	ScreencastFrameBase64 {
+		/// Underlying base64 decoding failure.
+		#[source]
+		source: omp_core::encoding::DecodeError,
+	},
+
+	/// A Firefox screenshot contained invalid base64.
+	#[error("screenshot base64: {source}")]
+	ScreenshotBase64 {
+		/// Underlying base64 decoding failure.
+		#[source]
+		source: omp_core::encoding::DecodeError,
+	},
+
+	/// A JPEG frame could not be decoded.
+	#[error("jpeg: {0}")]
+	Jpeg(#[source] zune_jpeg::errors::DecodeErrors),
+
+	/// A PNG frame could not be decoded.
+	#[error("png: {0}")]
+	Png(#[source] png::DecodingError),
+
+	/// A websocket message contained malformed JSON.
+	#[error("malformed message: {0}")]
+	MalformedMessage(#[from] serde_json::Error),
+
 	/// Websocket transport failure while talking to a remote engine.
 	#[error("websocket error: {0}")]
 	WebSocket(#[from] tokio_tungstenite::tungstenite::Error),

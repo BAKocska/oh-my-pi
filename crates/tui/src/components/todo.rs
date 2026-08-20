@@ -92,20 +92,29 @@ impl TaskStatus {
 /// checkbox and its label. `status=` sets [`TaskStatus`]; `desc=` carries
 /// the blocker note shown by [`TaskStatus::Blocked`].
 pub struct TodoTask {
-	props:    Props,
-	label:    Str,
-	children: Vec<Self>,
+	props:        Props,
+	label:        Str,
+	blocked_note: Str,
+	counter:      Str,
+	children:     Vec<Self>,
 }
 
 impl TodoTask {
 	/// Creates a pending, empty task.
 	pub fn new() -> Self {
-		Self { props: Props::new(), label: Str::default(), children: Vec::new() }
+		Self {
+			props:        Props::new(),
+			label:        Str::default(),
+			blocked_note: sf!(" (blocked)"),
+			counter:      Str::default(),
+			children:     Vec::new(),
+		}
 	}
 
 	/// Sets one task property.
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		self.props.set(prop, value);
+		self.refresh_labels();
 		self
 	}
 
@@ -130,7 +139,21 @@ impl TodoTask {
 	/// Appends a child task, turning this task into a group header.
 	pub fn task(mut self, task: Self) -> Self {
 		self.children.push(task);
+		self.refresh_labels();
 		self
+	}
+
+	fn refresh_labels(&mut self) {
+		self.blocked_note = self
+			.props
+			.str_of(Prop::Desc)
+			.map_or_else(|| sf!(" (blocked)"), |reason| sf!(" (blocked: {reason})"));
+		let (closed, total) = leaf_counts(&self.children);
+		self.counter = if self.children.is_empty() {
+			Str::default()
+		} else {
+			sf!(" {closed}/{total}")
+		};
 	}
 
 	fn effective_label(&self) -> &str {
@@ -165,15 +188,21 @@ impl Default for TodoTask {
 /// any remaining stages collapse into a summary row. The list is display-only
 /// and has no focus or keys.
 pub struct Todo {
-	props: Props,
-	slot:  Slot,
-	tasks: Vec<TodoTask>,
+	props:           Props,
+	slot:            Slot,
+	tasks:           Vec<TodoTask>,
+	stage_summaries: [Str; 2],
 }
 
 impl Todo {
 	/// Creates an empty todo list.
 	pub fn new() -> Self {
-		Self { props: Props::new(), slot: next_slot(), tasks: Vec::new() }
+		Self {
+			props:           Props::new(),
+			slot:            next_slot(),
+			tasks:           Vec::new(),
+			stage_summaries: [Str::default(), Str::default()],
+		}
 	}
 
 	/// Sets one list property.
@@ -185,6 +214,11 @@ impl Todo {
 	/// Appends a root task.
 	pub fn task(mut self, task: TodoTask) -> Self {
 		self.tasks.push(task);
+		let (_, end) = self.stage_window();
+		let hidden = self.tasks.len().saturating_sub(end);
+		let suffix = if hidden == 1 { "" } else { "s" };
+		self.stage_summaries =
+			[sf!("... {hidden} more stage{suffix}"), sf!("… {hidden} more stage{suffix}")];
 		self
 	}
 
@@ -375,16 +409,10 @@ impl Component for Todo {
 			}
 			if end < self.tasks.len() && y < rect.y.saturating_add(rect.height).min(pc.clip) {
 				let x = paint_spine(pc, rect.x, y, glyphs.branch, &mut spine);
-				let hidden = self.tasks.len() - end;
-				let ellipsis = if matches!(pc.ctx.charset, Charset::Ascii) {
-					"..."
-				} else {
-					"…"
-				};
 				let summary =
-					sf!("{ellipsis} {hidden} more stage{}", if hidden == 1 { "" } else { "s" });
+					&self.stage_summaries[usize::from(!matches!(pc.ctx.charset, Charset::Ascii))];
 				pc.frame
-					.put(x, y, &summary, Style::new().fg(pc.ctx.theme.muted));
+					.put(x, y, summary, Style::new().fg(pc.ctx.theme.muted));
 				y = y.saturating_add(1);
 			}
 		} else {
@@ -507,21 +535,15 @@ fn paint_tasks(
 			};
 			x = pc.frame.put(x, *y, label, label_style);
 			if status == TaskStatus::Blocked {
-				let note = task
-					.props
-					.str_of(Prop::Desc)
-					.map_or_else(|| sf!(" (blocked)"), |reason| sf!(" (blocked: {reason})"));
-				pc.frame.put(x, *y, &note, Style::new().dim());
+				pc.frame.put(x, *y, &task.blocked_note, Style::new().dim());
 			}
 		} else {
 			// Group header: bold label plus an automatic closed/total count
 			// over its descendant leaves.
-			let (closed, total) = leaf_counts(&task.children);
 			x = pc
 				.frame
 				.put(x, *y, label, Style::new().fg(pc.ctx.theme.fg).bold());
-			let counter = sf!(" {closed}/{total}");
-			pc.frame.put(x, *y, &counter, Style::new().dim());
+			pc.frame.put(x, *y, &task.counter, Style::new().dim());
 		}
 		*y = y.saturating_add(1);
 		if descend && !task.children.is_empty() {

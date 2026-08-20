@@ -1,8 +1,10 @@
 //! Offline model identity classification for catalog compilation and discovery
 //! normalization.
+#![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 
 use omp_core::{SemVer, Str, sf};
 use serde::{Deserialize, Serialize};
+use strum::IntoStaticStr;
 
 use crate::{
 	id::{ClassId, FamilyId},
@@ -10,12 +12,15 @@ use crate::{
 };
 
 /// Source phase allowed to invoke identity classification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[allow(missing_docs, reason = "strum IntoStaticStr generates undocumented as_str")]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassificationPhase {
 	/// Checked-in source compilation.
+	#[strum(serialize = "catalog-compiler")]
 	CatalogCompiler,
 	/// Provider model-list normalization.
+	#[strum(serialize = "provider-discovery")]
 	DiscoveryNormalizer,
 }
 
@@ -174,10 +179,7 @@ fn classify_with_taxonomy(
 			} else {
 				sf!("bounded vendor and model-family segments establish lineage")
 			},
-			provenance: match input.phase {
-				ClassificationPhase::CatalogCompiler => sf!("catalog-compiler"),
-				ClassificationPhase::DiscoveryNormalizer => sf!("provider-discovery"),
-			},
+			provenance: sf!(<&'static str>::from(input.phase)),
 			expires_at_ms: None,
 		},
 	}

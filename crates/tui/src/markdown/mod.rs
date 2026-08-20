@@ -1,6 +1,8 @@
 //! Width-aware Markdown rendering into styled terminal lines.
 
-use omp_core::{Str, StrMut, sf};
+use std::{fmt, fmt::Write as _};
+
+use omp_core::{Str, StrMut};
 use smallvec::SmallVec;
 
 use crate::{
@@ -27,6 +29,41 @@ struct DiagramStyles {
 	line:   Style,
 	/// Arrowheads, markers, and fills.
 	accent: Style,
+}
+
+pub(super) struct MarkerText {
+	bytes: [u8; 23],
+	len:   u8,
+}
+
+impl MarkerText {
+	pub(super) fn as_str(&self) -> &str {
+		// SAFETY: `fmt::Write` only appends valid UTF-8 within the fixed buffer.
+		unsafe { std::str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
+	}
+}
+
+impl fmt::Write for MarkerText {
+	fn write_str(&mut self, text: &str) -> fmt::Result {
+		let start = usize::from(self.len);
+		let end = start.checked_add(text.len()).ok_or(fmt::Error)?;
+		let target = self.bytes.get_mut(start..end).ok_or(fmt::Error)?;
+		target.copy_from_slice(text.as_bytes());
+		self.len = end as u8;
+		Ok(())
+	}
+}
+
+fn ordinal_marker(value: u64) -> MarkerText {
+	let mut marker = MarkerText { bytes: [0; 23], len: 0 };
+	write!(&mut marker, "{value}. ").expect("usize marker fits its fixed buffer");
+	marker
+}
+
+fn ordinal_marker_unordered() -> MarkerText {
+	let mut marker = MarkerText { bytes: [0; 23], len: 2 };
+	marker.bytes[..2].copy_from_slice(b"- ");
+	marker
 }
 
 /// Styles used by the Markdown renderer.
@@ -655,12 +692,12 @@ fn render_fenced_code(
 		None
 	};
 
-	let top = if language.is_empty() {
-		sf!("```")
-	} else {
-		sf!("```{language}")
-	};
-	clipped_row(sink, width, theme.code_border, top.as_str());
+	{
+		let mut clipped = (&mut *sink).clip(width, None);
+		clipped.run(theme.code_border, "```");
+		clipped.run(theme.code_border, language);
+		clipped.newline();
+	}
 
 	if let Some((rows, after)) = highlighted {
 		push_highlighted_code_rows(&rows, width, theme, Prefix::empty_ref(), sink);
@@ -767,12 +804,15 @@ fn bare_math_end(lines: &[&str], index: usize) -> Option<usize> {
 	if !crate::latex::is_bare_math_environment(environment) {
 		return None;
 	}
-	let end_token = sf!("\\end{{{environment}}}");
 	for (offset, candidate) in lines[index..].iter().enumerate() {
 		if offset > 0 && candidate.trim().is_empty() {
 			return None;
 		}
-		if candidate.contains(end_token.as_str()) {
+		if candidate.match_indices("\\end{").any(|(at, _)| {
+			candidate[at + 5..]
+				.strip_prefix(environment)
+				.is_some_and(|rest| rest.starts_with('}'))
+		}) {
 			return Some(index + offset + 1);
 		}
 	}
@@ -942,9 +982,9 @@ fn render_list(
 		let marker_text = if ordered {
 			let value = ordinal;
 			ordinal = ordinal.saturating_add(1);
-			sf!("{value}. ")
+			ordinal_marker(value as u64)
 		} else {
-			sf!("- ")
+			ordinal_marker_unordered()
 		};
 		let indent = depth.saturating_mul(2);
 		let mut first_prefix = Prefix::default();
@@ -1087,15 +1127,11 @@ fn render_list_fenced_code(
 		None
 	};
 
-	let top = if language.is_empty() {
-		sf!("```")
-	} else {
-		sf!("```{language}")
-	};
 	{
 		let clipped = (&mut *sink).clip(width, None);
 		let mut prefixed = clipped.prefixed(first_prefix, continuation);
-		prefixed.run(theme.code_border, top.as_str());
+		prefixed.run(theme.code_border, "```");
+		prefixed.run(theme.code_border, language);
 		prefixed.newline();
 	}
 
@@ -1499,7 +1535,7 @@ fn normalize_html_chunk(raw: &str, output: &mut StrMut) {
 							}
 							if let Some(list) = lists.last_mut() {
 								if list.ordered {
-									output.push_str(sf!("{}. ", list.next).as_str());
+									let _ = write!(output, "{}. ", list.next);
 									list.next = list.next.saturating_add(1);
 								} else {
 									output.push_str("- ");

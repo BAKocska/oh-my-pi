@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use omp_core::{Str, sf};
+use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
 /// Content capability kinds supported by the static declaration table.
@@ -149,6 +149,8 @@ pub fn dispatch_first<'a, T>(
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 	#[test]
 	fn static_priority_and_first_wins_dispatch() {

@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use omp_core::{Str, sf};
+use omp_core::sf;
 use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
 use url::Url;

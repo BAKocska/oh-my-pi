@@ -514,11 +514,14 @@ mod tests {
 	#[test]
 	fn artifact_url_accepts_only_canonical_durable_digests() {
 		const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-		let url = ArtifactUrl::new(concat!(
-			"artifact://b3/",
-			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-			":raw"
-		).into_str())
+		let url = ArtifactUrl::new(
+			concat!(
+				"artifact://b3/",
+				"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				":raw"
+			)
+			.into_str(),
+		)
 		.unwrap();
 		assert_eq!(url.address(), ArtifactAddress::Digest(DIGEST));
 		assert_eq!(url.digest(), Some(DIGEST));

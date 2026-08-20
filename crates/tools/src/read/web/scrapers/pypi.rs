@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use futures::join;
-use omp_core::{Str, sf};
+use omp_core::sf;
 use serde::Deserialize;
 use url::Url;
 

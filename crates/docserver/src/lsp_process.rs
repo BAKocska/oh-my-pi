@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	Environment, LanguageId,
+	Environment, Error, LanguageId,
 	lsp::{LspError, LspServer, LspTransport, LspTransportError},
 	lsp_registry::{
 		LspBindingHandle, LspBindingId, LspBindingSpec, LspRegistry, LspRegistryError, LspSelector,
@@ -114,13 +114,15 @@ impl LspTransportSettings {
 		validate_limit("inbound_queue_capacity", self.inbound_queue_capacity, MAX_QUEUE_CAPACITY)?;
 		validate_limit("max_pending_requests", self.max_pending_requests, MAX_PENDING_REQUESTS)?;
 		if self.initialize_timeout_ms == 0 || self.initialize_timeout_ms > MAX_INITIALIZE_TIMEOUT_MS {
-			return Err(LspProcessError::InvalidConfig {
-				reason: sf!("initialize_timeout_ms must be between 1 and {MAX_INITIALIZE_TIMEOUT_MS}"),
+			return Err(LspProcessError::InvalidTimeout {
+				setting: "initialize_timeout_ms",
+				max:     MAX_INITIALIZE_TIMEOUT_MS,
 			});
 		}
 		if self.shutdown_timeout_ms == 0 || self.shutdown_timeout_ms > MAX_SHUTDOWN_TIMEOUT_MS {
-			return Err(LspProcessError::InvalidConfig {
-				reason: sf!("shutdown_timeout_ms must be between 1 and {MAX_SHUTDOWN_TIMEOUT_MS}"),
+			return Err(LspProcessError::InvalidTimeout {
+				setting: "shutdown_timeout_ms",
+				max:     MAX_SHUTDOWN_TIMEOUT_MS,
 			});
 		}
 		Ok(())
@@ -173,8 +175,9 @@ impl LspProcessConfig {
 			.languages
 			.iter()
 			.map(|language| {
-				LanguageId::new(language).map_err(|error| LspProcessError::InvalidConfig {
-					reason: Str::new(error.to_string()),
+				LanguageId::new(language).map_err(|source| LspProcessError::InvalidLanguage {
+					language: language.clone(),
+					source,
 				})
 			})
 			.collect::<Result<Vec<_>, LspProcessError>>()?;
@@ -214,6 +217,23 @@ pub enum LspProcessError {
 	InvalidConfig {
 		/// Validation diagnostic.
 		reason: Str,
+	},
+	/// A configured language identifier was invalid.
+	#[error("invalid LSP language identifier {language}")]
+	InvalidLanguage {
+		/// The rejected language identifier.
+		language: Str,
+		/// The validation failure.
+		#[source]
+		source:   Error,
+	},
+	/// A configured timeout is zero or exceeds its strict upper bound.
+	#[error("{setting} must be between 1 and {max}")]
+	InvalidTimeout {
+		/// Configuration field containing the invalid timeout.
+		setting: &'static str,
+		/// Largest accepted timeout in milliseconds.
+		max:     u64,
 	},
 	/// The child did not complete initialize before the configured deadline.
 	#[error("LSP initialize request timed out")]
@@ -868,8 +888,9 @@ async fn writer_loop<W>(
 		};
 		let result = write_frame(&mut writer, &command.payload)
 			.await
-			.map_err(|error| LspTransportError::Closed {
-				message: sf!("cannot write LSP frame: {error}"),
+			.map_err(|source| LspTransportError::Io {
+				operation: "cannot write LSP frame",
+				source:    Arc::new(source),
 			});
 		let failed = result.is_err();
 		let failure = result.as_ref().err().cloned();
@@ -893,8 +914,8 @@ async fn reader_loop<R>(
 	loop {
 		let payload = match read_frame(&mut reader, max_header_bytes, max_message_bytes).await {
 			Ok(payload) => payload,
-			Err(message) => {
-				transport.fail_all(LspTransportError::Closed { message });
+			Err(source) => {
+				transport.fail_all(LspTransportError::Frame { source: Arc::new(source) });
 				break;
 			},
 		};
@@ -1000,68 +1021,115 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
 	writer.flush().await
 }
 
+/// A failure while decoding one Content-Length-framed LSP message.
+#[derive(Debug, thiserror::Error)]
+pub enum LspFrameError {
+	/// Standard output ended before the next frame began.
+	#[error("LSP standard output reached EOF")]
+	Eof,
+	/// Standard output ended partway through a frame header.
+	#[error("EOF inside LSP frame header")]
+	HeaderEof,
+	/// The frame header exceeded its configured byte limit.
+	#[error("LSP frame header exceeds configured limit")]
+	HeaderTooLarge,
+	/// Reading the frame header failed.
+	#[error("cannot read LSP frame header")]
+	ReadHeader {
+		/// The underlying I/O failure.
+		#[source]
+		source: std::io::Error,
+	},
+	/// The frame header was not UTF-8.
+	#[error("LSP frame header is not ASCII-compatible UTF-8")]
+	HeaderUtf8,
+	/// The frame header contained non-ASCII bytes.
+	#[error("LSP frame header contains non-ASCII bytes")]
+	HeaderNonAscii,
+	/// A frame header field was malformed.
+	#[error("malformed LSP frame header field")]
+	MalformedHeader,
+	/// The frame contained multiple Content-Length headers.
+	#[error("duplicate Content-Length header")]
+	DuplicateContentLength,
+	/// The Content-Length value was empty or contained non-digits.
+	#[error("invalid Content-Length header")]
+	InvalidContentLength,
+	/// The Content-Length value overflowed this platform.
+	#[error("Content-Length overflows this platform")]
+	ContentLengthOverflow,
+	/// The frame did not contain a Content-Length header.
+	#[error("LSP frame is missing Content-Length")]
+	MissingContentLength,
+	/// The frame payload exceeded its configured byte limit.
+	#[error("LSP frame payload exceeds configured limit")]
+	PayloadTooLarge,
+	/// Reading the complete frame payload failed.
+	#[error("cannot read complete LSP frame payload")]
+	ReadPayload {
+		/// The underlying I/O failure.
+		#[source]
+		source: std::io::Error,
+	},
+}
+
 pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 	reader: &mut R,
 	max_header_bytes: usize,
 	max_message_bytes: usize,
-) -> Result<Bytes, Str> {
+) -> Result<Bytes, LspFrameError> {
 	let mut header = Vec::with_capacity(max_header_bytes.min(1024));
 	let mut byte = [0_u8; 1];
 	loop {
 		match reader.read(&mut byte).await {
-			Ok(0) if header.is_empty() => {
-				return Err(sf!("LSP standard output reached EOF"));
-			},
-			Ok(0) => return Err(sf!("EOF inside LSP frame header")),
+			Ok(0) if header.is_empty() => return Err(LspFrameError::Eof),
+			Ok(0) => return Err(LspFrameError::HeaderEof),
 			Ok(_) => {
 				if header.len() == max_header_bytes {
-					return Err(sf!("LSP frame header exceeds configured limit"));
+					return Err(LspFrameError::HeaderTooLarge);
 				}
 				if header.len() == header.capacity() {
 					header.reserve_exact(1);
 				}
 				header.push(byte[0]);
 			},
-			Err(error) => return Err(sf!("cannot read LSP frame header: {error}")),
+			Err(source) => return Err(LspFrameError::ReadHeader { source }),
 		}
 		if header.ends_with(b"\r\n\r\n") {
 			break;
 		}
 	}
-	let header_text = std::str::from_utf8(&header)
-		.map_err(|_| sf!("LSP frame header is not ASCII-compatible UTF-8"))?;
+	let header_text = std::str::from_utf8(&header).map_err(|_| LspFrameError::HeaderUtf8)?;
 	if !header.is_ascii() {
-		return Err(sf!("LSP frame header contains non-ASCII bytes"));
+		return Err(LspFrameError::HeaderNonAscii);
 	}
 	let mut content_length = None;
 	for line in header_text[..header_text.len() - 4].split("\r\n") {
-		let (name, value) = line
-			.split_once(':')
-			.ok_or_else(|| sf!("malformed LSP frame header field"))?;
+		let (name, value) = line.split_once(':').ok_or(LspFrameError::MalformedHeader)?;
 		if name.eq_ignore_ascii_case("Content-Length") {
 			if content_length.is_some() {
-				return Err(sf!("duplicate Content-Length header"));
+				return Err(LspFrameError::DuplicateContentLength);
 			}
 			let value = value.trim();
 			if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-				return Err(sf!("invalid Content-Length header"));
+				return Err(LspFrameError::InvalidContentLength);
 			}
 			content_length = Some(
 				value
 					.parse::<usize>()
-					.map_err(|_| sf!("Content-Length overflows this platform"))?,
+					.map_err(|_| LspFrameError::ContentLengthOverflow)?,
 			);
 		}
 	}
-	let content_length = content_length.ok_or_else(|| sf!("LSP frame is missing Content-Length"))?;
+	let content_length = content_length.ok_or(LspFrameError::MissingContentLength)?;
 	if content_length > max_message_bytes {
-		return Err(sf!("LSP frame payload exceeds configured limit"));
+		return Err(LspFrameError::PayloadTooLarge);
 	}
 	let mut payload = vec![0; content_length];
 	reader
 		.read_exact(&mut payload)
 		.await
-		.map_err(|error| sf!("cannot read complete LSP frame payload: {error}"))?;
+		.map_err(|source| LspFrameError::ReadPayload { source })?;
 	Ok(Bytes::from(payload))
 }
 
@@ -1095,8 +1163,8 @@ fn raw_from_bytes(bytes: &[u8]) -> Result<&RawValue, LspTransportError> {
 	serde_json::from_slice(bytes).map_err(invalid_response)
 }
 
-fn invalid_response(error: serde_json::Error) -> LspTransportError {
-	LspTransportError::InvalidResponse { message: Str::new(error.to_string()) }
+fn invalid_response(source: serde_json::Error) -> LspTransportError {
+	LspTransportError::InvalidJson { source: Arc::new(source) }
 }
 
 fn validate_limit(name: &str, value: usize, maximum: usize) -> Result<(), LspProcessError> {

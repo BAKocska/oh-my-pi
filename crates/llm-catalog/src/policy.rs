@@ -1192,7 +1192,7 @@ mod tests {
 			StaticHeader { name: sf!("user-agent"), value: sf!("b") },
 			StaticHeader { name: sf!("x-model-test"), value: sf!("a") },
 		])
-		.expect("safe headers"); 
+		.expect("safe headers");
 		assert_eq!(left, right);
 		assert_eq!(left.id, left.content_id().expect("valid content id"));
 	}

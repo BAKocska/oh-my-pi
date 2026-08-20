@@ -10,6 +10,7 @@ use bytes::Bytes;
 use omp_core::{Str, sf};
 use secrecy::SecretString;
 use serde_json::{Value, value::RawValue};
+use strum::IntoStaticStr;
 
 use crate::{
 	answer::ArtifactRef,
@@ -511,7 +512,8 @@ pub struct Message {
 }
 
 /// Grammar language for a freeform tool input.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
 pub enum ToolGrammarSyntax {
 	/// Lark grammar.
 	Lark,
@@ -644,13 +646,16 @@ pub struct ReasoningRequest {
 }
 
 /// Visibility of model reasoning.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
 pub enum ReasoningVisibility {
 	/// Do not expose reasoning text.
+	#[strum(serialize = "omitted")]
 	Hidden,
 	/// Expose a provider-produced summary when available.
+	#[strum(serialize = "summarized")]
 	Summary,
 	/// Expose canonical thinking deltas when supported.
+	#[strum(serialize = "visible")]
 	Visible,
 }
 
@@ -1142,7 +1147,8 @@ pub struct LoginRequest {
 }
 
 /// Public authentication method selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "kebab-case")]
 pub enum AuthMethod {
 	/// Static API key.
 	ApiKey,

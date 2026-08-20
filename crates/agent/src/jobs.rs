@@ -6,8 +6,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Duration, Str, sf};
-use omp_env::{EnvClient, ProcessAttachmentEvent};
+use omp_core::{Duration, Str};
+use omp_env::{ClientError, EnvClient, ProcessAttachmentEvent};
 use omp_proto::{
 	blob::v1::Chunk,
 	env::v1::{
@@ -375,6 +375,69 @@ pub enum JobClaimError {
 	AlreadyConsumed,
 }
 
+/// Failure while observing and recording a named-process settlement.
+#[derive(Debug, thiserror::Error)]
+enum JobSettlementError {
+	#[error("could not attach to named process: {0}")]
+	Attach(#[source] ClientError),
+	#[error("named-process attachment failed: {0}")]
+	Attachment(#[source] ClientError),
+	#[error("could not open settlement artifact upload: {0}")]
+	OpenArtifact(#[source] ClientError),
+	#[error("could not commit settlement artifact: {0}")]
+	CommitArtifact(#[source] ClientError),
+	#[error("could not stream settlement artifact: {0}")]
+	StreamArtifact(#[source] ClientError),
+	#[error("could not encode settlement header: {0}")]
+	EncodeHeader(#[source] serde_json::Error),
+	#[error("could not encode process output: {0}")]
+	EncodeOutput(#[source] serde_json::Error),
+	#[error("could not encode terminal process state: {0}")]
+	EncodeTerminalState(#[source] serde_json::Error),
+	#[error("named-process attachment omitted acknowledgement")]
+	AttachmentOmittedAcknowledgement,
+	#[error("named-process attachment closed before acknowledgement")]
+	AttachmentClosedBeforeAcknowledgement,
+	#[error("named-process attachment closed before terminal state")]
+	AttachmentClosedBeforeTerminalState,
+	#[error("named-process attachment repeated acknowledgement")]
+	AttachmentRepeatedAcknowledgement,
+	#[error("named-process state omitted process info")]
+	MissingProcessInfo,
+	#[error("settlement header was not a JSON object")]
+	NonObjectHeader,
+	#[error(
+		"named-process attachment generation mismatch: expected {name}@{expected}, got \
+		 {actual_name}@{got}"
+	)]
+	AttachmentGenerationMismatch {
+		name:        Str,
+		expected:    u64,
+		actual_name: Str,
+		got:         u64,
+	},
+	#[error(
+		"named-process output generation mismatch: expected {name}@{expected}, got \
+		 {actual_name}@{got}"
+	)]
+	OutputGenerationMismatch {
+		name:        Str,
+		expected:    u64,
+		actual_name: Str,
+		got:         u64,
+	},
+	#[error(
+		"named-process state generation mismatch: expected {name}@{expected}, got \
+		 {actual_name}@{got}"
+	)]
+	StateGenerationMismatch {
+		name:        Str,
+		expected:    u64,
+		actual_name: Str,
+		got:         u64,
+	},
+}
+
 /// One watched terminal settlement and its exclusive delivery lease.
 pub struct JobSettlement {
 	/// Stable detached-job descriptor.
@@ -472,7 +535,7 @@ impl Drop for JobWatch {
 	}
 }
 
-async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
+async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, JobSettlementError> {
 	let JobOwner::NamedProcess { name, generation } = &job.owner;
 	let mut attachment = env
 		.attach_output(AttachOutput {
@@ -481,29 +544,26 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 			props:          None,
 		})
 		.await
-		.map_err(|error| sf!("could not attach to named process: {error}"))?;
+		.map_err(JobSettlementError::Attach)?;
 	let attached = match attachment
 		.next_event()
 		.await
-		.map_err(|error| sf!("named-process attachment failed: {error}"))?
+		.map_err(JobSettlementError::Attachment)?
 	{
 		Some(ProcessAttachmentEvent::Attached(attached)) => attached,
-		Some(_) => return Err(sf!("named-process attachment omitted acknowledgement")),
-		None => {
-			return Err(sf!("named-process attachment closed before acknowledgement"));
-		},
+		Some(_) => return Err(JobSettlementError::AttachmentOmittedAcknowledgement),
+		None => return Err(JobSettlementError::AttachmentClosedBeforeAcknowledgement),
 	};
 	if attached.name != name.as_str() || attached.generation != *generation {
-		return Err(sf!(
-			"named-process attachment generation mismatch: expected {name}@{generation}, got {}@{}",
-			attached.name,
-			attached.generation
-		));
+		return Err(JobSettlementError::AttachmentGenerationMismatch {
+			name:        name.clone(),
+			expected:    *generation,
+			actual_name: Str::from(attached.name),
+			got:         attached.generation,
+		});
 	}
 
-	let upload = env
-		.blob_put()
-		.map_err(|error| sf!("could not open settlement artifact upload: {error}"))?;
+	let upload = env.blob_put().map_err(JobSettlementError::OpenArtifact)?;
 	let mut header = serde_json::to_vec(&ArtifactHeader {
 		job_id:            job.id.as_str(),
 		owner:             OwnerRecord { name: name.as_str(), generation: *generation },
@@ -513,9 +573,9 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 			lifetime:    job.artifact.lifetime,
 		},
 	})
-	.map_err(|error| sf!("could not encode settlement header: {error}"))?;
+	.map_err(JobSettlementError::EncodeHeader)?;
 	if header.pop() != Some(b'}') {
-		return Err(sf!("settlement header was not a JSON object"));
+		return Err(JobSettlementError::NonObjectHeader);
 	}
 	header.extend_from_slice(b",\"output\":[");
 	upload_bytes(&upload, &header).await?;
@@ -525,11 +585,11 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 		let event = attachment
 			.next_event()
 			.await
-			.map_err(|error| sf!("named-process attachment failed: {error}"))?
-			.ok_or_else(|| sf!("named-process attachment closed before terminal state"))?;
+			.map_err(JobSettlementError::Attachment)?
+			.ok_or(JobSettlementError::AttachmentClosedBeforeTerminalState)?;
 		match event {
 			ProcessAttachmentEvent::Attached(_) => {
-				return Err(sf!("named-process attachment repeated acknowledgement"));
+				return Err(JobSettlementError::AttachmentRepeatedAcknowledgement);
 			},
 			ProcessAttachmentEvent::Output(output) => {
 				validate_output(&output, name, *generation)?;
@@ -538,7 +598,7 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 					channel:  output.channel,
 					data:     &output.data,
 				})
-				.map_err(|error| sf!("could not encode process output: {error}"))?;
+				.map_err(JobSettlementError::EncodeOutput)?;
 				if !first_output {
 					encoded.insert(0, b',');
 				}
@@ -548,7 +608,7 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 			ProcessAttachmentEvent::State(state) => {
 				let info = state
 					.process
-					.ok_or_else(|| sf!("named-process state omitted process info"))?;
+					.ok_or(JobSettlementError::MissingProcessInfo)?;
 				validate_state(&info, name, *generation)?;
 				if terminal_state(&info) {
 					return finish_settlement(upload, job, info).await;
@@ -562,16 +622,16 @@ async fn finish_settlement(
 	upload: omp_env::BlobUpload,
 	job: &JobRef,
 	info: ProcessInfo,
-) -> Result<thread::Item, Str> {
+) -> Result<thread::Item, JobSettlementError> {
 	let mut suffix = Vec::from(&b"],\"state\":"[..]);
 	serde_json::to_writer(&mut suffix, &StateRecord::from(&info))
-		.map_err(|error| sf!("could not encode terminal process state: {error}"))?;
+		.map_err(JobSettlementError::EncodeTerminalState)?;
 	suffix.push(b'}');
 	upload_bytes(&upload, &suffix).await?;
 	let stored = upload
 		.commit()
 		.await
-		.map_err(|error| sf!("could not commit settlement artifact: {error}"))?;
+		.map_err(JobSettlementError::CommitArtifact)?;
 	let state = ProcessState::try_from(info.state)
 		.map_or_else(|_| format!("state {}", info.state), |state| format!("{state:?}"));
 	let text = format!("Detached job {} settled: {}.", job.id, state.to_lowercase());
@@ -590,37 +650,50 @@ async fn finish_settlement(
 	]))
 }
 
-async fn upload_bytes(upload: &omp_env::BlobUpload, bytes: &[u8]) -> Result<(), Str> {
+async fn upload_bytes(
+	upload: &omp_env::BlobUpload,
+	bytes: &[u8],
+) -> Result<(), JobSettlementError> {
 	for data in bytes.chunks(UPLOAD_CHUNK_BYTES) {
 		upload
 			.send_chunk(Chunk { data: Bytes::copy_from_slice(data), hash: Bytes::new(), size: None })
 			.await
-			.map_err(|error| sf!("could not stream settlement artifact: {error}"))?;
+			.map_err(JobSettlementError::StreamArtifact)?;
 	}
 	Ok(())
 }
 
-fn validate_output(output: &ProcessOutput, name: &str, generation: u64) -> Result<(), Str> {
+fn validate_output(
+	output: &ProcessOutput,
+	name: &str,
+	generation: u64,
+) -> Result<(), JobSettlementError> {
 	if output.name == name && output.generation == generation {
 		Ok(())
 	} else {
-		Err(sf!(
-			"named-process output generation mismatch: expected {name}@{generation}, got {}@{}",
-			output.name,
-			output.generation
-		))
+		Err(JobSettlementError::OutputGenerationMismatch {
+			name:        Str::from(name),
+			expected:    generation,
+			actual_name: Str::from(output.name.as_str()),
+			got:         output.generation,
+		})
 	}
 }
 
-fn validate_state(info: &ProcessInfo, name: &str, generation: u64) -> Result<(), Str> {
+fn validate_state(
+	info: &ProcessInfo,
+	name: &str,
+	generation: u64,
+) -> Result<(), JobSettlementError> {
 	if info.name == name && info.generation == generation {
 		Ok(())
 	} else {
-		Err(sf!(
-			"named-process state generation mismatch: expected {name}@{generation}, got {}@{}",
-			info.name,
-			info.generation
-		))
+		Err(JobSettlementError::StateGenerationMismatch {
+			name:        Str::from(name),
+			expected:    generation,
+			actual_name: Str::from(info.name.as_str()),
+			got:         info.generation,
+		})
 	}
 }
 
@@ -631,7 +704,7 @@ fn terminal_state(info: &ProcessInfo) -> bool {
 	)
 }
 
-fn settlement_error_item(job: &JobRef, reason: &str) -> thread::Item {
+fn settlement_error_item(job: &JobRef, reason: &JobSettlementError) -> thread::Item {
 	system_item(vec![thread::Part {
 		kind: Some(thread::part::Kind::Text(format!(
 			"Detached job {} could not be observed to settlement: {reason}",
@@ -719,6 +792,7 @@ mod tests {
 		thread as std_thread,
 	};
 
+	use omp_core::sf;
 	use omp_tool::{ArtifactLifetime, ExpectedArtifact};
 
 	use super::*;
@@ -791,6 +865,7 @@ mod tests {
 
 #[cfg(test)]
 mod watch_tests {
+	use omp_core::sf;
 	use omp_tool::{ArtifactLifetime, ExpectedArtifact};
 
 	use super::*;

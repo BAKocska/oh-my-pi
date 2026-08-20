@@ -798,11 +798,15 @@ pub const fn attachment_color(marker: usize) -> Color {
 /// [`crate::EditBuffer::insert_reference`]); [`EditInput`] does so
 /// automatically for staged image path drops and large paste cards.
 pub fn chip_label(attachment: &Attachment, charset: Charset) -> Str {
-	let icon = charset.icon(match attachment.content {
-		AttachmentContent::Image { .. } => crate::Icon::Image,
-		AttachmentContent::Text { .. } => crate::Icon::TextFile,
-	});
-	sf!("{icon} #{}", attachment.marker)
+	attachment.preview_names[charset_index(charset)].clone()
+}
+
+const fn charset_index(charset: Charset) -> usize {
+	match charset {
+		Charset::Unicode => 0,
+		Charset::NerdFont => 1,
+		Charset::Ascii => 2,
+	}
 }
 
 /// Chip style for an atomic marker: a trailing `#N` selects the marker's
@@ -878,13 +882,38 @@ fn overlay_chip_runs(
 #[derive(Clone)]
 pub struct Attachment {
 	/// What the attachment holds and how its preview card renders.
-	pub content: AttachmentContent,
+	pub content:   AttachmentContent,
 	/// 1-based marker number (`#N`), stable until the queue is drained.
-	pub marker:  usize,
+	pub marker:    usize,
 	/// Identity color shared by the preview frame and chip highlights.
-	pub color:   Color,
+	pub color:     Color,
+	preview_names: [Str; 3],
+	size_label:    Str,
 }
 
+impl Attachment {
+	/// Builds a descriptor, deriving the per-charset preview names and the
+	/// size caption from `content` once at staging time.
+	pub fn new(content: AttachmentContent, marker: usize, color: Color) -> Self {
+		let icon = match &content {
+			AttachmentContent::Image { .. } => crate::Icon::Image,
+			AttachmentContent::Text { .. } => crate::Icon::TextFile,
+		};
+		let preview_names = [
+			sf!("{} #{marker}", Charset::Unicode.icon(icon)),
+			sf!("{} #{marker}", Charset::NerdFont.icon(icon)),
+			sf!("{} #{marker}", Charset::Ascii.icon(icon)),
+		];
+		let size_label = match &content {
+			AttachmentContent::Image { dimensions, .. } => {
+				dimensions.map_or_else(Str::default, |(width, height)| sf!("{width}x{height}"))
+			},
+			AttachmentContent::Text { lines, .. } if *lines > 1 => sf!("+{lines} lines"),
+			AttachmentContent::Text { chars, .. } => sf!("{chars} chars"),
+		};
+		Self { content, marker, color, preview_names, size_label }
+	}
+}
 /// Content behind one [`Attachment`].
 #[derive(Clone)]
 pub enum AttachmentContent {
@@ -979,8 +1008,8 @@ impl Attachments {
 	fn stage(&self, content: AttachmentContent) -> Attachment {
 		let mut state = self.state.borrow_mut();
 		state.counter += 1;
-		let attachment =
-			Attachment { content, marker: state.counter, color: attachment_color(state.counter) };
+		let marker = state.counter;
+		let attachment = Attachment::new(content, marker, attachment_color(marker));
 		state
 			.staged
 			.push(Staged { attachment: attachment.clone(), hidden: false });
@@ -1211,29 +1240,15 @@ impl EditorPane {
 			}
 			let line = Style::new().fg(attachment.color);
 			let label = line.bold();
-			let (icon, size) = match &attachment.content {
-				AttachmentContent::Image { dimensions, .. } => (
-					pc.ctx.charset.icon(crate::Icon::Image),
-					dimensions.map(|(width, height)| sf!("{width}x{height}")),
-				),
-				AttachmentContent::Text { lines, chars, .. } => (
-					pc.ctx.charset.icon(crate::Icon::TextFile),
-					Some(if *lines > 1 {
-						sf!("+{lines} lines")
-					} else {
-						sf!("{chars} chars")
-					}),
-				),
-			};
-			let name = sf!("{icon} #{}", attachment.marker);
-			frame_caption_row(pc, x, top, PREVIEW_BOX_COLS, (tl, tr, horizontal), &name, line, label);
+			let name = &attachment.preview_names[charset_index(pc.ctx.charset)];
+			frame_caption_row(pc, x, top, PREVIEW_BOX_COLS, (tl, tr, horizontal), name, line, label);
 			frame_caption_row(
 				pc,
 				x,
 				bottom,
 				PREVIEW_BOX_COLS,
 				(bl, br, horizontal),
-				size.as_deref().unwrap_or(""),
+				attachment.size_label.as_str(),
 				line,
 				label,
 			);

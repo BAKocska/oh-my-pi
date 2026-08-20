@@ -1102,7 +1102,7 @@ impl RemoteCheckpoint {
 #[cfg(test)]
 mod tests {
 
-	use omp_core::{Str, sf};
+	use omp_core::sf;
 
 	use super::{
 		COMPACTION_RECOVERY_BAND, Compact, CompactionCoordinator, CompactionDecision,

@@ -2150,7 +2150,18 @@ fn classify_error(error: &Error) -> (TransactionRejectReason, Str) {
 		| Error::InvalidTarget { .. }
 		| Error::DocumentNotFound { .. }
 		| Error::LeaseExpired { .. }
-		| Error::Protocol { .. } => TransactionRejectReason::PreconditionFailed,
+		| Error::Protocol { .. }
+		| Error::Worker { .. }
+		| Error::HashlineSnapshot { .. }
+		| Error::HashlinePayloadUtf8 { .. }
+		| Error::ReplacePayloadJson { .. }
+		| Error::ReplaceOptionsJson { .. }
+		| Error::HashlineOptionsJson { .. }
+		| Error::Replace { .. }
+		| Error::HashlineParse { .. }
+		| Error::HashlineLookup { .. }
+		| Error::HashlineApply { .. }
+		| Error::HashlineRecovery { .. } => TransactionRejectReason::PreconditionFailed,
 	};
 	(reason, Str::new(error.to_string()))
 }

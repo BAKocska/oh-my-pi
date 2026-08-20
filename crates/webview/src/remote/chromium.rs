@@ -835,7 +835,7 @@ impl Cdp {
 		}
 		let bytes = base64::decode(data)
 			.into_vec()
-			.map_err(|err| Error::Protocol(sf!("screencast frame base64: {err}")))?;
+			.map_err(|source| Error::ScreencastFrameBase64 { source })?;
 		let format = self.frame_cfg.map_or(FrameFormat::Png, |cfg| cfg.format);
 		let mut frame = decode_frame(format, &bytes)?;
 		match &self.last_pixels {
@@ -893,8 +893,15 @@ fn exception_text(details: &Value) -> Str {
 
 /// CDP `Input.dispatchKeyEvent` name for a key identity.
 fn key_name(key: Key) -> Str {
+	const F_KEYS: [&str; 24] = [
+		"F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14",
+		"F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+	];
 	match key {
-		Key::Char(c) => sf!("{c}"),
+		Key::Char(c) => {
+			let mut buf = [0; 4];
+			Str::new(c.encode_utf8(&mut buf))
+		},
 		Key::Enter => "Enter".to_str(),
 		Key::Tab => "Tab".to_str(),
 		Key::Backspace => "Backspace".to_str(),
@@ -908,7 +915,7 @@ fn key_name(key: Key) -> Str {
 		Key::End => "End".to_str(),
 		Key::PageUp => "PageUp".to_str(),
 		Key::PageDown => "PageDown".to_str(),
-		Key::F(n) => sf!("F{n}"),
+		Key::F(n) => sf!(F_KEYS[usize::from(n.clamp(1, 24) - 1)]),
 	}
 }
 

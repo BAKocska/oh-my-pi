@@ -574,7 +574,7 @@ fn validate_request(messages: &[ChatMessage], options: &GenerationOptions) -> Lo
 mod tests {
 	use std::sync::Arc;
 
-	
+	use omp_core::sf;
 
 	use super::ClassifierLadder;
 

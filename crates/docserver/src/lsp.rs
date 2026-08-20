@@ -50,7 +50,31 @@ pub enum LspTransportError {
 		/// Transport-specific diagnostic.
 		message: Str,
 	},
+	/// Reading or writing the process transport failed.
+	#[error("{operation}: {source}")]
+	Io {
+		/// The transport operation that failed.
+		operation: &'static str,
+		/// The underlying I/O failure.
+		#[source]
+		source:    Arc<std::io::Error>,
+	},
+	/// Reading an LSP frame failed.
+	#[error("LSP transport closed: {source}")]
+	Frame {
+		/// The frame decoding failure.
+		#[source]
+		source: Arc<crate::lsp_process::LspFrameError>,
+	},
 	/// The peer returned malformed JSON where raw JSON was required.
+	#[error("invalid LSP response JSON")]
+	InvalidJson {
+		/// The JSON decoding failure.
+		#[source]
+		source: Arc<serde_json::Error>,
+	},
+	/// The peer returned an invalid response that was not a JSON decoding
+	/// failure.
 	#[error("invalid LSP response JSON: {message}")]
 	InvalidResponse {
 		/// Parsing diagnostic.

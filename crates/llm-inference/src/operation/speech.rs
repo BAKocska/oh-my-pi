@@ -7,7 +7,6 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::sf;
 use tower::Service;
 
 use crate::{
@@ -16,8 +15,8 @@ use crate::{
 	catalog::OperationKind,
 	error::Error,
 	operation::{
-		OperationRequest, OperationResponse, media_protocol_error, media_validation_error,
-		wrong_operation,
+		MediaOperationError, OperationRequest, OperationResponse, media_protocol_error,
+		media_validation_error, wrong_operation,
 	},
 };
 /// Speech capability bounds used during request validation.
@@ -38,21 +37,37 @@ pub struct SpeechLimits {
 }
 
 /// Typed request or streamed-audio violation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum SpeechError {
 	/// Input text is empty.
+	#[error("speech input text is empty")]
 	EmptyText,
 	/// Voice identity is empty.
+	#[error("speech voice identity is empty")]
 	EmptyVoice,
 	/// Explicit format is unsupported.
-	Format(AudioFormat),
+	#[error("speech audio format {format:?} is unsupported")]
+	Format {
+		/// Unsupported audio format.
+		format: AudioFormat,
+	},
 	/// Explicit sample rate is unsupported.
-	SampleRate(u32),
+	#[error("speech sample rate {sample_rate} Hz is unsupported")]
+	SampleRate {
+		/// Unsupported sample rate.
+		sample_rate: u32,
+	},
 	/// Playback speed is not finite, positive, or inside negotiated bounds.
-	Speed(f32),
+	#[error("speech playback speed {speed} is unsupported")]
+	Speed {
+		/// Unsupported playback-speed multiplier.
+		speed: f32,
+	},
 	/// Timestamps were explicitly requested but unavailable.
+	#[error("speech timestamps are unsupported")]
 	TimestampsUnsupported,
 	/// A chunk exceeded the negotiated maximum size.
+	#[error("speech chunk contains {observed} bytes, but the maximum is {limit}")]
 	ChunkTooLarge {
 		/// Negotiated maximum chunk size in bytes.
 		limit:    usize,
@@ -60,10 +75,13 @@ pub enum SpeechError {
 		observed: usize,
 	},
 	/// Timestamp interval is inverted or moved backwards.
+	#[error("speech timestamp interval is invalid")]
 	InvalidTimestamp,
 	/// A non-final chunk arrived after the final chunk.
+	#[error("speech chunk arrived after the final chunk")]
 	AfterFinal,
 	/// Stream ended without an explicit final chunk.
+	#[error("speech stream ended without a final chunk")]
 	MissingFinalChunk,
 }
 
@@ -78,12 +96,12 @@ pub fn validate_request(request: &SpeechRequest, limits: &SpeechLimits) -> Resul
 	if let Setting::Prefer(format) | Setting::Require(format) = &request.format
 		&& !limits.formats.contains(format)
 	{
-		return Err(SpeechError::Format(*format));
+		return Err(SpeechError::Format { format: *format });
 	}
 	if let Setting::Prefer(rate) | Setting::Require(rate) = &request.sample_rate_hz
 		&& !limits.sample_rates_hz.contains(rate)
 	{
-		return Err(SpeechError::SampleRate(*rate));
+		return Err(SpeechError::SampleRate { sample_rate: *rate });
 	}
 	if let Setting::Prefer(speed) | Setting::Require(speed) = &request.speed {
 		let scaled = *speed * 1_000_000.0;
@@ -92,7 +110,7 @@ pub fn validate_request(request: &SpeechRequest, limits: &SpeechLimits) -> Resul
 			|| scaled < limits.min_speed_millionths as f32
 			|| scaled > limits.max_speed_millionths as f32
 		{
-			return Err(SpeechError::Speed(*speed));
+			return Err(SpeechError::Speed { speed: *speed });
 		}
 	}
 	if let Setting::Require(granularity) = &request.timestamps
@@ -224,32 +242,38 @@ where
 				return Err(wrong_operation(&call, OperationKind::Speak));
 			}
 			if let Some(Err(error)) = validation {
-				return Err(media_validation_error(OperationKind::Speak, sf!("{error:?}")));
+				return Err(media_validation_error(OperationKind::Speak, error));
 			}
 			let response = pending
 				.ok_or_else(|| {
-					media_validation_error(OperationKind::Speak, sf!("speech_request_not_dispatched"))
+					media_validation_error(
+						OperationKind::Speak,
+						MediaOperationError::SpeechRequestNotDispatched,
+					)
 				})?
 				.await?;
 			let mut state = SpeechStreamState::new(max_chunk_bytes);
-			Ok(response.map(move |mut output| {
-				let stream = async_stream::stream! {
-					while let Some(chunk) = output.next().await {
-						match chunk.and_then(|chunk| {
-							state.observe(&chunk).map_err(|error| media_protocol_error(OperationKind::Speak, sf!("{error:?}")))?;
-							Ok(chunk)
-						}) {
-							Ok(chunk) => yield Ok(chunk),
-							Err(error) => { yield Err(error); return; }
+			Ok(response
+				.map(move |mut output| {
+					let stream = async_stream::stream! {
+						while let Some(chunk) = output.next().await {
+							match chunk.and_then(|chunk| {
+								state.observe(&chunk).map_err(|error| {
+									media_protocol_error(OperationKind::Speak, error)
+								})?;
+								Ok(chunk)
+							}) {
+								Ok(chunk) => yield Ok(chunk),
+								Err(error) => { yield Err(error); return; }
+							}
 						}
-					}
-					if let Err(error) = state.finish() {
-						let detail = sf!("{error:?}");
-						yield Err(media_protocol_error(OperationKind::Speak, detail));
-					}
-				};
-				Box::pin(stream) as AudioStream
-			}).into_answer(AnswerBody::Speech))
+						if let Err(error) = state.finish() {
+							yield Err(media_protocol_error(OperationKind::Speak, error));
+						}
+					};
+					Box::pin(stream) as AudioStream
+				})
+				.into_answer(AnswerBody::Speech))
 		}
 	}
 }

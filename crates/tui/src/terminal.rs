@@ -1972,14 +1972,33 @@ impl Terminal {
 		ALT_SCREEN_ACTIVE.store(true, Ordering::Release);
 		self.cursor_visible = None;
 		self.alt_mouse = purpose == AltScreenUse::Interactive && !self.mouse;
-		let tracking = if self.alt_mouse {
-			esc!(mouse_vt200, mouse_any_event, mouse_sgr)
-		} else {
-			""
-		};
-		Some(match self.keyboard {
-			KeyboardMode::Kitty(push) => sf!("{}{}{}", esc!(alt_screen), push, tracking),
-			KeyboardMode::ModifyOtherKeys => sf!("{}{}", esc!(alt_screen), tracking),
+		Some(match (self.keyboard, self.alt_mouse) {
+			(KeyboardMode::Kitty(push), true) if push == esc!(csi, ">1u") => {
+				sf!(esc!(alt_screen, csi, ">1u", mouse_vt200, mouse_any_event, mouse_sgr))
+			},
+			(KeyboardMode::Kitty(push), true) if push == esc!(csi, ">3u") => {
+				sf!(esc!(alt_screen, csi, ">3u", mouse_vt200, mouse_any_event, mouse_sgr))
+			},
+			(KeyboardMode::Kitty(push), true) if push == esc!(csi, ">5u") => {
+				sf!(esc!(alt_screen, csi, ">5u", mouse_vt200, mouse_any_event, mouse_sgr))
+			},
+			(KeyboardMode::Kitty(_), true) => {
+				sf!(esc!(alt_screen, csi, ">7u", mouse_vt200, mouse_any_event, mouse_sgr))
+			},
+			(KeyboardMode::Kitty(push), false) if push == esc!(csi, ">1u") => {
+				sf!(esc!(alt_screen, csi, ">1u"))
+			},
+			(KeyboardMode::Kitty(push), false) if push == esc!(csi, ">3u") => {
+				sf!(esc!(alt_screen, csi, ">3u"))
+			},
+			(KeyboardMode::Kitty(push), false) if push == esc!(csi, ">5u") => {
+				sf!(esc!(alt_screen, csi, ">5u"))
+			},
+			(KeyboardMode::Kitty(_), false) => sf!(esc!(alt_screen, csi, ">7u")),
+			(KeyboardMode::ModifyOtherKeys, true) => {
+				sf!(esc!(alt_screen, mouse_vt200, mouse_any_event, mouse_sgr))
+			},
+			(KeyboardMode::ModifyOtherKeys, false) => sf!(esc!(alt_screen)),
 		})
 	}
 

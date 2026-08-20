@@ -7,9 +7,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, sf};
+use omp_core::Str;
 
-use crate::format::normalized_file_xxh32;
+use crate::format::{hash_tag16, normalized_file_xxh32};
 
 // Wide sessions routinely touch more than a few dozen files. Retention remains
 // bounded by the global byte ceiling, so a generous path count avoids aging
@@ -572,11 +572,13 @@ impl SnapshotStore {
 #[must_use]
 pub fn compute_snapshot_tag(exact: &[u8]) -> Str {
 	let exact = exact.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(exact);
-	sf!("{:04X}", normalized_file_xxh32(exact) & 0xffff)
+	Str::new_inline(hash_tag16(normalized_file_xxh32(exact)).as_str())
 }
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	const PATH: &str = "/tmp/hashline-snapshots.rs";

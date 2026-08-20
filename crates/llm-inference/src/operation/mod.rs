@@ -170,26 +170,96 @@ pub(crate) fn wrong_operation(call: &Call, expected: OperationKind) -> Error {
 	.request_id(call.id.clone())
 }
 
+/// Typed operation-policy or media-lifecycle failure carried through [`Error`].
+#[allow(missing_docs, reason = "crate-private variants are documented by their error messages")]
+#[derive(Clone, Debug, strum::IntoStaticStr, thiserror::Error)]
+#[strum(serialize_all = "snake_case", const_into_str)]
+pub(crate) enum MediaOperationError {
+	#[error(transparent)]
+	#[strum(serialize = "image_operation_failed")]
+	Image(#[from] image::ImageError),
+	#[error(transparent)]
+	#[strum(serialize = "speech_operation_failed")]
+	Speech(#[from] speech::SpeechError),
+	#[error(transparent)]
+	#[strum(serialize = "transcription_operation_failed")]
+	Transcription(#[from] transcription::TranscriptionError),
+	#[error(transparent)]
+	#[strum(serialize = "video_operation_failed")]
+	Video(#[from] video::VideoError),
+	#[error(transparent)]
+	#[strum(serialize = "realtime_operation_failed")]
+	Realtime(#[from] realtime::RealtimeSessionError),
+	#[error("operation policy requires an execution plan")]
+	OperationPolicyRequiresExecutionPlan,
+	#[error("embedding policy was not constructed")]
+	EmbeddingPolicyNotConstructed,
+	#[error("selected model has no embedding capabilities")]
+	SelectedModelHasNoEmbeddingCapabilities,
+	#[error("embedding batch capacity is zero")]
+	ZeroEmbeddingBatchCapacity,
+	#[error("one-shot embedding cannot open multiple batches")]
+	OneShotEmbeddingCannotOpenMultipleBatches,
+	#[error("selected model has no search capabilities")]
+	SelectedModelHasNoSearchCapabilities,
+	#[error("exact token count policy was not constructed")]
+	ExactTokenCountNotConstructed,
+	#[error("discovery policy was not constructed")]
+	DiscoveryPolicyNotConstructed,
+	#[error("discovery page size is invalid")]
+	InvalidDiscoveryPageSize,
+	#[error("native operation policy was not constructed")]
+	NativePolicyNotConstructed,
+	#[error("image request was not dispatched")]
+	ImageRequestNotDispatched,
+	#[error("speech request was not dispatched")]
+	SpeechRequestNotDispatched,
+	#[error("transcription request was not dispatched")]
+	TranscriptionRequestNotDispatched,
+	#[error("video request was not dispatched")]
+	VideoRequestNotDispatched,
+	#[error("realtime request was not dispatched")]
+	RealtimeRequestNotDispatched,
+	#[error("embedding batch route changed")]
+	EmbeddingBatchRouteChanged,
+	#[error("embedding page dimensions changed")]
+	EmbeddingPageDimensionsChanged,
+	#[error("exact token count returned an estimate")]
+	ExactTokenCountReturnedEstimate,
+	#[error("tokenization returned an estimate")]
+	TokenizeReturnedEstimate,
+	#[error("detokenization returned an estimate")]
+	DetokenizeReturnedEstimate,
+	#[error("required embedding dimensions were not returned")]
+	RequiredEmbeddingDimensionsNotReturned,
+	#[error("normalized discovery page is invalid")]
+	InvalidNormalizedDiscoveryPage,
+	#[error("discovery page contains an unrequested operation")]
+	DiscoveryPageContainsUnrequestedOperation,
+}
+
 pub(crate) fn media_validation_error(
 	operation: OperationKind,
-	reason: impl omp_core::IntoStr,
+	failure: impl Into<MediaOperationError>,
 ) -> Error {
+	let failure = failure.into();
+	let reason = ReasonId(omp_core::Str::new_static(failure.into_str()));
 	Error::new(
 		ErrorKind::InvalidRequest,
 		ErrorPhase::Planning,
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::capability(
-		omp_core::Str::new(operation.to_string()),
-		ReasonId(reason.into_str()),
-	))
+	.detail(ErrorDetail::capability(omp_core::Str::new(operation.to_string()), reason))
+	.typed_source(failure)
 }
 
 pub(crate) fn media_protocol_error(
 	operation: OperationKind,
-	reason: impl omp_core::IntoStr,
+	failure: impl Into<MediaOperationError>,
 ) -> Error {
+	let failure = failure.into();
+	let reason = ReasonId(omp_core::Str::new_static(failure.into_str()));
 	Error::new(
 		ErrorKind::ProviderContractMismatch,
 		ErrorPhase::Streaming,
@@ -197,8 +267,6 @@ pub(crate) fn media_protocol_error(
 		ExecutionReceipt::default(),
 	)
 	.committed(true)
-	.detail(ErrorDetail::capability(
-		omp_core::Str::new(operation.to_string()),
-		ReasonId(reason.into_str()),
-	))
+	.detail(ErrorDetail::capability(omp_core::Str::new(operation.to_string()), reason))
+	.typed_source(failure)
 }

@@ -525,6 +525,7 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
 	use serde_json::json;
 
 	use super::*;
