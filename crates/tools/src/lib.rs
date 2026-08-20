@@ -10,6 +10,8 @@ mod render;
 
 pub use render::{BuiltinRendererIdentities, register_builtin_renderers};
 
+/// Stable dynamic device transport and catalog rendering.
+pub mod device;
 /// Hashline document transactions with speculative previews.
 pub mod edit;
 /// Persistent Python evaluation.

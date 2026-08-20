@@ -182,10 +182,16 @@ pub struct ChatUiSession {
 }
 
 enum UiCmd {
-	/// Boxes the foreign generated protobuf item; one allocation is paid per user submit.
+	/// Boxes the foreign generated protobuf item; one allocation is paid per
+	/// user submit.
 	Submit(Box<Item>),
-	ListRewind { reply: flume::Sender<Result<Vec<RewindTarget>, String>> },
-	Rewind { to: Option<u64>, reply: flume::Sender<Result<Vec<Item>, String>> },
+	ListRewind {
+		reply: flume::Sender<Result<Vec<RewindTarget>, String>>,
+	},
+	Rewind {
+		to:    Option<u64>,
+		reply: flume::Sender<Result<Vec<Item>, String>>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

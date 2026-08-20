@@ -18,10 +18,10 @@ use omp_llm_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 	ToolInputConstraint,
 };
-use serde::{Deserialize, Serialize};
 use omp_proto::inference::v1::InvokeInput;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use parking_lot::Mutex;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -310,11 +310,11 @@ impl ProjectionKey {
 #[derive(Clone, Debug)]
 pub struct ProjectionRequest<'a> {
 	/// Cache identity and target tool revision.
-	pub key:             ProjectionKey,
+	pub key:              ProjectionKey,
 	/// Projection budget represented by [`ProjectionKey::caps_hash`].
-	pub caps:            PromptCaps,
+	pub caps:             PromptCaps,
 	/// Exact canonical structured verdict bytes.
-	pub verdict:         &'a [u8],
+	pub verdict:          &'a [u8],
 	/// Durable compaction hint recorded with this call.
 	pub recorded_useless: bool,
 }
@@ -396,13 +396,17 @@ impl ProjectionCache {
 			let lru = inner
 				.by_device
 				.get_or_insert_with(device_id, || ProjectionLru { entries: SmallVec::new() });
-			if let Some(entry) = lru.entries.iter_mut().find(|entry| entry.hash == key.cache_hash)
+			if let Some(entry) = lru
+				.entries
+				.iter_mut()
+				.find(|entry| entry.hash == key.cache_hash)
 			{
 				let previous = entry.bytes;
 				*entry = ProjectionCacheEntry { hash: key.cache_hash, value, bytes, used };
 				Some(previous)
 			} else {
-				lru.entries.push(ProjectionCacheEntry { hash: key.cache_hash, value, bytes, used });
+				lru.entries
+					.push(ProjectionCacheEntry { hash: key.cache_hash, value, bytes, used });
 				None
 			}
 		};
@@ -446,7 +450,10 @@ impl ProjectionWarm {
 	}
 
 	fn into_ready(mut self) -> Result<(), RegistryError> {
-		self.result.take().expect("projection warm future is consumed once")
+		self
+			.result
+			.take()
+			.expect("projection warm future is consumed once")
 	}
 }
 
@@ -454,7 +461,12 @@ impl Future for ProjectionWarm {
 	type Output = Result<(), RegistryError>;
 
 	fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-		Poll::Ready(self.result.take().expect("projection warm future polled after completion"))
+		Poll::Ready(
+			self
+				.result
+				.take()
+				.expect("projection warm future polled after completion"),
+		)
 	}
 }
 
@@ -561,7 +573,6 @@ trait ErasedTool: Send + Sync {
 }
 static NATIVE_TOOL_ROUTE: ToolRoute = ToolRoute::Native;
 
-
 struct Worker {
 	spec:     crate::ToolSpec,
 	schema:   OpaqueJson,
@@ -591,6 +602,7 @@ impl ErasedTool for Worker {
 	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>> {
 		self.cache.get(self.cache_id, key)
 	}
+
 	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict) {
 		self.cache.insert(self.cache_id, key, projected);
 	}
@@ -747,6 +759,7 @@ impl<T: Tool> ErasedTool for Registered<T> {
 	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>> {
 		self.cache.get(self.cache_id, key)
 	}
+
 	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict) {
 		self.cache.insert(self.cache_id, key, projected);
 	}
@@ -801,7 +814,7 @@ struct RegistryEntry {
 pub struct Registry {
 	versions:         BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
 	live:             BTreeMap<Str, Claim>,
-	unmounted:        BTreeMap<Str, Option<Str>>,
+	unmounted:        RwLock<BTreeMap<Str, Option<Str>>>,
 	arg_specs:        ArgSpecRegistry,
 	renderers:        RenderRegistry,
 	projection_cache: Arc<ProjectionCache>,
@@ -881,11 +894,11 @@ impl Registry {
 	) -> Result<Str, RenderRegistryError> {
 		self.renderers.view(identity, state, outcome)
 	}
+
 	fn next_projection_cache_id(&self) -> Result<u32, RegistryError> {
 		let count = self.versions.values().map(BTreeMap::len).sum::<usize>();
 		u32::try_from(count).map_err(|_| RegistryError::ProjectionCacheIdLimit)
 	}
-
 
 	/// Registers a typed tool under one presentation and claimant.
 	///
@@ -1032,16 +1045,14 @@ impl Registry {
 	pub fn presentation(&self, name: &str) -> Result<Presentation, RegistryError> {
 		Ok(self.live_entry(name)?.presentation)
 	}
+
 	/// Resolves a typed device path without admitting it to the model slot
 	/// catalog.
 	///
 	/// The optional sub-tool component remains owned by the `dyn` router; the
 	/// registry resolves the root claim and its live semantic revision.
-	pub fn resolve_device(
-		&self,
-		path: &DevicePath,
-	) -> Result<DeviceTarget<'_>, DeviceIssue> {
-		if self.unmounted.contains_key(path.root()) {
+	pub fn resolve_device(&self, path: &DevicePath) -> Result<DeviceTarget<'_>, DeviceIssue> {
+		if self.unmounted.read().contains_key(path.root()) {
 			return Err(device_issue(path));
 		}
 		let Some((name, claim)) = self.live.get_key_value(path.root()) else {
@@ -1072,33 +1083,31 @@ impl Registry {
 			route: entry.tool.route(),
 		})
 	}
+
 	/// Conservatively applies worker availability reports and returns the
 	/// transitions that actually unmounted live devices.
 	///
 	/// `mounted=true` is deliberately ignored: only a fresh registry
 	/// composition may make a device reachable after a worker report.
 	pub fn apply_availability(
-		&mut self,
+		&self,
 		deltas: &[AvailabilityDelta],
 	) -> SmallVec<AvailabilityDelta, 2> {
 		let mut applied = SmallVec::new();
+		let mut unmounted = self.unmounted.write();
 		for delta in deltas {
 			if delta.mounted
-				|| self.unmounted.contains_key(&delta.name)
-				|| !self
-					.live
-					.get(&delta.name)
-					.is_some_and(|claim| {
-						self
-							.versions
-							.get(&delta.name)
-							.and_then(|versions| versions.get(&claim.rev))
-							.is_some_and(|entry| entry.presentation == Presentation::Device)
-					})
-			{
+				|| unmounted.contains_key(&delta.name)
+				|| !self.live.get(&delta.name).is_some_and(|claim| {
+					self
+						.versions
+						.get(&delta.name)
+						.and_then(|versions| versions.get(&claim.rev))
+						.is_some_and(|entry| entry.presentation == Presentation::Device)
+				}) {
 				continue;
 			}
-			self.unmounted.insert(delta.name.clone(), delta.reason.clone());
+			unmounted.insert(delta.name.clone(), delta.reason.clone());
 			applied.push(delta.clone());
 		}
 		applied
@@ -1110,8 +1119,8 @@ impl Registry {
 	pub fn devices(&self) -> impl DoubleEndedIterator<Item = MountedDevice<'_>> + '_ {
 		self.live.iter().filter_map(|(name, claim)| {
 			let entry = self.versions.get(name)?.get(&claim.rev)?;
-			(!self.unmounted.contains_key(name) && entry.presentation == Presentation::Device).then(
-				|| MountedDevice {
+			(!self.unmounted.read().contains_key(name) && entry.presentation == Presentation::Device)
+				.then(|| MountedDevice {
 					name,
 					rev: &claim.rev,
 					claimant: &claim.claimant,
@@ -1120,8 +1129,7 @@ impl Registry {
 					effects: &entry.tool.spec().effects,
 					docs: None,
 					route: entry.tool.route(),
-				},
-			)
+				})
 		})
 	}
 
@@ -1150,8 +1158,9 @@ impl Registry {
 	pub fn device_hash(&self) -> [u8; 32] {
 		let mut hasher = blake3::Hasher::new();
 		hasher.update(b"omp-tool/devices/v1\0");
+		let unmounted = self.unmounted.read();
 		for (name, claim) in &self.live {
-			if self.unmounted.contains_key(name) {
+			if unmounted.contains_key(name) {
 				continue;
 			}
 			for shadow in claim_entries(claim) {
@@ -1207,6 +1216,7 @@ impl Registry {
 		params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
 		Ok(entry.tool.call(params))
 	}
+
 	/// Dispatches one resolved native device while preserving the normal slot
 	/// invocation path unchanged.
 	///
@@ -1279,8 +1289,12 @@ impl Registry {
 		&self,
 		key: &ProjectionKey,
 	) -> Result<Option<Arc<ProjectedVerdict>>, RegistryError> {
-		Ok(self.projection_entry(&key.identity)?.tool.project_cached(key))
+		Ok(self
+			.projection_entry(&key.identity)?
+			.tool
+			.project_cached(key))
 	}
+
 	/// Stores a projection returned by a worker batch in the matching cache
 	/// partition.
 	pub fn cache_projected(
@@ -1328,7 +1342,10 @@ impl Registry {
 		if let Some(projected) = entry.tool.project_cached(&request.key) {
 			return Ok(projected);
 		}
-		entry.tool.warm(std::slice::from_ref(&request)).into_ready()?;
+		entry
+			.tool
+			.warm(std::slice::from_ref(&request))
+			.into_ready()?;
 		entry
 			.tool
 			.project_cached(&request.key)
@@ -1569,12 +1586,12 @@ fn projected_part_bytes(parts: &[Part]) -> usize {
 		let part_bytes = match part {
 			Part::Text { text } => text.len(),
 			Part::Json { json } => json.len(),
-			Part::Blob { blob, alt } => {
-				blob.hash.len()
-					.saturating_add(blob.media_type.len())
-					.saturating_add(alt.as_ref().map_or(0, Str::len))
-					.saturating_add(size_of::<u64>())
-			},
+			Part::Blob { blob, alt } => blob
+				.hash
+				.len()
+				.saturating_add(blob.media_type.len())
+				.saturating_add(alt.as_ref().map_or(0, Str::len))
+				.saturating_add(size_of::<u64>()),
 		};
 		bytes.saturating_add(part_bytes)
 	})
@@ -1749,7 +1766,6 @@ fn dropped(name: &Str, feature: &str, reason: &'static str) -> Adjustment {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
 	use crate::{Effects, Ev, ToolSpec};
 
 	struct LiftTool {
@@ -1757,10 +1773,10 @@ mod tests {
 	}
 
 	impl Tool for LiftTool {
-		type Params = Value;
-		type Update = Value;
-		type Payload = Value;
 		type Fault = Value;
+		type Params = Value;
+		type Payload = Value;
+		type Update = Value;
 
 		fn spec(&self) -> &ToolSpec {
 			&self.spec
@@ -1823,11 +1839,11 @@ mod tests {
 		let key = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [1; 32]);
 		let different = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [2; 32]);
 		assert!(cache.get(0, &key).is_none());
-		cache.insert(
-			0,
-			&key,
-			ProjectedVerdict { parts: Arc::<[Part]>::from([]), is_error: false, useless: false },
-		);
+		cache.insert(0, &key, ProjectedVerdict {
+			parts:    Arc::<[Part]>::from([]),
+			is_error: false,
+			useless:  false,
+		});
 		let hit = cache.get(0, &key).expect("matching key hits");
 		assert!(Arc::ptr_eq(&hit, &cache.get(0, &key).expect("second matching key hits")));
 		assert!(cache.get(0, &different).is_none());

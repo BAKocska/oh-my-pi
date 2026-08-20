@@ -368,10 +368,7 @@ pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 				on_unsupported: omp_tool::Fallback::Unspecified,
 			},
 			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: Arc::default(),
-				}),
+				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
 				exec:      None,
 				inference: None,
 				subagents: 0,

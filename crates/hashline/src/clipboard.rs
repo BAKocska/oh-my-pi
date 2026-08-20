@@ -1,7 +1,6 @@
 //! In-memory clipboard lowering for `CUT` and register-backed `PUT` edits.
 
 use im::{OrdMap, Vector};
-
 use omp_core::Str;
 
 use crate::types::{Anchor, ApplyWarning, Cursor, Edit, InsertMode, ParsedRange, PasteTarget};

@@ -231,10 +231,7 @@ pub enum ServiceError {
 	StaleCorrelation(u64),
 }
 
-const _: () = assert!(
-	std::mem::size_of::<ServiceError>() <= 128,
-	"ServiceError must stay compact"
-);
+const _: () = assert!(std::mem::size_of::<ServiceError>() <= 128, "ServiceError must stay compact");
 
 /// Failure observed while awaiting a service method.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

@@ -499,11 +499,8 @@ fn stream_search_slice<S: GrepSink>(
 		};
 		let context_after_end =
 			context_after_end(content, context_after_start, options.context_after);
-		let before_lines = u64::try_from(count(
-			&content[context_before_start..line_start],
-			b'\n',
-		))
-		.expect("line count fits in u64");
+		let before_lines = u64::try_from(count(&content[context_before_start..line_start], b'\n'))
+			.expect("line count fits in u64");
 		let after_line = line_number.saturating_add(
 			u64::try_from(count(&content[line_start..context_after_start], b'\n'))
 				.expect("line count fits in u64"),

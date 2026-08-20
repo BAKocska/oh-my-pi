@@ -4,7 +4,7 @@ use std::{
 	fmt,
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicU128, Ordering},
+		atomic::{AtomicBool, AtomicU128, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -97,8 +97,8 @@ pub enum InvocationHookRequest {
 	/// Per-invocation admission query, declared authority ceiling, and unique
 	/// reply channel.
 	Admission {
-		/// Boxed because `AdmitInvocation` is a foreign generated prost message; one allocation is
-		/// paid per hook-subscribed admission.
+		/// Boxed because `AdmitInvocation` is a foreign generated prost message;
+		/// one allocation is paid per hook-subscribed admission.
 		query:           Box<AdmitInvocation>,
 		/// Maximum authority declared by the resolved tool revision.
 		maximum_effects: Effects,
@@ -273,6 +273,7 @@ struct InvocationPump {
 	admission:       Arc<OnceLock<Admission>>,
 	effects:         Arc<OnceLock<Effects>>,
 	facts:           Arc<OnceLock<flume::Sender<InvocationAdmissionFact>>>,
+	cancelled:       Arc<AtomicBool>,
 }
 
 impl InvocationPump {
@@ -389,6 +390,8 @@ fn spawn_invocation_pump(
 	let task_effects = Arc::clone(&effects);
 	let facts: Arc<OnceLock<flume::Sender<InvocationAdmissionFact>>> = Arc::new(OnceLock::new());
 	let task_facts = Arc::clone(&facts);
+	let cancelled = Arc::new(AtomicBool::new(false));
+	let task_cancelled = Arc::clone(&cancelled);
 	tokio::spawn(async move {
 		let mut args_text = StrMut::default();
 		loop {
@@ -514,6 +517,11 @@ fn spawn_invocation_pump(
 								admission:     decision.admission.clone(),
 							});
 						}
+						tokio::task::yield_now().await;
+						if task_cancelled.load(Ordering::Acquire) {
+							invocation.guard().cancel();
+							break;
+						}
 						if let Err(error) = invocation.admit(decision.admission).await {
 							let _ = output_tx.send(PumpOutput::Terminal(
 								PumpTerminal::ClientError(error),
@@ -558,6 +566,7 @@ fn spawn_invocation_pump(
 		admission,
 		effects,
 		facts,
+		cancelled,
 	}
 }
 
@@ -567,6 +576,10 @@ fn spawn_invocation_pump(
 /// [`commit`](Self::commit) creates a call eligible to send `ArgsCommitted`.
 /// Dropping this handle structurally cancels the uncommitted invocation.
 pub struct SpeculativeCall {
+	inner: Option<SpeculativeCallInner>,
+}
+
+struct SpeculativeCallInner {
 	call_id:  Str,
 	identity: ToolIdentity,
 	pump:     InvocationPump,
@@ -597,17 +610,19 @@ impl SpeculativeCall {
 			rev:     identity.rev.clone(),
 		});
 		let pump = spawn_invocation_pump(invocation, call_id.clone(), events.clone());
-		Ok(Self { call_id, identity, pump, events: events.clone() })
+		Ok(Self {
+			inner: Some(SpeculativeCallInner { call_id, identity, pump, events: events.clone() }),
+		})
 	}
 
 	/// Returns the stable model-authored call identifier.
-	pub const fn call_id(&self) -> &Str {
-		&self.call_id
+	pub fn call_id(&self) -> &Str {
+		&self.inner.as_ref().expect("live speculative call").call_id
 	}
 
 	/// Returns the exact live tool identity selected when speculation opened.
-	pub const fn identity(&self) -> &ToolIdentity {
-		&self.identity
+	pub fn identity(&self) -> &ToolIdentity {
+		&self.inner.as_ref().expect("live speculative call").identity
 	}
 
 	/// Installs the loop-owned hook, authority ceiling, and durable fact bus.
@@ -617,24 +632,22 @@ impl SpeculativeCall {
 		facts: flume::Sender<InvocationAdmissionFact>,
 		maximum_effects: Effects,
 	) -> Result<(), BatchError> {
-		self
-			.pump
+		let pump = &self.inner.as_ref().expect("live speculative call").pump;
+		pump
 			.hooks
 			.set(hooks)
 			.map_err(|_| BatchError::Projection(Str::new_static("invocation hook bus already set")))?;
-		self
-			.pump
+		pump
 			.maximum_effects
 			.set(maximum_effects)
 			.map_err(|_| {
 				BatchError::Projection(Str::new_static("invocation effect maximum already set"))
 			})?;
-		self
-			.pump
+		pump
 			.facts
 			.set(facts)
 			.map_err(|_| BatchError::Projection(Str::new_static("invocation fact bus already set")))?;
-		self.pump.maximum_ready.notify_one();
+		pump.maximum_ready.notify_one();
 		Ok(())
 	}
 
@@ -643,22 +656,23 @@ impl SpeculativeCall {
 	/// Subscribed hooks observe the raw fragment before the environment document
 	/// feed. The negative path performs one atomic load and no clone.
 	pub async fn relay_fragment(&mut self, fragment: Str) -> Result<(), BatchError> {
-		if let Some(hooks) = self.pump.hooks.get() {
-			hooks.arg_text(&self.call_id, &fragment);
+		let inner = self.inner.as_ref().expect("live speculative call");
+		if let Some(hooks) = inner.pump.hooks.get() {
+			hooks.arg_text(&inner.call_id, &fragment);
 		}
-		self.pump.arg_text(fragment).await
+		inner.pump.arg_text(fragment).await
 	}
 
 	/// Returns the admission receipt fixed by the environment, when available.
 	pub(crate) fn admission(&self) -> Option<&Admission> {
-		self.pump.admission.get()
+		self.inner.as_ref().expect("live speculative call").pump.admission.get()
 	}
 
 	/// Records the durable assistant-item commitment for this invocation.
 	///
 	/// This local transition performs no I/O. Effect authorization is sent only
 	/// by [`ToolBatch::drive`] after the loop journals the token and timestamp.
-	pub fn commit(self, raw_args: Bytes) -> CommittedCall {
+	pub fn commit(mut self, raw_args: Bytes) -> CommittedCall {
 		let effect_token = ulid::Ulid::generate().to_string().to_str();
 		let authorized_at_ms = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -666,17 +680,30 @@ impl SpeculativeCall {
 			.as_millis()
 			.try_into()
 			.unwrap_or(u64::MAX);
-		let effects = self.pump.effects.get().cloned().unwrap_or_default();
+		let SpeculativeCallInner { call_id, identity, pump, events } =
+			self.inner.take().expect("live speculative call");
+		let effects = pump.effects.get().cloned().unwrap_or_default();
 		CommittedCall {
-			call_id: self.call_id,
-			identity: self.identity,
+			call_id,
+			identity,
 			raw_args,
 			effect_token,
 			authorized_at_ms,
 			effects,
-			pump: self.pump,
-			events: self.events,
+			pump,
+			events,
 		}
+	}
+}
+
+impl Drop for SpeculativeCall {
+	fn drop(&mut self) {
+		let Some(inner) = self.inner.as_ref() else {
+			return;
+		};
+		inner.pump.cancelled.store(true, Ordering::Release);
+		let (acknowledged, _) = flume::bounded(1);
+		let _ = inner.pump.send(PumpCommand::Cancel { ack: acknowledged });
 	}
 }
 
@@ -1507,7 +1534,7 @@ mod tests {
 		let (client, transport) = EnvClient::in_process(0);
 		let (requests, responses) = transport.into_parts();
 		let events = EventBus::new();
-		let mut call = SpeculativeCall::open(
+		let call = SpeculativeCall::open(
 			&client,
 			&events,
 			Str::new_static("abandoned"),

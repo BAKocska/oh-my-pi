@@ -414,13 +414,21 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 			.unwrap()
 			.is_empty()
 	);
-	assert_eq!(registry.route("catalogued").unwrap(), omp_tool::ToolRoute::Worker);
+	assert!(matches!(
+		registry.route("catalogued").unwrap(),
+		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
+			if name == "catalogued"
+	));
 	assert_eq!(registry.presentation("catalogued").unwrap(), Presentation::Device);
 	let mut devices = registry.devices();
 	let device = devices.next().expect("worker device is mounted");
 	assert_eq!(device.name, "catalogued");
 	assert_eq!(device.claimant, "publisher/catalogue");
-	assert_eq!(device.route, omp_tool::ToolRoute::Worker);
+	assert!(matches!(
+		device.route,
+		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
+			if name == "catalogued"
+	));
 	assert_eq!(device.summary, "catalogued device");
 	assert_eq!(device.schema, br#"{"type":"object"}"#);
 	assert!(device.effects.is_empty());
@@ -452,13 +460,17 @@ fn route_and_presentation_filter_independently() {
 		.unwrap();
 	assert_eq!(advertised.len(), 1);
 	assert_eq!(advertised[0].identity.name, "worker_slot");
-	assert_eq!(registry.route("worker_slot").unwrap(), omp_tool::ToolRoute::Worker);
+	assert!(matches!(
+		registry.route("worker_slot").unwrap(),
+		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
+			if name == "worker_slot"
+	));
 	assert_eq!(registry.presentation("worker_slot").unwrap(), Presentation::Slot);
 
 	let mut devices = registry.devices();
 	let device = devices.next().expect("native soft tool is catalogued");
 	assert_eq!(device.name, "native_device");
-	assert_eq!(device.route, omp_tool::ToolRoute::Native);
+	assert_eq!(device.route, &omp_tool::ToolRoute::Native);
 	assert!(devices.next().is_none());
 }
 
@@ -956,10 +968,15 @@ fn prompt_projection_is_exact_and_deterministic_for_the_same_input() {
 		.unwrap()
 		.unwrap();
 	assert_eq!(first, second);
-	assert_eq!(first, vec![
-		Part::Text { text: Str::from(format!("renderer|ok:engine:{}|3/256/true", "{value:9}")) },
-		Part::Json { json: Bytes::from_static(br#""ok:engine:{value:9}""#) },
-	]);
+	assert_eq!(
+		first,
+		Arc::<[Part]>::from(vec![
+			Part::Text {
+				text: Str::from(format!("renderer|ok:engine:{}|3/256/true", "{value:9}"))
+			},
+			Part::Json { json: Bytes::from_static(br#""ok:engine:{value:9}""#) },
+		])
+	);
 }
 
 #[test]
@@ -1330,11 +1347,13 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	let maximum = Effects {
 		documents: Some(DocEffects {
 			read:        true,
-			write_globs: [Str::from("src/**"), Str::from("tests/**")].into_iter().collect(),
+			write_globs: [Str::from("src/**"), Str::from("tests/**")]
+				.into_iter()
+				.collect(),
 		}),
 		exec:      Some(ExecEffects {
 			commands: [Str::from("*")].into_iter().collect(),
-			network: false,
+			network:  false,
 		}),
 		inference: Some(InferenceEffects {
 			max_requests: 3,
@@ -1349,7 +1368,7 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 		}),
 		exec:      Some(ExecEffects {
 			commands: [Str::from("cargo")].into_iter().collect(),
-			network: false,
+			network:  false,
 		}),
 		inference: Some(InferenceEffects {
 			max_requests: 1,
@@ -1368,7 +1387,10 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	widened.exec.as_mut().unwrap().network = true;
 	assert!(!widened.is_subset_of(&maximum));
 	widened.exec.as_mut().unwrap().network = false;
-	widened.documents.as_mut().unwrap().write_globs[0] = Str::from("src/../secrets/**");
+	widened.documents = Some(DocEffects {
+		read:        true,
+		write_globs: Arc::from([Str::from("src/../secrets/**")]),
+	});
 	assert!(!widened.is_subset_of(&maximum));
 	assert!(!maximum.is_subset_of(&Effects::empty()));
 

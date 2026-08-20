@@ -251,10 +251,7 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 				on_unsupported: omp_tool::Fallback::Unspecified,
 			},
 			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: Arc::default(),
-				}),
+				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
 				exec:      None,
 				inference: None,
 				subagents: 0,

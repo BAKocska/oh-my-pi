@@ -340,7 +340,7 @@ impl InferenceRpc {
 					context_id:            Some(seed.context_id.clone()),
 					provider_session:      Some(provider_session),
 					provider_conversation: Some(conversation),
-					provider_heads:        [(0, revision)].into_iter().collect(),
+					provider_heads:        [(0u64, revision)].into_iter().collect(),
 				})
 			},
 			Some(pb::turn_request::Input::Incremental(incremental)) => {
@@ -428,7 +428,7 @@ impl InferenceRpc {
 							committed_messages.clone(),
 							root.conversation().clone(),
 							root.revision().clone(),
-							[(0, root.revision().clone())].into_iter().collect(),
+							[(0u64, root.revision().clone())].into_iter().collect(),
 							true,
 						)
 					};

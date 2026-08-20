@@ -3,7 +3,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use im::HashMap as ImHashMap;
-
 pub use shell_builder::State as ShellBuilderState;
 
 use super::Shell;

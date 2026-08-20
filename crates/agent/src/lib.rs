@@ -39,7 +39,10 @@ pub use journal::{
 };
 pub use journal_kinds::{EntryKindDecl, EntryKindError, EntryKindRegistry, KindRecord, LiftHook};
 pub use r#loop::{AbortHandle, Agent, AgentError, AgentRunSummary, RewindTarget};
-pub use mailbox::{DrainPoint, Interrupt, InterruptClass, InterruptSource, Mailbox, MailboxSender};
+pub use mailbox::{
+	DrainPoint, Interrupt, InterruptClass, InterruptSource, Mailbox, MailboxSender,
+	device_availability_interrupt,
+};
 pub use omp_llm_inference::TurnId;
 pub use omp_proto::{
 	inference::v1::{

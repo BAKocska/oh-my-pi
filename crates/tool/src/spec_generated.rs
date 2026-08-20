@@ -693,6 +693,46 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 		ENV_WRITE,
 		"await omp.env.worktree.merge(worktree)"
 	),
+	symbol!(
+		"docs/py/04-placement.md",
+		"omp.env.worker.open",
+		"(spec) -> Worker",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.worker.open(spec)"
+	),
+	symbol!(
+		"docs/py/04-placement.md",
+		"omp.env.worker.close",
+		"(name, generation) -> None",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.worker.close(name, generation)"
+	),
+	symbol!(
+		"docs/py/04-placement.md",
+		"omp.env.worker.data",
+		"(name, generation, channel, data) -> bytes",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.worker.data(name, generation, channel, data)"
+	),
+	symbol!(
+		"docs/py/04-placement.md",
+		"omp.env.worker.info",
+		"(name) -> WorkerInfo",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.worker.info(name)"
+	),
+	symbol!(
+		"docs/py/04-placement.md",
+		"omp.env.worker.list",
+		"() -> list[WorkerInfo]",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.worker.list()"
+	),
 ];
 
 /// Returns every canonical runtime symbol row without allocation.

@@ -341,6 +341,48 @@ impl AuthorityTable {
 		Ok(())
 	}
 
+	/// Validates a read-class DATA request's authorization phase, token,
+	/// generations, and connection ownership without requiring a mutation
+	/// capability in the narrowed effect envelope.
+	pub fn validate_read(
+		&self,
+		host: &HostKey,
+		connection_owner: u64,
+		credentials: DataAuthority<'_>,
+	) -> Result<(), PolicyError> {
+		let mut state = self.state.lock();
+		let Some(invocation) = state
+			.hosts
+			.get_mut(host)
+			.and_then(|authority| authority.invocations.get_mut(credentials.invocation_id))
+		else {
+			return Err(PolicyError::EffectsNotAuthorized);
+		};
+		if invocation.authorized_at_ms == 0
+			|| !invocation
+				.phase
+				.allows_operation(omp_core::InvocationPhase::EffectsAuthorized)
+		{
+			return Err(PolicyError::EffectsNotAuthorized);
+		}
+		if invocation.host_generation != credentials.host_generation
+			|| invocation.session_generation != credentials.session_generation
+		{
+			return Err(PolicyError::StaleGeneration);
+		}
+		if invocation.effect_token.as_ref() != credentials.effect_token
+			|| credentials.effect_token.is_empty()
+		{
+			return Err(PolicyError::InvalidEffectToken);
+		}
+		match invocation.claimed_by {
+			Some(owner) if owner != connection_owner => return Err(PolicyError::InvalidEffectToken),
+			Some(_) => {},
+			None => invocation.claimed_by = Some(connection_owner),
+		}
+		Ok(())
+	}
+
 	/// Settles an invocation and revokes its token before returning.
 	pub fn settle(&self, host: &HostKey, invocation_id: &str) {
 		let mut state = self.state.lock();

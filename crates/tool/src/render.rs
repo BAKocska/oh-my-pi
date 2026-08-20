@@ -221,14 +221,20 @@ impl RenderEntry<'_> {
 		state.bind(self.identity)?;
 		match &mut state.fold {
 			FoldState::Reduced(reduced) => {
-				self.render.fold(self.identity.as_ref(), reduced.as_mut(), update)
+				self
+					.render
+					.fold(self.identity.as_ref(), reduced.as_mut(), update)
 			},
 			FoldState::Updates(updates) => {
 				let mut reduced = self.render.initial();
 				for prior in updates.iter() {
-					self.render.fold(self.identity.as_ref(), reduced.as_mut(), prior)?;
+					self
+						.render
+						.fold(self.identity.as_ref(), reduced.as_mut(), prior)?;
 				}
-				self.render.fold(self.identity.as_ref(), reduced.as_mut(), update)?;
+				self
+					.render
+					.fold(self.identity.as_ref(), reduced.as_mut(), update)?;
 				state.fold = FoldState::Reduced(reduced);
 				Ok(())
 			},
@@ -244,14 +250,20 @@ impl RenderEntry<'_> {
 		state.check(self.identity)?;
 		match &state.fold {
 			FoldState::Reduced(reduced) => {
-				self.render.view(self.identity.as_ref(), reduced.as_ref(), outcome)
+				self
+					.render
+					.view(self.identity.as_ref(), reduced.as_ref(), outcome)
 			},
 			FoldState::Updates(updates) => {
 				let mut reduced = self.render.initial();
 				for update in updates {
-					self.render.fold(self.identity.as_ref(), reduced.as_mut(), update)?;
+					self
+						.render
+						.fold(self.identity.as_ref(), reduced.as_mut(), update)?;
 				}
-				self.render.view(self.identity.as_ref(), reduced.as_ref(), outcome)
+				self
+					.render
+					.view(self.identity.as_ref(), reduced.as_ref(), outcome)
 			},
 		}
 	}
@@ -280,7 +292,9 @@ impl RenderRegistry {
 		if self.entries.contains_key(&identity) {
 			return Err(RenderRegistryError::Duplicate((*identity).clone()));
 		}
-		self.entries.insert(identity, Box::new(RegisteredRender(render)));
+		self
+			.entries
+			.insert(identity, Box::new(RegisteredRender(render)));
 		Ok(())
 	}
 

@@ -1023,6 +1023,84 @@ fn _local_path_string(_path: &PyEnvPath) -> PyResult<String> {
 	))
 }
 
+/// Immutable reference to the inherited CONTROL transport.
+#[pyclass(name = "ControlHandle", frozen, module = "_omp")]
+#[derive(Debug)]
+struct PyControlHandle {
+	fd: i32,
+}
+
+#[pymethods]
+impl PyControlHandle {
+	#[new]
+	fn new(fd: i32) -> Self {
+		Self { fd }
+	}
+
+	#[getter]
+	fn fd(&self) -> i32 {
+		self.fd
+	}
+}
+
+/// Immutable reference to an invocation-scoped DATA transport.
+#[pyclass(name = "DataHandle", frozen, module = "_omp")]
+#[derive(Debug)]
+struct PyDataHandle {
+	generation: u64,
+}
+
+#[pymethods]
+impl PyDataHandle {
+	#[new]
+	fn new(generation: u64) -> Self {
+		Self { generation }
+	}
+
+	#[getter]
+	fn generation(&self) -> u64 {
+		self.generation
+	}
+}
+
+/// Frozen cancellation token shared safely by free-threaded Python callers.
+#[pyclass(name = "Cancellation", frozen, module = "_omp")]
+#[derive(Debug, Default)]
+struct PyCancellation {
+	cancelled: std::sync::atomic::AtomicBool,
+}
+
+#[pymethods]
+impl PyCancellation {
+	#[new]
+	fn new() -> Self {
+		Self::default()
+	}
+
+	fn cancel(&self) {
+		self
+			.cancelled
+			.store(true, std::sync::atomic::Ordering::Release);
+	}
+
+	#[getter]
+	fn cancelled(&self) -> bool {
+		self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+	}
+}
+
+/// Return CPython's identifier for the attached current thread.
+#[pyfunction]
+fn _thread_id() -> u64 {
+	crate::interrupt::current_thread_id()
+}
+
+/// Deliver a stage-two `KeyboardInterrupt` to a Python thread id.
+#[pyfunction]
+fn _interrupt(py: Python<'_>, thread_id: u64) -> bool {
+	crate::interrupt::interrupt(py, thread_id)
+}
+
 /// Registers the native `_omp` module before `CPython` initialization.
 pub fn register() {
 	pyo3::append_to_inittab!(_omp);
@@ -1050,6 +1128,11 @@ fn _omp(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 	module.add_class::<PyPrincipal>()?;
 	module.add_class::<PyQuotaStatus>()?;
 	module.add_class::<PyResourceReceipt>()?;
+	module.add_class::<PyControlHandle>()?;
+	module.add_class::<PyDataHandle>()?;
+	module.add_class::<PyCancellation>()?;
+	module.add_function(wrap_pyfunction!(_interrupt, module)?)?;
+	module.add_function(wrap_pyfunction!(_thread_id, module)?)?;
 	module.add_function(wrap_pyfunction!(operation_spec, module)?)?;
 	module.add_function(wrap_pyfunction!(resources, module)?)?;
 	module.add_function(wrap_pyfunction!(_read_bytes_blocking, module)?)?;

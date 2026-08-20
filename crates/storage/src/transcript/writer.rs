@@ -41,9 +41,11 @@ impl IndexRun {
 	/// slice produces an empty run.
 	#[must_use]
 	pub fn from_contiguous(indexes: &[u64]) -> Self {
-		debug_assert!(indexes.windows(2).all(|pair| {
-			pair[0].checked_add(1).is_some_and(|next| pair[1] == next)
-		}));
+		debug_assert!(
+			indexes
+				.windows(2)
+				.all(|pair| { pair[0].checked_add(1).is_some_and(|next| pair[1] == next) })
+		);
 		Self {
 			first: indexes.first().copied().unwrap_or_default(),
 			count: u64::try_from(indexes.len()).expect("index count fits in u64"),
@@ -53,7 +55,11 @@ impl IndexRun {
 	/// Returns the first physical index, if this run is non-empty.
 	#[must_use]
 	pub const fn first(self) -> Option<u64> {
-		if self.count == 0 { None } else { Some(self.first) }
+		if self.count == 0 {
+			None
+		} else {
+			Some(self.first)
+		}
 	}
 
 	/// Returns the number of physical indexes in this run.
@@ -345,10 +351,7 @@ impl Writer {
 	/// reports those physical indexes in [`AppendManyError::appended`].
 	pub fn append_many(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, AppendManyError> {
 		if self.poisoned {
-			return Err(AppendManyError {
-				source:   halted_error(),
-				appended: IndexRun::default(),
-			});
+			return Err(AppendManyError { source: halted_error(), appended: IndexRun::default() });
 		}
 		let ends = self.stage(events).map_err(|source| AppendManyError {
 			source:   JournalError::RolledBack { source },
@@ -521,7 +524,10 @@ fn run_including_next(indexes: &[u64], next: u64) -> IndexRun {
 	}));
 	IndexRun {
 		first: prefix.first().unwrap_or(next),
-		count: prefix.count.checked_add(1).expect("index count fits in u64"),
+		count: prefix
+			.count
+			.checked_add(1)
+			.expect("index count fits in u64"),
 	}
 }
 
@@ -530,7 +536,6 @@ mod tests {
 	use std::io::{self, Write};
 
 	use bytes::BytesMut;
-	use smallvec::SmallVec;
 	use tempfile::tempdir;
 
 	use super::{AppendTarget, Error, IndexRun, JournalError, Writer, append_all, commit};

@@ -522,7 +522,6 @@ const _: () = assert!(
 	"JournalControlError must stay compact"
 );
 
-
 /// Authenticated journal-domain CONTROL dispatcher for one extension.
 ///
 /// Durable frames are generation-fenced and fully decoded before the one

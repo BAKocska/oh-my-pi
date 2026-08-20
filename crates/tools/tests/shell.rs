@@ -622,7 +622,7 @@ fn prompt_projection_retains_status_and_obeys_text_caps() {
 		.prompt(&ToolIdentity { name: name.clone(), rev: rev.clone() }, verdict, &caps)
 		.unwrap()
 		.unwrap();
-	let [Part::Text { text }] = parts.as_slice() else {
+	let [Part::Text { text }] = parts.as_ref() else {
 		panic!("shell prompt must be one capped text part")
 	};
 	assert!(text.len() <= 96);

@@ -4,6 +4,7 @@
 //! parameter and result types until [`Registry::register`], while prompt
 //! projection and revision lifting remain deterministic shared code.
 
+mod device_path;
 mod incoming;
 mod registry;
 pub mod render;
@@ -12,6 +13,7 @@ mod spec_generated;
 use std::{collections::BTreeMap, fmt, future::Future, io::Write, mem::size_of, sync::Arc};
 
 use bytes::Bytes;
+pub use device_path::{DevicePath, DevicePathError};
 use futures::Stream;
 pub use incoming::{
 	CommitError, FinalizedArgs, IncomingCursor, IncomingParams, Interrupt, InterruptWaitError,
@@ -21,9 +23,10 @@ use omp_core::{InvocationPhase, SparseMap, Str};
 pub use omp_proto::inference::v1::Fallback;
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
-	Claim, Claims, ConstraintDisposition, ErasedEv, ErasedOutcome, ErasedStream, LoweredTool,
-	LoweringCaps, MountedDevice, Precedence, ProjectedCall, ProjectedVerdict, Registry,
-	RegistryError, ShadowClaim, ToolRoute,
+	AvailabilityDelta, Claim, Claims, ConstraintDisposition, DeviceTarget, ErasedEv, ErasedOutcome,
+	ErasedStream, LoweredTool, LoweringCaps, MountedDevice, Precedence, ProjectedCall,
+	ProjectedVerdict, ProjectionKey, ProjectionRequest, Registry, RegistryError, ShadowClaim,
+	ToolRoute, WorkerSiteKind,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
@@ -85,6 +88,33 @@ pub enum Presentation {
 	Slot,
 	/// A catalog entry reached through the dynamic device tool.
 	Device,
+}
+/// Session policy deciding whether the model receives tool slots, the dynamic
+/// device transport, or both.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ToolsPolicy {
+	/// Advertise slots and the dynamic device transport.
+	#[default]
+	Auto,
+	/// Advertise only the dynamic device transport.
+	DeviceOnly,
+	/// Advertise only tool slots.
+	ToolOnly,
 }
 
 /// One argument-dialect revision within a revision family.
@@ -239,7 +269,7 @@ pub struct DocEffects {
 impl DocEffects {
 	/// Returns whether this document domain grants no authority.
 	#[must_use]
-	pub const fn is_empty(&self) -> bool {
+	pub fn is_empty(&self) -> bool {
 		!self.read && self.write_globs.is_empty()
 	}
 }
@@ -256,7 +286,7 @@ pub struct ExecEffects {
 impl ExecEffects {
 	/// Returns whether this process domain grants no authority.
 	#[must_use]
-	pub const fn is_empty(&self) -> bool {
+	pub fn is_empty(&self) -> bool {
 		self.commands.is_empty() && !self.network
 	}
 }
@@ -1143,10 +1173,8 @@ pub enum ArgSpecRegistryError {
 	PathLimit(Rev),
 }
 
-const _: () = assert!(
-	size_of::<ArgSpecRegistryError>() <= 128,
-	"ArgSpecRegistryError must stay compact"
-);
+const _: () =
+	assert!(size_of::<ArgSpecRegistryError>() <= 128, "ArgSpecRegistryError must stay compact");
 
 impl ArgSpecRegistry {
 	/// Creates an empty mutable declaration table.
@@ -1166,7 +1194,7 @@ impl ArgSpecRegistry {
 			if !matches!(spec.path.last(), Some(ArgPath::Key(_))) {
 				return Err(ArgSpecRegistryError::AliasOnIndex {
 					rev,
-					path: Arc::from(spec.path),
+					path: Arc::from(spec.path.into_vec()),
 				});
 			}
 			for alias in &spec.aliases {
@@ -1176,7 +1204,10 @@ impl ArgSpecRegistry {
 				};
 				*key = alias.clone();
 				if paths.contains(&path) {
-					return Err(ArgSpecRegistryError::Duplicate { rev, path: Arc::from(path) });
+					return Err(ArgSpecRegistryError::Duplicate {
+						rev,
+						path: Arc::from(path.into_vec()),
+					});
 				}
 				paths.push(path);
 			}
@@ -1188,7 +1219,7 @@ impl ArgSpecRegistry {
 		{
 			return Err(ArgSpecRegistryError::Duplicate {
 				rev,
-				path: Arc::from((*path).clone()),
+				path: Arc::from((*path).clone().into_vec()),
 			});
 		}
 		let path_id = u32::try_from(revision.specs.len())
@@ -1286,6 +1317,28 @@ pub struct ArgIssue {
 	pub example:  Option<Str>,
 	/// Observed shape for [`ArgIssueKind::TypeMismatch`].
 	pub found:    Option<Str>,
+}
+/// Structured device-routing issue, using the same repair vocabulary as a
+/// pulled argument failure.
+pub type DeviceIssue = ArgIssue;
+
+/// Durable device-router fault.
+///
+/// A device failure retains the resolved semantic revision and the typed path
+/// that selected its claimant so replay and schema-echo projection never
+/// recover identity from text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Verdict {
+	/// A device path could not be resolved or dispatched.
+	Device {
+		/// Device-tree address selected by the dynamic transport.
+		path:  DevicePath,
+		/// Semantic revision attributed to the selected device.
+		rev:   Rev,
+		/// Structured routing or argument issue.
+		issue: DeviceIssue,
+	},
 }
 
 /// Structured reason an invocation did not produce a normal outcome.
@@ -1674,5 +1727,31 @@ where
 				.map_err(CallOutcomeDetailsError::SpillFinalize)?;
 			Ok(CallOutcomeDetails::Spilled { blob, byte_len: writer.byte_len })
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn device_fault_round_trips_through_the_durable_verdict_codec() {
+		let outcome = CallOutcome::<(), Verdict>::Faulted(Verdict::Device {
+			path:  "lint@publisher/extension"
+				.parse()
+				.expect("valid device path"),
+			rev:   Rev { family: Str::new_static("device"), n: 3 },
+			issue: DeviceIssue {
+				path:     Vec::new(),
+				expected: Str::new_static("mounted device"),
+				kind:     ArgIssueKind::Missing,
+				example:  None,
+				found:    Some(Str::new_static("lint")),
+			},
+		});
+		let encoded = serde_json::to_vec(&outcome).expect("fault serializes");
+		let decoded: CallOutcome<(), Verdict> =
+			serde_json::from_slice(&encoded).expect("fault deserializes");
+		assert_eq!(decoded, outcome);
 	}
 }

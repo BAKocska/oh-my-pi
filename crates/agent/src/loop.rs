@@ -109,10 +109,7 @@ pub enum AgentError {
 	Interrupted,
 }
 
-const _: () = assert!(
-	std::mem::size_of::<AgentError>() <= 128,
-	"AgentError must stay compact"
-);
+const _: () = assert!(std::mem::size_of::<AgentError>() <= 128, "AgentError must stay compact");
 
 /// Cloneable out-of-band stop signal for the active submission.
 #[derive(Clone, Debug)]
@@ -148,11 +145,12 @@ pub struct Agent<C: TurnClient> {
 	jobs_restored:      bool,
 	abort_tx:           Arc<tokio::sync::watch::Sender<u64>>,
 	abort_rx:           tokio::sync::watch::Receiver<u64>,
-	phase:              AgentPhase,
-	context:            Option<ContextRef>,
-	prompt_hash:        Option<crate::PromptHash>,
-	prompt_head_events: Vec<u64>,
-	last_toolset_hash:  Option<[u8; 32]>,
+	phase:                         AgentPhase,
+	control_serviced_during_turn:  bool,
+	context:                       Option<ContextRef>,
+	prompt_hash:                   Option<crate::PromptHash>,
+	prompt_head_events:            Vec<u64>,
+	last_toolset_hash:             Option<[u8; 32]>,
 }
 
 impl<C: TurnClient> Agent<C> {
@@ -224,6 +222,7 @@ impl<C: TurnClient> Agent<C> {
 			abort_tx: Arc::new(abort_tx),
 			abort_rx,
 			phase: AgentPhase::Idle,
+			control_serviced_during_turn: false,
 			context,
 			prompt_hash,
 			prompt_head_events,
@@ -455,6 +454,9 @@ impl<C: TurnClient> Agent<C> {
 						continue;
 					}
 					self.transition(AgentPhase::Idle);
+					if self.control_serviced_during_turn {
+						return Err(AgentError::Interrupted);
+					}
 					return Ok(AgentRunSummary {
 						outcome: last_outcome,
 						committed_turns,
@@ -567,12 +569,11 @@ impl<C: TurnClient> Agent<C> {
 					)?;
 				}
 				let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(None);
-				for interrupt in std::mem::take(&mut immediate) {
-					interrupt_tx.send_replace(Some(interrupt_reason(&interrupt.source)));
-					boundary.push(interrupt);
+				let mut aborted = self.abort_rx.has_changed().unwrap_or(false);
+				if aborted {
+					interrupt_tx.send_replace(Some(Str::new_static("user interrupt")));
 				}
 				let mut deadline_elapsed = false;
-				let mut aborted = false;
 				let mut abort_rx = self.abort_rx.clone();
 				let results = {
 					let caps = self.caps;
@@ -750,6 +751,7 @@ impl<C: TurnClient> Agent<C> {
 		),
 		AgentError,
 	> {
+		self.control_serviced_during_turn = false;
 		let snapshot = self.state.snapshot();
 		let durable = self
 			.journal
@@ -1090,6 +1092,7 @@ impl<C: TurnClient> Agent<C> {
 					event = events.next() => event,
 					handled = self.control_mailbox.handle_next(&mut self.journal) => {
 						if handled {
+							self.control_serviced_during_turn = true;
 							continue;
 						}
 						std::future::pending().await
@@ -1103,6 +1106,7 @@ impl<C: TurnClient> Agent<C> {
 						completion = duplex.next() => Err(completion),
 						handled = self.control_mailbox.handle_next(&mut self.journal) => {
 							if handled {
+								self.control_serviced_during_turn = true;
 								continue;
 							}
 							std::future::pending().await
@@ -1496,9 +1500,6 @@ fn committed_calls(
 			.ok_or(AgentError::Protocol("committed tool revision missing"))?;
 		if committed_rev != opened.identity().rev.to_string() {
 			return Err(AgentError::Protocol("committed tool revision changed"));
-		}
-		if opened.admission().is_none() {
-			return Err(AgentError::Protocol("committed tool lacked admission"));
 		}
 		committed.push(opened.commit(call.args_json.clone()));
 	}

@@ -28,6 +28,7 @@
 //! to its own binaries; downstream crates need it in their own build script.
 
 mod bindings;
+pub mod interrupt;
 
 use std::{
 	env,
@@ -154,6 +155,21 @@ impl Engine {
 	{
 		Python::attach(f)
 	}
+}
+
+/// Imports the inert extension package and explicitly attaches its inherited
+/// CONTROL descriptor. Extension-host process startup calls this after
+/// [`Engine`] initialization; ordinary package import never invokes it.
+///
+/// # Errors
+/// Returns the Python bootstrap error when the CONTROL descriptor is
+/// unavailable or malformed.
+pub fn bootstrap_extension_host(engine: &Engine) -> PyResult<()> {
+	engine.attach(|py| {
+		let host = py.import("omp._host")?;
+		host.getattr("bootstrap")?.call0()?;
+		Ok(())
+	})
 }
 
 /// Default wheel directory: `$OMP_PY_SITE` or a home-relative fallback.

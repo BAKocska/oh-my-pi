@@ -334,7 +334,7 @@ impl EvalChild {
 				() = timeout.expired() => {
 					needs_reset.store(true, Ordering::Release);
 					tokio::time::sleep(self.interrupt_grace).await;
-					let _ = events.send(Ok(RunEvent::Completed(Box::new(timeout_completion(elapsed_ms(started))))));
+					let _ = events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
 					return false;
 				},
 				frame = read_frame(&mut self.stdout) => frame,
@@ -351,9 +351,8 @@ impl EvalChild {
 						.and_then(|status| status.code())
 						== Some(CHILD_TIMEOUT_EXIT)
 					{
-						let _ = events.send(Ok(RunEvent::Completed(Box::new(timeout_completion(
-							elapsed_ms(started),
-						)))));
+						let _ =
+							events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
 					} else {
 						let _ = events.send(Err(Fault::SessionLost {
 							message: Str::from("Python eval child exited during the active cell"),
@@ -378,7 +377,7 @@ impl EvalChild {
 				},
 				ChildFrame::Completed { run_id: actual, completion } if actual == run_id => {
 					timeout.dispose();
-					let _ = events.send(Ok(RunEvent::Completed(completion)));
+					let _ = events.send(Ok(RunEvent::Completed(*completion)));
 					return true;
 				},
 				ChildFrame::BridgeCall { run_id: actual, request_id, token, name, args }
@@ -747,7 +746,10 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 							},
 							Ok(Some(RunEvent::Completed(completion))) => {
 								active_run.store(false, Ordering::Release);
-								let _ = outgoing.send(ChildFrame::Completed { run_id, completion });
+								let _ = outgoing.send(ChildFrame::Completed {
+									run_id,
+									completion: Box::new(completion),
+								});
 								break;
 							},
 							Ok(None) => {

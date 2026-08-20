@@ -1,14 +1,103 @@
 //! Extension declaration, verification, and activation lifecycle.
 
-use std::{collections::BTreeSet, future::Future, time::SystemTime};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::SystemTime};
 
-use omp_agent::HookPhase;
+use omp_agent::{HookPhase, MailboxSender, device_availability_interrupt};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason};
 use omp_core::{Provenance, Str};
+use omp_proto::{
+	thread::v1::{Item, Message, Part, Role, item, part},
+	toolhost::v1::SetAvailability,
+};
+use omp_tool::{AvailabilityDelta, Registry};
 use thiserror::Error;
 
 use super::{quota::QuotaSpec, services::ServiceManifest};
 
+/// Authenticated, generation-fenced worker availability batch.
+///
+/// The supervisor calls this only after it verifies the owning child
+/// generation, so stale host frames never reach shared catalog state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AvailabilityBatch {
+	/// Worker-reported mount transitions in one CONTROL frame.
+	pub deltas: Box<[AvailabilityDelta]>,
+}
+
+impl AvailabilityBatch {
+	/// Decodes one `LifecycleWorkerEnvelope.set_availability` body.
+	#[must_use]
+	pub fn from_wire(wire: SetAvailability) -> Self {
+		Self {
+			deltas: wire
+				.deltas
+				.into_iter()
+				.map(|delta| AvailabilityDelta {
+					name:    Str::from(delta.name),
+					mounted: delta.available,
+					reason:  delta.reason.map(Str::from),
+				})
+				.collect(),
+		}
+	}
+}
+/// App-side destination for a verified `SetAvailability` CONTROL frame.
+pub trait AvailabilitySink: Send + Sync {
+	/// Applies one complete worker availability batch.
+	fn set_availability(&self, batch: AvailabilityBatch);
+}
+
+/// Catalog and mailbox implementation of [`AvailabilitySink`].
+///
+/// The registry accepts unmounts immediately and conservatively ignores
+/// mounts. The one turn-boundary system item still reports all worker facts,
+/// allowing normal next-turn composition to surface availability changes.
+pub struct RegistryAvailabilitySink {
+	registry: Arc<Registry>,
+	mailbox:  MailboxSender,
+}
+
+impl RegistryAvailabilitySink {
+	/// Binds a shared catalog and the agent's turn-boundary mailbox producer.
+	#[must_use]
+	pub const fn new(registry: Arc<Registry>, mailbox: MailboxSender) -> Self {
+		Self { registry, mailbox }
+	}
+}
+
+impl AvailabilitySink for RegistryAvailabilitySink {
+	fn set_availability(&self, batch: AvailabilityBatch) {
+		self.registry.apply_availability(&batch.deltas);
+		let mut text = String::from("Extension device availability changed:");
+		for delta in &batch.deltas {
+			text.push(' ');
+			text.push_str(delta.name.as_str());
+			text.push_str(if delta.mounted {
+				" is available"
+			} else {
+				" is unavailable"
+			});
+			if let Some(reason) = &delta.reason {
+				text.push_str(" (");
+				text.push_str(reason.as_str());
+				text.push(')');
+			}
+			text.push('.');
+		}
+		let item = Item {
+			seq:           0,
+			created_at_ms: 0,
+			kind:          Some(item::Kind::Message(Message {
+				role:  Role::System as i32,
+				parts: vec![Part { kind: Some(part::Kind::Text(text)) }],
+			})),
+			props:         None,
+		};
+		let _ = self
+			.mailbox
+			.try_enqueue(device_availability_interrupt(item));
+	}
+}
 /// A tool identity in the authoritative manifest declaration set.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ToolDeclarationKey {

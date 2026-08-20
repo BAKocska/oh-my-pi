@@ -52,9 +52,10 @@ use tokio::{
 use crate::{
 	envd::policy::{AuthorityTable, Grants},
 	exthost::{
-		ActivationCause, ActivationEvent, ActivationTrigger, ControlQuotaLedger, DeclarationSet,
-		ExtensionManifest, GenerationFence, LifecycleHost, ServiceBroker, ServiceCallId,
-		ServiceConnection, ServiceKey, ServiceRequestMeta, ServiceResponse, ToolDeclarationKey,
+		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
+		ControlQuotaLedger, DeclarationSet, ExtensionManifest, GenerationFence, LifecycleHost,
+		ServiceBroker, ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta,
+		ServiceResponse, ToolDeclarationKey,
 		control::{
 			ExternalJournalRequest, JournalConnectionIdentity, JournalControl, JournalDispatch,
 		},
@@ -96,10 +97,8 @@ impl std::fmt::Debug for HostKey {
 	}
 }
 
-const _: () = assert!(
-	std::mem::size_of::<HostKey>() <= 16,
-	"HostKey must remain a cheap identity handle"
-);
+const _: () =
+	assert!(std::mem::size_of::<HostKey>() <= 16, "HostKey must remain a cheap identity handle");
 
 impl HostKey {
 	/// Builds a host identity.
@@ -244,6 +243,8 @@ pub struct ExtHostConfig {
 	/// CONTROL routing to the serialized Agent Journal and external storage
 	/// backends.
 	pub journal:            Option<JournalRuntime>,
+	/// Late-bound, generation-fenced device availability destination.
+	availability_sink:      Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
 }
 impl ExtHostConfig {
 	/// Builds the production configuration from authenticated session context.
@@ -272,6 +273,7 @@ impl ExtHostConfig {
 			journal: None,
 			initial_backoff: Duration::from_secs(1),
 			scheme_snapshot: None,
+			availability_sink: Arc::new(Mutex::new(None)),
 			max_backoff: Duration::from_secs(30),
 			healthy_reset: Duration::from_secs(30),
 		}
@@ -504,17 +506,15 @@ impl WorkerInvocation {
 			)));
 		}
 		if let Some(authority) = &self.data_authority {
-			let effects = frame.effects.as_ref().ok_or_else(|| {
-				WorkerError::Protocol(Str::new_static(
-					"ArgsCommitted omitted its Core-narrowed effect envelope",
-				))
-			})?;
 			authority
 				.authorize(
 					&self.owner,
 					self.invocation_id.as_str(),
 					frame.effect_token.clone(),
-					Grants::from_effect_envelope(effects),
+					frame
+						.effects
+						.as_ref()
+						.map_or_else(Grants::default, Grants::from_effect_envelope),
 					frame.authorized_at_ms,
 					self.host_generation,
 					self.session_generation,
@@ -611,15 +611,16 @@ pub struct OwnedToolDecl {
 
 /// Independently supervises the process group for each active extension host.
 pub struct ExtHostSupervisor {
-	routes:          BTreeMap<(Str, Str), HostRoute>,
-	registrations:   Arc<[OwnedToolDecl]>,
-	next_invocation: AtomicU64,
-	actors:          Vec<HostActor>,
-	data_authority:  Option<Arc<AuthorityTable>>,
-	journal_runtime: Arc<Mutex<Option<JournalRuntime>>>,
-	children_active: AtomicBool,
+	routes:               BTreeMap<(Str, Str), HostRoute>,
+	registrations:        Arc<[OwnedToolDecl]>,
+	next_invocation:      AtomicU64,
+	actors:               Vec<HostActor>,
+	data_authority:       Option<Arc<AuthorityTable>>,
+	journal_runtime:      Arc<Mutex<Option<JournalRuntime>>>,
+	availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
+	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
+	children_active:      AtomicBool,
 }
-
 impl ExtHostSupervisor {
 	/// Starts and verifies every configured active extension.
 	///
@@ -644,6 +645,8 @@ impl ExtHostSupervisor {
 		let mut identities = HashSet::with_capacity(config.extensions.len());
 		let data_authority = config.data_authority.clone();
 		let resources = Arc::new(Mutex::new(ControlQuotaLedger::new()));
+		let availability_sink = Arc::clone(&config.availability_sink);
+		let availability_pending = Arc::new(Mutex::new(VecDeque::new()));
 		let journal_runtime = Arc::new(Mutex::new(config.journal.clone()));
 		let children_active = AtomicBool::new(false);
 		for extension in config.extensions.iter().cloned() {
@@ -676,6 +679,7 @@ impl ExtHostSupervisor {
 				key,
 				extensions,
 				Arc::clone(&resources),
+				Arc::clone(&availability_pending),
 				Arc::clone(&journal_runtime),
 			)?;
 			match WorkerProcess::spawn(&process_config, 1, ActivationCause::FirstReach).await {
@@ -803,6 +807,8 @@ impl ExtHostSupervisor {
 			actors,
 			data_authority,
 			journal_runtime,
+			availability_sink,
+			availability_pending,
 			children_active,
 		})
 	}
@@ -830,6 +836,18 @@ impl ExtHostSupervisor {
 		}
 		*self.journal_runtime.lock() = Some(runtime);
 		Ok(())
+	}
+
+	/// Binds the active Agent mailbox's device availability destination.
+	pub fn bind_availability_sink(&self, sink: Arc<dyn AvailabilitySink>) {
+		let pending = {
+			let mut availability_sink = self.availability_sink.lock();
+			*availability_sink = Some(Arc::clone(&sink));
+			std::mem::take(&mut *self.availability_pending.lock())
+		};
+		for batch in pending {
+			sink.set_availability(batch);
+		}
 	}
 
 	/// Opens one invocation and establishes its host-owned request mapping.
@@ -980,6 +998,9 @@ pub enum WorkerError {
 	/// The supervisor actor is no longer available.
 	#[error("python tool worker supervisor is unavailable")]
 	Unavailable,
+	/// Named-worker routing refused immediate placement.
+	#[error(transparent)]
+	WorkerUnavailable(#[from] crate::envd::worker_pool::WorkerUnavailable),
 }
 
 impl From<PyErr> for WorkerError {
@@ -1067,28 +1088,30 @@ impl ProcessKey {
 
 #[derive(Clone)]
 struct ProcessConfig {
-	process_id:         ProcessKey,
-	executable:         PathBuf,
-	python_site:        Option<PathBuf>,
-	modules:            Vec<Str>,
-	manifests:          BTreeMap<HostKey, ExtensionManifest>,
-	data_socket:        Option<PathBuf>,
-	schema_rev:         u32,
-	python_rev:         Str,
-	principal:          omp_core::Principal,
-	session_started_at: SystemTime,
-	session_id:         Str,
-	max_frame_bytes:    NonZeroUsize,
-	health_timeout:     Duration,
-	ping_interval:      Duration,
-	interrupt_grace:    Duration,
-	initial_backoff:    Duration,
-	max_backoff:        Duration,
-	healthy_reset:      Duration,
-	session_generation: u64,
-	scheme_snapshot:    Option<SchemeSnapshot>,
-	journal:            Arc<Mutex<Option<JournalRuntime>>>,
-	resources:          Arc<Mutex<ControlQuotaLedger>>,
+	process_id:           ProcessKey,
+	executable:           PathBuf,
+	python_site:          Option<PathBuf>,
+	modules:              Vec<Str>,
+	manifests:            BTreeMap<HostKey, ExtensionManifest>,
+	data_socket:          Option<PathBuf>,
+	schema_rev:           u32,
+	python_rev:           Str,
+	principal:            omp_core::Principal,
+	session_started_at:   SystemTime,
+	session_id:           Str,
+	max_frame_bytes:      NonZeroUsize,
+	health_timeout:       Duration,
+	ping_interval:        Duration,
+	interrupt_grace:      Duration,
+	initial_backoff:      Duration,
+	max_backoff:          Duration,
+	healthy_reset:        Duration,
+	session_generation:   u64,
+	scheme_snapshot:      Option<SchemeSnapshot>,
+	journal:              Arc<Mutex<Option<JournalRuntime>>>,
+	resources:            Arc<Mutex<ControlQuotaLedger>>,
+	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
+	availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
 }
 
 impl ProcessConfig {
@@ -1097,6 +1120,7 @@ impl ProcessConfig {
 		process_id: ProcessKey,
 		extensions: Vec<ExtHostSpec>,
 		resources: Arc<Mutex<ControlQuotaLedger>>,
+		availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
 		journal: Arc<Mutex<Option<JournalRuntime>>>,
 	) -> Result<Self, WorkerError> {
 		let python_site = extensions
@@ -1164,6 +1188,8 @@ impl ProcessConfig {
 			scheme_snapshot: root.scheme_snapshot.clone(),
 			journal,
 			resources,
+			availability_sink: Arc::clone(&root.availability_sink),
+			availability_pending,
 		})
 	}
 
@@ -2267,6 +2293,26 @@ async fn run_invocation(
 					return InvocationAction::ReplaceWorker(RestartReason::Crash);
 				};
 				if let Some(worker_frame::Body::Lifecycle(envelope)) = &frame.body
+					&& let Some(lifecycle_worker_envelope::Body::SetAvailability(availability)) =
+						&envelope.body
+				{
+					if availability.deltas.iter().any(|delta| !owns_availability(config, delta)) {
+						send_abort(
+							&invocation,
+							WorkerAbortKind::Crashed,
+							"worker availability named an undeclared device",
+						);
+						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+					}
+					let batch = AvailabilityBatch::from_wire(availability.clone());
+					let sink = config.availability_sink.lock().as_ref().map(Arc::clone);
+					match sink {
+						Some(sink) => sink.set_availability(batch),
+						None => config.availability_pending.lock().push_back(batch),
+					}
+					continue;
+				}
+				if let Some(worker_frame::Body::Lifecycle(envelope)) = &frame.body
 					&& let Some(lifecycle_worker_envelope::Body::ResourceQuery(query)) =
 						&envelope.body
 				{
@@ -2504,6 +2550,18 @@ async fn run_invocation(
 			},
 		}
 	}
+}
+
+fn owns_availability(
+	config: &ProcessConfig,
+	delta: &omp_proto::toolhost::v1::AvailabilityDelta,
+) -> bool {
+	config.manifests.values().any(|manifest| {
+		manifest
+			.declarations
+			.tools()
+			.any(|tool| tool.name.as_str() == delta.name && tool.rev.to_string() == delta.rev)
+	})
 }
 
 async fn write_argument_frame(
@@ -2788,13 +2846,71 @@ fn validate_manifest_registrations(
 	tools: &[ToolDecl],
 ) -> Result<(), WorkerError> {
 	for (owner, manifest) in &config.manifests {
-		if actual_declarations(config, tools, owner)? != manifest.declarations {
-			return Err(WorkerError::Protocol(Str::new_static(
-				"frozen worker declarations differ from the authenticated manifest",
+		let actual = actual_declarations(config, tools, owner)?;
+		if actual != manifest.declarations {
+			return Err(WorkerError::Protocol(manifest_registration_diff(
+				owner,
+				manifest,
+				tools,
+				&actual,
 			)));
 		}
 	}
 	Ok(())
+}
+
+fn manifest_registration_diff(
+	owner: &HostKey,
+	manifest: &ExtensionManifest,
+	tools: &[ToolDecl],
+	actual: &DeclarationSet,
+) -> Str {
+	let missing = manifest
+		.declarations
+		.tools()
+		.filter(|expected| !actual.tools().any(|registered| *registered == **expected))
+		.map(|tool| format!("{}@{}:{}", tool.name, tool.family, tool.rev))
+		.collect::<Vec<_>>();
+	let unexpected = actual
+		.tools()
+		.filter(|registered| !manifest.declarations.tools().any(|expected| *expected == **registered))
+		.map(|tool| format!("{}@{}:{}", tool.name, tool.family, tool.rev))
+		.collect::<Vec<_>>();
+	let mismatches = manifest
+		.declarations
+		.tools()
+		.filter_map(|expected| {
+			actual.tools().find(|registered| registered.name == expected.name).and_then(|registered| {
+				(registered.rev != expected.rev || registered.family != expected.family).then(|| {
+					format!(
+						"name {} has registered rev {}@{} instead of {}@{}",
+						expected.name, registered.family, registered.rev, expected.family, expected.rev
+					)
+				})
+			})
+		})
+		.collect::<Vec<_>>();
+	let flags = tools
+		.iter()
+		.filter(|tool| tool.extension_id == owner.extension().as_str())
+		.map(|tool| {
+			format!(
+				"{}: streams_args={}, effects={}",
+				tool.definition.as_ref().map_or("", |definition| definition.name.as_str()),
+				tool.streams_args,
+				tool.effects.is_some()
+			)
+		})
+		.collect::<Vec<_>>();
+	Str::from(format!(
+		"frozen worker declarations differ from authenticated manifest for {}: missing=[{}]; \
+		 unexpected=[{}]; name/rev mismatches=[{}]; registered flags=[{}]",
+		owner.extension(),
+		missing.join(", "),
+		unexpected.join(", "),
+		mismatches.join(", "),
+		flags.join(", "),
+	))
 }
 
 fn actual_declarations(
@@ -2952,6 +3068,11 @@ fn install_scheme_snapshot() -> Result<(), WorkerError> {
 fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerError> {
 	engine.attach(|py| -> PyResult<()> {
 		let sys = PyModule::import(py, "sys")?;
+		if let Ok(site) = env::var("OMP_PY_SITE") {
+			let path = sys.getattr("path")?;
+			let path = path.cast::<PyList>()?;
+			path.insert(0, site)?;
+		}
 		sys.setattr("stdout", sys.getattr("stderr")?)?;
 		Ok(())
 	})?;

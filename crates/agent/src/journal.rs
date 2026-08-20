@@ -438,10 +438,7 @@ pub enum JournalError {
 	RewindWhilePending,
 }
 
-const _: () = assert!(
-	std::mem::size_of::<JournalError>() <= 128,
-	"JournalError must stay compact"
-);
+const _: () = assert!(std::mem::size_of::<JournalError>() <= 128, "JournalError must stay compact");
 
 /// Append-only transcript owner with an in-memory terminal-turn index.
 pub struct Journal {
@@ -1531,7 +1528,7 @@ impl Journal {
 		Ok((stamp, author))
 	}
 
-	const fn validate_request(
+	fn validate_request(
 		&self,
 		stamp: &JournalRequestStamp,
 		author: &JournalAuthor,

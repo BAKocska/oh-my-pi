@@ -70,6 +70,19 @@ pub struct Interrupt {
 	pub source: InterruptSource,
 }
 
+/// Builds the deferred catalog-change interrupt used for device availability.
+///
+/// Availability is deliberately visible only at the turn boundary: changing a
+/// device catalog cannot preempt an in-flight tool batch.
+#[must_use]
+pub fn device_availability_interrupt(item: Item) -> Interrupt {
+	Interrupt {
+		class: InterruptClass::TurnBoundary,
+		item,
+		source: InterruptSource::Producer(Str::new_static("device availability")),
+	}
+}
+
 /// Cloneable nonblocking producer for the agent's sole command mailbox.
 #[derive(Clone, Debug)]
 pub struct MailboxSender {

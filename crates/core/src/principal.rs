@@ -1,7 +1,12 @@
 //! Authenticated actor identity and extension provenance carried by durable
 //! records.
 
-use std::{fmt, hash::{Hash, Hasher}, str::FromStr, sync::Arc};
+use std::{
+	fmt,
+	hash::{Hash, Hasher},
+	str::FromStr,
+	sync::Arc,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
@@ -161,10 +166,7 @@ struct ProvenanceData {
 	generation:      u64,
 }
 
-const _: () = assert!(
-	std::mem::size_of::<Provenance>() <= 16,
-	"Provenance must stay compact"
-);
+const _: () = assert!(std::mem::size_of::<Provenance>() <= 16, "Provenance must stay compact");
 
 impl Provenance {
 	/// Creates provenance from core-authenticated extension installation facts.

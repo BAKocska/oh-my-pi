@@ -57,10 +57,8 @@ impl FunctionEnv {
 	/// Returns an iterator over the functions registered in this environment.
 	pub fn iter(
 		&self,
-	) -> impl Iterator<Item = (&String, &Registration)>
-	+ ExactSizeIterator
-	+ std::iter::FusedIterator
-	+ '_ {
+	) -> impl Iterator<Item = (&String, &Registration)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	{
 		self.functions.iter()
 	}
 }

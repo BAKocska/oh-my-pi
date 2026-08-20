@@ -411,10 +411,7 @@ mod tests {
 	}
 	impl Http {
 		fn new(body: &'static str) -> Self {
-			Self {
-				responses: Arc::new(Mutex::new([body].into())),
-				requests: Arc::default(),
-			}
+			Self { responses: Arc::new(Mutex::new([body].into())), requests: Arc::default() }
 		}
 	}
 	impl OAuthHttpClient for Http {
@@ -443,7 +440,10 @@ mod tests {
 		let fetcher = KimiUsageFetcher::new(client.clone());
 		let credentials =
 			SecretString::from(r#"{"accessToken":"token","accountId":"acc-1"}"#.to_owned());
-		let report = fetcher.fetch(Some(&credentials), SystemTime::now(), None).await.unwrap();
+		let report = fetcher
+			.fetch(Some(&credentials), SystemTime::now(), None)
+			.await
+			.unwrap();
 		assert_eq!(report.account_meta.provider_account_id.as_deref(), Some("acc-1"));
 		assert_eq!(
 			report
@@ -479,10 +479,10 @@ mod tests {
 		let body = r#"{"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE","resetTime":"2026-07-18T06:00:00.000Z"},"detail":{"limit":"100","remaining":"40","resetTime":"2026-07-18T05:43:35.355947Z"}}]}"#;
 		let fetcher = KimiUsageFetcher::new(Arc::new(Http::new(body)));
 		let credentials = SecretString::from("token".to_owned());
-		let report = fetcher.fetch(Some(&credentials), SystemTime::now(), None).await.unwrap();
-		assert_eq!(
-			report.windows[0].resets_at,
-			omp_core::parse_rfc3339("2026-07-18T06:00:00.000Z")
-		);
+		let report = fetcher
+			.fetch(Some(&credentials), SystemTime::now(), None)
+			.await
+			.unwrap();
+		assert_eq!(report.windows[0].resets_at, omp_core::parse_rfc3339("2026-07-18T06:00:00.000Z"));
 	}
 }

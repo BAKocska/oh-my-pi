@@ -416,11 +416,15 @@ fn test_config() -> ExtHostConfig {
 fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig {
 	let mut config = test_config();
 	let key = HostKey::new("workspace", "trusted", module);
-	let manifest = test_manifest(&key, module, [
-		ToolDeclarationKey::new("worker_block", "r", 1),
-		ToolDeclarationKey::new("worker_echo", "r", 1),
-		ToolDeclarationKey::new("worker_fail", "r", 1),
-	]);
+	let manifest = if module == PY_EVAL_MODULE {
+		ExtensionManifest::py_eval(test_provenance(&key), [])
+	} else {
+		test_manifest(&key, module, [
+			ToolDeclarationKey::new("worker_block", "r", 1),
+			ToolDeclarationKey::new("worker_echo", "r", 1),
+			ToolDeclarationKey::new("worker_fail", "r", 1),
+		])
+	};
 	let mut extension = ExtHostSpec::new(key, manifest);
 	extension.python_site = python_site;
 	config.extensions.push(extension);
@@ -641,6 +645,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		.map(|tool| (tool.identity.name.as_str(), tool.identity.rev.to_string()))
 		.collect::<Vec<_>>();
 	assert_eq!(identities, [
+		("dyn", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
 		("glob", "1".to_owned()),
@@ -1689,8 +1694,8 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			grammar:       omp_llm_catalog::GrammarBits::empty(),
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 7);
-	assert_eq!(registry.route("py_eval").expect("python route"), ToolRoute::Worker);
+	assert_eq!(advertised.len(), 8);
+	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
 			.live_identity("py_eval")
@@ -2834,7 +2839,14 @@ async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
 			.await
 	});
 	tokio::time::timeout(Duration::from_secs(2), async {
-		while !socket.exists() {
+		loop {
+			if socket.exists()
+				&& std::os::unix::fs::PermissionsExt::mode(
+					&std::fs::metadata(&socket).expect("socket metadata").permissions(),
+				) & 0o077 == 0
+			{
+				break;
+			}
 			tokio::task::yield_now().await;
 		}
 	})

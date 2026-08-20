@@ -296,10 +296,7 @@ impl AppleFmAvailabilityEvidence {
 	/// Whether the narrow ABI seam exposes native schema-guided generation.
 	#[must_use]
 	pub const fn structured_generation(&self) -> bool {
-		matches!(
-			self.structured_generation_evidence,
-			AppleFmFeatureEvidence::Native
-		)
+		matches!(self.structured_generation_evidence, AppleFmFeatureEvidence::Native)
 	}
 }
 
@@ -1903,9 +1900,6 @@ mod tests {
 	#[test]
 	fn support_state_codes_use_strum_serialization() {
 		assert_eq!(AppleFmSupportState::Available.code(), "available");
-		assert_eq!(
-			AppleFmSupportState::SettingsDisabled.code(),
-			"apple_intelligence_not_enabled"
-		);
+		assert_eq!(AppleFmSupportState::SettingsDisabled.code(), "apple_intelligence_not_enabled");
 	}
 }

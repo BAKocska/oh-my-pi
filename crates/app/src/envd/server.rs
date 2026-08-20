@@ -27,6 +27,7 @@ use omp_tool::{
 	Abort, ArgIssue, ArgPath, CallOutcome, ErasedEv, ErasedOutcome, IncomingParams, Interrupt,
 	Registry, RegistryError, ToolRoute, ToolTerminal,
 };
+use omp_tools::device::{DeviceInvokeRequest, DeviceInvoker};
 use omp_walker::{
 	CompiledWalkGlob, DirectoryErrorMode, FileType, FollowLinks, WalkDetail, WalkFilter,
 	WalkOptions, WalkOrder, WalkRequest, WalkStatus,
@@ -50,12 +51,13 @@ use super::{
 		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, JournalRuntime, OpenToolCall,
 		WorkerError, WorkerEvent, WorkerOutcomeKind,
 	},
+	worker_pool::{WorkerKey, WorkerRoute, WorkerSupervisor, WorkerUnavailable},
 	workspace::{
 		WorkspaceError, WorkspaceHost, WorkspaceOperationError, WorkspaceOperations,
 		WorkspaceSearchCase, WorkspaceSearchOptions,
 	},
 };
-use crate::cli::EnvdArgs;
+use crate::{cli::EnvdArgs, exthost::RegistryAvailabilitySink};
 
 const MIN_SCHEMA_REV: u32 = 4;
 const FRAME_LIMIT: usize = 64 * 1024 * 1024;
@@ -64,6 +66,8 @@ const DEFAULT_TOOL_DEADLINE: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const NATIVE_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const INVOCATION_RESPONSE_SEND_GRACE: Duration = Duration::from_millis(250);
+const WORKER_LAYER_CEILING: u64 = 8;
+const MAX_CONCURRENT_SPAWNS: u64 = 4;
 static NEXT_CONNECTION_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Environment-daemon assembly or serving failure.
@@ -164,16 +168,17 @@ pub(crate) struct ConnectionPolicy {
 	retire: Option<CancellationToken>,
 	grants: Grants,
 	host:   Option<HostKey>,
+	ambient: bool,
 }
 
 impl ConnectionPolicy {
 	fn in_process() -> Self {
-		Self { retire: None, grants: Grants::all(), host: None }
+		Self { retire: None, grants: Grants::all(), host: None, ambient: true }
 	}
 
 	/// Grants owner-local lifecycle traffic while retaining DATA phase checks.
 	pub(crate) fn external(retire: Option<CancellationToken>) -> Self {
-		Self { retire, grants: Grants::all(), host: None }
+		Self { retire, grants: Grants::all(), host: None, ambient: false }
 	}
 
 	/// Restricts an extension-host connection to explicitly granted, reachable
@@ -183,7 +188,7 @@ impl ConnectionPolicy {
 		I: IntoIterator<Item = S>,
 		S: AsRef<str>,
 	{
-		Self { retire: None, grants: Grants::supported(grants), host: Some(host) }
+		Self { retire: None, grants: Grants::supported(grants), host: Some(host), ambient: false }
 	}
 }
 
@@ -279,6 +284,81 @@ impl Drop for DocumentAuthority {
 ///
 /// Executors remain env-side beside these resources. The server never passes a
 /// capability/facet trait bundle through a tool signature.
+/// Device-router bridge for final, worker-routed invocations.
+#[derive(Clone)]
+struct WorkerDeviceInvoker {
+	hosts: Arc<ExtHostSupervisor>,
+}
+
+impl WorkerDeviceInvoker {
+	fn new(hosts: Arc<ExtHostSupervisor>) -> Self {
+		Self { hosts }
+	}
+}
+
+impl DeviceInvoker for WorkerDeviceInvoker {
+	async fn invoke(&self, request: DeviceInvokeRequest) -> omp_tool::ErasedStream<'static> {
+		let hosts = Arc::clone(&self.hosts);
+		Box::pin(async_stream::stream! {
+			let deadline = match request.deadline.to_std() {
+				Ok(deadline) => deadline,
+				Err(error) => {
+					yield Err(RegistryError::VerdictShape(Str::from(error.to_string())));
+					return;
+				},
+			};
+			let mut invocation = match hosts.open(OpenToolCall {
+				invocation_id: request.invocation_id.clone(),
+				name: request.name.clone(),
+				rev: request.rev.clone(),
+				deadline,
+			}) {
+				Ok(invocation) => invocation,
+				Err(error) => {
+					yield Err(RegistryError::VerdictShape(Str::from(error.to_string())));
+					return;
+				},
+			};
+			let committed = omp_proto::env::v1::ArgsCommitted {
+				invocation_id: request.invocation_id.to_string(),
+				raw: request.args_json,
+				..omp_proto::env::v1::ArgsCommitted::default()
+			};
+			if let Err(error) = invocation.args_committed(committed) {
+				yield Err(RegistryError::VerdictShape(Str::from(error.to_string())));
+				return;
+			}
+			while let Ok(event) = invocation.next().await {
+				match event {
+					WorkerEvent::Update(update) => yield Ok(ErasedEv::Update(Bytes::from(update.encode_to_vec()))),
+					WorkerEvent::Complete(complete) => match worker_completion_json(&complete) {
+						Ok((verdict, _, _)) => {
+							yield Ok(ErasedEv::Done(ErasedOutcome::Done {
+								verdict,
+								useless: complete.useless,
+							}));
+							return;
+						},
+						Err(error) => {
+							yield Err(RegistryError::VerdictShape(error));
+							return;
+						},
+					},
+					WorkerEvent::Aborted(abort) => {
+						yield Err(RegistryError::VerdictShape(abort.reason));
+						return;
+					},
+					WorkerEvent::Pull(_) | WorkerEvent::ProtocolError(_) => {
+						yield Err(RegistryError::VerdictShape(Str::new_static("worker device protocol rejected final invocation")));
+						return;
+					},
+				}
+			}
+		})
+	}
+}
+
+/// Owner-local `env/v1` dispatch state serving one project environment.
 pub struct EnvServer {
 	identity:            ServerIdentity,
 	documents:           DocumentHost,
@@ -293,6 +373,7 @@ pub struct EnvServer {
 	eval_control:        omp_tools::eval::EvalSessionControl,
 	sessions_index:      Arc<SessionIndex>,
 	journal_external:    ExternalJournalActor,
+	workers:             Arc<WorkerSupervisor>,
 	authority:           Arc<AuthorityTable>,
 }
 
@@ -315,6 +396,27 @@ fn open_journal_authorities(
 	Ok((Arc::new(sessions_index), state_store))
 }
 
+fn worker_operation(request: &pb::WorkerOp) -> &'static str {
+	use pb::worker_op::Op;
+
+	match request.op.as_ref() {
+		Some(Op::Open(_)) => "omp.env.worker.open",
+		Some(Op::Close(_)) => "omp.env.worker.close",
+		Some(Op::Data(_)) => "omp.env.worker.data",
+		Some(Op::Info(_)) => "omp.env.worker.info",
+		Some(Op::List(_)) | None => "omp.env.worker.list",
+	}
+}
+
+fn worker_info(route: &WorkerRoute) -> pb::WorkerInfo {
+	pb::WorkerInfo {
+		name: route.key.name.to_string(),
+		generation: route.generation,
+		state: pb::WorkerState::Ready as i32,
+		..pb::WorkerInfo::default()
+	}
+}
+
 impl EnvServer {
 	#[must_use]
 	fn new(
@@ -326,7 +428,7 @@ impl EnvServer {
 		blobs: BlobHost,
 		registry: Arc<Registry>,
 		workspace_ops: WorkspaceOperations,
-		ext_hosts: ExtHostSupervisor,
+		ext_hosts: Arc<ExtHostSupervisor>,
 		eval_bridge: Arc<SessionBridgeHost>,
 		eval_control: omp_tools::eval::EvalSessionControl,
 		sessions_index: Arc<SessionIndex>,
@@ -342,11 +444,12 @@ impl EnvServer {
 			blobs,
 			registry,
 			workspace_ops,
-			ext_hosts: Arc::new(ext_hosts),
+			ext_hosts,
 			eval_bridge,
 			eval_control,
 			sessions_index,
 			journal_external,
+			workers: Arc::new(WorkerSupervisor::new(WORKER_LAYER_CEILING, MAX_CONCURRENT_SPAWNS)),
 			authority,
 		}
 	}
@@ -385,7 +488,7 @@ impl EnvServer {
 		let (sessions_index, state_store) = open_journal_authorities(state_dir, true)?;
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
-		let ext_hosts = ExtHostSupervisor::spawn(ext_host_config).await?;
+		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
@@ -410,8 +513,10 @@ impl EnvServer {
 			&exec,
 			&workspace,
 			&hello.root_uri,
-			&ext_hosts,
+			ext_hosts.as_ref(),
 			interrupt_grace,
+			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
+			omp_tool::ToolsPolicy::Auto,
 			registry,
 		)?;
 		let identity = ServerIdentity {
@@ -460,7 +565,7 @@ impl EnvServer {
 		let (sessions_index, state_store) = open_journal_authorities(state_dir, writer)?;
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
-		let ext_hosts = ExtHostSupervisor::spawn(ext_host_config).await?;
+		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
@@ -485,8 +590,10 @@ impl EnvServer {
 			&exec,
 			&workspace,
 			&hello.root_uri,
-			&ext_hosts,
+			ext_hosts.as_ref(),
 			interrupt_grace,
+			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
+			omp_tool::ToolsPolicy::Auto,
 			registry,
 		)?;
 		let identity = ServerIdentity {
@@ -613,6 +720,16 @@ impl EnvServer {
 			external: self.journal_external.sender(),
 		})?;
 		Ok(())
+	}
+
+	/// Binds extension device availability to the active Agent turn boundary.
+	pub(crate) fn bind_device_availability(&self, mailbox: omp_agent::MailboxSender) {
+		self
+			.ext_hosts
+			.bind_availability_sink(Arc::new(RegistryAvailabilitySink::new(
+				Arc::clone(&self.registry),
+				mailbox,
+			)));
 	}
 
 	/// Serves the server half returned by [`omp_env::EnvClient::in_process`].
@@ -930,7 +1047,11 @@ impl EnvServer {
 			.await;
 			return None;
 		}
-		let grants = policy.grants.requested(&hello.capabilities);
+		let grants = if hello.capabilities.is_empty() && policy.host.is_none() {
+			policy.grants.clone()
+		} else {
+			policy.grants.requested(&hello.capabilities)
+		};
 		responses
 			.send_async(server_frame(
 				0,
@@ -1463,6 +1584,21 @@ impl EnvServer {
 		use pb::data_request::Body;
 
 		match request.body {
+			Some(Body::Worker(request)) => {
+				if !authorize_data_operation(
+					connection,
+					scope,
+					worker_operation(&request),
+					"env.worker",
+					responses,
+					request_id,
+				)
+				.await
+				{
+					return;
+				}
+				self.dispatch_worker(request_id, request, responses).await;
+			},
 			Some(Body::Document(request)) => {
 				self
 					.dispatch_document(request_id, request, scope, responses, finished, connection)
@@ -1575,9 +1711,6 @@ impl EnvServer {
 					finished.clone(),
 				);
 			},
-			Some(Body::Worker(_)) => {
-				send_unsupported_data(responses, request_id, "worker DATA operations").await;
-			},
 			Some(Body::Workspace(request)) => {
 				self
 					.dispatch_workspace(request_id, request, scope, responses, connection)
@@ -1625,6 +1758,86 @@ impl EnvServer {
 				)
 				.await;
 			},
+		}
+	}
+
+	async fn dispatch_worker(
+		&self,
+		request_id: u64,
+		request: pb::WorkerOp,
+		responses: &flume::Sender<pb::ServerFrame>,
+	) {
+		use pb::{worker_op::Op, worker_result::Result as WorkerResult};
+
+		let result = match request.op {
+			Some(Op::Open(open)) => {
+				let key = WorkerKey {
+					extension: Str::new_static("env"),
+					name:      Str::from(open.name.as_str()),
+					site:      Str::new_static("env"),
+				};
+				match self.workers.open(key) {
+					Ok((route, lease)) => {
+						lease.relinquish();
+						Ok(WorkerResult::Opened(pb::WorkerOpened {
+							name: route.key.name.to_string(),
+							generation: route.generation,
+							..pb::WorkerOpened::default()
+						}))
+					},
+					Err(WorkerUnavailable::LayerCeiling | WorkerUnavailable::SpawnCeiling) => {
+						Err((pb::ProtocolErrorCode::ResourceExhausted, "WorkerUnavailable"))
+					},
+					Err(WorkerUnavailable::StaleGeneration) => {
+						Err((pb::ProtocolErrorCode::InvalidArgument, "stale worker generation"))
+					},
+				}
+			},
+			Some(Op::Close(close)) => match self.workers.close(&close.name, close.generation) {
+				true => Ok(WorkerResult::Closed(pb::ProcessCommandAccepted::default())),
+				false => Err((pb::ProtocolErrorCode::InvalidArgument, "stale worker generation")),
+			},
+			Some(Op::Data(data)) => match self.workers.demux(data) {
+				Ok(accepted) => Ok(WorkerResult::Data(pb::WorkerData {
+					name: accepted.route.key.name.to_string(),
+					generation: accepted.route.generation,
+					channel: accepted.channel,
+					data: Bytes::copy_from_slice(&accepted.data),
+					..pb::WorkerData::default()
+				})),
+				Err(WorkerUnavailable::StaleGeneration) => {
+					Err((pb::ProtocolErrorCode::InvalidArgument, "stale worker generation"))
+				},
+				Err(WorkerUnavailable::LayerCeiling | WorkerUnavailable::SpawnCeiling) => {
+					Err((pb::ProtocolErrorCode::ResourceExhausted, "WorkerUnavailable"))
+				},
+			},
+			Some(Op::Info(info)) => match self.workers.route(&info.name) {
+				Some(route) => Ok(WorkerResult::Info(worker_info(&route))),
+				None => Err((pb::ProtocolErrorCode::InvalidArgument, "unknown worker")),
+			},
+			Some(Op::List(_)) => Ok(WorkerResult::List(pb::WorkerList {
+				workers: self.workers.routes().iter().map(worker_info).collect(),
+				..pb::WorkerList::default()
+			})),
+			None => Err((pb::ProtocolErrorCode::InvalidArgument, "worker operation is missing")),
+		};
+		match result {
+			Ok(result) => {
+				send_body(
+					responses,
+					request_id,
+					server_frame::Body::Data(pb::DataResponse {
+						body: Some(pb::data_response::Body::Worker(pb::WorkerResult {
+							result: Some(result),
+							..pb::WorkerResult::default()
+						})),
+						..pb::DataResponse::default()
+					}),
+				)
+				.await
+			},
+			Err((code, message)) => send_error(responses, request_id, code, message).await,
 		}
 	}
 
@@ -2159,6 +2372,16 @@ impl EnvServer {
 		if reject_duplicate_open(connection, request_id, responses).await {
 			return;
 		}
+		if !connection.ambient && request.name == "eval" {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::PermissionDenied,
+				"eval is available only through the session-local environment",
+			)
+			.await;
+			return;
+		}
 		let invocation_id = Str::from(request.invocation_id.as_str());
 		if invocation_id.is_empty() {
 			send_error(
@@ -2249,7 +2472,7 @@ impl EnvServer {
 				finished.clone(),
 			)
 			.await;
-		} else if route == ToolRoute::Worker {
+		} else if matches!(route, ToolRoute::Worker { .. }) {
 			let Some(owner) = self.worker_owner(&request.name, &request.rev) else {
 				send_error(
 					responses,
@@ -2395,10 +2618,6 @@ impl EnvServer {
 					send_policy_error(responses, request_id, PolicyError::InvalidEffectToken).await;
 					return;
 				}
-				if request.effects.is_none() {
-					send_policy_error(responses, request_id, PolicyError::EffectsNotAuthorized).await;
-					return;
-				}
 				let Some(worker) = invocation.as_mut() else {
 					send_error(
 						responses,
@@ -2430,7 +2649,7 @@ impl EnvServer {
 				spawn_worker_invocation(
 					request_id,
 					id.clone(),
-					*invocation,
+					invocation,
 					cancel.clone(),
 					interrupts,
 					responses.clone(),
@@ -2550,6 +2769,7 @@ struct ConnectionState {
 	document_leases:  HashMap<Bytes, DocumentLease>,
 	grants:           Grants,
 	host:             Option<HostKey>,
+	ambient:          bool,
 	authority:        Arc<AuthorityTable>,
 	connection_owner: u64,
 	quotas:           QuotaAccount,
@@ -2654,7 +2874,8 @@ struct Finished {
 }
 
 enum LoopEvent {
-	/// Boxes the foreign generated protobuf frame to keep this local event enum compact.
+	/// Boxes the foreign generated protobuf frame to keep this local event enum
+	/// compact.
 	Frame(Box<pb::ClientFrame>),
 	Finished(Finished),
 }
@@ -2686,6 +2907,7 @@ impl ConnectionState {
 			document_leases: HashMap::new(),
 			grants,
 			host: policy.host.clone(),
+			ambient: policy.ambient,
 			authority,
 			connection_owner,
 			quotas,
@@ -4158,11 +4380,21 @@ async fn send_exec_error(
 		},
 		ExecError::ProcessExists(_) => pb::ProtocolErrorCode::AlreadyExists,
 		ExecError::UnsupportedSignal(_) => pb::ProtocolErrorCode::Unsupported,
-		ExecError::InvalidCwd(_) => pb::ProtocolErrorCode::InvalidArgument,
-		ExecError::SessionClosed => pb::ProtocolErrorCode::PreconditionFailed,
-		ExecError::Shell(_) | ExecError::Io(_) => pb::ProtocolErrorCode::Internal,
+		_ => pb::ProtocolErrorCode::Internal,
 	};
 	send_error(responses, request_id, code, &error.to_string()).await;
+}
+
+fn worker_operation_allowed(operation: &str) -> bool {
+	operation.starts_with("omp.env.docs.")
+		|| operation.starts_with("omp.env.find.")
+		|| matches!(
+			operation,
+			"omp.env.blobs.stat"
+				| "omp.env.blobs.get"
+				| "omp.env.blobs.put"
+				| "omp.env.blobs.commit_put"
+		)
 }
 
 async fn send_blob_error(
@@ -4261,18 +4493,6 @@ const fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str
 	}
 }
 
-fn worker_operation_allowed(operation: &str) -> bool {
-	operation.starts_with("omp.env.docs.")
-		|| operation.starts_with("omp.env.fs.")
-		|| operation.starts_with("omp.env.sh.")
-		|| matches!(
-			operation,
-			"omp.env.blobs.stat"
-				| "omp.env.blobs.get"
-				| "omp.env.blobs.put"
-				| "omp.env.blobs.commit_put"
-		)
-}
 
 async fn authorize_data_operation(
 	connection: &ConnectionState,
@@ -4306,6 +4526,9 @@ async fn authorize_data_operation(
 		send_policy_error(responses, request_id, PolicyError::Denied { capability }).await;
 		return false;
 	}
+	if scope.is_none() {
+		return true;
+	}
 	if !spec
 		.minimum_phase
 		.has_reached(omp_core::InvocationPhase::EffectsAuthorized)
@@ -4330,17 +4553,21 @@ async fn authorize_data_operation(
 	let worker_scope = connection
 		.authority
 		.is_worker_invocation(host, &scope.invocation_id);
-	let result = connection.authority.validate(
-		host,
-		connection.connection_owner,
-		DataAuthority {
-			invocation_id:      &scope.invocation_id,
-			effect_token:       &scope.effect_token,
-			host_generation:    scope.host_generation,
-			session_generation: scope.session_generation,
-		},
-		capability,
-	);
+	let credentials = DataAuthority {
+		invocation_id:      &scope.invocation_id,
+		effect_token:       &scope.effect_token,
+		host_generation:    scope.host_generation,
+		session_generation: scope.session_generation,
+	};
+	let result = if capability == "env.search" {
+		connection
+			.authority
+			.validate_read(host, connection.connection_owner, credentials)
+	} else {
+		connection
+			.authority
+			.validate(host, connection.connection_owner, credentials, capability)
+	};
 	if let Err(error) = result {
 		send_policy_error(responses, request_id, error).await;
 		return false;
@@ -5068,7 +5295,7 @@ mod tests {
 			blobs,
 			Arc::new(Registry::new()),
 			workspace_ops,
-			ext_hosts,
+			Arc::new(ext_hosts),
 			Arc::new(SessionBridgeHost::new()),
 			omp_tools::eval::EvalSessionControl::default(),
 			sessions_index,
@@ -5210,13 +5437,7 @@ mod tests {
 		requests
 			.send_async(data_frame(
 				3,
-				pb::data_request::Body::Document(pb::DocumentOp {
-					op:    Some(pb::document_op::Op::Stat(document_pb::StatPathRequest {
-						uri:             root.path().to_string_lossy().into_owned(),
-						follow_symlinks: document_pb::FollowSymlinks::No as i32,
-					})),
-					props: Default::default(),
-				}),
+				pb::data_request::Body::Site(pb::MaterializeSite::default()),
 			))
 			.await
 			.expect("send unsupported stat");

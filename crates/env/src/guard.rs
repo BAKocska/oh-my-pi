@@ -61,6 +61,85 @@ impl Drop for RunGuard {
 	}
 }
 
+/// Nonblocking termination ownership for one named worker generation.
+///
+/// Dropping an armed lease queues termination on the supervisor's unbounded
+/// control lane. A lease is generation-specific, so a late drop cannot
+/// terminate a replacement worker with the same name.
+#[derive(Debug)]
+pub struct WorkerLease {
+	state: WorkerLeaseState,
+}
+
+#[derive(Debug)]
+struct WorkerLeaseState {
+	name:       omp_core::Str,
+	generation: u64,
+	armed:      AtomicBool,
+	terminate:  Sender<(omp_core::Str, u64)>,
+}
+
+impl WorkerLease {
+	/// Creates an armed lease for one worker generation.
+	#[must_use]
+	pub fn new(
+		name: impl Into<omp_core::Str>,
+		generation: u64,
+		terminate: Sender<(omp_core::Str, u64)>,
+	) -> Self {
+		Self {
+			state: WorkerLeaseState {
+				name: name.into(),
+				generation,
+				armed: AtomicBool::new(true),
+				terminate,
+			},
+		}
+	}
+
+	/// Returns the leased worker generation.
+	#[must_use]
+	pub const fn generation(&self) -> u64 {
+		self.state.generation
+	}
+
+	/// Returns whether dropping this lease will terminate its generation.
+	#[must_use]
+	pub fn is_armed(&self) -> bool {
+		self.state.armed.load(Ordering::Acquire)
+	}
+
+	/// Transfers termination responsibility to the supervisor.
+	pub fn relinquish(self) {
+		self.state.disarm();
+	}
+}
+
+impl Drop for WorkerLease {
+	fn drop(&mut self) {
+		self.state.terminate();
+	}
+}
+
+impl WorkerLeaseState {
+	fn disarm(&self) {
+		self.armed.store(false, Ordering::Release);
+	}
+
+	fn terminate(&self) {
+		if self
+			.armed
+			.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+			.is_ok()
+		{
+			// This sender is always the supervisor's unbounded lifecycle lane.
+			let _ = self
+				.terminate
+				.try_send((self.name.clone(), self.generation));
+		}
+	}
+}
+
 impl GuardState {
 	fn disarm(&self) {
 		self.armed.store(false, Ordering::Release);

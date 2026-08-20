@@ -11,8 +11,14 @@ use omp_proto::{
 };
 use omp_tool::{
 	Claims, Constraint, GrammarSyntax, Precedence, Presentation, Registry, Rev, Tool, ToolSpec,
+	ToolsPolicy,
 };
-use omp_tools::{BuiltinRendererIdentities, edit::FormatPolicy, register_builtin_renderers};
+use omp_tools::{
+	BuiltinRendererIdentities,
+	device::{DeviceCatalog, dyn_enabled, dyn_tool, flatten_slots},
+	edit::FormatPolicy,
+	register_builtin_renderers,
+};
 
 use super::{
 	EnvdError,
@@ -32,7 +38,7 @@ use super::{
 /// Resource adapters are cloned into their typed executors. Worker declarations
 /// occupy device presentation entries and explicit worker routes; only the
 /// environment's worker supervisor can invoke them.
-pub fn production_registry(
+pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	documents: &DocumentHost,
 	blobs: &BlobHost,
 	exec: &ExecHost,
@@ -40,10 +46,12 @@ pub fn production_registry(
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
+	device_invoker: I,
+	policy: ToolsPolicy,
 	mut registry: Registry,
 ) -> Result<(Arc<Registry>, Arc<SessionBridgeHost>, omp_tools::eval::EvalSessionControl), EnvdError>
 {
-	for name in ["read", "edit", "shell", "grep", "glob", "write", "eval"] {
+	for name in ["read", "edit", "shell", "grep", "glob", "write", "eval", "dyn"] {
 		ensure_name_absent(&registry, name)?;
 	}
 	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
@@ -72,6 +80,14 @@ pub fn production_registry(
 	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
 	let eval_identity = eval_tool.spec().identity();
 	registry.register(eval_tool, Presentation::Slot, core_claims())?;
+	let catalog = DeviceCatalog::default();
+	if dyn_enabled(policy) {
+		registry.register(
+			dyn_tool(device_invoker, catalog.clone(), policy),
+			Presentation::Slot,
+			core_claims(),
+		)?;
+	}
 	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
 		edit:  edit_identity,
 		grep:  grep_identity,
@@ -82,17 +98,60 @@ pub fn production_registry(
 		eval:  eval_identity,
 	})
 	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
+	let flattened_slots = if policy == ToolsPolicy::ToolOnly {
+		Some(
+			flatten_slots(
+				workers
+					.registrations()
+					.iter()
+					.map(|registration| {
+						let definition =
+							registration
+								.declaration
+								.definition
+								.as_ref()
+								.ok_or_else(|| {
+									worker_declaration_error("worker tool declaration has no definition")
+								})?;
+						Ok((Str::from(definition.name.as_str()), registration.owner.extension().clone()))
+					})
+					.collect::<Result<Vec<_>, EnvdError>>()?,
+			)
+			.map_err(|collision| {
+				EnvdError::WorkerDeclaration(Str::from(format!(
+					"tool_only slot {} is claimed by both {} and {}",
+					collision.slot, collision.first, collision.second
+				)))
+			})?,
+		)
+	} else {
+		None
+	};
 	for registration in workers.registrations() {
 		let declaration = &registration.declaration;
-		let spec = worker_spec(declaration)?;
+		let mut spec = worker_spec(declaration)?;
+		if flattened_slots.is_some() {
+			spec.name = Str::from(spec.name.as_str().replace('/', "_"));
+		}
 		ensure_name_absent(&registry, &spec.name)?;
-		registry.register_worker(spec, Presentation::Device, Claims {
-			precedence: Precedence::DEFAULT,
-			claimant:   registration.owner.extension().clone(),
-			replaces:   None,
-		})?;
+		registry.register_worker(
+			spec,
+			if flattened_slots.is_some() {
+				Presentation::Slot
+			} else {
+				Presentation::Device
+			},
+			Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   registration.owner.extension().clone(),
+				replaces:   None,
+			},
+		)?;
 	}
 	let registry = Arc::new(registry);
+	catalog.bind(Arc::clone(&registry)).map_err(|_| {
+		EnvdError::WorkerDeclaration(Str::new_static("dynamic device catalog bound twice"))
+	})?;
 	eval_host
 		.bind_registry(Arc::clone(&registry))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;

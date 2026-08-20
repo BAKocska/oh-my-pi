@@ -763,10 +763,7 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		.submit([user_text("original")], TurnId::new("root"))
 		.await
 		.expect_err("bounded upstream recovery must surface the final failure");
-	assert!(matches!(
-		&error,
-		AgentError::Turn(Error::Terminal(_))
-	));
+	assert!(matches!(&error, AgentError::Turn(Error::Terminal(_))));
 	assert!(error.to_string().contains("provider detail"));
 	{
 		let attempts = opened.lock();

@@ -18,6 +18,6 @@ pub use client::{
 	ProcessAttachment, ProcessAttachmentEvent, RequestStream, SearchEvent, SearchStream, StreamLost,
 	TransactionId, TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
 };
-pub use guard::RunGuard;
+pub use guard::{RunGuard, WorkerLease};
 /// Generated `omp.env.v1` wire frames used at transport boundaries.
 pub use omp_proto::env::v1 as frame;

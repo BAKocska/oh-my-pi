@@ -611,10 +611,8 @@ impl ShellVariableMap {
 	/// Returns an iterator over all the variables in the map.
 	pub fn iter(
 		&self,
-	) -> impl Iterator<Item = (&String, &ShellVariable)>
-	+ ExactSizeIterator
-	+ std::iter::FusedIterator
-	+ '_ {
+	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	{
 		self.variables.iter()
 	}
 

@@ -16,13 +16,12 @@
 //!
 //! Timeouts are enforced solely by a Tokio watchdog task that first cancels
 //! host work, then raises `KeyboardInterrupt` in the worker after the
-//! configured interrupt grace via `PyThreadState_SetAsyncExc`. Python-side line
-//! tracing is deliberately absent because it deoptimizes the whole cell without
-//! covering anything the async interrupt cannot.
+//! configured interrupt grace through the shared `omp_py::interrupt` API.
+//! Python-side line tracing is deliberately absent because it deoptimizes the
+//! whole cell without covering anything the async interrupt cannot.
 
 use std::{
 	collections::HashMap,
-	ffi::{c_long, c_ulong},
 	sync::{
 		Arc, LazyLock,
 		atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -34,10 +33,13 @@ use std::{
 use bytes::Bytes;
 use flume::{Receiver, Sender};
 use omp_core::{CowBytes, Duration, DurationError, Str};
-use omp_py::Engine;
+use omp_py::{
+	Engine,
+	interrupt::{current_thread_id, interrupt},
+};
 use parking_lot::Mutex;
 use pyo3::{
-	Py, PyAny, PyResult, Python, ffi,
+	Py, PyAny, PyResult, Python,
 	ffi::c_str,
 	prelude::*,
 	pyclass, pymethods,
@@ -233,9 +235,6 @@ struct Command {
 	runtime:   Option<Handle>,
 	epoch:     u64,
 }
-unsafe extern "C" {
-	fn PyThread_get_thread_ident() -> c_ulong;
-}
 
 impl WorkerState {
 	fn begin_interrupt(&self, target: &Arc<AtomicBool>) -> bool {
@@ -311,22 +310,8 @@ impl WorkerState {
 
 	fn interrupt_thread(&self) -> Result<(), Fault> {
 		let id = self.thread_id.load(Ordering::Acquire);
-		if id == 0 {
-			return Ok(());
-		}
-		let changed = self.engine.attach(|_| {
-			// SAFETY: `id` is CPython's identifier for this live worker thread and
-			// `PyExc_KeyboardInterrupt` is an immortal runtime-owned exception type.
-			// The caller is attached while CPython selects the target thread state.
-			let changed =
-				unsafe { ffi::PyThreadState_SetAsyncExc(id as c_long, ffi::PyExc_KeyboardInterrupt) };
-			if changed > 1 {
-				// SAFETY: passing NULL clears the exception set by the preceding call.
-				unsafe { ffi::PyThreadState_SetAsyncExc(id as c_long, std::ptr::null_mut()) };
-			}
-			changed
-		});
-		if changed == 1 {
+		let changed = self.engine.attach(|py| interrupt(py, id as u64));
+		if changed {
 			return Ok(());
 		}
 		Err(Fault::Resource {
@@ -897,9 +882,7 @@ fn worker_main(
 ) {
 	let _alive = WorkerAlive(&state.alive);
 	engine.attach(|py| {
-		// SAFETY: the engine attaches this closure to CPython before accessing
-		// the interpreter-local thread identifier.
-		let thread_id = unsafe { PyThread_get_thread_ident() };
+		let thread_id = current_thread_id();
 		state
 			.thread_id
 			.store(i64::try_from(thread_id).unwrap_or(i64::MAX), Ordering::Release);
@@ -970,12 +953,9 @@ fn worker_main(
 					let _ = command.events.send(Ok(RunEvent::Completed(completion)));
 				},
 				Err(_) if command.timed_out.load(Ordering::Acquire) => {
-					let _ =
-						command
-							.events
-							.send(Ok(RunEvent::Completed(Box::new(timed_out_completion(
-								cancelled_completion(),
-							)))));
+					let _ = command
+						.events
+						.send(Ok(RunEvent::Completed(timed_out_completion(cancelled_completion()))));
 				},
 				Err(_) if command.cancelled.load(Ordering::Acquire) => {
 					send_cancelled(&command);
@@ -1009,7 +989,9 @@ fn clear_active(state: &WorkerState, cancelled: &Arc<AtomicBool>) {
 }
 
 fn send_cancelled(command: &Command) {
-	let _ = command.events.send(Ok(RunEvent::Completed(cancelled_completion())));
+	let _ = command
+		.events
+		.send(Ok(RunEvent::Completed(cancelled_completion())));
 }
 
 const fn cancelled_completion() -> RunCompletion {

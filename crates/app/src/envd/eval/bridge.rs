@@ -408,7 +408,7 @@ impl BridgeHost for RegistryBridgeHost {
 		let Some((live_name, revision)) = self.registry.live_identity(name) else {
 			return Err(BridgeHostError::message(format!("Unknown tool from py runtime: {name}")));
 		};
-		if self.registry.route(name).map_err(registry_error)? != ToolRoute::Native {
+		if !matches!(self.registry.route(name).map_err(registry_error)?, ToolRoute::Native) {
 			return Err(BridgeHostError::message(format!(
 				"Tool from py runtime is not available through the native eval bridge: {name}"
 			)));
@@ -461,7 +461,7 @@ impl BridgeHost for RegistryBridgeHost {
 							),
 						)
 						.map_err(registry_error)?;
-					let mut value = projected_parts(projected.parts)?;
+					let mut value = projected_parts(projected.parts.as_ref().to_vec())?;
 					if projected.is_error {
 						match &mut value {
 							Value::Object(object) => {
@@ -552,7 +552,10 @@ impl SessionBridgeHost {
 		let tools = registry
 			.live_identities()
 			.filter(|&(name, _)| {
-				name.as_str() != "eval" && registry.route(name.as_str()).ok() == Some(ToolRoute::Native)
+				name.as_str() != "eval"
+					&& registry
+						.route(name.as_str())
+						.is_ok_and(|route| matches!(route, ToolRoute::Native))
 			})
 			.map(|(name, _)| name.clone());
 		let capabilities = BridgeCapabilities::new(tools);

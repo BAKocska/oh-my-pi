@@ -15,11 +15,12 @@ mod tools;
 #[cfg(windows)]
 pub mod windows;
 pub mod worker;
+pub mod worker_pool;
 pub mod workspace;
 use std::{io, path::Path, sync::Arc};
 
 #[doc(hidden)]
-pub use eval::{EVAL_CHILD_ARG, ProcessError as EvalChildError, run_eval_child_entry};
+pub use eval::{EVAL_CHILD_ARG, run_eval_child_entry};
 use miette::IntoDiagnostic as _;
 use omp_core::Str;
 use omp_env::EnvClient;
@@ -27,6 +28,8 @@ use omp_proto::env::v1::{ClientHello, ServerHello};
 use omp_tool::Registry;
 pub use server::EnvdError;
 use tokio_util::sync::CancellationToken;
+#[doc(hidden)]
+pub use worker::run_py_worker_entry;
 
 use self::{
 	server::{EnvServer, ExtensionDataBinding},
@@ -429,6 +432,11 @@ impl ProjectEnvironment {
 		sender: omp_agent::control::ControlSender,
 	) -> Result<(), EnvdError> {
 		self.lifecycle.server.bind_agent_control(sender)
+	}
+
+	/// Binds extension device availability notifications to the active turn.
+	pub(crate) fn bind_device_availability(&self, mailbox: omp_agent::MailboxSender) {
+		self.lifecycle.server.bind_device_availability(mailbox);
 	}
 }
 

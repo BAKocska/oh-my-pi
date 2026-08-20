@@ -5,6 +5,7 @@ use std::{
 	fmt::Write as _,
 	future::{Future, ready},
 	ops::Range,
+	path::{Path, PathBuf},
 	slice,
 	sync::{
 		Arc,

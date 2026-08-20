@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio as _asyncio
 import contextvars as _contextvars
 import inspect as _inspect
+from enum import StrEnum as _StrEnum
 from typing import Any as _Any
 
 from _omp import (
@@ -169,6 +170,13 @@ async def state_dir() -> EnvPath:
 state = _State()
 CancelledError = _asyncio.CancelledError
 
+
+class Capability(_StrEnum):
+    """Manifest capabilities required by extension declarations."""
+
+    PLACE_ENV = "place_env"
+    PLACE_WORKER = "place_worker"
+
 # Importing these frozen modules only creates declarations and namespace values.
 from . import env as env
 from . import urls as urls
@@ -194,10 +202,40 @@ from ._registry import (
     ServiceClient,
     ServiceDefinition,
     Services,
+    resources,
     service,
     services,
-    resources,
+    registry as _declarations,
 )
+from .placement import (
+    BoundaryError,
+    MAX_WORKERS,
+    Place,
+    PlaceKind,
+    Restart,
+    ShipError,
+    Site,
+    SiteKind,
+    Spill,
+    WorkerHandle,
+    WorkerInfo,
+    WorkerResources,
+    WorkerSpec,
+    WorkerState,
+    WorkerUnavailable,
+    worker_state,
+    workers,
+)
+
+
+def device(name: str, *, family: str, rev: int, place: str | Place = "host"):
+    """Declare a device and record its parsed placement before FREEZE."""
+    parsed = Place.parse(place)
+    def decorate(function: _Any) -> _Any:
+        function.__omp_place__ = parsed
+        _declarations.register_tool(name, family, rev, function)
+        return function
+    return decorate
 urls._bind_scheme_source(_scheme_snapshot)
 
 RUNTIME_METADATA = _runtime_metadata()
@@ -301,4 +339,23 @@ __all__ = (
     "state_dir",
     "urls",
     "schemes",
+    "BoundaryError",
+    "Capability",
+    "MAX_WORKERS",
+    "Place",
+    "PlaceKind",
+    "Restart",
+    "ShipError",
+    "Site",
+    "SiteKind",
+    "Spill",
+    "WorkerHandle",
+    "WorkerInfo",
+    "WorkerResources",
+    "WorkerSpec",
+    "WorkerState",
+    "WorkerUnavailable",
+    "device",
+    "worker_state",
+    "workers",
 )

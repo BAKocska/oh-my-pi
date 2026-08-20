@@ -37,7 +37,6 @@ use std::{
 };
 
 use im::HashMap;
-
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, ShellExtensions,
 	builtins::{self, Registration},
@@ -143,7 +142,9 @@ impl Host {
 
 	/// The exported shell environment, for building a child process
 	/// environment (`env_clear().envs(host.env())`).
-	pub fn env(&self) -> impl Iterator<Item = (&str, &str)> + ExactSizeIterator + std::iter::FusedIterator {
+	pub fn env(
+		&self,
+	) -> impl Iterator<Item = (&str, &str)> + ExactSizeIterator + std::iter::FusedIterator {
 		self.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
 	}
 

@@ -148,10 +148,6 @@ pub enum ChatError {
 	UnsupportedPlatform,
 }
 
-
-
-
-
 struct Session {
 	id:            Str,
 	journal:       Journal,
@@ -872,6 +868,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		let current_id = id.clone();
 		let agent = Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
 		environment.bind_agent_control(agent.control())?;
+		environment.bind_device_availability(agent.mailbox());
 		let exit = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
