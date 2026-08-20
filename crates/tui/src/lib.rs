@@ -50,6 +50,7 @@ pub mod syntax;
 mod terminal;
 #[doc(hidden)]
 pub mod test_support;
+mod theme;
 mod tty;
 /// Stable controlling-terminal identity helpers.
 pub mod ttyid;
@@ -102,5 +103,6 @@ pub use rich::{
 };
 pub use runtime::{App, AppEnv, AppEvent, AppOptions, ImageLoader, UiHandle, is_core_chord};
 pub use terminal::{AltScreenUse, CursorStyle, Progress, Terminal, TerminalOptions};
+pub use theme::{JsonTheme, ThemeError};
 pub use tty::TtyOut;
 pub use ui::Ui;

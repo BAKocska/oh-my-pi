@@ -135,6 +135,19 @@ pub async fn read_resource<C: HttpClient + Sync>(
 		});
 	}
 
+	if raw {
+		return Ok(WebRead {
+			final_url,
+			render: finish(RenderResult {
+				content:      decode_response(&response),
+				content_type: Some(content_type),
+				method:       Str::new_static("raw"),
+				notes:        SmallVec::new(),
+			}),
+			image: None,
+		});
+	}
+
 	let extension = extension_hint(&response.final_url, response.header("content-disposition"));
 	if is_image(&content_type, &extension)
 		&& let Some(processed) = image::process_image(response.body.clone())
@@ -248,19 +261,6 @@ pub async fn read_resource<C: HttpClient + Sync>(
 				Str::from(format!("Archive rendering failed: {error}")),
 			)),
 		};
-	}
-
-	if raw {
-		return Ok(WebRead {
-			final_url,
-			render: finish(RenderResult {
-				content:      decode_response(&response),
-				content_type: Some(content_type),
-				method:       Str::new_static("raw"),
-				notes:        SmallVec::new(),
-			}),
-			image: None,
-		});
 	}
 
 	let text = decode_response(&response);

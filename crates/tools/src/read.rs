@@ -321,6 +321,7 @@ pub struct ReadTool<S, B, R = resolver::NoResolver> {
 	sources:   S,
 	blobs:     B,
 	resolvers: Arc<resolver::ResolverTable<R>>,
+	conflicts: Arc<conflicts::ConflictRegistry>,
 	spec:      ToolSpec,
 }
 
@@ -345,7 +346,12 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(
 	sources: S,
 	blobs: B,
 ) -> ReadTool<S, B, resolver::NoResolver> {
-	tool_with_resolvers(sources, blobs, Arc::new(resolver::ResolverTable::default()))
+	tool_with_resolvers_and_conflicts(
+		sources,
+		blobs,
+		Arc::new(resolver::ResolverTable::default()),
+		Arc::new(conflicts::ConflictRegistry::default()),
+	)
 }
 
 /// Constructs `read@1` with concrete, constructor-owned internal URL
@@ -355,10 +361,27 @@ pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	blobs: B,
 	resolvers: Arc<resolver::ResolverTable<R>>,
 ) -> ReadTool<S, B, R> {
+	tool_with_resolvers_and_conflicts(
+		sources,
+		blobs,
+		resolvers,
+		Arc::new(conflicts::ConflictRegistry::default()),
+	)
+}
+
+/// Constructs `read@1` with internal URL resolvers and the session conflict
+/// registry shared with its `conflict://` resolver and splice writer.
+pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
+	sources: S,
+	blobs: B,
+	resolvers: Arc<resolver::ResolverTable<R>>,
+	conflicts: Arc<conflicts::ConflictRegistry>,
+) -> ReadTool<S, B, R> {
 	ReadTool {
 		sources,
 		blobs,
 		resolvers,
+		conflicts,
 		spec: ToolSpec {
 			name:            Str::new_static("read"),
 			rev:             Rev { family: Str::new_static(""), n: 1 },
@@ -705,7 +728,15 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		if matches!(parsed, selector::ParsedSelector::Conflicts) {
 			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
 			let text = String::from_utf8_lossy(&bytes);
-			let rendered = conflicts::render_conflicts_for_path(&text, &stat.display_path, false);
+			let registered = self.conflicts.refresh(stat.display_path.clone(), &text);
+			let entries = registered
+				.into_iter()
+				.map(|entry| conflicts::ConflictEntry::new(entry.id, entry.block))
+				.collect::<Vec<_>>();
+			let rendered = conflicts::RenderedConflicts {
+				text:  conflicts::format_conflict_summary(&entries, &stat.display_path, false),
+				count: entries.len(),
+			};
 			let text = format::prepend_suffix_resolution_notice(
 				&rendered.text,
 				suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
@@ -1059,7 +1090,13 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	) -> Result<Vec<PayloadPart>, Fault> {
 		let placeholder_tag = pinned.filter(|_| !parsed.is_raw()).map(|_| "0000");
 		let mut formatted = format_read_projection(stat, text, parsed, placeholder_tag, suffix_from);
-		append_visible_conflict_warning(&mut formatted, text, &stat.display_path, parsed);
+		append_visible_conflict_warning(
+			&mut formatted,
+			text,
+			&stat.display_path,
+			parsed,
+			&self.conflicts,
+		);
 		let (candidate_text, candidate_sources) = formatted.projection();
 		let candidate_seen = retained_source_lines(candidate_text, candidate_sources);
 		let tag = if let Some((path, revision, bytes)) = pinned {
@@ -1075,7 +1112,13 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 
 		if placeholder_tag.is_some() && tag.is_none() {
 			formatted = format_read_projection(stat, text, parsed, None, suffix_from);
-			append_visible_conflict_warning(&mut formatted, text, &stat.display_path, parsed);
+			append_visible_conflict_warning(
+				&mut formatted,
+				text,
+				&stat.display_path,
+				parsed,
+				&self.conflicts,
+			);
 		}
 		let (mut projection, _) = formatted.into_projection();
 		if let Some(tag) = tag
@@ -1170,6 +1213,7 @@ fn append_visible_conflict_warning(
 	source: &str,
 	display_path: &str,
 	parsed: &selector::ParsedSelector,
+	registry: &conflicts::ConflictRegistry,
 ) {
 	if parsed.is_raw() {
 		return;
@@ -1210,18 +1254,18 @@ fn append_visible_conflict_warning(
 	if visible_blocks.is_empty() {
 		return;
 	}
-	let all_blocks = conflicts::scan_conflicts(source);
-	let total = all_blocks.len();
+	let registered = registry.refresh(Str::from(display_path), source);
+	let total = registered.len();
 	let visible = visible_blocks
 		.into_iter()
-		.map(|block| {
-			let id = all_blocks
+		.filter_map(|block| {
+			registered
 				.iter()
-				.position(|candidate| {
-					candidate.start_line == block.start_line && candidate.end_line == block.end_line
+				.find(|candidate| {
+					candidate.block.start_line == block.start_line
+						&& candidate.block.end_line == block.end_line
 				})
-				.map_or(1, |index| index + 1);
-			conflicts::ConflictEntry::new(id, block)
+				.map(|entry| conflicts::ConflictEntry::new(entry.id, block))
 		})
 		.collect::<Vec<_>>();
 	if visible.is_empty() {

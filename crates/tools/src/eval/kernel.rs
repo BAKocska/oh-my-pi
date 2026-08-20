@@ -40,6 +40,7 @@ use omp_py::{
 use parking_lot::Mutex;
 use pyo3::{
 	Py, PyAny, PyResult, Python,
+	class::gc::{PyTraverseError, PyVisit},
 	ffi::c_str,
 	prelude::*,
 	pyclass, pymethods,
@@ -62,6 +63,9 @@ import asyncio as _omp_asyncio
 import contextvars as _omp_contextvars
 import inspect as _omp_inspect
 import json as _omp_json
+import os as _omp_os
+import re as _omp_re
+import subprocess as _omp_subprocess
 import sys as _omp_sys
 import threading as _omp_threading
 import types as _omp_types
@@ -110,9 +114,200 @@ def _omp_new_namespace():
         "__name__": "__main__",
         "__builtins__": __builtins__,
         "__omp_async_runner": _omp_asyncio.Runner(),
+        "_omp_os": _omp_os,
+        "_omp_sys": _omp_sys,
+        "_omp_shell": _omp_shell,
+        "_omp_magic_env": _omp_magic_env,
+        "_omp_magic_who": _omp_magic_who,
+        "_omp_magic_reset": _omp_magic_reset,
+        "_omp_capture": _omp_capture,
+        "_omp_timeit": _omp_timeit,
     }
 
+class _OmpShellResult(list):
+    def __init__(self, lines, returncode):
+        super().__init__(lines)
+        self.returncode = returncode
+
+def _omp_shell(command):
+    process = _omp_subprocess.run(
+        command,
+        shell=True,
+        stdin=_omp_subprocess.DEVNULL,
+        stdout=_omp_subprocess.PIPE,
+        stderr=_omp_subprocess.STDOUT,
+        text=True,
+        errors="replace",
+    )
+    output = process.stdout or ""
+    encoded = output.encode("utf-8", "replace")
+    lines = output.splitlines()
+    truncated = len(encoded) > 1024 * 1024 or len(lines) > 3000
+    if truncated:
+        encoded = encoded[:1024 * 1024]
+        output = encoded.decode("utf-8", "ignore")
+        lines = output.splitlines()[:3000]
+        output = "\n".join(lines) + "\n[…shell output truncated…]\n"
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n")
+    return _OmpShellResult(lines, process.returncode)
+
+def _omp_magic_env(argument):
+    if "=" in argument:
+        key, value = argument.split("=", 1)
+        _omp_os.environ[key.strip()] = value.strip()
+        return value.strip()
+    if argument:
+        return _omp_os.environ.get(argument.strip())
+    return dict(sorted(_omp_os.environ.items()))
+
+def _omp_magic_who(namespace):
+    names = sorted(
+        name for name in namespace
+        if not name.startswith("_") and name not in {"display", "tool", "budget"}
+    )
+    print(" ".join(names))
+    return names
+
+def _omp_magic_reset(namespace):
+    for name in list(namespace):
+        if not name.startswith("_") and name not in {
+            "display", "read", "write", "output", "tool", "completion",
+            "agent", "parallel", "pipeline", "budget", "env", "log", "phase",
+        }:
+            namespace.pop(name, None)
+
+class _OmpCaptured:
+    def __init__(self, stdout, stderr):
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __repr__(self):
+        return f"<captured stdout={len(self.stdout)}ch stderr={len(self.stderr)}ch>"
+
+def _omp_capture(name, source, namespace):
+    io = __import__("io")
+    builtins = __import__("builtins")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    missing = object()
+    previous_print = namespace.get("print", missing)
+
+    def capture_print(*values, **options):
+        target = options.get("file")
+        if target is None or target is _omp_sys.stdout:
+            options["file"] = stdout
+        elif target is _omp_sys.stderr:
+            options["file"] = stderr
+        builtins.print(*values, **options)
+
+    namespace["print"] = capture_print
+    try:
+        exec(compile(source, "<capture>", "exec"), namespace)
+    finally:
+        if previous_print is missing:
+            namespace.pop("print", None)
+        else:
+            namespace["print"] = previous_print
+    captured = _OmpCaptured(stdout.getvalue(), stderr.getvalue())
+    namespace[name] = captured
+    return captured
+
+def _omp_timeit(source, namespace):
+    code = compile(source, "<timeit>", "exec")
+    samples = []
+    for _ in range(5):
+        started = _omp_time.perf_counter()
+        exec(code, namespace)
+        samples.append(_omp_time.perf_counter() - started)
+    best = min(samples)
+    print(f"{best * 1000:.3f} ms per loop (best of {len(samples)})")
+    return best
+
+def _omp_cell_magic(source):
+    lines = source.splitlines()
+    if not lines:
+        return source
+    header = lines[0].strip()
+    body = "\n".join(lines[1:])
+    if header == "%%bash":
+        return f"_omp_shell({_omp_json.dumps(body)})"
+    if header.startswith("%%capture "):
+        name = header[len("%%capture "):].strip()
+        if not _omp_re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            raise SyntaxError("%%capture requires a variable name")
+        return f"_omp_capture({_omp_json.dumps(name)}, {_omp_json.dumps(body)}, globals())"
+    if header == "%%timeit":
+        return f"_omp_timeit({_omp_json.dumps(body)}, globals())"
+    if header.startswith("%%writefile "):
+        target = header[len("%%writefile "):].strip()
+        return (
+            "from pathlib import Path as _OmpPath\n"
+            f"_omp_write_target = _OmpPath({_omp_json.dumps(target)}).expanduser()\n"
+            "_omp_write_target.parent.mkdir(parents=True, exist_ok=True)\n"
+            f"_omp_write_target.write_text({_omp_json.dumps(body)}, encoding='utf-8')"
+        )
+    return source
+
+def _omp_transform_cell(source):
+    source = _omp_cell_magic(source)
+    transformed = []
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        indent = line[:len(line) - len(stripped)]
+        assignment = _omp_re.match(
+            r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*!(.*)$", stripped)
+        if assignment:
+            transformed.append(
+                f"{indent}{assignment.group(1)} = _omp_shell("
+                f"{_omp_json.dumps(assignment.group(2).strip())})")
+        elif stripped.startswith("!"):
+            transformed.append(
+                f"{indent}_omp_shell({_omp_json.dumps(stripped[1:].strip())})")
+        elif stripped.startswith("%cd "):
+            transformed.append(
+                f"{indent}_omp_os.chdir(_omp_os.path.expanduser("
+                f"{_omp_json.dumps(stripped[4:].strip())}))")
+        elif stripped == "%pwd":
+            transformed.append(f"{indent}print(_omp_os.getcwd())")
+        elif stripped.startswith("%env"):
+            transformed.append(
+                f"{indent}_omp_magic_env({_omp_json.dumps(stripped[4:].strip())})")
+        elif stripped in {"%who", "%whos"}:
+            transformed.append(f"{indent}_omp_magic_who(globals())")
+        elif stripped == "%reset":
+            transformed.append(f"{indent}_omp_magic_reset(globals())")
+        elif stripped.startswith("%pip "):
+            command = (
+                _omp_json.dumps(_omp_sys.executable)
+                + " + ' -m pip ' + "
+                + _omp_json.dumps(stripped[5:].strip())
+            )
+            transformed.append(f"{indent}_omp_shell({command})")
+        elif stripped.startswith("%ls"):
+            transformed.append(
+                f"{indent}_omp_shell({_omp_json.dumps('ls ' + stripped[3:].strip())})")
+        elif stripped.startswith("%load "):
+            target = stripped[6:].strip()
+            transformed.append(
+                f"{indent}exec(compile(open({_omp_json.dumps(target)}, "
+                f"encoding='utf-8').read(), {_omp_json.dumps(target)}, 'exec'), globals())")
+        elif stripped.startswith("%timeit "):
+            transformed.append(
+                f"{indent}_omp_timeit({_omp_json.dumps(stripped[8:].strip())}, globals())")
+        elif stripped.startswith("%run "):
+            target = stripped[5:].strip()
+            transformed.append(
+                f"{indent}exec(compile(open({_omp_json.dumps(target)}, "
+                f"encoding='utf-8').read(), {_omp_json.dumps(target)}, 'exec'), globals())")
+        elif stripped.startswith("%time "):
+            transformed.append(indent + stripped[6:])
+        else:
+            transformed.append(line)
+    return "\n".join(transformed)
+
 def _omp_compile(source):
+    source = _omp_transform_cell(source)
     module = _omp_ast.parse(source, "<cell>", "exec")
     if not module.body:
         return None, None
@@ -163,6 +358,13 @@ def _omp_run_cell(source, ns, timeout_control, sink):
                     result_json = _omp_json.dumps(value, allow_nan=False, separators=(",", ":"))
                 except (TypeError, ValueError, OverflowError):
                     result_json = None
+                if any(hasattr(value, name) for name in (
+                    "_repr_mimebundle_", "_repr_json_", "_repr_markdown_",
+                    "_repr_html_", "_repr_svg_", "_repr_latex_",
+                )):
+                    presenter = ns.get("display")
+                    if callable(presenter):
+                        presenter(value)
     except BaseException as exc:
         outcome = "cancelled" if isinstance(exc, KeyboardInterrupt) else "error"
         error_name = type(exc).__name__
@@ -481,7 +683,7 @@ impl Drop for SinkGuard {
 }
 
 /// Per-cell output sink carried by the routing context variable.
-#[pyclass(frozen)]
+#[pyclass(frozen, module = "_omp_eval")]
 struct CellSink {
 	shared: Arc<SinkShared>,
 }
@@ -492,7 +694,7 @@ struct CellSink {
 /// started inside a cell); if that sink is sealed, the same session's
 /// currently open cell; otherwise deliberate discard — a context with no sink
 /// has no provenance and must not be guessed at.
-#[pyclass(frozen)]
+#[pyclass(frozen, module = "_omp_eval")]
 struct OutputRouter {
 	channel:  OutputChannel,
 	registry: Arc<SinkRegistry>,
@@ -546,7 +748,7 @@ fn context_sink(py: Python<'_>) -> Option<Arc<SinkShared>> {
 	Some(Arc::clone(&sink.get().shared))
 }
 
-#[pyclass]
+#[pyclass(frozen, module = "_omp_eval")]
 struct TimeoutControl {
 	handle: TimeoutHandle,
 	pauses: Mutex<Vec<TimeoutPause>>,
@@ -573,7 +775,7 @@ impl TimeoutControl {
 	}
 }
 
-#[pyclass]
+#[pyclass(frozen, module = "_omp_eval")]
 struct DisplayCollector {
 	entries: Mutex<Vec<(Py<PyAny>, bool)>>,
 }
@@ -591,38 +793,26 @@ impl DisplayCollector {
 		let entries = std::mem::take(&mut *self.entries.lock());
 		let mut outputs = Vec::with_capacity(entries.len());
 		for (value, raw) in entries {
+			let bound = value.bind(py);
 			if raw {
-				let bound = value.bind(py);
 				if let Ok(bundle) = bound.cast::<PyDict>() {
-					if let Some(status) = bundle.get_item("application/x-omp-status")? {
-						if let Some(event) = python_to_json(py, &status)? {
-							outputs.push(super::DisplayOutput::Status { event });
-						}
-						continue;
-					}
-					if let Some(json) = bundle.get_item("application/json")? {
-						if let Some(data) = python_to_json(py, &json)? {
-							outputs.push(super::DisplayOutput::Json { data });
-						}
-						continue;
-					}
-					if let Some(markdown) = bundle.get_item("text/markdown")? {
-						outputs.push(super::DisplayOutput::Markdown {
-							text: Str::from(markdown.extract::<String>()?),
-						});
-						continue;
-					}
-					if let Some(text) = bundle.get_item("text/plain")? {
-						outputs.push(super::DisplayOutput::Markdown {
-							text: Str::from(text.extract::<String>()?),
-						});
+					if let Some(output) = display_bundle(py, bundle)? {
+						outputs.push(output);
 					}
 				}
-			} else if let Some(data) = python_to_json(py, value.bind(py))? {
+				continue;
+			}
+			if let Some(bundle) = repr_mime_bundle(&bound)? {
+				if let Some(output) = display_bundle(py, &bundle)? {
+					outputs.push(output);
+					continue;
+				}
+			}
+			if let Some(data) = python_to_json(py, &bound)? {
 				outputs.push(super::DisplayOutput::Json { data });
 			} else {
 				outputs.push(super::DisplayOutput::Markdown {
-					text: Str::from(value.bind(py).repr()?.extract::<String>()?),
+					text: Str::from(bound.repr()?.extract::<String>()?),
 				});
 			}
 		}
@@ -630,11 +820,82 @@ impl DisplayCollector {
 	}
 }
 
+fn display_bundle(
+	py: Python<'_>,
+	bundle: &Bound<'_, PyDict>,
+) -> PyResult<Option<super::DisplayOutput>> {
+	if let Some(status) = bundle.get_item("application/x-omp-status")? {
+		return python_to_json(py, &status)
+			.map(|event| event.map(|event| super::DisplayOutput::Status { event }));
+	}
+	if let Some(json) = bundle.get_item("application/json")? {
+		return python_to_json(py, &json)
+			.map(|data| data.map(|data| super::DisplayOutput::Json { data }));
+	}
+	for mime in ["text/markdown", "text/html", "image/svg+xml"] {
+		if let Some(text) = bundle.get_item(mime)? {
+			return Ok(Some(super::DisplayOutput::Markdown {
+				text: Str::from(text.extract::<String>()?),
+			}));
+		}
+	}
+	if let Some(text) = bundle.get_item("text/latex")? {
+		let text = text.extract::<String>()?;
+		return Ok(Some(super::DisplayOutput::Markdown {
+			text: Str::from(format!("$$\n{text}\n$$")),
+		}));
+	}
+	if let Some(text) = bundle.get_item("text/plain")? {
+		return Ok(Some(super::DisplayOutput::Markdown {
+			text: Str::from(text.extract::<String>()?),
+		}));
+	}
+	Ok(None)
+}
+
+fn repr_mime_bundle<'py>(value: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyDict>>> {
+	let py = value.py();
+	if value.hasattr("_repr_mimebundle_")? {
+		let rendered = value.call_method0("_repr_mimebundle_")?;
+		if !rendered.is_none() {
+			return Ok(Some(rendered.cast_into::<PyDict>()?));
+		}
+	}
+	let bundle = PyDict::new(py);
+	for (method, mime) in [
+		("_repr_json_", "application/json"),
+		("_repr_markdown_", "text/markdown"),
+		("_repr_html_", "text/html"),
+		("_repr_svg_", "image/svg+xml"),
+		("_repr_latex_", "text/latex"),
+	] {
+		if value.hasattr(method)? {
+			let rendered = value.call_method0(method)?;
+			if !rendered.is_none() {
+				bundle.set_item(mime, rendered)?;
+				break;
+			}
+		}
+	}
+	Ok((!bundle.is_empty()).then_some(bundle))
+}
+
 #[pymethods]
 impl DisplayCollector {
 	#[pyo3(signature = (value, raw=false))]
 	fn __call__(&self, value: Py<PyAny>, raw: bool) {
 		self.entries.lock().push((value, raw));
+	}
+
+	fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+		for (value, _) in self.entries.lock().iter() {
+			visit.call(value)?;
+		}
+		Ok(())
+	}
+
+	fn __clear__(&self) {
+		self.entries.lock().clear();
 	}
 }
 
@@ -1823,5 +2084,31 @@ print("right")"#
 		);
 		second.cancel().await.expect("second cancels independently");
 		assert_eq!(completion(&mut second).await.status.outcome, CellOutcome::Cancelled);
+	}
+
+	#[tokio::test]
+	async fn ipython_style_line_magics_preserve_the_namespace() {
+		let runtime = runtime();
+		let session = runtime.open_session().await.expect("session opens");
+		let (_, env_set) =
+			run_to_completion(&runtime, &session, "%env OMP_MAGIC_TEST=present", false).await;
+		assert_eq!(env_set.status.outcome, CellOutcome::Complete);
+		let (_, pwd) = run_to_completion(&runtime, &session, "%pwd", false).await;
+		assert_eq!(pwd.status.outcome, CellOutcome::Complete);
+		let (_, observed) =
+			run_to_completion(&runtime, &session, "import os\nos.environ['OMP_MAGIC_TEST']", false)
+				.await;
+		assert_eq!(
+			observed.result.expect("environment result").json,
+			Some(Value::String("present".to_owned())),
+		);
+		let (_, reset) = run_to_completion(
+			&runtime,
+			&session,
+			"kept = 7\n%who\n%reset\n'kept' in globals()",
+			false,
+		)
+		.await;
+		assert_eq!(reset.result.expect("reset result").json, Some(Value::Bool(false)));
 	}
 }

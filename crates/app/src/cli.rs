@@ -279,6 +279,8 @@ pub enum Command {
 	/// Run a single prompt and stream its response to standard output.
 	#[command(alias = "p")]
 	Print(PrintArgs),
+	/// Run the stateful Content-Length framed RPC server on standard I/O.
+	Rpc(RpcArgs),
 	/// Run one typed operation in process.
 	Infer(InferArgs),
 	/// Manage provider credentials.
@@ -316,6 +318,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "chat", aliases: &["i", "launch"] },
 	CommandSpec { name: "print", aliases: &["p"] },
 	CommandSpec { name: "infer", aliases: &[] },
+	CommandSpec { name: "rpc", aliases: &[] },
 	CommandSpec { name: "auth", aliases: &[] },
 	CommandSpec { name: "auth-broker", aliases: &[] },
 	CommandSpec { name: "catalog", aliases: &[] },
@@ -327,7 +330,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 
 /// Returns whether a root command shares the launch option surface.
 fn is_launch_command(argument: &OsString) -> bool {
-	matches!(argument.to_string_lossy().as_ref(), "chat" | "i" | "launch" | "print" | "p")
+	matches!(argument.to_string_lossy().as_ref(), "chat" | "i" | "launch" | "print" | "p" | "rpc")
 }
 
 /// Classifies options accepted by launch-shaped invocations.
@@ -518,6 +521,23 @@ pub struct PrintArgs {
 	/// Prompt words; `@path` includes a typed attachment.
 	#[arg(num_args = 0..)]
 	pub prompt:           Vec<Str>,
+}
+
+/// Stateful headless RPC server options.
+#[derive(Clone, Debug, Args)]
+pub struct RpcArgs {
+	/// Catalog model key. Falls back to `config.default_model`.
+	#[arg(long)]
+	pub model:       Option<Str>,
+	/// Prefer routes owned by this provider when the selected model permits it.
+	#[arg(long)]
+	pub provider:    Option<Str>,
+	/// Project root used for session metadata and orchestration context.
+	#[arg(long, value_name = "PATH", default_value = ".")]
+	pub project:     PathBuf,
+	/// Optional directory used to discover subagent transcript files.
+	#[arg(long, value_name = "PATH")]
+	pub session_dir: Option<PathBuf>,
 }
 
 /// Direct typed inference options.
@@ -752,6 +772,7 @@ enum DispatchTarget {
 	Envd,
 	Chat,
 	Print,
+	Rpc,
 	Infer,
 	Auth,
 	CatalogImport,
@@ -767,6 +788,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	match command {
 		None | Some(Command::Chat(_)) => DispatchTarget::Chat,
 		Some(Command::Print(_)) => DispatchTarget::Print,
+		Some(Command::Rpc(_)) => DispatchTarget::Rpc,
 		Some(Command::Serve(_)) => DispatchTarget::Serve,
 		Some(Command::Envd(_)) => DispatchTarget::Envd,
 		Some(Command::Infer(_)) => DispatchTarget::Infer,
@@ -837,6 +859,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			Box::pin(crate::chat::run(args)).await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
+		Command::Rpc(args) => crate::rpc_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
 		Command::Auth(args) => auth(args).await,
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
@@ -1216,6 +1239,7 @@ mod tests {
 				&["omp", "chat", "--model", "provider/model", "--project", "."][..],
 				DispatchTarget::Chat,
 			),
+			(&["omp", "rpc"][..], DispatchTarget::Rpc),
 			(
 				&["omp", "infer", "--model", "provider/model", "--prompt", "hello"][..],
 				DispatchTarget::Infer,

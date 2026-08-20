@@ -13,6 +13,7 @@ mod tool_document;
 mod tool_read_sources;
 mod tool_search;
 mod tool_shell;
+mod tool_url;
 mod tools;
 #[cfg(windows)]
 pub mod windows;

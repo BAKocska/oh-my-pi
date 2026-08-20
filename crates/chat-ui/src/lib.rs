@@ -6,12 +6,14 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod ask;
 pub mod completion;
 pub mod host;
 mod overlays;
 pub mod palette;
 pub mod picker;
 pub mod provider_picker;
+pub mod queue;
 pub mod scene;
 pub mod sidebar;
 pub mod welcome;
@@ -57,6 +59,52 @@ pub struct SessionRow {
 	pub label:  Str,
 	/// Secondary display detail.
 	pub detail: Str,
+}
+/// One live node projected from the core-owned `AgentTree` roster.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRow {
+	/// Stable agent identity.
+	pub id:     Str,
+	/// User-facing agent name.
+	pub name:   Str,
+	/// Parent identity, absent for a root.
+	pub parent: Option<Str>,
+	/// Hierarchy depth.
+	pub depth:  u16,
+	/// Allocation-free lifecycle status snapshot.
+	pub status: Str,
+	/// Currently executing tool, when known.
+	pub tool:   Option<Str>,
+	/// Token consumption, when known.
+	pub tokens: Option<u64>,
+}
+
+/// Core-owned transcript frame category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranscriptFrameKind {
+	/// Context compaction summary.
+	Compaction,
+	/// Session branch boundary.
+	Branch,
+	/// Session handoff boundary.
+	Handoff,
+	/// Prompt-cache invalidation.
+	CacheBreak,
+	/// Automatic context recovery.
+	Recovery,
+	/// Turn-ending error.
+	Error,
+}
+
+/// One backend-authored transcript frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptFrame {
+	/// Semantic frame category.
+	pub kind:   TranscriptFrameKind,
+	/// Compact frame heading.
+	pub title:  Str,
+	/// Optional explanatory body.
+	pub detail: Option<Str>,
 }
 
 /// Optional repository facts for the status line.
@@ -272,6 +320,18 @@ pub enum BackendEvent {
 		/// Estimated context tokens after the rewrite.
 		tokens_after:  Option<u64>,
 	},
+	/// Append a semantic transcript boundary or error frame.
+	TranscriptFrame(TranscriptFrame),
+	/// Replace the live AgentTree roster projection.
+	AgentRoster(Vec<AgentRow>),
+	/// Request the core-owned settings seam.
+	OpenSettings,
+	/// Request the live agent hierarchy overlay.
+	OpenAgentTree,
+	/// Request the pause overlay.
+	Pause,
+	/// Request a host-level fresh session transition.
+	NewSessionRequested,
 	/// Append an informational notice.
 	Notice(Str),
 	/// Append an error notice.

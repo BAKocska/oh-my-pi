@@ -1,11 +1,11 @@
 //! Session agent roster, recursive budget authority, and concurrency permits.
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	future::Future,
 	sync::{
 		Arc,
-		atomic::{AtomicU8, AtomicUsize, Ordering},
+		atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 	},
 	time::Instant,
 };
@@ -20,21 +20,27 @@ use thiserror::Error;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 32;
 /// Default number of whole spawn waves allowed to await admission.
 pub const DEFAULT_MAX_ADMISSION_QUEUE: usize = 128;
+/// Number of schema-correction attempts before permissive mode accepts the
+/// caller-visible override.
+pub const MAX_YIELD_SCHEMA_RETRIES: u8 = 2;
 
 /// Validated terminal or incremental subagent yield.
 #[derive(Clone, Debug, PartialEq)]
 pub struct YieldPayload {
 	/// Verbatim structured success payload after lossless string-container
 	/// salvage, when present.
-	pub data:          Option<Value>,
+	pub data:              Option<Value>,
 	/// Caller-reported terminal failure.
-	pub error:         Option<Str>,
+	pub error:             Option<Str>,
 	/// String terminal label or array incremental section path.
-	pub kind:          Option<Value>,
+	pub kind:              Option<Value>,
 	/// Whether finalization should consume the child's last assistant turn.
-	pub use_last_turn: bool,
+	pub use_last_turn:     bool,
 	/// Whether this call submitted an incremental section.
-	pub incremental:   bool,
+	pub incremental:       bool,
+	/// Whether permissive mode accepted a payload after exhausting schema
+	/// correction attempts.
+	pub schema_overridden: bool,
 }
 
 /// Retryable malformed-yield reason returned in-band to the child.
@@ -77,13 +83,14 @@ pub struct YieldPayloadValidator {
 	schema:                   Option<Value>,
 	strict:                   bool,
 	has_incremental_sections: bool,
+	schema_retries:           u8,
 }
 
 impl YieldPayloadValidator {
 	/// Creates a validator for an optional declared output schema.
 	#[must_use]
 	pub fn new(schema: Option<Value>, strict: bool) -> Self {
-		Self { schema, strict, has_incremental_sections: false }
+		Self { schema, strict, has_incremental_sections: false, schema_retries: 0 }
 	}
 
 	/// Validates and losslessly salvages one raw yield argument object.
@@ -110,6 +117,7 @@ impl YieldPayloadValidator {
 		if use_last_turn && self.schema.is_some() && !self.has_incremental_sections && !incremental {
 			return Err(YieldPayloadError::SchemaBoundLastTurn);
 		}
+		let mut schema_overridden = false;
 		if error.is_none()
 			&& !use_last_turn
 			&& !incremental
@@ -129,17 +137,21 @@ impl YieldPayloadValidator {
 					salvaged = true;
 				}
 				if !salvaged {
-					return Err(YieldPayloadError::SchemaViolation {
-						path: issue.path,
-						rule: issue.rule,
-					});
+					if self.strict || self.schema_retries < MAX_YIELD_SCHEMA_RETRIES {
+						self.schema_retries = self.schema_retries.saturating_add(1);
+						return Err(YieldPayloadError::SchemaViolation {
+							path: issue.path,
+							rule: issue.rule,
+						});
+					}
+					schema_overridden = true;
 				}
 			}
 		}
 		if error.is_none() && incremental {
 			self.has_incremental_sections = true;
 		}
-		Ok(YieldPayload { data, error, kind, use_last_turn, incremental })
+		Ok(YieldPayload { data, error, kind, use_last_turn, incremental, schema_overridden })
 	}
 
 	/// Returns whether at least one incremental section was accepted.
@@ -232,6 +244,8 @@ pub enum AgentKind {
 	Main,
 	/// A child admitted through subagent spawning.
 	Subagent,
+	/// A passive observability transcript hidden from peer rosters.
+	Advisor,
 }
 
 /// Lifecycle state stored in each roster node without allocating on reads.
@@ -277,6 +291,197 @@ impl AgentStatus {
 	pub const fn terminal(self) -> bool {
 		matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Exhausted)
 	}
+}
+
+/// Frontmatter policy governing which definitions an agent may spawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SpawnPolicy {
+	/// The `task` tool is unavailable.
+	Disabled,
+	/// Any discovered definition may be spawned.
+	Any,
+	/// Only the named definitions may be spawned.
+	Only(Box<[Str]>),
+}
+
+impl SpawnPolicy {
+	/// Reports whether `definition` is allowed by this exact policy.
+	#[must_use]
+	pub fn allows(&self, definition: &str) -> bool {
+		match self {
+			Self::Disabled => false,
+			Self::Any => true,
+			Self::Only(allowed) => allowed
+				.iter()
+				.any(|candidate| candidate.as_str().eq_ignore_ascii_case(definition)),
+		}
+	}
+
+	/// Returns the inherited default definition for a child spawn.
+	#[must_use]
+	pub fn default_definition(&self) -> Option<&str> {
+		match self {
+			Self::Only(allowed) => allowed.first().map(Str::as_str),
+			Self::Any => Some("task"),
+			Self::Disabled => None,
+		}
+	}
+}
+
+/// Static agent definition loaded through the discovery manifest table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentDefinition {
+	/// Stable discovery key, normally the file stem.
+	pub name:           Str,
+	/// Human-readable description used by dynamic task schemas.
+	pub description:    Str,
+	/// Exact child tool vocabulary. An empty list inherits the caller toolset.
+	pub tools:          Box<[Str]>,
+	/// Child-spawn capability and whitelist.
+	pub spawns:         SpawnPolicy,
+	/// Optional role or exact model selector.
+	pub model:          Option<Str>,
+	/// Optional typed thinking level name.
+	pub thinking_level: Option<Str>,
+	/// Whether execution must block the caller.
+	pub blocking:       bool,
+	/// Markdown body appended to the spawned system prompt.
+	pub prompt:         Str,
+}
+
+/// Malformed agent discovery frontmatter.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AgentDefinitionError {
+	/// The markdown document lacks a complete frontmatter fence.
+	#[error("agent definition frontmatter is missing or unterminated")]
+	MissingFrontmatter,
+	/// A supported field had an invalid value.
+	#[error("invalid agent frontmatter field {0}")]
+	InvalidField(Str),
+}
+
+impl AgentDefinition {
+	/// Parses the portable frontmatter subset used by manifest-discovered
+	/// definitions. Unknown keys remain forward-compatible and are ignored.
+	pub fn parse_markdown(
+		name: impl Into<Str>,
+		markdown: &str,
+	) -> Result<Self, AgentDefinitionError> {
+		let name = name.into();
+		let Some(rest) = markdown.strip_prefix("---\n") else {
+			return Err(AgentDefinitionError::MissingFrontmatter);
+		};
+		let Some((frontmatter, prompt)) = rest.split_once("\n---") else {
+			return Err(AgentDefinitionError::MissingFrontmatter);
+		};
+		let prompt = prompt.strip_prefix('\n').unwrap_or(prompt);
+		let mut description = Str::new_static("");
+		let mut tools = Box::<[Str]>::default();
+		let mut spawns = SpawnPolicy::Disabled;
+		let mut model = None;
+		let mut thinking_level = None;
+		let mut blocking = false;
+		for raw in frontmatter.lines() {
+			let line = raw.trim();
+			if line.is_empty() || line.starts_with('#') {
+				continue;
+			}
+			let Some((key, value)) = line.split_once(':') else {
+				return Err(AgentDefinitionError::InvalidField(Str::from(line)));
+			};
+			let value = value.trim();
+			match key.trim() {
+				"description" => description = Str::from(unquote(value)),
+				"tools" => tools = parse_string_list(value)?.into_boxed_slice(),
+				"spawns" => spawns = parse_spawn_policy(value)?,
+				"model" if !value.is_empty() => model = Some(Str::from(unquote(value))),
+				"thinkingLevel" | "thinking_level" if !value.is_empty() => {
+					thinking_level = Some(Str::from(unquote(value)));
+				},
+				"blocking" => {
+					blocking = parse_bool(value)
+						.ok_or_else(|| AgentDefinitionError::InvalidField("blocking".into()))?;
+				},
+				_ => {},
+			}
+		}
+		Ok(Self {
+			name,
+			description,
+			tools,
+			spawns,
+			model,
+			thinking_level,
+			blocking,
+			prompt: Str::from(prompt),
+		})
+	}
+
+	/// Resolves a configured per-agent override ahead of frontmatter.
+	#[must_use]
+	pub fn effective_model<'a>(&'a self, overrides: &'a BTreeMap<Str, Str>) -> Option<&'a str> {
+		overrides
+			.iter()
+			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(self.name.as_str()))
+			.map(|(_, model)| model.as_str())
+			.or_else(|| self.model.as_deref())
+	}
+}
+
+fn parse_spawn_policy(value: &str) -> Result<SpawnPolicy, AgentDefinitionError> {
+	match unquote(value) {
+		"*" | "true" => Ok(SpawnPolicy::Any),
+		"" | "false" => Ok(SpawnPolicy::Disabled),
+		_ => {
+			let allowed = parse_string_list(value)?;
+			if allowed.is_empty() {
+				Ok(SpawnPolicy::Disabled)
+			} else {
+				Ok(SpawnPolicy::Only(allowed.into_boxed_slice()))
+			}
+		},
+	}
+}
+
+fn parse_string_list(value: &str) -> Result<Vec<Str>, AgentDefinitionError> {
+	let value = value.trim();
+	let value = value
+		.strip_prefix('[')
+		.and_then(|value| value.strip_suffix(']'))
+		.unwrap_or(value);
+	if value.trim().is_empty() {
+		return Ok(Vec::new());
+	}
+	let values = value
+		.split(',')
+		.map(|part| Str::from(unquote(part.trim())))
+		.filter(|part| !part.is_empty())
+		.collect::<Vec<_>>();
+	if values.is_empty() {
+		Err(AgentDefinitionError::InvalidField(Str::from(value)))
+	} else {
+		Ok(values)
+	}
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+	match unquote(value) {
+		"true" => Some(true),
+		"false" => Some(false),
+		_ => None,
+	}
+}
+
+fn unquote(value: &str) -> &str {
+	value
+		.strip_prefix('"')
+		.and_then(|value| value.strip_suffix('"'))
+		.or_else(|| {
+			value
+				.strip_prefix('\'')
+				.and_then(|value| value.strip_suffix('\''))
+		})
+		.unwrap_or(value)
 }
 
 /// Durable usage totals used for hard subtree budget checks.
@@ -582,14 +787,16 @@ impl SpawnPermit {
 
 /// Session-scoped append-only roster and resource authority.
 pub struct AgentTree {
-	nodes:           AppendVec<Arc<AgentNode>>,
-	by_id:           RwLock<HashMap<Str, usize>>,
-	by_name:         RwLock<HashMap<Str, usize>>,
-	permits:         Arc<tokio::sync::Semaphore>,
-	max_depth:       u16,
-	max_concurrency: usize,
-	max_queue:       usize,
-	queued:          AtomicUsize,
+	nodes:             AppendVec<Arc<AgentNode>>,
+	by_id:             RwLock<HashMap<Str, usize>>,
+	by_name:           RwLock<HashMap<Str, usize>>,
+	permits:           Arc<tokio::sync::Semaphore>,
+	max_depth:         u16,
+	max_concurrency:   usize,
+	max_queue:         usize,
+	queued:            AtomicUsize,
+	roster_generation: AtomicU64,
+	roster_watch:      tokio::sync::watch::Sender<u64>,
 }
 
 impl AgentTree {
@@ -598,6 +805,7 @@ impl AgentTree {
 	#[must_use]
 	pub fn new(max_depth: u16, max_concurrency: usize, max_queue: usize) -> Self {
 		let max_concurrency = max_concurrency.max(1);
+		let (roster_watch, _) = tokio::sync::watch::channel(0_u64);
 		Self {
 			nodes: AppendVec::new(),
 			by_id: RwLock::new(HashMap::new()),
@@ -607,6 +815,8 @@ impl AgentTree {
 			max_concurrency,
 			max_queue,
 			queued: AtomicUsize::new(0),
+			roster_generation: AtomicU64::new(0),
+			roster_watch,
 		}
 	}
 
@@ -655,6 +865,7 @@ impl AgentTree {
 		let index = self.nodes.push(Arc::clone(&node));
 		self.by_id.write().insert(id, index);
 		self.by_name.write().insert(name, index);
+		self.publish_roster_change();
 		Ok(node)
 	}
 
@@ -675,6 +886,21 @@ impl AgentTree {
 	/// Iterates the append-only roster in admission order.
 	pub fn roster(&self) -> impl Iterator<Item = &Arc<AgentNode>> {
 		self.nodes.iter()
+	}
+
+	/// Returns a watch receiver that advances whenever a node is admitted.
+	///
+	/// Consumers obtain the allocation-free roster after `changed()`; this
+	/// avoids UI polling while keeping node storage append-only.
+	#[must_use]
+	pub fn watch_roster(&self) -> tokio::sync::watch::Receiver<u64> {
+		self.roster_watch.subscribe()
+	}
+
+	/// Returns the current monotonic roster generation.
+	#[must_use]
+	pub fn roster_generation(&self) -> u64 {
+		self.roster_generation.load(Ordering::Acquire)
 	}
 
 	/// Reserves an entire spawn wave, queuing it as one unit when saturated.
@@ -767,6 +993,14 @@ impl AgentTree {
 			queued:          self.queued.load(Ordering::Acquire),
 			max_concurrency: self.max_concurrency,
 		}
+	}
+
+	fn publish_roster_change(&self) {
+		let generation = self
+			.roster_generation
+			.fetch_add(1, Ordering::AcqRel)
+			.wrapping_add(1);
+		self.roster_watch.send_replace(generation);
 	}
 }
 
@@ -905,5 +1139,42 @@ mod tests {
 			Err(YieldPayloadError::SchemaViolation { path, rule: "type" })
 				if path.as_str() == "/summary"
 		));
+	}
+
+	#[test]
+	fn permissive_yield_overrides_only_after_retry_budget() {
+		let schema = json!({"type":"string"});
+		let raw = json!({"result":{"data":7}});
+		let mut permissive = YieldPayloadValidator::new(Some(schema.clone()), false);
+		for _ in 0..MAX_YIELD_SCHEMA_RETRIES {
+			assert!(matches!(
+				permissive.validate(&raw),
+				Err(YieldPayloadError::SchemaViolation { .. })
+			));
+		}
+		assert!(permissive.validate(&raw).unwrap().schema_overridden);
+
+		let mut strict = YieldPayloadValidator::new(Some(schema), true);
+		for _ in 0..=MAX_YIELD_SCHEMA_RETRIES {
+			assert!(matches!(strict.validate(&raw), Err(YieldPayloadError::SchemaViolation { .. })));
+		}
+	}
+
+	#[test]
+	fn discovered_agent_frontmatter_enforces_spawn_and_model_policy() {
+		let definition = AgentDefinition::parse_markdown(
+			"reviewer",
+			"---\ndescription: Review code\ntools: [read, grep, hub]\nspawns: [scout, \
+			 librarian]\nmodel: '@task'\nthinkingLevel: high\nblocking: true\n---\nReview carefully.",
+		)
+		.expect("definition");
+		assert_eq!(definition.tools.as_ref(), ["read", "grep", "hub"]);
+		assert!(definition.spawns.allows("SCOUT"));
+		assert!(!definition.spawns.allows("task"));
+		assert_eq!(definition.spawns.default_definition(), Some("scout"));
+		assert_eq!(definition.thinking_level.as_deref(), Some("high"));
+		assert!(definition.blocking);
+		let overrides = BTreeMap::from([("Reviewer".into(), "@slow".into())]);
+		assert_eq!(definition.effective_model(&overrides), Some("@slow"));
 	}
 }

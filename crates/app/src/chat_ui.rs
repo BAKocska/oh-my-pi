@@ -13,12 +13,12 @@ use std::{
 
 use bytes::Bytes;
 use omp_agent::{
-	Agent, AgentEvent, AgentPhase, AgentState, Interrupt, InterruptClass, InterruptSource,
-	RewindTarget, TurnClient,
+	Agent, AgentEvent, AgentPhase, AgentState, AgentTree, Interrupt, InterruptClass,
+	InterruptSource, RewindTarget, TurnClient,
 };
 use omp_chat_ui::{
-	Attachment, BackendEvent, Chat, Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts,
-	SubmitMode,
+	AgentRow, Attachment, BackendEvent, Chat, Intent, ModelRow, RewindTargetRow, SessionRow,
+	StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
 	host::{HostExit, HostOptions},
 };
 use omp_core::{Str, encoding::hex, fmts};
@@ -36,7 +36,7 @@ use omp_tui::{UiContext, components::AttachmentContent, detect};
 use secrecy::SecretString;
 
 use crate::{
-	chat_ui::input::{ChatCommand, commands, help_text, parse_input},
+	chat_ui::input::{ChatCommand, CommandContribution, CommandRoster},
 	settings::Settings,
 };
 
@@ -230,6 +230,7 @@ struct BridgeState {
 	pending_auth_kind: Option<AuthPromptKind>,
 	replaying_turn:    bool,
 	settings:          Settings,
+	commands:          CommandRoster,
 }
 
 /// Runs the designed terminal chat scene bridged to a real durable agent.
@@ -241,8 +242,10 @@ pub async fn run<'a, C, R>(
 	mut agent: Agent<C>,
 	session: ChatUiSession,
 	registry: Arc<Registry>,
+	tree: Arc<AgentTree>,
 	auth: Option<&'a ChatAuth>,
 	data_dir: PathBuf,
+	command_sources: Vec<Vec<CommandContribution>>,
 	mut list_sessions: R,
 	welcome: bool,
 ) -> anyhow::Result<HostExit>
@@ -253,6 +256,9 @@ where
 	let bus = agent.events().clone();
 	let mailbox = agent.mailbox();
 	let agent_events = bus.subscribe_ui(256);
+	let mut roster_events = tree.watch_roster();
+	let mut roster_tick = tokio::time::interval(Duration::from_millis(100));
+	roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 	let agent_state = agent.state().clone();
 	let abort = agent.abort_handle();
 	let startup_pending = startup_recovery_needed(
@@ -309,7 +315,8 @@ where
 	let caps = detect();
 	let ctx = UiContext::default().with_terminal_caps(&caps);
 	let mut chat = Chat::new(&ctx);
-	chat.set_slash_commands(commands());
+	let commands = CommandRoster::new(command_sources);
+	chat.set_slash_commands(commands.completions());
 	let (backend_tx, backend_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
 	let snapshot = agent_state.snapshot();
@@ -333,6 +340,7 @@ where
 		pending_auth_kind: None,
 		replaying_turn: false,
 		settings: Settings::load(&data_dir),
+		commands,
 	};
 	chat.set_composer_style(state.settings.composer.shape);
 
@@ -358,6 +366,8 @@ where
 		registry.as_ref(),
 	);
 	send_status(&backend_tx, &state, &bus, agent_events.dropped());
+	let mut last_roster = project_agent_roster(&tree);
+	send_backend(&backend_tx, BackendEvent::AgentRoster(last_roster.clone()));
 
 	let bridge = async move {
 		loop {
@@ -408,14 +418,29 @@ where
 					handle_auth_event(&backend_tx, &mut state, event);
 				},
 				Ok(event) = agent_events.recv() => {
-					handle_agent_event(
-						&backend_tx,
-						&mut state,
-						&event,
-						registry.as_ref(),
-						&bus,
-						agent_events.dropped(),
-					);
+					if matches!(&*event, AgentEvent::RosterChanged { .. }) {
+						publish_agent_roster(&backend_tx, &tree, &mut last_roster);
+					} else {
+						handle_agent_event(
+							&backend_tx,
+							&mut state,
+							&event,
+							registry.as_ref(),
+							&bus,
+							agent_events.dropped(),
+						);
+					}
+				},
+				Ok(()) = roster_events.changed() => {
+					let generation = *roster_events.borrow_and_update();
+					bus.publish(AgentEvent::RosterChanged { generation });
+				},
+				_ = roster_tick.tick() => {
+					if project_agent_roster(&tree) != last_roster {
+						bus.publish(AgentEvent::RosterChanged {
+							generation: tree.roster_generation(),
+						});
+					}
 				},
 			}
 		}
@@ -458,14 +483,14 @@ where
 	R: FnMut() -> anyhow::Result<Vec<ResumeChoice>>,
 {
 	match intent {
-		Intent::Submit { text, attachments, mode } => match parse_input(&text) {
+		Intent::Submit { text, attachments, mode } => match state.commands.parse_input(&text) {
 			Ok(ChatCommand::Nothing) => {
 				if should_abort_empty(chat_active(state.submit_pending, bus.phase()), state.queued) {
 					abort.abort();
 				}
 			},
 			Ok(ChatCommand::Help) => {
-				send_backend(backend, BackendEvent::Notice(Str::from(help_text())));
+				send_backend(backend, BackendEvent::Notice(Str::from(state.commands.help_text())));
 			},
 			Ok(ChatCommand::Login(provider)) => {
 				if chat_active(state.submit_pending, bus.phase()) {
@@ -502,6 +527,42 @@ where
 						),
 					}
 				}
+			},
+			Ok(ChatCommand::NewSession) => {
+				if chat_active(state.submit_pending, bus.phase()) {
+					send_backend(
+						backend,
+						BackendEvent::Error(Str::new_static(
+							"Wait for the active turn to finish before starting a new session.",
+						)),
+					);
+				} else {
+					send_backend(backend, BackendEvent::NewSessionRequested);
+				}
+			},
+			Ok(ChatCommand::Jobs) => {
+				let mut jobs: Vec<_> = state.jobs.iter().map(Str::as_str).collect();
+				jobs.sort_unstable();
+				let message = if jobs.is_empty() {
+					Str::new_static("No active background jobs.")
+				} else {
+					Str::from(format!(
+						"**Active jobs ({})**\n{}",
+						jobs.len(),
+						jobs
+							.into_iter()
+							.map(|job| format!("- `{job}`"))
+							.collect::<Vec<_>>()
+							.join("\n"),
+					))
+				};
+				send_backend(backend, BackendEvent::Notice(message));
+			},
+			Ok(ChatCommand::Settings) => send_backend(backend, BackendEvent::OpenSettings),
+			Ok(ChatCommand::Agents) => send_backend(backend, BackendEvent::OpenAgentTree),
+			Ok(ChatCommand::Pause) => send_backend(backend, BackendEvent::Pause),
+			Ok(ChatCommand::Unavailable { command, reason }) => {
+				send_backend(backend, BackendEvent::Error(fmts!("/{command} unavailable: {reason}")))
 			},
 			Ok(ChatCommand::Quit) => {
 				if chat_active(state.submit_pending, bus.phase()) {
@@ -719,7 +780,9 @@ where
 				send_backend(backend, BackendEvent::Error(Str::from(error)));
 			}
 		},
-		Intent::Help => send_backend(backend, BackendEvent::Notice(Str::from(help_text()))),
+		Intent::Help => {
+			send_backend(backend, BackendEvent::Notice(Str::from(state.commands.help_text())));
+		},
 		Intent::Quit => {
 			if chat_active(state.submit_pending, bus.phase()) {
 				abort.abort();
@@ -840,8 +903,31 @@ fn handle_agent_event(
 				for (_, id) in state.active_parts.drain() {
 					send_backend(backend, BackendEvent::AssistantEnd { id });
 				}
+				if state.attempt > 1 {
+					send_backend(
+						backend,
+						BackendEvent::TranscriptFrame(TranscriptFrame {
+							kind:   TranscriptFrameKind::Recovery,
+							title:  fmts!("Recovered on attempt {}", state.attempt),
+							detail: None,
+						}),
+					);
+				}
+				state.attempt = 0;
 			},
-			Some(Event::Attempt(attempt)) => state.attempt = attempt.number,
+			Some(Event::Attempt(attempt)) => {
+				state.attempt = attempt.number;
+				if attempt.number > 1 {
+					send_backend(
+						backend,
+						BackendEvent::TranscriptFrame(TranscriptFrame {
+							kind:   TranscriptFrameKind::Recovery,
+							title:  fmts!("Retry attempt {}", attempt.number),
+							detail: None,
+						}),
+					);
+				}
+			},
 			Some(Event::PartStart(start)) => {
 				let prefix = match part_start::Kind::try_from(start.kind) {
 					Ok(part_start::Kind::Text) => Some(None),
@@ -921,9 +1007,18 @@ fn handle_agent_event(
 			state.jobs.remove(job_id);
 		},
 		AgentEvent::Failed { message, .. } => {
-			send_backend(backend, BackendEvent::Error(fmts!("Agent error: {message}")));
+			send_backend(
+				backend,
+				BackendEvent::TranscriptFrame(TranscriptFrame {
+					kind:   TranscriptFrameKind::Error,
+					title:  Str::new_static("Agent error"),
+					detail: Some(message.clone()),
+				}),
+			);
 		},
-		AgentEvent::Snapshot(_) | AgentEvent::PhaseChanged { .. } => {},
+		AgentEvent::Snapshot(_)
+		| AgentEvent::PhaseChanged { .. }
+		| AgentEvent::RosterChanged { .. } => {},
 	}
 	send_status(backend, state, bus, dropped);
 }
@@ -1456,6 +1551,37 @@ fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str
 		));
 	}
 	Ok(Str::from(provider.id.as_str()))
+}
+
+fn project_agent_roster(tree: &AgentTree) -> Vec<AgentRow> {
+	tree
+		.roster()
+		.map(|node| {
+			let usage = node.usage();
+			let activity = node.activity();
+			AgentRow {
+				id:     node.id.clone(),
+				name:   node.name.clone(),
+				parent: node.parent.clone(),
+				depth:  node.depth,
+				status: Str::from(node.status().to_string()),
+				tool:   (!activity.is_empty()).then_some(activity),
+				tokens: Some(usage.input_tokens.saturating_add(usage.output_tokens)),
+			}
+		})
+		.collect()
+}
+
+fn publish_agent_roster(
+	backend: &flume::Sender<BackendEvent>,
+	tree: &AgentTree,
+	last: &mut Vec<AgentRow>,
+) {
+	let current = project_agent_roster(tree);
+	if current != *last {
+		*last = current.clone();
+		send_backend(backend, BackendEvent::AgentRoster(current));
+	}
 }
 
 fn send_status(

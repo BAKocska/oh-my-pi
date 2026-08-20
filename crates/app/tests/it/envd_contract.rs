@@ -664,13 +664,19 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		.map(|tool| (tool.identity.name.as_str(), tool.identity.rev.to_string()))
 		.collect::<Vec<_>>();
 	assert_eq!(identities, [
+		("checkpoint", "1".to_owned()),
+		("rewind", "1".to_owned()),
+		("yield", "1".to_owned()),
 		("ask", "1".to_owned()),
 		("dyn", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
+		("fetch", "1".to_owned()),
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
+		("hub", "1".to_owned()),
 		("shell", "1".to_owned()),
+		("think", "1".to_owned()),
 		("todo", "1".to_owned()),
 		("write", "1".to_owned()),
 		("read", "1".to_owned()),
@@ -687,9 +693,11 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			 more complex\n- Supports `.tar`, `.tar.gz`, `.tgz`, `.zip`, and ZIP-based \
 			 `.jar`/`.war`/`.ear`/`.apk` archive entries via `archive.ext:path/inside/archive`\n- \
 			 Supports SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` \
-			 (update with JSON content, delete with empty content)\n</conditions>\n\n<critical>\n- \
-			 You SHOULD use Edit tool for modifying existing files\n- You NEVER create documentation \
-			 files (*.md, README) unless explicitly requested\n- You NEVER use emojis unless \
+			 (update with JSON content, delete with empty content)\n- Supports registered \
+			 merge-conflict splices via `conflict://<id>` and \
+			 `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit \
+			 tool for modifying existing files\n- You NEVER create documentation files (*.md, \
+			 README) unless explicitly requested\n- You NEVER use emojis unless \
 			 requested\n</critical>"
 		)
 	);
@@ -785,7 +793,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 				"language": {
 					"type": "string",
 					"enum": ["py"],
-					"description": "runtime: \"py\" for the IPython kernel"
+					"description": "runtime: \"py\" for the Python kernel"
 				},
 				"code": {
 					"type": "string",
@@ -802,6 +810,27 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 				"reset": {
 					"type": "boolean",
 					"description": "wipe this language's kernel before running. Other languages are untouched."
+				},
+				"kernel_mode": {
+					"anyOf": [
+						{
+							"oneOf": [
+								{
+									"type": "string",
+									"const": "persistent",
+									"description": "Reuse the owner-scoped Python kernel."
+								},
+								{
+									"type": "string",
+									"const": "per-call",
+									"description": "Spawn a clean Python kernel for this call and dispose it at settlement."
+								}
+							],
+							"description": "Lifetime policy for the Python kernel."
+						},
+						{"type": "null"}
+					],
+					"description": "Select a persistent kernel or an isolated one-shot process."
 				}
 			}
 		})
@@ -1736,7 +1765,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 10);
+	assert_eq!(advertised.len(), 16);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry

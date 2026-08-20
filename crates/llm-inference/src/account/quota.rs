@@ -239,4 +239,48 @@ impl QuotaState {
 			})
 			.min()
 	}
+
+	/// Reports whether any current known remaining/limit pair is below the
+	/// configured percentage. Unknown or reset-stale pairs do not fail closed.
+	#[must_use]
+	pub fn below_remaining_percent(&self, now: SystemTime, percent: u8) -> bool {
+		let percent = u128::from(percent.min(100));
+		self.windows.values().any(|window| {
+			let (Some(remaining), Some(limit)) = (window.remaining, window.limit) else {
+				return false;
+			};
+			if limit.value == 0
+				|| window
+					.reset_at
+					.is_some_and(|reset| reset.value <= now && remaining.observed_at < reset.value)
+			{
+				return false;
+			}
+			u128::from(remaining.value) * 100 < u128::from(limit.value) * percent
+		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn reserve_preflight_uses_only_current_known_remaining_fraction() {
+		let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+		let mut quota = QuotaState::default();
+		quota.apply(QuotaObservation {
+			window:      QuotaWindowId::new("monthly"),
+			consumed:    Some(91),
+			remaining:   Some(9),
+			limit:       Some(100),
+			reset_at:    Some(now + std::time::Duration::from_secs(60)),
+			exhausted:   Some(false),
+			provenance:  QuotaProvenance::Provider,
+			observed_at: now,
+		});
+		assert!(quota.below_remaining_percent(now, 10));
+		assert!(!quota.below_remaining_percent(now, 9));
+		assert!(!quota.below_remaining_percent(now + std::time::Duration::from_secs(61), 10));
+	}
 }

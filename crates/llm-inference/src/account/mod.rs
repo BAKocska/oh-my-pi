@@ -10,8 +10,8 @@ use std::time::SystemTime;
 
 pub use pool::{
 	AccountPool, AccountPoolError, AccountRecord, AccountRegistrationError, AccountSelection,
-	AccountSelectionRequest, CandidateEvidence, CooldownReason, Eligibility, RotationPolicy,
-	SelectionReceipt,
+	AccountSelectionRequest, CandidateEvidence, CooldownReason, Eligibility, QuotaReservePolicy,
+	RotationPolicy, SelectionReceipt,
 };
 pub use quota::{
 	QuotaAvailability, QuotaObservation, QuotaProvenance, QuotaState, QuotaWindow, QuotaWindowId,

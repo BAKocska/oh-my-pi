@@ -5,7 +5,13 @@
 //! drains these commands at its established mailbox points; one command is
 //! fully handled before another callback may enter.
 
-use std::collections::BTreeMap;
+use std::{
+	collections::{BTreeMap, VecDeque},
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+};
 
 use omp_core::Str;
 use omp_storage::{
@@ -26,7 +32,8 @@ use crate::{
 /// A cloneable sender for authenticated extension CONTROL operations.
 #[derive(Clone)]
 pub struct ControlSender {
-	commands: flume::Sender<ControlCommand>,
+	commands:     flume::Sender<ControlCommand>,
+	next_receipt: Arc<AtomicU64>,
 }
 
 /// The receive half retained by the sole mutable journal owner.
@@ -45,6 +52,37 @@ pub enum ControlError {
 	Journal(#[from] JournalError),
 }
 
+/// Authoritative acknowledgement that a rewind entered the boundary queue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewindAck {
+	/// Requested live journal head.
+	pub target:  u64,
+	/// Agent-issued command identifier.
+	pub receipt: Str,
+}
+
+/// A rewind command surfaced to the agent loop for boundary execution.
+pub struct ScheduledRewind {
+	/// Durable journal event index to rewind to.
+	pub target: u64,
+	/// Caller-declared rewind scope label.
+	pub scope:  Str,
+}
+
+/// Result of receiving one typed CONTROL command.
+///
+/// Journal-owner harnesses outside the agent loop drive
+/// [`ControlMailbox::handle_next`] and match on this; loop-scoped rewinds must
+/// be executed (or refused) by whoever owns full agent state.
+pub enum ControlMailboxEvent {
+	/// Every sender has closed.
+	Closed,
+	/// A journal-scoped command completed on the journal owner.
+	JournalHandled,
+	/// A loop-scoped rewind is ready for boundary execution.
+	Rewind(ScheduledRewind),
+}
+
 type JournalReplyResult<T> = Result<T, JournalError>;
 
 /// Creates the extension CONTROL mailbox pair.
@@ -55,10 +93,30 @@ type JournalReplyResult<T> = Result<T, JournalError>;
 #[must_use]
 pub fn channel() -> (ControlSender, ControlMailbox) {
 	let (commands, receiver) = flume::unbounded();
-	(ControlSender { commands }, ControlMailbox { commands: receiver })
+	(ControlSender { commands, next_receipt: Arc::new(AtomicU64::new(1)) }, ControlMailbox {
+		commands: receiver,
+	})
 }
 
 impl ControlSender {
+	/// Appends a Core-authored labeled checkpoint and returns its durable token.
+	///
+	/// # Errors
+	pub async fn checkpoint(&self, label: Str) -> Result<u64, ControlError> {
+		let sequence = self.next_receipt.fetch_add(1, Ordering::Relaxed);
+		let request_id = Str::from(format!("checkpoint-{sequence}"));
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Checkpoint { label, request_id, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
 	/// Requests one authenticated journal operation and awaits its assigned
 	/// indexes.
 	///
@@ -223,40 +281,73 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 			.map_err(ControlError::from)
 	}
+
+	/// Schedules a full agent rewind for the next turn boundary.
+	///
+	/// The acknowledgement means the sole owner accepted the command into its
+	/// boundary queue; execution deliberately happens later, after any active
+	/// tool batch settles.
+	///
+	/// # Errors
+	/// Returns [`ControlError::Closed`] if the agent loop stopped receiving.
+	pub async fn schedule_rewind(&self, target: u64, scope: Str) -> Result<RewindAck, ControlError> {
+		let sequence = self.next_receipt.fetch_add(1, Ordering::Relaxed);
+		let receipt = Str::from(format!("rewind-{sequence}"));
+		let (ack, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Rewind { target, scope, receipt: receipt.clone(), ack })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)
+	}
 }
 
 impl ControlMailbox {
-	/// Handles the next command, waiting without holding a lock.
+	/// Handles the next typed command, waiting without holding a lock.
 	///
-	/// Returns `false` after every sender has closed. Each callback is completed
-	/// before this method receives another command.
-	pub async fn handle_next(&self, journal: &mut Journal) -> bool {
+	/// Journal commands complete immediately. Loop-scoped commands are surfaced
+	/// to the caller, which must execute them at its documented boundary.
+	pub async fn handle_next(&self, journal: &mut Journal) -> ControlMailboxEvent {
 		let Ok(command) = self.commands.recv_async().await else {
-			return false;
+			return ControlMailboxEvent::Closed;
 		};
-		handle_command(journal, command);
-		true
+		handle_command(journal, command)
 	}
 
 	/// Drains at most `limit` commands already waiting at an agent-loop mailbox
 	/// point.
 	///
-	/// Returns the number of completely handled callbacks. A zero limit performs
-	/// no work, and bounding the drain preserves fairness with turn traffic.
-	pub fn drain_ready(&self, journal: &mut Journal, limit: usize) -> usize {
+	/// Journal commands retain their existing latency. Loop-scoped commands are
+	/// appended to `surfaced` in receive order for later boundary execution.
+	pub(crate) fn drain_ready(
+		&self,
+		journal: &mut Journal,
+		limit: usize,
+		surfaced: &mut VecDeque<ScheduledRewind>,
+	) -> usize {
 		let mut handled = 0;
 		while handled < limit {
 			let Ok(command) = self.commands.try_recv() else {
 				break;
 			};
-			handle_command(journal, command);
+			if let ControlMailboxEvent::Rewind(rewind) = handle_command(journal, command) {
+				surfaced.push_back(rewind);
+			}
 			handled += 1;
 		}
 		handled
 	}
 }
 
-enum ControlCommand {
+pub(crate) enum ControlCommand {
+	Checkpoint {
+		label:      Str,
+		request_id: Str,
+		reply:      flume::Sender<JournalReplyResult<u64>>,
+	},
 	Journal {
 		request: JournalRequest,
 		reply:   flume::Sender<JournalReplyResult<JournalReply>>,
@@ -295,10 +386,19 @@ enum ControlCommand {
 		transition: InvocationTransition,
 		reply:      flume::Sender<JournalReplyResult<u64>>,
 	},
+	Rewind {
+		target:  u64,
+		scope:   Str,
+		receipt: Str,
+		ack:     flume::Sender<RewindAck>,
+	},
 }
 
-fn handle_command(journal: &mut Journal, command: ControlCommand) {
+fn handle_command(journal: &mut Journal, command: ControlCommand) -> ControlMailboxEvent {
 	match command {
+		ControlCommand::Checkpoint { label, request_id, reply } => {
+			let _ = reply.send(journal.checkpoint(crate::r#loop::now_ms(), label, request_id));
+		},
 		ControlCommand::Journal { request, reply } => {
 			let _ = reply.send(journal.handle_request(request));
 		},
@@ -337,5 +437,10 @@ fn handle_command(journal: &mut Journal, command: ControlCommand) {
 		ControlCommand::InvocationTransition { ts, transition, reply } => {
 			let _ = reply.send(journal.record_invocation_transition(ts, transition));
 		},
+		ControlCommand::Rewind { target, scope, receipt, ack } => {
+			let _ = ack.send(RewindAck { target, receipt });
+			return ControlMailboxEvent::Rewind(ScheduledRewind { target, scope });
+		},
 	}
+	ControlMailboxEvent::JournalHandled
 }

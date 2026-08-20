@@ -7,7 +7,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::HashMap,
+	collections::{HashMap, VecDeque},
 	fmt::Write as _,
 	future::Future,
 	sync::{
@@ -46,7 +46,7 @@ pub mod idle_timeout;
 /// Embedded CPython implementation of the eval resource boundary.
 pub mod kernel;
 
-const EVAL_DESCRIPTION: &str = r#"Run one step of code in a persistent kernel. State persists across calls and subagents.
+const EVAL_DESCRIPTION: &str = r#"Run one step of code in a persistent Python kernel. State persists across calls and subagents.
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
 Cells exceeding the foreground wait threshold continue as managed jobs; their results are delivered automatically.
@@ -89,6 +89,8 @@ Prior top-level names survive into the next cell — reuse; NEVER re-import/re-d
 </critical>"#;
 
 const MAX_DISPLAY_TEXT_BYTES: usize = 8_000;
+const MAX_RETAINED_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_CELL_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 /// Runtime accepted by this build of `eval@1`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -115,24 +117,36 @@ impl JsonSchema for Language {
 	}
 }
 
+/// Lifetime policy for the Python kernel.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum KernelMode {
+	/// Reuse the owner-scoped Python kernel.
+	#[default]
+	Persistent,
+	/// Spawn a clean Python kernel for this call and dispose it at settlement.
+	PerCall,
+}
+
 /// Complete arguments for one Python cell.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[schemars(description = "")]
 #[serde(deny_unknown_fields)]
 pub struct Params {
-	/// runtime: "py" for the IPython kernel
+	/// runtime: "py" for the Python kernel
 	#[expect(
 		clippy::doc_markdown,
 		reason = "doc comment is the verbatim model-facing description; backticks would leak"
 	)]
-	#[schemars(description = "runtime: \"py\" for the IPython kernel")]
-	pub language: Language,
+	#[schemars(required, description = "runtime: \"py\" for the Python kernel")]
+	pub language:    Language,
 	/// code to run in this eval call, verbatim. Use top-level await freely.
 	#[schemars(
+		required,
 		with = "String",
 		description = "code to run in this eval call, verbatim. Use top-level await freely."
 	)]
-	pub code:     Str,
+	pub code:        Str,
 	/// short label shown in transcript (e.g. "imports", "load config")
 	#[schemars(
 		default,
@@ -140,7 +154,7 @@ pub struct Params {
 		with = "String",
 		description = "short label shown in transcript (e.g. \"imports\", \"load config\")"
 	)]
-	pub title:    Option<Str>,
+	pub title:       Option<Str>,
 	/// timeout for this eval call in seconds; 0 disables the cell timeout
 	#[schemars(
 		default,
@@ -148,7 +162,7 @@ pub struct Params {
 		with = "serde_json::Number",
 		description = "timeout for this eval call in seconds; 0 disables the cell timeout"
 	)]
-	pub timeout:  Option<f64>,
+	pub timeout:     Option<f64>,
 	/// wipe this language's kernel before running. Other languages are
 	/// untouched.
 	#[schemars(
@@ -157,7 +171,10 @@ pub struct Params {
 		with = "bool",
 		description = "wipe this language's kernel before running. Other languages are untouched."
 	)]
-	pub reset:    Option<bool>,
+	pub reset:       Option<bool>,
+	/// Select a persistent kernel or an isolated one-shot process.
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
+	pub kernel_mode: Option<KernelMode>,
 }
 
 /// Ordered text stream emitted by Python.
@@ -416,6 +433,27 @@ pub trait EvalExec: Clone + Send + Sync + 'static {
 		session: &'a Session,
 		request: RunRequest,
 	) -> impl Future<Output = Result<Self::Run, Fault>> + Send + 'a;
+
+	/// Starts one cell with an explicit lifetime policy.
+	fn run_with_mode<'a>(
+		&'a self,
+		session: &'a Session,
+		request: RunRequest,
+		_disposable: bool,
+	) -> impl Future<Output = Result<Self::Run, Fault>> + Send + 'a {
+		self.run(session, request)
+	}
+
+	/// Disposes one persistent session before a reset cell.
+	fn dispose_session(
+		&self,
+		_session: &Session,
+	) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
+		std::future::ready(Ok(()))
+	}
+
+	/// Requests disposal of every persistent session owned by this executor.
+	fn dispose_all(&self) {}
 }
 
 fn format_display_json(outputs: &[DisplayOutput]) -> String {
@@ -444,6 +482,69 @@ fn format_display_json(outputs: &[DisplayOutput]) -> String {
 	rendered.join("\n\n")
 }
 
+struct OutputRetention {
+	head:       Vec<OutputFrame>,
+	tail:       VecDeque<OutputFrame>,
+	head_bytes: usize,
+	tail_bytes: usize,
+	truncated:  bool,
+}
+
+impl OutputRetention {
+	const HALF: usize = MAX_RETAINED_OUTPUT_BYTES / 2;
+
+	const fn new() -> Self {
+		Self {
+			head:       Vec::new(),
+			tail:       VecDeque::new(),
+			head_bytes: 0,
+			tail_bytes: 0,
+			truncated:  false,
+		}
+	}
+
+	fn push(&mut self, update: &Update) {
+		let data = update.data.as_ref();
+		if self.head_bytes < Self::HALF {
+			let retained = data.len().min(Self::HALF - self.head_bytes);
+			if retained > 0 {
+				self.head.push(OutputFrame {
+					channel:  update.channel,
+					data:     CowBytes::from(data[..retained].to_vec()),
+					sequence: update.sequence,
+				});
+				self.head_bytes += retained;
+			}
+			if retained == data.len() {
+				return;
+			}
+		}
+		self.truncated = true;
+		let retained = data.len().min(Self::HALF);
+		if retained == 0 {
+			return;
+		}
+		let tail = &data[data.len() - retained..];
+		self.tail.push_back(OutputFrame {
+			channel:  update.channel,
+			data:     CowBytes::from(tail.to_vec()),
+			sequence: update.sequence,
+		});
+		self.tail_bytes += retained;
+		while self.tail_bytes > Self::HALF {
+			let Some(front) = self.tail.pop_front() else {
+				break;
+			};
+			self.tail_bytes = self.tail_bytes.saturating_sub(front.data.as_ref().len());
+		}
+	}
+
+	fn finish(mut self) -> (Vec<OutputFrame>, bool) {
+		self.head.extend(self.tail);
+		(self.head, self.truncated)
+	}
+}
+
 /// Python-only `eval@1` implementation retaining one lazy session per owner.
 pub struct EvalTool<E: EvalExec> {
 	exec: E,
@@ -459,16 +560,24 @@ struct OwnerSession {
 	reset_generation: AtomicU64,
 }
 
-/// External reset trigger used when chat identity changes.
-#[derive(Clone, Default)]
+/// External reset and disposal trigger used when chat identity changes.
+#[derive(Clone)]
 pub struct EvalSessionControl {
 	reset_generation: Arc<AtomicU64>,
+	dispose_all:      Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Default for EvalSessionControl {
+	fn default() -> Self {
+		Self { reset_generation: Arc::new(AtomicU64::new(0)), dispose_all: Arc::new(|| {}) }
+	}
 }
 
 impl EvalSessionControl {
-	/// Makes every owner's next committed cell start with a fresh namespace.
+	/// Disposes every live process and makes each owner's next cell fresh.
 	pub fn request_reset(&self) {
 		self.reset_generation.fetch_add(1, Ordering::AcqRel);
+		(self.dispose_all)();
 	}
 }
 
@@ -479,7 +588,11 @@ pub fn eval<E: EvalExec>(exec: E) -> EvalTool<E> {
 
 /// Constructs `eval@1` together with its owning session reset capability.
 pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl) {
-	let control = EvalSessionControl::default();
+	let disposer = exec.clone();
+	let control = EvalSessionControl {
+		reset_generation: Arc::new(AtomicU64::new(0)),
+		dispose_all:      Arc::new(move || disposer.dispose_all()),
+	};
 	let tool = EvalTool {
 		exec,
 		sessions: Mutex::new(HashMap::new()),
@@ -558,7 +671,8 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			let timeout = match args.timeout {
 				None => Some(Duration::from_secs(30)),
 				Some(0.0) => None,
-				Some(value) if value.is_finite() && value > 0.0 => Some(Duration::from_secs_f64(value)),
+				Some(value) if value.is_finite() && value > 0.0 =>
+					Some(Duration::from_secs_f64(value).min(MAX_CELL_TIMEOUT)),
 				Some(_) => {
 					yield Ev::Done(ToolTerminal::Done { result: Err(Fault::InvalidTimeout), useless: false });
 					return;
@@ -588,11 +702,18 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			};
 			let reset = args.reset.unwrap_or(false)
 				|| owned.reset_generation.swap(reset_generation, Ordering::AcqRel) != reset_generation;
-			let mut run = match self.exec.run(&session, RunRequest {
+			if reset
+				&& let Err(fault) = self.exec.dispose_session(&session).await
+			{
+				yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
+				return;
+			}
+			let disposable = args.kernel_mode == Some(KernelMode::PerCall);
+			let mut run = match self.exec.run_with_mode(&session, RunRequest {
 				code: args.code.clone(),
 				timeout,
 				reset,
-			}).await {
+			}, disposable).await {
 				Ok(run) => run,
 				Err(fault) => {
 					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
@@ -605,7 +726,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			let mut auto_background = true;
 
 			let mut cell_id = Bytes::new();
-			let mut frames = Vec::new();
+			let mut frames = OutputRetention::new();
 			let mut cancellation_reason: Option<Str> = None;
 			loop {
 				let event = if cancellation_reason.is_some() {
@@ -665,8 +786,8 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 								}
 							}
 							let reason = interrupt.reason;
-							if let Err(fault) = run.cancel().await {
-								yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
+							if run.cancel().await.is_err() {
+								yield Ev::Aborted(Abort::EffectsUnknown { reason });
 								return;
 							}
 							cancellation_reason = Some(reason);
@@ -679,14 +800,15 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				match event {
 					Ok(Some(RunEvent::Started { cell_id: id })) => cell_id = id,
 					Ok(Some(RunEvent::Output(update))) => {
-						frames.push(OutputFrame {
-							channel: update.channel,
-							data: update.data.clone(),
-							sequence: update.sequence,
-						});
+						frames.push(&update);
 						yield Ev::Update(update);
 					},
 					Ok(Some(RunEvent::Completed(done))) => {
+						if let Some(reason) = cancellation_reason {
+							yield Ev::Aborted(Abort::EffectsUnknown { reason });
+							return;
+						}
+						let (frames, retained_truncated) = frames.finish();
 						yield Ev::Done(ToolTerminal::Done {
 							result: Ok(Payload {
 								session_id: session.id,
@@ -699,7 +821,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 								result: done.result,
 								display_outputs: done.display_outputs,
 								status: done.status,
-								truncated: done.truncated,
+								truncated: done.truncated || retained_truncated,
 								spilled_output: done.spilled_output,
 								total_lines: done.total_lines,
 								total_bytes: done.total_bytes,
@@ -715,7 +837,11 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 						return;
 					},
 					Err(fault) => {
-						yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
+						if let Some(reason) = cancellation_reason {
+							yield Ev::Aborted(Abort::EffectsUnknown { reason });
+						} else {
+							yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
+						}
 						return;
 					},
 				}
@@ -950,6 +1076,7 @@ mod tests {
 		assert_eq!(python.title, None);
 		assert_eq!(python.timeout, None);
 		assert_eq!(python.reset, None);
+		assert_eq!(python.kernel_mode, None);
 		assert!(
 			serde_json::from_value::<Params>(serde_json::json!({
 				"language": "js",
@@ -965,5 +1092,28 @@ mod tests {
 			}))
 			.is_err()
 		);
+	}
+
+	#[test]
+	fn output_retention_keeps_bounded_head_and_tail() {
+		let mut retention = OutputRetention::new();
+		for (sequence, byte) in [(0, b'a'), (1, b'b'), (2, b'c')] {
+			retention.push(&Update {
+				channel: OutputChannel::Stdout,
+				data: CowBytes::from(vec![byte; MAX_RETAINED_OUTPUT_BYTES]),
+				sequence,
+			});
+		}
+		let (frames, truncated) = retention.finish();
+		assert!(truncated);
+		assert!(
+			frames
+				.iter()
+				.map(|frame| frame.data.as_ref().len())
+				.sum::<usize>()
+				<= MAX_RETAINED_OUTPUT_BYTES
+		);
+		assert_eq!(frames.first().and_then(|frame| frame.data.as_ref().first()), Some(&b'a'));
+		assert_eq!(frames.last().and_then(|frame| frame.data.as_ref().last()), Some(&b'c'));
 	}
 }

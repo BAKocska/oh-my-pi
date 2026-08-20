@@ -5402,7 +5402,9 @@ dependencies = [
  "flume",
  "omp-core",
  "omp-proto",
+ "omp-tools",
  "omp-tui",
+ "parking_lot",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
  "tokio",
@@ -5710,9 +5712,14 @@ dependencies = [
 name = "omp-rpc"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "flume",
  "hyper-util",
  "omp-core",
  "omp-proto",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

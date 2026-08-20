@@ -3,6 +3,7 @@
 
 use std::{
 	cell::RefCell,
+	collections::VecDeque,
 	fmt::Write as _,
 	rc::Rc,
 	time::{Duration, Instant},
@@ -24,7 +25,8 @@ use omp_tui::{
 use smallvec::SmallVec;
 
 use crate::{
-	BackendEvent, CompactionSpeculationStatus, StatusFacts, SubmitMode,
+	AgentRow, BackendEvent, CompactionSpeculationStatus, StatusFacts, SubmitMode, TranscriptFrame,
+	TranscriptFrameKind,
 	slots::{Mount, Slots},
 };
 
@@ -400,6 +402,7 @@ impl ToolView {
 }
 
 struct ToolEntry {
+	name:   Str,
 	title:  Str,
 	ok:     bool,
 	view:   ToolView,
@@ -416,6 +419,7 @@ struct LiveAssistant {
 }
 struct LiveTool {
 	id:     Str,
+	name:   Str,
 	title:  Str,
 	view:   ToolView,
 	images: Vec<ToolImageEntry>,
@@ -425,6 +429,7 @@ enum Entry {
 	User(UserEntry),
 	Assistant(RichText),
 	Tool(ToolEntry),
+	ToolGroup(Vec<ToolEntry>),
 	Compaction(CompactionEntry),
 	Notice { text: Str, error: bool },
 }
@@ -445,7 +450,9 @@ impl<'a> PreviewEntry<'a> {
 			Entry::Assistant(body) => {
 				Self::Assistant(RichText::new(body.text.as_str(), width.max(1), ctx))
 			},
-			Entry::Tool(_) | Entry::Compaction(_) | Entry::Notice { .. } => Self::Other(entry),
+			Entry::Tool(_) | Entry::ToolGroup(_) | Entry::Compaction(_) | Entry::Notice { .. } => {
+				Self::Other(entry)
+			},
 		}
 	}
 
@@ -799,7 +806,7 @@ pub struct Chat {
 	ctx:             UiContext,
 	editor_ui:       Ui,
 	attachments:     Attachments,
-	pending_submit:  Option<(String, Vec<Attachment>, SubmitMode)>,
+	pending_submit:  VecDeque<(String, Vec<Attachment>, SubmitMode)>,
 	copied:          Option<Str>,
 	work:            Rc<RefCell<WorkState>>,
 	session_title:   Str,
@@ -816,6 +823,7 @@ pub struct Chat {
 	last_working:    bool,
 	right_inset:     u16,
 	slots:           Slots,
+	agents:          Vec<AgentRow>,
 	attribution:     Option<Attribution>,
 }
 
@@ -841,7 +849,7 @@ impl Chat {
 			ctx: ctx.clone(),
 			editor_ui,
 			attachments,
-			pending_submit: None,
+			pending_submit: VecDeque::new(),
 			copied: None,
 			work,
 			session_title: Str::default(),
@@ -857,6 +865,7 @@ impl Chat {
 			drawn_live: 0,
 			last_working: false,
 			right_inset: 0,
+			agents: Vec::new(),
 			slots: Slots::new(ctx.clone()),
 			attribution: None,
 		}
@@ -906,7 +915,9 @@ impl Chat {
 	/// Routes a key through the composer.
 	pub fn handle_key(&mut self, key: Key) -> ChatKey {
 		if key == Key::Enter && self.composer_empty() && self.is_working() {
-			self.pending_submit = Some((String::new(), Vec::new(), SubmitMode::Steer));
+			self
+				.pending_submit
+				.push_back((String::new(), Vec::new(), SubmitMode::Steer));
 			return ChatKey::Consumed;
 		}
 		if key == Key::FollowUp {
@@ -937,12 +948,34 @@ impl Chat {
 		if text.trim().is_empty() {
 			return;
 		}
-		let attachments = if preserves_attachments(&text) {
+		let mut attachments = if preserves_attachments(&text) {
 			Vec::new()
 		} else {
 			self.attachments.take()
 		};
-		self.pending_submit = Some((text, attachments, mode));
+		let items = if text.trim_start().starts_with('/') {
+			vec![crate::queue::QueueItem {
+				text:             Str::from(text.as_str()),
+				yield_after_turn: false,
+			}]
+		} else {
+			crate::queue::split(&text)
+		};
+		for (index, item) in items.into_iter().enumerate() {
+			let item_mode = if index > 0 || item.yield_after_turn {
+				SubmitMode::FollowUp
+			} else {
+				mode
+			};
+			let item_attachments = if index == 0 {
+				std::mem::take(&mut attachments)
+			} else {
+				Vec::new()
+			};
+			self
+				.pending_submit
+				.push_back((item.text.to_string(), item_attachments, item_mode));
+		}
 		self.editor_ui.set_text(INPUT_ID, "");
 		self.refresh_composer();
 	}
@@ -977,8 +1010,8 @@ impl Chat {
 
 	/// Takes the next composer submission: its text, staged attachments,
 	/// and active-turn delivery mode.
-	pub const fn take_submission(&mut self) -> Option<(String, Vec<Attachment>, SubmitMode)> {
-		self.pending_submit.take()
+	pub fn take_submission(&mut self) -> Option<(String, Vec<Attachment>, SubmitMode)> {
+		self.pending_submit.pop_front()
 	}
 
 	/// Returns whether the composer contains no non-whitespace text.
@@ -1067,15 +1100,11 @@ impl Chat {
 	}
 
 	/// Begins a live tool card.
-	pub fn tool_started(
-		&mut self,
-		id: impl Into<Str>,
-		_name: impl Into<Str>,
-		title: impl Into<Str>,
-	) {
+	pub fn tool_started(&mut self, id: impl Into<Str>, name: impl Into<Str>, title: impl Into<Str>) {
 		let title = hud_line(title.into(), self.ctx.charset);
 		self.live_tools.push(LiveTool {
 			id: id.into(),
+			name: name.into(),
 			title,
 			view: ToolView::structured(
 				Str::new_static(""),
@@ -1143,12 +1172,28 @@ impl Chat {
 		{
 			let mut tool = self.live_tools.remove(index);
 			tool.view.replace(view, &self.ctx);
-			self.transcript.push(Entry::Tool(ToolEntry {
+			let entry = ToolEntry {
+				name: tool.name,
 				title: tool.title,
 				ok,
 				view: tool.view,
 				images: tool.images,
-			}));
+			};
+			if entry.name.as_str() == "read" {
+				let prior_is_read = matches!(self.transcript.last(), Some(Entry::Tool(prior)) if prior.name.as_str() == "read");
+				if let Some(Entry::ToolGroup(group)) = self.transcript.last_mut() {
+					group.push(entry);
+				} else if prior_is_read {
+					let Some(Entry::Tool(prior)) = self.transcript.pop() else {
+						unreachable!("matched a read tool entry")
+					};
+					self.transcript.push(Entry::ToolGroup(vec![prior, entry]));
+				} else {
+					self.transcript.push(Entry::Tool(entry));
+				}
+			} else {
+				self.transcript.push(Entry::Tool(entry));
+			}
 			self.bump_live();
 		}
 	}
@@ -1203,6 +1248,38 @@ impl Chat {
 		self
 			.transcript
 			.push(Entry::Notice { text: text.into(), error: true });
+	}
+
+	/// Appends a semantic transcript boundary with core-owned styling.
+	pub fn push_transcript_frame(&mut self, frame: TranscriptFrame) {
+		let marker = match frame.kind {
+			TranscriptFrameKind::Compaction => "compact",
+			TranscriptFrameKind::Branch => "branch",
+			TranscriptFrameKind::Handoff => "handoff",
+			TranscriptFrameKind::CacheBreak => "cache break",
+			TranscriptFrameKind::Recovery => "recovery",
+			TranscriptFrameKind::Error => "error",
+		};
+		let text = match frame.detail {
+			Some(detail) if !detail.is_empty() => fmts!("{marker} · {} — {detail}", frame.title),
+			_ => fmts!("{marker} · {}", frame.title),
+		};
+		if frame.kind == TranscriptFrameKind::Error {
+			self.push_error(text);
+		} else {
+			self.push_notice(text);
+		}
+	}
+
+	/// Replaces the anchored AgentTree HUD projection.
+	pub fn set_agent_roster(&mut self, rows: Vec<AgentRow>) {
+		self.agents = rows;
+		self.bump_live();
+	}
+
+	/// Borrows the current AgentTree roster projection.
+	pub fn agent_roster(&self) -> &[AgentRow] {
+		&self.agents
 	}
 
 	/// Replaces the complete status snapshot.
@@ -1296,6 +1373,8 @@ impl Chat {
 			BackendEvent::Compacted { summary, title, method, tokens_before, tokens_after } => {
 				self.push_compaction(summary, title, method, tokens_before, tokens_after)
 			},
+			BackendEvent::TranscriptFrame(frame) => self.push_transcript_frame(frame),
+			BackendEvent::AgentRoster(rows) => self.set_agent_roster(rows),
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
@@ -1312,7 +1391,11 @@ impl Chat {
 			| BackendEvent::LoginProviders(_)
 			| BackendEvent::RewindTargets(_)
 			| BackendEvent::AuthPrompt { .. }
-			| BackendEvent::AuthPromptClose) => return Some(event),
+			| BackendEvent::AuthPromptClose
+			| BackendEvent::OpenSettings
+			| BackendEvent::OpenAgentTree
+			| BackendEvent::Pause
+			| BackendEvent::NewSessionRequested) => return Some(event),
 		}
 		None
 	}
@@ -1555,6 +1638,11 @@ impl Chat {
 			Entry::User(user) => user.body.resize(message_width, ctx),
 			Entry::Assistant(body) => body.resize(width.max(1), ctx),
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
+			Entry::ToolGroup(tools) => {
+				for tool in tools {
+					tool.view.resize(Self::tool_view_width(width), ctx);
+				}
+			},
 			Entry::Compaction(_) | Entry::Notice { .. } => {},
 		}
 	}
@@ -1568,6 +1656,11 @@ impl Chat {
 				.saturating_add(1),
 			Entry::Assistant(body) => body.height().saturating_add(1),
 			Entry::Tool(tool) => tool_height(tool, width).saturating_add(1),
+			Entry::ToolGroup(tools) => tools.iter().fold(1_u16, |height, tool| {
+				height
+					.saturating_add(tool_height(tool, width))
+					.saturating_add(1)
+			}),
 			Entry::Compaction(compaction) => {
 				flowed_height(&compaction.label, width.saturating_sub(2)).saturating_add(1)
 			},
@@ -1580,6 +1673,18 @@ impl Chat {
 			Entry::User(user) => draw_user(frame, y, user, ctx),
 			Entry::Assistant(body) => draw_rich(frame, y, body, 0, width, ctx.theme).saturating_add(1),
 			Entry::Tool(tool) => draw_tool(frame, y, width, tool, ctx).saturating_add(1),
+			Entry::ToolGroup(tools) => {
+				let label = fmts!("Read {} files", tools.len());
+				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
+					&label,
+					ink(ctx.theme.muted).bold(),
+				)]);
+				tools.iter().fold(1_u16, |rows, tool| {
+					rows
+						.saturating_add(draw_tool(frame, y.saturating_add(rows), width, tool, ctx))
+						.saturating_add(1)
+				})
+			},
 			Entry::Compaction(compaction) => draw_flowed(
 				frame,
 				Rect::new(1, y, width.saturating_sub(2), frame.size().height.saturating_sub(y)),
@@ -1609,6 +1714,7 @@ impl Chat {
 			rect,
 			self.live_assistant.as_ref(),
 			&self.live_tools,
+			&self.agents,
 			&ctx,
 			elapsed,
 		);
@@ -1620,6 +1726,7 @@ impl Chat {
 			rect,
 			self.live_assistant.as_ref(),
 			&self.live_tools,
+			&self.agents,
 			&self.ctx,
 			elapsed,
 		);
@@ -1667,11 +1774,12 @@ fn draw_live_panel_impl(
 	rect: Rect,
 	assistant: Option<&LiveAssistant>,
 	tools: &[LiveTool],
+	agents: &[AgentRow],
 	ctx: &UiContext,
 	elapsed: Duration,
 ) {
 	frame.fill(rect, base_style(ctx.theme));
-	if assistant.is_none() && tools.is_empty() {
+	if assistant.is_none() && tools.is_empty() && agents.is_empty() {
 		return;
 	}
 	draw_box(
@@ -1684,6 +1792,30 @@ fn draw_live_panel_impl(
 	);
 	let mut y = rect.y.saturating_add(1);
 	let bottom = rect.y.saturating_add(rect.height).saturating_sub(1);
+	for agent in agents.iter().take(8) {
+		if y >= bottom {
+			break;
+		}
+		let indent = "  ".repeat(usize::from(agent.depth.min(4)));
+		let tool = agent
+			.tool
+			.as_deref()
+			.map_or_else(Str::default, |tool| fmts!(" · {tool}"));
+		let tokens = agent
+			.tokens
+			.map_or_else(Str::default, |tokens| fmts!(" · {}", compact_count(tokens)));
+		let label = fmts!(
+			"{indent}{} {} · {}{tool}{tokens}",
+			ctx.charset.icon(Icon::Task),
+			agent.name,
+			agent.status
+		);
+		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
+			&label,
+			ink(ctx.theme.secondary),
+		)]);
+		y = y.saturating_add(1);
+	}
 	if let Some(message) = assistant {
 		let used = draw_flowed(
 			frame,
@@ -2213,6 +2345,26 @@ mod tests {
 	}
 
 	#[test]
+	fn consecutive_reads_group_until_another_transcript_entry() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("read-a", "read", "src/a.rs");
+		chat.tool_finished("read-a", true, Str::new_static("a"));
+		chat.tool_started("read-b", "read", "src/b.rs");
+		chat.tool_finished("read-b", true, Str::new_static("b"));
+		assert!(matches!(&chat.transcript[..], [Entry::ToolGroup(group)] if group.len() == 2));
+
+		chat.tool_started("shell", "bash", "cargo metadata");
+		chat.tool_finished("shell", true, Str::new_static("ok"));
+		chat.tool_started("read-c", "read", "src/c.rs");
+		chat.tool_finished("read-c", true, Str::new_static("c"));
+		assert!(matches!(
+			&chat.transcript[..],
+			[Entry::ToolGroup(_), Entry::Tool(shell), Entry::Tool(read)]
+				if shell.name.as_str() == "bash" && read.name.as_str() == "read"
+		));
+	}
+
+	#[test]
 	fn resize_preview_does_not_mutate_retained_geometry() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_user("a line that wraps when narrow", vec![]);
@@ -2388,6 +2540,39 @@ mod tests {
 	}
 
 	#[test]
+	fn split_submission_steers_first_and_queues_followups() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_composer_text("first\n---\nsecond\n///\nthird");
+		assert_eq!(chat.handle_key(Key::Enter), ChatKey::Consumed);
+		for (expected, mode) in [
+			("first", SubmitMode::Steer),
+			("second", SubmitMode::FollowUp),
+			("third", SubmitMode::FollowUp),
+		] {
+			let (text, _, actual) = chat.take_submission().expect("split item");
+			assert_eq!(text, expected);
+			assert_eq!(actual, mode);
+		}
+		assert!(chat.take_submission().is_none());
+	}
+
+	#[test]
+	fn semantic_transcript_frames_keep_kind_and_detail_visible() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_transcript_frame(TranscriptFrame {
+			kind:   TranscriptFrameKind::Handoff,
+			title:  Str::from("Transferred session"),
+			detail: Some(Str::from("focus on UI")),
+		});
+		let Some(Entry::Notice { text, error }) = chat.transcript.last() else {
+			panic!("notice")
+		};
+		assert!(!error);
+		assert!(text.contains("handoff"));
+		assert!(text.contains("focus on UI"));
+	}
+
+	#[test]
 	fn raw_scene_chrome_uses_the_supplied_theme() {
 		let mut context = ctx();
 		context.theme = Theme::for_appearance(omp_tui::Appearance::Light);
@@ -2397,6 +2582,7 @@ mod tests {
 			&mut frame,
 			Rect::new(0, 0, 20, 5),
 			assistant.as_ref(),
+			&[],
 			&[],
 			&context,
 			Duration::ZERO,

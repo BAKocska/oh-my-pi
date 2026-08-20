@@ -60,6 +60,12 @@ pub enum AgentEvent {
 		/// Phase entered by the loop.
 		to:   AgentPhase,
 	},
+	/// The append-only agent roster changed; consumers re-project from
+	/// AgentTree.
+	RosterChanged {
+		/// Monotonic generation returned by `AgentTree::roster_generation`.
+		generation: u64,
+	},
 	/// An inference event, preserved without lossy adaptation.
 	Turn {
 		/// Logical turn that emitted the event.

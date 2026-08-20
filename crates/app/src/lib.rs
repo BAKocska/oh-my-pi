@@ -24,6 +24,7 @@ pub mod models_cmd;
 pub mod print_mode;
 pub mod project_state;
 pub mod rpc_adapter;
+pub mod rpc_mode;
 pub mod settings;
 pub mod spec;
 pub mod startup_notice;

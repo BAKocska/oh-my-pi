@@ -22,7 +22,17 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::{read::selector::LiteralPathProbe, render::TextProjection};
+use crate::{
+	read::{
+		conflicts::{
+			ConflictRegistry, ConflictReplacement, RegisteredConflict, parse_conflict_address,
+			parse_replacement,
+		},
+		resolver::Scheme,
+		selector::{LiteralPathProbe, parse_uri},
+	},
+	render::TextProjection,
+};
 
 /// Archive and SQLite write seams.
 pub mod backends;
@@ -33,9 +43,11 @@ const DESCRIPTION: &str =
 	 complex\n- Supports `.tar`, `.tar.gz`, `.tgz`, `.zip`, and ZIP-based \
 	 `.jar`/`.war`/`.ear`/`.apk` archive entries via `archive.ext:path/inside/archive`\n- Supports \
 	 SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON \
-	 content, delete with empty content)\n</conditions>\n\n<critical>\n- You SHOULD use Edit tool \
-	 for modifying existing files\n- You NEVER create documentation files (*.md, README) unless \
-	 explicitly requested\n- You NEVER use emojis unless requested\n</critical>";
+	 content, delete with empty content)\n- Supports registered merge-conflict splices via \
+	 `conflict://<id>` and `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You \
+	 SHOULD use Edit tool for modifying existing files\n- You NEVER create documentation files \
+	 (*.md, README) unless explicitly requested\n- You NEVER use emojis unless \
+	 requested\n</critical>";
 const EXECUTABLE_NOTICE: &str = "[Notice: Made executable via chmod +x]";
 const STRIPPED_NOTICE: &str =
 	"Note: auto-stripped hashline display prefixes from content before writing.";
@@ -73,6 +85,15 @@ pub enum WriteDisposition {
 pub enum WriteOperation {
 	/// Plain whole-file create or overwrite.
 	Plain,
+	/// Registered merge-conflict splice.
+	ConflictSplice {
+		/// Session-local conflict ID.
+		id:         usize,
+		/// One-based marker range replaced.
+		start_line: usize,
+		/// One-based final marker line replaced.
+		end_line:   usize,
+	},
 	/// ZIP/TAR member create or replacement.
 	ArchiveMember,
 	/// SQLite row insertion.
@@ -125,6 +146,24 @@ pub struct PlainWriteResult {
 	/// Four-character tag recorded in the shared session snapshot store.
 	/// Absent for oversized or otherwise untaggable text.
 	pub snapshot_tag:    Option<Str>,
+}
+
+/// Resource request for one revision-checked conflict splice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictSpliceRequest {
+	/// Registered path and marker sides.
+	pub entry:       RegisteredConflict,
+	/// Selected side directive or exact custom text.
+	pub replacement: ConflictReplacement,
+}
+
+/// Resource-owned truth returned after a conflict splice transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictSpliceResult {
+	/// Standard committed-document receipt.
+	pub write: PlainWriteResult,
+	/// One-based marker range replaced in the committed base.
+	pub range: (usize, usize),
 }
 
 /// Durable successful `write@1` result.
@@ -333,6 +372,17 @@ pub trait WriteDocuments: Send + Sync + 'static {
 		request: PlainWriteRequest,
 	) -> impl Future<Output = Result<PlainWriteResult, WriteCommitError>> + Send + '_;
 
+	/// Attempts a revision-checked `conflict://<id>` splice.
+	///
+	/// The implementation must read and commit through the document authority,
+	/// use [`crate::read::conflicts::splice_registered`] against the pinned
+	/// bytes, and reject a moved/ambiguous/stale region without mutation.
+	fn splice_conflict(
+		&self,
+		_request: ConflictSpliceRequest,
+	) -> impl Future<Output = Result<Option<ConflictSpliceResult>, WriteCommitError>> + Send + '_ {
+		std::future::ready(Ok(None))
+	}
 	/// Attempts an archive-member write after commitment. Implementations MUST
 	/// honor `control` and call [`SpecialWriteControl::begin_effects`] before
 	/// creating directories, temporary files, or replacing the archive.
@@ -364,13 +414,23 @@ pub trait WriteDocuments: Send + Sync + 'static {
 /// `write@1` executor.
 pub struct WriteTool<D> {
 	documents: D,
+	conflicts: Arc<ConflictRegistry>,
 	spec:      ToolSpec,
 }
 
 /// Construct the built-in whole-file write tool.
 pub fn tool<D: WriteDocuments>(documents: D) -> WriteTool<D> {
+	tool_with_conflicts(documents, Arc::new(ConflictRegistry::default()))
+}
+
+/// Construct `write@1` sharing conflict registrations with `read@1`.
+pub fn tool_with_conflicts<D: WriteDocuments>(
+	documents: D,
+	conflicts: Arc<ConflictRegistry>,
+) -> WriteTool<D> {
 	WriteTool {
 		documents,
+		conflicts,
 		spec: ToolSpec {
 			name:            "write".into(),
 			rev:             Rev { family: Str::new(""), n: 1 },
@@ -421,7 +481,44 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 				},
 			};
 			let path = Str::from(unwrap_hashline_header_path(&arguments.path));
-			if let Some(fault) = reject_uri_like_target(&path) {
+			let conflict_request = match parse_uri(&path) {
+				Ok(Some(uri)) if uri.scheme == Scheme::Conflict => {
+					if uri.selector_text.is_some() || uri.resource.contains('/') {
+						yield done(Err(Fault::UriLikeTarget {
+							message: Str::new_static(
+								"Conflict splices target conflict://<id> without a scope or read selector",
+							),
+						}));
+						return;
+					}
+					let address = match parse_conflict_address(uri.resource) {
+						Ok(address) => address,
+						Err(fault) => {
+							yield done(Err(Fault::Document { message: fault.message().clone() }));
+							return;
+						},
+					};
+					let Some(entry) = self.conflicts.get(address.id) else {
+						yield done(Err(Fault::Document {
+							message: Str::from(format!(
+								"Conflict #{} is no longer registered",
+								address.id
+							)),
+						}));
+						return;
+					};
+					Some(ConflictSpliceRequest {
+						entry,
+						replacement: parse_replacement(arguments.content.clone()),
+					})
+				},
+				Ok(_) => None,
+				Err(error) => {
+					yield done(Err(Fault::UriLikeTarget { message: Str::from(error.to_string()) }));
+					return;
+				},
+			};
+			if conflict_request.is_none() && let Some(fault) = reject_uri_like_target(&path) {
 				yield done(Err(fault));
 				return;
 			}
@@ -435,6 +532,48 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 					yield commit_event(error);
 					return;
 				},
+			}
+
+			if let Some(request) = conflict_request {
+				let id = request.entry.id;
+				let operation = self.documents.splice_conflict(request).fuse();
+				let interruption = params.next_interrupt().fuse();
+				pin_mut!(operation, interruption);
+				select_biased! {
+					result = operation => match result {
+						Ok(Some(result)) => {
+							self.conflicts.remove(id);
+							yield done(Ok(Payload {
+								resolved_path: result.write.resolved_path,
+								display_path: result.write.display_path,
+								byte_len: result.write.byte_len,
+								reported_len,
+								disposition: result.write.disposition,
+								stripped_wrapper: stripped.stripped,
+								made_executable: result.write.made_executable,
+								snapshot_tag: result.write.snapshot_tag,
+								operation: WriteOperation::ConflictSplice {
+									id,
+									start_line: result.range.0,
+									end_line: result.range.1,
+								},
+							}));
+						},
+						Ok(None) => yield done(Err(Fault::Document {
+							message: Str::new_static(
+								"conflict:// writes are unavailable in this deployment",
+							),
+						})),
+						Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
+						Err(WriteCommitError::EffectsUnknown { reason }) => {
+							yield Ev::Aborted(Abort::EffectsUnknown { reason });
+						},
+					},
+					interrupt = interruption => {
+						yield interrupt_event(interrupt, true);
+					},
+				}
+				return;
 			}
 
 			let archive_result = {
@@ -864,6 +1003,14 @@ fn render_payload(payload: &Payload) -> String {
 			payload.reported_len, payload.display_path
 		)
 		.expect("writing to String cannot fail"),
+		WriteOperation::ConflictSplice { id, start_line, end_line } => {
+			write!(
+				output,
+				"Resolved conflict #{id} at {}:L{start_line}-L{end_line}",
+				payload.display_path
+			)
+			.expect("writing to String cannot fail");
+		},
 		WriteOperation::SqliteInsert { table } => {
 			write!(output, "Inserted row into {table}").expect("writing to String cannot fail");
 		},

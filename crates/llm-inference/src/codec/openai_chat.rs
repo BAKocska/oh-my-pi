@@ -2301,10 +2301,7 @@ mod tests {
 	use bytes::Bytes;
 	use serde::Deserialize;
 
-	use super::{
-		OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ThinkingToolChoiceConflict,
-		ToolIdWireProfile,
-	};
+	use super::{OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ToolIdWireProfile};
 	use crate::{
 		call::{
 			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, Role, Sampling, Setting,

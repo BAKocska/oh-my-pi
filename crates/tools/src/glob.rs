@@ -316,13 +316,7 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 				return;
 			}
 
-			let request = WalkRequest {
-				path,
-				hidden: arguments.hidden,
-				gitignore: arguments.gitignore,
-				limit,
-				timeout_ms: DEFAULT_TIMEOUT_MS,
-			};
+			let request = walk_request(path, arguments.hidden, arguments.gitignore, limit);
 			let operation = async {
 				let result = self.workspace.glob(request).await?;
 				prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await
@@ -367,6 +361,10 @@ fn effective_limit(limit: Option<f64>) -> Result<u64, Fault> {
 		return Err(Fault::InvalidLimit);
 	}
 	Ok((requested.floor() as u64).clamp(1, MAX_LIMIT))
+}
+
+fn walk_request(path: Str, hidden: bool, gitignore: bool, limit: u64) -> WalkRequest {
+	WalkRequest { path, hidden, gitignore, limit, timeout_ms: DEFAULT_TIMEOUT_MS }
 }
 
 fn contains_root_target(path: &str) -> bool {
@@ -563,5 +561,83 @@ fn protocol_issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(Str::from("{\"path\":\"crates/**/*.rs\"}")),
 		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn walk_match(path: &str, modified_ms: u64, is_dir: bool) -> WalkMatch {
+		WalkMatch { path: Str::from(path), modified_ms, is_dir }
+	}
+
+	#[test]
+	fn params_default_to_visible_gitignored_walk_and_accept_toggles() {
+		let defaults: Params = serde_json::from_str("{}").unwrap();
+		assert_eq!(defaults.path, None);
+		assert!(defaults.hidden);
+		assert!(defaults.gitignore);
+		assert_eq!(defaults.limit, None);
+
+		let toggled: Params =
+			serde_json::from_str(r#"{"path":"src; tests","hidden":false,"gitignore":false}"#).unwrap();
+		assert_eq!(toggled.path.as_deref(), Some("src; tests"));
+		assert!(!toggled.hidden);
+		assert!(!toggled.gitignore);
+	}
+
+	#[test]
+	fn walk_request_preserves_multi_root_path_and_toggles() {
+		let request = walk_request(Str::from("src; tests"), false, false, 17);
+		assert_eq!(request.path, "src; tests");
+		assert!(!request.hidden);
+		assert!(!request.gitignore);
+		assert_eq!(request.limit, 17);
+		assert_eq!(request.timeout_ms, DEFAULT_TIMEOUT_MS);
+	}
+
+	#[test]
+	fn payload_is_newest_first_deduplicated_and_hard_limited() {
+		let ranked = payload(
+			WalkResult {
+				matches:       vec![
+					walk_match("src/old.rs", 10, false),
+					walk_match("src/new.rs", 30, false),
+					walk_match("docs/generated", 40, true),
+					walk_match("src/mid.rs", 20, false),
+					walk_match("src/new.rs", 1, false),
+				],
+				missing_paths: Vec::new(),
+				timed_out:     false,
+				truncated:     false,
+			},
+			3,
+			DEFAULT_TIMEOUT_MS,
+		);
+		assert_eq!(
+			ranked
+				.matches
+				.iter()
+				.map(|entry| entry.path.as_str())
+				.collect::<Vec<_>>(),
+			["docs/generated/", "src/new.rs", "src/mid.rs"]
+		);
+		assert_eq!(ranked.partial_match_count, 4);
+		assert_eq!(ranked.result_limit_reached, Some(3));
+		assert!(ranked.truncated);
+		assert_eq!(
+			render_payload(&ranked),
+			["# docs/generated/", "# src/", "new.rs", "mid.rs"].join("\n")
+		);
+	}
+
+	#[test]
+	fn limit_is_positive_floored_and_capped() {
+		assert_eq!(effective_limit(None), Ok(DEFAULT_LIMIT));
+		assert_eq!(effective_limit(Some(3.9)), Ok(3));
+		assert_eq!(effective_limit(Some(10_000.0)), Ok(MAX_LIMIT));
+		assert_eq!(effective_limit(Some(0.0)), Err(Fault::InvalidLimit));
+		assert_eq!(effective_limit(Some(f64::NAN)), Err(Fault::InvalidLimit));
 	}
 }

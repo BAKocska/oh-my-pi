@@ -53,6 +53,7 @@ where
 			request.context.set_attempt_action(AttemptAction::Initial);
 			loop {
 				request.context.clear_body_evidence();
+				let attempted_action = request.context.attempt_action();
 				let result = service.call(request.clone()).await;
 				let mut error = match result {
 					Ok(response) => return Ok(response),
@@ -76,8 +77,18 @@ where
 					.last()
 					.and_then(|attempt| attempt.account.clone());
 				let action = match &error.action {
-					RetryAction::RefreshCredential => {
-						AttemptAction::RefreshCredential { previous_account }
+					RetryAction::RefreshCredential => match attempted_action {
+						AttemptAction::Initial => AttemptAction::RefreshCredential { previous_account },
+						AttemptAction::RefreshCredential { previous_account: refreshed_account } => {
+							AttemptAction::RotateAccount {
+								previous_account: previous_account.or(refreshed_account),
+							}
+						},
+						AttemptAction::RotateAccount { .. } => {
+							error.action = RetryAction::Never;
+							request.context.finalize_error(&mut error);
+							return Err(error);
+						},
 					},
 					RetryAction::RotateAccount => AttemptAction::RotateAccount { previous_account },
 					RetryAction::SameRoute { .. }
@@ -209,7 +220,8 @@ mod tests {
 
 	#[derive(Clone)]
 	struct RefreshTwice {
-		calls: Arc<AtomicUsize>,
+		calls:   Arc<AtomicUsize>,
+		actions: Arc<Mutex<Vec<AttemptAction>>>,
 	}
 	impl Service<LayerCall<()>> for RefreshTwice {
 		type Error = Error;
@@ -220,7 +232,8 @@ mod tests {
 			Poll::Ready(Ok(()))
 		}
 
-		fn call(&mut self, _: LayerCall<()>) -> Self::Future {
+		fn call(&mut self, request: LayerCall<()>) -> Self::Future {
+			self.actions.lock().push(request.context.attempt_action());
 			let index = self.calls.fetch_add(1, Ordering::SeqCst) as u32;
 			let mut receipt = ExecutionReceipt::default();
 			receipt.record_attempt(AttemptReceipt {
@@ -255,9 +268,10 @@ mod tests {
 	#[tokio::test]
 	async fn fail_then_fail_merges_attempts_and_charges_once() {
 		let calls = Arc::new(AtomicUsize::new(0));
+		let actions = Arc::new(Mutex::new(Vec::new()));
 		let context =
 			ExecutionContext::new(ExecutionBudget { max_attempts: 2, ..ExecutionBudget::default() });
-		let mut service = AttemptService { inner: RefreshTwice { calls: calls.clone() } };
+		let mut service = AttemptService { inner: RefreshTwice { calls: calls.clone(), actions } };
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await
 			.unwrap();
@@ -277,5 +291,28 @@ mod tests {
 		);
 		assert_eq!(error.receipt().usage.input_tokens, 2);
 		assert_eq!(error.receipt().cost.micro_usd, 2);
+	}
+
+	#[tokio::test]
+	async fn persistent_401_refreshes_same_account_then_rotates_a_sibling() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let actions = Arc::new(Mutex::new(Vec::new()));
+		let context =
+			ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() });
+		let mut service =
+			AttemptService { inner: RefreshTwice { calls: calls.clone(), actions: actions.clone() } };
+		futures::future::poll_fn(|cx| service.poll_ready(cx))
+			.await
+			.expect("ready");
+		service
+			.call(LayerCall { payload: (), context })
+			.await
+			.expect_err("persistent rejection");
+		assert_eq!(calls.load(Ordering::SeqCst), 3);
+		assert_eq!(actions.lock().as_slice(), [
+			AttemptAction::Initial,
+			AttemptAction::RefreshCredential { previous_account: Some(AccountId::from("account")) },
+			AttemptAction::RotateAccount { previous_account: Some(AccountId::from("account")) },
+		]);
 	}
 }

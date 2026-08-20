@@ -2,6 +2,7 @@ mod boxed;
 mod button;
 mod callout;
 mod col;
+mod countdown;
 mod custom;
 mod diff;
 mod editor;
@@ -39,6 +40,7 @@ pub use boxed::Boxed;
 pub use button::Button;
 pub use callout::Callout;
 pub use col::Col;
+pub use countdown::Countdown;
 pub use custom::CustomElement;
 pub use diff::{DiffKind, DiffLine, DiffView};
 pub use editor::{

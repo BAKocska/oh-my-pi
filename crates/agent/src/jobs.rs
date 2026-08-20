@@ -1,16 +1,19 @@
 //! Detached-job registration and authoritative settlement delivery.
 
 use std::{
-	collections::{BTreeMap, btree_map::Entry},
-	sync::Arc,
+	collections::{BTreeMap, BTreeSet, btree_map::Entry},
+	sync::{Arc, Weak},
 };
 
 use bytes::Bytes;
-use omp_core::{Str, fmts};
+use omp_core::{Duration, Str, fmts};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
 use omp_proto::{
 	blob::v1::Chunk,
-	env::v1::{AttachOutput, ExecStatusMsg, ProcessInfo, ProcessOutput, ProcessState},
+	env::v1::{
+		AttachOutput, ExecStatusMsg, ListProcesses, ProcessInfo, ProcessOutput, ProcessState,
+		StopProcess,
+	},
 	thread::v1 as thread,
 };
 use omp_tool::{ArtifactLifetime, JobOwner, JobRef};
@@ -33,10 +36,19 @@ pub struct JobBoard {
 }
 
 struct JobBoardInner {
-	env:      EnvClient,
-	mailbox:  MailboxSender,
-	pending:  Mutex<BTreeMap<Str, JobRef>>,
-	watchers: Mutex<BTreeMap<Str, AbortHandle>>,
+	env:        EnvClient,
+	mailbox:    MailboxSender,
+	pending:    Mutex<BTreeMap<Str, JobEntry>>,
+	watchers:   Mutex<BTreeMap<Str, AbortHandle>>,
+	settled:    Mutex<BTreeSet<Str>>,
+	generation: tokio::sync::watch::Sender<u64>,
+}
+
+struct JobEntry {
+	job:          JobRef,
+	settlement:   Option<thread::Item>,
+	suppressions: usize,
+	leased:       bool,
 }
 
 impl Drop for JobBoardInner {
@@ -56,6 +68,8 @@ impl JobBoard {
 				mailbox,
 				pending: Mutex::new(BTreeMap::new()),
 				watchers: Mutex::new(BTreeMap::new()),
+				settled: Mutex::new(BTreeSet::new()),
+				generation: tokio::sync::watch::channel(0).0,
 			}),
 		}
 	}
@@ -69,7 +83,12 @@ impl JobBoard {
 		let mut pending = self.inner.pending.lock();
 		match pending.entry(job.id.clone()) {
 			Entry::Vacant(entry) => {
-				entry.insert(job.clone());
+				entry.insert(JobEntry {
+					job:          job.clone(),
+					settlement:   None,
+					suppressions: 0,
+					leased:       false,
+				});
 			},
 			Entry::Occupied(_) => return false,
 		}
@@ -84,7 +103,7 @@ impl JobBoard {
 				Err(reason) => settlement_error_item(&job, &reason),
 			};
 			if let Some(inner) = weak.upgrade() {
-				let _ = inner.deliver(&id, item);
+				let _ = inner.complete(&id, item);
 				inner.watchers.lock().remove(&id);
 			}
 		})
@@ -104,11 +123,100 @@ impl JobBoard {
 		job_id: &str,
 		item: thread::Item,
 	) -> Result<bool, Box<flume::TrySendError<Interrupt>>> {
-		let delivered = self.inner.deliver(job_id, item)?;
-		if delivered && let Some(watcher) = self.inner.watchers.lock().remove(job_id) {
+		let accepted = self.inner.complete(job_id, item)?;
+		if accepted && let Some(watcher) = self.inner.watchers.lock().remove(job_id) {
 			watcher.abort();
 		}
-		Ok(delivered)
+		Ok(accepted)
+	}
+
+	/// Copies pending descriptors in stable job-identifier order.
+	#[must_use]
+	pub fn snapshot(&self) -> Vec<JobRef> {
+		self
+			.inner
+			.pending
+			.lock()
+			.values()
+			.map(|entry| entry.job.clone())
+			.collect()
+	}
+
+	/// Suppresses automatic delivery for selected jobs until a settlement is
+	/// claimed or the returned watch is dropped.
+	#[must_use]
+	pub fn watch(&self, ids: Option<&[Str]>) -> JobWatch {
+		let mut pending = self.inner.pending.lock();
+		let selected = match ids {
+			Some(ids) => ids
+				.iter()
+				.filter(|id| pending.contains_key(id.as_str()))
+				.cloned()
+				.collect::<BTreeSet<_>>(),
+			None => pending.keys().cloned().collect(),
+		};
+		for id in &selected {
+			if let Some(entry) = pending.get_mut(id) {
+				entry.suppressions = entry.suppressions.saturating_add(1);
+			}
+		}
+		drop(pending);
+		JobWatch {
+			inner:      Arc::clone(&self.inner),
+			ids:        selected,
+			generation: self.inner.generation.subscribe(),
+		}
+	}
+
+	/// Stops the verified named process that owns a pending job.
+	pub async fn cancel(&self, id: &str, grace: Duration) -> Result<CancelOutcome, JobError> {
+		let job = {
+			let pending = self.inner.pending.lock();
+			let Some(entry) = pending.get(id) else {
+				return Ok(if self.inner.settled.lock().contains(id) {
+					CancelOutcome::AlreadySettled
+				} else {
+					CancelOutcome::Missing
+				});
+			};
+			if entry.settlement.is_some() {
+				return Ok(CancelOutcome::AlreadySettled);
+			}
+			entry.job.clone()
+		};
+		let JobOwner::NamedProcess { name, generation } = &job.owner;
+		let processes = self
+			.inner
+			.env
+			.list_processes(ListProcesses { props: None })
+			.await
+			.map_err(|error| JobError::Environment(Str::from(error.to_string())))?;
+		let Some(process) = processes
+			.processes
+			.iter()
+			.find(|process| process.name == name.as_str() && process.generation == *generation)
+		else {
+			return Ok(CancelOutcome::AlreadySettled);
+		};
+		if matches!(
+			ProcessState::try_from(process.state),
+			Ok(ProcessState::Exited | ProcessState::Stopped | ProcessState::Failed)
+		) {
+			return Ok(CancelOutcome::AlreadySettled);
+		}
+		let grace_ms = grace
+			.to_std()
+			.map_err(|error| JobError::InvalidGrace(Str::from(error.to_string())))?
+			.as_millis()
+			.try_into()
+			.unwrap_or(u64::MAX);
+		self
+			.inner
+			.env
+			.stop_process(StopProcess { name: name.to_string(), grace_ms, props: None })
+			.await
+			.map_err(|error| JobError::Environment(Str::from(error.to_string())))?;
+		Ok(CancelOutcome::Accepted)
 	}
 
 	/// Borrows pending jobs in stable identifier order without allocating.
@@ -128,34 +236,102 @@ impl JobBoard {
 }
 
 impl JobBoardInner {
-	fn deliver(
+	fn complete(
 		&self,
 		job_id: &str,
 		item: thread::Item,
 	) -> Result<bool, Box<flume::TrySendError<Interrupt>>> {
 		let mut pending = self.pending.lock();
-		let Some(job) = pending.get(job_id) else {
+		let Some(entry) = pending.get_mut(job_id) else {
 			return Ok(false);
 		};
+		if entry.settlement.is_some() {
+			return Ok(false);
+		}
+		entry.settlement = Some(item);
+		self.flush_locked(job_id, &mut pending)?;
+		self.bump();
+		Ok(true)
+	}
+
+	fn flush_locked(
+		&self,
+		job_id: &str,
+		pending: &mut BTreeMap<Str, JobEntry>,
+	) -> Result<(), Box<flume::TrySendError<Interrupt>>> {
+		let Some(entry) = pending.get(job_id) else {
+			return Ok(());
+		};
+		if entry.suppressions != 0 || entry.leased {
+			return Ok(());
+		}
+		let Some(item) = entry.settlement.clone() else {
+			return Ok(());
+		};
+		let id = entry.job.id.clone();
 		self.mailbox.try_enqueue(Interrupt {
 			class: InterruptClass::TurnBoundary,
 			item,
-			source: InterruptSource::Job { id: job.id.clone() },
+			source: InterruptSource::Job { id: id.clone() },
 		})?;
 		pending.remove(job_id);
-		Ok(true)
+		self.settled.lock().insert(id);
+		Ok(())
+	}
+
+	fn claim(&self, job_id: &str) -> Result<(), JobClaimError> {
+		let mut pending = self.pending.lock();
+		let Some(entry) = pending.get(job_id) else {
+			return Err(JobClaimError::AlreadyConsumed);
+		};
+		if !entry.leased || entry.settlement.is_none() {
+			return Err(JobClaimError::AlreadyConsumed);
+		}
+		let id = entry.job.id.clone();
+		pending.remove(job_id);
+		self.settled.lock().insert(id);
+		drop(pending);
+		self.bump();
+		Ok(())
+	}
+
+	fn release_lease(&self, job_id: &str) {
+		let mut pending = self.pending.lock();
+		if let Some(entry) = pending.get_mut(job_id) {
+			entry.leased = false;
+		}
+		let _ = self.flush_locked(job_id, &mut pending);
+		drop(pending);
+		self.bump();
+	}
+
+	fn release_watch(&self, ids: &BTreeSet<Str>) {
+		let mut pending = self.pending.lock();
+		for id in ids {
+			if let Some(entry) = pending.get_mut(id) {
+				entry.suppressions = entry.suppressions.saturating_sub(1);
+			}
+			let _ = self.flush_locked(id, &mut pending);
+		}
+		drop(pending);
+		self.bump();
+	}
+
+	fn bump(&self) {
+		let next = (*self.generation.borrow()).wrapping_add(1);
+		self.generation.send_replace(next);
 	}
 }
 
 /// Locked, allocation-free view of jobs awaiting settlement.
 pub struct PendingJobs<'a> {
-	guard: MutexGuard<'a, BTreeMap<Str, JobRef>>,
+	guard: MutexGuard<'a, BTreeMap<Str, JobEntry>>,
 }
 
 impl PendingJobs<'_> {
 	/// Iterates descriptors in stable job-identifier order.
 	pub fn iter(&self) -> impl DoubleEndedIterator<Item = &JobRef> + ExactSizeIterator + Clone + '_ {
-		self.guard.values()
+		self.guard.values().map(|entry| &entry.job)
 	}
 
 	/// Returns the number of jobs in this view.
@@ -166,6 +342,133 @@ impl PendingJobs<'_> {
 	/// Returns whether this view contains no jobs.
 	pub fn is_empty(&self) -> bool {
 		self.guard.is_empty()
+	}
+}
+
+/// Result of requesting cancellation for a detached job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelOutcome {
+	/// No pending or settled job has this identifier.
+	Missing,
+	/// The job has already produced a terminal settlement.
+	AlreadySettled,
+	/// The authoritative environment accepted the stop request.
+	Accepted,
+}
+
+/// Failure to inspect or stop a detached job.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum JobError {
+	/// The configured courtesy grace cannot be represented by the runtime.
+	#[error("invalid job cancellation grace: {0}")]
+	InvalidGrace(Str),
+	/// The environment rejected a process operation.
+	#[error("job process operation failed: {0}")]
+	Environment(Str),
+}
+
+/// Failure to atomically consume a watched settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum JobClaimError {
+	/// Another consumer already delivered or claimed the settlement.
+	#[error("job settlement was already consumed")]
+	AlreadyConsumed,
+}
+
+/// One watched terminal settlement and its exclusive delivery lease.
+pub struct JobSettlement {
+	/// Stable detached-job descriptor.
+	pub job:   JobRef,
+	/// Canonical thread item produced by the settlement watcher.
+	pub item:  thread::Item,
+	/// Lease controlling whether normal mailbox delivery resumes.
+	pub lease: SettlementLease,
+}
+
+/// Exclusive claim on one settlement held outside the board lock.
+pub struct SettlementLease {
+	inner:   Weak<JobBoardInner>,
+	job_id:  Str,
+	claimed: bool,
+}
+
+impl SettlementLease {
+	/// Atomically consumes the settlement without mailbox auto-delivery.
+	pub fn claim(mut self) -> Result<(), JobClaimError> {
+		let inner = self.inner.upgrade().ok_or(JobClaimError::AlreadyConsumed)?;
+		inner.claim(self.job_id.as_str())?;
+		self.claimed = true;
+		Ok(())
+	}
+}
+
+impl Drop for SettlementLease {
+	fn drop(&mut self) {
+		if !self.claimed
+			&& let Some(inner) = self.inner.upgrade()
+		{
+			inner.release_lease(self.job_id.as_str());
+		}
+	}
+}
+
+/// Settlement subscription which temporarily suppresses normal delivery.
+pub struct JobWatch {
+	inner:      Arc<JobBoardInner>,
+	ids:        BTreeSet<Str>,
+	generation: tokio::sync::watch::Receiver<u64>,
+}
+
+impl JobWatch {
+	/// Returns whether no selected pending job remains.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.ids.is_empty()
+	}
+
+	/// Waits for the next selected settlement, retaining unrelated jobs.
+	pub async fn next(&mut self) -> Option<JobSettlement> {
+		loop {
+			let selected = {
+				let mut pending = self.inner.pending.lock();
+				let id = self.ids.iter().find_map(|id| {
+					pending
+						.get(id)
+						.filter(|entry| entry.settlement.is_some() && !entry.leased)
+						.map(|_| id.clone())
+				});
+				id.and_then(|id| {
+					let entry = pending.get_mut(&id)?;
+					entry.leased = true;
+					entry.suppressions = entry.suppressions.saturating_sub(1);
+					Some((id, entry.job.clone(), entry.settlement.clone()?))
+				})
+			};
+			if let Some((id, job, item)) = selected {
+				self.ids.remove(&id);
+				return Some(JobSettlement {
+					job,
+					item,
+					lease: SettlementLease {
+						inner:   Arc::downgrade(&self.inner),
+						job_id:  id,
+						claimed: false,
+					},
+				});
+			}
+			self
+				.ids
+				.retain(|id| self.inner.pending.lock().contains_key(id));
+			if self.ids.is_empty() || self.generation.changed().await.is_err() {
+				return None;
+			}
+		}
+	}
+}
+
+impl Drop for JobWatch {
+	fn drop(&mut self) {
+		self.inner.release_watch(&self.ids);
 	}
 }
 
@@ -481,5 +784,54 @@ mod tests {
 		assert_eq!(interrupts[0].source, InterruptSource::Job { id: Str::from("job-1") });
 		assert!(!board.settle("job-1", thread::Item::default()).unwrap());
 		assert!(mailbox.is_empty());
+	}
+}
+
+#[cfg(test)]
+mod watch_tests {
+	use omp_tool::{ArtifactLifetime, ExpectedArtifact};
+
+	use super::*;
+	use crate::mailbox::Mailbox;
+
+	fn watched_job(id: &str) -> JobRef {
+		JobRef {
+			id:       Str::from(id),
+			owner:    JobOwner::NamedProcess { name: Str::from(id), generation: 1 },
+			artifact: ExpectedArtifact {
+				description: Str::from("detached output"),
+				media_type:  None,
+				lifetime:    ArtifactLifetime::Session,
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn claimed_watch_settlement_suppresses_mailbox_delivery() {
+		let mailbox = Mailbox::new();
+		let (env, _transport) = EnvClient::in_process(0);
+		let board = JobBoard::new(env, mailbox.sender());
+		assert!(board.register(watched_job("claimed")));
+		let mut watch = board.watch(None);
+		assert!(board.settle("claimed", thread::Item::default()).unwrap());
+		assert!(mailbox.is_empty());
+		let settlement = watch.next().await.expect("watched settlement");
+		settlement.lease.claim().expect("exclusive claim");
+		assert!(board.is_empty());
+		assert!(mailbox.is_empty());
+	}
+
+	#[tokio::test]
+	async fn dropping_watch_resumes_normal_delivery() {
+		let mailbox = Mailbox::new();
+		let (env, _transport) = EnvClient::in_process(0);
+		let board = JobBoard::new(env, mailbox.sender());
+		assert!(board.register(watched_job("released")));
+		let watch = board.watch(None);
+		assert!(board.settle("released", thread::Item::default()).unwrap());
+		assert!(mailbox.is_empty());
+		drop(watch);
+		assert_eq!(mailbox.len(), 1);
+		assert!(board.is_empty());
 	}
 }

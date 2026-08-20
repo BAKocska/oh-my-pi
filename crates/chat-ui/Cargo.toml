@@ -17,6 +17,8 @@ arc-swap = { workspace = true }
 flume = { workspace = true }
 omp-core = { workspace = true }
 omp-tui = { workspace = true }
+omp-tools = { workspace = true }
+parking_lot = { workspace = true }
 omp-proto = { workspace = true }
 smallvec = { workspace = true }
 serde_json = { workspace = true }

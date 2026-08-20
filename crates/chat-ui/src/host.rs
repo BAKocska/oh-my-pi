@@ -16,6 +16,7 @@ use crate::{
 	BackendEvent, Chat, ChatKey, CommandPalette, Intent, ListPicker, ListRow, ModelPicker, ModelRow,
 	PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, PromptEvent, PromptOverlay,
 	ProviderPicker, RenderedFrame, RewindTargetRow, SessionRow, Sidebar, Welcome, WelcomeEvent,
+	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -317,11 +318,12 @@ fn rail_layers(sidebar: &mut Sidebar, viewport: Size) -> SmallVec<Layer<'_>, 2> 
 		.into_iter()
 		.collect()
 }
-
-#[derive(Clone, Copy)]
 enum ListPurpose {
 	Resume,
 	Rewind,
+	Settings,
+	Agents,
+	Pause,
 }
 
 enum Overlay {
@@ -330,6 +332,7 @@ enum Overlay {
 	List { picker: ListPicker, rows: Vec<ListRow>, prefill: Vec<Str>, purpose: ListPurpose },
 	Providers(ProviderPicker),
 	Prompt(PromptOverlay),
+	Ask { dialog: AskDialog, request: AskRequest },
 }
 
 enum OverlayEvent {
@@ -339,6 +342,8 @@ enum OverlayEvent {
 	Palette(PaletteAction),
 	PromptCancel,
 	Prompt(Str),
+	AskCancel,
+	AskSubmit(Vec<Str>),
 }
 
 impl Overlay {
@@ -349,6 +354,7 @@ impl Overlay {
 			Self::List { picker, .. } => picker_event(picker.handle_key(key)),
 			Self::Providers(picker) => picker_event(picker.handle_key(key)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_key(key)),
+			Self::Ask { dialog, .. } => ask_event(dialog.handle_key(key)),
 		}
 	}
 
@@ -359,6 +365,7 @@ impl Overlay {
 			Self::List { picker, .. } => picker_event(picker.handle_paste(text)),
 			Self::Providers(picker) => picker_event(picker.handle_paste(text)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_paste(text)),
+			Self::Ask { dialog, .. } => ask_event(dialog.handle_paste(text)),
 		}
 	}
 
@@ -369,6 +376,7 @@ impl Overlay {
 			Self::List { picker, .. } => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Providers(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_mouse(col, row, kind, viewport)),
+			Self::Ask { dialog, .. } => ask_event(dialog.handle_mouse(col, row, kind, viewport)),
 		}
 	}
 
@@ -379,6 +387,7 @@ impl Overlay {
 			Self::List { picker, .. } => picker.layer(viewport),
 			Self::Providers(picker) => picker.layer(viewport),
 			Self::Prompt(prompt) => prompt.layer(viewport),
+			Self::Ask { dialog, .. } => dialog.layer(viewport),
 		}
 	}
 }
@@ -404,6 +413,14 @@ fn prompt_event(event: PromptEvent) -> OverlayEvent {
 		PromptEvent::Consumed => OverlayEvent::Consumed,
 		PromptEvent::Cancel => OverlayEvent::PromptCancel,
 		PromptEvent::Submit(value) => OverlayEvent::Prompt(value),
+	}
+}
+
+fn ask_event(event: AskDialogEvent) -> OverlayEvent {
+	match event {
+		AskDialogEvent::Consumed => OverlayEvent::Consumed,
+		AskDialogEvent::Cancel => OverlayEvent::AskCancel,
+		AskDialogEvent::Submit(values) => OverlayEvent::AskSubmit(values),
 	}
 }
 
@@ -449,6 +466,7 @@ async fn run_chat(
 	exit_on_session_change: bool,
 ) -> io::Result<HostExit> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model);
+	let ask_binding = ask::bind();
 	{
 		let rendered = host.chat.render(viewport);
 		let layers = rail_layers(&mut host.sidebar, viewport);
@@ -509,6 +527,17 @@ async fn run_chat(
 									break;
 								}
 								host.sidebar.handle_key(key);
+							} else if key == Key::Alt('a') || key == Key::Ctrl('s') {
+								open_agents(&mut host, ctx);
+								open_overlay(
+									terminal,
+									renderer,
+									&mut host,
+									viewport,
+									&mut drag_alt,
+									&mut overlay_stale,
+									&mut resize,
+								)?;
 							} else if key == Key::Ctrl('p') || key == Key::Alt('p') {
 								host.open_models(ctx);
 								if host.overlay.is_some() {
@@ -531,7 +560,7 @@ async fn run_chat(
 								host.last_esc = None;
 								let result = host.chat.handle_key(key);
 								if let Some(text) = host.chat.take_copied() { terminal.copy_to_clipboard(&text)?; }
-								if let Some((text, attachments, mode)) = host.chat.take_submission() {
+								while let Some((text, attachments, mode)) = host.chat.take_submission() {
 									send(intents, Intent::Submit { text, attachments, mode });
 								}
 								if result == ChatKey::Quit {
@@ -587,7 +616,30 @@ async fn run_chat(
 					}
 				},
 			},
+			request = ask_binding.recv() => {
+				if let Ok(request) = request {
+					if host.overlay.is_some() {
+						request.fail("another modal dialog is already active");
+					} else {
+						let dialog = AskDialog::open(request.question.clone(), ctx);
+						host.overlay = Some(Overlay::Ask { dialog, request });
+						open_overlay(
+							terminal,
+							renderer,
+							&mut host,
+							viewport,
+							&mut drag_alt,
+							&mut overlay_stale,
+							&mut resize,
+						)?;
+						next_frame = Instant::now();
+					}
+				}
+			},
 			backend = events.recv_async() => match backend {
+				Ok(BackendEvent::NewSessionRequested) if exit_on_session_change => {
+					return Ok(HostExit::NewSession);
+				},
 				Ok(event) => {
 					let had_overlay = host.overlay.is_some();
 					apply_backend(&mut host, event, ctx);
@@ -690,6 +742,11 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 		BackendEvent::Sessions(rows) => open_sessions(host, rows, ctx),
 		BackendEvent::LoginProviders(rows) => open_login_providers(host, rows, ctx),
 		BackendEvent::RewindTargets(rows) => open_rewind(host, rows, ctx),
+		BackendEvent::AgentRoster(rows) => host.chat.set_agent_roster(rows),
+		BackendEvent::OpenSettings => open_settings(host, ctx),
+		BackendEvent::OpenAgentTree => open_agents(host, ctx),
+		BackendEvent::Pause => open_pause(host, ctx),
+		BackendEvent::NewSessionRequested => {},
 		BackendEvent::AuthPrompt { message, masked } => {
 			host.overlay = Some(Overlay::Prompt(PromptOverlay::open(message, masked, ctx)));
 		},
@@ -734,6 +791,77 @@ fn open_sessions(host: &mut ChatHost, sessions: Vec<SessionRow>, ctx: &UiContext
 
 fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &UiContext) {
 	host.overlay = Some(Overlay::Providers(ProviderPicker::open(providers, ctx)));
+}
+
+fn open_settings(host: &mut ChatHost, ctx: &UiContext) {
+	let rows = vec![
+		ListRow {
+			key:    Str::new_static("appearance"),
+			label:  Str::new_static("Appearance"),
+			detail: Str::new_static("Theme and glyph presentation"),
+		},
+		ListRow {
+			key:    Str::new_static("model"),
+			label:  Str::new_static("Model"),
+			detail: Str::new_static("Model and provider selection"),
+		},
+		ListRow {
+			key:    Str::new_static("interaction"),
+			label:  Str::new_static("Interaction"),
+			detail: Str::new_static("Queue, steering, and hotkeys"),
+		},
+		ListRow {
+			key:    Str::new_static("tools"),
+			label:  Str::new_static("Tools"),
+			detail: Str::new_static("Tool visibility and behavior"),
+		},
+		ListRow {
+			key:    Str::new_static("tasks"),
+			label:  Str::new_static("Tasks"),
+			detail: Str::new_static("Agent and background-job settings"),
+		},
+	];
+	let picker = ListPicker::open("Settings", &rows, 0, ctx);
+	host.overlay =
+		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Settings });
+}
+
+fn open_agents(host: &mut ChatHost, ctx: &UiContext) {
+	let rows: Vec<ListRow> = host
+		.chat
+		.agent_roster()
+		.iter()
+		.map(|agent| {
+			let indent = "  ".repeat(usize::from(agent.depth));
+			let detail = match (&agent.tool, agent.tokens) {
+				(Some(tool), Some(tokens)) => {
+					Str::from(format!("{} · {tool} · {tokens} tokens", agent.status))
+				},
+				(Some(tool), None) => Str::from(format!("{} · {tool}", agent.status)),
+				(None, Some(tokens)) => Str::from(format!("{} · {tokens} tokens", agent.status)),
+				(None, None) => agent.status.clone(),
+			};
+			ListRow {
+				key: agent.id.clone(),
+				label: Str::from(format!("{indent}{}", agent.name)),
+				detail,
+			}
+		})
+		.collect();
+	let picker = ListPicker::open("Agents · live hierarchy", &rows, 0, ctx);
+	host.overlay =
+		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Agents });
+}
+
+fn open_pause(host: &mut ChatHost, ctx: &UiContext) {
+	let rows = vec![ListRow {
+		key:    Str::new_static("resume"),
+		label:  Str::new_static("Resume"),
+		detail: Str::new_static("Press Enter or Esc to return to the session"),
+	}];
+	let picker = ListPicker::open("Paused", &rows, 0, ctx);
+	host.overlay =
+		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Pause });
 }
 
 fn open_rewind(host: &mut ChatHost, targets: Vec<RewindTargetRow>, ctx: &UiContext) {
@@ -791,6 +919,7 @@ fn apply_overlay_event(
 								send(intents, Intent::Rewind { event });
 							}
 						},
+						ListPurpose::Settings | ListPurpose::Agents | ListPurpose::Pause => {},
 					}
 				}
 				host.overlay = None;
@@ -837,6 +966,17 @@ fn apply_overlay_event(
 		OverlayEvent::PromptCancel => {
 			send(intents, Intent::AuthCancel);
 			host.overlay = None;
+		},
+		OverlayEvent::AskSubmit(values) => {
+			if let Some(Overlay::Ask { request, .. }) = host.overlay.take() {
+				let id = request.question.id.clone();
+				request.answer(omp_tools::ask::Answer { id, selected: values, timed_out: false });
+			}
+		},
+		OverlayEvent::AskCancel => {
+			if let Some(Overlay::Ask { request, .. }) = host.overlay.take() {
+				request.fail("Ask dialog cancelled");
+			}
 		},
 	}
 	None

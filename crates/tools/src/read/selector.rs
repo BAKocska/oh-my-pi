@@ -553,13 +553,14 @@ pub fn parse_uri(input: &str) -> Result<Option<ParsedUri<'_>>, SelectorError> {
 	let split = split_uri_selector(input, raw_scheme, scheme);
 	let resource_start = raw_scheme.len() + 3;
 	let resource = &split.path[resource_start..];
-	if resource.is_empty()
+	if (resource.is_empty() && scheme != Scheme::History)
 		|| resource
 			.bytes()
 			.any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
 	{
 		return Err(SelectorError::from_message(format!(
-			"Invalid URL '{input}': resource must be non-empty and contain no whitespace."
+			"Invalid URL '{input}': resource must contain no whitespace and may be empty only for \
+			 history://."
 		)));
 	}
 	let selector = parse_selector(split.selector)?;
@@ -752,6 +753,14 @@ mod tests {
 		assert_eq!(mcp.scheme, Scheme::Mcp);
 		assert_eq!(mcp.resource, "server/resource:50");
 		assert_eq!(mcp.selector, ParsedSelector::None);
+
+		let conflict = parse_uri("conflict://17/ours:raw").unwrap().unwrap();
+		assert_eq!(conflict.scheme, Scheme::Conflict);
+		assert_eq!(conflict.resource, "17/ours");
+		assert_eq!(conflict.selector, ParsedSelector::Raw);
+		let history = parse_uri("history://").unwrap().unwrap();
+		assert_eq!(history.scheme, Scheme::History);
+		assert_eq!(history.resource, "");
 	}
 
 	#[test]

@@ -17,8 +17,10 @@ use omp_tools::{
 	BuiltinRendererIdentities,
 	device::{DeviceCatalog, dyn_enabled, dyn_tool, flatten_slots},
 	edit::{EditRevisionCandidates, FormatPolicy, resolve_edit_revision},
+	read::conflicts::ConflictRegistry,
 	register_builtin_renderers,
 };
+use parking_lot::RwLock;
 
 use super::{
 	EnvdError,
@@ -29,6 +31,7 @@ use super::{
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
 	tool_shell::ShellExecHost,
+	tool_url::production_url_resolvers,
 	worker::ExtHostSupervisor,
 	workspace::WorkspaceHost,
 };
@@ -51,16 +54,52 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	device_invoker: I,
 	policy: ToolsPolicy,
 	mut registry: Registry,
-) -> Result<(Arc<Registry>, Arc<SessionBridgeHost>, omp_tools::eval::EvalSessionControl), EnvdError>
-{
-	for name in ["read", "edit", "shell", "grep", "glob", "write", "eval", "todo", "ask", "dyn"] {
+) -> Result<
+	(
+		Arc<Registry>,
+		Arc<SessionBridgeHost>,
+		omp_tools::eval::EvalSessionControl,
+		AgentCheckpointControl,
+	),
+	EnvdError,
+> {
+	for name in [
+		"read",
+		"edit",
+		"shell",
+		"grep",
+		"glob",
+		"write",
+		"eval",
+		"todo",
+		"ask",
+		"fetch",
+		"think",
+		"yield",
+		"checkpoint",
+		"rewind",
+		"hub",
+		"dyn",
+	] {
 		ensure_name_absent(&registry, name)?;
 	}
+	let checkpoint_control = AgentCheckpointControl::default();
 	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
-	let read = omp_tools::read::tool(read_sources, blobs.clone());
+	let conflicts = Arc::new(ConflictRegistry::default());
+	let resolvers = production_url_resolvers(Arc::clone(&conflicts));
+	let read = omp_tools::read::tool_with_resolvers_and_conflicts(
+		read_sources.clone(),
+		blobs.clone(),
+		resolvers,
+		Arc::clone(&conflicts),
+	);
 	let read_identity = read.spec().identity();
 	if tool_settings.enabled("read") {
 		registry.register(read, Presentation::Slot, core_claims())?;
+	}
+	let fetch = omp_tools::fetch::tool(read_sources);
+	if tool_settings.enabled("fetch") {
+		registry.register(fetch, Presentation::Slot, core_claims())?;
 	}
 	let edit_pin = tool_settings
 		.edit_dialect
@@ -94,7 +133,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 			registry.register(edit, Presentation::Slot, core_claims())?;
 		}
 	}
-	let write = omp_tools::write::tool(documents.clone());
+	let write = omp_tools::write::tool_with_conflicts(documents.clone(), conflicts);
 	let write_identity = write.spec().identity();
 	if tool_settings.enabled("write") {
 		registry.register(write, Presentation::Slot, core_claims())?;
@@ -119,8 +158,9 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		registry.register(glob, Presentation::Slot, core_claims())?;
 	}
 	let eval_host = Arc::new(SessionBridgeHost::new());
-	let eval_exec = ProcessEvalExec::production(Arc::clone(&eval_host), interrupt_grace)
-		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
+	let eval_exec =
+		ProcessEvalExec::production(Arc::clone(&eval_host), interrupt_grace, blobs.clone())
+			.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
 	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
 	let eval_identity = eval_tool.spec().identity();
 	if tool_settings.enabled("eval") {
@@ -130,7 +170,27 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		registry.register(omp_tools::todo::tool(), Presentation::Slot, core_claims())?;
 	}
 	if tool_settings.enabled("ask") {
-		registry.register(omp_tools::ask::headless_tool(), Presentation::Slot, core_claims())?;
+		registry.register(
+			omp_tools::ask::tool(omp_chat_ui::ask::presenter()),
+			Presentation::Slot,
+			core_claims(),
+		)?;
+	}
+	if tool_settings.enabled("think") {
+		registry.register(omp_tools::think::tool(), Presentation::Slot, core_claims())?;
+	}
+	if tool_settings.enabled("hub") {
+		registry.register(crate::chat::chat_hub_tool(), Presentation::Slot, core_claims())?;
+	}
+	if tool_settings.enabled("yield") {
+		registry.register(omp_tools::yield_tool::tool(), Presentation::Slot, core_claims())?;
+	}
+	let (checkpoint, rewind) = omp_tools::checkpoint::tools(checkpoint_control.clone());
+	if tool_settings.enabled("checkpoint") {
+		registry.register(checkpoint, Presentation::Slot, core_claims())?;
+	}
+	if tool_settings.enabled("rewind") {
+		registry.register(rewind, Presentation::Slot, core_claims())?;
 	}
 	let catalog = DeviceCatalog::default();
 	if tool_settings.enabled("dyn") && dyn_enabled(policy) {
@@ -140,21 +200,16 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 			core_claims(),
 		)?;
 	}
-	if ["read", "edit", "shell", "grep", "glob", "write", "eval"]
-		.into_iter()
-		.all(|name| tool_settings.enabled(name))
-	{
-		register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
-			edit:  edit_identity,
-			grep:  grep_identity,
-			glob:  glob_identity,
-			shell: shell_identity,
-			write: write_identity,
-			read:  read_identity,
-			eval:  eval_identity,
-		})
-		.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
-	}
+	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
+		edit:  tool_settings.enabled("edit").then_some(edit_identity),
+		grep:  tool_settings.enabled("grep").then_some(grep_identity),
+		glob:  tool_settings.enabled("glob").then_some(glob_identity),
+		shell: tool_settings.enabled("shell").then_some(shell_identity),
+		write: tool_settings.enabled("write").then_some(write_identity),
+		read:  tool_settings.enabled("read").then_some(read_identity),
+		eval:  tool_settings.enabled("eval").then_some(eval_identity),
+	})
+	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
 	let flattened_slots = if policy == ToolsPolicy::ToolOnly {
 		Some(
 			flatten_slots(
@@ -212,7 +267,52 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	eval_host
 		.bind_registry(Arc::clone(&registry))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
-	Ok((registry, eval_host, eval_control))
+	Ok((registry, eval_host, eval_control, checkpoint_control))
+}
+
+/// Late-bound bridge from environment-owned checkpoint tools to the active
+/// Agent CONTROL mailbox.
+#[derive(Clone, Default)]
+pub struct AgentCheckpointControl {
+	sender: Arc<RwLock<Option<omp_agent::ControlSender>>>,
+}
+
+impl AgentCheckpointControl {
+	/// Replaces the active session binding.
+	pub fn bind(&self, sender: omp_agent::ControlSender) {
+		*self.sender.write() = Some(sender);
+	}
+
+	fn sender(&self) -> Result<omp_agent::ControlSender, Str> {
+		self
+			.sender
+			.read()
+			.clone()
+			.ok_or_else(|| Str::new_static("active Agent CONTROL is not bound"))
+	}
+}
+
+impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
+	async fn checkpoint(&self, label: Str) -> Result<u64, Str> {
+		self
+			.sender()?
+			.checkpoint(label)
+			.await
+			.map_err(|error| Str::from(error.to_string()))
+	}
+
+	async fn schedule_rewind(
+		&self,
+		target: u64,
+		scope: Str,
+	) -> Result<omp_tools::checkpoint::RewindAck, Str> {
+		let ack = self
+			.sender()?
+			.schedule_rewind(target, scope)
+			.await
+			.map_err(|error| Str::from(error.to_string()))?;
+		Ok(omp_tools::checkpoint::RewindAck { target: ack.target, receipt: ack.receipt })
+	}
 }
 
 #[cfg(test)]

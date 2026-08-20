@@ -1201,16 +1201,14 @@ async fn conflict_selector_is_a_compact_index_and_normal_read_appends_warning() 
 			"- ours = HEAD\n",
 			"- theirs = feature/source\n",
 			"- base = base\n",
-			"NOTICE: Read `conflicted.txt:conflicts` for the conflict index, then read the affected ",
-			"source ranges to obtain their `[conflicted.txt#TAG]` header and numbered marker lines. ",
-			"Resolve each complete marker block with the hashline `edit` tool, using `PUT N.=M:` \
-			 from ",
-			"`<<<<<<<` through `>>>>>>>`; preserve the intended side(s), and re-read ",
-			"`conflicted.txt:conflicts` to verify.\n\n",
+			"NOTICE: Read `conflicted.txt:conflicts` for the conflict index and ",
+			"`conflict://<id>` (or `/ours`, `/base`, `/theirs`, `/both`) for exact sides. Resolve ",
+			"with `write` targeting `conflict://<id>` and content `@ours`, `@base`, `@theirs`, ",
+			"`@both`, or custom text; re-read `conflicted.txt:conflicts` to verify.\n\n",
 			"#1  L2-8  (3-way)",
 		)
 	);
-	assert!(!summary.contains("conflict://"));
+	assert!(summary.contains("conflict://"));
 	let warning = read::conflicts::render_conflict_warning(CONFLICTED);
 	assert_eq!(
 		warning.text,
@@ -1219,11 +1217,10 @@ async fn conflict_selector_is_a_compact_index_and_normal_read_appends_warning() 
 			"- ours = HEAD\n",
 			"- theirs = feature/source\n",
 			"- base = base\n",
-			"NOTICE: Read `path:conflicts` for the conflict index, then read the affected source ",
-			"ranges to obtain their `[path#TAG]` header and numbered marker lines. Resolve each ",
-			"complete marker block with the hashline `edit` tool, using `PUT N.=M:` from ",
-			"`<<<<<<<` through `>>>>>>>`; preserve the intended side(s), and re-read ",
-			"`path:conflicts` to verify.\n\n",
+			"NOTICE: Read `path:conflicts` for the conflict index and `conflict://<id>` (or ",
+			"`/ours`, `/base`, `/theirs`, `/both`) for exact sides. Resolve with `write` targeting ",
+			"`conflict://<id>` and content `@ours`, `@base`, `@theirs`, `@both`, or custom text; ",
+			"re-read `path:conflicts` to verify.\n\n",
 			"──── #1  L2-8 ────\n",
 			"<<< ours\n",
 			"ours\n",
@@ -1233,7 +1230,7 @@ async fn conflict_selector_is_a_compact_index_and_normal_read_appends_warning() 
 			"theirs",
 		)
 	);
-	assert!(!warning.text.contains("conflict://"));
+	assert!(warning.text.contains("conflict://"));
 	let ordinary = text(sources, r#"{"path":"conflicted.txt"}"#).await;
 	assert!(ordinary.starts_with("[conflicted.txt#A1B2]\n1:before\n2:<<<<<<< HEAD"), "{ordinary}");
 	assert!(ordinary.ends_with(warning.text.as_str()), "{ordinary}");

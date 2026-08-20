@@ -716,7 +716,15 @@ mod tests {
 		.expect("journal");
 		let (control, mailbox) = omp_agent::control::channel();
 		actor.bind_agent(control).expect("bind agent owner");
-		let owner = tokio::spawn(async move { while mailbox.handle_next(&mut journal).await {} });
+		let owner = tokio::spawn(async move {
+			loop {
+				match mailbox.handle_next(&mut journal).await {
+					omp_agent::control::ControlMailboxEvent::Closed => break,
+					omp_agent::control::ControlMailboxEvent::JournalHandled
+					| omp_agent::control::ControlMailboxEvent::Rewind(_) => {},
+				}
+			}
+		});
 
 		let (reply, replies) = flume::unbounded();
 		actor

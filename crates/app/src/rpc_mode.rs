@@ -1,0 +1,2209 @@
+//! Stateful Content-Length framed RPC server for headless clients.
+
+use std::{
+	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	path::{Path, PathBuf},
+	process::Stdio,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicU8, Ordering},
+	},
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use flume::{Receiver, Sender};
+use futures::StreamExt as _;
+use miette::{IntoDiagnostic as _, miette};
+use omp_core::Str;
+use omp_llm_catalog::ModelKey;
+use omp_llm_inference::{
+	Client, Registry,
+	call::{
+		CallMeta, ChatRequest, ContentPart, Message, NegotiationPolicy, Role, Sampling, Setting,
+		Target,
+	},
+	event::ChatEvent,
+	id::RequestId as InferenceRequestId,
+	receipt::ExecutionBudget,
+};
+use omp_rpc::{
+	framing::{
+		ContentLengthDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES, RpcFrameDecoder,
+		encode_json_v1, encode_json_v2,
+	},
+	protocol::{
+		ExtensionUiResponse, HostToolCall, HostToolCancel, HostToolDefinition, HostToolResult,
+		HostToolUpdate, OAuthProvider, PROTOCOL_V1, PROTOCOL_V2, ReadyFrame, RequestId, RpcErrorCode,
+		RpcRequest, RpcResponse, SubagentMessages,
+	},
+};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use tokio::{
+	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+	process::Command,
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::cli::{RpcArgs, data_dir, turn_id};
+
+const DEFAULT_PAGE_MESSAGES: usize = 100;
+const MAX_PAGE_MESSAGES: usize = 256;
+const MAX_PAGE_BYTES: usize = 768 * 1024;
+const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
+const SUBAGENT_READ_BYTES: usize = 768 * 1024;
+const ORCHESTRATE_NOTICE: &str = "The user explicitly requested orchestration. Treat this as a \
+                                  hidden system instruction: delegate independent work to \
+                                  available subagents, coordinate their results, and retain \
+                                  responsibility for the final answer.";
+
+static STDIN_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Runs the stateful RPC server using stdin exclusively for protocol input and
+/// stdout exclusively for protocol output.
+pub async fn run(args: RpcArgs) -> miette::Result<()> {
+	let _stdin_claim = StdinClaim::claim()?;
+	// RPC stdout is protocol-only; process notifications are suppressed by the
+	// embedding client before this process starts.
+
+	let data = data_dir(None)?;
+	let model = args
+		.model
+		.or_else(|| {
+			crate::settings::Settings::load(&data)
+				.default_model
+				.map(Str::from)
+		})
+		.ok_or_else(|| miette!("rpc mode requires --model or config.default_model"))?;
+	let store =
+		crate::daemon::open_credential_store(data.join("credentials.db")).into_diagnostic()?;
+	let registry = crate::daemon::production_registry(&data, store)
+		.await
+		.into_diagnostic()?;
+	let models = registry
+		.catalog()
+		.models()
+		.iter()
+		.map(|entry| entry.key.as_str().to_owned())
+		.collect::<Vec<_>>();
+	let providers = registry
+		.catalog()
+		.providers()
+		.iter()
+		.map(|entry| OAuthProvider {
+			id:            entry.id.as_str().to_owned(),
+			name:          entry.name.to_string(),
+			available:     true,
+			authenticated: false,
+		})
+		.collect::<Vec<_>>();
+	let preferred_provider = args.provider.map(|provider| provider.to_string());
+	if let Some(provider) = preferred_provider.as_deref()
+		&& !providers.iter().any(|candidate| candidate.id == provider)
+	{
+		return Err(miette!("unknown RPC provider `{provider}`"));
+	}
+	let negotiated = Arc::new(AtomicU8::new(PROTOCOL_V1));
+	let (output_tx, output_rx) = flume::unbounded();
+	let writer = tokio::spawn(write_frames(tokio::io::stdout(), output_rx, negotiated.clone()));
+	let ready = serde_json::to_value(ReadyFrame::v2_capable(MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES))
+		.into_diagnostic()?;
+	emit(&output_tx, ready)?;
+
+	let runtime = Arc::new(Runtime {
+		registry,
+		output: output_tx.clone(),
+		negotiated,
+		state: Mutex::new(ServerState::new(
+			model.to_string(),
+			models,
+			providers,
+			preferred_provider,
+			args.project,
+			args.session_dir,
+		)),
+	});
+	runtime.notify_session_start()?;
+
+	let (input_tx, input_rx) = flume::unbounded();
+	let reader = tokio::spawn(read_frames(tokio::io::stdin(), input_tx));
+	let dispatch_result = dispatch_inputs(runtime.clone(), input_rx).await;
+	{
+		let mut state = runtime.state.lock();
+		if let Some(active) = state.active.take() {
+			active.cancel();
+		}
+		if let Some(active) = state.active_bash.take() {
+			active.cancellation.cancel();
+		}
+		state.pending_host_tools.clear();
+	}
+	let read_result = reader.await.into_diagnostic()?;
+	drop(runtime);
+	drop(output_tx);
+	let write_result = writer.await.into_diagnostic()?;
+	dispatch_result?;
+	read_result?;
+	write_result
+}
+
+struct StdinClaim;
+
+impl StdinClaim {
+	fn claim() -> miette::Result<Self> {
+		STDIN_CLAIMED
+			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+			.map(|_| Self)
+			.map_err(|_| miette!("RPC stdin has already been claimed in this process"))
+	}
+}
+
+impl Drop for StdinClaim {
+	fn drop(&mut self) {
+		STDIN_CLAIMED.store(false, Ordering::Release);
+	}
+}
+
+enum Input {
+	Request(Value),
+	Malformed(String),
+}
+
+async fn read_frames<R>(mut input: R, sender: Sender<Input>) -> miette::Result<()>
+where
+	R: AsyncRead + Unpin,
+{
+	let mut physical = ContentLengthDecoder::new();
+	let mut logical = RpcFrameDecoder::new();
+	let mut buffer = [0_u8; 16 * 1024];
+	loop {
+		let count = input.read(&mut buffer).await.into_diagnostic()?;
+		if count == 0 {
+			break;
+		}
+		let batch = physical.push(&buffer[..count]);
+		for diagnostic in batch.diagnostics {
+			sender
+				.send_async(Input::Malformed(format!(
+					"{} (skipped {} bytes)",
+					diagnostic.reason, diagnostic.skipped_bytes
+				)))
+				.await
+				.into_diagnostic()?;
+		}
+		for frame in batch.frames {
+			match logical.push_frame(&frame) {
+				Ok(Some(value)) => sender
+					.send_async(Input::Request(value))
+					.await
+					.into_diagnostic()?,
+				Ok(None) => {},
+				Err(error) => {
+					logical.reset();
+					sender
+						.send_async(Input::Malformed(error.to_string()))
+						.await
+						.into_diagnostic()?;
+				},
+			}
+		}
+	}
+	Ok(())
+}
+
+async fn write_frames<W>(
+	mut output: W,
+	receiver: Receiver<Value>,
+	negotiated: Arc<AtomicU8>,
+) -> miette::Result<()>
+where
+	W: AsyncWrite + Unpin,
+{
+	let mut sequence = 0_u64;
+	let streamed = HashSet::new();
+	while let Ok(value) = receiver.recv_async().await {
+		let frames = if negotiated.load(Ordering::Acquire) >= PROTOCOL_V2 {
+			sequence = sequence.wrapping_add(1);
+			encode_json_v2(&value, &format!("server-{sequence}"))
+				.map_err(|error| miette!(error.to_string()))?
+		} else {
+			vec![encode_json_v1(&value, &streamed)]
+		};
+		for frame in frames {
+			output.write_all(&frame).await.into_diagnostic()?;
+		}
+		output.flush().await.into_diagnostic()?;
+	}
+	Ok(())
+}
+
+async fn dispatch_inputs(runtime: Arc<Runtime>, receiver: Receiver<Input>) -> miette::Result<()> {
+	let (ordinary_tx, ordinary_rx) = flume::unbounded();
+	let worker_runtime = runtime.clone();
+	let worker = tokio::spawn(async move {
+		while let Ok(value) = ordinary_rx.recv_async().await {
+			worker_runtime.handle_request(value).await?;
+		}
+		Ok::<_, miette::Report>(())
+	});
+
+	while let Ok(input) = receiver.recv_async().await {
+		match input {
+			Input::Malformed(message) => runtime.send_error(None, "parse", "parse_error", message)?,
+			Input::Request(value) if is_immediate_frame(&value) => runtime.handle_immediate(value)?,
+			Input::Request(value) => ordinary_tx.send_async(value).await.into_diagnostic()?,
+		}
+	}
+	drop(ordinary_tx);
+	worker.await.into_diagnostic()?
+}
+
+fn is_immediate_frame(value: &Value) -> bool {
+	matches!(
+		value.get("type").and_then(Value::as_str),
+		Some(
+			"bash"
+				| "abort_bash"
+				| "extension_ui_response"
+				| "host_tool_update"
+				| "host_tool_result"
+				| "host_tool_cancel"
+		)
+	)
+}
+
+struct Runtime {
+	registry:   Registry,
+	output:     Sender<Value>,
+	negotiated: Arc<AtomicU8>,
+	state:      Mutex<ServerState>,
+}
+
+impl Runtime {
+	async fn handle_request(self: &Arc<Self>, value: Value) -> miette::Result<()> {
+		let request = match serde_json::from_value::<RpcRequest>(value) {
+			Ok(request) => request,
+			Err(error) => {
+				return self.send_error(None, "parse", "invalid_request", error.to_string());
+			},
+		};
+		if request.command == "bash" {
+			return self.start_bash(request);
+		}
+		let id = request.id.clone();
+		let command = request.command.clone();
+		let result = self.execute(&command, &request.params).await;
+		match result {
+			Ok(data) => self.send_success(id, &command, data),
+			Err(error) => self.send_error(id, &command, error.code, error.message),
+		}
+	}
+
+	fn handle_immediate(self: &Arc<Self>, value: Value) -> miette::Result<()> {
+		match value.get("type").and_then(Value::as_str) {
+			Some("bash") => {
+				let request = match serde_json::from_value::<RpcRequest>(value) {
+					Ok(request) => request,
+					Err(error) => {
+						return self.send_error(None, "bash", "invalid_request", error.to_string());
+					},
+				};
+				self.start_bash(request)
+			},
+			Some("abort_bash") => {
+				let request = match serde_json::from_value::<RpcRequest>(value) {
+					Ok(request) => request,
+					Err(error) => {
+						return self.send_error(None, "abort_bash", "invalid_request", error.to_string());
+					},
+				};
+				let aborted = self.abort_bash();
+				self.send_success(request.id, "abort_bash", json!({ "aborted": aborted }))
+			},
+			Some("extension_ui_response") => {
+				let response = match serde_json::from_value::<ExtensionUiResponse>(value) {
+					Ok(response) => response,
+					Err(error) => {
+						return self.send_error(
+							None,
+							"extension_ui_response",
+							"invalid_request",
+							error.to_string(),
+						);
+					},
+				};
+				self.send_error(
+					Some(RequestId::new(response.id)),
+					"extension_ui_response",
+					"extension_ui_not_pending",
+					"no extension UI request is awaiting this response",
+				)
+			},
+			Some("host_tool_update" | "host_tool_result" | "host_tool_cancel") => {
+				self.handle_side_channel(value)
+			},
+			_ => self.send_error(None, "side_channel", "invalid_request", "unknown immediate frame"),
+		}
+	}
+
+	fn start_bash(self: &Arc<Self>, request: RpcRequest) -> miette::Result<()> {
+		let params = match parse_params::<BashParams>(&request.params) {
+			Ok(params) => params,
+			Err(error) => {
+				return self.send_error(request.id, "bash", error.code, error.message);
+			},
+		};
+		let operation_id = new_id("bash");
+		let cancellation = CancellationToken::new();
+		let project = {
+			let mut state = self.state.lock();
+			if state.active_bash.is_some() {
+				return self.send_error(
+					request.id,
+					"bash",
+					"bash_busy",
+					"a shell command is already active",
+				);
+			}
+			state.active_bash = Some(ActiveBash {
+				id:           operation_id.clone(),
+				cancellation: cancellation.clone(),
+			});
+			state.project.clone()
+		};
+		let mut command = shell_command(&params.command);
+		command
+			.current_dir(project)
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.kill_on_drop(true);
+		let child = match command.spawn() {
+			Ok(child) => child,
+			Err(error) => {
+				self.state.lock().active_bash = None;
+				return self.send_error(request.id, "bash", "bash_spawn_failed", error.to_string());
+			},
+		};
+		let runtime = self.clone();
+		tokio::spawn(async move {
+			let data = tokio::select! {
+				() = cancellation.cancelled() => {
+					json!({
+						"operationId": operation_id.clone(),
+						"stdout": "",
+						"stderr": "",
+						"status": Value::Null,
+						"success": false,
+						"aborted": true,
+					})
+				},
+				output = child.wait_with_output() => match output {
+					Ok(output) => json!({
+						"operationId": operation_id.clone(),
+						"stdout": String::from_utf8_lossy(&output.stdout),
+						"stderr": String::from_utf8_lossy(&output.stderr),
+						"status": output.status.code(),
+						"success": output.status.success(),
+						"aborted": false,
+					}),
+					Err(error) => {
+						let mut state = runtime.state.lock();
+						if state.active_bash.as_ref().is_some_and(|active| active.id == operation_id) {
+							state.active_bash = None;
+						}
+						drop(state);
+						let _ = runtime.send_error(request.id, "bash", "bash_wait_failed", error.to_string());
+						return;
+					},
+				},
+			};
+			{
+				let mut state = runtime.state.lock();
+				if state
+					.active_bash
+					.as_ref()
+					.is_some_and(|active| active.id == operation_id)
+				{
+					state.active_bash = None;
+				}
+			}
+			let mut event = data.clone();
+			if let Some(event) = event.as_object_mut() {
+				event.insert("type".into(), Value::String("bash_result".into()));
+			}
+			let _ = runtime.notify(event);
+			let _ = runtime.send_success(request.id, "bash", data);
+		});
+		Ok(())
+	}
+
+	fn abort_bash(&self) -> bool {
+		let state = self.state.lock();
+		state.active_bash.as_ref().is_some_and(|active| {
+			active.cancellation.cancel();
+			true
+		})
+	}
+
+	async fn execute(
+		self: &Arc<Self>,
+		command: &str,
+		params: &Map<String, Value>,
+	) -> Result<Value, CommandError> {
+		match command {
+			"negotiate_protocol" => {
+				let version = unsigned(params, "protocolVersion")? as u8;
+				if !matches!(version, PROTOCOL_V1 | PROTOCOL_V2) {
+					return Err(CommandError::new(
+						"unsupported_protocol",
+						"only protocol versions 1 and 2 are supported",
+					));
+				}
+				self.negotiated.store(version, Ordering::Release);
+				Ok(json!({ "protocolVersion": version }))
+			},
+			"prompt" => {
+				let text = text(params, "message")
+					.or_else(|_| text(params, "text"))?
+					.to_owned();
+				let behavior = params
+					.get("streamingBehavior")
+					.and_then(Value::as_str)
+					.unwrap_or("prompt");
+				self.submit_prompt(text, behavior)?;
+				self
+					.notify(json!({ "type": "prompt_result", "invoked": true }))
+					.map_err(CommandError::transport)?;
+				Ok(json!({ "invoked": true }))
+			},
+			"steer" => {
+				let message = text(params, "message")
+					.or_else(|_| text(params, "text"))?
+					.to_owned();
+				self.submit_prompt(message, "steer")?;
+				Ok(json!({ "queued": true, "mode": "steer" }))
+			},
+			"follow_up" => {
+				let message = text(params, "message")
+					.or_else(|_| text(params, "text"))?
+					.to_owned();
+				self.submit_prompt(message, "followUp")?;
+				Ok(json!({ "queued": true, "mode": "followUp" }))
+			},
+			"abort" => Ok(json!({ "aborted": self.abort(false, None)? })),
+			"abort_and_prompt" => {
+				let message = text(params, "message")
+					.or_else(|_| text(params, "text"))?
+					.to_owned();
+				Ok(json!({ "aborted": self.abort(true, Some(message))? }))
+			},
+			"new_session" => self.new_session(params),
+			"get_state" => Ok(self.state_value()),
+			"get_available_models" => {
+				let state = self.state.lock();
+				Ok(json!({ "models": state.models, "active": state.config.model }))
+			},
+			"cycle_model" => self.cycle_model(),
+			"set_model" => {
+				let params = parse_params::<SetModelParams>(params)?;
+				self.set_model(&params.provider, &params.model_id)
+			},
+			"set_fast_mode" => self.set_bool_config("fastMode", boolean(params, "enabled")?),
+			"set_thinking_level" => self.set_string_config("thinkingLevel", text(params, "level")?),
+			"cycle_thinking_level" => self.cycle_thinking(),
+			"set_steering_mode" => self.set_string_config("steeringMode", text(params, "mode")?),
+			"set_follow_up_mode" => self.set_string_config("followUpMode", text(params, "mode")?),
+			"set_interrupt_mode" => {
+				let mode = text(params, "mode")?;
+				if !matches!(mode, "immediate" | "wait") {
+					return Err(CommandError::new(
+						"invalid_params",
+						"interrupt mode must be immediate or wait",
+					));
+				}
+				self.set_string_config("interruptMode", mode)
+			},
+			"set_auto_compaction" => {
+				self.set_bool_config("autoCompaction", boolean(params, "enabled")?)
+			},
+			"set_auto_retry" => self.set_bool_config("autoRetry", boolean(params, "enabled")?),
+			"abort_retry" => Ok(json!({ "aborted": false })),
+			"set_todos" => self.set_todos(params),
+			"compact" => self.compact(),
+			"get_session_stats" => self.session_stats(),
+			"switch_session" => {
+				let params = parse_params::<SwitchSessionParams>(params)?;
+				self.switch_session(&params.session_path)
+			},
+			"branch" => self.branch(params),
+			"get_branch_messages" | "get_messages" => self.get_messages(params),
+			"get_messages_page" => self.get_messages_page(params),
+			"get_last_assistant_text" => self.last_assistant(),
+			"set_session_name" => self.rename_session(text(params, "name")?),
+			"handoff" => self.handoff(params),
+			"export_html" => self.export_html(),
+			"get_login_providers" => self.login_providers(),
+			"login" => self.login(params),
+			"set_host_tools" => self.set_host_tools(params),
+			"call_host_tool" => self.call_host_tool(params),
+			"set_subagent_subscription" => self.set_subscription(params),
+			"get_subagents" => self.get_subagents(),
+			"get_subagent_messages" => self.get_subagent_messages(params).await,
+			"get_available_commands" => Ok(json!({ "commands": supported_commands() })),
+			"bash" | "abort_bash" => Err(CommandError::new(
+				"invalid_request",
+				"shell commands must be dispatched through the asynchronous command path",
+			)),
+			_ => Err(CommandError::new("unknown_command", format!("unknown RPC command `{command}`"))),
+		}
+	}
+
+	fn submit_prompt(self: &Arc<Self>, message: String, behavior: &str) -> Result<(), CommandError> {
+		let mut state = self.state.lock();
+		if let Some(active) = state.active.as_ref() {
+			match behavior {
+				"steer" => {
+					active.cancel();
+					state.queue.push_front(message);
+					return Ok(());
+				},
+				"followUp" | "follow_up" => {
+					state.queue.push_back(message);
+					return Ok(());
+				},
+				_ => return Err(CommandError::new("session_busy", "an agent turn is already active")),
+			}
+		}
+		let cancellation = CancellationToken::new();
+		state.active = Some(cancellation.clone());
+		drop(state);
+		let runtime = self.clone();
+		tokio::spawn(async move { runtime.conversation_loop(message, cancellation).await });
+		Ok(())
+	}
+
+	async fn conversation_loop(
+		self: Arc<Self>,
+		mut message: String,
+		mut cancellation: CancellationToken,
+	) {
+		loop {
+			let _ = self.run_turn(message, cancellation.clone()).await;
+			let next = {
+				let mut state = self.state.lock();
+				state.active = None;
+				state.queue.pop_front()
+			};
+			let Some(next) = next else { break };
+			message = next;
+			cancellation = CancellationToken::new();
+			self.state.lock().active = Some(cancellation.clone());
+		}
+	}
+
+	async fn run_turn(
+		&self,
+		prompt: String,
+		cancellation: CancellationToken,
+	) -> Result<(), CommandError> {
+		let (session_id, model, request) = {
+			let mut state = self.state.lock();
+			let session_id = state.current.clone();
+			let model = state.config.model.clone();
+			let session = state.current_mut();
+			session.push_message("user", &prompt);
+			let request = build_request(session, contains_orchestrate(&prompt));
+			(session_id, model, request)
+		};
+		self
+			.notify(json!({ "type": "agent_start", "sessionId": session_id }))
+			.map_err(CommandError::transport)?;
+		let planner =
+			omp_llm_inference::router::Router::new(self.registry.clone(), Duration::from_secs(30));
+		let meta = CallMeta {
+			id:       InferenceRequestId::from(turn_id()),
+			target:   Target::Model(ModelKey::from(model)),
+			deadline: None,
+			budget:   ExecutionBudget::default(),
+			session:  None,
+		};
+		let mut client = Client::new(self.registry.service(), planner, meta);
+		let mut events = match client.execute(request).await {
+			Ok(events) => events,
+			Err(error) => {
+				self.notify(json!({ "type": "agent_end", "sessionId": session_id, "error": error.to_string(), "aborted": false }))
+					.map_err(CommandError::transport)?;
+				return Err(CommandError::new("inference_error", error.to_string()));
+			},
+		};
+		let mut assistant = String::new();
+		let mut completed = false;
+		let mut aborted = false;
+		loop {
+			tokio::select! {
+				() = cancellation.cancelled() => {
+					aborted = true;
+					break;
+				}
+				event = events.next() => {
+					let Some(event) = event else { break };
+					match event {
+						Ok(ChatEvent::TextDelta { text, .. }) => {
+							assistant.push_str(text.as_str());
+							self.notify(json!({ "type": "agent_event", "event": { "type": "text_delta", "text": text.as_str() }, "sessionId": session_id }))
+								.map_err(CommandError::transport)?;
+						},
+						Ok(ChatEvent::ThinkingDelta { text, .. }) => {
+							self.notify(json!({ "type": "agent_event", "event": { "type": "thinking_delta", "text": text.as_str() }, "sessionId": session_id }))
+								.map_err(CommandError::transport)?;
+						},
+						Ok(ChatEvent::Completed(_)) => completed = true,
+						Ok(_) => {},
+						Err(error) => {
+							self.notify(json!({ "type": "agent_event", "event": { "type": "error", "message": error.to_string() }, "sessionId": session_id }))
+								.map_err(CommandError::transport)?;
+							break;
+						},
+					}
+				}
+			}
+		}
+		if !assistant.is_empty() {
+			if let Some(session) = self.state.lock().sessions.get_mut(&session_id) {
+				session.push_message("assistant", &assistant);
+			}
+		}
+		self.notify(json!({
+			"type": "agent_end",
+			"sessionId": session_id,
+			"aborted": aborted,
+			"completed": completed,
+			"message": if assistant.is_empty() { Value::Null } else { json!({ "role": "assistant", "content": assistant }) },
+		}))
+		.map_err(CommandError::transport)
+	}
+
+	fn abort(&self, replace_queue: bool, message: Option<String>) -> Result<bool, CommandError> {
+		let (active, pending) = {
+			let mut state = self.state.lock();
+			let active = state.active.as_ref().is_some_and(|token| {
+				token.cancel();
+				true
+			});
+			if replace_queue {
+				state.queue.clear();
+				if let Some(message) = message {
+					state.queue.push_front(message);
+				}
+			}
+			let pending = state.pending_host_tools.keys().cloned().collect::<Vec<_>>();
+			state.pending_host_tools.clear();
+			(active, pending)
+		};
+		for target_id in pending {
+			let frame = HostToolCancel {
+				kind: "host_tool_cancel".into(),
+				id: new_id("host-tool-cancel"),
+				target_id,
+			};
+			self
+				.notify(serde_json::to_value(frame).map_err(CommandError::json)?)
+				.map_err(CommandError::transport)?;
+		}
+		Ok(active)
+	}
+
+	fn new_session(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let mut state = self.state.lock();
+		if let Some(active) = state.active.take() {
+			active.cancel();
+		}
+		state.queue.clear();
+		let parent = params
+			.get("parentSession")
+			.and_then(Value::as_str)
+			.map(str::to_owned);
+		let id = new_id("session");
+		state
+			.sessions
+			.insert(id.clone(), Session::new(id.clone(), parent));
+		state.current = id.clone();
+		drop(state);
+		self
+			.notify_session_start()
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "sessionId": id }))
+	}
+
+	fn state_value(&self) -> Value {
+		let state = self.state.lock();
+		let session = state.current_session();
+		json!({
+			"model": state.config.model,
+			"provider": state.config.provider,
+			"thinkingLevel": state.config.thinking_level,
+			"isStreaming": state.active.is_some(),
+			"isCompacting": false,
+			"fastMode": state.config.fast_mode,
+			"steeringMode": state.config.steering_mode,
+			"followUpMode": state.config.follow_up_mode,
+			"interruptMode": state.config.interrupt_mode,
+			"autoCompaction": state.config.auto_compaction,
+			"autoRetry": state.config.auto_retry,
+			"session": { "id": session.id, "name": session.name, "parentSession": session.parent },
+			"messageCount": session.messages.len(),
+			"tokensPerSecond": Value::Null,
+			"todos": state.config.todos,
+			"project": state.project,
+		})
+	}
+
+	fn set_string_config(&self, key: &str, value: &str) -> Result<Value, CommandError> {
+		let mut state = self.state.lock();
+		match key {
+			"model" => {
+				if !state.models.iter().any(|candidate| candidate == value) {
+					return Err(CommandError::new(
+						"model_not_found",
+						format!("unknown model `{value}`"),
+					));
+				}
+				state.config.model = value.to_owned();
+			},
+			"thinkingLevel" => state.config.thinking_level = value.to_owned(),
+			"steeringMode" => state.config.steering_mode = value.to_owned(),
+			"followUpMode" => state.config.follow_up_mode = value.to_owned(),
+			"interruptMode" => state.config.interrupt_mode = value.to_owned(),
+			_ => return Err(CommandError::new("invalid_params", "unknown configuration key")),
+		}
+		let config = serde_json::to_value(&state.config).map_err(CommandError::json)?;
+		drop(state);
+		self
+			.notify(json!({ "type": "config_update", "config": config }))
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "key": key, "value": value }))
+	}
+
+	fn set_model(&self, provider: &str, model_id: &str) -> Result<Value, CommandError> {
+		if provider.is_empty() || model_id.is_empty() {
+			return Err(CommandError::new("invalid_params", "provider and modelId must not be empty"));
+		}
+		let key = if model_id.starts_with(&format!("{provider}/")) {
+			model_id.to_owned()
+		} else {
+			format!("{provider}/{model_id}")
+		};
+		let mut state = self.state.lock();
+		if !state
+			.providers
+			.iter()
+			.any(|candidate| candidate.id == provider)
+		{
+			return Err(CommandError::new(
+				"provider_not_found",
+				format!("unknown provider `{provider}`"),
+			));
+		}
+		if !state.models.iter().any(|candidate| candidate == &key) {
+			return Err(CommandError::new("model_not_found", format!("unknown model `{key}`")));
+		}
+		state.config.model = key.clone();
+		state.config.provider = Some(provider.to_owned());
+		let config = serde_json::to_value(&state.config).map_err(CommandError::json)?;
+		drop(state);
+		self
+			.notify(json!({ "type": "config_update", "config": config }))
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "provider": provider, "modelId": model_id, "model": key }))
+	}
+
+	fn set_bool_config(&self, key: &str, value: bool) -> Result<Value, CommandError> {
+		let mut state = self.state.lock();
+		match key {
+			"fastMode" => state.config.fast_mode = value,
+			"autoCompaction" => state.config.auto_compaction = value,
+			"autoRetry" => state.config.auto_retry = value,
+			_ => return Err(CommandError::new("invalid_params", "unknown configuration key")),
+		}
+		let config = serde_json::to_value(&state.config).map_err(CommandError::json)?;
+		drop(state);
+		self
+			.notify(json!({ "type": "config_update", "config": config }))
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "enabled": value, "active": value }))
+	}
+
+	fn cycle_model(&self) -> Result<Value, CommandError> {
+		let next = {
+			let state = self.state.lock();
+			let index = state
+				.models
+				.iter()
+				.position(|model| model == &state.config.model)
+				.unwrap_or(0);
+			state
+				.models
+				.get((index + 1) % state.models.len().max(1))
+				.cloned()
+		}
+		.ok_or_else(|| CommandError::new("model_not_found", "no models are available"))?;
+		self.set_string_config("model", &next)
+	}
+
+	fn cycle_thinking(&self) -> Result<Value, CommandError> {
+		const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+		let next = {
+			let state = self.state.lock();
+			let index = LEVELS
+				.iter()
+				.position(|level| *level == state.config.thinking_level)
+				.unwrap_or(0);
+			LEVELS[(index + 1) % LEVELS.len()]
+		};
+		self.set_string_config("thinkingLevel", next)
+	}
+
+	fn set_todos(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let phases = params
+			.get("phases")
+			.and_then(Value::as_array)
+			.cloned()
+			.ok_or_else(|| CommandError::new("invalid_params", "phases must be an array"))?;
+		self.state.lock().config.todos = phases.clone();
+		self
+			.notify(json!({ "type": "config_update", "todos": phases }))
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "phases": phases }))
+	}
+
+	fn compact(&self) -> Result<Value, CommandError> {
+		let mut state = self.state.lock();
+		if state.active.is_some() {
+			return Err(CommandError::new(
+				"session_busy",
+				"cannot compact while an agent turn is active",
+			));
+		}
+		let session = state.current_mut();
+		let removed = session.messages.len().saturating_sub(32);
+		if removed > 0 {
+			session.messages.drain(..removed);
+			session.bump_revision();
+		}
+		Ok(json!({ "compacted": removed > 0, "removedMessages": removed }))
+	}
+
+	fn session_stats(&self) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		let session = state.current_session();
+		let bytes = serde_json::to_vec(&session.messages)
+			.map_err(CommandError::json)?
+			.len();
+		Ok(json!({
+			"sessionId": session.id,
+			"name": session.name,
+			"messageCount": session.messages.len(),
+			"transcriptBytes": bytes,
+			"createdAt": session.created_at,
+			"updatedAt": session.updated_at,
+		}))
+	}
+
+	fn switch_session(&self, session_path: &str) -> Result<Value, CommandError> {
+		let mut state = self.state.lock();
+		if state.active.is_some() {
+			return Err(CommandError::new(
+				"session_busy",
+				"cannot switch sessions during an active turn",
+			));
+		}
+		let id = if state.sessions.contains_key(session_path) {
+			session_path.to_owned()
+		} else {
+			Path::new(session_path)
+				.file_stem()
+				.and_then(|stem| stem.to_str())
+				.filter(|id| state.sessions.contains_key(*id))
+				.map(str::to_owned)
+				.ok_or_else(|| {
+					CommandError::new("session_not_found", format!("unknown session `{session_path}`"))
+				})?
+		};
+		state.current = id.clone();
+		drop(state);
+		self
+			.notify_session_info()
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "sessionId": id, "sessionPath": session_path }))
+	}
+
+	fn branch(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let mut state = self.state.lock();
+		if state.active.is_some() {
+			return Err(CommandError::new("session_busy", "cannot branch during an active turn"));
+		}
+		let entry_id = text(params, "entryId")?;
+		let source = state.current_session();
+		let count = source
+			.messages
+			.iter()
+			.position(|message| message.id == entry_id)
+			.map(|index| index + 1)
+			.ok_or_else(|| {
+				CommandError::new("entry_not_found", format!("unknown entry `{entry_id}`"))
+			})?;
+		let id = new_id("session");
+		let mut branch = Session::new(id.clone(), Some(source.id.clone()));
+		branch.messages = source.messages[..count].to_vec();
+		branch.bump_revision();
+		state.sessions.insert(id.clone(), branch);
+		state.current = id.clone();
+		drop(state);
+		self
+			.notify_session_start()
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "sessionId": id, "messageCount": count }))
+	}
+
+	fn get_messages(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		let session = session_from_params(&state, params)?;
+		Ok(json!({ "sessionId": session.id, "messages": session.messages }))
+	}
+
+	fn get_messages_page(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		if state.active.is_some() {
+			return Err(CommandError::new(
+				"session_busy",
+				"transcript is changing during an active turn",
+			));
+		}
+		let session = session_from_params(&state, params)?;
+		let limit = params
+			.get("limit")
+			.and_then(Value::as_u64)
+			.map_or(DEFAULT_PAGE_MESSAGES, |value| usize::try_from(value).unwrap_or(MAX_PAGE_MESSAGES))
+			.clamp(1, MAX_PAGE_MESSAGES);
+		let cursor = params.get("cursor").and_then(Value::as_str);
+		message_page(session, cursor, limit)
+	}
+
+	fn last_assistant(&self) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		let text = state
+			.current_session()
+			.messages
+			.iter()
+			.rev()
+			.find(|message| message.role == "assistant")
+			.map(|message| message.content.clone());
+		Ok(json!({ "text": text }))
+	}
+
+	fn rename_session(&self, name: &str) -> Result<Value, CommandError> {
+		if name.trim().is_empty() {
+			return Err(CommandError::new("invalid_params", "session name must not be empty"));
+		}
+		let id = {
+			let mut state = self.state.lock();
+			let session = state.current_mut();
+			session.name = Some(name.to_owned());
+			session.id.clone()
+		};
+		self
+			.notify_session_info()
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "sessionId": id, "name": name }))
+	}
+
+	fn handoff(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let instructions = params
+			.get("customInstructions")
+			.and_then(Value::as_str)
+			.unwrap_or("Continue this session from the retained context.");
+		let mut state = self.state.lock();
+		if state.active.is_some() {
+			return Err(CommandError::new("session_busy", "cannot hand off during an active turn"));
+		}
+		let source = state.current_session();
+		let id = new_id("session");
+		let mut target = Session::new(id.clone(), Some(source.id.clone()));
+		target.messages = source.messages.clone();
+		target.push_message("user", instructions);
+		state.sessions.insert(id.clone(), target);
+		state.current = id.clone();
+		drop(state);
+		self
+			.notify_session_start()
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "sessionId": id }))
+	}
+
+	fn export_html(&self) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		let session = state.current_session();
+		let mut html =
+			String::from("<!doctype html><meta charset=\"utf-8\"><title>OMP transcript</title><main>");
+		for message in &session.messages {
+			html.push_str("<article data-role=\"");
+			html.push_str(&escape_html(&message.role));
+			html.push_str("\"><pre>");
+			html.push_str(&escape_html(&message.content));
+			html.push_str("</pre></article>");
+		}
+		html.push_str("</main>");
+		Ok(json!({ "sessionId": session.id, "html": html }))
+	}
+
+	fn login_providers(&self) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		Ok(oauth_providers_value(&state.providers))
+	}
+
+	fn login(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let params = parse_params::<LoginParams>(params)?;
+		let state = self.state.lock();
+		if !state
+			.providers
+			.iter()
+			.any(|candidate| candidate.id == params.provider_id)
+		{
+			return Err(CommandError::new(
+				"provider_not_found",
+				format!("unknown provider `{}`", params.provider_id),
+			));
+		}
+		Err(CommandError::new(
+			"interactive_login_required",
+			"this provider login requires an interactive authentication exchange; use `omp auth \
+			 login`",
+		))
+	}
+
+	fn set_host_tools(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let tools = params
+			.get("tools")
+			.and_then(Value::as_array)
+			.ok_or_else(|| CommandError::new("invalid_params", "tools must be an array"))?;
+		let mut parsed = BTreeMap::new();
+		for tool in tools {
+			let definition = serde_json::from_value::<HostToolDefinition>(tool.clone())
+				.map_err(|error| CommandError::new("invalid_params", error.to_string()))?;
+			if !definition.parameters.is_object() {
+				return Err(CommandError::new(
+					"invalid_params",
+					"host tool parameters must be JSON Schema objects",
+				));
+			}
+			parsed.insert(definition.name, tool.clone());
+		}
+		let tool_names = parsed.keys().cloned().collect::<Vec<_>>();
+		self.state.lock().host_tools = parsed;
+		Ok(host_tool_names_value(tool_names))
+	}
+
+	fn call_host_tool(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let name = text(params, "name")?;
+		let arguments = params
+			.get("arguments")
+			.cloned()
+			.unwrap_or_else(|| json!({}))
+			.as_object()
+			.cloned()
+			.ok_or_else(|| CommandError::new("invalid_params", "arguments must be an object"))?;
+		let invocation_id = new_id("host-tool");
+		let tool_call_id = params
+			.get("toolCallId")
+			.and_then(Value::as_str)
+			.map_or_else(|| new_id("call"), str::to_owned);
+		{
+			let mut state = self.state.lock();
+			if !state.host_tools.contains_key(name) {
+				return Err(CommandError::new(
+					"host_tool_not_found",
+					format!("host tool `{name}` is not registered"),
+				));
+			}
+			state
+				.pending_host_tools
+				.insert(invocation_id.clone(), PendingHostTool {
+					name:    name.to_owned(),
+					updates: Vec::new(),
+				});
+		}
+		let frame = HostToolCall {
+			kind: "host_tool_call".into(),
+			id: invocation_id.clone(),
+			tool_call_id: tool_call_id.clone(),
+			tool_name: name.to_owned(),
+			arguments,
+		};
+		self
+			.notify(serde_json::to_value(frame).map_err(CommandError::json)?)
+			.map_err(CommandError::transport)?;
+		Ok(json!({ "id": invocation_id, "toolCallId": tool_call_id }))
+	}
+
+	fn handle_side_channel(&self, value: Value) -> miette::Result<()> {
+		let kind = value
+			.get("type")
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_owned();
+		let parsed = match kind.as_str() {
+			"host_tool_update" => {
+				serde_json::from_value::<HostToolUpdate>(value).map(HostSideChannel::Update)
+			},
+			"host_tool_result" => {
+				serde_json::from_value::<HostToolResult>(value).map(HostSideChannel::Result)
+			},
+			"host_tool_cancel" => {
+				serde_json::from_value::<HostToolCancel>(value).map(HostSideChannel::Cancel)
+			},
+			_ => unreachable!("immediate frame classifier only admits host tool frames"),
+		};
+		let frame = match parsed {
+			Ok(frame) => frame,
+			Err(error) => {
+				return self.send_error(None, &kind, "invalid_request", error.to_string());
+			},
+		};
+		let event = {
+			let mut state = self.state.lock();
+			match frame {
+				HostSideChannel::Update(update) => {
+					let Some(pending) = state.pending_host_tools.get_mut(&update.id) else {
+						drop(state);
+						return self.send_error(
+							Some(RequestId::new(update.id.clone())),
+							&kind,
+							"host_tool_not_pending",
+							format!("host tool invocation `{}` is not pending", update.id),
+						);
+					};
+					pending.updates.push(update.partial_result.clone());
+					json!({
+						"type": "host_tool_progress",
+						"invocationId": update.id,
+						"name": pending.name,
+						"update": update.partial_result,
+					})
+				},
+				HostSideChannel::Result(result) => {
+					let Some(pending) = state.pending_host_tools.remove(&result.id) else {
+						drop(state);
+						return self.send_error(
+							Some(RequestId::new(result.id.clone())),
+							&kind,
+							"host_tool_not_pending",
+							format!("host tool invocation `{}` is not pending", result.id),
+						);
+					};
+					json!({
+						"type": "host_tool_complete",
+						"invocationId": result.id,
+						"name": pending.name,
+						"updates": pending.updates,
+						"result": result.result,
+						"isError": result.is_error,
+					})
+				},
+				HostSideChannel::Cancel(cancel) => {
+					let Some(pending) = state.pending_host_tools.remove(&cancel.target_id) else {
+						drop(state);
+						return self.send_error(
+							Some(RequestId::new(cancel.id.clone())),
+							&kind,
+							"host_tool_not_pending",
+							format!("host tool invocation `{}` is not pending", cancel.target_id),
+						);
+					};
+					json!({
+						"type": "host_tool_cancelled",
+						"invocationId": cancel.target_id,
+						"name": pending.name,
+					})
+				},
+			}
+		};
+		self.notify(event)
+	}
+
+	fn set_subscription(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let level = text(params, "level")?;
+		let subscription = match level {
+			"off" => Subscription::Off,
+			"progress" => Subscription::Progress,
+			"events" => Subscription::Events,
+			_ => {
+				return Err(CommandError::new(
+					"invalid_params",
+					"subscription must be off, progress, or events",
+				));
+			},
+		};
+		self.state.lock().subscription = subscription;
+		Ok(json!({ "level": level }))
+	}
+
+	fn get_subagents(&self) -> Result<Value, CommandError> {
+		let state = self.state.lock();
+		let mut snapshots = state.subagents.values().cloned().collect::<Vec<_>>();
+		snapshots.sort_by(|left, right| {
+			left
+				.index
+				.cmp(&right.index)
+				.then_with(|| left.id.cmp(&right.id))
+		});
+		Ok(json!({ "subscription": state.subscription.as_str(), "subagents": snapshots }))
+	}
+
+	async fn get_subagent_messages(
+		&self,
+		params: &Map<String, Value>,
+	) -> Result<Value, CommandError> {
+		let params = parse_params::<GetSubagentMessagesParams>(params)?;
+		let requested_from = params.from_byte.unwrap_or(0);
+		let (root, relative) = {
+			let state = self.state.lock();
+			let root = state.session_dir.clone().ok_or_else(|| {
+				CommandError::new("unsupported_operation", "no --session-dir was configured")
+			})?;
+			let relative = if let Some(session_file) = params.session_file {
+				PathBuf::from(session_file)
+			} else {
+				let id = params.subagent_id.ok_or_else(|| {
+					CommandError::new("invalid_params", "subagentId or sessionFile is required")
+				})?;
+				state
+					.subagents
+					.get(&id)
+					.ok_or_else(|| {
+						CommandError::new("subagent_not_found", format!("unknown subagent `{id}`"))
+					})?
+					.transcript_path
+					.clone()
+					.ok_or_else(|| {
+						CommandError::new("transcript_unavailable", "subagent has no transcript path")
+					})?
+			};
+			(root, relative)
+		};
+		let root = tokio::fs::canonicalize(root)
+			.await
+			.map_err(CommandError::io)?;
+		let path = tokio::fs::canonicalize(root.join(&relative))
+			.await
+			.map_err(CommandError::io)?;
+		if !path.starts_with(&root) {
+			return Err(CommandError::new(
+				"invalid_params",
+				"subagent transcript escapes --session-dir",
+			));
+		}
+		let session_file = relative.to_string_lossy().into_owned();
+		let previous_length = {
+			let state = self.state.lock();
+			state
+				.transcript_lru
+				.iter()
+				.find(|(entry, _)| entry == &session_file)
+				.map(|(_, length)| *length)
+		};
+		let bytes = tokio::fs::read(&path).await.map_err(CommandError::io)?;
+		let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+		let reset =
+			requested_from > length || previous_length.is_some_and(|previous| length < previous);
+		let from_byte = if reset { 0 } else { requested_from };
+		let start = usize::try_from(from_byte)
+			.unwrap_or(bytes.len())
+			.min(bytes.len());
+		let limit = start.saturating_add(SUBAGENT_READ_BYTES).min(bytes.len());
+		let end = if limit < bytes.len() {
+			bytes[start..limit]
+				.iter()
+				.rposition(|byte| *byte == b'\n')
+				.map_or(limit, |offset| start + offset + 1)
+		} else {
+			limit
+		};
+		let (entries, messages) = decode_transcript_entries(&bytes[start..end]);
+		{
+			let mut state = self.state.lock();
+			state.touch_transcript(&session_file, length);
+		}
+		let result = SubagentMessages {
+			session_file,
+			from_byte,
+			next_byte: u64::try_from(end).unwrap_or(u64::MAX),
+			reset,
+			entries,
+			messages,
+		};
+		serde_json::to_value(result).map_err(CommandError::json)
+	}
+
+	fn notify_session_start(&self) -> miette::Result<()> {
+		let state = self.state.lock();
+		let session = state.current_session();
+		self.notify(json!({ "type": "session_start", "sessionId": session.id, "name": session.name }))
+	}
+
+	fn notify_session_info(&self) -> miette::Result<()> {
+		let state = self.state.lock();
+		let session = state.current_session();
+		self.notify(
+			json!({ "type": "session_info_update", "sessionId": session.id, "name": session.name }),
+		)
+	}
+
+	fn notify(&self, value: Value) -> miette::Result<()> {
+		emit(&self.output, value)
+	}
+
+	fn send_success(&self, id: Option<RequestId>, command: &str, data: Value) -> miette::Result<()> {
+		let response = RpcResponse::success(id, command, data).into_diagnostic()?;
+		self.notify(serde_json::to_value(response).into_diagnostic()?)
+	}
+
+	fn send_error(
+		&self,
+		id: Option<RequestId>,
+		command: &str,
+		code: impl Into<String>,
+		message: impl Into<String>,
+	) -> miette::Result<()> {
+		let response = RpcResponse::error(id, command, message, Some(RpcErrorCode::new(code)));
+		self.notify(serde_json::to_value(response).into_diagnostic()?)
+	}
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetModelParams {
+	provider: String,
+	model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchSessionParams {
+	session_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginParams {
+	provider_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BashParams {
+	command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetSubagentMessagesParams {
+	#[serde(default)]
+	subagent_id:  Option<String>,
+	#[serde(default)]
+	session_file: Option<String>,
+	#[serde(default)]
+	from_byte:    Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigState {
+	model:           String,
+	provider:        Option<String>,
+	thinking_level:  String,
+	fast_mode:       bool,
+	steering_mode:   String,
+	follow_up_mode:  String,
+	interrupt_mode:  String,
+	auto_compaction: bool,
+	auto_retry:      bool,
+	todos:           Vec<Value>,
+}
+
+struct ActiveBash {
+	id:           String,
+	cancellation: CancellationToken,
+}
+
+enum HostSideChannel {
+	Update(HostToolUpdate),
+	Result(HostToolResult),
+	Cancel(HostToolCancel),
+}
+
+struct ServerState {
+	current:            String,
+	sessions:           HashMap<String, Session>,
+	active:             Option<CancellationToken>,
+	active_bash:        Option<ActiveBash>,
+	queue:              VecDeque<String>,
+	config:             ConfigState,
+	models:             Vec<String>,
+	providers:          Vec<OAuthProvider>,
+	project:            PathBuf,
+	session_dir:        Option<PathBuf>,
+	host_tools:         BTreeMap<String, Value>,
+	pending_host_tools: HashMap<String, PendingHostTool>,
+	subscription:       Subscription,
+	subagents:          HashMap<String, SubagentSnapshot>,
+	transcript_lru:     VecDeque<(String, u64)>,
+}
+
+impl ServerState {
+	fn new(
+		model: String,
+		models: Vec<String>,
+		providers: Vec<OAuthProvider>,
+		preferred_provider: Option<String>,
+		project: PathBuf,
+		session_dir: Option<PathBuf>,
+	) -> Self {
+		let id = new_id("session");
+		let mut sessions = HashMap::new();
+		sessions.insert(id.clone(), Session::new(id.clone(), None));
+		Self {
+			current: id,
+			sessions,
+			active: None,
+			active_bash: None,
+			queue: VecDeque::new(),
+			config: ConfigState {
+				model,
+				provider: preferred_provider,
+				thinking_level: "medium".into(),
+				fast_mode: false,
+				steering_mode: "steer".into(),
+				follow_up_mode: "followUp".into(),
+				interrupt_mode: "immediate".into(),
+				auto_compaction: true,
+				auto_retry: true,
+				todos: Vec::new(),
+			},
+			models,
+			providers,
+			project,
+			session_dir,
+			host_tools: BTreeMap::new(),
+			pending_host_tools: HashMap::new(),
+			subscription: Subscription::Off,
+			subagents: HashMap::new(),
+			transcript_lru: VecDeque::new(),
+		}
+	}
+
+	fn current_session(&self) -> &Session {
+		self
+			.sessions
+			.get(&self.current)
+			.expect("current session is retained")
+	}
+
+	fn current_mut(&mut self) -> &mut Session {
+		self
+			.sessions
+			.get_mut(&self.current)
+			.expect("current session is retained")
+	}
+
+	fn touch_transcript(&mut self, id: &str, length: u64) {
+		self.transcript_lru.retain(|(entry, _)| entry != id);
+		self.transcript_lru.push_back((id.to_owned(), length));
+		while self.transcript_lru.len() > MAX_SUBAGENT_TRANSCRIPTS {
+			self.transcript_lru.pop_front();
+		}
+	}
+}
+
+struct PendingHostTool {
+	name:    String,
+	updates: Vec<Value>,
+}
+
+#[derive(Clone, Copy)]
+enum Subscription {
+	Off,
+	Progress,
+	Events,
+}
+
+impl Subscription {
+	const fn as_str(self) -> &'static str {
+		match self {
+			Self::Off => "off",
+			Self::Progress => "progress",
+			Self::Events => "events",
+		}
+	}
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentSnapshot {
+	id:              String,
+	index:           u64,
+	status:          String,
+	task:            Option<String>,
+	assignment:      Option<String>,
+	progress:        Option<Value>,
+	transcript_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptMessage {
+	id:        String,
+	role:      String,
+	content:   String,
+	timestamp: u64,
+}
+
+#[derive(Clone)]
+struct Session {
+	id:         String,
+	name:       Option<String>,
+	parent:     Option<String>,
+	messages:   Vec<TranscriptMessage>,
+	revision:   u64,
+	leaf_id:    String,
+	created_at: u64,
+	updated_at: u64,
+}
+
+impl Session {
+	fn new(id: String, parent: Option<String>) -> Self {
+		let now = unix_millis();
+		Self {
+			id,
+			name: None,
+			parent,
+			messages: Vec::new(),
+			revision: 0,
+			leaf_id: new_id("leaf"),
+			created_at: now,
+			updated_at: now,
+		}
+	}
+
+	fn push_message(&mut self, role: &str, content: &str) {
+		self.messages.push(TranscriptMessage {
+			id:        new_id("message"),
+			role:      role.to_owned(),
+			content:   content.to_owned(),
+			timestamp: unix_millis(),
+		});
+		self.bump_revision();
+	}
+
+	fn bump_revision(&mut self) {
+		self.revision = self.revision.wrapping_add(1);
+		self.leaf_id = new_id("leaf");
+		self.updated_at = unix_millis();
+	}
+}
+
+fn build_request(session: &Session, orchestration: bool) -> ChatRequest {
+	let mut messages = Vec::with_capacity(session.messages.len() + usize::from(orchestration));
+	if orchestration {
+		messages.push(Message {
+			role:    Role::System,
+			content: Arc::from([ContentPart::Text {
+				text:  Str::from(ORCHESTRATE_NOTICE),
+				proof: None,
+			}]),
+			name:    None,
+		});
+	}
+	messages.extend(session.messages.iter().map(|message| Message {
+		role:    match message.role.as_str() {
+			"assistant" => Role::Assistant,
+			"system" => Role::System,
+			_ => Role::User,
+		},
+		content: Arc::from([ContentPart::Text {
+			text:  Str::from(message.content.clone()),
+			proof: None,
+		}]),
+		name:    None,
+	}));
+	ChatRequest {
+		messages:          Arc::from(messages),
+		tools:             Arc::from([]),
+		hosted_tools:      Arc::from([]),
+		tool_choice:       Setting::Unset,
+		output:            Setting::Unset,
+		reasoning:         Setting::Unset,
+		verbosity:         Setting::Unset,
+		cache_retention:   Setting::Unset,
+		service_tier:      Setting::Unset,
+		sampling:          Sampling::default(),
+		max_output_tokens: None,
+		top_logprobs:      None,
+		safety:            Arc::from([]),
+		negotiation:       NegotiationPolicy::default(),
+	}
+}
+
+fn session_from_params<'a>(
+	state: &'a ServerState,
+	params: &Map<String, Value>,
+) -> Result<&'a Session, CommandError> {
+	let id = params
+		.get("sessionId")
+		.and_then(Value::as_str)
+		.unwrap_or(&state.current);
+	state
+		.sessions
+		.get(id)
+		.ok_or_else(|| CommandError::new("session_not_found", format!("unknown session `{id}`")))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageCursor {
+	version:       u8,
+	session_id:    String,
+	leaf_id:       String,
+	message_count: usize,
+	revision:      u64,
+	offset:        usize,
+}
+
+fn message_page(
+	session: &Session,
+	encoded: Option<&str>,
+	limit: usize,
+) -> Result<Value, CommandError> {
+	let offset = if let Some(encoded) = encoded {
+		let cursor: PageCursor = serde_json::from_slice(&decode_base64url(encoded)?)
+			.map_err(|_| CommandError::new("stale_cursor", "cursor is invalid"))?;
+		if cursor.version != 1
+			|| cursor.session_id != session.id
+			|| cursor.leaf_id != session.leaf_id
+			|| cursor.message_count != session.messages.len()
+			|| cursor.revision != session.revision
+		{
+			return Err(CommandError::new(
+				"stale_cursor",
+				"transcript changed since the cursor was issued",
+			));
+		}
+		cursor.offset
+	} else {
+		0
+	};
+	if offset > session.messages.len() {
+		return Err(CommandError::new("stale_cursor", "cursor offset is outside the transcript"));
+	}
+	let mut messages = Vec::new();
+	let mut bytes = 0;
+	for message in session.messages.iter().skip(offset).take(limit) {
+		let size = serde_json::to_vec(message)
+			.map_err(CommandError::json)?
+			.len();
+		if !messages.is_empty() && bytes + size > MAX_PAGE_BYTES {
+			break;
+		}
+		bytes += size;
+		messages.push(message.clone());
+	}
+	let next_offset = offset + messages.len();
+	let cursor = if next_offset < session.messages.len() {
+		let cursor = PageCursor {
+			version:       1,
+			session_id:    session.id.clone(),
+			leaf_id:       session.leaf_id.clone(),
+			message_count: session.messages.len(),
+			revision:      session.revision,
+			offset:        next_offset,
+		};
+		Some(encode_base64url(&serde_json::to_vec(&cursor).map_err(CommandError::json)?))
+	} else {
+		None
+	};
+	Ok(
+		json!({ "sessionId": session.id, "messages": messages, "nextCursor": cursor, "bytes": bytes }),
+	)
+}
+
+fn contains_orchestrate(input: &str) -> bool {
+	let bytes = input.as_bytes();
+	let mut index = 0;
+	let mut fenced: Option<u8> = None;
+	let mut inline = false;
+	let mut tag = false;
+	while index < bytes.len() {
+		if !inline
+			&& !tag
+			&& (bytes[index..].starts_with(b"```") || bytes[index..].starts_with(b"~~~"))
+		{
+			let marker = bytes[index];
+			if fenced == Some(marker) {
+				fenced = None;
+			} else if fenced.is_none() {
+				fenced = Some(marker);
+			}
+			index += 3;
+			continue;
+		}
+		if fenced.is_some() {
+			index += 1;
+			continue;
+		}
+		match bytes[index] {
+			b'`' if !tag => {
+				inline = !inline;
+				index += 1;
+				continue;
+			},
+			b'<' if !inline => {
+				tag = true;
+				index += 1;
+				continue;
+			},
+			b'>' if tag => {
+				tag = false;
+				index += 1;
+				continue;
+			},
+			_ => {},
+		}
+		if !inline && !tag && bytes[index..].starts_with(b"orchestrate") {
+			let before = index.checked_sub(1).and_then(|at| bytes.get(at)).copied();
+			let after = bytes.get(index + "orchestrate".len()).copied();
+			if !before.is_some_and(is_word_byte) && !after.is_some_and(is_word_byte) {
+				return true;
+			}
+		}
+		index += 1;
+	}
+	false
+}
+
+const fn is_word_byte(byte: u8) -> bool {
+	byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn oauth_providers_value(providers: &[OAuthProvider]) -> Value {
+	json!({ "providers": providers })
+}
+
+fn host_tool_names_value(tool_names: Vec<String>) -> Value {
+	json!({ "toolNames": tool_names })
+}
+
+fn parse_params<P>(params: &Map<String, Value>) -> Result<P, CommandError>
+where
+	P: for<'de> Deserialize<'de>,
+{
+	serde_json::from_value(Value::Object(params.clone()))
+		.map_err(|error| CommandError::new("invalid_params", error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+	let shell = std::env::var_os("SHELL")
+		.filter(|value| !value.is_empty())
+		.unwrap_or_else(|| "/bin/sh".into());
+	let mut process = Command::new(shell);
+	process.arg("-lc").arg(command);
+	process
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+	let mut process = Command::new("cmd");
+	process.arg("/C").arg(command);
+	process
+}
+
+fn decode_transcript_entries(bytes: &[u8]) -> (Vec<Value>, Vec<Value>) {
+	let entries = bytes
+		.split(|byte| *byte == b'\n')
+		.filter_map(|line| {
+			let line = line.strip_suffix(b"\r").unwrap_or(line);
+			(!line.is_empty())
+				.then(|| serde_json::from_slice::<Value>(line).ok())
+				.flatten()
+		})
+		.collect::<Vec<_>>();
+	let messages = entries.iter().filter_map(renderable_message).collect();
+	(entries, messages)
+}
+
+fn renderable_message(entry: &Value) -> Option<Value> {
+	if entry.get("role").and_then(Value::as_str).is_some() {
+		return Some(entry.clone());
+	}
+	["/message", "/data/message", "/item/message", "/data/item/message"]
+		.into_iter()
+		.find_map(|pointer| {
+			entry
+				.pointer(pointer)
+				.filter(|value| value.is_object())
+				.cloned()
+		})
+}
+
+fn text<'a>(params: &'a Map<String, Value>, key: &str) -> Result<&'a str, CommandError> {
+	params
+		.get(key)
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.ok_or_else(|| {
+			CommandError::new("invalid_params", format!("`{key}` must be a non-empty string"))
+		})
+}
+
+fn boolean(params: &Map<String, Value>, key: &str) -> Result<bool, CommandError> {
+	params
+		.get(key)
+		.and_then(Value::as_bool)
+		.ok_or_else(|| CommandError::new("invalid_params", format!("`{key}` must be a boolean")))
+}
+
+fn unsigned(params: &Map<String, Value>, key: &str) -> Result<u64, CommandError> {
+	params.get(key).and_then(Value::as_u64).ok_or_else(|| {
+		CommandError::new("invalid_params", format!("`{key}` must be an unsigned integer"))
+	})
+}
+fn emit(sender: &Sender<Value>, value: Value) -> miette::Result<()> {
+	sender.send(value).into_diagnostic()
+}
+
+#[derive(Debug)]
+struct CommandError {
+	code:    &'static str,
+	message: String,
+}
+
+impl CommandError {
+	fn new(code: &'static str, message: impl Into<String>) -> Self {
+		Self { code, message: message.into() }
+	}
+
+	fn transport(error: miette::Report) -> Self {
+		Self::new("transport_error", error.to_string())
+	}
+
+	fn json(error: serde_json::Error) -> Self {
+		Self::new("serialization_error", error.to_string())
+	}
+
+	fn io(error: std::io::Error) -> Self {
+		Self::new("transcript_unavailable", error.to_string())
+	}
+}
+
+fn supported_commands() -> &'static [&'static str] {
+	&[
+		"prompt",
+		"steer",
+		"follow_up",
+		"abort",
+		"abort_and_prompt",
+		"new_session",
+		"get_state",
+		"set_model",
+		"cycle_model",
+		"get_available_models",
+		"set_fast_mode",
+		"set_thinking_level",
+		"cycle_thinking_level",
+		"set_steering_mode",
+		"set_follow_up_mode",
+		"set_interrupt_mode",
+		"compact",
+		"set_auto_compaction",
+		"set_auto_retry",
+		"abort_retry",
+		"set_todos",
+		"bash",
+		"abort_bash",
+		"get_session_stats",
+		"export_html",
+		"switch_session",
+		"branch",
+		"get_branch_messages",
+		"get_last_assistant_text",
+		"set_session_name",
+		"handoff",
+		"get_messages",
+		"get_messages_page",
+		"get_login_providers",
+		"login",
+		"set_host_tools",
+		"call_host_tool",
+		"set_subagent_subscription",
+		"get_subagents",
+		"get_subagent_messages",
+	]
+}
+
+fn unix_millis() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
+}
+
+fn new_id(prefix: &str) -> String {
+	format!("{prefix}-{}-{}", std::process::id(), turn_id())
+}
+
+fn escape_html(text: &str) -> String {
+	text
+		.replace('&', "&amp;")
+		.replace('<', "&lt;")
+		.replace('>', "&gt;")
+		.replace('"', "&quot;")
+}
+
+fn encode_base64url(input: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+	for chunk in input.chunks(3) {
+		let bits = u32::from(chunk[0]) << 16
+			| u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+			| u32::from(*chunk.get(2).unwrap_or(&0));
+		output.push(char::from(ALPHABET[((bits >> 18) & 63) as usize]));
+		output.push(char::from(ALPHABET[((bits >> 12) & 63) as usize]));
+		if chunk.len() > 1 {
+			output.push(char::from(ALPHABET[((bits >> 6) & 63) as usize]));
+		}
+		if chunk.len() > 2 {
+			output.push(char::from(ALPHABET[(bits & 63) as usize]));
+		}
+	}
+	output
+}
+
+fn decode_base64url(input: &str) -> Result<Vec<u8>, CommandError> {
+	if input.len() % 4 == 1 {
+		return Err(CommandError::new("stale_cursor", "cursor has invalid base64url length"));
+	}
+	let mut output = Vec::with_capacity(input.len() / 4 * 3);
+	for chunk in input.as_bytes().chunks(4) {
+		let mut bits = 0_u32;
+		for (index, byte) in chunk.iter().enumerate() {
+			let value = match byte {
+				b'A'..=b'Z' => byte - b'A',
+				b'a'..=b'z' => byte - b'a' + 26,
+				b'0'..=b'9' => byte - b'0' + 52,
+				b'-' => 62,
+				b'_' => 63,
+				_ => return Err(CommandError::new("stale_cursor", "cursor is not base64url")),
+			};
+			bits |= u32::from(value) << (18 - index * 6);
+		}
+		output.push((bits >> 16) as u8);
+		if chunk.len() > 2 {
+			output.push((bits >> 8) as u8);
+		}
+		if chunk.len() > 3 {
+			output.push(bits as u8);
+		}
+	}
+	Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn detects_only_standalone_lowercase_orchestrate_in_prose() {
+		assert!(contains_orchestrate("please orchestrate this work"));
+		assert!(contains_orchestrate("(orchestrate)"));
+		assert!(!contains_orchestrate("Orchestrate this"));
+		assert!(!contains_orchestrate("orchestrated work"));
+		assert!(!contains_orchestrate("`orchestrate`"));
+		assert!(!contains_orchestrate("```text\norchestrate\n```"));
+		assert!(!contains_orchestrate("<orchestrate value=\"yes\">"));
+	}
+
+	#[test]
+	fn transcript_cursor_paginates_and_invalidates_on_mutation() {
+		let mut session = Session::new("session-a".into(), None);
+		for index in 0..5 {
+			session.push_message("user", &format!("message {index}"));
+		}
+		let first = message_page(&session, None, 2).expect("first page");
+		assert_eq!(first["messages"].as_array().expect("messages").len(), 2);
+		let cursor = first["nextCursor"].as_str().expect("cursor").to_owned();
+		let second = message_page(&session, Some(&cursor), 2).expect("second page");
+		assert_eq!(second["messages"][0]["content"], "message 2");
+		session.push_message("assistant", "changed");
+		assert_eq!(
+			message_page(&session, Some(&cursor), 2)
+				.expect_err("stale")
+				.code,
+			"stale_cursor"
+		);
+	}
+
+	#[tokio::test]
+	async fn ordinary_dispatch_channel_preserves_fifo_order() {
+		let (sender, receiver) = flume::unbounded();
+		for value in 0..64_u64 {
+			sender.send_async(value).await.expect("send");
+		}
+		drop(sender);
+		let mut observed = Vec::new();
+		while let Ok(value) = receiver.recv_async().await {
+			observed.push(value);
+		}
+		assert_eq!(observed, (0..64).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn corrected_command_params_use_sdk_field_names() {
+		let set_model = json!({ "provider": "anthropic", "modelId": "claude" });
+		let parsed =
+			parse_params::<SetModelParams>(set_model.as_object().expect("object")).expect("set model");
+		assert_eq!(parsed.provider, "anthropic");
+		assert_eq!(parsed.model_id, "claude");
+
+		let switch = json!({ "sessionPath": "sessions/one.jsonl" });
+		let parsed = parse_params::<SwitchSessionParams>(switch.as_object().expect("object"))
+			.expect("switch session");
+		assert_eq!(parsed.session_path, "sessions/one.jsonl");
+
+		let login = json!({ "providerId": "openai" });
+		let parsed = parse_params::<LoginParams>(login.as_object().expect("object")).expect("login");
+		assert_eq!(parsed.provider_id, "openai");
+
+		let subagent = json!({
+			"subagentId": "sub-1",
+			"sessionFile": "sub-1.jsonl",
+			"fromByte": 42,
+		});
+		let parsed = parse_params::<GetSubagentMessagesParams>(subagent.as_object().expect("object"))
+			.expect("subagent messages");
+		assert_eq!(parsed.subagent_id.as_deref(), Some("sub-1"));
+		assert_eq!(parsed.session_file.as_deref(), Some("sub-1.jsonl"));
+		assert_eq!(parsed.from_byte, Some(42));
+	}
+
+	#[test]
+	fn corrected_results_match_sdk_wire_types() {
+		let provider = OAuthProvider {
+			id:            "openai".into(),
+			name:          "OpenAI".into(),
+			available:     true,
+			authenticated: false,
+		};
+		let providers = oauth_providers_value(std::slice::from_ref(&provider));
+		assert_eq!(
+			providers,
+			json!({
+				"providers": [{
+					"id": "openai",
+					"name": "OpenAI",
+					"available": true,
+					"authenticated": false,
+				}],
+			})
+		);
+		let decoded: OAuthProvider =
+			serde_json::from_value(providers["providers"][0].clone()).expect("OAuth provider");
+		assert_eq!(decoded, provider);
+
+		assert_eq!(host_tool_names_value(vec!["search".into()]), json!({ "toolNames": ["search"] }));
+
+		let messages = SubagentMessages {
+			session_file: "sub-1.jsonl".into(),
+			from_byte:    4,
+			next_byte:    9,
+			reset:        false,
+			entries:      vec![json!({ "type": "entry" })],
+			messages:     vec![json!({ "role": "assistant", "content": "done" })],
+		};
+		let value = serde_json::to_value(&messages).expect("subagent result");
+		assert_eq!(value["sessionFile"], "sub-1.jsonl");
+		assert_eq!(value["fromByte"], 4);
+		assert_eq!(value["nextByte"], 9);
+		assert!(value.get("entries").is_some());
+		assert!(value.get("messages").is_some());
+		let decoded: SubagentMessages = serde_json::from_value(value).expect("SDK subagent result");
+		assert_eq!(decoded, messages);
+	}
+
+	#[test]
+	fn host_side_channel_frames_use_canonical_fields() {
+		let call = HostToolCall {
+			kind:         "host_tool_call".into(),
+			id:           "inv-1".into(),
+			tool_call_id: "call-1".into(),
+			tool_name:    "search".into(),
+			arguments:    Map::from_iter([("query".into(), json!("rust"))]),
+		};
+		assert_eq!(
+			serde_json::to_value(call).expect("host call"),
+			json!({
+				"type": "host_tool_call",
+				"id": "inv-1",
+				"toolCallId": "call-1",
+				"toolName": "search",
+				"arguments": { "query": "rust" },
+			})
+		);
+
+		let update: HostToolUpdate = serde_json::from_value(json!({
+			"type": "host_tool_update",
+			"id": "inv-1",
+			"partialResult": { "progress": 1 },
+		}))
+		.expect("host update");
+		assert_eq!(update.id, "inv-1");
+		assert_eq!(update.partial_result["progress"], 1);
+
+		let result: HostToolResult = serde_json::from_value(json!({
+			"type": "host_tool_result",
+			"id": "inv-1",
+			"result": "done",
+			"isError": false,
+		}))
+		.expect("host result");
+		assert_eq!(result.result, "done");
+
+		let cancel: HostToolCancel = serde_json::from_value(json!({
+			"type": "host_tool_cancel",
+			"id": "cancel-1",
+			"targetId": "inv-1",
+		}))
+		.expect("host cancel");
+		assert_eq!(cancel.target_id, "inv-1");
+	}
+
+	#[test]
+	fn shell_commands_bypass_the_ordinary_fifo() {
+		assert!(is_immediate_frame(&json!({ "type": "bash", "command": "echo ok" })));
+		assert!(is_immediate_frame(&json!({ "type": "abort_bash" })));
+		assert!(is_immediate_frame(&json!({
+			"type": "extension_ui_response",
+			"id": "ui-1",
+		})));
+		assert!(!is_immediate_frame(&json!({ "type": "get_state" })));
+	}
+
+	#[test]
+	fn stdin_claim_is_exclusive_and_released_by_guard() {
+		let first = StdinClaim::claim().expect("first claim");
+		assert!(StdinClaim::claim().is_err());
+		drop(first);
+		assert!(StdinClaim::claim().is_ok());
+	}
+}

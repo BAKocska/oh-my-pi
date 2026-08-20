@@ -629,13 +629,17 @@ fn attribute_error(
 }
 
 fn fallback_is_safe(error: &Error, has_next: bool) -> bool {
-	has_next
-		&& !error.committed
-		&& error.action == RetryAction::ReselectRoute
-		&& error.receipt().attempts.last().is_some_and(|attempt| {
-			attempt.outcome != AttemptOutcome::FailedCommitted
-				&& attempt.body.retry_decision == RetryDecision::Allow
-		})
+	if !has_next || error.committed || error.action != RetryAction::ReselectRoute {
+		return false;
+	}
+	if error.receipt().attempts.is_empty() {
+		return error.phase == crate::error::ErrorPhase::Admission
+			&& error.kind == ErrorKind::QuotaExhausted;
+	}
+	error.receipt().attempts.last().is_some_and(|attempt| {
+		attempt.outcome != AttemptOutcome::FailedCommitted
+			&& attempt.body.retry_decision == RetryDecision::Allow
+	})
 }
 
 fn hide_attempts_since(context: &ExecutionContext, start: usize) {

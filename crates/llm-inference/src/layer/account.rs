@@ -67,11 +67,21 @@ where
 	) -> Result<Self::Account, Error> {
 		let affinity = context.session_affinity();
 		let selection = (self.map)(request, context.attempt_action(), affinity.as_ref());
-		self.pool.select(&selection).map_err(|_| {
+		self.pool.select(&selection).map_err(|failure| {
+			let action = match failure.reserve_policy {
+				Some(crate::account::QuotaReservePolicy::FallbackPercent(_)) => {
+					crate::error::RetryAction::ReselectRoute
+				},
+				Some(
+					crate::account::QuotaReservePolicy::FailClosedPercent(_)
+					| crate::account::QuotaReservePolicy::Disabled,
+				)
+				| None => crate::error::RetryAction::Never,
+			};
 			Error::new(
 				crate::error::ErrorKind::QuotaExhausted,
 				crate::error::ErrorPhase::Admission,
-				crate::error::RetryAction::Never,
+				action,
 				context.receipt(),
 			)
 		})

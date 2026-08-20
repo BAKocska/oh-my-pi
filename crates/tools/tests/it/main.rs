@@ -1,3 +1,6 @@
+//! Consolidated omp-tools integration harness; one binary per crate keeps
+//! static links off the per-file hot path.
+
 mod documents;
 mod edit;
 mod eval;

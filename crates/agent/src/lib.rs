@@ -42,8 +42,8 @@ pub use batch::{
 	InvocationHookRequest, SpeculativeCall, ToolBatch, hook_event_mask,
 };
 pub use broker::{
-	Broker, BrokerError, BrokerInbox, DeliveryMode, PeerMessage, Receipt, now_ms as broker_now_ms,
-	peer_item,
+	AgentRegistry, Broker, BrokerError, BrokerInbox, DeliveryMode, PeerMessage, Receipt,
+	now_ms as broker_now_ms, peer_item,
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionCoordinator, CompactionDecision,
@@ -62,6 +62,7 @@ pub use context::{
 pub use continuation::{
 	AgentSettledEvent, Continuation, ContinuationLedger, continues_loop, from_hook,
 };
+pub use control::{ControlError, ControlSender, RewindAck};
 pub use events::{AgentEvent, AgentPhase, EventBus, EventSubscription, LossyEventSubscription};
 pub use hooks::{
 	AgentSettled, Composition, ContextPatch, DomainReturn, GateDecision, GateError, GateEvent,
@@ -69,7 +70,10 @@ pub use hooks::{
 	OnFailure, ProviderFailover, SourceRef, Subscription, TransformTrail, When,
 };
 pub use inproc::{InProcTurnClient, RpcTurnClient, RpcTurnSession};
-pub use jobs::{JobBoard, PendingJobs};
+pub use jobs::{
+	CancelOutcome, JobBoard, JobClaimError, JobError, JobSettlement, JobWatch, PendingJobs,
+	SettlementLease,
+};
 pub use journal::{
 	AbortDisposition, Compact, Journal, JournalAuthor, JournalCustomEntry, JournalError,
 	JournalGenerations, JournalOperation, JournalQuery, JournalReply, JournalRequest,
@@ -112,9 +116,10 @@ pub use schedule::{
 };
 pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError};
 pub use tree::{
-	AgentKind, AgentNode, AgentStatus, AgentTree, Budget, BudgetCeiling, BudgetExceeded,
-	BudgetRemainder, DEFAULT_MAX_ADMISSION_QUEUE, DEFAULT_MAX_CONCURRENCY, EffectsOperation,
-	SpawnPermit, SpawnRefusal, Usage, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	AgentDefinition, AgentDefinitionError, AgentKind, AgentNode, AgentStatus, AgentTree, Budget,
+	BudgetCeiling, BudgetExceeded, BudgetRemainder, DEFAULT_MAX_ADMISSION_QUEUE,
+	DEFAULT_MAX_CONCURRENCY, EffectsOperation, MAX_YIELD_SCHEMA_RETRIES, SpawnPermit, SpawnPolicy,
+	SpawnRefusal, Usage, YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	enforce_minimum_phase,
 };
 pub use turn::{

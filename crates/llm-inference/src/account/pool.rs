@@ -110,12 +110,43 @@ pub enum Eligibility {
 		/// Known quota reset time, if supplied by the provider.
 		reset_at: Option<SystemTime>,
 	},
+	/// Known quota remains, but policy reserves it for higher-priority work.
+	QuotaReserved {
+		/// Smallest observed remaining amount.
+		remaining: Option<u64>,
+		/// Configured remaining percentage threshold.
+		percent:   u8,
+	},
 	/// Rotation policy forbids leaving the previous account.
 	RotationForbidden,
 	/// Rotation policy requires the previous principal.
 	PrincipalMismatch,
 	/// Explicit rotation excludes the preceding account.
 	PreviousAccount,
+}
+
+/// Usage-aware reserve behavior applied before credential or network work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuotaReservePolicy {
+	/// Do not reserve known provider quota.
+	#[default]
+	Disabled,
+	/// Degrade through the preplanned model/route fallback chain when any known
+	/// window falls below this remaining percentage.
+	FallbackPercent(u8),
+	/// Refuse the call rather than consuming the reserve.
+	FailClosedPercent(u8),
+}
+
+impl QuotaReservePolicy {
+	fn percent(self) -> Option<u8> {
+		match self {
+			Self::Disabled => None,
+			Self::FallbackPercent(percent) | Self::FailClosedPercent(percent) => {
+				Some(percent.min(100))
+			},
+		}
+	}
 }
 
 /// Evidence retained for every account considered by a selection.
@@ -213,7 +244,9 @@ pub struct AccountSelectionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountPoolError {
 	/// Complete evidence accumulated before failure.
-	pub receipt: SelectionReceipt,
+	pub receipt:        SelectionReceipt,
+	/// Reserve policy responsible for the preflight refusal, if any.
+	pub reserve_policy: Option<QuotaReservePolicy>,
 }
 
 impl fmt::Display for AccountPoolError {
@@ -301,6 +334,7 @@ struct PoolState {
 	rejections:      BTreeMap<AccountId, Rejection>,
 	rate:            BTreeMap<AccountId, RateState>,
 	quota:           BTreeMap<AccountId, QuotaState>,
+	quota_reserve:   QuotaReservePolicy,
 	affinities:      BTreeMap<AffinityScope, AccountAffinity>,
 }
 
@@ -332,6 +366,20 @@ impl AccountPool {
 	/// Returns the durable account-state dependency, when configured.
 	pub const fn state_store(&self) -> Option<&Arc<AccountStateStore>> {
 		self.store.as_ref()
+	}
+
+	/// Replaces the account-pool quota reserve used by the attempt spine.
+	///
+	/// The preflight uses only provider-observed remaining/limit pairs. Unknown
+	/// quota never becomes an invented denial.
+	pub fn set_quota_reserve(&self, policy: QuotaReservePolicy) {
+		self.state.write().quota_reserve = policy;
+	}
+
+	/// Returns the active usage-aware reserve policy.
+	#[must_use]
+	pub fn quota_reserve(&self) -> QuotaReservePolicy {
+		self.state.read().quota_reserve
 	}
 
 	/// Inserts or atomically replaces metadata while enforcing stable account
@@ -738,6 +786,10 @@ impl AccountPool {
 			.filter_map(|candidate| candidate.eligible_at)
 			.filter(|eligible_at| eligible_at > &request.now)
 			.min();
+		let reserve_policy = candidates
+			.iter()
+			.any(|candidate| matches!(candidate.eligibility, Eligibility::QuotaReserved { .. }))
+			.then_some(state.quota_reserve);
 		let receipt = SelectionReceipt {
 			provider: request.provider.clone(),
 			route: request.route.clone(),
@@ -746,10 +798,10 @@ impl AccountPool {
 			retry_at,
 		};
 		let Some((_, _, _, selected_id, _)) = ranked.into_iter().next() else {
-			return Err(AccountPoolError { receipt });
+			return Err(AccountPoolError { receipt, reserve_policy });
 		};
 		let Some(record) = state.accounts.get(&selected_id).cloned() else {
-			return Err(AccountPoolError { receipt });
+			return Err(AccountPoolError { receipt, reserve_policy });
 		};
 		let routing = record.routing_context();
 		let account_change = AccountChangeEvidence::new(
@@ -848,6 +900,15 @@ fn eligibility(
 		QuotaAvailability::ExhaustedUnknownReset => {
 			return Eligibility::QuotaExhausted { reset_at: None };
 		},
+	}
+	if let Some(percent) = state.quota_reserve.percent()
+		&& let Some(quota) = state.quota.get(&record.account)
+		&& quota.below_remaining_percent(request.now, percent)
+	{
+		return Eligibility::QuotaReserved {
+			remaining: quota.minimum_remaining(request.now),
+			percent,
+		};
 	}
 	match state
 		.rate

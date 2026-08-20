@@ -1,0 +1,157 @@
+//! Private no-op reasoning scratch tool.
+
+use std::fmt;
+
+use async_stream::stream;
+use futures::Stream;
+use omp_core::Str;
+use omp_tool::{
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
+	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// Arguments accepted by `think@1`.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Params {
+	/// Private reasoning note retained in the durable tool-call journal.
+	#[schemars(with = "String")]
+	pub thoughts: Str,
+}
+
+/// Durable acknowledgement. The thoughts remain in the call arguments rather
+/// than being copied into the model-facing result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Payload {
+	/// Confirms that the note was committed with the tool call.
+	pub recorded: bool,
+}
+
+/// Think does not stream updates.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Update {}
+
+/// A rejected scratch note.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Fault {
+	message: Str,
+}
+impl fmt::Display for Fault {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.message)
+	}
+}
+impl std::error::Error for Fault {}
+
+/// No-op scratch executor; normal tool journaling is the note's durable truth.
+pub struct Think {
+	spec: ToolSpec,
+}
+
+/// Creates `think@1`.
+#[must_use]
+pub fn tool() -> Think {
+	Think {
+		spec: ToolSpec {
+			name:            Str::new_static("think"),
+			rev:             Rev { family: Str::new_static(""), n: 1 },
+			description:     Str::new_static(
+				"Records a private reasoning scratch note. It has no external effect and returns only \
+				 an acknowledgement.",
+			),
+			schema:          omp_tool::schema::<Params>(),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects::empty(),
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("think.rs"),
+			),
+		},
+	}
+}
+
+impl Tool for Think {
+	type Fault = Fault;
+	type Params = Params;
+	type Payload = Payload;
+	type Update = Update;
+
+	fn spec(&self) -> &ToolSpec {
+		&self.spec
+	}
+
+	fn call<'c>(
+		&'c self,
+		mut incoming: IncomingParams<'c>,
+	) -> impl Stream<Item = Ev<Update, Payload, Fault>> + Send + 'c {
+		stream! {
+			let params = match incoming.whole::<Params>().await {
+				Ok(value) => value,
+				Err(error) => { yield param_event(error); return; }
+			};
+			if params.thoughts.trim().is_empty() {
+				yield Ev::Done(ToolTerminal::Done { result: Err(Fault { message: Str::new_static("thoughts must not be empty") }), useless: true });
+				return;
+			}
+			if let Err(error) = incoming.interruptable().committed().await { yield commit_event(error); return; }
+			yield Ev::Done(ToolTerminal::Done { result: Ok(Payload { recorded: true }), useless: false });
+		}
+	}
+
+	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
+		vec![Part::Text {
+			text: match view {
+				Ok(_) => Str::new_static("------"),
+				Err(fault) => Str::from(fault.to_string()),
+			},
+		}]
+	}
+}
+
+fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {
+	match error {
+		ParamError::Args(issue) => Ev::Args(*issue),
+		ParamError::Interrupted(interrupt) => {
+			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+		},
+		ParamError::Protocol(message) => Ev::Args(protocol_issue(message)),
+	}
+}
+fn commit_event(error: CommitError) -> Ev<Update, Payload, Fault> {
+	match error {
+		CommitError::Aborted => Ev::Aborted(Abort::InputDropped),
+		CommitError::Interrupted(interrupt) => {
+			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+		},
+		CommitError::Protocol(message) => Ev::Args(protocol_issue(message)),
+	}
+}
+fn protocol_issue(message: Str) -> ArgIssue {
+	ArgIssue {
+		path:     Vec::new(),
+		expected: Str::new_static("one committed JSON argument object"),
+		kind:     ArgIssueKind::Protocol,
+		example:  Some(Str::new_static(r#"{"thoughts":"reasoning"}"#)),
+		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn scratch_schema_is_closed_and_requires_text() {
+		assert!(
+			serde_json::from_value::<Params>(serde_json::json!({"thoughts":"private","visible":true}))
+				.is_err()
+		);
+		assert!(serde_json::from_value::<Params>(serde_json::json!({"thoughts":"private"})).is_ok());
+	}
+}

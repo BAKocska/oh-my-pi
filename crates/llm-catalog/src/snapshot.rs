@@ -7,9 +7,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
 	compile::{CatalogAlias, CompileError, CompiledCatalog},
+	contrib::RuntimeProviderRecords,
 	id::{
-		AuthSpecId, DiscoverySpecId, HeaderProfileId, ModelKey, OAuthSpecId, ProviderId, RouteId,
-		ThinkingPolicyId, WirePolicyId,
+		AuthSpecId, CatalogRevision, DiscoverySpecId, HeaderProfileId, ModelKey, OAuthSpecId,
+		ProviderId, RouteId, ThinkingPolicyId, WirePolicyId,
 	},
 	model::ModelSpec,
 	policy::WirePolicy,
@@ -219,6 +220,71 @@ impl Catalog {
 		})
 	}
 
+	/// Rebuilds a validated immutable snapshot with one admitted
+	/// `@omp.provider` contribution.
+	///
+	/// Registration and teardown are generation swaps: callers retain the old
+	/// snapshot for in-flight requests and publish the returned snapshot through
+	/// the inference registry only after every route service is constructed.
+	pub fn with_runtime_provider(
+		&self,
+		records: &RuntimeProviderRecords,
+	) -> Result<Self, SnapshotError> {
+		let mut compiled = self.compiled.clone();
+		upsert_record(&mut compiled.providers, records.provider.clone(), |record| record.id.clone());
+		for auth in &records.auth_specs {
+			upsert_record(&mut compiled.auth_specs, auth.clone(), |record| record.id.clone());
+		}
+		for oauth in &records.oauth_specs {
+			upsert_record(&mut compiled.oauth_specs, oauth.clone(), |record| record.id.clone());
+		}
+		for route in &records.routes {
+			upsert_record(&mut compiled.routes, route.clone(), |record| record.id.clone());
+		}
+		for model in &records.models {
+			upsert_record(&mut compiled.models, model.clone(), |record| record.key.clone());
+		}
+		compiled.census.providers = compiled.providers.len();
+		compiled.census.logical_models = compiled.models.len();
+		let contribution = serde_json::to_vec(records)
+			.map_err(|_| SnapshotError::Invariant("runtime provider records do not serialize"))?;
+		let digest = Sha256::digest(contribution);
+		let mut suffix = String::with_capacity(16);
+		for byte in &digest[..8] {
+			use std::fmt::Write as _;
+			let _ = write!(suffix, "{byte:02x}");
+		}
+		compiled.revision =
+			CatalogRevision::from(format!("{}+runtime-{suffix}", self.compiled.revision.as_str()));
+		validate_catalog(&compiled)?;
+		let provider_models = provider_model_index(&compiled)?;
+		let model_index = model_index(&compiled)?;
+		let wire_policy_ids = compiled
+			.wire_policies
+			.iter()
+			.map(WirePolicy::content_id)
+			.collect::<Vec<_>>()
+			.into_boxed_slice();
+		let thinking_policy_ids = compiled
+			.thinking_policies
+			.iter()
+			.map(ThinkingPolicy::content_id)
+			.collect::<Vec<_>>()
+			.into_boxed_slice();
+		let normalized_json = compiled
+			.normalized_json()
+			.map_err(|_| SnapshotError::Invariant("runtime catalog normalization failed"))?;
+		Ok(Self {
+			compiled,
+			provider_models,
+			model_index,
+			wire_policy_ids,
+			thinking_policy_ids,
+			source_digest: self.source_digest,
+			normalized_json_sha256: Sha256::digest(normalized_json).into(),
+		})
+	}
+
 	/// Returns the immutable catalog revision.
 	#[must_use]
 	pub const fn revision(&self) -> &crate::CatalogRevision {
@@ -424,6 +490,15 @@ impl Catalog {
 		let index = self.thinking_policy_ids.binary_search(id).ok()?;
 		Some(&self.compiled.thinking_policies[index])
 	}
+}
+
+fn upsert_record<T, K: Ord>(records: &mut Box<[T]>, value: T, key: impl Fn(&T) -> K) {
+	let target = key(&value);
+	let mut values = std::mem::take(records).into_vec();
+	values.retain(|record| key(record) != target);
+	values.push(value);
+	values.sort_by_key(key);
+	*records = values.into_boxed_slice();
 }
 
 fn validate_catalog(catalog: &CompiledCatalog) -> Result<(), SnapshotError> {

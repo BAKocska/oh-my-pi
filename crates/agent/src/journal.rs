@@ -7,7 +7,7 @@ use std::{
 	sync::Arc,
 };
 
-use omp_core::{InvocationPhase, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str};
 use omp_proto::{inference::v1::Outcome, thread::v1::Item};
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
 use omp_storage::{
@@ -2037,6 +2037,59 @@ impl Journal {
 		self.claims.retain(|_, claimed| claimed != &turn_id);
 		self.aborted.insert(turn_id, (index, disposition));
 		Ok(index)
+	}
+
+	/// Appends one invisible Core-authored checkpoint marker.
+	///
+	/// The returned physical index is the stable token accepted by rewind.
+	pub fn checkpoint(&mut self, ts: u64, label: Str, request_id: Str) -> Result<u64, JournalError> {
+		#[derive(Serialize)]
+		struct Checkpoint<'a> {
+			label: &'a str,
+		}
+
+		const KIND: &str = "dev.omp.core.checkpoint";
+		const EXTENSION: &str = "dev.omp.core";
+		self.declare_entry_kinds(EXTENSION, vec![
+			EntryKindDecl::parse(KIND, "core.1", false, false, None)
+				.expect("static checkpoint revision is valid"),
+		])?;
+		let data = serde_json::value::to_raw_value(&Checkpoint { label: label.as_str() })
+			.map_err(transcript::Error::from)?;
+		let stamp = JournalRequestStamp {
+			idempotency_key: request_id.clone(),
+			request_id,
+			host_generation: self.generations.host,
+			session_generation: self.generations.session,
+		};
+		let author = JournalAuthor {
+			principal:  Principal::new(Str::new_static("omp.core"), Str::new_static("OMP Core")),
+			provenance: Provenance::new(
+				Str::new_static("omp"),
+				Str::new_static(EXTENSION),
+				Str::new_static(env!("CARGO_PKG_VERSION")),
+				ArtifactDigest::new([0; 32]),
+				Str::new_static("core"),
+				Str::new_static("builtin"),
+				0,
+			),
+		};
+		let reply = self.handle_request(JournalRequest {
+			ts,
+			stamp,
+			author,
+			operation: JournalOperation::Append(PendingCustomEntry {
+				kind:    Str::new_static(KIND),
+				rev:     Str::new_static("core.1"),
+				data:    Some(data),
+				context: None,
+				display: Some(false),
+			}),
+		})?;
+		Ok(*reply
+			.indexes
+			.first()
+			.expect("single checkpoint append returns one payload index"))
 	}
 
 	/// Moves the live chain point to `to`, or to the transcript root.

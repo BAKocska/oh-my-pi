@@ -1,7 +1,7 @@
 //! Durable N-turn agent policy loop.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, VecDeque},
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,7 +32,7 @@ use crate::{
 	},
 	context::{ContextProjection, project_context},
 	continuation::{AgentSettledEvent, Continuation, ContinuationLedger, continues_loop, from_hook},
-	control::{ControlMailbox, ControlSender},
+	control::{ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
 	hooks::HookGate,
@@ -178,6 +178,7 @@ pub struct Agent<C: TurnClient> {
 	invocation_fact_rx: flume::Receiver<InvocationAdmissionFact>,
 	control_tx: ControlSender,
 	control_mailbox: ControlMailbox,
+	pending_rewinds: VecDeque<ScheduledRewind>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
 	jobs_restored: bool,
@@ -257,6 +258,7 @@ impl<C: TurnClient> Agent<C> {
 			invocation_fact_rx,
 			control_tx,
 			control_mailbox,
+			pending_rewinds: VecDeque::new(),
 			mailbox,
 			jobs,
 			jobs_restored: false,
@@ -472,6 +474,7 @@ impl<C: TurnClient> Agent<C> {
 			(pending_indexes, TurnId::new(turn_id))
 		} else {
 			self.drain_control();
+			self.execute_scheduled_rewinds()?;
 			let snapshot = self.state.snapshot();
 			let queued = self
 				.mailbox
@@ -519,6 +522,7 @@ impl<C: TurnClient> Agent<C> {
 					self.context = None;
 					self.abort_rx.mark_unchanged();
 					self.drain_control();
+					self.execute_scheduled_rewinds()?;
 					let snapshot = self.state.snapshot();
 					let drained = self
 						.mailbox
@@ -678,9 +682,11 @@ impl<C: TurnClient> Agent<C> {
 								aborted = true;
 								interrupt_tx.send_replace(Some(Str::new_static("user interrupt")));
 							},
-							handled = self.control_mailbox.handle_next(&mut self.journal) => {
-								if !handled {
-									std::future::pending::<()>().await;
+							event = self.control_mailbox.handle_next(&mut self.journal) => {
+								match event {
+									ControlMailboxEvent::Closed => std::future::pending::<()>().await,
+									ControlMailboxEvent::JournalHandled => {},
+									ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
 								}
 							},
 							received = self.mailbox.wait() => {
@@ -727,6 +733,14 @@ impl<C: TurnClient> Agent<C> {
 						}
 					}
 				}
+				if self.execute_scheduled_rewinds()? {
+					self.transition(AgentPhase::Idle);
+					return Ok(AgentRunSummary {
+						outcome: Some(outcome),
+						committed_turns,
+						interrupted: false,
+					});
+				}
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.append_pending(&next_turn_id, next)?;
 				let has_producer = boundary
@@ -759,6 +773,14 @@ impl<C: TurnClient> Agent<C> {
 			boundary = immediate;
 
 			self.drain_control();
+			if self.execute_scheduled_rewinds()? {
+				self.transition(AgentPhase::Idle);
+				return Ok(AgentRunSummary {
+					outcome: Some(outcome),
+					committed_turns,
+					interrupted: false,
+				});
+			}
 			let mut idle = self
 				.mailbox
 				.drain(DrainPoint::Idle, snapshot.defer_interrupts);
@@ -1243,9 +1265,11 @@ impl<C: TurnClient> Agent<C> {
 		let mut session = loop {
 			tokio::select! {
 				session = &mut opening => break session?,
-				handled = self.control_mailbox.handle_next(&mut self.journal) => {
-					if !handled {
-						std::future::pending::<()>().await;
+				event = self.control_mailbox.handle_next(&mut self.journal) => {
+					match event {
+						ControlMailboxEvent::Closed => std::future::pending::<()>().await,
+						ControlMailboxEvent::JournalHandled => {},
+						ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
 					}
 				},
 			}
@@ -1264,12 +1288,19 @@ impl<C: TurnClient> Agent<C> {
 				let mut events = session.events();
 				tokio::select! {
 					event = events.next() => event,
-					handled = self.control_mailbox.handle_next(&mut self.journal) => {
-						if handled {
-							self.control_serviced_during_turn = true;
-							continue;
+					event = self.control_mailbox.handle_next(&mut self.journal) => {
+						match event {
+							ControlMailboxEvent::Closed => std::future::pending().await,
+							ControlMailboxEvent::JournalHandled => {
+								self.control_serviced_during_turn = true;
+								continue;
+							},
+							ControlMailboxEvent::Rewind(rewind) => {
+								self.pending_rewinds.push_back(rewind);
+								self.control_serviced_during_turn = true;
+								continue;
+							},
 						}
-						std::future::pending().await
 					},
 				}
 			} else {
@@ -1278,12 +1309,19 @@ impl<C: TurnClient> Agent<C> {
 					tokio::select! {
 						event = events.next() => Ok(event),
 						completion = duplex.next() => Err(completion),
-						handled = self.control_mailbox.handle_next(&mut self.journal) => {
-							if handled {
-								self.control_serviced_during_turn = true;
-								continue;
+						event = self.control_mailbox.handle_next(&mut self.journal) => {
+							match event {
+								ControlMailboxEvent::Closed => std::future::pending().await,
+								ControlMailboxEvent::JournalHandled => {
+									self.control_serviced_during_turn = true;
+									continue;
+								},
+								ControlMailboxEvent::Rewind(rewind) => {
+									self.pending_rewinds.push_back(rewind);
+									self.control_serviced_during_turn = true;
+									continue;
+								},
 							}
-							std::future::pending().await
 						},
 					}
 				};
@@ -1423,9 +1461,28 @@ impl<C: TurnClient> Agent<C> {
 	}
 
 	fn drain_control(&mut self) {
-		self
-			.control_mailbox
-			.drain_ready(&mut self.journal, CONTROL_DRAIN_LIMIT);
+		self.control_mailbox.drain_ready(
+			&mut self.journal,
+			CONTROL_DRAIN_LIMIT,
+			&mut self.pending_rewinds,
+		);
+	}
+
+	fn execute_scheduled_rewinds(&mut self) -> Result<bool, AgentError> {
+		let mut executed = false;
+		while let Some(ScheduledRewind { target, scope }) = self.pending_rewinds.pop_front() {
+			drop(scope);
+			self.rewind(Some(target))?;
+			if !self.jobs.is_empty() {
+				self.journal.append_optimistic(
+					now_ms(),
+					rewind_background_warning(self.jobs.len()),
+					self.prompt_hash,
+				)?;
+			}
+			executed = true;
+		}
+		Ok(executed)
 	}
 
 	fn patch_input_sequences(
@@ -1768,6 +1825,22 @@ fn continuation_item() -> Item {
 	}
 }
 
+fn rewind_background_warning(count: usize) -> Item {
+	let text = format!(
+		"<system-injection>\nRewind left {count} background job(s) running; their settlements may \
+		 still arrive. Cancel them explicitly if they are no longer wanted.\n</system-injection>"
+	);
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::System as i32,
+			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+		})),
+		props:         None,
+	}
+}
+
 fn duplex_turn_error(error: DuplexError) -> TurnError {
 	TurnError::Protocol(match error {
 		DuplexError::Batch(_) => "duplex tool batch failed",
@@ -1836,7 +1909,7 @@ fn runtime_duration(duration: omp_core::Duration) -> Duration {
 		.expect("agent runtime duration constants fit std::time::Duration")
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.unwrap_or(Duration::ZERO)
@@ -2523,6 +2596,100 @@ mod tests {
 		let (agent, result) = active.await.expect("active turn task");
 		assert!(matches!(result, Err(AgentError::Interrupted)));
 		drop(agent);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn scheduled_rewind_waits_for_active_tool_batch_boundary() {
+		let (journal, path) = test_journal("scheduled-rewind-boundary");
+		let identity =
+			ToolIdentity { name: Str::from("pending"), rev: Rev { family: Str::from("test"), n: 1 } };
+		let mut registry = ToolRegistry::new();
+		registry
+			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
+			.expect("register pending tool");
+		let state = AgentState::new(crate::AgentSnapshot {
+			enabled_tools: Arc::from([identity.name.clone()]),
+			registry: Arc::new(registry),
+			..crate::AgentSnapshot::default()
+		});
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([pending_tool_script(&identity)]))),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let (env, transport) = EnvClient::in_process(1);
+		let (requests, responses) = transport.into_parts();
+		let env_task = tokio::spawn(async move {
+			let _responses = responses;
+			while requests.recv_async().await.is_ok() {}
+		});
+		let mut agent = Agent::new(client, env, state, journal, test_caps());
+		let control = agent.control();
+		let checkpoint = tokio::spawn({
+			let control = control.clone();
+			async move { control.checkpoint(Str::from("before batch")).await }
+		});
+		tokio::task::yield_now().await;
+		agent.drain_control();
+		let checkpoint = checkpoint
+			.await
+			.expect("checkpoint task")
+			.expect("checkpoint command");
+
+		let events = agent.events().subscribe_lossless();
+		let abort = agent.abort_handle();
+		let scheduling = async {
+			loop {
+				let event = events.recv().await.expect("agent event");
+				if matches!(event.as_ref(), AgentEvent::PhaseChanged { to: AgentPhase::ToolBatch, .. })
+				{
+					let ack = control
+						.schedule_rewind(checkpoint, Str::from("thread"))
+						.await
+						.expect("schedule rewind");
+					assert_eq!(ack.target, checkpoint);
+					abort.abort();
+					break ack;
+				}
+			}
+		};
+		let (summary, ack) = tokio::join!(
+			agent.submit(
+				[message(thread::Role::User, "run pending tool")],
+				TurnId::new("scheduled-rewind"),
+			),
+			scheduling,
+		);
+		let summary = summary.expect("rewind boundary summary");
+		assert_eq!(ack.target, checkpoint);
+		assert_eq!(summary.committed_turns, 1);
+
+		let log = agent.journal.load().expect("load rewind journal");
+		let mut settled = None;
+		let mut rewinds = Vec::new();
+		for index in 0..u64::try_from(log.len()).expect("journal length") {
+			let Some(Entry::Ok(event)) = log.get(index) else {
+				continue;
+			};
+			match &event.kind {
+				Kind::InvocationTransition(transition)
+					if transition.phase == InvocationPhase::Settled =>
+				{
+					settled = Some(index);
+				},
+				Kind::Rewind { to } => rewinds.push((index, *to)),
+				_ => {},
+			}
+		}
+		assert_eq!(rewinds.len(), 1, "rewind outcome is journaled exactly once");
+		assert_eq!(rewinds[0].1, Some(checkpoint));
+		assert!(
+			settled.is_some_and(|settled| settled < rewinds[0].0),
+			"rewind executes only after tool settlement is journaled"
+		);
+		drop(log);
+		drop(agent);
+		env_task.abort();
 		std::fs::remove_file(path).expect("remove journal");
 	}
 

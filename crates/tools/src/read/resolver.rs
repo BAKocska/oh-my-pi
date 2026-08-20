@@ -75,6 +75,8 @@ pub enum Scheme {
 	Vault,
 	/// Detached-job output.
 	Job,
+	/// A session-registered merge conflict region.
+	Conflict,
 	/// A syntactically valid scheme outside the built-in vocabulary.
 	Unknown,
 }

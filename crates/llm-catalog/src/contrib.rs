@@ -11,7 +11,8 @@ use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	CatalogOverlay, ModelOverlay, ProvenanceSource, ProviderId, RouteOverlay, ScopedAlias,
+	AuthSpec, CatalogOverlay, ModelOverlay, ModelSpec, OAuthSpec, ProvenanceSource, ProviderDef,
+	ProviderId, RouteDef, RouteOverlay, ScopedAlias,
 };
 
 /// The owner of one replaceable catalog overlay layer.
@@ -248,6 +249,23 @@ impl ProviderPublisher {
 	}
 }
 
+/// Complete non-secret records contributed by an admitted runtime provider.
+///
+/// Rebuilds an immutable catalog generation; no extension callback enters the
+/// inference request path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeProviderRecords {
+	/// Provider/account management definition.
+	pub provider:    ProviderDef,
+	/// Dynamically registered authentication specifications.
+	pub auth_specs:  Box<[AuthSpec]>,
+	/// Dynamically registered public OAuth flow specifications.
+	pub oauth_specs: Box<[OAuthSpec]>,
+	/// Concrete provider routes.
+	pub routes:      Box<[RouteDef]>,
+	/// Models made selectable through those routes.
+	pub models:      Box<[ModelSpec]>,
+}
 /// One admitted `@omp.provider` declaration lowered into a catalog overlay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderDeclaration {
@@ -265,6 +283,9 @@ pub struct ProviderDeclaration {
 	pub replaces:  Option<ProviderPublisher>,
 	/// Whether admission and policy allow this declaration to participate.
 	pub available: bool,
+	/// Complete records used to rebuild the immutable runtime catalog. Required
+	/// on a new root provider; extensions may omit it and contribute overlays.
+	pub runtime:   Option<RuntimeProviderRecords>,
 }
 
 /// Activation failure for a provider declaration set.
@@ -313,6 +334,8 @@ pub struct ActivatedProvider {
 	pub overlays: OverlayStack,
 	/// All declarations considered, including losing and replaced declarations.
 	pub evidence: Arc<[ProviderDeclarationId]>,
+	/// Complete records selected from the active root declaration.
+	pub runtime:  Option<RuntimeProviderRecords>,
 }
 
 /// Activates declarations for one provider without a load-order tie-break.
@@ -427,7 +450,12 @@ impl ProviderDeclarations {
 				declaration.overlay.clone(),
 			)
 		}));
-		Ok(Some(ActivatedProvider { provider: provider.clone(), overlays, evidence }))
+		Ok(Some(ActivatedProvider {
+			provider: provider.clone(),
+			overlays,
+			evidence,
+			runtime: root.runtime.clone(),
+		}))
 	}
 
 	/// Activates every declared provider in lexical provider-id order.
@@ -482,6 +510,7 @@ mod tests {
 			extends: None,
 			replaces: None,
 			available: true,
+			runtime: None,
 		}
 	}
 
@@ -561,5 +590,72 @@ mod tests {
 			.unwrap();
 		assert_eq!(active.overlays.overlays()[0].source.origin, "replacement");
 		assert_eq!(active.evidence.len(), 2);
+	}
+
+	#[test]
+	fn admitted_runtime_provider_registers_oauth_into_a_new_catalog_generation() {
+		let catalog = crate::Catalog::embedded();
+		let provider = catalog
+			.providers()
+			.iter()
+			.find(|provider| {
+				provider
+					.auth
+					.iter()
+					.filter_map(|id| catalog.auth_spec(id))
+					.any(|auth| auth.oauth.is_some())
+			})
+			.expect("OAuth provider")
+			.clone();
+		let auth_specs = provider
+			.auth
+			.iter()
+			.filter_map(|id| catalog.auth_spec(id).cloned())
+			.collect::<Vec<_>>();
+		let oauth_specs = auth_specs
+			.iter()
+			.filter_map(|auth| auth.oauth.as_ref())
+			.filter_map(|id| catalog.oauth_spec(id).cloned())
+			.collect::<Vec<_>>();
+		let routes = provider
+			.routes
+			.iter()
+			.filter_map(|id| catalog.route(id).cloned())
+			.collect::<Vec<_>>();
+		let models = catalog
+			.models()
+			.iter()
+			.filter(|model| {
+				model
+					.routes
+					.iter()
+					.any(|route| provider.routes.contains(route))
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		let runtime = RuntimeProviderRecords {
+			provider:    provider.clone(),
+			auth_specs:  auth_specs.into_boxed_slice(),
+			oauth_specs: oauth_specs.clone().into_boxed_slice(),
+			routes:      routes.into_boxed_slice(),
+			models:      models.into_boxed_slice(),
+		};
+		let mut declaration = declaration("runtime", 10);
+		declaration.provider = provider.id.clone();
+		declaration.runtime = Some(runtime);
+		let active = ProviderDeclarations::new([declaration])
+			.activate(&provider.id)
+			.expect("activation")
+			.expect("active");
+		let rebuilt = catalog
+			.with_runtime_provider(active.runtime.as_ref().expect("runtime records"))
+			.expect("runtime catalog");
+		assert_ne!(rebuilt.revision(), catalog.revision());
+		assert!(
+			oauth_specs
+				.iter()
+				.all(|oauth| rebuilt.oauth_spec(&oauth.id).is_some())
+		);
+		assert!(rebuilt.provider(&provider.id).is_some());
 	}
 }

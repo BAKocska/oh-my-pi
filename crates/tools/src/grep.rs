@@ -454,23 +454,7 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 					return;
 				},
 			};
-			let (single_file_max_count, multi_file_max_count, max_count) = fetch_budgets(&roots);
-			let multiline = arguments.pattern.contains('\n') || arguments.pattern.contains("\\n");
-			let request = SearchRequest {
-				pattern: arguments.pattern,
-				roots: roots.clone(),
-				ignore_case: !arguments.case.unwrap_or(true),
-				multiline,
-				gitignore: arguments.gitignore.unwrap_or(true),
-				hidden: true,
-				max_count,
-				single_file_max_count,
-				multi_file_max_count,
-				context_before: 0,
-				context_after: 0,
-				max_columns: DEFAULT_MAX_COLUMN,
-				timeout_ms: SEARCH_GREP_TIMEOUT_MS,
-			};
+			let request = build_request(arguments, &roots);
 			let operation = async {
 				let result = self.workspace.search(request).await?;
 				prepare_payload(result, &roots, skip, &self.workspace, &self.blobs).await
@@ -504,6 +488,24 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 			}
 		}
 		projection.finish()
+	}
+}
+fn build_request(arguments: Params, roots: &[SearchRoot]) -> SearchRequest {
+	let (single_file_max_count, multi_file_max_count, max_count) = fetch_budgets(roots);
+	SearchRequest {
+		multiline: arguments.pattern.contains('\n') || arguments.pattern.contains("\\n"),
+		pattern: arguments.pattern,
+		roots: roots.to_vec(),
+		ignore_case: !arguments.case.unwrap_or(true),
+		gitignore: arguments.gitignore.unwrap_or(true),
+		hidden: true,
+		max_count,
+		single_file_max_count,
+		multi_file_max_count,
+		context_before: 0,
+		context_after: 0,
+		max_columns: DEFAULT_MAX_COLUMN,
+		timeout_ms: SEARCH_GREP_TIMEOUT_MS,
 	}
 }
 
@@ -1030,5 +1032,104 @@ fn protocol_issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(Str::from("{\"pattern\":\"TODO\",\"path\":\"src\"}")),
 		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn search_match(path: impl Into<Str>, root_index: u64) -> SearchMatch {
+		let path = path.into();
+		SearchMatch {
+			source_key: path.clone(),
+			path,
+			root_index,
+			line_number: 1,
+			line: Str::from("needle"),
+			truncated: false,
+			context_before: Vec::new(),
+			context_after: Vec::new(),
+			snapshot_tag: None,
+		}
+	}
+
+	#[test]
+	fn semicolon_roots_preserve_order_and_parse_per_file_ranges() {
+		let roots = parse_roots(Some(" src ; tests/grep.rs:5-8,12-13 ")).unwrap();
+		assert_eq!(roots.len(), 2);
+		assert_eq!(roots[0].path, "src");
+		assert!(roots[0].ranges.is_empty());
+		assert_eq!(roots[1].path, "tests/grep.rs");
+		assert_eq!(roots[1].ranges.as_ref(), [
+			LineRange { start_line: 5, end_line: Some(8) },
+			LineRange { start_line: 12, end_line: Some(13) },
+		]);
+	}
+
+	#[test]
+	fn request_applies_case_gitignore_and_cross_line_rules() {
+		let roots = parse_roots(Some("src; tests")).unwrap();
+		let request = build_request(
+			Params {
+				pattern:   Str::from(r"alpha\nbeta"),
+				path:      None,
+				case:      Some(false),
+				gitignore: Some(false),
+				skip:      None,
+			},
+			&roots,
+		);
+		assert!(request.ignore_case);
+		assert!(request.multiline);
+		assert!(!request.gitignore);
+		assert_eq!(request.roots, roots);
+
+		let default_case = build_request(
+			Params {
+				pattern:   Str::from("alpha"),
+				path:      None,
+				case:      None,
+				gitignore: None,
+				skip:      None,
+			},
+			&parse_roots(None).unwrap(),
+		);
+		assert!(!default_case.ignore_case);
+		assert!(default_case.gitignore);
+		assert!(!default_case.multiline);
+	}
+
+	#[test]
+	fn skip_paginates_matching_files_not_match_rows() {
+		let roots = parse_roots(Some(".")).unwrap();
+		let matches: Vec<_> = (0..22)
+			.map(|index| search_match(format!("src/file-{index:02}.rs"), 0))
+			.collect();
+		let first = make_payload(
+			SearchResult { matches: matches.clone(), multi_scope: true, ..SearchResult::default() },
+			&roots,
+			0,
+		);
+		assert_eq!(first.files.len(), DEFAULT_FILE_LIMIT);
+		assert_eq!(first.files[0].path, "src/file-00.rs");
+		assert!(first.file_limit_reached);
+
+		let second = make_payload(
+			SearchResult { matches, multi_scope: true, ..SearchResult::default() },
+			&roots,
+			20,
+		);
+		assert_eq!(second.total_files, 22);
+		assert_eq!(second.skip, 20);
+		assert_eq!(
+			second
+				.files
+				.iter()
+				.map(|file| file.path.as_str())
+				.collect::<Vec<_>>(),
+			["src/file-20.rs", "src/file-21.rs"]
+		);
+		assert!(!second.file_limit_reached);
 	}
 }

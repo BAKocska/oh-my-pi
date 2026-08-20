@@ -1750,6 +1750,7 @@ impl Editor {
 		match key {
 			Key::Enter => self.submit(),
 			Key::Tab => self.tab_complete(),
+			Key::Ctrl('r') if self.options.history => self.history_search(),
 			Key::Up if self.options.history && self.history_gate_up() => self.history_older(),
 			Key::Down
 				if self.options.history
@@ -1832,6 +1833,37 @@ impl Editor {
 		}
 		self.history_index = Some(next);
 		self.buffer.replace_external(&self.history[next], true);
+		self.refresh();
+		EditOutcome::Changed
+	}
+
+	fn history_search(&mut self) -> EditOutcome {
+		if self.history.is_empty() {
+			return EditOutcome::Ignored;
+		}
+		if self.history_index.is_none() {
+			self.history_draft = Str::new(self.buffer.text());
+		}
+		let query = self.history_draft.trim().to_ascii_lowercase();
+		let start = self
+			.history_index
+			.map_or(0, |index| index.saturating_add(1));
+		let found = self
+			.history
+			.iter()
+			.enumerate()
+			.skip(start)
+			.find_map(|(index, entry)| {
+				(query.is_empty()
+					|| entry.to_ascii_lowercase().contains(&query)
+					|| fuzzy_score(&query, &entry.to_ascii_lowercase()) > 0)
+					.then_some(index)
+			});
+		let Some(index) = found else {
+			return EditOutcome::Ignored;
+		};
+		self.history_index = Some(index);
+		self.buffer.replace_external(&self.history[index], false);
 		self.refresh();
 		EditOutcome::Changed
 	}
@@ -2116,7 +2148,6 @@ impl SlashCommands {
 	fn name_suggestions(&self, line_start: usize, line: &str) -> Option<Suggestions> {
 		let trimmed = line.trim_start_matches([' ', '\t']);
 		let body = trimmed.strip_prefix('/')?;
-		// a second slash means a path, not a command
 		if body.contains('/') {
 			return None;
 		}
@@ -2158,13 +2189,14 @@ impl SlashCommands {
 		(!items.is_empty()).then_some(Suggestions { prefix_start, items })
 	}
 
-	/// Completion for the argument position of a recognized command: the
-	/// text after `/name ` matches against the command's argument
-	/// candidates. Only the first argument completes; later words are
-	/// free-form.
-	fn argument_suggestions(&self, cursor: usize, body: &str, space: usize) -> Option<Suggestions> {
-		let (name, rest) = body.split_at(space);
-		let partial = rest.trim_start_matches([' ', '\t']);
+	fn argument_suggestions(
+		&self,
+		cursor: usize,
+		body: &str,
+		delimiter: usize,
+	) -> Option<Suggestions> {
+		let (name, rest) = body.split_at(delimiter);
+		let partial = rest.trim_start_matches([' ', '\t', ':']);
 		if partial.contains(char::is_whitespace) {
 			return None;
 		}
@@ -2201,8 +2233,8 @@ impl EditorCompletion for SlashCommands {
 		let line_start = before.rfind('\n').map_or(0, |index| index + 1);
 		let line = &before[line_start..];
 		let body = line.trim_start_matches([' ', '\t']).strip_prefix('/')?;
-		match body.find(char::is_whitespace) {
-			Some(space) => self.argument_suggestions(cursor, body, space),
+		match body.find(|ch: char| ch.is_whitespace() || ch == ':') {
+			Some(delimiter) => self.argument_suggestions(cursor, body, delimiter),
 			None => self.name_suggestions(line_start, line),
 		}
 	}
@@ -2214,16 +2246,15 @@ impl EditorCompletion for SlashCommands {
 		let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
 		let line = &text[line_start..cursor];
 		let body = line.trim_start_matches([' ', '\t']).strip_prefix('/')?;
-		let space = body.find(char::is_whitespace)?;
-		let (name, rest) = body.split_at(space);
+		let delimiter = body.find(|ch: char| ch.is_whitespace() || ch == ':')?;
+		let (name, rest) = body.split_at(delimiter);
 		let command = self.find(name)?;
-		let argument = rest.trim_start_matches([' ', '\t']);
+		let argument = rest.trim_start_matches([' ', '\t', ':']);
 		if argument.is_empty() {
 			return command.hint.clone();
 		}
 		match argument.find(char::is_whitespace) {
 			None => {
-				// still typing the argument name: remaining chars + usage
 				let prefix = argument.to_ascii_lowercase();
 				let matched = command
 					.args
@@ -2237,7 +2268,6 @@ impl EditorCompletion for SlashCommands {
 				}
 			},
 			Some(argument_end) => {
-				// argument chosen: ghost the usage words not yet typed
 				let (chosen, after) = argument.split_at(argument_end);
 				let arg = command.args.iter().find(|arg| arg.name == chosen)?;
 				let usage = arg.usage.as_deref()?;
@@ -2520,6 +2550,18 @@ mod tests {
 	}
 
 	#[test]
+	fn colon_delimiter_opens_subcommand_completion() {
+		let mut editor = editor();
+		type_text(&mut editor, "/security:im");
+		let picker = editor.picker().expect("colon argument candidates open");
+		assert_eq!(
+			*picker.suggestions[picker.selected].display(),
+			SuggestionDisplay::Text("import".into())
+		);
+		assert_eq!(editor.inline_hint().as_deref(), Some("port <path>"));
+	}
+
+	#[test]
 	fn inline_hint_follows_selection_arguments_and_usage() {
 		let mut editor = editor();
 		type_text(&mut editor, "/sec");
@@ -2727,6 +2769,26 @@ mod tests {
 		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
 		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
 		assert_eq!(editor.text(), "draft");
+	}
+
+	#[test]
+	fn ctrl_r_fuzzy_search_preserves_draft_and_walks_older_matches() {
+		let mut editor = editor();
+		for prompt in ["fix parser", "write docs", "parser tests"] {
+			type_text(&mut editor, prompt);
+			editor.handle(Key::Enter);
+		}
+		type_text(&mut editor, "prs");
+		assert_eq!(editor.handle(Key::Ctrl('r')), EditOutcome::Changed);
+		assert_eq!(editor.text(), "parser tests");
+		assert_eq!(editor.handle(Key::Ctrl('r')), EditOutcome::Changed);
+		assert_eq!(editor.text(), "fix parser");
+		editor.handle(Key::End);
+		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
+		assert_eq!(editor.text(), "parser tests");
+		editor.handle(Key::End);
+		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
+		assert_eq!(editor.text(), "prs");
 	}
 
 	#[test]

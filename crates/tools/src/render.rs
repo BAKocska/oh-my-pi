@@ -11,27 +11,28 @@ pub mod paths;
 /// Shared line, byte, and column truncation.
 pub mod truncate;
 
-/// Exact production identities associated with the seven native renderer
+/// Exact production identities associated with enabled native renderer
 /// implementations.
 ///
-/// Composition supplies these identities from the registered tool specs. The
-/// renderers therefore never guess revisions or dispatch by tool name.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Composition supplies identities only for tools that were actually
+/// registered. Renderers therefore auto-follow tool inclusion independently:
+/// disabling one tool cannot suppress every unrelated renderer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuiltinRendererIdentities {
-	/// Identity of the native hashline editor.
-	pub edit:  ToolIdentity,
-	/// Identity of the native regex search tool.
-	pub grep:  ToolIdentity,
-	/// Identity of the native path matching tool.
-	pub glob:  ToolIdentity,
-	/// Identity of the native persistent shell.
-	pub shell: ToolIdentity,
-	/// Identity of the native whole-file writer.
-	pub write: ToolIdentity,
-	/// Identity of the native resource reader.
-	pub read:  ToolIdentity,
-	/// Identity of the native persistent evaluator.
-	pub eval:  ToolIdentity,
+	/// Identity of the native hashline editor, when enabled.
+	pub edit:  Option<ToolIdentity>,
+	/// Identity of the native regex search tool, when enabled.
+	pub grep:  Option<ToolIdentity>,
+	/// Identity of the native path matching tool, when enabled.
+	pub glob:  Option<ToolIdentity>,
+	/// Identity of the native persistent shell, when enabled.
+	pub shell: Option<ToolIdentity>,
+	/// Identity of the native whole-file writer, when enabled.
+	pub write: Option<ToolIdentity>,
+	/// Identity of the native resource reader, when enabled.
+	pub read:  Option<ToolIdentity>,
+	/// Identity of the native persistent evaluator, when enabled.
+	pub eval:  Option<ToolIdentity>,
 }
 
 /// Registers every native renderer under the exact identities supplied by
@@ -44,13 +45,27 @@ pub fn register_builtin_renderers(
 	registry: &mut RenderRegistry,
 	identities: BuiltinRendererIdentities,
 ) -> Result<(), RenderRegistryError> {
-	registry.register(identities.edit, EditRenderer)?;
-	registry.register(identities.grep, GrepRenderer)?;
-	registry.register(identities.glob, GlobRenderer)?;
-	registry.register(identities.shell, ShellRenderer)?;
-	registry.register(identities.write, WriteRenderer)?;
-	registry.register(identities.read, ReadRenderer)?;
-	registry.register(identities.eval, EvalRenderer)?;
+	if let Some(identity) = identities.edit {
+		registry.register(identity, EditRenderer)?;
+	}
+	if let Some(identity) = identities.grep {
+		registry.register(identity, GrepRenderer)?;
+	}
+	if let Some(identity) = identities.glob {
+		registry.register(identity, GlobRenderer)?;
+	}
+	if let Some(identity) = identities.shell {
+		registry.register(identity, ShellRenderer)?;
+	}
+	if let Some(identity) = identities.write {
+		registry.register(identity, WriteRenderer)?;
+	}
+	if let Some(identity) = identities.read {
+		registry.register(identity, ReadRenderer)?;
+	}
+	if let Some(identity) = identities.eval {
+		registry.register(identity, EvalRenderer)?;
+	}
 	Ok(())
 }
 
@@ -582,13 +597,13 @@ mod tests {
 
 	fn identities() -> BuiltinRendererIdentities {
 		BuiltinRendererIdentities {
-			edit:  identity("edit", 41),
-			grep:  identity("grep", 42),
-			glob:  identity("glob", 43),
-			shell: identity("shell", 44),
-			write: identity("write", 45),
-			read:  identity("read", 46),
-			eval:  identity("eval", 47),
+			edit:  Some(identity("edit", 41)),
+			grep:  Some(identity("grep", 42)),
+			glob:  Some(identity("glob", 43)),
+			shell: Some(identity("shell", 44)),
+			write: Some(identity("write", 45)),
+			read:  Some(identity("read", 46)),
+			eval:  Some(identity("eval", 47)),
 		}
 	}
 
@@ -605,13 +620,13 @@ mod tests {
 	fn registers_every_builtin_at_only_its_exact_revision() {
 		let (registry, identities) = registry(identities());
 		for identity in [
-			&identities.edit,
-			&identities.grep,
-			&identities.glob,
-			&identities.shell,
-			&identities.write,
-			&identities.read,
-			&identities.eval,
+			identities.edit.as_ref().unwrap(),
+			identities.grep.as_ref().unwrap(),
+			identities.glob.as_ref().unwrap(),
+			identities.shell.as_ref().unwrap(),
+			identities.write.as_ref().unwrap(),
+			identities.read.as_ref().unwrap(),
+			identities.eval.as_ref().unwrap(),
 		] {
 			assert!(
 				registry
@@ -620,7 +635,7 @@ mod tests {
 			);
 		}
 
-		let wrong_revision = identity("edit", identities.edit.rev.n + 1);
+		let wrong_revision = identity("edit", identities.edit.as_ref().unwrap().rev.n + 1);
 		assert!(registry.get(&wrong_revision).is_none());
 		let raw = br#"{"kind":"ok","value":{"foreign":true}}"#;
 		assert_eq!(
@@ -630,6 +645,19 @@ mod tests {
 				.as_str(),
 			std::str::from_utf8(raw).expect("fixture is UTF-8"),
 		);
+	}
+
+	#[test]
+	fn disabled_tool_does_not_suppress_enabled_renderers() {
+		let read = identity("read", 9);
+		let mut registry = RenderRegistry::new();
+		register_builtin_renderers(&mut registry, BuiltinRendererIdentities {
+			read: Some(read.clone()),
+			..Default::default()
+		})
+		.unwrap();
+		assert!(registry.get(&read).is_some());
+		assert!(registry.get(&identity("edit", 9)).is_none());
 	}
 
 	#[test]
@@ -644,7 +672,7 @@ mod tests {
 		let mut state = ViewState::new();
 		registry
 			.fold(
-				&identities.edit,
+				identities.edit.as_ref().unwrap(),
 				&mut state,
 				Bytes::from(serde_json::to_vec(&update).expect("update serializes")),
 			)
@@ -652,7 +680,7 @@ mod tests {
 		assert_eq!(state.raw_update_count(), 0);
 		assert_eq!(
 			registry
-				.view(&identities.edit, &state, None)
+				.view(identities.edit.as_ref().unwrap(), &state, None)
 				.expect("live edit renders")
 				.as_str(),
 			"<col gap=0><row gap=1><text bold>edit</text><text fg=muted>preview · 2 ops · +3 \
@@ -666,7 +694,7 @@ mod tests {
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
 		assert_eq!(
 			registry
-				.view(&identities.edit, &state, Some(&encoded))
+				.view(identities.edit.as_ref().unwrap(), &state, Some(&encoded))
 				.expect("settled edit renders")
 				.as_str(),
 			"<col gap=0><row gap=1><text bold>edit</text><text>0 files changed · +0 \
@@ -684,7 +712,7 @@ mod tests {
 		let encoded_fault = serde_json::to_vec(&fault).expect("fault serializes");
 		assert_eq!(
 			registry
-				.view(&identities.read, &state, Some(&encoded_fault))
+				.view(identities.read.as_ref().unwrap(), &state, Some(&encoded_fault))
 				.expect("typed fault renders")
 				.as_str(),
 			"<row gap=1><text bold fg=error>read</text><text fg=error>missing &lt;file&gt; &amp; \
@@ -701,7 +729,7 @@ mod tests {
 		let encoded_args = serde_json::to_vec(&args).expect("argument issue serializes");
 		assert_eq!(
 			registry
-				.view(&identities.read, &state, Some(&encoded_args))
+				.view(identities.read.as_ref().unwrap(), &state, Some(&encoded_args))
 				.expect("argument fallback renders")
 				.as_str(),
 			std::str::from_utf8(&encoded_args).expect("JSON is UTF-8"),
@@ -714,7 +742,7 @@ mod tests {
 		let encoded_abort = serde_json::to_vec(&abort).expect("abort serializes");
 		assert_eq!(
 			registry
-				.view(&identities.read, &state, Some(&encoded_abort))
+				.view(identities.read.as_ref().unwrap(), &state, Some(&encoded_abort))
 				.expect("abort fallback renders")
 				.as_str(),
 			std::str::from_utf8(&encoded_abort).expect("JSON is UTF-8"),
@@ -738,11 +766,15 @@ mod tests {
 			});
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
 		let state = ViewState::new();
+		let write_identity = identities
+			.write
+			.as_ref()
+			.expect("write identity registered");
 		let first = registry
-			.view(&identities.write, &state, Some(&encoded))
+			.view(write_identity, &state, Some(&encoded))
 			.expect("write renders");
 		let second = registry
-			.view(&identities.write, &state, Some(&encoded))
+			.view(write_identity, &state, Some(&encoded))
 			.expect("write rerenders");
 		assert_eq!(first, second);
 		assert_eq!(

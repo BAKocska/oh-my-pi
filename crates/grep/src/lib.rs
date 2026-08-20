@@ -1379,6 +1379,27 @@ mod tests {
 	}
 
 	#[test]
+	fn pcre2_fallback_honors_case_and_cross_line_options() {
+		let mut options = options(r"(?<=alpha)\nbeta");
+		options.ignore_case = true;
+		let matcher = build_matcher(options.pattern.as_str(), options.ignore_case, true).unwrap();
+		assert!(matches!(matcher, CompiledMatcher::Pcre2(_)));
+		let result = search(b"ALPHA\nBETA\n", &options).unwrap();
+		assert_eq!(result.total_matches, 1);
+	}
+
+	#[test]
+	fn rust_regex_case_matching_is_explicit() {
+		let sensitive = search(b"Needle\n", &options("needle")).unwrap();
+		assert_eq!(sensitive.total_matches, 0);
+
+		let mut insensitive = options("needle");
+		insensitive.ignore_case = true;
+		let insensitive = search(b"Needle\n", &insensitive).unwrap();
+		assert_eq!(insensitive.total_matches, 1);
+	}
+
+	#[test]
 	fn invalid_pattern_preserves_both_engine_diagnostics() {
 		let error = search(b"text", &options("(")).unwrap_err();
 		assert!(matches!(error, GrepError::InvalidRegex { .. }));

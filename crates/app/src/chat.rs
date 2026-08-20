@@ -1,6 +1,14 @@
 //! Durable project-chat composition.
 
+#[path = "chat_hub.rs"]
+mod hub_backend;
+
+pub(crate) fn chat_hub_tool() -> impl omp_tool::Tool {
+	hub_backend::tool()
+}
+
 use std::{
+	collections::BTreeMap,
 	fs::File,
 	io::{BufRead as _, BufReader},
 	path::{Path, PathBuf},
@@ -433,6 +441,41 @@ mod auth_worker_tests {
 		));
 	}
 }
+fn discover_chat_agents(root: &Path) -> Arc<BTreeMap<Str, omp_agent::AgentDefinition>> {
+	use crate::discovery::manifest::{CapabilityDeclaration, CapabilityKind};
+
+	let mut declarations = vec![CapabilityDeclaration {
+		id:       Str::new_static("project-agents"),
+		kind:     CapabilityKind::Agents,
+		root:     root.join(".omp/agents"),
+		priority: 100,
+	}];
+	if let Some(home) = std::env::var_os("HOME") {
+		declarations.push(CapabilityDeclaration {
+			id:       Str::new_static("user-agents"),
+			kind:     CapabilityKind::Agents,
+			root:     PathBuf::from(home).join(".omp/agent/agents"),
+			priority: 50,
+		});
+	}
+	let mut definitions = crate::discovery::manifest::discover_agents(&declarations)
+		.definitions
+		.into_iter()
+		.collect::<BTreeMap<_, _>>();
+	definitions
+		.entry(Str::new_static("task"))
+		.or_insert_with(|| omp_agent::AgentDefinition {
+			name:           Str::new_static("task"),
+			description:    Str::new_static("General-purpose subagent"),
+			tools:          Box::default(),
+			spawns:         omp_agent::SpawnPolicy::Any,
+			model:          None,
+			thinking_level: None,
+			blocking:       false,
+			prompt:         Str::new_static("Complete the delegated task and report the result."),
+		});
+	Arc::new(definitions)
+}
 
 #[derive(Clone)]
 struct ChatParentContext {
@@ -441,12 +484,14 @@ struct ChatParentContext {
 	sessions_dir:  PathBuf,
 	root:          PathBuf,
 	session_index: Arc<SessionIndex>,
+	definitions:   Arc<BTreeMap<Str, omp_agent::AgentDefinition>>,
 	tree:          Arc<AgentTree>,
 }
 
 pub(crate) struct ChatParentHost<C: TurnClient + Clone + 'static> {
 	client:  C,
 	env:     omp_env::EnvClient,
+	broker:  omp_agent::Broker,
 	context: Mutex<ChatParentContext>,
 }
 
@@ -460,15 +505,18 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 		root: PathBuf,
 		session_index: Arc<SessionIndex>,
 	) -> Self {
+		let definitions = discover_chat_agents(&root);
 		Self {
 			client,
 			env,
+			broker: omp_agent::Broker::new(Str::from(root.to_string_lossy().as_ref())),
 			context: Mutex::new(ChatParentContext {
 				state,
 				session_id,
 				sessions_dir,
 				root,
 				session_index,
+				definitions,
 				tree: Arc::new(AgentTree::new(
 					8,
 					DEFAULT_EVAL_CONCURRENCY_LIMIT,
@@ -482,6 +530,15 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 		let mut context = self.context.lock();
 		context.state = state;
 		context.session_id = session_id;
+	}
+
+	/// Shares the append-only subagent roster with the interactive UI bridge.
+	pub(crate) fn tree(&self) -> Arc<AgentTree> {
+		Arc::clone(&self.context.lock().tree)
+	}
+
+	pub(crate) fn broker(&self) -> omp_agent::Broker {
+		self.broker.clone()
 	}
 }
 
@@ -622,11 +679,25 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			.and_then(Value::as_str)
 			.ok_or_else(|| crate::envd::eval::BridgeHostError::message("agent prompt is required"))?;
 		let kind = args.get("agent").and_then(Value::as_str).unwrap_or("task");
-		if kind != "task" {
-			return Err(crate::envd::eval::BridgeHostError::message(format!(
-				"agent type '{kind}' is not available in this session"
-			)));
-		}
+		let context = self.context.lock().clone();
+		let definition = context
+			.definitions
+			.iter()
+			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(kind))
+			.map(|(_, definition)| definition.clone())
+			.ok_or_else(|| {
+				crate::envd::eval::BridgeHostError::message(format!(
+					"agent type '{kind}' is not available in this session"
+				))
+			})?;
+		let system_prompt = match (definition.description.is_empty(), definition.prompt.is_empty()) {
+			(true, true) => Str::new_static("Complete the delegated task."),
+			(false, true) => definition.description.clone(),
+			(true, false) => definition.prompt.clone(),
+			(false, false) => {
+				Str::from(format!("{}\n\n{}", definition.description, definition.prompt))
+			},
+		};
 		for option in ["isolated", "apply", "merge"] {
 			if args.get(option).is_some() {
 				return Err(crate::envd::eval::BridgeHostError::message(format!(
@@ -639,7 +710,6 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				"structured subagent output is not supported by this session",
 			));
 		}
-		let context = self.context.lock().clone();
 		let id = Str::from(ulid::Ulid::generate().to_string());
 		let directory = context.sessions_dir.join("eval-agents");
 		let name = args
@@ -657,7 +727,10 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				id.clone(),
 				name,
 				AgentKind::Subagent,
-				None,
+				context
+					.tree
+					.node(context.session_id.as_str())
+					.map(|parent| parent.id.clone()),
 				context.session_id.clone(),
 				Budget::default(),
 			)
@@ -676,18 +749,45 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		)
 		.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		let mut child_snapshot = context.state.snapshot().as_ref().clone();
+		if let Some(model) = definition.effective_model(&BTreeMap::new()) {
+			child_snapshot.turn.params.model = model.to_owned();
+		}
+		if let Some(level) = definition.thinking_level.as_deref() {
+			let effort = match level {
+				"off" => inference_pb::Effort::Off,
+				"minimal" | "min" => inference_pb::Effort::Minimal,
+				"low" | "lo" => inference_pb::Effort::Low,
+				"medium" | "med" => inference_pb::Effort::Medium,
+				"high" | "hi" => inference_pb::Effort::High,
+				"max" => inference_pb::Effort::Max,
+				"xhigh" => inference_pb::Effort::Xhigh,
+				_ => inference_pb::Effort::Unspecified,
+			};
+			child_snapshot.turn.params.thinking =
+				Some(inference_pb::Reasoning { effort: effort as i32, ..Default::default() });
+		}
+		let may_spawn = definition.spawns.default_definition().is_some();
+		let declared_tools = &definition.tools;
 		child_snapshot.enabled_tools = child_snapshot
 			.enabled_tools
 			.iter()
-			.filter(|name| name.as_str() != "eval")
+			.filter(|name| {
+				!matches!(name.as_str(), "checkpoint" | "rewind")
+					&& (may_spawn || name.as_str() != "eval")
+					&& (declared_tools.is_empty()
+						|| name.as_str() == "hub"
+						|| declared_tools.iter().any(|allowed| allowed == *name))
+			})
 			.cloned()
 			.collect::<Vec<_>>()
 			.into();
-		child_snapshot
-			.turn
-			.params
-			.tools
-			.retain(|tool| tool.name != "eval");
+		child_snapshot.turn.params.tools.retain(|tool| {
+			!matches!(tool.name.as_str(), "checkpoint" | "rewind")
+				&& (may_spawn || tool.name.as_str() != "eval")
+				&& (declared_tools.is_empty()
+					|| tool.name == "hub"
+					|| declared_tools.iter().any(|allowed| allowed == &tool.name))
+		});
 		let mut child = Agent::new(
 			self.client.clone(),
 			self.env.clone(),
@@ -695,9 +795,24 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			journal,
 			CHAT_CAPS_BASE,
 		);
+		let inbox = self
+			.broker
+			.register(&node, child.mailbox())
+			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		let _hub = hub_backend::attach(Arc::new(hub_backend::ChatHubBackend::new(
+			self.broker.clone(),
+			inbox,
+			Arc::clone(child.jobs()),
+			self.env.clone(),
+			id.clone(),
+			context.session_id.clone(),
+		)));
 		let summary = match child
 			.submit(
-				[bridge_message(Role::User, prompt)],
+				[
+					bridge_message(Role::System, system_prompt.as_str()),
+					bridge_message(Role::User, prompt),
+				],
 				TurnId::new(format!("eval-agent-{}", ulid::Ulid::generate())),
 			)
 			.await
@@ -726,7 +841,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		Ok(json!({
 			"text": text,
-			"details": { "id": id, "agent": kind },
+			"details": { "id": id, "agent": kind, "blocking": definition.blocking },
 		}))
 	}
 
@@ -942,12 +1057,38 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		let agent = Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
 		environment.bind_agent_control(agent.control())?;
 		environment.bind_device_availability(agent.mailbox());
+		let tree = parent.tree();
+		let node = tree
+			.register(
+				id.clone(),
+				Str::new_static("Main"),
+				AgentKind::Main,
+				None,
+				id.clone(),
+				Budget::default(),
+			)
+			.map_err(|error| ChatError::EvalBridge(Str::from(error.to_string())))?;
+		node.set_status(AgentStatus::Running);
+		let broker = parent.broker();
+		let inbox = broker
+			.register(&node, agent.mailbox())
+			.map_err(|error| ChatError::EvalBridge(Str::from(error.to_string())))?;
+		let _hub = hub_backend::attach(Arc::new(hub_backend::ChatHubBackend::new(
+			broker,
+			inbox,
+			Arc::clone(agent.jobs()),
+			env.clone(),
+			id.clone(),
+			id.clone(),
+		)));
 		let exit = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
 			Arc::clone(&scope.registry),
+			parent.tree(),
 			auth.as_ref().map(|worker| &worker.ui),
 			data_dir.clone(),
+			Vec::new(),
 			|| {
 				resume_choices(scope.sessions_dir, scope.root, Some(&current_id))
 					.map_err(anyhow::Error::from)

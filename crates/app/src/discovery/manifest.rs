@@ -4,7 +4,7 @@
 //! never registers in-process callbacks; callers dispatch the winning static
 //! declaration by kind and priority.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ pub enum CapabilityKind {
 	Instructions,
 	/// Markdown slash-command templates.
 	SlashCommands,
+	/// Markdown subagent definitions parsed by `omp-agent`.
+	Agents,
 	/// Native settings sources.
 	Settings,
 }
@@ -40,6 +42,74 @@ pub struct CapabilityDeclaration {
 	pub root:     PathBuf,
 	/// Larger values override lower-priority sources for the same item key.
 	pub priority: i32,
+}
+
+/// One malformed or unreadable manifest-discovered agent definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentDiscoveryWarning {
+	/// Source file skipped during discovery.
+	pub path:    PathBuf,
+	/// Sanitized parse or I/O failure.
+	pub message: Str,
+}
+
+/// First-wins agent definitions plus non-fatal source warnings.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentDiscovery {
+	/// Definitions in manifest precedence order.
+	pub definitions: Vec<(Str, omp_agent::AgentDefinition)>,
+	/// Malformed definitions skipped without aborting discovery.
+	pub warnings:    Vec<AgentDiscoveryWarning>,
+}
+
+/// Loads manifest-declared agent directories through the common static
+/// capability table. File stems are stable definition keys and malformed
+/// extension/project content is skipped with structured warning evidence.
+pub fn discover_agents(declarations: &[CapabilityDeclaration]) -> AgentDiscovery {
+	let ordered = priority_ordered(declarations.to_vec());
+	let warnings = std::cell::RefCell::new(Vec::new());
+	let definitions = dispatch_first(&ordered, CapabilityKind::Agents, |declaration| {
+		agent_files(&declaration.root)
+			.into_iter()
+			.filter_map(|path| {
+				let key = path
+					.file_stem()
+					.and_then(std::ffi::OsStr::to_str)
+					.map(Str::from)?;
+				let markdown = match std::fs::read_to_string(&path) {
+					Ok(markdown) => markdown,
+					Err(error) => {
+						warnings
+							.borrow_mut()
+							.push(AgentDiscoveryWarning { path, message: Str::from(error.to_string()) });
+						return None;
+					},
+				};
+				match omp_agent::AgentDefinition::parse_markdown(key.clone(), &markdown) {
+					Ok(definition) => Some((key, definition)),
+					Err(error) => {
+						warnings
+							.borrow_mut()
+							.push(AgentDiscoveryWarning { path, message: Str::from(error.to_string()) });
+						None
+					},
+				}
+			})
+			.collect()
+	});
+	AgentDiscovery { definitions, warnings: warnings.into_inner() }
+}
+
+fn agent_files(root: &Path) -> Vec<PathBuf> {
+	if root.is_file() {
+		return vec![root.to_path_buf()];
+	}
+	let mut paths = super::native::scan_capability_dir(root)
+		.into_iter()
+		.filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("md"))
+		.collect::<Vec<_>>();
+	paths.sort();
+	paths
 }
 
 /// Sorts declarations so dispatch is deterministic without registration order.

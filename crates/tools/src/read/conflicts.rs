@@ -1,5 +1,12 @@
 //! Pure detection and rendering of unresolved git conflict markers.
 
+use std::{collections::HashMap, sync::Arc};
+
+use omp_core::{CowBytes, Str};
+use parking_lot::Mutex;
+
+use super::{Fault, resolver::Resolve, selector::ParsedSelector};
+
 const OURS_PREFIX: &str = "<<<<<<<";
 const BASE_PREFIX: &str = "|||||||";
 const SEPARATOR: &str = "=======";
@@ -363,11 +370,10 @@ pub fn format_conflict_warning(
 
 fn conflict_resolution_guidance(display_path: &str) -> String {
 	format!(
-		"NOTICE: Read `{display_path}:conflicts` for the conflict index, then read the affected \
-		 source ranges to obtain their `[{display_path}#TAG]` header and numbered marker lines. \
-		 Resolve each complete marker block with the hashline `edit` tool, using `PUT N.=M:` from \
-		 `<<<<<<<` through `>>>>>>>`; preserve the intended side(s), and re-read \
-		 `{display_path}:conflicts` to verify."
+		"NOTICE: Read `{display_path}:conflicts` for the conflict index and `conflict://<id>` (or \
+		 `/ours`, `/base`, `/theirs`, `/both`) for exact sides. Resolve with `write` targeting \
+		 `conflict://<id>` and content `@ours`, `@base`, `@theirs`, `@both`, or custom text; \
+		 re-read `{display_path}:conflicts` to verify."
 	)
 }
 
@@ -429,5 +435,414 @@ fn append_body(out: &mut Vec<String>, section: &[String]) {
 	if hidden > 0 {
 		let suffix = if hidden == 1 { "" } else { "s" };
 		out.push(format!("… ({hidden} more line{suffix})"));
+	}
+}
+
+/// One session-registered conflict addressable through `conflict://<id>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredConflict {
+	/// Stable session-local numeric identity.
+	pub id:           usize,
+	/// Display path whose bytes contained the marker block.
+	pub display_path: Str,
+	/// Captured marker block.
+	pub block:        ConflictBlock,
+}
+
+#[derive(Default)]
+struct RegistryState {
+	next_id: usize,
+	by_id:   HashMap<usize, RegisteredConflict>,
+	by_path: HashMap<Str, Vec<usize>>,
+}
+
+/// Session-local conflict registry shared by read and splice-capable tools.
+#[derive(Clone, Default)]
+pub struct ConflictRegistry(Arc<Mutex<RegistryState>>);
+
+impl ConflictRegistry {
+	/// Replaces one path's registrations after a complete-file scan.
+	///
+	/// Unchanged blocks retain their IDs, so re-reading a file does not
+	/// invalidate a pending `conflict://<id>` instruction.
+	pub fn refresh(&self, display_path: impl Into<Str>, input: &str) -> Vec<RegisteredConflict> {
+		let display_path = display_path.into();
+		let blocks = scan_conflicts(input);
+		let mut state = self.0.lock();
+		let prior_ids = state.by_path.remove(&display_path).unwrap_or_default();
+		let mut prior = prior_ids
+			.into_iter()
+			.filter_map(|id| state.by_id.remove(&id))
+			.collect::<Vec<_>>();
+		let mut registered = Vec::with_capacity(blocks.len());
+		for block in blocks {
+			let id = prior
+				.iter()
+				.position(|entry| entry.block == block)
+				.map(|index| prior.swap_remove(index).id)
+				.unwrap_or_else(|| {
+					state.next_id = state.next_id.saturating_add(1).max(1);
+					state.next_id
+				});
+			let entry = RegisteredConflict { id, display_path: display_path.clone(), block };
+			state.by_id.insert(id, entry.clone());
+			registered.push(entry);
+		}
+		state
+			.by_path
+			.insert(display_path, registered.iter().map(|entry| entry.id).collect());
+		registered
+	}
+
+	/// Returns a registered conflict by session-local ID.
+	#[must_use]
+	pub fn get(&self, id: usize) -> Option<RegisteredConflict> {
+		self.0.lock().by_id.get(&id).cloned()
+	}
+
+	/// Removes a registration after a confirmed splice.
+	pub fn remove(&self, id: usize) -> Option<RegisteredConflict> {
+		let mut state = self.0.lock();
+		let removed = state.by_id.remove(&id)?;
+		let path_empty = state
+			.by_path
+			.get_mut(&removed.display_path)
+			.is_some_and(|ids| {
+				ids.retain(|candidate| *candidate != id);
+				ids.is_empty()
+			});
+		if path_empty {
+			state.by_path.remove(&removed.display_path);
+		}
+		Some(removed)
+	}
+
+	/// Returns current registrations in numeric order.
+	#[must_use]
+	pub fn entries(&self) -> Vec<RegisteredConflict> {
+		let state = self.0.lock();
+		let mut entries = state.by_id.values().cloned().collect::<Vec<_>>();
+		entries.sort_unstable_by_key(|entry| entry.id);
+		entries
+	}
+}
+
+/// A conflict-region projection selected by the URL path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictScope {
+	/// Render all sides with labels and source line locations.
+	All,
+	/// Render only the current branch.
+	Ours,
+	/// Render only the merge base.
+	Base,
+	/// Render only the incoming branch.
+	Theirs,
+	/// Render current and incoming sides in order.
+	Both,
+}
+
+/// Parsed `conflict://<id>[/<scope>]` address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConflictAddress {
+	/// Session-local conflict ID.
+	pub id:    usize,
+	/// Requested region projection.
+	pub scope: ConflictScope,
+}
+
+/// Parses a conflict URL resource without its `conflict://` prefix.
+pub fn parse_conflict_address(resource: &str) -> Result<ConflictAddress, Fault> {
+	if resource == "*" {
+		return Err(Fault::Invalid {
+			message: Str::new_static("conflict://* is write-only; read one conflict ID"),
+		});
+	}
+	let (id, scope) = resource.split_once('/').unwrap_or((resource, ""));
+	let id = id
+		.parse::<usize>()
+		.ok()
+		.filter(|id| *id > 0)
+		.ok_or_else(|| Fault::Invalid {
+			message: Str::from(format!("Invalid conflict address 'conflict://{resource}'")),
+		})?;
+	let scope = match scope.to_ascii_lowercase().as_str() {
+		"" => ConflictScope::All,
+		"ours" => ConflictScope::Ours,
+		"base" => ConflictScope::Base,
+		"theirs" => ConflictScope::Theirs,
+		"both" => ConflictScope::Both,
+		_ => {
+			return Err(Fault::Invalid {
+				message: Str::from(format!(
+					"Unknown conflict scope '{scope}'; use ours, base, theirs, or both"
+				)),
+			});
+		},
+	};
+	Ok(ConflictAddress { id, scope })
+}
+
+/// Constructor-owned resolver for session conflict registrations.
+#[derive(Clone)]
+pub struct ConflictResolver {
+	registry: ConflictRegistry,
+}
+
+impl ConflictResolver {
+	/// Creates a resolver sharing `registry` with conflict-scanning readers.
+	#[must_use]
+	pub const fn new(registry: ConflictRegistry) -> Self {
+		Self { registry }
+	}
+}
+
+impl Resolve for ConflictResolver {
+	async fn read<'a>(
+		&'a self,
+		resource: &'a str,
+		selector: &'a ParsedSelector,
+	) -> Result<CowBytes<'static>, Fault> {
+		if !matches!(selector, ParsedSelector::None | ParsedSelector::Raw) {
+			return Err(Fault::Invalid {
+				message: Str::new_static(
+					"conflict:// reads accept only :raw; choose /ours, /base, /theirs, or /both",
+				),
+			});
+		}
+		let address = parse_conflict_address(resource)?;
+		let entry = self.registry.get(address.id).ok_or_else(|| Fault::Source {
+			message: Str::from(format!("Conflict #{} is no longer registered", address.id)),
+		})?;
+		Ok(CowBytes::from(render_registered(&entry, address.scope).into_bytes()))
+	}
+}
+
+/// Replacement requested by a conflict splice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConflictReplacement {
+	/// Keep the current branch.
+	Ours,
+	/// Restore the merge base.
+	Base,
+	/// Keep the incoming branch.
+	Theirs,
+	/// Keep current then incoming text.
+	Both,
+	/// Install caller-supplied text.
+	Custom(Str),
+}
+
+/// A successfully prepared whole-document conflict splice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictSplice {
+	/// Complete post-splice UTF-8 document.
+	pub text:  Str,
+	/// One-based marker range replaced in the current document.
+	pub range: (usize, usize),
+}
+
+/// Parses exact side directives while preserving all custom text verbatim.
+#[must_use]
+pub fn parse_replacement(content: Str) -> ConflictReplacement {
+	match content.trim().as_str() {
+		"@ours" => ConflictReplacement::Ours,
+		"@base" => ConflictReplacement::Base,
+		"@theirs" => ConflictReplacement::Theirs,
+		"@both" => ConflictReplacement::Both,
+		_ => ConflictReplacement::Custom(content),
+	}
+}
+
+/// Applies one registered splice to current bytes without clobbering drift.
+///
+/// When the recorded line range moved, an exact semantic block may be
+/// recovered only if it is unique. Duplicate matches are rejected.
+pub fn splice_registered(
+	current: &str,
+	entry: &RegisteredConflict,
+	replacement: &ConflictReplacement,
+) -> Result<ConflictSplice, Fault> {
+	let candidates = scan_conflicts(current)
+		.into_iter()
+		.filter(|block| same_conflict(block, &entry.block))
+		.collect::<Vec<_>>();
+	let selected = candidates
+		.iter()
+		.find(|block| {
+			block.start_line == entry.block.start_line && block.end_line == entry.block.end_line
+		})
+		.or_else(|| (candidates.len() == 1).then(|| &candidates[0]))
+		.ok_or_else(|| Fault::Source {
+			message: Str::from(if candidates.is_empty() {
+				format!("Conflict #{} is stale; its marker block no longer exists", entry.id)
+			} else {
+				format!(
+					"Conflict #{} is ambiguous; {} identical marker blocks exist",
+					entry.id,
+					candidates.len()
+				)
+			}),
+		})?;
+	let range = line_byte_range(current, selected.start_line, selected.end_line)?;
+	let had_line_ending = current[range.clone()].ends_with('\n');
+	let mut replacement_text = replacement_text(selected, replacement)?;
+	while replacement_text.ends_with('\n') {
+		replacement_text.pop();
+	}
+	if had_line_ending && !replacement_text.is_empty() {
+		replacement_text.push('\n');
+	}
+	let mut output = String::with_capacity(current.len() - range.len() + replacement_text.len());
+	output.push_str(&current[..range.start]);
+	output.push_str(&replacement_text);
+	output.push_str(&current[range.end..]);
+	Ok(ConflictSplice { text: Str::from(output), range: (selected.start_line, selected.end_line) })
+}
+
+fn render_registered(entry: &RegisteredConflict, scope: ConflictScope) -> String {
+	let block = &entry.block;
+	let section = |lines: &[String]| lines.join("\n");
+	match scope {
+		ConflictScope::Ours => section(&block.ours_lines),
+		ConflictScope::Base => block.base_lines.as_deref().map(section).unwrap_or_default(),
+		ConflictScope::Theirs => section(&block.theirs_lines),
+		ConflictScope::Both => join_sides(&block.ours_lines, &block.theirs_lines),
+		ConflictScope::All => {
+			let mut out = format!(
+				"[conflict://{}]\n{}:L{}-L{}\n<<<<<<< {}",
+				entry.id,
+				entry.display_path,
+				block.start_line,
+				block.end_line,
+				block.ours_label.as_deref().unwrap_or("ours")
+			);
+			if !block.ours_lines.is_empty() {
+				out.push('\n');
+				out.push_str(&section(&block.ours_lines));
+			}
+			if let Some(base) = &block.base_lines {
+				out.push_str("\n||||||| ");
+				out.push_str(block.base_label.as_deref().unwrap_or("base"));
+				if !base.is_empty() {
+					out.push('\n');
+					out.push_str(&section(base));
+				}
+			}
+			out.push_str("\n=======");
+			if !block.theirs_lines.is_empty() {
+				out.push('\n');
+				out.push_str(&section(&block.theirs_lines));
+			}
+			out.push_str("\n>>>>>>> ");
+			out.push_str(block.theirs_label.as_deref().unwrap_or("theirs"));
+			out
+		},
+	}
+}
+
+fn same_conflict(left: &ConflictBlock, right: &ConflictBlock) -> bool {
+	left.ours_label == right.ours_label
+		&& left.base_label == right.base_label
+		&& left.theirs_label == right.theirs_label
+		&& left.ours_lines == right.ours_lines
+		&& left.base_lines == right.base_lines
+		&& left.theirs_lines == right.theirs_lines
+}
+
+fn replacement_text(
+	block: &ConflictBlock,
+	replacement: &ConflictReplacement,
+) -> Result<String, Fault> {
+	Ok(match replacement {
+		ConflictReplacement::Ours => block.ours_lines.join("\n"),
+		ConflictReplacement::Base => block
+			.base_lines
+			.as_ref()
+			.ok_or_else(|| Fault::Invalid {
+				message: Str::new_static("@base requires a three-way conflict with a base section"),
+			})?
+			.join("\n"),
+		ConflictReplacement::Theirs => block.theirs_lines.join("\n"),
+		ConflictReplacement::Both => join_sides(&block.ours_lines, &block.theirs_lines),
+		ConflictReplacement::Custom(text) => text.to_string(),
+	})
+}
+
+fn join_sides(ours: &[String], theirs: &[String]) -> String {
+	match (ours.is_empty(), theirs.is_empty()) {
+		(true, true) => String::new(),
+		(false, true) => ours.join("\n"),
+		(true, false) => theirs.join("\n"),
+		(false, false) => format!("{}\n{}", ours.join("\n"), theirs.join("\n")),
+	}
+}
+
+fn line_byte_range(
+	input: &str,
+	start_line: usize,
+	end_line: usize,
+) -> Result<std::ops::Range<usize>, Fault> {
+	let mut starts = Vec::with_capacity(input.bytes().filter(|byte| *byte == b'\n').count() + 1);
+	starts.push(0);
+	for (index, byte) in input.bytes().enumerate() {
+		if byte == b'\n' {
+			starts.push(index + 1);
+		}
+	}
+	if start_line == 0 || end_line < start_line || end_line > starts.len() {
+		return Err(Fault::Source {
+			message: Str::from(format!("Conflict line range L{start_line}-L{end_line} is stale")),
+		});
+	}
+	let start = starts[start_line - 1];
+	let end = starts.get(end_line).copied().unwrap_or(input.len());
+	Ok(start..end)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{
+		ConflictRegistry, ConflictReplacement, ConflictScope, parse_conflict_address,
+		render_registered, splice_registered,
+	};
+
+	const CONFLICT: &str =
+		"before\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> topic\nafter\n";
+
+	#[test]
+	fn registry_retains_ids_and_resolves_scopes() {
+		let registry = ConflictRegistry::default();
+		let first = registry.refresh("src/lib.rs", CONFLICT);
+		let second = registry.refresh("src/lib.rs", CONFLICT);
+		assert_eq!(first[0].id, second[0].id);
+		assert_eq!(render_registered(&first[0], ConflictScope::Ours), "ours");
+		assert_eq!(parse_conflict_address("1/theirs").unwrap().scope, ConflictScope::Theirs);
+	}
+
+	#[test]
+	fn splice_uses_registered_semantics_and_rejects_stale_content() {
+		let registry = ConflictRegistry::default();
+		let entry = registry.refresh("src/lib.rs", CONFLICT).remove(0);
+		let spliced = splice_registered(CONFLICT, &entry, &ConflictReplacement::Both).unwrap();
+		assert_eq!(spliced.text, "before\nours\ntheirs\nafter\n");
+		let changed = CONFLICT.replace("ours", "changed");
+		assert!(splice_registered(&changed, &entry, &ConflictReplacement::Ours).is_err());
+	}
+
+	#[test]
+	fn base_requires_a_three_way_conflict() {
+		let registry = ConflictRegistry::default();
+		let entry = registry
+			.refresh("x", "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> topic\n")
+			.remove(0);
+		assert!(
+			splice_registered(
+				"<<<<<<< HEAD\na\n=======\nb\n>>>>>>> topic\n",
+				&entry,
+				&ConflictReplacement::Base,
+			)
+			.is_err()
+		);
 	}
 }

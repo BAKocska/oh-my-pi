@@ -23,10 +23,10 @@ use omp_tools::{
 		EditPrepared, EditProposal, Fault as EditFault, FormatPolicy, NoopResult, PrepareRequest,
 		RejectionReason, StalePolicy,
 	},
-	read::{Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES},
+	read::{Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES, conflicts::splice_registered},
 	write::{
-		Fault as WriteFault, PlainWriteRequest, PlainWriteResult, SpecialWriteControl,
-		WriteCommitError, WriteDisposition, WriteDocuments,
+		ConflictSpliceRequest, ConflictSpliceResult, Fault as WriteFault, PlainWriteRequest,
+		PlainWriteResult, SpecialWriteControl, WriteCommitError, WriteDisposition, WriteDocuments,
 	},
 };
 use parking_lot::Mutex;
@@ -913,126 +913,12 @@ fn serialize_notebook_edit(
 	editable: &[u8],
 	display_path: &str,
 ) -> Result<Bytes, String> {
-	let mut notebook: serde_json::Value = serde_json::from_slice(original)
-		.map_err(|_| format!("Invalid JSON in notebook: {display_path}"))?;
-	let cells = notebook
-		.as_object()
-		.and_then(|object| object.get("cells"))
-		.and_then(serde_json::Value::as_array)
-		.ok_or_else(|| format!("Invalid notebook structure (missing cells array): {display_path}"))?
-		.clone();
 	let editable = std::str::from_utf8(editable).map_err(|_| {
 		format!("Invalid notebook editable representation for {display_path}: text is not UTF-8")
 	})?;
-	let parsed = parse_notebook_cells(editable, display_path)?;
-	let mut used = std::collections::HashSet::new();
-	let mut next_cells = Vec::with_capacity(parsed.len());
-	for (cell_type, original_index, source) in parsed {
-		let original_cell = original_index
-			.filter(|index| *index < cells.len() && used.insert(*index))
-			.and_then(|index| cells.get(index))
-			.and_then(serde_json::Value::as_object)
-			.cloned();
-		let mut cell = original_cell.unwrap_or_default();
-		cell.insert("cell_type".into(), serde_json::Value::String(cell_type.to_owned()));
-		cell.insert(
-			"source".into(),
-			serde_json::Value::Array(
-				source
-					.split_inclusive('\n')
-					.filter(|line| !line.is_empty())
-					.map(|line| serde_json::Value::String(line.to_owned()))
-					.collect(),
-			),
-		);
-		if cell_type == "code" {
-			cell
-				.entry("execution_count")
-				.or_insert(serde_json::Value::Null);
-			cell
-				.entry("outputs")
-				.or_insert_with(|| serde_json::Value::Array(Vec::new()));
-		} else {
-			cell.remove("execution_count");
-			cell.remove("outputs");
-		}
-		cell
-			.entry("metadata")
-			.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-		next_cells.push(serde_json::Value::Object(cell));
-	}
-	notebook
-		.as_object_mut()
-		.expect("notebook object was validated")
-		.insert("cells".into(), serde_json::Value::Array(next_cells));
-	let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
-	let mut serializer = serde_json::Serializer::with_formatter(Vec::new(), formatter);
-	serde::Serialize::serialize(&notebook, &mut serializer)
-		.map_err(|error| format!("Failed to serialize notebook {display_path}: {error}"))?;
-	Ok(Bytes::from(serializer.into_inner()))
-}
-
-type NotebookCell<'a> = (&'a str, Option<usize>, String);
-
-fn parse_notebook_cells<'a>(
-	editable: &'a str,
-	display_path: &str,
-) -> Result<Vec<NotebookCell<'a>>, String> {
-	let mut cells: Vec<(&str, Option<usize>, Vec<String>)> = Vec::new();
-	for line in if editable.is_empty() {
-		Vec::new()
-	} else {
-		editable.split('\n').collect()
-	} {
-		if let Some((cell_type, index)) = parse_notebook_marker(line) {
-			cells.push((cell_type, index, Vec::new()));
-		} else if let Some((_, _, source)) = cells.last_mut() {
-			source.push(unescape_notebook_marker(line));
-		} else {
-			return Err(format!(
-				"Invalid notebook editable representation for {display_path}: expected first line to \
-				 be \"# %% [code] cell:0\", \"# %% [markdown] cell:0\", or \"# %% [raw] cell:0\"."
-			));
-		}
-	}
-	Ok(cells
-		.into_iter()
-		.map(|(cell_type, index, source)| (cell_type, index, source.join("\n")))
-		.collect())
-}
-
-fn parse_notebook_marker(line: &str) -> Option<(&str, Option<usize>)> {
-	let body = line.strip_prefix("# %% [")?;
-	let (cell_type, suffix) = body.split_once(']')?;
-	if !matches!(cell_type, "code" | "markdown" | "raw") {
-		return None;
-	}
-	let index = if suffix.is_empty() {
-		None
-	} else {
-		Some(suffix.strip_prefix(" cell:")?.parse().ok()?)
-	};
-	Some((cell_type, index))
-}
-
-fn unescape_notebook_marker(line: &str) -> String {
-	let Some(after_prefix) = line.strip_prefix("# ") else {
-		return line.to_owned();
-	};
-	let percent_count = after_prefix
-		.bytes()
-		.take_while(|byte| *byte == b'%')
-		.count();
-	if percent_count < 3 {
-		return line.to_owned();
-	}
-	let suffix = &after_prefix[percent_count..];
-	let marker = format!("# %%{suffix}");
-	if parse_notebook_marker(&marker).is_some() {
-		format!("# {}{suffix}", "%".repeat(percent_count - 1))
-	} else {
-		line.to_owned()
-	}
+	omp_tools::read::notebook::round_trip(original, editable)
+		.map(Bytes::from)
+		.map_err(|error| format!("Invalid notebook edit for {display_path}: {error}"))
 }
 
 fn record_committed_snapshot(
@@ -1472,6 +1358,13 @@ impl WriteDocuments for DocumentHost {
 		})
 	}
 
+	async fn splice_conflict(
+		&self,
+		request: ConflictSpliceRequest,
+	) -> Result<Option<ConflictSpliceResult>, WriteCommitError> {
+		splice_conflict_document(self, request).await.map(Some)
+	}
+
 	async fn write_archive_member(
 		&self,
 		display_path: Str,
@@ -1651,6 +1544,116 @@ fn record_write_snapshot(
 		.lock()
 		.record(path, revision, content, 1..=line_count)
 		.ok()
+}
+
+async fn splice_conflict_document(
+	host: &DocumentHost,
+	request: ConflictSpliceRequest,
+) -> Result<ConflictSpliceResult, WriteCommitError> {
+	let resolved = resolve_document(host, &request.entry.display_path).map_err(write_rejected)?;
+	let lease = DocumentHost::open(host, resolved.uri, None, &CancellationToken::new())
+		.await
+		.map_err(|error| write_rejected(error.to_string()))?;
+	if pb::DocumentKind::try_from(lease.head().kind) != Ok(pb::DocumentKind::Text) {
+		return Err(write_rejected("conflict splices require a UTF-8 text document"));
+	}
+	let revision = lease
+		.head()
+		.revision
+		.clone()
+		.ok_or_else(|| write_rejected("document head omitted its revision"))?;
+	let current = read_whole(host, &lease)
+		.await
+		.map_err(|error| write_rejected(error.to_string()))?;
+	let current_text = std::str::from_utf8(&current)
+		.map_err(|_| write_rejected("conflict splices require a UTF-8 text document"))?;
+	let splice = splice_registered(current_text, &request.entry, &request.replacement)
+		.map_err(|fault| write_rejected(fault.message().to_string()))?;
+	let content = Bytes::copy_from_slice(splice.text.as_bytes());
+	let transaction_id = transaction_id(host.hello().server_epoch.as_ref());
+	let response = host
+		.commit_transaction(
+			transaction_id.clone(),
+			vec![pb::DocumentMutation {
+				document:  Some(lease_target(&lease)),
+				operation: Some(pb::document_mutation::Operation::Text(pb::TextMutation {
+					base_revision: Some(revision),
+					change:        Some(pb::text_mutation::Change::ProposedContent(content.clone())),
+					stale_policy:  pb::StalePolicy::Fail as i32,
+					format_policy: pb::FormatPolicy::Disabled as i32,
+				})),
+			}],
+			&CancellationToken::new(),
+		)
+		.await
+		.map_err(|error| WriteCommitError::EffectsUnknown { reason: Str::from(error.to_string()) })?;
+	let committed = match response.outcome {
+		Some(pb::commit_transaction_response::Outcome::Committed(committed))
+			if committed.transaction_id == transaction_id =>
+		{
+			committed
+		},
+		Some(pb::commit_transaction_response::Outcome::Rejected(rejected))
+			if rejected.transaction_id == transaction_id =>
+		{
+			return Err(write_rejected(rejected.message));
+		},
+		Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(partial))
+			if partial.transaction_id == transaction_id =>
+		{
+			return Err(WriteCommitError::EffectsUnknown {
+				reason: fmts!(
+					"conflict splice partially committed before operation {}: {}",
+					partial.failed_operation_index,
+					partial.message
+				),
+			});
+		},
+		Some(_) => {
+			return Err(WriteCommitError::EffectsUnknown {
+				reason: "conflict splice transaction identity did not match".into(),
+			});
+		},
+		None => {
+			return Err(WriteCommitError::EffectsUnknown {
+				reason: "conflict splice transaction omitted its outcome".into(),
+			});
+		},
+	};
+	let operation = committed
+		.operations
+		.first()
+		.filter(|operation| committed.operations.len() == 1 && operation.operation_index == 0)
+		.ok_or_else(|| WriteCommitError::EffectsUnknown {
+			reason: "conflict splice did not return exactly operation 0".into(),
+		})?;
+	let head = operation
+		.head
+		.as_ref()
+		.ok_or_else(|| WriteCommitError::EffectsUnknown {
+			reason: "conflict splice omitted its committed document head".into(),
+		})?;
+	let committed_revision = revision_identity(head)
+		.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
+	let resolved_path = document_path(head)
+		.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
+	let snapshot_tag = record_write_snapshot(
+		host,
+		resolved_path.clone(),
+		RevisionToken::new(committed_revision.as_bytes()),
+		content.clone(),
+	);
+	Ok(ConflictSpliceResult {
+		write: PlainWriteResult {
+			resolved_path,
+			display_path: request.entry.display_path,
+			byte_len: u64::try_from(content.len()).unwrap_or(u64::MAX),
+			disposition: WriteDisposition::Overwrote,
+			made_executable: false,
+			snapshot_tag,
+		},
+		range: splice.range,
+	})
 }
 
 fn write_rejected(message: impl Into<String>) -> WriteCommitError {

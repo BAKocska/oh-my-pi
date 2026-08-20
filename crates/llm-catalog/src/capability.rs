@@ -408,6 +408,135 @@ pub struct ServiceTier {
 	pub priority: i16,
 }
 
+/// Provider family whose service-tier vocabulary shares wire semantics.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	PartialEq,
+	Serialize,
+	Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum ProviderFamily {
+	/// OpenAI-compatible flex, scale, and priority tiers.
+	OpenAi,
+	/// Anthropic priority and fast-mode tiers.
+	Anthropic,
+	/// Google flex and priority tiers.
+	Google,
+	/// Provider-specific vocabulary without family defaults.
+	Other,
+}
+
+/// Session role used when resolving an inherited tier intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TierAudience {
+	/// Interactive or headless root session.
+	Session,
+	/// Spawned task agent.
+	Subagent,
+	/// Passive advisor.
+	Advisor,
+}
+
+/// Declarative service-tier intent before child inheritance is resolved.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "tier")]
+pub enum ServiceTierIntent {
+	/// Preserve provider defaults.
+	#[default]
+	Unset,
+	/// Reuse the parent session's concrete family tier.
+	Inherit,
+	/// Select an exact typed provider tier.
+	Select(ServiceTier),
+}
+
+/// Per-family tier policy plus subagent/advisor inheritance controls.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FamilyServiceTierPolicy {
+	/// OpenAI-family session intent.
+	pub openai:    ServiceTierIntent,
+	/// Anthropic-family session intent.
+	pub anthropic: ServiceTierIntent,
+	/// Google-family session intent.
+	pub google:    ServiceTierIntent,
+	/// Spawned-agent override or inheritance.
+	pub subagent:  ServiceTierIntent,
+	/// Advisor override or inheritance.
+	pub advisor:   ServiceTierIntent,
+}
+
+impl Default for FamilyServiceTierPolicy {
+	fn default() -> Self {
+		Self {
+			openai:    ServiceTierIntent::Unset,
+			anthropic: ServiceTierIntent::Unset,
+			google:    ServiceTierIntent::Unset,
+			subagent:  ServiceTierIntent::Inherit,
+			advisor:   ServiceTierIntent::Inherit,
+		}
+	}
+}
+
+impl FamilyServiceTierPolicy {
+	/// Resolves one concrete tier before canonical intent negotiation.
+	#[must_use]
+	pub fn resolve(
+		&self,
+		family: ProviderFamily,
+		audience: TierAudience,
+		parent: Option<&ServiceTier>,
+	) -> Option<ServiceTier> {
+		let family_intent = match family {
+			ProviderFamily::OpenAi => &self.openai,
+			ProviderFamily::Anthropic => &self.anthropic,
+			ProviderFamily::Google => &self.google,
+			ProviderFamily::Other => &ServiceTierIntent::Unset,
+		};
+		let audience_intent = match audience {
+			TierAudience::Session => family_intent,
+			TierAudience::Subagent => &self.subagent,
+			TierAudience::Advisor => &self.advisor,
+		};
+		match audience_intent {
+			ServiceTierIntent::Select(tier) => Some(tier.clone()),
+			ServiceTierIntent::Inherit => parent.cloned().or_else(|| match family_intent {
+				ServiceTierIntent::Select(tier) => Some(tier.clone()),
+				ServiceTierIntent::Unset | ServiceTierIntent::Inherit => None,
+			}),
+			ServiceTierIntent::Unset => None,
+		}
+	}
+}
+
+impl ServiceTier {
+	/// Validates and constructs a family-defined wire tier.
+	#[must_use]
+	pub fn for_family(family: ProviderFamily, name: &str) -> Option<Self> {
+		let priority = match (family, name) {
+			(ProviderFamily::OpenAi, "auto" | "default") => 0,
+			(ProviderFamily::OpenAi, "flex") => -1,
+			(ProviderFamily::OpenAi, "scale") => 1,
+			(ProviderFamily::OpenAi, "priority") => 2,
+			(ProviderFamily::Anthropic, "default") => 0,
+			(ProviderFamily::Anthropic, "priority" | "fast") => 1,
+			(ProviderFamily::Google, "default") => 0,
+			(ProviderFamily::Google, "flex") => -1,
+			(ProviderFamily::Google, "priority") => 1,
+			(ProviderFamily::Other, _) | (..) => return None,
+		};
+		Some(Self { name: Str::from(name), priority })
+	}
+}
+
 bitset!(/// Independent sampling controls.
 	SamplingControlBits, u16);
 impl SamplingControlBits {
@@ -765,4 +894,20 @@ pub struct ModelCapabilities {
 	pub search:        Option<SearchCapabilities>,
 	/// Token counting and token conversion capabilities.
 	pub tokenization:  Option<TokenizationCapabilities>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn child_tier_inherits_concrete_parent_family_intent() {
+		let parent = ServiceTier::for_family(ProviderFamily::OpenAi, "priority").expect("tier");
+		let policy = FamilyServiceTierPolicy::default();
+		assert_eq!(
+			policy.resolve(ProviderFamily::OpenAi, TierAudience::Subagent, Some(&parent)),
+			Some(parent)
+		);
+		assert!(ServiceTier::for_family(ProviderFamily::Anthropic, "flex").is_none());
+	}
 }

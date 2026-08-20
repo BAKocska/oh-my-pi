@@ -37,6 +37,8 @@ enum Format {
 	Pptx,
 	Rtf,
 	Epub,
+	Html,
+	Xml,
 }
 
 /// Markdown produced from a supported document.
@@ -160,7 +162,35 @@ pub fn convert(path: &Path, bytes: &[u8]) -> Result<Option<Conversion>, MarkitEr
 			let (text, title) = epub::convert(bytes)?;
 			Conversion { text, note: None, title }
 		},
+		Format::Html | Format::Xml => {
+			let source = std::str::from_utf8(bytes)
+				.map_err(|error| MarkitError::conversion("html/xml", error.to_string()))?;
+			let converted = html_to_markdown_rs::convert(source, None)
+				.map_err(|error| MarkitError::conversion("html/xml", error.to_string()))?;
+			let text = Str::from(converted.content.unwrap_or_default());
+			Conversion::plain(text)
+		},
 	};
-
 	Ok(Some(conversion))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::Path;
+
+	use super::{convert, supports_path};
+
+	#[test]
+	fn converts_local_html_and_xml_as_documents() {
+		for (path, source, needle) in [
+			("page.html", "<h1>Title</h1><p>Body</p>", "# Title"),
+			("feed.xml", "<article><h2>Entry</h2><p>Text</p></article>", "## Entry"),
+		] {
+			assert!(supports_path(Path::new(path)));
+			let converted = convert(Path::new(path), source.as_bytes())
+				.unwrap()
+				.expect("recognized document");
+			assert!(converted.text.contains(needle), "{path}: {}", converted.text);
+		}
+	}
 }

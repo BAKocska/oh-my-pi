@@ -382,6 +382,7 @@ pub struct EnvServer {
 	ext_hosts:           Arc<ExtHostSupervisor>,
 	eval_bridge:         Arc<SessionBridgeHost>,
 	eval_control:        omp_tools::eval::EvalSessionControl,
+	checkpoint_control:  super::tools::AgentCheckpointControl,
 	sessions_index:      Arc<SessionIndex>,
 	journal_external:    ExternalJournalActor,
 	workers:             Arc<WorkerSupervisor>,
@@ -443,6 +444,7 @@ impl EnvServer {
 		ext_hosts: Arc<ExtHostSupervisor>,
 		eval_bridge: Arc<SessionBridgeHost>,
 		eval_control: omp_tools::eval::EvalSessionControl,
+		checkpoint_control: super::tools::AgentCheckpointControl,
 		sessions_index: Arc<SessionIndex>,
 		journal_external: ExternalJournalActor,
 		authority: Arc<AuthorityTable>,
@@ -460,6 +462,7 @@ impl EnvServer {
 			ext_hosts,
 			eval_bridge,
 			eval_control,
+			checkpoint_control,
 			sessions_index,
 			journal_external,
 			workers: Arc::new(WorkerSupervisor::new(WORKER_LAYER_CEILING, MAX_CONCURRENT_SPAWNS)),
@@ -523,7 +526,7 @@ impl EnvServer {
 			state_dir.join("workspace-ops"),
 		)?;
 		let tool_settings = crate::settings::Settings::load(state_dir).tools;
-		let (registry, eval_bridge, eval_control) = production_registry(
+		let (registry, eval_bridge, eval_control, checkpoint_control) = production_registry(
 			&documents,
 			&blobs,
 			&exec,
@@ -556,6 +559,7 @@ impl EnvServer {
 			ext_hosts,
 			eval_bridge,
 			eval_control,
+			checkpoint_control,
 			sessions_index,
 			journal_external,
 			authority,
@@ -605,7 +609,7 @@ impl EnvServer {
 			state_dir.join("workspace-ops"),
 		)?;
 		let tool_settings = crate::settings::Settings::load(state_dir).tools;
-		let (registry, eval_bridge, eval_control) = production_registry(
+		let (registry, eval_bridge, eval_control, checkpoint_control) = production_registry(
 			&documents,
 			&blobs,
 			&exec,
@@ -638,6 +642,7 @@ impl EnvServer {
 			ext_hosts,
 			eval_bridge,
 			eval_control,
+			checkpoint_control,
 			sessions_index,
 			journal_external,
 			authority,
@@ -750,9 +755,10 @@ impl EnvServer {
 	) -> Result<(), EnvdError> {
 		self.journal_external.bind_agent(sender.clone())?;
 		self.ext_hosts.bind_journal_runtime(JournalRuntime {
-			agent:    sender,
+			agent:    sender.clone(),
 			external: self.journal_external.sender(),
 		})?;
+		self.checkpoint_control.bind(sender);
 		Ok(())
 	}
 
@@ -5713,6 +5719,7 @@ mod tests {
 			Arc::new(ext_hosts),
 			Arc::new(SessionBridgeHost::new()),
 			omp_tools::eval::EvalSessionControl::default(),
+			crate::envd::tools::AgentCheckpointControl::default(),
 			sessions_index,
 			journal_external,
 			Arc::new(AuthorityTable::default()),

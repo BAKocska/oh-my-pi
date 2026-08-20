@@ -11,8 +11,11 @@
 
 use omp_core::Str;
 
+pub mod client;
+pub mod framing;
 pub mod health;
 pub mod hello;
+pub mod protocol;
 pub mod tls;
 pub mod uds;
 
