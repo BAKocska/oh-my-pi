@@ -12,19 +12,19 @@ use std::{
 	fmt,
 	hash::{self, Hash, Hasher},
 	iter::FromIterator,
-	mem,
+	mem::{self, ManuallyDrop},
 	ops::{Add, Deref, DerefMut, Index},
-	ptr, str,
+	ptr, slice, str,
 	string::String,
 	sync::Arc,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use bytes_utils::{Str as BytesStr, StrMut as BytesStrMut, string::StorageMut};
 
 /// A `Str` is a string type that has the following properties:
 ///
-/// * `size_of::<Str>() == 32`
+/// * `size_of::<Str>() == 24`
 /// * `Clone` is `O(1)`
 /// * Strings are stack-allocated if they are:
 ///     * Up to 23 bytes long
@@ -34,7 +34,7 @@ use bytes_utils::{Str as BytesStr, StrMut as BytesStrMut, string::StorageMut};
 /// Unlike `String`, however, `Str` is immutable. The primary use case for
 #[derive(Default, Clone)]
 #[repr(transparent)]
-pub struct Str(Repr<BytesStr>);
+pub struct Str(Repr);
 
 /// An error type for UTF-8 validation.
 pub type Utf8Error = bytes_utils::string::Utf8Error<Bytes>;
@@ -53,22 +53,7 @@ impl Str {
 	#[inline]
 	pub unsafe fn from_utf8_unchecked_owned(u: impl Into<Bytes>) -> Self {
 		// SAFETY: The caller guarantees that the bytes are valid UTF-8.
-		Self(Repr::Heap(unsafe { BytesStr::from_inner_unchecked(u.into()) }))
-	}
-
-	/// Promotes an inline representation to a heap representation in place.
-	///
-	/// This function converts the internal representation of the `Str` from
-	/// inline to heap and returns a reference to the [`BytesStr`].
-	#[inline]
-	pub fn promote(&mut self) -> &mut BytesStr {
-		if let Repr::Inline(buf) = &mut self.0 {
-			self.0 = Repr::Heap(buf.as_str().into());
-		}
-		let Repr::Heap(data) = &mut self.0 else {
-			unreachable!();
-		};
-		data
+		Self(Repr::spilled(unsafe { BytesStr::from_inner_unchecked(u.into()) }))
 	}
 
 	/// Constructs a `Str` from a byte slice without checking for UTF-8
@@ -90,7 +75,7 @@ impl Str {
 	/// Returns an error if the bytes are not valid UTF-8.
 	#[inline]
 	pub fn from_utf8_owned(u: impl Into<Bytes>) -> Result<Self, Utf8Error> {
-		Ok(Self(Repr::Heap(BytesStr::from_inner(u.into())?)))
+		Ok(Self(Repr::spilled(BytesStr::from_inner(u.into())?)))
 	}
 
 	/// Constructs a `Str` from a byte slice, checking for UTF-8 validity.
@@ -123,7 +108,7 @@ impl Str {
 	/// Panics if `text.len() > 23`.
 	#[inline]
 	pub fn new_inline(text: &str) -> Self {
-		Self(Repr::new_inline(text).expect("len <= INLINE_CAP"))
+		Self(Repr::inline(text).expect("len <= INLINE_CAP"))
 	}
 
 	/// Constructs a `Str` from a statically allocated string.
@@ -134,13 +119,17 @@ impl Str {
 		// NOTE: this never uses the inline storage; if a canonical
 		// representation is needed, we could check for `len() < INLINE_CAP`
 		// and call `new_inline`, but this would mean an extra branch.
-		Self(Repr::Heap(BytesStr::from_static(text)))
+		Self(Repr::literal(text))
 	}
 
 	/// Constructs a `Str` from a `str`, heap-allocating if necessary.
 	#[inline(always)]
 	pub fn new(text: impl AsRef<str>) -> Self {
-		Self(Repr::copy_from_str(text.as_ref()))
+		let text = text.as_ref();
+		match Repr::inline(text) {
+			Some(repr) => Self(repr),
+			None => Self(Repr::spilled(text.into())),
+		}
 	}
 
 	/// Returns a `&str` slice of this `Str`.
@@ -161,18 +150,22 @@ impl Str {
 		self.0.is_empty()
 	}
 
-	/// Returns `true` if `self` is heap-allocated.
+	/// Returns `true` if `self` is not stored inline.
 	#[inline(always)]
 	pub const fn is_spilled(&self) -> bool {
-		matches!(self.0, Repr::Heap(..))
+		self.0.tag() > INLINE_CAP as u8
 	}
 
 	/// Returns `true` if the string is unique.
 	#[inline(always)]
 	pub fn is_unique(&self) -> bool {
-		match &self.0 {
-			Repr::Heap(data) => data.inner().is_unique(),
-			Repr::Inline(_) => true,
+		match self.0.view() {
+			View::Inline(_) => true,
+			View::Static(_) => false,
+			View::Heap(heap) => {
+				Arc::strong_count(&heap.shared) == 1 && heap.shared.inner().is_unique()
+			},
+			View::Big(shared) => Arc::strong_count(shared) == 1 && shared.inner().is_unique(),
 		}
 	}
 
@@ -193,7 +186,7 @@ impl Str {
 	}
 
 	/// Returns a substring as a new `Str`.
-	/// For heap-allocated strings, this is a zero-copy operation.
+	/// For spilled strings, this is a zero-copy operation.
 	///
 	/// # Panics
 	/// Panics if the range is not on valid UTF-8 boundaries.
@@ -202,20 +195,49 @@ impl Str {
 	where
 		str: Index<R, Output = str>,
 	{
-		match &self.0 {
-			Repr::Heap(data) => Self(Repr::Heap(data.slice(range))),
-			_ => Self::new_inline(&self[range]),
+		if self.is_spilled() {
+			self.spilled_subslice(&self.as_str()[range])
+		} else {
+			Self::new_inline(&self[range])
 		}
 	}
 
 	/// Extracts owned representation of the slice passed.
-	/// For heap-allocated strings, this is a zero-copy operation.
+	/// For spilled strings, this is a zero-copy operation.
 	#[inline]
 	pub fn slice_ref(&self, subset: &str) -> Self {
-		match &self.0 {
-			Repr::Heap(data) => Self(Repr::Heap(data.slice_ref(subset))),
-			_ => Self::new_inline(subset),
+		if self.is_spilled() {
+			self.spilled_subslice(subset)
+		} else {
+			Self::new_inline(subset)
 		}
+	}
+
+	/// Re-anchors `subset` as an owned view of this spilled string.
+	///
+	/// # Panics
+	/// Panics if `subset` does not lie within `self`'s buffer.
+	fn spilled_subslice(&self, subset: &str) -> Self {
+		let start = self.as_str().as_ptr() as usize;
+		let sub = subset.as_ptr() as usize;
+		assert!(
+			sub >= start && sub + subset.len() <= start + self.len(),
+			"subset is not contained in this Str"
+		);
+		Self(match self.0.view() {
+			View::Heap(heap) => {
+				// In bounds of a heap view, so the length fits in u32.
+				Repr::heap_view(subset.as_ptr(), Arc::clone(&heap.shared), subset.len() as u32)
+			},
+			// SAFETY: the containment check above proves `subset` borrows
+			// from the underlying `&'static str`.
+			View::Static(_) => Repr::literal(unsafe { mem::transmute::<&str, &'static str>(subset) }),
+			View::Big(shared) => match u32::try_from(subset.len()) {
+				Ok(len) => Repr::heap_view(subset.as_ptr(), Arc::clone(shared), len),
+				Err(_) => Repr::spilled(shared.as_ref().slice_ref(subset)),
+			},
+			View::Inline(_) => unreachable!("spilled_subslice on inline repr"),
+		})
 	}
 
 	/// Splits the string at the given byte index and returns two `Str`s.
@@ -225,15 +247,11 @@ impl Str {
 	/// Panics if `at` is not on a UTF-8 character boundary.
 	#[inline]
 	pub fn split_at(&self, at: usize) -> (Self, Self) {
-		match &self.0 {
-			Repr::Heap(data) => {
-				let (left, right) = data.clone().split_at_bytes(at);
-				(Self(Repr::Heap(left)), Self(Repr::Heap(right)))
-			},
-			Repr::Inline(buf) => {
-				let (left, right) = buf.split_at(at);
-				(Self::new_inline(left), Self::new_inline(right))
-			},
+		let (left, right) = self.as_str().split_at(at);
+		if self.is_spilled() {
+			(self.spilled_subslice(left), self.spilled_subslice(right))
+		} else {
+			(Self::new_inline(left), Self::new_inline(right))
 		}
 	}
 
@@ -261,32 +279,21 @@ impl Str {
 		self.slice_ref(trimmed)
 	}
 
-	/// Truncates the `Str` to the specified length.
+	/// Truncates the `Str` to the specified length, zero-copy.
 	///
-	/// If `len` is greater than the current length, this has no effect.
+	/// If `len` is greater than or equal to the current length, this has no
+	/// effect.
 	///
 	/// # Panics
 	///
-	/// Panics if `len` is greater than the current length of the `Str` or if
-	/// `len` is not on a valid UTF-8 character boundary.
+	/// Panics if `len` is not on a valid UTF-8 character boundary.
 	#[inline]
 	pub fn truncate(&mut self, len: usize) {
-		match &mut self.0 {
-			Repr::Inline(buf) => {
-				buf.truncate(len);
-			},
-			Repr::Heap(heap) => {
-				assert!(heap.is_char_boundary(len), "Index is not on a char boundary");
-				// SAFETY: The bytes are valid UTF-8 because they originated from a
-				// heap-allocated string that was previously validated. Truncating at a
-				// char boundary (verified by the assert above) preserves UTF-8 validity.
-				unsafe {
-					let mut bytes = mem::take(heap).into_inner();
-					bytes.truncate(len);
-					*heap = BytesStr::from_inner_unchecked(bytes);
-				}
-			},
+		if len >= self.len() {
+			return;
 		}
+		assert!(self.as_str().is_char_boundary(len), "Index is not on a char boundary");
+		self.0.truncate(len);
 	}
 
 	/// Splits on the given separator and returns an iterator of `Str`s.
@@ -328,16 +335,23 @@ impl Str {
 	/// Tries to convert this `Str` into a `StrMut`.
 	#[inline]
 	pub fn try_into_mut(self) -> Result<StrMut, Self> {
-		match self.0 {
-			Repr::Heap(data) => match data.into_inner().try_into_mut() {
-				// SAFETY: The data is valid UTF-8 because it came from a BytesStr,
-				// and BytesMut preserves the UTF-8 bytes when converted.
-				Ok(data) => Ok(StrMut(Repr::Heap(unsafe { BytesStrMut::from_inner_unchecked(data) }))),
-				// SAFETY: If try_into_mut fails, we reconstruct the original BytesStr from
-				// the returned Bytes. The bytes are still valid UTF-8.
-				Err(e) => Err(Self(Repr::Heap(unsafe { BytesStr::from_inner_unchecked(e) }))),
+		match self.0.unpack() {
+			Parts::Inline(inline) => Ok(StrMut::new_inline(inline.as_str())),
+			Parts::Static(text) => Err(Self(Repr::literal(text))),
+			Parts::Heap { ptr, shared, len } => match Arc::try_unwrap(shared) {
+				Ok(full) => {
+					let offset = ptr as usize - full.as_ptr() as usize;
+					let mut bytes = full.into_inner();
+					bytes.truncate(offset + len as usize);
+					bytes.advance(offset);
+					thaw(bytes)
+				},
+				Err(shared) => Err(Self(Repr::heap_view(ptr, shared, len))),
 			},
-			Repr::Inline(buf) => Ok(StrMut(Repr::Inline(buf))),
+			Parts::Big(shared) => match Arc::try_unwrap(shared) {
+				Ok(full) => thaw(full.into_inner()),
+				Err(shared) => Err(Self(Repr::big(shared))),
+			},
 		}
 	}
 }
@@ -1000,45 +1014,358 @@ impl Add<&StrMut> for &StrMut {
 
 const INLINE_CAP: usize = 23;
 
-#[derive(Debug)]
-enum Repr<H> {
-	Inline(heapless::String<INLINE_CAP, u8>),
-	Heap(H),
+/// Tag byte marking a borrowed `&'static str` view.
+const TAG_STATIC: u8 = 0xfd;
+/// Tag byte marking a shared heap view of at most `u32::MAX` bytes.
+const TAG_HEAP: u8 = 0xfe;
+/// Tag byte marking a whole shared buffer longer than `u32::MAX` bytes.
+const TAG_BIG: u8 = 0xff;
+
+const HEAP_PAD: usize = INLINE_CAP - size_of::<*const u8>() - size_of::<Arc<BytesStr>>() - 4;
+const STATIC_PAD: usize = INLINE_CAP - size_of::<&'static str>();
+const BIG_PAD: usize = INLINE_CAP - size_of::<Arc<BytesStr>>();
+
+/// Inline payload: string bytes with the length stored in the tag byte.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct InlineRepr {
+	buf: [u8; INLINE_CAP],
+	/// Inline length (`0..=INLINE_CAP`); doubles as the union tag.
+	tag: u8,
 }
 
-impl<H: Clone> Clone for Repr<H> {
+impl InlineRepr {
+	#[inline(always)]
+	fn as_str(&self) -> &str {
+		// SAFETY: `tag <= INLINE_CAP` and the prefix was copied from a `&str`.
+		unsafe { str::from_utf8_unchecked(self.buf.get_unchecked(..self.tag as usize)) }
+	}
+}
+
+/// Shared heap payload: a char-boundary view into an `Arc`-shared buffer.
+#[repr(C)]
+struct HeapRepr {
+	/// First byte of this string's view into `shared`.
+	ptr:    *const u8,
+	/// Full validated buffer; the view never outlives it.
+	shared: Arc<BytesStr>,
+	/// View length in bytes.
+	len:    u32,
+	_pad:   [u8; HEAP_PAD],
+	tag:    u8,
+}
+
+impl HeapRepr {
+	#[inline(always)]
+	const fn as_str(&self) -> &str {
+		// SAFETY: the view is an in-bounds char-boundary sub-slice of the
+		// validated UTF-8 buffer owned by `shared`.
+		unsafe { str::from_utf8_unchecked(slice::from_raw_parts(self.ptr, self.len as usize)) }
+	}
+}
+
+/// Static payload: a borrowed `&'static str`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct StaticRepr {
+	text: &'static str,
+	_pad: [u8; STATIC_PAD],
+	tag:  u8,
+}
+
+/// Oversized payload: a whole shared buffer longer than `u32::MAX` bytes.
+#[repr(C)]
+struct BigRepr {
+	shared: Arc<BytesStr>,
+	_pad:   [u8; BIG_PAD],
+	tag:    u8,
+}
+
+/// 24-byte backing store of [`Str`].
+///
+/// A manual tagged union: the byte at offset [`INLINE_CAP`] is the
+/// discriminant (`0..=INLINE_CAP` = inline length, or one of the `TAG_*`
+/// markers), which every payload struct pins there via explicit padding.
+/// The compiler cannot derive this layout itself: an automatic enum rounds
+/// each variant up to its 8-byte alignment, colliding with the tag byte.
+#[repr(C)]
+union Repr {
+	inline:  InlineRepr,
+	heap:    ManuallyDrop<HeapRepr>,
+	literal: StaticRepr,
+	big:     ManuallyDrop<BigRepr>,
+}
+
+const _: () = {
+	assert!(size_of::<Repr>() == INLINE_CAP + 1);
+	assert!(mem::offset_of!(InlineRepr, tag) == INLINE_CAP);
+	assert!(mem::offset_of!(HeapRepr, tag) == INLINE_CAP);
+	assert!(mem::offset_of!(StaticRepr, tag) == INLINE_CAP);
+	assert!(mem::offset_of!(BigRepr, tag) == INLINE_CAP);
+};
+
+#[allow(
+	clippy::non_send_fields_in_send_ty,
+	reason = "the raw view pointer borrows immutable bytes owned by the Arc stored beside it"
+)]
+// SAFETY: heap views borrow immutable bytes owned by the `Arc<BytesStr>`
+// stored beside them, static views borrow `'static` data, and all owned
+// payloads (`Arc<BytesStr>`) are `Send + Sync`.
+unsafe impl Send for Repr {}
+// SAFETY: see the `Send` impl; all payloads are immutable.
+unsafe impl Sync for Repr {}
+
+/// Borrowed view of a [`Repr`], dispatched on the tag byte.
+enum View<'r> {
+	Inline(&'r InlineRepr),
+	Heap(&'r HeapRepr),
+	Static(&'static str),
+	Big(&'r Arc<BytesStr>),
+}
+
+/// Owned decomposition of a [`Repr`]; see [`Repr::unpack`].
+enum Parts {
+	Inline(InlineRepr),
+	Heap { ptr: *const u8, shared: Arc<BytesStr>, len: u32 },
+	Static(&'static str),
+	Big(Arc<BytesStr>),
+}
+
+impl Repr {
+	/// Empty inline repr.
+	#[inline(always)]
+	const fn empty() -> Self {
+		Self { inline: InlineRepr { buf: [0; INLINE_CAP], tag: 0 } }
+	}
+
+	/// Discriminant byte; every payload initializes it.
+	#[inline(always)]
+	const fn tag(&self) -> u8 {
+		// SAFETY: every variant writes the byte at offset INLINE_CAP.
+		unsafe { self.inline.tag }
+	}
+
+	/// Inline copy of `text`, or `None` if it exceeds [`INLINE_CAP`].
 	#[inline]
-	fn clone(&self) -> Self {
-		match self {
-			Self::Heap(data) => Self::Heap(data.clone()),
-			// SAFETY: For Inline variant, we perform a bitwise copy using ptr::read.
-			// This is safe because the Inline variant contains only Copy types
-			// (heapless::String which is a wrapper around a fixed-size array).
-			_ => unsafe { ptr::read(self as *const Self) },
+	fn inline(text: &str) -> Option<Self> {
+		(text.len() <= INLINE_CAP).then(|| {
+			let mut buf = [0; INLINE_CAP];
+			buf[..text.len()].copy_from_slice(text.as_bytes());
+			Self { inline: InlineRepr { buf, tag: text.len() as u8 } }
+		})
+	}
+
+	/// Borrows a `&'static str` without allocating.
+	#[inline(always)]
+	const fn literal(text: &'static str) -> Self {
+		Self { literal: StaticRepr { text, _pad: [0; STATIC_PAD], tag: TAG_STATIC } }
+	}
+
+	/// Shares an owned validated buffer behind a fresh `Arc`.
+	fn spilled(text: BytesStr) -> Self {
+		match u32::try_from(text.len()) {
+			Ok(len) => {
+				let shared = Arc::new(text);
+				Self::heap_view(shared.as_ptr(), shared, len)
+			},
+			Err(_) => Self::big(Arc::new(text)),
+		}
+	}
+
+	/// Heap view into `shared`; `ptr..ptr + len` must be a char-boundary
+	/// sub-slice of it.
+	#[inline]
+	const fn heap_view(ptr: *const u8, shared: Arc<BytesStr>, len: u32) -> Self {
+		Self {
+			heap: ManuallyDrop::new(HeapRepr { ptr, shared, len, _pad: [0; HEAP_PAD], tag: TAG_HEAP }),
+		}
+	}
+
+	/// Wraps a whole shared buffer longer than `u32::MAX` bytes.
+	const fn big(shared: Arc<BytesStr>) -> Self {
+		Self { big: ManuallyDrop::new(BigRepr { shared, _pad: [0; BIG_PAD], tag: TAG_BIG }) }
+	}
+
+	#[inline(always)]
+	fn view(&self) -> View<'_> {
+		let tag = self.tag();
+		// SAFETY: the tag byte identifies the initialized union field.
+		unsafe {
+			if tag as usize <= INLINE_CAP {
+				View::Inline(&self.inline)
+			} else if tag == TAG_HEAP {
+				View::Heap(&self.heap)
+			} else if tag == TAG_STATIC {
+				View::Static(self.literal.text)
+			} else {
+				View::Big(&self.big.shared)
+			}
+		}
+	}
+
+	/// Consumes `self` into owned parts without running its destructor.
+	fn unpack(self) -> Parts {
+		let this = ManuallyDrop::new(self);
+		// SAFETY: the tag identifies the live field, and `this` is never
+		// dropped, so each `Arc` is moved out exactly once.
+		unsafe {
+			match this.tag() {
+				TAG_HEAP => {
+					let HeapRepr { ptr, shared, len, .. } = ptr::read(&*this.heap);
+					Parts::Heap { ptr, shared, len }
+				},
+				TAG_STATIC => Parts::Static(this.literal.text),
+				TAG_BIG => Parts::Big(ptr::read(&*this.big).shared),
+				_ => Parts::Inline(this.inline),
+			}
+		}
+	}
+
+	#[inline]
+	fn as_str(&self) -> &str {
+		match self.view() {
+			View::Inline(inline) => inline.as_str(),
+			View::Heap(heap) => heap.as_str(),
+			View::Static(text) => text,
+			View::Big(shared) => shared,
+		}
+	}
+
+	#[inline(always)]
+	fn len(&self) -> usize {
+		match self.view() {
+			View::Inline(inline) => inline.tag as usize,
+			View::Heap(heap) => heap.len as usize,
+			View::Static(text) => text.len(),
+			View::Big(shared) => shared.len(),
+		}
+	}
+
+	#[inline(always)]
+	fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	#[inline]
+	fn ptr_eq(&self, other: &Self) -> bool {
+		same_str(self.as_str(), other.as_str())
+	}
+
+	/// Shrinks to `len` bytes in place, zero-copy.
+	///
+	/// The caller has checked that `len < self.len()` and that `len` lies on
+	/// a char boundary.
+	fn truncate(&mut self, len: usize) {
+		debug_assert!(len < self.len());
+		// SAFETY: the tag identifies the live field; shrinking a view keeps
+		// it in bounds and on a char boundary (checked by the caller).
+		unsafe {
+			match self.tag() {
+				TAG_HEAP => self.heap.len = len as u32,
+				TAG_STATIC => {
+					let text = self.literal.text;
+					self.literal.text = &text[..len];
+				},
+				TAG_BIG => {
+					let Parts::Big(shared) = mem::take(self).unpack() else {
+						unreachable!();
+					};
+					*self = match u32::try_from(len) {
+						Ok(len32) => Self::heap_view(shared.as_ptr(), shared, len32),
+						Err(_) => Self::spilled(shared.as_ref().slice(..len)),
+					};
+				},
+				_ => self.inline.tag = len as u8,
+			}
 		}
 	}
 }
 
-impl<H> Default for Repr<H> {
+impl Clone for Repr {
+	#[inline]
+	fn clone(&self) -> Self {
+		match self.view() {
+			View::Heap(heap) => Self::heap_view(heap.ptr, Arc::clone(&heap.shared), heap.len),
+			View::Big(shared) => Self::big(Arc::clone(shared)),
+			// SAFETY: inline and static payloads are plain copyable bytes.
+			_ => unsafe { ptr::read(self) },
+		}
+	}
+}
+
+impl Default for Repr {
+	#[inline]
+	fn default() -> Self {
+		Self::empty()
+	}
+}
+
+impl Drop for Repr {
+	#[inline]
+	fn drop(&mut self) {
+		// SAFETY: the tag identifies the live field; each `Arc` drops once.
+		unsafe {
+			match self.tag() {
+				TAG_HEAP => ManuallyDrop::drop(&mut self.heap),
+				TAG_BIG => ManuallyDrop::drop(&mut self.big),
+				_ => {},
+			}
+		}
+	}
+}
+
+/// Pointer-identity fast path shared by [`Str`] and [`StrMut`] equality.
+///
+/// Pointer identity alone is not equality: zero-copy prefix slices share
+/// their parent's start pointer with a different length.
+#[inline]
+fn same_str(this: &str, that: &str) -> bool {
+	ptr::eq(this.as_ptr(), that.as_ptr()) && this.len() == that.len()
+}
+
+/// Reclaims a uniquely-owned buffer as a mutable string, or repacks it
+/// immutable when the bytes are still shared.
+fn thaw(bytes: Bytes) -> Result<StrMut, Str> {
+	match bytes.try_into_mut() {
+		// SAFETY: the bytes were validated as UTF-8 when the `Str` was built.
+		Ok(bytes) => Ok(StrMut(MutRepr::Heap(unsafe { BytesStrMut::from_inner_unchecked(bytes) }))),
+		// SAFETY: same bytes, still valid UTF-8.
+		Err(bytes) => Err(Str(Repr::spilled(unsafe { BytesStr::from_inner_unchecked(bytes) }))),
+	}
+}
+
+/// Backing store of [`StrMut`]: inline buffer or growable heap string.
+enum MutRepr {
+	Inline(heapless::String<INLINE_CAP, u8>),
+	Heap(BytesStrMut),
+}
+
+impl Clone for MutRepr {
+	#[inline]
+	fn clone(&self) -> Self {
+		match self {
+			Self::Heap(data) => Self::Heap(data.clone()),
+			// SAFETY: the Inline variant contains only plain copyable data
+			// (a fixed-size array plus a length).
+			_ => unsafe { ptr::read(self) },
+		}
+	}
+}
+
+impl Default for MutRepr {
 	#[inline]
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-impl<H> Repr<H> {
+impl MutRepr {
 	#[inline(always)]
 	const fn new() -> Self {
 		Self::Inline(heapless::String::new())
 	}
-}
 
-impl<H> Repr<H>
-where
-	H: Deref<Target = str> + for<'a> From<&'a str>,
-{
-	/// This function tries to create a new `Repr::Inline` or `Repr::Static`
-	/// If it isn't possible, this function returns None
+	/// Inline copy of `text`, or `None` if it exceeds [`INLINE_CAP`].
 	#[inline(always)]
 	fn new_inline(text: &str) -> Option<Self> {
 		heapless::String::try_from(text).ok().map(Self::Inline)
@@ -1062,10 +1389,7 @@ where
 
 	#[inline(always)]
 	fn is_empty(&self) -> bool {
-		match self {
-			Self::Heap(data) => data.is_empty(),
-			Self::Inline(buf) => buf.is_empty(),
-		}
+		self.len() == 0
 	}
 
 	#[inline]
@@ -1078,10 +1402,7 @@ where
 
 	#[inline]
 	fn ptr_eq(&self, other: &Self) -> bool {
-		let (this, that) = (self.as_str(), other.as_str());
-		// Pointer identity alone is not equality: zero-copy prefix slices
-		// share their parent's start pointer with a different length.
-		ptr::eq(this.as_ptr(), that.as_ptr()) && this.len() == that.len()
+		same_str(self.as_str(), other.as_str())
 	}
 }
 
@@ -1185,7 +1506,7 @@ impl_extend!(for<'a> &'a str, (s, rhs) => s.push_str(rhs));
 /// into an immutable [`Str`] without copying.
 #[derive(Default, Clone)]
 #[repr(transparent)]
-pub struct StrMut(Repr<BytesStrMut>);
+pub struct StrMut(MutRepr);
 
 impl StrMut {
 	/// Constructs a `StrMut` from a `BytesMut` object without checking for
@@ -1198,7 +1519,7 @@ impl StrMut {
 	#[inline]
 	pub unsafe fn from_utf8_unchecked_owned(u: impl Into<BytesMut>) -> Self {
 		// SAFETY: The caller guarantees that the bytes are valid UTF-8.
-		Self(Repr::Heap(unsafe { BytesStrMut::from_inner_unchecked(u.into()) }))
+		Self(MutRepr::Heap(unsafe { BytesStrMut::from_inner_unchecked(u.into()) }))
 	}
 
 	/// Constructs a `StrMut` from a byte slice without checking for UTF-8
@@ -1221,7 +1542,7 @@ impl StrMut {
 	#[inline]
 	pub fn from_utf8_owned(u: impl Into<BytesMut>) -> Result<Self, Utf8ErrorMut> {
 		let u: BytesMut = u.into();
-		Ok(Self(Repr::Heap(BytesStrMut::from_inner(u)?)))
+		Ok(Self(MutRepr::Heap(BytesStrMut::from_inner(u)?)))
 	}
 
 	/// Constructs a `StrMut` from a byte slice, checking for UTF-8 validity.
@@ -1241,13 +1562,13 @@ impl StrMut {
 	/// Panics if `text.len() > 23`.
 	#[inline]
 	pub fn new_inline(text: &str) -> Self {
-		Self(Repr::new_inline(text).expect("len <= INLINE_CAP"))
+		Self(MutRepr::new_inline(text).expect("len <= INLINE_CAP"))
 	}
 
 	/// Constructs a `Str` from a `str`, heap-allocating if necessary.
 	#[inline(always)]
 	pub fn new(text: impl AsRef<str>) -> Self {
-		Self(Repr::copy_from_str(text.as_ref()))
+		Self(MutRepr::copy_from_str(text.as_ref()))
 	}
 
 	/// Constructs a `StrMut` with the given capacity.
@@ -1256,11 +1577,11 @@ impl StrMut {
 		if capacity > INLINE_CAP {
 			// SAFETY: A newly allocated BytesMut with capacity is empty, and an
 			// empty byte buffer is trivially valid UTF-8.
-			Self(Repr::Heap(unsafe {
+			Self(MutRepr::Heap(unsafe {
 				BytesStrMut::from_inner_unchecked(BytesMut::with_capacity(capacity))
 			}))
 		} else {
-			Self(Repr::new())
+			Self(MutRepr::new())
 		}
 	}
 
@@ -1275,8 +1596,8 @@ impl StrMut {
 	pub fn as_str_mut(&mut self) -> &mut str {
 		match &mut self.0 {
 			// SAFETY: BytesStrMut guarantees that its inner BytesMut contains valid UTF-8.
-			Repr::Heap(data) => unsafe { str::from_utf8_unchecked_mut(data.as_bytes_mut()) },
-			Repr::Inline(buf) => buf.as_mut_str(),
+			MutRepr::Heap(data) => unsafe { str::from_utf8_unchecked_mut(data.as_bytes_mut()) },
+			MutRepr::Inline(buf) => buf.as_mut_str(),
 		}
 	}
 
@@ -1303,10 +1624,10 @@ impl StrMut {
 	#[inline]
 	pub fn truncate(&mut self, len: usize) {
 		match &mut self.0 {
-			Repr::Inline(buf) => {
+			MutRepr::Inline(buf) => {
 				buf.truncate(len);
 			},
-			Repr::Heap(heap) => {
+			MutRepr::Heap(heap) => {
 				assert!(heap.is_char_boundary(len), "Index is not on a char boundary");
 				// SAFETY: Truncating at a char boundary (verified by the assert above)
 				// preserves UTF-8 validity of the underlying byte buffer.
@@ -1320,7 +1641,7 @@ impl StrMut {
 	/// Returns `true` if `self` is heap-allocated.
 	#[inline(always)]
 	pub const fn is_spilled(&self) -> bool {
-		matches!(self.0, Repr::Heap(..))
+		matches!(self.0, MutRepr::Heap(..))
 	}
 
 	/// Reserves capacity for at least `additional` more bytes to be inserted in
@@ -1328,7 +1649,7 @@ impl StrMut {
 	#[inline]
 	pub fn reserve(&mut self, additional: usize) {
 		match &mut self.0 {
-			Repr::Inline(buf) => {
+			MutRepr::Inline(buf) => {
 				let cap = buf.len() + additional;
 				if cap > INLINE_CAP {
 					let cap = cap.next_power_of_two();
@@ -1337,10 +1658,10 @@ impl StrMut {
 					let mut heap =
 						unsafe { BytesStrMut::from_inner_unchecked(BytesMut::with_capacity(cap)) };
 					heap.push_str(buf.as_str());
-					*self = Self(Repr::Heap(heap));
+					*self = Self(MutRepr::Heap(heap));
 				}
 			},
-			Repr::Heap(heap) => {
+			MutRepr::Heap(heap) => {
 				// SAFETY: Reserving capacity does not modify the existing UTF-8 bytes,
 				// only extends the available capacity.
 				unsafe {
@@ -1355,8 +1676,8 @@ impl StrMut {
 	#[inline]
 	pub fn freeze(self) -> Str {
 		Str(match self.0 {
-			Repr::Inline(buf) => Repr::Inline(buf),
-			Repr::Heap(heap) => Repr::Heap(heap.freeze()),
+			MutRepr::Inline(buf) => Repr::inline(buf.as_str()).expect("len <= INLINE_CAP"),
+			MutRepr::Heap(heap) => Repr::spilled(heap.freeze()),
 		})
 	}
 
@@ -1371,7 +1692,7 @@ impl StrMut {
 	#[inline]
 	pub fn push_str(&mut self, s: &str) {
 		match &mut self.0 {
-			Repr::Inline(buf) => {
+			MutRepr::Inline(buf) => {
 				let len = buf.len();
 				if buf.push_str(s).is_err() {
 					let mut heap = BytesMut::with_capacity((len + s.len()).next_power_of_two());
@@ -1379,10 +1700,10 @@ impl StrMut {
 					heap.extend_from_slice(s.as_bytes());
 					// SAFETY: We copy valid UTF-8 bytes from buf and s into heap.
 					// Both sources are valid UTF-8, so the result is valid UTF-8.
-					*self = Self(Repr::Heap(unsafe { BytesStrMut::from_inner_unchecked(heap) }));
+					*self = Self(MutRepr::Heap(unsafe { BytesStrMut::from_inner_unchecked(heap) }));
 				}
 			},
-			Repr::Heap(heap) => heap.push_str(s),
+			MutRepr::Heap(heap) => heap.push_str(s),
 		}
 	}
 
@@ -1395,7 +1716,7 @@ impl StrMut {
 	#[inline]
 	pub unsafe fn extend_from_bytes_unchecked(&mut self, s: &[u8]) {
 		match &mut self.0 {
-			Repr::Inline(buf) => {
+			MutRepr::Inline(buf) => {
 				let len = buf.len();
 				// SAFETY: The caller guarantees that s contains valid UTF-8 bytes.
 				// We extend the inline buffer's internal vector directly.
@@ -1405,11 +1726,11 @@ impl StrMut {
 					heap.extend_from_slice(s);
 					// SAFETY: buf contains valid UTF-8 and the caller guarantees s
 					// contains valid UTF-8, so heap contains valid UTF-8.
-					*self = Self(Repr::Heap(unsafe { BytesStrMut::from_inner_unchecked(heap) }));
+					*self = Self(MutRepr::Heap(unsafe { BytesStrMut::from_inner_unchecked(heap) }));
 				}
 			},
 			// SAFETY: The caller guarantees that s contains valid UTF-8 bytes.
-			Repr::Heap(heap) => unsafe { heap.inner_mut().push_slice(s) },
+			MutRepr::Heap(heap) => unsafe { heap.inner_mut().push_slice(s) },
 		}
 	}
 
@@ -1423,7 +1744,7 @@ impl StrMut {
 	#[inline]
 	pub fn insert(&mut self, index: usize, s: &str) {
 		match &mut self.0 {
-			Repr::Inline(buf) => {
+			MutRepr::Inline(buf) => {
 				// First check if index is on a valid char boundary
 				assert!(
 					buf.is_char_boundary(index),
@@ -1446,10 +1767,10 @@ impl StrMut {
 					// SAFETY: We copy valid UTF-8 bytes from buf (before and after index)
 					// and valid UTF-8 bytes from s. The result is valid UTF-8 because we
 					// insert at a valid char boundary (verified by the assert above).
-					*self = Self(Repr::Heap(unsafe { BytesStrMut::from_inner_unchecked(heap) }));
+					*self = Self(MutRepr::Heap(unsafe { BytesStrMut::from_inner_unchecked(heap) }));
 				}
 			},
-			Repr::Heap(heap) => {
+			MutRepr::Heap(heap) => {
 				assert!(
 					heap.is_char_boundary(index),
 					"index is not on a valid UTF-8 character boundary"
@@ -1658,14 +1979,14 @@ impl IntoStr for CowStr<'_> {
 impl IntoStr for String {
 	#[inline]
 	fn into_str(self) -> Str {
-		Str(Repr::Heap(self.into()))
+		Str(Repr::spilled(self.into()))
 	}
 
 	#[inline]
 	fn into_str_mut(self) -> StrMut {
 		// SAFETY: String guarantees its contents are valid UTF-8. We convert
 		// into bytes and then wrap in BytesStrMut, preserving UTF-8 validity.
-		StrMut(Repr::Heap(unsafe {
+		StrMut(MutRepr::Heap(unsafe {
 			BytesStrMut::from_inner_unchecked(Bytes::from(self.into_bytes()).into())
 		}))
 	}
@@ -1684,19 +2005,19 @@ impl IntoStr for String {
 impl IntoStr for BytesStr {
 	#[inline]
 	fn into_str(self) -> Str {
-		Str(Repr::Heap(self))
+		Str(Repr::spilled(self))
 	}
 
 	#[inline]
 	fn into_str_mut(self) -> StrMut {
 		// SAFETY: BytesStr guarantees its contents are valid UTF-8. Converting
 		// to BytesMut preserves the UTF-8 bytes.
-		StrMut(Repr::Heap(unsafe { BytesStrMut::from_inner_unchecked(self.into_inner().into()) }))
+		StrMut(MutRepr::Heap(unsafe { BytesStrMut::from_inner_unchecked(self.into_inner().into()) }))
 	}
 
 	#[inline]
 	fn to_str(&self) -> Str {
-		Str(Repr::Heap(self.clone()))
+		Str(Repr::spilled(self.clone()))
 	}
 
 	#[inline]
@@ -1710,7 +2031,7 @@ impl IntoStr for Cow<'_, str> {
 	fn into_str(self) -> Str {
 		match self {
 			Cow::Borrowed(s) => Str::new(s),
-			Cow::Owned(s) => Str(Repr::Heap(s.into())),
+			Cow::Owned(s) => Str(Repr::spilled(s.into())),
 		}
 	}
 
@@ -1742,14 +2063,14 @@ impl IntoStr for Cow<'_, str> {
 impl IntoStr for Box<str> {
 	#[inline]
 	fn into_str(self) -> Str {
-		Str(Repr::Heap(self.into()))
+		Str(Repr::spilled(self.into()))
 	}
 
 	#[inline]
 	fn into_str_mut(self) -> StrMut {
 		// SAFETY: Box<str> guarantees its contents are valid UTF-8. Converting
 		// to boxed bytes and then to BytesMut preserves the UTF-8 bytes.
-		StrMut(Repr::Heap(unsafe {
+		StrMut(MutRepr::Heap(unsafe {
 			BytesStrMut::from_inner_unchecked(Bytes::from(self.into_boxed_bytes()).into())
 		}))
 	}
@@ -1771,7 +2092,7 @@ impl IntoStr for Arc<str> {
 		let bytes: Arc<[u8]> = self.into();
 		// SAFETY: Arc<str> guarantees its contents are valid UTF-8. Converting
 		// to Arc<[u8]> preserves the bytes without modification.
-		Str(Repr::Heap(unsafe { BytesStr::from_inner_unchecked(Bytes::from_owner(bytes)) }))
+		Str(Repr::spilled(unsafe { BytesStr::from_inner_unchecked(Bytes::from_owner(bytes)) }))
 	}
 
 	#[inline]
@@ -1879,7 +2200,7 @@ impl From<&String> for StrMut {
 impl From<String> for Str {
 	#[inline(always)]
 	fn from(text: String) -> Self {
-		Self(Repr::Heap(text.into()))
+		Self(Repr::spilled(text.into()))
 	}
 }
 
@@ -1888,7 +2209,7 @@ impl From<String> for StrMut {
 	fn from(text: String) -> Self {
 		// SAFETY: String guarantees its contents are valid UTF-8. Converting
 		// into bytes preserves those UTF-8 bytes.
-		Self(Repr::Heap(unsafe {
+		Self(MutRepr::Heap(unsafe {
 			BytesStrMut::from_inner_unchecked(Bytes::from(text.into_bytes()).into())
 		}))
 	}
@@ -1897,7 +2218,7 @@ impl From<String> for StrMut {
 impl From<&BytesStr> for Str {
 	#[inline]
 	fn from(s: &BytesStr) -> Self {
-		Self(Repr::Heap(s.clone()))
+		Self(Repr::spilled(s.clone()))
 	}
 }
 
@@ -1911,7 +2232,7 @@ impl From<&BytesStr> for StrMut {
 impl From<BytesStr> for Str {
 	#[inline(always)]
 	fn from(text: BytesStr) -> Self {
-		Self(Repr::Heap(text))
+		Self(Repr::spilled(text))
 	}
 }
 
@@ -1920,7 +2241,7 @@ impl From<BytesStr> for StrMut {
 	fn from(text: BytesStr) -> Self {
 		// SAFETY: BytesStr guarantees its contents are valid UTF-8. Converting
 		// to BytesMut preserves the UTF-8 bytes.
-		Self(Repr::Heap(unsafe {
+		Self(MutRepr::Heap(unsafe {
 			BytesStrMut::from_inner_unchecked(BytesMut::from(text.into_inner()))
 		}))
 	}
@@ -1929,14 +2250,14 @@ impl From<BytesStr> for StrMut {
 impl From<BytesStrMut> for Str {
 	#[inline]
 	fn from(value: BytesStrMut) -> Self {
-		Self(Repr::Heap(value.freeze()))
+		Self(Repr::spilled(value.freeze()))
 	}
 }
 
 impl From<BytesStrMut> for StrMut {
 	#[inline]
 	fn from(value: BytesStrMut) -> Self {
-		Self(Repr::Heap(value))
+		Self(MutRepr::Heap(value))
 	}
 }
 
@@ -1945,7 +2266,7 @@ impl<'a> From<Cow<'a, str>> for Str {
 	fn from(s: Cow<'a, str>) -> Self {
 		match s {
 			Cow::Borrowed(borrowed) => Self::new(borrowed),
-			Cow::Owned(owned) => Self(Repr::Heap(owned.into())),
+			Cow::Owned(owned) => Self(Repr::spilled(owned.into())),
 		}
 	}
 }
@@ -1961,11 +2282,21 @@ impl<'a> From<Cow<'a, str>> for StrMut {
 }
 
 impl From<Str> for BytesStr {
-	#[inline(always)]
+	#[inline]
 	fn from(text: Str) -> Self {
-		match text.0 {
-			Repr::Heap(data) => data,
-			_ => text.as_str().into(),
+		match text.0.unpack() {
+			Parts::Inline(inline) => inline.as_str().into(),
+			Parts::Static(text) => Self::from_static(text),
+			Parts::Heap { ptr, shared, len } => {
+				// SAFETY: the view is an in-bounds char-boundary sub-slice of
+				// the validated buffer.
+				let view =
+					unsafe { str::from_utf8_unchecked(slice::from_raw_parts(ptr, len as usize)) };
+				shared.slice_ref(view)
+			},
+			Parts::Big(shared) => {
+				Arc::try_unwrap(shared).unwrap_or_else(|shared| shared.as_ref().clone())
+			},
 		}
 	}
 }
@@ -1974,7 +2305,7 @@ impl From<StrMut> for BytesStr {
 	#[inline(always)]
 	fn from(text: StrMut) -> Self {
 		match text.0 {
-			Repr::Heap(data) => data.freeze(),
+			MutRepr::Heap(data) => data.freeze(),
 			_ => text.as_str().into(),
 		}
 	}
@@ -1997,10 +2328,7 @@ impl From<StrMut> for String {
 impl From<Str> for Bytes {
 	#[inline(always)]
 	fn from(text: Str) -> Self {
-		match text.0 {
-			Repr::Heap(data) => data.into(),
-			Repr::Inline(buf) => Self::copy_from_slice(buf.as_bytes()),
-		}
+		BytesStr::from(text).into_inner()
 	}
 }
 
@@ -2008,8 +2336,8 @@ impl From<StrMut> for Bytes {
 	#[inline(always)]
 	fn from(text: StrMut) -> Self {
 		match text.0 {
-			Repr::Heap(data) => data.into_inner().into(),
-			Repr::Inline(buf) => Self::copy_from_slice(buf.as_bytes()),
+			MutRepr::Heap(data) => data.into_inner().into(),
+			MutRepr::Inline(buf) => Self::copy_from_slice(buf.as_bytes()),
 		}
 	}
 }
@@ -2017,10 +2345,7 @@ impl From<StrMut> for Bytes {
 impl From<Str> for BytesMut {
 	#[inline(always)]
 	fn from(value: Str) -> Self {
-		match value.0 {
-			Repr::Heap(data) => data.into_inner().into(),
-			Repr::Inline(buf) => Self::from(buf.as_bytes()),
-		}
+		Bytes::from(value).into()
 	}
 }
 
@@ -2028,8 +2353,8 @@ impl From<StrMut> for BytesMut {
 	#[inline(always)]
 	fn from(text: StrMut) -> Self {
 		match text.0 {
-			Repr::Heap(data) => data.into_inner(),
-			Repr::Inline(buf) => Self::from(buf.as_bytes()),
+			MutRepr::Heap(data) => data.into_inner(),
+			MutRepr::Inline(buf) => Self::from(buf.as_bytes()),
 		}
 	}
 }
@@ -2047,10 +2372,12 @@ impl From<StrMut> for BytesStrMut {
 	#[inline(always)]
 	fn from(value: StrMut) -> Self {
 		match value.0 {
-			Repr::Heap(data) => data,
+			MutRepr::Heap(data) => data,
 			// SAFETY: buf contains valid UTF-8 (guaranteed by StrMut invariants).
 			// Converting to BytesMut preserves the UTF-8 bytes.
-			Repr::Inline(buf) => unsafe { Self::from_inner_unchecked(BytesMut::from(buf.as_bytes())) },
+			MutRepr::Inline(buf) => unsafe {
+				Self::from_inner_unchecked(BytesMut::from(buf.as_bytes()))
+			},
 		}
 	}
 }
@@ -2065,10 +2392,9 @@ impl From<StrMut> for Str {
 impl From<Str> for StrMut {
 	#[inline]
 	fn from(value: Str) -> Self {
-		match value.0 {
-			Repr::Inline(buf) => Self(Repr::Inline(buf)),
-			// SAFETY: heap contains valid UTF-8 (guaranteed by Str invariants).
-			Repr::Heap(heap) => unsafe { Self::from_utf8_unchecked_owned(heap.into_inner()) },
+		match value.try_into_mut() {
+			Ok(mutable) => mutable,
+			Err(value) => Self::new(value.as_str()),
 		}
 	}
 }
@@ -2079,14 +2405,14 @@ impl From<Arc<str>> for Str {
 		let bytes: Arc<[u8]> = value.into();
 		// SAFETY: Arc<str> guarantees its contents are valid UTF-8. Converting
 		// to Arc<[u8]> preserves the bytes without modification.
-		Self(Repr::Heap(unsafe { BytesStr::from_inner_unchecked(Bytes::from_owner(bytes)) }))
+		Self(Repr::spilled(unsafe { BytesStr::from_inner_unchecked(Bytes::from_owner(bytes)) }))
 	}
 }
 
 impl From<Box<str>> for Str {
 	#[inline]
 	fn from(value: Box<str>) -> Self {
-		Self(Repr::Heap(value.into()))
+		Self(Repr::spilled(value.into()))
 	}
 }
 
@@ -2095,7 +2421,7 @@ impl From<Box<str>> for StrMut {
 	fn from(value: Box<str>) -> Self {
 		// SAFETY: Box<str> guarantees its contents are valid UTF-8. Converting
 		// to boxed bytes and then to BytesMut preserves the UTF-8 bytes.
-		Self(Repr::Heap(unsafe {
+		Self(MutRepr::Heap(unsafe {
 			BytesStrMut::from_inner_unchecked(Bytes::from(value.into_boxed_bytes()).into())
 		}))
 	}
@@ -2808,10 +3134,32 @@ mod tests {
 	const SPACED: &str = "   prefix__abcdefghijklmnopjklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 	fn heap_ptr(s: &Str) -> (*const u8, usize) {
-		match &s.0 {
-			Repr::Heap(data) => (data.inner().as_ptr(), data.len()),
-			_ => panic!("expected heap representation"),
-		}
+		assert!(s.is_spilled(), "expected spilled representation");
+		(s.as_str().as_ptr(), s.len())
+	}
+
+	#[test]
+	fn test_str_is_24_bytes() {
+		assert_eq!(mem::size_of::<Str>(), 24);
+	}
+
+	#[test]
+	fn test_static_slice_is_zero_copy() {
+		const TEXT: &str = "static text that is quite long";
+		let s = Str::new_static(TEXT);
+		let sliced = s.slice(7..11);
+		assert!(sliced.is_spilled());
+		assert_eq!(sliced, "text");
+		assert_eq!(sliced.as_str().as_ptr(), TEXT.as_bytes()[7..].as_ptr());
+	}
+
+	#[test]
+	fn test_truncate_heap_is_zero_copy() {
+		let mut s = Str::new(LONG_TEXT);
+		let (ptr, _) = heap_ptr(&s);
+		s.truncate(PREFIX.len());
+		assert_eq!(s, PREFIX);
+		assert_eq!(heap_ptr(&s), (ptr, PREFIX.len()));
 	}
 
 	#[test]
@@ -3410,7 +3758,7 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic(expected = "self.is_char_boundary(new_len)")]
+	#[should_panic(expected = "Index is not on a char boundary")]
 	fn test_truncate_non_char_boundary_inline() {
 		let mut s = Str::new("hello world 世界");
 		s.truncate(13); // Middle of '世' (3 bytes)
@@ -3737,16 +4085,6 @@ mod tests {
 
 		assert_eq!(upper.as_str(), "HELLO WORLD HELLO WORLD!!");
 		assert_eq!(s2.as_str(), "hello world hello world!!"); // Unchanged
-	}
-
-	#[test]
-	fn test_promote_inline_to_heap() {
-		let mut s = Str::new("hello");
-		assert!(!s.is_spilled());
-
-		let heap_str = s.promote();
-		assert_eq!(&**heap_str, "hello");
-		assert!(s.is_spilled());
 	}
 
 	// ============================
