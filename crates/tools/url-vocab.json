@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "selector_grammar": "selector = raw | conflicts | ranges | raw ':' ranges | ranges ':' raw ; ranges = range { ',' range } ; range = [ 'L' | 'l' ] uint [ ( '-' | '..' ) [ 'L' | 'l' ] uint | ( '-' | '..' ) | '+' uint ] ; uint = digit { digit } ;",
+  "schemes": [
+    { "member": "FILE", "wire": ["file"], "selectors": true },
+    { "member": "HTTP", "wire": ["http", "https"], "selectors": true },
+    { "member": "ARTIFACT", "wire": ["artifact"], "selectors": true },
+    { "member": "HISTORY", "wire": ["history"], "selectors": true },
+    { "member": "AGENT", "wire": ["agent"], "selectors": true },
+    { "member": "LOCAL", "wire": ["local"], "selectors": true },
+    { "member": "MEMORY", "wire": ["memory"], "selectors": true },
+    { "member": "MCP", "wire": ["mcp"], "selectors": false },
+    { "member": "SKILL", "wire": ["skill"], "selectors": true },
+    { "member": "RULE", "wire": ["rule"], "selectors": true },
+    { "member": "OMP", "wire": ["omp"], "selectors": true },
+    { "member": "ISSUE", "wire": ["issue"], "selectors": true },
+    { "member": "PR", "wire": ["pr"], "selectors": true },
+    { "member": "SSH", "wire": ["ssh"], "selectors": true },
+    { "member": "SECURITY", "wire": ["security"], "selectors": true },
+    { "member": "VAULT", "wire": ["vault"], "selectors": true },
+    { "member": "JOB", "wire": ["job"], "selectors": true },
+    { "member": "UNKNOWN", "wire": [], "selectors": false }
+  ]
+}

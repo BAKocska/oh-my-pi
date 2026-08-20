@@ -63,6 +63,7 @@ const CLOSE_SESSION_LEASE_DEADLINE: Duration = Duration::from_secs(1);
 /// Cancels every session event forwarder and releases every registry-owned
 /// lease, balancing LSP and document-store ownership.
 pub async fn close_session(session: &EnvironmentSession) {
+	session.release_workspace_leases();
 	let leases = session.take_leases();
 	for lease_id in leases {
 		let cancellation = CancellationToken::new();
@@ -324,6 +325,12 @@ async fn dispatch(
 		Request::LspNotification(request) => lsp_notification(session, request, cancellation)
 			.await
 			.map(Response::LspNotificationAccepted),
+		Request::AcquireWorkspaceLease(request) => acquire_workspace_lease(session, request)
+			.await
+			.map(Response::WorkspaceLeaseAcquired),
+		Request::ReleaseWorkspaceLease(request) => {
+			release_workspace_lease(session, request).map(Response::WorkspaceLeaseReleased)
+		},
 		Request::CanonicalizePath(request) => {
 			canonicalize_path(session, request).map(Response::PathCanonicalized)
 		},
@@ -354,6 +361,59 @@ async fn dispatch(
 			.await
 			.map(Response::PermissionsSet),
 	}
+}
+
+async fn acquire_workspace_lease(
+	session: &EnvironmentSession,
+	request: proto::AcquireWorkspaceLeaseRequest,
+) -> DispatchResult<proto::AcquireWorkspaceLeaseResponse> {
+	if request.uris.is_empty() {
+		return Err(Failure::invalid("workspace lease requires at least one URI"));
+	}
+	let transaction_id = exact_array(&request.transaction_id, "workspace lease transaction id")?;
+	let uris = request
+		.uris
+		.iter()
+		.map(|uri| parse_file_uri(uri))
+		.collect::<DispatchResult<Vec<_>>>()?;
+	let outcome = session
+		.acquire_workspace_lease(&uris, transaction_id, request.dry_run)
+		.await
+		.map_err(Failure::from_core)?;
+	Ok(proto::AcquireWorkspaceLeaseResponse {
+		workspace_lease_id: outcome
+			.lease_id
+			.map(|id| Bytes::copy_from_slice(id.as_bytes())),
+		conflicts:          outcome
+			.conflicts
+			.into_iter()
+			.map(|conflict| {
+				let uri = session
+					.environment()
+					.store()
+					.file_uri(&conflict.path)
+					.map_err(Failure::from_core)?;
+				Ok(proto::WorkspaceLeaseConflict {
+					uri:             uri.to_string(),
+					active_lease_id: Bytes::copy_from_slice(&conflict.active_lease_id),
+				})
+			})
+			.collect::<DispatchResult<Vec<_>>>()?,
+	})
+}
+
+fn release_workspace_lease(
+	session: &EnvironmentSession,
+	request: proto::ReleaseWorkspaceLeaseRequest,
+) -> DispatchResult<proto::ReleaseWorkspaceLeaseResponse> {
+	let id = crate::environment::WorkspaceLeaseId::from_bytes(exact_array(
+		&request.workspace_lease_id,
+		"workspace lease id",
+	)?);
+	if !session.release_workspace_lease(id) {
+		return Err(Failure::invalid("workspace lease is missing or owned by another connection"));
+	}
+	Ok(proto::ReleaseWorkspaceLeaseResponse {})
 }
 
 async fn open_document(
@@ -607,7 +667,7 @@ async fn commit_transaction(
 	let outcome = session
 		.environment()
 		.transactions()
-		.commit_lazy(transaction_id, cancellation, move || async move {
+		.commit_lazy_for(session.owner(), transaction_id, cancellation, move || async move {
 			build_operations(build_session, operations, build_cancellation).await
 		})
 		.await;
@@ -628,7 +688,21 @@ async fn build_operations(
 			.document
 			.ok_or_else(|| build_invalid("document mutation target is required"))
 			.and_then(|target| parse_target(target).map_err(build_from_failure))?;
-		locator_for_target(&session, &target).map_err(|error| build_precondition(error.message))?;
+		let locator = locator_for_target(&session, &target)
+			.map_err(|error| build_precondition(error.message))?;
+		let target_path = match &target {
+			DocumentTarget::Uri(uri) => session
+				.environment()
+				.store()
+				.resolve_entry_path(uri)
+				.map_err(build_snapshot_error)?,
+			_ => canonical_path_for_locator(&session, locator, &cancellation)
+				.await
+				.map_err(|error| build_precondition(error.message))?,
+		};
+		session
+			.check_workspace_paths([target_path])
+			.map_err(build_snapshot_error)?;
 		let native = match operation
 			.operation
 			.ok_or_else(|| build_invalid("document mutation operation is required"))?
@@ -647,10 +721,14 @@ async fn build_operations(
 				MutationOperation::Delete(DeleteMutation::new(revision))
 			},
 			proto::document_mutation::Operation::Move(moved) => {
-				MutationOperation::Move(build_move_mutation(moved)?)
+				let moved = build_move_mutation(moved)?;
+				check_workspace_uris(&session, [moved.destination()]).map_err(build_from_failure)?;
+				MutationOperation::Move(moved)
 			},
 			proto::document_mutation::Operation::MoveWithContent(moved) => {
-				MutationOperation::MoveWithContent(build_move_with_content_mutation(moved)?)
+				let moved = build_move_with_content_mutation(moved)?;
+				check_workspace_uris(&session, [moved.destination()]).map_err(build_from_failure)?;
+				MutationOperation::MoveWithContent(moved)
 			},
 		};
 		built.push(DocumentMutation::new(target, native));
@@ -964,6 +1042,7 @@ async fn create_directory(
 	cancellation: CancellationToken,
 ) -> DispatchResult<proto::CreateDirectoryResponse> {
 	let uri = parse_file_uri(&request.uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&uri])?;
 	let existing = match proto::ExistingDirectoryPolicy::try_from(request.existing_leaf)
 		.map_err(|_| Failure::invalid("unknown existing directory policy"))?
 	{
@@ -989,6 +1068,7 @@ async fn remove_path(
 	cancellation: CancellationToken,
 ) -> DispatchResult<proto::RemovePathResponse> {
 	let uri = parse_file_uri(&request.uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&uri])?;
 	let revision = request.revision.map(parse_revision).transpose()?;
 	completed_path_result(
 		session
@@ -1008,6 +1088,7 @@ async fn rename_path(
 ) -> DispatchResult<proto::RenamePathResponse> {
 	let source = parse_file_uri(&request.source_uri)?;
 	let destination = parse_file_uri(&request.destination_uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&source, &destination])?;
 	let overwrite = parse_overwrite(request.overwrite, true)?;
 	let source_revision = request.source_revision.map(parse_revision).transpose()?;
 	let destination_revision = request
@@ -1039,6 +1120,7 @@ async fn copy_path(
 ) -> DispatchResult<proto::CopyPathResponse> {
 	let source = parse_file_uri(&request.source_uri)?;
 	let destination = parse_file_uri(&request.destination_uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&destination])?;
 	let follow = parse_follow(request.follow_source_symlinks)?;
 	let overwrite = parse_overwrite(request.overwrite, false)?;
 	let revision = request
@@ -1079,6 +1161,7 @@ async fn create_symlink(
 ) -> DispatchResult<proto::CreateSymlinkResponse> {
 	let target = parse_symlink_target(session, required(request.target, "symlink target")?)?;
 	let link = parse_file_uri(&request.link_uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&link])?;
 	let kind = match proto::SymlinkTargetKind::try_from(request.target_kind)
 		.map_err(|_| Failure::invalid("unknown symlink target kind"))?
 	{
@@ -1107,6 +1190,7 @@ async fn create_hard_link(
 ) -> DispatchResult<proto::CreateHardLinkResponse> {
 	let source = parse_file_uri(&request.source_uri)?;
 	let link = parse_file_uri(&request.link_uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&source, &link])?;
 	let follow = parse_follow(request.follow_source_symlinks)?;
 	let overwrite = parse_overwrite(request.overwrite, false)?;
 	let metadata = completed_path_result(
@@ -1126,6 +1210,7 @@ async fn set_permissions(
 	cancellation: CancellationToken,
 ) -> DispatchResult<proto::SetPermissionsResponse> {
 	let uri = parse_file_uri(&request.uri)?;
+	let _workspace_mutation = begin_workspace_mutation(session, [&uri])?;
 	let permissions = required(request.permissions, "portable permissions")?;
 	if permissions.read_only.is_none() && permissions.executable.is_none() {
 		return Err(Failure::invalid("at least one portable permission is required"));
@@ -1150,6 +1235,36 @@ async fn set_permissions(
 			.map_err(Failure::from_core)?,
 	)?;
 	Ok(proto::SetPermissionsResponse { metadata: Some(metadata_to_proto(session, &metadata)?) })
+}
+
+fn begin_workspace_mutation<'a>(
+	session: &EnvironmentSession,
+	uris: impl IntoIterator<Item = &'a Url>,
+) -> DispatchResult<crate::environment::WorkspaceMutationGuard> {
+	let paths = uris
+		.into_iter()
+		.map(|uri| session.environment().store().resolve_entry_path(uri))
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.map_err(Failure::from_core)?;
+	session
+		.environment()
+		.paths()
+		.begin_workspace_mutation(session.owner(), paths)
+		.map_err(Failure::from_core)
+}
+
+fn check_workspace_uris<'a>(
+	session: &EnvironmentSession,
+	uris: impl IntoIterator<Item = &'a Url>,
+) -> DispatchResult<()> {
+	let paths = uris
+		.into_iter()
+		.map(|uri| session.environment().store().resolve_entry_path(uri))
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.map_err(Failure::from_core)?;
+	session
+		.check_workspace_paths(paths)
+		.map_err(Failure::from_core)
 }
 
 fn completed_path_result<T>(result: PathMutationResult<T>) -> DispatchResult<T> {

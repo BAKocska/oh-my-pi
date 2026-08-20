@@ -4,6 +4,7 @@ use std::{
 	collections::{HashMap, VecDeque},
 	fmt::Write as _,
 	future::{Future, ready},
+	ops::Range,
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -14,14 +15,19 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use omp_core::Str;
+use omp_core::{CowBytes, Str};
 use omp_tool::{
-	Abort, BlobRef, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part, PromptCaps, Tool,
-	ToolTerminal,
+	Abort, ArtifactLifetime, BlobRef, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part,
+	PromptCaps, Tool, ToolTerminal,
 };
 use omp_tools::read::{
 	self, DirectoryEntry, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord,
 	SourceKind, SourceStat,
+	resolver::{
+		ArtifactCatalog, ArtifactRecord, ArtifactResolver, BlobAuthority, BlobStat, LineOffsetCache,
+		Resolve, ResolverTable, Scheme, SchemeEntry,
+	},
+	selector::ParsedSelector,
 	web::types::{HttpClient, HttpRequest, HttpResponse, WebError},
 };
 use parking_lot::Mutex;
@@ -168,6 +174,83 @@ impl ReadBlobs for Blobs {
 			media_type,
 			byte_len: bytes.len() as u64,
 		}))
+	}
+}
+
+#[derive(Clone)]
+struct StaticResolver {
+	bytes: CowBytes<'static>,
+	lines: Arc<LineOffsetCache>,
+	calls: Arc<AtomicU64>,
+}
+
+impl Resolve for StaticResolver {
+	async fn read<'a>(
+		&'a self,
+		resource: &'a str,
+		selector: &'a ParsedSelector,
+	) -> Result<CowBytes<'static>, Fault> {
+		assert_eq!(resource, "7");
+		self.calls.fetch_add(1, Ordering::Relaxed);
+		let ParsedSelector::Lines { ranges, .. } = selector else {
+			return Ok(self.bytes.clone());
+		};
+		let [range] = ranges.as_ref() else {
+			panic!("fixture expects one merged range")
+		};
+		self
+			.lines
+			.slice("artifact-7", &self.bytes, *range)
+			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })
+	}
+}
+
+#[derive(Clone)]
+struct ArtifactCatalogFixture {
+	record: ArtifactRecord,
+}
+
+impl ArtifactCatalog for ArtifactCatalogFixture {
+	fn by_ordinal(
+		&self,
+		ordinal: u64,
+	) -> impl Future<Output = Result<Option<ArtifactRecord>, Fault>> + Send + '_ {
+		ready(Ok((ordinal == 7).then(|| self.record.clone())))
+	}
+
+	fn by_digest<'a>(
+		&'a self,
+		digest: &'a str,
+	) -> impl Future<Output = Result<Option<ArtifactRecord>, Fault>> + Send + 'a {
+		ready(Ok((digest == self.record.digest.as_str()).then(|| self.record.clone())))
+	}
+}
+
+#[derive(Clone)]
+struct BlobAuthorityFixture {
+	bytes:  CowBytes<'static>,
+	stats:  Arc<AtomicU64>,
+	ranges: Arc<Mutex<Vec<Range<u64>>>>,
+}
+
+impl BlobAuthority for BlobAuthorityFixture {
+	fn stat<'a>(
+		&'a self,
+		_digest: &'a str,
+	) -> impl Future<Output = Result<BlobStat, Fault>> + Send + 'a {
+		self.stats.fetch_add(1, Ordering::Relaxed);
+		ready(Ok(BlobStat { byte_len: self.bytes.len() as u64 }))
+	}
+
+	fn read_range<'a>(
+		&'a self,
+		_digest: &'a str,
+		range: Range<u64>,
+	) -> impl Future<Output = Result<CowBytes<'static>, Fault>> + Send + 'a {
+		self.ranges.lock().push(range.clone());
+		let start = usize::try_from(range.start).unwrap();
+		let end = usize::try_from(range.end).unwrap();
+		ready(Ok(self.bytes.slice(start..end)))
 	}
 }
 
@@ -351,6 +434,40 @@ fn generated_schema_is_semantically_the_pi_read_schema() {
 			serde_json::from_value::<read::Params>(legacy).is_err(),
 			"read params must reject legacy fields"
 		);
+	}
+}
+
+#[test]
+fn canonical_url_vocabulary_matches_dense_rust_dispatch_and_selector_parser() {
+	#[derive(serde::Deserialize)]
+	struct Vocabulary {
+		version:          u32,
+		selector_grammar: String,
+		schemes:          Vec<SchemeRow>,
+	}
+
+	#[derive(serde::Deserialize)]
+	struct SchemeRow {
+		member:    String,
+		wire:      Vec<String>,
+		selectors: bool,
+	}
+
+	let vocabulary: Vocabulary = serde_json::from_str(read::resolver::URL_VOCABULARY_JSON).unwrap();
+	assert_eq!(vocabulary.version, 1);
+	assert!(vocabulary.selector_grammar.contains("raw ':' ranges"));
+	assert_eq!(vocabulary.schemes.len(), Scheme::ALL.len());
+	for (scheme, row) in Scheme::ALL.iter().copied().zip(vocabulary.schemes) {
+		let entry = SchemeEntry::new(scheme, false, false, "");
+		assert_eq!(entry.member.as_str(), row.member);
+		assert_eq!(entry.selectors, row.selectors);
+		for wire in row.wire {
+			assert_eq!(Scheme::parse(&wire), scheme);
+		}
+	}
+	assert_eq!(Scheme::parse("xd"), Scheme::Unknown);
+	for selector in ["5", "5-16,960-973", "5..16", "5+12", "5-", "raw", "conflicts", "raw:5-16"] {
+		assert_ne!(read::selector::parse_selector(Some(selector)).unwrap(), ParsedSelector::None);
 	}
 }
 
@@ -1258,12 +1375,14 @@ async fn checked_in_url_mock_drives_the_network_free_html_pipeline() {
 }
 
 #[tokio::test]
-async fn unsupported_uri_suffix_recovery_and_semicolon_sections_are_exact() {
+async fn scheme_faults_suffix_recovery_and_semicolon_sections_are_exact() {
 	let sources = Sources::default();
 	assert_eq!(
 		text(sources.clone(), r#"{"path":"skill://react"}"#).await,
-		"skill:// targets are not supported yet"
+		"skill:// is not readable in this deployment"
 	);
+	sources.file("uri-note.txt", "uri body");
+	assert_eq!(text(sources.clone(), r#"{"path":"file://uri-note.txt:raw"}"#).await, "uri body");
 
 	sources.file("nested/lost.txt", "found");
 	sources.suffix("lost.txt", "nested/lost.txt");
@@ -1278,4 +1397,115 @@ async fn unsupported_uri_suffix_recovery_and_semicolon_sections_are_exact() {
 		text(sources, r#"{"path":"one.txt:raw;two.txt:raw"}"#).await,
 		"Note: interpreted as 2 paths: one.txt:raw, two.txt:raw\n\nalpha\n\nbeta"
 	);
+}
+
+#[tokio::test]
+async fn dense_resolver_dispatch_applies_the_shared_selector_without_copying_the_slice() {
+	let calls = Arc::new(AtomicU64::new(0));
+	let source = CowBytes::from_static(b"one\ntwo\nthree\nfour\n");
+	let resolver = StaticResolver {
+		bytes: source,
+		lines: Arc::new(LineOffsetCache::default()),
+
+		calls: calls.clone(),
+	};
+	let mut builder = ResolverTable::builder();
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Artifact, true, true, "Session and durable artifacts"),
+			resolver,
+		)
+		.unwrap();
+	let table = Arc::new(builder.build());
+	assert_eq!(table.routes().get(Scheme::Artifact).unwrap().index(), 0);
+	assert!(table.routes().get(Scheme::History).is_none());
+	let snapshot = table.snapshot([7; 32]);
+	assert_eq!(snapshot.device_hash, [7; 32]);
+	assert_eq!(snapshot.entries.as_ref(), table.entries());
+
+	let tool = read::tool_with_resolvers(Sources::default(), Blobs::default(), table);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::new_static(r#"{"path":"artifact://7:2-3"}"#))
+		.expect("resolver invocation remains live");
+	let events = tool.call(params).collect::<Vec<_>>().await;
+	let [Ev::Done(ToolTerminal::Done { result: Ok(payload), .. })] = events.as_slice() else {
+		panic!("expected resolved payload: {events:?}");
+	};
+	let [read::PayloadPart::Text { text }] = payload.parts.as_slice() else {
+		panic!("expected one resolved text part: {:?}", payload.parts);
+	};
+	assert_eq!(text.as_str(), "two\nthree\n");
+	assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+	let cache = LineOffsetCache::default();
+	let bytes = CowBytes::from_static(b"one\ntwo\nthree\n");
+	let bytes_ptr = bytes.as_ptr();
+	let sliced = cache
+		.slice("same-blob", &bytes, read::selector::LineRange { start_line: 2, end_line: Some(2) })
+		.unwrap();
+	assert_eq!(sliced.as_ptr(), bytes_ptr.wrapping_add(4));
+}
+#[tokio::test]
+async fn artifact_resolver_stats_authority_caches_offsets_and_gates_digest_form_to_durable() {
+	let digest = Str::from("a".repeat(64));
+	let bytes = CowBytes::from_static(b"one\ntwo\nthree\n");
+	let stats = Arc::new(AtomicU64::new(0));
+	let ranges = Arc::new(Mutex::new(Vec::new()));
+	let authority =
+		BlobAuthorityFixture { bytes: bytes.clone(), stats: stats.clone(), ranges: ranges.clone() };
+	let session_record =
+		ArtifactRecord { digest: digest.clone(), lifetime: ArtifactLifetime::Session };
+	let resolver =
+		ArtifactResolver::new(ArtifactCatalogFixture { record: session_record }, authority.clone());
+
+	let selected = read::selector::parse_selector(Some("2-3")).unwrap();
+	let first = resolver.read("7", &selected).await.unwrap();
+	assert_eq!(&*first, b"two\nthree\n");
+	assert_eq!(first.as_ptr(), bytes.as_ptr().wrapping_add(4));
+	assert_eq!(stats.load(Ordering::Relaxed), 1);
+	assert_eq!(ranges.lock().as_slice(), &[0..bytes.len() as u64]);
+
+	let first_line = read::selector::parse_selector(Some("1-1")).unwrap();
+	assert_eq!(&*resolver.read("7", &first_line).await.unwrap(), b"one\n");
+	assert_eq!(stats.load(Ordering::Relaxed), 2);
+	assert_eq!(ranges.lock().as_slice(), &[0..bytes.len() as u64, 0..4]);
+
+	let error = resolver
+		.read(digest.as_str(), &ParsedSelector::None)
+		.await
+		.unwrap_err();
+	assert!(matches!(error, Fault::Source { .. }));
+	assert_eq!(stats.load(Ordering::Relaxed), 2);
+
+	let durable = ArtifactResolver::new(
+		ArtifactCatalogFixture {
+			record: ArtifactRecord { digest: digest.clone(), lifetime: ArtifactLifetime::Durable },
+		},
+		authority,
+	);
+	assert_eq!(
+		&*durable
+			.read(digest.as_str(), &ParsedSelector::None)
+			.await
+			.unwrap(),
+		bytes.as_ref()
+	);
+	assert_eq!(stats.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn unknown_scheme_is_a_typed_fault() {
+	let tool = read::tool(Sources::default(), Blobs::default());
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::new_static(r#"{"path":"xd://pending"}"#))
+		.expect("unknown-scheme invocation remains live");
+	let events = tool.call(params).collect::<Vec<_>>().await;
+	let [Ev::Done(ToolTerminal::Done { result: Err(Fault::UnknownScheme { scheme, .. }), .. })] =
+		events.as_slice()
+	else {
+		panic!("expected typed unknown-scheme fault: {events:?}");
+	};
+	assert_eq!(scheme.as_str(), "xd");
 }

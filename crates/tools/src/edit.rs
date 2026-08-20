@@ -17,8 +17,9 @@ use omp_hashline::{
 	recovery::{ByteRange, RecoveryEdit, recover_exact},
 };
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, ArgPath, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, ArgPath, CommitError, Constraint, DocEffects, Effects, Ev,
+	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -362,6 +363,15 @@ pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> Edit
 			constraint:      Constraint::Schema {
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				documents: Some(DocEffects {
+					read:        true,
+					write_globs: smallvec::smallvec![Str::new_static("**")],
+				}),
+				exec:      None,
+				inference: None,
+				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),

@@ -54,8 +54,8 @@ use omp_llm_inference::{
 	session::ConversationSessionPlanner,
 };
 use omp_tool::{
-	Claims, Constraint, Ev, IncomingParams, Part, Precedence, Presentation, PromptCaps, Rev, Tool,
-	ToolSpec,
+	Claims, Constraint, Effects, Ev, IncomingParams, Part, Precedence, Presentation, PromptCaps,
+	Rev, Tool, ToolSpec,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -80,6 +80,7 @@ impl ProofTool {
 					br#"{"type":"object","additionalProperties":true}"#,
 				),
 				constraint:      Constraint::None,
+				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
 		}

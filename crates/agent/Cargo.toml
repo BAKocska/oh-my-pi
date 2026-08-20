@@ -16,10 +16,12 @@ flume = { workspace = true }
 futures = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 omp-core = { workspace = true }
+# D2 world boundary: client API only. CI rejects docserver, shell-engine, and walker.
 omp-env = { workspace = true }
 omp-llm-inference = { workspace = true }
 omp-slopjson = { workspace = true }
 omp-proto = { workspace = true, features = ["tonic"] }
+# The sole sanctioned direct storage edge is the durable journal subscriber.
 omp-storage = { workspace = true }
 omp-tool = { workspace = true }
 parking_lot = { workspace = true }

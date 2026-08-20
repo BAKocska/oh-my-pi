@@ -62,9 +62,9 @@ use omp_proto::{
 };
 use omp_storage::transcript::{self, AmendPatch, Entry, Header, Kind, SessionId};
 use omp_tool::{
-	Abort, CallOutcome, CapsBase, Claims, Constraint, Ev, IncomingParams, ModelClass,
-	Part as ToolPart, Precedence, Presentation, PromptCaps, Registry, Rev, TOOL_REV_PROP, Tool,
-	ToolSpec,
+	Abort, CallOutcome, CapsBase, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams,
+	ModelClass, Part as ToolPart, Precedence, Presentation, PromptCaps, Registry, Rev,
+	TOOL_REV_PROP, Tool, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +73,18 @@ use tower::Service;
 const TEST_NAME: &str = "crash_resume_replays_exact_durable_truth";
 const CHILD_ENV: &str = "OMP_P6_CHILD";
 const ROOT_ENV: &str = "OMP_P6_ROOT";
+
+fn file_write_effects() -> Effects {
+	Effects {
+		documents: Some(DocEffects {
+			read:        false,
+			write_globs: [Str::new_static("**")].into_iter().collect(),
+		}),
+		exec:      None,
+		inference: None,
+		subagents: 0,
+	}
+}
 const ROOT_TURN: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const BATCH_TURN: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const FALLBACK_TURN: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
@@ -228,6 +240,7 @@ impl HangingTool {
 					br#"{"type":"object","properties":{"call":{"type":"string"}},"required":["call"]}"#,
 				),
 				constraint:      Constraint::None,
+				effects:         file_write_effects(),
 				projection_code: [0; 32],
 			},
 			effects,
@@ -613,6 +626,7 @@ fn binary_gateway_tools() -> Arc<Registry> {
 					description:     Str::new_static("binary crash-resume fixture"),
 					schema:          Bytes::from_static(br#"{"type":"object"}"#),
 					constraint:      Constraint::None,
+					effects:         Effects::empty(),
 					projection_code: [0; 32],
 				},
 				Presentation::Device,
@@ -1077,7 +1091,15 @@ async fn batch_child(root: &Path, create: bool) {
 			&workspace,
 			&state_dir,
 			environment_registry,
-			ExtHostConfig::new(omp_binary().expect("worker-capable host binary")),
+			ExtHostConfig::new(
+				omp_binary().expect("worker-capable host binary"),
+				omp_core::Principal::new(
+					omp_core::Str::new_static("e2e-tester"),
+					omp_core::Str::new_static("E2E Tester"),
+				),
+				omp_core::Str::new_static("p6-session"),
+				1,
+			),
 		)
 		.await
 		.expect("real local environment host"),

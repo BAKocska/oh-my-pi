@@ -45,12 +45,19 @@ pub struct EnvHarness {
 impl EnvHarness {
 	/// Opens all real local environment resources and completes a framed client
 	/// hello.
-	pub async fn spawn(scratch: &Scratch, registry: Registry) -> Result<Self> {
+	pub async fn spawn(scratch: &Scratch, _registry: Registry) -> Result<Self> {
 		let socket = scratch.socket("env.sock");
-		let ext_host_config =
-			ExtHostConfig::new(omp_binary().context("resolving worker-capable host")?);
+		let ext_host_config = ExtHostConfig::new(
+			omp_binary().context("resolving worker-capable host")?,
+			omp_core::Principal::new(
+				omp_core::Str::new_static("e2e-tester"),
+				omp_core::Str::new_static("E2E Tester"),
+			),
+			omp_core::Str::new_static("e2e-session"),
+			1,
+		);
 		let server = Arc::new(
-			EnvServer::open_local(scratch.project(), scratch.state(), registry, ext_host_config)
+			EnvServer::open_local(scratch.project(), scratch.state(), ext_host_config)
 				.await
 				.context("opening local environment authority")?,
 		);

@@ -258,6 +258,14 @@ impl std::fmt::Debug for DocumentStore {
 impl DocumentStore {
 	/// Creates an empty document registry rooted at `config`.
 	pub fn new(config: ServerConfig) -> Result<Self> {
+		Self::new_with_workspace_leases(config, crate::environment::WorkspaceLeaseTable::default())
+	}
+
+	/// Creates a registry sharing the Environment's exclusive workspace leases.
+	pub(crate) fn new_with_workspace_leases(
+		config: ServerConfig,
+		workspace_leases: crate::environment::WorkspaceLeaseTable,
+	) -> Result<Self> {
 		let fs = LocalFs::new(&config)?;
 		Ok(Self {
 			inner: Arc::new(RegistryInner {
@@ -266,14 +274,25 @@ impl DocumentStore {
 				fs,
 				mutation_gate: Arc::new(AsyncMutex::new(())),
 				maps: Mutex::new(RegistryMaps::default()),
+				workspace_leases,
 			}),
 		})
 	}
 
 	/// Acquires a distinct lease, activating and caching a path when necessary.
 	pub async fn open(&self, locator: impl Into<DocumentLocator>) -> Result<OpenedDocument> {
+		let locator = locator.into();
 		let gate = self.mutation_gate();
 		let _authority = gate.lock().await;
+		let path = match &locator {
+			DocumentLocator::Path(path) if path.is_absolute() => path.clone(),
+			DocumentLocator::Path(path) => self.inner.config.environment_root().join(path),
+			DocumentLocator::Document(document_id) => {
+				self.handle_for_id(*document_id)?.state().await?.path
+			},
+			DocumentLocator::Lease(lease_id) => self.handle_for_lease(*lease_id)?.state().await?.path,
+		};
+		self.inner.workspace_leases.check_paths(None, [path])?;
 		self.open_with_mutation_authority(locator).await
 	}
 
@@ -347,6 +366,35 @@ impl DocumentStore {
 	/// path operations.
 	pub(crate) fn mutation_gate(&self) -> Arc<AsyncMutex<()>> {
 		Arc::clone(&self.inner.mutation_gate)
+	}
+
+	/// Snapshots active lease identities for the selected exact paths.
+	pub(crate) fn active_leases_for_paths(&self, paths: &[PathBuf]) -> Vec<(PathBuf, LeaseId)> {
+		let maps = self.inner.lock_maps();
+		maps
+			.by_lease
+			.iter()
+			.filter_map(|(lease_id, document_id)| {
+				let path = maps
+					.by_path
+					.iter()
+					.find_map(|(path, owner)| (*owner == *document_id).then_some(path))?;
+				paths.contains(path).then(|| (path.clone(), *lease_id))
+			})
+			.collect()
+	}
+
+	/// Checks selected mutation paths against the shared workspace lease table.
+	pub(crate) fn check_workspace_paths(
+		&self,
+		owner: Option<[u8; 16]>,
+		paths: impl IntoIterator<Item = PathBuf>,
+	) -> Result<()> {
+		self.inner.workspace_leases.check_paths(owner, paths)
+	}
+
+	pub(crate) fn workspace_leases(&self) -> &crate::environment::WorkspaceLeaseTable {
+		&self.inner.workspace_leases
 	}
 
 	/// Resolves a no-follow destination entry which may be missing.
@@ -572,6 +620,7 @@ struct RegistryInner {
 	revision_capacity: usize,
 	mutation_gate:     Arc<AsyncMutex<()>>,
 	maps:              Mutex<RegistryMaps>,
+	workspace_leases:  crate::environment::WorkspaceLeaseTable,
 }
 
 struct OpenLeaseGuard {

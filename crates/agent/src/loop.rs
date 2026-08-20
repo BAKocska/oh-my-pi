@@ -7,32 +7,43 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::{IntoStr, Str};
+use omp_core::{IntoStr, InvocationPhase, Str};
 use omp_env::EnvClient;
 use omp_llm_inference::TurnId;
 use omp_proto::{
 	inference::v1::{self as pb, ContextRef, Outcome, ThreadDelta},
 	thread::v1::{self as thread, Item},
 };
+use omp_storage::transcript::{CallId, InvocationTransition};
 use omp_tool::{CapsBase, Registry as ToolRegistry, ToolIdentity};
+use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
 use crate::{
-	AgentEvent, AgentPhase, AgentState, BatchError, EventBus, JobBoard, Journal, JournalError,
-	Mailbox, MailboxSender, ProjectionError, PromptError, TurnClient, TurnInput, TurnSession,
-	batch::{SpeculativeCall, ToolBatch},
+	BatchError, Journal, JournalError, Mailbox, MailboxSender, ProjectionError, PromptError,
+	TurnClient, TurnInput, TurnSession,
+	batch::{
+		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
+	},
+	control::{ControlMailbox, ControlSender},
 	duplex::{DuplexError, DuplexManager},
+	events::{AgentEvent, AgentPhase, EventBus},
+	jobs::JobBoard,
 	journal::{AbortDisposition, TurnInputRecord, TurnOptionsRecord, TurnStart},
 	mailbox::DrainPoint,
 	project::project_journal,
+	state::AgentState,
 	turn::{Error as TurnError, empty_stop},
 };
 
-const INTERRUPT_GRACE: Duration = Duration::from_millis(500);
-const TOOL_DEADLINE: Duration = Duration::from_secs(300);
+const INTERRUPT_GRACE: omp_core::Duration =
+	omp_core::Duration::new(500, omp_core::DurationUnit::Milliseconds);
+const TOOL_DEADLINE: omp_core::Duration =
+	omp_core::Duration::new(300, omp_core::DurationUnit::Seconds);
 const EMPTY_OUTPUT_RETRY_CAP: u8 = 3;
 const EMPTY_OUTPUT_RETRY_DETAIL: &str =
 	"Assistant returned no final output after retry cap; try switching models";
+const CONTROL_DRAIN_LIMIT: usize = 32;
 
 /// Terminal result of one complete caller submission, including tool
 /// follow-ups.
@@ -121,6 +132,12 @@ pub struct Agent<C: TurnClient> {
 	journal:            Journal,
 	caps:               CapsBase,
 	events:             EventBus,
+	hook_bus:           InvocationHookBus,
+	hook_requests:      flume::Receiver<InvocationHookRequest>,
+	invocation_fact_tx: flume::Sender<InvocationAdmissionFact>,
+	invocation_fact_rx: flume::Receiver<InvocationAdmissionFact>,
+	control_tx:         ControlSender,
+	control_mailbox:    ControlMailbox,
 	mailbox:            Mailbox,
 	jobs:               Arc<JobBoard>,
 	jobs_restored:      bool,
@@ -146,6 +163,9 @@ impl<C: TurnClient> Agent<C> {
 		let jobs = Arc::new(JobBoard::new(env.clone(), mailbox.sender()));
 		let events = EventBus::new();
 		let (abort_tx, abort_rx) = tokio::sync::watch::channel(0_u64);
+		let (hook_bus, hook_requests) = InvocationHookBus::channel();
+		let (invocation_fact_tx, invocation_fact_rx) = flume::unbounded();
+		let (control_tx, control_mailbox) = crate::control::channel();
 		let mut context = None;
 		let mut prompt_hash = None;
 		let mut prompt_head_events = Vec::new();
@@ -187,6 +207,12 @@ impl<C: TurnClient> Agent<C> {
 			journal,
 			caps,
 			events,
+			hook_bus,
+			hook_requests,
+			invocation_fact_tx,
+			invocation_fact_rx,
+			control_tx,
+			control_mailbox,
 			mailbox,
 			jobs,
 			jobs_restored: false,
@@ -213,6 +239,23 @@ impl<C: TurnClient> Agent<C> {
 	/// Returns a producer for asynchronous steering and settlement items.
 	pub fn mailbox(&self) -> MailboxSender {
 		self.mailbox.sender()
+	}
+
+	/// Returns the CONTROL-side receiver for invocation hook handoffs.
+	///
+	/// Clones compete for messages; one supervisor should own the receiver.
+	pub fn hook_requests(&self) -> flume::Receiver<InvocationHookRequest> {
+		self.hook_requests.clone()
+	}
+
+	/// Replaces the registered hook union mask in one atomic publication.
+	pub fn replace_hook_mask(&self, mask: u128) {
+		self.hook_bus.replace_union_mask(mask);
+	}
+
+	/// Returns a sender for authenticated extension CONTROL operations.
+	pub fn control(&self) -> ControlSender {
+		self.control_tx.clone()
 	}
 
 	/// Returns a cloneable out-of-band stop signal.
@@ -351,6 +394,7 @@ impl<C: TurnClient> Agent<C> {
 			pending_indexes.dedup();
 			(pending_indexes, TurnId::new(turn_id))
 		} else {
+			self.drain_control();
 			let snapshot = self.state.snapshot();
 			let queued = self
 				.mailbox
@@ -391,6 +435,7 @@ impl<C: TurnClient> Agent<C> {
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.context = None;
 					self.abort_rx.mark_unchanged();
+					self.drain_control();
 					let snapshot = self.state.snapshot();
 					let drained = self
 						.mailbox
@@ -452,6 +497,7 @@ impl<C: TurnClient> Agent<C> {
 			});
 
 			self.events.publish(AgentEvent::Snapshot(snapshot.clone()));
+			self.drain_control();
 			let mut immediate = self
 				.mailbox
 				.drain(DrainPoint::Immediate, snapshot.defer_interrupts);
@@ -473,6 +519,8 @@ impl<C: TurnClient> Agent<C> {
 					self.mailbox.requeue_front(immediate);
 					return Err(error);
 				}
+				tokio::task::yield_now().await;
+				self.drain_invocation_facts()?;
 				let calls = match committed_calls(&outcome.output, &mut speculative) {
 					Ok(calls) => calls,
 					Err(error) => {
@@ -498,6 +546,21 @@ impl<C: TurnClient> Agent<C> {
 					self.mailbox.requeue_front(immediate);
 					return Err(error.into());
 				}
+				for call in &calls {
+					self.journal.record_invocation_transition(
+						call.authorized_at_ms(),
+						InvocationTransition {
+							effect_token: Some(call.effect_token().clone()),
+							authorized_at: Some(call.authorized_at_ms()),
+							effects: Some(call.effects().clone()),
+							..empty_invocation_transition(
+								call.call_id().clone(),
+								CallId(call.call_id().clone()),
+								InvocationPhase::EffectsAuthorized,
+							)
+						},
+					)?;
+				}
 				let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(None);
 				for interrupt in std::mem::take(&mut immediate) {
 					interrupt_tx.send_replace(Some(interrupt_reason(&interrupt.source)));
@@ -507,11 +570,12 @@ impl<C: TurnClient> Agent<C> {
 				let mut aborted = false;
 				let mut abort_rx = self.abort_rx.clone();
 				let results = {
+					let caps = self.caps;
 					let drive = ToolBatch::new(calls).drive_interruptible(
 						snapshot.registry.as_ref(),
-						&self.caps,
+						&caps,
 						interrupt_rx,
-						INTERRUPT_GRACE,
+						runtime_duration(INTERRUPT_GRACE),
 					);
 					tokio::pin!(drive);
 					loop {
@@ -525,8 +589,14 @@ impl<C: TurnClient> Agent<C> {
 								aborted = true;
 								interrupt_tx.send_replace(Some(Str::new_static("user interrupt")));
 							},
+							handled = self.control_mailbox.handle_next(&mut self.journal) => {
+								if !handled {
+									std::future::pending::<()>().await;
+								}
+							},
 							received = self.mailbox.wait() => {
 								if received.is_err() { continue; }
+								self.drain_control();
 								for interrupt in self.mailbox.drain(DrainPoint::Immediate, snapshot.defer_interrupts) {
 									interrupt_tx.send_replace(Some(interrupt_reason(&interrupt.source)));
 									boundary.push(interrupt);
@@ -537,6 +607,19 @@ impl<C: TurnClient> Agent<C> {
 				};
 				let mut next = Vec::with_capacity(results.len() + boundary.len());
 				for result in results {
+					if let Some(outcome) = result.outcome().cloned() {
+						let call_id = result.call_id().clone();
+						self
+							.journal
+							.record_invocation_transition(now_ms(), InvocationTransition {
+								outcome: Some(outcome),
+								..empty_invocation_transition(
+									call_id.clone(),
+									CallId(call_id),
+									InvocationPhase::Settled,
+								)
+							})?;
+					}
 					next.push(result.item().clone());
 					if let Some(job) = result.into_job() {
 						let id = job.id.clone();
@@ -579,6 +662,7 @@ impl<C: TurnClient> Agent<C> {
 			immediate.append(&mut boundary);
 			boundary = immediate;
 
+			self.drain_control();
 			let mut idle = self
 				.mailbox
 				.drain(DrainPoint::Idle, snapshot.defer_interrupts);
@@ -862,7 +946,7 @@ impl<C: TurnClient> Agent<C> {
 			let stateful = matches!(&input, TurnInput::Delta(..))
 				|| matches!(&input, TurnInput::Full(_) if frozen_options.context_id.is_some());
 
-			let session_result = {
+			let selected = {
 				let mut abort_rx = self.abort_rx.clone();
 				let session = self.drive_session(
 					turn_id.clone(),
@@ -873,11 +957,13 @@ impl<C: TurnClient> Agent<C> {
 				);
 				tokio::pin!(session);
 				tokio::select! {
-					result = &mut session => result,
-					() = wait_deadline(latest.deadline) => return Err(AgentError::Deadline),
-					_ = abort_rx.changed() => return Err(AgentError::Interrupted),
+					result = &mut session => Ok(result),
+					() = wait_deadline(latest.deadline) => Err(AgentError::Deadline),
+					_ = abort_rx.changed() => Err(AgentError::Interrupted),
 				}
 			};
+			self.drain_invocation_facts()?;
+			let session_result = selected?;
 			match session_result {
 				Ok((outcome, speculative)) => {
 					validate_outcome(&outcome)?;
@@ -897,9 +983,12 @@ impl<C: TurnClient> Agent<C> {
 							));
 						}
 					}
-					self
-						.journal
-						.append_gateway_outcome(now_ms(), turn_id.as_str(), outcome.clone())?;
+					let (receipt, _) = self.journal.append_gateway_outcome(
+						now_ms(),
+						turn_id.as_str(),
+						outcome.clone(),
+					)?;
+					self.record_committed_invocations(&outcome, &speculative, &receipt)?;
 					self.patch_input_sequences(&sequence_targets, &outcome)?;
 					self.last_toolset_hash = Some(toolset_hash);
 					return Ok((
@@ -930,6 +1019,24 @@ impl<C: TurnClient> Agent<C> {
 					full = true;
 					resume_input = None;
 				},
+				Err(TurnError::Terminal(error))
+					if matches!(
+						pb::turn_error::Kind::try_from(error.kind),
+						Ok(pb::turn_error::Kind::RateLimited)
+					) && attempts < latest.retry.max_attempts().get() =>
+				{
+					sleep_with_deadline(Duration::from_millis(error.retry_after_ms), latest.deadline)
+						.await?;
+				},
+				Err(TurnError::Terminal(error))
+					if matches!(
+						pb::turn_error::Kind::try_from(error.kind),
+						Ok(pb::turn_error::Kind::Overloaded | pb::turn_error::Kind::Upstream)
+					) && attempts < latest.retry.max_attempts().get() =>
+				{
+					sleep_with_deadline(backoff, latest.deadline).await?;
+					backoff = backoff.saturating_mul(2).min(latest.retry.max_backoff());
+				},
 				Err(TurnError::Terminal(error)) => {
 					return Err(AgentError::Turn(TurnError::Terminal(error)));
 				},
@@ -943,33 +1050,58 @@ impl<C: TurnClient> Agent<C> {
 	}
 
 	async fn drive_session(
-		&self,
+		&mut self,
 		turn_id: TurnId,
 		input: TurnInput,
 		options: &crate::TurnOptions,
 		registry: Arc<ToolRegistry>,
 		enabled_tools: Arc<[Str]>,
 	) -> Result<(Outcome, BTreeMap<Str, SpeculativeCall>), TurnError> {
-		let mut session = self.client.turn(turn_id.clone(), input, options).await?;
+		let opening = self.client.turn(turn_id.clone(), input, options);
+		tokio::pin!(opening);
+		let mut session = loop {
+			tokio::select! {
+				session = &mut opening => break session?,
+				handled = self.control_mailbox.handle_next(&mut self.journal) => {
+					if !handled {
+						std::future::pending::<()>().await;
+					}
+				},
+			}
+		};
 		let mut duplex = DuplexManager::new(
 			self.env.clone(),
 			Arc::clone(&registry),
 			self.events.clone(),
 			self.caps,
-			INTERRUPT_GRACE,
+			runtime_duration(INTERRUPT_GRACE),
 		);
 		let mut speculative = BTreeMap::new();
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
 		loop {
 			let event = if duplex.is_empty() {
 				let mut events = session.events();
-				events.next().await
+				tokio::select! {
+					event = events.next() => event,
+					handled = self.control_mailbox.handle_next(&mut self.journal) => {
+						if handled {
+							continue;
+						}
+						std::future::pending().await
+					},
+				}
 			} else {
 				let completion = {
 					let mut events = session.events();
 					tokio::select! {
 						event = events.next() => Ok(event),
 						completion = duplex.next() => Err(completion),
+						handled = self.control_mailbox.handle_next(&mut self.journal) => {
+							if handled {
+								continue;
+							}
+							std::future::pending().await
+						},
 					}
 				};
 				match completion {
@@ -1004,15 +1136,37 @@ impl<C: TurnClient> Agent<C> {
 						return Err(TurnError::Protocol("stream named unknown tool"));
 					};
 					let call_id = part.tool_call_id.as_str().to_str();
-					let opened = SpeculativeCall::open(
+					let mut opened = SpeculativeCall::open(
 						&self.env,
 						&self.events,
 						call_id.clone(),
 						ToolIdentity { name: name.clone(), rev: rev.clone() },
-						TOOL_DEADLINE,
+						runtime_duration(TOOL_DEADLINE),
 					)
 					.await
 					.map_err(|_| TurnError::Protocol("failed to open speculative tool"))?;
+					let maximum_effects = registry
+						.effects(&part.tool_name)
+						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?
+						.clone();
+					opened
+						.attach_runtime(
+							self.hook_bus.clone(),
+							self.invocation_fact_tx.clone(),
+							maximum_effects,
+						)
+						.map_err(|_| TurnError::Protocol("failed to attach invocation runtime"))?;
+					self
+						.journal
+						.record_invocation_transition(
+							now_ms(),
+							empty_invocation_transition(
+								call_id.clone(),
+								CallId(call_id.clone()),
+								InvocationPhase::Open,
+							),
+						)
+						.map_err(|_| TurnError::Protocol("failed to journal invocation open"))?;
 					speculative.insert(call_id.clone(), opened);
 					part_calls.insert(part.index, call_id);
 				},
@@ -1065,15 +1219,30 @@ impl<C: TurnClient> Agent<C> {
 				&self.events,
 				call.id.as_str().to_str(),
 				ToolIdentity { name: name.clone(), rev: rev.clone() },
-				TOOL_DEADLINE,
+				runtime_duration(TOOL_DEADLINE),
 			)
 			.await?;
+			let maximum_effects = registry
+				.effects(&call.name)
+				.map_err(|_| AgentError::Protocol("committed tool effects missing"))?
+				.clone();
+			opened.attach_runtime(
+				self.hook_bus.clone(),
+				self.invocation_fact_tx.clone(),
+				maximum_effects,
+			)?;
 			let fragment = std::str::from_utf8(&call.args_json)
 				.map_err(|_| AgentError::Protocol("tool arguments are not UTF-8"))?;
 			opened.relay_fragment(fragment.to_str()).await?;
 			speculative.insert(call.id.as_str().to_str(), opened);
 		}
 		Ok(())
+	}
+
+	fn drain_control(&mut self) {
+		self
+			.control_mailbox
+			.drain_ready(&mut self.journal, CONTROL_DRAIN_LIMIT);
 	}
 
 	fn patch_input_sequences(
@@ -1106,10 +1275,191 @@ impl<C: TurnClient> Agent<C> {
 		Ok(())
 	}
 
+	fn drain_invocation_facts(&mut self) -> Result<(), AgentError> {
+		while let Ok(fact) = self.invocation_fact_rx.try_recv() {
+			let requested = canonical_raw(fact.raw.as_bytes())?;
+			let patch = (!fact.admission.args_patch.is_empty())
+				.then(|| canonical_raw(&fact.admission.args_patch))
+				.transpose()?;
+			let effective = effective_args(&requested, patch.as_deref())?;
+			let admission_receipt = serde_json::value::to_raw_value(&serde_json::json!({
+				"allow": fact.admission.allow,
+			}))
+			.map_err(|_| AgentError::Protocol("admission receipt is not canonical JSON"))?;
+			let call_id = CallId(fact.invocation_id.clone());
+			for transition in [
+				empty_invocation_transition(
+					fact.invocation_id.clone(),
+					call_id.clone(),
+					InvocationPhase::Open,
+				),
+				InvocationTransition {
+					requested_args: Some(requested),
+					..empty_invocation_transition(
+						fact.invocation_id.clone(),
+						call_id.clone(),
+						InvocationPhase::ArgsFinalized,
+					)
+				},
+				empty_invocation_transition(
+					fact.invocation_id.clone(),
+					call_id.clone(),
+					InvocationPhase::Admission,
+				),
+				InvocationTransition {
+					transformations: Some(patch.into_iter().collect()),
+					effective_args: Some(effective),
+					admission_receipt: Some(admission_receipt),
+					..empty_invocation_transition(fact.invocation_id, call_id, InvocationPhase::Admitted)
+				},
+			] {
+				self
+					.journal
+					.record_invocation_transition(now_ms(), transition)?;
+			}
+		}
+		Ok(())
+	}
+
+	fn record_committed_invocations(
+		&mut self,
+		outcome: &Outcome,
+		speculative: &BTreeMap<Str, SpeculativeCall>,
+		receipt: &crate::TurnReceipt,
+	) -> Result<(), AgentError> {
+		for (position, item) in outcome.output.iter().enumerate() {
+			let Some(thread::item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+				continue;
+			};
+			let opened = speculative
+				.get(call.id.as_str())
+				.ok_or(AgentError::Protocol("committed tool lacked speculation"))?;
+			let requested = canonical_raw(&call.args_json)?;
+			let admission = opened.admission();
+			let patch = admission
+				.filter(|value| !value.args_patch.is_empty())
+				.map(|value| canonical_raw(&value.args_patch))
+				.transpose()?;
+			let effective = effective_args(&requested, patch.as_deref())?;
+			let admission_receipt = serde_json::value::to_raw_value(&serde_json::json!({
+				"allow": admission.is_none_or(|value| value.allow),
+			}))
+			.map_err(|_| AgentError::Protocol("admission receipt is not canonical JSON"))?;
+			let invocation_id = call.id.as_str().to_str();
+			let call_id = CallId(invocation_id.clone());
+			for transition in [
+				empty_invocation_transition(
+					invocation_id.clone(),
+					call_id.clone(),
+					InvocationPhase::Open,
+				),
+				InvocationTransition {
+					requested_args: Some(requested.clone()),
+					..empty_invocation_transition(
+						invocation_id.clone(),
+						call_id.clone(),
+						InvocationPhase::ArgsFinalized,
+					)
+				},
+				empty_invocation_transition(
+					invocation_id.clone(),
+					call_id.clone(),
+					InvocationPhase::Admission,
+				),
+				InvocationTransition {
+					transformations: Some(patch.into_iter().collect()),
+					effective_args: Some(effective),
+					admission_receipt: Some(admission_receipt),
+					..empty_invocation_transition(
+						invocation_id.clone(),
+						call_id.clone(),
+						InvocationPhase::Admitted,
+					)
+				},
+				InvocationTransition {
+					assistant_item_event: receipt.item_events.get(position).copied(),
+					..empty_invocation_transition(
+						invocation_id,
+						call_id,
+						InvocationPhase::AssistantItemCommitted,
+					)
+				},
+			] {
+				self
+					.journal
+					.record_invocation_transition(now_ms(), transition)?;
+			}
+		}
+		Ok(())
+	}
+
 	fn transition(&mut self, to: AgentPhase) {
 		if self.phase != to {
 			self.events.transition(self.phase, to);
 			self.phase = to;
+		}
+	}
+}
+
+fn empty_invocation_transition(
+	invocation_id: Str,
+	call_id: CallId,
+	phase: InvocationPhase,
+) -> InvocationTransition {
+	InvocationTransition {
+		invocation_id,
+		call_id,
+		phase,
+		requested_args: None,
+		transformations: None,
+		effective_args: None,
+		admission_receipt: None,
+		assistant_item_event: None,
+		effect_token: None,
+		effects: None,
+		authorized_at: None,
+		outcome: None,
+	}
+}
+
+fn canonical_raw(bytes: &[u8]) -> Result<Box<RawValue>, AgentError> {
+	let value = serde_json::from_slice::<Value>(bytes)
+		.map_err(|_| AgentError::Protocol("invocation arguments are not one JSON document"))?;
+	serde_json::value::to_raw_value(&value)
+		.map_err(|_| AgentError::Protocol("invocation arguments cannot be canonicalized"))
+}
+
+fn effective_args(
+	requested: &RawValue,
+	patch: Option<&RawValue>,
+) -> Result<Box<RawValue>, AgentError> {
+	let mut value = serde_json::from_str::<Value>(requested.get())
+		.map_err(|_| AgentError::Protocol("canonical requested arguments became invalid"))?;
+	if let Some(patch) = patch {
+		let patch = serde_json::from_str::<Value>(patch.get())
+			.map_err(|_| AgentError::Protocol("admission patch is not valid JSON"))?;
+		apply_merge_patch(&mut value, patch);
+	}
+	serde_json::value::to_raw_value(&value)
+		.map_err(|_| AgentError::Protocol("effective arguments cannot be canonicalized"))
+}
+
+fn apply_merge_patch(target: &mut Value, patch: Value) {
+	let Value::Object(patch) = patch else {
+		*target = patch;
+		return;
+	};
+	if !target.is_object() {
+		*target = Value::Object(serde_json::Map::new());
+	}
+	let target = target
+		.as_object_mut()
+		.expect("target was normalized to an object");
+	for (key, value) in patch {
+		if value.is_null() {
+			target.remove(&key);
+		} else {
+			apply_merge_patch(target.entry(key).or_insert(Value::Null), value);
 		}
 	}
 }
@@ -1141,6 +1491,9 @@ fn committed_calls(
 			.ok_or(AgentError::Protocol("committed tool revision missing"))?;
 		if committed_rev != opened.identity().rev.to_string() {
 			return Err(AgentError::Protocol("committed tool revision changed"));
+		}
+		if opened.admission().is_none() {
+			return Err(AgentError::Protocol("committed tool lacked admission"));
 		}
 		committed.push(opened.commit(call.args_json.clone()));
 	}
@@ -1267,6 +1620,12 @@ fn follow_up_id(_root: &TurnId, _ordinal: u32) -> TurnId {
 	TurnId::new(ulid::Ulid::generate().to_string())
 }
 
+fn runtime_duration(duration: omp_core::Duration) -> Duration {
+	duration
+		.to_std()
+		.expect("agent runtime duration constants fit std::time::Duration")
+}
+
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -1286,7 +1645,9 @@ mod tests {
 	use bytes::Bytes;
 	use futures::stream;
 	use omp_storage::transcript::{Entry, Header, Kind, SessionId};
-	use omp_tool::{Claims, Constraint, ModelClass, Precedence, Presentation, Rev, ToolSpec};
+	use omp_tool::{
+		Claims, Constraint, Effects, ModelClass, Precedence, Presentation, Rev, ToolSpec,
+	};
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -1490,6 +1851,7 @@ mod tests {
 			description:     Str::from("test worker"),
 			schema:          Bytes::from_static(br#"{"type":"object"}"#),
 			constraint:      Constraint::None,
+			effects:         Effects::empty(),
 			projection_code: [0; 32],
 		}
 	}
@@ -1892,6 +2254,63 @@ mod tests {
 		assert!(input_contains_text(&opened[0].1, "replacement"));
 		assert!(!input_contains_text(&opened[0].1, "stale steering"));
 		drop(opened);
+		drop(agent);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn control_requests_complete_at_idle_and_active_turn_points() {
+		let (journal, path) = test_journal("control-mailbox");
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				outcome_script(end_outcome("idle drained")),
+				pending_text_script(),
+			]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent = Agent::new(
+			client,
+			env,
+			AgentState::new(crate::AgentSnapshot::default()),
+			journal,
+			test_caps(),
+		);
+		let control = agent.control();
+		let idle_request = tokio::spawn({
+			let control = control.clone();
+			async move { control.query(Vec::new()).await }
+		});
+		tokio::task::yield_now().await;
+		agent
+			.submit([message(thread::Role::User, "idle")], TurnId::new("idle"))
+			.await
+			.expect("idle turn");
+		assert!(
+			idle_request
+				.await
+				.expect("idle CONTROL task")
+				.expect("idle CONTROL request")
+				.is_empty()
+		);
+
+		let abort = agent.abort_handle();
+		let active = tokio::spawn(async move {
+			let result = agent
+				.submit([message(thread::Role::User, "active")], TurnId::new("active"))
+				.await;
+			(agent, result)
+		});
+		wait_for_opened(&opened, 2).await;
+		let rows = tokio::time::timeout(Duration::from_secs(1), control.query(Vec::new()))
+			.await
+			.expect("active CONTROL timeout")
+			.expect("active CONTROL request");
+		assert!(rows.is_empty());
+		abort.abort();
+		let (agent, result) = active.await.expect("active turn task");
+		assert!(matches!(result, Err(AgentError::Interrupted)));
 		drop(agent);
 		std::fs::remove_file(path).expect("remove journal");
 	}

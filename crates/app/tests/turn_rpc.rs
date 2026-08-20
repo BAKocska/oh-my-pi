@@ -40,8 +40,8 @@ use omp_llm_inference::{
 };
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 use omp_tool::{
-	Claims, Constraint, Ev, IncomingParams, LiftedCall, Part, Precedence, Presentation, PromptCaps,
-	RecordedCall, Rev, Tool, ToolSpec,
+	Claims, Constraint, Effects, Ev, IncomingParams, LiftedCall, Part, Precedence, Presentation,
+	PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
 };
 use tower::Service;
 
@@ -90,6 +90,7 @@ fn tool_registry() -> Arc<omp_tool::Registry> {
 					description:     Str::from("test shell"),
 					schema:          Bytes::from_static(br#"{"type":"object"}"#),
 					constraint:      Constraint::None,
+					effects:         Effects::empty(),
 					projection_code: [0; 32],
 				},
 			},
@@ -635,6 +636,7 @@ fn history_tool(n: u16, lifts_hl1: bool) -> HistoryTool {
 			description: Str::from(format!("history law revision {n}")),
 			schema,
 			constraint: Constraint::None,
+			effects: Effects::empty(),
 			projection_code: [0; 32],
 		},
 		lift_from: lifts_hl1.then(|| Rev { family: Str::from("hl"), n: 1 }),

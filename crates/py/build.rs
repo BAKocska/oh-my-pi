@@ -153,6 +153,55 @@ fn main() {
 	println!("cargo::rerun-if-changed={}", py_src.display());
 	println!("cargo::rerun-if-changed={}", requirements.display());
 	println!("cargo::rerun-if-changed={}", packer.display());
+
+	let url_vocab = manifest.join("../tools/url-vocab.json");
+	println!("cargo::rerun-if-changed={}", url_vocab.display());
+	let frozen_generated = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("frozen-python");
+	std::fs::create_dir_all(&frozen_generated).expect("create generated frozen-module directory");
+	let vocabulary: serde_json::Value = serde_json::from_str(
+		&std::fs::read_to_string(&url_vocab).expect("read canonical URL vocabulary"),
+	)
+	.expect("parse canonical URL vocabulary");
+	let mut vocabulary_module =
+		String::from("\"\"\"Generated canonical URL and selector vocabulary; do not edit.\"\"\"\n");
+	vocabulary_module.push_str(&format!(
+		"URL_VOCAB_VERSION = {}\nSELECTOR_GRAMMAR = {}\nSCHEMES = (\n",
+		vocabulary["version"]
+			.as_u64()
+			.expect("URL vocabulary version"),
+		serde_json::to_string(
+			vocabulary["selector_grammar"]
+				.as_str()
+				.expect("URL selector grammar"),
+		)
+		.expect("serialize selector grammar"),
+	));
+	for scheme in vocabulary["schemes"].as_array().expect("URL scheme rows") {
+		let member = scheme["member"].as_str().expect("URL scheme member");
+		let wire = scheme["wire"]
+			.as_array()
+			.expect("URL scheme wire spellings");
+		let selectors = scheme["selectors"].as_bool().expect("URL selector support");
+		let mut wire_values = wire
+			.iter()
+			.map(|value| serde_json::to_string(value.as_str().expect("URL wire spelling")))
+			.collect::<Result<Vec<_>, _>>()
+			.expect("serialize URL wire spellings")
+			.join(", ");
+		if wire.len() == 1 {
+			wire_values.push(',');
+		}
+		vocabulary_module.push_str(&format!(
+			"    ({}, ({}), {}),\n",
+			serde_json::to_string(member).expect("serialize URL member"),
+			wire_values,
+			if selectors { "True" } else { "False" },
+		));
+	}
+	vocabulary_module.push_str(")\n");
+	std::fs::write(frozen_generated.join("_omp_url_vocab.py"), vocabulary_module)
+		.expect("write generated frozen URL vocabulary");
+
 	let interpreter = ["python3.14td", "python3.14t"]
 		.iter()
 		.map(|name| vendor.join("install/bin").join(name))
@@ -162,6 +211,7 @@ fn main() {
 	let modules_blob = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("omp_modules.bin");
 	let mut pack = Command::new(interpreter);
 	pack.arg(&packer).arg(&py_src);
+	pack.arg(&frozen_generated);
 	if let Some(dir) = &bundled {
 		pack.arg(dir);
 	}

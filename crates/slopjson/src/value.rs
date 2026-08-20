@@ -3,10 +3,11 @@
 
 use std::{
 	fmt::{self, Write as _},
-	ops,
+	ops, slice,
 };
 
 use omp_core::Str;
+use serde::de::Error as _;
 
 /// A parsed JSON value. `Display` serializes back to compact JSON.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -106,6 +107,15 @@ impl Value {
 			Self::Object(object) => Some(object),
 			_ => None,
 		}
+	}
+
+	/// Deserialize a typed view directly from this tree without serializing or
+	/// reparsing it.
+	pub fn deserialize_into<'de, T>(&'de self) -> Result<T, serde::de::value::Error>
+	where
+		T: serde::Deserialize<'de>,
+	{
+		T::deserialize(self)
 	}
 }
 
@@ -595,5 +605,230 @@ impl<'de> serde::Deserialize<'de> for Value {
 		}
 
 		deserializer.deserialize_any(ValueVisitor)
+	}
+}
+
+struct ValueSeqAccess<'de> {
+	iter: slice::Iter<'de, Value>,
+}
+
+impl<'de> serde::de::SeqAccess<'de> for ValueSeqAccess<'de> {
+	type Error = serde::de::value::Error;
+
+	fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+	where
+		T: serde::de::DeserializeSeed<'de>,
+	{
+		self
+			.iter
+			.next()
+			.map(|value| seed.deserialize(value))
+			.transpose()
+	}
+
+	fn size_hint(&self) -> Option<usize> {
+		Some(self.iter.len())
+	}
+}
+
+struct ValueMapAccess<'de> {
+	iter:  ObjectIter<'de>,
+	value: Option<&'de Value>,
+}
+
+impl<'de> serde::de::MapAccess<'de> for ValueMapAccess<'de> {
+	type Error = serde::de::value::Error;
+
+	fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+	where
+		K: serde::de::DeserializeSeed<'de>,
+	{
+		let Some((key, value)) = self.iter.next() else {
+			return Ok(None);
+		};
+		self.value = Some(value);
+		seed
+			.deserialize(serde::de::value::BorrowedStrDeserializer::new(key.as_str()))
+			.map(Some)
+	}
+
+	fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::DeserializeSeed<'de>,
+	{
+		let value = self
+			.value
+			.take()
+			.ok_or_else(|| serde::de::value::Error::custom("value requested before map key"))?;
+		seed.deserialize(value)
+	}
+
+	fn size_hint(&self) -> Option<usize> {
+		Some(self.iter.len())
+	}
+}
+
+struct ValueEnumAccess<'de> {
+	key:   &'de str,
+	value: Option<&'de Value>,
+}
+
+impl<'de> serde::de::EnumAccess<'de> for ValueEnumAccess<'de> {
+	type Error = serde::de::value::Error;
+	type Variant = ValueVariantAccess<'de>;
+
+	fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
+	where
+		V: serde::de::DeserializeSeed<'de>,
+	{
+		let variant = seed.deserialize(serde::de::value::BorrowedStrDeserializer::new(self.key))?;
+		Ok((variant, ValueVariantAccess { value: self.value }))
+	}
+}
+
+struct ValueVariantAccess<'de> {
+	value: Option<&'de Value>,
+}
+
+impl<'de> serde::de::VariantAccess<'de> for ValueVariantAccess<'de> {
+	type Error = serde::de::value::Error;
+
+	fn unit_variant(self) -> Result<(), Self::Error> {
+		match self.value {
+			None | Some(Value::Null) => Ok(()),
+			Some(value) => serde::Deserialize::deserialize(value),
+		}
+	}
+
+	fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
+	where
+		T: serde::de::DeserializeSeed<'de>,
+	{
+		seed.deserialize(
+			self
+				.value
+				.ok_or_else(|| serde::de::value::Error::custom("missing enum newtype value"))?,
+		)
+	}
+
+	fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		serde::Deserializer::deserialize_seq(
+			self
+				.value
+				.ok_or_else(|| serde::de::value::Error::custom("missing enum tuple value"))?,
+			visitor,
+		)
+	}
+
+	fn struct_variant<V>(
+		self,
+		_fields: &'static [&'static str],
+		visitor: V,
+	) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		serde::Deserializer::deserialize_map(
+			self
+				.value
+				.ok_or_else(|| serde::de::value::Error::custom("missing enum struct value"))?,
+			visitor,
+		)
+	}
+}
+
+impl<'de> serde::Deserializer<'de> for &'de Value {
+	type Error = serde::de::value::Error;
+
+	serde::forward_to_deserialize_any! {
+		bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+		byte_buf unit unit_struct seq tuple tuple_struct map struct
+	}
+
+	fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		match self {
+			Value::Null => visitor.visit_unit(),
+			Value::Bool(value) => visitor.visit_bool(*value),
+			Value::Number(number) => {
+				if let Some(value) = number.as_u64() {
+					visitor.visit_u64(value)
+				} else if let Some(value) = number.as_i64() {
+					visitor.visit_i64(value)
+				} else {
+					visitor.visit_f64(number.as_f64())
+				}
+			},
+			Value::String(value) => visitor.visit_borrowed_str(value),
+			Value::Array(values) => visitor.visit_seq(ValueSeqAccess { iter: values.iter() }),
+			Value::Object(object) => {
+				visitor.visit_map(ValueMapAccess { iter: object.iter(), value: None })
+			},
+		}
+	}
+
+	fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		if matches!(self, Value::Null) {
+			visitor.visit_none()
+		} else {
+			visitor.visit_some(self)
+		}
+	}
+
+	fn deserialize_newtype_struct<V>(
+		self,
+		_name: &'static str,
+		visitor: V,
+	) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		visitor.visit_newtype_struct(self)
+	}
+
+	fn deserialize_enum<V>(
+		self,
+		_name: &'static str,
+		_variants: &'static [&'static str],
+		visitor: V,
+	) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		match self {
+			Value::String(key) => {
+				visitor.visit_enum(ValueEnumAccess { key: key.as_str(), value: None })
+			},
+			Value::Object(object) if object.len() == 1 => {
+				let (key, value) = object.iter().next().expect("length checked");
+				visitor.visit_enum(ValueEnumAccess { key: key.as_str(), value: Some(value) })
+			},
+			_ => Err(serde::de::value::Error::custom("expected enum string or single-key object")),
+		}
+	}
+
+	fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		match self {
+			Value::String(value) => visitor.visit_borrowed_str(value),
+			_ => self.deserialize_any(visitor),
+		}
+	}
+
+	fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+	where
+		V: serde::de::Visitor<'de>,
+	{
+		visitor.visit_unit()
 	}
 }

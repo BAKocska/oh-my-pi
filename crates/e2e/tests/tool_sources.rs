@@ -39,7 +39,11 @@ async fn invoke_ok(
 	within(
 		"committing built-in arguments",
 		DEFAULT_TIMEOUT,
-		invocation.commit_args(Bytes::from(serde_json::to_vec(&args)?)),
+		invocation.commit_args(
+			Bytes::from(serde_json::to_vec(&args)?),
+			Bytes::from_static(b"tool-sources-test-token"),
+			1000,
+		),
 	)
 	.await??;
 	loop {
@@ -55,8 +59,8 @@ async fn invoke_ok(
 			},
 			Some(InvocationEvent::Update(_)) => {},
 			Some(InvocationEvent::Accepted(_)) => bail!("built-in invocation was accepted twice"),
-			Some(InvocationEvent::StreamError(error)) => {
-				bail!("built-in stream failed: {}", error.message)
+			Some(InvocationEvent::Admission(_)) => {
+				bail!("unexpected admission in built-in invocation")
 			},
 			None => bail!("built-in invocation closed before its verdict"),
 		}

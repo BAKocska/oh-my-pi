@@ -5320,6 +5320,7 @@ dependencies = [
  "notify",
  "omp-ast",
  "omp-core",
+ "omp-env",
  "omp-hashline",
  "omp-proto",
  "parking_lot",
@@ -5386,12 +5387,16 @@ dependencies = [
 name = "omp-env"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "flume",
  "omp-core",
  "omp-proto",
  "parking_lot",
  "thiserror 2.0.20",
+ "tokio",
+ "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5558,8 +5563,14 @@ dependencies = [
 name = "omp-py"
 version = "0.1.0"
 dependencies = [
+ "omp-core",
+ "omp-env",
+ "omp-storage",
+ "omp-tool",
+ "parking_lot",
  "pyo3",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -5731,14 +5742,19 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "flume",
+ "fs2",
  "omp-core",
  "omp-proto",
  "omp-tool",
+ "parking_lot",
  "pretty_assertions",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
+ "strum",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -5777,6 +5793,7 @@ dependencies = [
  "omp-llm-inference",
  "omp-proto",
  "omp-slopjson",
+ "parking_lot",
  "schemars",
  "serde",
  "serde_json",

@@ -38,6 +38,9 @@ url = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
 
+[target.'cfg(windows)'.dependencies]
+omp-env = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

@@ -116,3 +116,32 @@ message PolicyDenied {
   repeated string rules = 4;
   omp.inference.v1.ValueMap props = 15;
 }
+
+// Narrow effect authority captured at EFFECTS_AUTHORIZED. Absence of a domain
+// grants no authority in that domain.
+message DocEffects {
+  bool read = 1;
+  repeated string write_globs = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ExecEffects {
+  repeated string commands = 1;
+  bool network = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message InferenceEffects {
+  uint32 max_requests = 1;
+  // Canonical decimal spelling; never an IEEE-754 approximation.
+  string max_usd = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message EffectEnvelope {
+  optional DocEffects documents = 1;
+  optional ExecEffects exec = 2;
+  optional InferenceEffects inference = 3;
+  uint32 subagents = 4;
+  omp.inference.v1.ValueMap props = 15;
+}

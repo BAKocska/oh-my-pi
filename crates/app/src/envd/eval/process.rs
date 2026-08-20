@@ -15,7 +15,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Duration as OmpDuration, DurationError, Str};
 use omp_tools::eval::{
 	CellOutcome, CellStatus, EvalExec, EvalRun, Fault, PythonException, RunCompletion, RunEvent,
 	RunRequest, Session, Update, idle_timeout::TimeoutHandle, kernel::EmbeddedPython,
@@ -40,7 +40,6 @@ use super::bridge::{
 pub const EVAL_CHILD_ARG: &str = "__omp-eval-child";
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const CHILD_TIMEOUT_EXIT: i32 = 124;
 
 /// Production [`EvalExec`] that owns one killable same-binary child per
@@ -51,10 +50,11 @@ pub struct ProcessEvalExec {
 }
 
 struct ProcessEvalInner {
-	executable: PathBuf,
-	host:       Arc<SessionBridgeHost>,
-	sessions:   Mutex<HashMap<Bytes, Arc<ProcessSession>>>,
-	next_cell:  AtomicU64,
+	executable:      PathBuf,
+	host:            Arc<SessionBridgeHost>,
+	interrupt_grace: OmpDuration,
+	sessions:        Mutex<HashMap<Bytes, Arc<ProcessSession>>>,
+	next_cell:       AtomicU64,
 }
 
 struct ProcessSession {
@@ -75,17 +75,26 @@ pub struct ProcessEvalRun {
 impl ProcessEvalExec {
 	/// Resolves the real `omp` executable and constructs the production
 	/// resource.
-	pub fn production(host: Arc<SessionBridgeHost>) -> Result<Self, io::Error> {
-		resolve_omp_executable().map(|executable| Self::new(executable, host))
+	pub fn production(
+		host: Arc<SessionBridgeHost>,
+		interrupt_grace: OmpDuration,
+	) -> Result<Self, io::Error> {
+		resolve_omp_executable().map(|executable| Self::new(executable, host, interrupt_grace))
 	}
 
-	/// Constructs the resource with an explicit same-binary executable.
+	/// Constructs the resource with an explicit same-binary executable and the
+	/// resolved runtime cancellation grace.
 	#[must_use]
-	pub fn new(executable: PathBuf, host: Arc<SessionBridgeHost>) -> Self {
+	pub fn new(
+		executable: PathBuf,
+		host: Arc<SessionBridgeHost>,
+		interrupt_grace: OmpDuration,
+	) -> Self {
 		Self {
 			inner: Arc::new(ProcessEvalInner {
 				executable,
 				host,
+				interrupt_grace,
 				sessions: Mutex::new(HashMap::new()),
 				next_cell: AtomicU64::new(1),
 			}),
@@ -132,6 +141,7 @@ impl EvalExec for ProcessEvalExec {
 		let task_cancelled = cancelled.clone();
 		let executable = self.inner.executable.clone();
 		let host = Arc::clone(&self.inner.host);
+		let interrupt_grace = self.inner.interrupt_grace;
 		tokio::spawn(async move {
 			let _gate = gate;
 			if task_cancelled.is_cancelled() {
@@ -145,7 +155,8 @@ impl EvalExec for ProcessEvalExec {
 				stale.terminate().await;
 			}
 			if child_slot.is_none() {
-				match EvalChild::spawn(&executable, &owned.id, Arc::clone(&host)).await {
+				match EvalChild::spawn(&executable, &owned.id, Arc::clone(&host), interrupt_grace).await
+				{
 					Ok(child) => *child_slot = Some(child),
 					Err(error) => {
 						owned.needs_reset.store(true, Ordering::Release);
@@ -200,20 +211,14 @@ impl EvalRun for ProcessEvalRun {
 	}
 }
 
-impl Drop for ProcessEvalRun {
-	fn drop(&mut self) {
-		if !self.terminal {
-			self.cancelled.cancel();
-		}
-	}
-}
 struct EvalChild {
-	child:         Child,
-	stdin:         ChildStdin,
-	stdout:        ChildStdout,
-	token:         Str,
-	next_run:      AtomicU64,
-	process_group: Option<u32>,
+	child:           Child,
+	stdin:           ChildStdin,
+	stdout:          ChildStdout,
+	token:           Str,
+	next_run:        AtomicU64,
+	process_group:   Option<u32>,
+	interrupt_grace: Duration,
 }
 
 impl EvalChild {
@@ -221,7 +226,9 @@ impl EvalChild {
 		executable: &Path,
 		session_id: &Bytes,
 		host: Arc<SessionBridgeHost>,
+		interrupt_grace: OmpDuration,
 	) -> Result<Self, ProcessError> {
+		let interrupt_grace_std = interrupt_grace.to_std()?;
 		let capabilities = host.capabilities()?.allowed_names();
 		let config = host.session_config().map(WireSessionConfig::from);
 		let token = Str::from(Ulid::generate().to_string());
@@ -259,12 +266,14 @@ impl EvalChild {
 			token: token.clone(),
 			next_run: AtomicU64::new(1),
 			process_group,
+			interrupt_grace: interrupt_grace_std,
 		};
 		write_frame(&mut process.stdin, &ParentFrame::Init {
 			token,
 			session_id: session_id.clone(),
 			capabilities,
 			config,
+			interrupt_grace: Str::from(interrupt_grace.to_string()),
 		})
 		.await?;
 		match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut process.stdout)).await {
@@ -291,13 +300,23 @@ impl EvalChild {
 		let run_id = self.next_run.fetch_add(1, Ordering::Relaxed);
 		let started = Instant::now();
 		let timeout = TimeoutHandle::new(request.timeout);
+		let timeout_ns = match request
+			.timeout
+			.map(|duration| u64::try_from(duration.as_nanos()))
+			.transpose()
+		{
+			Ok(timeout_ns) => timeout_ns,
+			Err(_) => {
+				let _ = events
+					.send(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow))));
+				return false;
+			},
+		};
 		if let Err(error) = write_frame(&mut self.stdin, &ParentFrame::Run {
 			run_id,
 			cell_id: cell_id.clone(),
 			code: request.code,
-			timeout_ms: request
-				.timeout
-				.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+			timeout_ns,
 			reset: request.reset,
 		})
 		.await
@@ -312,10 +331,12 @@ impl EvalChild {
 				() = cancelled.cancelled() => {
 					needs_reset.store(true, Ordering::Release);
 					timeout.dispose();
+					tokio::time::sleep(self.interrupt_grace).await;
 					return false;
 				},
 				() = timeout.expired() => {
 					needs_reset.store(true, Ordering::Release);
+					tokio::time::sleep(self.interrupt_grace).await;
 					let _ = events.send(Ok(RunEvent::Completed(Box::new(timeout_completion(elapsed_ms(started))))));
 					return false;
 				},
@@ -429,7 +450,6 @@ impl EvalChild {
 				ChildFrame::Fatal { message } => {
 					needs_reset.store(true, Ordering::Release);
 					let _ = events.send(Err(Fault::SessionLost { message }));
-					return false;
 				},
 				_ => {
 					needs_reset.store(true, Ordering::Release);
@@ -461,7 +481,7 @@ impl EvalChild {
 			}
 		}
 
-		if tokio::time::timeout(TERMINATE_GRACE, self.child.wait())
+		if tokio::time::timeout(self.interrupt_grace, self.child.wait())
 			.await
 			.is_ok_and(|status| status.is_ok())
 		{
@@ -502,16 +522,17 @@ impl Drop for EvalChild {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ParentFrame {
 	Init {
-		token:        Str,
-		session_id:   Bytes,
-		capabilities: Vec<Str>,
-		config:       Option<WireSessionConfig>,
+		token:           Str,
+		session_id:      Bytes,
+		capabilities:    Vec<Str>,
+		config:          Option<WireSessionConfig>,
+		interrupt_grace: Str,
 	},
 	Run {
 		run_id:     u64,
 		cell_id:    Bytes,
 		code:       Str,
-		timeout_ms: Option<u64>,
+		timeout_ns: Option<u64>,
 		reset:      bool,
 	},
 	BridgeResponse {
@@ -637,15 +658,22 @@ impl ChildBridgeTransport for ChildBridgeHost {
 /// Runs the hidden eval child entry before ordinary CLI or telemetry startup.
 pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 	let mut stdin = tokio::io::stdin();
-	let (token, capabilities, config) = match read_frame::<_, ParentFrame>(&mut stdin).await? {
-		Some(ParentFrame::Init { token, session_id: _, capabilities, config }) => {
-			(token, capabilities, config)
-		},
-		Some(_) => {
-			return Err(ProcessError::Protocol(Str::from("Init must be the first eval child frame")));
-		},
-		None => return Ok(()),
-	};
+	let (token, capabilities, config, interrupt_grace) =
+		match read_frame::<_, ParentFrame>(&mut stdin).await? {
+			Some(ParentFrame::Init {
+				token,
+				session_id: _,
+				capabilities,
+				config,
+				interrupt_grace,
+			}) => (token, capabilities, config, interrupt_grace.parse::<OmpDuration>()?),
+			Some(_) => {
+				return Err(ProcessError::Protocol(Str::from(
+					"Init must be the first eval child frame",
+				)));
+			},
+			None => return Ok(()),
+		};
 	let (outgoing, outgoing_rx) = flume::unbounded();
 	let child_host = Arc::new(ChildBridgeHost {
 		token,
@@ -670,7 +698,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 		.init()
 		.map(Arc::new)
 		.map_err(|error| ProcessError::Python(Str::from(error.to_string())))?;
-	let eval = EmbeddedPython::with_installer(engine, installer);
+	let eval = EmbeddedPython::with_installer(engine, installer, interrupt_grace)?;
 	let session = eval.open_session().await.map_err(ProcessError::Eval)?;
 	child_host
 		.outgoing
@@ -679,7 +707,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 	let active = Arc::new(AtomicBool::new(false));
 	loop {
 		match read_frame::<_, ParentFrame>(&mut stdin).await? {
-			Some(ParentFrame::Run { run_id, cell_id, code, timeout_ms, reset }) => {
+			Some(ParentFrame::Run { run_id, cell_id, code, timeout_ns, reset }) => {
 				if active.swap(true, Ordering::AcqRel) {
 					child_host
 						.outgoing
@@ -693,7 +721,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 				let mut run = match eval
 					.run(&session, RunRequest {
 						code,
-						timeout: timeout_ms.map(Duration::from_millis),
+						timeout: timeout_ns.map(Duration::from_nanos),
 						reset,
 					})
 					.await
@@ -779,6 +807,9 @@ pub enum ProcessError {
 	/// The child could not initialize embedded Python.
 	#[error("eval child embedded Python failed: {0}")]
 	Python(Str),
+	/// A configured or serialized duration was not representable.
+	#[error("eval child duration failed: {0}")]
+	Duration(#[from] DurationError),
 	/// The child's embedded eval kernel rejected an operation.
 	#[error("eval child kernel failed: {0:?}")]
 	Eval(Fault),

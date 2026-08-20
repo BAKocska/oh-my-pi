@@ -7,6 +7,7 @@ import "omp/env/v1/env.proto";
 import "omp/inference/v1/common.proto";
 import "omp/inference/v1/inference.proto";
 import "omp/inference/v1/models.proto";
+import "omp/policy/v1/policy.proto";
 import "omp/telemetry/v1/telemetry.proto";
 import "omp/thread/v1/thread.proto";
 import "omp/ui/v1/ui.proto";
@@ -87,6 +88,8 @@ message ToolDecl {
   string docs = 8;
   repeated ToolExample examples = 9;
   bool streams_args = 10;
+  // Maximum device envelope; Core may only narrow it at authorization.
+  optional omp.policy.v1.EffectEnvelope effects = 11;
   omp.inference.v1.ValueMap props = 15;
 }
 
@@ -219,15 +222,145 @@ message SetAvailability {
   repeated AvailabilityDelta deltas = 1;
   omp.inference.v1.ValueMap props = 15;
 }
+
+// Sent after Core exact-validates the import-time RegisterTools declaration
+// against the manifest. It seals the registry; there is no separate VERIFY
+// callback.
+message FreezeDeclarations {
+  string extension_id = 1;
+  uint64 generation = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+enum ActivateReason {
+  ACTIVATE_REASON_UNSPECIFIED = 0;
+  ACTIVATE_REASON_FIRST_REACH = 1;
+  ACTIVATE_REASON_RESTART = 2;
+  ACTIVATE_REASON_HOT_RELOAD = 3;
+}
+
+// Fine-grained supervisor cause. ActivateReason remains the coarse class an
+// extension branches on; a restarted child cannot derive this cause itself.
+enum RestartReason {
+  RESTART_REASON_UNSPECIFIED = 0;
+  RESTART_REASON_CRASH = 1;
+  RESTART_REASON_CANCEL_ESCALATION = 2;
+  RESTART_REASON_PROTOCOL_ERROR = 3;
+  RESTART_REASON_OOM = 4;
+  RESTART_REASON_HEALTH_TIMEOUT = 5;
+  RESTART_REASON_HOT_RELOAD = 6;
+}
+
+message PrincipalRef {
+  string id = 1;
+  string display = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ActivateExtension {
+  string extension_id = 1;
+  ActivateReason reason = 2;
+  uint64 session_started_at_ms = 3;
+  uint64 generation = 4;
+  PrincipalRef principal = 5;
+  optional RestartReason restart_reason = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ExtensionActivated {
+  string extension_id = 1;
+  uint64 generation = 2;
+  bool degraded = 3;
+  optional string error = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Each CONTROL hop uses the outer frame request_id. caller_request_id bridges
+// the Core→provider hop back to the original caller hop; it never replaces
+// outer correlation.
+message ServiceCall {
+  string extension_id = 1;
+  string service = 2;
+  uint32 rev = 3;
+  string method = 4;
+  bytes payload = 5;
+  uint64 deadline_ms = 6;
+  uint64 host_generation = 7;
+  uint64 session_generation = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ServiceReply {
+  bytes payload = 1;
+  optional ProtocolError error = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ServiceDispatch {
+  string provider_extension_id = 1;
+  string service = 2;
+  uint32 rev = 3;
+  string method = 4;
+  bytes payload = 5;
+  uint64 deadline_ms = 6;
+  uint64 caller_request_id = 7;
+  uint64 caller_host_generation = 8;
+  uint64 session_generation = 9;
+  uint64 provider_generation = 10;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ServiceResult {
+  uint64 caller_request_id = 1;
+  uint64 provider_generation = 2;
+  bytes payload = 3;
+  optional ProtocolError error = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message QuotaStatus {
+  string name = 1;
+  uint64 limit = 2;
+  uint64 used = 3;
+  optional uint64 window_ms = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message QuotaDrop {
+  string name = 1;
+  uint64 count = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ResourceUpdate {
+  string extension_id = 1;
+  repeated QuotaStatus quotas = 2;
+  repeated QuotaDrop dropped = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message ResourceQuery {
+  string extension_id = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
 message LifecycleHostEnvelope {
   oneof body {
     AdmitExtensions admit_extensions = 1;
+    FreezeDeclarations freeze_declarations = 2;
+    ActivateExtension activate_extension = 3;
+    ServiceReply service_reply = 4;
+    ResourceUpdate resource_update = 5;
+    ServiceDispatch service_dispatch = 6;
   }
   omp.inference.v1.ValueMap props = 15;
 }
 message LifecycleWorkerEnvelope {
   oneof body {
     SetAvailability set_availability = 1;
+    ExtensionActivated extension_activated = 2;
+    ServiceCall service_call = 3;
+    ResourceQuery resource_query = 4;
+    ServiceResult service_result = 5;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -816,6 +949,54 @@ message ArtifactRow {
   bool terminal = 6;
   omp.inference.v1.ValueMap props = 15;
 }
+
+enum StateScope {
+  STATE_SCOPE_UNSPECIFIED = 0;
+  STATE_SCOPE_SESSION = 1;
+  STATE_SCOPE_PROJECT = 2;
+  STATE_SCOPE_USER = 3;
+  STATE_SCOPE_ORGANIZATION = 4;
+}
+
+message StateGet {
+  StateScope scope = 1;
+  string namespace = 2;
+  string key = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message StateCas {
+  StateScope scope = 1;
+  string namespace = 2;
+  string key = 3;
+  uint64 expected_revision = 4;
+  bytes value_json = 5;
+  string idempotency_key = 6;
+  uint64 host_generation = 7;
+  uint64 session_generation = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message StateWatch {
+  StateScope scope = 1;
+  string namespace = 2;
+  string key = 3;
+  uint64 after_revision = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message StateValue {
+  uint64 revision = 1;
+  bytes value_json = 2;
+  bool present = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message StateChanged {
+  uint64 revision = 1;
+  bytes value_json = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
 message JournalWorkerEnvelope {
   oneof body {
     DeclareEntryKinds declare_entry_kinds = 1;
@@ -828,6 +1009,9 @@ message JournalWorkerEnvelope {
     StatArtifact stat_artifact = 8;
     ListArtifacts list_artifacts = 9;
     PinArtifact pin_artifact = 10;
+    StateGet state_get = 11;
+    StateCas state_cas = 12;
+    StateWatch state_watch = 13;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -838,6 +1022,8 @@ message JournalHostEnvelope {
     SessionRow session_row = 3;
     UsageReport usage_report = 4;
     ArtifactRow artifact_row = 5;
+    StateValue state_value = 6;
+    StateChanged state_changed = 7;
   }
   omp.inference.v1.ValueMap props = 15;
 }

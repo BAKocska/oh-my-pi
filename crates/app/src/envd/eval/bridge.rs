@@ -862,7 +862,7 @@ mod tests {
 	use async_stream::stream;
 	use futures::Stream;
 	use omp_tool::{
-		Claims, Constraint, Ev, Precedence, Presentation, Rev, Tool, ToolSpec, ToolTerminal,
+		Claims, Constraint, Effects, Ev, Precedence, Presentation, Rev, Tool, ToolSpec, ToolTerminal,
 	};
 	use serde::{Deserialize, Deserializer, Serialize};
 
@@ -950,6 +950,7 @@ mod tests {
 						br#"{"type":"object","additionalProperties":false}"#,
 					),
 					constraint:      Constraint::None,
+					effects:         Effects::empty(),
 					projection_code: [0; 32],
 				},
 				invalid,

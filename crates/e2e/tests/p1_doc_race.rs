@@ -256,7 +256,11 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 	within(
 		"committing snapshot read",
 		TEST_TIMEOUT,
-		invocation.commit_args(Bytes::from(serde_json::to_vec(&serde_json::json!({"path": path}))?)),
+		invocation.commit_args(
+			Bytes::from(serde_json::to_vec(&serde_json::json!({"path": path}))?),
+			Bytes::from_static(b"doc-race-test-token"),
+			1000,
+		),
 	)
 	.await??;
 	loop {
@@ -293,8 +297,8 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 			Some(InvocationEvent::Accepted(_)) => {
 				return Err(anyhow!("snapshot read was accepted twice"));
 			},
-			Some(InvocationEvent::StreamError(error)) => {
-				return Err(anyhow!("snapshot read stream failed: {}", error.message));
+			Some(InvocationEvent::Admission(_)) => {
+				return Err(anyhow!("unexpected admission query during snapshot read"));
 			},
 			None => return Err(anyhow!("snapshot read closed before its verdict")),
 		}

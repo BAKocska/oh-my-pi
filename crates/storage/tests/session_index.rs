@@ -1,0 +1,496 @@
+use std::{
+	io,
+	sync::{
+		Arc, Barrier,
+		atomic::{AtomicBool, Ordering},
+	},
+};
+
+use omp_core::Str;
+use omp_proto::inference::v1 as pb;
+use omp_storage::{
+	index::{
+		EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError, JournalPosition,
+		NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind, UsageBucketWidth,
+		UsageDimension, UsageQuery,
+	},
+	transcript::{SessionId, TitleSource},
+};
+use smallvec::smallvec;
+use tempfile::tempdir;
+
+fn session_id(value: &str) -> SessionId {
+	SessionId(Str::from(value))
+}
+
+fn create(index: &SessionIndex, id: &SessionId) {
+	create_after_journal(index, id, || {});
+}
+
+fn create_after_journal(index: &SessionIndex, id: &SessionId, after_journal: impl FnOnce()) {
+	index
+		.create_session(
+			&NewSession {
+				id,
+				cwd: "/workspace/project",
+				project: "/workspace/project",
+				created_ms: 1_000,
+				kind: SessionKind::Interactive,
+				parent: None,
+				remote: false,
+			},
+			|| {
+				after_journal();
+				Ok::<_, io::Error>(((), 64))
+			},
+		)
+		.expect("write header and session index row");
+}
+
+fn outcome(input: u64, output: u64) -> pb::Outcome {
+	pb::Outcome {
+		provider: "anthropic".to_owned(),
+		model: "claude-opus".to_owned(),
+		duration_ms: Some(250),
+		usage: Some(pb::Usage {
+			input_tokens:       input,
+			output_tokens:      output,
+			cache_read_tokens:  3,
+			cache_write_tokens: 4,
+			accuracy:           pb::usage::Accuracy::Exact as i32,
+			detail:             Some(pb::ValueMap {
+				fields: [("anthropic/service_tier".to_owned(), pb::Value {
+					kind: Some(pb::value::Kind::String("standard".to_owned())),
+				})]
+				.into_iter()
+				.collect(),
+			}),
+			total_tokens:       Some(input + output + 7),
+			context_tokens:     Some(8_192),
+			orchestration:      Some(pb::OrchestrationUsage {
+				input_tokens:      Some(5),
+				cache_read_tokens: Some(6),
+				output_tokens:     Some(7),
+			}),
+			premium_requests:   Some(1),
+			reasoning_tokens:   Some(2),
+			cache_ttl:          Some(pb::CacheTtlUsage {
+				ephemeral_5m_tokens: Some(8),
+				ephemeral_1h_tokens: Some(9),
+			}),
+			server_tools:       Some(pb::ServerToolUsage {
+				web_search_requests: Some(10),
+				web_fetch_requests:  Some(11),
+			}),
+		}),
+		cost: Some(pb::Cost {
+			nanos_usd:             1_000,
+			estimated:             false,
+			input_nanos_usd:       Some(400),
+			output_nanos_usd:      Some(500),
+			cache_read_nanos_usd:  Some(40),
+			cache_write_nanos_usd: Some(60),
+		}),
+		..pb::Outcome::default()
+	}
+}
+
+fn receipt_event<'a>(id: &'a SessionId, outcome: &'a pb::Outcome, ts_ms: u64) -> IndexedEvent<'a> {
+	IndexedEvent {
+		session: id,
+		ts_ms,
+		kind: "omp.turn_receipt",
+		projection: EventProjection::TurnReceipt { outcome, failed: false },
+	}
+}
+
+#[test]
+fn failed_journal_header_does_not_publish_a_session_row() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("failed-header");
+	let result = index.create_session(
+		&NewSession {
+			id:         &id,
+			cwd:        "/workspace",
+			project:    "/workspace",
+			created_ms: 1,
+			kind:       SessionKind::Interactive,
+			parent:     None,
+			remote:     false,
+		},
+		|| Err::<((), u64), _>(io::Error::other("disk full")),
+	);
+	assert!(matches!(result, Err(IndexedWriteError::Journal(_))));
+	assert!(
+		index
+			.list(&SessionFilter::default())
+			.expect("list index only")
+			.sessions
+			.is_empty()
+	);
+}
+
+#[test]
+fn failed_receipt_append_rolls_back_every_index_projection() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("failed-receipt");
+	create(&index, &id);
+	let outcome = outcome(13, 21);
+	let result = index.append(&receipt_event(&id, &outcome, 2_000), || {
+		Err::<((), JournalPosition), _>(io::Error::other("journal write failed"))
+	});
+	assert!(matches!(result, Err(IndexedWriteError::Journal(_))));
+
+	let page = index
+		.list(&SessionFilter::default())
+		.expect("list index only");
+	assert_eq!(page.sessions.len(), 1);
+	assert_eq!(page.sessions[0].entries, 0);
+	assert_eq!(page.sessions[0].turns, 0);
+	assert_eq!(page.sessions[0].journal_watermark, 64);
+	assert_eq!(index.receipt(&id, 0).expect("query receipt"), None);
+}
+
+#[test]
+fn receipt_persists_canonical_usage_and_sql_groups_every_scalar_field() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("accounting");
+	create(&index, &id);
+	let first = outcome(13, 21);
+	let second = outcome(34, 55);
+	index
+		.append(&receipt_event(&id, &first, 3_600_001), || {
+			Ok::<_, io::Error>(((), JournalPosition { event_index: 0, byte_watermark: 256 }))
+		})
+		.expect("append first receipt");
+	index
+		.append(&receipt_event(&id, &second, 3_600_002), || {
+			Ok::<_, io::Error>(((), JournalPosition { event_index: 1, byte_watermark: 512 }))
+		})
+		.expect("append second receipt");
+
+	let exact = index
+		.receipt(&id, 0)
+		.expect("query exact receipt")
+		.expect("receipt row");
+	assert_eq!(exact.usage, first.usage.expect("fixture usage"));
+	assert_eq!(exact.cost, first.cost.expect("fixture cost"));
+	let sessions = index
+		.list(&SessionFilter::default())
+		.expect("list from index rows");
+	assert_eq!(sessions.sessions[0].usage.input_tokens, 47);
+	assert_eq!(sessions.sessions[0].cost.nanos_usd, 2_000);
+	assert_eq!(sessions.sessions[0].models.as_slice(), [Str::from("anthropic/claude-opus")]);
+
+	let buckets = index
+		.usage(&UsageQuery {
+			group_by: smallvec![UsageDimension::Provider, UsageDimension::Model],
+			bucket: UsageBucketWidth::Hour,
+			..UsageQuery::default()
+		})
+		.expect("aggregate from SQLite rows");
+	assert_eq!(buckets.len(), 1);
+	let bucket = &buckets[0];
+	assert_eq!(bucket.start_ms, Some(3_600_000));
+	assert_eq!(bucket.requests, 2);
+	assert_eq!(bucket.sessions, 1);
+	assert_eq!(bucket.duration_ms, 500);
+	assert_eq!(bucket.usage.input_tokens, 47);
+	assert_eq!(bucket.usage.output_tokens, 76);
+	assert_eq!(bucket.usage.cache_read_tokens, 6);
+	assert_eq!(bucket.usage.cache_write_tokens, 8);
+	assert_eq!(bucket.usage.premium_requests, Some(2));
+	assert_eq!(bucket.usage.reasoning_tokens, Some(4));
+	assert!(matches!(
+		bucket
+			.usage
+			.detail
+			.as_ref()
+			.and_then(|detail| detail.fields.get("anthropic/service_tier"))
+			.and_then(|value| value.kind.as_ref()),
+		Some(pb::value::Kind::String(value)) if value == "standard"
+	));
+	assert_eq!(
+		bucket
+			.usage
+			.orchestration
+			.as_ref()
+			.and_then(|usage| usage.input_tokens),
+		Some(10)
+	);
+	assert_eq!(
+		bucket
+			.usage
+			.cache_ttl
+			.as_ref()
+			.and_then(|usage| usage.ephemeral_1h_tokens),
+		Some(18)
+	);
+	assert_eq!(
+		bucket
+			.usage
+			.server_tools
+			.as_ref()
+			.and_then(|usage| usage.web_fetch_requests),
+		Some(22)
+	);
+	assert_eq!(bucket.cost.nanos_usd, 2_000);
+	assert_eq!(bucket.cost.input_nanos_usd, Some(800));
+}
+
+#[test]
+fn index_failure_after_journal_rolls_back_partial_sql_transaction() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("missing-usage");
+	create(&index, &id);
+	let outcome = pb::Outcome {
+		provider: "provider".to_owned(),
+		model: "model".to_owned(),
+		..pb::Outcome::default()
+	};
+	let event = receipt_event(&id, &outcome, 2_000);
+	let result = index.append(&event, || {
+		Ok::<_, io::Error>(("durable", JournalPosition { event_index: 0, byte_watermark: 128 }))
+	});
+	assert!(matches!(
+		result,
+		Err(IndexedWriteError::IndexAfterJournal {
+			written:  "durable",
+			position: Some(JournalPosition { event_index: 0, byte_watermark: 128 }),
+			source:   omp_storage::index::Error::MissingUsage,
+		})
+	));
+	let page = index
+		.list(&SessionFilter::default())
+		.expect("list rolled-back index");
+	assert_eq!(page.sessions[0].entries, 0);
+	assert_eq!(page.sessions[0].turns, 0);
+	assert!(
+		index
+			.receipt(&id, 0)
+			.expect("query rolled-back receipt")
+			.is_none()
+	);
+}
+
+#[test]
+fn title_and_contains_kind_are_updated_only_after_journal_success() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("title");
+	create(&index, &id);
+	let failed = IndexedEvent {
+		session:    &id,
+		ts_ms:      2_000,
+		kind:       "omp.title",
+		projection: EventProjection::Title { title: "Not durable", source: TitleSource::Assistant },
+	};
+	assert!(matches!(
+		index.append(&failed, || Err::<((), JournalPosition), _>(io::Error::other("write failed"))),
+		Err(IndexedWriteError::Journal(_))
+	));
+	let durable = IndexedEvent {
+		projection: EventProjection::Title { title: "Durable", source: TitleSource::User },
+		..failed
+	};
+	index
+		.append(&durable, || {
+			Ok::<_, io::Error>(((), JournalPosition { event_index: 0, byte_watermark: 128 }))
+		})
+		.expect("append durable title");
+
+	let page = index
+		.list(&SessionFilter {
+			contains_kind: Some(Str::from("omp.title")),
+			..SessionFilter::default()
+		})
+		.expect("query indexed kind");
+	assert_eq!(page.sessions.len(), 1);
+	assert_eq!(page.sessions[0].title.as_deref(), Some("Durable"));
+	assert_eq!(page.sessions[0].title_source, Some(TitleSource::User));
+}
+
+#[test]
+fn stale_position_is_reported_after_journal_without_advancing_index_watermarks() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("watermark");
+	create(&index, &id);
+	let outcome = outcome(1, 2);
+	let event = receipt_event(&id, &outcome, 2_000);
+	index
+		.append(&event, || {
+			Ok::<_, io::Error>(((), JournalPosition { event_index: 0, byte_watermark: 128 }))
+		})
+		.expect("first append");
+	let journal_ran = AtomicBool::new(false);
+	let stale = index.append(&event, || {
+		journal_ran.store(true, Ordering::SeqCst);
+		Ok::<_, io::Error>(((), JournalPosition { event_index: 0, byte_watermark: 128 }))
+	});
+	assert!(journal_ran.load(Ordering::SeqCst));
+	assert!(matches!(
+		stale,
+		Err(IndexedWriteError::IndexAfterJournal {
+			written: (),
+			position: Some(JournalPosition { event_index: 0, byte_watermark: 128 }),
+			..
+		})
+	));
+	let page = index.list(&SessionFilter::default()).expect("list index");
+	assert_eq!(page.sessions[0].entries, 1);
+	assert_eq!(page.sessions[0].turns, 1);
+	assert_eq!(page.sessions[0].journal_watermark, 128);
+}
+
+#[test]
+fn explicit_repair_has_a_separate_monotonic_watermark() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("foreign");
+	create(&index, &id);
+	index
+		.repair(&id, 256, [RepairRecord {
+			event_index:    0,
+			byte_watermark: 256,
+			ts_ms:          5_000,
+			kind:           "omp.title",
+			projection:     EventProjection::Title {
+				title:  "Imported",
+				source: TitleSource::Imported,
+			},
+		}])
+		.expect("explicit legacy repair");
+	assert!(index.repair(&id, 256, []).is_err());
+	let page = index
+		.list(&SessionFilter::default())
+		.expect("normal listing");
+	assert_eq!(page.sessions[0].title.as_deref(), Some("Imported"));
+}
+
+#[test]
+fn offline_thin_client_cache_is_stale_labeled_and_read_only() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("sessions.sqlite3");
+	let id = session_id("remote-authority");
+	{
+		let index = SessionIndex::open(&path).expect("open authoritative index");
+		create(&index, &id);
+	}
+	let cache = SessionIndex::open_offline_cache(&path, 9_999).expect("open offline cache");
+	let page = cache
+		.list(&SessionFilter::default())
+		.expect("offline listing");
+	assert_eq!(page.authority, IndexAuthority::OfflineCache { cached_at_ms: 9_999 });
+	assert_eq!(page.sessions.len(), 1);
+
+	let journal_ran = Arc::new(AtomicBool::new(false));
+	let observed = Arc::clone(&journal_ran);
+	let result = cache.append(
+		&IndexedEvent {
+			session:    &id,
+			ts_ms:      2_000,
+			kind:       "omp.title",
+			projection: EventProjection::Title { title: "local fork", source: TitleSource::User },
+		},
+		move || {
+			observed.store(true, Ordering::SeqCst);
+			Ok::<_, io::Error>(((), JournalPosition { event_index: 0, byte_watermark: 128 }))
+		},
+	);
+	assert!(matches!(result, Err(IndexedWriteError::IndexBeforeJournal(_))));
+	assert!(!journal_ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn remote_authority_reader_bootstraps_before_writer_and_remains_query_only() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("sessions.sqlite3");
+	let reader = SessionIndex::open_authoritative_reader(&path).expect("bootstrap authority reader");
+	assert_eq!(
+		reader
+			.list(&SessionFilter::default())
+			.expect("empty authority listing")
+			.authority,
+		IndexAuthority::Authoritative
+	);
+
+	let writer = SessionIndex::open(&path).expect("writer opens while reader remains live");
+	let id = session_id("remote-reader");
+	create(&writer, &id);
+	assert_eq!(
+		reader
+			.list(&SessionFilter::default())
+			.expect("live authority listing")
+			.sessions
+			.len(),
+		1
+	);
+
+	let journal_ran = Arc::new(AtomicBool::new(false));
+	let observed = Arc::clone(&journal_ran);
+	let result = reader.append(
+		&IndexedEvent {
+			session:    &id,
+			ts_ms:      2_000,
+			kind:       "omp.title",
+			projection: EventProjection::Title { title: "forbidden", source: TitleSource::User },
+		},
+		move || {
+			observed.store(true, Ordering::SeqCst);
+			Ok::<_, io::Error>(((), JournalPosition { event_index: 0, byte_watermark: 128 }))
+		},
+	);
+	assert!(matches!(
+		result,
+		Err(IndexedWriteError::IndexBeforeJournal(omp_storage::index::Error::ReadOnlyAuthority))
+	));
+	assert!(!journal_ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn two_writer_connections_serialize_distinct_session_commits() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("sessions.sqlite3");
+	let first = SessionIndex::open(&path).expect("first writer connection");
+	let second = SessionIndex::open(&path).expect("second writer connection");
+	let gate = Arc::new(Barrier::new(2));
+	let first_gate = Arc::clone(&gate);
+	let first_writer = std::thread::spawn(move || {
+		let id = session_id("first-writer");
+		create_after_journal(&first, &id, || {
+			first_gate.wait();
+		});
+	});
+	let second_gate = Arc::clone(&gate);
+	let second_writer = std::thread::spawn(move || {
+		let id = session_id("second-writer");
+		create_after_journal(&second, &id, || {
+			second_gate.wait();
+		});
+	});
+	first_writer.join().expect("first writer thread");
+	second_writer.join().expect("second writer thread");
+
+	let reader = SessionIndex::open_authoritative_reader(&path).expect("authority reader");
+	let page = reader
+		.list(&SessionFilter::default())
+		.expect("serialized writer rows");
+	assert_eq!(page.sessions.len(), 2);
+	assert!(
+		page
+			.sessions
+			.iter()
+			.any(|session| session.id == session_id("first-writer"))
+	);
+	assert!(
+		page
+			.sessions
+			.iter()
+			.any(|session| session.id == session_id("second-writer"))
+	);
+}

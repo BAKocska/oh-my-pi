@@ -22,6 +22,7 @@ omp-core = { workspace = true }
 omp-llm-catalog = { workspace = true }
 omp-llm-inference = { workspace = true }
 omp-slopjson = { workspace = true }
+parking_lot = { workspace = true }
 omp-proto = { workspace = true }
 serde = { workspace = true }
 schemars = { workspace = true }

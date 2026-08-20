@@ -21,6 +21,11 @@ use omp_walker::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+#[path = "workspace_ops.rs"]
+mod operations;
+
+pub use operations::{WorkspaceOperationError, WorkspaceOperations, WorktreeMerge};
+
 const SEARCH_CHANNEL_DEPTH: usize = 16;
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 

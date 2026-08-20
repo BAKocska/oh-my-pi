@@ -464,3 +464,18 @@ fn raw_value_still_rejects_truncation_and_garbage() {
 	assert!(from_str::<&omp_slopjson::RawValue>("{\"a\": ").is_err());
 	assert!(from_str::<&omp_slopjson::RawValue>("[1] nope").is_err());
 }
+
+#[test]
+fn value_deserializes_borrowed_typed_views_without_text_round_trip() {
+	#[derive(Debug, PartialEq, serde::Deserialize)]
+	struct View<'a> {
+		name:  &'a str,
+		items: Vec<u64>,
+		flag:  Option<bool>,
+	}
+
+	let value = parse(r#"{"name":"borrowed","items":[1,2,3],"flag":true}"#).unwrap();
+	let view: View<'_> = value.deserialize_into().unwrap();
+	assert_eq!(view, View { name: "borrowed", items: vec![1, 2, 3], flag: Some(true) });
+	assert_eq!(view.name.as_ptr(), value["name"].as_str().unwrap().as_ptr());
+}

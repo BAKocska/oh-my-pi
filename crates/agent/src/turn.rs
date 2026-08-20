@@ -5,6 +5,7 @@ use std::{
 	future::Future,
 	pin::Pin,
 	task::{Context, Poll},
+	time::Duration,
 };
 
 use futures::Stream;
@@ -93,6 +94,17 @@ pub mod empty_stop {
 	/// An empty stop without billed non-reasoning output evidence.
 	pub const EMPTY: &str = "empty_stop.empty";
 }
+/// Loop-owned recovery timing for a typed turn-layer failure.
+///
+/// This classification is deliberately limited to gateway protocol kinds. It
+/// does not expose provider routes, credentials, or internal retry policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Recovery {
+	/// Retry the same logical turn after the gateway-mandated delay.
+	RetryAfter(Duration),
+	/// Retry the same logical turn with the agent's bounded transient backoff.
+	Backoff,
+}
 
 /// A turn-layer failure.
 ///
@@ -132,11 +144,29 @@ impl Error {
 		}
 	}
 
-	/// Reports whether policy above this seam may recover by rebasing or
-	/// reseeding.
+	/// Returns the loop-owned recovery timing for this typed failure.
+	#[must_use]
+	pub fn recovery(&self) -> Option<Recovery> {
+		match self {
+			Self::Conflict(_) | Self::NeedFull(_) => None,
+			Self::Terminal(error) => match pb::turn_error::Kind::try_from(error.kind).ok()? {
+				pb::turn_error::Kind::RateLimited => {
+					Some(Recovery::RetryAfter(Duration::from_millis(error.retry_after_ms)))
+				},
+				pb::turn_error::Kind::Overloaded | pb::turn_error::Kind::Upstream => {
+					Some(Recovery::Backoff)
+				},
+				_ => None,
+			},
+			Self::Rpc(_) => Some(Recovery::Backoff),
+			Self::Connect(_) | Self::Protocol(_) | Self::Invalid(_) | Self::Closed => None,
+		}
+	}
+
+	/// Reports whether the agent loop owns recovery for this failure.
 	#[inline]
-	pub const fn is_recovery(&self) -> bool {
-		matches!(self, Self::Conflict(_) | Self::NeedFull(_))
+	pub fn is_recovery(&self) -> bool {
+		matches!(self, Self::Conflict(_) | Self::NeedFull(_)) || self.recovery().is_some()
 	}
 
 	pub(crate) fn from_turn(error: TurnError) -> Self {

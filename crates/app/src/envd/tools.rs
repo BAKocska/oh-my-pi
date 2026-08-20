@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
 
-use omp_core::Str;
+use omp_core::{Duration, Str};
 use omp_proto::{
 	prost::Message as _,
 	toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint},
@@ -39,6 +39,7 @@ pub fn production_registry(
 	workspace: &WorkspaceHost,
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
+	interrupt_grace: Duration,
 	mut registry: Registry,
 ) -> Result<(Arc<Registry>, Arc<SessionBridgeHost>, omp_tools::eval::EvalSessionControl), EnvdError>
 {
@@ -66,7 +67,7 @@ pub fn production_registry(
 	let glob_identity = glob.spec().identity();
 	registry.register(glob, Presentation::Slot, core_claims())?;
 	let eval_host = Arc::new(SessionBridgeHost::new());
-	let eval_exec = ProcessEvalExec::production(Arc::clone(&eval_host))
+	let eval_exec = ProcessEvalExec::production(Arc::clone(&eval_host), interrupt_grace)
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
 	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
 	let eval_identity = eval_tool.spec().identity();
@@ -144,6 +145,13 @@ fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 		schema:          definition.schema_json.clone(),
 		constraint:      worker_constraint(declaration)?,
 		projection_code: worker_projection_code(declaration),
+		effects:         declaration
+			.effects
+			.as_ref()
+			.map(omp_tool::Effects::try_from)
+			.transpose()
+			.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?
+			.unwrap_or_default(),
 	})
 }
 

@@ -10,6 +10,7 @@ use url::Url;
 use crate::{
 	DocumentHead, DocumentId, DocumentPresence, DocumentStore, Error, ReadBody, ReadSelection,
 	Result, Revision, TransactionId,
+	environment::WorkspaceMutationGuard,
 	fs::{
 		CopyOutcome, DestinationOverwritePolicy, DirectoryEntry, DiskState, ExistingDirectoryPolicy,
 		FileKind, FollowSymlinks, PathMetadata, PortablePermissions, SymlinkTarget,
@@ -78,6 +79,15 @@ impl PathService {
 		Self { store, transactions }
 	}
 
+	/// Reserves mutation targets against concurrent workspace lease acquisition.
+	pub(crate) fn begin_workspace_mutation(
+		&self,
+		owner: [u8; 16],
+		paths: Vec<std::path::PathBuf>,
+	) -> Result<WorkspaceMutationGuard> {
+		self.store.workspace_leases().begin_mutation(owner, paths)
+	}
+
 	/// Canonicalizes an existing confined file URI.
 	pub fn canonicalize(&self, uri: &Url) -> Result<Url> {
 		let path = self.store.resolve_entry_path(uri)?;
@@ -116,6 +126,7 @@ impl PathService {
 			},
 			authority = gate.lock() => authority,
 		};
+		self.store.check_workspace_paths(None, [path.clone()])?;
 		ensure_not_cancelled(cancellation, &path, "create directory")?;
 		self.reject_active_at_or_below(&path, cancellation).await?;
 		ensure_not_cancelled(cancellation, &path, "create directory")?;
@@ -159,6 +170,9 @@ impl PathService {
 			},
 			authority = gate.lock() => authority,
 		};
+		self
+			.store
+			.check_workspace_paths(None, [metadata.path.clone()])?;
 		ensure_not_cancelled(cancellation, &metadata.path, "remove path")?;
 		if metadata.kind == FileKind::Directory {
 			self
@@ -229,6 +243,9 @@ impl PathService {
 			},
 			authority = gate.lock() => authority,
 		};
+		self
+			.store
+			.check_workspace_paths(None, [source_metadata.path.clone(), destination.clone()])?;
 		ensure_not_cancelled(cancellation, &source_metadata.path, "rename path")?;
 		if source_metadata.kind == FileKind::Directory {
 			self
@@ -340,6 +357,9 @@ impl PathService {
 			},
 			authority = gate.lock() => authority,
 		};
+		self
+			.store
+			.check_workspace_paths(None, [destination.clone()])?;
 		ensure_not_cancelled(cancellation, &destination, "copy path")?;
 		self
 			.reject_active_at_or_below(&destination, cancellation)
@@ -377,6 +397,7 @@ impl PathService {
 			},
 			authority = gate.lock() => authority,
 		};
+		self.store.check_workspace_paths(None, [link.clone()])?;
 		ensure_not_cancelled(cancellation, &link, "create symlink")?;
 		self.reject_active_at_or_below(&link, cancellation).await?;
 		ensure_not_cancelled(cancellation, &link, "create symlink")?;
@@ -408,6 +429,9 @@ impl PathService {
 			authority = gate.lock() => authority,
 		};
 		ensure_not_cancelled(cancellation, &source, "create hard link")?;
+		self
+			.store
+			.check_workspace_paths(None, [source.clone(), link.clone()])?;
 		let selected_source = self.store.local_fs().stat(&source, follow_source)?;
 		if selected_source.kind == FileKind::RegularFile
 			&& self
@@ -452,6 +476,9 @@ impl PathService {
 			authority = gate.lock() => authority,
 		};
 		ensure_not_cancelled(cancellation, &selected.path, "set path permissions")?;
+		self
+			.store
+			.check_workspace_paths(None, [selected.path.clone()])?;
 		if selected.kind == FileKind::RegularFile
 			&& let Some(handle) = self.store.actor_handle_for_path(&selected.path)
 		{

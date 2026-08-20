@@ -2,14 +2,15 @@
 
 use std::sync::Arc;
 
-use omp_core::Str;
+use omp_core::{Duration, DurationError, Str};
 use opentelemetry::{
 	KeyValue, global,
 	metrics::{Counter, Histogram},
 };
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::{
+	attrs::omp_runtime,
 	collector::{RunCoverage, RunSummary, Usage},
 	semconv::{METER_NAME, TokenType},
 };
@@ -45,50 +46,50 @@ pub struct ChatUsageMetric {
 /// The nine instruments emitted by pi's coding-agent telemetry exporter.
 #[derive(Clone, Debug)]
 pub struct MetricRecorder {
-	token_usage:      Histogram<u64>,
-	chat_cost_usd:    Counter<f64>,
-	runs:             Counter<u64>,
-	steps:            Counter<u64>,
-	chat_calls:       Counter<u64>,
-	chat_duration_ms: Histogram<f64>,
-	tool_calls:       Counter<u64>,
-	tool_duration_ms: Histogram<f64>,
-	errors:           Counter<u64>,
-}
-
-impl Default for MetricRecorder {
-	fn default() -> Self {
-		Self::new()
-	}
+	token_usage:        Histogram<u64>,
+	chat_cost_usd:      Counter<f64>,
+	runs:               Counter<u64>,
+	steps:              Counter<u64>,
+	chat_calls:         Counter<u64>,
+	chat_duration_ms:   Histogram<f64>,
+	tool_calls:         Counter<u64>,
+	tool_duration_ms:   Histogram<f64>,
+	errors:             Counter<u64>,
+	runtime_attributes: SmallVec<KeyValue, 2>,
 }
 
 impl MetricRecorder {
-	/// Creates all instruments from the global meter named by pi.
-	#[must_use]
-	pub fn new() -> Self {
+	/// Creates all instruments from the global meter named by pi and binds the
+	/// configured courtesy-interrupt grace to every emitted series.
+	///
+	/// # Errors
+	/// Returns [`DurationError::Overflow`] when the exact nanosecond value
+	/// cannot be represented by an OpenTelemetry integer attribute.
+	pub fn new(interrupt_grace: Duration) -> Result<Self, DurationError> {
+		let runtime_attributes = interrupt_grace_attributes(interrupt_grace)?;
 		let meter = global::meter(METER_NAME);
-		Self {
-			token_usage:      meter
+		Ok(Self {
+			token_usage: meter
 				.u64_histogram("gen_ai.client.token.usage")
 				.with_description("Token usage reported by GenAI chat calls.")
 				.with_unit("{token}")
 				.build(),
-			chat_cost_usd:    meter
+			chat_cost_usd: meter
 				.f64_counter("omp.agent.chat.cost.estimated_usd")
 				.with_description("Estimated USD cost for completed chat calls.")
 				.with_unit("USD")
 				.build(),
-			runs:             meter
+			runs: meter
 				.u64_counter("omp.agent.runs")
 				.with_description("Completed agent runs.")
 				.with_unit("{run}")
 				.build(),
-			steps:            meter
+			steps: meter
 				.u64_counter("omp.agent.steps")
 				.with_description("Agent loop steps completed inside a run.")
 				.with_unit("{step}")
 				.build(),
-			chat_calls:       meter
+			chat_calls: meter
 				.u64_counter("omp.agent.chat.calls")
 				.with_description("Chat calls completed inside agent runs.")
 				.with_unit("{call}")
@@ -98,7 +99,7 @@ impl MetricRecorder {
 				.with_description("Total chat latency observed in an agent run.")
 				.with_unit("ms")
 				.build(),
-			tool_calls:       meter
+			tool_calls: meter
 				.u64_counter("omp.agent.tool.calls")
 				.with_description("Tool calls completed inside agent runs.")
 				.with_unit("{call}")
@@ -108,22 +109,32 @@ impl MetricRecorder {
 				.with_description("Total tool latency observed in an agent run.")
 				.with_unit("ms")
 				.build(),
-			errors:           meter
+			errors: meter
 				.u64_counter("omp.agent.errors")
 				.with_description("Errors observed in chat and tool execution.")
 				.with_unit("{error}")
 				.build(),
-		}
+			runtime_attributes,
+		})
 	}
 
 	/// Records all positive token buckets and a positive available cost for one
-	/// chat.
-	pub fn record_chat_usage(&self, event: &ChatUsageMetric) {
-		let mut attrs: SmallVec<KeyValue, 8> = smallvec![
+	/// chat, including its configured deadline when bounded.
+	///
+	/// # Errors
+	/// Returns [`DurationError::Overflow`] when the exact deadline cannot be
+	/// represented by an OpenTelemetry integer attribute.
+	pub fn record_chat_usage(
+		&self,
+		event: &ChatUsageMetric,
+		deadline: Option<Duration>,
+	) -> Result<(), DurationError> {
+		let mut attrs = self.attributes_with_deadline(deadline)?;
+		attrs.extend([
 			KeyValue::new("gen_ai.operation.name", "chat"),
 			string_attr("gen_ai.request.model", &event.model),
 			string_attr("omp.gen_ai.usage.accuracy", &event.usage_accuracy),
-		];
+		]);
 		if let Some(provider) = &event.provider {
 			attrs.push(string_attr("gen_ai.provider.name", provider));
 		}
@@ -148,17 +159,29 @@ impl MetricRecorder {
 		if let Some(cost) = event.cost_usd.filter(|cost| *cost > 0.0) {
 			self.chat_cost_usd.add(cost, &attrs);
 		}
+		Ok(())
 	}
 
-	/// Records one completed run using pi's common run-level attribute set.
-	pub fn record_run(&self, summary: &RunSummary, coverage: &RunCoverage) {
-		let run_attrs: SmallVec<KeyValue, 5> = smallvec![
+	/// Records one completed run using pi's common run-level attribute set and
+	/// the configured run deadline when bounded.
+	///
+	/// # Errors
+	/// Returns [`DurationError::Overflow`] when the exact deadline cannot be
+	/// represented by an OpenTelemetry integer attribute.
+	pub fn record_run(
+		&self,
+		summary: &RunSummary,
+		coverage: &RunCoverage,
+		deadline: Option<Duration>,
+	) -> Result<(), DurationError> {
+		let mut run_attrs = self.attributes_with_deadline(deadline)?;
+		run_attrs.extend([
 			count_attr("omp.agent.models_used.count", coverage.models_used.len()),
 			count_attr("omp.agent.providers_used.count", coverage.providers_used.len()),
 			count_attr("omp.agent.tools_available.count", coverage.tools_available.len()),
 			count_attr("omp.agent.tools_invoked.count", coverage.tools_invoked.len()),
 			count_attr("omp.agent.tools_unused.count", coverage.tools_unused.len()),
-		];
+		]);
 
 		self.runs.add(1, &run_attrs);
 		if summary.step_count > 0 {
@@ -195,6 +218,7 @@ impl MetricRecorder {
 				self.errors.add(*count, &attrs);
 			}
 		}
+		Ok(())
 	}
 
 	fn record_token(&self, value: u64, base_attrs: &[KeyValue], token_type: TokenType) {
@@ -214,6 +238,77 @@ impl MetricRecorder {
 		attrs.push(KeyValue::new("omp.tool.status", status));
 		self.tool_calls.add(count, &attrs);
 	}
+
+	fn attributes_with_deadline(
+		&self,
+		deadline: Option<Duration>,
+	) -> Result<SmallVec<KeyValue, 4>, DurationError> {
+		let mut attributes = self.runtime_attributes.iter().cloned().collect();
+		if let Some(deadline) = deadline {
+			push_duration_attributes(
+				&mut attributes,
+				deadline,
+				omp_runtime::DEADLINE_NS,
+				omp_runtime::DEADLINE_UNIT,
+			)?;
+		}
+		Ok(attributes)
+	}
+}
+
+/// Builds the exact interrupt-grace attributes shared by metrics and durable
+/// receipts.
+///
+/// # Errors
+/// Returns [`DurationError::Overflow`] when the exact nanosecond value cannot
+/// be represented by an OpenTelemetry integer attribute.
+pub fn interrupt_grace_attributes(
+	interrupt_grace: Duration,
+) -> Result<SmallVec<KeyValue, 2>, DurationError> {
+	let mut attributes = SmallVec::new();
+	push_duration_attributes(
+		&mut attributes,
+		interrupt_grace,
+		omp_runtime::INTERRUPT_GRACE_NS,
+		omp_runtime::INTERRUPT_GRACE_UNIT,
+	)?;
+	Ok(attributes)
+}
+
+/// Builds the exact configured runtime-duration attributes for a metric or
+/// durable receipt.
+///
+/// # Errors
+/// Returns [`DurationError::Overflow`] when either exact nanosecond value
+/// cannot be represented by an OpenTelemetry integer attribute.
+pub fn runtime_duration_attributes(
+	interrupt_grace: Duration,
+	deadline: Option<Duration>,
+) -> Result<SmallVec<KeyValue, 4>, DurationError> {
+	let grace = interrupt_grace_attributes(interrupt_grace)?;
+	let mut attributes = grace.into_iter().collect();
+	if let Some(deadline) = deadline {
+		push_duration_attributes(
+			&mut attributes,
+			deadline,
+			omp_runtime::DEADLINE_NS,
+			omp_runtime::DEADLINE_UNIT,
+		)?;
+	}
+	Ok(attributes)
+}
+
+fn push_duration_attributes<const N: usize>(
+	attributes: &mut SmallVec<KeyValue, N>,
+	value: Duration,
+	nanoseconds_key: &'static str,
+	unit_key: &'static str,
+) -> Result<(), DurationError> {
+	let nanoseconds =
+		i64::try_from(value.to_std()?.as_nanos()).map_err(|_| DurationError::Overflow)?;
+	attributes.push(KeyValue::new(nanoseconds_key, nanoseconds));
+	attributes.push(KeyValue::new(unit_key, value.unit().to_string()));
+	Ok(())
 }
 
 fn string_attr(key: &'static str, value: &Str) -> KeyValue {
@@ -232,4 +327,39 @@ fn with_string_attr<const N: usize>(
 	let mut extended: SmallVec<KeyValue, 7> = attrs.iter().cloned().collect();
 	extended.push(string_attr(key, value));
 	extended
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_core::DurationUnit;
+	use opentelemetry::Value;
+
+	use super::*;
+
+	#[test]
+	fn runtime_duration_attributes_preserve_exact_value_and_configured_unit() {
+		let attributes = runtime_duration_attributes(
+			Duration::new(375, DurationUnit::Milliseconds),
+			Some(Duration::new(2, DurationUnit::Seconds)),
+		)
+		.expect("durations fit telemetry integers");
+
+		assert_eq!(attributes[0].key.as_str(), omp_runtime::INTERRUPT_GRACE_NS);
+		assert_eq!(attributes[0].value, Value::I64(375_000_000));
+		assert_eq!(attributes[1].key.as_str(), omp_runtime::INTERRUPT_GRACE_UNIT);
+		assert_eq!(attributes[1].value, Value::String("ms".into()));
+		assert_eq!(attributes[2].key.as_str(), omp_runtime::DEADLINE_NS);
+		assert_eq!(attributes[2].value, Value::I64(2_000_000_000));
+		assert_eq!(attributes[3].key.as_str(), omp_runtime::DEADLINE_UNIT);
+		assert_eq!(attributes[3].value, Value::String("s".into()));
+	}
+
+	#[test]
+	fn runtime_duration_attributes_reject_integer_overflow() {
+		let error =
+			runtime_duration_attributes(Duration::new(u64::MAX, DurationUnit::Nanoseconds), None)
+				.expect_err("OpenTelemetry integer attributes are signed");
+
+		assert_eq!(error, DurationError::Overflow);
+	}
 }

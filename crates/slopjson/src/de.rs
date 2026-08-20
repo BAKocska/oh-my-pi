@@ -4,7 +4,7 @@
 //! intermediate tree. [`Value`] is just one visitor: [`parse`] is
 //! `from_str::<Value>`.
 
-use omp_core::CowStr;
+use omp_core::{CowStr, Str};
 use serde::{
 	de::{
 		self, DeserializeSeed, Unexpected, Visitor,
@@ -15,7 +15,7 @@ use serde::{
 
 use crate::{
 	error::ParseError,
-	parser::{Atom, MAX_DEPTH, Mode, Parser},
+	parser::{Atom, MAX_DEPTH, Mode, Parser, Repair, RepairLog, RepairPathSegment},
 	value::Value,
 };
 
@@ -48,6 +48,7 @@ pub struct Deserializer<'de> {
 	/// Whether an unrecognized token may recover as a bareword string —
 	/// true only in object/array value position, mirroring the TS parser.
 	allow_bareword: bool,
+	pending_key:    Option<Str>,
 }
 
 impl<'de> Deserializer<'de> {
@@ -58,6 +59,7 @@ impl<'de> Deserializer<'de> {
 			p:              Parser::new(json, Mode::Strict),
 			depth:          0,
 			allow_bareword: false,
+			pending_key:    None,
 		}
 	}
 
@@ -69,6 +71,16 @@ impl<'de> Deserializer<'de> {
 		} else {
 			Err(ParseError::TrailingCharacters(self.p.pos()))
 		}
+	}
+
+	/// Borrow tolerance repairs observed during deserialization so far.
+	pub fn repairs(&self) -> &[Repair] {
+		self.p.repairs()
+	}
+
+	/// Consume this deserializer and return its compact repair record.
+	pub fn into_repairs(mut self) -> RepairLog {
+		self.p.take_repairs()
 	}
 
 	fn peek_some(&mut self) -> Result<u8, ParseError> {
@@ -89,21 +101,36 @@ impl<'de> Deserializer<'de> {
 
 	/// Deserialize an object key (quoted or unquoted) into `seed`.
 	fn map_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<K::Value, ParseError> {
+		let start = self.p.pos();
 		if let Some(quote @ (b'"' | b'\'')) = self.p.peek() {
 			match self.p.string(quote)? {
 				CowStr::Borrowed(key) => {
+					let path_key = Str::from(key);
+					self
+						.p
+						.retarget_repairs_from(start, RepairPathSegment::Key(path_key.clone()));
+					self.pending_key = Some(path_key);
 					seed.deserialize(BorrowedStrDeserializer::<ParseError>::new(key))
 				},
 				CowStr::Owned(key) => {
+					let path_key = Str::from(key.as_str());
+					self
+						.p
+						.retarget_repairs_from(start, RepairPathSegment::Key(path_key.clone()));
+					self.pending_key = Some(path_key);
 					seed.deserialize(StrDeserializer::<ParseError>::new(key.as_str()))
 				},
 			}
 		} else {
-			let start = self.p.pos();
 			let key = self.p.unquoted_key();
 			if key.is_empty() {
 				return Err(ParseError::ExpectedKey(start));
 			}
+			let path_key = Str::from(key);
+			self
+				.p
+				.retarget_repairs_from(start, RepairPathSegment::Key(path_key.clone()));
+			self.pending_key = Some(path_key);
 			seed.deserialize(BorrowedStrDeserializer::<ParseError>::new(key))
 		}
 	}
@@ -131,14 +158,22 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
 			b'{' => {
 				self.descend()?;
 				self.p.bump();
-				let out = visitor.visit_map(CommaSeparated { de: self, first: true });
+				let out = visitor.visit_map(CommaSeparated {
+					de:         self,
+					first:      true,
+					next_index: 0,
+				});
 				self.depth -= 1;
 				out
 			},
 			b'[' => {
 				self.descend()?;
 				self.p.bump();
-				let out = visitor.visit_seq(CommaSeparated { de: self, first: true });
+				let out = visitor.visit_seq(CommaSeparated {
+					de:         self,
+					first:      true,
+					next_index: 0,
+				});
 				self.depth -= 1;
 				out
 			},
@@ -228,8 +263,9 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
 /// Object/array walker with the tolerant comma rules: leading, doubled, and
 /// trailing commas are skipped; a missing comma between entries still fails.
 struct CommaSeparated<'a, 'de> {
-	de:    &'a mut Deserializer<'de>,
-	first: bool,
+	de:         &'a mut Deserializer<'de>,
+	first:      bool,
+	next_index: usize,
 }
 
 impl<'de> de::MapAccess<'de> for CommaSeparated<'_, 'de> {
@@ -251,9 +287,14 @@ impl<'de> de::MapAccess<'de> for CommaSeparated<'_, 'de> {
 					return Ok(None);
 				},
 				Some(b',') => {
+					let comma = self.de.p.pos();
 					self.de.p.bump();
-					saw_comma = true;
 					self.de.p.ws();
+					let trailing = self.de.p.peek() == Some(b'}');
+					if trailing || self.first || saw_comma {
+						self.de.p.record_comma(comma, trailing);
+					}
+					saw_comma = true;
 				},
 				Some(_) => break,
 			}
@@ -276,7 +317,15 @@ impl<'de> de::MapAccess<'de> for CommaSeparated<'_, 'de> {
 		if self.de.p.at_end() {
 			return Err(ParseError::ExpectedValue(self.de.p.pos()));
 		}
-		self.de.in_value_position(|de| seed.deserialize(&mut *de))
+		let key = self
+			.de
+			.pending_key
+			.take()
+			.expect("map value follows a parsed key");
+		self.de.p.push_repair_path(RepairPathSegment::Key(key));
+		let result = self.de.in_value_position(|de| seed.deserialize(&mut *de));
+		self.de.p.pop_repair_path();
+		result
 	}
 }
 
@@ -299,9 +348,14 @@ impl<'de> de::SeqAccess<'de> for CommaSeparated<'_, 'de> {
 					return Ok(None);
 				},
 				Some(b',') => {
+					let comma = self.de.p.pos();
 					self.de.p.bump();
-					saw_comma = true;
 					self.de.p.ws();
+					let trailing = self.de.p.peek() == Some(b']');
+					if trailing || self.first || saw_comma {
+						self.de.p.record_comma(comma, trailing);
+					}
+					saw_comma = true;
 				},
 				Some(_) => break,
 			}
@@ -310,10 +364,15 @@ impl<'de> de::SeqAccess<'de> for CommaSeparated<'_, 'de> {
 			return Err(ParseError::ExpectedCommaOrBracket(self.de.p.pos()));
 		}
 		self.first = false;
-		self
+		let index = self.next_index;
+		self.next_index += 1;
+		self.de.p.push_repair_path(RepairPathSegment::Index(index));
+		let result = self
 			.de
 			.in_value_position(|de| seed.deserialize(&mut *de))
-			.map(Some)
+			.map(Some);
+		self.de.p.pop_repair_path();
+		result
 	}
 }
 

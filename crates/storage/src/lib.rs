@@ -9,4 +9,7 @@
 //!   live in the blob store behind typed [`blob::BlobRef`]s.
 
 pub mod blob;
+pub mod gc;
+pub mod index;
+pub mod state;
 pub mod transcript;

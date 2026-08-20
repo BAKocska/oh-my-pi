@@ -164,7 +164,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(AppEvent::Changed { id, value })
 					if id.as_str() == MODEL_SELECT_ID && step == Step::Model =>
 				{
-					Settings { default_model: Some(value.to_string()) }
+					Settings { default_model: Some(value.to_string()), ..Settings::default() }
 						.save(data_dir)
 						.into_diagnostic()?;
 					break 'wizard Some(value);

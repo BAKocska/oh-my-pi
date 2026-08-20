@@ -5,6 +5,8 @@
 //! once they have complete implementations.
 
 mod actor;
+/// Client-side terminal stream primitives for document protocol consumers.
+pub mod client;
 /// Concurrent framed protocol connections over a shared Environment.
 pub mod connection;
 /// Long-lived document authority over standard I/O or a Unix-domain socket.
@@ -33,6 +35,9 @@ pub mod summary;
 pub mod transaction;
 mod types;
 mod watch;
+/// Windows owner-only named-pipe transport.
+#[cfg(windows)]
+pub mod windows;
 /// Bounded length-delimited protobuf transport framing.
 pub mod wire;
 pub use actor::{
@@ -42,7 +47,9 @@ pub use actor::{
 pub use edit_adapter::{
 	EditAdapterRegistry, HASHLINE_EDIT_FORMAT, REPLACE_EDIT_FORMAT, TextEditAdapter,
 };
-pub use environment::{Environment, EnvironmentSession};
+pub use environment::{
+	Environment, EnvironmentSession, WorkspaceLeaseConflict, WorkspaceLeaseId, WorkspaceLeaseOutcome,
+};
 pub use error::{Error, RangeKind, Result};
 pub use fs::{
 	CopyOutcome, DestinationOverwritePolicy, DirectoryEntry, ExistingDirectoryPolicy, FileKind,

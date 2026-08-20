@@ -72,7 +72,15 @@ impl RealEnv {
 				root.path(),
 				state.path(),
 				Registry::new(),
-				ExtHostConfig::new(omp_binary().expect("Cargo-built e2e host")),
+				ExtHostConfig::new(
+					omp_binary().expect("Cargo-built e2e host"),
+					omp_core::Principal::new(
+						omp_core::Str::new_static("e2e-tester"),
+						omp_core::Str::new_static("E2E Tester"),
+					),
+					omp_core::Str::new_static("p3-session"),
+					1,
+				),
 			)
 			.await
 			.expect("real local environment"),
@@ -466,9 +474,6 @@ async fn wait_terminal(client: &EnvClient, name: &str, generation: u64) {
 					return;
 				}
 			},
-			ProcessAttachmentEvent::StreamError(error) => {
-				panic!("process attachment failed: {error:?}")
-			},
 		}
 	}
 }
@@ -625,14 +630,13 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let early_name = "p3-already-exited";
 	let started = env
 		.client
-		.start_process(StartProcess {
+		.start_process(&omp_core::EnvPath::new(env.cwd_uri()).expect("typed cwd"), StartProcess {
 			name: early_name.to_owned(),
 			spec: Some(ProcessSpec {
 				source: Some(Script {
 					text: "printf 'early-1\\nearly-2\\n'".to_owned(),
 					..Default::default()
 				}),
-				cwd_uri: env.cwd_uri(),
 				restart: Some(RestartSpec {
 					policy: RestartPolicy::Never as i32,
 					..Default::default()

@@ -23,11 +23,17 @@ use nix::{
 	sys::signal,
 	unistd::{Pid, getpgid},
 };
-use omp_app::envd::{
-	server::EnvServer,
-	worker::{ExtHostConfig, ExtHostSpec, HostKey},
+use omp_app::{
+	envd::{
+		server::EnvServer,
+		worker::{ExtHostConfig, ExtHostSpec, HostKey},
+	},
+	exthost::{
+		ActivationTrigger, ArtifactDigest, DeclarationSet, ExtensionManifest, Provenance,
+		ServiceManifest, ToolDeclarationKey,
+	},
 };
-use omp_core::Str;
+use omp_core::{Principal, Str};
 use omp_e2e::support::omp_binary;
 use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_proto::{
@@ -37,8 +43,8 @@ use omp_proto::{
 	},
 };
 use omp_tool::{
-	Abort, CallOutcome, Claims, Constraint, Ev, IncomingParams, ParamError, Part, Precedence,
-	Presentation, PromptCaps, Registry, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, ParamError,
+	Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -47,6 +53,18 @@ const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const EVENT_DEADLINE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const NATIVE_SLEEP: Duration = Duration::from_millis(400);
+
+fn file_write_effects() -> Effects {
+	Effects {
+		documents: Some(DocEffects {
+			read:        false,
+			write_globs: [Str::new_static("**")].into_iter().collect(),
+		}),
+		exec:      None,
+		inference: None,
+		subagents: 0,
+	}
+}
 
 const PY_EXTENSION: &str = r#"
 import ctypes
@@ -105,6 +123,41 @@ OMP_TOOLS = [
 ]
 "#;
 
+fn test_config() -> ExtHostConfig {
+	ExtHostConfig::new(
+		omp_binary().expect("resolve worker-capable omp binary"),
+		Principal::new(Str::new_static("e2e-tester"), Str::new_static("E2E Tester")),
+		Str::new_static("p2-session"),
+		1,
+	)
+}
+
+fn test_manifest(key: &HostKey) -> ExtensionManifest {
+	ExtensionManifest::new(
+		Provenance::new(
+			Str::new_static("test-publisher"),
+			key.extension.clone(),
+			Str::new_static("1.0.0"),
+			ArtifactDigest::new([0; 32]),
+			key.layer.clone(),
+			key.tier.clone(),
+			1,
+		),
+		Str::new_static("cancel_matrix_tools"),
+		[],
+		DeclarationSet::new(
+			[
+				ToolDeclarationKey::new("matrix_block", "py", 1),
+				ToolDeclarationKey::new("matrix_echo", "py", 1),
+			],
+			[],
+		),
+		ServiceManifest::default(),
+		[],
+		[ActivationTrigger::FirstReach],
+	)
+}
+
 struct LocalEnv {
 	client:      EnvClient,
 	root:        TempDir,
@@ -160,7 +213,7 @@ struct CancellableSleeper {
 }
 
 impl CancellableSleeper {
-	const fn new(started: PathBuf, marker: PathBuf, dropped: Arc<AtomicBool>) -> Self {
+	fn new(started: PathBuf, marker: PathBuf, dropped: Arc<AtomicBool>) -> Self {
 		Self {
 			spec: ToolSpec {
 				name:            Str::new_static("matrix_sleeper"),
@@ -168,6 +221,7 @@ impl CancellableSleeper {
 				description:     Str::new_static("sleeps before attempting a marker mutation"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
+				effects:         file_write_effects(),
 				projection_code: [0; 32],
 			},
 			started,
@@ -246,7 +300,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 			},
 		)
 		.expect("register cancellable sleeper");
-	let worker = ExtHostConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
+	let worker = test_config();
 	let env = within(STARTUP_DEADLINE, LocalEnv::start(registry, worker)).await;
 
 	let mut skipped = within(
@@ -289,9 +343,16 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 	.await
 	.expect("open committed sleeper");
 	expect_accepted(&mut interrupted).await;
-	within(EVENT_DEADLINE, interrupted.commit_args(Bytes::from_static(b"{}")))
-		.await
-		.expect("commit sleeper arguments");
+	within(
+		EVENT_DEADLINE,
+		interrupted.commit_args(
+			Bytes::from_static(b"{}"),
+			Bytes::from_static(b"cancel-matrix-test-token"),
+			1000,
+		),
+	)
+	.await
+	.expect("commit sleeper arguments");
 	wait_for_file(&started, EVENT_DEADLINE).await;
 	interrupted.guard().cancel();
 	let interrupted_terminal = next_verdict(&mut interrupted).await;
@@ -319,14 +380,14 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 
 #[tokio::test]
 async fn dropping_exec_run_kills_the_whole_pgid_but_preserves_its_session() {
-	let worker = ExtHostConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
+	let worker = test_config();
 	let env = within(STARTUP_DEADLINE, LocalEnv::start(Registry::new(), worker)).await;
 	let opened = within(
 		EVENT_DEADLINE,
-		env.client.open_session(OpenSessionRequest {
-			cwd_uri: file_uri(env.root.path()),
-			..OpenSessionRequest::default()
-		}),
+		env.client.open_session(
+			&omp_core::EnvPath::new(file_uri(env.root.path())).expect("typed cwd"),
+			OpenSessionRequest::default(),
+		),
 	)
 	.await
 	.expect("open persistent exec session");
@@ -401,18 +462,16 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	let site = tempfile::tempdir().expect("Python extension scratch");
 	fs::write(site.path().join("cancel_matrix_tools.py"), PY_EXTENSION)
 		.expect("write Python cancellation extension");
-	let mut worker = ExtHostConfig::new(omp_binary().expect("resolve worker-capable omp binary"));
-	let mut spec = ExtHostSpec::new(
-		HostKey::new("project", "workspace", "cancel_matrix_tools"),
-		Str::new_static("cancel_matrix_tools"),
-	);
+	let mut worker = test_config();
+	let key = HostKey::new("project", "workspace", "cancel_matrix_tools");
+	let mut spec = ExtHostSpec::new(key.clone(), test_manifest(&key));
 	spec.python_site = Some(site.path().to_owned());
 	worker.extensions.push(spec);
 	worker.health_timeout = Duration::from_secs(5);
-	worker.interrupt_grace = Duration::from_millis(150);
+	let hard_kill_grace = Duration::from_millis(150);
+	worker.interrupt_grace = omp_core::Duration::new(150, omp_core::DurationUnit::Milliseconds);
 	worker.initial_backoff = Duration::from_millis(10);
 	worker.max_backoff = Duration::from_millis(50);
-	let hard_kill_grace = worker.interrupt_grace;
 	let env = within(STARTUP_DEADLINE, LocalEnv::start(Registry::new(), worker)).await;
 	let started = site.path().join("ctypes-sleep-started");
 
@@ -433,9 +492,12 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 		"started": started.to_str().expect("temporary path is UTF-8"),
 	}))
 	.expect("serialize Python blocker arguments");
-	within(EVENT_DEADLINE, blocked.commit_args(Bytes::from(args)))
-		.await
-		.expect("commit Python blocker arguments");
+	within(
+		EVENT_DEADLINE,
+		blocked.commit_args(Bytes::from(args), Bytes::from_static(b"cancel-matrix-test-token"), 1000),
+	)
+	.await
+	.expect("commit Python blocker arguments");
 	let blocked_pid = wait_for_pid(&started, EVENT_DEADLINE).await;
 
 	// This is deliberately weaker than cancellation. The worker cannot read the
@@ -482,9 +544,16 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	.await
 	.expect("open Python call after supervisor respawn");
 	expect_accepted(&mut next).await;
-	within(EVENT_DEADLINE, next.commit_args(Bytes::from_static(br#"{"message":"after respawn"}"#)))
-		.await
-		.expect("commit post-respawn Python call");
+	within(
+		EVENT_DEADLINE,
+		next.commit_args(
+			Bytes::from_static(br#"{"message":"after respawn"}"#),
+			Bytes::from_static(b"cancel-matrix-test-token"),
+			1000,
+		),
+	)
+	.await
+	.expect("commit post-respawn Python call");
 	let success = next_verdict(&mut next).await;
 	assert!(!success.is_error);
 	assert!(!success.useless);
@@ -527,9 +596,7 @@ async fn next_verdict(invocation: &mut Invocation) -> omp_proto::env::v1::Verdic
 				InvocationEvent::Verdict(verdict) => return verdict,
 				InvocationEvent::Update(_) => {},
 				InvocationEvent::Accepted(_) => panic!("invocation was accepted twice"),
-				InvocationEvent::StreamError(error) => {
-					panic!("invocation stream lost continuity: {}", error.message)
-				},
+				InvocationEvent::Admission(_) => panic!("unexpected admission query"),
 			}
 		}
 	})
@@ -580,7 +647,6 @@ async fn collect_exec(run: &mut omp_env::ExecRun) -> (Vec<u8>, ExecStatusMsg) {
 				ExecEvent::Started(_) => {},
 				ExecEvent::Output(frame) => output.extend_from_slice(&frame.data),
 				ExecEvent::Exit(exit) => return (output, exit.status.expect("exec terminal status")),
-				ExecEvent::StreamError(error) => panic!("exec stream error: {}", error.message),
 			}
 		}
 	})

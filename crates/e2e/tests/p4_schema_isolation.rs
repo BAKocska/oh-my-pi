@@ -22,9 +22,9 @@ use omp_llm_inference::{
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
-	CapsBase, Claims, Constraint, Ev, IncomingParams, LiftedCall, LoweringCaps, ModelClass, Part,
-	Precedence, Presentation, PromptCaps, RecordedCall, RecordedCallOwned, Registry, Rev, Tool,
-	ToolIdentity, ToolSpec,
+	CapsBase, Claims, Constraint, Effects, Ev, IncomingParams, LiftedCall, LoweringCaps, ModelClass,
+	Part, Precedence, Presentation, PromptCaps, RecordedCall, RecordedCallOwned, Registry, Rev,
+	Tool, ToolIdentity, ToolSpec,
 };
 use prost::Message as _;
 use serde_json::{Value, json};
@@ -54,6 +54,7 @@ impl LiveEdit {
 				description:     Str::new_static("apply a hashline edit"),
 				schema:          Bytes::from_static(HL2_SCHEMA),
 				constraint:      Constraint::Schema { priority: 1 },
+				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
 			allow_lift,
@@ -73,6 +74,7 @@ impl HistoricalEdit {
 				description:     Str::new_static("historical hashline edit"),
 				schema:          Bytes::from_static(HL1_SCHEMA),
 				constraint:      Constraint::Schema { priority: 1 },
+				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
 		}

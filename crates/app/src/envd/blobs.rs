@@ -89,6 +89,11 @@ impl BlobHost {
 		Self { store }
 	}
 
+	/// Borrows the single blob authority for metadata and retention operations.
+	pub(crate) const fn store(&self) -> &BlobStore {
+		&self.store
+	}
+
 	/// Opens the single staged minting path shared by every blob producer.
 	pub(crate) fn begin_spill(&self) -> Result<BlobStage, BlobError> {
 		self.store.begin_put().map_err(BlobError::from)

@@ -1,26 +1,43 @@
 //! Durable append-only journal operations for canonical agent turns.
 
 use std::{
-	collections::{BTreeMap, BTreeSet, VecDeque},
+	collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
 	ops::Deref,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
-use omp_core::Str;
+use omp_core::{InvocationPhase, Principal, Provenance, Str};
 use omp_proto::{inference::v1::Outcome, thread::v1::Item};
-use omp_storage::transcript::{
-	self, AmendPatch, Event, Header, ItemRecord, JobRegistered, JobSettled, Kind, Log,
-	PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState,
-	ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
-};
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
+use omp_storage::{
+	index::{EventProjection, IndexedEvent, IndexedWriteError, JournalPosition, SessionIndex},
+	transcript::{
+		self, AmendPatch, Event, Header, ItemRecord, JobRegistered, JobSettled, Kind, Log,
+		PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState,
+		RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
+		event::Custom,
+		msg::Content,
+		writer::{AppendManyError, JournalError as WriterError},
+	},
+};
 use omp_tool::{Abort, JobRef};
 use parking_lot::{Mutex, MutexGuard};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use thiserror::Error;
 
-use crate::prompt::PromptHash;
+use crate::{
+	journal_kinds::{EntryKindDecl, EntryKindError, EntryKindRegistry},
+	prompt::PromptHash,
+};
 type ActivePrompt = ([u8; 32], Vec<u64>);
 type PendingItem = (u64, Item, Option<[u8; 32]>);
+type ReplayKey = (Str, Str, Str);
+struct IndexedAppend {
+	index:       u64,
+	index_error: Option<omp_storage::index::Error>,
+}
 type PendingItems = Vec<PendingItem>;
 struct CachedReader {
 	transcript:   Reader,
@@ -67,6 +84,182 @@ impl AbortDisposition {
 		matches!(self, Self::Continue)
 	}
 }
+/// Generation fence currently accepted by a session journal owner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JournalGenerations {
+	/// Active extension-host incarnation.
+	pub host:    u64,
+	/// Active session incarnation.
+	pub session: u64,
+}
+
+/// Request identity stamped on every durable journal operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalRequestStamp {
+	/// Unique correlation identifier for this attempt.
+	pub request_id:         Str,
+	/// Stable key shared by retries of one logical operation.
+	pub idempotency_key:    Str,
+	/// Extension-host generation observed by the requester.
+	pub host_generation:    u64,
+	/// Session generation observed by the requester.
+	pub session_generation: u64,
+}
+
+/// Core-authenticated authorship for an extension journal request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalAuthor {
+	/// Authenticated person acting through the daemon.
+	pub principal:  Principal,
+	/// Authenticated exact extension incarnation.
+	pub provenance: Provenance,
+}
+
+/// Unattributed custom payload accepted from an extension worker.
+/// Source, principal, provenance, and the display default are deliberately
+/// absent: the core derives them from the live registry and authenticated
+/// request channel. `rev` is only an assertion checked against that registry.
+#[derive(Debug)]
+pub struct PendingCustomEntry {
+	/// Declared reverse-DNS entry-kind name.
+	pub kind:    Str,
+	/// Revision asserted by the worker's declared entry instance.
+	pub rev:     Str,
+	/// Canonical JSON payload bytes.
+	pub data:    Option<Box<RawValue>>,
+	/// Optional already-materialized model-context projection.
+	pub context: Option<Content>,
+	/// Per-entry display override, or the declaration default.
+	pub display: Option<bool>,
+}
+
+/// One journal operation carried as one single-owner mailbox message.
+#[derive(Debug)]
+pub enum JournalOperation {
+	/// Append one declared custom entry.
+	Append(PendingCustomEntry),
+	/// Append a non-transactional ordered group.
+	AppendMany(Vec<PendingCustomEntry>),
+	/// Append an all-or-nothing ordered group.
+	AppendAtomic(Vec<PendingCustomEntry>),
+	/// Append a label mutation against an earlier physical event.
+	Label {
+		/// Addressed physical event.
+		target: u64,
+		/// New label, or `None` to clear it.
+		label:  Option<Str>,
+	},
+}
+
+/// Authenticated journal request consumed by the session's sole owner.
+#[derive(Debug)]
+pub struct JournalRequest {
+	/// Epoch-millisecond timestamp stamped on all operation events.
+	pub ts:        u64,
+	/// Durable request quartet.
+	pub stamp:     JournalRequestStamp,
+	/// Core-authenticated author.
+	pub author:    JournalAuthor,
+	/// Requested durable operation.
+	pub operation: JournalOperation,
+}
+
+/// Successful result from one journal mailbox request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalReply {
+	/// Physical indexes assigned to the requested entries, excluding the audit
+	/// event that carries the request quartet.
+	pub indexes: Vec<u64>,
+}
+/// Rust-enforced custom-journal query from an authenticated extension.
+#[derive(Clone, Debug)]
+pub struct JournalQuery {
+	/// Calling extension identity.
+	pub caller_extension:   Str,
+	/// Manifest-granted foreign extension namespaces.
+	pub granted_extensions: Vec<Str>,
+	/// Optional exact kind filter.
+	pub kind:               Option<Str>,
+	/// Optional exact recorded revision filter.
+	pub rev:                Option<Str>,
+	/// Exclusive physical event watermark.
+	pub since:              Option<u64>,
+	/// Maximum number of most-recent matches returned in ascending order.
+	pub limit:              Option<usize>,
+	/// Whether abandoned physical branches are excluded.
+	pub live:               bool,
+}
+
+/// One raw custom-journal query result.
+#[derive(Clone, Debug)]
+pub struct JournalCustomEntry {
+	/// Physical journal event index.
+	pub index: u64,
+	/// Core-stamped epoch-millisecond timestamp.
+	pub ts:    u64,
+	/// Strictly decoded custom record with verbatim canonical raw bytes.
+	pub entry: Custom,
+}
+/// Session-scoped compare-and-swap value backed by a physical journal event.
+#[derive(Clone, Debug)]
+pub struct SessionStateValue {
+	/// Physical journal event index, also the session state revision.
+	pub revision: omp_storage::state::StateRevision,
+	/// Namespaced state key.
+	pub key:      Str,
+	/// Verbatim canonical JSON value.
+	pub value:    Box<RawValue>,
+}
+/// Ordered SESSION-state watch delivery.
+#[derive(Clone, Debug)]
+pub enum SessionStateWatchEvent {
+	/// A newer compare-and-swap value committed durably.
+	Value(SessionStateValue),
+	/// The subscription ended with an explicit typed status.
+	Terminal(SessionStateWatchTerminal),
+}
+
+/// Terminal SESSION-state subscription status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionStateWatchTerminal {
+	/// The bounded consumer fell behind; resubscribe after this revision.
+	Lagged {
+		/// Last revision offered before termination.
+		after: Option<omp_storage::state::StateRevision>,
+	},
+	/// The owning journal actor closed.
+	Closed,
+}
+
+struct SessionStateSubscriber {
+	namespace: Str,
+	key:       Str,
+	last:      Option<omp_storage::state::StateRevision>,
+	sender:    flume::Sender<SessionStateWatchEvent>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SessionCasRecord {
+	namespace: Str,
+	key:       Str,
+	value:     Box<RawValue>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SessionContentRecord {
+	namespace: Str,
+	reference: omp_storage::blob::BlobRef,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+enum JournalOperationName {
+	Append,
+	AppendMany,
+	AppendAtomic,
+	Label,
+	StateCompareExchange,
+	StateContent,
+}
 
 /// Journal append or validation failure.
 #[derive(Debug, Error)]
@@ -74,6 +267,100 @@ pub enum JournalError {
 	/// Transcript storage failed.
 	#[error(transparent)]
 	Storage(#[from] transcript::Error),
+	/// A non-atomic group left a proven durable prefix.
+	#[error("journal append_many failed after {count} entries: {source}", count = .appended.len())]
+	Partial {
+		/// Durable custom-entry indexes that landed before failure.
+		appended: Vec<u64>,
+		/// Proven writer failure.
+		#[source]
+		source:   WriterError,
+	},
+	/// Durability could not be proven and this session has halted.
+	#[error("journal durability is indeterminate; the session is halted: {0}")]
+	JournalIndeterminate(#[source] transcript::writer::JournalIndeterminate),
+	/// An atomic request exceeded the durable writer's hard group bound.
+	#[error("atomic journal append has {entries} events; maximum is {maximum}")]
+	AtomicTooLarge {
+		/// Requested event count, including its request audit.
+		entries: usize,
+		/// Durable writer ceiling.
+		maximum: usize,
+	},
+	/// This owner previously observed indeterminate durability.
+	#[error("journal session is halted after an indeterminate write")]
+	Halted,
+	/// A durable request was sent by a stale host or session generation.
+	#[error(
+		"stale journal generation: expected host {expected_host}/session {expected_session}, got \
+		 host {actual_host}/session {actual_session}"
+	)]
+	StaleGeneration {
+		/// Active host generation.
+		expected_host:    u64,
+		/// Active session generation.
+		expected_session: u64,
+		/// Request host generation.
+		actual_host:      u64,
+		/// Request session generation.
+		actual_session:   u64,
+	},
+	/// The request's authenticated provenance disagreed with its host fence.
+	#[error("journal author provenance generation does not match the request generation")]
+	AuthorGenerationMismatch,
+	/// A custom append or label was requested while a turn was pending.
+	#[error("cannot append extension journal state while a turn is pending")]
+	WriteWhilePending,
+	/// A label targeted an absent physical journal event.
+	#[error("journal target {0} is outside the physical event range")]
+	InvalidTarget(u64),
+	/// A core SESSION-state record failed strict decoding.
+	#[error("session state record at journal event {0} is corrupt")]
+	CorruptSessionState(u64),
+	/// An idempotency key was replayed with a different operation or payload.
+	#[error("journal idempotency replay for `{0}` differs from durable truth")]
+	IdempotencyConflict(Str),
+	/// Entry-kind declaration or access validation failed.
+	#[error(transparent)]
+	EntryKind(#[from] EntryKindError),
+	/// A worker supplied context for a kind without a declared projection.
+	#[error("entry kind `{0}` does not declare a model-context projection")]
+	ProjectionNotDeclared(Str),
+	/// A worker asserted a revision other than the live declared revision.
+	#[error("entry kind `{kind}` asserted revision `{actual}`, live revision is `{expected}`")]
+	RevisionMismatch {
+		/// Declared kind.
+		kind:     Str,
+		/// Live registry revision.
+		expected: Str,
+		/// Rejected worker revision.
+		actual:   Str,
+	},
+	/// A repeated invocation phase carried different facts.
+	#[error("invocation {0} replay differs from its durable transition")]
+	InvocationReplayMismatch(Str),
+	/// An invocation skipped, reversed, or restarted its durable phase machine.
+	#[error("invocation {invocation_id} cannot transition from {previous:?} to {next:?}")]
+	InvalidInvocationTransition {
+		/// Stable invocation identity.
+		invocation_id: Str,
+		/// Last durable phase, or `None` before `OPEN`.
+		previous:      Option<InvocationPhase>,
+		/// Rejected next phase.
+		next:          InvocationPhase,
+	},
+	/// The sessions index rejected an event before its journal append.
+	#[error("sessions index rejected journal write: {0}")]
+	SessionIndex(#[source] omp_storage::index::Error),
+	/// The journal committed but its rebuildable sessions-index update failed.
+	#[error("journal event {event_index} committed but sessions index failed: {source}")]
+	SessionIndexAfterJournal {
+		/// Durable event index that must not be appended again.
+		event_index: u64,
+		/// Rebuildable index failure.
+		#[source]
+		source:      omp_storage::index::Error,
+	},
 	/// A sequence amendment targeted a non-item event.
 	#[error("sequence amendment target {0} is not a canonical item")]
 	InvalidItemTarget(u64),
@@ -86,6 +373,9 @@ pub enum JournalError {
 	/// A logical turn was started again with a different prompt identity.
 	#[error("turn start for {0} changed its durable prompt identity")]
 	TurnStartMismatch(Str),
+	/// Session-scoped state routing or CAS validation failed.
+	#[error(transparent)]
+	State(#[from] omp_storage::state::Error),
 	/// A settled failed turn was opened again under the same identity.
 	#[error("turn {0} was already aborted")]
 	TurnAlreadyAborted(Str),
@@ -157,6 +447,7 @@ pub struct Journal {
 	aborted:                 BTreeMap<Str, (u64, AbortDisposition)>,
 	claims:                  BTreeMap<u64, Str>,
 	last_start:              Option<TurnStart>,
+	session_id:              transcript::SessionId,
 	last_receipt:            Option<TurnReceipt>,
 	last_receipt_event:      Option<u64>,
 	active_prompt:           Option<ActivePrompt>,
@@ -169,6 +460,14 @@ pub struct Journal {
 	released_turn_id:        Option<Str>,
 	pending_inputs:          VecDeque<(Str, Vec<u64>)>,
 	item_count:              u64,
+	entry_kinds:             EntryKindRegistry,
+	invocations:             HashMap<Str, (u64, transcript::InvocationTransition)>,
+	generations:             JournalGenerations,
+	request_replays:         HashMap<ReplayKey, Vec<u64>>,
+	halted:                  bool,
+	session_index:           Option<(Arc<SessionIndex>, transcript::SessionId)>,
+	state_subscribers:       HashMap<u64, SessionStateSubscriber>,
+	next_state_subscriber:   u64,
 }
 
 impl Journal {
@@ -186,6 +485,7 @@ impl Journal {
 			claims: BTreeMap::new(),
 			last_start: None,
 			last_receipt: None,
+			session_id: header.id.clone(),
 			last_receipt_event: None,
 			active_prompt: None,
 			pending: BTreeMap::new(),
@@ -197,6 +497,14 @@ impl Journal {
 			pending_inputs: VecDeque::new(),
 			settled_jobs: BTreeMap::new(),
 			item_count: 0,
+			entry_kinds: EntryKindRegistry::new(),
+			invocations: HashMap::new(),
+			generations: JournalGenerations::default(),
+			request_replays: HashMap::new(),
+			halted: false,
+			session_index: None,
+			state_subscribers: HashMap::new(),
+			next_state_subscriber: 0,
 		})
 	}
 
@@ -215,8 +523,10 @@ impl Journal {
 		let mut last_receipt_event = None;
 		let mut authorized_batches = BTreeMap::new();
 		let mut turn_inputs = BTreeMap::<Str, Vec<u64>>::new();
+		let mut invocations = HashMap::<Str, (u64, transcript::InvocationTransition)>::new();
 		let mut turn_input_order = Vec::new();
 		let mut claimed_ever = BTreeSet::new();
+		let mut request_replays = HashMap::<ReplayKey, Vec<u64>>::new();
 		let mut settled_input_events = Vec::new();
 		for index in 0..u64::try_from(log.len()).expect("transcript length fits in u64") {
 			let Some(transcript::Entry::Ok(event)) = log.get(index) else {
@@ -277,6 +587,45 @@ impl Journal {
 				},
 				Kind::ToolBatchAuthorized(batch) => {
 					authorized_batches.insert(batch.turn_id.clone(), (index, batch.call_ids.clone()));
+				},
+				Kind::RequestAudit(audit) => {
+					let key = (
+						audit.extension_id.clone(),
+						audit.idempotency_key.clone(),
+						audit.operation.clone(),
+					);
+					let indexes = audit.indexes.iter().copied().collect::<Vec<_>>();
+					if let Some(previous) = request_replays.insert(key, indexes.clone())
+						&& previous != indexes
+					{
+						return Err(JournalError::IdempotencyConflict(audit.idempotency_key.clone()));
+					}
+				},
+				Kind::InvocationTransition(transition) => {
+					if let Some((_, previous)) = invocations.get(transition.invocation_id.as_str()) {
+						if transition.phase == previous.phase && transition != previous {
+							return Err(JournalError::InvocationReplayMismatch(
+								transition.invocation_id.clone(),
+							));
+						}
+						if transition.phase != previous.phase
+							&& (transition.call_id != previous.call_id
+								|| !previous.phase.can_transition_to(transition.phase))
+						{
+							return Err(JournalError::InvalidInvocationTransition {
+								invocation_id: transition.invocation_id.clone(),
+								previous:      Some(previous.phase),
+								next:          transition.phase,
+							});
+						}
+					} else if transition.phase != InvocationPhase::Open {
+						return Err(JournalError::InvalidInvocationTransition {
+							invocation_id: transition.invocation_id.clone(),
+							previous:      None,
+							next:          transition.phase,
+						});
+					}
+					invocations.insert(transition.invocation_id.clone(), (index, transition.clone()));
 				},
 				_ => {},
 			}
@@ -361,7 +710,9 @@ impl Journal {
 			.into_iter()
 			.filter(|index| !claimed_ever.contains(index))
 			.collect();
-		let reader = Mutex::new(CachedReader::open(path)?);
+		let cached_reader = CachedReader::open(path)?;
+		let session_id = cached_reader.transcript.log().header().id.clone();
+		let reader = Mutex::new(cached_reader);
 		Ok(Self {
 			path: path.to_owned(),
 			writer,
@@ -376,6 +727,7 @@ impl Journal {
 			active_prompt,
 			pending,
 			pending_jobs,
+			session_id,
 			settled_jobs,
 			authorized_batches,
 			recoverable_settlements,
@@ -383,6 +735,14 @@ impl Journal {
 			released_inputs,
 			released_turn_id,
 			item_count,
+			entry_kinds: EntryKindRegistry::new(),
+			invocations,
+			generations: JournalGenerations::default(),
+			request_replays,
+			halted: false,
+			session_index: None,
+			state_subscribers: HashMap::new(),
+			next_state_subscriber: 0,
 		})
 	}
 
@@ -393,12 +753,18 @@ impl Journal {
 	pub fn load(
 		&self,
 	) -> Result<impl Deref<Target = Log> + AsRef<transcript::LiveSet> + '_, JournalError> {
+		if self.halted {
+			return Err(JournalError::Halted);
+		}
 		let mut reader = self.reader.lock();
 		reader.refresh_projection()?;
 		Ok(JournalLog(reader))
 	}
 
-	fn append(&mut self, event: &Event) -> Result<u64, JournalError> {
+	fn prepare_append(&mut self) -> Result<u64, JournalError> {
+		if self.halted {
+			return Err(JournalError::Halted);
+		}
 		let cached = self.reader.get_mut();
 		let before = cached.transcript.refresh()?;
 		if cached.writer_stale || !matches!(before.state, RefreshState::Unchanged) {
@@ -409,30 +775,984 @@ impl Journal {
 			}
 			cached.writer_stale = false;
 		}
-		let expected = cached.transcript.next_index();
-		let appended = self.writer.append(event);
-		let refreshed = cached.transcript.refresh();
-		let index = match appended {
-			Ok(index) => index,
-			Err(error) => {
-				if let Ok(report) = &refreshed {
-					cached.writer_stale = !matches!(report.state, RefreshState::Unchanged);
-				}
-				refreshed?;
-				return Err(error.into());
-			},
-		};
-		let report = refreshed?;
-		if index != expected
-			|| report.next_index != expected.saturating_add(1)
-			|| !matches!(report.state, RefreshState::Advanced { records: 1 })
+		Ok(cached.transcript.next_index())
+	}
+
+	fn refresh_after_append(&mut self, expected: u64, count: usize) -> Result<(), JournalError> {
+		let cached = self.reader.get_mut();
+		let report = cached.transcript.refresh()?;
+		let count = u64::try_from(count).expect("journal request event count fits in u64");
+		if report.next_index != expected.saturating_add(count)
+			|| !matches!(report.state, RefreshState::Advanced { records } if records == count)
 		{
 			self.writer = Writer::open_append(&self.path)?;
 			cached.transcript.refresh()?;
 			cached.writer_stale = false;
 			return Err(refresh_invariant("writer and incremental reader diverged after append"));
 		}
+		Ok(())
+	}
+
+	fn append(&mut self, event: &Event) -> Result<u64, JournalError> {
+		let expected = self.prepare_append()?;
+		match self.writer.append_atomic(std::slice::from_ref(event)) {
+			Ok(indexes) => {
+				self.refresh_after_append(expected, 1)?;
+				Ok(indexes[0])
+			},
+			Err(WriterError::RolledBack { source }) => {
+				self.reader.get_mut().transcript.refresh()?;
+				Err(JournalError::Storage(source))
+			},
+			Err(WriterError::Indeterminate(indeterminate)) => {
+				self.halt_session();
+				Err(JournalError::JournalIndeterminate(indeterminate))
+			},
+			Err(WriterError::TooManyEntries { entries, maximum }) => {
+				Err(JournalError::AtomicTooLarge { entries, maximum })
+			},
+		}
+	}
+
+	/// Attaches the authoritative write-time sessions index for this journal.
+	pub fn attach_session_index(
+		&mut self,
+		index: Arc<SessionIndex>,
+		session: transcript::SessionId,
+	) {
+		self.session_index = Some((index, session));
+	}
+
+	/// Returns the complete committed journal byte watermark.
+	pub fn byte_watermark(&self) -> Result<u64, JournalError> {
+		Ok(self.writer.byte_watermark()?)
+	}
+
+	fn append_indexed_event(
+		&mut self,
+		ts: u64,
+		kind: &'static str,
+		projection: EventProjection<'_>,
+		event: &Event,
+	) -> Result<IndexedAppend, JournalError> {
+		let Some((index, session)) = self.session_index.clone() else {
+			return Ok(IndexedAppend { index: self.append(event)?, index_error: None });
+		};
+		let indexed = IndexedEvent { session: &session, ts_ms: ts, kind, projection };
+		match index.append(&indexed, || {
+			let event_index = self.append(event)?;
+			let byte_watermark = self.writer.byte_watermark()?;
+			Ok((event_index, JournalPosition { event_index, byte_watermark }))
+		}) {
+			Ok(event_index) => Ok(IndexedAppend { index: event_index, index_error: None }),
+			Err(IndexedWriteError::Journal(error)) => Err(error),
+			Err(IndexedWriteError::IndexBeforeJournal(error)) => {
+				Err(JournalError::SessionIndex(error))
+			},
+			Err(IndexedWriteError::IndexAfterJournal { written, source, .. }) => {
+				Ok(IndexedAppend { index: written, index_error: Some(source) })
+			},
+		}
+	}
+
+	/// Appends a title event and updates the attached sessions index in the same
+	/// sole-writer critical section.
+	pub fn append_title(
+		&mut self,
+		ts: u64,
+		title: Str,
+		source: transcript::TitleSource,
+	) -> Result<u64, JournalError> {
+		let event = Event { ts, kind: Kind::Title { title: title.clone(), source } };
+		let appended = self.append_indexed_event(
+			ts,
+			"title",
+			EventProjection::Title { title: title.as_str(), source },
+			&event,
+		)?;
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal {
+				event_index: appended.index,
+				source,
+			});
+		}
+		Ok(appended.index)
+	}
+
+	/// Replaces the host/session generation fence accepted by this owner.
+	pub const fn set_generations(&mut self, generations: JournalGenerations) {
+		self.generations = generations;
+	}
+
+	/// Atomically declares one authenticated extension's complete entry-kind
+	/// set.
+	pub fn declare_entry_kinds(
+		&mut self,
+		extension: &str,
+		declarations: impl IntoIterator<Item = EntryKindDecl>,
+	) -> Result<(), JournalError> {
+		self
+			.entry_kinds
+			.declare_extension(extension, declarations)?;
+		Ok(())
+	}
+
+	/// Borrows the live entry-kind registry for scoped query validation.
+	#[must_use]
+	pub const fn entry_kinds(&self) -> &EntryKindRegistry {
+		&self.entry_kinds
+	}
+
+	/// Persists one adjacent invocation-machine transition through the journal
+	/// owner.
+	///
+	/// An exact repeat of the current phase is idempotent and returns its
+	/// existing event index. Changed facts, skipped phases, reversed phases, and
+	/// call-id changes are rejected before staging bytes.
+	pub fn record_invocation_transition(
+		&mut self,
+		ts: u64,
+		transition: transcript::InvocationTransition,
+	) -> Result<u64, JournalError> {
+		transition.validate().map_err(transcript::Error::from)?;
+		if let Some((index, previous)) = self.invocations.get(transition.invocation_id.as_str()) {
+			if transition.phase == previous.phase {
+				return if transition == *previous {
+					Ok(*index)
+				} else {
+					Err(JournalError::InvocationReplayMismatch(transition.invocation_id.clone()))
+				};
+			}
+			if transition.call_id != previous.call_id
+				|| !previous.phase.can_transition_to(transition.phase)
+			{
+				return Err(JournalError::InvalidInvocationTransition {
+					invocation_id: transition.invocation_id.clone(),
+					previous:      Some(previous.phase),
+					next:          transition.phase,
+				});
+			}
+		} else if transition.phase != InvocationPhase::Open {
+			return Err(JournalError::InvalidInvocationTransition {
+				invocation_id: transition.invocation_id.clone(),
+				previous:      None,
+				next:          transition.phase,
+			});
+		}
+		let invocation_id = transition.invocation_id.clone();
+		let durable = transition.clone();
+		let index = self.append(&Event { ts, kind: Kind::InvocationTransition(transition) })?;
+		self.invocations.insert(invocation_id, (index, durable));
 		Ok(index)
+	}
+
+	/// Handles exactly one authenticated single-owner mailbox request.
+	pub fn handle_request(&mut self, request: JournalRequest) -> Result<JournalReply, JournalError> {
+		let JournalRequest { ts, stamp, author, operation } = request;
+		let indexes = match operation {
+			JournalOperation::Append(entry) => {
+				vec![self.append_custom(ts, entry, &stamp, &author)?]
+			},
+			JournalOperation::AppendMany(entries) => {
+				self.append_custom_many(ts, entries, &stamp, &author)?
+			},
+			JournalOperation::AppendAtomic(entries) => {
+				self.append_custom_atomic(ts, entries, &stamp, &author)?
+			},
+			JournalOperation::Label { target, label } => {
+				vec![self.label(ts, target, label, &stamp, &author)?]
+			},
+		};
+		Ok(JournalReply { indexes })
+	}
+
+	/// Appends one declared extension entry and returns its physical event
+	/// index.
+	pub fn append_custom(
+		&mut self,
+		ts: u64,
+		entry: PendingCustomEntry,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+	) -> Result<u64, JournalError> {
+		let mut indexes = self.append_request_atomic(
+			ts,
+			vec![self.custom_event(ts, entry, author)?],
+			JournalOperationName::Append,
+			stamp,
+			author,
+		)?;
+		Ok(indexes.remove(0))
+	}
+
+	/// Appends a declared-entry group non-transactionally as one writer request.
+	///
+	/// On a clean partial failure, [`JournalError::Partial`] contains only the
+	/// custom entry indexes proven durable; the request-audit index is excluded.
+	pub fn append_custom_many(
+		&mut self,
+		ts: u64,
+		entries: Vec<PendingCustomEntry>,
+		stamp: &JournalRequestStamp,
+
+		author: &JournalAuthor,
+	) -> Result<Vec<u64>, JournalError> {
+		self.validate_request(stamp, author)?;
+		self.ensure_extension_write_allowed()?;
+		let events = entries
+			.into_iter()
+			.map(|entry| self.custom_event(ts, entry, author))
+			.collect::<Result<Vec<_>, _>>()?;
+		if let Some(indexes) =
+			self.replay(stamp, author, JournalOperationName::AppendMany, &events)?
+		{
+			return Ok(indexes);
+		}
+		let expected = self.prepare_append()?;
+		let indexes = payload_indexes(expected, events.len());
+		let audit = self.audit_event(ts, stamp, author, JournalOperationName::AppendMany, &indexes);
+		let mut staged = Vec::with_capacity(events.len().saturating_add(1));
+		staged.push(audit);
+		staged.extend(events);
+		match self.writer.append_many(&staged) {
+			Ok(written) => {
+				self.refresh_after_append(expected, staged.len())?;
+				debug_assert_eq!(written.len(), staged.len());
+				self.remember_replay(stamp, author, JournalOperationName::AppendMany, &indexes);
+				Ok(indexes)
+			},
+			Err(error) => {
+				self.finish_many_error(expected, staged.len(), indexes, stamp, author, error)
+			},
+		}
+	}
+
+	/// Queries extension entries with namespace access enforced in Rust.
+	pub fn query_custom(
+		&self,
+		query: &JournalQuery,
+	) -> Result<Vec<JournalCustomEntry>, JournalError> {
+		if let Some(kind) = &query.kind
+			&& !EntryKindRegistry::can_read_core(kind.as_str())
+		{
+			self.entry_kinds.authorize_read(
+				query.caller_extension.as_str(),
+				query.granted_extensions.iter().map(Str::as_str),
+				kind.as_str(),
+			)?;
+		}
+		let log = self.load()?;
+		let mut entries = Vec::new();
+		for index in 0..u64::try_from(log.len()).expect("journal length fits in u64") {
+			if query.live && !log.as_ref().contains(index) {
+				continue;
+			}
+			if query.since.is_some_and(|since| index <= since) {
+				continue;
+			}
+			let Some(transcript::Entry::Ok(event)) = log.get(index) else {
+				continue;
+			};
+			let Kind::Custom(custom) = &event.kind else {
+				continue;
+			};
+			if custom.kind().starts_with("omp.state.session.") {
+				continue;
+			}
+			if query
+				.kind
+				.as_ref()
+				.is_some_and(|kind| kind.as_str() != custom.kind())
+			{
+				continue;
+			}
+			if query
+				.rev
+				.as_ref()
+				.is_some_and(|rev| Some(rev.as_str()) != custom.rev())
+			{
+				continue;
+			}
+			let readable = EntryKindRegistry::can_read_core(custom.kind())
+				|| custom.source().is_some_and(|source| {
+					source == query.caller_extension.as_str()
+						|| query
+							.granted_extensions
+							.iter()
+							.any(|granted| granted == source)
+				});
+			if !readable {
+				continue;
+			}
+			entries.push(JournalCustomEntry { index, ts: event.ts, entry: custom.clone() });
+		}
+		if let Some(limit) = query.limit
+			&& entries.len() > limit
+		{
+			entries.drain(..entries.len() - limit);
+		}
+		Ok(entries)
+	}
+
+	/// Appends a declared-entry group atomically.
+	///
+	/// A replay under the same authenticated extension and idempotency key
+	/// returns the first request's recorded indexes without appending.
+	pub fn append_custom_atomic(
+		&mut self,
+		ts: u64,
+		entries: Vec<PendingCustomEntry>,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+	) -> Result<Vec<u64>, JournalError> {
+		let events = entries
+			.into_iter()
+			.map(|entry| self.custom_event(ts, entry, author))
+			.collect::<Result<Vec<_>, _>>()?;
+		self.append_request_atomic(ts, events, JournalOperationName::AppendAtomic, stamp, author)
+	}
+
+	/// Appends a label assignment against an addressable earlier event.
+	pub fn label(
+		&mut self,
+		ts: u64,
+		target: u64,
+		label: Option<Str>,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+	) -> Result<u64, JournalError> {
+		self.validate_request(stamp, author)?;
+		self.ensure_extension_write_allowed()?;
+		{
+			let log = self.load()?;
+			if target >= u64::try_from(log.len()).expect("journal length fits in u64") {
+				return Err(JournalError::InvalidTarget(target));
+			}
+		}
+
+		let mut indexes = self.append_request_atomic(
+			ts,
+			vec![Event { ts, kind: Kind::Label { target, label } }],
+			JournalOperationName::Label,
+			stamp,
+			author,
+		)?;
+		Ok(indexes.remove(0))
+	}
+
+	/// Appends a SESSION-scoped typed state entry into this canonical journal.
+	pub fn append_session_state(
+		&mut self,
+		ts: u64,
+		authority: &omp_storage::state::StateAuthority,
+		kind: Str,
+		schema_rev: Str,
+		data: Box<RawValue>,
+		request: &omp_storage::state::DurableRequest,
+	) -> Result<u64, JournalError> {
+		let (stamp, author) = self.session_state_request(authority, request)?;
+		self.append_custom(
+			ts,
+			PendingCustomEntry {
+				kind,
+				rev: schema_rev,
+				data: Some(data),
+				context: None,
+				display: None,
+			},
+			&stamp,
+			&author,
+		)
+	}
+
+	/// Reads SESSION-scoped typed entries through the journal's physical ids,
+	/// liveness, revisions, and Rust namespace gate.
+	pub fn query_session_state(
+		&self,
+		authority: &omp_storage::state::StateAuthority,
+		kind: Str,
+		since: Option<u64>,
+		limit: Option<usize>,
+		live: bool,
+	) -> Result<Vec<JournalCustomEntry>, JournalError> {
+		if authority.session_id() != self.session_id.0.as_str() {
+			return Err(omp_storage::state::Error::InvalidAuthority.into());
+		}
+		let owner = self
+			.entry_kinds
+			.require_declared(kind.as_str())?
+			.extension
+			.clone();
+		if !authority.may_read_namespace(owner.as_str()) {
+			return Err(omp_storage::state::Error::NamespaceDenied.into());
+		}
+		let granted_extensions: Vec<Str> = (owner != authority.namespace())
+			.then_some(owner)
+			.into_iter()
+			.collect();
+		self.query_custom(&JournalQuery {
+			caller_extension: Str::from(authority.namespace()),
+			granted_extensions,
+			kind: Some(kind),
+			rev: None,
+			since,
+			limit,
+			live,
+		})
+	}
+
+	/// Atomically installs a SESSION-scoped JSON value when the journal-backed
+	/// key's current physical revision equals `expected`.
+	pub fn compare_exchange_session_state(
+		&mut self,
+		ts: u64,
+		authority: &omp_storage::state::StateAuthority,
+		key: Str,
+		expected: Option<omp_storage::state::StateRevision>,
+		value: Box<RawValue>,
+		request: &omp_storage::state::DurableRequest,
+	) -> Result<SessionStateValue, JournalError> {
+		if request.idempotency_key().is_none() {
+			return Err(omp_storage::state::Error::MissingIdempotencyKey.into());
+		}
+		let (stamp, author) = self.session_state_request(authority, request)?;
+		let record = SessionCasRecord {
+			namespace: Str::from(authority.namespace()),
+			key:       key.clone(),
+			value:     value.clone(),
+		};
+		let data = serde_json::value::to_raw_value(&record).map_err(transcript::Error::from)?;
+		let custom = Custom::new(
+			Str::new_static("omp.state.session.cas"),
+			Some(Str::new_static("state.1")),
+			Some(Str::from(authority.namespace())),
+			author.principal.clone(),
+			author.provenance.clone(),
+			Some(data),
+			None,
+			false,
+		)
+		.map_err(transcript::Error::from)?;
+		let events = vec![Event { ts, kind: Kind::Custom(custom) }];
+		self.validate_request(&stamp, &author)?;
+		self.ensure_extension_write_allowed()?;
+		if let Some(indexes) =
+			self.replay(&stamp, &author, JournalOperationName::StateCompareExchange, &events)?
+		{
+			let revision = indexes
+				.first()
+				.copied()
+				.ok_or_else(|| JournalError::IdempotencyConflict(stamp.idempotency_key.clone()))?;
+			return Ok(SessionStateValue {
+				revision: omp_storage::state::StateRevision::new(revision),
+				key,
+				value,
+			});
+		}
+		let actual = self.latest_session_state_value(authority.namespace(), key.as_str())?;
+		let actual_revision = actual.as_ref().map(|state| state.revision);
+		if actual_revision != expected {
+			return Err(
+				omp_storage::state::Error::CasConflict { expected, actual: actual_revision }.into(),
+			);
+		}
+		let indexes = self.append_request_atomic(
+			ts,
+			events,
+			JournalOperationName::StateCompareExchange,
+			&stamp,
+			&author,
+		)?;
+		let revision = indexes[0];
+		let state = SessionStateValue {
+			revision: omp_storage::state::StateRevision::new(revision),
+			key,
+			value,
+		};
+		self.publish_session_state(authority.namespace(), &state);
+		Ok(state)
+	}
+
+	/// Subscribes to newer SESSION-state values for the authenticated
+	/// extension's key.
+	///
+	/// Catch-up is delivered before the subscriber is registered while the sole
+	/// journal owner is borrowed, so no commit can race between the two. The
+	/// bounded channel reserves one slot for a typed terminal status.
+	pub fn subscribe_session_state(
+		&mut self,
+		authority: &omp_storage::state::StateAuthority,
+		key: Str,
+		since: Option<omp_storage::state::StateRevision>,
+	) -> Result<flume::Receiver<SessionStateWatchEvent>, JournalError> {
+		if authority.session_id() != self.session_id.0.as_str() {
+			return Err(omp_storage::state::Error::InvalidAuthority.into());
+		}
+		if !authority.may_read_namespace(authority.namespace()) {
+			return Err(omp_storage::state::Error::NamespaceDenied.into());
+		}
+		let latest = self.latest_session_state_value(authority.namespace(), key.as_str())?;
+		let (sender, receiver) = flume::bounded(2);
+		let mut last = since;
+		if let Some(value) = latest
+			&& since.is_none_or(|revision| value.revision > revision)
+		{
+			last = Some(value.revision);
+			sender
+				.try_send(SessionStateWatchEvent::Value(value))
+				.expect("new state subscription has capacity");
+		}
+		let subscriber = self.next_state_subscriber;
+		self.next_state_subscriber = self.next_state_subscriber.wrapping_add(1);
+		self
+			.state_subscribers
+			.insert(subscriber, SessionStateSubscriber {
+				namespace: Str::from(authority.namespace()),
+				key,
+				last,
+				sender,
+			});
+		Ok(receiver)
+	}
+
+	fn publish_session_state(&mut self, namespace: &str, value: &SessionStateValue) {
+		self.state_subscribers.retain(|_, subscriber| {
+			if subscriber.sender.is_disconnected() {
+				return false;
+			}
+			if subscriber.namespace != namespace
+				|| subscriber.key != value.key
+				|| subscriber
+					.last
+					.is_some_and(|revision| revision >= value.revision)
+			{
+				return true;
+			}
+			if !subscriber.sender.is_empty() {
+				let _ = subscriber.sender.try_send(SessionStateWatchEvent::Terminal(
+					SessionStateWatchTerminal::Lagged { after: subscriber.last },
+				));
+				return false;
+			}
+			match subscriber
+				.sender
+				.try_send(SessionStateWatchEvent::Value(value.clone()))
+			{
+				Ok(()) => {
+					subscriber.last = Some(value.revision);
+					true
+				},
+				Err(flume::TrySendError::Disconnected(_)) => false,
+				Err(flume::TrySendError::Full(_)) => {
+					let _ = subscriber.sender.try_send(SessionStateWatchEvent::Terminal(
+						SessionStateWatchTerminal::Lagged { after: subscriber.last },
+					));
+					false
+				},
+			}
+		});
+	}
+
+	fn halt_session(&mut self) {
+		self.halted = true;
+		for subscriber in self.state_subscribers.values() {
+			let _ = subscriber
+				.sender
+				.try_send(SessionStateWatchEvent::Terminal(SessionStateWatchTerminal::Closed));
+		}
+		self.state_subscribers.clear();
+	}
+
+	/// Returns the authenticated extension's latest live SESSION-scoped value.
+	///
+	/// Session identity and namespace authority are checked before any journal
+	/// read, so CONTROL dispatch never accepts a worker-supplied namespace.
+	pub fn latest_session_state(
+		&self,
+		authority: &omp_storage::state::StateAuthority,
+		key: &str,
+	) -> Result<Option<SessionStateValue>, JournalError> {
+		if authority.session_id() != self.session_id.0.as_str() {
+			return Err(omp_storage::state::Error::InvalidAuthority.into());
+		}
+		if !authority.may_read_namespace(authority.namespace()) {
+			return Err(omp_storage::state::Error::NamespaceDenied.into());
+		}
+		self.latest_session_state_value(authority.namespace(), key)
+	}
+
+	/// Returns the latest live SESSION-scoped value for one trusted namespace.
+	fn latest_session_state_value(
+		&self,
+		namespace: &str,
+		key: &str,
+	) -> Result<Option<SessionStateValue>, JournalError> {
+		let log = self.load()?;
+		for (index, event) in log.custom(log.as_ref(), "omp.state.session.cas").rev() {
+			let Kind::Custom(custom) = &event.kind else {
+				continue;
+			};
+			if custom.source() != Some(namespace) {
+				continue;
+			}
+			let Some(data) = custom.data() else {
+				return Err(JournalError::CorruptSessionState(index));
+			};
+			let record = serde_json::from_str::<SessionCasRecord>(data.get())
+				.map_err(|_| JournalError::CorruptSessionState(index))?;
+			if record.namespace == namespace && record.key == key {
+				return Ok(Some(SessionStateValue {
+					revision: omp_storage::state::StateRevision::new(index),
+					key:      record.key,
+					value:    record.value,
+				}));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Roots an already-adopted blob from the SESSION journal so reachability is
+	/// governed by the same physical history and liveness rules.
+	pub fn root_session_state_content(
+		&mut self,
+		ts: u64,
+		authority: &omp_storage::state::StateAuthority,
+		reference: omp_storage::blob::BlobRef,
+		request: &omp_storage::state::DurableRequest,
+	) -> Result<omp_storage::state::ContentRoot, JournalError> {
+		if request.idempotency_key().is_none() {
+			return Err(omp_storage::state::Error::MissingIdempotencyKey.into());
+		}
+		let (stamp, author) = self.session_state_request(authority, request)?;
+		let record = SessionContentRecord { namespace: Str::from(authority.namespace()), reference };
+		let data = serde_json::value::to_raw_value(&record).map_err(transcript::Error::from)?;
+		let custom = Custom::new(
+			Str::new_static("omp.state.session.content"),
+			Some(Str::new_static("state.1")),
+			Some(Str::from(authority.namespace())),
+			author.principal.clone(),
+			author.provenance.clone(),
+			Some(data),
+			None,
+			false,
+		)
+		.map_err(transcript::Error::from)?;
+		let events = vec![Event { ts, kind: Kind::Custom(custom) }];
+		self.validate_request(&stamp, &author)?;
+		self.ensure_extension_write_allowed()?;
+		if let Some(indexes) =
+			self.replay(&stamp, &author, JournalOperationName::StateContent, &events)?
+		{
+			let revision = indexes
+				.first()
+				.copied()
+				.ok_or_else(|| JournalError::IdempotencyConflict(stamp.idempotency_key.clone()))?;
+			return Ok(omp_storage::state::ContentRoot {
+				revision: omp_storage::state::StateRevision::new(revision),
+				reference,
+			});
+		}
+		let indexes = self.append_request_atomic(
+			ts,
+			events,
+			JournalOperationName::StateContent,
+			&stamp,
+			&author,
+		)?;
+		Ok(omp_storage::state::ContentRoot {
+			revision: omp_storage::state::StateRevision::new(indexes[0]),
+			reference,
+		})
+	}
+
+	/// Reports whether a blob reference is rooted by a live SESSION journal
+	/// entry in a namespace readable by the authenticated authority.
+	pub fn session_state_content_is_rooted(
+		&self,
+		authority: &omp_storage::state::StateAuthority,
+		namespace: &str,
+		reference: &omp_storage::blob::BlobRef,
+	) -> Result<bool, JournalError> {
+		if authority.session_id() != self.session_id.0.as_str() {
+			return Err(omp_storage::state::Error::InvalidAuthority.into());
+		}
+		if !authority.may_read_namespace(namespace) {
+			return Err(omp_storage::state::Error::NamespaceDenied.into());
+		}
+		let log = self.load()?;
+		for (index, event) in log.custom(log.as_ref(), "omp.state.session.content").rev() {
+			let Kind::Custom(custom) = &event.kind else {
+				continue;
+			};
+			if custom.source() != Some(namespace) {
+				continue;
+			}
+			let Some(data) = custom.data() else {
+				return Err(JournalError::CorruptSessionState(index));
+			};
+			let record = serde_json::from_str::<SessionContentRecord>(data.get())
+				.map_err(|_| JournalError::CorruptSessionState(index))?;
+			if record.namespace == namespace && record.reference == *reference {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	fn session_state_request(
+		&self,
+		authority: &omp_storage::state::StateAuthority,
+		request: &omp_storage::state::DurableRequest,
+	) -> Result<(JournalRequestStamp, JournalAuthor), JournalError> {
+		if authority.session_id() != self.session_id.0.as_str() {
+			return Err(omp_storage::state::Error::InvalidAuthority.into());
+		}
+		let generation = request.generation();
+		let stamp = JournalRequestStamp {
+			request_id:         Str::from(request.request_id()),
+			idempotency_key:    Str::from(
+				request
+					.idempotency_key()
+					.unwrap_or_else(|| request.request_id()),
+			),
+			host_generation:    generation.host,
+			session_generation: generation.session,
+		};
+		let author = JournalAuthor {
+			principal:  authority.principal().clone(),
+			provenance: authority.provenance().clone(),
+		};
+		Ok((stamp, author))
+	}
+
+	fn validate_request(
+		&self,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+	) -> Result<(), JournalError> {
+		if self.halted {
+			return Err(JournalError::Halted);
+		}
+		if stamp.host_generation != self.generations.host
+			|| stamp.session_generation != self.generations.session
+		{
+			return Err(JournalError::StaleGeneration {
+				expected_host:    self.generations.host,
+				expected_session: self.generations.session,
+				actual_host:      stamp.host_generation,
+				actual_session:   stamp.session_generation,
+			});
+		}
+		if author.provenance.generation() != stamp.host_generation {
+			return Err(JournalError::AuthorGenerationMismatch);
+		}
+		Ok(())
+	}
+
+	fn ensure_extension_write_allowed(&self) -> Result<(), JournalError> {
+		if self.pending_turn().is_some() {
+			return Err(JournalError::WriteWhilePending);
+		}
+		Ok(())
+	}
+
+	fn custom_event(
+		&self,
+		ts: u64,
+		entry: PendingCustomEntry,
+		author: &JournalAuthor,
+	) -> Result<Event, JournalError> {
+		let record = self.entry_kinds.require_declared(entry.kind.as_str())?;
+		let live_rev = Str::from(record.rev.to_string());
+		if entry.rev != live_rev {
+			return Err(JournalError::RevisionMismatch {
+				kind:     entry.kind,
+				expected: live_rev,
+				actual:   entry.rev,
+			});
+		}
+		if record.extension != author.provenance.extension_id() {
+			return Err(
+				EntryKindError::AccessDenied {
+					extension: Str::from(author.provenance.extension_id()),
+					kind:      entry.kind,
+				}
+				.into(),
+			);
+		}
+		if entry.context.is_some() && !record.projects {
+			return Err(JournalError::ProjectionNotDeclared(entry.kind));
+		}
+		let custom = Custom::new(
+			entry.kind,
+			Some(live_rev),
+			Some(record.extension.clone()),
+			author.principal.clone(),
+			author.provenance.clone(),
+			entry.data,
+			entry.context,
+			entry.display.unwrap_or(record.display),
+		)
+		.map_err(transcript::Error::from)?;
+		Ok(Event { ts, kind: Kind::Custom(custom) })
+	}
+
+	fn append_request_atomic(
+		&mut self,
+		ts: u64,
+		events: Vec<Event>,
+		operation: JournalOperationName,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+	) -> Result<Vec<u64>, JournalError> {
+		self.validate_request(stamp, author)?;
+		self.ensure_extension_write_allowed()?;
+		if let Some(indexes) = self.replay(stamp, author, operation, &events)? {
+			return Ok(indexes);
+		}
+		let expected = self.prepare_append()?;
+		let indexes = payload_indexes(expected, events.len());
+		let audit = self.audit_event(ts, stamp, author, operation, &indexes);
+		let mut staged = Vec::with_capacity(events.len().saturating_add(1));
+		staged.push(audit);
+		staged.extend(events);
+		match self.writer.append_atomic(&staged) {
+			Ok(written) => {
+				self.refresh_after_append(expected, staged.len())?;
+				debug_assert_eq!(written.len(), staged.len());
+				self.remember_replay(stamp, author, operation, &indexes);
+				Ok(indexes)
+			},
+			Err(WriterError::RolledBack { source }) => {
+				self.reader.get_mut().transcript.refresh()?;
+				Err(JournalError::Storage(source))
+			},
+			Err(WriterError::Indeterminate(indeterminate)) => {
+				self.halt_session();
+				Err(JournalError::JournalIndeterminate(indeterminate))
+			},
+			Err(WriterError::TooManyEntries { entries, maximum }) => {
+				Err(JournalError::AtomicTooLarge { entries, maximum })
+			},
+		}
+	}
+
+	fn audit_event(
+		&self,
+		ts: u64,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+		operation: JournalOperationName,
+		indexes: &[u64],
+	) -> Event {
+		Event {
+			ts,
+			kind: Kind::RequestAudit(RequestAudit {
+				request_id:         stamp.request_id.clone(),
+				idempotency_key:    stamp.idempotency_key.clone(),
+				extension_id:       Str::from(author.provenance.extension_id()),
+				host_generation:    stamp.host_generation,
+				session_generation: stamp.session_generation,
+				operation:          Str::from(operation.to_string()),
+				indexes:            indexes.iter().copied().collect(),
+			}),
+		}
+	}
+
+	fn replay(
+		&self,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+		operation: JournalOperationName,
+		events: &[Event],
+	) -> Result<Option<Vec<u64>>, JournalError> {
+		let extension = author.provenance.extension_id();
+		let operation = operation.to_string();
+		if self
+			.request_replays
+			.keys()
+			.any(|(recorded_extension, key, recorded_operation)| {
+				recorded_extension == extension
+					&& key == stamp.idempotency_key.as_str()
+					&& recorded_operation != operation.as_str()
+			}) {
+			return Err(JournalError::IdempotencyConflict(stamp.idempotency_key.clone()));
+		}
+		let key = (extension, stamp.idempotency_key.as_str(), operation.as_str());
+		let Some(indexes) = self.request_replays.iter().find_map(
+			|((recorded_extension, recorded_key, recorded_operation), indexes)| {
+				(recorded_extension == key.0 && recorded_key == key.1 && recorded_operation == key.2)
+					.then_some(indexes)
+			},
+		) else {
+			return Ok(None);
+		};
+		if indexes.len() != events.len() {
+			return Err(JournalError::IdempotencyConflict(stamp.idempotency_key.clone()));
+		}
+		let log = self.load()?;
+		let mut recorded = Vec::with_capacity(indexes.len());
+		for (index, expected) in indexes.iter().zip(events) {
+			let Some(transcript::Entry::Ok(actual)) = log.get(*index) else {
+				break;
+			};
+			if actual.kind != expected.kind {
+				return Err(JournalError::IdempotencyConflict(stamp.idempotency_key.clone()));
+			}
+			recorded.push(*index);
+		}
+		Ok(Some(recorded))
+	}
+
+	fn remember_replay(
+		&mut self,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+		operation: JournalOperationName,
+		indexes: &[u64],
+	) {
+		self.request_replays.insert(
+			(
+				Str::from(author.provenance.extension_id()),
+				stamp.idempotency_key.clone(),
+				Str::from(operation.to_string()),
+			),
+			indexes.to_vec(),
+		);
+	}
+
+	fn finish_many_error(
+		&mut self,
+		expected: u64,
+		staged_count: usize,
+		indexes: Vec<u64>,
+		stamp: &JournalRequestStamp,
+		author: &JournalAuthor,
+		error: AppendManyError,
+	) -> Result<Vec<u64>, JournalError> {
+		match error.source {
+			WriterError::Indeterminate(indeterminate) => {
+				self.halt_session();
+				Err(JournalError::JournalIndeterminate(indeterminate))
+			},
+			source @ (WriterError::RolledBack { .. } | WriterError::TooManyEntries { .. }) => {
+				let written = error.appended.len();
+				if written != 0 {
+					self.refresh_after_append(expected, written)?;
+				} else {
+					self.reader.get_mut().transcript.refresh()?;
+				}
+				let appended = if error.appended.first() == Some(&expected) {
+					let count = error.appended.len().saturating_sub(1);
+					self.remember_replay(stamp, author, JournalOperationName::AppendMany, &indexes);
+					indexes[..count.min(indexes.len())].to_vec()
+				} else {
+					Vec::new()
+				};
+				debug_assert!(written <= staged_count);
+				Err(JournalError::Partial { appended, source })
+			},
+		}
 	}
 
 	/// Appends one local item optimistically with sequence zero.
@@ -499,6 +1819,9 @@ impl Journal {
 		head: &[Item],
 		preserved_tail: &[u64],
 	) -> Result<Vec<u64>, JournalError> {
+		if self.halted {
+			return Err(JournalError::Halted);
+		}
 		{
 			let mut reader = self.reader.lock();
 			reader.refresh_projection()?;
@@ -694,6 +2017,9 @@ impl Journal {
 
 	/// Returns every live canonical item event in projection order.
 	pub fn live_item_events(&self) -> Result<Vec<u64>, JournalError> {
+		if self.halted {
+			return Err(JournalError::Halted);
+		}
 		let mut reader = self.reader.lock();
 		reader.refresh_projection()?;
 		Ok(reader
@@ -775,7 +2101,14 @@ impl Journal {
 			outcome,
 		};
 
-		let receipt_event = self.append(&Event { ts, kind: Kind::TurnReceipt(receipt.clone()) })?;
+		let receipt_record = Event { ts, kind: Kind::TurnReceipt(receipt.clone()) };
+		let appended = self.append_indexed_event(
+			ts,
+			"turn_receipt",
+			EventProjection::TurnReceipt { outcome: &receipt.outcome, failed: false },
+			&receipt_record,
+		)?;
+		let receipt_event = appended.index;
 		self.pending.remove(turn_id.as_str());
 		self.starts.remove(turn_id.as_str());
 		self.claims.retain(|_, claimed| claimed != &turn_id);
@@ -784,6 +2117,9 @@ impl Journal {
 		self.released_inputs.clear();
 		self.released_turn_id = None;
 		self.receipts.insert(turn_id, receipt.clone());
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal { event_index: receipt_event, source });
+		}
 		Ok((receipt, false))
 	}
 
@@ -1018,6 +2354,25 @@ impl Journal {
 	pub const fn item_count(&self) -> u64 {
 		self.item_count
 	}
+}
+impl Drop for Journal {
+	fn drop(&mut self) {
+		for subscriber in self.state_subscribers.values() {
+			let _ = subscriber
+				.sender
+				.try_send(SessionStateWatchEvent::Terminal(SessionStateWatchTerminal::Closed));
+		}
+	}
+}
+
+fn payload_indexes(audit_index: u64, count: usize) -> Vec<u64> {
+	(0..count)
+		.map(|offset| {
+			audit_index
+				.saturating_add(1)
+				.saturating_add(u64::try_from(offset).expect("journal request count fits in u64"))
+		})
+		.collect()
 }
 
 fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)>, JournalError> {

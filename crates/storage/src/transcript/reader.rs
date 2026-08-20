@@ -234,7 +234,7 @@ impl Log {
 						if live.contains(index)
 							&& matches!(
 								&event.kind,
-								Kind::Custom { kind: event_kind, .. } if event_kind.as_str() == kind
+								Kind::Custom(custom) if custom.kind() == kind
 							) =>
 					{
 						Some((index, event.as_ref()))

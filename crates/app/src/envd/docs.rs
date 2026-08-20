@@ -12,6 +12,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use omp_docserver::{
+	client::{TerminalEventReceiver, terminal_event_channel},
 	connection::{PROTOCOL_MAJOR, PROTOCOL_MINOR},
 	wire::{self, FrameConfig},
 };
@@ -38,6 +39,62 @@ pub struct DocumentHello {
 	/// Build identity of the serving document authority; empty means unknown.
 	pub server_build:   Str,
 }
+/// A terminal loss of continuity in a document-server event stream.
+#[derive(Clone, Debug, Error)]
+#[error("document event stream ended ({failure:?}); skipped {skipped_events} events: {message}")]
+pub struct EventStreamError {
+	/// Stream family whose continuity was lost.
+	pub stream:         pb::EventStreamKind,
+	/// Terminal failure classification.
+	pub failure:        pb::EventStreamFailure,
+	/// Number of events overwritten before a lag failure.
+	pub skipped_events: u64,
+	/// Server-provided diagnostic.
+	pub message:        Str,
+}
+
+/// One connection-wide LSP registry event.
+#[derive(Clone, Debug)]
+pub enum LspRegistryEvent {
+	/// Notification emitted by a bound language server.
+	Event(pb::LspEvent),
+	/// Binding lifecycle or synchronization-policy change.
+	Binding(pb::LspBindingEvent),
+}
+
+/// The terminally contiguous event stream attached to an open document lease.
+#[derive(Debug)]
+pub struct DocumentEvents {
+	receiver: TerminalEventReceiver<pb::DocumentEvent, EventStreamError>,
+}
+
+impl DocumentEvents {
+	/// Waits for the next event, returning the terminal continuity error once.
+	pub async fn next_event(&self) -> Result<pb::DocumentEvent, EventStreamError> {
+		self
+			.receiver
+			.next_event()
+			.await
+			.unwrap_or_else(|| Err(closed_stream_error(pb::EventStreamKind::Document)))
+	}
+}
+
+/// The terminally contiguous connection-wide LSP event stream.
+#[derive(Debug)]
+pub struct LspEvents {
+	receiver: TerminalEventReceiver<LspRegistryEvent, EventStreamError>,
+}
+
+impl LspEvents {
+	/// Waits for the next LSP or binding event.
+	pub async fn next_event(&self) -> Result<LspRegistryEvent, EventStreamError> {
+		self
+			.receiver
+			.next_event()
+			.await
+			.unwrap_or_else(|| Err(closed_stream_error(pb::EventStreamKind::LspRegistry)))
+	}
+}
 
 /// A document-server lease pinned to the revision returned by `OpenDocument`.
 ///
@@ -48,6 +105,7 @@ pub struct DocumentLease {
 	lease_id: Bytes,
 	head:     pb::DocumentHead,
 	host:     Arc<Inner>,
+	events:   Option<DocumentEvents>,
 	released: bool,
 }
 
@@ -60,6 +118,13 @@ impl DocumentLease {
 	/// Returns the immutable head to which reads and edits are pinned.
 	pub const fn head(&self) -> &pb::DocumentHead {
 		&self.head
+	}
+
+	/// Takes the terminally contiguous event stream for this lease.
+	///
+	/// A lease has exactly one event consumer. Subsequent calls return `None`.
+	pub fn take_events(&mut self) -> Option<DocumentEvents> {
+		self.events.take()
 	}
 
 	/// Advances this lease to a committed head returned for the same document.
@@ -81,8 +146,42 @@ impl DocumentLease {
 			)))
 	}
 }
+/// Connection-owned exclusive workspace reservation.
+#[derive(Debug)]
+pub struct WorkspaceLease {
+	lease_id: Bytes,
+	host:     Arc<Inner>,
+	released: bool,
+}
+
+impl WorkspaceLease {
+	/// Returns the opaque reservation identity.
+	pub const fn id(&self) -> &Bytes {
+		&self.lease_id
+	}
+}
+
+impl Drop for WorkspaceLease {
+	fn drop(&mut self) {
+		if self.released || self.host.shutdown.is_cancelled() {
+			return;
+		}
+		let request_id = self.host.next_request.fetch_add(1, Ordering::Relaxed);
+		if request_id == 0 {
+			return;
+		}
+		let _ = self.host.writer.try_send(pb::ClientFrame {
+			request_id,
+			body: Some(pb::client_frame::Body::ReleaseWorkspaceLease(
+				pb::ReleaseWorkspaceLeaseRequest { workspace_lease_id: self.lease_id.clone() },
+			)),
+		});
+	}
+}
+
 impl Drop for DocumentLease {
 	fn drop(&mut self) {
+		self.host.document_events.lock().remove(&self.lease_id);
 		if self.released || self.host.shutdown.is_cancelled() {
 			return;
 		}
@@ -126,14 +225,22 @@ pub enum DocumentError {
 
 #[derive(Debug)]
 struct Inner {
-	hello:           DocumentHello,
-	writer:          flume::Sender<pb::ClientFrame>,
-	pending:         Arc<Mutex<HashMap<u64, flume::Sender<pb::ServerFrame>>>>,
-	next_request:    AtomicU64,
-	shutdown:        CancellationToken,
-	snapshot_store:  Mutex<SnapshotStore>,
-	clipboard:       Mutex<Clipboard>,
-	noop_loop_guard: Mutex<NoopLoopGuard>,
+	hello:                    DocumentHello,
+	writer:                   flume::Sender<pb::ClientFrame>,
+	pending:                  Arc<Mutex<HashMap<u64, flume::Sender<pb::ServerFrame>>>>,
+	document_events: Arc<
+		Mutex<HashMap<Bytes, (Bytes, flume::Sender<Result<pb::DocumentEvent, EventStreamError>>)>>,
+	>,
+	pending_document_events:
+		Arc<Mutex<HashMap<Bytes, Vec<Result<pb::DocumentEvent, EventStreamError>>>>>,
+	document_event_sequences: Arc<Mutex<HashMap<Bytes, u64>>>,
+	lsp_event_sender:         flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
+	lsp_events:               Mutex<Option<LspEvents>>,
+	next_request:             AtomicU64,
+	shutdown:                 CancellationToken,
+	snapshot_store:           Mutex<SnapshotStore>,
+	clipboard:                Mutex<Clipboard>,
+	noop_loop_guard:          Mutex<NoopLoopGuard>,
 }
 
 /// Concrete env-side owner of one multiplexed `document/v1` client connection.
@@ -199,10 +306,16 @@ impl DocumentHost {
 		};
 
 		let (write_tx, write_rx) = flume::unbounded();
+		let (lsp_event_sender, lsp_event_receiver) = terminal_event_channel();
 		let inner = Arc::new(Inner {
 			hello,
 			writer: write_tx,
 			pending: Arc::new(Mutex::new(HashMap::new())),
+			document_events: Arc::new(Mutex::new(HashMap::new())),
+			pending_document_events: Arc::new(Mutex::new(HashMap::new())),
+			document_event_sequences: Arc::new(Mutex::new(HashMap::new())),
+			lsp_event_sender,
+			lsp_events: Mutex::new(Some(LspEvents { receiver: lsp_event_receiver })),
 			next_request: AtomicU64::new(1),
 			shutdown: CancellationToken::new(),
 			snapshot_store: Mutex::new(SnapshotStore::default()),
@@ -225,6 +338,10 @@ impl DocumentHost {
 		});
 
 		let reader_pending = Arc::clone(&inner.pending);
+		let reader_document_events = Arc::clone(&inner.document_events);
+		let reader_document_event_sequences = Arc::clone(&inner.document_event_sequences);
+		let reader_pending_document_events = Arc::clone(&inner.pending_document_events);
+		let reader_lsp_events = inner.lsp_event_sender.clone();
 		let reader_shutdown = inner.shutdown.clone();
 		tokio::spawn(async move {
 			loop {
@@ -238,6 +355,15 @@ impl DocumentHost {
 					},
 				};
 				if frame.request_id == 0 {
+					if let Some(body) = frame.body {
+						dispatch_event_frame(
+							body,
+							&reader_document_events,
+							&reader_pending_document_events,
+							&reader_document_event_sequences,
+							&reader_lsp_events,
+						);
+					}
 					continue;
 				}
 				let waiter = reader_pending.lock().remove(&frame.request_id);
@@ -250,6 +376,11 @@ impl DocumentHost {
 			for (request_id, waiter) in waiters {
 				let _ = waiter.send(disconnected_frame(request_id));
 			}
+			let closed = closed_stream_error(pb::EventStreamKind::Document);
+			for (_, sender) in std::mem::take(&mut *reader_document_events.lock()).into_values() {
+				let _ = sender.send(Err(closed.clone()));
+			}
+			let _ = reader_lsp_events.send(Err(closed_stream_error(pb::EventStreamKind::LspRegistry)));
 		});
 
 		Ok(Self { inner })
@@ -292,6 +423,13 @@ impl DocumentHost {
 		&self.inner.noop_loop_guard
 	}
 
+	/// Takes the connection-wide LSP registry event stream.
+	///
+	/// A protocol connection has exactly one ordered LSP event consumer.
+	pub fn take_lsp_events(&self) -> Option<LspEvents> {
+		self.inner.lsp_events.lock().take()
+	}
+
 	/// Acquires a document lease and pins it to the returned immutable revision.
 	pub async fn open(
 		&self,
@@ -328,13 +466,46 @@ impl DocumentHost {
 			.head
 			.clone()
 			.ok_or_else(|| unexpected("OpenDocumentResponse.head"))?;
+		let document_id = head
+			.document
+			.as_ref()
+			.map(|document| document.id.clone())
+			.filter(|id| !id.is_empty())
+			.ok_or_else(|| unexpected("OpenDocumentResponse.head.document.id"))?;
 		if opened.lease_id.len() != 16 || head.revision.is_none() {
 			return Err(unexpected("valid lease id and pinned revision"));
+		}
+		let (event_sender, event_receiver) = terminal_event_channel();
+		self
+			.inner
+			.document_events
+			.lock()
+			.insert(opened.lease_id.clone(), (document_id.clone(), event_sender.clone()));
+		if let Some(events) = self
+			.inner
+			.pending_document_events
+			.lock()
+			.remove(&document_id)
+		{
+			for event in events {
+				let _ = event_sender.send(event);
+			}
+		}
+		if let Some(events) = self
+			.inner
+			.pending_document_events
+			.lock()
+			.remove(&opened.lease_id)
+		{
+			for event in events {
+				let _ = event_sender.send(event);
+			}
 		}
 		let lease = DocumentLease {
 			lease_id: opened.lease_id.clone(),
 			head,
 			host: Arc::clone(&self.inner),
+			events: Some(DocumentEvents { receiver: event_receiver }),
 			released: false,
 		};
 		Ok((lease, opened))
@@ -502,6 +673,270 @@ impl DocumentHost {
 		Ok(response)
 	}
 
+	/// Resolves an existing path to its host-canonical file URI.
+	pub async fn canonicalize(
+		&self,
+		request: pb::CanonicalizePathRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CanonicalizePathResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::CanonicalizePath(request), cancel)
+			.await?;
+		let pb::server_frame::Body::PathCanonicalized(response) = body else {
+			return Err(unexpected("CanonicalizePathResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Reads stat or lstat metadata through the document authority.
+	pub async fn stat(
+		&self,
+		request: pb::StatPathRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::StatPathResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::StatPath(request), cancel)
+			.await?;
+		let pb::server_frame::Body::PathStat(response) = body else {
+			return Err(unexpected("StatPathResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Enumerates one directory through the document authority.
+	pub async fn list_directory(
+		&self,
+		request: pb::ListDirectoryRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::ListDirectoryResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::ListDirectory(request), cancel)
+			.await?;
+		let pb::server_frame::Body::DirectoryListed(response) = body else {
+			return Err(unexpected("ListDirectoryResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Creates a directory through the document authority.
+	pub async fn create_directory(
+		&self,
+		request: pb::CreateDirectoryRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CreateDirectoryResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::CreateDirectory(request), cancel)
+			.await?;
+		let pb::server_frame::Body::DirectoryCreated(response) = body else {
+			return Err(unexpected("CreateDirectoryResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Removes a path under the authority's active-document revision checks.
+	pub async fn remove(
+		&self,
+		request: pb::RemovePathRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::RemovePathResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::RemovePath(request), cancel)
+			.await?;
+		let pb::server_frame::Body::PathRemoved(response) = body else {
+			return Err(unexpected("RemovePathResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Renames a path under exact source and destination revision checks.
+	pub async fn rename(
+		&self,
+		request: pb::RenamePathRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::RenamePathResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::RenamePath(request), cancel)
+			.await?;
+		let pb::server_frame::Body::PathRenamed(response) = body else {
+			return Err(unexpected("RenamePathResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Copies a regular file or symbolic link without bypassing the authority.
+	pub async fn copy(
+		&self,
+		request: pb::CopyPathRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CopyPathResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::CopyPath(request), cancel)
+			.await?;
+		let pb::server_frame::Body::PathCopied(response) = body else {
+			return Err(unexpected("CopyPathResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Reads a symbolic-link target without dereferencing the final entry.
+	pub async fn read_link(
+		&self,
+		request: pb::ReadLinkRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::ReadLinkResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::ReadLink(request), cancel)
+			.await?;
+		let pb::server_frame::Body::LinkRead(response) = body else {
+			return Err(unexpected("ReadLinkResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Creates a symbolic link through the document authority.
+	pub async fn create_symlink(
+		&self,
+		request: pb::CreateSymlinkRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CreateSymlinkResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::CreateSymlink(request), cancel)
+			.await?;
+		let pb::server_frame::Body::SymlinkCreated(response) = body else {
+			return Err(unexpected("CreateSymlinkResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Creates a hard link through the document authority.
+	pub async fn create_hard_link(
+		&self,
+		request: pb::CreateHardLinkRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::CreateHardLinkResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::CreateHardLink(request), cancel)
+			.await?;
+		let pb::server_frame::Body::HardLinkCreated(response) = body else {
+			return Err(unexpected("CreateHardLinkResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Applies a portable permission transition under revision checks.
+	pub async fn set_permissions(
+		&self,
+		request: pb::SetPermissionsRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::SetPermissionsResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::SetPermissions(request), cancel)
+			.await?;
+		let pb::server_frame::Body::PermissionsSet(response) = body else {
+			return Err(unexpected("SetPermissionsResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Returns the authority-resolved LSP bindings for a document.
+	pub async fn get_lsp_bindings(
+		&self,
+		request: pb::GetLspBindingsRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::GetLspBindingsResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::GetLspBindings(request), cancel)
+			.await?;
+		let pb::server_frame::Body::LspBindings(response) = body else {
+			return Err(unexpected("GetLspBindingsResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Forwards an arbitrary non-lifecycle LSP request through the authority.
+	pub async fn lsp_request(
+		&self,
+		request: pb::LspRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::LspResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::LspRequest(request), cancel)
+			.await?;
+		let pb::server_frame::Body::LspResponse(response) = body else {
+			return Err(unexpected("LspResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Enqueues a non-lifecycle LSP notification on the selected server lane.
+	pub async fn lsp_notification(
+		&self,
+		request: pb::LspNotificationRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::LspNotificationResponse, DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::LspNotification(request), cancel)
+			.await?;
+		let pb::server_frame::Body::LspNotificationAccepted(response) = body else {
+			return Err(unexpected("LspNotificationResponse"));
+		};
+		Ok(response)
+	}
+
+	/// Atomically acquires or dry-runs an exclusive workspace path reservation.
+	pub async fn acquire_workspace_lease(
+		&self,
+		request: pb::AcquireWorkspaceLeaseRequest,
+		cancel: &CancellationToken,
+	) -> Result<(Option<WorkspaceLease>, pb::AcquireWorkspaceLeaseResponse), DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::AcquireWorkspaceLease(request), cancel)
+			.await?;
+		let pb::server_frame::Body::WorkspaceLeaseAcquired(response) = body else {
+			return Err(unexpected("AcquireWorkspaceLeaseResponse"));
+		};
+		if response
+			.workspace_lease_id
+			.as_ref()
+			.is_some_and(|lease_id| lease_id.len() != 16)
+		{
+			return Err(unexpected("16-byte workspace lease id"));
+		}
+		let lease = response
+			.workspace_lease_id
+			.as_ref()
+			.map(|lease_id| WorkspaceLease {
+				lease_id: lease_id.clone(),
+				host:     Arc::clone(&self.inner),
+				released: false,
+			});
+		Ok((lease, response))
+	}
+
+	/// Explicitly releases an exclusive workspace reservation.
+	pub async fn release_workspace_lease(
+		&self,
+		mut lease: WorkspaceLease,
+		cancel: &CancellationToken,
+	) -> Result<pb::ReleaseWorkspaceLeaseResponse, DocumentError> {
+		if !Arc::ptr_eq(&self.inner, &lease.host) {
+			return Err(unexpected("connection-owned workspace lease"));
+		}
+		let body = self
+			.request(
+				pb::client_frame::Body::ReleaseWorkspaceLease(pb::ReleaseWorkspaceLeaseRequest {
+					workspace_lease_id: lease.lease_id.clone(),
+				}),
+				cancel,
+			)
+			.await?;
+		let pb::server_frame::Body::WorkspaceLeaseReleased(response) = body else {
+			return Err(unexpected("ReleaseWorkspaceLeaseResponse"));
+		};
+		lease.released = true;
+		Ok(response)
+	}
+
 	/// Releases a connection-owned document lease.
 	pub async fn close(
 		&self,
@@ -642,6 +1077,98 @@ fn ensure_pinned_head(
 
 pub(crate) fn lease_target(lease: &DocumentLease) -> pb::DocumentTarget {
 	pb::DocumentTarget { target: Some(pb::document_target::Target::LeaseId(lease.lease_id.clone())) }
+}
+fn dispatch_event_frame(
+	body: pb::server_frame::Body,
+	document_events: &Mutex<
+		HashMap<Bytes, (Bytes, flume::Sender<Result<pb::DocumentEvent, EventStreamError>>)>,
+	>,
+	pending_document_events: &Mutex<
+		HashMap<Bytes, Vec<Result<pb::DocumentEvent, EventStreamError>>>,
+	>,
+	document_event_sequences: &Mutex<HashMap<Bytes, u64>>,
+	lsp_events: &flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
+) {
+	match body {
+		pb::server_frame::Body::DocumentEvent(event) => {
+			let Some(document_id) = event
+				.head
+				.as_ref()
+				.and_then(|head| head.document.as_ref())
+				.map(|document| document.id.clone())
+				.filter(|id| !id.is_empty())
+			else {
+				return;
+			};
+			let mut sequences = document_event_sequences.lock();
+			if sequences
+				.get(&document_id)
+				.is_some_and(|sequence| *sequence >= event.event_sequence)
+			{
+				return;
+			}
+			sequences.insert(document_id.clone(), event.event_sequence);
+			drop(sequences);
+			let mut delivered = false;
+			document_events.lock().retain(|_, (subscribed_id, sender)| {
+				if subscribed_id != &document_id {
+					return true;
+				}
+				let alive = sender.send(Ok(event.clone())).is_ok();
+				delivered |= alive;
+				alive
+			});
+			if !delivered {
+				pending_document_events
+					.lock()
+					.entry(document_id)
+					.or_default()
+					.push(Ok(event));
+			}
+		},
+		pb::server_frame::Body::LspEvent(event) => {
+			let _ = lsp_events.send(Ok(LspRegistryEvent::Event(event)));
+		},
+		pb::server_frame::Body::LspBindingEvent(event) => {
+			let _ = lsp_events.send(Ok(LspRegistryEvent::Binding(event)));
+		},
+		pb::server_frame::Body::EventStreamError(error) => {
+			let terminal = EventStreamError {
+				stream:         pb::EventStreamKind::try_from(error.stream)
+					.unwrap_or(pb::EventStreamKind::Unspecified),
+				failure:        pb::EventStreamFailure::try_from(error.failure)
+					.unwrap_or(pb::EventStreamFailure::Unspecified),
+				skipped_events: error.skipped_events,
+				message:        Str::from(error.message),
+			};
+			match terminal.stream {
+				pb::EventStreamKind::Document => {
+					if let Some((_, sender)) = document_events.lock().remove(&error.lease_id) {
+						let _ = sender.send(Err(terminal));
+					} else {
+						pending_document_events
+							.lock()
+							.entry(error.lease_id)
+							.or_default()
+							.push(Err(terminal));
+					}
+				},
+				pb::EventStreamKind::LspRegistry | pb::EventStreamKind::Unspecified => {
+					let _ = lsp_events.send(Err(terminal));
+				},
+			}
+		},
+		_ => {},
+	}
+}
+
+fn closed_stream_error(stream: pb::EventStreamKind) -> EventStreamError {
+	EventStreamError {
+		stream,
+		failure: pb::EventStreamFailure::Closed,
+		skipped_events: 0,
+		message: Str::new_static("document-server connection closed"),
+	}
 }
 
 fn unexpected(expected: &'static str) -> DocumentError {

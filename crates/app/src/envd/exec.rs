@@ -30,6 +30,17 @@ use parking_lot::Mutex;
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
+/// Content identity of the process environment inherited by new shell sessions.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WorkspaceEnvironmentDigest([u8; 32]);
+
+impl WorkspaceEnvironmentDigest {
+	/// Returns the BLAKE3 digest over sorted environment name/value pairs.
+	pub const fn as_bytes(&self) -> &[u8; 32] {
+		&self.0
+	}
+}
+
 /// Errors returned by the environment execution host.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
@@ -88,7 +99,8 @@ pub enum ProcessEvent {
 /// RAII ownership of one command invocation.
 ///
 /// Dropping this value requests TERM-then-KILL teardown of only this command's
-/// process groups. The shell session is owned by [`ExecHost`] and survives.
+/// process groups unless [`ExecHost::detach_exec`] retained the exact run as a
+/// named process. The shell session is owned by [`ExecHost`] and survives.
 pub struct ExecRun {
 	id:      Bytes,
 	events:  flume::Receiver<ExecEvent>,
@@ -114,7 +126,16 @@ impl ExecRun {
 
 impl Drop for ExecRun {
 	fn drop(&mut self) {
-		self.cancel();
+		if self
+			.control
+			.retained
+			.lock()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.is_none()
+		{
+			self.cancel();
+		}
 	}
 }
 
@@ -137,11 +158,12 @@ pub struct ExecHost {
 }
 
 struct HostInner {
-	next_id:   AtomicU64,
-	sessions:  Mutex<HashMap<Bytes, SessionHandle>>,
-	runs:      Mutex<HashMap<Bytes, Weak<RunControl>>>,
-	processes: Mutex<HashMap<Str, Arc<NamedProcess>>>,
-	starting:  Mutex<HashSet<Str>>,
+	next_id:     AtomicU64,
+	sessions:    Mutex<HashMap<Bytes, SessionHandle>>,
+	runs:        Mutex<HashMap<Bytes, Weak<RunControl>>>,
+	processes:   Mutex<HashMap<Str, Arc<NamedProcess>>>,
+	starting:    Mutex<HashSet<Str>>,
+	environment: Mutex<WorkspaceEnvironment>,
 }
 
 #[derive(Clone)]
@@ -173,10 +195,15 @@ struct RunControl {
 	input:     Mutex<Option<InputSink>>,
 	spawns:    Arc<SpawnBook>,
 	finished:  AtomicBool,
+	retained:  Mutex<Option<Weak<NamedProcess>>>,
 }
 
 struct CancelRequest {
 	grace: Duration,
+}
+struct WorkspaceEnvironment {
+	variables: Arc<[(Str, Str)]>,
+	digest:    WorkspaceEnvironmentDigest,
 }
 
 enum InputSink {
@@ -209,11 +236,12 @@ impl ExecHost {
 	pub fn new() -> Self {
 		Self {
 			inner: Arc::new(HostInner {
-				next_id:   AtomicU64::new(1),
-				sessions:  Mutex::new(HashMap::new()),
-				runs:      Mutex::new(HashMap::new()),
-				processes: Mutex::new(HashMap::new()),
-				starting:  Mutex::new(HashSet::new()),
+				next_id:     AtomicU64::new(1),
+				sessions:    Mutex::new(HashMap::new()),
+				runs:        Mutex::new(HashMap::new()),
+				processes:   Mutex::new(HashMap::new()),
+				starting:    Mutex::new(HashSet::new()),
+				environment: Mutex::new(read_workspace_environment()),
 			}),
 		}
 	}
@@ -224,14 +252,19 @@ impl ExecHost {
 		request: OpenSessionRequest,
 	) -> Result<OpenSessionResponse, ExecError> {
 		let cwd = cwd_from_uri(&request.cwd_uri)?.map_or_else(std::env::current_dir, Ok)?;
-		let mut shell = Shell::builder()
+		let variables = Arc::clone(&self.inner.environment.lock().variables);
+		let mut builder = Shell::builder()
 			.profile(omp_shell_engine::ProfileLoadBehavior::Skip)
 			.rc(omp_shell_engine::RcLoadBehavior::Skip)
 			.working_dir(cwd)
-			.builtins(omp_shell_engine::builtins::default_builtins())
-			.build()
-			.await
-			.map_err(shell_error)?;
+			.do_not_inherit_env(true)
+			.builtins(omp_shell_engine::builtins::default_builtins());
+		for (name, value) in variables.iter() {
+			let mut variable = ShellVariable::new(value.to_string());
+			variable.export();
+			builder = builder.var(name.to_string(), variable);
+		}
+		let mut shell = builder.build().await.map_err(shell_error)?;
 		if let Some(pty) = request.pty.as_ref()
 			&& !pty.terminal.is_empty()
 		{
@@ -266,6 +299,22 @@ impl ExecHost {
 			cwd_uri: request.cwd_uri,
 			props: Default::default(),
 		})
+	}
+
+	/// Returns the digest of the cached environment inherited by new sessions.
+	pub fn workspace_environment_digest(&self) -> WorkspaceEnvironmentDigest {
+		self.inner.environment.lock().digest
+	}
+
+	/// Explicitly refreshes the environment inherited by subsequently opened
+	/// sessions.
+	///
+	/// Existing sessions retain their own shell state.
+	pub fn refresh_workspace_environment(&self) -> WorkspaceEnvironmentDigest {
+		let environment = read_workspace_environment();
+		let digest = environment.digest;
+		*self.inner.environment.lock() = environment;
+		digest
 	}
 
 	/// Closes a session and all shell-owned background jobs.
@@ -304,6 +353,7 @@ impl ExecHost {
 			input: Mutex::new(None),
 			spawns: Arc::new(SpawnBook { groups: Mutex::new(Vec::new()) }),
 			finished: AtomicBool::new(false),
+			retained: Mutex::new(None),
 		});
 		let command = SessionCommand {
 			exec: exec.clone(),
@@ -417,6 +467,41 @@ impl ExecHost {
 		});
 		self.inner.processes.lock().insert(name, process.clone());
 		tokio::spawn(forward_named_process(process.clone(), run, started.exec));
+		Ok(ProcessStarted { name: process.name.to_string(), generation, props: Default::default() })
+	}
+
+	/// Converts an active foreground execution into a retained named process.
+	///
+	/// The existing process groups, input handles, execution identifier, and
+	/// output sequencer are preserved. Dropping the foreground [`ExecRun`] after
+	/// this succeeds no longer requests process-tree cancellation.
+	pub fn detach_exec(&self, exec: &[u8], name: &str) -> Result<ProcessStarted, ExecError> {
+		let name = Str::from(name);
+		let _reservation = self.reserve_process(name.clone())?;
+		let control = self.run(exec)?;
+		let mut retained = control.retained.lock();
+		if control.finished.load(Ordering::Acquire) {
+			return Err(ExecError::RunNotFound);
+		}
+		let generation = 1;
+		let process = Arc::new(NamedProcess {
+			name: name.clone(),
+			generation,
+			control: control.clone(),
+			stream: Mutex::new(ProcessStreamState {
+				info:        ProcessInfo {
+					name: name.to_string(),
+					generation,
+					state: ProcessState::Running as i32,
+					status: None,
+					props: Default::default(),
+				},
+				history:     Vec::new(),
+				subscribers: Vec::new(),
+			}),
+		});
+		self.inner.processes.lock().insert(name, process.clone());
+		*retained = Some(Arc::downgrade(&process));
 		Ok(ProcessStarted { name: process.name.to_string(), generation, props: Default::default() })
 	}
 
@@ -700,13 +785,17 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 }
 
 fn finish_session_command(command: &SessionCommand, result: RunTerminal, elapsed: Duration) {
+	let retained = command.control.retained.lock();
 	command.control.finished.store(true, Ordering::Release);
-	let status = result.status(elapsed);
-	let _ = command.events.send(ExecEvent::Exit(ExitEvent {
+	let event = ExecEvent::Exit(ExitEvent {
 		exec:   command.exec.clone(),
-		status: Some(status),
+		status: Some(result.status(elapsed)),
 		props:  Default::default(),
-	}));
+	});
+	let _ = command.events.send(event.clone());
+	if let Some(process) = retained.as_ref().and_then(Weak::upgrade) {
+		route_named_event(&process, event);
+	}
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -761,7 +850,8 @@ fn setup_io(
 	events: flume::Sender<ExecEvent>,
 ) -> Result<(ExecutionParameters, Vec<tokio::task::JoinHandle<()>>), ExecError> {
 	let mut params = ExecutionParameters::default();
-	let sequencer = Arc::new(Mutex::new(OutputSequencer { next: 1, events }));
+	let sequencer =
+		Arc::new(Mutex::new(OutputSequencer { next: 1, events, control: control.clone() }));
 	if let Some(pty) = pty {
 		let winsize = nix::pty::Winsize {
 			ws_row:    clamp_u16(pty.rows),
@@ -796,8 +886,9 @@ fn setup_io(
 }
 
 struct OutputSequencer {
-	next:   u64,
-	events: flume::Sender<ExecEvent>,
+	next:    u64,
+	events:  flume::Sender<ExecEvent>,
+	control: Arc<RunControl>,
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -822,44 +913,59 @@ fn spawn_reader<R: Read + Send + 'static>(
 				props:    Default::default(),
 			};
 			sequencer.next += 1;
-			let _ = sequencer.events.send(ExecEvent::Output(frame));
+			let event = ExecEvent::Output(frame);
+			let _ = sequencer.events.send(event.clone());
+			if let Some(process) = sequencer
+				.control
+				.retained
+				.lock()
+				.as_ref()
+				.and_then(Weak::upgrade)
+			{
+				route_named_event(&process, event);
+			}
 		}
 	})
 }
 
 async fn forward_named_process(process: Arc<NamedProcess>, run: ExecRun, _exec: Bytes) {
 	while let Some(event) = run.next_event().await {
-		match event {
-			ExecEvent::Started { .. } => {},
-			ExecEvent::Output(output) => {
-				let output = ProcessOutput {
-					name:       process.name.to_string(),
-					generation: process.generation,
-					channel:    output.channel,
-					data:       output.data,
-					sequence:   output.sequence,
-					props:      Default::default(),
-				};
-				let mut stream = process.stream.lock();
-				stream.history.push(output.clone());
-				stream.broadcast(ProcessEvent::Output(output));
-			},
-			ExecEvent::Exit(exit) => {
-				let mut stream = process.stream.lock();
-				stream.info.status = exit.status;
-				stream.info.state = match stream.info.status.as_ref().map(|status| status.outcome) {
-					Some(value) if value == ExecOutcome::Exited as i32 => ProcessState::Exited as i32,
-					Some(value) if value == ExecOutcome::Cancelled as i32 => {
-						ProcessState::Stopped as i32
-					},
-					_ => ProcessState::Failed as i32,
-				};
-				let info = stream.info.clone();
-				drop(process.control.input.lock());
-				stream.broadcast(ProcessEvent::State(info));
-				break;
-			},
+		let terminal = matches!(event, ExecEvent::Exit(_));
+		route_named_event(&process, event);
+		if terminal {
+			break;
 		}
+	}
+}
+
+fn route_named_event(process: &NamedProcess, event: ExecEvent) {
+	match event {
+		ExecEvent::Started { .. } => {},
+		ExecEvent::Output(output) => {
+			let output = ProcessOutput {
+				name:       process.name.to_string(),
+				generation: process.generation,
+				channel:    output.channel,
+				data:       output.data,
+				sequence:   output.sequence,
+				props:      Default::default(),
+			};
+			let mut stream = process.stream.lock();
+			stream.history.push(output.clone());
+			stream.broadcast(ProcessEvent::Output(output));
+		},
+		ExecEvent::Exit(exit) => {
+			let mut stream = process.stream.lock();
+			stream.info.status = exit.status;
+			stream.info.state = match stream.info.status.as_ref().map(|status| status.outcome) {
+				Some(value) if value == ExecOutcome::Exited as i32 => ProcessState::Exited as i32,
+				Some(value) if value == ExecOutcome::Cancelled as i32 => ProcessState::Stopped as i32,
+				_ => ProcessState::Failed as i32,
+			};
+			let info = stream.info.clone();
+			drop(process.control.input.lock());
+			stream.broadcast(ProcessEvent::State(info));
+		},
 	}
 }
 
@@ -885,6 +991,28 @@ fn apply_env_delta(
 		shell.set_env_global(name, variable)?;
 	}
 	Ok(())
+}
+
+fn read_workspace_environment() -> WorkspaceEnvironment {
+	let mut variables: Vec<_> = std::env::vars_os()
+		.filter_map(|(name, value)| {
+			Some((Str::from(name.into_string().ok()?), Str::from(value.into_string().ok()?)))
+		})
+		.collect();
+	variables.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+	let mut hasher = blake3::Hasher::new();
+	for (name, value) in &variables {
+		let name = name.as_bytes();
+		let value = value.as_bytes();
+		hasher.update(&(name.len() as u64).to_be_bytes());
+		hasher.update(name);
+		hasher.update(&(value.len() as u64).to_be_bytes());
+		hasher.update(value);
+	}
+	WorkspaceEnvironment {
+		variables: variables.into(),
+		digest:    WorkspaceEnvironmentDigest(*hasher.finalize().as_bytes()),
+	}
 }
 
 fn cwd_from_uri(uri: &str) -> Result<Option<PathBuf>, ExecError> {

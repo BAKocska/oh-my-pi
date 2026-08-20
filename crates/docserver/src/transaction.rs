@@ -886,6 +886,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 				cancellation,
 				move || async move { Ok::<_, TransactionBuildError>(request.operations) },
 				false,
+				None,
 			)
 			.await
 	}
@@ -908,7 +909,26 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 			+ 'static,
 	{
 		self
-			.commit_lazy_with_publication(transaction_id, cancellation, build, true)
+			.commit_lazy_with_publication(transaction_id, cancellation, build, true, None)
+			.await
+	}
+
+	/// Claims the idempotency ledger for a connection holding workspace leases.
+	pub async fn commit_lazy_for<B, Fut>(
+		&self,
+		owner: [u8; 16],
+		transaction_id: TransactionId,
+		cancellation: CancellationToken,
+		build: B,
+	) -> Arc<TransactionOutcome>
+	where
+		B: FnOnce() -> Fut + Send + 'static,
+		Fut: Future<Output = std::result::Result<Vec<DocumentMutation>, TransactionBuildError>>
+			+ Send
+			+ 'static,
+	{
+		self
+			.commit_lazy_with_publication(transaction_id, cancellation, build, true, Some(owner))
 			.await
 	}
 
@@ -918,6 +938,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		cancellation: CancellationToken,
 		build: B,
 		publish: bool,
+		workspace_owner: Option<[u8; 16]>,
 	) -> Arc<TransactionOutcome>
 	where
 		B: FnOnce() -> Fut + Send + 'static,
@@ -962,6 +983,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 										TransactionRequest::new(transaction_id, operations),
 										cancellation,
 										publish,
+										workspace_owner,
 									)
 									.await
 							},
@@ -1027,6 +1049,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		request: TransactionRequest,
 		cancellation: CancellationToken,
 		publish: bool,
+		workspace_owner: Option<[u8; 16]>,
 	) -> TransactionOutcome {
 		let transaction_id = request.transaction_id;
 		let gate = self.inner.store.mutation_gate();
@@ -1041,7 +1064,10 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 				"transaction cancelled before planning",
 			);
 		}
-		match self.plan_and_commit(request, cancellation, publish).await {
+		match self
+			.plan_and_commit(request, cancellation, publish, workspace_owner)
+			.await
+		{
 			Ok(outcome) | Err(outcome) => outcome,
 		}
 	}
@@ -1051,6 +1077,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		request: TransactionRequest,
 		cancellation: CancellationToken,
 		publish: bool,
+		workspace_owner: Option<[u8; 16]>,
 	) -> std::result::Result<TransactionOutcome, TransactionOutcome> {
 		let transaction_id = request.transaction_id;
 		if request.operations.is_empty() {
@@ -1064,6 +1091,21 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 			Err(failure) => return Err(failure.outcome(transaction_id, Vec::new())),
 		};
 		let ResolvedOperations { operations: resolved, owned_leases } = resolved;
+		let mut workspace_paths = Vec::with_capacity(resolved.len() * 2);
+		for operation in &resolved {
+			workspace_paths.push(operation.path.clone());
+			if let Some(destination) = &operation.destination_path {
+				workspace_paths.push(destination.clone());
+			}
+		}
+		if let Err(error) = self
+			.inner
+			.store
+			.check_workspace_paths(workspace_owner, workspace_paths)
+		{
+			self.close_owned(owned_leases).await;
+			return Err(PlanningFailure::from_error(0, error).outcome(transaction_id, Vec::new()));
+		}
 		let mut plans = match self.reserve_plans(transaction_id, &resolved).await {
 			Ok(plans) => plans,
 			Err(failure) => {
@@ -1314,16 +1356,25 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 				| MutationOperation::Create(_)
 				| MutationOperation::Delete(_) => None,
 			};
-			if let Some(destination) = destination {
+			let destination_path = if let Some(destination) = destination {
 				let destination = self
 					.inner
 					.store
 					.resolve_entry_path(destination)
 					.map_err(|error| PlanningFailure::from_error(operation_index, error))?;
 				overlay_paths.remove(&path);
-				overlay_paths.insert(destination, handle.clone());
-			}
-			resolved.push(ResolvedOperation { operation_index, mutation: mutation.clone(), handle });
+				overlay_paths.insert(destination.clone(), handle.clone());
+				Some(destination)
+			} else {
+				None
+			};
+			resolved.push(ResolvedOperation {
+				operation_index,
+				mutation: mutation.clone(),
+				handle,
+				path,
+				destination_path,
+			});
 			if cancellation.is_cancelled() {
 				return Err(PlanningFailure::cancelled(
 					operation_index,
@@ -1903,9 +1954,11 @@ struct ResolvedOperations {
 }
 
 struct ResolvedOperation {
-	operation_index: u32,
-	mutation:        DocumentMutation,
-	handle:          ActorHandle,
+	operation_index:  u32,
+	mutation:         DocumentMutation,
+	handle:           ActorHandle,
+	path:             PathBuf,
+	destination_path: Option<PathBuf>,
 }
 
 struct DocumentPlan {

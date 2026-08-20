@@ -9,6 +9,8 @@ use std::{
 
 use omp_core::Str;
 
+use super::resolver::Scheme;
+
 /// One inclusive, one-based line range in a path selector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LineRange {
@@ -68,7 +70,8 @@ impl ParsedSelector {
 pub struct SelectorError(Str);
 
 impl SelectorError {
-	fn new(message: impl Into<Str>) -> Self {
+	/// Constructs a selector error with model-facing text.
+	pub fn from_message(message: impl Into<Str>) -> Self {
 		Self(message.into())
 	}
 
@@ -98,7 +101,9 @@ pub fn parse_line_range_chunk(input: &str) -> Result<Option<LineRange>, Selector
 	}
 	let start = parse_u64(&input[..digit_end])?;
 	if start == 0 {
-		return Err(SelectorError::new("Line selector 0 is invalid; lines are 1-indexed. Use :1."));
+		return Err(SelectorError::from_message(
+			"Line selector 0 is invalid; lines are 1-indexed. Use :1.",
+		));
 	}
 	let rest = &input[digit_end..];
 	if rest.is_empty() {
@@ -129,15 +134,17 @@ pub fn parse_line_range_chunk(input: &str) -> Result<Option<LineRange>, Selector
 	let value = parse_u64(rhs)?;
 	if separator == '+' {
 		if value == 0 {
-			return Err(SelectorError::new(format!("Invalid range {start}+0: count must be >= 1.")));
+			return Err(SelectorError::from_message(format!(
+				"Invalid range {start}+0: count must be >= 1."
+			)));
 		}
 		let end = start.checked_add(value - 1).ok_or_else(|| {
-			SelectorError::new(format!("Invalid range {start}+{value}: count is too large."))
+			SelectorError::from_message(format!("Invalid range {start}+{value}: count is too large."))
 		})?;
 		return Ok(Some(LineRange { start_line: start, end_line: Some(end) }));
 	}
 	if value < start {
-		return Err(SelectorError::new(format!(
+		return Err(SelectorError::from_message(format!(
 			"Invalid range {start}-{value}: end must be >= start."
 		)));
 	}
@@ -147,7 +154,7 @@ pub fn parse_line_range_chunk(input: &str) -> Result<Option<LineRange>, Selector
 fn parse_u64(input: &str) -> Result<u64, SelectorError> {
 	input
 		.parse()
-		.map_err(|_| SelectorError::new(format!("Line selector '{input}' is too large.")))
+		.map_err(|_| SelectorError::from_message(format!("Line selector '{input}' is too large.")))
 }
 
 /// Parse, sort, and merge a comma-separated list of line ranges.
@@ -282,7 +289,7 @@ fn selector_chunk_looks_read_like(input: &str) -> Result<bool, SelectorError> {
 }
 
 fn invalid_selector(input: &str) -> SelectorError {
-	SelectorError::new(format!(
+	SelectorError::from_message(format!(
 		"Invalid selector ':{input}'. Use :N, :N-M, :N+K, :N- (open-ended), a comma-separated list \
 		 of ranges, :raw, or a range combined with raw (e.g. :raw:50-100)."
 	))
@@ -478,49 +485,48 @@ pub fn percent_encode_member_delimiters(input: &str) -> Cow<'_, str> {
 	Cow::Owned(encoded)
 }
 
-/// URI-scheme classification used before local path dispatch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UriTarget<'a> {
-	/// No leading `scheme://` shape was found.
-	LocalOrOther,
-	/// An HTTP(S) URL, handled by the web reader.
-	Http {
-		/// `http` or `https`, retaining the caller's spelling.
-		scheme: &'a str,
-	},
-	/// A syntactically valid but currently unsupported URI scheme.
-	Unsupported {
-		/// Scheme text before `://`.
-		scheme: &'a str,
-	},
+/// A pure parse of one absolute URI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedUri<'a> {
+	/// Built-in scheme, or [`Scheme::Unknown`] for a valid unrecognized scheme.
+	pub scheme:        Scheme,
+	/// Caller spelling before `://`, with case preserved.
+	pub raw_scheme:    &'a str,
+	/// Everything after `://`, with a recognized selector removed.
+	pub resource:      &'a str,
+	/// Parsed trailing selector.
+	pub selector:      ParsedSelector,
+	/// Original selector text without its leading colon.
+	pub selector_text: Option<&'a str>,
 }
 
-impl UriTarget<'_> {
-	/// Return the exact unsupported-target fault text, if this is an unsupported
-	/// scheme.
-	pub fn unsupported_message(self) -> Option<Str> {
-		match self {
-			Self::Unsupported { scheme } => Some(unsupported_uri_message(scheme)),
-			_ => None,
-		}
-	}
-}
-
-/// Classify `scheme://` paths while keeping HTTP(S) distinct from unsupported
-/// internal schemes.
-pub fn classify_uri_target(input: &str) -> UriTarget<'_> {
+/// Purely parses an absolute URI and its trailing read selector.
+///
+/// `Ok(None)` means `input` has no syntactically valid URI scheme. No path,
+/// network, or registry I/O occurs.
+pub fn parse_uri(input: &str) -> Result<Option<ParsedUri<'_>>, SelectorError> {
 	let Some(separator) = input.find("://") else {
-		return UriTarget::LocalOrOther;
+		return Ok(None);
 	};
-	let scheme = &input[..separator];
-	if !valid_uri_scheme(scheme) {
-		return UriTarget::LocalOrOther;
+	let raw_scheme = &input[..separator];
+	if !valid_uri_scheme(raw_scheme) {
+		return Ok(None);
 	}
-	if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-		UriTarget::Http { scheme }
-	} else {
-		UriTarget::Unsupported { scheme }
+	let scheme = Scheme::parse(raw_scheme);
+	let split = split_uri_selector(input, raw_scheme, scheme);
+	let resource_start = raw_scheme.len() + 3;
+	let resource = &split.path[resource_start..];
+	if resource.is_empty()
+		|| resource
+			.bytes()
+			.any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+	{
+		return Err(SelectorError::from_message(format!(
+			"Invalid URL '{input}': resource must be non-empty and contain no whitespace."
+		)));
 	}
+	let selector = parse_selector(split.selector)?;
+	Ok(Some(ParsedUri { scheme, raw_scheme, resource, selector, selector_text: split.selector }))
 }
 
 fn valid_uri_scheme(scheme: &str) -> bool {
@@ -529,21 +535,24 @@ fn valid_uri_scheme(scheme: &str) -> bool {
 		&& bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
 }
 
-/// Build the exact unsupported-target seam message for a URI scheme.
-pub fn unsupported_uri_message(scheme: &str) -> Str {
-	Str::from(format!("{}:// targets are not supported yet", scheme.to_ascii_lowercase()))
-}
-
-/// Split selectors from internal URLs whose resource grammar permits them.
+/// Split selectors from URLs whose resource grammar permits them.
 pub fn split_internal_uri_selector(raw_path: &str) -> SplitPath<'_> {
-	let UriTarget::Unsupported { scheme } = classify_uri_target(raw_path) else {
+	let Some(separator) = raw_path.find("://") else {
 		return SplitPath { path: raw_path, selector: None };
 	};
-	if scheme.eq_ignore_ascii_case("mcp") || !internal_scheme_accepts_selectors(scheme) {
+	let raw_scheme = &raw_path[..separator];
+	if !valid_uri_scheme(raw_scheme) {
 		return SplitPath { path: raw_path, selector: None };
 	}
-	let scheme_end = scheme.len() + 3;
-	if scheme.eq_ignore_ascii_case("ssh") && !raw_path[scheme_end..].contains('/') {
+	split_uri_selector(raw_path, raw_scheme, Scheme::parse(raw_scheme))
+}
+
+fn split_uri_selector<'a>(raw_path: &'a str, raw_scheme: &str, scheme: Scheme) -> SplitPath<'a> {
+	if !scheme.accepts_selectors() {
+		return SplitPath { path: raw_path, selector: None };
+	}
+	let scheme_end = raw_scheme.len() + 3;
+	if scheme == Scheme::Ssh && !raw_path[scheme_end..].contains('/') {
 		return SplitPath { path: raw_path, selector: None };
 	}
 	let mut path = raw_path;
@@ -559,15 +568,6 @@ pub fn split_internal_uri_selector(raw_path: &str) -> SplitPath<'_> {
 		Some(start) => SplitPath { path, selector: Some(&raw_path[start..]) },
 		None => SplitPath { path: raw_path, selector: None },
 	}
-}
-
-fn internal_scheme_accepts_selectors(scheme: &str) -> bool {
-	[
-		"agent", "artifact", "issue", "history", "local", "memory", "omp", "pr", "rule", "security",
-		"skill", "ssh", "vault",
-	]
-	.iter()
-	.any(|candidate| scheme.eq_ignore_ascii_case(candidate))
 }
 
 fn internal_selector_chunk(input: &str) -> bool {
@@ -700,12 +700,21 @@ mod tests {
 	}
 
 	#[test]
-	fn classifies_http_separately_and_formats_unsupported_seam() {
-		assert!(matches!(classify_uri_target("https://example.com"), UriTarget::Http { .. }));
-		let UriTarget::Unsupported { scheme } = classify_uri_target("Skill://name") else {
-			panic!("expected unsupported URI");
-		};
-		assert_eq!(&*unsupported_uri_message(scheme), "skill:// targets are not supported yet");
+	fn parses_known_and_unknown_uri_schemes_without_io() {
+		let http = parse_uri("https://example.com/page:5-7").unwrap().unwrap();
+		assert_eq!(http.scheme, Scheme::Http);
+		assert_eq!(http.resource, "example.com/page");
+		assert!(matches!(http.selector, ParsedSelector::Lines { .. }));
+
+		let unknown = parse_uri("xd://pending:raw").unwrap().unwrap();
+		assert_eq!(unknown.scheme, Scheme::Unknown);
+		assert_eq!(unknown.resource, "pending:raw");
+		assert_eq!(unknown.selector, ParsedSelector::None);
+
+		let mcp = parse_uri("mcp://server/resource:50").unwrap().unwrap();
+		assert_eq!(mcp.scheme, Scheme::Mcp);
+		assert_eq!(mcp.resource, "server/resource:50");
+		assert_eq!(mcp.selector, ParsedSelector::None);
 	}
 
 	#[test]

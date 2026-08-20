@@ -20,10 +20,11 @@ use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
 	ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError,
 	CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint, ConstraintDisposition,
-	ErasedEv, ErasedOutcome, Ev, ExpectedArtifact, Fallback, GrammarSyntax, IncomingParams,
-	Interrupt, InterruptWaitError, JobOwner, JobRef, LiftedCall, LoweringCaps, ModelClass,
-	ParamError, Part, Precedence, Presentation, ProjectedCall, PromptCaps, RecordedCall,
-	RecordedCallOwned, Registry, RegistryError, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal,
+	DocEffects, Effects, ErasedEv, ErasedOutcome, Ev, ExecEffects, ExpectedArtifact, Fallback,
+	FinalizedArgs, GrammarSyntax, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError,
+	JobOwner, JobRef, LiftedCall, LoweringCaps, ModelClass, ParamError, Part, Precedence,
+	Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall, RecordedCallOwned,
+	Registry, RegistryError, RepairKind, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal, Usd,
 	call_outcome_details,
 	render::{Render, RenderRegistryError, ViewState},
 };
@@ -69,6 +70,7 @@ impl FakeTool {
 				description: Str::from(format!("fake revision {n}")),
 				schema: Bytes::from_static(schema),
 				constraint,
+				effects: Effects::empty(),
 				projection_code: [0; 32],
 			},
 			marker: Str::from(marker),
@@ -162,6 +164,7 @@ impl PullingTool {
 					br#"{"type":"object","properties":{"wanted":{"type":"number"}}}"#,
 				),
 				constraint:      Constraint::None,
+				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
 		}
@@ -225,6 +228,7 @@ impl AbortingTool {
 				description:     Str::from("aborts before completion"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
+				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
 		}
@@ -286,6 +290,7 @@ fn worker_spec(name: &str, projection_code: [u8; 32]) -> ToolSpec {
 		description: Str::from(format!("{name} device")),
 		schema: Bytes::from_static(br#"{"type":"object"}"#),
 		constraint: Constraint::None,
+		effects: Effects::empty(),
 		projection_code,
 	}
 }
@@ -343,7 +348,7 @@ fn duplicate_registration_never_replaces_the_erased_implementation() {
 		verdict,
 		CallOutcome::Ok(FakePayload {
 			implementation: Str::from("original"),
-			raw:            Str::from("{value:1}"),
+			raw:            Str::from(r#"{"value":1}"#),
 		})
 	);
 }
@@ -418,6 +423,8 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 	assert_eq!(device.route, omp_tool::ToolRoute::Worker);
 	assert_eq!(device.summary, "catalogued device");
 	assert_eq!(device.schema, br#"{"type":"object"}"#);
+	assert!(device.effects.is_empty());
+	assert!(registry.effects("catalogued").unwrap().is_empty());
 	assert_eq!(device.docs, None);
 	assert!(devices.next().is_none());
 }
@@ -860,7 +867,10 @@ fn pull_validates_only_the_requested_value_and_ignores_unknown_malformed_json() 
 	}))
 	.expect("an unknown unpulled sibling cannot fail the requested pull");
 	assert_eq!(wanted.as_f64(), 7.0);
-	assert_eq!(block_on(params.committed()).unwrap(), raw);
+	assert!(matches!(
+		block_on(params.finalize()),
+		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Malformed
+	));
 }
 
 #[test]
@@ -890,7 +900,7 @@ fn commitment_is_explicit_and_feed_guard_drop_aborts() {
 	let (feed, mut committed) = IncomingParams::channel();
 	feed.arg_text(Str::from("{value:1}")).unwrap();
 	feed.args_committed(Str::from("{value:1}")).unwrap();
-	assert_eq!(block_on(committed.committed()).unwrap(), "{value:1}");
+	assert_eq!(block_on(committed.committed()).unwrap(), r#"{"value":1}"#);
 
 	let (guard, mut abandoned) = IncomingParams::channel();
 	guard.arg_text(Str::from("{value:")).unwrap();
@@ -1228,11 +1238,12 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 	let canonical = smallvec![ArgPath::Key(Str::from("path"))];
 	let alias = smallvec![ArgPath::Key(Str::from("file"))];
 	let spec = ArgSpec {
-		path:     canonical.clone(),
-		aliases:  smallvec![Str::from("file")],
-		coerce:   smallvec![Coerce::Strip, Coerce::JsonString],
-		expected: Str::from("workspace path"),
-		example:  Some(Str::from("src/lib.rs")),
+		path:                  canonical.clone(),
+		aliases:               smallvec![Str::from("file")],
+		coerce:                smallvec![Coerce::Strip, Coerce::JsonString],
+		expected:              Str::from("workspace path"),
+		example:               Some(Str::from("src/lib.rs")),
+		additional_properties: false,
 	};
 	let mut specs = ArgSpecRegistry::new();
 	specs.register(rev.clone(), spec).unwrap();
@@ -1248,11 +1259,12 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 	);
 	assert!(matches!(
 		specs.register(rev.clone(), ArgSpec {
-			path:     alias,
-			aliases:  smallvec![],
-			coerce:   smallvec![],
-			expected: Str::from("other"),
-			example:  None,
+			path:                  alias,
+			aliases:               smallvec![],
+			coerce:                smallvec![],
+			expected:              Str::from("other"),
+			example:               None,
+			additional_properties: false,
 		},),
 		Err(ArgSpecRegistryError::Duplicate { .. }),
 	));
@@ -1260,14 +1272,273 @@ fn argument_specs_intern_aliases_per_revision_and_reject_late_mutation() {
 	assert!(specs.is_sealed());
 	assert_eq!(
 		specs.register(rev, ArgSpec {
-			path:     smallvec![ArgPath::Key(Str::from("late"))],
-			aliases:  smallvec![],
-			coerce:   smallvec![],
-			expected: Str::from("late"),
-			example:  None,
+			path:                  smallvec![ArgPath::Key(Str::from("late"))],
+			aliases:               smallvec![],
+			coerce:                smallvec![],
+			expected:              Str::from("late"),
+			example:               None,
+			additional_properties: false,
 		},),
 		Err(ArgSpecRegistryError::Sealed),
 	);
+}
+
+fn declared_arg(name: &str, aliases: &[&str], coerce: &[Coerce]) -> ArgSpec {
+	ArgSpec {
+		path:                  smallvec![ArgPath::Key(Str::from(name))],
+		aliases:               aliases.iter().map(|alias| Str::from(*alias)).collect(),
+		coerce:                coerce.iter().copied().collect(),
+		expected:              Str::from(name),
+		example:               None,
+		additional_properties: false,
+	}
+}
+
+fn bound_params<'a>(
+	rev: &'a Rev,
+	specs: &'a ArgSpecRegistry,
+) -> (omp_tool::InvocationFeed, IncomingParams<'a>) {
+	let (feed, mut params): (_, IncomingParams<'a>) = IncomingParams::channel();
+	params.bind_arg_specs(rev, specs);
+	(feed, params)
+}
+
+#[test]
+fn finalizer_rejects_every_alias_ambiguity_class() {
+	let rev = Rev { family: Str::from("args"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	specs
+		.register(rev.clone(), declared_arg("path", &["file", "filename"], &[]))
+		.unwrap();
+	specs.seal();
+
+	for raw in
+		[r#"{"path":"a","path":"b"}"#, r#"{"path":"a","file":"b"}"#, r#"{"file":"a","filename":"b"}"#]
+	{
+		let (feed, mut params) = bound_params(&rev, &specs);
+		feed.args_committed(Str::from(raw)).unwrap();
+		assert!(matches!(
+			block_on(params.finalize()),
+			Err(ParamError::Args(issue))
+				if issue.kind == ArgIssueKind::Ambiguous
+					&& issue.path == vec![ArgPath::Key(Str::from("path"))]
+		));
+	}
+}
+#[test]
+fn effects_are_exact_deny_safe_and_wire_stable() {
+	let maximum = Effects {
+		documents: Some(DocEffects {
+			read:        true,
+			write_globs: smallvec![Str::from("src/**"), Str::from("tests/**")],
+		}),
+		exec:      Some(ExecEffects { commands: smallvec![Str::from("*")], network: false }),
+		inference: Some(InferenceEffects {
+			max_requests: 3,
+			max_usd:      "1.25".parse().expect("canonical decimal"),
+		}),
+		subagents: 2,
+	};
+	let narrowed = Effects {
+		documents: Some(DocEffects {
+			read:        true,
+			write_globs: smallvec![Str::from("src/generated/**")],
+		}),
+		exec:      Some(ExecEffects { commands: smallvec![Str::from("cargo")], network: false }),
+		inference: Some(InferenceEffects {
+			max_requests: 1,
+			max_usd:      "0.5".parse().expect("canonical decimal"),
+		}),
+		subagents: 0,
+	};
+	assert!(narrowed.is_subset_of(&maximum));
+	assert_eq!(maximum.narrow(narrowed.clone()), Some(narrowed.clone()));
+	assert!(Effects::empty().is_empty());
+	let explicit_empty_domain =
+		Effects { documents: Some(DocEffects::default()), ..Effects::empty() };
+	assert!(explicit_empty_domain.is_empty());
+	assert!(explicit_empty_domain.is_subset_of(&Effects::empty()));
+	let mut widened = narrowed.clone();
+	widened.exec.as_mut().unwrap().network = true;
+	assert!(!widened.is_subset_of(&maximum));
+	widened.exec.as_mut().unwrap().network = false;
+	widened.documents.as_mut().unwrap().write_globs[0] = Str::from("src/../secrets/**");
+	assert!(!widened.is_subset_of(&maximum));
+	assert!(!maximum.is_subset_of(&Effects::empty()));
+
+	let wire = omp_proto::policy::v1::EffectEnvelope::from(&narrowed);
+	assert_eq!(wire.inference.as_ref().unwrap().max_usd, "0.5");
+	assert_eq!(Effects::try_from(&wire).unwrap(), narrowed);
+	assert_eq!(serde_json::to_string(&Usd::ZERO).unwrap(), r#""0""#);
+	assert_eq!(serde_json::to_string(&"1.25".parse::<Usd>().unwrap()).unwrap(), r#""1.25""#);
+	for invalid in ["", "00", "01", "1.", "1.0", ".5", "-1", "1.0000000001"] {
+		assert!(invalid.parse::<Usd>().is_err(), "{invalid} must be rejected");
+	}
+}
+
+#[test]
+fn finalizer_applies_all_nine_coercions_and_logs_only_successes() {
+	let rev = Rev { family: Str::from("coerce"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	for (name, coercion) in [
+		("b", Coerce::LooseBool),
+		("i", Coerce::Integer),
+		("n", Coerce::Number),
+		("s", Coerce::String),
+		("one", Coerce::Singleton),
+		("js", Coerce::JsonString),
+		("trim", Coerce::Strip),
+		("csv", Coerce::Csv),
+		("gone", Coerce::NullElision),
+	] {
+		specs
+			.register(rev.clone(), declared_arg(name, &[], &[coercion]))
+			.unwrap();
+	}
+	specs
+		.register(rev.clone(), declared_arg("already", &[], &[Coerce::Strip]))
+		.unwrap();
+	specs.seal();
+	let raw = r#"{"b":"yes","i":42.0,"n":"3.5","s":true,"one":"x","js":"[1,2]","trim":" x ","csv":"a, b","gone":"null","already":true}"#;
+	let (feed, mut params) = bound_params(&rev, &specs);
+	feed.args_committed(Str::from(raw)).unwrap();
+	let finalized = block_on(params.finalize()).unwrap();
+
+	assert_eq!(finalized.raw(), raw);
+	assert_eq!(
+		finalized.effective_json(),
+		r#"{"b":true,"i":42,"n":3.5,"s":"true","one":["x"],"js":[1,2],"trim":"x","csv":["a","b"],"already":true}"#
+	);
+	assert_eq!(finalized.repairs().len(), 9);
+	assert_eq!(
+		finalized
+			.repairs()
+			.iter()
+			.filter(|repair| repair.kind == RepairKind::Coercion)
+			.count(),
+		8
+	);
+	assert_eq!(finalized.repairs().last().unwrap().kind, RepairKind::Elision);
+}
+
+#[test]
+fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_enforces_open_maps() {
+	let rev = Rev { family: Str::from("final"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	specs
+		.register(rev.clone(), declared_arg("path", &["p"], &[]))
+		.unwrap();
+	let mut closed = declared_arg("config", &[], &[]);
+	closed.additional_properties = false;
+	specs.register(rev.clone(), closed).unwrap();
+	specs.seal();
+
+	let raw = "{p:'x',config:{extra:1},}";
+	let (feed, mut params) = bound_params(&rev, &specs);
+	feed.args_committed(Str::from(raw)).unwrap();
+	assert!(matches!(
+		block_on(params.finalize()),
+		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Malformed
+	));
+
+	let open_rev = Rev { family: Str::from("final"), n: 2 };
+	let mut open_specs = ArgSpecRegistry::new();
+	open_specs
+		.register(open_rev.clone(), declared_arg("path", &["p"], &[]))
+		.unwrap();
+	let mut open = declared_arg("config", &[], &[]);
+	open.additional_properties = true;
+	open_specs.register(open_rev.clone(), open).unwrap();
+	open_specs.seal();
+	let (feed, mut params) = bound_params(&open_rev, &open_specs);
+	feed.args_committed(Str::from(raw)).unwrap();
+	let finalized = block_on(params.finalize()).unwrap();
+	assert_eq!(finalized.raw().as_bytes(), raw.as_bytes());
+	assert_eq!(finalized.effective_json(), r#"{"path":"x","config":{"extra":1}}"#);
+	assert!(
+		finalized
+			.repairs()
+			.iter()
+			.any(|repair| repair.kind == RepairKind::Alias)
+	);
+	assert!(
+		finalized
+			.repairs()
+			.iter()
+			.any(|repair| repair.kind == RepairKind::Tolerance)
+	);
+	let duplicate = r#"{"config":{"x":1,"x":2}}"#;
+	let (feed, mut params) = bound_params(&open_rev, &open_specs);
+	feed.args_committed(Str::from(duplicate)).unwrap();
+	assert!(matches!(
+		block_on(params.finalize()),
+		Err(ParamError::Args(issue)) if issue.kind == ArgIssueKind::Ambiguous
+	));
+}
+
+#[test]
+fn cursor_refuses_concurrent_pulls_and_keeps_lazy_chunk_offsets() {
+	let rev = Rev { family: Str::from("cursor"), n: 1 };
+	let mut specs = ArgSpecRegistry::new();
+	specs
+		.register(rev.clone(), declared_arg("text", &[], &[]))
+		.unwrap();
+	specs.seal();
+
+	let (feed, mut params) = bound_params(&rev, &specs);
+	let cursor = params.cursor().unwrap();
+	feed.arg_text(Str::from(r#"{"text":"hel"#)).unwrap();
+	let path = [ArgPath::Key(Str::from("text"))];
+	let mut first = Box::pin(cursor.pull_at(&path, PullMode::Complete, "string"));
+	assert!(first.as_mut().now_or_never().is_none());
+	assert!(matches!(
+		block_on(cursor.pull_at(&path, PullMode::Complete, "string")),
+		Err(ParamError::Protocol(problem)) if problem == "concurrent pull"
+	));
+	drop(first);
+	feed.arg_text(Str::from(r#"lo"}"#)).unwrap();
+	feed
+		.args_committed(Str::from(r#"{"text":"hello"}"#))
+		.unwrap();
+	let pulled = block_on(cursor.pull_at(&path, PullMode::Complete, "string")).unwrap();
+	assert!(
+		matches!(pulled.kind, PulledKind::Complete(omp_slopjson::Value::String(value)) if value == "hello")
+	);
+
+	let (feed, mut params) = bound_params(&rev, &specs);
+	let cursor = params.cursor().unwrap();
+	feed
+		.args_committed(Str::from(r#"{"text":"a\nb"}"#))
+		.unwrap();
+	let first = block_on(cursor.pull_at(&path, PullMode::Chunk(999), "string")).unwrap();
+	assert!(matches!(
+		first.kind,
+		PulledKind::Chunk { value, complete: true } if value == "a\nb"
+	));
+	let second = block_on(cursor.pull_at(&path, PullMode::Chunk(0), "string")).unwrap();
+	assert!(matches!(
+		second.kind,
+		PulledKind::Chunk { value, complete: true } if value.is_empty()
+	));
+}
+
+#[test]
+fn finalizer_uses_only_the_bound_revision_declarations() {
+	let first = Rev { family: Str::from("rev"), n: 1 };
+	let second = Rev { family: Str::from("rev"), n: 2 };
+	let mut specs = ArgSpecRegistry::new();
+	specs
+		.register(first.clone(), declared_arg("v", &[], &[Coerce::Integer]))
+		.unwrap();
+	specs
+		.register(second.clone(), declared_arg("v", &[], &[Coerce::Strip]))
+		.unwrap();
+	specs.seal();
+	for (rev, expected) in [(&first, r#"{"v":42}"#), (&second, r#"{"v":"42"}"#)] {
+		let (feed, mut params) = bound_params(rev, &specs);
+		feed.args_committed(Str::from(r#"{"v":"42"}"#)).unwrap();
+		assert_eq!(block_on(params.finalize()).unwrap().effective_json(), expected);
+	}
 }
 
 #[derive(Deserialize)]

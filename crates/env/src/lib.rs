@@ -8,10 +8,15 @@
 mod client;
 mod guard;
 
+#[cfg(windows)]
+pub mod windows;
+
 pub use client::{
-	BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, EnvClient, ExecEvent, ExecRun,
-	InProcessEnvTransport, Invocation, InvocationEvent, ProcessAttachment, ProcessAttachmentEvent,
-	RequestStream,
+	BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DataScope, DataStream, DataStreamItem,
+	DocumentEvents, DocumentLease, DocumentRead, EnvClient, ExecEvent, ExecRun,
+	InProcessEnvTransport, Invocation, InvocationEvent, LspEvents, LspStreamEvent,
+	ProcessAttachment, ProcessAttachmentEvent, RequestStream, SearchEvent, SearchStream, StreamLost,
+	TransactionId, TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
 };
 pub use guard::RunGuard;
 /// Generated `omp.env.v1` wire frames used at transport boundaries.

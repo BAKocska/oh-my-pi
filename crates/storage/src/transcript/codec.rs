@@ -3,22 +3,23 @@
 use std::{path::PathBuf, str::Utf8Error};
 
 use bytes::BufMut;
-use omp_core::Str;
+use omp_core::{Principal, Provenance, Str};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use thiserror::Error as ThisError;
 
 use super::{
 	event::{
-		Event, ItemRecord, JobRegistered, JobSettled, Kind, PromptRewriteCommit, PromptRewriteIntent,
-		PromptRewriteStage, ToolBatchAuthorized, TurnAbort, TurnInputItem, TurnInputRecord,
-		TurnOptionsRecord, TurnReceipt, TurnStart,
+		Custom, EntryUndecodable, Event, ItemRecord, JobRegistered, JobSettled, Kind,
+		PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ToolBatchAuthorized, TurnAbort,
+		TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 	},
 	msg::{Content, Msg},
 	patch::Patch,
 	types::{
-		AmendPatch, CallId, ModelChange, ModelId, ModelRef, Pin, ProviderId, RequestError, SessionId,
-		ThinkingSel, Tier, TitleSource, Usage,
+		AmendPatch, CallId, InvocationTransition, InvocationTransitionError, ModelChange, ModelId,
+		ModelRef, Pin, ProviderId, RequestAudit, RequestError, SessionId, ThinkingSel, Tier,
+		TitleSource, Usage,
 	},
 };
 use crate::blob::BlobRef;
@@ -61,6 +62,12 @@ pub enum Error {
 	/// An inference update did not change or clear any field.
 	#[error("an infer event must change or clear at least one field")]
 	EmptyInfer,
+	/// An invocation transition carried facts outside its recorded phase.
+	#[error(transparent)]
+	InvalidInvocationTransition(#[from] InvocationTransitionError),
+	/// An undecodable record was incorrectly paired with a decoded value.
+	#[error("an EntryUndecodable record must have value=None")]
+	UndecodableHasValue,
 }
 
 /// The identity header stored at line zero of every transcript v4 file.
@@ -129,12 +136,15 @@ pub fn read_header(line: &[u8]) -> Result<Header, Error> {
 
 /// Writes one event object without a trailing newline.
 ///
-/// Unknown event objects are copied byte-for-byte. Recognized objects are
+/// Undecodable event objects are copied byte-for-byte. Recognized objects are
 /// emitted directly to the destination, and every [`RawValue`] is serialized as
 /// a raw JSON fragment rather than buffered through an intermediate value tree.
 pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
-	if let Kind::Unknown(raw) = &event.kind {
-		out.put_slice(raw.get().as_bytes());
+	if let Kind::EntryUndecodable(entry) = &event.kind {
+		if entry.value.is_some() {
+			return Err(Error::UndecodableHasValue);
+		}
+		out.put_slice(entry.raw.get().as_bytes());
 		return Ok(());
 	}
 	let mut object = Object::new(out);
@@ -289,14 +299,46 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 			object.field("target", target)?;
 			object.field("label", label)?;
 		},
-		Kind::Custom { kind, data, context, display } => {
+		Kind::Custom(custom) => {
 			object.field("k", "custom")?;
-			object.field("kind", kind)?;
-			object.field("data", data)?;
-			object.field("context", context)?;
-			object.field("display", display)?;
+			object.field("kind", custom.kind())?;
+			object.field("rev", &custom.rev())?;
+			object.field("source", &custom.source())?;
+			object.field("principal", custom.principal())?;
+			object.field("provenance", custom.provenance())?;
+			object.field("data", &custom.data())?;
+			object.field("context", &custom.context())?;
+			object.field("display", &custom.display())?;
 		},
-		Kind::Unknown(_) => unreachable!("unknown events return before object encoding"),
+		Kind::RequestAudit(audit) => {
+			object.field("k", "request_audit")?;
+			object.field("request_id", &audit.request_id)?;
+			object.field("idempotency_key", &audit.idempotency_key)?;
+			object.field("extension_id", &audit.extension_id)?;
+			object.field("host_generation", &audit.host_generation)?;
+			object.field("session_generation", &audit.session_generation)?;
+			object.field("operation", &audit.operation)?;
+			object.field("indexes", &audit.indexes)?;
+		},
+		Kind::InvocationTransition(transition) => {
+			transition.validate()?;
+			object.field("k", "invocation_transition")?;
+			object.field("invocation_id", &transition.invocation_id)?;
+			object.field("call_id", &transition.call_id)?;
+			object.field("phase", &transition.phase)?;
+			object.field("requested_args", &transition.requested_args)?;
+			object.field("transformations", &transition.transformations)?;
+			object.field("effective_args", &transition.effective_args)?;
+			object.field("admission_receipt", &transition.admission_receipt)?;
+			object.field("assistant_item_event", &transition.assistant_item_event)?;
+			object.field("effect_token", &transition.effect_token)?;
+			object.field("effects", &transition.effects)?;
+			object.field("authorized_at", &transition.authorized_at)?;
+			object.field("outcome", &transition.outcome)?;
+		},
+		Kind::EntryUndecodable(_) => {
+			unreachable!("undecodable events return before object encoding")
+		},
 	}
 	object.finish();
 	Ok(())
@@ -356,9 +398,13 @@ fn write_msg_fields<B: BufMut>(object: &mut Object<'_, B>, message: &Msg) -> Res
 #[derive(Deserialize)]
 struct Probe {
 	#[serde(default)]
-	ts: Option<u64>,
+	ts:   Option<u64>,
 	#[serde(default)]
-	k:  Option<Str>,
+	k:    Option<Str>,
+	#[serde(default)]
+	kind: Option<Str>,
+	#[serde(default)]
+	rev:  Option<Str>,
 }
 
 macro_rules! payload {
@@ -461,23 +507,75 @@ payload!(TurnStartPayload {
 payload!(LabelPayload { target: u64, label: Option<Str> });
 payload!(CustomPayload {
 	kind: Str,
+	rev: Option<Str>,
+	source: Option<Str>,
+	principal: Principal,
+	provenance: Provenance,
 	data: Option<Box<RawValue>>,
 	context: Option<Content>,
 	display: bool,
 });
-
-/// Reads one event object, preserving an unrecognized object's complete source
-/// bytes.
+payload!(RequestAuditPayload {
+	request_id: Str,
+	idempotency_key: Str,
+	extension_id: Str,
+	host_generation: u64,
+	session_generation: u64,
+	operation: Str,
+	indexes: smallvec::SmallVec<u64, 8>,
+});
+/// Reads one event object with strict canonical validation.
+///
+/// Valid JSON objects that use an unknown record tag, fail their recorded
+/// schema, or differ from canonical append bytes are returned as
+/// [`Kind::EntryUndecodable`] with the original bytes intact.
 pub fn read_line(line: &[u8]) -> Result<Event, Error> {
 	let probe: Probe = serde_json::from_slice(line)?;
-	let Some(tag) = probe.k.as_ref().map(Str::as_str) else {
-		return unknown_line(line, probe.ts.unwrap_or_default());
+	let decoded = match decode_line(line) {
+		Ok(event) => event,
+		Err(error) => {
+			return undecodable_line(
+				line,
+				probe.ts.unwrap_or_default(),
+				probe.kind.or(probe.k),
+				probe.rev,
+				error.to_string(),
+			);
+		},
+	};
+	if matches!(decoded.kind, Kind::EntryUndecodable(_)) {
+		return Ok(decoded);
+	}
+	let mut canonical = Vec::with_capacity(line.len());
+	write_line(&decoded, &mut canonical)?;
+	if canonical != line {
+		return undecodable_line(
+			line,
+			decoded.ts,
+			probe.kind.or(probe.k),
+			probe.rev,
+			"record is not in canonical append encoding".to_owned(),
+		);
+	}
+	Ok(decoded)
+}
+
+fn decode_line(line: &[u8]) -> Result<Event, Error> {
+	let probe: Probe = serde_json::from_slice(line)?;
+	let Some(tag) = probe.k.clone() else {
+		return undecodable_line(
+			line,
+			probe.ts.unwrap_or_default(),
+			probe.kind,
+			probe.rev,
+			"record has no event kind".to_owned(),
+		);
 	};
 	let Some(ts) = probe.ts else {
 		return Err(Error::MissingTimestamp);
 	};
 
-	let kind = match tag {
+	let kind = match tag.as_str() {
 		"init" => {
 			let payload: InitPayload = serde_json::from_slice(line)?;
 			Kind::Init {
@@ -639,20 +737,64 @@ pub fn read_line(line: &[u8]) -> Result<Event, Error> {
 		},
 		"custom" => {
 			let payload: CustomPayload = serde_json::from_slice(line)?;
-			Kind::Custom {
-				kind:    payload.kind,
-				data:    payload.data,
-				context: payload.context,
-				display: payload.display,
-			}
+			Kind::Custom(Custom::new(
+				payload.kind,
+				payload.rev,
+				payload.source,
+				payload.principal,
+				payload.provenance,
+				payload.data,
+				payload.context,
+				payload.display,
+			)?)
 		},
-		_ => return unknown_line(line, ts),
+		"request_audit" => {
+			let payload: RequestAuditPayload = serde_json::from_slice(line)?;
+			Kind::RequestAudit(RequestAudit {
+				request_id:         payload.request_id,
+				idempotency_key:    payload.idempotency_key,
+				extension_id:       payload.extension_id,
+				host_generation:    payload.host_generation,
+				session_generation: payload.session_generation,
+				operation:          payload.operation,
+				indexes:            payload.indexes,
+			})
+		},
+		"invocation_transition" => {
+			let transition: InvocationTransition = serde_json::from_slice(line)?;
+			transition.validate()?;
+			Kind::InvocationTransition(transition)
+		},
+		_ => {
+			return undecodable_line(
+				line,
+				ts,
+				probe.kind.or(probe.k),
+				probe.rev,
+				format!("unknown event kind `{tag}`"),
+			);
+		},
 	};
 	Ok(Event { ts, kind })
 }
 
-fn unknown_line(line: &[u8], ts: u64) -> Result<Event, Error> {
+fn undecodable_line(
+	line: &[u8],
+	ts: u64,
+	kind: Option<Str>,
+	rev: Option<Str>,
+	reason: String,
+) -> Result<Event, Error> {
 	let source = std::str::from_utf8(line)?.to_owned();
 	let raw = RawValue::from_string(source)?;
-	Ok(Event { ts, kind: Kind::Unknown(raw) })
+	Ok(Event {
+		ts,
+		kind: Kind::EntryUndecodable(EntryUndecodable {
+			kind,
+			rev,
+			value: None,
+			raw,
+			reason: Str::new(&reason),
+		}),
+	})
 }

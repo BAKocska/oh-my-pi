@@ -23,8 +23,9 @@ use futures::{FutureExt, Stream, future::Either, pin_mut};
 use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
+	ExecEffects, IncomingParams, InferenceEffects, InterruptWaitError, ParamError, Part, PromptCaps,
+	Rev, Tool, ToolSpec, ToolTerminal, Usd,
 };
 use parking_lot::Mutex;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -464,6 +465,21 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 			constraint:      Constraint::Schema {
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				documents: Some(DocEffects {
+					read:        true,
+					write_globs: smallvec::smallvec![Str::new_static("**")],
+				}),
+				exec:      Some(ExecEffects {
+					commands: smallvec::smallvec![Str::new_static("*")],
+					network:  true,
+				}),
+				inference: Some(InferenceEffects {
+					max_requests: u32::MAX,
+					max_usd:      Usd::from_nanos(u64::MAX),
+				}),
+				subagents: u32::MAX,
 			},
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),

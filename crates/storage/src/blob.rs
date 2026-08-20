@@ -144,6 +144,12 @@ impl BlobStore {
 		Ok(store)
 	}
 
+	/// Returns the filesystem root that owns this blob namespace.
+	#[must_use]
+	pub fn root(&self) -> &Path {
+		&self.root
+	}
+
 	/// Stores an in-memory blob and returns its content-derived reference.
 	///
 	/// This uses the same staged, single-pass placement authority as

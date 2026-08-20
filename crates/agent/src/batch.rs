@@ -1,21 +1,30 @@
 //! Speculative environment invocations and ordered concurrent tool batches.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+	fmt,
+	sync::{
+		Arc, OnceLock,
+		atomic::{AtomicU128, Ordering},
+	},
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use futures::future::join_all;
 use omp_core::{IntoStr, Str, StrMut};
 use omp_env::{ClientError, EnvClient, Invocation, InvocationEvent};
 use omp_proto::{
-	env::v1::{EventStreamError, InvokeTool, Verdict as EnvVerdict},
+	env::v1::{Admission, AdmitInvocation, InvokeTool, Verdict as EnvVerdict},
+	policy::v1::EffectEnvelope,
 	thread::v1::{Item, Part as CanonicalPart},
+	toolhost::v1::HookEventId,
 };
 use omp_tool::{
-	Abort, ArgIssue, ArgPath, CallOutcome, CapsBase, JobRef, Part, PromptCaps, Registry,
-	ToolIdentity, ToolTerminal,
+	Abort, ArgIssue, ArgPath, CallOutcome, CallOutcomeDetails, CapsBase, Effects, JobRef, Part,
+	PromptCaps, Registry, ToolIdentity, ToolTerminal,
 };
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::{
 	events::{AgentEvent, EventBus},
@@ -58,24 +67,164 @@ impl From<ClientError> for BatchError {
 		Self::Environment(Box::new(error))
 	}
 }
+/// Returns the subscription-mask bit for one stable hook event id.
+#[must_use]
+pub const fn hook_event_mask(event: HookEventId) -> u128 {
+	1_u128 << event as u32
+}
 
+/// One hook-composed admission answer and its narrowed authority envelope.
+#[derive(Clone, Debug)]
+pub struct InvocationAdmission {
+	/// Environment admission receipt.
+	pub admission: Admission,
+	/// Authority no wider than the tool revision's declared maximum.
+	pub effects:   Effects,
+}
+
+/// One allocation-free-negative-path handoff from an invocation to hook
+/// CONTROL.
+#[derive(Debug)]
+pub enum InvocationHookRequest {
+	/// Exact raw provider argument text, emitted before the environment document
+	/// feed observes the fragment.
+	ArgText {
+		/// Transcript-visible invocation identity.
+		invocation_id: Str,
+		/// The one shared fragment clone made for subscribed hooks.
+		fragment:      Str,
+	},
+	/// Per-invocation admission query, declared authority ceiling, and unique
+	/// reply channel.
+	Admission {
+		/// Environment-owned finalized admission query.
+		query:           AdmitInvocation,
+		/// Maximum authority declared by the resolved tool revision.
+		maximum_effects: Effects,
+		/// One-shot response consumed only by this invocation.
+		reply:           flume::Sender<InvocationAdmission>,
+	},
+}
+
+/// Atomic union-mask and hook request sender shared by invocation pumps.
+#[derive(Clone, Debug)]
+pub struct InvocationHookBus {
+	union: Arc<AtomicU128>,
+	tx:    flume::Sender<InvocationHookRequest>,
+}
+
+impl InvocationHookBus {
+	/// Creates a hook bus and its single CONTROL-side request receiver.
+	#[must_use]
+	pub fn channel() -> (Self, flume::Receiver<InvocationHookRequest>) {
+		let (tx, rx) = flume::unbounded();
+		(Self { union: Arc::new(AtomicU128::new(0)), tx }, rx)
+	}
+
+	/// Replaces the registered union mask in one atomic publication.
+	pub fn replace_union_mask(&self, mask: u128) {
+		self.union.store(mask, Ordering::Release);
+	}
+
+	/// Returns the currently published union mask.
+	#[must_use]
+	pub fn union_mask(&self) -> u128 {
+		self.union.load(Ordering::Acquire)
+	}
+
+	fn subscribed(&self, event: HookEventId) -> bool {
+		self.union.load(Ordering::Relaxed) & hook_event_mask(event) != 0
+	}
+
+	fn arg_text(&self, invocation_id: &Str, fragment: &Str) {
+		if self.subscribed(HookEventId::HookEventToolCall) {
+			let _ = self.tx.send(InvocationHookRequest::ArgText {
+				invocation_id: invocation_id.clone(),
+				fragment:      fragment.clone(),
+			});
+		}
+	}
+
+	async fn admit(&self, query: AdmitInvocation, maximum_effects: Effects) -> InvocationAdmission {
+		let (reply, receive) = flume::bounded(1);
+		let decision = if self.subscribed(HookEventId::HookEventToolCall) {
+			if self
+				.tx
+				.send(InvocationHookRequest::Admission {
+					query: query.clone(),
+					maximum_effects: maximum_effects.clone(),
+					reply,
+				})
+				.is_ok()
+			{
+				receive.recv_async().await.ok()
+			} else {
+				None
+			}
+		} else {
+			Some(InvocationAdmission {
+				admission: allowed_admission(&query),
+				effects:   maximum_effects.clone(),
+			})
+		};
+		match decision {
+			Some(mut decision) if decision.effects.is_subset_of(&maximum_effects) => {
+				if !decision.admission.allow {
+					decision.effects = Effects::empty();
+				}
+				decision
+			},
+			_ => {
+				InvocationAdmission { admission: denied_admission(&query), effects: Effects::empty() }
+			},
+		}
+	}
+}
+
+fn allowed_admission(query: &AdmitInvocation) -> Admission {
+	Admission { invocation_id: query.invocation_id.clone(), allow: true, ..Admission::default() }
+}
+
+fn denied_admission(query: &AdmitInvocation) -> Admission {
+	Admission { invocation_id: query.invocation_id.clone(), allow: false, ..Admission::default() }
+}
+#[derive(Clone, Debug)]
+pub(crate) struct InvocationAdmissionFact {
+	pub(crate) invocation_id: Str,
+	pub(crate) raw:           Str,
+	pub(crate) admission:     Admission,
+}
 enum PumpCommand {
-	ArgText { fragment: Str, ack: flume::Sender<Result<(), ClientError>> },
-	Commit { raw: Bytes, ack: flume::Sender<Result<CommitState, ClientError>> },
-	Interrupt { reason: Str, ack: flume::Sender<Result<(), ClientError>> },
-	Cancel { ack: flume::Sender<()> },
+	ArgText {
+		fragment: Str,
+		ack:      flume::Sender<Result<(), ClientError>>,
+	},
+	Authorize {
+		raw:              Bytes,
+		effect_token:     Bytes,
+		authorized_at_ms: u64,
+		effects:          Effects,
+		ack:              flume::Sender<Result<AuthorizationState, ClientError>>,
+	},
+	Interrupt {
+		reason: Str,
+		ack:    flume::Sender<Result<(), ClientError>>,
+	},
+	Cancel {
+		ack: flume::Sender<()>,
+	},
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum CommitState {
+enum AuthorizationState {
 	Sent,
 	DeliveryIndeterminate,
 }
 
-struct CommitReceipt(flume::Receiver<Result<CommitState, ClientError>>);
+struct AuthorizationReceipt(flume::Receiver<Result<AuthorizationState, ClientError>>);
 
-impl CommitReceipt {
-	async fn wait(&self) -> Result<CommitState, BatchError> {
+impl AuthorizationReceipt {
+	async fn wait(&self) -> Result<AuthorizationState, BatchError> {
 		Ok(self
 			.0
 			.recv_async()
@@ -99,7 +248,6 @@ impl CommandReceipt {
 
 enum PumpTerminal {
 	Verdict(EnvVerdict),
-	StreamError(EventStreamError),
 	ClientError(ClientError),
 	Closed,
 	CancelUnobserved,
@@ -115,8 +263,14 @@ struct InterruptRequest {
 }
 
 struct InvocationPump {
-	commands: flume::Sender<PumpCommand>,
-	outputs:  flume::Receiver<PumpOutput>,
+	commands:        flume::Sender<PumpCommand>,
+	outputs:         flume::Receiver<PumpOutput>,
+	hooks:           Arc<OnceLock<InvocationHookBus>>,
+	maximum_effects: Arc<OnceLock<Effects>>,
+	maximum_ready:   Arc<Notify>,
+	admission:       Arc<OnceLock<Admission>>,
+	effects:         Arc<OnceLock<Effects>>,
+	facts:           Arc<OnceLock<flume::Sender<InvocationAdmissionFact>>>,
 }
 
 impl InvocationPump {
@@ -127,10 +281,16 @@ impl InvocationPump {
 		Ok(())
 	}
 
-	fn begin_commit(&self, raw: Bytes) -> Result<CommitReceipt, BatchError> {
+	fn begin_authorization(
+		&self,
+		raw: Bytes,
+		effect_token: Bytes,
+		authorized_at_ms: u64,
+		effects: Effects,
+	) -> Result<AuthorizationReceipt, BatchError> {
 		let (ack, reply) = flume::bounded(1);
-		self.send(PumpCommand::Commit { raw, ack })?;
-		Ok(CommitReceipt(reply))
+		self.send(PumpCommand::Authorize { raw, effect_token, authorized_at_ms, effects, ack })?;
+		Ok(AuthorizationReceipt(reply))
 	}
 
 	fn begin_interrupt(&self, reason: Str) -> Result<CommandReceipt, BatchError> {
@@ -202,7 +362,7 @@ async fn handle_interrupt(
 	}
 }
 
-enum CommitAction {
+enum AuthorizationAction {
 	Sent(Result<(), ClientError>),
 	Control(PumpCommand),
 	Closed,
@@ -215,6 +375,18 @@ fn spawn_invocation_pump(
 ) -> InvocationPump {
 	let (commands, command_rx) = flume::unbounded();
 	let (output_tx, outputs) = flume::unbounded();
+	let hooks: Arc<OnceLock<InvocationHookBus>> = Arc::new(OnceLock::new());
+	let task_hooks = Arc::clone(&hooks);
+	let maximum_effects: Arc<OnceLock<Effects>> = Arc::new(OnceLock::new());
+	let task_maximum_effects = Arc::clone(&maximum_effects);
+	let maximum_ready = Arc::new(Notify::new());
+	let task_maximum_ready = Arc::clone(&maximum_ready);
+	let admission: Arc<OnceLock<Admission>> = Arc::new(OnceLock::new());
+	let task_admission = Arc::clone(&admission);
+	let effects: Arc<OnceLock<Effects>> = Arc::new(OnceLock::new());
+	let task_effects = Arc::clone(&effects);
+	let facts: Arc<OnceLock<flume::Sender<InvocationAdmissionFact>>> = Arc::new(OnceLock::new());
+	let task_facts = Arc::clone(&facts);
 	tokio::spawn(async move {
 		let mut args_text = StrMut::default();
 		loop {
@@ -223,15 +395,20 @@ fn spawn_invocation_pump(
 					let Ok(command) = command else { break };
 					match command {
 						PumpCommand::ArgText { fragment, ack } => {
-							let result = invocation.arg_text(fragment.clone()).await;
+							let fragment_start = args_text.len();
+							args_text.push_str(&fragment);
+							let result = invocation.arg_text(fragment).await;
 							if result.is_ok() {
-								args_text.push_str(&fragment);
 								let view = omp_slopjson::parse_streaming(args_text.as_str());
 								events.publish(AgentEvent::ToolArgs {
 									call_id: call_id.clone(),
-									fragment: Bytes::copy_from_slice(fragment.as_bytes()),
+									fragment: Bytes::copy_from_slice(
+										args_text.as_str()[fragment_start..].as_bytes(),
+									),
 									view,
 								});
+							} else {
+								args_text.truncate(fragment_start);
 							}
 							let failed = result.is_err();
 							let _ = ack.send(result);
@@ -239,32 +416,43 @@ fn spawn_invocation_pump(
 								break;
 							}
 						},
-						PumpCommand::Commit { raw, ack } => {
+						PumpCommand::Authorize {
+							raw,
+							effect_token,
+							authorized_at_ms,
+							effects,
+							ack,
+						} => {
 							let action = {
-								let sent = invocation.commit_args(raw);
+								let sent = invocation.commit_args(
+									raw,
+									effect_token,
+									authorized_at_ms,
+									Some(EffectEnvelope::from(&effects)),
+								);
 								tokio::pin!(sent);
 								tokio::select! {
-									result = &mut sent => CommitAction::Sent(result),
+									result = &mut sent => AuthorizationAction::Sent(result),
 									control = command_rx.recv_async() => match control {
-										Ok(control) => CommitAction::Control(control),
-										Err(_) => CommitAction::Closed,
+										Ok(control) => AuthorizationAction::Control(control),
+										Err(_) => AuthorizationAction::Closed,
 									},
 								}
 							};
 							match action {
-								CommitAction::Sent(result) => {
-									let result = result.map(|()| CommitState::Sent);
+								AuthorizationAction::Sent(result) => {
+									let result = result.map(|()| AuthorizationState::Sent);
 									let failed = result.is_err();
 									let _ = ack.send(result);
 									if failed {
 										break;
 									}
 								},
-								CommitAction::Control(PumpCommand::Interrupt {
+								AuthorizationAction::Control(PumpCommand::Interrupt {
 									reason,
 									ack: interrupt_ack,
 								}) => {
-									let _ = ack.send(Ok(CommitState::DeliveryIndeterminate));
+									let _ = ack.send(Ok(AuthorizationState::DeliveryIndeterminate));
 									if handle_interrupt(
 										&invocation,
 										reason,
@@ -276,17 +464,19 @@ fn spawn_invocation_pump(
 										break;
 									}
 								},
-								CommitAction::Control(PumpCommand::Cancel { ack: cancel_ack }) => {
-									let _ = ack.send(Ok(CommitState::DeliveryIndeterminate));
+								AuthorizationAction::Control(PumpCommand::Cancel {
+									ack: cancel_ack,
+								}) => {
+									let _ = ack.send(Ok(AuthorizationState::DeliveryIndeterminate));
 									invocation.guard().cancel();
 									let _ = cancel_ack.send(());
 								},
-								CommitAction::Control(command) => {
+								AuthorizationAction::Control(command) => {
 									drop(command);
 									drop(ack);
 									break;
 								},
-								CommitAction::Closed => break,
+								AuthorizationAction::Closed => break,
 							}
 						},
 						PumpCommand::Interrupt { reason, ack } => {
@@ -302,6 +492,36 @@ fn spawn_invocation_pump(
 				},
 				event = invocation.next_event() => match event {
 					Ok(Some(InvocationEvent::Accepted(_))) => {},
+					Ok(Some(InvocationEvent::Admission(query))) => {
+						let maximum = loop {
+							if let Some(maximum) = task_maximum_effects.get() {
+								break maximum.clone();
+							}
+							task_maximum_ready.notified().await;
+						};
+						let decision = match task_hooks.get() {
+							Some(hooks) => hooks.admit(query.clone(), maximum.clone()).await,
+							None => InvocationAdmission {
+								admission: allowed_admission(&query),
+								effects: maximum,
+							},
+						};
+						let _ = task_admission.set(decision.admission.clone());
+						let _ = task_effects.set(decision.effects.clone());
+						if let Some(facts) = task_facts.get() {
+							let _ = facts.send(InvocationAdmissionFact {
+								invocation_id: call_id.clone(),
+								raw:           args_text.as_str().to_str(),
+								admission:     decision.admission.clone(),
+							});
+						}
+						if let Err(error) = invocation.admit(decision.admission).await {
+							let _ = output_tx.send(PumpOutput::Terminal(
+								PumpTerminal::ClientError(error),
+							));
+							break;
+						}
+					},
 					Ok(Some(InvocationEvent::Update(update))) => {
 						let json = update.json;
 						events.publish(AgentEvent::ToolUpdate {
@@ -313,12 +533,6 @@ fn spawn_invocation_pump(
 					Ok(Some(InvocationEvent::Verdict(verdict))) => {
 						let _ = output_tx.send(PumpOutput::Terminal(
 							PumpTerminal::Verdict(verdict),
-						));
-						break;
-					},
-					Ok(Some(InvocationEvent::StreamError(error))) => {
-						let _ = output_tx.send(PumpOutput::Terminal(
-							PumpTerminal::StreamError(error),
 						));
 						break;
 					},
@@ -336,7 +550,16 @@ fn spawn_invocation_pump(
 			}
 		}
 	});
-	InvocationPump { commands, outputs }
+	InvocationPump {
+		commands,
+		outputs,
+		hooks,
+		maximum_effects,
+		maximum_ready,
+		admission,
+		effects,
+		facts,
+	}
 }
 
 /// An environment invocation opened before its model arguments are committed.
@@ -388,37 +611,86 @@ impl SpeculativeCall {
 		&self.identity
 	}
 
+	/// Installs the loop-owned hook, authority ceiling, and durable fact bus.
+	pub(crate) fn attach_runtime(
+		&mut self,
+		hooks: InvocationHookBus,
+		facts: flume::Sender<InvocationAdmissionFact>,
+		maximum_effects: Effects,
+	) -> Result<(), BatchError> {
+		self
+			.pump
+			.hooks
+			.set(hooks)
+			.map_err(|_| BatchError::Projection(Str::new_static("invocation hook bus already set")))?;
+		self
+			.pump
+			.maximum_effects
+			.set(maximum_effects)
+			.map_err(|_| {
+				BatchError::Projection(Str::new_static("invocation effect maximum already set"))
+			})?;
+		self
+			.pump
+			.facts
+			.set(facts)
+			.map_err(|_| BatchError::Projection(Str::new_static("invocation fact bus already set")))?;
+		self.pump.maximum_ready.notify_one();
+		Ok(())
+	}
+
 	/// Queues one provider argument fragment verbatim for the invocation owner.
 	///
-	/// The owner publishes the cumulative parsed view only after env/v1 accepts
-	/// the fragment, before it can observe and publish the resulting update.
+	/// Subscribed hooks observe the raw fragment before the environment document
+	/// feed. The negative path performs one atomic load and no clone.
 	pub async fn relay_fragment(&mut self, fragment: Str) -> Result<(), BatchError> {
+		if let Some(hooks) = self.pump.hooks.get() {
+			hooks.arg_text(&self.call_id, &fragment);
+		}
 		self.pump.arg_text(fragment).await
 	}
 
-	/// Binds authoritative committed argument bytes to this invocation.
+	/// Returns the admission receipt fixed by the environment, when available.
+	pub(crate) fn admission(&self) -> Option<&Admission> {
+		self.pump.admission.get()
+	}
+
+	/// Records the durable assistant-item commitment for this invocation.
 	///
-	/// This local transition performs no I/O. [`ToolBatch::drive`] sends every
-	/// batch member's commit gate concurrently, so issued-order iteration cannot
-	/// serialize otherwise independent tool effects.
+	/// This local transition performs no I/O. Effect authorization is sent only
+	/// by [`ToolBatch::drive`] after the loop journals the token and timestamp.
 	pub fn commit(self, raw_args: Bytes) -> CommittedCall {
+		let effect_token = ulid::Ulid::generate().to_string().to_str();
+		let authorized_at_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis()
+			.try_into()
+			.unwrap_or(u64::MAX);
+		let effects = self.pump.effects.get().cloned().unwrap_or_default();
 		CommittedCall {
 			call_id: self.call_id,
 			identity: self.identity,
 			raw_args,
+			effect_token,
+			authorized_at_ms,
+			effects,
 			pump: self.pump,
 			events: self.events,
 		}
 	}
 }
 
-/// An authoritative call waiting for the concurrent `ArgsCommitted` gate.
+/// An assistant-item-committed call waiting for effect authorization.
 pub struct CommittedCall {
-	call_id:  Str,
-	identity: ToolIdentity,
-	raw_args: Bytes,
-	pump:     InvocationPump,
-	events:   EventBus,
+	call_id:          Str,
+	identity:         ToolIdentity,
+	raw_args:         Bytes,
+	effect_token:     Str,
+	authorized_at_ms: u64,
+	effects:          Effects,
+	pump:             InvocationPump,
+	events:           EventBus,
 }
 
 impl CommittedCall {
@@ -436,6 +708,21 @@ impl CommittedCall {
 	pub const fn identity(&self) -> &ToolIdentity {
 		&self.identity
 	}
+
+	/// Returns the unforgeable token issued for this invocation's effect scope.
+	pub const fn effect_token(&self) -> &Str {
+		&self.effect_token
+	}
+
+	/// Returns the epoch-millisecond effect-authorization timestamp.
+	pub const fn authorized_at_ms(&self) -> u64 {
+		self.authorized_at_ms
+	}
+
+	/// Returns the exact Core-narrowed authority envelope.
+	pub const fn effects(&self) -> &Effects {
+		&self.effects
+	}
 }
 
 /// One exact serialized tool update emitted while a batch call is live.
@@ -449,8 +736,9 @@ pub struct BatchUpdate {
 /// One ordered batch completion shared with the event feed.
 #[derive(Clone)]
 pub struct BatchResult {
-	event: Arc<AgentEvent>,
-	job:   Option<JobRef>,
+	event:   Arc<AgentEvent>,
+	job:     Option<JobRef>,
+	outcome: Option<CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
 }
 
 impl BatchResult {
@@ -458,6 +746,14 @@ impl BatchResult {
 	pub fn item(&self) -> &Item {
 		match self.event.as_ref() {
 			AgentEvent::ToolFinished { item, .. } => item,
+			_ => unreachable!("batch results only retain ToolFinished events"),
+		}
+	}
+
+	/// Returns the transcript-visible invocation identity.
+	pub fn call_id(&self) -> &Str {
+		match self.event.as_ref() {
+			AgentEvent::ToolFinished { call_id, .. } => call_id,
 			_ => unreachable!("batch results only retain ToolFinished events"),
 		}
 	}
@@ -470,6 +766,11 @@ impl BatchResult {
 	/// Returns detached job ownership when work outlives the turn.
 	pub const fn job(&self) -> Option<&JobRef> {
 		self.job.as_ref()
+	}
+
+	/// Borrows the canonical four-arm durable outcome fixed at settlement.
+	pub const fn outcome(&self) -> Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>> {
+		self.outcome.as_ref()
 	}
 
 	/// Takes detached job ownership for registration with the job board.
@@ -504,7 +805,7 @@ impl ToolBatch {
 		self.calls.is_empty()
 	}
 
-	/// Sends every commit gate and drives all calls concurrently.
+	/// Sends every effect authorization and drives all calls concurrently.
 	///
 	/// Results remain in issued order. Once a call is authorized, environment
 	/// or lowering failures become canonical `EffectsUnknown` results so every
@@ -594,17 +895,22 @@ async fn run_call(
 	grace: Duration,
 	updates: Option<flume::Sender<BatchUpdate>>,
 ) -> (usize, BatchResult) {
-	let receipt = match call.pump.begin_commit(call.raw_args.clone()) {
+	let receipt = match call.pump.begin_authorization(
+		call.raw_args.clone(),
+		Bytes::copy_from_slice(call.effect_token.as_bytes()),
+		call.authorized_at_ms,
+		call.effects.clone(),
+	) {
 		Ok(receipt) => receipt,
 		Err(error) => {
-			let reason = format!("ArgsCommitted delivery failed: {error}").to_str();
+			let reason = format!("effect authorization delivery failed: {error}").to_str();
 			return (index, lower_abort_total(&call, Abort::EffectsUnknown { reason }));
 		},
 	};
 	let mut pending_interrupt = None;
-	let mut terminal_during_commit = None;
-	let mut commit_failure = None;
-	let commit = tokio::select! {
+	let mut terminal_during_authorization = None;
+	let mut authorization_failure = None;
+	let authorization = tokio::select! {
 		biased;
 		request = wait_for_ordered_interrupt(&interrupt) => {
 			match call.pump.begin_interrupt(request.reason) {
@@ -614,26 +920,28 @@ async fn run_call(
 				},
 				Err(error) => {
 					drop(request.acknowledged);
-					commit_failure =
-						Some(format!("failed to interrupt pending ArgsCommitted: {error}").to_str());
-					terminal_during_commit = Some(drain_pump(&call, updates.as_ref()).await);
-					Ok(CommitState::DeliveryIndeterminate)
+					authorization_failure =
+						Some(format!("failed to interrupt pending authorization: {error}").to_str());
+					terminal_during_authorization =
+						Some(drain_pump(&call, updates.as_ref()).await);
+					Ok(AuthorizationState::DeliveryIndeterminate)
 				},
 			}
 		},
 		result = receipt.wait() => result,
 	};
-	let commit_indeterminate = match commit {
-		Ok(CommitState::Sent) => false,
-		Ok(CommitState::DeliveryIndeterminate) => true,
+	let authorization_indeterminate = match authorization {
+		Ok(AuthorizationState::Sent) => false,
+		Ok(AuthorizationState::DeliveryIndeterminate) => true,
 		Err(error) => {
-			commit_failure = Some(format!("ArgsCommitted delivery failed: {error}").to_str());
-			terminal_during_commit = Some(drain_pump(&call, updates.as_ref()).await);
+			authorization_failure =
+				Some(format!("effect authorization delivery failed: {error}").to_str());
+			terminal_during_authorization = Some(drain_pump(&call, updates.as_ref()).await);
 			true
 		},
 	};
 
-	let terminal = if let Some(terminal) = terminal_during_commit {
+	let terminal = if let Some(terminal) = terminal_during_authorization {
 		terminal
 	} else if let Some((receipt, acknowledged)) = pending_interrupt {
 		finish_interrupt_with_grace(&call, updates.as_ref(), receipt, acknowledged, grace).await
@@ -653,16 +961,13 @@ async fn run_call(
 					reason: format!("failed to lower environment verdict: {error}").to_str(),
 				})
 			}),
-		PumpTerminal::StreamError(error) => lower_abort_total(&call, Abort::EffectsUnknown {
-			reason: format!("environment invocation stream lost: {}", error.message).to_str(),
-		}),
 		PumpTerminal::Closed => {
-			if let Some(reason) = commit_failure {
+			if let Some(reason) = authorization_failure {
 				lower_abort_total(&call, Abort::EffectsUnknown { reason })
-			} else if commit_indeterminate {
+			} else if authorization_indeterminate {
 				lower_abort_total(&call, Abort::EffectsUnknown {
 					reason: Str::new_static(
-						"ArgsCommitted delivery became indeterminate during interruption",
+						"effect authorization delivery became indeterminate during interruption",
 					),
 				})
 			} else {
@@ -744,7 +1049,6 @@ async fn force_cancel_with_grace(
 	};
 	match tokio::time::timeout(grace, forced).await {
 		Ok(PumpTerminal::Verdict(verdict)) => PumpTerminal::Verdict(verdict),
-		Ok(PumpTerminal::StreamError(error)) => PumpTerminal::StreamError(error),
 		Ok(PumpTerminal::ClientError(error)) => PumpTerminal::ClientError(error),
 		Ok(PumpTerminal::Closed | PumpTerminal::CancelUnobserved) | Err(_) => {
 			PumpTerminal::CancelUnobserved
@@ -810,16 +1114,22 @@ fn lower_verdict(
 
 	let outcome = serde_json::from_slice::<CallOutcome<Value, Value>>(&wire.json)
 		.map_err(BatchError::InvalidOutcome)?;
+	let durable = durable_outcome(&wire.json, &outcome);
 	let is_error = !matches!(outcome, CallOutcome::Ok(_));
-	if let Some(parts) = harness_parts(&outcome) {
-		return lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts);
-	}
-	let caps = PromptCaps::for_tool(caps, &call.identity.rev);
-	match registry.prompt(&call.identity, &wire.json, &caps) {
-		Ok(Some(parts)) => lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts),
-		Ok(None) => unreachable!("harness outcome branches were handled before registry projection"),
-		Err(_) => lower_canonical_parts(call, &wire.json, is_error, wire.useless, wire.parts),
-	}
+	let mut result = if let Some(parts) = harness_parts(&outcome) {
+		lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?
+	} else {
+		let caps = PromptCaps::for_tool(caps, &call.identity.rev);
+		match registry.prompt(&call.identity, &wire.json, &caps) {
+			Ok(Some(parts)) => lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?,
+			Ok(None) => {
+				unreachable!("harness outcome branches were handled before registry projection")
+			},
+			Err(_) => lower_canonical_parts(call, &wire.json, is_error, wire.useless, wire.parts)?,
+		}
+	};
+	result.outcome = Some(durable);
+	Ok(result)
 }
 
 fn lower_detached(
@@ -834,14 +1144,16 @@ fn lower_detached(
 	let item = tool_result_item(0, &call.call_id, &call.identity, &raw, false, false, &parts)
 		.map_err(|error| BatchError::Projection(error.to_string().to_str()))?;
 	let event = finish_event(call, item);
-	Ok(BatchResult { event, job: Some(job) })
+	Ok(BatchResult { event, job: Some(job), outcome: None })
 }
 
 fn lower_abort(call: &CommittedCall, abort: Abort) -> Result<BatchResult, BatchError> {
 	let outcome = CallOutcome::<Value, Value>::aborted(abort);
 	let raw = Bytes::from(serde_json::to_vec(&outcome).map_err(BatchError::InvalidOutcome)?);
 	let parts = harness_parts(&outcome).expect("aborted outcome always uses the harness renderer");
-	lower_tool_parts(call, &raw, true, false, &parts)
+	let mut result = lower_tool_parts(call, &raw, true, false, &parts)?;
+	result.outcome = Some(durable_outcome(&raw, &outcome));
+	Ok(result)
 }
 
 fn lower_abort_total(call: &CommittedCall, abort: Abort) -> BatchResult {
@@ -858,7 +1170,7 @@ fn lower_tool_parts(
 ) -> Result<BatchResult, BatchError> {
 	let item = tool_result_item(0, &call.call_id, &call.identity, verdict, is_error, useless, parts)
 		.map_err(|error| BatchError::Projection(error.to_string().to_str()))?;
-	Ok(BatchResult { event: finish_event(call, item), job: None })
+	Ok(BatchResult { event: finish_event(call, item), job: None, outcome: None })
 }
 
 fn lower_canonical_parts(
@@ -878,7 +1190,22 @@ fn lower_canonical_parts(
 		parts,
 	)
 	.map_err(|error| BatchError::Projection(error.to_string().to_str()))?;
-	Ok(BatchResult { event: finish_event(call, item), job: None })
+	Ok(BatchResult { event: finish_event(call, item), job: None, outcome: None })
+}
+
+fn durable_outcome(
+	raw: &Bytes,
+	outcome: &CallOutcome<Value, Value>,
+) -> CallOutcome<CallOutcomeDetails, CallOutcomeDetails> {
+	let details = || CallOutcomeDetails::Inline { json: raw.clone() };
+	match outcome {
+		CallOutcome::Ok(_) => CallOutcome::Ok(details()),
+		CallOutcome::Faulted(_) => CallOutcome::Faulted(details()),
+		CallOutcome::ArgsRejected(issue) => CallOutcome::ArgsRejected(issue.clone()),
+		CallOutcome::Aborted { abort, kind, policy } => {
+			CallOutcome::Aborted { abort: abort.clone(), kind: *kind, policy: policy.clone() }
+		},
+	}
 }
 
 fn finish_event(call: &CommittedCall, item: Item) -> Arc<AgentEvent> {
@@ -947,7 +1274,7 @@ mod tests {
 
 	use omp_env::frame::{self, client_frame, server_frame};
 	use omp_proto::thread::v1::{Part as ThreadPart, part};
-	use omp_tool::{ModelClass, Rev};
+	use omp_tool::{ArgIssueKind, ModelClass, Rev};
 
 	use super::*;
 
@@ -978,6 +1305,83 @@ mod tests {
 		text
 	}
 
+	#[test]
+	fn hook_mask_zero_path_does_not_clone_or_enqueue_argument_text() {
+		let (bus, requests) = InvocationHookBus::channel();
+		let invocation_id = Str::from("call");
+		let fragment = Str::from("{\"value\":");
+		bus.arg_text(&invocation_id, &fragment);
+		assert!(requests.try_recv().is_err());
+
+		bus.replace_union_mask(hook_event_mask(HookEventId::HookEventToolCall));
+		bus.arg_text(&invocation_id, &fragment);
+		assert!(matches!(
+			requests.try_recv(),
+			Ok(InvocationHookRequest::ArgText {
+				invocation_id: actual_id,
+				fragment: actual_fragment,
+			}) if actual_id == invocation_id && actual_fragment == fragment
+		));
+	}
+
+	#[tokio::test]
+	async fn admission_hooks_cannot_widen_declared_effects() {
+		let (bus, requests) = InvocationHookBus::channel();
+		bus.replace_union_mask(hook_event_mask(HookEventId::HookEventToolCall));
+		let maximum = Effects { subagents: 1, ..Effects::empty() };
+		let query = AdmitInvocation { invocation_id: "effects".into(), ..AdmitInvocation::default() };
+		let answer = bus.admit(query, maximum.clone());
+		let responder = async {
+			let InvocationHookRequest::Admission { maximum_effects, reply, .. } =
+				requests.recv_async().await.expect("admission request")
+			else {
+				panic!("expected admission request");
+			};
+			assert_eq!(maximum_effects, maximum);
+			reply
+				.send(InvocationAdmission {
+					admission: Admission {
+						invocation_id: "effects".into(),
+						allow: true,
+						..Admission::default()
+					},
+					effects:   Effects { subagents: 2, ..Effects::empty() },
+				})
+				.expect("admission reply");
+		};
+		let (decision, ()) = tokio::join!(answer, responder);
+		assert!(!decision.admission.allow);
+		assert!(decision.effects.is_empty());
+	}
+
+	#[test]
+	fn durable_outcome_preserves_all_four_terminal_arms() {
+		let issue = ArgIssue {
+			path:     Vec::new(),
+			expected: Str::new_static("object"),
+			kind:     ArgIssueKind::Malformed,
+			example:  None,
+			found:    None,
+		};
+		let outcomes = [
+			CallOutcome::Ok(Value::Null),
+			CallOutcome::Faulted(Value::Null),
+			CallOutcome::ArgsRejected(issue),
+			CallOutcome::aborted(Abort::InputDropped),
+		];
+		for outcome in outcomes {
+			let raw = Bytes::from(serde_json::to_vec(&outcome).expect("serialize outcome"));
+			let durable = durable_outcome(&raw, &outcome);
+			assert!(matches!(
+				(&outcome, durable),
+				(CallOutcome::Ok(_), CallOutcome::Ok(_))
+					| (CallOutcome::Faulted(_), CallOutcome::Faulted(_))
+					| (CallOutcome::ArgsRejected(_), CallOutcome::ArgsRejected(_))
+					| (CallOutcome::Aborted { .. }, CallOutcome::Aborted { .. })
+			));
+		}
+	}
+
 	#[tokio::test]
 	async fn two_calls_preserve_order_and_malformed_terminal_becomes_effects_unknown() {
 		let (client, transport) = EnvClient::in_process(0);
@@ -997,6 +1401,7 @@ mod tests {
 				let Some(client_frame::Body::ArgsCommitted(commit)) = frame.body else {
 					continue;
 				};
+				assert!(commit.effects.is_some(), "authorization must carry an explicit envelope");
 				committed.insert(commit.invocation_id, frame.request_id);
 			}
 			let second = committed["second"];
@@ -1094,6 +1499,59 @@ mod tests {
 			assert!(
 				!matches!(frame.body, Some(client_frame::Body::ArgsCommitted(_))),
 				"interrupted unstarted call sent ArgsCommitted"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn abandonment_after_admission_never_authorizes_effects() {
+		let (client, transport) = EnvClient::in_process(0);
+		let (requests, responses) = transport.into_parts();
+		let events = EventBus::new();
+		let mut call = SpeculativeCall::open(
+			&client,
+			&events,
+			Str::new_static("abandoned"),
+			identity("abandoned_tool"),
+			Duration::from_secs(1),
+		)
+		.await
+		.expect("open call");
+		let (hooks, _hook_requests) = InvocationHookBus::channel();
+		let (facts, _fact_receiver) = flume::unbounded();
+		call
+			.attach_runtime(hooks, facts, Effects::empty())
+			.expect("attach runtime");
+		let opened = requests.recv_async().await.expect("invoke frame");
+		responses
+			.send_async(frame::ServerFrame {
+				request_id: opened.request_id,
+				body: Some(server_frame::Body::AdmitInvocation(AdmitInvocation {
+					invocation_id: "abandoned".into(),
+					..AdmitInvocation::default()
+				})),
+				..frame::ServerFrame::default()
+			})
+			.await
+			.expect("admit invocation");
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while call.admission().is_none() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("admission observed");
+		drop(call);
+
+		let cancelled = tokio::time::timeout(Duration::from_secs(1), requests.recv_async())
+			.await
+			.expect("cancel timeout")
+			.expect("cancel frame");
+		assert!(matches!(cancelled.body, Some(client_frame::Body::Cancel(_))));
+		while let Ok(frame) = requests.try_recv() {
+			assert!(
+				!matches!(frame.body, Some(client_frame::Body::ArgsCommitted(_))),
+				"abandoned admitted invocation authorized effects"
 			);
 		}
 	}

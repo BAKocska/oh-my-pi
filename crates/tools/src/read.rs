@@ -7,8 +7,8 @@ use bytes::Bytes;
 use futures::{FutureExt as _, Stream, pin_mut, select_biased};
 use omp_core::Str;
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams, ParamError,
-	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
+	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ pub mod image;
 pub mod markit;
 pub mod notebook;
 pub mod profile;
+pub mod resolver;
 pub mod selector;
 pub mod sqlite;
 pub use sqlite::looks_like_sqlite;
@@ -263,7 +264,21 @@ pub enum Fault {
 		/// Exact diagnostic.
 		message: Str,
 	},
-	/// Unsupported internal resource seam.
+	/// A syntactically valid scheme outside the built-in vocabulary.
+	UnknownScheme {
+		/// Caller spelling of the unknown scheme.
+		scheme:  Str,
+		/// Exact diagnostic.
+		message: Str,
+	},
+	/// A known scheme with no resolver in this deployment.
+	SchemeNotReadable {
+		/// Known scheme that could not be dispatched.
+		scheme:  resolver::Scheme,
+		/// Exact diagnostic.
+		message: Str,
+	},
+	/// Unsupported operation on an otherwise readable source.
 	Unsupported {
 		/// Exact diagnostic.
 		message: Str,
@@ -291,6 +306,8 @@ impl Fault {
 		match self {
 			Self::Invalid { message }
 			| Self::Source { message }
+			| Self::UnknownScheme { message, .. }
+			| Self::SchemeNotReadable { message, .. }
 			| Self::Unsupported { message }
 			| Self::Web { message }
 			| Self::Blob { message } => message,
@@ -299,10 +316,11 @@ impl Fault {
 }
 
 /// `read@1` executor over unboxed app resource adapters.
-pub struct ReadTool<S, B> {
-	sources: S,
-	blobs:   B,
-	spec:    ToolSpec,
+pub struct ReadTool<S, B, R = resolver::NoResolver> {
+	sources:   S,
+	blobs:     B,
+	resolvers: Arc<resolver::ResolverTable<R>>,
+	spec:      ToolSpec,
 }
 
 struct InterruptSqliteOnDrop(Option<Arc<sqlite::QueryInterrupt>>);
@@ -321,11 +339,25 @@ impl Drop for InterruptSqliteOnDrop {
 	}
 }
 
-/// Constructs the Pi-compatible `read@1` tool.
-pub fn tool<S: ReadSources, B: ReadBlobs>(sources: S, blobs: B) -> ReadTool<S, B> {
+/// Constructs the Pi-compatible `read@1` tool without internal URL resolvers.
+pub fn tool<S: ReadSources, B: ReadBlobs>(
+	sources: S,
+	blobs: B,
+) -> ReadTool<S, B, resolver::NoResolver> {
+	tool_with_resolvers(sources, blobs, Arc::new(resolver::ResolverTable::default()))
+}
+
+/// Constructs `read@1` with concrete, constructor-owned internal URL
+/// resolvers.
+pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
+	sources: S,
+	blobs: B,
+	resolvers: Arc<resolver::ResolverTable<R>>,
+) -> ReadTool<S, B, R> {
 	ReadTool {
 		sources,
 		blobs,
+		resolvers,
 		spec: ToolSpec {
 			name:            Str::new_static("read"),
 			rev:             Rev { family: Str::new_static(""), n: 1 },
@@ -334,6 +366,15 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(sources: S, blobs: B) -> ReadTool<S, B
 			constraint:      Constraint::Schema {
 				priority:       10,
 				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				documents: Some(DocEffects {
+					read:        true,
+					write_globs: smallvec::SmallVec::new(),
+				}),
+				exec:      None,
+				inference: None,
+				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),
@@ -344,7 +385,7 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(sources: S, blobs: B) -> ReadTool<S, B
 	}
 }
 
-impl<S: ReadSources, B: ReadBlobs> Tool for ReadTool<S, B> {
+impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B, R> {
 	type Fault = Fault;
 	type Params = Params;
 	type Payload = Payload;
@@ -441,7 +482,7 @@ impl<S: ReadSources, B: ReadBlobs> Tool for ReadTool<S, B> {
 	}
 }
 
-impl<S: ReadSources, B: ReadBlobs> ReadTool<S, B> {
+impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	async fn execute(&self, authored: Str) -> Result<Payload, Fault> {
 		let targets = self.split_targets(&authored).await?;
 		let multiple = targets.len() > 1;
@@ -476,6 +517,9 @@ impl<S: ReadSources, B: ReadBlobs> ReadTool<S, B> {
 
 	async fn split_targets(&self, authored: &str) -> Result<Vec<Str>, Fault> {
 		if !authored.contains(';')
+			|| selector::parse_uri(authored)
+				.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+				.is_some()
 			|| !matches!(web::parse_target(authored), Ok(None))
 			|| self.sources.stat(Str::from(authored)).await.is_ok()
 		{
@@ -495,9 +539,50 @@ impl<S: ReadSources, B: ReadBlobs> ReadTool<S, B> {
 		})? {
 			return self.read_web(target).await;
 		}
-		if let Some(message) = selector::classify_uri_target(authored).unsupported_message() {
-			return Err(Fault::Unsupported { message });
-		}
+
+		let file_authored = match selector::parse_uri(authored)
+			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })?
+		{
+			Some(uri) if uri.scheme == resolver::Scheme::File => {
+				let mut path = uri.resource.to_owned();
+				if let Some(selector) = uri.selector_text {
+					path.push(':');
+					path.push_str(selector);
+				}
+				Some(path)
+			},
+			Some(uri) if uri.scheme == resolver::Scheme::Unknown => {
+				return Err(Fault::UnknownScheme {
+					scheme:  Str::from(uri.raw_scheme),
+					message: Str::from(format!("Unknown URL scheme '{}'", uri.raw_scheme)),
+				});
+			},
+			Some(uri) => {
+				let Some(result) = self
+					.resolvers
+					.read(uri.scheme, uri.resource, &uri.selector)
+					.await
+				else {
+					return Err(Fault::SchemeNotReadable {
+						scheme:  uri.scheme,
+						message: Str::from(format!(
+							"{}:// is not readable in this deployment",
+							uri.raw_scheme.to_ascii_lowercase()
+						)),
+					});
+				};
+				let bytes = result?;
+				let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+					message: Str::from(format!(
+						"{}://{} did not resolve to UTF-8 text",
+						uri.raw_scheme, uri.resource
+					)),
+				})?;
+				return Ok(vec![PayloadPart::Text { text: Str::from(text) }]);
+			},
+			None => None,
+		};
+		let authored = file_authored.as_deref().unwrap_or(authored);
 
 		let literal = self.sources.stat(Str::from(authored)).await.ok();
 		let parsed_split = selector::split_path_and_selector(authored);

@@ -61,12 +61,14 @@ pub use classify::{JsonPrefixState, classify_json_prefix};
 pub use de::{Deserializer, from_str, parse};
 pub use error::ParseError;
 pub use incoming::{
-	FeedClosed, IncomingArray, IncomingDoc, IncomingError, IncomingFeed, IncomingJson,
-	IncomingObject, IncomingString, PullIssue, PullIssueKind, PullPathSegment,
+	FeedClosed, IncomingArray, IncomingCursor, IncomingDoc, IncomingError, IncomingFeed,
+	IncomingJson, IncomingObject, IncomingString, PullIssue, PullIssueKind, PullMode,
+	PullPathSegment, Pulled, PulledKind, PulledValueKind, RepairGuard,
 };
 /// String type used for object keys and string values; re-exported for
 /// constructing [`Value`]s without depending on `omp-core` directly.
 pub use omp_core::Str;
+pub use parser::{Repair, RepairKind, RepairLog, RepairPathSegment};
 pub use raw::RawValue;
 pub use repair::repair_json;
 pub use streaming::parse_streaming;

@@ -24,9 +24,9 @@ pub mod writer;
 pub use block::{Block, BlockKind, Replay};
 pub use codec::{Error, Header, read_header, read_line, write_header, write_line};
 pub use event::{
-	Event, ItemRecord, JobRegistered, JobSettled, Kind, PromptRewriteCommit, PromptRewriteIntent,
-	PromptRewriteStage, ToolBatchAuthorized, TurnAbort, TurnInputItem, TurnInputRecord,
-	TurnOptionsRecord, TurnReceipt, TurnStart,
+	Custom, EntryUndecodable, Event, ItemRecord, JobRegistered, JobSettled, Kind,
+	PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ToolBatchAuthorized, TurnAbort,
+	TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 };
 pub use msg::{Content, Msg, UserBlock};
 pub use patch::Patch;

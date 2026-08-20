@@ -18,6 +18,7 @@ pub mod cow_bytes;
 pub mod encoding;
 pub mod location;
 pub mod phase;
+pub mod principal;
 pub mod semver;
 pub mod sparse_index;
 pub mod sparse_map;
@@ -29,9 +30,11 @@ pub use append_vec::{AppendSlice, AppendVec};
 pub use cow_bytes::CowBytes;
 pub use encoding::{base32, base32_dns, base32_hex, base64, base64_url, hex};
 pub use location::{
-	AgentUrl, ArtifactUrl, ClientPath, EnvPath, HistoryUrl, LocationError, ToolPath, WorkspaceUri,
+	AgentUrl, ArtifactAddress, ArtifactUrl, ClientPath, EnvPath, HistoryUrl, LocationError,
+	ToolPath, WorkspaceUri,
 };
-pub use phase::InvocationPhase;
+pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
+pub use principal::{ArtifactDigest, ArtifactDigestError, Principal, Provenance};
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;
 pub use sparse_set::SparseSet;

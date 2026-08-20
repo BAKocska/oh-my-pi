@@ -11,17 +11,27 @@ use std::{
 
 use bytes::Bytes;
 use nix::{errno::Errno, sys::signal, unistd::Pid};
-use omp_app::envd::worker::{
-	CommittedToolCall, ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE,
-	WorkerAbortKind, WorkerCompletion, WorkerEvent, WorkerOutcomeKind,
+use omp_app::{
+	envd::worker::{
+		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, OpenToolCall, PY_EVAL_MODULE,
+		WorkerAbortKind, WorkerCompletion, WorkerError, WorkerEvent, WorkerInvocation,
+		WorkerOutcomeKind,
+	},
+	exthost::{
+		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
+		control::{ControlError, HostRequestMap},
+	},
 };
-use omp_core::Str;
+use omp_core::{
+	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str,
+};
 use omp_proto::{
+	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
 	prost::Message as _,
 	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
 		AdmitExtensions, AdmittedExtension, ArgIssue, HostFrame, LifecycleHostEnvelope, OutcomeKind,
-		ToolComplete, host_frame, lifecycle_host_envelope,
+		PullReply, PullRequest, ToolComplete, host_frame, lifecycle_host_envelope,
 	},
 };
 use serde_json::{Value, json};
@@ -64,6 +74,18 @@ def native_block(params):
     return {"parts": ["native sleep returned"], "details": {"pid": os.getpid()}}
 
 
+def reject_args(_params):
+    return {
+        "args_issue": {
+            "path": ["count"],
+            "expected": "integer",
+            "kind": "type",
+            "example": "3",
+            "found": "string",
+        }
+    }
+
+
 OMP_TOOLS = [
     {
         "name": "echo_update",
@@ -77,9 +99,21 @@ OMP_TOOLS = [
             "required": ["message", "commit_seal"],
             "additionalProperties": False,
         },
-        "rev": "r1",
+        "rev": "1",
         "strict": True,
         "handler": echo_update,
+    },
+    {
+        "name": "reject_args",
+        "description": "returns one structured argument rejection",
+        "schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "rev": "1",
+        "strict": True,
+        "handler": reject_args,
     },
     {
         "name": "native_block",
@@ -93,7 +127,7 @@ OMP_TOOLS = [
             "required": ["started", "seconds"],
             "additionalProperties": False,
         },
-        "rev": "r1",
+        "rev": "1",
         "strict": True,
         "handler": native_block,
     },
@@ -123,7 +157,7 @@ OMP_TOOLS = [{
         "required": ["message"],
         "additionalProperties": False,
     },
-    "rev": "r1",
+    "rev": "1",
     "strict": True,
     "handler": stable_echo,
 }]
@@ -191,6 +225,81 @@ fn completion_preserves_all_outcome_branches_and_presence_rules() {
 		.is_err()
 	);
 }
+
+#[test]
+fn control_mapping_fences_stale_frames_and_one_pull_slot() {
+	let mut requests = HostRequestMap::new();
+	let ordinary = requests
+		.open(Str::new_static("ordinary"), Str::new_static("ordinary-call"), false)
+		.expect("map ordinary invocation");
+	assert_eq!(ordinary.request_id, 1);
+	assert_eq!(
+		requests.arg_text(&ArgText {
+			invocation_id: "ordinary".into(),
+			fragment:      "{}".into(),
+			props:         None,
+		}),
+		Err(ControlError::StreamingNotDeclared),
+	);
+	assert!(matches!(
+		requests.arg_text(&ArgText {
+			invocation_id: "stale".into(),
+			fragment:      "{}".into(),
+			props:         None,
+		}),
+		Err(ControlError::UnknownInvocation(_)),
+	));
+
+	let streaming = requests
+		.open(Str::new_static("stream"), Str::new_static("stream-call"), true)
+		.expect("map streaming invocation");
+	let pull = PullRequest {
+		call_id:     "stream-call".into(),
+		path:        vec!["payload".into()],
+		key:         Some("payload".into()),
+		aliases:     vec!["data".into()],
+		expected:    Some(Bytes::from_static(b"string")),
+		chunk_bytes: 4096,
+		props:       None,
+	};
+	requests
+		.begin_pull(streaming.request_id, &pull)
+		.expect("take pull slot");
+	assert_eq!(requests.begin_pull(streaming.request_id, &pull), Err(ControlError::PullBusy),);
+	assert!(
+		!requests
+			.accept_pull_reply(streaming.request_id, &PullReply {
+				call_id:  "stream-call".into(),
+				chunk:    Bytes::from_static(b"part"),
+				complete: false,
+				issue:    None,
+				props:    None,
+			},)
+			.expect("accept streamed pull reply"),
+	);
+	assert_eq!(requests.begin_pull(streaming.request_id, &pull), Err(ControlError::PullBusy),);
+	assert!(
+		requests
+			.accept_pull_reply(streaming.request_id, &PullReply {
+				call_id:  "stream-call".into(),
+				chunk:    Bytes::new(),
+				complete: true,
+				issue:    None,
+				props:    None,
+			},)
+			.expect("fuse streamed pull reply"),
+	);
+	requests
+		.begin_pull(streaming.request_id, &pull)
+		.expect("terminal reply released pull slot");
+	requests
+		.fuse(streaming.request_id, "stream-call")
+		.expect("fuse invocation");
+	assert_eq!(
+		requests.request(streaming.request_id),
+		Err(ControlError::StaleRequest(streaming.request_id)),
+	);
+}
 #[test]
 fn worker_connection_rejects_nested_counts_before_decode() {
 	let mut child = Command::new(env!("CARGO_BIN_EXE_omp"))
@@ -247,10 +356,11 @@ async fn supervisor_rejects_stale_host_generation() {
 	.expect("write stale-generation wrapper");
 	fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
 		.expect("make stale-generation wrapper executable");
-	let mut config = ExtHostConfig::new(wrapper);
+	let mut config = test_config(wrapper);
+	let key = HostKey::new("workspace", "trusted", PY_EVAL_MODULE);
 	config
 		.extensions
-		.push(ExtHostSpec::new(HostKey::new("workspace", "trusted", PY_EVAL_MODULE), PY_EVAL_MODULE));
+		.push(ExtHostSpec::new(key.clone(), py_eval_manifest(&key)));
 	let Err(error) = ExtHostSupervisor::spawn(config).await else {
 		panic!("stale WorkerHello generation was accepted");
 	};
@@ -268,25 +378,30 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 	fs::write(site.path().join("sibling_worker_tools.py"), SIBLING_EXTENSION)
 		.expect("write sibling Python extension");
 
-	let mut config = ExtHostConfig::new(env!("CARGO_BIN_EXE_omp").into());
+	let mut config = test_config(env!("CARGO_BIN_EXE_omp").into());
+	let key = HostKey::new("workspace", "trusted", "phase1-worker-tools");
 	let mut extension = ExtHostSpec::new(
-		HostKey::new("workspace", "trusted", "phase1-worker-tools"),
-		"phase1_worker_tools",
+		key.clone(),
+		test_manifest(&key, "phase1_worker_tools", ["echo_update", "reject_args", "native_block"]),
 	);
 	extension.python_site = Some(site.path().to_owned());
 	config.extensions.push(extension);
+	let sibling_key = HostKey::new("workspace", "trusted", "sibling-worker-tools");
 	let mut sibling = ExtHostSpec::new(
-		HostKey::new("workspace", "trusted", "sibling-worker-tools"),
-		"sibling_worker_tools",
+		sibling_key.clone(),
+		test_manifest(&sibling_key, "sibling_worker_tools", ["stable_echo"]),
 	);
 	let scoped_socket = site.path().join("sibling-data.sock");
 	sibling.data_socket = Some(scoped_socket.clone());
 	sibling.python_site = Some(site.path().to_owned());
 	config.extensions.push(sibling);
-	config.interrupt_grace = Duration::from_millis(250);
+	config.interrupt_grace = CoreDuration::new(250, DurationUnit::Milliseconds);
 	config.initial_backoff = Duration::from_millis(10);
 	config.max_backoff = Duration::from_millis(50);
-	let interrupt_grace = config.interrupt_grace;
+	let interrupt_grace = config
+		.interrupt_grace
+		.to_std()
+		.expect("test interrupt grace");
 
 	let supervisor = tokio::time::timeout(Duration::from_secs(10), ExtHostSupervisor::spawn(config))
 		.await
@@ -306,12 +421,12 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 				.as_str()
 		})
 		.collect::<Vec<_>>();
-	assert_eq!(names, ["echo_update", "native_block", "stable_echo"]);
+	assert_eq!(names, ["echo_update", "reject_args", "native_block", "stable_echo"]);
 	assert!(
 		supervisor
 			.registrations()
 			.iter()
-			.all(|registration| registration.declaration.rev == "r1")
+			.all(|registration| registration.declaration.rev == "1")
 	);
 
 	let (first_update, first_complete) = tokio::time::timeout(
@@ -331,6 +446,24 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 	)
 	.expect("echo completion details JSON");
 	assert_eq!(first_details, first_update);
+	let mut rejected = open_committed(
+		&supervisor,
+		call("args-rejected", "reject_args", json!({}), Duration::from_secs(5)),
+	)
+	.expect("dispatch structured argument rejection");
+	match rejected.next().await.expect("argument rejection event") {
+		WorkerEvent::Complete(complete) => {
+			assert_eq!(complete.kind, WorkerOutcomeKind::ArgsRejected);
+			let issue = complete.args_issue.expect("ToolArgs retained ArgIssue");
+			assert_eq!(issue.path, ["count"]);
+			assert_eq!(issue.expected, "integer");
+			assert_eq!(issue.kind, "type");
+		},
+		WorkerEvent::ProtocolError(error) => {
+			panic!("argument rejection flattened to protocol error: {}", error.message)
+		},
+		event => panic!("argument rejection flattened to wrong terminal event: {event:?}"),
+	}
 	let first_pid = first_details["pid"]
 		.as_i64()
 		.expect("worker pid in echo details") as i32;
@@ -343,18 +476,27 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		scoped_socket.to_str(),
 		"selected child did not inherit its scoped DATA socket"
 	);
-	let mut blocked = supervisor
-		.invoke_committed(call(
+	let mut blocked = open_committed(
+		&supervisor,
+		call(
 			"native-block",
 			"native_block",
 			json!({ "started": started, "seconds": 30 }),
 			Duration::from_secs(60),
-		))
-		.expect("dispatch committed native invocation");
+		),
+	)
+	.expect("dispatch committed native invocation");
 	let blocked_pid = wait_for_marker(&started).await;
 	assert_eq!(blocked_pid, first_pid, "native call did not run in the warm worker");
 
-	blocked.interrupt("courtesy interrupt");
+	blocked
+		.interrupt(Interrupt {
+			invocation_id: "native-block".into(),
+			reason:        "courtesy interrupt".into(),
+			class:         InterruptClass::Immediate.into(),
+			props:         None,
+		})
+		.expect("forward courtesy interrupt");
 	tokio::time::sleep(Duration::from_millis(75)).await;
 	assert!(
 		signal::kill(Pid::from_raw(blocked_pid), None).is_ok(),
@@ -371,6 +513,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		WorkerEvent::Aborted(abort) => abort,
 		WorkerEvent::Update(_) => panic!("native blocker unexpectedly emitted an update"),
 		WorkerEvent::Complete(_) => panic!("native blocker completed instead of being killed"),
+		event => panic!("native blocker emitted unexpected CONTROL event: {event:?}"),
 	};
 	let cancel_elapsed = cancelled_at.elapsed();
 	assert_eq!(abort.kind, WorkerAbortKind::Cancelled);
@@ -420,24 +563,26 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 
 #[tokio::test]
 async fn opt_in_py_eval_survives_cancel_and_respawn() {
-	let disabled =
-		ExtHostSupervisor::spawn(ExtHostConfig::new("/definitely/not/an/extension-host".into()))
-			.await
-			.expect("spawn empty extension supervisor");
+	let disabled = ExtHostSupervisor::spawn(test_config("/definitely/not/an/extension-host".into()))
+		.await
+		.expect("spawn empty extension supervisor");
 	assert!(
 		disabled.registrations().is_empty(),
 		"default worker unexpectedly advertised a Python tool"
 	);
 	disabled.shutdown().await;
 
-	let mut config = ExtHostConfig::new(env!("CARGO_BIN_EXE_omp").into());
+	let mut config = test_config(env!("CARGO_BIN_EXE_omp").into());
+	let key = HostKey::new("workspace", "trusted", PY_EVAL_MODULE);
 	config
 		.extensions
-		.push(ExtHostSpec::new(HostKey::new("workspace", "trusted", PY_EVAL_MODULE), PY_EVAL_MODULE));
-	config.interrupt_grace = Duration::from_millis(150);
+		.push(ExtHostSpec::new(key.clone(), py_eval_manifest(&key)));
 	config.initial_backoff = Duration::from_millis(10);
 	config.max_backoff = Duration::from_millis(50);
-	let interrupt_grace = config.interrupt_grace;
+	let interrupt_grace = config
+		.interrupt_grace
+		.to_std()
+		.expect("test interrupt grace");
 	let supervisor = tokio::time::timeout(Duration::from_secs(10), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("py_eval worker registration timed out")
@@ -473,9 +618,9 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		json!({ "result": "{1, 2, 3}" })
 	);
 
-	let mut fault = supervisor
-		.invoke_committed(py_eval_call("py-eval-fault", "1 / 0", Duration::from_secs(5)))
-		.expect("dispatch failing py_eval");
+	let mut fault =
+		open_committed(&supervisor, py_eval_call("py-eval-fault", "1 / 0", Duration::from_secs(5)))
+			.expect("dispatch failing py_eval");
 	match fault.next().await.expect("py_eval fault event") {
 		WorkerEvent::Complete(complete) => {
 			assert_eq!(
@@ -495,15 +640,14 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		},
 		WorkerEvent::Update(_) => panic!("failing py_eval unexpectedly emitted an update"),
 		WorkerEvent::Aborted(abort) => panic!("failing py_eval aborted: {}", abort.reason),
+		event => panic!("failing py_eval emitted unexpected CONTROL event: {event:?}"),
 	}
 
-	let mut sleeping = supervisor
-		.invoke_committed(py_eval_call(
-			"py-eval-sleep",
-			"__import__('time').sleep(30)",
-			Duration::from_secs(60),
-		))
-		.expect("dispatch sleeping py_eval");
+	let mut sleeping = open_committed(
+		&supervisor,
+		py_eval_call("py-eval-sleep", "__import__('time').sleep(30)", Duration::from_secs(60)),
+	)
+	.expect("dispatch sleeping py_eval");
 	tokio::time::sleep(Duration::from_millis(100)).await;
 	let cancelled_at = Instant::now();
 	sleeping.cancel("cancel sleeping evaluation");
@@ -517,6 +661,7 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 			panic!("cancelled py_eval reported clean completion: {complete:?}")
 		},
 		WorkerEvent::Update(_) => panic!("py_eval unexpectedly emitted an update"),
+		event => panic!("sleeping py_eval emitted unexpected CONTROL event: {event:?}"),
 	};
 	assert_eq!(abort.kind, WorkerAbortKind::Cancelled);
 	assert!(abort.effects_unknown);
@@ -544,19 +689,22 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 	supervisor.shutdown().await;
 }
 
-fn py_eval_call(
-	call_id: &'static str,
-	code: &'static str,
-	deadline: Duration,
-) -> CommittedToolCall {
-	CommittedToolCall {
-		call_id: Str::new_static(call_id),
-		name: Str::new_static("py_eval"),
-		rev: Str::new_static("1"),
-		args_json: Bytes::from(
+struct TestCall {
+	open: OpenToolCall,
+	raw:  Bytes,
+}
+
+fn py_eval_call(call_id: &'static str, code: &'static str, deadline: Duration) -> TestCall {
+	TestCall {
+		open: OpenToolCall {
+			invocation_id: Str::new_static(call_id),
+			name: Str::new_static("py_eval"),
+			rev: Str::new_static("1"),
+			deadline,
+		},
+		raw:  Bytes::from(
 			serde_json::to_vec(&json!({ "code": code })).expect("serialize py_eval arguments"),
 		),
-		deadline,
 	}
 }
 
@@ -565,9 +713,9 @@ async fn py_eval_roundtrip(
 	call_id: &'static str,
 	code: &'static str,
 ) -> WorkerCompletion {
-	let mut invocation = supervisor
-		.invoke_committed(py_eval_call(call_id, code, Duration::from_secs(5)))
-		.expect("dispatch py_eval");
+	let mut invocation =
+		open_committed(&supervisor, py_eval_call(call_id, code, Duration::from_secs(5)))
+			.expect("dispatch py_eval");
 	match invocation.next().await.expect("py_eval event") {
 		WorkerEvent::Complete(complete) => {
 			assert_eq!(complete.kind, WorkerOutcomeKind::Ok);
@@ -575,22 +723,37 @@ async fn py_eval_roundtrip(
 		},
 		WorkerEvent::Update(_) => panic!("py_eval unexpectedly emitted an update"),
 		WorkerEvent::Aborted(abort) => panic!("py_eval aborted: {}", abort.reason),
+		event => panic!("py_eval emitted unexpected CONTROL event: {event:?}"),
 	}
 }
 
-fn call(
-	call_id: &'static str,
-	name: &'static str,
-	args: Value,
-	deadline: Duration,
-) -> CommittedToolCall {
-	CommittedToolCall {
-		call_id: Str::new_static(call_id),
-		name: Str::new_static(name),
-		rev: Str::new_static("r1"),
-		args_json: Bytes::from(serde_json::to_vec(&args).expect("serialize committed arguments")),
-		deadline,
+fn call(call_id: &'static str, name: &'static str, args: Value, deadline: Duration) -> TestCall {
+	TestCall {
+		open: OpenToolCall {
+			invocation_id: Str::new_static(call_id),
+			name: Str::new_static(name),
+			rev: Str::new_static("1"),
+			deadline,
+		},
+		raw:  Bytes::from(serde_json::to_vec(&args).expect("serialize committed arguments")),
 	}
+}
+
+fn open_committed(
+	supervisor: &ExtHostSupervisor,
+	call: TestCall,
+) -> Result<WorkerInvocation, WorkerError> {
+	let TestCall { open, raw } = call;
+	let invocation_id = open.invocation_id.clone();
+	let mut invocation = supervisor.open(open)?;
+	invocation.args_committed(ArgsCommitted {
+		invocation_id: invocation_id.to_string(),
+		raw,
+		effect_token: Bytes::from_static(b"test-effect-token"),
+		authorized_at_ms: 1,
+		props: None,
+	})?;
+	Ok(invocation)
 }
 
 async fn echo_roundtrip(
@@ -598,18 +761,21 @@ async fn echo_roundtrip(
 	call_id: &'static str,
 	message: &'static str,
 ) -> (Value, WorkerCompletion) {
-	let mut invocation = supervisor
-		.invoke_committed(call(
+	let mut invocation = open_committed(
+		&supervisor,
+		call(
 			call_id,
 			"echo_update",
 			json!({ "message": message, "commit_seal": "committed" }),
 			Duration::from_secs(5),
-		))
-		.expect("dispatch committed echo invocation");
+		),
+	)
+	.expect("dispatch committed echo invocation");
 	let update = match invocation.next().await.expect("echo update event") {
 		WorkerEvent::Update(update) => update,
 		WorkerEvent::Complete(_) => panic!("echo completed before its update"),
 		WorkerEvent::Aborted(abort) => panic!("echo aborted: {}", abort.reason),
+		event => panic!("echo emitted unexpected CONTROL event: {event:?}"),
 	};
 	assert_eq!(update.call_id, call_id);
 	let update = serde_json::from_slice(&update.json).expect("echo update JSON");
@@ -617,6 +783,7 @@ async fn echo_roundtrip(
 		WorkerEvent::Complete(complete) => complete,
 		WorkerEvent::Update(_) => panic!("echo emitted an unexpected second update"),
 		WorkerEvent::Aborted(abort) => panic!("echo aborted after update: {}", abort.reason),
+		event => panic!("echo emitted unexpected CONTROL event after update: {event:?}"),
 	};
 	assert_eq!(complete.call_id, call_id);
 	assert_eq!(complete.kind, WorkerOutcomeKind::Ok);
@@ -628,18 +795,16 @@ async fn stable_roundtrip(
 	call_id: &'static str,
 	message: &'static str,
 ) -> (i32, Option<String>) {
-	let mut invocation = supervisor
-		.invoke_committed(call(
-			call_id,
-			"stable_echo",
-			json!({ "message": message }),
-			Duration::from_secs(5),
-		))
-		.expect("dispatch sibling invocation");
+	let mut invocation = open_committed(
+		&supervisor,
+		call(call_id, "stable_echo", json!({ "message": message }), Duration::from_secs(5)),
+	)
+	.expect("dispatch sibling invocation");
 	let complete = match invocation.next().await.expect("sibling completion") {
 		WorkerEvent::Complete(complete) => complete,
 		WorkerEvent::Update(_) => panic!("sibling unexpectedly emitted an update"),
 		WorkerEvent::Aborted(abort) => panic!("sibling aborted: {}", abort.reason),
+		event => panic!("sibling emitted unexpected CONTROL event: {event:?}"),
 	};
 	let details =
 		serde_json::from_slice::<Value>(completion_details(&complete)).expect("sibling details JSON");
@@ -655,6 +820,7 @@ async fn wait_for_marker(path: &Path) -> i32 {
 			if let Ok(pid) = fs::read_to_string(path) {
 				return pid.parse().expect("native marker contains worker pid");
 			}
+
 			tokio::time::sleep(Duration::from_millis(10)).await;
 		}
 	})
@@ -662,6 +828,51 @@ async fn wait_for_marker(path: &Path) -> i32 {
 	.expect("native Python call did not enter ctypes sleep")
 }
 
+fn test_config(executable: std::path::PathBuf) -> ExtHostConfig {
+	ExtHostConfig::new(
+		executable,
+		Principal::new(Str::new_static("test"), Str::new_static("Test")),
+		Str::new_static("test-session"),
+		1,
+	)
+}
+
+fn py_eval_manifest(key: &HostKey) -> ExtensionManifest {
+	ExtensionManifest::py_eval(test_provenance(key), [])
+}
+
+fn test_manifest<const N: usize>(
+	key: &HostKey,
+	entry: &'static str,
+	tools: [&'static str; N],
+) -> ExtensionManifest {
+	ExtensionManifest::new(
+		test_provenance(key),
+		entry,
+		[],
+		DeclarationSet::new(
+			tools
+				.into_iter()
+				.map(|name| ToolDeclarationKey::new(name, "", 1)),
+			[],
+		),
+		ServiceManifest::default(),
+		[],
+		[ActivationTrigger::FirstReach],
+	)
+}
+
+fn test_provenance(key: &HostKey) -> Provenance {
+	Provenance::new(
+		Str::new_static("test-publisher"),
+		key.extension.clone(),
+		Str::new_static("1.0.0"),
+		ArtifactDigest::new([0; 32]),
+		key.layer.clone(),
+		key.tier.clone(),
+		1,
+	)
+}
 fn completion_text(complete: &WorkerCompletion) -> &str {
 	match complete.parts.as_slice() {
 		[part] => match part.kind.as_ref() {

@@ -14,10 +14,11 @@
 //! event is sent, so
 //! `Completed` is always the last event on the channel.
 //!
-//! Timeouts are enforced solely by a Tokio watchdog task that raises
-//! `KeyboardInterrupt` in the worker via `PyThreadState_SetAsyncExc`;
-//! Python-side line tracing is deliberately absent because it deoptimizes
-//! the whole cell without covering anything the async interrupt cannot.
+//! Timeouts are enforced solely by a Tokio watchdog task that first cancels
+//! host work, then raises `KeyboardInterrupt` in the worker after the
+//! configured interrupt grace via `PyThreadState_SetAsyncExc`. Python-side line
+//! tracing is deliberately absent because it deoptimizes the whole cell without
+//! covering anything the async interrupt cannot.
 
 use std::{
 	collections::HashMap,
@@ -27,12 +28,12 @@ use std::{
 		atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 	},
 	thread,
-	time::Duration,
+	time::Duration as StdDuration,
 };
 
 use bytes::Bytes;
 use flume::{Receiver, Sender};
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Duration, DurationError, Str};
 use omp_py::Engine;
 use parking_lot::Mutex;
 use pyo3::{
@@ -194,10 +195,11 @@ pub struct EmbeddedPython {
 }
 
 struct Inner {
-	engine:    Arc<Engine>,
-	next_cell: AtomicU64,
-	installer: Arc<dyn NamespaceInstaller>,
-	workers:   Mutex<HashMap<Bytes, Arc<Worker>>>,
+	engine:          Arc<Engine>,
+	next_cell:       AtomicU64,
+	installer:       Arc<dyn NamespaceInstaller>,
+	interrupt_grace: StdDuration,
+	workers:         Mutex<HashMap<Bytes, Arc<Worker>>>,
 }
 
 struct Worker {
@@ -207,12 +209,13 @@ struct Worker {
 }
 
 struct WorkerState {
-	engine:    Arc<Engine>,
-	thread_id: AtomicI64,
-	epoch:     AtomicU64,
-	alive:     AtomicBool,
-	active:    Mutex<Option<ActiveCell>>,
-	installer: Arc<dyn NamespaceInstaller>,
+	engine:          Arc<Engine>,
+	thread_id:       AtomicI64,
+	epoch:           AtomicU64,
+	alive:           AtomicBool,
+	active:          Mutex<Option<ActiveCell>>,
+	installer:       Arc<dyn NamespaceInstaller>,
+	interrupt_grace: StdDuration,
 }
 
 struct ActiveCell {
@@ -235,31 +238,65 @@ unsafe extern "C" {
 }
 
 impl WorkerState {
-	fn interrupt_if_active(&self, target: &Arc<AtomicBool>) -> Result<(), Fault> {
+	fn begin_interrupt(&self, target: &Arc<AtomicBool>) -> bool {
 		let cell_id = {
 			let active = self.active.lock();
 			let Some(active) = active
 				.as_ref()
 				.filter(|active| Arc::ptr_eq(&active.cancelled, target))
 			else {
-				return Ok(());
+				return false;
 			};
 			active.cell_id.clone()
 		};
 		self.installer.cancel_cell(&cell_id);
-		self.interrupt_thread()
+		true
 	}
 
-	fn cancel_active(&self) -> Result<(), Fault> {
-		let (cell_id, cancelled) = {
+	async fn interrupt_after_grace(&self, target: &Arc<AtomicBool>) -> Result<(), Fault> {
+		if !self.begin_interrupt(target) {
+			return Ok(());
+		}
+		tokio::time::sleep(self.interrupt_grace).await;
+		self.interrupt_if_active(target)
+	}
+
+	async fn cancel_active(&self) -> Result<(), Fault> {
+		let cancelled = {
 			let active = self.active.lock();
 			let Some(active) = active.as_ref() else {
 				return Ok(());
 			};
-			(active.cell_id.clone(), Arc::clone(&active.cancelled))
+			Arc::clone(&active.cancelled)
 		};
 		cancelled.store(true, Ordering::Release);
-		self.installer.cancel_cell(&cell_id);
+		self.interrupt_after_grace(&cancelled).await
+	}
+
+	fn schedule_interrupt(self: &Arc<Self>, target: Arc<AtomicBool>) {
+		if !self.begin_interrupt(&target) {
+			return;
+		}
+		let Ok(runtime) = Handle::try_current() else {
+			let _ = self.interrupt_if_active(&target);
+			return;
+		};
+		let state = Arc::clone(self);
+		runtime.spawn(async move {
+			tokio::time::sleep(state.interrupt_grace).await;
+			let _ = state.interrupt_if_active(&target);
+		});
+	}
+
+	fn interrupt_if_active(&self, target: &Arc<AtomicBool>) -> Result<(), Fault> {
+		if !self
+			.active
+			.lock()
+			.as_ref()
+			.is_some_and(|active| Arc::ptr_eq(&active.cancelled, target))
+		{
+			return Ok(());
+		}
 		self.interrupt_thread()
 	}
 
@@ -635,7 +672,7 @@ pub trait NamespaceInstaller: Send + Sync + 'static {
 		_py: Python<'_>,
 		_globals: &Bound<'_, PyDict>,
 		_cell_id: &Bytes,
-		timeout: Option<Duration>,
+		timeout: Option<StdDuration>,
 	) -> PyResult<TimeoutHandle> {
 		Ok(TimeoutHandle::new(timeout))
 	}
@@ -670,20 +707,34 @@ impl EmbeddedPython {
 	/// This constructor installs no host helpers. Production app wiring should
 	/// use [`Self::with_installer`] so the authenticated bridge and prelude are
 	/// present from the first cell.
-	pub fn new(engine: Arc<Engine>) -> Self {
-		Self::with_installer(engine, Arc::new(EmptyNamespaceInstaller))
+	///
+	/// # Errors
+	/// Returns [`DurationError::Overflow`] when `interrupt_grace` cannot be
+	/// represented by the platform timer.
+	pub fn new(engine: Arc<Engine>, interrupt_grace: Duration) -> Result<Self, DurationError> {
+		Self::with_installer(engine, Arc::new(EmptyNamespaceInstaller), interrupt_grace)
 	}
 
 	/// Creates a Python eval resource with a namespace bootstrap installer.
-	pub fn with_installer(engine: Arc<Engine>, installer: Arc<dyn NamespaceInstaller>) -> Self {
-		Self {
+	///
+	/// # Errors
+	/// Returns [`DurationError::Overflow`] when `interrupt_grace` cannot be
+	/// represented by the platform timer.
+	pub fn with_installer(
+		engine: Arc<Engine>,
+		installer: Arc<dyn NamespaceInstaller>,
+		interrupt_grace: Duration,
+	) -> Result<Self, DurationError> {
+		let interrupt_grace = interrupt_grace.to_std()?;
+		Ok(Self {
 			inner: Arc::new(Inner {
 				engine,
 				installer,
+				interrupt_grace,
 				next_cell: AtomicU64::new(1),
 				workers: Mutex::new(HashMap::new()),
 			}),
-		}
+		})
 	}
 
 	fn worker(&self, session: &Session) -> Result<Arc<Worker>, Fault> {
@@ -706,12 +757,13 @@ impl EmbeddedPython {
 		let engine = Arc::clone(&self.inner.engine);
 		let installer = Arc::clone(&self.inner.installer);
 		let state = Arc::new(WorkerState {
-			engine:    Arc::clone(&engine),
-			thread_id: AtomicI64::new(0),
-			epoch:     AtomicU64::new(0),
-			alive:     AtomicBool::new(true),
-			active:    Mutex::new(None),
-			installer: Arc::clone(&installer),
+			engine:          Arc::clone(&engine),
+			thread_id:       AtomicI64::new(0),
+			epoch:           AtomicU64::new(0),
+			alive:           AtomicBool::new(true),
+			active:          Mutex::new(None),
+			installer:       Arc::clone(&installer),
+			interrupt_grace: self.inner.interrupt_grace,
 		});
 		let worker =
 			Arc::new(Worker { commands, state: Arc::clone(&state), enqueue: AsyncMutex::new(()) });
@@ -765,7 +817,7 @@ impl EvalExec for EmbeddedPython {
 				.epoch
 				.fetch_add(1, Ordering::AcqRel)
 				.wrapping_add(1);
-			worker.state.cancel_active()?;
+			worker.state.cancel_active().await?;
 			epoch
 		} else {
 			worker.state.epoch.load(Ordering::Acquire)
@@ -810,13 +862,13 @@ impl EvalRun for EmbeddedRun {
 
 	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
 		self.cancelled.store(true, Ordering::Release);
-		std::future::ready(self.state.interrupt_if_active(&self.cancelled))
+		self.state.interrupt_after_grace(&self.cancelled)
 	}
 }
 impl Drop for EmbeddedRun {
 	fn drop(&mut self) {
 		self.cancelled.store(true, Ordering::Release);
-		let _ = self.state.interrupt_if_active(&self.cancelled);
+		self.state.schedule_interrupt(Arc::clone(&self.cancelled));
 	}
 }
 
@@ -1072,7 +1124,7 @@ fn spawn_watchdog(
 		runtime.spawn(async move {
 			watchdog.expired().await;
 			timed_out.store(true, Ordering::Release);
-			let _ = state.interrupt_if_active(&cancelled);
+			let _ = state.interrupt_after_grace(&cancelled).await;
 		})
 	})
 }
@@ -1236,9 +1288,21 @@ mod tests {
 
 	static ENGINE: LazyLock<Arc<Engine>> =
 		LazyLock::new(|| Arc::new(Engine::builder().init().expect("embedded Python boots")));
+	const TEST_INTERRUPT_GRACE: Duration = Duration::new(1, omp_core::DurationUnit::Milliseconds);
 
 	fn runtime() -> EmbeddedPython {
-		EmbeddedPython::new(Arc::clone(&ENGINE))
+		EmbeddedPython::new(Arc::clone(&ENGINE), TEST_INTERRUPT_GRACE)
+			.expect("test interrupt grace is representable")
+	}
+
+	#[test]
+	fn configured_interrupt_grace_rejects_platform_timer_overflow() {
+		let result = EmbeddedPython::new(
+			Arc::clone(&ENGINE),
+			Duration::new(u64::MAX, omp_core::DurationUnit::Hours),
+		);
+
+		assert!(matches!(result, Err(DurationError::Overflow)));
 	}
 
 	async fn run_to_completion(
@@ -1250,7 +1314,7 @@ mod tests {
 		let mut run = runtime
 			.run(session, RunRequest {
 				code: Str::from(code),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset,
 			})
 			.await
@@ -1499,7 +1563,7 @@ print("right")"#
 		let mut active = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("while True: pass"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
 			.await
@@ -1509,7 +1573,7 @@ print("right")"#
 		let mut queued = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("queued_effect = True"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
 			.await
@@ -1532,7 +1596,7 @@ print("right")"#
 		let mut active = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("while True: pass"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
 			.await
@@ -1541,7 +1605,7 @@ print("right")"#
 		let mut stale = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("stale_effect = True"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
 			.await
@@ -1549,7 +1613,7 @@ print("right")"#
 		let mut reset = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("('kept' in globals(), 'stale_effect' in globals())"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   true,
 			})
 			.await
@@ -1568,7 +1632,7 @@ print("right")"#
 		let mut timed_out = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("while True: pass"),
-				timeout: Some(Duration::from_millis(25)),
+				timeout: Some(StdDuration::from_millis(25)),
 				reset:   false,
 			})
 			.await
@@ -1578,7 +1642,7 @@ print("right")"#
 		let mut dropped = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("while True: pass"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
 			.await
@@ -1641,7 +1705,7 @@ print("right")"#
 					"__omp_timeout_resume__()\n",
 					"7",
 				)),
-				timeout: Some(Duration::from_millis(100)),
+				timeout: Some(StdDuration::from_millis(100)),
 				reset:   false,
 			})
 			.await
@@ -1677,7 +1741,7 @@ print("right")"#
 			_py: Python<'_>,
 			_globals: &Bound<'_, PyDict>,
 			_cell_id: &Bytes,
-			timeout: Option<Duration>,
+			timeout: Option<StdDuration>,
 		) -> PyResult<TimeoutHandle> {
 			if self.0.swap(false, Ordering::AcqRel) {
 				Err(pyo3::exceptions::PyRuntimeError::new_err("poisoned worker"))
@@ -1692,12 +1756,14 @@ print("right")"#
 		let runtime = EmbeddedPython::with_installer(
 			Arc::clone(&ENGINE),
 			Arc::new(FailFirstCell(AtomicBool::new(true))),
-		);
+			TEST_INTERRUPT_GRACE,
+		)
+		.expect("test interrupt grace is representable");
 		let session = runtime.open_session().await.expect("session opens");
 		let mut failed = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("1"),
-				timeout: Some(Duration::from_secs(1)),
+				timeout: Some(StdDuration::from_secs(1)),
 				reset:   false,
 			})
 			.await
@@ -1717,7 +1783,7 @@ print("right")"#
 		let mut active = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("while True: pass"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 			})
 			.await
@@ -1726,7 +1792,7 @@ print("right")"#
 		let mut reset = runtime
 			.run(&session, RunRequest {
 				code:    Str::new_static("'old_state' in globals()"),
-				timeout: Some(Duration::from_secs(2)),
+				timeout: Some(StdDuration::from_secs(2)),
 				reset:   true,
 			})
 			.await
@@ -1746,7 +1812,7 @@ print("right")"#
 		let second_session = runtime.open_session().await.expect("second session opens");
 		let request = || RunRequest {
 			code:    Str::new_static("while True: pass"),
-			timeout: Some(Duration::from_secs(2)),
+			timeout: Some(StdDuration::from_secs(2)),
 			reset:   false,
 		};
 		let mut first = runtime
@@ -1763,7 +1829,7 @@ print("right")"#
 		first.cancel().await.expect("first cancels");
 		assert_eq!(completion(&mut first).await.status.outcome, CellOutcome::Cancelled);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(30), second.next_event())
+			tokio::time::timeout(StdDuration::from_millis(30), second.next_event())
 				.await
 				.is_err(),
 			"second worker must remain active",

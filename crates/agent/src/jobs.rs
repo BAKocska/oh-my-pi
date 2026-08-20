@@ -249,9 +249,6 @@ async fn watch_job(env: &EnvClient, job: &JobRef) -> Result<thread::Item, Str> {
 					return finish_settlement(upload, job, info).await;
 				}
 			},
-			ProcessAttachmentEvent::StreamError(error) => {
-				return Err(fmts!("named-process stream failed: {error:?}"));
-			},
 		}
 	}
 }

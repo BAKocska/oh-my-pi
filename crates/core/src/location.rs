@@ -15,6 +15,8 @@ pub enum LocationError {
 	InvalidPath,
 	/// A tool path does not match its component grammar.
 	InvalidToolPath,
+	/// An artifact address is neither a canonical ordinal nor a BLAKE3 digest.
+	InvalidArtifactAddress,
 	/// A URL carries a scheme other than the one required by its type.
 	WrongScheme {
 		/// The scheme required by the destination type.
@@ -32,6 +34,7 @@ impl fmt::Display for LocationError {
 			Self::InvalidPath => formatter.write_str("path contains a NUL character"),
 			Self::InvalidToolPath => formatter.write_str("invalid tool path"),
 			Self::WrongScheme { expected } => write!(formatter, "URL must use the {expected} scheme"),
+			Self::InvalidArtifactAddress => formatter.write_str("invalid artifact address"),
 			Self::InvalidUri => formatter.write_str("invalid URI"),
 		}
 	}
@@ -230,6 +233,141 @@ fn valid_claimant_byte(byte: u8) -> bool {
 	byte.is_ascii_graphic() && !matches!(byte, b'/' | b'@' | b'\\')
 }
 
+/// The canonical address carried by an [`ArtifactUrl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArtifactAddress<'a> {
+	/// A session-local artifact ordinal.
+	Ordinal(u64),
+	/// A durable cross-session BLAKE3 digest, without the `b3/` prefix.
+	Digest(&'a str),
+}
+
+/// A typed artifact address.
+///
+/// The canonical resource is either a session-local decimal `u64` ordinal or
+/// `b3/` followed by exactly 64 lowercase hexadecimal digest digits.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct ArtifactUrl(Str);
+
+impl ArtifactUrl {
+	/// Parses a canonical artifact URL, refusing other schemes and ambiguous
+	/// addresses.
+	pub fn new(value: impl Into<Str>) -> Result<Self, LocationError> {
+		let value = value.into();
+		let Some(after_scheme) = value.as_str().strip_prefix("artifact://") else {
+			return Err(LocationError::WrongScheme { expected: "artifact" });
+		};
+		let (resource, selector) = match after_scheme.split_once(':') {
+			Some((resource, selector)) => (resource, Some(selector)),
+			None => (after_scheme, None),
+		};
+		if selector.is_some_and(str::is_empty)
+			|| selector
+				.unwrap_or_default()
+				.bytes()
+				.any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+			|| !valid_artifact_resource(resource)
+		{
+			return Err(LocationError::InvalidArtifactAddress);
+		}
+		Ok(Self(value))
+	}
+
+	/// Creates a canonical session-local artifact URL.
+	#[must_use]
+	pub fn from_ordinal(ordinal: u64) -> Self {
+		Self(Str::from(format!("artifact://{ordinal}")))
+	}
+
+	/// Creates a canonical durable artifact URL from a BLAKE3-256 digest.
+	#[must_use]
+	pub fn from_digest(digest: [u8; 32]) -> Self {
+		Self(Str::from(format!("artifact://b3/{}", crate::hex::encode(&digest))))
+	}
+
+	/// Returns the complete wire-form URL without allocating.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		self.0.as_str()
+	}
+
+	/// Returns the canonical resource component with its selector removed.
+	#[must_use]
+	pub fn resource(&self) -> &str {
+		self
+			.after_scheme()
+			.split_once(':')
+			.map_or(self.after_scheme(), |parts| parts.0)
+	}
+
+	/// Returns the optional trailing selector without its `:` delimiter.
+	#[must_use]
+	pub fn selector(&self) -> Option<&str> {
+		self.after_scheme().split_once(':').map(|parts| parts.1)
+	}
+
+	/// Returns the parsed canonical artifact address.
+	#[must_use]
+	pub fn address(&self) -> ArtifactAddress<'_> {
+		if let Some(digest) = self.resource().strip_prefix("b3/") {
+			ArtifactAddress::Digest(digest)
+		} else {
+			ArtifactAddress::Ordinal(
+				self
+					.resource()
+					.parse()
+					.expect("ArtifactUrl validates its ordinal at construction"),
+			)
+		}
+	}
+
+	/// Returns the session-local ordinal, or [`None`] for a durable address.
+	#[must_use]
+	pub fn ordinal(&self) -> Option<u64> {
+		match self.address() {
+			ArtifactAddress::Ordinal(ordinal) => Some(ordinal),
+			ArtifactAddress::Digest(_) => None,
+		}
+	}
+
+	/// Returns the borrowed durable digest, or [`None`] for a session-local
+	/// address.
+	#[must_use]
+	pub fn digest(&self) -> Option<&str> {
+		match self.address() {
+			ArtifactAddress::Ordinal(_) => None,
+			ArtifactAddress::Digest(digest) => Some(digest),
+		}
+	}
+
+	fn after_scheme(&self) -> &str {
+		&self.as_str()["artifact://".len()..]
+	}
+}
+
+impl fmt::Display for ArtifactUrl {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.as_str())
+	}
+}
+
+fn valid_artifact_resource(resource: &str) -> bool {
+	if !resource.is_empty()
+		&& resource.bytes().all(|byte| byte.is_ascii_digit())
+		&& (resource == "0" || !resource.starts_with('0'))
+	{
+		return resource.parse::<u64>().is_ok();
+	}
+	let Some(digest) = resource.strip_prefix("b3/") else {
+		return false;
+	};
+	digest.len() == 64
+		&& digest
+			.bytes()
+			.all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 macro_rules! typed_url {
 	($name:ident, $scheme:literal, $doc:literal) => {
 		#[doc = $doc]
@@ -294,7 +432,8 @@ macro_rules! typed_url {
 	};
 }
 
-typed_url!(ArtifactUrl, "artifact", "A typed `artifact://` address for a session artifact.");
+// `ArtifactUrl` has a stricter two-tier address grammar than the generic typed
+// URLs.
 typed_url!(HistoryUrl, "history", "A typed `history://` address for a read-only agent transcript.");
 typed_url!(AgentUrl, "agent", "A typed `agent://` address for settled subagent output.");
 
@@ -346,7 +485,9 @@ impl fmt::Display for WorkspaceUri {
 
 #[cfg(test)]
 mod tests {
-	use super::{AgentUrl, ArtifactUrl, HistoryUrl, LocationError, ToolPath, WorkspaceUri};
+	use super::{
+		AgentUrl, ArtifactAddress, ArtifactUrl, HistoryUrl, LocationError, ToolPath, WorkspaceUri,
+	};
 
 	#[test]
 	fn typed_urls_refuse_relabeling_other_schemes() {
@@ -360,12 +501,53 @@ mod tests {
 	}
 
 	#[test]
-	fn typed_url_accessors_borrow_resource_and_selector() {
-		let url = ArtifactUrl::new("artifact://123456789012345678901234:20-40").unwrap();
-		assert_eq!(url.resource(), "123456789012345678901234");
+	fn artifact_url_accessors_borrow_resource_and_parse_selectors_separately() {
+		let url = ArtifactUrl::new("artifact://18446744073709551615:20-40").unwrap();
+		assert_eq!(url.resource(), "18446744073709551615");
 		assert_eq!(url.selector(), Some("20-40"));
+		assert_eq!(url.address(), ArtifactAddress::Ordinal(u64::MAX));
+		assert_eq!(url.ordinal(), Some(u64::MAX));
+		assert_eq!(url.digest(), None);
 		assert_eq!(url.resource().as_ptr(), url.as_str()["artifact://".len()..].as_ptr());
 		assert_eq!(url.as_str().as_ptr(), url.clone().as_str().as_ptr());
+	}
+
+	#[test]
+	fn artifact_url_accepts_only_canonical_durable_digests() {
+		const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+		let url = ArtifactUrl::new(concat!(
+			"artifact://b3/",
+			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			":raw"
+		))
+		.unwrap();
+		assert_eq!(url.address(), ArtifactAddress::Digest(DIGEST));
+		assert_eq!(url.digest(), Some(DIGEST));
+		assert_eq!(url.ordinal(), None);
+		assert_eq!(url.selector(), Some("raw"));
+
+		let minted = ArtifactUrl::from_digest([0xab; 32]);
+		assert_eq!(
+			minted.digest(),
+			Some("abababababababababababababababababababababababababababababababab")
+		);
+		assert_eq!(ArtifactUrl::from_ordinal(42).ordinal(), Some(42));
+	}
+
+	#[test]
+	fn artifact_url_rejects_ambiguous_or_malformed_addresses() {
+		for value in [
+			"artifact://",
+			"artifact://00",
+			"artifact://01",
+			"artifact://+1",
+			"artifact://18446744073709551616",
+			"artifact://b3/abcdef",
+			"artifact://b3/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			"artifact://1:",
+		] {
+			assert_eq!(ArtifactUrl::new(value), Err(LocationError::InvalidArtifactAddress));
+		}
 	}
 
 	#[test]

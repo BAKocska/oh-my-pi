@@ -118,6 +118,8 @@ pub struct MountedDevice<'a> {
 	pub summary:  &'a Str,
 	/// Complete JSON Schema bytes.
 	pub schema:   &'a [u8],
+	/// Maximum declared authority before per-invocation narrowing.
+	pub effects:  &'a crate::Effects,
 	/// Long-form documentation, when supplied by the declaration surface.
 	pub docs:     Option<&'a str>,
 	/// Execution placement, independent of device presentation.
@@ -657,6 +659,18 @@ impl Registry {
 		Some((stored_name, claim_revision(claim, claimant)?))
 	}
 
+	/// Borrows the complete policy-resolved specification.
+	///
+	/// Claimant-qualified names resolve their shadow without promoting it.
+	pub fn live_spec(&self, name: &str) -> Result<&crate::ToolSpec, RegistryError> {
+		Ok(self.live_entry(name)?.tool.spec())
+	}
+
+	/// Borrows the declared maximum effect envelope of a resolved tool.
+	pub fn effects(&self, name: &str) -> Result<&crate::Effects, RegistryError> {
+		Ok(&self.live_spec(name)?.effects)
+	}
+
 	/// Iterates winning identities in deterministic name order.
 	pub fn live_identities(
 		&self,
@@ -692,6 +706,7 @@ impl Registry {
 				claimant: &claim.claimant,
 				summary: &entry.tool.spec().description,
 				schema: entry.tool.spec().schema.as_ref(),
+				effects: &entry.tool.spec().effects,
 				docs: None,
 				route: entry.tool.route(),
 			})

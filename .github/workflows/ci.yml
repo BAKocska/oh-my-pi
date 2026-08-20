@@ -8,6 +8,7 @@ on:
       - ".github/workflows/ci.yml"
       - "crates/**"
       - "fixtures/**"
+      - "docs/py/**"
       - "scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -22,6 +23,7 @@ on:
       - "crates/**"
       - "fixtures/**"
       - "scripts/**"
+      - "docs/py/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "clippy.toml"
@@ -52,9 +54,20 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  runtime_spec:
+    name: Runtime symbol and dependency contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Generate and validate runtime specification
+        run: cargo -Zscript scripts/check-spec.rs -- target/runtime-symbol-spec.json
+
   rust:
     name: Rust workspace and acceptance proofs
-    needs: format
+    needs: [format, runtime_spec]
     runs-on: macos-15
     timeout-minutes: 120
     steps:

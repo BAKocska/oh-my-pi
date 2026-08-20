@@ -2,17 +2,20 @@
 
 use std::path::PathBuf;
 
-use omp_core::Str;
+use omp_core::{Principal, Provenance, Str};
 use omp_proto::thread::v1::Item;
-use serde_json::value::RawValue;
+use serde_json::{
+	Value,
+	value::{RawValue, to_raw_value},
+};
 
 use super::{
 	msg::{Content, Msg},
 	patch::Patch,
 	raweq::{opt_raw_eq, raw_eq},
 	types::{
-		AmendPatch, CallId, ModelChange, ModelId, ModelRef, Pin, ProviderId, RequestError, SessionId,
-		ThinkingSel, Tier, TitleSource, Usage,
+		AmendPatch, CallId, InvocationTransition, ModelChange, ModelId, ModelRef, Pin, ProviderId,
+		RequestAudit, RequestError, SessionId, ThinkingSel, Tier, TitleSource, Usage,
 	},
 };
 use crate::blob::BlobRef;
@@ -188,6 +191,151 @@ pub struct JobSettled {
 
 impl Eq for JobSettled {}
 
+/// One canonically encoded extension-authored journal entry.
+#[derive(Debug, Clone)]
+pub struct Custom {
+	/// Extension-defined kind name.
+	kind:       Str,
+	/// Schema revision at which `data` was encoded.
+	rev:        Option<Str>,
+	/// Optional source within the authenticated extension.
+	source:     Option<Str>,
+	/// Authenticated principal stamped by the core.
+	principal:  Principal,
+	/// Authenticated extension provenance septet stamped by the core.
+	provenance: Provenance,
+	/// Canonical extension data.
+	data:       Option<Box<RawValue>>,
+	/// Optional content participating in model context.
+	context:    Option<Content>,
+	/// Whether clients should display the event.
+	display:    bool,
+}
+
+impl Custom {
+	/// Creates an entry and converts its data to the canonical compact JSON
+	/// representation used by the append codec.
+	pub fn new(
+		kind: Str,
+		rev: Option<Str>,
+		source: Option<Str>,
+		principal: Principal,
+		provenance: Provenance,
+		data: Option<Box<RawValue>>,
+		context: Option<Content>,
+		display: bool,
+	) -> Result<Self, serde_json::Error> {
+		let data = data
+			.map(|raw| serde_json::from_str::<Value>(raw.get()).and_then(|value| to_raw_value(&value)))
+			.transpose()?;
+		Ok(Self { kind, rev, source, principal, provenance, data, context, display })
+	}
+
+	/// Returns the declared entry-kind name.
+	#[must_use]
+	pub fn kind(&self) -> &str {
+		self.kind.as_str()
+	}
+
+	/// Returns the recorded schema revision.
+	#[must_use]
+	pub fn rev(&self) -> Option<&str> {
+		self.rev.as_deref()
+	}
+
+	/// Returns the optional extension-local source.
+	#[must_use]
+	pub fn source(&self) -> Option<&str> {
+		self.source.as_deref()
+	}
+
+	/// Returns the authenticated acting principal.
+	#[must_use]
+	pub const fn principal(&self) -> &Principal {
+		&self.principal
+	}
+
+	/// Returns the authenticated extension provenance.
+	#[must_use]
+	pub const fn provenance(&self) -> &Provenance {
+		&self.provenance
+	}
+
+	/// Returns the canonical data bytes.
+	#[must_use]
+	pub fn data(&self) -> Option<&RawValue> {
+		self.data.as_deref()
+	}
+
+	/// Returns the materialized model-context projection.
+	#[must_use]
+	pub fn context(&self) -> Option<&Content> {
+		self.context.as_ref()
+	}
+
+	/// Returns whether clients should display the event.
+	#[must_use]
+	pub const fn display(&self) -> bool {
+		self.display
+	}
+
+	/// Returns the same per-revision attribution key and value used by tool
+	/// thread items.
+	#[must_use]
+	pub fn rev_attribution(&self) -> Option<(&'static str, &str)> {
+		self
+			.rev
+			.as_ref()
+			.map(|rev| (omp_tool::TOOL_REV_PROP, rev.as_str()))
+	}
+}
+
+impl PartialEq for Custom {
+	fn eq(&self, other: &Self) -> bool {
+		self.kind == other.kind
+			&& self.rev == other.rev
+			&& self.source == other.source
+			&& self.principal == other.principal
+			&& self.provenance == other.provenance
+			&& opt_raw_eq(self.data.as_deref(), other.data.as_deref())
+			&& self.context == other.context
+			&& self.display == other.display
+	}
+}
+
+impl Eq for Custom {}
+
+/// A valid JSON journal object that could not be decoded as recorded.
+///
+/// `raw` is the exact complete record and `value` is always `None`. Keeping a
+/// typed event instead of dropping the record preserves its physical index and
+/// makes corruption and forward-version records addressable.
+#[derive(Debug, Clone)]
+pub struct EntryUndecodable {
+	/// Recorded event or extension-kind name, when recoverable.
+	pub kind:   Option<Str>,
+	/// Recorded schema revision, when recoverable.
+	pub rev:    Option<Str>,
+	/// Decoded value; always `None` for this event.
+	pub value:  Option<Box<RawValue>>,
+	/// Exact complete JSON record bytes.
+	pub raw:    Box<RawValue>,
+	/// Strict-decoding failure description.
+	pub reason: Str,
+}
+
+impl PartialEq for EntryUndecodable {
+	fn eq(&self, other: &Self) -> bool {
+		self.kind == other.kind
+			&& self.rev == other.rev
+			&& opt_raw_eq(self.value.as_deref(), other.value.as_deref())
+			&& raw_eq(&self.raw, &other.raw)
+			&& self.reason == other.reason
+	}
+}
+
+impl Eq for EntryUndecodable {}
+
 /// A timestamped transcript event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -330,19 +478,18 @@ pub enum Kind {
 		/// New label, or `None` to clear it.
 		label:  Option<Str>,
 	},
-	/// Store an extension event.
-	Custom {
-		/// Extension-defined kind name.
-		kind:    Str,
-		/// Verbatim extension data.
-		data:    Option<Box<RawValue>>,
-		/// Optional content participating in model context.
-		context: Option<Content>,
-		/// Whether clients should display the event.
-		display: bool,
-	},
-	/// Preserve an unrecognized or foreign journal object verbatim.
-	Unknown(Box<RawValue>),
+	/// Store one canonically encoded, core-attributed extension event.
+	///
+	/// `TurnStart`, not this payload, determines the enum's current size, so
+	/// boxing this variant would add an allocation without shrinking [`Kind`].
+	Custom(Custom),
+	/// Record the authenticated request identity and indexes assigned to a
+	/// durable operation.
+	RequestAudit(RequestAudit),
+	/// Fix the phase-specific facts of one tool invocation.
+	InvocationTransition(InvocationTransition),
+	/// Preserve an unrecognized or corrupt machine record verbatim.
+	EntryUndecodable(EntryUndecodable),
 }
 /// Equality is byte equality of stored JSON text, preserving verbatim round
 /// trips.
@@ -445,16 +592,10 @@ impl PartialEq for Kind {
 				Self::Label { target: a_target, label: a_label },
 				Self::Label { target: b_target, label: b_label },
 			) => (a_target, a_label) == (b_target, b_label),
-			(
-				Self::Custom { kind: a_kind, data: a_data, context: a_context, display: a_display },
-				Self::Custom { kind: b_kind, data: b_data, context: b_context, display: b_display },
-			) => {
-				a_kind == b_kind
-					&& opt_raw_eq(a_data.as_deref(), b_data.as_deref())
-					&& a_context == b_context
-					&& a_display == b_display
-			},
-			(Self::Unknown(a), Self::Unknown(b)) => raw_eq(a, b),
+			(Self::InvocationTransition(a), Self::InvocationTransition(b)) => a == b,
+			(Self::Custom(a), Self::Custom(b)) => a == b,
+			(Self::RequestAudit(a), Self::RequestAudit(b)) => a == b,
+			(Self::EntryUndecodable(a), Self::EntryUndecodable(b)) => a == b,
 			_ => false,
 		}
 	}

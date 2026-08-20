@@ -1,3 +1,4 @@
+#![feature(integer_atomics)]
 //! Transport-neutral foundations for durable, interruptible OMP agent loops.
 //!
 //! The crate composes immutable configuration snapshots, deterministic system
@@ -8,11 +9,13 @@
 //! into complete N-turn conversations.
 
 mod batch;
+pub mod control;
 pub(crate) mod duplex;
 mod events;
 mod inproc;
 mod jobs;
 mod journal;
+pub mod journal_kinds;
 mod r#loop;
 mod mailbox;
 mod phases;
@@ -21,14 +24,20 @@ mod prompt;
 mod state;
 mod turn;
 
-pub use batch::{BatchError, BatchResult, CommittedCall, SpeculativeCall, ToolBatch};
+pub use batch::{
+	BatchError, BatchResult, CommittedCall, InvocationAdmission, InvocationHookBus,
+	InvocationHookRequest, SpeculativeCall, ToolBatch, hook_event_mask,
+};
 pub use events::{AgentEvent, AgentPhase, EventBus, EventSubscription, LossyEventSubscription};
 pub use inproc::{InProcTurnClient, RpcTurnClient, RpcTurnSession};
 pub use jobs::{JobBoard, PendingJobs};
 pub use journal::{
-	AbortDisposition, Journal, JournalError, TurnInputRecord, TurnOptionsRecord, TurnReceipt,
-	TurnStart,
+	AbortDisposition, Journal, JournalAuthor, JournalCustomEntry, JournalError, JournalGenerations,
+	JournalOperation, JournalQuery, JournalReply, JournalRequest, JournalRequestStamp,
+	PendingCustomEntry, SessionStateValue, SessionStateWatchEvent, SessionStateWatchTerminal,
+	TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 };
+pub use journal_kinds::{EntryKindDecl, EntryKindError, EntryKindRegistry, KindRecord, LiftHook};
 pub use r#loop::{AbortHandle, Agent, AgentError, AgentRunSummary, RewindTarget};
 pub use mailbox::{DrainPoint, Interrupt, InterruptClass, InterruptSource, Mailbox, MailboxSender};
 pub use omp_llm_inference::TurnId;
@@ -39,7 +48,9 @@ pub use omp_proto::{
 	},
 	thread::v1::{Item, Thread},
 };
-pub use phases::{HookDecision, HookPhase, InvocationPhase, LifecyclePhase};
+pub use phases::{
+	ActivateReason, HookDecision, HookPhase, InvocationPhase, LifecyclePhase, RestartReason,
+};
 pub use project::{
 	ProjectionError, project_journal, project_thread_history, tool_result_item,
 	tool_result_item_canonical_parts,
@@ -49,4 +60,6 @@ pub use prompt::{
 	WorkspacePromptSource, render_prompt,
 };
 pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError};
-pub use turn::{Error, InvokeFrame, TurnClient, TurnInput, TurnOptions, TurnSession, empty_stop};
+pub use turn::{
+	Error, InvokeFrame, Recovery, TurnClient, TurnInput, TurnOptions, TurnSession, empty_stop,
+};

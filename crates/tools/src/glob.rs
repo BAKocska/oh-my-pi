@@ -6,8 +6,9 @@ use async_stream::stream;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::Str;
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
+	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,15 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 			constraint:      Constraint::Schema {
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				documents: Some(DocEffects {
+					read:        true,
+					write_globs: smallvec::SmallVec::new(),
+				}),
+				exec:      None,
+				inference: None,
+				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),

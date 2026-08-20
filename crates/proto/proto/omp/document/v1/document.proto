@@ -998,6 +998,32 @@ message ProtocolError {
   string message = 2;
 }
 
+// Atomically acquires a workspace-wide mutation barrier over the named URIs.
+// A live barrier blocks new document opens and mutations for every listed URI
+// until ReleaseWorkspaceLease succeeds. dry_run reports conflicts only and is
+// advisory: callers must reacquire without dry_run before mutating.
+message AcquireWorkspaceLeaseRequest {
+  repeated string uris = 1;
+  bytes transaction_id = 2;
+  bool dry_run = 3;
+}
+
+message WorkspaceLeaseConflict {
+  string uri = 1;
+  bytes active_lease_id = 2;
+}
+
+message AcquireWorkspaceLeaseResponse {
+  optional bytes workspace_lease_id = 1;
+  repeated WorkspaceLeaseConflict conflicts = 2;
+}
+
+message ReleaseWorkspaceLeaseRequest {
+  bytes workspace_lease_id = 1;
+}
+
+message ReleaseWorkspaceLeaseResponse {}
+
 // Bidirectional connection frame. request_id 0 is reserved for hello/events;
 // all ordinary client requests use a nonzero id unique among in-flight calls.
 message ClientFrame {
@@ -1036,6 +1062,8 @@ message ClientFrame {
     SetPermissionsRequest set_permissions = 21;
     // Requests a structural summary of an immutable current or retained head.
     SummarizeDocumentRequest summarize_document = 22;
+    AcquireWorkspaceLeaseRequest acquire_workspace_lease = 23;
+    ReleaseWorkspaceLeaseRequest release_workspace_lease = 24;
   }
 }
 
@@ -1080,5 +1108,7 @@ message ServerFrame {
     SummarizeDocumentResponse document_summarized = 25;
     // Terminal event-continuity failure; recovery is defined by EventStreamError.
     EventStreamError event_stream_error = 26;
+    AcquireWorkspaceLeaseResponse workspace_lease_acquired = 27;
+    ReleaseWorkspaceLeaseResponse workspace_lease_released = 28;
   }
 }

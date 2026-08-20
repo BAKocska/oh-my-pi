@@ -1,14 +1,26 @@
 //! Linear invocation framing layered over `omp-slopjson`.
 
-use std::{collections::VecDeque, future::Future, marker::PhantomData};
+use std::{
+	collections::VecDeque,
+	future::Future,
+	marker::PhantomData,
+	ops::Range,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	},
+};
 
 use flume::{Receiver, Sender};
 use futures::{FutureExt, pin_mut, select_biased};
-use omp_core::Str;
+use omp_core::{SparseMap, Str};
 use omp_slopjson::{
-	IncomingDoc, IncomingError, IncomingFeed, PullIssue, PullIssueKind, PullPathSegment,
+	IncomingCursor as SlopCursor, IncomingDoc, IncomingError, IncomingFeed, PullIssue,
+	PullIssueKind, PullMode, PullPathSegment, Pulled, PulledKind, Value,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{ArgIssue, ArgIssueKind, ArgPath, ArgSpecRegistry, Rev};
@@ -22,7 +34,7 @@ pub enum InvocationEvent {
 		/// Raw text chunk emitted by the provider.
 		fragment: Str,
 	},
-	/// Explicit durable commitment point and authoritative complete arguments.
+	/// Authoritative complete-argument boundary supplied by the invocation host.
 	ArgsCommitted {
 		/// Final complete argument payload string.
 		raw: Str,
@@ -40,28 +52,144 @@ pub struct Interrupt {
 	pub reason: Str,
 }
 
+impl Interrupt {
+	/// Invocation deadline expiry.
+	pub const DEADLINE: &'static str = "deadline";
+	/// Explicit user cancellation.
+	pub const ESCAPE: &'static str = "escape";
+	/// Session termination.
+	pub const SHUTDOWN: &'static str = "shutdown";
+	/// User steering supplied while a turn is in progress.
+	pub const STEERING: &'static str = "steering";
+}
 /// Sending failed because the invocation consumer is gone.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("invocation event stream is closed")]
 pub struct InvocationSendError;
 
+struct DirectFeed {
+	state:     Mutex<DirectFeedState>,
+	producers: AtomicUsize,
+}
+
+struct DirectFeedState {
+	parser:    Option<IncomingFeed>,
+	fragments: SmallVec<Str, 4>,
+	byte_len:  usize,
+	committed: bool,
+	protocol:  Option<Str>,
+}
+
+impl Drop for DirectFeed {
+	fn drop(&mut self) {
+		if let Some(feed) = self.state.get_mut().parser.take() {
+			feed.abort();
+		}
+	}
+}
+
 /// Producer side of one linear invocation event stream.
 ///
-/// Dropping the last producer before `args_committed` disconnects the stream;
-/// [`IncomingParams`] then reports an abort rather than inventing commitment.
-#[derive(Clone)]
+/// Dropping the last producer before `args_committed` abandons the parser feed;
+/// [`IncomingParams`] then reports an abort rather than inventing finalization.
 pub struct InvocationFeed {
-	tx: Sender<InvocationEvent>,
+	tx:     Sender<InvocationEvent>,
+	direct: Arc<DirectFeed>,
+}
+
+impl Clone for InvocationFeed {
+	fn clone(&self) -> Self {
+		self.direct.producers.fetch_add(1, Ordering::Relaxed);
+		Self { tx: self.tx.clone(), direct: Arc::clone(&self.direct) }
+	}
+}
+
+impl Drop for InvocationFeed {
+	fn drop(&mut self) {
+		if self.direct.producers.fetch_sub(1, Ordering::AcqRel) == 1 {
+			let mut direct = self.direct.state.lock();
+			if !direct.committed
+				&& let Some(feed) = direct.parser.take()
+			{
+				feed.abort();
+			}
+		}
+	}
 }
 
 impl InvocationFeed {
 	/// Relays one raw argument text fragment verbatim.
 	pub fn arg_text(&self, fragment: Str) -> Result<(), InvocationSendError> {
-		self.send(InvocationEvent::ArgText { fragment })
+		if self.tx.is_disconnected() {
+			return Err(InvocationSendError);
+		}
+		let mut direct = self.direct.state.lock();
+		if direct.committed {
+			direct
+				.protocol
+				.get_or_insert_with(|| Str::from("argument text arrived after commitment"));
+			if let Some(feed) = direct.parser.take() {
+				feed.abort();
+			}
+			return Ok(());
+		}
+		if direct
+			.parser
+			.as_mut()
+			.is_none_or(|feed| feed.push(&fragment).is_err())
+		{
+			direct
+				.protocol
+				.get_or_insert_with(|| Str::from("JSON feed closed before commitment"));
+		}
+		direct.byte_len = direct.byte_len.saturating_add(fragment.len());
+		direct.fragments.push(fragment);
+		Ok(())
 	}
 
-	/// Marks the invocation durable with its exact complete raw arguments.
+	/// Closes argument streaming with its exact complete raw emission.
 	pub fn args_committed(&self, raw: Str) -> Result<(), InvocationSendError> {
+		if self.tx.is_disconnected() {
+			return Err(InvocationSendError);
+		}
+		{
+			let mut direct = self.direct.state.lock();
+			if direct.committed {
+				direct
+					.protocol
+					.get_or_insert_with(|| Str::from("duplicate argument commitment"));
+			} else if direct.byte_len == 0 && !raw.is_empty() {
+				direct.byte_len = raw.len();
+				direct.fragments.push(raw.clone());
+				if direct
+					.parser
+					.as_mut()
+					.is_none_or(|feed| feed.push(&raw).is_err())
+				{
+					direct
+						.protocol
+						.get_or_insert_with(|| Str::from("JSON feed closed before commitment"));
+				}
+			} else if direct.byte_len != raw.len()
+				|| !direct
+					.fragments
+					.iter()
+					.flat_map(|fragment| fragment.bytes())
+					.eq(raw.bytes())
+			{
+				direct.protocol.get_or_insert_with(|| {
+					Str::from("committed arguments differ from streamed fragments")
+				});
+			}
+			direct.committed = true;
+			if let Some(feed) = direct.parser.take() {
+				if direct.protocol.is_some() {
+					feed.abort();
+				} else {
+					feed.finish();
+				}
+			}
+		}
 		self.send(InvocationEvent::ArgsCommitted { raw })
 	}
 
@@ -104,6 +232,7 @@ pub enum CommitError {
 }
 /// Failure while waiting for the next invocation interrupt.
 #[derive(Debug, Error)]
+
 pub enum InterruptWaitError {
 	/// The invocation owner disappeared before sending another interrupt.
 	#[error("invocation event stream closed")]
@@ -111,6 +240,428 @@ pub enum InterruptWaitError {
 	/// Framing violated the one-stream invocation protocol.
 	#[error("invalid invocation framing: {0}")]
 	Protocol(Str),
+}
+/// Immutable result of strict whole-structure argument finalization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalizedArgs {
+	raw:            Str,
+	effective:      Value,
+	effective_json: Str,
+	repairs:        SmallVec<crate::Repair, 4>,
+}
+
+impl FinalizedArgs {
+	/// Exact provider-emitted argument bytes.
+	pub const fn raw(&self) -> &Str {
+		&self.raw
+	}
+
+	/// One canonical effective argument value shared by every downstream
+	/// consumer.
+	pub const fn effective(&self) -> &Value {
+		&self.effective
+	}
+
+	/// Cached compact JSON representation of [`effective`](Self::effective).
+	pub const fn effective_json(&self) -> &Str {
+		&self.effective_json
+	}
+
+	/// Immutable parser, alias, coercion, and elision trail.
+	pub fn repairs(&self) -> &[crate::Repair] {
+		&self.repairs
+	}
+}
+
+struct CursorState {
+	active: AtomicBool,
+	chunks: Mutex<Option<SparseMap<u32, usize>>>,
+}
+
+/// Re-entrant host cursor over one incoming argument document.
+///
+/// Pull requests may be created from separate host callbacks, but only one may
+/// remain outstanding. A concurrent request is refused rather than queued.
+#[derive(Clone)]
+pub struct IncomingCursor<'c> {
+	inner: SlopCursor,
+	rev:   Option<&'c Rev>,
+
+	arg_specs: Option<&'c ArgSpecRegistry>,
+	state:     Arc<CursorState>,
+}
+struct PullSlot<'a>(&'a AtomicBool);
+
+impl Drop for PullSlot<'_> {
+	fn drop(&mut self) {
+		self.0.store(false, Ordering::Release);
+	}
+}
+
+impl<'c> IncomingCursor<'c> {
+	/// Pulls one declared path while enforcing the invocation's single
+	/// outstanding host slot.
+	pub fn pull_at<'a>(
+		&'a self,
+		path: &'a [ArgPath],
+		mode: PullMode,
+		expected: &'static str,
+	) -> impl Future<Output = Result<Pulled, ParamError>> + 'a {
+		async move {
+			if self
+				.state
+				.active
+				.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+				.is_err()
+			{
+				return Err(ParamError::Protocol(Str::from("concurrent pull")));
+			}
+			let _slot = PullSlot(&self.state.active);
+			let declaration = self
+				.rev
+				.zip(self.arg_specs)
+				.and_then(|(rev, specs)| specs.get_with_id(rev, path));
+			let slop_path = declared_pull_path(path, self.rev.zip(self.arg_specs));
+			let mode = match mode {
+				PullMode::Chunk(_) | PullMode::Line(_) => {
+					let (path_id, _) = declaration.ok_or_else(|| {
+						ParamError::Protocol(Str::from("chunk pull requires a declared path"))
+					})?;
+					let emitted = self
+						.state
+						.chunks
+						.lock()
+						.as_ref()
+						.and_then(|chunks| chunks.get(path_id))
+						.copied()
+						.unwrap_or(0);
+					if matches!(mode, PullMode::Line(_)) {
+						PullMode::Line(emitted)
+					} else {
+						PullMode::Chunk(emitted)
+					}
+				},
+				other => other,
+			};
+			let mut pulled = self
+				.inner
+				.pull_at(&slop_path, mode, expected)
+				.await
+				.map_err(|error| param_error(error, self.rev.zip(self.arg_specs)))?;
+			if let PulledKind::Complete(value) = &mut pulled.kind
+				&& let Some((_, spec)) = declaration
+			{
+				let _ = apply_coercions(value, spec);
+			}
+			if let PulledKind::Chunk { value, .. } = &pulled.kind {
+				let (path_id, _) = declaration.expect("chunk mode requires a declaration");
+				let mut chunks = self.state.chunks.lock();
+				let offsets = chunks.get_or_insert_with(SparseMap::new);
+				let emitted = offsets.get(path_id).copied().unwrap_or(0);
+				offsets.insert(path_id, emitted.saturating_add(value.len()));
+			}
+			Ok(pulled)
+		}
+	}
+
+	/// Copies one exact raw source span returned by [`pull_at`](Self::pull_at).
+	pub fn raw(&self, span: Range<usize>) -> Option<Str> {
+		self.inner.raw(span)
+	}
+}
+
+fn declared_pull_path(
+	path: &[ArgPath],
+	arg_specs: Option<(&Rev, &ArgSpecRegistry)>,
+) -> SmallVec<PullPathSegment, 4> {
+	let mut prefix = SmallVec::<ArgPath, 4>::new();
+	path
+		.iter()
+		.map(|part| {
+			prefix.push(part.clone());
+			match part {
+				ArgPath::Key(key) => {
+					if let Some(spec) = arg_specs.and_then(|(rev, specs)| specs.get(rev, &prefix)) {
+						let mut keys = SmallVec::with_capacity(1 + spec.aliases.len());
+						let canonical = match spec.path.last() {
+							Some(ArgPath::Key(canonical)) => canonical.clone(),
+							_ => key.clone(),
+						};
+						keys.push(canonical);
+						keys.extend(spec.aliases.iter().cloned());
+						PullPathSegment::Keys(keys)
+					} else {
+						PullPathSegment::Key(key.clone())
+					}
+				},
+				ArgPath::Index(index) => {
+					PullPathSegment::Index(usize::try_from(*index).unwrap_or(usize::MAX))
+				},
+			}
+		})
+		.collect()
+}
+
+struct AppliedCoercions {
+	steps:  SmallVec<(crate::Coerce, Str, Str), 2>,
+	elided: bool,
+}
+
+fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions {
+	let mut applied = AppliedCoercions { steps: SmallVec::new(), elided: false };
+	for coercion in &spec.coerce {
+		let before = Str::from(value.to_string());
+		let Some(next) = coerce_once(*coercion, value) else {
+			continue;
+		};
+		match next {
+			Some(next) => {
+				let after = Str::from(next.to_string());
+				*value = next;
+				applied.steps.push((*coercion, before, after));
+			},
+			None => {
+				applied.elided = true;
+				applied
+					.steps
+					.push((*coercion, before, Str::from("<absent>")));
+				break;
+			},
+		}
+	}
+	applied
+}
+
+fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<Option<Value>> {
+	use crate::Coerce;
+	match coercion {
+		Coerce::LooseBool => match value {
+			Value::String(value) => match value.as_str() {
+				"true" | "yes" | "1" => Some(Some(Value::Bool(true))),
+				"false" | "no" | "0" => Some(Some(Value::Bool(false))),
+				_ => None,
+			},
+			Value::Number(number) if number.as_i64() == Some(1) => Some(Some(Value::Bool(true))),
+			Value::Number(number) if number.as_i64() == Some(0) => Some(Some(Value::Bool(false))),
+			_ => None,
+		},
+		Coerce::Integer => match value {
+			Value::String(value) => value
+				.parse::<i64>()
+				.map(Value::from)
+				.or_else(|_| value.parse::<u64>().map(Value::from))
+				.ok()
+				.map(Some),
+			Value::Number(number) if number.is_f64() => {
+				let number = number.as_f64();
+				(number.fract() == 0.0 && number >= i64::MIN as f64 && number < -(i64::MIN as f64))
+					.then(|| Some(Value::from(number as i64)))
+			},
+			_ => None,
+		},
+		Coerce::Number => match value {
+			Value::String(value) => value
+				.parse::<f64>()
+				.ok()
+				.and_then(omp_slopjson::Number::from_f64)
+				.map(Value::from)
+				.map(Some),
+			_ => None,
+		},
+		Coerce::String => match value {
+			Value::Number(_) | Value::Bool(_) | Value::Null => {
+				Some(Some(Value::String(Str::from(value.to_string()))))
+			},
+			_ => None,
+		},
+		Coerce::Singleton if !matches!(value, Value::Array(_)) => {
+			Some(Some(Value::Array(vec![value.clone()])))
+		},
+		Coerce::Singleton => None,
+		Coerce::JsonString => match value {
+			Value::String(value) => omp_slopjson::parse(value).ok().map(Some),
+			_ => None,
+		},
+		Coerce::Strip => match value {
+			Value::String(value) => {
+				let trimmed = value.trim();
+				(trimmed.len() != value.len()).then(|| Some(Value::String(Str::from(trimmed))))
+			},
+			_ => None,
+		},
+		Coerce::Csv => match value {
+			Value::String(value) if value.contains(',') => Some(Some(Value::Array(
+				value
+					.split(",")
+					.map(|item| Value::String(Str::from(item.trim())))
+					.collect(),
+			))),
+			_ => None,
+		},
+		Coerce::NullElision => match value {
+			Value::Null => Some(None),
+			Value::String(value) if value.is_empty() || value == "null" => Some(None),
+			_ => None,
+		},
+	}
+}
+
+struct StructureNode<'a> {
+	value:     &'a Value,
+	source:    SmallVec<PullPathSegment, 4>,
+	canonical: SmallVec<ArgPath, 4>,
+}
+
+async fn validate_structure(
+	cursor: &SlopCursor,
+	root: &Value,
+	arg_specs: Option<(&Rev, &ArgSpecRegistry)>,
+) -> Result<(), ParamError> {
+	let mut pending = vec![StructureNode {
+		value:     root,
+		source:    SmallVec::new(),
+		canonical: SmallVec::new(),
+	}];
+	while let Some(node) = pending.pop() {
+		match node.value {
+			Value::Object(object) => {
+				let keys = cursor
+					.object_keys(&node.source)
+					.await
+					.map_err(|error| param_error(error, arg_specs))?;
+				let mut seen = SmallVec::<SmallVec<ArgPath, 4>, 8>::new();
+				for key in &keys {
+					let candidate = child_path(&node.canonical, ArgPath::Key(key.clone()));
+					let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
+					let identity = spec.map_or_else(|| candidate.clone(), |spec| spec.path.clone());
+					if seen.contains(&identity) {
+						let expected = spec.map_or_else(
+							|| Str::from("one unambiguous value"),
+							|spec| spec.expected.clone(),
+						);
+						return Err(ParamError::Args(Box::new(ArgIssue {
+							path: identity.into_iter().collect(),
+							expected,
+							kind: ArgIssueKind::Ambiguous,
+							example: spec.and_then(|spec| spec.example.clone()),
+							found: Some(Str::from("multiple values")),
+						})));
+					}
+					seen.push(identity);
+					if !node.canonical.is_empty()
+						&& let Some((rev, specs)) = arg_specs
+						&& let Some(parent) = specs.get(rev, &node.canonical)
+						&& !parent.additional_properties
+						&& spec.is_none()
+					{
+						return Err(ParamError::Args(Box::new(ArgIssue {
+							path:     candidate.into_iter().collect(),
+							expected: Str::from("a declared object member"),
+							kind:     ArgIssueKind::Malformed,
+							example:  parent.example.clone(),
+							found:    Some(Str::from("undeclared open-map member")),
+						})));
+					}
+				}
+				for (key, value) in object {
+					let candidate = child_path(&node.canonical, ArgPath::Key(key.clone()));
+					let canonical = arg_specs
+						.and_then(|(rev, specs)| specs.get(rev, &candidate))
+						.map_or(candidate, |spec| spec.path.clone());
+					let mut source = node.source.clone();
+					source.push(PullPathSegment::Key(key.clone()));
+					pending.push(StructureNode { value, source, canonical });
+				}
+			},
+			Value::Array(values) => {
+				for (index, value) in values.iter().enumerate() {
+					let index_u64 = u64::try_from(index).unwrap_or(u64::MAX);
+					let candidate = child_path(&node.canonical, ArgPath::Index(index_u64));
+					let canonical = arg_specs
+						.and_then(|(rev, specs)| specs.get(rev, &candidate))
+						.map_or(candidate, |spec| spec.path.clone());
+					let mut source = node.source.clone();
+					source.push(PullPathSegment::Index(index));
+					pending.push(StructureNode { value, source, canonical });
+				}
+			},
+			_ => {},
+		}
+	}
+	Ok(())
+}
+
+fn child_path(path: &[ArgPath], child: ArgPath) -> SmallVec<ArgPath, 4> {
+	let mut result = SmallVec::with_capacity(path.len() + 1);
+	result.extend(path.iter().cloned());
+	result.push(child);
+	result
+}
+
+fn canonicalize(
+	mut value: Value,
+	path: &SmallVec<ArgPath, 4>,
+	arg_specs: Option<(&Rev, &ArgSpecRegistry)>,
+	repairs: &mut SmallVec<crate::Repair, 4>,
+) -> Option<Value> {
+	if let Some(spec) = arg_specs.and_then(|(rev, specs)| specs.get(rev, path)) {
+		let applied = apply_coercions(&mut value, spec);
+		for (coercion, before, after) in applied.steps {
+			repairs.push(crate::Repair {
+				path:   spec.path.clone(),
+				kind:   if coercion == crate::Coerce::NullElision {
+					crate::RepairKind::Elision
+				} else {
+					crate::RepairKind::Coercion
+				},
+				detail: Str::from(format!("{coercion}: {before} -> {after}")),
+			});
+		}
+		if applied.elided {
+			return None;
+		}
+	}
+	match value {
+		Value::Object(object) => {
+			let mut canonical = omp_slopjson::Object::with_capacity(object.len());
+			for (key, value) in object {
+				let candidate = child_path(path, ArgPath::Key(key.clone()));
+				let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
+				let (canonical_path, canonical_key) = if let Some(spec) = spec {
+					let canonical_key = match spec.path.last() {
+						Some(ArgPath::Key(key)) => key.clone(),
+						_ => key.clone(),
+					};
+					if canonical_key != key {
+						repairs.push(crate::Repair {
+							path:   spec.path.clone(),
+							kind:   crate::RepairKind::Alias,
+							detail: Str::from(format!("{key} -> {canonical_key}")),
+						});
+					}
+					(spec.path.clone(), canonical_key)
+				} else {
+					(candidate, key)
+				};
+				if let Some(value) = canonicalize(value, &canonical_path, arg_specs, repairs) {
+					let previous = canonical.insert(canonical_key, value);
+					debug_assert!(previous.is_none(), "ambiguity was rejected before canonicalization");
+				}
+			}
+			Some(Value::Object(canonical))
+		},
+		Value::Array(values) => Some(Value::Array(
+			values
+				.into_iter()
+				.enumerate()
+				.filter_map(|(index, value)| {
+					let path = child_path(path, ArgPath::Index(index as u64));
+					canonicalize(value, &path, arg_specs, repairs)
+				})
+				.collect(),
+		)),
+		value => Some(value),
+	}
 }
 
 /// Tool-facing cursor over one invocation's single inbound event stream.
@@ -121,16 +672,20 @@ pub enum InterruptWaitError {
 /// Effects must await [`committed`](Self::committed), which succeeds only after
 /// an explicit [`InvocationEvent::ArgsCommitted`].
 pub struct IncomingParams<'c> {
-	events:     Receiver<InvocationEvent>,
-	owner:      Option<Str>,
-	feed:       Option<IncomingFeed>,
-	doc:        Option<IncomingDoc>,
-	arg_specs:  Option<(&'c Rev, &'c ArgSpecRegistry)>,
-	assembled:  String,
-	committed:  Option<Str>,
-	interrupts: VecDeque<Interrupt>,
-	protocol:   Option<Str>,
-	_scope:     PhantomData<&'c ()>,
+	events:        Receiver<InvocationEvent>,
+	owner:         Option<Str>,
+	direct:        Option<Arc<DirectFeed>>,
+	feed:          Option<IncomingFeed>,
+	doc:           Option<IncomingDoc>,
+	finalizer:     Option<SlopCursor>,
+	finalized:     Option<FinalizedArgs>,
+	cursor_issued: bool,
+	arg_specs:     Option<(&'c Rev, &'c ArgSpecRegistry)>,
+	assembled:     String,
+	committed:     Option<Str>,
+	interrupts:    VecDeque<Interrupt>,
+	protocol:      Option<Str>,
+	_scope:        PhantomData<&'c ()>,
 }
 
 impl IncomingParams<'static> {
@@ -146,13 +701,27 @@ impl IncomingParams<'static> {
 
 	fn channel_for_owner(owner: Option<Str>) -> (InvocationFeed, Self) {
 		let (tx, events) = flume::unbounded();
-		let (feed, doc) = IncomingDoc::channel();
-		(InvocationFeed { tx }, Self {
+		let (parser, doc) = IncomingDoc::channel();
+		let direct = Arc::new(DirectFeed {
+			state:     Mutex::new(DirectFeedState {
+				parser:    Some(parser),
+				fragments: SmallVec::new(),
+				byte_len:  0,
+				committed: false,
+				protocol:  None,
+			}),
+			producers: AtomicUsize::new(1),
+		});
+		(InvocationFeed { tx, direct: Arc::clone(&direct) }, Self {
 			events,
 			owner,
-			feed: Some(feed),
+			direct: Some(direct),
+			feed: None,
 			arg_specs: None,
+			finalizer: Some(doc.cursor()),
 			doc: Some(doc),
+			finalized: None,
+			cursor_issued: false,
 			assembled: String::new(),
 			committed: None,
 			interrupts: VecDeque::new(),
@@ -169,9 +738,13 @@ impl<'c> IncomingParams<'c> {
 		Self {
 			events,
 			owner: None,
+			direct: None,
 			feed: Some(feed),
 			arg_specs: None,
+			finalizer: Some(doc.cursor()),
 			doc: Some(doc),
+			finalized: None,
+			cursor_issued: false,
 			assembled: String::new(),
 			committed: None,
 			interrupts: VecDeque::new(),
@@ -187,8 +760,37 @@ impl<'c> IncomingParams<'c> {
 
 	/// Binds argument pulls to the immutable declarations for the invoked
 	/// revision.
-	pub(crate) const fn bind_arg_specs(&mut self, rev: &'c Rev, specs: &'c ArgSpecRegistry) {
+	pub const fn bind_arg_specs(&mut self, rev: &'c Rev, specs: &'c ArgSpecRegistry) {
 		self.arg_specs = Some((rev, specs));
+	}
+
+	/// Takes the document's path-addressed host cursor.
+	///
+	/// The closure API and cursor API are mutually exclusive views of the same
+	/// document. A second take is a protocol error.
+	pub fn cursor(&mut self) -> Result<IncomingCursor<'c>, ParamError> {
+		if self.direct.is_none() {
+			return Err(ParamError::Protocol(Str::from(
+				"path cursor requires an InvocationFeed channel",
+			)));
+		}
+		self.sync_direct_problem().map_err(ParamError::Protocol)?;
+		if self.cursor_issued {
+			return Err(ParamError::Protocol(Str::from("JSON cursor session was already consumed")));
+		}
+		let doc = self.doc.take().ok_or_else(|| {
+			ParamError::Protocol(Str::from("JSON cursor session was already consumed"))
+		})?;
+		self.cursor_issued = true;
+		let (rev, arg_specs) = self
+			.arg_specs
+			.map_or((None, None), |(rev, specs)| (Some(rev), Some(specs)));
+		Ok(IncomingCursor {
+			inner: doc.cursor(),
+			rev,
+			arg_specs,
+			state: Arc::new(CursorState { active: AtomicBool::new(false), chunks: Mutex::new(None) }),
+		})
 	}
 
 	/// Runs the invocation's sole JSON cursor session while continuing to feed
@@ -205,18 +807,40 @@ impl<'c> IncomingParams<'c> {
 		self.drive_pull(operation, false).await
 	}
 
-	/// Explicitly opts into decoding and validating the complete argument shape.
-	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, ParamError> {
-		self
-			.pull(|mut doc| async move { doc.whole::<T>().await })
-			.await
+	/// Strictly finalizes the complete argument document exactly once.
+	pub async fn finalize(&mut self) -> Result<&FinalizedArgs, ParamError> {
+		self.finalize_with_interrupts(false).await
 	}
 
-	/// Waits for the explicit durable argument commitment frame.
+	/// Returns the exact provider-emitted argument text after the feed closes.
+	pub async fn raw(&mut self) -> Result<Str, ParamError> {
+		self
+			.drive_commit_raw(false)
+			.await
+			.map_err(commit_param_error)
+	}
+
+	/// Explicitly opts into decoding and validating the one canonical complete
+	/// argument shape.
+	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, ParamError> {
+		self
+			.finalize()
+			.await?
+			.effective()
+			.deserialize_into()
+			.map_err(|_| malformed_issue(std::any::type_name::<T>(), None))
+	}
+
+	/// Waits for the explicit effect-authorization frame and returns the
+	/// canonical effective argument JSON.
 	///
 	/// Disconnect/drop before that frame is [`CommitError::Aborted`].
 	pub async fn committed(&mut self) -> Result<Str, CommitError> {
-		self.drive_commit(false).await
+		self
+			.finalize_with_interrupts(false)
+			.await
+			.map(|finalized| finalized.effective_json().clone())
+			.map_err(param_commit_error)
 	}
 
 	/// Returns a view whose pulls and commitment wait observe interrupts.
@@ -251,11 +875,78 @@ impl<'c> IncomingParams<'c> {
 		}
 	}
 
+	async fn finalize_with_interrupts(
+		&mut self,
+		observe: bool,
+	) -> Result<&FinalizedArgs, ParamError> {
+		self.sync_direct_problem().map_err(ParamError::Protocol)?;
+		if self.finalized.is_none() {
+			let raw = self
+				.drive_commit_raw(observe)
+				.await
+				.map_err(commit_param_error)?;
+			let cursor = self.finalizer.clone().ok_or_else(|| {
+				ParamError::Protocol(Str::from("argument finalizer cursor is unavailable"))
+			})?;
+			let pulled = cursor
+				.pull_at(&[], PullMode::Complete, "an argument object")
+				.await
+				.map_err(|error| param_error(error, self.arg_specs))?;
+			let PulledKind::Complete(root) = pulled.kind else {
+				unreachable!("complete pull always returns a complete value")
+			};
+			if !matches!(&root, Value::Object(_)) {
+				return Err(malformed_issue("an argument object", Some(value_kind(&root))));
+			}
+			let observed_raw = cursor
+				.raw_document()
+				.await
+				.map_err(|error| param_error(error, self.arg_specs))?;
+			if observed_raw != raw {
+				return Err(ParamError::Protocol(Str::from(
+					"finalized arguments differ from streamed fragments",
+				)));
+			}
+			validate_structure(&cursor, &root, self.arg_specs).await?;
+			let mut repairs = SmallVec::new();
+			{
+				let parser_repairs = cursor.repairs();
+				for repair in parser_repairs.as_slice() {
+					let path = repair
+						.path
+						.iter()
+						.map(|part| match part {
+							omp_slopjson::RepairPathSegment::Key(key) => ArgPath::Key(key.clone()),
+							omp_slopjson::RepairPathSegment::Index(index) => ArgPath::Index(*index as u64),
+						})
+						.collect();
+					repairs.push(crate::Repair {
+						path,
+						kind: crate::RepairKind::Tolerance,
+						detail: Str::from(format!(
+							"{:?}: {} -> {}",
+							repair.kind, repair.before, repair.after
+						)),
+					});
+				}
+			}
+			let effective = canonicalize(root, &SmallVec::new(), self.arg_specs, &mut repairs)
+				.expect("the root argument object cannot be elided");
+			let effective_json = Str::from(effective.to_string());
+			self.finalized = Some(FinalizedArgs { raw, effective, effective_json, repairs });
+		}
+		Ok(self
+			.finalized
+			.as_ref()
+			.expect("set above or already finalized"))
+	}
+
 	async fn drive_pull<R, F, Fut>(&mut self, operation: F, observe: bool) -> Result<R, ParamError>
 	where
 		F: FnOnce(IncomingDoc) -> Fut,
 		Fut: Future<Output = Result<R, IncomingError>>,
 	{
+		self.sync_direct_problem().map_err(ParamError::Protocol)?;
 		if let Some(problem) = self.protocol.clone() {
 			return Err(ParamError::Protocol(problem));
 		}
@@ -289,7 +980,8 @@ impl<'c> IncomingParams<'c> {
 		}
 	}
 
-	async fn drive_commit(&mut self, observe: bool) -> Result<Str, CommitError> {
+	async fn drive_commit_raw(&mut self, observe: bool) -> Result<Str, CommitError> {
+		self.sync_direct_problem().map_err(CommitError::Protocol)?;
 		if let Some(problem) = self.protocol.clone() {
 			return Err(CommitError::Protocol(problem));
 		}
@@ -307,6 +999,7 @@ impl<'c> IncomingParams<'c> {
 					self.interrupts.pop_back();
 					return Err(CommitError::Interrupted(interrupt));
 				}
+				self.sync_direct_problem().map_err(CommitError::Protocol)?;
 				if let Some(raw) = self.committed.clone() {
 					return Ok(raw);
 				}
@@ -368,6 +1061,17 @@ impl<'c> IncomingParams<'c> {
 		Err(problem)
 	}
 
+	fn sync_direct_problem(&mut self) -> Result<(), Str> {
+		let Some(direct) = self.direct.as_ref() else {
+			return Ok(());
+		};
+		if let Some(problem) = direct.state.lock().protocol.clone() {
+			self.protocol = Some(problem.clone());
+			return Err(problem);
+		}
+		Ok(())
+	}
+
 	fn disconnect(&mut self) {
 		if self.committed.is_none()
 			&& let Some(feed) = self.feed.take()
@@ -395,13 +1099,71 @@ impl InterruptibleParams<'_, '_> {
 	/// Whole-document decode with interrupt observation.
 	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, ParamError> {
 		self
-			.pull(|mut doc| async move { doc.whole::<T>().await })
-			.await
+			.inner
+			.finalize_with_interrupts(true)
+			.await?
+			.effective()
+			.deserialize_into()
+			.map_err(|_| malformed_issue(std::any::type_name::<T>(), None))
 	}
 
 	/// Explicit commitment wait with interrupt observation.
 	pub async fn committed(&mut self) -> Result<Str, CommitError> {
-		self.inner.drive_commit(true).await
+		self
+			.inner
+			.finalize_with_interrupts(true)
+			.await
+			.map(|finalized| finalized.effective_json().clone())
+			.map_err(param_commit_error)
+	}
+}
+
+fn commit_param_error(error: CommitError) -> ParamError {
+	match error {
+		CommitError::Aborted => {
+			malformed_issue_with_kind("complete JSON arguments", ArgIssueKind::Aborted, None)
+		},
+		CommitError::Interrupted(interrupt) => ParamError::Interrupted(interrupt),
+		CommitError::Protocol(problem) => ParamError::Protocol(problem),
+	}
+}
+
+fn param_commit_error(error: ParamError) -> CommitError {
+	match error {
+		ParamError::Args(_) => {
+			CommitError::Protocol(Str::from("argument finalization failed before authorization"))
+		},
+		ParamError::Interrupted(interrupt) => CommitError::Interrupted(interrupt),
+		ParamError::Protocol(problem) => CommitError::Protocol(problem),
+	}
+}
+
+fn malformed_issue(expected: &'static str, found: Option<&'static str>) -> ParamError {
+	malformed_issue_with_kind(expected, ArgIssueKind::Malformed, found)
+}
+
+fn malformed_issue_with_kind(
+	expected: &'static str,
+	kind: ArgIssueKind,
+	found: Option<&'static str>,
+) -> ParamError {
+	ParamError::Args(Box::new(ArgIssue {
+		path: Vec::new(),
+		expected: Str::from(expected),
+		kind,
+		example: None,
+		found: found.map(Str::from),
+	}))
+}
+
+const fn value_kind(value: &Value) -> &'static str {
+	match value {
+		Value::Null => "null",
+		Value::Bool(_) => "boolean",
+		Value::Number(_) => "number",
+		Value::String(_) => "string",
+		Value::Array(_) => "array",
+		Value::Object(_) => "object",
 	}
 }
 
@@ -438,6 +1200,7 @@ fn arg_issue(issue: PullIssue, arg_specs: Option<(&Rev, &ArgSpecRegistry)>) -> A
 		.into_iter()
 		.map(|part| match part {
 			PullPathSegment::Key(key) => ArgPath::Key(key),
+			PullPathSegment::Keys(keys) => ArgPath::Key(keys.into_iter().next().unwrap_or_default()),
 			PullPathSegment::Index(index) => ArgPath::Index(index as u64),
 		})
 		.collect::<Vec<_>>();
@@ -463,11 +1226,12 @@ mod tests {
 		let mut specs = ArgSpecRegistry::new();
 		specs
 			.register(rev.clone(), ArgSpec {
-				path:     smallvec![ArgPath::Key(Str::from("path"))],
-				aliases:  smallvec![Str::from("file_path")],
-				coerce:   smallvec![],
-				expected: Str::from("declared numeric path"),
-				example:  Some(Str::from(EXAMPLE)),
+				path:                  smallvec![ArgPath::Key(Str::from("path"))],
+				aliases:               smallvec![Str::from("file_path")],
+				coerce:                smallvec![],
+				expected:              Str::from("declared numeric path"),
+				example:               Some(Str::from(EXAMPLE)),
+				additional_properties: false,
 			})
 			.expect("argument declaration registers");
 		specs.seal();

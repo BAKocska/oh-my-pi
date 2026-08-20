@@ -10,13 +10,19 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
-use omp_app::envd::{
-	exec::{ExecEvent as HostExecEvent, ExecHost},
-	server::EnvServer,
-	worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
-	workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
+use omp_app::{
+	envd::{
+		exec::{ExecEvent as HostExecEvent, ExecHost},
+		server::EnvServer,
+		worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
+		workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
+	},
+	exthost::{
+		ActivationTrigger, ArtifactDigest, DeclarationSet, ExtensionManifest, Provenance,
+		ServiceManifest, ToolDeclarationKey,
+	},
 };
-use omp_core::Str;
+use omp_core::{Principal, Str};
 use omp_env::{BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent};
 use omp_proto::{
 	SCHEMA_REV,
@@ -27,8 +33,9 @@ use omp_proto::{
 	},
 };
 use omp_tool::{
-	Abort, CallOutcome, Claims, Constraint, Ev, IncomingParams, LoweringCaps, ParamError, Part,
-	Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec, ToolTerminal,
+	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, LoweringCaps,
+	ParamError, Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute,
+	ToolSpec, ToolTerminal,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -42,17 +49,29 @@ fn test_claims() -> Claims {
 	}
 }
 
+fn file_write_effects() -> Effects {
+	Effects {
+		documents: Some(DocEffects {
+			read:        false,
+			write_globs: [Str::new_static("**")].into_iter().collect(),
+		}),
+		exec:      None,
+		inference: None,
+		subagents: 0,
+	}
+}
+
 struct EffectTool {
 	spec:   ToolSpec,
 	marker: PathBuf,
 }
 
 impl EffectTool {
-	const fn new(marker: PathBuf) -> Self {
+	fn new(marker: PathBuf) -> Self {
 		Self::named("effect_probe", marker)
 	}
 
-	const fn named(name: &'static str, marker: PathBuf) -> Self {
+	fn named(name: &'static str, marker: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
 				name:            Str::new_static(name),
@@ -60,6 +79,7 @@ impl EffectTool {
 				description:     Str::new_static("records a committed invocation"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
+				effects:         file_write_effects(),
 				projection_code: [0; 32],
 			},
 			marker,
@@ -116,7 +136,7 @@ struct StreamingTool {
 }
 
 impl StreamingTool {
-	const fn new(lease: PathBuf, effect: PathBuf) -> Self {
+	fn new(lease: PathBuf, effect: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
 				name:            Str::new_static("streaming_probe"),
@@ -126,6 +146,7 @@ impl StreamingTool {
 					br#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
 				),
 				constraint:      Constraint::None,
+				effects:         file_write_effects(),
 				projection_code: [0; 32],
 			},
 			lease,
@@ -182,7 +203,7 @@ struct BlockingTool {
 }
 
 impl BlockingTool {
-	const fn new(started: PathBuf) -> Self {
+	fn new(started: PathBuf) -> Self {
 		Self {
 			spec: ToolSpec {
 				name:            Str::new_static("native_block"),
@@ -190,6 +211,7 @@ impl BlockingTool {
 				description:     Str::new_static("waits until the environment cancels it"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
+				effects:         file_write_effects(),
 				projection_code: [0; 32],
 			},
 			started,
@@ -241,6 +263,7 @@ impl CooperativeInterruptTool {
 				description:     Str::new_static("reports cooperative interrupt truth"),
 				schema:          Bytes::from_static(br#"{"type":"object"}"#),
 				constraint:      Constraint::None,
+				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
 		}
@@ -354,10 +377,52 @@ OMP_TOOLS = [
 ]
 
 "#;
+fn test_provenance(key: &HostKey) -> Provenance {
+	Provenance::new(
+		Str::new_static("test-publisher"),
+		key.extension.clone(),
+		Str::new_static("1.0.0"),
+		ArtifactDigest::new([0; 32]),
+		key.layer.clone(),
+		key.tier.clone(),
+		1,
+	)
+}
+
+fn test_manifest(
+	key: &HostKey,
+	entry: &str,
+	tools: impl IntoIterator<Item = ToolDeclarationKey>,
+) -> ExtensionManifest {
+	ExtensionManifest::new(
+		test_provenance(key),
+		Str::from(entry),
+		[],
+		DeclarationSet::new(tools, []),
+		ServiceManifest::default(),
+		[],
+		[ActivationTrigger::FirstReach],
+	)
+}
+
+fn test_config() -> ExtHostConfig {
+	ExtHostConfig::new(
+		PathBuf::from(env!("CARGO_BIN_EXE_omp")),
+		Principal::new(Str::new_static("test"), Str::new_static("Test")),
+		Str::new_static("test-session"),
+		1,
+	)
+}
+
 fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig {
-	let mut config = ExtHostConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
-	let mut extension =
-		ExtHostSpec::new(HostKey::new("workspace", "trusted", module), Str::from(module));
+	let mut config = test_config();
+	let key = HostKey::new("workspace", "trusted", module);
+	let manifest = test_manifest(&key, module, [
+		ToolDeclarationKey::new("worker_block", "r", 1),
+		ToolDeclarationKey::new("worker_echo", "r", 1),
+		ToolDeclarationKey::new("worker_fail", "r", 1),
+	]);
+	let mut extension = ExtHostSpec::new(key, manifest);
 	extension.python_site = python_site;
 	config.extensions.push(extension);
 	config
@@ -373,11 +438,7 @@ struct Harness {
 
 impl Harness {
 	async fn start(registry: Registry) -> Self {
-		Self::start_with_worker(
-			registry,
-			ExtHostConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp"))),
-		)
-		.await
+		Self::start_with_worker(registry, test_config()).await
 	}
 
 	async fn start_with_worker(registry: Registry, worker: ExtHostConfig) -> Self {
@@ -454,7 +515,6 @@ async fn collect_exec(run: &mut omp_env::ExecRun) -> (Vec<u8>, omp_proto::env::v
 			ExecEvent::Started(_) => {},
 			ExecEvent::Output(frame) => output.extend_from_slice(&frame.data),
 			ExecEvent::Exit(exit) => return (output, exit.status.expect("terminal status")),
-			ExecEvent::StreamError(error) => panic!("exec stream error: {}", error.message),
 		}
 	}
 }
@@ -480,7 +540,11 @@ async fn invoke_builtin(
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation
-		.commit_args(Bytes::from(serde_json::to_vec(&args).expect("encode built-in args")))
+		.commit_args(
+			Bytes::from(serde_json::to_vec(&args).expect("encode built-in args")),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit built-in arguments");
 	loop {
@@ -493,7 +557,7 @@ async fn invoke_builtin(
 			InvocationEvent::Verdict(verdict) => return verdict,
 			InvocationEvent::Update(_) => {},
 			InvocationEvent::Accepted(_) => panic!("built-in invocation was accepted twice"),
-			InvocationEvent::StreamError(error) => panic!("built-in stream failed: {}", error.message),
+			InvocationEvent::Admission(_) => panic!("unexpected admission in built-in test"),
 		}
 	}
 }
@@ -551,13 +615,7 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 	registry
 		.register(EffectTool::named("write", marker), Presentation::Slot, test_claims())
 		.expect("register colliding caller write tool");
-	let result = EnvServer::open_local(
-		root.path(),
-		state.path(),
-		registry,
-		ExtHostConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_omp"))),
-	)
-	.await;
+	let result = EnvServer::open_local(root.path(), state.path(), registry, test_config()).await;
 	let Err(error) = result else {
 		panic!("production registry accepted a caller-owned write tool");
 	};
@@ -1449,10 +1507,14 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		Some(InvocationEvent::Accepted(_))
 	));
 	cancelled
-		.commit_args(Bytes::from(
-			serde_json::to_vec(&json!({"language":"py","code":code}))
-				.expect("encode cancellable eval arguments"),
-		))
+		.commit_args(
+			Bytes::from(
+				serde_json::to_vec(&json!({"language":"py","code":code}))
+					.expect("encode cancellable eval arguments"),
+			),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit cancellable eval arguments");
 	tokio::time::timeout(Duration::from_secs(2), async {
@@ -1747,7 +1809,11 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 	));
 	assert!(!effect.exists(), "effect marker appeared before ArgsCommitted");
 	committed
-		.commit_args(Bytes::from_static(br#"{"path":"committed"}"#))
+		.commit_args(
+			Bytes::from_static(br#"{"path":"committed"}"#),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit streamed arguments");
 	let terminal = committed
@@ -1785,11 +1851,19 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		Some(InvocationEvent::Update(_))
 	));
 	duplicate
-		.commit_args(Bytes::from_static(br#"{"path":"duplicate"}"#))
+		.commit_args(
+			Bytes::from_static(br#"{"path":"duplicate"}"#),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("first duplicate commit");
 	duplicate
-		.commit_args(Bytes::from_static(br#"{"path":"duplicate"}"#))
+		.commit_args(
+			Bytes::from_static(br#"{"path":"duplicate"}"#),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("send duplicate commit");
 	let error = duplicate
@@ -1849,7 +1923,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 		Some(InvocationEvent::Accepted(_))
 	));
 	blocked
-		.commit_args(Bytes::from_static(b"{}"))
+		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
 		.await
 		.expect("commit blocking native invocation");
 	assert!(matches!(
@@ -1896,7 +1970,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 		Some(InvocationEvent::Accepted(_))
 	));
 	next
-		.commit_args(Bytes::from_static(b"{}"))
+		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
 		.await
 		.expect("commit next native request");
 	assert!(matches!(
@@ -1928,7 +2002,7 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation
-		.commit_args(Bytes::from_static(b"{}"))
+		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
 		.await
 		.expect("commit cooperative invocation");
 	assert!(matches!(
@@ -1987,7 +2061,7 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation
-		.commit_args(Bytes::from_static(b"{}"))
+		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
 		.await
 		.expect("commit deadline native invocation");
 	assert!(matches!(
@@ -2018,7 +2092,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		.expect("write worker cancellation extension");
 	let mut worker = extension_worker("envd_cancel_tools", Some(site.path().to_owned()));
 	worker.health_timeout = Duration::from_secs(5);
-	worker.interrupt_grace = Duration::from_millis(150);
+	worker.interrupt_grace = omp_core::Duration::new(150, omp_core::DurationUnit::Milliseconds);
 	worker.initial_backoff = Duration::from_millis(10);
 	worker.max_backoff = Duration::from_millis(50);
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
@@ -2039,13 +2113,17 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		Some(InvocationEvent::Accepted(_))
 	));
 	blocked
-		.commit_args(Bytes::from(
-			serde_json::to_vec(&json!({
-				"started": started.to_string_lossy(),
-				"seconds": 30,
-			}))
-			.expect("serialize worker arguments"),
-		))
+		.commit_args(
+			Bytes::from(
+				serde_json::to_vec(&json!({
+					"started": started.to_string_lossy(),
+					"seconds": 30,
+				}))
+				.expect("serialize worker arguments"),
+			),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit blocking worker invocation");
 	tokio::time::timeout(Duration::from_secs(3), async {
@@ -2094,7 +2172,11 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		Some(InvocationEvent::Accepted(_))
 	));
 	next
-		.commit_args(Bytes::from_static(br#"{"message":"after cancellation"}"#))
+		.commit_args(
+			Bytes::from_static(br#"{"message":"after cancellation"}"#),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit next worker request");
 	let next_terminal = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2108,9 +2190,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 				InvocationEvent::Verdict(verdict) => break verdict,
 				InvocationEvent::Update(_) => {},
 				InvocationEvent::Accepted(_) => panic!("worker request was accepted twice"),
-				InvocationEvent::StreamError(error) => {
-					panic!("next worker stream failed: {}", error.message)
-				},
+				InvocationEvent::Admission(_) => panic!("unexpected admission in worker test"),
 			}
 		}
 	})
@@ -2142,7 +2222,11 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		Some(InvocationEvent::Accepted(_))
 	));
 	fault
-		.commit_args(Bytes::from_static(br#"{"code":409}"#))
+		.commit_args(
+			Bytes::from_static(br#"{"code":409}"#),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit worker fault request");
 	let fault_terminal = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2156,9 +2240,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 				InvocationEvent::Verdict(verdict) => break verdict,
 				InvocationEvent::Update(_) => {},
 				InvocationEvent::Accepted(_) => panic!("worker fault was accepted twice"),
-				InvocationEvent::StreamError(error) => {
-					panic!("worker fault stream failed: {}", error.message)
-				},
+				InvocationEvent::Admission(_) => panic!("unexpected admission in worker fault test"),
 			}
 		}
 	})
@@ -2182,7 +2264,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		.expect("write worker collision extension");
 	let mut worker = extension_worker("envd_cancel_tools", Some(site.path().to_owned()));
 	worker.health_timeout = Duration::from_secs(5);
-	worker.interrupt_grace = Duration::from_millis(100);
+	worker.interrupt_grace = omp_core::Duration::new(100, omp_core::DurationUnit::Milliseconds);
 	worker.initial_backoff = Duration::from_millis(10);
 	worker.max_backoff = Duration::from_millis(50);
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
@@ -2205,13 +2287,17 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation_a
-		.commit_args(Bytes::from(
-			serde_json::to_vec(&json!({
-				"started": started_a.to_string_lossy(),
-				"seconds": 30,
-			}))
-			.expect("serialize worker A arguments"),
-		))
+		.commit_args(
+			Bytes::from(
+				serde_json::to_vec(&json!({
+					"started": started_a.to_string_lossy(),
+					"seconds": 30,
+				}))
+				.expect("serialize worker A arguments"),
+			),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit worker A");
 	tokio::time::timeout(Duration::from_secs(3), async {
@@ -2236,13 +2322,17 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation_b
-		.commit_args(Bytes::from(
-			serde_json::to_vec(&json!({
-				"started": started_b.to_string_lossy(),
-				"seconds": 30,
-			}))
-			.expect("serialize worker B arguments"),
-		))
+		.commit_args(
+			Bytes::from(
+				serde_json::to_vec(&json!({
+					"started": started_b.to_string_lossy(),
+					"seconds": 30,
+				}))
+				.expect("serialize worker B arguments"),
+			),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit worker B");
 	invocation_b.guard().cancel();
@@ -2293,7 +2383,11 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		Some(InvocationEvent::Accepted(_))
 	));
 	next
-		.commit_args(Bytes::from_static(br#"{"message":"still isolated"}"#))
+		.commit_args(
+			Bytes::from_static(br#"{"message":"still isolated"}"#),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+		)
 		.await
 		.expect("commit follow-up worker");
 	assert!(matches!(
@@ -2311,10 +2405,10 @@ async fn cancelled_exec_preserves_session_cwd_and_kills_term_ignoring_tree() {
 	let harness = Harness::start(Registry::new()).await;
 	let client = harness.client();
 	let opened = client
-		.open_session(OpenSessionRequest {
-			cwd_uri: cwd_uri(harness.root.path()),
-			..Default::default()
-		})
+		.open_session(
+			&omp_core::EnvPath::new(cwd_uri(harness.root.path())).expect("typed cwd"),
+			OpenSessionRequest::default(),
+		)
 		.await
 		.expect("open session");
 	let child_pid = harness.root.path().join("child.pid");
@@ -2395,15 +2489,17 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 	assert_eq!(received, payload);
 
 	client
-		.start_process(StartProcess {
-			name: "contract-process".into(),
-			spec: Some(ProcessSpec {
-				source: Some(Script { text: "echo ready; sleep 30".into(), ..Default::default() }),
-				cwd_uri: cwd_uri(harness.root.path()),
+		.start_process(
+			&omp_core::EnvPath::new(cwd_uri(harness.root.path())).expect("typed cwd"),
+			StartProcess {
+				name: "contract-process".into(),
+				spec: Some(ProcessSpec {
+					source: Some(Script { text: "echo ready; sleep 30".into(), ..Default::default() }),
+					..Default::default()
+				}),
 				..Default::default()
-			}),
-			..Default::default()
-		})
+			},
+		)
 		.await
 		.expect("start named process");
 	let listed = client
@@ -2485,19 +2581,21 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 	let harness = Harness::start(Registry::new()).await;
 	let client = harness.client();
 	client
-		.start_process(StartProcess {
-			name: "attach-race".into(),
-			spec: Some(ProcessSpec {
-				source: Some(Script {
-					text: "i=0; while [ $i -lt 50 ]; do echo output; sleep 0.01; i=$((i + 1)); done"
-						.into(),
+		.start_process(
+			&omp_core::EnvPath::new(cwd_uri(harness.root.path())).expect("typed cwd"),
+			StartProcess {
+				name: "attach-race".into(),
+				spec: Some(ProcessSpec {
+					source: Some(Script {
+						text: "i=0; while [ $i -lt 50 ]; do echo output; sleep 0.01; i=$((i + 1)); done"
+							.into(),
+						..Default::default()
+					}),
 					..Default::default()
 				}),
-				cwd_uri: cwd_uri(harness.root.path()),
 				..Default::default()
-			}),
-			..Default::default()
-		})
+			},
+		)
 		.await
 		.expect("start racing named process");
 	let mut attachment = client

@@ -17,6 +17,12 @@ workspace = true
 
 [dependencies]
 pyo3 = { workspace = true }
+omp-core = { workspace = true }
+omp-env = { workspace = true }
+omp-tool = { workspace = true }
+omp-storage = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

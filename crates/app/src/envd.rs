@@ -4,12 +4,16 @@ pub mod blobs;
 pub mod docs;
 pub(crate) mod eval;
 pub mod exec;
+mod journal_runtime;
+pub mod policy;
 pub mod server;
 mod tool_document;
 mod tool_read_sources;
 mod tool_search;
 mod tool_shell;
 mod tools;
+#[cfg(windows)]
+pub mod windows;
 pub mod worker;
 pub mod workspace;
 use std::{io, path::Path, sync::Arc};
@@ -17,6 +21,7 @@ use std::{io, path::Path, sync::Arc};
 #[doc(hidden)]
 pub use eval::{EVAL_CHILD_ARG, ProcessError as EvalChildError, run_eval_child_entry};
 use miette::IntoDiagnostic as _;
+use omp_core::Str;
 use omp_env::EnvClient;
 use omp_proto::env::v1::{ClientHello, ServerHello};
 use omp_tool::Registry;
@@ -28,8 +33,20 @@ use self::{
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
 use crate::cli::EnvdArgs;
-
 /// Starts the project environment daemon and serves until process shutdown.
+#[cfg(unix)]
+pub async fn run(args: EnvdArgs) -> miette::Result<()> {
+	server::run(args).await.into_diagnostic()
+}
+
+/// Starts the Windows named-pipe project environment daemon.
+#[cfg(windows)]
+pub async fn run(args: EnvdArgs) -> miette::Result<()> {
+	windows::run(args).await.into_diagnostic()
+}
+
+/// Reports that no owner-local environment transport exists on this target.
+#[cfg(not(any(unix, windows)))]
 pub async fn run(args: EnvdArgs) -> miette::Result<()> {
 	server::run(args).await.into_diagnostic()
 }
@@ -65,12 +82,14 @@ impl Drop for ProjectLifecycle {
 
 impl ProjectEnvironment {
 	/// Connects an existing owner environment or starts one for this process.
+	#[cfg(unix)]
 	pub(crate) async fn connect_or_start(
 		root: &Path,
 		state_dir: &Path,
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
 		match EnvServer::connect_owner_uds(socket).await {
 			Ok((owner_probe, bridge)) => {
@@ -96,8 +115,15 @@ impl ProjectEnvironment {
 										io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
 									) =>
 								{
-									return Self::start(root, state_dir, socket, docserver_socket, py_eval)
-										.await;
+									return Self::start(
+										root,
+										state_dir,
+										socket,
+										docserver_socket,
+										py_eval,
+										interrupt_grace,
+									)
+									.await;
 								},
 								_ if tokio::time::Instant::now() >= deadline => break,
 								_ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
@@ -123,7 +149,7 @@ impl ProjectEnvironment {
 					},
 					Err(error) => return Err(error),
 				}
-				Self::connect_peer(root, state_dir, docserver_socket, py_eval).await
+				Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace).await
 			},
 			Err(EnvdError::Io(error))
 				if matches!(
@@ -134,18 +160,102 @@ impl ProjectEnvironment {
 				// No owner: autostart a detached project daemon so the shared
 				// authorities outlive this process, then join it as a peer.
 				match spawn_project_daemon(root, state_dir, socket, docserver_socket).await {
-					Ok(()) => Self::connect_peer(root, state_dir, docserver_socket, py_eval).await,
+					Ok(()) => {
+						Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace)
+							.await
+					},
 					Err(error) => {
 						tracing::warn!(
 							socket = %socket.display(),
 							%error,
 							"could not autostart the project daemon; running an embedded environment"
 						);
-						Self::start(root, state_dir, socket, docserver_socket, py_eval).await
+						Self::start(root, state_dir, socket, docserver_socket, py_eval, interrupt_grace)
+							.await
 					},
 				}
 			},
 			Err(error) => Err(error),
+		}
+	}
+
+	/// Connects to or starts the owner-scoped Windows project environment.
+	#[cfg(windows)]
+	pub(crate) async fn connect_or_start(
+		root: &Path,
+		state_dir: &Path,
+		socket: &Path,
+		docserver_socket: &Path,
+		py_eval: bool,
+		interrupt_grace: omp_core::Duration,
+	) -> Result<Self, EnvdError> {
+		match omp_env::windows::connect_owner_pipe(socket) {
+			Ok((owner_probe, bridge)) => {
+				match hello(&owner_probe).await {
+					Ok(owner_hello)
+						if crate::build_id::is_stale(
+							crate::build_id::current(),
+							&owner_hello.server_build,
+						) =>
+					{
+						let _ = owner_probe.retire().await;
+						bridge.abort();
+						let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+						loop {
+							match omp_env::windows::open_owner_pipe(socket) {
+								Err(error) if error.kind() == io::ErrorKind::NotFound => {
+									return Self::start(
+										root,
+										state_dir,
+										socket,
+										docserver_socket,
+										py_eval,
+										interrupt_grace,
+									)
+									.await;
+								},
+								_ if tokio::time::Instant::now() >= deadline => break,
+								_ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+							}
+						}
+					},
+					Ok(_) => bridge.abort(),
+					Err(omp_env::ClientError::Protocol(error)) => {
+						bridge.abort();
+						tracing::warn!(
+							socket = %socket.display(),
+							code = error.code,
+							message = %error.message,
+							"environment owner rejected the handshake; joining document authority"
+						);
+					},
+					Err(error) => return Err(EnvdError::Client(error)),
+				}
+				Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace).await
+			},
+			Err(error)
+				if matches!(
+					error.kind(),
+					io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+				) =>
+			{
+				match spawn_project_daemon(root, state_dir, socket, docserver_socket).await {
+					Ok(()) => {
+						Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace)
+							.await
+					},
+					Err(error) => {
+						tracing::warn!(
+							socket = %socket.display(),
+							%error,
+							"could not autostart the project daemon; running an embedded environment"
+						);
+						Self::start(root, state_dir, socket, docserver_socket, py_eval, interrupt_grace)
+							.await
+					},
+				}
+			},
+			Err(error) => Err(error.into()),
 		}
 	}
 
@@ -159,8 +269,9 @@ impl ProjectEnvironment {
 		state_dir: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
-		let (worker_config, data_bindings) = worker_config(state_dir, py_eval)?;
+		let (worker_config, data_bindings) = worker_config(state_dir, py_eval, interrupt_grace)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -187,14 +298,16 @@ impl ProjectEnvironment {
 		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
 	}
 
+	#[cfg(unix)]
 	async fn start(
 		root: &Path,
 		state_dir: &Path,
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
-		let (worker_config, data_bindings) = worker_config(state_dir, py_eval)?;
+		let (worker_config, data_bindings) = worker_config(state_dir, py_eval, interrupt_grace)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -235,6 +348,52 @@ impl ProjectEnvironment {
 		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
 	}
 
+	#[cfg(windows)]
+	async fn start(
+		root: &Path,
+		state_dir: &Path,
+		socket: &Path,
+		docserver_socket: &Path,
+		py_eval: bool,
+		interrupt_grace: omp_core::Duration,
+	) -> Result<Self, EnvdError> {
+		let owner_listener = windows::OwnerPipeListener::bind(socket)?;
+		let (worker_config, data_bindings) = worker_config(state_dir, py_eval, interrupt_grace)?;
+		let server = EnvServer::open_project(
+			root,
+			state_dir,
+			docserver_socket,
+			Registry::new(),
+			worker_config,
+			None,
+		)
+		.await?;
+		let server = Arc::new(server);
+		let registry = server.registry();
+		let eval_bridge = server.eval_bridge();
+		let eval_control = server.eval_control();
+		let (client, transport) = EnvClient::in_process(64);
+		let in_process_server = Arc::clone(&server);
+		let in_process = tokio::spawn(async move {
+			in_process_server.serve_in_process(transport).await;
+		});
+		let shutdown = CancellationToken::new();
+		let owner_server = Arc::clone(&server);
+		let owner_shutdown = shutdown.clone();
+		let owner = tokio::spawn(async move {
+			if let Err(error) =
+				windows::serve_owner_pipe(owner_server, owner_listener, owner_shutdown, None).await
+			{
+				tracing::warn!(%error, "environment owner pipe stopped");
+			}
+		});
+		let mut tasks = vec![in_process, owner];
+		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, _server: server };
+		hello(&client).await?;
+		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
+	}
+
 	#[must_use]
 	pub(crate) const fn client(&self) -> &EnvClient {
 		&self.client
@@ -254,23 +413,112 @@ impl ProjectEnvironment {
 	pub(crate) fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
 		self.eval_control.clone()
 	}
+
+	/// Returns the Environment-owned authoritative sessions index.
+	#[must_use]
+	pub(crate) fn sessions_index(&self) -> Arc<omp_storage::index::SessionIndex> {
+		self._lifecycle._server.sessions_index()
+	}
+
+	/// Binds authenticated extension CONTROL to the active Agent Journal.
+	///
+	/// # Errors
+	///
+	/// Fails if a journal runtime was already bound or child activation already
+	/// began.
+	pub(crate) fn bind_agent_control(
+		&self,
+		sender: omp_agent::control::ControlSender,
+	) -> Result<(), EnvdError> {
+		self._lifecycle._server.bind_agent_control(sender)
+	}
 }
 
 fn worker_config(
 	state_dir: &Path,
 	py_eval: bool,
+	interrupt_grace: omp_core::Duration,
 ) -> Result<(ExtHostConfig, Vec<ExtensionDataBinding>), EnvdError> {
-	let mut config = ExtHostConfig::current()?;
+	let (authority, session_id, session_generation) = authenticated_runtime_identity()?;
+	let mut config = ExtHostConfig::current(
+		authority.principal().clone(),
+		session_id.clone(),
+		session_generation,
+	)?;
+	config.interrupt_grace = interrupt_grace;
 	let mut bindings = Vec::new();
 	if py_eval {
 		let key = HostKey::new("workspace", "trusted", PY_EVAL_MODULE);
-		let binding = ExtensionDataBinding::built_in(state_dir, key.clone());
-		let mut extension = ExtHostSpec::new(key, PY_EVAL_MODULE);
-		extension.data_socket = Some(binding.path().to_path_buf());
+		let binding = ExtensionDataBinding::built_in(
+			state_dir,
+			key.clone(),
+			session_id.as_str(),
+			session_generation,
+		);
+		let mut digest = blake3::Hasher::new();
+		digest.update(crate::build_id::current().as_bytes());
+		digest.update(env!("CARGO_PKG_VERSION").as_bytes());
+		digest.update(PY_EVAL_MODULE.as_bytes());
+		let provenance = omp_core::Provenance::new(
+			Str::new_static("omp-first-party"),
+			Str::new_static(PY_EVAL_MODULE),
+			Str::new_static(env!("CARGO_PKG_VERSION")),
+			omp_core::ArtifactDigest::new(*digest.finalize().as_bytes()),
+			Str::new_static("workspace"),
+			Str::new_static("trusted"),
+			1,
+		);
+		let manifest = crate::exthost::ExtensionManifest::py_eval(provenance, []);
+		let mut extension = ExtHostSpec::new(key, manifest);
+		extension.data_grants = binding.grants().clone();
+		extension.data_socket = Some(extension_data_endpoint(&binding));
 		config.extensions.push(extension);
 		bindings.push(binding);
 	}
 	Ok((config, bindings))
+}
+
+/// Derives the authenticated OS principal and a fresh project-runtime fence.
+///
+/// The generation is the runtime's creation timestamp, not a placeholder
+/// ordinal, and the ULID distinguishes simultaneous runtimes.
+pub(crate) fn authenticated_runtime_identity()
+-> Result<(crate::exthost::PrincipalAuthority, Str, u64), EnvdError> {
+	let user = authenticated_os_user()?;
+	let principal = omp_core::Principal::new(Str::from(format!("os:{user}")), user);
+	let authority = crate::exthost::PrincipalAuthority::new(principal);
+	let session_id = Str::from(ulid::Ulid::generate().to_string());
+	let session_generation = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_err(io::Error::other)?
+		.as_millis()
+		.try_into()
+		.map_err(io::Error::other)?;
+	Ok((authority, session_id, session_generation))
+}
+
+#[cfg(unix)]
+fn authenticated_os_user() -> Result<Str, EnvdError> {
+	let uid = nix::unistd::geteuid();
+	let user = nix::unistd::User::from_uid(uid)
+		.map_err(io::Error::from)?
+		.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "current OS user has no account"))?;
+	Ok(Str::from(user.name))
+}
+
+#[cfg(windows)]
+fn authenticated_os_user() -> Result<Str, EnvdError> {
+	Ok(omp_env::windows::current_user_name()?)
+}
+
+#[cfg(not(windows))]
+fn extension_data_endpoint(binding: &ExtensionDataBinding) -> std::path::PathBuf {
+	binding.path().to_path_buf()
+}
+
+#[cfg(windows)]
+fn extension_data_endpoint(binding: &ExtensionDataBinding) -> std::path::PathBuf {
+	windows::extension_pipe_endpoint(binding)
 }
 
 #[cfg(unix)]
@@ -291,7 +539,25 @@ fn spawn_extension_data_servers(
 	}
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn spawn_extension_data_servers(
+	server: &Arc<EnvServer>,
+	bindings: Vec<ExtensionDataBinding>,
+	shutdown: &CancellationToken,
+	tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+	for binding in bindings {
+		let server = Arc::clone(server);
+		let shutdown = shutdown.clone();
+		tasks.push(tokio::spawn(async move {
+			if let Err(error) = windows::serve_extension_pipe(server, binding, shutdown).await {
+				tracing::warn!(%error, "extension DATA pipe stopped");
+			}
+		}));
+	}
+}
+
+#[cfg(not(any(unix, windows)))]
 fn spawn_extension_data_servers(
 	_server: &Arc<EnvServer>,
 	_bindings: Vec<ExtensionDataBinding>,
@@ -366,6 +632,7 @@ async fn spawn_project_daemon_with(
 		.stdout(log)
 		.stderr(errors)
 		.kill_on_drop(false);
+	#[cfg(unix)]
 	{
 		use std::os::unix::process::CommandExt as _;
 		command.as_std_mut().process_group(0);
@@ -378,16 +645,12 @@ async fn spawn_project_daemon_with(
 				io::Error::other(format!("project daemon exited during startup: {status}")).into(),
 			);
 		}
-		if let Ok((probe, bridge)) = EnvServer::connect_owner_uds(socket).await {
-			let ready = hello(&probe).await;
-			bridge.abort();
-			if ready.is_ok() {
-				// Reap in the background; the daemon's lifetime is its own.
-				tokio::spawn(async move {
-					let _ = child.wait().await;
-				});
-				return Ok(());
-			}
+		if owner_endpoint_ready(socket).await {
+			// Reap in the background; the daemon's lifetime is its own.
+			tokio::spawn(async move {
+				let _ = child.wait().await;
+			});
+			return Ok(());
 		}
 		if tokio::time::Instant::now() >= deadline {
 			let _ = child.start_kill();
@@ -402,7 +665,27 @@ async fn spawn_project_daemon_with(
 	}
 }
 
-#[cfg(test)]
+#[cfg(unix)]
+async fn owner_endpoint_ready(socket: &Path) -> bool {
+	let Ok((probe, bridge)) = EnvServer::connect_owner_uds(socket).await else {
+		return false;
+	};
+	let ready = hello(&probe).await.is_ok();
+	bridge.abort();
+	ready
+}
+
+#[cfg(windows)]
+async fn owner_endpoint_ready(socket: &Path) -> bool {
+	let Ok((probe, bridge)) = omp_env::windows::connect_owner_pipe(socket) else {
+		return false;
+	};
+	let ready = hello(&probe).await.is_ok();
+	bridge.abort();
+	ready
+}
+
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
 

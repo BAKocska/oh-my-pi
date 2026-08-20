@@ -9,8 +9,8 @@ use omp_proto::{
 	thread::v1::ToolCall,
 };
 use omp_tool::{
-	CallOutcome, CapsBase, Claims, Constraint, Ev, IncomingParams, ModelClass, Part, Precedence,
-	Presentation, PromptCaps, Registry, Rev, Tool, ToolSpec,
+	CallOutcome, CapsBase, Claims, Constraint, Effects, Ev, IncomingParams, ModelClass, Part,
+	Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,7 @@ impl ScriptTool {
 					br#"{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}"#,
 				),
 				constraint: Constraint::None,
+				effects: Effects::empty(),
 				projection_code: [0; 32],
 			},
 			project_inputs,

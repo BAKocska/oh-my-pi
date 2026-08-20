@@ -7,19 +7,22 @@ use std::{
 	path::PathBuf,
 };
 
-use omp_core::Str;
+use bytes::Bytes;
+use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::{
 	blob::BlobRef,
 	transcript::{
-		AmendPatch, Attribution, Block, BlockKind, CallId, CtxSnapshot, DialectId, Entry, Error,
-		Event, FeatureId, Header, ItemRecord, Kind, LiveSet, ModelChange, ModelId, ModelRef, Msg,
-		Patch, Pin, PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, ProviderId, Reader,
-		RefreshState, Replay, RequestError, SessionId, Stop, ThinkingSel, Timing, TitleSource,
+		AmendPatch, Attribution, Block, BlockKind, CallId, CtxSnapshot, Custom, DialectId, Entry,
+		EntryUndecodable, Error, Event, FeatureId, Header, InvocationTransition, ItemRecord, Kind,
+		LiveSet, ModelChange, ModelId, ModelRef, Msg, Patch, Pin, PromptRewriteCommit,
+		PromptRewriteIntent, PromptRewriteStage, ProviderId, Reader, RefreshState, Replay,
+		RequestAudit, RequestError, SessionId, Stop, ThinkingSel, Timing, TitleSource,
 		ToolBatchAuthorized, TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt,
 		TurnStart, Usage, UserBlock, Writer, load, read_line, write_header, write_line,
 	},
 };
+use omp_tool::{CallOutcome, CallOutcomeDetails};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tempfile::tempdir;
@@ -34,6 +37,36 @@ fn raw(value: &str) -> Box<RawValue> {
 
 const fn blob(byte: u8, size: u64) -> BlobRef {
 	BlobRef { hash: [byte; 32], size }
+}
+
+fn principal() -> Principal {
+	Principal::new(text("os:test"), text("Test User"))
+}
+
+fn provenance() -> Provenance {
+	Provenance::new(
+		text("publisher-key"),
+		text("com.example.test"),
+		text("1.2.3"),
+		ArtifactDigest::new([0x42; 32]),
+		text("workspace"),
+		text("sandboxed"),
+		7,
+	)
+}
+
+fn custom(kind: &str, data: Option<Box<RawValue>>, display: bool) -> Custom {
+	Custom::new(
+		text(kind),
+		Some(text("schema.2")),
+		Some(text("worker")),
+		principal(),
+		provenance(),
+		data,
+		None,
+		display,
+	)
+	.expect("custom data is valid")
 }
 
 fn model() -> ModelRef {
@@ -169,12 +202,19 @@ fn every_kind() -> Vec<Event> {
 		Event { ts: 16, kind: Kind::Label { target: 2, label: Some(text("good")) } },
 		Event {
 			ts:   17,
-			kind: Kind::Custom {
-				kind:    text("extension"),
-				data:    Some(raw(r#"{ "z" : [3,2,1], "a":"x&y" }"#)),
-				context: Some(vec![UserBlock::Image { blob: blob(3, 32) }]),
-				display: true,
-			},
+			kind: Kind::Custom(
+				Custom::new(
+					text("extension"),
+					Some(text("schema.2")),
+					Some(text("worker")),
+					principal(),
+					provenance(),
+					Some(raw(r#"{ "z" : [3,2,1], "a":"x&y" }"#)),
+					Some(vec![UserBlock::Image { blob: blob(3, 32) }]),
+					true,
+				)
+				.expect("custom data"),
+			),
 		},
 		Event {
 			ts:   18,
@@ -273,8 +313,43 @@ fn every_kind() -> Vec<Event> {
 			}),
 		},
 		Event {
-			ts:   22,
-			kind: Kind::Unknown(raw(r#"{ "foreign" : true, "ts" : 22, "k":"else" }"#)),
+			ts:   24,
+			kind: Kind::RequestAudit(RequestAudit {
+				request_id:         text("attempt-1"),
+				idempotency_key:    text("logical-1"),
+				extension_id:       text("com.example.test"),
+				host_generation:    7,
+				session_generation: 3,
+				operation:          text("append_atomic"),
+				indexes:            vec![16, 17].into(),
+			}),
+		},
+		Event {
+			ts:   25,
+			kind: Kind::InvocationTransition(InvocationTransition {
+				invocation_id:        text("invocation-1"),
+				call_id:              CallId(text("call-1")),
+				phase:                InvocationPhase::ArgsFinalized,
+				requested_args:       Some(raw(r#"{"path":"src"}"#)),
+				transformations:      None,
+				effective_args:       None,
+				admission_receipt:    None,
+				assistant_item_event: None,
+				effect_token:         None,
+				effects:              None,
+				authorized_at:        None,
+				outcome:              None,
+			}),
+		},
+		Event {
+			ts:   26,
+			kind: Kind::EntryUndecodable(EntryUndecodable {
+				kind:   Some(text("alien")),
+				rev:    None,
+				value:  None,
+				raw:    raw(r#"{"ts":26,"k":"alien","foreign":true}"#),
+				reason: text("unknown event kind `alien`"),
+			}),
 		},
 	]
 }
@@ -289,23 +364,122 @@ fn unknown_line_is_byte_verbatim() {
 }
 
 #[test]
-fn embedded_raw_value_is_spliced_verbatim() {
-	let raw_data = r#"{ "z" : [3, 2], "a" : "x&y" }"#;
+fn unknown_record_is_typed_and_addressable() {
+	let source = br#"{"ts":77,"k":"future_machine_record","rev":"future.9","payload":1}"#;
+	let event = read_line(source).expect("valid unknown JSON is retained");
+	let Kind::EntryUndecodable(entry) = &event.kind else {
+		panic!("unknown record must remain typed");
+	};
+	assert_eq!(entry.kind.as_ref().map(Str::as_str), Some("future_machine_record"));
+	assert_eq!(entry.rev.as_ref().map(Str::as_str), Some("future.9"));
+	assert!(entry.value.is_none());
+	assert_eq!(entry.raw.get().as_bytes(), source);
+}
+
+#[test]
+fn corrupt_known_record_preserves_exact_bytes() {
+	let source = br#"{"ts":8,"k":"custom","kind":"memo","rev":"m.1","data":{"x":1}}"#;
+	let event = read_line(source).expect("corrupt machine record remains addressable");
+	assert!(matches!(&event.kind, Kind::EntryUndecodable(entry) if entry.value.is_none()));
+	let mut rewritten = Vec::new();
+	write_line(&event, &mut rewritten).expect("corrupt record rewrites");
+	assert_eq!(rewritten, source);
+}
+
+#[test]
+fn noncanonical_machine_record_is_not_charitably_repaired() {
+	let source = br#"{ "ts":8,"k":"reset"}"#;
+	let event = read_line(source).expect("noncanonical JSON remains addressable");
+	let Kind::EntryUndecodable(entry) = &event.kind else {
+		panic!("noncanonical machine truth must not decode");
+	};
+	assert!(entry.value.is_none());
+	assert_eq!(entry.raw.get().as_bytes(), source);
+}
+
+#[test]
+fn invocation_transition_rejects_facts_from_another_phase() {
+	let source = br#"{"ts":9,"k":"invocation_transition","invocation_id":"inv-1","call_id":"call-1","phase":"ARGS_FINALIZED","requested_args":{"x":1},"transformations":null,"effective_args":null,"admission_receipt":null,"assistant_item_event":null,"effect_token":"forged","authorized_at":null,"outcome":null}"#;
+	let event = read_line(source).expect("invalid transition is preserved");
+	let Kind::EntryUndecodable(entry) = &event.kind else {
+		panic!("phase-inconsistent transition must not decode");
+	};
+	assert!(entry.value.is_none());
+	assert_eq!(entry.raw.get().as_bytes(), source);
+}
+
+#[test]
+fn every_invocation_phase_accepts_only_its_fixed_facts() {
+	for phase in InvocationPhase::ALL {
+		let mut transition = InvocationTransition {
+			invocation_id: text("inv-1"),
+			call_id: CallId(text("call-1")),
+			phase,
+			requested_args: None,
+			transformations: None,
+			effective_args: None,
+			admission_receipt: None,
+			assistant_item_event: None,
+			effect_token: None,
+			effects: None,
+			authorized_at: None,
+			outcome: None,
+		};
+		match phase {
+			InvocationPhase::Open | InvocationPhase::Admission => {},
+			InvocationPhase::ArgsFinalized => {
+				transition.requested_args = Some(raw(r#"{"path":"src"}"#));
+			},
+			InvocationPhase::Admitted => {
+				transition.transformations = Some(Default::default());
+				transition.effective_args = Some(raw(r#"{"path":"src"}"#));
+				transition.admission_receipt = Some(raw(r#"{"decision":"allow"}"#));
+			},
+			InvocationPhase::AssistantItemCommitted => {
+				transition.assistant_item_event = Some(42);
+			},
+			InvocationPhase::EffectsAuthorized => {
+				transition.effect_token = Some(text("scoped-token"));
+				transition.effects = Some(omp_tool::Effects::empty());
+				transition.authorized_at = Some(1_700_000_000_000);
+			},
+			InvocationPhase::Settled => {
+				transition.outcome = Some(CallOutcome::Ok(CallOutcomeDetails::Inline {
+					json: Bytes::from_static(br#"{"ok":true}"#),
+				}));
+			},
+		}
+		transition.validate().expect("phase facts are valid");
+		let event = Event { ts: 9, kind: Kind::InvocationTransition(transition) };
+		let mut encoded = Vec::new();
+		write_line(&event, &mut encoded).expect("transition writes");
+		assert_eq!(read_line(&encoded).expect("transition reads"), event);
+	}
+}
+
+#[test]
+fn custom_revision_uses_tool_attribution_key() {
+	let entry = custom("memo", None, false);
+	assert_eq!(entry.rev_attribution(), Some((omp_tool::TOOL_REV_PROP, "schema.2")));
+}
+
+#[test]
+fn custom_payload_does_not_determine_kind_size() {
+	assert!(std::mem::size_of::<Custom>() < std::mem::size_of::<TurnStart>());
+}
+
+#[test]
+fn custom_data_is_canonical_and_stable() {
 	let event = Event {
 		ts:   4,
-		kind: Kind::Custom {
-			kind:    text("raw"),
-			data:    Some(raw(raw_data)),
-			context: None,
-			display: false,
-		},
+		kind: Kind::Custom(custom("raw", Some(raw(r#"{ "z" : [3, 2], "a" : "x&y" }"#)), false)),
 	};
 	let mut first = Vec::new();
 	write_line(&event, &mut first).expect("custom event writes");
 	assert!(
 		std::str::from_utf8(&first)
 			.expect("JSON is UTF-8")
-			.contains(raw_data)
+			.contains(r#"{"z":[3,2],"a":"x&y"}"#)
 	);
 	let decoded = read_line(&first).expect("custom event reads");
 	let mut second = Vec::new();
@@ -336,7 +510,13 @@ fn header_is_single_and_torn_tail_is_truncated() {
 	write_header(&header(), &mut duplicate).expect("duplicate header encodes");
 	let duplicate = Event {
 		ts:   0,
-		kind: Kind::Unknown(raw(std::str::from_utf8(&duplicate).expect("header is UTF-8"))),
+		kind: Kind::EntryUndecodable(EntryUndecodable {
+			kind:   None,
+			rev:    None,
+			value:  None,
+			raw:    raw(std::str::from_utf8(&duplicate).expect("header is UTF-8")),
+			reason: text("header in event position"),
+		}),
 	};
 	assert!(matches!(writer.append(&duplicate), Err(Error::DuplicateHeader)));
 	assert_eq!(writer.append(&title(1, "first")).expect("first event"), 0);
@@ -723,10 +903,7 @@ fn reader_rejects_replacement_without_discarding_prior_state() {
 fn custom_iterator_filters_live_events_without_collection() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("session.jsonl");
-	let custom = |ts, kind: &str| Event {
-		ts,
-		kind: Kind::Custom { kind: text(kind), data: None, context: None, display: false },
-	};
+	let custom = |ts, kind: &str| Event { ts, kind: Kind::Custom(custom(kind, None, false)) };
 	let mut writer = Writer::create(&path, &header()).expect("new transcript");
 	writer.append(&custom(1, "wanted")).expect("wanted event");
 	writer.append(&custom(2, "other")).expect("other event");

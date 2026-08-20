@@ -12,8 +12,9 @@ use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::Str;
 use omp_hashline::format_hashline_header;
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Ev, IncomingParams,
-	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
+	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	read::{
 		ReadBlobs,
+		resolver::Scheme,
 		selector::{
-			LineRange, ParsedSelector, UriTarget, classify_uri_target, line_is_in_ranges,
-			parse_selector, split_path_and_selector, split_semicolon_targets,
+			LineRange, ParsedSelector, line_is_in_ranges, parse_selector, parse_uri,
+			split_path_and_selector, split_semicolon_targets,
 		},
 	},
 	render::{
@@ -388,6 +390,15 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W,
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
 			},
+			effects:         Effects {
+				documents: Some(DocEffects {
+					read:        true,
+					write_globs: smallvec::SmallVec::new(),
+				}),
+				exec:      None,
+				inference: None,
+				subagents: 0,
+			},
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
@@ -548,18 +559,20 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 			)),
 		});
 	}
-	let kind = match classify_uri_target(clean) {
-		UriTarget::Http { .. } => SearchRootKind::Url,
-		UriTarget::Unsupported { scheme } => {
+	let kind = match parse_uri(clean).map_err(|error| Fault::InvalidSelector {
+		message: Str::from(format!("path entry \"{original}\" has an invalid URL — {error}")),
+	})? {
+		Some(uri) if uri.scheme == Scheme::Http => SearchRootKind::Url,
+		Some(uri) => {
 			return Err(Fault::UnsupportedTarget {
 				message: Str::from(format!(
 					"{}:// targets are not supported yet",
-					scheme.to_ascii_lowercase()
+					uri.raw_scheme.to_ascii_lowercase()
 				)),
 			});
 		},
-		UriTarget::LocalOrOther if looks_like_archive_member(clean) => SearchRootKind::Archive,
-		UriTarget::LocalOrOther => SearchRootKind::Filesystem,
+		None if looks_like_archive_member(clean) => SearchRootKind::Archive,
+		None => SearchRootKind::Filesystem,
 	};
 	Ok(SearchRoot { original: Str::from(original.as_str()), path: Str::from(clean), kind, ranges })
 }

@@ -44,8 +44,8 @@ use omp_llm_inference::{
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread};
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
-	CapsBase, Claims, Constraint, Ev, IncomingParams, ModelClass, Part, Precedence, Presentation,
-	PromptCaps, Rev, Tool, ToolSpec,
+	CapsBase, Claims, Constraint, Effects, Ev, IncomingParams, ModelClass, Part, Precedence,
+	Presentation, PromptCaps, Rev, Tool, ToolSpec,
 };
 use parking_lot::Mutex;
 use ulid::Ulid;
@@ -187,6 +187,7 @@ fn tool_registry(revision: u16) -> Arc<omp_tool::Registry> {
 					description:     format!("prefix probe revision {revision}").into(),
 					schema:          tool_schema(revision),
 					constraint:      Constraint::None,
+					effects:         Effects::empty(),
 					projection_code: [0; 32],
 				},
 			},

@@ -12,9 +12,9 @@ use futures::{FutureExt, Stream, future::Either, pin_mut};
 use omp_core::{CowBytes, Str};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, ArtifactLifetime, BlobRef, CommitError, Constraint, Ev,
-	ExpectedArtifact, IncomingParams, InterruptWaitError, JobOwner, JobRef, ParamError, Part,
-	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, ArtifactLifetime, BlobRef, CommitError, Constraint, Effects, Ev,
+	ExecEffects, ExpectedArtifact, IncomingParams, InterruptWaitError, JobOwner, JobRef, ParamError,
+	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use parking_lot::Mutex;
 use schemars::JsonSchema;
@@ -339,6 +339,15 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 			constraint:      Constraint::Schema {
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				documents: None,
+				exec:      Some(ExecEffects {
+					commands: smallvec::smallvec![Str::new_static("*")],
+					network:  true,
+				}),
+				inference: None,
+				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),

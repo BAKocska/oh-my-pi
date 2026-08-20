@@ -9,9 +9,13 @@ use std::{
 };
 
 use bytes::Bytes;
-use frame::{client_frame, server_frame};
-use omp_core::Str;
-use omp_env::{EnvClient, InvocationEvent, frame};
+use frame::{client_frame, data_event, data_request, document_op, document_result, server_frame};
+use omp_core::{EnvPath, Str};
+use omp_env::{
+	ClientError, DataScope, EnvClient, InvocationEvent, LspStreamEvent, SearchEvent,
+	TransactionOutcome, WalkEvent, frame,
+};
+use omp_proto::document::v1::{self as document, commit_transaction_response};
 
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
 const QUIET_PERIOD: Duration = Duration::from_millis(100);
@@ -84,6 +88,20 @@ fn expect_scoped_cancel(frame: frame::ClientFrame, target_request_id: u64) {
 		)),
 		body => panic!("expected scoped CancelRequest, got {body:?}"),
 	}
+}
+
+fn data_scope() -> DataScope {
+	DataScope::new("invocation-data", Bytes::from_static(b"effect-token"), 7, 11)
+}
+
+fn data_response(result: document_result::Result) -> server_frame::Body {
+	server_frame::Body::Data(frame::DataResponse {
+		body: Some(frame::data_response::Body::Document(frame::DocumentResult {
+			result: Some(result),
+			..frame::DocumentResult::default()
+		})),
+		..frame::DataResponse::default()
+	})
 }
 
 #[test]
@@ -190,8 +208,13 @@ fn invocation_frames_preserve_commit_and_event_order() {
 
 	block_on(invocation.arg_text(Str::from("{\"path\":"))).expect("first argument fragment");
 	block_on(invocation.arg_text(Str::from("\"a\"}"))).expect("second argument fragment");
-	block_on(invocation.commit_args(Bytes::from_static(b"{\"path\":\"a\"}")))
-		.expect("argument commitment");
+	block_on(invocation.commit_args(
+		Bytes::from_static(b"{\"path\":\"a\"}"),
+		Bytes::from_static(b"effect-token"),
+		123,
+		None,
+	))
+	.expect("argument commitment");
 	block_on(invocation.interrupt(Str::from("please stop"))).expect("interrupt");
 
 	let frames = [receive(&requests), receive(&requests), receive(&requests), receive(&requests)];
@@ -309,8 +332,9 @@ fn command_guard_cancels_only_its_request_and_does_not_own_the_session() {
 		);
 		(requests, responses)
 	});
+	let cwd = EnvPath::new("file:///workspace").expect("typed env path");
 	let opened =
-		block_on(client.open_session(frame::OpenSessionRequest::default())).expect("session");
+		block_on(client.open_session(&cwd, frame::OpenSessionRequest::default())).expect("session");
 	assert_eq!(opened.session, session);
 	let (requests, responses) = server.join().expect("server thread");
 
@@ -364,4 +388,404 @@ fn command_guard_cancels_only_its_request_and_does_not_own_the_session() {
 	.expect("close session after command cancellation");
 	assert_eq!(closed.session, session);
 	server.join().expect("server thread");
+}
+
+#[test]
+fn admission_and_authorization_frames_carry_typed_phase_data() {
+	let (client, transport) = EnvClient::in_process(0);
+	let (requests, responses) = transport.into_parts();
+	let mut invocation = block_on(client.invoke(invoke_request("phase"))).expect("invocation");
+	let request_id = expect_invoke(receive(&requests), "phase");
+
+	respond(
+		&responses,
+		request_id,
+		server_frame::Body::AdmitInvocation(frame::AdmitInvocation {
+			invocation_id: "phase".into(),
+			..frame::AdmitInvocation::default()
+		}),
+	);
+	assert!(matches!(
+		block_on(invocation.next_event()).expect("admission event"),
+		Some(InvocationEvent::Admission(admission)) if admission.invocation_id == "phase"
+	));
+	block_on(invocation.admit(frame::Admission {
+		invocation_id: "forged".into(),
+		allow: true,
+		..frame::Admission::default()
+	}))
+	.expect("admission reply");
+	let admission = receive(&requests);
+	assert_eq!(admission.request_id, request_id);
+	assert!(matches!(
+		admission.body,
+		Some(client_frame::Body::Admission(reply)) if reply.invocation_id == "phase" && reply.allow
+	));
+
+	block_on(invocation.commit_args(
+		Bytes::from_static(b"{}"),
+		Bytes::from_static(b"phase-token"),
+		456,
+		None,
+	))
+	.expect("authorization frame");
+	let authorized = receive(&requests);
+	assert_eq!(authorized.request_id, request_id);
+	assert!(matches!(
+		authorized.body,
+		Some(client_frame::Body::ArgsCommitted(commit))
+			if commit.effect_token == Bytes::from_static(b"phase-token")
+				&& commit.authorized_at_ms == 456
+	));
+}
+
+#[test]
+fn scoped_walk_and_search_interleave_and_fuse_after_completion() {
+	let (client, transport) = EnvClient::in_process(0);
+	let worker = client.worker_scope(data_scope());
+	let (requests, responses) = transport.into_parts();
+	let root = EnvPath::new("file:///workspace").expect("typed root");
+
+	let mut walk = block_on(worker.walk(&root, frame::WalkRequest::default())).expect("walk stream");
+	let walk_request = receive(&requests);
+	let walk_id = walk_request.request_id;
+	assert!(matches!(
+		walk_request.scope,
+		Some(scope)
+			if scope.invocation_id == "invocation-data"
+				&& scope.effect_token == Bytes::from_static(b"effect-token")
+				&& scope.host_generation == 7
+				&& scope.session_generation == 11
+	));
+	assert!(matches!(
+		walk_request.body,
+		Some(client_frame::Body::Data(frame::DataRequest {
+			body: Some(data_request::Body::Walk(frame::WalkRequest { root_uri, .. })),
+			..
+		})) if root_uri == "file:///workspace"
+	));
+
+	let mut search =
+		block_on(worker.search(&root, frame::SearchRequest::default())).expect("search stream");
+	let search_request = receive(&requests);
+	let search_id = search_request.request_id;
+	assert_ne!(walk_id, search_id);
+
+	respond(
+		&responses,
+		search_id,
+		server_frame::Body::DataEvent(frame::DataEvent {
+			body: Some(data_event::Body::SearchMatch(frame::SearchMatchMsg {
+				path: "src/lib.rs".into(),
+				line: 9,
+				..frame::SearchMatchMsg::default()
+			})),
+			..frame::DataEvent::default()
+		}),
+	);
+	respond(
+		&responses,
+		walk_id,
+		server_frame::Body::DataEvent(frame::DataEvent {
+			body: Some(data_event::Body::WalkEntry(frame::WalkEntry {
+				path: "src".into(),
+				..frame::WalkEntry::default()
+			})),
+			..frame::DataEvent::default()
+		}),
+	);
+	assert!(matches!(
+		block_on(walk.next_event()).expect("walk entry"),
+		Some(WalkEvent::Entry(entry)) if entry.path == "src"
+	));
+	assert!(matches!(
+		block_on(search.next_event()).expect("search match"),
+		Some(SearchEvent::Match(found)) if found.path == "src/lib.rs" && found.line == 9
+	));
+
+	respond(
+		&responses,
+		walk_id,
+		server_frame::Body::DataEvent(frame::DataEvent {
+			body: Some(data_event::Body::WalkComplete(frame::WalkComplete::default())),
+			..frame::DataEvent::default()
+		}),
+	);
+	respond(
+		&responses,
+		search_id,
+		server_frame::Body::DataEvent(frame::DataEvent {
+			body: Some(data_event::Body::SearchComplete(frame::SearchComplete::default())),
+			..frame::DataEvent::default()
+		}),
+	);
+	assert!(matches!(block_on(walk.next_event()), Ok(Some(WalkEvent::Complete(_)))));
+	assert!(matches!(block_on(search.next_event()), Ok(Some(SearchEvent::Complete(_)))));
+	assert!(matches!(block_on(walk.next_event()), Ok(None)));
+	assert!(matches!(block_on(search.next_event()), Ok(None)));
+}
+
+#[test]
+fn document_stream_loss_is_terminal_and_drop_closes_connection_owned_lease() {
+	let (client, transport) = EnvClient::in_process(0);
+	let worker = client.worker_scope(data_scope());
+	let (requests, responses) = transport.into_parts();
+	let path = EnvPath::new("file:///workspace/src/lib.rs").expect("typed document path");
+
+	let server = thread::spawn(move || {
+		let open = receive(&requests);
+		assert!(matches!(
+			open.body,
+			Some(client_frame::Body::Data(frame::DataRequest {
+				body: Some(data_request::Body::Document(frame::DocumentOp {
+					op: Some(document_op::Op::Open(_)),
+					..
+				})),
+				..
+			}))
+		));
+		respond(
+			&responses,
+			open.request_id,
+			data_response(document_result::Result::Opened(document::OpenDocumentResponse {
+				lease_id: Bytes::from_static(b"lease-a"),
+				head:     Some(document::DocumentHead {
+					document: Some(document::DocumentRef {
+						id:  Bytes::from_static(b"document-a"),
+						uri: "file:///workspace/src/lib.rs".into(),
+					}),
+					revision: Some(document::Revision {
+						sequence:     1,
+						content_hash: Bytes::from_static(b"0123456789abcdef0123456789abcdef"),
+					}),
+					..document::DocumentHead::default()
+				}),
+			})),
+		);
+		(requests, responses, open.request_id)
+	});
+	let mut lease = block_on(worker.open_document(&path, Some("rust"))).expect("document lease");
+	let (requests, responses, open_id) = server.join().expect("open server");
+	respond(
+		&responses,
+		open_id,
+		server_frame::Body::EventStreamError(frame::EventStreamError {
+			stream: frame::EventStreamKind::Document as i32,
+			skipped_events: 3,
+			message: "receiver lagged".into(),
+			..frame::EventStreamError::default()
+		}),
+	);
+	let error = block_on(lease.events().next_event()).expect_err("continuity loss");
+	let ClientError::StreamLost(lost) = error else {
+		panic!("expected StreamLost");
+	};
+	assert_eq!(lost.skipped, 3);
+	assert!(lost.reopen_guidance.contains("reopen"));
+	assert!(matches!(block_on(lease.events().next_event()), Ok(None)));
+
+	drop(lease);
+	let close = receive(&requests);
+	assert!(matches!(
+		close.body,
+		Some(client_frame::Body::Data(frame::DataRequest {
+			body: Some(data_request::Body::Document(frame::DocumentOp {
+				op: Some(document_op::Op::Close(document::CloseDocumentRequest { lease_id })),
+				..
+			})),
+			..
+		})) if lease_id == Bytes::from_static(b"lease-a")
+	));
+	assert!(close.scope.is_some(), "lease close retains invocation authority");
+}
+
+#[test]
+fn lsp_stream_loss_requires_reconnect_and_requery() {
+	let (client, transport) = EnvClient::in_process(0);
+	let worker = client.worker_scope(data_scope());
+	let (requests, responses) = transport.into_parts();
+	let path = EnvPath::new("file:///workspace/src/main.rs").expect("typed document path");
+	let server = thread::spawn(move || {
+		let open = receive(&requests);
+		respond(
+			&responses,
+			open.request_id,
+			data_response(document_result::Result::Opened(document::OpenDocumentResponse {
+				lease_id: Bytes::from_static(b"lease-lsp"),
+				head:     Some(document::DocumentHead {
+					document: Some(document::DocumentRef {
+						id:  Bytes::from_static(b"document-lsp"),
+						uri: "file:///workspace/src/main.rs".into(),
+					}),
+					revision: Some(document::Revision {
+						sequence:     4,
+						content_hash: Bytes::from_static(b"abcdef0123456789abcdef0123456789"),
+					}),
+					..document::DocumentHead::default()
+				}),
+			})),
+		);
+		(requests, responses)
+	});
+	let lease = block_on(worker.open_document(&path, Some("rust"))).expect("document lease");
+	let (requests, responses) = server.join().expect("open server");
+	let mut events = block_on(worker.lsp_events(&lease)).expect("LSP event stream");
+	let subscription = receive(&requests);
+	assert!(matches!(
+		subscription.body,
+		Some(client_frame::Body::Data(frame::DataRequest {
+			body: Some(data_request::Body::Document(frame::DocumentOp {
+				op: Some(document_op::Op::GetLspBindings(_)),
+				..
+			})),
+			..
+		}))
+	));
+	respond(
+		&responses,
+		subscription.request_id,
+		data_response(document_result::Result::LspBindings(
+			document::GetLspBindingsResponse::default(),
+		)),
+	);
+	assert!(matches!(block_on(events.next_event()), Ok(Some(LspStreamEvent::Bindings(_)))));
+	respond(
+		&responses,
+		subscription.request_id,
+		server_frame::Body::EventStreamError(frame::EventStreamError {
+			stream: frame::EventStreamKind::LspRegistry as i32,
+			skipped_events: 2,
+			message: "registry lagged".into(),
+			..frame::EventStreamError::default()
+		}),
+	);
+	let error = block_on(events.next_event()).expect_err("LSP continuity loss");
+	let ClientError::StreamLost(lost) = error else {
+		panic!("expected StreamLost");
+	};
+	assert_eq!(lost.skipped, 2);
+	assert!(lost.reopen_guidance.contains("reconnect"));
+	assert!(lost.reopen_guidance.contains("re-query"));
+	assert!(matches!(block_on(events.next_event()), Ok(None)));
+	drop(lease);
+	let _close = receive(&requests);
+}
+
+#[test]
+fn transaction_ids_are_epoch_scoped_duplicates_reuse_outcome_and_partial_stays_distinct() {
+	let (client, transport) = EnvClient::in_process(0);
+	let (requests, responses) = transport.into_parts();
+	let hello_server = thread::spawn(move || {
+		let hello = receive(&requests);
+		respond(
+			&responses,
+			hello.request_id,
+			server_frame::Body::Hello(frame::ServerHello {
+				server_epoch: Bytes::from_static(b"epoch-a"),
+				..frame::ServerHello::default()
+			}),
+		);
+		(requests, responses)
+	});
+	block_on(client.hello(frame::ClientHello::default())).expect("hello");
+	let (requests, responses) = hello_server.join().expect("hello server");
+	let worker = client.worker_scope(data_scope());
+
+	let server = thread::spawn(move || {
+		for duplicate in 0..2 {
+			let request = receive(&requests);
+			let Some(client_frame::Body::Data(frame::DataRequest {
+				body:
+					Some(data_request::Body::Document(frame::DocumentOp {
+						op: Some(document_op::Op::CommitTransaction(transaction)),
+						..
+					})),
+				..
+			})) = request.body
+			else {
+				panic!("expected transaction");
+			};
+			assert_eq!(transaction.transaction_id, Bytes::from_static(b"txn-same"));
+			respond(
+				&responses,
+				request.request_id,
+				data_response(document_result::Result::Transaction(
+					document::CommitTransactionResponse {
+						outcome: Some(commit_transaction_response::Outcome::Committed(
+							document::TransactionCommitted {
+								transaction_id: Bytes::from_static(b"txn-same"),
+								..document::TransactionCommitted::default()
+							},
+						)),
+					},
+				)),
+			);
+			assert!(duplicate < 2);
+		}
+		let request = receive(&requests);
+		respond(
+			&responses,
+			request.request_id,
+			data_response(document_result::Result::Transaction(document::CommitTransactionResponse {
+				outcome: Some(commit_transaction_response::Outcome::PartiallyCommitted(
+					document::TransactionPartiallyCommitted {
+						transaction_id: Bytes::from_static(b"txn-partial"),
+						failed_operation_index: 1,
+						..document::TransactionPartiallyCommitted::default()
+					},
+				)),
+			})),
+		);
+	});
+	for _ in 0..2 {
+		let outcome = block_on(worker.commit_transaction(document::CommitTransactionRequest {
+			transaction_id: Bytes::from_static(b"txn-same"),
+			..document::CommitTransactionRequest::default()
+		}))
+		.expect("duplicate transaction outcome");
+		assert!(matches!(outcome, TransactionOutcome::Committed(_)));
+	}
+	let retained = worker.last_transaction().expect("retained transaction id");
+	assert_eq!(retained.server_epoch, Bytes::from_static(b"epoch-a"));
+	assert_eq!(retained.txn_id, Bytes::from_static(b"txn-same"));
+
+	let partial = block_on(worker.commit_transaction(document::CommitTransactionRequest {
+		transaction_id: Bytes::from_static(b"txn-partial"),
+		..document::CommitTransactionRequest::default()
+	}))
+	.expect("partial transaction outcome");
+	assert!(matches!(
+		partial,
+		TransactionOutcome::Partial(document::TransactionPartiallyCommitted {
+			failed_operation_index: 1,
+			..
+		})
+	));
+	server.join().expect("transaction server");
+}
+
+#[test]
+fn preauthorization_protocol_error_has_a_distinct_client_variant() {
+	let (client, transport) = EnvClient::in_process(0);
+	let worker = client.worker_scope(data_scope());
+	let (requests, responses) = transport.into_parts();
+	let server = thread::spawn(move || {
+		let request = receive(&requests);
+		respond(
+			&responses,
+			request.request_id,
+			server_frame::Body::Error(frame::ProtocolError {
+				code: frame::ProtocolErrorCode::Uncommitted as i32,
+				message: "effects not authorized".into(),
+				..frame::ProtocolError::default()
+			}),
+		);
+	});
+	let error = block_on(worker.request(frame::DataRequest {
+		body: Some(data_request::Body::Walk(frame::WalkRequest::default())),
+		..frame::DataRequest::default()
+	}))
+	.expect_err("preauthorization request must fail");
+	assert!(matches!(error, ClientError::EffectsNotAuthorized(_)));
+	server.join().expect("phase-error server");
 }

@@ -2,8 +2,10 @@
 
 use futures::{FutureExt, executor::block_on};
 use omp_slopjson::{
-	IncomingDoc, IncomingError, PullIssueKind, PullPathSegment, Str, Value, json, parse,
+	IncomingDoc, IncomingError, PullIssueKind, PullMode, PullPathSegment, PulledKind, RepairKind,
+	Str, Value, json, parse,
 };
+use smallvec::SmallVec;
 
 #[test]
 fn key_string_is_available_before_object_finishes() {
@@ -464,4 +466,101 @@ fn finished_and_aborted_are_distinct_terminal_states() {
 	assert_eq!(issue.expected, "value");
 	assert_eq!(issue.kind, PullIssueKind::Aborted);
 	assert!(matches!(block_on(doc.whole::<Value>()), Err(IncomingError::Aborted)));
+}
+
+#[test]
+fn path_cursor_rounds_lines_and_reports_the_alias_that_matched() {
+	let (mut feed, doc) = IncomingDoc::channel();
+	let cursor = doc.cursor();
+	let mut names = SmallVec::<Str, 4>::new();
+	names.push(Str::from("message"));
+	names.push(Str::from("text"));
+	let path = [PullPathSegment::Keys(names)];
+
+	feed.push("{\"text\":\"a\\nb").unwrap();
+	let first = block_on(cursor.pull_at(&path, PullMode::Line(0), "string")).unwrap();
+	assert_eq!(first.matched_key.as_deref(), Some("text"));
+	assert!(matches!(
+		first.kind,
+		PulledKind::Chunk { ref value, complete: false } if value.as_str() == "a\n"
+	));
+
+	feed.push("\\n").unwrap();
+	let second = block_on(cursor.pull_at(&path, PullMode::Line(2), "string")).unwrap();
+	assert!(matches!(
+		second.kind,
+		PulledKind::Chunk { ref value, complete: false } if value.as_str() == "b\n"
+	));
+
+	feed.push("c\"}").unwrap();
+	let final_line = block_on(cursor.pull_at(&path, PullMode::Line(4), "string")).unwrap();
+	assert!(matches!(
+		final_line.kind,
+		PulledKind::Chunk { ref value, complete: true } if value.as_str() == "c"
+	));
+	feed.finish();
+}
+
+#[test]
+fn finished_object_key_scan_preserves_alias_collisions_and_duplicates() {
+	let (mut feed, doc) = IncomingDoc::channel();
+	let cursor = doc.cursor();
+	feed.push("{\"path\":1,\"file\":2,\"path\":3}").unwrap();
+	feed.finish();
+
+	let mut names = SmallVec::<Str, 4>::new();
+	names.push(Str::from("path"));
+	names.push(Str::from("file"));
+	let pulled =
+		block_on(cursor.pull_at(&[PullPathSegment::Keys(names)], PullMode::Complete, "number"))
+			.unwrap();
+	assert_eq!(pulled.matched_key.as_deref(), Some("path"));
+	assert!(matches!(
+		pulled.kind,
+		PulledKind::Complete(Value::Number(number)) if number.as_u64() == Some(1)
+	));
+
+	let keys = block_on(cursor.object_keys(&[])).unwrap();
+	assert_eq!(keys.as_slice(), [Str::from("path"), Str::from("file"), Str::from("path")]);
+}
+
+#[test]
+fn parser_repairs_are_lossless_and_strict_json_stays_empty() {
+	let input = "{,// note\nunquoted:'x\\q\u{1}', flag: True, hex: 0x10, relaxed: +.5, bare: foo,,}";
+	let (mut feed, mut doc) = IncomingDoc::channel();
+	feed.push(input).unwrap();
+	feed.finish();
+	block_on(doc.whole::<Value>()).unwrap();
+
+	let repairs = doc.repairs();
+	for kind in [
+		RepairKind::Comment,
+		RepairKind::SingleQuotedString,
+		RepairKind::UnquotedKey,
+		RepairKind::PythonLiteral,
+		RepairKind::StrayComma,
+		RepairKind::TrailingComma,
+		RepairKind::InvalidEscape,
+		RepairKind::RawControlCharacter,
+		RepairKind::RadixNumber,
+		RepairKind::RelaxedNumber,
+		RepairKind::BarewordValue,
+	] {
+		assert!(repairs.iter().any(|repair| repair.kind == kind), "missing {kind:?}");
+	}
+	for repair in repairs.iter() {
+		assert_eq!(repair.before.as_str(), &input[repair.span.clone()]);
+	}
+	assert!(repairs.iter().any(|repair| {
+		repair.kind == RepairKind::SingleQuotedString
+			&& repair.path.as_slice() == [omp_slopjson::RepairPathSegment::Key(Str::from("unquoted"))]
+	}));
+	drop(repairs);
+
+	let strict = "{\"ok\":true,\"items\":[1,2]}";
+	let (mut feed, mut doc) = IncomingDoc::channel();
+	feed.push(strict).unwrap();
+	feed.finish();
+	block_on(doc.whole::<Value>()).unwrap();
+	assert!(doc.repairs().is_empty());
 }

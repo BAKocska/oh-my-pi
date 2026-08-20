@@ -21,13 +21,112 @@
 //!   unrecognized bareword such as `{"paths": packages/foo/*}` is recovered as
 //!   a string up to the next `,` / `}` / `]` / newline.
 
-use omp_core::{CowStr, StrMut};
+use std::ops::Range;
+
+use omp_core::{CowStr, Str, StrMut};
+use smallvec::SmallVec;
 
 use crate::{
 	error::ParseError,
 	hex4, is_whitespace,
 	value::{Number, Value},
 };
+
+/// One component of the JSON path at which a tolerance was applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepairPathSegment {
+	/// Object member name.
+	Key(Str),
+	/// Array element index.
+	Index(usize),
+}
+
+/// Exact tolerant-parser branch that accepted non-standard JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairKind {
+	/// A line or block comment was ignored.
+	Comment,
+	/// A string used single rather than double quotes.
+	SingleQuotedString,
+	/// An object key was not quoted.
+	UnquotedKey,
+	/// A Python-spelled literal was accepted.
+	PythonLiteral,
+	/// An extra comma was ignored between container entries.
+	StrayComma,
+	/// A comma immediately before a container close was ignored.
+	TrailingComma,
+	/// A string escape was not part of the JSON escape vocabulary.
+	InvalidEscape,
+	/// A raw control character occurred inside a string.
+	RawControlCharacter,
+	/// A hexadecimal or binary integer literal was accepted.
+	RadixNumber,
+	/// A number used a relaxed spelling such as a leading plus or bare dot.
+	RelaxedNumber,
+	/// An unquoted bareword was recovered as a string value.
+	BarewordValue,
+	/// Streaming display recovery treated an unescaped quote as content.
+	InnerQuote,
+}
+
+/// One lossless record of a tolerant syntax branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Repair {
+	/// Raw half-open byte range in the source document.
+	pub span:   Range<usize>,
+	/// JSON path being parsed when the tolerance fired.
+	pub path:   SmallVec<RepairPathSegment, 4>,
+	/// Exact tolerant branch that fired.
+	pub kind:   RepairKind,
+	/// Original source spelling covered by `span`.
+	pub before: Str,
+	/// Canonical spelling or replacement.
+	pub after:  Str,
+}
+
+/// Compact append-only parser repair record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepairLog(SmallVec<Repair, 4>);
+
+impl RepairLog {
+	/// Empty repair record.
+	pub const fn new() -> Self {
+		Self(SmallVec::new())
+	}
+
+	/// Number of recorded repairs.
+	pub const fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	/// Whether no tolerance branch fired.
+	pub const fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	/// Borrow repairs in source order.
+	pub fn as_slice(&self) -> &[Repair] {
+		&self.0
+	}
+
+	pub(crate) fn append_unique(&mut self, mut other: Self, _path: &[crate::PullPathSegment]) {
+		for repair in other.0.drain(..) {
+			if !self.0.contains(&repair) {
+				self.0.push(repair);
+			}
+		}
+		self.0.sort_by_key(|repair| repair.span.start);
+	}
+}
+
+impl std::ops::Deref for RepairLog {
+	type Target = [Repair];
+
+	fn deref(&self) -> &Self::Target {
+		self.as_slice()
+	}
+}
 
 /// Maximum container nesting before the parser refuses (strict) or rolls
 /// back to the last valid prefix (partial).
@@ -140,15 +239,104 @@ impl Mode {
 /// Cursor over the input with the tolerant token readers; [`Mode`] selects
 /// how truncation and unescaped inner double quotes are treated.
 pub struct Parser<'a> {
-	src:  &'a str,
-	s:    &'a [u8],
-	i:    usize,
-	mode: Mode,
+	src:             &'a str,
+	s:               &'a [u8],
+	i:               usize,
+	mode:            Mode,
+	repairs:         RepairLog,
+	repair_path:     SmallVec<RepairPathSegment, 4>,
+	track_structure: bool,
 }
 
 impl<'a> Parser<'a> {
 	pub(crate) const fn new(src: &'a str, mode: Mode) -> Self {
-		Self { src, s: src.as_bytes(), i: 0, mode }
+		Self {
+			src,
+			s: src.as_bytes(),
+			i: 0,
+			mode,
+			repairs: RepairLog::new(),
+			repair_path: SmallVec::new(),
+			track_structure: false,
+		}
+	}
+
+	pub(crate) const fn resume(src: &'a str, mode: Mode, offset: usize) -> Self {
+		Self {
+			src,
+			s: src.as_bytes(),
+			i: offset,
+			mode,
+			repairs: RepairLog::new(),
+			repair_path: SmallVec::new(),
+			track_structure: false,
+		}
+	}
+
+	pub(crate) fn take_repairs(&mut self) -> RepairLog {
+		std::mem::take(&mut self.repairs)
+	}
+
+	pub(crate) fn record_comma(&mut self, at: usize, trailing: bool) {
+		self.record(
+			at..at + 1,
+			if trailing {
+				RepairKind::TrailingComma
+			} else {
+				RepairKind::StrayComma
+			},
+			Str::default(),
+		);
+	}
+
+	pub(crate) fn repairs(&self) -> &[Repair] {
+		self.repairs.as_slice()
+	}
+
+	pub(crate) fn set_repair_path(&mut self, path: &[crate::PullPathSegment]) {
+		self.track_structure = path.is_empty();
+		self.repair_path.clear();
+		self
+			.repair_path
+			.extend(path.iter().filter_map(|segment| match segment {
+				crate::PullPathSegment::Key(key) => Some(RepairPathSegment::Key(key.clone())),
+				crate::PullPathSegment::Keys(keys) => keys.first().cloned().map(RepairPathSegment::Key),
+				crate::PullPathSegment::Index(index) => Some(RepairPathSegment::Index(*index)),
+			}));
+	}
+
+	pub(crate) const fn tracks_structure(&self) -> bool {
+		self.track_structure
+	}
+
+	pub(crate) fn push_repair_path(&mut self, segment: RepairPathSegment) {
+		self.repair_path.push(segment);
+	}
+
+	pub(crate) fn pop_repair_path(&mut self) {
+		self.repair_path.pop();
+	}
+
+	pub(crate) fn retarget_repairs_from(&mut self, start: usize, segment: RepairPathSegment) {
+		for repair in self
+			.repairs
+			.0
+			.iter_mut()
+			.filter(|repair| repair.span.start >= start)
+		{
+			repair.path.push(segment.clone());
+		}
+	}
+
+	fn record(&mut self, span: Range<usize>, kind: RepairKind, after: impl Into<Str>) {
+		let before = Str::from(&self.src[span.clone()]);
+		self.repairs.0.push(Repair {
+			span,
+			path: self.repair_path.clone(),
+			kind,
+			before,
+			after: after.into(),
+		});
 	}
 
 	pub(crate) const fn pos(&self) -> usize {
@@ -180,7 +368,39 @@ impl<'a> Parser<'a> {
 
 	/// Skip whitespace plus `//` line and `/* */` block comments.
 	pub(crate) fn ws(&mut self) {
-		self.i = skip_insignificant(self.s, self.i);
+		loop {
+			while self.i < self.s.len() && is_whitespace(self.s[self.i]) {
+				self.i += 1;
+			}
+			if self.i + 1 >= self.s.len() || self.s[self.i] != b'/' {
+				return;
+			}
+			let start = self.i;
+			let complete = match self.s[self.i + 1] {
+				b'/' => {
+					self.i += 2;
+					while self.i < self.s.len() && self.s[self.i] != b'\n' {
+						self.i += 1;
+					}
+					self.i < self.s.len() || self.mode == Mode::Strict
+				},
+				b'*' => {
+					self.i += 2;
+					while self.i + 1 < self.s.len()
+						&& !(self.s[self.i] == b'*' && self.s[self.i + 1] == b'/')
+					{
+						self.i += 1;
+					}
+					let closed = self.i + 1 < self.s.len();
+					self.i = if closed { self.i + 2 } else { self.s.len() };
+					closed || self.mode == Mode::Strict
+				},
+				_ => return,
+			};
+			if complete {
+				self.record(start..self.i, RepairKind::Comment, Str::default());
+			}
+		}
 	}
 
 	/// Read a string starting at the opening `quote`. Borrowed (zero-copy)
@@ -200,11 +420,24 @@ impl<'a> Parser<'a> {
 		let s = self.s;
 		let n = s.len();
 		let mut i = self.i + 1; // skip opening quote
+		let string_start = self.i;
 		let mut out: Option<StrMut> = None;
 		let mut run_start = i;
 		let mut unstable_from = None;
 		while i < n {
 			let b = s[i];
+			if b < 0x20 {
+				match b {
+					b'\n' => self.record(i..i + 1, RepairKind::RawControlCharacter, "\\n"),
+					b'\r' => self.record(i..i + 1, RepairKind::RawControlCharacter, "\\r"),
+					b'\t' => self.record(i..i + 1, RepairKind::RawControlCharacter, "\\t"),
+					b'\x08' => self.record(i..i + 1, RepairKind::RawControlCharacter, "\\b"),
+					b'\x0c' => self.record(i..i + 1, RepairKind::RawControlCharacter, "\\f"),
+					_ => self.record(i..i + 1, RepairKind::RawControlCharacter, format!("\\u{b:04X}")),
+				}
+				i += 1;
+				continue;
+			}
 			if b != b'\\' && b != quote {
 				i += 1;
 				continue;
@@ -226,6 +459,10 @@ impl<'a> Parser<'a> {
 						self.i = i + 1;
 						let value = finish(out, &self.src[run_start..i]);
 						let stable_len = value.len();
+						if quote == b'\'' {
+							let after = Value::String(Str::from(value.as_str())).to_string();
+							self.record(string_start..self.i, RepairKind::SingleQuotedString, after);
+						}
 						return Ok(StringProgress { value, stable_len, complete: true });
 					},
 					// A lone `/` at the buffer edge may grow into a comment, flipping
@@ -237,7 +474,11 @@ impl<'a> Parser<'a> {
 						}
 					},
 					// Unescaped inner quote (e.g. apostrophe in `'it's'`) — literal.
-					QuoteLook::Inner => {},
+					QuoteLook::Inner => {
+						if quote == b'"' {
+							self.record(i..i + 1, RepairKind::InnerQuote, "\\\"");
+						}
+					},
 				}
 				i += 1;
 				continue;
@@ -293,6 +534,8 @@ impl<'a> Parser<'a> {
 					} else {
 						if i + 5 > n {
 							unstable_from = Some(escape_output_start);
+						} else {
+							self.record(i - 1..i + 1, RepairKind::InvalidEscape, "\\\\u");
 						}
 						out.push_str("\\u"); // invalid \u — keep literal
 					}
@@ -303,6 +546,11 @@ impl<'a> Parser<'a> {
 						.chars()
 						.next()
 						.expect("escape byte starts a char");
+					self.record(i - 1..i + ch.len_utf8(), RepairKind::InvalidEscape, {
+						let mut replacement = StrMut::from("\\\\");
+						replacement.push(ch);
+						replacement
+					});
 					out.push('\\');
 					out.push(ch);
 					i += ch.len_utf8() - 1;
@@ -318,6 +566,7 @@ impl<'a> Parser<'a> {
 			let stable_len = unstable_from.unwrap_or_else(|| value.len());
 			return Ok(StringProgress { value, stable_len, complete: false });
 		}
+
 		Err(ParseError::UnterminatedString)
 	}
 
@@ -345,7 +594,25 @@ impl<'a> Parser<'a> {
 			self.i += 1;
 		}
 		match parse_number_token(&self.src[start..self.i]) {
-			Some(number) => Ok(Some(number)),
+			Some(number) => {
+				let raw = &self.src[start..self.i];
+				let kind = if raw
+					.as_bytes()
+					.get(1)
+					.is_some_and(|byte| matches!(byte, b'x' | b'X' | b'b' | b'B'))
+					&& raw.starts_with('0')
+				{
+					Some(RepairKind::RadixNumber)
+				} else if raw.starts_with('+') || raw.starts_with('.') || raw.ends_with('.') {
+					Some(RepairKind::RelaxedNumber)
+				} else {
+					None
+				};
+				if let Some(kind) = kind {
+					self.record(start..self.i, kind, number.to_string());
+				}
+				Ok(Some(number))
+			},
 			None if self.mode.incomplete_ok() => Ok(None),
 			None => Err(ParseError::InvalidNumber(start)),
 		}
@@ -363,7 +630,16 @@ impl<'a> Parser<'a> {
 					.copied()
 					.is_some_and(is_ident_char)
 			{
+				let start = self.i;
 				self.i += word.len();
+				if word.as_bytes()[0].is_ascii_uppercase() {
+					let after = match atom {
+						Atom::Bool(true) => "true",
+						Atom::Bool(false) => "false",
+						Atom::Null => "null",
+					};
+					self.record(start..self.i, RepairKind::PythonLiteral, after);
+				}
 				return Some(atom);
 			}
 		}
@@ -381,7 +657,11 @@ impl<'a> Parser<'a> {
 					.copied()
 					.is_some_and(is_ident_char)
 			{
+				let start = self.i;
 				self.i += word.len();
+				if word == "None" {
+					self.record(start..self.i, RepairKind::PythonLiteral, "null");
+				}
 				return true;
 			}
 		}
@@ -398,6 +678,10 @@ impl<'a> Parser<'a> {
 				break;
 			}
 			self.i += 1;
+		}
+		if self.i > start {
+			let after = Value::String(Str::from(&self.src[start..self.i])).to_string();
+			self.record(start..self.i, RepairKind::UnquotedKey, after);
 		}
 		&self.src[start..self.i]
 	}
@@ -442,6 +726,8 @@ impl<'a> Parser<'a> {
 			return Err(ParseError::UnexpectedToken(start));
 		}
 		self.i = i;
+		let after = Value::String(Str::from(word)).to_string();
+		self.record(start..end, RepairKind::BarewordValue, after);
 		Ok(word)
 	}
 }
@@ -513,5 +799,25 @@ fn parse_radix(digits: &[u8], radix: u32) -> Option<Number> {
 		Number::from_f64(float)
 	} else {
 		Some(Number::from(int))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn streaming_inner_quote_repair_is_exact() {
+		let source = r#""a"b""#;
+		let mut parser = Parser::new(source, Mode::Streaming);
+		let progress = parser.string_progress(b'"').unwrap();
+		assert!(progress.complete);
+		assert_eq!(progress.value.as_str(), "a\"b");
+		let repairs = parser.take_repairs();
+		assert_eq!(repairs.len(), 1);
+		assert_eq!(repairs[0].kind, RepairKind::InnerQuote);
+		assert_eq!(repairs[0].span, 2..3);
+		assert_eq!(repairs[0].before.as_str(), "\"");
+		assert_eq!(repairs[0].after.as_str(), "\\\"");
 	}
 }

@@ -7,22 +7,29 @@ use std::{
 };
 
 use bytes::BytesMut;
+use smallvec::SmallVec;
+use thiserror::Error as ThisError;
 
 use super::{
 	codec::{Error, Header, read_header, read_line, write_header, write_line},
 	event::{Event, Kind},
 };
 
+/// Maximum number of events in one atomic transcript append.
+pub const MAX_ATOMIC_ENTRIES: usize = 1_024;
+
 /// A transcript writer that owns the single header and appends event lines.
 pub struct Writer {
 	file:       File,
 	next_index: u64,
 	line:       BytesMut,
+	poisoned:   bool,
 }
 
 trait AppendTarget: Write {
 	fn append_len(&self) -> std::io::Result<u64>;
 	fn rollback_to(&mut self, len: u64) -> std::io::Result<()>;
+	fn sync_data(&mut self) -> std::io::Result<()>;
 }
 
 impl AppendTarget for File {
@@ -33,19 +40,118 @@ impl AppendTarget for File {
 	fn rollback_to(&mut self, len: u64) -> std::io::Result<()> {
 		self.set_len(len)?;
 		self.seek(SeekFrom::Start(len))?;
-		Ok(())
+		File::sync_data(self)
+	}
+
+	fn sync_data(&mut self) -> std::io::Result<()> {
+		File::sync_data(self)
 	}
 }
 
-fn append_all(target: &mut impl AppendTarget, bytes: &[u8]) -> Result<(), Error> {
-	let original_len = target.append_len()?;
-	if let Err(write) = target.write_all(bytes) {
-		return match target.rollback_to(original_len) {
-			Ok(()) => Err(Error::Io(write)),
-			Err(rollback) => Err(Error::AppendRollback { write, rollback }),
-		};
+/// A journal write failure with a proven or indeterminate outcome.
+#[derive(Debug, ThisError)]
+pub enum JournalError {
+	/// The attempted append was rolled back completely.
+	#[error("journal append failed and was rolled back: {source}")]
+	RolledBack {
+		/// Encoding, write, or durability failure.
+		#[source]
+		source: Error,
+	},
+	/// The attempted append could not be rolled back and the writer is halted.
+	#[error(transparent)]
+	Indeterminate(#[from] JournalIndeterminate),
+	/// The requested atomic group exceeded [`MAX_ATOMIC_ENTRIES`].
+	#[error("atomic journal append has {entries} entries; maximum is {maximum}")]
+	TooManyEntries {
+		/// Requested event count.
+		entries: usize,
+		/// Supported event count ceiling.
+		maximum: usize,
+	},
+}
+
+/// A journal failure whose durable outcome cannot be proven.
+#[derive(Debug, ThisError)]
+#[error("journal durability is indeterminate and the writer is halted: {source}")]
+pub struct JournalIndeterminate {
+	/// Write and rollback failure pair.
+	#[source]
+	pub source:   Error,
+	/// Physical indexes whose bytes may have been written.
+	pub written:  SmallVec<u64, 8>,
+	/// Whether the single-owner writer refuses subsequent appends.
+	pub poisoned: bool,
+}
+
+/// Failure from a non-atomic multi-event append.
+///
+/// `appended` contains exactly the physical indexes proven to remain in the
+/// transcript. The indeterminate variant reports potentially written indexes
+/// separately through [`JournalIndeterminate::written`].
+#[derive(Debug, ThisError)]
+#[error("transcript batch append failed after {count} events: {source}", count = .appended.len())]
+pub struct AppendManyError {
+	/// Proven or indeterminate journal outcome.
+	#[source]
+	pub source:   JournalError,
+	/// Physical indexes proven to remain appended by this operation.
+	pub appended: SmallVec<u64, 8>,
+}
+
+fn rollback_error(
+	target: &mut impl AppendTarget,
+	original_len: u64,
+	write: std::io::Error,
+) -> Error {
+	match target.rollback_to(original_len) {
+		Ok(()) => Error::Io(write),
+		Err(rollback) => Error::AppendRollback { write, rollback },
+	}
+}
+
+fn append_all(
+	target: &mut impl AppendTarget,
+	original_len: u64,
+	bytes: &[u8],
+) -> Result<(), Error> {
+	target
+		.write_all(bytes)
+		.map_err(|write| rollback_error(target, original_len, write))
+}
+
+fn commit(target: &mut impl AppendTarget, original_len: u64) -> Result<(), Error> {
+	target
+		.sync_data()
+		.map_err(|write| rollback_error(target, original_len, write))
+}
+
+fn validate_event(event: &Event) -> Result<(), Error> {
+	if let Kind::Infer { thinking, model, tier, cred_pin } = &event.kind
+		&& thinking.is_unchanged()
+		&& model.is_unchanged()
+		&& tier.is_unchanged()
+		&& cred_pin.is_unchanged()
+	{
+		return Err(Error::EmptyInfer);
+	}
+	if let Kind::EntryUndecodable(entry) = &event.kind
+		&& serde_json::from_str::<Header>(entry.raw.get()).is_ok()
+	{
+		return Err(Error::DuplicateHeader);
 	}
 	Ok(())
+}
+
+fn halted_error() -> JournalError {
+	JournalIndeterminate {
+		source:   Error::Io(std::io::Error::other(
+			"transcript writer is halted after an indeterminate append",
+		)),
+		written:  SmallVec::new(),
+		poisoned: true,
+	}
+	.into()
 }
 
 impl Writer {
@@ -66,8 +172,9 @@ impl Writer {
 		write_header(header, &mut line)?;
 		line.extend_from_slice(b"\n");
 		file.write_all(&line)?;
+		file.sync_data()?;
 		line.clear();
-		Ok(Self { file, next_index: 0, line })
+		Ok(Self { file, next_index: 0, line, poisoned: false })
 	}
 
 	/// Opens an existing transcript for append, repairing malformed trailing
@@ -88,7 +195,8 @@ impl Writer {
 			read_header(&bytes)?;
 			file.seek(SeekFrom::End(0))?;
 			file.write_all(b"\n")?;
-			return Ok(Self { file, next_index: 0, line: BytesMut::new() });
+			file.sync_data()?;
+			return Ok(Self { file, next_index: 0, line: BytesMut::new(), poisoned: false });
 		};
 		read_header(&bytes[..header_end])?;
 
@@ -121,6 +229,7 @@ impl Writer {
 				next_index = next_index.saturating_add(1);
 				file.seek(SeekFrom::End(0))?;
 				file.write_all(b"\n")?;
+				file.sync_data()?;
 			} else if malformed_tail.is_none() {
 				malformed_tail =
 					Some((u64::try_from(start).expect("file offsets fit in u64"), next_index));
@@ -128,10 +237,11 @@ impl Writer {
 		}
 		if let Some((offset, repaired_next_index)) = malformed_tail {
 			file.set_len(offset)?;
+			file.sync_data()?;
 			next_index = repaired_next_index;
 		}
 		file.seek(SeekFrom::End(0))?;
-		Ok(Self { file, next_index, line: BytesMut::new() })
+		Ok(Self { file, next_index, line: BytesMut::new(), poisoned: false })
 	}
 
 	/// Rejects an attempt to write another header to this transcript.
@@ -144,28 +254,185 @@ impl Writer {
 	/// The event index is the physical line number minus one. Empty inference
 	/// patches are rejected because they encode no state transition.
 	pub fn append(&mut self, event: &Event) -> Result<u64, Error> {
-		if let Kind::Infer { thinking, model, tier, cred_pin } = &event.kind
-			&& thinking.is_unchanged()
-			&& model.is_unchanged()
-			&& tier.is_unchanged()
-			&& cred_pin.is_unchanged()
-		{
-			return Err(Error::EmptyInfer);
+		match self.append_atomic(std::slice::from_ref(event)) {
+			Ok(mut indexes) => Ok(indexes.pop().expect("one event has one physical index")),
+			Err(JournalError::RolledBack { source }) => Err(source),
+			Err(JournalError::Indeterminate(indeterminate)) => Err(indeterminate.source),
+			Err(JournalError::TooManyEntries { .. }) => {
+				unreachable!("a single-event append cannot exceed the atomic group limit")
+			},
 		}
-		if let Kind::Unknown(raw) = &event.kind
-			&& serde_json::from_str::<Header>(raw.get()).is_ok()
-		{
-			return Err(Error::DuplicateHeader);
+	}
+
+	/// Appends events in order with one final durability point.
+	///
+	/// This operation is deliberately not transactional. A failure while
+	/// writing a later line leaves the successfully written prefix in place and
+	/// reports those physical indexes in [`AppendManyError::appended`].
+	pub fn append_many(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, AppendManyError> {
+		if self.poisoned {
+			return Err(AppendManyError { source: halted_error(), appended: SmallVec::new() });
+		}
+		let ends = self.stage(events).map_err(|source| AppendManyError {
+			source:   JournalError::RolledBack { source },
+			appended: SmallVec::new(),
+		})?;
+		if ends.is_empty() {
+			return Ok(SmallVec::new());
 		}
 
+		let original_len = self.file.append_len().map_err(|source| AppendManyError {
+			source:   JournalError::RolledBack { source: Error::Io(source) },
+			appended: SmallVec::new(),
+		})?;
+		let first_index = self.next_index;
+		let mut indexes = SmallVec::with_capacity(ends.len());
+		let mut start = 0;
+		for end in ends {
+			let index = self.next_index;
+			let line_start = match self.file.append_len() {
+				Ok(line_start) => line_start,
+				Err(error) => {
+					let mut appended = indexes;
+					let source = if appended.is_empty() {
+						JournalError::RolledBack { source: Error::Io(error) }
+					} else {
+						match self.file.sync_data() {
+							Ok(()) => JournalError::RolledBack { source: Error::Io(error) },
+							Err(write) => {
+								self.next_index = first_index;
+								let rollback = rollback_error(&mut self.file, original_len, write);
+								let source = self.classify(rollback, appended.clone());
+								appended.clear();
+								source
+							},
+						}
+					};
+					self.line.clear();
+					return Err(AppendManyError { source, appended });
+				},
+			};
+			let result = append_all(&mut self.file, line_start, &self.line[start..end]);
+			if let Err(source) = result {
+				let journal_error = self.finish_failed_many(source, &indexes, index);
+				self.line.clear();
+				return Err(journal_error);
+			}
+			indexes.push(index);
+			self.next_index = self.next_index.saturating_add(1);
+			start = end;
+		}
+
+		if let Err(source) = commit(&mut self.file, original_len) {
+			self.next_index = first_index;
+			let source = self.classify(source, indexes.clone());
+			self.line.clear();
+			return Err(AppendManyError { source, appended: SmallVec::new() });
+		}
 		self.line.clear();
-		write_line(event, &mut self.line)?;
-		self.line.extend_from_slice(b"\n");
-		append_all(&mut self.file, &self.line)?;
+		Ok(indexes)
+	}
+
+	/// Atomically appends an event group with contiguous physical indexes.
+	///
+	/// Every line is encoded before the file is touched, then the staged bytes
+	/// are written and synchronized at one durability point. A clean failure
+	/// restores and synchronizes the original length. If rollback itself fails,
+	/// the returned [`JournalIndeterminate`] poisons this writer permanently.
+	pub fn append_atomic(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, JournalError> {
+		if self.poisoned {
+			return Err(halted_error());
+		}
+		if events.len() > MAX_ATOMIC_ENTRIES {
+			return Err(JournalError::TooManyEntries {
+				entries: events.len(),
+				maximum: MAX_ATOMIC_ENTRIES,
+			});
+		}
+		let ends = self
+			.stage(events)
+			.map_err(|source| JournalError::RolledBack { source })?;
+		if ends.is_empty() {
+			return Ok(SmallVec::new());
+		}
+		let original_len = self
+			.file
+			.append_len()
+			.map_err(|source| JournalError::RolledBack { source: Error::Io(source) })?;
+		let first_index = self.next_index;
+		let indexes = (0..events.len())
+			.map(|offset| {
+				first_index.saturating_add(u64::try_from(offset).expect("event count fits in u64"))
+			})
+			.collect::<SmallVec<u64, 8>>();
+		let result = append_all(&mut self.file, original_len, &self.line)
+			.and_then(|()| commit(&mut self.file, original_len));
 		self.line.clear();
-		let index = self.next_index;
-		self.next_index = self.next_index.saturating_add(1);
-		Ok(index)
+		match result {
+			Ok(()) => {
+				self.next_index = first_index
+					.saturating_add(u64::try_from(events.len()).expect("event count fits in u64"));
+				Ok(indexes)
+			},
+			Err(source) => Err(self.classify(source, indexes)),
+		}
+	}
+
+	/// Returns whether an indeterminate rollback has halted this writer.
+	pub const fn is_poisoned(&self) -> bool {
+		self.poisoned
+	}
+
+	/// Returns the byte offset immediately after the last complete durable line.
+	///
+	/// The watermark is allocation-free and may be persisted beside the last
+	/// assigned physical index. An indeterminate writer fails closed because a
+	/// torn suffix has no trustworthy complete-line boundary.
+	pub fn byte_watermark(&self) -> Result<u64, Error> {
+		if self.poisoned {
+			return Err(Error::Io(std::io::Error::other(
+				"transcript byte watermark is unknown after an indeterminate append",
+			)));
+		}
+		Ok(self.file.metadata()?.len())
+	}
+
+	fn stage(&mut self, events: &[Event]) -> Result<SmallVec<usize, 8>, Error> {
+		self.line.clear();
+		let mut ends = SmallVec::with_capacity(events.len());
+		for event in events {
+			validate_event(event)?;
+			write_line(event, &mut self.line)?;
+			self.line.extend_from_slice(b"\n");
+			ends.push(self.line.len());
+		}
+		Ok(ends)
+	}
+
+	fn classify(&mut self, source: Error, written: SmallVec<u64, 8>) -> JournalError {
+		if matches!(source, Error::AppendRollback { .. }) {
+			self.poisoned = true;
+			JournalIndeterminate { source, written, poisoned: true }.into()
+		} else {
+			JournalError::RolledBack { source }
+		}
+	}
+
+	fn finish_failed_many(
+		&mut self,
+		source: Error,
+		indexes: &SmallVec<u64, 8>,
+		failed_index: u64,
+	) -> AppendManyError {
+		if matches!(source, Error::AppendRollback { .. }) {
+			let mut written = indexes.clone();
+			written.push(failed_index);
+			return AppendManyError {
+				source:   self.classify(source, written),
+				appended: SmallVec::new(),
+			};
+		}
+		AppendManyError { source: JournalError::RolledBack { source }, appended: indexes.clone() }
 	}
 }
 
@@ -173,14 +440,21 @@ impl Writer {
 mod tests {
 	use std::io::{self, Write};
 
-	use super::{AppendTarget, append_all};
+	use bytes::BytesMut;
+	use smallvec::SmallVec;
+	use tempfile::tempdir;
 
-	struct PartialTarget {
-		bytes:      Vec<u8>,
-		write_left: Option<usize>,
+	use super::{AppendTarget, Error, JournalError, Writer, append_all, commit};
+
+	struct FaultTarget {
+		bytes:         Vec<u8>,
+		write_left:    Option<usize>,
+		rollback_fail: bool,
+		sync_failures: usize,
+		syncs:         usize,
 	}
 
-	impl Write for PartialTarget {
+	impl Write for FaultTarget {
 		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
 			let Some(left) = self.write_left else {
 				self.bytes.extend_from_slice(bytes);
@@ -200,27 +474,124 @@ mod tests {
 		}
 	}
 
-	impl AppendTarget for PartialTarget {
+	impl AppendTarget for FaultTarget {
 		fn append_len(&self) -> io::Result<u64> {
 			Ok(u64::try_from(self.bytes.len()).expect("test buffer length fits in u64"))
 		}
 
 		fn rollback_to(&mut self, len: u64) -> io::Result<()> {
+			if self.rollback_fail {
+				return Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
+					"injected rollback failure",
+				));
+			}
 			self
 				.bytes
 				.truncate(usize::try_from(len).expect("test buffer length fits in usize"));
+			self.sync_data()
+		}
+
+		fn sync_data(&mut self) -> io::Result<()> {
+			self.syncs += 1;
+			if self.sync_failures > 0 {
+				self.sync_failures -= 1;
+				return Err(io::Error::new(io::ErrorKind::Other, "injected sync failure"));
+			}
 			Ok(())
+		}
+	}
+
+	fn target() -> FaultTarget {
+		FaultTarget {
+			bytes:         b"complete\n".to_vec(),
+			write_left:    None,
+			rollback_fail: false,
+			sync_failures: 0,
+			syncs:         0,
 		}
 	}
 
 	#[test]
 	fn partial_append_rolls_back_and_target_remains_retryable() {
-		let mut target = PartialTarget { bytes: b"complete\n".to_vec(), write_left: Some(5) };
-		assert!(append_all(&mut target, b"{\"torn\":true}\n").is_err());
+		let mut target = target();
+		target.write_left = Some(5);
+		let original_len = target.append_len().expect("length");
+		assert!(append_all(&mut target, original_len, b"{\"torn\":true}\n").is_err());
 		assert_eq!(target.bytes, b"complete\n");
+		assert_eq!(target.syncs, 1, "rollback is made durable");
 
 		target.write_left = None;
-		append_all(&mut target, b"{\"complete\":true}\n").expect("retry succeeds");
+		let original_len = target.append_len().expect("length");
+		append_all(&mut target, original_len, b"{\"complete\":true}\n").expect("retry succeeds");
 		assert_eq!(target.bytes, b"complete\n{\"complete\":true}\n");
+	}
+
+	#[test]
+	fn rollback_failure_reports_indeterminate_bytes() {
+		let mut target = target();
+		target.write_left = Some(5);
+		target.rollback_fail = true;
+		let original_len = target.append_len().expect("length");
+		assert!(matches!(
+			append_all(&mut target, original_len, b"{\"torn\":true}\n"),
+			Err(Error::AppendRollback { .. })
+		));
+		assert_eq!(target.bytes, b"complete\n{\"to");
+	}
+
+	#[test]
+	fn durability_failure_with_clean_rollback_removes_the_group() {
+		let mut target = target();
+		let original_len = target.append_len().expect("length");
+		append_all(&mut target, original_len, b"one\ntwo\n").expect("staged write");
+		target.sync_failures = 1;
+		assert!(matches!(commit(&mut target, original_len), Err(Error::Io(_))));
+		assert_eq!(target.bytes, b"complete\n");
+		assert_eq!(target.syncs, 2, "failed commit and durable rollback each synchronize");
+	}
+
+	#[test]
+	fn durability_failure_never_makes_a_false_rollback_claim() {
+		let mut target = target();
+		let original_len = target.append_len().expect("length");
+		append_all(&mut target, original_len, b"one\ntwo\n").expect("staged write");
+		target.sync_failures = 2;
+		assert!(matches!(commit(&mut target, original_len), Err(Error::AppendRollback { .. })));
+		assert_eq!(
+			target.bytes, b"complete\n",
+			"truncate happened but its durability is indeterminate when rollback sync fails"
+		);
+	}
+
+	#[test]
+	fn indeterminate_failure_poison_halts_the_writer() {
+		let directory = tempdir().expect("temporary directory");
+		let file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.open(directory.path().join("poisoned.jsonl"))
+			.expect("create target");
+		let mut writer = Writer { file, next_index: 7, line: BytesMut::new(), poisoned: false };
+		let failure = writer.classify(
+			Error::AppendRollback {
+				write:    io::Error::new(io::ErrorKind::StorageFull, "injected write failure"),
+				rollback: io::Error::new(io::ErrorKind::PermissionDenied, "injected rollback failure"),
+			},
+			SmallVec::from_iter([7]),
+		);
+
+		assert!(matches!(
+			&failure,
+			JournalError::Indeterminate(state)
+				if state.written.as_slice() == [7] && state.poisoned
+		));
+		assert!(writer.is_poisoned());
+		assert!(matches!(
+			writer.append_atomic(&[]),
+			Err(JournalError::Indeterminate(state))
+				if state.written.is_empty() && state.poisoned
+		));
 	}
 }

@@ -298,6 +298,12 @@ zstd = "0.13"
 xutf = "1.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
+[workspace.metadata.omp.dependency-lints.omp-agent]
+# D2: the agent reaches the world through omp-env. omp-storage is the single
+# sanctioned journal-subscriber edge; implementation crates stay behind env/v1.
+allowed-world-boundary = ["omp-env", "omp-storage"]
+denied-direct = ["omp-docserver", "omp-shell-engine", "omp-walker"]
+
 [patch.crates-io]
 # btls-sys 0.5.6 rewrites archive symbols with objcopy, which does not rewrite
 # Mach-O archives. This pinned upstream fix uses BoringSSL's native source-level

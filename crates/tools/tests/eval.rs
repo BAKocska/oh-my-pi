@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use omp_core::Str;
+use omp_core::{Duration, DurationUnit, Str};
 use omp_tool::{
 	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
 };
@@ -16,6 +16,8 @@ use omp_tools::eval::{
 	OutputChannel, OutputFrame, Payload, RunEvent, RunRequest, Session,
 };
 use serde_json::json;
+
+const TEST_INTERRUPT_GRACE: Duration = Duration::new(1, DurationUnit::Milliseconds);
 
 #[derive(Clone)]
 struct UnusedExec;
@@ -354,7 +356,8 @@ fn invalid_timeout_fault_projection_is_exact() {
 
 #[tokio::test]
 async fn external_session_reset_separates_chat_state_and_preserves_the_new_session() {
-	let runtime = eval::kernel::EmbeddedPython::new(Arc::clone(&PYTHON));
+	let runtime = eval::kernel::EmbeddedPython::new(Arc::clone(&PYTHON), TEST_INTERRUPT_GRACE)
+		.expect("test interrupt grace is representable");
 	let (tool, control) = eval::eval_controlled(runtime);
 
 	let session_a = execute(&tool, "session_value = 'A'\nsession_value").await;
@@ -384,7 +387,8 @@ async fn external_session_reset_separates_chat_state_and_preserves_the_new_sessi
 
 #[tokio::test]
 async fn authenticated_owners_have_isolated_persistent_namespaces() {
-	let runtime = eval::kernel::EmbeddedPython::new(Arc::clone(&PYTHON));
+	let runtime = eval::kernel::EmbeddedPython::new(Arc::clone(&PYTHON), TEST_INTERRUPT_GRACE)
+		.expect("test interrupt grace is representable");
 	let tool = eval::eval(runtime);
 
 	execute_owned(&tool, "chat-a", "private_value = 'A'").await;

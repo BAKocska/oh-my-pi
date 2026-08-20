@@ -32,7 +32,10 @@ use omp_proto::{
 	inference::v1 as inference_pb,
 	thread::v1::{Item, Message, Part, Role, Thread, item, part},
 };
-use omp_storage::transcript::{Header, Kind, SessionId, read_header, read_line};
+use omp_storage::{
+	index::{IndexedWriteError, NewSession, SessionIndex, SessionKind},
+	transcript::{Header, Kind, SessionId, read_header, read_line},
+};
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
 use parking_lot::Mutex;
 use secrecy::ExposeSecret as _;
@@ -97,6 +100,9 @@ pub enum ChatError {
 	/// Durable transcript state failed to open, create, or project.
 	#[error(transparent)]
 	Journal(Box<omp_agent::JournalError>),
+	/// The authoritative write-time sessions index failed.
+	#[error(transparent)]
+	SessionIndex(Box<omp_storage::index::Error>),
 	/// A durable transcript could not be projected into canonical replay items.
 	#[error(transparent)]
 	Projection(Box<omp_agent::ProjectionError>),
@@ -173,10 +179,11 @@ struct Session {
 }
 
 struct ChatScope<'a> {
-	catalog:      &'a omp_llm_catalog::snapshot::Catalog,
-	root:         &'a Path,
-	sessions_dir: &'a Path,
-	registry:     Arc<Registry>,
+	catalog:       &'a omp_llm_catalog::snapshot::Catalog,
+	root:          &'a Path,
+	sessions_dir:  &'a Path,
+	session_index: Arc<SessionIndex>,
+	registry:      Arc<Registry>,
 }
 pub(crate) struct ChatAuthWorker {
 	ui:   ChatAuth,
@@ -452,10 +459,11 @@ mod auth_worker_tests {
 
 #[derive(Clone)]
 struct ChatParentContext {
-	state:        AgentState,
-	session_id:   Str,
-	sessions_dir: PathBuf,
-	root:         PathBuf,
+	state:         AgentState,
+	session_id:    Str,
+	sessions_dir:  PathBuf,
+	root:          PathBuf,
+	session_index: Arc<SessionIndex>,
 }
 
 pub(crate) struct ChatParentHost<C: TurnClient + Clone + 'static> {
@@ -472,11 +480,18 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 		session_id: Str,
 		sessions_dir: PathBuf,
 		root: PathBuf,
+		session_index: Arc<SessionIndex>,
 	) -> Self {
 		Self {
 			client,
 			env,
-			context: Mutex::new(ChatParentContext { state, session_id, sessions_dir, root }),
+			context: Mutex::new(ChatParentContext {
+				state,
+				session_id,
+				sessions_dir,
+				root,
+				session_index,
+			}),
 		}
 	}
 
@@ -611,12 +626,15 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		let directory = context.sessions_dir.join("eval-agents");
 		std::fs::create_dir_all(&directory)
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
-		let journal = Journal::create(&directory.join(format!("{id}.jsonl")), &Header {
-			v:       4,
-			id:      SessionId(id.clone()),
-			created: now_ms(),
-			cwd:     context.root,
-		})
+		let parent = SessionId(context.session_id.clone());
+		let journal = create_indexed_journal(
+			&directory.join(format!("{id}.jsonl")),
+			&context.root,
+			&id,
+			Arc::clone(&context.session_index),
+			SessionKind::Subagent,
+			Some(&parent),
+		)
 		.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		let mut child_snapshot = context.state.snapshot().as_ref().clone();
 		child_snapshot.enabled_tools = child_snapshot
@@ -684,7 +702,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 }
 
 /// Runs one interactive durable project-chat session.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[expect(
 	clippy::future_not_send,
 	reason = "the interactive chat future owns a thread-confined terminal scene"
@@ -695,11 +713,13 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 	let data_dir = crate::cli::data_dir(None)?;
 	let catalog =
 		omp_llm_catalog::snapshot::Catalog::try_embedded().map_err(|e| miette::miette!(e))?;
-	let model = match args.model.clone().or_else(|| {
-		crate::settings::Settings::load(&data_dir)
-			.default_model
-			.map(Str::from)
-	}) {
+	let settings = crate::settings::Settings::load(&data_dir);
+	let interrupt_grace = settings.runtime_durations().interrupt_grace;
+	let model = match args
+		.model
+		.clone()
+		.or_else(|| settings.default_model.map(Str::from))
+	{
 		Some(model) => model,
 		None => crate::wizard::run(&data_dir, catalog)
 			.await?
@@ -721,16 +741,24 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 		&env_socket,
 		&document_socket,
 		args.py_eval,
+		interrupt_grace,
 	)
 	.await
 	.map_err(|e| miette::miette!(e))?;
+	let session_index = environment.sessions_index();
 	let env = environment.client().clone();
 	let eval_bridge = environment.eval_bridge();
 	let eval_control = environment.eval_control();
 
 	let registry = environment.registry();
-	let session = open_session(&root, &sessions_dir, resume.as_ref(), registry.as_ref())
-		.map_err(|e| miette::miette!(e))?;
+	let session = open_session(
+		&root,
+		&sessions_dir,
+		resume.as_ref(),
+		registry.as_ref(),
+		Arc::clone(&session_index),
+	)
+	.map_err(|e| miette::miette!(e))?;
 	let snapshot =
 		agent_snapshot(model.as_str(), catalog, &root, &session.id, Arc::clone(&registry))
 			.map_err(|e| miette::miette!(e))?;
@@ -743,6 +771,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 			.wrap_err_with(|| format!("could not connect to {endpoint}"))?;
 		run_ui(
 			RpcTurnClient::new(channel),
+			&environment,
 			env,
 			state,
 			session,
@@ -750,7 +779,13 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 			eval_control.clone(),
 			None,
 			data_dir.clone(),
-			ChatScope { catalog, root: &root, sessions_dir: &sessions_dir, registry },
+			ChatScope {
+				catalog,
+				root: &root,
+				sessions_dir: &sessions_dir,
+				session_index: Arc::clone(&session_index),
+				registry,
+			},
 			!resume_requested,
 		)
 		.await
@@ -766,6 +801,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 			.map_err(|e| miette::miette!(e))?;
 		run_ui(
 			client,
+			&environment,
 			env,
 			state,
 			session,
@@ -773,7 +809,13 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 			eval_control,
 			Some(inference_registry),
 			data_dir,
-			ChatScope { catalog, root: &root, sessions_dir: &sessions_dir, registry },
+			ChatScope {
+				catalog,
+				root: &root,
+				sessions_dir: &sessions_dir,
+				session_index: Arc::clone(&session_index),
+				registry,
+			},
 			!resume_requested,
 		)
 		.await
@@ -788,7 +830,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 }
 
 /// Reports the platform limitation before touching project state.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub async fn run(_args: ChatArgs) -> miette::Result<()> {
 	use miette::IntoDiagnostic as _;
 	Err(ChatError::UnsupportedPlatform).into_diagnostic()
@@ -800,6 +842,7 @@ pub async fn run(_args: ChatArgs) -> miette::Result<()> {
 )]
 async fn run_ui<C: TurnClient + Clone + 'static>(
 	client: C,
+	environment: &crate::envd::ProjectEnvironment,
 	env: omp_env::EnvClient,
 	mut state: AgentState,
 	mut session: Session,
@@ -817,6 +860,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		session.id.clone(),
 		scope.sessions_dir.to_path_buf(),
 		scope.root.to_path_buf(),
+		Arc::clone(&scope.session_index),
 	));
 	eval_bridge
 		.bind_parent(parent.clone())
@@ -847,6 +891,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		let Session { id, journal, initial_items } = session;
 		let current_id = id.clone();
 		let agent = Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
+		environment.bind_agent_control(agent.control())?;
 		let exit = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
@@ -867,8 +912,13 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			omp_chat_ui::host::HostExit::Resume(id) => {
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
-				session =
-					open_session(scope.root, scope.sessions_dir, Some(&id), scope.registry.as_ref())?;
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					Some(&id),
+					scope.registry.as_ref(),
+					Arc::clone(&scope.session_index),
+				)?;
 				state = AgentState::new(agent_snapshot(
 					&model,
 					scope.catalog,
@@ -880,7 +930,13 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			omp_chat_ui::host::HostExit::NewSession => {
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
-				session = open_session(scope.root, scope.sessions_dir, None, scope.registry.as_ref())?;
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					None,
+					scope.registry.as_ref(),
+					Arc::clone(&scope.session_index),
+				)?;
 				state = AgentState::new(agent_snapshot(
 					&model,
 					scope.catalog,
@@ -1006,6 +1062,7 @@ fn open_session(
 	sessions_dir: &Path,
 	resume: Option<&Str>,
 	registry: &Registry,
+	session_index: Arc<SessionIndex>,
 ) -> Result<Session, ChatError> {
 	let id = match resume {
 		Some(id) => strict_session_id(id)?,
@@ -1020,7 +1077,7 @@ fn open_session(
 				ChatError::ProjectState { path: path.clone(), source }
 			}
 		})?;
-		let journal = Journal::open(&path)?;
+		let mut journal = Journal::open(&path)?;
 		let view = journal.load()?;
 		if view.header().id.0 != id {
 			return Err(ChatError::SessionMismatch(id));
@@ -1030,20 +1087,65 @@ fn open_session(
 		}
 		let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
 		drop(view);
+		journal.attach_session_index(Arc::clone(&session_index), SessionId(id.clone()));
 		(journal, initial_items)
 	} else {
-		let journal = Journal::create(&path, &Header {
-			v:       4,
-			id:      SessionId(id.clone()),
-			created: now_ms(),
-			cwd:     root.to_owned(),
-		})?;
+		let journal = create_indexed_journal(
+			&path,
+			root,
+			&id,
+			Arc::clone(&session_index),
+			SessionKind::Interactive,
+			None,
+		)?;
 		let view = journal.load()?;
 		let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
 		drop(view);
 		(journal, initial_items)
 	};
 	Ok(Session { id, journal, initial_items })
+}
+
+fn create_indexed_journal(
+	path: &Path,
+	root: &Path,
+	id: &Str,
+	session_index: Arc<SessionIndex>,
+	kind: SessionKind,
+	parent: Option<&SessionId>,
+) -> Result<Journal, ChatError> {
+	let session_id = SessionId(id.clone());
+	let created_ms = now_ms();
+	let root_text = root.to_string_lossy();
+	let request = NewSession {
+		id: &session_id,
+		cwd: root_text.as_ref(),
+		project: root_text.as_ref(),
+		created_ms,
+		kind,
+		parent,
+		remote: false,
+	};
+	let result = session_index.create_session(&request, || {
+		let journal = Journal::create(path, &Header {
+			v:       4,
+			id:      session_id.clone(),
+			created: created_ms,
+			cwd:     root.to_owned(),
+		})?;
+		let watermark = journal.byte_watermark()?;
+		Ok::<_, omp_agent::JournalError>((journal, watermark))
+	});
+	let mut journal = match result {
+		Ok(journal) => journal,
+		Err(IndexedWriteError::Journal(error)) => return Err(error.into()),
+		Err(IndexedWriteError::IndexBeforeJournal(error))
+		| Err(IndexedWriteError::IndexAfterJournal { source: error, .. }) => {
+			return Err(ChatError::SessionIndex(Box::new(error)));
+		},
+	};
+	journal.attach_session_index(session_index, session_id);
+	Ok(journal)
 }
 
 fn resume_choices(
@@ -1462,6 +1564,10 @@ mod tests {
 		inference_pb::Outcome {
 			output: vec![output],
 			stop: inference_pb::StopReason::StopEndTurn as i32,
+			usage: Some(inference_pb::Usage::default()),
+			cost: Some(inference_pb::Cost::default()),
+			provider: "test".to_owned(),
+			model: "scripted".to_owned(),
 			..inference_pb::Outcome::default()
 		}
 	}
@@ -1575,8 +1681,14 @@ mod tests {
 		let path = sessions_dir.join(format!("{id}.jsonl"));
 		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
 			.expect("standard journal permissions");
-		let session =
-			open_session(&root, &sessions_dir, Some(&id), &Registry::new()).expect("resume session");
+		let session = open_session(
+			&root,
+			&sessions_dir,
+			Some(&id),
+			&Registry::new(),
+			Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).expect("session index")),
+		)
+		.expect("resume session");
 		assert_eq!(session.id, id);
 		assert_eq!(
 			std::fs::metadata(path)
@@ -1722,8 +1834,16 @@ mod tests {
 			.expect("write torn fragment");
 		drop(file);
 
-		let session = open_session(&root, &sessions_dir, Some(&id), &Registry::new())
-			.expect("torn session resumes");
+		let session = open_session(
+			&root,
+			&sessions_dir,
+			Some(&id),
+			&Registry::new(),
+			Arc::new(
+				SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("session index"),
+			),
+		)
+		.expect("torn session resumes");
 		assert_eq!(session.id, id);
 		let log = session.journal.load().expect("repaired journal loads");
 		assert_eq!(log.len(), 1, "the torn fragment is truncated, intact events remain");
@@ -1761,6 +1881,9 @@ mod tests {
 			Str::new_static("parent-session"),
 			sessions_dir,
 			root,
+			Arc::new(
+				SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("session index"),
+			),
 		);
 
 		let completion = crate::envd::eval::ParentSessionHost::completion(

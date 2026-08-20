@@ -1,10 +1,18 @@
 //! Leaf value types used by transcript events.
 
-use omp_core::Str;
+use omp_core::{InvocationPhase, Str};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
-use serde_json::value::RawValue;
+use serde_json::{
+	Value,
+	value::{RawValue, to_raw_value},
+};
+use smallvec::SmallVec;
+use thiserror::Error;
 
-use super::{block::Block, raweq::opt_raw_eq};
+use super::{
+	block::Block,
+	raweq::{opt_raw_eq, raw_eq},
+};
 
 macro_rules! string_id {
 	($(#[$meta:meta])* $name:ident, $doc:literal) => {
@@ -187,8 +195,20 @@ impl PartialEq for RequestError {
 impl Eq for RequestError {}
 
 /// The source that assigned a transcript title.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+	Debug,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Serialize,
+	Deserialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum TitleSource {
 	/// A person explicitly chose the title.
 	User,
@@ -317,4 +337,209 @@ pub struct Pin {
 	pub provider:   ProviderId,
 	/// Provider-local credential identifier.
 	pub credential: Str,
+}
+
+/// Core-authenticated identity and replay result of one durable request.
+///
+/// The generation and idempotency fields are copied from the authenticated
+/// request envelope after the core accepts its generation fence. `indexes`
+/// records the exact journal events assigned to the logical operation so a
+/// retry can return the original result without applying it twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestAudit {
+	/// Unique identifier for this attempt.
+	pub request_id:         Str,
+	/// Stable identity shared by retries of the logical operation.
+	pub idempotency_key:    Str,
+	/// Authenticated extension namespace owning this idempotency key.
+	pub extension_id:       Str,
+	/// Authenticated extension-host incarnation.
+	pub host_generation:    u64,
+	/// Session incarnation against which the operation was accepted.
+	pub session_generation: u64,
+	/// Stable operation vocabulary supplied by the core request router.
+	pub operation:          Str,
+	/// Exact journal indexes returned by the first successful application.
+	pub indexes:            SmallVec<u64, 8>,
+}
+
+/// Phase-specific durable facts fixed by one invocation transition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvocationTransition {
+	/// Stable invocation identity shared by all seven transitions.
+	pub invocation_id:        Str,
+	/// Provider call identity for the invocation.
+	pub call_id:              CallId,
+	/// Canonical phase whose facts this record fixes.
+	pub phase:                InvocationPhase,
+	/// Canonical requested arguments, present only at `ARGS_FINALIZED`.
+	pub requested_args:       Option<Box<RawValue>>,
+	/// Ordered argument transformation trail, present only at `ADMITTED`.
+	pub transformations:      Option<SmallVec<Box<RawValue>, 4>>,
+	/// Frozen effective arguments, present only at `ADMITTED`.
+	pub effective_args:       Option<Box<RawValue>>,
+	/// Structured admission receipt, present only at `ADMITTED`.
+	pub admission_receipt:    Option<Box<RawValue>>,
+	/// Durable assistant-item journal index, present only when committed.
+	pub assistant_item_event: Option<u64>,
+	/// Core-issued scoped effect token, present only at `EFFECTS_AUTHORIZED`.
+	pub effect_token:         Option<Str>,
+	/// Exact core-narrowed effect envelope paired with the scoped token.
+	pub effects:              Option<omp_tool::Effects>,
+	/// Epoch-millisecond effect authorization time, paired with the token.
+	pub authorized_at:        Option<u64>,
+	/// Single durable call-outcome reference, present only at `SETTLED`.
+	pub outcome:
+		Option<omp_tool::CallOutcome<omp_tool::CallOutcomeDetails, omp_tool::CallOutcomeDetails>>,
+}
+
+impl InvocationTransition {
+	/// Validates that exactly the facts fixed by `phase` are present and that
+	/// structured fact bytes use canonical compact JSON.
+	pub fn validate(&self) -> Result<(), InvocationTransitionError> {
+		let canonical = self.requested_args.as_deref().is_none_or(raw_is_canonical)
+			&& self.effective_args.as_deref().is_none_or(raw_is_canonical)
+			&& self
+				.admission_receipt
+				.as_deref()
+				.is_none_or(raw_is_canonical)
+			&& self
+				.transformations
+				.as_ref()
+				.is_none_or(|trail| trail.iter().all(|raw| raw_is_canonical(raw)))
+			&& self.outcome.as_ref().is_none_or(outcome_is_canonical);
+		let phase_fields = match self.phase {
+			InvocationPhase::Open | InvocationPhase::Admission => {
+				self.requested_args.is_none()
+					&& self.transformations.is_none()
+					&& self.effective_args.is_none()
+					&& self.admission_receipt.is_none()
+					&& self.assistant_item_event.is_none()
+					&& self.effect_token.is_none()
+					&& self.effects.is_none()
+					&& self.authorized_at.is_none()
+					&& self.outcome.is_none()
+			},
+			InvocationPhase::ArgsFinalized => {
+				self.requested_args.is_some()
+					&& self.transformations.is_none()
+					&& self.effective_args.is_none()
+					&& self.admission_receipt.is_none()
+					&& self.assistant_item_event.is_none()
+					&& self.effect_token.is_none()
+					&& self.effects.is_none()
+					&& self.authorized_at.is_none()
+					&& self.outcome.is_none()
+			},
+			InvocationPhase::Admitted => {
+				self.requested_args.is_none()
+					&& self.transformations.is_some()
+					&& self.effective_args.is_some()
+					&& self.admission_receipt.is_some()
+					&& self.assistant_item_event.is_none()
+					&& self.effect_token.is_none()
+					&& self.effects.is_none()
+					&& self.authorized_at.is_none()
+					&& self.outcome.is_none()
+			},
+			InvocationPhase::AssistantItemCommitted => {
+				self.requested_args.is_none()
+					&& self.transformations.is_none()
+					&& self.effective_args.is_none()
+					&& self.admission_receipt.is_none()
+					&& self.assistant_item_event.is_some()
+					&& self.effect_token.is_none()
+					&& self.effects.is_none()
+					&& self.authorized_at.is_none()
+					&& self.outcome.is_none()
+			},
+			InvocationPhase::EffectsAuthorized => {
+				self.requested_args.is_none()
+					&& self.transformations.is_none()
+					&& self.effective_args.is_none()
+					&& self.admission_receipt.is_none()
+					&& self.assistant_item_event.is_none()
+					&& self.effect_token.is_some()
+					&& self.effects.is_some()
+					&& self.authorized_at.is_some()
+					&& self.outcome.is_none()
+			},
+			InvocationPhase::Settled => {
+				self.requested_args.is_none()
+					&& self.transformations.is_none()
+					&& self.effective_args.is_none()
+					&& self.admission_receipt.is_none()
+					&& self.assistant_item_event.is_none()
+					&& self.effect_token.is_none()
+					&& self.effects.is_none()
+					&& self.authorized_at.is_none()
+					&& self.outcome.is_some()
+			},
+		};
+		if canonical && phase_fields {
+			Ok(())
+		} else {
+			Err(InvocationTransitionError { phase: self.phase })
+		}
+	}
+}
+
+fn raw_is_canonical(raw: &RawValue) -> bool {
+	serde_json::from_str::<Value>(raw.get())
+		.and_then(|value| to_raw_value(&value))
+		.is_ok_and(|canonical| canonical.get() == raw.get())
+}
+
+fn outcome_is_canonical(
+	outcome: &omp_tool::CallOutcome<omp_tool::CallOutcomeDetails, omp_tool::CallOutcomeDetails>,
+) -> bool {
+	let details = match outcome {
+		omp_tool::CallOutcome::Ok(details) | omp_tool::CallOutcome::Faulted(details) => details,
+		omp_tool::CallOutcome::ArgsRejected(_) | omp_tool::CallOutcome::Aborted { .. } => {
+			return true;
+		},
+	};
+	match details {
+		omp_tool::CallOutcomeDetails::Inline { json } => serde_json::from_slice::<Value>(json)
+			.and_then(|value| serde_json::to_vec(&value))
+			.is_ok_and(|canonical| canonical.as_slice() == json.as_ref()),
+		omp_tool::CallOutcomeDetails::Spilled { .. } => true,
+	}
+}
+
+impl PartialEq for InvocationTransition {
+	fn eq(&self, other: &Self) -> bool {
+		self.invocation_id == other.invocation_id
+			&& self.call_id == other.call_id
+			&& self.phase == other.phase
+			&& opt_raw_eq(self.requested_args.as_deref(), other.requested_args.as_deref())
+			&& match (&self.transformations, &other.transformations) {
+				(Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| raw_eq(a, b)),
+				(None, None) => true,
+				_ => false,
+			} && opt_raw_eq(self.effective_args.as_deref(), other.effective_args.as_deref())
+			&& opt_raw_eq(self.admission_receipt.as_deref(), other.admission_receipt.as_deref())
+			&& self.assistant_item_event == other.assistant_item_event
+			&& self.effect_token == other.effect_token
+			&& self.effects == other.effects
+			&& self.authorized_at == other.authorized_at
+			&& self.outcome == other.outcome
+	}
+}
+
+impl Eq for InvocationTransition {}
+
+/// A transition carried facts that do not belong to its recorded phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("invocation transition has fields inconsistent with phase {phase}")]
+pub struct InvocationTransitionError {
+	phase: InvocationPhase,
+}
+
+impl InvocationTransitionError {
+	/// Returns the phase whose fact invariant was violated.
+	#[must_use]
+	pub const fn phase(self) -> InvocationPhase {
+		self.phase
+	}
 }

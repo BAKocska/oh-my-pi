@@ -7,17 +7,19 @@
 mod incoming;
 mod registry;
 pub mod render;
+mod spec_generated;
 
 use std::{collections::BTreeMap, fmt, future::Future, io::Write};
 
 use bytes::Bytes;
 use futures::Stream;
 pub use incoming::{
-	CommitError, IncomingParams, Interrupt, InterruptWaitError, InterruptibleParams,
-	InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
+	CommitError, FinalizedArgs, IncomingCursor, IncomingParams, Interrupt, InterruptWaitError,
+	InterruptibleParams, InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
 };
 use omp_core::{InvocationPhase, SparseMap, Str};
 pub use omp_proto::inference::v1::Fallback;
+pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
 	Claim, Claims, ConstraintDisposition, ErasedEv, ErasedOutcome, ErasedStream, LoweredTool,
 	LoweringCaps, MountedDevice, Precedence, ProjectedCall, ProjectedVerdict, Registry,
@@ -25,6 +27,10 @@ pub use registry::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
+pub use spec_generated::{
+	CallbackAbi, PhaseLegalityRow, RuntimeDurationMetadata, RuntimeSymbolSpec, operation_spec,
+	phase_legality_matrix, runtime_duration_metadata, runtime_symbols,
+};
 use thiserror::Error;
 
 /// Generates the compact, deterministic JSON Schema exposed to models for `T`.
@@ -50,6 +56,13 @@ pub fn schema<T: schemars::JsonSchema>() -> Bytes {
 
 /// Namespaced thread-item property carrying a committed tool revision.
 pub const TOOL_REV_PROP: &str = "omp/tool-rev";
+
+/// Canonical courtesy-interrupt grace used when runtime settings omit it.
+pub const DEFAULT_INTERRUPT_GRACE: omp_core::Duration =
+	omp_core::Duration::new(150, omp_core::DurationUnit::Milliseconds);
+
+/// Maximum number of simultaneous host pull requests for one invocation.
+pub const MAX_PENDING_PULLS: usize = 1;
 
 /// Model-facing registration surface for a tool declaration.
 #[derive(
@@ -123,6 +136,337 @@ impl std::str::FromStr for Rev {
 	}
 }
 
+/// Canonical non-negative US-dollar amount stored exactly as nano-USD.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Usd(u64);
+
+impl Usd {
+	/// Zero dollars.
+	pub const ZERO: Self = Self(0);
+
+	/// Creates an exact amount from nano-US dollars.
+	#[must_use]
+	pub const fn from_nanos(nanos: u64) -> Self {
+		Self(nanos)
+	}
+
+	/// Returns the exact nano-US-dollar magnitude.
+	#[must_use]
+	pub const fn as_nanos(self) -> u64 {
+		self.0
+	}
+}
+
+/// Invalid or non-canonical decimal US-dollar text.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("invalid canonical USD amount: {value}")]
+pub struct UsdParseError {
+	/// Rejected spelling.
+	pub value: Str,
+}
+
+impl std::str::FromStr for Usd {
+	type Err = UsdParseError;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		let invalid = || UsdParseError { value: Str::from(value) };
+		let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+		if whole.is_empty()
+			|| !whole.bytes().all(|byte| byte.is_ascii_digit())
+			|| (whole.len() > 1 && whole.starts_with('0'))
+			|| fraction.len() > 9
+			|| (!fraction.is_empty()
+				&& (!fraction.bytes().all(|byte| byte.is_ascii_digit()) || fraction.ends_with('0')))
+		{
+			return Err(invalid());
+		}
+		let whole: u64 = whole.parse().map_err(|_| invalid())?;
+		let scale = 10_u64.pow(u32::try_from(9 - fraction.len()).expect("fraction length bounded"));
+		let fraction = if fraction.is_empty() {
+			0
+		} else {
+			fraction
+				.parse::<u64>()
+				.map_err(|_| invalid())?
+				.checked_mul(scale)
+				.ok_or_else(invalid)?
+		};
+		let nanos = whole
+			.checked_mul(1_000_000_000)
+			.and_then(|whole| whole.checked_add(fraction))
+			.ok_or_else(invalid)?;
+		Ok(Self(nanos))
+	}
+}
+
+impl fmt::Display for Usd {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let whole = self.0 / 1_000_000_000;
+		let fraction = self.0 % 1_000_000_000;
+		if fraction == 0 {
+			return whole.fmt(formatter);
+		}
+		let mut digits = format!("{fraction:09}");
+		while digits.ends_with('0') {
+			digits.pop();
+		}
+		write!(formatter, "{whole}.{digits}")
+	}
+}
+
+impl Serialize for Usd {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.collect_str(self)
+	}
+}
+
+impl<'de> Deserialize<'de> for Usd {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Str::deserialize(deserializer)?;
+		value.parse().map_err(serde::de::Error::custom)
+	}
+}
+
+/// Maximum declared document authority for one tool revision.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DocEffects {
+	/// Whether document reads are permitted.
+	pub read:        bool,
+	/// Exact declared write-glob ceilings.
+	pub write_globs: SmallVec<Str, 4>,
+}
+
+impl DocEffects {
+	/// Returns whether this document domain grants no authority.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		!self.read && self.write_globs.is_empty()
+	}
+}
+
+/// Maximum declared process authority for one tool revision.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecEffects {
+	/// Exact executable names permitted by the declaration.
+	pub commands: SmallVec<Str, 4>,
+	/// Whether outbound network access is permitted.
+	pub network:  bool,
+}
+
+impl ExecEffects {
+	/// Returns whether this process domain grants no authority.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.commands.is_empty() && !self.network
+	}
+}
+
+/// Maximum declared inference spend for one tool revision.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InferenceEffects {
+	/// Maximum provider requests.
+	pub max_requests: u32,
+	/// Maximum exact provider spend.
+	pub max_usd:      Usd,
+}
+
+impl InferenceEffects {
+	/// Returns whether this inference domain grants no authority.
+	#[must_use]
+	pub const fn is_empty(&self) -> bool {
+		self.max_requests == 0 && self.max_usd.as_nanos() == 0
+	}
+}
+
+/// Maximum declared effect envelope for one tool revision.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Effects {
+	/// Document authority, absent when the domain is denied.
+	pub documents: Option<DocEffects>,
+	/// Process authority, absent when the domain is denied.
+	pub exec:      Option<ExecEffects>,
+	/// Inference authority, absent when the domain is denied.
+	pub inference: Option<InferenceEffects>,
+	/// Maximum spawned subagents.
+	pub subagents: u32,
+}
+
+impl Effects {
+	/// Empty deny-all envelope for an explicitly effect-free tool.
+	pub const fn empty() -> Self {
+		Self { documents: None, exec: None, inference: None, subagents: 0 }
+	}
+
+	/// Returns whether `self` grants no authority.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.documents.as_ref().is_none_or(DocEffects::is_empty)
+			&& self.exec.as_ref().is_none_or(ExecEffects::is_empty)
+			&& self
+				.inference
+				.as_ref()
+				.is_none_or(InferenceEffects::is_empty)
+			&& self.subagents == 0
+	}
+
+	/// Returns whether this envelope is a conservative subset of `maximum`.
+	///
+	/// Executable `*` is the explicit unrestricted ceiling. Write-glob
+	/// narrowing recognizes exact ceilings, `**`, and lexical descendants of a
+	/// `path/**` ceiling; uncertain glob-language implication fails closed.
+	#[must_use]
+	pub fn is_subset_of(&self, maximum: &Self) -> bool {
+		self.subagents <= maximum.subagents
+			&& optional_subset(
+				self.documents.as_ref(),
+				maximum.documents.as_ref(),
+				DocEffects::is_empty,
+				|value, max| {
+					(!value.read || max.read)
+						&& value.write_globs.iter().all(|glob| {
+							max.write_globs
+								.iter()
+								.any(|ceiling| glob_is_subset(glob, ceiling))
+						})
+				},
+			) && optional_subset(
+			self.exec.as_ref(),
+			maximum.exec.as_ref(),
+			ExecEffects::is_empty,
+			|value, max| {
+				(!value.network || max.network)
+					&& value.commands.iter().all(|command| {
+						max.commands
+							.iter()
+							.any(|ceiling| ceiling == "*" || ceiling == command)
+					})
+			},
+		) && optional_subset(
+			self.inference.as_ref(),
+			maximum.inference.as_ref(),
+			InferenceEffects::is_empty,
+			|value, max| value.max_requests <= max.max_requests && value.max_usd <= max.max_usd,
+		)
+	}
+
+	/// Accepts an invocation envelope only when it narrows this declaration.
+	#[must_use]
+	pub fn narrow(&self, requested: Self) -> Option<Self> {
+		requested.is_subset_of(self).then_some(requested)
+	}
+}
+
+fn glob_is_subset(value: &str, maximum: &str) -> bool {
+	if value == maximum || maximum == "**" {
+		return true;
+	}
+	if value.split('/').any(|component| component == "..") {
+		return false;
+	}
+	maximum.strip_suffix("/**").is_some_and(|prefix| {
+		value
+			.strip_prefix(prefix)
+			.is_some_and(|suffix| suffix.starts_with('/'))
+	})
+}
+
+fn optional_subset<T>(
+	value: Option<&T>,
+	maximum: Option<&T>,
+	is_empty: impl FnOnce(&T) -> bool,
+	check: impl FnOnce(&T, &T) -> bool,
+) -> bool {
+	match (value, maximum) {
+		(None, _) => true,
+		(Some(value), Some(maximum)) => check(value, maximum),
+		(Some(value), None) => is_empty(value),
+	}
+}
+
+/// Invalid effect envelope received at a transport boundary.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum EffectsWireError {
+	/// Inference spend was not canonical decimal USD.
+	#[error(transparent)]
+	Usd(#[from] UsdParseError),
+}
+
+impl From<&Effects> for omp_proto::policy::v1::EffectEnvelope {
+	fn from(value: &Effects) -> Self {
+		Self {
+			documents: value
+				.documents
+				.as_ref()
+				.map(|documents| omp_proto::policy::v1::DocEffects {
+					read:        documents.read,
+					write_globs: documents
+						.write_globs
+						.iter()
+						.map(|glob| glob.as_str().to_owned())
+						.collect(),
+					props:       None,
+				}),
+			exec:      value
+				.exec
+				.as_ref()
+				.map(|exec| omp_proto::policy::v1::ExecEffects {
+					commands: exec
+						.commands
+						.iter()
+						.map(|command| command.as_str().to_owned())
+						.collect(),
+					network:  exec.network,
+					props:    None,
+				}),
+			inference: value.inference.as_ref().map(|inference| {
+				omp_proto::policy::v1::InferenceEffects {
+					max_requests: inference.max_requests,
+					max_usd:      inference.max_usd.to_string(),
+					props:        None,
+				}
+			}),
+			subagents: value.subagents,
+			props:     None,
+		}
+	}
+}
+
+impl TryFrom<&omp_proto::policy::v1::EffectEnvelope> for Effects {
+	type Error = EffectsWireError;
+
+	fn try_from(value: &omp_proto::policy::v1::EffectEnvelope) -> Result<Self, Self::Error> {
+		Ok(Self {
+			documents: value.documents.as_ref().map(|documents| DocEffects {
+				read:        documents.read,
+				write_globs: documents
+					.write_globs
+					.iter()
+					.map(|glob| Str::from(glob.as_str()))
+					.collect(),
+			}),
+			exec:      value.exec.as_ref().map(|exec| ExecEffects {
+				commands: exec
+					.commands
+					.iter()
+					.map(|command| Str::from(command.as_str()))
+					.collect(),
+				network:  exec.network,
+			}),
+			inference: value
+				.inference
+				.as_ref()
+				.map(|inference| -> Result<InferenceEffects, EffectsWireError> {
+					Ok(InferenceEffects {
+						max_requests: inference.max_requests,
+						max_usd:      inference.max_usd.parse()?,
+					})
+				})
+				.transpose()?,
+			subagents: value.subagents,
+		})
+	}
+}
+
 /// Durable identity of a tool call in a transcript.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ToolIdentity {
@@ -145,6 +489,8 @@ pub struct ToolSpec {
 	pub schema:          Bytes,
 	/// Requested constrained-sampling behavior.
 	pub constraint:      Constraint,
+	/// Maximum declared effect envelope; empty grants no authority.
+	pub effects:         Effects,
 	/// Content identity of the code that produces model-facing projections.
 	///
 	/// Native registrations use their crate/build identity. Supervised workers
@@ -690,19 +1036,61 @@ pub enum Coerce {
 	NullElision,
 }
 
+/// Stable class of an immutable argument repair.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum RepairKind {
+	/// A declared non-canonical field name was replaced by its canonical name.
+	Alias,
+	/// A declared [`Coerce`] transformation succeeded.
+	Coercion,
+	/// The tolerant parser accepted non-standard surface syntax.
+	Tolerance,
+	/// A declared optional null-like field was removed.
+	Elision,
+}
+
+/// One immutable transformation tied to the exact raw argument emission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Repair {
+	/// Canonical argument path affected by the transformation.
+	pub path:   SmallVec<ArgPath, 4>,
+	/// Stable repair class.
+	pub kind:   RepairKind,
+	/// Exact human-readable before/after description.
+	pub detail: Str,
+}
+
 /// Immutable declaration for one canonical argument path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArgSpec {
 	/// Canonical key/index path.
-	pub path:     SmallVec<ArgPath, 4>,
+	pub path:                  SmallVec<ArgPath, 4>,
 	/// Additional accepted spellings of the final object key.
-	pub aliases:  SmallVec<Str, 4>,
+	pub aliases:               SmallVec<Str, 4>,
 	/// Coercions applied in declaration order.
-	pub coerce:   SmallVec<Coerce, 2>,
+	pub coerce:                SmallVec<Coerce, 2>,
 	/// Human-readable requested shape used by structured argument faults.
-	pub expected: Str,
+	pub expected:              Str,
 	/// Optional valid example borrowed into a structured argument fault.
-	pub example:  Option<Str>,
+	pub example:               Option<Str>,
+	/// Whether this object field explicitly accepts undeclared member names.
+	///
+	/// Duplicate member names remain ambiguous even for an open object.
+	#[serde(default)]
+	pub additional_properties: bool,
 }
 
 #[derive(Default)]
@@ -815,6 +1203,25 @@ impl ArgSpecRegistry {
 		let revision = self.revisions.get(rev)?;
 		revision.specs.get(*revision.path_ids.get(path)?)
 	}
+
+	/// Borrows the declaration and its dense path identifier for one exact
+	/// revision and canonical or alias path.
+	#[must_use]
+	pub fn get_with_id(&self, rev: &Rev, path: &[ArgPath]) -> Option<(u32, &ArgSpec)> {
+		let revision = self.revisions.get(rev)?;
+		let path_id = *revision.path_ids.get(path)?;
+		Some((path_id, revision.specs.get(path_id)?))
+	}
+
+	/// Iterates the canonical declarations for one exact revision in dense path
+	/// identifier order.
+	pub fn iter(&self, rev: &Rev) -> impl Iterator<Item = (u32, &ArgSpec)> + '_ {
+		self
+			.revisions
+			.get(rev)
+			.into_iter()
+			.flat_map(|revision| revision.specs.iter())
+	}
 }
 
 /// Stable class of parameter pull failure.
@@ -843,6 +1250,8 @@ pub enum ArgIssueKind {
 	Malformed,
 	/// Pulled value had another JSON shape.
 	TypeMismatch,
+	/// More than one source member mapped to one canonical argument path.
+	Ambiguous,
 	/// Invocation framing violated the linear stream contract.
 	Protocol,
 }

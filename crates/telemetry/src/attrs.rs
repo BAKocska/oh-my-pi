@@ -190,6 +190,18 @@ pub mod omp_gen_ai {
 	pub const GATEWAY_RESPONSE_CACHE_STATUS: &str = "omp.gen_ai.gateway.response_cache.status";
 }
 
+/// omp runtime-duration attributes emitted on metrics and durable receipts.
+pub mod omp_runtime {
+	/// Configured courtesy-interrupt grace expressed exactly in nanoseconds.
+	pub const INTERRUPT_GRACE_NS: &str = "omp.runtime.interrupt_grace.ns";
+	/// Unit used to configure the courtesy-interrupt grace.
+	pub const INTERRUPT_GRACE_UNIT: &str = "omp.runtime.interrupt_grace.unit";
+	/// Configured invocation deadline expressed exactly in nanoseconds.
+	pub const DEADLINE_NS: &str = "omp.runtime.deadline.ns";
+	/// Unit used to configure the invocation deadline.
+	pub const DEADLINE_UNIT: &str = "omp.runtime.deadline.unit";
+}
+
 /// omp aggregate attribute keys stamped on the outer `invoke_agent` span.
 pub mod omp_aggregate {
 	/// Number of chat calls in the run, on `invoke_agent` spans.

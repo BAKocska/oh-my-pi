@@ -27,6 +27,8 @@
 //! C-API from the executable at dlopen. This crate's build script applies it
 //! to its own binaries; downstream crates need it in their own build script.
 
+mod bindings;
+
 use std::{
 	env,
 	error::Error,
@@ -39,6 +41,10 @@ use std::{
 	sync::atomic::{AtomicBool, Ordering},
 };
 
+pub use bindings::{
+	bind_duration, bind_principal, install_environment_client, set_environment_root,
+	set_resource_receipt, set_scheme_snapshot,
+};
 pub use pyo3;
 use pyo3::{ffi, prelude::*};
 
@@ -121,6 +127,7 @@ impl Builder {
 		let site = self.site_packages.unwrap_or_else(default_site_packages);
 		let site_c = CString::new(site.as_os_str().as_bytes())
 			.map_err(|_| InitError::InvalidPath(site.clone()))?;
+		bindings::register();
 		install_frozen_modules();
 		init_python(&site_c);
 		Ok(Engine { _priv: () })

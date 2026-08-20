@@ -3,17 +3,19 @@
 use std::{
 	collections::VecDeque,
 	future::{Future, pending, ready},
+	num::NonZeroU32,
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
 	},
+	time::{Duration, Instant},
 };
 
 use futures::stream;
 use omp_agent::{
 	AbortDisposition, Agent, AgentError, AgentPhase, AgentSnapshot, AgentState, Error, InvokeFrame,
-	Journal, TurnClient, TurnId, TurnInput, TurnInputRecord, TurnOptions, TurnOptionsRecord,
-	TurnSession, TurnStart,
+	Journal, RetryPolicy, TurnClient, TurnId, TurnInput, TurnInputRecord, TurnOptions,
+	TurnOptionsRecord, TurnSession, TurnStart,
 };
 use omp_core::Str;
 use omp_env::EnvClient;
@@ -81,6 +83,34 @@ impl TurnClient for ScriptedClient {
 	}
 }
 #[derive(Clone)]
+struct RecoveryClient {
+	script: ScriptQueue,
+	opened: Arc<Mutex<Vec<(TurnId, Instant, TurnInput)>>>,
+}
+
+impl TurnClient for RecoveryClient {
+	type Session<'client> = ScriptedSession;
+
+	fn turn<'client>(
+		&'client self,
+		turn_id: TurnId,
+		input: TurnInput,
+		_options: &'client TurnOptions,
+	) -> impl Future<Output = Result<Self::Session<'client>, Error>> + Send + 'client {
+		self.opened.lock().push((turn_id, Instant::now(), input));
+		let outcome = self
+			.script
+			.lock()
+			.pop_front()
+			.expect("one script entry per turn");
+		let event = match outcome {
+			Ok(outcome) => Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) }),
+			Err(error) => Err(Error::Terminal(error)),
+		};
+		ready(Ok(ScriptedSession { events: vec![event] }))
+	}
+}
+#[derive(Clone)]
 struct CrashClient {
 	opened: flume::Sender<TurnInput>,
 	calls:  Arc<AtomicUsize>,
@@ -129,6 +159,14 @@ fn terminal(kind: pb::turn_error::Kind) -> ScriptOutcome {
 	Err(Box::new(pb::TurnError {
 		kind: kind as i32,
 		detail: "provider detail".to_owned(),
+		..pb::TurnError::default()
+	}))
+}
+fn rate_limited(retry_after_ms: u64) -> ScriptOutcome {
+	Err(Box::new(pb::TurnError {
+		kind: pb::turn_error::Kind::RateLimited as i32,
+		detail: "provider detail".to_owned(),
+		retry_after_ms,
 		..pb::TurnError::default()
 	}))
 }
@@ -677,29 +715,88 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 }
 
 #[tokio::test]
-async fn other_terminal_error_fails_without_reminder() {
-	let (mut agent, opened, path) =
-		agent(vec![terminal(pb::turn_error::Kind::Upstream), Ok(success())]);
+async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
+	let path = std::env::temp_dir().join(format!(
+		"omp-agent-upstream-recovery-{}-{}.jsonl",
+		std::process::id(),
+		ulid::Ulid::generate()
+	));
+	let journal = Journal::create(&path, &Header {
+		v:       4,
+		id:      SessionId(Str::from("upstream-recovery-test")),
+		created: 1,
+		cwd:     std::env::temp_dir(),
+	})
+	.expect("create journal");
+	let opened = Arc::new(Mutex::new(Vec::new()));
+	let client = RecoveryClient {
+		script: Arc::new(Mutex::new(
+			vec![
+				rate_limited(15),
+				terminal(pb::turn_error::Kind::Upstream),
+				terminal(pb::turn_error::Kind::Upstream),
+				terminal(pb::turn_error::Kind::Auth),
+				Ok(success()),
+			]
+			.into(),
+		)),
+		opened: Arc::clone(&opened),
+	};
+	let mut snapshot = AgentSnapshot::default();
+	snapshot.retry = RetryPolicy::new(
+		NonZeroU32::new(3).expect("three is non-zero"),
+		Duration::from_millis(10),
+		Duration::from_millis(10),
+	)
+	.expect("constant retry policy");
+	let (env, _transport) = EnvClient::in_process(1);
+	let mut agent = Agent::new(client, env, AgentState::new(snapshot), journal, CapsBase {
+		maximum_parts:      16,
+		maximum_text_bytes: 16_384,
+		media:              false,
+		model_class:        ModelClass::Standard,
+	});
+
 	let error = agent
 		.submit([user_text("original")], TurnId::new("root"))
 		.await
-		.expect_err("upstream error must fail immediately");
+		.expect_err("bounded upstream recovery must surface the final failure");
 	assert!(matches!(&error, AgentError::Turn(Error::Terminal(_))));
 	assert!(error.to_string().contains("provider detail"));
-	assert!(agent.journal().pending_turn().is_none());
+	{
+		let attempts = opened.lock();
+		assert_eq!(attempts.len(), 3);
+		assert!(
+			attempts
+				.iter()
+				.all(|(turn_id, ..)| turn_id.as_str() == "root")
+		);
+		assert!(
+			attempts[1].1.duration_since(attempts[0].1) >= Duration::from_millis(15),
+			"rate limit retry_after must be honored"
+		);
+		assert!(
+			attempts[2].1.duration_since(attempts[1].1) >= Duration::from_millis(10),
+			"configured transient backoff must precede the final attempt"
+		);
+		assert!(attempts.iter().all(|(_, _, input)| {
+			!input_texts(input)
+				.iter()
+				.any(|text| text.contains("Stopped without actionable output"))
+		}));
+	}
+	let auth = agent
+		.submit([user_text("auth")], TurnId::new("auth"))
+		.await
+		.expect_err("authentication failures must surface immediately");
+	assert!(matches!(&auth, AgentError::Turn(Error::Terminal(error))
+		if pb::turn_error::Kind::try_from(error.kind) == Ok(pb::turn_error::Kind::Auth)));
+	assert_eq!(opened.lock().len(), 4, "authentication failure must not retry");
 	agent
 		.submit([user_text("fresh")], TurnId::new("next"))
 		.await
-		.expect("terminally failed turn must not block later caller input");
-	let opened = opened.lock();
-	assert_eq!(opened.len(), 2);
-	assert!(
-		!input_texts(&opened[0])
-			.iter()
-			.any(|text| text.contains("Stopped without actionable output"))
-	);
-	assert!(input_texts(&opened[1]).contains(&"fresh"));
-	drop(opened);
+		.expect("terminally failed turns must not block later caller input");
+	assert_eq!(opened.lock()[4].0.as_str(), "next");
 	drop(agent);
 	std::fs::remove_file(path).expect("remove journal");
 }

@@ -2,8 +2,8 @@
 
 //! Stable lifecycle, invocation, and hook decision vocabularies.
 
-/// Canonical ordered state of one tool invocation.
-pub use omp_core::phase::InvocationPhase;
+/// Canonical lifecycle and invocation vocabularies.
+pub use omp_core::phase::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -102,51 +102,6 @@ impl HookDecision {
 				| (HookPhase::Approval, Self::Allow | Self::Deny | Self::Defer | Self::RequireApproval)
 				| (HookPhase::Observe, Self::Defer)
 		)
-	}
-}
-
-/// Ordered lifecycle state of an extension declaration.
-#[allow(missing_docs, reason = "strum IntoStaticStr generates undocumented as_str")]
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Deserialize,
-	Display,
-	EnumString,
-	Eq,
-	Hash,
-	IntoStaticStr,
-	Ord,
-	PartialEq,
-	PartialOrd,
-	Serialize,
-)]
-#[repr(u8)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE", const_into_str)]
-pub enum LifecyclePhase {
-	/// Extension declarations are being collected.
-	Declared = 0,
-	/// The declaration registry is immutable.
-	Frozen   = 1,
-	/// Frozen declarations match their authoritative manifest.
-	Verified = 2,
-	/// The verified extension may receive dispatches.
-	Active   = 3,
-	/// The extension remains known but must not receive dispatches.
-	Degraded = 4,
-}
-
-impl LifecyclePhase {
-	/// Every lifecycle phase in stable vocabulary order.
-	pub const ALL: [Self; 5] =
-		[Self::Declared, Self::Frozen, Self::Verified, Self::Active, Self::Degraded];
-
-	/// Returns the stable zero-based vocabulary position.
-	#[must_use]
-	pub const fn ordinal(self) -> u8 {
-		self as u8
 	}
 }
 
