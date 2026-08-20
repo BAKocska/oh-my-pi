@@ -1157,10 +1157,11 @@ unverified PID.
 
 #### Process value types
 
-`class omp.env.RestartPolicy` — `policy: Restart`, `delay: omp.Duration = omp.Duration("500ms")`
+`class omp.env.RestartPolicy` — `policy: omp.Restart`, `delay: omp.Duration = omp.Duration("500ms")`
 (bounded backoff base), `max_restarts: int | None = None`.
 
-`class omp.env.Restart` — `NEVER` (default), `ON_FAILURE`, `ALWAYS`.
+`RestartPolicy.policy` uses the shared top-level `omp.Restart` vocabulary: `NO` (default),
+`ON_FAILURE`, `ALWAYS`.
 
 `class omp.env.ReadyLog` — `pattern: str` (a regex matched against the process's combined output),
 `timeout: omp.Duration = omp.Duration("30s")`.
@@ -1168,13 +1169,17 @@ unverified PID.
 `class omp.env.ReadyTcp` — `port: int`, `host: str = "127.0.0.1"`,
 `timeout: omp.Duration = omp.Duration("30s")`.
 
-`class omp.env.ReadyAll` — `probes: tuple[ReadyLog | ReadyTcp, ...]`; constructed as
-`omp.env.ReadyAll(log_probe, tcp_probe)`. Every probe must pass, matching the wire contract that
-all supplied readiness conditions hold.
+`class omp.env.ReadyPing` — `nonce: int = 1`,
+`timeout: omp.Duration = omp.Duration("30s")`; sends toolhost `Ping` and awaits the matching `Pong`.
 
-`omp.env.Ready` is the type alias `ReadyLog | ReadyTcp | ReadyAll`. The three mirror the two
-`oneof probe` arms and their shared timeout exactly, so a probe is one value in and one value on
-the wire.
+
+`class omp.env.ReadyAll` — `probes: tuple[ReadyLog | ReadyTcp | ReadyPing, ...]`; constructed as
+`omp.env.ReadyAll(log_probe, tcp_probe)`. Every probe must pass. It lowers to repeated
+`ReadyProbe` frames on the wire, where each frame retains its own timeout and the supervisor joins
+all waits before reporting readiness.
+
+`omp.env.Ready` is the type alias `ReadyLog | ReadyTcp | ReadyPing | ReadyAll`. Each leaf maps to
+one `ReadyProbe.oneof` arm; `ReadyAll` is the Python combining value for the repeated field.
 
 `class omp.env.ProcState` — `STARTING`, `READY`, `RUNNING`, `EXITED`, `STOPPED`, `FAILED`.
 `READY` appears only when a probe was supplied; without one a healthy process goes
@@ -2201,6 +2206,9 @@ synchronization* (100-108), *Atomic text edit and workspace edit application eng
    allowlist enforcement in v1; direct sockets remain the labelled, honest status quo
    (extensions are not a security boundary), and enforcement is deferred to the vibevmm/isobox
    integration.**
+   The discovery-HTTP ownership ruling in `docs/py/13-inference.md` question 2 assigns that future
+   transport to `omp.env`; the frozen `omp.env.http_get` seam exists and raises `NotWiredError`
+   until the scoped-egress frame lands.
    **`env.net`.** Documented above as a capability, but the Environment-side HTTP client with
    manifest allowlist enforcement does not exist yet, and it is the one capability whose
    enforcement point is genuinely ambiguous: allowlisting by hostname is trivially bypassed by

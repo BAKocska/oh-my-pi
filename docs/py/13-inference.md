@@ -452,6 +452,7 @@ Closed selector over Rust's codec set. Members, with the codec that backs each:
 | `OPENAI_MEDIA` | `codec/openai_media.rs` | Image, video, speech, transcription. |
 | `OPENAI_REALTIME` | `codec/openai_realtime.rs` | `Operation.REALTIME`. |
 | `SEARCH_EXA` / `SEARCH_TAVILY` / `SEARCH_KAGI` / `SEARCH_PERPLEXITY` / `SEARCH_PARALLEL` | `codec/search_*.rs` | `Operation.SEARCH`. |
+| `SEARCH_HTTP` | shared search HTTP machinery + provider `search_parse` hook | `Operation.SEARCH`. Core performs transport and credential placement; the extension parses the raw response, and the key is never revealed to Python. |
 | `OMP_NATIVE` | `codec/omp_native.rs` | omp's own streaming protocol; used by the auth-gateway sidecar. |
 | `LOCAL` | in-process | `Transport.LOCAL` only. |
 
@@ -1272,6 +1273,7 @@ several extensions subscribe to one event, ordering is the deterministic
 | `models_discover` | `DiscoveryQuery` | `Sequence[ModelSpec]` \| `DiscoveryPage` | CONTROL + DATA | background | fail-open — previous rows retained |
 | `provider_error` | `ProviderError` | `omp.Failover` \| `None` | CONTROL | error path, ~100 µs | **fail-closed** — original error bubbles unchanged |
 | `provider_usage` | `UsageQuery` | `UsageReport` \| `None` | CONTROL + DATA | background | fail-open — stale or absent report |
+| `search_parse` | `SearchQuery` plus raw HTTP response | `tuple[SearchResult, ...]` \| `SearchPage` | CONTROL + DATA | per response, cold | **fail-closed** — malformed or unavailable parser fails the search |
 
 #### `provider_login`
 
@@ -1433,6 +1435,7 @@ class ProviderError:
 	model: str
 	operation: Operation
 	kind: ErrorKind
+	retryability: Retryability
 	status: int | None
 	retry_after: omp.Duration | None
 	attempt: int
@@ -1445,7 +1448,8 @@ class ProviderError:
 `ACCOUNT_DISABLED`, `PAYMENT_REQUIRED`, `CONTEXT_OVERFLOW`, `RESOURCE_EXHAUSTED`, `CONNECTIVITY`,
 `STREAM_CORRUPTION`, `MALFORMED_MODEL_OUTPUT`, `TOOL_NON_COMPLIANCE`, `EMPTY_COMPLETION`,
 `SESSION_EXPIRED`, `CONTENT_FILTER`, `SAFETY_REFUSAL`, `INVALID_REQUEST`, and the rest of
-`crates/llm-inference/src/error.rs:11-96`. `retry_after` is already parsed from the header into an
+`crates/llm-inference/src/error.rs:11-96`. `retryability` is the typed retry lane
+(`docs/py/10-telemetry.md` §Retryability). `retry_after` is already parsed from the header into an
 `omp.Duration`, whether it arrived as a delta or an HTTP date.
 
 That classification is the substance of the improvement. `pi-model-fallback` had to sniff status codes
@@ -1518,6 +1522,27 @@ policy, and any status widget — which is why `@ogulcancelik/pi-minimal-footer`
 `@benvargas/pi-synthetic-provider`'s quota command become a declaration plus a TML slot instead of a
 private HTTP client and a cache file. Fourteen providers already have Rust usage projections
 (`crates/llm-inference/src/operation/usage/`); this hook is for the fifteenth.
+
+#### `search_parse`
+
+`Api.SEARCH_HTTP` keeps HTTP transport, retries, trust checks, and `AuthSpec` credential placement in
+Core while delegating provider-specific response interpretation to Python. `SearchQuery` has
+`provider`, `query`, `count`, and optional `offset` fields; `SearchPage` has `results` and optional
+`next_offset`. Every `SearchResult` carries `title`, `url`, `snippet`, and `rank`.
+
+```python
+@omp.hook("search_parse", provider="brave")
+def parse_brave(query: SearchQuery, response: object) -> SearchPage:
+	rows = response["web"]["results"]
+	results = tuple(
+		SearchResult(row["title"], row["url"], row["description"], (query.offset or 0) + i + 1)
+		for i, row in enumerate(rows)
+	)
+	return SearchPage(results, (query.offset or 0) + len(results))
+```
+
+The extension receives the typed query and raw response only; authentication material remains inside
+the shared transport. Parser absence, exceptions, or invalid return values fail the search closed.
 
 ### `omp.creds`
 
@@ -1739,6 +1764,9 @@ async def discover(q: omp.DiscoveryQuery, ctx: omp.Context) -> DiscoveryPage:
 	)
 ```
 
+The frozen API reserves that exact `omp.env.http_get` call shape, but v1 raises
+`omp.NotWiredError` until the scoped-egress frame deferred by `docs/py/11-env.md` question 6 lands.
+
 The differences that matter: the poll is a background job on a declared interval rather than a
 per-turn round-trip, so turns do not pay for it; a raised exception retains the previous rows instead
 of wiping them; `authoritative=True` is a declared property of a *successful* listing, so retirement
@@ -1908,8 +1936,8 @@ therefore depends on the bridge persisting them, and omp cannot verify that it d
 
 Several things above route through `omp.env` — `models_discover` doing its HTTP probe
 (`omp.env.http_get`), the class (c) proxy (`omp.env.spawn_process`, `proc.endpoint`,
-`proc.send_secret`), and the `!command` replacement (`omp.env.exec`). None of that is reachable from
-Python today, and the reference sections above should be read as target behavior on those points.
+`proc.send_secret`), and the `!command` replacement (`omp.env.exec`). Their Python spellings are
+frozen, but the host operations are not wired; `http_get` fails explicitly with `NotWiredError`.
 
 What exists is one socket, not two. The Python side is a `toolhost/v1` stdio worker: varint-length-
 delimited protobuf over stdin/stdout, whose entire frame vocabulary is
@@ -1928,7 +1956,7 @@ worth stating because it determines what is a wiring task versus a design task:
 | `omp.env.spawn_process` (class (c) proxy) | wire-complete | no Python DATA connection |
 | `omp.env.exec` (credential helper) | wire-complete | no Python DATA connection |
 | `omp.env.put_blob` / `get_blob` | wire-complete | no Python DATA connection |
-| `omp.env.http_get` (discovery probe) | **no frame** | needs a scoped egress request type |
+| `omp.env.http_get` (discovery probe) | frozen `NotWiredError` arm, **no frame** | scoped egress deferred by `docs/py/11-env.md` question 6 |
 
 The additive path for the first three is small and specific. `EnvServer::serve_io` already accepts any
 `AsyncRead + AsyncWrite` and differentiates callers per connection through `ConnectionPolicy`, so the
@@ -1941,11 +1969,10 @@ connection rather than per call. `docs/py/11-env.md` owns the method-level surfa
 types a worker-scoped client may issue; this section only records that the inference-facing uses above
 depend on it.
 
-The fourth is a genuine design question, not wiring, and it is already listed in the open questions:
-discovery HTTP has no `env/v1` request type, and the choice is between adding a scoped-egress frame
-with a manifest allowlist or routing discovery through the inference transport, which would give it the
-connection pool and trust-domain checks for free but needs a credential-free request path the transport
-does not currently have.
+The fourth has a settled owner but a deliberately deferred transport. Open question 2 assigns
+discovery HTTP to `omp.env`; v1 still ships no Environment-side HTTP client or `env/v1` scoped-egress
+request type, as reconciled with `docs/py/11-env.md` question 6. The inference transport therefore
+grows no credential-free alternative.
 
 Nothing else in this document depends on DATA. Provider declaration, every cold-path hook payload
 and return value, `omp.creds`, and `omp.intents` are all CONTROL traffic, and CONTROL is the socket
@@ -2426,6 +2453,7 @@ overlay wiring (item 1 above) is a prerequisite and belongs earlier.
 
 1. **Resolved (2026-08-19 user ruling): no SearchResponseShape — search backends stay class (b)
    and parse in Python; the schema-driven codec DSL slope is refused at its first step.**
+   The class-(b) seam is now named `Api.SEARCH_HTTP` plus the provider-scoped `search_parse` hook.
    **Extension-declared codecs for the `SEARCH_*` family.** A search backend's wire is a single
    JSON POST with a flat result list — genuinely declarative. Should `DiscoveryKind`'s "declare the
    shape, parse in Rust" trick extend to a `SearchResponseShape` (result path, title/url/snippet

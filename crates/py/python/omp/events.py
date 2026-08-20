@@ -13,21 +13,22 @@ from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final
-from _omp import ActivateReason
+from _omp import ActivateReason, ArtifactUrl, BlobRef, Duration, EnvPath
 
 
-from .hooks import CallTarget, TargetKind
+from .agents import Usage
+from .hooks import CallOrigin, CallTarget, TargetKind
+from .devices import DeviceInfo
+from .placement import Place
+from .policy import BashIR
+from .provider import Intent, ModelRef, Role, RouteRef
 from ._verdicts import ArtifactLifetime
+from ._scope import Trust
+from .ui import InvocationMode
+from .telemetry import StopReason
 
 
 
-class CallOrigin(StrEnum):
-    """Identify who issued a logical call."""
-
-    MODEL = "model"
-    USER = "user"
-    SUBAGENT = "subagent"
-    REPLAY = "replay"
 
 
 class InputSource(StrEnum):
@@ -293,7 +294,7 @@ class SessionStartEvent:
     resumed: bool
     forked_from: SessionOrigin | None
     agent: str | None
-    trust: TrustTier
+    trust: Trust
     head_event: int
     prompt_rev: str
 
@@ -421,8 +422,8 @@ class TurnEndEvent:
     turn_index: int
     event_index: int
     stop: StopReason
-    usage: omp.agents.Usage
-    session_usage: omp.agents.Usage
+    usage: Usage
+    session_usage: Usage
     revision: str | None
     calls: tuple[CallRef, ...]
     items: tuple[ItemRef, ...]
@@ -523,7 +524,7 @@ class CallOpenEvent:
     target: CallTarget
     kind: TargetKind
     turn_id: str
-    place: omp.Place
+    place: Place
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,7 +554,7 @@ class ToolExecutionStartEvent:
     call_id: str
     invocation_id: str
     target: CallTarget
-    place: omp.Place
+    place: Place
     deadline: Duration | None
 
 
@@ -624,8 +625,7 @@ class ToolApprovalResolvedEvent:
 class DeviceListEvent:
     """Carry the effective device set at one discovery boundary."""
 
-    reason: DeviceListReason
-    devices: tuple[DeviceRef, ...]
+    devices: tuple[DeviceInfo, ...]
     turn_id: str | None
 
 
@@ -668,7 +668,7 @@ class CommandInvokeEvent:
     name: str
     argv: tuple[str, ...]
     raw: str
-    mode: omp.ui.InvocationMode
+    mode: InvocationMode
     source: InputSource
 
 
@@ -697,10 +697,9 @@ class CapabilityBudgetEvent:
     """Describe constrained-sampling intents granted, degraded, or refused."""
 
     turn_id: str
-    provider: str
-    granted: tuple[CapabilityIntent, ...]
-    degraded: tuple[CapabilityIntent, ...]
-    refused: tuple[CapabilityIntent, ...]
+    granted: tuple[Intent, ...]
+    degraded: tuple[Intent, ...]
+    refused: tuple[Intent, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,7 +761,7 @@ class ExtensionLoadEvent:
     extension: str
     version: str
     source: str
-    trust: TrustTier
+    trust: Trust
     reloaded: bool
 
 @dataclass(frozen=True, slots=True)

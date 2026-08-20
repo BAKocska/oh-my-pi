@@ -1604,6 +1604,15 @@ impl<C: TurnClient> Agent<C> {
 					..empty_invocation_transition(fact.invocation_id, call_id, InvocationPhase::Admitted)
 				},
 			] {
+				// A fact drained after later phases were journaled must not
+				// replay earlier steps; the journal's richer record wins.
+				if self
+					.journal
+					.invocation_phase(transition.invocation_id.as_str())
+					.is_some_and(|current| current > transition.phase)
+				{
+					continue;
+				}
 				self
 					.journal
 					.record_invocation_transition(now_ms(), transition)?;
@@ -1676,6 +1685,15 @@ impl<C: TurnClient> Agent<C> {
 					)
 				},
 			] {
+				// Live admission facts may already have advanced this invocation
+				// past the replayed step; the journal's richer record wins.
+				if self
+					.journal
+					.invocation_phase(transition.invocation_id.as_str())
+					.is_some_and(|current| current > transition.phase)
+				{
+					continue;
+				}
 				self
 					.journal
 					.record_invocation_transition(now_ms(), transition)?;

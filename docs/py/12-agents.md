@@ -1213,7 +1213,7 @@ its `/rewind` selector and had to implement the workspace arm itself.
 
 #### `@dataclass(frozen=True, slots=True) class omp.agents.Snapshot`
 
-`id: str`, `generation: int` (monotonic per workspace), `label: str | None`,
+`id: str`, `generation: int` (monotonic per workspace; the content-addressed identity is `id`, the blob-manifest hash — see §workspace generations), `label: str | None`,
 `created_ms: int`, `root: WorkspaceUri` (`docs/py/14-deploy.md` owns the
 type), `parent: str | None`, `tree_hash: str`,
 `entry_count: int`, `bytes: int`, `partial: bool` (`True` when a `paths`

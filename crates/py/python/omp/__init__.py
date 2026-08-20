@@ -9,7 +9,15 @@ from __future__ import annotations
 import asyncio as _asyncio
 import contextvars as _contextvars
 import inspect as _inspect
+import os as _os
+import re as _re
+from dataclasses import KW_ONLY as _KW_ONLY
+from dataclasses import dataclass as _dataclass
 from enum import StrEnum as _StrEnum
+from collections.abc import Callable as _Callable
+from collections.abc import Mapping as _Mapping
+from collections.abc import Sequence as _Sequence
+from types import MappingProxyType as _MappingProxyType
 from typing import Any as _Any
 
 from _omp import (
@@ -56,6 +64,57 @@ from _omp import (
 )
 
 
+class Coerce(_StrEnum):
+    """Name one declared, journaled argument coercion."""
+
+    LOOSE_BOOL = "loose_bool"
+    INTEGER = "integer"
+    NUMBER = "number"
+    STRING = "string"
+    SINGLETON = "singleton"
+    JSON_STRING = "json_string"
+    STRIP = "strip"
+    CSV = "csv"
+    NULL_ELISION = "null_elision"
+
+
+@_dataclass(frozen=True, slots=True)
+class Field:
+    """Carry declarative metadata for one ``Annotated`` device argument."""
+
+    description: str | None = None
+    _: _KW_ONLY
+    additional_properties: bool = False
+    alias: tuple[str, ...] = ()
+    coerce: tuple[Coerce, ...] = ()
+    expected: str | None = None
+    example: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate and freeze aliases and coercions at declaration time."""
+
+        if self.description is not None and not isinstance(self.description, str):
+            raise TypeError("field description must be str or None")
+        if not isinstance(self.additional_properties, bool):
+            raise TypeError("field additional_properties must be bool")
+        if isinstance(self.alias, str):
+            raise TypeError("field alias must be a tuple of strings")
+        aliases = tuple(self.alias)
+        if any(not isinstance(alias, str) or not alias for alias in aliases):
+            raise TypeError("field aliases must be non-empty strings")
+        if len(set(aliases)) != len(aliases):
+            raise ValueError("field aliases must be unique")
+        coercions = tuple(self.coerce)
+        if any(not isinstance(coercion, Coerce) for coercion in coercions):
+            raise TypeError("field coercions must contain only Coerce members")
+        if self.expected is not None and not isinstance(self.expected, str):
+            raise TypeError("field expected must be str or None")
+        if self.example is not None and not isinstance(self.example, str):
+            raise TypeError("field example must be str or None")
+        object.__setattr__(self, "alias", aliases)
+        object.__setattr__(self, "coerce", coercions)
+
+
 class Fault:
     """Marker base for a device's durable typed failure value."""
 
@@ -74,12 +133,14 @@ class Fault:
 
 
 from ._context import Context
-from ._errors import NotWiredError
+from ._errors import ExtensionError, NotWiredError
+from ._scope import Trust
 from ._verdicts import (
     ArtifactLifetime,
     BlobPart,
     Budget,
     Dialect,
+    Done,
     Faulted,
     JsonPart,
     LiftedCall,
@@ -94,12 +155,17 @@ from ._verdicts import (
     SpillBudget,
     TextPart,
     ToolIdentity,
+    Update,
     View,
     prompt,
 )
 
 class StateScopeDenied(OmpError):
     """The authenticated principal may not access a requested state scope."""
+
+
+class PermissionDenied(PermissionError, OmpError):
+    """The authenticated principal lacks permission for a requested operation."""
 
 _control_backend: _contextvars.ContextVar[_Any | None] = _contextvars.ContextVar(
     "omp_control_backend", default=None
@@ -109,8 +175,14 @@ _control_backend: _contextvars.ContextVar[_Any | None] = _contextvars.ContextVar
 def _install_control_backend(backend: _Any) -> None:
     """Install the host-owned CONTROL bridge in the active invocation context."""
     _control_backend.set(backend)
+    from . import _context as _context_module
+    from . import telemetry as _telemetry
     from . import ui as _ui
+
     _ui._install_effect_sink(getattr(backend, "effect", None))
+    _telemetry._install_instrument_sink(getattr(backend, "instrument", None))
+    _context_module._install_log_sink(getattr(backend, "log", None))
+
 
 async def _control_request(operation: str, /, **arguments: _Any) -> _Any:
     backend = _control_backend.get()
@@ -206,8 +278,8 @@ CancelledError = _asyncio.CancelledError
 class Capability(_StrEnum):
     """Manifest capabilities required by extension declarations."""
 
-    PLACE_ENV = "place_env"
-    PLACE_WORKER = "place_worker"
+    PLACE_ENV = "place.env"
+    PLACE_WORKER = "place.worker"
     SCHEDULES_PROJECT = "schedules:project"
 
 # Importing these frozen modules only creates declarations and namespace values.
@@ -220,6 +292,11 @@ from . import agents as agents
 from . import prompts as prompts
 from . import sessions as sessions
 from . import telemetry as telemetry
+from . import context as context
+from . import policy as policy
+from . import limits as limits
+from . import creds as creds
+from .creds import CredentialMeta, ScopedToken
 from .prompts import (
     PromptContext,
     SlotClass,
@@ -227,12 +304,39 @@ from .prompts import (
     UnknownSlot,
     prompt_slot,
 )
+from .context import (
+    Anchor,
+    CancelCompaction,
+    CompactionBusy,
+    CompactionEvent,
+    CompactionOutcome,
+    CompactionRefused,
+    CompactionTier,
+    CompactionVerdict,
+    ContextGone,
+    ContextPatch,
+    ContextResetEvent,
+    ContextUsage,
+    ContextView,
+    CustomSummary,
+    DelegateCompaction,
+    Insert,
+    MessageKind,
+    MessageRef,
+    NoVerdict,
+    PatchRejected,
+    PinBudgetExceeded,
+    Prune,
+    Reorder,
+    Replace,
+    StaleEpoch,
+    ToolRef,
+)
 from .sessions import (
     Bucket,
     GroupBy,
     SessionFilter,
     SessionInfo,
-    SessionKind,
     SessionStatus,
     TitleSource,
     Usage,
@@ -243,6 +347,8 @@ from .sessions import (
 )
 from .telemetry import PromptFingerprint
 renderer = ui.renderer
+command = ui.command
+DuplicateRenderer = ui.DuplicateRenderer
 from .urls import (
     Scheme,
     SchemeInfo,
@@ -257,6 +363,7 @@ from .urls import (
 )
 from ._registry import (
     DeclarationDrift,
+    DeviceDefinition as _DeviceDefinition,
     DeclarationRegistry,
     MAX_DECLARATIONS,
     DeclarationSnapshot,
@@ -290,10 +397,105 @@ from .placement import (
     worker_state,
     workers,
 )
+from .policy import (
+    APPROVAL_DEADLINE,
+    Access,
+    Amend,
+    AndOrOp,
+    ApprovalDecision,
+    ApprovalSource,
+    ApprovalTicket,
+    BASH_IR_MAX_DEPTH,
+    BASH_IR_MAX_NODES,
+    BASH_IR_MAX_SOURCE,
+    BASH_IR_REV,
+    BashAndOrList,
+    BashArg,
+    BashAssignment,
+    BashCommandIR,
+    BashCompound,
+    BashFunctionDef,
+    BashIR,
+    BashNode,
+    BashPipeline,
+    BashRedirect,
+    BashTestExpr,
+    CompoundKind,
+    DnsPolicy,
+    DomainRule,
+    Dynamism,
+    EnforcementUnavailable,
+    ExecPolicy,
+    FilesystemGrade,
+    FilesystemPolicy,
+    HereDoc,
+    NetDirection,
+    NetKind,
+    NetRef,
+    NetworkGrade,
+    NetworkMode,
+    NetworkPolicy,
+    OpaqueEvaluator,
+    OpaqueReason,
+    POLICY_DEADLINE,
+    ParseError,
+    ParseFailure,
+    PathOrigin,
+    PathRef,
+    PathRule,
+    PolicyDenied,
+    PolicyError,
+    ProcessGrade,
+    ProcessSubDirection,
+    ProcessSubIR,
+    ProfileHandle,
+    ProfileRejected,
+    ProfileWidened,
+    Quoting,
+    RedirectOp,
+    RedirectTarget,
+    ResourceBudget,
+    RuleEffect,
+    RuleRef,
+    SandboxBackend,
+    SandboxCapabilities,
+    SandboxEnforcement,
+    SandboxMode,
+    SandboxProfile,
+    SandboxRequest,
+    Separator,
+    SessionKind,
+    Span,
+    TicketState,
+    Tier,
+    VIOLATION_COALESCE,
+    Violation,
+    ViolationKind,
+)
 from .devices import (
+    Availability,
     AvailabilityDelta,
+    Devices,
+    Device,
+    DeviceError,
+    DeviceInfo,
+    DeviceNameError,
+    DeviceUnavailable,
+    DocEffects,
+    DocsBudgetError,
+    DocsMode,
     DynamicDeviceParent,
+    EXTERNAL_SUMMARY_CAP,
+    Effects,
+    Example,
+    ExecEffects,
+    InferenceEffects,
     MountSpec,
+    PER_DEVICE_CAP,
+    Precedence,
+    PrecedenceConflict,
+    SchemaError,
+    ToolPath,
     devices,
 )
 from .provider import (
@@ -310,7 +512,18 @@ from .provider import (
     ContextSpec,
     Cost,
     CostTier,
+    Credential,
+    CredentialKind,
     CredentialSource,
+    DiscoveryDefaults,
+    DiscoveryKind,
+    DiscoveryPage,
+    DiscoveryQuery,
+    DiscoverySpec,
+    ErrorKind,
+    Failover,
+    FailoverKind,
+    Fallback,
     Effort,
     LogprobCaps,
     ManagementSpec,
@@ -318,13 +531,24 @@ from .provider import (
     ModelSpec,
     OAuthFlow,
     OAuthFlowKind,
+    Intent,
+    IntentKind,
+    ModelFallback,
+    ModelRef,
     OAuthSpec,
+    Pagination,
     Operation,
     PrincipalResolution,
     PromptCacheCaps,
     ProviderSpec,
+    ProviderHandle,
     ReasoningCaps,
     RefreshBehavior,
+    ProviderError,
+    Retryability,
+    RedirectTrust,
+    RouteLimits,
+    RouteRef,
     RouteSpec,
     ServerStateCaps,
     ServiceTier,
@@ -335,12 +559,16 @@ from .provider import (
     ToolFeature,
     ToolSchemaFlavor,
     Transport,
+    TrustDomain,
     provider,
 )
 from . import hooks as hooks
 from .hooks import *
 from . import events as events
 from .events import *
+# Hooks and policy document the same top-level approval deadline; policy owns
+# the assembled policy vocabulary.
+APPROVAL_DEADLINE = policy.APPROVAL_DEADLINE
 
 
 from . import index as index
@@ -354,17 +582,133 @@ from .packages import (
     PackageError,
     Provenance,
     ResolutionError,
+    SettingSchema,
     SiteTree,
 )
 
 
-def device(name: str, *, family: str, rev: int, place: str | Place = "host"):
-    """Declare a device and record its parsed placement before FREEZE."""
-    parsed = Place.parse(place)
-    def decorate(function: _Any) -> _Any:
-        function.__omp_place__ = parsed
-        _declarations.register_tool(name, family, rev, function)
-        return function
+_DEVICE_NAME_PATTERN = _re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_RESERVED_DEVICE_NAMES = frozenset(
+    {"resolve", "reject", "propose", "report_issue"}
+)
+
+
+def device(
+    name: str | None = None,
+    *,
+    family: str = "",
+    rev: int = 1,
+    place: str | Place = "host",
+    summary: str | None = None,
+    docs: str | _os.PathLike[str] | None = None,
+    schema: type | dict[str, object] | None = None,
+    examples: _Sequence[Example] = (),
+    available: _Callable[[], bool | Availability] | None = None,
+    precedence: int = Precedence.DEFAULT,
+    replaces: str | None = None,
+    intents: _Sequence[Intent] = (),
+    effects: Effects | None = None,
+    tier: Tier = Tier.WRITE,
+    deadline: Duration | None = None,
+    aliases: _Mapping[str, str] | None = None,
+) -> _Callable[[_Any], Device]:
+    """Declare a device while deferring its availability predicate to FREEZE."""
+    parsed_place = Place.parse(place)
+    if not isinstance(rev, int) or isinstance(rev, bool):
+        raise TypeError("device rev must be int")
+    if not isinstance(precedence, int) or isinstance(precedence, bool):
+        raise TypeError("device precedence must be int")
+    if precedence >= Precedence.CORE:
+        raise DeviceNameError(
+            f"device precedence must be below Precedence.CORE: {precedence}"
+        )
+    if schema is not None and not isinstance(schema, (type, dict)):
+        raise SchemaError("device schema must be a type, dict, or None")
+    if available is not None and not callable(available):
+        raise SchemaError("device available predicate must be callable")
+
+    frozen_examples = tuple(examples)
+    if any(not isinstance(example, Example) for example in frozen_examples):
+        raise SchemaError("device examples must contain only Example values")
+
+    frozen_aliases: _Mapping[str, str] | None = None
+    if aliases is not None:
+        if not isinstance(aliases, _Mapping):
+            raise SchemaError("device aliases must be a mapping")
+        seen_aliases: set[str] = set()
+        alias_items: list[tuple[str, str]] = []
+        for alias, target in aliases.items():
+            if not isinstance(alias, str) or not isinstance(target, str):
+                raise SchemaError("device aliases must map strings to strings")
+            if alias in seen_aliases:
+                raise SchemaError(f"duplicate device alias {alias!r}")
+            if alias == target:
+                raise SchemaError(f"device alias {alias!r} cannot map to itself")
+            seen_aliases.add(alias)
+            alias_items.append((alias, target))
+        frozen_aliases = _MappingProxyType(dict(alias_items))
+
+    frozen_intents = tuple(intents)
+
+    def decorate(body: _Any) -> Device:
+        if not callable(body):
+            raise TypeError("@omp.device may decorate only a callable")
+        resolved_name = (
+            getattr(body, "__name__", "").lstrip("_") if name is None else name
+        )
+        if (
+            not isinstance(resolved_name, str)
+            or _DEVICE_NAME_PATTERN.fullmatch(resolved_name) is None
+        ):
+            raise DeviceNameError(f"invalid device name {resolved_name!r}")
+        if resolved_name in _RESERVED_DEVICE_NAMES:
+            raise DeviceNameError(f"reserved device name {resolved_name!r}")
+
+
+        handle = Device(
+            name=resolved_name,
+            family=family,
+            rev=rev,
+            place=parsed_place,
+            precedence=precedence,
+            replaces=replaces,
+            schema=schema,
+            docs=docs,
+            summary=summary,
+            body=body,
+        )
+        definition = _DeviceDefinition(
+            name=resolved_name,
+            family=family,
+            rev=rev,
+            place=parsed_place,
+            summary=summary,
+            docs=docs,
+            schema=schema,
+            examples=frozen_examples,
+            available=available,
+            precedence=precedence,
+            replaces=replaces,
+            intents=frozen_intents,
+            effects=effects,
+            tier=tier,
+            deadline=deadline,
+            aliases=frozen_aliases,
+            body=body,
+        )
+        try:
+            body.__omp_place__ = parsed_place
+        except (AttributeError, TypeError):
+            pass
+        _declarations.register_tool(
+            resolved_name,
+            family,
+            rev,
+            handle,
+            definition=definition,
+        )
+        return handle
+
     return decorate
 
 
@@ -388,7 +732,28 @@ def tool(
         function.__omp_tool_kind__ = kind
         function.__omp_effects__ = effects
         function.__omp_tier__ = tier
-        _declarations.register_tool(tool_name, "", rev, function)
+        definition = _DeviceDefinition(
+            name=tool_name,
+            family="",
+            rev=rev,
+            place=Place.HOST,
+            summary=None,
+            docs=None,
+            schema=None,
+            examples=(),
+            available=None,
+            precedence=Precedence.DEFAULT,
+            replaces=None,
+            intents=(),
+            effects=effects,
+            tier=tier,
+            deadline=None,
+            aliases=None,
+            body=function,
+        )
+        _declarations.register_tool(
+            tool_name, "", rev, function, definition=definition
+        )
         return function
 
     if callable(name):
@@ -441,6 +806,7 @@ __all__ = (
     "CapabilityError",
     "ClientPath",
     "CostClass",
+    "Coerce",
     "DeadlineExceeded",
     "DeclarationDrift",
     "DeclarationLimit",
@@ -452,18 +818,21 @@ __all__ = (
     "Duration",
     "EffectsNotAuthorized",
     "EnvPath",
+    "ExtensionError",
     "EnvUnavailable",
     "EntryId",
     "ArtifactLifetime",
     "BlobPart",
     "Budget",
     "Context",
+    "Field",
     "Fault",
     "Bucket",
     "AccountScope",
     "Api",
     "AuthMode",
     "AuthSpec",
+    "Availability",
     "AvailabilityDelta",
     "CacheRetention",
     "Cap",
@@ -474,10 +843,30 @@ __all__ = (
     "ContextSpec",
     "Cost",
     "CostTier",
+    "Credential",
+    "CredentialKind",
+    "CredentialMeta",
     "CredentialSource",
+    "DiscoveryDefaults",
+    "DiscoveryKind",
+    "DiscoveryPage",
+    "DiscoveryQuery",
+    "DiscoverySpec",
+    "Device",
+    "DeviceError",
+    "DeviceInfo",
+    "DeviceNameError",
+    "DeviceUnavailable",
+    "DocEffects",
+    "DocsBudgetError",
+    "DocsMode",
     "DynamicDeviceParent",
+    "Effects",
+    "Example",
+    "ExecEffects",
     "Effort",
     "LogprobCaps",
+    "InferenceEffects",
     "ManagementSpec",
     "Modality",
     "ModelSpec",
@@ -486,12 +875,19 @@ __all__ = (
     "OAuthFlowKind",
     "OAuthSpec",
     "Operation",
+    "Pagination",
     "PrincipalResolution",
+    "Precedence",
+    "PrecedenceConflict",
     "PromptCacheCaps",
     "ProviderSpec",
+    "ProviderHandle",
     "ReasoningCaps",
     "RefreshBehavior",
+    "RedirectTrust",
+    "RouteLimits",
     "RouteSpec",
+    "SchemaError",
     "ServerStateCaps",
     "ServiceTier",
     "ThinkingMode",
@@ -500,9 +896,12 @@ __all__ = (
     "ToolCaps",
     "ToolFeature",
     "ToolSchemaFlavor",
+    "ToolPath",
     "Transport",
+    "TrustDomain",
     "GroupBy",
     "Dialect",
+    "Done",
     "Faulted",
     "FrameTooLarge",
     "HistoryUrl",
@@ -545,6 +944,7 @@ __all__ = (
     "SPILL_INLINE_LIMIT",
     "SpillBudget",
     "TextPart",
+    "Update",
     "ToolIdentity",
     "View",
     "StaleGeneration",
@@ -599,6 +999,8 @@ __all__ = (
     "WorkerHandle",
     "WorkerInfo",
     "WorkerResources",
+    "command",
+    "DuplicateRenderer",
     "renderer",
     "WorkerSpec",
     "WorkerState",
@@ -609,6 +1011,7 @@ __all__ = (
     "worker_state",
     "workers",
     "devices",
+    "creds",
     "provider",
     "DiagnosticCode",
     "Distribution",
@@ -620,9 +1023,129 @@ __all__ = (
     "Provenance",
     "ResolutionError",
     "SiteTree",
+    "ScopedToken",
     "Secret",
     "WarningCode",
     "index",
     "packages",
+)
+__all__ += (
+    "Access",
+    "Amend",
+    "Anchor",
+    "AndOrOp",
+    "ApprovalDecision",
+    "ApprovalSource",
+    "ApprovalTicket",
+    "BASH_IR_MAX_DEPTH",
+    "BASH_IR_MAX_NODES",
+    "BASH_IR_MAX_SOURCE",
+    "BASH_IR_REV",
+    "BashAndOrList",
+    "BashArg",
+    "BashAssignment",
+    "BashCommandIR",
+    "BashCompound",
+    "BashFunctionDef",
+    "BashIR",
+    "BashNode",
+    "BashPipeline",
+    "BashRedirect",
+    "BashTestExpr",
+    "CancelCompaction",
+    "CompactionBusy",
+    "CompactionEvent",
+    "CompactionOutcome",
+    "CompactionRefused",
+    "CompactionTier",
+    "CompactionVerdict",
+    "CompoundKind",
+    "ContextGone",
+    "ContextPatch",
+    "ContextResetEvent",
+    "ContextUsage",
+    "ContextView",
+    "CustomSummary",
+    "DelegateCompaction",
+    "Devices",
+    "DnsPolicy",
+    "DomainRule",
+    "Dynamism",
+    "EXTERNAL_SUMMARY_CAP",
+    "EnforcementUnavailable",
+    "ErrorKind",
+    "ExecPolicy",
+    "Failover",
+    "FailoverKind",
+    "Fallback",
+    "FilesystemGrade",
+    "FilesystemPolicy",
+    "HereDoc",
+    "Insert",
+    "Intent",
+    "IntentKind",
+    "MessageKind",
+    "MessageRef",
+    "ModelFallback",
+    "ModelRef",
+    "NetDirection",
+    "NetKind",
+    "NetRef",
+    "NetworkGrade",
+    "NetworkMode",
+    "NetworkPolicy",
+    "NoVerdict",
+    "OpaqueEvaluator",
+    "OpaqueReason",
+    "PER_DEVICE_CAP",
+    "POLICY_DEADLINE",
+    "ParseError",
+    "ParseFailure",
+    "PatchRejected",
+    "PathOrigin",
+    "PathRef",
+    "PathRule",
+    "PermissionDenied",
+    "PinBudgetExceeded",
+    "PolicyDenied",
+    "PolicyError",
+    "ProcessGrade",
+    "ProcessSubDirection",
+    "ProcessSubIR",
+    "ProfileHandle",
+    "ProfileRejected",
+    "ProfileWidened",
+    "ProviderError",
+    "Prune",
+    "Quoting",
+    "RedirectOp",
+    "RedirectTarget",
+    "Reorder",
+    "Replace",
+    "ResourceBudget",
+    "Retryability",
+    "RouteRef",
+    "RuleEffect",
+    "RuleRef",
+    "SandboxBackend",
+    "SandboxCapabilities",
+    "SandboxEnforcement",
+    "SandboxMode",
+    "SandboxProfile",
+    "SandboxRequest",
+    "Separator",
+    "SettingSchema",
+    "Span",
+    "StaleEpoch",
+    "TicketState",
+    "Tier",
+    "ToolRef",
+    "Trust",
+    "VIOLATION_COALESCE",
+    "Violation",
+    "ViolationKind",
+    "context",
+    "limits",
+    "policy",
 )
 __all__ += hooks.__all__ + events.__all__ + ("hooks", "events")

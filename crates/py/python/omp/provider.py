@@ -7,13 +7,19 @@ no credential, network, filesystem, CONTROL, or DATA access.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from ipaddress import ip_address
+from urllib.parse import urlsplit
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
+
+from _omp import Duration, Secret
 
 from ._registry import registry
+from ._errors import NotWiredError
 
 _T = TypeVar("_T", bound=type)
 _EMPTY_MAP: Mapping[Any, Any] = MappingProxyType({})
@@ -37,6 +43,7 @@ class Api(StrEnum):
     OPENAI_MEDIA = "openai_media"
     OPENAI_REALTIME = "openai_realtime"
     SEARCH_EXA = "search_exa"
+    SEARCH_HTTP = "search_http"
     SEARCH_TAVILY = "search_tavily"
     SEARCH_KAGI = "search_kagi"
     SEARCH_PERPLEXITY = "search_perplexity"
@@ -129,6 +136,16 @@ class Operation(StrEnum):
     DISCOVER_MODELS = "discover_models"
     AUTH = "auth"
     NATIVE = "native"
+
+
+class Role(StrEnum):
+    """Identify a canonical chat-message role."""
+
+    SYSTEM = "system"
+    DEVELOPER = "developer"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
 
 
 class Modality(StrEnum):
@@ -377,6 +394,139 @@ class CompatFlags:
 
     schema_flavor: ToolSchemaFlavor | None = None
 
+class DiscoveryKind(StrEnum):
+    """Select the response family used for remote model discovery."""
+
+    OPENAI_MODELS = "openai_models"
+    GOOGLE_MODELS = "google_models"
+    OLLAMA_TAGS = "ollama_tags"
+    ACCOUNT_MODELS = "account_models"
+    SPECIALIZED = "specialized"
+
+
+@dataclass(frozen=True, slots=True)
+class Pagination:
+    """Describe how a remote model listing advances between pages."""
+
+    kind: str
+    query_parameter: str | None = None
+    first_page: int | None = None
+
+    @classmethod
+    def single_page(cls) -> "Pagination":
+        """Return a pagination policy whose first response is complete."""
+        return cls("single_page")
+
+    @classmethod
+    def cursor(cls, query_parameter: str) -> "Pagination":
+        """Pass a response cursor through the named query parameter."""
+        return cls("cursor", query_parameter=query_parameter)
+
+    @classmethod
+    def page_number(
+        cls, query_parameter: str, *, first_page: int = 1
+    ) -> "Pagination":
+        """Pass an increasing page number through the named query parameter."""
+        return cls("page_number", query_parameter=query_parameter, first_page=first_page)
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoverySpec:
+    """Configure one route's remote model-list operation."""
+
+    kind: DiscoveryKind
+    path: str
+    label: str
+    pagination: Pagination = Pagination.single_page()
+    authoritative: bool = False
+    interval: Duration | None = None
+
+    def __post_init__(self) -> None:
+        """Reject periodic discovery faster than the daemon scheduling floor."""
+        if self.interval is not None:
+            if not isinstance(self.interval, Duration):
+                raise TypeError("DiscoverySpec.interval must be Duration or None")
+            if self.interval < Duration("5s"):
+                raise ValueError("DiscoverySpec.interval must be at least 5s")
+
+
+class RedirectTrust(StrEnum):
+    """Constrain redirects relative to a route's trusted origin."""
+
+    DENY = "deny"
+    SAME_ORIGIN = "same_origin"
+    PUBLIC_ONLY = "public_only"
+
+
+def _origin(url: str) -> tuple[str, str | None]:
+    parsed = urlsplit(url)
+    if parsed.scheme in {"unix", "http+unix"} or (
+        not parsed.scheme and url.startswith("/")
+    ):
+        return url, None
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("route base_url must be an absolute URL or Unix socket path")
+    return f"{parsed.scheme.lower()}://{parsed.netloc}", parsed.hostname
+
+
+def _is_loopback(url: str) -> bool:
+    parsed = urlsplit(url)
+    if parsed.scheme in {"unix", "http+unix"} or (
+        not parsed.scheme and url.startswith("/")
+    ):
+        return True
+    host = parsed.hostname
+    if host is None:
+        return False
+    lowered = host.rstrip(".").lower()
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(lowered).is_loopback
+    except ValueError:
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class TrustDomain:
+    """Declare the origin and credential-forwarding boundary for a route."""
+
+    origin: str
+    redirects: RedirectTrust = RedirectTrust.SAME_ORIGIN
+    allow_plaintext: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject plaintext trust for anything except loopback and Unix sockets."""
+        if self.allow_plaintext and self.origin and not _is_loopback(self.origin):
+            raise ValueError("plaintext trust is limited to loopback hosts and Unix sockets")
+
+    @classmethod
+    def https(
+        cls, *, redirects: RedirectTrust = RedirectTrust.SAME_ORIGIN
+    ) -> "TrustDomain":
+        """Derive a TLS-required trust origin from the route base URL."""
+        return cls("", redirects=redirects)
+
+    @classmethod
+    def loopback(
+        cls, *, redirects: RedirectTrust = RedirectTrust.SAME_ORIGIN
+    ) -> "TrustDomain":
+        """Derive a trust origin while permitting loopback plaintext."""
+        return cls("", redirects=redirects, allow_plaintext=True)
+
+
+@dataclass(frozen=True, slots=True)
+class RouteLimits:
+    """Subtract route-specific operations and token limits from model capabilities."""
+
+    operations: frozenset[Operation] | None = None
+    max_context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    disable_server_state: bool = False
+    disable_prompt_caching: bool = False
+
+
+
 
 @dataclass(frozen=True, slots=True)
 class RouteSpec:
@@ -389,12 +539,34 @@ class RouteSpec:
     auth: AuthSpec = AuthSpec(AuthMode.NONE, header=None, prefix=None, sources=())
     headers: Mapping[str, str] = field(default_factory=lambda: _EMPTY_MAP)
     region: str | None = None
-    discovery: object | None = None
-    trust: object | None = None
-    limits: object | None = None
+    discovery: DiscoverySpec | None = None
+    trust: TrustDomain = TrustDomain.https()
+    limits: RouteLimits = RouteLimits()
     compat: CompatFlags = CompatFlags()
     codec_profile: CodecProfile = CodecProfile.STANDARD
     priority: int | None = None
+
+    def __post_init__(self) -> None:
+        """Resolve and validate the route's declared trust boundary."""
+        route_origin, _ = _origin(self.base_url)
+        trust = self.trust
+        if not isinstance(trust, TrustDomain):
+            raise TypeError("RouteSpec.trust must be TrustDomain")
+        if trust.allow_plaintext:
+            if not _is_loopback(self.base_url):
+                raise ValueError(
+                    "TrustDomain.loopback() requires a loopback host or Unix socket path"
+                )
+        elif urlsplit(self.base_url).scheme.lower() != "https":
+            raise ValueError("plaintext routes require TrustDomain.loopback()")
+        if not trust.origin:
+            object.__setattr__(
+                self,
+                "trust",
+                TrustDomain(route_origin, trust.redirects, trust.allow_plaintext),
+            )
+        elif route_origin != trust.origin:
+            raise ValueError("RouteSpec.base_url is outside its TrustDomain origin")
 
 
 class Cap(StrEnum):
@@ -460,8 +632,8 @@ class LogprobCaps:
 class ChatCaps:
     """Complete chat capability axes, field-for-field with Rust."""
 
-    roles: Cap | frozenset[str] = Cap.UNKNOWN
-    mid_session_roles: Cap | frozenset[str] = Cap.UNKNOWN
+    roles: Cap | frozenset[Role] = Cap.UNKNOWN
+    mid_session_roles: Cap | frozenset[Role] = Cap.UNKNOWN
     tools: Cap | ToolCaps = Cap.UNKNOWN
     structured_output: Cap | frozenset[str] = Cap.UNKNOWN
     grammar: Cap | frozenset[str] = Cap.UNKNOWN
@@ -526,6 +698,39 @@ class CostTier:
 
     prompt_tokens_above: int
     cost: Cost
+
+class Availability(StrEnum):
+    """Describe the selectable state assigned to a discovered model."""
+
+    UNSPECIFIED = "unspecified"
+    AVAILABLE = "available"
+    LOGIN_REQUIRED = "login_required"
+    BLOCKED = "blocked"
+    DISABLED = "disabled"
+
+
+class Confidence(StrEnum):
+    """Describe the evidence confidence assigned to discovered model facts."""
+
+    VERIFIED = "verified"
+    DECLARED = "declared"
+    INFERRED = "inferred"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryDefaults:
+    """Provide conservative facts for newly discovered models."""
+
+    routes: tuple[str, ...]
+    cost: Cost = Cost.free()
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    operations: frozenset[Operation] = frozenset({Operation.CHAT})
+    availability: Availability = Availability.AVAILABLE
+    confidence: Confidence = Confidence.INFERRED
+
+
 
 
 
@@ -599,29 +804,557 @@ class ProviderSpec:
     routes: tuple[RouteSpec, ...]
     models: tuple[ModelSpec, ...] = ()
     management: ManagementSpec = ManagementSpec()
-    discovery_defaults: object | None = None
+    discovery_defaults: DiscoveryDefaults | None = None
     mapping: object = "concrete"
     aliases: tuple[str, ...] = ()
 
-def provider(spec: ProviderSpec) -> Callable[[_T], _T]:
-    """Record one provider declaration during IMPORT without performing I/O."""
-    if not isinstance(spec, ProviderSpec):
-        raise TypeError("@omp.provider requires a ProviderSpec")
+class ProviderHandle:
+    """Refer to one provider declaration and its host-owned CONTROL operations."""
 
-    def decorate(implementation: _T) -> _T:
-        registry.register_provider(spec.id, spec, implementation)
-        implementation.__omp_provider_spec__ = spec
+    __slots__ = ("_spec", "_priority", "_extends", "_replaces")
+
+    def __init__(
+        self,
+        spec: ProviderSpec,
+        *,
+        priority: int = 0,
+        extends: str | None = None,
+        replaces: str | None = None,
+    ) -> None:
+        """Create a handle for a validated import-time provider declaration."""
+        self._spec = spec
+        self._priority = priority
+        self._extends = extends
+        self._replaces = replaces
+
+    @property
+    def id(self) -> str:
+        """Return the stable provider identifier."""
+        return self._spec.id
+
+    def __call__(self, implementation: _T) -> _T:
+        """Bind a provider-scoped implementation class to this declaration."""
+        registry.register_provider(self.id, self._spec, implementation)
+        implementation.__omp_provider_spec__ = self._spec
+        implementation.__omp_provider_priority__ = self._priority
+        implementation.__omp_provider_extends__ = self._extends
+        implementation.__omp_provider_replaces__ = self._replaces
         return implementation
 
-    return decorate
+    async def retract(self) -> None:
+        """Remove this provider declaration through the host CONTROL bridge."""
+        await _provider_control_request("omp.provider.retract", provider=self.id)
+
+    async def replace(self, spec: ProviderSpec) -> None:
+        """Atomically replace this provider declaration through CONTROL."""
+        if not isinstance(spec, ProviderSpec):
+            raise TypeError("ProviderHandle.replace requires a ProviderSpec")
+        await _provider_control_request("omp.provider.replace", provider=self.id, spec=spec)
+
+    async def models(self) -> tuple[ModelSpec, ...]:
+        """Return the provider's resolved model cards through CONTROL."""
+        return await _provider_control_request("omp.provider.models", provider=self.id)
+
+    async def is_authenticated(self) -> bool:
+        """Return whether an eligible provider principal is available."""
+        return await _provider_control_request(
+            "omp.provider.is_authenticated", provider=self.id
+        )
+
+
+async def _provider_control_request(operation: str, /, **arguments: object) -> Any:
+    from . import _control_backend, _control_request
+
+    if _control_backend.get() is None:
+        raise NotWiredError(f"{operation} CONTROL dispatch is not wired")
+    return await _control_request(operation, **arguments)
+
+@dataclass(frozen=True, slots=True)
+class ModelRef:
+    """Identify one provider model and API family."""
+
+    provider: str
+    api: str
+    model: str
+
+
+@dataclass(frozen=True, slots=True)
+class RouteRef:
+    """Identify one selected provider route."""
+
+    provider: str
+    route: str
+
+
+class ErrorKind(StrEnum):
+    """Classify a stable provider failure for policy decisions."""
+
+    CANCELLED = "cancelled"
+    DEADLINE_EXCEEDED = "deadline_exceeded"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    POLICY_BUFFER_EXCEEDED = "policy_buffer_exceeded"
+    DNS = "dns"
+    TLS = "tls"
+    CONNECTIVITY = "connectivity"
+    PROTOCOL = "protocol"
+    STREAM_CORRUPTION = "stream_corruption"
+    AUTHENTICATION = "authentication"
+    CREDENTIAL_STORAGE_UNAVAILABLE = "credential_storage_unavailable"
+    AUTHORIZATION = "authorization"
+    ACCOUNT_DISABLED = "account_disabled"
+    RATE_LIMITED = "rate_limited"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    PAYMENT_REQUIRED = "payment_required"
+    INVALID_REQUEST = "invalid_request"
+    TARGET_NOT_FOUND = "target_not_found"
+    CAPABILITY_UNKNOWN = "capability_unknown"
+    CODEC_MISMATCH = "codec_mismatch"
+    ROUTE_UNAVAILABLE = "route_unavailable"
+    STALE_PLAN = "stale_plan"
+    REPLAY_REQUIRED = "replay_required"
+    STAGING_REQUIRED = "staging_required"
+    CAPABILITY_MISMATCH = "capability_mismatch"
+    PROVIDER_CONTRACT_MISMATCH = "provider_contract_mismatch"
+    CONTEXT_OVERFLOW = "context_overflow"
+    CONTENT_FILTER = "content_filter"
+    SAFETY_REFUSAL = "safety_refusal"
+    MALFORMED_MODEL_OUTPUT = "malformed_model_output"
+    STRUCTURED_OUTPUT_FAILURE = "structured_output_failure"
+    TOOL_NON_COMPLIANCE = "tool_non_compliance"
+    REPEATED_REASONING = "repeated_reasoning"
+    REPEATED_TOOL_CALL = "repeated_tool_call"
+    EMPTY_COMPLETION = "empty_completion"
+    EMPTY_OUTPUT = "empty_output"
+    SESSION_EXPIRED = "session_expired"
+    SESSION_CONFLICT = "session_conflict"
+    LOCAL_MODEL_UNAVAILABLE = "local_model_unavailable"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+    NATIVE_REQUEST_REJECTED = "native_request_rejected"
+    INTERNAL_INVARIANT = "internal_invariant"
+
+
+class Retryability(StrEnum):
+    """Name the safe recovery lane for a classified attempt."""
+
+    NEVER = "never"
+    SAME_ROUTE = "same_route"
+    AFTER_REPAIR = "after_repair"
+    AFTER_CREDENTIAL = "after_credential"
+    AFTER_DELAY = "after_delay"
+    UNSPECIFIED = "unspecified"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderError:
+    """Describe a structured failure from one provider attempt."""
+
+    provider: str
+    route: str
+    model: str
+    operation: Operation
+    kind: ErrorKind
+    retryability: Retryability
+    status: int | None
+    retry_after: Duration | None
+    attempt: int
+    committed: bool
+    message: str
+    identity: str | None
+
+
+class FailoverKind(StrEnum):
+    """Select the recovery action represented by a failover verdict."""
+
+    RETRY = "retry"
+    REFRESH_CREDENTIAL = "refresh_credential"
+    ROTATE_ACCOUNT = "rotate_account"
+    RESELECT_ROUTE = "reselect_route"
+    SWITCH_MODEL = "switch_model"
+    RESEED_SESSION = "reseed_session"
+    SEMANTIC_RETRY = "semantic_retry"
+    FAIL = "fail"
+
+
+@dataclass(frozen=True, slots=True)
+class Failover:
+    """Request one typed recovery action for a provider failure."""
+
+    kind: FailoverKind
+    after: Duration | None = None
+    cooldown: Duration | None = None
+    route: str | None = None
+    target: str | None = None
+    reason: str | None = None
+
+    @staticmethod
+    def retry(*, after: Duration | None = None, cooldown: Duration | None = None) -> Failover:
+        """Retry the same attempt, optionally after a delay."""
+        return Failover(FailoverKind.RETRY, after=after, cooldown=cooldown)
+
+    @staticmethod
+    def refresh_credential() -> Failover:
+        """Refresh the current credential before retrying."""
+        return Failover(FailoverKind.REFRESH_CREDENTIAL)
+
+    @staticmethod
+    def rotate_account(*, cooldown: Duration | None = None) -> Failover:
+        """Rotate to another account before retrying."""
+        return Failover(FailoverKind.ROTATE_ACCOUNT, cooldown=cooldown)
+
+    @staticmethod
+    def reselect_route(
+        *, route: str | None = None, cooldown: Duration | None = None
+    ) -> Failover:
+        """Reselect a route, optionally preferring one route."""
+        return Failover(FailoverKind.RESELECT_ROUTE, cooldown=cooldown, route=route)
+
+    @staticmethod
+    def switch_model(target: str, *, cooldown: Duration | None = None) -> Failover:
+        """Switch to a fully qualified model target."""
+        return Failover(FailoverKind.SWITCH_MODEL, cooldown=cooldown, target=target)
+
+    @staticmethod
+    def reseed_session() -> Failover:
+        """Reseed provider-side session state before retrying."""
+        return Failover(FailoverKind.RESEED_SESSION)
+
+    @staticmethod
+    def semantic_retry() -> Failover:
+        """Retry through the bounded semantic-repair lane."""
+        return Failover(FailoverKind.SEMANTIC_RETRY)
+
+    @staticmethod
+    def fail(reason: str | None = None) -> Failover:
+        """Fail without further recovery."""
+        return Failover(FailoverKind.FAIL, reason=reason)
+
+
+class ModelFallback(StrEnum):
+    """Choose selection-time behavior for an unavailable pinned model."""
+
+    DENY = "deny"
+    PARENT = "parent"
+    CHAIN = "chain"
+
+
+class AuthMethod(StrEnum):
+    """Identify a provider login method."""
+
+    API_KEY = "api_key"
+    OAUTH_PKCE = "oauth_pkce"
+    OAUTH_DEVICE = "oauth_device"
+    OAUTH_PASTE = "oauth_paste"
+    AWS_PROFILE = "aws_profile"
+    ADC = "adc"
+    SESSION = "session"
+
+
+class LoginUi(Protocol):
+    """Provide reentrant user interaction during provider login."""
+
+    async def prompt(self, text: str) -> str:
+        """Prompt for a text value."""
+        ...
+
+    async def select(self, text: str, options: Sequence[str]) -> str:
+        """Select one value from an ordered option list."""
+        ...
+
+    async def open_url(self, url: str) -> None:
+        """Open a login URL for the user."""
+        ...
+
+    async def notify(self, text: str, level: str) -> None:
+        """Show a login notification."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class LoginRequest:
+    """Request an extension-owned provider login flow."""
+
+    provider: str
+    method: AuthMethod
+    ui: LoginUi
+
+
+class RefreshReason(StrEnum):
+    """Explain why a credential refresh was requested."""
+
+    EXPIRING = "expiring"
+    REJECTED_401 = "rejected_401"
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshRequest:
+    """Provide ephemeral material for one serialized credential refresh."""
+
+    provider: str
+    identity: str | None
+    refresh_token: Secret | None
+    expires_at_ms: int | None
+    props: Mapping[str, int | str | bool]
+    reason: RefreshReason
+
+
+class Signer(Protocol):
+    """Perform keyed signing operations without exposing key material."""
+
+    async def hmac_sha256(self, message: bytes) -> bytes:
+        """Compute an HMAC-SHA256 digest."""
+        ...
+
+    async def jwt(self, claims: Mapping[str, object], algorithm: str) -> str:
+        """Sign a JSON Web Token."""
+        ...
+
+    async def attest(self, challenge: bytes) -> bytes:
+        """Produce a platform attestation response."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class SignRequest:
+    """Describe one provider request requiring extension-owned signing."""
+
+    provider: str
+    route: str
+    method: str
+    url: str
+    headers: Mapping[str, str]
+    body_sha256: bytes
+    signer: Signer
+
+
+@dataclass(frozen=True, slots=True)
+class Signature:
+    """Carry signer-produced headers and query parameters."""
+
+    headers: Mapping[str, str]
+    query: Mapping[str, str] = _EMPTY_MAP
+
+
+class Fallback(StrEnum):
+    """Choose behavior when a provider cannot honor an intent."""
+
+    UNSPECIFIED = "unspecified"
+    ERROR = "error"
+    IGNORE = "ignore"
+    EMULATE = "emulate"
+
+
+class IntentKind(StrEnum):
+    """Identify one negotiated inference capability intent."""
+
+    STRICT = "strict"
+    GRAMMAR = "grammar"
+    FORCE_CALL = "force_call"
+    SERVICE_TIER = "service_tier"
+    VERBOSITY = "verbosity"
+    CACHE_RETENTION = "cache_retention"
+    REASONING = "reasoning"
+    SAFETY = "safety"
+    DETERMINISM = "determinism"
+    HOSTED_TOOL = "hosted_tool"
+
+
+@dataclass(frozen=True, slots=True)
+class Intent:
+    """Declare a negotiated inference capability request."""
+
+    kind: IntentKind
+    on_unsupported: Fallback = Fallback.UNSPECIFIED
+    priority: int = 0
+    payload: object = None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestDraft:
+    """Expose bounded request metadata to a pre-encoding hook."""
+
+    provider: str
+    route: str
+    model: str
+    operation: Operation
+    scalars: Mapping[str, int | float | str | bool]
+    headers: Mapping[str, str]
+    intents: tuple[Intent, ...]
+    message_count: int
+    approx_prompt_tokens: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestMutation:
+    """Describe a shallow request-body and header mutation."""
+
+    body: Mapping[str, object] = _EMPTY_MAP
+    headers: Mapping[str, str | None] = _EMPTY_MAP
+    timeout: Duration | None = None
+
+
+class DiscoveryTrigger(StrEnum):
+    """Identify what initiated provider model discovery."""
+
+    SESSION_START = "session_start"
+    INTERVAL = "interval"
+    MANUAL = "manual"
+    POST_LOGIN = "post_login"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryQuery:
+    """Request one page of provider model discovery."""
+
+    provider: str
+    route: str
+    cursor: str | None
+    page_size: int | None
+    trigger: DiscoveryTrigger
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryPage:
+    """Return one page of dynamically discovered models."""
+
+    models: tuple[ModelSpec, ...]
+    next_cursor: str | None = None
+    authoritative: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SearchQuery:
+    """Request one page from a provider-backed web search."""
+
+    provider: str
+    query: str
+    count: int
+    offset: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResult:
+    """Represent one normalized ranked web search result."""
+
+    title: str
+    url: str
+    snippet: str
+    rank: int
+
+
+@dataclass(frozen=True, slots=True)
+class SearchPage:
+    """Return one normalized page of provider-backed search results."""
+
+    results: tuple[SearchResult, ...]
+    next_offset: int | None = None
+
+
+class UsageScope(StrEnum):
+    """Select the provider usage scope to query."""
+
+    CURRENT = "current"
+    BILLING = "billing"
+    RATE_LIMIT = "rate_limit"
+    ALL = "all"
+
+
+class UsageUnit(StrEnum):
+    """Identify the unit used by a provider usage window."""
+
+    REQUESTS = "requests"
+    TOKENS = "tokens"
+    PREMIUM_UNITS = "premium_units"
+    NANOS_USD = "nanos_usd"
+
+
+@dataclass(frozen=True, slots=True)
+class UsageQuery:
+    """Request provider usage for one credential identity."""
+
+    provider: str
+    identity: str | None
+    scope: UsageScope
+    allow_stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UsageWindow:
+    """Describe one provider quota or billing window."""
+
+    id: str
+    used: int | None = None
+    limit: int | None = None
+    fraction: Decimal | None = None
+    resets_at_ms: int | None = None
+    unit: UsageUnit = UsageUnit.REQUESTS
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReport:
+    """Aggregate provider usage windows and account balance metadata."""
+
+    windows: tuple[UsageWindow, ...]
+    balance_nanos_usd: int | None = None
+    plan: str | None = None
+    observed_at_ms: int | None = None
+
+
+class CredentialKind(StrEnum):
+    """Identify the material carried by a provider credential."""
+
+    API_KEY = "api_key"
+    BEARER = "bearer"
+    OAUTH = "oauth"
+    AWS = "aws"
+    SESSION = "session"
+
+
+@dataclass(frozen=True, slots=True)
+class Credential:
+    """Carry provider credential material returned by login or refresh."""
+
+    kind: CredentialKind
+    secret: Secret
+    refresh_token: Secret | None = None
+    expires_at_ms: int | None = None
+    identity: str | None = None
+    props: Mapping[str, int | str | bool] = _EMPTY_MAP
+
+
+def provider(
+    spec: ProviderSpec,
+    /,
+    *,
+    priority: int = 0,
+    extends: str | None = None,
+    replaces: str | None = None,
+) -> ProviderHandle:
+    """Return the declaration handle used directly or as a class decorator."""
+    if not isinstance(spec, ProviderSpec):
+        raise TypeError("omp.provider requires a ProviderSpec")
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise TypeError("provider priority must be an integer")
+    return ProviderHandle(
+        spec, priority=priority, extends=extends, replaces=replaces
+    )
 
 
 __all__ = (
-    "AccountScope", "Api", "AuthMode", "AuthSpec", "CacheRetention", "Cap", "ChatCaps",
-    "CodecProfile", "CompatFlags", "Completion", "ContextSpec", "Cost", "CostTier",
-    "CredentialSource", "Effort", "LogprobCaps", "ManagementSpec", "Modality", "ModelSpec",
-    "OAuthFlow", "OAuthFlowKind", "OAuthSpec", "Operation", "PrincipalResolution",
-    "PromptCacheCaps", "ProviderSpec", "ReasoningCaps", "RefreshBehavior", "RouteSpec",
-    "ServerStateCaps", "ServiceTier", "ThinkingMode", "ThinkingSpec", "TokenPlacement",
-    "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "provider",
+    "AccountScope", "Api", "AuthMethod", "AuthMode", "AuthSpec", "Availability",
+    "CacheRetention", "Cap", "ChatCaps", "CodecProfile", "CompatFlags", "Completion",
+    "Confidence", "ContextSpec", "Cost", "CostTier", "Credential", "CredentialKind",
+    "CredentialSource", "DiscoveryDefaults", "DiscoveryKind", "DiscoveryPage", "DiscoveryQuery",
+    "DiscoverySpec", "DiscoveryTrigger", "Effort", "ErrorKind", "Failover", "FailoverKind",
+    "Fallback", "Intent", "IntentKind", "LoginRequest", "LoginUi", "LogprobCaps",
+    "ManagementSpec", "Modality", "ModelFallback", "ModelRef", "ModelSpec", "OAuthFlow",
+    "OAuthFlowKind", "OAuthSpec", "Operation", "Pagination", "PrincipalResolution",
+    "PromptCacheCaps", "ProviderError", "ProviderHandle", "ProviderSpec", "ReasoningCaps",
+    "RedirectTrust", "RefreshBehavior", "RefreshReason", "RefreshRequest", "RequestDraft",
+    "RequestMutation", "Retryability", "Role", "RouteLimits", "RouteRef", "RouteSpec",
+    "SearchPage", "SearchQuery", "SearchResult", "ServerStateCaps", "ServiceTier",
+    "SignRequest", "Signature", "Signer", "ThinkingMode", "ThinkingSpec", "TokenPlacement",
+    "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "TrustDomain", "UsageQuery",
+    "UsageReport", "UsageScope", "UsageUnit", "UsageWindow", "provider",
 )

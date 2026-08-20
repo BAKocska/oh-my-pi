@@ -232,6 +232,7 @@ struct BridgeState {
 	pending_prompt:    Option<PendingPrompt>,
 	part_serial:       u64,
 	active_parts:      HashMap<u32, Str>,
+	streaming_tools:   HashMap<u32, (Str, Vec<u8>)>,
 	tools:             HashMap<Str, ToolDisplay>,
 	rewind_targets:    Vec<RewindTarget>,
 	pending_auth_kind: Option<AuthPromptKind>,
@@ -359,6 +360,7 @@ where
 		pending_prompt: None,
 		part_serial: 0,
 		active_parts: HashMap::new(),
+		streaming_tools: HashMap::new(),
 		tools: HashMap::new(),
 		rewind_targets: Vec::new(),
 		live_enabled: false,
@@ -1179,24 +1181,31 @@ fn handle_agent_event(
 					);
 				}
 			},
-			Some(Event::PartStart(start)) => {
-				let prefix = match part_start::Kind::try_from(start.kind) {
-					Ok(part_start::Kind::Text) => Some(None),
-					Ok(part_start::Kind::Thinking) => Some(Some("*Thinking:* ")),
-					_ => None,
-				};
-				if let Some(prefix) = prefix {
+			Some(Event::PartStart(start)) => match part_start::Kind::try_from(start.kind) {
+				Ok(part_start::Kind::Text | part_start::Kind::Thinking) => {
 					state.part_serial = state.part_serial.saturating_add(1);
 					let id = Str::from(format!("assistant-{}", state.part_serial));
 					send_backend(backend, BackendEvent::AssistantBegin { id: id.clone() });
-					if let Some(prefix) = prefix {
+					if start.kind == part_start::Kind::Thinking as i32 {
 						send_backend(backend, BackendEvent::AssistantDelta {
 							id:   id.clone(),
-							text: Str::new_static(prefix),
+							text: Str::new_static("*Thinking:* "),
 						});
 					}
 					state.active_parts.insert(start.index, id);
-				}
+				},
+				Ok(part_start::Kind::ToolCall) => {
+					let id = Str::from(start.tool_call_id.as_str());
+					let identity = missing_identity(&start.tool_name);
+					state.tools.insert(id.clone(), ToolDisplay {
+						identity,
+						args: omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+						started: false,
+						fold: ViewState::new(),
+					});
+					state.streaming_tools.insert(start.index, (id, Vec::new()));
+				},
+				_ => {},
 			},
 			Some(Event::PartDelta(delta)) => {
 				if let Some(id) = state.active_parts.get(&delta.index)
@@ -1206,22 +1215,44 @@ fn handle_agent_event(
 						id:   id.clone(),
 						text: Str::from(fragment),
 					});
+				} else if let Some((id, bytes)) = state.streaming_tools.get_mut(&delta.index) {
+					bytes.extend_from_slice(&delta.chunk);
+					if let Ok(fragment) = std::str::from_utf8(bytes)
+						&& let Some(tool) = state.tools.get_mut(id.as_str())
+					{
+						tool.args = omp_slopjson::parse_streaming(fragment);
+						ensure_tool_started(backend, id, tool, false);
+						if tool.started
+							&& let Some(input) = tool.args.get("input").and_then(|value| value.as_str())
+						{
+							send_backend(backend, BackendEvent::ToolView {
+								id:   id.clone(),
+								view: Str::from(input),
+							});
+						}
+					}
 				}
 			},
 			Some(Event::PartEnd(end)) => {
 				if let Some(id) = state.active_parts.remove(&end.index) {
 					send_backend(backend, BackendEvent::AssistantEnd { id });
 				}
+				state.streaming_tools.remove(&end.index);
 			},
 			_ => {},
 		},
 		AgentEvent::ToolOpened { call_id, name, rev } => {
-			state.tools.insert(call_id.clone(), ToolDisplay {
-				identity: ToolIdentity { name: name.clone(), rev: rev.clone() },
-				args:     omp_slopjson::Value::Object(omp_slopjson::Object::new()),
-				started:  false,
-				fold:     ViewState::new(),
-			});
+			let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
+			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
+				tool.identity = identity;
+			} else {
+				state.tools.insert(call_id.clone(), ToolDisplay {
+					identity,
+					args: omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+					started: false,
+					fold: ViewState::new(),
+				});
+			}
 		},
 		AgentEvent::ToolArgs { call_id, view, .. } => {
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
@@ -1566,7 +1597,15 @@ fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
 	let detail = ["title", "path", "command", "pattern", "query"]
 		.into_iter()
 		.find_map(|key| args.get(key).and_then(|value| value.as_str()))
-		.and_then(|text| text.lines().next());
+		.and_then(|text| text.lines().next())
+		.or_else(|| {
+			args
+				.get("input")
+				.and_then(|value| value.as_str())
+				.and_then(|input| input.lines().next())
+				.and_then(|header| header.strip_prefix('['))
+				.and_then(|header| header.split_once('#').map(|(path, _)| path))
+		});
 	detail.map_or_else(|| name.clone(), |detail| fmts!("{name} · {detail}"))
 }
 

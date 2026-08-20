@@ -1,0 +1,23 @@
+id = "examples.plan-mode"
+entry = "plan_mode"
+kind = "extension"
+version = "0.1.0"
+description = "A session-scoped read-only planning mode with typed plan handoff."
+requires = []
+capabilities = []
+
+[[tools]]
+name = "plan"
+kind = "soft"
+
+[[hooks]]
+event = "tool_call"
+phase = "precheck"
+order = 50
+failure = "fail-closed"
+
+[[hooks]]
+event = "turn_start"
+phase = "transform"
+order = 50
+failure = "fail-open"

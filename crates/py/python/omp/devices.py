@@ -22,19 +22,124 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Any
 
-from ._errors import NotWiredError
+from ._errors import ExtensionError, NotWiredError
 from ._registry import registry
+from .placement import Place
+from .policy import Tier
+
+
+EXTERNAL_SUMMARY_CAP = 200
+PER_DEVICE_CAP = 10_000
+
+
+class Precedence(IntEnum):
+    """Order competing claims on one device name."""
+
+    CORE = 1000
+    INTEGRATION = 700
+    ENHANCEMENT = 500
+    DEFAULT = 0
+    FALLBACK = -500
+
+
+@dataclass(frozen=True, slots=True)
+class Availability:
+    """Describe whether a declared device is currently mounted."""
+
+    mounted: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Example:
+    """Describe one worked device invocation."""
+
+    args: Mapping[str, object]
+    note: str | None = None
+    result: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DocEffects:
+    """Bound a device's document effects."""
+
+    read: bool = False
+    write_globs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExecEffects:
+    """Bound a device's command and network effects."""
+
+    commands: tuple[str, ...] = ()
+    network: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceEffects:
+    """Bound a device's inference effects."""
+
+    max_requests: int = 0
+    max_usd: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class Effects:
+    """Declare a device's maximum static effect envelope."""
+
+    documents: DocEffects | None = None
+    exec: ExecEffects | None = None
+    inference: InferenceEffects | None = None
+    subagents: int = 0
+
+
+class DocsMode(StrEnum):
+    """Select how much device documentation is inlined."""
+
+    CATALOG = "catalog"
+    BUILTINS = "builtins"
+    INLINE = "inline"
+
+
+class DeviceError(ExtensionError):
+    """A device declaration or runtime operation failed."""
+
+
+class DeviceNameError(DeviceError):
+    """Raised when a device name or precedence claim is invalid."""
+
+
+class SchemaError(DeviceError):
+    """Raised when a device schema or example is invalid."""
+
+
+class PrecedenceConflict(DeviceError):
+    """Raised when device claims cannot be ordered unambiguously."""
+
+
+class DocsBudgetError(DeviceError):
+    """Raised when device documentation exceeds its allowed budget."""
+
+
+class DeviceUnavailable(DeviceError):
+    """Raised when no mounted device satisfies a requested path."""
 
 
 def _segment(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("device path segments must be non-empty strings")
-    if not value[0].isalpha() or not value[0].islower() or len(value) > 64:
-        raise ValueError(f"invalid device path segment {value!r}")
-    if any(not (character.islower() or character.isdigit() or character == "_") for character in value):
+    if (
+        len(value) > 64
+        or not ("a" <= value[0] <= "z")
+        or any(
+            not ("a" <= character <= "z" or "0" <= character <= "9" or character == "_")
+            for character in value
+        )
+    ):
         raise ValueError(f"invalid device path segment {value!r}")
     return value
 
@@ -46,6 +151,141 @@ def _subpath(value: str) -> str:
     if not parts or any(not part for part in parts):
         raise ValueError(f"invalid dynamic device subpath {value!r}")
     return "/".join(_segment(part) for part in parts)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPath:
+    """Identify one device-tree path and optional claimant."""
+
+    name: str
+    sub: str | None = None
+    claimant: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            _segment(self.name)
+            if self.sub is not None:
+                _subpath(self.sub)
+        except (TypeError, ValueError) as error:
+            raise DeviceError(str(error)) from error
+        if self.claimant is not None:
+            if (
+                not isinstance(self.claimant, str)
+                or self.claimant.count("/") != 1
+                or any(not part for part in self.claimant.split("/"))
+            ):
+                raise DeviceError(f"invalid device claimant {self.claimant!r}")
+
+    def __str__(self) -> str:
+        """Render the canonical model-facing device path."""
+        rendered = self.name
+        if self.sub is not None:
+            rendered = f"{rendered}/{self.sub}"
+        if self.claimant is not None:
+            rendered = f"{rendered}@{self.claimant}"
+        return rendered
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceInfo:
+    """Capture an immutable snapshot of one device claimant."""
+
+    name: str
+    family: str
+    rev: int
+    identity: str
+    claimant: str
+    path: ToolPath
+    summary: str | None
+    place: Place
+    precedence: int
+    tier: Tier
+    effects: Effects | None
+    mounted: bool
+    enabled: bool
+    available: bool
+    reason: str | None
+    shadowed_by: str | None
+    source: str
+
+
+class Device:
+    """Provide the live handle returned by ``@omp.device``."""
+
+    __slots__ = (
+        "body",
+        "docs",
+        "enabled",
+        "family",
+        "identity",
+        "mounted",
+        "name",
+        "path",
+        "place",
+        "precedence",
+        "replaces",
+        "rev",
+        "schema",
+        "shadowed_by",
+        "shadows",
+        "summary",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        family: str,
+        rev: int,
+        place: Place,
+        precedence: int,
+        replaces: str | None,
+        schema: type | dict[str, object] | None,
+        docs: object | None,
+        summary: str | None,
+        body: Callable[..., Any],
+    ) -> None:
+        """Initialize one declared device handle."""
+        self.name = name
+        self.family = family
+        self.rev = rev
+        self.identity = f"{name}@{family or name}/{rev}"
+        self.path = ToolPath(name)
+        self.place = place
+        self.precedence = precedence
+        self.replaces = replaces
+        self.schema = schema
+        self.docs = docs
+        self.summary = summary
+        self.body = body
+        self.enabled = True
+        self.mounted = False
+        self.shadows = ()
+        self.shadowed_by = None
+
+    def enable(self) -> None:
+        """Enable this device for the host's FREEZE projection."""
+        registry.set_device_enabled(self.name, self.family, self.rev, True)
+        self.enabled = True
+
+    def disable(self, reason: str | None = None) -> None:
+        """Disable this device for the host's FREEZE projection."""
+        registry.set_device_enabled(
+            self.name, self.family, self.rev, False, reason=reason
+        )
+        self.enabled = False
+
+    def subtool(self, name: str) -> ToolPath:
+        """Return a typed child path below this device."""
+        try:
+            sub = _subpath(name)
+        except (TypeError, ValueError) as error:
+            raise DeviceError(str(error)) from error
+        return ToolPath(self.name, sub)
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke the decorated body directly in process."""
+        return await self.body(*args, **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +356,9 @@ class DynamicDeviceParent:
 class Devices:
     """Static parent declarations plus the session-scoped mounted-set surface."""
 
+    EXTERNAL_SUMMARY_CAP = EXTERNAL_SUMMARY_CAP
+    PER_DEVICE_CAP = PER_DEVICE_CAP
+
     __slots__ = ()
 
     def parent(
@@ -155,9 +398,28 @@ class Devices:
 devices = Devices()
 
 __all__ = (
+    "Availability",
     "AvailabilityDelta",
+    "Device",
+    "DeviceError",
+    "DeviceInfo",
+    "DeviceNameError",
+    "DeviceUnavailable",
     "Devices",
+    "DocsBudgetError",
+    "DocsMode",
+    "DocEffects",
     "DynamicDeviceParent",
+    "EXTERNAL_SUMMARY_CAP",
+    "Effects",
+    "Example",
+    "ExecEffects",
+    "InferenceEffects",
     "MountSpec",
+    "PER_DEVICE_CAP",
+    "Precedence",
+    "PrecedenceConflict",
+    "SchemaError",
+    "ToolPath",
     "devices",
 )

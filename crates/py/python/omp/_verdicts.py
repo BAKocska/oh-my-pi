@@ -32,6 +32,31 @@ class Payload:
 _P = TypeVar("_P", bound=Payload)
 _F = TypeVar("_F")
 _U = TypeVar("_U")
+_R = TypeVar("_R")
+_UPDATE_MISSING = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class Update(Generic[_U]):
+    """An ephemeral typed progress payload emitted by a streaming device."""
+
+    payload: _U
+
+    def __init__(
+        self, payload: _U | object = _UPDATE_MISSING, /, **fields: object
+    ) -> None:
+        if payload is not _UPDATE_MISSING and fields:
+            raise TypeError("Update accepts either one payload or keyword fields")
+        value = fields if payload is _UPDATE_MISSING else payload
+        object.__setattr__(self, "payload", value)
+
+
+@dataclass(frozen=True, slots=True)
+class Done(Generic[_R]):
+    """The terminal result emitted by a streaming device."""
+
+    result: _R
+    useless: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -602,7 +602,6 @@ fn archive_error(error: ArError, format: ArchiveFormat) -> ArchiveError {
 	}
 }
 
-
 fn node_from_entry(entry: &Entry, path: String) -> ArchiveNode {
 	ArchiveNode {
 		path,

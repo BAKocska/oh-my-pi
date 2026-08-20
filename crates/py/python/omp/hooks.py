@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar, Final, TypeAlias, TypeVar
 
-from _omp import Duration
+from _omp import Duration, OmpError
 
 from ._errors import NotWiredError
 from ._registry import registry
@@ -32,6 +32,14 @@ class LateRegistration(RuntimeError):
     """A hook was declared after the extension declaration table was sealed."""
 
 
+class ReentrancyError(OmpError):
+    """A hook exceeded ``omp.limits.REENTRANCY_DEPTH``."""
+
+
+class PhaseConflict(OmpError):
+    """A hook awaited a CONTROL operation blocked by its pending loop phase."""
+
+
 class HookPhase(StrEnum):
     """Order one hook within the per-event decision procedure."""
 
@@ -40,6 +48,15 @@ class HookPhase(StrEnum):
     REVIEW = "review"
     APPROVAL = "approval"
     OBSERVE = "observe"
+
+
+class CallOrigin(StrEnum):
+    """Identify who issued a logical call."""
+
+    MODEL = "model"
+    USER = "user"
+    SUBAGENT = "subagent"
+    REPLAY = "replay"
 
 
 class TargetKind(StrEnum):
@@ -245,9 +262,10 @@ _EVENT_NAMES = (
     "tool_approval_requested", "tool_approval_resolved", "device_list", "user_input",
     "user_bash", "user_eval", "command_invoke", "resources_discover",
     "resources_changed", "provider_login", "provider_refresh", "provider_sign",
-    "before_request", "models_discover", "provider_error", "provider_usage",
+    "before_request", "models_discover", "provider_error", "provider_usage", "search_parse",
+    "sandbox_profile", "sandbox_violation",
     "capability_budget", "model_changed", "credential_disabled", "compaction",
-    "compaction_done", "thread_projection", "subagent_spawn", "worker_state",
+    "compaction_done", "context_reset", "thread_projection", "subagent_spawn", "worker_state",
     "job_registered", "job_settled", "extension_activate", "extension_load",
     "extension_unload", "host_reconnect",
 )
@@ -275,12 +293,23 @@ _OBSERVATION_EVENTS = frozenset(
         "message_start", "message_update", "message_end", "item_committed", "call_open",
         "tool_execution_start", "tool_update", "tool_execution_end",
         "tool_approval_requested", "tool_approval_resolved", "resources_changed",
-        "provider_usage", "capability_budget", "model_changed", "credential_disabled",
-        "compaction_done", "worker_state", "job_registered", "job_settled",
+        "capability_budget", "model_changed", "credential_disabled",
+        "compaction_done", "context_reset", "worker_state", "job_registered", "job_settled",
         "extension_activate", "extension_load", "extension_unload", "host_reconnect",
     }
 )
-_DOMAIN_EVENTS = frozenset({"agent_settled", "provider_error", "thread_projection"})
+_DOMAIN_EVENTS = frozenset(
+    {
+        "agent_settled",
+        "compaction",
+        "models_discover",
+        "provider_error",
+        "provider_usage",
+        "search_parse",
+        "sandbox_violation",
+        "thread_projection",
+    }
+)
 _STREAM_EVENTS = frozenset({"message_start", "message_update", "message_end", "call_open", "tool_update"})
 
 
@@ -319,6 +348,10 @@ def hook(
         if phase not in (None, HookPhase.OBSERVE):
             raise HookContractError(f"observation event {event!r} only accepts OBSERVE")
         registry_phase = HookPhase.OBSERVE
+    elif event == "sandbox_profile":
+        if phase != HookPhase.TRANSFORM:
+            raise HookContractError("sandbox_profile requires TRANSFORM phase")
+        registry_phase = phase
     else:
         if phase is None:
             raise HookContractError(f"gateable event {event!r} requires phase")
@@ -376,8 +409,9 @@ async def dispatch_hook(*_args: object, **_kwargs: object) -> object:
 
 __all__ = (
     "APPROVAL_DEADLINE", "Allow", "ApprovalKind", "ApprovalRoute", "ApprovalSpec",
-    "CallTarget", "CoreTool", "Defer", "Deny", "DeviceCall", "HookContractError",
+    "CallOrigin", "CallTarget", "CoreTool", "Defer", "Deny", "DeviceCall", "HookContractError",
     "HookDecision", "HookPhase", "LateRegistration", "McpCall", "Modify", "OnFailure",
-    "PolicyScope", "RequireApproval", "TargetKind", "UNSET", "UnknownEvent", "Unreachable",
+    "PhaseConflict", "PolicyScope", "ReentrancyError", "RequireApproval", "TargetKind",
+    "UNSET", "UnknownEvent", "Unreachable",
     "When", "dispatch_hook", "hook",
 )

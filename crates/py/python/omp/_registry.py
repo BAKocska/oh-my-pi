@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from dataclasses import dataclass, replace
+from typing import Annotated, Protocol, TypeVar, get_args, get_origin, get_type_hints
 
 from _omp import (
     CapabilityError,
@@ -104,11 +104,69 @@ class ProviderDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class CommandDefinition:
+    """One import-time slash-command declaration and its dispatch callbacks."""
+
+    name: str
+    aliases: tuple[str, ...]
+    description: str
+    args: tuple[object, ...]
+    hint: str | None
+    arg_completions: object | None
+    handler: object
+
+@dataclass(frozen=True, slots=True)
 class WorkerDefinition:
     """One import-time ``omp.workers.declare`` declaration."""
 
     name: str
     spec: object
+
+@dataclass(frozen=True, slots=True)
+class ArgSpec:
+    """Immutable metadata for one argument path of a device revision."""
+
+    path: tuple[str | int, ...]
+    aliases: tuple[str, ...]
+    coerce: tuple[object, ...]
+    expected: str | None
+    example: str | None
+    description: str | None
+    additional_properties: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceDefinition:
+    """One import-time static device declaration."""
+
+    name: str
+    family: str
+    rev: int
+    place: object
+    summary: str | None
+    docs: object | None
+    schema: object | None
+    examples: tuple[object, ...]
+    available: object | None
+    precedence: int
+    replaces: str | None
+    intents: tuple[object, ...]
+    effects: object | None
+    tier: object
+    deadline: object | None
+    aliases: Mapping[str, str] | None
+    body: object
+    arg_specs: tuple[ArgSpec, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExportDefinition:
+    """One import-time telemetry export declaration."""
+
+    target: object
+    kinds: tuple[str, ...]
+    sample: float
+
 
 
 
@@ -148,9 +206,14 @@ class DeclarationSnapshot:
     hooks: frozenset[_HookKey]
     services: frozenset[_ServiceKey]
     telemetry: tuple[TelemetryDefinition, ...] = ()
+    commands: tuple[CommandDefinition, ...] = ()
     prompt_slots: tuple[PromptSlotDefinition, ...] = ()
     providers: tuple[ProviderDefinition, ...] = ()
     workers: tuple[WorkerDefinition, ...] = ()
+    device_definitions: tuple[DeviceDefinition, ...] = ()
+    exports: tuple[ExportDefinition, ...] = ()
+    device_states: tuple[tuple[_ToolKey, bool, str | None], ...] = ()
+    arg_specs: tuple[tuple[_ToolKey, tuple[ArgSpec, ...]], ...] = ()
 
 
 class DeclarationRegistry:
@@ -158,7 +221,14 @@ class DeclarationRegistry:
 
     __slots__ = (
         "_configured",
+        "_commands",
+        "_device_claims",
+        "_device_definitions",
+        "_device_states",
         "_entry_kinds",
+        "_export_sequence",
+        "_exports",
+        "_extension_id",
         "_providers",
         "_hooks",
         "_prompt_slots",
@@ -179,11 +249,20 @@ class DeclarationRegistry:
         self._configured = False
         self._sealed = False
         self._verified = False
+        self._commands: dict[str, CommandDefinition] = {}
         self._tools: dict[_ToolKey, object] = {}
+        self._device_definitions: dict[_ToolKey, DeviceDefinition] = {}
+        self._device_claims: dict[
+            str, list[tuple[int, str | None, _ToolKey]]
+        ] = {}
+        self._device_states: dict[_ToolKey, tuple[bool, str | None]] = {}
         self._entry_kinds: dict[_EntryKindKey, EntryKindDefinition] = {}
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookKey, object] = {}
         self._telemetry: dict[str, TelemetryDefinition] = {}
+        self._exports: dict[int, ExportDefinition] = {}
+        self._export_sequence = 0
+        self._extension_id: str | None = None
         self._prompt_slots: dict[tuple[str, str], PromptSlotDefinition] = {}
         self._services: dict[_ServiceKey, ServiceDefinition] = {}
         self._workers: dict[_WorkerKey, WorkerDefinition] = {}
@@ -198,6 +277,11 @@ class DeclarationRegistry:
         """Whether FREEZE has made every declaration immutable."""
 
         return self._sealed
+    @property
+    def extension_id(self) -> str | None:
+        """Return the configured extension identity, if any."""
+
+        return self._extension_id
 
     @property
     def required_services(self) -> frozenset[_ServiceKey]:
@@ -212,18 +296,20 @@ class DeclarationRegistry:
         hooks: Iterable[_HookKey] = (),
         services: Iterable[_ServiceKey] = (),
         requires: Iterable[_ServiceKey] = (),
+        extension: str | None = None,
     ) -> None:
         """Installs authoritative manifest sets before the first module import."""
 
         self._ensure_open()
         if self._configured:
             raise RuntimeError("manifest declaration sets are already configured")
-        if self._tools or self._hooks or self._services:
+        if self._tools or self._hooks or self._services or self._commands:
             raise RuntimeError("manifest must be configured before declaration import")
         self._manifest_tools = frozenset(_tool_key(*item) for item in tools)
         self._manifest_hooks = frozenset(_hook_key(*item) for item in hooks)
         self._manifest_services = frozenset(_service_key(*item) for item in services)
         self._manifest_requires = frozenset(_service_key(*item) for item in requires)
+        self._extension_id = extension
         self._configured = True
 
     def register_tool(
@@ -232,12 +318,120 @@ class DeclarationRegistry:
         family: str,
         rev: int,
         declaration: object,
+        *,
+        definition: DeviceDefinition | None = None,
     ) -> object:
         """Records a tool decorator during sequential manifest import."""
 
         key = _tool_key(name, family, rev)
+        if definition is not None:
+            if not isinstance(definition, DeviceDefinition):
+                raise TypeError("device definition must be a DeviceDefinition")
+            if (definition.name, definition.family, definition.rev) != key:
+                raise ValueError("device definition identity does not match its tool key")
+            definition = replace(
+                definition,
+                arg_specs=_extract_arg_specs(definition.body, definition.schema),
+            )
+        if definition is not None:
+            from .devices import PrecedenceConflict
+
+            for prior_precedence, _prior_replaces, prior_key in self.device_claims(name):
+                if prior_precedence == definition.precedence:
+                    raise PrecedenceConflict(
+                        f"equal-precedence claims for {name!r}: {prior_key!r} and {key!r}"
+                    )
+                if definition.replaces is None:
+                    raise PrecedenceConflict(
+                        f"device {name!r} is already claimed; "
+                        "name the replaced device explicitly"
+                    )
         self._insert(self._tools, key, declaration, "tool")
+        if definition is not None:
+            self._device_definitions[key] = definition
+            self._device_claims.setdefault(name, []).append(
+                (definition.precedence, definition.replaces, key)
+            )
+            self._device_states[key] = (True, None)
         return declaration
+
+    def device_claims(
+        self, name: str
+    ) -> tuple[tuple[int, str | None, _ToolKey], ...]:
+        """Return earlier static claims for a device name."""
+
+        return tuple(self._device_claims.get(name, ()))
+
+    def device_definition(
+        self, name: str, family: str, rev: int
+    ) -> DeviceDefinition:
+        """Return one registered static device definition."""
+
+        key = _tool_key(name, family, rev)
+        try:
+            return self._device_definitions[key]
+        except KeyError as error:
+            raise LookupError(f"device definition is not registered: {key!r}") from error
+
+    def device_definitions(self) -> tuple[DeviceDefinition, ...]:
+        """Return static device definitions in deterministic key order."""
+
+        return tuple(
+            self._device_definitions[key] for key in sorted(self._device_definitions)
+        )
+
+    def arg_specs(
+        self, name: str, family: str, rev: int
+    ) -> tuple[ArgSpec, ...]:
+        """Return immutable argument metadata for one device revision."""
+
+        return self.device_definition(name, family, rev).arg_specs
+
+    def set_device_enabled(
+        self,
+        name: str,
+        family: str,
+        rev: int,
+        enabled: bool,
+        reason: str | None = None,
+    ) -> None:
+        """Record a local static-device enablement projection before FREEZE."""
+
+        self._ensure_open()
+        key = _tool_key(name, family, rev)
+        if key not in self._device_definitions:
+            raise LookupError(f"device definition is not registered: {key!r}")
+        if not isinstance(enabled, bool):
+            raise TypeError("device enabled state must be bool")
+        if enabled and reason is not None:
+            raise ValueError("an enabled device cannot carry a disabled reason")
+        self._device_states[key] = (enabled, reason)
+
+    def device_state(
+        self, name: str, family: str, rev: int
+    ) -> tuple[bool, str | None]:
+        """Return the projected local enablement state for one static device."""
+
+        key = _tool_key(name, family, rev)
+        try:
+            return self._device_states[key]
+        except KeyError as error:
+            raise LookupError(f"device definition is not registered: {key!r}") from error
+
+    def register_export(self, definition: ExportDefinition) -> ExportDefinition:
+        """Record one declarative telemetry export during import."""
+
+        if not isinstance(definition, ExportDefinition):
+            raise TypeError("export definition must be an ExportDefinition")
+        key = self._export_sequence
+        self._insert(self._exports, key, definition, "telemetry export")
+        self._export_sequence += 1
+        return definition
+
+    def export_definitions(self) -> tuple[ExportDefinition, ...]:
+        """Return telemetry exports in declaration order."""
+
+        return tuple(self._exports[key] for key in sorted(self._exports))
 
     def register_hook(self, event: str, phase: object, handler: object) -> object:
         """Records a hook decorator during sequential manifest import."""
@@ -345,6 +539,47 @@ class DeclarationRegistry:
 
         return tuple(self._workers[key] for key in sorted(self._workers))
 
+    def register_command(
+        self,
+        name: str,
+        aliases: tuple[str, ...],
+        description: str,
+        args: tuple[object, ...],
+        hint: str | None,
+        arg_completions: object | None,
+        handler: object,
+    ) -> object:
+        """Record one slash command and its static and dynamic completion metadata."""
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("command name must be a non-empty string")
+        if any(not isinstance(alias, str) or not alias for alias in aliases):
+            raise ValueError("command aliases must be non-empty strings")
+        if not isinstance(description, str):
+            raise TypeError("command description must be a string")
+        if hint is not None and not isinstance(hint, str):
+            raise TypeError("command hint must be a string or None")
+        if arg_completions is not None and not callable(arg_completions):
+            raise TypeError("command arg_completions must be callable or None")
+        if not callable(handler):
+            raise TypeError("@omp.command may decorate only a callable")
+        definition = CommandDefinition(
+            name,
+            aliases,
+            description,
+            args,
+            hint,
+            arg_completions,
+            handler,
+        )
+        self._insert(self._commands, name, definition, "command")
+        return handler
+
+    def command_definitions(self) -> tuple[CommandDefinition, ...]:
+        """Return command declarations in deterministic name order."""
+
+        return tuple(self._commands[key] for key in sorted(self._commands))
+
 
 
 
@@ -379,7 +614,34 @@ class DeclarationRegistry:
     def freeze(self) -> DeclarationSnapshot:
         """Seals the Core-verified registry and returns its immutable sets."""
 
+        self._ensure_open()
         self._sealed = True
+        from .devices import Availability
+
+        for key, definition in self._device_definitions.items():
+            enabled, disabled_reason = self._device_states[key]
+            mounted = enabled
+            reason = disabled_reason
+            if enabled and definition.available is not None:
+                try:
+                    result = definition.available()
+                except Exception as error:
+                    mounted = False
+                    reason = f"{type(error).__name__}: {error}"
+                else:
+                    if isinstance(result, bool):
+                        mounted = result
+                        reason = None
+                    elif isinstance(result, Availability):
+                        mounted = result.mounted
+                        reason = result.reason
+                    else:
+                        mounted = False
+                        reason = "availability predicate returned neither bool nor Availability"
+            self._device_states[key] = (mounted, reason)
+            declaration = self._tools[key]
+            if hasattr(declaration, "mounted"):
+                declaration.mounted = mounted
         self._verified = True
         return self.snapshot()
 
@@ -391,12 +653,22 @@ class DeclarationRegistry:
             tools=frozenset(self._tools),
             hooks=frozenset(self._hooks),
             services=frozenset(self._services),
+            commands=self.command_definitions(),
             telemetry=tuple(self._telemetry[key] for key in sorted(self._telemetry)),
             prompt_slots=tuple(
                 self._prompt_slots[key] for key in sorted(self._prompt_slots)
             ),
             providers=self.provider_definitions(),
             workers=self.worker_definitions(),
+            device_definitions=self.device_definitions(),
+            exports=self.export_definitions(),
+            device_states=tuple(
+                (key, *self._device_states[key]) for key in sorted(self._device_states)
+            ),
+            arg_specs=tuple(
+                (key, self._device_definitions[key].arg_specs)
+                for key in sorted(self._device_definitions)
+            ),
         )
 
 
@@ -436,6 +708,7 @@ class DeclarationRegistry:
         self._ensure_open()
         if (
             len(self._tools)
+            + len(self._commands)
             + len(self._hooks)
             + len(self._services)
             + len(self._entry_kinds)
@@ -443,6 +716,7 @@ class DeclarationRegistry:
             + len(self._prompt_slots)
             + len(self._providers)
             + len(self._workers)
+            + len(self._exports)
             >= MAX_DECLARATIONS
         ):
             raise DeclarationLimit(
@@ -544,6 +818,7 @@ def configure_manifest(
     hooks: Iterable[_HookKey] = (),
     services: Iterable[_ServiceKey] = (),
     requires: Iterable[_ServiceKey] = (),
+    extension: str | None = None,
 ) -> None:
     """Installs authoritative existence sets before sequential import."""
 
@@ -552,6 +827,7 @@ def configure_manifest(
         hooks=hooks,
         services=services,
         requires=requires,
+        extension=extension,
     )
 
 
@@ -617,6 +893,68 @@ async def dispatch_service(
 
 
 
+def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ...]:
+    from . import Coerce, Field
+
+    annotations: list[tuple[str, object]] = []
+    if isinstance(schema, type):
+        try:
+            schema_hints = get_type_hints(schema, include_extras=True)
+        except (NameError, TypeError):
+            schema_hints = inspect.get_annotations(schema, eval_str=False)
+        annotations.extend(schema_hints.items())
+
+    try:
+        body_hints = get_type_hints(body, include_extras=True)
+    except (NameError, TypeError):
+        body_hints = inspect.get_annotations(body, eval_str=False)
+    try:
+        parameters = inspect.signature(body).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    annotations.extend(
+        (name, body_hints[name]) for name in parameters if name in body_hints
+    )
+
+    specs: list[ArgSpec] = []
+    seen_paths: set[str] = set()
+    for name, annotation in annotations:
+        metadata = tuple(_annotation_metadata(annotation))
+        fields = tuple(item for item in metadata if isinstance(item, Field))
+        coercions = tuple(item for item in metadata if isinstance(item, Coerce))
+        if not fields and not coercions:
+            continue
+        if len(fields) > 1:
+            raise TypeError(f"argument {name!r} carries more than one omp.Field")
+        field = fields[0] if fields else Field()
+        if name in seen_paths:
+            raise TypeError(f"argument metadata path is declared twice: {name!r}")
+        seen_paths.add(name)
+        specs.append(
+            ArgSpec(
+                path=(name,),
+                aliases=field.alias,
+                coerce=field.coerce + coercions,
+                expected=field.expected,
+                example=field.example,
+                description=field.description,
+                additional_properties=field.additional_properties,
+            )
+        )
+    return tuple(specs)
+
+
+def _annotation_metadata(annotation: object) -> Iterable[object]:
+    origin = get_origin(annotation)
+    arguments = get_args(annotation)
+    if origin is Annotated:
+        yield from arguments[1:]
+        yield from _annotation_metadata(arguments[0])
+        return
+    for argument in arguments:
+        yield from _annotation_metadata(argument)
+
+
 def _tool_key(name: str, family: str, rev: int) -> _ToolKey:
     if not name:
         raise ValueError("tool name must be non-empty")
@@ -658,13 +996,17 @@ def _service_key(name: str, rev: int) -> _ServiceKey:
 
 
 __all__ = (
+    "ArgSpec",
     "ControlServiceTransport",
     "DeclarationDrift",
+    "CommandDefinition",
     "DeclarationRegistry",
+    "DeviceDefinition",
     "DeclarationSnapshot",
     "MAX_DECLARATIONS",
     "QuotaExceeded",
     "EntryKindDefinition",
+    "ExportDefinition",
     "QuotaStatus",
     "ResourceReceipt",
     "ServiceClient",

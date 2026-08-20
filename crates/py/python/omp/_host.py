@@ -85,8 +85,22 @@ class Host:
     def effect(self, effect: dict[str, Any]) -> None:
         """Write one already-encoded, non-correlated UI effect frame."""
         self._write({"kind": "UiEffect", "body": effect})
-    def log(self, stream: str, text: str) -> None:
-        self._write({"kind": "Log", "body": {"stream": stream, "text": text}})
+    def log(
+        self,
+        stream: object,
+        text: str,
+        fields: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit captured text or a structured context log as one Log frame."""
+        if fields is None:
+            body: dict[str, Any] = {"stream": stream, "text": text}
+        else:
+            body = {
+                "level": str(getattr(stream, "value", stream)),
+                "message": text,
+                "fields": fields,
+            }
+        self._write({"kind": "Log", "body": body})
     def install_capture(self) -> None:
         """Capture child stdout and stderr without making prints protocol errors."""
         self._stdout, self._stderr = sys.stdout, sys.stderr

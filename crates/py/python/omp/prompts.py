@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from _omp import OmpError
+
 from ._errors import NotWiredError
 from ._registry import registry as _declarations
 
@@ -45,6 +47,10 @@ class UnknownSlot(ValueError):
 
 class SlotClassConflict(ValueError):
     """A contribution attempts to loosen its catalog stability band."""
+
+
+class VolatilePrompt(OmpError):
+    """A slot function returned different bytes on the harness's two renders."""
 
 
 _SLOT_CLASSES = {
@@ -101,6 +107,6 @@ async def invalidate(slot: str) -> int:
 
 
 __all__ = (
-    "PromptContext", "SlotClass", "SlotClassConflict", "UnknownSlot", "invalidate",
-    "prompt_slot",
+    "PromptContext", "SlotClass", "SlotClassConflict", "UnknownSlot", "VolatilePrompt",
+    "invalidate", "prompt_slot",
 )

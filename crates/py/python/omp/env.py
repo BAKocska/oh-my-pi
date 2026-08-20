@@ -8,16 +8,20 @@ file, socket, process, or event loop.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import contextvars
+import inspect
+import json
 from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
+
 from _omp import (
     BlobRef,
     ClientPath,
+    Duration,
     EnvPath,
     EnvUnavailable,
     PlacementError,
@@ -25,6 +29,8 @@ from _omp import (
 )
 
 from . import EffectsNotAuthorized, Fault, OmpError, StaleGeneration
+from ._errors import NotWiredError
+from .placement import Restart
 
 
 class Capability(StrEnum):
@@ -225,6 +231,105 @@ class Match:
     byte_offset: int
     line_bytes: bytes
 
+@dataclass(frozen=True, slots=True)
+class Revision:
+    """An immutable content revision pinned by a document lease."""
+
+    sequence: int
+    content_hash: bytes
+
+    @property
+    def hex(self) -> str:
+        """Return the lowercase content hash for logging."""
+        return self.content_hash.hex()
+
+
+@dataclass(frozen=True, slots=True)
+class Edit:
+    """A byte-range replacement in a base revision's coordinate space."""
+
+    start: int
+    end: int
+    replacement: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class EditResult:
+    """The committed result of a revisioned document mutation."""
+
+    revision: Revision
+    previous: Revision
+    rebased: bool
+    formatted: bool
+    changed_ranges: tuple[tuple[int, int], ...]
+    previous_path: EnvPath | None
+
+
+@dataclass(frozen=True, slots=True)
+class EditPlan:
+    """A resolved document mutation that has not been committed."""
+
+    revision: Revision
+    edits: tuple[Edit, ...]
+    preview: str
+    first_changed_line: int | None
+    warnings: tuple[str, ...]
+
+
+class OnStale(StrEnum):
+    """Policy for a mutation whose base revision is no longer current."""
+
+    FAIL = "fail"
+    REBASE = "rebase"
+    REPLACE = "replace"
+
+
+class Format(StrEnum):
+    """Language-server formatting policy for a document mutation."""
+
+    OFF = "off"
+    BEST_EFFORT = "best_effort"
+    REQUIRED = "required"
+
+
+class Overwrite(StrEnum):
+    """Destination replacement policy for document and filesystem operations."""
+
+    FAIL = "fail"
+    REPLACE_FILE = "replace_file"
+    REPLACE_EMPTY_DIR = "replace_empty_dir"
+
+
+class Presence(StrEnum):
+    """Whether a revisioned document path currently exists."""
+
+    PRESENT = "present"
+    MISSING = "missing"
+
+
+class DocEventKind(StrEnum):
+    """Kind of committed or externally observed document change."""
+
+    COMMITTED = "committed"
+    EXTERNAL_CREATED = "external_created"
+    EXTERNAL_MODIFIED = "external_modified"
+    EXTERNAL_DELETED = "external_deleted"
+    EXTERNAL_RENAMED = "external_renamed"
+    WATCH_RESCANNED = "watch_rescanned"
+
+
+@dataclass(frozen=True, slots=True)
+class DocEvent:
+    """One ordered change observed by a document lease."""
+
+    sequence: int
+    kind: DocEventKind
+    revision: Revision
+    previous_revision: Revision
+    txn_id: bytes | None = None
+    invalidated_txn_ids: tuple[bytes, ...] = ()
+    previous_path: EnvPath | None = None
+
 
 _binding: contextvars.ContextVar[tuple[Any, EnvInfo] | None] = contextvars.ContextVar(
     "omp_env_binding", default=None
@@ -341,10 +446,12 @@ class Doc:
 
     __slots__ = ("_lease", "path", "revision", "uri")
 
-    def __init__(self, lease: Any, path: EnvPath, revision: Any = None) -> None:
+    def __init__(
+        self, lease: Any, path: EnvPath, revision: Revision | None = None
+    ) -> None:
         self._lease = lease
         self.path = path
-        self.revision = revision
+        self.revision: Revision | None = revision
         self.uri = path.uri
 
     async def read_bytes(self, *, revision: Any = None) -> bytes:
@@ -359,6 +466,17 @@ class Doc:
         """Read a zero-based half-open line range."""
         return await _request(
             "omp.env.docs.Doc.lines", lease=self._lease, start=start, end=end, revision=revision
+        )
+
+    async def dry_run(
+        self, ops: Any, *, format: Format = Format.OFF
+    ) -> EditPlan:
+        """Resolve a document mutation without committing it."""
+        return await _request(
+            "omp.env.docs.Doc.dry_run",
+            lease=self._lease,
+            ops=ops,
+            format=format,
         )
 
     async def edit(self, edits: Iterable[Any], **options: Any) -> Any:
@@ -390,7 +508,7 @@ class Doc:
         if lease is not None:
             await _request("omp.env.docs.Doc.close", lease=lease)
 
-    def events(self) -> AsyncIterator[Any]:
+    def events(self) -> AsyncIterator[DocEvent]:
         """Yield ordered document events until close or stream loss."""
         return _stream("omp.env.docs.Doc.events", lease=self._lease)
 
@@ -640,6 +758,161 @@ class Session:
         await self.close()
 
 
+class Channel(StrEnum):
+    """Output channel emitted by an Environment-owned process."""
+
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    PTY = "pty"
+
+
+class Outcome(StrEnum):
+    """Terminal outcome of an Environment-owned command."""
+
+    EXITED = "exited"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    DENIED = "denied"
+
+
+@dataclass(frozen=True, slots=True)
+class Completed:
+    """Bounded terminal receipt for an Environment-owned command."""
+
+    outcome: Outcome
+    exit_code: int | None
+    signal: str
+    wall: Duration
+    output: bytes
+    artifact: BlobRef | None
+    aborted: bool
+
+    def text(self, channel: Channel | None = None) -> str:
+        """Decode the bounded output lossily."""
+        del channel
+        return self.output.decode("utf-8", errors="replace")
+
+
+@dataclass(frozen=True, slots=True)
+class RestartPolicy:
+    """Automatic restart policy for a named process."""
+
+    policy: Restart
+    delay: Duration = Duration("500ms")
+    max_restarts: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyLog:
+    """Readiness probe matching a regular expression against combined output."""
+
+    pattern: str
+    timeout: Duration = Duration("30s")
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyTcp:
+    """Readiness probe connecting to a TCP endpoint."""
+
+    port: int
+    host: str = "127.0.0.1"
+    timeout: Duration = Duration("30s")
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyPing:
+    """Readiness probe requiring a matching toolhost Pong frame."""
+
+    nonce: int = 1
+    timeout: Duration = Duration("30s")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ReadyAll:
+    """Readiness group requiring every supplied probe to pass."""
+
+    probes: tuple[ReadyLog | ReadyTcp | ReadyPing, ...]
+
+    def __init__(self, *probes: ReadyLog | ReadyTcp | ReadyPing) -> None:
+        for probe in probes:
+            if not isinstance(probe, (ReadyLog, ReadyTcp, ReadyPing)):
+                raise TypeError(
+                    "ReadyAll probes must be ReadyLog, ReadyTcp, or ReadyPing values"
+                )
+        object.__setattr__(self, "probes", probes)
+
+
+Ready = ReadyLog | ReadyTcp | ReadyPing | ReadyAll
+
+
+class ProcState(StrEnum):
+    """Observable state of one named-process generation."""
+
+    STARTING = "starting"
+    READY = "ready"
+    RUNNING = "running"
+    EXITED = "exited"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessInfo:
+    """Immutable snapshot of one named-process generation."""
+
+    name: str
+    generation: int
+    state: ProcState
+    status: Completed
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessOutput:
+    """One ordered output frame from a named-process generation."""
+
+    generation: int
+    channel: Channel
+    data: bytes
+    sequence: int
+
+
+class Lifecycle(StrEnum):
+    """Named-process lifecycle target used by wait operations."""
+
+    READY = "ready"
+    EXIT = "exit"
+
+
+@dataclass(frozen=True, slots=True)
+class HttpResponse:
+    """Immutable response returned by scoped Environment HTTP egress."""
+
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
+        if type(self.body) is not bytes:
+            raise TypeError("HttpResponse.body must be bytes")
+
+    def json(self) -> Any:
+        """Decode the response body as JSON."""
+        return json.loads(self.body)
+
+
+async def http_get(
+    url: str,
+    *,
+    timeout: Duration | None = None,
+    headers: Mapping[str, str] = MappingProxyType({}),
+) -> HttpResponse:
+    """Request one URL through scoped Environment HTTP egress."""
+    del url, timeout, headers
+    raise NotWiredError("omp.env.http_get")
+
+
 class Process:
     """Stable named-process generation handle."""
 
@@ -649,15 +922,21 @@ class Process:
         self.name = name
         self.generation = generation
 
-    async def info(self) -> Any:
+    @property
+    def endpoint(self) -> str:
+        """Return the generation-fenced loopback or Unix endpoint."""
+        raise NotWiredError("omp.env.Process.endpoint")
+
+
+    async def info(self) -> ProcessInfo:
         """Return the current generation snapshot."""
         return await _request("omp.env.Process.info", name=self.name)
 
-    def output(self, *, after: int = 0) -> AsyncIterator[Any]:
+    def output(self, *, after: int = 0) -> AsyncIterator[ProcessOutput]:
         """Yield retained and live ordered process output."""
         return _stream("omp.env.Process.output", name=self.name, after=after)
 
-    def states(self) -> AsyncIterator[Any]:
+    def states(self) -> AsyncIterator[ProcessInfo]:
         """Yield named-process lifecycle transitions."""
         return _stream("omp.env.Process.states", name=self.name)
 
@@ -665,11 +944,18 @@ class Process:
         """Send bytes to process stdin."""
         await _request("omp.env.Process.send", name=self.name, data=data)
 
+    async def send_secret(self, name: str, value: str) -> None:
+        """Inject a scoped secret without exposing it through argv or environment."""
+        await _request(
+            "omp.env.Process.send_secret", name=self.name, secret_name=name, value=value
+        )
+
+
     async def signal(self, signal: str) -> None:
         """Signal the Environment-owned process group."""
         await _request("omp.env.Process.signal", name=self.name, signal=signal)
 
-    async def stop(self, **options: Any) -> Any:
+    async def stop(self, **options: Any) -> ProcessInfo:
         """Stop the process tree and return its terminal state."""
         return await _request("omp.env.Process.stop", name=self.name, **options)
 
@@ -748,15 +1034,43 @@ class _Proc:
             return result
         return Process(result["name"], result["generation"])
 
-    async def ensure(self, name: str, script: str, **options: Any) -> Process:
+    async def ensure(
+        self,
+        name: str,
+        script: str,
+        *,
+        cwd: EnvPath | None = None,
+        env: Mapping[str, str] | None = None,
+        pty: object | None = None,
+        restart: RestartPolicy | None = None,
+        ready: Ready | None = None,
+    ) -> Process:
         """Adopt a matching process or start it atomically."""
-        cwd = options.get("cwd")
         if cwd is not None:
-            options["cwd"] = _env_path(cwd, "cwd")
-        result = await _request("omp.env.proc.ensure", name=name, script=script, **options)
-        return result if isinstance(result, Process) else Process(result["name"], result["generation"])
+            cwd = _env_path(cwd, "cwd")
+        if restart is not None and not isinstance(restart, RestartPolicy):
+            raise TypeError("restart must be an omp.env.RestartPolicy or None")
+        if ready is not None and not isinstance(
+            ready, (ReadyLog, ReadyTcp, ReadyPing, ReadyAll)
+        ):
+            raise TypeError("ready must be an omp.env.Ready value or None")
+        result = await _request(
+            "omp.env.proc.ensure",
+            name=name,
+            script=script,
+            cwd=cwd,
+            env=env,
+            pty=pty,
+            restart=restart,
+            ready=ready,
+        )
+        return (
+            result
+            if isinstance(result, Process)
+            else Process(result["name"], result["generation"])
+        )
 
-    async def list(self) -> list[Any]:
+    async def list(self) -> list[ProcessInfo]:
         """List named processes visible to this connection."""
         return await _request("omp.env.proc.list")
 
@@ -834,9 +1148,13 @@ __all__ = (
     "AlreadyExists",
     "BlobStat",
     "BlobWriter",
+    "Channel",
+    "Completed",
     "Cancelled",
     "Capability",
     "Conflict",
+    "DocEvent",
+    "DocEventKind",
     "Denied",
     "Disconnected",
     "Doc",
@@ -844,16 +1162,36 @@ __all__ = (
     "Entry",
     "EnvError",
     "EnvInfo",
+    "Edit",
+    "EditPlan",
+    "EditResult",
     "Follow",
+    "Format",
+    "HttpResponse",
     "Invalid",
     "Io",
     "Match",
+    "Lifecycle",
+    "OnStale",
+    "Overwrite",
     "NotFound",
     "Partial",
+    "Presence",
+    "Outcome",
     "Process",
+    "ProcessInfo",
+    "ProcessOutput",
+    "ProcState",
     "PreconditionFailed",
     "QuotaExceeded",
     "Rank",
+    "Revision",
+    "Ready",
+    "ReadyAll",
+    "ReadyLog",
+    "ReadyPing",
+    "ReadyTcp",
+    "RestartPolicy",
     "Run",
     "Session",
     "Stale",
@@ -867,6 +1205,7 @@ __all__ = (
     "find",
     "fs",
     "has",
+    "http_get",
     "info",
     "lsp",
     "proc",

@@ -1,8 +1,25 @@
 """Per-invocation authority scopes; inert at import."""
 from __future__ import annotations
+
 import contextvars
-from dataclasses import dataclass
-from _omp import InvocationPhase, Principal
+from dataclasses import dataclass, field
+from enum import StrEnum
+from types import MappingProxyType
+from typing import Callable, Mapping
+
+from _omp import InvocationPhase, LifecyclePhase, Principal
+
+
+class Trust(StrEnum):
+    """Confinement tier granted to an extension child."""
+
+    SANDBOXED = "sandboxed"
+    TRUSTED = "trusted"
+
+
+_shielded: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "omp_scope_shielded", default=False
+)
 
 @dataclass(frozen=True, slots=True)
 class Scope:
@@ -13,6 +30,27 @@ class Scope:
     phase: InvocationPhase
     deadline: float | None = None
     effects: frozenset[str] = frozenset()
+    extension: str = ""
+    session: str = ""
+    turn: int | None = None
+    event: str | None = None
+    call: str | None = None
+    device: str | None = None
+    trust: Trust = Trust.SANDBOXED
+    caps: frozenset[str] = frozenset()
+    place_kind: str = "host"
+    lifecycle: LifecyclePhase = LifecyclePhase.ACTIVE
+    roots: tuple[str, ...] = ()
+    remote: bool = False
+    has_ui: bool = False
+    headless: bool = True
+    model: object | None = None
+    settings: Mapping[str, object] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    secret_settings: frozenset[str] = frozenset()
+    cancelled: object | None = None
+    cancel_callbacks: list[Callable[[], None]] = field(default_factory=list)
 
 _current: contextvars.ContextVar[Scope | None] = contextvars.ContextVar("omp_scope", default=None)
 
@@ -30,3 +68,6 @@ def install(scope: Scope) -> contextvars.Token[Scope | None]:
 def reset(token: contextvars.Token[Scope | None]) -> None:
     """Restore the scope preceding ``install``."""
     _current.reset(token)
+
+
+__all__ = ("Scope", "Trust", "current", "install", "reset")

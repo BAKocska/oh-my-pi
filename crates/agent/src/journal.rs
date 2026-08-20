@@ -935,6 +935,19 @@ impl Journal {
 		&self.entry_kinds
 	}
 
+	/// Returns the journaled phase of one invocation, when any transition has
+	/// been recorded for it.
+	///
+	/// Live-fact writers advance phases during the turn, so post-outcome
+	/// replay ladders consult this to skip steps the journal already passed.
+	#[must_use]
+	pub fn invocation_phase(&self, invocation_id: &str) -> Option<InvocationPhase> {
+		self
+			.invocations
+			.get(invocation_id)
+			.map(|(_, transition)| transition.phase)
+	}
+
 	/// Persists one adjacent invocation-machine transition through the journal
 	/// owner.
 	///

@@ -6,12 +6,15 @@ that keeps deployment introspection declarative and preserves isolated-host poli
 """
 from __future__ import annotations
 
+import builtins as _builtins
 import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping
+
+from _omp import ManifestError
 
 
 class PackageError(RuntimeError):
@@ -46,6 +49,34 @@ def _normalize(name: str) -> str:
     if not normalized:
         raise ValueError("distribution name must include an alphanumeric segment")
     return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class SettingSchema:
+    """Typed manifest schema for one user-editable extension setting."""
+
+    type: Literal["string", "number", "boolean", "enum"]
+    default: str | float | bool | None = None
+    description: str | None = None
+    values: tuple[str, ...] | None = None
+    min: float | None = None
+    max: float | None = None
+    step: float | None = None
+    secret: bool = False
+    env: str | None = None
+
+    def validate(self) -> None:
+        """Raise ``ManifestError`` when this setting schema is inconsistent."""
+        if self.type not in {"string", "number", "boolean", "enum"}:
+            raise ManifestError(f"unknown setting type {self.type!r}")
+        if (
+            self.type == "enum"
+            and self.default is not None
+            and (self.values is None or self.default not in self.values)
+        ):
+            raise ManifestError("enum setting default must be one of values")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ManifestError("setting min must not exceed max")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,9 +224,9 @@ def _install_snapshot_json(envelope: bytes | str) -> None:
     )
 
 
-def list() -> list[Distribution]:
+def list() -> _builtins.list[Distribution]:
     """Return every distribution visible in this host's site tree."""
-    return builtins.list(_snapshot)
+    return _builtins.list(_snapshot)
 
 
 def get(name: str) -> Distribution | None:
@@ -232,9 +263,9 @@ def site() -> SiteTree:
 
 # Kept as an alias instead of an import-time module alias so the public API can
 # remain exactly ``omp.packages.list`` without shadowing Python's list globally.
-import builtins
 
 __all__ = (
     "Distribution", "GrantError", "IntegrityError", "Origin", "PackageError",
-    "Provenance", "ResolutionError", "SiteTree", "get", "list", "of", "own", "site",
+    "Provenance", "ResolutionError", "SettingSchema", "SiteTree", "get", "list",
+    "of", "own", "site",
 )

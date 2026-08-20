@@ -14,6 +14,9 @@ from enum import StrEnum
 from string import Formatter
 from typing import Any
 
+from .._errors import ExtensionError as _ExtensionError
+from .._registry import registry as _declarations
+
 
 class TmlError(ValueError):
     """Markup source was malformed before it could be sent to the renderer."""
@@ -38,6 +41,9 @@ class ShortcutError(ValueError):
 class DialogUnavailable(RuntimeError):
     """An arbitrary overlay has no attached presentation client."""
 
+
+class DuplicateRenderer(_ExtensionError):
+    """A second device-rendering fold claimed the same frozen identity."""
 
 @dataclass(frozen=True, slots=True)
 class StatusFacts:
@@ -217,6 +223,12 @@ class Anchor(StrEnum):
     CENTER = "center"; TOP_LEFT = "top_left"; TOP = "top"; TOP_RIGHT = "top_right"; RIGHT = "right"; BOTTOM_RIGHT = "bottom_right"; BOTTOM = "bottom"; BOTTOM_LEFT = "bottom_left"; LEFT = "left"
 
 
+class ActivationSource(StrEnum):
+    """Input source that activated a focusable transcript element."""
+
+    KEY = "key"
+    MOUSE = "mouse"
+
 class EventKind(StrEnum):
     """Observed retained-overlay interaction."""
     HIGHLIGHTED = "highlighted"; CHANGED = "changed"; FILTERED = "filtered"; PRESSED = "pressed"; SUBMIT = "submit"; CANCEL = "cancel"
@@ -363,6 +375,14 @@ class Action:
 
 
 @dataclass(frozen=True, slots=True)
+class Activation:
+    """One click or Enter activation from an id-bearing transcript element."""
+
+    element_id: str
+    source: ActivationSource
+
+
+@dataclass(frozen=True, slots=True)
 class Invocation:
     """A parsed slash-command invocation."""
     name: str; argv: tuple[str, ...]; raw: str; mode: InvocationMode
@@ -406,6 +426,7 @@ _shortcut_handlers: dict[str, Callable[..., object]] = {}
 _device_renderers: dict[tuple[str, str, int], Callable[..., Tml | None]] = {}
 _fold_failures: set[tuple[str, str]] = set()
 _command_handlers: dict[str, Callable[..., object]] = {}
+_activation_handlers: dict[str, Callable[..., object]] = {}
 
 
 def _install_effect_sink(sink: Callable[[dict[str, object]], None] | None) -> None:
@@ -602,7 +623,7 @@ def renderer(name: str, *, family: str | None = None, rev: int | None = None, re
         if _inspect.iscoroutinefunction(function):
             raise TypeError("renderer folds must be synchronous")
         if key in _device_renderers:
-            raise ValueError(f"duplicate renderer: {key!r}")
+            raise DuplicateRenderer(f"duplicate renderer: {key!r}")
         function.__omp_renderer_reduce__ = reduce
         _device_renderers[key] = function
         return function
@@ -644,6 +665,42 @@ def completion(trigger: Trigger) -> Callable[[Callable[..., object]], Callable[.
     return decorate
 
 
+def on_activate(prefix: str) -> Callable[[Callable[..., object]], Callable[..., object]]:
+    """Register a handler for transcript ids equal to or nested below ``prefix``."""
+
+    if not isinstance(prefix, str) or not prefix:
+        raise ValueError("activation prefix must be a non-empty string")
+
+    def decorate(function: Callable[..., object]) -> Callable[..., object]:
+        if not callable(function):
+            raise TypeError("activation handlers must be callable")
+        _activation_handlers[prefix] = function
+        return function
+
+    return decorate
+
+
+async def _dispatch_activation(
+    activation: Activation, ctx: object
+) -> None:
+    """Dispatch one host-originated transcript activation to its closest prefix."""
+
+    if not isinstance(activation, Activation):
+        raise TypeError("activation dispatch requires Activation")
+    matches = (
+        prefix
+        for prefix in _activation_handlers
+        if activation.element_id == prefix
+        or activation.element_id.startswith(f"{prefix}.")
+    )
+    prefix = max(matches, key=len, default=None)
+    if prefix is None:
+        return
+    result = _activation_handlers[prefix](activation, ctx)
+    if _inspect.isawaitable(result):
+        await result
+
+
 def shortcut(chord: str, *, action_id: str | None = None, description: str = "", when: frozenset[Phase] | None = None) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Declare one shortcut and retain its host callback."""
     def decorate(function: Callable[..., object]) -> Callable[..., object]: _shortcut_handlers[action_id or function.__name__] = function; return function
@@ -651,8 +708,23 @@ def shortcut(chord: str, *, action_id: str | None = None, description: str = "",
 
 
 def command(name: str, *, aliases: Sequence[str] = (), description: str = "", args: Sequence[Arg] = (), hint: str | None = None, arg_completions: Callable[..., object] | None = None) -> Callable[[Callable[..., object]], Callable[..., object]]:
-    """Declare one slash command and retain its host callback."""
-    def decorate(function: Callable[..., object]) -> Callable[..., object]: _command_handlers[name] = function; return function
+    """Declare one slash command with static and dynamic completion metadata."""
+    resolved_aliases = tuple(aliases)
+    resolved_args = tuple(args)
+    if any(not isinstance(argument, Arg) for argument in resolved_args):
+        raise TypeError("command args must contain only Arg values")
+    def decorate(function: Callable[..., object]) -> Callable[..., object]:
+        _declarations.register_command(
+            name,
+            resolved_aliases,
+            description,
+            resolved_args,
+            hint,
+            arg_completions,
+            function,
+        )
+        _command_handlers[name] = function
+        return function
     return decorate
 
 
