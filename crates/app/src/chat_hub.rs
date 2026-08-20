@@ -215,30 +215,31 @@ impl ChatHubBackend {
 				.ok_or_else(|| fault("application is required"))?,
 			params.args.as_deref().unwrap_or_default(),
 		);
-		let ready = params.ready.as_ref().and_then(|ready| {
+		let ready = params.ready.as_ref().map_or_else(Vec::new, |ready| {
 			let timeout_ms = ready.timeout.unwrap_or(30.0).mul_add(1_000.0, 0.0) as u64;
-			ready
-				.log
-				.as_ref()
-				.map(|pattern| ReadyProbe {
+			let mut probes = Vec::new();
+			if let Some(pattern) = &ready.log {
+				probes.push(ReadyProbe {
 					probe: Some(ready_probe::Probe::Log(ReadyLog {
 						pattern: pattern.to_string(),
 						props:   None,
 					})),
 					timeout_ms,
 					props: None,
-				})
-				.or_else(|| {
-					ready.port.map(|port| ReadyProbe {
-						probe: Some(ready_probe::Probe::Tcp(ReadyTcp {
-							host:  ready.host.as_deref().unwrap_or("127.0.0.1").to_owned(),
-							port:  u32::from(port),
-							props: None,
-						})),
-						timeout_ms,
+				});
+			}
+			if let Some(port) = ready.port {
+				probes.push(ReadyProbe {
+					probe: Some(ready_probe::Probe::Tcp(ReadyTcp {
+						host:  ready.host.as_deref().unwrap_or("127.0.0.1").to_owned(),
+						port:  u32::from(port),
 						props: None,
-					})
-				})
+					})),
+					timeout_ms,
+					props: None,
+				});
+			}
+			probes
 		});
 		let restart = match params.restart.unwrap_or(RestartPolicy::No) {
 			RestartPolicy::No => omp_proto::env::v1::RestartPolicy::Never,
@@ -292,23 +293,6 @@ impl ChatHubBackend {
 			})
 			.await
 			.map_err(|error| fault(error.to_string()))?;
-		if let Some(ready) = &params.ready
-			&& ready.log.is_some()
-			&& let Some(port) = ready.port
-		{
-			let host = ready.host.as_deref().unwrap_or("127.0.0.1");
-			let deadline =
-				tokio::time::Instant::now() + StdDuration::from_secs_f64(ready.timeout.unwrap_or(30.0));
-			loop {
-				if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
-					break;
-				}
-				if tokio::time::Instant::now() >= deadline {
-					return Err(fault("TCP readiness timed out after log readiness"));
-				}
-				tokio::time::sleep(StdDuration::from_millis(50)).await;
-			}
-		}
 		self.launches.lock().insert(name.clone(), params.clone());
 		let lifetime = if params.detached {
 			ArtifactLifetime::Durable

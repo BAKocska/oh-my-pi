@@ -12,13 +12,17 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{Buf as _, Bytes, BytesMut};
+use futures::future::try_join_all;
 use omp_core::Str;
-use omp_proto::env::v1::{
-	AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecOutcome, ExecRequest, ExecStarted,
-	ExecStatusMsg, ExitEvent, OpenSessionRequest, OpenSessionResponse, OutputAttached,
-	OutputChannel, OutputFrame, ProcessCommandAccepted, ProcessInfo, ProcessList, ProcessOutput,
-	ProcessStarted, ProcessState, PtySpec, StartProcess,
+use omp_proto::{
+	env::v1::{
+		AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecOutcome, ExecRequest, ExecStarted,
+		ExecStatusMsg, ExitEvent, OpenSessionRequest, OpenSessionResponse, OutputAttached,
+		OutputChannel, OutputFrame, ProcessCommandAccepted, ProcessInfo, ProcessList, ProcessOutput,
+		ProcessStarted, ProcessState, PtySpec, ReadyProbe, StartProcess, ready_probe,
+	},
+	toolhost::v1::{HostFrame, Ping, WorkerFrame, host_frame, worker_frame},
 };
 use omp_shell_engine::{
 	ExecutionParameters, Shell, ShellVariable, SourceInfo, SpawnObserver,
@@ -26,6 +30,8 @@ use omp_shell_engine::{
 	processes::{ProcessSignal, signal_process_group},
 };
 use parking_lot::Mutex;
+use prost::Message as _;
+use regex::bytes::Regex;
 
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
@@ -65,6 +71,9 @@ pub enum ExecError {
 	/// The shell engine rejected the requested operation.
 	#[error("shell execution failed: {0}")]
 	Shell(Str),
+	/// A named-process readiness probe was invalid or did not pass.
+	#[error("process readiness failed: {0}")]
+	Readiness(Str),
 	/// An operating-system process primitive failed.
 	#[error("process I/O failed: {0}")]
 	Io(#[from] std::io::Error),
@@ -421,11 +430,11 @@ impl ExecHost {
 		Ok(())
 	}
 
-	/// Starts a persistent named process. Readiness and restart fields are
-	/// retained on the wire but intentionally have no Phase 1 behavior.
+	/// Starts a persistent named process and waits for every readiness probe.
 	pub async fn start_process(&self, request: StartProcess) -> Result<ProcessStarted, ExecError> {
 		let name = Str::from(request.name);
 		let _reservation = self.reserve_process(name.clone())?;
+		let ready = request.ready;
 		let spec = request
 			.spec
 			.ok_or_else(|| ExecError::Shell(Str::from("missing process spec")))?;
@@ -457,7 +466,11 @@ impl ExecHost {
 				info:        ProcessInfo {
 					name: name.to_string(),
 					generation,
-					state: ProcessState::Running as i32,
+					state: if ready.is_empty() {
+						ProcessState::Running as i32
+					} else {
+						ProcessState::Starting as i32
+					},
 					status: None,
 					props: Default::default(),
 				},
@@ -465,8 +478,41 @@ impl ExecHost {
 				subscribers: Vec::new(),
 			}),
 		});
-		self.inner.processes.lock().insert(name, process.clone());
+		self
+			.inner
+			.processes
+			.lock()
+			.insert(name.clone(), process.clone());
 		tokio::spawn(forward_named_process(process.clone(), run, started.exec));
+		if let Err(error) = try_join_all(
+			ready
+				.into_iter()
+				.map(|probe| wait_ready_probe(process.clone(), probe)),
+		)
+		.await
+		{
+			process.control.cancel(CANCEL_GRACE);
+			self.inner.processes.lock().remove(&name);
+			return Err(error);
+		}
+		let terminal = {
+			let mut stream = process.stream.lock();
+			if stream.info.state == ProcessState::Starting as i32 {
+				stream.info.state = ProcessState::Ready as i32;
+				let info = stream.info.clone();
+				stream.broadcast(ProcessEvent::State(info));
+				false
+			} else {
+				process_state_is_terminal(stream.info.state)
+			}
+		};
+		if terminal {
+			process.control.cancel(CANCEL_GRACE);
+			self.inner.processes.lock().remove(&name);
+			return Err(ExecError::Readiness(Str::new_static(
+				"process exited while readiness probes were running",
+			)));
+		}
 		Ok(ProcessStarted { name: process.name.to_string(), generation, props: Default::default() })
 	}
 
@@ -924,6 +970,165 @@ fn spawn_reader<R: Read + Send + 'static>(
 			}
 		}
 	})
+}
+
+async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Result<(), ExecError> {
+	let timeout = Duration::from_millis(probe.timeout_ms);
+	match probe.probe {
+		Some(ready_probe::Probe::Log(log)) => {
+			let pattern = Regex::new(&log.pattern)
+				.map_err(|error| ExecError::Readiness(Str::from(error.to_string())))?;
+			let (backlog, events) = readiness_events(&process);
+			let wait = async {
+				let mut output = Vec::new();
+				for frame in backlog {
+					output.extend_from_slice(&frame.data);
+				}
+				if pattern.is_match(&output) {
+					return Ok(());
+				}
+				while let Ok(event) = events.recv_async().await {
+					match event {
+						ProcessEvent::Output(frame) => {
+							output.extend_from_slice(&frame.data);
+							if pattern.is_match(&output) {
+								return Ok(());
+							}
+						},
+						ProcessEvent::State(info) if process_state_is_terminal(info.state) => {
+							return Err(ExecError::Readiness(Str::new_static(
+								"process exited before its log probe passed",
+							)));
+						},
+						_ => {},
+					}
+				}
+				Err(ExecError::Readiness(Str::new_static(
+					"process output closed before its log probe passed",
+				)))
+			};
+			tokio::time::timeout(timeout, wait)
+				.await
+				.map_err(|_| ExecError::Readiness(Str::new_static("log probe timed out")))?
+		},
+		Some(ready_probe::Probe::Tcp(tcp)) => {
+			let port = u16::try_from(tcp.port)
+				.map_err(|_| ExecError::Readiness(Str::new_static("TCP probe port is out of range")))?;
+			let wait = async {
+				loop {
+					if process.control.finished.load(Ordering::Acquire) {
+						return Err(ExecError::Readiness(Str::new_static(
+							"process exited before its TCP probe passed",
+						)));
+					}
+					if tokio::net::TcpStream::connect((tcp.host.as_str(), port))
+						.await
+						.is_ok()
+					{
+						return Ok(());
+					}
+					tokio::time::sleep(Duration::from_millis(50)).await;
+				}
+			};
+			tokio::time::timeout(timeout, wait)
+				.await
+				.map_err(|_| ExecError::Readiness(Str::new_static("TCP probe timed out")))?
+		},
+		Some(ready_probe::Probe::Ping(ping)) => {
+			let (_, events) = readiness_events(&process);
+			let encoded = HostFrame {
+				request_id: 0,
+				body:       Some(host_frame::Body::Ping(Ping { nonce: ping.nonce, props: None })),
+				props:      None,
+			}
+			.encode_length_delimited_to_vec();
+			write_input(&process.control, Some(&encoded))?;
+			let wait = async {
+				let mut output = BytesMut::new();
+				while let Ok(event) = events.recv_async().await {
+					match event {
+						ProcessEvent::Output(frame) if frame.channel != OutputChannel::Stderr as i32 => {
+							output.extend_from_slice(&frame.data);
+							while let Some(worker) = take_worker_frame(&mut output)? {
+								if matches!(
+									&worker.body,
+									Some(worker_frame::Body::Pong(pong)) if pong.nonce == ping.nonce
+								) {
+									return Ok(());
+								}
+							}
+						},
+						ProcessEvent::State(info) if process_state_is_terminal(info.state) => {
+							return Err(ExecError::Readiness(Str::new_static(
+								"process exited before its Ping probe passed",
+							)));
+						},
+						_ => {},
+					}
+				}
+				Err(ExecError::Readiness(Str::new_static(
+					"process output closed before its Ping probe passed",
+				)))
+			};
+			tokio::time::timeout(timeout, wait)
+				.await
+				.map_err(|_| ExecError::Readiness(Str::new_static("Ping probe timed out")))?
+		},
+		None => Err(ExecError::Readiness(Str::new_static("readiness probe has no kind"))),
+	}
+}
+
+fn readiness_events(process: &NamedProcess) -> (Vec<ProcessOutput>, flume::Receiver<ProcessEvent>) {
+	let (sender, receiver) = flume::unbounded();
+	let mut stream = process.stream.lock();
+	let backlog = stream.history.clone();
+	stream.subscribers.push(sender);
+	(backlog, receiver)
+}
+
+fn process_state_is_terminal(state: i32) -> bool {
+	matches!(
+		ProcessState::try_from(state),
+		Ok(ProcessState::Exited | ProcessState::Stopped | ProcessState::Failed)
+	)
+}
+
+fn take_worker_frame(buffer: &mut BytesMut) -> Result<Option<WorkerFrame>, ExecError> {
+	let mut length = 0_u64;
+	let mut prefix = None;
+	for (index, byte) in buffer.iter().copied().take(10).enumerate() {
+		if index == 9 && byte > 1 {
+			return Err(ExecError::Readiness(Str::new_static(
+				"Ping probe received an invalid frame length",
+			)));
+		}
+		length |= u64::from(byte & 0x7f) << (index * 7);
+		if byte & 0x80 == 0 {
+			prefix = Some(index + 1);
+			break;
+		}
+	}
+	let Some(prefix) = prefix else {
+		if buffer.len() >= 10 {
+			return Err(ExecError::Readiness(Str::new_static(
+				"Ping probe received an invalid frame length",
+			)));
+		}
+		return Ok(None);
+	};
+	let length = usize::try_from(length)
+		.map_err(|_| ExecError::Readiness(Str::new_static("Ping probe frame is too large")))?;
+	let total = prefix
+		.checked_add(length)
+		.ok_or_else(|| ExecError::Readiness(Str::new_static("Ping probe frame length overflow")))?;
+	if buffer.len() < total {
+		return Ok(None);
+	}
+	let mut framed = buffer.split_to(total);
+	framed.advance(prefix);
+	WorkerFrame::decode(framed)
+		.map(Some)
+		.map_err(|error| ExecError::Readiness(Str::from(error.to_string())))
 }
 
 async fn forward_named_process(process: Arc<NamedProcess>, run: ExecRun, _exec: Bytes) {

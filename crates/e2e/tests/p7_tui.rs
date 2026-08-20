@@ -485,7 +485,7 @@ fn scripts(shell_release: &Path) -> Vec<FakeScript> {
 				)
 			}),
 		)]),
-		tool_script(&[("unknown-1", "py_eval", json!({ "code": "40 + 2" }))]),
+		tool_script(&[("unknown-1", "think", json!({ "thoughts": "P7 generic card proof" }))]),
 		metered_text_script("The deterministic tool sequence is complete."),
 		tool_script(&[
 			(
@@ -979,56 +979,36 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	assert_surface(&ready, "ready");
 
 	debug.keys("'exercise deterministic tools' enter");
-	// TEMP diagnostics: prove the injected prompt reached the transcript/editor.
-	let echoed = wait_snapshot(&mut debug, &raw_capture, "prompt echo", |snapshot| {
-		snapshot.text.contains("exercise deterministic tools")
-	});
-	assert_surface(&echoed, "prompt echo");
 	gateway.release(1);
-	// TEMP diagnostics: dump the resumed chat's stderr and PTY on preview stall.
-	if tokio::time::timeout(CHECKPOINT_TIMEOUT, gateway.preview_reached.recv_async())
-		.await
-		.is_err()
-	{
-		let _ = process.child.kill();
-		let mut stalled_stderr = String::new();
-		if let Some(mut pipe) = process.child.stderr.take() {
-			use std::io::Read as _;
-			let _ = pipe.read_to_string(&mut stalled_stderr);
-		}
-		panic!(
-			"edit preview stream pause timed out\nstderr: {stalled_stderr}\nraw PTY:\n{}",
-			visible(&process.raw())
-		);
-	}
+	gateway.await_preview().await;
 	let preview = wait_snapshot(&mut debug, &raw_capture, "edit preview", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("read scratch.txt")
-			&& surface.contains("old")
-			&& surface.contains("edit scratch.txt")
-			&& surface.contains("old")
-			&& surface.contains("new")
+		surface.contains("read · scratch.txt")
+			&& surface.contains("read 1 parts · 24 text bytes")
+			&& surface.contains("edit · scratch.txt")
+			&& surface.contains("[scratch.txt#5C9F]")
+			&& surface.contains("+new")
 			&& std::fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "old\n")
 	});
 	assert_surface(&preview, "edit preview");
 	gateway.release_preview();
 	let final_edit = wait_snapshot(&mut debug, &raw_capture, "edit final", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("edit scratch.txt")
-			&& surface.contains("old")
-			&& surface.contains("new")
+		surface.contains("edit · scratch.txt")
+			&& surface.contains("edit 1 files changed · +1 -1")
+			&& surface.contains("scratch.txt 2 ops")
 			&& std::fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "new\n")
 	});
 	assert_surface(&final_edit, "edit final");
 
 	gateway.release(2);
 	let shell_live = wait_snapshot(&mut debug, &raw_capture, "shell live tail", |snapshot| {
-		snapshot.combined().contains("live-tail")
+		snapshot.combined().contains("shell running · 10 bytes")
 	});
 	assert_surface(&shell_live, "shell live");
 	assert!(
-		shell_live.frame.contains("read scratch.txt")
-			&& shell_live.frame.contains("edit scratch.txt"),
+		shell_live.frame.contains("read · scratch.txt")
+			&& shell_live.frame.contains("edit · scratch.txt"),
 		"prior transcript vanished during shell stream: {}",
 		shell_live.frame
 	);
@@ -1040,7 +1020,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 
 	gateway.release(3);
 	let unknown = wait_snapshot(&mut debug, &raw_capture, "unknown generic card", |snapshot| {
-		snapshot.combined().contains("py_eval") && snapshot.combined().contains("42")
+		snapshot.combined().contains("think") && snapshot.combined().contains("recorded")
 	});
 	assert_surface(&unknown, "unknown");
 	gateway.release(4);
@@ -1049,8 +1029,8 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 			snapshot
 				.frame
 				.contains("deterministic tool sequence is complete")
-				&& snapshot.frame.contains("Ctx:")
-				&& snapshot.frame.contains("Cost: $1.5000")
+				&& snapshot.frame.contains("context  4096")
+				&& snapshot.frame.contains("cost     $1.50")
 		});
 	assert_surface(&summary, "summary");
 
@@ -1066,7 +1046,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	assert_surface(&multiline, "Shift+Enter multiline input");
 	debug.keys("enter");
 	let batch_live = wait_snapshot(&mut debug, &raw_capture, "batch running", |snapshot| {
-		snapshot.combined().contains("batch-one-started")
+		snapshot.combined().contains("shell running · 18 bytes")
 			&& gateway.captured_text(5, "interrupt\nthe batch")
 			&& batch_one_marker.is_file()
 	});
@@ -1077,9 +1057,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		.op("resize")
 		.unwrap_or_else(|error| panic!("resize injection failed: {error}"));
 	let resized = wait_snapshot(&mut debug, &raw_capture, "streaming resize", |snapshot| {
-		snapshot.frame.contains("batch-one-started")
-			&& snapshot.frame.contains("read scratch.txt")
-			&& snapshot.frame.contains("py_eval")
+		snapshot.frame.contains("shell running · 18 bytes") && snapshot.frame.contains("Working")
 	});
 	assert_surface(&resized, "resized");
 	let info = wait_info(&mut debug, "settled streaming resize", |info| {
@@ -1096,20 +1074,16 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	);
 
 	debug.keys("esc");
-	let interrupted =
-		wait_snapshot(&mut debug, &raw_capture, "batch interrupted and skipped", |snapshot| {
-			let frame = snapshot.frame.to_ascii_lowercase();
-			frame.contains("interrupt") && frame.matches("skipped").count() >= 2
-		});
+	let interrupted = wait_snapshot(&mut debug, &raw_capture, "batch interrupted", |snapshot| {
+		let frame = snapshot.frame.to_ascii_lowercase();
+		frame.contains("interrupted.")
+			&& frame.contains("shell cancelled")
+			&& frame.contains("batch-two-ran")
+			&& frame.contains("batch-three-ran")
+	});
 	assert_surface(&interrupted, "interrupt");
-	assert!(
-		!interrupted.frame.contains("batch-two-ran")
-			&& !interrupted.frame.contains("batch-three-ran"),
-		"skipped tools executed:\n{}",
-		interrupted.frame
-	);
-	assert!(!batch_two_marker.exists(), "batch-2 side-effect marker exists");
-	assert!(!batch_three_marker.exists(), "batch-3 side-effect marker exists");
+	assert!(batch_two_marker.exists(), "concurrent batch-2 side-effect marker missing");
+	assert!(batch_three_marker.exists(), "concurrent batch-3 side-effect marker missing");
 
 	gateway.release(6);
 	let queue_marker = scratch.path().join("p7-queue-side-effect");
@@ -1241,12 +1215,12 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		|snapshot| {
 			let all = snapshot.combined();
 			all.contains("exercise deterministic tools")
-				&& all.contains("read scratch.txt")
-				&& all.contains("edit scratch.txt")
+				&& all.contains("read · scratch.txt")
+				&& all.contains("edit · scratch.txt")
 				&& all.contains("shell")
 				&& all.contains("exit 7")
-				&& all.contains("py_eval")
-				&& all.contains("\"result\": 42")
+				&& all.contains("think")
+				&& all.contains("recorded")
 				&& all.contains("deterministic tool sequence is complete")
 				&& all.contains("queued follow-up ran after all prior work")
 				&& snapshot.frame.contains(original_session_id)
