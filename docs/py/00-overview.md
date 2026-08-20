@@ -7,8 +7,8 @@ omp's Python extension surface, from the process outward.
 | **00-overview.md** (this file) | host children, the two sockets, the six verbs and their `OperationSpec` gating, the phase legality matrix, the manifest, lifecycle and activation triggers, trust tiers, `omp.Context`, `omp.LifecyclePhase`, `omp.Duration`, principal identity, idempotency and generation fencing, per-extension quotas, `@omp.service` / `omp.services`, cancellation, crash/restart, package-root constants and exceptions |
 | [01-devices.md](01-devices.md) | `@omp.device`, `@omp.tool` (soft/hard intent, `kind`), the `dyn` core tool and its `do_` op grammar, the dynamic tool policy (`tools.policy`), `omp.ToolPath`, schema-on-demand, precedence, MCP mounting |
 | [02-verdicts.md](02-verdicts.md) | `omp.Payload` / `omp.Fault`, `omp.CallOutcome`, `PolicyDenied`, `prompt(view, caps)`, `omp.PromptCaps`, `lift()`, `family@rev`, `schema_rev` vs `artifact_digest`, spill budget, `@omp.renderer` |
-| [03-params.md](03-params.md) | `omp.InvocationPhase` (the invocation state machine), `omp.IncomingParams` (core-internal), the `Ev` vocabulary, charitable decoding |
-| [04-placement.md](04-placement.md) | `place=` semantics, `omp.Place`, `omp.remote`, `omp.workers`, `omp.WorkerSpec`, `omp.Spill` |
+| [03-params.md](03-params.md) | `omp.InvocationPhase` (the invocation state machine), `IncomingParams` (core-internal), the `Ev` vocabulary, charitable decoding |
+| [04-placement.md](04-placement.md) | `place=` semantics, `omp.Place`, `omp_remote`, `omp.workers`, `omp.WorkerSpec`, `omp.Spill` |
 | [05-hooks.md](05-hooks.md) | `@omp.hook`, the event catalog, the `tool_call` target union, `omp.HookDecision` (`Allow` / `Deny` / `Modify` / `Defer` / `RequireApproval`), `omp.HookPhase`, failure table |
 | [06-policy.md](06-policy.md) | verdict-based policy, bash AST IR, `omp.SandboxProfile`, `SandboxEnforcement`, `ApprovalSpec` and durable approval tickets |
 | [07-ui.md](07-ui.md) | `omp.ui.*`, TML, slots, dialogs, triggers, ghost text, `@omp.command`, `@omp.shortcut`, `@omp.message_renderer` |
@@ -744,6 +744,19 @@ class OperationSpec:
 
 `omp.operation_spec(symbol)` returns the spec for any public symbol — the same data the generated matrix renders. Calling a symbol before its `minimum_phase` raises `omp.EffectsNotAuthorized` from the enforcing side (`authority`), never from a Python-side courtesy check.
 
+`omp.Durability` is the closed `EPHEMERAL | DURABLE` enum, `omp.CostClass`
+is `NONE | METERED | PAID`, and `omp.Authority` is `CORE | ENVIRONMENT`.
+Together they are the three immutable policy axes carried by every operation spec.
+
+`omp.RUNTIME_METADATA` is the immutable generated mapping from public symbol to owner,
+signature, callback ABI, operation spec, timeout, and examples.
+`omp.PHASE_LEGALITY_MATRIX` is its immutable symbol-to-legal-phases projection.
+
+`omp.DeclarationRegistry` is the process-local declaration authority sealed exactly once
+at FREEZE; `omp.DeclarationSnapshot` is its immutable existence-set view.
+`omp.DeclarationDrift` is raised when that frozen snapshot differs from the admitted
+manifest, carrying the missing and undeclared tools, hooks, services, and declarations.
+
 #### `omp.Principal`
 
 Who is acting (*Principal identity*, Concepts). Stamped by core; an extension reads it and can never write it.
@@ -787,13 +800,22 @@ The typed inter-extension surface (*Extension services*, Concepts).
 
 Declares a service implementation. The decorated class's public `async def` methods are the service's methods; inside them, `omp.Context.current()` is the **caller-scoped** context — `ctx.extension` names the caller, `ctx.deadline` is the caller's deadline, and cancelling the caller's scope cancels the method. The service must be named in the manifest's `[[services]]` table; a decorator without a manifest row fails VERIFY.
 
-#### `omp.services.connect(name: str, *, rev: int) -> ServiceClient`
+#### `await omp.services.connect(name: str, *, rev: int) -> ServiceClient`
+
+**Resolved (2026-08-20 ruling):** `connect` is async and must be awaited. It is a Request over
+CONTROL, brokered by core; there is no direct socket between children.
 
 - **Channel** — Request over CONTROL, brokered by core; no direct socket between children.
 - **Raises** — `CapabilityError` if this extension's manifest does not declare the dependency under `[requires]`; `LookupError` if no admitted extension provides `name` at a compatible `rev`.
 - **Latency** — one CONTROL round trip per call plus the provider's work; connecting may boot the provider's child (lazy on first reach).
 
 The client's methods mirror the service's. Deadlines and cancellation propagate; the provider crashing mid-call fails that call only. Version compatibility follows device `rev` semantics ([02-verdicts.md](02-verdicts.md)): a provider serves an older `rev` only by explicit declaration, never by silent coercion.
+
+`omp.ServiceDefinition` is the frozen provider declaration (name, revision,
+implementation, method set); `omp.ServiceClient` is the exact-revision async proxy returned
+by connect. `omp.Services` is the manifest-gated connector type of the singleton
+`omp.services`. `omp.service` declares implementations, and `omp.resources()` returns the
+current local quota receipt.
 
 ### Enumerations
 
@@ -810,7 +832,7 @@ Ordered: `SANDBOXED < TRUSTED`. The ordering exists for policy comparisons, not 
 
 A child's lifecycle state for one extension, reported by `ctx.phase` on host-lifecycle events.
 
-> Renamed from `omp.Phase` (review P0 #1): Rev 1 shipped two public `omp.Phase` types — this lifecycle enum and 03-params' invocation state — which cannot coexist in one package and invited conflating an extension's lifecycle with a call's progress. The name `omp.Phase` is deleted, not aliased. The invocation machine is `omp.InvocationPhase` ([03-params.md](03-params.md)); the hook phases are `omp.HookPhase` ([05-hooks.md](05-hooks.md)).
+> Renamed from `Phase` (review P0 #1): Rev 1 shipped two public `Phase` types — this lifecycle enum and 03-params' invocation state — which cannot coexist in one package and invited conflating an extension's lifecycle with a call's progress. The old name is deleted, not aliased. The invocation machine is `omp.InvocationPhase` ([03-params.md](03-params.md)); the hook phases are `omp.HookPhase` ([05-hooks.md](05-hooks.md)).
 
 | Member | Meaning |
 |---|---|
@@ -847,7 +869,11 @@ The `reason` on the `extension_activate` payload (*Lifecycle*).
 
 #### `omp.Capability`
 
-The vocabulary a manifest requests and an install grants. Each member is a string, so a manifest stays readable and forward-compatible.
+The closed vocabulary a manifest requests and an install grants. Each member is a string,
+so manifests and grant records stay readable; an unknown spelling is rejected at admission.
+The table matches the frozen Environment/placement/scheduling grant keys that have an
+enforcing surface—UI, policy, journal, session, agent, credential, and provider declarations
+do not invent parallel capability names here.
 
 | Member | Value | Grants |
 |---|---|---|
@@ -861,18 +887,11 @@ The vocabulary a manifest requests and an install grants. Each member is a strin
 | `Capability.ENV_SEARCH` | `"env.search"` | Walker queries. A glob result is names and sizes, not content, so a glob-only extension needs strictly less than a reader. |
 | `Capability.ENV_LSP` | `"env.lsp"` | Query a language server. A server-initiated `workspace/applyEdit` lowers into a document transaction and additionally requires `ENV_DOC_WRITE`. |
 | `Capability.ENV_NET` | `"env.net"` | Outbound HTTP through the environment, against the manifest allowlist. |
-| `Capability.ENV_WORKSPACE_SNAPSHOT` | `"env.workspace.snapshot"` | Snapshot and restore the workspace, for `rewind` ([12-agents.md](12-agents.md)). Grantable today, unimplemented env-side. |
-| `Capability.ENV_WORKTREE` | `"env.worktree"` | Copy-on-write worktree isolation for subagents ([12-agents.md](12-agents.md)). Grantable today, unimplemented env-side. |
-| `Capability.UI_STATUS` | `"ui.status"` | Status lines, slots, widgets, notifications. |
-| `Capability.UI_DIALOG` | `"ui.dialog"` | Modal prompts that can block a turn. Separated from `UI_STATUS` because one is cosmetic and the other holds the user hostage. |
-| `Capability.JOURNAL_APPEND` | `"journal.append"` | Write custom durable entries. |
-| `Capability.SESSIONS_READ` | `"sessions.read"` | List sessions, stream journals, aggregate usage. Replaces the 16 packages that parse session JSONL off disk. |
-| `Capability.AGENTS_SPAWN` | `"agents.spawn"` | Spawn, steer, and cancel subagents. |
-| `Capability.CREDS` | `"creds"` | Read and store credentials for providers this extension declares. Never cross-provider. |
-| `Capability.PROVIDER` | `"provider"` | Register inference provider entries. |
-| `Capability.POLICY` | `"policy"` | Return `Deny` or `Modify` from a gating hook. Observation needs no capability; veto does. |
+| `Capability.ENV_WORKSPACE_SNAPSHOT` | `"env.workspace.snapshot"` | Snapshot and restore the workspace, for `rewind` ([12-agents.md](12-agents.md)). |
+| `Capability.ENV_WORKTREE` | `"env.worktree"` | Copy-on-write worktree isolation for subagents ([12-agents.md](12-agents.md)). |
 | `Capability.PLACE_ENV` | `"place.env"` | Ship function bodies to an environment-side worker. |
 | `Capability.PLACE_WORKER` | `"place.worker"` | Ship function bodies to a named, possibly remote worker. |
+| `Capability.SCHEDULES_PROJECT` | `"schedules:project"` | Create and manage project-scoped durable schedules. |
 
 Semantics of each grant live with the namespace that enforces it; this table is the enumeration.
 
@@ -901,7 +920,7 @@ There is no `critical`. An extension cannot declare a session-fatal condition; t
 | `omp.API_LEVEL` | `int` | `1` | The extension API level this host implements. What a new manifest should declare. |
 | `omp.API_LEVELS` | `frozenset[int]` | `frozenset({1})` | Every level this host can admit. Older levels stay in the set until dropped in a release note; membership is the entire compatibility story. |
 | `omp.HOST_VERSION` | `str` | build-stamped | The omp build string. Informational — never branch on it; branch on `API_LEVEL`. |
-| `omp.SCHEMA_REV` | `int` | `7` | Wire schema revision, mirroring `omp_proto::SCHEMA_REV` (currently `6` at `crates/proto/src/lib.rs:42`; the additive `toolhost/v1` growth described below bumps it). A mismatch between child and core is a startup failure, not a negotiation. |
+| `omp.SCHEMA_REV` | `int` | `7` | Wire schema revision, mirroring `omp_proto::SCHEMA_REV` (currently `7` at `crates/proto/src/lib.rs:42`). A mismatch between child and core is a startup failure, not a negotiation. |
 | `omp.PYTHON_REV` | `str` | `"3.14t"` | Interpreter ABI revision, mirroring `PYTHON_REV` (`crates/app/src/envd/worker.rs:48`). Native wheels in a site tree must match it. |
 
 #### Limits
@@ -910,7 +929,7 @@ There is no `critical`. An extension cannot declare a session-fatal condition; t
 |---|---|---|---|
 | `omp.MAX_FRAME_BYTES` | `int` | `67_108_864` | Largest encoded CONTROL or DATA frame, matching `DEFAULT_MAX_FRAME_BYTES` (`worker.rs:53`). Exceeding it raises `FrameTooLarge`; the payload was never sent. Anything near this bound belongs in a blob or an artifact ([09-journal.md](09-journal.md)). |
 | `omp.MAX_DECLARATIONS` | `int` | `256` | Declarations (devices + commands + prompt slots + providers + renderers + services) per extension. Exceeding it fails the import phase with `DeclarationLimit`. A number this high is already a smell — `@bdsqqq/pi` registers 33 entrypoints and is the ecosystem's outlier. |
-| `omp.MAX_PENDING_EFFECTS` | `int` | `1024` | Depth of the fire-and-forget effect mailbox per child. Past it the oldest effects drop and the drop is counted. Effects are cosmetic by definition; back-pressuring a turn on a status line is worse than losing the status line. |
+| `omp.MAX_PENDING_EFFECTS` | `int` | `1024` | Shared bound for pending CONTROL correlations and the fire-and-forget effect mailbox per child. Past the effect bound the oldest cosmetic effects drop and the drop is counted. |
 | `omp.MAX_WORKERS` | `int` | `8` | Concurrent named workers per extension ([04-placement.md](04-placement.md)). |
 | `omp.MAX_HOST_CHILDREN` | `int` | `32` | Live host children per session across every `(layer, tier, extension \| group)` key. Under per-extension keying this bounds *installed and reached* extensions, so it is deliberately generous rather than tight; a tighter number would be a user-facing cap on how many extensions may be installed. Exceeding it fails the install, not the session. [14-deploy.md](14-deploy.md) keeps a lower advisory warning targeted at total resident cost rather than raw count. |
 
@@ -961,7 +980,7 @@ Two more derive from `omp.OmpError` and are defined elsewhere, so `except omp.Om
 | `omp.TrustError(required, actual)` | an operation needs `Trust.TRUSTED` and the child is `SANDBOXED` | no |
 | `omp.DuplicateRegistration(name, holder)` | two declarations claim one name without `precedence`/`replaces` ([01-devices.md](01-devices.md)). Names the incumbent | no |
 | `omp.DeclarationSealed(name)` | a decorator ran after FREEZE — typically a lazy `import` inside a handler tried to declare. Declarations happen during manifest-ordered import or not at all (*Lifecycle*) | no |
-| `omp.EffectsNotAuthorized(invocation, spec)` | an operation ran before its `OperationSpec.minimum_phase` (*Value types*). Raised by the enforcing side (`spec.authority`) and carried across the wire — the gate is protocol, not type gymnastics. Renamed from Rev 1's `omp.NotCommitted`: "commit" is reserved for `ASSISTANT_ITEM_COMMITTED` ([03-params.md](03-params.md)), and this exception is about effect authorization, not commitment. v1 device bodies start at `EFFECTS_AUTHORIZED`, so a device that sees it has found a core sequencing bug, not an author error | yes — reach the required phase |
+| `omp.EffectsNotAuthorized(invocation, spec)` | an operation ran before its `OperationSpec.minimum_phase` (*Value types*). Raised by the enforcing side (`spec.authority`) and carried across the wire — the gate is protocol, not type gymnastics. Renamed from Rev 1's `NotCommitted` spelling: "commit" is reserved for `ASSISTANT_ITEM_COMMITTED` ([03-params.md](03-params.md)), and this exception is about effect authorization, not commitment. v1 device bodies start at `EFFECTS_AUTHORIZED`, so a device that sees it has found a core sequencing bug, not an author error | yes — reach the required phase |
 | `omp.QuotaExceeded(quota, receipt)` | a hard per-extension quota was exhausted (*Quotas and fairness*). Carries the `ResourceReceipt` | yes — back off; the window slides |
 | `omp.DeadlineExceeded(deadline)` | a scope's `deadline` passed and the operation refused to start rather than start doomed | yes |
 | `omp.HostDisconnected()` | CONTROL reached EOF. The agent is gone; nothing this process does matters. Handlers should unwind, not retry | no |
@@ -985,7 +1004,7 @@ async def analyze(event, ctx: omp.Context) -> omp.HookDecision:
         return omp.Defer()
 ```
 
-The host defines no `omp.TimeoutError`. A deadline surfaces as `omp.DeadlineExceeded` when it is refused up front and as `omp.CancelledError` when it interrupts work in progress — two names for two genuinely different situations, and neither is a subclass of the other.
+The host defines no timeout-specific compatibility alias. A deadline surfaces as `omp.DeadlineExceeded` when it is refused up front and as `omp.CancelledError` when it interrupts work in progress — two names for two genuinely different situations, and neither is a subclass of the other.
 
 ## Patterns
 
@@ -1003,8 +1022,6 @@ The `target` union members below follow [05-hooks.md](05-hooks.md), which owns t
 
 ```python
 import omp
-
-omp.require(omp.Capability.POLICY, omp.Capability.UI_STATUS)
 
 
 @omp.hook("tool_call", phase=omp.HookPhase.PRECHECK)
@@ -1087,7 +1104,7 @@ async def computer(args: ComputerArgs, ctx: omp.Context) -> ComputerResult:
 - **The driver outlives the child.** It is a named process owned by the environment, so a crash, a hot reload, or a stage-3 kill leaves it running; `extension_activate` re-attaches. In pi the driver is a child of the harness and dies with it.
 - **`place="env"` keeps frames small.** Screenshots never transit the host to reach the environment's blob store ([04-placement.md](04-placement.md)).
 - **The native binary cannot kill the session.** Worst case it kills its host child, and that child comes back.
-- **One device shape.** Rev 1's version of this example pulled `action` from `omp.IncomingParams` mid-speculation and awaited `params.committed()` by hand. Retracted (P0 #2): the only v1 third-party device contract is final-args-in, `Payload | Fault | AsyncIterator[Update | Done]` out, body starting at `EFFECTS_AUTHORIZED` ([01-devices.md](01-devices.md)). `IncomingParams` is core-internal plus the explicitly named, not-in-v1 `@omp.streaming_device` ([03-params.md](03-params.md)), and protocol selection is only ever by decorator — never inferred from a return annotation.
+- **One device shape.** Rev 1's version of this example pulled `action` from the core-internal `IncomingParams` stream and awaited `params.committed()` by hand. Retracted (P0 #2): the only v1 third-party device contract is final-args-in, `Payload | Fault | AsyncIterator[Update | Done]` out, body starting at `EFFECTS_AUTHORIZED` ([01-devices.md](01-devices.md)). The separately proposed, not-in-v1 `@streaming_device` spelling remains historical ([03-params.md](03-params.md)), and protocol selection is only ever by decorator — never inferred from a return annotation.
 
 ### 3. `pi-intercom` — a broker that must survive its owner
 
@@ -1100,20 +1117,24 @@ import omp
 
 
 @omp.hook("extension_activate")
-async def join(event, ctx: omp.Context) -> None:
-    await omp.agents.join(topic=f"dir:{ctx.roots[0]}")
-    if event.reason is not omp.ActivateReason.FIRST_REACH:
-        # we came back from a restart or reload: the roster may have moved on
-        await omp.agents.resync()
+async def announce_presence(event, ctx: omp.Context) -> None:
+    roster = await omp.agents.peers(scope="project")
+    await omp.agents.broadcast(
+        f"{ctx.session} online with {len(roster)} peers",
+        scope="project",
+    )
 
 
 @omp.hook("agent_settled")
 async def announce(settled, ctx: omp.Context) -> None:
-    await omp.agents.send("all", f"{ctx.session} idle after {settled.turns} turns")
+    await omp.agents.broadcast(
+        f"{ctx.session} idle after {settled.turns} turns",
+        scope="project",
+    )
 ```
 
 - **The broker belongs to the daemon, not the extension.** `omp.agents` ([12-agents.md](12-agents.md)) is a Request surface over CONTROL; the bus is shared across every agent in the directory because it lives one level up. No port to bind, no lock file, no "is the broker already running" race written in Python.
-- **Restart is a first-class state.** `event.reason` (`omp.ActivateReason`) distinguishes "I just started" from "I came back", so re-joining is not confused with joining; `omp.restart_reason()` carries the finer cause when it matters.
+- **Restart is a first-class state.** `event.reason` (`omp.ActivateReason`) distinguishes first activation from replay; project-scoped roster lookup and broadcast remain valid across either, while `omp.restart_reason()` carries the finer cause when it matters.
 - **`agent_settled` is a per-turn hook**, which the latency table permits and which the bitmap makes free for everyone who does not install this.
 
 ### 4. `pi-cache-optimizer` — the extension that should not need to exist
@@ -1304,7 +1325,7 @@ message WorkerFrame {
 
 *Why JSON payload bodies inside protobuf frames.* Hook payloads and verdicts are open, per-event, and versioned by the event catalogue rather than by the transport. Modelling each as a protobuf message means the proto file changes whenever a hook gains a field, and every change is a `SCHEMA_REV` bump. Bytes-of-JSON keeps the transport stable and pushes evolution into the event schema — which is exactly what this file already does for `ToolUpdate.json` and `ToolComplete.details_json` (`toolhost.proto:83-97`). Cost: one serde round trip per hook. At ~200 µs of per-call budget and payloads measured in hundreds of bytes that is affordable; at per-token rates it would not be, which is another reason no per-token hook exists.
 
-**Missing capability 4 — speculative arguments, which are not mine to fix.** `env/v1` already defines `ArgText` and `ArgsCommitted` in its invocation union (`env.proto:70-82`, `:437-438`), and `ArgsCommitted` is documented as "the sole effect-commit gate". But `toolhost.proto:66-67` states plainly: "Python workers receive only committed args; speculative `ArgText` never crosses this boundary." That boundary is now the v1 contract, not a gap: third-party devices receive only final, policy-approved args (P0 #2), so the pull cursor stays core-internal. Forwarding the existing `env/v1` frames across the toolhost boundary — not designing new ones — is what the future, explicitly separate `@omp.streaming_device` facility will need, and [03-params.md](03-params.md) specifies it.
+**Missing capability 4 — speculative arguments, which are not mine to fix.** `env/v1` already defines `ArgText` and `ArgsCommitted` in its invocation union (`env.proto:70-82`, `:437-438`), and `ArgsCommitted` is documented as "the sole effect-commit gate". But `toolhost.proto:66-67` states plainly: "Python workers receive only committed args; speculative `ArgText` never crosses this boundary." That boundary is now the v1 contract, not a gap: third-party devices receive only final, policy-approved args (P0 #2), so the pull cursor stays core-internal. Forwarding the existing `env/v1` frames across the toolhost boundary — not designing new ones — is what the future, explicitly separate `@streaming_device` facility will need, and [03-params.md](03-params.md) specifies it.
 
 **`SCHEMA_REV` bumps to 7.** Every change above is additive and skip-safe, so a strict revision bump is not required for wire compatibility — but the handshake compares it exactly (`WorkerError::SchemaRevision`, `crates/app/src/envd/worker.rs:326-332`), and that exact check is right for a same-binary child: it catches a stale `omp` on `$PATH` before anything subtle happens. Bumping records the vocabulary change honestly.
 
@@ -1334,7 +1355,7 @@ One honest consequence: a *workspace-layer* child next to a remote environment m
 - `FEATURES.md:971` "registration: tools, commands, shortcuts, flags, renderers … ArkType/TypeBox/Zod schemas" — **partially redesigned**. Tools become devices, registered with the host and never with the model ([01-devices.md](01-devices.md)); the three schema libraries become Python type hints, since the schema is derived from the annotated signature. Flags do **not** survive: pi's two-pass argv reparse against an `ExtensionFlagSink` (`.plan/feature-map/cli.md:55-58`) requires extension code to run before argument parsing finishes, which directly contradicts ADMIT-before-IMPORT. The replacement is a manifest setting plus a command ([07-ui.md](07-ui.md)).
 - `.plan/feature-map/cli.md:41` — `--trusted-extension` mutual exclusivity with `--extension`/`-e`/`--hook` is **not** ported. It existed because pi had one runtime; omp routes the two tiers to different children, so the combination is ordinary rather than forbidden. `--trusted-extension`'s other properties — absolute paths, exact-module load, hard-fail on load error — are kept.
 - `ROADMAP.md:988` "events: … provider payload interception … ⚠ redesign: no client-side context hooks" — respected. Context manipulation is a patch protocol ([08-context.md](08-context.md)), not free rewriting.
-- `ROADMAP.md:993` "tool interception: pre-execution block/rewrite … ⚠ redesign: env invariants, no gate chain" — **the sharpest conflict, and it constrains this document.** The roadmap's position is that safety belongs to environment invariants, not to a chain of client-side gates. The reconciliation, in Rev 2's vocabulary: the per-invocation phase walk is a policy-evaluation mechanism whose output is a decision the **environment** enforces, not a client-side veto the loop is asked to honour. A `Deny` does not stop a call by convincing the loop; it produces a decision the environment refuses to execute against. That is why `Capability.POLICY` is separate from observation, and why [06-policy.md](06-policy.md) owns the enforcement half. A gate the loop could bypass would be theatre — and the D6 scope reading (*Lifecycle*) is exactly the line between this mechanism and the batch scheduling the roadmap forbids.
+- `ROADMAP.md:993` "tool interception: pre-execution block/rewrite … ⚠ redesign: env invariants, no gate chain" — **the sharpest conflict, and it constrains this document.** The roadmap's position is that safety belongs to environment invariants, not to a chain of client-side gates. The reconciliation, in Rev 2's vocabulary: the per-invocation phase walk is a policy-evaluation mechanism whose output is a decision the **environment** enforces, not a client-side veto the loop is asked to honour. A `Deny` does not stop a call by convincing the loop; it produces a decision the environment refuses to execute against. Policy decisions are separate from observation, and [06-policy.md](06-policy.md) owns the enforcement half. A gate the loop could bypass would be theatre — and the D6 scope reading (*Lifecycle*) is exactly the line between this mechanism and the batch scheduling the roadmap forbids.
 - `ROADMAP.md:992` "custom compaction + command-list handlers … ⚠ redesign: compaction stays env/loop-side" — respected; compaction is a verdict, not a callback ([08-context.md](08-context.md)).
 
 ### Performance
@@ -1400,12 +1421,14 @@ The prose itself splits into four layers — recorded here as the documentation 
 5. **Event ordinals and the 128-bit ceiling.** A `u128` mask is free today. The catalogue will grow. The fallback (`SparseSet` plus a `bytes` mask) costs an allocation at PUBLISH, not at dispatch, so the ceiling is not urgent — but ordinal assignment must be append-only from day one and there is currently no mechanism enforcing that.
 6. **Resolved (2026-08-19 user ruling): report and degrade — journal the flip loudly, never refuse the wheel; per-extension keying already bounds the loss to the one extension.** **GIL re-enablement by a native wheel.** Detectable after the fact, not preventable. Whether a child should *refuse* a wheel that flips `sys._is_gil_enabled()` — killing the extension to save the parallelism — or accept the degradation and report it, is unresolved. Leaning report, because the alternative bricks working extensions over a performance property. Per-extension keying makes this much less severe than it was: the wheel serializes only its own extension's interpreter, and every other extension is a different process.
 
+7. **Resolved (2026-08-20 ruling): `omp.services.connect` is async, is spelled `await omp.services.connect(...)`, and performs a Request over CONTROL.** **Service connection awaitability.** The usage example awaited the connection (`docs/py/00-overview.md:390-392`), while the API heading presented a synchronous return even though the channel description called it a Request (`docs/py/00-overview.md:790-795`); the competing readings were an immediately returned client versus an awaited CONTROL request.
+
 ### Revision 2 (post-review)
 
 Changes this file made in response to the external review, by review point:
 
-- **P0 #1** — `omp.Phase` deleted, not aliased; the lifecycle enum is `omp.LifecyclePhase` (this file), the invocation machine `omp.InvocationPhase` ([03-params.md](03-params.md)). `IMPORTED` merged into `DECLARED` (a separate import/declare split cannot exist — see P0 #9). The doc-ownership table was updated to the ruled owners, and the owner-defines rule is now machine-enforced (*The generated spec*).
-- **P0 #5** — new concept section *Every symbol carries an `OperationSpec`*, the `omp.OperationSpec` value type, `omp.operation_spec()`, and the generated phase legality matrix (owned here). `omp.journal.append` reclassified from Effect to Request in the six-verbs table, with the reversal recorded at the table. `omp.EffectsNotAuthorized` added as the enforcement error (renamed from `omp.NotCommitted`, since "commit" is reserved for `ASSISTANT_ITEM_COMMITTED`).
+- **P0 #1** — the old `Phase` spelling was deleted, not aliased; the lifecycle enum is `omp.LifecyclePhase` (this file), the invocation machine `omp.InvocationPhase` ([03-params.md](03-params.md)). `IMPORTED` merged into `DECLARED` (a separate import/declare split cannot exist — see P0 #9). The doc-ownership table was updated to the ruled owners, and the owner-defines rule is now machine-enforced (*The generated spec*).
+- **P0 #5** — new concept section *Every symbol carries an `OperationSpec`*, the `omp.OperationSpec` value type, `omp.operation_spec()`, and the generated phase legality matrix (owned here). `omp.journal.append` reclassified from Effect to Request in the six-verbs table, with the reversal recorded at the table. `omp.EffectsNotAuthorized` added as the enforcement error (renamed from the Rev-1 `NotCommitted` spelling, since "commit" is reserved for `ASSISTANT_ITEM_COMMITTED`).
 - **P0 #6** — every "pure courier" phrase deleted. Core runs the per-invocation decision procedure; the environment owns the gate. D6 is cited with its explicit scope reading — batch scheduling prohibited, per-invocation decisions in scope — and **D6 wording amendment recommended** was flagged as an open item rather than silently assumed. The double reversal of this position is recorded in prose in *Lifecycle*. `relay.rs`, `dispatch.rs`, and the `crates/agent` notes were rewritten to match; pattern 1's approval hook now returns `RequireApproval(ApprovalSpec(...))` instead of awaiting a dialog. *(Since ratified: D6 amended 2026-08-19, `PLAN.md` §D6 — see Revision 2.1.)*
 - **P0 #8** — ACTIVATE dispatches `extension_activate(reason, session_started_at, generation)`; `session_start` is reserved for the real session transition, with the misnaming reversal recorded at ACTIVATE. `omp.ActivateReason` added, with its mapping to `RestartReason`. New *Activation triggers* subsection classifies every declare surface into four boot classes and links the manifest declaration table ([14-deploy.md](14-deploy.md)). Every example, the failure table, and the crash/restart procedure migrated off `session_start`.
 - **P0 #9** — lifecycle rewritten: sequential manifest-ordered import *is* declaration; FREEZE seals the registry (`omp.DeclarationSealed`); concurrent import deleted from the semantic contract, with the reversal recorded in prose at IMPORT; "no I/O during declaration" enforced by CONTROL/DATA-unavailable plus sandbox-active during import, not by prose.

@@ -14,10 +14,12 @@ from pathlib import Path
 from types import ModuleType, MappingProxyType
 from typing import Any, Callable, Iterable, Literal, Mapping
 
-from _omp import ManifestError
+from _omp import OmpError
+
+from ._errors import ManifestError
 
 
-class PackageError(RuntimeError):
+class PackageError(OmpError, RuntimeError):
     """Package metadata is unavailable in the current execution context."""
 
 
@@ -65,9 +67,17 @@ class ContentDeclaration:
         if not isinstance(self.kind, ContentKind):
             object.__setattr__(self, "kind", ContentKind(self.kind))
         if not isinstance(self.path, str) or not self.path:
-            raise ManifestError("content declaration path must be a non-empty str")
+            raise ManifestError(
+                "<manifest>",
+                "content.path",
+                "content declaration path must be a non-empty str",
+            )
         if not isinstance(self.metadata, Mapping):
-            raise ManifestError("content declaration metadata must be a mapping")
+            raise ManifestError(
+                str(self.path),
+                "content.metadata",
+                "content declaration metadata must be a mapping",
+            )
         object.__setattr__(
             self, "metadata", MappingProxyType(dict(self.metadata))
         )
@@ -85,7 +95,7 @@ def _normalize(name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SettingSchema:
-    """Typed manifest schema for one user-editable extension setting."""
+    """Validated schema for one user-editable manifest setting."""
 
     type: Literal["string", "number", "boolean", "enum"]
     default: str | float | bool | None = None
@@ -97,18 +107,88 @@ class SettingSchema:
     secret: bool = False
     env: str | None = None
 
+    def __post_init__(self) -> None:
+        self.validate()
+
     def validate(self) -> None:
         """Raise ``ManifestError`` when this setting schema is inconsistent."""
         if self.type not in {"string", "number", "boolean", "enum"}:
-            raise ManifestError(f"unknown setting type {self.type!r}")
-        if (
-            self.type == "enum"
-            and self.default is not None
-            and (self.values is None or self.default not in self.values)
+            raise ManifestError(
+                "omp.toml", "settings.type", f"unknown setting type {self.type!r}"
+            )
+        if self.description is not None and not isinstance(self.description, str):
+            raise ManifestError(
+                "omp.toml", "settings.description", "must be str or None"
+            )
+        if self.values is not None:
+            if isinstance(self.values, str):
+                raise ManifestError(
+                    "omp.toml",
+                    "settings.values",
+                    "must be a sequence of strings",
+                )
+            values = tuple(self.values)
+            if any(not isinstance(item, str) or not item for item in values):
+                raise ManifestError(
+                    "omp.toml",
+                    "settings.values",
+                    "must contain non-empty strings",
+                )
+            object.__setattr__(self, "values", values)
+        if self.type == "enum" and (
+            self.values is None
+            or self.default is not None
+            and self.default not in self.values
         ):
-            raise ManifestError("enum setting default must be one of values")
+            raise ManifestError(
+                "omp.toml",
+                "settings.default",
+                "enum default must be one of values",
+            )
+        if self.type != "enum" and self.values is not None:
+            raise ManifestError(
+                "omp.toml",
+                "settings.values",
+                "is valid only for enum settings",
+            )
+        for name in ("min", "max", "step"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+            ):
+                raise ManifestError(
+                    "omp.toml",
+                    f"settings.{name}",
+                    "must be numeric or None",
+                )
+        if self.type != "number" and any(
+            getattr(self, name) is not None for name in ("min", "max", "step")
+        ):
+            raise ManifestError(
+                "omp.toml",
+                "settings",
+                "min, max, and step are valid only for number settings",
+            )
         if self.min is not None and self.max is not None and self.min > self.max:
-            raise ManifestError("setting min must not exceed max")
+            raise ManifestError(
+                "omp.toml", "settings.min", "must not exceed max"
+            )
+        if self.step is not None and self.step <= 0:
+            raise ManifestError(
+                "omp.toml", "settings.step", "must be positive"
+            )
+        if not isinstance(self.secret, bool):
+            raise ManifestError(
+                "omp.toml", "settings.secret", "must be bool"
+            )
+        if self.env is not None and (
+            not isinstance(self.env, str) or not self.env
+        ):
+            raise ManifestError(
+                "omp.toml",
+                "settings.env",
+                "must be a non-empty str or None",
+            )
 
 
 @dataclass(frozen=True, slots=True)

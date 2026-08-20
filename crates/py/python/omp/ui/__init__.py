@@ -14,13 +14,15 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
 from string import Formatter
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeAlias as _TypeAlias
 
+from _omp import OmpError as _OmpError
+from .._errors import DuplicateRegistration as _DuplicateRegistration
 from .._errors import ExtensionError as _ExtensionError
 from .._registry import registry as _declarations
 
 
-class TmlError(ValueError):
+class TmlError(ValueError, _OmpError):
     """Markup source was malformed before it could be sent to the renderer."""
 
     def __init__(self, message: str, at: int, source: str) -> None:
@@ -28,15 +30,15 @@ class TmlError(ValueError):
         self.message, self.at, self.source = message, at, source
 
 
-class SlotDenied(PermissionError):
+class SlotDenied(PermissionError, _OmpError):
     """The extension is not allowed to mount in the requested slot."""
 
 
-class CommandDenied(PermissionError):
+class CommandDenied(PermissionError, _OmpError):
     """The extension is not allowed to register the requested command."""
 
 
-class ShortcutError(ValueError):
+class ShortcutError(ValueError, _OmpError):
     """A shortcut is malformed or unavailable."""
 
 
@@ -79,12 +81,18 @@ def _normalize_shortcut_chord(chord: str) -> str:
     return "+".join((*ordered_modifiers, key))
 
 
-class DialogUnavailable(RuntimeError):
+class DialogUnavailable(RuntimeError, _OmpError):
     """An arbitrary overlay has no attached presentation client."""
 
 
-class DuplicateRenderer(_ExtensionError):
+class DuplicateRenderer(_DuplicateRegistration):
     """A second device-rendering fold claimed the same frozen identity."""
+
+    def __init__(self, name: str, holder: str, claimant: str | None = None) -> None:
+        super().__init__(name, holder)
+        self.claimant = claimant
+        if claimant is not None:
+            self.args = (f"renderer {name!r} is already held by {holder!r}; second claimant {claimant!r}",)
 
 @dataclass(frozen=True, slots=True)
 class StatusFacts:
@@ -99,8 +107,19 @@ class StatusFacts:
     dropped: int = 0
 
 
+def _byte_offset(source: str, index: int) -> int:
+    return len(source[:index].encode("utf-8"))
+
+
 def _validate(source: str) -> None:
     """Reject structurally malformed TML without admitting a second markup grammar."""
+    encoded_size = len(source.encode("utf-8"))
+    if encoded_size > limits.TML_MAX_BYTES:
+        raise TmlError(
+            f"TML_MAX_BYTES exceeded: {encoded_size} > {limits.TML_MAX_BYTES}",
+            limits.TML_MAX_BYTES,
+            source,
+        )
     stack: list[tuple[str, int]] = []
     cursor = 0
     while cursor < len(source):
@@ -112,22 +131,36 @@ def _validate(source: str) -> None:
             continue
         closing = source.find(">", opening + 1)
         if closing < 0:
-            raise TmlError("unclosed tag", opening, source)
+            raise TmlError("unclosed tag", _byte_offset(source, opening), source)
         body = source[opening + 1 : closing].strip()
         if not body:
-            raise TmlError("empty tag", opening, source)
+            raise TmlError("empty tag", _byte_offset(source, opening), source)
         if body.startswith("/"):
             name = body[1:].strip()
             if not stack or stack[-1][0] != name:
-                raise TmlError(f"unexpected closing tag </{name}>", opening, source)
+                raise TmlError(
+                    f"unexpected closing tag </{name}>",
+                    _byte_offset(source, opening),
+                    source,
+                )
             stack.pop()
         elif not body.endswith("/") and not body.startswith("!"):
             name = body.split(None, 1)[0]
+            if len(stack) >= limits.TML_MAX_DEPTH:
+                raise TmlError(
+                    f"TML_MAX_DEPTH exceeded: {len(stack) + 1} > {limits.TML_MAX_DEPTH}",
+                    _byte_offset(source, opening),
+                    source,
+                )
             stack.append((name, opening))
         cursor = closing + 1
     if stack:
         name, at = stack[-1]
-        raise TmlError(f"unclosed tag <{name}>", at, source)
+        raise TmlError(
+            f"unclosed tag <{name}>",
+            _byte_offset(source, at),
+            source,
+        )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -545,6 +578,10 @@ class Prompt:
     text: str; submit: bool = True
 
 
+CommandResult: _TypeAlias = Consumed | Prompt
+"""The closed, typed return vocabulary for a slash-command handler."""
+
+
 class _Limits:
     """Read-only UI protocol ceilings."""
     TML_MAX_BYTES = 262_144; TML_MAX_DEPTH = 64; SLOT_MAX_PER_EXTENSION = 16; NOTIFY_PER_TURN = 10; COMPLETION_DEADLINE = "250ms"; RENDER_DEADLINE = "50ms"; OVERLAY_MAX_CONCURRENT = 2; WATCH_DEBOUNCE = "60ms"
@@ -767,6 +804,7 @@ def message_renderer(
     ) -> Callable[[MessageView, RenderCtx], Tml | None]:
         if not callable(function) or _inspect.iscoroutinefunction(function):
             raise TypeError("message_renderer folds must be synchronous callables")
+        _declarations.register_ui("message_renderer", kind, function)
         _message_renderers[kind] = function
         return function
     return decorate
@@ -790,11 +828,16 @@ def renderer(
     def decorate(function: Callable[..., Tml | None]) -> Callable[..., Tml | None]:
         if _inspect.iscoroutinefunction(function):
             raise TypeError("renderer folds must be synchronous")
-        if key in _device_renderers:
-            raise DuplicateRenderer(f"duplicate renderer: {key!r}")
         function.__omp_renderer_reduce__ = reduce
         function.__omp_renderer_decorates__ = decorates
-        _device_renderers[key] = _RendererRegistration(function, reduce, decorates)
+        registration = _RendererRegistration(function, reduce, decorates)
+        try:
+            _declarations.register_ui("verdict_renderer", key, registration)
+        except _DuplicateRegistration as error:
+            incumbent = _device_renderers.get(key)
+            holder = getattr(getattr(incumbent, "function", None), "__qualname__", None) or error.holder
+            raise DuplicateRenderer(str(key), holder, getattr(function, "__qualname__", None)) from None
+        _device_renderers[key] = registration
         return function
     return decorate
 
@@ -830,7 +873,10 @@ def _dispatch_message_renderer(kind: str, message: MessageView, ctx: RenderCtx) 
 
 def completion(trigger: Trigger) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Register one asynchronous completion fold by static trigger prefix."""
-    def decorate(function: Callable[..., object]) -> Callable[..., object]: _completion_handlers[trigger.prefix] = function; return function
+    def decorate(function: Callable[..., object]) -> Callable[..., object]:
+        _declarations.register_ui("completion", trigger.prefix, function)
+        _completion_handlers[trigger.prefix] = function
+        return function
     return decorate
 
 
@@ -939,4 +985,24 @@ def command(name: str, *, aliases: Sequence[str] = (), description: str = "", ar
     return decorate
 
 
-__all__ = tuple(name for name in globals() if not name.startswith("_"))
+__all__ = tuple(
+    name
+    for name in globals()
+    if not name.startswith("_")
+    and name not in {
+        "Any",
+        "Callable",
+        "ContextVar",
+        "Formatter",
+        "Iterable",
+        "Mapping",
+        "MappingProxyType",
+        "Sequence",
+        "StrEnum",
+        "annotations",
+        "dataclass",
+        "field",
+        "fields",
+        "is_dataclass",
+    }
+)

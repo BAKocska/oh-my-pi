@@ -7,7 +7,7 @@ hook protobuf; this module intentionally contains no generator or host I/O.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -16,12 +16,47 @@ from typing import Any, Final
 from _omp import ActivateReason, ArtifactUrl, BlobRef, Duration, EnvPath
 
 
-from .agents import Usage
-from .hooks import CallOrigin, CallTarget, TargetKind
+from .agents import Continue, Settle, SubagentSpec, Usage
+from .hooks import (
+    Allow,
+    CallOrigin,
+    CallTarget,
+    Channel,
+    Composition,
+    HookDecision,
+    LatencyClass,
+    OnFailure,
+    TargetKind,
+    UnknownEvent,
+)
+from .context import (
+    CompactionEvent,
+    CompactionOutcome,
+    CompactionVerdict,
+    ContextPatch,
+    ContextView,
+)
 from .devices import DeviceInfo
-from .placement import Place
+from .placement import Place, WorkerInfo
 from .policy import BashIR
-from .provider import Effort, Intent, ModelRef, Role, RouteRef
+from .provider import (
+    Credential,
+    DiscoveryPage,
+    DiscoveryQuery,
+    Effort,
+    Failover,
+    Intent,
+    LoginRequest,
+    ModelRef,
+    ProviderError,
+    RefreshRequest,
+    RequestDraft,
+    Role,
+    RouteRef,
+    SignRequest,
+    UsageQuery,
+    UsageReport,
+)
 from ._verdicts import ArtifactLifetime
 from ._scope import Trust
 from .ui import InvocationMode
@@ -807,8 +842,169 @@ EVENT_IDS: Final[Mapping[str, int]] = MappingProxyType(
 """Stable dense event identifiers used by the subscription bitmap."""
 
 
-__all__ = tuple(
-    name for name, value in globals().items()
-    if name == "EVENT_IDS"
-    or (isinstance(value, type) and value.__module__ == __name__)
+@dataclass(frozen=True, slots=True)
+class EventSpec:
+    """Describe one immutable row of the declared hook event catalog."""
+
+    name: str
+    id: int
+    rev: int
+    payload: type
+    returns: object | None
+    channel: Channel
+    latency: LatencyClass
+    on_failure: OnFailure
+    default_decision: type | None
+    reentrant: bool
+    gateable: bool
+    fields: Mapping[str, Composition]
+    default_timeout: Duration
+    ceiling_timeout: Duration
+
+
+_LATENCY_TIMEOUTS: Final[Mapping[LatencyClass, tuple[Duration, Duration]]] = MappingProxyType(
+    {
+        LatencyClass.SESSION: (Duration("5s"), Duration("60s")),
+        LatencyClass.SUBMISSION: (Duration("5s"), Duration("30s")),
+        LatencyClass.TURN: (Duration("5s"), Duration("30s")),
+        LatencyClass.CALL: (Duration("30s"), Duration("15m")),
+        LatencyClass.INPUT: (Duration("5s"), Duration("15m")),
+        LatencyClass.STREAM: (Duration("250ms"), Duration("1s")),
+        LatencyClass.ASYNC: (Duration("0s"), Duration("0s")),
+    }
+)
+
+_HOOK = HookDecision
+_OBSERVE = None
+_ALLOW = Allow
+_DOMAIN = False
+_GATE = True
+_EMPTY_FIELDS: Final[Mapping[str, Composition]] = MappingProxyType({})
+
+_EVENT_METADATA = {
+    # name: payload, returns, latency, failure, reentrant, gateable, default, mutable fields
+    "session_start": (SessionStartEvent, _HOOK, LatencyClass.SESSION, OnFailure.DEFER, True, _GATE, _ALLOW, {}),
+    "session_shutdown": (SessionShutdownEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "session_switch": (SessionSwitchEvent, _HOOK, LatencyClass.SESSION, OnFailure.DEFER, True, _GATE, _ALLOW, {}),
+    "session_switched": (SessionSwitchedEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "session_branch": (SessionBranchEvent, _HOOK, LatencyClass.SESSION, OnFailure.DEFER, True, _GATE, _ALLOW, {"summarize": Composition.REPLACE}),
+    "session_branched": (SessionBranchedEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "session_rewind": (SessionRewindEvent, _HOOK, LatencyClass.SESSION, OnFailure.DENY, True, _GATE, _ALLOW, {"restore_workspace": Composition.REPLACE}),
+    "session_rewound": (SessionRewoundEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "session_reset": (SessionResetEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "before_agent_start": (BeforeAgentStartEvent, _HOOK, LatencyClass.INPUT, OnFailure.DEFER, True, _GATE, _ALLOW, {"text": Composition.REPLACE, "items": Composition.APPEND}),
+    "agent_start": (AgentStartEvent, _OBSERVE, LatencyClass.SUBMISSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "turn_start": (TurnStartEvent, _HOOK, LatencyClass.TURN, OnFailure.DEFER, True, _GATE, _ALLOW, {"enabled_tools": Composition.INTERSECT, "model": Composition.REPLACE, "route": Composition.REPLACE, "thinking": Composition.REPLACE, "deadline": Composition.REPLACE}),
+    "turn_end": (TurnEndEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "agent_settled": (AgentSettledEvent, Continue | Settle, LatencyClass.SUBMISSION, OnFailure.DEFER, True, _DOMAIN, Settle, {}),
+    "agent_end": (AgentEndEvent, _OBSERVE, LatencyClass.SUBMISSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "interrupt": (InterruptEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "deadline": (DeadlineEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "message_start": (MessageStartEvent, _OBSERVE, LatencyClass.STREAM, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "message_update": (MessageUpdateEvent, _OBSERVE, LatencyClass.STREAM, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "message_end": (MessageEndEvent, _OBSERVE, LatencyClass.STREAM, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "item_committed": (ItemCommittedEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "call_open": (CallOpenEvent, _OBSERVE, LatencyClass.STREAM, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "tool_call": (ToolCallEvent, _HOOK, LatencyClass.CALL, OnFailure.DENY, True, _GATE, _ALLOW, {"target": Composition.REPLACE, "args": Composition.REPLACE, "cwd": Composition.REPLACE, "deadline": Composition.REPLACE}),
+    "tool_execution_start": (ToolExecutionStartEvent, _OBSERVE, LatencyClass.CALL, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "tool_update": (ToolUpdateEvent, _OBSERVE, LatencyClass.STREAM, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "tool_execution_end": (ToolExecutionEndEvent, _OBSERVE, LatencyClass.CALL, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "tool_result": (ToolResultEvent, _HOOK, LatencyClass.CALL, OnFailure.DEFER, True, _GATE, _ALLOW, {"annotate": Composition.APPEND, "spill": Composition.REPLACE}),
+    "tool_approval_requested": (ToolApprovalRequestedEvent, _OBSERVE, LatencyClass.CALL, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "tool_approval_resolved": (ToolApprovalResolvedEvent, _OBSERVE, LatencyClass.CALL, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "device_list": (DeviceListEvent, _HOOK, LatencyClass.TURN, OnFailure.DENY, False, _GATE, _ALLOW, {"devices": Composition.INTERSECT}),
+    "user_input": (UserInputEvent, _HOOK, LatencyClass.INPUT, OnFailure.DEFER, True, _GATE, _ALLOW, {"text": Composition.REPLACE, "images": Composition.APPEND}),
+    "user_bash": (UserBashEvent, _HOOK, LatencyClass.INPUT, OnFailure.DENY, True, _GATE, _ALLOW, {"command": Composition.REPLACE, "cwd": Composition.REPLACE, "env_overrides": Composition.REPLACE}),
+    "user_eval": (UserEvalEvent, _HOOK, LatencyClass.INPUT, OnFailure.DENY, True, _GATE, _ALLOW, {"code": Composition.REPLACE}),
+    "command_invoke": (CommandInvokeEvent, _HOOK, LatencyClass.INPUT, OnFailure.DEFER, True, _GATE, _ALLOW, {"name": Composition.REPLACE, "argv": Composition.REPLACE}),
+    "resources_discover": (ResourcesDiscoverEvent, _HOOK, LatencyClass.SESSION, OnFailure.DENY, True, _GATE, _ALLOW, {"add": Composition.APPEND, "keep": Composition.INTERSECT}),
+    "resources_changed": (ResourcesChangedEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "provider_login": (LoginRequest, _HOOK, LatencyClass.SESSION, OnFailure.DENY, True, _GATE, _ALLOW, {}),
+    "provider_refresh": (RefreshRequest, Credential, LatencyClass.SESSION, OnFailure.DENY, False, _DOMAIN, None, {}),
+    "provider_sign": (SignRequest, _HOOK, LatencyClass.TURN, OnFailure.DENY, False, _GATE, _ALLOW, {}),
+    "before_request": (RequestDraft, _HOOK, LatencyClass.TURN, OnFailure.DEFER, False, _GATE, _ALLOW, {"intents": Composition.INTERSECT}),
+    "models_discover": (DiscoveryQuery, DiscoveryPage, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {"models": Composition.INTERSECT}),
+    "provider_error": (ProviderError, Failover | None, LatencyClass.TURN, OnFailure.DENY, True, _DOMAIN, None, {}),
+    "provider_usage": (UsageQuery, UsageReport | None, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "capability_budget": (CapabilityBudgetEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "model_changed": (ModelChangedEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "credential_disabled": (CredentialDisabledEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "compaction": (CompactionEvent, CompactionVerdict | None, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "compaction_done": (CompactionOutcome, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "thread_projection": (ContextView, ContextPatch | None, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "subagent_spawn": (SubagentSpec, _HOOK, LatencyClass.CALL, OnFailure.DENY, True, _GATE, _ALLOW, {}),
+    "worker_state": (WorkerInfo, _OBSERVE, LatencyClass.ASYNC, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "job_registered": (JobRegisteredEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "job_settled": (JobSettledEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "extension_activate": (ExtensionActivateEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "extension_load": (ExtensionLoadEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "extension_unload": (ExtensionUnloadEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "host_reconnect": (HostReconnectEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+}
+
+
+def _make_spec(name: str) -> EventSpec:
+    payload, returns, latency, failure, reentrant, gateable, default, fields = _EVENT_METADATA[name]
+    default_timeout, ceiling_timeout = _LATENCY_TIMEOUTS[latency]
+    return EventSpec(
+        name=name,
+        id=EVENT_IDS[name],
+        rev=1,
+        payload=payload,
+        returns=returns,
+        channel=Channel.CONTROL,
+        latency=latency,
+        on_failure=failure,
+        default_decision=default,
+        reentrant=reentrant,
+        gateable=gateable,
+        fields=MappingProxyType(fields) if fields else _EMPTY_FIELDS,
+        default_timeout=default_timeout,
+        ceiling_timeout=ceiling_timeout,
+    )
+
+
+_EVENT_SPECS: Final[Mapping[str, EventSpec]] = MappingProxyType(
+    {name: _make_spec(name) for name in _EVENT_NAMES}
+)
+
+
+def spec(event: str) -> EventSpec:
+    """Return the declared catalog row for *event*."""
+
+    try:
+        return _EVENT_SPECS[event]
+    except (KeyError, TypeError) as error:
+        raise UnknownEvent(f"unknown hook event {event!r}") from error
+
+
+def specs() -> Iterator[EventSpec]:
+    """Iterate event specs in stable event-id order."""
+
+    return iter(_EVENT_SPECS.values())
+
+
+def default_decision(event: str) -> type | None:
+    """Return the catalog default decision for *event*."""
+
+    return spec(event).default_decision
+
+
+def field_composition(event: str) -> Mapping[str, Composition]:
+    """Return immutable mutable-field composition rules for *event*."""
+
+    return spec(event).fields
+
+
+__all__ = (
+    "EVENT_IDS",
+    "default_decision",
+    "field_composition",
+    "spec",
+    "specs",
+    *tuple(
+        name
+        for name, value in globals().items()
+        if isinstance(value, type) and value.__module__ == __name__
+    ),
 )

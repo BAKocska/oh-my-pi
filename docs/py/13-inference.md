@@ -377,6 +377,9 @@ this is the supported shape for reconciliation, and it is why `pi-lmstudio`'s
 *resolved* cards, after overlay merge and user configuration, which is not necessarily what was
 declared. `is_authenticated()` answers without revealing anything.
 
+`omp.provider.watch_models(since=None)` returns a resumable `WatchModels` subscription whose async
+iterator yields ordered `ModelEvent` catalog deltas until the host closes the stream.
+
 **Resolved (2026-08-20 ruling): GENERATE_IMAGE uses a named provider request seam.**
 `ProviderHandle.request(Operation.GENERATE_IMAGE, ImageRequest(...))` is the extension-visible
 CONTROL + DATA host arm; Core owns selection, credential application, wire encoding, decoding, blob
@@ -489,6 +492,22 @@ class RouteSpec:
 | `codec_profile` | `STANDARD`, `GOOGLE_CCA_GEMINI_CLI`, `GOOGLE_CCA_ANTIGRAVITY`, `APPLE_FM`. Selects a codec construction variant without provider-name policy. |
 | `priority` | Larger is preferred when several routes serve the same model. `None` means catalog default ordering. |
 
+Supporting closed vocabularies are public where they are consumed:
+
+- `omp.provider.CodecProfile`: codec construction variants `STANDARD`,
+  `GOOGLE_CCA_GEMINI_CLI`, `GOOGLE_CCA_ANTIGRAVITY`, and `APPLE_FM`.
+- `omp.provider.OAuthFlowKind`: authorization-flow discriminators `PKCE`, `DEVICE_CODE`,
+  `PASTE`, and `CUSTOM`.
+- `omp.provider.ImageFeature`, `omp.provider.SpeechFeature`,
+  `omp.provider.TranscriptionFeature`, and `omp.provider.RealtimeFeature`: the closed capability
+  sets carried by their corresponding `*Caps.features` fields; the member sets are listed in the
+  capability table below.
+- `omp.provider.MismatchPolicy`: selected-codec mismatch handling, either `REJECT` or
+  `DROP_PREFERRED`.
+- `omp.provider.FailoverKind`: recovery actions `RETRY`, `REFRESH_CREDENTIAL`,
+  `ROTATE_ACCOUNT`, `RESELECT_ROUTE`, `SWITCH_MODEL`, `RESEED_SESSION`, `SEMANTIC_RETRY`, and
+  `FAIL`.
+
 ### `Api`
 
 Closed selector over Rust's codec set. Members, with the codec that backs each:
@@ -569,7 +588,7 @@ keys and headers, resolved per request (`.plan/feature-map/FEATURES.md:157`), an
 `pi-provider-litellm` used it to run `LITELLM_API_KEY_HELPER` on the turn path. Executing a shell
 helper synchronously before every request is a latency cliff, an unauditable credential source, and a
 policy hole. The replacement is a `@omp.hook("provider_refresh")` that runs a command through
-`omp.env.exec` ahead of expiry and stores the result — same capability, off the request path, visible
+`omp.env.sh.run` ahead of expiry and stores the result — same capability, off the request path, visible
 to policy (`docs/py/06-policy.md`), and cached with a real TTL. This is a deliberate divergence from
 the feature map; see the closing section.
 
@@ -1137,8 +1156,10 @@ grammar-safe flavor a local llama.cpp-class server needs; `MOONSHOT_MFJS` is the
 on), `body_override`, `toggle`.
 
 **Output and streaming axes.** `max_tokens_field` (which name the output cap uses),
-`emit_max_tokens`, `extended_context_mode`, `stream_framing`, `watchdog` (`StreamWatchdog(first_event,
-inter_event)`, both `omp.Duration`), `image_encoding`, `cache_marker`, `audio_api_version`, `usage_projection`.
+`emit_max_tokens`, `extended_context_mode`, `stream_framing`, `watchdog`
+(`omp.provider.StreamWatchdog(first_event, inter_event=None)`), `image_encoding`, `cache_marker`,
+`audio_api_version`, `usage_projection`. Its `first_event` window is required; `inter_event`
+optionally bounds every subsequent gap. Both are positive `omp.Duration` values.
 
 Setting an axis the selected codec does not honor is a declaration-time `SpecError`, not a silent
 no-op. This is the concrete fix for pi's opaque passthrough struct.
@@ -1282,7 +1303,8 @@ def clear(key: str, /) -> None: ...
 def declared(key: str | None = None, /) -> tuple[Intent, ...]: ...
 ```
 
-Keyed, last-write-wins per key, exactly like `omp.ui.set_slot` — an extension owns its keys and can
+Keyed, last-write-wins per key, like keyed slot contributions managed by `omp.ui.mount` — an
+extension owns its keys and can
 neither read nor overwrite another extension's. **Channel** CONTROL, fire-and-forget. **Latency
 class** per-toggle, not per-request; the assignment is recomputed on the registration-set change, not
 on the turn. **Failure** fail-open: a rejected contribution leaves the previous set in place and
@@ -1777,6 +1799,9 @@ class Credential:
 	props: Mapping[str, int | str | bool] = FROZEN_EMPTY
 ```
 
+`omp.creds.CredentialMeta` is the frozen, secret-free record returned by the lifecycle methods:
+`id`, `provider`, `identity`, `kind`, `expires_at_ms`, `disabled`, `disabled_cause`, and `blocks`.
+
 `CredentialKind`: `API_KEY`, `BEARER`, `OAUTH`, `AWS`, `SESSION`. `props` carries provider-specific
 non-secret extras — account ids, plan hints, project ids. Integers stay integers: a large account id
 must not be silently mangled by a float round-trip.
@@ -2053,15 +2078,17 @@ import omp
 #                                ServiceTier("default", 0),
 #                                ServiceTier("priority", 20)))
 
+fast = False
+
 @omp.command("fast")
 async def toggle_fast(invocation: omp.ui.Invocation, ctx: omp.Context) -> None:
-	on = not await omp.journal.state_get("fast", default=False)
-	await omp.journal.state_set("fast", on)
-	if on:
+	global fast
+	fast = not fast
+	if fast:
 		omp.intents.set("fast", omp.intent.service_tier("priority", priority=50))
 	else:
 		omp.intents.clear("fast")
-	omp.ui.set_status("fast", omp.ui.tml("<ico:bolt/> fast") if on else None)
+	omp.ui.set_status("fast", omp.ui.tml("<ico:bolt/> fast") if fast else None)
 ```
 
 No `before_request`. No body dict. If the active model does not declare a `priority` tier, the intent
@@ -2085,25 +2112,22 @@ from omp import Api, AuthMode, AuthSpec, CredentialSource, ProviderSpec, RouteSp
 
 @omp.hook("extension_activate")
 async def start_proxy(ev: omp.ExtensionActivateEvent, ctx: omp.Context) -> None:
-	# Runs beside the Environment — which may be remote. `socket` is resolved in
-	# the Environment's filesystem, and that is the only place the route can reach.
-	proc = await omp.env.spawn_process(
-		"cursor-bridge",
-		("cursor-bridge", "--listen", "$OMP_PROC_SOCKET"),
-		restart="on-failure",
-		ready={"log": r"listening on"},
-	)
-	# The bridge never receives the real credential: it gets a facet-scoped,
-	# short-lived token it cannot use for anything else.
+	# Runs beside the Environment — which may be remote. The loopback route is
+	# reachable only in that Environment's network namespace.
 	token = await omp.creds.mint_scoped("bridge", ttl=omp.Duration("15m"))
-	await proc.send_secret("OMP_BRIDGE_TOKEN", token.token)
+	proc = await omp.env.proc.ensure(
+		"cursor-bridge",
+		"cursor-bridge --listen http://127.0.0.1:43191",
+		env={"OMP_BRIDGE_TOKEN": token.token},
+		restart=omp.env.RestartPolicy(omp.Restart.ON_FAILURE),
+	)
 
 	omp.provider(ProviderSpec(
 		id="cursor",
 		name="Cursor",
 		routes=(RouteSpec(
 			id="bridge",
-			base_url=proc.endpoint,                   # unix:// or loopback
+			base_url="http://127.0.0.1:43191",        # Environment loopback
 			api=Api.OPENAI_CHAT,                      # the bridge's local dialect
 			trust=TrustDomain.loopback(),
 			auth=AuthSpec(mode=AuthMode.BEARER,
@@ -2121,7 +2145,7 @@ crash-recovery replay in the failure section.
 Rust streams against the bridge with its ordinary codec, retry, rate, and recovery layers intact.
 Python's total involvement is one spawn, one token mint, and one declaration. Two consequences worth
 stating plainly: the bridge inherits the Environment's location, so on a remote workspace it runs
-remotely and `proc.endpoint` is meaningful only there (`docs/py/11-env.md`,
+remotely and its loopback listener is reachable only there (`docs/py/11-env.md`,
 `docs/py/14-deploy.md`); and the credential harvest cascade is *not* ported. The user runs
 `/login cursor` for PKCE, or one explicit import command; the extension does not read the Keychain,
 does not open `state.vscdb`, and does not walk `/mnt/c/Users/…`.
@@ -2139,8 +2163,8 @@ therefore depends on the bridge persisting them, and omp cannot verify that it d
 ### Prerequisite: the DATA edge this document assumes does not exist yet
 
 Several things above route through `omp.env` — `models_discover` doing its HTTP probe
-(`omp.env.http_get`), the class (c) proxy (`omp.env.spawn_process`, `proc.endpoint`,
-`proc.send_secret`), and the `!command` replacement (`omp.env.exec`). Their Python spellings are
+(`omp.env.http_get`), the class (c) proxy (`omp.env.proc.ensure`), and the `!command` replacement
+(`omp.env.sh.run`). Their Python spellings are
 frozen, but the host has not installed the Python DATA binding; without that binding each arm fails explicitly
 with `NotWiredError`. The scoped-egress HTTP frame and envd client themselves are implemented.
 
@@ -2158,9 +2182,9 @@ worth stating because it determines what is a wiring task versus a design task:
 
 | Dependency | env/v1 status | Blocker |
 |---|---|---|
-| `omp.env.spawn_process` (class (c) proxy) | wire-complete | no Python DATA connection |
-| `omp.env.exec` (credential helper) | wire-complete | no Python DATA connection |
-| `omp.env.put_blob` / `get_blob` | wire-complete | no Python DATA connection |
+| `omp.env.proc.ensure` (class (c) proxy) | wire-complete | no Python DATA connection |
+| `omp.env.sh.run` (credential helper) | wire-complete | no Python DATA connection |
+| `omp.env.blobs.put` / `omp.env.blobs.get` | wire-complete | no Python DATA connection |
 | `omp.env.http_get` (discovery probe) | wire-complete scoped-egress frame and envd client | Python DATA bridge wiring outstanding |
 
 The additive path for the first three is small and specific. `EnvServer::serve_io` already accepts any
@@ -2613,7 +2637,7 @@ overlay wiring (item 1 above) is a prerequisite and belongs earlier.
    Refused on the request path. A shell helper resolved per request is a latency cliff, an
    unauditable credential source, and a policy hole; `pi-provider-litellm` ran
    `LITELLM_API_KEY_HELPER` on the turn path. Replacement: `provider_refresh` invoking
-   `omp.env.exec` ahead of expiry, result stored, visible to `docs/py/06-policy.md`, with a real TTL.
+   `omp.env.sh.run` ahead of expiry, result stored, visible to `docs/py/06-policy.md`, with a real TTL.
    Same capability, off the hot path, auditable. This is a deliberate divergence and the feature-map
    entry should be amended rather than quietly satisfied.
 2. **`FEATURES.md:158` — "`$VAR` env resolution with literal fallback."** Env resolution is kept

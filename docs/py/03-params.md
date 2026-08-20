@@ -2,7 +2,7 @@
 
 This document owns two things. First, `omp.InvocationPhase` — the single seven-state machine every tool invocation walks from first stream delta to durable outcome; [00-overview.md](00-overview.md), [01-devices.md](01-devices.md), [05-hooks.md](05-hooks.md), and [06-policy.md](06-policy.md) link here rather than defining their own. Second, `omp.IncomingParams` — a typed, linear, streaming cursor over the argument document: you *pull* the values you need, each one resolving the instant its closing delimiter arrives.
 
-Scope, stated before anything else because Revision 1 got it wrong: **the pull cursor is core-tool-internal machinery in v1.** The first revision of this document opened with "`omp.IncomingParams` is the only way a device sees its arguments," which quietly made speculative streaming the public contract for every extension device — while [01-devices.md](01-devices.md) described a device receiving one complete, committed object. The review called this "two different products," and the resolution is the review's: the v1 public device contract is `async def device(args: Args, ctx: omp.Context)` — the body receives **final, policy-approved effective arguments** and starts only at `EFFECTS_AUTHORIZED` ([01-devices.md](01-devices.md) owns that contract). Core tools keep the streaming cursor internally, in Rust. The Python surface documented in this file reaches third parties only through `@omp.streaming_device`, a separate, explicitly named facility that is **not in v1** and will not ship until the benefit is measured. Protocol selection is only ever by decorator — never inferred from a return annotation, an omitted field, or a manifest subtlety. Everything below is therefore fully specified — the cursor exists and core tools exercise it — but nothing below is a thing a v1 extension author writes.
+Scope, stated before anything else because Revision 1 got it wrong: **the pull cursor is core-tool-internal machinery in v1.** The first revision of this document opened with "`omp.IncomingParams` is the only way a device sees its arguments," which quietly made speculative streaming the public contract for every extension device — while [01-devices.md](01-devices.md) described a device receiving one complete, committed object. The review called this "two different products," and the resolution is the review's: the v1 public device contract is `async def device(args: Args, ctx: omp.Context)` — the body receives **final, policy-approved effective arguments** and starts only at `EFFECTS_AUTHORIZED` ([01-devices.md](01-devices.md) owns that contract). Core tools keep the streaming cursor internally, in Rust. The Python surface documented in this file reaches third parties only through `@streaming_device`, a separate, explicitly named facility that is **not in v1** and will not ship until the benefit is measured. Protocol selection is only ever by decorator — never inferred from a return annotation, an omitted field, or a manifest subtlety. Everything below is therefore fully specified — the cursor exists and core tools exercise it — but nothing below is a thing a v1 extension author writes.
 
 This removes pi's central defect at the input boundary. Pi streamed arguments as `Partial<T>` snapshots, smuggled the raw text into the args object under a magic `__partialJson` key (`/work/pi/packages/coding-agent/src/tools/xdev.ts:236-237`), and left every tool to re-derive JSON structure by hand from that string. `dropIncompleteLastEdit` counts braces, tracks escapes, and probes with `/\{/.test(tail)` to guess whether a trailing array element has closed (`/work/pi/packages/coding-agent/src/edit/streaming.ts:134-190`). `extractPartialBashEnv` regex-searches `"env"\s*:\s*\{` and re-lexes the object body (`/work/pi/packages/coding-agent/src/tools/bash.ts:468-474`). And because the magic key is an ordinary property, a renderer has to hide it again (`json-tree.ts:16`). Partial-JSON semantics are computed once, by the parser, and handed out through a cursor. Nobody counts braces.
 
@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 
 import omp
 
-@omp.streaming_device("lint", family="lint", rev=2, place="env")   # not in v1; see above
+@streaming_device("lint", family="lint", rev=2, place="env")   # not in v1; see above
 async def lint(params: omp.IncomingParams, ctx: omp.Context) -> AsyncIterator[omp.Ev]:
     path = await params.arg("path")             # resolves at the closing quote
     yield omp.Update(stage="parsing", path=path)
@@ -62,7 +62,7 @@ Two consequences worth internalising. First, a scalar is not complete merely bec
 
 ### One state machine, seven phases
 
-Revision 1 of this document drew a two-phase picture here — `SPECULATION | EFFECT`, one gate between them, named `omp.Phase`. That machine is deleted, and the deletion is a material reversal worth spelling out. Two things were wrong with it. The name collided outright with [00-overview.md](00-overview.md)'s extension lifecycle enum (now `omp.LifecyclePhase`; the invocation machine is `omp.InvocationPhase`). And the single gate forced the word "commit" to carry three meanings at once — the assistant item becoming durable, policy admission completing, and effects becoming authorized — which produced a real ordering contradiction across the document set: 06-policy had admission answered while the invocation was still speculative and preceding the gate, while a proposed hooks wire addition had the admission query emitted after `ArgsCommitted`. A two-state machine cannot even express that question, let alone answer it.
+Revision 1 of this document drew a two-phase picture here — `SPECULATION | EFFECT`, one gate between them, named `Phase`. That machine is deleted, and the deletion is a material reversal worth spelling out. Two things were wrong with it. The name collided outright with [00-overview.md](00-overview.md)'s extension lifecycle enum (now `omp.LifecyclePhase`; the invocation machine is `omp.InvocationPhase`). And the single gate forced the word "commit" to carry three meanings at once — the assistant item becoming durable, policy admission completing, and effects becoming authorized — which produced a real ordering contradiction across the document set: 06-policy had admission answered while the invocation was still speculative and preceding the gate, while a proposed hooks wire addition had the admission query emitted after `ArgsCommitted`. A two-state machine cannot even express that question, let alone answer it.
 
 This document now owns the one machine, and every sibling links here:
 
@@ -180,7 +180,10 @@ Terminal for this turn only. Work continues outside the turn and settles through
 
 #### `omp.Abort`
 
-Structured reason an invocation produced no normal verdict. Five constructors, each carrying the fields the journal needs:
+Structured reason an invocation produced no normal verdict. Its frozen fields are `kind: str`
+(`"skipped"`, `"interrupted"`, `"effects_unknown"`, `"input_dropped"`, or
+`"missing_outcome"`) and `detail: str | None`; the constructors below are the
+authoritative way to build each variant.
 
 | Constructor | Meaning | Typical origin |
 |---|---|---|
@@ -227,16 +230,16 @@ Awaiting the `Arg` directly decodes against the declared type for that key on th
 path = await params.arg("path", alias=("file_path", "filename", "file"))
 ```
 
-#### `await params.whole(shape=None) -> Any`
+#### `await params.args(shape=None) -> Any`
 
-Explicitly opts into decoding the *complete* argument shape. Waits for input completion and strict finalization (`ARGS_FINALIZED`), then decodes the canonical effective document into `shape` (defaulting to the device's declared params type). Inside `@omp.streaming_device` this is the "simple" path and it is itself a pull — though note that in v1 the genuinely simple device never touches this file at all: it is an ordinary `(args, ctx)` device and receives this same finalized object as its argument. Mirrors `IncomingParams::whole` (`crates/tool/src/incoming.rs:200-204`).
+Explicitly opts into decoding the *complete* argument shape. Waits for input completion and strict finalization (`ARGS_FINALIZED`), then decodes the canonical effective document into `shape` (defaulting to the device's declared params type). Inside `@streaming_device` this is the "simple" path and it is itself a pull — though note that in v1 the genuinely simple device never touches this file at all: it is an ordinary `(args, ctx)` device and receives this same finalized object as its argument. Mirrors `IncomingParams::whole` (`crates/tool/src/incoming.rs:200-204`).
 
-Raises `omp.ArgFault` with `path=[]` and `kind=MALFORMED` when the finished document does not decode, `kind=AMBIGUOUS` when finalization rejected a duplicate key or alias collision, or `kind=ABORTED` when input was abandoned. Note the ordering: `whole()` never decodes aborted input, so a dropped feed is `ABORTED`, never a spurious malformed-JSON complaint.
+Raises `omp.ArgFault` with `path=()` and `kind=MALFORMED` when the finished document does not decode, `kind=AMBIGUOUS` when finalization rejected a duplicate key or alias collision, or `kind=ABORTED` when input was abandoned. Note the ordering: `args()` never decodes aborted input, so a dropped feed is `ABORTED`, never a spurious malformed-JSON complaint.
 
 ```python
-@omp.streaming_device("edit", family="hl", rev=3, place="env")
+@streaming_device("edit", family="hl", rev=3, place="env")
 async def edit(params, ctx):
-    args = await params.whole()          # hashline is one text field; nothing to stream
+    args = await params.args()          # hashline is one text field; nothing to stream
 ```
 
 #### `await params.raw() -> str`
@@ -258,7 +261,7 @@ Raises:
 Rides CONTROL; latency class per-call. `commitment_is_explicit_and_feed_guard_drop_aborts` (`crates/tool/tests/contracts.rs:591`) pins both arms, and `erased_tool_does_not_run_before_explicit_argument_commitment` (`contracts.rs:332`) pins that nothing executes without it.
 
 ```python
-lease = await omp.env.open(path)          # OPEN: lease pins revision N
+lease = await omp.env.docs.open(path)          # OPEN: lease pins revision N
 ops = []
 async for op in params.arg("ops").array():
     ops.append(await op)
@@ -417,7 +420,7 @@ This is the input-side half of Lesson #7's ban on ad-hoc strings. In pi a valida
 
 Seven members, ordered: `OPEN`, `ARGS_FINALIZED`, `ADMISSION`, `ADMITTED`, `ASSISTANT_ITEM_COMMITTED`, `EFFECTS_AUTHORIZED`, `SETTLED`. Defined in the concepts section above and owned by this document — [00-overview.md](00-overview.md) (`OperationSpec.minimum_phase` and the phase legality matrix), [01-devices.md](01-devices.md) (the v1 body start), [05-hooks.md](05-hooks.md) (the ADMISSION window), and [06-policy.md](06-policy.md) (admission receipts) link here rather than redefining it. Members compare by order: `params.phase >= omp.InvocationPhase.EFFECTS_AUTHORIZED` is what `is_authorized` reads. An abandoned invocation is dropped from whatever phase it reached — it never regresses, and without `ASSISTANT_ITEM_COMMITTED` it can never reach `EFFECTS_AUTHORIZED`.
 
-Revision 1 defined `omp.Phase = SPECULATION | EFFECT` in this slot. Deleted: the name collided with the extension lifecycle enum, and the two states blurred three distinct transitions under one word. The full reversal is recorded in the concepts section.
+Revision 1 defined `Phase = SPECULATION | EFFECT` in this slot. Deleted: the name collided with the extension lifecycle enum, and the two states blurred three distinct transitions under one word. The full reversal is recorded in the concepts section.
 
 ### Charitable decoding
 
@@ -499,9 +502,16 @@ Repairs are read-only from the device's side. `params.repairs()` returns the lis
 | `omp.InterruptClosed` | `next_interrupt()` | Yours to handle; escaping yields `Abort.effects_unknown`. |
 | `omp.ParamsProtocol(str)` | any pull, `committed()` | Framing violation. Journaled as `ArgIssueKind.PROTOCOL` and reported through `report_issue` ([10-telemetry.md](10-telemetry.md)). |
 | `omp.ParamsMisuse(str)` | any pull | The device fanned out, reused a consumed cursor, or stashed an element cursor. A bug in the extension; journaled with a traceback. |
-| `omp.EffectsNotAuthorized(str)` | `omp.env` effect operations | The environment refused an effect before `EFFECTS_AUTHORIZED`. [00-overview.md](00-overview.md) owns the exception and the `OperationSpec.minimum_phase` rule it enforces; [11-env.md](11-env.md) owns the refusal path. Revision 1 called this `omp.Uncommitted`. Never catch and retry: await `committed()`. |
+| `omp.EffectsNotAuthorized(invocation, spec)` | `omp.env` effect operations | The environment refused an effect before `EFFECTS_AUTHORIZED`. `.invocation` is the invocation id string and `.spec` is the `OperationSpec` (or its qualified-name string after transport). [00-overview.md](00-overview.md) owns the exception and the `OperationSpec.minimum_phase` rule it enforces; [11-env.md](11-env.md) owns the refusal path. Revision 1 called this `Uncommitted`. Never catch and retry: await `committed()`. |
 
-`ArgFault` subclasses `ValueError`; `CommitAborted`, `Interrupted`, and `InterruptClosed` subclass `omp.InvocationEnded`, so `except omp.InvocationEnded` is the one-line "clean up and stop" handler.
+**Resolved (2026-08-20 ruling):** `EffectsNotAuthorized` carries the positional
+`(invocation, spec)` payload owned by `docs/py/00-overview.md`; it is not a one-string error.
+
+`ArgFault` subclasses both `ValueError` and `omp.OmpError`; it exposes `.issue` plus
+the direct payload fields `.path`, `.kind`, `.detail`, and `.example`.
+`CommitAborted`, `Interrupted`, and `InterruptClosed` subclass
+`omp.InvocationEnded`, so `except omp.InvocationEnded` is the one-line
+"clean up and stop" handler.
 
 ### Constants
 
@@ -513,11 +523,11 @@ Repairs are read-only from the device's side. `params.repairs()` returns the lis
 
 ## Patterns
 
-A scope note before the worked examples, because Revision 1 blurred it: patterns 1 and 2 are **core tools** — the streaming cursor is theirs, and the shipped implementations are Rust. They are rendered here in Python as the future `@omp.streaming_device` would write them, because that rendering is the clearest specification of the cursor's semantics; no v1 extension author writes this shape. Patterns 3 and 5 are third-party devices in the v1 contract — `(args, ctx)`, final effective arguments, body starting at `EFFECTS_AUTHORIZED` ([01-devices.md](01-devices.md)). Pattern 4 is a hook.
+A scope note before the worked examples, because Revision 1 blurred it: patterns 1 and 2 are **core tools** — the streaming cursor is theirs, and the shipped implementations are Rust. They are rendered here in Python as the future `@streaming_device` would write them, because that rendering is the clearest specification of the cursor's semantics; no v1 extension author writes this shape. Patterns 3 and 5 are third-party devices in the v1 contract — `(args, ctx)`, final effective arguments, body starting at `EFFECTS_AUTHORIZED` ([01-devices.md](01-devices.md)). Pattern 4 is a hook.
 
 ### 1. Hashline `edit` — one text field, whole-pull
 
-`edit` is a core tool, not an extension device, and after Lesson #6 that distinction is structural: core tools ship their schema in every request, everything else is dispatched and documented through the `dyn` core tool ([01-devices.md](01-devices.md), which also defines `@omp.tool` — the ergonomic soft default — and the dynamic tool policy that decides the surface). It is shown here because it is the canonical cursor example, and because it is the direct answer to `@piex-dev/hashline` and `pi-hashline-edit-pro` (`catalog.md:282`, `catalog.md:198`) — two extensions that existed only to disable pi's built-in `edit` via `setActiveTools` and re-implement streaming previews around `Partial<T>`. In omp there is nothing for them to replace: hashline *is* the core dialect. The Python rendering below is the contract the future `@omp.streaming_device` would get; a v1 device receives the same finalized arguments without the cursor.
+`edit` is a core tool, not an extension device, and after Lesson #6 that distinction is structural: core tools ship their schema in every request, everything else is dispatched and documented through the `dyn` core tool ([01-devices.md](01-devices.md), which also defines `@omp.tool` — the ergonomic soft default — and the dynamic tool policy that decides the surface). It is shown here because it is the canonical cursor example, and because it is the direct answer to `@piex-dev/hashline` and `pi-hashline-edit-pro` (`catalog.md:282`, `catalog.md:198`) — two extensions that existed only to disable pi's built-in `edit` via `setActiveTools` and re-implement streaming previews around `Partial<T>`. In omp there is nothing for them to replace: hashline *is* the core dialect. The Python rendering below is the contract the future `@streaming_device` would get; a v1 device receives the same finalized arguments without the cursor.
 
 The hashline dialect takes a single text field, so there is nothing to stream key-by-key; what it needs is to open documents before effect authorization and dry-run the whole patch first.
 
@@ -527,13 +537,13 @@ class HashlineParams:
     input: Annotated[str, omp.Alias("_input", "patch", "text"),
                           omp.Example("[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement")]
 
-@omp.streaming_device("edit", family="hl", rev=3, place="env", params=HashlineParams)
+@streaming_device("edit", family="hl", rev=3, place="env", params=HashlineParams)
 async def edit(params: omp.IncomingParams, ctx: omp.Context) -> AsyncIterator[omp.Ev]:
-    args = await params.whole()
+    args = await params.args()
     patch = omp.hashline.parse(args.input)          # raises ArgFault(MALFORMED) with example
 
     # before effect authorization: one lease per section, pinned to the previewed revision
-    leases = [await omp.env.open(s.path, expect=s.tag) for s in patch.sections]
+    leases = [await omp.env.docs.open(s.path, expect=s.tag) for s in patch.sections]
     previews = [await lease.dry_run(section) for lease, section in zip(leases, patch.sections)]
     yield omp.Update(
         applied_ops=sum(len(p.ops) for p in previews),
@@ -569,17 +579,17 @@ class ReplaceParams:
     path: Annotated[str, omp.Alias("file_path", "filename", "file"), omp.Example("src/main.rs")]
     ops: Annotated[list[ReplaceOp], omp.Coerce.SINGLETON, omp.Coerce.JSON_STRING]
 
-@omp.streaming_device("edit", family="rep", rev=1, place="env", params=ReplaceParams)
+@streaming_device("edit", family="rep", rev=1, place="env", params=ReplaceParams)
 async def edit_replace(params: omp.IncomingParams, ctx: omp.Context) -> AsyncIterator[omp.Ev]:
     path = await params.arg("path")
-    lease = await omp.env.open(path)                 # pins revision N, seconds early
+    lease = await omp.env.docs.open(path)                 # pins revision N, seconds early
 
     previews = []
     async for element in params.arg("ops").array():
         op = await element                           # resolves at this element's `}`
         try:
             previews.append(await lease.dry_run(op))
-        except omp.env.NoMatch as miss:
+        except omp.env.Invalid as miss:
             raise omp.ArgFault(omp.ArgIssue(
                 path=element.path,
                 expected="an `old` string occurring exactly once in the file",
@@ -668,10 +678,11 @@ async def shell_guard(args: ShellParams, ctx: omp.Context) -> AsyncIterator[omp.
         yield omp.Done(GuardFault.refused(blocking))
         return
 
-    async with omp.env.exec(ast) as run:
-        async for chunk in run.output():
-            yield omp.Update(output=chunk)
-        yield omp.Done(GuardPayload(await run.status()))
+    async with omp.env.sh.session() as session:
+        run = await session.run(ast)
+        async for event in run:
+            yield omp.Update(output=event)
+        yield omp.Done(GuardPayload(await run.wait()))
 ```
 
 Three structural gains. `ArgIssueKind.INCOMPLETE` distinguishes truncation from malformation at finalization, so a cut-off generation is reported as truncation rather than as a policy refusal the model will argue with — and the guard body never runs against it. The refusal performs no effect operation, so the world is untouched not because a gate intervened but because the device never asked the environment for anything — and the arguments it analyzed are the canonical effective object policy admission saw, so the guard and the hooks can never disagree about what was analyzed. And the analysis reads a shell AST (`crates/shell-engine/src/parser/ast.rs`), so "pipes to a network sink" is a question about `Pipeline` and `IoRedirect` nodes rather than a regex over a string, which is what let `cc-safety-net` need a whole second layer for "shell-composition and interpreter bypass patterns."
@@ -773,7 +784,7 @@ There is one correlation-key mismatch to resolve, not paper over: the env plane 
 
 All additions are new field numbers in the existing `oneof`s; no field is renamed, renumbered, or repurposed; unknown bodies are skipped by receivers per the file's evolution rules (`toolhost.proto:14-18`). `ArgIssue` is worth defining once in `omp.env.v1` beside `Verdict` and importing into `toolhost.proto`, for the same anti-drift reason as the gate.
 
-**`InvokeTool.args_json` stays — it is the v1 public contract's wire shape.** A v1 device receives the final effective arguments in one frame, and shipping them whole is strictly cheaper than replaying fragments plus a pull round trip. That is every third-party device in v1, and the overwhelming majority forever. The host picks the mode from the device's host-side registration — `RegisterTools`/`ToolDecl` (`toolhost.proto:52-64`) already carries rev and constraint identity, and a `streams_args` bit belongs there, set only by the future `@omp.streaming_device` decorator — so protocol selection is a declaration, never an inference, and a device that declares no streaming pulls never receives `ArgText` and pays nothing for a capability it does not use. One correction to what the frame carries: after finalization it is the canonical effective text, not the raw emission — the raw text and its repairs live in the journal as `requested_args`.
+**`InvokeTool.args_json` stays — it is the v1 public contract's wire shape.** A v1 device receives the final effective arguments in one frame, and shipping them whole is strictly cheaper than replaying fragments plus a pull round trip. That is every third-party device in v1, and the overwhelming majority forever. The host picks the mode from the device's host-side registration — `RegisterTools`/`ToolDecl` (`toolhost.proto:52-64`) already carries rev and constraint identity, and a `streams_args` bit belongs there, set only by the future `@streaming_device` decorator — so protocol selection is a declaration, never an inference, and a device that declares no streaming pulls never receives `ArgText` and pays nothing for a capability it does not use. One correction to what the frame carries: after finalization it is the canonical effective text, not the raw emission — the raw text and its repairs live in the journal as `requested_args`.
 
 **Bounded framing is part of the frame definition, not a later hardening pass.** Two checked-in defects show what happens when a length is trusted, and both are live today — neither is fixed by this design, and neither should be described as if it were.
 
@@ -801,7 +812,7 @@ The second defect is about *ordering*, and it is the one my `PullReply` shape ex
 
 ### The DATA edge, which is not reachable from Python today
 
-The effect phase of every example in this document calls `omp.env` — `open`, `edit`, `docs.transaction`, `exec`. None of that is reachable from a Python worker as the code stands, and the gap is wiring rather than protocol.
+The effect phase of every example in this document calls `omp.env` — `docs.open`, `Doc.edit`, `docs.transaction`, and `sh.session`. None of that is reachable from a Python worker as the code stands, and the gap is wiring rather than protocol.
 
 `EnvServer` holds `_documents: DocumentHost` and `_document_authority: Option<DocumentAuthority>` (`crates/app/src/envd/server.rs:179-180`) plus `_workspace: WorkspaceHost` (`server.rs:182`) as underscore-prefixed fields — constructed and never dispatched — while `exec` (`server.rs:181`), `blobs`, `eval_bridge`, and `workers` beside them are wired. `env/v1` is wire-complete for exec, named processes, and blobs, but documents, fs, LSP, and search have no reachable frame for a Python client. Meanwhile the Python side is a `toolhost/v1` stdio worker with no world access at all. So the two-socket topology this document assumes is, today, **one socket carrying no DATA plane** ([00-overview.md](00-overview.md) states the topology and its current state; [11-env.md](11-env.md) owns the client surface).
 
@@ -830,7 +841,7 @@ Cancellation composes in both directions, and the directions are not symmetric:
 
   Revision 1 recorded here, honestly, that the shipped supervisor made this much worse than one device: `WorkerInvocation::drop` sends `SupervisorCommand::Cancel` (`crates/app/src/envd/worker.rs:220-229`), the supervisor's own doc says it "kills only the worker process group, reports effects-unknown, and replaces the worker before it accepts the next invocation" (`worker.rs:169-172`), with `SIGKILL` at `worker.rs:515-517` after the 150 ms courtesy window and `respawn` at `:806` — and `ToolWorkerSupervisor` is a "One-worker warm supervisor" (`worker.rs:232`), so the killed process group was *every device in the session*. That analysis stands as a description of the shipped code, which still implements pre-amendment D5's warm pool of one — `run_invocation` still serializes one invocation at a time (`worker.rs:592-598`), so the defect is latent rather than live. But it is no longer an open design question. The per-extension process ruling makes the target blast radius one extension: cancelling a call can only take down sibling calls *of the same extension* — fate-sharing that is explicit and author-legible, since opting into `--pool` or into intra-extension concurrency is opting into shared fate. The amendment to D5's "warm pool of one" wording that this document flagged as recommended was ratified 2026-08-19 (`PLAN.md` §D5): D5's third clause now reads per-extension worker processes, and the remaining delta between the shipped one-worker supervisor and the per-extension target is purely implementation. Durable approval tickets ([06-policy.md](06-policy.md)) remove the other half of the old deadlock — D5 as amended says approval "is a durable Core-owned ticket" — so nothing suspends a Python coroutine across an approval, and a long wait never holds an interpreter hostage. Until the per-extension supervisor exists, the shipped code remains unsafe under concurrent device calls, exactly as Revision 1 said.
 
-The native module surface is small: `omp._params` exposes `IncomingParams`, `Arg`, `ArgArray`, `ArgObject`, `InterruptibleParams` as `#[pyclass(frozen)]` handles over `u32` invocation and cursor ids, plus `Interrupt` and `ArgIssue` as plain dataclass-shaped `#[pyclass(get_all)]` values. Values cross as `str`/`int`/`float`/`bool`/`None`/`list`/`dict` built directly from `Value` — one conversion, no intermediate JSON text — except `typed(T)` and `whole(T)`, which hand the span to the declared type's own decoder. String chunks cross as `Str` → `PyString`, one copy, unavoidable at the boundary.
+The native module surface is small: `omp._params` exposes `IncomingParams`, `Arg`, `ArgArray`, `ArgObject`, `InterruptibleParams` as `#[pyclass(frozen)]` handles over `u32` invocation and cursor ids, plus `Interrupt` and `ArgIssue` as plain dataclass-shaped `#[pyclass(get_all)]` values. Values cross as `str`/`int`/`float`/`bool`/`None`/`list`/`dict` built directly from `Value` — one conversion, no intermediate JSON text — except `typed(T)` and `args(T)`, which hand the span to the declared type's own decoder. String chunks cross as `Str` → `PyString`, one copy, unavoidable at the boundary.
 
 Arguments never travel over the `omp_remote` pickle transport, and that is deliberate rather than incidental. Pickle-5 out-of-band buffers (`crates/py/python/omp_remote.py`) exist for bulk binary payloads; arguments are text, so the params path rides varint-framed protobuf on the toolhost socket and inherits neither the pickle deserialization surface nor the unbounded-header defect documented above. A device that wants to *hand* arguments to a remote worker does so explicitly through [04-placement.md](04-placement.md)'s surface, after effect authorization — at which point the values are ordinary Python objects and the boundary is that transport's problem, with that transport's bounds.
 
@@ -884,7 +895,7 @@ Three of Revision 1's open questions were closed by review rulings rather than b
 
 - **"Cancelling one device kills them all" (old question 0) — resolved: one process per extension is final.** Revision 1 laid out three ways out and recommended the third, a pool keyed per extension; the ruling adopted it. Host key `(layer, tier, extension)`, actor-style serialized callback entry per extension, concurrency opt-in (`concurrency=N` / `threadsafe=True`), pooling only as explicit fate-sharing via `--pool`, SIGKILL granularity one extension's process group. The corresponding amendment to D5's "warm pool of one" — flagged here in Revision 2 — was ratified 2026-08-19 (`PLAN.md` §D5): D5's third clause now reads per-extension worker processes keyed `(layer, tier, extension)`, with pooling as explicit opt-in fate-sharing and approval as a durable Core-owned ticket. The shipped one-worker supervisor (`crates/app/src/envd/worker.rs:232`) implements the pre-amendment letter of D5 and is now the migration source, not the target.
 - **Alias duplicates (old question 1) — resolved: rejected, not prioritized.** Revision 1 asked whether document order or declaration order should pick between `path` and `file_path` when a call carries both; strict finalization answers "neither": duplicates among a canonical key and its aliases are `AMBIGUOUS` at `ARGS_FINALIZED`. Per-rev repair metrics still matter — they now measure how often models emit the collision at all, which is the retraining signal.
-- **Whether `whole()` should imply commitment (old question 6) — dissolved by the v1 contract.** The device that "only ever calls `whole()`" is, in v1, not a cursor user at all: it is an ordinary `(args, ctx)` device and receives the finalized effective object as its argument, no awaits involved. The two-awaits boilerplate this question worried about no longer exists for anyone. Inside the future `@omp.streaming_device`, `whole()` and `committed()` stay separate on purpose: hiding the authorization gate is how pi's tools ended up not knowing when they were allowed to act.
+- **Whether `args()` should imply commitment (old question 6) — dissolved by the v1 contract.** The device that "only ever calls `args()`" is, in v1, not a cursor user at all: it is an ordinary `(args, ctx)` device and receives the finalized effective object as its argument, no awaits involved. The two-awaits boilerplate this question worried about no longer exists for anyone. Inside the future `@streaming_device`, `args()` and `committed()` stay separate on purpose: hiding the authorization gate is how pi's tools ended up not knowing when they were allowed to act.
 
 ### Open questions
 
@@ -893,16 +904,18 @@ Three of Revision 1's open questions were closed by review rulings rather than b
 3. **Resolved (2026-08-19 user ruling): closed — interrupt classes stay loop-owned; an extension that wants to stop a call returns Deny.** **Interrupt class authorship.** The loop is the only producer today, and `class` is a free-form `Str` (`crates/tool/src/incoming.rs:36-41`). Should extensions be able to mint classes — a policy hook interrupting a device it disapproves of? It would be useful and it would also make `.interruptable()` unpredictable across installed extension sets. Leaning closed: interrupts stay loop-owned, and an extension that wants to stop a call returns `Deny` ([05-hooks.md](05-hooks.md)).
 4. **`INTERRUPT_GRACE` is not the knob it looks like.** The shipped default is 150 ms (`crates/app/src/envd/worker.rs:96`), and an earlier draft of this document guessed `2.0` seconds — a twelve-fold error that mattered less than it appears, because D5 says the courtesy interrupt is "never the mechanism" (`PLAN.md` §D5). Tuning it only changes how long a well-behaved device gets to unwind before the kill; it cannot make an ill-behaved one stoppable. The real answer is the per-extension topology recorded above, not this number. It should still be a setting and it should still be observable in telemetry, because "how often does the grace window actually save an unwind" is the measurement that tells you whether cooperative unwinding is worth keeping at all.
 
+5. **Resolved (2026-08-20 ruling): `omp.EffectsNotAuthorized(invocation, spec)` carries `.invocation` (invocation id string) and `.spec` (the `OperationSpec` or its qualified-name string).** **Effect-authorization error payload.** The params exception table reduced the error to `EffectsNotAuthorized(str)` (`docs/py/03-params.md:501-502`), while the owning exception table specifies `EffectsNotAuthorized(invocation, spec)` (`docs/py/00-overview.md:963-964`); the competing readings were one prose string versus two structured positional fields.
+
 ### Revision 2 (post-review)
 
 Changes made in this file, and the ruling that drove each:
 
-- **Owns `omp.InvocationPhase` (P0#1, P0#3).** Deleted the two-state `omp.Phase = SPECULATION | EFFECT` machine and its name collision with the lifecycle enum; defined `OPEN → ARGS_FINALIZED → ADMISSION → ADMITTED → ASSISTANT_ITEM_COMMITTED → EFFECTS_AUTHORIZED → SETTLED` with the journal facts each transition fixes (`requested_args`; transformation trail + `effective_args` + admission receipt; effect-authorization timestamp; the settled `CallOutcome`). "Commit" is reserved for `ASSISTANT_ITEM_COMMITTED`; admission and effect authorization no longer borrow the word. `params.committed()` was rewritten in the machine's terms, `is_committed` became `is_authorized`, and the ADMITTED-but-abandoned path (assistant item never committed) is stated explicitly. Reversals recorded in prose in the concepts section and at `omp.InvocationPhase`.
-- **Re-scoped `IncomingParams` (P0#2).** The pull cursor is core-tool-internal machinery plus the future, explicitly decorated, not-in-v1 `@omp.streaming_device`; the v1 public device contract is `(args, ctx)` with final effective arguments, owned by [01-devices.md](01-devices.md). Patterns 3 and 5 were rewritten into the v1 contract; patterns 1–2 are labeled core-tool renderings; the build section's `streams_args` registration bit makes protocol selection a declaration. Reversal of Revision 1's "the only way a device sees its arguments" opener recorded in the scope note.
+- **Owns `omp.InvocationPhase` (P0#1, P0#3).** Deleted the two-state `Phase = SPECULATION | EFFECT` machine and its name collision with the lifecycle enum; defined `OPEN → ARGS_FINALIZED → ADMISSION → ADMITTED → ASSISTANT_ITEM_COMMITTED → EFFECTS_AUTHORIZED → SETTLED` with the journal facts each transition fixes (`requested_args`; transformation trail + `effective_args` + admission receipt; effect-authorization timestamp; the settled `CallOutcome`). "Commit" is reserved for `ASSISTANT_ITEM_COMMITTED`; admission and effect authorization no longer borrow the word. `params.committed()` was rewritten in the machine's terms, `is_committed` became `is_authorized`, and the ADMITTED-but-abandoned path (assistant item never committed) is stated explicitly. Reversals recorded in prose in the concepts section and at `omp.InvocationPhase`.
+- **Re-scoped `IncomingParams` (P0#2).** The pull cursor is core-tool-internal machinery plus the future, explicitly decorated, not-in-v1 `@streaming_device`; the v1 public device contract is `(args, ctx)` with final effective arguments, owned by [01-devices.md](01-devices.md). Patterns 3 and 5 were rewritten into the v1 contract; patterns 1–2 are labeled core-tool renderings; the build section's `streams_args` registration bit makes protocol selection a declaration. Reversal of Revision 1's "the only way a device sees its arguments" opener recorded in the scope note.
 - **Strict finalization (P0#14).** Charitable decoding repairs surface syntax only; `ARGS_FINALIZED` rejects duplicate canonical keys, canonical+alias pairs, and two-aliases-to-one-field as the new `ArgIssueKind.AMBIGUOUS` (seventh member); exact repairs are recorded; one canonical effective object is shared by policy, device, journal, and telemetry; malformed-tail documents never reach `EFFECTS_AUTHORIZED` (partial pulls are preview-only); open maps require the explicit `additional_properties=True` marker (`omp.Field`). `ArgObject.collect()` last-write-wins is deleted with the reversal recorded at `omp.ArgObject`, and the build section gained the finalizer work item.
 - **Hook alignment (P0#6).** The `supi-bash-timeout` example moved to `omp.HookPhase.TRANSFORM` with explicit `order` and the `(event, ctx)` ABI; the D6 passage states the settled scope reading (per-invocation decision procedure runs in Core; batch-level scheduling remains prohibited) and flags the recommended D6 wording amendment instead of contradicting the locked decision.
 - **Topology alignment (P0#10).** The D5/warm-pool passage, the failure table's sibling row, and old open question 0 were rewritten for the settled per-extension process topology (key `(layer, tier, extension)`, serialized callbacks, opt-in concurrency, SIGKILL per extension); the recommended D5 "warm pool of one" amendment is flagged, not silently applied to the citations.
-- **Global renames and vocabulary (§0).** Durable outcomes read `CallOutcome: Ok | Faulted | ArgsRejected | Aborted` wherever Revision 1 wrote `Verdict::…` for the journal (Rust `Verdict<P,F>` citations stay, as Rust); `omp.Uncommitted` → `omp.EffectsNotAuthorized` (owner [00-overview.md](00-overview.md)); example effect verbs use [11-env.md](11-env.md)'s real surface (`lease.edit`, `lease.hashline`, `omp.env.docs.transaction()` — whose `txn.commit()` is the document-domain transaction, noted as such); durations are `omp.Duration` everywhere (`deadline`, `INTERRUPT_GRACE`, the bash `timeout` field); every callback example uses the uniform `(payload, ctx)` ABI; field metadata rides `Annotated`/`omp.Field`, never field docstrings.
+- **Global renames and vocabulary (§0).** Durable outcomes read `CallOutcome: Ok | Faulted | ArgsRejected | Aborted` wherever Revision 1 wrote `Verdict::…` for the journal (Rust `Verdict<P,F>` citations stay, as Rust); `Uncommitted` → `omp.EffectsNotAuthorized` (owner [00-overview.md](00-overview.md)); example effect verbs use [11-env.md](11-env.md)'s real surface (`omp.env.docs.open`, `Doc.edit`, `Doc.hashline`, `omp.env.docs.transaction()`, and `omp.env.sh.session()` — whose `txn.commit()` is the document-domain transaction, noted as such); durations are `omp.Duration` everywhere (`deadline`, `INTERRUPT_GRACE`, the bash `timeout` field); every callback example uses the uniform `(payload, ctx)` ABI; field metadata rides `Annotated`/`omp.Field`, never field docstrings.
 
 **Revision 2.1** — the `dyn`/`@omp.tool` rulings addendum and the PLAN.md amendment:
 

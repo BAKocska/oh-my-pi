@@ -13,12 +13,16 @@ import struct
 import sys
 from collections import deque
 from dataclasses import dataclass
+from threading import Lock, Timer
 from typing import Any, BinaryIO
 
-from _omp import FrameTooLarge, HostDisconnected, _interrupt, _thread_id
+from _omp import HostDisconnected, _interrupt, _thread_id
 
-_MAX_FRAME_BYTES = 4 * 1024 * 1024
-_MAX_PENDING = 1024
+from . import _scope
+from ._errors import FrameTooLarge
+from .limits import CANCEL_GRACE, MAX_FRAME_BYTES, MAX_PENDING_EFFECTS
+
+_MAX_PENDING = MAX_PENDING_EFFECTS
 _effects: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("omp_effects", default=None)
 _reentrancy: contextvars.ContextVar[int] = contextvars.ContextVar("omp_control_depth", default=0)
 
@@ -28,6 +32,18 @@ class _Frame:
     kind: str
     correlation: int | None
     body: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _Dispatch:
+    """One live invocation and its pending cancellation escalation."""
+
+    task: asyncio.Task[Any]
+    thread_id: int
+    scope: _scope.Scope | None
+    escalation: Timer | None = None
+    cancel_started: bool = False
+
 
 class _Capture:
     """Line-buffered stream forwarding output as structured CONTROL logs."""
@@ -47,15 +63,25 @@ class _Capture:
 
 class Host:
     """Correlation-aware, reentrant CONTROL codec on one inherited descriptor."""
-    __slots__ = ("_fd", "_pending", "_next_id", "_mailbox", "_stdout", "_stderr", "_tasks")
+    __slots__ = (
+        "_fd",
+        "_lock",
+        "_pending",
+        "_next_id",
+        "_mailbox",
+        "_stdout",
+        "_stderr",
+        "_tasks",
+    )
     def __init__(self, fd: int) -> None:
         self._fd = fd
+        self._lock = Lock()
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 1
         self._mailbox: deque[dict[str, Any]] = deque()
         self._stdout: Any = None
         self._stderr: Any = None
-        self._tasks: dict[str, tuple[asyncio.Task[Any], int]] = {}
+        self._tasks: dict[str, _Dispatch] = {}
     @staticmethod
     def _decode(raw: bytes) -> _Frame:
         try:
@@ -74,13 +100,13 @@ class Host:
     def _read_frame(self) -> _Frame:
         header = self._read_exact(4)
         size = struct.unpack("!I", header)[0]
-        if size > _MAX_FRAME_BYTES:
-            raise FrameTooLarge(f"CONTROL frame is {size} bytes (limit {_MAX_FRAME_BYTES})")
+        if size > MAX_FRAME_BYTES:
+            raise FrameTooLarge(size, MAX_FRAME_BYTES)
         return self._decode(self._read_exact(size))
     def _write(self, value: dict[str, Any]) -> None:
         raw = json.dumps(value, separators=(",", ":")).encode()
-        if len(raw) > _MAX_FRAME_BYTES:
-            raise FrameTooLarge(f"CONTROL frame is {len(raw)} bytes (limit {_MAX_FRAME_BYTES})")
+        if len(raw) > MAX_FRAME_BYTES:
+            raise FrameTooLarge(len(raw), MAX_FRAME_BYTES)
         os.write(self._fd, struct.pack("!I", len(raw)) + raw)
     def effect(self, effect: dict[str, Any]) -> None:
         """Write one already-encoded, non-correlated UI effect frame."""
@@ -109,10 +135,38 @@ class Host:
         """Receive one frame and resolve a correlated request or queue an effect."""
         frame = self._read_frame()
         if frame.kind == "CancelDispatch":
-            task, thread_id = self._tasks.get(str(frame.body["invocation"]), (None, 0))
-            if task is not None:
-                task.cancel()
-                _interrupt(thread_id)
+            invocation = str(frame.body["invocation"])
+            with self._lock:
+                dispatch = self._tasks.get(invocation)
+                if (
+                    dispatch is None
+                    or dispatch.cancel_started
+                    or dispatch.task.done()
+                ):
+                    return
+                dispatch.cancel_started = True
+                timer = Timer(
+                    CANCEL_GRACE.seconds,
+                    self._interrupt_dispatch,
+                    (invocation, dispatch),
+                )
+                timer.daemon = True
+                dispatch.escalation = timer
+                first_cancel = (
+                    dispatch.scope is not None
+                    and _scope._request_cancel(dispatch.scope)
+                )
+            loop = dispatch.task.get_loop()
+            loop.call_soon_threadsafe(dispatch.task.cancel)
+            if first_cancel:
+                loop.call_soon_threadsafe(
+                    _scope._fire_cancel_callbacks,
+                    dispatch.scope,
+                    lambda error: self._log_cancel_callback_error(
+                        invocation, error
+                    ),
+                )
+            timer.start()
             return
         if frame.kind == "Effect":
             self._mailbox.append(frame.body)
@@ -139,13 +193,81 @@ class Host:
         """Return the next host-delivered effect without reentering the codec."""
         return self._mailbox.popleft() if self._mailbox else None
 
-    def track_dispatch(self, invocation: str, task: asyncio.Task[Any]) -> None:
-        """Record the asyncio task and Python thread for cancellation escalation."""
-        self._tasks[invocation] = (task, _thread_id())
+    def _log_cancel_callback_error(
+        self,
+        invocation: str,
+        error: BaseException,
+    ) -> None:
+        """Report a guarded cancellation callback failure without breaking CONTROL."""
+        try:
+            self.log(
+                "error",
+                "cancellation callback failed",
+                {
+                    "invocation": invocation,
+                    "error": repr(error),
+                },
+            )
+        except BaseException:
+            pass
+
+    def _interrupt_dispatch(
+        self,
+        invocation: str,
+        dispatch: _Dispatch,
+    ) -> None:
+        """Interrupt a dispatch only when it remains live after the grace."""
+        with self._lock:
+            if (
+                self._tasks.get(invocation) is not dispatch
+                or dispatch.task.done()
+            ):
+                return
+            dispatch.escalation = None
+            # Python owns stages 1-2 inside the interpreter; Rust owns stage 3.
+            _interrupt(dispatch.thread_id)
+
+    def _settle_if_current(
+        self,
+        invocation: str,
+        dispatch: _Dispatch,
+    ) -> None:
+        """Forget a dispatch only if it is still the invocation's live target."""
+        with self._lock:
+            if self._tasks.get(invocation) is not dispatch:
+                return
+            self._tasks.pop(invocation)
+        if dispatch.escalation is not None:
+            dispatch.escalation.cancel()
+
+    def track_dispatch(
+        self,
+        invocation: str,
+        task: asyncio.Task[Any],
+        scope: _scope.Scope | None = None,
+    ) -> None:
+        """Record the task, thread, and authority scope for cancellation."""
+        if scope is None:
+            try:
+                scope = _scope.current()
+            except RuntimeError:
+                pass
+        dispatch = _Dispatch(task, _thread_id(), scope)
+        with self._lock:
+            previous = self._tasks.get(invocation)
+            self._tasks[invocation] = dispatch
+        if previous is not None and previous.escalation is not None:
+            previous.escalation.cancel()
+        task.add_done_callback(
+            lambda _task: self._settle_if_current(invocation, dispatch)
+        )
 
     def settle_dispatch(self, invocation: str) -> None:
-        """Forget a settled invocation's cancellation target."""
-        self._tasks.pop(invocation, None)
+        """Forget a settled invocation and cancel its pending escalation."""
+        with self._lock:
+            dispatch = self._tasks.pop(invocation, None)
+        if dispatch is not None and dispatch.escalation is not None:
+            dispatch.escalation.cancel()
 
 def bootstrap(fd: int | None = None) -> Host:
     """Open the inherited CONTROL descriptor and install its explicit bridge."""

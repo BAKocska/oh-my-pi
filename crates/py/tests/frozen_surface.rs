@@ -22,16 +22,18 @@ from omp._scope import Scope
 def expect_raises(error_type, call):
     try:
         call()
-    except error_type:
-        return
+    except error_type as error:
+        return error
+    raise AssertionError(f"expected {error_type.__name__}")
     raise AssertionError(f"expected {error_type.__name__}")
 
 
 async def expect_raises_async(error_type, awaitable):
     try:
         await awaitable
-    except error_type:
-        return
+    except error_type as error:
+        return error
+    raise AssertionError(f"expected {error_type.__name__}")
     raise AssertionError(f"expected {error_type.__name__}")
 
 
@@ -54,6 +56,45 @@ for suffix in (
 
 registry_module = importlib.import_module("omp._registry")
 packages_module = importlib.import_module("omp.packages")
+
+
+def executable_declaration(declaration_id, kind, key):
+    return {
+        "id": declaration_id,
+        "kind": kind,
+        "module": "acme_ext.surface",
+        "key": key,
+        "trigger": "lazy",
+        "api": 1,
+        "failure": "fail-open",
+    }
+
+
+# Bidirectional manifest drift reports both a manifest-only declaration and a
+# decorator-only declaration without mutating the process registry.
+drift_registry = registry_module.DeclarationRegistry()
+drift_registry.configure_manifest(
+    extension="drift-test",
+    declarations=(
+        executable_declaration(
+            "manifest-only", "soft", "manifest_only@.1"
+        ),
+    ),
+)
+drift_registry.register_tool("decorated_only", "", 1, lambda: None)
+drift_error = expect_raises(omp.DeclarationDrift, drift_registry.freeze)
+assert drift_error.missing_declarations == frozenset({
+    ("soft", "manifest_only@.1"),
+})
+assert drift_error.undeclared_declarations == frozenset({
+    ("soft", "decorated_only@.1"),
+})
+assert "missing declarations" in str(drift_error)
+assert "undeclared declarations" in str(drift_error)
+assert "manifest_only@.1" in str(drift_error)
+assert "decorated_only@.1" in str(drift_error)
+
+
 packages_module._install_snapshot(
     [
         {
@@ -75,8 +116,150 @@ registry_module.configure_manifest(
                 "description": "Review a change.",
             },
         },
+        executable_declaration("offline-device", "soft", "offline_device@.1"),
+        executable_declaration("surface-device", "soft", "surface_device@.1"),
+        executable_declaration(
+            "argument-metadata-device",
+            "soft",
+            "arg_metadata_device@arg-contract.3",
+        ),
+        executable_declaration(
+            "surface-inspect-detail",
+            "soft",
+            "surface_device/inspect/detail@.1",
+        ),
+        executable_declaration(
+            "surface-inspect-annotated",
+            "soft",
+            "surface_device/inspect/annotated@surface-routes.1",
+        ),
+        executable_declaration(
+            "surface-mounted-status",
+            "soft",
+            "surface_device/mounted/status/detail@.1",
+        ),
+        executable_declaration("compaction-hook", "hook", "compaction/domain"),
+        executable_declaration(
+            "sandbox-profile-hook", "hook", "sandbox_profile/transform"
+        ),
+        executable_declaration(
+            "sandbox-violation-hook", "hook", "sandbox_violation/domain"
+        ),
+        executable_declaration(
+            "provider-usage-hook", "hook", "provider_usage/domain"
+        ),
+        executable_declaration(
+            "search-parse-hook", "hook", "search_parse/domain"
+        ),
+        executable_declaration(
+            "models-discover-hook", "hook", "models_discover/domain"
+        ),
+        executable_declaration(
+            "provider-refresh-hook", "hook", "provider_refresh/domain"
+        ),
+        executable_declaration("managed-command", "command", "managed"),
+        executable_declaration(
+            "copy-cut-shortcut", "shortcut", "ctrl+shift+x"
+        ),
+        executable_declaration(
+            "duplicate-ui-renderer",
+            "verdict_renderer",
+            "__duplicate_ui__@ui.1",
+        ),
+        executable_declaration(
+            "decorated-ui-renderer",
+            "verdict_renderer",
+            "__decorated_ui__@ui.1",
+        ),
+        executable_declaration(
+            "discovery-provider", "provider", "discovery-test"
+        ),
+        executable_declaration(
+            "overlay-provider", "provider", "overlay-provider"
+        ),
+        executable_declaration(
+            "round5-bare-provider", "provider", "round5-bare-provider"
+        ),
+        executable_declaration(
+            "model-request-telemetry", "telemetry", "model_request"
+        ),
     ),
 )
+
+
+# Shared exception payloads remain inspectable across the frozen boundary.
+manifest_error = omp.ManifestError("omp.toml", "extension.name", "missing")
+assert (
+    manifest_error.path,
+    manifest_error.key,
+    manifest_error.detail,
+) == ("omp.toml", "extension.name", "missing")
+declaration_limit = omp.DeclarationLimit(257, 256)
+assert (declaration_limit.count, declaration_limit.limit) == (257, 256)
+duplicate_registration = omp.DuplicateRegistration("surface", "acme.incumbent")
+assert (
+    duplicate_registration.name,
+    duplicate_registration.holder,
+) == ("surface", "acme.incumbent")
+declaration_sealed = omp.DeclarationSealed("surface")
+assert declaration_sealed.name == "surface"
+capability_error = omp.CapabilityError("network:egress")
+assert capability_error.capability == "network:egress"
+trust_error = omp.TrustError("trusted", "untrusted")
+assert (trust_error.required, trust_error.actual) == ("trusted", "untrusted")
+effect_spec = object()
+effects_error = omp.EffectsNotAuthorized("invoke-1", effect_spec)
+assert (
+    effects_error.invocation,
+    effects_error.spec,
+) == ("invoke-1", effect_spec)
+deadline = omp.Duration("250ms")
+deadline_error = omp.DeadlineExceeded(deadline)
+assert deadline_error.deadline is deadline
+frame_error = omp.FrameTooLarge(67_108_865, 67_108_864)
+assert (frame_error.actual, frame_error.limit) == (67_108_865, 67_108_864)
+api_error = omp.ApiLevelError(2, frozenset({1}))
+assert (api_error.requested, api_error.supported) == (2, frozenset({1}))
+
+
+def raise_error(error):
+    raise error
+
+
+for family_error in (
+    omp.urls.SelectorError("invalid selector"),
+    omp.hooks.HookContractError("invalid hook"),
+    omp.packages.PackageError("invalid package"),
+    omp.prompts.UnknownSlot("invalid prompt slot"),
+    omp.telemetry.TelemetryError("invalid telemetry"),
+    omp.placement.WorkerUnavailable("invalid placement"),
+):
+    expect_raises(
+        omp.OmpError,
+        lambda family_error=family_error: raise_error(family_error),
+    )
+
+assert issubclass(omp.urls.SelectorError, omp.urls.UrlError)
+assert issubclass(omp.urls.UrlError, omp.OmpError)
+assert issubclass(omp.urls.UrlError, ValueError)
+
+assert omp.MAX_FRAME_BYTES == 67_108_864
+assert omp.limits.MAX_FRAME_BYTES == 67_108_864
+assert all(
+    hasattr(omp, name) and hasattr(omp.limits, name)
+    for name in ("CANCEL_GRACE", "SHUTDOWN_GRACE", "HEALTH_TIMEOUT")
+)
+assert omp.CANCEL_GRACE == omp.Duration("150ms")
+
+
+@dataclasses.dataclass(frozen=True)
+class CodecSample:
+    label: str
+    count: int
+
+
+codec_sample = CodecSample("frozen", 3)
+assert omp.loads(omp.dumps(codec_sample), CodecSample) == codec_sample
 
 # Compaction is a domain hook, not a phased observation hook.
 @omp.hook("compaction")
@@ -290,6 +473,10 @@ assert asyncio.run(surface_device()) == 42
 
 # Telemetry identity, fail-open instruments, and declarative export.
 telemetry = importlib.import_module("omp.telemetry")
+assert telemetry.MAX_INSTRUMENTS == 256
+assert telemetry.MAX_CARDINALITY == 1024
+assert "MAX_INSTRUMENTS" in telemetry.__all__
+assert "MAX_CARDINALITY" in telemetry.__all__
 counter = telemetry.counter("cache.hits", unit="1", description="d")
 assert counter.name == "omp.ext.acme-ext.cache.hits"
 expect_raises(
@@ -464,7 +651,7 @@ assert provider_module.ErrorKind.RATE_LIMITED.value == "rate_limited"
 assert omp.env.DocEventKind.WATCH_RESCANNED.value == "watch_rescanned"
 spill = omp.Spill(b"payload", media_type="text/plain")
 assert spill.value == b"payload" and spill.media_type == "text/plain"
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.workers.restart("missing")))
+asyncio.run(expect_raises_async(omp.OmpError, omp.workers.restart("missing")))
 
 # Streaming device frames: typed progress and terminal results round-trip.
 update = omp.Update(stage="running")
@@ -590,8 +777,15 @@ def register_duplicate_ui_renderer():
     @omp.renderer("__duplicate_ui__", family="ui", rev=1)
     def duplicate_ui_renderer(view, ctx):
         return None
-expect_raises(omp.ui.DuplicateRenderer, register_duplicate_ui_renderer)
+duplicate_renderer = expect_raises(
+    omp.ui.DuplicateRenderer,
+    register_duplicate_ui_renderer,
+)
 assert omp.DuplicateRenderer is omp.ui.DuplicateRenderer
+assert issubclass(omp.DuplicateRenderer, omp.DuplicateRegistration)
+assert duplicate_renderer.name == "('__duplicate_ui__', 'ui', 1)"
+assert duplicate_renderer.holder.endswith("first_ui_renderer")
+assert duplicate_renderer.claimant.endswith("duplicate_ui_renderer")
 
 # Argument metadata: Field and Coerce lower once into the per-revision registry.
 argument_field = omp.Field(
@@ -614,6 +808,22 @@ async def arg_metadata_device(
     count: typing.Annotated[int, argument_field],
 ):
     return count
+
+
+def register_reserved_do_parameter():
+    @omp.device("reserved_do_parameter")
+    async def reserved_do_parameter(do_):
+        return do_
+
+
+def register_reserved_suffix_parameter():
+    @omp.device("reserved_suffix_parameter")
+    async def reserved_suffix_parameter(value_):
+        return value_
+
+
+expect_raises(omp.SchemaError, register_reserved_do_parameter)
+expect_raises(omp.SchemaError, register_reserved_suffix_parameter)
 
 
 # Discovery and trust: typed declarations and phase-free model projection.

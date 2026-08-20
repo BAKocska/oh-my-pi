@@ -28,34 +28,14 @@ use pyo3::{
 };
 
 create_exception!(_omp, OmpError, PyException, "Base class for omp runtime failures.");
-create_exception!(_omp, ManifestError, OmpError, "An extension manifest is invalid.");
-create_exception!(
-	_omp,
-	ApiLevelError,
-	ManifestError,
-	"The requested omp API level is unsupported."
-);
-create_exception!(_omp, DeclarationLimit, ManifestError, "The declaration limit was exceeded.");
-create_exception!(_omp, CapabilityError, OmpError, "A required capability was not granted.");
-create_exception!(_omp, TrustError, CapabilityError, "The active trust tier is insufficient.");
-create_exception!(
-	_omp,
-	DuplicateRegistration,
-	OmpError,
-	"A declaration collides with an incumbent."
-);
-create_exception!(_omp, DeclarationSealed, OmpError, "A declaration ran after the registry froze.");
-create_exception!(
-	_omp,
-	EffectsNotAuthorized,
-	OmpError,
-	"The invocation has not authorized effects."
-);
-create_exception!(_omp, DeadlineExceeded, OmpError, "The active invocation deadline elapsed.");
 create_exception!(_omp, HostDisconnected, OmpError, "The host CONTROL channel disconnected.");
-create_exception!(_omp, FrameTooLarge, OmpError, "An encoded extension frame exceeds its bound.");
 create_exception!(_omp, EnvUnavailable, OmpError, "No Environment exists at this placement.");
-create_exception!(_omp, PlacementError, OmpError, "A resource is unavailable at this placement.");
+create_exception!(
+	_omp,
+	PlacementError,
+	OmpError,
+	"A placement declaration or execution claim cannot be honored."
+);
 create_exception!(
 	_omp,
 	StaleGeneration,
@@ -1201,17 +1181,7 @@ fn _omp(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 		};
 	}
 	add_exception!(OmpError);
-	add_exception!(ManifestError);
-	add_exception!(ApiLevelError);
-	add_exception!(DeclarationLimit);
-	add_exception!(CapabilityError);
-	add_exception!(TrustError);
-	add_exception!(DuplicateRegistration);
-	add_exception!(DeclarationSealed);
-	add_exception!(EffectsNotAuthorized);
-	add_exception!(DeadlineExceeded);
 	add_exception!(HostDisconnected);
-	add_exception!(FrameTooLarge);
 	add_exception!(EnvUnavailable);
 	add_exception!(PlacementError);
 	module.add_function(wrap_pyfunction!(_scheme_snapshot, module)?)?;

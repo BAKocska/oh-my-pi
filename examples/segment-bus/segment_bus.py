@@ -59,17 +59,14 @@ class PublishReceipt:
     bytes: int
 
 
-class PublisherQuotaExceeded(ValueError):
-    """Refusal raised before state changes when a publisher exceeds a quota."""
+def _refuse(publisher: str, quota: str, limit: int, actual: int) -> omp.QuotaExceeded:
+    """Build the core quota refusal for a caller exceeding its slot allowance."""
 
-    def __init__(self, publisher: str, quota: str, limit: int, actual: int) -> None:
-        super().__init__(
-            f"publisher {publisher!r} exceeds {quota} quota: {actual} > {limit}"
-        )
-        self.publisher = publisher
-        self.quota = quota
-        self.limit = limit
-        self.actual = actual
+    error = omp.QuotaExceeded(f"segments.publish.{quota}", None)
+    error.publisher = publisher
+    error.limit = limit
+    error.actual = actual
+    return error
 
 
 _segments_by_publisher: dict[str, tuple[Segment, ...]] = {}
@@ -142,7 +139,7 @@ class SegmentPublisherService:
         if not isinstance(segments, tuple):
             raise TypeError("PublishRequest.segments must be a tuple")
         if len(segments) > MAX_SEGMENTS_PER_PUBLISHER:
-            raise PublisherQuotaExceeded(
+            raise _refuse(
                 publisher,
                 "segments",
                 MAX_SEGMENTS_PER_PUBLISHER,
@@ -158,7 +155,7 @@ class SegmentPublisherService:
 
         payload_bytes = _payload_bytes(segments)
         if payload_bytes > MAX_BYTES_PER_PUBLISHER:
-            raise PublisherQuotaExceeded(
+            raise _refuse(
                 publisher,
                 "bytes",
                 MAX_BYTES_PER_PUBLISHER,

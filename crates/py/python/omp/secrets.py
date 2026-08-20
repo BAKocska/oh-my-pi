@@ -7,10 +7,16 @@ installed, both operations fail closed with :class:`omp.NotWiredError`.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 
 from ._errors import NotWiredError
+
+
+_MASKED_PLACEHOLDER = re.compile(
+    r"\$\$(?:[A-Z][A-Z0-9_]*_)?[0-9a-z]{12}(?::[ULCM])?\$\$"
+)
 
 
 class SecretKind(StrEnum):
@@ -53,10 +59,18 @@ def mask(text: str) -> str:
     raise NotWiredError("omp.secrets.mask")
 
 
+def is_masked(text: str) -> bool:
+    """Return whether text contains a canonical reversible secret placeholder."""
+    if not isinstance(text, str):
+        raise TypeError("is_masked expects a string")
+    return _MASKED_PLACEHOLDER.search(text) is not None
+
+
 __all__ = (
     "SecretKind",
     "SecretMode",
     "SecretRule",
     "declare",
+    "is_masked",
     "mask",
 )

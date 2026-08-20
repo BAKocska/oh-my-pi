@@ -5,8 +5,8 @@
 `family@rev` · `schema_rev` vs `artifact_digest` · the spill gate
 
 The file keeps its historical name, and "verdict" survives in prose as the informal noun
-for a settled call's durable outcome; the *symbol* `omp.Verdict` is gone (renamed — see
-`omp.CallOutcome`).
+for a settled call's durable outcome; the former `Verdict` symbol in the `omp` namespace
+is gone (renamed — see `omp.CallOutcome`).
 
 ## Purpose
 
@@ -173,15 +173,18 @@ def dumps(value: object) -> bytes: ...
 def loads(data: bytes, shape: type[T]) -> T: ...
 ```
 
-The canonical codec for verdict values. `dumps` produces deterministic bytes — object keys
-in declaration order, no insignificant whitespace, integers never widened to floats — which
-is what makes `blake3(verdict)` a usable cache key and a rebuilt transcript byte-stable.
+The canonical codec for verdict values. `dumps` produces deterministic UTF-8 bytes — object keys in sorted order, no insignificant
+whitespace, no non-finite floats, and integers never widened to floats — which is what
+makes `blake3(verdict)` a usable cache key and a rebuilt transcript byte-stable.
 `loads` decodes against an explicit `shape`, which is required rather than inferred because
 a `lift()` step must decode a *previous* revision's types (see `omp.RecordedCall`).
 
-`loads` raises `omp.VerdictShapeError` when the bytes do not match `shape`. It is not
-charitable: verdicts are machine-written, so a mismatch is a bug, not a repairable
-emission. Charitable decoding applies to model-written *arguments* only
+`loads` raises `omp.VerdictShapeError` when the bytes are not valid UTF-8 JSON, contain
+trailing data, or do not match `shape` exactly. Fields annotated `Any` or `object` are an
+explicit canonical-JSON passthrough: their nested values are preserved without further
+shape narrowing, while sorted keys, unique keys, and finite numbers remain mandatory.
+It is not charitable: verdicts are machine-written, so a mismatch is a bug, not a
+repairable emission. Charitable decoding applies to model-written *arguments* only
 (`docs/py/03-params.md`).
 
 - **Channel** — CONTROL (the serialized verdict rides the invocation's terminal frame).
@@ -257,8 +260,8 @@ expected shape, a worked example, the conflicting ranges — as fields.
 
 `Fault` is a **value, never an exception base**. It does not derive from `BaseException`,
 and nothing may inherit from both. The one sanctioned bridge between the two worlds is
-`omp.EnvError` (`docs/py/11-env.md`): an `Exception` subclass that *carries* a `Fault` as
-its `.fault` attribute. When a known `EnvError` escapes `call()`, the framework catches it
+`omp.env.EnvError` (`docs/py/11-env.md`): an `Exception` subclass that *carries* a `Fault`
+as its `.fault` attribute. When a known `EnvError` escapes `call()`, the framework catches it
 and lowers `exc.fault` to `Faulted` — ergonomic exception-based control flow, durable
 typed truth. An arbitrary exception settles as `omp.Aborted` with the traceback journaled,
 which tells the model only that something broke; reserve that path for genuine bugs.
@@ -295,8 +298,9 @@ type CallOutcome[P: Payload, F: Fault] = Ok[P] | Faulted[F] | ArgsRejected | Abo
 The four durable branches of a settled call. Exactly one is journaled per call. The union
 is closed; extensions produce the first two, the harness and Core produce the last two.
 
-**Renamed (review P0#1).** Revision 1 called this type `omp.Verdict` — and so did
-`docs/py/05-hooks.md`, for the *hook decision* union `Allow | Deny | Modify | Defer`. Two
+**Renamed (review P0#1).** Revision 1 called this type `Verdict` in the `omp` namespace —
+and so did `docs/py/05-hooks.md`, for the *hook decision* union
+`Allow | Deny | Modify | Defer`. Two
 flagship types sharing one name in one namespace was an outright collision, not a nuance,
 so both sides renamed: the durable call outcome is `omp.CallOutcome`, the hook decision is
 `omp.HookDecision` (`docs/py/05-hooks.md`). The four arms are unchanged and stay aligned
@@ -337,6 +341,11 @@ class Aborted:
     policy: PolicyDenied | None = None
 ```
 
+When device code yields the terminal event form `omp.Aborted(abort)`, the constructor derives
+`SKIPPED` from `Abort.kind == "skipped"` and `CANCELLED` from the other device-producible
+abort kinds. `POLICY_DENIED` is host-owned and always requires the explicit `kind` and
+`policy` payload; it cannot be produced by that one-argument convenience.
+
 ##### `omp.AbortKind`
 
 ```python
@@ -368,12 +377,16 @@ in the system. `omp.ArgIssue` is defined in `docs/py/03-params.md` (charitable d
 
 ```python
 @dataclasses.dataclass(frozen=True, slots=True)
-class PolicyDenied:
+class PolicyDenied(omp.OmpError):
     reason: str
-    code: str | None
+    code: str
     decision_id: str
     rules: tuple[omp.RuleRef, ...]
 ```
+
+**Resolved (2026-08-20 ruling):** `PolicyDenied` is a frozen dataclass deriving
+`omp.OmpError`, and `code` is required. It is both the structured payload carried by
+`Aborted` and a raisable exception with the same durable fields.
 
 The structured form of a policy denial, carried as
 `Aborted(kind=AbortKind.POLICY_DENIED, policy=...)`. Keeping denial *inside* the `Aborted`
@@ -401,7 +414,7 @@ class PostconditionStatus(enum.Enum):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Postcondition:
-    status: PostconditionStatus
+    status: omp.PostconditionStatus
     reason: str
     code: str | None
     decision_id: str
@@ -744,7 +757,14 @@ class View[U, P: Payload, F: Fault]:
     verdict: CallOutcome[P, F] | None
     elapsed: omp.Duration
     phase: omp.InvocationPhase
+    presentation: Mapping[str, object] = dataclasses.field(
+        default_factory=lambda: MappingProxyType({})
+    )
 ```
+
+**Resolved (2026-08-20 ruling):** `presentation` is the eighth `View` field. It defaults
+to an empty read-only mapping and carries the host-materialized immutable presentation
+snapshot described by `docs/py/07-ui.md:1509-1514`.
 
 The fold state handed to a renderer. One object serves both the live and the settled
 render; `verdict is None` distinguishes them.
@@ -758,6 +778,7 @@ render; `verdict is None` distinguishes them.
 | `verdict` | `None` while the call is live; the settled four-branch verdict afterwards. |
 | `elapsed` | Monotonic time since the invocation opened, as an `omp.Duration` (`docs/py/00-overview.md`) — Revision 1's `elapsed_ms: int` went with every other unit-suffixed field (§0 rename table). Advisory; the renderer must stay deterministic *given* it, and the harness quantizes it so repaints do not thrash. |
 | `phase` | The `omp.InvocationPhase` the invocation has reached (`docs/py/03-params.md` owns the machine). Revision 1 exposed `committed: bool`, "whether the commit frame has arrived"; "commit" is now reserved for `ASSISTANT_ITEM_COMMITTED` (P0#3), and a bool cannot say which of seven states a call is in. A third-party device body only starts at `EFFECTS_AUTHORIZED` (v1), so its live renders never see an earlier phase; core streaming tools may. |
+| `presentation` | Read-only `Mapping[str, object]` materialized by the host from the extension's declared presentation state. The immutable snapshot is shared with `RenderCtx`, defaults empty, and binds the host's presentation-cache entry (`docs/py/07-ui.md:1509-1514`). |
 
 ### Revisions
 
@@ -1840,8 +1861,9 @@ Design points:
   Rust, and a validation failure is the fail-open path (harness fallback row).
 - Per-frame CONTROL round trips for a *live* renderer are the concerning path: a device
   emitting updates at 30 Hz would drive 30 RTT/s. Mitigation: the host pushes the rendered
-  `Tml` as a *state effect* (same mechanism as `omp.ui.set_slot`), coalesced by the host at
-  a frame budget, rather than the TUI pulling. The TUI never blocks on Python.
+  `Tml` as a state effect (the same mechanism exposed by `omp.ui.mount` and
+  `SlotHandle.set`), coalesced by the host at a frame budget, rather than the TUI pulling.
+  The TUI never blocks on Python.
 - Ownership: `docs/py/07-ui.md` owns `Tml`, `RenderCtx`, and the effect channel; this
   document owns the `(name, rev)` keying and the fold semantics.
 
@@ -2187,12 +2209,16 @@ what the ruling resolved, what it did not, and does not claim the residue is saf
    Both should be settled before any concurrent-device workload ships, because each
    changes what a cancellation verdict *means*.
 
+9. **Resolved (2026-08-20 ruling): `PolicyDenied` is the frozen dataclass deriving `omp.OmpError` with required `code: str`; it is both a carriable `Aborted` payload and raisable.** **Policy denial shape.** The prose sketch made `code` optional and did not derive from the exception root (`docs/py/02-verdicts.md:367-377`), while the frozen surface requires `code` and derives from `OmpError` (`crates/py/python/omp/policy.py:672-681`); the competing readings were an optional payload-only record versus the frozen required-code payload exception.
+
+10. **Resolved (2026-08-20 ruling): `View.presentation` is a real eighth field, a host-materialized immutable `Mapping[str, object]` snapshot defaulting to an empty read-only mapping.** **Renderer presentation input.** The verdict-owned `View` sketch and table exposed seven fields and omitted presentation (`docs/py/02-verdicts.md:738-760`), while the UI contract requires the synchronous fold input to carry the same immutable presentation snapshot as `RenderCtx` (`docs/py/07-ui.md:1487-1514`); the competing readings were no presentation field versus a real host-materialized field.
+
 ### Revision 2 (post-review)
 
 Changes made in this file, and the review points that drove them:
 
-- **P0#1 — `omp.Verdict` → `omp.CallOutcome`.** The durable outcome type collided with
-  `docs/py/05-hooks.md`'s decision type of the same name; renamed file-wide (title, symbol
+- **P0#1 — `Verdict` in the `omp` namespace → `omp.CallOutcome`.** The durable outcome
+type collided with `docs/py/05-hooks.md`'s decision type of the same name; renamed file-wide (title, symbol
   list, both diagrams, `View.verdict`'s type, the compaction table, the lift example's
   `omp.loads` call). The Rust `Verdict<P, F>` (`crates/tool/src/lib.rs:251`) keeps its
   name; the four arms are unchanged. Reversal recorded under `omp.CallOutcome`, and
@@ -2206,7 +2232,7 @@ Changes made in this file, and the review points that drove them:
   never a rewritten `Ok`. The failure table gained the admission-denial row; build item 7
   notes telemetry reads `AbortKind`/`PolicyDenied` fields, never prose.
 - **P0#16 — `Fault` is a value.** `omp.Fault` now states it is never an exception base;
-  `omp.EnvError(Exception)` (`docs/py/11-env.md`) *carries* `.fault`, the framework lowers
+  `omp.env.EnvError(Exception)` (`docs/py/11-env.md`) *carries* `.fault`, the framework lowers
   known `EnvError` → `Faulted` and arbitrary exceptions → `Aborted`. The reversal of
   11-env's "EnvError derives from omp.Fault" is recorded in prose.
 - **UX#5 — `schema_rev` vs `artifact_digest`.** New Revisions subsection specifying the

@@ -1,6 +1,6 @@
 # Extension examples
 
-One hundred twelve ports of real pi-ecosystem extensions onto the omp Python
+One hundred nineteen extensions onto the omp Python extension
 layer (`crates/py/python/omp`). Each directory is one extension: an `omp.toml`
 manifest, the Python module(s), and a README stating what the pi original did,
 how the omp shape differs, and — load-bearing — a **Gaps** section listing every
@@ -118,8 +118,9 @@ distance.
 | `native-grounding/` | `@pokutuna/pi-google-genai` | provider-native tools as model caps, not proxy devices | `docs/py/13` |
 | `welcome-chrome/` | `@zeerke/ascet-copilot-ui` | welcome scene, recent-session rows, title set/restore, zero timers | `docs/py/07` |
 | `segment-bus/` | `@juanibiapina/pi-powerbar` | `@omp.service` producer/owner bus with per-publisher quotas | `docs/py/00 §Extension services` |
-| `pr-review/` | `pi-pr-review` | tiered reviewer waves, schema-validated findings, sanitized rail | `docs/py/12` || `patch-dialect/` | `mitsupi` (edit-surface cohort) | third edit family `patch@1`, 3-family `lift()` chain, 02 q3 evidence | `docs/py/02 §3` |
-| `resource-receipts/` | `@narumitw/pi-usage` + `@sreetej510/pi-usage` (derived) | `omp.resources()` receipt, `QuotaExceeded` degradation, hand-rolled quotas deleted | `docs/py/00`, `docs/py/04` |
+| `pr-review/` | `pi-pr-review` | tiered reviewer waves, schema-validated findings, sanitized rail | `docs/py/12` |
+| `patch-dialect/` | `mitsupi` (edit-surface cohort) | third edit family `patch@1`, 3-family `lift()` chain, 02 q3 evidence | `docs/py/02 §3` |
+| `resource-receipts/` | `@narumitw/pi-usage` + `@sreetej510/pi-usage` (derived) | `omp.resources()` receipt, `QuotaExceeded` degradation, self-accounting deleted | `docs/py/00`, `docs/py/04` |
 | `trust-gates/` | `pi-sandbox` | `omp.Trust` tier branching, degrade-never-fail | `docs/py/00`, `docs/py/06` |
 | `grant-widening/` | `pi-sandbox` (policy-safety cohort) | `Amend(approval=)` session-scope widening, external approver decision | `docs/py/06 §Approvals` |
 | `org-registry/` | `@7n/rules` (derived) | `StateScope.ORGANIZATION` registry, `StateScopeDenied` fallback overlay | `docs/py/09 §omp.state` |
@@ -390,3 +391,126 @@ device-decode and journal-replay paths, so `SchemaError(DeviceError,
 JournalError)` keeps both documented contracts true. The three finding ports
 were reconciled to the landed surface and are gap-free.
 
+
+**Parallel-round reconciliation (2026-08-20).** Round 7 was run twice
+concurrently against the same six target surfaces, under two naming schemes.
+The duplicate set (`resource-budget/`, `trust-tiers/`, `grant-widen/`,
+`org-notes/`, `retro-trim/`) was removed in favour of the ports above, which
+did the discovery; `patch-dialect/` is shared and retains the three-family
+edge-count evidence. Two results survive from the removed set because they
+refine the findings rather than restate them:
+
+- **`ResourceReceipt` replaces self-accounting, not admission policy.** The
+  duplicate concluded the receipt could *not* subsume the two earlier
+  hand-rolled quota sites; the surviving port claimed it deleted both.
+  Reconciled in `resource-receipts/README.md`: `segment-bus/` dropped its
+  custom `PublisherQuotaExceeded` for `omp.QuotaExceeded` (the mechanism the
+  receipt genuinely deletes) but keeps its per-publisher maxima, which
+  apportion the slot it owns among sibling callers — something a
+  per-extension receipt cannot describe. `tool-toggle/` needed no change: its
+  schema costs already come from frozen `DeviceInfo` rows.
+- **Concurrent rounds hide gaps.** Five of the six duplicates came back
+  gap-free precisely because the surviving ports' three findings
+  (`JournalError` base, `DropParts` arm, `QuotaExceeded` payload) were closed
+  while the duplicates were still running. A gap-free result is only evidence
+  when the layer held still underneath it.
+
+## Round 8 — adversarial audit (2026-08-20, 4 audits + 7 probes)
+
+Method change: seven rounds of feature-porting had converged, so this round
+attacked the surface instead of sampling it — mechanical bidirectional
+doc↔code diffs, boundary/limit probes, and multi-extension conflict tests.
+Seven conformance probes landed under `examples/` (`limits-probe/`,
+`malformed-probe/`, `fencing-probe/`, `cancel-probe/`, `precedence-conflict/`,
+`patch-conflict/`, `determinism-probe/` — no pi origin; each drives a contract
+to its boundary and asserts the documented refusal) plus one re-runnable gate,
+`scripts/check-docs-surface.py`. Highest-yield round of the eight.
+
+**Closed (2026-08-20 remediation).** Everything below is the audit record, not
+live state: all 15 code defects are fixed, the 257 drift entries are closed
+(`check-docs-surface.py` now reports 0), the 8 docs self-contradictions and
+underspecified contracts are ruled and recorded in the owning docs'
+Open-questions sections, and the six enum divergences are resolved. Each
+probe's README carries the re-observed matrix and per-finding closure records;
+the one known remaining gap is agent-side (`crates/agent/src/context.rs`
+`apply_patches` still short-circuits per-sequence instead of the ruled per-op
+drop), recorded in `patch-conflict/README.md`.
+
+### Live code defects (not drift)
+
+| # | Defect | Found by | Where |
+|---|---|---|---|
+| 1 | **Two distinct `PlacementError` classes** — `WorkerUnavailable`/`ShipError`/`BoundaryError` derive from a private `placement.PlacementError(RuntimeError)`, so `except omp.PlacementError` (the native `OmpError` subclass) does **not** catch them | error audit | `placement.py:25-32`, `__init__.py:23-58,426-443` |
+| 2 | **`except omp.OmpError` does not catch everything** despite 00:952 — hook, UI, url, package, prompt, telemetry, and private-placement errors all sit outside the umbrella | error audit | 7 modules |
+| 3 | **Cancellation grace ladder collapsed** — `task.cancel()` and `_interrupt(thread_id)` fire back-to-back, so D5's `CANCEL_GRACE` unwind window never exists; `crates/app/src/exthost/cancel.rs:67-83`'s staged delays are dead code | `cancel-probe/` | `_host.py:111-115` |
+| 4 | **`ctx.on_cancel` callbacks never fire** — stored only; `Scope.cancelled` is never set on `CancelDispatch` | `cancel-probe/` | `_context.py:111-134`, `_host.py:108-116` |
+| 5 | **TML byte/depth ceilings unenforced** — `_validate` never reads `TML_MAX_BYTES`/`TML_MAX_DEPTH`; depth 65 constructs fine, contra the reject-before-allocate rule | `limits-probe/`, `malformed-probe/` | `ui/__init__.py:102-152` |
+| 6 | **`MAX_FRAME_BYTES` 16× divergence** — documented 67 108 864, privately enforced 4 194 304 | `limits-probe/` | `_host.py:20,76-83` |
+| 7 | **`MAX_DECLARATIONS` bypassable** — completion/message_renderer/verdict_renderer write UI-local dicts, skipping `_insert`, so 256 can be exceeded without `DeclarationLimit` | declaration audit | `ui/__init__.py:758-834` |
+| 8 | **Metric instruments unbounded** — 1 025 counters created without refusal; the quotas are promised but numerically unspecified | `limits-probe/` | `telemetry.py:240-330` |
+| 9 | **`WorkerHandle.call` drops its generation** and wraps stale-generation as `WorkerUnavailable` instead of `StaleGeneration` | `fencing-probe/` | `placement.py:134-150,213-218` |
+| 10 | **Manifest drift never checked at FREEZE** — `_manifest_tools`/`_hooks`/`_services` are written and never read; `DeclarationDrift` is dead code | declaration audit | `_registry.py:372-375,780-841` |
+| 11 | **Executable declaration rows cannot be ingested** — `configure_manifest(declarations=)` decodes every row as `ContentDeclaration` (4 content kinds), so command/renderer/completion rows in real manifests never reach the registry | declaration audit | `_registry.py:337-375` |
+| 12 | **Reserved parameter names survive** — `do_` and trailing-underscore params pass schema derivation instead of raising activation-time `SchemaError` | `malformed-probe/` | `_registry.py:1071-1119` |
+| 13 | **`omp.ui.__all__` leaks imports** — `Any`, `Callable`, `ContextVar`, `MappingProxyType`, `dataclass`, `field`, `annotations` are public exports | symbol audit | `ui/__init__.py` |
+| 14 | **No activation-trigger class is ever set** — no Definition record or snapshot carries `trigger`; static/lazy/eager-prompt/eager-ui are all absent in practice. Three kinds are also recorded but absent from `DeclarationSnapshot` | declaration audit | `_registry.py:83-255` |
+| 15 | **`TmlError.at` is a code-point offset, not the documented byte offset** | `malformed-probe/` | `ui/__init__.py:102-130` |
+
+### Surface drift, measured exhaustively
+
+`scripts/check-docs-surface.py` inventories 1 590 documented spellings against
+1 372 frozen exports and reports **257 drift entries** (157 documented-but-absent,
+100 frozen-but-undocumented), each citing doc line and frozen module. Clusters:
+the entire params/finalizer family (`IncomingParams`, `ArgFault`, `ArgIssue`,
+`ArgIssueKind`, `Abort`), ~25 exception classes, `omp.dumps`/`omp.loads`,
+`journal.decode` plus its six error types, telemetry constants and
+`TelemetryError`/`QueryError`, `DOCS_TOTAL_BUDGET`, `MAX_PENDING_EFFECTS`; and
+in the other direction `omp.index.*` errors that are raised but documented
+nowhere.
+
+**Enum vocabularies diverge badly** (41 compared): `Capability` frozen has 3
+members against 22 documented (20 missing, 1 extra `SCHEDULES_PROJECT`);
+`SessionStatus` overlaps on only `ABORTED` (4 frozen vs 6 documented);
+`SessionKind` missing `EVAL`; `GroupBy` missing `KIND`/`DAY`; `Bucket` extra
+`MONTH`; `TitleSource` `USER|MODEL|SYSTEM` vs documented `AUTO|USER`.
+
+**Native exceptions carry no payload** — `create_exception!` declares none, so
+`ManifestError.path/key/detail`, `ApiLevelError.requested/supported`,
+`DeclarationLimit.count/limit`, `CapabilityError.capability`,
+`TrustError.required/actual`, `DuplicateRegistration.name/holder`,
+`DeadlineExceeded.deadline`, and `FrameTooLarge.actual/limit` are all prose
+strings at their raise sites.
+
+### Docs self-contradictions
+
+`Spill.value` (:901) vs `.buf` (:930) in one section · `services.connect`
+documented sync at 00:790 but awaited at 00:389 · `EffectsNotAuthorized(str)`
+(03:500) vs `(invocation, spec)` (00:964) · `ContextPatch` "all four lists"
+while frozen has five · `View.presentation` used in 07:1487 but absent from
+02's field table · patch rejection scope whole-patch (08:551) vs per-op
+(08:2018) · `SelectorError` claimed under both `ArtifactError` and `UrlError`
+but frozen satisfies only the latter · `PolicyDenied` a frozen value class with
+optional `code` in 02 vs an `OmpError` with required `code` frozen.
+
+### Underspecified — needs rulings
+
+`DropParts` is frozen but absent from 08's op vocabulary, leaving its
+Replace/pin/unknown-id/conflict semantics undefined; duplicate-id disposition
+(reject vs coalesce) unstated; same-patch `Reorder`/`Prune` precedence unstated;
+the patch-application algorithm has no epoch fence though staleness is promised
+detectable. Precedence arbitration is not representable at all: the registry
+holds one extension identity, so cross-claimant live-winner, qualified-shadow,
+and hidden-catalog rules cannot be enforced in-process.
+
+### Conformant — recorded so the negatives are evidence
+
+Core-name claims above `Precedence.CORE` correctly raise `DeviceNameError`
+before decoration · `Process.send` forwards its generation and refuses stale
+handles with `PreconditionFailed` · stale doc leases raise `Conflict` and
+`Partial` stays distinct from it · every round-7 closure verified
+(`QuotaExceeded` payload, `JournalError.appended`, `StateScopeDenied` base,
+`SchemaError`'s dual MRO catching on both documented bases) · `TmlError`'s
+payload is complete · and no contracted-stable operation in the existing corpus
+varied: `canary`'s slot, `chat-bridge`'s prompt, and `edit-dialect`'s `lift`
+and `prompt` were all byte-stable under identical input and all changed under
+perturbation, with the deliberately volatile slot correctly rejected.

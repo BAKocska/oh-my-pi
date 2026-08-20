@@ -419,10 +419,31 @@ class ManagementSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamWatchdog:
+    """Bound the wait for the first and subsequent streaming events."""
+
+    first_event: Duration
+    inter_event: Duration | None = None
+
+    def __post_init__(self) -> None:
+        """Reject missing, mistyped, or non-positive watchdog windows."""
+        if not isinstance(self.first_event, Duration):
+            raise SpecError("StreamWatchdog.first_event must be Duration")
+        if self.first_event <= Duration("0s"):
+            raise SpecError("StreamWatchdog.first_event must be positive")
+        if self.inter_event is not None:
+            if not isinstance(self.inter_event, Duration):
+                raise SpecError("StreamWatchdog.inter_event must be Duration or None")
+            if self.inter_event <= Duration("0s"):
+                raise SpecError("StreamWatchdog.inter_event must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class CompatFlags:
     """Closed route/model wire-compatibility overrides used by declarations."""
 
     schema_flavor: ToolSchemaFlavor | None = None
+    watchdog: StreamWatchdog | None = None
 
 class DiscoveryKind(StrEnum):
     """Select the response family used for remote model discovery."""
@@ -1831,6 +1852,46 @@ class Intent:
     payload: object = None
 
 
+class _Intents:
+    """Manage this extension's keyed session-level intent contributions."""
+
+    __slots__ = ("_declared",)
+
+    def __init__(self) -> None:
+        self._declared: dict[str, tuple[Intent, ...]] = {}
+
+    @staticmethod
+    def _validate(key: str, values: tuple[Intent, ...]) -> None:
+        if not isinstance(key, str) or not key:
+            raise SpecError("intent contribution key must be a non-empty string")
+        if not all(isinstance(value, Intent) for value in values):
+            raise SpecError("intent contributions must contain only Intent values")
+
+    def set(self, key: str, /, *values: Intent) -> None:
+        """Replace one keyed contribution, preserving it if dispatch is rejected."""
+        self._validate(key, values)
+        raise NotWiredError("omp.intents.set CONTROL dispatch is not wired")
+
+    def clear(self, key: str, /) -> None:
+        """Clear one keyed contribution, preserving it if dispatch is rejected."""
+        self._validate(key, ())
+        raise NotWiredError("omp.intents.clear CONTROL dispatch is not wired")
+
+    def declared(self, key: str | None = None, /) -> tuple[Intent, ...]:
+        """Return only this extension's accepted intent contributions."""
+        if key is not None:
+            self._validate(key, ())
+            return self._declared.get(key, ())
+        return tuple(
+            value
+            for contribution in self._declared.values()
+            for value in contribution
+        )
+
+
+intents = _Intents()
+
+
 @dataclass(frozen=True, slots=True)
 class RequestDraft:
     """Expose bounded request metadata to a pre-encoding hook."""
@@ -2034,6 +2095,7 @@ __all__ = (
     "RealtimeSession", "RealtimeTurnDetectionMode",
     "RedirectTrust", "RefreshBehavior", "RefreshReason", "RefreshRequest", "RequestDraft",
     "RequestMutation", "Retryability", "Role", "RouteLimits", "RouteRef", "RouteSpec",
+    "StreamWatchdog",
     "ScopedAlias",
     "SearchPage", "SearchQuery", "SearchResult", "ServerStateCaps", "ServiceTier", "Setting",
     "SettingKind",
@@ -2043,5 +2105,19 @@ __all__ = (
     "ToolCaps", "ToolFeature", "ToolSchemaFlavor", "Transport", "TrustDomain",
     "UnknownCapabilityPolicy", "UsageQuery",
     "UsageReport", "UsageScope", "UsageUnit", "UsageWindow", "WatchModels", "models",
-    "provider", "watch_models",
+    "intents", "provider", "watch_models",
 )
+
+
+import sys as _sys
+import types as _types
+
+
+class _CallableProviderModule(_types.ModuleType):
+    def __call__(self, *args: Any, **kwargs: Any) -> ProviderHandle:
+        """Delegate callable-module registration to :func:`provider`."""
+        return provider(*args, **kwargs)
+
+
+_sys.modules[__name__].__class__ = _CallableProviderModule
+del _sys, _types

@@ -11,21 +11,22 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Annotated, Protocol, TypeVar, get_args, get_origin, get_type_hints
 
-from _omp import (
+from _omp import QuotaStatus, ResourceReceipt, resources
+
+
+from . import QuotaExceeded
+from ._errors import (
     CapabilityError,
     DeclarationLimit,
     DeclarationSealed,
     DuplicateRegistration,
-    QuotaStatus,
-    ResourceReceipt,
-    resources,
+    ExtensionError,
+    ManifestError,
+    SpecError,
 )
-
-
-from . import QuotaExceeded
-from ._errors import SpecError
 from . import packages as _packages
 
 
@@ -36,6 +37,49 @@ _EntryKindKey = tuple[str, str]
 _ServiceKey = tuple[str, int]
 _ProviderKey = str
 _WorkerKey = str
+
+
+class _ActivationTrigger(StrEnum):
+    """Closed manifest vocabulary for declaration activation."""
+
+    STATIC = "static"
+    LAZY = "lazy"
+    EAGER_PROMPT = "eager-prompt"
+    EAGER_UI = "eager-ui"
+
+
+_EXECUTABLE_KINDS = frozenset(
+    {
+        "soft",
+        "hard",
+        "hook",
+        "worker",
+        "provider",
+        "prompt_slot",
+        "command",
+        "shortcut",
+        "completion",
+        "message_renderer",
+        "verdict_renderer",
+        "telemetry",
+        "service",
+    }
+)
+_CONTENT_KINDS = frozenset({"skills", "rules", "context-files", "prompts"})
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableDeclaration:
+    """One validated executable row from the uniform manifest table."""
+
+    declaration_id: str
+    kind: str
+    module: str
+    key: str
+    trigger: _ActivationTrigger
+    api: int
+    failure: str
+
 
 MAX_DECLARATIONS = 256
 """Maximum decorator declarations accepted from one extension."""
@@ -58,26 +102,45 @@ SCHEDULES_PROJECT_CAPABILITY = "schedules:project"
 """The ratified capability key granting project-scoped schedules."""
 
 
-class DeclarationDrift(RuntimeError):
+class DeclarationDrift(ExtensionError, RuntimeError):
     """The frozen decorator existence sets differ from the manifest."""
 
     def __init__(
         self,
         *,
         missing_tools: frozenset[_ToolKey],
-        unexpected_tools: frozenset[_ToolKey],
+        undeclared_tools: frozenset[_ToolKey],
         missing_hooks: frozenset[_HookKey],
-        unexpected_hooks: frozenset[_HookKey],
+        undeclared_hooks: frozenset[_HookKey],
         missing_services: frozenset[_ServiceKey],
-        unexpected_services: frozenset[_ServiceKey],
+        undeclared_services: frozenset[_ServiceKey],
+        missing_declarations: frozenset[tuple[str, str]],
+        undeclared_declarations: frozenset[tuple[str, str]],
     ) -> None:
-        super().__init__("frozen declarations differ from the manifest")
+        groups = (
+            ("missing tools", missing_tools),
+            ("undeclared tools", undeclared_tools),
+            ("missing hooks", missing_hooks),
+            ("undeclared hooks", undeclared_hooks),
+            ("missing services", missing_services),
+            ("undeclared services", undeclared_services),
+            ("missing declarations", missing_declarations),
+            ("undeclared declarations", undeclared_declarations),
+        )
+        detail = "; ".join(
+            f"{label}: {', '.join(repr(item) for item in sorted(items))}"
+            for label, items in groups
+            if items
+        )
+        super().__init__(f"frozen declarations differ from the manifest: {detail}")
         self.missing_tools = missing_tools
-        self.unexpected_tools = unexpected_tools
+        self.undeclared_tools = undeclared_tools
         self.missing_hooks = missing_hooks
-        self.unexpected_hooks = unexpected_hooks
+        self.undeclared_hooks = undeclared_hooks
         self.missing_services = missing_services
-        self.unexpected_services = unexpected_services
+        self.undeclared_services = undeclared_services
+        self.missing_declarations = missing_declarations
+        self.undeclared_declarations = undeclared_declarations
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +151,7 @@ class ServiceDefinition:
     rev: int
     implementation: type
     methods: tuple[str, ...]
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 @dataclass(frozen=True, slots=True)
 class EntryKindDefinition:
@@ -98,6 +162,7 @@ class EntryKindDefinition:
     display: bool | None
     spill: bool
     implementation: type
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 @dataclass(frozen=True, slots=True)
 class ProviderDefinition:
     """One import-time ``@omp.provider`` declaration."""
@@ -108,6 +173,7 @@ class ProviderDefinition:
     priority: int
     extends: str | None
     replaces: str | None
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +187,7 @@ class CommandDefinition:
     hint: str | None
     arg_completions: object | None
     handler: object
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 @dataclass(frozen=True, slots=True)
 class ShortcutDefinition:
@@ -131,6 +198,7 @@ class ShortcutDefinition:
     description: str
     when: frozenset[object] | None
     handler: object
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +207,7 @@ class WorkerDefinition:
 
     name: str
     spec: object
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 @dataclass(frozen=True, slots=True)
 class ArgSpec:
@@ -175,6 +244,7 @@ class DeviceDefinition:
     aliases: Mapping[str, str] | None
     body: object
     arg_specs: tuple[ArgSpec, ...] = ()
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +254,7 @@ class ChildDeviceDefinition:
     parent: _ToolKey
     path: str
     definition: DeviceDefinition
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +264,7 @@ class ExportDefinition:
     target: object
     kinds: tuple[str, ...]
     sample: float
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 
 
@@ -210,6 +282,7 @@ class TelemetryDefinition:
     replay: bool
     replay_limit: int
     handler: object
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +293,7 @@ class PromptSlotDefinition:
     priority: int
     cls: str
     renderer: object
+    trigger: _ActivationTrigger = _ActivationTrigger.EAGER_PROMPT
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +305,27 @@ class ApproverDefinition:
     timeout: object
     unreachable: object
     handler: object
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
+
+
+@dataclass(frozen=True, slots=True)
+class HookDefinition:
+    """One import-time hook subscription and its activation trigger."""
+
+    event: str
+    phase: str
+    handler: object
+    trigger: _ActivationTrigger
+
+
+@dataclass(frozen=True, slots=True)
+class UIDefinition:
+    """One UI callback declaration stored by the shared registry."""
+
+    kind: str
+    name: object
+    value: object
+    trigger: _ActivationTrigger
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +348,11 @@ class DeclarationSnapshot:
     approvers: tuple[ApproverDefinition, ...] = ()
     device_states: tuple[tuple[_ToolKey, bool, str | None], ...] = ()
     arg_specs: tuple[tuple[_ToolKey, tuple[ArgSpec, ...]], ...] = ()
+    hook_definitions: tuple[HookDefinition, ...] = ()
+    service_definitions: tuple[ServiceDefinition, ...] = ()
+    completions: tuple[UIDefinition, ...] = ()
+    message_renderers: tuple[UIDefinition, ...] = ()
+    verdict_renderers: tuple[UIDefinition, ...] = ()
 
 
 class DeclarationRegistry:
@@ -262,6 +362,9 @@ class DeclarationRegistry:
         "_approvers",
         "_configured",
         "_commands",
+        "_completions",
+        "_message_renderers",
+        "_verdict_renderers",
         "_shortcuts",
         "_device_claims",
         "_device_definitions",
@@ -273,9 +376,12 @@ class DeclarationRegistry:
         "_extension_id",
         "_providers",
         "_hooks",
+        "_hook_definitions",
         "_prompt_slots",
         "_telemetry",
         "_manifest_hooks",
+        "_manifest_executables",
+        "_uniform_manifest_configured",
         "_manifest_requires",
         "_manifest_services",
         "_manifest_tools",
@@ -293,6 +399,9 @@ class DeclarationRegistry:
         self._verified = False
         self._approvers: dict[str, ApproverDefinition] = {}
         self._commands: dict[str, CommandDefinition] = {}
+        self._completions: dict[object, UIDefinition] = {}
+        self._message_renderers: dict[object, UIDefinition] = {}
+        self._verdict_renderers: dict[object, UIDefinition] = {}
         self._shortcuts: dict[str, ShortcutDefinition] = {}
         self._tools: dict[_ToolKey, object] = {}
         self._device_definitions: dict[_ToolKey, DeviceDefinition] = {}
@@ -304,6 +413,7 @@ class DeclarationRegistry:
         self._entry_kinds: dict[_EntryKindKey, EntryKindDefinition] = {}
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookKey, object] = {}
+        self._hook_definitions: dict[_HookKey, HookDefinition] = {}
         self._telemetry: dict[str, TelemetryDefinition] = {}
         self._exports: dict[int, ExportDefinition] = {}
         self._export_sequence = 0
@@ -315,6 +425,10 @@ class DeclarationRegistry:
         self._manifest_tools: frozenset[_ToolKey] = frozenset()
         self._manifest_hooks: frozenset[_HookKey] = frozenset()
         self._manifest_services: frozenset[_ServiceKey] = frozenset()
+        self._manifest_executables: dict[
+            tuple[str, str], _ExecutableDeclaration
+        ] = {}
+        self._uniform_manifest_configured = False
         self._manifest_requires: frozenset[_ServiceKey] = frozenset()
 
     @property
@@ -348,12 +462,44 @@ class DeclarationRegistry:
     ) -> None:
         """Install authoritative manifest sets before the first module import."""
 
-        self._ensure_open()
-        content_declarations = (
-            None
-            if declarations is None
-            else _packages._content_declarations(declarations)
-        )
+        self._ensure_open("manifest")
+        content_declarations: list[_packages.ContentDeclaration] = []
+        executable_declarations: dict[
+            tuple[str, str], _ExecutableDeclaration
+        ] = {}
+        if declarations is not None:
+            for index, declaration in enumerate(declarations):
+                if isinstance(declaration, _packages.ContentDeclaration):
+                    content_declarations.append(declaration)
+                    continue
+                if not isinstance(declaration, Mapping):
+                    raise ManifestError(
+                        "omp.toml",
+                        f"declarations[{index}]",
+                        "row must be a mapping or ContentDeclaration",
+                    )
+                kind = declaration.get("kind")
+                if isinstance(kind, str) and kind in _CONTENT_KINDS:
+                    try:
+                        content_declarations.append(
+                            _packages._content_declaration(declaration)
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise ManifestError(
+                            "omp.toml",
+                            f"declarations[{index}]",
+                            str(error),
+                        ) from error
+                    continue
+                executable = _executable_declaration(declaration, index)
+                identity = (executable.kind, executable.key)
+                if identity in executable_declarations:
+                    raise ManifestError(
+                        "omp.toml",
+                        f"declarations[{index}].key",
+                        f"duplicate executable declaration {identity!r}",
+                    )
+                executable_declarations[identity] = executable
         if self._configured:
             raise RuntimeError("manifest declaration sets are already configured")
         if (
@@ -361,18 +507,30 @@ class DeclarationRegistry:
             or self._hooks
             or self._services
             or self._commands
+            or self._completions
+            or self._message_renderers
+            or self._verdict_renderers
             or self._shortcuts
             or self._approvers
         ):
             raise RuntimeError("manifest must be configured before declaration import")
-        if content_declarations is not None:
+        if declarations is not None:
             _packages._configure_own_declarations(
-                extension, content_declarations
+                extension, tuple(content_declarations)
             )
-        self._manifest_tools = frozenset(_tool_key(*item) for item in tools)
-        self._manifest_hooks = frozenset(_hook_key(*item) for item in hooks)
+        manifest_tools = {_tool_key(*item) for item in tools}
+        manifest_hooks = {_hook_key(*item) for item in hooks}
+        for executable in executable_declarations.values():
+            if executable.kind in {"soft", "hard"}:
+                manifest_tools.add(_manifest_tool_key(executable.key))
+            elif executable.kind == "hook":
+                manifest_hooks.add(_manifest_hook_key(executable.key))
+        self._manifest_tools = frozenset(manifest_tools)
+        self._manifest_hooks = frozenset(manifest_hooks)
         self._manifest_services = frozenset(_service_key(*item) for item in services)
         self._manifest_requires = frozenset(_service_key(*item) for item in requires)
+        self._manifest_executables = executable_declarations
+        self._uniform_manifest_configured = declarations is not None
         self._extension_id = extension
         self._configured = True
 
@@ -400,15 +558,17 @@ class DeclarationRegistry:
         if definition is not None:
             from .devices import PrecedenceConflict
 
+            source_package = self._extension_id or "<unconfigured extension>"
             for prior_precedence, _prior_replaces, prior_key in self.device_claims(name):
                 if prior_precedence == definition.precedence:
                     raise PrecedenceConflict(
-                        f"equal-precedence claims for {name!r}: {prior_key!r} and {key!r}"
+                        f"equal-precedence claimant keys {prior_key!r} and {key!r} "
+                        f"from source package {source_package!r}"
                     )
                 if definition.replaces is None:
                     raise PrecedenceConflict(
-                        f"device {name!r} is already claimed; "
-                        "name the replaced device explicitly"
+                        f"claimant keys {prior_key!r} and {key!r} from source package "
+                        f"{source_package!r} conflict; name the replaced device explicitly"
                     )
         self._insert(self._tools, key, declaration, "tool")
         if definition is not None:
@@ -536,7 +696,15 @@ class DeclarationRegistry:
         """Records a hook decorator during sequential manifest import."""
 
         key = _hook_key(event, phase)
+        trigger = (
+            _ActivationTrigger.EAGER_PROMPT
+            if str(getattr(handler, "on_failure", "")) == "fail-closed"
+            else _ActivationTrigger.LAZY
+        )
         self._insert(self._hooks, key, handler, "hook")
+        self._hook_definitions[key] = HookDefinition(
+            key[0], key[1], handler, trigger
+        )
         return handler
 
     def register_approver(
@@ -718,8 +886,39 @@ class DeclarationRegistry:
 
         return tuple(self._commands[key] for key in sorted(self._commands))
 
+    def register_ui(
+        self, kind: str, name: object, value: object
+    ) -> object:
+        """Insert one completion or renderer through the shared declaration gate."""
 
-
+        targets = {
+            "completion": (
+                self._completions,
+                _ActivationTrigger.EAGER_UI,
+            ),
+            "message_renderer": (
+                self._message_renderers,
+                _ActivationTrigger.LAZY,
+            ),
+            "verdict_renderer": (
+                self._verdict_renderers,
+                _ActivationTrigger.LAZY,
+            ),
+        }
+        try:
+            declarations, trigger = targets[kind]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                "UI declaration kind must be completion, message_renderer, "
+                "or verdict_renderer"
+            ) from error
+        try:
+            hash(name)
+        except TypeError as error:
+            raise TypeError("UI declaration name must be hashable") from error
+        definition = UIDefinition(kind, name, value, trigger)
+        self._insert(declarations, name, definition, kind)
+        return value
 
     def register_shortcut(
         self,
@@ -780,8 +979,66 @@ class DeclarationRegistry:
     def freeze(self) -> DeclarationSnapshot:
         """Seals the Core-verified registry and returns its immutable sets."""
 
-        self._ensure_open()
+        self._ensure_open("declaration registry")
         self._sealed = True
+        missing_tools: frozenset[_ToolKey] = frozenset()
+        undeclared_tools: frozenset[_ToolKey] = frozenset()
+        missing_hooks: frozenset[_HookKey] = frozenset()
+        undeclared_hooks: frozenset[_HookKey] = frozenset()
+        missing_services: frozenset[_ServiceKey] = frozenset()
+        undeclared_services: frozenset[_ServiceKey] = frozenset()
+        if self._configured:
+            missing_tools = self._manifest_tools.difference(self._tools)
+            undeclared_tools = frozenset(self._tools).difference(
+                self._manifest_tools
+            )
+            missing_hooks = self._manifest_hooks.difference(self._hooks)
+            undeclared_hooks = frozenset(self._hooks).difference(
+                self._manifest_hooks
+            )
+            uniform_service_names = {
+                declaration.key
+                for declaration in self._manifest_executables.values()
+                if declaration.kind == "service"
+            }
+            actual_legacy_services = frozenset(
+                key for key in self._services if key[0] not in uniform_service_names
+            )
+            missing_services = self._manifest_services.difference(self._services)
+            undeclared_services = actual_legacy_services.difference(
+                self._manifest_services
+            )
+        missing_declarations: frozenset[tuple[str, str]] = frozenset()
+        undeclared_declarations: frozenset[tuple[str, str]] = frozenset()
+        if self._uniform_manifest_configured:
+            manifest_declarations = frozenset(self._manifest_executables)
+            decorated_declarations = self._decorated_executable_keys()
+            missing_declarations = manifest_declarations.difference(
+                decorated_declarations
+            )
+            undeclared_declarations = decorated_declarations.difference(
+                manifest_declarations
+            )
+        if (
+            missing_tools
+            or undeclared_tools
+            or missing_hooks
+            or undeclared_hooks
+            or missing_services
+            or undeclared_services
+            or missing_declarations
+            or undeclared_declarations
+        ):
+            raise DeclarationDrift(
+                missing_tools=frozenset(missing_tools),
+                undeclared_tools=frozenset(undeclared_tools),
+                missing_hooks=frozenset(missing_hooks),
+                undeclared_hooks=frozenset(undeclared_hooks),
+                missing_services=frozenset(missing_services),
+                undeclared_services=frozenset(undeclared_services),
+                missing_declarations=missing_declarations,
+                undeclared_declarations=undeclared_declarations,
+            )
         from .devices import Availability
 
         for key, definition in self._device_definitions.items():
@@ -811,6 +1068,40 @@ class DeclarationRegistry:
         self._verified = True
         return self.snapshot()
 
+    def _decorated_executable_keys(self) -> frozenset[tuple[str, str]]:
+        declarations: set[tuple[str, str]] = set()
+        for key, value in self._tools.items():
+            body = self._device_definitions.get(key)
+            kind = getattr(value, "__omp_tool_kind__", None)
+            if kind is None and body is not None:
+                kind = getattr(body.body, "__omp_tool_kind__", None)
+            declarations.add(
+                (str(kind or "soft"), _manifest_tool_static_key(key))
+            )
+        declarations.update(
+            ("hook", _manifest_hook_static_key(key)) for key in self._hooks
+        )
+        declarations.update(("service", key[0]) for key in self._services)
+        declarations.update(("command", key) for key in self._commands)
+        declarations.update(("shortcut", key) for key in self._shortcuts)
+        declarations.update(("provider", key) for key in self._providers)
+        declarations.update(
+            ("prompt_slot", definition.slot)
+            for definition in self._prompt_slots.values()
+        )
+        declarations.update(("worker", key) for key in self._workers)
+        for definition in self._telemetry.values():
+            declarations.update(("telemetry", kind) for kind in definition.kinds)
+        for kind, values in (
+            ("completion", self._completions),
+            ("message_renderer", self._message_renderers),
+            ("verdict_renderer", self._verdict_renderers),
+        ):
+            declarations.update(
+                (kind, _ui_manifest_key(kind, name)) for name in values
+            )
+        return frozenset(declarations)
+
     def snapshot(self) -> DeclarationSnapshot:
         """Returns the current declaration existence sets without mutation."""
 
@@ -838,6 +1129,24 @@ class DeclarationRegistry:
                 (key, self._device_definitions[key].arg_specs)
                 for key in sorted(self._device_definitions)
             ),
+            hook_definitions=tuple(
+                self._hook_definitions[key] for key in sorted(self._hook_definitions)
+            ),
+            service_definitions=tuple(
+                self._services[key] for key in sorted(self._services)
+            ),
+            completions=tuple(
+                self._completions[key]
+                for key in sorted(self._completions, key=repr)
+            ),
+            message_renderers=tuple(
+                self._message_renderers[key]
+                for key in sorted(self._message_renderers, key=repr)
+            ),
+            verdict_renderers=tuple(
+                self._verdict_renderers[key]
+                for key in sorted(self._verdict_renderers, key=repr)
+            ),
         )
 
 
@@ -863,9 +1172,9 @@ class DeclarationRegistry:
             self._service_instances[key] = instance
         return instance
 
-    def _ensure_open(self) -> None:
+    def _ensure_open(self, name: object = "declaration registry") -> None:
         if self._sealed:
-            raise DeclarationSealed("declaration registry is sealed")
+            raise DeclarationSealed(str(name))
 
     def _insert(
         self,
@@ -874,10 +1183,16 @@ class DeclarationRegistry:
         value: object,
         kind: str,
     ) -> None:
-        self._ensure_open()
-        if (
+        self._ensure_open(key)
+        if key in declarations:
+            holder = self._extension_id or _declaration_holder(declarations[key])
+            raise DuplicateRegistration(str(key), holder)
+        count = (
             len(self._tools)
             + len(self._commands)
+            + len(self._completions)
+            + len(self._message_renderers)
+            + len(self._verdict_renderers)
             + len(self._shortcuts)
             + len(self._hooks)
             + len(self._approvers)
@@ -888,13 +1203,9 @@ class DeclarationRegistry:
             + len(self._providers)
             + len(self._workers)
             + len(self._exports)
-            >= MAX_DECLARATIONS
-        ):
-            raise DeclarationLimit(
-                f"extension exceeds the {MAX_DECLARATIONS} declaration limit"
-            )
-        if key in declarations:
-            raise DuplicateRegistration(f"duplicate {kind} declaration: {key!r}")
+        )
+        if count >= MAX_DECLARATIONS:
+            raise DeclarationLimit(count + 1, MAX_DECLARATIONS)
         declarations[key] = value
 
 
@@ -966,9 +1277,7 @@ class Services:
 
         key = _service_key(name, rev)
         if key not in registry.required_services:
-            raise CapabilityError(
-                f"manifest does not grant service dependency {name!r} rev {rev}"
-            )
+            raise CapabilityError(f"service:{name}@{rev}")
         transport = self._transport
         if transport is None:
             raise RuntimeError("CONTROL service transport is unavailable before ACTIVATE")
@@ -1068,16 +1377,239 @@ async def dispatch_service(
 
 
 
+def _executable_declaration(
+    value: Mapping[str, object], index: int
+) -> _ExecutableDeclaration:
+    """Decode and validate one executable manifest declaration row."""
+
+    required = frozenset(
+        {"id", "kind", "module", "key", "trigger", "api", "failure"}
+    )
+    fields = frozenset(value)
+    missing = required.difference(fields)
+    if missing:
+        field = sorted(missing)[0]
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].{field}",
+            "required executable declaration field is missing",
+        )
+    unknown = fields.difference(required)
+    if unknown:
+        field = sorted(str(item) for item in unknown)[0]
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].{field}",
+            "unknown executable declaration field",
+        )
+
+    declaration_id = value["id"]
+    kind = value["kind"]
+    module = value["module"]
+    key = value["key"]
+    for field, item in (
+        ("id", declaration_id),
+        ("kind", kind),
+        ("module", module),
+        ("key", key),
+    ):
+        if not isinstance(item, str) or not item:
+            raise ManifestError(
+                "omp.toml",
+                f"declarations[{index}].{field}",
+                "must be a non-empty string",
+            )
+    if kind not in _EXECUTABLE_KINDS:
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].kind",
+            f"unknown executable declaration kind {kind!r}",
+        )
+
+    raw_trigger = value["trigger"]
+    try:
+        trigger = _ActivationTrigger(raw_trigger)
+    except (TypeError, ValueError) as error:
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].trigger",
+            "must be static, lazy, eager-prompt, or eager-ui",
+        ) from error
+    failure = value["failure"]
+    if (
+        not isinstance(failure, str)
+        or failure not in {"fault", "fail-open", "fail-closed"}
+    ):
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].failure",
+            "must be fault, fail-open, or fail-closed",
+        )
+    required_trigger = {
+        "prompt_slot": _ActivationTrigger.EAGER_PROMPT,
+        "completion": _ActivationTrigger.EAGER_UI,
+    }.get(kind)
+    if kind == "hook" and failure == "fail-closed":
+        required_trigger = _ActivationTrigger.EAGER_PROMPT
+    if required_trigger is not None and trigger is not required_trigger:
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].trigger",
+            f"{kind} declarations require trigger {required_trigger.value!r}",
+        )
+    if required_trigger is None and trigger is _ActivationTrigger.STATIC:
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].trigger",
+            f"{kind} declarations may not use the static trigger",
+        )
+
+    api = value["api"]
+    if isinstance(api, bool) or not isinstance(api, int) or api < 1:
+        raise ManifestError(
+            "omp.toml",
+            f"declarations[{index}].api",
+            "must be a positive integer",
+        )
+
+    normalized_key = key
+    if kind in {"soft", "hard"}:
+        normalized_key = _manifest_tool_static_key(_manifest_tool_key(key))
+    elif kind == "hook":
+        normalized_key = _manifest_hook_static_key(_manifest_hook_key(key))
+    elif kind == "service":
+        service_name, separator, revision = key.rpartition("@")
+        if separator and revision.isascii() and revision.isdigit():
+            normalized_key = service_name
+        if "." not in normalized_key:
+            raise ManifestError(
+                "omp.toml",
+                f"declarations[{index}].key",
+                "service key must be a globally qualified dotted name",
+            )
+
+    return _ExecutableDeclaration(
+        declaration_id,
+        kind,
+        module,
+        normalized_key,
+        trigger,
+        api,
+        failure,
+    )
+
+
+def _manifest_tool_key(value: str) -> _ToolKey:
+    """Decode a uniform-manifest tool static key."""
+
+    name, separator, revision = value.rpartition("@")
+    family, revision_separator, number = revision.rpartition(".")
+    if (
+        not separator
+        or not name
+        or not revision_separator
+        or not number.isascii()
+        or not number.isdigit()
+    ):
+        raise ManifestError(
+            "omp.toml",
+            "declarations[].key",
+            "tool key must have the form 'name@family.rev'",
+        )
+    try:
+        return _tool_key(name, family, int(number))
+    except (TypeError, ValueError) as error:
+        raise ManifestError(
+            "omp.toml",
+            "declarations[].key",
+            str(error),
+        ) from error
+
+
+def _manifest_tool_static_key(key: _ToolKey) -> str:
+    """Encode a canonical uniform-manifest tool static key."""
+
+    return f"{key[0]}@{key[1]}.{key[2]}"
+
+
+def _manifest_hook_key(value: str) -> _HookKey:
+    """Decode a uniform-manifest hook static key."""
+
+    event, separator, phase = value.rpartition("/")
+    if not separator:
+        raise ManifestError(
+            "omp.toml",
+            "declarations[].key",
+            "hook key must have the form 'event/phase'",
+        )
+    try:
+        return _hook_key(event, phase)
+    except ValueError as error:
+        raise ManifestError(
+            "omp.toml",
+            "declarations[].key",
+            str(error),
+        ) from error
+
+
+def _manifest_hook_static_key(key: _HookKey) -> str:
+    """Encode a canonical uniform-manifest hook static key."""
+
+    return f"{key[0]}/{key[1]}"
+
+
+def _ui_manifest_key(kind: str, name: object) -> str:
+    """Project a UI registry key to its uniform-manifest spelling."""
+
+    if (
+        kind == "verdict_renderer"
+        and isinstance(name, tuple)
+        and len(name) == 3
+        and isinstance(name[0], str)
+        and isinstance(name[1], str)
+        and isinstance(name[2], int)
+    ):
+        if name[1] or name[2]:
+            return _manifest_tool_static_key(name)
+        return name[0]
+    return str(name)
+
+
+def _declaration_holder(value: object) -> str:
+    """Name the incumbent callable or class for duplicate diagnostics."""
+
+    for candidate in (
+        value,
+        getattr(value, "handler", None),
+        getattr(value, "implementation", None),
+        getattr(value, "body", None),
+        getattr(value, "value", None),
+    ):
+        module = getattr(candidate, "__module__", None)
+        qualname = getattr(candidate, "__qualname__", None)
+        if isinstance(module, str) and isinstance(qualname, str):
+            return f"{module}.{qualname}"
+    return type(value).__name__
+
+
 def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ...]:
-    from . import Coerce, Field
+    from . import Coerce, Field, SchemaError
 
     annotations: list[tuple[str, object]] = []
+    schema_parameter_names: set[str] = set()
     if isinstance(schema, type):
         try:
             schema_hints = get_type_hints(schema, include_extras=True)
         except (NameError, TypeError):
             schema_hints = inspect.get_annotations(schema, eval_str=False)
         annotations.extend(schema_hints.items())
+        schema_parameter_names.update(schema_hints)
+    elif isinstance(schema, Mapping):
+        properties = schema.get("properties", {})
+        if isinstance(properties, Mapping):
+            schema_parameter_names.update(
+                name for name in properties if isinstance(name, str)
+            )
 
     try:
         body_hints = get_type_hints(body, include_extras=True)
@@ -1090,6 +1622,16 @@ def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ..
     annotations.extend(
         (name, body_hints[name]) for name in parameters if name in body_hints
     )
+
+    parameter_names = schema_parameter_names
+    parameter_names.update(name for name, _annotation in annotations)
+    parameter_names.update(parameters)
+    for name in sorted(parameter_names):
+        if name == "do_" or name.endswith("_"):
+            raise SchemaError(
+                f"parameter {name!r} violates the reserved-name rule: "
+                "no parameter named do_, none ending _"
+            )
 
     specs: list[ArgSpec] = []
     seen_paths: set[str] = set()

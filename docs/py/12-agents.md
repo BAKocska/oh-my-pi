@@ -1296,7 +1296,7 @@ them in a renderer.
 
 ### Exceptions
 
-All derive from `omp.agents.AgentsError`, which derives from `omp.Error`.
+All derive from `omp.agents.AgentsError`, which derives from `omp.OmpError`.
 
 | Exception | Raised when | Fields |
 |---|---|---|
@@ -1397,7 +1397,7 @@ async def agent_device(args: AgentArgs, ctx: omp.Context) -> omp.Payload:
 			"usage": result.subtree_usage,
 		})
 
-	raise omp.Fault.invalid("op", expected='"spawn" | "steer" | "result"', got=args.op)
+	raise omp.ArgFault(("op",), omp.ArgIssueKind.MALFORMED, f'expected "spawn" | "steer" | "result", got {args.op!r}')
 ```
 
 Revision 1 wrote this device against the streaming-pull shape — `params.arg()`
@@ -1511,7 +1511,7 @@ async def workflow(inv: omp.ui.Invocation, ctx: omp.Context) -> omp.ui.CommandRe
 
 Downstream steps receive `agent://<name>` URLs, not pasted transcripts —
 results reference, they do not embed. Resumability is free: the journal entries
-are the run state, so `omp.sessions.get_journal(id)`
+are the run state, so streaming `omp.sessions.journal(id)`
 (`docs/py/09-journal.md`) replaces `runs/<runId>.json` and works for a remote
 session too. And a step whose body touches many files declares
 `place="env"` (`docs/py/04-placement.md`) so its bytes never transit the host.
@@ -1731,7 +1731,7 @@ async def radio(args: RadioArgs, ctx: omp.Context) -> omp.Payload:
 	if args.op == "inbox":
 		return omp.Payload({"messages": [m.text for m in await omp.agents.inbox()]})
 
-	raise omp.Fault.invalid("op", expected='"send" | "list" | "inbox"', got=args.op)
+	raise omp.ArgFault(("op",), omp.ArgIssueKind.MALFORMED, f'expected "send" | "list" | "inbox", got {args.op!r}')
 ```
 
 No socket path, no framing, no environment-variable identity smuggling, no
@@ -2861,7 +2861,7 @@ Changes this file made for Revision 2, and the review point that drove each:
   patches, `WorkspaceUri` for the snapshot root); journal examples rewritten
   to typed `@omp.entry_kind` entries (P0#17); the `context` hook reference in
   `Isolation.FILTERED` renamed `thread_projection` (P0#11); the boundary
-  flowchart's "verdict" relabeled "decision" so the retired `omp.Verdict`
+  flowchart's "verdict" relabeled "decision" so the retired `Verdict`
   name stops leaking into prose.
 - **Schedule credentials question closed as far as this file goes** (review
   §"Principal identity"): open question 1 rewritten as resolved-for-semantics

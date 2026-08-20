@@ -4,7 +4,7 @@ Where an extension's code runs, how it gets there, and what is allowed to cross.
 
 ## Purpose
 
-`omp.remote` and the `place=` axis exist because a function body and the data it
+`omp_remote` and the `place=` axis exist because a function body and the data it
 touches are two different things, and pi kept them in two different processes on
 two different machines. In pi, every extension callback executes inside the agent's
 own JavaScript event loop. There is no placement concept anywhere in
@@ -255,7 +255,7 @@ load, not at call.
 
 ### Large payloads
 
-`omp.remote` will happily pickle a gigabyte. It should not have to. Two rules:
+`omp_remote` will happily pickle a gigabyte. It should not have to. Two rules:
 
 1. **A worker's result is either small or a reference.** A return value whose
    serialized size exceeds `omp.workers.RESULT_SPILL_BYTES` is a design error;
@@ -482,22 +482,24 @@ supervisor a named worker is realized on.
 class Site:
     kind: SiteKind
     process: str | None = None
-    ready: omp.env.ReadyProbe | None = None
+    ready: omp.env.Ready | None = None
 
     ENV: ClassVar[Site]
     LOCAL: ClassVar[Site]
 
     @classmethod
-    def attached(cls, process: str, *, ready: omp.env.ReadyProbe | None = None) -> Site: ...
+    def attached(cls, process: str, *, ready: omp.env.Ready | None = None) -> Site: ...
 ```
 
 - **`Site.kind`** — the `SiteKind`.
 - **`Site.process`** — for `SiteKind.ATTACHED`, the env named-process name that
-  carries the worker. `None` otherwise. The process must already be declared; see
-  `omp.env.start_process` in `docs/py/11-env.md`.
-- **`Site.ready`** — an optional readiness probe applied before the handshake, so a
-  worker behind a slow SSH connection is not declared `READY` on spawn alone.
-  `omp.env.ReadyProbe` is defined in `docs/py/11-env.md`.
+  carries the worker. `None` otherwise. The process must already be declared with
+  `omp.env.proc.start` or atomically adopted with `omp.env.proc.ensure`; see
+  `docs/py/11-env.md`.
+- **`Site.ready`** — an optional `omp.env.Ready` value applied before the handshake, so a
+  worker behind a slow SSH connection is not declared `READY` on spawn alone. The concrete
+  `omp.env.ReadyLog`, `omp.env.ReadyTcp`, `omp.env.ReadyPing`, and `omp.env.ReadyAll` values are
+  defined in `docs/py/11-env.md`.
 - **`Site.ENV`** / **`Site.LOCAL`** — singletons.
 - **`Site.attached(process, ready=None)`** — constructs an attached site.
 
@@ -579,7 +581,7 @@ needs to know.
 class WorkerSpec:
     name: str
     site: Site = Site.ENV
-    boot: omp.remote.RemoteFunction | None = None
+    boot: omp_remote.RemoteFunction | None = None
     idle_ttl: omp.Duration = omp.workers.DEFAULT_IDLE_TTL
     max_concurrency: int = 1
     max_calls: int | None = None
@@ -599,7 +601,7 @@ reads this as a record.
   layer; two extensions declaring the same name is an error at load, not a silent
   merge, because they would share an address space.
 - **`site`** — see `omp.Site`.
-- **`boot`** — a `@omp.remote` function run exactly once per generation after the
+- **`boot`** — a `@omp_remote.remote` function run exactly once per generation after the
   handshake and before the first call. Its return value is discarded; its side
   effects on the worker's module globals are the warm state. Boot runs inside
   `WorkerState.BOOTING`, and a boot that raises moves the generation to
@@ -611,7 +613,7 @@ reads this as a record.
   (the worker lives until session teardown). Default
   `omp.workers.DEFAULT_IDLE_TTL`.
 - **`max_concurrency`** — how many calls may be in flight. Each concurrent slot is
-  one connection to the worker, because `omp.remote.Session` serializes calls under
+  one connection to the worker, because `omp_remote.Session` serializes calls under
   a lock; `serve_forever` runs one thread per connection and free-threaded CPython
   executes them in parallel. Values above `1` are meaningful only for bodies that
   are actually thread-safe — and concurrent calls on one generation share a
@@ -705,17 +707,17 @@ class WorkerHandle:
 
     async def state(self) -> WorkerState: ...
     async def info(self) -> WorkerInfo: ...
-    async def call(self, fn: omp.remote.RemoteFunction, /, *args, **kwargs) -> Any: ...
+    async def call(self, fn: omp_remote.RemoteFunction, /, *args, **kwargs) -> Any: ...
     async def map[T, R](
         self,
-        fn: omp.remote.RemoteFunction,
+        fn: omp_remote.RemoteFunction,
         items: Iterable[T],
         *,
         concurrency: int | None = None,
     ) -> list[R]: ...
     async def warm(self) -> None: ...
     async def stop(self, *, grace: omp.Duration = omp.Duration("5s")) -> None: ...
-    def session(self) -> AbstractAsyncContextManager[omp.remote.Session]: ...
+    def session(self) -> AbstractAsyncContextManager[omp_remote.Session]: ...
 ```
 
 A reference to one worker generation, returned by `omp.workers.get()`. Handles are
@@ -805,9 +807,9 @@ async def first_hits(ctx: omp.Context) -> list:
   already advanced, so two racing callers do not evict each other's replacement.
   Channel: DATA. Latency: bounded by `grace`. Failure: fail-open.
 
-- **`handle.session() -> AbstractAsyncContextManager[omp.remote.Session]`**
+- **`handle.session() -> AbstractAsyncContextManager[omp_remote.Session]`**
 
-  The escape hatch: borrows one raw `omp.remote.Session` from the connection pool
+  The escape hatch: borrows one raw `omp_remote.Session` from the connection pool
   for the duration of the context, returning it on exit. For code that needs to
   issue many calls with strict ordering, or that wants `omp_remote` semantics
   directly.
@@ -927,15 +929,20 @@ untrusted data in a privileged process.
 worker buffer and a spilled verdict name content in one namespace with one minting
 authority; `docs/py/02-verdicts.md` covers the second path.
 
-- **`buf`** — any object supporting the buffer protocol. Must be contiguous; a
+- **`value`** — any object supporting the buffer protocol. Must be contiguous; a
   non-contiguous buffer raises `TypeError` at pickle time, since `PickleBuffer`
   cannot emit it out-of-band and silently falling back to in-band would defeat the
   purpose.
 - **`media_type`** — carried into the eventual artifact so `read artifact://<id>`
   knows how to present it.
 
+**Resolved (2026-08-20 ruling):** the spill field is `value`, not `buf`; all
+buffer-protocol and contiguity requirements above apply to `value`.
+
 ```python
-@omp.remote
+import omp_remote
+
+@omp_remote.remote
 def render_report(rows: list[dict]) -> omp.Spill:
     body = build_html(rows).encode()          # 40 MB, on the env machine
     return omp.Spill(body, media_type="text/html")
@@ -960,7 +967,7 @@ silently in-lining 40 MB across a WAN is not an acceptable fallback.
   to `READY`, or a call was issued against a name whose generation is `FAILED`.
   Chains the underlying cause (`RemoteTraceback` for a boot fault, `OSError` for a
   spawn failure, `TimeoutError` for a readiness timeout).
-- **`omp.WorkerEvicted(Exception)`** — the handle's generation is no longer current.
+- **`omp.WorkerEvicted(omp.PlacementError)`** — the handle's generation is no longer current.
   Distinct from `WorkerUnavailable` because it is *not* an error condition in the
   system: the correct response is `await omp.workers.get(name)` and retry, which is
   what `WorkerHandle.call` does once before giving up.
@@ -981,7 +988,7 @@ Per-worker lifecycle transitions arrive as `@omp.hook("worker_state")` with an
 
 ---
 
-### `omp.remote`
+### `omp_remote`
 
 The mechanism `place=` is built on, shipping today as
 `crates/py/python/omp_remote.py` and frozen into the interpreter alongside the
@@ -1042,6 +1049,8 @@ Marks a function for remote execution, returning a `RemoteFunction`. Usable bare
 with keywords:
 
 ```python
+import omp_remote
+
 @omp_remote.remote
 def double(a): return a * 2
 
@@ -1410,13 +1419,14 @@ The omp shape:
 import dataclasses, json, subprocess
 
 import omp
+import omp_remote
 
 # The Environment owns the connection. One SSH multiplex, supervised, credentials
 # from the scoped store — never an argv element. See docs/py/11-env.md for
-# start_process and docs/py/13-inference.md for omp.creds.
+# proc.start / proc.ensure and docs/py/13-inference.md for omp.creds.
 omp.workers.declare(omp.WorkerSpec(
     name="hpc",
-    site=omp.Site.attached("hpc-login", ready=omp.env.ReadyProbe.log(r"omp-py-worker ready")),
+    site=omp.Site.attached("hpc-login", ready=omp.env.ReadyLog(r"omp-py-worker ready")),
     unmanaged=True,                      # bare host: no Environment, no omp authority — trusted tier
     idle_ttl=omp.Duration("30m"),        # keep the multiplex warm
     max_concurrency=4,
@@ -1424,7 +1434,7 @@ omp.workers.declare(omp.WorkerSpec(
 ))
 
 
-@omp.remote(ship="import")
+@omp_remote.remote(ship="import")
 def grep(pattern: str, root: str, *, glob: str | None = None, limit: int = 2_000) -> dict:
     """Runs on the login node. Files never leave it.
 
@@ -1531,6 +1541,7 @@ Warm state is exactly what a named worker is for:
 import dataclasses
 
 import omp
+import omp_remote
 
 omp.workers.declare(omp.WorkerSpec(
     name="index",
@@ -1547,7 +1558,7 @@ omp.workers.declare(omp.WorkerSpec(
 _INDEX: object | None = None
 
 
-@omp.remote(ship="import")
+@omp_remote.remote(ship="import")
 def build_index() -> None:
     global _INDEX
     # Env-colocated: local_path() is legal here and nowhere else — it raises
@@ -1557,7 +1568,7 @@ def build_index() -> None:
     _INDEX.warm()
 
 
-@omp.remote(ship="import")
+@omp_remote.remote(ship="import")
 def query(kind: str, needle: str, limit: int) -> dict:
     assert _INDEX is not None, "boot did not run"
     return {"kind": kind, "results": _INDEX.search(kind, needle, limit=limit)}
@@ -1596,7 +1607,7 @@ The properties that matter:
   cannot have in pi at any price.
 - **`max_concurrency=8` is real parallelism**, because the worker runs eight
   connections on eight threads under free-threaded CPython. The lock inside
-  `omp.remote.Session` is per-connection, not per-worker.
+  `omp_remote.Session` is per-connection, not per-worker.
 - **`idle_ttl=omp.Duration("0s")`** is the correct choice here and the wrong
   choice for most workers. An index that took 40 seconds to build must not be
   evicted seven minutes into a session; a worker holding a 200 MB model the user
@@ -1622,6 +1633,7 @@ Placement fixes both, and the fan-out is one line:
 import dataclasses
 
 import omp
+import omp_remote
 
 omp.workers.declare(omp.WorkerSpec(
     name="ast",
@@ -1632,7 +1644,7 @@ omp.workers.declare(omp.WorkerSpec(
 ))
 
 
-@omp.remote(ship="import")
+@omp_remote.remote(ship="import")
 def analyse(path: omp.EnvPath) -> dict:
     """Runs beside the files. Reads locally, returns a summary."""
     src = path.local_path().read_bytes()      # direct read: legal env-colocated, and the point
@@ -1640,7 +1652,7 @@ def analyse(path: omp.EnvPath) -> dict:
     return {"path": path.uri, "symbols": symbols(tree), "diagnostics": lint(tree)}
 
 
-@omp.remote(ship="import")
+@omp_remote.remote(ship="import")
 def render(reports: list[dict]) -> omp.Spill:
     body = format_markdown(reports).encode()  # may be tens of MB
     return omp.Spill(body, media_type="text/markdown")
@@ -1685,7 +1697,7 @@ async def ast_survey(args: AstSurveyArgs, ctx: omp.Context) -> AstSurveyResult:
   not yet approved would have been a DATA read before authorization, the exact
   confidentiality hole `docs/py/03-params.md` closes. The overlap was a real
   latency win and it is genuinely given up; core streaming tools keep it
-  internally, and `@omp.streaming_device` is the named, not-in-v1 facility that
+  internally, and the `streaming_device` decorator is the named, not-in-v1 facility that
   may eventually return it to extensions (`docs/py/01-devices.md`).
 - **Paths are typed end to end.** The model's arguments materialize as
   `omp.EnvPath` values, the worker body calls `path.local_path()` where that is
@@ -1864,7 +1876,7 @@ split, not to `live_hash` as it stands.
 
 | Piece | Where | What it gives placement |
 |---|---|---|
-| `omp.remote` in full | `crates/py/python/omp_remote.py` | Ship modes, content-addressed bundles, pickle-5 OOB path, HMAC handshake, per-connection code cache, threaded parallel workers, error transport with remote tracebacks |
+| `omp_remote` in full | `crates/py/python/omp_remote.py` | Ship modes, content-addressed bundles, pickle-5 OOB path, HMAC handshake, per-connection code cache, threaded parallel workers, error transport with remote tracebacks |
 | Embedded free-threaded CPython 3.14t | `crates/py/src/lib.rs:1-2`, `Engine::builder().init()` at `:117`, `Engine::attach` at `:144` | The worker runtime. `omp_remote` and `cloudpickle` are frozen in (`OMP_MODULES_BLOB`, `crates/py/src/lib.rs:56`), so a worker needs no site-packages to speak the protocol |
 | Same-binary child re-exec | `crates/app/src/envd/eval/process.rs:40` (`EVAL_CHILD_ARG`), spawn at `:228-231` | The pattern for spawning a worker: `Command::new(executable).arg(ARG)`, piped stdio, `kill_on_drop(true)` |
 | A Python tool worker with a protobuf stdio protocol | `crates/app/src/envd/worker.rs:379-433`; `crates/proto/proto/omp/toolhost/v1/toolhost.proto` | `WorkerHello`/`RegisterTools` handshake with `schema_rev` + `python_rev` validation (`worker.rs:435-463`), process-group isolation (`:401-410`), `OMP_PY_SITE`/`OMP_PY_MODULES` injection (`:387-400`) |
@@ -1966,7 +1978,7 @@ Supervision behaviour to implement, and the prior art to port from:
 
 ### 2. Socket tunnelling through `env/v1` frames
 
-The host must speak the `omp.remote` wire protocol to a process it did not spawn
+The host must speak the `omp_remote` wire protocol to a process it did not spawn
 and cannot address. Three designs; the third is the recommendation.
 
 **(a) Host dials the worker directly.** `Session` over `AF_UNIX` when colocated,
@@ -2630,6 +2642,8 @@ makes `--pool` a rare exception or a common UX path is precisely what
    should refuse `OpenWorker` immediately and let the host fail over, is unspecified.
    It matters for zero-downtime daemon upgrades and it has no obviously correct
    answer.
+
+7. **Resolved (2026-08-20 ruling): the `omp.Spill` field is `value`, and the buffer-protocol and contiguity rules apply to `value`.** **Spill buffer field name.** The dataclass sketch and pickle description name `value` (`docs/py/04-placement.md:905-918`), while the field bullet called the same input `buf` (`docs/py/04-placement.md:930-933`); the competing readings were `Spill(value=...)` versus `Spill(buf=...)`.
 
 ### Revision 2 (post-review)
 

@@ -12,17 +12,31 @@ from _omp import Duration, EnvPath, OmpError
 from ._errors import NotWiredError
 
 
+class SessionError(OmpError):
+    """Base error for historical session operations."""
+
+
+class SessionAccessDenied(SessionError):
+    """The caller may not read the requested historical session."""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"historical session {session_id!r} is not readable")
+
+
 class SessionNotFound(OmpError):
     """The requested session does not exist or is not visible to the caller."""
 
 
 class SessionStatus(StrEnum):
-    """Terminal disposition of a session index row."""
+    """Disposition derived from the latest durable turn records."""
 
-    ACTIVE = "active"
-    SETTLED = "settled"
+    COMPLETE = "complete"
+    INTERRUPTED = "interrupted"
     ABORTED = "aborted"
-    FAILED = "failed"
+    ERROR = "error"
+    PENDING = "pending"
+    UNKNOWN = "unknown"
 
 
 class SessionKind(StrEnum):
@@ -48,6 +62,7 @@ class GroupBy(StrEnum):
     PROVIDER = "provider"
     PROJECT = "project"
     SESSION = "session"
+    KIND = "kind"
 
 
 class Bucket(StrEnum):
@@ -261,8 +276,9 @@ async def journal(
 
 
 __all__ = (
-    "Bucket", "Cost", "GroupBy", "SessionFilter", "SessionInfo", "SessionKind",
-    "SessionLink", "SessionNotFound", "SessionStatus", "TitleSource", "Usage",
+    "Bucket", "Cost", "GroupBy", "SessionAccessDenied", "SessionError",
+    "SessionFilter", "SessionInfo", "SessionKind", "SessionLink", "SessionNotFound",
+    "SessionStatus", "TitleSource", "Usage",
     "UsageAccuracy", "UsageBucket", "UsageQuery", "UsageReport", "current", "delete",
     "get", "journal", "lineage", "list", "rename", "resume", "usage",
 )

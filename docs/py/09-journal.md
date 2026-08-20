@@ -509,7 +509,7 @@ minus one — which is stable across reloads because tombstones are never droppe
 
 | Exception | Base | Raised when |
 |---|---|---|
-| `omp.JournalError` | `omp.Error` | Base for this namespace. Carries `appended: list[EntryId]` for partial `append_many` groups. |
+| `omp.JournalError` | `omp.OmpError` | Base for this namespace. Carries `appended: list[EntryId]` for partial `append_many` groups. |
 | `omp.UnknownEntryKind` | `omp.JournalError` | Appending an instance of an undeclared class. |
 | `omp.EntryKindConflict` | `omp.JournalError` | Declaring a name owned by the core or another extension. |
 | `omp.SchemaError` | `omp.JournalError` | A declared class has non-serializable fields. |
@@ -518,7 +518,7 @@ minus one — which is stable across reloads because tombstones are never droppe
 | `omp.JournalIndeterminate` | `omp.JournalError` | Durability could not be proven. The session is halting; do not retry. |
 | `omp.EntryUndecodable` | `omp.JournalError` | An entry's `data` bytes fail strict decode against the recorded `(kind, rev)`. The record is preserved as corrupt/unknown — `raw` intact, `value` `None`. |
 | `omp.StateScopeDenied` | `omp.JournalError` | An `omp.state` operation names a scope the manifest or org policy does not grant. |
-| `omp.StaleGeneration` | `omp.Error` | A durable request carried an old `host_generation`/`session_generation` after a reload or reconnect. Owned, with the fencing contract, by `docs/py/00-overview.md`. |
+| `omp.StaleGeneration` | `omp.OmpError` | A durable request carried an old `host_generation`/`session_generation` after a reload or reconnect. Owned, with the fencing contract, by `docs/py/00-overview.md`. |
 
 ### `omp.state`
 
@@ -600,7 +600,7 @@ entries belongs there exactly as an index over journal entries does, keyed to a
 that want to talk use `@omp.service` / `omp.services.connect`
 (`docs/py/00-overview.md`), never a polled log.
 
-**Exceptions** `omp.StateScopeDenied`; otherwise the `omp.Journal*` family
+**Exceptions** `omp.StateScopeDenied`; otherwise the `omp.JournalError` family
 applies unchanged.
 
 ### `omp.sessions`
@@ -692,8 +692,8 @@ opens, rewrites, renames, or removes journal files itself.
 |---|---|---|---|
 | `async get(session_id) -> omp.SessionInfo` | Return the visible indexed row for one stable id. | CONTROL request; no mutation. | `omp.SessionNotFound`; access and host failures fail closed. |
 | `async lineage(session_id) -> Sequence[omp.SessionLink]` | Return the durable parent chain, oldest first. | CONTROL request; no mutation. | `omp.SessionNotFound`; access and host failures fail closed. |
-| `async resume(session_id) -> omp.SessionInfo` | Make the historical interactive session current and return its refreshed index row. | CONTROL request; the Core journals a resume receipt before acknowledging. | `omp.SessionNotFound`; non-interactive, access, and host failures fail closed. |
-| `async rename(session_id, title) -> omp.SessionInfo` | Assign a user title and return the refreshed immutable index row. | CONTROL request; the Core journals the rename receipt before acknowledging. | `omp.SessionNotFound`; invalid titles, access, and host failures fail closed. |
+| `async omp.sessions.resume(session_id) -> omp.SessionInfo` | Make the historical interactive session current and return its refreshed index row. | CONTROL request; the Core journals a resume receipt before acknowledging. | `omp.SessionNotFound`; non-interactive, access, and host failures fail closed. |
+| `async omp.sessions.rename(session_id, title) -> omp.SessionInfo` | Assign a user title and return the refreshed immutable index row. | CONTROL request; the Core journals the rename receipt before acknowledging. | `omp.SessionNotFound`; invalid titles, access, and host failures fail closed. |
 | `async delete(session_id) -> None` | Permanently remove the session selected by an approved deletion ticket. | Approval-gated CONTROL request. | `omp.PermissionDenied` without the matching approval grant; `omp.SessionNotFound`; host failures fail closed. |
 
 `delete` never bypasses policy. An extension offering deletion emits the durable
@@ -850,7 +850,6 @@ for display only; never aggregate on it.
 | `INTERACTIVE` | A session a user drove. |
 | `SUBAGENT` | Spawned by `omp.agents` (`docs/py/12-agents.md`). |
 | `ADVISOR` | Background advisory session. |
-| `EVAL` | Kernel-spawned scratch session. |
 
 #### `omp.GroupBy`
 
@@ -861,31 +860,32 @@ for display only; never aggregate on it.
 | `PROJECT` | Normalized project root. |
 | `SESSION` | Session id. |
 | `KIND` | `omp.SessionKind`. |
-| `DAY` | Calendar day in the local zone. |
 
 #### `omp.Bucket`
 
 | Member | Bucket width |
 |---|---|
 | `NONE` | No series output. |
-| `HOUR` | One hour. |
-| `DAY` | One calendar day, local zone. |
-| `WEEK` | Seven days from the range start. |
+| `HOUR` | One UTC hour. |
+| `DAY` | One UTC day. |
+| `WEEK` | Seven UTC days from the Unix epoch. |
+| `MONTH` | One UTC calendar month. |
 
 #### `omp.TitleSource`
 
-Mirrors `omp_storage::transcript::TitleSource`.
+Identifies which frozen Python authority assigned the indexed title.
 
 | Member | Meaning |
 |---|---|
-| `AUTO` | Generated by the harness. |
-| `USER` | Set explicitly; never overwritten by generation. |
+| `USER` | Set explicitly by a person. |
+| `MODEL` | Generated by a model. |
+| `SYSTEM` | Assigned by the runtime. |
 
 #### Exceptions
 
 | Exception | Base | Raised when |
 |---|---|---|
-| `omp.SessionError` | `omp.Error` | Base for this namespace. |
+| `omp.SessionError` | `omp.OmpError` | Base for this namespace. |
 | `omp.SessionNotFound` | `omp.OmpError` | No such session, or not visible to the caller. |
 | `omp.SessionAccessDenied` | `omp.SessionError` | The manifest does not grant historical reads. |
 
@@ -968,7 +968,7 @@ ref = w.ref
 
 Promotes an `omp.BlobRef` (defined in `docs/py/11-env.md`) into an addressable
 artifact. This is the bridge across the placement spill path: a worker returns
-`omp.Spill(buf)` (`docs/py/04-placement.md`), the environment supervisor diverts
+`omp.Spill(value)` (`docs/py/04-placement.md`), the environment supervisor diverts
 that pickle-5 out-of-band frame straight into the blob store, and the host
 receives an `omp.BlobRef` instead of bytes. `BlobRef` is content identity;
 `ArtifactRef` is an addressable, slice-readable resource carrying a retention
@@ -1078,11 +1078,11 @@ is the field to check when an artifact vanished.
 
 | Exception | Base | Raised when |
 |---|---|---|
-| `omp.ArtifactError` | `omp.Error` | Base for this namespace; also an illegal lifetime downgrade. |
+| `omp.ArtifactError` | `omp.OmpError` | Base for this namespace; also an illegal lifetime downgrade. |
 | `omp.ArtifactNotFound` | `omp.ArtifactError` | Swept, never existed, or not visible. |
 | `omp.ArtifactCorrupt` | `omp.ArtifactError` | Stored length disagrees with the reference. |
 | `omp.ArtifactNotText` | `omp.ArtifactError` | `read` on a non-textual media type. |
-| `omp.SelectorError` | `omp.ArtifactError` | Invalid selector syntax. |
+| `omp.SelectorError` | `omp.UrlError` | Invalid selector syntax. The same selector vocabulary and exception are shared by artifact and URL reads. |
 
 ### `omp.urls`
 
@@ -1223,9 +1223,13 @@ set.
 
 | Exception | Base | Raised when |
 |---|---|---|
-| `omp.UrlError` | `omp.Error` | Base for this namespace. |
+| `omp.UrlError` | `omp.OmpError, ValueError` | Base for this namespace; it is both an omp exception and a value/parsing error. |
 | `omp.SchemeNotReadable` | `omp.UrlError` | Scheme has no reader in this deployment. |
 | `omp.SelectorError` | `omp.UrlError` | Invalid selector syntax or out-of-bounds range. |
+
+**Resolved (2026-08-20 ruling):** `SelectorError` remains one class under `UrlError`,
+shared by artifact and URL readers. `UrlError` itself derives from both `omp.OmpError` and
+`ValueError`.
 
 ### `omp.state_dir`
 
@@ -1273,8 +1277,9 @@ filesystem runs where the filesystem is (`site=omp.Site.ENV`,
 
 ```python
 import omp
+import omp_remote
 
-@omp.remote
+@omp_remote.remote
 def watermark(state: omp.EnvPath) -> str | None:
     import sqlite3
     db = sqlite3.connect(state.local_path() / "index.db")
@@ -1283,7 +1288,7 @@ def watermark(state: omp.EnvPath) -> str | None:
     row = db.execute("SELECT v FROM meta WHERE k='watermark'").fetchone()
     return row[0] if row else None
 
-@omp.remote
+@omp_remote.remote
 def apply_rows(state: omp.EnvPath, rows: list[tuple[int, str]], mark: str) -> None:
     import sqlite3
     db = sqlite3.connect(state.local_path() / "index.db")
@@ -1353,12 +1358,13 @@ folders and worktrees appear as phantom duplicate projects.
 writes turn receipts.
 
 ```python
+import time
 import omp
 
 @omp.command("usage")
 async def usage(invocation: omp.ui.Invocation, ctx: omp.Context) -> omp.ui.Tml:
     report = await omp.sessions.usage(omp.UsageQuery(
-        since_ms=omp.now_ms() - 30 * 86_400_000,
+        since_ms=time.time_ns() // 1_000_000 - 30 * 86_400_000,
         group_by=(omp.GroupBy.PROVIDER, omp.GroupBy.MODEL),
         bucket=omp.Bucket.DAY,
         filter=omp.SessionFilter(project=""),      # every project
@@ -1497,6 +1503,8 @@ accumulated data.
 sessions.
 
 ```python
+import time
+
 @omp.telemetry(["model_request"])
 async def record(event: omp.ModelRequest, ctx: omp.Context) -> None:
     omp.journal.append(CacheTurn(
@@ -1511,7 +1519,7 @@ async def record(event: omp.ModelRequest, ctx: omp.Context) -> None:
 async def forensics(invocation: omp.ui.Invocation, ctx: omp.Context) -> omp.ui.Tml:
     by_fp: dict[str, list[float]] = {}
     for info in await omp.sessions.list(omp.SessionFilter(
-            project="", since_ms=omp.now_ms() - 7 * 86_400_000)):
+            project="", since_ms=time.time_ns() // 1_000_000 - 7 * 86_400_000)):
         async for e in omp.sessions.journal(
                 info.id, kinds=["dev.mrclrchtr.cache.turn"]):
             if e.value is not None:                # lifted from v.2 where possible
@@ -2406,6 +2414,8 @@ as the historical record.
    at any cancellation granularity `docs/py/04-placement.md` ultimately lands
    on, which is the most this namespace needs to promise now that the blast
    radius is bounded to one extension.
+
+7. **Resolved (2026-08-20 ruling): `SelectorError` is one shared class deriving from `UrlError`; artifact reads and URL reads use the same selector vocabulary. `UrlError` is rebased to `omp.OmpError, ValueError`.** **Selector error hierarchy.** The artifact exception table placed `SelectorError` under `ArtifactError` (`docs/py/09-journal.md:1079-1085`), while the URL exception table placed the same public class under `UrlError` and described the wider selector semantics (`docs/py/09-journal.md:1225-1228`); the competing readings were two namespace-specific selector classes versus one shared URL/value-error hierarchy.
 
 ### Revision 2 (post-review)
 

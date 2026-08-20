@@ -17,7 +17,7 @@
 > the durable approval ticket, env-side admission),
 > [`07-ui.md`](07-ui.md) (`omp.ui.confirm`, `omp.ui.DialogOutcome`, `omp.ui.InvocationMode`,
 > `@omp.command`, TML),
-> [`08-context.md`](08-context.md) (`omp.Item`, `Role`, `StopReason`, `MessageRef`,
+> [`08-context.md`](08-context.md) (`omp.MessageRef`, `Role`, `StopReason`,
 > `CompactionEvent`, `CompactionAction`, `thread_projection`, `ContextPatch`, `DelegateSpec`,
 > prompt slots),
 > [`09-journal.md`](09-journal.md) (`omp.journal`, `omp.sessions`, `artifact://`),
@@ -356,7 +356,7 @@ Four properties make the round-trips that remain safe:
    `ui.custom` component actually mounts (`runner.ts:146-187`, `runner.ts:282-298`) — kept in
    intent, but made explicit on the wire (`BudgetPause`) instead of inferred from which request is
    in flight, which is why pi has to special-case component mounting. Non-interactive round-trips
-   (`omp.journal.append`, `omp.env.read_file`) do **not** suspend it. Approval waits no longer
+   (`omp.journal.append`, reads through `omp.env.docs.open`) do **not** suspend it. Approval waits no longer
    appear here at all: the ticket is Core's, so no handler budget is suspended for one.
 3. **Dialogs never raise.** `omp.ui.confirm` / `select` / `input` / `ask_user` return
    `omp.ui.DialogOutcome` and, absent a TUI, return
@@ -587,7 +587,7 @@ review identified in the band model is structurally impossible here.
 type HookDecision = Allow | Deny | Modify | Defer | RequireApproval
 ```
 
-A previous revision named this type `omp.Verdict`, colliding with
+A previous revision named this type `Verdict`, colliding with
 [`02-verdicts.md`](02-verdicts.md)'s durable call outcome of the same name. The collision was real,
 not cosmetic — one symbol meant "a hook's answer" in this document and "what a call settled as" in
 its sibling. Both are renamed: the hook decision is `omp.HookDecision`, the durable outcome is
@@ -715,7 +715,7 @@ paid inference. REVIEW remains the paid-classifier phase for those events.
 A hook registered at `OBSERVE` that returns anything other than `Defer()`/`None` raises
 `omp.HookContractError`. This makes "I only wanted to watch" enforceable instead of aspirational.
 
-**This replaces `omp.Priority`, and the replacement is a reversal, not a rename.** A previous
+**This replaces `Priority`, and the replacement is a reversal, not a rename.** A previous
 revision ordered hooks by arbitrary integer priority with six named band anchors (`PRE_FILTER`
 900, `MUTATE` 700, `AUTO_REVIEW` 500, `INTERACTIVE` 300, `REMOTE` 100, `OBSERVE` 0) and dispatched
 band-by-band, concurrently within a band. The review demonstrated the model was incoherent on its
@@ -863,8 +863,9 @@ Timeouts are `omp.Duration` values throughout (config strings such as `"5s"` par
 | `STREAM` | Per coalesced stream window | `250ms` | `1s` |
 | `ASYNC` | Off the critical path; never awaited | n/a | n/a |
 
-`omp.DEFAULT_HOOK_TIMEOUT` and `omp.ACTIVATION_TIMEOUT` ([`00-overview.md`](00-overview.md)) are the
-host-level defaults applied when an event declares none; the table above is the per-event override
+`omp.DEFAULT_HOOK_TIMEOUT` (`Duration("5s")`) and `omp.ACTIVATION_TIMEOUT`
+([`00-overview.md`](00-overview.md)) are the host-level defaults applied when an event declares
+none; the table above is the per-event override
 and wins where the two differ. The one place they differ is `CALL`, deliberately: 30 seconds is pi's
 `EXTENSION_HANDLER_TIMEOUT_MS` (`runner.ts:85`), the number the ecosystem's external
 approvers were written against. pi's `SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS` is a separate
@@ -891,6 +892,8 @@ EVENT_IDS: Mapping[str, int]
 ```
 Stable dense id per event name, and the bit position in the subscription bitmap (§2.5). Ids are
 append-only; a removed event's id is never reused.
+
+`omp.events.EventSpec` is the frozen row type returned by catalog lookup:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -922,8 +925,10 @@ def default_decision(event: str) -> type[Allow] | type[Deny]: ...
 def field_composition(event: str) -> Mapping[str, Composition]: ...
 ```
 
-`spec` and `default_decision` raise `omp.UnknownEvent` for an unknown name. `subscribed` reports
-whether the *core* currently has this event's bit set — useful to skip building an expensive
+`omp.events.specs()` iterates the immutable rows in event-id order, and
+`omp.events.default_decision(event)` returns the catalog fallback. `spec` and `default_decision`
+raise `omp.UnknownEvent` for an unknown name. `subscribed` reports whether the *core* currently has
+this event's bit set — useful to skip building an expensive
 `omp.journal` annotation nobody will read.
 
 ### 3.9 `omp.limits`
@@ -947,6 +952,11 @@ whether the *core* currently has this event's bit set — useful to skip buildin
 | `omp.ReentrancyError` | A hook exceeds `omp.limits.REENTRANCY_DEPTH` | Propagates out of the awaited call; uncaught, becomes the event's failure decision |
 | `omp.PhaseConflict` | A hook awaits a CONTROL operation whose service requires a loop phase (`AgentPhase`) its own pending decision is blocking | Propagates immediately rather than deadlocking |
 | `omp.HostShuttingDown` | A hook awaits anything after `session_shutdown` began | Propagates; handlers should treat it as "stop cleanly" |
+
+`omp.hooks.APPROVAL_DEADLINE` is `omp.Duration("5m")`, the default wall-clock deadline carried by
+durable approval requests. `omp.hooks.dispatch_hook` is the public CONTROL dispatch arm; until a
+host transport installs that arm, awaiting it raises `omp.NotWiredError` rather than performing I/O
+or silently accepting an event.
 
 An exception the handler does not catch is **never** silently swallowed into `Allow`. It becomes the
 event's failure decision, with the Python traceback journaled. This is pi's rule for `emitToolCall`
@@ -1048,7 +1058,7 @@ and maps one-to-one onto `omp_tool::Verdict` (`crates/tool/src/lib.rs:251-260`);
 revision called this enum `VerdictKind`; it is renamed with the rest of the verdict vocabulary
 (§3.2).
 
-Types owned elsewhere and referenced here: `Role`, `StopReason`, `omp.Item`, `MessageRef`,
+Types owned elsewhere and referenced here: `Role`, `StopReason`, `omp.MessageRef`,
 `CompactionEvent`, `CompactionAction`, `ContextView`, `ContextPatch`, `DelegateSpec`
 ([`08-context.md`](08-context.md)); `omp.Place`,
 `omp.WorkerInfo` ([`04-placement.md`](04-placement.md)); `omp.ui.InvocationMode`,
@@ -1330,7 +1340,7 @@ class DeadlineScope(enum.StrEnum):
 `AgentPhase`, `InterruptClass`, `DrainPoint` and `InterruptSource` mirror the Rust enums exactly
 (`crates/agent/src/events.rs:19-29`, `crates/agent/src/mailbox.rs:10-60`), so an extension that
 reasons about interrupt timing reasons about the same taxonomy the loop does rather than a
-reinvented one. A previous revision exported the loop mirror as bare `omp.Phase`, colliding with
+reinvented one. A previous revision exported the loop mirror as bare `Phase`, colliding with
 two other "phase" meanings across the set; it is renamed `AgentPhase` (matching the Rust name),
 with `omp.LifecyclePhase` and `omp.InvocationPhase` owned by [`00-overview.md`](00-overview.md)
 and [`03-params.md`](03-params.md), and `omp.HookPhase` in §3.4.
@@ -1716,12 +1726,12 @@ accept `provider=` scoping (§3.1).
 | Event | Payload | Ret | Ph | Lat | Fail | Re | Def |
 |---|---|---|---|---|---|---|---|
 | `provider_login` | `13-inference.md` | `HookDecision` | any | SESSION | **DENY** | yes | `Allow` |
-| `provider_refresh` | `13-inference.md` | `HookDecision` | any | SESSION | **DENY** | no | `Allow` |
+| `provider_refresh` | `13-inference.md` | `omp.Credential` | domain | SESSION | **DENY** | no | — |
 | `provider_sign` | `13-inference.md` | `HookDecision` | any | TURN | **DENY** | no | `Allow` |
 | `before_request` | `13-inference.md` | `HookDecision` | any | TURN | DEFER | no | `Allow` |
-| `models_discover` | `13-inference.md` | `HookDecision` | any | SESSION | DEFER | yes | `Allow` |
+| `models_discover` | `13-inference.md` | `Sequence[omp.ModelSpec] \| omp.DiscoveryPage` | domain | SESSION | DEFER | yes | — |
 | `provider_error` | `13-inference.md` | `omp.Failover` | domain | TURN | **DENY** | yes | — |
-| `provider_usage` | `13-inference.md` | — | OBSERVE | TURN | DEFER | no | — |
+| `provider_usage` | `13-inference.md` | `omp.UsageReport \| None` | domain | TURN | DEFER | no | — |
 | `capability_budget` | `CapabilityBudgetEvent` | — | OBSERVE | TURN | DEFER | no | — |
 | `model_changed` | `ModelChangedEvent` | — | OBSERVE | TURN | DEFER | yes | — |
 | `credential_disabled` | `CredentialDisabledEvent` | — | OBSERVE | SESSION | DEFER | yes | — |
@@ -2916,12 +2926,12 @@ finding, §3.11 family D). What remains:
 Changes made in this revision, each named with the review point that drove it. Reversals are
 recorded in prose at the site of the change, per the verify-then-retract standard.
 
-- **P0#1 (symbol collisions).** `omp.Verdict` (hook decision) → `omp.HookDecision`; handler
+- **P0#1 (symbol collisions).** `Verdict` (hook decision) → `omp.HookDecision`; handler
   signatures, tables and examples updated file-wide. `VerdictKind` → `OutcomeKind`, aligned with
   `omp.CallOutcome`'s four arms (§3.2, §3.11). The local `CompactionEvent` and `CompactionDoneEvent`
   definitions are deleted; family H links [`08-context.md`](08-context.md)'s single definitions,
   with the duplication called out as the owner-defines/others-link violation it was.
-- **P0#6 (phases replace chain semantics).** `omp.Priority` bands, the purity-by-band rule, the
+- **P0#6 (phases replace chain semantics).** `Priority` bands, the purity-by-band rule, the
   same-band `REPLACE` `FieldError`, and the nine-step chain semantics are replaced by
   `omp.HookPhase = PRECHECK | TRANSFORM | REVIEW | APPROVAL | OBSERVE` (§3.4), the per-field
   composition rules restated for ordered TRANSFORM (§3.5), and the ten-step decision procedure
@@ -2955,8 +2965,8 @@ recorded in prose at the site of the change, per the verify-then-retract standar
   D), closing the former open question 7.
 - **§0 renames and conventions, file-wide.** `(event, ctx)` callback ABI in every example;
   `timeout_ms`/`coalesce_ms`/`*_ms` API fields → `omp.Duration`; typed locations (`EnvPath`,
-  `BlobRef`, `ArtifactUrl`) replace raw path/URL strings in payloads and examples; bare `omp.Phase`
-  → `AgentPhase`; `omp.limits.SHUTDOWN_BUDGET_MS` → `SHUTDOWN_BUDGET`; journal examples use typed
+  `BlobRef`, `ArtifactUrl`) replace raw path/URL strings in payloads and examples; bare `Phase`
+  → `AgentPhase`; `SHUTDOWN_BUDGET_MS` → `SHUTDOWN_BUDGET`; journal examples use typed
   entry instances (P0#17); the proto sketch renames `HookVerdict` → `HookDecision` and
   `SubscriptionSpec.priority` → `phase`/`order`.
 

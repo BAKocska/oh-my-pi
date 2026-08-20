@@ -520,6 +520,14 @@ buckets are `0`, never `None`, so arithmetic never needs a guard.
   None`.
 - `usd: float` (property) — `nanos_usd / 1e9`. For display. Do not aggregate over it.
 
+### `class PromptSlotFingerprint`
+
+`@dataclass(frozen=True, slots=True)`. One assembler-owned prompt-slot contribution.
+
+- `digest: str` — the slot's BLAKE3-128 content digest.
+- `size_bytes: int` — encoded size contributed to the assembled prompt.
+- `band: SlotClass` — the assembler band that placed the contribution.
+
 ### `class PromptFingerprint`
 
 `@dataclass(frozen=True, slots=True)`. The prompt-cache truth, computed by the assembler that built
@@ -1099,12 +1107,23 @@ a wire contract owned by `crates/telemetry/src/attrs.rs`, and an extension may n
 **Latency class** creation once per activation; `add` is lock-free and allocation-free.
 **Fails** open — with no exporter configured the instrument still exists and discards.
 
-Instruments are quota'd: instrument count and attribute **cardinality** are per-extension quotas
-surfaced in the extension's resource receipt (`docs/py/00-overview.md`). Creating an instrument
-beyond the quota raises `SubscriptionError`; an `add` whose attribute set would mint a series
-beyond the cardinality quota is folded into an `overflow="true"` series and publishes one
-`HostWarning(code="cardinality")` per instrument — the series count stays bounded no matter what an
-extension does per event.
+Instruments are quota'd with these proposed v1 defaults, exported by this namespace:
+
+```python
+omp.telemetry.MAX_INSTRUMENTS = 256
+omp.telemetry.MAX_CARDINALITY = 1024
+```
+
+`MAX_INSTRUMENTS` counts distinct instruments per extension. Creating instrument 257 raises
+`SubscriptionError`. `MAX_CARDINALITY` counts attribute series per instrument; an observation
+that would mint series 1025 is folded into the instrument's `overflow="true"` series and
+publishes exactly one `HostWarning(code="cardinality")` for that instrument. The series count
+therefore stays bounded no matter what an extension does per event. Both quota standings are
+surfaced in the extension's resource receipt (`docs/py/00-overview.md`).
+
+**Resolved (2026-08-20 ruling):** the proposed default values are 256 instruments per
+extension and 1024 attribute series per instrument, with the failure and overflow behavior
+above.
 
 ### `class Counter`
 
@@ -1410,8 +1429,9 @@ existed.
 
 ### `class ProcessTarget(ExportTarget)`
 
-- `process: str` — the name of a process declared through `omp.env.spawn_process`
-  (`docs/py/11-env.md`). Required. The process must already be declared; `export` does not spawn
+- `process: str` — the name of a process started through `await omp.env.proc.start(...)` or
+  atomically adopted/started through `await omp.env.proc.ensure(...)` (`docs/py/11-env.md`).
+  Required. The process must already be declared; `export` does not spawn
   anything itself, which is the whole point of retiring `spawn(…, {detached: true})`.
 - `framing: str = "jsonl"` — `"jsonl"` for newline-delimited JSON, `"lenprefix"` for
   varint-length-prefixed protobuf.
@@ -1430,7 +1450,7 @@ lives beside the **remote** Environment (`docs/py/14-deploy.md`).
 > wire-complete for exec, named processes, and blobs, but no Python client can open it. Until the
 > DATA edge lands (`docs/py/11-env.md`, `docs/py/00-overview.md`), `OtlpTarget` is the only export
 > target an extension can actually register, and the `@braintrust/pi-extension` port below is
-> correct in shape while its `spawn_process` line is aspirational.
+> correct in shape while its named-process start is aspirational.
 
 ### `class FileTarget(ExportTarget)`
 
@@ -1477,19 +1497,20 @@ does not raise.
 
 Frozen mapping from event field path to the exact OpenTelemetry attribute key, so a Python sink
 producing its own attributes produces byte-identical series to the Rust exporter:
-`semconv["served_model"] == "gen_ai.response.model"`,
+`semconv["model_request.served_model"] == "gen_ai.response.model"`,
 `semconv["tokens.cache_read"] == "gen_ai.usage.cache_read.input_tokens"`,
-`semconv["cost.nanos_usd"] == "omp.gen_ai.cost.estimated_usd"`.
+`semconv["compaction.reason"] == "omp.compaction.reason"`.
 
 The keys themselves are **not** redefined here. `crates/telemetry/src/attrs.rs` is the single
 authority and its own doc comment explains why: these literals are a compatibility contract, and
 changing one breaks live dashboards. Look up, never hardcode.
 
-### `attributes(event) -> Mapping[str, str | int | float | bool]`
+### `attributes(event) -> Mapping[str, object]`
 
 Projects an event onto its wire attribute set using `semconv`, skipping fields that are `None` or
-zero exactly as the Rust exporter does. The one-line way to forward an event to a foreign collector
-without rebuilding the vocabulary.
+numeric zero exactly as the Rust exporter does. Scalar values retain their scalar type and
+homogeneous attribute arrays become tuples. The one-line way to forward an event to a foreign
+collector without rebuilding the vocabulary.
 
 ```python
 @omp.telemetry(["model_request"])
@@ -1593,10 +1614,13 @@ watermark rather than inheriting the old one.
   are one value, not two that agree.
 - `QUERY_LIMIT_MAX: int = 10_000` — hard cap on `Query.limit`.
 - `METRIC_PREFIX: str = "omp.ext."` — mandatory prefix for extension-defined instruments.
-- `SPILL_BYTES: int = 51_200` — the spill gate's byte budget, mirroring
+- `DEFAULT_MAX_BYTES: int = 51_200` — default byte budget for an inline rendered result.
+- `DEFAULT_MAX_LINES: int = 3_000` — default line budget for an inline rendered result.
+- `DEFAULT_MAX_COLUMN: int = 512` — default per-line UTF-16 column budget.
+- `SPILL_BYTES: int = DEFAULT_MAX_BYTES` — telemetry name for the byte spill gate, mirroring
   `omp_tools::render::truncate::DEFAULT_MAX_BYTES`.
-- `SPILL_LINES: int = 3_000` — its line budget (`DEFAULT_MAX_LINES`).
-- `SPILL_COLUMN: int = 512` — its per-line UTF-16 budget (`DEFAULT_MAX_COLUMN`).
+- `SPILL_LINES: int = DEFAULT_MAX_LINES` — telemetry name for the line spill gate.
+- `SPILL_COLUMN: int = DEFAULT_MAX_COLUMN` — telemetry name for the column spill gate.
 
 ### Exceptions
 
@@ -1662,10 +1686,9 @@ async def start_tracing(event, ctx) -> None:
     # Supervised, restartable, killable — not `spawn(..., {detached: true})`.
     # For a remote-declared extension this process lives beside the REMOTE
     # Environment; see docs/py/11-env.md and docs/py/14-deploy.md.
-    await omp.env.spawn_process(
+    await omp.env.proc.ensure(
         "bt-trace-daemon",
-        ["bt", "trace", "daemon", "--stdio"],
-        restart="on-failure",
+        "bt trace daemon --stdio",
     )
     omp.telemetry.export(
         omp.telemetry.ProcessTarget(
@@ -2106,8 +2129,8 @@ carries the keys for most of what the events record, and the mapping is mechanic
 | `ProviderError.error_kind` | `error.type` | `gen_ai::ERROR_TYPE` |
 | `ModelRequest.service_tier` | `openai.request.service_tier` | `openai::REQUEST_SERVICE_TIER` |
 
-`omp.telemetry.semconv` is generated from that table, so the Python mapping cannot drift from the
-Rust constants. `attributes(event)` applies it with the exporter's own skip-if-zero rule, which is
+`omp.telemetry.semconv` is the frozen Python projection of that authority's documented table.
+`attributes(event)` applies it with the exporter's own skip-if-zero rule, which is
 why a Python sink and the Rust exporter produce identical series rather than similar ones.
 
 Genuinely new keys are needed for the facts `attrs.rs` has never modelled, and they belong in
@@ -2576,6 +2599,8 @@ Conflicts, stated rather than glossed:
    to export, never to subscriptions or the index — meaning the index grows with full fidelity and
    question 1 gets harder. Whether tail sampling on the index is worth its complexity is open.
 
+7. **Resolved (2026-08-20 ruling): proposed defaults are `omp.telemetry.MAX_INSTRUMENTS = 256` distinct instruments per extension and `omp.telemetry.MAX_CARDINALITY = 1024` attribute series per instrument; exceeding the first raises `SubscriptionError`, while exceeding the second folds observations into `overflow="true"` and emits one `HostWarning(code="cardinality")` per instrument.** **Telemetry quota values.** The overview defines telemetry cardinality as a core-owned per-extension quota without concrete numbers (`docs/py/00-overview.md:368-373`), while this document specified instrument rejection and overflow behavior but left both limits unnamed (`docs/py/10-telemetry.md:1102-1108`); the competing readings were deployment-only unspecified limits versus exported concrete proposed defaults.
+
 ### Revision 2 (post-review)
 
 Changes this file made in the post-review revision, and the review point that drove each:
@@ -2607,7 +2632,7 @@ Changes this file made in the post-review revision, and the review point that dr
   gained the `"cardinality"` code.
 - **Principal + provenance stamping (§4).** `Envelope` gained `principal` and `generation`;
   `ExtensionRef` now carries the full provenance septet (P0#15), with `origin` renamed `layer`.
-- **Rename table (§0).** `omp.Verdict`-as-durable-outcome → `omp.CallOutcome` throughout:
+- **Rename table (§0).** `Verdict`-as-durable-outcome → `omp.CallOutcome` throughout:
   `ToolCall.verdict` → `ToolCall.outcome` with 02-owned arm names, `Compaction.verdicts_kept` →
   `outcomes_kept` (and the proposed `omp.compaction.outcomes_kept` key), `RevMetrics.uncommitted` →
   `abandoned`. "Commit" is reserved for `ASSISTANT_ITEM_COMMITTED` (P0#3): `ToolCall.committed:

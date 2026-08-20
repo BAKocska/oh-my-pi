@@ -23,28 +23,19 @@ from typing import Any as _Any
 from _omp import (
     ActivateReason,
     AgentUrl,
-    ApiLevelError,
     ArtifactUrl,
     Authority,
     BlobRef,
-    CapabilityError,
     ClientPath,
     CostClass,
-    DeadlineExceeded,
-    DeclarationLimit,
-    DeclarationSealed,
-    DuplicateRegistration,
     Durability,
     Duration,
-    EffectsNotAuthorized,
     EnvPath,
     EnvUnavailable,
-    FrameTooLarge,
     HistoryUrl,
     HostDisconnected,
     InvocationPhase,
     LifecyclePhase,
-    ManifestError,
     OmpError,
     OperationSpec,
     RestartReason,
@@ -54,7 +45,6 @@ from _omp import (
     ResourceReceipt,
     Secret,
     StaleGeneration,
-    TrustError,
     WorkspaceUri,
     _scheme_snapshot,
     _phase_legality_matrix,
@@ -133,6 +123,12 @@ class Fault:
 
     __slots__ = ()
 
+    def __init_subclass__(cls, **kwargs: _Any) -> None:
+        super().__init_subclass__(**kwargs)
+        from ._verdicts import _validate_verdict_schema
+
+        _validate_verdict_schema(cls)
+
     def __new__(cls, *_args: _Any, **_kwargs: _Any) -> Fault:
         if cls is Fault:
             raise TypeError("Fault is a marker base; instantiate a frozen dataclass subclass")
@@ -146,13 +142,28 @@ class Fault:
 
 
 from ._context import Context
-from ._errors import ExtensionError, SpecError, NotWiredError
+from ._errors import (
+    ApiLevelError,
+    CapabilityError,
+    DeadlineExceeded,
+    DeclarationLimit,
+    DeclarationSealed,
+    DuplicateRegistration,
+    EffectsNotAuthorized,
+    ExtensionError,
+    FrameTooLarge,
+    ManifestError,
+    NotWiredError,
+    SpecError,
+    TrustError,
+)
 from ._scope import Trust
 from ._verdicts import (
     ArtifactLifetime,
     ArtifactRef,
     BlobPart,
     Budget,
+    BudgetError,
     AbortKind,
     Aborted,
     ArgsRejected,
@@ -168,20 +179,39 @@ from ._verdicts import (
     Ok,
     Part,
     Payload,
+    Postcondition,
+    PostconditionStatus,
     PromptCaps,
     RecordedCall,
     Rev,
+    RevError,
     SPILL_INLINE_LIMIT,
     SpillBudget,
     TextPart,
     ToolIdentity,
     Update,
+    VerdictSchemaError,
+    VerdictShapeError,
     View,
+    dumps,
     jobs,
+    loads,
     prompt,
 )
 
-from .journal import JournalError
+from .journal import (
+    EntryAccessDenied,
+    EntryId,
+    EntryKindConflict,
+    EntryTooLarge,
+    EntryUndecodable,
+    JournalEntry,
+    JournalError,
+    JournalIndeterminate,
+    StateEntry,
+    StateEntryId,
+    UnknownEntryKind,
+)
 
 
 class StateScopeDenied(JournalError):
@@ -302,17 +332,347 @@ CancelledError = _asyncio.CancelledError
 
 
 class Capability(_StrEnum):
-    """Manifest capabilities required by extension declarations."""
+    """Closed manifest capability vocabulary enforced by the frozen host."""
 
+    ENV_BLOB = "env.blob"
+    ENV_DOC_READ = "env.doc.read"
+    ENV_DOC_WRITE = "env.doc.write"
+    ENV_EXEC = "env.exec"
+    ENV_FS_READ = "env.fs.read"
+    ENV_FS_WRITE = "env.fs.write"
+    ENV_LSP = "env.lsp"
+    ENV_NET = "env.net"
+    ENV_PROCESS = "env.process"
+    ENV_SEARCH = "env.search"
+    ENV_WORKSPACE_SNAPSHOT = "env.workspace.snapshot"
+    ENV_WORKTREE = "env.worktree"
     PLACE_ENV = "place.env"
     PLACE_WORKER = "place.worker"
     SCHEDULES_PROJECT = "schedules:project"
+
+
+class Layer(_StrEnum):
+    """Deployment layer that admitted an extension."""
+
+    CLIENT = "client"
+    WORKSPACE = "workspace"
+
+
+class LogLevel(_StrEnum):
+    """Structured extension log severity."""
+
+    TRACE = "trace"
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+def _manifest_error(key: str, detail: str) -> ManifestError:
+    return ManifestError("omp.toml", key, detail)
+
+
+def _freeze_str_tuple(value: _Any, key: str) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raise _manifest_error(key, "must be a sequence of strings")
+    frozen = tuple(value)
+    if any(not isinstance(item, str) or not item for item in frozen):
+        raise _manifest_error(key, "must contain non-empty strings")
+    return frozen
+
+
+def _freeze_mapping(value: _Any, key: str) -> _Mapping[str, _Any]:
+    if not isinstance(value, _Mapping):
+        raise _manifest_error(key, "must be a mapping")
+    if any(not isinstance(name, str) or not name for name in value):
+        raise _manifest_error(key, "keys must be non-empty strings")
+    return _MappingProxyType(dict(value))
+
+
+def _manifest_hash_value(value: _Any) -> _Any:
+    if isinstance(value, _Mapping):
+        return tuple(
+            sorted(
+                (key, _manifest_hash_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (tuple, list, set, frozenset)):
+        items = (_manifest_hash_value(item) for item in value)
+        return tuple(sorted(items, key=repr)) if isinstance(value, (set, frozenset)) else tuple(items)
+    try:
+        hash(value)
+    except TypeError:
+        slots = getattr(type(value), "__slots__", ())
+        return (
+            type(value),
+            tuple(
+                (slot, _manifest_hash_value(getattr(value, slot)))
+                for slot in slots
+                if hasattr(value, slot)
+            ),
+        )
+    return value
+
+
+@_dataclass(frozen=True, slots=True)
+class ToolEntry:
+    """One statically declared manifest tool."""
+
+    name: str
+    kind: str
+    family: str
+    rev: int
+    module: str
+    summary: str
+
+    def __post_init__(self) -> None:
+        for key in ("name", "module", "summary"):
+            if not isinstance(getattr(self, key), str) or not getattr(self, key):
+                raise _manifest_error(f"tools.{key}", "must be a non-empty str")
+        if not isinstance(self.family, str):
+            raise _manifest_error("tools.family", "must be str")
+        if self.kind not in {"soft", "hard"}:
+            raise _manifest_error("tools.kind", "must be 'soft' or 'hard'")
+        if not isinstance(self.rev, int) or isinstance(self.rev, bool) or self.rev < 1:
+            raise _manifest_error("tools.rev", "must be a positive int")
+
+
+@_dataclass(frozen=True, slots=True)
+class HookEntry:
+    """One statically declared manifest hook subscription."""
+
+    event: str
+    phase: str
+    module: str
+    order: int | None = None
+
+    def __post_init__(self) -> None:
+        for key in ("event", "phase", "module"):
+            if not isinstance(getattr(self, key), str) or not getattr(self, key):
+                raise _manifest_error(f"hooks.{key}", "must be a non-empty str")
+        if self.order is not None and (
+            not isinstance(self.order, int) or isinstance(self.order, bool)
+        ):
+            raise _manifest_error("hooks.order", "must be int or None")
+
+
+@_dataclass(frozen=True, slots=True)
+class ServiceEntry:
+    """One service implementation declared by a manifest."""
+
+    name: str
+    rev: int
+    module: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise _manifest_error("services.name", "must be a non-empty str")
+        if not isinstance(self.module, str) or not self.module:
+            raise _manifest_error("services.module", "must be a non-empty str")
+        if not isinstance(self.rev, int) or isinstance(self.rev, bool) or self.rev < 1:
+            raise _manifest_error("services.rev", "must be a positive int")
+
+
+@_dataclass(frozen=True, slots=True)
+class Requires:
+    """Inert Python, wheel, and service requirements from a manifest."""
+
+    python: str | None = None
+    wheels: tuple[str, ...] = ()
+    services: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.python is not None and (
+            not isinstance(self.python, str) or not self.python
+        ):
+            raise _manifest_error("requires.python", "must be a non-empty str or None")
+        object.__setattr__(
+            self, "wheels", _freeze_str_tuple(self.wheels, "requires.wheels")
+        )
+        object.__setattr__(
+            self, "services", _freeze_str_tuple(self.services, "requires.services")
+        )
+
+
+@_dataclass(frozen=True, slots=True)
+class Manifest:
+    """Parsed, immutable manifest of the calling extension."""
+
+    id: str
+    name: str
+    version: str
+    omp_api: int
+    description: str | None
+    entry: str
+    capabilities: frozenset[Capability]
+    tools: tuple[ToolEntry, ...]
+    hooks: tuple[HookEntry, ...]
+    services: tuple[ServiceEntry, ...]
+    workers: _Mapping[str, "WorkerSpec"]
+    settings: _Mapping[str, SettingSchema]
+    requires: Requires
+
+    def __post_init__(self) -> None:
+        for key in ("id", "name", "version", "entry"):
+            if not isinstance(getattr(self, key), str) or not getattr(self, key):
+                raise _manifest_error(key, "must be a non-empty str")
+        if _re.fullmatch(r"[a-z0-9.-]{3,128}", self.id) is None:
+            raise _manifest_error("id", "must be reverse-DNS form")
+        if not isinstance(self.omp_api, int) or isinstance(self.omp_api, bool):
+            raise _manifest_error("omp_api", "must be int")
+        if self.omp_api not in API_LEVELS:
+            raise ApiLevelError(self.omp_api, API_LEVELS)
+        if self.description is not None and not isinstance(self.description, str):
+            raise _manifest_error("description", "must be str or None")
+        try:
+            capabilities = frozenset(Capability(cap) for cap in self.capabilities)
+        except (TypeError, ValueError) as error:
+            raise _manifest_error("capabilities", str(error)) from error
+        try:
+            tools = tuple(
+                item if isinstance(item, ToolEntry) else ToolEntry(**item)
+                for item in self.tools
+            )
+            hooks = tuple(
+                item if isinstance(item, HookEntry) else HookEntry(**item)
+                for item in self.hooks
+            )
+            services = tuple(
+                item if isinstance(item, ServiceEntry) else ServiceEntry(**item)
+                for item in self.services
+            )
+        except (TypeError, ValueError) as error:
+            raise _manifest_error("declarations", str(error)) from error
+        workers = _freeze_mapping(self.workers, "workers")
+        try:
+            workers = _MappingProxyType(
+                {
+                    name: (
+                        worker
+                        if isinstance(worker, WorkerSpec)
+                        else WorkerSpec(**({"name": name} | dict(worker)))
+                    )
+                    for name, worker in workers.items()
+                }
+            )
+        except (TypeError, ValueError) as error:
+            raise _manifest_error("workers", str(error)) from error
+        if any(worker.name != name for name, worker in workers.items()):
+            raise _manifest_error("workers", "mapping key must match WorkerSpec.name")
+        settings = _freeze_mapping(self.settings, "settings")
+        for name, schema in settings.items():
+            if not isinstance(schema, SettingSchema):
+                try:
+                    settings = _MappingProxyType(
+                        {
+                            item_name: (
+                                item_schema
+                                if isinstance(item_schema, SettingSchema)
+                                else SettingSchema(**item_schema)
+                            )
+                            for item_name, item_schema in settings.items()
+                        }
+                    )
+                except (TypeError, ValueError) as error:
+                    raise _manifest_error(f"settings.{name}", str(error)) from error
+                break
+        try:
+            requires = (
+                self.requires
+                if isinstance(self.requires, Requires)
+                else Requires(**self.requires)
+            )
+        except (TypeError, ValueError) as error:
+            raise _manifest_error("requires", str(error)) from error
+        object.__setattr__(self, "capabilities", capabilities)
+        object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "hooks", hooks)
+        object.__setattr__(self, "services", services)
+        object.__setattr__(self, "workers", workers)
+        object.__setattr__(self, "settings", settings)
+        object.__setattr__(self, "requires", requires)
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.id,
+                self.name,
+                self.version,
+                self.omp_api,
+                self.description,
+                self.entry,
+                self.capabilities,
+                self.tools,
+                self.hooks,
+                self.services,
+                _manifest_hash_value(self.workers),
+                _manifest_hash_value(self.settings),
+                self.requires,
+            )
+        )
+
+
+def manifest() -> Manifest:
+    """Return the host-delivered manifest for the calling extension."""
+    backend = _control_backend.get()
+    value = getattr(backend, "manifest", None)
+    if callable(value):
+        value = value()
+    if value is None:
+        raise NotWiredError("omp.manifest")
+    if isinstance(value, Manifest):
+        return value
+    if not isinstance(value, _Mapping):
+        raise TypeError("host manifest must be a Manifest or mapping")
+    return Manifest(**value)
+
+
+def is_subscribed(event: str) -> bool:
+    """Return whether this child declared a hook for ``event``."""
+    if not isinstance(event, str):
+        raise TypeError("event must be str")
+    return any(key[0] == event for key in _declarations.snapshot().hooks)
+
+
+def restart_reason() -> RestartReason | None:
+    """Return the host-delivered reason for this child generation."""
+    backend = _control_backend.get()
+    if backend is None or not hasattr(backend, "restart_reason"):
+        raise NotWiredError("omp.restart_reason")
+    value = backend.restart_reason
+    if value is None:
+        return None
+    return value if isinstance(value, RestartReason) else RestartReason(value)
+
+
+def require(*caps: Capability) -> None:
+    """Raise ``CapabilityError`` for the first capability not granted."""
+    requested: tuple[Capability, ...] = tuple(
+        cap if isinstance(cap, Capability) else Capability(cap) for cap in caps
+    )
+    if not requested:
+        return
+    try:
+        Context.current().require(*requested)
+        return
+    except LookupError:
+        backend = _control_backend.get()
+        granted = getattr(backend, "capabilities", None)
+        if granted is None:
+            raise NotWiredError("omp.require") from None
+        granted_values = frozenset(
+            str(getattr(capability, "value", capability))
+            for capability in granted
+        )
+        for capability in requested:
+            if capability.value not in granted_values:
+                raise CapabilityError(capability.value)
 
 # Importing these frozen modules only creates declarations and namespace values.
 from . import env as env
 from . import urls as urls
 from . import journal as journal
-from .journal import EntryId, JournalEntry
 from . import artifacts as artifacts
 from .artifacts import (
     ArtifactCorrupt,
@@ -324,6 +684,7 @@ from .artifacts import (
     ArtifactWriter,
 )
 from . import ui as ui
+from .ui import completion
 from . import agents as agents
 from . import prompts as prompts
 from . import sessions as sessions
@@ -331,15 +692,57 @@ from . import telemetry as telemetry
 from . import context as context
 from . import policy as policy
 from . import limits as limits
+from . import mcp as mcp
+from .limits import (
+    ACTIVATION_TIMEOUT,
+    API_LEVEL,
+    API_LEVELS,
+    CANCEL_GRACE,
+    DOCS_TOTAL_BUDGET,
+    HEALTH_TIMEOUT,
+    HOST_VERSION,
+    MAX_FRAME_BYTES,
+    MAX_HOST_CHILDREN,
+    MAX_PENDING_EFFECTS,
+    PING_INTERVAL,
+    PYTHON_REV,
+    SCHEMA_REV,
+    SHUTDOWN_GRACE,
+)
 from . import creds as creds
 from . import secrets as secrets
 from .creds import CredentialMeta, ScopedToken
 from .secrets import SecretKind, SecretMode, SecretRule
+from .params import (
+    Abort,
+    Alias,
+    Arg,
+    ArgArray,
+    ArgFault,
+    ArgIssue,
+    ArgIssueKind,
+    ArgObject,
+    Args,
+    CommitAborted,
+    Ev,
+    IncomingParams,
+    Interrupt,
+    InterruptClosed,
+    Interrupted,
+    InterruptibleParams,
+    InvocationEnded,
+    ParamsMisuse,
+    ParamsProtocol,
+    Repair,
+    RepairKind,
+    params,
+)
 from .prompts import (
     PromptContext,
     SlotClass,
     SlotClassConflict,
     UnknownSlot,
+    VolatilePrompt,
     prompt_slot,
 )
 from .context import (
@@ -373,6 +776,8 @@ from .context import (
 )
 from .sessions import (
     Bucket,
+    SessionAccessDenied,
+    SessionError,
     GroupBy,
     SessionFilter,
     SessionInfo,
@@ -387,7 +792,7 @@ from .sessions import (
     UsageQuery,
     UsageReport,
 )
-from .telemetry import PromptFingerprint
+from .telemetry import ModelRequest, PromptFingerprint, TelemetryError
 renderer = ui.renderer
 message_renderer = ui.message_renderer
 command = ui.command
@@ -438,6 +843,7 @@ from .placement import (
     WorkerResources,
     WorkerSpec,
     WorkerState,
+    WorkerEvicted,
     WorkerUnavailable,
     worker_state,
     workers,
@@ -514,6 +920,7 @@ from .policy import (
     Span,
     TicketState,
     Tier,
+    tier_of,
     VIOLATION_COALESCE,
     Violation,
     ViolationKind,
@@ -590,6 +997,7 @@ from .provider import (
     SpeechFeature,
     SpeechRequest,
     SpeechResult,
+    StreamWatchdog,
     LoginRequest,
     LogprobCaps,
     ManagementSpec,
@@ -657,8 +1065,8 @@ from .provider import (
     TrustDomain,
     UnknownCapabilityPolicy,
     WatchModels,
+    intents,
     models,
-    provider,
     watch_models,
 )
 from . import hooks as hooks
@@ -917,6 +1325,7 @@ __all__ = (
     "BlobRef",
     "CancelledError",
     "CapabilityError",
+    "CANCEL_GRACE",
     "ClientPath",
     "CostClass",
     "Coerce",
@@ -1067,6 +1476,7 @@ __all__ = (
     "Detached",
     "Faulted",
     "FrameTooLarge",
+    "HEALTH_TIMEOUT",
     "HistoryUrl",
     "HostDisconnected",
     "JournalEntry",
@@ -1086,6 +1496,7 @@ __all__ = (
     "OmpError",
     "OperationSpec",
     "MAX_DECLARATIONS",
+    "MAX_FRAME_BYTES",
     "PlacementError",
     "Principal",
     "QuotaExceeded",
@@ -1093,117 +1504,7 @@ __all__ = (
     "RestartReason",
     "Scheme",
     "SchemeInfo",
-    "SchemeNotReadable",
-    "Selector",
-    "SelectorError",
-    "QuotaStatus",
-    "ResourceReceipt",
-    "ServiceClient",
-    "ServiceDefinition",
-    "Services",
-    "Part",
-    "Payload",
-    "PromptCaps",
-    "RecordedCall",
-    "Rev",
-    "SPILL_INLINE_LIMIT",
-    "SpillBudget",
-    "TextPart",
-    "Update",
-    "ToolIdentity",
-    "jobs",
-    "View",
-    "StaleGeneration",
-    "StateScope",
-    "SessionFilter",
-    "SessionInfo",
-    "SessionKind",
-    "SessionLink",
-    "SessionNotFound",
-    "SessionStatus",
-    "SlotClass",
-    "SlotClassConflict",
-    "TitleSource",
-    "UnknownSlot",
-    "Usage",
-    "UsageAccuracy",
-    "UsageBucket",
-    "UsageQuery",
-    "UsageReport",
-    "WatchModels",
-    "StateScopeDenied",
-    "Url",
-    "UrlError",
-    "TrustError",
-    "WorkspaceUri",
-    "env",
-    "agents",
-    "entry_kind",
-    "journal",
-    "artifacts",
-    "prompts",
-    "prompt_slot",
-    "sessions",
-    "telemetry",
-    "operation_spec",
-    "resources",
-    "service",
-    "parse",
-    "parse_selector",
-    "services",
-    "state",
-    "state_dir",
-    "urls",
-    "ui",
-    "schemes",
-    "BoundaryError",
-    "Capability",
-    "MAX_WORKERS",
-    "Place",
-    "PlaceKind",
-    "Restart",
-    "ShipError",
-    "Site",
-    "SiteKind",
-    "Spill",
-    "WorkerHandle",
-    "WorkerInfo",
-    "WorkerResources",
-    "command",
-    "shortcut",
-    "DuplicateRenderer",
-    "MessageView",
-    "renderer",
-    "message_renderer",
-    "WorkerSpec",
-    "WorkerState",
-    "WorkerUnavailable",
-    "approver",
-    "device",
-    "router",
-    "prompt",
-    "tool",
-    "worker_state",
-    "workers",
-    "devices",
-    "creds",
-    "secrets",
-    "models",
-    "provider",
-    "watch_models",
-    "DiagnosticCode",
-    "ContentDeclaration",
-    "ContentKind",
-    "Distribution",
-    "FailureCode",
-    "GrantError",
-    "IntegrityError",
-    "Origin",
-    "PackageError",
-    "Provenance",
-    "ResolutionError",
-    "SiteTree",
-    "ScopedToken",
+    "SHUTDOWN_GRACE",
     "Secret",
     "SecretKind",
     "SecretMode",
@@ -1333,5 +1634,84 @@ __all__ += (
     "context",
     "limits",
     "policy",
+)
+__all__ += (
+    "ACTIVATION_TIMEOUT",
+    "API_LEVEL",
+    "API_LEVELS",
+    "Abort",
+    "Alias",
+    "Arg",
+    "ArgArray",
+    "ArgFault",
+    "ArgIssue",
+    "ArgIssueKind",
+    "ArgObject",
+    "Args",
+    "BudgetError",
+    "Capability",
+    "CommitAborted",
+    "DOCS_TOTAL_BUDGET",
+    "EntryAccessDenied",
+    "EntryKindConflict",
+    "EntryTooLarge",
+    "EntryUndecodable",
+    "Ev",
+    "HOST_VERSION",
+    "HookEntry",
+    "IncomingParams",
+    "Interrupt",
+    "InterruptClosed",
+    "Interrupted",
+    "InterruptibleParams",
+    "InvocationEnded",
+    "JournalIndeterminate",
+    "Layer",
+    "LogLevel",
+    "MAX_HOST_CHILDREN",
+    "MAX_PENDING_EFFECTS",
+    "Manifest",
+    "ModelRequest",
+    "PING_INTERVAL",
+    "PYTHON_REV",
+    "ParamsMisuse",
+    "ParamsProtocol",
+    "Postcondition",
+    "PostconditionStatus",
+    "Repair",
+    "RepairKind",
+    "Requires",
+    "RevError",
+    "SCHEMA_REV",
+    "ServiceClient",
+    "ServiceDefinition",
+    "ServiceEntry",
+    "Services",
+    "SessionAccessDenied",
+    "SessionError",
+    "StateEntry",
+    "StateEntryId",
+    "StreamWatchdog",
+    "TelemetryError",
+    "ToolEntry",
+    "UnknownEntryKind",
+    "VerdictSchemaError",
+    "VerdictShapeError",
+    "VolatilePrompt",
+    "WorkerEvicted",
+    "completion",
+    "dumps",
+    "intents",
+    "is_subscribed",
+    "loads",
+    "manifest",
+    "mcp",
+    "params",
+    "require",
+    "resources",
+    "restart_reason",
+    "service",
+    "services",
+    "tier_of",
 )
 __all__ += hooks.__all__ + events.__all__ + ("hooks", "events")

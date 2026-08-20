@@ -366,6 +366,13 @@ server's edit is refused and your request returns the server's own result unchan
 The last two members are granted-but-unimplemented and exist so a caller can degrade rather than
 crash: `omp.env.has(Capability.WORKSPACE_SNAPSHOT)` is `False` on every Environment today.
 
+#### `await omp.env.worktree() -> omp.env.WorktreeInfo | None`
+
+Returns the isolated worktree containing the current workspace, or `None` for the primary
+workspace. `omp.env.WorktreeInfo` is a frozen dataclass with `id: str`, `root: EnvPath`,
+`base: str`, and `generation: int`; the generation fences stale topology. The Python symbol is
+frozen ahead of the host arm and currently raises `omp.NotWiredError` without performing I/O.
+
 #### `omp.env.has(*caps: Capability) -> bool`
 
 `True` only when every named capability is granted.
@@ -413,7 +420,7 @@ cannot run here". See `docs/py/04-placement.md`.
 
 **`omp.EffectsNotAuthorized`** (`docs/py/00-overview.md` owns it) is raised when a DATA operation
 arrives before its `OperationSpec.minimum_phase` — for everything in this namespace, before the
-invocation reached `EFFECTS_AUTHORIZED`. It replaces the first revision's `omp.env.Uncommitted`:
+invocation reached `EFFECTS_AUTHORIZED`. It replaces the first revision's `env.Uncommitted`:
 "commit" is reserved vocabulary now (`docs/py/03-params.md`), and the condition was never about a
 commit anyway — it is about authorization. The `env/v1` wire code is still `UNCOMMITTED`, because
 wire arms evolve additively and the frame vocabulary predates the rename; only the Python name
@@ -784,8 +791,9 @@ segments, verbatim apart from newline joining).
 
 ##### `class omp.env.SummaryUnavailable`
 
-`reason: SummaryReason`, `total_lines: int`, `language: str`, `parsed: bool`. `SummaryReason` has
-one member per refusal: `BINARY`, `MISSING_DOCUMENT`, `TOO_LARGE`, `TOO_MANY_LINES`,
+`reason: omp.env.SummaryReason`, `total_lines: int`, `language: str`, `parsed: bool`.
+`class omp.env.SummaryReason` has one member per refusal: `BINARY`, `MISSING_DOCUMENT`,
+`TOO_LARGE`, `TOO_MANY_LINES`,
 `BELOW_MINIMUM_LINES`, `PROSE_DISABLED`, `UNSUPPORTED_LANGUAGE`, `EMPTY`, `SYNTAX_ERROR`,
 `NO_ELISIONS`, `PARSER_FAILURE`.
 
@@ -849,7 +857,8 @@ not display those as if they described the current text.
 `class omp.env.LspBinding` — `server_id: bytes`, `name: str`, `sync: SyncPolicy`,
 `capabilities: dict`.
 
-`class omp.env.SyncPolicy` — `change: SyncKind` (`NONE`/`FULL`/`INCREMENTAL`), `open_close: bool`,
+`class omp.env.SyncPolicy` — `change: omp.env.SyncKind`
+(`NONE`/`FULL`/`INCREMENTAL`), `open_close: bool`,
 `will_save: bool`, `will_save_wait_until: bool`, `save: bool`, `save_include_text: bool`,
 `position_encoding: str` (the exact negotiated `PositionEncodingKind`, normally `utf-8`, `utf-16`,
 or `utf-32` — an extension computing offsets from LSP positions must honour it).
@@ -857,7 +866,8 @@ or `utf-32` — an extension computing offsets from LSP positions must honour it
 `class omp.env.LspEvent` — `server_id: bytes`, `method: str`, `params: Any`, `path: str | None`,
 `revision: Revision | None`.
 
-`class omp.env.LspBindingEvent` — `kind: LspBindingEventKind` (`READY`, `POLICY_CHANGED`,
+`class omp.env.LspBindingEvent` — `kind: omp.env.LspBindingEventKind`
+(`READY`, `POLICY_CHANGED`,
 `RESTARTED`, `STOPPED`), `binding: LspBinding`, `path: str | None`. `path` is omitted when an
 entire server stopped or restarted and every binding for it must be refreshed.
 
@@ -1219,9 +1229,10 @@ iterable of chunks; large payloads stream and are never materialized twice.
   `CommitBlobPut`, so a partial upload is never observable.
 - **Fail** closed
 
-#### `omp.env.blobs.writer() -> BlobWriter`
+#### `omp.env.blobs.writer() -> omp.env.BlobWriter`
 
-Async context manager for incremental uploads when the total size is unknown.
+Returns an `omp.env.BlobWriter`, an async context manager for incremental uploads when the total
+size is unknown.
 
 | Member | Meaning |
 |---|---|
@@ -2298,7 +2309,7 @@ Changes this file made for Rev 2, and the review point that drove each:
   [Effect authorization](#effect-authorization): all DATA calls before `EFFECTS_AUTHORIZED` are
   rejected env-side (confidentiality rationale included — a denied read that already happened has
   leaked), "commit" vocabulary is vacated in favor of `omp.InvocationPhase` states,
-  `omp.env.Uncommitted` is replaced by the 00-owned `omp.EffectsNotAuthorized` (wire code
+  `env.Uncommitted` is replaced by the 00-owned `omp.EffectsNotAuthorized` (wire code
   unchanged), and the lease-survives-commit and speculative-window claims are retracted in prose.
   `doc.pin()` is re-motivated accordingly; prepare tokens are noted as future work with their
   subset-only invariant, per `docs/py/03-params.md`.

@@ -1,4 +1,4 @@
-//! FastEmbed-backed local text embeddings.
+//! `FastEmbed`-backed local text embeddings.
 
 use std::{
 	collections::HashMap,
@@ -8,6 +8,7 @@ use std::{
 };
 
 use fastembed::{TextEmbedding, TextInitOptions};
+use omp_core::Str;
 use serde::Deserialize;
 
 use super::runtime::{
@@ -17,7 +18,8 @@ use super::runtime::{
 
 const MODEL_CATALOG_JSON: &str = include_str!("embedding_models.json");
 
-/// Third-party provenance disclosed for a model before FastEmbed can download it.
+/// Third-party provenance disclosed for a model before `FastEmbed` can download
+/// it.
 ///
 /// A missing optional value means the bundled catalog does not establish that
 /// fact. Downloaded model artifacts are never covered by OMP's project
@@ -25,38 +27,38 @@ const MODEL_CATALOG_JSON: &str = include_str!("embedding_models.json");
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDownloadMetadata {
-	/// FastEmbed model variant name.
-	pub model:                  String,
-	/// Hugging Face repository FastEmbed downloads from.
-	pub download_repository:    String,
-	/// Repository-relative model artifact selected by FastEmbed.
-	pub artifact:               String,
+	/// `FastEmbed` model variant name.
+	pub model:               Str,
+	/// Hugging Face repository `FastEmbed` downloads from.
+	pub download_repository: Str,
+	/// Repository-relative model artifact selected by `FastEmbed`.
+	pub artifact:            Str,
 	/// Immutable upstream revision, when established.
-	pub source_revision:        Option<String>,
+	pub source_revision:     Option<Str>,
 	/// Upstream model license identifier or expression, when established.
-	pub license:                Option<String>,
+	pub license:             Option<Str>,
 	/// Upstream license text or terms URL, when established.
-	pub license_url:            Option<String>,
+	pub license_url:         Option<Str>,
 	/// Whether upstream requires affirmative acceptance, when established.
-	pub acceptance_required:    Option<bool>,
+	pub acceptance_required: Option<bool>,
 	/// Upstream acceptance flow or terms URL, when established.
-	pub acceptance_url:         Option<String>,
+	pub acceptance_url:      Option<Str>,
 	/// Always false: downloaded artifacts are outside OMP's license grant.
-	pub omp_license_applies:    bool,
+	pub omp_license_applies: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelCatalog {
 	schema_version:    u32,
-	fastembed_version: String,
+	fastembed_version: Str,
 	models:            Vec<ModelDownloadMetadata>,
 }
 
-static MODEL_CATALOG: LazyLock<Result<HashMap<String, ModelDownloadMetadata>, String>> =
+static MODEL_CATALOG: LazyLock<Result<HashMap<Str, ModelDownloadMetadata>, String>> =
 	LazyLock::new(parse_model_catalog);
 
-fn model_catalog() -> LocalResult<&'static HashMap<String, ModelDownloadMetadata>> {
+fn model_catalog() -> LocalResult<&'static HashMap<Str, ModelDownloadMetadata>> {
 	MODEL_CATALOG.as_ref().map_err(|error| {
 		LocalError::new(
 			LocalErrorKind::Backend,
@@ -69,18 +71,16 @@ fn model_catalog() -> LocalResult<&'static HashMap<String, ModelDownloadMetadata
 pub fn model_download_metadata(
 	model: &fastembed::EmbeddingModel,
 ) -> LocalResult<&'static ModelDownloadMetadata> {
-	let model_name = model.to_string();
-	model_catalog()?
-		.get(&model_name)
-		.ok_or_else(|| {
-			LocalError::new(
-				LocalErrorKind::Backend,
-				format!("FastEmbed model provenance is missing for {model_name}"),
-			)
-		})
+	let model_name = Str::new(model.to_string());
+	model_catalog()?.get(&model_name).ok_or_else(|| {
+		LocalError::new(
+			LocalErrorKind::Backend,
+			format!("FastEmbed model provenance is missing for {model_name}"),
+		)
+	})
 }
 
-fn parse_model_catalog() -> Result<HashMap<String, ModelDownloadMetadata>, String> {
+fn parse_model_catalog() -> Result<HashMap<Str, ModelDownloadMetadata>, String> {
 	let catalog: ModelCatalog =
 		serde_json::from_str(MODEL_CATALOG_JSON).map_err(|error| error.to_string())?;
 	if catalog.schema_version != 1 {
@@ -99,10 +99,7 @@ fn parse_model_catalog() -> Result<HashMap<String, ModelDownloadMetadata>, Strin
 			return Err("model identity fields must be non-empty".to_owned());
 		}
 		if metadata.omp_license_applies {
-			return Err(format!(
-				"{} incorrectly applies an OMP project license",
-				metadata.model
-			));
+			return Err(format!("{} incorrectly applies an OMP project license", metadata.model));
 		}
 		for (name, value) in [
 			("source_revision", metadata.source_revision.as_deref()),
@@ -115,10 +112,7 @@ fn parse_model_catalog() -> Result<HashMap<String, ModelDownloadMetadata>, Strin
 			}
 		}
 		if metadata.acceptance_required == Some(true) && metadata.acceptance_url.is_none() {
-			return Err(format!(
-				"{} requires acceptance without an acceptance URL",
-				metadata.model
-			));
+			return Err(format!("{} requires acceptance without an acceptance URL", metadata.model));
 		}
 		let model = metadata.model.clone();
 		if entries.insert(model.clone(), metadata).is_some() {
@@ -137,9 +131,11 @@ fn parse_model_catalog() -> Result<HashMap<String, ModelDownloadMetadata>, Strin
 	for info in supported {
 		let model = info.model.to_string();
 		let metadata = entries
-			.get(&model)
+			.get(model.as_str())
 			.ok_or_else(|| format!("missing FastEmbed model {model}"))?;
-		if metadata.download_repository != info.model_code || metadata.artifact != info.model_file {
+		if metadata.download_repository.as_str() != info.model_code.as_str()
+			|| metadata.artifact.as_str() != info.model_file.as_str()
+		{
 			return Err(format!("{model} download identity does not match FastEmbed"));
 		}
 	}
@@ -230,7 +226,7 @@ impl EmbeddingAdapter {
 	///
 	/// Construction does not access the network. Callers can present this
 	/// disclosure before the first [`Self::embed`] call, which is the boundary
-	/// where FastEmbed may download the selected artifact.
+	/// where `FastEmbed` may download the selected artifact.
 	pub const fn download_metadata(&self) -> &ModelDownloadMetadata {
 		self.metadata
 	}
@@ -304,21 +300,17 @@ mod tests {
 	}
 
 	#[test]
-	fn existing_models_explicitly_leave_unknown_provenance_absent() {
+	fn catalog_entries_explicitly_include_provenance_fields() {
 		let catalog: Value =
 			serde_json::from_str(MODEL_CATALOG_JSON).expect("valid model provenance JSON");
 		let models = catalog["models"].as_array().expect("models array");
 		for model in models {
-			for field in [
-				"source_revision",
-				"license",
-				"license_url",
-				"acceptance_required",
-				"acceptance_url",
-			] {
+			for field in
+				["source_revision", "license", "license_url", "acceptance_required", "acceptance_url"]
+			{
 				assert!(
-					model.get(field).is_some_and(Value::is_null),
-					"{} must explicitly set {field} to null",
+					model.get(field).is_some(),
+					"{} must explicitly include {field}",
 					model["model"]
 				);
 			}

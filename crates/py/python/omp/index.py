@@ -13,12 +13,14 @@ import json
 from typing import Any
 from urllib.parse import quote, urljoin
 
+from _omp import OmpError
 
-class IndexError(ValueError):
+
+class IndexError(OmpError, ValueError):
     """A static index document did not satisfy the omp index schema."""
 
 
-class IndexTransportError(RuntimeError):
+class IndexTransportError(OmpError, RuntimeError):
     """A live index request could not be routed through the Environment."""
 
 

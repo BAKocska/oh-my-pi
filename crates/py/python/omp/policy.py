@@ -13,7 +13,7 @@ from _omp import Duration, EnvPath, OmpError, WorkspaceUri
 
 from ._errors import NotWiredError
 from ._registry import registry as _declarations
-from .hooks import ApprovalKind, ApprovalSpec, PolicyScope, Unreachable
+from .hooks import ApprovalKind, ApprovalSpec, CallTarget, CoreTool, DeviceCall, McpCall, PolicyScope, Unreachable
 
 
 class ParseFailure(StrEnum):
@@ -773,6 +773,18 @@ async def pending() -> tuple[ApprovalTicket, ...]:
     raise NotWiredError("omp.policy.pending")
 
 
+def tier_of(target: CallTarget) -> Tier:
+    """Return the effective approval tier for a logical call target.
+
+    Core owns tier resolution because it composes frozen declarations with
+    session configuration. This frozen half rejects values outside the closed
+    ``CallTarget`` union before reaching the not-yet-installed host arm.
+    """
+    if not isinstance(target, (CoreTool, DeviceCall, McpCall)):
+        raise TypeError("tier_of expects an omp.CallTarget")
+    raise NotWiredError("omp.tier_of")
+
+
 async def decide(ticket_id: str, decision: ApprovalDecision) -> None:
     """Resolve a ticket; an identical decision after an idempotent re-offer is a no-op."""
 
@@ -792,4 +804,5 @@ __all__ = (
     "RuleRef", "SandboxBackend", "SandboxCapabilities", "SandboxEnforcement", "SandboxMode", "SandboxProfile", "SandboxRequest",
     "Separator", "SandboxSessionKind", "Span", "TicketState", "Tier", "VIOLATION_COALESCE", "Violation", "ViolationKind",
     "amend", "approver", "capabilities", "decide", "effective_profile", "enforcement", "install", "match_paths", "parse", "pending",
+    "tier_of",
 )

@@ -18,7 +18,7 @@ tool through the full path-aware declaration surface, and the pit of success
 was on the wrong side of that surface. What survives unchanged is the claim
 the sentence was protecting — one catalog, one transport, no third
 registration path. `@omp.tool` is sugar over the same registry, not a
-parallel mechanism, and `@omp.streaming_device` keeps its name and its
+parallel mechanism, and `@streaming_device` keeps its name and its
 not-in-v1 status.
 
 ## Purpose
@@ -266,7 +266,7 @@ Four properties of that diagram are load-bearing:
    argument streaming is asking to be a core tool, and in v1 the answer is
    no. The invocation machine, and `IncomingParams` — the streaming-pull
    surface, re-scoped to core internals plus the future
-   `@omp.streaming_device` — are in [docs/py/03-params.md](03-params.md);
+   `@streaming_device` — are in [docs/py/03-params.md](03-params.md);
    the body contract itself is in the body-contract section below.
 4. **Constraint requests are already intents on the wire.** A declaration
    carries `ToolConstraint`, whose `SchemaConstraint { uint32 priority }` and
@@ -310,7 +310,7 @@ Three clauses, each deliberate:
   streaming is in v1. Input streaming is not — a distinction Revision 1
   left implicit and this revision states.
 - **Protocol selection is only by decorator.** `@omp.device` is this
-  contract; `@omp.streaming_device` is the other one — named, specified in
+  contract; `@streaming_device` is the other one — named, specified in
   the reference below, and not in v1. The active protocol is never inferred
   from a return annotation, an omitted `parts`, or a manifest subtlety: the
   difference decides *when extension code may run*, which is too
@@ -411,7 +411,7 @@ CORE (1000) → INTEGRATION (700) → ENHANCEMENT (500) → DEFAULT (0) → FALL
   again. A shadowed *implementation* is addressable; a superseded *revision*
   is not.
 - **Equal precedence for the same name is a load error**, `PrecedenceConflict`,
-  naming both claimants and both source packages. This is the deliberate
+  naming both claimant keys and the source package. This is the deliberate
   opposite of `Map.set`: ambiguity fails loudly at load rather than silently at
   the first call.
 - A device can **never** claim a core tool name at or above
@@ -432,8 +432,14 @@ CORE (1000) → INTEGRATION (700) → ENHANCEMENT (500) → DEFAULT (0) → FALL
   mean is a sub-CORE transport claim: core tools hold their names at
   `Precedence.CORE` but are never dispatched through `dyn` — they have
   slots — so the highest device claimant below CORE is what the device path
-  `grep` addresses, while the model-facing `grep` remains exactly the core
+  `grep` addresses, while the   model-facing `grep` remains exactly the core
   tool.
+
+**Resolved (2026-08-20 ruling):** cross-claimant live-winner, qualified-shadow, and
+hidden-catalog arbitration is core-registry-owned (`crates/tool`, `Claim` /
+`PrecedenceTie` per `PLAN.md:252`). The frozen Python registry holds one extension identity
+and enforces only intra-extension claims. Its public error spelling remains
+`PrecedenceConflict`, naming both claimant keys and the source package.
 
 **Resolved (2026-08-20 ruling):** the sanctioned presentation spelling is
 `@omp.renderer("grep", decorates=True)`. A decoration registration records that mode in
@@ -718,7 +724,7 @@ below. The descriptions here are the surfaces under the default policy,
   caller, because every caller path that worked without the slot still works.
 
 `kind` exists on `@omp.tool` **only**. Neither `@omp.device` nor
-`@omp.streaming_device` accepts it — an `@omp.device` declaration carries
+`@streaming_device` accepts it — an `@omp.device` declaration carries
 implicit soft intent, always. The slot claim is the one costly thing in this
 design, and it is confined to the decorator whose whole surface is auditable
 at a glance. If a path-aware device deserves a slot, that is a core tool by
@@ -871,10 +877,10 @@ structured denial inside its own call, never a second surprise dialog. The
 second dialog is how approval fatigue gets trained, and approval fatigue is
 a security defect, not a UX blemish.
 
-### `@omp.streaming_device` — named, specified, not in v1
+### `@streaming_device` — named, specified, not in v1
 
 ```python
-@omp.streaming_device(...)
+@streaming_device(...)
 async def device(params: IncomingParams, ctx: omp.Context) -> AsyncIterator[Ev]: ...
 ```
 
@@ -978,7 +984,7 @@ standalone, mountable form; neither API is an address-value constructor.
 ```python
 lint = house_lint  # the decorator returned the handle
 
-if not omp.env.exists(omp.EnvPath("houserules.toml")):
+if not _workspace_has_house_rules():
     lint.disable(reason="no houserules.toml in this workspace")
 ```
 
@@ -1018,56 +1024,53 @@ emits inside `do_`, which the router parses into exactly this value.
 Journal, UI, and provenance references to a device carry a `ToolPath` plus
 provenance chrome.
 
+### `omp.Devices`
+
+The namespace type behind the singleton `omp.devices`. It exposes frozen declarations and the
+session's mounted view without performing import-time I/O:
+
+- `parent(name, *, family, rev, place="host") -> DynamicDeviceParent` declares a manifest-backed
+  dynamic parent during IMPORT.
+- `list(*, mounted_only=True) -> tuple[DeviceInfo, ...]` synchronously snapshots the frozen
+  declarations and any installed host catalog view.
+- `set_availability(*deltas)`, `enable(*paths)`, `disable(*paths, reason=None)`, and `refresh()`
+  are asynchronous, atomic mounted-set transitions.
+- `invoke(path, args, *, deadline=None)` dispatches an independently admitted nested call and
+  therefore inherits no ambient authority.
+
+The mutating operations require their host arms and raise `NotWiredError` when those arms are
+not installed.
+
+### `omp.MountSpec`
+
+An immutable runtime leaf specification with fields `subpath: str`, `body: Callable`,
+`schema: Mapping[str, object]`, `summary: str`, and optional `docs: str`. Construction
+validates the relative subpath and callable body, copies `schema` into a read-only mapping,
+and rejects non-string summaries.
+
+### `omp.DynamicDeviceParent`
+
+An immutable manifest-authorized parent with `name`, `family`, `rev`, and `place` fields.
+`path(subpath)` validates a relative leaf and returns its absolute device path.
+`await mount(spec)` and `await mount_many(*specs)` install discovered leaves beneath that
+parent only; they cannot change the parent's family, revision, placement, or provenance.
+Until the dynamic-mount host arm is installed, both mounting operations raise
+`NotWiredError`.
+
 ### `omp.devices`
 
-Session-scoped introspection and control over the mounted set. CONTROL channel
-throughout.
-
-- `list(*, mounted_only: bool = True) -> tuple[DeviceInfo, ...]` — every device
-  visible to this session, in catalog order (the order a bare `search`
-  renders). With `mounted_only=False`, shadowed and disabled devices are
-  included.
-- `get(name: str) -> Device` — the live claimant of `name`. Raises
-  `DeviceUnavailable` if nothing claims it. Accepts a claimant-qualified
-  `name@publisher/extension` to reach a shadowed claimant; a schema revision
-  is never a dispatch address.
-- `resolve(path: ToolPath | str) -> Device` — the device a
-  [`ToolPath`](#omptoolpath) addresses. A raw string is parsed first, with
-  the same parse the router uses; a malformed path raises `DeviceError`.
-- `docs(name: str, *, mode: DocsMode = DocsMode.INLINE) -> str` — the exact
-  text the `docs` op would return under `mode`.
-- `catalog() -> str` — the exact text a bare `search` (no `q`) would return.
-- `refresh() -> tuple[DeviceInfo, ...]` — re-evaluate every `available`
-  predicate, recompute precedence, and emit one notification item describing
-  the whole delta. Returns the new mounted set. This is the only correct way to
-  react to a world change that affects reachability; it is a single
-  round-trip and a single notice regardless of how many devices moved.
-- `enable(*names: str) -> None` / `disable(*names: str, reason: str | None = None) -> None`
-  — batch forms; one notification for the batch.
+The session-scoped singleton instance of `omp.Devices`; its methods and host-arm behavior are
+listed above. `list()` is the only operation that can complete from frozen declarations alone.
+All other runtime operations ride CONTROL.
 
 Constants:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `devices.HARD_SLOT_BUDGET` | `8` | per-session cap on granted hard tools advertised at once |
-| `devices.DOCS_TOTAL_BUDGET` | `48_000` | aggregate character budget when device docs are inlined into the system prompt |
-| `devices.PER_DEVICE_CAP` | `10_000` | per-device character cap, so one pathological docstring cannot starve later devices |
-| `devices.EXTERNAL_SUMMARY_CAP` | `200` | UTF-8 byte cap on catalog summaries for third-party devices |
-| `devices.HELP_TOKENS` | `frozenset({"", "?", "help"})` | invoke payloads that return docs instead of dispatching |
-| `devices.RESERVED` | `frozenset({...})` | names extensions may never claim |
-
-`devices.RESERVED` holds the harness-owned device names, individually:
-
-- `resolve` — apply the pending staged action. Plain text, not JSON.
-- `reject` — discard the pending staged action.
-- `propose` — submit a plan proposal for user approval.
-- `report_issue` — the AutoQA reporter; see
-  [docs/py/10-telemetry.md](10-telemetry.md).
-
-These four take plain text rather than JSON precisely because they are
-frequent, terse, and adjacent to every other call
-(`.plan/feature-map/tools-misc.md:61-75`). An extension declaring one of them
-raises `DeviceNameError`.
+| `omp.HARD_SLOT_BUDGET` / `omp.devices.HARD_SLOT_BUDGET` | `8` | per-session cap on granted hard tools advertised at once |
+| `omp.DOCS_TOTAL_BUDGET` / `omp.limits.DOCS_TOTAL_BUDGET` | `48_000` | aggregate character budget when device docs are inlined into the system prompt |
+| `omp.devices.PER_DEVICE_CAP` | `10_000` | per-device character cap, so one pathological docstring cannot starve later devices |
+| `omp.EXTERNAL_SUMMARY_CAP` / `omp.devices.EXTERNAL_SUMMARY_CAP` | `200` | UTF-8 byte cap on catalog summaries for third-party devices |
 
 ### `omp.DeviceInfo`
 
@@ -1127,9 +1130,8 @@ async def hpc_grep(args: HpcGrep, ctx: omp.Context) -> omp.Payload: ...
 
 
 def _hpc_reachable() -> omp.Availability:
-    host = omp.env.get("OMP_HPC_HOST")
-    if not host:
-        return omp.Availability(False, "OMP_HPC_HOST is unset")
+    if not _configured_hpc_host():
+        return omp.Availability(False, "the HPC host is not configured")
     return omp.Availability(True)
 ```
 
@@ -1350,29 +1352,30 @@ omp.mcp.mount(
 
 Surface:
 
-- `mcp.mount(spec: McpMount) -> tuple[Device, ...]` — declare a server and
+- `omp.mcp.mount(spec: McpMount) -> tuple[Device, ...]` — declare a server and
   mount its endpoints as devices named `<server>.<tool>`
   (path `github.create_issue` in the `dyn` tree). Returns a handle per mounted endpoint. CONTROL,
   per-session, fail-closed at load; a server that is unreachable at load mounts
   nothing and emits one notification, rather than failing activation.
-- `mcp.unmount(server: str) -> None` — remove every device from one server and
+- `omp.mcp.unmount(server: str) -> None` — remove every device from one server and
   release the connection.
-- `mcp.servers() -> tuple[McpServer, ...]` — connection state per mounted
-  server: `name`, `state`, `protocol_version`, `instructions`, `endpoints`,
-  `resources`, `prompts`, `last_error`.
-- `mcp.McpMount` — the declaration: `server`, `transport`, `auth`, `include`,
+- `omp.mcp.servers() -> tuple[omp.mcp.McpServer, ...]` — connection state per mounted
+  server: `name`, `state` (an `omp.mcp.McpServerState`), `protocol_version`,
+  `instructions`, `endpoints`, `resources`, `prompts`, `last_error`.
+- `omp.mcp.McpMount` — the declaration: `server`, `transport`, `auth`, `include`,
   `exclude`, `rename`, `docs`, `precedence`, `tier`, `timeout` (an
   `omp.Duration`), `restart`.
   `include`/`exclude` are glob sequences over endpoint names; `rename` is a
   mapping from endpoint name to device name, for the cases where a server's
   naming is actively hostile.
-- `mcp.Stdio(command, args=(), env=None, cwd=None)`,
-  `mcp.Http(url, headers=None)`, `mcp.Sse(url, headers=None)` — the three
-  transports.
-- `mcp.McpAuth.oauth(scopes=...)`, `mcp.McpAuth.api_key(name=...)`,
-  `mcp.McpAuth.none()` — auth *requirements*, declared. The extension never
-  runs an OAuth flow.
-- `mcp.McpResource` — a discovered resource: `uri`, `name`, `media_type`,
+- `omp.mcp.Stdio(command, args=(), env=None, cwd=None)`,
+  `omp.mcp.Http(url, headers=None)`, `omp.mcp.Sse(url, headers=None)` — the three
+  transports, closed as the `omp.mcp.McpTransport` union with the
+  `omp.mcp.McpTransportKind` discriminant.
+- `omp.mcp.McpAuth.oauth(scopes=...)`, `omp.mcp.McpAuth.api_key(name=...)`,
+  `omp.mcp.McpAuth.none()` — the `omp.mcp.McpAuth` *requirements*, declared (discriminated by
+  `omp.mcp.McpAuthKind`). The extension never runs an OAuth flow.
+- `omp.mcp.McpResource` — a discovered resource: `uri`, `name`, `media_type`,
   `template`. Resources are addressable through the same `read` that accepts
   files and `artifact://`; see
   [docs/py/09-journal.md](09-journal.md).
@@ -1467,7 +1470,7 @@ CONFIGS = ("~/.omp/mcp.json", ".omp/mcp.json")
 
 
 @omp.hook("extension_activate")
-async def mount_servers(event: omp.Event, ctx: omp.Context) -> None:
+async def mount_servers(event: omp.ExtensionActivateEvent, ctx: omp.Context) -> None:
     for entry in _load_configs(CONFIGS):
         if entry.disabled:
             continue
@@ -1485,9 +1488,9 @@ async def mount_servers(event: omp.Event, ctx: omp.Context) -> None:
         )
 
 
-@omp.hook("mcp_tools_changed")
-async def announce(event: omp.Event, ctx: omp.Context) -> None:
-    omp.devices.refresh()
+@omp.hook("resources_changed")
+async def announce(event: omp.ResourcesChangedEvent, ctx: omp.Context) -> None:
+    await omp.devices.refresh()
 ```
 
 That is the whole thing — and it mounts on `extension_activate`, not
@@ -1573,7 +1576,7 @@ class IndexGrep:
     examples=[omp.Example({"pattern": "fn advertise", "path": "crates"})],
     effects=omp.Effects(documents=omp.DocEffects(read=True)),
     tier=omp.Tier.READ,
-    available=lambda: omp.env.exists(_index_path()),
+    available=lambda: _index_is_ready(),
 )
 async def index_grep(args: IndexGrep, ctx: omp.Context) -> omp.Payload:
     """
@@ -1687,8 +1690,6 @@ class ReplaceOps:
     aliases={"file_path": "path", "edits": "ops", "replacements": "ops"},
     effects=omp.Effects(documents=omp.DocEffects(read=True, write_globs=("**",))),
     tier=omp.Tier.WRITE,
-    # `omp.model` belongs to docs/py/13-inference.md; this device only reads it.
-    available=lambda: not omp.model.supports("hashline"),
 )
 async def edit_replace(args: ReplaceOps, ctx: omp.Context) -> omp.Payload:
     """
@@ -1885,9 +1886,8 @@ This is the single most important correction here, and it is a small diff in a
 load-bearing place.
 
 **The other honest gap: Python has no DATA edge today.** This document's
-examples call `omp.env.exists(...)` in `available=` predicates and place device
-bodies with `place="env"`, both of which assume a Python client for the
-environment. That client does not exist yet. The Python side is a
+examples use cached synchronous availability predicates and place device bodies
+with `place="env"`; those bodies assume a Python client for the environment. That client does not exist yet. The Python side is a
 `toolhost/v1` stdio worker with no world access at all, and the environment's
 own server holds `_documents: DocumentHost` and `_workspace: WorkspaceHost` as
 underscore-prefixed, never-dispatched fields (`crates/app/src/envd/server.rs:179`,
@@ -2462,12 +2462,14 @@ the digest). What remains genuinely open:
    clamps against the placement — I do not know which produces fewer
    surprises, and pi's global `tools.maxTimeout` clamp (`tools-misc.md:25`)
    suggests the clamp direction has been contentious before.
-4. **Whether `available` should ever see the model.** `edit_replace` above
-   gates on `omp.model.supports("hashline")`, which means device availability
-   depends on the active model and therefore changes on a mid-session switch.
-   That is the correct behaviour and it works, but it makes model switching a
-   mount transition, and I have not established whether the notification
-   arrives before the first turn on the new model or races it.
+4. **Whether `available` should ever see the model.** The earlier
+   `edit_replace` sketch gated on an unspecified model-capability helper.
+   That helper is not part of the Python surface, so the example no longer
+   makes a model-dependent availability claim. If such a gate is specified
+   later, model switching will need an ordered mounted-set transition before
+   the first turn on the new model.
+
+5. **Resolved (2026-08-20 ruling): cross-claimant live-winner, claimant-qualified shadow, and hidden-catalog arbitration is owned by the core registry in `crates/tool` (`Claim`/`PrecedenceTie`, `PLAN.md:252`); the frozen Python registry holds one extension identity and enforces intra-extension claims only. Python keeps the spelling `PrecedenceConflict`, whose message names both claimant keys and the source package.** **Precedence arbitration owner.** The public contract describes a session-wide winner, qualified shadows, and equal-precedence errors across claimants (`docs/py/01-devices.md:389-416`), while the frozen Python registry stores one configured extension identity and checks only its local claim table (`crates/py/python/omp/_registry.py:418-442,557-574,1136-1140`); the competing readings were Python-owned global arbitration versus core-owned cross-claimant arbitration with Python enforcing only local collisions.
 
 ### Revision 2 (post-review)
 
@@ -2478,7 +2480,7 @@ each:
   canonically — `async def device(args, ctx) -> Payload | Fault |
   AsyncIterator[Update | Done]` — with `args` the final, policy-approved
   effective arguments and the body starting at `EFFECTS_AUTHORIZED`.
-  `@omp.streaming_device` is documented as a separate, explicitly named,
+  `@streaming_device` is documented as a separate, explicitly named,
   not-in-v1 facility; protocol selection is by decorator only. The sequence
   diagram and the properties of what is now the three-ops section were rewritten in
   `omp.InvocationPhase` terms ([docs/py/03-params.md](03-params.md) owns the

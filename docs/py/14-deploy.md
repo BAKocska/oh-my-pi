@@ -10,7 +10,7 @@
 > *runtime* grants, the discovery→admit→import→declare→register→activate ordering,
 > hot-reload, `omp.Context`, cancellation, crash/restart replay →
 > [`00-overview.md`](00-overview.md).
-> `place=` semantics, `omp.remote` ship modes, `omp.workers`, `omp.Spill` →
+> `place=` semantics, `omp_remote` ship modes, `omp.workers`, `omp.Spill` →
 > [`04-placement.md`](04-placement.md). `omp.BlobRef` and typed paths → [`11-env.md`](11-env.md).
 > `omp.env` request surface and env-side policy → [`11-env.md`](11-env.md).
 > Hook events and the failure table → [`05-hooks.md`](05-hooks.md).
@@ -126,6 +126,8 @@ academic — see §3.11.2 for the measured matrix and why it forces a first-part
 ### 2.1 Two layers
 
 An extension enters a session through exactly one of two **layers**.
+`omp.Layer` is the corresponding string enum: `Layer.CLIENT == "client"` and
+`Layer.WORKSPACE == "workspace"`.
 
 | | **client layer** | **workspace layer** |
 |---|---|---|
@@ -1112,7 +1114,7 @@ Each extension gets its own host child (§2.2), hence its own interpreter, its o
   in-flight work, not every extension in the session. §6.5.
 - **A suspended approval blocks only its own extension.** The shipped supervisor services one
   invocation at a time with the rest queued (`crates/app/src/envd/worker.rs:592-597`), so on a
-  single shared child a `omp.policy.approve` awaiting a human — latency class of *hours* —
+  single shared child a Revision-1 `policy.approve`-style approval awaiting a human — latency class of *hours* —
   would stop every extension in the session. Per-extension children make that survivable
   without abandoning D5's "interrupts are courtesy, never the mechanism".
 - **Faults are attributable and contained.** A segfaulting native module in one extension kills
@@ -1527,7 +1529,7 @@ the grant records.
 | `proc = [names]` | "own long-lived processes: `acme-lsp`" | Named processes, adopted via env. |
 | `workers = [names]` | "run code on: `env`, `worker:hpc`" | Gates `place=`. |
 | `tools.hard = [names]` | "advertise model-facing tool slots: `triage`" | One named claim per `@omp.tool(kind="hard")` export ([`01-devices.md`](01-devices.md) owns the decorator; §3.1.5 the `hard` declaration kind). Each claim is listed **by name** in the digest, so adding a hard tool re-prompts (§3.9.1) while patch upgrades stay silent. The per-session hard-slot **budget** is an org/user policy knob ([`06-policy.md`](06-policy.md)), not a manifest key: the manifest asks, the grant admits, the budget caps. A claim naming a core tool is refused ([`01-devices.md`](01-devices.md) owns the prohibition). Mode interaction ([`01-devices.md`](01-devices.md) owns `tools.policy`): the grant binds under the default `auto`; it is **inert** under `device_only` (hard intent is demoted to a device, so no extension ever gets a slot); it is **subsumed** under `tool_only`, which is itself the global consent to slot growth. |
-| `ship` | see below | Gates `omp.remote` code shipping. |
+| `ship` | see below | Gates `omp_remote` code shipping. |
 | `ui.slots` / `ui.shortcuts` / `ui.dialogs` / `ui.ghost` | "occupy the status bar", "bind ⌃G", … | Part of the install diff. Runtime *enforcement* is per-effect and never prompts: a `mount()` into an undeclared slot is refused and journaled ([`07-ui.md`](07-ui.md)). |
 
 **`ship`** deserves its own row because it is the one capability that governs code
@@ -1536,7 +1538,7 @@ the grant records.
 | Level | Prompted? | Meaning | Tier ceiling |
 |---|---|---|---|
 | `installed` | no | Worker code must resolve to a module inside this extension's own installed, hash-verified package. Wire mode `"import"` — see [`04-placement.md`](04-placement.md). | any |
-| `source` | yes | Permits `omp.remote`'s source re-execution of a module under a synthetic name. Code that never passed the install path materializes on the worker. | any |
+| `source` | yes | Permits `omp_remote`'s source re-execution of a module under a synthetic name. Code that never passed the install path materializes on the worker. | any |
 | `pickle` | yes | Permits cloudpickle / code-object modes. A marshalled code object is arbitrary bytecode with no source to review, and the integrity chain ends at the wheel hash. | **`trusted` only** — hard-refused at `sandboxed` regardless of manifest |
 
 The effective level is `min(install-record level, tier ceiling)`. Refusal happens host-side
@@ -1836,7 +1838,51 @@ is a thing to debug.
 `omp ext index add <name> <url>` records an index; the list order is the resolution order
 under R8. `pypi.org` is present by default and can be removed.
 
-#### 3.11.4 Mirroring and air-gap
+#### 3.11.4 Python static index reader
+
+`omp.index` is the import-time-inert reader for those three static surfaces. It parses
+caller-provided bytes or mappings; only an explicitly constructed `omp.index.IndexClient`
+performs I/O, and its async live transport routes through the active Environment rather than
+opening a process-global HTTP client.
+
+The catalog records are frozen values. `omp.index.IdentityClaim` contains `publisher`,
+`extension_id`, and the publisher-key `fingerprint`. `omp.index.CapabilityAttestation`
+contains the optional `capability_digest`, review `outcome`, optional `build_provenance`, and
+optional `signature`; an attestation remains advisory (§3.10.4). Each
+`omp.index.CatalogEntry` carries that identity, distribution name, versions, summary,
+capability names, optional attestation, deprecation and revocation pointers, and optional
+non-negative download count.
+
+The PEP 691 projection uses `omp.index.SimpleFile` (`filename`, `url`, sorted hash pairs,
+optional `requires_python`, and a boolean or reason-valued `yanked`) and
+`omp.index.SimpleProject` (`name`, `files`). A pre-resolved lock is an
+`omp.index.ResolvedClosure` with `extension_id`, `version`, `target`, the unparsed TOML
+`lock`, and its optional signature; dependency interpretation remains the resolver's job.
+
+The pure entry points are:
+
+- `omp.index.parse_catalog(payload)` validates the catalog object and returns its frozen
+  catalogue; it neither fetches nor verifies a signature.
+- `omp.index.parse_simple_project(payload)` validates a PEP 691 JSON response, including API
+  version, hashes, and yank shape.
+- `omp.index.parse_closure(payload, *, extension_id, version, target, signature=None)` accepts
+  UTF-8 TOML text (or a mapping's `lock` field) and wraps the non-empty lock without
+  interpreting it.
+
+`omp.index.IndexClient(base_url, fetcher=None, verifier=None)` accepts an async injected
+fetcher for static or test use. `IndexClient.live()` installs the Environment-backed
+transport; `catalog()`, `simple(distribution)`, and `closure(extension_id, version, target)`
+read the corresponding surfaces. `closure_or_resolve(..., fallback)` invokes the caller's
+resolver only for `omp.index.IndexTransportError`; malformed or unverified content never
+falls back.
+
+`omp.index.IndexError` is both `omp.OmpError` and `ValueError` and reports malformed static
+documents. `omp.index.IndexTransportError` is both `omp.OmpError` and `RuntimeError` and
+reports an unavailable or unconfigured live transport.
+`omp.index.IndexVerificationError` is an `IndexError` raised when the caller-supplied
+signature verifier rejects catalog or closure bytes.
+
+#### 3.11.5 Mirroring and air-gap
 
 A mirror is `<index>/simple/`, `<index>/catalog/`, and `<index>/resolved/` copied verbatim;
 signatures are over content, so a mirror needs no trust. Air-gapped installs use §3.3.4
@@ -2191,9 +2237,9 @@ All `OMP_*` per repository policy. Every one has a flag equivalent except where 
 
 ### 3.15 Python-visible symbols
 
-Deployment is deliberately **read-only** from inside Python. There is no
-`omp.packages.install`, no `omp.ext.add`, no way for an extension to change what is
-installed or granted. An extension that could install another extension would be an
+Deployment is deliberately **read-only** from inside Python. There is no Python-level
+`packages.install`, no `omp.ext.add`, and no way for an extension to change what is installed
+or granted. An extension that could install another extension would be an
 arbitrary-capability escalation with a bypass of §3.9.3's operator-origin invariant.
 
 ```text
@@ -2213,6 +2259,12 @@ omp.packages.own() -> Distribution
 omp.packages.site() -> SiteTree
     # This host's site tree.
 ```
+
+`omp.packages.SiteTree` is the frozen description of that one import tree, and
+`omp.packages.Origin` records whether a distribution is frozen, store-backed, or a
+development link. `omp.packages.ContentKind` is the closed string vocabulary for
+non-executable manifest content: `SKILLS = "skills"`, `RULES = "rules"`,
+`CONTEXT_FILES = "context-files"`, and `PROMPTS = "prompts"`.
 
 ```text
 class omp.packages.Distribution:
@@ -2240,6 +2292,12 @@ class omp.packages.Origin(enum.Enum):
     FROZEN = "frozen"   # in the binary; version is immovable (R7)
     STORE  = "store"    # content-addressed store entry
     LINK   = "link"     # development pointer (§3.3.1)
+
+class omp.packages.ContentKind(enum.Enum):
+    SKILLS        = "skills"
+    RULES         = "rules"
+    CONTEXT_FILES = "context-files"
+    PROMPTS       = "prompts"
 ```
 
 (The two blocks above are signature catalogues, not runnable Python — dotted class names
@@ -2284,6 +2342,14 @@ class Provenance:
 ```
 
 ### 3.16 Failure and error reference
+
+Python exposes the stable subset used for programmatic branching as string enums.
+`omp.diagnostics.FailureCode` contains `UNSAT`, `FROZEN_CONFLICT`, `LOCK_PYTHON`,
+`REVOKED`, `ABI_EXPORT`, `REPLACE_SCOPE`, `TRUSTED_LOAD`, and `SETTING_SECRET`.
+`omp.diagnostics.WarningCode` contains `YANKED`, `SITE_OVERRIDE`, `API_SKEW`,
+`FOREIGN_ROOT`, `REPLACE_DENIED`, and `POOL_COUNT`. `omp.diagnostics.DiagnosticCode`
+contains the union of those members for decoding a frame before its severity is known; each
+member's value is the corresponding `E-*` or `W-*` spelling in the table below.
 
 | Code | Stage | Exit | Condition | Behavior |
 |---|---|---|---|---|
@@ -3049,7 +3115,7 @@ pre-amendment wording, "warm pool of one":
 **Two failures follow from one shared child, and they compound.** Cancelling one device call
 SIGKILLs every concurrently running device in that child — Lesson #2 reproduced one layer
 down, inside the thing built to escape it. And because execution is serialized, a single
-suspended call stops everything behind it: `omp.policy.approve` with an external approver has
+suspended call stops everything behind it: an approval ticket with an external approver has
 a latency class of *hours* (the catalog's `@agentapprove/pi` routes approval to a phone), so on
 a one-at-a-time shared supervisor one pending approval freezes every extension in the session.
 
@@ -3219,7 +3285,7 @@ configure one.
 
 **Code shipping is a distribution channel, and it is the one that bypasses everything
 above.** Every control in this document — hashes, signatures, revocation, consent — applies
-to a *wheel*. `omp.remote`'s `ship="source"` and `ship="pickle"` move code that never passed
+to a *wheel*. `omp_remote`'s `ship="source"` and `ship="pickle"` move code that never passed
 through any of it. That is precisely why `ship` is an install-time grant with a tier ceiling
 (§3.9.2) and why the default level is statically checkable rather than heuristic
 ([`04-placement.md`](04-placement.md)'s `ship="import"`). Framed as a threat: an extension
@@ -3485,7 +3551,7 @@ review round; reversals recorded here and at the point of change:
   lowers with implicit `soft`), two of thirteen executable kinds now (§3.1.5). The surface an intent
   gets is decided by the dynamic tool policy (`tools.policy`,
   [`01-devices.md`](01-devices.md), which owns the decorators and the mode table);
-  `@omp.streaming_device` keeps its name. Rev 2.1-internal correction: an earlier draft
+  the future `@streaming_device` spelling stays separate. Rev 2.1-internal correction: an earlier draft
   of this revision spelled the vocabulary `device | tool | hard` — retracted the same
   day, because kind states intent, never surface.
 - **`tools.hard` capability.** New §3.9.2 row: a `hard` declaration is admitted only under

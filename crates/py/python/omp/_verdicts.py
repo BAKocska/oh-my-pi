@@ -4,23 +4,66 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import datetime as _datetime
 import json
-from collections.abc import AsyncIterator
+import math
+import types
+import typing
+from collections.abc import AsyncIterator, Mapping as MappingABC
 from dataclasses import dataclass
 from enum import Enum, IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar
 
-from _omp import ArtifactUrl, Duration, InvocationPhase
+from _omp import ArtifactUrl, Duration, InvocationPhase, OmpError
 
 from ._context import Context
 from ._errors import NotWiredError
+
+
+class VerdictSchemaError(OmpError):
+    """Report a non-serializable field type in durable verdict truth."""
+
+    def __init__(self, shape: object, field: str, detail: str) -> None:
+        self.shape = shape
+        self.field = field
+        self.detail = detail
+        name = getattr(shape, "__qualname__", repr(shape))
+        super().__init__(f"{name}.{field} is not verdict-serializable: {detail}")
+
+
+class VerdictShapeError(OmpError):
+    """Report canonical verdict bytes that do not match their declared shape."""
+
+    def __init__(self, shape: object, detail: str) -> None:
+        self.shape = shape
+        self.detail = detail
+        name = getattr(shape, "__qualname__", repr(shape))
+        super().__init__(f"verdict does not match {name}: {detail}")
+
+
+class RevError(OmpError, ValueError):
+    """Report a malformed textual revision."""
+
+    def __init__(self, value: object, detail: str = "expected family.n or a bare u16") -> None:
+        self.value = value
+        self.detail = detail
+        super().__init__(f"malformed revision {value!r}: {detail}")
+
+
+class BudgetError(OmpError, ValueError):
+    """Report invalid use of a sealed projection budget or text fragment."""
 
 
 class Payload:
     """Marker base for a device's durable success value."""
 
     __slots__ = ()
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Reject unsupported durable field annotations when a payload is declared."""
+        super().__init_subclass__(**kwargs)
+        _validate_verdict_schema(cls)
 
     def __new__(cls, *_args: Any, **_kwargs: Any) -> Payload:
         if cls is Payload:
@@ -122,6 +165,24 @@ class Faulted(Generic[_F]):
     fault: _F
 
 
+class PostconditionStatus(StrEnum):
+    """Classify a durable finding attached after a call settles."""
+
+    PASSED = "passed"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class Postcondition:
+    """Record a policy finding beside, without rewriting, a settled outcome."""
+
+    status: PostconditionStatus
+    reason: str
+    code: str | None
+    decision_id: str
+    rules: tuple["RuleRef", ...] = ()
+
+
 class AbortKind(StrEnum):
     """Classify why a call settled without a normal device verdict."""
 
@@ -137,7 +198,7 @@ class ArgsRejected:
     issue: object
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class Aborted:
     """Record a harness- or Core-owned abnormal call settlement."""
 
@@ -145,13 +206,35 @@ class Aborted:
     kind: AbortKind
     policy: object | None = None
 
-    def __post_init__(self) -> None:
-        """Enforce that only policy denials carry a structured policy value."""
-        has_policy = self.policy is not None
-        if has_policy != (self.kind is AbortKind.POLICY_DENIED):
+    def __init__(
+        self,
+        abort: object,
+        kind: AbortKind | None = None,
+        policy: object | None = None,
+    ) -> None:
+        if kind is None:
+            abort_kind = getattr(abort, "kind", None)
+            if abort_kind == "skipped":
+                kind = AbortKind.SKIPPED
+            elif abort_kind in {
+                "interrupted",
+                "effects_unknown",
+                "input_dropped",
+                "missing_outcome",
+            }:
+                kind = AbortKind.CANCELLED
+            else:
+                raise ValueError("cannot derive AbortKind from abort")
+        if not isinstance(kind, AbortKind):
+            raise TypeError("kind must be AbortKind")
+        has_policy = policy is not None
+        if has_policy != (kind is AbortKind.POLICY_DENIED):
             raise ValueError(
                 "policy must be present exactly when kind is AbortKind.POLICY_DENIED"
             )
+        object.__setattr__(self, "abort", abort)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "policy", policy)
 
 
 CallOutcome = Ok[_P] | Faulted[_F] | ArgsRejected | Aborted
@@ -291,7 +374,7 @@ class Budget:
         """Append a whole text fragment when it fits."""
         self._ensure_open()
         if not isinstance(fragment, str):
-            raise TypeError("projection fragments must be str")
+            raise BudgetError("projection fragments must be str")
         size = len(fragment.encode("utf-8"))
         needs_part = not self._parts or not isinstance(self._parts[-1], TextPart)
         if size > self.remaining or (
@@ -322,6 +405,8 @@ class Budget:
     def push_blob(self, ref: Any, alt: str) -> bool:
         """Append media, or its fallback text when media is unavailable."""
         self._ensure_open()
+        if not isinstance(alt, str):
+            raise BudgetError("projection fragments must be str")
         if not self._caps.media:
             return self.push(alt)
         if len(self._parts) >= self._caps.maximum_parts:
@@ -352,7 +437,7 @@ class Budget:
 
     def _ensure_open(self) -> None:
         if self._sealed:
-            raise RuntimeError("projection budget is sealed")
+            raise BudgetError("projection budget is sealed")
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -376,13 +461,21 @@ class Rev:
     def parse(cls, value: str) -> Rev:
         """Parse ``family.n`` or a bare numeric revision."""
         if not isinstance(value, str) or not value:
-            raise ValueError("revision must be a non-empty string")
+            raise RevError(value, "revision must be a non-empty string")
         family, separator, number = value.rpartition(".")
         if not separator:
             family, number = "", value
-        if not number.isascii() or not number.isdigit():
-            raise ValueError(f"malformed revision: {value!r}")
-        return cls(family, int(number))
+        if (
+            not number.isascii()
+            or not number.isdigit()
+            or "." in family
+            or (family == "" and separator and value.startswith("."))
+        ):
+            raise RevError(value)
+        try:
+            return cls(family, int(number))
+        except (TypeError, ValueError) as error:
+            raise RevError(value, str(error)) from error
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -474,14 +567,385 @@ def prompt(view: Ok[Any] | Faulted[Any], caps: PromptCaps) -> list[TextPart | Js
     raise NotWiredError("verdict prompt projection dispatch is not wired")
 
 
-def _canonical_json(value: object) -> bytes:
-    def default(item: object) -> object:
-        if dataclasses.is_dataclass(item) and not isinstance(item, type):
-            return {field.name: getattr(item, field.name) for field in dataclasses.fields(item)}
-        if isinstance(item, Enum):
-            return item.value
-        if isinstance(item, bytes):
-            return {"$bytes": base64.b64encode(item).decode("ascii")}
-        raise TypeError(f"{type(item).__name__} is not verdict-serializable")
+class _ShapeMismatch(ValueError):
+    pass
 
-    return json.dumps(value, default=default, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+def _type_globals(cls: type[object]) -> dict[str, object]:
+    namespace = dict(vars(__import__(cls.__module__, fromlist=("*",))))
+    if any("RuleRef" in str(value) for value in cls.__dict__.get("__annotations__", {}).values()):
+        from .policy import RuleRef
+
+        namespace["RuleRef"] = RuleRef
+    namespace[cls.__name__] = cls
+    return namespace
+
+
+def _resolved_hints(cls: type[object]) -> dict[str, object]:
+    try:
+        return typing.get_type_hints(cls, globalns=_type_globals(cls), localns={cls.__name__: cls})
+    except (NameError, TypeError) as error:
+        raise _ShapeMismatch(f"cannot resolve field annotations: {error}") from error
+
+
+def _validate_verdict_schema(cls: type[object]) -> None:
+    """Validate the field annotations declared by one durable marker subclass."""
+    namespace = _type_globals(cls)
+    for owner in reversed(cls.__mro__):
+        for field, annotation in owner.__dict__.get("__annotations__", {}).items():
+            if isinstance(annotation, str):
+                try:
+                    annotation = eval(annotation, namespace, {cls.__name__: cls})
+                except NameError:
+                    # A forward declaration is checked when the codec resolves the completed shape.
+                    continue
+            try:
+                _assert_serializable_type(annotation, set())
+            except TypeError as error:
+                raise VerdictSchemaError(cls, field, str(error)) from error
+
+
+def _assert_serializable_type(shape: object, seen: set[object]) -> None:
+    if shape in seen:
+        return
+    try:
+        seen.add(shape)
+    except TypeError:
+        pass
+
+    if shape in (bool, int, float, str, bytes, type(None), _datetime.datetime, Duration):
+        return
+    if shape in (Any, object):
+        return
+    if isinstance(shape, typing.ForwardRef):
+        return
+    if isinstance(shape, TypeVar):
+        if shape.__constraints__:
+            for constraint in shape.__constraints__:
+                _assert_serializable_type(constraint, seen)
+            return
+        if shape.__bound__ is not None:
+            _assert_serializable_type(shape.__bound__, seen)
+            return
+        raise TypeError(f"unbound type variable {shape!s}")
+    if isinstance(shape, type) and issubclass(shape, Enum):
+        for member in shape:
+            _assert_serializable_type(type(member.value), seen)
+        return
+
+    origin = typing.get_origin(shape)
+    args = typing.get_args(shape)
+    if origin is typing.Annotated:
+        _assert_serializable_type(args[0], seen)
+        return
+    if origin is typing.Literal:
+        for value in args:
+            _assert_serializable_type(type(value), seen)
+        return
+    if origin in (typing.Union, types.UnionType):
+        for arm in args:
+            _assert_serializable_type(arm, seen)
+        return
+    if origin is list:
+        _assert_serializable_type(args[0], seen)
+        return
+    if origin in (dict, Mapping, MappingABC):
+        if args[0] is not str:
+            raise TypeError("verdict mappings must have str keys")
+        _assert_serializable_type(args[1], seen)
+        return
+    if origin is tuple:
+        for item in args:
+            if item is not Ellipsis:
+                _assert_serializable_type(item, seen)
+        return
+
+    candidate = origin or shape
+    if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
+        for field_shape in _resolved_hints(candidate).values():
+            _assert_serializable_type(field_shape, seen)
+        return
+    # During __init_subclass__, @dataclass has not run yet; annotations are still sufficient.
+    if isinstance(candidate, type) and candidate.__dict__.get("__annotations__"):
+        for field_shape in candidate.__dict__["__annotations__"].values():
+            if not isinstance(field_shape, str):
+                _assert_serializable_type(field_shape, seen)
+        return
+    raise TypeError(f"unsupported field type {shape!r}")
+
+
+def _encode_verdict(value: object, active: set[int]) -> object:
+    if value is None or isinstance(value, (bool, str)):
+        if isinstance(value, str):
+            value.encode("utf-8")
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("non-finite floats are not verdict-serializable")
+        return value
+    if isinstance(value, Enum):
+        return _encode_verdict(value.value, active)
+    if isinstance(value, bytes):
+        return {"$bytes": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, _datetime.datetime):
+        return {"$datetime": value.isoformat()}
+    if isinstance(value, Duration):
+        return {"$duration": str(value)}
+
+    identity = id(value)
+    if identity in active:
+        raise TypeError("cyclic values are not verdict-serializable")
+    active.add(identity)
+    try:
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {
+                field.name: _encode_verdict(getattr(value, field.name), active)
+                for field in dataclasses.fields(value)
+            }
+        if isinstance(value, MappingABC):
+            encoded: dict[str, object] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("verdict mappings must have str keys")
+                encoded[key] = _encode_verdict(item, active)
+            return encoded
+        if isinstance(value, (list, tuple)):
+            return [_encode_verdict(item, active) for item in value]
+    finally:
+        active.remove(identity)
+    raise TypeError(f"{type(value).__name__} is not verdict-serializable")
+
+
+def dumps(value: object) -> bytes:
+    """Serialize a verdict value to deterministic canonical UTF-8 JSON bytes."""
+    encoded = _encode_verdict(value, set())
+    try:
+        text = json.dumps(
+            encoded,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return text.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise TypeError(f"verdict serialization failed: {error}") from error
+
+
+def _decode_dynamic(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise _ShapeMismatch("string is not valid UTF-8") from error
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        raise _ShapeMismatch("expected finite float")
+    if isinstance(value, list):
+        return [_decode_dynamic(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _decode_dynamic(item) for key, item in value.items()}
+    return value
+
+
+def _decode_verdict(
+    value: object,
+    shape: object,
+    bindings: Mapping[TypeVar, object] | None = None,
+) -> object:
+    bindings = bindings or {}
+    if isinstance(shape, TypeVar):
+        if shape in bindings:
+            return _decode_verdict(value, bindings[shape], bindings)
+        raise _ShapeMismatch(f"unbound type variable {shape!s}")
+
+    origin = typing.get_origin(shape)
+    args = typing.get_args(shape)
+    if origin is typing.Annotated:
+        return _decode_verdict(value, args[0], bindings)
+    if origin is typing.Literal:
+        matches = [
+            item
+            for item in args
+            if type(value) is type(item) and value == item
+        ]
+        if len(matches) != 1:
+            raise _ShapeMismatch(f"expected one of {args!r}")
+        return matches[0]
+    if origin in (typing.Union, types.UnionType):
+        matches: list[object] = []
+        for arm in args:
+            try:
+                matches.append(_decode_verdict(value, arm, bindings))
+            except _ShapeMismatch:
+                pass
+        if len(matches) != 1:
+            raise _ShapeMismatch("value does not select exactly one union arm")
+        return matches[0]
+
+    if shape in (Any, object):
+        return _decode_dynamic(value)
+    if shape is type(None):
+        if value is not None:
+            raise _ShapeMismatch("expected null")
+        return None
+    if shape is bool:
+        if type(value) is not bool:
+            raise _ShapeMismatch("expected bool")
+        return value
+    if shape is int:
+        if type(value) is not int:
+            raise _ShapeMismatch("expected int")
+        return value
+    if shape is float:
+        if type(value) is not float or not math.isfinite(value):
+            raise _ShapeMismatch("expected finite float")
+        return value
+    if shape is str:
+        if type(value) is not str:
+            raise _ShapeMismatch("expected str")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise _ShapeMismatch("string is not valid UTF-8") from error
+        return value
+    if shape is bytes:
+        if not isinstance(value, dict) or set(value) != {"$bytes"}:
+            raise _ShapeMismatch("expected tagged bytes")
+        encoded = value["$bytes"]
+        if not isinstance(encoded, str):
+            raise _ShapeMismatch("expected base64 string")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except ValueError as error:
+            raise _ShapeMismatch("invalid base64 bytes value") from error
+    if shape is _datetime.datetime:
+        if not isinstance(value, dict) or set(value) != {"$datetime"}:
+            raise _ShapeMismatch("expected tagged datetime")
+        encoded = value["$datetime"]
+        if not isinstance(encoded, str):
+            raise _ShapeMismatch("expected datetime string")
+        try:
+            return _datetime.datetime.fromisoformat(encoded)
+        except ValueError as error:
+            raise _ShapeMismatch("invalid datetime value") from error
+    if shape is Duration:
+        if not isinstance(value, dict) or set(value) != {"$duration"}:
+            raise _ShapeMismatch("expected tagged Duration")
+        encoded = value["$duration"]
+        if not isinstance(encoded, str):
+            raise _ShapeMismatch("expected Duration string")
+        try:
+            return Duration(encoded)
+        except (TypeError, ValueError) as error:
+            raise _ShapeMismatch("invalid Duration value") from error
+
+    candidate = origin or shape
+    if isinstance(candidate, type) and issubclass(candidate, Enum):
+        matches = [
+            member
+            for member in candidate
+            if type(value) is type(member.value) and value == member.value
+        ]
+        if len(matches) != 1:
+            raise _ShapeMismatch(f"expected a {candidate.__qualname__} value")
+        return matches[0]
+
+    if origin is list:
+        if not isinstance(value, list):
+            raise _ShapeMismatch("expected array")
+        return [_decode_verdict(item, args[0], bindings) for item in value]
+    if origin in (dict, Mapping, MappingABC):
+        if not isinstance(value, dict) or args[0] is not str:
+            raise _ShapeMismatch("expected string-keyed object")
+        return {
+            key: _decode_verdict(item, args[1], bindings)
+            for key, item in value.items()
+        }
+    if origin is tuple:
+        if not isinstance(value, list):
+            raise _ShapeMismatch("expected array")
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(_decode_verdict(item, args[0], bindings) for item in value)
+        if len(value) != len(args):
+            raise _ShapeMismatch(f"expected tuple of length {len(args)}")
+        return tuple(
+            _decode_verdict(item, item_shape, bindings)
+            for item, item_shape in zip(value, args, strict=True)
+        )
+
+    if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
+        if not isinstance(value, dict):
+            raise _ShapeMismatch(f"expected object for {candidate.__qualname__}")
+        local_bindings = dict(bindings)
+        parameters = getattr(candidate, "__parameters__", ())
+        if origin is not None and parameters:
+            local_bindings.update(zip(parameters, args, strict=True))
+        fields = dataclasses.fields(candidate)
+        expected = {field.name for field in fields}
+        actual = set(value)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            raise _ShapeMismatch(f"field mismatch (missing={missing!r}, extra={extra!r})")
+        hints = _resolved_hints(candidate)
+        decoded = {
+            field.name: _decode_verdict(value[field.name], hints[field.name], local_bindings)
+            for field in fields
+        }
+        try:
+            return candidate(**decoded)
+        except Exception as error:
+            raise _ShapeMismatch(f"constructor rejected decoded fields: {error}") from error
+
+    raise _ShapeMismatch(f"unsupported requested shape {shape!r}")
+
+
+def loads(data: bytes, shape: type[_R]) -> _R:
+    """Decode canonical UTF-8 JSON bytes against an explicit, exact verdict shape."""
+    if not isinstance(data, bytes):
+        raise VerdictShapeError(shape, "data must be bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerdictShapeError(shape, "data is not valid UTF-8") from error
+
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        keys: list[str] = []
+        for key, value in pairs:
+            if key in result:
+                raise _ShapeMismatch(f"duplicate object key {key!r}")
+            keys.append(key)
+            result[key] = value
+        if keys != sorted(keys):
+            raise _ShapeMismatch("object keys are not in canonical sorted order")
+        return result
+
+    def finite_float(token: str) -> float:
+        value = float(token)
+        if not math.isfinite(value):
+            raise _ShapeMismatch(f"non-finite number {token}")
+        return value
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=object_pairs,
+        parse_constant=lambda token: (_ for _ in ()).throw(
+            _ShapeMismatch(f"non-finite number {token}")
+        ),
+        parse_float=finite_float,
+    )
+    try:
+        value, end = decoder.raw_decode(text)
+        if end != len(text):
+            raise _ShapeMismatch("trailing data")
+        decoded = _decode_verdict(value, shape)
+    except (json.JSONDecodeError, _ShapeMismatch) as error:
+        raise VerdictShapeError(shape, str(error)) from error
+    return typing.cast(_R, decoded)
+
+
+def _canonical_json(value: object) -> bytes:
+    return dumps(value)

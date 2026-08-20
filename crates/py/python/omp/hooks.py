@@ -20,15 +20,15 @@ from ._registry import registry
 _HookFn = TypeVar("_HookFn", bound=Callable[..., object])
 
 
-class UnknownEvent(ValueError):
+class UnknownEvent(OmpError, ValueError):
     """A hook declaration or catalog lookup named no frozen event."""
 
 
-class HookContractError(ValueError):
+class HookContractError(OmpError, ValueError):
     """A hook declaration or decision violates the frozen hook contract."""
 
 
-class LateRegistration(RuntimeError):
+class LateRegistration(OmpError, RuntimeError):
     """A hook was declared after the extension declaration table was sealed."""
 
 
@@ -38,6 +38,10 @@ class ReentrancyError(OmpError):
 
 class PhaseConflict(OmpError):
     """A hook awaited a CONTROL operation blocked by its pending loop phase."""
+
+
+class HostShuttingDown(OmpError):
+    """A hook operation was attempted after session shutdown began."""
 
 
 class HookPhase(StrEnum):
@@ -67,6 +71,12 @@ class TargetKind(StrEnum):
     MCP = "mcp"
 
 
+class Composition(StrEnum):
+    """Select how ordered hook mutations combine for one payload field."""
+
+    REPLACE = "replace"
+    APPEND = "append"
+    INTERSECT = "intersect"
 
 
 class OnFailure(StrEnum):
@@ -74,6 +84,24 @@ class OnFailure(StrEnum):
 
     DEFER = "defer"
     DENY = "deny"
+
+
+class LatencyClass(StrEnum):
+    """Classify an event by how frequently it can delay harness progress."""
+
+    SESSION = "session"
+    SUBMISSION = "submission"
+    TURN = "turn"
+    CALL = "call"
+    INPUT = "input"
+    STREAM = "stream"
+    ASYNC = "async"
+
+
+class Channel(StrEnum):
+    """Identify the transport carrying hook dispatches."""
+
+    CONTROL = "control"
 
 
 class ApprovalKind(StrEnum):
@@ -115,6 +143,9 @@ class Unreachable(StrEnum):
     ESCALATE_LOCAL = "escalate_local"
     FAIL_OPEN_AUDITED = "fail_open_audited"
 
+
+DEFAULT_HOOK_TIMEOUT: Final[Duration] = Duration("5s")
+"""Host fallback deadline for an event without a catalog-specific timeout."""
 
 APPROVAL_DEADLINE: Final[Duration] = Duration("5m")
 """Default wall-clock deadline carried by a durable approval request."""
@@ -409,10 +440,10 @@ async def dispatch_hook(*_args: object, **_kwargs: object) -> object:
     raise NotWiredError("omp hook CONTROL dispatch is not wired")
 
 __all__ = (
-    "APPROVAL_DEADLINE", "Allow", "ApprovalKind", "ApprovalRoute", "ApprovalSpec",
-    "CallOrigin", "CallTarget", "CoreTool", "Defer", "Deny", "DeviceCall", "HookContractError",
-    "HookDecision", "HookPhase", "LateRegistration", "McpCall", "Modify", "OnFailure",
+    "APPROVAL_DEADLINE", "DEFAULT_HOOK_TIMEOUT", "Allow", "ApprovalKind", "ApprovalRoute",
+    "ApprovalSpec", "CallOrigin", "CallTarget", "Channel", "Composition", "CoreTool", "Defer",
+    "Deny", "DeviceCall", "HookContractError", "HookDecision", "HookPhase",
+    "HostShuttingDown", "LatencyClass", "LateRegistration", "McpCall", "Modify", "OnFailure",
     "PhaseConflict", "PolicyScope", "ReentrancyError", "RequireApproval", "TargetKind",
-    "UNSET", "UnknownEvent", "Unreachable",
-    "When", "dispatch_hook", "hook",
+    "UNSET", "UnknownEvent", "Unreachable", "When", "dispatch_hook", "hook",
 )

@@ -400,8 +400,15 @@ something already pruned.
 
 ### Patch operations
 
-Each op is a frozen dataclass. All four are order-independent within one patch: application
-is a single pass, described under *What this requires us to build*.
+Each op is a frozen dataclass. There are five op lists, applied in this fixed order:
+`prune → drop_parts → replace → insert → reorder`. Conflicts are resolved
+earlier-op-wins; the later offending op is dropped and journaled. Application is a single
+plan-building pass, described under *What this requires us to build*.
+
+**Resolved (2026-08-20 ruling):** operation order is semantic, not order-independent.
+Within any one op, a duplicate id is a validation failure for that op: it is dropped and
+journaled with `duplicate id`, never coalesced. Any other invalid op is likewise dropped and
+journaled with the rule it broke; the remaining ops continue.
 
 #### `omp.Prune`
 
@@ -415,15 +422,42 @@ class Prune:
 
 Removes items from the working copy for this turn only.
 
-- `ids` — items to remove. Naming a `pinned` item raises `omp.PatchRejected`. Naming an
-  unknown id is ignored.
+- `ids` — items to remove. An op naming a `pinned` item is dropped and journaled with
+  `omp.PatchRejected`. Naming an unknown id is ignored.
 - `reason` — recorded in the patch-application telemetry record (`docs/py/10-telemetry.md`)
   and shown in the TUI's context breakdown. Not sent to the model.
 - `keep_placeholder` — when `True` (default) and the pruned item is a `TOOL_RESULT` whose
   `TOOL_CALL` survives, a minimal placeholder result is substituted so the provider does not
-  see a dangling call. Setting it `False` requires also pruning the matching call; failing to
-  do so raises `omp.PatchRejected`. This is the single most common bug in pi context
-  rewriters and it is a validation error here rather than a provider 400.
+  see a dangling call. Setting it `False` requires also pruning the matching call; if it
+  does not, that `Prune` op is dropped and journaled with `omp.PatchRejected`. This is the
+  single most common bug in pi context rewriters and it is a validation error here rather
+  than a provider 400.
+
+#### `omp.DropParts`
+
+```python
+@dataclass(frozen=True, slots=True)
+class DropParts:
+    ids: tuple[str, ...]
+    reason: str = ""
+```
+
+Drops the named `PARTS` from the model-facing projection only. The typed verdict and journal
+record remain intact, so renderers, telemetry, replay, and later structured reads retain
+truth. It is the projection-time sibling of transcript amendment
+`AmendPatch::DropParts` (`docs/py/02-verdicts.md:1868`), not a transcript mutation.
+
+- `ids` — projected items whose model-facing parts are omitted. An unknown id drops and
+  journals this op; a pinned target does the same.
+- `reason` — recorded in the patch-application journal entry and never sent to the model.
+
+`DropParts` marks its targets in the same `bitvec` conflict accounting as the other id-based
+ops. If it conflicts with an earlier op, `DropParts` is dropped and journaled; if it precedes
+the conflicting op in fixed application order, that later op is dropped and journaled.
+Duplicate ids within this op are the general `duplicate id` validation failure.
+
+**Resolved (2026-08-20 ruling):** `DropParts` is a real projection operation with the
+semantics above; it is not an alias for pruning a transcript item.
 
 #### `omp.Replace`
 
@@ -446,10 +480,12 @@ Substitutes one synthetic item for a contiguous or scattered set of real ones.
   cannot claim a `tool_call_id`.
 - `label` — display label for the folded region in the TUI. Not sent to the model.
 - `inherit_position` — `"first"` places the replacement where the earliest named item sat,
-  `"last"` where the latest sat. Anything else raises `omp.PatchRejected`.
+  `"last"` where the latest sat. Any other value drops and journals this op with
+  `omp.PatchRejected`.
 
-If two `Replace` ops name overlapping ids the patch is rejected. A `Replace` and a `Prune`
-naming the same id is also rejected; ambiguity is never resolved by precedence.
+If two `Replace` ops name overlapping ids, the earlier op wins and the later op is dropped
+and journaled. A `Replace` conflicting with an earlier `Prune` or `DropParts` is likewise
+dropped and journaled; the rest of the patch still applies.
 
 #### `omp.Insert`
 
@@ -470,8 +506,9 @@ Adds a synthetic item that exists only in this turn's working copy.
 - `role` — `"user"`, `"assistant"`, or `"system"`. A `"system"` insert lands as a
   `MessageKind.NOTICE` item and is rendered as such.
 - `ephemeral` — `True` means the item is never journaled; the next turn's patch must insert
-  it again. `False` requests durability, which is refused with `omp.PatchRejected`: durable
-  additions go through `omp.journal.append` (`docs/py/09-journal.md`), where they get an id,
+  it again. `False` requests durability, so that op is dropped and journaled with
+  `omp.PatchRejected`: durable additions go through `omp.journal.append`
+  (`docs/py/09-journal.md`), where they get an id,
   an event index, and a place in the chain. There is no back door.
 - `dedupe_key` — when set, at most one insert with that key survives per turn across all
   handlers. Two nudge-injecting extensions using the same key produce one nudge instead of
@@ -494,8 +531,9 @@ Moves the named items, preserving their relative order, immediately before the i
 
 This op is deliberately weak. It cannot move items across a `turn_id` boundary, cannot move
 `TOOL_CALL` and `TOOL_RESULT` apart, cannot move a `pinned` item, and cannot move anything
-above the last `COMPACTION` item. Violating any of those raises `omp.PatchRejected`. It
-exists for one legitimate use — hoisting a retrieved memory block to sit adjacent to the
+above the last `COMPACTION` item. Violating any of those rules drops and journals that op
+with `omp.PatchRejected`; the remaining ops still apply. It exists for one legitimate use
+— hoisting a retrieved memory block to sit adjacent to the
 question that retrieved it — and every reorder invalidates the prefix cache from the
 earliest touched position, which the application record states plainly.
 
@@ -530,6 +568,7 @@ before anything crosses a socket.
 @dataclass(slots=True)
 class ContextPatch:
     prune: list[Prune] = field(default_factory=list)
+    drop_parts: list[DropParts] = field(default_factory=list)
     replace: list[Replace] = field(default_factory=list)
     insert: list[Insert] = field(default_factory=list)
     reorder: list[Reorder] = field(default_factory=list)
@@ -542,7 +581,7 @@ patch and is measurably cheaper — no frame is sent.
 `note` is a human-readable one-liner recorded with the application record; it is what shows
 up in the TUI when a user asks why their context shrank.
 
-**`patch.is_empty() -> bool`** — True when all four lists are empty. Pure.
+**`patch.is_empty() -> bool`** — True when all five lists are empty. Pure.
 
 **`patch.merge(other: ContextPatch) -> ContextPatch`** — Concatenates op lists. Provided so
 one extension can compose its own sub-rules; it performs no conflict checking, because
@@ -550,10 +589,15 @@ conflict checking is the agent's job and duplicating it in Python would let the 
 
 **Channel and latency.** The `thread_projection` event rides CONTROL, once per LLM request, in
 the Projecting phase. Latency class: **per-turn**. Failure policy: **fail-open** — a handler
-that raises, times out, or returns a rejected patch is skipped with a journaled diagnostic and
-the turn proceeds on the unpatched thread. Rationale: a projection handler is an optimization.
+that raises or times out is skipped whole with a journaled diagnostic. If a returned patch
+contains an invalid op, only that offending op is dropped and journaled with the rule it
+broke; the rest of that patch applies. If every contribution is skipped, the turn proceeds
+on the unpatched thread. Rationale: a projection handler is an optimization.
 A policy handler denying a call is a safety decision and fails closed
 (`docs/py/06-policy.md`); dropping stale tool output is not.
+
+**Resolved (2026-08-20 ruling):** handler failure is whole-handler fail-open, while patch
+validation is per-op fail-open. A rejected op never discards its valid siblings.
 
 **Chaining.** Handlers run in deterministic handler order — the `(layer, publisher,
 extension_id)` tie-break every hook dispatch uses (`docs/py/05-hooks.md`); there is no
@@ -563,8 +607,11 @@ and applied together, once. This is the deliberate break from pi's sequential pi
 means handler N's cost scales with handler N-1's output size and no handler can be reasoned
 about in isolation. Collecting means conflicts are detected instead of silently resolved by
 ordering, and total application cost is one pass regardless of handler count. When two
-patches genuinely conflict the op from the later handler in that order is dropped, and both
-the drop and the winning op are journaled.
+patches genuinely conflict, deterministic handler order wins first — the earlier handler's
+op is kept and the later handler's op is dropped. Within one handler's patch, the fixed
+application order `prune → drop_parts → replace → insert → reorder` and then list order
+define which op is earlier. The later op is dropped; both the drop and the winning op are
+journaled.
 
 **This is not a gate chain, and the distinction is load-bearing.** `PLAN.md` §D6
 locks **D6 — One mailbox, no gate chain**, amended 2026-08-19: a tool batch runs concurrently
@@ -586,7 +633,7 @@ their work would be discarded, and skipping it is observationally identical apar
 Compaction is not a dispatch, so D6 does not reach it. Worth being explicit, since a reader
 arriving from `docs/py/06-policy.md` will reasonably ask.
 
-### `omp.ContextEpoch` and `omp.context`
+### `omp.context.epoch()` and context control
 
 Module-level accessors. All are `async` and ride CONTROL unless noted.
 
@@ -731,8 +778,8 @@ with `omp.VolatilePrompt` and journaled. Read your inputs on `extension_activate
 `session_start`, for eager extensions that see the real session transition) or in a telemetry
 handler; render from a snapshot.
 
-Returning `None` omits the contribution. Returning `str` contributes text. Returning
-`omp.Tml` is rejected — TML is a UI type (`docs/py/07-ui.md`); the model reads text.
+Returning `None` omits the contribution. Returning `str` contributes text. Returning a
+`Tml` object is rejected — TML is a UI type (`docs/py/07-ui.md`); the model reads text.
 
 - `slot` — one of the names below. An unknown slot raises `omp.UnknownSlot` at import.
 - `priority` — orders contributions *within* a slot, descending. Ties break deterministically
@@ -1099,12 +1146,12 @@ registers five devices and, under the default dynamic tool policy
 
 | Exception | Raised when | Effect |
 |---|---|---|
-| `omp.PatchRejected` | A patch or compaction verdict violates a structural rule: pinned target, overlapping ops, dangling call, illegal reorder, unknown `first_kept_id`. | Contribution dropped, diagnostic journaled with the offending op, turn proceeds. |
-| `omp.ContextGone` | `MessageRef.parts()` / `.verdict()` names an item no longer in the live chain. | Handler's problem to catch; usually means re-read the view. |
+| `omp.PatchRejected` | A patch op or compaction verdict violates a structural rule: duplicate id, pinned target, conflicting op, dangling call, illegal reorder, unknown required id. | For a context patch, only the offending op is dropped and journaled; the remaining ops apply. A rejected compaction verdict is dropped as one contribution. |
+| `omp.ContextGone` | `MessageRef.parts()` / `.verdict()` names an item no longer in the live chain, or a patch's `ContextView.epoch` predates the live `compaction_epoch`. | A stale patch is rejected whole before validation, projection untouched and rejection journaled; a stale item fetch is the handler's problem to catch. |
 | `omp.NoVerdict` | `.verdict()` on a non-`TOOL_RESULT`, or a result with no stored verdict. | — |
 | `omp.UnknownSlot` | `@omp.prompt_slot` names a slot outside the catalog. | Raised at import; the extension fails to load. Loud on purpose: a typo'd slot silently contributing nothing is worse. |
 | `omp.SlotClassConflict` | `cls=` loosens a slot's class, or `invalidate()` targets a `FROZEN` slot. | Import-time or call-time error. |
-| `omp.VolatilePrompt` | A slot function returned different bytes on the harness's two renders. | Contribution dropped for the session, journaled with the slot name and both hashes. |
+| `omp.VolatilePrompt` (`omp.prompts.VolatilePrompt` is the identical defining-module spelling) | A slot function returned different bytes on the harness's two renders. | Contribution dropped for the session, journaled with the slot name and both hashes. |
 | `omp.PinBudgetExceeded` | `pin()` would exceed the pin fraction of the window. | Nothing pinned. |
 | `omp.CompactionBusy` | `compact()` while one runs. | — |
 | `omp.CompactionRefused` | `CancelCompaction` at `HANDOFF` under `reason="rescue"`. | Verdict dropped, handoff proceeds. |
@@ -1291,11 +1338,11 @@ _state = {"observed_at": 0, "epoch": 0}
 @omp.entry_kind("dev.om.observations", rev="v.1")
 @dataclass(frozen=True, slots=True)
 class ObservationsRecorded:
-    turn_id: str
+    turn: int
     observations: tuple[str, ...]
 
-@omp.telemetry(["turn"])
-async def observe(ev: omp.TurnTelemetry, ctx: omp.Context) -> None:
+@omp.telemetry(["turn_end"])
+async def observe(ev: omp.telemetry.TurnEnd, ctx: omp.Context) -> None:
     usage = await omp.context.usage()
     if usage.total_tokens - _state["observed_at"] < OBSERVE_EVERY_TOKENS:
         return
@@ -1303,14 +1350,17 @@ async def observe(ev: omp.TurnTelemetry, ctx: omp.Context) -> None:
     _state["epoch"] = usage.compaction_epoch
 
     view = await omp.context.view()
-    recent = [r for r in view.since(ev.turn_id) if r.kind is omp.MessageKind.TOOL_RESULT]
+    recent = [
+        r for r in view.messages
+        if r.turn_id == view.turn_id and r.kind is omp.MessageKind.TOOL_RESULT
+    ]
     # Read structured verdicts, not prose: dialect-neutral and stable across revs.
     facts = [await r.verdict() for r in recent if not r.is_error and not r.useless]
 
     out = await omp.agents.completion(
         role="smol",
         system="Extract durable observations. One per line. No speculation.",
-        parts=(omp.Part.json({"turn": ev.turn_id, "verdicts": facts}),),
+        parts=(omp.Part.json({"turn": ev.turn, "verdicts": facts}),),
         max_output_tokens=512,
         effort="low",
         labels={"pipeline": "om", "stage": "observe"},
@@ -1321,7 +1371,7 @@ async def observe(ev: omp.TurnTelemetry, ctx: omp.Context) -> None:
     if await omp.context.epoch() != _state["epoch"]:
         return  # context was compacted or reset under us; drop this batch
     await omp.journal.append(ObservationsRecorded(
-        turn_id=ev.turn_id,
+        turn=ev.turn,
         observations=tuple(out.text.splitlines()),
     ))
 
@@ -1329,8 +1379,11 @@ async def observe(ev: omp.TurnTelemetry, ctx: omp.Context) -> None:
 async def supply_fold(ev: omp.CompactionEvent, ctx: omp.Context) -> omp.CompactionVerdict | None:
     if ev.tier is not omp.CompactionTier.LOCAL:
         return None  # let PRUNE/DROP_MEDIA/ELIDE run; we only replace summarization
-    entries = await omp.sessions.journal(omp.session_id(), types=(ObservationsRecorded,))
-    lines = [o for e in entries for o in e.observations]
+    lines = []
+    async for entry in omp.sessions.journal(
+        ctx.session, kinds=("dev.om.observations",)
+    ):
+        lines.extend(entry.observations)
     if not lines:
         return None  # nothing folded yet — let the default summarizer earn its keep
     return omp.CustomSummary(
@@ -1406,6 +1459,8 @@ Under omp the extension splits cleanly along two boundaries — host versus env 
 stability class for the prompt:
 
 ```python
+import hashlib
+import json
 import omp
 import sqlite3
 from dataclasses import dataclass
@@ -1431,13 +1486,19 @@ def _db() -> sqlite3.Connection:
 async def backfill(ev: omp.ExtensionActivateEvent, ctx: omp.Context) -> None:
     conn = _db()
     seen = {row[0] for row in conn.execute("SELECT DISTINCT session FROM mem_fts")}
-    for desc in await omp.sessions.list(project=omp.cwd(), limit=500):
-        if desc.session_id in seen:
+    sessions = await omp.sessions.list(
+        omp.sessions.SessionFilter(project=ctx.root.uri, limit=500)
+    )
+    for desc in sessions:
+        if desc.id in seen:
             continue
-        entries = await omp.sessions.journal(desc.session_id, types=("message",))
+        rows = []
+        async for entry in omp.sessions.journal(desc.id, kinds=("message",)):
+            if entry.text:
+                rows.append((entry.text, desc.id))
         conn.executemany(
             "INSERT INTO mem_fts(body, kind, session) VALUES (?, 'message', ?)",
-            ((e.text, desc.session_id) for e in entries if e.text),
+            rows,
         )
     conn.commit()
 
@@ -1454,7 +1515,11 @@ async def index_workspace(args: IndexArgs, ctx: omp.Context) -> omp.Payload:
     async for entry in omp.env.find.walk(root=args.root, globs=("**/*.md", "**/*.rst")):
         rows.append((entry.path.uri, await entry.path.read_text()))
     # Only the digest crosses back to the host.
-    return omp.Payload({"files": len(rows), "digest": omp.digest(rows)})
+    encoded = json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode()
+    return omp.Payload({
+        "files": len(rows),
+        "digest": hashlib.sha256(encoded).hexdigest(),
+    })
 
 @dataclass(frozen=True, slots=True)
 class RecallArgs:
@@ -1570,6 +1635,8 @@ closed set, so a plain enum is correct.
 ```rust
 pub enum PatchOp {
 	Prune { ids: SmallVec<[Str; 8]>, keep_placeholder: bool },
+	// To build: crates/agent does not carry DropParts yet.
+	DropParts { ids: SmallVec<[Str; 8]>, reason: Str },
 	Replace { ids: SmallVec<[Str; 8]>, parts: SmallVec<[Part; 2]>, role: Role, at: InheritPos },
 	Insert { parts: SmallVec<[Part; 2]>, anchor: Anchor, role: Role, dedupe: Option<Str> },
 	Reorder { ids: SmallVec<[Str; 8]>, before: Str },
@@ -1579,18 +1646,28 @@ pub enum PatchOp {
 **Algorithm, one pass, no rebuild.** Application must not clone the thread. The shape that
 works:
 
+0. Compare the patch's `ContextView.epoch` with the live `compaction_epoch`. If the epoch
+   advanced, reject the whole patch before validation with `ContextGone`: leave the
+   projection untouched, journal the rejection, and proceed with the turn unpatched.
+   `StaleEpoch` remains scoped to strict context-lane journal writes; it is not the patch
+   fence error.
 1. Build `SparseMap<Str, u32>` from item id to index over the projected slice. `SparseMap` is
    already in `crates/core`.
-2. Resolve every op's ids to indexes, rejecting unknown-but-required and pinned targets. This
-   is where `PatchRejected` is decided — before any mutation, so rejection costs nothing.
-3. Detect conflicts by marking a `bitvec` of touched indexes per op and testing overlap.
-   O(ops × ids), no allocation beyond the bitvec.
+2. Validate each op and resolve its ids to indexes. A duplicate id, unknown-but-required id,
+   pinned target, or other invalid field drops and journals only that op with the rule it
+   broke; validation completes before mutation.
+3. Visit the five lists in fixed order `prune → drop_parts → replace → insert → reorder`.
+   Mark a `bitvec` of touched indexes per op; on overlap, the earlier op wins and the later
+   op is dropped and journaled. This is O(ops × ids), with no allocation beyond the bitvec.
 4. Compute a `Vec<Slot>` plan where `Slot` is `Keep(u32)`, `Synth(u32)` (index into a side
-   vector of synthesized items), or `Placeholder(u32)`. Reorder and insert are edits to this
-   plan, not to items.
+   vector of synthesized items), or `Placeholder(u32)`. Drop-parts, reorder, and insert are
+   edits to this plan, not to journal items.
 5. Materialize by walking the plan and cloning only `Synth`/`Placeholder` items. `Keep` items
    are moved out of the projected vector by index. The projection is owned and about to be
    consumed, so `Keep` is a move, not a clone.
+
+**Resolved (2026-08-20 ruling):** the epoch fence precedes all op validation, while op
+validation and conflict rejection are per-op. A stale patch is the one whole-patch rejection.
 
 Cost is O(items) for the map plus O(ops × ids) for resolution, with allocations bounded by the
 number of synthetic items. That is the whole point of the protocol: no patch, no cost beyond
@@ -2019,6 +2096,7 @@ on bytes. Revisit if the compaction threshold proves too jittery in practice.
 | `thread_projection` handler raises | Contribution dropped, traceback journaled, turn proceeds unpatched. Fail-open. |
 | `thread_projection` handler exceeds deadline | Same, plus a telemetry record naming the extension and its elapsed time. Deadline is a fraction of the turn's own deadline, so a slow handler cannot consume the turn. |
 | Patch fails validation | Offending op dropped and journaled with the rule it broke; the rest of that patch still applies. Per-op, not per-patch, because an extension that gets one op wrong should not lose the other forty. |
+| Patch epoch predates live `compaction_epoch` | Whole patch rejected with `ContextGone` before validation; projection untouched, rejection journaled, turn proceeds unpatched. |
 | Host crash / socket EOF during `thread_projection` | Unpatched thread sent. Host restarts; `extension_activate(reason=RESTART)` fires; nothing is inconsistent because patches are not durable. |
 | Host crash during `compaction` | Tier runs its default behaviour. The `Compact` event is appended by the agent, never by the host, so a crash cannot leave a half-written compaction. |
 | `CustomSummary` accepted, then turn cancelled | The `Compact` event already landed and stands. Compaction is not part of a turn's transaction; it is a chain edit. Correct, and the reason it must not be entangled with turn commit. |
@@ -2120,6 +2198,14 @@ The rest are genuine open questions.
    promises not to drop. Telling the model that would let it reason about its own context
    budget; it would also invite it to request pins, which is a resource it should not control.
    Currently invisible. Uncertain.
+
+7. **Resolved (2026-08-20 ruling): `DropParts(ids, reason="")` is a fifth `ContextPatch` op that removes named parts from the model-facing projection only; typed verdict and journal truth remain. Unknown or pinned targets drop and journal that op, and it participates in earlier-op-wins bitvec conflict accounting.** **DropParts semantics.** The verdict protocol already has transcript amendment `AmendPatch::DropParts` (`docs/py/02-verdicts.md:1868`), while the context patch listed only four projection ops and offered either whole-item pruning or replacement (`docs/py/08-context.md:403-536`); the competing readings were no projection-time sibling versus a real projection-only `DropParts`.
+
+8. **Resolved (2026-08-20 ruling): a duplicate id within one op is a validation failure that drops and journals that op with `duplicate id`; duplicates are never coalesced.** **Duplicate ids inside one patch op.** The op sketches accept raw id tuples without a uniqueness rule (`docs/py/08-context.md:407-498`), while the proposed resolver and bitvec accounting could either mark the same index once or reject duplicate input (`docs/py/08-context.md:1582-1587`); the competing readings were harmless coalescing versus per-op validation failure.
+
+9. **Resolved (2026-08-20 ruling): same-patch application order is fixed as `prune → drop_parts → replace → insert → reorder`, and conflicts are earlier-op-wins with the later op dropped and journaled.** **Reorder and prune ordering.** The body said all patch ops were order-independent (`docs/py/08-context.md:403-404`), while the plan-building algorithm necessarily resolves removals and moves in some order without specifying which (`docs/py/08-context.md:1579-1593`); the competing readings were order-independent set composition versus a fixed semantic order.
+
+10. **Resolved (2026-08-20 ruling): a patch applies only at the `ContextView` epoch where it was minted; if live `compaction_epoch` advanced, the whole patch is rejected before validation with `ContextGone`, projection untouched and rejection journaled, and the turn proceeds unpatched. `StaleEpoch` remains exclusive to strict-lane journal writes.** **Patch epoch fence.** `ContextView` carries an epoch and compaction advances it (`docs/py/08-context.md:352-377`), but the patch algorithm had no pre-validation epoch comparison (`docs/py/08-context.md:1579-1593`) while `StaleEpoch` was already reserved for strict context-lane journal writes (`docs/py/08-context.md:619-624`); the competing readings were applying ids against the new projection versus whole-patch stale rejection with `ContextGone`.
 
 ### Revision 2 (post-review)
 

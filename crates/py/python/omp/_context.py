@@ -11,9 +11,10 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any
 
-from _omp import CapabilityError, Duration, LifecyclePhase, Principal, WorkspaceUri
+from _omp import Duration, LifecyclePhase, Principal, WorkspaceUri
 
 from . import _scope
+from ._errors import CapabilityError
 from .placement import Place
 from .provider import Effort, ModelRef, RouteRef
 
@@ -110,8 +111,7 @@ class Context:
 
     def cancelled(self) -> bool:
         """Return whether cancellation has been requested for this scope."""
-        event = self._scope.cancelled if self._scope is not None else None
-        return bool(event is not None and event.is_set())
+        return bool(self._scope is not None and self._scope.cancelled)
 
     def checkpoint(self) -> None:
         """Raise ``CancelledError`` when cancellation is pending."""
@@ -123,6 +123,12 @@ class Context:
         if self._scope is None:
             raise RuntimeError("context is not attached to an invocation scope")
         callbacks = self._scope.cancel_callbacks
+        if self._scope.cancelled:
+            try:
+                fn()
+            except BaseException:
+                pass
+            return lambda: None
         callbacks.append(fn)
 
         def unregister() -> None:
@@ -147,9 +153,7 @@ class Context:
         requested = tuple(str(getattr(cap, "value", cap)) for cap in caps)
         missing = tuple(cap for cap in requested if cap not in self.caps)
         if missing:
-            raise CapabilityError(
-                f"required capabilities not granted: {', '.join(missing)}"
-            )
+            raise CapabilityError(missing[0])
 
     def log(self, level: object, message: str, /, **fields: object) -> None:
         """Emit a redacted structured log to the installed host sink."""

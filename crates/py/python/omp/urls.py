@@ -8,7 +8,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 
-from _omp import AgentUrl, ArtifactUrl, EnvPath, HistoryUrl
+from _omp import AgentUrl, ArtifactUrl, EnvPath, HistoryUrl, OmpError
 from _omp_url_vocab import (
     SCHEMES as _SCHEMES,
     SELECTOR_GRAMMAR,
@@ -16,7 +16,7 @@ from _omp_url_vocab import (
 )
 
 
-class UrlError(ValueError):
+class UrlError(OmpError, ValueError):
     """Base error for URL namespace operations."""
 
 

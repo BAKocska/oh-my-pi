@@ -113,6 +113,18 @@ class Conflict(EnvError):
         self.ranges = tuple(ranges)
 
 
+@dataclass(frozen=True, slots=True)
+class EditConflictFault(Fault):
+    """Durable conflict payload carrying both revisions and collided ranges."""
+
+    expected: Revision
+    current: Revision
+    ranges: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ranges", tuple(self.ranges))
+
+
 class Stale(EnvError):
     """A retained revision or host generation is stale."""
 
@@ -235,6 +247,37 @@ class PathMeta:
 
 
 @dataclass(frozen=True, slots=True)
+class DirEntry:
+    """One immediate directory child and its unfollowed metadata."""
+
+    name: str
+    meta: PathMeta
+
+
+@dataclass(frozen=True, slots=True)
+class SymlinkTarget:
+    """Resolved lexical target of a symbolic-link entry."""
+
+    target: EnvPath
+    relative: bool
+
+
+class LinkKind(StrEnum):
+    """Host-facing symbolic-link target hint."""
+
+    FILE = "file"
+    DIRECTORY = "directory"
+
+
+@dataclass(frozen=True, slots=True)
+class CopyResult:
+    """Receipt for a filesystem copy."""
+
+    meta: PathMeta
+    bytes_copied: int
+
+
+@dataclass(frozen=True, slots=True)
 class WorktreeInfo:
     """Describe the Environment worktree containing the current workspace."""
 
@@ -343,6 +386,124 @@ class Presence(StrEnum):
 
     PRESENT = "present"
     MISSING = "missing"
+
+
+class Kind(StrEnum):
+    """Content kind of a pinned document revision."""
+
+    TEXT = "text"
+    BINARY = "binary"
+
+
+class SummaryRender(StrEnum):
+    """Rendering dialect for structural summaries."""
+
+    HASHLINE = "hashline"
+    NUMBERED = "numbered"
+    PLAIN = "plain"
+
+
+class SummaryReason(StrEnum):
+    """Machine-readable reason a structural summary was unavailable."""
+
+    BINARY = "binary"
+    MISSING_DOCUMENT = "missing_document"
+    TOO_LARGE = "too_large"
+    TOO_MANY_LINES = "too_many_lines"
+    BELOW_MINIMUM_LINES = "below_minimum_lines"
+    PROSE_DISABLED = "prose_disabled"
+    UNSUPPORTED_LANGUAGE = "unsupported_language"
+    EMPTY = "empty"
+    SYNTAX_ERROR = "syntax_error"
+    NO_ELISIONS = "no_elisions"
+    PARSER_FAILURE = "parser_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryOptions:
+    """Caller-controlled structural-summary thresholds and rendering."""
+
+    min_body_lines: int = 2
+    min_comment_lines: int = 4
+    unfold_until_lines: int = 0
+    unfold_limit_lines: int = 0
+    prose: bool = False
+    min_total_lines: int = 0
+    render: SummaryRender = SummaryRender.HASHLINE
+    language: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "min_body_lines",
+            "min_comment_lines",
+            "unfold_until_lines",
+            "unfold_limit_lines",
+            "min_total_lines",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an int")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if not isinstance(self.prose, bool):
+            raise TypeError("prose must be a bool")
+        if not isinstance(self.render, SummaryRender):
+            raise TypeError("render must be an omp.env.SummaryRender")
+        if self.language is not None and (
+            not isinstance(self.language, str) or not self.language
+        ):
+            raise ValueError("language must be a non-empty str or None")
+
+
+@dataclass(frozen=True, slots=True)
+class SummarySegment:
+    """One kept or elided one-based inclusive summary range."""
+
+    kept: bool
+    start_line: int
+    end_line: int
+    text: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.start_line) is not int or type(self.end_line) is not int:
+            raise TypeError("summary segment coordinates must be ints")
+        if self.start_line < 1 or self.end_line < self.start_line:
+            raise ValueError("summary segment coordinates must be one-based and ordered")
+        if self.kept and self.text is None:
+            raise ValueError("a kept summary segment must carry text")
+        if not self.kept and self.text is not None:
+            raise ValueError("an elided summary segment cannot carry text")
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    """Successful bounded structural summary."""
+
+    language: str
+    parsed: bool
+    elided: bool
+    total_lines: int
+    segments: tuple[SummarySegment, ...]
+    text: str
+    display_text: str
+    elided_ranges: tuple[tuple[int, int], ...]
+    elided_lines: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "segments", tuple(self.segments))
+        object.__setattr__(
+            self, "elided_ranges", tuple(tuple(bounds) for bounds in self.elided_ranges)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryUnavailable:
+    """Machine-readable structural-summary refusal."""
+
+    reason: SummaryReason
+    total_lines: int
+    language: str
+    parsed: bool
 
 
 class DocEventKind(StrEnum):
@@ -529,11 +690,30 @@ class Doc:
         """Apply one hashline patch through the document actor."""
         return await _request("omp.env.docs.Doc.hashline", lease=self._lease, patch=patch, **options)
 
-    async def summary(self, options: Any = None) -> Any:
+    async def summary(
+        self, options: SummaryOptions | None = None
+    ) -> Summary | SummaryUnavailable:
         """Return a bounded structural summary at the current revision."""
-        return await _request(
+        if options is not None and not isinstance(options, SummaryOptions):
+            raise TypeError("options must be an omp.env.SummaryOptions or None")
+        result = await _request(
             "omp.env.docs.Doc.summary", lease=self._lease, options=options
         )
+        if isinstance(result, (Summary, SummaryUnavailable)):
+            return result
+        if not isinstance(result, Mapping):
+            raise TypeError("summary backend returned an invalid value")
+        values = dict(result)
+        if "reason" in values:
+            reason = values["reason"]
+            if not isinstance(reason, SummaryReason):
+                values["reason"] = SummaryReason(reason)
+            return SummaryUnavailable(**values)
+        values["segments"] = tuple(
+            segment if isinstance(segment, SummarySegment) else SummarySegment(**segment)
+            for segment in values["segments"]
+        )
+        return Summary(**values)
 
     async def refresh(self) -> Any:
         """Refresh and return the current committed revision."""
@@ -628,100 +808,425 @@ class _Docs:
         return Txn(txn_id)
 
 
+def _as_path_meta(value: Any) -> PathMeta:
+    if isinstance(value, PathMeta):
+        return value
+    if isinstance(value, Mapping):
+        values = dict(value)
+        kind = values.get("kind")
+        if not isinstance(kind, FileKind):
+            values["kind"] = FileKind(kind)
+        return PathMeta(**values)
+    raise TypeError("filesystem backend returned invalid path metadata")
+
+
 class _Fs:
     """Raw metadata and namespace operations over typed Environment paths."""
 
     async def stat(self, path: EnvPath) -> PathMeta:
         """Stat a path while following symbolic links."""
-        return await _request("omp.env.fs.stat", path=_env_path(path))
+        return _as_path_meta(
+            await _request("omp.env.fs.stat", path=_env_path(path))
+        )
 
     async def lstat(self, path: EnvPath) -> PathMeta:
         """Stat a path without following its final symbolic link."""
-        return await _request("omp.env.fs.lstat", path=_env_path(path))
+        return _as_path_meta(
+            await _request("omp.env.fs.lstat", path=_env_path(path))
+        )
 
-    async def list_dir(self, path: EnvPath) -> list[Any]:
-        """List one directory."""
-        return await _request("omp.env.fs.list_dir", path=_env_path(path))
+    async def list_dir(
+        self, path: EnvPath, *, follow: bool = False
+    ) -> list[DirEntry]:
+        """List immediate children with unfollowed metadata by default."""
+        values = await _request(
+            "omp.env.fs.list_dir", path=_env_path(path), follow=follow
+        )
+        return [
+            value
+            if isinstance(value, DirEntry)
+            else DirEntry(value["name"], _as_path_meta(value["meta"]))
+            for value in values
+        ]
 
-    async def read_link(self, path: EnvPath) -> EnvPath:
-        """Read a symbolic-link target as an Environment path."""
-        return await _request("omp.env.fs.read_link", path=_env_path(path))
+    async def read_link(self, path: EnvPath) -> SymlinkTarget:
+        """Read a symbolic-link target and whether its on-disk form was relative."""
+        value = await _request("omp.env.fs.read_link", path=_env_path(path))
+        if isinstance(value, SymlinkTarget):
+            return value
+        if isinstance(value, Mapping):
+            return SymlinkTarget(**value)
+        raise TypeError("filesystem backend returned an invalid symlink target")
 
     async def canonicalize(self, path: EnvPath) -> EnvPath:
         """Resolve a path in the Environment namespace."""
-        return await _request("omp.env.fs.canonicalize", path=_env_path(path))
+        value = await _request("omp.env.fs.canonicalize", path=_env_path(path))
+        return _env_path(value, "canonical path")
 
-    async def mkdir(self, path: EnvPath, *, parents: bool = False, exist_ok: bool = False) -> None:
-        """Create a directory."""
-        await _request(
-            "omp.env.fs.mkdir", path=_env_path(path), parents=parents, exist_ok=exist_ok
+    async def mkdir(
+        self, path: EnvPath, *, parents: bool = False, exist_ok: bool = False
+    ) -> PathMeta:
+        """Create a directory and return its metadata."""
+        return _as_path_meta(
+            await _request(
+                "omp.env.fs.mkdir",
+                path=_env_path(path),
+                parents=parents,
+                exist_ok=exist_ok,
+            )
         )
 
-    async def remove(self, path: EnvPath, *, recursive: bool = False) -> None:
-        """Remove a path."""
-        await _request("omp.env.fs.remove", path=_env_path(path), recursive=recursive)
+    async def remove(
+        self,
+        path: EnvPath,
+        *,
+        recursive: bool = False,
+        revision: Revision | None = None,
+    ) -> None:
+        """Remove a path, optionally fenced by a document revision."""
+        await _request(
+            "omp.env.fs.remove",
+            path=_env_path(path),
+            recursive=recursive,
+            revision=revision,
+        )
 
-    async def rename(self, source: EnvPath, destination: EnvPath, **options: Any) -> Any:
+    async def rename(
+        self,
+        src: EnvPath,
+        dest: EnvPath,
+        *,
+        overwrite: Overwrite = Overwrite.FAIL,
+        src_revision: Revision | None = None,
+        dest_revision: Revision | None = None,
+    ) -> PathMeta:
         """Rename a path inside the Environment namespace."""
-        return await _request(
-            "omp.env.fs.rename",
-            source=_env_path(source, "source"),
-            destination=_env_path(destination, "destination"),
-            **options,
+        if not isinstance(overwrite, Overwrite):
+            raise TypeError("overwrite must be an omp.env.Overwrite")
+        return _as_path_meta(
+            await _request(
+                "omp.env.fs.rename",
+                src=_env_path(src, "src"),
+                dest=_env_path(dest, "dest"),
+                overwrite=overwrite,
+                src_revision=src_revision,
+                dest_revision=dest_revision,
+            )
         )
 
-    async def copy(self, source: EnvPath, destination: EnvPath, **options: Any) -> Any:
-        """Copy a path inside the Environment namespace."""
-        return await _request(
+    async def copy(
+        self,
+        src: EnvPath,
+        dest: EnvPath,
+        *,
+        follow: bool = True,
+        overwrite: Overwrite = Overwrite.FAIL,
+        dest_revision: Revision | None = None,
+    ) -> CopyResult:
+        """Copy one non-directory entry."""
+        if not isinstance(overwrite, Overwrite):
+            raise TypeError("overwrite must be an omp.env.Overwrite")
+        value = await _request(
             "omp.env.fs.copy",
-            source=_env_path(source, "source"),
-            destination=_env_path(destination, "destination"),
-            **options,
+            src=_env_path(src, "src"),
+            dest=_env_path(dest, "dest"),
+            follow=follow,
+            overwrite=overwrite,
+            dest_revision=dest_revision,
         )
+        if isinstance(value, CopyResult):
+            return value
+        if isinstance(value, Mapping):
+            return CopyResult(_as_path_meta(value["meta"]), value["bytes_copied"])
+        raise TypeError("filesystem backend returned an invalid copy receipt")
 
-    async def symlink(self, target: EnvPath, link: EnvPath) -> None:
+    async def symlink(
+        self,
+        target: EnvPath,
+        link: EnvPath,
+        *,
+        kind: LinkKind = LinkKind.FILE,
+        relative: bool = False,
+        overwrite: Overwrite = Overwrite.FAIL,
+    ) -> PathMeta:
         """Create a symbolic link without ambient path conversion."""
-        await _request(
-            "omp.env.fs.symlink",
-            target=_env_path(target, "target"),
-            link=_env_path(link, "link"),
+        if not isinstance(kind, LinkKind):
+            raise TypeError("kind must be an omp.env.LinkKind")
+        if not isinstance(overwrite, Overwrite):
+            raise TypeError("overwrite must be an omp.env.Overwrite")
+        return _as_path_meta(
+            await _request(
+                "omp.env.fs.symlink",
+                target=_env_path(target, "target"),
+                link=_env_path(link, "link"),
+                kind=kind,
+                relative=relative,
+                overwrite=overwrite,
+            )
         )
 
-    async def hard_link(self, target: EnvPath, link: EnvPath) -> None:
+    async def hard_link(
+        self,
+        src: EnvPath,
+        link: EnvPath,
+        *,
+        follow: bool = False,
+        overwrite: Overwrite = Overwrite.FAIL,
+    ) -> PathMeta:
         """Create a hard link without ambient path conversion."""
-        await _request(
-            "omp.env.fs.hard_link",
-            target=_env_path(target, "target"),
-            link=_env_path(link, "link"),
+        if not isinstance(overwrite, Overwrite):
+            raise TypeError("overwrite must be an omp.env.Overwrite")
+        return _as_path_meta(
+            await _request(
+                "omp.env.fs.hard_link",
+                src=_env_path(src, "src"),
+                link=_env_path(link, "link"),
+                follow=follow,
+                overwrite=overwrite,
+            )
         )
 
-    async def chmod(self, path: EnvPath, permissions: Any) -> None:
-        """Set Environment-owned path permissions."""
-        await _request(
-            "omp.env.fs.chmod", path=_env_path(path), permissions=permissions
+    async def chmod(
+        self,
+        path: EnvPath,
+        *,
+        read_only: bool | None = None,
+        executable: bool | None = None,
+        follow: bool = True,
+        revision: Revision | None = None,
+    ) -> PathMeta:
+        """Update portable permission properties."""
+        return _as_path_meta(
+            await _request(
+                "omp.env.fs.chmod",
+                path=_env_path(path),
+                read_only=read_only,
+                executable=executable,
+                follow=follow,
+                revision=revision,
+            )
         )
+
+
+class SyncKind(StrEnum):
+    """Negotiated LSP text-document synchronization mode."""
+
+    NONE = "none"
+    FULL = "full"
+    INCREMENTAL = "incremental"
+
+
+@dataclass(frozen=True, slots=True)
+class SyncPolicy:
+    """Resolved synchronization behavior for one document-server binding."""
+
+    change: SyncKind
+    open_close: bool
+    will_save: bool
+    will_save_wait_until: bool
+    save: bool
+    save_include_text: bool
+    position_encoding: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.change, SyncKind):
+            raise TypeError("change must be an omp.env.SyncKind")
+        if not self.position_encoding:
+            raise ValueError("position_encoding must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class LspBinding:
+    """One language server bound to a document."""
+
+    server_id: bytes
+    name: str
+    sync: SyncPolicy
+    capabilities: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if type(self.server_id) is not bytes:
+            raise TypeError("server_id must be bytes")
+        if not isinstance(self.sync, SyncPolicy):
+            raise TypeError("sync must be an omp.env.SyncPolicy")
+        object.__setattr__(self, "capabilities", dict(self.capabilities))
+
+
+class LspStale(StrEnum):
+    """Policy for a request whose pinned document revision moved."""
+
+    FAIL = "fail"
+    RETRY_HEAD = "retry_head"
+
+
+class LspBindingEventKind(StrEnum):
+    """Kind of LSP server binding transition."""
+
+    READY = "ready"
+    POLICY_CHANGED = "policy_changed"
+    RESTARTED = "restarted"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True, slots=True)
+class LspEvent:
+    """One server notification with its authoritative revision when known."""
+
+    server_id: bytes
+    method: str
+    params: Any
+    path: str | None
+    revision: Revision | None
+
+
+@dataclass(frozen=True, slots=True)
+class LspBindingEvent:
+    """One connection-wide server binding transition."""
+
+    kind: LspBindingEventKind
+    binding: LspBinding
+    path: str | None
+
+
+class LspFailure(EnvError):
+    """JSON-RPC error returned by a selected language server."""
+
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        data: Any = None,
+        *,
+        fault: Fault | None = None,
+    ) -> None:
+        if type(code) is not int:
+            raise TypeError("LspFailure code must be an int")
+        super().__init__(message, fault=fault)
+        self.code = code
+        self.data = data
+
+
+def _as_revision(value: Any) -> Revision | None:
+    if value is None or isinstance(value, Revision):
+        return value
+    if isinstance(value, Mapping):
+        return Revision(**value)
+    raise TypeError("LSP backend returned an invalid revision")
+
+
+def _as_sync_policy(value: Any) -> SyncPolicy:
+    if isinstance(value, SyncPolicy):
+        return value
+    if isinstance(value, Mapping):
+        values = dict(value)
+        change = values.get("change")
+        if not isinstance(change, SyncKind):
+            values["change"] = SyncKind(change)
+        return SyncPolicy(**values)
+    raise TypeError("LSP backend returned an invalid sync policy")
+
+
+def _as_lsp_binding(value: Any) -> LspBinding:
+    if isinstance(value, LspBinding):
+        return value
+    if isinstance(value, Mapping):
+        values = dict(value)
+        values["sync"] = _as_sync_policy(values.pop("sync_policy", values.get("sync")))
+        return LspBinding(**values)
+    raise TypeError("LSP backend returned an invalid binding")
+
+
+_lsp_last_revision: contextvars.ContextVar[Revision | None] = contextvars.ContextVar(
+    "omp_env_lsp_last_revision", default=None
+)
 
 
 class _Lsp:
     """Revision-aware language-server multiplexing."""
 
-    async def bindings(self, path: EnvPath) -> list[Any]:
+    @property
+    def last_revision(self) -> Revision | None:
+        """Return the authoritative revision used by the latest request in this context."""
+        return _lsp_last_revision.get()
+
+    async def bindings(self, path: EnvPath) -> list[LspBinding]:
         """Return servers currently bound to a path."""
-        return await _request("omp.env.lsp.bindings", path=_env_path(path))
+        values = await _request("omp.env.lsp.bindings", path=_env_path(path))
+        return [_as_lsp_binding(value) for value in values]
 
-    async def request(self, server: object, method: str, params: Any, **options: Any) -> Any:
-        """Issue a revision-aware LSP request."""
-        return await _request(
-            "omp.env.lsp.request", server=server, method=method, params=params, **options
+    async def request(
+        self,
+        server: bytes,
+        method: str,
+        params: Any,
+        *,
+        doc: Doc | None = None,
+        on_stale: LspStale = LspStale.RETRY_HEAD,
+        timeout: Duration | None = None,
+    ) -> Any:
+        """Issue a revision-aware LSP request and retain the revision actually used."""
+        if type(server) is not bytes:
+            raise TypeError("server must be an LspBinding.server_id bytes value")
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty str")
+        if doc is not None and not isinstance(doc, Doc):
+            raise TypeError("doc must be an omp.env.Doc or None")
+        if not isinstance(on_stale, LspStale):
+            raise TypeError("on_stale must be an omp.env.LspStale")
+        result = await _request(
+            "omp.env.lsp.request",
+            server=server,
+            method=method,
+            params=params,
+            doc=doc,
+            on_stale=on_stale,
+            timeout=timeout,
         )
+        if isinstance(result, Mapping) and "revision" in result:
+            revision = _as_revision(result["revision"])
+            _lsp_last_revision.set(revision)
+            error = result.get("error")
+            if error is not None:
+                if not isinstance(error, Mapping):
+                    raise TypeError("LSP backend returned an invalid error")
+                raise LspFailure(
+                    error["code"], error["message"], error.get("data")
+                )
+            if "result" not in result:
+                raise TypeError("LSP backend response omitted its result")
+            return result["result"]
+        _lsp_last_revision.set(None)
+        return result
 
-    async def notify(self, server: object, method: str, params: Any) -> None:
+    async def notify(self, server: bytes, method: str, params: Any) -> None:
         """Issue an LSP notification."""
+        if type(server) is not bytes:
+            raise TypeError("server must be an LspBinding.server_id bytes value")
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty str")
         await _request("omp.env.lsp.notify", server=server, method=method, params=params)
 
-    def events(self) -> AsyncIterator[Any]:
-        """Yield LSP registry and server events."""
-        return _stream("omp.env.lsp.events")
+    async def _events(self) -> AsyncIterator[LspEvent | LspBindingEvent]:
+        async for value in _stream("omp.env.lsp.events"):
+            if isinstance(value, (LspEvent, LspBindingEvent)):
+                yield value
+                continue
+            if not isinstance(value, Mapping):
+                raise TypeError("LSP backend returned an invalid event")
+            values = dict(value)
+            if "method" in values:
+                values["revision"] = _as_revision(values.get("revision"))
+                yield LspEvent(**values)
+            else:
+                kind = values.get("kind")
+                if not isinstance(kind, LspBindingEventKind):
+                    values["kind"] = LspBindingEventKind(kind)
+                values["binding"] = _as_lsp_binding(values["binding"])
+                yield LspBindingEvent(**values)
+
+    def events(self) -> AsyncIterator[LspEvent | LspBindingEvent]:
+        """Yield typed LSP registry and server events."""
+        return self._events()
 
 
 class Run:
@@ -732,12 +1237,12 @@ class Run:
     def __init__(self, run_id: bytes) -> None:
         self.id = run_id
 
-    def __aiter__(self) -> AsyncIterator[Any]:
-        return _stream("omp.env.Run.events", run=self.id)
+    def __aiter__(self) -> AsyncIterator[Output | Exit]:
+        return _run_events(self.id)
 
-    async def wait(self) -> Any:
+    async def wait(self) -> Completed:
         """Drain output and return the terminal completion receipt."""
-        return await _request("omp.env.Run.wait", run=self.id)
+        return _as_completed(await _request("omp.env.Run.wait", run=self.id))
 
     async def stdin(self, data: bytes) -> None:
         """Write bytes to stdin or the PTY master."""
@@ -804,6 +1309,22 @@ class Channel(StrEnum):
     PTY = "pty"
 
 
+@dataclass(frozen=True, slots=True)
+class Output:
+    """One ordered output frame from an Environment-owned command."""
+
+    channel: Channel
+    data: bytes
+    sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class Exit:
+    """Terminal event for an Environment-owned command."""
+
+    status: Completed
+
+
 class Outcome(StrEnum):
     """Terminal outcome of an Environment-owned command."""
 
@@ -830,6 +1351,34 @@ class Completed:
         """Decode the bounded output lossily."""
         del channel
         return self.output.decode("utf-8", errors="replace")
+
+
+def _as_completed(value: Any) -> Completed:
+    if isinstance(value, Completed):
+        return value
+    if isinstance(value, Mapping):
+        values = dict(value)
+        outcome = values.get("outcome")
+        if not isinstance(outcome, Outcome):
+            values["outcome"] = Outcome(outcome)
+        return Completed(**values)
+    raise TypeError("exec backend returned an invalid completion receipt")
+
+
+async def _run_events(run_id: bytes) -> AsyncIterator[Output | Exit]:
+    async for value in _stream("omp.env.Run.events", run=run_id):
+        if isinstance(value, (Output, Exit)):
+            yield value
+        elif isinstance(value, Mapping) and "status" in value:
+            yield Exit(_as_completed(value["status"]))
+        elif isinstance(value, Mapping):
+            values = dict(value)
+            channel = values.get("channel")
+            if not isinstance(channel, Channel):
+                values["channel"] = Channel(channel)
+            yield Output(**values)
+        else:
+            raise TypeError("exec backend returned an invalid run event")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1191,12 +1740,16 @@ class _Sh:
             return result
         return Session(result["id"], result["cwd"])
 
-    async def run(self, script: str, **options: Any) -> Any:
+    async def run(self, script: str, **options: Any) -> Completed:
         """Run a command and collect its bounded completion receipt."""
+        if not isinstance(script, str) or not script:
+            raise ValueError("script must be a non-empty str")
         cwd = options.get("cwd")
         if cwd is not None:
             options["cwd"] = _env_path(cwd, "cwd")
-        return await _request("omp.env.sh.run", script=script, **options)
+        return _as_completed(
+            await _request("omp.env.sh.run", script=script, **options)
+        )
 
     def parse(self, script: str) -> Any:
         """Parse a script without executing it or performing I/O."""
@@ -1341,6 +1894,8 @@ __all__ = (
     "Cancelled",
     "Capability",
     "Conflict",
+    "CopyResult",
+    "DirEntry",
     "DocEvent",
     "DocEventKind",
     "Denied",
@@ -1351,14 +1906,24 @@ __all__ = (
     "EnvError",
     "EnvInfo",
     "Edit",
+    "EditConflictFault",
     "EditPlan",
     "EditResult",
+    "Exit",
     "FileKind",
     "Follow",
     "Format",
     "HttpResponse",
     "Invalid",
     "Io",
+    "Kind",
+    "LinkKind",
+    "LspBinding",
+    "LspBindingEvent",
+    "LspBindingEventKind",
+    "LspEvent",
+    "LspFailure",
+    "LspStale",
     "Match",
     "Lifecycle",
     "OnStale",
@@ -1368,6 +1933,7 @@ __all__ = (
     "Partial",
     "Presence",
     "Outcome",
+    "Output",
     "Process",
     "ProcessInfo",
     "ProcessOutput",
@@ -1388,6 +1954,15 @@ __all__ = (
     "Stale",
     "StaleGeneration",
     "StreamLost",
+    "Summary",
+    "SummaryOptions",
+    "SummaryReason",
+    "SummaryRender",
+    "SummarySegment",
+    "SummaryUnavailable",
+    "SymlinkTarget",
+    "SyncKind",
+    "SyncPolicy",
     "TimedOut",
     "Unsupported",
     "Txn",

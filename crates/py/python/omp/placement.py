@@ -1,11 +1,12 @@
 """Declarative placement and worker API; import is transport-free."""
 from __future__ import annotations
+import asyncio
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping, TypeVar
+from typing import Any, Callable, Final, Iterable, Mapping, TypeVar
 
-from _omp import Duration
+from _omp import Duration, PlacementError, StaleGeneration
 
 from ._registry import registry
 from ._errors import NotWiredError
@@ -22,10 +23,10 @@ class Restart(StrEnum):
 class WorkerState(StrEnum):
     """Observable named-worker lifecycle state."""
     SPAWNING = "spawning"; BOOTING = "booting"; READY = "ready"; DRAINING = "draining"; EVICTED = "evicted"; FAILED = "failed"
-class PlacementError(RuntimeError):
-    """A placement declaration or execution cannot be honored."""
 class WorkerUnavailable(PlacementError):
     """The requested named worker is not currently reachable."""
+class WorkerEvicted(PlacementError):
+    """A worker handle names a draining or retired generation."""
 class ShipError(PlacementError):
     """Code shipping to a worker failed."""
 class BoundaryError(PlacementError):
@@ -137,25 +138,56 @@ class WorkerHandle:
     def __init__(self, name: str, generation: int = 0, site: Site = Site.ENV) -> None: self.name, self.generation, self.site = name, generation, site
     async def state(self) -> WorkerState:
         """Return this worker generation's current state."""
-        raise NotWiredError("omp.workers.WorkerHandle.state")
+        try:
+            return (await self.info()).state
+        except (WorkerEvicted, NotWiredError):
+            raise
+        except Exception:
+            return WorkerState.FAILED
 
     async def info(self) -> WorkerInfo:
         """Return the full observation of this worker generation."""
-        raise NotWiredError("omp.workers.WorkerHandle.info")
+        info = await workers._admin(
+            "info", name=self.name, generation=self.generation
+        )
+        if not isinstance(info, WorkerInfo):
+            raise TypeError("worker info transport must return WorkerInfo")
+        return info
 
-    async def call(self, function: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T: return await workers._call(self.name, function, args, kwargs)
+    async def call(
+        self, function: Callable[..., _T], /, *args: Any, **kwargs: Any
+    ) -> _T:
+        """Run a remote function against this handle's worker generation."""
+        state = await self.state()
+        if state in (WorkerState.DRAINING, WorkerState.EVICTED):
+            raise WorkerEvicted(
+                f"worker {self.name!r} generation {self.generation} has been evicted"
+            )
+        return await workers._call(
+            self.name, self.generation, function, args, kwargs
+        )
     async def map(self, function: Callable[[_T], Any], values: Iterable[_T], *, concurrency: int | None = None) -> list[Any]:
         """Map calls serially; ``concurrency`` is reserved until the Part 3 supervisor lands."""
         if concurrency is not None and concurrency < 1: raise ValueError("concurrency must be positive")
         return [await self.call(function, value) for value in values]
     async def warm(self) -> None:
         """Ensure this worker generation has reached the ready state."""
-        raise NotWiredError("omp.workers.WorkerHandle.warm")
+        state = await workers._admin(
+            "warm", name=self.name, generation=self.generation
+        )
+        if state in (WorkerState.DRAINING, WorkerState.EVICTED):
+            raise WorkerEvicted(
+                f"worker {self.name!r} generation {self.generation} has been evicted"
+            )
 
     async def stop(self, *, grace: Duration = Duration("5s")) -> None:
         """Drain and terminate this worker generation."""
-        del grace
-        raise NotWiredError("omp.workers.WorkerHandle.stop")
+        try:
+            await workers._admin(
+                "stop", name=self.name, generation=self.generation, grace=grace
+            )
+        except WorkerEvicted:
+            return
 
     def session(self) -> _WorkerSession:
         """Borrow one raw session from this worker's connection pool."""
@@ -163,25 +195,53 @@ class WorkerHandle:
 
 class _Workers:
     """Worker declaration table and host-installed WorkerOp DATA registry."""
-    RESULT_SPILL_BYTES = 256 * 1024
-    DEFAULT_IDLE_TTL = Duration("7m")
-    __slots__ = ("_transport", "_unmanaged")
-    def __init__(self) -> None: self._transport: Any = None; self._unmanaged = False
+    RESULT_SPILL_BYTES: Final[int] = 256 * 1024
+    DEFAULT_IDLE_TTL: Final[Duration] = Duration("7m")
+    MAX_CONCURRENT_SPAWNS: Final[int] = 4
+    __slots__ = ("_transport", "_unmanaged", "_spawn_gate")
+    def __init__(self) -> None:
+        self._transport: Any = None
+        self._unmanaged = False
+        self._spawn_gate = asyncio.Semaphore(self.MAX_CONCURRENT_SPAWNS)
     def declare(self, spec: WorkerSpec) -> None:
         """Record one worker manifest projection during IMPORT."""
         if not isinstance(spec, WorkerSpec):
             raise TypeError("omp.workers.declare requires a WorkerSpec")
         registry.register_worker(spec.name, spec)
     def install(self, transport: Any, *, unmanaged: bool = False) -> None: self._transport, self._unmanaged = transport, unmanaged
+    async def _admin(self, action: str, **kwargs: Any) -> Any:
+        if self._transport is None:
+            raise NotWiredError(f"omp.workers.{action}")
+        try:
+            return await self._transport.worker_admin(action, **kwargs)
+        except WorkerEvicted:
+            raise
+        except StaleGeneration as error:
+            name = kwargs.get("name", "<unknown>")
+            generation = kwargs.get("generation")
+            detail = f"worker {name!r}"
+            if generation is not None:
+                detail += f" generation {generation}"
+            raise WorkerEvicted(f"{detail} has been evicted") from error
     async def get(self, name: str) -> WorkerHandle:
-        """Resolve a named worker handle through the asynchronous worker surface."""
-        return WorkerHandle(name)
+        """Resolve a named worker handle, bounding concurrent cold spawns."""
+        if not name:
+            raise ValueError("worker name is required")
+        async with self._spawn_gate:
+            resolved = await self._admin("get", name=name)
+        if isinstance(resolved, WorkerHandle):
+            return resolved
+        if isinstance(resolved, WorkerInfo):
+            if resolved.state in (WorkerState.DRAINING, WorkerState.EVICTED):
+                raise WorkerEvicted(
+                    f"worker {name!r} generation {resolved.generation} has been evicted"
+                )
+            return WorkerHandle(resolved.name, resolved.generation, resolved.site)
+        raise TypeError("worker get transport must return WorkerHandle or WorkerInfo")
     async def list(self) -> list[WorkerInfo]:
         """Return observations for every declared worker generation."""
-        if self._transport is None:
-            raise NotWiredError("omp.workers.list")
         try:
-            return await self._transport.worker_admin("list")
+            return await self._admin("list")
         except Exception:
             return []
 
@@ -189,12 +249,8 @@ class _Workers:
         self, name: str, *, grace: Duration = Duration("5s")
     ) -> bool:
         """Drain and terminate the current generation of a named worker."""
-        if self._transport is None:
-            raise NotWiredError("omp.workers.evict")
         try:
-            return await self._transport.worker_admin(
-                "evict", name=name, grace=grace
-            )
+            return await self._admin("evict", name=name, grace=grace)
         except Exception:
             return False
 
@@ -202,20 +258,31 @@ class _Workers:
         self, name: str, *, grace: Duration = Duration("5s")
     ) -> WorkerInfo:
         """Restart a named worker and return its new generation."""
-        if self._transport is None:
-            raise NotWiredError("omp.workers.restart")
         try:
-            return await self._transport.worker_admin(
-                "restart", name=name, grace=grace
-            )
+            return await self._admin("restart", name=name, grace=grace)
         except Exception as error:
             raise WorkerUnavailable(f"worker {name!r} failed") from error
-    async def _call(self, name: str, function: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str, Any]) -> _T:
+    async def _call(
+        self,
+        name: str,
+        generation: int,
+        function: Callable[..., _T],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> _T:
         if self._transport is None:
             from omp_remote import RemoteTraceback
-            raise WorkerUnavailable(f"worker {name!r} is unavailable") from RemoteTraceback(f"worker {name!r} has not been provisioned")
-        try: return await self._transport.worker_op(name, function, args, kwargs)
-        except Exception as error: raise WorkerUnavailable(f"worker {name!r} failed") from error
+            raise WorkerUnavailable(
+                f"worker {name!r} is unavailable"
+            ) from RemoteTraceback(f"worker {name!r} has not been provisioned")
+        try:
+            return await self._transport.worker_op(
+                name, generation, function, args, kwargs
+            )
+        except (WorkerEvicted, StaleGeneration):
+            raise
+        except Exception as error:
+            raise WorkerUnavailable(f"worker {name!r} failed") from error
 workers = _Workers()
 worker_state = "worker_state"
 MAX_WORKERS = 8

@@ -1322,7 +1322,7 @@ patch requires `approval`, and applies only when the ticket resolves approved.
 
 ### Approvals
 
-Approval in Revision 1 was `await omp.policy.approve(request)`: the calling hook coroutine
+Approval in Revision 1 was `await policy.approve(request)`: the calling hook coroutine
 suspended — "from seconds to hours" — until a human or an external service answered, and a
 pending request was journaled so a host restart could re-offer it. That shape is retracted,
 for the reasons the review gave. A suspended coroutine ties the decision's lifetime to a
@@ -1499,7 +1499,7 @@ denies everything gets disabled by the user within a day, and then nothing is ga
 is deliberately restricted to read-shaped operations, and the restriction is enforced by core,
 not by the extension's honesty. An unreachable route never raises into extension code — there
 is no suspended coroutine to raise into. It resolves the ticket, through this table, into an
-`ApprovalDecision` whose `source` is `UNAVAILABLE`. Revision 1's `omp.ApprovalUnavailable`
+`ApprovalDecision` whose `source` is `UNAVAILABLE`. Revision 1's `ApprovalUnavailable`
 exception is deleted along with the suspension model that needed it.
 
 #### `@omp.approver(name, *, kinds=(), timeout=..., unreachable=...)`
@@ -1529,6 +1529,13 @@ routinely outlive the process that started them.
 
 Every pending ticket for this session, in filing order. Used to render a status slot, and to
 reconcile an approver's outstanding asks after a restart.
+
+#### `await omp.policy.decide(ticket_id: str, decision: ApprovalDecision) -> None`
+
+Resolves a pending ticket with the supplied durable decision. Repeating the identical decision
+when Core re-offers the same `ticket_id` is an idempotent no-op; a conflicting second decision
+is rejected by Core. The operation rides CONTROL and raises `NotWiredError` when the host
+decision arm is unavailable.
 
 ### Input and discovery gating
 
@@ -1577,7 +1584,7 @@ an exact-match edit round-trips) and `REDACT` (one-way).
 The interaction rules are absolute:
 
 1. **`BashIR.source`, `BashArg.text` and `PathRef.lexical` are unredacted.** A policy that saw
-   `$$TOKEN_a1b2$$` instead of `ghp_…` could not tell a credential from a filename. The IR is
+   `$$TOKEN_a1b2c3d4e5f6$$` instead of `ghp_…` could not tell a credential from a filename. The IR is
    host-visible truth.
 2. **Everything a policy emits is masked before it leaves the host.** `Deny.reason`,
    `ApprovalSpec.subject`/`body`/`evidence`, `Amend.reason` and any journal record pass
@@ -1587,13 +1594,16 @@ The interaction rules are absolute:
    hand-written regexes (DSNs, `-----BEGIN`, Bearer, `AKIA`, `eyJ`, `ghp_`) to do it.
 3. **Approval bodies are masked, and the mask is stable.** Two requests quoting the same secret
    quote the same placeholder, so a human approving `curl -H "Authorization: Bearer
-   $$CRED_7f3a$$"` can recognise the credential without seeing it.
+   $$CRED_7f3a9b2c4d6e$$"` can recognise the credential without seeing it.
 4. **A profile may not be built from a secret.** `PathRule.path` and `DomainRule.domain`
    containing a placeholder raise `omp.ProfileRejected`: enforcement rules must be legible in
    an audit record.
 
-`omp.secrets.mask` is the escape hatch for extension-authored records that core does not route,
-and `omp.secrets.is_masked` lets a policy assert it never handled plaintext.
+`omp.secrets.mask` is the escape hatch for extension-authored records that core does not route.
+`omp.secrets.is_masked(text)` returns whether `text` contains a canonical reversible
+placeholder: a 12-character lowercase base-36 keyed digest, an optional uppercase label, and
+an optional `U`, `L`, `C`, or `M` case hint. It performs this format check locally and does not
+send the text through a host arm.
 
 ### Exceptions
 
@@ -2650,7 +2660,7 @@ mechanism (**D5**).
      still the mechanism, interrupts are still courtesy (`interrupt_grace`,
      `worker.rs:74-75`) — with the unit of loss shrunk from the session to the extension.
    - **Approvals no longer create long suspensions at all.** Revision 1's worst case — a
-     suspended `omp.policy.approve` coroutine holding the worker for hours while every other
+     suspended `policy.approve` coroutine holding the worker for hours while every other
      extension queued behind it, including the `sandbox_violation` hook that would remediate
      it — cannot occur, because approval is a returned `RequireApproval` and a Core-owned
      durable ticket. There is no host coroutine to hold, so cancellation never has to choose
@@ -2675,13 +2685,13 @@ mechanism (**D5**).
 
 Changes this file made for Revision 2, and the review point that drove each:
 
-- **P0#6 — approvals are tickets, not suspensions.** `await omp.policy.approve()` and the
+- **P0#6 — approvals are tickets, not suspensions.** `await policy.approve()` and the
   suspended-coroutine model are deleted; the Approvals section now defines `omp.ApprovalSpec`
   (renamed from `ApprovalRequest`), the Core-persisted durable `omp.ApprovalTicket`, and the
   flow in which an `APPROVAL`-phase hook returns `RequireApproval(ApprovalSpec(...))` (the
   decision arm is owned by `docs/py/05-hooks.md`). Ticket properties: survives extension
   restarts, never occupies a host coroutine, exactly one unspoofable dialog,
-  headless/external approval as ticket properties. `omp.ApprovalUnavailable` is deleted
+  headless/external approval as ticket properties. `ApprovalUnavailable` is deleted
   (nothing waits, so nothing raises); `@omp.approver` receives a ticket and keys idempotence
   on `ticket_id`; `pending()` returns tickets; `Amend`/`policy.amend` gained `approval=` so
   widening grants ride the same mechanism. The reversal is recorded in prose at the top of
@@ -2741,8 +2751,8 @@ Changes this file made for Revision 2, and the review point that drove each:
   resolve the deadlock; the recommended D5 amendment ("warm pool of one" → warm process per
   active extension) is stated explicitly and flagged for `PLAN.md`, never silently
   contradicted.
-- **§0 renames, file-wide.** Hook signatures return `omp.HookDecision` (never `omp.Verdict`);
-  `omp.Priority` bands became `omp.HookPhase` with `phase=` in every decorator (pattern hooks
+- **§0 renames, file-wide.** Hook signatures return `omp.HookDecision` (never `Verdict`);
+  `Priority` bands became `omp.HookPhase` with `phase=` in every decorator (pattern hooks
   re-homed to PRECHECK/TRANSFORM/REVIEW/APPROVAL, and the pi-permission-system port's
   interactive terminal became an `APPROVAL`-phase `RequireApproval`); millisecond constants
   and fields became `omp.Duration` (`POLICY_DEADLINE`, `APPROVAL_DEADLINE`,
@@ -2752,7 +2762,7 @@ Changes this file made for Revision 2, and the review point that drove each:
   deliberately kept raw and the reason stated); late-activation re-offer language uses
   `extension_activate`, never `session_start`; the guardian example's raw string/dict
   `journal.append` became a declared `@omp.entry_kind` instance (P0#17); profile composition
-  is restated as order-independent rather than `omp.Priority`-ordered.
+  is restated as order-independent rather than `Priority`-ordered.
 
 **Revision 2.1** — the `dyn`/`@omp.tool` rulings addendum and the PLAN.md amendment:
 

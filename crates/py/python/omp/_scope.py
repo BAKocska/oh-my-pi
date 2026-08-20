@@ -51,7 +51,7 @@ class Scope:
         default_factory=lambda: MappingProxyType({})
     )
     secret_settings: frozenset[str] = frozenset()
-    cancelled: object | None = None
+    cancelled: bool = False
     cancel_callbacks: list[Callable[[], None]] = field(default_factory=list)
 
 _current: contextvars.ContextVar[Scope | None] = contextvars.ContextVar("omp_scope", default=None)
@@ -70,6 +70,31 @@ def install(scope: Scope) -> contextvars.Token[Scope | None]:
 def reset(token: contextvars.Token[Scope | None]) -> None:
     """Restore the scope preceding ``install``."""
     _current.reset(token)
+
+
+def _request_cancel(scope: Scope) -> bool:
+    """Mark a scope cancelled, returning whether this is the first request."""
+    if scope.cancelled:
+        return False
+    object.__setattr__(scope, "cancelled", True)
+    return True
+
+
+def _fire_cancel_callbacks(
+    scope: Scope,
+    on_callback_error: Callable[[BaseException], None],
+) -> None:
+    """Fire and remove cancellation callbacks in reverse registration order."""
+    callbacks = tuple(reversed(scope.cancel_callbacks))
+    scope.cancel_callbacks.clear()
+    for callback in callbacks:
+        try:
+            callback()
+        except BaseException as error:
+            try:
+                on_callback_error(error)
+            except BaseException:
+                pass
 
 
 __all__ = ("Scope", "Trust", "current", "install", "reset")

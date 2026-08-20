@@ -3,28 +3,59 @@
 from __future__ import annotations
 
 import sys
+import warnings
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, StrEnum
 from types import MappingProxyType, ModuleType
-from typing import Any
+from typing import Any, Final
 
-from _omp import Duration, EnvPath
+from _omp import ArtifactUrl, Duration, EnvPath, OmpError
+
 
 from ._errors import NotWiredError
+from ._verdicts import Rev
 from ._registry import ExportDefinition, registry as _declarations
 from .placement import Place
 from .prompts import SlotClass
 
 QUEUE_DEFAULT = 4096
+QUEUE_MAX: Final[int] = 65_536
+"""Maximum supported subscription ring capacity."""
 BATCH_MAX = 1024
 METRIC_PREFIX = "omp.ext."
+MAX_INSTRUMENTS: Final[int] = 256
+"""Maximum number of distinct metric instruments an extension may declare."""
+MAX_CARDINALITY: Final[int] = 1024
+"""Maximum number of distinct attribute series retained per instrument."""
+DEFAULT_MAX_BYTES: Final[int] = 51_200
+"""Default byte budget for an inline rendered result."""
+DEFAULT_MAX_LINES: Final[int] = 3_000
+"""Default line budget for an inline rendered result."""
+DEFAULT_MAX_COLUMN: Final[int] = 512
+"""Default UTF-16 column budget for an inline rendered result."""
+QUERY_LIMIT_MAX: Final[int] = 10_000
+"""Maximum number of rows one telemetry query may request."""
+SPILL_BYTES: Final[int] = DEFAULT_MAX_BYTES
+"""Telemetry name for the rendered-result byte spill gate."""
+SPILL_LINES: Final[int] = DEFAULT_MAX_LINES
+"""Telemetry name for the rendered-result line spill gate."""
+SPILL_COLUMN: Final[int] = DEFAULT_MAX_COLUMN
+"""Telemetry name for the rendered-result column spill gate."""
 
 
-class SubscriptionError(ValueError):
+class TelemetryError(OmpError):
+    """Base class for telemetry declaration, query, and export failures."""
+
+
+class SubscriptionError(TelemetryError):
     """A telemetry declaration is malformed or duplicates a static key."""
+
+
+class QueryError(TelemetryError):
+    """A telemetry query is malformed or refers to an unknown indexed value."""
 
 
 class Kind(StrEnum):
@@ -197,8 +228,8 @@ def _subscribe(
         raise SubscriptionError(str(error)) from error
     if not parsed_kinds:
         raise SubscriptionError("telemetry kinds must not be empty")
-    if not 1 <= queue <= 65536:
-        raise SubscriptionError("telemetry queue must be in 1..=65536")
+    if not 1 <= queue <= QUEUE_MAX:
+        raise SubscriptionError(f"telemetry queue must be in 1..={QUEUE_MAX}")
     if batch is not None and not 2 <= batch <= BATCH_MAX:
         raise SubscriptionError(f"telemetry batch must be in 2..={BATCH_MAX}")
     if replay_limit < 1:
@@ -229,6 +260,7 @@ _instrument_sink: ContextVar[Any | None] = ContextVar(
     "omp_telemetry_instrument_sink", default=None
 )
 _instruments: dict[str, Counter | Histogram] = {}
+_OVERFLOW_ATTRS: Mapping[str, str] = MappingProxyType({"overflow": "true"})
 
 
 def _install_instrument_sink(sink: Any | None) -> None:
@@ -249,13 +281,36 @@ def _validate_attrs(attrs: Mapping[str, object]) -> None:
             raise TypeError("instrument attribute values must be str, int, float, or bool")
 
 
+def _bounded_attrs(
+    instrument: Counter | Histogram,
+    attrs: Mapping[str, object],
+) -> Mapping[str, object]:
+    series = frozenset(attrs.items())
+    if series in instrument._series:
+        return attrs
+    if len(instrument._series) < MAX_CARDINALITY:
+        instrument._series.add(series)
+        return attrs
+    if not instrument._cardinality_warned:
+        warnings.warn(
+            f"metric {instrument.name!r} exceeded attribute cardinality; "
+            'folding new series into overflow="true"',
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        instrument._cardinality_warned = True
+    return _OVERFLOW_ATTRS
+
+
 class Counter:
     """Extension-owned monotonic counter declaration."""
 
-    __slots__ = ("_local", "description", "unit")
+    __slots__ = ("_cardinality_warned", "_local", "_series", "description", "unit")
 
     def __init__(self, local: str, unit: str, description: str) -> None:
         self._local = local
+        self._series: set[frozenset[tuple[str, object]]] = set()
+        self._cardinality_warned = False
         self.unit = unit
         self.description = description
 
@@ -275,13 +330,20 @@ class Counter:
         sink = _instrument_sink.get()
         if sink is None:
             return
-        sink.add(self.name, value, attrs)
+        sink.add(self.name, value, _bounded_attrs(self, attrs))
 
 
 class Histogram:
     """Extension-owned histogram declaration."""
 
-    __slots__ = ("_local", "boundaries", "description", "unit")
+    __slots__ = (
+        "_cardinality_warned",
+        "_local",
+        "_series",
+        "boundaries",
+        "description",
+        "unit",
+    )
 
     def __init__(
         self,
@@ -291,6 +353,8 @@ class Histogram:
         boundaries: tuple[int | float, ...] | None,
     ) -> None:
         self._local = local
+        self._series: set[frozenset[tuple[str, object]]] = set()
+        self._cardinality_warned = False
         self.unit = unit
         self.description = description
         self.boundaries = boundaries
@@ -309,7 +373,7 @@ class Histogram:
         sink = _instrument_sink.get()
         if sink is None:
             return
-        sink.record(self.name, value, attrs)
+        sink.record(self.name, value, _bounded_attrs(self, attrs))
 
 
 def counter(name: str, *, unit: str, description: str) -> Counter:
@@ -325,6 +389,10 @@ def counter(name: str, *, unit: str, description: str) -> Counter:
         ):
             raise SubscriptionError(f"conflicting instrument declaration: {local!r}")
         return existing
+    if len(_instruments) >= MAX_INSTRUMENTS:
+        raise SubscriptionError(
+            f"metric instrument quota exceeded: {MAX_INSTRUMENTS}"
+        )
     instrument = Counter(local, unit, description)
     _instruments[local] = instrument
     return instrument
@@ -355,12 +423,16 @@ def histogram(
         ):
             raise SubscriptionError(f"conflicting instrument declaration: {local!r}")
         return existing
+    if len(_instruments) >= MAX_INSTRUMENTS:
+        raise SubscriptionError(
+            f"metric instrument quota exceeded: {MAX_INSTRUMENTS}"
+        )
     instrument = Histogram(local, unit, description, parsed_boundaries)
     _instruments[local] = instrument
     return instrument
 
 
-class ExportError(SubscriptionError):
+class ExportError(TelemetryError):
     """An export target declaration is malformed."""
 
 
@@ -624,6 +696,75 @@ class TurnEnd(Envelope):
 
 
 @dataclass(frozen=True, slots=True)
+class CapabilityDegraded(Envelope):
+    """Record how a provider constraint budget treated one declared intent."""
+
+    intent: str
+    tool: str | None
+    rev: Rev | None
+    requested_priority: int
+    granted: bool
+    reason: str
+    provider: str
+    budget_used: int
+    budget_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class Compaction(Envelope):
+    """Measure one settled context-compaction attempt."""
+
+    reason: str
+    strategy: str
+    by: str | None
+    tokens_before: int
+    tokens_after: int
+    items_before: int
+    items_after: int
+    prompt_text_dropped_bytes: int
+    outcomes_kept: int
+    artifacts_promoted: tuple[ArtifactUrl, ...]
+    duration_ms: int
+    aborted: bool
+    epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class IssueReport(Envelope):
+    """Describe one durable AutoQA issue report."""
+
+    issue: str
+    tool: str
+    rev: Rev
+    summary: str
+    expected: str | None
+    observed: str | None
+    reporter: str
+    reporter_id: str | None
+    call_id: str | None
+    turn: int
+    args_raw: str | None
+    payload: object | None
+    fault: object | None
+    repairs: tuple[object, ...]
+    labels: tuple[str, ...]
+    consent: object
+
+
+Event = (
+    SessionStart
+    | SessionEnd
+    | TurnStart
+    | TurnEnd
+    | ModelRequest
+    | CapabilityDegraded
+    | Compaction
+    | IssueReport
+)
+"""Closed union of event values currently materialized by the Python host."""
+
+
+@dataclass(frozen=True, slots=True)
 class Predicate:
     """Base value for a host-evaluated telemetry query predicate."""
 
@@ -692,6 +833,37 @@ class Row(Mapping[str, object]):
 
 
 @dataclass(frozen=True, slots=True)
+class RevMetrics:
+    """Aggregate one tool revision's indexed reliability and latency facts."""
+
+    rev: Rev
+    first_seen_ms: int
+    last_seen_ms: int
+    sessions: int
+    calls: int
+    ok: int
+    faults: int
+    blocked: int
+    timeouts: int
+    aborted: int
+    skipped: int
+    postcondition_rejected: int
+    abandoned: int
+    fault_codes: Mapping[str, int]
+    repaired_calls: int
+    repair_paths: Mapping[str, int]
+    retry_rate: float
+    p50_latency_ms: float
+    p95_latency_ms: float
+    p99_latency_ms: float
+    p50_speculation_ms: float
+    p50_prompt_bytes: float
+    p95_prompt_bytes: float
+    spills: int
+    issues: int
+
+
+@dataclass(frozen=True, slots=True)
 class QueryResult:
     """Report rows and scan facts from a settled telemetry query."""
 
@@ -751,9 +923,242 @@ async def query(q: Query) -> QueryResult:
 
     from . import _control_backend, _control_request
 
+    if not isinstance(q, Query):
+        raise TypeError("q must be an omp.telemetry.Query")
+    if not q.match:
+        raise QueryError("query match must not be empty")
+    if not 1 <= q.limit <= QUERY_LIMIT_MAX:
+        raise QueryError(f"query limit must be in 1..={QUERY_LIMIT_MAX}")
+    if q.window < 0:
+        raise QueryError("query window must be non-negative")
     if _control_backend.get() is None:
         raise NotWiredError("omp.telemetry.query")
     return await _control_request("omp.telemetry.query", query=_query_wire(q))
+
+
+async def rev_metrics(
+    tool: str,
+    *,
+    family: str | None = None,
+    since: datetime | timedelta | None = None,
+    scope: Scope = Scope.PROJECT,
+) -> tuple[RevMetrics, ...]:
+    """Return newest-first indexed metrics for one tool's revisions."""
+
+    from . import _control_backend, _control_request
+
+    if not isinstance(tool, str) or not tool:
+        raise QueryError("tool must be a nonempty wire name")
+    if family is not None and (not isinstance(family, str) or not family):
+        raise QueryError("family must be a nonempty string or None")
+    if since is not None and not isinstance(since, (datetime, timedelta)):
+        raise TypeError("since must be a datetime, timedelta, or None")
+    try:
+        parsed_scope = Scope(scope)
+    except ValueError as error:
+        raise QueryError(str(error)) from error
+    if _control_backend.get() is None:
+        raise NotWiredError("omp.telemetry.rev_metrics")
+    result = await _control_request(
+        "omp.telemetry.rev_metrics",
+        tool=tool,
+        family=family,
+        since=_query_wire(since),
+        scope=parsed_scope.value,
+    )
+    return result if isinstance(result, tuple) else tuple(result)
+
+
+semconv: Mapping[str, str] = MappingProxyType(
+    {
+        "model_request.requested_model": "gen_ai.request.model",
+        "model_request.served_model": "gen_ai.response.model",
+        "model_request.provider": "gen_ai.provider.name",
+        "model_request.upstream_provider": "omp.gen_ai.response.upstream_provider",
+        "model_request.ttft_ms": "gen_ai.response.time_to_first_chunk",
+        "model_request.step": "omp.gen_ai.agent.step.number",
+        "model_request.core_tools": "omp.gen_ai.request.available_tools",
+        "model_request.effort": "omp.gen_ai.request.reasoning.effort",
+        "model_request.tool_choice": "omp.gen_ai.request.tool.choice",
+        "tokens.input": "gen_ai.usage.input_tokens",
+        "tokens.output": "gen_ai.usage.output_tokens",
+        "tokens.cache_read": "gen_ai.usage.cache_read.input_tokens",
+        "tokens.cache_write": "gen_ai.usage.cache_creation.input_tokens",
+        "tokens.reasoning": "gen_ai.usage.reasoning.output_tokens",
+        "tokens.total": "omp.gen_ai.usage.total_tokens",
+        "prompt.digest": "omp.gen_ai.prompt.digest",
+        "prompt.changed": "omp.gen_ai.prompt.changed_slots",
+        "prompt.prefix_stable_bytes": "omp.gen_ai.prompt.prefix_stable_bytes",
+        "prompt.cache_key": "omp.gen_ai.cache.key",
+        "tool_call.rev": "omp.tool.rev",
+        "tool_call.place": "omp.tool.place",
+        "tool_call.target": "omp.tool.target",
+        "tool_call.projection_bytes": "omp.tool.prompt_bytes",
+        "tool_call.repairs": "omp.tool.repairs",
+        "compaction.reason": "omp.compaction.reason",
+        "artifact_spill.artifact_id": "omp.artifact.id",
+        "issue_report.issue_id": "omp.issue.id",
+        "capability_degraded.intent": "omp.constraint.intent",
+        "capability_degraded.granted": "omp.constraint.granted",
+        "tool_call.status": "omp.gen_ai.tool.status",
+    }
+)
+"""Frozen Python projection of ``omp_telemetry::semconv_gen::SEMCONV``."""
+
+
+_EVENT_FIELD_PREFIX: Mapping[type[object], str] = MappingProxyType(
+    {
+        ModelRequest: "model_request",
+        CapabilityDegraded: "capability_degraded",
+        Compaction: "compaction",
+        IssueReport: "issue_report",
+    }
+)
+
+
+def _field_value(value: object, path: str) -> object | None:
+    prefix = _EVENT_FIELD_PREFIX.get(type(value))
+    if prefix is not None and path.startswith(prefix + "."):
+        path = path[len(prefix) + 1 :]
+    for part in path.split("."):
+        if part == "tokens" and not hasattr(value, "tokens") and hasattr(value, "usage"):
+            part = "usage"
+        elif part == "issue_id" and not hasattr(value, "issue_id") and hasattr(value, "issue"):
+            part = "issue"
+        if isinstance(value, Mapping):
+            if part not in value:
+                return None
+            value = value[part]
+        else:
+            value = getattr(value, part, None)
+        if value is None:
+            return None
+    return value
+
+
+def attributes(event: Event) -> Mapping[str, object]:
+    """Project an event onto the Rust exporter's stable semantic attributes."""
+
+    projected: dict[str, object] = {}
+    for path, key in semconv.items():
+        value = _field_value(event, path)
+        if value is None or (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and value == 0
+        ):
+            continue
+        if isinstance(value, Enum):
+            value = value.value
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            value = tuple(
+                item.value if isinstance(item, Enum) else item for item in value
+            )
+        if isinstance(value, (str, int, float, bool, tuple)):
+            projected[key] = value
+    return MappingProxyType(projected)
+
+
+class Span:
+    """Async context manager for one extension-owned trace span."""
+
+    __slots__ = ("_attrs", "_events", "_fault", "_handle", "_name", "_trace")
+
+    def __init__(
+        self,
+        name: str,
+        attrs: Mapping[str, str | int | float | bool],
+    ) -> None:
+        self._name = name
+        self._attrs = dict(attrs)
+        self._events: list[tuple[str, Mapping[str, object]]] = []
+        self._fault: tuple[str, str] | None = None
+        self._handle: object | None = None
+        self._trace = TraceRef("", "", False)
+
+    @property
+    def trace(self) -> TraceRef:
+        """Return this span's trace identity after it has opened."""
+
+        return self._trace
+
+    def set(self, **attrs: str | int | float | bool) -> None:
+        """Set scalar span attributes."""
+
+        _validate_attrs(attrs)
+        self._attrs.update(attrs)
+
+    def event(self, name: str, /, **attrs: str | int | float | bool) -> None:
+        """Record a named point-in-time event on this span."""
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("span event name must be nonempty")
+        _validate_attrs(attrs)
+        self._events.append((name, MappingProxyType(dict(attrs))))
+
+    def fault(self, kind: str, message: str) -> None:
+        """Mark this span failed without ending or raising from it."""
+
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("span fault kind must be nonempty")
+        if not isinstance(message, str):
+            raise TypeError("span fault message must be a string")
+        self._fault = (kind, message)
+
+    async def __aenter__(self) -> Span:
+        from . import _control_backend, _control_request
+
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.telemetry.span")
+        opened = await _control_request(
+            "omp.telemetry.span.open",
+            name=self._name,
+            attributes=dict(self._attrs),
+        )
+        if isinstance(opened, Mapping):
+            self._handle = opened.get("handle")
+            trace = opened.get("trace")
+            if isinstance(trace, Mapping):
+                self._trace = TraceRef(
+                    trace_id=str(trace.get("trace_id", "")),
+                    span_id=str(trace.get("span_id", "")),
+                    sampled=bool(trace.get("sampled", False)),
+                )
+        else:
+            self._handle = opened
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        from . import _control_request
+
+        if exc_type is not None and isinstance(exc_type, type):
+            self._fault = (exc_type.__name__, str(exc))
+        try:
+            await _control_request(
+                "omp.telemetry.span.close",
+                handle=self._handle,
+                attributes=dict(self._attrs),
+                events=[
+                    {"name": name, "attributes": dict(attrs)}
+                    for name, attrs in self._events
+                ],
+                fault=self._fault,
+            )
+        except Exception:
+            if exc_type is None:
+                raise
+        return False
+
+
+def span(name: str, /, **attrs: str | int | float | bool) -> Span:
+    """Create an extension-owned async trace span."""
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("span name must be nonempty")
+    _validate_attrs(attrs)
+    return Span(name, attrs)
 
 
 class _TelemetryModule(ModuleType):
@@ -764,12 +1169,15 @@ class _TelemetryModule(ModuleType):
 sys.modules[__name__].__class__ = _TelemetryModule
 
 __all__ = (
-    "BATCH_MAX", "ContextSnapshot", "Cost", "Counter", "Degradation", "DegradeAction",
-    "DropStats", "Envelope", "Eq",
-    "ExportError", "ExportHandle", "ExportStats", "ExportTarget", "ExtensionRef", "FileTarget",
-    "Histogram", "Kind", "METRIC_PREFIX", "ModelRequest", "OtlpTarget", "Overflow", "Predicate",
-    "ProcessTarget", "PromptFingerprint", "PromptSlotFingerprint", "Query", "QueryResult",
-    "QUEUE_DEFAULT", "Row", "Scope",
-    "SessionEnd", "SessionStart", "Step", "StopReason", "SubscriptionError", "Tokens", "TraceRef",
-    "TurnEnd", "TurnStart", "counter", "dropped", "export", "flush", "histogram", "query",
+    "BATCH_MAX", "CapabilityDegraded", "Compaction", "ContextSnapshot", "Cost", "Counter",
+    "DEFAULT_MAX_BYTES", "DEFAULT_MAX_COLUMN", "DEFAULT_MAX_LINES", "Degradation", "DegradeAction",
+    "DropStats", "Envelope", "Eq", "Event", "ExportError", "ExportHandle", "ExportStats",
+    "ExportTarget", "ExtensionRef", "FileTarget", "Histogram", "IssueReport", "Kind",
+    "MAX_CARDINALITY", "MAX_INSTRUMENTS", "METRIC_PREFIX", "ModelRequest", "OtlpTarget",
+    "Overflow", "Predicate", "ProcessTarget", "PromptFingerprint", "PromptSlotFingerprint", "Query",
+    "QueryError", "QueryResult", "QUERY_LIMIT_MAX", "QUEUE_DEFAULT", "QUEUE_MAX", "RevMetrics", "Row", "SPILL_BYTES",
+    "SPILL_COLUMN", "SPILL_LINES", "Scope", "SessionEnd", "SessionStart", "Span", "Step",
+    "StopReason", "SubscriptionError", "TelemetryError", "Tokens", "TraceRef", "TurnEnd",
+    "TurnStart", "attributes", "counter", "dropped", "export", "flush", "histogram", "query",
+    "rev_metrics", "semconv", "span",
 )

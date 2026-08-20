@@ -41,11 +41,11 @@ class PromptContext:
     budget_bytes: int
 
 
-class UnknownSlot(ValueError):
+class UnknownSlot(OmpError, ValueError):
     """A prompt-slot declaration names a non-writable catalog slot."""
 
 
-class SlotClassConflict(ValueError):
+class SlotClassConflict(OmpError, ValueError):
     """A contribution attempts to loosen its catalog stability band."""
 
 

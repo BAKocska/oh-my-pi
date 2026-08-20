@@ -28,8 +28,8 @@ from enum import IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Any
 
-from _omp import DeclarationSealed, Duration
-from ._errors import ExtensionError, NotWiredError
+from _omp import Duration
+from ._errors import DeclarationSealed, ExtensionError, NotWiredError
 from ._registry import registry
 from .journal import JournalError
 from .packages import Provenance
@@ -445,7 +445,7 @@ class Device:
         if not isinstance(mounted_router, Router):
             raise TypeError("Device.mount expects an omp.Router")
         if registry.sealed:
-            raise DeclarationSealed("declaration registry is sealed")
+            raise DeclarationSealed(self.name)
         return tuple(
             self._register_route(
                 f"{mounted_router.prefix}/{route.path}",
