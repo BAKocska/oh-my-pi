@@ -5407,6 +5407,7 @@ version = "0.1.0"
 name = "omp-grep"
 version = "0.1.0"
 dependencies = [
+ "bytecount",
  "grep-matcher",
  "grep-pcre2",
  "grep-regex",

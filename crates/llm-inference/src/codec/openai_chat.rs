@@ -2961,11 +2961,10 @@ mod tests {
 
 	#[test]
 	fn truncated_content_stream_and_resource_finish_are_retryable_failures() {
-		let truncated = match decode_fixture(
+		let Err(truncated) = decode_fixture(
 			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
-		) {
-			Ok(_) => panic!("content without a finish reason must be truncated"),
-			Err(error) => error,
+		) else {
+			panic!("content without a finish reason must be truncated");
 		};
 		assert_eq!(truncated.kind, ErrorKind::StreamCorruption);
 		assert_eq!(truncated.action, RetryAction::SemanticRetry);

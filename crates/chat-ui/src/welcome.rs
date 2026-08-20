@@ -154,14 +154,14 @@ impl AperturePalette {
 			background:  panel * vec3(0.825_585_1, 0.635_398_7, 0.607_804_4),
 			white:       fg * vec3(1.370_022, 1.583_189_9, 1.518_891_6),
 			ink:         shadow * 0.0,
-			live:        secondary * vec3(0.961_527_05, 0.781_290_01, 1.143_262_4),
+			live:        secondary * vec3(0.961_527_05, 0.781_29, 1.143_262_4),
 			glass:       info * vec3(1.946_768_4, 1.827_751_6, 1.299_589_5),
 			tone_lift:   panel * vec3(0.247_675_54, 0.190_619_6, 0.200_717_71),
 		}
 	}
 }
 
-fn color_vec(color: Color) -> Vec3 {
+const fn color_vec(color: Color) -> Vec3 {
 	match color {
 		RgbColor(red, green, blue) => Vec3::rgb(red, green, blue),
 		Color::Indexed(value) => Vec3::rgb(value, value, value),

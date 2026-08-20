@@ -279,6 +279,6 @@ fn xls_malformed_ole_or_biff_never_panics() {
 		let error = markit::convert(Path::new("broken.xls"), bytes)
 			.expect_err("malformed XLS must return a typed error");
 		assert_eq!(error.format(), "xls");
-		assert!(!error.message().is_empty());
+		assert_ne!(error.message(), "");
 	}
 }

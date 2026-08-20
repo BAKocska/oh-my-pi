@@ -25,7 +25,7 @@ use crate::{
 };
 
 const REDIRECT_PARAMETER: &str = "redirect_uri";
-const EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(5 * 60);
+const EXPIRY_SAFETY_MARGIN: Duration = Duration::from_mins(5);
 const CALLBACK_PROMPT: &str = "Complete GitLab login in your browser. This uses GitLab's official \
                                VS Code OAuth application. If the redirect opens VS Code instead \
                                of returning to OMP, copy the full \
@@ -210,10 +210,10 @@ impl OAuthCustomHandler for GitlabExternalRedirectHandler {
 fn catalog_redirect_uri(spec: &OAuthCustomSpec) -> Result<&str, OAuthError> {
 	let mut redirect_uri = None;
 	for parameter in &spec.parameters {
-		if parameter.name == REDIRECT_PARAMETER {
-			if redirect_uri.replace(parameter.value.as_str()).is_some() {
-				return Err(OAuthError::InvalidUrl);
-			}
+		if parameter.name == REDIRECT_PARAMETER
+			&& redirect_uri.replace(parameter.value.as_str()).is_some()
+		{
+			return Err(OAuthError::InvalidUrl);
 		}
 	}
 	redirect_uri
@@ -471,32 +471,34 @@ mod tests {
 		assert!(authorization.contains(&("scope".to_owned(), "api".to_owned())));
 		assert!(authorization.contains(&("code_challenge_method".to_owned(), "S256".to_owned())));
 
-		let requests = http.requests.lock();
-		assert_eq!(requests.len(), 1);
-		let request = &requests[0];
-		assert_eq!(request.method, Method::POST);
-		assert_eq!(request.url.as_str(), "https://gitlab.example/oauth/token");
-		assert_eq!(
-			request.headers.get(CONTENT_TYPE).expect("content type"),
-			"application/x-www-form-urlencoded"
-		);
-		let body = request.body.as_ref().expect("form body").expose_secret();
-		let form: Vec<_> = url::form_urlencoded::parse(body.as_bytes())
-			.into_owned()
-			.collect();
-		assert_eq!(form[0], ("client_id".to_owned(), "catalog-client".to_owned()));
-		assert_eq!(form[1], ("redirect_uri".to_owned(), REDIRECT_URI.to_owned()));
-		assert_eq!(form[2], ("grant_type".to_owned(), "authorization_code".to_owned()));
-		assert_eq!(form[3], ("code".to_owned(), "code/with+symbols".to_owned()));
-		assert_eq!(form[5], ("public_hint".to_owned(), "hint value".to_owned()));
-		let verifier = &form[4].1;
-		let expected_challenge =
-			base64_url::encode_raw(&Sha256::digest(verifier.as_bytes())).into_string();
-		assert!(authorization.contains(&("code_challenge".to_owned(), expected_challenge)));
+		{
+			let requests = http.requests.lock();
+			assert_eq!(requests.len(), 1);
+			let request = &requests[0];
+			assert_eq!(request.method, Method::POST);
+			assert_eq!(request.url.as_str(), "https://gitlab.example/oauth/token");
+			assert_eq!(
+				request.headers.get(CONTENT_TYPE).expect("content type"),
+				"application/x-www-form-urlencoded"
+			);
+			let body = request.body.as_ref().expect("form body").expose_secret();
+			let form: Vec<_> = url::form_urlencoded::parse(body.as_bytes())
+				.into_owned()
+				.collect();
+			assert_eq!(form[0], ("client_id".to_owned(), "catalog-client".to_owned()));
+			assert_eq!(form[1], ("redirect_uri".to_owned(), REDIRECT_URI.to_owned()));
+			assert_eq!(form[2], ("grant_type".to_owned(), "authorization_code".to_owned()));
+			assert_eq!(form[3], ("code".to_owned(), "code/with+symbols".to_owned()));
+			assert_eq!(form[5], ("public_hint".to_owned(), "hint value".to_owned()));
+			let verifier = &form[4].1;
+			let expected_challenge =
+				base64_url::encode_raw(&Sha256::digest(verifier.as_bytes())).into_string();
+			assert!(authorization.contains(&("code_challenge".to_owned(), expected_challenge)));
+		}
 
 		assert!(tokens.is_refreshable());
 		assert_eq!(tokens.token_type(), "Bearer");
-		assert_eq!(tokens.expires_in(), Some(Duration::from_secs(3300)));
+		assert_eq!(tokens.expires_in(), Some(Duration::from_hours(1) - EXPIRY_SAFETY_MARGIN));
 		let principal = tokens
 			.resolve_principal(
 				&PrincipalResolution::TokenResponseField { pointer: "/identity".into() },

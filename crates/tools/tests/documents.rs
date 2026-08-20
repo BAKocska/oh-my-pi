@@ -630,7 +630,7 @@ fn pdf_structural_corruption_returns_a_pdf_conversion_error() {
 	let error = markit::convert(Path::new("truncated.pdf"), b"%PDF-1.4\n")
 		.expect_err("a truncated PDF cannot be converted");
 	assert_eq!(error.format(), "pdf");
-	assert!(!error.message().is_empty());
+	assert_ne!(error.message(), "");
 }
 
 #[test]

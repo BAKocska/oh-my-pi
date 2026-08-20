@@ -45,6 +45,8 @@ pub enum ControlError {
 	Journal(#[from] JournalError),
 }
 
+type JournalReplyResult<T> = Result<T, JournalError>;
+
 /// Creates the extension CONTROL mailbox pair.
 ///
 /// The channel is unbounded because every durable request already has a bounded
@@ -257,21 +259,21 @@ impl ControlMailbox {
 enum ControlCommand {
 	Journal {
 		request: JournalRequest,
-		reply:   flume::Sender<Result<JournalReply, JournalError>>,
+		reply:   flume::Sender<JournalReplyResult<JournalReply>>,
 	},
 	DeclareEntryKinds {
 		extension:    Str,
 		declarations: Vec<EntryKindDecl>,
-		reply:        flume::Sender<Result<(), JournalError>>,
+		reply:        flume::Sender<JournalReplyResult<()>>,
 	},
 	Query {
 		queries: Vec<JournalQuery>,
-		reply:   flume::Sender<Result<Vec<JournalCustomEntry>, JournalError>>,
+		reply:   flume::Sender<JournalReplyResult<Vec<JournalCustomEntry>>>,
 	},
 	SessionStateGet {
 		authority: StateAuthority,
 		key:       Str,
-		reply:     flume::Sender<Result<Option<SessionStateValue>, JournalError>>,
+		reply:     flume::Sender<JournalReplyResult<Option<SessionStateValue>>>,
 	},
 	SessionStateCompareExchange {
 		ts:        u64,
@@ -280,18 +282,18 @@ enum ControlCommand {
 		expected:  Option<StateRevision>,
 		value:     Box<RawValue>,
 		request:   DurableRequest,
-		reply:     flume::Sender<Result<SessionStateValue, JournalError>>,
+		reply:     flume::Sender<JournalReplyResult<SessionStateValue>>,
 	},
 	SessionStateWatch {
 		authority: StateAuthority,
 		key:       Str,
 		since:     Option<StateRevision>,
-		reply:     flume::Sender<Result<flume::Receiver<SessionStateWatchEvent>, JournalError>>,
+		reply:     flume::Sender<JournalReplyResult<flume::Receiver<SessionStateWatchEvent>>>,
 	},
 	InvocationTransition {
 		ts:         u64,
 		transition: InvocationTransition,
-		reply:      flume::Sender<Result<u64, JournalError>>,
+		reply:      flume::Sender<JournalReplyResult<u64>>,
 	},
 }
 
@@ -314,8 +316,7 @@ fn handle_command(journal: &mut Journal, command: ControlCommand) {
 			let _ = reply.send(result.map(|()| rows.into_values().collect()));
 		},
 		ControlCommand::SessionStateGet { authority, key, reply } => {
-			let result = journal.latest_session_state(&authority, key.as_str());
-			let _ = reply.send(result);
+			let _ = reply.send(journal.latest_session_state(&authority, key.as_str()));
 		},
 		ControlCommand::SessionStateCompareExchange {
 			ts,
@@ -331,8 +332,7 @@ fn handle_command(journal: &mut Journal, command: ControlCommand) {
 			let _ = reply.send(result);
 		},
 		ControlCommand::SessionStateWatch { authority, key, since, reply } => {
-			let result = journal.subscribe_session_state(&authority, key, since);
-			let _ = reply.send(result);
+			let _ = reply.send(journal.subscribe_session_state(&authority, key, since));
 		},
 		ControlCommand::InvocationTransition { ts, transition, reply } => {
 			let _ = reply.send(journal.record_invocation_transition(ts, transition));

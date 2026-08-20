@@ -110,6 +110,10 @@ pub async fn run_with_options(
 	}
 }
 
+#[expect(
+	clippy::future_not_send,
+	reason = "chat components remain confined to their terminal event-loop thread"
+)]
 async fn run_with_terminal(
 	terminal: &mut Terminal,
 	renderer: &mut Renderer<TtyOut>,
@@ -161,6 +165,10 @@ enum WelcomeOutcome {
 	Exit(HostExit),
 }
 
+#[expect(
+	clippy::future_not_send,
+	reason = "chat components remain confined to their terminal event-loop thread"
+)]
 async fn run_welcome(
 	terminal: &mut Terminal,
 	renderer: &mut Renderer<TtyOut>,
@@ -347,7 +355,7 @@ impl Overlay {
 	}
 }
 
-fn picker_event(event: PickerEvent) -> OverlayEvent {
+const fn picker_event(event: PickerEvent) -> OverlayEvent {
 	match event {
 		PickerEvent::Consumed => OverlayEvent::Consumed,
 		PickerEvent::Close => OverlayEvent::Close,
@@ -995,7 +1003,7 @@ async fn deadline(at: Option<Instant>) {
 mod tests {
 	use omp_tui::{Renderer, Size, UiContext};
 
-	use super::{Duration, Instant, RESIZE_SETTLE, ResizeState, present};
+	use super::{Duration, Instant, ResizeState, present};
 	use crate::Chat;
 
 	#[test]

@@ -181,7 +181,7 @@ impl Service<crate::call::Call> for FakeProvider {
 				})
 			},
 			FakeOutcome::Error(error) => {
-				let error = (*error).request_id(request_id);
+				let error = error.request_id(request_id);
 				let error = if error.provider.is_none() {
 					error.provider(provider)
 				} else {
@@ -230,7 +230,7 @@ pub struct FakeScript {
 
 enum FakeOutcome {
 	Answer(Box<FakeAnswer>),
-	Error(Box<Error>),
+	Error(Error),
 	Cancelled(FakeCancellation),
 }
 
@@ -301,7 +301,7 @@ impl FakeScript {
 
 	/// Scripts an exact account usage report.
 	pub fn usage(answer: UsageReport) -> Self {
-		Self::answer(OperationKind::Usage, FakeAnswer::Usage(answer))
+		Self::answer(OperationKind::Usage, FakeAnswer::Usage(Box::new(answer)))
 	}
 
 	/// Scripts an exact model discovery page.
@@ -324,14 +324,14 @@ impl FakeScript {
 	pub fn precommit(operation: OperationKind, error: Error) -> Self {
 		let error = error.committed(false);
 		let receipt = error.receipt().clone();
-		Self { receipt, ..Self::new(operation, FakeOutcome::Error(Box::new(error))) }
+		Self { receipt, ..Self::new(operation, FakeOutcome::Error(error)) }
 	}
 
 	/// Scripts a structured failure after ordinary output commits.
 	pub fn committed(operation: OperationKind, error: Error) -> Self {
 		let error = error.committed(true);
 		let receipt = error.receipt().clone();
-		Self { receipt, ..Self::new(operation, FakeOutcome::Error(Box::new(error))) }
+		Self { receipt, ..Self::new(operation, FakeOutcome::Error(error)) }
 	}
 
 	/// Scripts a call that remains pending until the returned handle is
@@ -427,9 +427,10 @@ pub enum FakeAnswer {
 	Realtime(RealtimeSession),
 	/// Ranked search results.
 	Search(SearchResults),
-	/// Account usage report.
-	Usage(UsageReport),
-	/// Runtime model page.
+	/// Account usage report, boxed because the lossless provider payload is
+	/// intentionally wider than this scripted-answer enum's other variants.
+	Usage(Box<UsageReport>),
+	/// Runtime-discovered normalized model page.
 	Models(ModelDiscoveryPage),
 	/// Authentication answer or session.
 	Auth(AuthAnswer),
@@ -473,7 +474,7 @@ impl FakeAnswer {
 			Self::Transcript(items) => AnswerBody::Transcript(Box::pin(stream::iter(items))),
 			Self::Realtime(value) => AnswerBody::Realtime(value),
 			Self::Search(value) => AnswerBody::Search(value),
-			Self::Usage(value) => AnswerBody::Usage(Box::new(value)),
+			Self::Usage(value) => AnswerBody::Usage(value),
 			Self::Models(value) => AnswerBody::Models(value),
 			Self::Auth(value) => AnswerBody::Auth(value),
 			Self::Native(value) => AnswerBody::Native(value),

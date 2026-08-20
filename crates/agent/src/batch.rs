@@ -35,7 +35,7 @@ use crate::{
 #[derive(Debug)]
 pub enum BatchError {
 	/// The environment channel rejected an operation.
-	Environment(Box<ClientError>),
+	Environment(ClientError),
 	/// A terminal environment payload was not a supported structured outcome.
 	InvalidOutcome(serde_json::Error),
 	/// Canonical result construction failed.
@@ -55,7 +55,7 @@ impl fmt::Display for BatchError {
 impl std::error::Error for BatchError {
 	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
 		match self {
-			Self::Environment(error) => Some(error.as_ref()),
+			Self::Environment(error) => Some(error),
 			Self::InvalidOutcome(error) => Some(error),
 			Self::Projection(_) => None,
 		}
@@ -64,7 +64,7 @@ impl std::error::Error for BatchError {
 
 impl From<ClientError> for BatchError {
 	fn from(error: ClientError) -> Self {
-		Self::Environment(Box::new(error))
+		Self::Environment(error)
 	}
 }
 /// Returns the subscription-mask bit for one stable hook event id.
@@ -97,8 +97,9 @@ pub enum InvocationHookRequest {
 	/// Per-invocation admission query, declared authority ceiling, and unique
 	/// reply channel.
 	Admission {
-		/// Environment-owned finalized admission query.
-		query:           AdmitInvocation,
+		/// Boxed because `AdmitInvocation` is a foreign generated prost message; one allocation is
+		/// paid per hook-subscribed admission.
+		query:           Box<AdmitInvocation>,
 		/// Maximum authority declared by the resolved tool revision.
 		maximum_effects: Effects,
 		/// One-shot response consumed only by this invocation.
@@ -151,7 +152,7 @@ impl InvocationHookBus {
 			if self
 				.tx
 				.send(InvocationHookRequest::Admission {
-					query: query.clone(),
+					query: Box::new(query.clone()),
 					maximum_effects: maximum_effects.clone(),
 					reply,
 				})
@@ -194,6 +195,7 @@ pub(crate) struct InvocationAdmissionFact {
 	pub(crate) raw:           Str,
 	pub(crate) admission:     Admission,
 }
+
 enum PumpCommand {
 	ArgText {
 		fragment: Str,
@@ -403,7 +405,7 @@ fn spawn_invocation_pump(
 								events.publish(AgentEvent::ToolArgs {
 									call_id: call_id.clone(),
 									fragment: Bytes::copy_from_slice(
-										args_text.as_str()[fragment_start..].as_bytes(),
+										&args_text.as_str().as_bytes()[fragment_start..],
 									),
 									view,
 								});
@@ -448,33 +450,30 @@ fn spawn_invocation_pump(
 										break;
 									}
 								},
-								AuthorizationAction::Control(PumpCommand::Interrupt {
-									reason,
-									ack: interrupt_ack,
-								}) => {
-									let _ = ack.send(Ok(AuthorizationState::DeliveryIndeterminate));
-									if handle_interrupt(
-										&invocation,
-										reason,
-										interrupt_ack,
-										&command_rx,
-									)
-									.await
-									{
+								AuthorizationAction::Control(command) => match command {
+									PumpCommand::Interrupt { reason, ack: interrupt_ack } => {
+										let _ = ack.send(Ok(AuthorizationState::DeliveryIndeterminate));
+										if handle_interrupt(
+											&invocation,
+											reason,
+											interrupt_ack,
+											&command_rx,
+										)
+										.await
+										{
+											break;
+										}
+									},
+									PumpCommand::Cancel { ack: cancel_ack } => {
+										let _ = ack.send(Ok(AuthorizationState::DeliveryIndeterminate));
+										invocation.guard().cancel();
+										let _ = cancel_ack.send(());
+									},
+									command => {
+										drop(command);
+										drop(ack);
 										break;
-									}
-								},
-								AuthorizationAction::Control(PumpCommand::Cancel {
-									ack: cancel_ack,
-								}) => {
-									let _ = ack.send(Ok(AuthorizationState::DeliveryIndeterminate));
-									invocation.guard().cancel();
-									let _ = cancel_ack.send(());
-								},
-								AuthorizationAction::Control(command) => {
-									drop(command);
-									drop(ack);
-									break;
+									},
 								},
 								AuthorizationAction::Closed => break,
 							}
@@ -613,7 +612,7 @@ impl SpeculativeCall {
 
 	/// Installs the loop-owned hook, authority ceiling, and durable fact bus.
 	pub(crate) fn attach_runtime(
-		&mut self,
+		&self,
 		hooks: InvocationHookBus,
 		facts: flume::Sender<InvocationAdmissionFact>,
 		maximum_effects: Effects,

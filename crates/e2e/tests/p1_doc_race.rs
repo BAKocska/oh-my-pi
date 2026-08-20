@@ -260,6 +260,7 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 			Bytes::from(serde_json::to_vec(&serde_json::json!({"path": path}))?),
 			Bytes::from_static(b"doc-race-test-token"),
 			1000,
+			None,
 		),
 	)
 	.await??;

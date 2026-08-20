@@ -383,7 +383,7 @@ pub fn tool<D: WriteDocuments>(documents: D) -> WriteTool<D> {
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: smallvec::smallvec![Str::new_static("**")],
+					write_globs: [Str::new_static("**")].into_iter().collect(),
 				}),
 				exec:      None,
 				inference: None,

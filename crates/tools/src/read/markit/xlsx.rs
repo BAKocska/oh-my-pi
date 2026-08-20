@@ -306,7 +306,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles, String> {
 	Ok(Styles { cell_kinds })
 }
 
-fn builtin_number_kind(id: u32) -> NumberKind {
+const fn builtin_number_kind(id: u32) -> NumberKind {
 	match id {
 		14..=17 | 27..=36 | 50..=58 => NumberKind::Date,
 		18..=21 | 45 | 47 => NumberKind::Time,
@@ -318,7 +318,7 @@ fn builtin_number_kind(id: u32) -> NumberKind {
 
 fn classify_number_format(code: &str) -> NumberKind {
 	let mut significant = String::new();
-	let mut chars = code.chars().peekable();
+	let mut chars = code.chars();
 	let mut elapsed = false;
 	while let Some(character) = chars.next() {
 		match character {

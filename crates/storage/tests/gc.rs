@@ -1,3 +1,5 @@
+//! Integration tests for durable artifact garbage collection.
+
 use std::{
 	fs::{self, File},
 	io::Write as _,
@@ -27,7 +29,11 @@ fn session(name: &str) -> SessionId {
 	SessionId(Str::from(name))
 }
 
-fn request<'a>(session: &'a SessionId, key: &'a str, host_generation: u64) -> ArtifactRequest<'a> {
+const fn request<'a>(
+	session: &'a SessionId,
+	key: &'a str,
+	host_generation: u64,
+) -> ArtifactRequest<'a> {
 	ArtifactRequest {
 		principal: "principal",
 		extension: "publisher.extension",

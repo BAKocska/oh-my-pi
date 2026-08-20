@@ -1,4 +1,4 @@
-//! Behavioral OpenDocument Spreadsheet conversion fixtures.
+//! Behavioral `OpenDocument` Spreadsheet conversion fixtures.
 
 use std::path::Path;
 
@@ -149,7 +149,7 @@ fn ods_reports_malformed_and_encrypted_packages_without_panicking() {
 	assert!(malformed.message().contains("OpenDocument body"), "unexpected error: {malformed}");
 
 	let encrypted_content = format!(
-		r#"<office:document-content {NS}><office:body><office:spreadsheet/></office:body></office:document-content>"#
+		r"<office:document-content {NS}><office:body><office:spreadsheet/></office:body></office:document-content>"
 	);
 	let manifest = r#"<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"><manifest:file-entry manifest:full-path="content.xml"><manifest:encryption-data/></manifest:file-entry></manifest:manifest>"#;
 	let encrypted = zip(&[

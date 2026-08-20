@@ -391,7 +391,8 @@ fn artifact_argument() -> Result<PathBuf> {
 #[tokio::main]
 async fn main() -> Result<()> {
 	let artifact = artifact_argument()?;
-	let metrics = measure(DEFAULT_FRAME_TOKENS, DEFAULT_LOOP_TOKENS, DEFAULT_SAMPLES).await?;
+	let metrics =
+		Box::pin(measure(DEFAULT_FRAME_TOKENS, DEFAULT_LOOP_TOKENS, DEFAULT_SAMPLES)).await?;
 	write_metrics(&artifact, &metrics)?;
 	println!("{}", serde_json::to_string(&metrics)?);
 	if metrics.r#loop.gross_regression {

@@ -343,7 +343,7 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 			effects:         Effects {
 				documents: None,
 				exec:      Some(ExecEffects {
-					commands: smallvec::smallvec![Str::new_static("*")],
+					commands: [Str::new_static("*")].into_iter().collect(),
 					network:  true,
 				}),
 				inference: None,

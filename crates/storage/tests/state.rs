@@ -1,3 +1,4 @@
+//! Durable state-store integration coverage.
 use std::{
 	fs::OpenOptions,
 	io::{Seek, SeekFrom, Write},

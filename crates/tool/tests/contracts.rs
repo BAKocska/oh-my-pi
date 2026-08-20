@@ -21,10 +21,10 @@ use omp_tool::{
 	ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError,
 	CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint, ConstraintDisposition,
 	DocEffects, Effects, ErasedEv, ErasedOutcome, Ev, ExecEffects, ExpectedArtifact, Fallback,
-	FinalizedArgs, GrammarSyntax, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError,
-	JobOwner, JobRef, LiftedCall, LoweringCaps, ModelClass, ParamError, Part, Precedence,
-	Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall, RecordedCallOwned,
-	Registry, RegistryError, RepairKind, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal, Usd,
+	GrammarSyntax, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, JobOwner,
+	JobRef, LiftedCall, LoweringCaps, ModelClass, ParamError, Part, Precedence, Presentation,
+	ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall, RecordedCallOwned, Registry,
+	RegistryError, RepairKind, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal, Usd,
 	call_outcome_details,
 	render::{Render, RenderRegistryError, ViewState},
 };
@@ -89,7 +89,7 @@ impl FakeTool {
 		self
 	}
 
-	fn with_projection_code(mut self, projection_code: [u8; 32]) -> Self {
+	const fn with_projection_code(mut self, projection_code: [u8; 32]) -> Self {
 		self.spec.projection_code = projection_code;
 		self
 	}
@@ -1330,9 +1330,12 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	let maximum = Effects {
 		documents: Some(DocEffects {
 			read:        true,
-			write_globs: smallvec![Str::from("src/**"), Str::from("tests/**")],
+			write_globs: [Str::from("src/**"), Str::from("tests/**")].into_iter().collect(),
 		}),
-		exec:      Some(ExecEffects { commands: smallvec![Str::from("*")], network: false }),
+		exec:      Some(ExecEffects {
+			commands: [Str::from("*")].into_iter().collect(),
+			network: false,
+		}),
 		inference: Some(InferenceEffects {
 			max_requests: 3,
 			max_usd:      "1.25".parse().expect("canonical decimal"),
@@ -1342,9 +1345,12 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	let narrowed = Effects {
 		documents: Some(DocEffects {
 			read:        true,
-			write_globs: smallvec![Str::from("src/generated/**")],
+			write_globs: [Str::from("src/generated/**")].into_iter().collect(),
 		}),
-		exec:      Some(ExecEffects { commands: smallvec![Str::from("cargo")], network: false }),
+		exec:      Some(ExecEffects {
+			commands: [Str::from("cargo")].into_iter().collect(),
+			network: false,
+		}),
 		inference: Some(InferenceEffects {
 			max_requests: 1,
 			max_usd:      "0.5".parse().expect("canonical decimal"),
@@ -1433,7 +1439,7 @@ fn finalizer_preserves_raw_bytes_canonicalizes_aliases_and_enforces_open_maps() 
 	specs.register(rev.clone(), closed).unwrap();
 	specs.seal();
 
-	let raw = "{p:'x',config:{extra:1},}";
+	let raw = r"{p:'x',config:{extra:1},}";
 	let (feed, mut params) = bound_params(&rev, &specs);
 	feed.args_committed(Str::from(raw)).unwrap();
 	assert!(matches!(

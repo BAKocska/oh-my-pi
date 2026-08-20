@@ -12,6 +12,7 @@ description = "Synchronous regex and PCRE2 search over memory and workspace file
 workspace = true
 
 [dependencies]
+bytecount.workspace = true
 grep-matcher.workspace = true
 grep-pcre2.workspace = true
 grep-regex.workspace = true

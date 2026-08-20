@@ -22,7 +22,7 @@ use crate::transcript::{SessionId, TitleSource};
 
 const SCHEMA_VERSION: i64 = 1;
 
-const SCHEMA: &str = r#"
+const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS index_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS receipts (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS receipts_time ON receipts(ts_ms, session_id);
 CREATE INDEX IF NOT EXISTS receipts_model ON receipts(provider, model, ts_ms);
-"#;
+";
 
 /// Whether an index is writable authority or a stale offline projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,7 +761,7 @@ impl SessionIndex {
 			.transpose()
 	}
 
-	fn require_writer(&self) -> Result<(), Error> {
+	const fn require_writer(&self) -> Result<(), Error> {
 		match (self.authority, self.writable) {
 			(IndexAuthority::Authoritative, true) => Ok(()),
 			(IndexAuthority::Authoritative, false) => Err(Error::ReadOnlyAuthority),
@@ -891,7 +891,7 @@ fn insert_receipt(
 	failed: bool,
 ) -> Result<(), Error> {
 	let usage = outcome.usage.as_ref().ok_or(Error::MissingUsage)?;
-	let cost = outcome.cost.as_ref().cloned().unwrap_or_default();
+	let cost = outcome.cost.unwrap_or_default();
 	let orchestration = usage.orchestration.as_ref();
 	let cache_ttl = usage.cache_ttl.as_ref();
 	let server_tools = usage.server_tools.as_ref();
@@ -1167,7 +1167,9 @@ fn usage_sql(query: &UsageQuery) -> Result<(String, Vec<Value>), Error> {
 		 SUM(output_nanos_usd), SUM(cache_read_nanos_usd), SUM(cache_write_nanos_usd), COUNT(*),
 		 SUM(failed), SUM(COALESCE(duration_ms, 0)), COUNT(DISTINCT session_id) FROM scoped",
 	);
-	if !group_expressions.is_empty() {
+	if group_expressions.is_empty() {
+		sql.push_str(" HAVING COUNT(*) > 0");
+	} else {
 		sql.push_str(" GROUP BY ");
 		for (index, expression) in group_expressions.iter().enumerate() {
 			if index != 0 {
@@ -1183,8 +1185,6 @@ fn usage_sql(query: &UsageQuery) -> Result<(String, Vec<Value>), Error> {
 			}
 			sql.push_str(expression);
 		}
-	} else {
-		sql.push_str(" HAVING COUNT(*) > 0");
 	}
 	Ok((sql, values))
 }
@@ -1279,7 +1279,7 @@ fn usage_detail_sql(query: &UsageQuery) -> Result<(String, Vec<Value>), Error> {
 	Ok((sql, values))
 }
 
-fn bucket_expression(bucket: UsageBucketWidth) -> Option<&'static str> {
+const fn bucket_expression(bucket: UsageBucketWidth) -> Option<&'static str> {
 	match bucket {
 		UsageBucketWidth::None => None,
 		UsageBucketWidth::Hour => Some("(ts_ms / 3600000) * 3600000"),

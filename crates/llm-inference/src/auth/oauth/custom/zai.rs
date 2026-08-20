@@ -155,7 +155,7 @@ impl ZaiApiKeyHandler {
 			.or_else(|| organizations.first())
 			.ok_or(OAuthError::MalformedResponse)?;
 		let organization_id = organization
-			.organization_id
+			.id
 			.and_then(trimmed)
 			.ok_or(OAuthError::MalformedResponse)?;
 		let projects = organization
@@ -332,7 +332,7 @@ fn bearer_headers(token: &SecretString) -> Result<HeaderMap, OAuthError> {
 	Ok(headers)
 }
 
-fn envelope_data<'a>(body: &'a SecretString) -> Result<&'a RawValue, OAuthError> {
+fn envelope_data(body: &SecretString) -> Result<&RawValue, OAuthError> {
 	let raw: &RawValue =
 		serde_json::from_str(body.expose_secret()).map_err(|_| OAuthError::MalformedResponse)?;
 	if !raw.get().trim_start().starts_with('{') {
@@ -426,11 +426,11 @@ fn trimmed(value: &str) -> Option<&str> {
 struct PresentRaw<'a>(Option<&'a RawValue>);
 
 impl<'a> PresentRaw<'a> {
-	fn is_present(&self) -> bool {
+	const fn is_present(&self) -> bool {
 		self.0.is_some()
 	}
 
-	fn raw(&self) -> Option<&'a RawValue> {
+	const fn raw(&self) -> Option<&'a RawValue> {
 		self.0
 	}
 }
@@ -494,11 +494,11 @@ struct Customer<'a> {
 #[derive(Deserialize)]
 struct Organization<'a> {
 	#[serde(rename = "organizationId")]
-	organization_id: Option<&'a str>,
+	id:         Option<&'a str>,
 	#[serde(rename = "isDefault")]
-	is_default:      Option<bool>,
+	is_default: Option<bool>,
 	#[serde(borrow)]
-	projects:        Option<Vec<Project<'a>>>,
+	projects:   Option<Vec<Project<'a>>>,
 }
 
 #[derive(Deserialize)]

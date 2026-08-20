@@ -60,8 +60,8 @@ use crate::{
 		},
 	},
 };
-/// worker.
-pub const WORKER_ARG: &str = "__omp-tool-worker";
+/// Child argv selector for the dedicated placed-Python worker runtime.
+pub const WORKER_ARG: &str = "__omp-py-worker";
 
 /// Python ABI revision required by this worker implementation.
 pub const PYTHON_REV: &str = "3.14t";
@@ -72,27 +72,68 @@ pub const PY_EVAL_MODULE: &str = "omp_py_eval";
 pub const DEFAULT_MAX_FRAME_BYTES: usize = omp_proto::bounds::FRAME_MAX_BYTES;
 
 /// Stable identity of one extension host.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct HostKey {
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HostKey(Arc<HostKeyFields>);
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct HostKeyFields {
 	/// Extension layer, such as project or user.
-	pub layer:     Str,
+	layer:     Str,
 	/// Trust or sandbox tier.
-	pub tier:      Str,
+	tier:      Str,
 	/// Stable extension identity.
-	pub extension: Str,
+	extension: Str,
 }
+
+impl std::fmt::Debug for HostKey {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("HostKey")
+			.field("layer", self.layer())
+			.field("tier", self.tier())
+			.field("extension", self.extension())
+			.finish()
+	}
+}
+
+const _: () = assert!(
+	std::mem::size_of::<HostKey>() <= 16,
+	"HostKey must remain a cheap identity handle"
+);
 
 impl HostKey {
 	/// Builds a host identity.
 	#[must_use]
 	pub fn new(layer: impl Into<Str>, tier: impl Into<Str>, extension: impl Into<Str>) -> Self {
-		Self { layer: layer.into(), tier: tier.into(), extension: extension.into() }
+		Self(Arc::new(HostKeyFields {
+			layer:     layer.into(),
+			tier:      tier.into(),
+			extension: extension.into(),
+		}))
+	}
+
+	/// Returns the extension layer, such as project or user.
+	#[must_use]
+	pub fn layer(&self) -> &Str {
+		&self.0.layer
+	}
+
+	/// Returns the trust or sandbox tier.
+	#[must_use]
+	pub fn tier(&self) -> &Str {
+		&self.0.tier
+	}
+
+	/// Returns the stable extension identity.
+	#[must_use]
+	pub fn extension(&self) -> &Str {
+		&self.0.extension
 	}
 
 	/// Returns the ordered identity fields used by scoped binding derivation.
 	#[must_use]
 	pub fn fields(&self) -> [&str; 3] {
-		[self.layer.as_str(), self.tier.as_str(), self.extension.as_str()]
+		[self.layer().as_str(), self.tier().as_str(), self.extension().as_str()]
 	}
 }
 
@@ -663,19 +704,18 @@ impl ExtHostSupervisor {
 				let Some(definition) = declaration.definition.as_ref() else {
 					continue;
 				};
-				let maximum_effects = match declaration
+				let maximum_effects = if let Ok(effects) = declaration
 					.effects
 					.as_ref()
 					.map(omp_tool::Effects::try_from)
 					.transpose()
 				{
-					Ok(effects) => effects.unwrap_or_default(),
-					Err(_) => {
-						registration_error = Some(WorkerError::Protocol(Str::new_static(
-							"registered tool effects are invalid",
-						)));
-						break 'registration;
-					},
+					effects.unwrap_or_default()
+				} else {
+					registration_error = Some(WorkerError::Protocol(Str::new_static(
+						"registered tool effects are invalid",
+					)));
+					break 'registration;
 				};
 				let route = (Str::from(definition.name.as_str()), Str::from(declaration.rev.as_str()));
 				if routes
@@ -699,7 +739,7 @@ impl ExtHostSupervisor {
 			}
 		}
 		if let Some(error) = registration_error {
-			for (prepared_config, mut process) in prepared.drain(..) {
+			for (prepared_config, mut process) in prepared {
 				process.terminate(prepared_config.interrupt_grace).await;
 			}
 			return Err(error);
@@ -1013,11 +1053,11 @@ impl ProcessKey {
 		let unit = spec
 			.pool
 			.clone()
-			.map_or_else(|| FateUnit::Extension(spec.key.extension.clone()), FateUnit::Pool);
-		Self { layer: spec.key.layer.clone(), tier: spec.key.tier.clone(), unit }
+			.map_or_else(|| FateUnit::Extension(spec.key.extension().clone()), FateUnit::Pool);
+		Self { layer: spec.key.layer().clone(), tier: spec.key.tier().clone(), unit }
 	}
 
-	fn pool(&self) -> Option<&Str> {
+	const fn pool(&self) -> Option<&Str> {
 		match &self.unit {
 			FateUnit::Extension(_) => None,
 			FateUnit::Pool(pool) => Some(pool),
@@ -1131,7 +1171,7 @@ impl ProcessConfig {
 		self
 			.manifests
 			.keys()
-			.find(|owner| owner.extension.as_str() == declaration.extension_id)
+			.find(|owner| owner.extension().as_str() == declaration.extension_id)
 			.cloned()
 			.ok_or_else(|| {
 				WorkerError::Protocol(Str::new_static(
@@ -1142,9 +1182,9 @@ impl ProcessConfig {
 }
 
 fn validate_extension_spec(spec: &ExtHostSpec) -> Result<(), WorkerError> {
-	if spec.key.layer.is_empty()
-		|| spec.key.tier.is_empty()
-		|| spec.key.extension.is_empty()
+	if spec.key.layer().is_empty()
+		|| spec.key.tier().is_empty()
+		|| spec.key.extension().is_empty()
 		|| spec.manifest.entry.is_empty()
 		|| spec.pool.as_ref().is_some_and(Str::is_empty)
 	{
@@ -1152,9 +1192,9 @@ fn validate_extension_spec(spec: &ExtHostSpec) -> Result<(), WorkerError> {
 			"extension host identity, manifest entry, and explicit pool names must be nonempty",
 		)));
 	}
-	if spec.manifest.provenance.extension_id() != spec.key.extension.as_str()
-		|| spec.manifest.provenance.layer() != spec.key.layer.as_str()
-		|| spec.manifest.provenance.tier() != spec.key.tier.as_str()
+	if spec.manifest.provenance.extension_id() != spec.key.extension().as_str()
+		|| spec.manifest.provenance.layer() != spec.key.layer().as_str()
+		|| spec.manifest.provenance.tier() != spec.key.tier().as_str()
 	{
 		return Err(WorkerError::Protocol(Str::new_static(
 			"extension manifest provenance does not match its authenticated host key",
@@ -1315,7 +1355,7 @@ impl WorkerProcess {
 				std::iter::once(&manifest.entry)
 					.chain(manifest.declaration_modules.iter())
 					.map(|module| AdmittedExtension {
-						extension_id: key.extension.to_string(),
+						extension_id: key.extension().to_string(),
 						module:       module.to_string(),
 						rev:          manifest.provenance.version().to_owned(),
 					})
@@ -1361,7 +1401,7 @@ impl WorkerProcess {
 			|| config
 				.manifests
 				.keys()
-				.any(|owner| !registered_extensions.contains(owner.extension.as_str()))
+				.any(|owner| !registered_extensions.contains(owner.extension().as_str()))
 		{
 			return Err(WorkerError::Protocol(Str::new_static(
 				"RegisterTools extension set did not match the spawned host",
@@ -1387,7 +1427,7 @@ impl WorkerProcess {
 			let mut host = WorkerLifecycleAdapter {
 				process: self,
 				config,
-				extension_id: owner.extension.clone(),
+				extension_id: owner.extension().clone(),
 				generation,
 				request_id: &mut request_id,
 			};
@@ -1473,31 +1513,29 @@ struct WorkerLifecycleAdapter<'a> {
 }
 
 impl LifecycleHost for WorkerLifecycleAdapter<'_> {
-	fn freeze(&mut self) -> impl Future<Output = Result<(), Str>> + Send {
-		async move {
-			let request_id = take_request_id(self.request_id);
-			self
-				.process
-				.write(
-					&HostFrame {
-						request_id,
-						body: Some(host_frame::Body::Lifecycle(LifecycleHostEnvelope {
-							body:  Some(lifecycle_host_envelope::Body::FreezeDeclarations(
-								FreezeDeclarations {
-									extension_id: self.extension_id.to_string(),
-									generation:   self.generation,
-									props:        None,
-								},
-							)),
-							props: None,
-						})),
+	async fn freeze(&mut self) -> Result<(), Str> {
+		let request_id = take_request_id(self.request_id);
+		self
+			.process
+			.write(
+				&HostFrame {
+					request_id,
+					body: Some(host_frame::Body::Lifecycle(LifecycleHostEnvelope {
+						body:  Some(lifecycle_host_envelope::Body::FreezeDeclarations(
+							FreezeDeclarations {
+								extension_id: self.extension_id.to_string(),
+								generation:   self.generation,
+								props:        None,
+							},
+						)),
 						props: None,
-					},
-					self.config,
-				)
-				.await
-				.map_err(|error| Str::from(error.to_string()))
-		}
+					})),
+					props: None,
+				},
+				self.config,
+			)
+			.await
+			.map_err(|error| Str::from(error.to_string()))
 	}
 
 	fn activate(
@@ -1608,7 +1646,7 @@ async fn send_resource_update(
 	let owner = config
 		.manifests
 		.keys()
-		.find(|owner| owner.extension.as_str() == extension_id)
+		.find(|owner| owner.extension().as_str() == extension_id)
 		.ok_or_else(|| WorkerError::Protocol(Str::new_static("resource query is not admitted")))?;
 	let receipt = config
 		.resources
@@ -1874,7 +1912,7 @@ async fn dispatch_journal_control(
 	};
 	let control = JournalControl::new(
 		runtime.agent.clone(),
-		invocation.owner.extension.clone(),
+		invocation.owner.extension().clone(),
 		Vec::new(),
 		identity.clone(),
 	);
@@ -1941,7 +1979,7 @@ async fn dispatch_service_call(
 	call: omp_proto::toolhost::v1::ServiceCall,
 ) -> Result<(), WorkerError> {
 	if request_id == 0
-		|| call.extension_id != invocation.owner.extension.as_str()
+		|| call.extension_id != invocation.owner.extension().as_str()
 		|| call.host_generation != host_generation
 		|| call.session_generation != config.session_generation
 	{
@@ -1991,7 +2029,7 @@ async fn dispatch_service_call(
 	let provider_id = dispatch.id.0;
 	let provider_host = dispatch.route.provider.clone();
 	let wire = WireServiceDispatch {
-		provider_extension_id: provider_host.extension.to_string(),
+		provider_extension_id: provider_host.extension().to_string(),
 		service: dispatch.route.service.name.to_string(),
 		rev: dispatch.route.service.rev,
 		method: dispatch.method.to_string(),
@@ -2232,7 +2270,7 @@ async fn run_invocation(
 					&& let Some(lifecycle_worker_envelope::Body::ResourceQuery(query)) =
 						&envelope.body
 				{
-					if query.extension_id != invocation.owner.extension.as_str()
+					if query.extension_id != invocation.owner.extension().as_str()
 						|| send_resource_update(
 							process,
 							config,
@@ -2324,16 +2362,16 @@ async fn run_invocation(
 						}
 					},
 					Some(worker_frame::Body::ToolComplete(complete)) if complete.call_id == call_id.as_str() => {
-						match WorkerCompletion::try_from(complete) {
-							Ok(complete) => {
-								let _ = invocation.events.send(WorkerEvent::Complete(complete));
-								return InvocationAction::KeepWorker;
-							},
-							Err(_) => {
-								send_abort(&invocation, WorkerAbortKind::Crashed, "worker sent an invalid ToolComplete");
-								return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
-							},
-						}
+						let Ok(complete) = WorkerCompletion::try_from(complete) else {
+							send_abort(
+								&invocation,
+								WorkerAbortKind::Crashed,
+								"worker sent an invalid ToolComplete",
+							);
+							return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+						};
+						let _ = invocation.events.send(WorkerEvent::Complete(complete));
+						return InvocationAction::KeepWorker;
 					},
 					Some(worker_frame::Body::Arguments(arguments)) => match arguments.body {
 						Some(omp_proto::toolhost::v1::argument_worker_envelope::Body::PullRequest(pull)) => {
@@ -2585,7 +2623,11 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 			"stale or duplicate ArgsCommitted",
 		),
 		SupervisorCommand::Interrupt { .. } => {
-			send_host_protocol_error(invocation, ProtocolErrorCode::InvalidArgument, "stale Interrupt")
+			send_host_protocol_error(
+				invocation,
+				ProtocolErrorCode::InvalidArgument,
+				"stale Interrupt",
+			);
 		},
 		SupervisorCommand::Open { .. }
 		| SupervisorCommand::ServiceDispatch { .. }
@@ -2641,12 +2683,12 @@ fn cancellation_reason(config: &ProcessConfig, owner: &HostKey, reason: &str) ->
 		Str::from(format!(
 			"{reason}; effects unknown for {}; explicit pool {pool} fate-sharing terminated sibling \
 			 extension calls",
-			owner.extension,
+			owner.extension(),
 		))
 	} else {
 		Str::from(format!(
 			"{reason}; effects unknown for {}; no other extension host was terminated",
-			owner.extension,
+			owner.extension(),
 		))
 	}
 }
@@ -2702,7 +2744,7 @@ impl TryFrom<ToolComplete> for WorkerCompletion {
 				"ToolComplete args_issue presence does not match ArgsRejected",
 			)));
 		}
-		Ok(WorkerCompletion {
+		Ok(Self {
 			call_id: Str::from(complete.call_id),
 			kind,
 			parts: complete.parts,
@@ -2762,7 +2804,7 @@ fn actual_declarations(
 ) -> Result<DeclarationSet, WorkerError> {
 	let tools = tools
 		.iter()
-		.filter(|tool| tool.extension_id == owner.extension.as_str())
+		.filter(|tool| tool.extension_id == owner.extension().as_str())
 		.map(|tool| {
 			let definition = tool.definition.as_ref().ok_or_else(|| {
 				WorkerError::Protocol(Str::new_static("registered tool has no definition"))
@@ -2838,7 +2880,7 @@ fn omp_py_eval(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///
 /// # Errors
 /// Returns a worker startup, extension import, or stdio protocol error.
-pub fn run_worker_entry() -> Result<(), WorkerError> {
+pub fn run_py_worker_entry() -> Result<(), WorkerError> {
 	let modules = configured_modules();
 	if modules
 		.iter()
@@ -2935,9 +2977,9 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 				python_rev: PYTHON_REV.to_owned(),
 				worker_id: Bytes::copy_from_slice(&std::process::id().to_be_bytes()),
 				api_level: 1,
-				layer: layer.clone(),
-				tier: tier.clone(),
-				pool: pool.clone(),
+				layer,
+				tier,
+				pool,
 				host_version: env!("CARGO_PKG_VERSION").to_owned(),
 				host_generation,
 				session_generation,

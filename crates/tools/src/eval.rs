@@ -363,7 +363,7 @@ pub enum RunEvent {
 	/// Cell-bounded stdout or stderr.
 	Output(Update),
 	/// Terminal result.
-	Completed(Box<RunCompletion>),
+	Completed(RunCompletion),
 }
 
 /// Request-scoped active Python cell.
@@ -469,10 +469,10 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: smallvec::smallvec![Str::new_static("**")],
+					write_globs: [Str::new_static("**")].into_iter().collect(),
 				}),
 				exec:      Some(ExecEffects {
-					commands: smallvec::smallvec![Str::new_static("*")],
+					commands: [Str::new_static("*")].into_iter().collect(),
 					network:  true,
 				}),
 				inference: Some(InferenceEffects {
@@ -608,7 +608,6 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 						yield Ev::Update(update);
 					},
 					Ok(Some(RunEvent::Completed(done))) => {
-						let done = *done;
 						yield Ev::Done(ToolTerminal::Done {
 							result: Ok(Payload {
 								session_id: session.id,

@@ -1337,7 +1337,7 @@ mod tests {
 			antigravity_policy:  AntigravityPolicy::default(),
 		};
 		let binding = codec_binding(&route, &cca).expect("route codec binding");
-		let codec = discovery_codec(&catalog, &route, &binding)
+		let codec = discovery_codec(catalog, &route, &binding)
 			.expect("discovery codec")
 			.expect("route supports discovery");
 		let auth = catalog.auth_spec(&route.auth).expect("catalog auth");
@@ -1516,11 +1516,11 @@ mod tests {
 		.commit(Revision::new("revision"));
 		context.set_session_state(Some(binding));
 
-		let error =
-			match encoder.encode(&call, &Some(shaped), &context, 0, false, Cancellation::default()) {
-				Err(error) => error,
-				Ok(_) => panic!("endpoint change must reseed provider state"),
-			};
+		let Err(error) =
+			encoder.encode(&call, &Some(shaped), &context, 0, false, Cancellation::default())
+		else {
+			panic!("endpoint change must reseed provider state");
+		};
 
 		assert_eq!(error.kind, ErrorKind::SessionExpired);
 		assert_eq!(error.action, RetryAction::ReseedSession);

@@ -260,7 +260,7 @@ impl Duration {
 	pub fn from_std(value: StdDuration, unit: DurationUnit) -> Result<Self, DurationError> {
 		let nanos = value.as_nanos();
 		let unit_nanos = u128::from(unit.nanoseconds());
-		if nanos % unit_nanos != 0 {
+		if !nanos.is_multiple_of(unit_nanos) {
 			return Err(DurationError::PrecisionLoss);
 		}
 		let value = u64::try_from(nanos / unit_nanos).map_err(|_| DurationError::Overflow)?;

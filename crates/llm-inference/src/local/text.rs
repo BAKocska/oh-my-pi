@@ -194,7 +194,7 @@ impl TextAdapter {
 }
 
 fn generate(
-	engine: &mut LlamaEngine,
+	engine: &LlamaEngine,
 	messages: &[ChatMessage],
 	options: &GenerationOptions,
 	cancel: &LocalCancellation,
@@ -277,11 +277,11 @@ fn generate(
 		LlamaSampler::greedy()
 	};
 	sampler.accept_many(&tokens);
-	let mut position = tokens.len() as i32;
+	let position = tokens.len() as i32;
 	let mut output_tokens = 0_u64;
 	let mut decoder = TokenUtf8Decoder::default();
 	let mut pending = String::new();
-	for generated in 0..options.max_tokens {
+	for (generated, position) in (0..options.max_tokens).zip(position..) {
 		if cancel.is_cancelled() {
 			return Err(LocalError::cancelled());
 		}
@@ -326,7 +326,6 @@ fn generate(
 		batch.add(token, position, &[0], true).map_err(|error| {
 			LocalError::new(LocalErrorKind::Backend, format!("generation batch failed: {error}"))
 		})?;
-		position += 1;
 		context.decode(&mut batch).map_err(|error| {
 			LocalError::new(LocalErrorKind::Backend, format!("generation decode failed: {error}"))
 		})?;

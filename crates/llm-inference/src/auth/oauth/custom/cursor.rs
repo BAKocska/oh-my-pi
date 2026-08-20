@@ -40,8 +40,8 @@ const DEFAULT_MAX_INTERVAL: Duration = Duration::from_secs(10);
 const BACKOFF_NUMERATOR: u32 = 6;
 const BACKOFF_DENOMINATOR: u32 = 5;
 const MAX_CONSECUTIVE_ERRORS: u8 = 3;
-const EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(5 * 60);
-const FALLBACK_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const EXPIRY_SAFETY_MARGIN: Duration = Duration::from_mins(5);
+const FALLBACK_LIFETIME: Duration = Duration::from_hours(1);
 
 /// Registers Cursor's catalog-selected polling exchange.
 pub(super) fn register(
@@ -546,7 +546,7 @@ mod tests {
 				.expose_secret(),
 			"refresh-secret"
 		);
-		assert_eq!(tokens.expires_in(), Some(Duration::from_secs(6_900)));
+		assert_eq!(tokens.expires_in(), Some(Duration::from_hours(1) + Duration::from_mins(55)));
 		assert_eq!(tokens.identity_response.expose_secret(), identity.as_str());
 		let debug = format!("{tokens:?}");
 		assert!(!debug.contains(&access));

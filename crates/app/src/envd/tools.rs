@@ -88,7 +88,7 @@ pub fn production_registry(
 		ensure_name_absent(&registry, &spec.name)?;
 		registry.register_worker(spec, Presentation::Device, Claims {
 			precedence: Precedence::DEFAULT,
-			claimant:   registration.owner.extension.clone(),
+			claimant:   registration.owner.extension().clone(),
 			replaces:   None,
 		})?;
 	}
@@ -120,7 +120,7 @@ fn ensure_name_absent(registry: &Registry, name: &str) -> Result<(), EnvdError> 
 	Ok(())
 }
 
-fn core_claims() -> Claims {
+const fn core_claims() -> Claims {
 	Claims {
 		precedence: Precedence::CORE,
 		claimant:   Str::new_static("omp/core"),

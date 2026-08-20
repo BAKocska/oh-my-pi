@@ -60,13 +60,13 @@ pub(crate) struct ProjectEnvironment {
 	pub(crate) registry: Arc<Registry>,
 	eval_bridge:         Arc<eval::SessionBridgeHost>,
 	eval_control:        omp_tools::eval::EvalSessionControl,
-	_lifecycle:          ProjectLifecycle,
+	lifecycle:           ProjectLifecycle,
 }
 
 struct ProjectLifecycle {
 	shutdown: Option<CancellationToken>,
 	tasks:    Vec<tokio::task::JoinHandle<()>>,
-	_server:  Arc<EnvServer>,
+	server:   Arc<EnvServer>,
 }
 
 impl Drop for ProjectLifecycle {
@@ -294,8 +294,8 @@ impl ProjectEnvironment {
 		let mut tasks = vec![in_process];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		hello(&client).await?;
-		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, _server: server };
-		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
+		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
 	}
 
 	#[cfg(unix)]
@@ -343,9 +343,8 @@ impl ProjectEnvironment {
 		});
 		let mut tasks = vec![in_process, uds];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
-		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, _server: server };
-		hello(&client).await?;
-		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
+		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
 	}
 
 	#[cfg(windows)]
@@ -389,9 +388,8 @@ impl ProjectEnvironment {
 		});
 		let mut tasks = vec![in_process, owner];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
-		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, _server: server };
-		hello(&client).await?;
-		Ok(Self { client, registry, eval_bridge, eval_control, _lifecycle: lifecycle })
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
+		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
 	}
 
 	#[must_use]
@@ -417,7 +415,7 @@ impl ProjectEnvironment {
 	/// Returns the Environment-owned authoritative sessions index.
 	#[must_use]
 	pub(crate) fn sessions_index(&self) -> Arc<omp_storage::index::SessionIndex> {
-		self._lifecycle._server.sessions_index()
+		self.lifecycle.server.sessions_index()
 	}
 
 	/// Binds authenticated extension CONTROL to the active Agent Journal.
@@ -430,7 +428,7 @@ impl ProjectEnvironment {
 		&self,
 		sender: omp_agent::control::ControlSender,
 	) -> Result<(), EnvdError> {
-		self._lifecycle._server.bind_agent_control(sender)
+		self.lifecycle.server.bind_agent_control(sender)
 	}
 }
 

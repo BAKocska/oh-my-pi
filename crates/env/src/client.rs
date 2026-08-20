@@ -803,7 +803,7 @@ impl EnvClient {
 					component => {
 						segments.push(component);
 					},
-				};
+				}
 			}
 		}
 		url.set_query(None);
@@ -1164,7 +1164,7 @@ impl Drop for DocumentLease {
 impl DocumentRead {
 	/// Returns the head from which this response was read.
 	#[must_use]
-	pub fn head(&self) -> &DocumentHead {
+	pub const fn head(&self) -> &DocumentHead {
 		self
 			.response
 			.head
@@ -1175,7 +1175,7 @@ impl DocumentRead {
 	/// Returns the complete content bytes, or `None` when the response contains
 	/// requested slices.
 	#[must_use]
-	pub fn content(&self) -> Option<&Bytes> {
+	pub const fn content(&self) -> Option<&Bytes> {
 		let Some(read_document_response::Body::Content(content)) = self.response.body.as_ref() else {
 			return None;
 		};
@@ -1184,7 +1184,7 @@ impl DocumentRead {
 
 	/// Returns disjoint content slices when ranges were requested.
 	#[must_use]
-	pub fn slices(&self) -> Option<&document::ContentSlices> {
+	pub const fn slices(&self) -> Option<&document::ContentSlices> {
 		let Some(read_document_response::Body::Slices(slices)) = self.response.body.as_ref() else {
 			return None;
 		};
@@ -1228,12 +1228,11 @@ impl RequestStream {
 		if self.finished {
 			return Ok(None);
 		}
-		match self.receiver.recv_async().await {
-			Ok(frame) => Ok(Some(frame)),
-			Err(_) => {
-				self.finish();
-				Err(ClientError::TransportClosed)
-			},
+		if let Ok(frame) = self.receiver.recv_async().await {
+			Ok(Some(frame))
+		} else {
+			self.finish();
+			Err(ClientError::TransportClosed)
 		}
 	}
 
@@ -1534,12 +1533,13 @@ impl DocumentEvents {
 			return Ok(None);
 		};
 		match response_body(frame) {
-			Ok(server_frame::Body::DataEvent(event)) => match event.body {
-				Some(data_event::Body::Document(event)) => Ok(Some(event)),
-				_ => {
+			Ok(server_frame::Body::DataEvent(event)) => {
+				if let Some(data_event::Body::Document(event)) = event.body {
+					Ok(Some(event))
+				} else {
 					self.stream.finish();
 					Err(ClientError::UnexpectedResponse { expected: "DocumentEvent" })
-				},
+				}
 			},
 			Ok(server_frame::Body::EventStreamError(event)) => {
 				let error = stream_lost(event);
@@ -1807,7 +1807,7 @@ fn response_body(frame: ServerFrame) -> Result<server_frame::Body, ClientError> 
 	}
 }
 
-fn protocol_error(error: ProtocolError) -> ClientError {
+const fn protocol_error(error: ProtocolError) -> ClientError {
 	if error.code == ProtocolErrorCode::Uncommitted as i32 {
 		ClientError::EffectsNotAuthorized(error)
 	} else {
@@ -1892,7 +1892,7 @@ fn stream_lost(event: EventStreamError) -> ClientError {
 	})
 }
 
-fn ensure_worker_data(request: &DataRequest) -> Result<(), ClientError> {
+const fn ensure_worker_data(request: &DataRequest) -> Result<(), ClientError> {
 	match request.body.as_ref() {
 		Some(
 			data_request::Body::Document(_)

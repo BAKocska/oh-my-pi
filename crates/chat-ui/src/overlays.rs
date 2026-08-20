@@ -78,7 +78,7 @@ impl ListPicker {
 
 	/// Returns a centered, viewport-responsive composited layer.
 	pub fn layer(&mut self, viewport: Size) -> Layer<'_> {
-		let width = viewport.width.saturating_sub(4).min(72).max(1);
+		let width = viewport.width.saturating_sub(4).clamp(1, 72);
 		let rows = (viewport.height / 2).saturating_sub(4).max(5);
 		if rows != self.list_rows {
 			self.list_rows = rows;
@@ -238,7 +238,7 @@ impl PromptOverlay {
 
 	/// Returns a centered rounded-box composited layer.
 	pub fn layer(&mut self, viewport: Size) -> Layer<'_> {
-		let width = viewport.width.saturating_sub(4).min(56).max(1);
+		let width = viewport.width.saturating_sub(4).clamp(1, 56);
 		if self.ui.frame().size().width != width {
 			let value = self.value();
 			self.ui = build_prompt(&self.title, self.masked, width, &self.ctx);

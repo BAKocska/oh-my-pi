@@ -458,15 +458,16 @@ mod tests {
 			shaped.endpoint_override.as_deref(),
 			Some("https://api.business.githubcopilot.com")
 		);
-		let requests = http.requests.lock();
-		assert_eq!(requests.len(), 1);
-		assert_eq!(requests[0].0, Method::GET);
-		assert_eq!(requests[0].1, COPILOT_USER_URL);
-		assert_eq!(requests[0].2[AUTHORIZATION], "token ghu_token");
-		assert_eq!(requests[0].2[USER_AGENT], COPILOT_USER_AGENT);
-		assert_eq!(requests[0].2[ACCEPT], "application/json");
-		assert!(requests[0].2[AUTHORIZATION].is_sensitive());
-		drop(requests);
+		{
+			let requests = http.requests.lock();
+			assert_eq!(requests.len(), 1);
+			assert_eq!(requests[0].0, Method::GET);
+			assert_eq!(requests[0].1, COPILOT_USER_URL);
+			assert_eq!(requests[0].2[AUTHORIZATION], "token ghu_token");
+			assert_eq!(requests[0].2[USER_AGENT], COPILOT_USER_AGENT);
+			assert_eq!(requests[0].2[ACCEPT], "application/json");
+			assert!(requests[0].2[AUTHORIZATION].is_sensitive());
+		}
 		let future = shaper.shape(&token, PERSONAL_GITHUB_COPILOT_BASE_URL, None);
 		assert!(matches!(&future, Either::Left(_)));
 		let memoized = future.await.expect("memoized endpoint");

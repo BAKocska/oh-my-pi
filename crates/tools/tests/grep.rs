@@ -324,7 +324,7 @@ fn range_overfetch_and_output_truncation_authorize_only_emitted_rows() {
 
 	assert!(text.starts_with("[src/range.rs#F00D]\n*500:needle "));
 	assert!(text.contains("[truncated:"));
-	assert!(!visible.is_empty());
+	assert_ne!(visible, [] as [usize; 0]);
 	assert!(visible.iter().all(|line| (500..=600).contains(line)));
 	assert!(!visible.contains(&600), "the shared byte cap must omit tail matches");
 	assert_eq!(record.seen_lines, visible);

@@ -11,6 +11,7 @@ use std::{
 	fmt,
 	fs::{self, File, OpenOptions},
 	io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
+	mem::size_of,
 	path::{Path, PathBuf},
 	sync::{Arc, Weak},
 	time::{SystemTime, UNIX_EPOCH},
@@ -394,6 +395,8 @@ pub enum StateChange {
 	Content(ContentRoot),
 }
 
+const _: () = assert!(size_of::<StateChange>() <= 288, "StateChange must stay compact");
+
 impl StateChange {
 	/// Returns the scope revision assigned to the change.
 	#[must_use]
@@ -582,6 +585,7 @@ impl StateStore {
 		fs::create_dir_all(root)?;
 		let lock = OpenOptions::new()
 			.create(true)
+			.truncate(false)
 			.read(true)
 			.write(true)
 			.open(root.join(LOCK_FILE))?;
@@ -1535,7 +1539,7 @@ fn validate_key(label: &'static str, value: &str) -> Result<(), Error> {
 	Ok(())
 }
 
-fn corrupt<T>(line: u64, reason: &'static str) -> Result<T, Error> {
+const fn corrupt<T>(line: u64, reason: &'static str) -> Result<T, Error> {
 	Err(Error::CorruptRecord { line, reason: Str::new_static(reason) })
 }
 

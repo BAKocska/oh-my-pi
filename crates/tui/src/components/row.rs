@@ -341,8 +341,8 @@ impl Component for Row {
 		self.place_line(ctx, &visible, content.x, content.y, content.width, gap);
 	}
 
-	fn paint(&mut self, pc: &mut PaintCtx<'_>, _rect: Rect) {
-		if _rect.height == 0 || _rect.width == 0 {
+	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		if rect.height == 0 || rect.width == 0 {
 			return;
 		}
 		for child in self.children.iter_mut().filter(|child| child.visible) {

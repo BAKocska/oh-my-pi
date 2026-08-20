@@ -400,7 +400,7 @@ fn apply_length_rule(
 	}
 }
 
-fn check_field_bytes(
+const fn check_field_bytes(
 	kind: MessageKind,
 	field: u32,
 	actual: usize,
@@ -413,7 +413,7 @@ fn check_field_bytes(
 	}
 }
 
-fn check_repeated(
+const fn check_repeated(
 	kind: MessageKind,
 	field: u32,
 	actual: usize,
@@ -462,7 +462,7 @@ const fn length_rule(kind: MessageKind, field: u32) -> Option<LengthRule> {
 
 		(M::LifecycleHost, 1) => Some(Message(M::AdmitExtensions)),
 		(M::LifecycleWorker, 1) => Some(Message(M::SetAvailability)),
-		(M::AdmitExtensions, 1) | (M::SetAvailability, 1) => {
+		(M::AdmitExtensions | M::SetAvailability, 1) => {
 			Some(RepeatedMessage { max_count: DECLARATION_MAX_COUNT, kind: M::Generic })
 		},
 		(M::ArgumentHost, 1..=3) => Some(Message(M::Generic)),
@@ -513,7 +513,7 @@ const fn length_rule(kind: MessageKind, field: u32) -> Option<LengthRule> {
 		(M::UiDispatchResult, 4) => {
 			Some(RepeatedMessage { max_count: REPEATED_MAX_COUNT, kind: M::Generic })
 		},
-		(M::MountSlot, 3) | (M::PatchNode, 3) | (M::SetStatus, 1) => Some(Message(M::Tml)),
+		(M::MountSlot | M::PatchNode, 3) | (M::SetStatus, 1) => Some(Message(M::Tml)),
 		(M::ShowOverlay, 2) | (M::Dialog, 3) | (M::RenderedView, 1) => Some(Message(M::Tml)),
 		(M::ShowOverlay, 3) => Some(Message(M::ValueMap)),
 
@@ -558,10 +558,10 @@ const fn length_rule(kind: MessageKind, field: u32) -> Option<LengthRule> {
 		(M::Replace, 1) => {
 			Some(RepeatedBytes { max_count: REPEATED_MAX_COUNT, max_bytes: FIELD_MAX_BYTES })
 		},
-		(M::Prune, 1) | (M::Reorder, 1) => {
+		(M::Prune | M::Reorder, 1) => {
 			Some(RepeatedBytes { max_count: REPEATED_MAX_COUNT, max_bytes: FIELD_MAX_BYTES })
 		},
-		(M::Replace, 2) | (M::Insert, 1) | (M::PromptContribution, 2) => {
+		(M::Replace | M::PromptContribution, 2) | (M::Insert, 1) => {
 			Some(RepeatedMessage { max_count: REPEATED_MAX_COUNT, kind: M::ThreadPart })
 		},
 
@@ -693,7 +693,7 @@ fn scan_tml_depth(source: &[u8]) -> Result<(), FrameBoundsError> {
 	Ok(())
 }
 
-fn tag_close(source: &[u8], mut at: usize) -> Option<usize> {
+const fn tag_close(source: &[u8], mut at: usize) -> Option<usize> {
 	while at < source.len() {
 		match source[at] {
 			b'>' => return Some(at),
@@ -760,7 +760,7 @@ impl<'a> Cursor<'a> {
 		Err(FrameBoundsError::MalformedVarint { offset: start })
 	}
 
-	fn take(&mut self, length: usize) -> Result<&'a [u8], FrameBoundsError> {
+	const fn take(&mut self, length: usize) -> Result<&'a [u8], FrameBoundsError> {
 		if self.remaining.len() < length {
 			return Err(FrameBoundsError::Truncated {
 				offset:    self.offset,

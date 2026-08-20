@@ -297,7 +297,7 @@ impl OwnedSwiftString {
 		self.raw
 	}
 
-	fn into_raw(self) -> SwiftString {
+	const fn into_raw(self) -> SwiftString {
 		let raw = self.raw;
 		mem::forget(self);
 		raw

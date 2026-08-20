@@ -51,8 +51,7 @@ fn memory_reservations_and_failed_loads_release_capacity() {
 	let reservation = memory.reserve(48).unwrap();
 	let overloaded = memory
 		.reserve(17)
-		.err()
-		.expect("reservation over the limit must fail");
+		.expect_err("reservation over the limit must fail");
 	assert_eq!(overloaded.kind, LocalErrorKind::Overloaded);
 	assert_eq!(memory.used(), 48);
 	drop(reservation);
@@ -161,8 +160,8 @@ fn artifacts_require_confined_exact_size_and_digest() {
 async fn applefm_reports_honest_capabilities_and_precise_unavailability() {
 	let evidence = AppleFm::availability_evidence().await.unwrap();
 	assert!(evidence.streaming);
-	assert!(!evidence.tools);
-	assert!(!evidence.structured_generation);
+	assert!(!evidence.tools());
+	assert!(!evidence.structured_generation());
 	assert_eq!(evidence.tool_evidence, AppleFmFeatureEvidence::RequiresCompiledSwiftToolConformance,);
 	assert_eq!(
 		evidence.structured_generation_evidence,

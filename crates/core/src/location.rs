@@ -229,7 +229,7 @@ fn valid_device_segment(value: &str) -> bool {
 			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
-fn valid_claimant_byte(byte: u8) -> bool {
+const fn valid_claimant_byte(byte: u8) -> bool {
 	byte.is_ascii_graphic() && !matches!(byte, b'/' | b'@' | b'\\')
 }
 
@@ -295,10 +295,8 @@ impl ArtifactUrl {
 	/// Returns the canonical resource component with its selector removed.
 	#[must_use]
 	pub fn resource(&self) -> &str {
-		self
-			.after_scheme()
-			.split_once(':')
-			.map_or(self.after_scheme(), |parts| parts.0)
+		let resource = self.after_scheme();
+		resource.split_once(':').map_or(resource, |parts| parts.0)
 	}
 
 	/// Returns the optional trailing selector without its `:` delimiter.

@@ -1,3 +1,5 @@
+//! Integration coverage for durable blob storage.
+
 use std::{
 	fs,
 	io::{self, Cursor, Write},

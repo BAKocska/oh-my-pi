@@ -88,7 +88,7 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	))
 	.await
 	.expect("dry-run restore");
-	assert!(!dry_run.undo_snapshot_id.is_empty());
+	assert_ne!(dry_run.undo_snapshot_id, "");
 	assert_eq!(dry_run.conflicts.len(), 1);
 	assert_eq!(dry_run.conflicts[0].reason, ConflictReason::OpenLease as i32);
 	within(external.close(external_lease, &cancel))
@@ -102,9 +102,9 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	))
 	.await
 	.expect("restore");
-	assert!(!restored.undo_snapshot_id.is_empty());
+	assert_ne!(restored.undo_snapshot_id, "");
 	assert!(!restored.partial);
-	assert!(restored.conflicts.is_empty());
+	assert_eq!(restored.conflicts, [] as [omp_proto::env::v1::WorkspaceConflict; 0]);
 	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"before\n");
 }
 

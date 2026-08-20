@@ -57,9 +57,14 @@ impl EnvHarness {
 			1,
 		);
 		let server = Arc::new(
-			EnvServer::open_local(scratch.project(), scratch.state(), ext_host_config)
-				.await
-				.context("opening local environment authority")?,
+			EnvServer::open_local(
+				scratch.project(),
+				scratch.state(),
+				Registry::new(),
+				ext_host_config,
+			)
+			.await
+			.context("opening local environment authority")?,
 		);
 		let shutdown = CancellationToken::new();
 		let task_server = Arc::clone(&server);

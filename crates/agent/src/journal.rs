@@ -18,7 +18,7 @@ use omp_storage::{
 		RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
 		event::Custom,
 		msg::Content,
-		writer::{AppendManyError, JournalError as WriterError},
+		writer::{AppendManyError, IndexRun, JournalError as WriterError},
 	},
 };
 use omp_tool::{Abort, JobRef};
@@ -116,6 +116,7 @@ pub struct JournalAuthor {
 }
 
 /// Unattributed custom payload accepted from an extension worker.
+///
 /// Source, principal, provenance, and the display default are deliberately
 /// absent: the core derives them from the live registry and authenticated
 /// request channel. `rev` is only an assertion checked against that registry.
@@ -270,8 +271,8 @@ pub enum JournalError {
 	/// A non-atomic group left a proven durable prefix.
 	#[error("journal append_many failed after {count} entries: {source}", count = .appended.len())]
 	Partial {
-		/// Durable custom-entry indexes that landed before failure.
-		appended: Vec<u64>,
+		/// Durable custom-entry index run that landed before failure.
+		appended: IndexRun,
 		/// Proven writer failure.
 		#[source]
 		source:   WriterError,
@@ -436,6 +437,11 @@ pub enum JournalError {
 	#[error("cannot rewind while a turn is pending")]
 	RewindWhilePending,
 }
+
+const _: () = assert!(
+	std::mem::size_of::<JournalError>() <= 128,
+	"JournalError must stay compact"
+);
 
 /// Append-only transcript owner with an in-memory terminal-turn index.
 pub struct Journal {
@@ -1010,7 +1016,7 @@ impl Journal {
 		}
 		let expected = self.prepare_append()?;
 		let indexes = payload_indexes(expected, events.len());
-		let audit = self.audit_event(ts, stamp, author, JournalOperationName::AppendMany, &indexes);
+		let audit = Self::audit_event(ts, stamp, author, JournalOperationName::AppendMany, &indexes);
 		let mut staged = Vec::with_capacity(events.len().saturating_add(1));
 		staged.push(audit);
 		staged.extend(events);
@@ -1525,7 +1531,7 @@ impl Journal {
 		Ok((stamp, author))
 	}
 
-	fn validate_request(
+	const fn validate_request(
 		&self,
 		stamp: &JournalRequestStamp,
 		author: &JournalAuthor,
@@ -1612,7 +1618,7 @@ impl Journal {
 		}
 		let expected = self.prepare_append()?;
 		let indexes = payload_indexes(expected, events.len());
-		let audit = self.audit_event(ts, stamp, author, operation, &indexes);
+		let audit = Self::audit_event(ts, stamp, author, operation, &indexes);
 		let mut staged = Vec::with_capacity(events.len().saturating_add(1));
 		staged.push(audit);
 		staged.extend(events);
@@ -1638,7 +1644,6 @@ impl Journal {
 	}
 
 	fn audit_event(
-		&self,
 		ts: u64,
 		stamp: &JournalRequestStamp,
 		author: &JournalAuthor,
@@ -1742,12 +1747,12 @@ impl Journal {
 				} else {
 					self.reader.get_mut().transcript.refresh()?;
 				}
-				let appended = if error.appended.first() == Some(&expected) {
+				let appended = if error.appended.first() == Some(expected) {
 					let count = error.appended.len().saturating_sub(1);
 					self.remember_replay(stamp, author, JournalOperationName::AppendMany, &indexes);
-					indexes[..count.min(indexes.len())].to_vec()
+					IndexRun::from_contiguous(&indexes[..count.min(indexes.len())])
 				} else {
-					Vec::new()
+					IndexRun::from_contiguous(&[])
 				};
 				debug_assert!(written <= staged_count);
 				Err(JournalError::Partial { appended, source })
@@ -1979,7 +1984,7 @@ impl Journal {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::RewindWhilePending);
 		}
-		Ok(self.append(&Event { ts, kind: Kind::Rewind { to } })?)
+		self.append(&Event { ts, kind: Kind::Rewind { to } })
 	}
 
 	/// Returns the earliest live turn start that lacks a terminal receipt.
@@ -2284,8 +2289,7 @@ impl Journal {
 				return Err(JournalError::InvalidItemTarget(target));
 			}
 		}
-		Ok(self
-			.append(&Event { ts, kind: Kind::Amend { target, patch: AmendPatch::Seq { seq } } })?)
+		self.append(&Event { ts, kind: Kind::Amend { target, patch: AmendPatch::Seq { seq } } })
 	}
 
 	/// Returns whether a turn has a terminal durable receipt.

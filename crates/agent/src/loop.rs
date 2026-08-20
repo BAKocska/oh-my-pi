@@ -109,6 +109,11 @@ pub enum AgentError {
 	Interrupted,
 }
 
+const _: () = assert!(
+	std::mem::size_of::<AgentError>() <= 128,
+	"AgentError must stay compact"
+);
+
 /// Cloneable out-of-band stop signal for the active submission.
 #[derive(Clone, Debug)]
 pub struct AbortHandle {
@@ -480,12 +485,12 @@ impl<C: TurnClient> Agent<C> {
 					turn_id = next_turn_id;
 					continue;
 				},
-				Err(error @ AgentError::Turn(TurnError::Terminal(_))) => {
+				Err(AgentError::Turn(error @ TurnError::Terminal(_))) => {
 					self
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.context = None;
-					return Err(error);
+					return Err(AgentError::Turn(error));
 				},
 				Err(error) => return Err(error),
 			};
@@ -1001,7 +1006,7 @@ impl<C: TurnClient> Agent<C> {
 				},
 				Err(TurnError::Conflict(error)) => {
 					if attempts >= latest.retry.max_attempts().get() {
-						return Err(AgentError::Turn(TurnError::Conflict(error)));
+						return Err(TurnError::Conflict(error).into());
 					}
 					let actual = error
 						.actual
@@ -1014,7 +1019,7 @@ impl<C: TurnClient> Agent<C> {
 				},
 				Err(TurnError::NeedFull(error)) => {
 					if attempts >= latest.retry.max_attempts().get() {
-						return Err(AgentError::Turn(TurnError::NeedFull(error)));
+						return Err(TurnError::NeedFull(error).into());
 					}
 					full = true;
 					resume_input = None;
@@ -1038,7 +1043,7 @@ impl<C: TurnClient> Agent<C> {
 					backoff = backoff.saturating_mul(2).min(latest.retry.max_backoff());
 				},
 				Err(TurnError::Terminal(error)) => {
-					return Err(AgentError::Turn(TurnError::Terminal(error)));
+					return Err(TurnError::Terminal(error).into());
 				},
 				Err(TurnError::Rpc(_)) if attempts < latest.retry.max_attempts().get() => {
 					sleep_with_deadline(backoff, latest.deadline).await?;
@@ -1136,7 +1141,7 @@ impl<C: TurnClient> Agent<C> {
 						return Err(TurnError::Protocol("stream named unknown tool"));
 					};
 					let call_id = part.tool_call_id.as_str().to_str();
-					let mut opened = SpeculativeCall::open(
+					let opened = SpeculativeCall::open(
 						&self.env,
 						&self.events,
 						call_id.clone(),
@@ -1401,7 +1406,7 @@ impl<C: TurnClient> Agent<C> {
 	}
 }
 
-fn empty_invocation_transition(
+const fn empty_invocation_transition(
 	invocation_id: Str,
 	call_id: CallId,
 	phase: InvocationPhase,
@@ -1652,10 +1657,14 @@ mod tests {
 
 	use super::*;
 
+	type Script = Vec<Result<pb::TurnEvent, TurnError>>;
+	type OpenedTurn = (TurnId, TurnInput, crate::TurnOptions);
+	type OpenedTurns = Vec<OpenedTurn>;
+
 	#[derive(Clone)]
 	struct ScriptedClient {
-		scripts: Arc<Mutex<VecDeque<Vec<Result<pb::TurnEvent, TurnError>>>>>,
-		opened:  Arc<Mutex<Vec<(TurnId, TurnInput, crate::TurnOptions)>>>,
+		scripts: Arc<Mutex<VecDeque<Script>>>,
+		opened:  Arc<Mutex<OpenedTurns>>,
 	}
 
 	struct ScriptedSession {
@@ -1812,10 +1821,7 @@ mod tests {
 		}
 	}
 
-	async fn wait_for_opened(
-		opened: &Arc<Mutex<Vec<(TurnId, TurnInput, crate::TurnOptions)>>>,
-		count: usize,
-	) {
+	async fn wait_for_opened(opened: &Arc<Mutex<OpenedTurns>>, count: usize) {
 		for _ in 0..100 {
 			if opened.lock().len() >= count {
 				return;

@@ -300,17 +300,14 @@ impl EvalChild {
 		let run_id = self.next_run.fetch_add(1, Ordering::Relaxed);
 		let started = Instant::now();
 		let timeout = TimeoutHandle::new(request.timeout);
-		let timeout_ns = match request
+		let Ok(timeout_ns) = request
 			.timeout
 			.map(|duration| u64::try_from(duration.as_nanos()))
 			.transpose()
-		{
-			Ok(timeout_ns) => timeout_ns,
-			Err(_) => {
-				let _ = events
-					.send(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow))));
-				return false;
-			},
+		else {
+			let _ = events
+				.send(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow))));
+			return false;
 		};
 		if let Err(error) = write_frame(&mut self.stdin, &ParentFrame::Run {
 			run_id,

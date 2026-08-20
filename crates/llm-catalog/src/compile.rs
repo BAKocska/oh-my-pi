@@ -3740,8 +3740,7 @@ fn compile_thinking(
 	classified_efforts.dedup();
 	let tier_collapsed = classified_efforts.len() >= 2;
 	let synthesize_cursor = provider == "cursor" && tier_collapsed && source.is_none();
-	let mut profile = profile;
-	if synthesize_cursor {
+	let profile = if synthesize_cursor {
 		let efforts = classified_efforts
 			.iter()
 			.copied()
@@ -3758,7 +3757,7 @@ fn compile_thinking(
 				.find(|effort| *effort != ThinkingEffort::Off)
 				.expect("collapsed effort family has a non-off route")
 		});
-		profile = Some(ThinkingPolicy {
+		Some(ThinkingPolicy {
 			mode: ThinkingMode::Effort,
 			efforts,
 			default_level,
@@ -3766,8 +3765,10 @@ fn compile_thinking(
 			supports_display: None,
 			suppress_when_off: None,
 			requires_effort: (!has_off_route).then_some(true),
-		});
-	}
+		})
+	} else {
+		profile
+	};
 	if let Some(profile) = &profile {
 		profile.validate().map_err(|error| {
 			CompileError::Invariant(Str::from(format!("invalid thinking profile: {error}")))
@@ -4753,7 +4754,7 @@ mod tests {
 		// rotating model menu: runtime /v1/models discovery must replace stale
 		// bundled rows instead of merging over them (pi 309d5712af, PR #8923).
 		let providers = include_str!("../../../fixtures/llm-oracle/catalog/providers.toml");
-		let models = zstd::stream::encode_all(&br#"{}"#[..], 1).expect("fixture compression");
+		let models = zstd::stream::encode_all(&br"{}"[..], 1).expect("fixture compression");
 		let source = parse_oracle(providers, &models).expect("fixture providers parse");
 		let coreweave = source
 			.providers

@@ -239,7 +239,7 @@ mod tests {
 		}
 		assert_eq!(picker.query, "cop");
 		assert_eq!(picker.handle_key(Key::Esc), PickerEvent::Consumed);
-		assert!(picker.query.is_empty());
+		assert_eq!(picker.query, "");
 		assert_eq!(picker.handle_key(Key::Esc), PickerEvent::Close);
 	}
 

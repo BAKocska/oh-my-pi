@@ -165,7 +165,7 @@ pub enum PolicyError {
 /// Refuses ENFORCE while kernel sandbox installation is explicitly deferred.
 ///
 /// OBSERVE/OFF policy remains outside this deferred enforcement path.
-pub fn require_sandbox_enforcement(enforce: bool) -> Result<(), PolicyError> {
+pub const fn require_sandbox_enforcement(enforce: bool) -> Result<(), PolicyError> {
 	if enforce {
 		Err(PolicyError::EnforcementUnavailable)
 	} else {
@@ -434,7 +434,7 @@ type AuthorityTableRef = Arc<AuthorityTable>;
 impl QuotaAccount {
 	/// Creates accounting for an owner or extension connection.
 	#[must_use]
-	pub fn new(table: AuthorityTableRef, host: Option<HostKey>) -> Self {
+	pub const fn new(table: AuthorityTableRef, host: Option<HostKey>) -> Self {
 		Self { table, host, usage: [0; Quota::COUNT] }
 	}
 

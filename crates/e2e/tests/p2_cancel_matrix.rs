@@ -29,11 +29,10 @@ use omp_app::{
 		worker::{ExtHostConfig, ExtHostSpec, HostKey},
 	},
 	exthost::{
-		ActivationTrigger, ArtifactDigest, DeclarationSet, ExtensionManifest, Provenance,
-		ServiceManifest, ToolDeclarationKey,
+		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{Principal, Str};
+use omp_core::{ArtifactDigest, Principal, Provenance, Str};
 use omp_e2e::support::omp_binary;
 use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_proto::{
@@ -136,11 +135,11 @@ fn test_manifest(key: &HostKey) -> ExtensionManifest {
 	ExtensionManifest::new(
 		Provenance::new(
 			Str::new_static("test-publisher"),
-			key.extension.clone(),
+			key.extension().clone(),
 			Str::new_static("1.0.0"),
 			ArtifactDigest::new([0; 32]),
-			key.layer.clone(),
-			key.tier.clone(),
+			key.layer().clone(),
+			key.tier().clone(),
 			1,
 		),
 		Str::new_static("cancel_matrix_tools"),
@@ -349,6 +348,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 			Bytes::from_static(b"{}"),
 			Bytes::from_static(b"cancel-matrix-test-token"),
 			1000,
+			None,
 		),
 	)
 	.await
@@ -494,7 +494,12 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	.expect("serialize Python blocker arguments");
 	within(
 		EVENT_DEADLINE,
-		blocked.commit_args(Bytes::from(args), Bytes::from_static(b"cancel-matrix-test-token"), 1000),
+		blocked.commit_args(
+			Bytes::from(args),
+			Bytes::from_static(b"cancel-matrix-test-token"),
+			1000,
+			None,
+		),
 	)
 	.await
 	.expect("commit Python blocker arguments");
@@ -550,6 +555,7 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 			Bytes::from_static(br#"{"message":"after respawn"}"#),
 			Bytes::from_static(b"cancel-matrix-test-token"),
 			1000,
+			None,
 		),
 	)
 	.await

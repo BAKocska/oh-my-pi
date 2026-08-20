@@ -1109,10 +1109,14 @@ mod tests {
 	#[derive(Deserialize)]
 	#[serde(deny_unknown_fields, rename_all = "camelCase")]
 	struct FixtureUsage {
-		input_tokens:       String,
-		output_tokens:      String,
-		cache_write_tokens: String,
-		cache_read_tokens:  String,
+		#[serde(rename = "inputTokens")]
+		input:       String,
+		#[serde(rename = "outputTokens")]
+		output:      String,
+		#[serde(rename = "cacheWriteTokens")]
+		cache_write: String,
+		#[serde(rename = "cacheReadTokens")]
+		cache_read:  String,
 	}
 
 	#[derive(Deserialize)]
@@ -1134,13 +1138,10 @@ mod tests {
 		for line in fixture.lines() {
 			let row: FixtureResponse = serde_json::from_str(line).expect("typed fixture row");
 			let usage = row.usage.map(|usage| ModelUsageStats {
-				input_tokens: usage.input_tokens.parse().expect("input tokens"),
-				output_tokens: usage.output_tokens.parse().expect("output tokens"),
-				cache_write_tokens: usage
-					.cache_write_tokens
-					.parse()
-					.expect("cache write tokens"),
-				cache_read_tokens: usage.cache_read_tokens.parse().expect("cache read tokens"),
+				input_tokens: usage.input.parse().expect("input tokens"),
+				output_tokens: usage.output.parse().expect("output tokens"),
+				cache_write_tokens: usage.cache_write.parse().expect("cache write tokens"),
+				cache_read_tokens: usage.cache_read.parse().expect("cache read tokens"),
 				..ModelUsageStats::default()
 			});
 			let response = GetChatMessageResponse {

@@ -308,12 +308,12 @@ impl<R: Resolve> ResolverTable<R> {
 pub struct NoResolver;
 
 impl Resolve for NoResolver {
-	async fn read<'a>(
+	fn read<'a>(
 		&'a self,
 		_resource: &'a str,
 		_selector: &'a ParsedSelector,
-	) -> Result<CowBytes<'static>, Fault> {
-		unreachable!("NoResolver is never installed in a ResolverTable")
+	) -> impl Future<Output = Result<CowBytes<'static>, Fault>> + Send + 'a {
+		async { unreachable!("NoResolver is never installed in a ResolverTable") }
 	}
 }
 
@@ -392,8 +392,7 @@ impl LineOffsets {
 		}
 		let end_line = range
 			.end_line
-			.map(|end| usize::try_from(end).unwrap_or(usize::MAX))
-			.unwrap_or(self.starts.len())
+			.map_or(self.starts.len(), |end| usize::try_from(end).unwrap_or(usize::MAX))
 			.min(self.starts.len());
 		let start = self.starts[start_line - 1];
 		let end = self.starts.get(end_line).copied().unwrap_or(self.len);
@@ -488,9 +487,7 @@ impl<C: ArtifactCatalog, B: BlobAuthority> ArtifactResolver<C, B> {
 		size: u64,
 		ranges: &[LineRange],
 	) -> Result<CowBytes<'static>, Fault> {
-		let offsets = if let Some(offsets) = self.lines.get(&record.digest) {
-			offsets
-		} else {
+		let Some(offsets) = self.lines.get(&record.digest) else {
 			let bytes = self.all_bytes(record, size).await?;
 			std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 				message: Str::new_static("Artifact selectors require UTF-8 text"),

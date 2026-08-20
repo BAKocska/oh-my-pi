@@ -366,7 +366,7 @@ fn resize_and_encode_to_limit(
 	Some(best)
 }
 
-fn encoded_image(
+const fn encoded_image(
 	data: Vec<u8>,
 	kind: ImageKind,
 	width: u32,

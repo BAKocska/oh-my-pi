@@ -1227,7 +1227,7 @@ fn thinking_level(effort: ReasoningEffort) -> Str {
 }
 
 /// Spells a resolved catalog wire effort as Google's `thinkingLevel` value.
-fn selection_thinking_level(effort: ThinkingEffort) -> Str {
+const fn selection_thinking_level(effort: ThinkingEffort) -> Str {
 	Str::new_static(match effort {
 		ThinkingEffort::Off | ThinkingEffort::Minimal => "MINIMAL",
 		ThinkingEffort::Low => "LOW",

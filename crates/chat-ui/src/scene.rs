@@ -545,13 +545,13 @@ impl Chat {
 	}
 
 	/// Takes text copied or cut by the composer.
-	pub fn take_copied(&mut self) -> Option<Str> {
+	pub const fn take_copied(&mut self) -> Option<Str> {
 		self.copied.take()
 	}
 
 	/// Takes the next composer submission: its text, staged attachments,
 	/// and active-turn delivery mode.
-	pub fn take_submission(&mut self) -> Option<(String, Vec<Attachment>, SubmitMode)> {
+	pub const fn take_submission(&mut self) -> Option<(String, Vec<Attachment>, SubmitMode)> {
 		self.pending_submit.take()
 	}
 
@@ -788,7 +788,7 @@ impl Chat {
 			BackendEvent::UserReplayed { text, chips } => self.push_user(text.as_str(), chips),
 			BackendEvent::AssistantBegin { id } => self.begin_assistant(id),
 			BackendEvent::AssistantDelta { id, text } => {
-				self.append_assistant(id.as_str(), text.as_str())
+				self.append_assistant(id.as_str(), text.as_str());
 			},
 			BackendEvent::AssistantEnd { id } => self.end_assistant(id.as_str()),
 			BackendEvent::ToolStarted { id, name, title } => self.tool_started(id, name, title),
@@ -886,7 +886,7 @@ impl Chat {
 		}
 	}
 
-	fn bump_live(&mut self) {
+	const fn bump_live(&mut self) {
 		self.live_revision = self.live_revision.wrapping_add(1);
 	}
 
@@ -1085,7 +1085,7 @@ impl Chat {
 		draw_live_panel_impl(
 			&mut self.frame,
 			rect,
-			&self.live_assistant,
+			self.live_assistant.as_ref(),
 			&self.live_tools,
 			&ctx,
 			elapsed,
@@ -1093,7 +1093,14 @@ impl Chat {
 	}
 
 	fn draw_live_panel(&self, frame: &mut Frame, rect: Rect, elapsed: Duration) {
-		draw_live_panel_impl(frame, rect, &self.live_assistant, &self.live_tools, &self.ctx, elapsed);
+		draw_live_panel_impl(
+			frame,
+			rect,
+			self.live_assistant.as_ref(),
+			&self.live_tools,
+			&self.ctx,
+			elapsed,
+		);
 	}
 
 	fn draw_working_owned(&mut self, y: u16, elapsed: Duration) {
@@ -1136,7 +1143,7 @@ impl Chat {
 fn draw_live_panel_impl(
 	frame: &mut Frame,
 	rect: Rect,
-	assistant: &Option<LiveAssistant>,
+	assistant: Option<&LiveAssistant>,
 	tools: &[LiveTool],
 	ctx: &UiContext,
 	elapsed: Duration,
@@ -1350,7 +1357,7 @@ fn tool_height(tool: &ToolEntry, width: u16) -> u16 {
 }
 
 fn preserves_attachments(text: &str) -> bool {
-	let first = text.trim().split_whitespace().next().unwrap_or_default();
+	let first = text.split_whitespace().next().unwrap_or_default();
 	first.starts_with('/') && first.get(1..).is_some_and(|command| !command.contains('/'))
 }
 
@@ -1640,7 +1647,7 @@ mod tests {
 		let (text, submitted, mode) = chat
 			.take_submission()
 			.expect("working empty enter submitted");
-		assert!(text.is_empty());
+		assert_eq!(text, "");
 		assert!(submitted.is_empty());
 		assert_eq!(mode, SubmitMode::Steer);
 		assert_eq!(chat.attachments.take().len(), 1);
@@ -1674,7 +1681,7 @@ mod tests {
 		draw_live_panel_impl(
 			&mut frame,
 			Rect::new(0, 0, 20, 5),
-			&assistant,
+			assistant.as_ref(),
 			&[],
 			&context,
 			Duration::ZERO,

@@ -54,7 +54,7 @@ pub struct Conversion {
 }
 
 impl Conversion {
-	fn plain(text: Str) -> Self {
+	const fn plain(text: Str) -> Self {
 		Self { text, note: None, title: None }
 	}
 }

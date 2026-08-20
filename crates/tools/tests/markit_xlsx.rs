@@ -50,7 +50,7 @@ fn xlsx_preserves_sparse_coordinates_and_formats_typed_values() {
 			r#"<styleSheet><numFmts count="1"><numFmt numFmtId="165" formatCode="[h]:mm:ss"/></numFmts><cellXfs count="4"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="20"/><xf numFmtId="165"/></cellXfs></styleSheet>"#,
 		),
 		Some(
-			r#"<sst><si><r><t>Shared </t></r><r><t>rich &amp;copy;</t></r><rPh><t>phonetic</t></rPh></si></sst>"#,
+			r"<sst><si><r><t>Shared </t></r><r><t>rich &amp;copy;</t></r><rPh><t>phonetic</t></rPh></si></sst>",
 		),
 	);
 

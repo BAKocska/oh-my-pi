@@ -370,7 +370,7 @@ pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: smallvec::SmallVec::new(),
+					write_globs: Arc::default(),
 				}),
 				exec:      None,
 				inference: None,

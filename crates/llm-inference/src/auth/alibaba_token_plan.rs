@@ -591,8 +591,7 @@ mod tests {
 		assert_eq!(
 			serialized.expose_secret(),
 			format!(
-				r#"{{"token":"sk-sp-test","cookie":"sid=value","baseUrl":"{}"}}"#,
-				ALIBABA_TOKEN_PLAN_CN_BASE_URL
+				r#"{{"token":"sk-sp-test","cookie":"sid=value","baseUrl":"{ALIBABA_TOKEN_PLAN_CN_BASE_URL}"}}"#
 			)
 		);
 		let parsed =
@@ -802,7 +801,7 @@ mod tests {
 		assert!(cookie_prompt.contains("bailian-cs.console.aliyun.com/data/api.json"));
 		assert_eq!(
 			stored,
-			format!(r#"{{"token":"sk-sp-test","baseUrl":"{}"}}"#, ALIBABA_TOKEN_PLAN_CN_BASE_URL)
+			format!(r#"{{"token":"sk-sp-test","baseUrl":"{ALIBABA_TOKEN_PLAN_CN_BASE_URL}"}}"#)
 		);
 		let _ = std::fs::remove_file(path);
 	}

@@ -96,6 +96,11 @@ impl LspEvents {
 	}
 }
 
+type DocumentEventResult = Result<pb::DocumentEvent, EventStreamError>;
+type DocumentEventSender = flume::Sender<DocumentEventResult>;
+type DocumentEventSubscribers = HashMap<Bytes, (Bytes, DocumentEventSender)>;
+type PendingDocumentEvents = HashMap<Bytes, Vec<DocumentEventResult>>;
+
 /// A document-server lease pinned to the revision returned by `OpenDocument`.
 ///
 /// Dropping the lease sends a best-effort close request, keeping lease release
@@ -123,7 +128,7 @@ impl DocumentLease {
 	/// Takes the terminally contiguous event stream for this lease.
 	///
 	/// A lease has exactly one event consumer. Subsequent calls return `None`.
-	pub fn take_events(&mut self) -> Option<DocumentEvents> {
+	pub const fn take_events(&mut self) -> Option<DocumentEvents> {
 		self.events.take()
 	}
 
@@ -228,11 +233,8 @@ struct Inner {
 	hello:                    DocumentHello,
 	writer:                   flume::Sender<pb::ClientFrame>,
 	pending:                  Arc<Mutex<HashMap<u64, flume::Sender<pb::ServerFrame>>>>,
-	document_events: Arc<
-		Mutex<HashMap<Bytes, (Bytes, flume::Sender<Result<pb::DocumentEvent, EventStreamError>>)>>,
-	>,
-	pending_document_events:
-		Arc<Mutex<HashMap<Bytes, Vec<Result<pb::DocumentEvent, EventStreamError>>>>>,
+	document_events:          Arc<Mutex<DocumentEventSubscribers>>,
+	pending_document_events:  Arc<Mutex<PendingDocumentEvents>>,
 	document_event_sequences: Arc<Mutex<HashMap<Bytes, u64>>>,
 	lsp_event_sender:         flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
 	lsp_events:               Mutex<Option<LspEvents>>,
@@ -377,7 +379,8 @@ impl DocumentHost {
 				let _ = waiter.send(disconnected_frame(request_id));
 			}
 			let closed = closed_stream_error(pb::EventStreamKind::Document);
-			for (_, sender) in std::mem::take(&mut *reader_document_events.lock()).into_values() {
+			let document_events = std::mem::take(&mut *reader_document_events.lock());
+			for (_, sender) in document_events.into_values() {
 				let _ = sender.send(Err(closed.clone()));
 			}
 			let _ = reader_lsp_events.send(Err(closed_stream_error(pb::EventStreamKind::LspRegistry)));
@@ -481,22 +484,22 @@ impl DocumentHost {
 			.document_events
 			.lock()
 			.insert(opened.lease_id.clone(), (document_id.clone(), event_sender.clone()));
-		if let Some(events) = self
+		let pending_events = self
 			.inner
 			.pending_document_events
 			.lock()
-			.remove(&document_id)
-		{
+			.remove(&document_id);
+		if let Some(events) = pending_events {
 			for event in events {
 				let _ = event_sender.send(event);
 			}
 		}
-		if let Some(events) = self
+		let pending_events = self
 			.inner
 			.pending_document_events
 			.lock()
-			.remove(&opened.lease_id)
-		{
+			.remove(&opened.lease_id);
+		if let Some(events) = pending_events {
 			for event in events {
 				let _ = event_sender.send(event);
 			}
@@ -1080,12 +1083,8 @@ pub(crate) fn lease_target(lease: &DocumentLease) -> pb::DocumentTarget {
 }
 fn dispatch_event_frame(
 	body: pb::server_frame::Body,
-	document_events: &Mutex<
-		HashMap<Bytes, (Bytes, flume::Sender<Result<pb::DocumentEvent, EventStreamError>>)>,
-	>,
-	pending_document_events: &Mutex<
-		HashMap<Bytes, Vec<Result<pb::DocumentEvent, EventStreamError>>>,
-	>,
+	document_events: &Mutex<DocumentEventSubscribers>,
+	pending_document_events: &Mutex<PendingDocumentEvents>,
 	document_event_sequences: &Mutex<HashMap<Bytes, u64>>,
 	lsp_events: &flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
 ) {
@@ -1143,7 +1142,8 @@ fn dispatch_event_frame(
 			};
 			match terminal.stream {
 				pb::EventStreamKind::Document => {
-					if let Some((_, sender)) = document_events.lock().remove(&error.lease_id) {
+					let subscriber = document_events.lock().remove(&error.lease_id);
+					if let Some((_, sender)) = subscriber {
 						let _ = sender.send(Err(terminal));
 					} else {
 						pending_document_events
@@ -1162,7 +1162,7 @@ fn dispatch_event_frame(
 	}
 }
 
-fn closed_stream_error(stream: pb::EventStreamKind) -> EventStreamError {
+const fn closed_stream_error(stream: pb::EventStreamKind) -> EventStreamError {
 	EventStreamError {
 		stream,
 		failure: pb::EventStreamFailure::Closed,

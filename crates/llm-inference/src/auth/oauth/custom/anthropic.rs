@@ -520,7 +520,7 @@ mod tests {
 		let tokens = tokens.expect("token exchange");
 		assert!(tokens.is_refreshable());
 		assert_eq!(tokens.token_type(), "Bearer");
-		assert_eq!(tokens.expires_in(), Some(Duration::from_secs(3300)));
+		assert_eq!(tokens.expires_in(), Some(Duration::from_hours(1) - Duration::from_mins(5)));
 		let principal = tokens
 			.resolve_principal(
 				&PrincipalResolution::TokenResponseField { pointer: "/account/email_address".into() },

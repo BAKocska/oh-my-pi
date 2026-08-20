@@ -257,7 +257,9 @@ pub enum AnswerBody {
 	Realtime(RealtimeSession),
 	/// Ranked standalone search results.
 	Search(SearchResults),
-	/// Account-scoped usage and quota report, boxed to keep the enum small.
+	/// Account-scoped provider usage payload, boxed because its lossless,
+	/// provider-defined window report is intentionally wider than this enum's
+	/// other response bodies.
 	Usage(Box<UsageReport>),
 	/// Runtime-discovered normalized model page.
 	Models(ModelDiscoveryPage),

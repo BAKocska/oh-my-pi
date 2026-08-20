@@ -39,7 +39,7 @@
 
 use std::{
 	fmt,
-	future::{Future, poll_fn},
+	future::poll_fn,
 	marker::PhantomData,
 	ops::{Deref, Range},
 	sync::Arc,
@@ -390,56 +390,54 @@ pub struct Pulled {
 }
 impl IncomingCursor {
 	/// Pull an arbitrary path without allocating or boxing the returned future.
-	pub fn pull_at<'a>(
+	pub async fn pull_at<'a>(
 		&'a self,
 		path: &'a [PullPathSegment],
 		mode: PullMode,
 		expected: &'static str,
-	) -> impl Future<Output = Result<Pulled, IncomingError>> + 'a {
-		async move {
-			let located = wait_for(&self.shared, path, mode, expected).await?;
-			let state = self.shared.state.lock();
-			let Located { start, end, kind, matched_key } = located;
-			let observed_end = end.unwrap_or(state.text.len());
-			let span = start..observed_end;
-			let kind = match mode {
-				PullMode::Started => PulledKind::Started(kind.value_kind()),
-				PullMode::Complete => {
-					let value = match kind {
-						Kind::Null => Value::Null,
-						Kind::Bool(value) => Value::Bool(value),
-						Kind::Number(value) => Value::Number(value),
-						Kind::String { value, .. } => Value::String(value),
-						Kind::Array | Kind::Object => parse(&state.text[span.clone()])
-							.map_err(|_| pull_issue(path, expected, PullIssueKind::Malformed))?,
+	) -> Result<Pulled, IncomingError> {
+		let located = wait_for(&self.shared, path, mode, expected).await?;
+		let state = self.shared.state.lock();
+		let Located { start, end, kind, matched_key } = located;
+		let observed_end = end.unwrap_or(state.text.len());
+		let span = start..observed_end;
+		let kind = match mode {
+			PullMode::Started => PulledKind::Started(kind.value_kind()),
+			PullMode::Complete => {
+				let value = match kind {
+					Kind::Null => Value::Null,
+					Kind::Bool(value) => Value::Bool(value),
+					Kind::Number(value) => Value::Number(value),
+					Kind::String { value, .. } => Value::String(value),
+					Kind::Array | Kind::Object => parse(&state.text[span.clone()])
+						.map_err(|_| pull_issue(path, expected, PullIssueKind::Malformed))?,
+				};
+				PulledKind::Complete(value)
+			},
+			PullMode::Chunk(emitted) | PullMode::Line(emitted) => match kind {
+				Kind::String { value, stable_len } => {
+					let Some(remaining) = value.get(emitted..stable_len) else {
+						return Err(pull_issue(path, "valid string offset", PullIssueKind::Malformed));
 					};
-					PulledKind::Complete(value)
+					let upper = match mode {
+						PullMode::Line(_) if end.is_none() => remaining
+							.rfind('\n')
+							.map_or(emitted, |offset| emitted + offset + 1),
+						_ => stable_len,
+					};
+					PulledKind::Chunk {
+						value:    Str::from(
+							value
+								.get(emitted..upper)
+								.expect("validated decoded string boundaries"),
+						),
+						complete: end.is_some(),
+					}
 				},
-				PullMode::Chunk(emitted) | PullMode::Line(emitted) => match kind {
-					Kind::String { value, stable_len } => {
-						let Some(remaining) = value.get(emitted..stable_len) else {
-							return Err(pull_issue(path, "valid string offset", PullIssueKind::Malformed));
-						};
-						let upper = match mode {
-							PullMode::Line(_) if end.is_none() => remaining
-								.rfind('\n')
-								.map_or(emitted, |offset| emitted + offset + 1),
-							_ => stable_len,
-						};
-						PulledKind::Chunk {
-							value:    Str::from(
-								value
-									.get(emitted..upper)
-									.expect("validated decoded string boundaries"),
-							),
-							complete: end.is_some(),
-						}
-					},
-					other => return Err(type_mismatch(path, "string", other.name())),
-				},
-			};
-			Ok(Pulled { kind, span, matched_key })
-		}
+				other => return Err(type_mismatch(path, "string", other.name())),
+			},
+		};
+		Ok(Pulled { kind, span, matched_key })
 	}
 
 	/// Copy one valid UTF-8 source span from the append-only buffer.
@@ -454,93 +452,89 @@ impl IncomingCursor {
 	}
 
 	/// Await successful completion and copy the exact original document.
-	pub fn raw_document(&self) -> impl Future<Output = Result<Str, IncomingError>> + '_ {
-		async move {
-			wait_until_finished(&self.shared).await?;
-			Ok(Str::from(self.shared.state.lock().text.as_str()))
-		}
+	pub async fn raw_document(&self) -> Result<Str, IncomingError> {
+		wait_until_finished(&self.shared).await?;
+		Ok(Str::from(self.shared.state.lock().text.as_str()))
 	}
 
 	/// Return every object key occurrence in source order, preserving
 	/// duplicates.
-	pub fn object_keys<'a>(
+	pub async fn object_keys<'a>(
 		&'a self,
 		path: &'a [PullPathSegment],
-	) -> impl Future<Output = Result<SmallVec<Str, 8>, IncomingError>> + 'a {
-		async move {
-			wait_until_finished(&self.shared).await?;
-			let located = wait_for(&self.shared, path, PullMode::Complete, "object").await?;
-			if !matches!(&located.kind, Kind::Object) {
-				return Err(type_mismatch(path, "object", located.kind.name()));
-			}
-			let state = self.shared.state.lock();
-			let mut parser = Parser::resume(&state.text, Mode::Incoming, located.start);
-			parser.set_repair_path(path);
-			parser.ws();
-			parser.bump();
-			let mut keys = SmallVec::new();
-			loop {
-				parser.ws();
-				match parser.peek() {
-					Some(b'}') => {
-						parser.bump();
-						break;
-					},
-					Some(b',') => {
-						let comma = parser.pos();
-						parser.bump();
-						parser.ws();
-						parser.record_comma(comma, parser.peek() == Some(b'}'));
-						continue;
-					},
-					None => {
-						return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
-					},
-					_ => {},
-				}
-				let key = match parser.peek() {
-					Some(quote @ (b'"' | b'\'')) => {
-						let progress = parser.string_progress(quote).map_err(IncomingError::from)?;
-						if !progress.complete {
-							return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
-						}
-						Str::from(progress.value)
-					},
-					Some(_) => Str::from(parser.unquoted_key()),
-					None => {
-						return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
-					},
-				};
-				keys.push(key);
-				parser.ws();
-				if parser.peek() != Some(b':') {
-					return Err(pull_issue(path, "object", PullIssueKind::Malformed));
-				}
-				parser.bump();
-				parser.ws();
-				if !matches!(
-					scan_value(&mut parser, true, 1),
-					Probe::Located(Located { end: Some(_), .. })
-				) {
-					return Err(pull_issue(path, "object", PullIssueKind::Malformed));
-				}
-				parser.ws();
-				match parser.peek() {
-					Some(b',') => {
-						let comma = parser.pos();
-						parser.bump();
-						parser.ws();
-						if parser.peek() == Some(b'}') {
-							parser.record_comma(comma, true);
-						}
-					},
-					Some(b'}') => {},
-					_ => return Err(pull_issue(path, "object", PullIssueKind::Malformed)),
-				}
-			}
-			drop(parser);
-			Ok(keys)
+	) -> Result<SmallVec<Str, 8>, IncomingError> {
+		wait_until_finished(&self.shared).await?;
+		let located = wait_for(&self.shared, path, PullMode::Complete, "object").await?;
+		if !matches!(&located.kind, Kind::Object) {
+			return Err(type_mismatch(path, "object", located.kind.name()));
 		}
+		let state = self.shared.state.lock();
+		let mut parser = Parser::resume(&state.text, Mode::Incoming, located.start);
+		parser.set_repair_path(path);
+		parser.ws();
+		parser.bump();
+		let mut keys = SmallVec::new();
+		loop {
+			parser.ws();
+			match parser.peek() {
+				Some(b'}') => {
+					parser.bump();
+					break;
+				},
+				Some(b',') => {
+					let comma = parser.pos();
+					parser.bump();
+					parser.ws();
+					parser.record_comma(comma, parser.peek() == Some(b'}'));
+					continue;
+				},
+				None => {
+					return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
+				},
+				_ => {},
+			}
+			let key = match parser.peek() {
+				Some(quote @ (b'"' | b'\'')) => {
+					let progress = parser.string_progress(quote).map_err(IncomingError::from)?;
+					if !progress.complete {
+						return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
+					}
+					Str::from(progress.value)
+				},
+				Some(_) => Str::from(parser.unquoted_key()),
+				None => {
+					return Err(pull_issue(path, "object", PullIssueKind::Incomplete));
+				},
+			};
+			keys.push(key);
+			parser.ws();
+			if parser.peek() != Some(b':') {
+				return Err(pull_issue(path, "object", PullIssueKind::Malformed));
+			}
+			parser.bump();
+			parser.ws();
+			if !matches!(
+				scan_value(&mut parser, true, 1),
+				Probe::Located(Located { end: Some(_), .. })
+			) {
+				return Err(pull_issue(path, "object", PullIssueKind::Malformed));
+			}
+			parser.ws();
+			match parser.peek() {
+				Some(b',') => {
+					let comma = parser.pos();
+					parser.bump();
+					parser.ws();
+					if parser.peek() == Some(b'}') {
+						parser.record_comma(comma, true);
+					}
+				},
+				Some(b'}') => {},
+				_ => return Err(pull_issue(path, "object", PullIssueKind::Malformed)),
+			}
+		}
+		drop(parser);
+		Ok(keys)
 	}
 }
 

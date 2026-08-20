@@ -234,7 +234,7 @@ impl ExtensionDataBinding {
 	}
 
 	/// Returns the exact grants enforced for this listener.
-	pub(crate) fn grants(&self) -> &Grants {
+	pub(crate) const fn grants(&self) -> &Grants {
 		&self.grants
 	}
 
@@ -360,6 +360,7 @@ impl EnvServer {
 	pub async fn open_local(
 		root: &Path,
 		state_dir: &Path,
+		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -411,7 +412,7 @@ impl EnvServer {
 			&hello.root_uri,
 			&ext_hosts,
 			interrupt_grace,
-			Registry::new(),
+			registry,
 		)?;
 		let identity = ServerIdentity {
 			workspace_id:   hello.workspace_id,
@@ -2021,10 +2022,9 @@ impl EnvServer {
 								};
 								if let (Some(lease), Some(head)) =
 									(connection.document_leases.get_mut(lease_id), operation.head.clone())
+									&& let Err(error) = lease.advance(head)
 								{
-									if let Err(error) = lease.advance(head) {
-										return send_document_error(responses, request_id, &error).await;
-									}
+									return send_document_error(responses, request_id, &error).await;
 								}
 							}
 						}
@@ -2430,7 +2430,7 @@ impl EnvServer {
 				spawn_worker_invocation(
 					request_id,
 					id.clone(),
-					invocation,
+					*invocation,
 					cancel.clone(),
 					interrupts,
 					responses.clone(),
@@ -2654,6 +2654,7 @@ struct Finished {
 }
 
 enum LoopEvent {
+	/// Boxes the foreign generated protobuf frame to keep this local event enum compact.
 	Frame(Box<pb::ClientFrame>),
 	Finished(Finished),
 }
@@ -2761,11 +2762,13 @@ impl ConnectionState {
 				self.authority.settle(&owner, &id);
 			},
 			Some(RequestState::Exec { .. }) => self.quotas.release_exec(),
-			Some(RequestState::ProcessAttach { .. })
-			| Some(RequestState::BlobGet { .. })
-			| Some(RequestState::DataStream { .. })
-			| Some(RequestState::DocumentEvents { .. })
-			| Some(RequestState::LspEvents { .. }) => self.quotas.release_stream(),
+			Some(
+				RequestState::ProcessAttach { .. }
+				| RequestState::BlobGet { .. }
+				| RequestState::DataStream { .. }
+				| RequestState::DocumentEvents { .. }
+				| RequestState::LspEvents { .. },
+			) => self.quotas.release_stream(),
 			_ => {},
 		}
 		if let Some(invocation_id) = done.invocation_id {
@@ -4235,7 +4238,7 @@ async fn send_document_error(
 	send_error(responses, request_id, code, &error.to_string()).await;
 }
 
-fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str, &'static str)> {
+const fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str, &'static str)> {
 	match body {
 		client_frame::Body::OpenSession(_) => Some(("omp.env.sh.open_session", "env.exec")),
 		client_frame::Body::CloseSession(_) => Some(("omp.env.sh.close_session", "env.exec")),
@@ -4272,7 +4275,7 @@ fn worker_operation_allowed(operation: &str) -> bool {
 }
 
 async fn authorize_data_operation(
-	connection: &mut ConnectionState,
+	connection: &ConnectionState,
 	scope: Option<&pb::InvocationScope>,
 	operation: &'static str,
 	capability: &'static str,
@@ -5129,9 +5132,9 @@ mod tests {
 				props: Default::default(),
 			})),
 			scope: Some(pb::InvocationScope {
-				invocation_id:      "test-invocation".to_owned(),
-				effect_token:       Bytes::from_static(b"test-effect-token"),
-				host_generation:    1,
+				invocation_id: "test-invocation".to_owned(),
+				effect_token: Bytes::from_static(b"test-effect-token"),
+				host_generation: 1,
 				session_generation: 1,
 				..Default::default()
 			}),

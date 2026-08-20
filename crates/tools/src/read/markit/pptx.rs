@@ -329,7 +329,7 @@ enum Fragment {
 }
 
 impl Fragment {
-	fn is_empty(&self) -> bool {
+	const fn is_empty(&self) -> bool {
 		matches!(self, Self::Break) || matches!(self, Self::Text { text, .. } if text.is_empty())
 	}
 }
@@ -554,7 +554,7 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>) -> Result<Paragraph, String> {
 				}
 			},
 			Event::Empty(element) if local_name(element.name().as_ref()) == b"br" => {
-				paragraph.fragments.push(Fragment::Break)
+				paragraph.fragments.push(Fragment::Break);
 			},
 			Event::End(_) => {
 				if depth == 1 {
@@ -629,8 +629,7 @@ fn apply_para_property(
 			};
 			let start = attribute(reader, element, b"startAt")?
 				.and_then(|value| value.parse::<i64>().ok())
-				.map(|value| value.clamp(1, 32767) as u64)
-				.unwrap_or(1);
+				.map_or(1, |value| value.clamp(1, 32767) as u64);
 			properties.bullet = Bullet::Auto { start, kind, wrap };
 		},
 		b"defRPr" => properties.style = properties.style.overlay(parse_style(reader, element)?),

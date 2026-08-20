@@ -68,7 +68,7 @@ pub struct GitFacts {
 }
 
 /// Complete host-supplied status snapshot.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct StatusFacts {
 	/// Model label shown in the status line.
 	pub model:          Str,
@@ -92,24 +92,6 @@ pub struct StatusFacts {
 	pub dropped:        u64,
 	/// Repository facts, omitted when unavailable.
 	pub git:            Option<GitFacts>,
-}
-
-impl Default for StatusFacts {
-	fn default() -> Self {
-		Self {
-			model:          Str::default(),
-			working:        false,
-			turn_started:   None,
-			context_tokens: 0,
-			context_window: None,
-			cost_nanos:     0,
-			queued:         0,
-			jobs:           0,
-			attempt:        0,
-			dropped:        0,
-			git:            None,
-		}
-	}
 }
 
 /// How a composer submission interacts with an active turn.

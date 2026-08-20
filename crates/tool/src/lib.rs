@@ -9,7 +9,7 @@ mod registry;
 pub mod render;
 mod spec_generated;
 
-use std::{collections::BTreeMap, fmt, future::Future, io::Write};
+use std::{collections::BTreeMap, fmt, future::Future, io::Write, mem::size_of, sync::Arc};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -170,7 +170,7 @@ impl std::str::FromStr for Usd {
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		let invalid = || UsdParseError { value: Str::from(value) };
-		let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+		let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
 		if whole.is_empty()
 			|| !whole.bytes().all(|byte| byte.is_ascii_digit())
 			|| (whole.len() > 1 && whole.starts_with('0'))
@@ -233,13 +233,13 @@ pub struct DocEffects {
 	/// Whether document reads are permitted.
 	pub read:        bool,
 	/// Exact declared write-glob ceilings.
-	pub write_globs: SmallVec<Str, 4>,
+	pub write_globs: Arc<[Str]>,
 }
 
 impl DocEffects {
 	/// Returns whether this document domain grants no authority.
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		!self.read && self.write_globs.is_empty()
 	}
 }
@@ -248,7 +248,7 @@ impl DocEffects {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExecEffects {
 	/// Exact executable names permitted by the declaration.
-	pub commands: SmallVec<Str, 4>,
+	pub commands: Arc<[Str]>,
 	/// Whether outbound network access is permitted.
 	pub network:  bool,
 }
@@ -256,7 +256,7 @@ pub struct ExecEffects {
 impl ExecEffects {
 	/// Returns whether this process domain grants no authority.
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.commands.is_empty() && !self.network
 	}
 }
@@ -290,6 +290,8 @@ pub struct Effects {
 	/// Maximum spawned subagents.
 	pub subagents: u32,
 }
+
+const _: () = assert!(size_of::<Effects>() <= 96, "Effects must stay compact");
 
 impl Effects {
 	/// Empty deny-all envelope for an explicitly effect-free tool.
@@ -438,18 +440,22 @@ impl TryFrom<&omp_proto::policy::v1::EffectEnvelope> for Effects {
 		Ok(Self {
 			documents: value.documents.as_ref().map(|documents| DocEffects {
 				read:        documents.read,
-				write_globs: documents
-					.write_globs
-					.iter()
-					.map(|glob| Str::from(glob.as_str()))
-					.collect(),
+				write_globs: Arc::from(
+					documents
+						.write_globs
+						.iter()
+						.map(|glob| Str::from(glob.as_str()))
+						.collect::<Vec<_>>(),
+				),
 			}),
 			exec:      value.exec.as_ref().map(|exec| ExecEffects {
-				commands: exec
-					.commands
-					.iter()
-					.map(|command| Str::from(command.as_str()))
-					.collect(),
+				commands: Arc::from(
+					exec
+						.commands
+						.iter()
+						.map(|command| Str::from(command.as_str()))
+						.collect::<Vec<_>>(),
+				),
 				network:  exec.network,
 			}),
 			inference: value
@@ -920,14 +926,14 @@ pub enum CallOutcome<P, F> {
 impl<P, F> CallOutcome<P, F> {
 	/// Creates a non-policy abort, deriving its coarse class from `abort`.
 	#[must_use]
-	pub fn aborted(abort: Abort) -> Self {
+	pub const fn aborted(abort: Abort) -> Self {
 		let kind = abort.kind();
 		Self::Aborted { abort, kind, policy: None }
 	}
 
 	/// Creates a structured policy denial.
 	#[must_use]
-	pub fn policy_denied(abort: Abort, policy: PolicyDenied) -> Self {
+	pub const fn policy_denied(abort: Abort, policy: PolicyDenied) -> Self {
 		Self::Aborted { abort, kind: AbortKind::PolicyDenied, policy: Some(policy) }
 	}
 }
@@ -1122,7 +1128,7 @@ pub enum ArgSpecRegistryError {
 		/// Exact argument dialect revision.
 		rev:  Rev,
 		/// Conflicting canonical or alias path.
-		path: SmallVec<ArgPath, 4>,
+		path: Arc<[ArgPath]>,
 	},
 	/// Aliases were declared for a path which does not end in an object key.
 	#[error("argument aliases require a final object key for revision {rev}: {path:?}")]
@@ -1130,12 +1136,17 @@ pub enum ArgSpecRegistryError {
 		/// Exact argument dialect revision.
 		rev:  Rev,
 		/// Invalid canonical path.
-		path: SmallVec<ArgPath, 4>,
+		path: Arc<[ArgPath]>,
 	},
 	/// One revision exhausted the dense path identifier space.
 	#[error("too many argument paths registered for revision {0}")]
 	PathLimit(Rev),
 }
+
+const _: () = assert!(
+	size_of::<ArgSpecRegistryError>() <= 128,
+	"ArgSpecRegistryError must stay compact"
+);
 
 impl ArgSpecRegistry {
 	/// Creates an empty mutable declaration table.
@@ -1153,7 +1164,10 @@ impl ArgSpecRegistry {
 		paths.push(spec.path.clone());
 		if !spec.aliases.is_empty() {
 			if !matches!(spec.path.last(), Some(ArgPath::Key(_))) {
-				return Err(ArgSpecRegistryError::AliasOnIndex { rev, path: spec.path });
+				return Err(ArgSpecRegistryError::AliasOnIndex {
+					rev,
+					path: Arc::from(spec.path),
+				});
 			}
 			for alias in &spec.aliases {
 				let mut path = spec.path.clone();
@@ -1162,7 +1176,7 @@ impl ArgSpecRegistry {
 				};
 				*key = alias.clone();
 				if paths.contains(&path) {
-					return Err(ArgSpecRegistryError::Duplicate { rev, path });
+					return Err(ArgSpecRegistryError::Duplicate { rev, path: Arc::from(path) });
 				}
 				paths.push(path);
 			}
@@ -1172,7 +1186,10 @@ impl ArgSpecRegistry {
 			.iter()
 			.find(|path| revision.path_ids.contains_key(path.as_slice()))
 		{
-			return Err(ArgSpecRegistryError::Duplicate { rev, path: (*path).clone() });
+			return Err(ArgSpecRegistryError::Duplicate {
+				rev,
+				path: Arc::from((*path).clone()),
+			});
 		}
 		let path_id = u32::try_from(revision.specs.len())
 			.map_err(|_| ArgSpecRegistryError::PathLimit(rev.clone()))?;
@@ -1186,7 +1203,7 @@ impl ArgSpecRegistry {
 	}
 
 	/// Seals the table against every later registration.
-	pub fn seal(&mut self) {
+	pub const fn seal(&mut self) {
 		self.sealed = true;
 	}
 
@@ -1344,8 +1361,10 @@ pub struct PolicyDenied {
 	/// Durable admission decision identifier.
 	pub decision_id: Str,
 	/// Stable identifiers of every policy rule that fired.
-	pub rules:       SmallVec<Str, 4>,
+	pub rules:       Arc<[Str]>,
 }
+
+const _: () = assert!(size_of::<PolicyDenied>() <= 128, "PolicyDenied must stay compact");
 
 /// Result of a post-settlement review that cannot rewrite the call outcome.
 #[derive(
@@ -1555,7 +1574,7 @@ struct ThresholdWriter<'a, S: CallOutcomeSpill> {
 }
 
 impl<'a, S: CallOutcomeSpill> ThresholdWriter<'a, S> {
-	fn new(spill: &'a S, inline_limit: usize) -> Self {
+	const fn new(spill: &'a S, inline_limit: usize) -> Self {
 		Self {
 			spill,
 			inline_limit,

@@ -976,10 +976,7 @@ mod tests {
 		let worker = &page.models[0];
 		let plain = &page.models[1];
 		assert_eq!(worker.key.as_str(), "openai-codex/gpt-5.6-luna-wm");
-		assert_eq!(worker.wire_ids.as_ref(), &[(
-			route.clone(),
-			WireModelId::from("gpt-5.6-luna-wm")
-		)]);
+		assert_eq!(worker.wire_ids.as_ref(), &[(route, WireModelId::from("gpt-5.6-luna-wm"))]);
 		assert_eq!(
 			worker.limits.context_window,
 			Some(1_000_000),
@@ -1133,7 +1130,11 @@ mod tests {
 			route.clone(),
 			WireModelId::from("deepseek-ai/DeepSeek-V4-Pro")
 		)]);
-		assert_eq!(model.routes.as_ref(), &[route.clone()], "discovery route binding is kept");
+		assert_eq!(
+			model.routes.as_ref(),
+			std::slice::from_ref(&route),
+			"discovery route binding is kept"
+		);
 	}
 
 	#[test]
@@ -1248,7 +1249,7 @@ mod tests {
 		assert!(pro.limits.maximum_output_tokens.is_some(), "output limit recovered");
 		assert!(pro.thinking.is_some(), "thinking ladder recovered from the canonical card");
 		assert_eq!(pro.pricing, Pricing::default(), "tariffs never cross providers");
-		assert_eq!(pro.routes.as_ref(), &[route.id.clone()], "discovery route binding");
+		assert_eq!(pro.routes.as_ref(), std::slice::from_ref(&route.id), "discovery route binding");
 		let flash = page
 			.models
 			.iter()
@@ -1328,10 +1329,10 @@ mod tests {
 				.routes
 				.clone()
 		};
-		assert_eq!(routes_of("gpt-5.5").as_ref(), &[target.clone()]);
-		assert_eq!(routes_of("muse-spark-1.2-contributor").as_ref(), &[target.clone()]);
-		assert_eq!(routes_of("minimax-m2.5").as_ref(), &[route.clone()]);
-		assert_eq!(routes_of("brand-new-model").as_ref(), &[route.clone()]);
+		assert_eq!(routes_of("gpt-5.5").as_ref(), std::slice::from_ref(&target));
+		assert_eq!(routes_of("muse-spark-1.2-contributor").as_ref(), std::slice::from_ref(&target));
+		assert_eq!(routes_of("minimax-m2.5").as_ref(), std::slice::from_ref(&route));
+		assert_eq!(routes_of("brand-new-model").as_ref(), std::slice::from_ref(&route));
 		let contributor = page
 			.models
 			.iter()
@@ -1405,7 +1406,7 @@ mod tests {
 		let unknown = find("muse-spark-1.3");
 		assert_eq!(
 			unknown.routes.as_ref(),
-			&[route.id.clone()],
+			std::slice::from_ref(&route.id),
 			"no bundled signal on either gateway keeps the discovery route"
 		);
 	}

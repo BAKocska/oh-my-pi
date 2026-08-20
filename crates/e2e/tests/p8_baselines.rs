@@ -19,7 +19,7 @@ fn ratio_math_and_zero_duration_are_guarded() {
 
 #[tokio::test]
 async fn artifact_schema_is_stable_and_frame_metric_is_record_only() {
-	let metrics = measure(128, 256, 2)
+	let metrics = Box::pin(measure(128, 256, 2))
 		.await
 		.expect("bounded baseline measurement");
 	assert_eq!(metrics.schema_version, 1);

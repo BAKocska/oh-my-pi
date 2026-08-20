@@ -616,7 +616,7 @@ fn prompt_projection_retains_status_and_obeys_text_caps() {
 			media:              false,
 			model_class:        ModelClass::Standard,
 		},
-		&rev,
+		rev,
 	);
 	let parts = registry
 		.prompt(&ToolIdentity { name: name.clone(), rev: rev.clone() }, verdict, &caps)

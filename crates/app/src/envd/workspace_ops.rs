@@ -284,7 +284,7 @@ impl WorkspaceOperations {
 		let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
 		let record = WorktreeRecord {
 			id: id.clone(),
-			root: root.clone(),
+			root,
 			base: Str::from(snapshot.snapshot_id),
 			generation,
 			branch: None,
@@ -463,12 +463,12 @@ impl WorkspaceOperations {
 			return Ok((cached.blob, fingerprint.mode));
 		}
 		let mut stage = self.inner.blobs.begin_spill()?;
-		let mut buffer = [0_u8; IO_BUFFER_BYTES];
+		let mut buffer = Box::new([0_u8; IO_BUFFER_BYTES]);
 		loop {
 			if cancel.is_cancelled() {
 				return Err(WorkspaceError::Cancelled.into());
 			}
-			let read = source.read(&mut buffer)?;
+			let read = source.read(&mut buffer[..])?;
 			if read == 0 {
 				break;
 			}
@@ -516,9 +516,7 @@ impl WorkspaceOperations {
 			if presence == document_pb::DocumentPresence::Present {
 				let content = read_whole(&self.inner.documents, &lease).await?;
 				let actual = *blake3::hash(&content).as_bytes();
-				let mode = fs::metadata(&path)
-					.map(|metadata| file_mode(&metadata))
-					.unwrap_or(0);
+				let mode = fs::metadata(&path).map_or(0, |metadata| file_mode(&metadata));
 				if actual == entry.hash && mode == entry.mode {
 					continue;
 				}
@@ -718,7 +716,7 @@ impl WorkspaceOperations {
 			if base.entries.get(path) == Some(entry) {
 				continue;
 			}
-			stage.write_all(&[b'M'])?;
+			stage.write_all(b"M")?;
 			write_bytes(&mut stage, path.as_bytes())?;
 			stage.write_all(&entry.mode.to_be_bytes())?;
 			stage.write_all(&entry.hash)?;
@@ -727,7 +725,7 @@ impl WorkspaceOperations {
 			if current.entries.contains_key(path) {
 				continue;
 			}
-			stage.write_all(&[b'D'])?;
+			stage.write_all(b"D")?;
 			write_bytes(&mut stage, path.as_bytes())?;
 		}
 		Ok(BlobId::from(stage.finish().map_err(BlobError::from)?))
@@ -762,7 +760,7 @@ struct ApplyFailure {
 }
 
 impl RestorePlan {
-	fn path(&self) -> &Str {
+	const fn path(&self) -> &Str {
 		match self {
 			Self::Replace { entry, .. } | Self::Create { entry, .. } => &entry.path,
 			Self::Delete { path, .. } => path,
@@ -923,7 +921,7 @@ fn invalid_manifest(error: io::Error) -> WorkspaceOperationError {
 	WorkspaceOperationError::InvalidGeneration(Str::from(error.to_string()))
 }
 
-fn check_manifest_bound(bytes: u64) -> Result<(), WorkspaceOperationError> {
+const fn check_manifest_bound(bytes: u64) -> Result<(), WorkspaceOperationError> {
 	if bytes > MAX_MANIFEST_BYTES {
 		Err(WorkspaceOperationError::InvalidGeneration(Str::new_static(
 			"manifest exceeds size bound",

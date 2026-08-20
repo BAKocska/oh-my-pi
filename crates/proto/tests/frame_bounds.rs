@@ -1,3 +1,6 @@
+//! Validates that protobuf frame limits reject malformed and oversized
+//! payloads.
+
 use omp_proto::bounds::{
 	DECLARATION_MAX_COUNT, FRAME_MAX_BYTES, FrameBoundsError, LENGTH_DELIMITED_MAX_COUNT,
 	PROTOBUF_MAX_DEPTH, PULL_ALIAS_MAX_COUNT, PULL_CHUNK_MAX_BYTES, PULL_EXPECTED_MAX_BYTES,
@@ -332,7 +335,7 @@ fn rejects_tml_bytes_and_depth_before_decode() {
 
 #[test]
 fn ignores_markup_like_text_in_comments_and_attributes() {
-	let source = br#"<!-- <panel><panel> --><panel title='<panel>'></panel>"#;
+	let source = br"<!-- <panel><panel> --><panel title='<panel>'></panel>";
 	validate_worker_frame(&worker_tml(source)).unwrap();
 }
 

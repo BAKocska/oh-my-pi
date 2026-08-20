@@ -714,7 +714,7 @@ async fn py_eval_roundtrip(
 	code: &'static str,
 ) -> WorkerCompletion {
 	let mut invocation =
-		open_committed(&supervisor, py_eval_call(call_id, code, Duration::from_secs(5)))
+		open_committed(supervisor, py_eval_call(call_id, code, Duration::from_secs(5)))
 			.expect("dispatch py_eval");
 	match invocation.next().await.expect("py_eval event") {
 		WorkerEvent::Complete(complete) => {
@@ -751,6 +751,7 @@ fn open_committed(
 		raw,
 		effect_token: Bytes::from_static(b"test-effect-token"),
 		authorized_at_ms: 1,
+		effects: None,
 		props: None,
 	})?;
 	Ok(invocation)
@@ -762,7 +763,7 @@ async fn echo_roundtrip(
 	message: &'static str,
 ) -> (Value, WorkerCompletion) {
 	let mut invocation = open_committed(
-		&supervisor,
+		supervisor,
 		call(
 			call_id,
 			"echo_update",
@@ -796,7 +797,7 @@ async fn stable_roundtrip(
 	message: &'static str,
 ) -> (i32, Option<String>) {
 	let mut invocation = open_committed(
-		&supervisor,
+		supervisor,
 		call(call_id, "stable_echo", json!({ "message": message }), Duration::from_secs(5)),
 	)
 	.expect("dispatch sibling invocation");
@@ -865,11 +866,11 @@ fn test_manifest<const N: usize>(
 fn test_provenance(key: &HostKey) -> Provenance {
 	Provenance::new(
 		Str::new_static("test-publisher"),
-		key.extension.clone(),
+		key.extension().clone(),
 		Str::new_static("1.0.0"),
 		ArtifactDigest::new([0; 32]),
-		key.layer.clone(),
-		key.tier.clone(),
+		key.layer().clone(),
+		key.tier().clone(),
 		1,
 	)
 }

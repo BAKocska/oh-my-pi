@@ -21,7 +21,7 @@ use omp_chat_ui::{
 	SubmitMode,
 	host::{HostExit, HostOptions},
 };
-use omp_core::{Str, fmts};
+use omp_core::{Str, encoding::hex, fmts};
 use omp_llm_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, provider::AuthSpecKind,
 	snapshot::Catalog,
@@ -182,7 +182,8 @@ pub struct ChatUiSession {
 }
 
 enum UiCmd {
-	Submit(Item),
+	/// Boxes the foreign generated protobuf item; one allocation is paid per user submit.
+	Submit(Box<Item>),
 	ListRewind { reply: flume::Sender<Result<Vec<RewindTarget>, String>> },
 	Rewind { to: Option<u64>, reply: flume::Sender<Result<Vec<Item>, String>> },
 }
@@ -267,7 +268,7 @@ where
 			match command {
 				UiCmd::Submit(item) => {
 					let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
-					let ack = match agent.submit([item], turn_id).await {
+					let ack = match agent.submit([*item], turn_id).await {
 						Ok(summary) if summary.interrupted => SubmitAck::Interrupted,
 						Ok(_) => SubmitAck::Done,
 						Err(error) => {
@@ -504,7 +505,10 @@ where
 							.is_ok()
 					} else {
 						state.submit_pending = true;
-						commands_tx.send_async(UiCmd::Submit(item)).await.is_ok()
+						commands_tx
+							.send_async(UiCmd::Submit(Box::new(item)))
+							.await
+							.is_ok()
 					};
 					if delivered {
 						send_backend(backend, BackendEvent::UserReplayed {
@@ -870,7 +874,7 @@ fn handle_agent_event(
 				send_backend(backend, BackendEvent::ToolStarted {
 					id:    call_id.clone(),
 					name:  identity.name.clone(),
-					title: identity.name.clone(),
+					title: identity.name,
 				});
 			}
 			send_tool_result_images(backend, call_id, item);
@@ -1210,12 +1214,7 @@ fn persist_tool_image(blob: &Blob) -> Option<Str> {
 	let name = if blob.hash.is_empty() {
 		format!("omp-tool-image-{}.png", ulid::Ulid::generate())
 	} else {
-		let hex: String = blob
-			.hash
-			.iter()
-			.take(16)
-			.map(|byte| format!("{byte:02x}"))
-			.collect();
+		let hex = hex::encode(&blob.hash[..blob.hash.len().min(16)]).into_string();
 		format!("omp-tool-image-{hex}.png")
 	};
 	let path = std::env::temp_dir().join(name);
@@ -1584,7 +1583,7 @@ mod tests {
 		let mut errors = Vec::new();
 		let chips = lower_attachments(&mut item, vec![attachment], |error| errors.push(error));
 		std::fs::remove_file(path).expect("remove attachment fixture");
-		assert!(errors.is_empty());
+		assert_eq!(errors, [] as [omp_core::Str; 0]);
 		let Some(item::Kind::Message(message)) = item.kind else {
 			panic!("message")
 		};
@@ -1729,8 +1728,7 @@ mod tests {
 			fields: [(TOOL_REV_PROP.to_owned(), omp_proto::inference::v1::Value {
 				kind: Some(value::Kind::String(rev.to_owned())),
 			})]
-			.into_iter()
-			.collect(),
+			.into(),
 		}
 	}
 

@@ -367,7 +367,7 @@ pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> Edit
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: smallvec::smallvec![Str::new_static("**")],
+					write_globs: [Str::new_static("**")].into_iter().collect(),
 				}),
 				exec:      None,
 				inference: None,

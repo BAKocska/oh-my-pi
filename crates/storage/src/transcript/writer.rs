@@ -1,8 +1,13 @@
 //! Append-only transcript file writer.
+//!
+//! Error paths summarize affected physical indexes as [`IndexRun`] because
+//! appends assign consecutive indexes in write order.
 
 use std::{
 	fs::{File, OpenOptions},
 	io::{Seek, SeekFrom, Write},
+	mem::size_of,
+	ops::RangeInclusive,
 	path::Path,
 };
 
@@ -17,6 +22,71 @@ use super::{
 
 /// Maximum number of events in one atomic transcript append.
 pub const MAX_ATOMIC_ENTRIES: usize = 1_024;
+
+/// A compact contiguous run of physical transcript indexes carried by errors.
+///
+/// Writer failures always identify either a proven prefix or a possibly written
+/// atomic group. Both are contiguous because physical indexes are assigned in
+/// append order, so retaining every index would only duplicate that fact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexRun {
+	first: u64,
+	count: u64,
+}
+
+impl IndexRun {
+	/// Creates a run from contiguous physical indexes.
+	///
+	/// Debug builds assert that every adjacent pair is consecutive. An empty
+	/// slice produces an empty run.
+	#[must_use]
+	pub fn from_contiguous(indexes: &[u64]) -> Self {
+		debug_assert!(indexes.windows(2).all(|pair| {
+			pair[0].checked_add(1).is_some_and(|next| pair[1] == next)
+		}));
+		Self {
+			first: indexes.first().copied().unwrap_or_default(),
+			count: u64::try_from(indexes.len()).expect("index count fits in u64"),
+		}
+	}
+
+	/// Returns the first physical index, if this run is non-empty.
+	#[must_use]
+	pub const fn first(self) -> Option<u64> {
+		if self.count == 0 { None } else { Some(self.first) }
+	}
+
+	/// Returns the number of physical indexes in this run.
+	#[must_use]
+	pub fn len(self) -> usize {
+		usize::try_from(self.count).expect("index count fits in usize")
+	}
+
+	/// Returns whether this run contains no physical indexes.
+	#[must_use]
+	pub const fn is_empty(self) -> bool {
+		self.count == 0
+	}
+}
+
+impl IntoIterator for IndexRun {
+	type IntoIter = RangeInclusive<u64>;
+	type Item = u64;
+
+	/// Iterates over every physical index in the run.
+	fn into_iter(self) -> Self::IntoIter {
+		match self.count {
+			0 => 1..=0,
+			count => {
+				let last = self
+					.first
+					.checked_add(count - 1)
+					.expect("contiguous index run must not overflow");
+				self.first..=last
+			},
+		}
+	}
+}
 
 /// A transcript writer that owns the single header and appends event lines.
 pub struct Writer {
@@ -40,11 +110,11 @@ impl AppendTarget for File {
 	fn rollback_to(&mut self, len: u64) -> std::io::Result<()> {
 		self.set_len(len)?;
 		self.seek(SeekFrom::Start(len))?;
-		File::sync_data(self)
+		Self::sync_data(self)
 	}
 
 	fn sync_data(&mut self) -> std::io::Result<()> {
-		File::sync_data(self)
+		Self::sync_data(self)
 	}
 }
 
@@ -79,7 +149,7 @@ pub struct JournalIndeterminate {
 	#[source]
 	pub source:   Error,
 	/// Physical indexes whose bytes may have been written.
-	pub written:  SmallVec<u64, 8>,
+	pub written:  IndexRun,
 	/// Whether the single-owner writer refuses subsequent appends.
 	pub poisoned: bool,
 }
@@ -96,8 +166,12 @@ pub struct AppendManyError {
 	#[source]
 	pub source:   JournalError,
 	/// Physical indexes proven to remain appended by this operation.
-	pub appended: SmallVec<u64, 8>,
+	pub appended: IndexRun,
 }
+
+const _: () = assert!(size_of::<IndexRun>() == 16, "IndexRun must stay compact");
+const _: () = assert!(size_of::<JournalError>() <= 64, "JournalError must stay compact");
+const _: () = assert!(size_of::<AppendManyError>() <= 80, "AppendManyError must stay compact");
 
 fn rollback_error(
 	target: &mut impl AppendTarget,
@@ -148,7 +222,7 @@ fn halted_error() -> JournalError {
 		source:   Error::Io(std::io::Error::other(
 			"transcript writer is halted after an indeterminate append",
 		)),
-		written:  SmallVec::new(),
+		written:  IndexRun::default(),
 		poisoned: true,
 	}
 	.into()
@@ -271,11 +345,14 @@ impl Writer {
 	/// reports those physical indexes in [`AppendManyError::appended`].
 	pub fn append_many(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, AppendManyError> {
 		if self.poisoned {
-			return Err(AppendManyError { source: halted_error(), appended: SmallVec::new() });
+			return Err(AppendManyError {
+				source:   halted_error(),
+				appended: IndexRun::default(),
+			});
 		}
 		let ends = self.stage(events).map_err(|source| AppendManyError {
 			source:   JournalError::RolledBack { source },
-			appended: SmallVec::new(),
+			appended: IndexRun::default(),
 		})?;
 		if ends.is_empty() {
 			return Ok(SmallVec::new());
@@ -283,7 +360,7 @@ impl Writer {
 
 		let original_len = self.file.append_len().map_err(|source| AppendManyError {
 			source:   JournalError::RolledBack { source: Error::Io(source) },
-			appended: SmallVec::new(),
+			appended: IndexRun::default(),
 		})?;
 		let first_index = self.next_index;
 		let mut indexes = SmallVec::with_capacity(ends.len());
@@ -293,18 +370,16 @@ impl Writer {
 			let line_start = match self.file.append_len() {
 				Ok(line_start) => line_start,
 				Err(error) => {
-					let mut appended = indexes;
-					let source = if appended.is_empty() {
-						JournalError::RolledBack { source: Error::Io(error) }
+					let appended = IndexRun::from_contiguous(&indexes);
+					let (source, appended) = if appended.is_empty() {
+						(JournalError::RolledBack { source: Error::Io(error) }, appended)
 					} else {
 						match self.file.sync_data() {
-							Ok(()) => JournalError::RolledBack { source: Error::Io(error) },
+							Ok(()) => (JournalError::RolledBack { source: Error::Io(error) }, appended),
 							Err(write) => {
 								self.next_index = first_index;
 								let rollback = rollback_error(&mut self.file, original_len, write);
-								let source = self.classify(rollback, appended.clone());
-								appended.clear();
-								source
+								(self.classify(rollback, appended), IndexRun::default())
 							},
 						}
 					};
@@ -325,9 +400,9 @@ impl Writer {
 
 		if let Err(source) = commit(&mut self.file, original_len) {
 			self.next_index = first_index;
-			let source = self.classify(source, indexes.clone());
+			let source = self.classify(source, IndexRun::from_contiguous(&indexes));
 			self.line.clear();
-			return Err(AppendManyError { source, appended: SmallVec::new() });
+			return Err(AppendManyError { source, appended: IndexRun::default() });
 		}
 		self.line.clear();
 		Ok(indexes)
@@ -374,7 +449,7 @@ impl Writer {
 					.saturating_add(u64::try_from(events.len()).expect("event count fits in u64"));
 				Ok(indexes)
 			},
-			Err(source) => Err(self.classify(source, indexes)),
+			Err(source) => Err(self.classify(source, IndexRun::from_contiguous(&indexes))),
 		}
 	}
 
@@ -409,7 +484,7 @@ impl Writer {
 		Ok(ends)
 	}
 
-	fn classify(&mut self, source: Error, written: SmallVec<u64, 8>) -> JournalError {
+	fn classify(&mut self, source: Error, written: IndexRun) -> JournalError {
 		if matches!(source, Error::AppendRollback { .. }) {
 			self.poisoned = true;
 			JournalIndeterminate { source, written, poisoned: true }.into()
@@ -425,14 +500,28 @@ impl Writer {
 		failed_index: u64,
 	) -> AppendManyError {
 		if matches!(source, Error::AppendRollback { .. }) {
-			let mut written = indexes.clone();
-			written.push(failed_index);
 			return AppendManyError {
-				source:   self.classify(source, written),
-				appended: SmallVec::new(),
+				source:   self.classify(source, run_including_next(indexes, failed_index)),
+				appended: IndexRun::default(),
 			};
 		}
-		AppendManyError { source: JournalError::RolledBack { source }, appended: indexes.clone() }
+		AppendManyError {
+			source:   JournalError::RolledBack { source },
+			appended: IndexRun::from_contiguous(indexes),
+		}
+	}
+}
+
+fn run_including_next(indexes: &[u64], next: u64) -> IndexRun {
+	let prefix = IndexRun::from_contiguous(indexes);
+	debug_assert!(prefix.first().is_none_or(|first| {
+		first
+			.checked_add(u64::try_from(prefix.len()).expect("index count fits in u64"))
+			.is_some_and(|expected| next == expected)
+	}));
+	IndexRun {
+		first: prefix.first().unwrap_or(next),
+		count: prefix.count.checked_add(1).expect("index count fits in u64"),
 	}
 }
 
@@ -444,7 +533,7 @@ mod tests {
 	use smallvec::SmallVec;
 	use tempfile::tempdir;
 
-	use super::{AppendTarget, Error, JournalError, Writer, append_all, commit};
+	use super::{AppendTarget, Error, IndexRun, JournalError, Writer, append_all, commit};
 
 	struct FaultTarget {
 		bytes:         Vec<u8>,
@@ -496,7 +585,7 @@ mod tests {
 			self.syncs += 1;
 			if self.sync_failures > 0 {
 				self.sync_failures -= 1;
-				return Err(io::Error::new(io::ErrorKind::Other, "injected sync failure"));
+				return Err(io::Error::other("injected sync failure"));
 			}
 			Ok(())
 		}
@@ -510,6 +599,16 @@ mod tests {
 			sync_failures: 0,
 			syncs:         0,
 		}
+	}
+
+	#[test]
+	fn index_run_preserves_contiguous_indexes() {
+		let run = IndexRun::from_contiguous(&[7, 8, 9]);
+		assert_eq!(run.first(), Some(7));
+		assert_eq!(run.len(), 3);
+		assert!(!run.is_empty());
+		assert_eq!(run.into_iter().collect::<Vec<_>>(), [7, 8, 9]);
+		assert!(IndexRun::from_contiguous(&[]).is_empty());
 	}
 
 	#[test]
@@ -579,13 +678,13 @@ mod tests {
 				write:    io::Error::new(io::ErrorKind::StorageFull, "injected write failure"),
 				rollback: io::Error::new(io::ErrorKind::PermissionDenied, "injected rollback failure"),
 			},
-			SmallVec::from_iter([7]),
+			IndexRun::from_contiguous(&[7]),
 		);
 
 		assert!(matches!(
 			&failure,
 			JournalError::Indeterminate(state)
-				if state.written.as_slice() == [7] && state.poisoned
+				if state.written.into_iter().eq([7]) && state.poisoned
 		));
 		assert!(writer.is_poisoned());
 		assert!(matches!(

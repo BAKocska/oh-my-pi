@@ -298,70 +298,68 @@ impl Drop for PullSlot<'_> {
 	}
 }
 
-impl<'c> IncomingCursor<'c> {
+impl IncomingCursor<'_> {
 	/// Pulls one declared path while enforcing the invocation's single
 	/// outstanding host slot.
-	pub fn pull_at<'a>(
+	pub async fn pull_at<'a>(
 		&'a self,
 		path: &'a [ArgPath],
 		mode: PullMode,
 		expected: &'static str,
-	) -> impl Future<Output = Result<Pulled, ParamError>> + 'a {
-		async move {
-			if self
-				.state
-				.active
-				.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-				.is_err()
-			{
-				return Err(ParamError::Protocol(Str::from("concurrent pull")));
-			}
-			let _slot = PullSlot(&self.state.active);
-			let declaration = self
-				.rev
-				.zip(self.arg_specs)
-				.and_then(|(rev, specs)| specs.get_with_id(rev, path));
-			let slop_path = declared_pull_path(path, self.rev.zip(self.arg_specs));
-			let mode = match mode {
-				PullMode::Chunk(_) | PullMode::Line(_) => {
-					let (path_id, _) = declaration.ok_or_else(|| {
-						ParamError::Protocol(Str::from("chunk pull requires a declared path"))
-					})?;
-					let emitted = self
-						.state
-						.chunks
-						.lock()
-						.as_ref()
-						.and_then(|chunks| chunks.get(path_id))
-						.copied()
-						.unwrap_or(0);
-					if matches!(mode, PullMode::Line(_)) {
-						PullMode::Line(emitted)
-					} else {
-						PullMode::Chunk(emitted)
-					}
-				},
-				other => other,
-			};
-			let mut pulled = self
-				.inner
-				.pull_at(&slop_path, mode, expected)
-				.await
-				.map_err(|error| param_error(error, self.rev.zip(self.arg_specs)))?;
-			if let PulledKind::Complete(value) = &mut pulled.kind
-				&& let Some((_, spec)) = declaration
-			{
-				let _ = apply_coercions(value, spec);
-			}
-			if let PulledKind::Chunk { value, .. } = &pulled.kind {
-				let (path_id, _) = declaration.expect("chunk mode requires a declaration");
-				let mut chunks = self.state.chunks.lock();
-				let offsets = chunks.get_or_insert_with(SparseMap::new);
-				let emitted = offsets.get(path_id).copied().unwrap_or(0);
-				offsets.insert(path_id, emitted.saturating_add(value.len()));
-			}
-			Ok(pulled)
+	) -> Result<Pulled, ParamError> {
+		if self
+			.state
+			.active
+			.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+			.is_err()
+		{
+			return Err(ParamError::Protocol(Str::from("concurrent pull")));
 		}
+		let _slot = PullSlot(&self.state.active);
+		let declaration = self
+			.rev
+			.zip(self.arg_specs)
+			.and_then(|(rev, specs)| specs.get_with_id(rev, path));
+		let slop_path = declared_pull_path(path, self.rev.zip(self.arg_specs));
+		let mode = match mode {
+			PullMode::Chunk(_) | PullMode::Line(_) => {
+				let (path_id, _) = declaration.ok_or_else(|| {
+					ParamError::Protocol(Str::from("chunk pull requires a declared path"))
+				})?;
+				let emitted = self
+					.state
+					.chunks
+					.lock()
+					.as_ref()
+					.and_then(|chunks| chunks.get(path_id))
+					.copied()
+					.unwrap_or(0);
+				if matches!(mode, PullMode::Line(_)) {
+					PullMode::Line(emitted)
+				} else {
+					PullMode::Chunk(emitted)
+				}
+			},
+			other => other,
+		};
+		let mut pulled = self
+			.inner
+			.pull_at(&slop_path, mode, expected)
+			.await
+			.map_err(|error| param_error(error, self.rev.zip(self.arg_specs)))?;
+		if let PulledKind::Complete(value) = &mut pulled.kind
+			&& let Some((_, spec)) = declaration
+		{
+			let _ = apply_coercions(value, spec);
+		}
+		if let PulledKind::Chunk { value, .. } = &pulled.kind {
+			let (path_id, _) = declaration.expect("chunk mode requires a declaration");
+			let mut chunks = self.state.chunks.lock();
+			let offsets = chunks.get_or_insert_with(SparseMap::new);
+			let emitted = offsets.get(path_id).copied().unwrap_or(0);
+			offsets.insert(path_id, emitted.saturating_add(value.len()));
+		}
+		Ok(pulled)
 	}
 
 	/// Copies one exact raw source span returned by [`pull_at`](Self::pull_at).
@@ -402,6 +400,11 @@ fn declared_pull_path(
 		.collect()
 }
 
+enum CoercionResult {
+	Value(Value),
+	Elided,
+}
+
 struct AppliedCoercions {
 	steps:  SmallVec<(crate::Coerce, Str, Str), 2>,
 	elided: bool,
@@ -411,16 +414,16 @@ fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions
 	let mut applied = AppliedCoercions { steps: SmallVec::new(), elided: false };
 	for coercion in &spec.coerce {
 		let before = Str::from(value.to_string());
-		let Some(next) = coerce_once(*coercion, value) else {
+		let Some(result) = coerce_once(*coercion, value) else {
 			continue;
 		};
-		match next {
-			Some(next) => {
+		match result {
+			CoercionResult::Value(next) => {
 				let after = Str::from(next.to_string());
 				*value = next;
 				applied.steps.push((*coercion, before, after));
 			},
-			None => {
+			CoercionResult::Elided => {
 				applied.elided = true;
 				applied
 					.steps
@@ -432,17 +435,21 @@ fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions
 	applied
 }
 
-fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<Option<Value>> {
+fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<CoercionResult> {
 	use crate::Coerce;
 	match coercion {
 		Coerce::LooseBool => match value {
 			Value::String(value) => match value.as_str() {
-				"true" | "yes" | "1" => Some(Some(Value::Bool(true))),
-				"false" | "no" | "0" => Some(Some(Value::Bool(false))),
+				"true" | "yes" | "1" => Some(CoercionResult::Value(Value::Bool(true))),
+				"false" | "no" | "0" => Some(CoercionResult::Value(Value::Bool(false))),
 				_ => None,
 			},
-			Value::Number(number) if number.as_i64() == Some(1) => Some(Some(Value::Bool(true))),
-			Value::Number(number) if number.as_i64() == Some(0) => Some(Some(Value::Bool(false))),
+			Value::Number(number) if number.as_i64() == Some(1) => {
+				Some(CoercionResult::Value(Value::Bool(true)))
+			},
+			Value::Number(number) if number.as_i64() == Some(0) => {
+				Some(CoercionResult::Value(Value::Bool(false)))
+			},
 			_ => None,
 		},
 		Coerce::Integer => match value {
@@ -451,11 +458,11 @@ fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<Option<Value>> 
 				.map(Value::from)
 				.or_else(|_| value.parse::<u64>().map(Value::from))
 				.ok()
-				.map(Some),
+				.map(CoercionResult::Value),
 			Value::Number(number) if number.is_f64() => {
 				let number = number.as_f64();
 				(number.fract() == 0.0 && number >= i64::MIN as f64 && number < -(i64::MIN as f64))
-					.then(|| Some(Value::from(number as i64)))
+					.then(|| CoercionResult::Value(Value::from(number as i64)))
 			},
 			_ => None,
 		},
@@ -465,42 +472,44 @@ fn coerce_once(coercion: crate::Coerce, value: &Value) -> Option<Option<Value>> 
 				.ok()
 				.and_then(omp_slopjson::Number::from_f64)
 				.map(Value::from)
-				.map(Some),
+				.map(CoercionResult::Value),
 			_ => None,
 		},
 		Coerce::String => match value {
 			Value::Number(_) | Value::Bool(_) | Value::Null => {
-				Some(Some(Value::String(Str::from(value.to_string()))))
+				Some(CoercionResult::Value(Value::String(Str::from(value.to_string()))))
 			},
 			_ => None,
 		},
 		Coerce::Singleton if !matches!(value, Value::Array(_)) => {
-			Some(Some(Value::Array(vec![value.clone()])))
+			Some(CoercionResult::Value(Value::Array(vec![value.clone()])))
 		},
 		Coerce::Singleton => None,
 		Coerce::JsonString => match value {
-			Value::String(value) => omp_slopjson::parse(value).ok().map(Some),
+			Value::String(value) => omp_slopjson::parse(value).ok().map(CoercionResult::Value),
 			_ => None,
 		},
 		Coerce::Strip => match value {
 			Value::String(value) => {
 				let trimmed = value.trim();
-				(trimmed.len() != value.len()).then(|| Some(Value::String(Str::from(trimmed))))
+				(trimmed.len() != value.len()).then(|| CoercionResult::Value(Value::String(trimmed)))
 			},
 			_ => None,
 		},
 		Coerce::Csv => match value {
-			Value::String(value) if value.contains(',') => Some(Some(Value::Array(
+			Value::String(value) if value.contains(',') => Some(CoercionResult::Value(Value::Array(
 				value
 					.split(",")
-					.map(|item| Value::String(Str::from(item.trim())))
+					.map(|item| Value::String(item.trim()))
 					.collect(),
 			))),
 			_ => None,
 		},
 		Coerce::NullElision => match value {
-			Value::Null => Some(None),
-			Value::String(value) if value.is_empty() || value == "null" => Some(None),
+			Value::Null => Some(CoercionResult::Elided),
+			Value::String(value) if value.is_empty() || value == "null" => {
+				Some(CoercionResult::Elided)
+			},
 			_ => None,
 		},
 	}
@@ -1065,7 +1074,8 @@ impl<'c> IncomingParams<'c> {
 		let Some(direct) = self.direct.as_ref() else {
 			return Ok(());
 		};
-		if let Some(problem) = direct.state.lock().protocol.clone() {
+		let problem = { direct.state.lock().protocol.clone() };
+		if let Some(problem) = problem {
 			self.protocol = Some(problem.clone());
 			return Err(problem);
 		}

@@ -1,4 +1,4 @@
-//! Synthetic PowerPoint 97-2003 conversion fixtures.
+//! Synthetic `PowerPoint` 97-2003 conversion fixtures.
 
 use std::path::Path;
 
@@ -258,6 +258,6 @@ fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
 	bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
-fn sector_offset(sector: usize) -> usize {
+const fn sector_offset(sector: usize) -> usize {
 	SECTOR_LEN + sector * SECTOR_LEN
 }

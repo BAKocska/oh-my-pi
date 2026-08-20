@@ -915,13 +915,11 @@ fn spawn_reader<R: Read + Send + 'static>(
 			sequencer.next += 1;
 			let event = ExecEvent::Output(frame);
 			let _ = sequencer.events.send(event.clone());
-			if let Some(process) = sequencer
-				.control
-				.retained
-				.lock()
-				.as_ref()
-				.and_then(Weak::upgrade)
-			{
+			let process = {
+				let retained = sequencer.control.retained.lock();
+				retained.as_ref().and_then(Weak::upgrade)
+			};
+			if let Some(process) = process {
 				route_named_event(&process, event);
 			}
 		}

@@ -143,9 +143,8 @@ impl WorkspaceLeaseTable {
 				}
 			}
 			for (mutating, (mutation_owner, _)) in &state.mutations {
-				if (path.starts_with(mutating) || mutating.starts_with(path))
-					&& *mutation_owner != owner
-				{
+				let overlaps = path.starts_with(mutating) || mutating.starts_with(path);
+				if overlaps && *mutation_owner != owner {
 					return Err(crate::Error::InvalidTarget {
 						target: Str::new(path.to_string_lossy()),
 						reason: Str::new_static("path has an in-flight workspace mutation"),

@@ -274,6 +274,46 @@ other.
   hex/base64 crate. This one has no exception: external encoding crates
   are banned outright.
 
+### Type Size Discipline (CRITICAL)
+`clippy::result_large_err`, `large_enum_variant`, `large_stack_arrays`, and
+`large_futures` report a *measurement*: some type of ours is fat. They are
+not requests to add a pointer.
+
+- **Boxing to silence a size lint is PROHIBITED** and a reviewer-reject:
+  `Err(Box<MyError>)`, `Variant(Box<MyPayload>)`, `Box<SmallVec<..>>`,
+  `field: Box<MyStruct>`, a fresh wrapper struct that exists only to be
+  boxed, and `#[allow(clippy::result_large_err, reason = "…")]` are all the
+  same defect: the fat type survives, every construction site pays an
+  allocation, and the error path is now the only path that heap-allocates.
+  Same verdict for `Box::new([0u8; N])` when the buffer wants to be a
+  right-sized `Vec`/`BytesMut` instead.
+- **Fix the type.** Measure first (`size_of`), find the fat field, shrink
+  that field. Recurring causes and their fixes:
+  - `SmallVec<T, N>` inline capacity in a cold or cloned type — 4 × `Str`
+    is 136 bytes. Cold and cloned → `Arc<[T]>` (16 bytes, O(1) clone);
+    cold and uniquely owned → `Box<[T]>`. Inline capacity is for hot,
+    short-lived, usually-small collections, not for declarations,
+    identities, or diagnostics.
+  - A set of values that is *always* a contiguous run (physical indexes,
+    sequence ranges) → a two-field run/range struct, not a collection.
+  - An identity struct of several `Str`s cloned into maps, messages, and
+    errors → one `Arc`-backed handle with accessors (8 bytes, O(1) clone,
+    forwarded `Eq`/`Ord`/`Hash`), not N inline `Str`s per copy.
+  - Fields derivable from a sibling field, or duplicated between an error
+    and its source → delete them.
+  - An error variant that carries a whole domain aggregate for a
+    `{:?}` in its message → carry the identifying facts it actually names.
+- **Foreign fat types are the one exception.** A generated prost message,
+  a provider payload, or another crate's struct that we cannot shrink may
+  be boxed — but box that ONE field, never our own error or enum around
+  it, and say why in a comment on the field.
+- **Pin the win.** A type that was shrunk on purpose gets a compile-time
+  guard beside it, so the regression is a build failure and not a later
+  lint:
+  ```rust
+  const _: () = assert!(size_of::<Effects>() <= 96, "Effects must stay compact");
+  ```
+
 ### Async, Iterator & Codegen Discipline (CRITICAL)
 House rules, proven in a sibling codebase (tetra). Not suggestions.
 

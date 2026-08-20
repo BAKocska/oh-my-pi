@@ -1,6 +1,6 @@
 //! Pi-compatible workspace path matching with mtime-ranked grouped output.
 
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use async_stream::stream;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
@@ -30,6 +30,10 @@ const fn default_true() -> bool {
 	true
 }
 
+#[expect(
+	clippy::trivially_copy_pass_by_ref,
+	reason = "schemars skip_serializing_if predicates receive field references"
+)]
 const fn is_true(value: &bool) -> bool {
 	*value
 }
@@ -249,7 +253,7 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: smallvec::SmallVec::new(),
+					write_globs: Arc::default(),
 				}),
 				exec:      None,
 				inference: None,

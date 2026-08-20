@@ -1,6 +1,6 @@
 //! Revision-keyed, synchronous tool renderer folds.
 
-use std::{any::Any, collections::BTreeMap};
+use std::{any::Any, collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -37,7 +37,7 @@ pub trait Render: Send + Sync + 'static {
 /// accumulator on the first fold.
 #[derive(Default)]
 pub struct ViewState {
-	identity: Option<ToolIdentity>,
+	identity: Option<Arc<ToolIdentity>>,
 	fold:     FoldState,
 }
 
@@ -62,12 +62,12 @@ impl ViewState {
 	/// Borrows the exact identity bound by the first fold or view.
 	#[must_use]
 	pub fn identity(&self) -> Option<&ToolIdentity> {
-		self.identity.as_ref()
+		self.identity.as_deref()
 	}
 
 	/// Returns the number of raw updates retained for a generic fallback.
 	#[must_use]
-	pub fn raw_update_count(&self) -> usize {
+	pub const fn raw_update_count(&self) -> usize {
 		match &self.fold {
 			FoldState::Updates(updates) => updates.len(),
 			FoldState::Reduced(_) => 0,
@@ -76,13 +76,13 @@ impl ViewState {
 
 	fn bind(&mut self, identity: &ToolIdentity) -> Result<(), RenderRegistryError> {
 		match &self.identity {
-			Some(bound) if bound != identity => Err(RenderRegistryError::StateIdentity {
+			Some(bound) if bound.as_ref() != identity => Err(RenderRegistryError::StateIdentity {
 				bound:     bound.clone(),
 				requested: identity.clone(),
 			}),
 			Some(_) => Ok(()),
 			None => {
-				self.identity = Some(identity.clone());
+				self.identity = Some(Arc::new(identity.clone()));
 				Ok(())
 			},
 		}
@@ -90,7 +90,7 @@ impl ViewState {
 
 	fn check(&self, identity: &ToolIdentity) -> Result<(), RenderRegistryError> {
 		match &self.identity {
-			Some(bound) if bound != identity => Err(RenderRegistryError::StateIdentity {
+			Some(bound) if bound.as_ref() != identity => Err(RenderRegistryError::StateIdentity {
 				bound:     bound.clone(),
 				requested: identity.clone(),
 			}),
@@ -109,7 +109,7 @@ pub enum RenderRegistryError {
 	#[error("render state for {bound:?} cannot be dispatched as {requested:?}")]
 	StateIdentity {
 		/// Identity which first bound the state.
-		bound:     ToolIdentity,
+		bound:     Arc<ToolIdentity>,
 		/// Identity requested by the caller.
 		requested: ToolIdentity,
 	},
@@ -141,6 +141,11 @@ pub enum RenderRegistryError {
 		source:   std::str::Utf8Error,
 	},
 }
+
+const _: () = assert!(
+	std::mem::size_of::<RenderRegistryError>() <= 128,
+	"RenderRegistryError must stay compact"
+);
 
 trait ErasedRender: Send + Sync {
 	fn initial(&self) -> Box<dyn Any + Send + Sync>;
@@ -200,7 +205,7 @@ impl<R: Render> ErasedRender for RegisteredRender<R> {
 /// Borrowed, cached exact-revision renderer lookup.
 #[derive(Clone, Copy)]
 pub struct RenderEntry<'a> {
-	identity: &'a ToolIdentity,
+	identity: &'a Arc<ToolIdentity>,
 	render:   &'a dyn ErasedRender,
 }
 
@@ -215,13 +220,15 @@ impl RenderEntry<'_> {
 	pub fn fold(self, state: &mut ViewState, update: &[u8]) -> Result<(), RenderRegistryError> {
 		state.bind(self.identity)?;
 		match &mut state.fold {
-			FoldState::Reduced(reduced) => self.render.fold(self.identity, reduced.as_mut(), update),
+			FoldState::Reduced(reduced) => {
+				self.render.fold(self.identity.as_ref(), reduced.as_mut(), update)
+			},
 			FoldState::Updates(updates) => {
 				let mut reduced = self.render.initial();
 				for prior in updates.iter() {
-					self.render.fold(self.identity, reduced.as_mut(), prior)?;
+					self.render.fold(self.identity.as_ref(), reduced.as_mut(), prior)?;
 				}
-				self.render.fold(self.identity, reduced.as_mut(), update)?;
+				self.render.fold(self.identity.as_ref(), reduced.as_mut(), update)?;
 				state.fold = FoldState::Reduced(reduced);
 				Ok(())
 			},
@@ -236,13 +243,15 @@ impl RenderEntry<'_> {
 	) -> Result<Option<Str>, RenderRegistryError> {
 		state.check(self.identity)?;
 		match &state.fold {
-			FoldState::Reduced(reduced) => self.render.view(self.identity, reduced.as_ref(), outcome),
+			FoldState::Reduced(reduced) => {
+				self.render.view(self.identity.as_ref(), reduced.as_ref(), outcome)
+			},
 			FoldState::Updates(updates) => {
 				let mut reduced = self.render.initial();
 				for update in updates {
-					self.render.fold(self.identity, reduced.as_mut(), update)?;
+					self.render.fold(self.identity.as_ref(), reduced.as_mut(), update)?;
 				}
-				self.render.view(self.identity, reduced.as_ref(), outcome)
+				self.render.view(self.identity.as_ref(), reduced.as_ref(), outcome)
 			},
 		}
 	}
@@ -251,7 +260,7 @@ impl RenderEntry<'_> {
 /// Immutable-by-key registry of exact-revision renderer folds.
 #[derive(Default)]
 pub struct RenderRegistry {
-	entries: BTreeMap<ToolIdentity, Box<dyn ErasedRender>>,
+	entries: BTreeMap<Arc<ToolIdentity>, Box<dyn ErasedRender>>,
 }
 
 impl RenderRegistry {
@@ -267,12 +276,11 @@ impl RenderRegistry {
 		identity: ToolIdentity,
 		render: R,
 	) -> Result<(), RenderRegistryError> {
+		let identity = Arc::new(identity);
 		if self.entries.contains_key(&identity) {
-			return Err(RenderRegistryError::Duplicate(identity));
+			return Err(RenderRegistryError::Duplicate((*identity).clone()));
 		}
-		self
-			.entries
-			.insert(identity, Box::new(RegisteredRender(render)));
+		self.entries.insert(identity, Box::new(RegisteredRender(render)));
 		Ok(())
 	}
 
@@ -291,20 +299,19 @@ impl RenderRegistry {
 		state: &mut ViewState,
 		update: Bytes,
 	) -> Result<(), RenderRegistryError> {
-		state.bind(identity)?;
 		if let Some(entry) = self.get(identity) {
-			entry.fold(state, &update)
-		} else {
-			match &mut state.fold {
-				FoldState::Updates(updates) => {
-					if updates.len() == 4 {
-						let _ = updates.remove(0);
-					}
-					updates.push(update);
-					Ok(())
-				},
-				FoldState::Reduced(_) => Err(RenderRegistryError::StateType(identity.clone())),
-			}
+			return entry.fold(state, &update);
+		}
+		state.bind(identity)?;
+		match &mut state.fold {
+			FoldState::Updates(updates) => {
+				if updates.len() == 4 {
+					let _ = updates.remove(0);
+				}
+				updates.push(update);
+				Ok(())
+			},
+			FoldState::Reduced(_) => Err(RenderRegistryError::StateType(identity.clone())),
 		}
 	}
 
@@ -317,14 +324,12 @@ impl RenderRegistry {
 		state: &ViewState,
 		outcome: Option<&[u8]>,
 	) -> Result<Str, RenderRegistryError> {
-		state.check(identity)?;
-		if let Some(rendered) = self
-			.get(identity)
-			.map(|entry| entry.view(state, outcome))
-			.transpose()?
-			.flatten()
-		{
-			return Ok(rendered);
+		if let Some(entry) = self.get(identity) {
+			if let Some(rendered) = entry.view(state, outcome)? {
+				return Ok(rendered);
+			}
+		} else {
+			state.check(identity)?;
 		}
 		generic_view(identity, state, outcome)
 	}

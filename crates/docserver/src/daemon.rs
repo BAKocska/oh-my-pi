@@ -431,7 +431,7 @@ async fn serve_socket_until(
 	validate_socket_location(&path, &root)?;
 	let (listener, socket) = bind_socket(path).await?;
 	let mut connections = JoinSet::new();
-	publish_connection_count(&connection_gauge, 0);
+	publish_connection_count(connection_gauge.as_ref(), 0);
 
 	loop {
 		tokio::select! {
@@ -476,12 +476,12 @@ async fn serve_socket_until(
 					)
 					.await
 				});
-				publish_connection_count(&connection_gauge, connections.len());
+				publish_connection_count(connection_gauge.as_ref(), connections.len());
 			},
 			completed = connections.join_next(), if !connections.is_empty() => {
 				if let Some(completed) = completed {
 					report_connection(completed);
-					publish_connection_count(&connection_gauge, connections.len());
+					publish_connection_count(connection_gauge.as_ref(), connections.len());
 				}
 			},
 		}
@@ -491,12 +491,12 @@ async fn serve_socket_until(
 	let drain = async {
 		while let Some(completed) = connections.join_next().await {
 			report_connection(completed);
-			publish_connection_count(&connection_gauge, connections.len());
+			publish_connection_count(connection_gauge.as_ref(), connections.len());
 		}
 	};
 	if timeout(SHUTDOWN_GRACE, drain).await.is_err() {
 		connections.shutdown().await;
-		publish_connection_count(&connection_gauge, 0);
+		publish_connection_count(connection_gauge.as_ref(), 0);
 	}
 	drop(socket);
 	Ok(())
@@ -522,7 +522,7 @@ async fn serve_socket_until(
 }
 
 #[cfg(unix)]
-fn publish_connection_count(gauge: &Option<tokio::sync::watch::Sender<usize>>, count: usize) {
+fn publish_connection_count(gauge: Option<&tokio::sync::watch::Sender<usize>>, count: usize) {
 	if let Some(gauge) = gauge {
 		gauge.send_replace(count);
 	}

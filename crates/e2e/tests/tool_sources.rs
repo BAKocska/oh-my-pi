@@ -43,6 +43,7 @@ async fn invoke_ok(
 			Bytes::from(serde_json::to_vec(&args)?),
 			Bytes::from_static(b"tool-sources-test-token"),
 			1000,
+			None,
 		),
 	)
 	.await??;

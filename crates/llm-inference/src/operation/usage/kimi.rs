@@ -406,28 +406,31 @@ mod tests {
 	};
 	#[derive(Clone, Default)]
 	struct Http {
-		r: Arc<Mutex<VecDeque<&'static str>>>,
-		q: Arc<Mutex<Vec<(String, HeaderMap)>>>,
+		responses: Arc<Mutex<VecDeque<&'static str>>>,
+		requests:  Arc<Mutex<Vec<(String, HeaderMap)>>>,
 	}
 	impl Http {
-		fn new(b: &'static str) -> Self {
-			Self { r: Arc::new(Mutex::new([b].into())), q: Arc::default() }
+		fn new(body: &'static str) -> Self {
+			Self {
+				responses: Arc::new(Mutex::new([body].into())),
+				requests: Arc::default(),
+			}
 		}
 	}
 	impl OAuthHttpClient for Http {
 		fn execute(
 			&self,
-			x: OAuthHttpRequest,
+			request: OAuthHttpRequest,
 		) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
-			let (_, u, h, b) = x.into_parts();
-			assert!(b.is_none());
-			self.q.lock().push((u.to_string(), h));
-			let b = self.r.lock().pop_front().unwrap();
+			let (_, url, headers, body) = request.into_parts();
+			assert!(body.is_none());
+			self.requests.lock().push((url.to_string(), headers));
+			let response_body = self.responses.lock().pop_front().unwrap();
 			async move {
 				Ok(OAuthHttpResponse {
 					status:  200,
 					headers: HeaderMap::new(),
-					body:    SecretString::from(b.to_owned()),
+					body:    SecretString::from(response_body.to_owned()),
 				})
 			}
 			.boxed()
@@ -436,23 +439,28 @@ mod tests {
 	#[tokio::test]
 	async fn reset_fallback_headers_and_canonical_windows() {
 		let body = r#"{"usage":{"limit":"100","used":"28","remaining":"72","resetTime":"2026-07-21T07:43:35.355947Z"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","remaining":"100","resetTime":"2026-07-18T05:43:35.355947Z"}},{"window":{"duration":7,"timeUnit":"TIME_UNIT_DAY"},"detail":{"limit":"100","remaining":"50"}},{"window":{"duration":90,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","remaining":"50"}}]}"#;
-		let h = Arc::new(Http::new(body));
-		let f = KimiUsageFetcher::new(h.clone());
-		let k = SecretString::from(r#"{"accessToken":"token","accountId":"acc-1"}"#.to_owned());
-		let r = f.fetch(Some(&k), SystemTime::now(), None).await.unwrap();
-		assert_eq!(r.account_meta.provider_account_id.as_deref(), Some("acc-1"));
+		let client = Arc::new(Http::new(body));
+		let fetcher = KimiUsageFetcher::new(client.clone());
+		let credentials =
+			SecretString::from(r#"{"accessToken":"token","accountId":"acc-1"}"#.to_owned());
+		let report = fetcher.fetch(Some(&credentials), SystemTime::now(), None).await.unwrap();
+		assert_eq!(report.account_meta.provider_account_id.as_deref(), Some("acc-1"));
 		assert_eq!(
-			r.windows
+			report
+				.windows
 				.iter()
-				.map(|w| w.scope.as_deref())
+				.map(|window| window.scope.as_deref())
 				.collect::<Vec<_>>(),
 			[Some("7d"), Some("5h"), Some("7d"), Some("90m")]
 		);
-		assert_eq!(r.windows[1].duration.unwrap().as_secs(), 18000);
-		assert_eq!(r.windows[1].resets_at, omp_core::parse_rfc3339("2026-07-18T05:43:35.355947Z"));
-		let q = h.q.lock();
-		assert_eq!(q[0].0, "https://api.kimi.com/coding/v1/usages");
-		assert_eq!(q[0].1["authorization"].to_str().unwrap(), "Bearer token");
+		assert_eq!(report.windows[1].duration.unwrap().as_secs(), 18000);
+		assert_eq!(
+			report.windows[1].resets_at,
+			omp_core::parse_rfc3339("2026-07-18T05:43:35.355947Z")
+		);
+		let requests = client.requests.lock();
+		assert_eq!(requests[0].0, "https://api.kimi.com/coding/v1/usages");
+		assert_eq!(requests[0].1["authorization"].to_str().unwrap(), "Bearer token");
 		for name in [
 			"user-agent",
 			"x-msh-platform",
@@ -462,16 +470,19 @@ mod tests {
 			"x-msh-os-version",
 			"x-msh-device-id",
 		] {
-			assert!(q[0].1.contains_key(name), "missing {name}")
+			assert!(requests[0].1.contains_key(name), "missing {name}");
 		}
-		assert_eq!(q[0].1["x-msh-device-id"].as_bytes().len(), 32);
+		assert_eq!(requests[0].1["x-msh-device-id"].as_bytes().len(), 32);
 	}
 	#[tokio::test]
 	async fn explicit_window_reset_is_authoritative() {
 		let body = r#"{"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE","resetTime":"2026-07-18T06:00:00.000Z"},"detail":{"limit":"100","remaining":"40","resetTime":"2026-07-18T05:43:35.355947Z"}}]}"#;
-		let f = KimiUsageFetcher::new(Arc::new(Http::new(body)));
-		let k = SecretString::from("token".to_owned());
-		let r = f.fetch(Some(&k), SystemTime::now(), None).await.unwrap();
-		assert_eq!(r.windows[0].resets_at, omp_core::parse_rfc3339("2026-07-18T06:00:00.000Z"));
+		let fetcher = KimiUsageFetcher::new(Arc::new(Http::new(body)));
+		let credentials = SecretString::from("token".to_owned());
+		let report = fetcher.fetch(Some(&credentials), SystemTime::now(), None).await.unwrap();
+		assert_eq!(
+			report.windows[0].resets_at,
+			omp_core::parse_rfc3339("2026-07-18T06:00:00.000Z")
+		);
 	}
 }

@@ -382,7 +382,7 @@ impl BlobStage {
 		Ok(reference)
 	}
 
-	fn file(&mut self) -> &mut File {
+	const fn file(&mut self) -> &mut File {
 		self.file.as_mut().expect("blob stage file is present")
 	}
 }
@@ -397,15 +397,14 @@ impl Write for BlobStage {
 			},
 		};
 		self.hasher.update(&buffer[..written]);
-		self.size = match u64::try_from(written)
+		self.size = if let Some(size) = u64::try_from(written)
 			.ok()
 			.and_then(|written| self.size.checked_add(written))
 		{
-			Some(size) => size,
-			None => {
-				self.failed = true;
-				return Err(io::Error::other("blob length exceeds u64"));
-			},
+			size
+		} else {
+			self.failed = true;
+			return Err(io::Error::other("blob length exceeds u64"));
 		};
 		Ok(written)
 	}

@@ -1,6 +1,6 @@
 //! Content-addressed env blob storage and hash-only result references.
 
-use std::{future::Future, io, path::Path};
+use std::{io, path::Path};
 
 use bytes::Bytes;
 use omp_core::{Str, encoding::hex};
@@ -231,14 +231,9 @@ impl omp_tool::CallOutcomeSpill for BlobHost {
 		self.begin_spill()
 	}
 
-	fn finish<'a>(
-		&'a self,
-		stage: Self::Stage<'a>,
-	) -> impl Future<Output = Result<omp_tool::BlobRef, Self::Error>> + Send + 'a {
-		async move {
-			let reference = tokio::task::spawn_blocking(move || stage.finish()).await??;
-			Ok(call_outcome_reference(reference))
-		}
+	async fn finish<'a>(&'a self, stage: Self::Stage<'a>) -> Result<omp_tool::BlobRef, Self::Error> {
+		let reference = tokio::task::spawn_blocking(move || stage.finish()).await??;
+		Ok(call_outcome_reference(reference))
 	}
 }
 

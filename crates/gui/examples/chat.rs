@@ -127,7 +127,7 @@ impl Overlay {
 	}
 }
 
-fn picker_event(event: PickerEvent) -> OverlayEvent {
+const fn picker_event(event: PickerEvent) -> OverlayEvent {
 	match event {
 		PickerEvent::Consumed => OverlayEvent::Consumed,
 		PickerEvent::Close => OverlayEvent::Close,
@@ -308,12 +308,8 @@ impl Scene for ChatScene {
 		let Phase::Chat(state) = &mut self.phase else {
 			return Effect::Ignored;
 		};
-		if state.overlay.is_some() {
-			let event = state
-				.overlay
-				.as_mut()
-				.expect("overlay present")
-				.handle_key(key);
+		if let Some(overlay) = state.overlay.as_mut() {
+			let event = overlay.handle_key(key);
 			return self.apply_overlay(event);
 		}
 		if key == Key::Ctrl('b') {

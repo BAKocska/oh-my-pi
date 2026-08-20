@@ -63,16 +63,12 @@ impl DeclarationSet {
 	}
 
 	/// Iterates over tool identities in canonical order.
-	pub fn tools(
-		&self,
-	) -> impl Iterator<Item = &ToolDeclarationKey> + DoubleEndedIterator + ExactSizeIterator {
+	pub fn tools(&self) -> impl DoubleEndedIterator<Item = &ToolDeclarationKey> + ExactSizeIterator {
 		self.tools.iter()
 	}
 
 	/// Iterates over hook identities in canonical order.
-	pub fn hooks(
-		&self,
-	) -> impl Iterator<Item = &HookDeclarationKey> + DoubleEndedIterator + ExactSizeIterator {
+	pub fn hooks(&self) -> impl DoubleEndedIterator<Item = &HookDeclarationKey> + ExactSizeIterator {
 		self.hooks.iter()
 	}
 }
@@ -141,7 +137,7 @@ pub enum ActivationCause {
 }
 
 impl ActivationCause {
-	fn split(self) -> (ActivateReason, Option<RestartReason>) {
+	const fn split(self) -> (ActivateReason, Option<RestartReason>) {
 		match self {
 			Self::FirstReach => (ActivateReason::FirstReach, None),
 			Self::Restart(reason) => (reason.activate_reason(), Some(reason)),
@@ -417,7 +413,7 @@ impl LifecycleMachine {
 	}
 
 	/// Iterates over the resolved import order.
-	pub fn modules(&self) -> impl Iterator<Item = &str> + DoubleEndedIterator + ExactSizeIterator {
+	pub fn modules(&self) -> impl DoubleEndedIterator<Item = &str> + ExactSizeIterator {
 		self.modules.iter().map(Str::as_str)
 	}
 

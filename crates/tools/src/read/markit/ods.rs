@@ -1,4 +1,4 @@
-//! OpenDocument Spreadsheet conversion.
+//! `OpenDocument` Spreadsheet conversion.
 
 use omp_core::Str;
 

@@ -456,7 +456,7 @@ impl AccountPool {
 	/// Blocks one account on exactly one route, leaving every other route
 	/// eligible.
 	///
-	/// Used for provider model-entitlement denials (for example a ChatGPT
+	/// Used for provider model-entitlement denials (for example a `ChatGPT`
 	/// account that lacks one requested Codex model): rotation must reach an
 	/// entitled sibling while the denied account keeps serving the models it is
 	/// entitled to. Process-local by design; the denial is re-observed cheaply.

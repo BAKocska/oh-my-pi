@@ -1,3 +1,5 @@
+//! Integration coverage for the document authority client protocol.
+
 use bytes::{Bytes, BytesMut};
 use omp_docserver::{
 	Environment, ServerConfig,

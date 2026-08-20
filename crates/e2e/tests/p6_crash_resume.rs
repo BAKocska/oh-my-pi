@@ -78,7 +78,7 @@ fn file_write_effects() -> Effects {
 	Effects {
 		documents: Some(DocEffects {
 			read:        false,
-			write_globs: [Str::new_static("**")].into_iter().collect(),
+			write_globs: std::iter::once(Str::new_static("**")).collect(),
 		}),
 		exec:      None,
 		inference: None,
@@ -908,8 +908,8 @@ async fn run_child(stage: &str, root: &Path) {
 		"replay-resume" => Box::pin(replay_child(root, false, true)).await,
 		"receipt-crash" => receipt_child(root, true),
 		"receipt-resume" => receipt_child(root, false),
-		"batch-crash" => batch_child(root, true).await,
-		"batch-resume" => batch_child(root, false).await,
+		"batch-crash" => Box::pin(batch_child(root, true)).await,
+		"batch-resume" => Box::pin(batch_child(root, false)).await,
 		other => panic!("unknown P6 child stage {other}"),
 	}
 }
@@ -1520,7 +1520,7 @@ const fn caps() -> CapsBase {
 	}
 }
 
-fn core_claims() -> Claims {
+const fn core_claims() -> Claims {
 	Claims {
 		precedence: Precedence::CORE,
 		claimant:   Str::new_static("omp/core"),
@@ -1528,7 +1528,7 @@ fn core_claims() -> Claims {
 	}
 }
 
-fn worker_claims() -> Claims {
+const fn worker_claims() -> Claims {
 	Claims {
 		precedence: Precedence::DEFAULT,
 		claimant:   Str::new_static("test/worker"),

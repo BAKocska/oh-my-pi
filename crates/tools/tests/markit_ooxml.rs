@@ -92,7 +92,7 @@ fn xlsm_matches_xlsx_and_ignores_macro_and_external_link_parts() {
 		("xl/vbaProject.bin", "macro payload must not become worksheet text or execute"),
 		(
 			"xl/externalLinks/externalLink1.xml",
-			r#"<externalLink><externalBook><sheetDataSet><sheetData><row><c><v>external secret</v></c></row></sheetData></sheetDataSet></externalBook></externalLink>"#,
+			r"<externalLink><externalBook><sheetDataSet><sheetData><row><c><v>external secret</v></c></row></sheetData></sheetDataSet></externalBook></externalLink>",
 		),
 	]);
 

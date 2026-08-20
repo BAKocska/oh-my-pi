@@ -276,17 +276,17 @@ mod tests {
 	impl OAuthHttpClient for Http {
 		fn execute(
 			&self,
-			r: OAuthHttpRequest,
+			request: OAuthHttpRequest,
 		) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
-			let (_, u, h, b) = r.into_parts();
-			assert!(b.is_none());
-			self.requests.lock().push((u.to_string(), h));
-			let (s, b) = self.responses.lock().pop_front().unwrap();
+			let (_, url, headers, body) = request.into_parts();
+			assert!(body.is_none());
+			self.requests.lock().push((url.to_string(), headers));
+			let (status, response_body) = self.responses.lock().pop_front().unwrap();
 			async move {
 				Ok(OAuthHttpResponse {
-					status:  s,
+					status,
 					headers: HeaderMap::new(),
-					body:    SecretString::from(b.to_owned()),
+					body: SecretString::from(response_body.to_owned()),
 				})
 			}
 			.boxed()

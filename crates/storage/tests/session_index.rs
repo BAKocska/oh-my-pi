@@ -1,3 +1,5 @@
+//! Integration tests for the durable session index.
+
 use std::{
 	io,
 	sync::{
@@ -62,8 +64,7 @@ fn outcome(input: u64, output: u64) -> pb::Outcome {
 				fields: [("anthropic/service_tier".to_owned(), pb::Value {
 					kind: Some(pb::value::Kind::String("standard".to_owned())),
 				})]
-				.into_iter()
-				.collect(),
+				.into(),
 			}),
 			total_tokens:       Some(input + output + 7),
 			context_tokens:     Some(8_192),
@@ -95,7 +96,11 @@ fn outcome(input: u64, output: u64) -> pb::Outcome {
 	}
 }
 
-fn receipt_event<'a>(id: &'a SessionId, outcome: &'a pb::Outcome, ts_ms: u64) -> IndexedEvent<'a> {
+const fn receipt_event<'a>(
+	id: &'a SessionId,
+	outcome: &'a pb::Outcome,
+	ts_ms: u64,
+) -> IndexedEvent<'a> {
 	IndexedEvent {
 		session: id,
 		ts_ms,
@@ -122,12 +127,12 @@ fn failed_journal_header_does_not_publish_a_session_row() {
 		|| Err::<((), u64), _>(io::Error::other("disk full")),
 	);
 	assert!(matches!(result, Err(IndexedWriteError::Journal(_))));
-	assert!(
+	assert_eq!(
 		index
 			.list(&SessionFilter::default())
 			.expect("list index only")
-			.sessions
-			.is_empty()
+			.sessions,
+		[] as [omp_storage::index::SessionInfo; 0]
 	);
 }
 

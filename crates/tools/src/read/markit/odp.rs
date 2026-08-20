@@ -1,4 +1,4 @@
-//! OpenDocument Presentation conversion.
+//! `OpenDocument` Presentation conversion.
 
 use omp_core::Str;
 

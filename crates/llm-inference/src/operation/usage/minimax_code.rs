@@ -350,28 +350,31 @@ mod tests {
 	};
 	#[derive(Clone, Default)]
 	struct Http {
-		r: Arc<Mutex<VecDeque<(u16, &'static str)>>>,
-		q: Arc<Mutex<Vec<(String, HeaderMap)>>>,
+		responses: Arc<Mutex<VecDeque<(u16, &'static str)>>>,
+		requests:  Arc<Mutex<Vec<(String, HeaderMap)>>>,
 	}
 	impl Http {
-		fn new(r: impl IntoIterator<Item = (u16, &'static str)>) -> Self {
-			Self { r: Arc::new(Mutex::new(r.into_iter().collect())), q: Arc::default() }
+		fn new(responses: impl IntoIterator<Item = (u16, &'static str)>) -> Self {
+			Self {
+				responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+				requests:  Arc::default(),
+			}
 		}
 	}
 	impl OAuthHttpClient for Http {
 		fn execute(
 			&self,
-			x: OAuthHttpRequest,
+			request: OAuthHttpRequest,
 		) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
-			let (_, u, h, b) = x.into_parts();
-			assert!(b.is_none());
-			self.q.lock().push((u.to_string(), h));
-			let (s, b) = self.r.lock().pop_front().unwrap();
+			let (_, url, headers, body) = request.into_parts();
+			assert!(body.is_none());
+			self.requests.lock().push((url.to_string(), headers));
+			let (status, response_body) = self.responses.lock().pop_front().unwrap();
 			async move {
 				Ok(OAuthHttpResponse {
-					status:  s,
+					status,
 					headers: HeaderMap::new(),
-					body:    SecretString::from(b.to_owned()),
+					body: SecretString::from(response_body.to_owned()),
 				})
 			}
 			.boxed()
@@ -400,8 +403,8 @@ mod tests {
 		assert_eq!(r.windows[1].amount.consumed.unwrap(), crate::answer::UsageQuantity::new(22, 0));
 		assert_eq!(r.windows[2].notes[0], "Requests: 1/3");
 		assert_eq!(r.windows[3].notes[0], "Requests: 1/21");
-		assert_eq!(h.q.lock()[0].0, "https://api.minimax.io/v1/token_plan/remains");
-		assert_eq!(h.q.lock()[0].1["authorization"].to_str().unwrap(), "Bearer sk-cp-test");
+		assert_eq!(h.requests.lock()[0].0, "https://api.minimax.io/v1/token_plan/remains");
+		assert_eq!(h.requests.lock()[0].1["authorization"].to_str().unwrap(), "Bearer sk-cp-test");
 	}
 	#[tokio::test]
 	async fn region_and_base_routing_are_exact() {
@@ -414,7 +417,7 @@ mod tests {
 			let f = MiniMaxCodeUsageFetcher::with_provider(h.clone(), "minimax-code", base);
 			let k = SecretString::from("k".to_owned());
 			f.fetch(Some(&k), SystemTime::now(), None).await.unwrap();
-			assert_eq!(h.q.lock()[0].0, expected);
+			assert_eq!(h.requests.lock()[0].0, expected);
 		}
 		let f = MiniMaxCodeUsageFetcher::china(Arc::new(Http::default()));
 		assert_eq!(f.provider().as_str(), "minimax-code-cn");
@@ -434,7 +437,7 @@ mod tests {
 					.await
 					.unwrap_err(),
 				UsageFetchError::Unavailable
-			)
+			);
 		}
 		let body = r#"{"model_remains":[{"model_name":"general","start_time":1785009600000,"end_time":1785024000000,"current_interval_remaining_percent":0,"current_interval_status":2,"current_interval_total_count":0,"current_weekly_status":3,"current_weekly_total_count":0}],"base_resp":{"status_code":0}}"#;
 		let f = MiniMaxCodeUsageFetcher::new(Arc::new(Http::new([(200, body)])));

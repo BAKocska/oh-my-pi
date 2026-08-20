@@ -555,7 +555,7 @@ impl ServerConfig {
 
 	/// Returns the build identity advertised to document clients.
 	#[must_use]
-	pub fn server_build(&self) -> &Str {
+	pub const fn server_build(&self) -> &Str {
 		&self.server_build
 	}
 

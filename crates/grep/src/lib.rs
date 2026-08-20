@@ -15,6 +15,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use bytecount::count;
 use grep_matcher::Matcher;
 use grep_pcre2::{RegexMatcher as PcreMatcher, RegexMatcherBuilder as PcreMatcherBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -498,15 +499,14 @@ fn stream_search_slice<S: GrepSink>(
 		};
 		let context_after_end =
 			context_after_end(content, context_after_start, options.context_after);
-		let before_lines = content[context_before_start..line_start]
-			.iter()
-			.filter(|byte| **byte == b'\n')
-			.count() as u64;
+		let before_lines = u64::try_from(count(
+			&content[context_before_start..line_start],
+			b'\n',
+		))
+		.expect("line count fits in u64");
 		let after_line = line_number.saturating_add(
-			content[line_start..context_after_start]
-				.iter()
-				.filter(|byte| **byte == b'\n')
-				.count() as u64,
+			u64::try_from(count(&content[line_start..context_after_start], b'\n'))
+				.expect("line count fits in u64"),
 		);
 		let record = GrepMatchRef {
 			path,
@@ -1321,9 +1321,11 @@ mod tests {
 		}
 	}
 
+	type RecordedMatch = (Str, u64, u64, u64, Vec<u8>, Vec<u8>);
+
 	#[derive(Default)]
 	struct RecordingSink {
-		records: Vec<(Str, u64, u64, u64, Vec<u8>, Vec<u8>)>,
+		records: Vec<RecordedMatch>,
 	}
 
 	impl GrepSink for RecordingSink {

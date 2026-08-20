@@ -4,6 +4,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	fmt::{self, Write as _},
 	future::Future,
+	sync::Arc,
 };
 
 use async_stream::stream;
@@ -393,7 +394,7 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W,
 			effects:         Effects {
 				documents: Some(DocEffects {
 					read:        true,
-					write_globs: smallvec::SmallVec::new(),
+					write_globs: Arc::default(),
 				}),
 				exec:      None,
 				inference: None,

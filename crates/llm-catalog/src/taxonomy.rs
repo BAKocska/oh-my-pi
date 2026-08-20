@@ -1600,13 +1600,13 @@ mod tests {
 			// Empty block.
 			"discovery {}",
 			// No providers.
-			r#"discovery { recover-canonical-params }"#,
+			r"discovery { recover-canonical-params }",
 			// Empty provider.
 			r#"discovery { recover-canonical-params "" }"#,
 			// Duplicate provider.
 			r#"discovery { recover-canonical-params "gmi-cloud" "GMI-Cloud" }"#,
 			// Empty group.
-			r#"discovery { borrow-responses-route }"#,
+			r"discovery { borrow-responses-route }",
 			// Empty group member.
 			r#"discovery { borrow-responses-route "" }"#,
 			// Duplicate member within one group.

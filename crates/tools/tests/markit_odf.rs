@@ -1,4 +1,4 @@
-//! Compact, synthetic OpenDocument conversion fixtures.
+//! Compact, synthetic `OpenDocument` conversion fixtures.
 
 use std::path::Path;
 
@@ -31,7 +31,7 @@ fn structured_odt() -> Vec<u8> {
 	</office:document-styles>"#;
 	// Deliberately uses non-canonical namespace prefixes. Namespace URIs, not
 	// producer-chosen prefixes, define ODF elements.
-	let content = r##"<o:document-content
+	let content = r#"<o:document-content
 		xmlns:o="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
 		xmlns:t="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
 		xmlns:tb="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
@@ -47,7 +47,7 @@ fn structured_odt() -> Vec<u8> {
 			<tb:table><tb:table-row><tb:table-cell tb:number-columns-spanned="2"><t:p>Merged heading</t:p></tb:table-cell><tb:covered-table-cell/></tb:table-row><tb:table-row><tb:table-cell><t:p>Left</t:p></tb:table-cell><tb:table-cell><t:p>Right</t:p></tb:table-cell></tb:table-row></tb:table>
 			<t:p><dr:frame><svg:title>Architecture diagram</svg:title></dr:frame></t:p>
 		</o:text></o:body>
-	</o:document-content>"##;
+	</o:document-content>"#;
 	let manifest = format!(
 		r#"<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"><manifest:file-entry manifest:full-path="/" manifest:media-type="{ODT_MIMETYPE}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/></manifest:manifest>"#
 	);
@@ -98,7 +98,7 @@ fn odt_reports_missing_or_malformed_content_without_panicking() {
 	let error = markit::convert(Path::new("malformed.odt"), &malformed)
 		.expect_err("malformed XML is rejected");
 	assert_eq!(error.format(), "odt");
-	assert!(!error.message().is_empty());
+	assert_ne!(error.message(), "");
 
 	let error = markit::convert(Path::new("not-a-zip.odt"), b"not a ZIP archive")
 		.expect_err("malformed ZIP is rejected");

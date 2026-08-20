@@ -53,7 +53,10 @@ impl LiveEdit {
 				rev:             Rev { family: Str::new_static("hl"), n: 2 },
 				description:     Str::new_static("apply a hashline edit"),
 				schema:          Bytes::from_static(HL2_SCHEMA),
-				constraint:      Constraint::Schema { priority: 1 },
+				constraint:      Constraint::Schema {
+					priority:       1,
+					on_unsupported: pb::Fallback::Unspecified,
+				},
 				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},
@@ -73,7 +76,10 @@ impl HistoricalEdit {
 				rev:             Rev { family: Str::new_static("hl"), n: 1 },
 				description:     Str::new_static("historical hashline edit"),
 				schema:          Bytes::from_static(HL1_SCHEMA),
-				constraint:      Constraint::Schema { priority: 1 },
+				constraint:      Constraint::Schema {
+					priority:       1,
+					on_unsupported: pb::Fallback::Unspecified,
+				},
 				effects:         Effects::empty(),
 				projection_code: [0; 32],
 			},

@@ -145,7 +145,7 @@ struct Usage {
 }
 
 impl Usage {
-	fn new(now: Instant) -> Self {
+	const fn new(now: Instant) -> Self {
 		Self { used: 0, dropped: 0, started: now }
 	}
 
@@ -173,20 +173,11 @@ struct SessionUsage {
 /// Accounting is nested by session and extension. A charge must fit both
 /// limits, preventing one extension from starving its peers and one session
 /// from bypassing its aggregate allocation.
+#[derive(Default)]
 pub struct ControlQuotaLedger {
 	specs:          BTreeMap<HostKey, BTreeMap<Str, QuotaSpec>>,
 	session_limits: BTreeMap<Str, u64>,
 	sessions:       BTreeMap<Str, SessionUsage>,
-}
-
-impl Default for ControlQuotaLedger {
-	fn default() -> Self {
-		Self {
-			specs:          BTreeMap::new(),
-			session_limits: BTreeMap::new(),
-			sessions:       BTreeMap::new(),
-		}
-	}
 }
 
 impl ControlQuotaLedger {

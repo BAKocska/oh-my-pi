@@ -269,7 +269,7 @@ impl Custom {
 
 	/// Returns the materialized model-context projection.
 	#[must_use]
-	pub fn context(&self) -> Option<&Content> {
+	pub const fn context(&self) -> Option<&Content> {
 		self.context.as_ref()
 	}
 

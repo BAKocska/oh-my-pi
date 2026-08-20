@@ -1,3 +1,5 @@
+//! Session-index integration checks for attached chat journals.
+
 use std::sync::Arc;
 
 use omp_agent::Journal;
@@ -47,7 +49,7 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 			},
 		)
 		.unwrap_or_else(|error| panic!("journal header and index row failed: {error}"));
-	journal.attach_session_index(Arc::clone(&index), id.clone());
+	journal.attach_session_index(Arc::clone(&index), id);
 
 	journal
 		.append_title(2, Str::from("Indexed chat"), TitleSource::Assistant)

@@ -46,7 +46,7 @@ pub fn write_test_png(path: &std::path::Path, width: u32, height: u32, rgb: [u8;
 	encoder.set_depth(png::BitDepth::Eight);
 	let mut writer = encoder.write_header().expect("PNG header");
 	let mut data = vec![0_u8; (width * height * 4) as usize];
-	for pixel in data.chunks_exact_mut(4) {
+	for pixel in data.as_chunks_mut::<4>().0 {
 		pixel[..3].copy_from_slice(&rgb);
 		pixel[3] = 255;
 	}

@@ -99,19 +99,19 @@ pub enum ChatError {
 	},
 	/// Durable transcript state failed to open, create, or project.
 	#[error(transparent)]
-	Journal(Box<omp_agent::JournalError>),
+	Journal(#[from] omp_agent::JournalError),
 	/// The authoritative write-time sessions index failed.
 	#[error(transparent)]
-	SessionIndex(Box<omp_storage::index::Error>),
+	SessionIndex(omp_storage::index::Error),
 	/// A durable transcript could not be projected into canonical replay items.
 	#[error(transparent)]
-	Projection(Box<omp_agent::ProjectionError>),
+	Projection(#[from] omp_agent::ProjectionError),
 	/// The project environment authority failed to start or connect.
 	#[error(transparent)]
-	Environment(Box<crate::envd::EnvdError>),
+	Environment(#[from] crate::envd::EnvdError),
 	/// The in-process turn authority could not be constructed.
 	#[error(transparent)]
-	TurnClient(Box<omp_agent::Error>),
+	TurnClient(#[from] omp_agent::Error),
 	/// A live tool declaration could not be represented on the turn protocol.
 	#[error("tool {0} uses a grammar input unsupported by the turn protocol")]
 	GrammarTool(Str),
@@ -148,29 +148,9 @@ pub enum ChatError {
 	UnsupportedPlatform,
 }
 
-impl From<omp_agent::JournalError> for ChatError {
-	fn from(error: omp_agent::JournalError) -> Self {
-		Self::Journal(Box::new(error))
-	}
-}
 
-impl From<omp_agent::ProjectionError> for ChatError {
-	fn from(error: omp_agent::ProjectionError) -> Self {
-		Self::Projection(Box::new(error))
-	}
-}
 
-impl From<crate::envd::EnvdError> for ChatError {
-	fn from(error: crate::envd::EnvdError) -> Self {
-		Self::Environment(Box::new(error))
-	}
-}
 
-impl From<omp_agent::Error> for ChatError {
-	fn from(error: omp_agent::Error) -> Self {
-		Self::TurnClient(Box::new(error))
-	}
-}
 
 struct Session {
 	id:            Str,
@@ -769,7 +749,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 			.await
 			.into_diagnostic()
 			.wrap_err_with(|| format!("could not connect to {endpoint}"))?;
-		run_ui(
+		Box::pin(run_ui(
 			RpcTurnClient::new(channel),
 			&environment,
 			env,
@@ -787,7 +767,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 				registry,
 			},
 			!resume_requested,
-		)
+		))
 		.await
 		.map_err(|e| miette::miette!(e))?;
 	} else {
@@ -799,7 +779,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 			.await
 			.map_err(ChatError::from)
 			.map_err(|e| miette::miette!(e))?;
-		run_ui(
+		Box::pin(run_ui(
 			client,
 			&environment,
 			env,
@@ -817,7 +797,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 				registry,
 			},
 			!resume_requested,
-		)
+		))
 		.await
 		.map_err(|e| miette::miette!(e))?;
 	}
@@ -1139,9 +1119,11 @@ fn create_indexed_journal(
 	let mut journal = match result {
 		Ok(journal) => journal,
 		Err(IndexedWriteError::Journal(error)) => return Err(error.into()),
-		Err(IndexedWriteError::IndexBeforeJournal(error))
-		| Err(IndexedWriteError::IndexAfterJournal { source: error, .. }) => {
-			return Err(ChatError::SessionIndex(Box::new(error)));
+		Err(
+			IndexedWriteError::IndexBeforeJournal(error)
+			| IndexedWriteError::IndexAfterJournal { source: error, .. },
+		) => {
+			return Err(ChatError::SessionIndex(error));
 		},
 	};
 	journal.attach_session_index(session_index, session_id);

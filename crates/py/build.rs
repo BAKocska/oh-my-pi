@@ -19,6 +19,7 @@
 
 use std::{
 	collections::BTreeSet,
+	fmt::Write,
 	path::{Path, PathBuf},
 	process::Command,
 };
@@ -164,8 +165,9 @@ fn main() {
 	.expect("parse canonical URL vocabulary");
 	let mut vocabulary_module =
 		String::from("\"\"\"Generated canonical URL and selector vocabulary; do not edit.\"\"\"\n");
-	vocabulary_module.push_str(&format!(
-		"URL_VOCAB_VERSION = {}\nSELECTOR_GRAMMAR = {}\nSCHEMES = (\n",
+	writeln!(
+		&mut vocabulary_module,
+		"URL_VOCAB_VERSION = {}\nSELECTOR_GRAMMAR = {}\nSCHEMES = (",
 		vocabulary["version"]
 			.as_u64()
 			.expect("URL vocabulary version"),
@@ -175,7 +177,8 @@ fn main() {
 				.expect("URL selector grammar"),
 		)
 		.expect("serialize selector grammar"),
-	));
+	)
+	.expect("write URL vocabulary header");
 	for scheme in vocabulary["schemes"].as_array().expect("URL scheme rows") {
 		let member = scheme["member"].as_str().expect("URL scheme member");
 		let wire = scheme["wire"]
@@ -191,12 +194,14 @@ fn main() {
 		if wire.len() == 1 {
 			wire_values.push(',');
 		}
-		vocabulary_module.push_str(&format!(
-			"    ({}, ({}), {}),\n",
+		writeln!(
+			&mut vocabulary_module,
+			"    ({}, ({}), {}),",
 			serde_json::to_string(member).expect("serialize URL member"),
 			wire_values,
 			if selectors { "True" } else { "False" },
-		));
+		)
+		.expect("write URL vocabulary scheme");
 	}
 	vocabulary_module.push_str(")\n");
 	std::fs::write(frozen_generated.join("_omp_url_vocab.py"), vocabulary_module)

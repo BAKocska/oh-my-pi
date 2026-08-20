@@ -33,7 +33,7 @@ use crate::{
 };
 
 const JSON_CONTENT_TYPE: &str = "application/json";
-const FALLBACK_EXPIRES: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const FALLBACK_EXPIRES: Duration = Duration::from_days(365);
 const JWT_EXPIRY_SKEW_SECONDS: f64 = 5.0 * 60.0;
 const PKCE_VERIFIER_BYTES: usize = 96;
 

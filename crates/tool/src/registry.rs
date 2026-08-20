@@ -514,7 +514,7 @@ impl Registry {
 	}
 
 	/// Seals argument declarations against every later mutation.
-	pub fn seal_arg_specs(&mut self) {
+	pub const fn seal_arg_specs(&mut self) {
 		self.arg_specs.seal();
 	}
 

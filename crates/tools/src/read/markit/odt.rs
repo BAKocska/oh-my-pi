@@ -1,4 +1,4 @@
-//! OpenDocument Text to Markdown conversion.
+//! `OpenDocument` Text to Markdown conversion.
 
 use omp_core::Str;
 

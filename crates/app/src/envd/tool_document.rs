@@ -2210,7 +2210,7 @@ mod tests {
 	#[test]
 	fn seen_line_guard_caps_the_reveal_and_keeps_retries_rejected() {
 		let content = (1..=200).fold(String::new(), |mut text, line| {
-			text.push_str(&format!("l{line}\n"));
+			writeln!(text, "l{line}").expect("writing to String cannot fail");
 			text
 		});
 		let (mut store, tag) = guard_store(&content, vec![1]);

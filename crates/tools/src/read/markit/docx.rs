@@ -67,7 +67,7 @@ struct ToggleFormatting {
 }
 
 impl ToggleFormatting {
-	fn apply(self, base: Formatting) -> Formatting {
+	const fn apply(self, base: Formatting) -> Formatting {
 		Formatting {
 			bold:   base.bold ^ self.bold,
 			italic: base.italic ^ self.italic,
@@ -76,13 +76,19 @@ impl ToggleFormatting {
 	}
 }
 
+#[derive(Clone, Copy, Debug)]
+enum OutlineLevel {
+	Level(usize),
+	NotHeading,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Style {
 	name:                 String,
 	based_on:             Option<String>,
 	numbering:            Option<(String, usize)>,
 	numbering_suppressed: bool,
-	outline_level:        Option<Option<usize>>,
+	outline_level:        Option<OutlineLevel>,
 	formatting:           ToggleFormatting,
 }
 
@@ -564,7 +570,13 @@ fn parse_styles(xml: &str) -> Result<(HashMap<String, Style>, Formatting), Marki
 			.and_then(|properties| properties.child("outlineLvl"))
 			.and_then(|outline| outline.attr("val"))
 			.and_then(|value| value.parse::<usize>().ok())
-			.map(|level| (level < 9).then_some(level + 1));
+			.map(|level| {
+				if level < 9 {
+					OutlineLevel::Level(level + 1)
+				} else {
+					OutlineLevel::NotHeading
+				}
+			});
 		styles.insert(id.to_owned(), Style {
 			name,
 			based_on: node
@@ -894,8 +906,11 @@ fn resolve_heading(
 		let Some(style) = styles.get(id) else {
 			return heading_level(id);
 		};
-		if let Some(level) = style.outline_level {
-			return level;
+		if let Some(outline_level) = style.outline_level {
+			return match outline_level {
+				OutlineLevel::Level(level) => Some(level),
+				OutlineLevel::NotHeading => None,
+			};
 		}
 		if let Some(level) = heading_level(&style.name).or_else(|| heading_level(id)) {
 			return Some(level);
@@ -917,15 +932,14 @@ fn next_list_marker(context: &mut Context, id: &str, level: usize) -> (bool, Str
 	let counter = context
 		.counters
 		.entry((id.to_owned(), level))
-		.or_insert(definition.start.saturating_sub(1));
+		.or_insert_with(|| definition.start.saturating_sub(1));
 	*counter = counter.saturating_add(1);
 	let value = *counter;
 	let default_label = format_number(value, definition.format);
-	let label = definition
-		.pattern
-		.as_deref()
-		.map(|pattern| format_number_pattern(pattern, id, context, definition.legal))
-		.unwrap_or_else(|| format!("{default_label}."));
+	let label = definition.pattern.as_deref().map_or_else(
+		|| format!("{default_label}."),
+		|pattern| format_number_pattern(pattern, id, context, definition.legal),
+	);
 	let standard_decimal =
 		definition.format == NumberFormat::Decimal && definition.pattern.is_none();
 	let marker = if standard_decimal {
@@ -1432,12 +1446,11 @@ fn wrap_inline(value: String, delimiter: &str) -> String {
 }
 
 fn property_value(node: Option<&Node>) -> Option<bool> {
-	node.map(|node| {
-		!matches!(
-			node.attr("val").map(str::to_ascii_lowercase).as_deref(),
-			Some("0" | "false" | "off" | "none")
-		)
-	})
+	let node = node?;
+	Some(!matches!(
+		node.attr("val").map(str::to_ascii_lowercase).as_deref(),
+		Some("0" | "false" | "off" | "none")
+	))
 }
 
 fn property_enabled(node: Option<&Node>) -> bool {

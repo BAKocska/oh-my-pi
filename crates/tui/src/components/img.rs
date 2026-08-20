@@ -322,7 +322,7 @@ impl Component for Img {
 
 /// Half-block glyph and colors for one sampled cell. Transparent halves
 /// stay unpainted so the terminal or container background shows through.
-fn half_block_cell(upper: Option<Rgb>, lower: Option<Rgb>) -> Option<(crate::Icon, Style)> {
+const fn half_block_cell(upper: Option<Rgb>, lower: Option<Rgb>) -> Option<(crate::Icon, Style)> {
 	match (upper, lower) {
 		(Some(upper), Some(lower)) => Some((
 			crate::Icon::UpperHalf,
@@ -889,7 +889,7 @@ mod tests {
 			encoder.set_depth(png::BitDepth::Eight);
 			let mut writer = encoder.write_header().unwrap();
 			let mut data = vec![0_u8; 4 * 4 * 4];
-			for pixel in data.chunks_exact_mut(4) {
+			for pixel in data.as_chunks_mut::<4>().0 {
 				pixel[0] = 255;
 				pixel[3] = 255;
 			}

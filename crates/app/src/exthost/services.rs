@@ -49,16 +49,12 @@ impl ServiceManifest {
 	}
 
 	/// Iterates over services this extension declares as a provider.
-	pub fn provides(
-		&self,
-	) -> impl Iterator<Item = &ServiceKey> + DoubleEndedIterator + ExactSizeIterator {
+	pub fn provides(&self) -> impl DoubleEndedIterator<Item = &ServiceKey> + ExactSizeIterator {
 		self.provides.iter()
 	}
 
 	/// Iterates over services this extension is granted permission to consume.
-	pub fn requires(
-		&self,
-	) -> impl Iterator<Item = &ServiceKey> + DoubleEndedIterator + ExactSizeIterator {
+	pub fn requires(&self) -> impl DoubleEndedIterator<Item = &ServiceKey> + ExactSizeIterator {
 		self.requires.iter()
 	}
 }
@@ -234,6 +230,11 @@ pub enum ServiceError {
 	#[error("stale or unknown service response correlation {0}")]
 	StaleCorrelation(u64),
 }
+
+const _: () = assert!(
+	std::mem::size_of::<ServiceError>() <= 128,
+	"ServiceError must stay compact"
+);
 
 /// Failure observed while awaiting a service method.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

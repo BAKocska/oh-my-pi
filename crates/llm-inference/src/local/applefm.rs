@@ -31,7 +31,6 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use omp_core::Str;
-use strum::{Display, EnumString, IntoStaticStr};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tower::Service;
@@ -99,54 +98,61 @@ pub(crate) const CONTEXT_SIZE: u32 = 4096;
 static APPLE_ADMISSION: LazyLock<Arc<AdmissionControl>> =
 	LazyLock::new(|| Arc::new(AdmissionControl::new(1).expect("one is a valid admission limit")));
 
-/// Stable category attached to an [`AppleFmError`].
 #[allow(
 	missing_docs,
-	reason = "strum generates the public string-conversion method from documented variants"
+	reason = "strum generates the public string-conversion method in this private module"
 )]
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, IntoStaticStr, PartialEq)]
-#[strum(serialize_all = "snake_case", const_into_str)]
-pub enum AppleFmErrorCode {
-	/// The caller supplied an invalid request option.
-	InvalidInput,
-	/// The caller cancelled generation.
-	Cancelled,
-	/// Generation exceeded the runtime's request deadline.
-	TimedOut,
-	/// The device or system model cannot currently run the request.
-	ModelUnavailable,
-	/// This hardware is not eligible for Apple Intelligence.
-	DeviceNotEligible,
-	/// Apple Intelligence is disabled in System Settings.
-	AppleIntelligenceNotEnabled,
-	/// The on-device model has not finished downloading or preparing.
-	ModelNotReady,
-	/// The prompt exceeded the system model's context window.
-	ContextOverflow,
-	/// Apple's safety policy rejected the request.
-	GuardrailBlocked,
-	/// Guided generation is unsupported for this request.
-	UnsupportedGuide,
-	/// The current language or locale is unsupported.
-	UnsupportedLocale,
-	/// The framework could not decode a response.
-	DecodingFailure,
-	/// The system model rate-limited the request.
-	RateLimited,
-	/// Another process-local request is already active.
-	ConcurrentRequests,
-	/// The Foundation Models or Swift runtime failed unexpectedly.
-	#[strum(serialize = "runtime_error", serialize = "runtime")]
-	Runtime,
-}
+mod error_code {
+	use strum::{Display, EnumString, IntoStaticStr};
 
-impl AppleFmErrorCode {
-	/// Stable machine-readable string representation of this error code.
-	#[must_use]
-	pub const fn as_str(&self) -> &'static str {
-		(*self).into_str()
+	/// Stable category attached to an [`super::AppleFmError`].
+	#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, IntoStaticStr, PartialEq)]
+	#[strum(serialize_all = "snake_case", const_into_str)]
+	pub enum AppleFmErrorCode {
+		/// The caller supplied an invalid request option.
+		InvalidInput,
+		/// The caller cancelled generation.
+		Cancelled,
+		/// Generation exceeded the runtime's request deadline.
+		TimedOut,
+		/// The device or system model cannot currently run the request.
+		ModelUnavailable,
+		/// This hardware is not eligible for Apple Intelligence.
+		DeviceNotEligible,
+		/// Apple Intelligence is disabled in System Settings.
+		AppleIntelligenceNotEnabled,
+		/// The on-device model has not finished downloading or preparing.
+		ModelNotReady,
+		/// The prompt exceeded the system model's context window.
+		ContextOverflow,
+		/// Apple's safety policy rejected the request.
+		GuardrailBlocked,
+		/// Guided generation is unsupported for this request.
+		UnsupportedGuide,
+		/// The current language or locale is unsupported.
+		UnsupportedLocale,
+		/// The framework could not decode a response.
+		DecodingFailure,
+		/// The system model rate-limited the request.
+		RateLimited,
+		/// Another process-local request is already active.
+		ConcurrentRequests,
+		/// The Foundation Models or Swift runtime failed unexpectedly.
+		#[strum(serialize = "runtime_error", serialize = "runtime")]
+		Runtime,
+	}
+
+	impl AppleFmErrorCode {
+		/// Stable machine-readable string representation of this error code.
+		#[must_use]
+		pub const fn as_str(&self) -> &'static str {
+			(*self).into_str()
+		}
 	}
 }
+
+#[doc(inline)]
+pub use error_code::AppleFmErrorCode;
 
 /// Error returned by Apple Foundation Models availability checks or generation.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -198,43 +204,47 @@ pub struct AppleFmAvailability {
 	/// Stable unavailability reason or native loading diagnostic.
 	pub reason:    Option<Str>,
 }
+#[allow(
+	missing_docs,
+	reason = "strum generates the public string-conversion method in this private module"
+)]
+mod support_state {
+	use strum::{Display, EnumString, IntoStaticStr};
 
-/// Stable reason why Apple Foundation Models can or cannot run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AppleFmSupportState {
-	/// Generation is available now.
-	Available,
-	/// The operating system is not macOS.
-	UnsupportedOperatingSystem,
-	/// The process is not running on Apple Silicon.
-	UnsupportedArchitecture,
-	/// The Foundation Models framework is absent from this OS release.
-	FrameworkUnavailable,
-	/// The device is not eligible for Apple Intelligence.
-	DeviceNotEligible,
-	/// Apple Intelligence is disabled in System Settings.
-	SettingsDisabled,
-	/// The system model is downloading or preparing.
-	ModelNotReady,
-	/// The native runtime returned an unclassified failure.
-	RuntimeFailure,
-}
+	/// Stable reason why Apple Foundation Models can or cannot run.
+	#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+	#[strum(serialize_all = "snake_case", const_into_str)]
+	pub enum AppleFmSupportState {
+		/// Generation is available now.
+		Available,
+		/// The operating system is not macOS.
+		UnsupportedOperatingSystem,
+		/// The process is not running on Apple Silicon.
+		UnsupportedArchitecture,
+		/// The Foundation Models framework is absent from this OS release.
+		FrameworkUnavailable,
+		/// The device is not eligible for Apple Intelligence.
+		DeviceNotEligible,
+		/// Apple Intelligence is disabled in System Settings.
+		#[strum(serialize = "apple_intelligence_not_enabled")]
+		SettingsDisabled,
+		/// The system model is downloading or preparing.
+		ModelNotReady,
+		/// The native runtime returned an unclassified failure.
+		RuntimeFailure,
+	}
 
-impl AppleFmSupportState {
-	/// Returns the stable planning-evidence code for this availability state.
-	pub const fn code(self) -> &'static str {
-		match self {
-			Self::Available => "available",
-			Self::UnsupportedOperatingSystem => "unsupported_operating_system",
-			Self::UnsupportedArchitecture => "unsupported_architecture",
-			Self::FrameworkUnavailable => "framework_unavailable",
-			Self::DeviceNotEligible => "device_not_eligible",
-			Self::SettingsDisabled => "apple_intelligence_not_enabled",
-			Self::ModelNotReady => "model_not_ready",
-			Self::RuntimeFailure => "runtime_failure",
+	impl AppleFmSupportState {
+		/// Returns the stable planning-evidence code for this availability state.
+		#[must_use]
+		pub const fn code(self) -> &'static str {
+			self.into_str()
 		}
 	}
 }
+
+#[doc(inline)]
+pub use support_state::AppleFmSupportState;
 
 /// Native feature status distinguished from an unrecovered binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,21 +268,39 @@ pub struct AppleFmAvailabilityEvidence {
 	/// OS version reported without invoking an external process.
 	pub os_version: Option<Str>,
 	/// Compile-time process architecture.
-	pub architecture: Str,
+	pub architecture: &'static str,
 	/// Native diagnostic or stable reason.
 	pub detail: Option<Str>,
 	/// Native incremental snapshot streaming is implemented.
 	pub streaming: bool,
-	/// Native tools are exposed by this narrow ABI seam.
-	pub tools: bool,
-	/// Native schema-guided generation is exposed by this narrow ABI seam.
-	pub structured_generation: bool,
 	/// Precise reason tools are or are not available.
 	pub tool_evidence: AppleFmFeatureEvidence,
 	/// Precise reason structured generation is or is not available.
 	pub structured_generation_evidence: AppleFmFeatureEvidence,
 	/// Documented system-model context budget.
 	pub context_tokens: u32,
+}
+
+const _: () = assert!(
+	std::mem::size_of::<AppleFmAvailabilityEvidence>() <= 128,
+	"AppleFmAvailabilityEvidence must stay compact"
+);
+
+impl AppleFmAvailabilityEvidence {
+	/// Whether the narrow ABI seam exposes native tools.
+	#[must_use]
+	pub const fn tools(&self) -> bool {
+		matches!(self.tool_evidence, AppleFmFeatureEvidence::Native)
+	}
+
+	/// Whether the narrow ABI seam exposes native schema-guided generation.
+	#[must_use]
+	pub const fn structured_generation(&self) -> bool {
+		matches!(
+			self.structured_generation_evidence,
+			AppleFmFeatureEvidence::Native
+		)
+	}
 }
 
 /// Controls one Apple Foundation Models request.
@@ -387,11 +415,9 @@ impl AppleFm {
 		Ok(AppleFmAvailabilityEvidence {
 			state,
 			os_version: platform::os_version(),
-			architecture: std::env::consts::ARCH.into(),
+			architecture: std::env::consts::ARCH,
 			detail,
 			streaming: true,
-			tools: false,
-			structured_generation: false,
 			tool_evidence: AppleFmFeatureEvidence::RequiresCompiledSwiftToolConformance,
 			structured_generation_evidence: AppleFmFeatureEvidence::DynamicSchemaAbiUnverified,
 			context_tokens: CONTEXT_SIZE,
@@ -961,7 +987,7 @@ struct AppleFmResponseCleaner {
 }
 
 impl AppleFmResponseCleaner {
-	fn new(enabled: bool) -> Self {
+	const fn new(enabled: bool) -> Self {
 		Self { enabled, leading: enabled, saw_delta: false, truncated: false, pending: String::new() }
 	}
 
@@ -1317,11 +1343,9 @@ fn availability_evidence_sync() -> AppleFmAvailabilityEvidence {
 	AppleFmAvailabilityEvidence {
 		state,
 		os_version: platform::os_version(),
-		architecture: std::env::consts::ARCH.into(),
+		architecture: std::env::consts::ARCH,
 		detail,
 		streaming: true,
-		tools: false,
-		structured_generation: false,
 		tool_evidence: AppleFmFeatureEvidence::RequiresCompiledSwiftToolConformance,
 		structured_generation_evidence: AppleFmFeatureEvidence::DynamicSchemaAbiUnverified,
 		context_tokens: CONTEXT_SIZE,
@@ -1398,7 +1422,7 @@ fn native_attempt_error(
 		.code(Str::new_static(error.code().as_str()))
 }
 
-fn apple_native_error(code: AppleFmErrorCode, committed: bool) -> (ErrorKind, ErrorPhase) {
+const fn apple_native_error(code: AppleFmErrorCode, committed: bool) -> (ErrorKind, ErrorPhase) {
 	let phase = if committed {
 		ErrorPhase::Streaming
 	} else {
@@ -1664,11 +1688,9 @@ mod tests {
 		AppleFmAvailabilityEvidence {
 			state,
 			os_version: Some("26.0".into()),
-			architecture: "aarch64".into(),
+			architecture: "aarch64",
 			detail: (state != AppleFmSupportState::Available).then(|| "model_not_ready".into()),
 			streaming: true,
-			tools: false,
-			structured_generation: false,
 			tool_evidence: AppleFmFeatureEvidence::RequiresCompiledSwiftToolConformance,
 			structured_generation_evidence: AppleFmFeatureEvidence::DynamicSchemaAbiUnverified,
 			context_tokens: 4096,
@@ -1876,5 +1898,14 @@ mod tests {
 		let attempt_err = native_attempt_error(&attempt(), &error, false);
 		assert_eq!(attempt_err.code.as_deref(), Some("context_overflow"));
 		assert_eq!(AppleFmErrorCode::Runtime.as_str(), "runtime_error");
+	}
+
+	#[test]
+	fn support_state_codes_use_strum_serialization() {
+		assert_eq!(AppleFmSupportState::Available.code(), "available");
+		assert_eq!(
+			AppleFmSupportState::SettingsDisabled.code(),
+			"apple_intelligence_not_enabled"
+		);
 	}
 }

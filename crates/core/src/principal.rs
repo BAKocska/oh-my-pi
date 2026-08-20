@@ -1,7 +1,7 @@
 //! Authenticated actor identity and extension provenance carried by durable
 //! records.
 
-use std::{fmt, str::FromStr};
+use std::{fmt, hash::{Hash, Hasher}, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
@@ -147,8 +147,11 @@ impl<'de> Deserialize<'de> for ArtifactDigest {
 /// The seven fields are the publisher, extension id, version, artifact digest,
 /// installation layer, trust tier, and host generation. Workers may observe
 /// this value but must never be trusted to author it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Provenance {
+#[derive(Clone)]
+pub struct Provenance(Arc<ProvenanceData>);
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+struct ProvenanceData {
 	publisher:       Str,
 	extension_id:    Str,
 	version:         Str,
@@ -158,10 +161,15 @@ pub struct Provenance {
 	generation:      u64,
 }
 
+const _: () = assert!(
+	std::mem::size_of::<Provenance>() <= 16,
+	"Provenance must stay compact"
+);
+
 impl Provenance {
 	/// Creates provenance from core-authenticated extension installation facts.
 	#[must_use]
-	pub const fn new(
+	pub fn new(
 		publisher: Str,
 		extension_id: Str,
 		version: Str,
@@ -170,48 +178,115 @@ impl Provenance {
 		tier: Str,
 		generation: u64,
 	) -> Self {
-		Self { publisher, extension_id, version, artifact_digest, layer, tier, generation }
+		Self(Arc::new(ProvenanceData {
+			publisher,
+			extension_id,
+			version,
+			artifact_digest,
+			layer,
+			tier,
+			generation,
+		}))
 	}
 
 	/// Returns the publisher key fingerprint.
 	#[must_use]
 	pub fn publisher(&self) -> &str {
-		self.publisher.as_str()
+		self.0.publisher.as_str()
 	}
 
 	/// Returns the dotted extension identifier.
 	#[must_use]
 	pub fn extension_id(&self) -> &str {
-		self.extension_id.as_str()
+		self.0.extension_id.as_str()
 	}
 
 	/// Returns the exact extension version.
 	#[must_use]
 	pub fn version(&self) -> &str {
-		self.version.as_str()
+		self.0.version.as_str()
 	}
 
 	/// Returns the exact extension artifact digest.
 	#[must_use]
-	pub const fn artifact_digest(&self) -> ArtifactDigest {
-		self.artifact_digest
+	pub fn artifact_digest(&self) -> ArtifactDigest {
+		self.0.artifact_digest
 	}
 
 	/// Returns the installation layer.
 	#[must_use]
 	pub fn layer(&self) -> &str {
-		self.layer.as_str()
+		self.0.layer.as_str()
 	}
 
 	/// Returns the conferred trust tier.
 	#[must_use]
 	pub fn tier(&self) -> &str {
-		self.tier.as_str()
+		self.0.tier.as_str()
 	}
 
 	/// Returns the host incarnation generation.
 	#[must_use]
-	pub const fn generation(&self) -> u64 {
-		self.generation
+	pub fn generation(&self) -> u64 {
+		self.0.generation
+	}
+}
+
+impl fmt::Debug for Provenance {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("Provenance")
+			.field("publisher", &self.0.publisher)
+			.field("extension_id", &self.0.extension_id)
+			.field("version", &self.0.version)
+			.field("artifact_digest", &self.0.artifact_digest)
+			.field("layer", &self.0.layer)
+			.field("tier", &self.0.tier)
+			.field("generation", &self.0.generation)
+			.finish()
+	}
+}
+
+impl PartialEq for Provenance {
+	fn eq(&self, other: &Self) -> bool {
+		self.0 == other.0
+	}
+}
+
+impl Eq for Provenance {}
+
+impl PartialOrd for Provenance {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for Provenance {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.0.cmp(&other.0)
+	}
+}
+
+impl Hash for Provenance {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.0.hash(state);
+	}
+}
+
+impl Serialize for Provenance {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		self.0.serialize(serializer)
+	}
+}
+
+impl<'de> Deserialize<'de> for Provenance {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		ProvenanceData::deserialize(deserializer).map(|data| Self(Arc::new(data)))
 	}
 }

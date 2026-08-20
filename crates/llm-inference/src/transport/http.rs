@@ -1158,7 +1158,7 @@ mod tests {
 		assert_eq!(mapped.receipt(), inner.receipt());
 	}
 
-	/// Mid-stream transport interruptions (HTTP/2 RST_STREAM, connection
+	/// Mid-stream transport interruptions (`HTTP/2` `RST_STREAM`, connection
 	/// resets) are classified as transient connectivity: uncommitted attempts
 	/// retry the same route immediately, while committed attempts keep the
 	/// stable `Connectivity`/`Streaming`/`committed` signature session-level
@@ -1206,7 +1206,7 @@ mod tests {
 		assert!(sanitize_headers(&headers).is_empty());
 	}
 
-	/// A header-marked LiteLLM concurrency-admission 429 (pi #8854) must
+	/// A header-marked `LiteLLM` concurrency-admission 429 (`pi` #8854) must
 	/// surface for immediate route reselection instead of sleeping through the
 	/// transport's same-route retry lane; unmarked rate limits and every other
 	/// classification keep their action.

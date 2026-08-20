@@ -1,3 +1,5 @@
+//! Integration coverage for environment-daemon policy enforcement.
+
 use std::sync::Arc;
 
 use bytes::Bytes;

@@ -5,7 +5,7 @@ use std::{
 	fmt::Write as _,
 	future::{Future, ready},
 	ops::Range,
-	path::{Path, PathBuf},
+	slice,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -185,23 +185,26 @@ struct StaticResolver {
 }
 
 impl Resolve for StaticResolver {
-	async fn read<'a>(
+	fn read<'a>(
 		&'a self,
 		resource: &'a str,
 		selector: &'a ParsedSelector,
-	) -> Result<CowBytes<'static>, Fault> {
+	) -> impl Future<Output = Result<CowBytes<'static>, Fault>> + Send + 'a {
 		assert_eq!(resource, "7");
 		self.calls.fetch_add(1, Ordering::Relaxed);
-		let ParsedSelector::Lines { ranges, .. } = selector else {
-			return Ok(self.bytes.clone());
+		let result = match selector {
+			ParsedSelector::Lines { ranges, .. } => {
+				let [range] = ranges.as_ref() else {
+					panic!("fixture expects one merged range")
+				};
+				self
+					.lines
+					.slice("artifact-7", &self.bytes, *range)
+					.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })
+			},
+			_ => Ok(self.bytes.clone()),
 		};
-		let [range] = ranges.as_ref() else {
-			panic!("fixture expects one merged range")
-		};
-		self
-			.lines
-			.slice("artifact-7", &self.bytes, *range)
-			.map_err(|error| Fault::Invalid { message: Str::from(error.to_string()) })
+		ready(result)
 	}
 }
 
@@ -1464,7 +1467,7 @@ async fn artifact_resolver_stats_authority_caches_offsets_and_gates_digest_form_
 	assert_eq!(&*first, b"two\nthree\n");
 	assert_eq!(first.as_ptr(), bytes.as_ptr().wrapping_add(4));
 	assert_eq!(stats.load(Ordering::Relaxed), 1);
-	assert_eq!(ranges.lock().as_slice(), &[0..bytes.len() as u64]);
+	assert_eq!(ranges.lock().as_slice(), slice::from_ref(&(0..bytes.len() as u64)));
 
 	let first_line = read::selector::parse_selector(Some("1-1")).unwrap();
 	assert_eq!(&*resolver.read("7", &first_line).await.unwrap(), b"one\n");

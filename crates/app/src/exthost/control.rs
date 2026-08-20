@@ -517,6 +517,12 @@ pub enum JournalControlError {
 	Agent(#[from] AgentControlError),
 }
 
+const _: () = assert!(
+	std::mem::size_of::<JournalControlError>() <= 128,
+	"JournalControlError must stay compact"
+);
+
+
 /// Authenticated journal-domain CONTROL dispatcher for one extension.
 ///
 /// Durable frames are generation-fenced and fully decoded before the one
@@ -783,7 +789,7 @@ impl JournalControl {
 		})
 	}
 
-	fn generations(
+	const fn generations(
 		&self,
 		host_generation: u64,
 		session_generation: u64,
@@ -844,10 +850,9 @@ fn pending_entry(entry: AppendEntry) -> Result<PendingCustomEntry, JournalContro
 ///
 /// An empty result emits one terminal sentinel row so an empty query cannot be
 /// mistaken for a dropped stream.
-#[must_use]
 pub fn journal_rows(
 	rows: &[JournalCustomEntry],
-) -> impl Iterator<Item = JournalHostEnvelope> + DoubleEndedIterator + '_ {
+) -> impl DoubleEndedIterator<Item = JournalHostEnvelope> + '_ {
 	let terminal = rows.last().map(|row| row.index);
 	let sentinel = rows.is_empty().then(|| {
 		journal_row_reply(journal_host_envelope::Body::JournalRow(JournalRow {

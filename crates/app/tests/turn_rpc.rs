@@ -45,7 +45,7 @@ use omp_tool::{
 };
 use tower::Service;
 
-fn test_claims() -> Claims {
+const fn test_claims() -> Claims {
 	Claims {
 		precedence: Precedence::CORE,
 		claimant:   Str::new_static("omp/core"),

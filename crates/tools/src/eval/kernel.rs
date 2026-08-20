@@ -262,15 +262,24 @@ impl WorkerState {
 	}
 
 	async fn cancel_active(&self) -> Result<(), Fault> {
-		let cancelled = {
-			let active = self.active.lock();
-			let Some(active) = active.as_ref() else {
-				return Ok(());
-			};
-			Arc::clone(&active.cancelled)
+		let Some(cancelled) = self.active_cancellation() else {
+			return Ok(());
 		};
 		cancelled.store(true, Ordering::Release);
 		self.interrupt_after_grace(&cancelled).await
+	}
+
+	fn schedule_active_cancellation(self: &Arc<Self>) {
+		let Some(cancelled) = self.active_cancellation() else {
+			return;
+		};
+		cancelled.store(true, Ordering::Release);
+		self.schedule_interrupt(cancelled);
+	}
+
+	fn active_cancellation(&self) -> Option<Arc<AtomicBool>> {
+		let active = self.active.lock();
+		active.as_ref().map(|active| Arc::clone(&active.cancelled))
 	}
 
 	fn schedule_interrupt(self: &Arc<Self>, target: Arc<AtomicBool>) {
@@ -329,7 +338,7 @@ impl WorkerState {
 
 impl Drop for Worker {
 	fn drop(&mut self) {
-		let _ = self.state.cancel_active();
+		self.state.schedule_active_cancellation();
 	}
 }
 
@@ -955,12 +964,10 @@ fn worker_main(
 				Ok(completion) if command.timed_out.load(Ordering::Acquire) => {
 					let _ = command
 						.events
-						.send(Ok(RunEvent::Completed(Box::new(timed_out_completion(completion)))));
+						.send(Ok(RunEvent::Completed(timed_out_completion(completion))));
 				},
 				Ok(completion) => {
-					let _ = command
-						.events
-						.send(Ok(RunEvent::Completed(Box::new(completion))));
+					let _ = command.events.send(Ok(RunEvent::Completed(completion)));
 				},
 				Err(_) if command.timed_out.load(Ordering::Acquire) => {
 					let _ =
@@ -1002,9 +1009,7 @@ fn clear_active(state: &WorkerState, cancelled: &Arc<AtomicBool>) {
 }
 
 fn send_cancelled(command: &Command) {
-	let _ = command
-		.events
-		.send(Ok(RunEvent::Completed(Box::new(cancelled_completion()))));
+	let _ = command.events.send(Ok(RunEvent::Completed(cancelled_completion())));
 }
 
 const fn cancelled_completion() -> RunCompletion {
@@ -1324,7 +1329,7 @@ mod tests {
 			match run.next_event().await.expect("event") {
 				Some(RunEvent::Started { .. }) => {},
 				Some(RunEvent::Output(update)) => updates.push(update),
-				Some(RunEvent::Completed(done)) => return (updates, *done),
+				Some(RunEvent::Completed(done)) => return (updates, done),
 				None => panic!("worker ended before completion"),
 			}
 		}
@@ -1333,7 +1338,7 @@ mod tests {
 		loop {
 			match run.next_event().await.expect("event") {
 				Some(RunEvent::Started { .. } | RunEvent::Output(_)) => {},
-				Some(RunEvent::Completed(done)) => return *done,
+				Some(RunEvent::Completed(done)) => return done,
 				None => panic!("worker ended before completion"),
 			}
 		}

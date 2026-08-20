@@ -171,7 +171,7 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
 
 /// Immutable Python duration retaining its explicit source unit.
 #[pyclass(name = "Duration", frozen, module = "_omp", from_py_object)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PyDuration(Duration);
 
 #[pymethods]
@@ -213,7 +213,7 @@ impl PyDuration {
 	}
 
 	#[getter]
-	fn value(&self) -> u64 {
+	const fn value(&self) -> u64 {
 		self.0.value()
 	}
 
@@ -266,7 +266,7 @@ pub fn bind_duration(py: Python<'_>, duration: Duration) -> PyResult<Py<PyAny>> 
 
 /// Canonical ordered Python invocation phase.
 #[pyclass(name = "InvocationPhase", frozen, module = "_omp", from_py_object)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PyInvocationPhase(InvocationPhase);
 
 #[pymethods]
@@ -292,7 +292,7 @@ impl PyInvocationPhase {
 	}
 
 	#[getter]
-	fn ordinal(&self) -> u8 {
+	const fn ordinal(&self) -> u8 {
 		self.0.ordinal()
 	}
 
@@ -304,7 +304,7 @@ impl PyInvocationPhase {
 		format!("InvocationPhase.{}", <&str>::from(self.0))
 	}
 
-	fn __hash__(&self) -> isize {
+	const fn __hash__(&self) -> isize {
 		self.0 as isize
 	}
 
@@ -315,7 +315,7 @@ impl PyInvocationPhase {
 
 /// Canonical ordered Python extension lifecycle phase.
 #[pyclass(name = "LifecyclePhase", frozen, module = "_omp", from_py_object)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PyLifecyclePhase(LifecyclePhase);
 
 #[pymethods]
@@ -337,7 +337,7 @@ impl PyLifecyclePhase {
 	}
 
 	#[getter]
-	fn ordinal(&self) -> u8 {
+	const fn ordinal(&self) -> u8 {
 		self.0.ordinal()
 	}
 
@@ -349,7 +349,7 @@ impl PyLifecyclePhase {
 		format!("LifecyclePhase.{}", <&str>::from(self.0))
 	}
 
-	fn __hash__(&self) -> isize {
+	const fn __hash__(&self) -> isize {
 		self.0 as isize
 	}
 
@@ -373,7 +373,7 @@ macro_rules! string_enum {
 	($rust:ident, $python:literal, $inner:ty, [$($member:ident => $variant:path),+ $(,)?]) => {
 		#[doc = concat!("Canonical Python ", $python, " vocabulary.")]
 		#[pyclass(name = $python, frozen, module = "_omp", from_py_object)]
-		#[derive(Clone, Copy, Debug)]
+		#[derive(Clone, Debug)]
 		struct $rust($inner);
 
 		#[pymethods]
@@ -390,7 +390,7 @@ macro_rules! string_enum {
 				format!(concat!($python, ".{}"), self.0.to_string().to_ascii_uppercase())
 			}
 
-			fn __hash__(&self) -> isize { self.0 as isize }
+			const fn __hash__(&self) -> isize { self.0 as isize }
 
 			fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
 				compare((self.0 as u8).cmp(&(other.0 as u8)), op)
@@ -434,28 +434,28 @@ string_enum!(PyAuthority, "Authority", Authority, [
 
 /// Generated phase, durability, cost, and authority metadata.
 #[pyclass(name = "OperationSpec", frozen, module = "_omp", from_py_object)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PyOperationSpec(OperationSpec);
 
 #[pymethods]
 impl PyOperationSpec {
 	#[getter]
-	fn minimum_phase(&self) -> PyInvocationPhase {
+	const fn minimum_phase(&self) -> PyInvocationPhase {
 		PyInvocationPhase(self.0.minimum_phase)
 	}
 
 	#[getter]
-	fn durability(&self) -> PyDurability {
+	const fn durability(&self) -> PyDurability {
 		PyDurability(self.0.durability)
 	}
 
 	#[getter]
-	fn cost(&self) -> PyCostClass {
+	const fn cost(&self) -> PyCostClass {
 		PyCostClass(self.0.cost)
 	}
 
 	#[getter]
-	fn authority(&self) -> PyAuthority {
+	const fn authority(&self) -> PyAuthority {
 		PyAuthority(self.0.authority)
 	}
 
@@ -859,7 +859,7 @@ impl PyBlobRef {
 	}
 
 	#[getter]
-	fn size(&self) -> u64 {
+	const fn size(&self) -> u64 {
 		self.size
 	}
 
@@ -904,7 +904,8 @@ impl PyPrincipal {
 		self.0.display()
 	}
 
-	fn __repr__(&self) -> &'static str {
+	#[staticmethod]
+	const fn __repr__() -> &'static str {
 		"Principal(<core-issued>)"
 	}
 
@@ -1022,8 +1023,8 @@ fn _local_path_string(_path: &PyEnvPath) -> PyResult<String> {
 	))
 }
 
-/// Registers the native `_omp` module before CPython initialization.
-pub(crate) fn register() {
+/// Registers the native `_omp` module before `CPython` initialization.
+pub fn register() {
 	pyo3::append_to_inittab!(_omp);
 }
 

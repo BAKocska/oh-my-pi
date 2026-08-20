@@ -1,4 +1,4 @@
-//! OpenDocument Presentation conversion fixtures.
+//! `OpenDocument` Presentation conversion fixtures.
 
 use std::path::Path;
 

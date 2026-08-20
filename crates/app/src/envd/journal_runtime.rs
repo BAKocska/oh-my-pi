@@ -34,7 +34,7 @@ use crate::exthost::control::{
 
 /// Environment-owned endpoint for external Journal CONTROL requests.
 #[derive(Clone)]
-pub(crate) struct ExternalJournalActor {
+pub struct ExternalJournalActor {
 	sender: flume::Sender<ExternalJournalCall>,
 	agent:  Arc<Mutex<Option<ControlSender>>>,
 }
@@ -45,7 +45,6 @@ impl ExternalJournalActor {
 	/// # Errors
 	///
 	/// Fails if the shared artifact catalog cannot be opened.
-	#[must_use]
 	pub(crate) fn spawn(
 		sessions: Arc<SessionIndex>,
 		state: Option<Arc<StateStore>>,
@@ -540,7 +539,7 @@ fn state_scope(scope: i32) -> Result<StateScope, Str> {
 	}
 }
 
-fn requested_namespace<'a>(requested: &'a str, own: &'a str) -> &'a str {
+const fn requested_namespace<'a>(requested: &'a str, own: &'a str) -> &'a str {
 	if requested.is_empty() { own } else { requested }
 }
 
@@ -581,7 +580,7 @@ fn state_value(value: Option<(u64, Bytes)>) -> JournalHostEnvelope {
 	}
 }
 
-fn state_changed(revision: u64, value_json: Bytes) -> JournalHostEnvelope {
+const fn state_changed(revision: u64, value_json: Bytes) -> JournalHostEnvelope {
 	JournalHostEnvelope {
 		body:  Some(journal_host_envelope::Body::StateChanged(WireStateChanged {
 			revision,

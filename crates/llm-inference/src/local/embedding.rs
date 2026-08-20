@@ -9,18 +9,18 @@ use super::runtime::{
 	MemoryPool,
 };
 
-/// Configuration for a real FastEmbed model.
+/// Configuration for a real `FastEmbed` model.
 #[derive(Clone, Debug)]
 pub struct EmbeddingConfig {
-	/// Model from FastEmbed's typed catalog.
+	/// Model from `FastEmbed`'s typed catalog.
 	pub model:           fastembed::EmbeddingModel,
-	/// Hugging Face cache used by FastEmbed.
+	/// Hugging Face cache used by `FastEmbed`.
 	pub cache_dir:       PathBuf,
 	/// Maximum tokenized input length.
 	pub max_length:      usize,
 	/// Estimated resident bytes charged before loading.
 	pub resident_bytes:  usize,
-	/// Admission limit; currently must be one because FastEmbed access is
+	/// Admission limit; currently must be one because `FastEmbed` access is
 	/// serialized.
 	pub max_concurrency: usize,
 	/// Duration after which an explicit idle sweep unloads the model.
@@ -30,7 +30,7 @@ pub struct EmbeddingConfig {
 /// Per-call embedding controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EmbeddingOptions {
-	/// Optional FastEmbed batch size.
+	/// Optional `FastEmbed` batch size.
 	pub batch_size: Option<usize>,
 	/// Whether to L2-normalize every vector.
 	pub normalize:  bool,
@@ -51,7 +51,7 @@ pub struct EmbeddingOutput {
 	pub receipt:    LocalExecutionReceipt,
 }
 
-/// Lazy, bounded adapter over FastEmbed's ONNX runtime.
+/// Lazy, bounded adapter over `FastEmbed`'s ONNX runtime.
 #[derive(Clone)]
 pub struct EmbeddingAdapter {
 	runtime: LocalRuntime<TextEmbedding>,

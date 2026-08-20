@@ -18,11 +18,10 @@ use omp_app::{
 		workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
 	},
 	exthost::{
-		ActivationTrigger, ArtifactDigest, DeclarationSet, ExtensionManifest, Provenance,
-		ServiceManifest, ToolDeclarationKey,
+		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
 };
-use omp_core::{Principal, Str};
+use omp_core::{ArtifactDigest, Principal, Provenance, Str};
 use omp_env::{BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent};
 use omp_proto::{
 	SCHEMA_REV,
@@ -41,7 +40,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-fn test_claims() -> Claims {
+const fn test_claims() -> Claims {
 	Claims {
 		precedence: Precedence::CORE,
 		claimant:   Str::new_static("omp/core"),
@@ -380,11 +379,11 @@ OMP_TOOLS = [
 fn test_provenance(key: &HostKey) -> Provenance {
 	Provenance::new(
 		Str::new_static("test-publisher"),
-		key.extension.clone(),
+		key.extension().clone(),
 		Str::new_static("1.0.0"),
 		ArtifactDigest::new([0; 32]),
-		key.layer.clone(),
-		key.tier.clone(),
+		key.layer().clone(),
+		key.tier().clone(),
 		1,
 	)
 }
@@ -544,6 +543,7 @@ async fn invoke_builtin(
 			Bytes::from(serde_json::to_vec(&args).expect("encode built-in args")),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit built-in arguments");
@@ -1442,12 +1442,12 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		)
 		.await
 	};
-	let ((timed_out, timeout_elapsed), recovered) =
-		tokio::time::timeout(Duration::from_secs(5), async {
-			tokio::join!(timed_out, queued_after_timeout)
-		})
-		.await
-		.expect("queued cell deadlocked behind timed-out Python kernel");
+	let ((timed_out, timeout_elapsed), recovered) = tokio::time::timeout(
+		Duration::from_secs(5),
+		Box::pin(async { tokio::join!(timed_out, queued_after_timeout) }),
+	)
+	.await
+	.expect("queued cell deadlocked behind timed-out Python kernel");
 	assert!(!timed_out.is_error, "timed-out Python cell did not return typed cell truth");
 	let timed_out: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
 		serde_json::from_slice(&timed_out.json).expect("typed eval timeout verdict");
@@ -1514,6 +1514,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 			),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit cancellable eval arguments");
@@ -1813,6 +1814,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 			Bytes::from_static(br#"{"path":"committed"}"#),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit streamed arguments");
@@ -1855,6 +1857,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 			Bytes::from_static(br#"{"path":"duplicate"}"#),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("first duplicate commit");
@@ -1863,6 +1866,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 			Bytes::from_static(br#"{"path":"duplicate"}"#),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("send duplicate commit");
@@ -1923,7 +1927,12 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 		Some(InvocationEvent::Accepted(_))
 	));
 	blocked
-		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
+		.commit_args(
+			Bytes::from_static(b"{}"),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+			None,
+		)
 		.await
 		.expect("commit blocking native invocation");
 	assert!(matches!(
@@ -1970,7 +1979,12 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 		Some(InvocationEvent::Accepted(_))
 	));
 	next
-		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
+		.commit_args(
+			Bytes::from_static(b"{}"),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+			None,
+		)
 		.await
 		.expect("commit next native request");
 	assert!(matches!(
@@ -2002,7 +2016,12 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation
-		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
+		.commit_args(
+			Bytes::from_static(b"{}"),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+			None,
+		)
 		.await
 		.expect("commit cooperative invocation");
 	assert!(matches!(
@@ -2061,7 +2080,12 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 		Some(InvocationEvent::Accepted(_))
 	));
 	invocation
-		.commit_args(Bytes::from_static(b"{}"), Bytes::from_static(b"contract-test-token"), 1000)
+		.commit_args(
+			Bytes::from_static(b"{}"),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+			None,
+		)
 		.await
 		.expect("commit deadline native invocation");
 	assert!(matches!(
@@ -2123,6 +2147,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 			),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit blocking worker invocation");
@@ -2176,6 +2201,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 			Bytes::from_static(br#"{"message":"after cancellation"}"#),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit next worker request");
@@ -2226,6 +2252,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 			Bytes::from_static(br#"{"code":409}"#),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit worker fault request");
@@ -2297,6 +2324,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 			),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit worker A");
@@ -2332,6 +2360,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 			),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit worker B");
@@ -2387,6 +2416,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 			Bytes::from_static(br#"{"message":"still isolated"}"#),
 			Bytes::from_static(b"contract-test-token"),
 			1000,
+			None,
 		)
 		.await
 		.expect("commit follow-up worker");
@@ -2833,7 +2863,7 @@ async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
 		})
 		.await
 		.expect("remaining client hello");
-	assert!(!retiring_hello.server_build.is_empty());
+	assert_ne!(retiring_hello.server_build, "");
 	assert_eq!(retiring_hello.server_build, remaining_hello.server_build);
 
 	retiring.retire().await.expect("retire acknowledgement");

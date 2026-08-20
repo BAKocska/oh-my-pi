@@ -122,12 +122,12 @@ impl ArtifactStore {
 			}
 		}
 		let mut digest = Sha256::new();
-		let mut buffer = [0_u8; 64 * 1024];
+		let mut buffer = Box::new([0_u8; 64 * 1024]);
 		loop {
 			if cancel.is_cancelled() {
 				return Err(LocalError::cancelled());
 			}
-			let read = file.read(&mut buffer).map_err(|error| {
+			let read = file.read(&mut buffer[..]).map_err(|error| {
 				LocalError::new(LocalErrorKind::Artifact, format!("artifact read failed: {error}"))
 			})?;
 			if read == 0 {

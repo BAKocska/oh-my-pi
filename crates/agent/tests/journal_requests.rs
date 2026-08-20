@@ -1,3 +1,5 @@
+//! Integration coverage for journal request persistence and recovery.
+
 use std::{
 	path::PathBuf,
 	sync::atomic::{AtomicU64, Ordering},

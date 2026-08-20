@@ -1,4 +1,4 @@
-//! Shared OpenDocument package validation and conversion.
+//! Shared `OpenDocument` package validation and conversion.
 //!
 //! ODT, ODS, and ODP use the same bounded ZIP/XML parser. Keeping the
 //! package identity check and error adaptation here prevents the three
@@ -12,7 +12,7 @@ use super::{
 	ooxml::{Archive, attribute, decode_xml_bytes, local_name, xml_reader},
 };
 
-/// Converts one OpenDocument package after validating its declared identity.
+/// Converts one `OpenDocument` package after validating its declared identity.
 ///
 /// `mimetype` is mandatory in conforming ODF packages, but real producers
 /// occasionally omit it and identify the package in the manifest instead.

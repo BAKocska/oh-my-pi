@@ -34,7 +34,7 @@ const APP_USER_AGENT: &str = "Perplexity/641 CFNetwork/1568 Darwin/25.2.0";
 #[cfg(target_os = "macos")]
 const NATIVE_APP_BUNDLE: &str = "ai.perplexity.mac";
 const NEVER_EXPIRES_MILLIS: u64 = 8_640_000_000_000_000;
-const EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(5 * 60);
+const EXPIRY_SAFETY_MARGIN: Duration = Duration::from_mins(5);
 
 /// Registers Perplexity's catalog-selected email OTP exchange.
 pub(super) fn register(
@@ -814,7 +814,7 @@ mod tests {
 				.expect("after epoch"),
 		);
 		assert_eq!(jwt_expiry("not-a-jwt", now), expected);
-		let payload = base64_url::encode_raw(br#"{}"#).into_string();
+		let payload = base64_url::encode_raw(br"{}").into_string();
 		assert_eq!(jwt_expiry(&format!("header.{payload}.signature"), now), expected);
 	}
 }

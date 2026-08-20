@@ -742,13 +742,15 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		)),
 		opened: Arc::clone(&opened),
 	};
-	let mut snapshot = AgentSnapshot::default();
-	snapshot.retry = RetryPolicy::new(
-		NonZeroU32::new(3).expect("three is non-zero"),
-		Duration::from_millis(10),
-		Duration::from_millis(10),
-	)
-	.expect("constant retry policy");
+	let snapshot = AgentSnapshot {
+		retry: RetryPolicy::new(
+			NonZeroU32::new(3).expect("three is non-zero"),
+			Duration::from_millis(10),
+			Duration::from_millis(10),
+		)
+		.expect("constant retry policy"),
+		..Default::default()
+	};
 	let (env, _transport) = EnvClient::in_process(1);
 	let mut agent = Agent::new(client, env, AgentState::new(snapshot), journal, CapsBase {
 		maximum_parts:      16,
@@ -761,7 +763,10 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		.submit([user_text("original")], TurnId::new("root"))
 		.await
 		.expect_err("bounded upstream recovery must surface the final failure");
-	assert!(matches!(&error, AgentError::Turn(Error::Terminal(_))));
+	assert!(matches!(
+		&error,
+		AgentError::Turn(Error::Terminal(_))
+	));
 	assert!(error.to_string().contains("provider detail"));
 	{
 		let attempts = opened.lock();

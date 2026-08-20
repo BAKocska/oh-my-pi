@@ -1,3 +1,5 @@
+//! Integration tests for terminal event stream continuity.
+
 use omp_docserver::client::terminal_event_channel;
 
 #[tokio::test]
