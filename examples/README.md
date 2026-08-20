@@ -91,7 +91,7 @@ real extensions; everything below is namespace-specific.
 
 | Missing from the frozen layer | Ports blocked | Owning doc |
 |---|---|---|
-| `omp.BashIR` | 2 | `docs/py/06` |
+| *(none remaining as of 2026-08-20)* | — | — |
 
 The resolved divergence rulings are reflected in the ports: documents expose
 `revision` and `uri`; LSP server values stay opaque; named processes use
@@ -188,3 +188,34 @@ gate cannot catch. Exact citations in each example's README.
 | `omp.journal.latest`/`fold` helpers absent | `fresh-loop/` | `journal.py:94-119` |
 | `Context` exposes no current `RouteRef` and no thinking selection — third round in a row the turn_start `thinking` patchability ruling surfaces (`plan-mode`, `profiles`, `project-model-pin`) | `project-model-pin/`, `profiles/` | `_context.py:32-54`, `events.py:399-414` |
 | Async `omp.urls.read` absent (typed `HistoryUrl.read` works via bindings) | `side-chat/` | `urls.py:334-348` |
+**Resolved 2026-08-20:** All Round 4 clusters closed across the frozen Python
+layer, wire protocol, envd, and authoritative docs: (1) the sessions mutation
+design landed — `get`/`lineage`/`resume`/`rename`/`delete` (delete
+approval-gated), `SessionLink`/`SessionNotFound`, module-local
+`omp.sessions.Cost`, the `SessionKind` import bug fixed and the underlying
+top-level collision resolved by renaming the sandbox enum to
+`SandboxSessionKind`; (2) env-brokered HTTP ships — 11 §q6's "ship nothing"
+posture is superseded by a dated ruling: `HttpRequest`/`HttpResponse` egress
+frames, an `env.net`-gated envd client (wreq, per-request timeout, 256 KiB
+cap), and `http_get`/`http_post`/`http_put` verbs; (3) schedule values
+completed (`Inject` prompt payload, `BeforeAgentStartEvent.schedule_id`;
+`Every` stays the documented `(interval, jitter, align)`); (4) `@omp.approver`
++ `omp.policy.decide`; (5) the `omp.secrets` namespace with core-side masking;
+(6) UI: `ui.set_clipboard` (doc gap fixed), validated + registered shortcuts
+with top-level `omp.shortcut`, host-fed `OverlayHandle.events` watched
+interactions; (7) provider catalog: `ModelPatch`/`ModelOverlay`/`ScopedAlias`,
+`Failover.rotate_account` successor targeting,
+`CredentialSource.application_default`, typed image caps and the
+`ProviderHandle.request` seam (ruled like Round 3's SEARCH seam),
+`provider_refresh` ruled a phase-free domain hook; (8) `omp.devices.list` +
+`DeviceInfo` metadata, env `Pty`/`PathMeta`/`FileKind`/worktree topology,
+`journal.latest`/`fold`, async `omp.urls.read`; (9) the three-round
+`turn_start.thinking` ruling — patchable fields widen to
+model/route/deadline/thinking and `Context` exposes the current route and
+thinking selection; (10) the examples gate gained the requested stub-scan:
+frozen-but-NotWired symbols are reported distinctly from missing ones, and
+the gate now runs 66/66 green after stale `# GAP:` markers and resolved Gaps
+claims were reconciled (ports whose declarations the docs proved illegal —
+non-TRANSFORM `order`, observation `on_failure`, `@omp.tool` `family=`,
+missing loopback trust — were corrected to the documented contract).
+

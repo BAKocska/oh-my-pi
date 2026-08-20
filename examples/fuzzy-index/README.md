@@ -12,5 +12,4 @@ The intended catalog policy is a sub-CORE claim: core retains its model slot, th
 
 ## Gaps
 
-- **Sub-CORE claims are absent from the frozen API.** `omp.Precedence` and the documented `replaces=` / `precedence=` parameters of `omp.device` are missing from `crates/py/python/omp/__init__.py` (`device`, lines 361–368), despite `docs/py/01-devices.md` § “Namespacing and ordered precedence” and § “`@ff-labs/pi-fff` → precedence over `grep`”. Consequently this port uses the explicitly allowed plain-soft-device fallback and cannot demonstrate shadowed claimant-qualified dispatch.
-- **A rescan cannot trigger a supported rebuild.** No `WATCH_RESCANNED` event exists in `crates/py/python/omp/events.py`, and `_Workers.restart` is absent from `crates/py/python/omp/placement.py`, despite `docs/py/11-env.md` open question 4 (“Document events and the walker cache”) and `docs/py/04-placement.md` § `omp.workers` documenting `await omp.workers.restart(...)`. The index therefore rebuilds on worker generation boot only; workspace-wide watch coherence remains the stated open Q4.
+- **Workspace-wide watch coherence remains open.** No `WATCH_RESCANNED` event exists in `crates/py/python/omp/events.py`, matching `docs/py/11-env.md` open question 4 (“Document events and the walker cache”).

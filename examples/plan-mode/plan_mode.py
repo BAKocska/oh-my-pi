@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 import omp
-from omp import BashIR  # GAP: not exported by frozen layer (docs/py/06-policy.md §4)
-from omp import ModelRef  # GAP: not exported by frozen layer (docs/py/05-hooks.md §3.3)
+from omp import BashIR
+from omp import ModelRef
 
 _SESSION = omp.StateScope.SESSION
 _DENIAL_CODE = "plan_readonly"
@@ -113,7 +113,6 @@ async def plan(args: PlanArgs, ctx: omp.Context) -> dict[str, object]:
 @omp.hook(
     "tool_call",
     phase=omp.HookPhase.PRECHECK,
-    order=50,
     on_failure=omp.OnFailure.DENY,
 )
 async def deny_writes_while_planning(

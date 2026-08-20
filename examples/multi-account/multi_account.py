@@ -175,7 +175,7 @@ def _account_state(meta: omp.CredentialMeta | None) -> str:
     return "ready"
 
 
-@omp.tool("accounts", kind="soft", family="multi-account", rev=1)
+@omp.device("accounts", family="multi-account", rev=1)
 async def accounts(
     args: AccountsArgs, ctx: omp.Context
 ) -> AccountsPayload | AccountsFault:

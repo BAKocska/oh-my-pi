@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Mapping
 
 import omp
-from omp.telemetry import OtlpTarget, ProcessTarget, export  # GAP: not in frozen layer (docs/py/10 §export targets)
+from omp.telemetry import OtlpTarget, ProcessTarget, export
 
 TRACE_KINDS = (
     "turn_start",

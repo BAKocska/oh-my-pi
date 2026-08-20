@@ -8,5 +8,4 @@ The bundled parser, WASM payload, parse timeout, and shell-token heuristics are 
 
 ## Gaps
 
-- `omp.BashIR` is not exported by the frozen layer (`docs/py/06` §BashIR).
 - No frozen-versus-documented signature divergence was encountered for `omp.state`: this port uses the frozen async `latest(kind, *, scope)` and `append(entry, *, scope, idempotency_key=None)` signatures directly.

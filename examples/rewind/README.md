@@ -10,5 +10,4 @@ There is no shadow repository, private ref, pruning routine, checkpoint cap, sid
 
 ## Gaps
 
-- `omp.agents.RestoreScope`, `omp.agents.RewindPending`, `omp.agents.rewind`, and `omp.agents.snapshot` are documented in `docs/py/12-agents.md` §Time travel but are absent from `crates/py/python/omp/agents.py` and its `__all__`. The example imports the documented symbols with an inline GAP marker and cannot execute against the frozen package until that module exports and wires them.
 - The documented generation vocabulary diverges internally: `docs/py/12-agents.md` §Time travel defines `Snapshot.generation: int` as monotonic, while its §`crates/env` + `crates/app/src/envd` — workspace generations and `docs/py/11-env.md` §Closing the remaining gaps define a generation as the blob-manifest hash. This port follows the requested storage invariant and journals `Snapshot.id`, the documented content-addressed manifest identifier.

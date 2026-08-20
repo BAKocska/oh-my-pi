@@ -11,5 +11,4 @@ This port declares `alt+shift+x` as a lazy shortcut and `/paste-cut` as a lazy c
 ## Gaps
 
 - Required symbol `omp.ui.set_clipboard(text: str) -> None` is absent. The frozen effect list in `crates/py/python/omp/ui/__init__.py:524-542` has no clipboard or OSC 52 verb, and `docs/py/07-ui.md` §4.16 (`:1688-1720`) documents no clipboard effect. Until that client-owned effect exists, the shortcut deliberately faults before clearing the composer rather than pretending a notification, subprocess, or raw escape copied the text.
-- Documented symbol `omp.shortcut` is absent from the frozen top-level exports in `crates/py/python/omp/__init__.py:349-351`, despite `docs/py/07-ui.md` §4.14 (`:1514-1519`) specifying `@omp.shortcut`. This example must use the available `omp.ui.shortcut` spelling.
 - Frozen `omp.ui.shortcut` at `crates/py/python/omp/ui/__init__.py:704-707` only stores a callback: it neither validates the chord nor adds a shortcut declaration to `omp._declarations`. That diverges from `docs/py/07-ui.md` §4.14 (`:1521-1545`) and the generated declaration contract in `docs/py/14-deploy.md` §3.1.5 (`:652-691`), so this example must hand-author its manifest row.

@@ -10,5 +10,4 @@ The custom authorizer engine, AST walker, cwd folder, polling mailbox, and await
 
 ## Gaps
 
-- `omp.BashIR` is not exported by the frozen layer yet (docs/py/06-policy.md §Bash IR).
 - No frozen-vs-docs signature divergence is exercised beyond those missing symbols.

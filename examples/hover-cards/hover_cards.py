@@ -33,7 +33,7 @@ class CardFault(omp.Fault):
     detail: str
 
 
-@omp.tool("hover_card", kind="soft", family="hover-card", rev=1)
+@omp.device("hover_card", family="hover-card", rev=1)
 async def hover_card(args: CardArgs, ctx: Context) -> CardPayload | CardFault:
     """Return user-safe content for the declaratively interactive result card."""
 

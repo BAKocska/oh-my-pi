@@ -598,8 +598,9 @@ assert all(
     getattr(omp, name) is getattr(provider_module, name)
     for name in (
         "DiscoveryDefaults", "DiscoveryKind", "DiscoveryPage", "DiscoveryQuery",
-        "DiscoverySpec", "Pagination", "ProviderHandle", "RedirectTrust",
-        "RouteLimits", "TrustDomain",
+        "DiscoverySpec", "LoginRequest", "Pagination", "ProviderHandle",
+        "RedirectTrust", "RefreshReason", "RefreshRequest", "RouteLimits",
+        "SignRequest", "TrustDomain",
     )
 )
 assert tuple(member.value for member in omp.DiscoveryKind) == (
@@ -624,12 +625,17 @@ defaults = omp.DiscoveryDefaults(routes=("local",))
 assert defaults.cost == omp.Cost.free()
 assert defaults.operations == frozenset({omp.Operation.CHAT})
 https_route = omp.RouteSpec("remote", "https://example.test/v1", omp.Api.OPENAI_CHAT)
+in_process_route = omp.RouteSpec(
+    "usage", "local://synthetic-provider", omp.Api.LOCAL,
+    transport=omp.Transport.LOCAL,
+)
 loopback_route = omp.RouteSpec(
     "local", "http://127.0.0.1:1234/v1", omp.Api.OPENAI_CHAT,
     discovery=discovery_spec, trust=omp.TrustDomain.loopback(),
     limits=omp.RouteLimits(max_context_tokens=8192),
 )
 assert https_route.trust.origin == "https://example.test"
+assert in_process_route.trust.origin == "local://synthetic-provider"
 assert loopback_route.trust.origin == "http://127.0.0.1:1234"
 expect_raises(
     ValueError,
@@ -700,8 +706,9 @@ expect_raises(omp.NotWiredError, lambda: omp.secrets.declare(secret_rule))
 expect_raises(omp.NotWiredError, lambda: omp.secrets.mask("TOKEN"))
 
 # Residual closures: catalog, Environment values, journal projections, and URL reads.
+devices_module = importlib.import_module("omp.devices")
 assert {"provenance", "slotted", "schema_bytes", "schema_tokens"} <= set(
-    devices_module.DeviceInfo.__dataclass_fields__
+	devices_module.DeviceInfo.__dataclass_fields__
 )
 asyncio.run(expect_raises_async(omp.NotWiredError, omp.devices.list()))
 pty = omp.env.Pty(rows=24, columns=80)
@@ -759,6 +766,7 @@ assert selection_context.route is selected_route
 assert selection_context.thinking is omp.Effort.HIGH
 
 # Sessions: typed lineage, indexed cost, and host-owned mutation requests.
+assert omp.SandboxSessionKind is omp.policy.SandboxSessionKind
 assert omp.SessionKind is omp.sessions.SessionKind
 assert omp.SessionLink is omp.sessions.SessionLink
 assert omp.SessionNotFound is omp.sessions.SessionNotFound

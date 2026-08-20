@@ -12,4 +12,4 @@ The detached broker daemon is deleted because routing is Core-owned and project-
 
 ## Gaps
 
-- `omp.agents.send`, `omp.agents.inbox`, `omp.agents.wait_for`, `omp.agents.peers`, `omp.agents.Message`, and `omp.agents.AgentRef` are documented in `docs/py/12-agents.md` §Inter-session messaging (and §Listing, revival, and limits for `AgentRef`) but are absent from the frozen `crates/py/python/omp/agents.py` exports. The module therefore carries the round-1 GAP import exactly as documented; no local broker or substitute transport masks the defect.
+None — every symbol this port needs is frozen.

@@ -56,6 +56,25 @@ class _StubValue:
     def __bool__(self) -> bool:
         return False
 
+    # Frozen modules compare and combine native values (Duration floors,
+    # budget arithmetic); the inert stand-in must stay permissive there too.
+    def __lt__(self, _other: Any) -> bool:
+        return False
+
+    def __le__(self, _other: Any) -> bool:
+        return False
+
+    def __gt__(self, _other: Any) -> bool:
+        return False
+
+    def __ge__(self, _other: Any) -> bool:
+        return False
+
+    def __add__(self, _other: Any) -> "_StubValue":
+        return self
+
+    __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
+
 
 _VALUE = _StubValue()
 
@@ -66,7 +85,18 @@ class _NativeMeta(type):
 
 
 class _NativeError(Exception, metaclass=_NativeMeta):
-    """Common inert native type; exception ancestry supports package errors."""
+    """Common inert native type; exception ancestry supports package errors."""    # Native value types (Duration, budgets) are compared and combined by the
+    # frozen modules at import time; instances must stay inert there too.
+    def __lt__(self, _other: Any) -> bool:
+        return False
+
+    __le__ = __gt__ = __ge__ = __lt__
+
+    def __add__(self, _other: Any) -> "_NativeError":
+        return self
+
+    __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
+
 
 
 class _NativeModule(types.ModuleType):

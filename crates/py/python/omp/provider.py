@@ -570,13 +570,14 @@ class RouteSpec:
         trust = self.trust
         if not isinstance(trust, TrustDomain):
             raise TypeError("RouteSpec.trust must be TrustDomain")
-        if trust.allow_plaintext:
-            if not _is_loopback(self.base_url):
-                raise ValueError(
-                    "TrustDomain.loopback() requires a loopback host or Unix socket path"
-                )
-        elif urlsplit(self.base_url).scheme.lower() != "https":
-            raise ValueError("plaintext routes require TrustDomain.loopback()")
+        if self.transport is not Transport.LOCAL:
+            if trust.allow_plaintext:
+                if not _is_loopback(self.base_url):
+                    raise ValueError(
+                        "TrustDomain.loopback() requires a loopback host or Unix socket path"
+                    )
+            elif urlsplit(self.base_url).scheme.lower() != "https":
+                raise ValueError("plaintext routes require TrustDomain.loopback()")
         if not trust.origin:
             object.__setattr__(
                 self,

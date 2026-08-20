@@ -21,6 +21,4 @@ Deleted mechanisms:
 
 ## Gaps
 
-The frozen layer cannot yet construct the documented named-process launch options. `omp.env.proc.ensure` exists but accepts opaque `**options` (`crates/py/python/omp/env.py:863-869`), while `omp.env.RestartPolicy`, `omp.env.ReadyLog`, `omp.env.ReadyTcp`, and `omp.env.ReadyAll` are absent from that module and its export list (`crates/py/python/omp/env.py:945-997`). They are required by `docs/py/11-env.md` §“Process value types” (lines 1160-1177), and this port deliberately names that documented surface rather than inventing dictionary wire shapes.
-
 Gap closure should reuse the already-frozen top-level `omp.Restart` vocabulary from `crates/py/python/omp/placement.py:19-21` for both workers and named processes instead of creating a second Python enum. The readiness family should likewise track the protocol's `ReadyProbe` variants: log, TCP, and the ratified Ping/Pong probe (`crates/proto/proto/omp/env/v1/env.proto:274-297`; `docs/py/04-placement.md` §“Resolved,” lines 2585-2592). If combined `ReadyAll(log, tcp)` remains the Python contract required here, it also needs an honest wire representation: the current protocol field is a single `oneof`, despite `docs/py/11-env.md:1171-1176` claiming combined probes mirror that wire exactly.

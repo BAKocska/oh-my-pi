@@ -5,7 +5,7 @@ import json
 
 import omp
 from omp import Context, Faulted, LiftedCall, Ok, Part, Payload, PromptCaps, RecordedCall, Rev
-from omp.env import Format, OnStale  # GAP: not in frozen layer yet (docs/py/11 §Document leases)
+from omp.env import Format, OnStale  
 
 _DIALECT_DOCS = """HLX edit dialect
 Pass one `patch` string containing hashline sections. Each section starts `[PATH#TAG]`; use `PUT`, `CUT`, `REM`, or `MV`, and prefix every replacement-body line with `+`. A call may mention only one document path so its mutation stays on one revision-pinned lease.

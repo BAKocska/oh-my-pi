@@ -11,4 +11,3 @@ PRECHECK performs only classification and returns `Defer`, preserving the deny-o
 ## Gaps
 
 - `omp.env.PathMeta` and `omp.env.FileKind` are documented as the typed return and discriminator for `fs.lstat` in `docs/py/11-env.md` §Raw filesystem value types (lines 908–922), but neither symbol exists in frozen `crates/py/python/omp/env.py`; `_Fs.lstat` instead returns `Any` at lines 600–602. This port normalizes the backend receipt's documented `kind` field until the frozen layer exports those types.
-- A first-class `omp.env.worktree` topology query is absent: frozen `crates/py/python/omp/env.py:49-50` exposes only `Capability.WORKTREE`, while `docs/py/11-env.md` §Connection and capability (lines 354–365) says the worktree capability is grantable but unimplemented and covers isolated creation/destruction/merge, not topology. The `.git` `lstat` fallback is Environment-routed and remote-safe, but the missing topology symbol remains a frozen-layer gap.

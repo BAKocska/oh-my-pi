@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from omp import Duration, StateScope, state
-from omp import BashIR  # GAP: not in frozen layer yet (docs/py/06 §BashIR)
+from omp import BashIR
 from omp import Context
 from omp import Defer
 from omp import Deny

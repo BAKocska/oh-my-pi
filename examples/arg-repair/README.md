@@ -28,6 +28,4 @@ Nothing scans thinking text for tool calls: only a provider-emitted tool invocat
 
 ## Gaps
 
-- **`omp.Field` argument metadata is absent.** The frozen top-level exports in `crates/py/python/omp/__init__.py:21-62,305-321` expose no `omp.Field`; `crates/py/python/omp/ui/__init__.py:311` defines only the unrelated native-form `omp.ui.Field`. Required by `docs/py/03-params.md` §Charitable decoding / `omp.Field` and §`crates/tool` item 1.
-- **`omp.Coerce` is absent.** The frozen top-level exports in `crates/py/python/omp/__init__.py:21-62` contain no coercion vocabulary, while `docs/py/03-params.md` §`omp.Coerce` requires `CSV`, `SINGLETON`, and the other declared coercions.
 - **Registered argument metadata cannot be introspected.** `DeviceDefinition` in `crates/py/python/omp/_registry.py:114-133` stores `schema` and device-name `aliases` but no per-revision argument-spec table, and `DeclarationRegistry` exposes no argument-spec accessor. `docs/py/03-params.md` §`crates/tool` item 1 requires immutable `ArgSpec` storage per `Rev`; §`crates/py` requires `Annotated` metadata to be lowered once at import. Consequently the requested frozen-registry introspection smoke cannot be run until that surface exists.

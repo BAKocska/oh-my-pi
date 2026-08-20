@@ -840,7 +840,7 @@ class ScheduleBudget:
 
     max_usd_per_firing: float | None = None
     max_usd_per_window: float | None = None
-    window: Duration = Duration(seconds=30 * 24 * 60 * 60)
+    window: Duration = Duration("720h")
     max_requests_per_firing: int | None = None
 
 

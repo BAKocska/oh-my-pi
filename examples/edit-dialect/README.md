@@ -10,5 +10,4 @@ The `hl.1` lift deterministically rewrites the old `{“input”: ...}` argument
 
 ## Gaps
 
-- `omp.env.Format` and `omp.env.OnStale` are documented options for `Doc.hashline` but are not exported by the frozen environment module.
 - `Doc.dry_run` and typed hashline edit-result values are not frozen yet, so this port cannot emit a dry-run preview or statically check those result fields.

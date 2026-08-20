@@ -8,5 +8,4 @@ Following `docs/py/10-telemetry.md` §1 and §export targets, this port declares
 
 ## Gaps
 
-- `omp.telemetry.ProcessTarget`, `omp.telemetry.OtlpTarget`, and `omp.telemetry.export` are documented in `docs/py/10-telemetry.md` §export targets (lines 1357–1412) but are absent from the frozen `crates/py/python/omp/telemetry.py` exports (`__all__`, lines 258–262). The documented imports are retained with a GAP marker, so compilation succeeds but activation cannot import until the frozen layer lands them.
 - Extension counter qualification diverges from `docs/py/10-telemetry.md` §Semconv (lines 159–165): frozen `crates/py/python/omp/telemetry.py::_instrument_name` (lines 216–219) emits the literal placeholder `omp.ext.<extension>.<name>` rather than `omp.ext.<id>.<name>`, and `Counter.add` (lines 188–192) is not wired. `EVENTS_SEEN` therefore states the intended declaration but cannot yet record the required `omp.ext.examples.trace-export.*` series.

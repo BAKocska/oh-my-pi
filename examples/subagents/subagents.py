@@ -6,15 +6,15 @@ from typing import Literal
 
 from omp import Context, Duration, device
 from omp.agents import (
-    AgentGone,  # GAP: not in frozen layer (docs/py/12-agents.md, "Exceptions")
-    AgentKind,  # GAP: not in frozen layer (docs/py/12-agents.md, "Listing, revival, and limits")
-    Budget,  # GAP: not in frozen layer (docs/py/12-agents.md, "Spawning")
+    AgentGone,
+    AgentKind,
+    Budget,
     DeliveryMode,
     SubagentSpec,
-    Usage,  # GAP: frozen fields diverge from docs/py/12-agents.md, "The handle"
-    get as get_agent,  # GAP: not in frozen layer (docs/py/12-agents.md, "Listing, revival, and limits")
-    list as list_agents,  # GAP: not in frozen layer (docs/py/12-agents.md, "Listing, revival, and limits")
-    spawn_all,  # GAP: not in frozen layer (docs/py/12-agents.md, "Spawning")
+    Usage,
+    get as get_agent,
+    list as list_agents,
+    spawn_all,
 )
 
 
@@ -138,7 +138,7 @@ def _spec(member: SwarmMember) -> SubagentSpec:
         model=member.model,
         background=member.detached,
         max_depth=member.max_depth,
-        budget=budget,  # GAP: absent from frozen SubagentSpec; documented in docs/py/12-agents.md.
+        budget=budget,
     )
 
 

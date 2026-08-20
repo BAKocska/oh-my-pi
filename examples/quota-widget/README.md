@@ -13,4 +13,3 @@ The private provider HTTP client and extension-owned cache file are deleted. Cor
 ## Gaps
 
 - `provider_usage` return handling diverges: the frozen layer classifies it as an observation event in `crates/py/python/omp/hooks.py:280-290`, while `docs/py/13-inference.md:1266-1275` and `docs/py/13-inference.md:1490-1522` specify a provider-scoped hook returning `UsageReport | None`. The example returns the documented report, but the frozen observation dispatch contract may discard it.
-- The documented top-level `@omp.command` is absent: `crates/py/python/omp/__init__.py:230-239,291-293` exports `ui` and only re-exports `renderer`, while the available decorator is `omp.ui.command` at `crates/py/python/omp/ui/__init__.py:653-656`. This example uses the frozen spelling; `docs/py/07-ui.md:376-378,1568-1576` requires the top-level spelling.

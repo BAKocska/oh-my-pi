@@ -144,7 +144,7 @@ def _approval(event: omp.ToolCallEvent) -> omp.RequireApproval:
     )
 
 
-@omp.hook("extension_activate", phase=omp.HookPhase.OBSERVE, order=0)
+@omp.hook("extension_activate", phase=omp.HookPhase.OBSERVE)
 async def activate(payload: object, ctx: omp.Context) -> None:
     """Install extension-authored secret rules beside Core's built-ins."""
 
@@ -155,7 +155,6 @@ async def activate(payload: object, ctx: omp.Context) -> None:
 @omp.hook(
     "tool_call",
     phase=omp.HookPhase.PRECHECK,
-    order=-100,
     on_failure=omp.OnFailure.DENY,
 )
 async def deny_secret_reads(
@@ -175,7 +174,6 @@ async def deny_secret_reads(
 @omp.hook(
     "tool_call",
     phase=omp.HookPhase.APPROVAL,
-    order=-100,
     on_failure=omp.OnFailure.DENY,
 )
 async def review_dynamic_reads(
@@ -189,7 +187,7 @@ async def review_dynamic_reads(
     return omp.Defer()
 
 
-@omp.hook("tool_call", phase=omp.HookPhase.OBSERVE, order=100)
+@omp.hook("tool_call", phase=omp.HookPhase.OBSERVE)
 async def count_redaction_hits(event: omp.ToolCallEvent, ctx: omp.Context) -> None:
     """Count calls for which Core's masker changes the unredacted policy input."""
 

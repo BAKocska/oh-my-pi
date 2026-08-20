@@ -14,4 +14,4 @@ Deleted mechanisms: 49 eager MCP schema slots, harness-owned native-process life
 
 ## Gaps
 
-- `omp.Update` and `omp.Done` are absent from the frozen public layer: `crates/py/python/omp/_verdicts.py:17-142` defines `Payload`, `BlobPart`, and `Part` but no streaming events, and `crates/py/python/omp/__init__.py:85-106` cannot re-export them. This diverges from `docs/py/01-devices.md:268-302` (the v1 `AsyncIterator[Update | Done]` body contract) and `docs/py/03-params.md:149-175` (the exact constructors). The example uses those documented names so the stub smoke can exercise the intended stream, but a real frozen-layer invocation cannot emit its frames until the symbols exist.
+None — every symbol this port needs is frozen.

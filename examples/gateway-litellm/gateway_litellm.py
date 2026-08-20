@@ -19,6 +19,7 @@ from omp import (
     Operation,
     ProviderSpec,
     RouteSpec,
+    TrustDomain,
 )
 from omp.provider import DiscoveryPage, DiscoveryQuery
 
@@ -39,6 +40,7 @@ _LITELLM_SPEC = ProviderSpec(
             id=_ROUTE,
             base_url=_DEFAULT_BASE_URL,
             api=Api.OPENAI_CHAT,
+            trust=TrustDomain.loopback(),
             auth=AuthSpec(
                 mode=AuthMode.BEARER,
                 header="authorization",
@@ -149,7 +151,6 @@ def _model_info_url(ctx: omp.Context) -> str:
 
 @omp.hook(
     "models_discover",
-    phase=omp.HookPhase.TRANSFORM,
     provider="litellm",
     on_failure=omp.OnFailure.DEFER,
 )

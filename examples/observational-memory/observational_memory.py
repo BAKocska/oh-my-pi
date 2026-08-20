@@ -87,8 +87,6 @@ async def record_outcome(ev: omp.ToolResultEvent, ctx: omp.Context) -> None:
     omp.journal.append(_observation(ev))
 
 
-# GAP: omp.hook rejects the documented domain-return form because frozen hooks.py
-# omits "compaction" from _DOMAIN_EVENTS (docs/py/08-context.md §2).
 @omp.hook("compaction")
 async def supply_fold(
     ev: omp.CompactionEvent, ctx: omp.Context
@@ -96,8 +94,6 @@ async def supply_fold(
     """Supply a validated, deterministic ledger summary for the LOCAL tier."""
 
     del ctx
-    # GAP: CompactionTier and CustomSummary are not exported by the frozen layer
-    # (docs/py/08-context.md §Compaction control).
     if ev.tier is not omp.CompactionTier.LOCAL:
         return None
     observations = _ledger()
@@ -133,8 +129,6 @@ async def request_compaction(
     if not _ledger():
         return None
     try:
-        # GAP: omp.context and omp.CompactionBusy are absent from the frozen layer
-        # (docs/py/08-context.md §omp.ContextEpoch and omp.context).
         await omp.context.compact()
     except omp.CompactionBusy:
         pass

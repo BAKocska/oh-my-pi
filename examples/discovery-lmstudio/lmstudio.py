@@ -99,7 +99,6 @@ class LmStudio:
 @omp.hook(
     "models_discover",
     provider="lmstudio",
-    phase=omp.HookPhase.TRANSFORM,
     on_failure=omp.OnFailure.DEFER,
 )
 async def _discover(query: DiscoveryQuery, ctx: Context) -> DiscoveryPage:

@@ -14,4 +14,4 @@ This differs from `examples/goal-loop`: goal-loop returns `Continue` at the sett
 
 ## Gaps
 
-- `omp.journal.latest` and `omp.journal.fold` are documented in docs/py/09-journal.md, “`omp.journal`” (§§ `omp.journal.latest` and `omp.journal.fold`), but are absent from the frozen `crates/py/python/omp/journal.py:94-119` surface. This port uses the available `omp.journal.entries` fold instead.
+None — every symbol this port needs is frozen.

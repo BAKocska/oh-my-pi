@@ -453,7 +453,7 @@ class DnsPolicy(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
 
-class SessionKind(StrEnum):
+class SandboxSessionKind(StrEnum):
     """Classify the confined execution session."""
     TOOL = "tool"
     USER = "user"
@@ -591,7 +591,7 @@ class SandboxProfile:
 @dataclass(frozen=True, slots=True)
 class SandboxRequest:
     """Describe a request to establish a sandboxed session."""
-    session_kind: SessionKind
+    session_kind: SandboxSessionKind
     cwd: EnvPath
     roots: tuple[WorkspaceUri, ...]
     backends: tuple[SandboxBackend, ...]
@@ -627,7 +627,7 @@ class Violation:
     profile: str
     rule: str | None
     backend: SandboxBackend
-    session_kind: SessionKind
+    session_kind: SandboxSessionKind
     invocation_id: str | None
     command_index: int | None
     pid: int | None
@@ -790,6 +790,6 @@ __all__ = (
     "PathOrigin", "PathRef", "PathRule", "PolicyDenied", "PolicyError", "ProcessGrade", "ProcessSubDirection", "ProcessSubIR",
     "ProfileHandle", "ProfileRejected", "ProfileWidened", "Quoting", "RedirectOp", "RedirectTarget", "ResourceBudget", "RuleEffect",
     "RuleRef", "SandboxBackend", "SandboxCapabilities", "SandboxEnforcement", "SandboxMode", "SandboxProfile", "SandboxRequest",
-    "Separator", "SessionKind", "Span", "TicketState", "Tier", "VIOLATION_COALESCE", "Violation", "ViolationKind",
+    "Separator", "SandboxSessionKind", "Span", "TicketState", "Tier", "VIOLATION_COALESCE", "Violation", "ViolationKind",
     "amend", "approver", "capabilities", "decide", "effective_profile", "enforcement", "install", "match_paths", "parse", "pending",
 )

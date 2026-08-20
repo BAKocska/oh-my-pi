@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import omp
-# GAP: these documented inference symbols are absent from the frozen layer
-# (docs/py/13-inference.md §§ModelFallback and provider_error).
 from omp import ErrorKind, Failover, ModelFallback, ProviderError, Retryability
 
 _SHORT_RATE_LIMIT = omp.Duration("20s")

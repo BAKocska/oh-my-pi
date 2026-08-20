@@ -86,8 +86,6 @@ async def pin_model(inv: ui.Invocation, ctx: omp.Context) -> ui.Consumed:
 @omp.hook(
     "model_changed",
     phase=omp.HookPhase.OBSERVE,
-    order=0,
-    on_failure=omp.OnFailure.DEFER,
 )
 async def remember_manual_override(
     event: omp.ModelChangedEvent, ctx: omp.Context

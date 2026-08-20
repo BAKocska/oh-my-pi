@@ -1160,7 +1160,7 @@ succeeded and configuration requires confinement, the session refuses to open wi
 ```python
 @dataclass(frozen=True, slots=True)
 class SandboxRequest:
-    session_kind: SessionKind
+    session_kind: SandboxSessionKind
     cwd: EnvPath
     roots: tuple[WorkspaceUri, ...]           # workspace roots, primary first (docs/py/14-deploy.md)
     backends: tuple[SandboxBackend, ...]      # what this environment can actually enforce
@@ -1168,7 +1168,7 @@ class SandboxRequest:
     process_name: str | None                  # set for named processes
 ```
 
-`omp.SessionKind` is a `StrEnum`: `TOOL` (a `shell` invocation), `USER` (a user-typed command),
+`omp.SandboxSessionKind` is a `StrEnum`: `TOOL` (a `shell` invocation), `USER` (a user-typed command),
 `PROCESS` (a named long-running process), `WORKER` (an extension worker; see
 `docs/py/04-placement.md`).
 
@@ -1258,7 +1258,7 @@ class Violation:
     profile: str                          # SandboxProfile.label that denied it
     rule: str | None                       # the specific rule, when attributable
     backend: SandboxBackend
-    session_kind: SessionKind
+    session_kind: SandboxSessionKind
     invocation_id: str | None
     command_index: int | None              # index into the BashIR that was running
     pid: int | None
@@ -1861,7 +1861,7 @@ REGISTRIES = ("crates.io", "*.crates.io", "static.crates.io", "index.crates.io",
 
 @omp.hook("sandbox_profile", phase=omp.HookPhase.TRANSFORM)
 def profile(request: omp.SandboxRequest, ctx: omp.Context) -> omp.SandboxProfile | None:
-    if request.session_kind is omp.SessionKind.WORKER:
+    if request.session_kind is omp.SandboxSessionKind.WORKER:
         return None                        # workers are confined by docs/py/04-placement.md
     # Every root, not just the primary: an added directory that is readable but not
     # writable is a policy bug that only shows up in a multi-root session.

@@ -18,6 +18,6 @@ Deleted mechanisms:
 
 ## Gaps
 
-- `omp.agents.Budget`, `spawn_all`, `AgentGone`, `AgentKind`, `get`, and `list` are documented in `docs/py/12-agents.md` under “Spawning”, “The handle”, “Listing, revival, and limits”, and “Exceptions”, but are absent from `crates/py/python/omp/agents.py` and its `__all__` export at lines 279-285. The same frozen module also lacks the documented `SubagentHandle`, `SubagentResult`, `RunStatus`, `AgentRef`, and `Receipt` types needed to type the returned live objects.
+- The frozen module still lacks the documented `SubagentHandle`, `SubagentResult`, `RunStatus`, `AgentRef`, and `Receipt` types needed to type the returned live objects.
 - `omp.agents.SubagentSpec.budget` is documented in `docs/py/12-agents.md`, “Spawning” (`SubagentSpec` field table), but the frozen dataclass in `crates/py/python/omp/agents.py:174-185` has no `budget` field. The example imports the documented symbols and marks each dependency with `GAP` rather than creating a local substitute.
 - `omp.agents.Usage` is documented in `docs/py/12-agents.md`, “The handle”, with `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_write_tokens`, `requests`, `cost_usd`, and `wall`; the frozen `crates/py/python/omp/agents.py:14-23` instead exports `input`, `output`, `cache_read`, `cache_write`, `reasoning`, and `cost_usd`. `harvest` therefore passes `subtree_usage` through without inventing a competing projection.

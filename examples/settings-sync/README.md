@@ -14,6 +14,5 @@ Session synchronization is deliberately out of scope: the session journal is alr
 
 ## Gaps
 
-- `omp.env.http_put` is absent. The frozen environment exports only `http_get` (`crates/py/python/omp/env.py:905-913,1207-1209`), while `docs/py/11-env.md:2209-2211` says scoped HTTP egress belongs to `omp.env`. Consequently the push path can prepare and conflict-check its envelope but cannot transmit it.
 - `omp.env.http_get` exists but unconditionally raises `NotWiredError` (`crates/py/python/omp/env.py:905-913`), so pull-on-activate is durably recorded as deferred on the frozen layer. This is also acknowledged in `docs/py/13-inference.md:1767-1769`.
 - `omp.agents.schedule` unconditionally raises `NotWiredError` (`crates/py/python/omp/agents.py:923-936`) despite the durable schedule contract in `docs/py/12-agents.md:831-901`; therefore the declared `AfterIdle` push cannot arm on the frozen layer.

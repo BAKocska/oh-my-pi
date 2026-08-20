@@ -223,6 +223,7 @@ class Device:
         "enabled",
         "family",
         "identity",
+        "lift",
         "mounted",
         "name",
         "path",
@@ -231,6 +232,7 @@ class Device:
         "replaces",
         "rev",
         "schema",
+        "prompt",
         "shadowed_by",
         "shadows",
         "summary",
@@ -265,6 +267,11 @@ class Device:
         self.body = body
         self.enabled = True
         self.mounted = False
+        # Projection hooks per docs/py/02 §Projecting for the model: a device
+        # that declares a Payload assigns its pure `prompt(view, caps)` here;
+        # `lift(from_rev, call)` re-expresses historical calls across revisions.
+        self.prompt = None
+        self.lift = None
         self.shadows = ()
         self.shadowed_by = None
 

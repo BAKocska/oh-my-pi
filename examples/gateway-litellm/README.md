@@ -12,6 +12,4 @@ The synchronous `LITELLM_API_KEY_HELPER` request-path shell execution is deleted
 
 ## Gaps
 
-- `DiscoverySpec`, `DiscoveryKind`, and `DiscoveryDefaults` are documented in `docs/py/13-inference.md:624-662`, but the frozen `crates/py/python/omp/provider.py:395-405, 607-615, 1058-1071` types `RouteSpec.discovery` and `ProviderSpec.discovery_defaults` only as `object` and exports none of those symbols.
 - The documented `omp.provider(...)->ProviderHandle` / `ProviderHandle.replace` setting-time reconciliation surface (`docs/py/13-inference.md:256-321`) is absent: frozen `crates/py/python/omp/provider.py:1045-1055` only returns a class decorator. Consequently the declared inference route cannot be rebuilt from `ctx.settings.base_url` at activation.
-- The documented discovery transport `omp.env.http_get` (`docs/py/13-inference.md:1421-1424`) is absent from frozen `crates/py/python/omp/env.py:936-997`; `docs/py/11-env.md:2200-2209` instead records the later v1 ruling to ship no Environment HTTP client. The hook is written to the inference contract, but cannot execute on the frozen layer until those documents and the surface converge.

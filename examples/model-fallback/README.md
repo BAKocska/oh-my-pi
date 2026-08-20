@@ -8,5 +8,4 @@ This port follows docs/py/13-inference.md §§“ModelFallback” and “provide
 
 ## Gaps
 
-- `ErrorKind`, `ProviderError`, `Failover`, and `ModelFallback` are documented by docs/py/13-inference.md §§“ModelFallback” and “provider_error”, but are absent from `crates/py/python/omp/provider.py` and are not re-exported by `crates/py/python/omp/__init__.py`. The hook therefore cannot import on the current frozen layer.
-- `Retryability` and `ProviderError.retryability` are required by the typed-classification contract, but are absent from `crates/py/python/omp/provider.py`; docs/py/13-inference.md §“provider_error” also shows `ProviderError` without the field, so the frozen surface and that reference section both need the typed retry lane added.
+None — every symbol this port needs is frozen.

@@ -10,7 +10,5 @@ The original four-tier Keychain/SQLite/Linux/WSL harvest cascade is deleted rath
 
 ## Gaps
 
-- `omp.TrustDomain` is required by `docs/py/13-inference.md` §“TrustDomain and RouteLimits” and its class (c) worked port, but is absent from the frozen provider definitions/exports at `crates/py/python/omp/provider.py:25-205,1058-1072`.
 - `omp.creds.mint_scoped` and its `ScopedToken` result are required by `docs/py/13-inference.md` §“Credentials” (the `MintScopedToken` proxy flow at lines 1525-1564), but the frozen root surface has no `creds` facade in `crates/py/python/omp/__init__.py:442-492,930-932`.
 - `omp.env.Process.send_secret` (and the worked port's dynamic `Process.endpoint`) are required by `docs/py/13-inference.md` §“`@rahularya01/pi-cursor` — class (c)” at lines 1848-1869, but the frozen handle ends at `send`, `signal`, and `stop` in `crates/py/python/omp/env.py:755-786`. The port retains the documented secret-channel call and uses a fixed loopback endpoint; it does not substitute stdin or expose the stored credential.
-- `omp.env.RestartPolicy` and `omp.env.ReadyLog` are specified by `docs/py/11-env.md` §“Named processes” at lines 1160-1177, but are absent from the frozen `crates/py/python/omp/env.py:945-997` exports. `proc.ensure` currently accepts their untyped wire-shaped options through `**options` (`env.py:863-869`).

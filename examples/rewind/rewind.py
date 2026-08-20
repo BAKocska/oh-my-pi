@@ -7,7 +7,7 @@ from typing import Literal
 
 import omp
 from omp import Context, Payload, entry_kind, journal
-from omp.agents import (  # GAP: not in frozen layer (docs/py/12-agents.md § Time travel)
+from omp.agents import (
     RestoreScope,
     RewindPending,
     rewind as agent_rewind,
