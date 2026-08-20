@@ -1,15 +1,51 @@
+use std::borrow::Cow;
+
 use omp_core::{Str, fmts};
 use smallvec::SmallVec;
 use strum::{EnumString, IntoStaticStr};
 
 use crate::{
+	Icon,
 	component::{Component, PaintCtx, Slot, next_slot},
-	context::UiContext,
+	context::{Charset, UiContext},
 	frame::{Rect, Style},
 	markup::Border,
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
 };
+
+const VISIBLE_STAGE_LIMIT: usize = 5;
+const SPINE_TAIL_CELLS: usize = 6;
+
+/// Collapses multiline HUD copy onto one row using this terminal's return
+/// glyph.
+///
+/// Whitespace touching one or more line breaks is replaced by one padded
+/// marker. Single-line input is borrowed without allocation.
+pub fn collapse_hud_line(text: &str, charset: Charset) -> Cow<'_, str> {
+	if !text.contains('\r') && !text.contains('\n') {
+		return Cow::Borrowed(text);
+	}
+	let marker = charset.icon(Icon::Enter);
+	let mut collapsed = String::with_capacity(text.len().saturating_add(marker.len()));
+	let mut chars = text.chars().peekable();
+	while let Some(ch) = chars.next() {
+		if ch != '\r' && ch != '\n' {
+			collapsed.push(ch);
+			continue;
+		}
+		while collapsed.chars().next_back().is_some_and(char::is_whitespace) {
+			collapsed.pop();
+		}
+		while chars.peek().is_some_and(|next| next.is_whitespace()) {
+			chars.next();
+		}
+		collapsed.push(' ');
+		collapsed.push_str(marker);
+		collapsed.push(' ');
+	}
+	Cow::Owned(collapsed)
+}
 
 /// Lifecycle state of a [`TodoTask`], mirroring the coding agent's todo
 /// tracker: open work, the one active item, and the three closed shapes.
@@ -48,7 +84,7 @@ impl TaskStatus {
 /// One row of a [`Todo`] list, backing the `<task>` markup tag.
 ///
 /// A task with children renders as a group header with an automatic
-/// `done/total` count over its direct children; a leaf renders a status
+/// `closed/total` count over its descendant leaves; a leaf renders a status
 /// checkbox and its label. `status=` sets [`TaskStatus`]; `desc=` carries
 /// the blocker note shown by [`TaskStatus::Blocked`].
 pub struct TodoTask {
@@ -119,8 +155,11 @@ impl Default for TodoTask {
 /// A static todo list backing the `<todo>` markup tag.
 ///
 /// Children are [`TodoTask`] records; nesting produces tree guides in the
-/// family chosen by `guides=` (square by default). Unlike [`crate::Tree`],
-/// the list is display-only: no focus, keys, or collapse state.
+/// family chosen by `guides=` (square by default). The header is followed by
+/// a progress-colored outer spine and tail. When every root is a group, roots
+/// are treated as stages: the active stage plus four successors are shown and
+/// any remaining stages collapse into a summary row. The list is display-only
+/// and has no focus or keys.
 pub struct Todo {
 	props: Props,
 	slot:  Slot,
@@ -145,8 +184,10 @@ impl Todo {
 		self
 	}
 
-	/// Leaf `(done, total)` across the whole list, for host-built headers
-	/// like `3/14 tasks`.
+	/// Leaf `(closed, total)` across the whole list.
+	///
+	/// Finished and dropped work are both closed; pending, active, and blocked
+	/// work remain open.
 	pub fn counts(&self) -> (usize, usize) {
 		leaf_counts(&self.tasks)
 	}
@@ -155,23 +196,48 @@ impl Todo {
 		self.props.guides().unwrap_or(Border::Square)
 	}
 
-	fn row_count(tasks: &[TodoTask]) -> u16 {
-		let mut rows = 0u16;
-		for task in tasks {
-			rows = rows
+	fn row_count(tasks: &[TodoTask]) -> usize {
+		tasks.iter().fold(0usize, |rows, task| {
+			rows
 				.saturating_add(1)
-				.saturating_add(Self::row_count(&task.children));
+				.saturating_add(Self::row_count(&task.children))
+		})
+	}
+
+	fn is_stage_list(&self) -> bool {
+		!self.tasks.is_empty() && self.tasks.iter().all(|task| !task.children.is_empty())
+	}
+
+	fn stage_window(&self) -> (usize, usize) {
+		if !self.is_stage_list() {
+			return (0, self.tasks.len());
 		}
-		rows
+		let active = self
+			.tasks
+			.iter()
+			.position(has_open_work)
+			.unwrap_or_else(|| self.tasks.len().saturating_sub(1));
+		(active, active.saturating_add(VISIBLE_STAGE_LIMIT).min(self.tasks.len()))
+	}
+
+	fn visible_row_count(&self) -> usize {
+		let (start, end) = self.stage_window();
+		if !self.is_stage_list() {
+			return Self::row_count(&self.tasks[start..end]);
+		}
+		let active_rows = self.tasks.get(start).map_or(0, |task| 1 + Self::row_count(&task.children));
+		active_rows
+			.saturating_add(end.saturating_sub(start).saturating_sub(1))
+			.saturating_add(usize::from(end < self.tasks.len()))
 	}
 
 	fn max_width(tasks: &[TodoTask], depth: u16) -> u16 {
 		let mut widest = 0u16;
 		for task in tasks {
-			// gutter columns + connector + checkbox/count slack
+			// outer spine + nested gutters + checkbox/count slack
 			let width = cell_width(task.effective_label())
 				.saturating_add(depth.saturating_mul(2))
-				.saturating_add(10);
+				.saturating_add(13);
 			widest = widest
 				.max(width)
 				.max(Self::max_width(&task.children, depth + 1));
@@ -179,20 +245,32 @@ impl Todo {
 		widest
 	}
 }
-/// Leaf `(done, total)` under `tasks`; groups contribute their descendants.
+
+fn has_open_work(task: &TodoTask) -> bool {
+	if task.children.is_empty() {
+		matches!(task.effective_status(), TaskStatus::Pending | TaskStatus::Active)
+	} else {
+		task.children.iter().any(has_open_work)
+	}
+}
+
+/// Leaf `(closed, total)` under `tasks`; groups contribute their descendants.
 fn leaf_counts(tasks: &[TodoTask]) -> (usize, usize) {
-	let (mut done, mut total) = (0, 0);
+	let (mut closed, mut total) = (0, 0);
 	for task in tasks {
 		if task.children.is_empty() {
 			total += 1;
-			done += usize::from(task.effective_status() == TaskStatus::Done);
+			closed += usize::from(matches!(
+				task.effective_status(),
+				TaskStatus::Done | TaskStatus::Dropped
+			));
 		} else {
-			let (child_done, child_total) = leaf_counts(&task.children);
-			done += child_done;
+			let (child_closed, child_total) = leaf_counts(&task.children);
+			closed += child_closed;
 			total += child_total;
 		}
 	}
-	(done, total)
+	(closed, total)
 }
 
 impl Default for Todo {
@@ -215,14 +293,21 @@ impl Component for Todo {
 	}
 
 	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
-		(12, Self::max_width(&self.tasks, 0).max(12))
+		(12, Self::max_width(&self.tasks, 0).max(20))
 	}
 
 	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
-		Self::row_count(&self.tasks)
+		if self.tasks.is_empty() {
+			0
+		} else {
+			u16::try_from(self.visible_row_count().saturating_add(2)).unwrap_or(u16::MAX)
+		}
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		if self.tasks.is_empty() || rect.y >= pc.clip {
+			return;
+		}
 		let (branch, last, cont) = pc.ctx.charset.guides(self.family());
 		let glyphs = Glyphs {
 			branch,
@@ -232,9 +317,86 @@ impl Component for Todo {
 			unchecked: pc.ctx.charset.checkbox(false),
 		};
 		let mut y = rect.y;
+		pc.frame.put(
+			rect.x,
+			y,
+			"TODO",
+			Style::new().fg(pc.ctx.theme.accent).bold(),
+		);
+		y = y.saturating_add(1);
+
+		let content_rows = self.visible_row_count();
+		let (closed, total) = self.counts();
+		let path_cells = content_rows.saturating_add(SPINE_TAIL_CELLS);
+		let mut filled = if total == 0 {
+			0
+		} else {
+			closed
+				.saturating_mul(path_cells)
+				.saturating_add(total / 2)
+				/ total
+		};
+		if closed > 0 {
+			filled = filled.max(1);
+		}
+		if closed < total {
+			filled = filled.min(path_cells.saturating_sub(1));
+		}
+		let mut spine = Spine { filled, row: 0 };
 		let mut trail: SmallVec<bool, 8> = SmallVec::new();
-		paint_tasks(pc, rect, &glyphs, &self.tasks, &mut trail, &mut y);
+		let (start, end) = self.stage_window();
+		if self.is_stage_list() {
+			if let Some(active) = self.tasks.get(start) {
+				paint_tasks(
+					pc,
+					rect,
+					&glyphs,
+					std::slice::from_ref(active),
+					&mut trail,
+					&mut spine,
+					&mut y,
+					true,
+				);
+			}
+			for stage in &self.tasks[start.saturating_add(1)..end] {
+				paint_tasks(
+					pc,
+					rect,
+					&glyphs,
+					std::slice::from_ref(stage),
+					&mut trail,
+					&mut spine,
+					&mut y,
+					false,
+				);
+			}
+			if end < self.tasks.len() && y < rect.y.saturating_add(rect.height).min(pc.clip) {
+				let x = paint_spine(pc, rect.x, y, glyphs.branch, &mut spine);
+				let hidden = self.tasks.len() - end;
+				let ellipsis = if matches!(pc.ctx.charset, Charset::Ascii) { "..." } else { "…" };
+				let summary = fmts!("{ellipsis} {hidden} more stage{}", if hidden == 1 { "" } else { "s" });
+				pc.frame.put(x, y, &summary, Style::new().fg(pc.ctx.theme.muted));
+				y = y.saturating_add(1);
+			}
+		} else {
+			paint_tasks(
+				pc,
+				rect,
+				&glyphs,
+				&self.tasks[start..end],
+				&mut trail,
+				&mut spine,
+				&mut y,
+				true,
+			);
+		}
+		paint_spine_tail(pc, rect, &glyphs, &spine, y);
 	}
+}
+
+struct Spine {
+	filled: usize,
+	row:    usize,
 }
 
 struct Glyphs {
@@ -245,13 +407,53 @@ struct Glyphs {
 	unchecked: &'static str,
 }
 
+fn paint_spine(
+	pc: &mut PaintCtx<'_>,
+	x: u16,
+	y: u16,
+	glyph: &str,
+	spine: &mut Spine,
+) -> u16 {
+	let color = if spine.row < spine.filled { pc.ctx.theme.accent } else { pc.ctx.theme.muted };
+	spine.row = spine.row.saturating_add(1);
+	let x = pc.frame.put(x, y, glyph, Style::new().fg(color));
+	pc.frame.put(x, y, " ", Style::new().fg(color))
+}
+
+fn paint_spine_tail(
+	pc: &mut PaintCtx<'_>,
+	rect: Rect,
+	glyphs: &Glyphs,
+	spine: &Spine,
+	y: u16,
+) {
+	if y >= rect.y.saturating_add(rect.height).min(pc.clip) {
+		return;
+	}
+	let mut parts = xutf::graphemes_str(glyphs.last);
+	let hook = parts.next().unwrap_or(glyphs.last);
+	let horizontal = parts.next().unwrap_or("-");
+	let mut x = rect.x;
+	for cell in 0..SPINE_TAIL_CELLS {
+		let glyph = if cell == 0 { hook } else { horizontal };
+		let color = if spine.row.saturating_add(cell) < spine.filled {
+			pc.ctx.theme.accent
+		} else {
+			pc.ctx.theme.muted
+		};
+		x = pc.frame.put(x, y, glyph, Style::new().fg(color));
+	}
+}
+
 fn paint_tasks(
 	pc: &mut PaintCtx<'_>,
 	rect: Rect,
 	glyphs: &Glyphs,
 	tasks: &[TodoTask],
 	trail: &mut SmallVec<bool, 8>,
+	spine: &mut Spine,
 	y: &mut u16,
+	descend: bool,
 ) {
 	let bottom = rect.y.saturating_add(rect.height).min(pc.clip);
 	let count = tasks.len();
@@ -260,10 +462,16 @@ fn paint_tasks(
 			return;
 		}
 		let is_last = index + 1 == count;
-		let mut x = rect.x;
+		let mut x = paint_spine(
+			pc,
+			rect.x,
+			*y,
+			if trail.is_empty() { glyphs.branch } else { glyphs.cont },
+			spine,
+		);
 		let guide = Style::new().fg(pc.ctx.theme.muted);
-		// Ancestor gutters, then this row's connector. Roots draw neither,
-		// and the root level's continuation bit is never displayed.
+		// Ancestor gutters, then this row's nested connector. The outer
+		// progress spine already owns the root connector.
 		if !trail.is_empty() {
 			for &more in &trail[1..] {
 				x = pc
@@ -301,19 +509,19 @@ fn paint_tasks(
 				pc.frame.put(x, *y, &note, Style::new().dim());
 			}
 		} else {
-			// Group header: bold label plus an automatic done/total count
+			// Group header: bold label plus an automatic closed/total count
 			// over its descendant leaves.
-			let (done, total) = leaf_counts(&task.children);
+			let (closed, total) = leaf_counts(&task.children);
 			x = pc
 				.frame
 				.put(x, *y, label, Style::new().fg(pc.ctx.theme.fg).bold());
-			let counter = fmts!(" {done}/{total}");
+			let counter = fmts!(" {closed}/{total}");
 			pc.frame.put(x, *y, &counter, Style::new().dim());
 		}
 		*y = y.saturating_add(1);
-		if !task.children.is_empty() {
+		if descend && !task.children.is_empty() {
 			trail.push(!is_last);
-			paint_tasks(pc, rect, glyphs, &task.children, trail, y);
+			paint_tasks(pc, rect, glyphs, &task.children, trail, spine, y, true);
 			trail.pop();
 		}
 	}
@@ -322,9 +530,25 @@ fn paint_tasks(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{
+		component::PaintCtx,
+		frame::{Frame, Size},
+		test_support::frame_row_text,
+	};
 
+	fn paint(todo: &mut Todo) -> (Frame, UiContext) {
+		let ctx = UiContext::default();
+		let height = todo.height(&ctx, 48);
+		let mut frame = Frame::new(Size::new(48, height));
+		let mut hits = Vec::new();
+		todo.paint(
+			&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()),
+			Rect::new(0, 0, 48, height),
+		);
+		(frame, ctx)
+	}
 	#[test]
-	fn counts_walk_nested_leaves_only() {
+	fn counts_walk_nested_closed_leaves_only() {
 		let todo = Todo::new()
 			.task(
 				TodoTask::new()
@@ -332,7 +556,7 @@ mod tests {
 					.task(TodoTask::new().label("a").status(TaskStatus::Done))
 					.task(TodoTask::new().label("b")),
 			)
-			.task(TodoTask::new().label("flat").status(TaskStatus::Done));
+			.task(TodoTask::new().label("flat").status(TaskStatus::Dropped));
 		assert_eq!(todo.counts(), (2, 3));
 	}
 
@@ -342,5 +566,73 @@ mod tests {
 		assert_eq!(TaskStatus::parse("completed"), Some(TaskStatus::Done));
 		assert_eq!(TaskStatus::parse("abandoned"), Some(TaskStatus::Dropped));
 		assert_eq!(TaskStatus::parse("nope"), None);
+	}
+
+	#[test]
+	fn spine_fill_pins_zero_half_and_full_progress() {
+		let make = |closed: usize| {
+			let mut todo = Todo::new();
+			for index in 0..2 {
+				let status = if index < closed { TaskStatus::Done } else { TaskStatus::Pending };
+				todo = todo.task(TodoTask::new().label(format!("task {index}")).status(status));
+			}
+			todo
+		};
+		for (closed, expected_accent) in [(0, 0), (1, 4), (2, 8)] {
+			let (frame, ctx) = paint(&mut make(closed));
+			assert_eq!(frame_row_text(&frame, 0).trim_end(), "TODO");
+			assert!(frame_row_text(&frame, 1).starts_with("├─ task 0"));
+			assert_eq!(frame_row_text(&frame, 3).trim_end(), "└─────");
+			let path = [
+				frame.cell(0, 1).style.foreground_color(),
+				frame.cell(0, 2).style.foreground_color(),
+				frame.cell(0, 3).style.foreground_color(),
+				frame.cell(1, 3).style.foreground_color(),
+				frame.cell(2, 3).style.foreground_color(),
+				frame.cell(3, 3).style.foreground_color(),
+				frame.cell(4, 3).style.foreground_color(),
+				frame.cell(5, 3).style.foreground_color(),
+			];
+			assert_eq!(
+				path.iter().filter(|&&color| color == ctx.theme.accent).count(),
+				expected_accent,
+				"{closed}/2 progress path: {path:?}",
+			);
+			assert!(path.iter().all(|&color| color == ctx.theme.accent || color == ctx.theme.muted));
+		}
+	}
+
+	#[test]
+	fn stage_window_ends_with_overflow_summary() {
+		let mut todo = Todo::new();
+		for index in 1..=7 {
+			todo = todo.task(
+				TodoTask::new()
+					.label(format!("Stage {index}"))
+					.task(TodoTask::new().label(format!("work {index}"))),
+			);
+		}
+		let (frame, _) = paint(&mut todo);
+		let text = (0..frame.size().height)
+			.map(|row| frame_row_text(&frame, row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(text.contains("TODO"), "{text}");
+		assert!(text.contains("Stage 5"), "{text}");
+		assert!(!text.contains("Stage 6"), "{text}");
+		assert!(text.contains("├─ … 2 more stages"), "{text}");
+	}
+
+	#[test]
+	fn multiline_hud_copy_uses_charset_return_marker() {
+		assert_eq!(
+			collapse_hud_line("First line\n\n  Second line", Charset::Unicode),
+			"First line ↵ Second line",
+		);
+		assert_eq!(
+			collapse_hud_line("Task\r\n  preview", Charset::Ascii),
+			"Task enter preview",
+		);
+		assert!(matches!(collapse_hud_line("one line", Charset::Unicode), Cow::Borrowed(_)));
 	}
 }

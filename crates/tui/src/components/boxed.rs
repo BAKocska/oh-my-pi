@@ -161,4 +161,28 @@ mod tests {
 		assert_eq!(frame_row_text(&frame, 1), "│body        │");
 		assert_eq!(frame_row_text(&frame, height - 1), "╰────────────╯");
 	}
+
+	#[test]
+	fn box_title_truncates_between_corner_cells_at_boundary_widths() {
+		let ctx = UiContext::default();
+		for (width, expected) in [
+			(7, "╭ al… ╮"),
+			(5, "╭ … ╮"),
+			(4, "╭ …╮"),
+			(3, "╭…╮"),
+		] {
+			let mut root = Cached::new(Box::new(
+				Boxed::new()
+					.with(Prop::Border, Border::Round)
+					.with(Prop::Title, "alphabet")
+					.child(TextLeaf::new().text("")),
+			));
+			let height = root.height(&ctx, width);
+			root.place(&ctx, Rect::new(0, 0, width, height));
+			let mut frame = Frame::new(Size::new(width, height));
+			let mut hits = Vec::new();
+			root.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
+			assert_eq!(frame_row_text(&frame, 0), expected);
+		}
+	}
 }

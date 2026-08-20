@@ -1825,15 +1825,16 @@ fn todo_markup_renders_groups_counts_statuses_and_guides() {
 "#;
 	let ui = Ui::from_markup(src, 48, UiContext::default()).unwrap();
 	let text = rows(&ui).join("\n");
-	// group header with automatic done/total over direct children
-	assert!(text.contains("Part A 1/4"), "{text}");
-	// connectors: three branches then a closing corner
-	assert!(text.contains("├─ ☑ A4 tui test strings"), "{text}");
-	assert!(text.contains("├─ ☐ A5 examples"), "{text}");
-	assert!(text.contains("├─ ☐ A6 README (blocked: waiting on CI)"), "{text}");
-	assert!(text.contains("└─ ☐ A7 ui-poc.py"), "{text}");
-	// root-level leaf draws no connector
-	assert!(text.contains("\n☑ flat follow-up"), "{text}");
+	assert!(text.contains("TODO"), "{text}");
+	// group header with automatic closed/total count
+	assert!(text.contains("├─ Part A 1/4"), "{text}");
+	// The overall progress spine precedes the group's nested connectors.
+	assert!(text.contains("│  ├─ ☑ A4 tui test strings"), "{text}");
+	assert!(text.contains("│  ├─ ☐ A5 examples"), "{text}");
+	assert!(text.contains("│  ├─ ☐ A6 README (blocked: waiting on CI)"), "{text}");
+	assert!(text.contains("│  └─ ☐ A7 ui-poc.py"), "{text}");
+	assert!(text.contains("\n├─ ☑ flat follow-up"), "{text}");
+	assert!(text.contains("\n└─────"), "{text}");
 	for leak in ["<todo", "<task", "</task>"] {
 		assert!(!text.contains(leak), "leaked {leak}: {text}");
 	}
@@ -1862,10 +1863,11 @@ fn todo_guides_family_and_nested_gutters() {
 "#;
 	let ui = Ui::from_markup(src, 40, UiContext::default()).unwrap();
 	let text = rows(&ui).join("\n");
-	// `mid` still has a sibling below, so its gutter runs through the deep rows
-	assert!(text.contains("│ ├─ ☐ deep-first"), "{text}");
-	assert!(text.contains("│ ╰─ ☐ deep-last"), "{text}");
-	assert!(text.contains("╰─ ☐ outer-last"), "{text}");
+	// `mid` still has a sibling below, so its gutter runs through the deep rows.
+	// The first rail is the Todo's overall progress spine.
+	assert!(text.contains("│  │ ├─ ☐ deep-first"), "{text}");
+	assert!(text.contains("│  │ ╰─ ☐ deep-last"), "{text}");
+	assert!(text.contains("│  ╰─ ☐ outer-last"), "{text}");
 }
 
 #[test]

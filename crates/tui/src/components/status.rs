@@ -1,14 +1,131 @@
+use super::hr::truncate_to_width;
+
 use omp_core::Str;
 use smallvec::SmallVec;
 
 use crate::{
+	Icon,
 	component::{Component, PaintCtx, Slot, next_slot},
-	context::{Charset, UiContext},
+	context::{Charset, Theme, UiContext},
 	frame::{Color, Rect},
 	markup::Align,
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
 };
+
+/// Placement of a composer's primary status line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusPlacement {
+	/// The status occupies composer chrome, such as a box's top border.
+	Embedded,
+	/// The status occupies its own row outside the editable surface.
+	Standalone,
+}
+
+/// Presentation of context-window usage in a status line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextGaugeMode {
+	/// Show context usage as a numeric segment.
+	Numeric,
+	/// Use the flexible boundary between status groups as a proportional bar.
+	Bar,
+}
+
+/// Horizontal slots for two status groups separated by a flexible boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundaryLayout {
+	/// First column of the left group.
+	pub left_x:    u16,
+	/// First column of the flexible boundary.
+	pub boundary_x: u16,
+	/// Width of the flexible boundary.
+	pub boundary_width: u16,
+	/// First column of the right group.
+	pub right_x:   u16,
+}
+
+/// Fits left and right status groups around a flexible boundary.
+///
+/// Returns `None` when both groups plus `minimum_boundary` do not fit.
+#[must_use]
+pub const fn boundary_layout(
+	x: u16,
+	width: u16,
+	left_width: u16,
+	right_width: u16,
+	minimum_boundary: u16,
+) -> Option<BoundaryLayout> {
+	let occupied = left_width.saturating_add(right_width);
+	if occupied.saturating_add(minimum_boundary) > width {
+		return None;
+	}
+	let boundary_width = width - occupied;
+	let boundary_x = x.saturating_add(left_width);
+	Some(BoundaryLayout {
+		left_x: x,
+		boundary_x,
+		boundary_width,
+		right_x: boundary_x.saturating_add(boundary_width),
+	})
+}
+
+/// Number of cells filled by a proportional context gauge.
+#[must_use]
+pub const fn context_gauge_cells(width: u16, used: u64, total: u64) -> u16 {
+	if total == 0 {
+		return 0;
+	}
+	let used = if used > total { total } else { used };
+	((width as u128 * used as u128 + total as u128 / 2) / total as u128) as u16
+}
+
+/// Returns the themed accent shared by the compaction threshold marker and
+/// context-window usage labels.
+#[must_use]
+pub const fn compaction_threshold_color(theme: &Theme) -> Color {
+	theme.accent
+}
+
+/// Formats primary-model spend for metered or subscription billing.
+///
+/// Subscription-backed spend uses the dedicated Nerd Font icon where
+/// available and an `S` prefix elsewhere. A zero-cost subscription still
+/// renders its semantic subscription marker.
+#[must_use]
+pub fn spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> Str {
+	if amount_nanos == 0 {
+		return if subscription {
+			Str::from(charset.icon(Icon::Subscription))
+		} else {
+			Str::default()
+		};
+	}
+	let amount = amount_nanos as f64 / 1_000_000_000.0;
+	if !subscription {
+		return Str::from(format!("${amount:.4}"));
+	}
+	match charset {
+		Charset::NerdFont => {
+			Str::from(format!("{} {amount:.4}", charset.icon(Icon::Subscription)))
+		},
+		Charset::Unicode | Charset::Ascii => Str::from(format!("S{amount:.4}")),
+	}
+}
+
+/// Formats advisor-model spend with the charset's advisor degradation.
+#[must_use]
+pub fn advisor_spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> Str {
+	let spend = spend_label(amount_nanos, subscription, charset);
+	if spend.is_empty() {
+		return spend;
+	}
+	match charset {
+		Charset::Ascii => Str::from(format!("{spend} {}", charset.icon(Icon::Advisor))),
+		Charset::Unicode | Charset::NerdFont => {
+			Str::from(format!("{} {spend}", charset.icon(Icon::Advisor)))
+		},
+	}
+}
 
 /// Declarative segment data backing the `<segment>` markup tag.
 pub struct Segment {
@@ -179,6 +296,52 @@ impl Component for Status {
 		let style = self.props.style(&pc.ctx.theme);
 		let (left_cap, separator, cap) = self.chrome(pc.ctx.charset);
 		let edge_style = crate::Style::new().fg(style.background_color());
+		let left_width = cell_width(left_cap);
+		let cap_width = cell_width(cap);
+		let truncate_first = visible == 1 && self.group_width(visible, pc.ctx.charset) > rect.width;
+		let boundary_width = left_width.saturating_add(cap_width);
+		if truncate_first && boundary_width <= rect.width {
+			let interior = rect.width - boundary_width;
+			let left_pad = interior >= 2;
+			let right_pad = interior >= 3;
+			let fit = interior
+				.saturating_sub(u16::from(left_pad))
+				.saturating_sub(u16::from(right_pad));
+			let segment = &self.segments[0];
+			let mut segment_style = segment.props.style(&pc.ctx.theme).inherit(style);
+			if segment_style.background_color() == Color::Default {
+				segment_style = segment_style.bg(style.background_color());
+			}
+			let label = truncate_to_width(&segment.label, fit);
+			let mut column = pc.frame.put(rect.x, rect.y, left_cap, edge_style);
+			if left_pad {
+				column = pc.frame.put(column, rect.y, " ", style);
+			}
+			column = pc.frame.put(column, rect.y, label.text, segment_style);
+			if label.ellipsis {
+				column = pc.frame.put(column, rect.y, "…", segment_style);
+			}
+			if right_pad {
+				column = pc.frame.put(column, rect.y, " ", style);
+			}
+			pc.frame.put(column, rect.y, cap, edge_style);
+			return;
+		}
+		let chrome_width = boundary_width.saturating_add(2);
+		if rect.width < chrome_width {
+			if left_width <= rect.width {
+				pc.frame.put(rect.x, rect.y, left_cap, edge_style);
+			}
+			if left_width.saturating_add(cap_width) <= rect.width {
+				pc.frame.put(
+					rect.x.saturating_add(rect.width - cap_width),
+					rect.y,
+					cap,
+					edge_style,
+				);
+			}
+			return;
+		}
 		let mut column = pc.frame.put(rect.x, rect.y, left_cap, edge_style);
 		column = pc.frame.put(column, rect.y, " ", style);
 		for (index, segment) in self.segments[..visible].iter().enumerate() {
@@ -204,7 +367,9 @@ impl Component for Status {
 
 #[cfg(test)]
 mod tests {
-	use super::{Segment, Status};
+	use super::{
+		Segment, Status, advisor_spend_label, boundary_layout, context_gauge_cells, spend_label,
+	};
 	use crate::{
 		Charset, Color, Prop, Ui, UiContext,
 		component::{Cached, Hit, PaintCtx},
@@ -315,6 +480,15 @@ mod tests {
 	}
 
 	#[test]
+	fn status_truncates_its_last_chip_at_boundary_widths() {
+		for (width, expected) in [(7, " alp… ›"), (4, " … ›"), (3, " …›"), (2, "…›")] {
+			let status = Status::new().segment(Segment::new().label("alphabet"));
+			let (frame, _) = paint(status, width);
+			assert_eq!(frame_row_text(&frame, 0), expected);
+		}
+	}
+
+	#[test]
 	fn status_markup_paints_segment_labels() {
 		let ui = Ui::from_markup(
 			"<status><segment fg=green>alpha</segment><segment>beta</segment></status>",
@@ -347,4 +521,49 @@ mod tests {
 		);
 		assert!(frame_row_text(ui.frame(), 0).contains("alpha"));
 	}
+	#[test]
+	fn boundary_layout_docks_groups_and_reserves_the_gap() {
+		let layout = boundary_layout(3, 30, 8, 6, 2).expect("groups fit");
+		assert_eq!(layout.left_x, 3);
+		assert_eq!(layout.boundary_x, 11);
+		assert_eq!(layout.boundary_width, 16);
+		assert_eq!(layout.right_x, 27);
+		assert_eq!(boundary_layout(0, 12, 6, 5, 2), None);
+	}
+
+	#[test]
+	fn context_gauge_rounds_and_clamps_to_its_boundary() {
+		assert_eq!(context_gauge_cells(20, 25, 100), 5);
+		assert_eq!(context_gauge_cells(9, 50, 100), 5);
+		assert_eq!(context_gauge_cells(20, 200, 100), 20);
+		assert_eq!(context_gauge_cells(20, 1, 0), 0);
+	}
+
+	#[test]
+	fn billing_labels_degrade_by_charset() {
+		assert_eq!(spend_label(250_000_000, false, Charset::Ascii), "$0.2500");
+		assert_eq!(spend_label(250_000_000, true, Charset::Ascii), "S0.2500");
+		assert_eq!(spend_label(0, true, Charset::Unicode), "(sub)");
+		assert_eq!(
+			spend_label(250_000_000, true, Charset::NerdFont),
+			"\u{f067a} 0.2500",
+		);
+	}
+
+	#[test]
+	fn advisor_billing_uses_semantic_glyphs() {
+		assert_eq!(
+			advisor_spend_label(250_000_000, false, Charset::Ascii),
+			"$0.2500 (adv)",
+		);
+		assert_eq!(
+			advisor_spend_label(250_000_000, true, Charset::Unicode),
+			"👁 S0.2500",
+		);
+		assert_eq!(
+			advisor_spend_label(250_000_000, true, Charset::NerdFont),
+			"\u{ea70} \u{f067a} 0.2500",
+		);
+	}
+
 }

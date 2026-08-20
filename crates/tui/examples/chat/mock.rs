@@ -191,6 +191,7 @@ fn status(model: &Str, working: bool) -> StatusFacts {
 		attempt: 0,
 		dropped: 0,
 		git: Some(GitFacts { branch: Str::new_static("main"), dirty: 5, staged: 9 }),
+		..StatusFacts::default()
 	}
 }
 

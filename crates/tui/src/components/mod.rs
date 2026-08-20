@@ -6,7 +6,7 @@ mod custom;
 mod diff;
 mod editor;
 mod form;
-mod hr;
+pub mod hr;
 mod icon;
 mod img;
 mod input;
@@ -42,7 +42,8 @@ pub use col::Col;
 pub use custom::CustomElement;
 pub use diff::{DiffKind, DiffLine, DiffView};
 pub use editor::{
-	Attachment, AttachmentContent, Attachments, EditInput, EditorPane, attachment_color, chip_label,
+	Attachment, AttachmentContent, Attachments, ComposerLayout, ComposerStatusAttachment,
+	ComposerStyle, EditInput, EditorPane, attachment_color, chip_label,
 };
 pub use form::{Field, Form};
 pub use hr::{Hr, Spacer};
@@ -61,11 +62,14 @@ pub use scroll::Scroll;
 pub use select::{Select, SelectOption};
 pub use shader::Shader;
 pub use spinner::Spinner;
-pub use status::{Segment, Status};
+pub use status::{
+	BoundaryLayout, ContextGaugeMode, Segment, Status, StatusPlacement, advisor_spend_label,
+	boundary_layout, compaction_threshold_color, context_gauge_cells, spend_label,
+};
 pub use table::{Table, TableCell, TableRow};
 pub use tabs::Tabs;
 pub use text::{Pre, TextLeaf};
-pub use todo::{TaskStatus, Todo, TodoTask};
+pub use todo::{TaskStatus, Todo, TodoTask, collapse_hud_line};
 pub use tool_card::{ToolCard, ToolState};
 pub use transcript::TranscriptView;
 pub use tree::{Tree, TreeNode};

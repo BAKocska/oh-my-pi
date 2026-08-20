@@ -542,10 +542,22 @@ impl EditBuffer {
 	/// remains detached until the next editing command.
 	#[must_use]
 	pub fn rows(&self, width_limit: u16, max_rows: usize) -> SmallVec<VisualRow<'_>, 8> {
+		self.rows_with_metrics(width_limit, max_rows).0
+	}
+
+	/// Returns visible rows and `(first, visible, total)` viewport metrics from
+	/// one wrapping pass.
+	#[must_use]
+	pub fn rows_with_metrics(
+		&self,
+		width_limit: u16,
+		max_rows: usize,
+	) -> (SmallVec<VisualRow<'_>, 8>, (usize, usize, usize)) {
 		let segments = self.segments(width_limit.max(1));
 		let cursor_row = self.segment_at_cursor(&segments);
-		let visible = segments.len().min(max_rows);
-		let max_offset = segments.len() - visible;
+		let total = segments.len();
+		let visible = total.min(max_rows);
+		let max_offset = total - visible;
 		let first = if self.manual_scroll.get() {
 			self.view_offset.get().min(max_offset)
 		} else {
@@ -554,7 +566,7 @@ impl EditBuffer {
 				.min(max_offset)
 		};
 		self.view_offset.set(first);
-		segments[first..first + visible]
+		let rows = segments[first..first + visible]
 			.iter()
 			.map(|segment| VisualRow {
 				start:         segment.start,
@@ -565,7 +577,8 @@ impl EditBuffer {
 					&& (segment.last || self.cursor < segment.end))
 					.then(|| cell_width(&self.text[segment.start..self.cursor])),
 			})
-			.collect()
+			.collect();
+		(rows, (first, visible, total))
 	}
 
 	/// Moves the visible row window without moving the cursor.
@@ -594,6 +607,7 @@ impl EditBuffer {
 	pub fn visual_height(&self, width: u16, max_rows: usize) -> usize {
 		self.segments(width.max(1)).len().min(max_rows)
 	}
+
 
 	#[must_use]
 	/// Reports whether the cursor is at the document's visual start.
@@ -1647,6 +1661,18 @@ impl Editor {
 	pub fn view_rows(&self, width: u16, max_rows: usize) -> SmallVec<VisualRow<'_>, 8> {
 		self.last_layout_width.set(width.max(1));
 		self.buffer.rows(width, max_rows)
+	}
+
+	/// Returns visible input rows and `(first, visible, total)` viewport
+	/// metrics from one wrapping pass.
+	#[must_use]
+	pub fn view_rows_with_metrics(
+		&self,
+		width: u16,
+		max_rows: usize,
+	) -> (SmallVec<VisualRow<'_>, 8>, (usize, usize, usize)) {
+		self.last_layout_width.set(width.max(1));
+		self.buffer.rows_with_metrics(width, max_rows)
 	}
 
 	/// Returns the cursor-centered visible input rows at `width`.

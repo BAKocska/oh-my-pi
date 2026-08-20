@@ -9,6 +9,7 @@ added	status.added	+	✚	
 adhesive-bandage	object.adhesiveBandage	bandg	🩹	
 admin	user.admin	admin	👑	
 admission-ticket	object.admissionTicket	tkt	🎟	
+advisor	icon.advisor	(adv)	👁	
 agents	icon.agents	AG	👥	
 airplane	object.airplane	plane	✈	
 airplane-arrival	object.airplaneArrival	<fly	🛬	
@@ -904,6 +905,7 @@ storm-cloud-rain	object.stormCloudRain	storm	⛈	
 straight-ruler	object.straightRuler	ruler	📏	
 straw-cup	object.strawCup	cup	🥤	󰆪
 studio-microphone	device.studioMicrophone	mic	🎙	
+subscription	icon.subscription	(sub)	(sub)	󰙺
 success	status.success	[ok]	✔	
 sun-cloud	object.sunCloud	partly	⛅	
 sun-rain-cloud	object.sunRainCloud	rain	🌦	

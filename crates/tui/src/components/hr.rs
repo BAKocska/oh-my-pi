@@ -1,3 +1,5 @@
+//! Horizontal and vertical rules, including width-safe docked labels.
+
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
@@ -5,6 +7,60 @@ use crate::{
 	markup::Border,
 	props::{Prop, PropValue, Props},
 };
+use xutf::Text as _;
+
+/// A display-width-limited string prefix.
+///
+/// When [`ellipsis`](Self::ellipsis) is true, callers should append a
+/// one-cell ellipsis after [`text`](Self::text); [`width`](Self::width)
+/// includes that ellipsis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TruncatedText<'a> {
+	/// Grapheme-boundary prefix of the original text.
+	pub text:      &'a str,
+	/// Display width of the prefix plus its optional ellipsis.
+	pub width:     u16,
+	/// Whether a one-cell ellipsis must follow the prefix.
+	pub ellipsis: bool,
+}
+
+/// Truncates `text` to `max_width` terminal cells without allocating.
+///
+/// The returned prefix always ends on a grapheme boundary. When truncation is
+/// necessary and at least one cell is available, one cell is reserved for an
+/// ellipsis that the caller paints as a separate span.
+#[must_use]
+pub fn truncate_to_width(text: &str, max_width: u16) -> TruncatedText<'_> {
+	let max_width = usize::from(max_width);
+	let prefix_limit = max_width.saturating_sub(1);
+	let mut full_width = 0_usize;
+	let mut prefix_width = 0_usize;
+	let mut prefix_end = 0;
+	for grapheme in text.graphemes() {
+		let width = grapheme.visible_width();
+		let next = full_width.saturating_add(width);
+		if next > max_width {
+			if max_width == 0 {
+				return TruncatedText { text: "", width: 0, ellipsis: false };
+			}
+			return TruncatedText {
+				text:      &text[..prefix_end],
+				width:     u16::try_from(prefix_width + 1).unwrap_or(u16::MAX),
+				ellipsis: true,
+			};
+		}
+		full_width = next;
+		if full_width <= prefix_limit {
+			prefix_width = full_width;
+			prefix_end += grapheme.len();
+		}
+	}
+	TruncatedText {
+		text,
+		width: u16::try_from(full_width).unwrap_or(u16::MAX),
+		ellipsis: false,
+	}
+}
 
 /// A horizontal or vertical divider backing the `<hr>` markup tag.
 pub struct Hr {
@@ -104,12 +160,49 @@ impl Component for Hr {
 		self.bar.clear();
 		repeated_char(&mut self.bar, horizontal, usize::from(rect.width));
 		pc.frame.put(rect.x, rect.y, &self.bar, line);
-		if let Some(title) = self.props.title() {
-			pc.frame.put(rect.x.saturating_add(2), rect.y, " ", style);
-			let end = pc
-				.frame
-				.put(rect.x.saturating_add(3), rect.y, title, style.bold());
-			pc.frame.put(end, rect.y, " ", style);
+		if let Some(title) = self.props.title()
+			&& !title.is_empty()
+			&& rect.width > 2
+		{
+			// The outermost rule cells are inviolable. Padding collapses only
+			// at widths where retaining it would drop the label altogether.
+			let interior = rect.width - 2;
+			let left_pad = interior >= 2;
+			let right_pad = interior >= 3;
+			let fit = interior
+				.saturating_sub(u16::from(left_pad))
+				.saturating_sub(u16::from(right_pad));
+			let title = truncate_to_width(title, fit);
+			let total = title
+				.width
+				.saturating_add(u16::from(left_pad))
+				.saturating_add(u16::from(right_pad));
+			let x = match self.props.title_align() {
+				crate::markup::Align::Start => rect.x.saturating_add(2),
+				crate::markup::Align::Center => {
+					rect.x.saturating_add(rect.width.saturating_sub(total) / 2)
+				},
+				crate::markup::Align::End => rect
+					.x
+					.saturating_add(rect.width.saturating_sub(2).saturating_sub(total)),
+			}
+			.clamp(
+				rect.x.saturating_add(1),
+				rect
+					.x
+					.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
+			);
+			let mut end = x;
+			if left_pad {
+				end = pc.frame.put(end, rect.y, " ", style);
+			}
+			end = pc.frame.put(end, rect.y, title.text, style.bold());
+			if title.ellipsis {
+				end = pc.frame.put(end, rect.y, "…", style.bold());
+			}
+			if right_pad {
+				pc.frame.put(end, rect.y, " ", style);
+			}
 		}
 	}
 }
@@ -176,7 +269,7 @@ fn repeated_char(output: &mut String, character: char, count: usize) {
 
 #[cfg(test)]
 mod tests {
-	use super::Hr;
+	use super::{Hr, truncate_to_width};
 	use crate::{
 		component::{Cached, Component, PaintCtx},
 		context::UiContext,
@@ -195,6 +288,31 @@ mod tests {
 		let mut hits = Vec::new();
 		hr.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
 		assert_eq!(frame_row_text(&frame, 0), "──────");
+	}
+
+	#[test]
+	fn titled_rule_truncates_between_boundary_cells() {
+		let ctx = UiContext::default();
+		for (width, expected) in [(7, "─ al… ─"), (3, "─…─")] {
+			let mut hr = Cached::new(Box::new(Hr::new().with(Prop::Title, "alphabet")));
+			hr.place(&ctx, Rect::new(0, 0, width, 1));
+			let mut frame = Frame::new(Size::new(width, 1));
+			let mut hits = Vec::new();
+			hr.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
+			assert_eq!(frame_row_text(&frame, 0), expected);
+		}
+	}
+
+	#[test]
+	fn title_truncation_respects_wide_grapheme_boundaries() {
+		assert_eq!(
+			truncate_to_width("界ab", 3),
+			super::TruncatedText { text: "界", width: 3, ellipsis: true },
+		);
+		assert_eq!(
+			truncate_to_width("界a", 3),
+			super::TruncatedText { text: "界a", width: 3, ellipsis: false },
+		);
 	}
 
 	#[test]

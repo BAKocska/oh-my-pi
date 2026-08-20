@@ -14,11 +14,10 @@ use std::{
 
 use omp_core::Str;
 use smallvec::SmallVec;
-use xutf::Text as _;
 
 use crate::{
 	anim::{self, Easing, Lerp, Tween},
-	components::Markdown,
+	components::{Markdown, hr::truncate_to_width},
 	context::UiContext,
 	frame::{Color, Decor, DecorFill, DecorKind, Frame, Gradient, Rect, Style},
 	input::{Key, Mouse, UiEvent},
@@ -1284,13 +1283,13 @@ fn paint_border(
 	}
 }
 
-/// Paints one border label — title or footer — padded by one space per side
-/// so the frame line breaks around it. `base` already carries the node's
-/// background only under `bleed`, keeping the label transparent otherwise.
+/// Paints one border label — title or footer — normally padded by one space
+/// per side so the frame line breaks around it. At extreme widths padding
+/// collapses before the label, preserving both corner cells and a visible
+/// ellipsis. `base` carries the node background only under `bleed`.
 ///
 /// [`Frame::put`] clips at the frame edge, not the rect, so the label is
-/// truncated by cell width to the border's interior first — an overlong
-/// title would otherwise run over the right corner into neighboring cells.
+/// display-width-truncated before painting.
 fn border_label(
 	pc: &mut PaintCtx<'_>,
 	rect: Rect,
@@ -1300,31 +1299,20 @@ fn border_label(
 	base: Style,
 	bold: bool,
 ) {
-	// Interior cells between the corners, minus the two pad spaces.
-	let fit = rect.width.saturating_sub(4);
-	if fit == 0 {
+	if text.is_empty() || rect.width <= 2 {
 		return;
 	}
-	// Widths accumulate per grapheme exactly as `Frame::put` paints them,
-	// so the cutoff never lands mid-grapheme or half a wide cell short.
-	let mut width: u16 = 0;
-	let mut end = 0usize;
-	for grapheme in text.graphemes() {
-		if grapheme == "\n" || grapheme == "\r" {
-			break;
-		}
-		let cells = u16::try_from(grapheme.visible_width()).unwrap_or(u16::MAX);
-		if width.saturating_add(cells) > fit {
-			break;
-		}
-		width += cells;
-		end += grapheme.len();
-	}
-	if width == 0 {
-		return;
-	}
-	let text = &text[..end];
-	let total = width + 2;
+	let interior = rect.width - 2;
+	let left_pad = interior >= 2;
+	let right_pad = interior >= 3;
+	let fit = interior
+		.saturating_sub(u16::from(left_pad))
+		.saturating_sub(u16::from(right_pad));
+	let text = truncate_to_width(text, fit);
+	let total = text
+		.width
+		.saturating_add(u16::from(left_pad))
+		.saturating_add(u16::from(right_pad));
 	let x = match align {
 		Align::Start => rect.x.saturating_add(2),
 		Align::Center => rect.x.saturating_add(rect.width.saturating_sub(total) / 2),
@@ -1338,11 +1326,18 @@ fn border_label(
 			.x
 			.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
 	);
-	let end = pc.frame.put(x, y, " ", base);
-	let end = pc
-		.frame
-		.put(end, y, text, if bold { base.bold() } else { base });
-	pc.frame.put(end, y, " ", base);
+	let mut end = x;
+	if left_pad {
+		end = pc.frame.put(end, y, " ", base);
+	}
+	let label = if bold { base.bold() } else { base };
+	end = pc.frame.put(end, y, text.text, label);
+	if text.ellipsis {
+		end = pc.frame.put(end, y, "…", label);
+	}
+	if right_pad {
+		pc.frame.put(end, y, " ", base);
+	}
 }
 
 /// State shared by component painters for one frame.
