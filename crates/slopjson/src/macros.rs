@@ -1,4 +1,8 @@
 //! `json!` construction macro, adapted from `serde_json`'s TT muncher.
+//!
+//! Upstream: <https://github.com/serde-rs/json>
+//! Licensed under MIT.
+//! See this package's `NOTICE` and `LICENSE`.
 
 /// Build a [`Value`](crate::Value) from a JSON-shaped literal.
 ///

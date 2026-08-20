@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/can1357/omp?style=flat&colorA=222222&colorB=58A6FF" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/stencil-hq/omp?style=flat&colorA=222222&colorB=58A6FF" alt="License"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-DEA584?style=flat&colorA=222222&logo=rust&logoColor=white" alt="Rust"></a>
 </p>
 
@@ -110,4 +110,8 @@ live in [`AGENTS.md`](AGENTS.md). Read it before touching anything.
 
 ## License
 
-MIT
+`omp` is released under the [MIT License](LICENSE).
+
+Third-party material is excluded from these blanket license grants and remains
+subject to its own license terms. See [third-party notices](THIRD-PARTY-NOTICES.txt)
+for attribution and applicable terms.

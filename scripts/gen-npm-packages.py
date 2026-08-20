@@ -27,6 +27,9 @@ DIR must hold the release binaries under their GitHub asset names
 (omp-linux-x64, omp-linux-arm64, omp-darwin-x64, omp-darwin-arm64,
 omp-windows-x64.exe). Missing binaries are a hard error: publishing a
 partial platform set breaks the pinned-leaf install on the missing tags.
+
+The repository root LICENSE and THIRD-PARTY-NOTICES.txt are required inputs
+and are included in every generated package.
 """
 
 import argparse
@@ -42,8 +45,9 @@ SCOPE = "@oh-my-pi"
 CORE = f"{SCOPE}/pi-coding-agent"
 SENTINEL = f"{SCOPE}/pi-natives"
 LICENSE = "MIT"
+NOTICE_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.txt")
 HOMEPAGE = "https://omp.sh/"
-REPOSITORY = "https://github.com/can1357/omp"
+REPOSITORY = "https://github.com/stencil-hq/omp"
 
 # tag -> (npm "os" value, npm "cpu" value, GitHub release asset name)
 TARGETS = {
@@ -63,6 +67,7 @@ def base_manifest(name: str, version: str, description: str) -> dict:
         "version": version,
         "description": description,
         "license": LICENSE,
+        "files": list(NOTICE_FILES),
         "homepage": HOMEPAGE,
         "repository": {"type": "git", "url": f"git+{REPOSITORY}.git"},
     }
@@ -71,6 +76,8 @@ def base_manifest(name: str, version: str, description: str) -> dict:
 def write_package(out_dir: Path, manifest: dict, readme: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "package.json").write_text(json.dumps(manifest, indent="\t") + "\n")
+    for notice_file in NOTICE_FILES:
+        shutil.copyfile(REPO_ROOT / notice_file, out_dir / notice_file)
     (out_dir / "README.md").write_text(readme)
 
 
@@ -92,7 +99,7 @@ def emit_leaf(out: Path, tag: str, version: str, binaries: Path) -> str:
     manifest = base_manifest(name, version, f"omp native binary for {tag}")
     manifest["os"] = [os_name]
     manifest["cpu"] = [cpu]
-    manifest["files"] = ["bin/"]
+    manifest["files"] = [*NOTICE_FILES, "bin/"]
     # No "exports": the launcher resolves `<name>/package.json` through the
     # legacy algorithm and joins bin/ itself.
     write_package(
@@ -120,6 +127,15 @@ def main() -> None:
         sys.exit(f"error: invalid version {args.version!r} (expected X.Y.Z)")
     version: str = args.version
 
+    missing_notices = [
+        REPO_ROOT / notice_file
+        for notice_file in NOTICE_FILES
+        if not (REPO_ROOT / notice_file).is_file()
+    ]
+    if missing_notices:
+        missing = ", ".join(str(path) for path in missing_notices)
+        sys.exit(f"error: missing required npm package notice input(s): {missing}")
+
     out: Path = args.out
     if out.exists():
         shutil.rmtree(out)
@@ -140,7 +156,7 @@ def main() -> None:
 
     core = base_manifest(CORE, version, "omp — a coding agent with the IDE wired in")
     core["bin"] = {"omp": "bin/omp.js"}
-    core["files"] = ["bin/"]
+    core["files"] = [*NOTICE_FILES, "bin/"]
     core["engines"] = {"node": ">=20"}
     # Read by `omp update` (resolveReleaseDist): "npm" keeps bun/npm-managed
     # installs on their package manager across major bumps; removing this

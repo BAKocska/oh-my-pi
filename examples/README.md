@@ -376,3 +376,17 @@ thirteen residual drift sites the round-5/6 spot fixes missed, notably every
 | `StateScopeDenied` derives from `OmpError` while docs specify `omp.JournalError` as its base (and no `JournalError` is exported) | `org-registry/` | `__init__.py:171-172` |
 | `AmendPatch::DropParts` declared by 02 §4 but the frozen `ContextPatch` vocabulary has no arm — the policy is declarable, the amend op is not | `part-pruner/` | `context.py` |
 | `QuotaExceeded` carries neither documented `.quota` nor `.receipt` payload fields (native `create_exception!` supplies no payload) | `resource-receipts/` | `_errors.py` / native |
+**Resolved 2026-08-20:** All three Round 7 findings closed. `JournalError`
+is frozen per docs/py/09 (with the documented `appended` partial-append
+payload) and `StateScopeDenied` rebases on it; the `DropParts(ids, reason)`
+amend arm joined the `ContextPatch` vocabulary with projection-only semantics
+and top-level export; `QuotaExceeded` became a payload-carrying Python
+exception (`quota: str`, `receipt: ResourceReceipt | None`), replacing the
+fieldless native `create_exception!` (no native raiser existed). A docs
+self-conflict surfaced during closure — 09:512-520 places `SchemaError`
+under `JournalError` while 01:1179-1188 places it under `DeviceError` — and
+resolved by multiple inheritance: schema failures genuinely arise on both the
+device-decode and journal-replay paths, so `SchemaError(DeviceError,
+JournalError)` keeps both documented contracts true. The three finding ports
+were reconciled to the landed surface and are gap-free.
+

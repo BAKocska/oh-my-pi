@@ -209,8 +209,13 @@ inference-smoke:
     cargo run -p omp-llm-inference --example applefm_smoke
 
 # ---------------------------------------------------------------------------
-# Release packaging
+# Licensing & release packaging
 # ---------------------------------------------------------------------------
+
+# Verify locked Rust dependency licenses and sources with standard cargo-deny tooling.
+[group('release')]
+license-check:
+    cargo deny --locked check licenses sources
 
 # Assemble npm publish packages from built release binaries.
 [group('release')]

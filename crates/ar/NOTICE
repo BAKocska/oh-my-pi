@@ -1,0 +1,14 @@
+omp-ar attribution notice
+=========================
+
+The RAR decompression structures in `src/rar/rar4_decoder.rs` and
+`src/rar/rar5_decoder.rs` are adapted from unrar5j by Stephane Bury:
+
+https://github.com/RealBurst/unrar5j
+Copyright 2025 Stephane Bury
+
+unrar5j and this adaptation are licensed under the Apache License, Version
+2.0. The complete license terms are in `THIRD-PARTY-NOTICES.txt` in the
+repository root. The Rust implementation has been modified from the Java
+upstream for integration into omp-ar; this notice does not claim ownership
+of the upstream work.

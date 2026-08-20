@@ -3,6 +3,8 @@
 # stdlib) and generates the build inputs omp-py derives from it:
 #   <dest>/python/stdlib.bin       in-memory stdlib blob embedded by omp-py
 #   <dest>/python/pyo3-config.txt  static-link config consumed via PYO3_CONFIG_FILE
+#   crates/py/THIRD-PARTY-NOTICES.txt (checkout mode) from PYTHON.json,
+#                                      its license corpus, and frozen wheels
 #
 # Usage: fetch-python.sh [dest-dir]
 #   dest-dir  directory that receives the `python/` tree; defaults to the
@@ -156,5 +158,5 @@ esac
 if [ -n "$REPO_MODE" ]; then
 	DEV_EXE="$DEST/python/install/bin/python3.14td"
 	[ -x "$DEV_EXE" ] || DEV_EXE="$DEST/python/install/bin/python3.14t"
-	"$DEV_EXE" "$SCRIPT_DIR/gen-py-notices.py" "$DEST/python/bundled" "$CRATE_DIR/THIRD-PARTY-NOTICES.txt"
+	"$DEV_EXE" "$SCRIPT_DIR/gen-py-notices.py" "$DEST/python" "$CRATE_DIR/THIRD-PARTY-NOTICES.txt"
 fi

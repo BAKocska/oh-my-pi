@@ -6,9 +6,9 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-authors = ["Can Boluk"]
+authors = ["Stencil Labs, Inc."]
 homepage = "https://omp.sh/"
-repository = "https://github.com/can1357/omp"
+repository = "https://github.com/stencil-hq/omp"
 
 # All dependencies live here; member crates reference them with
 # `dep = { workspace = true }` and never pin their own versions.

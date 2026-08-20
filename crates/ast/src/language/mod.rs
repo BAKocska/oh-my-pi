@@ -2,6 +2,10 @@
 //!
 //! Originally derived from `ast-grep-language` v0.39.9, stripped of
 //! serde/ignore machinery, and extended with additional languages.
+//!
+//! Upstream: <https://github.com/ast-grep/ast-grep>
+//! Copyright (c) 2022 Herrington Darkholme; licensed under MIT.
+//! See this package's `NOTICE` and `LICENSE` for attribution and terms.
 
 mod parsers;
 

@@ -2,12 +2,12 @@
   "schema_version": 1,
   "corpus": "llm-oracle",
   "hash_algorithm": "sha256",
-  "corpus_sha256": "00aa5e54ca291dcd497051f0b4e34d32cb3ecc6caf7de121beeb985ed127365c",
+  "corpus_sha256": "d960505c7126d47a7f32bf49978ab148ecd29b99edb8b8880d3941802b1c88b3",
   "category_count": 14,
   "manifest_count": 14,
-  "artifact_count": 267,
-  "indexed_file_count": 281,
-  "secret_free_count": 281,
+  "artifact_count": 268,
+  "indexed_file_count": 282,
+  "secret_free_count": 282,
   "categories": [
     {
       "id": "agent-protocols",
@@ -90,8 +90,8 @@
     {
       "id": "vendor-schemas",
       "manifest_path": "vendor-schemas/manifest.json",
-      "artifact_count": 23,
-      "indexed_file_count": 24
+      "artifact_count": 24,
+      "indexed_file_count": 25
     }
   ],
   "entries": [
@@ -2152,6 +2152,14 @@
       "sha256": "29b7ab6405136460ed9d5c0ba031c32e31aa45c2ace998ea2b649f41b3beca9e"
     },
     {
+      "id": "vendor-schemas.notice.v1",
+      "kind": "artifact",
+      "path": "vendor-schemas/NOTICE.txt",
+      "provenance_category": "vendor-schemas",
+      "secret_free": true,
+      "sha256": "fc46542c68ef744fea035cfcb5bc453e8aa6ed46c3f1a80fcff6ccb7ab148cee"
+    },
+    {
       "id": "vendor-schemas.cursor.agent.v1",
       "kind": "artifact",
       "path": "vendor-schemas/cursor/agent.proto",
@@ -2333,7 +2341,7 @@
       "path": "vendor-schemas/manifest.json",
       "provenance_category": "vendor-schemas",
       "secret_free": true,
-      "sha256": "87a66db76482369e81bb4f80b5672610bee2a9eb06fbf19d5cb7c798b5407c74"
+      "sha256": "6a8fbca526cc196572bfb332e30af17f37d0f1465529aa2a49fc2d55dfbb64b0"
     },
     {
       "id": "vendor-schemas.provenance.v1",
@@ -2341,7 +2349,7 @@
       "path": "vendor-schemas/provenance.json",
       "provenance_category": "vendor-schemas",
       "secret_free": true,
-      "sha256": "2b8b3816ee18af5362c3b434c59fba2c0e63754bee1f05191505fe1c0e726741"
+      "sha256": "d56d697020537c20b1c8ca962ac5609a464c67ee450c3f72a5e815712c6437a3"
     }
   ]
 }

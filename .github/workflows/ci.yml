@@ -6,6 +6,11 @@ on:
     paths:
       - ".cargo/**"
       - ".github/workflows/ci.yml"
+      - "about.toml"
+      - "deny.toml"
+      - "justfile"
+      - "LICENSE*"
+      - "THIRD-PARTY-NOTICES.txt"
       - "crates/**"
       - "examples/**"
       - "fixtures/**"
@@ -21,6 +26,11 @@ on:
     paths:
       - ".cargo/**"
       - ".github/workflows/ci.yml"
+      - "about.toml"
+      - "deny.toml"
+      - "justfile"
+      - "LICENSE*"
+      - "THIRD-PARTY-NOTICES.txt"
       - "crates/**"
       - "examples/**"
       - "fixtures/**"
@@ -67,9 +77,25 @@ jobs:
       - name: Generate and validate runtime specification
         run: cargo -Zscript scripts/check-spec.rs -- target/runtime-symbol-spec.json
 
+  licenses:
+    name: License policy and release notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install pinned compliance tools
+        run: |
+          cargo install --locked --version 1.58.0 just
+          cargo install --locked --version 0.20.2 cargo-deny
+          cargo install --locked --version 0.8.2 cargo-about
+      - name: Check license policy and release notices
+        run: just license-check
+
   rust:
     name: Rust workspace and acceptance proofs
-    needs: [format, runtime_spec]
+    needs: [format, runtime_spec, licenses]
     runs-on: macos-15
     timeout-minutes: 120
     steps:

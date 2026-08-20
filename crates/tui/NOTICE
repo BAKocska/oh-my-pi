@@ -1,0 +1,14 @@
+omp-tui bundled-data notices
+============================
+
+Syntax definitions
+------------------
+
+The copied syntax definitions under `src/markdown/syntaxes` retain their
+copyright, provenance, and complete MIT terms in:
+
+`src/markdown/syntaxes/NOTICE`
+
+That notice covers `Nix.sublime-syntax`, derived from wmertens/sublime-nix
+(Copyright (c) 2016 Wout Mertens), and `Mermaid.sublime-syntax`, vendored from
+SublimeText/Mermaid (Copyright (c) 2017 Peng Wang).

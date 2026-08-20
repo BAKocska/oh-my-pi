@@ -1,5 +1,5 @@
-// Decompression structure adapted from unrar5j by Stephane Bury
-// (Copyright 2025, Apache License 2.0).
+// Decompression structure adapted and modified for omp-ar from unrar5j by
+// Stephane Bury (Copyright 2025, Apache License 2.0). See ../../NOTICE.
 
 use crate::{Error, Result};
 

@@ -1,0 +1,7 @@
+VENDOR SCHEMA NOTICE
+
+This directory contains 21 protocol schema files recovered from this repository's historical provider sources: one Cursor schema and twenty Devin schemas. The exact file-by-file source path, historical commit, digest, and size are recorded in provenance.json.
+
+No license notice is present in any of these schema files, and the recorded repository history does not establish a license grant for them. Accordingly, these files are excluded from the project's root MIT license. Their use and redistribution require rights review. This notice does not assert ownership, origin beyond the factual history recorded in provenance.json, or permission from Cursor, Devin, or any other party.
+
+provenance.json is the machine-readable inventory for this directory. Each .proto file must appear there exactly once with license_status "no_license_present", rights_review "required", and root_license_scope "excluded".

@@ -1,0 +1,13 @@
+omp-ast attribution notice
+==========================
+
+`src/language/mod.rs` was originally derived from `ast-grep-language` v0.39.9,
+then stripped of serde/ignore machinery and extended with additional
+languages.
+
+Upstream project: https://github.com/ast-grep/ast-grep
+Copyright (c) 2022 Herrington Darkholme
+
+The upstream work is licensed under the MIT License. Complete MIT terms are in
+`LICENSE`. Copyright in the upstream material remains with its upstream
+owner; this notice does not claim ownership of that material.

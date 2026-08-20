@@ -1,0 +1,12 @@
+omp-walker provenance notice
+============================
+
+This package continues the earlier `pi-walker` implementation incorporated in
+the OMP source tree. The implementation has since been renamed, extended, and
+modified for the current workspace. The retained `pi-walker` references in
+source comments, worker names, and performance-test descriptions document
+that code lineage.
+
+No separate third-party copyright or license notice for `pi-walker` is present
+in the incorporated source snapshot. The current omp-walker package is
+distributed under MIT; complete terms are in `LICENSE`.

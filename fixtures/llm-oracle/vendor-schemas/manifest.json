@@ -160,8 +160,15 @@
       "id": "vendor-schemas.provenance.v1",
       "path": "provenance.json",
       "secret_free": true,
-      "sha256": "2b8b3816ee18af5362c3b434c59fba2c0e63754bee1f05191505fe1c0e726741",
+      "sha256": "d56d697020537c20b1c8ca962ac5609a464c67ee450c3f72a5e815712c6437a3",
       "source": "repository history paths and archived Cursor/Devin wire bindings"
+    },
+    {
+      "id": "vendor-schemas.notice.v1",
+      "path": "NOTICE.txt",
+      "secret_free": true,
+      "sha256": "fc46542c68ef744fea035cfcb5bc453e8aa6ed46c3f1a80fcff6ccb7ab148cee",
+      "source": "local compliance notice based on provenance.json"
     }
   ],
   "schema_version": 1

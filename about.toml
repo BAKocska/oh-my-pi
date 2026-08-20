@@ -1,0 +1,46 @@
+# cargo-about 0.8.2 resolves OR expressions in this priority order. Licenses
+# requiring case-by-case review are accepted only for the locked packages below;
+# cargo-deny enforces their exact package/version scope.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MIT-0",
+]
+
+[bitmaps]
+accepted = ["MPL-2.0"]
+
+[im]
+accepted = ["MPL-2.0"]
+
+[option-ext]
+accepted = ["MPL-2.0"]
+
+[sized-chunks]
+accepted = ["MPL-2.0"]
+
+[terminfo]
+accepted = ["WTFPL"]
+
+[whisper-rs]
+accepted = ["Unlicense"]
+
+[whisper-rs-sys]
+accepted = ["Unlicense"]
+
+[tree-sitter-graphql.clarify]
+license = "MIT"
+
+[[tree-sitter-graphql.clarify.files]]
+path = "LICENSE"
+checksum = "5ea7d9ec06cb21ca0a800b69cd954e346bafba94620eb115c4b1fead3f3b30f8"

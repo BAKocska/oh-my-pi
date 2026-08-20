@@ -1,0 +1,20 @@
+omp-shell-builtins attribution notice
+=====================================
+
+This package was ported from the earlier `pi-builtins` implementation. Source
+module headers identify additional lineages and are retained with the code,
+including:
+
+* utilities ported from uutils coreutils 0.8.0;
+* `find`, ported from uutils findutils, with retained notices for Google Inc.
+  (2017), Tavian Barnes (2017 and 2022), and Collabora, Ltd. (2021 and 2022);
+* `sed`, ported from uutils sed 0.1.1, with retained
+  Copyright (c) 2025 Diomidis Spinellis notices;
+* the UTF-8 decoder in `wc`, with its retained
+  Copyright (c) Simon Sapin and many others notice; and
+* utilities ported from earlier `pi-shell` in-process implementations.
+
+The identified upstream code is distributed under the MIT License. The
+complete MIT terms are in `LICENSE`. Copyright in upstream material remains
+with the named upstream owners and contributors; the package license does not
+claim ownership of that material.
