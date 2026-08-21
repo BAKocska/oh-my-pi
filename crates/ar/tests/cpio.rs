@@ -81,7 +81,7 @@ fn rejects_bad_crc_missing_trailer_and_unsafe_paths() {
 		.unwrap();
 	assert!(matches!(
 		Archive::from_bytes_with_format(&bytes[..trailer.saturating_sub(110)], Format::Cpio),
-		Err(Error::InvalidArchive(_)) | Err(Error::Io(_))
+		Err(Error::InvalidArchive(_) | Error::Io(_))
 	));
 
 	let bytes = fixture_bytes("cpio-traversal.cpio");

@@ -17,7 +17,7 @@ pub fn expand_at_paths(path: &Path) -> io::Result<String> {
 
 fn expand(path: &Path, depth: usize, visited: &mut BTreeSet<PathBuf>) -> io::Result<String> {
 	if depth > MAX_AT_PATH_DEPTH {
-		return Ok(fs::read_to_string(path)?);
+		return fs::read_to_string(path);
 	}
 	let canonical = fs::canonicalize(path)?;
 	if !visited.insert(canonical.clone()) {
@@ -99,12 +99,11 @@ fn expand_line(
 		}
 		let suffix = &line[start + token.len()..end];
 		let target = resolve_path(base, token);
-		match target.and_then(|target| expand(&target, depth + 1, visited)) {
-			Ok(expanded) => output.push_str(&expanded),
-			Err(_) => {
-				output.push('@');
-				output.push_str(token);
-			},
+		if let Ok(expanded) = target.and_then(|target| expand(&target, depth + 1, visited)) {
+			output.push_str(&expanded)
+		} else {
+			output.push('@');
+			output.push_str(token);
 		}
 		output.push_str(suffix);
 		cursor = end;

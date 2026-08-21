@@ -226,7 +226,7 @@ impl<C: CheckpointControl> Tool for Rewind<C> {
 	}
 }
 
-fn fault(message: &'static str) -> Fault {
+const fn fault(message: &'static str) -> Fault {
 	Fault { message: sf!(message) }
 }
 const fn done_checkpoint(

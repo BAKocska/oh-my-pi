@@ -138,10 +138,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 				yield done_fault(Fault::invalid("No replacement operations found in edits."));
 				return;
 			}
-			let journal_input = match serde_json::to_vec(&replace_params) {
-				Ok(input) => Bytes::from(input),
-				Err(_) => { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; },
-			};
+			let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
 			let mut works = Vec::with_capacity(replace_params.edits.len());
 			for op in replace_params.edits {
 				let prepared = match self.documents.prepare(PrepareRequest {
@@ -200,12 +197,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 				} else if recovery_edits.is_empty() {
 					yield done_fault(Fault::stale("The source snapshot changed before this replacement could be applied; re-read the document."));
 					return;
-				} else {
-					match recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) {
-						Ok(recovered) => recovered.content().clone(),
-						Err(_) => { yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document.")); return; },
-					}
-				};
+				} else if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else { yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document.")); return; };
 				proposals.push(EditProposal {
 					action: EditAction::Write { content: after.clone() },
 					base_revision: work.prepared.base_revision().clone(),

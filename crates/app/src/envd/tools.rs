@@ -137,7 +137,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	let edit_identity = if selected_edit == replace_identity.rev {
 		replace_identity.clone()
 	} else {
-		hashline_identity.clone()
+		hashline_identity
 	};
 	if tool_settings.enabled("edit") {
 		if selected_edit == replace_identity.rev {
@@ -421,7 +421,7 @@ fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 fn worker_projection_code(declaration: &ToolDecl) -> [u8; 32] {
 	let mut hasher = Hash32::hasher();
 	hasher.update(b"omp/frozen-worker-registration/v1");
-	hasher.update(&declaration.encode_to_vec());
+	hasher.update(declaration.encode_to_vec());
 	hasher.finalize().into_bytes()
 }
 

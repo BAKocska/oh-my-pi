@@ -18,7 +18,7 @@ use thiserror::Error;
 
 /// A finalized admission result, with policy transformation applied before the
 /// executor can observe arguments.
-pub(crate) enum AdmissionDecision {
+pub enum AdmissionDecision {
 	/// The effective canonical arguments and regenerated shell facts.
 	Allowed {
 		/// RFC 8785-compatible serde canonical argument bytes for the executor.
@@ -32,7 +32,7 @@ pub(crate) enum AdmissionDecision {
 
 /// A protocol or transformation failure while admitting an invocation.
 #[derive(Debug, Error)]
-pub(crate) enum AdmissionError {
+pub enum AdmissionError {
 	/// Arguments ended in a value that cannot be transformed as an object.
 	#[error("finalized invocation arguments must be a JSON object")]
 	ArgumentsNotObject,
@@ -51,7 +51,7 @@ pub(crate) enum AdmissionError {
 }
 
 /// Env-owned one-shot admission state for one invocation.
-pub(crate) struct AdmissionGate {
+pub struct AdmissionGate {
 	invocation_id: Str,
 	tool_name:     Str,
 	deadline:      tokio::time::Instant,
@@ -152,7 +152,7 @@ impl AdmissionGate {
 	}
 
 	/// Reports whether Core's one admission answer has arrived.
-	pub(crate) fn is_answered(&self) -> bool {
+	pub(crate) const fn is_answered(&self) -> bool {
 		self.query_emitted && self.answer_tx.is_none()
 	}
 
@@ -197,7 +197,7 @@ impl AdmissionGate {
 }
 
 /// Refuses an envelope that would widen the resolved tool declaration.
-pub(crate) fn effects_narrow_or_refuse(
+pub fn effects_narrow_or_refuse(
 	requested: Option<&EffectEnvelope>,
 	maximum: &Effects,
 ) -> Option<Effects> {

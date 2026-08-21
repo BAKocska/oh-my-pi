@@ -413,21 +413,21 @@ impl CompactionCoordinator {
 					.context_window
 					.saturating_sub(SPECULATION_LEAD_MIN_TOKENS),
 			);
-		if usage.total_tokens < grace_cap {
-			if let Some(method) = method {
-				match &self.slot {
-					SpeculationSlot::Running(request)
-						if request.method == method
-							&& request.snapshot.compaction_epoch == usage.compaction_epoch
-							&& snapshot_leaf_present =>
-					{
-						return CompactionDecision::Defer;
-					},
-					SpeculationSlot::Idle => {
-						return self.launch(method, usage, live_session_id, branch_leaf, true, None);
-					},
-					SpeculationSlot::Running(_) | SpeculationSlot::Armed(_) => {},
-				}
+		if usage.total_tokens < grace_cap
+			&& let Some(method) = method
+		{
+			match &self.slot {
+				SpeculationSlot::Running(request)
+					if request.method == method
+						&& request.snapshot.compaction_epoch == usage.compaction_epoch
+						&& snapshot_leaf_present =>
+				{
+					return CompactionDecision::Defer;
+				},
+				SpeculationSlot::Idle => {
+					return self.launch(method, usage, live_session_id, branch_leaf, true, None);
+				},
+				SpeculationSlot::Running(_) | SpeculationSlot::Armed(_) => {},
 			}
 		}
 
@@ -499,7 +499,7 @@ pub struct ContextUsage {
 impl ContextUsage {
 	/// Creates usage while deriving the usable window from its reserve.
 	#[must_use]
-	pub fn new(
+	pub const fn new(
 		total_tokens: u64,
 		context_window: u64,
 		reserve_tokens: u64,

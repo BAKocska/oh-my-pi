@@ -434,11 +434,29 @@ impl DapSession {
 		breakpoints: Vec<Value>,
 	) -> Result<Value, DapSessionError> {
 		let source = Str::new(source.as_ref());
+		let (response, mut pending) = self
+			.replace_source_breakpoints(&source, &breakpoints)
+			.await?;
+		pending.reverse();
+		while let Some(session) = pending.pop() {
+			let (_, children) = session
+				.replace_source_breakpoints(&source, &breakpoints)
+				.await?;
+			pending.extend(children.into_iter().rev());
+		}
+		Ok(response)
+	}
+
+	async fn replace_source_breakpoints(
+		&self,
+		source: &Str,
+		breakpoints: &[Value],
+	) -> Result<(Value, Vec<Arc<Self>>), DapSessionError> {
 		let _guard = self.breakpoint_mutation.lock().await;
 		self
 			.source_breakpoints
 			.lock()
-			.insert(source.clone(), breakpoints.clone());
+			.insert(source.clone(), breakpoints.to_vec());
 		let response = self
 			.protocol
 			.request("setBreakpoints", json!({"source": {"path": source}, "breakpoints": breakpoints}))
@@ -448,12 +466,9 @@ impl DapSession {
 			.lock()
 			.iter()
 			.filter_map(Weak::upgrade)
-			.collect::<Vec<_>>();
+			.collect();
 		drop(_guard);
-		for child in children {
-			Box::pin(child.set_source_breakpoints(source.as_str(), breakpoints.clone())).await?;
-		}
-		Ok(response)
+		Ok((response, children))
 	}
 
 	/// Adds a child and replays current source breakpoints before exposing it.
@@ -575,11 +590,11 @@ impl DapSessionRegistry {
 			.sessions
 			.read()
 			.iter()
-			.filter_map(|(id, session)| {
-				((session.state() == DapSessionState::Terminated)
-					|| (session.is_idle(now) && session.protocol.is_closed()))
-				.then(|| id.clone())
+			.filter(|&(_id, session)| {
+				(session.state() == DapSessionState::Terminated)
+					|| (session.is_idle(now) && session.protocol.is_closed())
 			})
+			.map(|(id, _session)| id.clone())
 			.collect::<Vec<_>>();
 		let mut sessions = self.sessions.write();
 		for id in &removed {

@@ -380,5 +380,5 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 			&zero_tool.spec().rev,
 		),
 	);
-	assert_eq!(zero, [] as [omp_tool::Part; 0]);
+	assert!(zero.is_empty());
 }

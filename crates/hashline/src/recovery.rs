@@ -846,8 +846,8 @@ mod tests {
 		let bytes = Bytes::from_static(b"a\nb\nc\n");
 		let result = recover_exact(&bytes, &bytes, &[edit(2, 4, b"B-long\n")]).unwrap();
 		assert_eq!(result.content(), &Bytes::from_static(b"a\nB-long\nc\n"));
-		assert_ne!(result.canonical_edits(), []);
-		assert_ne!(result.changed_ranges(), []);
+		assert!(!result.canonical_edits().is_empty());
+		assert!(!result.changed_ranges().is_empty());
 		assert_eq!(result.recovered_edits()[0].current_range(), ByteRange { start: 2, end: 4 });
 		assert_eq!(result.recovered_edits()[0].final_range(), ByteRange { start: 2, end: 9 });
 	}

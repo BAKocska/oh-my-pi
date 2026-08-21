@@ -76,7 +76,7 @@ pub enum ExtensionCode {
 	EFrozenConflict,
 	/// A target lacks an installable wheel.
 	ETargetMissing,
-	/// A wheel ABI is not valid for CPython 3.14t.
+	/// A wheel ABI is not valid for `CPython` 3.14t.
 	EAbiRejected,
 	/// A direct URL occurred in a requirement.
 	EUrlRequire,
@@ -118,7 +118,7 @@ pub enum ExtensionCode {
 	ESettingSecret,
 	/// A trusted extension failed to load.
 	ETrustedLoad,
-	/// A host binary does not export the CPython C API.
+	/// A host binary does not export the `CPython` C API.
 	EAbiExport,
 	/// A lock references a yanked artifact.
 	WYanked,

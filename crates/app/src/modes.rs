@@ -190,7 +190,7 @@ impl ExecutionModes {
 		}
 	}
 
-	/// Wraps an existing prompt source with the active mode SlotSource.
+	/// Wraps an existing prompt source with the active mode `SlotSource`.
 	#[must_use]
 	pub fn prompt_source(&self, base: Arc<dyn PromptSource>) -> Arc<dyn PromptSource> {
 		Arc::new(ModeAwarePromptSource { base, modes: self.clone() })

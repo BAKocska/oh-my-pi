@@ -544,14 +544,15 @@ impl ServerConfig {
 		})
 	}
 
-	/// Sets the build identity advertised to document clients.
+	/// Sets the executable-generation identity advertised to document clients.
 	#[must_use]
 	pub fn with_server_build(mut self, build: impl Into<Str>) -> Self {
 		self.server_build = build.into();
 		self
 	}
 
-	/// Returns the build identity advertised to document clients.
+	/// Returns the executable-generation identity advertised to document
+	/// clients.
 	#[must_use]
 	pub const fn server_build(&self) -> &Str {
 		&self.server_build

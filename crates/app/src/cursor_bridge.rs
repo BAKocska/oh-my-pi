@@ -26,7 +26,7 @@ pub enum WritePolicy {
 }
 
 /// A validated invocation of the stable dynamic-device transport.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DynDispatch {
 	/// Always `dyn`; exposed so adapters cannot accidentally invoke a device as
 	/// a core tool.

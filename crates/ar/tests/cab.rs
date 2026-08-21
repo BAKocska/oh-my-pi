@@ -121,7 +121,7 @@ fn rejects_truncation_multicab_checksum_damage_and_bad_mszip_framing() {
 	truncated.pop();
 	assert!(matches!(
 		Archive::from_bytes_with_format(&truncated, Format::Cab),
-		Err(Error::InvalidArchive(_)) | Err(Error::Io(_))
+		Err(Error::InvalidArchive(_) | Error::Io(_))
 	));
 
 	let mut multi = fixture_bytes("cab-none.cab");

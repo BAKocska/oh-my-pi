@@ -1208,9 +1208,9 @@ fn read_workspace_environment() -> WorkspaceEnvironment {
 	for (name, value) in &variables {
 		let name = name.as_bytes();
 		let value = value.as_bytes();
-		hasher.update(&(name.len() as u64).to_be_bytes());
+		hasher.update((name.len() as u64).to_be_bytes());
 		hasher.update(name);
-		hasher.update(&(value.len() as u64).to_be_bytes());
+		hasher.update((value.len() as u64).to_be_bytes());
 		hasher.update(value);
 	}
 	WorkspaceEnvironment {

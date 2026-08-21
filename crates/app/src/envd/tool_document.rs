@@ -1062,9 +1062,9 @@ fn transaction_id(server_epoch: &[u8]) -> Bytes {
 		.as_nanos();
 	let mut hasher = Hash32::hasher();
 	hasher.update(server_epoch);
-	hasher.update(&std::process::id().to_le_bytes());
-	hasher.update(&sequence.to_le_bytes());
-	hasher.update(&now.to_le_bytes());
+	hasher.update(std::process::id().to_le_bytes());
+	hasher.update(sequence.to_le_bytes());
+	hasher.update(now.to_le_bytes());
 	Bytes::copy_from_slice(&hasher.finalize().as_bytes()[..16])
 }
 

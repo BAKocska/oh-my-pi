@@ -316,8 +316,7 @@ fn image_description(
 	dimension_note: Option<&str>,
 ) -> Str {
 	let dimensions = dimensions
-		.map(|(width, height)| format!("{width}x{height}"))
-		.unwrap_or_else(|| "unknown".to_owned());
+		.map_or_else(|| "unknown".to_owned(), |(width, height)| format!("{width}x{height}"));
 	let channels = channels.map_or_else(|| "unknown".to_owned(), |count| count.to_string());
 	let alpha = has_alpha.map_or("unknown", |present| if present { "yes" } else { "no" });
 	let mut description = format!(

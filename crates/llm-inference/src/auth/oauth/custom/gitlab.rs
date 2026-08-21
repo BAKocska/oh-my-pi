@@ -503,7 +503,7 @@ mod tests {
 
 		assert!(tokens.is_refreshable());
 		assert_eq!(tokens.token_type(), "Bearer");
-		assert_eq!(tokens.expires_in(), Some(Duration::from_hours(1) - EXPIRY_SAFETY_MARGIN));
+		assert_eq!(tokens.expires_in(), Some(Duration::from_mins(55)));
 		let principal = tokens
 			.resolve_principal(
 				&PrincipalResolution::TokenResponseField { pointer: "/identity".into() },

@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Model arguments for `todo@1`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// State transition to perform.
@@ -231,7 +231,7 @@ pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Faul
 		Op::Init => {
 			*phases = params
 				.list
-				.ok_or_else(|| invalid("`list` is required for init"))?
+				.ok_or_else(|| invalid("`list` is required for init"))?;
 		},
 		Op::View => {},
 		Op::Append => {
@@ -347,7 +347,7 @@ pub fn render(phases: &[Phase]) -> String {
 		.collect::<Vec<_>>()
 		.join("\n\n")
 }
-fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
+const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
 }
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

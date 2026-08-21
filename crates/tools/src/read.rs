@@ -778,7 +778,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			let lease = self.sources.open(stat.canonical_path.clone()).await?;
 			let source_bytes = lease.read_all().await?;
 			let rendered = notebook::render(&source_bytes, &stat.display_path)
-				.map_err(|error| Fault::Source { message: Str::new(error.message().to_owned()) })?;
+				.map_err(|error| Fault::Source { message: Str::new(error.message()) })?;
 			let rendered_bytes = Bytes::copy_from_slice(rendered.text.as_bytes());
 			return self.text_parts(
 				&stat,

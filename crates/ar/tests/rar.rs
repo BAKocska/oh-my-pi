@@ -227,7 +227,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 	}
 	padded.extend_from_slice(&bit_len.to_be_bytes());
 	let mut hash = INITIAL;
-	for chunk in padded.chunks_exact(64) {
+	for chunk in padded.as_chunks::<64>().0 {
 		let mut schedule = [0u32; 64];
 		for (index, word) in schedule[..16].iter_mut().enumerate() {
 			*word = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());
@@ -294,6 +294,6 @@ impl Seek for TrackingReader<'_> {
 	}
 }
 
-fn overlaps(left: &Range<usize>, right: &Range<usize>) -> bool {
+const fn overlaps(left: &Range<usize>, right: &Range<usize>) -> bool {
 	left.start < right.end && right.start < left.end
 }

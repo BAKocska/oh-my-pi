@@ -225,7 +225,7 @@ pub mod omp_firehose {
 	pub const ARTIFACT_ID: &str = "omp.artifact.id";
 	/// Layer that caused an artifact spill.
 	pub const ARTIFACT_REASON: &str = "omp.artifact.reason";
-	/// Identifier of a durable AutoQA issue.
+	/// Identifier of a durable `AutoQA` issue.
 	pub const ISSUE_ID: &str = "omp.issue.id";
 	/// Requested capability constraint intent.
 	pub const CONSTRAINT_INTENT: &str = "omp.constraint.intent";

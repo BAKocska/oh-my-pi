@@ -816,15 +816,14 @@ fn load_worktree_records(
 		{
 			continue;
 		}
-		let durable: DurableWorktreeRecord = match fs::read(entry.path())
+		let durable: DurableWorktreeRecord = if let Some(record) = fs::read(entry.path())
 			.ok()
 			.and_then(|bytes| serde_json::from_slice(&bytes).ok())
 		{
-			Some(record) => record,
-			None => {
-				tracing::warn!(path = %entry.path().display(), "ignoring malformed worktree record");
-				continue;
-			},
+			record
+		} else {
+			tracing::warn!(path = %entry.path().display(), "ignoring malformed worktree record");
+			continue;
 		};
 		if durable.version != 1
 			|| durable.id.is_empty()

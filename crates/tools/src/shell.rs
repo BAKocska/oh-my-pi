@@ -610,17 +610,13 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 						PendingRun::Background => {
 							let name =
 								next_background_name("shell", &self.next_background_name);
-							match run.detach(name).await {
-								Ok(job) => {
-									self.finish_session(&session, persistent, true).await;
-									yield Ev::Done(detached_terminal(job));
-									return;
-								},
-								Err(_) => {
-									auto_background = false;
-									continue;
-								},
-							}
+							if let Ok(job) = run.detach(name).await {
+											 self.finish_session(&session, persistent, true).await;
+											 yield Ev::Done(detached_terminal(job));
+											 return;
+										 }
+											 auto_background = false;
+											 continue;
 						},
 						PendingRun::Event(event) => event,
 						PendingRun::Interrupt(interrupt) => {
@@ -823,7 +819,7 @@ fn extract_leading_cd(command: &Str) -> (Str, Option<Str>) {
 	if cursor == bytes.len() {
 		return (command.clone(), None);
 	}
-	(Str::new(String::from_utf8_lossy(&bytes[cursor..]).into_owned()), Some(Str::new(cwd)))
+	(Str::new(String::from_utf8_lossy(&bytes[cursor..])), Some(Str::new(cwd)))
 }
 
 fn skip_space(bytes: &[u8], mut cursor: usize) -> usize {

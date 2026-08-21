@@ -156,14 +156,14 @@ fn discover_root(root: &Path, rows: &mut Vec<WorktreeRow>) -> io::Result<()> {
 				});
 				continue;
 			};
-			let class = if record.version != 1 {
-				"stray"
-			} else {
+			let class = if record.version == 1 {
 				match record.class.as_str() {
 					"pr-checkout" => "pr-checkout",
 					"task-isolation" => "task-isolation",
 					_ => "stray",
 				}
+			} else {
+				"stray"
 			};
 			rows.push(WorktreeRow {
 				id: record.id,

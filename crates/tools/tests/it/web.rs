@@ -902,7 +902,7 @@ async fn github_and_gist_failures_decline_without_inventing_content() {
 		.await
 		.expect("unsupported repository page cleanly declines");
 	assert!(result.is_none());
-	assert_eq!(unsupported.requests(), [] as [omp_tools::read::web::types::HttpRequest; 0]);
+	assert!(unsupported.requests().is_empty());
 
 	for client in [
 		CannedHttp::from_results([Err(WebError::request("offline"))]),
@@ -942,7 +942,7 @@ async fn github_and_gist_failures_decline_without_inventing_content() {
 		.await
 		.expect("invalid gist URL cleanly declines");
 	assert!(result.is_none());
-	assert_eq!(invalid_gist.requests(), [] as [omp_tools::read::web::types::HttpRequest; 0]);
+	assert!(invalid_gist.requests().is_empty());
 }
 
 #[tokio::test]

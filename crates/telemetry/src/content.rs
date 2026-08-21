@@ -507,8 +507,7 @@ mod tests {
 		let system = json!("system");
 		let messages = [json!({ "role": "user", "content": "hello" })];
 		let request = RequestContent { system_prompt: Some(&system), messages: &messages };
-		assert_eq!(request_attributes(CaptureMode::None, request), [] as [opentelemetry::KeyValue;
-			0]);
+		assert!(request_attributes(CaptureMode::None, request).is_empty());
 		let summary = request_attributes(CaptureMode::Summary, request);
 		assert_eq!(
 			summary
@@ -531,8 +530,7 @@ mod tests {
 			json!({ "type": "toolCall", "id": "1", "name": "read", "arguments": {} }),
 		];
 		let response = ResponseContent { parts: &parts, stop_reason: Some("toolUse") };
-		assert_eq!(response_attributes(CaptureMode::None, response), [] as [opentelemetry::KeyValue;
-			0]);
+		assert!(response_attributes(CaptureMode::None, response).is_empty());
 		let summary = response_attributes(CaptureMode::Summary, response);
 		assert_eq!(
 			summary

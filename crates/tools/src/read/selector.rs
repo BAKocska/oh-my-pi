@@ -475,7 +475,7 @@ pub fn parse_json_path_array(input: &str) -> Result<Option<Vec<Str>>, SelectorEr
 	}
 	let paths = paths
 		.into_iter()
-		.map(|path| Str::new(normalize_path_input(&path).to_owned()))
+		.map(|path| Str::new(normalize_path_input(&path)))
 		.collect::<Vec<_>>();
 	if paths.iter().any(|path| path.is_empty()) {
 		return Err(SelectorError::from_message("JSON path arrays must not contain empty paths."));

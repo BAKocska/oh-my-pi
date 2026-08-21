@@ -1251,7 +1251,7 @@ mod tests {
 		(feed, params)
 	}
 
-	fn number_issue(params: &mut IncomingParams<'_>, key: &'static str) -> Box<ArgIssue> {
+	fn number_issue(params: &mut IncomingParams<'_>, key: &'static str) -> ArgIssue {
 		let error = block_on(params.pull(|mut doc| async move {
 			let root = doc.json();
 			let mut object = root.object();
@@ -1262,7 +1262,7 @@ mod tests {
 		let ParamError::Args(issue) = error else {
 			panic!("pull failure must remain a structured argument issue");
 		};
-		issue
+		*issue
 	}
 
 	#[test]

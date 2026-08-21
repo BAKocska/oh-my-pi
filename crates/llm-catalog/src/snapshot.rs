@@ -688,10 +688,10 @@ mod tests {
 	#[test]
 	fn embedded_snapshot_opens_and_indexes_deterministically() {
 		let catalog = Catalog::embedded();
-		assert_ne!(catalog.providers(), []);
-		assert_ne!(catalog.routes(), []);
-		assert_ne!(catalog.models(), []);
-		assert_ne!(catalog.oauth_specs(), []);
+		assert!(!catalog.providers().is_empty());
+		assert!(!catalog.routes().is_empty());
+		assert!(!catalog.models().is_empty());
+		assert!(!catalog.oauth_specs().is_empty());
 		for oauth in catalog.oauth_specs() {
 			assert_eq!(catalog.oauth_spec(&oauth.id), Some(oauth));
 		}

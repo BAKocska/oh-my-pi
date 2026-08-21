@@ -836,7 +836,7 @@ fn advertisement_contains_only_the_live_schema_and_preserves_supported_grammar()
 	assert_eq!(grammar.definition, r"live=(true|false)");
 	assert_eq!(tool.disposition, Some(ConstraintDisposition::Required));
 	assert_eq!(tool.priority, Some(131));
-	assert_eq!(tool.adjustments, [] as [omp_llm_inference::Adjustment; 0]);
+	assert!(tool.adjustments.is_empty());
 }
 
 #[test]

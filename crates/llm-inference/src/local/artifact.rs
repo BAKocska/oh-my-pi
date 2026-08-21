@@ -122,7 +122,7 @@ impl ArtifactStore {
 			}
 		}
 		let mut digest = Sha256::new();
-		let mut buffer = Box::new([0_u8; 64 * 1024]);
+		let mut buffer = vec![0_u8; 64 * 1024];
 		loop {
 			if cancel.is_cancelled() {
 				return Err(LocalError::cancelled());

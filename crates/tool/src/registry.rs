@@ -1188,7 +1188,7 @@ impl Registry {
 						.replaces
 						.map_or(&[][..], |replacement| replacement.as_bytes()),
 				);
-				hasher.update(&shadow.precedence.0.to_le_bytes());
+				hasher.update(shadow.precedence.0.to_le_bytes());
 				hash_tool_route(&mut hasher, entry.tool.route());
 			}
 		}
@@ -1649,7 +1649,7 @@ fn projected_part_bytes(parts: &[Part]) -> usize {
 
 fn hash_field(hasher: &mut Hasher, field: &[u8]) {
 	let len = u64::try_from(field.len()).expect("tool identity length fits in u64");
-	hasher.update(&len.to_le_bytes());
+	hasher.update(len.to_le_bytes());
 	hasher.update(field);
 }
 

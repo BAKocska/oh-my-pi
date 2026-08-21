@@ -683,7 +683,7 @@ fn pin_fingerprint(catalog_id: u64, lifetime: ArtifactLifetime) -> [u8; 32] {
 
 fn hash_fingerprint_field(hasher: &mut Hasher, value: &[u8]) {
 	hasher.update(
-		&u64::try_from(value.len())
+		u64::try_from(value.len())
 			.expect("fingerprint field length fits u64")
 			.to_le_bytes(),
 	);

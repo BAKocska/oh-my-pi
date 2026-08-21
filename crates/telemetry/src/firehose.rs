@@ -182,7 +182,7 @@ impl PromptFingerprint {
 		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp.telemetry.prompt/v1\0");
 		for slot in &slot_digests {
-			hasher.update(&slot.digest);
+			hasher.update(slot.digest);
 		}
 		let changed = slot_digests
 			.iter()
@@ -386,7 +386,7 @@ pub struct ArtifactSpill {
 	pub reason:      Option<SpillReason>,
 }
 
-/// A model-filed AutoQA report.
+/// A model-filed `AutoQA` report.
 #[derive(Clone, Debug, Default)]
 pub struct IssueReport {
 	/// Shared event metadata.
@@ -446,7 +446,7 @@ pub enum Event {
 	Branch(Branch),
 	/// A payload spills to an artifact.
 	ArtifactSpill(ArtifactSpill),
-	/// An AutoQA issue is filed.
+	/// An `AutoQA` issue is filed.
 	IssueReport(Box<IssueReport>),
 	/// A non-fatal telemetry failure occurs.
 	HostWarning(HostWarning),

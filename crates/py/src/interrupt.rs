@@ -1,4 +1,4 @@
-//! CPython async interruption shared by embedded Python hosts.
+//! `CPython` async interruption shared by embedded Python hosts.
 
 use std::ffi::{c_long, c_ulong};
 
@@ -8,7 +8,7 @@ unsafe extern "C" {
 	fn PyThread_get_thread_ident() -> c_ulong;
 }
 
-/// Returns CPython's identifier for the attached current thread.
+/// Returns `CPython`'s identifier for the attached current thread.
 #[must_use]
 pub fn current_thread_id() -> u64 {
 	// SAFETY: callers use this only while their thread is attached to CPython.
@@ -18,9 +18,9 @@ pub fn current_thread_id() -> u64 {
 /// Raises `KeyboardInterrupt` asynchronously in the identified live Python
 /// thread.
 ///
-/// Returns `true` only when CPython selected exactly one thread state.
-/// CPython's documented recovery for an ambiguous selection is performed before
-/// returning.
+/// Returns `true` only when `CPython` selected exactly one thread state.
+/// `CPython`'s documented recovery for an ambiguous selection is performed
+/// before returning.
 #[must_use]
 pub fn interrupt(_py: Python<'_>, thread_id: u64) -> bool {
 	let Ok(id) = c_long::try_from(thread_id) else {

@@ -36,7 +36,7 @@ pub struct DocumentHello {
 	pub root_uri:       Str,
 	/// Epoch scoping transaction idempotency keys.
 	pub server_epoch:   Bytes,
-	/// Build identity of the serving document authority; empty means unknown.
+	/// Executable-generation identity of the serving document authority.
 	pub server_build:   Str,
 }
 /// A terminal loss of continuity in a document-server event stream.

@@ -37,7 +37,7 @@ pub struct AllowAdmission;
 impl Admitter for AllowAdmission {
 	type Future<'client> = std::future::Ready<Admission>;
 
-	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client> {
+	fn admit(&self, query: AdmitInvocation) -> Self::Future<'_> {
 		std::future::ready(Admission {
 			invocation_id: query.invocation_id,
 			allow: true,

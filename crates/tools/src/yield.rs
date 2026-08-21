@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Arguments accepted by `yield@1`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Terminal label or non-empty incremental section path.
@@ -27,7 +27,7 @@ pub struct Params {
 }
 
 /// Terminal label or incremental section path.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum YieldType {
 	/// Named terminal result.
@@ -37,7 +37,7 @@ pub enum YieldType {
 }
 
 /// Structured success or failure.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ResultEnvelope {
 	/// Successful structured output.

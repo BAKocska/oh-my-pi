@@ -113,7 +113,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<(Str, Option<Str>), MarkitError> {
 		return Err(failure("Invalid EPUB: no spine document could be read"));
 	}
 
-	Ok((Str::new(sections.join("\n\n").trim().to_owned()), title))
+	Ok((Str::new(sections.join("\n\n").trim()), title))
 }
 
 fn epub_html_options() -> ConversionOptions {

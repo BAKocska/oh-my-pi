@@ -52,7 +52,7 @@ pub struct ServeOptions {
 	pub lsp_config_paths: Vec<PathBuf>,
 	/// External shutdown; `None` installs signal handling.
 	pub shutdown:         Option<CancellationToken>,
-	/// Build identity advertised in `ServerHello`; empty means unknown.
+	/// Executable-generation identity advertised in `ServerHello`.
 	pub server_build:     Str,
 	/// Socket-connection gauge receiving the live accepted-connection count.
 	pub connections:      Option<tokio::sync::watch::Sender<usize>>,

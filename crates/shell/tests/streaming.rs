@@ -38,14 +38,14 @@ fn assert_streams_before_exit(script: &str) {
 		output
 	});
 
-	let first_line = match first_line_rx.recv_timeout(Duration::from_millis(1_200)) {
-		Ok(first_line) => first_line,
-		Err(_) => {
-			let _ = child.kill();
-			let _ = child.wait();
-			let _ = reader.join();
-			panic!("`{script}` buffered its first line until exit");
-		},
+	let first_line = if let Ok(first_line) = first_line_rx.recv_timeout(Duration::from_millis(1_200))
+	{
+		first_line
+	} else {
+		let _ = child.kill();
+		let _ = child.wait();
+		let _ = reader.join();
+		panic!("`{script}` buffered its first line until exit");
 	};
 	assert!(first_line < Duration::from_millis(1_200), "first line arrived at {first_line:?}");
 	assert!(

@@ -124,7 +124,7 @@ impl Params {
 }
 
 /// JSON result returned by the device.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Payload {
 	/// Structured operation result.
 	pub result: Value,
@@ -281,7 +281,7 @@ pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + 'static> {
 impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 	/// Creates a wave runner for one interactive chat.
 	#[must_use]
-	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<ExecutionModes>) -> Self {
+	pub(crate) const fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<ExecutionModes>) -> Self {
 		Self { parent, modes, workers: Mutex::new(BTreeMap::new()) }
 	}
 
@@ -400,18 +400,19 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 				return Err(Fault::new(format!("vibe worker {id} has no collectable result")));
 			};
 			let joined = if let Some(limit) = timeout_ms {
-				match tokio::time::timeout(std::time::Duration::from_millis(limit), &mut task).await {
-					Ok(result) => result,
-					Err(_) => {
-						self
-							.workers
-							.lock()
-							.get_mut(&id)
-							.expect("selected worker remains registered")
-							.handle = Some(task);
-						rows.push(json!({ "id": id, "status": "running" }));
-						continue;
-					},
+				if let Ok(result) =
+					tokio::time::timeout(std::time::Duration::from_millis(limit), &mut task).await
+				{
+					result
+				} else {
+					self
+						.workers
+						.lock()
+						.get_mut(&id)
+						.expect("selected worker remains registered")
+						.handle = Some(task);
+					rows.push(json!({ "id": id, "status": "running" }));
+					continue;
 				}
 			} else {
 				task.await

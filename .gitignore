@@ -6,6 +6,10 @@
 # stdlib.bin and pyo3-config.txt. Regenerate with crates/py/scripts/fetch-python.sh.
 /vendor/
 
+# Node / JS
+node_modules/
+.omp/tools/node_modules/
+
 # Python
 __pycache__/
 *.py[cod]

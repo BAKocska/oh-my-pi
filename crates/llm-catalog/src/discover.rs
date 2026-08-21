@@ -1042,6 +1042,6 @@ mod tests {
 		let gate = DiscoveryPollGate::default();
 		let now = Instant::now();
 		assert!(gate.claim_interval(key.clone(), &spec, now));
-		assert!(!gate.clone().claim_interval(key, &spec, now));
+		assert!(!gate.claim_interval(key, &spec, now));
 	}
 }

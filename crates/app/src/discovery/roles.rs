@@ -32,6 +32,7 @@ pub fn load_project_roles(
 }
 
 /// Appends a complete replacement snapshot for project-scoped role resolution.
+///
 /// `StateStore` supplies durable ordering and idempotency; callers use the
 /// returned request's project authority rather than writing workspace files.
 pub fn save_project_roles(

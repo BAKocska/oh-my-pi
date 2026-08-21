@@ -110,7 +110,7 @@ impl ProjectEnvironment {
 					{
 						// Stale-build owners can only appear on explicitly
 						// configured socket paths; the automatic path is keyed
-						// by build identity. Ask the owner to retire, then wait
+						// by executable generation. Ask the owner to retire, then wait
 						// briefly for the endpoint to be released.
 						let _ = owner_probe.retire().await;
 						bridge.abort();

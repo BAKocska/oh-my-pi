@@ -850,21 +850,21 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 		let endpoint_override = lease
 			.as_ref()
 			.and_then(crate::auth::CredentialLease::endpoint_override);
-		let mut effective_route = None;
-		let mut effective_target = None;
-		if let Some(endpoint_override) = endpoint_override {
+		let (effective_route, effective_target) = if let Some(endpoint_override) = endpoint_override {
 			let mut route = self.route.clone();
 			route.endpoint.base_url = endpoint_override.clone();
 			route.trust_domain.origin = url::Url::parse(endpoint_override).map_or_else(
 				|_| endpoint_override.clone(),
 				|url| Str::new(url.origin().ascii_serialization()),
 			);
-			effective_route = Some(route);
-			effective_target = plan.wire_target().cloned().map(|mut target| {
+			let target = plan.wire_target().cloned().map(|mut target| {
 				target.endpoint.base_url = endpoint_override.clone();
 				target
 			});
-		}
+			(Some(route), target)
+		} else {
+			(None, None)
+		};
 		let route = effective_route.as_ref().unwrap_or(&self.route);
 		if endpoint_override.is_some() {
 			execution.set_effective_trust_domain(route.trust_domain.clone());

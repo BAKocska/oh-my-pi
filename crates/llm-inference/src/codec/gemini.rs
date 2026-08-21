@@ -3490,7 +3490,7 @@ mod tests {
 						serde_json::to_vec(actual).expect("actual part"),
 						serde_json::to_vec(&expected).expect("expected part"),
 					);
-					assert_eq!(projection.adjustments, [] as [GoogleAdjustment; 0]);
+					assert!(projection.adjustments.is_empty());
 				},
 				(None, Some(expected)) => {
 					assert!(projection.request.contents.is_empty());
@@ -3789,7 +3789,7 @@ mod tests {
 		let projection = GeminiCodec::vertex(Some(GoogleThinkingPolicy::Level))
 			.project(&request, &options)
 			.expect("Vertex projection");
-		assert_eq!(projection.adjustments, [] as [GoogleAdjustment; 0]);
+		assert!(projection.adjustments.is_empty());
 		let actual = serde_json::to_value(projection.request).expect("request serializes");
 		#[derive(Deserialize)]
 		struct Oracle {

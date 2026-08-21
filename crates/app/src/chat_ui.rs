@@ -388,7 +388,7 @@ where
 		match list_sessions() {
 			Ok(choices) => send_backend(&backend_tx, BackendEvent::Sessions(session_rows(choices))),
 			Err(error) => {
-				send_backend(&backend_tx, BackendEvent::Error(sf!("Could not list sessions: {error}")))
+				send_backend(&backend_tx, BackendEvent::Error(sf!("Could not list sessions: {error}")));
 			},
 		}
 	}
@@ -501,7 +501,7 @@ where
 	bridge_result?;
 	host_result.map_err(Into::into)
 }
-fn mode_name(mode: ActiveMode) -> &'static str {
+const fn mode_name(mode: ActiveMode) -> &'static str {
 	match mode {
 		ActiveMode::Standard => "standard",
 		ActiveMode::Plan => "plan",
@@ -618,15 +618,16 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		"resume" => modes.resume_goal(now_ms()),
 		"complete" => modes.complete_goal(now_ms()),
 		"drop" => modes.drop_goal(now_ms()),
-		"budget" => match rest.parse::<u64>() {
-			Ok(budget) => modes.set_goal_budget(budget),
-			Err(_) => {
+		"budget" => {
+			if let Ok(budget) = rest.parse::<u64>() {
+				modes.set_goal_budget(budget)
+			} else {
 				send_backend(
 					backend,
 					BackendEvent::Error(sf!("Usage: /goal budget <positive-tokens>")),
 				);
 				return;
-			},
+			}
 		},
 		_ => {
 			send_backend(
@@ -798,7 +799,7 @@ where
 			Ok(ChatCommand::Agents) => send_backend(backend, BackendEvent::OpenAgentTree),
 			Ok(ChatCommand::Pause) => send_backend(backend, BackendEvent::Pause),
 			Ok(ChatCommand::Unavailable { command, reason }) => {
-				send_backend(backend, BackendEvent::Error(sf!("/{command} unavailable: {reason}")))
+				send_backend(backend, BackendEvent::Error(sf!("/{command} unavailable: {reason}")));
 			},
 			Ok(ChatCommand::Quit) => {
 				if chat_active(state.submit_pending, bus.phase()) {
@@ -1816,8 +1817,11 @@ fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str
 	Ok(Str::from(provider.id.as_str()))
 }
 
+/// Projects the live roster for the HUD. The roster exists to surface
+/// subagent activity: a session whose only node is the root agent projects
+/// empty, so the HUD stays out of the way until subagents actually run.
 fn project_agent_roster(tree: &AgentTree, session: &str) -> Vec<AgentRow> {
-	tree
+	let rows: Vec<AgentRow> = tree
 		.roster()
 		.filter(|node| {
 			node.session == session
@@ -1838,7 +1842,11 @@ fn project_agent_roster(tree: &AgentTree, session: &str) -> Vec<AgentRow> {
 				tokens: Some(usage.input_tokens.saturating_add(usage.output_tokens)),
 			}
 		})
-		.collect()
+		.collect();
+	if rows.iter().all(|row| row.parent.is_none()) && rows.len() <= 1 {
+		return Vec::new();
+	}
+	rows
 }
 
 fn publish_agent_roster(
@@ -1909,7 +1917,7 @@ fn drain_live_activity(events: &SubscriptionHandle, state: &mut BridgeState) -> 
 
 fn apply_turn_budget(state: &AgentState, budget: Option<&ParsedTurnBudget>) {
 	state.update(|snapshot| {
-		snapshot.turn.params.task_budget = budget.map(|budget| budget.task.clone());
+		snapshot.turn.params.task_budget = budget.map(|budget| budget.task);
 	});
 }
 
@@ -2025,10 +2033,29 @@ mod tests {
 			)
 			.expect("other session");
 
+		// A lone root is not worth a HUD: the roster projects empty until
+		// a subagent joins the session.
+		assert!(project_agent_roster(&tree, "session-a").is_empty());
+
+		tree
+			.register(
+				sf!("worker"),
+				sf!("Worker"),
+				AgentKind::Subagent,
+				Some(sf!("main")),
+				sf!("session-a"),
+				Budget::default(),
+			)
+			.expect("subagent");
 		let rows = project_agent_roster(&tree, "session-a");
-		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0].id, "main");
-		assert_eq!(rows[0].status, "running");
+		assert_eq!(rows.len(), 2);
+		let main = rows
+			.iter()
+			.find(|row| row.id == "main")
+			.expect("canonical main");
+		assert_eq!(main.status, "running", "the replacement root is the canonical node");
+		assert!(rows.iter().any(|row| row.id == "worker"));
+		assert!(project_agent_roster(&tree, "session-b").is_empty(), "other sessions stay solo");
 	}
 
 	fn test_bridge_state() -> BridgeState {
@@ -2225,7 +2252,7 @@ mod tests {
 		let mut errors = Vec::new();
 		let chips = lower_attachments(&mut item, vec![attachment], |error| errors.push(error));
 		std::fs::remove_file(path).expect("remove attachment fixture");
-		assert_eq!(errors, [] as [omp_core::Str; 0]);
+		assert!(errors.is_empty());
 		let Some(item::Kind::Message(message)) = item.kind else {
 			panic!("message")
 		};

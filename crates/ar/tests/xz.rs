@@ -74,7 +74,7 @@ fn rejects_corruption_truncation_unsupported_filter_and_overflow() {
 		Err(Error::ArchiveTooLargeInMemory { .. })
 	));
 
-	let mut unsupported = original.clone();
+	let mut unsupported = original;
 	let header_size = (usize::from(unsupported[12]) + 1) * 4;
 	let header_end = 12 + header_size;
 	let filter = (14..header_end - 4)

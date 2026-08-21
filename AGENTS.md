@@ -467,9 +467,10 @@ generated inputs.
 ### TUI Debugging (`tui` tool, `OMP_TUI_DEBUG`, `OMP_TTY`)
 Prefer `.omp/tools/tui.ts`: runs an example/bin on a Bun-native PTY (real
 controlling terminal — SIGWINCH resizes + immediate-mode hosts behave as
-production); screenshots (`text`), component trees (`tree`), widget values,
-key/mouse/paste injection, resizes, raw byte-stream stats as one session-based
-tool. Structured ops ride hook 1; hook 2 for external harnesses w/o their own
+production); screenshots (`text`, emulator `screen` for any app, pixel `shot`
+PNGs from an in-process rasterizer), component trees (`tree`), widget values,
+key/mouse/paste injection (each echoing the resulting screen), resizes, raw
+byte-stream stats as one session-based tool. Structured ops ride hook 1; hook 2 for external harnesses w/o their own
 PTY:
 - `OMP_TUI_DEBUG=<unix-socket-path>`: `Terminal::enter` starts a server thread
   on the socket, line-delimited JSON ops (`text`, `tree`, `values`, `keys`,

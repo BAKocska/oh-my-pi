@@ -24,17 +24,17 @@ static ROUTER: LazyLock<HubRouter<ChatHubBackend>> = LazyLock::new(HubRouter::ne
 const DEFAULT_ROUTE: &str = "*";
 
 /// Produces the one process-global hub tool registered in the env registry.
-pub(crate) fn tool() -> impl Tool {
+pub fn tool() -> impl Tool {
 	omp_tools::hub::tool(ChatHubRoute)
 }
 
 /// Installs one live chat composition, restoring the prior one on drop.
-pub(crate) fn attach(backend: Arc<ChatHubBackend>) -> HubAttachment {
+pub fn attach(backend: Arc<ChatHubBackend>) -> HubAttachment {
 	let previous = ROUTER.attach(sf!(DEFAULT_ROUTE), backend);
 	HubAttachment { previous }
 }
 
-pub(crate) struct HubAttachment {
+pub struct HubAttachment {
 	previous: Option<Arc<ChatHubBackend>>,
 }
 
@@ -62,7 +62,7 @@ impl HubBackend for ChatHubRoute {
 	}
 }
 
-pub(crate) struct ChatHubBackend {
+pub struct ChatHubBackend {
 	broker:   Broker,
 	inbox:    tokio::sync::Mutex<BrokerInbox>,
 	jobs:     Arc<JobBoard>,
@@ -407,7 +407,7 @@ impl ChatHubBackend {
 						break;
 					}
 				},
-				Ok(Ok(Some(ProcessAttachmentEvent::State(_)))) | Ok(Ok(None)) | Err(_) => break,
+				Ok(Ok(Some(ProcessAttachmentEvent::State(_)) | None)) | Err(_) => break,
 				Ok(Ok(Some(ProcessAttachmentEvent::Attached(_)))) => {},
 				Ok(Err(error)) => return Err(fault(error.to_string())),
 			}
@@ -563,7 +563,7 @@ impl HubBackend for ChatHubBackend {
 	}
 }
 
-fn wait_timeout(timeout_ms: Option<u64>) -> Option<StdDuration> {
+const fn wait_timeout(timeout_ms: Option<u64>) -> Option<StdDuration> {
 	match timeout_ms {
 		Some(0) | None => None,
 		Some(timeout) => Some(StdDuration::from_millis(timeout)),

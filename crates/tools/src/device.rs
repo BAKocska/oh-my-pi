@@ -603,7 +603,7 @@ fn catalog_score(device: &MountedDevice<'_>, text: &str) -> u8 {
 	}
 }
 
-fn glob_matches(pattern: &str, value: &str) -> bool {
+const fn glob_matches(pattern: &str, value: &str) -> bool {
 	let pattern = pattern.as_bytes();
 	let value = value.as_bytes();
 	let (mut pattern_at, mut value_at, mut star, mut retry) = (0, 0, None, 0);
@@ -729,7 +729,7 @@ impl<I: DeviceInvoker + 'static> DynTool<I> {
 		rendered
 	}
 
-	fn fault(&self, path: DevicePath, rev: Rev, issue: DeviceIssue) -> Verdict {
+	const fn fault(&self, path: DevicePath, rev: Rev, issue: DeviceIssue) -> Verdict {
 		Verdict::Device { path, rev, issue }
 	}
 
@@ -835,23 +835,17 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 					yield done(Ok(DynPayload::Text { text: self.catalog(&registry, subtree.as_ref(), flat) }));
 				},
 				Operation::Docs(raw) => {
-					let (path, _target) = match resolve_operation(&registry, &Operation::Docs(raw.clone())) {
-						Ok(resolved) => resolved,
-						Err(_) => {
-							yield done(Err(self.unknown_path_fault(raw.as_str(), &registry)));
-							return;
-						},
-					};
+					let (path, _target) = if let Ok(resolved) = resolve_operation(&registry, &Operation::Docs(raw.clone())) { resolved } else {
+								  yield done(Err(self.unknown_path_fault(raw.as_str(), &registry)));
+								  return;
+							  };
 					yield done(Ok(DynPayload::Text { text: self.docs(&registry, &path, flat) }));
 				},
 				Operation::Invoke(raw) => {
-					let (path, target) = match resolve_operation(&registry, &Operation::Invoke(raw.clone())) {
-						Ok(resolved) => resolved,
-						Err(_) => {
-							yield done(Err(self.unknown_path_fault(raw.as_str(), &registry)));
-							return;
-						},
-					};
+					let (path, target) = if let Ok(resolved) = resolve_operation(&registry, &Operation::Invoke(raw.clone())) { resolved } else {
+								  yield done(Err(self.unknown_path_fault(raw.as_str(), &registry)));
+								  return;
+							  };
 					if is_device_help(flat) {
 						yield done(Ok(DynPayload::Text { text: self.docs(&registry, &path, flat) }));
 						return;
@@ -862,13 +856,10 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 						.and_then(|spec| serde_json::from_slice::<SchemaValue>(&spec.schema).ok())
 						.and_then(|schema| schema.get("properties").and_then(SchemaValue::as_object).cloned())
 						.is_some_and(|properties| properties.contains_key("i"));
-					let args_json = match renest_args(flat, declares_intent) {
-						Ok(args) => args,
-						Err(_) => {
-							yield done(Err(self.fault(path, target.rev.clone(), operation_issue(OperationError::MissingPath { op: sf!("arguments") }))));
-							return;
-						},
-					};
+					let args_json = if let Ok(args) = renest_args(flat, declares_intent) { args } else {
+								  yield done(Err(self.fault(path, target.rev.clone(), operation_issue(OperationError::MissingPath { op: sf!("arguments") }))));
+								  return;
+							  };
 					let identity = target.identity();
 					let mut events = match target.route {
 						ToolRoute::Native => {
@@ -878,13 +869,10 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 								yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
 								return;
 							}
-							match registry.invoke_device(&path, nested) {
-								Ok(events) => events,
-								Err(_) => {
-									yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
-									return;
-								},
-							}
+							if let Ok(events) = registry.invoke_device(&path, nested) { events } else {
+											 yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
+											 return;
+										 }
 						},
 						ToolRoute::Worker { site, name } => self.invoker.invoke(DeviceInvokeRequest {
 							path: path.clone(),
@@ -941,7 +929,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 	}
 }
 
-fn done(result: Result<DynPayload, Verdict>) -> omp_tool::Ev<DynUpdate, DynPayload, Verdict> {
+const fn done(result: Result<DynPayload, Verdict>) -> omp_tool::Ev<DynUpdate, DynPayload, Verdict> {
 	omp_tool::Ev::Done(ToolTerminal::Done { result, useless: false })
 }
 
@@ -1066,7 +1054,7 @@ fn levenshtein(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::{Arc, Mutex};
+	use std::sync::Arc;
 
 	use async_stream::stream;
 	use bytes::Bytes;
@@ -1078,6 +1066,7 @@ mod tests {
 		Precedence, Presentation, Registry, Rev, Tool, ToolRoute, ToolSpec, ToolTerminal,
 		ToolsPolicy,
 	};
+	use parking_lot::Mutex;
 	use serde_json::json;
 
 	use super::{
@@ -1092,7 +1081,7 @@ mod tests {
 
 	impl DeviceInvoker for StubInvoker {
 		async fn invoke(&self, request: DeviceInvokeRequest) -> omp_tool::ErasedStream<'static> {
-			self.0.lock().expect("stub lock").push(request);
+			self.0.lock().push(request);
 			Box::pin(stream! {
 				yield Ok(ErasedEv::Done(ErasedOutcome::Done {
 					verdict: Bytes::from_static(br#"{"kind":"ok","value":{}}"#),
@@ -1222,14 +1211,14 @@ mod tests {
 			events.last(),
 			Some(Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Invocation { .. }), .. }))
 		));
-		let calls = invoker.0.lock().expect("stub lock");
+		let calls = invoker.0.lock();
 		assert_eq!(calls.len(), 1);
 		assert_eq!(calls[0].args_json.as_ref(), br#"{"title":"Fix"}"#);
 	}
 
 	#[tokio::test]
 	async fn dyn_help_echoes_schema_without_dispatch() {
-		for args in [r#"{}"#, r#"{"content":"?"}"#, r#"{"do_":" ? "}"#, r#"{"do_":"HELP"}"#] {
+		for args in [r"{}", r#"{"content":"?"}"#, r#"{"do_":" ? "}"#, r#"{"do_":"HELP"}"#] {
 			let (catalog, _registry) = catalog();
 			let invoker = StubInvoker::default();
 			let tool = dyn_tool(invoker.clone(), catalog, ToolsPolicy::Auto);
@@ -1241,7 +1230,7 @@ mod tests {
 				},
 				event => panic!("unexpected event: {event:?}"),
 			}
-			assert!(invoker.0.lock().expect("stub lock").is_empty());
+			assert!(invoker.0.lock().is_empty());
 		}
 	}
 
@@ -1259,7 +1248,7 @@ mod tests {
 			},
 			event => panic!("unexpected event: {event:?}"),
 		}
-		assert!(invoker.0.lock().expect("stub lock").is_empty());
+		assert!(invoker.0.lock().is_empty());
 	}
 
 	#[tokio::test]
@@ -1273,7 +1262,7 @@ mod tests {
 			events.last(),
 			Some(Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Invocation { .. }), .. }))
 		));
-		let calls = invoker.0.lock().expect("stub lock");
+		let calls = invoker.0.lock();
 		assert_eq!(calls[0].path.to_string(), "fixture/resolve");
 		assert_eq!(calls[0].args_json.as_ref(), br#"{"reason":"Apply proposal"}"#);
 	}

@@ -22,7 +22,7 @@ pub struct Params {
 	pub questions: Vec<Question>,
 }
 /// One picker question.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Question {
 	/// Stable key returned with the answer.
@@ -44,7 +44,7 @@ pub struct Question {
 	pub recommended: Option<usize>,
 }
 /// One picker choice.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptionItem {
 	/// Returned choice label.
@@ -239,7 +239,7 @@ fn headless_answer(question: &Question) -> Result<Answer, Fault> {
 fn invalid(message: &str) -> Fault {
 	Fault::Invalid { message: Str::new(message) }
 }
-fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
+const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
 }
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

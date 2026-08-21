@@ -137,8 +137,8 @@ fn parse_record(
 		.map(Str::new);
 	let ts = parse_timestamp(object.get("timestamp")).unwrap_or_default();
 	let message = match format {
-		ForeignFormat::ClaudeCode => parse_claude(value)?,
-		ForeignFormat::Codex => parse_codex(value)?,
+		ForeignFormat::ClaudeCode => parse_claude(value),
+		ForeignFormat::Codex => parse_codex(value),
 	};
 	Ok(message.map(|message| ImportedEntry {
 		source_line,
@@ -147,13 +147,13 @@ fn parse_record(
 	}))
 }
 
-fn parse_claude(value: &Value) -> Result<Option<Msg>, Str> {
+fn parse_claude(value: &Value) -> Option<Msg> {
 	let kind = value
 		.get("type")
 		.and_then(Value::as_str)
 		.unwrap_or_default();
 	if !matches!(kind, "user" | "assistant") {
-		return Ok(None);
+		return None;
 	}
 	let message = value.get("message").unwrap_or(value);
 	let role = message.get("role").and_then(Value::as_str).unwrap_or(kind);
@@ -165,13 +165,13 @@ fn parse_claude(value: &Value) -> Result<Option<Msg>, Str> {
 			.filter_map(claude_assistant_block)
 			.collect::<Vec<_>>();
 		if !blocks.is_empty() {
-			return Ok(Some(assistant_message(blocks, "anthropic", message.get("model"))));
+			return Some(assistant_message(blocks, "anthropic", message.get("model")));
 		}
 	}
 	parse_message(role, message.get("content"), "anthropic", message.get("model"))
 }
 
-fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
+fn parse_codex(value: &Value) -> Option<Msg> {
 	let kind = value
 		.get("type")
 		.and_then(Value::as_str)
@@ -185,12 +185,12 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 		let role = match event_kind {
 			"user_message" => "user",
 			"agent_message" => "assistant",
-			_ => return Ok(None),
+			_ => return None,
 		};
 		return parse_message(role, payload.get("message"), "openai", payload.get("model"));
 	}
 	if kind != "response_item" && kind != "message" {
-		return Ok(None);
+		return None;
 	}
 	match payload
 		.get("type")
@@ -207,15 +207,15 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 				.get("name")
 				.and_then(Value::as_str)
 				.unwrap_or("unknown");
-			let args = payload
-				.get("arguments")
-				.map(|value| {
+			let args = payload.get("arguments").map_or_else(
+				|| "{}".to_owned(),
+				|value| {
 					value
 						.as_str()
 						.map_or_else(|| value.to_string(), ToOwned::to_owned)
-				})
-				.unwrap_or_else(|| "{}".to_owned());
-			return Ok(Some(assistant_message(
+				},
+			);
+			return Some(assistant_message(
 				vec![Block {
 					kind: BlockKind::Tool {
 						id:   CallId(Str::new(id)),
@@ -227,7 +227,7 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 				}],
 				"openai",
 				payload.get("model"),
-			)));
+			));
 		},
 		"function_call_output" => {
 			let call = payload
@@ -239,7 +239,7 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 					.as_str()
 					.map_or_else(|| value.to_string(), ToOwned::to_owned)
 			});
-			return Ok(Some(Msg::ToolResult {
+			return Some(Msg::ToolResult {
 				call:          CallId(Str::new(call)),
 				tool:          sf!("unknown"),
 				content:       vec![UserBlock::Text { text: Str::new(output) }],
@@ -247,14 +247,12 @@ fn parse_codex(value: &Value) -> Result<Option<Msg>, Str> {
 				error:         false,
 				useless:       false,
 				provider_meta: None,
-			}));
+			});
 		},
 		"message" => {},
-		_ => return Ok(None),
+		_ => return None,
 	}
-	let Some(role) = payload.get("role").and_then(Value::as_str) else {
-		return Ok(None);
-	};
+	let role = payload.get("role").and_then(Value::as_str)?;
 	parse_message(role, payload.get("content"), "openai", payload.get("model"))
 }
 
@@ -308,14 +306,14 @@ fn parse_message(
 	content: Option<&Value>,
 	provider: &'static str,
 	model: Option<&Value>,
-) -> Result<Option<Msg>, Str> {
+) -> Option<Msg> {
 	let texts = extract_text(content);
 	if texts.is_empty() {
-		return Ok(None);
+		return None;
 	}
 	let imported = Some(Attribution { source: sf!("imported.{provider}"), id: None });
 	match role {
-		"user" => Ok(Some(Msg::User {
+		"user" => Some(Msg::User {
 			content:     texts
 				.into_iter()
 				.map(|text| UserBlock::Text { text })
@@ -323,23 +321,23 @@ fn parse_message(
 			synthetic:   false,
 			steering:    false,
 			attribution: imported,
-		})),
-		"developer" | "system" => Ok(Some(Msg::Developer {
+		}),
+		"developer" | "system" => Some(Msg::Developer {
 			content:     texts
 				.into_iter()
 				.map(|text| UserBlock::Text { text })
 				.collect(),
 			attribution: imported,
-		})),
-		"assistant" => Ok(Some(assistant_message(
+		}),
+		"assistant" => Some(assistant_message(
 			texts
 				.into_iter()
 				.map(|text| Block { kind: BlockKind::Text { text }, re: None })
 				.collect(),
 			provider,
 			model,
-		))),
-		_ => Ok(None),
+		)),
+		_ => None,
 	}
 }
 

@@ -255,7 +255,7 @@ pub struct ServerIdentity {
 	pub server_epoch:   Bytes,
 	/// Human-readable server build version.
 	pub server_version: Str,
-	/// Build identity of the serving environment; empty means unknown.
+	/// Executable-generation identity of the serving environment.
 	pub server_build:   Str,
 }
 
@@ -314,11 +314,11 @@ impl ExtensionDataBinding {
 	) -> Self {
 		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp/extension-data-binding/v1");
-		hasher.update(&(session_id.len() as u64).to_le_bytes());
+		hasher.update((session_id.len() as u64).to_le_bytes());
 		hasher.update(session_id.as_bytes());
-		hasher.update(&session_generation.to_le_bytes());
+		hasher.update(session_generation.to_le_bytes());
 		for field in key.fields() {
-			hasher.update(&(field.len() as u64).to_le_bytes());
+			hasher.update((field.len() as u64).to_le_bytes());
 			hasher.update(field.as_bytes());
 		}
 		let digest = hasher.finalize().to_hex();
@@ -393,7 +393,7 @@ struct WorkerDeviceInvoker {
 }
 
 impl WorkerDeviceInvoker {
-	fn new(hosts: Arc<ExtHostSupervisor>) -> Self {
+	const fn new(hosts: Arc<ExtHostSupervisor>) -> Self {
 		Self { hosts }
 	}
 }
@@ -514,7 +514,7 @@ fn open_journal_authorities(
 	Ok((Arc::new(sessions_index), state_store))
 }
 
-fn worker_operation(request: &pb::WorkerOp) -> &'static str {
+const fn worker_operation(request: &pb::WorkerOp) -> &'static str {
 	use pb::worker_op::Op;
 
 	match request.op.as_ref() {
@@ -1465,8 +1465,10 @@ impl EnvServer {
 			client_frame::Body::Admission(admission) => {
 				let result = connection.invocation_mut(frame.request_id, &admission.invocation_id);
 				let pending = match result {
-					Ok(InvocationState::Native { admission: gate, pending_commit, .. })
-					| Ok(InvocationState::Worker { admission: gate, pending_commit, .. }) => {
+					Ok(
+						InvocationState::Native { admission: gate, pending_commit, .. }
+						| InvocationState::Worker { admission: gate, pending_commit, .. },
+					) => {
 						if let Err(error) = gate.answer(admission) {
 							send_error(
 								responses,
@@ -1514,8 +1516,10 @@ impl EnvServer {
 					return;
 				}
 				let query = match connection.invocation_mut(frame.request_id, &request.invocation_id) {
-					Ok(InvocationState::Native { admission, .. })
-					| Ok(InvocationState::Worker { admission, .. }) => {
+					Ok(
+						InvocationState::Native { admission, .. }
+						| InvocationState::Worker { admission, .. },
+					) => {
 						match admission.finalize(
 							&request.raw,
 							self.workspace.root(),
@@ -2180,9 +2184,12 @@ impl EnvServer {
 					},
 				}
 			},
-			Some(Op::Close(close)) => match self.workers.close(&close.name, close.generation) {
-				true => Ok(WorkerResult::Closed(pb::ProcessCommandAccepted::default())),
-				false => Err((pb::ProtocolErrorCode::InvalidArgument, "stale worker generation")),
+			Some(Op::Close(close)) => {
+				if self.workers.close(&close.name, close.generation) {
+					Ok(WorkerResult::Closed(pb::ProcessCommandAccepted::default()))
+				} else {
+					Err((pb::ProtocolErrorCode::InvalidArgument, "stale worker generation"))
+				}
 			},
 			Some(Op::Data(data)) => match self.workers.demux(data) {
 				Ok(accepted) => Ok(WorkerResult::Data(pb::WorkerData {
@@ -2222,7 +2229,7 @@ impl EnvServer {
 						..pb::DataResponse::default()
 					}),
 				)
-				.await
+				.await;
 			},
 			Err((code, message)) => send_error(responses, request_id, code, message).await,
 		}
@@ -2966,10 +2973,10 @@ impl EnvServer {
 		}
 
 		match connection.invocation_mut(request_id, &request.invocation_id) {
-			Ok(InvocationState::Native { admission, pending_commit, .. })
-			| Ok(InvocationState::Worker { admission, pending_commit, .. })
-				if !admission.is_answered() =>
-			{
+			Ok(
+				InvocationState::Native { admission, pending_commit, .. }
+				| InvocationState::Worker { admission, pending_commit, .. },
+			) if !admission.is_answered() => {
 				if pending_commit.is_some() {
 					send_error(
 						responses,
@@ -2992,8 +2999,10 @@ impl EnvServer {
 
 		let (admission, maximum_effects) =
 			match connection.invocation_mut(request_id, &request.invocation_id) {
-				Ok(InvocationState::Native { admission, maximum_effects, .. })
-				| Ok(InvocationState::Worker { admission, maximum_effects, .. }) => (
+				Ok(
+					InvocationState::Native { admission, maximum_effects, .. }
+					| InvocationState::Worker { admission, maximum_effects, .. },
+				) => (
 					admission
 						.decide(self.workspace.root(), self.workspace.root())
 						.await,
@@ -3016,20 +3025,20 @@ impl EnvServer {
 				return;
 			},
 		};
-		let narrowed_effects =
-			match effects_narrow_or_refuse(request.effects.as_ref(), &maximum_effects) {
-				Some(effects) => effects,
-				None => {
-					send_error(
-						responses,
-						request_id,
-						pb::ProtocolErrorCode::PermissionDenied,
-						"ArgsCommitted effect envelope widens the declared tool authority",
-					)
-					.await;
-					return;
-				},
-			};
+		let narrowed_effects = if let Some(effects) =
+			effects_narrow_or_refuse(request.effects.as_ref(), &maximum_effects)
+		{
+			effects
+		} else {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::PermissionDenied,
+				"ArgsCommitted effect envelope widens the declared tool authority",
+			)
+			.await;
+			return;
+		};
 		request.effects = Some((&narrowed_effects).into());
 		let result = connection.invocation_mut(request_id, &request.invocation_id);
 		match result {

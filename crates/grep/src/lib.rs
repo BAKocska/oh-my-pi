@@ -1427,7 +1427,7 @@ mod tests {
 	fn nul_marks_binary_content() {
 		let result = search(b"needle\0needle\n", &options("needle")).unwrap();
 		assert_eq!(result.total_matches, 0);
-		assert_eq!(result.matches, [] as [GrepMatch; 0]);
+		assert!(result.matches.is_empty());
 	}
 
 	#[test]

@@ -1,5 +1,5 @@
 //! Consolidated omp-app integration harness; one binary links the embedded
-//! CPython image once instead of once per test file.
+//! `CPython` image once instead of once per test file.
 
 #[cfg(unix)]
 mod envd_contract;

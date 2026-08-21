@@ -682,7 +682,7 @@ mod tests {
 		let (visible, thinking, starts, ends, recoveries) =
 			scan(input, DialectThinking::Generic, input.len());
 		assert_eq!(visible, input);
-		assert_eq!(thinking, [] as [u8; 0]);
+		assert!(thinking.is_empty());
 		assert_eq!((starts, ends, recoveries), (0, 0, 0));
 	}
 

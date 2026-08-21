@@ -306,7 +306,8 @@ impl ClientState {
 	async fn dispatch(self: &Arc<Self>, value: Value) -> Result<(), ClientError> {
 		if value.get("type").and_then(Value::as_str) == Some("ready") {
 			let ready: ReadyFrame = serde_json::from_value(value)?;
-			if let Some(sender) = self.ready.lock().await.take() {
+			let sender = self.ready.lock().await.take();
+			if let Some(sender) = sender {
 				let _ = sender.send(ready);
 			}
 			return Ok(());
@@ -425,7 +426,8 @@ impl ClientState {
 		for (_, sender) in pending {
 			let _ = sender.send(Err(ClientError::Disconnected(reason.clone())));
 		}
-		for (_, cancellation) in std::mem::take(&mut *self.host_cancellations.lock().await) {
+		let cancellations = std::mem::take(&mut *self.host_cancellations.lock().await);
+		for (_, cancellation) in cancellations {
 			let _ = cancellation.send(true);
 		}
 	}
@@ -594,7 +596,7 @@ impl RpcClient {
 				return Err(ClientError::ReadyTimeout);
 			},
 		};
-		if let Err(error) = client.validate_ready(&ready) {
+		if let Err(error) = Self::validate_ready(&ready) {
 			let _ = client.shutdown().await;
 			return Err(error);
 		}
@@ -622,7 +624,7 @@ impl RpcClient {
 		Ok(client)
 	}
 
-	fn validate_ready(&self, ready: &ReadyFrame) -> Result<(), ClientError> {
+	fn validate_ready(ready: &ReadyFrame) -> Result<(), ClientError> {
 		if ready.kind != "ready" || ready.protocol_version != ProtocolVersion::V1 {
 			return Err(ClientError::IncompatibleHandshake(
 				"expected initial protocol v1 ready frame".into(),
@@ -646,7 +648,7 @@ impl RpcClient {
 	/// Sends any command and deserializes its successful `data` payload.
 	pub async fn request<P, R>(&self, command: &str, params: &P) -> Result<R, ClientError>
 	where
-		P: Serialize + ?Sized,
+		P: Serialize + Sync + ?Sized,
 		R: DeserializeOwned,
 	{
 		self
@@ -662,7 +664,7 @@ impl RpcClient {
 		timeout: Duration,
 	) -> Result<R, ClientError>
 	where
-		P: Serialize + ?Sized,
+		P: Serialize + Sync + ?Sized,
 		R: DeserializeOwned,
 	{
 		let id =
@@ -1169,9 +1171,9 @@ impl RpcClient {
 	pub async fn shutdown(&self) -> Result<(), ClientError> {
 		self.state.writer.lock().await.take();
 		self.state.fail_all("client shut down").await;
-		let mut child = match self.child.lock().await.take() {
-			Some(child) => child,
-			None => return Ok(()),
+		let child = self.child.lock().await.take();
+		let Some(mut child) = child else {
+			return Ok(());
 		};
 		if let Ok(status) = tokio::time::timeout(self.termination_grace, child.wait()).await {
 			status?;

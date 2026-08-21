@@ -155,7 +155,7 @@ fn string_value(value: &'static str) -> value_pb::Value {
 	value_pb::Value { kind: Some(value_pb::value::Kind::String(value.to_owned())) }
 }
 
-fn bool_value(value: bool) -> value_pb::Value {
+const fn bool_value(value: bool) -> value_pb::Value {
 	value_pb::Value { kind: Some(value_pb::value::Kind::Bool(value)) }
 }
 
@@ -310,7 +310,7 @@ fn denied_admission(query: &AdmitInvocation) -> Admission {
 	Admission { invocation_id: query.invocation_id.clone(), allow: false, ..Admission::default() }
 }
 #[derive(Clone, Debug)]
-pub(crate) struct InvocationAdmissionFact {
+pub struct InvocationAdmissionFact {
 	pub(crate) invocation_id: Str,
 	pub(crate) raw:           Str,
 	pub(crate) admission:     Admission,
@@ -750,12 +750,12 @@ impl SpeculativeCall {
 	}
 
 	/// Returns the stable model-authored call identifier.
-	pub fn call_id(&self) -> &Str {
+	pub const fn call_id(&self) -> &Str {
 		&self.inner.as_ref().expect("live speculative call").call_id
 	}
 
 	/// Returns the exact live tool identity selected when speculation opened.
-	pub fn identity(&self) -> &ToolIdentity {
+	pub const fn identity(&self) -> &ToolIdentity {
 		&self.inner.as_ref().expect("live speculative call").identity
 	}
 

@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	Environment, Error, LanguageId,
+	Environment, LanguageId,
 	lsp::{LspError, LspServer, LspTransport, LspTransportError},
 	lsp_registry::{
 		LspBindingHandle, LspBindingId, LspBindingSpec, LspRegistry, LspRegistryError, LspSelector,
@@ -175,10 +175,8 @@ impl LspProcessConfig {
 			.languages
 			.iter()
 			.map(|language| {
-				LanguageId::new(language).map_err(|source| LspProcessError::InvalidLanguage {
-					language: language.clone(),
-					source,
-				})
+				LanguageId::new(language)
+					.map_err(|_| LspProcessError::InvalidLanguage { language: language.clone() })
 			})
 			.collect::<Result<Vec<_>, LspProcessError>>()?;
 		let selector = LspSelector::new(
@@ -223,9 +221,6 @@ pub enum LspProcessError {
 	InvalidLanguage {
 		/// The rejected language identifier.
 		language: Str,
-		/// The validation failure.
-		#[source]
-		source:   Error,
 	},
 	/// A configured timeout is zero or exceeds its strict upper bound.
 	#[error("{setting} must be between 1 and {max}")]

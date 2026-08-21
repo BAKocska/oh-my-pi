@@ -195,7 +195,7 @@ impl Drop for ApprovalGuard<'_> {
 impl ApprovalBook {
 	/// Creates an empty Core ticket index.
 	#[must_use]
-	pub fn new() -> Self {
+	pub const fn new() -> Self {
 		Self {
 			next_id:       AtomicU64::new(1),
 			tickets:       Mutex::new(BTreeMap::new()),
@@ -424,6 +424,6 @@ mod tests {
 		{
 			let _guard = book.guard(ticket.ticket_id.as_str()).unwrap();
 		}
-		assert_eq!(book.pending(), Vec::new());
+		assert!(book.pending().is_empty());
 	}
 }

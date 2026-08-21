@@ -9,9 +9,6 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-const fn is_false(value: &bool) -> bool {
-	!*value
-}
 
 /// The baseline, single-frame protocol version.
 pub const PROTOCOL_V1: u8 = 1;
@@ -465,7 +462,7 @@ pub struct HostToolDefinition {
 	/// JSON Schema parameters object.
 	pub parameters:  Value,
 	/// Whether normal tool rosters hide this tool.
-	#[serde(default, skip_serializing_if = "is_false")]
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub hidden:      bool,
 	/// Optional application-defined load mode.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,7 +524,7 @@ pub struct HostToolResult {
 	/// Application-native tool result.
 	pub result:   Value,
 	/// Whether the result represents a failure.
-	#[serde(default, skip_serializing_if = "is_false")]
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub is_error: bool,
 }
 

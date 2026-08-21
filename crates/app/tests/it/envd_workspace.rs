@@ -102,7 +102,7 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	.expect("restore");
 	assert_ne!(restored.undo_snapshot_id, "");
 	assert!(!restored.partial);
-	assert_eq!(restored.conflicts, [] as [omp_proto::env::v1::WorkspaceConflict; 0]);
+	assert!(restored.conflicts.is_empty());
 	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"before\n");
 }
 

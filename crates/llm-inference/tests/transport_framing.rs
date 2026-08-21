@@ -542,7 +542,7 @@ fn eventstream_validates_and_types_every_header_value() {
 fn bedrock_eventstream_is_exact_under_all_chunkings_and_bounds_corruption() {
 	let success = include_bytes!("../../../fixtures/llm-oracle/bedrock/eventstream-success.bin");
 	let expected = decode_eventstream(success, success.len()).expect("valid whole EventStream");
-	assert_ne!(expected, [] as [omp_llm_inference::transport::EventStreamMessage; 0]);
+	assert!(!expected.is_empty());
 	for chunk_size in [1, 2, 3, 7, 31, 127, success.len()] {
 		assert_eq!(
 			decode_eventstream(success, chunk_size).expect("valid chunked EventStream"),

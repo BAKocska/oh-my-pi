@@ -201,7 +201,7 @@ impl std::str::FromStr for Usd {
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		let invalid = || UsdParseError { value: Str::new(value) };
 		let (whole, fraction) = match value.split_once('.') {
-			Some((_whole, fraction)) if fraction.is_empty() => return Err(invalid()),
+			Some((_whole, "")) => return Err(invalid()),
 			Some((whole, fraction)) => (whole, fraction),
 			None => (value, ""),
 		};
@@ -551,7 +551,7 @@ pub fn native_projection_code(
 ) -> Hash32 {
 	let mut hasher = Hash32::hasher();
 	for field in [crate_name.as_bytes(), crate_version.as_bytes(), module_source] {
-		hasher.update(&(field.len() as u64).to_le_bytes());
+		hasher.update((field.len() as u64).to_le_bytes());
 		hasher.update(field);
 	}
 	hasher.finalize()

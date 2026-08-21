@@ -1,4 +1,4 @@
-//! Harness-owned dynamic devices for media generation and AutoQA reports.
+//! Harness-owned dynamic devices for media generation and `AutoQA` reports.
 
 use std::{
 	fmt,
@@ -214,7 +214,7 @@ pub struct ReportParams {
 	pub consent:    Option<Str>,
 }
 
-/// Durable AutoQA filing result.
+/// Durable `AutoQA` filing result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReportPayload {
 	/// Stable issue identifier.
@@ -225,13 +225,13 @@ pub struct ReportPayload {
 	pub kind:     Str,
 }
 
-/// Dyn-mounted AutoQA issue recorder.
+/// Dyn-mounted `AutoQA` issue recorder.
 pub struct ReportIssue {
 	spec:  ToolSpec,
 	store: Arc<TelemetryIndex>,
 }
 
-/// Creates `report_issue@1` over the project AutoQA store.
+/// Creates `report_issue@1` over the project `AutoQA` store.
 #[must_use]
 pub fn report_issue(store: Arc<TelemetryIndex>) -> ReportIssue {
 	ReportIssue {
@@ -328,12 +328,12 @@ fn store_fault(message: String) -> MediaFault {
 		message: Str::from(message),
 	}
 }
-fn media_done(
+const fn media_done(
 	result: Result<MediaPayload, MediaFault>,
 ) -> Ev<MediaUpdate, MediaPayload, MediaFault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
 }
-fn report_done(
+const fn report_done(
 	result: Result<ReportPayload, MediaFault>,
 ) -> Ev<MediaUpdate, ReportPayload, MediaFault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })

@@ -872,7 +872,7 @@ impl<C: TurnClient> Agent<C> {
 				served_model: Str::new(outcome.model.as_str()),
 				provider: Str::new(outcome.provider.as_str()),
 				usage: outcome.usage.clone().unwrap_or_default(),
-				cost: outcome.cost.clone(),
+				cost: outcome.cost,
 				..ModelRequest::default()
 			})));
 		for diagnostic in &outcome.diagnostics {
@@ -928,7 +928,7 @@ impl<C: TurnClient> Agent<C> {
 				source.decide(&self.loop_signal, now)
 			});
 		if matches!(candidate, Continuation::Settle)
-			&& let Some(gate) = self.settled_gate.as_ref().cloned()
+			&& let Some(gate) = self.settled_gate.clone()
 		{
 			let event =
 				AgentSettledEvent { agent_id: sf!("agent"), turn_id: Str::new(turn_id.as_str()) };
@@ -1881,9 +1881,9 @@ fn tool_call_digest(items: &[Item]) -> Option<Str> {
 			continue;
 		};
 		calls = calls.saturating_add(1);
-		hasher.update(&(call.name.len() as u64).to_le_bytes());
+		hasher.update((call.name.len() as u64).to_le_bytes());
 		hasher.update(call.name.as_bytes());
-		hasher.update(&(call.args_json.len() as u64).to_le_bytes());
+		hasher.update((call.args_json.len() as u64).to_le_bytes());
 		hasher.update(&call.args_json);
 	}
 	(calls != 0).then(|| Str::new(hasher.finalize().to_string()))
@@ -1991,7 +1991,7 @@ fn runtime_duration(duration: omp_core::Duration) -> Duration {
 		.expect("agent runtime duration constants fit std::time::Duration")
 }
 
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.unwrap_or(Duration::ZERO)

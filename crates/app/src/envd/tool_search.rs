@@ -1438,7 +1438,7 @@ mod tests {
 			assert_eq!(result.matches[0].line_number, 2);
 			assert_eq!(result.matches[0].line, "needle");
 			assert_eq!(result.matches[0].snapshot_tag, None);
-			assert_eq!(result.archive_unreadable, [] as [omp_core::Str; 0]);
+			assert!(result.archive_unreadable.is_empty());
 		}
 	}
 
@@ -1632,7 +1632,7 @@ mod tests {
 		)
 		.expect("glob returns partial timeout metadata");
 		assert!(timed_out.timed_out);
-		assert_eq!(timed_out.matches, [] as [omp_tools::glob::WalkMatch; 0]);
+		assert!(timed_out.matches.is_empty());
 	}
 
 	fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {

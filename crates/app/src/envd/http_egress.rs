@@ -20,7 +20,7 @@ use super::worker_pool::MAX_TUNNEL_BUFFER_BYTES;
 const MAX_REDIRECTS: u32 = 10;
 
 #[derive(Clone)]
-pub(crate) struct HttpEgressHost {
+pub struct HttpEgressHost {
 	client: wreq::Client,
 }
 
@@ -73,25 +73,25 @@ impl HttpEgressHost {
 				.await
 				.map_err(HttpEgressError::transport)?;
 			let status_code = response.status();
-			if followed < request.redirects {
-				if let Some(location) = redirect_location(status_code, response.headers()) {
-					let next_url = parse_redirect_url(&url, &location)?;
-					if !same_origin(&url, &next_url) {
-						headers.remove(AUTHORIZATION);
-						headers.remove(COOKIE);
-						headers.remove(HOST);
-						headers.remove(PROXY_AUTHORIZATION);
-					}
-					if redirects_to_get(status_code, &method) {
-						method = Method::GET;
-						body = Bytes::new();
-						headers.remove(CONTENT_LENGTH);
-						headers.remove(CONTENT_TYPE);
-					}
-					url = next_url;
-					followed += 1;
-					continue;
+			if followed < request.redirects
+				&& let Some(location) = redirect_location(status_code, response.headers())
+			{
+				let next_url = parse_redirect_url(&url, &location)?;
+				if !same_origin(&url, &next_url) {
+					headers.remove(AUTHORIZATION);
+					headers.remove(COOKIE);
+					headers.remove(HOST);
+					headers.remove(PROXY_AUTHORIZATION);
 				}
+				if redirects_to_get(status_code, &method) {
+					method = Method::GET;
+					body = Bytes::new();
+					headers.remove(CONTENT_LENGTH);
+					headers.remove(CONTENT_TYPE);
+				}
+				url = next_url;
+				followed += 1;
+				continue;
 			}
 
 			let status = u32::from(status_code.as_u16());
@@ -113,7 +113,7 @@ impl HttpEgressHost {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum HttpEgressError {
+pub enum HttpEgressError {
 	#[error("invalid HTTP egress request: {0}")]
 	InvalidArgument(String),
 	#[error("HTTP egress request timed out")]

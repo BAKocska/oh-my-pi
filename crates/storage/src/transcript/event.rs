@@ -215,7 +215,7 @@ pub struct HookOutcome {
 pub struct PolicyDecision {
 	/// Environment invocation identity.
 	pub invocation_id:       Str,
-	/// Requested target fixed at ARGS_FINALIZED.
+	/// Requested target fixed at `ARGS_FINALIZED`.
 	pub requested_target:    Str,
 	/// Canonical requested arguments.
 	pub requested_args:      Str,

@@ -502,7 +502,7 @@ pub enum ChatCommand {
 }
 
 /// Parsed `+Nk` or `+Nk!` turn-budget directive.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedTurnBudget {
 	/// Agent-side output-token budget represented in the landed budget type.
 	pub agent: Budget,
@@ -662,7 +662,7 @@ pub fn parse_budget_prefix(text: &str) -> Result<(&str, Option<ParsedTurnBudget>
 	))
 }
 
-fn unavailable(command: &'static str, reason: &'static str) -> ChatCommand {
+const fn unavailable(command: &'static str, reason: &'static str) -> ChatCommand {
 	ChatCommand::Unavailable { command: sf!(command), reason: sf!(reason) }
 }
 

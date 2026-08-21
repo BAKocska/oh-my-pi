@@ -96,9 +96,9 @@ pub struct LockFile {
 	pub generated_at:    String,
 	/// Owning layer.
 	pub layer:           Layer,
-	/// Required CPython version.
+	/// Required `CPython` version.
 	pub requires_python: Str,
-	/// Required CPython ABI.
+	/// Required `CPython` ABI.
 	pub abi:             Str,
 	/// Union of resolved target triples.
 	pub targets:         Vec<Str>,
@@ -280,7 +280,7 @@ pub struct InstalledExtension {
 }
 
 /// The materialized per-host site tree carried into the Python package
-/// snapshot. This is constructed from SiteTree's result, not guessed from a
+/// snapshot. This is constructed from `SiteTree`'s result, not guessed from a
 /// lock path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedSite {
@@ -371,8 +371,10 @@ pub fn package_snapshot(
 		tree:          Option<Tree<'a>>,
 	}
 	let root = Some(site.path.display().to_string());
+	// `root_name` is moved into `own` below; the envelope borrows this copy.
+	let root_distribution_name = root_name.clone();
 	let mut distributions = vec![Distribution {
-		name:         &root_name,
+		name:         &root_distribution_name,
 		version:      &extension.version,
 		extension_id: Some(&extension.id),
 		origin:       "store",
@@ -436,7 +438,7 @@ pub fn package_snapshot(
 	let envelope = Envelope {
 		distributions,
 		modules,
-		own: Some(root_name.clone()),
+		own: Some(root_name),
 		tree: Some(Tree {
 			path:       site.path.display().to_string(),
 			key:        &site.key,

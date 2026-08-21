@@ -392,7 +392,8 @@ impl Environment {
 		&self.inner.server_epoch
 	}
 
-	/// Returns the build identity advertised to document clients.
+	/// Returns the executable-generation identity advertised to document
+	/// clients.
 	#[must_use]
 	pub fn server_build(&self) -> &str {
 		self.inner.server_build.as_str()

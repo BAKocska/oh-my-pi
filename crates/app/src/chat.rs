@@ -1084,16 +1084,16 @@ pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> 
 			start,
 		))
 		.await
-		.map_err(|e| miette::miette!(e))?;
+		.into_diagnostic()?;
 	} else {
 		let (inference_registry, inference) =
 			crate::daemon::production_inference(&data_dir, Arc::clone(&registry))
 				.await
-				.map_err(|e| miette::miette!(e))?;
+				.into_diagnostic()?;
 		let client = InProcTurnClient::new(inference)
 			.await
 			.map_err(ChatError::from)
-			.map_err(|e| miette::miette!(e))?;
+			.into_diagnostic()?;
 		Box::pin(run_ui(
 			client,
 			&environment,
@@ -1114,7 +1114,7 @@ pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> 
 			start,
 		))
 		.await
-		.map_err(|e| miette::miette!(e))?;
+		.into_diagnostic()?;
 	}
 
 	// `environment` is deliberately retained until the agent and UI have been

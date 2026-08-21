@@ -479,11 +479,13 @@ impl ConflictRegistry {
 			let id = prior
 				.iter()
 				.position(|entry| entry.block == block)
-				.map(|index| prior.swap_remove(index).id)
-				.unwrap_or_else(|| {
-					state.next_id = state.next_id.saturating_add(1).max(1);
-					state.next_id
-				});
+				.map_or_else(
+					|| {
+						state.next_id = state.next_id.saturating_add(1).max(1);
+						state.next_id
+					},
+					|index| prior.swap_remove(index).id,
+				);
 			let entry = RegisteredConflict { id, display_path: display_path.clone(), block };
 			state.by_id.insert(id, entry.clone());
 			registered.push(entry);

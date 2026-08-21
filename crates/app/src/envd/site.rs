@@ -19,7 +19,7 @@ static SITE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Errors while materializing an immutable site tree.
 #[derive(Debug, Error)]
-pub(crate) enum SiteError {
+pub enum SiteError {
 	/// The site key would escape the environment-owned sites directory.
 	#[error("invalid site key")]
 	InvalidSiteKey,
@@ -49,7 +49,7 @@ pub(crate) enum SiteError {
 
 /// Sorted, persisted `RECORD` ownership entries for one materialized tree.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct OwnershipMap {
+pub struct OwnershipMap {
 	entries: Vec<Ownership>,
 }
 
@@ -68,8 +68,7 @@ impl OwnershipMap {
 		for (record_path, record) in records {
 			let is_record = record_path
 				.rsplit_once('/')
-				.map(|(parent, name)| name == "RECORD" && parent.ends_with(".dist-info"))
-				.unwrap_or(false);
+				.is_some_and(|(parent, name)| name == "RECORD" && parent.ends_with(".dist-info"));
 			if !is_record {
 				return Err(SiteError::InvalidFilePath(record_path));
 			}
@@ -114,7 +113,7 @@ impl OwnershipMap {
 
 /// Environment-owned content store and per-host symlink-farm builder.
 #[derive(Clone, Debug)]
-pub(crate) struct SiteMaterializer {
+pub struct SiteMaterializer {
 	root:   PathBuf,
 	store:  BlobStore,
 	source: BlobStore,
@@ -233,7 +232,7 @@ impl SiteMaterializer {
 		fs::create_dir(&temporary)?;
 		let built = (|| {
 			let mut records = Vec::new();
-			for (path, _file) in files {
+			for path in files.keys() {
 				let destination = temporary.join(path.as_str());
 				if let Some(parent) = destination.parent() {
 					fs::create_dir_all(parent)?;
@@ -304,7 +303,7 @@ fn canonical_files(files: Vec<pb::SiteFile>) -> Result<BTreeMap<Str, pb::SiteFil
 
 /// Returns every importable module path represented by a site manifest.
 #[must_use]
-pub(crate) fn record_modules(files: &[pb::SiteFile]) -> Vec<Str> {
+pub fn record_modules(files: &[pb::SiteFile]) -> Vec<Str> {
 	files
 		.iter()
 		.filter_map(|file| module_path(&file.path))
@@ -315,13 +314,13 @@ pub(crate) fn record_modules(files: &[pb::SiteFile]) -> Vec<Str> {
 fn manifest_hash(site_key: &str, files: &BTreeMap<Str, pb::SiteFile>) -> [u8; 32] {
 	let mut hasher = Hash32::hasher();
 	hasher.update(b"omp/site-manifest/v1");
-	hasher.update(&(site_key.len() as u64).to_le_bytes());
+	hasher.update((site_key.len() as u64).to_le_bytes());
 	hasher.update(site_key.as_bytes());
 	for (path, file) in files {
-		hasher.update(&(path.len() as u64).to_le_bytes());
+		hasher.update((path.len() as u64).to_le_bytes());
 		hasher.update(path.as_bytes());
 		hasher.update(&file.blob_hash);
-		hasher.update(&file.mode.to_le_bytes());
+		hasher.update(file.mode.to_le_bytes());
 	}
 	hasher.finalize().into_bytes()
 }
@@ -381,10 +380,10 @@ fn module_path(path: &str) -> Option<String> {
 		.or_else(|| path.strip_suffix(".pyi"))
 	{
 		path
-	} else if let Some(path) = path
-		.strip_suffix(".pyd")
-		.or_else(|| path.strip_suffix(".so"))
-	{
+	} else {
+		let path = path
+			.strip_suffix(".pyd")
+			.or_else(|| path.strip_suffix(".so"))?;
 		let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
 		let name = name.split('.').next().unwrap_or_default();
 		if parent.is_empty() {
@@ -392,8 +391,6 @@ fn module_path(path: &str) -> Option<String> {
 		} else {
 			return (!name.is_empty()).then(|| format!("{parent}/{name}").replace('/', "."));
 		}
-	} else {
-		return None;
 	};
 	let path = path.strip_suffix("/__init__").unwrap_or(path);
 	(!path.is_empty()).then(|| path.replace('/', "."))

@@ -225,7 +225,7 @@ async fn committed_unknown_fields_are_rejected_before_edit_effects() {
 		events.iter().any(|event| matches!(event, Ev::Args(_))),
 		"unknown sibling did not produce an argument issue: {events:?}"
 	);
-	assert_eq!(fake.state.lock().commits, [] as [omp_tools::edit::EditProposal; 0]);
+	assert!(fake.state.lock().commits.is_empty());
 }
 
 #[tokio::test]
@@ -356,7 +356,7 @@ async fn byte_identical_put_escalates_from_exact_soft_diagnostic_to_loop_guard_f
 		 then author a different edit). This exact payload will keep being rejected until it \
 		 changes."
 	);
-	assert_eq!(fake.state.lock().commits, [] as [omp_tools::edit::EditProposal; 0]);
+	assert!(fake.state.lock().commits.is_empty());
 }
 
 #[tokio::test]
@@ -429,7 +429,7 @@ async fn malformed_and_headerless_input_never_commit_and_preserve_parser_diagnos
 			.unwrap_or_else(|| panic!("diagnostic event for {input:?}: {events:?}"));
 		assert_eq!(rendered, expected);
 	}
-	assert_eq!(fake.state.lock().commits, [] as [omp_tools::edit::EditProposal; 0]);
+	assert!(fake.state.lock().commits.is_empty());
 }
 
 #[tokio::test]

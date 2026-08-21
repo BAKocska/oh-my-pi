@@ -452,11 +452,11 @@ const fn valid_name_byte(byte: u8) -> bool {
 	byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
 }
 
-fn invalid(message: &'static str) -> Fault {
+const fn invalid(message: &'static str) -> Fault {
 	Fault { message: sf!(message) }
 }
 
-fn done(result: Result<Response, Fault>, useless: bool) -> Ev<(), Response, Fault> {
+const fn done(result: Result<Response, Fault>, useless: bool) -> Ev<(), Response, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless })
 }
 fn param_event(error: ParamError) -> Ev<(), Response, Fault> {

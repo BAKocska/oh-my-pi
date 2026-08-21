@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::read::{selector::ParsedSelector, web};
 
 /// Arguments accepted by `fetch@1`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// HTTP(S) URL, optionally followed by a read line selector or `:raw`.

@@ -1,6 +1,6 @@
 //! Best-effort launcher for URLs and file paths via the OS default handler.
 //!
-//! Port of pi's `utils/open.ts`: `open` on macOS, ShellExecute through
+//! Port of pi's `utils/open.ts`: `open` on macOS, `ShellExecute` through
 //! PowerShell on Windows, `wslview`/`xdg-open` on Linux. Callers always keep a
 //! visible copy-URL fallback; launch failures are logged, never surfaced.
 
@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 /// Fire-and-forget: the caller never blocks and never fails. Spawn errors and
 /// non-zero opener exits (e.g. `xdg-open` without an `https` handler) are
 /// recorded via `tracing` so silent misconfigurations stay diagnosable.
-pub(crate) fn open_path(target: &str) {
+pub fn open_path(target: &str) {
 	let mut command = opener_command(target);
 	command
 		.stdin(Stdio::null())

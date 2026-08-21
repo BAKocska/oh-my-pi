@@ -1,6 +1,6 @@
 //! Content-Length transport framing and protocol-v2 logical frame chunking.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, hash::BuildHasher};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
@@ -136,7 +136,7 @@ impl ContentLengthDecoder {
 			let Some(header_end) = find_bytes(&self.buffer, b"\r\n\r\n") else {
 				if self.buffer.len() > MAX_FRAME_BYTES {
 					let keep_from = find_ascii_case_insensitive(&self.buffer[1..], b"content-length:")
-						.map_or(self.buffer.len().saturating_sub(3), |offset| offset + 1);
+						.map_or_else(|| self.buffer.len().saturating_sub(3), |offset| offset + 1);
 					self.buffer.drain(..keep_from);
 					self.resync(&mut output, keep_from, "unterminated header exceeds transport limit");
 					continue;
@@ -238,10 +238,10 @@ pub fn encode_json_v2(value: &Value, sequence_id: &str) -> Result<Vec<Vec<u8>>, 
 /// messages.
 ///
 /// This is equivalent to [`encode_json_v2`] for non-`agent_end` values.
-pub fn encode_json_v2_with_streamed(
+pub fn encode_json_v2_with_streamed<S: BuildHasher>(
 	value: &Value,
 	sequence_id: &str,
-	streamed_message_ids: &HashSet<String>,
+	streamed_message_ids: &HashSet<String, S>,
 ) -> Result<Vec<Vec<u8>>, FramingError> {
 	let mut compacted = value.clone();
 	strip_streamed_agent_end_messages(&mut compacted, streamed_message_ids);
@@ -403,7 +403,10 @@ fn json_usize(object: &Map<String, Value>, key: &'static str) -> Result<usize, F
 /// the frame, a small structured overflow frame matching the original kind is
 /// returned.
 #[must_use]
-pub fn encode_json_v1(value: &Value, streamed_message_ids: &HashSet<String>) -> Vec<u8> {
+pub fn encode_json_v1<S: BuildHasher>(
+	value: &Value,
+	streamed_message_ids: &HashSet<String, S>,
+) -> Vec<u8> {
 	if value.get("type").and_then(Value::as_str) == Some("agent_end") {
 		let mut candidate = value.clone();
 		strip_streamed_agent_end_messages(&mut candidate, streamed_message_ids);
@@ -479,7 +482,10 @@ fn truncate_string(value: &str, cap: usize) -> String {
 	format!("{head}\n…[{} chars elided for RPC frame]", length - head_length)
 }
 
-fn strip_streamed_agent_end_messages(value: &mut Value, streamed: &HashSet<String>) {
+fn strip_streamed_agent_end_messages<S: BuildHasher>(
+	value: &mut Value,
+	streamed: &HashSet<String, S>,
+) {
 	if value.get("type").and_then(Value::as_str) != Some("agent_end") {
 		return;
 	}
@@ -546,7 +552,7 @@ mod tests {
 		let mut restarted = ContentLengthDecoder::new();
 		assert!(restarted.push(&remainder).frames.is_empty());
 		assert_eq!(restarted.push(b"llo").frames, vec![b"hello".to_vec()]);
-		assert!(restarted.remainder().is_empty());
+		assert_eq!(restarted.remainder(), b"");
 	}
 
 	#[test]

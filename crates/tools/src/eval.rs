@@ -755,16 +755,12 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 						PendingEval::Background => {
 							let name =
 								next_background_name("eval", &self.next_background_name);
-							match run.detach(name).await {
-								Ok(job) => {
-									yield Ev::Done(detached_terminal(job));
-									return;
-								},
-								Err(_) => {
-									auto_background = false;
-									continue;
-								},
-							}
+							if let Ok(job) = run.detach(name).await {
+											 yield Ev::Done(detached_terminal(job));
+											 return;
+										 }
+											 auto_background = false;
+											 continue;
 						},
 						PendingEval::Interrupt(interrupt) => {
 							let interrupt = match interrupt {

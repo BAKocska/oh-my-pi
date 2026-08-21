@@ -42,9 +42,9 @@ pub enum SourceSpec {
 		/// Distribution name resolved from that index.
 		distribution: Str,
 	},
-	/// A PyPI distribution.
+	/// A `PyPI` distribution.
 	Pypi {
-		/// Distribution name resolved through PyPI.
+		/// Distribution name resolved through `PyPI`.
 		distribution: Str,
 	},
 	/// A commit-pinned Git source.

@@ -2038,7 +2038,7 @@ mod tests {
 		assert_eq!(capture.out(), "a.txt\0hit\n");
 		let (code, capture) = run_util::<Rg>(&["-n0", "hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt\01:hit\n");
+		assert_eq!(capture.out(), concat!("a.txt\0", "1:hit\n"));
 		let (_code, capture) =
 			run_util::<Rg>(&["--files-without-match", "-0", "nope", "."], "", tree.path());
 		assert_eq!(capture.out(), "a.txt\0");

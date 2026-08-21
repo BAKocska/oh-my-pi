@@ -2534,7 +2534,7 @@ fn random_id_bytes() -> [u8; 16] {
 	rand::rng().random()
 }
 
-fn join_error(source: tokio::task::JoinError) -> Error {
+const fn join_error(source: tokio::task::JoinError) -> Error {
 	Error::Worker { source }
 }
 

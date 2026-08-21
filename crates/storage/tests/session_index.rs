@@ -127,12 +127,12 @@ fn failed_journal_header_does_not_publish_a_session_row() {
 		|| Err::<((), u64), _>(io::Error::other("disk full")),
 	);
 	assert!(matches!(result, Err(IndexedWriteError::Journal(_))));
-	assert_eq!(
+	assert!(
 		index
 			.list(&SessionFilter::default())
 			.expect("list index only")
-			.sessions,
-		[] as [omp_storage::index::SessionInfo; 0]
+			.sessions
+			.is_empty()
 	);
 }
 

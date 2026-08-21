@@ -670,10 +670,10 @@ impl Runtime {
 				}
 			}
 		}
-		if !assistant.is_empty() {
-			if let Some(session) = self.state.lock().sessions.get_mut(&session_id) {
-				session.push_message("assistant", &assistant);
-			}
+		if !assistant.is_empty()
+			&& let Some(session) = self.state.lock().sessions.get_mut(&session_id)
+		{
+			session.push_message("assistant", &assistant);
 		}
 		self.notify(json!({
 			"type": "agent_end",
@@ -1905,7 +1905,7 @@ impl CommandError {
 	}
 }
 
-fn supported_commands() -> &'static [&'static str] {
+const fn supported_commands() -> &'static [&'static str] {
 	&[
 		"prompt",
 		"steer",

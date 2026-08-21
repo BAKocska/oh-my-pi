@@ -956,8 +956,8 @@ message ServerHello {
   // Opaque identity regenerated whenever the daemon loses its transaction
   // outcome ledger. Transaction idempotency is scoped to this epoch.
   bytes server_epoch = 5;
-  // Content hash identifying the build of the serving executable; empty when
-  // the server could not determine its own build identity.
+  // Local executable-generation fingerprint; empty when the server could not
+  // read its executable metadata.
   string server_build = 6;
 }
 

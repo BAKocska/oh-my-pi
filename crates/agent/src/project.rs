@@ -129,7 +129,7 @@ struct ItemAmendment {
 
 impl ItemAmendment {
 	/// Records one amendment, returning whether it changes canonical projection.
-	fn record(&mut self, patch: &AmendPatch) -> bool {
+	const fn record(&mut self, patch: &AmendPatch) -> bool {
 		match patch {
 			AmendPatch::DropParts => {
 				self.drop_parts = true;

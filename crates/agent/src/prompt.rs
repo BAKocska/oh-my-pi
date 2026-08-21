@@ -282,7 +282,7 @@ pub enum PromptMode {
 }
 
 impl PromptMode {
-	fn prompt(self) -> &'static str {
+	const fn prompt(self) -> &'static str {
 		match self {
 			Self::Plan => {
 				"Plan mode is active. Inspect freely, but do not mutate the workspace or spawn \

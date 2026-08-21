@@ -28,6 +28,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CAPACITY: usize = 512;
 
+type PendingResponse = (Str, oneshot::Sender<Result<Value, DapProtocolError>>);
+type PendingRequests = HashMap<i64, PendingResponse>;
+
 /// An event or reverse request received from a debug adapter.
 #[derive(Clone, Debug)]
 pub enum DapInbound {
@@ -318,8 +321,7 @@ async fn run_protocol<R, W>(
 	W: AsyncWrite + Unpin,
 {
 	let mut reader = reader;
-	let pending =
-		Mutex::new(HashMap::<i64, (Str, oneshot::Sender<Result<Value, DapProtocolError>>)>::new());
+	let pending = Mutex::new(PendingRequests::new());
 	loop {
 		tokio::select! {
 			outbound = outgoing.recv_async() => match outbound {
@@ -349,7 +351,7 @@ async fn run_protocol<R, W>(
 
 fn dispatch_message(
 	message: Value,
-	pending: &Mutex<HashMap<i64, (Str, oneshot::Sender<Result<Value, DapProtocolError>>)>>,
+	pending: &Mutex<PendingRequests>,
 	events: &broadcast::Sender<DapInbound>,
 ) {
 	match message.get("type").and_then(Value::as_str) {

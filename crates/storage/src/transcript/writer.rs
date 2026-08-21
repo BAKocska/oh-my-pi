@@ -6,8 +6,8 @@
 use std::{
 	fs::{File, OpenOptions},
 	io::{Seek, SeekFrom, Write},
+	iter::FusedIterator,
 	mem::size_of,
-	ops::RangeInclusive,
 	path::Path,
 };
 
@@ -75,22 +75,49 @@ impl IndexRun {
 	}
 }
 
+/// Iterator over the physical indexes in an [`IndexRun`].
+#[derive(Debug, Clone)]
+pub struct IndexRunIter {
+	next:      u64,
+	remaining: u64,
+}
+
+impl Iterator for IndexRunIter {
+	type Item = u64;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.remaining == 0 {
+			return None;
+		}
+
+		let index = self.next;
+		self.remaining -= 1;
+		if self.remaining != 0 {
+			self.next = self
+				.next
+				.checked_add(1)
+				.expect("contiguous index run must not overflow");
+		}
+		Some(index)
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		match usize::try_from(self.remaining) {
+			Ok(remaining) => (remaining, Some(remaining)),
+			Err(_) => (usize::MAX, None),
+		}
+	}
+}
+
+impl FusedIterator for IndexRunIter {}
+
 impl IntoIterator for IndexRun {
-	type IntoIter = RangeInclusive<u64>;
+	type IntoIter = IndexRunIter;
 	type Item = u64;
 
 	/// Iterates over every physical index in the run.
 	fn into_iter(self) -> Self::IntoIter {
-		match self.count {
-			0 => 1..=0,
-			count => {
-				let last = self
-					.first
-					.checked_add(count - 1)
-					.expect("contiguous index run must not overflow");
-				self.first..=last
-			},
-		}
+		IndexRunIter { next: self.first, remaining: self.count }
 	}
 }
 

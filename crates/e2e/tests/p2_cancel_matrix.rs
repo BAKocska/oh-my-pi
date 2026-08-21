@@ -561,7 +561,7 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	let success = next_verdict(&mut next).await;
 	assert!(!success.is_error);
 	assert!(!success.useless);
-	assert_eq!(success.parts, [] as [omp_proto::thread::v1::Part; 0]);
+	assert!(success.parts.is_empty());
 	let CallOutcome::Ok(details) = decode_verdict(&success) else {
 		panic!("replacement worker did not return an ok outcome");
 	};
@@ -614,7 +614,7 @@ fn decode_verdict(terminal: &omp_proto::env::v1::Verdict) -> CallOutcome<Value, 
 fn assert_abort_envelope(terminal: &omp_proto::env::v1::Verdict) {
 	assert!(terminal.is_error);
 	assert!(!terminal.useless);
-	assert_eq!(terminal.parts, [] as [omp_proto::thread::v1::Part; 0]);
+	assert!(terminal.parts.is_empty());
 }
 
 fn file_uri(path: &Path) -> String {

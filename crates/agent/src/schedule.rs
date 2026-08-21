@@ -333,7 +333,7 @@ impl Scheduler {
 	}
 }
 
-fn validate(schedule: &Schedule) -> Result<(), ScheduleError> {
+const fn validate(schedule: &Schedule) -> Result<(), ScheduleError> {
 	if matches!(schedule.scope, ScheduleScope::Project)
 		&& matches!(&schedule.delivery, ScheduleDelivery::Spawn { .. })
 		&& schedule.budget.is_none()

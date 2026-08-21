@@ -65,7 +65,7 @@ pub fn resolve_auto_background_wait(threshold: Duration, timeout: Option<Duratio
 	let wait = if timeout <= TIMEOUT_BUFFER {
 		timeout
 	} else {
-		timeout - TIMEOUT_BUFFER
+		timeout.checked_sub(TIMEOUT_BUFFER).unwrap()
 	};
 	threshold.min(wait)
 }

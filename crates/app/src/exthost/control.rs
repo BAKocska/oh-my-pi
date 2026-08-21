@@ -816,7 +816,7 @@ pub const fn journal_row_reply(body: journal_host_envelope::Body) -> JournalHost
 	JournalHostEnvelope { body: Some(body), props: None }
 }
 
-fn appended_reply(indexes: Vec<u64>) -> JournalHostEnvelope {
+const fn appended_reply(indexes: Vec<u64>) -> JournalHostEnvelope {
 	journal_row_reply(journal_host_envelope::Body::EntryAppended(EntryAppended {
 		indexes,
 		terminal: true,

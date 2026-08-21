@@ -61,7 +61,7 @@ pub enum AgentEvent {
 		to:   AgentPhase,
 	},
 	/// The append-only agent roster changed; consumers re-project from
-	/// AgentTree.
+	/// `AgentTree`.
 	RosterChanged {
 		/// Monotonic generation returned by `AgentTree::roster_generation`.
 		generation: u64,

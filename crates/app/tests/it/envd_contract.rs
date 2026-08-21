@@ -46,7 +46,7 @@ struct AllowAdmission;
 impl Admitter for AllowAdmission {
 	type Future<'client> = std::future::Ready<Admission>;
 
-	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client> {
+	fn admit(&self, query: AdmitInvocation) -> Self::Future<'_> {
 		std::future::ready(Admission {
 			invocation_id: query.invocation_id,
 			allow: true,
@@ -2745,7 +2745,7 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 			_ => {},
 		}
 	}
-	assert_ne!(sequences, [] as [u64; 0]);
+	assert!(!sequences.is_empty());
 	assert_eq!(sequences[0], 1);
 	assert!(
 		sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),

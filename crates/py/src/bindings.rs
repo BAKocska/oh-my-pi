@@ -265,15 +265,15 @@ impl PySecret {
 		PySecretUse(Arc::clone(&self.0))
 	}
 
-	fn __str__(&self) -> &'static str {
+	const fn __str__(&self) -> &'static str {
 		"<redacted>"
 	}
 
-	fn __repr__(&self) -> &'static str {
+	const fn __repr__(&self) -> &'static str {
 		"Secret(<redacted>)"
 	}
 
-	fn __format__(&self, _format_spec: &str) -> &'static str {
+	const fn __format__(&self, _format_spec: &str) -> &'static str {
 		"<redacted>"
 	}
 }
@@ -289,7 +289,7 @@ impl PySecretUse {
 		self.0.expose(|bytes| PyBytes::new(py, bytes))
 	}
 
-	fn __exit__(
+	const fn __exit__(
 		&self,
 		_exc_type: Option<&Bound<'_, PyAny>>,
 		_exc_value: Option<&Bound<'_, PyAny>>,
@@ -1066,12 +1066,12 @@ struct PyControlHandle {
 #[pymethods]
 impl PyControlHandle {
 	#[new]
-	fn new(fd: i32) -> Self {
+	const fn new(fd: i32) -> Self {
 		Self { fd }
 	}
 
 	#[getter]
-	fn fd(&self) -> i32 {
+	const fn fd(&self) -> i32 {
 		self.fd
 	}
 }
@@ -1086,12 +1086,12 @@ struct PyDataHandle {
 #[pymethods]
 impl PyDataHandle {
 	#[new]
-	fn new(generation: u64) -> Self {
+	const fn new(generation: u64) -> Self {
 		Self { generation }
 	}
 
 	#[getter]
-	fn generation(&self) -> u64 {
+	const fn generation(&self) -> u64 {
 		self.generation
 	}
 }
@@ -1122,7 +1122,7 @@ impl PyCancellation {
 	}
 }
 
-/// Return CPython's identifier for the attached current thread.
+/// Return `CPython`'s identifier for the attached current thread.
 #[pyfunction]
 fn _thread_id() -> u64 {
 	crate::interrupt::current_thread_id()

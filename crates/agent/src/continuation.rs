@@ -105,7 +105,7 @@ impl ContinuationLedger {
 	}
 
 	/// Resets the consecutive count after a real user item.
-	pub fn reset_for_user(&mut self) {
+	pub const fn reset_for_user(&mut self) {
 		self.consecutive = 0;
 	}
 

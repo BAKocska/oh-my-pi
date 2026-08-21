@@ -676,7 +676,7 @@ async fn spawn_terminal_auth(_provider: &str) -> miette::Result<std::process::Ex
 	))
 }
 
-fn map_stop_reason(reason: &FinishReason) -> &'static str {
+const fn map_stop_reason(reason: &FinishReason) -> &'static str {
 	match reason {
 		FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Other(_) => "end_turn",
 		FinishReason::Length => "max_tokens",
@@ -942,7 +942,7 @@ fn now_ms() -> u64 {
 ///
 /// These constructors are the sole remote filesystem/terminal seam: they
 /// produce ordinary ACP requests and never access the local workspace.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteOperation {
 	/// Read a remote UTF-8 file.
 	ReadText {

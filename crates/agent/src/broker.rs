@@ -851,9 +851,8 @@ impl Broker {
 			.nodes
 			.lock()
 			.iter()
-			.filter_map(|(id, node)| {
-				(session.is_none() || session == Some(node.session.as_str())).then(|| id.clone())
-			})
+			.filter(|&(_id, node)| session.is_none() || session == Some(node.session.as_str()))
+			.map(|(id, _node)| id.clone())
 			.collect()
 	}
 
@@ -1021,7 +1020,7 @@ fn peer_is_live(broker: &BrokerInner, owner: &str, sender: Option<&str>) -> bool
 	}
 }
 
-fn class(mode: DeliveryMode) -> InterruptClass {
+const fn class(mode: DeliveryMode) -> InterruptClass {
 	match mode {
 		DeliveryMode::Aside | DeliveryMode::Steer => InterruptClass::Immediate,
 		DeliveryMode::NextTurn => InterruptClass::TurnBoundary,

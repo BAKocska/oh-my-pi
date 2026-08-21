@@ -364,7 +364,7 @@ fn effective_limit(limit: Option<f64>) -> Result<u64, Fault> {
 	Ok((requested.floor() as u64).clamp(1, MAX_LIMIT))
 }
 
-fn walk_request(path: Str, hidden: bool, gitignore: bool, limit: u64) -> WalkRequest {
+const fn walk_request(path: Str, hidden: bool, gitignore: bool, limit: u64) -> WalkRequest {
 	WalkRequest { path, hidden, gitignore, limit, timeout_ms: DEFAULT_TIMEOUT_MS }
 }
 

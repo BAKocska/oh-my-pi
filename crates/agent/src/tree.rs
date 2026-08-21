@@ -25,7 +25,7 @@ pub const DEFAULT_MAX_ADMISSION_QUEUE: usize = 128;
 pub const MAX_YIELD_SCHEMA_RETRIES: u8 = 2;
 
 /// Validated terminal or incremental subagent yield.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YieldPayload {
 	/// Verbatim structured success payload after lossless string-container
 	/// salvage, when present.
@@ -89,7 +89,7 @@ pub struct YieldPayloadValidator {
 impl YieldPayloadValidator {
 	/// Creates a validator for an optional declared output schema.
 	#[must_use]
-	pub fn new(schema: Option<Value>, strict: bool) -> Self {
+	pub const fn new(schema: Option<Value>, strict: bool) -> Self {
 		Self { schema, strict, has_incremental_sections: false, schema_retries: 0 }
 	}
 
@@ -123,29 +123,26 @@ impl YieldPayloadValidator {
 			&& !incremental
 			&& let Some(schema) = self.schema.as_ref()
 			&& let Some(value) = data.as_mut()
-		{
-			if let Err(issue) =
+			&& let Err(issue) =
 				validate_schema(schema, value, self.strict, ToolAssemblyLimits::default())
+		{
+			let mut salvaged = false;
+			if let Value::String(encoded) = value
+				&& let Some(parsed) = parse_container_string(encoded)
+				&& validate_schema(schema, &parsed, self.strict, ToolAssemblyLimits::default()).is_ok()
 			{
-				let mut salvaged = false;
-				if let Value::String(encoded) = value
-					&& let Some(parsed) = parse_container_string(encoded)
-					&& validate_schema(schema, &parsed, self.strict, ToolAssemblyLimits::default())
-						.is_ok()
-				{
-					*value = parsed;
-					salvaged = true;
+				*value = parsed;
+				salvaged = true;
+			}
+			if !salvaged {
+				if self.strict || self.schema_retries < MAX_YIELD_SCHEMA_RETRIES {
+					self.schema_retries = self.schema_retries.saturating_add(1);
+					return Err(YieldPayloadError::SchemaViolation {
+						path: issue.path,
+						rule: issue.rule,
+					});
 				}
-				if !salvaged {
-					if self.strict || self.schema_retries < MAX_YIELD_SCHEMA_RETRIES {
-						self.schema_retries = self.schema_retries.saturating_add(1);
-						return Err(YieldPayloadError::SchemaViolation {
-							path: issue.path,
-							rule: issue.rule,
-						});
-					}
-					schema_overridden = true;
-				}
+				schema_overridden = true;
 			}
 		}
 		if error.is_none() && incremental {
@@ -225,7 +222,7 @@ pub enum EffectsOperation {
 /// Wire responders map [`SpawnRefusal::MinimumPhase`] to
 /// `SPAWN_REFUSAL_MINIMUM_PHASE`; all three operations deliberately use the
 /// same refusal so hooks cannot spend or spawn speculatively.
-pub fn enforce_minimum_phase(
+pub const fn enforce_minimum_phase(
 	phase: InvocationPhase,
 	_: EffectsOperation,
 ) -> Result<(), SpawnRefusal> {
@@ -399,8 +396,8 @@ impl AgentDefinition {
 					thinking_level = Some(Str::new(unquote(value)));
 				},
 				"blocking" => {
-					blocking = parse_bool(value)
-						.ok_or_else(|| AgentDefinitionError::InvalidField("blocking"))?;
+					blocking =
+						parse_bool(value).ok_or(AgentDefinitionError::InvalidField("blocking"))?;
 				},
 				_ => {},
 			}
@@ -424,7 +421,7 @@ impl AgentDefinition {
 			.iter()
 			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(self.name.as_str()))
 			.map(|(_, model)| model.as_str())
-			.or_else(|| self.model.as_deref())
+			.or(self.model.as_deref())
 	}
 }
 
@@ -498,7 +495,7 @@ pub struct Usage {
 }
 
 impl Usage {
-	fn saturating_add(self, right: Self) -> Self {
+	const fn saturating_add(self, right: Self) -> Self {
 		Self {
 			requests:      self.requests.saturating_add(right.requests),
 			input_tokens:  self.input_tokens.saturating_add(right.input_tokens),

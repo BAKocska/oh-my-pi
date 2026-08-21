@@ -584,6 +584,6 @@ mod tests {
 				.expect("non-match is not an error"),
 			None
 		);
-		assert_eq!(client.requested_urls(), [] as [std::string::String; 0]);
+		assert!(client.requested_urls().is_empty());
 	}
 }

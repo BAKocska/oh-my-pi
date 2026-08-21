@@ -419,7 +419,7 @@ async fn render_html<C: HttpClient + Sync>(
 			match converted {
 				Ok(_) => notes.push(sf!("Page appears to require JavaScript or is mostly navigation")),
 				Err(_) => {
-					notes.push(sf!("html rendering failed (no reader backend produced usable output)",))
+					notes.push(sf!("html rendering failed (no reader backend produced usable output)",));
 				},
 			}
 			if let Some((endpoint, content)) = try_llms(client, &final_parsed).await {

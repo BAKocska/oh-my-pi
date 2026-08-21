@@ -1,3 +1,5 @@
+//! Verifies the protobuf JSON representation of byte fields.
+
 use bytes::Bytes;
 use omp_proto::omp::{
 	document::v1::{DocumentEvent, DocumentTarget, document_target},
@@ -72,8 +74,7 @@ fn optional_bytes_preserve_none_and_some() {
 #[test]
 fn oneof_bytes_variant_round_trips_as_text() {
 	let document_id = Bytes::from_static(b"doc-123");
-	let target =
-		DocumentTarget { target: Some(document_target::Target::DocumentId(document_id.clone())) };
+	let target = DocumentTarget { target: Some(document_target::Target::DocumentId(document_id)) };
 	let value = serde_json::to_value(&target).unwrap();
 	assert_eq!(value["target"], json!({"DocumentId": "doc-123"}));
 	assert_eq!(serde_json::from_value::<DocumentTarget>(value).unwrap(), target);

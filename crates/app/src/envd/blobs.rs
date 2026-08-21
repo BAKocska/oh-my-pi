@@ -258,7 +258,7 @@ mod tests {
 		path::{Path, PathBuf},
 	};
 
-	use omp_core::{Hash32, encoding::hex};
+	use omp_core::Hash32;
 	use omp_tool::{CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError, call_outcome_details};
 	use tempfile::TempDir;
 

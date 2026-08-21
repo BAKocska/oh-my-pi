@@ -234,8 +234,8 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	let padded_len = if remainder.len() < 56 { 64 } else { 128 };
 	final_blocks[padded_len - 8..padded_len]
 		.copy_from_slice(&((bytes.len() as u64) * 8).to_be_bytes());
-	for block in final_blocks[..padded_len].chunks_exact(64) {
-		sha256_block(&mut state, block.try_into().unwrap());
+	for block in final_blocks[..padded_len].as_chunks::<64>().0 {
+		sha256_block(&mut state, block);
 	}
 	let mut digest = [0_u8; 32];
 	for (word, bytes) in state.into_iter().zip(digest.chunks_exact_mut(4)) {
@@ -312,8 +312,8 @@ fn sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
 		0xc671_78f2,
 	];
 	let mut schedule = [0_u32; 64];
-	for (index, word) in block.chunks_exact(4).enumerate() {
-		schedule[index] = u32::from_be_bytes(word.try_into().unwrap());
+	for (index, word) in block.as_chunks::<4>().0.iter().enumerate() {
+		schedule[index] = u32::from_be_bytes(*word);
 	}
 	for index in 16..64 {
 		let s0 = schedule[index - 15].rotate_right(7)

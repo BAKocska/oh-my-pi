@@ -171,7 +171,11 @@ impl DispatchRouter {
 
 	/// Validates every inbound frame against the transport-authenticated child
 	/// generation before domain-specific dispatch examines the frame body.
-	pub fn accept_frame(&self, generation: u64, _frame: &WorkerFrame) -> Result<(), DispatchError> {
+	pub const fn accept_frame(
+		&self,
+		generation: u64,
+		_frame: &WorkerFrame,
+	) -> Result<(), DispatchError> {
 		if generation == self.generation {
 			Ok(())
 		} else {

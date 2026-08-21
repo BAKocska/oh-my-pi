@@ -795,20 +795,20 @@ impl DisplayCollector {
 		for (value, raw) in entries {
 			let bound = value.bind(py);
 			if raw {
-				if let Ok(bundle) = bound.cast::<PyDict>() {
-					if let Some(output) = display_bundle(py, bundle)? {
-						outputs.push(output);
-					}
+				if let Ok(bundle) = bound.cast::<PyDict>()
+					&& let Some(output) = display_bundle(py, bundle)?
+				{
+					outputs.push(output);
 				}
 				continue;
 			}
-			if let Some(bundle) = repr_mime_bundle(&bound)? {
-				if let Some(output) = display_bundle(py, &bundle)? {
-					outputs.push(output);
-					continue;
-				}
+			if let Some(bundle) = repr_mime_bundle(bound)?
+				&& let Some(output) = display_bundle(py, &bundle)?
+			{
+				outputs.push(output);
+				continue;
 			}
-			if let Some(data) = python_to_json(py, &bound)? {
+			if let Some(data) = python_to_json(py, bound)? {
 				outputs.push(super::DisplayOutput::Json { data });
 			} else {
 				outputs.push(super::DisplayOutput::Markdown {

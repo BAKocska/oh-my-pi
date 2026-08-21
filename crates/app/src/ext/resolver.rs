@@ -11,7 +11,7 @@ use omp_core::Str;
 
 use super::{ExtensionCode, ExtensionError};
 
-/// The CPython ABI tags allowed by R3.
+/// The `CPython` ABI tags allowed by R3.
 pub const ACCEPTED_ABIS: [&str; 3] = ["cp314t", "abi3t", "none"];
 
 /// One enabled extension requirement participating in a host-child unit.

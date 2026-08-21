@@ -8,7 +8,6 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use omp_core::{Str, sf};
 use serde_json::Value;
-use smallvec::SmallVec;
 use xutf::BufReadCharsExt as _;
 
 use super::{RecoveryError, Stage};
@@ -87,7 +86,7 @@ pub struct SchemaViolation {
 	/// Stable validation rule identifier.
 	pub rule:              &'static str,
 	/// Candidate JSON types reported by a failed `type` check.
-	pub expected_types:    SmallVec<Str, 4>,
+	pub expected_types:    Box<[Str]>,
 	/// Whether this issue came from a speculative failed union branch.
 	///
 	/// Lossy repair consumers must ignore speculative issues. A branch uniquely
@@ -95,6 +94,9 @@ pub struct SchemaViolation {
 	/// reports `false`.
 	pub from_union_branch: bool,
 }
+
+const _: () =
+	assert!(std::mem::size_of::<SchemaViolation>() <= 64, "SchemaViolation must stay compact");
 
 /// One incremental input from a native codec or recovered text tool channel.
 #[derive(Clone, Debug)]
@@ -722,7 +724,7 @@ fn validate_node(
 					.filter_map(Value::as_str)
 					.map(Str::new)
 					.collect(),
-				_ => SmallVec::new(),
+				_ => Box::default(),
 			};
 			return type_violation(path, expected_types);
 		}
@@ -1028,7 +1030,7 @@ fn is_tag_selected_branch(branch: &Value, value: &Value) -> bool {
 	matched
 }
 
-fn type_violation<T>(path: &str, expected_types: SmallVec<Str, 4>) -> Result<T, SchemaViolation> {
+fn type_violation<T>(path: &str, expected_types: Box<[Str]>) -> Result<T, SchemaViolation> {
 	Err(SchemaViolation {
 		path: Str::new(if path.is_empty() { "/" } else { path }),
 		rule: "type",
@@ -1044,7 +1046,7 @@ fn violation<T>(path: &str, rule: &'static str) -> Result<T, SchemaViolation> {
 	Err(SchemaViolation {
 		path: Str::new(if path.is_empty() { "/" } else { path }),
 		rule,
-		expected_types: SmallVec::new(),
+		expected_types: Box::default(),
 		from_union_branch: false,
 	})
 }

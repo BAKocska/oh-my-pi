@@ -1081,7 +1081,7 @@ fn normalize_bare_resume(arguments: &mut Vec<OsString>) {
 		if arguments[index] == "--resume"
 			&& arguments
 				.get(index + 1)
-				.map_or(true, |next| next.to_string_lossy().starts_with('-'))
+				.is_none_or(|next| next.to_string_lossy().starts_with('-'))
 		{
 			arguments.insert(index + 1, OsString::from("__omp_picker__"));
 			index += 1;
@@ -1106,7 +1106,7 @@ fn looks_like_uuid(value: &str) -> bool {
 
 fn is_home_dir() -> miette::Result<bool> {
 	let home = std::env::var_os("HOME").ok_or_else(|| miette!("HOME must be set"))?;
-	Ok(std::env::current_dir().into_diagnostic()? == PathBuf::from(home))
+	Ok(std::env::current_dir().into_diagnostic()? == home)
 }
 
 async fn serve(args: ServeArgs) -> miette::Result<()> {

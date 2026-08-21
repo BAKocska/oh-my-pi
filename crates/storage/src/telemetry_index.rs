@@ -1,4 +1,4 @@
-//! Per-session telemetry side index and durable AutoQA issue store.
+//! Per-session telemetry side index and durable `AutoQA` issue store.
 //!
 //! Telemetry payloads remain in `telemetry.bin`; SQLite stores only indexed
 //! columns and byte offsets. This deliberately branches from transcript entry
@@ -48,7 +48,7 @@ pub struct TelemetryQueryResult {
 	pub backfilled: bool,
 }
 
-/// Durable AutoQA issue metadata kept beside telemetry index rows.
+/// Durable `AutoQA` issue metadata kept beside telemetry index rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredIssue {
 	/// Stable issue identifier.
@@ -385,7 +385,7 @@ impl TelemetryIndex {
 		Ok(result)
 	}
 
-	/// Stores an AutoQA issue in the audit-tier issue table.
+	/// Stores an `AutoQA` issue in the audit-tier issue table.
 	///
 	/// # Errors
 	/// Returns a SQLite error when the durable issue row cannot be written.
@@ -406,7 +406,7 @@ impl TelemetryIndex {
 		Ok(())
 	}
 
-	/// Reads a durable AutoQA issue by identifier.
+	/// Reads a durable `AutoQA` issue by identifier.
 	///
 	/// # Errors
 	/// Returns a SQLite error when the issue table cannot be queried.

@@ -2290,7 +2290,7 @@ fn format_shadow_document(request: &FormatRequest) -> DocumentId {
 	hasher.update(b"omp-lsp-format-shadow-v1\0");
 	hasher.update(request.base().head().document_id().as_bytes());
 	hasher.update(request.transaction_id().as_bytes());
-	hasher.update(&request.operation_index().to_be_bytes());
+	hasher.update(request.operation_index().to_be_bytes());
 	let mut bytes = [0; 16];
 	bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
 	DocumentId::from_bytes(bytes)

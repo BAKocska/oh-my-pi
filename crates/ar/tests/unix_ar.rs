@@ -75,7 +75,7 @@ fn rejects_truncated_malformed_and_missing_long_name_metadata() {
 	let original = fixture_bytes("unix-gnu.a");
 	assert!(matches!(
 		Archive::from_bytes_with_format(&original[..original.len() - 1], Format::Ar),
-		Err(Error::InvalidArchive(_)) | Err(Error::Io(_))
+		Err(Error::InvalidArchive(_) | Error::Io(_))
 	));
 
 	let mut bad_header = original.clone();

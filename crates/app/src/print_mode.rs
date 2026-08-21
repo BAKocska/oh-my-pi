@@ -80,7 +80,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 					&mut stdout,
 					&format!("{{\"type\":\"text_delta\",\"text\":{}}}\n", json_string(text.as_str())),
 				)
-				.await?
+				.await?;
 			},
 			ChatEvent::ThinkingDelta { text, .. } if json && !args.shape_transcript => {
 				write_json(
@@ -90,7 +90,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 						json_string(text.as_str())
 					),
 				)
-				.await?
+				.await?;
 			},
 			ChatEvent::TextDelta { text, .. } => stdout
 				.write_all(sanitize(text.as_str()).as_bytes())
@@ -128,10 +128,10 @@ async fn initial_parts(words: &[Str]) -> miette::Result<Vec<ContentPart>> {
 			match attachment {
 				Attachment::Text(contents) => append_text(&mut text, &contents),
 				Attachment::Image { media_type, data } => {
-					parts.push(ContentPart::Image(MediaInput::Bytes { media_type, data }))
+					parts.push(ContentPart::Image(MediaInput::Bytes { media_type, data }));
 				},
 				Attachment::Document { media_type, data } => {
-					parts.push(ContentPart::Document(MediaInput::Bytes { media_type, data }))
+					parts.push(ContentPart::Document(MediaInput::Bytes { media_type, data }));
 				},
 			}
 		} else {
@@ -233,9 +233,7 @@ fn document_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 
 fn discover_system_prompt() -> miette::Result<Option<Str>> {
 	let cwd = std::env::current_dir().into_diagnostic()?;
-	let home = std::env::var_os("HOME")
-		.map(PathBuf::from)
-		.unwrap_or_else(|| cwd.clone());
+	let home = std::env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
 	discover_system_prompt_from(&cwd, &home)
 }
 

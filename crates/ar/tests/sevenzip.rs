@@ -61,14 +61,12 @@ fn drops_traversal_and_reports_unsupported_coders_precisely() {
 	let traversal = open("sevenzip-traversal.7z").unwrap();
 	assert_eq!(traversal.entries().count(), 0);
 
-	let encrypted = match open("sevenzip-encrypted.7z") {
-		Err(error) => error,
-		Ok(_) => panic!("encrypted 7z unexpectedly opened"),
+	let Err(encrypted) = open("sevenzip-encrypted.7z") else {
+		panic!("encrypted 7z unexpectedly opened");
 	};
 	assert!(matches!(encrypted, Error::UnsupportedFeature(feature) if feature.contains("7zAES")));
-	let ppmd = match open("sevenzip-ppmd.7z") {
-		Err(error) => error,
-		Ok(_) => panic!("PPMd 7z unexpectedly opened"),
+	let Err(ppmd) = open("sevenzip-ppmd.7z") else {
+		panic!("PPMd 7z unexpectedly opened");
 	};
 	assert!(matches!(ppmd, Error::UnsupportedFeature(feature) if feature.contains("PPMd")));
 }

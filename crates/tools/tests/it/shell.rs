@@ -270,7 +270,7 @@ fn execution_waits_for_the_explicit_commit_gate() {
 	pin_mut!(stream);
 	assert!(stream.next().now_or_never().is_none());
 	assert_eq!(exec.state.lock().opens, 0);
-	assert_eq!(exec.state.lock().runs, [] as [(bytes::Bytes, omp_tools::shell::RunRequest); 0]);
+	assert!(exec.state.lock().runs.is_empty());
 
 	feed
 		.args_committed(sf!(r#"{{"command":"ordered"}}"#))
@@ -591,7 +591,7 @@ fn malformed_whole_arguments_are_a_structured_args_verdict() {
 	assert!(matches!(outcome, CallOutcome::ArgsRejected(_)));
 	let state = exec.state.lock();
 	assert_eq!(state.opens, 0);
-	assert_eq!(state.runs, [] as [(bytes::Bytes, omp_tools::shell::RunRequest); 0]);
+	assert!(state.runs.is_empty());
 }
 
 #[test]

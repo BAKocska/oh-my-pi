@@ -721,7 +721,7 @@ fn demangle_symbol(raw: &str) -> String {
 				.ok_or(())
 				.and_then(|symbol| rustc_demangle::try_demangle(symbol).map_err(|_| ()))
 		})
-		.map_or_else(|_| raw.to_owned(), |symbol| format!("{symbol:#}"))
+		.map_or_else(|()| raw.to_owned(), |symbol| format!("{symbol:#}"))
 }
 
 fn build_sample_node(

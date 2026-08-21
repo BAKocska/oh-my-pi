@@ -1,9 +1,6 @@
 //! Subscription masks and the per-invocation hook decision procedure.
 
-use std::{
-	future::Future,
-	sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use omp_core::{Str, sf};
@@ -263,7 +260,7 @@ pub enum GateDecision {
 }
 
 impl GateDecision {
-	fn arm(&self) -> Option<HookDecision> {
+	const fn arm(&self) -> Option<HookDecision> {
 		Some(match self {
 			Self::Allow => HookDecision::Allow,
 			Self::Deny(_) => HookDecision::Deny,
@@ -477,42 +474,40 @@ impl HookGate {
 	}
 
 	/// Runs the phase-ordered decision procedure without boxing its future.
-	pub fn gate(&self, mut event: GateEvent) -> impl Future<Output = GateOutcome> + '_ {
-		async move {
-			let mut trail = Vec::new();
-			let mut approvals = Vec::new();
-			for phase in
-				[HookPhase::Precheck, HookPhase::Transform, HookPhase::Review, HookPhase::Approval]
-			{
-				let replies = self.dispatch_phase(&event, phase).await;
-				for (subscription, decision) in replies {
-					if decision.arm().is_none_or(|arm| !arm.is_legal_in(phase)) {
-						return GateOutcome::Deny { event, reason: sf!("illegal hook decision"), trail };
-					}
-					match decision {
-						GateDecision::Deny(reason) => return GateOutcome::Deny { event, reason, trail },
-						GateDecision::Modify(patch) => {
-							let previous_target = event.effective_target.clone();
-							let previous_args = event.effective_args.clone();
-							let _ = event.apply(&patch);
-							trail.push(TransformTrail {
-								subscription_id: subscription.id,
-								previous_target,
-								previous_args,
-								effective_target: event.effective_target.clone(),
-								effective_args: event.effective_args.clone(),
-							});
-						},
-						GateDecision::RequireApproval(spec) => approvals.push(spec),
-						GateDecision::Allow | GateDecision::Defer | GateDecision::Domain(_) => {},
-					}
+	pub async fn gate(&self, mut event: GateEvent) -> GateOutcome {
+		let mut trail = Vec::new();
+		let mut approvals = Vec::new();
+		for phase in
+			[HookPhase::Precheck, HookPhase::Transform, HookPhase::Review, HookPhase::Approval]
+		{
+			let replies = self.dispatch_phase(&event, phase).await;
+			for (subscription, decision) in replies {
+				if decision.arm().is_none_or(|arm| !arm.is_legal_in(phase)) {
+					return GateOutcome::Deny { event, reason: sf!("illegal hook decision"), trail };
+				}
+				match decision {
+					GateDecision::Deny(reason) => return GateOutcome::Deny { event, reason, trail },
+					GateDecision::Modify(patch) => {
+						let previous_target = event.effective_target.clone();
+						let previous_args = event.effective_args.clone();
+						let _ = event.apply(&patch);
+						trail.push(TransformTrail {
+							subscription_id: subscription.id,
+							previous_target,
+							previous_args,
+							effective_target: event.effective_target.clone(),
+							effective_args: event.effective_args.clone(),
+						});
+					},
+					GateDecision::RequireApproval(spec) => approvals.push(spec),
+					GateDecision::Allow | GateDecision::Defer | GateDecision::Domain(_) => {},
 				}
 			}
-			if approvals.is_empty() {
-				GateOutcome::Allow { event, trail }
-			} else {
-				GateOutcome::Approval { event, specs: approvals, trail }
-			}
+		}
+		if approvals.is_empty() {
+			GateOutcome::Allow { event, trail }
+		} else {
+			GateOutcome::Approval { event, specs: approvals, trail }
 		}
 	}
 
@@ -521,59 +516,57 @@ impl HookGate {
 	/// Contributions are ordered by `(layer, publisher, extension_id)` so
 	/// callers can select a winner and journal deterministic losers. Missing,
 	/// malformed, and failed replies retain the family's fail-open default.
-	pub fn gate_domain<'gate, E: HookEvent>(
+	pub async fn gate_domain<'gate, E: HookEvent>(
 		&'gate self,
 		event: &'gate E,
-	) -> impl Future<Output = DomainOutcome<E::Return>> + 'gate {
-		async move {
-			let mut result = E::Return::fail_open();
-			let mut contributions: SmallVec<(SourceRef, E::Return), 2> = SmallVec::new();
-			if !self.subscribed(E::ID) {
-				return DomainOutcome { winner: result, contributions };
-			}
-			let mut payload = BytesMut::new();
-			event.encode_into(&mut payload);
-			let payload = payload.freeze();
-			for phase in HookPhase::ALL {
-				let mut subscriptions = self.selected(E::ID, phase, "", "");
-				subscriptions.sort_by_key(|subscription| subscription.source.clone());
-				for subscription in subscriptions {
-					let dispatch_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-					let (reply, receive) = flume::bounded(1);
-					self
-						.pending
-						.lock()
-						.insert(dispatch_id, Pending { response: reply });
-					let dispatch = HookDispatch {
-						dispatch_id,
-						event: E::ID,
-						rev: E::REV,
-						phase,
-						subscriptions: vec![subscription.clone()],
-						payload: payload.clone(),
-					};
-					if self.dispatch.send_async(dispatch).await.is_err() {
-						self.pending.lock().remove(dispatch_id);
+	) -> DomainOutcome<E::Return> {
+		let mut result = E::Return::fail_open();
+		let mut contributions: SmallVec<(SourceRef, E::Return), 2> = SmallVec::new();
+		if !self.subscribed(E::ID) {
+			return DomainOutcome { winner: result, contributions };
+		}
+		let mut payload = BytesMut::new();
+		event.encode_into(&mut payload);
+		let payload = payload.freeze();
+		for phase in HookPhase::ALL {
+			let mut subscriptions = self.selected(E::ID, phase, "", "");
+			subscriptions.sort_by_key(|subscription| subscription.source.clone());
+			for subscription in subscriptions {
+				let dispatch_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+				let (reply, receive) = flume::bounded(1);
+				self
+					.pending
+					.lock()
+					.insert(dispatch_id, Pending { response: reply });
+				let dispatch = HookDispatch {
+					dispatch_id,
+					event: E::ID,
+					rev: E::REV,
+					phase,
+					subscriptions: vec![subscription.clone()],
+					payload: payload.clone(),
+				};
+				if self.dispatch.send_async(dispatch).await.is_err() {
+					self.pending.lock().remove(dispatch_id);
+					continue;
+				}
+				let Ok(decisions) = receive.recv_async().await else {
+					continue;
+				};
+				for (reported_id, decision) in decisions {
+					if reported_id != subscription.id {
 						continue;
 					}
-					let Ok(decisions) = receive.recv_async().await else {
-						continue;
-					};
-					for (reported_id, decision) in decisions {
-						if reported_id != subscription.id {
-							continue;
-						}
-						if let GateDecision::Domain(bytes) = decision
-							&& let Some(next) = E::Return::decode_domain(&bytes)
-						{
-							result = result.merge_domain(next.clone());
-							contributions.push((subscription.source.clone(), next));
-						}
+					if let GateDecision::Domain(bytes) = decision
+						&& let Some(next) = E::Return::decode_domain(&bytes)
+					{
+						result = result.merge_domain(next.clone());
+						contributions.push((subscription.source.clone(), next));
 					}
 				}
 			}
-			DomainOutcome { winner: result, contributions }
 		}
+		DomainOutcome { winner: result, contributions }
 	}
 
 	async fn dispatch_phase(
@@ -629,7 +622,7 @@ impl HookGate {
 					}
 				},
 				Err(_) if subscription.on_failure == OnFailure::Deny => {
-					replies.push((subscription, GateDecision::Deny(sf!("required hook host failed"))))
+					replies.push((subscription, GateDecision::Deny(sf!("required hook host failed"))));
 				},
 				Err(_) => {},
 			}

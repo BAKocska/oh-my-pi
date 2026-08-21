@@ -691,16 +691,16 @@ fn lower_count_tokens(
 		let mut input_schema = parameters.as_value().clone();
 		spill_root_combinators(&mut input_schema);
 		body.tools.push(Tool::Client(ClientTool {
-			name:                  if claude_code_oauth {
+			name: if claude_code_oauth {
 				claude_code_tool_name(&tool.name)
 			} else {
 				tool.name.clone()
 			},
-			description:           tool.description.clone(),
+			description: tool.description.clone(),
 			input_schema,
-			strict:                Some(strict),
+			strict: Some(strict),
 			eager_input_streaming: None,
-			cache_control:         None,
+			cache_control: None,
 		}));
 	}
 	serde_json::to_vec(&body)
@@ -782,7 +782,7 @@ fn claude_code_tool_name(name: &str) -> Str {
 fn strip_claude_code_tool_prefix(name: Str) -> Str {
 	name
 		.strip_prefix(CLAUDE_CODE_TOOL_PREFIX)
-		.map_or(name.clone(), Str::new)
+		.map_or(name, Str::new)
 }
 
 fn apply_claude_code_fingerprint(body: &mut MessagesRequest, context: &EncodeContext<'_>) {
@@ -873,12 +873,12 @@ pub fn lower_chat(
 		let mut input_schema = parameters.as_value().clone();
 		spill_root_combinators(&mut input_schema);
 		body.tools.push(Tool::Client(ClientTool {
-			name:                  tool.name.clone(),
-			description:           tool.description.clone(),
+			name: tool.name.clone(),
+			description: tool.description.clone(),
 			input_schema,
-			strict:                Some(strict),
+			strict: Some(strict),
 			eager_input_streaming: None,
-			cache_control:         cache.clone(),
+			cache_control: cache.clone(),
 		}));
 	}
 	for tool in request.hosted_tools.iter() {
