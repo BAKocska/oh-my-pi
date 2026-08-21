@@ -260,10 +260,12 @@ impl fmt::Debug for EncodeAttempt {
 	}
 }
 
-/// Credential-free context for canonical-to-wire lowering.
+/// Secret-free context for canonical-to-wire lowering.
 pub struct EncodeContext<'a> {
 	/// Logical request identity used by protocols with stable reconnect keys.
 	pub request_id:         &'a RequestId,
+	/// Non-secret authentication scheme selected for the resolved lease.
+	pub auth_scheme:        Option<crate::auth::AuthScheme>,
 	/// Complete selected route definition.
 	pub route:              &'a RouteDef,
 	/// Optional codec-facing target. Model-less management operations carry
@@ -332,6 +334,7 @@ impl Default for EncodeContext<'_> {
 	fn default() -> Self {
 		Self {
 			request_id:         &DEFAULT_REQUEST_ID,
+			auth_scheme:        None,
 			route:              &DEFAULT_ROUTE,
 			target:             None,
 			policy_model:       None,
@@ -357,10 +360,12 @@ pub enum NativeResponseFormat {
 	Sse,
 }
 
-/// Credential-free context for decoding one provider attempt.
+/// Secret-free context for decoding one provider attempt.
 pub struct DecodeContext<'a> {
 	/// Logical request identity.
 	pub request_id:         &'a RequestId,
+	/// Non-secret authentication scheme used for this attempt.
+	pub auth_scheme:        Option<crate::auth::AuthScheme>,
 	/// Selected provider domain.
 	pub provider:           &'a ProviderId,
 	/// Selected route.
@@ -992,4 +997,93 @@ pub struct HandshakenResponse {
 	pub control:  Option<flume::Sender<ProviderControlInput>>,
 	/// Owned realtime session; present exactly when `events` is absent.
 	pub realtime: Option<RealtimeSession>,
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_core::Str;
+	use omp_llm_catalog::Catalog;
+
+	use super::{anthropic, gemini, google_cca, openai_chat, openai_codex, openai_responses};
+
+	fn representative_uri(codec: &str, base: &str) -> Str {
+		match codec {
+			"anthropic" if base.contains(":streamRawPredict") => Str::new(base),
+			"anthropic" => anthropic::direct_uri(base),
+			"bedrock-converse" => openai_chat::join_uri(base, "/model/test/converse-stream"),
+			"cursor" => openai_chat::join_uri(base, "/agent.v1.AgentService/Run"),
+			"devin" => {
+				openai_chat::join_uri(base, "/exa.api_server_pb.ApiServerService/GetChatMessage")
+			},
+			"gitlab-duo" | "local" => Str::new(base),
+			"google-cca" => openai_chat::join_uri(base, google_cca::STREAM_GENERATE_PATH),
+			"google-genai" => {
+				openai_chat::join_uri(base, "/models/test:streamGenerateContent?alt=sse")
+			},
+			"google-vertex" => {
+				let path = if gemini::vertex_version_prefix(base).is_empty() {
+					"/projects/test/locations/test/publishers/google/models/test:streamGenerateContent?\
+					 alt=sse"
+				} else {
+					"/v1/projects/test/locations/test/publishers/google/models/test:\
+					 streamGenerateContent?alt=sse"
+				};
+				openai_chat::join_uri(base, path)
+			},
+			"ollama" => openai_chat::join_uri(base, "/api/chat"),
+			"openai-chat" => {
+				openai_chat::join_uri(base, openai_chat::OpenAiChatProfile::default().path.as_str())
+			},
+			"openai-codex" => openai_codex::resolve_codex_responses_url(base),
+			"openai-responses" => openai_responses::responses_uri(base),
+			"search-exa" | "search-kagi" | "search-tavily" => openai_chat::join_uri(base, "/search"),
+			"search-parallel" => openai_chat::join_uri(base, "/v1beta/search"),
+			"search-perplexity" => openai_chat::join_uri(base, "/chat/completions"),
+			unknown => panic!("embedded route uses unaudited codec {unknown}"),
+		}
+	}
+
+	fn duplicated_adjacent_segment(uri: &str) -> Option<&str> {
+		let without_query = uri.split_once('?').map_or(uri, |(path, _)| path);
+		let path =
+			without_query
+				.split_once("://")
+				.map_or(without_query, |(_, authority_and_path)| {
+					authority_and_path
+						.find('/')
+						.map_or("", |path_start| &authority_and_path[path_start..])
+				});
+		let mut prior = None;
+		for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+			if prior == Some(segment) {
+				return Some(segment);
+			}
+			prior = Some(segment);
+		}
+		None
+	}
+
+	#[test]
+	fn embedded_catalog_routes_never_duplicate_adjacent_uri_segments() {
+		let catalog = Catalog::embedded();
+		for route in catalog.routes() {
+			let uri = representative_uri(route.codec.as_str(), route.endpoint.base_url.as_str());
+			assert_eq!(
+				duplicated_adjacent_segment(uri.as_str()),
+				None,
+				"route {} ({}) joined an adjacent duplicate in {uri}",
+				route.id,
+				route.codec,
+			);
+		}
+
+		assert_eq!(
+			representative_uri("openai-chat", "https://api.cerebras.ai/v1"),
+			"https://api.cerebras.ai/v1/chat/completions",
+		);
+		assert_eq!(
+			representative_uri("openai-responses", "https://api.openai.com/v1"),
+			"https://api.openai.com/v1/responses",
+		);
+	}
 }

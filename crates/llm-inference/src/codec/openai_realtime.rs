@@ -29,8 +29,8 @@ pub fn encode_handshake(
 	wire_model: &str,
 	maximum_frame_bytes: u64,
 ) -> Result<EncodedRequest, Error> {
-	let mut uri = url::Url::parse(base_url).map_err(|_| capability_error())?;
-	uri.set_path("/v1/realtime");
+	let endpoint = super::openai_chat::join_uri(base_url, "/realtime");
+	let mut uri = url::Url::parse(endpoint.as_str()).map_err(|_| capability_error())?;
 	uri.set_query(None);
 	uri.query_pairs_mut().append_pair("model", wire_model);
 	Ok(EncodedRequest::new(
@@ -602,6 +602,15 @@ mod tests {
 			tools:          std::sync::Arc::from([]),
 			negotiation:    crate::call::NegotiationPolicy::default(),
 		})
+	}
+
+	#[test]
+	fn handshake_path_is_relative_to_the_versioned_route_base() {
+		let encoded = encode_handshake("https://api.openai.com/v1/", "gpt-realtime", 1024).unwrap();
+		assert_eq!(encoded.uri.as_str(), "https://api.openai.com/v1/realtime?model=gpt-realtime",);
+		let proxy =
+			encode_handshake("https://proxy.example/openai/v2", "gpt-realtime", 1024).unwrap();
+		assert_eq!(proxy.uri.as_str(), "https://proxy.example/openai/v2/realtime?model=gpt-realtime",);
 	}
 
 	#[test]

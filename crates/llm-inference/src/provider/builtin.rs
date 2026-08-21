@@ -344,8 +344,31 @@ impl RouteComposer for ProductionRouteComposer {
 			.get(&route.id)
 			.cloned()
 			.or_else(|| route.endpoint.region.clone());
-		let runtime_auth = crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region)
-			.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+		let runtime_auth =
+			crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region.clone())
+				.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
+		if route.codec.as_str() == "anthropic" {
+			let provider = catalog
+				.provider(&route.provider)
+				.ok_or_else(|| unavailable(route, "catalog-provider-missing"))?;
+			for auth_id in &provider.auth {
+				if auth_id == &route.auth {
+					continue;
+				}
+				let Some(auth) = catalog.auth_spec(auth_id) else {
+					return Err(unavailable(route, "catalog-auth-spec-missing"));
+				};
+				if auth.kind != AuthSpecKind::Oauth {
+					continue;
+				}
+				let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
+				let runtime =
+					crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region.clone())
+						.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+				auth_specs.push((auth_id.clone(), runtime));
+			}
+		}
 		let account = RouteAccountSelector {
 			pool: self.dependencies.accounts.clone(),
 			provider: route.provider.clone(),
@@ -357,11 +380,15 @@ impl RouteComposer for ProductionRouteComposer {
 			shapers: self.dependencies.credential_shapers.clone(),
 			provider: route.provider.clone(),
 			route_base_url: route.endpoint.base_url.clone(),
-			spec: route.auth.clone(),
+			specs: auth_specs.iter().map(|(id, _)| id.clone()).collect(),
 			authenticated,
 		};
 		let encoder = RouteEncoder {
 			route: route.clone(),
+			auth_schemes: auth_specs
+				.iter()
+				.map(|(_, auth)| crate::auth::AuthScheme::for_spec(auth))
+				.collect(),
 			headers: catalog
 				.header_profile(&route.headers)
 				.map(|profile| {
@@ -391,7 +418,9 @@ impl RouteComposer for ProductionRouteComposer {
 			retry: TransportRetryLayer::new(u32::MAX),
 			rate: RateLayer::new(PoolRateLimiter { pool: self.dependencies.accounts.clone() }),
 			encode: crate::layer::encode::EncodeLayer::new(encoder, false),
-			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier { auth: runtime_auth }),
+			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier {
+				auth: auth_specs.into_iter().map(|(_, auth)| auth).collect(),
+			}),
 			provider_error: ProviderErrorLayer::new(),
 		});
 		Ok(RouteProviderService::new(stack))
@@ -761,6 +790,7 @@ impl Codec for RouteCodecSet {
 #[derive(Clone)]
 struct RouteEncoder {
 	route:             RouteDef,
+	auth_schemes:      Box<[crate::auth::AuthScheme]>,
 	headers:           Box<[crate::codec::RequestHeader]>,
 	codec:             Arc<dyn Codec>,
 	transport_timeout: Duration,
@@ -779,6 +809,23 @@ fn encode_wire_request(
 	} else {
 		codec.encode(context, operation)
 	}
+}
+
+fn scheme_for_credential(
+	schemes: &[crate::auth::AuthScheme],
+	kind: crate::auth::CredentialKind,
+) -> Option<crate::auth::AuthScheme> {
+	schemes.iter().copied().find(|scheme| {
+		matches!(
+			(kind, scheme),
+			(crate::auth::CredentialKind::ApiKey, crate::auth::AuthScheme::ApiKey)
+				| (
+					crate::auth::CredentialKind::Bearer,
+					crate::auth::AuthScheme::OAuth | crate::auth::AuthScheme::ApplicationDefault,
+				) | (crate::auth::CredentialKind::SessionToken, crate::auth::AuthScheme::SessionToken,)
+				| (crate::auth::CredentialKind::AwsSigV4, crate::auth::AuthScheme::AwsSigV4,)
+		)
+	})
 }
 
 impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder {
@@ -829,8 +876,12 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 			return Err(session_trust_error(execution));
 		}
 		let target = effective_target.as_ref().or_else(|| plan.wire_target());
+		let auth_scheme = lease
+			.as_ref()
+			.and_then(|lease| scheme_for_credential(&self.auth_schemes, lease.kind()));
 		let encode_context = EncodeContext {
 			request_id: &call.id,
+			auth_scheme,
 			route,
 			target,
 			policy_model: plan.policy_model.as_deref(),
@@ -870,6 +921,7 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 		}
 		let decode_context = DecodeContext {
 			request_id: &call.id,
+			auth_scheme,
 			provider: &plan.provider,
 			route: &plan.route,
 			target,
@@ -1032,7 +1084,7 @@ struct RouteLeaseProvider {
 	shapers:        Arc<CredentialShaperRegistry>,
 	provider:       omp_llm_catalog::ProviderId,
 	route_base_url: Str,
-	spec:           crate::catalog::AuthSpecId,
+	specs:          Box<[crate::catalog::AuthSpecId]>,
 	authenticated:  bool,
 }
 
@@ -1065,13 +1117,34 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 					return Err(contract_error(context, "anonymous-account-on-authenticated-route"));
 				},
 			};
-			let need = CredentialNeed {
-				spec: self.spec.clone(),
-				account,
-				principal,
-				valid_after: SystemTime::now(),
-			};
-			let lease = self.source.lease(need).await.map_err(|_| {
+			let mut resolved = None;
+			for spec in &self.specs {
+				let need = CredentialNeed {
+					spec:        spec.clone(),
+					account:     account.clone(),
+					principal:   principal.clone(),
+					valid_after: SystemTime::now(),
+				};
+				match self.source.lease(need).await {
+					Ok(lease) => {
+						resolved = Some(lease);
+						break;
+					},
+					Err(
+						crate::auth::CredentialError::Unavailable
+						| crate::auth::CredentialError::InvalidSource,
+					) => {},
+					Err(_) => {
+						return Err(Error::new(
+							ErrorKind::Authentication,
+							ErrorPhase::Authentication,
+							RetryAction::Never,
+							context.receipt(),
+						));
+					},
+				}
+			}
+			let lease = resolved.ok_or_else(|| {
 				Error::new(
 					ErrorKind::Authentication,
 					ErrorPhase::Authentication,
@@ -1122,7 +1195,7 @@ fn shaper_deadline(call: &Call, context: &ExecutionContext) -> Option<Instant> {
 
 #[derive(Clone)]
 struct RouteCredentialApplier {
-	auth: crate::auth::AuthSpec,
+	auth: Box<[crate::auth::AuthSpec]>,
 }
 
 impl CredentialApplier<RouteAccount, Option<crate::auth::CredentialLease>>
@@ -1135,18 +1208,27 @@ impl CredentialApplier<RouteAccount, Option<crate::auth::CredentialLease>>
 		request: &mut TransportRequest,
 		context: &ExecutionContext,
 	) -> Result<(), Error> {
-		match (&self.auth, lease) {
-			(crate::auth::AuthSpec::None, None) => Ok(()),
-			(crate::auth::AuthSpec::None, Some(_)) => {
+		match (self.auth.first(), lease) {
+			(Some(crate::auth::AuthSpec::None), None) => Ok(()),
+			(Some(crate::auth::AuthSpec::None), Some(_)) => {
 				Err(authentication_error(context, "credential-on-anonymous-route"))
 			},
+			(None, _) => Err(authentication_error(context, "credential-auth-spec-missing")),
 			(_, None) => Err(authentication_error(context, "credential-lease-missing")),
 			(_, Some(lease)) => {
-				let credentials = lease
-					.prepare(&self.auth, SystemTime::now())
-					.map_err(|_| authentication_error(context, "credential-application-failed"))?;
-				request.credentials = Some(credentials);
-				Ok(())
+				for auth in &self.auth {
+					match lease.prepare(auth, SystemTime::now()) {
+						Ok(credentials) => {
+							request.credentials = Some(credentials);
+							return Ok(());
+						},
+						Err(crate::auth::CredentialApplyError::WrongKind { .. }) => {},
+						Err(_) => {
+							return Err(authentication_error(context, "credential-application-failed"));
+						},
+					}
+				}
+				Err(authentication_error(context, "credential-application-failed"))
 			},
 		}
 	}
@@ -1407,6 +1489,7 @@ mod tests {
 		(
 			RouteEncoder {
 				route,
+				auth_schemes: Box::new([crate::auth::AuthScheme::for_spec(&runtime_auth)]),
 				headers: Box::new([]),
 				codec,
 				transport_timeout: Duration::from_secs(30),
@@ -1427,7 +1510,7 @@ mod tests {
 		context: &ExecutionContext,
 		expected: &str,
 	) {
-		RouteCredentialApplier { auth }
+		RouteCredentialApplier { auth: Box::new([auth]) }
 			.apply(account, Some(lease), &mut transport, context)
 			.expect("prepare credentials");
 		let credentials = transport.credentials.take().expect("prepared credentials");

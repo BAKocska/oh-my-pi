@@ -160,9 +160,10 @@ pub enum RetryAction {
 }
 
 /// Typed supplemental evidence that contains no secret-bearing source text.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ErrorDetail {
 	/// Erased answer variant did not match the typed operation contract.
+	#[error("expected {expected:?} answer, got {actual:?}")]
 	BodyVariantMismatch {
 		/// Expected operation.
 		expected: OperationKind,
@@ -170,6 +171,7 @@ pub enum ErrorDetail {
 		actual:   AnswerKind,
 	},
 	/// A named budget dimension was exhausted at an integer observed value.
+	#[error("budget {dimension} exhausted at {observed} of {limit}")]
 	Budget {
 		/// Exhausted budget dimension.
 		dimension: Str,
@@ -179,6 +181,7 @@ pub enum ErrorDetail {
 		observed:  u128,
 	},
 	/// Context size evidence.
+	#[error("context {observed} exceeds limit {limit}")]
 	Context {
 		/// Configured context limit.
 		limit:    u64,
@@ -186,6 +189,7 @@ pub enum ErrorDetail {
 		observed: u64,
 	},
 	/// A capability requirement could not be satisfied.
+	#[error("capability {feature} unavailable ({})", .reason.0)]
 	Capability {
 		/// Required feature.
 		feature: Str,
@@ -193,11 +197,13 @@ pub enum ErrorDetail {
 		reason:  ReasonId,
 	},
 	/// A selector or target could not resolve.
+	#[error("target {selector} did not resolve")]
 	Target {
 		/// Sanitized selector.
 		selector: Str,
 	},
 	/// A previously produced execution plan is no longer valid.
+	#[error("plan revision {planned_revision} superseded by {current_revision}")]
 	StalePlan {
 		/// Revision used during planning.
 		planned_revision: Str,
@@ -205,21 +211,25 @@ pub enum ErrorDetail {
 		current_revision: Str,
 	},
 	/// Replay or staging requirement evidence.
+	#[error("replay required ({})", .reason.0)]
 	Replay {
 		/// Typed replay reason.
 		reason: ReasonId,
 	},
 	/// Sanitized bounded protocol evidence.
+	#[error("protocol violation ({})", .reason.0)]
 	Protocol {
 		/// Typed protocol reason.
 		reason: ReasonId,
 	},
 	/// Bounded provider message after codec-owned sanitization.
+	#[error("{sanitized_message}")]
 	Provider {
 		/// Sanitized bounded provider message.
 		sanitized_message: Str,
 	},
 	/// Local availability evidence.
+	#[error("local backend unavailable ({})", .reason.0)]
 	LocalUnavailable {
 		/// Typed local-availability reason.
 		reason: ReasonId,
@@ -474,6 +484,12 @@ impl fmt::Display for Error {
 		if let Some(code) = &self.code {
 			write!(formatter, " ({code})")?;
 		}
+		if let Some(status) = self.status {
+			write!(formatter, " [http {status}]")?;
+		}
+		if let Some(detail) = &self.evidence.detail {
+			write!(formatter, ": {detail}")?;
+		}
 		Ok(())
 	}
 }
@@ -515,5 +531,22 @@ mod tests {
 	#[test]
 	fn structured_errors_fit_the_inline_result_budget() {
 		assert!(size_of::<Error>() <= 128);
+	}
+
+	#[test]
+	fn display_names_status_and_sanitized_detail() {
+		let error = Error::new(
+			ErrorKind::InvalidRequest,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.code(sf!("model_archived"))
+		.status(Some(404))
+		.detail(super::ErrorDetail::Provider { sanitized_message: sf!("model does not exist") });
+		let rendered = error.to_string();
+		assert!(rendered.contains("(model_archived)"));
+		assert!(rendered.contains("[http 404]"));
+		assert!(rendered.contains("model does not exist"));
 	}
 }

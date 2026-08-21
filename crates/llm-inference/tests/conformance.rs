@@ -1056,6 +1056,7 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 		assert_eq!(operation_call.kind(), operation);
 		let context = DecodeContext {
 			request_id: &request_id,
+			auth_scheme: None,
 			provider: &provider,
 			route: &route,
 			policy,

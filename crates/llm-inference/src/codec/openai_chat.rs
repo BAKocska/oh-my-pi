@@ -172,7 +172,7 @@ pub struct OpenAiChatProfile {
 impl Default for OpenAiChatProfile {
 	fn default() -> Self {
 		Self {
-			path: sf!("/v1/chat/completions"),
+			path: sf!("/chat/completions"),
 			system_role: WireRole::System,
 			multiple_system_messages: true,
 			sampling: true,
@@ -489,17 +489,17 @@ impl Codec for OpenAiChatCodec {
 		}
 		let uri = join_uri(target.endpoint.base_url.as_str(), selected.profile.path.as_str());
 		Ok(EncodedRequest {
-			operation:   OperationKind::Chat,
-			method:      RequestMethod::Post,
-			uri:         Str::new(uri),
-			headers:     vec![RequestHeader {
+			operation: OperationKind::Chat,
+			method: RequestMethod::Post,
+			uri,
+			headers: vec![RequestHeader {
 				name:  sf!("content-type"),
 				value: sf!("application/json"),
 			}]
 			.into_boxed_slice(),
-			body:        crate::body::BodySource::Bytes(body),
-			framing:     FramingProtocol::Sse,
-			bounds:      SizeBounds {
+			body: crate::body::BodySource::Bytes(body),
+			framing: FramingProtocol::Sse,
+			bounds: SizeBounds {
 				request_body: selected.profile.max_request_bytes,
 				frame:        selected.profile.max_frame_bytes,
 				response:     selected.profile.max_response_bytes,
@@ -520,14 +520,14 @@ impl Codec for OpenAiChatCodec {
 	}
 }
 
-fn join_uri(base: &str, path: &str) -> String {
+pub(super) fn join_uri(base: &str, path: &str) -> Str {
 	let mut uri = String::with_capacity(base.len() + path.len() + 1);
 	uri.push_str(base.trim_end_matches('/'));
 	if !path.starts_with('/') {
 		uri.push('/');
 	}
 	uri.push_str(path);
-	uri
+	Str::new(uri)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]

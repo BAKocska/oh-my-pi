@@ -332,6 +332,7 @@ impl DifficultyClassifier {
 			})
 	}
 
+	#[cfg(feature = "local-text")]
 	fn fallback_level(&self, auto: AutoDifficulty) -> Difficulty {
 		self
 			.state

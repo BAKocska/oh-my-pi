@@ -51,10 +51,10 @@ pub struct OpenAiMediaProfile {
 impl Default for OpenAiMediaProfile {
 	fn default() -> Self {
 		Self {
-			images_path:              sf!("/v1/images/generations"),
-			speech_path:              sf!("/v1/audio/speech"),
-			transcription_path:       sf!("/v1/audio/transcriptions"),
-			translation_path:         sf!("/v1/audio/translations"),
+			images_path:              sf!("/images/generations"),
+			speech_path:              sf!("/audio/speech"),
+			transcription_path:       sf!("/audio/transcriptions"),
+			translation_path:         sf!("/audio/translations"),
 			max_request_bytes:        128 * 1024 * 1024,
 			max_frame_bytes:          32 * 1024 * 1024,
 			max_response_bytes:       128 * 1024 * 1024,
@@ -165,7 +165,7 @@ fn encoded(
 	EncodedRequest::new(
 		operation,
 		RequestMethod::Post,
-		Str::new(join_uri(base, path)),
+		join_uri(base, path),
 		vec![RequestHeader { name: sf!("content-type"), value: content_type }].into_boxed_slice(),
 		body,
 		FramingProtocol::Raw,
@@ -247,7 +247,7 @@ fn encode_image(
 	Ok((
 		BodySource::multipart(Arc::<[BodySource]>::from(parts)),
 		sf!("multipart/form-data; boundary={boundary}"),
-		sf!("/v1/images/edits"),
+		sf!("/images/edits"),
 	))
 }
 
@@ -635,14 +635,8 @@ fn boundary(request_id: &str) -> String {
 	}
 	value
 }
-fn join_uri(base: &str, path: &str) -> String {
-	let mut uri = String::with_capacity(base.len() + path.len() + 1);
-	uri.push_str(base.trim_end_matches('/'));
-	if !path.starts_with('/') {
-		uri.push('/');
-	}
-	uri.push_str(path);
-	uri
+fn join_uri(base: &str, path: &str) -> Str {
+	super::openai_chat::join_uri(base, path)
 }
 fn capability_error() -> Error {
 	Error::new(
@@ -680,6 +674,19 @@ mod tests {
 	};
 
 	#[test]
+	fn every_default_media_path_is_relative_to_the_versioned_route_base() {
+		let profile = OpenAiMediaProfile::default();
+		for (path, expected) in [
+			(&profile.images_path, "https://api.openai.com/v1/images/generations"),
+			(&profile.transcription_path, "https://api.openai.com/v1/audio/transcriptions"),
+			(&profile.translation_path, "https://api.openai.com/v1/audio/translations"),
+			(&profile.speech_path, "https://api.openai.com/v1/audio/speech"),
+		] {
+			assert_eq!(join_uri("https://api.openai.com/v1", path.as_str()), expected);
+		}
+	}
+
+	#[test]
 	fn image_edit_multipart_preserves_consumable_one_shot_evidence() {
 		let body =
 			BodySource::OneShot(Arc::new(OneShotBody::new(byte_stream(Bytes::from_static(b"image")))));
@@ -706,6 +713,6 @@ mod tests {
 				.expect("valid multipart edit");
 		assert_eq!(body.replayability(), Replayability::OneShot);
 		assert!(content_type.starts_with("multipart/form-data; boundary="));
-		assert_eq!(path.as_str(), "/v1/images/edits");
+		assert_eq!(path.as_str(), "/images/edits");
 	}
 }

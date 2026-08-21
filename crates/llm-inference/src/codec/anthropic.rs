@@ -38,6 +38,23 @@ pub const BEDROCK_VERSION: &str = "bedrock-2023-05-31";
 /// Direct Messages endpoint.
 pub const DIRECT_PATH: &str = "/v1/messages";
 
+/// OAuth beta required by Anthropic's Claude Code inference endpoint.
+///
+/// Kept here because catalog header profiles are route-wide and cannot vary by
+/// the resolved credential kind. Values mirror pi's
+/// `packages/ai/src/providers/claude-code-fingerprint.ts` and Anthropic request
+/// construction.
+const CLAUDE_CODE_OAUTH_BETA: &str = "oauth-2025-04-20";
+/// User-Agent emitted by Cowork's Claude desktop inference entrypoint.
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.220 (external, claude-desktop)";
+/// Identity instruction prepended to OAuth Anthropic system blocks.
+const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
+	"You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+/// Prefix isolating custom OAuth tools from Anthropic built-ins.
+const CLAUDE_CODE_TOOL_PREFIX: &str = "_";
+/// Claude Code's per-request output-token ceiling.
+const CLAUDE_CODE_MAX_OUTPUT_TOKENS: u64 = 64_000;
+
 /// Anthropic Messages hosting envelope.
 #[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
 pub enum AnthropicAdapter {
@@ -613,11 +630,42 @@ struct CountTokensBody {
 	tools:    Vec<Tool>,
 }
 
+/// Rewrites a tool schema root for Anthropic's `input_schema` validator, which
+/// rejects `allOf`/`anyOf`/`oneOf` at the top level (HTTP 400
+/// `invalid_request_error`). Root combinators are spilled into the root
+/// `description` so the constraint stays model-visible; nested combinators are
+/// untouched.
+fn spill_root_combinators(schema: &mut Value) {
+	let Some(object) = schema.as_object_mut() else {
+		return;
+	};
+	for key in ["allOf", "anyOf", "oneOf"] {
+		let Some(spilled) = object.remove(key) else {
+			continue;
+		};
+		let Ok(rendered) = serde_json::to_string(&spilled) else {
+			continue;
+		};
+		let description = object
+			.entry("description")
+			.or_insert_with(|| Value::String(String::new()));
+		if let Value::String(text) = description {
+			if !text.is_empty() {
+				text.push_str("\n\n");
+			}
+			text.push_str(key);
+			text.push_str(": ");
+			text.push_str(&rendered);
+		}
+	}
+}
+
 fn lower_count_tokens(
 	model: Str,
 	provider: &ProviderId,
 	codec: &CodecId,
 	request: &CountTokensRequest,
+	claude_code_oauth: bool,
 ) -> Result<Bytes, Error> {
 	let mut body = CountTokensBody {
 		model,
@@ -633,14 +681,23 @@ fn lower_count_tokens(
 			Role::Assistant => append_message(&mut body.messages, "assistant", blocks),
 		}
 	}
+	if claude_code_oauth {
+		prepend_claude_code_identity(&mut body.system);
+	}
 	for tool in request.tools.iter() {
 		let Some((parameters, strict)) = tool.input.json_schema() else {
 			return Err(capability_error("anthropic.tools.grammar_unsupported"));
 		};
+		let mut input_schema = parameters.as_value().clone();
+		spill_root_combinators(&mut input_schema);
 		body.tools.push(Tool::Client(ClientTool {
-			name:                  tool.name.clone(),
+			name:                  if claude_code_oauth {
+				claude_code_tool_name(&tool.name)
+			} else {
+				tool.name.clone()
+			},
 			description:           tool.description.clone(),
-			input_schema:          parameters.as_value().clone(),
+			input_schema,
 			strict:                Some(strict),
 			eager_input_streaming: None,
 			cache_control:         None,
@@ -685,6 +742,77 @@ pub fn project(
 			})
 		},
 	}
+}
+
+fn is_claude_code_oauth(context: &EncodeContext<'_>, adapter: AnthropicAdapter) -> bool {
+	adapter == AnthropicAdapter::Direct
+		&& context.auth_scheme == Some(crate::auth::AuthScheme::OAuth)
+}
+
+fn prepend_claude_code_identity(system: &mut Vec<ContentBlock>) {
+	system.retain(|block| {
+		!matches!(
+			block,
+			ContentBlock::Text { text, .. } if text.as_str() == CLAUDE_CODE_SYSTEM_INSTRUCTION
+		)
+	});
+	system.insert(0, ContentBlock::Text {
+		text:          sf!(CLAUDE_CODE_SYSTEM_INSTRUCTION),
+		cache_control: None,
+	});
+}
+
+fn is_anthropic_builtin_tool(name: &str) -> bool {
+	["web_search", "code_execution", "text_editor", "computer"]
+		.into_iter()
+		.any(|builtin| name.eq_ignore_ascii_case(builtin))
+}
+
+fn claude_code_tool_name(name: &str) -> Str {
+	if is_anthropic_builtin_tool(name) {
+		Str::new(name)
+	} else {
+		let mut prefixed = String::with_capacity(CLAUDE_CODE_TOOL_PREFIX.len() + name.len());
+		prefixed.push_str(CLAUDE_CODE_TOOL_PREFIX);
+		prefixed.push_str(name);
+		Str::new(prefixed)
+	}
+}
+
+fn strip_claude_code_tool_prefix(name: Str) -> Str {
+	name
+		.strip_prefix(CLAUDE_CODE_TOOL_PREFIX)
+		.map_or(name.clone(), Str::new)
+}
+
+fn apply_claude_code_fingerprint(body: &mut MessagesRequest, context: &EncodeContext<'_>) {
+	prepend_claude_code_identity(&mut body.system);
+	for tool in &mut body.tools {
+		if let Tool::Client(tool) = tool {
+			tool.name = claude_code_tool_name(&tool.name);
+		}
+	}
+	for message in &mut body.messages {
+		for block in &mut message.content {
+			if let ContentBlock::ToolUse { name, .. } = block {
+				*name = claude_code_tool_name(name);
+			}
+		}
+	}
+	if let Some(WireToolChoice::Tool { name, .. }) = &mut body.tool_choice {
+		*name = claude_code_tool_name(name);
+	}
+	let mut ceiling = CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+	if let Some(limit) = context
+		.policy_model
+		.and_then(|model| model.limits.maximum_output_tokens)
+	{
+		ceiling = ceiling.min(limit);
+	}
+	if let Some(limit) = context.route.capability_limits.maximum_output_tokens {
+		ceiling = ceiling.min(limit);
+	}
+	body.max_tokens = Some(body.max_tokens.unwrap_or(ceiling).min(ceiling));
 }
 
 fn serialize_body(body: &MessagesRequest) -> Result<Bytes, Error> {
@@ -742,10 +870,12 @@ pub fn lower_chat(
 		let Some((parameters, strict)) = tool.input.json_schema() else {
 			return Err(capability_error("anthropic.tools.grammar_unsupported"));
 		};
+		let mut input_schema = parameters.as_value().clone();
+		spill_root_combinators(&mut input_schema);
 		body.tools.push(Tool::Client(ClientTool {
 			name:                  tool.name.clone(),
 			description:           tool.description.clone(),
-			input_schema:          parameters.as_value().clone(),
+			input_schema,
 			strict:                Some(strict),
 			eager_input_streaming: None,
 			cache_control:         cache.clone(),
@@ -1141,18 +1271,26 @@ fn encoded_count_tokens(
 	let target = context
 		.target
 		.ok_or_else(|| encoding_error("anthropic.target.required"))?;
+	let claude_code_oauth = is_claude_code_oauth(context, adapter);
 	let body = lower_count_tokens(
 		Str::new(target.wire_model.as_str()),
 		&context.route.provider,
 		&target.codec,
 		request,
+		claude_code_oauth,
 	)?;
 	let mut headers = vec![
 		RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 		RequestHeader { name: sf!("anthropic-version"), value: sf!(DIRECT_VERSION) },
 	];
-	if !betas.as_slice().is_empty() {
-		headers.push(RequestHeader { name: sf!("anthropic-beta"), value: betas.header_value() });
+	let mut merged_betas = betas.clone();
+	if claude_code_oauth {
+		merged_betas.insert(sf!(CLAUDE_CODE_OAUTH_BETA));
+		headers.push(RequestHeader { name: sf!("user-agent"), value: sf!(CLAUDE_CODE_USER_AGENT) });
+	}
+	if !merged_betas.as_slice().is_empty() {
+		headers
+			.push(RequestHeader { name: sf!("anthropic-beta"), value: merged_betas.header_value() });
 	}
 	Ok(EncodedRequest {
 		operation:   OperationKind::CountTokens,
@@ -1185,19 +1323,26 @@ impl Codec for AnthropicCodec {
 		let target = context
 			.target
 			.ok_or_else(|| encoding_error("anthropic.target.required"))?;
-		let body = lower_chat(
+		let mut body = lower_chat(
 			Str::new(target.wire_model.as_str()),
 			&context.route.provider,
 			&target.codec,
 			context.thinking_selection,
 			request,
 		)?;
-		let projected = project(
-			MessagesIntent { body, fallbacks: Vec::new(), betas: self.betas.clone() },
-			self.adapter,
-		)?;
+		let claude_code_oauth = is_claude_code_oauth(context, self.adapter);
+		let mut betas = self.betas.clone();
+		if claude_code_oauth {
+			apply_claude_code_fingerprint(&mut body, context);
+			betas.insert(sf!(CLAUDE_CODE_OAUTH_BETA));
+		}
+		let projected = project(MessagesIntent { body, fallbacks: Vec::new(), betas }, self.adapter)?;
 		let mut headers =
 			vec![RequestHeader { name: sf!("content-type"), value: sf!("application/json") }];
+		if claude_code_oauth {
+			headers
+				.push(RequestHeader { name: sf!("user-agent"), value: sf!(CLAUDE_CODE_USER_AGENT) });
+		}
 		if let Some(version) = projected.anthropic_version_header {
 			headers.push(RequestHeader { name: sf!("anthropic-version"), value: version });
 		}
@@ -1240,18 +1385,20 @@ impl Codec for AnthropicCodec {
 				}))
 			},
 			OperationKind::Chat => Ok(Box::new(AnthropicWireDecoder {
-				adapter:          self.adapter,
-				inner:            AnthropicDecoder::new(),
-				signature_cursor: 0,
-				citation_cursor:  0,
-				history_cursor:   0,
+				adapter:           self.adapter,
+				claude_code_oauth: self.adapter == AnthropicAdapter::Direct
+					&& context.auth_scheme == Some(crate::auth::AuthScheme::OAuth),
+				inner:             AnthropicDecoder::new(),
+				signature_cursor:  0,
+				citation_cursor:   0,
+				history_cursor:    0,
 			})),
 			_ => Err(capability_error("anthropic.decoder.operation_unsupported")),
 		}
 	}
 }
 
-fn direct_uri(base: &str) -> Str {
+pub(super) fn direct_uri(base: &str) -> Str {
 	let base = base.trim_end_matches('/');
 	let suffix = if base.ends_with("/v1") {
 		"/messages"
@@ -1443,11 +1590,12 @@ fn endpoint_region(base_url: &str) -> Option<&str> {
 }
 #[derive(Debug)]
 struct AnthropicWireDecoder {
-	adapter:          AnthropicAdapter,
-	inner:            AnthropicDecoder,
-	signature_cursor: usize,
-	citation_cursor:  usize,
-	history_cursor:   usize,
+	adapter:           AnthropicAdapter,
+	claude_code_oauth: bool,
+	inner:             AnthropicDecoder,
+	signature_cursor:  usize,
+	citation_cursor:   usize,
+	history_cursor:    usize,
 }
 
 impl Decoder for AnthropicWireDecoder {
@@ -1470,7 +1618,7 @@ impl Decoder for AnthropicWireDecoder {
 			},
 		};
 		for event in events {
-			emit_anthropic_event(event, emit)?;
+			emit_anthropic_event(event, self.claude_code_oauth, emit)?;
 		}
 		while let Some((index, signature)) = self.inner.outcome.signatures.get(self.signature_cursor)
 		{
@@ -1509,16 +1657,28 @@ impl Decoder for AnthropicWireDecoder {
 			},
 		};
 		for event in events {
-			emit_anthropic_event(event, emit)?;
+			emit_anthropic_event(event, self.claude_code_oauth, emit)?;
 		}
 		Ok(())
 	}
 }
 
 fn emit_anthropic_event(
-	event: AnthropicEvent,
+	mut event: AnthropicEvent,
+	claude_code_oauth: bool,
 	emit: &mut dyn FnMut(RawEvent),
 ) -> Result<(), Error> {
+	if claude_code_oauth {
+		match &mut event {
+			AnthropicEvent::Chat(ChatEvent::ToolCallStarted { name, .. }) => {
+				*name = strip_claude_code_tool_prefix(name.clone());
+			},
+			AnthropicEvent::Chat(ChatEvent::ToolCallReady { call, .. }) => {
+				call.name = strip_claude_code_tool_prefix(call.name.clone());
+			},
+			AnthropicEvent::Completion(_) | AnthropicEvent::Chat(_) => {},
+		}
+	}
 	match event {
 		AnthropicEvent::Completion(completion) => emit(RawEvent::Completion(*completion)),
 		AnthropicEvent::Chat(ChatEvent::ToolCallReady { index, call }) => {
@@ -2277,8 +2437,273 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use std::{sync::Arc, time::UNIX_EPOCH};
+
+	use http::{HeaderName, HeaderValue, Request};
+	use omp_llm_catalog::{Catalog, WireTarget};
+	use secrecy::SecretString;
+
 	use super::*;
-	use crate::transport::EventStreamDecoder;
+	use crate::{
+		auth::{
+			AuthSpec, BearerScheme, CredentialKind, CredentialLease, HeaderPlacement, KeyPlacement,
+			LeaseMeta,
+		},
+		call::{
+			ContentPart as CanonicalContentPart, Message as CanonicalMessage, NegotiationPolicy,
+			Sampling, ToolDefinition, ToolInputConstraint,
+		},
+		id::{AccountId, PrincipalId, RequestId},
+		transport::EventStreamDecoder,
+	};
+
+	fn canonical_chat(system: &[&str]) -> ChatRequest {
+		let mut messages = Vec::with_capacity(system.len() + 1);
+		messages.extend(system.iter().map(|text| CanonicalMessage {
+			role:    Role::System,
+			content: Arc::from([CanonicalContentPart::Text { text: Str::new(*text), proof: None }]),
+			name:    None,
+		}));
+		messages.push(CanonicalMessage {
+			role:    Role::User,
+			content: Arc::from([CanonicalContentPart::Text { text: sf!("hello"), proof: None }]),
+			name:    None,
+		});
+		ChatRequest {
+			messages:          messages.into(),
+			tools:             Arc::from([
+				ToolDefinition {
+					name:        sf!("read"),
+					description: Some(sf!("Read a file")),
+					input:       ToolInputConstraint::JsonSchema {
+						parameters: OpaqueJson::new(serde_json::json!({
+							"type": "object",
+							"properties": {},
+						})),
+						strict:     true,
+					},
+				},
+				ToolDefinition {
+					name:        sf!("web_search"),
+					description: Some(sf!("Search the web")),
+					input:       ToolInputConstraint::JsonSchema {
+						parameters: OpaqueJson::new(serde_json::json!({
+							"type": "object",
+							"properties": {},
+						})),
+						strict:     true,
+					},
+				},
+			]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Require(ToolChoice::Named(sf!("read"))),
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Sampling::default(),
+			max_output_tokens: Some(100_000),
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+		}
+	}
+
+	fn encoded_anthropic(kind: CredentialKind, system: &[&str]) -> EncodedRequest {
+		let catalog = Catalog::embedded();
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| {
+				model.routes.iter().any(|id| {
+					catalog.route(id).is_some_and(|route| {
+						route.provider.as_str() == "anthropic" && route.codec.as_str() == "anthropic"
+					})
+				})
+			})
+			.expect("embedded Anthropic model");
+		let route = model
+			.routes
+			.iter()
+			.filter_map(|id| catalog.route(id))
+			.find(|route| {
+				route.provider.as_str() == "anthropic" && route.codec.as_str() == "anthropic"
+			})
+			.expect("embedded Anthropic route");
+		let wire_model = model
+			.wire_ids
+			.iter()
+			.find(|(id, _)| id == &route.id)
+			.expect("Anthropic wire model")
+			.1
+			.clone();
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		};
+		let policy = catalog
+			.wire_policy(&model.wire_policy)
+			.expect("Anthropic wire policy");
+		let request_id = RequestId::new("anthropic-oauth-fingerprint");
+		let context = EncodeContext {
+			request_id: &request_id,
+			auth_scheme: Some(match kind {
+				CredentialKind::Bearer => crate::auth::AuthScheme::OAuth,
+				CredentialKind::ApiKey => crate::auth::AuthScheme::ApiKey,
+				_ => panic!("unsupported test credential kind"),
+			}),
+			route,
+			target: Some(&target),
+			policy,
+			..EncodeContext::default()
+		};
+		let mut codec = AnthropicCodec::direct().with_betas([sf!("route-beta")]);
+		if kind == CredentialKind::Bearer {
+			codec = codec.with_betas([sf!(CLAUDE_CODE_OAUTH_BETA)]);
+		}
+		codec
+			.encode(&context, &OperationCall::Chat(Arc::new(canonical_chat(system))))
+			.expect("Anthropic request encodes")
+	}
+
+	fn finalize_auth(encoded: &EncodedRequest, kind: CredentialKind) -> Request<Bytes> {
+		let body = match &encoded.body {
+			BodySource::Bytes(body) => body.clone(),
+			_ => panic!("Anthropic body must be bytes"),
+		};
+		let mut request = Request::builder()
+			.method("POST")
+			.uri(encoded.uri.as_str())
+			.body(body)
+			.expect("HTTP request");
+		for header in &encoded.headers {
+			request.headers_mut().insert(
+				HeaderName::from_bytes(header.name.as_bytes()).expect("header name"),
+				HeaderValue::from_str(&header.value).expect("header value"),
+			);
+		}
+		let meta = LeaseMeta {
+			account:    AccountId::new("anthropic-test"),
+			principal:  PrincipalId::new("anthropic-test"),
+			generation: 1,
+			expires_at: None,
+		};
+		let (lease, auth) = match kind {
+			CredentialKind::Bearer => (
+				CredentialLease::bearer(meta, SecretString::from("oauth-token".to_owned())),
+				AuthSpec::Bearer {
+					sources:   Vec::new(),
+					placement: KeyPlacement::Header(HeaderPlacement::bearer()),
+					scheme:    BearerScheme::OAuth,
+				},
+			),
+			CredentialKind::ApiKey => (
+				CredentialLease::api_key(meta, SecretString::from("api-key".to_owned())),
+				AuthSpec::ApiKey {
+					sources:   Vec::new(),
+					placement: KeyPlacement::Header(HeaderPlacement {
+						name:   sf!("x-api-key"),
+						prefix: Str::empty(),
+					}),
+				},
+			),
+			_ => panic!("unsupported test credential kind"),
+		};
+		lease
+			.prepare(&auth, UNIX_EPOCH)
+			.expect("credentials prepare")
+			.finalize_buffered(&mut request)
+			.expect("credentials finalize");
+		request
+	}
+
+	#[test]
+	fn oauth_lease_applies_claude_code_fingerprint_and_bearer_auth() {
+		let encoded = encoded_anthropic(CredentialKind::Bearer, &["caller system"]);
+		let request = finalize_auth(&encoded, CredentialKind::Bearer);
+		assert_eq!(request.headers()["user-agent"], CLAUDE_CODE_USER_AGENT,);
+		assert_eq!(request.headers()["anthropic-beta"], "route-beta,oauth-2025-04-20",);
+		assert_eq!(request.headers()["authorization"], "Bearer oauth-token");
+		assert!(!request.headers().contains_key("x-api-key"));
+		let body: MessagesRequest = serde_json::from_slice(request.body()).expect("request body");
+		assert!(matches!(
+			body.system.first(),
+			Some(ContentBlock::Text { text, .. })
+				if text.as_str() == CLAUDE_CODE_SYSTEM_INSTRUCTION
+		));
+		assert_eq!(body.max_tokens, Some(CLAUDE_CODE_MAX_OUTPUT_TOKENS));
+		assert!(matches!(
+			body.tools.first(),
+			Some(Tool::Client(tool)) if tool.name.as_str() == "_read"
+		));
+		assert!(matches!(
+			body.tools.get(1),
+			Some(Tool::Client(tool)) if tool.name.as_str() == "web_search"
+		));
+		assert!(matches!(
+			body.tool_choice,
+			Some(WireToolChoice::Tool { name, .. }) if name.as_str() == "_read"
+		));
+	}
+
+	#[test]
+	fn api_key_lease_preserves_legacy_anthropic_shape() {
+		let encoded = encoded_anthropic(CredentialKind::ApiKey, &["caller system"]);
+		let request = finalize_auth(&encoded, CredentialKind::ApiKey);
+		assert_eq!(request.headers()["x-api-key"], "api-key");
+		assert!(!request.headers().contains_key("authorization"));
+		assert!(!request.headers().contains_key("user-agent"));
+		assert_eq!(request.headers()["anthropic-beta"], "route-beta");
+		let body: MessagesRequest = serde_json::from_slice(request.body()).expect("request body");
+		assert!(!body.system.iter().any(|block| matches!(
+			block,
+			ContentBlock::Text { text, .. }
+				if text.as_str() == CLAUDE_CODE_SYSTEM_INSTRUCTION
+		)));
+		assert_eq!(body.max_tokens, Some(100_000));
+		assert!(matches!(
+			body.tools.first(),
+			Some(Tool::Client(tool)) if tool.name.as_str() == "read"
+		));
+		assert!(matches!(
+			body.tool_choice,
+			Some(WireToolChoice::Tool { name, .. }) if name.as_str() == "read"
+		));
+	}
+
+	#[test]
+	fn oauth_identity_is_first_and_never_duplicated() {
+		let encoded = encoded_anthropic(CredentialKind::Bearer, &[
+			CLAUDE_CODE_SYSTEM_INSTRUCTION,
+			"caller system",
+		]);
+		let request = finalize_auth(&encoded, CredentialKind::Bearer);
+		let body: MessagesRequest = serde_json::from_slice(request.body()).expect("request body");
+		let identity_count = body
+			.system
+			.iter()
+			.filter(|block| {
+				matches!(
+					block,
+					ContentBlock::Text { text, .. }
+						if text.as_str() == CLAUDE_CODE_SYSTEM_INSTRUCTION
+				)
+			})
+			.count();
+		assert_eq!(identity_count, 1);
+		assert!(matches!(
+			body.system.first(),
+			Some(ContentBlock::Text { text, .. })
+				if text.as_str() == CLAUDE_CODE_SYSTEM_INSTRUCTION
+		));
+		assert!(matches!(
+			body.system.get(1),
+			Some(ContentBlock::Text { text, .. }) if text.as_str() == "caller system"
+		));
+	}
 
 	const ORACLE_FILES: [&[u8]; 31] = [
 		include_bytes!(

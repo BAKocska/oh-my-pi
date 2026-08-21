@@ -3231,15 +3231,8 @@ fn encoding_error(code: &'static str) -> crate::error::Error {
 	.code(Str::new(code))
 }
 
-fn responses_uri(base_url: &str) -> Str {
-	let base = base_url.trim_end_matches('/');
-	if base.ends_with("/responses") {
-		Str::new(base)
-	} else if base.ends_with("/v1") {
-		sf!("{base}/responses")
-	} else {
-		sf!("{base}/v1/responses")
-	}
+pub(super) fn responses_uri(base_url: &str) -> Str {
+	super::openai_chat::join_uri(base_url, "/responses")
 }
 
 impl super::Codec for OpenAiResponsesCodec {

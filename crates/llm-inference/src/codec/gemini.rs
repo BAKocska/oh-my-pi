@@ -2397,9 +2397,10 @@ fn google_unary_uri(
 			validate_path("project", project, false)?;
 			let location = location.unwrap_or("global");
 			validate_path("location", location, false)?;
+			let version = vertex_version_prefix(base);
 			Ok(format!(
-				"{base}/projects/{project}/locations/{location}/publishers/google/models/{model}:\
-				 {action}",
+				"{base}{version}/projects/{project}/locations/{location}/publishers/google/models/\
+				 {model}:{action}",
 			)
 			.into())
 		},
@@ -2573,8 +2574,9 @@ fn google_stream_uri(
 			})?;
 			validate_path("project", project, false)?;
 			validate_path("location", location, false)?;
+			let version = vertex_version_prefix(base);
 			format!(
-				"{base}/projects/{project}/locations/{location}/publishers/google/models/\
+				"{base}{version}/projects/{project}/locations/{location}/publishers/google/models/\
 				 {model}{GENERATIVE_LANGUAGE_STREAM_PATH}",
 			)
 		},
@@ -2585,6 +2587,10 @@ fn google_stream_uri(
 		},
 	};
 	Ok(uri.into())
+}
+
+pub(super) fn vertex_version_prefix(base: &str) -> &'static str {
+	if base.ends_with("/v1") { "" } else { "/v1" }
 }
 
 fn validate_path(name: &str, value: &str, allow_slash: bool) -> Result<(), GoogleCodecError> {
@@ -4299,17 +4305,21 @@ mod tests {
 			.as_str(),
 			"https://generativelanguage.googleapis.com/v1beta/models/gemini-count:countTokens",
 		);
-		assert_eq!(
-			google_unary_uri(
-				GoogleEndpointKind::Vertex,
-				"https://aiplatform.googleapis.com/v1",
-				"gemini-embedding",
-				Some("project"),
-				Some("global"),
-				"batchEmbedContents",
-			).expect("Vertex path").as_str(),
-			"https://aiplatform.googleapis.com/v1/projects/project/locations/global/publishers/google/models/gemini-embedding:batchEmbedContents",
-		);
+		for base in ["https://aiplatform.googleapis.com", "https://aiplatform.googleapis.com/v1"] {
+			assert_eq!(
+				google_unary_uri(
+					GoogleEndpointKind::Vertex,
+					base,
+					"gemini-embedding",
+					Some("project"),
+					Some("global"),
+					"batchEmbedContents",
+				)
+				.expect("Vertex path")
+				.as_str(),
+				"https://aiplatform.googleapis.com/v1/projects/project/locations/global/publishers/google/models/gemini-embedding:batchEmbedContents",
+			);
+		}
 		let count = GoogleCountTokensRequest {
 			contents:                 vec![GoogleContent {
 				role:  "user".into(),
