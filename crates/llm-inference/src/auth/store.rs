@@ -629,6 +629,7 @@ impl CredentialStore {
 			})?;
 			rows.collect::<Result<Vec<_>, _>>()?
 		};
+		let mut changed = 0;
 		for (
 			account,
 			principal,
@@ -642,6 +643,9 @@ impl CredentialStore {
 			ciphertext,
 		) in &encrypted
 		{
+			if old_key_id == active.id().as_str() {
+				continue;
+			}
 			let nonce: [u8; 12] = nonce
 				.as_slice()
 				.try_into()
@@ -684,9 +688,10 @@ impl CredentialStore {
 					replacement.ciphertext
 				],
 			)?;
+			changed += 1;
 		}
 		transaction.commit()?;
-		Ok(encrypted.len())
+		Ok(changed)
 	}
 
 	/// Tries to acquire an expiring, cross-process lease.
@@ -1812,6 +1817,14 @@ mod tests {
 		let loaded = store.get(&account).expect("load rotated");
 		assert_eq!(loaded.metadata.generation, 1);
 		assert_eq!(loaded.secret.expose_secret().as_slice(), b"rotation-secret");
+		assert_eq!(store.rotate_keys().expect("already current"), 0);
+		let unchanged_nonce: Vec<u8> = Connection::open(&path)
+			.expect("inspect unchanged")
+			.query_row("SELECT nonce FROM credentials WHERE account_id = 'account'", [], |row| {
+				row.get(0)
+			})
+			.expect("unchanged envelope");
+		assert_eq!(unchanged_nonce, after.1);
 	}
 
 	#[test]
