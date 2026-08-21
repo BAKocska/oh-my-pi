@@ -47,6 +47,9 @@ use crate::{
 
 const MAX_CAPTURED_HEADERS: usize = 32;
 const MAX_CAPTURED_HEADER_BYTES: usize = 32;
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_MESSAGE_BYTES: usize = 1_024;
+const MAX_PROVIDER_CODE_BYTES: usize = 128;
 const PUBLIC_NUMERIC_HEADERS: [&str; 13] = [
 	"content-length",
 	"retry-after",
@@ -402,10 +405,44 @@ async fn execute(
 	captures
 		.lock()
 		.push(HttpCaptureRecord { snapshot: Arc::clone(&capture), evidence: evidence.clone() });
+	let response_limit = transport.encoded.bounds.response;
+
+	if !(200..300).contains(&status) {
+		let body = collect_error_response_body(
+			incoming,
+			response_limit.min(MAX_PROVIDER_ERROR_BODY_BYTES as u64),
+			&transport.cancel,
+			deadline,
+		)
+		.await
+		.map_err(|error| {
+			record_failure(
+				error,
+				&attempt,
+				&evidence,
+				Some(status),
+				provider_request_id.as_ref(),
+				started,
+				false,
+			)
+		})?;
+		let mut capture_remaining = transport.attempt.capture_limit;
+		capture_http_frame(&capture, 0, &Frame::Raw(body.clone()), &mut capture_remaining);
+		let mut error = classify_http_error(status, &body);
+		surface_concurrency_admission(&mut error, concurrency_admission);
+		return Err(record_failure(
+			error,
+			&attempt,
+			&evidence,
+			Some(status),
+			provider_request_id.as_ref(),
+			started,
+			false,
+		));
+	}
 
 	let framing = transport.encoded.framing;
 	let frame_limit = usize::try_from(transport.encoded.bounds.frame).unwrap_or(usize::MAX);
-	let response_limit = transport.encoded.bounds.response;
 	let event_stream = decode_stream(
 		incoming,
 		framing,
@@ -654,6 +691,126 @@ async fn collect_request_body(
 			None => return Ok(output.freeze()),
 		}
 	}
+}
+
+async fn collect_error_response_body(
+	mut incoming: Incoming,
+	limit: u64,
+	cancel: &Cancellation,
+	deadline: tokio::time::Instant,
+) -> Result<Bytes, Error> {
+	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+	let mut output = BytesMut::with_capacity(limit.min(8 * 1024));
+	while output.len() < limit {
+		let next = tokio::select! {
+			next = incoming.frame() => next,
+			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
+			() = tokio::time::sleep_until(deadline) => {
+				cancel.cancel();
+				return Err(deadline_exceeded(false));
+			},
+		};
+		let Some(next) = next else {
+			break;
+		};
+		let frame = next
+			.map_err(|_| connectivity(ErrorPhase::Handshake, false, "http-error-response-body"))?;
+		let Ok(chunk) = frame.into_data() else {
+			continue;
+		};
+		let remaining = limit.saturating_sub(output.len());
+		output.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+	}
+	Ok(output.freeze())
+}
+
+fn classify_http_error(status: u16, body: &[u8]) -> Error {
+	use std::time::Duration;
+
+	let (kind, action) = match status {
+		401 | 403 => (ErrorKind::Authentication, RetryAction::Never),
+		408 => (ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: Duration::ZERO }),
+		429 => (ErrorKind::RateLimited, RetryAction::SameRoute { after: Duration::from_secs(30) }),
+		400 | 404 | 405 | 413 | 422 => (ErrorKind::InvalidRequest, RetryAction::Never),
+		402 => (ErrorKind::PaymentRequired, RetryAction::Never),
+		409 => (ErrorKind::SessionConflict, RetryAction::Never),
+		500..=599 => (ErrorKind::ResourceExhausted, RetryAction::SameRoute {
+			after: Duration::from_millis(500),
+		}),
+		_ => (ErrorKind::ProviderContractMismatch, RetryAction::Never),
+	};
+	let (code, message) = provider_error_facts(body);
+	Error::new(kind, ErrorPhase::Handshake, action, ExecutionReceipt::default())
+		.status(Some(status))
+		.optional_code(code)
+		.detail(ErrorDetail::provider(
+			message.unwrap_or_else(|| Str::new_static("Provider request failed")),
+		))
+}
+
+fn provider_error_facts(body: &[u8]) -> (Option<Str>, Option<Str>) {
+	let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+		return (None, None);
+	};
+	let facts = value.get("error").unwrap_or(&value);
+	let code = ["code", "type", "status"]
+		.into_iter()
+		.find_map(|field| facts.get(field).and_then(provider_code));
+	let message = ["message", "detail", "error"]
+		.into_iter()
+		.find_map(|field| facts.get(field).and_then(serde_json::Value::as_str))
+		.and_then(sanitize_provider_message);
+	(code, message)
+}
+
+fn provider_code(value: &serde_json::Value) -> Option<Str> {
+	let text = match value {
+		serde_json::Value::String(text) => text.clone(),
+		serde_json::Value::Number(number) => number.to_string(),
+		_ => return None,
+	};
+	(!text.is_empty()
+		&& text.len() <= MAX_PROVIDER_CODE_BYTES
+		&& text
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')))
+	.then(|| Str::new(text))
+}
+
+fn sanitize_provider_message(message: &str) -> Option<Str> {
+	let lowered = message.to_ascii_lowercase();
+	if [
+		"authorization:",
+		"bearer ",
+		"api_key",
+		"api key",
+		"access_token",
+		"access token",
+		"secret",
+		"sk-",
+	]
+	.into_iter()
+	.any(|marker| lowered.contains(marker))
+	{
+		return None;
+	}
+	let mut sanitized = String::with_capacity(message.len().min(MAX_PROVIDER_MESSAGE_BYTES));
+	for word in message.split_whitespace() {
+		let separator = usize::from(!sanitized.is_empty());
+		if sanitized
+			.len()
+			.saturating_add(separator)
+			.saturating_add(word.len())
+			> MAX_PROVIDER_MESSAGE_BYTES
+		{
+			break;
+		}
+		if separator != 0 {
+			sanitized.push(' ');
+		}
+		sanitized.push_str(word);
+	}
+	(!sanitized.is_empty()).then(|| Str::new(sanitized))
 }
 
 fn decode_stream(
@@ -1138,6 +1295,69 @@ mod tests {
 		let oversized = "a".repeat(MAX_REQUEST_ID_BYTES + 1);
 		headers.insert("x-request-id", HeaderValue::from_str(&oversized).expect("valid header"));
 		assert!(request_id(&headers).is_none());
+	}
+
+	#[test]
+	fn non_success_statuses_are_typed_before_codec_decoding() {
+		for (status, kind, retryable) in [
+			(400, ErrorKind::InvalidRequest, false),
+			(401, ErrorKind::Authentication, false),
+			(403, ErrorKind::Authentication, false),
+			(404, ErrorKind::InvalidRequest, false),
+			(408, ErrorKind::DeadlineExceeded, true),
+			(422, ErrorKind::InvalidRequest, false),
+			(429, ErrorKind::RateLimited, true),
+			(500, ErrorKind::ResourceExhausted, true),
+			(503, ErrorKind::ResourceExhausted, true),
+		] {
+			let error = classify_http_error(status, br#"{"error":{"code":"upstream_code"}}"#);
+			assert_eq!(error.kind, kind, "status {status}");
+			assert_eq!(error.phase, ErrorPhase::Handshake);
+			assert_eq!(error.status, Some(status));
+			assert_eq!(error.code.as_deref(), Some("upstream_code"));
+			assert_eq!(
+				matches!(error.action, RetryAction::SameRoute { .. }),
+				retryable,
+				"status {status}",
+			);
+		}
+	}
+
+	#[test]
+	fn provider_error_facts_are_bounded_and_secret_free() {
+		let error = classify_http_error(
+			404,
+			br#"{"error":{"code":"model_not_found","message":"Model zai-glm-4.7 was retired"}}"#,
+		);
+		assert_eq!(error.kind, ErrorKind::InvalidRequest);
+		assert_eq!(error.status, Some(404));
+		assert_eq!(error.code.as_deref(), Some("model_not_found"));
+		assert!(matches!(
+			error.detail_ref(),
+			Some(ErrorDetail::Provider { sanitized_message })
+				if sanitized_message.as_str() == "Model zai-glm-4.7 was retired"
+		));
+
+		let reflected = classify_http_error(
+			401,
+			br#"{"error":{"message":"Authorization: Bearer reflected-super-secret"}}"#,
+		);
+		assert!(matches!(
+			reflected.detail_ref(),
+			Some(ErrorDetail::Provider { sanitized_message })
+				if sanitized_message.as_str() == "Provider request failed"
+		));
+		assert!(!format!("{reflected:?}").contains("reflected-super-secret"));
+
+		let oversized = "x".repeat(MAX_PROVIDER_MESSAGE_BYTES + 20);
+		let body = serde_json::json!({"error": {"message": oversized}});
+		let encoded = serde_json::to_vec(&body).expect("provider error fixture");
+		let bounded = classify_http_error(500, &encoded);
+		assert!(matches!(
+			bounded.detail_ref(),
+			Some(ErrorDetail::Provider { sanitized_message })
+				if sanitized_message.len() <= MAX_PROVIDER_MESSAGE_BYTES
+		));
 	}
 
 	#[test]
