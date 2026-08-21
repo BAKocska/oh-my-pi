@@ -36,6 +36,8 @@
 pub use prost;
 /// Allocation-free bounds checks for extension-facing protobuf frames.
 pub mod bounds;
+/// Serde adapters rendering protobuf byte fields as lossless text.
+pub mod bytes_text;
 
 /// Current wire-visible protobuf schema revision.
 ///
