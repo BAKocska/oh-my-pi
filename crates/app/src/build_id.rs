@@ -1,29 +1,27 @@
 //! Build identity of the running executable.
 //!
-//! Project daemons advertise this identity in their hello frames so clients
-//! from a different build can detect a stale daemon and replace it. The
-//! identity changes on every relink — including dependency-only rebuilds —
-//! and is identical for byte-identical binaries regardless of path.
+//! Project daemons only need to know whether they were launched from the same
+//! local executable generation. Content addressability is unnecessary: the
+//! client launches its daemon from the same file, while a relink replaces or
+//! mutates that file.
 //!
-//! On macOS this is the linker-assigned `LC_UUID`, read from the running
-//! image's own load commands in microseconds. Elsewhere it falls back to a
-//! blake3 content hash of the executable (memory-mapped; the kernels are
-//! compiled optimized even in dev profiles — see the root `Cargo.toml`
-//! profile override).
+//! The identity hashes the executable path and filesystem generation metadata.
+//! Its cost is constant in the executable size on every supported platform; it
+//! never opens or reads the executable contents.
 
-use std::sync::LazyLock;
+use std::{path::Path, sync::LazyLock};
 
-use omp_core::Hash32;
+use omp_core::{Hash32, hex::ArrayStr};
 
-/// Returns the memoized build identity of the current executable, or an
-/// empty string when it cannot be determined.
+/// Returns the memoized local generation identity of the current executable,
+/// or an empty string when its filesystem metadata cannot be read.
 ///
 /// An empty identity means "unknown": callers must never initiate daemon
 /// replacement from an unknown identity, and must treat an empty advertised
 /// identity as stale only when their own identity is known.
 pub fn current() -> &'static str {
-	static BUILD_ID: LazyLock<String> = LazyLock::new(compute);
-	&BUILD_ID
+	static BUILD_ID: LazyLock<ArrayStr<32>> = LazyLock::new(compute);
+	BUILD_ID.as_str()
 }
 
 /// Returns whether a daemon advertising `theirs` should be replaced by a
@@ -36,73 +34,55 @@ pub fn is_stale(ours: &str, theirs: &str) -> bool {
 	!ours.is_empty() && ours != theirs
 }
 
-fn compute() -> String {
-	#[cfg(target_os = "macos")]
-	if let Some(uuid) = link_uuid() {
-		return omp_core::hex::encode(&uuid).into_string();
-	}
-	content_hash()
-}
-
-/// The linker-assigned `LC_UUID` of the main executable image.
-///
-/// ld64 stamps a fresh UUID on every link, so dependency-only rebuilds are
-/// covered without touching the file system.
-#[cfg(target_os = "macos")]
-fn link_uuid() -> Option<[u8; 16]> {
-	use libc::{load_command, mach_header_64};
-
-	// `libc` lacks these two Mach-O items; layouts per <mach-o/loader.h>.
-	const LC_UUID: u32 = 0x1b;
-	#[repr(C)]
-	struct uuid_command {
-		cmd:     u32,
-		cmdsize: u32,
-		uuid:    [u8; 16],
-	}
-
-	unsafe extern "C" {
-		fn _dyld_get_image_header(image_index: u32) -> *const mach_header_64;
-	}
-
-	// SAFETY: image 0 is the main executable; dyld keeps its header and load
-	// commands mapped for the process lifetime, so the walk below reads only
-	// live image memory bounded by `sizeofcmds`.
-	unsafe {
-		let header = _dyld_get_image_header(0);
-		if header.is_null() {
-			return None;
-		}
-		let mut cursor = header.add(1).cast::<u8>();
-		let end = cursor.add((*header).sizeofcmds as usize);
-		for _ in 0..(*header).ncmds {
-			if cursor.add(size_of::<load_command>()) > end.cast_mut().cast_const() {
-				return None;
-			}
-			let command = cursor.cast::<load_command>();
-			let size = (*command).cmdsize as usize;
-			if size < size_of::<load_command>() || cursor.add(size) > end {
-				return None;
-			}
-			if (*command).cmd == LC_UUID && size >= size_of::<uuid_command>() {
-				return Some((*cursor.cast::<uuid_command>()).uuid);
-			}
-			cursor = cursor.add(size);
-		}
-		None
-	}
-}
-
-/// BLAKE3 content hash of the executable, memory-mapped to avoid loading
-/// the whole binary.
-fn content_hash() -> String {
+fn compute() -> ArrayStr<32> {
 	std::env::current_exe()
-		.and_then(|exe| {
-			let mut hasher = Hash32::hasher();
-			hasher.update_mmap(exe)?;
-			Ok(hasher.finalize().to_hex().to_string())
-		})
+		.and_then(|executable| fingerprint(&executable))
 		.unwrap_or_default()
+}
+
+fn fingerprint(executable: &Path) -> std::io::Result<ArrayStr<32>> {
+	let metadata = std::fs::metadata(executable)?;
+	let mut digest = Hash32::hasher();
+	digest.update(b"omp/executable-generation/v1");
+
+	let path = executable.as_os_str().as_encoded_bytes();
+	digest.update((path.len() as u64).to_le_bytes());
+	digest.update(path);
+	digest.update(metadata.len().to_le_bytes());
+
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+
+		digest.update(metadata.dev().to_le_bytes());
+		digest.update(metadata.ino().to_le_bytes());
+		digest.update(metadata.mtime().to_le_bytes());
+		digest.update(metadata.mtime_nsec().to_le_bytes());
+		digest.update(metadata.ctime().to_le_bytes());
+		digest.update(metadata.ctime_nsec().to_le_bytes());
+	}
+
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::MetadataExt as _;
+
+		digest.update(metadata.creation_time().to_le_bytes());
+		digest.update(metadata.last_write_time().to_le_bytes());
+	}
+
+	#[cfg(not(any(unix, windows)))]
+	{
+		let (before_epoch, modified) =
+			match metadata.modified()?.duration_since(std::time::UNIX_EPOCH) {
+				Ok(modified) => (false, modified),
+				Err(error) => (true, error.duration()),
+			};
+		digest.update([u8::from(before_epoch)]);
+		digest.update(modified.as_secs().to_le_bytes());
+		digest.update(modified.subsec_nanos().to_le_bytes());
+	}
+
+	Ok(digest.finalize().to_hex())
 }
 
 #[cfg(test)]
@@ -114,15 +94,28 @@ mod tests {
 		let first = current();
 		assert_eq!(first, current());
 		assert!(!first.is_empty(), "test executable must be identifiable");
-		// LC_UUID renders as 32 hex chars, the content-hash fallback as 64.
-		assert!(first.len() == 32 || first.len() == 64, "unexpected length {}", first.len());
+		assert_eq!(first.len(), 64);
 		assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
 	}
 
-	#[cfg(target_os = "macos")]
 	#[test]
-	fn link_uuid_is_present_on_macos() {
-		assert!(link_uuid().is_some(), "ld64 always emits LC_UUID");
+	fn fingerprint_is_stable_and_changes_with_file_generation() {
+		let directory = tempfile::tempdir().expect("temporary executable directory");
+		let executable = directory.path().join("omp");
+		std::fs::write(&executable, b"first generation").expect("write first generation");
+
+		let first = fingerprint(&executable).expect("fingerprint first generation");
+		assert_eq!(
+			first.as_str(),
+			fingerprint(&executable)
+				.expect("fingerprint unchanged generation")
+				.as_str()
+		);
+
+		std::fs::write(&executable, b"replacement executable generation")
+			.expect("write replacement generation");
+		let replacement = fingerprint(&executable).expect("fingerprint replacement generation");
+		assert_ne!(first.as_str(), replacement.as_str());
 	}
 
 	#[test]
