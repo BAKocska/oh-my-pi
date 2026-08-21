@@ -62,7 +62,7 @@ pub use compact::{
 };
 pub use context::{
 	Anchor, ContextProjection, ContextView, InheritPosition, MessageKind, MessageRef, PatchOp,
-	PatchRejected, RefFlags, apply_patches, project_context,
+	PatchOutcome, PatchRejected, RefFlags, apply_patches, project_context,
 };
 pub use continuation::{
 	AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,

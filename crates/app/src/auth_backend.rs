@@ -74,8 +74,12 @@ async fn print_auth(answer: AuthAnswer) -> Result<()> {
 			let session_id = session.id.clone();
 			while let Ok(event) = session.events.recv_async().await {
 				match event.into_diagnostic()? {
-					AuthEvent::OpenUrl(url) => println!("open {url}"),
+					AuthEvent::OpenUrl(url) => {
+						crate::open::open_path(&url);
+						println!("open {url}");
+					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => {
+						crate::open::open_path(&verification_url);
 						println!(
 							"complete device authorization at {verification_url} using code {}",
 							code.expose_secret()

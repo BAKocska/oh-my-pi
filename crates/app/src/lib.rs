@@ -24,6 +24,7 @@ pub mod ext_cli;
 pub mod exthost;
 pub mod models_cmd;
 pub mod modes;
+mod open;
 pub mod print_mode;
 pub mod project_state;
 pub mod rpc_adapter;

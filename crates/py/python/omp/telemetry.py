@@ -20,6 +20,7 @@ from ._verdicts import Rev
 from ._registry import ExportDefinition, registry as _declarations
 from .placement import Place
 from .prompts import SlotClass
+from .ui import _emit as _emit_effect
 
 QUEUE_DEFAULT = 4096
 QUEUE_MAX: Final[int] = 65_536
@@ -292,13 +293,18 @@ def _bounded_attrs(
         instrument._series.add(series)
         return attrs
     if not instrument._cardinality_warned:
-        warnings.warn(
-            f"metric {instrument.name!r} exceeded attribute cardinality; "
-            'folding new series into overflow="true"',
-            RuntimeWarning,
-            stacklevel=3,
-        )
         instrument._cardinality_warned = True
+        message = (
+            f"metric {instrument.name!r} exceeded attribute cardinality; "
+            'folding new series into overflow="true"'
+        )
+        _emit_effect(
+            "host_warning",
+            code="cardinality",
+            message=message,
+            subject=instrument.name,
+        )
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
     return _OVERFLOW_ATTRS
 
 

@@ -375,6 +375,7 @@ class DeclarationRegistry:
         "_exports",
         "_extension_id",
         "_providers",
+        "_provider_candidates",
         "_hooks",
         "_hook_definitions",
         "_prompt_slots",
@@ -411,6 +412,7 @@ class DeclarationRegistry:
         ] = {}
         self._device_states: dict[_ToolKey, tuple[bool, str | None]] = {}
         self._entry_kinds: dict[_EntryKindKey, EntryKindDefinition] = {}
+        self._provider_candidates: dict[_ProviderKey, list[ProviderDefinition]] = {}
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookKey, object] = {}
         self._hook_definitions: dict[_HookKey, HookDefinition] = {}
@@ -558,17 +560,20 @@ class DeclarationRegistry:
         if definition is not None:
             from .devices import PrecedenceConflict
 
-            source_package = self._extension_id or "<unconfigured extension>"
+            extension_id = self._extension_id or "<unconfigured extension>"
             for prior_precedence, _prior_replaces, prior_key in self.device_claims(name):
+                claimant_detail = (
+                    f"local claimant {(extension_id, prior_key)!r} and "
+                    f"local claimant {(extension_id, key)!r}; competing claimants from "
+                    "another extension are outside this process"
+                )
                 if prior_precedence == definition.precedence:
                     raise PrecedenceConflict(
-                        f"equal-precedence claimant keys {prior_key!r} and {key!r} "
-                        f"from source package {source_package!r}"
+                        f"equal-precedence {claimant_detail}"
                     )
                 if definition.replaces is None:
                     raise PrecedenceConflict(
-                        f"claimant keys {prior_key!r} and {key!r} from source package "
-                        f"{source_package!r} conflict; name the replaced device explicitly"
+                        f"{claimant_detail} conflict; name the replaced device explicitly"
                     )
         self._insert(self._tools, key, declaration, "tool")
         if definition is not None:
@@ -809,6 +814,7 @@ class DeclarationRegistry:
     ) -> type | None:
         """Record a data-only provider or bind its decorated implementation."""
 
+        self._ensure_open(provider_id)
         if not isinstance(provider_id, str) or not provider_id:
             raise SpecError("provider id must be a non-empty string")
         if implementation is not None and not isinstance(implementation, type):
@@ -816,22 +822,64 @@ class DeclarationRegistry:
         definition = ProviderDefinition(
             provider_id, spec, implementation, priority, extends, replaces
         )
-        existing = self._providers.get(provider_id)
-        if (
-            implementation is not None
-            and existing is not None
-            and existing.spec is spec
-            and existing.implementation is None
-        ):
+        candidates = self._provider_candidates.get(provider_id)
+        if candidates is None:
+            self._check_declaration_limit()
+            self._provider_candidates[provider_id] = [definition]
             self._providers[provider_id] = definition
-        else:
-            self._insert(self._providers, provider_id, definition, "provider")
+            return implementation
+
+        if implementation is not None:
+            for index, existing in enumerate(candidates):
+                if existing.spec is spec and existing.implementation is None:
+                    candidates[index] = definition
+                    if self._providers.get(provider_id) is existing:
+                        self._providers[provider_id] = definition
+                    return implementation
+
+        self._check_declaration_limit()
+        candidates.append(definition)
+        self._providers.pop(provider_id, None)
         return implementation
 
     def provider_definitions(self) -> tuple[ProviderDefinition, ...]:
-        """Return provider declarations in deterministic identifier order."""
+        """Return active providers followed by their retained collision evidence."""
 
-        return tuple(self._providers[key] for key in sorted(self._providers))
+        definitions: list[ProviderDefinition] = []
+        for key in sorted(self._providers):
+            winner = self._providers[key]
+            definitions.append(winner)
+            definitions.extend(
+                candidate
+                for candidate in self._provider_candidates[key]
+                if candidate is not winner
+            )
+        return tuple(definitions)
+
+    def _resolve_provider_collisions(self) -> None:
+        """Resolve provider priority contests or fail closed on a highest tie."""
+
+        for provider_id, candidates in self._provider_candidates.items():
+            if len(candidates) < 2:
+                continue
+            highest_priority = max(candidate.priority for candidate in candidates)
+            winners = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.priority == highest_priority
+            )
+            if len(winners) != 1:
+                claimants = ", ".join(
+                    f"declaration {index} (provider_id={candidate.id!r}, "
+                    f"declaration_id={_provider_declaration_id(candidate)!r}, "
+                    f"priority={candidate.priority})"
+                    for index, candidate in enumerate(winners, start=1)
+                )
+                raise SpecError(
+                    f"provider activation conflict for {provider_id!r}: equal highest "
+                    f"priority claimants {claimants}; provider id is withheld"
+                )
+            self._providers[provider_id] = winners[0]
 
     def register_worker(self, name: str, spec: object) -> None:
         """Record one worker manifest projection during import."""
@@ -981,6 +1029,7 @@ class DeclarationRegistry:
 
         self._ensure_open("declaration registry")
         self._sealed = True
+        self._resolve_provider_collisions()
         missing_tools: frozenset[_ToolKey] = frozenset()
         undeclared_tools: frozenset[_ToolKey] = frozenset()
         missing_hooks: frozenset[_HookKey] = frozenset()
@@ -1176,17 +1225,9 @@ class DeclarationRegistry:
         if self._sealed:
             raise DeclarationSealed(str(name))
 
-    def _insert(
-        self,
-        declarations: dict[object, object],
-        key: object,
-        value: object,
-        kind: str,
-    ) -> None:
-        self._ensure_open(key)
-        if key in declarations:
-            holder = self._extension_id or _declaration_holder(declarations[key])
-            raise DuplicateRegistration(str(key), holder)
+    def _check_declaration_limit(self) -> None:
+        """Refuse a declaration that would exceed the per-extension bound."""
+
         count = (
             len(self._tools)
             + len(self._commands)
@@ -1200,12 +1241,25 @@ class DeclarationRegistry:
             + len(self._entry_kinds)
             + len(self._telemetry)
             + len(self._prompt_slots)
-            + len(self._providers)
+            + sum(len(candidates) for candidates in self._provider_candidates.values())
             + len(self._workers)
             + len(self._exports)
         )
         if count >= MAX_DECLARATIONS:
             raise DeclarationLimit(count + 1, MAX_DECLARATIONS)
+
+    def _insert(
+        self,
+        declarations: dict[object, object],
+        key: object,
+        value: object,
+        kind: str,
+    ) -> None:
+        self._ensure_open(key)
+        if key in declarations:
+            holder = self._extension_id or _declaration_holder(declarations[key])
+            raise DuplicateRegistration(str(key), holder)
+        self._check_declaration_limit()
         declarations[key] = value
 
 
@@ -1590,6 +1644,14 @@ def _declaration_holder(value: object) -> str:
         if isinstance(module, str) and isinstance(qualname, str):
             return f"{module}.{qualname}"
     return type(value).__name__
+
+
+def _provider_declaration_id(definition: ProviderDefinition) -> str:
+    """Name one provider declaration for activation diagnostics."""
+
+    if definition.implementation is not None:
+        return _declaration_holder(definition.implementation)
+    return _declaration_holder(definition.spec)
 
 
 def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ...]:

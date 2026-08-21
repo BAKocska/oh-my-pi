@@ -84,6 +84,14 @@ pub enum PatchOp {
 		/// Whether to leave a minimal replacement marker.
 		keep_placeholder: bool,
 	},
+	/// Remove model-visible parts while retaining the projected item and its
+	/// metadata.
+	DropParts {
+		/// Stable projected item ids whose parts are omitted.
+		ids:    SmallVec<Str, 8>,
+		/// Journal-only reason for omitting the parts.
+		reason: Str,
+	},
 	/// Replace named items with one synthetic message at the first or last
 	/// target.
 	Replace {
@@ -158,6 +166,15 @@ pub enum PatchRejected {
 	ReorderAnchor,
 }
 
+/// Per-operation result of applying a collected projection patch.
+#[derive(Debug)]
+pub struct PatchOutcome {
+	/// Projected thread after every valid operation has materialized.
+	pub thread:  Thread,
+	/// Rejected operations paired with their index in the input slice.
+	pub dropped: SmallVec<(usize, PatchRejected), 4>,
+}
+
 /// Result of deciding whether the expensive handler path is needed.
 #[derive(Debug)]
 pub enum ContextProjection {
@@ -204,15 +221,19 @@ pub fn project_context(
 	ContextProjection::View { thread, view: ContextView { refs } }
 }
 
-/// Applies all accepted operations in one materialization pass.
+/// Applies every valid operation in one materialization pass.
 ///
-/// Callers dispatch handlers independently, drop each handler whose patch
-/// returns an error, and call this once with the surviving operation sequence.
+/// Validation is per-operation fail-open: rejected operations are returned for
+/// journaling while their valid siblings still apply. This supersedes the
+/// earlier whole-handler-drop contract; handler execution failure remains
+/// whole-handler fail-open, but a handler's invalid operation does not discard
+/// its siblings.
+#[must_use]
 pub fn apply_patches(
 	mut thread: Thread,
 	view: &ContextView,
 	operations: &[PatchOp],
-) -> Result<Thread, PatchRejected> {
+) -> PatchOutcome {
 	let indexes: HashMap<&str, usize> = view
 		.refs
 		.iter()
@@ -222,10 +243,16 @@ pub fn apply_patches(
 	let mut touched = vec![false; thread.items.len()];
 	let mut plans = Vec::with_capacity(operations.len());
 	let mut seen_dedupe = HashSet::new();
+	let mut dropped = SmallVec::new();
 
-	for operation in operations {
-		let plan = validate_operation(operation, view, &indexes, &mut touched, &mut seen_dedupe)?;
-		plans.push(plan);
+	for (operation_index, operation) in operations.iter().enumerate() {
+		match validate_operation(operation, view, &indexes, &touched, &seen_dedupe) {
+			Ok(plan) => {
+				commit_plan(&plan, &mut touched, &mut seen_dedupe);
+				plans.push(plan);
+			},
+			Err(rejection) => dropped.push((operation_index, rejection)),
+		}
 	}
 
 	let mut slots: Vec<Slot> = (0..thread.items.len()).map(Slot::Keep).collect();
@@ -238,15 +265,21 @@ pub fn apply_patches(
 		.into_iter()
 		.map(|slot| match slot {
 			Slot::Keep(index) => items[index].take().expect("each keep slot is unique"),
+			Slot::DropParts(index) => {
+				let mut item = items[index].take().expect("each drop-parts slot is unique");
+				clear_parts(&mut item);
+				item
+			},
 			Slot::Synth(index) | Slot::Placeholder(index) => synthetic[index].clone(),
 		})
 		.collect();
-	Ok(thread)
+	PatchOutcome { thread, dropped }
 }
 
 #[derive(Clone, Debug)]
 enum Slot {
 	Keep(usize),
+	DropParts(usize),
 	Synth(usize),
 	Placeholder(usize),
 }
@@ -254,8 +287,9 @@ enum Slot {
 #[derive(Debug)]
 enum Plan {
 	Prune { indexes: SmallVec<usize, 8>, placeholder: Option<Item> },
+	DropParts { indexes: SmallVec<usize, 8> },
 	Replace { indexes: SmallVec<usize, 8>, item: Item, at: InheritPosition },
-	Insert { index: usize, after: bool, item: Item },
+	Insert { index: usize, after: bool, item: Item, dedupe: Option<Str> },
 	Reorder { indexes: SmallVec<usize, 8>, before: usize },
 	Skip,
 }
@@ -264,25 +298,24 @@ fn validate_operation(
 	operation: &PatchOp,
 	view: &ContextView,
 	indexes: &HashMap<&str, usize>,
-	touched: &mut [bool],
-	seen_dedupe: &mut HashSet<Str>,
+	touched: &[bool],
+	seen_dedupe: &HashSet<Str>,
 ) -> Result<Plan, PatchRejected> {
 	let resolve = |id: &Str, required: bool| match indexes.get(id.as_str()).copied() {
 		Some(index) => Ok(Some(index)),
 		None if required => Err(PatchRejected::Unknown(id.clone())),
 		None => Ok(None),
 	};
-	let mut claim = |ids: &[Str], required: bool| -> Result<SmallVec<usize, 8>, PatchRejected> {
+	let claim = |ids: &[Str], required: bool| -> Result<SmallVec<usize, 8>, PatchRejected> {
 		let mut resolved = SmallVec::with_capacity(ids.len());
 		for id in ids {
 			if let Some(index) = resolve(id, required)? {
 				if view.refs[index].flags.contains(RefFlags::PINNED) {
 					return Err(PatchRejected::Pinned(id.clone()));
 				}
-				if touched[index] {
+				if touched[index] || resolved.contains(&index) {
 					return Err(PatchRejected::Conflict(id.clone()));
 				}
-				touched[index] = true;
 				resolved.push(index);
 			}
 		}
@@ -300,15 +333,14 @@ fn validate_operation(
 				placeholder: keep_placeholder.then(placeholder_item),
 			})
 		},
+		PatchOp::DropParts { ids, reason: _ } => Ok(Plan::DropParts { indexes: claim(ids, true)? }),
 		PatchOp::Replace { ids, text, role, at } => Ok(Plan::Replace {
 			indexes: claim(ids, true)?,
 			item:    synthetic_item(text.clone(), *role),
 			at:      *at,
 		}),
 		PatchOp::Insert { text, anchor, role, dedupe } => {
-			if let Some(key) = dedupe
-				&& !seen_dedupe.insert(key.clone())
-			{
+			if dedupe.as_ref().is_some_and(|key| seen_dedupe.contains(key)) {
 				return Ok(Plan::Skip);
 			}
 			let (index, after) = match anchor {
@@ -317,7 +349,12 @@ fn validate_operation(
 				Anchor::Head => (0, false),
 				Anchor::Tail => (view.refs.len(), false),
 			};
-			Ok(Plan::Insert { index, after, item: synthetic_item(text.clone(), *role) })
+			Ok(Plan::Insert {
+				index,
+				after,
+				item: synthetic_item(text.clone(), *role),
+				dedupe: dedupe.clone(),
+			})
 		},
 		PatchOp::Reorder { ids, before } => {
 			let moved = claim(ids, true)?;
@@ -328,9 +365,28 @@ fn validate_operation(
 			if touched[before_index] {
 				return Err(PatchRejected::Conflict(before.clone()));
 			}
-			touched[before_index] = true;
 			Ok(Plan::Reorder { indexes: moved, before: before_index })
 		},
+	}
+}
+
+fn commit_plan(plan: &Plan, touched: &mut [bool], seen_dedupe: &mut HashSet<Str>) {
+	match plan {
+		Plan::Prune { indexes, .. } | Plan::DropParts { indexes } | Plan::Replace { indexes, .. } => {
+			for index in indexes {
+				touched[*index] = true;
+			}
+		},
+		Plan::Insert { dedupe: Some(key), .. } => {
+			seen_dedupe.insert(key.clone());
+		},
+		Plan::Reorder { indexes, before } => {
+			for index in indexes {
+				touched[*index] = true;
+			}
+			touched[*before] = true;
+		},
+		Plan::Insert { dedupe: None, .. } | Plan::Skip => {},
 	}
 }
 
@@ -351,6 +407,15 @@ fn apply_plan(slots: &mut Vec<Slot>, synthetic: &mut Vec<Item>, plan: Plan) {
 				}
 			}
 		},
+		Plan::DropParts { indexes } => {
+			for index in indexes {
+				let position = slots
+					.iter()
+					.position(|slot| matches!(slot, Slot::Keep(value) if *value == index))
+					.expect("drop-parts target survives validation");
+				slots[position] = Slot::DropParts(index);
+			}
+		},
 		Plan::Replace { indexes, item, at } => {
 			let positions: Vec<_> = slots
 				.iter()
@@ -369,10 +434,15 @@ fn apply_plan(slots: &mut Vec<Slot>, synthetic: &mut Vec<Item>, plan: Plan) {
 			synthetic.push(item);
 			slots.insert(position.min(slots.len()), Slot::Synth(synthetic_index));
 		},
-		Plan::Insert { index, after, item } => {
+		Plan::Insert { index, after, item, dedupe: _ } => {
 			let position = slots
 				.iter()
-				.position(|slot| matches!(slot, Slot::Keep(value) if *value == index))
+				.position(|slot| {
+					matches!(
+						slot,
+						Slot::Keep(value) | Slot::DropParts(value) if *value == index
+					)
+				})
 				.map_or(slots.len(), |position| position + usize::from(after));
 			let synthetic_index = synthetic.len();
 			synthetic.push(item);
@@ -409,6 +479,13 @@ fn message_kind(item: &Item) -> MessageKind {
 		None => MessageKind::Other,
 	}
 }
+fn clear_parts(item: &mut Item) {
+	match item.kind.as_mut() {
+		Some(thread::item::Kind::Message(message)) => message.parts.clear(),
+		Some(thread::item::Kind::ToolResult(result)) => result.parts.clear(),
+		Some(thread::item::Kind::ToolCall(_)) | None => {},
+	}
+}
 
 fn synthetic_item(text: Str, role: thread::Role) -> Item {
 	Item {
@@ -428,6 +505,10 @@ fn placeholder_item() -> Item {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeMap;
+
+	use omp_proto::inference::v1 as pb;
+
 	use super::*;
 
 	fn item(text: &str) -> Item {
@@ -441,56 +522,174 @@ mod tests {
 		};
 		(thread, view)
 	}
+	fn texts(thread: &Thread) -> Vec<&str> {
+		thread
+			.items
+			.iter()
+			.map(|item| match item.kind.as_ref().expect("item kind") {
+				thread::item::Kind::Message(message) => {
+					match message.parts[0].kind.as_ref().expect("part kind") {
+						thread::part::Kind::Text(text) => text.as_str(),
+						_ => "",
+					}
+				},
+				_ => "",
+			})
+			.collect()
+	}
 
 	#[test]
-	fn patch_validation_matrix() {
+	fn invalid_middle_operation_drops_independently() {
 		let (thread, view) = projected();
-		assert!(matches!(
-			apply_patches(thread.clone(), &view, &[PatchOp::Replace {
+		let outcome = apply_patches(thread, &view, &[
+			PatchOp::Prune {
+				ids:              ["10".into()].into_iter().collect(),
+				keep_placeholder: false,
+			},
+			PatchOp::Replace {
 				ids:  ["missing".into()].into_iter().collect(),
 				text: "x".into(),
 				role: thread::Role::User,
 				at:   InheritPosition::First,
-			}]),
-			Err(PatchRejected::Unknown(_))
-		));
+			},
+			PatchOp::Replace {
+				ids:  ["12".into()].into_iter().collect(),
+				text: "z".into(),
+				role: thread::Role::User,
+				at:   InheritPosition::First,
+			},
+		]);
+
+		assert_eq!(texts(&outcome.thread), ["b", "z"]);
+		assert_eq!(outcome.dropped.len(), 1);
+		assert_eq!(outcome.dropped[0].0, 1);
 		assert!(matches!(
-			apply_patches(thread, &view, &[
-				PatchOp::Prune {
-					ids:              ["10".into()].into_iter().collect(),
-					keep_placeholder: false,
-				},
-				PatchOp::Replace {
-					ids:  ["10".into()].into_iter().collect(),
-					text: "x".into(),
-					role: thread::Role::User,
-					at:   InheritPosition::First,
-				}
-			]),
-			Err(PatchRejected::Conflict(_))
+			&outcome.dropped[0].1,
+			PatchRejected::Unknown(id) if id.as_str() == "missing"
+		));
+	}
+
+	#[test]
+	fn rejected_operation_does_not_commit_touched_or_dedupe_claims() {
+		let (thread, view) = projected();
+		let touched = apply_patches(thread, &view, &[
+			PatchOp::Reorder { ids: ["10".into()].into_iter().collect(), before: "10".into() },
+			PatchOp::Prune {
+				ids:              ["10".into()].into_iter().collect(),
+				keep_placeholder: false,
+			},
+		]);
+		assert_eq!(texts(&touched.thread), ["b", "c"]);
+		assert!(matches!(touched.dropped.as_slice(), [(0, PatchRejected::ReorderAnchor)]));
+
+		let (thread, view) = projected();
+		let dedupe = apply_patches(thread, &view, &[
+			PatchOp::Insert {
+				text:   "invalid".into(),
+				anchor: Anchor::After("missing".into()),
+				role:   thread::Role::User,
+				dedupe: Some("same-key".into()),
+			},
+			PatchOp::Insert {
+				text:   "valid".into(),
+				anchor: Anchor::After("10".into()),
+				role:   thread::Role::User,
+				dedupe: Some("same-key".into()),
+			},
+		]);
+		assert_eq!(texts(&dedupe.thread), ["a", "valid", "b", "c"]);
+		assert_eq!(dedupe.dropped.len(), 1);
+		assert_eq!(dedupe.dropped[0].0, 0);
+		assert!(matches!(dedupe.dropped[0].1, PatchRejected::Unknown(_)));
+	}
+
+	#[test]
+	fn drop_parts_preserves_item_metadata() {
+		let details = pb::Value { kind: Some(pb::value::Kind::String("details".to_owned())) };
+		let props = pb::ValueMap {
+			fields: BTreeMap::from([("omp/tool-rev".to_owned(), pb::Value {
+				kind: Some(pb::value::Kind::String("read.1".to_owned())),
+			})]),
+		};
+		let provider_metadata = pb::ValueMap {
+			fields: BTreeMap::from([("provider/key".to_owned(), pb::Value {
+				kind: Some(pb::value::Kind::String("verbatim".to_owned())),
+			})]),
+		};
+		let tool_result = Item {
+			seq:           7,
+			created_at_ms: 99,
+			kind:          Some(thread::item::Kind::ToolResult(thread::ToolResult {
+				call_id: "call-1".to_owned(),
+				parts: vec![thread::Part {
+					kind: Some(thread::part::Kind::Text("large result".to_owned())),
+				}],
+				is_error: true,
+				name: "read".to_owned(),
+				details: Some(details),
+				pruned_at_ms: Some(42),
+				useless: Some(true),
+				provider_metadata: Some(provider_metadata),
+				..Default::default()
+			})),
+			props:         Some(props),
+		};
+		let message = Item {
+			seq:           8,
+			created_at_ms: 100,
+			kind:          Some(thread::item::Kind::Message(thread::Message {
+				role:  thread::Role::Assistant as i32,
+				parts: vec![thread::Part {
+					kind: Some(thread::part::Kind::Text("assistant text".to_owned())),
+				}],
+			})),
+			props:         None,
+		};
+		let thread = Thread { items: vec![tool_result, message] };
+		let view = match project_context(thread.clone(), &[10, 11], true) {
+			ContextProjection::View { view, .. } => view,
+			ContextProjection::Unchanged(_) => unreachable!(),
+		};
+		let mut expected = thread.clone();
+		clear_parts(&mut expected.items[0]);
+		clear_parts(&mut expected.items[1]);
+
+		let outcome = apply_patches(thread, &view, &[PatchOp::DropParts {
+			ids:    ["10".into(), "11".into()].into_iter().collect(),
+			reason: "projection budget".into(),
+		}]);
+
+		assert!(outcome.dropped.is_empty());
+		assert_eq!(outcome.thread, expected);
+	}
+
+	#[test]
+	fn pinned_drop_parts_is_rejected_without_mutation() {
+		let (thread, mut view) = projected();
+		view.refs[0].flags = RefFlags::PINNED;
+		let expected = thread.clone();
+
+		let outcome = apply_patches(thread, &view, &[PatchOp::DropParts {
+			ids:    ["10".into()].into_iter().collect(),
+			reason: "must survive".into(),
+		}]);
+
+		assert_eq!(outcome.thread, expected);
+		assert!(matches!(
+			outcome.dropped.as_slice(),
+			[(0, PatchRejected::Pinned(id))] if id.as_str() == "10"
 		));
 	}
 
 	#[test]
 	fn reorder_moves_named_items_once() {
 		let (thread, view) = projected();
-		let result = apply_patches(thread, &view, &[PatchOp::Reorder {
+		let outcome = apply_patches(thread, &view, &[PatchOp::Reorder {
 			ids:    ["12".into()].into_iter().collect(),
 			before: "10".into(),
-		}])
-		.unwrap();
-		let texts: Vec<_> = result
-			.items
-			.iter()
-			.map(|item| match item.kind.as_ref().unwrap() {
-				thread::item::Kind::Message(message) => match message.parts[0].kind.as_ref().unwrap() {
-					thread::part::Kind::Text(text) => text.as_str(),
-					_ => "",
-				},
-				_ => "",
-			})
-			.collect();
-		assert_eq!(texts, ["c", "a", "b"]);
+		}]);
+		assert!(outcome.dropped.is_empty());
+		assert_eq!(texts(&outcome.thread), ["c", "a", "b"]);
 	}
 
 	#[test]

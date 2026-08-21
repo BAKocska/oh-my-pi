@@ -44,7 +44,7 @@ This is a mechanical conformance probe, not a port; there is no pi origin. It in
 | `omp.telemetry.QUERY_LIMIT_MAX` | 10,000 | 10,000 | host-only | — | — | — | — |
 | `omp.telemetry.METRIC_PREFIX` | `omp.ext.` | `omp.ext.` | descriptive | — | — | — | — |
 | `omp.telemetry.MAX_INSTRUMENTS` | 256 | 256 | yes | yes, instrument 257 | yes, `SubscriptionError` | yes | yes |
-| `omp.telemetry.MAX_CARDINALITY` | 1,024 | 1,024 | yes | folds into `overflow="true"` | no refusal | one cardinality warning | no 1,025th series |
+| `omp.telemetry.MAX_CARDINALITY` | 1,024 | 1,024 | yes | folds into `overflow="true"` | no refusal | one local and one host cardinality warning | no 1,025th series |
 | `omp.telemetry.DEFAULT_MAX_BYTES` | 51,200 | 51,200 | descriptive | — | — | — | — |
 | `omp.telemetry.DEFAULT_MAX_LINES` | 3,000 | 3,000 | descriptive | — | — | — | — |
 | `omp.telemetry.DEFAULT_MAX_COLUMN` | 512 | 512 | descriptive | — | — | — | — |
@@ -69,7 +69,7 @@ This is a mechanical conformance probe, not a port; there is no pi origin. It in
 
 1. **Closed — TML byte and depth ceilings.** The former constructor gap was fixed in `crates/py/python/omp/ui/__init__.py:115-153`: UTF-8 byte length is checked before parsing, and nesting is checked while scanning opening tags. Re-observation accepts exactly 262,144 bytes and 64 levels, then raises a limit-naming `TmlError` for one byte or level over.
 2. **Closed — rendered-result telemetry constants.** The missing `DEFAULT_MAX_BYTES`, `DEFAULT_MAX_LINES`, `DEFAULT_MAX_COLUMN`, `SPILL_BYTES`, `SPILL_LINES`, and `SPILL_COLUMN` exports now live at `crates/py/python/omp/telemetry.py:31-42`. Re-observation reads 51,200 bytes, 3,000 lines, and 512 UTF-16 columns from both constant families.
-3. **Closed — metric quota values and enforcement.** The binding 2026-08-20 ruling is recorded at `docs/py/10-telemetry.md:1112-1125`. Its constants are frozen at `crates/py/python/omp/telemetry.py:27-30`; instrument creation refuses instrument 257 with `SubscriptionError` before registry mutation at `:387-391` and `:421-425`, while `_bounded_attrs` at `:276-301` retains exactly 1,024 series and folds later series into `overflow="true"`. The smoke re-observes both boundaries and the single warning.
+3. **Closed — metric quota values, enforcement, and host visibility.** The binding 2026-08-20 ruling is recorded at `docs/py/10-telemetry.md:1112-1125`. Its constants are frozen in `crates/py/python/omp/telemetry.py`; instrument creation refuses instrument 257 with `SubscriptionError` before registry mutation, while `_bounded_attrs` retains exactly 1,024 series and folds later series into `overflow="true"`. On the first overflow per instrument it now publishes one fail-open `host_warning` effect carrying `code="cardinality"` and the fully qualified instrument name, while preserving the one local `RuntimeWarning`; later overflowing series emit neither warning again. The smoke re-observes both boundaries, the unchanged fold, and the once-only warning behavior with and without an effect sink.
 4. **Closed — frame ceiling.** `omp.MAX_FRAME_BYTES` now exports 67,108,864 from `crates/py/python/omp/limits.py:24-25`; `crates/py/python/omp/_host.py:102-109` applies the same value before decode and before send. The frozen value now equals the documented transport ceiling.
 5. **Closed — aggregate device-doc budget.** `omp.DOCS_TOTAL_BUDGET` and `omp.limits.DOCS_TOTAL_BUDGET` now export 48,000 from `crates/py/python/omp/limits.py:18-19`, matching the corrected public names in `docs/py/01-devices.md:1070-1072`.
 6. **Closed — pending-effects ceiling surface.** `omp.MAX_PENDING_EFFECTS` now exports 1,024 from `crates/py/python/omp/limits.py:30-31`, and the frozen transport imports that single value at `crates/py/python/omp/_host.py:23-25`. Effect-mailbox drop-oldest behavior remains Core-owned and is therefore not reachable in this no-I/O probe.
@@ -77,7 +77,6 @@ This is a mechanical conformance probe, not a port; there is no pi origin. It in
 ## Still-open observations
 
 - Closed during remediation: `omp.telemetry.QUEUE_MAX = 65_536` and `omp.telemetry.QUERY_LIMIT_MAX = 10_000` are now exported and wired into queue and query validation (`crates/py/python/omp/telemetry.py`), replacing the former anonymous literals.
-- Cardinality overflow emits one Python `RuntimeWarning` per instrument (`crates/py/python/omp/telemetry.py:289-299`); the ruled `HostWarning(code="cardinality")` is the host-sink spelling and remains a sanctioned NotWired host arm — the frozen layer's folding and once-per-instrument properties conform.
 
 ## Stub smoke
 
@@ -87,4 +86,4 @@ Run from the repository root after installing the gate's native stubs:
 python3 -c 'import importlib.util, pathlib, sys; p=pathlib.Path("scripts/check-python-examples.py"); s=importlib.util.spec_from_file_location("gate", p); m=importlib.util.module_from_spec(s); sys.modules["gate"]=m; s.loader.exec_module(m); m._install_native_stubs(); sys.path[:0]=["crates/py/python", "examples/limits-probe"]; import limits_probe; limits_probe.smoke()'
 ```
 
-The smoke asserts the ruled TML and telemetry quota contracts directly: over-limit TML is rejected, instrument 257 is refused without mutation, and series 1,025 is folded into `overflow="true"`.
+The smoke asserts the ruled TML and telemetry quota contracts directly: over-limit TML is rejected, instrument 257 is refused without mutation, and series 1,025 is folded into `overflow="true"`. A dedicated remediation stub also verified that the first overflow publishes one `host_warning` effect with `code="cardinality"` and the prefixed instrument name, later overflow emits no duplicate, and detaching the effect sink still leaves one local `RuntimeWarning` without breaking metric recording.
