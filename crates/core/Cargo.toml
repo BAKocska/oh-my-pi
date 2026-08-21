@@ -12,6 +12,7 @@ description = "Core data structures, compact strings and bytes, sparse collectio
 workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 bytes = { workspace = true }
 bytes-utils = { workspace = true }
 heapless = { workspace = true }

@@ -25,7 +25,7 @@ async-trait = "0.1"
 bigdecimal = "0.4"
 binary-heap-plus = "0.5"
 base64 = "0.22"
-blake3 = "1.8"
+blake3 = { version = "1.8", features = ["mmap"] }
 block2 = "0.6.2"
 bon = "3"
 bstr = "1"
@@ -440,6 +440,11 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# build_id hashes the entire executable at startup; unoptimized blake3
+# kernels turn that into tens of seconds on a debug binary.
+[profile.dev.package.blake3]
+opt-level = 3
 
 [profile.release]
 opt-level = 2

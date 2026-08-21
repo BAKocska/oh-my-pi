@@ -592,6 +592,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "memmap2",
 ]
 
 [[package]]
@@ -5208,7 +5209,6 @@ dependencies = [
 name = "omp-agent"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "flume",
  "futures",
@@ -5423,6 +5423,7 @@ dependencies = [
 name = "omp-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "bytes-utils",
  "heapless 0.9.3",
@@ -5443,7 +5444,6 @@ name = "omp-docserver"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "blake3",
  "bytes",
  "cap-std",
  "filetime",
@@ -5521,7 +5521,6 @@ dependencies = [
 name = "omp-env"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "flume",
  "omp-ar",
@@ -5586,7 +5585,6 @@ dependencies = [
 name = "omp-hashline"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "im",
  "omp-ast",
@@ -5691,7 +5689,9 @@ name = "omp-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "omp-core",
  "prost",
+ "prost-types",
  "protox",
  "serde",
  "serde_json",
@@ -5891,7 +5891,6 @@ dependencies = [
 name = "omp-storage"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "cap-std",
  "chrono",
@@ -5917,7 +5916,6 @@ dependencies = [
 name = "omp-telemetry"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "flume",
  "omp-core",
  "omp-proto",
@@ -5942,7 +5940,6 @@ name = "omp-tool"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "blake3",
  "bytes",
  "flume",
  "futures",
