@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
 
-use omp_core::{Duration, Str, sf};
+use omp_core::{Duration, Hash32, Str, sf};
 use omp_proto::{
 	prost::Message as _,
 	toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint},
@@ -419,10 +419,10 @@ fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 }
 
 fn worker_projection_code(declaration: &ToolDecl) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(b"omp/frozen-worker-registration/v1");
 	hasher.update(&declaration.encode_to_vec());
-	*hasher.finalize().as_bytes()
+	hasher.finalize().into_bytes()
 }
 
 fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {

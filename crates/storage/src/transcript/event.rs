@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use omp_core::{Principal, Provenance, Str};
+use omp_core::{Hash32, Principal, Provenance, Str};
 use omp_proto::thread::v1::Item;
 use serde_json::{
 	Value,
@@ -28,7 +28,7 @@ pub struct TurnInputItem {
 	/// Canonical input item.
 	pub item:        Item,
 	/// Deterministic prompt identity active when the input was staged.
-	pub prompt_hash: Option<[u8; 32]>,
+	pub prompt_hash: Option<Hash32>,
 }
 
 impl Eq for TurnInputItem {}
@@ -41,7 +41,7 @@ pub struct ItemRecord {
 	/// Turn that committed the item, absent for optimistic local input.
 	pub turn_id:     Option<Str>,
 	/// Deterministic system-prompt hash active when the item was recorded.
-	pub prompt_hash: Option<[u8; 32]>,
+	pub prompt_hash: Option<Hash32>,
 }
 
 impl Eq for ItemRecord {}
@@ -53,7 +53,7 @@ pub struct TurnReceipt {
 	/// Gateway turn identifier.
 	pub turn_id:            Str,
 	/// Deterministic prompt identity fixed before the turn opened.
-	pub prompt_hash:        [u8; 32],
+	pub prompt_hash:        Hash32,
 	/// Ordered physical item events comprising the canonical system head.
 	pub prompt_head_events: Vec<u64>,
 	/// Physical event indexes of canonical items emitted by the outcome.
@@ -106,11 +106,11 @@ pub struct TurnStart {
 	/// Ordered physical item events claimed as this submission's input.
 	pub item_events:        Vec<u64>,
 	/// Deterministic prompt identity used to construct the submission.
-	pub prompt_hash:        [u8; 32],
+	pub prompt_hash:        Hash32,
 	/// Ordered physical item events comprising the canonical system head.
 	pub prompt_head_events: Vec<u64>,
 	/// Deterministic identity of the exact live tool registry used by the turn.
-	pub toolset_hash:       [u8; 32],
+	pub toolset_hash:       Hash32,
 	/// Stable ordered allowlist fixed for this exact submission.
 	pub enabled_tools:      Vec<Str>,
 	/// Ordered item events whose optimistic sequences require outcome patching.
@@ -133,7 +133,7 @@ pub struct TurnAbort {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PromptRewriteIntent {
 	/// Deterministic identity of the replacement prompt.
-	pub prompt_hash:    [u8; 32],
+	pub prompt_hash:    Hash32,
 	/// Canonical replacement head items, retained for crash recovery.
 	pub head:           Vec<Item>,
 	/// Ordered live item-event indexes retained after the new head.

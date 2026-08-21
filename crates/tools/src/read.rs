@@ -401,7 +401,8 @@ pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolv
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("read.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

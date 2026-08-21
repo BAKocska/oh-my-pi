@@ -10,7 +10,6 @@ description = "Local document authority for filesystem, revision, transaction, w
 
 [dependencies]
 async-trait = { workspace = true }
-blake3 = { workspace = true }
 bytes = { workspace = true }
 cap-std = { workspace = true }
 filetime = { workspace = true }

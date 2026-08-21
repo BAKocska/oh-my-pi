@@ -21,7 +21,7 @@ use omp_chat_ui::{
 	SessionRow, StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
 	host::{HostExit, HostOptions},
 };
-use omp_core::{Str, encoding::hex, sf};
+use omp_core::{Hash32, Str, encoding::hex, sf};
 use omp_llm_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, provider::AuthSpecKind,
 	snapshot::Catalog,
@@ -1419,7 +1419,7 @@ fn lower_attachments(
 					continue;
 				};
 				let size = bytes.len() as u64;
-				let hash = Bytes::copy_from_slice(blake3::hash(&bytes).as_bytes());
+				let hash = Bytes::copy_from_slice(Hash32::sum(&bytes).as_bytes());
 				let blob = Blob {
 					hash,
 					mime: mime.to_owned(),
@@ -2033,27 +2033,27 @@ mod tests {
 
 	fn test_bridge_state() -> BridgeState {
 		BridgeState {
-			model: "test/model".to_owned(),
-			context_window: None,
-			context_tokens: 0,
-			cost_nanos: 0,
-			queued: 0,
-			jobs: HashSet::new(),
-			attempt: 0,
-			turn_started: None,
-			submit_pending: false,
-			pending_prompt: None,
-			part_serial: 0,
-			active_parts: HashMap::new(),
-			streaming_tools: HashMap::new(),
-			tools: HashMap::new(),
-			rewind_targets: Vec::new(),
+			model:             "test/model".to_owned(),
+			context_window:    None,
+			context_tokens:    0,
+			cost_nanos:        0,
+			queued:            0,
+			jobs:              HashSet::new(),
+			attempt:           0,
+			turn_started:      None,
+			submit_pending:    false,
+			pending_prompt:    None,
+			part_serial:       0,
+			active_parts:      HashMap::new(),
+			streaming_tools:   HashMap::new(),
+			tools:             HashMap::new(),
+			rewind_targets:    Vec::new(),
 			pending_auth_kind: None,
-			live_enabled: false,
-			live_activity: ActivityWaveform::new(),
-			replaying_turn: false,
-			settings: Settings::default(),
-			commands: CommandRoster::new(Vec::new()),
+			live_enabled:      false,
+			live_activity:     ActivityWaveform::new(),
+			replaying_turn:    false,
+			settings:          Settings::default(),
+			commands:          CommandRoster::new(Vec::new()),
 		}
 	}
 
@@ -2234,7 +2234,7 @@ mod tests {
 		};
 		assert_eq!(blob.mime, "image/png");
 		assert_eq!(blob.inline.as_ref(), bytes);
-		assert_eq!(blob.hash.as_ref(), blake3::hash(bytes).as_bytes());
+		assert_eq!(blob.hash.as_ref(), Hash32::sum(bytes).as_bytes());
 		assert_eq!(chips.len(), 1);
 	}
 

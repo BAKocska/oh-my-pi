@@ -9,7 +9,7 @@ use omp_agent::{
 	EntryKindDecl, EntryKindError, Journal, JournalAuthor, JournalError, JournalGenerations,
 	JournalRequestStamp, PendingCustomEntry, SessionStateWatchEvent, SessionStateWatchTerminal,
 };
-use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str, sf};
+use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, sf};
 use omp_storage::{
 	state::{DurableRequest, GenerationFence, StateAuthority, StateRevision},
 	transcript::{
@@ -312,9 +312,9 @@ fn pending_turn_target_and_generation_guards_run_before_staging() {
 		.start_turn(3, TurnStart {
 			turn_id:            sf!("turn"),
 			item_events:        Vec::new(),
-			prompt_hash:        [0; 32],
+			prompt_hash:        Hash32::new([0; 32]),
 			prompt_head_events: Vec::new(),
-			toolset_hash:       [0; 32],
+			toolset_hash:       Hash32::new([0; 32]),
 			enabled_tools:      Vec::new(),
 			sequence_targets:   Vec::new(),
 			input:              TurnInputRecord::Full { thread: Default::default() },

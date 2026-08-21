@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use omp_proto::env::v1 as pb;
 use omp_storage::blob::{BlobRef, BlobStore};
 use serde::{Deserialize, Serialize};
@@ -212,7 +212,9 @@ impl SiteMaterializer {
 	}
 
 	fn source_ref(&self, hash: &[u8]) -> Result<BlobRef, SiteError> {
-		let hash: [u8; 32] = hash.try_into().map_err(|_| SiteError::InvalidBlobHash)?;
+		let hash = <[u8; 32]>::try_from(hash)
+			.map(Hash32::new)
+			.map_err(|_| SiteError::InvalidBlobHash)?;
 		let probe = BlobRef { hash, size: 0 };
 		let size = fs::metadata(self.source.path(&probe))?.len();
 		Ok(BlobRef { hash, size })
@@ -311,7 +313,7 @@ pub(crate) fn record_modules(files: &[pb::SiteFile]) -> Vec<Str> {
 }
 
 fn manifest_hash(site_key: &str, files: &BTreeMap<Str, pb::SiteFile>) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(b"omp/site-manifest/v1");
 	hasher.update(&(site_key.len() as u64).to_le_bytes());
 	hasher.update(site_key.as_bytes());
@@ -321,7 +323,7 @@ fn manifest_hash(site_key: &str, files: &BTreeMap<Str, pb::SiteFile>) -> [u8; 32
 		hasher.update(&file.blob_hash);
 		hasher.update(&file.mode.to_le_bytes());
 	}
-	*hasher.finalize().as_bytes()
+	hasher.finalize().into_bytes()
 }
 
 fn current_manifest_matches(current: &Path, manifest_hash: &[u8; 32]) -> Result<bool, SiteError> {
@@ -457,12 +459,12 @@ mod tests {
 			files: vec![
 				omp_proto::env::v1::SiteFile {
 					path:      "reviewer/__init__.py".to_owned(),
-					blob_hash: Bytes::copy_from_slice(&module.hash),
+					blob_hash: Bytes::copy_from_slice(module.hash.as_bytes()),
 					mode:      0,
 				},
 				omp_proto::env::v1::SiteFile {
 					path:      "reviewer-1.0.dist-info/RECORD".to_owned(),
-					blob_hash: Bytes::copy_from_slice(&record.hash),
+					blob_hash: Bytes::copy_from_slice(record.hash.as_bytes()),
 					mode:      0,
 				},
 			],

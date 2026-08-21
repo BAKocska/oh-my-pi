@@ -12,9 +12,9 @@ use std::{
 };
 use std::{path::PathBuf, time::Duration};
 
-use omp_core::Str;
 #[cfg(unix)]
-use omp_core::hex;
+use omp_core::Hash32;
+use omp_core::Str;
 #[cfg(unix)]
 use rustix::fs::{FlockOperation, flock};
 #[cfg(unix)]
@@ -277,8 +277,7 @@ struct InstanceLock {
 impl InstanceLock {
 	fn acquire(kind: &'static str, identity: &Path) -> Result<Self> {
 		let directory = lock_directory()?;
-		let digest = blake3::hash(identity.as_os_str().as_encoded_bytes());
-		let encoded = hex::encode_n(digest.as_bytes());
+		let encoded = Hash32::sum(identity.as_os_str().as_encoded_bytes()).to_hex();
 		let path = directory.join(format!("{kind}-{encoded}.lock"));
 		let file = OpenOptions::new()
 			.read(true)

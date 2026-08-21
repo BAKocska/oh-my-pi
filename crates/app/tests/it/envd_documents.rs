@@ -8,7 +8,7 @@ use omp_app::envd::{
 	docs::DocumentHost,
 	workspace::{WorkspaceError, WorkspaceHost},
 };
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_docserver::{
 	Environment, ServerConfig,
 	connection::{ConnectionConfig, PROTOCOL_MAJOR, PROTOCOL_MINOR, serve_connection},
@@ -286,7 +286,7 @@ fn blob_host_puts_stats_ranges_and_deletes_real_storage_content() {
 	let host = BlobHost::open(state.path()).expect("blob storage authority");
 	let content = b"binary\0blob\xffpayload";
 	let id = host.put(content).expect("blob put");
-	assert_eq!(id.hash, *blake3::hash(content).as_bytes());
+	assert_eq!(id.hash, Hash32::sum(content).into_bytes());
 	assert_eq!(id.size, content.len() as u64);
 
 	let stat = host.stat(&id.hash).expect("blob stat");

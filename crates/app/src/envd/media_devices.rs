@@ -123,7 +123,8 @@ fn media_device(name: &'static str, description: &'static str, kind: MediaKind) 
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("media_devices.rs"),
-			),
+			)
+			.into_bytes(),
 		},
 		kind,
 	}
@@ -251,7 +252,8 @@ pub fn report_issue(store: Arc<TelemetryIndex>) -> ReportIssue {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("media_devices.rs"),
-			),
+			)
+			.into_bytes(),
 		},
 		store,
 	}

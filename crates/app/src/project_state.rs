@@ -5,7 +5,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use omp_core::encoding::hex;
+use omp_core::{Hash32, encoding::hex};
 
 /// Resolves the durable state directory for a project beneath the application
 /// data directory.
@@ -14,7 +14,7 @@ use omp_core::encoding::hex;
 /// state identity.
 pub fn directory(data_dir: &Path, project_root: &Path) -> io::Result<PathBuf> {
 	let root = std::fs::canonicalize(project_root)?;
-	let digest = blake3::hash(root.as_os_str().as_encoded_bytes());
+	let digest = Hash32::sum(root.as_os_str().as_encoded_bytes());
 	Ok(data_dir
 		.join("projects")
 		.join(hex::encode_n(digest.as_bytes()).as_str()))
@@ -66,7 +66,7 @@ pub fn document_socket(state_dir: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn socket_path(state_dir: &Path, kind: &str) -> PathBuf {
-	let digest = blake3::hash(state_dir.as_os_str().as_encoded_bytes());
+	let digest = Hash32::sum(state_dir.as_os_str().as_encoded_bytes());
 	let short: [u8; 16] = digest.as_bytes()[..16]
 		.try_into()
 		.expect("a Blake3 digest contains 16 prefix bytes");
@@ -81,7 +81,7 @@ fn socket_path(state_dir: &Path, kind: &str) -> PathBuf {
 fn windows_pipe_path(state_dir: &Path, kind: &str) -> PathBuf {
 	let owner = omp_env::windows::current_user_pipe_scope()
 		.expect("the process has an authenticated Windows user SID");
-	let mut digest = blake3::Hasher::new();
+	let mut digest = Hash32::hasher();
 	digest.update(b"omp/project-owner-pipe/v1");
 	digest.update(&(owner.len() as u64).to_le_bytes());
 	digest.update(owner.as_bytes());

@@ -260,7 +260,8 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W,
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("glob.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

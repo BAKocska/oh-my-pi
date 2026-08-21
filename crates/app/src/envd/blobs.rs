@@ -3,7 +3,7 @@
 use std::{io, path::Path};
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_proto::{blob::v1 as blob_pb, thread::v1 as thread_pb};
 use omp_storage::blob::{BlobRef, BlobStage, BlobStore};
 use thiserror::Error;
@@ -19,13 +19,13 @@ pub struct BlobId {
 
 impl From<BlobRef> for BlobId {
 	fn from(reference: BlobRef) -> Self {
-		Self { hash: reference.hash, size: reference.size }
+		Self { hash: reference.hash.into_bytes(), size: reference.size }
 	}
 }
 
 impl From<BlobId> for BlobRef {
 	fn from(id: BlobId) -> Self {
-		Self { hash: id.hash, size: id.size }
+		Self { hash: Hash32::new(id.hash), size: id.size }
 	}
 }
 
@@ -122,7 +122,7 @@ impl BlobHost {
 		{
 			return Err(BlobError::SizeMismatch { expected, actual: actual_size });
 		}
-		if expected_hash.is_some_and(|expected| expected != *blake3::hash(data).as_bytes()) {
+		if expected_hash.is_some_and(|expected| expected != Hash32::sum(data).into_bytes()) {
 			return Err(BlobError::HashMismatch);
 		}
 		self.put(data)
@@ -137,7 +137,7 @@ impl BlobHost {
 	/// Returns presence and size for a raw BLAKE3 digest.
 	pub fn stat(&self, hash: &[u8]) -> Result<blob_pb::StatResponse, BlobError> {
 		let hash = parse_hash(hash)?;
-		let probe = BlobRef { hash, size: 0 };
+		let probe = BlobRef { hash: Hash32::new(hash), size: 0 };
 		match std::fs::metadata(self.store.path(&probe)) {
 			Ok(metadata) if metadata.is_file() => {
 				Ok(blob_pb::StatResponse { present: true, size: metadata.len() })
@@ -185,7 +185,7 @@ impl BlobHost {
 	/// Removes a raw digest and reports whether content existed.
 	pub fn delete(&self, hash: &[u8]) -> Result<blob_pb::DeleteResponse, BlobError> {
 		let hash = parse_hash(hash)?;
-		let probe = BlobRef { hash, size: 0 };
+		let probe = BlobRef { hash: Hash32::new(hash), size: 0 };
 		match std::fs::remove_file(self.store.path(&probe)) {
 			Ok(()) => Ok(blob_pb::DeleteResponse { deleted: true }),
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -238,7 +238,7 @@ impl omp_tool::CallOutcomeSpill for BlobHost {
 }
 
 fn call_outcome_reference(reference: BlobRef) -> omp_tool::BlobRef {
-	let hash = hex::encode_n(&reference.hash);
+	let hash = reference.hash.to_hex();
 	omp_tool::BlobRef {
 		hash:       Str::from(hash.as_str()),
 		media_type: sf!("application/json"),
@@ -258,7 +258,7 @@ mod tests {
 		path::{Path, PathBuf},
 	};
 
-	use omp_core::encoding::hex;
+	use omp_core::{Hash32, encoding::hex};
 	use omp_tool::{CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError, call_outcome_details};
 	use tempfile::TempDir;
 
@@ -300,7 +300,7 @@ mod tests {
 			"payload beyond the inline limit",
 		));
 		let expected = serde_json::to_vec(&outcome).expect("serialize expected outcome");
-		let expected_hash = *blake3::hash(&expected).as_bytes();
+		let expected_hash = Hash32::sum(&expected);
 
 		let details = call_outcome_details(&outcome, 1, &host)
 			.await
@@ -312,10 +312,10 @@ mod tests {
 		assert_eq!(byte_len, expected.len() as u64);
 		assert_eq!(blob.byte_len, expected.len() as u64);
 		assert_eq!(blob.media_type.as_str(), "application/json");
-		assert_eq!(blob.hash.as_str(), hex::encode_n(&expected_hash).as_str());
+		assert_eq!(blob.hash.as_str(), expected_hash.to_hex().as_str());
 		assert_eq!(
 			host
-				.get(BlobId { hash: expected_hash, size: expected.len() as u64 })
+				.get(BlobId { hash: expected_hash.into(), size: expected.len() as u64 })
 				.expect("read spilled outcome")
 				.as_ref(),
 			expected.as_slice()

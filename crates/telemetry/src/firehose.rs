@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use flume::{Receiver, Sender, TryRecvError, TrySendError};
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 /// Existing tool-layer vocabularies consumed verbatim by firehose payloads.
 pub use omp_tool::{ArgIssueKind, ArtifactLifetime, PolicyDenied};
 use parking_lot::RwLock;
@@ -176,10 +176,10 @@ impl PromptFingerprint {
 	) -> Self {
 		let mut slot_digests = SmallVec::<PromptSlotDigest, 8>::new();
 		for (key, value) in slots {
-			let digest = truncate_digest(blake3::hash(&value));
+			let digest = truncate_digest(Hash32::sum(&value));
 			slot_digests.push(PromptSlotDigest { key, digest });
 		}
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp.telemetry.prompt/v1\0");
 		for slot in &slot_digests {
 			hasher.update(&slot.digest);
@@ -210,7 +210,7 @@ impl PromptFingerprint {
 	}
 }
 
-fn truncate_digest(hash: blake3::Hash) -> [u8; 16] {
+fn truncate_digest(hash: Hash32) -> [u8; 16] {
 	let mut digest = [0; 16];
 	digest.copy_from_slice(&hash.as_bytes()[..16]);
 	digest

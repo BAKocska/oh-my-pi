@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::{
 	blob::BlobRef,
@@ -36,7 +36,7 @@ fn raw(value: &str) -> Box<RawValue> {
 }
 
 const fn blob(byte: u8, size: u64) -> BlobRef {
-	BlobRef { hash: [byte; 32], size }
+	BlobRef { hash: Hash32::new([byte; 32]), size }
 }
 
 fn principal() -> Principal {
@@ -234,7 +234,7 @@ fn every_kind() -> Vec<Event> {
 					props:         None,
 				},
 				turn_id:     Some(text("turn-1")),
-				prompt_hash: Some([4; 32]),
+				prompt_hash: Some(Hash32::new([4; 32])),
 			}),
 		},
 		Event { ts: 19, kind: Kind::Amend { target: 17, patch: AmendPatch::Seq { seq: 7 } } },
@@ -243,9 +243,9 @@ fn every_kind() -> Vec<Event> {
 			kind: Kind::TurnStart(TurnStart {
 				turn_id:            text("turn-1"),
 				item_events:        vec![17],
-				prompt_hash:        [4; 32],
+				prompt_hash:        Hash32::new([4; 32]),
 				prompt_head_events: vec![17],
-				toolset_hash:       [5; 32],
+				toolset_hash:       Hash32::new([5; 32]),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![17],
 				input:              TurnInputRecord::Delta {
@@ -267,7 +267,7 @@ fn every_kind() -> Vec<Event> {
 			ts:   21,
 			kind: Kind::TurnReceipt(TurnReceipt {
 				turn_id:            text("turn-1"),
-				prompt_hash:        [4; 32],
+				prompt_hash:        Hash32::new([4; 32]),
 				prompt_head_events: vec![17],
 				item_events:        vec![17],
 				outcome:            pb::Outcome {
@@ -305,7 +305,7 @@ fn every_kind() -> Vec<Event> {
 					})),
 					props:         None,
 				},
-				prompt_hash: Some([4; 32]),
+				prompt_hash: Some(Hash32::new([4; 32])),
 			}),
 		},
 		Event {
@@ -506,6 +506,24 @@ fn custom_data_is_canonical_and_stable() {
 	let mut second = Vec::new();
 	write_line(&decoded, &mut second).expect("custom event rewrites");
 	assert_eq!(second, first);
+}
+
+#[test]
+fn transcript_hashes_are_lowercase_hex_strings() {
+	let event = Event {
+		ts:   1,
+		kind: Kind::PromptRewriteIntent(PromptRewriteIntent {
+			prompt_hash:    Hash32::new([7; 32]),
+			head:           Vec::new(),
+			preserved_tail: Vec::new(),
+		}),
+	};
+	let mut encoded = Vec::new();
+	write_line(&event, &mut encoded).expect("prompt rewrite writes");
+	assert_eq!(
+		encoded,
+		br#"{"ts":1,"k":"prompt_rewrite_intent","prompt_hash":"0707070707070707070707070707070707070707070707070707070707070707","head":[],"preserved_tail":[]}"#
+	);
 }
 
 #[test]
@@ -743,7 +761,7 @@ fn reusable_live_set_matches_live_vectors_for_navigation_and_rewrite() {
 		.append(&Event {
 			ts:   6,
 			kind: Kind::PromptRewriteIntent(PromptRewriteIntent {
-				prompt_hash:    [7; 32],
+				prompt_hash:    Hash32::new([7; 32]),
 				head:           vec![replacement.clone()],
 				preserved_tail: vec![3],
 			}),

@@ -143,7 +143,8 @@ fn spec(name: &'static str, description: &'static str, schema: bytes::Bytes) -> 
 			env!("CARGO_PKG_NAME"),
 			env!("CARGO_PKG_VERSION"),
 			include_bytes!("checkpoint.rs"),
-		),
+		)
+		.into(),
 	}
 }
 

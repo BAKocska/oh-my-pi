@@ -11,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use cap_std::{ambient_authority, fs::Dir};
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -102,7 +102,7 @@ impl Revision {
 	/// sequence.
 	#[must_use]
 	pub fn for_content(sequence: u64, content: &[u8]) -> Self {
-		Self { sequence, content_hash: *blake3::hash(content).as_bytes() }
+		Self { sequence, content_hash: Hash32::sum(content).into_bytes() }
 	}
 
 	/// Reconstructs a revision from a sequence and an already computed BLAKE3
@@ -127,7 +127,7 @@ impl Revision {
 	/// Reports whether this revision identifies the supplied exact bytes.
 	#[must_use]
 	pub fn matches(self, content: &[u8]) -> bool {
-		self.content_hash == *blake3::hash(content).as_bytes()
+		self.content_hash == Hash32::sum(content).into_bytes()
 	}
 }
 
@@ -355,7 +355,7 @@ impl FileFingerprint {
 	/// Hashes the exact bytes read under `metadata`.
 	#[must_use]
 	pub fn for_content(metadata: FileMetadata, content: &[u8]) -> Self {
-		Self { metadata, content_hash: *blake3::hash(content).as_bytes() }
+		Self { metadata, content_hash: Hash32::sum(content).into_bytes() }
 	}
 
 	/// Returns the captured filesystem metadata.
@@ -373,7 +373,7 @@ impl FileFingerprint {
 	/// Reports whether both metadata and exact bytes still match.
 	#[must_use]
 	pub fn matches(&self, metadata: &FileMetadata, content: &[u8]) -> bool {
-		self.metadata == *metadata && self.content_hash == *blake3::hash(content).as_bytes()
+		self.metadata == *metadata && self.content_hash == Hash32::sum(content).into_bytes()
 	}
 }
 

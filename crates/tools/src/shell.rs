@@ -390,7 +390,8 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("shell.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

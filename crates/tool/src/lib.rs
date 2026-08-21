@@ -19,7 +19,7 @@ pub use incoming::{
 	CommitError, FinalizedArgs, IncomingCursor, IncomingParams, Interrupt, InterruptWaitError,
 	InterruptibleParams, InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
 };
-use omp_core::{InvocationPhase, SparseMap, Str};
+use omp_core::{Hash32, InvocationPhase, SparseMap, Str};
 pub use omp_proto::inference::v1::Fallback;
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
@@ -548,13 +548,13 @@ pub fn native_projection_code(
 	crate_name: &str,
 	crate_version: &str,
 	module_source: &[u8],
-) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+) -> Hash32 {
+	let mut hasher = Hash32::hasher();
 	for field in [crate_name.as_bytes(), crate_version.as_bytes(), module_source] {
 		hasher.update(&(field.len() as u64).to_le_bytes());
 		hasher.update(field);
 	}
-	*hasher.finalize().as_bytes()
+	hasher.finalize()
 }
 
 impl ToolSpec {

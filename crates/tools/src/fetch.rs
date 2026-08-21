@@ -95,7 +95,8 @@ pub fn tool<C: web::types::HttpClient + Send + Sync + 'static>(client: C) -> Fet
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("fetch.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

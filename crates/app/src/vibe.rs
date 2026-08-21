@@ -206,7 +206,8 @@ pub fn tool() -> Vibe {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("vibe.rs"),
-			),
+			)
+			.into_bytes(),
 		},
 	}
 }

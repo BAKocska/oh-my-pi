@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex, sf};
+use omp_core::{Hash32, Str, encoding::hex, sf};
 use omp_hashline::{
 	Clipboard, MismatchDetails, MismatchError, RevisionToken, compute_snapshot_tag,
 };
@@ -1060,7 +1060,7 @@ fn transaction_id(server_epoch: &[u8]) -> Bytes {
 		.duration_since(UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_nanos();
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(server_epoch);
 	hasher.update(&std::process::id().to_le_bytes());
 	hasher.update(&sequence.to_le_bytes());
@@ -1265,7 +1265,7 @@ impl WriteDocuments for DocumentHost {
 			let resolved_path = Str::from(resolved.path.to_string_lossy().into_owned());
 			let made_executable =
 				mark_executable_for_shebang(&resolved.path, request.content.as_bytes());
-			let revision = RevisionToken::new(blake3::hash(&content).as_bytes());
+			let revision = RevisionToken::new(Hash32::sum(&content).as_bytes());
 			let snapshot_tag =
 				record_write_snapshot(self, resolved_path.clone(), revision, content.clone());
 			return Ok(PlainWriteResult {
@@ -2512,7 +2512,7 @@ fn write_archive_member_blocking(
 		snapshots.invalidate(&canonical_key);
 		snapshots.invalidate(&member_key);
 		if content.len() <= SNAPSHOT_MAX_BYTES {
-			let revision = RevisionToken::new(blake3::hash(&content).as_bytes());
+			let revision = RevisionToken::new(Hash32::sum(&content).as_bytes());
 			snapshots
 				.record(member_key, revision, content.clone(), std::iter::empty())
 				.ok()

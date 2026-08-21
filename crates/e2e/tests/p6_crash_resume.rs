@@ -478,7 +478,7 @@ async fn resume_rejects_changed_toolset_before_opening_any_authority() {
 		.start_turn(2, TurnStart {
 			turn_id:            TOOLSET_TURN.into(),
 			item_events:        vec![input_event],
-			prompt_hash:        hash.into_bytes(),
+			prompt_hash:        hash.digest(),
 			prompt_head_events: Vec::new(),
 			toolset_hash:       durable_registry.slot_hash(),
 			enabled_tools:      Vec::new(),
@@ -978,7 +978,7 @@ async fn replay_child(root: &Path, create: bool, _mutated: bool) {
 			.start_turn(3, TurnStart {
 				turn_id:            ROOT_TURN.into(),
 				item_events:        vec![input_event],
-				prompt_hash:        hash.into_bytes(),
+				prompt_hash:        hash.digest(),
 				prompt_head_events: vec![prompt_event],
 				toolset_hash:       Registry::new().slot_hash(),
 				enabled_tools:      Vec::new(),
@@ -1076,7 +1076,7 @@ fn receipt_child(root: &Path, crash: bool) {
 			.start_turn(3, TurnStart {
 				turn_id:            RECEIPT_TURN.into(),
 				item_events:        vec![input],
-				prompt_hash:        hash.into_bytes(),
+				prompt_hash:        hash.digest(),
 				prompt_head_events: vec![prompt],
 				toolset_hash:       Registry::new().slot_hash(),
 				enabled_tools:      Vec::new(),

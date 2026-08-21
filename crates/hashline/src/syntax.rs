@@ -9,13 +9,13 @@ use omp_ast::block::{
 	BlockRangeOptions, EnclosingBoundaryOptions, LineRange, NodeSpan, enclosing_block_boundaries,
 	node_chain_at,
 };
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use parking_lot::Mutex;
 
 const CACHE_LIMIT: usize = 256;
-type ContentKey = ([u8; 32], Str);
-type BoundaryKey = ([u8; 32], Str, u32, u32);
-type ChainKey = ([u8; 32], Str, u32);
+type ContentKey = (Hash32, Str);
+type BoundaryKey = (Hash32, Str, u32, u32);
+type ChainKey = (Hash32, Str, u32);
 
 #[derive(Default)]
 struct ProbeCache {
@@ -33,7 +33,7 @@ static CACHE: LazyLock<Mutex<ProbeCache>> = LazyLock::new(|| Mutex::new(ProbeCac
 /// parses cleanly.
 pub fn parses_cleanly(path: Option<&str>, text: &str) -> bool {
 	let Some(path) = path else { return false };
-	let key = (*blake3::hash(text.as_bytes()).as_bytes(), Str::new(path));
+	let key = (Hash32::sum(text), Str::new(path));
 	if let Some(value) = CACHE.lock().parses.get(&key) {
 		return *value;
 	}
@@ -69,7 +69,7 @@ pub fn parses_cleanly(path: Option<&str>, text: &str) -> bool {
 /// an empty chain, so callers treat absence as no structural evidence.
 pub fn node_chain(text: &str, path: &str, line: usize) -> Arc<[NodeSpan]> {
 	let line = u32::try_from(line).unwrap_or(u32::MAX);
-	let key = (*blake3::hash(text.as_bytes()).as_bytes(), Str::new(path), line);
+	let key = (Hash32::sum(text), Str::new(path), line);
 	if let Some(value) = CACHE.lock().chains.get(&key) {
 		return value.clone();
 	}
@@ -108,7 +108,7 @@ pub fn is_enclosing_boundary(
 ) -> bool {
 	let start_line = u32::try_from(start_line).unwrap_or(u32::MAX);
 	let end_line = u32::try_from(end_line).unwrap_or(u32::MAX);
-	let key = (*blake3::hash(text.as_bytes()).as_bytes(), Str::new(path), start_line, end_line);
+	let key = (Hash32::sum(text), Str::new(path), start_line, end_line);
 	if let Some(value) = CACHE.lock().boundaries.get(&key) {
 		return value.contains(&boundary);
 	}

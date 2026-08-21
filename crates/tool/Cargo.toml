@@ -14,7 +14,6 @@ workspace = true
 
 [dependencies]
 async-stream = { workspace = true }
-blake3 = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }

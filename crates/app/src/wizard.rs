@@ -474,10 +474,9 @@ fn show_auth_prompt(
 		.child(TextLeaf::new().text(message));
 	if let Some(location) = location {
 		let (authorization, instruction) = match location {
-			AuthLocation::Url(url) => (
-				sf!("[{url}]({url})"),
-				"Authorize in your browser, then paste the redirect URL below.",
-			),
+			AuthLocation::Url(url) => {
+				(sf!("[{url}]({url})"), "Authorize in your browser, then paste the redirect URL below.")
+			},
 			AuthLocation::DeviceCode { code, url } => (
 				sf!("Enter code `{code}` at [{url}]({url})"),
 				"Complete authorization in your browser, then continue below.",

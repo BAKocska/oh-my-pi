@@ -627,7 +627,8 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("eval.rs"),
-			),
+			)
+			.into(),
 		},
 	};
 	(tool, control)

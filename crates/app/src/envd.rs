@@ -27,7 +27,7 @@ use std::{io, path::Path, sync::Arc};
 #[doc(hidden)]
 pub use eval::{EVAL_CHILD_ARG, run_eval_child_entry};
 use miette::IntoDiagnostic as _;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_env::EnvClient;
 use omp_proto::env::v1::{ClientHello, ServerHello};
 use omp_tool::Registry;
@@ -489,7 +489,7 @@ fn worker_config(
 			session_id.as_str(),
 			session_generation,
 		);
-		let mut digest = blake3::Hasher::new();
+		let mut digest = Hash32::hasher();
 		digest.update(crate::build_id::current().as_bytes());
 		digest.update(env!("CARGO_PKG_VERSION").as_bytes());
 		digest.update(PY_EVAL_MODULE.as_bytes());
@@ -497,7 +497,7 @@ fn worker_config(
 			sf!("omp-first-party"),
 			sf!(PY_EVAL_MODULE),
 			sf!(env!("CARGO_PKG_VERSION")),
-			omp_core::ArtifactDigest::new(*digest.finalize().as_bytes()),
+			omp_core::ArtifactDigest::new(digest.finalize().into_bytes()),
 			sf!("workspace"),
 			sf!("trusted"),
 			1,

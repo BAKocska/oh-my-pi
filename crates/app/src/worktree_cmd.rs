@@ -51,10 +51,9 @@ pub(crate) fn project_worktree_root(state_dir: &Path) -> io::Result<PathBuf> {
 		.filter(|name| !name.is_empty())
 		.map_or_else(
 			|| {
-				omp_core::encoding::hex::encode_n(
-					blake3::hash(state_dir.as_os_str().as_encoded_bytes()).as_bytes(),
-				)
-				.to_string()
+				omp_core::Hash32::sum(state_dir.as_os_str().as_encoded_bytes())
+					.to_hex()
+					.to_string()
 			},
 			|name| name.to_string_lossy().into_owned(),
 		);

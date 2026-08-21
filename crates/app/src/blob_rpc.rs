@@ -3,7 +3,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt as _};
+use futures::{Stream, StreamExt};
+use omp_core::Hash32;
 use omp_proto::omp::blob::v1 as pb;
 use omp_storage::blob::{BlobRef, BlobStore};
 use tonic::{Request, Response, Status};
@@ -84,12 +85,12 @@ impl pb::blob_server::Blob for BlobRpc {
 		let ranged = bytes.slice(start..end);
 		let stream = async_stream::try_stream! {
 			if ranged.is_empty() {
-				yield pb::Chunk { data: Bytes::new(), hash: Bytes::copy_from_slice(&hash), size: Some(size) };
+				yield pb::Chunk { data: Bytes::new(), hash: Bytes::copy_from_slice(hash.as_bytes()), size: Some(size) };
 			} else {
 				for (index, chunk) in ranged.chunks(CHUNK_SIZE).enumerate() {
 					yield pb::Chunk {
 						data: Bytes::copy_from_slice(chunk),
-						hash: if index == 0 { Bytes::copy_from_slice(&hash) } else { Bytes::new() },
+						hash: if index == 0 { Bytes::copy_from_slice(hash.as_bytes()) } else { Bytes::new() },
 						size: (index == 0).then_some(size),
 					};
 				}
@@ -143,7 +144,7 @@ impl pb::blob_server::Blob for BlobRpc {
 			return Err(Status::invalid_argument("uploaded blob hash does not match declared digest"));
 		}
 		Ok(Response::new(pb::PutResponse {
-			hash: Bytes::copy_from_slice(&reference.hash),
+			hash: Bytes::copy_from_slice(reference.hash.as_bytes()),
 			size: reference.size,
 		}))
 	}
@@ -166,9 +167,9 @@ impl pb::blob_server::Blob for BlobRpc {
 	}
 }
 
-fn parse_hash(bytes: &[u8]) -> Result<[u8; 32], Status> {
-	bytes
-		.try_into()
+fn parse_hash(bytes: &[u8]) -> Result<Hash32, Status> {
+	<[u8; 32]>::try_from(bytes)
+		.map(Hash32::new)
 		.map_err(|_| Status::invalid_argument("blob hash must be exactly 32 bytes"))
 }
 

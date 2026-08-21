@@ -1652,10 +1652,8 @@ mod tests {
 	fn session_index_is_explicit_while_chat_starts_inline() {
 		let mut chat = ChatArgs::default_interactive();
 		assert_eq!(chat_start(&mut chat), crate::chat::ChatStart::Session);
-		let mut picker = ChatArgs {
-			resume: Some(sf!("__omp_picker__")),
-			..ChatArgs::default_interactive()
-		};
+		let mut picker =
+			ChatArgs { resume: Some(sf!("__omp_picker__")), ..ChatArgs::default_interactive() };
 		assert_eq!(chat_start(&mut picker), crate::chat::ChatStart::SessionIndex);
 		assert!(picker.resume.is_none());
 	}

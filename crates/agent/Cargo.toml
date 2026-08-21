@@ -10,7 +10,6 @@ description = "Durable, interruptible agent-loop foundations for OMP"
 readme = "README.md"
 
 [dependencies]
-blake3 = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }

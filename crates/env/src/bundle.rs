@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use omp_ar::{Archive, Format, zip::Writer};
-use omp_core::{Str, encoding::hex, sf};
+use omp_core::{Hash32, Str, encoding::hex, sf};
 use omp_proto::blob::v1::{Chunk, GetRequest, StatRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -102,7 +102,7 @@ pub fn pack_bundle(
 			return Err(BundleError::Layout(sf!("duplicate bundle member")));
 		}
 		previous = Some(file.path.as_str());
-		let digest = hex::encode_n(blake3::hash(&file.contents).as_bytes());
+		let digest = Hash32::sum(&file.contents).to_hex();
 		if !payload_name_matches_digest(&file.path, digest.as_str()) {
 			return Err(BundleError::Layout(sf!("artifact pathname does not match its digest",)));
 		}
@@ -284,16 +284,13 @@ fn validate_payload_path(path: &str) -> Result<(), BundleError> {
 }
 
 fn is_blake3_hex(value: &str) -> bool {
-	value.len() == 64
-		&& value
-			.bytes()
-			.all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+	value.parse::<Hash32>().is_ok()
 }
 
 fn verify_entry(entry: &BundleEntry, contents: &[u8]) -> Result<(), BundleError> {
 	let size =
 		u64::try_from(contents.len()).map_err(|_| BundleError::Integrity(entry.path.clone()))?;
-	let digest = hex::encode_n(blake3::hash(contents).as_bytes());
+	let digest = Hash32::sum(contents).to_hex();
 	if size != entry.size || digest.as_str() != entry.blake3 {
 		return Err(BundleError::Integrity(entry.path.clone()));
 	}
@@ -330,14 +327,14 @@ fn hash_bytes(value: &str) -> Result<Bytes, BundleError> {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use omp_core::{Str, sf};
+	use omp_core::{Hash32, Str, sf};
 
 	use super::{BundleFile, pack_bundle, unpack_bundle};
 
 	#[test]
 	fn bundle_round_trip_preserves_content_addressed_layout() {
 		let wheel = Bytes::from_static(b"wheel");
-		let digest = omp_core::encoding::hex::encode_n(blake3::hash(&wheel).as_bytes());
+		let digest = Hash32::sum(&wheel).to_hex();
 		let archive = pack_bundle("omp-test", vec![sf!("aarch64-apple-darwin")], vec![
 			BundleFile { path: sf!("omp.lock"), contents: Bytes::from_static(b"version = 1\n") },
 			BundleFile {

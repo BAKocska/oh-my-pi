@@ -311,7 +311,8 @@ pub fn tool<B: HubBackend>(backend: B) -> Hub<B> {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("hub.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

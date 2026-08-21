@@ -6,6 +6,7 @@ use std::{
 	time::Duration,
 };
 
+use omp_core::Hash32;
 pub use omp_env::windows::OwnerPipeListener;
 use omp_tool::Registry;
 use tokio_util::sync::CancellationToken;
@@ -23,12 +24,12 @@ pub(crate) fn extension_pipe_endpoint(binding: &ExtensionDataBinding) -> PathBuf
 }
 
 fn scoped_pipe_endpoint(identity: &Path) -> PathBuf {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(b"omp/extension-data-pipe/v1");
 	let identity = identity.as_os_str().as_encoded_bytes();
 	hasher.update(&(identity.len() as u64).to_le_bytes());
 	hasher.update(identity);
-	let digest = omp_core::encoding::hex::encode_n(hasher.finalize().as_bytes());
+	let digest = hasher.finalize().to_hex();
 	PathBuf::from(format!(r"\\.\pipe\omp-env-{digest}"))
 }
 

@@ -3,7 +3,7 @@
 use std::{path::PathBuf, str::Utf8Error};
 
 use bytes::BufMut;
-use omp_core::{Principal, Provenance, Str};
+use omp_core::{Hash32, Principal, Provenance, Str};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use thiserror::Error as ThisError;
@@ -463,7 +463,7 @@ payload!(InitPayload {
 payload!(ItemPayload {
 	item: omp_proto::thread::v1::Item,
 	turn_id: Option<Str>,
-	prompt_hash: Option<[u8; 32]>,
+	prompt_hash: Option<Hash32>,
 });
 payload!(FailedPayload {
 	error: RequestError,
@@ -511,10 +511,10 @@ payload!(AmendPayload { target: u64, patch: AmendPatch });
 payload!(TurnInputPayload {
 	turn_id: Str,
 	item: omp_proto::thread::v1::Item,
-	prompt_hash: Option<[u8; 32]>,
+	prompt_hash: Option<Hash32>,
 });
 payload!(PromptRewriteIntentPayload {
-	prompt_hash: [u8; 32],
+	prompt_hash: Hash32,
 	head: Vec<omp_proto::thread::v1::Item>,
 	preserved_tail: Vec<u64>,
 });
@@ -536,7 +536,7 @@ payload!(ToolBatchAuthorizedPayload {
 payload!(TurnAbortPayload { turn_id: Str, recoverable: bool });
 payload!(TurnReceiptPayload {
 	turn_id: Str,
-	prompt_hash: [u8; 32],
+	prompt_hash: Hash32,
 	prompt_head_events: Vec<u64>,
 	item_events: Vec<u64>,
 	outcome: omp_proto::inference::v1::Outcome,
@@ -544,9 +544,9 @@ payload!(TurnReceiptPayload {
 payload!(TurnStartPayload {
 	turn_id: Str,
 	item_events: Vec<u64>,
-	prompt_hash: [u8; 32],
+	prompt_hash: Hash32,
 	prompt_head_events: Vec<u64>,
-	toolset_hash: [u8; 32],
+	toolset_hash: Hash32,
 	enabled_tools: Vec<Str>,
 	sequence_targets: Vec<u64>,
 	input: TurnInputRecord,

@@ -370,7 +370,7 @@ impl OutputSpill {
 			.await
 			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?
 			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?;
-		let hash = omp_core::encoding::hex::encode_n(&reference.hash);
+		let hash = reference.hash.to_hex();
 		Ok(Some(BlobRef {
 			hash:       Str::from(hash.as_str()),
 			media_type: sf!("text/plain; charset=utf-8"),

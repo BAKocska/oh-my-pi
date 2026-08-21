@@ -19,7 +19,7 @@ use std::{
 
 use bytes::Bytes;
 use flume::{Receiver, TryRecvError};
-use omp_core::{CowBytes, IntoStr, Principal, Provenance, Str, base64, hex, sf};
+use omp_core::{CowBytes, Hash32, IntoStr, Principal, Provenance, Str, base64, sf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -1496,11 +1496,11 @@ fn allocate_revision(state: &StoreState, scope: &ScopeKey) -> Result<StateRevisi
 }
 
 fn fingerprint(operation: &RequestedOp<'_>) -> Result<[u8; 32], Error> {
-	Ok(*blake3::hash(&serde_json::to_vec(operation)?).as_bytes())
+	Ok(Hash32::sum(serde_json::to_vec(operation)?).into_bytes())
 }
 
 fn checksum(encoded_body: &[u8]) -> Str {
-	Str::from(hex::encode(blake3::hash(encoded_body).as_bytes()).into_string())
+	Str::new(Hash32::sum(encoded_body).to_hex().as_str())
 }
 
 fn check_generation(authority: &StateAuthority, request: &DurableRequest) -> Result<(), Error> {

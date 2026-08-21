@@ -2965,6 +2965,48 @@ mod tests {
 	}
 
 	#[test]
+	fn root_schema_combinators_spill_into_the_description() {
+		let request = ChatRequest {
+			tools: Arc::from([ToolDefinition {
+				name:        sf!("shell"),
+				description: Some(sf!("Run a shell command")),
+				input:       ToolInputConstraint::JsonSchema {
+					parameters: OpaqueJson::new(serde_json::json!({
+						"type": "object",
+						"description": "Complete arguments.",
+						"properties": {
+							"name": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+						},
+						"allOf": [{
+							"if": {"properties": {"async": {"const": true}}, "required": ["async"]},
+							"then": {"required": ["name"]}
+						}]
+					})),
+					strict:     false,
+				},
+			}]),
+			tool_choice: Setting::Unset,
+			..canonical_chat(&[])
+		};
+		let body = lower_chat(
+			sf!("claude-opus-5"),
+			&ProviderId::new("anthropic"),
+			&CodecId::new("anthropic"),
+			None,
+			&request,
+		)
+		.expect("chat lowers");
+		let Tool::Client(tool) = &body.tools[0] else {
+			panic!("client tool expected");
+		};
+		let schema = tool.input_schema.as_object().expect("object schema");
+		assert!(!schema.contains_key("allOf"));
+		let description = schema["description"].as_str().expect("description");
+		assert!(description.starts_with("Complete arguments.\n\nallOf: [{\"if\""));
+		assert!(schema["properties"]["name"].get("anyOf").is_some());
+	}
+
+	#[test]
 	fn empty_successful_tool_results_lower_to_the_empty_string_not_an_empty_array() {
 		let provider = ProviderId::new("anthropic");
 		let codec = CodecId::new("anthropic");

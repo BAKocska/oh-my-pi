@@ -139,7 +139,7 @@ impl SpillDiverter {
 	) -> Result<omp_proto::thread::v1::Blob, omp_storage::blob::Error> {
 		let reference = self.store.put_reader(reader)?;
 		Ok(omp_proto::thread::v1::Blob {
-			hash: reference.hash.to_vec().into(),
+			hash: reference.hash.as_bytes().to_vec().into(),
 			size: reference.size,
 			..omp_proto::thread::v1::Blob::default()
 		})

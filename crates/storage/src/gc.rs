@@ -21,7 +21,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use omp_core::{ArtifactAddress, ArtifactUrl, Str};
+use omp_core::{ArtifactAddress, ArtifactUrl, Hash32, Str, hash32::Hasher};
 pub use omp_tool::ArtifactLifetime;
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
 use serde_json::{Map, Value};
@@ -155,7 +155,7 @@ impl DurableRoots {
 		}
 		transaction.execute(
 			"INSERT INTO durable_roots(hash) VALUES (?1) ON CONFLICT(hash) DO NOTHING",
-			params![reference.hash.as_slice()],
+			params![reference.hash.as_bytes()],
 		)?;
 		transaction.commit()?;
 		Ok(())
@@ -170,7 +170,7 @@ impl DurableRoots {
 			.connection
 			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		transaction.execute("DELETE FROM durable_roots WHERE hash = ?1", params![
-			reference.hash.as_slice()
+			reference.hash.as_bytes()
 		])?;
 		transaction.commit()?;
 		Ok(())
@@ -217,7 +217,7 @@ impl ArtifactRecord {
 	#[must_use]
 	pub fn durable_url(&self) -> Option<ArtifactUrl> {
 		(self.lifetime == ArtifactLifetime::Durable)
-			.then(|| ArtifactUrl::from_digest(self.reference.hash))
+			.then(|| ArtifactUrl::from_digest(self.reference.hash.into_bytes()))
 	}
 
 	/// Returns an address valid from `session`.
@@ -336,7 +336,7 @@ impl ArtifactCatalog {
 		lifetime: ArtifactLifetime,
 	) -> Result<ArtifactRecord, Error> {
 		let source = self.stat_url(session, source)?;
-		self.adopt(session, source.reference.hash, claimed_size, lifetime)
+		self.adopt(session, source.reference.hash.into_bytes(), claimed_size, lifetime)
 	}
 
 	/// Adopts an artifact URL with persistent authenticated replay.
@@ -348,7 +348,7 @@ impl ArtifactCatalog {
 		lifetime: ArtifactLifetime,
 	) -> Result<ArtifactRecord, Error> {
 		let source = self.stat_url(request.session, source)?;
-		self.adopt_once(request, source.reference.hash, claimed_size, lifetime)
+		self.adopt_once(request, source.reference.hash.into_bytes(), claimed_size, lifetime)
 	}
 
 	/// Resolves a typed artifact URL with authoritative blob metadata.
@@ -360,7 +360,7 @@ impl ArtifactCatalog {
 			ArtifactAddress::Ordinal(ordinal) => self.stat_ordinal(session, ordinal),
 			ArtifactAddress::Digest(hash) => {
 				let reference = BlobRef::parse_hex(hash, 0)?;
-				self.stat_digest(reference.hash)
+				self.stat_digest(reference.hash.into_bytes())
 			},
 		}
 	}
@@ -560,7 +560,7 @@ fn adopt_in_transaction(
 		catalog_id,
 		session: session.clone(),
 		ordinal,
-		reference: BlobRef { hash, size: actual },
+		reference: BlobRef { hash: Hash32::new(hash), size: actual },
 		lifetime,
 		pinned: lifetime == ArtifactLifetime::Durable,
 	})
@@ -646,7 +646,7 @@ fn record_request(
 			record.catalog_id,
 			record.session.0.as_str(),
 			record.ordinal,
-			record.reference.hash.as_slice(),
+			record.reference.hash.as_bytes(),
 			record.reference.size,
 			Into::<&'static str>::into(record.lifetime),
 		],
@@ -659,7 +659,7 @@ fn adopt_fingerprint(
 	claimed_size: Option<u64>,
 	lifetime: ArtifactLifetime,
 ) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hash_fingerprint_field(&mut hasher, b"adopt");
 	hash_fingerprint_field(&mut hasher, &hash);
 	match claimed_size {
@@ -670,18 +670,18 @@ fn adopt_fingerprint(
 		None => hash_fingerprint_field(&mut hasher, b"none"),
 	}
 	hash_fingerprint_field(&mut hasher, &[retention_rank(lifetime)]);
-	*hasher.finalize().as_bytes()
+	hasher.finalize().into_bytes()
 }
 
 fn pin_fingerprint(catalog_id: u64, lifetime: ArtifactLifetime) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hash_fingerprint_field(&mut hasher, b"pin");
 	hash_fingerprint_field(&mut hasher, &catalog_id.to_le_bytes());
 	hash_fingerprint_field(&mut hasher, &[retention_rank(lifetime)]);
-	*hasher.finalize().as_bytes()
+	hasher.finalize().into_bytes()
 }
 
-fn hash_fingerprint_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+fn hash_fingerprint_field(hasher: &mut Hasher, value: &[u8]) {
 	hasher.update(
 		&u64::try_from(value.len())
 			.expect("fingerprint field length fits u64")
@@ -726,14 +726,14 @@ fn decode_artifact(encoded: EncodedArtifact) -> Result<ArtifactRecord, Error> {
 		catalog_id,
 		session: SessionId(Str::new(session)),
 		ordinal,
-		reference: BlobRef { hash, size },
+		reference: BlobRef { hash: Hash32::new(hash), size },
 		lifetime,
 		pinned: lifetime == ArtifactLifetime::Durable,
 	})
 }
 
 fn authoritative_size(store: &BlobStore, hash: [u8; 32]) -> Result<u64, Error> {
-	let probe = BlobRef { hash, size: 0 };
+	let probe = BlobRef { hash: Hash32::new(hash), size: 0 };
 	match fs::metadata(store.path(&probe)) {
 		Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
 		Ok(_) => Err(blob::Error::NotFound.into()),
@@ -743,7 +743,7 @@ fn authoritative_size(store: &BlobStore, hash: [u8; 32]) -> Result<u64, Error> {
 }
 
 fn validate_record(store: &BlobStore, record: &ArtifactRecord) -> Result<(), Error> {
-	let actual = authoritative_size(store, record.reference.hash)?;
+	let actual = authoritative_size(store, record.reference.hash.into_bytes())?;
 	if actual == record.reference.size {
 		Ok(())
 	} else {
@@ -761,7 +761,7 @@ fn promote_record(
 	}
 	if requested == record.lifetime {
 		if requested == ArtifactLifetime::Durable {
-			insert_durable_root(transaction, record.reference.hash)?;
+			insert_durable_root(transaction, record.reference.hash.into_bytes())?;
 		}
 		return Ok(());
 	}
@@ -771,7 +771,7 @@ fn promote_record(
 		record.catalog_id
 	])?;
 	if requested == ArtifactLifetime::Durable {
-		insert_durable_root(transaction, record.reference.hash)?;
+		insert_durable_root(transaction, record.reference.hash.into_bytes())?;
 	}
 	Ok(())
 }
@@ -831,7 +831,7 @@ pub fn sweep(
 		while let Some(row) = rows.next()? {
 			let hash: Vec<u8> = row.get(0)?;
 			let hash: [u8; 32] = hash.try_into().map_err(|_| Error::CorruptDurableRoot)?;
-			reachable.insert(hash);
+			reachable.insert(Hash32::new(hash));
 		}
 	}
 	report.reachable_count = u64::try_from(reachable.len()).expect("blob root counts fit in u64");
@@ -846,7 +846,7 @@ pub fn sweep(
 fn mark_session_roots(
 	store: &BlobStore,
 	roots: &[SessionId],
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) -> Result<(), Error> {
@@ -870,7 +870,7 @@ fn mark_session_roots(
 fn walk_journals(
 	directory: &Path,
 	remaining: &mut HashSet<&str>,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) -> Result<(), Error> {
@@ -926,7 +926,7 @@ fn journal_session_id(path: &Path) -> Result<Option<SessionId>, Error> {
 fn mark_journal(
 	path: &Path,
 	session: &SessionId,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) -> Result<(), Error> {
@@ -952,7 +952,7 @@ fn mark_line(
 	line: &[u8],
 	session: &SessionId,
 	live: bool,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) {
@@ -975,7 +975,7 @@ fn mark_value(
 	session: &SessionId,
 	live: bool,
 	inherited_lifetime: ArtifactLifetime,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) {
@@ -1007,7 +1007,7 @@ fn mark_artifact_urls(
 	text: &str,
 	session: &SessionId,
 	live: bool,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 ) {
 	let mut rest = text;
@@ -1029,7 +1029,7 @@ fn mark_artifact_url(
 	text: &str,
 	session: &SessionId,
 	live: bool,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 ) {
 	if !text.starts_with("artifact://") {
@@ -1057,7 +1057,7 @@ fn mark_artifact_url(
 fn mark_catalog_uses(
 	transaction: &rusqlite::Transaction<'_>,
 	uses: &ArtifactUses,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	report: &mut SweepReport,
 ) -> Result<(), Error> {
 	let mut statement = transaction
@@ -1076,7 +1076,7 @@ fn mark_catalog_uses(
 			.map_err(|_| Error::CorruptArtifactCatalog)?;
 		if lifetime != ArtifactLifetime::Ephemeral || uses.live.contains(&(session.clone(), *ordinal))
 		{
-			reachable.insert(hash);
+			reachable.insert(Hash32::new(hash));
 		}
 	}
 	Ok(())
@@ -1100,7 +1100,7 @@ fn object_lifetime(
 	})
 }
 
-fn object_blob_hash(object: &Map<String, Value>, report: &mut SweepReport) -> Option<[u8; 32]> {
+fn object_blob_hash(object: &Map<String, Value>, report: &mut SweepReport) -> Option<Hash32> {
 	let (hash, length) = if let Some(hash) = object.get("h") {
 		(hash, object.get("n"))
 	} else if object.contains_key("byte_len") {
@@ -1123,7 +1123,7 @@ fn mark_corrupt_line(
 	line: &[u8],
 	session: &SessionId,
 	live: bool,
-	reachable: &mut HashSet<[u8; 32]>,
+	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) {
@@ -1168,7 +1168,7 @@ fn mark_corrupt_line(
 
 fn sweep_blob_directory(
 	store: &BlobStore,
-	reachable: &HashSet<[u8; 32]>,
+	reachable: &HashSet<Hash32>,
 	min_age: Duration,
 	report: &mut SweepReport,
 ) -> io::Result<()> {
@@ -1213,7 +1213,7 @@ fn sweep_blob_directory(
 	Ok(())
 }
 
-fn candidate_hash(path: &Path) -> Option<[u8; 32]> {
+fn candidate_hash(path: &Path) -> Option<Hash32> {
 	let name = path.file_name()?.to_str()?;
 	let reference = BlobRef::parse_hex(name, 0).ok()?;
 	let second = path.parent()?.file_name()?.to_str()?;

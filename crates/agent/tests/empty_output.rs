@@ -17,7 +17,7 @@ use omp_agent::{
 	Journal, RetryPolicy, TurnClient, TurnId, TurnInput, TurnInputRecord, TurnOptions,
 	TurnOptionsRecord, TurnSession, TurnStart,
 };
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_env::EnvClient;
 use omp_proto::{
 	inference::v1 as pb,
@@ -234,9 +234,9 @@ fn turn_start(id: &str) -> TurnStart {
 	TurnStart {
 		turn_id:            Str::new(id),
 		item_events:        Vec::new(),
-		prompt_hash:        [0; 32],
+		prompt_hash:        Hash32::new([0; 32]),
 		prompt_head_events: Vec::new(),
-		toolset_hash:       [0; 32],
+		toolset_hash:       Hash32::new([0; 32]),
 		enabled_tools:      Vec::new(),
 		sequence_targets:   Vec::new(),
 		input:              TurnInputRecord::Full { thread: thread::Thread::default() },

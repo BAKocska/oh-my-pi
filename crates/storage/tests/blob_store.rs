@@ -6,6 +6,7 @@ use std::{
 	path::Path,
 };
 
+use omp_core::Hash32;
 use omp_storage::blob::{BlobRef, BlobStore};
 use tempfile::tempdir;
 
@@ -27,7 +28,7 @@ fn staged_write_preserves_multi_chunk_content_exactly() {
 	}
 	let reference = stage.finish().unwrap();
 
-	assert_eq!(reference.hash, *blake3::hash(&expected).as_bytes());
+	assert_eq!(reference.hash, Hash32::sum(&expected));
 	assert_eq!(reference.size, u64::try_from(expected.len()).unwrap());
 	assert_eq!(store.get(&reference).unwrap(), expected.as_slice());
 	assert_tmp_empty(directory.path());
@@ -59,7 +60,7 @@ fn dropping_stage_removes_temporary_content() {
 	drop(stage);
 
 	assert_tmp_empty(directory.path());
-	let abandoned = BlobRef { hash: *blake3::hash(b"not finalized").as_bytes(), size: 13 };
+	let abandoned = BlobRef { hash: Hash32::sum(b"not finalized"), size: 13 };
 	assert!(!store.has(&abandoned));
 }
 
@@ -78,7 +79,7 @@ fn producer_failure_drops_unfinished_stage() {
 	drop(stage);
 
 	assert_tmp_empty(directory.path());
-	let partial = BlobRef { hash: *blake3::hash(b"partial serialized value").as_bytes(), size: 24 };
+	let partial = BlobRef { hash: Hash32::sum(b"partial serialized value"), size: 24 };
 	assert!(!store.has(&partial));
 }
 
@@ -108,7 +109,7 @@ fn reader_failure_leaves_no_blob_or_temporary_content() {
 		matches!(result, Err(omp_storage::blob::Error::Io(error)) if error.kind() == io::ErrorKind::Other)
 	);
 	assert_tmp_empty(directory.path());
-	let partial = BlobRef { hash: *blake3::hash(b"partial reader").as_bytes(), size: 14 };
+	let partial = BlobRef { hash: Hash32::sum(b"partial reader"), size: 14 };
 	assert!(!store.has(&partial));
 }
 
@@ -117,10 +118,8 @@ fn finish_failure_adopts_nothing_and_removes_temporary_content() {
 	let directory = tempdir().unwrap();
 	let store = BlobStore::open(directory.path()).unwrap();
 	let content = b"cannot be adopted";
-	let expected = BlobRef {
-		hash: *blake3::hash(content).as_bytes(),
-		size: u64::try_from(content.len()).unwrap(),
-	};
+	let expected =
+		BlobRef { hash: Hash32::sum(content), size: u64::try_from(content.len()).unwrap() };
 	let mut stage = store.begin_put().unwrap();
 	stage.write_all(content).unwrap();
 	let destination = store.path(&expected);
@@ -138,7 +137,7 @@ fn zero_byte_stage_has_exact_empty_reference() {
 	let store = BlobStore::open(directory.path()).unwrap();
 	let reference = store.begin_put().unwrap().finish().unwrap();
 
-	assert_eq!(reference, BlobRef { hash: *blake3::hash(&[]).as_bytes(), size: 0 });
+	assert_eq!(reference, BlobRef { hash: Hash32::sum([]), size: 0 });
 	assert_eq!(store.get(&reference).unwrap(), &[][..]);
 	assert_tmp_empty(directory.path());
 }
@@ -153,7 +152,7 @@ fn large_reader_is_streamed_and_verified() {
 		.collect::<Vec<_>>();
 	let reference = store.put_reader(Cursor::new(content.as_slice())).unwrap();
 
-	assert_eq!(reference.hash, *blake3::hash(&content).as_bytes());
+	assert_eq!(reference.hash, Hash32::sum(&content));
 	assert_eq!(reference.size, u64::try_from(LENGTH).unwrap());
 	assert!(store.verify(&reference).unwrap());
 	assert_tmp_empty(directory.path());

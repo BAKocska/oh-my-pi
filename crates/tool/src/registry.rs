@@ -12,7 +12,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-use omp_core::{SparseMap, Str, sf};
+use omp_core::{Hash32, SparseMap, Str, hash32::Hasher, sf};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
@@ -269,9 +269,9 @@ pub struct ProjectionKey {
 	/// Exact tool revision whose typed verdict decoder is selected.
 	pub identity:        ToolIdentity,
 	/// Digest of the model projection budget.
-	pub caps_hash:       [u8; 32],
+	pub caps_hash:       Hash32,
 	/// Registry-wide identity of projection implementations.
-	pub projection_hash: [u8; 32],
+	pub projection_hash: Hash32,
 	cache_hash:          [u8; 32],
 }
 
@@ -283,10 +283,10 @@ impl ProjectionKey {
 		identity: &ToolIdentity,
 		verdict: &[u8],
 		caps: &PromptCaps,
-		projection_hash: [u8; 32],
+		projection_hash: Hash32,
 	) -> Self {
 		let caps_hash = projection_caps_hash(caps);
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		hash_field(&mut hasher, verdict);
 		hash_field(&mut hasher, &caps.maximum_parts.to_le_bytes());
 		hash_field(&mut hasher, &caps.maximum_text_bytes.to_le_bytes());
@@ -294,12 +294,12 @@ impl ProjectionKey {
 		hash_field(&mut hasher, &[caps.dialect as u8]);
 		hash_field(&mut hasher, &[caps.model_class as u8]);
 		hash_identity(&mut hasher, &identity.name, &identity.rev);
-		hash_field(&mut hasher, &projection_hash);
+		hash_field(&mut hasher, projection_hash.as_bytes());
 		Self {
 			identity: identity.clone(),
 			caps_hash,
 			projection_hash,
-			cache_hash: *hasher.finalize().as_bytes(),
+			cache_hash: hasher.finalize().into_bytes(),
 		}
 	}
 
@@ -1138,10 +1138,10 @@ impl Registry {
 		})
 	}
 
-	/// Hashes only policy-resolved model-visible slots.
+	/// Returns the BLAKE3-256 digest of policy-resolved model-visible slots.
 	#[must_use]
-	pub fn slot_hash(&self) -> [u8; 32] {
-		let mut hasher = blake3::Hasher::new();
+	pub fn slot_hash(&self) -> Hash32 {
+		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-tool/slots/v1\0");
 		for (name, claim) in &self.live {
 			let Some(entry) = self
@@ -1155,13 +1155,14 @@ impl Registry {
 				hash_identity(&mut hasher, name, &claim.rev);
 			}
 		}
-		*hasher.finalize().as_bytes()
+		hasher.finalize()
 	}
 
-	/// Hashes mounted device availability and claimant-qualified reachability.
+	/// Returns the BLAKE3-256 digest of mounted device availability and
+	/// claimant-qualified reachability.
 	#[must_use]
-	pub fn device_hash(&self) -> [u8; 32] {
-		let mut hasher = blake3::Hasher::new();
+	pub fn device_hash(&self) -> Hash32 {
+		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-tool/devices/v1\0");
 		let unmounted = self.unmounted.read();
 		for (name, claim) in &self.live {
@@ -1191,13 +1192,14 @@ impl Registry {
 				hash_tool_route(&mut hasher, entry.tool.route());
 			}
 		}
-		*hasher.finalize().as_bytes()
+		hasher.finalize()
 	}
 
-	/// Hashes every registered revision with its projection implementation.
+	/// Returns the BLAKE3-256 digest of every registered revision and its
+	/// projection implementation.
 	#[must_use]
-	pub fn projection_hash(&self) -> [u8; 32] {
-		let mut hasher = blake3::Hasher::new();
+	pub fn projection_hash(&self) -> Hash32 {
+		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-tool/projections/v1\0");
 		for (name, versions) in &self.versions {
 			for (rev, entry) in versions {
@@ -1205,7 +1207,7 @@ impl Registry {
 				hash_field(&mut hasher, &entry.tool.spec().projection_code);
 			}
 		}
-		*hasher.finalize().as_bytes()
+		hasher.finalize()
 	}
 
 	/// Dispatches only the policy-resolved or claimant-qualified revision.
@@ -1602,23 +1604,23 @@ fn device_issue(path: &DevicePath) -> DeviceIssue {
 	}
 }
 
-fn hash_identity(hasher: &mut blake3::Hasher, name: &Str, rev: &Rev) {
+fn hash_identity(hasher: &mut Hasher, name: &Str, rev: &Rev) {
 	hash_field(hasher, name.as_bytes());
 	hash_field(hasher, rev.family.as_bytes());
 	hash_field(hasher, &rev.n.to_le_bytes());
 }
 
-fn projection_caps_hash(caps: &PromptCaps) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+fn projection_caps_hash(caps: &PromptCaps) -> Hash32 {
+	let mut hasher = Hash32::hasher();
 	hash_field(&mut hasher, &caps.maximum_parts.to_le_bytes());
 	hash_field(&mut hasher, &caps.maximum_text_bytes.to_le_bytes());
 	hash_field(&mut hasher, &[u8::from(caps.media)]);
 	hash_field(&mut hasher, &[caps.dialect as u8]);
 	hash_field(&mut hasher, &[caps.model_class as u8]);
-	*hasher.finalize().as_bytes()
+	hasher.finalize()
 }
 
-fn hash_tool_route(hasher: &mut blake3::Hasher, route: &ToolRoute) {
+fn hash_tool_route(hasher: &mut Hasher, route: &ToolRoute) {
 	match route {
 		ToolRoute::Native => hash_field(hasher, &[0]),
 		ToolRoute::Worker { site, name } => {
@@ -1645,7 +1647,7 @@ fn projected_part_bytes(parts: &[Part]) -> usize {
 	})
 }
 
-fn hash_field(hasher: &mut blake3::Hasher, field: &[u8]) {
+fn hash_field(hasher: &mut Hasher, field: &[u8]) {
 	let len = u64::try_from(field.len()).expect("tool identity length fits in u64");
 	hasher.update(&len.to_le_bytes());
 	hasher.update(field);
@@ -1930,8 +1932,9 @@ mod tests {
 	#[test]
 	fn projection_cache_returns_the_same_arc_only_for_the_same_key() {
 		let cache = ProjectionCache::default();
-		let key = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [1; 32]);
-		let different = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [2; 32]);
+		let key = ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [1; 32].into());
+		let different =
+			ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [2; 32].into());
 		assert!(cache.get(0, &key).is_none());
 		cache.insert(0, &key, ProjectedVerdict {
 			parts:    Arc::<[Part]>::from([]),

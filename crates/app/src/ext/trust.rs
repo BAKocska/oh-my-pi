@@ -3,7 +3,7 @@
 use std::{collections::BTreeSet, fs, io, path::Path};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use omp_core::{Str, base64, encoding::hex, sf};
+use omp_core::{Hash32, Str, base64, encoding::hex, sf};
 use serde::{Deserialize, Serialize};
 
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml};
@@ -336,12 +336,12 @@ pub fn capability_digest(
 ) -> Str {
 	let mut entries: BTreeSet<Str> = capabilities.into_iter().collect();
 	entries.extend(hard_tools.into_iter().map(|tool| sf!("tools.hard:{tool}")));
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	for entry in entries {
 		hasher.update(entry.as_str().as_bytes());
 		hasher.update(b"\n");
 	}
-	sf!("b3:{}", hex::encode_n(hasher.finalize().as_bytes()))
+	sf!("b3:{}", hasher.finalize().to_hex())
 }
 
 /// Verifies an Ed25519 signature over `blake3 || sha256 || capability_digest`.

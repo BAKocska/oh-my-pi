@@ -166,7 +166,8 @@ fn spec() -> ToolSpec {
 			env!("CARGO_PKG_NAME"),
 			env!("CARGO_PKG_VERSION"),
 			include_bytes!("ask.rs"),
-		),
+		)
+		.into(),
 	}
 }
 impl Tool for Ask {

@@ -453,7 +453,8 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("write.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

@@ -187,7 +187,8 @@ pub fn tool() -> Todo {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("todo.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

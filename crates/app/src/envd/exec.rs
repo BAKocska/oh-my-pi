@@ -14,7 +14,7 @@ use std::{
 
 use bytes::{Buf as _, Bytes, BytesMut};
 use futures::future::try_join_all;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_proto::{
 	env::v1::{
 		AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecOutcome, ExecRequest, ExecStarted,
@@ -38,12 +38,12 @@ const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Content identity of the process environment inherited by new shell sessions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct WorkspaceEnvironmentDigest([u8; 32]);
+pub struct WorkspaceEnvironmentDigest(Hash32);
 
 impl WorkspaceEnvironmentDigest {
 	/// Returns the BLAKE3 digest over sorted environment name/value pairs.
 	pub const fn as_bytes(&self) -> &[u8; 32] {
-		&self.0
+		self.0.as_bytes()
 	}
 }
 
@@ -1204,7 +1204,7 @@ fn read_workspace_environment() -> WorkspaceEnvironment {
 		})
 		.collect();
 	variables.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	for (name, value) in &variables {
 		let name = name.as_bytes();
 		let value = value.as_bytes();
@@ -1215,7 +1215,7 @@ fn read_workspace_environment() -> WorkspaceEnvironment {
 	}
 	WorkspaceEnvironment {
 		variables: variables.into(),
-		digest:    WorkspaceEnvironmentDigest(*hasher.finalize().as_bytes()),
+		digest:    WorkspaceEnvironmentDigest(hasher.finalize()),
 	}
 }
 

@@ -8,7 +8,7 @@ use omp_agent::{
 	JournalRequestStamp, PendingCustomEntry,
 	control::{ControlError as AgentControlError, ControlSender},
 };
-use omp_core::{Principal, Provenance, Str};
+use omp_core::{Hash32, Principal, Provenance, Str};
 use omp_proto::{
 	bounds::{
 		PULL_ALIAS_MAX_COUNT, PULL_CHUNK_MAX_BYTES, PULL_EXPECTED_MAX_BYTES, PULL_NAME_MAX_BYTES,
@@ -940,7 +940,7 @@ fn proto_part(block: &UserBlock) -> Part {
 		UserBlock::Text { text } => Part { kind: Some(part::Kind::Text(text.to_string())) },
 		UserBlock::Image { blob } => Part {
 			kind: Some(part::Kind::Blob(omp_proto::thread::v1::Blob {
-				hash: Bytes::copy_from_slice(&blob.hash),
+				hash: Bytes::copy_from_slice(blob.hash.as_bytes()),
 				size: blob.size,
 				..Default::default()
 			})),
@@ -954,7 +954,7 @@ fn user_block(part: Part) -> Result<UserBlock, JournalControlError> {
 		Some(part::Kind::Blob(blob)) => {
 			let hash = <[u8; 32]>::try_from(blob.hash.as_ref())
 				.map_err(|_| JournalControlError::InvalidContext)?;
-			Ok(UserBlock::Image { blob: BlobRef { hash, size: blob.size } })
+			Ok(UserBlock::Image { blob: BlobRef { hash: Hash32::new(hash), size: blob.size } })
 		},
 		Some(part::Kind::Thinking(_) | part::Kind::Fallback(_) | part::Kind::ServerTool(_))
 		| None => Err(JournalControlError::InvalidContext),

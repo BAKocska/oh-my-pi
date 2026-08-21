@@ -208,7 +208,7 @@ fn catalog_rejects_peer_size_and_missing_content_before_adoption() {
 	let mismatch = catalog
 		.adopt(
 			&session("authority"),
-			reference.hash,
+			reference.hash.into_bytes(),
 			Some(reference.size + 1),
 			ArtifactLifetime::Session,
 		)
@@ -223,7 +223,12 @@ fn catalog_rejects_peer_size_and_missing_content_before_adoption() {
 		.expect_err("missing content must not be catalogued");
 	assert!(matches!(missing, Error::Blob(omp_storage::blob::Error::NotFound)));
 	let adopted = catalog
-		.adopt(&session("authority"), reference.hash, Some(reference.size), ArtifactLifetime::Session)
+		.adopt(
+			&session("authority"),
+			reference.hash.into_bytes(),
+			Some(reference.size),
+			ArtifactLifetime::Session,
+		)
 		.expect("adopt authoritative artifact");
 	fs::remove_file(store.path(&reference)).expect("remove backing blob");
 	let missing_stat = catalog
@@ -238,7 +243,12 @@ fn catalog_pin_is_monotonic_and_updates_durable_roots_atomically() {
 	let reference = store.put(b"catalog pin").expect("put artifact");
 	let mut catalog = ArtifactCatalog::open(&store).expect("open artifact catalog");
 	let adopted = catalog
-		.adopt(&session("pin"), reference.hash, Some(reference.size), ArtifactLifetime::Session)
+		.adopt(
+			&session("pin"),
+			reference.hash.into_bytes(),
+			Some(reference.size),
+			ArtifactLifetime::Session,
+		)
 		.expect("adopt artifact");
 	let downgrade = catalog
 		.pin(adopted.catalog_id, ArtifactLifetime::Ephemeral)
@@ -250,7 +260,7 @@ fn catalog_pin_is_monotonic_and_updates_durable_roots_atomically() {
 	assert!(durable.pinned);
 	assert_eq!(
 		catalog
-			.stat_digest(reference.hash)
+			.stat_digest(reference.hash.into_bytes())
 			.expect("stat durable digest"),
 		durable
 	);
@@ -270,16 +280,16 @@ fn catalog_persists_exact_idempotency_results_and_rejects_conflicts() {
 	let mut catalog = ArtifactCatalog::open(&store).expect("open artifact catalog");
 	let stamp = request(&owner, "adopt-1", 3);
 	let adopted = catalog
-		.adopt_once(stamp, first.hash, Some(first.size), ArtifactLifetime::Session)
+		.adopt_once(stamp, first.hash.into_bytes(), Some(first.size), ArtifactLifetime::Session)
 		.expect("first adopt");
 	assert_eq!(
 		catalog
-			.adopt_once(stamp, first.hash, Some(first.size), ArtifactLifetime::Session)
+			.adopt_once(stamp, first.hash.into_bytes(), Some(first.size), ArtifactLifetime::Session)
 			.expect("exact replay"),
 		adopted
 	);
 	let conflict = catalog
-		.adopt_once(stamp, second.hash, Some(second.size), ArtifactLifetime::Session)
+		.adopt_once(stamp, second.hash.into_bytes(), Some(second.size), ArtifactLifetime::Session)
 		.expect_err("same key with another hash must conflict");
 	assert!(matches!(conflict, Error::IdempotencyConflict(_)));
 	let operation_conflict = catalog
@@ -299,7 +309,7 @@ fn catalog_persists_exact_idempotency_results_and_rejects_conflicts() {
 	);
 	assert_eq!(
 		catalog
-			.adopt_once(stamp, first.hash, Some(first.size), ArtifactLifetime::Session)
+			.adopt_once(stamp, first.hash.into_bytes(), Some(first.size), ArtifactLifetime::Session)
 			.expect("adopt replay keeps recorded result")
 			.lifetime,
 		ArtifactLifetime::Session
@@ -307,7 +317,7 @@ fn catalog_persists_exact_idempotency_results_and_rejects_conflicts() {
 	let next_generation = catalog
 		.adopt_once(
 			request(&owner, "adopt-1", 4),
-			second.hash,
+			second.hash.into_bytes(),
 			Some(second.size),
 			ArtifactLifetime::Session,
 		)
@@ -322,7 +332,7 @@ fn catalog_list_is_bounded_and_uses_a_stable_keyset_cursor() {
 	for byte in 0..=MAX_ARTIFACT_PAGE {
 		let reference = store.put(&byte.to_le_bytes()).expect("put listed artifact");
 		catalog
-			.adopt(&session("list"), reference.hash, None, ArtifactLifetime::Session)
+			.adopt(&session("list"), reference.hash.into_bytes(), None, ArtifactLifetime::Session)
 			.expect("adopt listed artifact");
 	}
 
@@ -349,10 +359,20 @@ fn journal_artifact_ordinals_mark_catalog_content_reachable() {
 		.expect("put unreferenced");
 	let mut catalog = ArtifactCatalog::open(&store).expect("open artifact catalog");
 	let record = catalog
-		.adopt(&session("catalog-journal"), referenced.hash, None, ArtifactLifetime::Session)
+		.adopt(
+			&session("catalog-journal"),
+			referenced.hash.into_bytes(),
+			None,
+			ArtifactLifetime::Session,
+		)
 		.expect("adopt referenced");
 	catalog
-		.adopt(&session("catalog-journal"), unreferenced.hash, None, ArtifactLifetime::Session)
+		.adopt(
+			&session("catalog-journal"),
+			unreferenced.hash.into_bytes(),
+			None,
+			ArtifactLifetime::Session,
+		)
 		.expect("adopt unreferenced");
 	journal(directory.path(), "catalog-journal", [json!({
 		"ts": 1,
@@ -377,7 +397,7 @@ fn artifact_urls_are_session_local_until_durable_digest_promotion() {
 	let reference = store.put(b"cross-session artifact").expect("put artifact");
 	let mut catalog = ArtifactCatalog::open(&store).expect("open artifact catalog");
 	let local = catalog
-		.adopt(&session("source"), reference.hash, None, ArtifactLifetime::Session)
+		.adopt(&session("source"), reference.hash.into_bytes(), None, ArtifactLifetime::Session)
 		.expect("adopt local artifact");
 	assert_eq!(local.url(), ArtifactUrl::from_ordinal(0));
 	assert_eq!(local.url_for(&session("other")), None);

@@ -17,7 +17,7 @@ use std::{
 use std::{fs::OpenOptions, os::fd::AsRawFd as _};
 
 use bytes::Bytes;
-use omp_core::{Str, encoding::hex, sf};
+use omp_core::{Hash32, Str, encoding::hex, sf};
 use omp_proto::{document::v1 as document_pb, env::v1 as pb};
 use omp_walker::{FileType, WalkOrder};
 use parking_lot::Mutex;
@@ -464,10 +464,10 @@ impl WorkspaceOperations {
 			return Err(WorkspaceError::Cancelled.into());
 		}
 		let reference = manifest.finish().map_err(BlobError::from)?;
-		let snapshot_id = hex::encode(&reference.hash).into_string();
+		let snapshot_id = reference.hash.to_string();
 		Ok(pb::WorkspaceSnapshot {
 			snapshot_id,
-			manifest_hash: Bytes::copy_from_slice(&reference.hash),
+			manifest_hash: Bytes::copy_from_slice(reference.hash.as_bytes()),
 			files,
 			bytes,
 			props: Default::default(),
@@ -543,7 +543,7 @@ impl WorkspaceOperations {
 				.unwrap_or(document_pb::DocumentPresence::Unspecified);
 			if presence == document_pb::DocumentPresence::Present {
 				let content = read_whole(&self.inner.documents, &lease).await?;
-				let actual = *blake3::hash(&content).as_bytes();
+				let actual = Hash32::sum(&content).into_bytes();
 				let mode = fs::metadata(&path).map_or(0, |metadata| file_mode(&metadata));
 				if actual == entry.hash && mode == entry.mode {
 					continue;

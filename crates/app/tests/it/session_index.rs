@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use omp_agent::Journal;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::{
 	index::{NewSession, SessionFilter, SessionIndex, SessionKind},
@@ -58,9 +58,9 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 		.start_turn(3, TurnStart {
 			turn_id:            sf!("turn-1"),
 			item_events:        Vec::new(),
-			prompt_hash:        [7; 32],
+			prompt_hash:        Hash32::new([7; 32]),
 			prompt_head_events: Vec::new(),
-			toolset_hash:       [8; 32],
+			toolset_hash:       Hash32::new([8; 32]),
 			enabled_tools:      Vec::new(),
 			sequence_targets:   Vec::new(),
 			input:              TurnInputRecord::Full {

@@ -107,7 +107,8 @@ pub fn tool() -> Yield {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("yield.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

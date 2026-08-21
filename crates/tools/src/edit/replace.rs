@@ -99,7 +99,8 @@ pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy)
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("replace.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

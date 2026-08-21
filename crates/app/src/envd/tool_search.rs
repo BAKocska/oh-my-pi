@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use omp_hashline::{RevisionToken, compute_snapshot_tag};
 use omp_tools::{
 	glob::{self, WalkMatch, WalkResult},
@@ -565,7 +565,7 @@ fn prepare_grep_snapshot(source_key: Str, path: &Path) -> Option<SearchSnapshot>
 		return None;
 	}
 	let bytes = Bytes::from(std::fs::read(path).ok()?);
-	let revision = Bytes::copy_from_slice(blake3::hash(&bytes).as_bytes());
+	let revision = Bytes::copy_from_slice(Hash32::sum(&bytes).as_bytes());
 	Some(SearchSnapshot { source_key, revision, bytes })
 }
 

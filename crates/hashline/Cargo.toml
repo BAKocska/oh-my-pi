@@ -12,7 +12,6 @@ description = "Disk-free hashline patch parsing and application over immutable b
 workspace = true
 
 [dependencies]
-blake3 = { workspace = true }
 bytes = { workspace = true }
 omp-ast = { workspace = true }
 im = { workspace = true }

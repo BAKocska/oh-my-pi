@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_core::{IntoStr, InvocationPhase, Str, sf};
+use omp_core::{Hash32, IntoStr, InvocationPhase, Str, sf};
 use omp_env::EnvClient;
 use omp_llm_inference::TurnId;
 use omp_proto::{
@@ -136,9 +136,9 @@ pub enum AgentError {
 	#[error("durable turn toolset differs from the authoritative registry")]
 	ToolsetMismatch {
 		/// Registry identity fixed by the durable turn start.
-		durable: [u8; 32],
+		durable: Hash32,
 		/// Registry identity published when replay was attempted.
-		current: [u8; 32],
+		current: Hash32,
 	},
 	/// An in-turn duplex invocation failed.
 	#[error("in-turn invocation failed: {0}")]
@@ -198,7 +198,7 @@ pub struct Agent<C: TurnClient> {
 	execution_mode: ExecutionModeHandle,
 	continuation_source: Option<Arc<dyn ContinuationSource>>,
 	loop_signal: LoopSignal,
-	last_toolset_hash: Option<[u8; 32]>,
+	last_toolset_hash: Option<Hash32>,
 	firehose: Arc<Firehose>,
 }
 
@@ -1142,7 +1142,7 @@ impl<C: TurnClient> Agent<C> {
 			let start = TurnStart {
 				turn_id: turn_id.as_str().to_str(),
 				item_events: input_events.clone(),
-				prompt_hash: self.prompt_hash.expect("prompt rendered").into_bytes(),
+				prompt_hash: self.prompt_hash.expect("prompt rendered").digest(),
 				prompt_head_events: self.prompt_head_events.clone(),
 				toolset_hash,
 				enabled_tools: frozen_enabled_tools.to_vec(),
@@ -1874,7 +1874,7 @@ fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
 }
 
 fn tool_call_digest(items: &[Item]) -> Option<Str> {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	let mut calls = 0_u32;
 	for item in items {
 		let Some(thread::item::Kind::ToolCall(call)) = &item.kind else {
@@ -2265,7 +2265,7 @@ mod tests {
 			.start_turn(1, TurnStart {
 				turn_id:            sf!("durable-turn"),
 				item_events:        Vec::new(),
-				prompt_hash:        [7; 32],
+				prompt_hash:        Hash32::new([7; 32]),
 				prompt_head_events: Vec::new(),
 				toolset_hash:       registry.slot_hash(),
 				enabled_tools:      vec![sf!("old")],

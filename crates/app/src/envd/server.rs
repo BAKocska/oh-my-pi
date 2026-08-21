@@ -14,7 +14,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_env::{EnvClient, InProcessEnvTransport};
 use omp_proto::{
 	blob::v1 as blob_pb,
@@ -312,7 +312,7 @@ impl ExtensionDataBinding {
 		session_id: &str,
 		session_generation: u64,
 	) -> Self {
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp/extension-data-binding/v1");
 		hasher.update(&(session_id.len() as u64).to_le_bytes());
 		hasher.update(session_id.as_bytes());
@@ -321,7 +321,7 @@ impl ExtensionDataBinding {
 			hasher.update(&(field.len() as u64).to_le_bytes());
 			hasher.update(field.as_bytes());
 		}
-		let digest = omp_core::encoding::hex::encode_n(hasher.finalize().as_bytes());
+		let digest = hasher.finalize().to_hex();
 		let grants = Grants::supported([
 			"env.doc.read",
 			"env.doc.write",
@@ -5577,7 +5577,7 @@ pub async fn run_with_registry(args: EnvdArgs, registry: Registry) -> Result<(),
 			session_id.as_str(),
 			session_generation,
 		);
-		let mut digest = blake3::Hasher::new();
+		let mut digest = Hash32::hasher();
 		digest.update(crate::build_id::current().as_bytes());
 		digest.update(env!("CARGO_PKG_VERSION").as_bytes());
 		digest.update(crate::envd::worker::PY_EVAL_MODULE.as_bytes());
@@ -5585,7 +5585,7 @@ pub async fn run_with_registry(args: EnvdArgs, registry: Registry) -> Result<(),
 			sf!("omp-first-party"),
 			sf!(crate::envd::worker::PY_EVAL_MODULE),
 			sf!(env!("CARGO_PKG_VERSION")),
-			omp_core::ArtifactDigest::new(*digest.finalize().as_bytes()),
+			omp_core::ArtifactDigest::new(digest.finalize().into_bytes()),
 			sf!("workspace"),
 			sf!("trusted"),
 			1,

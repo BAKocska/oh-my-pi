@@ -7,7 +7,7 @@ use std::{
 	sync::Arc,
 };
 
-use omp_core::{ArtifactDigest, InvocationPhase, Principal, Provenance, Str, sf};
+use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, sf};
 use omp_proto::{inference::v1::Outcome, thread::v1::Item};
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
 use omp_storage::{
@@ -32,8 +32,8 @@ use crate::{
 	journal_kinds::{EntryKindDecl, EntryKindError, EntryKindRegistry},
 	prompt::PromptHash,
 };
-type ActivePrompt = ([u8; 32], Vec<u64>);
-type PendingItem = (u64, Item, Option<[u8; 32]>);
+type ActivePrompt = (Hash32, Vec<u64>);
+type PendingItem = (u64, Item, Option<Hash32>);
 type ReplayKey = (Str, Str, Str);
 struct IndexedAppend {
 	index:       u64,
@@ -1848,7 +1848,7 @@ impl Journal {
 			kind: Kind::Item(ItemRecord {
 				item,
 				turn_id: None,
-				prompt_hash: prompt_hash.map(PromptHash::into_bytes),
+				prompt_hash: prompt_hash.map(PromptHash::digest),
 			}),
 		})?;
 		self.item_count = self.item_count.saturating_add(1);
@@ -1870,7 +1870,7 @@ impl Journal {
 			kind: Kind::TurnInput(TurnInputItem {
 				turn_id: turn_id.clone(),
 				item,
-				prompt_hash: prompt_hash.map(PromptHash::into_bytes),
+				prompt_hash: prompt_hash.map(PromptHash::digest),
 			}),
 		})?;
 		self.item_count = self.item_count.saturating_add(1);
@@ -1912,7 +1912,7 @@ impl Journal {
 			}
 		}
 		let intent = PromptRewriteIntent {
-			prompt_hash:    prompt_hash.into_bytes(),
+			prompt_hash:    prompt_hash.digest(),
 			head:           head.to_vec(),
 			preserved_tail: preserved_tail.to_vec(),
 		};
@@ -1934,7 +1934,7 @@ impl Journal {
 				head_events: head_events.clone(),
 			}),
 		})?;
-		self.active_prompt = Some((prompt_hash.into_bytes(), head_events.clone()));
+		self.active_prompt = Some((prompt_hash.digest(), head_events.clone()));
 		Ok(head_events)
 	}
 
@@ -2452,7 +2452,7 @@ impl Journal {
 
 	/// Returns the authoritative committed prompt identity and head event IDs.
 	#[must_use]
-	pub fn active_prompt(&self) -> Option<([u8; 32], &[u64])> {
+	pub fn active_prompt(&self) -> Option<(Hash32, &[u64])> {
 		self
 			.active_prompt
 			.as_ref()
@@ -2920,9 +2920,9 @@ mod tests {
 			.start_turn(3, TurnStart {
 				turn_id:            sf!("turn"),
 				item_events:        vec![input],
-				prompt_hash:        hash.into_bytes(),
+				prompt_hash:        hash.digest(),
 				prompt_head_events: Vec::new(),
-				toolset_hash:       [3; 32],
+				toolset_hash:       Hash32::new([3; 32]),
 				enabled_tools:      vec![sf!("read")],
 				sequence_targets:   vec![input],
 				input:              TurnInputRecord::Full {
@@ -3016,9 +3016,9 @@ mod tests {
 			.start_turn(3, TurnStart {
 				turn_id:            sf!("turn"),
 				item_events:        vec![input],
-				prompt_hash:        hash.into_bytes(),
+				prompt_hash:        hash.digest(),
 				prompt_head_events: Vec::new(),
-				toolset_hash:       [3; 32],
+				toolset_hash:       Hash32::new([3; 32]),
 				enabled_tools:      vec![sf!("read")],
 				sequence_targets:   vec![input],
 				input:              TurnInputRecord::Full {
@@ -3107,9 +3107,9 @@ mod tests {
 			.start_turn(5, TurnStart {
 				turn_id:            Str::new(first_turn.as_str()),
 				item_events:        vec![first, settlement],
-				prompt_hash:        [0; 32],
+				prompt_hash:        Hash32::new([0; 32]),
 				prompt_head_events: Vec::new(),
-				toolset_hash:       [0; 32],
+				toolset_hash:       Hash32::new([0; 32]),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![first, settlement],
 				input:              TurnInputRecord::Full {
@@ -3137,9 +3137,9 @@ mod tests {
 			.start_turn(7, TurnStart {
 				turn_id:            Str::new(second_turn.as_str()),
 				item_events:        vec![second],
-				prompt_hash:        [0; 32],
+				prompt_hash:        Hash32::new([0; 32]),
 				prompt_head_events: Vec::new(),
-				toolset_hash:       [0; 32],
+				toolset_hash:       Hash32::new([0; 32]),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![second],
 				input:              TurnInputRecord::Full {
@@ -3184,9 +3184,9 @@ mod tests {
 			.start_turn(4, TurnStart {
 				turn_id:            sf!("turn"),
 				item_events:        vec![input_event],
-				prompt_hash:        prompt_hash.into_bytes(),
+				prompt_hash:        prompt_hash.digest(),
 				prompt_head_events: vec![prompt_event],
-				toolset_hash:       [8; 32],
+				toolset_hash:       Hash32::new([8; 32]),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![input_event],
 				input:              TurnInputRecord::Delta {
@@ -3210,7 +3210,7 @@ mod tests {
 			.append_gateway_outcome(5, "turn", expected.clone())
 			.expect("append outcome");
 		assert!(!replay);
-		assert_eq!(receipt.prompt_hash, prompt_hash.into_bytes());
+		assert_eq!(receipt.prompt_hash, prompt_hash.digest());
 		assert_eq!(receipt.prompt_head_events, vec![prompt_event]);
 		assert_eq!(receipt.outcome, expected);
 		let bytes = std::fs::read(&path).expect("read committed journal");
@@ -3256,9 +3256,9 @@ mod tests {
 		let start = TurnStart {
 			turn_id:            sf!("turn"),
 			item_events:        vec![input_event],
-			prompt_hash:        prompt_hash.into_bytes(),
+			prompt_hash:        prompt_hash.digest(),
 			prompt_head_events: vec![prompt_event],
-			toolset_hash:       [6; 32],
+			toolset_hash:       Hash32::new([6; 32]),
 			enabled_tools:      Vec::new(),
 			sequence_targets:   vec![input_event],
 			input:              TurnInputRecord::Full {
@@ -3300,9 +3300,9 @@ mod tests {
 		let start = TurnStart {
 			turn_id:            sf!("failed-turn-1"),
 			item_events:        Vec::new(),
-			prompt_hash:        [3; 32],
+			prompt_hash:        Hash32::new([3; 32]),
 			prompt_head_events: Vec::new(),
-			toolset_hash:       [4; 32],
+			toolset_hash:       Hash32::new([4; 32]),
 			enabled_tools:      Vec::new(),
 			sequence_targets:   Vec::new(),
 			input:              TurnInputRecord::Full { thread: thread_pb::Thread::default() },
@@ -3397,7 +3397,7 @@ mod tests {
 				.append(&Event {
 					ts:   4,
 					kind: Kind::PromptRewriteIntent(PromptRewriteIntent {
-						prompt_hash:    [2; 32],
+						prompt_hash:    Hash32::new([2; 32]),
 						head:           head.clone(),
 						preserved_tail: vec![tail],
 					}),
@@ -3434,7 +3434,7 @@ mod tests {
 			assert_eq!(live[2], tail);
 			let (active_hash, active_head) =
 				recovered.active_prompt().expect("active recovered prompt");
-			assert_eq!(active_hash, [2; 32]);
+			assert_eq!(active_hash, Hash32::new([2; 32]));
 			assert_eq!(active_head, &live[..2]);
 			assert!(!live.contains(&old_head));
 			assert_eq!(recovered.items_at(&live).expect("read rewritten items"), vec![
@@ -3639,9 +3639,9 @@ mod tests {
 			.start_turn(3, TurnStart {
 				turn_id:            sf!("pending"),
 				item_events:        vec![input],
-				prompt_hash:        [1; 32],
+				prompt_hash:        Hash32::new([1; 32]),
 				prompt_head_events: Vec::new(),
-				toolset_hash:       [2; 32],
+				toolset_hash:       Hash32::new([2; 32]),
 				enabled_tools:      Vec::new(),
 				sequence_targets:   vec![input],
 				input:              TurnInputRecord::Full {

@@ -71,10 +71,10 @@ pub fn current_user_pipe_scope() -> io::Result<omp_core::Str> {
 	}
 	// SAFETY: GetLengthSid returned the readable byte length of this live SID.
 	let sid = unsafe { std::slice::from_raw_parts(user.User.Sid.cast::<u8>(), sid_bytes) };
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = omp_core::Hash32::hasher();
 	hasher.update(b"omp/windows-user-pipe-scope/v1");
 	hasher.update(sid);
-	Ok(omp_core::encoding::hex::encode_n(hasher.finalize().as_bytes()))
+	Ok(hasher.finalize().to_hex())
 }
 
 /// Returns the current Windows account name from the authenticated process

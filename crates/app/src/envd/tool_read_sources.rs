@@ -14,7 +14,7 @@ use http::{
 	HeaderMap, HeaderName, HeaderValue, StatusCode,
 	header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
 };
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_hashline::RevisionToken;
 use omp_tools::read::{
 	DirectoryEntry, DirectorySource, Fault, ReadLease, ReadSources, SNAPSHOT_MAX_BYTES,
@@ -483,7 +483,7 @@ async fn open_filesystem_lease(canonical_path: Str) -> Result<ReadDocumentLease,
 		.await
 		.map(Bytes::from)
 		.map_err(|error| source_io("read", &canonical_path, error))?;
-	let revision = Str::from(format!("fs:{}", blake3::hash(&bytes).to_hex()));
+	let revision = Str::from(format!("fs:{}", Hash32::sum(&bytes).to_hex()));
 	Ok(ReadDocumentLease { backing: ReadLeaseBacking::File(bytes), revision, canonical_path })
 }
 

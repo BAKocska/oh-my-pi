@@ -15,7 +15,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_slopjson::{Object, Value};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, Constraint, DeviceIssue, DevicePath, DeviceTarget,
@@ -633,7 +633,7 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 
 #[derive(Clone)]
 struct CatalogCache {
-	hash:     [u8; 32],
+	hash:     Hash32,
 	rendered: Str,
 }
 
@@ -700,7 +700,8 @@ pub fn dyn_tool<I: DeviceInvoker + 'static>(
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("device.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

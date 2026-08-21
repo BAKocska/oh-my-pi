@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_proto::thread::v1::{self as thread, Item};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -78,18 +78,18 @@ impl WorkspaceInput {
 /// Stable BLAKE3 digest of the canonical prompt items.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct PromptHash([u8; 32]);
+pub struct PromptHash(Hash32);
 
 impl PromptHash {
 	/// Returns the digest bytes.
 	#[inline]
 	pub const fn as_bytes(&self) -> &[u8; 32] {
-		&self.0
+		self.0.as_bytes()
 	}
 
-	/// Consumes the digest and returns its bytes.
+	/// Returns the typed digest.
 	#[inline]
-	pub const fn into_bytes(self) -> [u8; 32] {
+	pub const fn digest(self) -> Hash32 {
 		self.0
 	}
 }
@@ -97,11 +97,25 @@ impl PromptHash {
 impl From<[u8; 32]> for PromptHash {
 	#[inline]
 	fn from(bytes: [u8; 32]) -> Self {
-		Self(bytes)
+		Self(Hash32::new(bytes))
 	}
 }
 
 impl From<PromptHash> for [u8; 32] {
+	#[inline]
+	fn from(hash: PromptHash) -> Self {
+		hash.0.into_bytes()
+	}
+}
+
+impl From<Hash32> for PromptHash {
+	#[inline]
+	fn from(hash: Hash32) -> Self {
+		Self(hash)
+	}
+}
+
+impl From<PromptHash> for Hash32 {
 	#[inline]
 	fn from(hash: PromptHash) -> Self {
 		hash.0
@@ -498,14 +512,11 @@ impl SlotAssembler {
 		let (items, bands) = self
 			.banded_render(workspace)?
 			.expect("slot assembler is banded");
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		for band in bands {
 			hasher.update(band.as_bytes());
 		}
-		Ok((
-			RenderedPrompt { items: items.into(), hash: PromptHash(*hasher.finalize().as_bytes()) },
-			bands,
-		))
+		Ok((RenderedPrompt { items: items.into(), hash: PromptHash(hasher.finalize()) }, bands))
 	}
 
 	fn assemble(&self, workspace: &WorkspaceInput) -> Result<AssembledSlots, PromptError> {
@@ -569,7 +580,7 @@ struct AssembledSlots {
 }
 
 fn hash_band(bytes: &[u8]) -> BandHash {
-	BandHash(*blake3::hash(bytes).as_bytes())
+	BandHash(Hash32::sum(bytes).into_bytes())
 }
 
 /// A checked canonical prompt head and its content hash.
@@ -676,14 +687,11 @@ pub fn render_prompt(
 ) -> Result<RenderedPrompt, PromptError> {
 	if let Some((items, bands)) = source.banded_render(workspace)? {
 		validate_items(&items)?;
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		for band in bands {
 			hasher.update(band.as_bytes());
 		}
-		return Ok(RenderedPrompt {
-			items: items.into(),
-			hash:  PromptHash(*hasher.finalize().as_bytes()),
-		});
+		return Ok(RenderedPrompt { items: items.into(), hash: PromptHash(hasher.finalize()) });
 	}
 	let first = source.render(workspace)?;
 	validate_items(&first)?;
@@ -694,9 +702,9 @@ pub fn render_prompt(
 	}
 	drop(second);
 
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	serde_json::to_writer(&mut hasher, &first)?;
-	let hash = PromptHash(*hasher.finalize().as_bytes());
+	let hash = PromptHash(hasher.finalize());
 	Ok(RenderedPrompt { items: first.into(), hash })
 }
 
@@ -737,7 +745,7 @@ fn system_text(text: String) -> Item {
 
 impl fmt::Display for PromptHash {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{}", blake3::Hash::from_bytes(self.0))
+		self.0.fmt(formatter)
 	}
 }
 

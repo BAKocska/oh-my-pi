@@ -71,7 +71,8 @@ pub fn tool() -> Think {
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("think.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

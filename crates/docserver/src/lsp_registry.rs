@@ -9,7 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use globset::{Glob, GlobMatcher};
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use parking_lot::Mutex;
 use serde_json::Value;
 use thiserror::Error;
@@ -2286,7 +2286,7 @@ fn record_public_version(
 }
 
 fn format_shadow_document(request: &FormatRequest) -> DocumentId {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(b"omp-lsp-format-shadow-v1\0");
 	hasher.update(request.base().head().document_id().as_bytes());
 	hasher.update(request.transaction_id().as_bytes());

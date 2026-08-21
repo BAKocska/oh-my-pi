@@ -67,8 +67,11 @@ fn opener_command(target: &str) -> Command {
 		[system_root.as_str(), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"]
 			.iter()
 			.collect();
-	let powershell =
-		if absolute.is_file() { absolute } else { PathBuf::from("powershell.exe") };
+	let powershell = if absolute.is_file() {
+		absolute
+	} else {
+		PathBuf::from("powershell.exe")
+	};
 
 	let script =
 		format!("$ErrorActionPreference='Stop';Start-Process '{}'", target.replace('\'', "''"));
@@ -104,9 +107,7 @@ fn opener_command(target: &str) -> Command {
 fn wsl_windows_path(target: &str) -> Option<String> {
 	use std::path::PathBuf;
 
-	if std::env::var_os("WSL_DISTRO_NAME").is_none()
-		&& std::env::var_os("WSL_INTEROP").is_none()
-	{
+	if std::env::var_os("WSL_DISTRO_NAME").is_none() && std::env::var_os("WSL_INTEROP").is_none() {
 		return None;
 	}
 	if !on_path("wslview") {

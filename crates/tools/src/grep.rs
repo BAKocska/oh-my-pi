@@ -401,7 +401,8 @@ pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W,
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
 				include_bytes!("grep.rs"),
-			),
+			)
+			.into(),
 		},
 	}
 }

@@ -474,7 +474,7 @@ fn parse_blob_source(source: &str) -> Result<([u8; 32], Option<u64>), Str> {
 		.transpose()
 		.map_err(display_error)?;
 	BlobRef::parse_hex(digest, claimed_size.unwrap_or_default())
-		.map(|reference| (reference.hash, claimed_size))
+		.map(|reference| (reference.hash.into(), claimed_size))
 		.map_err(display_error)
 }
 
@@ -498,7 +498,7 @@ fn artifact_row(record: &ArtifactRecord, session: &SessionId) -> Option<Artifact
 	let lifetime: &'static str = record.lifetime.into();
 	Some(ArtifactRow {
 		url:      record.url_for(session)?.as_str().to_owned(),
-		hash:     Bytes::copy_from_slice(&record.reference.hash),
+		hash:     Bytes::copy_from_slice(record.reference.hash.as_bytes()),
 		size:     record.reference.size,
 		lifetime: lifetime.to_owned(),
 		pinned:   record.pinned,

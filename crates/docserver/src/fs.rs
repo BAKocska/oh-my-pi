@@ -13,6 +13,8 @@ use std::{
 
 use bytes::Bytes;
 use cap_std::fs::{Dir, Metadata, OpenOptions};
+#[cfg(test)]
+use omp_core::Hash32;
 use omp_core::{Str, sf};
 #[cfg(test)]
 use parking_lot::Mutex;
@@ -2654,7 +2656,7 @@ mod tests {
 			panic!("file should be present");
 		};
 		assert_eq!(content.as_ref(), bytes);
-		assert_eq!(fingerprint.content_hash(), blake3::hash(bytes).as_bytes());
+		assert_eq!(fingerprint.content_hash(), Hash32::sum(bytes).as_bytes());
 		assert_eq!(
 			filesystem
 				.stable_read(filesystem.root_path().join("missing"))

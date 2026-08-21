@@ -27,10 +27,7 @@ use std::{
 use bytes::Bytes;
 use cap_std::{ambient_authority, fs::Dir};
 use omp_ar::{Archive, Format};
-use omp_core::{
-	Str,
-	encoding::hex::{self, ArrayStr},
-};
+use omp_core::{Hash32, Str, encoding::hex::ArrayStr, hash32::Hasher};
 use serde::{
 	Deserialize, Deserializer, Serialize, Serializer,
 	de::{self, Visitor},
@@ -45,7 +42,7 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct BlobRef {
 	/// The BLAKE3-256 digest of the blob contents.
-	pub hash: [u8; 32],
+	pub hash: Hash32,
 	/// The blob length in bytes.
 	pub size: u64,
 }
@@ -55,7 +52,7 @@ impl BlobRef {
 	/// storage.
 	#[must_use]
 	pub const fn to_hex(&self) -> ArrayStr<32> {
-		hex::encode_n(&self.hash)
+		self.hash.to_hex()
 	}
 
 	/// Parses a 64-character lowercase hexadecimal digest with the supplied byte
@@ -97,7 +94,7 @@ impl<'de> Deserialize<'de> for BlobRef {
 		#[derive(Deserialize)]
 		struct WireRef {
 			#[serde(rename = "h", deserialize_with = "deserialize_hash")]
-			hash: [u8; 32],
+			hash: Hash32,
 			#[serde(rename = "n")]
 			size: u64,
 		}
@@ -273,7 +270,7 @@ impl BlobStore {
 			store: self.clone(),
 			file: Some(file),
 			temporary,
-			hasher: blake3::Hasher::new(),
+			hasher: Hash32::hasher(),
 			size: 0,
 			failed: false,
 		})
@@ -326,7 +323,7 @@ impl BlobStore {
 	/// it cannot be read.
 	pub fn verify(&self, reference: &BlobRef) -> Result<bool, Error> {
 		let mut file = File::open(self.path(reference)).map_err(map_read_error)?;
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		let mut size = 0_u64;
 		let mut buffer = vec![0_u8; COPY_BUFFER_SIZE].into_boxed_slice();
 
@@ -347,7 +344,7 @@ impl BlobStore {
 				.ok_or_else(|| io::Error::other("blob length exceeds u64"))?;
 		}
 
-		Ok(size == reference.size && hasher.finalize().as_bytes() == &reference.hash)
+		Ok(size == reference.size && hasher.finalize().as_bytes() == reference.hash.as_bytes())
 	}
 
 	/// Returns the immutable unpacked-wheel directory for `wheel`.
@@ -477,7 +474,7 @@ pub struct BlobStage {
 	store:     BlobStore,
 	file:      Option<File>,
 	temporary: TemporaryPath,
-	hasher:    blake3::Hasher,
+	hasher:    Hasher,
 	size:      u64,
 	failed:    bool,
 }
@@ -502,7 +499,7 @@ impl BlobStage {
 		file.sync_all()?;
 		drop(file);
 
-		let reference = BlobRef { hash: *self.hasher.finalize().as_bytes(), size: self.size };
+		let reference = BlobRef { hash: self.hasher.finalize(), size: self.size };
 		let destination = self.store.path(&reference);
 		if destination.try_exists()? {
 			return Ok(reference);
@@ -622,27 +619,18 @@ fn set_read_only(path: &Path) -> io::Result<()> {
 	fs::set_permissions(path, permissions)
 }
 
-fn parse_hash(hash: &str) -> Result<[u8; 32], Error> {
-	if hash.len() != 64
-		|| !hash
-			.bytes()
-			.all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-	{
-		return Err(Error::BadHex);
-	}
-	hex::decode(hash)
-		.into_array::<32>()
-		.map_err(|_| Error::BadHex)
+fn parse_hash(hash: &str) -> Result<Hash32, Error> {
+	hash.parse().map_err(|_| Error::BadHex)
 }
 
-fn deserialize_hash<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+fn deserialize_hash<'de, D>(deserializer: D) -> Result<Hash32, D::Error>
 where
 	D: Deserializer<'de>,
 {
 	struct HashVisitor;
 
 	impl Visitor<'_> for HashVisitor {
-		type Value = [u8; 32];
+		type Value = Hash32;
 
 		fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 			formatter.write_str("64 lowercase hexadecimal characters")
@@ -677,7 +665,7 @@ mod tests {
 	use omp_ar::zip::Writer;
 	use tempfile::tempdir;
 
-	use super::{BlobRef, BlobStore, Error, WheelName};
+	use super::{BlobRef, BlobStore, Error, Hash32, WheelName};
 
 	#[test]
 	fn put_get_round_trip() {
@@ -704,7 +692,7 @@ mod tests {
 	fn has_changes_after_put() {
 		let directory = tempdir().unwrap();
 		let store = BlobStore::open(directory.path()).unwrap();
-		let expected = BlobRef { hash: *blake3::hash(b"present later").as_bytes(), size: 13 };
+		let expected = BlobRef { hash: Hash32::sum(b"present later"), size: 13 };
 
 		assert!(!store.has(&expected));
 		assert_eq!(store.put(b"present later").unwrap(), expected);
@@ -733,7 +721,7 @@ mod tests {
 
 	#[test]
 	fn blob_ref_json_hex_round_trip() {
-		let reference = BlobRef { hash: [0; 32], size: 7 };
+		let reference = BlobRef { hash: Hash32::new([0; 32]), size: 7 };
 		let json = serde_json::to_string(&reference).unwrap();
 
 		assert_eq!(

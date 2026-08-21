@@ -150,8 +150,7 @@ fn auth_input(prompt: &AuthPrompt, value: &str) -> Result<AuthInput> {
 		&& matches!(
 			prompt.input,
 			AuthPromptKind::AuthorizationCode | AuthPromptKind::ApiKey | AuthPromptKind::SessionToken
-		)
-	{
+		) {
 		return Err(miette!("authentication input must not be empty"));
 	}
 	let kind = match prompt.input {
