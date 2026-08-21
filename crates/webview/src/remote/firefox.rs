@@ -337,7 +337,7 @@ fn write_prefs(profile: &Path, page: &PageOptions) -> Result<()> {
 	));
 	if let Some(ua) = &page.user_agent {
 		let escaped = ua.replace('\\', "\\\\").replace('"', "\\\"");
-		write!(prefs, "user_pref(\"general.useragent.override\", \"{escaped}\");\n")
+		writeln!(prefs, "user_pref(\"general.useragent.override\", \"{escaped}\");")
 			.expect("writing to a String cannot fail");
 	}
 	std::fs::write(profile.join("user.js"), prefs)?;
