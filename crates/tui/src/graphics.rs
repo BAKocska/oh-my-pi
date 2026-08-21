@@ -1349,7 +1349,7 @@ mod tests {
 		assert!(results.xterm_scroll_to_bottom_on_output);
 		assert!(!results.xterm_scroll_to_bottom_on_key_press);
 		assert!(results.supports_sixel());
-		assert_eq!(preserved, [] as [u8; 0]);
+		assert!(preserved.is_empty());
 	}
 
 	#[test]
@@ -1373,7 +1373,7 @@ mod tests {
 		assert!(results.in_band_resize_set);
 		assert!(results.paste_events);
 		assert!(results.supports_sixel());
-		assert_eq!(preserved, [] as [u8; 0]);
+		assert!(preserved.is_empty());
 	}
 
 	#[test]
@@ -1407,7 +1407,7 @@ mod tests {
 		assert_eq!(results.sixel_status, Some(0));
 		assert_eq!(results.sixel_color_registers, Some(1692));
 		assert!(results.supports_sixel());
-		assert_eq!(preserved, [] as [u8; 0]);
+		assert!(preserved.is_empty());
 
 		// Status 0 with a zero maximum geometry means no SIXEL support.
 		let (results, _) = parse([b"\x1b[?2;0;0;0S".to_vec()]);
@@ -1421,7 +1421,7 @@ mod tests {
 		let (results, preserved) = parse([b"\x1b[?2;0;100000S".to_vec()]);
 		assert_eq!(results.sixel_color_registers, Some(u16::MAX));
 		assert!(results.supports_sixel());
-		assert_eq!(preserved, [] as [u8; 0]);
+		assert!(preserved.is_empty());
 	}
 
 	#[test]
@@ -1459,14 +1459,14 @@ mod tests {
 			let response = format!("\x1b[?2026;{status}$y").into_bytes();
 			let (probe, preserved) = parse([response]);
 			assert_eq!(probe.sync_output, Some(true));
-			assert_eq!(preserved, [] as [u8; 0]);
+			assert!(preserved.is_empty());
 			assert!(TerminalCaps::resolve(base, Some(&probe), None).sync_output);
 		}
 		for status in [0, 3, 4] {
 			let response = format!("\x1b[?2026;{status}$y").into_bytes();
 			let (probe, preserved) = parse([response]);
 			assert_eq!(probe.sync_output, Some(false));
-			assert_eq!(preserved, [] as [u8; 0]);
+			assert!(preserved.is_empty());
 		}
 	}
 
@@ -1476,7 +1476,7 @@ mod tests {
 			for status in 0..=4 {
 				let response = format!("\x1b[{mode};{status}$y").into_bytes();
 				let (probe, preserved) = parse([response]);
-				assert_eq!(preserved, [] as [u8; 0]);
+				assert!(preserved.is_empty());
 				assert_eq!(
 					probe.insert_mode_set,
 					mode == 4 && status == 1,
@@ -1499,7 +1499,7 @@ mod tests {
 				let (probe, preserved) = parse([response]);
 				let supported = matches!(status, 1..=3);
 				let set = matches!(status, 1 | 3);
-				assert_eq!(preserved, [] as [u8; 0]);
+				assert!(preserved.is_empty());
 				assert_eq!(
 					probe.appearance_notifications,
 					mode == 2031 && supported,
@@ -1530,7 +1530,7 @@ mod tests {
 			for status in [1, 2, 3, 4] {
 				let response = format!("\x1b[?{mode};{status}$y").into_bytes();
 				let (probe, preserved) = parse([response]);
-				assert_eq!(preserved, [] as [u8; 0]);
+				assert!(preserved.is_empty());
 				assert_eq!(
 					probe.xterm_scroll_to_bottom_on_output,
 					mode == 1010 && status == 1,
@@ -1549,7 +1549,7 @@ mod tests {
 	fn kitty_keyboard_flags_parse_across_chunk_boundaries() {
 		let (probe, preserved) = parse(b"\x1b[?13u".iter().map(|byte| vec![*byte]));
 		assert_eq!(probe.kitty_keyboard, Some(13));
-		assert_eq!(preserved, [] as [u8; 0]);
+		assert!(preserved.is_empty());
 		let base = detect(&[], TerminalPlatform::Linux);
 		assert_eq!(TerminalCaps::resolve(base, Some(&probe), None).kitty_keyboard, Some(13));
 	}
@@ -1846,7 +1846,7 @@ mod tests {
 		let mut tty = EmptyTty::default();
 		let probe = probe_terminal(&mut tty, Duration::from_millis(2));
 		assert!(probe.timed_out);
-		assert_eq!(probe.preserved_input, [] as [u8; 0]);
+		assert!(probe.preserved_input.is_empty());
 		let detected = super::detect();
 		assert_eq!(
 			tty.0,

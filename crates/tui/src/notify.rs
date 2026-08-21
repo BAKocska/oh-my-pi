@@ -739,7 +739,7 @@ mod tests {
 		let notification = Notification::builder().title("Build").body("done").build();
 		let mut actual = Vec::new();
 		notify_with_system(&mut actual, &caps(NotifyProtocol::Osc9), &notification, &system).unwrap();
-		assert_eq!(actual, [] as [u8; 0]);
+		assert!(actual.is_empty());
 		assert_eq!(strings(&system.spawns.borrow()[0]), [
 			"cmux",
 			"notify",

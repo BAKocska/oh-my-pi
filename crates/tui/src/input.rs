@@ -1815,7 +1815,7 @@ mod tests {
 		events.clear();
 		decoder.keymap_mut().disable(chord);
 		decoder.feed(b"\x1bf", start, &mut events);
-		assert_eq!(events, [] as [InputEvent; 0]);
+		assert!(events.is_empty());
 
 		decoder.keymap_mut().bind(chord, Key::PageDown);
 		decoder.feed(b"\x1bf", start, &mut events);
@@ -1873,7 +1873,7 @@ mod tests {
 		decoder.set_kitty_keyboard(true);
 		decoder.feed(b"\x1b", start, &mut events);
 		decoder.tick(start + Duration::from_millis(224), &mut events);
-		assert_eq!(events, [] as [InputEvent; 0]);
+		assert!(events.is_empty());
 		decoder.tick(start + Duration::from_millis(225), &mut events);
 		assert_eq!(events, [InputEvent::Key(Key::Esc)]);
 	}
@@ -1885,7 +1885,7 @@ mod tests {
 		assert_eq!(decoder.deadline(), None);
 
 		decoder.feed(b"\x1b[", start, &mut events);
-		assert_eq!(events, [] as [InputEvent; 0]);
+		assert!(events.is_empty());
 		assert_eq!(decoder.deadline(), Some(start + Duration::from_millis(75)));
 
 		decoder.tick(start + Duration::from_millis(75), &mut events);
@@ -1996,7 +1996,7 @@ mod tests {
 		let mut events = Vec::new();
 		decoder.feed(b"\x1b[?1;22;23", start, &mut events);
 		decoder.tick(start + Duration::from_millis(200), &mut events);
-		assert_eq!(events, [] as [InputEvent; 0]);
+		assert!(events.is_empty());
 		decoder.feed(b";24;28;32;42;52c", start + Duration::from_millis(300), &mut events);
 		assert_eq!(events, [InputEvent::Response(TerminalResponse::DeviceAttributes(
 			"?1;22;23;24;28;32;42;52".into(),
@@ -2010,7 +2010,7 @@ mod tests {
 		let mut events = Vec::new();
 		decoder.feed(b"\x1b[?1;2", start, &mut events);
 		decoder.tick(start + Duration::from_millis(200), &mut events);
-		assert_eq!(events, [] as [InputEvent; 0]);
+		assert!(events.is_empty());
 		// A new escape can never continue a report: the stale partial is
 		// dropped as terminal noise and the arrow decodes normally.
 		decoder.feed(b"\x1b[A", start + Duration::from_millis(300), &mut events);

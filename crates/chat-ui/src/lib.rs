@@ -367,7 +367,7 @@ pub enum BackendEvent {
 	},
 	/// Append a semantic transcript boundary or error frame.
 	TranscriptFrame(TranscriptFrame),
-	/// Replace the live AgentTree roster projection.
+	/// Replace the live `AgentTree` roster projection.
 	AgentRoster(Vec<AgentRow>),
 	/// Request the core-owned settings seam.
 	OpenSettings,

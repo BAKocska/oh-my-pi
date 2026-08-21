@@ -15,8 +15,9 @@
 // Sessions live in this module for the lifetime of the agent session; the
 // child and its terminal are torn down on `stop` or shutdown.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as net from "node:net";
+import type * as CanvasModule from "@napi-rs/canvas";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -53,7 +54,10 @@ interface ToolUpdate {
 	details?: Record<string, unknown>;
 }
 interface ToolResult {
-	content: { type: "text"; text: string }[];
+	content: (
+		| { type: "text"; text: string }
+		| { type: "image"; data: string; mimeType: string }
+	)[];
 	details?: Record<string, unknown>;
 }
 
@@ -74,7 +78,8 @@ interface TuiParams {
 		| "mouse"
 		| "send"
 		| "resize"
-		| "raw";
+		| "raw"
+		| "shot";
 	name?: string;
 	example?: string;
 	bin?: string;
@@ -126,11 +131,138 @@ function zeroWidth(cp: number): boolean {
 	);
 }
 
+/** Style attribute bits carried per cell. */
+const BOLD = 1;
+const DIM = 2;
+const ITALIC = 4;
+const UNDERLINE = 8;
+const REVERSE = 16;
+const STRIKE = 32;
+
+/** Interned SGR paint state shared by every cell painted under it (colors 0xRRGGBB). */
+interface Style {
+	fg: number | null;
+	bg: number | null;
+	flags: number;
+}
+
+/** One rendered cell: glyph (empty = wide-char continuation) + style (null = default). */
+interface Cell {
+	ch: string;
+	st: Style | null;
+}
+
+const BLANK: Cell = { ch: " ", st: null };
+
+/** xterm's default 16-color palette. */
+const PALETTE16 = [
+	0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5,
+	0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
+];
+
+/** xterm 256-color index → 0xRRGGBB (16 basic, 6×6×6 cube, 24 grays). */
+function color256(index: number): number {
+	if (index < 16) return PALETTE16[index] ?? PALETTE16[0];
+	let r: number;
+	let g: number;
+	let b: number;
+	if (index < 232) {
+		const cube = index - 16;
+		r = Math.floor(cube / 36);
+		g = Math.floor(cube / 6) % 6;
+		b = cube % 6;
+		r = r === 0 ? 0 : 55 + 40 * r;
+		g = g === 0 ? 0 : 55 + 40 * g;
+		b = b === 0 ? 0 : 55 + 40 * b;
+	} else {
+		r = g = b = 8 + 10 * (index - 232);
+	}
+	return (r << 16) | (g << 8) | b;
+}
+
+// ─── PNG rasterizer ──────────────────────────────────────────────────────────
+//
+// `shot` rasterizes the emulator grid with @napi-rs/canvas (prebuilt Skia):
+// real system fonts with an explicit fallback stack (Menlo → nerd font →
+// braille → CJK → emoji), so icons, spinners, and wide text render as a
+// terminal would. Powerline separators (U+E0B0–E0B3) are drawn as vector
+// paths because font metrics leave gaps at cell edges. Imported lazily so a
+// missing install degrades only `shot`, not the tool.
+
+/** Cell pixel geometry. */
+const CW = 16;
+const CH = 32;
+/** Font size whose Menlo advance (~0.602 em) fits the 16px cell. */
+const FONT_PX = 26;
+/** Baseline offset inside a cell (Menlo 26px ascent ≈ 24.2px). */
+const BASELINE = 24;
+const DEF_FG = 0xd4d4d4;
+const DEF_BG = 0x101418;
+
+/** Lazily loaded canvas module + resolved font-family stack. */
+let canvasApi: { create: typeof CanvasModule.createCanvas; stack: string } | null = null;
+
 /**
- * Minimal VT100/xterm text-grid emulator fed every PTY byte. Styling (SGR) is
- * parsed and dropped; what remains is the plain-text screen a terminal would
- * show, so agents never have to decode raw escapes. Backs the `screen` op,
- * the socketless `text` fallback, and the after-screenshot on input ops.
+ * Loads @napi-rs/canvas and builds the fallback font stack from the fonts
+ * actually installed: Menlo, first nerd font, braille, CJK, emoji.
+ */
+async function loadCanvas() {
+	if (canvasApi) return canvasApi;
+	let mod: typeof CanvasModule;
+	try {
+		// Dynamic import: the dependency is optional — a missing
+		// `bun install` in .omp/tools must only disable `shot`, not fail
+		// the whole tool module at load.
+		mod = await import("@napi-rs/canvas");
+	} catch (error) {
+		throw new Error(
+			`shot needs @napi-rs/canvas — run \`bun install\` in .omp/tools (${error})`,
+		);
+	}
+	const families = mod.GlobalFonts.families.map((entry) => entry.family);
+	const stack = ["Menlo"];
+	const nerd =
+		families.find((family) => /nerd font mono/i.test(family)) ??
+		families.find((family) => /nerd font/i.test(family));
+	if (nerd) stack.push(nerd);
+	for (const wanted of [
+		"Apple Braille",
+		"PingFang SC",
+		"Hiragino Sans",
+		"Noto Sans CJK SC",
+		"Apple Color Emoji",
+		"Noto Color Emoji",
+	]) {
+		if (families.includes(wanted)) stack.push(wanted);
+	}
+	canvasApi = {
+		create: mod.createCanvas,
+		stack: stack.map((family) => `"${family}"`).join(", "),
+	};
+	return canvasApi;
+}
+
+/** 0xRRGGBB → CSS hex color. */
+function css(rgb: number): string {
+	return `#${rgb.toString(16).padStart(6, "0")}`;
+}
+
+/** Per-channel linear blend of two 0xRRGGBB colors. */
+function lerpColor(from: number, to: number, t: number): number {
+	const channel = (shift: number) => {
+		const a = (from >> shift) & 0xff;
+		const b = (to >> shift) & 0xff;
+		return Math.round(a + (b - a) * t) << shift;
+	};
+	return channel(16) | channel(8) | channel(0);
+}
+
+/**
+ * Minimal VT100/xterm cell-grid emulator fed every PTY byte. Text and SGR
+ * styling are both tracked, so any session — omp-tui host or not — can be
+ * read as plain text (`snapshot`) or rasterized to pixels (`png`). Backs the
+ * `screen`/`shot` ops, the socketless `text` fallback, and the
+ * after-screenshot on input ops.
  */
 class Screen {
 	cols: number;
@@ -139,8 +271,9 @@ class Screen {
 	scrollback: string[] = [];
 	altActive = false;
 	cursorVisible = true;
-	private grid: string[][];
-	private altGrid: string[][];
+	private grid: Cell[][];
+	private altGrid: Cell[][];
+	private current: Style | null = null;
 	private x = 0;
 	private y = 0;
 	private savedX = 0;
@@ -161,12 +294,18 @@ class Screen {
 		this.altGrid = Screen.blank(cols, rows);
 	}
 
-	private static blank(cols: number, rows: number): string[][] {
-		return Array.from({ length: rows }, () => new Array<string>(cols).fill(" "));
+	private static blank(cols: number, rows: number): Cell[][] {
+		return Array.from({ length: rows }, () => new Array<Cell>(cols).fill(BLANK));
 	}
 
-	private active(): string[][] {
+	private active(): Cell[][] {
 		return this.altActive ? this.altGrid : this.grid;
+	}
+
+	/** Blank cell for erases: carries the current background (bce), else default. */
+	private eraseCell(): Cell {
+		const bg = this.current?.bg;
+		return bg ? { ch: " ", st: { fg: null, bg, flags: 0 } } : BLANK;
 	}
 
 	feed(chunk: Buffer) {
@@ -185,18 +324,101 @@ class Screen {
 			out.push(`┆${line}`);
 		}
 		for (const row of this.active()) {
-			out.push(`│${row.join("").replace(/ +$/, "")}`);
+			out.push(`│${row.map((cell) => cell.ch).join("").replace(/ +$/, "")}`);
 		}
 		return out.join("\n");
 	}
 
+	/** Rasterizes the viewport to a PNG via Skia with real system fonts. */
+	async png(): Promise<Buffer> {
+		const { create, stack } = await loadCanvas();
+		const width = this.cols * CW;
+		const height = this.rows * CH;
+		const canvas = create(width, height);
+		const ctx = canvas.getContext("2d");
+		ctx.fillStyle = css(DEF_BG);
+		ctx.fillRect(0, 0, width, height);
+		const grid = this.active();
+		// Resolve each cell's paint once; draw backgrounds before any text so
+		// glyph overhang (italics, wide fallback) never sits under a
+		// neighbor's background.
+		const cells: { px: number; py: number; ch: string; fg: number; flags: number; span: number }[] =
+			[];
+		for (let y = 0; y < this.rows; y++) {
+			const row = grid[y];
+			for (let x = 0; x < this.cols; x++) {
+				const cell = row[x];
+				// Wide-char continuations are drawn by their lead cell.
+				if (cell.ch === "") continue;
+				const st = cell.st;
+				let fg = st?.fg ?? DEF_FG;
+				let bg = st?.bg ?? null;
+				if (st && st.flags & REVERSE) {
+					const swap = fg;
+					fg = bg ?? DEF_BG;
+					bg = swap;
+				}
+				if (st && st.flags & DIM) fg = lerpColor(fg, bg ?? DEF_BG, 0.45);
+				const span = x + 1 < this.cols && row[x + 1].ch === "" ? 2 : 1;
+				const px = x * CW;
+				const py = y * CH;
+				if (bg !== null) {
+					ctx.fillStyle = css(bg);
+					ctx.fillRect(px, py, span * CW, CH);
+				}
+				cells.push({ px, py, ch: cell.ch, fg, flags: st?.flags ?? 0, span });
+			}
+		}
+		for (const { px, py, ch, fg, flags, span } of cells) {
+			ctx.fillStyle = css(fg);
+			if (flags & UNDERLINE) ctx.fillRect(px, py + 28, span * CW, 2);
+			if (flags & STRIKE) ctx.fillRect(px, py + 15, span * CW, 2);
+			if (ch === " ") continue;
+			const cp = ch.codePointAt(0) ?? 0;
+			if (cp >= 0xe0b0 && cp <= 0xe0b3) {
+				// Powerline separators as vector paths: font metrics leave
+				// gaps at cell edges, which reads as broken bands.
+				ctx.beginPath();
+				if (cp <= 0xe0b1) {
+					ctx.moveTo(px, py);
+					ctx.lineTo(px + CW, py + CH / 2);
+					ctx.lineTo(px, py + CH);
+				} else {
+					ctx.moveTo(px + CW, py);
+					ctx.lineTo(px, py + CH / 2);
+					ctx.lineTo(px + CW, py + CH);
+				}
+				if (cp === 0xe0b0 || cp === 0xe0b2) {
+					ctx.closePath();
+					ctx.fill();
+				} else {
+					ctx.lineWidth = 2;
+					ctx.strokeStyle = css(fg);
+					ctx.stroke();
+				}
+				continue;
+			}
+			ctx.font =
+				`${flags & ITALIC ? "italic " : ""}${flags & BOLD ? "bold " : ""}` +
+				`${FONT_PX}px ${stack}`;
+			ctx.fillText(ch, px, py + BASELINE);
+		}
+		if (this.cursorVisible) {
+			ctx.globalAlpha = 0.4;
+			ctx.fillStyle = "#ffffff";
+			ctx.fillRect(this.x * CW, this.y * CH, CW, CH);
+			ctx.globalAlpha = 1;
+		}
+		return canvas.toBuffer("image/png");
+	}
+
 	resize(cols: number, rows: number) {
-		const fit = (grid: string[][]) => {
+		const fit = (grid: Cell[][]) => {
 			grid.length = Math.min(grid.length, rows);
-			while (grid.length < rows) grid.push(new Array<string>(cols).fill(" "));
+			while (grid.length < rows) grid.push(new Array<Cell>(cols).fill(BLANK));
 			for (const row of grid) {
 				row.length = Math.min(row.length, cols);
-				while (row.length < cols) row.push(" ");
+				while (row.length < cols) row.push(BLANK);
 			}
 		};
 		this.cols = cols;
@@ -338,8 +560,8 @@ class Screen {
 			// continuation cells) so columns stay aligned.
 			const row = this.active()[this.y];
 			let cell = this.wrapPending ? this.cols - 1 : this.x - 1;
-			while (cell > 0 && row[cell] === "") cell--;
-			if (cell >= 0) row[cell] += ch;
+			while (cell > 0 && row[cell].ch === "") cell--;
+			if (cell >= 0) row[cell] = { ch: row[cell].ch + ch, st: row[cell].st };
 			return;
 		}
 		if (this.wrapPending) {
@@ -353,8 +575,10 @@ class Screen {
 			this.lineFeed();
 		}
 		const row = this.active()[this.y];
-		row[this.x] = ch;
-		if (width === 2 && this.x + 1 < this.cols) row[this.x + 1] = "";
+		row[this.x] = { ch, st: this.current };
+		if (width === 2 && this.x + 1 < this.cols) {
+			row[this.x + 1] = { ch: "", st: this.current };
+		}
 		this.x += width;
 		if (this.x >= this.cols) {
 			this.x = this.cols - 1;
@@ -379,10 +603,10 @@ class Screen {
 		for (let i = 0; i < n; i++) {
 			const removed = grid.splice(this.top, 1)[0];
 			if (!this.altActive && this.top === 0) {
-				this.scrollback.push(removed.join("").replace(/ +$/, ""));
+				this.scrollback.push(removed.map((cell) => cell.ch).join("").replace(/ +$/, ""));
 				if (this.scrollback.length > 2000) this.scrollback.shift();
 			}
-			grid.splice(this.bottom, 0, new Array<string>(this.cols).fill(" "));
+			grid.splice(this.bottom, 0, new Array<Cell>(this.cols).fill(BLANK));
 		}
 	}
 
@@ -390,7 +614,7 @@ class Screen {
 		const grid = this.active();
 		for (let i = 0; i < n; i++) {
 			grid.splice(this.bottom, 1);
-			grid.splice(this.top, 0, new Array<string>(this.cols).fill(" "));
+			grid.splice(this.top, 0, new Array<Cell>(this.cols).fill(BLANK));
 		}
 	}
 
@@ -400,22 +624,24 @@ class Screen {
 			return;
 		}
 		const grid = this.active();
+		const cell = this.eraseCell();
 		if (kind === 2) {
-			for (const row of grid) row.fill(" ");
+			for (const row of grid) row.fill(cell);
 		} else if (kind === 1) {
-			for (let row = 0; row < this.y; row++) grid[row].fill(" ");
-			grid[this.y].fill(" ", 0, this.x + 1);
+			for (let row = 0; row < this.y; row++) grid[row].fill(cell);
+			grid[this.y].fill(cell, 0, this.x + 1);
 		} else {
-			grid[this.y].fill(" ", this.x);
-			for (let row = this.y + 1; row < this.rows; row++) grid[row].fill(" ");
+			grid[this.y].fill(cell, this.x);
+			for (let row = this.y + 1; row < this.rows; row++) grid[row].fill(cell);
 		}
 	}
 
 	private eraseLine(kind: number) {
 		const row = this.active()[this.y];
-		if (kind === 2) row.fill(" ");
-		else if (kind === 1) row.fill(" ", 0, this.x + 1);
-		else row.fill(" ", this.x);
+		const cell = this.eraseCell();
+		if (kind === 2) row.fill(cell);
+		else if (kind === 1) row.fill(cell, 0, this.x + 1);
+		else row.fill(cell, this.x);
 	}
 
 	private mode(modes: number[], set: boolean) {
@@ -446,6 +672,7 @@ class Screen {
 		this.grid = Screen.blank(this.cols, this.rows);
 		this.altGrid = Screen.blank(this.cols, this.rows);
 		this.altActive = false;
+		this.current = null;
 		this.x = this.y = this.savedX = this.savedY = 0;
 		this.top = 0;
 		this.bottom = this.rows - 1;
@@ -453,15 +680,115 @@ class Screen {
 		this.wrapPending = false;
 	}
 
+	/** Applies one SGR parameter string (handles `;` params and `:` subparams). */
+	private sgr(raw: string) {
+		let fg = this.current?.fg ?? null;
+		let bg = this.current?.bg ?? null;
+		let flags = this.current?.flags ?? 0;
+		const params = raw === "" ? ["0"] : raw.split(";");
+		for (let i = 0; i < params.length; i++) {
+			const subs = params[i].split(":");
+			const code = Number.parseInt(subs[0], 10) || 0;
+			switch (code) {
+				case 0:
+					fg = bg = null;
+					flags = 0;
+					break;
+				case 1:
+					flags |= BOLD;
+					break;
+				case 2:
+					flags |= DIM;
+					break;
+				case 3:
+					flags |= ITALIC;
+					break;
+				case 4:
+					if (subs[1] === "0") flags &= ~UNDERLINE;
+					else flags |= UNDERLINE;
+					break;
+				case 7:
+					flags |= REVERSE;
+					break;
+				case 9:
+					flags |= STRIKE;
+					break;
+				case 22:
+					flags &= ~(BOLD | DIM);
+					break;
+				case 23:
+					flags &= ~ITALIC;
+					break;
+				case 24:
+					flags &= ~UNDERLINE;
+					break;
+				case 27:
+					flags &= ~REVERSE;
+					break;
+				case 29:
+					flags &= ~STRIKE;
+					break;
+				case 39:
+					fg = null;
+					break;
+				case 49:
+					bg = null;
+					break;
+				case 38:
+				case 48:
+				case 58: {
+					// Extended color: `38;2;r;g;b` / `38;5;n` (also `:` subparam
+					// forms, incl. the optional colorspace slot). 58 (underline
+					// color) is consumed but dropped.
+					let color: number | null = null;
+					if (subs.length > 1) {
+						const mode = Number.parseInt(subs[1], 10);
+						if (mode === 5) color = color256(Number.parseInt(subs[2], 10) || 0);
+						else if (mode === 2) {
+							const from = subs.length > 5 ? 3 : 2;
+							const [r, g, b] = subs
+								.slice(from, from + 3)
+								.map((sub) => Number.parseInt(sub, 10) || 0);
+							color = (r << 16) | (g << 8) | b;
+						}
+					} else {
+						const mode = Number.parseInt(params[++i], 10);
+						if (mode === 5) color = color256(Number.parseInt(params[++i], 10) || 0);
+						else if (mode === 2) {
+							const r = Number.parseInt(params[++i], 10) || 0;
+							const g = Number.parseInt(params[++i], 10) || 0;
+							const b = Number.parseInt(params[++i], 10) || 0;
+							color = (r << 16) | (g << 8) | b;
+						}
+					}
+					if (code === 38) fg = color;
+					else if (code === 48) bg = color;
+					break;
+				}
+				default:
+					if (code >= 30 && code <= 37) fg = PALETTE16[code - 30];
+					else if (code >= 90 && code <= 97) fg = PALETTE16[code - 90 + 8];
+					else if (code >= 40 && code <= 47) bg = PALETTE16[code - 40];
+					else if (code >= 100 && code <= 107) bg = PALETTE16[code - 100 + 8];
+					break;
+			}
+		}
+		this.current = fg === null && bg === null && flags === 0 ? null : { fg, bg, flags };
+	}
+
 	private csi(final: string) {
 		const buf = this.csiBuf;
 		const priv = /^[?>=<]/.test(buf);
+		if (final === "m") {
+			if (!priv) this.sgr(buf);
+			return;
+		}
 		const nums = (priv ? buf.slice(1) : buf)
 			.split(";")
 			.map((part) => Number.parseInt(part, 10));
 		const arg = (index: number, fallback: number) =>
 			Number.isFinite(nums[index]) && nums[index] > 0 ? nums[index] : fallback;
-		if (final !== "m") this.wrapPending = false;
+		this.wrapPending = false;
 		switch (final) {
 			case "A":
 				this.y = Math.max(0, this.y - arg(0, 1));
@@ -508,32 +835,38 @@ class Screen {
 				for (let i = Math.min(arg(0, 1), this.rows); i > 0; i--) {
 					if (final === "L") {
 						grid.splice(this.bottom, 1);
-						grid.splice(this.y, 0, new Array<string>(this.cols).fill(" "));
+						grid.splice(this.y, 0, new Array<Cell>(this.cols).fill(BLANK));
 					} else {
 						grid.splice(this.y, 1);
-						grid.splice(this.bottom, 0, new Array<string>(this.cols).fill(" "));
+						grid.splice(this.bottom, 0, new Array<Cell>(this.cols).fill(BLANK));
 					}
 				}
 				break;
 			}
 			case "@": {
 				const row = this.active()[this.y];
+				const cell = this.eraseCell();
 				for (let i = Math.min(arg(0, 1), this.cols); i > 0; i--) {
 					row.pop();
-					row.splice(this.x, 0, " ");
+					row.splice(this.x, 0, cell);
 				}
 				break;
 			}
 			case "P": {
 				const row = this.active()[this.y];
+				const cell = this.eraseCell();
 				for (let i = Math.min(arg(0, 1), this.cols); i > 0; i--) {
 					row.splice(this.x, 1);
-					row.push(" ");
+					row.push(cell);
 				}
 				break;
 			}
 			case "X":
-				this.active()[this.y].fill(" ", this.x, Math.min(this.cols, this.x + arg(0, 1)));
+				this.active()[this.y].fill(
+					this.eraseCell(),
+					this.x,
+					Math.min(this.cols, this.x + arg(0, 1)),
+				);
 				break;
 			case "S":
 				this.scrollUp(Math.min(arg(0, 1), this.rows));
@@ -566,7 +899,7 @@ class Screen {
 				}
 				break;
 			default:
-				// SGR (`m`), queries, and anything unrecognized: no text effect.
+				// Queries and anything unrecognized: no text effect.
 				break;
 		}
 	}
@@ -995,7 +1328,9 @@ const factory = (omp: ToolHost) => {
 			"wheel-down), send (raw bytes to the terminal, \\e/\\xNN escapes), resize " +
 			"(cols,rows delivered via SIGWINCH), raw (exact captured byte stream: " +
 			"escape-sequence stats + escaped tail — prefer text/screen unless " +
-			"auditing escapes), stop, list. Input ops (keys/type/paste/mouse/send/" +
+			"auditing escapes), shot (pixel screenshot of the emulated screen — real " +
+			"colors/styles as a PNG image, rasterized in-process), stop, list. " +
+			"Input ops (keys/type/paste/mouse/send/" +
 			"resize) return an after-screenshot of the resulting display (quiet:true " +
 			"skips it). Sessions persist across calls; injected input rides the " +
 			"app's real input path.",
@@ -1003,7 +1338,7 @@ const factory = (omp: ToolHost) => {
 			op: omp.zod
 				.string()
 				.describe(
-					"operation: start | stop | list | text | screen | frame | tree | values | info | keys | type | paste | mouse | send | resize | raw",
+					"operation: start | stop | list | text | screen | shot | frame | tree | values | info | keys | type | paste | mouse | send | resize | raw",
 				),
 			name: omp.zod.string().optional().describe("session name (default: main)"),
 			example: omp.zod.string().optional().describe("start: cargo example name"),
@@ -1074,6 +1409,18 @@ const factory = (omp: ToolHost) => {
 				}
 				case "screen": {
 					return reply(need(params.name).screen.snapshot(params.peek ?? 0));
+				}
+				case "shot": {
+					const session = need(params.name);
+					const png = join(tmpdir(), `omp-tui-${session.name}-${Date.now()}.png`);
+					const bytes = await session.screen.png();
+					writeFileSync(png, bytes);
+					return {
+						content: [
+							{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" },
+							{ type: "text", text: `screenshot saved: ${png}` },
+						],
+					};
 				}
 				case "frame": {
 					const response = await request(need(params.name), { op: "frame" });

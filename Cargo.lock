@@ -5415,6 +5415,7 @@ dependencies = [
  "serde_json",
  "smallvec 2.0.0-alpha.12",
  "tokio",
+ "tracing",
  "xutf",
  "xxhash-rust",
 ]
@@ -6022,6 +6023,7 @@ dependencies = [
  "strum",
  "syntect",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "windows-sys 0.61.2",

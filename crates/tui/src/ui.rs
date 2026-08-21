@@ -4568,11 +4568,7 @@ cd</pre>"##,
 		assert_eq!(ui.values()["base"], "", "base entries stay present beside overlay entries");
 
 		ui.set_overlay_hidden(dialog, true);
-		assert_eq!(
-			ui.values().get("secret"),
-			None,
-			"hidden layers drop out of the merged map"
-		);
+		assert_eq!(ui.values().get("secret"), None, "hidden layers drop out of the merged map");
 	}
 
 	#[test]

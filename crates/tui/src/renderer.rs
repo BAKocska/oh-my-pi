@@ -269,6 +269,10 @@ struct RegisteredImage {
 	direct_visible: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("a previously declared-stable row changed; native history was left untouched")]
+struct StableRowMutation;
+
 impl RegisteredImage {
 	const fn new(png: CowBytes<'static>) -> Self {
 		Self {
@@ -759,8 +763,19 @@ impl<W: Write> Renderer<W> {
 		Ok(())
 	}
 
+	/// Returns whether an I/O error is the renderer's stable-prefix mutation
+	/// violation.
+	///
+	/// Hosts may use this to recover from a scene contract bug without mistaking
+	/// unrelated invalid input or writer failures for a repaintable error.
+	pub fn is_stable_mutation_error(error: &io::Error) -> bool {
+		error
+			.get_ref()
+			.is_some_and(|source| source.is::<StableRowMutation>())
+	}
+
 	fn stable_mutation_error() -> io::Error {
-		contract_error("a previously declared-stable row changed; native history was left untouched")
+		io::Error::new(io::ErrorKind::InvalidData, StableRowMutation)
 	}
 
 	fn paint_validated_next(

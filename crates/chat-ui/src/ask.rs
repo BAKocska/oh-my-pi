@@ -135,7 +135,7 @@ fn dialog_request(question: &Question) -> UiRequest {
 	}
 }
 
-fn presenter_fault(message: &'static str) -> Fault {
+const fn presenter_fault(message: &'static str) -> Fault {
 	Fault::Presenter { message: sf!(message) }
 }
 

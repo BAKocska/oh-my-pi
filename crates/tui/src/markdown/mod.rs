@@ -2131,7 +2131,7 @@ mod tests {
 	fn degenerate_widths_make_progress() {
 		for width in [0, 1] {
 			let rendered = plain("```\nunclosed\n|||\n- item", width);
-			assert_ne!(rendered, [] as [std::string::String; 0]);
+			assert!(!rendered.is_empty());
 			assert!(rendered.len() < 20);
 		}
 	}

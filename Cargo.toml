@@ -417,6 +417,7 @@ verbose_bit_mask = "allow"     # Explicit bit patterns can be clearer than hex
 # ──────────────────────────────────────────────────────────────────────────────
 # Code Style
 # ──────────────────────────────────────────────────────────────────────────────
+assert_is_empty = "allow"             # assert!(x.is_empty()) is fine; assert_eq! vs `[] as [T; 0]` is noise
 default_trait_access = "allow"        # Default::default() sometimes clearer
 significant_drop_tightening = "allow" # We pay attention to this already
 
@@ -441,8 +442,7 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
-# build_id hashes the entire executable at startup; unoptimized blake3
-# kernels turn that into tens of seconds on a debug binary.
+# Content-addressed storage and document hashing remain hot in debug builds.
 [profile.dev.package.blake3]
 opt-level = 3
 

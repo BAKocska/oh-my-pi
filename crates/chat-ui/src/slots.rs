@@ -78,7 +78,7 @@ impl Mount {
 		self.visible
 	}
 
-	pub(crate) fn ui_mut(&mut self) -> &mut Ui {
+	pub(crate) const fn ui_mut(&mut self) -> &mut Ui {
 		&mut self.ui
 	}
 
@@ -90,7 +90,7 @@ impl Mount {
 		self.height
 	}
 
-	pub(crate) fn resolve(&mut self, rect: Rect) {
+	pub(crate) const fn resolve(&mut self, rect: Rect) {
 		self.rect = rect;
 	}
 }
@@ -129,7 +129,7 @@ impl Damage {
 		Self { rects, status: false, refusal: None }
 	}
 
-	fn refused(refusal: SlotRefusal) -> Self {
+	const fn refused(refusal: SlotRefusal) -> Self {
 		Self { rects: SmallVec::new(), status: false, refusal: Some(refusal) }
 	}
 }
@@ -265,7 +265,7 @@ impl Slots {
 		if !self.mounts.contains_key(&id) && self.mounts.len() >= SLOT_MAX_PER_EXTENSION {
 			return Apply::Refused(SlotRefusal::MountLimit);
 		}
-		let options = wire.options.as_ref().cloned().unwrap_or_default();
+		let options = wire.options.clone().unwrap_or_default();
 		let width = options.width.and_then(|width| u16::try_from(width).ok());
 		let ui = match Ui::from_extension_markup(
 			Str::new(source),

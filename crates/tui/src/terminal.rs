@@ -1973,25 +1973,25 @@ impl Terminal {
 		self.cursor_visible = None;
 		self.alt_mouse = purpose == AltScreenUse::Interactive && !self.mouse;
 		Some(match (self.keyboard, self.alt_mouse) {
-			(KeyboardMode::Kitty(push), true) if push == esc!(csi, ">1u") => {
+			(KeyboardMode::Kitty(esc!(csi, ">1u")), true) => {
 				sf!(esc!(alt_screen, csi, ">1u", mouse_vt200, mouse_any_event, mouse_sgr))
 			},
-			(KeyboardMode::Kitty(push), true) if push == esc!(csi, ">3u") => {
+			(KeyboardMode::Kitty(esc!(csi, ">3u")), true) => {
 				sf!(esc!(alt_screen, csi, ">3u", mouse_vt200, mouse_any_event, mouse_sgr))
 			},
-			(KeyboardMode::Kitty(push), true) if push == esc!(csi, ">5u") => {
+			(KeyboardMode::Kitty(esc!(csi, ">5u")), true) => {
 				sf!(esc!(alt_screen, csi, ">5u", mouse_vt200, mouse_any_event, mouse_sgr))
 			},
 			(KeyboardMode::Kitty(_), true) => {
 				sf!(esc!(alt_screen, csi, ">7u", mouse_vt200, mouse_any_event, mouse_sgr))
 			},
-			(KeyboardMode::Kitty(push), false) if push == esc!(csi, ">1u") => {
+			(KeyboardMode::Kitty(esc!(csi, ">1u")), false) => {
 				sf!(esc!(alt_screen, csi, ">1u"))
 			},
-			(KeyboardMode::Kitty(push), false) if push == esc!(csi, ">3u") => {
+			(KeyboardMode::Kitty(esc!(csi, ">3u")), false) => {
 				sf!(esc!(alt_screen, csi, ">3u"))
 			},
-			(KeyboardMode::Kitty(push), false) if push == esc!(csi, ">5u") => {
+			(KeyboardMode::Kitty(esc!(csi, ">5u")), false) => {
 				sf!(esc!(alt_screen, csi, ">5u"))
 			},
 			(KeyboardMode::Kitty(_), false) => sf!(esc!(alt_screen, csi, ">7u")),
@@ -2523,11 +2523,11 @@ mod tests {
 	fn console_codepage_guard_only_reasserts_utf8_after_a_flip() {
 		let mut utf8 = MockCodepage { current: UTF8_CODEPAGE, sets: Vec::new() };
 		ensure_console_utf8(&mut utf8);
-		assert_eq!(utf8.sets, [] as [u32; 0]);
+		assert!(utf8.sets.is_empty());
 
 		let mut detached = MockCodepage::default();
 		ensure_console_utf8(&mut detached);
-		assert_eq!(detached.sets, [] as [u32; 0]);
+		assert!(detached.sets.is_empty());
 
 		let mut legacy = MockCodepage { current: 437, sets: Vec::new() };
 		ensure_console_utf8(&mut legacy);

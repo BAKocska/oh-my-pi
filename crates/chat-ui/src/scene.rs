@@ -265,7 +265,7 @@ pub struct Attribution {
 impl Attribution {
 	/// Creates the reserved attribution band from its seven provenance fields.
 	#[must_use]
-	pub fn new(septet: [Str; 7]) -> Self {
+	pub const fn new(septet: [Str; 7]) -> Self {
 		Self { septet }
 	}
 
@@ -626,7 +626,7 @@ impl ChatStatus {
 		Self { props, slot: next_slot(), work, idle_brand, charset, theme, style }
 	}
 
-	fn set_composer_style(&mut self, style: ComposerStyle) {
+	const fn set_composer_style(&mut self, style: ComposerStyle) {
 		self.style = style;
 	}
 
@@ -690,7 +690,7 @@ impl ChatStatus {
 			let speculation_color = match facts.compaction_speculation {
 				CompactionSpeculationStatus::Idle => None,
 				CompactionSpeculationStatus::Running => {
-					let phase = (now.as_millis() / SPECULATION_PULSE.as_millis()) % 2 == 0;
+					let phase = (now.as_millis() / SPECULATION_PULSE.as_millis()).is_multiple_of(2);
 					Some(if phase {
 						self.theme.accent
 					} else {
@@ -1400,7 +1400,7 @@ impl Chat {
 		}
 	}
 
-	/// Replaces the anchored AgentTree HUD projection.
+	/// Replaces the anchored `AgentTree` HUD projection.
 	pub fn set_agent_roster(&mut self, rows: Vec<AgentRow>) {
 		self.agent_labels = rows
 			.iter()
@@ -1410,7 +1410,7 @@ impl Chat {
 		self.bump_live();
 	}
 
-	/// Borrows the current AgentTree roster projection.
+	/// Borrows the current `AgentTree` roster projection.
 	pub fn agent_roster(&self) -> &[AgentRow] {
 		&self.agents
 	}
@@ -1510,7 +1510,7 @@ impl Chat {
 			BackendEvent::ToolImage { id, source } => self.tool_image(id.as_str(), source),
 			BackendEvent::ToolFinished { id, ok, view } => self.tool_finished(id.as_str(), ok, view),
 			BackendEvent::Compacted { summary, title, method, tokens_before, tokens_after } => {
-				self.push_compaction(summary, title, method, tokens_before, tokens_after)
+				self.push_compaction(summary, title, method, tokens_before, tokens_after);
 			},
 			BackendEvent::TranscriptFrame(frame) => self.push_transcript_frame(frame),
 			BackendEvent::AgentRoster(rows) => self.set_agent_roster(rows),
@@ -1654,8 +1654,9 @@ impl Chat {
 		}
 		self.editor_ui.tick(elapsed);
 		let editor_changed = self.editor_ui.take_frame_damage();
-		let rebuild = self.last_viewport != viewport || self.layout_width != content_width;
-		if rebuild {
+		let viewport_rebuild = self.last_viewport != viewport;
+		let content_reflow = self.layout_width != content_width;
+		if viewport_rebuild {
 			self.last_viewport = viewport;
 			self.layout_width = content_width;
 			self.height_floor = 0;
@@ -1664,6 +1665,16 @@ impl Chat {
 			for entry in &mut self.transcript {
 				Self::resize_entry(entry, content_width, &self.ctx);
 			}
+		} else if content_reflow {
+			self.layout_width = content_width;
+			// Drawn entries are already part of the declared-stable prefix. Keeping
+			// them at their original width also preserves an entry whose rows cross
+			// the renderer's committed boundary; only wholly-undrawn entries reflow.
+			for entry in &mut self.transcript[self.drawn_entries..] {
+				Self::resize_entry(entry, content_width, &self.ctx);
+			}
+		}
+		if viewport_rebuild || content_reflow {
 			let view_width = Self::tool_view_width(content_width);
 			for tool in &mut self.live_tools {
 				tool.view.resize(view_width, &self.ctx);
@@ -1679,7 +1690,11 @@ impl Chat {
 			transcript_rows.saturating_add(Self::band_height(editor_height, panel_height));
 		self.height_floor = self.height_floor.max(natural_height);
 		let document_height = self.height_floor.max(viewport.height);
-		let transcript_damage_start = if rebuild { 0 } else { self.transcript_rows };
+		let transcript_damage_start = if viewport_rebuild {
+			0
+		} else {
+			self.transcript_rows
+		};
 		let editor_y = document_height.saturating_sub(editor_height);
 		let title_y = editor_y.saturating_sub(1);
 		let working_y = title_y.saturating_sub(1);
@@ -1687,11 +1702,11 @@ impl Chat {
 			.saturating_sub(u16::from(panel_height > 0))
 			.saturating_sub(panel_height);
 		let panel = Rect::new(0, panel_y, content_width, panel_height);
-		let band_reflow = !rebuild
+		let band_reflow = !viewport_rebuild
 			&& ((self.last_editor_height != 0 && editor_height != self.last_editor_height)
 				|| panel_height != self.last_panel_height);
-		let repaint_suffix = rebuild || new_rows > 0 || band_reflow;
-		if rebuild {
+		let repaint_suffix = viewport_rebuild || content_reflow || new_rows > 0 || band_reflow;
+		if viewport_rebuild {
 			self.frame = Frame::new(Size::new(viewport.width, document_height));
 		} else {
 			self
@@ -2643,6 +2658,63 @@ mod tests {
 		assert_eq!(error_text.matches('x').count(), 100);
 		let composer_top = rendered.frame.size().height - composer_rows;
 		assert!(row_text(rendered.frame, composer_top).ends_with('╮'));
+	}
+
+	#[test]
+	fn inset_reflow_preserves_the_declared_stable_prefix() {
+		let viewport = Size::new(48, 10);
+		let mut chat = Chat::new(&ctx());
+		chat.set_right_inset(18);
+		for index in 0..12 {
+			chat.push_notice(format!("committed notice {index}"));
+		}
+		let mut renderer = omp_tui::Renderer::new(Vec::new());
+		let (stable_rows, retained) = {
+			let rendered = chat.render(viewport);
+			let stable_rows = rendered.stable_rows;
+			let retained = rendered.frame.clone();
+			renderer
+				.present_overlaid(
+					rendered.frame,
+					rendered.damage.as_slice(),
+					viewport.height,
+					stable_rows,
+					&[],
+				)
+				.expect("initial narrow frame presents");
+			(stable_rows, retained)
+		};
+		assert!(renderer.committed_rows() > 0, "the fixture must establish native history");
+
+		chat.set_right_inset(0);
+		chat.push_user(
+			"a newly committed message that should use all newly available columns",
+			vec![],
+		);
+		let rendered = chat.render(viewport);
+		assert_eq!(
+			rendered.damage.first().map(|damage| damage.0),
+			Some(stable_rows),
+			"only the suffix at the prior stable seam may reflow",
+		);
+		for row in 0..stable_rows {
+			for column in 0..viewport.width {
+				assert_eq!(
+					rendered.frame.cell(column, row),
+					retained.cell(column, row),
+					"stable cell changed at ({column}, {row})",
+				);
+			}
+		}
+		renderer
+			.present_overlaid(
+				rendered.frame,
+				rendered.damage.as_slice(),
+				viewport.height,
+				rendered.stable_rows,
+				&[],
+			)
+			.expect("widened suffix must satisfy the renderer's stable-row contract");
 	}
 
 	#[test]

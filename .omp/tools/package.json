@@ -1,0 +1,8 @@
+{
+	"name": "omp-agent-tools",
+	"private": true,
+	"description": "Dependencies for the project-local .omp/tools modules",
+	"dependencies": {
+		"@napi-rs/canvas": "^1.0.7"
+	}
+}

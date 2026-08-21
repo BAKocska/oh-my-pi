@@ -1082,13 +1082,34 @@ fn present<W: Write>(
 		}
 		return Ok(stats);
 	}
-	renderer.present_overlaid(
+	match renderer.present_overlaid(
 		rendered.frame,
 		rendered.damage.as_slice(),
 		viewport.height,
 		rendered.stable_rows,
 		layers,
-	)
+	) {
+		Ok(stats) => Ok(stats),
+		Err(error) if Renderer::<W>::is_stable_mutation_error(&error) => {
+			tracing::warn!(
+				error = %error,
+				"chat scene mutated stable rows; rebuilding the renderer epoch once"
+			);
+			let stats =
+				renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, "")?;
+			if !layers.is_empty() {
+				renderer.present_overlaid(
+					rendered.frame,
+					&[],
+					viewport.height,
+					rendered.stable_rows,
+					layers,
+				)?;
+			}
+			Ok(stats)
+		},
+		Err(error) => Err(error),
+	}
 }
 
 fn open_overlay(
@@ -1174,10 +1195,11 @@ async fn deadline(at: Option<Instant>) {
 
 #[cfg(test)]
 mod tests {
-	use omp_tui::{Renderer, Size, UiContext};
+	use omp_tui::{Rect, Renderer, Size, Style, UiContext};
+	use smallvec::SmallVec;
 
 	use super::{Duration, Instant, ResizeState, present};
-	use crate::Chat;
+	use crate::{Chat, RenderedFrame};
 
 	#[test]
 	fn resize_settle_window_restarts_at_each_event() {
@@ -1186,6 +1208,29 @@ mod tests {
 		state.observe(started_at + Duration::from_millis(100), true);
 		assert!(!state.settled(started_at + Duration::from_millis(219)));
 		assert!(state.settled(started_at + Duration::from_millis(220)));
+	}
+
+	#[test]
+	fn stable_mutation_rebuilds_once_instead_of_escaping_the_host() {
+		let viewport = Size::new(40, 8);
+		let mut chat = Chat::new(&UiContext::default());
+		for index in 0..12 {
+			chat.push_notice(format!("notice {index}"));
+		}
+		let mut renderer = Renderer::new(Vec::new());
+		present(&mut renderer, chat.render(viewport), viewport, &[]).unwrap();
+		assert!(renderer.committed_rows() > 0);
+
+		let initial = chat.render(viewport);
+		let mut changed = initial.frame.clone();
+		changed.fill(Rect::new(0, 0, viewport.width, 1), Style::default());
+		let mut damage = SmallVec::new();
+		damage.push((0, 1));
+		let rendered = RenderedFrame { frame: &changed, stable_rows: initial.stable_rows, damage };
+		let recovered = present(&mut renderer, rendered, viewport, &[])
+			.expect("stable mutation should trigger the one-time rebuild fallback");
+
+		assert!(recovered.full_repaint);
 	}
 
 	#[test]
