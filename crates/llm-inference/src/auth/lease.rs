@@ -391,7 +391,7 @@ pub enum AuthScheme {
 }
 
 impl AuthScheme {
-	const fn for_spec(spec: &AuthSpec) -> Self {
+	pub(crate) const fn for_spec(spec: &AuthSpec) -> Self {
 		match spec {
 			AuthSpec::None => Self::None,
 			AuthSpec::ApiKey { .. } => Self::ApiKey,

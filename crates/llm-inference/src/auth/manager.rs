@@ -412,11 +412,14 @@ where
 					let engine = OAuthEngine::new(http.as_ref(), clock.as_ref());
 					let tokens = match runtime {
 						AuthSpec::OAuthPkce(spec) if method == AuthMethod::OAuthPkce => {
-							let pending = engine
+							let mut pending = engine
 								.begin_pkce(&spec, &driver)
 								.await
 								.map_err(oauth_error)?;
-							let input = driver.receive().await.map_err(login_channel_error)?;
+							let input = engine
+								.receive_pkce_input(&mut pending, &driver)
+								.await
+								.map_err(oauth_error)?;
 							engine
 								.complete_pkce(&spec, pending, input)
 								.await

@@ -19,6 +19,7 @@ use super::super::{
 	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthEntropy,
 	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthProviderCode,
 	OAuthTokenSet, SystemEntropySource, callback_code, parse_http_url, provider_error,
+	receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -73,6 +74,7 @@ impl ZaiApiKeyHandler {
 				.append_pair("client_id", &spec.client.client_id)
 				.append_pair("state", &state);
 		}
+		let callback_server = start_callback_server(redirect_uri, &state).await;
 		driver
 			.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
 			.await?;
@@ -84,7 +86,7 @@ impl ZaiApiKeyHandler {
 			}))
 			.await?;
 
-		let code = match driver.receive().await? {
+		let code = match receive_callback_input(driver, callback_server).await? {
 			AuthInput::CallbackUrl(callback) => callback_code(&callback, &state)?,
 			AuthInput::AuthorizationCode(input) => manual_code(input, &state)?,
 			AuthInput::Cancel => return Err(OAuthError::Cancelled),
@@ -675,7 +677,7 @@ mod tests {
 			.responses
 			.send(AuthResponse {
 				session: session.id.clone(),
-				input:   AuthInput::CallbackUrl(SecretString::from(format!(
+				input:   AuthInput::AuthorizationCode(SecretString::from(format!(
 					"{REDIRECT}?code=auth-code&state={STATE}"
 				))),
 			})

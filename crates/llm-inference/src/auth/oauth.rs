@@ -1,4 +1,5 @@
 //! Generic OAuth PKCE, device, paste, and refresh protocol engines.
+mod callback;
 mod custom;
 
 use std::{
@@ -421,14 +422,25 @@ where
 				query.append_pair(&parameter.name, &parameter.value);
 			}
 		}
+		let callback_server = match spec.completion {
+			PkceCompletion::CallbackUrl | PkceCompletion::PasteCallbackUrl => {
+				start_callback_server(&spec.redirect_uri, &state).await
+			},
+			PkceCompletion::PasteCode => None,
+		};
 		driver
 			.emit(AuthEvent::OpenUrl(Str::new(url.as_str())))
 			.await?;
 		let (id, message, input) = match spec.completion {
-			PkceCompletion::CallbackUrl => (
+			PkceCompletion::CallbackUrl if callback_server.is_some() => (
 				"oauth-callback",
 				"Complete authorization in the opened browser",
 				AuthPromptKind::Confirmation,
+			),
+			PkceCompletion::CallbackUrl => (
+				"oauth-callback-url",
+				"Paste the complete authorization callback URL",
+				AuthPromptKind::AuthorizationCode,
 			),
 			PkceCompletion::PasteCallbackUrl => (
 				"oauth-callback-url",
@@ -451,7 +463,17 @@ where
 			state,
 			redirect_uri: spec.redirect_uri.clone(),
 			completion: spec.completion,
+			callback_server,
 		})
+	}
+
+	/// Waits for either the loopback redirect or typed manual PKCE input.
+	pub async fn receive_pkce_input(
+		&self,
+		pending: &mut PkcePending,
+		driver: &LoginDriver,
+	) -> Result<AuthInput, OAuthError> {
+		receive_callback_input(driver, pending.callback_server.take()).await
 	}
 
 	/// Completes a PKCE exchange from typed login input.
@@ -465,7 +487,7 @@ where
 			(PkceCompletion::PasteCode, AuthInput::AuthorizationCode(code)) => code,
 			(
 				PkceCompletion::CallbackUrl | PkceCompletion::PasteCallbackUrl,
-				AuthInput::CallbackUrl(callback),
+				AuthInput::CallbackUrl(callback) | AuthInput::AuthorizationCode(callback),
 			) => callback_code(&callback, &pending.state)?,
 			(_, AuthInput::Cancel) => return Err(OAuthError::Cancelled),
 			_ => return Err(OAuthError::UnexpectedInput),
@@ -679,10 +701,11 @@ where
 
 /// Pending state for one PKCE login; formatting is always redacted.
 pub struct PkcePending {
-	verifier:     SecretString,
-	state:        Str,
-	redirect_uri: Str,
-	completion:   PkceCompletion,
+	verifier:        SecretString,
+	state:           Str,
+	redirect_uri:    Str,
+	completion:      PkceCompletion,
+	callback_server: Option<callback::CallbackServer>,
 }
 
 impl<C, K, R> OAuthEngine<'_, C, K, R>
@@ -1180,6 +1203,12 @@ pub enum OAuthError {
 	/// Authorization callback omits a code or has an invalid shape.
 	#[error("OAuth authorization callback is malformed")]
 	MalformedCallback,
+	/// The authorization server returned a trusted denial callback.
+	#[error("OAuth authorization was denied")]
+	AuthorizationDenied,
+	/// A bound callback listener stopped before delivering a result.
+	#[error("OAuth callback listener became unavailable")]
+	CallbackUnavailable,
 	/// Token or device response has an invalid typed shape.
 	#[error("OAuth response is malformed")]
 	MalformedResponse,
@@ -1482,6 +1511,23 @@ fn provider_code(body: &SecretString) -> OAuthProviderCode {
 	}
 }
 
+async fn start_callback_server(
+	redirect_uri: &str,
+	expected_state: &str,
+) -> Option<callback::CallbackServer> {
+	callback::CallbackServer::bind(redirect_uri, expected_state)
+		.await
+		.ok()
+		.flatten()
+}
+
+async fn receive_callback_input(
+	driver: &LoginDriver,
+	server: Option<callback::CallbackServer>,
+) -> Result<AuthInput, OAuthError> {
+	callback::receive_callback(driver, server).await
+}
+
 fn callback_code(
 	callback: &SecretString,
 	expected_state: &str,
@@ -1615,10 +1661,15 @@ mod tests {
 	use futures::FutureExt;
 	use parking_lot::Mutex;
 	use tempfile::tempdir;
+	use tokio::{
+		io::{AsyncReadExt as _, AsyncWriteExt as _},
+		net::TcpStream,
+	};
 
 	use super::*;
 	use crate::{
 		account::{CredentialFreshness, RefreshCoordinator, RefreshPolicy, RefreshRequest},
+		answer::{AuthPrompt, AuthResponse},
 		auth::{
 			CredentialOrigin, CredentialSourceSpec, CredentialStore, HeadlessKeySource, KeyId,
 			OAuthRefreshSpec, login::default_login_channels, spec::HeaderPlacement,
@@ -1691,6 +1742,75 @@ mod tests {
 			placement:    HeaderPlacement::bearer().into(),
 		}
 	}
+
+	fn available_redirect_uri() -> (u16, Str) {
+		let listener =
+			std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+		let port = listener.local_addr().expect("local address").port();
+		drop(listener);
+		(port, sf!("http://127.0.0.1:{port}/callback"))
+	}
+
+	async fn raw_callback(port: u16, target: &str) -> String {
+		let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+			.await
+			.expect("connect callback");
+		let request =
+			format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+		stream
+			.write_all(request.as_bytes())
+			.await
+			.expect("write callback");
+		let mut response = Vec::new();
+		stream
+			.read_to_end(&mut response)
+			.await
+			.expect("read callback response");
+		String::from_utf8(response).expect("UTF-8 callback response")
+	}
+
+	fn token_http() -> TestHttp {
+		TestHttp(Mutex::new(VecDeque::from([OAuthHttpResponse {
+			status:  200,
+			headers: HeaderMap::new(),
+			body:    SecretString::from(
+				r#"{"access_token":"access","refresh_token":"refresh","expires_in":3600}"#.to_owned(),
+			),
+		}])))
+	}
+
+	async fn pkce_timeline(session: &crate::answer::AuthSession) -> (Url, AuthPrompt) {
+		let AuthEvent::OpenUrl(url) = session
+			.events
+			.recv_async()
+			.await
+			.expect("URL event")
+			.expect("valid URL event")
+		else {
+			panic!("expected authorization URL");
+		};
+		let AuthEvent::Prompt(prompt) = session
+			.events
+			.recv_async()
+			.await
+			.expect("prompt event")
+			.expect("valid prompt event")
+		else {
+			panic!("expected authorization prompt");
+		};
+		(Url::parse(&url).expect("authorization URL"), prompt)
+	}
+
+	fn callback_spec(redirect_uri: Str, completion: PkceCompletion) -> OAuthPkceSpec {
+		OAuthPkceSpec {
+			client: client(),
+			authorize_url: "https://auth.example/authorize".into(),
+			redirect_uri,
+			completion,
+			authorize_params: Vec::new(),
+		}
+	}
+
 	#[tokio::test]
 	async fn device_authorization_sends_declared_scopes() {
 		let http = RecordingHttp {
@@ -1764,6 +1884,172 @@ mod tests {
 			.expect("tokens");
 		assert!(tokens.is_refreshable());
 		assert!(!format!("{tokens:?}").contains("access"));
+	}
+
+	#[tokio::test]
+	async fn loopback_callback_completes_pkce_without_manual_input() {
+		let (port, redirect_uri) = available_redirect_uri();
+		let http = token_http();
+		let clock = TestClock(SystemTime::UNIX_EPOCH);
+		let engine = OAuthEngine::with_entropy(&http, &clock, FixedEntropy);
+		let spec = callback_spec(redirect_uri, PkceCompletion::CallbackUrl);
+		let (session, driver, _) = default_login_channels(LoginSessionId::from("loopback-callback"));
+		let mut pending = engine.begin_pkce(&spec, &driver).await.expect("begin");
+		let (authorization_url, prompt) = pkce_timeline(&session).await;
+		assert_eq!(prompt.input, AuthPromptKind::Confirmation);
+		let state = authorization_url
+			.query_pairs()
+			.find(|(name, _)| name == "state")
+			.expect("state")
+			.1
+			.into_owned();
+		let target = format!("/callback?code=browser-code&state={state}");
+		let receive = engine.receive_pkce_input(&mut pending, &driver);
+		let browser = raw_callback(port, &target);
+		let (input, response) = futures::join!(receive, browser);
+		assert!(response.starts_with("HTTP/1.1 200 OK"));
+		assert!(response.contains("Authentication Successful"));
+		let tokens = engine
+			.complete_pkce(&spec, pending, input.expect("browser input"))
+			.await
+			.expect("token exchange");
+		assert!(tokens.is_refreshable());
+	}
+
+	#[tokio::test]
+	async fn wrong_callback_state_is_rejected_without_stopping_listener() {
+		let (port, redirect_uri) = available_redirect_uri();
+		let http = token_http();
+		let clock = TestClock(SystemTime::UNIX_EPOCH);
+		let engine = OAuthEngine::with_entropy(&http, &clock, FixedEntropy);
+		let spec = callback_spec(redirect_uri, PkceCompletion::CallbackUrl);
+		let (session, driver, _) = default_login_channels(LoginSessionId::from("loopback-state"));
+		let mut pending = engine.begin_pkce(&spec, &driver).await.expect("begin");
+		let (authorization_url, _) = pkce_timeline(&session).await;
+		let state = authorization_url
+			.query_pairs()
+			.find(|(name, _)| name == "state")
+			.expect("state")
+			.1
+			.into_owned();
+		let receive = engine.receive_pkce_input(&mut pending, &driver);
+		let browser = async {
+			let rejected = raw_callback(port, "/callback?code=forged&state=wrong").await;
+			assert!(rejected.starts_with("HTTP/1.1 500 Internal Server Error"));
+			assert!(rejected.contains("State mismatch - possible CSRF attack"));
+			raw_callback(port, &format!("/callback?code=valid&state={state}")).await
+		};
+		let (input, accepted) = futures::join!(receive, browser);
+		assert!(accepted.starts_with("HTTP/1.1 200 OK"));
+		engine
+			.complete_pkce(&spec, pending, input.expect("valid callback"))
+			.await
+			.expect("token exchange");
+	}
+
+	#[tokio::test]
+	async fn trusted_error_callback_stops_with_typed_denial() {
+		let (port, redirect_uri) = available_redirect_uri();
+		let http = token_http();
+		let clock = TestClock(SystemTime::UNIX_EPOCH);
+		let engine = OAuthEngine::with_entropy(&http, &clock, FixedEntropy);
+		let spec = callback_spec(redirect_uri, PkceCompletion::CallbackUrl);
+		let (session, driver, _) = default_login_channels(LoginSessionId::from("loopback-denied"));
+		let mut pending = engine.begin_pkce(&spec, &driver).await.expect("begin");
+		let (authorization_url, _) = pkce_timeline(&session).await;
+		let state = authorization_url
+			.query_pairs()
+			.find(|(name, _)| name == "state")
+			.expect("state")
+			.1
+			.into_owned();
+		let target =
+			format!("/callback?error=access_denied&error_description=User+denied&state={state}");
+		let receive = engine.receive_pkce_input(&mut pending, &driver);
+		let browser = raw_callback(port, &target);
+		let (result, response) = futures::join!(receive, browser);
+		assert_eq!(result.expect_err("authorization denial"), OAuthError::AuthorizationDenied);
+		assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
+		assert!(response.contains("Authorization failed: User denied"));
+	}
+
+	#[tokio::test]
+	async fn callback_bind_conflict_degrades_to_paste_prompt() {
+		let listener =
+			std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("occupy port");
+		let port = listener.local_addr().expect("local address").port();
+		let redirect_uri = sf!("http://127.0.0.1:{port}/callback");
+		let http = token_http();
+		let clock = TestClock(SystemTime::UNIX_EPOCH);
+		let engine = OAuthEngine::with_entropy(&http, &clock, FixedEntropy);
+		let spec = callback_spec(redirect_uri.clone(), PkceCompletion::CallbackUrl);
+		let (session, driver, _) = default_login_channels(LoginSessionId::from("loopback-conflict"));
+		let mut pending = engine.begin_pkce(&spec, &driver).await.expect("begin");
+		let (authorization_url, prompt) = pkce_timeline(&session).await;
+		assert_eq!(prompt.id, "oauth-callback-url");
+		assert_eq!(prompt.input, AuthPromptKind::AuthorizationCode);
+		let state = authorization_url
+			.query_pairs()
+			.find(|(name, _)| name == "state")
+			.expect("state")
+			.1
+			.into_owned();
+		session
+			.responses
+			.send_async(AuthResponse {
+				session: session.id.clone(),
+				input:   AuthInput::AuthorizationCode(SecretString::from(format!(
+					"{redirect_uri}?code=pasted&state={state}"
+				))),
+			})
+			.await
+			.expect("manual callback");
+		let input = engine
+			.receive_pkce_input(&mut pending, &driver)
+			.await
+			.expect("paste input");
+		drop(listener);
+		engine
+			.complete_pkce(&spec, pending, input)
+			.await
+			.expect("token exchange");
+	}
+
+	#[tokio::test]
+	async fn manual_paste_wins_while_callback_server_is_waiting() {
+		let (_port, redirect_uri) = available_redirect_uri();
+		let http = token_http();
+		let clock = TestClock(SystemTime::UNIX_EPOCH);
+		let engine = OAuthEngine::with_entropy(&http, &clock, FixedEntropy);
+		let spec = callback_spec(redirect_uri.clone(), PkceCompletion::CallbackUrl);
+		let (session, driver, _) = default_login_channels(LoginSessionId::from("loopback-manual"));
+		let mut pending = engine.begin_pkce(&spec, &driver).await.expect("begin");
+		let (authorization_url, prompt) = pkce_timeline(&session).await;
+		assert_eq!(prompt.input, AuthPromptKind::Confirmation);
+		let state = authorization_url
+			.query_pairs()
+			.find(|(name, _)| name == "state")
+			.expect("state")
+			.1
+			.into_owned();
+		session
+			.responses
+			.send_async(AuthResponse {
+				session: session.id.clone(),
+				input:   AuthInput::AuthorizationCode(SecretString::from(format!(
+					"{redirect_uri}?code=manual&state={state}"
+				))),
+			})
+			.await
+			.expect("manual callback");
+		let input = engine
+			.receive_pkce_input(&mut pending, &driver)
+			.await
+			.expect("manual input");
+		engine
+			.complete_pkce(&spec, pending, input)
+			.await
+			.expect("token exchange");
 	}
 
 	#[tokio::test]

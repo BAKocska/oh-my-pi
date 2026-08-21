@@ -35,7 +35,8 @@ pub use github_copilot::{
 	normalize_api_endpoint, normalize_domain, normalize_enterprise_domain, parse_copilot_api_key,
 };
 pub use key::{
-	HeadlessKeySource, KeyError, KeyId, KeySource, OsCredentialKeySource, UnavailableKeySource,
+	FallbackKeySource, FileCredentialKeySource, FileKeyError, HeadlessKeySource, KeyError, KeyId,
+	KeySource, OsCredentialKeySource, UnavailableKeySource,
 };
 pub use lease::{
 	AppliedCredentials, AuthRejection, AuthRejectionKind, AuthScheme, CredentialApplyError,

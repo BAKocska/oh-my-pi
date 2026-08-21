@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
-use super::super::{FormValue, callback_code, form_request, parse_http_url, provider_error};
+use super::super::{
+	FormValue, callback_code, form_request, parse_http_url, provider_error, receive_callback_input,
+	start_callback_server,
+};
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
 	auth::{
@@ -134,8 +137,10 @@ impl GitlabExternalRedirectHandler {
 		driver: &LoginDriver,
 	) -> Result<OAuthTokenSet, OAuthError> {
 		let pending = self.begin(spec, driver).await?;
-		let input = driver.receive().await?;
-		let AuthInput::CallbackUrl(callback) = input else {
+		let callback_server = start_callback_server(&pending.redirect_uri, &pending.state).await;
+		let input = receive_callback_input(driver, callback_server).await?;
+		let (AuthInput::CallbackUrl(callback) | AuthInput::AuthorizationCode(callback)) = input
+		else {
 			return if matches!(input, AuthInput::Cancel) {
 				Err(OAuthError::Cancelled)
 			} else {
@@ -455,7 +460,7 @@ mod tests {
 				.responses
 				.send_async(AuthResponse {
 					session: session.id.clone(),
-					input:   AuthInput::CallbackUrl(SecretString::from(callback)),
+					input:   AuthInput::AuthorizationCode(SecretString::from(callback)),
 				})
 				.await
 				.expect("callback response");
@@ -528,7 +533,7 @@ mod tests {
 				.responses
 				.send_async(AuthResponse {
 					session: session.id.clone(),
-					input:   AuthInput::CallbackUrl(SecretString::from(format!(
+					input:   AuthInput::AuthorizationCode(SecretString::from(format!(
 						"{REDIRECT_URI}?code=secret-code-marker&state=wrong-state"
 					))),
 				})

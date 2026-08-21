@@ -16,6 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::super::{
 	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthError,
 	OAuthHttpClient, OAuthHttpRequest, OAuthTokenSet, callback_code, parse_http_url, provider_error,
+	receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -122,6 +123,7 @@ async fn exchange(
 			.append_pair("code_challenge_method", "S256")
 			.append_pair("state", &state);
 	}
+	let callback_server = start_callback_server(redirect_uri, &state).await;
 	driver
 		.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
 		.await?;
@@ -133,7 +135,7 @@ async fn exchange(
 		}))
 		.await?;
 
-	let code = match driver.receive().await? {
+	let code = match receive_callback_input(driver, callback_server).await? {
 		AuthInput::CallbackUrl(callback) => callback_code(&callback, &state)?,
 		AuthInput::AuthorizationCode(code) => authorization_code(code, &state)?,
 		AuthInput::Cancel => return Err(OAuthError::Cancelled),
@@ -305,6 +307,9 @@ fn authorization_code(
 	expected_state: &str,
 ) -> Result<SecretString, OAuthError> {
 	let value = code.expose_secret();
+	if value.starts_with("http://") || value.starts_with("https://") {
+		return callback_code(&code, expected_state);
+	}
 	let (code, fragment_state) = value
 		.split_once('#')
 		.map_or((value, None), |(code, state)| (code, Some(state)));
@@ -510,7 +515,7 @@ mod tests {
 				.responses
 				.send_async(AuthResponse {
 					session: session.id.clone(),
-					input:   AuthInput::CallbackUrl(SecretString::from(callback)),
+					input:   AuthInput::AuthorizationCode(SecretString::from(callback)),
 				})
 				.await
 				.unwrap();
@@ -595,7 +600,7 @@ mod tests {
 					.responses
 					.send_async(AuthResponse {
 						session: session.id.clone(),
-						input:   AuthInput::CallbackUrl(SecretString::from(format!(
+						input:   AuthInput::AuthorizationCode(SecretString::from(format!(
 							"http://localhost:54545/callback?code=code&state={state}"
 						))),
 					})

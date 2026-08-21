@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 use super::super::{
 	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthError,
 	OAuthHttpClient, OAuthHttpRequest, OAuthTokenSet, PkcePending, callback_code, parse_http_url,
-	provider_error,
+	provider_error, receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -62,9 +62,10 @@ impl OAuthCustomHandler for DevinCliTokenHandler {
 		driver: &'a LoginDriver,
 	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
 		async move {
-			let pending = self.begin(spec, driver).await?;
-			let input = driver.receive().await?;
-			let AuthInput::CallbackUrl(callback) = input else {
+			let mut pending = self.begin(spec, driver).await?;
+			let input = receive_callback_input(driver, pending.callback_server.take()).await?;
+			let (AuthInput::CallbackUrl(callback) | AuthInput::AuthorizationCode(callback)) = input
+			else {
 				return Err(OAuthError::UnexpectedInput);
 			};
 			let code = callback_code(&callback, &pending.state)?;
@@ -94,6 +95,7 @@ impl DevinCliTokenHandler {
 				.append_pair("code_challenge", &challenge)
 				.append_pair("code_challenge_method", "S256");
 		}
+		let callback_server = start_callback_server(redirect_uri, &state).await;
 
 		driver
 			.emit(AuthEvent::OpenUrl(Str::new(url.as_str())))
@@ -111,6 +113,7 @@ impl DevinCliTokenHandler {
 			state,
 			redirect_uri: Str::new(redirect_uri),
 			completion: PkceCompletion::PasteCallbackUrl,
+			callback_server,
 		})
 	}
 
@@ -387,7 +390,7 @@ mod tests {
 			.responses
 			.send_async(AuthResponse {
 				session: session.id.clone(),
-				input:   AuthInput::CallbackUrl(SecretString::from(callback)),
+				input:   AuthInput::AuthorizationCode(SecretString::from(callback)),
 			})
 			.await
 			.expect("callback response");
@@ -484,7 +487,7 @@ mod tests {
 				.responses
 				.send_async(AuthResponse {
 					session: session.id.clone(),
-					input:   AuthInput::CallbackUrl(SecretString::from(
+					input:   AuthInput::AuthorizationCode(SecretString::from(
 						"http://127.0.0.1:59653/callback?code=secret-code&state=wrong".to_owned(),
 					)),
 				})
