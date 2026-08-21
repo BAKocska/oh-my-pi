@@ -12,6 +12,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use miette::IntoDiagnostic as _;
 use omp_agent::{
 	Agent, AgentEvent, AgentPhase, AgentState, AgentTree, Interrupt, InterruptClass,
 	InterruptSource, RewindTarget, TurnClient,
@@ -21,7 +22,7 @@ use omp_chat_ui::{
 	SessionRow, StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
 	host::{HostExit, HostOptions},
 };
-use omp_core::{Hash32, Str, encoding::hex, sf};
+use omp_core::{Hash32, SecretString, Str, encoding::hex, sf};
 use omp_llm_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, provider::AuthSpecKind,
 	snapshot::Catalog,
@@ -36,7 +37,6 @@ use omp_telemetry::firehose::{
 };
 use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::ViewState};
 use omp_tui::{UiContext, components::AttachmentContent, detect};
-use secrecy::SecretString;
 
 use crate::{
 	chat_ui::input::{ChatCommand, CommandContribution, CommandRoster, ParsedTurnBudget},
@@ -264,27 +264,33 @@ pub async fn run<'a, C, R>(
 	command_sources: Vec<Vec<CommandContribution>>,
 	mut list_sessions: R,
 	welcome: bool,
-) -> anyhow::Result<HostExit>
+) -> miette::Result<HostExit>
 where
 	C: TurnClient + 'static,
-	R: FnMut() -> anyhow::Result<Vec<ResumeChoice>> + 'a,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + 'a,
 {
 	let bus = agent.events().clone();
 	let mailbox = agent.mailbox();
 	// Turn deltas and their authoritative outcome share this stream. Dropping
 	// either can leave a blank or permanently partial transcript.
 	let agent_events = subscribe_chat_events(&bus);
-	let live_events = agent.firehose().subscribe(SubscriptionOptions::new(
-		[
-			FirehoseKind::TurnStart,
-			FirehoseKind::TurnEnd,
-			FirehoseKind::ModelRequest,
-			FirehoseKind::ModelAttempt,
-			FirehoseKind::ProviderError,
-			FirehoseKind::ToolCall,
-		],
-		128,
-	)?)?;
+	let live_events = agent
+		.firehose()
+		.subscribe(
+			SubscriptionOptions::new(
+				[
+					FirehoseKind::TurnStart,
+					FirehoseKind::TurnEnd,
+					FirehoseKind::ModelRequest,
+					FirehoseKind::ModelAttempt,
+					FirehoseKind::ProviderError,
+					FirehoseKind::ToolCall,
+				],
+				128,
+			)
+			.into_diagnostic()?,
+		)
+		.into_diagnostic()?;
 	let session_id = session.session_id.clone();
 	let mut roster_events = tree.watch_roster();
 	let mut roster_tick = tokio::time::interval(Duration::from_millis(100));
@@ -302,7 +308,7 @@ where
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
 	let mut agent_task = tokio::spawn(async move {
 		if startup_pending {
-			let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
+			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
 			let ack = match agent.submit(Vec::new(), turn_id).await {
 				Ok(summary) => SubmitAck {
 					interrupted:     summary.interrupted,
@@ -319,7 +325,7 @@ where
 			match command {
 				UiCmd::Submit { item, budget } => {
 					apply_turn_budget(&submission_state, budget.as_ref());
-					let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
+					let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
 					let ack = match agent.submit([*item], turn_id).await {
 						Ok(summary) => SubmitAck {
 							interrupted:     summary.interrupted,
@@ -483,7 +489,7 @@ where
 				},
 			}
 		}
-		Ok::<(), anyhow::Error>(())
+		Ok::<(), miette::Report>(())
 	};
 
 	let host = omp_chat_ui::host::run_with_options(chat, ctx, backend_rx, intent_tx, HostOptions {
@@ -499,7 +505,7 @@ where
 		let _ = agent_task.await;
 	}
 	bridge_result?;
-	host_result.map_err(Into::into)
+	host_result.into_diagnostic()
 }
 const fn mode_name(mode: ActiveMode) -> &'static str {
 	match mode {
@@ -696,9 +702,9 @@ async fn handle_intent<R>(
 	registry: &Registry,
 	dropped: u64,
 	state: &mut BridgeState,
-) -> anyhow::Result<bool>
+) -> miette::Result<bool>
 where
-	R: FnMut() -> anyhow::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
 {
 	match intent {
 		Intent::Submit { text, attachments, mode } => match state.commands.parse_input(&text) {
@@ -1605,7 +1611,7 @@ fn persist_tool_image(blob: &Blob) -> Option<Str> {
 		return None;
 	}
 	let name = if blob.hash.is_empty() {
-		format!("omp-tool-image-{}.png", ulid::Ulid::generate())
+		format!("omp-tool-image-{}.png", omp_core::Ulid::generate())
 	} else {
 		let hex = hex::encode(&blob.hash[..blob.hash.len().min(16)]).into_string();
 		format!("omp-tool-image-{hex}.png")
@@ -1990,10 +1996,10 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
 	use omp_agent::{AgentKind, AgentStatus, Budget, ExecutionModeHandle};
+	use omp_core::ExposeSecret as _;
 	use omp_tui::{
 		Color, Size, UiContext, components::AttachmentContent, test_support::frame_row_text,
 	};
-	use secrecy::ExposeSecret as _;
 
 	use super::*;
 
@@ -2236,8 +2242,8 @@ mod tests {
 
 	#[test]
 	fn image_attachment_lowers_to_inline_hashed_blob() {
-		let path =
-			std::env::temp_dir().join(format!("omp-chat-attachment-{}.png", ulid::Ulid::generate()));
+		let path = std::env::temp_dir()
+			.join(format!("omp-chat-attachment-{}.png", omp_core::Ulid::generate()));
 		let bytes = b"not-a-decoded-image";
 		std::fs::write(&path, bytes).expect("write attachment fixture");
 		let mut item = input::user_message("inspect");

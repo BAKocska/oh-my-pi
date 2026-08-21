@@ -10,9 +10,8 @@ use std::{
 };
 
 use futures::future::{BoxFuture, FutureExt};
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret, SecretBox, SecretString, Str, sf};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1244,8 +1243,8 @@ mod tests {
 		time::Duration,
 	};
 
+	use omp_core::{ExposeSecret, SecretBox};
 	use rusqlite::Connection;
-	use secrecy::{ExposeSecret, SecretBox};
 	use tempfile::tempdir;
 
 	use super::*;

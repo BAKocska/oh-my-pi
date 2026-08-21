@@ -506,7 +506,7 @@ pub fn parse(
 	cacheable_parse(word.to_owned(), options.to_owned())
 }
 
-#[cached::proc_macro::cached(size = 64, result = true)]
+#[omp_macros::cached(size = 64, result = true)]
 fn cacheable_parse(
 	word: String,
 	options: ParserOptions,

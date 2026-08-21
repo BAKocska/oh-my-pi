@@ -1,9 +1,9 @@
 use std::{io, path::PathBuf, process::Stdio, sync::Once, time::Duration};
 
-use anyhow::{Context as _, Result};
 use tokio::process::{Child, Command};
 
 use super::within;
+use crate::{Context as _, Result};
 
 static OMP_BINARY_ENV: Once = Once::new();
 

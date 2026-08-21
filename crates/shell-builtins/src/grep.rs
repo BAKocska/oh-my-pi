@@ -11,7 +11,6 @@ use std::{
 };
 
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
-use globset::{Glob, GlobMatcher};
 use grep_matcher::{LineTerminator, Matcher};
 use grep_pcre2::{RegexMatcher as PcreMatcher, RegexMatcherBuilder as PcreMatcherBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -19,6 +18,7 @@ use grep_searcher::{
 	BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
 };
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
+use omp_walker::glob::{CompiledPattern, PatternBuilder};
 
 use crate::host::{Host, Utility, util};
 
@@ -357,7 +357,7 @@ enum CompiledMatcher {
 
 struct PathRule {
 	include: bool,
-	matcher: GlobMatcher,
+	matcher: CompiledPattern,
 }
 
 struct RuleSpec {
@@ -392,14 +392,14 @@ impl PathRules {
 	}
 }
 
-fn path_suffix_matches(matcher: &GlobMatcher, path: &Path) -> bool {
+fn path_suffix_matches(matcher: &CompiledPattern, path: &Path) -> bool {
 	let mut components = path.components();
 	loop {
 		let suffix = components.as_path();
 		if suffix.as_os_str().is_empty() {
 			return false;
 		}
-		if matcher.is_match(suffix) {
+		if matcher.matches_path(suffix) {
 			return true;
 		}
 		if components.next().is_none() {
@@ -1249,8 +1249,10 @@ fn compile_rules(mut specs: Vec<RuleSpec>) -> Result<Vec<PathRule>, String> {
 	specs
 		.into_iter()
 		.map(|spec| {
-			Glob::new(&spec.pattern)
-				.map(|glob| PathRule { include: spec.include, matcher: glob.compile_matcher() })
+			PatternBuilder::new(&spec.pattern)
+				.literal_separator(false)
+				.build()
+				.map(|matcher| PathRule { include: spec.include, matcher })
 				.map_err(|error| format!("{}: {error}", spec.pattern))
 		})
 		.collect()

@@ -11,9 +11,8 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT},
 };
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
-use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 
 use crate::{
@@ -517,8 +516,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
+	use omp_core::{ExposeSecret as _, SecretString};
 	use parking_lot::Mutex;
-	use secrecy::{ExposeSecret as _, SecretString};
 
 	use super::{CHINA_CONSOLE, INTERNATIONAL_CONSOLE, fetch_alibaba_token_plan_usage};
 	use crate::auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError};

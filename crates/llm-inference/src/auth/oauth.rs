@@ -23,12 +23,11 @@ use hyper_util::{
 	client::legacy::{Client, connect::HttpConnector},
 	rt::TokioExecutor,
 };
-use omp_core::{Str, base64_url, sf};
+use omp_core::{ExposeSecret, SecretBox, SecretString, Str, base64_url, sf};
 use omp_llm_catalog::provider::PrincipalResolution;
 use ring::rand::{SecureRandom, SystemRandom};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 

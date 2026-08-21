@@ -3,8 +3,7 @@
 use std::time::{Instant, SystemTime};
 
 use futures::FutureExt as _;
-use omp_core::sf;
-use secrecy::SecretString;
+use omp_core::{SecretString, sf};
 
 use crate::{
 	answer::UsageAccountMetadata,

@@ -14,18 +14,15 @@ workspace = true
 [dependencies]
 async-recursion = { workspace = true }
 bon = { workspace = true }
-cached = { workspace = true }
-cfg-if = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
 fancy-regex = { workspace = true }
 futures = { workspace = true }
 im = { workspace = true }
-indenter = { workspace = true }
-inherent = { workspace = true }
 itertools = { workspace = true }
-normalize-path = { workspace = true }
+jiff = { workspace = true }
+
 omp-core = { workspace = true }
+omp-macros = { workspace = true }
 omp-proto = { workspace = true }
 peg = { workspace = true }
 rand = { workspace = true }
@@ -39,19 +36,13 @@ uucore = { workspace = true }
 xutf = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
-hostname = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 command-fds = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true }
-rlimit = { workspace = true }
-terminfo = { workspace = true }
-uzers = { workspace = true }
+nix = { workspace = true, features = ["hostname"] }
 
 [target.'cfg(windows)'.dependencies]
-check_elevation = { workspace = true }
-whoami = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]

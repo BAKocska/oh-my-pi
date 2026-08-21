@@ -13,7 +13,7 @@ use std::{
 	process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use omp_e2e::{Context as _, Result, error};
 use serde::{Deserialize, Serialize};
 
 /// Versioned shape of the pooling benchmark artifact.
@@ -143,11 +143,17 @@ fn arguments() -> Result<(PathBuf, PathBuf, Option<usize>)> {
 					.parse::<usize>()
 					.context("--limit must be a positive integer no greater than 648")?;
 				if !(1..=648).contains(&parsed) {
-					bail!("--limit must be a positive integer no greater than 648");
+					return Err(error(format!(
+						"--limit must be a positive integer no greater than 648"
+					)));
 				}
 				limit = Some(parsed);
 			},
-			unknown => bail!("unknown argument {unknown:?}; pass --help for the matrix schema"),
+			unknown => {
+				return Err(error(format!(
+					"unknown argument {unknown:?}; pass --help for the matrix schema"
+				)));
+			},
 		}
 	}
 	Ok((
@@ -177,10 +183,10 @@ fn sample(runner: &Path, cell: MatrixCell) -> Result<Measurements> {
 		.output()
 		.with_context(|| format!("could not execute pooling runner {}", runner.display()))?;
 	if !output.status.success() {
-		bail!(
+		return Err(error(format!(
 			"pooling runner failed for {cell:?}: {}",
 			String::from_utf8_lossy(&output.stderr).trim()
-		);
+		)));
 	}
 	serde_json::from_slice(&output.stdout)
 		.with_context(|| format!("pooling runner emitted invalid measurements for {cell:?}"))

@@ -4,24 +4,16 @@ use std::os::fd::RawFd;
 
 use crate::{ShellFd, error, openfiles};
 
-cfg_if::cfg_if! {
-	 if #[cfg(any(target_os = "linux", target_os = "android"))] {
-		  const FD_DIR_PATH: &str = "/proc/self/fd";
-	 } else if #[cfg(any(
-				target_os = "freebsd",
-				target_os = "macos",
-				target_os = "netbsd",
-				target_os = "openbsd"
-		  ))] {
-		  const FD_DIR_PATH: &str = "/dev/fd";
-	 } else {
-		  /// Returns an iterator over all open file descriptors for the shell.
-		  pub fn iter_fds()
-		  -> Result<impl Iterator<Item = (ShellFd, openfiles::OpenFile)>, error::Error> {
-				Ok(std::iter::empty())
-		  }
-	 }
-}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const FD_DIR_PATH: &str = "/proc/self/fd";
+
+#[cfg(any(
+	target_os = "freebsd",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd"
+))]
+const FD_DIR_PATH: &str = "/dev/fd";
 
 /// Makes a best-effort attempt to iterate over all open file descriptors
 /// for the current process.

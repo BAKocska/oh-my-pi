@@ -14,10 +14,12 @@
 pub const USER_AGENT: &str = concat!("omp/", env!("CARGO_PKG_VERSION"));
 
 pub mod append_vec;
+pub mod cache;
 pub mod cow_bytes;
 pub mod encoding;
 pub mod hash32;
 pub mod location;
+pub mod path;
 pub mod phase;
 pub mod principal;
 pub mod secret;
@@ -27,8 +29,10 @@ pub mod sparse_map;
 pub mod sparse_set;
 pub mod str;
 pub mod time;
+pub mod ulid;
 
 pub use append_vec::{AppendSlice, AppendVec};
+pub use cache::MemoCache;
 pub use cow_bytes::CowBytes;
 pub use encoding::{base32, base32_dns, base32_hex, base64, base64_url, hex};
 pub use hash32::{Hash32, Hash32ParseError};
@@ -36,11 +40,13 @@ pub use location::{
 	AgentUrl, ArtifactAddress, ArtifactUrl, ClientPath, EnvPath, HistoryUrl, LocationError,
 	ToolPath, WorkspaceUri,
 };
+pub use path::NormalizePath;
 pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
 pub use principal::{ArtifactDigest, ArtifactDigestError, Principal, Provenance};
-pub use secret::Secret;
+pub use secret::{ExposeSecret, Secret, SecretBox, SecretString};
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;
 pub use sparse_set::SparseSet;
 pub use str::{CowStr, IntoStr, Str, StrExt, StrMut};
 pub use time::{Duration, DurationError, DurationUnit, format_rfc3339, parse_rfc3339};
+pub use ulid::{Ulid, UlidParseError};

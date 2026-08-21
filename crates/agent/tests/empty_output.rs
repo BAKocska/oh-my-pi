@@ -298,7 +298,7 @@ fn agent(
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-empty-output-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let journal = Journal::create(&path, &Header {
 		v:       4,
@@ -383,7 +383,7 @@ async fn retry_count_survives_journal_reopen() {
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-empty-output-reopen-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let mut journal = Journal::create(&path, &Header {
 		v:       4,
@@ -460,7 +460,7 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-empty-output-abort-gap-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let mut journal = Journal::create(&path, &Header {
 		v:       4,
@@ -536,7 +536,7 @@ async fn exhausted_chain_is_not_released_and_fresh_user_prompt_resets_cap() {
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-empty-output-exhausted-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let journal = exhausted_journal(&path);
 	drop(journal);
@@ -581,7 +581,7 @@ async fn fresh_epoch_abort_releases_only_fresh_inputs_after_reopen() {
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-empty-output-new-epoch-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let mut journal = exhausted_journal(&path);
 	let fresh = user_text("fresh crash task");
@@ -631,7 +631,7 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-empty-output-crash-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let mut journal = Journal::create(&path, &Header {
 		v:       4,
@@ -719,7 +719,7 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 	let path = std::env::temp_dir().join(format!(
 		"omp-agent-upstream-recovery-{}-{}.jsonl",
 		std::process::id(),
-		ulid::Ulid::generate()
+		omp_core::Ulid::generate()
 	));
 	let journal = Journal::create(&path, &Header {
 		v:       4,

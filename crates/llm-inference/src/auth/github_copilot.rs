@@ -20,10 +20,9 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, USER_AGENT},
 };
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use omp_llm_catalog::ProviderId;
 use parking_lot::Mutex;
-use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use url::Url;
 use zeroize::Zeroizing;
@@ -389,8 +388,8 @@ mod tests {
 
 	use futures::future::{BoxFuture, Either};
 	use http::HeaderMap;
+	use omp_core::SecretString;
 	use parking_lot::Mutex;
-	use secrecy::SecretString;
 
 	use super::*;
 	use crate::auth::{OAuthHttpResponse, OAuthTransportError};

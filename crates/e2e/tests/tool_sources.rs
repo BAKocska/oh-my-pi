@@ -2,9 +2,11 @@
 
 #![cfg(unix)]
 
-use anyhow::{Result, bail};
 use bytes::Bytes;
-use omp_e2e::support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, within};
+use omp_e2e::{
+	Result, error,
+	support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, within},
+};
 use omp_env::{EnvClient, InvocationEvent};
 use omp_proto::env::v1::InvokeTool;
 use omp_tool::{CallOutcome, Registry};
@@ -33,8 +35,8 @@ async fn invoke_ok(
 	.await??;
 	match within("built-in acceptance", DEFAULT_TIMEOUT, invocation.next_event()).await?? {
 		Some(InvocationEvent::Accepted(_)) => {},
-		Some(event) => bail!("expected accepted event, got {event:?}"),
-		None => bail!("built-in invocation closed before acceptance"),
+		Some(event) => return Err(error(format!("expected accepted event, got {event:?}"))),
+		None => return Err(error(format!("built-in invocation closed before acceptance"))),
 	}
 	within(
 		"committing built-in arguments",
@@ -51,19 +53,26 @@ async fn invoke_ok(
 		match within("built-in verdict", DEFAULT_TIMEOUT, invocation.next_event()).await?? {
 			Some(InvocationEvent::Verdict(verdict)) => {
 				if verdict.is_error {
-					bail!("{name} returned an error: {}", String::from_utf8_lossy(&verdict.json));
+					return Err(error(format!(
+						"{name} returned an error: {}",
+						String::from_utf8_lossy(&verdict.json)
+					)));
 				}
 				return match serde_json::from_slice::<CallOutcome<Value, Value>>(&verdict.json)? {
 					CallOutcome::Ok(payload) => Ok(payload),
-					other => bail!("{name} returned a non-success outcome: {other:?}"),
+					other => {
+						return Err(error(format!("{name} returned a non-success outcome: {other:?}")));
+					},
 				};
 			},
 			Some(InvocationEvent::Update(_)) => {},
-			Some(InvocationEvent::Accepted(_)) => bail!("built-in invocation was accepted twice"),
-			Some(InvocationEvent::Admission(_)) => {
-				bail!("unexpected admission in built-in invocation")
+			Some(InvocationEvent::Accepted(_)) => {
+				return Err(error(format!("built-in invocation was accepted twice")));
 			},
-			None => bail!("built-in invocation closed before its verdict"),
+			Some(InvocationEvent::Admission(_)) => {
+				return Err(error(format!("unexpected admission in built-in invocation")));
+			},
+			None => return Err(error(format!("built-in invocation closed before its verdict"))),
 		}
 	}
 }

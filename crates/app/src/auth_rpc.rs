@@ -12,6 +12,7 @@ use std::{
 };
 
 use futures::Stream;
+use omp_core::SecretString;
 use omp_llm_catalog::ProviderId;
 use omp_llm_inference::{
 	Client, Registry,
@@ -28,7 +29,6 @@ use omp_llm_inference::{
 };
 use omp_proto::omp::auth::v1 as pb;
 use parking_lot::Mutex;
-use secrecy::SecretString;
 use tonic::{Request, Response, Status};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -378,7 +378,7 @@ fn login_step(event: AuthEvent) -> Result<pb::begin_login_response::Step, Status
 		},
 		AuthEvent::ShowDeviceCode { code, verification_url } => {
 			Ok(pb::begin_login_response::Step::Device(pb::begin_login_response::DeviceCode {
-				user_code:  secrecy::ExposeSecret::expose_secret(&code).to_owned(),
+				user_code:  omp_core::ExposeSecret::expose_secret(&code).to_owned(),
 				verify_url: verification_url.as_str().to_owned(),
 			}))
 		},

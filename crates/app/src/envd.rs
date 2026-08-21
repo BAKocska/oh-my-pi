@@ -521,7 +521,7 @@ pub(crate) fn authenticated_runtime_identity()
 	let user = authenticated_os_user()?;
 	let principal = omp_core::Principal::new(Str::from(format!("os:{user}")), user);
 	let authority = crate::exthost::PrincipalAuthority::new(principal);
-	let session_id = Str::from(ulid::Ulid::generate().to_string());
+	let session_id = Str::from(omp_core::Ulid::generate().to_string());
 	let session_generation = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_err(io::Error::other)?

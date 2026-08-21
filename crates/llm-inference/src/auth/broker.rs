@@ -3,9 +3,8 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use futures::future::{BoxFuture, FutureExt as _};
-use omp_core::{Str, sf};
+use omp_core::{SecretString, Str, sf};
 use omp_llm_catalog::{AuthSpecId, Catalog, provider::AuthSpecKind};
-use secrecy::SecretString;
 
 use super::lease::{
 	AuthRejection, CredentialError, CredentialKind, CredentialLease, CredentialNeed,

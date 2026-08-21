@@ -3,8 +3,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use omp_core::{IntoStr, Str, sf};
-use secrecy::SecretString;
+use omp_core::{IntoStr, SecretString, Str, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 

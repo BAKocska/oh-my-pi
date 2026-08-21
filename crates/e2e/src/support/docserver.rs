@@ -6,12 +6,12 @@ use std::{
 	time::Duration,
 };
 
-use anyhow::{Context as _, Result};
 use omp_app::envd::docs::DocumentHost;
 use omp_docserver::daemon::{self, ServeOptions, Transport};
 use tokio::{net::UnixStream, task::JoinHandle};
 
 use super::{DEFAULT_TIMEOUT, within};
+use crate::{Context as _, Result, error};
 
 /// Real document authority running on a private Unix socket in a cancellable
 /// task.
@@ -52,7 +52,7 @@ impl DocServerTask {
 						.await
 						.context("joining docserver startup task")?;
 					result.context("docserver stopped during startup")?;
-					return Err(anyhow::anyhow!("docserver stopped without a startup error"));
+					return Err(error(format!("docserver stopped without a startup error")));
 				}
 				match UnixStream::connect(&server.socket).await {
 					Ok(stream) => {

@@ -32,7 +32,6 @@ path = "src/bin/omp_e2e_host.rs"
 test = false
 
 [dependencies]
-anyhow = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
@@ -67,7 +66,6 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
-ulid = { workspace = true }
 url = { workspace = true }
 xutf = { workspace = true }
 

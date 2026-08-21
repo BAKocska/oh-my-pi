@@ -487,7 +487,7 @@ pub struct AuthorityLock {
 
 impl Drop for AuthorityLock {
 	fn drop(&mut self) {
-		let _ = fs2::FileExt::unlock(&self.root);
+		let _ = self.root.unlock();
 		self.held.store(false, Ordering::Release);
 	}
 }
@@ -590,10 +590,10 @@ impl ServerConfig {
 					path: self.environment_root.clone(),
 					source,
 				})?;
-			fs2::FileExt::try_lock_exclusive(&root).map_err(|source| Error::Io {
+			root.try_lock().map_err(|source| Error::Io {
 				operation: sf!("lock Environment authority"),
-				path: self.environment_root.clone(),
-				source,
+				path:      self.environment_root.clone(),
+				source:    source.into(),
 			})?;
 			Ok(root)
 		})();

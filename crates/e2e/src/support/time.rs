@@ -7,8 +7,9 @@ use std::{
 	time::Duration,
 };
 
-use anyhow::{Context as _, Result};
 use tokio::sync::{Barrier as TokioBarrier, Notify};
+
+use crate::{Context as _, Result};
 
 /// Default upper bound for one local authority transition.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);

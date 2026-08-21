@@ -8,7 +8,6 @@ use std::{
 	time::Duration,
 };
 
-use anyhow::{Context as _, Result};
 use omp_agent::RpcTurnClient;
 use omp_app::{
 	daemon::{DaemonConfig, DaemonError, DaemonHandle},
@@ -35,6 +34,7 @@ use tokio::task::JoinHandle;
 use tower::Service;
 
 use super::{DEFAULT_TIMEOUT, Gate, Scratch, within};
+use crate::{Context as _, Result};
 
 #[derive(Clone)]
 struct FakeRoute {

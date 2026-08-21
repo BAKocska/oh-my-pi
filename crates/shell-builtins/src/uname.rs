@@ -9,7 +9,6 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use platform_info::{PlatformInfo, PlatformInfoAPI, UNameAPI};
 use uucore::display::Quotable;
 
 use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
@@ -37,6 +36,100 @@ struct UNameOutput {
 	hardware_platform: Option<OsString>,
 }
 
+#[cfg(unix)]
+fn platform_fields() -> Result<[OsString; 6], ()> {
+	let uname = nix::sys::utsname::uname().map_err(|_| ())?;
+	Ok([
+		uname.sysname().to_owned(),
+		uname.nodename().to_owned(),
+		uname.release().to_owned(),
+		uname.version().to_owned(),
+		uname.machine().to_owned(),
+		OsString::from(if cfg!(all(target_os = "linux", any(target_env = "gnu", target_env = ""))) {
+			"GNU/Linux"
+		} else if cfg!(target_os = "linux") {
+			"Linux"
+		} else if cfg!(target_os = "android") {
+			"Android"
+		} else if cfg!(target_os = "freebsd") {
+			"FreeBSD"
+		} else if cfg!(target_os = "netbsd") {
+			"NetBSD"
+		} else if cfg!(target_os = "openbsd") {
+			"OpenBSD"
+		} else if cfg!(target_vendor = "apple") {
+			"Darwin"
+		} else if cfg!(target_os = "illumos") {
+			"illumos"
+		} else if cfg!(target_os = "solaris") {
+			"Solaris"
+		} else if cfg!(target_os = "haiku") {
+			"Haiku"
+		} else if cfg!(target_os = "dragonfly") {
+			"DragonFly"
+		} else if cfg!(target_os = "aix") {
+			"AIX"
+		} else {
+			"unknown"
+		}),
+	])
+}
+
+#[cfg(windows)]
+fn platform_fields() -> Result<[OsString; 6], ()> {
+	use std::os::windows::ffi::OsStringExt;
+
+	use windows_sys::Win32::System::SystemInformation::{
+		GetComputerNameW, GetNativeSystemInfo, GetVersionExW, OSVERSIONINFOW,
+		PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM, PROCESSOR_ARCHITECTURE_ARM64,
+		PROCESSOR_ARCHITECTURE_IA64, PROCESSOR_ARCHITECTURE_INTEL, SYSTEM_INFO,
+	};
+
+	let mut hostname = [0u16; 256];
+	let mut hostname_len = hostname.len() as u32;
+	if unsafe { GetComputerNameW(hostname.as_mut_ptr(), &mut hostname_len) } == 0 {
+		return Err(());
+	}
+	let nodename = OsString::from_wide(&hostname[..hostname_len as usize]);
+
+	let mut version = OSVERSIONINFOW::default();
+	version.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
+	if unsafe { GetVersionExW(&mut version) } == 0 {
+		return Err(());
+	}
+
+	let mut system = SYSTEM_INFO::default();
+	unsafe { GetNativeSystemInfo(&mut system) };
+	let architecture = unsafe { system.Anonymous.Anonymous.wProcessorArchitecture };
+	let machine = match architecture {
+		PROCESSOR_ARCHITECTURE_AMD64 => "x86_64",
+		PROCESSOR_ARCHITECTURE_INTEL => match system.wProcessorLevel {
+			4 => "i486",
+			5 => "i586",
+			6 => "i686",
+			_ => "i386",
+		},
+		PROCESSOR_ARCHITECTURE_IA64 => "ia64",
+		PROCESSOR_ARCHITECTURE_ARM => "arm",
+		PROCESSOR_ARCHITECTURE_ARM64 => "aarch64",
+		_ => "unknown",
+	};
+
+	Ok([
+		OsString::from("Windows_NT"),
+		nodename,
+		OsString::from(format!("{}.{}", version.dwMajorVersion, version.dwMinorVersion)),
+		OsString::from(version.dwBuildNumber.to_string()),
+		OsString::from(machine),
+		OsString::from("MS/Windows"),
+	])
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_fields() -> Result<[OsString; 6], ()> {
+	Err(())
+}
+
 impl UNameOutput {
 	fn display(&self) -> OsString {
 		[
@@ -57,7 +150,8 @@ impl UNameOutput {
 	}
 
 	fn new(opts: &Options) -> Result<Self, &'static str> {
-		let uname = PlatformInfo::new().map_err(|_| "cannot get system name")?;
+		let [sysname, nodename_value, release, version, machine_value, osname] =
+			platform_fields().map_err(|()| "cannot get system name")?;
 		let none = !(opts.all
 			|| opts.kernel_name
 			|| opts.nodename
@@ -68,12 +162,12 @@ impl UNameOutput {
 			|| opts.processor
 			|| opts.hardware_platform);
 
-		let kernel_name = (opts.kernel_name || opts.all || none).then(|| uname.sysname().to_owned());
-		let nodename = (opts.nodename || opts.all).then(|| uname.nodename().to_owned());
-		let kernel_release = (opts.kernel_release || opts.all).then(|| uname.release().to_owned());
-		let kernel_version = (opts.kernel_version || opts.all).then(|| uname.version().to_owned());
-		let machine = (opts.machine || opts.all).then(|| uname.machine().to_owned());
-		let os = (opts.os || opts.all).then(|| uname.osname().to_owned());
+		let kernel_name = (opts.kernel_name || opts.all || none).then_some(sysname);
+		let nodename = (opts.nodename || opts.all).then_some(nodename_value);
+		let kernel_release = (opts.kernel_release || opts.all).then_some(release);
+		let kernel_version = (opts.kernel_version || opts.all).then_some(version);
+		let machine = (opts.machine || opts.all).then_some(machine_value);
+		let os = (opts.os || opts.all).then_some(osname);
 
 		// This option is unsupported on modern Linux systems.
 		// See: https://lists.gnu.org/archive/html/bug-coreutils/2005-09/msg00063.html

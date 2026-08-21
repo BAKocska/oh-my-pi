@@ -3,9 +3,8 @@
 use std::{collections::HashMap, time::Instant};
 
 use futures::future::{Either, Ready};
-use omp_core::Str;
+use omp_core::{SecretString, Str};
 use omp_llm_catalog::ProviderId;
-use secrecy::SecretString;
 use thiserror::Error;
 
 use super::{

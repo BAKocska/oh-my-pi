@@ -287,7 +287,7 @@ pub enum LoginChannelError {
 
 #[cfg(test)]
 mod tests {
-	use secrecy::SecretString;
+	use omp_core::SecretString;
 
 	use super::*;
 

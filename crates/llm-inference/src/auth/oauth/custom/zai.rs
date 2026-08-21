@@ -8,9 +8,8 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
-use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use zeroize::Zeroizing;

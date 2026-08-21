@@ -42,7 +42,7 @@ pub fn run(data_dir: &Path, project: &Path, args: &ImportSessionArgs) -> miette:
 	let state_dir = crate::project_state::directory(data_dir, &root).into_diagnostic()?;
 	let sessions_dir = state_dir.join("sessions");
 	std::fs::create_dir_all(&sessions_dir).into_diagnostic()?;
-	let session_id = SessionId(omp_core::Str::from(ulid::Ulid::generate().to_string()));
+	let session_id = SessionId(omp_core::Str::from(omp_core::Ulid::generate().to_string()));
 	let journal_path = sessions_dir.join(format!("{}.jsonl", session_id.0));
 	let index = SessionIndex::open(state_dir.join("sessions.sqlite3")).into_diagnostic()?;
 	let root_display = root.to_string_lossy().into_owned();

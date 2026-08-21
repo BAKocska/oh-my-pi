@@ -4,7 +4,7 @@
 	reason = "Windows implementations retain the Unix-compatible fallible user API"
 )]
 
-use std::{path::PathBuf, sync::LazyLock};
+use std::{path::PathBuf, ptr, sync::LazyLock};
 
 use crate::error;
 
@@ -22,11 +22,47 @@ const NON_ELEVATED_GID: u32 = 1000;
 /// Cached elevation status. The underlying check queries the process token,
 /// which can't change after process start, so it's safe to memoize.
 static IS_ELEVATED: LazyLock<bool> = LazyLock::new(|| {
-	check_elevation::is_elevated().unwrap_or_else(|err| {
+	query_elevation().unwrap_or_else(|err| {
 		tracing::warn!("failed to determine process elevation: {err}");
 		false
 	})
 });
+
+fn query_elevation() -> std::io::Result<bool> {
+	use windows_sys::Win32::{
+		Foundation::{CloseHandle, HANDLE},
+		Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+		System::Threading::{GetCurrentProcess, OpenProcessToken},
+	};
+
+	let mut token: HANDLE = ptr::null_mut();
+	// SAFETY: GetCurrentProcess returns a valid pseudo-handle and `token` is
+	// writable.
+	if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+
+	let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+	let mut returned = 0_u32;
+	// SAFETY: `token` is live and `elevation` is writable for its reported size.
+	let succeeded = unsafe {
+		GetTokenInformation(
+			token,
+			TokenElevation,
+			(&raw mut elevation).cast(),
+			std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+			&mut returned,
+		)
+	};
+	// SAFETY: `token` was returned by OpenProcessToken and is closed exactly once.
+	unsafe {
+		CloseHandle(token);
+	}
+	if succeeded == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(elevation.TokenIsElevated != 0)
+}
 
 pub(crate) fn get_user_home_dir(_username: &str) -> Option<PathBuf> {
 	// std::env::home_dir() doesn't support getting home dir for arbitrary users
@@ -67,8 +103,27 @@ pub(crate) fn get_effective_gid() -> Result<u32, error::Error> {
 }
 
 pub(crate) fn get_current_username() -> Result<String, error::Error> {
-	let username = whoami::username().map_err(std::io::Error::from)?;
-	Ok(username)
+	use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+
+	let mut units = 0_u32;
+	// SAFETY: null/zero is the documented buffer sizing query.
+	unsafe {
+		GetUserNameW(ptr::null_mut(), &mut units);
+	}
+	if units == 0 {
+		return Err(std::io::Error::last_os_error().into());
+	}
+	let mut name = vec![0_u16; units as usize];
+	// SAFETY: `name` has `units` writable UTF-16 code units.
+	if unsafe { GetUserNameW(name.as_mut_ptr(), &mut units) } == 0 {
+		return Err(std::io::Error::last_os_error().into());
+	}
+	let length = name
+		.iter()
+		.position(|unit| *unit == 0)
+		.unwrap_or(name.len());
+	String::from_utf16(&name[..length])
+		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
 }
 
 pub(crate) fn get_user_group_ids() -> Result<Vec<u32>, error::Error> {

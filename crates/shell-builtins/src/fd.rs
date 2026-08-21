@@ -1,4 +1,4 @@
-//! In-process `fd` builtin backed by `omp_walker`, `globset`, and `regex`.
+//! In-process `fd` builtin backed by `omp_walker` and `regex`.
 //!
 //! Relocated from pi-shell's native implementation.
 
@@ -16,9 +16,11 @@ use std::{
 };
 
 use clap::{ArgAction, Parser, ValueEnum};
-use globset::{GlobBuilder, GlobMatcher};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use omp_walker::CollectedEntry;
+use omp_walker::{
+	CollectedEntry,
+	glob::{CompiledPattern, PatternBuilder},
+};
 use regex::{Regex, RegexBuilder};
 
 use crate::host::{Host, Utility, util};
@@ -276,7 +278,7 @@ enum When {
 enum SearchMatcher {
 	All,
 	Regex(Vec<Regex>),
-	Glob(Vec<GlobMatcher>),
+	Glob(Vec<CompiledPattern>),
 	Fixed { patterns: Vec<String>, case_insensitive: bool },
 }
 
@@ -285,7 +287,7 @@ impl SearchMatcher {
 		match self {
 			Self::All => true,
 			Self::Regex(patterns) => patterns.iter().all(|pattern| pattern.is_match(candidate)),
-			Self::Glob(patterns) => patterns.iter().all(|pattern| pattern.is_match(candidate)),
+			Self::Glob(patterns) => patterns.iter().all(|pattern| pattern.matches(candidate)),
 			Self::Fixed { patterns, case_insensitive } => {
 				if *case_insensitive {
 					let candidate = candidate.to_lowercase();
@@ -299,7 +301,7 @@ impl SearchMatcher {
 }
 
 #[derive(Clone)]
-struct Excludes(Arc<Vec<GlobMatcher>>);
+struct Excludes(Arc<Vec<CompiledPattern>>);
 
 impl Excludes {
 	fn empty() -> Self {
@@ -316,7 +318,7 @@ impl Excludes {
 			.map_or_else(|_| absolute.clone(), normalize_display_path);
 		let name = path.file_name().map(normalize_os_str).unwrap_or_default();
 		self.0.iter().any(|pattern| {
-			pattern.is_match(&absolute) || pattern.is_match(&relative) || pattern.is_match(&name)
+			pattern.matches(&absolute) || pattern.matches(&relative) || pattern.matches(&name)
 		})
 	}
 }
@@ -1203,12 +1205,11 @@ fn build_matcher(cli: &FdCli) -> io::Result<SearchMatcher> {
 	if cli.glob {
 		let mut matchers = Vec::with_capacity(patterns.len());
 		for pattern in patterns {
-			let glob = GlobBuilder::new(&pattern)
-				.literal_separator(true)
+			let glob = PatternBuilder::new(&pattern)
 				.case_insensitive(case_insensitive)
 				.build()
 				.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-			matchers.push(glob.compile_matcher());
+			matchers.push(glob);
 		}
 		return Ok(SearchMatcher::Glob(matchers));
 	}
@@ -1240,11 +1241,9 @@ fn build_excludes(patterns: &[String]) -> io::Result<Excludes> {
 	}
 	let mut matchers = Vec::with_capacity(patterns.len());
 	for pattern in patterns {
-		let glob = GlobBuilder::new(pattern)
-			.literal_separator(true)
-			.build()
+		let glob = CompiledPattern::new(pattern)
 			.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-		matchers.push(glob.compile_matcher());
+		matchers.push(glob);
 	}
 	Ok(Excludes(Arc::new(matchers)))
 }

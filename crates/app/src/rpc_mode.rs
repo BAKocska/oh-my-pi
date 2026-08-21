@@ -1727,7 +1727,12 @@ fn message_page(
 			revision:      session.revision,
 			offset:        next_offset,
 		};
-		Some(encode_base64url(&serde_json::to_vec(&cursor).map_err(CommandError::json)?))
+		Some(
+			omp_core::base64_url::encode_raw(
+				&serde_json::to_vec(&cursor).map_err(CommandError::json)?,
+			)
+			.into_string(),
+		)
 	} else {
 		None
 	};
@@ -1971,52 +1976,10 @@ fn escape_html(text: &str) -> String {
 		.replace('"', "&quot;")
 }
 
-fn encode_base64url(input: &[u8]) -> String {
-	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-	let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-	for chunk in input.chunks(3) {
-		let bits = u32::from(chunk[0]) << 16
-			| u32::from(*chunk.get(1).unwrap_or(&0)) << 8
-			| u32::from(*chunk.get(2).unwrap_or(&0));
-		output.push(char::from(ALPHABET[((bits >> 18) & 63) as usize]));
-		output.push(char::from(ALPHABET[((bits >> 12) & 63) as usize]));
-		if chunk.len() > 1 {
-			output.push(char::from(ALPHABET[((bits >> 6) & 63) as usize]));
-		}
-		if chunk.len() > 2 {
-			output.push(char::from(ALPHABET[(bits & 63) as usize]));
-		}
-	}
-	output
-}
-
 fn decode_base64url(input: &str) -> Result<Vec<u8>, CommandError> {
-	if input.len() % 4 == 1 {
-		return Err(CommandError::new("stale_cursor", "cursor has invalid base64url length"));
-	}
-	let mut output = Vec::with_capacity(input.len() / 4 * 3);
-	for chunk in input.as_bytes().chunks(4) {
-		let mut bits = 0_u32;
-		for (index, byte) in chunk.iter().enumerate() {
-			let value = match byte {
-				b'A'..=b'Z' => byte - b'A',
-				b'a'..=b'z' => byte - b'a' + 26,
-				b'0'..=b'9' => byte - b'0' + 52,
-				b'-' => 62,
-				b'_' => 63,
-				_ => return Err(CommandError::new("stale_cursor", "cursor is not base64url")),
-			};
-			bits |= u32::from(value) << (18 - index * 6);
-		}
-		output.push((bits >> 16) as u8);
-		if chunk.len() > 2 {
-			output.push((bits >> 8) as u8);
-		}
-		if chunk.len() > 3 {
-			output.push(bits as u8);
-		}
-	}
-	Ok(output)
+	omp_core::base64_url::decode_raw(input)
+		.into_vec()
+		.map_err(|_| CommandError::new("stale_cursor", "cursor is not base64url"))
 }
 
 #[cfg(test)]

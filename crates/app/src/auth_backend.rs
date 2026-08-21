@@ -7,6 +7,7 @@ use std::{
 
 use miette::{IntoDiagnostic as _, Result, miette};
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+use omp_core::ExposeSecret as _;
 use omp_llm_catalog::ProviderId;
 use omp_llm_inference::{
 	Client,
@@ -15,7 +16,6 @@ use omp_llm_inference::{
 	id::{AccountId, RequestId},
 	receipt::ExecutionBudget,
 };
-use secrecy::ExposeSecret as _;
 use zeroize::Zeroizing;
 
 use crate::cli::AuthCommand;

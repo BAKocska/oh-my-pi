@@ -17,14 +17,13 @@ use std::{
 use std::{fs::OpenOptions, os::fd::AsRawFd as _};
 
 use bytes::Bytes;
-use omp_core::{Hash32, Str, encoding::hex, sf};
+use omp_core::{Hash32, Str, Ulid, encoding::hex, sf};
 use omp_proto::{document::v1 as document_pb, env::v1 as pb};
 use omp_walker::{FileType, WalkOrder};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use ulid::Ulid;
 
 use super::{
 	super::{

@@ -14,11 +14,10 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_core::{Str, base64_url, sf};
+use omp_core::{ExposeSecret, SecretString, Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use super::super::{
@@ -362,8 +361,8 @@ mod tests {
 	use std::{collections::VecDeque, sync::Arc};
 
 	use futures::FutureExt;
+	use omp_core::ExposeSecret;
 	use parking_lot::Mutex;
-	use secrecy::ExposeSecret;
 
 	use super::*;
 	use crate::{

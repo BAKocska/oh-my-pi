@@ -6,6 +6,7 @@
 
 - `src/lib.rs` defines walk requests and options, entry and candidate types, filters and predicates, visitor APIs, collection and streaming entry points, traversal ordering, and platform-specific directory-reading backends for macOS, Linux, Windows, and other targets.
 - `src/cache.rs` owns the shared scan cache, path normalization and classification helpers, cache invalidation, and the centralized Rayon worker pool used by traversal and candidate processing.
+- `src/glob.rs` exposes `CompiledPattern` for fnmatch-style single-pattern matching and `CompiledGlobSet`/`GlobSetBuilder` for shared, configurable multi-pattern matching without exposing the internal `globset` engine.
 
 ## Philosophy
 

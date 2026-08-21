@@ -16,6 +16,7 @@
 //! caller-supplied heartbeat so consumers do not inherit N-API dependencies.
 
 mod cache;
+pub mod glob;
 
 #[cfg(not(unix))]
 use std::ffi::OsString;
@@ -43,7 +44,6 @@ pub use cache::{
 	parallel_for_each, parallel_for_each_init, resolve_search_path, should_parallelize,
 	should_skip_path, walk_workers,
 };
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use parking_lot::Mutex;
 
 const HEARTBEAT_INTERVAL: usize = 128;
@@ -158,69 +158,7 @@ pub enum VisitOrder {
 	ContentsFirst,
 }
 
-/// Concrete compiled glob filter for normalized walk-relative paths.
-///
-/// Patterns are expected to already use the walker's normalized `/` separator
-/// form. Each pattern is compiled with [`GlobBuilder::literal_separator`] so
-/// wildcard matches never cross path separators. Equality and hashing use only
-/// the normalized pattern list, not the compiled matcher internals, which keeps
-/// [`WalkFilter`] suitable for static cacheable traversal policy.
-#[derive(Clone)]
-pub struct CompiledWalkGlob {
-	patterns: Arc<[String]>,
-	matcher:  Arc<GlobSet>,
-}
-
-impl CompiledWalkGlob {
-	/// Compile normalized glob patterns for walk-relative paths.
-	pub fn new<P, I>(patterns: I) -> Result<Self, globset::Error>
-	where
-		P: Into<String>,
-		I: IntoIterator<Item = P>,
-	{
-		let mut normalized_patterns = Vec::new();
-		let mut builder = GlobSetBuilder::new();
-		for pattern in patterns {
-			let pattern = pattern.into();
-			let glob = GlobBuilder::new(&pattern).literal_separator(true).build()?;
-			builder.add(glob);
-			normalized_patterns.push(pattern);
-		}
-		Ok(Self { patterns: normalized_patterns.into(), matcher: Arc::new(builder.build()?) })
-	}
-
-	/// Return whether `relative` matches any compiled pattern.
-	pub fn is_match(&self, relative: &str) -> bool {
-		self.matcher.is_match(relative)
-	}
-
-	/// Return the normalized patterns backing this compiled filter.
-	pub fn patterns(&self) -> &[String] {
-		&self.patterns
-	}
-}
-
-impl fmt::Debug for CompiledWalkGlob {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("CompiledWalkGlob")
-			.field("patterns", &self.patterns)
-			.finish()
-	}
-}
-
-impl PartialEq for CompiledWalkGlob {
-	fn eq(&self, other: &Self) -> bool {
-		self.patterns == other.patterns
-	}
-}
-
-impl Eq for CompiledWalkGlob {}
-
-impl Hash for CompiledWalkGlob {
-	fn hash<H: Hasher>(&self, state: &mut H) {
-		self.patterns.hash(state);
-	}
-}
+pub use glob::CompiledWalkGlob;
 
 /// High-level entry filter applied by collection and streaming APIs.
 #[derive(Clone)]

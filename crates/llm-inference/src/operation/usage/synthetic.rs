@@ -10,8 +10,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_core::{Str, parse_rfc3339, sf};
-use secrecy::{ExposeSecret as _, SecretString};
+use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde_json::Value;
 
 use crate::{
@@ -251,8 +250,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::HeaderMap;
+	use omp_core::SecretString;
 	use parking_lot::Mutex;
-	use secrecy::SecretString;
 
 	use super::SyntheticUsageFetcher;
 	use crate::{

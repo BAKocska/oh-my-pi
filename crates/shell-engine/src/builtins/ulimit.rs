@@ -44,32 +44,169 @@ impl Virtual {
 				let lim = nix::unistd::PathconfVar::PIPE_BUF as u64 * 512;
 				Ok((lim, lim))
 			},
-			Self::VMem => rlimit::Resource::AS
-				.get()
-				.or_else(|_| rlimit::Resource::VMEM.get()),
+			Self::VMem => Physical::AS.get().or_else(|_| Physical::VMEM.get()),
 		}
 	}
 
 	fn set(self, soft: u64, hard: u64) -> std::io::Result<()> {
 		match self {
 			Self::Pipe => Err(std::io::Error::from(ErrorKind::Unsupported)),
-			Self::VMem => rlimit::Resource::AS
+			Self::VMem => Physical::AS
 				.set(soft, hard)
-				.or_else(|_| rlimit::Resource::VMEM.set(soft, hard)),
+				.or_else(|_| Physical::VMEM.set(soft, hard)),
 		}
 	}
 
 	const fn is_supported(self) -> bool {
 		match self {
 			Self::Pipe => true,
-			Self::VMem => rlimit::Resource::AS.is_supported() || rlimit::Resource::VMEM.is_supported(),
+			Self::VMem => Physical::AS.is_supported() || Physical::VMEM.is_supported(),
 		}
 	}
 }
 
 #[derive(Clone, Copy)]
+enum Physical {
+	AS,
+	CORE,
+	CPU,
+	DATA,
+	FSIZE,
+	KQUEUES,
+	LOCKS,
+	MEMLOCK,
+	MSGQUEUE,
+	NICE,
+	NOFILE,
+	NPROC,
+	NPTS,
+	RSS,
+	RTPRIO,
+	RTTIME,
+	SBSIZE,
+	SIGPENDING,
+	STACK,
+	THREADS,
+	VMEM,
+}
+
+impl Physical {
+	const fn nix(self) -> Option<nix::sys::resource::Resource> {
+		use nix::sys::resource::Resource;
+		match self {
+			Self::CORE => Some(Resource::RLIMIT_CORE),
+			Self::CPU => Some(Resource::RLIMIT_CPU),
+			Self::DATA => Some(Resource::RLIMIT_DATA),
+			Self::FSIZE => Some(Resource::RLIMIT_FSIZE),
+			Self::NOFILE => Some(Resource::RLIMIT_NOFILE),
+			Self::STACK => Some(Resource::RLIMIT_STACK),
+			#[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
+			Self::AS => Some(Resource::RLIMIT_AS),
+			#[cfg(target_os = "freebsd")]
+			Self::KQUEUES => Some(Resource::RLIMIT_KQUEUES),
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			Self::LOCKS => Some(Resource::RLIMIT_LOCKS),
+			#[cfg(any(
+				target_os = "linux",
+				target_os = "android",
+				target_os = "freebsd",
+				target_os = "netbsd",
+				target_os = "openbsd"
+			))]
+			Self::MEMLOCK => Some(Resource::RLIMIT_MEMLOCK),
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			Self::MSGQUEUE => Some(Resource::RLIMIT_MSGQUEUE),
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			Self::NICE => Some(Resource::RLIMIT_NICE),
+			#[cfg(any(
+				target_os = "linux",
+				target_os = "android",
+				target_os = "freebsd",
+				target_os = "netbsd",
+				target_os = "openbsd"
+			))]
+			Self::NPROC => Some(Resource::RLIMIT_NPROC),
+			#[cfg(target_os = "freebsd")]
+			Self::NPTS => Some(Resource::RLIMIT_NPTS),
+			#[cfg(any(
+				target_os = "linux",
+				target_os = "android",
+				target_os = "freebsd",
+				target_os = "netbsd",
+				target_os = "openbsd"
+			))]
+			Self::RSS => Some(Resource::RLIMIT_RSS),
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			Self::RTPRIO => Some(Resource::RLIMIT_RTPRIO),
+			#[cfg(target_os = "linux")]
+			Self::RTTIME => Some(Resource::RLIMIT_RTTIME),
+			#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+			Self::SBSIZE => Some(Resource::RLIMIT_SBSIZE),
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			Self::SIGPENDING => Some(Resource::RLIMIT_SIGPENDING),
+			#[cfg(target_os = "freebsd")]
+			Self::VMEM => Some(Resource::RLIMIT_VMEM),
+			_ => None,
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	const fn macos_raw(self) -> Option<libc::c_int> {
+		match self {
+			Self::MEMLOCK => Some(libc::RLIMIT_MEMLOCK),
+			Self::NPROC => Some(libc::RLIMIT_NPROC),
+			Self::RSS => Some(libc::RLIMIT_RSS),
+			_ => None,
+		}
+	}
+
+	fn get(self) -> io::Result<(u64, u64)> {
+		if let Some(resource) = self.nix() {
+			return nix::sys::resource::getrlimit(resource).map_err(io::Error::from);
+		}
+		#[cfg(target_os = "macos")]
+		if let Some(resource) = self.macos_raw() {
+			let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+			// SAFETY: `limits` points to writable storage for getrlimit.
+			if unsafe { libc::getrlimit(resource, limits.as_mut_ptr()) } == 0 {
+				// SAFETY: a successful getrlimit initialized the structure.
+				let limits = unsafe { limits.assume_init() };
+				return Ok((limits.rlim_cur, limits.rlim_max));
+			}
+			return Err(io::Error::last_os_error());
+		}
+		Err(io::Error::from(ErrorKind::Unsupported))
+	}
+
+	fn set(self, soft: u64, hard: u64) -> io::Result<()> {
+		if let Some(resource) = self.nix() {
+			return nix::sys::resource::setrlimit(resource, soft, hard).map_err(io::Error::from);
+		}
+		#[cfg(target_os = "macos")]
+		if let Some(resource) = self.macos_raw() {
+			let limits = libc::rlimit { rlim_cur: soft, rlim_max: hard };
+			// SAFETY: `limits` is fully initialized and the resource is a valid macOS
+			// constant.
+			if unsafe { libc::setrlimit(resource, &raw const limits) } == 0 {
+				return Ok(());
+			}
+			return Err(io::Error::last_os_error());
+		}
+		Err(io::Error::from(ErrorKind::Unsupported))
+	}
+
+	const fn is_supported(self) -> bool {
+		#[cfg(target_os = "macos")]
+		if self.macos_raw().is_some() {
+			return true;
+		}
+		self.nix().is_some()
+	}
+}
+
+#[derive(Clone, Copy)]
 enum Resource {
-	Phy(rlimit::Resource),
+	Phy(Physical),
 	Virt(Virtual),
 }
 
@@ -107,84 +244,84 @@ struct ResourceDescription {
 
 impl ResourceDescription {
 	const CORE: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::CORE),
+		resource:    Resource::Phy(Physical::CORE),
 		help:        "the maximum size of core files created",
 		description: "core file size",
 		short:       'c',
 		unit:        Unit::Block,
 	};
 	const CPU: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::CPU),
+		resource:    Resource::Phy(Physical::CPU),
 		help:        "the maximum amount of cpu time in seconds",
 		description: "cpu time",
 		short:       't',
 		unit:        Unit::Seconds,
 	};
 	const DATA: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::DATA),
+		resource:    Resource::Phy(Physical::DATA),
 		help:        "the maximum size of a process's data segment",
 		description: "data seg size",
 		short:       'd',
 		unit:        Unit::KBytes,
 	};
 	const FSIZE: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::FSIZE),
+		resource:    Resource::Phy(Physical::FSIZE),
 		help:        "the maximum size of files written by the shell and its children",
 		description: "file size",
 		short:       'f',
 		unit:        Unit::Block,
 	};
 	const KQUEUES: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::KQUEUES),
+		resource:    Resource::Phy(Physical::KQUEUES),
 		help:        "the maximum number of kqueues allocated for this process",
 		description: "max kqueues",
 		short:       'k',
 		unit:        Unit::Number,
 	};
 	const LOCKS: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::LOCKS),
+		resource:    Resource::Phy(Physical::LOCKS),
 		help:        "the maximum number of file locks",
 		description: "file locks",
 		short:       'x',
 		unit:        Unit::Number,
 	};
 	const MEMLOCK: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::MEMLOCK),
+		resource:    Resource::Phy(Physical::MEMLOCK),
 		help:        "the maximum size a process may lock into memory",
 		description: "max locked memory",
 		short:       'l',
 		unit:        Unit::KBytes,
 	};
 	const MSGQUEUE: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::MSGQUEUE),
+		resource:    Resource::Phy(Physical::MSGQUEUE),
 		help:        "the maximum number of bytes in POSIX message queues",
 		description: "POSIX message queues",
 		short:       'q',
 		unit:        Unit::Bytes,
 	};
 	const NICE: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::NICE),
+		resource:    Resource::Phy(Physical::NICE),
 		help:        "the maximum scheduling priority (`nice`)",
 		description: "scheduling priority",
 		short:       'e',
 		unit:        Unit::Number,
 	};
 	const NOFILE: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::NOFILE),
+		resource:    Resource::Phy(Physical::NOFILE),
 		help:        "the maximum number of open file descriptors",
 		description: "open files",
 		short:       'n',
 		unit:        Unit::Number,
 	};
 	const NPROC: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::NPROC),
+		resource:    Resource::Phy(Physical::NPROC),
 		help:        "the maximum number of user processes",
 		description: "max user processes",
 		short:       'u',
 		unit:        Unit::Number,
 	};
 	const NPTS: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::NPTS),
+		resource:    Resource::Phy(Physical::NPTS),
 		help:        "the maximum number of pseudoterminals",
 		description: "number of pseudoterminals",
 		short:       'P',
@@ -198,49 +335,49 @@ impl ResourceDescription {
 		unit:        Unit::HalfKBytes,
 	};
 	const RSS: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::RSS),
+		resource:    Resource::Phy(Physical::RSS),
 		help:        "the maximum resident set size",
 		description: "max memory size",
 		short:       'm',
 		unit:        Unit::KBytes,
 	};
 	const RTPRIO: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::RTPRIO),
+		resource:    Resource::Phy(Physical::RTPRIO),
 		help:        "the maximum real-time scheduling priority",
 		description: "real-time priority",
 		short:       'r',
 		unit:        Unit::Number,
 	};
 	const RTTIME: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::RTTIME),
+		resource:    Resource::Phy(Physical::RTTIME),
 		help:        "the maximum real-time scheduling priority",
 		description: "real-time non-blocking time",
 		short:       'R',
 		unit:        Unit::Micros,
 	};
 	const SBSIZE: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::SBSIZE),
+		resource:    Resource::Phy(Physical::SBSIZE),
 		help:        "the socket buffer size",
 		description: "socket buffer size",
 		short:       'b',
 		unit:        Unit::Bytes,
 	};
 	const SIGPENDING: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::SIGPENDING),
+		resource:    Resource::Phy(Physical::SIGPENDING),
 		help:        "the maximum number of pending signals",
 		description: "pending signals",
 		short:       'i',
 		unit:        Unit::Number,
 	};
 	const STACK: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::STACK),
+		resource:    Resource::Phy(Physical::STACK),
 		help:        "the maximum stack size",
 		description: "stack size",
 		short:       's',
 		unit:        Unit::KBytes,
 	};
 	const THREADS: Self = Self {
-		resource:    Resource::Phy(rlimit::Resource::THREADS),
+		resource:    Resource::Phy(Physical::THREADS),
 		help:        "the maximum number of threads",
 		description: "number of threads",
 		short:       'T',
@@ -258,7 +395,7 @@ impl ResourceDescription {
 		let (soft_limit, hard_limit) = self.resource.get()?;
 		let val = if hard { hard_limit } else { soft_limit };
 
-		if val == rlimit::INFINITY {
+		if val == nix::sys::resource::RLIM_INFINITY {
 			Ok("unlimited".into())
 		} else {
 			Ok(format!("{}", val / self.unit.scale()))
@@ -270,7 +407,7 @@ impl ResourceDescription {
 		let value = match value {
 			LimitValue::Soft => soft,
 			LimitValue::Hard => hard,
-			LimitValue::Unlimited => rlimit::INFINITY,
+			LimitValue::Unlimited => nix::sys::resource::RLIM_INFINITY,
 			LimitValue::Value(v) => v * self.unit.scale(),
 			LimitValue::Unset => return Ok(()),
 		};

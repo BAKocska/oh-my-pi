@@ -17,6 +17,7 @@ use std::{
 
 use clap::{ArgAction, Parser};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
+use omp_walker::glob::CompiledPattern;
 use similar::{Algorithm, DiffOp, DiffTag, capture_diff_slices};
 
 use crate::host::{Host, Utility, util};
@@ -134,7 +135,7 @@ struct Options<'a> {
 	ignore_blank_lines:  bool,
 	strip_trailing_cr:   bool,
 	labels:              &'a [OsString],
-	excludes:            &'a [glob::Pattern],
+	excludes:            &'a [CompiledPattern],
 }
 
 /// A classified operand and its resolved filesystem path.
@@ -181,12 +182,12 @@ impl Utility for Diff {
 		}
 		// Compile `-x` globs once; a syntactically invalid glob falls back to a
 		// literal name match, like fnmatch treating a bad bracket literally.
-		let excludes: Vec<glob::Pattern> = self
+		let excludes: Vec<CompiledPattern> = self
 			.exclude
 			.iter()
 			.map(|pat| {
-				glob::Pattern::new(pat).unwrap_or_else(|_| {
-					glob::Pattern::new(&glob::Pattern::escape(pat))
+				CompiledPattern::new(pat).unwrap_or_else(|_| {
+					CompiledPattern::new(&CompiledPattern::escape(pat))
 						.expect("escaped pattern always compiles")
 				})
 			})
@@ -515,10 +516,12 @@ fn header(label: Option<&OsString>, name: &Path, mtime: Option<SystemTime>) -> S
 /// GNU header timestamp: `%Y-%m-%d %H:%M:%S.%N %z` in local time. Stdin has
 /// no mtime and uses the current time, like GNU.
 fn timestamp(mtime: Option<SystemTime>) -> String {
+	use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
+
 	let time = mtime.unwrap_or_else(SystemTime::now);
-	chrono::DateTime::<chrono::Local>::from(time)
-		.format("%Y-%m-%d %H:%M:%S%.9f %z")
-		.to_string()
+	let timestamp = Timestamp::try_from(time).unwrap_or_else(|_| Timestamp::now());
+	strtime::format("%Y-%m-%d %H:%M:%S.%N %z", &timestamp.to_zoned(TimeZone::system()))
+		.unwrap_or_default()
 }
 
 /// Writes `range` lines of `file` prefixed with `marker`, emitting the GNU
@@ -745,7 +748,7 @@ fn pair_prefix(name_a: &Path, name_b: &Path, opts: Options<'_>) -> String {
 }
 
 /// True when a directory entry's base name matches an `-x` glob.
-fn is_excluded(name: &OsStr, excludes: &[glob::Pattern]) -> bool {
+fn is_excluded(name: &OsStr, excludes: &[CompiledPattern]) -> bool {
 	if excludes.is_empty() {
 		return false;
 	}

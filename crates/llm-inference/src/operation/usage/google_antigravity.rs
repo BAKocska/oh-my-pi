@@ -11,8 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339, sf};
-use secrecy::{ExposeSecret as _, SecretString};
+use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -483,8 +482,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
+	use omp_core::{ExposeSecret as _, SecretString};
 	use parking_lot::Mutex;
-	use secrecy::{ExposeSecret as _, SecretString};
 
 	use super::fetch_google_antigravity_usage;
 	use crate::auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError};

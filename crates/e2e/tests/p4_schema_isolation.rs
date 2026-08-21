@@ -623,7 +623,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 	let mut gateway_params = params;
 	gateway_params.model = gateway.model().to_owned();
 	let options = TurnOptions { params: gateway_params, ..TurnOptions::default() };
-	let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
+	let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
 	let mut session = client
 		.turn(turn_id, TurnInput::Full(first), &options)
 		.await

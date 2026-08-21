@@ -17,6 +17,7 @@ bytes = { workspace = true }
 bytes-utils = { workspace = true }
 heapless = { workspace = true }
 parking_lot_core = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
 smol_bitmap = { workspace = true }

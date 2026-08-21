@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 ast-grep-core.workspace = true
-globset.workspace = true
+omp-walker.workspace = true
 ignore.workspace = true
 omp-core.workspace = true
 serde.workspace = true

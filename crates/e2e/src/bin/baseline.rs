@@ -12,7 +12,6 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use omp_agent::{
@@ -20,6 +19,7 @@ use omp_agent::{
 	TurnInput, TurnOptions, TurnSession,
 };
 use omp_core::Str;
+use omp_e2e::{Context as _, Result, error};
 use omp_env::{EnvClient, InProcessEnvTransport};
 use omp_proto::{
 	inference::v1::{self as pb, TurnEvent},
@@ -202,7 +202,7 @@ impl LoopFixture {
 	async fn warm(&mut self) -> Result<()> {
 		self
 			.agent
-			.submit([user_item("warmup")], TurnId::new(ulid::Ulid::generate().to_string()))
+			.submit([user_item("warmup")], TurnId::new(omp_core::Ulid::generate().to_string()))
 			.await
 			.context("warm full agent loop")?;
 		Ok(())
@@ -216,7 +216,9 @@ pub async fn measure(
 	samples: usize,
 ) -> Result<BaselineMetrics> {
 	if frame_tokens < 100 || loop_tokens < 100 || samples == 0 {
-		bail!("baseline requires at least 100 frame and loop tokens and one sample");
+		return Err(error(format!(
+			"baseline requires at least 100 frame and loop tokens and one sample"
+		)));
 	}
 	let frame = measure_frames(frame_tokens)?;
 	let scripted = ScriptedTurnClient::token_storm(loop_tokens);
@@ -229,7 +231,7 @@ pub async fn measure(
 		fixtures.push(fixture);
 	}
 	let measured_inputs: Vec<_> = (0..samples)
-		.map(|_| ([user_item("measure")], TurnId::new(ulid::Ulid::generate().to_string())))
+		.map(|_| ([user_item("measure")], TurnId::new(omp_core::Ulid::generate().to_string())))
 		.collect();
 	let mut full_duration = Duration::ZERO;
 	for (fixture, (items, turn_id)) in fixtures.iter_mut().zip(measured_inputs) {
@@ -278,7 +280,7 @@ fn measure_frames(tokens: usize) -> Result<FrameMetrics> {
 		text.push_str(TOKEN);
 		let started = Instant::now();
 		if !ui.set_text("stream", text.as_str()) {
-			bail!("token-storm text component stopped accepting updates");
+			return Err(error(format!("token-storm text component stopped accepting updates")));
 		}
 		ui.present(&mut renderer, 24, 0)
 			.context("paint token-storm frame")?;
@@ -301,7 +303,7 @@ async fn measure_raw(client: &ScriptedTurnClient, samples: usize) -> Result<Dura
 	let inputs: Vec<_> = (0..samples)
 		.map(|_| {
 			(
-				TurnId::new(ulid::Ulid::generate().to_string()),
+				TurnId::new(omp_core::Ulid::generate().to_string()),
 				TurnInput::Full(thread::Thread { items: vec![user_item("measure")] }),
 			)
 		})
@@ -323,14 +325,14 @@ async fn measure_raw(client: &ScriptedTurnClient, samples: usize) -> Result<Dura
 /// Computes token throughput from a nonzero duration and token count.
 pub fn duration_rate(tokens: usize, duration: Duration) -> Result<f64> {
 	if tokens == 0 {
-		bail!("token count must be non-zero");
+		return Err(error(format!("token count must be non-zero")));
 	}
 	if duration.is_zero() {
-		bail!("measured duration must be non-zero");
+		return Err(error(format!("measured duration must be non-zero")));
 	}
 	let rate = tokens as f64 / duration.as_secs_f64();
 	if !rate.is_finite() || rate <= 0.0 {
-		bail!("token rate is not finite and positive");
+		return Err(error(format!("token rate is not finite and positive")));
 	}
 	Ok(rate)
 }
@@ -338,7 +340,7 @@ pub fn duration_rate(tokens: usize, duration: Duration) -> Result<f64> {
 /// Computes the end-to-end slowdown relative to raw token throughput.
 pub fn slowdown_ratio(raw_rate: f64, full_rate: f64) -> Result<f64> {
 	if !raw_rate.is_finite() || raw_rate <= 0.0 || !full_rate.is_finite() || full_rate <= 0.0 {
-		bail!("token rates must be finite and positive");
+		return Err(error(format!("token rates must be finite and positive")));
 	}
 	Ok(raw_rate / full_rate)
 }
@@ -375,14 +377,14 @@ pub fn write_metrics(path: &Path, metrics: &BaselineMetrics) -> Result<()> {
 fn artifact_argument() -> Result<PathBuf> {
 	let mut args = std::env::args_os().skip(1);
 	let Some(flag) = args.next() else {
-		bail!("usage: baseline --artifact <path>");
+		return Err(error(format!("usage: baseline --artifact <path>")));
 	};
 	if flag != "--artifact" {
-		bail!("expected --artifact <path>");
+		return Err(error(format!("expected --artifact <path>")));
 	}
 	let path = args.next().context("--artifact requires a path")?;
 	if args.next().is_some() {
-		bail!("unexpected arguments after artifact path");
+		return Err(error(format!("unexpected arguments after artifact path")));
 	}
 	Ok(path.into())
 }
@@ -396,11 +398,10 @@ async fn main() -> Result<()> {
 	write_metrics(&artifact, &metrics)?;
 	println!("{}", serde_json::to_string(&metrics)?);
 	if metrics.r#loop.gross_regression {
-		bail!(
+		return Err(error(format!(
 			"full-loop throughput regressed {:.2}x versus raw scripted TurnClient (limit {:.2}x)",
-			metrics.r#loop.slowdown_ratio,
-			metrics.r#loop.regression_limit
-		);
+			metrics.r#loop.slowdown_ratio, metrics.r#loop.regression_limit
+		)));
 	}
 	Ok(())
 }

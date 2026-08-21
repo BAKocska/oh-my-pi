@@ -9,7 +9,6 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine as _;
 use bytes::Bytes;
 use flume::{Receiver, Sender};
 use futures::StreamExt as _;
@@ -287,7 +286,7 @@ impl Runtime {
 			}
 			state.thinking = thinking.to_owned();
 		}
-		let id = Str::from(ulid::Ulid::generate().to_string());
+		let id = Str::from(omp_core::Ulid::generate().to_string());
 		let journal = create_journal(&state, &id, parent.as_ref())?;
 		state
 			.sessions
@@ -822,8 +821,8 @@ fn convert_blocks(value: &Value) -> miette::Result<(Vec<ContentPart>, Vec<Value>
 					.and_then(Value::as_str)
 					.map(Str::from);
 				let image = if let Some(data) = block.get("data").and_then(Value::as_str) {
-					let data = base64::engine::general_purpose::STANDARD
-						.decode(data)
+					let data = omp_core::base64::decode(data)
+						.into_vec()
 						.map_err(|error| miette!("invalid image base64: {error}"))?;
 					MediaInput::Bytes {
 						media_type: media_type.unwrap_or_else(|| sf!("image/png")),

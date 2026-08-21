@@ -10,7 +10,7 @@ use omp_agent::{
 	TurnInput, TurnOptions, WorkspaceInput,
 };
 use omp_app::rpc_adapter::InferenceRpc;
-use omp_core::sf;
+use omp_core::{Ulid, sf};
 use omp_e2e::support::{Scratch, user_item, within};
 use omp_llm_catalog::{
 	CompiledCatalog,
@@ -48,7 +48,6 @@ use omp_tool::{
 	Presentation, PromptCaps, Rev, Tool, ToolSpec,
 };
 use parking_lot::Mutex;
-use ulid::Ulid;
 
 const MODEL: &str = "apple-intelligence/apple-intelligence";
 const ROUTE: &str = "route-15d4d866935964367e95fddfe4b98065053b172594f9334bdbe6e6cca7123886";

@@ -7,7 +7,6 @@ use std::{
 	time::Duration,
 };
 
-use anyhow::{Context as _, Result};
 use bytes::BytesMut;
 use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
@@ -27,6 +26,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{DEFAULT_TIMEOUT, OwnedProcess, Scratch, install_omp_binary_env, omp_binary, within};
+use crate::{Context as _, Result, error};
 
 const FRAME_LIMIT: usize = 64 * 1024 * 1024;
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -337,7 +337,7 @@ pub async fn read_blob(
 			match download.next_event().await? {
 				Some(BlobDownloadEvent::Chunk(chunk)) => bytes.extend_from_slice(&chunk.data),
 				Some(BlobDownloadEvent::Complete(_)) => return Ok(bytes),
-				None => return Err(anyhow::anyhow!("blob stream closed before completion")),
+				None => return Err(error(format!("blob stream closed before completion"))),
 			}
 		}
 	})

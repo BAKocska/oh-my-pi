@@ -7,8 +7,7 @@ use std::{
 
 use futures::FutureExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
-use omp_core::{Str, parse_rfc3339, sf};
-use secrecy::{ExposeSecret as _, SecretString};
+use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde_json::Value;
 
 use crate::{
@@ -297,9 +296,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::HeaderMap;
-	use omp_core::parse_rfc3339;
+	use omp_core::{SecretString, parse_rfc3339};
 	use parking_lot::Mutex;
-	use secrecy::SecretString;
 
 	use super::UmansUsageFetcher;
 	use crate::{

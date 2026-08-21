@@ -8,8 +8,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use globset::{Glob, GlobMatcher};
 use omp_core::{Hash32, Str};
+use omp_walker::glob::{CompiledPattern, PatternBuilder};
 use parking_lot::Mutex;
 use serde_json::Value;
 use thiserror::Error;
@@ -70,7 +70,7 @@ pub struct LspSelector {
 	languages:     Vec<LanguageId>,
 	schemes:       Vec<Str>,
 	path_patterns: Vec<Str>,
-	path_matchers: Vec<GlobMatcher>,
+	path_matchers: Vec<CompiledPattern>,
 }
 
 impl std::fmt::Debug for LspSelector {
@@ -94,11 +94,12 @@ impl LspSelector {
 	) -> Result<Self, LspRegistryError> {
 		let mut path_matchers = Vec::with_capacity(path_patterns.len());
 		for pattern in &path_patterns {
-			let matcher = Glob::new(pattern.as_str())
+			let matcher = PatternBuilder::new(pattern.as_str())
+				.literal_separator(false)
+				.build()
 				.map_err(|error| LspRegistryError::InvalidSelector {
 					reason: Str::new(error.to_string()),
-				})?
-				.compile_matcher();
+				})?;
 			path_matchers.push(matcher);
 		}
 		Ok(Self { languages, schemes, path_patterns, path_matchers })
@@ -147,7 +148,7 @@ impl LspSelector {
 			|| self
 				.path_matchers
 				.iter()
-				.any(|matcher| matcher.is_match(uri.path()));
+				.any(|matcher| matcher.matches(uri.path()));
 		language_matches && scheme_matches && path_matches
 	}
 }

@@ -5,9 +5,8 @@ use std::{fmt, sync::Arc, time::SystemTime};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Request, Uri};
-use omp_core::Str;
+use omp_core::{ExposeSecret, SecretString, Str};
 use omp_llm_catalog::AuthSpecId;
-use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
 use super::{

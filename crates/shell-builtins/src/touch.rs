@@ -10,7 +10,7 @@ use std::{
 	borrow::Cow,
 	ffi::{OsStr, OsString},
 	fs::{self, File},
-	io::{Error, ErrorKind},
+	io::{self, Error, ErrorKind},
 	path::{Path, PathBuf},
 	time::SystemTime,
 };
@@ -19,7 +19,6 @@ use clap::{
 	Arg, ArgAction, ArgGroup, ArgMatches, Command,
 	builder::{PossibleValue, ValueParser},
 };
-use filetime::{FileTime, set_file_times, set_symlink_file_times};
 use jiff::{Timestamp, ToSpan, Zoned, civil::Time, fmt::strtime, tz::TimeZone};
 #[cfg(unix)]
 use libc::O_NONBLOCK;
@@ -34,6 +33,51 @@ use uucore::libc;
 use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
 
 use crate::host::{Host, Utility, format_usage, matches_parser, util};
+
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct FileTime {
+	seconds: i64,
+	nanos:   u32,
+}
+
+impl FileTime {
+	const fn from_unix_time(seconds: i64, nanos: u32) -> Self {
+		Self { seconds, nanos }
+	}
+
+	fn from_system_time(time: SystemTime) -> Self {
+		let timestamp = Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH);
+		Self { seconds: timestamp.as_second(), nanos: timestamp.subsec_nanosecond().unsigned_abs() }
+	}
+
+	fn from_last_access_time(metadata: &fs::Metadata) -> Self {
+		metadata
+			.accessed()
+			.map(Self::from_system_time)
+			.unwrap_or(Self::from_unix_time(0, 0))
+	}
+
+	fn from_last_modification_time(metadata: &fs::Metadata) -> Self {
+		metadata
+			.modified()
+			.map(Self::from_system_time)
+			.unwrap_or(Self::from_unix_time(0, 0))
+	}
+
+	const fn unix_seconds(self) -> i64 {
+		self.seconds
+	}
+
+	const fn nanoseconds(self) -> u32 {
+		self.nanos
+	}
+}
+
+impl std::fmt::Display for FileTime {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(formatter, "{}.{:09}s", self.seconds, self.nanos)
+	}
+}
 
 #[derive(Debug, ThisError)]
 enum TouchError {
@@ -171,7 +215,7 @@ mod format {
 }
 
 fn timestamp_to_filetime(ts: Timestamp) -> FileTime {
-	FileTime::from_system_time(SystemTime::from(ts))
+	FileTime::from_unix_time(ts.as_second(), ts.subsec_nanosecond().unsigned_abs())
 }
 
 fn filetime_to_zoned(ft: &FileTime, time_zone: &TimeZone) -> Option<Zoned> {
@@ -654,7 +698,7 @@ fn update_times(
 	};
 
 	if opts.no_deref && !is_stdout {
-		return set_symlink_file_times(resolved, atime, mtime)
+		return set_path_times(resolved, atime, mtime, false)
 			.map_err(|error| io_context(error, format!("setting times of {}", path.quote())));
 	}
 
@@ -670,6 +714,93 @@ fn update_times(
 		.map_err(|error| io_context(error, format!("setting times of {}", path.quote())))
 }
 
+fn set_file_times(path: impl AsRef<Path>, atime: FileTime, mtime: FileTime) -> io::Result<()> {
+	set_path_times(path.as_ref(), atime, mtime, true)
+}
+
+#[cfg(unix)]
+fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, follow: bool) -> io::Result<()> {
+	use rustix::fs::{AtFlags, CWD, utimensat};
+
+	let timestamps = timestamps(atime, mtime);
+	let flags = if follow {
+		AtFlags::empty()
+	} else {
+		AtFlags::SYMLINK_NOFOLLOW
+	};
+	utimensat(CWD, path, &timestamps, flags)
+		.map_err(|error| Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(windows)]
+fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, follow: bool) -> io::Result<()> {
+	use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+	use windows_sys::Win32::{
+		Foundation::FILETIME,
+		Storage::FileSystem::{
+			FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+			SetFileTime,
+		},
+	};
+
+	fn as_filetime(time: FileTime) -> FILETIME {
+		let ticks = (i128::from(time.unix_seconds()) + 11_644_473_600)
+			.saturating_mul(10_000_000)
+			.saturating_add(i128::from(time.nanoseconds() / 100))
+			.clamp(0, i128::from(u64::MAX)) as u64;
+		FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 }
+	}
+
+	let mut options = fs::OpenOptions::new();
+	options.access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(
+		FILE_FLAG_BACKUP_SEMANTICS
+			| if follow {
+				0
+			} else {
+				FILE_FLAG_OPEN_REPARSE_POINT
+			},
+	);
+	let file = options.open(path)?;
+	let atime = as_filetime(atime);
+	let mtime = as_filetime(mtime);
+	if unsafe { SetFileTime(file.as_raw_handle(), std::ptr::null(), &atime, &mtime) } == 0 {
+		Err(Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, _follow: bool) -> io::Result<()> {
+	use std::{fs::FileTimes, time::Duration};
+
+	let as_system_time = |time: FileTime| {
+		SystemTime::UNIX_EPOCH
+			.checked_add(Duration::new(time.unix_seconds().max(0) as u64, time.nanoseconds()))
+			.unwrap_or(SystemTime::UNIX_EPOCH)
+	};
+	File::options().write(true).open(path)?.set_times(
+		FileTimes::new()
+			.set_accessed(as_system_time(atime))
+			.set_modified(as_system_time(mtime)),
+	)
+}
+
+#[cfg(unix)]
+fn timestamps(atime: FileTime, mtime: FileTime) -> Timestamps {
+	Timestamps {
+		last_access:       rustix::fs::Timespec {
+			tv_sec:  atime.unix_seconds(),
+			tv_nsec: atime.nanoseconds() as _,
+		},
+		last_modification: rustix::fs::Timespec {
+			tv_sec:  mtime.unix_seconds(),
+			tv_nsec: mtime.nanoseconds() as _,
+		},
+	}
+}
+
 #[cfg(unix)]
 /// Set file times via file descriptor using `futimens`.
 ///
@@ -683,18 +814,8 @@ fn try_futimens_via_write_fd(path: &Path, atime: FileTime, mtime: FileTime) -> s
 		.custom_flags(O_NONBLOCK)
 		.open(path)?;
 
-	let timestamps = Timestamps {
-		last_access:       rustix::fs::Timespec {
-			tv_sec:  atime.unix_seconds(),
-			tv_nsec: atime.nanoseconds() as _,
-		},
-		last_modification: rustix::fs::Timespec {
-			tv_sec:  mtime.unix_seconds(),
-			tv_nsec: mtime.nanoseconds() as _,
-		},
-	};
-
-	futimens(&file, &timestamps).map_err(|e| Error::from_raw_os_error(e.raw_os_error()))
+	futimens(&file, &timestamps(atime, mtime))
+		.map_err(|error| Error::from_raw_os_error(error.raw_os_error()))
 }
 
 /// Get metadata of the provided path
@@ -941,9 +1062,10 @@ mod tests {
 	};
 
 	use clap::Parser;
-	use filetime::{FileTime, set_file_times};
 
-	use super::{ChangeTimes, Touch, Utility, determine_atime_mtime_change, uu_app};
+	use super::{
+		ChangeTimes, FileTime, Touch, Utility, determine_atime_mtime_change, set_file_times, uu_app,
+	};
 	use crate::host::{Host, run_util};
 
 	fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {

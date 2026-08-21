@@ -284,7 +284,7 @@ impl Tool for ReportIssue {
 			}
 			if let Err(error) = incoming.interruptable().committed().await { yield report_commit_event(error); return; }
 			let now = now_ms();
-			let issue_id = Str::from(ulid::Ulid::generate().to_string());
+			let issue_id = Str::from(omp_core::Ulid::generate().to_string());
 			let consent = params.consent.unwrap_or_else(|| sf!("local_only"));
 			let issue = StoredIssue { id: issue_id.clone(), session_id: params.session_id.clone(), device: params.device.clone(), rev: Some(params.rev.clone()), consent, created_at_ms: now };
 			if let Err(error) = self.store.store_issue(&issue) {

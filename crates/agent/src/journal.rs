@@ -712,7 +712,7 @@ impl Journal {
 			}
 		}
 		let released_turn_id =
-			(!released_inputs.is_empty()).then(|| Str::new(ulid::Ulid::generate().to_string()));
+			(!released_inputs.is_empty()).then(|| Str::new(omp_core::Ulid::generate().to_string()));
 		for turn_id in starts.keys().chain(receipts.keys()).chain(aborted.keys()) {
 			turn_inputs.remove(turn_id.as_str());
 		}
@@ -2590,7 +2590,7 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 			};
 			let result = crate::project::recovery_tool_result_item(ts, item, abort)?;
 			let recovery_turn =
-				recovery_turn.get_or_insert_with(|| Str::new(ulid::Ulid::generate().to_string()));
+				recovery_turn.get_or_insert_with(|| Str::new(omp_core::Ulid::generate().to_string()));
 			let index = writer.append(&Event {
 				ts,
 				kind: Kind::TurnInput(TurnInputItem {
@@ -2949,7 +2949,7 @@ mod tests {
 		let (recovery_turn, indexes) = reopened
 			.pending_input_submission()
 			.expect("recovery submission");
-		ulid::Ulid::from_string(recovery_turn.as_str()).expect("recovery turn id is a ULID");
+		omp_core::Ulid::from_string(recovery_turn.as_str()).expect("recovery turn id is a ULID");
 		assert_eq!(indexes.len(), 1);
 		let log = reopened.load().expect("load recovery");
 		let Some(Entry::Ok(event)) = log.get(indexes[0]) else {
@@ -2987,7 +2987,7 @@ mod tests {
 	#[test]
 	fn staged_turn_input_reopens_with_exact_turn_id() {
 		let path = path("staged-input");
-		let turn_id = ulid::Ulid::generate().to_string();
+		let turn_id = omp_core::Ulid::generate().to_string();
 		let mut journal = Journal::create(&path, &header()).expect("create journal");
 		let index = journal
 			.append_turn_input(2, &turn_id, message("input"), Some(PromptHash::from([1; 32])))
@@ -3047,7 +3047,7 @@ mod tests {
 		journal
 			.authorize_tool_batch(5, "turn", &[sf!("call-1"), sf!("call-2")])
 			.expect("authorize tool batch");
-		let follow_up = ulid::Ulid::generate().to_string();
+		let follow_up = omp_core::Ulid::generate().to_string();
 		let first_result =
 			crate::project::recovery_tool_result_item(6, &outcome.output[0], Abort::Interrupted {
 				reason: sf!("fixture terminal result"),
@@ -3083,8 +3083,8 @@ mod tests {
 	fn ordered_staged_turn_groups_and_settlement_survive_sequential_reopens() {
 		let no_events: &[u64] = &[];
 		let path = path("staged-queue");
-		let first_turn = ulid::Ulid::generate().to_string();
-		let second_turn = ulid::Ulid::generate().to_string();
+		let first_turn = omp_core::Ulid::generate().to_string();
+		let second_turn = omp_core::Ulid::generate().to_string();
 		let mut journal = Journal::create(&path, &header()).expect("create journal");
 		let first = journal
 			.append_turn_input(2, &first_turn, message("first"), None)

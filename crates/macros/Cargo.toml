@@ -17,5 +17,8 @@ quote = { workspace = true }
 strum = { workspace = true }
 syn = { workspace = true }
 
+[dev-dependencies]
+omp-core = { workspace = true }
+
 [lints]
 workspace = true

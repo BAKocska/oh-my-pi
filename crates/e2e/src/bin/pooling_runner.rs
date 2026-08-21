@@ -12,7 +12,6 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
 use futures::future::join_all;
 use omp_app::{
@@ -27,6 +26,7 @@ use omp_app::{
 use omp_core::{
 	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
 };
+use omp_e2e::{Context as _, Result, error};
 use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_proto::{
 	SCHEMA_REV,
@@ -245,36 +245,36 @@ impl Condition {
 			.parse::<usize>()
 			.context("OMP_POOL_EXTENSIONS_ACTIVE must be an integer")?;
 		if ![0, 5, 15, 32].contains(&extensions) {
-			bail!("OMP_POOL_EXTENSIONS_ACTIVE must be one of 0, 5, 15, 32");
+			return Err(error(format!("OMP_POOL_EXTENSIONS_ACTIVE must be one of 0, 5, 15, 32")));
 		}
 		let dependency = match required("OMP_POOL_DEPENDENCY_PROFILE")?.as_str() {
 			"pure-python" => Dependency::PurePython,
 			"common-native" => Dependency::CommonNative,
 			"large-ml-wheel" => Dependency::LargeMlWheel,
-			other => bail!("unknown dependency profile {other:?}"),
+			other => return Err(error(format!("unknown dependency profile {other:?}"))),
 		};
 		let lifecycle = match required("OMP_POOL_LIFECYCLE")?.as_str() {
 			"cold-boot" => Lifecycle::ColdBoot,
 			"warm-restart" => Lifecycle::WarmRestart,
 			"hot-reload" => Lifecycle::HotReload,
-			other => bail!("unknown lifecycle {other:?}"),
+			other => return Err(error(format!("unknown lifecycle {other:?}"))),
 		};
 		let link_delay = match required("OMP_POOL_ENVIRONMENT_LINK")?.as_str() {
 			"local" => Duration::ZERO,
 			"remote-20ms-rtt" => Duration::from_millis(10),
 			"remote-100ms-rtt" => Duration::from_millis(50),
-			other => bail!("unknown environment link {other:?}"),
+			other => return Err(error(format!("unknown environment link {other:?}"))),
 		};
 		let hook_phases = match required("OMP_POOL_HOOK_LOAD")?.as_str() {
 			"one-phase" => 1,
 			"five-phases" => 5,
-			other => bail!("unknown hook load {other:?}"),
+			other => return Err(error(format!("unknown hook load {other:?}"))),
 		};
 		let invocation = match required("OMP_POOL_INVOCATION_PATTERN")?.as_str() {
 			"one-call" => InvocationPattern::OneCall,
 			"concurrent-calls" => InvocationPattern::ConcurrentCalls,
 			"cancellation-mid-call" => InvocationPattern::CancellationMidCall,
-			other => bail!("unknown invocation pattern {other:?}"),
+			other => return Err(error(format!("unknown invocation pattern {other:?}"))),
 		};
 		Ok(Self { extensions, dependency, lifecycle, link_delay, hook_phases, invocation })
 	}
@@ -322,7 +322,7 @@ async fn measure_hooks(client: &EnvClient, condition: Condition) -> Result<Durat
 		controlled_link(condition.link_delay).await;
 		let id = format!("hook-{phase}");
 		if !invoke(client, id, 0).await? {
-			bail!("hook probe did not complete successfully");
+			return Err(error(format!("hook probe did not complete successfully")));
 		}
 		controlled_link(condition.link_delay).await;
 	}
@@ -336,7 +336,7 @@ async fn exercise_invocation_pattern(client: &EnvClient, condition: Condition) -
 	match condition.invocation {
 		InvocationPattern::OneCall => {
 			if !invoke(client, "one-call".to_owned(), 0).await? {
-				bail!("one-call probe did not complete successfully");
+				return Err(error(format!("one-call probe did not complete successfully")));
 			}
 			Ok(0)
 		},
@@ -345,7 +345,7 @@ async fn exercise_invocation_pattern(client: &EnvClient, condition: Condition) -
 				join_all((0..4).map(|index| invoke(client, format!("concurrent-{index}"), 10))).await;
 			for result in results {
 				if !result? {
-					bail!("concurrent probe did not complete successfully");
+					return Err(error(format!("concurrent probe did not complete successfully")));
 				}
 			}
 			Ok(0)
@@ -388,7 +388,7 @@ async fn open_invocation(
 	.context("open pooling invocation timed out")??;
 	match tokio::time::timeout(CELL_TIMEOUT, invocation.next_event()).await?? {
 		Some(InvocationEvent::Accepted(_)) => {},
-		other => bail!("pooling invocation was not accepted: {other:?}"),
+		other => return Err(error(format!("pooling invocation was not accepted: {other:?}"))),
 	}
 	invocation
 		.commit_args(
@@ -427,7 +427,7 @@ fn process_tree_rss(root: u32) -> Result<u64> {
 		.output()
 		.context("read process RSS from ps")?;
 	if !output.status.success() {
-		bail!("ps failed while reading process RSS");
+		return Err(error(format!("ps failed while reading process RSS")));
 	}
 	let text = String::from_utf8(output.stdout).context("ps emitted non-UTF-8 output")?;
 	let mut parents = HashMap::<u32, u32>::new();

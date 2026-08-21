@@ -11,9 +11,8 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, USER_AGENT},
 };
-use omp_core::{Str, parse_rfc3339, sf};
+use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
-use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
 
 use crate::{
@@ -396,8 +395,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::HeaderMap;
+	use omp_core::SecretString;
 	use parking_lot::Mutex;
-	use secrecy::SecretString;
 
 	use super::KimiUsageFetcher;
 	use crate::{

@@ -239,7 +239,7 @@ impl ExecutionModes {
 			return Err(ModeError::Conflict { requested: ActiveMode::Goal, active: state.mode });
 		}
 		let goal = Goal {
-			id: Str::from(ulid::Ulid::generate().to_string()),
+			id: Str::from(omp_core::Ulid::generate().to_string()),
 			objective,
 			status: GoalStatus::Active,
 			token_budget,

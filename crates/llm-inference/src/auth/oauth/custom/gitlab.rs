@@ -5,11 +5,10 @@ use std::{
 };
 
 use futures::{FutureExt, future::BoxFuture};
-use omp_core::{Str, base64_url, sf};
+use omp_core::{ExposeSecret, SecretString, Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -312,9 +311,9 @@ mod tests {
 
 	use futures::FutureExt;
 	use http::{HeaderMap, Method, header::CONTENT_TYPE};
+	use omp_core::ExposeSecret;
 	use omp_llm_catalog::provider::PrincipalResolution;
 	use parking_lot::Mutex;
-	use secrecy::ExposeSecret;
 
 	use super::*;
 	use crate::{

@@ -7,7 +7,7 @@ use std::{
 };
 
 use omp_core::IntoStr;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 
 use super::runtime::{LocalCancellation, LocalError, LocalErrorKind, LocalResult};
 
@@ -121,7 +121,7 @@ impl ArtifactStore {
 				));
 			}
 		}
-		let mut digest = Sha256::new();
+		let mut context = Sha256::new();
 		let mut buffer = vec![0_u8; 64 * 1024];
 		loop {
 			if cancel.is_cancelled() {
@@ -133,9 +133,9 @@ impl ArtifactStore {
 			if read == 0 {
 				break;
 			}
-			digest.update(&buffer[..read]);
+			context.update(&buffer[..read]);
 		}
-		let observed: [u8; 32] = digest.finalize().into();
+		let observed: [u8; 32] = context.finalize().into();
 		if observed != spec.sha256 {
 			return Err(LocalError::new(LocalErrorKind::Artifact, "artifact SHA-256 mismatch"));
 		}

@@ -525,7 +525,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 			LIMIT,
 			agent.submit(
 				[user_item("start detached shell")],
-				TurnId::new(ulid::Ulid::generate().to_string()),
+				TurnId::new(omp_core::Ulid::generate().to_string()),
 			),
 		)
 		.await
@@ -603,8 +603,10 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let resumed = tokio::spawn(async move {
 		let result = tokio::time::timeout(
 			LIMIT,
-			reopened
-				.submit(Vec::<thread::Item>::new(), TurnId::new(ulid::Ulid::generate().to_string())),
+			reopened.submit(
+				Vec::<thread::Item>::new(),
+				TurnId::new(omp_core::Ulid::generate().to_string()),
+			),
 		)
 		.await;
 		(reopened, result)
@@ -713,7 +715,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		LIMIT,
 		final_agent.submit(
 			[user_item("observe retained early exit")],
-			TurnId::new(ulid::Ulid::generate().to_string()),
+			TurnId::new(omp_core::Ulid::generate().to_string()),
 		),
 	)
 	.await
@@ -755,7 +757,7 @@ async fn detached_replay_acceptance_comes_from_real_gateway_authority() {
 	let input = TurnInput::Full(thread::Thread {
 		items: vec![user_item("persist this exact detached acceptance turn")],
 	});
-	let turn_id = TurnId::new(ulid::Ulid::generate().to_string());
+	let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
 	let first_outcome = {
 		let client = gateway.client().await.expect("first real gateway client");
 		let mut session =

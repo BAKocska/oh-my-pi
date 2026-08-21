@@ -6,12 +6,11 @@ use std::{
 };
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
-use omp_core::{Str, base64, base64_url};
+use omp_core::{ExposeSecret, SecretString, Str, base64, base64_url};
 use ring::{
 	rand::SystemRandom,
 	signature::{RSA_PKCS1_SHA256, RsaKeyPair},
 };
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 

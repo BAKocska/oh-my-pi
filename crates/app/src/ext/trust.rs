@@ -2,8 +2,8 @@
 
 use std::{collections::BTreeSet, fs, io, path::Path};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use omp_core::{Hash32, Str, base64, encoding::hex, sf};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml};
@@ -376,15 +376,14 @@ fn verify_signature(key: &str, message: &[u8], signature: &str) -> Result<(), Ex
 	let signature = base64::decode(signature.as_bytes())
 		.into_vec()
 		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "signature is not base64"))?;
-	let key = VerifyingKey::from_bytes(
-		key.as_slice()
-			.try_into()
-			.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "publisher key is not 32 bytes"))?,
-	)
-	.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "invalid publisher key"))?;
-	let signature = Signature::from_slice(&signature)
-		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "invalid Ed25519 signature"))?;
-	key.verify(message, &signature)
+	if key.len() != 32 {
+		return Err(ExtensionError::new(ExtensionCode::ESig, "publisher key is not 32 bytes"));
+	}
+	if signature.len() != 64 {
+		return Err(ExtensionError::new(ExtensionCode::ESig, "invalid Ed25519 signature"));
+	}
+	UnparsedPublicKey::new(&ED25519, &key)
+		.verify(message, &signature)
 		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "signature verification failed"))
 }
 

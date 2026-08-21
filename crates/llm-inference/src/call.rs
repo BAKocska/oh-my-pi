@@ -7,8 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Str, sf};
-use secrecy::SecretString;
+use omp_core::{SecretString, Str, sf};
 use serde_json::{Value, value::RawValue};
 use strum::IntoStaticStr;
 
@@ -1307,7 +1306,7 @@ pub struct NativeRequest {
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
-	use secrecy::SecretString;
+	use omp_core::SecretString;
 
 	use super::{AuthInput, RawJson};
 

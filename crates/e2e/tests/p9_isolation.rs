@@ -5,7 +5,6 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
 use omp_app::{
 	envd::{
@@ -17,7 +16,10 @@ use omp_app::{
 	},
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
-use omp_e2e::support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, omp_binary, within};
+use omp_e2e::{
+	Context as _, Result, error,
+	support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, omp_binary, within},
+};
 use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_proto::{
 	SCHEMA_REV,
@@ -155,7 +157,7 @@ async fn invoke_worker(client: &EnvClient) -> Result<Value> {
 	.await??;
 	match within("worker acceptance", DEFAULT_TIMEOUT, invocation.next_event()).await?? {
 		Some(InvocationEvent::Accepted(_)) => {},
-		other => bail!("expected worker acceptance, got {other:?}"),
+		other => return Err(error(format!("expected worker acceptance, got {other:?}"))),
 	}
 	within(
 		"commit worker arguments",
@@ -174,12 +176,12 @@ async fn invoke_worker(client: &EnvClient) -> Result<Value> {
 				let outcome: CallOutcome<Value, Value> = serde_json::from_slice(&verdict.json)?;
 				return match outcome {
 					CallOutcome::Ok(value) => Ok(value),
-					other => bail!("isolated worker returned {other:?}"),
+					other => return Err(error(format!("isolated worker returned {other:?}"))),
 				};
 			},
 			Some(InvocationEvent::Update(_)) => {},
-			Some(other) => bail!("unexpected worker event {other:?}"),
-			None => bail!("isolated worker closed before verdict"),
+			Some(other) => return Err(error(format!("unexpected worker event {other:?}"))),
+			None => return Err(error(format!("isolated worker closed before verdict"))),
 		}
 	}
 }
@@ -205,7 +207,7 @@ async fn p9_env_worker_is_rooted_in_the_isolated_worktree() -> Result<()> {
 	let root = url::Url::parse(&worktree.root_uri)
 		.context("parse worktree root URI")?
 		.to_file_path()
-		.map_err(|()| anyhow::anyhow!("worktree root was not a file URI"))?;
+		.map_err(|()| error(format!("worktree root was not a file URI")))?;
 	std::fs::write(root.join(format!("{MODULE}.py")), WORKER_EXTENSION)
 		.context("install isolated worker extension")?;
 

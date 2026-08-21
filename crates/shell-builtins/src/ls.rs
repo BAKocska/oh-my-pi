@@ -3590,11 +3590,24 @@ mod display {
 	}
 
 	fn create_hyperlink(name: &OsStr, path: &PathData) -> OsString {
-		// The `hostname` crate does not support WASI (no OS-level hostname API),
-		// so we use an empty string for hyperlinks on WASI.
-		#[cfg(not(target_os = "wasi"))]
-		static HOSTNAME: LazyLock<OsString> = LazyLock::new(|| hostname::get().unwrap_or_default());
-		#[cfg(target_os = "wasi")]
+		#[cfg(unix)]
+		static HOSTNAME: LazyLock<OsString> =
+			LazyLock::new(|| nix::unistd::gethostname().unwrap_or_default());
+		#[cfg(windows)]
+		static HOSTNAME: LazyLock<OsString> = LazyLock::new(|| {
+			use std::os::windows::ffi::OsStringExt;
+
+			use windows_sys::Win32::System::SystemInformation::GetComputerNameW;
+
+			let mut buffer = [0u16; 256];
+			let mut len = buffer.len() as u32;
+			if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut len) } == 0 {
+				OsString::new()
+			} else {
+				OsString::from_wide(&buffer[..len as usize])
+			}
+		});
+		#[cfg(not(any(unix, windows)))]
 		static HOSTNAME: LazyLock<OsString> = LazyLock::new(OsString::new);
 
 		// OSC 8 hyperlink format: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\

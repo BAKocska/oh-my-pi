@@ -209,7 +209,7 @@ fn classify_unregistered(path: &Path) -> io::Result<&'static str> {
 		.file_name()
 		.and_then(|name| name.to_str())
 		.and_then(|name| name.rsplit_once('-').map(|(_, suffix)| suffix))
-		.is_some_and(|suffix| ulid::Ulid::from_string(suffix).is_ok())
+		.is_some_and(|suffix| omp_core::Ulid::from_string(suffix).is_ok())
 	{
 		return Ok("task-isolation");
 	}

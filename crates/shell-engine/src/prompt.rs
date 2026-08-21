@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use jiff::{Zoned, fmt::strtime};
+
 use crate::{
 	ExecutionParameters, error, expansion, extensions,
 	shell::Shell,
@@ -47,7 +49,7 @@ pub(crate) async fn expand_prompt(
 	Ok(formatted_prompt)
 }
 
-#[cached::proc_macro::cached(size = 64, result = true)]
+#[omp_macros::cached(size = 64, result = true)]
 fn parse_prompt(
 	spec: String,
 ) -> Result<Vec<crate::parser::prompt::PromptPiece>, crate::parser::WordParseError> {
@@ -75,9 +77,7 @@ fn format_prompt_piece(
 		crate::parser::prompt::PromptPiece::CurrentWorkingDirectory { tilde_replaced, basename } => {
 			format_current_working_directory(shell, tilde_replaced, basename)
 		},
-		crate::parser::prompt::PromptPiece::Date(format) => {
-			format_date(&chrono::Local::now(), &format)
-		},
+		crate::parser::prompt::PromptPiece::Date(format) => format_date(&Zoned::now(), &format),
 		crate::parser::prompt::PromptPiece::DollarOrPound => {
 			if users::is_root() {
 				"#".to_owned()
@@ -141,9 +141,7 @@ fn format_prompt_piece(
 				.and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
 				.unwrap_or_default()
 		},
-		crate::parser::prompt::PromptPiece::Time(time_fmt) => {
-			format_time(&chrono::Local::now(), &time_fmt)
-		},
+		crate::parser::prompt::PromptPiece::Time(time_fmt) => format_time(&Zoned::now(), &time_fmt),
 	};
 
 	Ok(formatted)
@@ -171,37 +169,27 @@ fn format_current_working_directory(
 	working_dir_str
 }
 
-fn format_time<Tz: chrono::TimeZone>(
-	datetime: &chrono::DateTime<Tz>,
-	format: &crate::parser::prompt::PromptTimeFormat,
-) -> String
-where
-	Tz::Offset: std::fmt::Display,
-{
-	let formatted = match format {
-		crate::parser::prompt::PromptTimeFormat::TwelveHourAM => datetime.format("%I:%M %p"),
-		crate::parser::prompt::PromptTimeFormat::TwelveHourHHMMSS => datetime.format("%I:%M:%S"),
-		crate::parser::prompt::PromptTimeFormat::TwentyFourHourHHMM => datetime.format("%H:%M"),
-		crate::parser::prompt::PromptTimeFormat::TwentyFourHourHHMMSS => datetime.format("%H:%M:%S"),
+fn format_time(datetime: &Zoned, format: &crate::parser::prompt::PromptTimeFormat) -> String {
+	let format = match format {
+		crate::parser::prompt::PromptTimeFormat::TwelveHourAM => "%I:%M %p",
+		crate::parser::prompt::PromptTimeFormat::TwelveHourHHMMSS => "%I:%M:%S",
+		crate::parser::prompt::PromptTimeFormat::TwentyFourHourHHMM => "%H:%M",
+		crate::parser::prompt::PromptTimeFormat::TwentyFourHourHHMMSS => "%H:%M:%S",
 	};
 
-	formatted.to_string()
+	strtime::format(format, datetime).unwrap_or_default()
 }
 
-fn format_date<Tz: chrono::TimeZone>(
-	datetime: &chrono::DateTime<Tz>,
-	format: &crate::parser::prompt::PromptDateFormat,
-) -> String
-where
-	Tz::Offset: std::fmt::Display,
-{
+fn format_date(datetime: &Zoned, format: &crate::parser::prompt::PromptDateFormat) -> String {
 	match format {
 		crate::parser::prompt::PromptDateFormat::WeekdayMonthDate => {
-			datetime.format("%a %b %d").to_string()
+			strtime::format("%a %b %d", datetime).unwrap_or_default()
 		},
-		crate::parser::prompt::PromptDateFormat::Custom(fmt) => {
-			let fmt_items = chrono::format::StrftimeItems::new(fmt);
-			datetime.format_with_items(fmt_items).to_string()
+		crate::parser::prompt::PromptDateFormat::Custom(format) => {
+			// Chrono's bare `%f` always emitted nine digits, while jiff trims
+			// trailing zeroes. Preserve the prompt escape's established output.
+			let chrono_compatible = format.replace("%f", "%9f");
+			strtime::format(&chrono_compatible, datetime).unwrap_or_default()
 		},
 	}
 }
@@ -213,7 +201,10 @@ mod tests {
 	#[test]
 	fn test_format_time() {
 		// Create a well-known test date/time.
-		let dt = chrono::DateTime::parse_from_rfc3339("2024-12-25T13:34:56.789Z").unwrap();
+		let dt = "2024-12-25T13:34:56.789Z"
+			.parse::<jiff::Timestamp>()
+			.unwrap()
+			.to_zoned(jiff::tz::TimeZone::UTC);
 
 		assert_eq!(
 			format_time(&dt, &crate::parser::prompt::PromptTimeFormat::TwelveHourAM),
@@ -234,7 +225,10 @@ mod tests {
 	#[test]
 	fn test_format_date() {
 		// Create a well-known test date/time.
-		let dt = chrono::DateTime::parse_from_rfc3339("2024-12-25T12:34:56.789Z").unwrap();
+		let dt = "2024-12-25T12:34:56.789Z"
+			.parse::<jiff::Timestamp>()
+			.unwrap()
+			.to_zoned(jiff::tz::TimeZone::UTC);
 
 		assert_eq!(
 			format_date(&dt, &crate::parser::prompt::PromptDateFormat::WeekdayMonthDate),

@@ -2,11 +2,11 @@
 
 use std::fmt;
 
+use omp_core::{ExposeSecret, SecretBox};
 use ring::{
 	aead,
 	rand::{SecureRandom, SystemRandom},
 };
-use secrecy::{ExposeSecret, SecretBox};
 use thiserror::Error;
 use zeroize::Zeroize;
 

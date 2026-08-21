@@ -561,14 +561,14 @@ struct FileLease<'a>(&'a File);
 
 impl<'a> FileLease<'a> {
 	fn acquire(file: &'a File) -> Result<Self, Error> {
-		fs2::FileExt::lock_exclusive(file)?;
+		file.lock()?;
 		Ok(Self(file))
 	}
 }
 
 impl Drop for FileLease<'_> {
 	fn drop(&mut self) {
-		let _ = fs2::FileExt::unlock(self.0);
+		let _ = self.0.unlock();
 	}
 }
 

@@ -136,16 +136,6 @@ mod operation {
 		io::{BufRead, Write},
 	};
 
-	use nom::{
-		IResult, Parser,
-		branch::alt,
-		bytes::complete::{tag, take, take_till, take_until},
-		character::complete::one_of,
-		combinator::{map, map_opt, peek, recognize, value},
-		multi::{many_m_n, many0},
-		sequence::{delimited, preceded, separated_pair, terminated},
-	};
-
 	use super::unicode_table;
 
 	/// Common trait for operations that can process chunks of data
@@ -451,214 +441,183 @@ mod operation {
 
 	impl Sequence {
 		pub fn from_str(input: &[u8], stderr: &mut dyn Write) -> Result<Vec<Self>, BadSequence> {
-			let parsed = many0(alt((
-				map(Self::parse_char_range, |s| (s, None)),
-				map(Self::parse_char_star, |s| (s, None)),
-				map(Self::parse_char_repeat, |s| (s, None)),
-				map(Self::parse_class, |s| (s, None)),
-				map(Self::parse_char_equal, |s| (s, None)),
-				// NOTE: This must be the last one
-				map(Self::parse_backslash_or_char_with_warning, |(s, warning)| {
-					(Ok(Self::Char(s)), warning)
-				}),
-			)))
-			.parse(input)
-			.map(|(_, r)| r)
-			.unwrap();
-			parsed
-				.into_iter()
-				.map(|(sequence, warning)| {
-					if let Some(warning) = warning {
-						let _ = writeln!(stderr, "tr: warning: {warning}");
-					}
-					sequence
-				})
-				.collect()
-		}
-
-		fn parse_octal(input: &[u8]) -> IResult<&[u8], u8> {
-			// For `parse_char_range`, `parse_char_star`, `parse_char_repeat`,
-			// `parse_char_equal`. Because in these patterns, there's no ambiguous cases.
-			preceded(tag("\\"), Self::parse_octal_up_to_three_digits).parse(input)
-		}
-
-		fn parse_octal_with_warning(input: &[u8]) -> IResult<&[u8], (u8, Option<String>)> {
-			let (digits, _) = tag("\\")(input)?;
-			if let Ok((rest, value)) = Self::parse_octal_up_to_three_digits(digits) {
-				return Ok((rest, (value, None)));
-			}
-
-			let (rest, value) = Self::parse_octal_two_digits(digits)?;
-			let warning = if let Ok(origin_octal) = std::str::from_utf8(digits) {
-				let actual_octal_tail = std::str::from_utf8(&digits[..2]).unwrap();
-				let outstand_char = char::from_u32(digits[2] as u32).unwrap();
-				format!(
-					"the ambiguous octal escape \\{origin_octal} is being interpreted as the 2-byte \
-					 sequence \\0{actual_octal_tail}, {outstand_char}"
-				)
-			} else {
-				"invalid utf8 sequence".to_string()
-			};
-			Ok((rest, (value, Some(warning))))
-		}
-
-		fn parse_octal_up_to_three_digits(input: &[u8]) -> IResult<&[u8], u8> {
-			map_opt(recognize(many_m_n(1, 3, one_of("01234567"))), |out: &[u8]| {
-				let str_to_parse = std::str::from_utf8(out).unwrap();
-				u8::from_str_radix(str_to_parse, 8).ok()
-			})
-			.parse(input)
-		}
-
-		fn parse_octal_two_digits(input: &[u8]) -> IResult<&[u8], u8> {
-			map_opt(recognize(many_m_n(2, 2, one_of("01234567"))), |out: &[u8]| {
-				u8::from_str_radix(std::str::from_utf8(out).unwrap(), 8).ok()
-			})
-			.parse(input)
-		}
-
-		fn parse_backslash(input: &[u8]) -> IResult<&[u8], u8> {
-			preceded(tag("\\"), Self::single_char)
-				.parse(input)
-				.map(|(l, a)| {
-					let c = match a {
-						b'a' => unicode_table::BEL,
-						b'b' => unicode_table::BS,
-						b'f' => unicode_table::FF,
-						b'n' => unicode_table::LF,
-						b'r' => unicode_table::CR,
-						b't' => unicode_table::HT,
-						b'v' => unicode_table::VT,
-						x => x,
-					};
-					(l, c)
-				})
-		}
-
-		fn parse_backslash_or_char(input: &[u8]) -> IResult<&[u8], u8> {
-			alt((Self::parse_octal, Self::parse_backslash, Self::single_char)).parse(input)
-		}
-
-		fn parse_backslash_or_char_with_warning(
-			input: &[u8],
-		) -> IResult<&[u8], (u8, Option<String>)> {
-			alt((
-				Self::parse_octal_with_warning,
-				map(Self::parse_backslash, |value| (value, None)),
-				map(Self::single_char, |value| (value, None)),
-			))
-			.parse(input)
-		}
-
-		fn single_char(input: &[u8]) -> IResult<&[u8], u8> {
-			take(1usize)(input).map(|(l, a)| (l, a[0]))
-		}
-
-		fn parse_char_range(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
-			separated_pair(Self::parse_backslash_or_char, tag("-"), Self::parse_backslash_or_char)
-				.parse(input)
-				.map(|(l, (a, b))| {
-					(l, {
-						let (start, end) = (u32::from(a), u32::from(b));
-
-						let range = start..=end;
-
-						if range.is_empty() {
-							Err(BadSequence::BackwardsRange { end, start })
-						} else {
-							Ok(Self::CharRange(start as u8, end as u8))
-						}
-					})
-				})
-		}
-
-		fn parse_char_star(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
-			delimited(tag("["), Self::parse_backslash_or_char, tag("*]"))
-				.parse(input)
-				.map(|(l, a)| (l, Ok(Self::CharStar(a))))
-		}
-
-		fn parse_char_repeat(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
-			delimited(
-				tag("["),
-				separated_pair(
-					Self::parse_backslash_or_char,
-					tag("*"),
-					// TODO
-					// Why are the opening and closing tags not sufficient?
-					// Backslash check is a workaround for `check_against_gnu_tr_tests_repeat_bs_9`
-					take_till(|ue| matches!(ue, b']' | b'\\')),
-				),
-				tag("]"),
-			)
-			.parse(input)
-			.map(|(l, (c, cnt_str))| {
-				let s = String::from_utf8_lossy(cnt_str);
-				let result = if cnt_str.starts_with(b"0") {
-					match usize::from_str_radix(&s, 8) {
-						Ok(0) => Ok(Self::CharStar(c)),
-						Ok(count) => Ok(Self::CharRepeat(c, count)),
-						Err(_) => Err(BadSequence::InvalidRepeatCount(s.to_string())),
-					}
-				} else {
-					match s.parse::<usize>() {
-						Ok(0) => Ok(Self::CharStar(c)),
-						Ok(count) => Ok(Self::CharRepeat(c, count)),
-						Err(_) => Err(BadSequence::InvalidRepeatCount(s.to_string())),
-					}
+			let mut parsed = Vec::new();
+			let mut offset = 0;
+			while offset < input.len() {
+				if let Some((sequence, next)) = Self::parse_range(input, offset) {
+					parsed.push(sequence?);
+					offset = next;
+					continue;
+				}
+				if let Some((sequence, next)) = Self::parse_repeat(input, offset) {
+					parsed.push(sequence?);
+					offset = next;
+					continue;
+				}
+				if let Some((sequence, next)) = Self::parse_class(input, offset) {
+					parsed.push(sequence?);
+					offset = next;
+					continue;
+				}
+				if let Some((sequence, next)) = Self::parse_equivalence(input, offset) {
+					parsed.push(sequence?);
+					offset = next;
+					continue;
+				}
+				let Some((value, next, warning)) = Self::parse_character(input, offset, true) else {
+					break;
 				};
-				(l, result)
-			})
+				if let Some(warning) = warning {
+					let _ = writeln!(stderr, "tr: warning: {warning}");
+				}
+				parsed.push(Self::Char(value));
+				offset = next;
+			}
+			Ok(parsed)
 		}
 
-		fn parse_class(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
-			preceded(tag("[:"), terminated(take_until(":]"), tag(":]")))
-				.parse(input)
-				.map(|(l, class_name)| {
-					(l, match class_name {
-						b"" => Err(BadSequence::MissingCharClassName),
-						b"alnum" => Ok(Self::Class(Class::Alnum)),
-						b"alpha" => Ok(Self::Class(Class::Alpha)),
-						b"blank" => Ok(Self::Class(Class::Blank)),
-						b"cntrl" => Ok(Self::Class(Class::Control)),
-						b"digit" => Ok(Self::Class(Class::Digit)),
-						b"graph" => Ok(Self::Class(Class::Graph)),
-						b"lower" => Ok(Self::Class(Class::Lower)),
-						b"print" => Ok(Self::Class(Class::Print)),
-						b"punct" => Ok(Self::Class(Class::Punct)),
-						b"space" => Ok(Self::Class(Class::Space)),
-						b"upper" => Ok(Self::Class(Class::Upper)),
-						b"xdigit" => Ok(Self::Class(Class::Xdigit)),
-						_ => Err(BadSequence::InvalidCharClass(format!(
-							"[:{}:]",
-							String::from_utf8_lossy(class_name)
-						))),
-					})
-				})
+		fn parse_character(
+			input: &[u8],
+			offset: usize,
+			warn_ambiguous_octal: bool,
+		) -> Option<(u8, usize, Option<String>)> {
+			let first = *input.get(offset)?;
+			if first != b'\\' {
+				return Some((first, offset + 1, None));
+			}
+			let escaped = *input.get(offset + 1)?;
+			if escaped.is_ascii_digit() && escaped < b'8' {
+				let mut end = offset + 1;
+				while end < input.len() && end < offset + 4 && matches!(input[end], b'0'..=b'7') {
+					end += 1;
+				}
+				let digits = &input[offset + 1..end];
+				if let Ok(text) = std::str::from_utf8(digits)
+					&& let Ok(value) = u8::from_str_radix(text, 8)
+				{
+					return Some((value, end, None));
+				}
+				if warn_ambiguous_octal && digits.len() == 3 {
+					let value = u8::from_str_radix(std::str::from_utf8(&digits[..2]).ok()?, 8).ok()?;
+					let warning = format!(
+						"the ambiguous octal escape \\{} is being interpreted as the 2-byte sequence \
+						 \\0{}, {}",
+						String::from_utf8_lossy(digits),
+						String::from_utf8_lossy(&digits[..2]),
+						digits[2] as char,
+					);
+					return Some((value, offset + 3, Some(warning)));
+				}
+			}
+			let value = match escaped {
+				b'a' => unicode_table::BEL,
+				b'b' => unicode_table::BS,
+				b'f' => unicode_table::FF,
+				b'n' => unicode_table::LF,
+				b'r' => unicode_table::CR,
+				b't' => unicode_table::HT,
+				b'v' => unicode_table::VT,
+				other => other,
+			};
+			Some((value, offset + 2, None))
 		}
 
-		fn parse_char_equal(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
-			preceded(
-				tag("[="),
-				(
-					alt((value(Err(()), peek(tag("=]"))), map(Self::parse_backslash_or_char, Ok))),
-					map(terminated(take_until("=]"), tag("=]")), |v: &[u8]| {
-						if v.is_empty() { Ok(()) } else { Err(v) }
-					}),
-				),
-			)
-			.parse(input)
-			.map(|(l, (a, b))| {
-				(l, match (a, b) {
-					(Err(()), _) => Err(BadSequence::MissingEquivalentClassChar),
-					(Ok(c), Ok(())) => Ok(Self::Char(c)),
-					(Ok(c), Err(v)) => Err(BadSequence::MultipleCharInEquivalence(format!(
-						"{}{}",
-						String::from_utf8_lossy(&[c]),
-						String::from_utf8_lossy(v),
-					))),
-				})
-			})
+		fn parse_range(input: &[u8], offset: usize) -> Option<(Result<Self, BadSequence>, usize)> {
+			let (start, hyphen, _) = Self::parse_character(input, offset, false)?;
+			if input.get(hyphen) != Some(&b'-') {
+				return None;
+			}
+			let (end, next, _) = Self::parse_character(input, hyphen + 1, false)?;
+			let result = if start > end {
+				Err(BadSequence::BackwardsRange { start: u32::from(start), end: u32::from(end) })
+			} else {
+				Ok(Self::CharRange(start, end))
+			};
+			Some((result, next))
+		}
+
+		fn parse_repeat(input: &[u8], offset: usize) -> Option<(Result<Self, BadSequence>, usize)> {
+			if input.get(offset) != Some(&b'[') {
+				return None;
+			}
+			let (value, star, _) = Self::parse_character(input, offset + 1, false)?;
+			if input.get(star) != Some(&b'*') {
+				return None;
+			}
+			let count_start = star + 1;
+			let close = input[count_start..]
+				.iter()
+				.position(|byte| matches!(byte, b']' | b'\\'))?
+				+ count_start;
+			if input.get(close) != Some(&b']') {
+				return None;
+			}
+			let count = &input[count_start..close];
+			let result = if count.is_empty() {
+				Ok(Self::CharStar(value))
+			} else {
+				let text = String::from_utf8_lossy(count);
+				let parsed = if count.starts_with(b"0") {
+					usize::from_str_radix(&text, 8)
+				} else {
+					text.parse()
+				};
+				match parsed {
+					Ok(0) => Ok(Self::CharStar(value)),
+					Ok(count) => Ok(Self::CharRepeat(value, count)),
+					Err(_) => Err(BadSequence::InvalidRepeatCount(text.into_owned())),
+				}
+			};
+			Some((result, close + 1))
+		}
+
+		fn parse_class(input: &[u8], offset: usize) -> Option<(Result<Self, BadSequence>, usize)> {
+			let rest = input.get(offset..)?.strip_prefix(b"[:")?;
+			let end = rest.windows(2).position(|window| window == b":]")?;
+			let name = &rest[..end];
+			let result = match name {
+				b"" => Err(BadSequence::MissingCharClassName),
+				b"alnum" => Ok(Self::Class(Class::Alnum)),
+				b"alpha" => Ok(Self::Class(Class::Alpha)),
+				b"blank" => Ok(Self::Class(Class::Blank)),
+				b"cntrl" => Ok(Self::Class(Class::Control)),
+				b"digit" => Ok(Self::Class(Class::Digit)),
+				b"graph" => Ok(Self::Class(Class::Graph)),
+				b"lower" => Ok(Self::Class(Class::Lower)),
+				b"print" => Ok(Self::Class(Class::Print)),
+				b"punct" => Ok(Self::Class(Class::Punct)),
+				b"space" => Ok(Self::Class(Class::Space)),
+				b"upper" => Ok(Self::Class(Class::Upper)),
+				b"xdigit" => Ok(Self::Class(Class::Xdigit)),
+				_ => {
+					Err(BadSequence::InvalidCharClass(format!("[:{}:]", String::from_utf8_lossy(name))))
+				},
+			};
+			Some((result, offset + 2 + end + 2))
+		}
+
+		fn parse_equivalence(
+			input: &[u8],
+			offset: usize,
+		) -> Option<(Result<Self, BadSequence>, usize)> {
+			input.get(offset..)?.strip_prefix(b"[=")?;
+			let content = offset + 2;
+			let close = input[content..]
+				.windows(2)
+				.position(|window| window == b"=]")?
+				+ content;
+			if close == content {
+				return Some((Err(BadSequence::MissingEquivalentClassChar), close + 2));
+			}
+			let (value, next, _) = Self::parse_character(input, content, false)?;
+			let result = if next == close {
+				Ok(Self::Char(value))
+			} else {
+				Err(BadSequence::MultipleCharInEquivalence(
+					String::from_utf8_lossy(&input[content..close]).into_owned(),
+				))
+			};
+			Some((result, close + 2))
 		}
 	}
 

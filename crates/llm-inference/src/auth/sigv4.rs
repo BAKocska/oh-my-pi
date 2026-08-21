@@ -6,19 +6,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
 use http::{
 	HeaderValue, Request,
 	header::{AUTHORIZATION, HOST, HeaderName},
 };
-use omp_core::hex;
-use secrecy::{ExposeSecret, SecretString};
-use sha2::{Digest, Sha256};
+use omp_core::{ExposeSecret, SecretString, hex};
+use ring::hmac;
+use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::spec::SigV4Spec;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Sealed AWS access material accepted only by a credential lease.
 pub(crate) struct AwsCredential {
@@ -197,7 +194,8 @@ fn canonical_request(
 	canonical.extend_from_slice(signed_headers.as_bytes());
 	canonical.push(b'\n');
 	canonical.extend_from_slice(payload_hash.as_bytes());
-	Ok((Sha256::digest(&canonical[..]).into(), signed_headers))
+	let hash = Sha256::digest(&canonical);
+	Ok((hash.into(), signed_headers))
 }
 
 fn canonical_uri(path: &str, service: &str) -> String {
@@ -349,9 +347,11 @@ fn append_normalized_header(output: &mut Vec<u8>, value: &str) {
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-	let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts every key length");
-	mac.update(message);
-	mac.finalize().into_bytes().into()
+	let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+	hmac::sign(&key, message)
+		.as_ref()
+		.try_into()
+		.expect("SHA-256 HMAC is 32 bytes")
 }
 
 fn aws_dates(time: SystemTime) -> Result<(String, String), SigV4Error> {

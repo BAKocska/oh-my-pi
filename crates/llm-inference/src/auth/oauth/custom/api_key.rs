@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, future::BoxFuture};
-use omp_core::sf;
+use omp_core::{ExposeSecret, SecretString, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
-use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
 use crate::{

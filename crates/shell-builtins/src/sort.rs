@@ -1379,6 +1379,7 @@ mod merge {
 
 	use std::{
 		cmp::Ordering,
+		collections::BinaryHeap,
 		ffi::{OsStr, OsString},
 		fs::{self, File},
 		io::{BufWriter, Read, Write},
@@ -1389,7 +1390,6 @@ mod merge {
 		thread::{self, JoinHandle},
 	};
 
-	use compare::Compare;
 	use flume::{Receiver, Sender};
 
 	use super::{
@@ -1582,9 +1582,12 @@ mod merge {
 		}
 
 		Ok(FileMerger {
-			heap: binary_heap_plus::BinaryHeap::from_vec_cmp(mergeable_files, FileComparator {
-				settings,
-			}),
+			heap: BinaryHeap::from(
+				mergeable_files
+					.into_iter()
+					.map(|file| HeapFile { file, settings })
+					.collect::<Vec<_>>(),
+			),
 			request_sender,
 			prev: None,
 			reader_join_handle,
@@ -1649,7 +1652,7 @@ mod merge {
 	/// Merges files together. This is **not** an iterator because of lifetime
 	/// problems.
 	struct FileMerger<'a> {
-		heap:               binary_heap_plus::BinaryHeap<MergeableFile, FileComparator<'a>>,
+		heap:               BinaryHeap<HeapFile<'a>>,
 		request_sender:     Sender<(usize, RecycledChunk)>,
 		prev:               Option<PreviousLine>,
 		reader_join_handle: JoinHandle<SortResult<()>>,
@@ -1735,27 +1738,51 @@ mod merge {
 		}
 	}
 
-	/// Compares files by their current line.
-	struct FileComparator<'a> {
+	struct HeapFile<'a> {
+		file:     MergeableFile,
 		settings: &'a GlobalSettings,
 	}
 
-	impl Compare<MergeableFile> for FileComparator<'_> {
-		fn compare(&self, a: &MergeableFile, b: &MergeableFile) -> Ordering {
+	impl std::ops::Deref for HeapFile<'_> {
+		type Target = MergeableFile;
+
+		fn deref(&self) -> &Self::Target {
+			&self.file
+		}
+	}
+
+	impl std::ops::DerefMut for HeapFile<'_> {
+		fn deref_mut(&mut self) -> &mut Self::Target {
+			&mut self.file
+		}
+	}
+
+	impl PartialEq for HeapFile<'_> {
+		fn eq(&self, other: &Self) -> bool {
+			self.cmp(other) == Ordering::Equal
+		}
+	}
+
+	impl Eq for HeapFile<'_> {}
+
+	impl PartialOrd for HeapFile<'_> {
+		fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+			Some(self.cmp(other))
+		}
+	}
+
+	impl Ord for HeapFile<'_> {
+		fn cmp(&self, other: &Self) -> Ordering {
 			let mut cmp = compare_by(
-				&a.current_chunk.lines()[a.line_idx],
-				&b.current_chunk.lines()[b.line_idx],
+				&self.current_chunk.lines()[self.line_idx],
+				&other.current_chunk.lines()[other.line_idx],
 				self.settings,
-				a.current_chunk.line_data(),
-				b.current_chunk.line_data(),
+				self.current_chunk.line_data(),
+				other.current_chunk.line_data(),
 			);
 			if cmp == Ordering::Equal {
-				// To make sorting stable, we need to consider the file number as well,
-				// as lines from a file with a lower number are to be considered "earlier".
-				cmp = a.file_number.cmp(&b.file_number);
+				cmp = self.file_number.cmp(&other.file_number);
 			}
-			// BinaryHeap is a max heap. We use it as a min heap, so we need to reverse the
-			// ordering.
 			cmp.reverse()
 		}
 	}
@@ -2453,12 +2480,12 @@ use clap::{
 };
 use custom_str_cmp::custom_str_cmp;
 use ext_sort::ext_sort;
-use foldhash::{HashMap, SharedSeed, fast::FoldHasher};
 use numeric_str_cmp::{NumInfo, NumInfoParseSettings, human_numeric_str_cmp, numeric_str_cmp};
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use rand::{RngExt as _, rng};
 #[cfg(not(target_os = "wasi"))]
 use rayon::slice::ParallelSliceMut;
+use rustc_hash::{FxHashMap, FxHasher};
 use thiserror::Error;
 use uucore::{
 	display::Quotable,
@@ -4076,7 +4103,7 @@ fn index_legacy_warnings(processed_args: &[OsString], legacy_warnings: &mut [Leg
 		return;
 	}
 
-	let mut index_by_arg = HashMap::default();
+	let mut index_by_arg = FxHashMap::default();
 	for (warning_idx, warning) in legacy_warnings.iter().enumerate() {
 		index_by_arg.insert(warning.arg_index, warning_idx);
 	}
@@ -5362,7 +5389,7 @@ fn salt_from_random_source(path: &Path) -> SortResult<[u8; SALT_LEN]> {
 	let mut buf = [0u8; BUF_LEN];
 	let mut total = 0usize;
 	// freeze seed for --random-source
-	let mut hasher = FoldHasher::with_seed(1, SharedSeed::global_fixed());
+	let mut hasher = FxHasher::with_seed(1);
 
 	loop {
 		let n = reader
@@ -5385,7 +5412,7 @@ fn salt_from_random_source(path: &Path) -> SortResult<[u8; SALT_LEN]> {
 
 	let first = hasher.finish();
 	// freeze seed for --random-source
-	let mut second_hasher = FoldHasher::with_seed(2, SharedSeed::global_fixed());
+	let mut second_hasher = FxHasher::with_seed(2);
 	second_hasher.write(RANDOM_SOURCE_TAG);
 	second_hasher.write_u64(first);
 	let second = second_hasher.finish();
@@ -5398,7 +5425,7 @@ fn salt_from_random_source(path: &Path) -> SortResult<[u8; SALT_LEN]> {
 
 fn get_hash<T: Hash>(t: &T) -> u64 {
 	// Is reproducibility of get_hash itself needed for --random-source ?
-	let mut s = FoldHasher::with_seed(0, SharedSeed::global_fixed());
+	let mut s = FxHasher::default();
 	t.hash(&mut s);
 	s.finish()
 }

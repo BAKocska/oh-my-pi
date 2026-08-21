@@ -14,8 +14,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
-use omp_core::Str;
-use secrecy::SecretString;
+use omp_core::{SecretString, Str};
 
 use crate::{
 	body::ByteStream,

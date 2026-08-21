@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use im::OrdSet;
-use omp_core::{IntoStr, Str, sf};
+use omp_core::{ExposeSecret as _, IntoStr, SecretString, Str, Ulid, sf};
 use omp_tool::{
 	CapsBase, ErasedEv, ErasedOutcome, IncomingParams, ModelClass, Part, PromptCaps, Registry,
 	ToolIdentity, ToolRoute,
@@ -24,12 +24,10 @@ use pyo3::{
 	prelude::*,
 	types::{PyAny, PyDict, PyModule},
 };
-use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
-use ulid::Ulid;
 
 use super::PYTHON_PRELUDE;
 

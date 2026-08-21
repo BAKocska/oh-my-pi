@@ -296,7 +296,7 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 	async fn spawn(&self, wave: Vec<WaveEntry>) -> Result<Value, Fault> {
 		let mut launched = Vec::with_capacity(wave.len());
 		for entry in wave {
-			let id = Str::from(ulid::Ulid::generate().to_string());
+			let id = Str::from(omp_core::Ulid::generate().to_string());
 			let label = entry.label.unwrap_or_else(|| id.clone());
 			let parent = Arc::clone(&self.parent);
 			let prompt = entry.brief;
@@ -363,7 +363,7 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 			.parent
 			.broker()
 			.send(omp_agent::PeerMessage {
-				id: Str::from(ulid::Ulid::generate().to_string()),
+				id: Str::from(omp_core::Ulid::generate().to_string()),
 				from: session_id.clone(),
 				to: id.clone(),
 				text: message,

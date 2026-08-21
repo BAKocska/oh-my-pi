@@ -311,8 +311,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	}
 }
 
-#[inherent::inherent]
-impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
+impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Returns whether or not this shell is a subshell.
 	pub fn is_subshell(&self) -> bool {
 		self.depth > 0
@@ -473,5 +472,127 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 	/// Returns the product display name for this shell.
 	pub fn product_display_str(&self) -> Option<&str> {
 		self.product_display_str.as_deref()
+	}
+}
+
+impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
+	fn is_subshell(&self) -> bool {
+		Shell::is_subshell(self)
+	}
+
+	fn last_stopwatch_time(&self) -> std::time::SystemTime {
+		Shell::last_stopwatch_time(self)
+	}
+
+	fn last_stopwatch_offset(&self) -> u32 {
+		Shell::last_stopwatch_offset(self)
+	}
+
+	fn env(&self) -> &ShellEnvironment {
+		Shell::env(self)
+	}
+
+	fn env_mut(&mut self) -> &mut ShellEnvironment {
+		Shell::env_mut(self)
+	}
+
+	fn options(&self) -> &RuntimeOptions {
+		Shell::options(self)
+	}
+
+	fn options_mut(&mut self) -> &mut RuntimeOptions {
+		Shell::options_mut(self)
+	}
+
+	fn aliases(&self) -> &HashMap<String, String> {
+		Shell::aliases(self)
+	}
+
+	fn aliases_mut(&mut self) -> &mut HashMap<String, String> {
+		Shell::aliases_mut(self)
+	}
+
+	fn jobs(&self) -> &jobs::JobManager {
+		Shell::jobs(self)
+	}
+
+	fn jobs_mut(&mut self) -> &mut jobs::JobManager {
+		Shell::jobs_mut(self)
+	}
+
+	fn traps(&self) -> &crate::traps::TrapHandlerConfig {
+		Shell::traps(self)
+	}
+
+	fn traps_mut(&mut self) -> &mut crate::traps::TrapHandlerConfig {
+		Shell::traps_mut(self)
+	}
+
+	fn directory_stack(&self) -> &[PathBuf] {
+		Shell::directory_stack(self)
+	}
+
+	fn directory_stack_mut(&mut self) -> &mut Vec<PathBuf> {
+		Shell::directory_stack_mut(self)
+	}
+
+	fn last_pipeline_statuses(&self) -> &[u8] {
+		Shell::last_pipeline_statuses(self)
+	}
+
+	fn last_pipeline_statuses_mut(&mut self) -> &mut Vec<u8> {
+		Shell::last_pipeline_statuses_mut(self)
+	}
+
+	fn program_location_cache(&self) -> &pathcache::PathCache {
+		Shell::program_location_cache(self)
+	}
+
+	fn program_location_cache_mut(&mut self) -> &mut pathcache::PathCache {
+		Shell::program_location_cache_mut(self)
+	}
+
+	fn open_files(&self) -> &openfiles::OpenFiles {
+		Shell::open_files(self)
+	}
+
+	fn open_files_mut(&mut self) -> &mut openfiles::OpenFiles {
+		Shell::open_files_mut(self)
+	}
+
+	fn current_shell_name(&self) -> Option<Cow<'_, str>> {
+		Shell::current_shell_name(self)
+	}
+
+	fn depth(&self) -> usize {
+		Shell::depth(self)
+	}
+
+	fn call_stack(&self) -> &crate::callstack::CallStack {
+		Shell::call_stack(self)
+	}
+
+	fn version(&self) -> Option<&str> {
+		Shell::version(self)
+	}
+
+	fn last_exit_status(&self) -> u8 {
+		Shell::last_exit_status(self)
+	}
+
+	fn set_last_exit_status(&mut self, status: u8) {
+		Shell::set_last_exit_status(self, status);
+	}
+
+	fn working_dir(&self) -> &Path {
+		Shell::working_dir(self)
+	}
+
+	fn working_dir_mut(&mut self) -> &mut PathBuf {
+		Shell::working_dir_mut(self)
+	}
+
+	fn product_display_str(&self) -> Option<&str> {
+		Shell::product_display_str(self)
 	}
 }

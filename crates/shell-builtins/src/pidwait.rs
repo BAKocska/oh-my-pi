@@ -34,7 +34,7 @@ mod tests {
 
 	async fn execute_bounded(
 		argv: Vec<String>,
-	) -> anyhow::Result<omp_shell_engine::ExecutionResult> {
+	) -> Result<omp_shell_engine::ExecutionResult, Box<dyn std::error::Error>> {
 		let mut shell = omp_shell_engine::Shell::builder().build().await?;
 		let params = shell.default_exec_params();
 		let command = PidwaitCommand { argv };
@@ -49,7 +49,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn exits_one_when_nothing_matches() -> anyhow::Result<()> {
+	async fn exits_one_when_nothing_matches() -> Result<(), Box<dyn std::error::Error>> {
 		let result = execute_bounded(vec!["-p".to_string(), i32::MAX.to_string()]).await?;
 
 		assert_eq!(u8::from(&result.exit_code), 1);
@@ -57,7 +57,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn already_exited_pid_returns_promptly() -> anyhow::Result<()> {
+	async fn already_exited_pid_returns_promptly() -> Result<(), Box<dyn std::error::Error>> {
 		#[cfg(unix)]
 		let mut child = ProcessCommand::new("sh").args(["-c", "exit 0"]).spawn()?;
 		#[cfg(windows)]

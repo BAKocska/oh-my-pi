@@ -11,9 +11,7 @@ description = "Append-only session transcripts and content-addressed blob storag
 [dependencies]
 cap-std = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 flume = { workspace = true }
-fs2 = { workspace = true }
 omp-core = { workspace = true }
 omp-ar = { workspace = true }
 omp-proto = { workspace = true }

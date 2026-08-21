@@ -45,7 +45,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	}
 }
 
-#[cached::proc_macro::cached(size = 64, result = true)]
+#[omp_macros::cached(size = 64, result = true)]
 fn parse_string_impl(
 	s: String,
 	parser_options: crate::parser::ParserOptions,

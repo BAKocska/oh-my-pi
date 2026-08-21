@@ -12,13 +12,12 @@ use std::{
 
 use flume::Sender;
 use futures::future::{BoxFuture, FutureExt as _};
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, SecretBox, Str, sf};
 use omp_llm_catalog::{
 	AuthSpecId, Catalog,
 	provider::{AuthSpecKind, OAuthFlowSpec},
 };
 use parking_lot::Mutex;
-use secrecy::{ExposeSecret as _, SecretBox};
 
 use super::{
 	AuthSpec, CredentialBroker, CredentialError, CredentialNeed, CredentialOrigin, CredentialSource,
@@ -1096,9 +1095,9 @@ mod tests {
 
 	use futures::future::{BoxFuture, FutureExt as _};
 	use http::HeaderMap;
+	use omp_core::{ExposeSecret as _, SecretString};
 	use omp_llm_catalog::{ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 	use parking_lot::Mutex;
-	use secrecy::{ExposeSecret as _, SecretString};
 
 	use super::{
 		AuthLoginEngine, AuthRefreshEngine, OAuthLoginEngine, StoredOAuthRefreshEngine, auth_method,

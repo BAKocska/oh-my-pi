@@ -1982,7 +1982,7 @@ fn empty_output_cap_detail(error: &pb::TurnError) -> String {
 }
 
 fn follow_up_id(_root: &TurnId, _ordinal: u32) -> TurnId {
-	TurnId::new(ulid::Ulid::generate().to_string())
+	TurnId::new(omp_core::Ulid::generate().to_string())
 }
 
 fn runtime_duration(duration: omp_core::Duration) -> Duration {
@@ -2160,7 +2160,7 @@ mod tests {
 		let path = std::env::temp_dir().join(format!(
 			"omp-agent-loop-{name}-{}-{}.jsonl",
 			std::process::id(),
-			ulid::Ulid::generate()
+			omp_core::Ulid::generate()
 		));
 		let journal = Journal::create(&path, &Header {
 			v:       4,
@@ -2251,7 +2251,7 @@ mod tests {
 		let path = std::env::temp_dir().join(format!(
 			"omp-agent-loop-allowlist-{}-{}.jsonl",
 			std::process::id(),
-			ulid::Ulid::generate()
+			omp_core::Ulid::generate()
 		));
 		let mut journal = Journal::create(&path, &Header {
 			v:       4,

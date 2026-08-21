@@ -98,7 +98,7 @@ const TOOL_NAME: &str = "p6_hang";
 fn assert_fixed_turn_ids() {
 	let ids = [ROOT_TURN, BATCH_TURN, FALLBACK_TURN, TOOLSET_TURN, RECEIPT_TURN, BINARY_SESSION];
 	for (index, id) in ids.iter().enumerate() {
-		assert!(id.parse::<ulid::Ulid>().is_ok(), "invalid fixed test TurnId {id}");
+		assert!(id.parse::<omp_core::Ulid>().is_ok(), "invalid fixed test TurnId {id}");
 		assert!(!ids[..index].contains(id), "duplicate fixed test TurnId {id}");
 	}
 }
@@ -584,7 +584,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 			 {screen}\nenvd:\n{envd_log}\njournal:\n{journal}"
 		);
 	}
-	assert!(pending_turn.parse::<ulid::Ulid>().is_ok(), "chat minted non-ULID TurnId");
+	assert!(pending_turn.parse::<omp_core::Ulid>().is_ok(), "chat minted non-ULID TurnId");
 	first.stop();
 	gateway
 		.release_response()

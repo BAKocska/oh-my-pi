@@ -5,7 +5,7 @@ use std::{
 };
 
 use flume::Receiver;
-use secrecy::{ExposeSecret as _, SecretString};
+use omp_core::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},

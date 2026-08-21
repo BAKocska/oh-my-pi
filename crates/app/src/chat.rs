@@ -21,12 +21,13 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
+use miette::IntoDiagnostic as _;
 use omp_agent::{
 	Agent, AgentKind, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget, CompletionError,
 	CompletionRequest, InProcTurnClient, Journal, RpcTurnClient, TurnClient, TurnId, TurnInput,
 	TurnOptions, TurnSession as _, WorkspaceInput, project_journal, resolve_completion,
 };
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, Str, sf};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{
 	Client, Registry as InferenceRegistry, ToolInputConstraint,
@@ -47,7 +48,6 @@ use omp_storage::{
 };
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
 use parking_lot::Mutex;
-use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
 use thiserror::Error;
 use xutf::IntoAnsiStripped as _;
@@ -150,8 +150,8 @@ pub enum ChatError {
 	#[error("eval session bridge failed: {0}")]
 	EvalBridge(Str),
 	/// The interactive terminal shell failed.
-	#[error("interactive chat shell failed")]
-	Ui(#[source] anyhow::Error),
+	#[error("interactive chat shell failed: {0}")]
+	Ui(miette::Report),
 	/// The platform cannot enforce the Phase 3 owner-local environment contract.
 	#[error("interactive chat requires Unix owner-local project authorities")]
 	UnsupportedPlatform,
@@ -281,7 +281,7 @@ async fn run_chat_login(
 	let provider = omp_llm_catalog::ProviderId::from(provider);
 	let planner = Router::new(registry.clone(), Duration::from_secs(30));
 	let meta = CallMeta {
-		id:       RequestId::from(format!("chat-auth-{}", ulid::Ulid::generate())),
+		id:       RequestId::from(format!("chat-auth-{}", omp_core::Ulid::generate())),
 		target:   Target::ProviderService(provider.clone()),
 		deadline: None,
 		budget:   ExecutionBudget::default(),
@@ -640,7 +640,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		let mut turn = self
 			.client
 			.turn(
-				TurnId::new(format!("eval-completion-{}", ulid::Ulid::generate())),
+				TurnId::new(format!("eval-completion-{}", omp_core::Ulid::generate())),
 				TurnInput::Full(Thread { items }),
 				&options,
 			)
@@ -730,7 +730,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		let id = args
 			.get("_id")
 			.and_then(Value::as_str)
-			.map_or_else(|| Str::from(ulid::Ulid::generate().to_string()), Str::from);
+			.map_or_else(|| Str::from(omp_core::Ulid::generate().to_string()), Str::from);
 		let directory = context.sessions_dir.join("eval-agents");
 		let (worktree_id, child_root, isolated_environment) = if isolated {
 			let created = self
@@ -879,7 +879,7 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 					bridge_message(Role::System, system_prompt.as_str()),
 					bridge_message(Role::User, prompt),
 				],
-				TurnId::new(format!("eval-agent-{}", ulid::Ulid::generate())),
+				TurnId::new(format!("eval-agent-{}", omp_core::Ulid::generate())),
 			)
 			.await
 		{
@@ -1221,10 +1221,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			auth.as_ref().map(|worker| &worker.ui),
 			data_dir.clone(),
 			Vec::new(),
-			|| {
-				resume_choices(scope.sessions_dir, scope.root, Some(&current_id))
-					.map_err(anyhow::Error::from)
-			},
+			|| resume_choices(scope.sessions_dir, scope.root, Some(&current_id)).into_diagnostic(),
 			matches!(start, ChatStart::SessionIndex),
 		)
 		.await
@@ -1389,7 +1386,7 @@ fn open_session(
 ) -> Result<Session, ChatError> {
 	let id = match resume {
 		Some(id) => strict_session_id(id)?,
-		None => Str::from(ulid::Ulid::generate().to_string()),
+		None => Str::from(omp_core::Ulid::generate().to_string()),
 	};
 	let path = sessions_dir.join(format!("{}.jsonl", id.as_str()));
 	let (journal, initial_items) = if resume.is_some() {
@@ -1618,7 +1615,7 @@ fn relative_time(modified: SystemTime) -> Str {
 fn strict_session_id(id: &Str) -> Result<Str, ChatError> {
 	let parsed = id
 		.as_str()
-		.parse::<ulid::Ulid>()
+		.parse::<omp_core::Ulid>()
 		.map_err(|_| ChatError::InvalidResume(id.clone()))?;
 	if parsed.to_string() != id.as_str() {
 		return Err(ChatError::InvalidResume(id.clone()));
@@ -1929,7 +1926,7 @@ mod tests {
 	}
 
 	fn write_session(sessions_dir: &Path, root: &Path, prompt: &str, title: Option<&str>) -> Str {
-		let id = Str::from(ulid::Ulid::generate().to_string());
+		let id = Str::from(omp_core::Ulid::generate().to_string());
 		let path = sessions_dir.join(format!("{id}.jsonl"));
 		let mut writer = Writer::create(&path, &Header {
 			v:       4,
@@ -2131,7 +2128,7 @@ mod tests {
 		std::fs::create_dir_all(&sessions_dir).expect("session directory");
 
 		// An eagerly created, immediately abandoned session: header only.
-		let empty_id = Str::from(ulid::Ulid::generate().to_string());
+		let empty_id = Str::from(omp_core::Ulid::generate().to_string());
 		let empty_path = sessions_dir.join(format!("{empty_id}.jsonl"));
 		drop(
 			Writer::create(&empty_path, &Header {

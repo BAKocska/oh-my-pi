@@ -14,9 +14,8 @@ use futures::{
 	future::{BoxFuture, Either, ready},
 };
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, SecretBox, SecretString, Str, sf};
 use omp_llm_catalog::{AuthSpecId, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
-use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -561,7 +560,7 @@ fn login_error(error: AlibabaTokenPlanLoginError) -> Error {
 #[cfg(test)]
 mod tests {
 	use futures::future::Either;
-	use secrecy::SecretString;
+	use omp_core::SecretString;
 
 	use super::*;
 

@@ -7,6 +7,47 @@
 //! `find` builtin ported from uutils findutils.
 
 pub mod matchers {
+	fn translate_basic_regex(pattern: &str) -> String {
+		let mut translated = String::with_capacity(pattern.len());
+		let mut chars = pattern.chars();
+		let mut in_class = false;
+		while let Some(ch) = chars.next() {
+			if in_class {
+				translated.push(ch);
+				if ch == '\\' {
+					if let Some(escaped) = chars.next() {
+						translated.push(escaped);
+					}
+				} else if ch == ']' {
+					in_class = false;
+				}
+				continue;
+			}
+
+			match ch {
+				'[' => {
+					in_class = true;
+					translated.push(ch);
+				},
+				'\\' => match chars.next() {
+					Some(operator @ ('(' | ')' | '{' | '}' | '+' | '?' | '|')) => {
+						translated.push(operator);
+					},
+					Some(escaped) => {
+						translated.push('\\');
+						translated.push(escaped);
+					},
+					None => translated.push('\\'),
+				},
+				literal @ ('(' | ')' | '{' | '}' | '+' | '?' | '|') => {
+					translated.push('\\');
+					translated.push(literal);
+				},
+				_ => translated.push(ch),
+			}
+		}
+		translated
+	}
 	// Copyright 2017 Google Inc.
 	//
 	// Use of this source code is governed by a MIT-style
@@ -20,7 +61,10 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use faccess::PathExt;
+		#[cfg(windows)]
+		use omp_shell_engine::sys::fs::PathExt;
+		#[cfg(unix)]
+		use rustix::fs::{Access, AtFlags, CWD, accessat};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
 
@@ -35,10 +79,30 @@ pub mod matchers {
 			fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
 				let path = file_info.path();
 
-				match self {
-					Self::Readable => path.readable(),
-					Self::Writable => path.writable(),
-					Self::Executable => path.executable(),
+				#[cfg(unix)]
+				{
+					let mode = match self {
+						Self::Readable => Access::READ_OK,
+						Self::Writable => Access::WRITE_OK,
+						Self::Executable => Access::EXEC_OK,
+					};
+					accessat(CWD, path, mode, AtFlags::EACCESS).is_ok()
+				}
+				#[cfg(windows)]
+				{
+					match self {
+						Self::Readable => path.readable(),
+						Self::Writable => path.writable(),
+						Self::Executable => path.executable(),
+					}
+				}
+				#[cfg(not(any(unix, windows)))]
+				{
+					match self {
+						Self::Readable => std::fs::File::open(path).is_ok(),
+						Self::Writable => std::fs::OpenOptions::new().write(true).open(path).is_ok(),
+						Self::Executable => path.is_file(),
+					}
 				}
 			}
 		}
@@ -809,12 +873,15 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use onig::{Regex, RegexOptions, Syntax};
+		use regex::{Regex, RegexBuilder};
+
+		use super::translate_basic_regex;
 
 		/// Parse a string as a POSIX Basic Regular Expression.
-		fn parse_bre(expr: &str, options: RegexOptions) -> Result<Regex, onig::Error> {
-			let bre = Syntax::posix_basic();
-			Regex::with_options(expr, bre.options() | options, bre)
+		fn parse_bre(expr: &str, caseless: bool) -> Result<Regex, regex::Error> {
+			RegexBuilder::new(&translate_basic_regex(expr))
+				.case_insensitive(caseless)
+				.build()
 		}
 
 		/// Push a literal character onto a regex, escaping it if necessary.
@@ -910,7 +977,7 @@ pub mod matchers {
 				next = chars.next();
 			}
 
-			if parse_bre(&expr, RegexOptions::REGEX_OPTION_NONE).is_ok() {
+			if parse_bre(&expr, false).is_ok() {
 				Some((expr, chars.as_str()))
 			} else {
 				None
@@ -954,14 +1021,8 @@ pub mod matchers {
 		impl Pattern {
 			/// Parse an fnmatch()-style glob.
 			pub fn new(pattern: &str, caseless: bool) -> Self {
-				let options = if caseless {
-					RegexOptions::REGEX_OPTION_IGNORECASE
-				} else {
-					RegexOptions::REGEX_OPTION_NONE
-				};
-
-				// As long as glob_to_regex() is correct, this should never fail
-				let regex = glob_to_regex(pattern).map(|r| parse_bre(&r, options).unwrap());
+				// As long as glob_to_regex() is correct, this should never fail.
+				let regex = glob_to_regex(pattern).map(|r| parse_bre(&r, caseless).unwrap());
 				Self { regex }
 			}
 
@@ -1482,7 +1543,7 @@ pub mod matchers {
 
 		use std::{fs::File, io::Write};
 
-		use chrono::DateTime;
+		use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
 
@@ -1637,8 +1698,9 @@ pub mod matchers {
 				let size = metadata.size();
 				let last_modified = {
 					let system_time = metadata.modified().unwrap();
-					let now_utc: DateTime<chrono::Utc> = system_time.into();
-					now_utc.format("%b %e %H:%M")
+					let timestamp = Timestamp::try_from(system_time).unwrap_or(Timestamp::UNIX_EPOCH);
+					strtime::format("%b %e %H:%M", &timestamp.to_zoned(TimeZone::UTC))
+						.unwrap_or_default()
 				};
 				let path = file_info.display_path().to_string_lossy();
 
@@ -1706,8 +1768,9 @@ pub mod matchers {
 				let size = metadata.file_size();
 				let last_modified = {
 					let system_time = metadata.modified().unwrap();
-					let now_utc: DateTime<chrono::Utc> = system_time.into();
-					now_utc.format("%b %e %H:%M")
+					let timestamp = Timestamp::try_from(system_time).unwrap_or(Timestamp::UNIX_EPOCH);
+					strtime::format("%b %e %H:%M", &timestamp.to_zoned(TimeZone::UTC))
+						.unwrap_or_default()
 				};
 				let path = file_info.display_path().to_string_lossy();
 
@@ -2064,7 +2127,7 @@ pub mod matchers {
 			time::SystemTime,
 		};
 
-		use chrono::{DateTime, Local, format::StrftimeItems};
+		use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
 		use super::{FileType, Matcher, MatcherIO, WalkEntry, WalkError};
 
@@ -2094,18 +2157,16 @@ pub mod matchers {
 						format!("{}.{:09}0", duration.as_secs(), duration.subsec_nanos())
 					},
 					Self::Ctime => {
-						const CTIME_FORMAT: &str = "%a %b %d %H:%M:%S.%f0 %Y";
-
-						DateTime::<Local>::from(time)
-							.format(CTIME_FORMAT)
-							.to_string()
+						let timestamp = Timestamp::try_from(time)?;
+						strtime::format(
+							"%a %b %d %H:%M:%S.%N0 %Y",
+							&timestamp.to_zoned(TimeZone::system()),
+						)?
 					},
 					Self::Strftime(format) => {
-						// Handle a special case
 						let custom_format = format.replace("%+", "%Y-%m-%d+%H:%M:%S%.f0");
-						DateTime::<Local>::from(time)
-							.format(&custom_format)
-							.to_string()
+						let timestamp = Timestamp::try_from(time)?;
+						strtime::format(&custom_format, &timestamp.to_zoned(TimeZone::system()))?
 					},
 				};
 
@@ -2270,17 +2331,18 @@ pub mod matchers {
 			fn parse_time_specifier(&mut self, first: char) -> Result<TimeFormat, Box<dyn Error>> {
 				match self.advance_one()? {
 					'@' => Ok(TimeFormat::SinceEpoch),
-					'S' => Ok(TimeFormat::Strftime("%S.%f0".to_string())),
+					'S' => Ok(TimeFormat::Strftime("%S.%N0".to_string())),
 					c => {
 						// We can't store the parsed items inside TimeFormat, because the items
 						// take a reference to the full format string, but we still try to parse
 						// it here so that errors get caught early.
 						let format = format!("%{c}");
-						match StrftimeItems::new(&format).next() {
-							None | Some(chrono::format::Item::Error) => {
-								Err(format!("Invalid time specifier: %{first}{c}").into())
-							},
-							Some(_item) => Ok(TimeFormat::Strftime(format)),
+						if strtime::format(&format, &Timestamp::now().to_zoned(TimeZone::system()))
+							.is_err()
+						{
+							Err(format!("Invalid time specifier: %{first}{c}").into())
+						} else {
+							Ok(TimeFormat::Strftime(format))
 						}
 					},
 				}
@@ -2728,9 +2790,9 @@ pub mod matchers {
 
 		use std::{error::Error, fmt, str::FromStr};
 
-		use onig::{Regex, RegexOptions, SearchOptions, Syntax};
+		use fancy_regex::Regex;
 
-		use super::{Matcher, MatcherIO, WalkEntry};
+		use super::{Matcher, MatcherIO, WalkEntry, translate_basic_regex};
 
 		#[derive(Debug)]
 		pub struct ParseRegexTypeError(String);
@@ -2803,23 +2865,15 @@ pub mod matchers {
 				pattern: &str,
 				ignore_case: bool,
 			) -> Result<Self, Box<dyn Error>> {
-				let syntax = match regex_type {
-					RegexType::Emacs => Syntax::emacs(),
-					RegexType::Grep => Syntax::grep(),
-					RegexType::PosixBasic => Syntax::posix_basic(),
-					RegexType::PosixExtended => Syntax::posix_extended(),
-				};
-
-				let regex = Regex::with_options(
-					pattern,
-					if ignore_case {
-						RegexOptions::REGEX_OPTION_IGNORECASE
-					} else {
-						RegexOptions::REGEX_OPTION_NONE
+				let translated = match regex_type {
+					RegexType::Emacs | RegexType::Grep | RegexType::PosixBasic => {
+						translate_basic_regex(pattern)
 					},
-					syntax,
-				)?;
-				Ok(Self { regex })
+					RegexType::PosixExtended => pattern.to_owned(),
+				};
+				let case = if ignore_case { "(?i)" } else { "" };
+				let anchored = format!(r"{case}\A(?:{translated})\z");
+				Ok(Self { regex: Regex::new(&anchored)? })
 			}
 		}
 
@@ -2830,15 +2884,7 @@ pub mod matchers {
 				// substring: anchor the match at the start of the path and
 				// require it to end at the end of the path (backtracking
 				// retries alternatives that stop short).
-				self
-					.regex
-					.match_with_options(
-						path.as_ref(),
-						0,
-						SearchOptions::SEARCH_OPTION_WHOLE_STRING,
-						None,
-					)
-					.is_some()
+				self.regex.is_match(path.as_ref()).unwrap_or(false)
 			}
 		}
 	}
@@ -3067,10 +3113,10 @@ pub mod matchers {
 			error::Error,
 			fs::{self, Metadata},
 			io::Write,
-			time::{Duration, SystemTime, UNIX_EPOCH},
+			time::{SystemTime, UNIX_EPOCH},
 		};
 
-		use chrono::{DateTime, Local, Timelike};
+		use jiff::{Timestamp, tz::TimeZone};
 
 		use super::{ComparableValue, Follow, Matcher, MatcherIO, WalkEntry};
 		use crate::host::Host;
@@ -3079,16 +3125,13 @@ pub mod matchers {
 
 		fn get_time(matcher_io: &mut MatcherIO, today_start: bool) -> SystemTime {
 			if today_start {
-				// the time at 00:00:00 of today
-				let duration_since_unix_epoch = matcher_io.now().duration_since(UNIX_EPOCH).unwrap();
-				let seconds_since_unix_epoch = duration_since_unix_epoch.as_secs();
-				let utc_time = DateTime::from_timestamp(seconds_since_unix_epoch as i64, 0).unwrap();
-				let local_time = utc_time.with_timezone(&Local);
-				let seconds_since_last_midnight = local_time.num_seconds_from_midnight();
-				let local_midnight_seconds =
-					local_time.timestamp() - seconds_since_last_midnight as i64;
-
-				UNIX_EPOCH + Duration::from_secs(local_midnight_seconds as u64)
+				let now = Timestamp::try_from(matcher_io.now()).unwrap_or_else(|_| Timestamp::now());
+				let time_zone = TimeZone::system();
+				let midnight = now.to_zoned(time_zone.clone()).date().at(0, 0, 0, 0);
+				time_zone
+					.to_zoned(midnight)
+					.map(|zoned| SystemTime::from(zoned.timestamp()))
+					.unwrap_or_else(|_| matcher_io.now())
 			} else {
 				matcher_io.now()
 			}
@@ -3655,9 +3698,9 @@ pub mod matchers {
 	};
 
 	use ::regex::Regex;
-	use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 	pub use entry::{FileType, WalkEntry, WalkError};
 	use fs::FileSystemMatcher;
+	use jiff::{Timestamp, civil::DateTime, fmt::strtime, tz::TimeZone};
 	use ls::Ls;
 
 	#[cfg(unix)]
@@ -3986,50 +4029,55 @@ pub mod matchers {
 			return Some((seconds * 1000.0) as i64);
 		}
 
-		if let Ok(datetime) = DateTime::parse_from_rfc3339(date_str) {
-			return Some(datetime.timestamp_millis());
+		if let Ok(timestamp) = date_str.parse::<Timestamp>() {
+			return Some(timestamp.as_millisecond());
 		}
 
-		let naive = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-			.ok()
-			.and_then(|date| date.and_hms_opt(0, 0, 0))
-			.or_else(|| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S").ok())
-			.or_else(|| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S").ok())
-			.or_else(|| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M").ok())
-			.or_else(|| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M").ok());
-		if let Some(naive) = naive {
-			return Some(
-				Local
-					.from_local_datetime(&naive)
-					.earliest()?
-					.timestamp_millis(),
-			);
+		let local = TimeZone::system();
+		let parse_local = |format: &str, value: &str| {
+			let broken = strtime::parse(format, value).ok()?;
+			let datetime = broken.to_datetime().ok()?;
+			local
+				.to_ambiguous_zoned(datetime)
+				.compatible()
+				.ok()
+				.map(|zoned| zoned.timestamp().as_millisecond())
+		};
+		for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"] {
+			if let Some(timestamp) = parse_local(format, date_str) {
+				return Some(timestamp);
+			}
+		}
+		if let Ok(date) = strtime::parse("%Y-%m-%d", date_str).and_then(|tm| tm.to_date()) {
+			let datetime = date.at(0, 0, 0, 0);
+			return local
+				.to_ambiguous_zoned(datetime)
+				.compatible()
+				.ok()
+				.map(|zoned| zoned.timestamp().as_millisecond());
 		}
 
 		let regex_pattern =
 			r"^(?P<month_day>\w{3} \d{2})?(?:, (?P<year>\d{4}))?(?: (?P<time>\d{2}:\d{2}:\d{2}))?$";
-		let re = Regex::new(regex_pattern);
-
-		if let Some(captures) = re.ok()?.captures(date_str) {
-			let now = Utc::now();
-			let month_day = captures
-				.get(1)
-				.map_or(format!("{} {}", now.format("%b"), now.format("%d")), |m| {
-					m.as_str().to_string()
-				});
-			// If no year input.
-			let year = captures
-				.get(2)
-				.map_or(now.year(), |m| m.as_str().parse().unwrap());
-			// If the user does not enter a specific time, it will be filled with 0
-			let time_str = captures.get(3).map_or("00:00:00", |m| m.as_str());
-			let date_time_str = format!("{month_day}, {year} {time_str}");
-			let datetime = NaiveDateTime::parse_from_str(&date_time_str, "%b %d, %Y %H:%M:%S").ok()?;
-			let utc_datetime = DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
-			Some(utc_datetime.timestamp_millis())
-		} else {
-			None
-		}
+		let captures = Regex::new(regex_pattern).ok()?.captures(date_str)?;
+		let now = Timestamp::now().to_zoned(TimeZone::UTC);
+		let default_month_day = strtime::format("%b %d", &now).ok()?;
+		let month_day = captures
+			.get(1)
+			.map_or(default_month_day.as_str(), |m| m.as_str());
+		let year = captures
+			.get(2)
+			.map_or_else(|| now.year().to_string(), |m| m.as_str().to_owned());
+		let time = captures.get(3).map_or("00:00:00", |m| m.as_str());
+		let input = format!("{month_day}, {year} {time}");
+		let datetime: DateTime = strtime::parse("%b %d, %Y %H:%M:%S", &input)
+			.ok()?
+			.to_datetime()
+			.ok()?;
+		TimeZone::UTC
+			.to_zoned(datetime)
+			.ok()
+			.map(|zoned| zoned.timestamp().as_millisecond())
 	}
 
 	/// This function implements the function of matching substrings of
@@ -5396,6 +5444,30 @@ mod tests {
 			run(&root, &[root.display().to_string(), "-regex".into(), r"c\.rs".into()]);
 		assert_eq!(code, 0, "stderr: {}", capture.err());
 		assert_eq!(capture.out(), "");
+	}
+
+	#[test]
+	fn regex_dialects_translate_their_alternation_and_group_syntax() {
+		let (_dir, root) = fixture();
+		for (dialect, pattern) in [
+			("emacs", r".*/\(a\.txt\|b\.md\)"),
+			("grep", r".*/\(a\.txt\|b\.md\)"),
+			("posix-basic", r".*/\(a\.txt\|b\.md\)"),
+			("posix-extended", r".*/(a\.txt|b\.md)"),
+		] {
+			let (code, capture) = run(&root, &[
+				root.display().to_string(),
+				"-regextype".into(),
+				dialect.into(),
+				"-regex".into(),
+				pattern.into(),
+			]);
+			assert_eq!(code, 0, "{dialect}: {}", capture.err());
+			assert_eq!(capture.err(), "", "{dialect}");
+			let mut matches = capture.out().lines().map(PathBuf::from).collect::<Vec<_>>();
+			matches.sort();
+			assert_eq!(matches, [root.join("a.txt"), root.join("b.md")], "{dialect}");
+		}
 	}
 
 	/// Failure mode: an alternation whose shorter branch matches a path prefix

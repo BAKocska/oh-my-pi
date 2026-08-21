@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use normalize_path::NormalizePath as _;
+use omp_core::NormalizePath as _;
 
 use crate::{
 	ExecutionParameters, ShellFd,

@@ -15,14 +15,16 @@ use std::{
 	time::Duration,
 };
 
-use anyhow::{Context as _, Result, anyhow, ensure};
 use bytes::Bytes;
 use omp_agent::{Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnId};
 use omp_app::envd::docs::{DocumentHost, DocumentLease};
 use omp_core::{Str, sf};
-use omp_e2e::support::{
-	DocServerTask, EnvHarness, Gate, Scratch, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
-	accepted_event, outcome_event, tool_call_item, turn_event, user_item, within,
+use omp_e2e::{
+	Context as _, Error, Result, error,
+	support::{
+		DocServerTask, EnvHarness, Gate, Scratch, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
+		accepted_event, outcome_event, tool_call_item, turn_event, user_item, within,
+	},
 };
 use omp_env::{EnvClient, InvocationEvent};
 use omp_hashline::compute_snapshot_tag;
@@ -36,6 +38,14 @@ use omp_tool::{
 use omp_tools::edit::{self, FormatPolicy};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
+
+macro_rules! ensure {
+	($condition:expr, $($message:tt)*) => {
+		if !$condition {
+			return Err(error(format!($($message)*)));
+		}
+	};
+}
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const STORM_COUNT: usize = 100;
@@ -121,7 +131,7 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 		let (mut agent_b, events_b) =
 			agent(b_client.clone(), env_b, Arc::clone(&registry), &scratch, "agent-b")?;
 
-		let a1_turn = TurnId::new(ulid::Ulid::generate().to_string());
+		let a1_turn = TurnId::new(omp_core::Ulid::generate().to_string());
 		agent_a
 			.submit([user_item("A: publish revision two")], a1_turn)
 			.await?;
@@ -129,7 +139,7 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 		let a1_bytes = REVISION_TWO;
 		ensure!(scratch.read("f.rs")? == a1_bytes, "A revision two was not durable");
 
-		let b1_turn = TurnId::new(ulid::Ulid::generate().to_string());
+		let b1_turn = TurnId::new(omp_core::Ulid::generate().to_string());
 		agent_b
 			.submit([user_item("B: publish revision three")], b1_turn)
 			.await?;
@@ -137,7 +147,7 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 		let b_bytes = b"fn main() { // agent B\n    let VALUE = 2;\n}\n";
 		ensure!(scratch.read("f.rs")? == b_bytes, "B revision three was not durable");
 
-		let a2_turn = TurnId::new(ulid::Ulid::generate().to_string());
+		let a2_turn = TurnId::new(omp_core::Ulid::generate().to_string());
 		agent_a
 			.submit([user_item("A: edit again from my revision-two view")], a2_turn)
 			.await?;
@@ -244,7 +254,7 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 	.await??;
 	match within("accepting snapshot read", TEST_TIMEOUT, invocation.next_event()).await?? {
 		Some(InvocationEvent::Accepted(_)) => {},
-		other => return Err(anyhow!("snapshot read was not accepted: {other:?}")),
+		other => return Err(error(format!("snapshot read was not accepted: {other:?}"))),
 	}
 	within(
 		"committing snapshot read",
@@ -268,19 +278,21 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 				let outcome: CallOutcome<serde_json::Value, serde_json::Value> =
 					serde_json::from_slice(&verdict.json)?;
 				let CallOutcome::Ok(payload) = outcome else {
-					return Err(anyhow!("snapshot read returned a non-success outcome"));
+					return Err(error(format!("snapshot read returned a non-success outcome")));
 				};
 				let header = payload["parts"][0]["text"]
 					.as_str()
 					.and_then(|text| text.lines().next())
-					.ok_or_else(|| anyhow!("snapshot read omitted its hashline header"))?;
+					.ok_or_else(|| error(format!("snapshot read omitted its hashline header")))?;
 				let body = header
 					.strip_prefix('[')
 					.and_then(|header| header.strip_suffix(']'))
-					.ok_or_else(|| anyhow!("snapshot read returned malformed header {header:?}"))?;
-				let (_, tag) = body
-					.rsplit_once('#')
-					.ok_or_else(|| anyhow!("snapshot read returned untagged header {header:?}"))?;
+					.ok_or_else(|| {
+						error(format!("snapshot read returned malformed header {header:?}"))
+					})?;
+				let (_, tag) = body.rsplit_once('#').ok_or_else(|| {
+					error(format!("snapshot read returned untagged header {header:?}"))
+				})?;
 				ensure!(
 					tag.len() == 4 && tag.bytes().all(|byte| byte.is_ascii_hexdigit()),
 					"snapshot read returned invalid tag {tag:?}"
@@ -289,12 +301,12 @@ async fn read_snapshot_tag(client: &EnvClient, path: &str) -> Result<Str> {
 			},
 			Some(InvocationEvent::Update(_)) => {},
 			Some(InvocationEvent::Accepted(_)) => {
-				return Err(anyhow!("snapshot read was accepted twice"));
+				return Err(error(format!("snapshot read was accepted twice")));
 			},
 			Some(InvocationEvent::Admission(_)) => {
-				return Err(anyhow!("unexpected admission query during snapshot read"));
+				return Err(error(format!("unexpected admission query during snapshot read")));
 			},
-			None => return Err(anyhow!("snapshot read closed before its verdict")),
+			None => return Err(error(format!("snapshot read closed before its verdict"))),
 		}
 	}
 }
@@ -365,14 +377,14 @@ async fn next_edit_payload(
 				continue;
 			}
 			let Some(thread::item::Kind::ToolResult(result)) = item.kind.as_ref() else {
-				return Err(anyhow!("ToolFinished did not carry ToolResult"));
+				return Err(error(format!("ToolFinished did not carry ToolResult")));
 			};
 			let details = result
 				.details
 				.as_ref()
-				.ok_or_else(|| anyhow!("missing edit outcome"))?;
+				.ok_or_else(|| error(format!("missing edit outcome")))?;
 			let outcome: CallOutcome<edit::Payload, edit::Fault> = serde_json::from_value(
-				proto_json(details).ok_or_else(|| anyhow!("invalid edit outcome"))?,
+				proto_json(details).ok_or_else(|| error(format!("invalid edit outcome")))?,
 			)?;
 			match outcome {
 				CallOutcome::Ok(mut payload) => {
@@ -385,7 +397,7 @@ async fn next_edit_payload(
 						.pop()
 						.expect("verified single edit section"));
 				},
-				other => return Err(anyhow!("edit did not commit: {other:?}")),
+				other => return Err(error(format!("edit did not commit: {other:?}"))),
 			}
 		}
 	})
@@ -421,7 +433,7 @@ fn revision_sequence(revision: &Str) -> Result<u64> {
 	revision
 		.as_str()
 		.split_once(':')
-		.ok_or_else(|| anyhow!("revision identity omitted sequence"))?
+		.ok_or_else(|| error(format!("revision identity omitted sequence")))?
 		.0
 		.parse()
 		.context("parse revision sequence")
@@ -431,7 +443,7 @@ fn committed_revision(section: &edit::SectionPayload) -> Result<&Str> {
 	section
 		.new_revision
 		.as_ref()
-		.ok_or_else(|| anyhow!("race edit unexpectedly deleted its document"))
+		.ok_or_else(|| error(format!("race edit unexpectedly deleted its document")))
 }
 
 async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> Result<()> {
@@ -457,7 +469,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 		.head()
 		.revision
 		.as_ref()
-		.ok_or_else(|| anyhow!("storm base omitted revision"))?
+		.ok_or_else(|| error(format!("storm base omitted revision")))?
 		.sequence;
 	ensure!(
 		leases.iter().all(|lease| lease
@@ -502,7 +514,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 				}
 				tokio::task::yield_now().await;
 			}
-			Ok::<_, anyhow::Error>(lease)
+			Ok::<_, Error>(lease)
 		}));
 	}
 
@@ -551,14 +563,14 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 						.operations
 						.into_iter()
 						.next()
-						.ok_or_else(|| anyhow!("committed storm op omitted result"))?;
+						.ok_or_else(|| error(format!("committed storm op omitted result")))?;
 					let rebased = operation.rebased;
 					let sequence = operation
 						.head
 						.and_then(|head| head.revision)
-						.ok_or_else(|| anyhow!("committed storm op omitted revision"))?
+						.ok_or_else(|| error(format!("committed storm op omitted revision")))?
 						.sequence;
-					Ok::<_, anyhow::Error>(Some(CommitRecord {
+					Ok::<_, Error>(Some(CommitRecord {
 						sequence,
 						start,
 						end,
@@ -579,9 +591,9 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 					Ok(None)
 				},
 				Some(document::commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
-					Err(anyhow!("single-operation storm partially committed: {partial:?}"))
+					Err(error(format!("single-operation storm partially committed: {partial:?}")))
 				},
-				None => Err(anyhow!("storm transaction omitted outcome")),
+				None => Err(error(format!("storm transaction omitted outcome"))),
 			}
 		}));
 	}
@@ -646,7 +658,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 		.head()
 		.revision
 		.as_ref()
-		.ok_or_else(|| anyhow!("final storm head omitted revision"))?
+		.ok_or_else(|| error(format!("final storm head omitted revision")))?
 		.sequence;
 	ensure!(
 		final_head == committed.last().expect("nonempty commits").sequence,
@@ -686,7 +698,7 @@ async fn read_whole(host: &DocumentHost, lease: &DocumentLease) -> Result<Bytes>
 		.await?;
 	match response.body {
 		Some(document::read_document_response::Body::Content(bytes)) => Ok(bytes),
-		_ => Err(anyhow!("whole read returned slices or no body")),
+		_ => Err(error(format!("whole read returned slices or no body"))),
 	}
 }
 
@@ -695,7 +707,7 @@ fn file_uri(scratch: &Scratch, relative: &str) -> Result<String> {
 		fs::canonicalize(scratch.project().join(relative)).context("canonicalize fixture path")?;
 	url::Url::from_file_path(path)
 		.map(String::from)
-		.map_err(|()| anyhow!("fixture path is not an absolute file URI"))
+		.map_err(|()| error(format!("fixture path is not an absolute file URI")))
 }
 
 fn install_lsp_fixture(scratch: &Scratch, log: &Path) -> Result<PathBuf> {
@@ -737,7 +749,7 @@ async fn wait_lsp_kind(path: &Path, uri: &str, kind: &str, minimum: usize) -> Re
 				.filter(|record| record.kind == kind && (uri.is_empty() || record.uri == uri))
 				.count() >= minimum
 			{
-				return Ok::<_, anyhow::Error>(());
+				return Ok::<_, Error>(());
 			}
 			tokio::time::sleep(Duration::from_millis(10)).await;
 		}

@@ -2,13 +2,13 @@
 
 use std::{borrow::Cow, cell::RefCell};
 
-use cached::Cached;
+use omp_core::cache::MemoCache;
 
 use crate::error;
 
 thread_local! {
-	 static REGEX_CACHE: RefCell<cached::SizedCache<(String, bool, bool), fancy_regex::Regex>> =
-		  RefCell::new(cached::SizedCache::with_size(64));
+	static REGEX_CACHE: RefCell<MemoCache<(String, bool, bool), fancy_regex::Regex>> =
+		RefCell::new(MemoCache::new(64));
 }
 
 /// Represents a piece of a regular expression.
@@ -99,7 +99,7 @@ pub(crate) fn compile_regex(
 	// Move regex_str into the key to avoid cloning on cache-hit path.
 	let key = (regex_str, case_insensitive, multiline);
 
-	let cached_regex = REGEX_CACHE.with(|cache| cache.borrow_mut().cache_get(&key).cloned());
+	let cached_regex = REGEX_CACHE.with(|cache| cache.borrow_mut().get_cloned(&key));
 	if let Some(re) = cached_regex {
 		return Ok(re);
 	}
@@ -129,7 +129,7 @@ pub(crate) fn compile_regex(
 	drop(regex_str);
 
 	REGEX_CACHE.with(|cache| {
-		cache.borrow_mut().cache_set(key, re.clone());
+		cache.borrow_mut().insert(key, re.clone());
 	});
 
 	Ok(re)

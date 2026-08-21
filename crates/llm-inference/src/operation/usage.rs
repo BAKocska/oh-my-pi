@@ -24,8 +24,7 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use omp_core::{Str, sf};
-use secrecy::SecretString;
+use omp_core::{SecretString, Str, sf};
 use tower::Service;
 
 use crate::{

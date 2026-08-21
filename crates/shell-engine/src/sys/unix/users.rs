@@ -1,39 +1,34 @@
+#[cfg(not(target_vendor = "apple"))]
+use std::ffi::CString;
 use std::path::PathBuf;
 
-use uzers::os::unix::UserExt;
+use nix::unistd::{Gid, Group, Uid, User};
 
-use crate::{error, trace_categories};
+use crate::error;
 
 pub(crate) fn is_root() -> bool {
-	uzers::get_current_uid() == 0
+	Uid::current().is_root()
 }
 
 pub(crate) fn get_user_home_dir(username: &str) -> Option<PathBuf> {
-	if let Some(user_info) = uzers::get_user_by_name(username) {
-		return Some(user_info.home_dir().to_path_buf());
-	}
-
-	None
+	User::from_name(username)
+		.ok()
+		.flatten()
+		.map(|user| user.dir)
 }
 
 pub(crate) fn get_current_user_home_dir() -> Option<PathBuf> {
-	if let Some(username) = uzers::get_current_username()
-		&& let Some(user_info) = uzers::get_user_by_name(&username)
-	{
-		return Some(user_info.home_dir().to_path_buf());
-	}
-
-	None
+	User::from_uid(Uid::current())
+		.ok()
+		.flatten()
+		.map(|user| user.dir)
 }
 
 pub(crate) fn get_current_user_default_shell() -> Option<PathBuf> {
-	if let Some(username) = uzers::get_current_username()
-		&& let Some(user_info) = uzers::get_user_by_name(&username)
-	{
-		return Some(user_info.shell().to_path_buf());
-	}
-
-	None
+	User::from_uid(Uid::current())
+		.ok()
+		.flatten()
+		.map(|user| user.shell)
 }
 
 #[expect(
@@ -41,7 +36,7 @@ pub(crate) fn get_current_user_default_shell() -> Option<PathBuf> {
 	reason = "the cross-platform interface returns fallible identity values"
 )]
 pub(crate) fn get_current_uid() -> Result<u32, error::Error> {
-	Ok(uzers::get_current_uid())
+	Ok(Uid::current().as_raw())
 }
 
 #[expect(
@@ -49,7 +44,7 @@ pub(crate) fn get_current_uid() -> Result<u32, error::Error> {
 	reason = "the cross-platform interface returns fallible identity values"
 )]
 pub(crate) fn get_current_gid() -> Result<u32, error::Error> {
-	Ok(uzers::get_current_gid())
+	Ok(Gid::current().as_raw())
 }
 
 #[expect(
@@ -57,7 +52,7 @@ pub(crate) fn get_current_gid() -> Result<u32, error::Error> {
 	reason = "the cross-platform interface returns fallible identity values"
 )]
 pub(crate) fn get_effective_uid() -> Result<u32, error::Error> {
-	Ok(uzers::get_effective_uid())
+	Ok(Uid::effective().as_raw())
 }
 
 #[expect(
@@ -65,39 +60,60 @@ pub(crate) fn get_effective_uid() -> Result<u32, error::Error> {
 	reason = "the cross-platform interface returns fallible identity values"
 )]
 pub(crate) fn get_effective_gid() -> Result<u32, error::Error> {
-	Ok(uzers::get_effective_gid())
+	Ok(Gid::effective().as_raw())
 }
 
 pub(crate) fn get_current_username() -> Result<String, error::Error> {
-	let username = uzers::get_current_username().ok_or_else(|| error::ErrorKind::NoCurrentUser)?;
-	Ok(username.to_string_lossy().to_string())
+	User::from_uid(Uid::current())?
+		.map(|user| user.name)
+		.ok_or_else(|| error::ErrorKind::NoCurrentUser.into())
 }
 
 pub(crate) fn get_user_group_ids() -> Result<Vec<u32>, error::Error> {
-	let groups = get_current_user_groups()?;
-	Ok(groups.into_iter().map(|g| g.gid()).collect())
+	Ok(get_current_user_groups()?
+		.into_iter()
+		.map(Gid::as_raw)
+		.collect())
 }
 
 pub(crate) fn get_all_users() -> Result<Vec<String>, error::Error> {
-	// TODO(#475): uzers::all_users() is available but unsafe; for now we just
-	// return the current user. That's better than nothing.
-	let user = get_current_username()?;
-	Ok(vec![user])
+	// Keep the prior deliberately bounded behavior: completion exposes the current
+	// account rather than traversing the process-global passwd iterator.
+	Ok(vec![get_current_username()?])
 }
 
 pub(crate) fn get_all_groups() -> Result<Vec<String>, error::Error> {
-	// TODO(#475): uzers::all_groups() is available but unsafe; for now we just
-	// return the current user's groups. That's better than nothing.
-	let groups = get_current_user_groups()?;
-	let group_names = groups
+	Ok(get_current_user_groups()?
 		.into_iter()
-		.map(|g| g.name().to_string_lossy().to_string());
-	Ok(group_names.collect())
+		.filter_map(|gid| Group::from_gid(gid).ok().flatten().map(|group| group.name))
+		.collect())
 }
 
-fn get_current_user_groups() -> Result<Vec<uzers::Group>, error::Error> {
-	let username = uzers::get_current_username().ok_or_else(|| error::ErrorKind::NoCurrentUser)?;
-	let gid = uzers::get_current_gid();
-	let groups = uzers::get_user_groups(&username, gid).unwrap_or_default();
+#[cfg(not(target_vendor = "apple"))]
+fn get_current_user_groups() -> Result<Vec<Gid>, error::Error> {
+	let username =
+		CString::new(get_current_username()?).map_err(|_| error::ErrorKind::NoCurrentUser)?;
+	Ok(nix::unistd::getgrouplist(&username, Gid::current()).unwrap_or_default())
+}
+
+#[cfg(target_vendor = "apple")]
+fn get_current_user_groups() -> Result<Vec<Gid>, error::Error> {
+	let primary = Gid::current();
+	// SAFETY: a null buffer with zero length is the documented sizing query.
+	let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+	if count < 0 {
+		return Err(std::io::Error::last_os_error().into());
+	}
+	let mut raw_groups = vec![0 as libc::gid_t; count as usize];
+	// SAFETY: `raw_groups` contains `count` writable gid_t slots.
+	let filled = unsafe { libc::getgroups(count, raw_groups.as_mut_ptr()) };
+	if filled < 0 {
+		return Err(std::io::Error::last_os_error().into());
+	}
+	raw_groups.truncate(filled as usize);
+	let mut groups: Vec<Gid> = raw_groups.into_iter().map(Gid::from_raw).collect();
+	if !groups.contains(&primary) {
+		groups.push(primary);
+	}
 	Ok(groups)
 }

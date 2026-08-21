@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, hash::BuildHasher};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use omp_core::base64;
 use serde_json::{Map, Value, json};
 
 /// Maximum size of one physical Content-Length payload.
@@ -267,7 +267,7 @@ fn encode_json_v2_payload(value: &Value, sequence_id: &str) -> Result<Vec<Vec<u8
 				"index": index,
 				"count": count,
 				"byteLength": payload.len(),
-				"data": BASE64.encode(chunk),
+				"data": base64::encode(chunk).into_string(),
 			});
 			encode_content_length(&serde_json::to_vec(&envelope)?)
 		})
@@ -337,8 +337,8 @@ impl RpcFrameDecoder {
 		if encoded.is_empty() {
 			return Err(FramingError::InvalidChunk("empty chunk data"));
 		}
-		let chunk = BASE64
-			.decode(encoded)
+		let chunk = base64::decode(encoded)
+			.into_vec()
 			.map_err(|_| FramingError::InvalidChunk("invalid base64 data"))?;
 		if chunk.len() > RPC_CHUNK_BYTES {
 			return Err(FramingError::InvalidChunk("chunk exceeds raw chunk limit"));
@@ -601,7 +601,7 @@ mod tests {
 			"index":1,
 			"count":2,
 			"byteLength":MAX_FRAME_BYTES,
-			"data":BASE64.encode(b"x"),
+			"data":base64::encode(b"x").into_string(),
 		});
 		let mut decoder = RpcFrameDecoder::new();
 		assert!(matches!(

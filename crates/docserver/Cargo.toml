@@ -12,10 +12,8 @@ description = "Local document authority for filesystem, revision, transaction, w
 async-trait = { workspace = true }
 bytes = { workspace = true }
 cap-std = { workspace = true }
-filetime = { workspace = true }
 flume = { workspace = true }
-fs2 = { workspace = true }
-globset = { workspace = true }
+omp-walker = { workspace = true }
 notify = { workspace = true }
 omp-ast = { workspace = true }
 omp-core = { workspace = true }

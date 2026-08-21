@@ -11,8 +11,7 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{IntoStr, Str, parse_rfc3339, sf};
-use secrecy::{ExposeSecret as _, SecretString};
+use omp_core::{ExposeSecret as _, IntoStr, SecretString, Str, parse_rfc3339, sf};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
@@ -616,8 +615,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
+	use omp_core::SecretString;
 	use parking_lot::Mutex;
-	use secrecy::SecretString;
 
 	use super::{ANTHROPIC_BETA, fetch_claude_usage, normalize_claude_base_url};
 	use crate::{

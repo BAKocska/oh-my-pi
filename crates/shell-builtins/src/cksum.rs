@@ -14,12 +14,12 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches, Command, ValueHint, builder::ValueParser};
 use omp_core::encoding::hex::decode;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use os_display::Quotable;
 use uucore::{
 	checksum::{
 		AlgoKind, BlakeLength, ChecksumError, ReadingMode, SUPPORTED_ALGORITHMS, ShaLength,
 		SizedAlgoKind, digest_reader, escape_filename, parse_blake_length, unescape_filename,
 	},
+	display::Quotable,
 	hardware::{HasHardwareFeatures as _, SimdPolicy},
 	line_ending::LineEnding,
 	os_str_from_bytes,

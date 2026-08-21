@@ -18,7 +18,6 @@ use std::{
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, error::ErrorKind};
-use fs_extra::dir::get_size as dir_get_size;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use parking_lot::Mutex;
@@ -1128,6 +1127,26 @@ fn rename_fifo_fallback(_host: &mut Host, _from: &Path, _to: &Path) -> io::Resul
 	Ok(())
 }
 
+fn recursive_size(path: impl AsRef<Path>) -> io::Result<u64> {
+	let path = path.as_ref();
+	let metadata = path.symlink_metadata()?;
+	if !metadata.is_dir() {
+		return Ok(metadata.len());
+	}
+
+	let mut size = 0u64;
+	for entry in fs::read_dir(path)? {
+		let entry = entry?;
+		let metadata = entry.metadata()?;
+		size = size.saturating_add(if metadata.is_dir() {
+			recursive_size(entry.path())?
+		} else {
+			metadata.len()
+		});
+	}
+	Ok(size)
+}
+
 /// Move the given symlink to the given destination. On Windows, dangling
 /// symlinks return an error.
 #[cfg(unix)]
@@ -1189,7 +1208,7 @@ fn rename_dir_fallback(
 	//    If finding the total size fails for whatever reason,
 	//    the progress bar wont be shown for this file / dir.
 	//    (Move will probably fail due to permission error later?)
-	let total_size = dir_get_size(host.resolve(from)).ok();
+	let total_size = recursive_size(host.resolve(from)).ok();
 
 	let progress_bar = match (display_manager, total_size) {
 		(Some(display_manager), Some(total_size)) => {

@@ -3,8 +3,7 @@
 //! Foreign records are deliberately parsed line-by-line: damaged records become
 //! diagnostics while later complete records retain their source line identity.
 
-use chrono::{DateTime, Utc};
-use omp_core::{Str, sf};
+use omp_core::{Str, sf, time::parse_rfc3339};
 use serde_json::Value;
 
 use super::{
@@ -373,12 +372,9 @@ fn extract_text(content: Option<&Value>) -> Vec<Str> {
 fn parse_timestamp(value: Option<&Value>) -> Option<u64> {
 	match value? {
 		Value::Number(number) => number.as_u64(),
-		Value::String(value) => DateTime::parse_from_rfc3339(value)
-			.ok()?
-			.with_timezone(&Utc)
-			.timestamp_millis()
-			.try_into()
-			.ok(),
+		Value::String(value) => parse_rfc3339(value)
+			.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+			.and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
 		_ => None,
 	}
 }

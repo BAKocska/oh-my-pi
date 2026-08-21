@@ -5,8 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use globset::{Glob, GlobMatcher};
 use omp_core::{Str, sf};
+use omp_walker::glob::{CompiledPattern, PatternBuilder};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -437,7 +437,7 @@ impl SelectorFilter {
 
 #[derive(Debug)]
 struct SelectorPattern {
-	matcher:  GlobMatcher,
+	matcher:  CompiledPattern,
 	base_uri: Option<Url>,
 }
 
@@ -474,9 +474,10 @@ impl SelectorPattern {
 				});
 			},
 		};
-		let matcher = Glob::new(pattern)
-			.map_err(|error| LspError::InvalidRegistration { reason: Str::new(error.to_string()) })?
-			.compile_matcher();
+		let matcher = PatternBuilder::new(pattern)
+			.literal_separator(false)
+			.build()
+			.map_err(|error| LspError::InvalidRegistration { reason: Str::new(error.to_string()) })?;
 		Ok(Self { matcher, base_uri })
 	}
 
@@ -496,14 +497,14 @@ impl SelectorPattern {
 			if !relative.is_empty() && !base.path().ends_with('/') && !relative.starts_with('/') {
 				return false;
 			}
-			return self.matcher.is_match(relative.trim_start_matches('/'));
+			return self.matcher.matches(relative.trim_start_matches('/'));
 		}
-		self.matcher.is_match(uri.as_str())
-			|| self.matcher.is_match(uri.path())
-			|| self.matcher.is_match(uri.path().trim_start_matches('/'))
+		self.matcher.matches(uri.as_str())
+			|| self.matcher.matches(uri.path())
+			|| self.matcher.matches(uri.path().trim_start_matches('/'))
 			|| uri
 				.to_file_path()
-				.is_ok_and(|path| self.matcher.is_match(path))
+				.is_ok_and(|path| self.matcher.matches_path(&path))
 	}
 }
 

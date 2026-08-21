@@ -8,13 +8,12 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 
-use omp_core::{Str, sf};
+use omp_core::{ExposeSecret as _, Str, sf};
 use omp_llm_catalog::{
 	OperationBits, OperationKind,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
 	snapshot::Catalog,
 };
-use secrecy::ExposeSecret as _;
 use tower::{Service, util::BoxCloneSyncService};
 
 use crate::{
@@ -1368,8 +1367,8 @@ fn session_trust_error(context: &ExecutionContext) -> Error {
 mod tests {
 	use bytes::Bytes;
 	use http::{Request, header::AUTHORIZATION};
+	use omp_core::SecretString;
 	use omp_llm_catalog::{ModelKey, PolicyModel, ProviderId, WireTarget};
-	use secrecy::SecretString;
 
 	use super::*;
 	use crate::{

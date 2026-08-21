@@ -6,9 +6,9 @@ use ast_grep_core::{
 	source::Edit,
 	tree_sitter::LanguageExt,
 };
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use omp_core::Str;
+use omp_walker::glob::CompiledGlobSet;
 use smallvec::SmallVec;
 
 use crate::{AstError, Result, language::SupportLang};
@@ -398,7 +398,7 @@ pub fn collect_matched_files(
 		} else {
 			Str::new(relative_path.as_ref())
 		};
-		if globset.is_match(relative_path.as_str())
+		if globset.matches(relative_path.as_str())
 			|| patterns
 				.iter()
 				.any(|pattern| pattern == relative_path.as_str())
@@ -410,20 +410,13 @@ pub fn collect_matched_files(
 	Ok(files)
 }
 
-fn build_globset(patterns: &[String]) -> Result<GlobSet, std::io::Error> {
-	let mut builder = GlobSetBuilder::new();
-	for pattern in patterns {
-		if has_glob_syntax(pattern) {
-			let glob = Glob::new(pattern).map_err(|error| {
-				std::io::Error::new(
-					std::io::ErrorKind::InvalidInput,
-					format!("invalid glob `{pattern}`: {error}"),
-				)
-			})?;
-			builder.add(glob);
-		}
-	}
-	builder.build().map_err(std::io::Error::other)
+fn build_globset(patterns: &[String]) -> Result<CompiledGlobSet, std::io::Error> {
+	let globby = patterns
+		.iter()
+		.filter(|pattern| has_glob_syntax(pattern))
+		.map(String::as_str);
+	CompiledGlobSet::new(globby)
+		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 /// Reports whether a path pattern contains supported glob syntax.

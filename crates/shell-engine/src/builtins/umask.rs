@@ -1,6 +1,5 @@
 use std::io::Write;
 
-use cfg_if::cfg_if;
 use clap::Parser;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use nix::sys::stat::Mode;
@@ -61,24 +60,25 @@ impl builtins::Command for UmaskCommand {
 	}
 }
 
-cfg_if! {
-	 if #[cfg(any(target_os = "linux", target_os = "android"))] {
-		  fn get_umask() -> Result<u32, crate::Error> {
-				let status = std::fs::read_to_string("/proc/self/status")?;
-				status
-					 .lines()
-					 .find_map(|line| line.strip_prefix("Umask:"))
-					 .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
-					 .ok_or_else(|| crate::ErrorKind::InvalidUmask.into())
-		  }
-	 } else {
-		  #[expect(clippy::unnecessary_wraps, reason = "platform-specific implementations share a fallible API")]
-		  fn get_umask() -> Result<u32, crate::Error> {
-				let u = nix::sys::stat::umask(Mode::empty());
-				nix::sys::stat::umask(u);
-				Ok(u32::from(u.bits()))
-		  }
-	 }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_umask() -> Result<u32, crate::Error> {
+	let status = std::fs::read_to_string("/proc/self/status")?;
+	status
+		.lines()
+		.find_map(|line| line.strip_prefix("Umask:"))
+		.and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+		.ok_or_else(|| crate::ErrorKind::InvalidUmask.into())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[expect(
+	clippy::unnecessary_wraps,
+	reason = "platform-specific implementations share a fallible API"
+)]
+fn get_umask() -> Result<u32, crate::Error> {
+	let u = nix::sys::stat::umask(Mode::empty());
+	nix::sys::stat::umask(u);
+	Ok(u32::from(u.bits()))
 }
 
 fn parse_symbolic_umask(

@@ -2,13 +2,9 @@
 //!
 //! Ported from uutils coreutils 0.8.0.
 
-#[cfg(not(any(target_os = "freebsd", target_os = "openbsd")))]
-use std::net::ToSocketAddrs;
-use std::{collections::hash_set::HashSet, ffi::OsString, io::Write};
+use std::{collections::hash_set::HashSet, ffi::OsString, io::Write, net::ToSocketAddrs};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
-#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-use dns_lookup::lookup_host;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 
 use crate::host::{Host, Utility, format_usage, matches_parser, util};
@@ -128,8 +124,33 @@ fn app() -> Command {
 		)
 }
 
+#[cfg(unix)]
+fn current_hostname() -> std::io::Result<OsString> {
+	nix::unistd::gethostname().map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn current_hostname() -> std::io::Result<OsString> {
+	use std::os::windows::ffi::OsStringExt;
+
+	use windows_sys::Win32::System::SystemInformation::GetComputerNameW;
+
+	let mut buffer = [0u16; 256];
+	let mut len = buffer.len() as u32;
+	if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut len) } == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(OsString::from_wide(&buffer[..len as usize]))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_hostname() -> std::io::Result<OsString> {
+	std::env::var_os("HOSTNAME")
+		.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOSTNAME is not set"))
+}
+
 fn display_hostname(matches: &ArgMatches, host: &mut Host) -> Result<(), String> {
-	let hostname = hostname::get()
+	let hostname = current_hostname()
 		.map_err(|err| format!("failed to get hostname: {err}"))?
 		.to_string_lossy()
 		.into_owned();
@@ -145,12 +166,12 @@ fn display_hostname(matches: &ArgMatches, host: &mut Host) -> Result<(), String>
 				.map_err(|err| format!("failed to resolve socket addresses: {err}"))?;
 		}
 
-		// DNS reverse lookup via "hostname:1" does not work on FreeBSD and OpenBSD;
-		// use the dns-lookup crate instead.
 		#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 		{
-			addresses = lookup_host(hostname.as_str())
-				.map_err(|err| format!("failed to lookup hostname: {err}"))?;
+			addresses = (hostname.as_str(), 0)
+				.to_socket_addrs()
+				.map_err(|err| format!("failed to lookup hostname: {err}"))?
+				.map(|addr| addr.ip());
 		}
 
 		let mut hashset = HashSet::new();

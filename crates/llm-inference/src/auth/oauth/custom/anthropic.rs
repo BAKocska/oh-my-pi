@@ -5,12 +5,11 @@ use http::{
 	HeaderMap, HeaderName, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, base64_url, sf};
+use omp_core::{ExposeSecret, SecretString, Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use ring::rand::{SecureRandom, SystemRandom};
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::{

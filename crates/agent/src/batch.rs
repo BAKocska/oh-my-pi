@@ -811,7 +811,7 @@ impl SpeculativeCall {
 	/// This local transition performs no I/O. Effect authorization is sent only
 	/// by [`ToolBatch::drive`] after the loop journals the token and timestamp.
 	pub fn commit(mut self, raw_args: Bytes) -> CommittedCall {
-		let effect_token = ulid::Ulid::generate().to_string().to_str();
+		let effect_token = omp_core::Ulid::generate().to_string().to_str();
 		let authorized_at_ms = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.unwrap_or_default()

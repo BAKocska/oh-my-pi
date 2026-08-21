@@ -119,7 +119,7 @@ impl ChatHubBackend {
 		if to.eq_ignore_ascii_case(self.agent_id.as_str()) {
 			return Err(fault("cannot send a hub message to the calling agent"));
 		}
-		let id = Str::from(ulid::Ulid::generate().to_string());
+		let id = Str::from(omp_core::Ulid::generate().to_string());
 		let message = PeerMessage {
 			id:         id.clone(),
 			from:       self.agent_id.clone(),

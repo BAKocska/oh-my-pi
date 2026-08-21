@@ -9,7 +9,7 @@ use std::{
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use strum::IntoStaticStr;
 
@@ -443,11 +443,11 @@ fn parse_online(output: &str, allow_max: bool) -> Option<Difficulty> {
 }
 
 fn memo_key(input: &Str, backend: DifficultyBackend, auto: AutoDifficulty) -> [u8; 32] {
-	let mut digest = Sha256::new();
-	digest.update(b"omp.difficulty/v1\0");
-	digest.update([backend as u8, auto.allow_max as u8, auto.ceiling as u8]);
-	digest.update(input.as_bytes());
-	digest.finalize().into()
+	let mut context = Sha256::new();
+	context.update(b"omp.difficulty/v1\0");
+	context.update(&[backend as u8, auto.allow_max as u8, auto.ceiling as u8]);
+	context.update(input.as_bytes());
+	context.finalize().into()
 }
 
 #[cfg(test)]

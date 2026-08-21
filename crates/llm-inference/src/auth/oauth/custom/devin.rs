@@ -10,10 +10,9 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, CONTENT_TYPE},
 };
-use omp_core::{Str, base64_url, sf};
+use omp_core::{ExposeSecret as _, SecretString, Str, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
 use ring::rand::{SecureRandom as _, SystemRandom};
-use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -252,7 +251,6 @@ mod tests {
 	use http::header::{ACCEPT, CONTENT_TYPE};
 	use parking_lot::Mutex;
 	use serde_json::Value;
-	use sha2::Sha256;
 
 	use super::{
 		super::super::{OAuthHttpResponse, OAuthTransportError},

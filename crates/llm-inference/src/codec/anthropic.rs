@@ -2440,8 +2440,8 @@ mod tests {
 	use std::{sync::Arc, time::UNIX_EPOCH};
 
 	use http::{HeaderName, HeaderValue, Request};
+	use omp_core::SecretString;
 	use omp_llm_catalog::{Catalog, WireTarget};
-	use secrecy::SecretString;
 
 	use super::*;
 	use crate::{

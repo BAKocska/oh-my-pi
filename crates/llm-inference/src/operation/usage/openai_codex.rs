@@ -11,9 +11,8 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
-use omp_core::{Str, base64_url, parse_rfc3339, sf};
+use omp_core::{ExposeSecret as _, SecretString, Str, base64_url, parse_rfc3339, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
-use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
@@ -773,9 +772,8 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
-	use omp_core::{base64_url, parse_rfc3339, sf};
+	use omp_core::{ExposeSecret as _, SecretString, base64_url, parse_rfc3339, sf};
 	use parking_lot::Mutex;
-	use secrecy::{ExposeSecret as _, SecretString};
 
 	use super::{
 		CodexResetCredit, consume_codex_reset_credit, fetch_openai_codex_usage,

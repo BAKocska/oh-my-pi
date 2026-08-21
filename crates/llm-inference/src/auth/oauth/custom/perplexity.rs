@@ -13,9 +13,8 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{CONTENT_TYPE, COOKIE, SET_COOKIE, USER_AGENT},
 };
-use omp_core::{base64_url, sf};
+use omp_core::{ExposeSecret as _, SecretString, base64_url, sf};
 use omp_llm_catalog::provider::OAuthExchangeKind;
-use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
