@@ -502,13 +502,16 @@ pub struct ChatArgs {
 	#[arg(long = "continue", short = 'c', value_name = "SESSION", conflicts_with = "fork")]
 	pub continue_session: Option<Str>,
 	/// Fork an existing session before opening the chat.
-	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session"])]
+	// Hidden until the session migration backend lands; dispatch rejects it.
+	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session"], hide = true)]
 	pub fork:             Option<Str>,
 	/// Do not persist a durable session for this chat.
-	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork"])]
+	// Hidden until the session migration backend lands; dispatch rejects it.
+	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork"], hide = true)]
 	pub no_session:       bool,
 	/// Override the session storage directory.
-	#[arg(long, value_name = "PATH")]
+	// Hidden until the session migration backend lands; dispatch rejects it.
+	#[arg(long, value_name = "PATH", hide = true)]
 	pub session_dir:      Option<PathBuf>,
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
 	#[arg(long)]
@@ -893,6 +896,15 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	}
 }
 
+fn chat_start(args: &mut ChatArgs) -> crate::chat::ChatStart {
+	if args.resume.as_deref() == Some("__omp_picker__") {
+		args.resume = None;
+		crate::chat::ChatStart::SessionIndex
+	} else {
+		crate::chat::ChatStart::Session
+	}
+}
+
 /// Dispatches one parsed command to its production implementation.
 #[expect(
 	clippy::future_not_send,
@@ -914,14 +926,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Serve(args) => serve(args).await,
 		Command::Envd(args) => crate::envd::run(args).await,
 		Command::Chat(mut args) => {
-			if args.resume.as_deref() == Some("__omp_picker__") {
-				return Err(
-					crate::usage_error::CliUsageError::new(
-						"session picker is unavailable in this non-interactive build",
-					)
-					.into(),
-				);
-			}
+			let start = chat_start(&mut args);
 			if args.fork.is_some() || args.no_session || args.session_dir.is_some() {
 				return Err(
 					crate::usage_error::CliUsageError::new(
@@ -943,7 +948,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			}
 			crate::startup_notice::show_once(&data_dir(None)?, args.model.as_ref())
 				.into_diagnostic()?;
-			Box::pin(crate::chat::run(args)).await
+			Box::pin(crate::chat::run(args, start)).await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
 		Command::Rpc(args) => crate::rpc_mode::run(args).await,
@@ -1641,6 +1646,18 @@ mod tests {
 				2
 			);
 		}
+	}
+
+	#[test]
+	fn session_index_is_explicit_while_chat_starts_inline() {
+		let mut chat = ChatArgs::default_interactive();
+		assert_eq!(chat_start(&mut chat), crate::chat::ChatStart::Session);
+		let mut picker = ChatArgs {
+			resume: Some(sf!("__omp_picker__")),
+			..ChatArgs::default_interactive()
+		};
+		assert_eq!(chat_start(&mut picker), crate::chat::ChatStart::SessionIndex);
+		assert!(picker.resume.is_none());
 	}
 
 	#[test]

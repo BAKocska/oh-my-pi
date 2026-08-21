@@ -9,6 +9,8 @@ use std::{
 };
 
 use omp_core::{Str, sf};
+#[cfg(target_os = "macos")]
+use omp_llm_inference::auth::FallbackKeySource;
 use omp_llm_inference::{
 	Client, ProviderService, Registry,
 	account::{
@@ -18,11 +20,11 @@ use omp_llm_inference::{
 		AlibabaTokenPlanLoginEngine, AlibabaTokenPlanShaper, AuthLoginEngine, AuthManager,
 		AuthManagerBuildError, CredentialAcquisitionLoginEngine,
 		CredentialAcquisitionLoginEngineError, CredentialBroker, CredentialBrokerEngines,
-		CredentialShaperRegistry, CredentialStore, GithubCopilotShaper, KeyError, KeySource,
-		OAuthCustomDispatcher, OAuthLoginEngine, OAuthLoginEngineError, OsCredentialKeySource,
-		ProviderShaper, SecretLoginEngine, SecretLoginEngineError, StoreError,
-		StoredCredentialSource, StoredOAuthRefreshEngine, SystemOAuthClock, SystemOAuthHttpClient,
-		UnavailableKeySource,
+		CredentialShaperRegistry, CredentialStore, FileCredentialKeySource, FileKeyError,
+		GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher, OAuthLoginEngine,
+		OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper, SecretLoginEngine,
+		SecretLoginEngineError, StoreError, StoredCredentialSource, StoredOAuthRefreshEngine,
+		SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
 	},
 	call::AuthMethod,
 	codec::google_cca::{
@@ -79,19 +81,24 @@ const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Selection of the credential encryption-key source.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CredentialKeyMode {
-	/// Fail closed without contacting an operating-system credential service.
+	/// Fail closed without accessing persistent encryption-key material.
 	#[default]
 	Unavailable,
-	/// Use the operating-system credential service after explicit application
-	/// opt-in or for an interactive process on a supported platform.
+	/// Use an owner-only key file beside the credential database.
+	///
+	/// This deliberately matches pi's filesystem security boundary for
+	/// interactive local use. It avoids macOS Keychain ACLs tied to a rebuilt
+	/// executable, but does not protect against an attacker who can read the
+	/// user's data directory.
+	LocalFile,
+	/// Use the operating-system credential service after explicit opt-in.
 	OsKeychain,
 }
 
 impl CredentialKeyMode {
-	/// Selects the OS keychain for exact `OMP_LLM_KEYCHAIN=1`, or when the
-	/// variable is unset and both stdin and stderr are terminals on a platform
-	/// with a supported credential service. Any other set value fails closed
-	/// without OS access.
+	/// Selects the OS keychain only for exact `OMP_LLM_KEYCHAIN=1`. When the
+	/// variable is unset, an interactive macOS process uses an owner-only local
+	/// key file; unattended processes and any other set value fail closed.
 	#[must_use]
 	pub fn from_environment() -> Self {
 		let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
@@ -101,7 +108,7 @@ impl CredentialKeyMode {
 	fn from_value(value: Option<&std::ffi::OsStr>, interactive: bool) -> Self {
 		match value {
 			Some(value) if value == "1" => Self::OsKeychain,
-			None if interactive && cfg!(target_os = "macos") => Self::OsKeychain,
+			None if interactive && cfg!(target_os = "macos") => Self::LocalFile,
 			_ => Self::Unavailable,
 		}
 	}
@@ -165,6 +172,9 @@ pub enum DaemonError {
 	/// Credential encryption key provisioning failed.
 	#[error(transparent)]
 	CredentialKey(#[from] KeyError),
+	/// Owner-only credential key file provisioning failed.
+	#[error(transparent)]
+	CredentialKeyFile(#[from] FileKeyError),
 	/// Durable account state could not be opened.
 	#[error(transparent)]
 	AccountState(#[from] AccountStateStoreError),
@@ -217,8 +227,12 @@ impl From<omp_llm_inference::Error> for DaemonError {
 	}
 }
 
-/// Opens encrypted production credential state, contacting the OS keychain for
-/// explicit opt-in or by default in a supported interactive process.
+/// Opens encrypted production credential state.
+///
+/// Interactive macOS processes default to an owner-only adjacent key file.
+/// `OMP_LLM_KEYCHAIN=1` deliberately opts into the stronger Keychain boundary,
+/// whose application ACL can prompt again when an unsigned development binary
+/// is rebuilt.
 pub fn open_credential_store(
 	database: impl AsRef<Path>,
 ) -> Result<Arc<CredentialStore>, DaemonError> {
@@ -226,6 +240,7 @@ pub fn open_credential_store(
 		CredentialKeyMode::Unavailable => {
 			open_credential_store_with_key_source(database, Arc::new(UnavailableKeySource))
 		},
+		CredentialKeyMode::LocalFile => open_local_file_credential_store(database.as_ref()),
 		CredentialKeyMode::OsKeychain => {
 			let key_source = OsCredentialKeySource::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
 			if key_source.active_key().is_err() {
@@ -233,6 +248,29 @@ pub fn open_credential_store(
 			}
 			open_credential_store_with_key_source(database, Arc::new(key_source))
 		},
+	}
+}
+
+fn open_local_file_credential_store(database: &Path) -> Result<Arc<CredentialStore>, DaemonError> {
+	let file = FileCredentialKeySource::open(database.with_extension("key"))?;
+	#[cfg(target_os = "macos")]
+	{
+		// One-time clean cutover for credentials written by the old interactive
+		// default. The fallback is consulted only for legacy key identifiers;
+		// after this transaction all rows use the file key and later rebuilds
+		// never contact Keychain. Denial aborts the transaction without losing
+		// the existing encrypted records.
+		let source = FallbackKeySource::new(
+			file,
+			OsCredentialKeySource::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT),
+		);
+		let store = open_credential_store_with_key_source(database, Arc::new(source))?;
+		store.rotate_keys()?;
+		Ok(store)
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		open_credential_store_with_key_source(database, Arc::new(file))
 	}
 }
 
@@ -719,7 +757,7 @@ mod credential_key_mode_tests {
 		assert_eq!(
 			CredentialKeyMode::from_value(None, true),
 			if cfg!(target_os = "macos") {
-				CredentialKeyMode::OsKeychain
+				CredentialKeyMode::LocalFile
 			} else {
 				CredentialKeyMode::Unavailable
 			}

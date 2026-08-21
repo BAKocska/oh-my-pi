@@ -58,6 +58,12 @@ enum Step {
 	Model,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuthLocation {
+	Url(Str),
+	DeviceCode { code: Str, url: Str },
+}
+
 /// Runs first-run setup and returns the persisted model selection.
 ///
 /// A clean cancellation returns `None`; provider login and model selection are
@@ -88,6 +94,9 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 		.into_diagnostic()?;
 	show_welcome(app.ui_mut());
 	let mut step = Step::Welcome;
+	let mut auth_location = None;
+	let mut auth_prompt_message = None;
+	let mut active_provider: Option<Str> = None;
 
 	let selected = 'wizard: loop {
 		tokio::select! {
@@ -98,7 +107,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				{
 					let _ = app.ui_mut().close_top_overlay();
 					if has_account {
-						open_setup_model_step(app.ui_mut(), catalog, "");
+						open_setup_model_step(app.ui_mut(), catalog, "", None);
 						step = Step::Model;
 					} else {
 						open_setup_provider_step(app.ui_mut(), catalog);
@@ -114,14 +123,16 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 						let _ = app.ui_mut().close_top_overlay();
 						match auth.answer(auth_input(kind, value)) {
 							Ok(()) => {
+								show_authenticating(app.ui_mut());
 								set_status(app.ui_mut(), "Authenticating… Esc to cancel");
+								auth_prompt_message = None;
 								step = Step::Authenticating;
 							},
 							Err(error) => {
-								let _ = app.ui_mut().close_top_overlay();
-								show_welcome(app.ui_mut());
-								set_status(app.ui_mut(), sf!("Setup error: {error}"));
 								open_setup_provider_step(app.ui_mut(), catalog);
+								set_status(app.ui_mut(), sf!("Setup error: {error}"));
+								auth_location = None;
+								auth_prompt_message = None;
 								step = Step::Provider;
 							},
 						}
@@ -129,12 +140,13 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				},
 				Some(AppEvent::Key(key)) if step == Step::Provider => {
 					if key == omp_tui::Key::Esc {
-								  let _ = app.ui_mut().close_top_overlay();
-								  if has_active_account(&registry).await.unwrap_or(false) {
-									  break 'wizard None;
-								  }
-												step = Step::Welcome;
-							  }
+						let _ = app.ui_mut().close_top_overlay();
+						if has_active_account(&registry).await.unwrap_or(false) {
+							break 'wizard None;
+						}
+						show_welcome(app.ui_mut());
+						step = Step::Welcome;
+					}
 				},
 				Some(AppEvent::Pressed(id))
 					if step == Step::Provider
@@ -146,6 +158,9 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 							.expect("guarded above"),
 					);
 					let _ = app.ui_mut().close_top_overlay();
+					auth_location = None;
+					auth_prompt_message = None;
+					active_provider = Some(value.clone());
 					match auth.start(value.clone()) {
 						Ok(()) => {
 							show_authenticating(app.ui_mut());
@@ -156,9 +171,8 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 							step = Step::Authenticating;
 						},
 						Err(error) => {
-							show_welcome(app.ui_mut());
-							set_status(app.ui_mut(), sf!("Setup error: {error}"));
 							open_setup_provider_step(app.ui_mut(), catalog);
+							set_status(app.ui_mut(), sf!("Setup error: {error}"));
 							step = Step::Provider;
 						},
 					}
@@ -175,10 +189,10 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 					Step::Welcome => break 'wizard None,
 					Step::Prompt(_) => {
 						let _ = auth.cancel();
-						let _ = app.ui_mut().close_top_overlay();
-						show_welcome(app.ui_mut());
-						set_status(app.ui_mut(), "Authentication cancelled. Choose a provider.");
 						open_setup_provider_step(app.ui_mut(), catalog);
+						set_status(app.ui_mut(), "Authentication cancelled. Choose a provider.");
+						auth_location = None;
+						auth_prompt_message = None;
 						step = Step::Provider;
 					},
 					Step::Provider | Step::Model => {
@@ -187,9 +201,10 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 					},
 					Step::Authenticating => {
 						let _ = auth.cancel();
-						show_welcome(app.ui_mut());
-						set_status(app.ui_mut(), "Authentication cancelled. Choose a provider.");
 						open_setup_provider_step(app.ui_mut(), catalog);
+						set_status(app.ui_mut(), "Authentication cancelled. Choose a provider.");
+						auth_location = None;
+						auth_prompt_message = None;
 						step = Step::Provider;
 					},
 					Step::CredentialStorageLocked => {
@@ -200,9 +215,10 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(AppEvent::Key(Key::Esc)) if step == Step::Authenticating => {
 					let _ = auth.cancel();
 					let _ = app.ui_mut().close_top_overlay();
-					show_welcome(app.ui_mut());
-					set_status(app.ui_mut(), "Authentication cancelled. Choose a provider.");
 					open_setup_provider_step(app.ui_mut(), catalog);
+					set_status(app.ui_mut(), "Authentication cancelled. Choose a provider.");
+					auth_location = None;
+					auth_prompt_message = None;
 					step = Step::Provider;
 				},
 				Some(AppEvent::Key(Key::Esc)) if step == Step::CredentialStorageLocked => {
@@ -216,23 +232,43 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(ChatAuthEvent::Url(url))
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
-					set_status(
-						app.ui_mut(),
-						sf!("[Open to authorize]({url}) · Esc to cancel"),
-					);
+					auth_location = Some(AuthLocation::Url(url));
+					if let Step::Prompt(kind) = step {
+						if let Some(message) = auth_prompt_message.clone() {
+							let _ = app.ui_mut().close_top_overlay();
+							show_auth_prompt(app.ui_mut(), message, kind, auth_location.as_ref());
+						}
+					} else if let Some(AuthLocation::Url(url)) = auth_location.as_ref() {
+						set_status(
+							app.ui_mut(),
+							sf!("[Open to authorize]({url}) · Esc to cancel"),
+						);
+					}
 				},
 				Some(ChatAuthEvent::DeviceCode { code, url })
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
-					set_status(
-						app.ui_mut(),
-						sf!("Enter code `{code}` at [{url}]({url}) · Esc to cancel"),
-					);
+					auth_location = Some(AuthLocation::DeviceCode { code, url });
+					if let Step::Prompt(kind) = step {
+						if let Some(message) = auth_prompt_message.clone() {
+							let _ = app.ui_mut().close_top_overlay();
+							show_auth_prompt(app.ui_mut(), message, kind, auth_location.as_ref());
+						}
+					} else if let Some(AuthLocation::DeviceCode { code, url }) =
+						auth_location.as_ref()
+					{
+						set_status(
+							app.ui_mut(),
+							sf!("Enter code `{code}` at [{url}]({url}) · Esc to cancel"),
+						);
+					}
 				},
 				Some(ChatAuthEvent::Prompt { message, kind })
 					if step == Step::Authenticating =>
 				{
-					show_auth_prompt(app.ui_mut(), message, kind);
+					auth_prompt_message = Some(message.clone());
+					let _ = app.ui_mut().close_top_overlay();
+					show_auth_prompt(app.ui_mut(), message, kind, auth_location.as_ref());
 					step = Step::Prompt(kind);
 				},
 				Some(ChatAuthEvent::Notice(message))
@@ -243,8 +279,15 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(ChatAuthEvent::Complete(_))
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
-					close_auth_scene(app.ui_mut(), step);
-					open_setup_model_step(app.ui_mut(), catalog, "");
+					close_auth_scene(app.ui_mut());
+					open_setup_model_step(
+						app.ui_mut(),
+						catalog,
+						"",
+						active_provider.as_deref(),
+					);
+					auth_location = None;
+					auth_prompt_message = None;
 					step = Step::Model;
 				},
 				Some(ChatAuthEvent::CredentialStorageLocked)
@@ -252,16 +295,20 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				{
 					if matches!(step, Step::Prompt(_)) {
 						let _ = app.ui_mut().close_top_overlay();
+						show_authenticating(app.ui_mut());
 					}
 					set_status(app.ui_mut(), CREDENTIAL_STORAGE_LOCKED_MESSAGE);
+					auth_location = None;
+					auth_prompt_message = None;
 					step = Step::CredentialStorageLocked;
 				},
 				Some(ChatAuthEvent::Failed(message)) => {
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) {
-						close_auth_scene(app.ui_mut(), step);
-						show_welcome(app.ui_mut());
-						set_status(app.ui_mut(), sf!("Setup error: {message}"));
+						close_auth_scene(app.ui_mut());
 						open_setup_provider_step(app.ui_mut(), catalog);
+						set_status(app.ui_mut(), sf!("Setup error: {message}"));
+						auth_location = None;
+						auth_prompt_message = None;
 						step = Step::Provider;
 					} else {
 						set_status(app.ui_mut(), sf!("Setup error: {message}"));
@@ -350,20 +397,39 @@ fn open_setup_provider_step(ui: &mut Ui, catalog: &Catalog) {
 		"↹/←→/↑↓ pick · ↵ login · Esc back",
 		18,
 	));
-	show_scene(ui, picker);
+	let scene = Col::new()
+		.with(Prop::Gap, 1_u16)
+		.child(picker)
+		.child(status_line());
+	show_scene(ui, scene);
+	ui.focus_first();
 }
 
-fn open_setup_model_step(ui: &mut Ui, catalog: &Catalog, current: &str) {
+/// Opens the model picker, scoped to `provider`'s models when it names any;
+/// falls back to the full catalog for providers without model entries.
+fn open_setup_model_step(ui: &mut Ui, catalog: &Catalog, current: &str, provider: Option<&str>) {
+	let mut scoped: Vec<&omp_llm_inference::ModelSpec> = match provider {
+		Some(provider) => catalog
+			.models()
+			.iter()
+			.filter(|model| {
+				model
+					.key
+					.as_str()
+					.strip_prefix(provider)
+					.is_some_and(|rest| rest.starts_with('/'))
+			})
+			.collect(),
+		None => Vec::new(),
+	};
+	if scoped.is_empty() {
+		scoped = catalog.models().iter().collect();
+	}
 	let mut select = Select::new()
 		.with(Prop::Id, MODEL_SELECT_ID)
 		.with(Prop::Filter, true)
-		.with(
-			Prop::H,
-			u16::try_from(catalog.models().len())
-				.unwrap_or(u16::MAX)
-				.min(12),
-		);
-	for model in catalog.models() {
+		.with(Prop::H, u16::try_from(scoped.len()).unwrap_or(u16::MAX).min(12));
+	for model in scoped {
 		let key = model.key.to_string();
 		let label = if key == current {
 			format!("{key} (current)")
@@ -384,34 +450,64 @@ fn open_setup_model_step(ui: &mut Ui, catalog: &Catalog, current: &str) {
 				.text("Type to filter · Enter select · Esc cancel"),
 		),
 	);
-	show_scene(ui, picker);
+	let scene = Col::new()
+		.with(Prop::Gap, 1_u16)
+		.child(picker)
+		.child(status_line());
+	show_scene(ui, scene);
+	ui.focus_first();
 }
 
-fn show_auth_prompt(ui: &mut Ui, message: Str, kind: AuthPromptKind) {
+fn show_auth_prompt(
+	ui: &mut Ui,
+	message: Str,
+	kind: AuthPromptKind,
+	location: Option<&AuthLocation>,
+) {
 	let placeholder = match kind {
 		AuthPromptKind::Confirmation => "Press Enter to confirm",
 		AuthPromptKind::OptionalSecret => "Enter optional response or press Enter to skip",
 		_ => "Enter provider response",
 	};
-	let prompt = OverlayPanel::new("Provider Authentication").child(
-		Col::new()
-			.with(Prop::Gap, 1_u16)
-			.child(TextLeaf::new().text(message))
-			.child(
-				Input::new()
-					.with(Prop::Id, "auth-secret")
-					.with(Prop::Placeholder, placeholder)
-					.with(Prop::Mask, prompt_masks_input(kind))
-					.with(Prop::Submit, true),
-			)
-			.child(panel_divider())
-			.child(
-				TextLeaf::new()
-					.with(Prop::Dim, true)
-					.text("Enter submit · Esc cancel"),
+	let mut content = Col::new()
+		.with(Prop::Gap, 1_u16)
+		.child(TextLeaf::new().text(message));
+	if let Some(location) = location {
+		let (authorization, instruction) = match location {
+			AuthLocation::Url(url) => (
+				sf!("[{url}]({url})"),
+				"Authorize in your browser, then paste the redirect URL below.",
 			),
-	);
-	show_scene(ui, prompt);
+			AuthLocation::DeviceCode { code, url } => (
+				sf!("Enter code `{code}` at [{url}]({url})"),
+				"Complete authorization in your browser, then continue below.",
+			),
+		};
+		content = content
+			.child(Markdown::new().text(authorization))
+			.child(TextLeaf::new().with(Prop::Dim, true).text(instruction));
+	}
+	content = content
+		.child(
+			Input::new()
+				.with(Prop::Id, "auth-secret")
+				.with(Prop::Placeholder, placeholder)
+				.with(Prop::Mask, prompt_masks_input(kind))
+				.with(Prop::Submit, true),
+		)
+		.child(panel_divider())
+		.child(
+			TextLeaf::new()
+				.with(Prop::Dim, true)
+				.text("Enter submit · Esc cancel"),
+		);
+	let prompt = OverlayPanel::new("Provider Authentication").child(content);
+	let scene = Col::new()
+		.with(Prop::Gap, 1_u16)
+		.child(prompt)
+		.child(status_line());
+	show_scene(ui, scene);
+	ui.focus_first();
 }
 
 fn provider_supports_login(catalog: &Catalog, provider: &ProviderDef) -> bool {
@@ -444,11 +540,15 @@ fn show_scene(ui: &mut Ui, scene: impl omp_tui::IntoComponent) {
 	);
 }
 
-fn close_auth_scene(ui: &mut Ui, step: Step) {
-	if matches!(step, Step::Prompt(_)) {
-		let _ = ui.close_top_overlay();
-	}
+fn close_auth_scene(ui: &mut Ui) {
 	let _ = ui.close_top_overlay();
+}
+
+fn status_line() -> Markdown {
+	Markdown::new()
+		.with(Prop::Id, STATUS_ID)
+		.with(Prop::Align, "center")
+		.text(" ")
 }
 
 fn set_status(ui: &mut Ui, message: impl IntoStr) {

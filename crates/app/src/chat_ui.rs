@@ -45,7 +45,8 @@ use crate::{
 };
 
 pub const CREDENTIAL_STORAGE_LOCKED_MESSAGE: &str =
-	"Credential storage is locked (no OS keychain). Set OMP_LLM_KEYCHAIN=1 or run interactively.";
+	"Credential storage is locked. Run interactively for owner-only local storage, or set \
+	 OMP_LLM_KEYCHAIN=1 to use the OS keychain.";
 const GATEWAY_LOGIN_MESSAGE: &str = "Provider login is unavailable through a remote gateway; run \
                                      `omp auth login <provider>` on the gateway host.";
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -243,6 +244,10 @@ struct BridgeState {
 	commands:          CommandRoster,
 }
 
+fn subscribe_chat_events(bus: &omp_agent::EventBus) -> omp_agent::EventSubscription {
+	bus.subscribe_lossless()
+}
+
 /// Runs the designed terminal chat scene bridged to a real durable agent.
 #[expect(
 	clippy::future_not_send,
@@ -266,7 +271,9 @@ where
 {
 	let bus = agent.events().clone();
 	let mailbox = agent.mailbox();
-	let agent_events = bus.subscribe_ui(256);
+	// Turn deltas and their authoritative outcome share this stream. Dropping
+	// either can leave a blank or permanently partial transcript.
+	let agent_events = subscribe_chat_events(&bus);
 	let live_events = agent.firehose().subscribe(SubscriptionOptions::new(
 		[
 			FirehoseKind::TurnStart,
@@ -278,6 +285,7 @@ where
 		],
 		128,
 	)?)?;
+	let session_id = session.session_id.clone();
 	let mut roster_events = tree.watch_roster();
 	let mut roster_tick = tokio::time::interval(Duration::from_millis(100));
 	roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -372,7 +380,6 @@ where
 	};
 	chat.set_composer_style(state.settings.composer.shape);
 
-	send_backend(&backend_tx, BackendEvent::SessionTitle(session.session_id));
 	send_backend(&backend_tx, BackendEvent::ModelsUpdated {
 		rows:    model_rows(Catalog::embedded()),
 		current: current_model_index(Catalog::embedded(), &state.model),
@@ -392,8 +399,8 @@ where
 		&mut state.part_serial,
 		registry.as_ref(),
 	);
-	send_status(&backend_tx, &state, &bus, agent_events.dropped());
-	let mut last_roster = project_agent_roster(&tree);
+	send_status(&backend_tx, &state, &bus, 0);
+	let mut last_roster = project_agent_roster(&tree, &session_id);
 	send_backend(&backend_tx, BackendEvent::AgentRoster(last_roster.clone()));
 
 	let bridge = async move {
@@ -414,7 +421,7 @@ where
 						&mut list_sessions,
 						&bus,
 						registry.as_ref(),
-						agent_events.dropped(),
+						0,
 						&mut state,
 					).await? {
 						break;
@@ -440,14 +447,14 @@ where
 					send_backend(&backend_tx, BackendEvent::Ack {
 						interrupted: ack.interrupted,
 					});
-					send_status(&backend_tx, &state, &bus, agent_events.dropped());
+					send_status(&backend_tx, &state, &bus, 0);
 				},
 				Some(event) = next_auth_event(auth) => {
 					handle_auth_event(&backend_tx, &mut state, event);
 				},
 				Ok(event) = agent_events.recv() => {
 					if matches!(&*event, AgentEvent::RosterChanged { .. }) {
-						publish_agent_roster(&backend_tx, &tree, &mut last_roster);
+						publish_agent_roster(&backend_tx, &tree, &session_id, &mut last_roster);
 					} else {
 						handle_agent_event(
 							&backend_tx,
@@ -456,7 +463,7 @@ where
 							modes.as_ref(),
 							registry.as_ref(),
 							&bus,
-							agent_events.dropped(),
+							0,
 						);
 					}
 				},
@@ -465,13 +472,13 @@ where
 					bus.publish(AgentEvent::RosterChanged { generation });
 				},
 				_ = roster_tick.tick() => {
-					if project_agent_roster(&tree) != last_roster {
+					if project_agent_roster(&tree, &session_id) != last_roster {
 						bus.publish(AgentEvent::RosterChanged {
 							generation: tree.roster_generation(),
 						});
 					}
 					if drain_live_activity(&live_events, &mut state) {
-						send_status(&backend_tx, &state, &bus, agent_events.dropped());
+						send_status(&backend_tx, &state, &bus, 0);
 					}
 				},
 			}
@@ -1809,9 +1816,15 @@ fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str
 	Ok(Str::from(provider.id.as_str()))
 }
 
-fn project_agent_roster(tree: &AgentTree) -> Vec<AgentRow> {
+fn project_agent_roster(tree: &AgentTree, session: &str) -> Vec<AgentRow> {
 	tree
 		.roster()
+		.filter(|node| {
+			node.session == session
+				&& tree
+					.node(&node.id)
+					.is_some_and(|latest| Arc::ptr_eq(&latest, node))
+		})
 		.map(|node| {
 			let usage = node.usage();
 			let activity = node.activity();
@@ -1831,9 +1844,10 @@ fn project_agent_roster(tree: &AgentTree) -> Vec<AgentRow> {
 fn publish_agent_roster(
 	backend: &flume::Sender<BackendEvent>,
 	tree: &AgentTree,
+	session: &str,
 	last: &mut Vec<AgentRow>,
 ) {
-	let current = project_agent_roster(tree);
+	let current = project_agent_roster(tree, session);
 	if current != *last {
 		*last = current.clone();
 		send_backend(backend, BackendEvent::AgentRoster(current));
@@ -1928,12 +1942,26 @@ pub const fn prompt_masks_input(kind: AuthPromptKind) -> bool {
 pub fn auth_input(kind: AuthPromptKind, value: String) -> AuthInput {
 	match kind {
 		AuthPromptKind::ApiKey => AuthInput::ApiKey(SecretString::from(value)),
+		AuthPromptKind::AuthorizationCode if url_shaped(&value) => {
+			AuthInput::CallbackUrl(SecretString::from(value))
+		},
 		AuthPromptKind::AuthorizationCode => AuthInput::AuthorizationCode(SecretString::from(value)),
 		AuthPromptKind::SessionToken => AuthInput::SessionToken(SecretString::from(value)),
 		AuthPromptKind::PlainText => AuthInput::PlainText(Str::from(value)),
 		AuthPromptKind::OptionalSecret => AuthInput::OptionalSecret(SecretString::from(value)),
 		AuthPromptKind::Confirmation => AuthInput::DeviceConfirmed,
 	}
+}
+
+fn url_shaped(value: &str) -> bool {
+	let Some((scheme, _)) = value.split_once("://") else {
+		return false;
+	};
+	let mut chars = scheme.chars();
+	chars
+		.next()
+		.is_some_and(|first| first.is_ascii_alphabetic())
+		&& chars.all(|char| char.is_ascii_alphanumeric() || matches!(char, '+' | '-' | '.'))
 }
 
 async fn next_auth_event(auth: Option<&ChatAuth>) -> Option<ChatAuthEvent> {
@@ -1953,9 +1981,149 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-	use omp_tui::{Color, components::AttachmentContent};
+	use omp_agent::{AgentKind, AgentStatus, Budget, ExecutionModeHandle};
+	use omp_tui::{
+		Color, Size, UiContext, components::AttachmentContent, test_support::frame_row_text,
+	};
+	use secrecy::ExposeSecret as _;
 
 	use super::*;
+
+	#[test]
+	fn roster_projection_keeps_only_the_current_canonical_session_nodes() {
+		let tree = AgentTree::new(4, 4, 4);
+		let old = tree
+			.register(
+				sf!("main"),
+				sf!("Main"),
+				AgentKind::Main,
+				None,
+				sf!("session-a"),
+				Budget::default(),
+			)
+			.expect("old root");
+		old.set_status(AgentStatus::Completed);
+		let latest = tree
+			.register(
+				sf!("main"),
+				sf!("Main"),
+				AgentKind::Main,
+				None,
+				sf!("session-a"),
+				Budget::default(),
+			)
+			.expect("replacement root");
+		latest.set_status(AgentStatus::Running);
+		tree
+			.register(
+				sf!("other"),
+				sf!("Main"),
+				AgentKind::Main,
+				None,
+				sf!("session-b"),
+				Budget::default(),
+			)
+			.expect("other session");
+
+		let rows = project_agent_roster(&tree, "session-a");
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].id, "main");
+		assert_eq!(rows[0].status, "running");
+	}
+
+	fn test_bridge_state() -> BridgeState {
+		BridgeState {
+			model: "test/model".to_owned(),
+			context_window: None,
+			context_tokens: 0,
+			cost_nanos: 0,
+			queued: 0,
+			jobs: HashSet::new(),
+			attempt: 0,
+			turn_started: None,
+			submit_pending: false,
+			pending_prompt: None,
+			part_serial: 0,
+			active_parts: HashMap::new(),
+			streaming_tools: HashMap::new(),
+			tools: HashMap::new(),
+			rewind_targets: Vec::new(),
+			pending_auth_kind: None,
+			live_enabled: false,
+			live_activity: ActivityWaveform::new(),
+			replaying_turn: false,
+			settings: Settings::default(),
+			commands: CommandRoster::new(Vec::new()),
+		}
+	}
+
+	#[test]
+	fn chat_event_subscription_keeps_bursts_beyond_the_old_ui_capacity() {
+		let bus = omp_agent::EventBus::new();
+		let events = subscribe_chat_events(&bus);
+		for generation in 0..300 {
+			bus.publish(AgentEvent::RosterChanged { generation });
+		}
+		assert_eq!(events.len(), 300);
+	}
+
+	#[test]
+	fn active_turn_text_and_submit_errors_project_into_visible_transcript_rows() {
+		let (tx, rx) = flume::unbounded();
+		let mut state = test_bridge_state();
+		let modes = ExecutionModes::new(ExecutionModeHandle::default());
+		let registry = Registry::new();
+		let bus = omp_agent::EventBus::new();
+		for event in [
+			Event::PartStart(omp_proto::inference::v1::PartStart {
+				index:        0,
+				kind:         part_start::Kind::Text as i32,
+				tool_call_id: String::new(),
+				tool_name:    String::new(),
+			}),
+			Event::PartDelta(omp_proto::inference::v1::PartDelta {
+				index: 0,
+				chunk: Bytes::from_static(b"banana"),
+			}),
+			Event::PartEnd(omp_proto::inference::v1::PartEnd {
+				index:     0,
+				signature: Bytes::new(),
+			}),
+		] {
+			handle_agent_event(
+				&tx,
+				&mut state,
+				&AgentEvent::Turn {
+					turn_id: TurnId::new("active-turn"),
+					event:   Box::new(omp_proto::inference::v1::TurnEvent { event: Some(event) }),
+				},
+				&modes,
+				&registry,
+				&bus,
+				0,
+			);
+		}
+		send_backend(&tx, BackendEvent::Error(sf!("Submit error: unauthorized")));
+
+		let mut chat = Chat::new(&UiContext::default());
+		let viewport = Size::new(80, 30);
+		let _ = chat.render(viewport);
+		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
+			text:  sf!("say banana"),
+			chips: Vec::new(),
+		});
+		for event in rx.drain() {
+			let _ = chat.apply_backend_event(event);
+		}
+		let rendered = chat.render(viewport);
+		let transcript = (0..rendered.stable_rows)
+			.map(|row| frame_row_text(rendered.frame, row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(transcript.contains("say banana"), "{transcript}");
+		assert!(transcript.contains("banana"), "{transcript}");
+		assert!(transcript.contains("Submit error: unauthorized"), "{transcript}");
+	}
 
 	#[test]
 	fn blank_submission_interrupts_only_with_queued_work() {
@@ -1980,7 +2148,7 @@ mod tests {
 	}
 
 	#[test]
-	fn authentication_answers_preserve_prompt_kind() {
+	fn auth_input_preserves_other_prompt_kinds() {
 		assert!(matches!(
 			auth_input(AuthPromptKind::ApiKey, "secret".to_owned()),
 			AuthInput::ApiKey(_)
@@ -1992,6 +2160,25 @@ mod tests {
 		assert!(matches!(
 			auth_input(AuthPromptKind::Confirmation, String::new()),
 			AuthInput::DeviceConfirmed
+		));
+	}
+
+	#[test]
+	fn auth_input_maps_redirect_urls_to_callback_urls() {
+		let AuthInput::CallbackUrl(value) = auth_input(
+			AuthPromptKind::AuthorizationCode,
+			"http://localhost:54545/callback?code=abc&state=xyz".to_owned(),
+		) else {
+			panic!("redirect URL must be submitted as a callback URL");
+		};
+		assert_eq!(value.expose_secret(), "http://localhost:54545/callback?code=abc&state=xyz");
+	}
+
+	#[test]
+	fn auth_input_keeps_bare_authorization_codes() {
+		assert!(matches!(
+			auth_input(AuthPromptKind::AuthorizationCode, "abc-123".to_owned()),
+			AuthInput::AuthorizationCode(value) if value.expose_secret() == "abc-123"
 		));
 	}
 

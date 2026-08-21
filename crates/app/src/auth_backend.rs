@@ -7,7 +7,6 @@ use std::{
 
 use miette::{IntoDiagnostic as _, Result, miette};
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-use omp_core::Str;
 use omp_llm_catalog::ProviderId;
 use omp_llm_inference::{
 	Client,
@@ -16,7 +15,7 @@ use omp_llm_inference::{
 	id::{AccountId, RequestId},
 	receipt::ExecutionBudget,
 };
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::ExposeSecret as _;
 use zeroize::Zeroizing;
 
 use crate::cli::AuthCommand;
@@ -147,32 +146,23 @@ fn read_prompt(prompt: &AuthPrompt) -> Result<AuthInput> {
 }
 
 fn auth_input(prompt: &AuthPrompt, value: &str) -> Result<AuthInput> {
-	match prompt.input {
-		AuthPromptKind::Confirmation => Ok(AuthInput::DeviceConfirmed),
-		AuthPromptKind::PlainText => Ok(AuthInput::PlainText(Str::from(value))),
-		AuthPromptKind::OptionalSecret => {
-			Ok(AuthInput::OptionalSecret(SecretString::from(value.to_owned())))
-		},
-		AuthPromptKind::AuthorizationCode if prompt.id == "oauth-callback-url" => {
-			if value.is_empty() {
-				Err(miette!("authentication input must not be empty"))
-			} else {
-				Ok(AuthInput::CallbackUrl(SecretString::from(value.to_owned())))
-			}
-		},
-		AuthPromptKind::AuthorizationCode | AuthPromptKind::ApiKey | AuthPromptKind::SessionToken => {
-			if value.is_empty() {
-				return Err(miette!("authentication input must not be empty"));
-			}
-			let value = SecretString::from(value.to_owned());
-			Ok(match prompt.input {
-				AuthPromptKind::AuthorizationCode => AuthInput::AuthorizationCode(value),
-				AuthPromptKind::ApiKey => AuthInput::ApiKey(value),
-				AuthPromptKind::SessionToken => AuthInput::SessionToken(value),
-				_ => unreachable!("matched required secret prompt"),
-			})
-		},
+	if value.is_empty()
+		&& matches!(
+			prompt.input,
+			AuthPromptKind::AuthorizationCode | AuthPromptKind::ApiKey | AuthPromptKind::SessionToken
+		)
+	{
+		return Err(miette!("authentication input must not be empty"));
 	}
+	let kind = match prompt.input {
+		AuthPromptKind::AuthorizationCode => crate::chat_ui::AuthPromptKind::AuthorizationCode,
+		AuthPromptKind::ApiKey => crate::chat_ui::AuthPromptKind::ApiKey,
+		AuthPromptKind::SessionToken => crate::chat_ui::AuthPromptKind::SessionToken,
+		AuthPromptKind::PlainText => crate::chat_ui::AuthPromptKind::PlainText,
+		AuthPromptKind::OptionalSecret => crate::chat_ui::AuthPromptKind::OptionalSecret,
+		AuthPromptKind::Confirmation => crate::chat_ui::AuthPromptKind::Confirmation,
+	};
+	Ok(crate::chat_ui::auth_input(kind, value.to_owned()))
 }
 
 #[cfg(test)]

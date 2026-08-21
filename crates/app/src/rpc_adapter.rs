@@ -1515,7 +1515,18 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		}
 		detail
 	} else {
-		format!("{:?} during {:?}", error.kind, error.phase)
+		use std::fmt::Write as _;
+		let mut detail = format!("{:?} during {:?}", error.kind, error.phase);
+		if let Some(code) = &error.code {
+			let _ = write!(detail, " ({code})");
+		}
+		if let Some(status) = error.status {
+			let _ = write!(detail, " [http {status}]");
+		}
+		if let Some(evidence) = error.detail_ref() {
+			let _ = write!(detail, ": {evidence}");
+		}
+		detail
 	};
 	let retry_after_ms = match error.action {
 		omp_llm_inference::RetryAction::SameRoute { after } => {

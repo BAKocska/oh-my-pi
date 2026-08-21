@@ -982,13 +982,22 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 	}
 }
 
+/// Initial surface selected by the command boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChatStart {
+	/// Open the inline transcript and composer immediately.
+	Session,
+	/// Open the alternate-screen session index before the transcript.
+	SessionIndex,
+}
+
 /// Runs one interactive durable project-chat session.
 #[cfg(any(unix, windows))]
 #[expect(
 	clippy::future_not_send,
 	reason = "the interactive chat future owns a thread-confined terminal scene"
 )]
-pub async fn run(args: ChatArgs) -> miette::Result<()> {
+pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> {
 	use miette::{Context as _, IntoDiagnostic as _};
 	let root = canonical_project(&args.project).map_err(|e| miette::miette!(e))?;
 	let data_dir = crate::cli::data_dir(None)?;
@@ -1013,7 +1022,6 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 	let sessions_dir = state_dir.join("sessions");
 	ensure_state_directory(&state_dir).map_err(|e| miette::miette!(e))?;
 	ensure_state_directory(&sessions_dir).map_err(|e| miette::miette!(e))?;
-	let resume_requested = args.resume.is_some();
 	let resume = args.resume.clone();
 	let env_socket = crate::project_state::environment_socket(&state_dir);
 	let document_socket = crate::project_state::document_socket(&state_dir);
@@ -1073,7 +1081,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 				session_index: Arc::clone(&session_index),
 				registry,
 			},
-			!resume_requested,
+			start,
 		))
 		.await
 		.map_err(|e| miette::miette!(e))?;
@@ -1103,7 +1111,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 				session_index: Arc::clone(&session_index),
 				registry,
 			},
-			!resume_requested,
+			start,
 		))
 		.await
 		.map_err(|e| miette::miette!(e))?;
@@ -1118,7 +1126,7 @@ pub async fn run(args: ChatArgs) -> miette::Result<()> {
 
 /// Reports the platform limitation before touching project state.
 #[cfg(not(any(unix, windows)))]
-pub async fn run(_args: ChatArgs) -> miette::Result<()> {
+pub(crate) async fn run(_args: ChatArgs, _start: ChatStart) -> miette::Result<()> {
 	use miette::IntoDiagnostic as _;
 	Err(ChatError::UnsupportedPlatform).into_diagnostic()
 }
@@ -1138,7 +1146,7 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 	auth_registry: Option<InferenceRegistry>,
 	data_dir: PathBuf,
 	scope: ChatScope<'_>,
-	mut welcome: bool,
+	mut start: ChatStart,
 ) -> Result<(), ChatError> {
 	let parent = Arc::new(ChatParentHost::new(
 		client.clone(),
@@ -1217,11 +1225,11 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 				resume_choices(scope.sessions_dir, scope.root, Some(&current_id))
 					.map_err(anyhow::Error::from)
 			},
-			welcome,
+			matches!(start, ChatStart::SessionIndex),
 		)
 		.await
 		.map_err(ChatError::Ui)?;
-		welcome = false;
+		start = ChatStart::Session;
 		match exit {
 			omp_chat_ui::host::HostExit::Quit => break,
 			omp_chat_ui::host::HostExit::Resume(id) => {
