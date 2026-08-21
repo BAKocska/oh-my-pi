@@ -251,9 +251,8 @@ fn build_dialog(question: &Question, width: u16, ctx: &UiContext) -> Ui {
 				{panel_divider()}
 				<select id="ask" multi={multi} h={rows}>
 					for choice in choices {
-						<option value={choice.label.clone()} label={choice.label.clone()}>
+						<option value={choice.label.clone()} label={choice.label}>
 							<col>
-								<text>{choice.label}</text>
 								if let Some(description) = choice.description { <text dim>{description}</text> }
 								if let Some(preview) = choice.preview { <markdown dim>{preview}</markdown> }
 							</col>

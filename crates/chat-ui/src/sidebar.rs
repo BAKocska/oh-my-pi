@@ -8,7 +8,8 @@ use std::time::Instant;
 use omp_core::{Str, sf};
 use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent,
-	components::compaction_threshold_color, dom,
+	components::{compaction_threshold_color, spend_label},
+	dom,
 };
 
 use crate::{CompactionSpeculationStatus, StatusFacts, scene::RailWidths};
@@ -179,15 +180,11 @@ fn context_label(facts: &StatusFacts) -> Str {
 	}
 }
 
-fn cost_label(nanos: u64) -> Str {
-	sf!("${}.{:02}", nanos / 1_000_000_000, (nanos / 10_000_000) % 100)
-}
-
 fn build(facts: &StatusFacts, ctx: &UiContext) -> Ui {
 	let state = if facts.working { "working" } else { "idle" };
 	let context = context_label(facts);
 	let context_color = compaction_threshold_color(&ctx.theme);
-	let cost = cost_label(facts.cost_nanos);
+	let cost = spend_label(facts.cost_nanos, facts.model_subscription, ctx.charset);
 	let compaction = match facts.compaction_speculation {
 		CompactionSpeculationStatus::Idle => None,
 		CompactionSpeculationStatus::Running => Some("running"),
@@ -319,6 +316,19 @@ mod tests {
 			.layer(viewport, Instant::now() + Duration::from_secs(1))
 			.expect("rail reopened");
 		assert!(layer.active);
+	}
+
+	#[test]
+	fn rail_preserves_sub_cent_cost_precision() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(120, 30);
+		let mut facts = facts();
+		facts.cost_nanos = 1_918_000;
+		let mut sidebar = Sidebar::new(&facts, &ctx);
+		let layer = sidebar
+			.layer(viewport, Instant::now())
+			.expect("rail visible");
+		assert!((0..30).any(|row| frame_row_text(layer.frame, row).contains("$0.0019")));
 	}
 
 	#[test]

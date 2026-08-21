@@ -1012,11 +1012,17 @@ impl Ui {
 		}
 	}
 
-	/// Collects values from every visible component of the base tree;
-	/// overlay trees report through [`Ui::overlay`].
+	/// Collects values from every visible component of the base tree and
+	/// every visible overlay layer; higher layers win on id collisions.
+	/// Scope to a single layer through [`Ui::overlay`].
 	pub fn values(&self) -> Value {
 		let mut values = serde_json::Map::new();
 		collect_values(&self.root, &mut values);
+		for entry in &self.overlays {
+			if !entry.hidden {
+				collect_values(&entry.ui.root, &mut values);
+			}
+		}
 		Value::Object(values)
 	}
 
@@ -4551,6 +4557,22 @@ cd</pre>"##,
 		);
 		assert_eq!(ui.overlay(low).expect("low tree").values()["low"], "");
 		assert_eq!(ui.values()["base"], "", "base never saw the key");
+	}
+
+	#[test]
+	fn values_include_visible_overlay_layers() {
+		let mut ui = Ui::from_markup("<input id=base/>", 20, UiContext::default()).unwrap();
+		let dialog = ui.show_overlay(dom! { <input id=secret/> }, OverlayOptions::default());
+		ui.handle_key(Key::Char('k'));
+		assert_eq!(ui.values()["secret"], "k", "overlay inputs report through merged values");
+		assert_eq!(ui.values()["base"], "", "base entries stay present beside overlay entries");
+
+		ui.set_overlay_hidden(dialog, true);
+		assert_eq!(
+			ui.values().get("secret"),
+			None,
+			"hidden layers drop out of the merged map"
+		);
 	}
 
 	#[test]

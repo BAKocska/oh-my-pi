@@ -352,14 +352,10 @@ fn build(
 			<col>
 				<row gap=1>
 					<select id="model-providers" w={sidebar_width} h={height}>
-						<option value="" label="All models" recommended={all_active}>
-							<text bold={all_active}>{"All models"}</text>
-						</option>
+						<option value="" label="All models" recommended={all_active}/>
 						for provider in providers {
 							<option value={provider.id.clone()} label={provider.label.clone()}
-								recommended={provider.current}>
-								<text bold={provider.current} truncate>{provider.label}</text>
-							</option>
+								recommended={provider.current}/>
 						}
 					</select>
 					<select id="models" filter={seed} h={height} grow>

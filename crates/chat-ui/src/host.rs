@@ -19,7 +19,6 @@ use crate::{
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 };
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
 const PASTE_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -209,9 +208,15 @@ async fn run_welcome(
 ) -> io::Result<WelcomeOutcome> {
 	let mut alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 	let mut welcome = Welcome::new(ctx, Vec::new());
-	let started = Instant::now();
-	let mut next_frame = Instant::now();
 	loop {
+		if let Some(size) = terminal.take_resize()? {
+			*viewport = size;
+		}
+		renderer.preview(
+			welcome.render(*viewport, Duration::ZERO),
+			viewport.height,
+			alt_enter.take().as_deref().unwrap_or(""),
+		)?;
 		tokio::select! {
 			event = terminal.next() => match event? {
 				TerminalEvent::Resize => if let Some(size) = terminal.take_resize()? { *viewport = size; },
@@ -263,16 +268,6 @@ async fn run_welcome(
 				},
 				Ok(event) => { let _ = chat.apply_backend_event(event); },
 				Err(_) => return Ok(WelcomeOutcome::Exit(HostExit::Quit)),
-			},
-			() = deadline(Some(next_frame)) => {
-				let now = Instant::now();
-				if let Some(size) = terminal.take_resize()? { *viewport = size; }
-				renderer.preview(
-					welcome.render(*viewport, started.elapsed()),
-					viewport.height,
-					alt_enter.take().as_deref().unwrap_or(""),
-				)?;
-				next_frame = now + FRAME_INTERVAL;
 			},
 		}
 	}
@@ -477,7 +472,7 @@ async fn run_chat(
 	let mut overlay_stale = false;
 	let mut resize = None;
 	let mut paste_read: Option<PasteRead> = None;
-	let mut next_frame = Instant::now() + FRAME_INTERVAL;
+	let mut next_frame = chat_deadline(&host.chat);
 	loop {
 		let paste_deadline = paste_read.as_ref().map(|read| read.abandon_at);
 		tokio::select! {
@@ -568,7 +563,7 @@ async fn run_chat(
 									break;
 								}
 							}
-							next_frame = Instant::now();
+							next_frame = Some(Instant::now());
 						},
 						InputEvent::Paste(text) => {
 							if let Some(active) = host.overlay.as_mut() {
@@ -589,7 +584,7 @@ async fn run_chat(
 							} else if !host.sidebar.focused() {
 								host.chat.handle_paste(&text);
 							}
-							next_frame = Instant::now();
+							next_frame = Some(Instant::now());
 						},
 						InputEvent::Mouse(report) => {
 							if let Some(active) = host.overlay.as_mut() {
@@ -610,7 +605,7 @@ async fn run_chat(
 							} else if !host.sidebar.handle_mouse(report.col, report.row, report.kind, viewport) {
 								host.chat.handle_mouse(&report);
 							}
-							next_frame = Instant::now();
+							next_frame = Some(Instant::now());
 						},
 						InputEvent::Focus(_) | InputEvent::Response(_) => {},
 					}
@@ -632,7 +627,7 @@ async fn run_chat(
 							&mut overlay_stale,
 							&mut resize,
 						)?;
-						next_frame = Instant::now();
+						next_frame = Some(Instant::now());
 					}
 				}
 			},
@@ -648,7 +643,7 @@ async fn run_chat(
 					} else if had_overlay && host.overlay.is_none() {
 						close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
 					}
-					next_frame = Instant::now();
+					next_frame = Some(Instant::now());
 				},
 				Err(_) => break,
 			},
@@ -663,11 +658,11 @@ async fn run_chat(
 						ClipboardRead::Text => host.chat.handle_paste_raw(&text),
 						ClipboardRead::Smart => host.chat.handle_paste(&text),
 					}
-					next_frame = Instant::now();
+					next_frame = Some(Instant::now());
 				}
 			},
 			() = deadline(paste_deadline) => paste_read = None,
-			() = deadline(Some(next_frame)) => {
+			() = deadline(next_frame) => {
 				let now = Instant::now();
 				let resized = observe_resize(terminal, &mut viewport, &mut resize, now)?;
 				host.chat.set_right_inset(host.sidebar.reserved(viewport));
@@ -697,7 +692,7 @@ async fn run_chat(
 					let layers = rail_layers(&mut host.sidebar, viewport);
 					present(renderer, rendered, viewport, &layers)?;
 				}
-				next_frame = now + FRAME_INTERVAL;
+				next_frame = chat_deadline(&host.chat);
 			},
 			() = deadline(resize.map(ResizeState::deadline)) => {
 				let now = Instant::now();
@@ -719,7 +714,7 @@ async fn run_chat(
 					renderer.present_overlaid(rendered.frame, &[], viewport.height, rendered.stable_rows, &layers)?;
 				}
 				resize = None;
-				next_frame = now + FRAME_INTERVAL;
+				next_frame = chat_deadline(&host.chat);
 			},
 		}
 	}
@@ -1164,6 +1159,10 @@ fn close_overlay(
 		)?;
 	}
 	Ok(())
+}
+
+fn chat_deadline(chat: &Chat) -> Option<Instant> {
+	chat.next_wake().map(|delay| Instant::now() + delay)
 }
 
 async fn deadline(at: Option<Instant>) {

@@ -30,7 +30,7 @@ use crate::{
 	slots::{Mount, Slots},
 };
 
-const LIVE_PANEL_ROWS: u16 = 12;
+const MAX_LIVE_PANEL_CONTENT_ROWS: u16 = 12;
 /// Column cap for inline tool-result images inside committed cards.
 const TOOL_IMAGE_MAX_COLS: u16 = 64;
 /// Row cap for inline tool-result images inside committed cards.
@@ -915,30 +915,34 @@ impl Component for ChatStatus {
 
 /// Immediate-mode designed chat scene driven entirely by host data.
 pub struct Chat {
-	started_at:      Instant,
-	ctx:             UiContext,
-	editor_ui:       Ui,
-	attachments:     Attachments,
-	pending_submit:  VecDeque<(String, Vec<Attachment>, SubmitMode)>,
-	copied:          Option<Str>,
-	work:            Rc<RefCell<WorkState>>,
-	session_title:   Str,
-	transcript:      Vec<Entry>,
-	drawn_entries:   usize,
-	transcript_rows: u16,
-	last_viewport:   Size,
-	height_floor:    u16,
-	frame:           Frame,
-	live_assistant:  Option<LiveAssistant>,
-	live_tools:      Vec<LiveTool>,
-	live_revision:   u64,
-	drawn_live:      u64,
-	last_working:    bool,
-	right_inset:     u16,
-	slots:           Slots,
-	agents:          Vec<AgentRow>,
-	agent_labels:    Vec<Str>,
-	attribution:     Option<Attribution>,
+	started_at:         Instant,
+	ctx:                UiContext,
+	editor_ui:          Ui,
+	attachments:        Attachments,
+	pending_submit:     VecDeque<(String, Vec<Attachment>, SubmitMode)>,
+	copied:             Option<Str>,
+	work:               Rc<RefCell<WorkState>>,
+	session_title:      Str,
+	transcript:         Vec<Entry>,
+	drawn_entries:      usize,
+	transcript_rows:    u16,
+	last_viewport:      Size,
+	height_floor:       u16,
+	last_editor_height: u16,
+	last_panel_height:  u16,
+	frame:              Frame,
+	live_assistant:     Option<LiveAssistant>,
+	live_tools:         Vec<LiveTool>,
+	live_revision:      u64,
+	drawn_live:         u64,
+	last_working:       bool,
+	host_right_inset:   u16,
+	slot_right_inset:   u16,
+	layout_width:       u16,
+	slots:              Slots,
+	agents:             Vec<AgentRow>,
+	agent_labels:       Vec<Str>,
+	attribution:        Option<Attribution>,
 }
 
 impl Chat {
@@ -977,13 +981,17 @@ impl Chat {
 			transcript_rows: 0,
 			last_viewport: Size::new(0, 0),
 			height_floor: 0,
+			last_editor_height: 0,
+			last_panel_height: 0,
 			frame: Frame::new(Size::new(0, 0)),
 			live_assistant: None,
 			live_tools: Vec::new(),
 			live_revision: 0,
 			drawn_live: 0,
 			last_working: false,
-			right_inset: 0,
+			host_right_inset: 0,
+			slot_right_inset: 0,
+			layout_width: 0,
 			agents: Vec::new(),
 			agent_labels: Vec::new(),
 			slots: Slots::new(ctx.clone()),
@@ -1172,13 +1180,13 @@ impl Chat {
 
 	/// Reserves right-edge columns for host-composited chrome.
 	pub const fn set_right_inset(&mut self, cols: u16) {
-		self.right_inset = cols;
+		self.host_right_inset = cols;
 	}
 
 	/// Appends a committed user message.
 	pub fn push_user(&mut self, text: impl Into<String>, chips: Vec<Str>) {
 		self.transcript.push(Entry::User(UserEntry {
-			body: RichText::new(text, Self::message_width(self.last_viewport.width), &self.ctx),
+			body: RichText::new(text, Self::message_width(self.layout_width), &self.ctx),
 			chips,
 		}));
 	}
@@ -1212,7 +1220,7 @@ impl Chat {
 				.expect("matching live assistant exists");
 			self.transcript.push(Entry::Assistant(RichText::new(
 				message.text.as_str(),
-				Self::message_width(self.last_viewport.width),
+				Self::message_width(self.layout_width),
 				&self.ctx,
 			)));
 			self.bump_live();
@@ -1228,7 +1236,7 @@ impl Chat {
 			title,
 			view: ToolView::structured(
 				Default::default(),
-				Self::tool_view_width(self.last_viewport.width),
+				Self::tool_view_width(self.layout_width),
 				&self.ctx,
 			),
 			images: Vec::new(),
@@ -1429,7 +1437,9 @@ impl Chat {
 		work.elapsed_label = None;
 		work.update_active_brand(now, self.ctx.charset);
 		drop(work);
-		self.editor_ui.invalidate(STATUS_ID);
+		self
+			.editor_ui
+			.update_component::<EditorPane>(INPUT_ID, |_| true);
 		self.bump_live();
 	}
 
@@ -1534,6 +1544,21 @@ impl Chat {
 		self.render_at(viewport, self.started_at.elapsed())
 	}
 
+	/// Returns the delay until the composer's next requested animation frame.
+	///
+	/// A settled idle chat returns `None`, allowing custom hosts to block on
+	/// input and backend events without polling.
+	pub fn next_wake(&self) -> Option<Duration> {
+		if self.layout_width != self.content_width(self.last_viewport) {
+			return Some(Duration::ZERO);
+		}
+		let elapsed = self.started_at.elapsed();
+		self
+			.editor_ui
+			.next_wake()
+			.map(|deadline| deadline.saturating_sub(elapsed))
+	}
+
 	/// Produces one throwaway viewport during an active resize gesture.
 	pub fn render_resize_preview(&mut self, viewport: Size) -> Frame {
 		let elapsed = self.started_at.elapsed();
@@ -1542,23 +1567,21 @@ impl Chat {
 			return frame;
 		}
 		frame.fill(Rect::new(0, 0, viewport.width, viewport.height), base_style(self.ctx.theme));
-		let composer_width = self.composer_width(viewport);
+		let content_width = self.content_width(viewport);
+		let composer_width = content_width;
 		if self.editor_ui.frame().size().width != composer_width {
 			self.editor_ui.resize(composer_width);
 		}
 		self.editor_ui.tick(elapsed);
 		let editor_height = self.composer_rows();
+		let panel_height = self.live_panel_height(content_width);
 		let editor_y = viewport.height.saturating_sub(editor_height);
 		let title_y = editor_y.saturating_sub(1);
 		let working_y = title_y.saturating_sub(1);
 		let panel_y = working_y
-			.saturating_sub(1)
-			.saturating_sub(LIVE_PANEL_ROWS + 2);
-		self.draw_live_panel(
-			&mut frame,
-			Rect::new(0, panel_y, viewport.width, LIVE_PANEL_ROWS + 2),
-			elapsed,
-		);
+			.saturating_sub(u16::from(panel_height > 0))
+			.saturating_sub(panel_height);
+		self.draw_live_panel(&mut frame, Rect::new(0, panel_y, content_width, panel_height), elapsed);
 		if self.is_working() {
 			self.draw_working(&mut frame, working_y, elapsed);
 		}
@@ -1569,14 +1592,14 @@ impl Chat {
 			if remaining == 0 {
 				break;
 			}
-			let preview = PreviewEntry::new(entry, viewport.width, &self.ctx);
-			let height = preview.height(viewport.width);
+			let preview = PreviewEntry::new(entry, content_width, &self.ctx);
+			let height = preview.height(content_width);
 			if height <= remaining {
 				remaining -= height;
-				preview.draw(&mut frame, remaining, viewport.width, &self.ctx);
+				preview.draw(&mut frame, remaining, content_width, &self.ctx);
 			} else {
-				let mut scratch = Frame::new(Size::new(viewport.width, height));
-				preview.draw(&mut scratch, 0, viewport.width, &self.ctx);
+				let mut scratch = Frame::new(Size::new(content_width, height));
+				preview.draw(&mut scratch, 0, content_width, &self.ctx);
 				frame.blit(&scratch, height - remaining, remaining, 0, 0);
 				remaining = 0;
 			}
@@ -1602,14 +1625,20 @@ impl Chat {
 		self.live_revision = self.live_revision.wrapping_add(1);
 	}
 
-	fn composer_width(&self, viewport: Size) -> u16 {
-		viewport.width.saturating_sub(self.right_inset).max(1)
+	const fn right_inset(&self) -> u16 {
+		self.host_right_inset.saturating_add(self.slot_right_inset)
+	}
+
+	fn content_width(&self, viewport: Size) -> u16 {
+		viewport.width.saturating_sub(self.right_inset()).max(1)
 	}
 
 	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> RenderedFrame<'_> {
 		if viewport.width == 0 || viewport.height == 0 {
 			self.last_viewport = viewport;
 			self.height_floor = 0;
+			self.last_editor_height = 0;
+			self.last_panel_height = 0;
 			self.drawn_entries = 0;
 			self.transcript_rows = 0;
 			self.frame = Frame::new(viewport);
@@ -1619,32 +1648,35 @@ impl Chat {
 				damage:      SmallVec::new(),
 			};
 		}
-		let composer_width = self.composer_width(viewport);
-		if self.editor_ui.frame().size().width != composer_width {
-			self.editor_ui.resize(composer_width);
+		let content_width = self.content_width(viewport);
+		if self.editor_ui.frame().size().width != content_width {
+			self.editor_ui.resize(content_width);
 		}
 		self.editor_ui.tick(elapsed);
 		let editor_changed = self.editor_ui.take_frame_damage();
-		let rebuild = self.last_viewport != viewport;
+		let rebuild = self.last_viewport != viewport || self.layout_width != content_width;
 		if rebuild {
 			self.last_viewport = viewport;
+			self.layout_width = content_width;
 			self.height_floor = 0;
 			self.drawn_entries = 0;
 			self.transcript_rows = 0;
 			for entry in &mut self.transcript {
-				Self::resize_entry(entry, viewport.width, &self.ctx);
+				Self::resize_entry(entry, content_width, &self.ctx);
 			}
-			let view_width = Self::tool_view_width(viewport.width);
+			let view_width = Self::tool_view_width(content_width);
 			for tool in &mut self.live_tools {
 				tool.view.resize(view_width, &self.ctx);
 			}
 		}
 		let new_rows = self.transcript[self.drawn_entries..]
 			.iter()
-			.fold(0_u16, |rows, entry| rows.saturating_add(Self::entry_height(entry, viewport.width)));
+			.fold(0_u16, |rows, entry| rows.saturating_add(Self::entry_height(entry, content_width)));
 		let transcript_rows = self.transcript_rows.saturating_add(new_rows);
 		let editor_height = self.composer_rows();
-		let natural_height = transcript_rows.saturating_add(Self::band_height(editor_height));
+		let panel_height = self.live_panel_height(content_width);
+		let natural_height =
+			transcript_rows.saturating_add(Self::band_height(editor_height, panel_height));
 		self.height_floor = self.height_floor.max(natural_height);
 		let document_height = self.height_floor.max(viewport.height);
 		let transcript_damage_start = if rebuild { 0 } else { self.transcript_rows };
@@ -1652,10 +1684,13 @@ impl Chat {
 		let title_y = editor_y.saturating_sub(1);
 		let working_y = title_y.saturating_sub(1);
 		let panel_y = working_y
-			.saturating_sub(1)
-			.saturating_sub(LIVE_PANEL_ROWS + 2);
-		let panel = Rect::new(0, panel_y, viewport.width, LIVE_PANEL_ROWS + 2);
-		let repaint_suffix = rebuild || new_rows > 0;
+			.saturating_sub(u16::from(panel_height > 0))
+			.saturating_sub(panel_height);
+		let panel = Rect::new(0, panel_y, content_width, panel_height);
+		let band_reflow = !rebuild
+			&& ((self.last_editor_height != 0 && editor_height != self.last_editor_height)
+				|| panel_height != self.last_panel_height);
+		let repaint_suffix = rebuild || new_rows > 0 || band_reflow;
 		if rebuild {
 			self.frame = Frame::new(Size::new(viewport.width, document_height));
 		} else {
@@ -1676,13 +1711,8 @@ impl Chat {
 		}
 		let mut y = self.transcript_rows;
 		for index in self.drawn_entries..self.transcript.len() {
-			let used = Self::draw_entry(
-				&mut self.frame,
-				&self.transcript[index],
-				y,
-				viewport.width,
-				&self.ctx,
-			);
+			let used =
+				Self::draw_entry(&mut self.frame, &self.transcript[index], y, content_width, &self.ctx);
 			y = y.saturating_add(used);
 		}
 		self.drawn_entries = self.transcript.len();
@@ -1705,7 +1735,7 @@ impl Chat {
 		if repaint_suffix || live_changed {
 			self.draw_session_title_owned(title_y);
 		}
-		let hud = Rect::new(0, working_y, viewport.width, 2);
+		let hud = Rect::new(0, working_y, content_width, 2);
 		if !self.frame.noselect().contains(&hud) {
 			self.frame.push_noselect(hud);
 		}
@@ -1726,13 +1756,13 @@ impl Chat {
 		} else {
 			Bands::compose(&mut self.frame, &mut self.slots, frame_size)
 		};
-		self.right_inset = rails.right;
+		self.slot_right_inset = rails.right;
 		let mut damage = SmallVec::new();
 		if repaint_suffix {
 			damage.push((transcript_damage_start, document_height));
 		} else {
 			if live_changed {
-				damage.push((panel_y, panel_y.saturating_add(LIVE_PANEL_ROWS + 2)));
+				damage.push((panel_y, panel_y.saturating_add(panel_height)));
 			}
 			if working || working_changed {
 				damage.push((working_y, working_y.saturating_add(1)));
@@ -1743,11 +1773,39 @@ impl Chat {
 		}
 		self.drawn_live = self.live_revision;
 		self.last_working = working;
+		self.last_editor_height = editor_height;
+		self.last_panel_height = panel_height;
 		RenderedFrame { frame: &self.frame, stable_rows: self.transcript_rows, damage }
 	}
 
-	const fn band_height(editor_height: u16) -> u16 {
-		LIVE_PANEL_ROWS + 5 + editor_height
+	const fn band_height(editor_height: u16, panel_height: u16) -> u16 {
+		let panel_gap = if panel_height > 0 { 1 } else { 0 };
+		editor_height
+			.saturating_add(2)
+			.saturating_add(panel_gap)
+			.saturating_add(panel_height)
+	}
+
+	fn live_panel_height(&self, width: u16) -> u16 {
+		let inner_width = width.saturating_sub(2).max(1);
+		let agent_rows = self.agent_labels.len().min(8) as u16;
+		let assistant_rows = self
+			.live_assistant
+			.as_ref()
+			.map_or(0, |assistant| flowed_height(assistant.text.as_str(), inner_width));
+		let tool_rows = self
+			.live_tools
+			.iter()
+			.fold(0_u16, |rows, tool| rows.saturating_add(1).saturating_add(tool.view.height()));
+		let content_rows = agent_rows
+			.saturating_add(assistant_rows)
+			.saturating_add(tool_rows)
+			.min(MAX_LIVE_PANEL_CONTENT_ROWS);
+		if content_rows == 0 {
+			0
+		} else {
+			content_rows.saturating_add(2)
+		}
 	}
 
 	const fn message_width(width: u16) -> u16 {
@@ -1793,7 +1851,9 @@ impl Chat {
 			Entry::Compaction(compaction) => {
 				flowed_height(&compaction.label, width.saturating_sub(2)).saturating_add(1)
 			},
-			Entry::Notice { text, .. } => flowed_height(text, width).saturating_add(1),
+			Entry::Notice { text, .. } => {
+				flowed_height(text, width.saturating_sub(2)).saturating_add(1)
+			},
 		}
 	}
 
@@ -1883,17 +1943,12 @@ impl Chat {
 	}
 
 	fn draw_session_title_owned(&mut self, y: u16) {
-		draw_session_title_impl(
-			&mut self.frame,
-			y,
-			self.right_inset,
-			&self.session_title,
-			self.ctx.theme,
-		);
+		let right_inset = self.right_inset();
+		draw_session_title_impl(&mut self.frame, y, right_inset, &self.session_title, self.ctx.theme);
 	}
 
 	fn draw_session_title(&self, frame: &mut Frame, y: u16) {
-		draw_session_title_impl(frame, y, self.right_inset, &self.session_title, self.ctx.theme);
+		draw_session_title_impl(frame, y, self.right_inset(), &self.session_title, self.ctx.theme);
 	}
 }
 
@@ -2360,6 +2415,34 @@ mod tests {
 		omp_tui::test_support::frame_row_text(frame, row)
 	}
 
+	fn present_and_assert_terminal(
+		chat: &mut Chat,
+		renderer: &mut omp_tui::Renderer<Vec<u8>>,
+		terminal: &mut omp_tui::test_support::TerminalModel,
+		viewport: Size,
+	) -> (u16, SmallVec<(u16, u16), 4>) {
+		let rendered = chat.render(viewport);
+		let height = rendered.frame.size().height;
+		let damage = rendered.damage.clone();
+		renderer
+			.present_overlaid(
+				rendered.frame,
+				rendered.damage.as_slice(),
+				viewport.height,
+				rendered.stable_rows,
+				&[],
+			)
+			.expect("chat frame presents");
+		let window_top = height.saturating_sub(viewport.height);
+		let expected = (window_top..height)
+			.map(|row| row_text(rendered.frame, row))
+			.collect::<Vec<_>>();
+		let output = std::mem::take(renderer.writer_mut());
+		terminal.apply(std::str::from_utf8(&output).expect("renderer output is UTF-8"));
+		assert_eq!(terminal.visible_rows(), expected.as_slice());
+		(height, damage)
+	}
+
 	fn text_color(frame: &Frame, needle: &str) -> Option<Color> {
 		(0..frame.size().height).find_map(|row| {
 			let text = row_text(frame, row);
@@ -2367,6 +2450,80 @@ mod tests {
 			let column = visible_width(&text[..byte]);
 			Some(frame.cell(column, row).style().foreground_color())
 		})
+	}
+
+	#[test]
+	fn completion_reflow_damages_rows_vacated_when_popup_closes() {
+		let viewport = Size::new(80, 24);
+		let mut chat = Chat::new(&ctx());
+		chat.set_slash_commands(vec![
+			Command::new("model", "Choose a model", &[]),
+			Command::new("models", "List available models", &[]),
+			Command::new("mode", "Change interaction mode", &[]),
+		]);
+		let mut renderer = omp_tui::Renderer::new(Vec::new());
+		let mut terminal = omp_tui::test_support::TerminalModel::new(
+			usize::from(viewport.width),
+			usize::from(viewport.height),
+		);
+
+		let _ = present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		let collapsed_height = chat.composer_rows();
+
+		assert_eq!(chat.handle_key(Key::Char('/')), ChatKey::Consumed);
+		let _ = present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		let expanded_height = chat.composer_rows();
+		assert!(expanded_height > collapsed_height, "completion popup must grow the editor");
+
+		assert_eq!(chat.handle_key(Key::Esc), ChatKey::Ignored);
+		let (_, damage) =
+			present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		assert_eq!(chat.composer_rows(), collapsed_height, "closing popup must shrink the editor");
+		assert_eq!(
+			damage.as_slice(),
+			&[(chat.transcript_rows, chat.frame.size().height)],
+			"the shrink frame must repaint the whole mutable suffix, including vacated popup rows",
+		);
+	}
+
+	#[test]
+	fn live_panel_is_content_sized_and_reflows_without_stale_rows() {
+		let viewport = Size::new(80, 24);
+		let mut chat = Chat::new(&ctx());
+		let mut renderer = omp_tui::Renderer::new(Vec::new());
+		let mut terminal = omp_tui::test_support::TerminalModel::new(
+			usize::from(viewport.width),
+			usize::from(viewport.height),
+		);
+		let _ = present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		assert_eq!(chat.live_panel_height(viewport.width), 0);
+
+		chat.agent_labels.push(sf!("Main · running · 0"));
+		chat.bump_live();
+		let (_, damage) =
+			present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		assert_eq!(chat.live_panel_height(viewport.width), 3, "one label needs one row plus border");
+		assert_eq!(damage.as_slice(), &[(chat.transcript_rows, chat.frame.size().height)]);
+
+		chat.tool_started("tool", "read", "Read source");
+		let prior_height = chat.live_panel_height(viewport.width);
+		let (_, damage) =
+			present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		assert!(chat.live_panel_height(viewport.width) > 3, "tool content must grow the panel");
+		assert_eq!(damage.as_slice(), &[(chat.transcript_rows, chat.frame.size().height)]);
+
+		chat.live_tools.clear();
+		chat.agent_labels.clear();
+		chat.bump_live();
+		let (_, damage) =
+			present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
+		assert!(prior_height > 3);
+		assert_eq!(chat.live_panel_height(viewport.width), 0, "empty panel must occupy no rows");
+		assert_eq!(
+			damage.as_slice(),
+			&[(chat.transcript_rows, chat.frame.size().height)],
+			"shrinking the panel must repaint its vacated rows",
+		);
 	}
 
 	#[test]
@@ -2459,6 +2616,33 @@ mod tests {
 			(bottom - composer_rows..bottom)
 				.any(|row| row_text(rendered.frame, row).contains("model-a"))
 		);
+	}
+
+	#[test]
+	fn right_rail_inset_reflows_errors_and_preserves_composer_border() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_composer_style(ComposerStyle::Box);
+		chat.set_right_inset(30);
+		let viewport = Size::new(120, 40);
+		let composer_rows = chat.composer_rows();
+		let _ = chat.render(viewport);
+		assert!(chat.next_wake().is_none());
+		chat.set_status(StatusFacts { working: true, ..StatusFacts::default() });
+		{
+			let rendered = chat.render(viewport);
+			let composer_top = rendered.frame.size().height - composer_rows;
+			assert!(row_text(rendered.frame, composer_top).ends_with('╮'));
+		}
+		chat.set_status(StatusFacts::default());
+		chat.push_error("x".repeat(100));
+		let rendered = chat.render(viewport);
+		assert_eq!(rendered.stable_rows, 3);
+		let error_text = (0..rendered.stable_rows)
+			.map(|row| row_text(rendered.frame, row))
+			.collect::<String>();
+		assert_eq!(error_text.matches('x').count(), 100);
+		let composer_top = rendered.frame.size().height - composer_rows;
+		assert!(row_text(rendered.frame, composer_top).ends_with('╮'));
 	}
 
 	#[test]

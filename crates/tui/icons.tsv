@@ -509,6 +509,7 @@ locked-pen	security.lockedPen	lock+p	🔏	
 locked-with-key-door	security.lockedWithKeyDoor	lock	🔐	󱂯
 locomotive	object.locomotive	train	🚂	
 log	lang.log	log	📜	󰌱
+log-in	nav.login	->]	🔑	󰍂
 lollipop	object.lollipop	lolly	🍭	
 long-drum	object.longDrum	drum	🪘	
 loop	icon.loop	loop	↻	
