@@ -16,6 +16,8 @@ pub const USER_AGENT: &str = concat!("omp/", env!("CARGO_PKG_VERSION"));
 pub mod append_vec;
 pub mod cache;
 pub mod cow_bytes;
+/// Stable local and UTC display-time formatting.
+pub mod display_time;
 pub mod encoding;
 pub mod hash32;
 pub mod location;
@@ -28,12 +30,17 @@ pub mod sparse_index;
 pub mod sparse_map;
 pub mod sparse_set;
 pub mod str;
+/// Branded string identifier macro with default borrowed  query forms.
+pub mod string_id;
 pub mod time;
 pub mod ulid;
 
 pub use append_vec::{AppendSlice, AppendVec};
 pub use cache::MemoCache;
 pub use cow_bytes::CowBytes;
+pub use display_time::{
+	DisplayTimeError, local_calendar_date, local_minute_with_offset, utc_minute,
+};
 pub use encoding::{base32, base32_dns, base32_hex, base64, base64_url, hex};
 pub use hash32::{Hash32, Hash32ParseError};
 pub use location::{

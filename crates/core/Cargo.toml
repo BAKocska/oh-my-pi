@@ -16,6 +16,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 bytes-utils = { workspace = true }
 heapless = { workspace = true }
+jiff = { workspace = true }
 parking_lot_core = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
