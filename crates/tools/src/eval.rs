@@ -888,6 +888,7 @@ fn eval_controlled_described<E: EvalExec>(
 					max_requests: u32::MAX,
 					max_usd:      Usd::from_nanos(u64::MAX),
 				}),
+				desktop:   None,
 				subagents: u32::MAX,
 			},
 			projection_code: omp_tool::native_projection_code(

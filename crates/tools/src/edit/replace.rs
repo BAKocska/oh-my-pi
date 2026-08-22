@@ -93,6 +93,7 @@ pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy)
 				}),
 				exec:      None,
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

@@ -89,6 +89,7 @@ pub fn tool<C: web::types::HttpClient + Send + Sync + 'static>(client: C) -> Fet
 				documents: None,
 				exec:      Some(ExecEffects { network: true, commands: Arc::default() }),
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

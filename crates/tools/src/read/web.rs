@@ -155,7 +155,14 @@ pub async fn read_resource<C: HttpClient + Sync>(
 
 	if let Some(document_extension) = document_extension(&content_type, &extension) {
 		let path = synthetic_path(document_extension);
-		match markit::convert_cached(client, &path, &response.body).await {
+		match markit::convert_cached(
+			client,
+			markit::DocumentMetadata { path: &path, media_type: Some(&content_type) },
+			&response.body,
+			markit::ConversionOptions::default(),
+		)
+		.await
+		{
 			Ok(Some(converted)) => {
 				let converted = converted.conversion;
 				let mut notes = SmallVec::new();
@@ -704,10 +711,8 @@ fn synthetic_path(extension: &str) -> std::path::PathBuf {
 }
 
 fn document_extension<'a>(mime: &str, extension: &'a str) -> Option<&'a str> {
-	if markit::supports_extension(extension) {
-		return Some(extension);
-	}
-	Some(match mime {
+	let mime = mime.split(';').next().unwrap_or(mime).trim();
+	let mime_extension = match mime {
 		"application/pdf" => ".pdf",
 		"application/msword" => ".doc",
 		"application/vnd.ms-word.document.macroenabled.12" => ".docm",
@@ -722,8 +727,12 @@ fn document_extension<'a>(mime: &str, extension: &'a str) -> Option<&'a str> {
 		"application/vnd.openxmlformats-officedocument.presentationml.presentation" => ".pptx",
 		"application/rtf" | "application/x-rtf" | "text/rtf" => ".rtf",
 		"application/epub+zip" => ".epub",
-		_ => return None,
-	})
+		_ => "",
+	};
+	if !mime_extension.is_empty() {
+		return Some(mime_extension);
+	}
+	markit::supports_extension(extension).then_some(extension)
 }
 
 fn is_notebook(mime: &str, extension: &str) -> bool {

@@ -46,7 +46,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Conversion, MarkitError> {
 		},
 	};
 
-	Ok(Conversion { text, note, title: result.title.map(Str::new) })
+	Ok(Conversion { text, note, title: result.title.map(Str::new), attachments: Vec::new() })
 }
 
 fn extraction_note(

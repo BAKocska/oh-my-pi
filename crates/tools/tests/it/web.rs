@@ -443,6 +443,7 @@ fn registry_matching_and_first_match_precedence_are_explicit() {
 		Scraper::GitHubGist,
 		Scraper::GitHub,
 		Scraper::GitLab,
+		Scraper::LongTail,
 		Scraper::YouTube,
 		Scraper::Twitter,
 		Scraper::HackerNews,

@@ -138,10 +138,18 @@ message InferenceEffects {
   omp.inference.v1.ValueMap props = 15;
 }
 
+message DesktopEffects {
+  bool capture = 1;
+  bool accessibility = 2;
+  bool input = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
 message EffectEnvelope {
   optional DocEffects documents = 1;
   optional ExecEffects exec = 2;
   optional InferenceEffects inference = 3;
   uint32 subagents = 4;
+  optional DesktopEffects desktop = 5;
   omp.inference.v1.ValueMap props = 15;
 }

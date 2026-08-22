@@ -213,6 +213,7 @@ pub fn tool<C: LspControl>(control: C, maximum: Duration) -> LspTool<C> {
 				}),
 				exec:      None,
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

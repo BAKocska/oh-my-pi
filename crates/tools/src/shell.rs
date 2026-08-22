@@ -501,6 +501,7 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 					network:  true,
 				}),
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

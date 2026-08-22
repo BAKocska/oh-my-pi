@@ -5,6 +5,7 @@ use url::Url;
 use crate::read::web::types::{HttpClient, RenderResult, WebError};
 
 mod arxiv;
+mod catalog;
 mod crates_io;
 mod docs_rs;
 mod github;
@@ -35,6 +36,8 @@ pub enum Scraper {
 	GitHub,
 	/// GitLab repositories and content.
 	GitLab,
+	/// Pi's ordered long-tail public API catalog.
+	LongTail,
 	/// `YouTube` videos and channels.
 	YouTube,
 	/// Twitter and X posts.
@@ -65,10 +68,11 @@ pub enum Scraper {
 
 impl Scraper {
 	/// Scrapers in deterministic first-match order.
-	pub const ALL: [Self; 16] = [
+	pub const ALL: [Self; 17] = [
 		Self::GitHubGist,
 		Self::GitHub,
 		Self::GitLab,
+		Self::LongTail,
 		Self::YouTube,
 		Self::Twitter,
 		Self::HackerNews,
@@ -91,6 +95,7 @@ impl Scraper {
 			Self::GitHubGist => github_gist::matches(url),
 			Self::GitHub => github::matches(url),
 			Self::GitLab => gitlab::matches(url),
+			Self::LongTail => catalog::matches(url),
 			Self::YouTube => youtube::matches(url),
 			Self::Twitter => twitter::matches(url),
 			Self::HackerNews => hackernews::matches(url),
@@ -117,6 +122,7 @@ impl Scraper {
 			Self::GitHubGist => github_gist::render(client, url).await,
 			Self::GitHub => github::render(client, url).await,
 			Self::GitLab => gitlab::render(client, url).await,
+			Self::LongTail => catalog::render(client, url).await,
 			Self::YouTube => youtube::render(client, url).await,
 			Self::Twitter => twitter::render(client, url).await,
 			Self::HackerNews => hackernews::render(client, url).await,

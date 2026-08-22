@@ -6,8 +6,10 @@ use omp_core::Str;
 use quick_xml::{Reader, XmlVersion, events::Event};
 
 use super::{
-	MarkitError,
-	ooxml::{Archive, decode_reference, decode_xml_bytes, format_url},
+	Attachment, Conversion, MarkitError,
+	ooxml::{
+		Archive, attachment_name, decode_reference, decode_xml_bytes, format_url, image_media_type,
+	},
 };
 
 const FORMAT: &str = "docx";
@@ -141,7 +143,7 @@ struct Context {
 
 /// Converts an Office Open XML word-processing document to deterministic
 /// Markdown.
-pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
+pub(super) fn convert(bytes: &[u8], extract_media: bool) -> Result<Conversion, MarkitError> {
 	let mut archive =
 		Archive::open(bytes).map_err(|error| MarkitError::conversion(FORMAT, error))?;
 	let root_relationships = read_member(&mut archive, "_rels/.rels")?
@@ -163,6 +165,11 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
 		.map(|xml| parse_relationships(&xml))
 		.transpose()?
 		.unwrap_or_default();
+	let attachments = if extract_media {
+		extract_attachments(&mut archive, &main_part, &relationships)?
+	} else {
+		Vec::new()
+	};
 	let drawing_text = read_drawing_text(&mut archive, &main_part, &relationships)?;
 	let styles_part = related_part(&relationships, &main_part, "/styles", "styles.xml");
 	let (styles, doc_defaults) = read_member(&mut archive, &styles_part)?
@@ -189,7 +196,46 @@ pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
 	let mut blocks = Vec::new();
 	render_block_children(body, &mut context, &mut blocks)?;
 	render_notes(&mut archive, &main_part, &mut context, &mut blocks)?;
-	Ok(Str::new(blocks.join("\n\n").trim_end()))
+	Ok(Conversion {
+		text: Str::new(blocks.join("\n\n").trim_end()),
+		note: None,
+		title: None,
+		attachments,
+	})
+}
+
+fn extract_attachments(
+	archive: &mut Archive<'_>,
+	main_part: &str,
+	relationships: &HashMap<String, Relationship>,
+) -> Result<Vec<Attachment>, MarkitError> {
+	let mut images = relationships
+		.iter()
+		.filter(|(_, relationship)| {
+			!relationship.external && relationship.rel_type.ends_with("/image")
+		})
+		.collect::<Vec<_>>();
+	images.sort_by(|(left, _), (right, _)| left.cmp(right));
+	let mut used = HashSet::new();
+	let mut attachments = Vec::with_capacity(images.len());
+	for (ordinal, (_, relationship)) in images.into_iter().enumerate() {
+		let Some(path) = resolve_part_path(main_part, &relationship.target) else {
+			continue;
+		};
+		let Some(bytes) = archive
+			.read(&path)
+			.map_err(|error| MarkitError::conversion(FORMAT, error))?
+		else {
+			continue;
+		};
+		let name = attachment_name(&path, ordinal + 1, &mut used);
+		attachments.push(Attachment {
+			name:       name.into(),
+			media_type: image_media_type(&path, &bytes).into(),
+			bytes:      bytes.into(),
+		});
+	}
+	Ok(attachments)
 }
 
 fn read_member(archive: &mut Archive<'_>, path: &str) -> Result<Option<String>, MarkitError> {
@@ -1804,7 +1850,7 @@ mod tests {
 				r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>1. Title &amp; * one</w:t></w:r></w:p><w:p><w:r><w:t>- prose</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="DerivedList"/></w:pPr><w:r><w:t>Item</w:t></w:r></w:p><w:p><w:hyperlink r:id="rId1"><w:r><w:t>Example</w:t><w:br/><w:t>site</w:t></w:r></w:hyperlink></w:p><w:p><w:hyperlink w:anchor="bookmark"><w:r><w:t>Jump</w:t></w:r></w:hyperlink></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>x|y</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#,
 			),
 		]);
-		let markdown = convert(&bytes).unwrap();
+		let markdown = convert(&bytes, false).unwrap();
 		assert_eq!(
 			markdown.as_str(),
 			"# 1. Title & \\* one\n\n\\- prose\n\n- Item\n\n[Example  \nsite](<https://example.com/a \
@@ -1871,7 +1917,7 @@ mod tests {
 			),
 		]);
 		assert_eq!(
-			convert(&bytes).unwrap().as_str(),
+			convert(&bytes, false).unwrap().as_str(),
 			"<a id=\"spot\"></a>Target\n\n[Simple](<https://e.com/a b>)\n\n[Complex](https://e.com/c)\n\nNewKept\n\n![Diagram](https://example.com/pic.png)\n\nNotes[^en3][^fn2]\n\n[^en3]: End\n\n[^fn2]: Foot"
 		);
 	}
@@ -1902,7 +1948,7 @@ mod tests {
 			),
 		]);
 		assert_eq!(
-			convert(&bytes).unwrap().as_str(),
+			convert(&bytes, false).unwrap().as_str(),
 			"***Styled***\n\n*Changed*\n\n## Title next\n\n### Outline\n\nleaddiscarded kept \
 			 tail\n\nPage  \nBreak"
 		);
@@ -1939,7 +1985,7 @@ mod tests {
 			),
 		]);
 		assert_eq!(
-			convert(&bytes).unwrap().as_str(),
+			convert(&bytes, false).unwrap().as_str(),
 			"  - 3.d) Child\n\nInterruption\n\n  - 3.e) Child two\n\n# 1. Intro\n\nNot a list"
 		);
 	}
@@ -1956,7 +2002,7 @@ mod tests {
 			</w:tbl></w:body></w:document>"#,
 		)]);
 		assert_eq!(
-			convert(&bytes).unwrap().as_str(),
+			convert(&bytes, false).unwrap().as_str(),
 			"|  | A\\|B |  | C |\n| --- | --- | --- | --- |\n| V | D |  |  |\n|  | E |  |  |\n| \
 			 H<br>I |  | J |  |"
 		);
@@ -1991,7 +2037,7 @@ mod tests {
 			),
 		]);
 		assert_eq!(
-			convert(&bytes).unwrap().as_str(),
+			convert(&bytes, false).unwrap().as_str(),
 			"Box text\n\n**Sales**\n\n|  | Q1 |\n| --- | --- |\n| Jan | 10 |\n| Feb | 20 |\n\n- \
 			 One\n- Two\n\nEmbedded object: Excel.Sheet"
 		);
@@ -2041,7 +2087,7 @@ mod tests {
 				r#"<w:styles xmlns:w="w"><w:style w:type="paragraph" w:styleId="H"><w:name w:val="Heading 3"/></w:style></w:styles>"#,
 			),
 		]);
-		assert_eq!(convert(&bytes).unwrap().as_str(), "## Chosen");
+		assert_eq!(convert(&bytes, false).unwrap().as_str(), "## Chosen");
 	}
 
 	#[test]
@@ -2050,9 +2096,9 @@ mod tests {
 			"word/document.xml",
 			r#"<w:document xmlns:w="w" xmlns:mc="mc"><w:body><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:t>Choice</w:t></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>Fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent></w:body></w:document>"#,
 		)]);
-		assert_eq!(convert(&bytes).unwrap().as_str(), "Choice");
+		assert_eq!(convert(&bytes, false).unwrap().as_str(), "Choice");
 		let malformed = docx(&[("word/document.xml", "<w:document><w:body>")]);
-		assert!(convert(&malformed).is_err());
+		assert!(convert(&malformed, false).is_err());
 		let mut count = super::MAX_XML_CONTENT_NODES - 1;
 		super::count_xml_content_node(&mut count).unwrap();
 		assert!(super::count_xml_content_node(&mut count).is_err());

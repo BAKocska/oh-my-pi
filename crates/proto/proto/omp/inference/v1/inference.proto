@@ -545,6 +545,18 @@ message ContextSnapshot {
   uint64 non_message_tokens = 2;
   optional uint64 history_rewrite_tokens_removed = 3;
   optional uint64 last_message_timestamp_ms = 4;
+  optional uint64 system_tokens = 5;
+  optional uint64 message_tokens = 6;
+  optional uint64 tool_tokens = 7;
+  optional uint64 buffer_tokens = 8;
+  optional uint64 unclassified_tokens = 9;
+  optional uint64 window_tokens = 10;
+  optional uint64 slack_tokens = 11;
+  optional uint64 snapcompact_savings = 12;
+  optional uint64 prompt_anchor = 13;
+  optional uint64 context_revision = 14;
+  optional uint64 compaction_epoch = 15;
+  optional uint64 skill_tokens = 16;
 }
 
 message PartEnd {

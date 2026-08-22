@@ -94,6 +94,7 @@ pub fn tool(root: PathBuf) -> AstGrep {
 				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
 				exec:      None,
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

@@ -9,10 +9,10 @@ use quick_xml::{
 };
 
 use super::{
-	MarkitError,
+	Attachment, Conversion, MarkitError,
 	ooxml::{
-		Archive, attribute, decode_reference, decode_text, format_url, local_name,
-		render_markdown_table, xml_reader,
+		Archive, attachment_name, attribute, decode_reference, decode_text, format_url,
+		image_media_type, local_name, render_markdown_table, xml_reader,
 	},
 };
 
@@ -23,11 +23,12 @@ const SLIDE_REL: &str = "/slide";
 const NOTES_REL: &str = "/notesSlide";
 
 /// Converts a PPTX document to Markdown in presentation order.
-pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
-	convert_inner(bytes).map(Str::new).map_err(failure)
+pub(super) fn convert(bytes: &[u8], extract_media: bool) -> Result<Conversion, MarkitError> {
+	let (text, attachments) = convert_inner(bytes, extract_media).map_err(failure)?;
+	Ok(Conversion { text: Str::new(text), note: None, title: None, attachments })
 }
 
-fn convert_inner(bytes: &[u8]) -> Result<String, String> {
+fn convert_inner(bytes: &[u8], extract_media: bool) -> Result<(String, Vec<Attachment>), String> {
 	let mut archive = Archive::open(bytes)?;
 	let root_relationships = archive
 		.read_xml("_rels/.rels")?
@@ -91,6 +92,9 @@ fn convert_inner(bytes: &[u8]) -> Result<String, String> {
 
 	let mut sections = Vec::with_capacity(slide_paths.len());
 	let mut image_count = 0usize;
+	let mut attachments = Vec::new();
+	let mut attachment_names = HashSet::new();
+	let mut extracted_paths = HashSet::new();
 	for (index, (slide_path, relationships)) in
 		slide_paths.iter().zip(&slide_relationships).enumerate()
 	{
@@ -137,14 +141,30 @@ fn convert_inner(bytes: &[u8]) -> Result<String, String> {
 						.description
 						.or(picture.name)
 						.filter(|value| !value.trim().is_empty());
+					let internal_path = (!relationship.external)
+						.then(|| resolve_part(slide_path, &relationship.target))
+						.flatten();
 					if !relationship.external
-						&& !resolve_part(slide_path, &relationship.target)
-							.is_some_and(|target| archive.contains(&target))
+						&& !internal_path
+							.as_deref()
+							.is_some_and(|target| archive.contains(target))
 					{
 						continue;
 					}
 					image_count += 1;
 					let alt = alt.unwrap_or_else(|| format!("image_{image_count}"));
+					if extract_media
+						&& let Some(path) = internal_path.as_deref()
+						&& extracted_paths.insert(path.to_owned())
+						&& let Some(bytes) = archive.read(path)?
+					{
+						let name = attachment_name(path, image_count, &mut attachment_names);
+						attachments.push(Attachment {
+							name:       name.into(),
+							media_type: image_media_type(path, &bytes).into(),
+							bytes:      bytes.into(),
+						});
+					}
 					if relationship.external {
 						lines.push(format!(
 							"![{}]({})",
@@ -198,7 +218,7 @@ fn convert_inner(bytes: &[u8]) -> Result<String, String> {
 		sections.push(lines.join("\n"));
 	}
 
-	Ok(sections.join("\n\n").trim().to_owned())
+	Ok((sections.join("\n\n").trim().to_owned(), attachments))
 }
 
 fn fallback_slide_paths(archive: &Archive<'_>) -> Vec<String> {
@@ -1236,7 +1256,7 @@ mod tests {
 		<p:cxnSp><p:txBody><a:p><a:pPr lvl="1"><a:buAutoNum type="alphaLcParenR" startAt="3"/></a:pPr><a:r><a:t>Connector item</a:t></a:r></a:p></p:txBody></p:cxnSp>
 		</p:spTree></p:cSld></p:sld>"#;
 		let rels = r#"<Relationships><Relationship Id="rId9" Type="x/hyperlink" Target="https://example.com/a b(c)|&lt;x&gt;" TargetMode="External"/></Relationships>"#;
-		let markdown = convert(&pptx(&base_parts(slide, rels))).unwrap();
+		let markdown = convert(&pptx(&base_parts(slide, rels)), false).unwrap();
 		assert_eq!(
 			markdown.as_str(),
 			"<!-- Slide 1 -->\nKicker\n# **Rich**  \n[_title_](<https://example.com/a \
@@ -1257,7 +1277,7 @@ mod tests {
 		let mut parts = base_parts(slide, rels).to_vec();
 		parts.push(("ppt/media/p.png", "png"));
 		parts.push(("ppt/odd/notes.xml", notes));
-		let markdown = convert(&pptx(&parts)).unwrap();
+		let markdown = convert(&pptx(&parts), false).unwrap();
 		assert_eq!(markdown.as_str(), "<!-- Slide 1 -->\n# Title\n<!-- image: Meaningful alt (slide 1) -->\n| Wide |  |\n| --- | --- |\n|  | Tail |\n![Remote alt](<https://example.com/image(a).png%7Craw>)\n\n### Notes:\nSpeaker text");
 	}
 
@@ -1283,7 +1303,7 @@ mod tests {
 		parts.push(("ppt/media/one.png", "one"));
 		parts.push(("ppt/media/two.png", "two"));
 		parts.push(("ppt/media/three.png", "three"));
-		let markdown = convert(&pptx(&parts)).unwrap();
+		let markdown = convert(&pptx(&parts), false).unwrap();
 		assert_eq!(
 			markdown.as_str(),
 			"<!-- Slide 1 -->\n<!-- image: image_1 (slide 1) -->\n<!-- image: image_2 (slide 1) \
@@ -1294,7 +1314,7 @@ mod tests {
 	#[test]
 	fn rejects_pathological_table_spans_without_allocating_them() {
 		let slide = r#"<p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree><p:graphicFrame><a:tbl><a:tr><a:tc gridSpan="2000000000" rowSpan="2000000000"><a:txBody><a:p/></a:txBody></a:tc></a:tr></a:tbl></p:graphicFrame></p:spTree></p:cSld></p:sld>"#;
-		let error = convert(&pptx(&base_parts(slide, "<Relationships/>"))).unwrap_err();
+		let error = convert(&pptx(&base_parts(slide, "<Relationships/>")), false).unwrap_err();
 		assert!(error.to_string().contains("table span exceeds"));
 	}
 }

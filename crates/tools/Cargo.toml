@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 anydoc = { workspace = true }
 async-stream = { workspace = true }
+async-trait = { workspace = true }
 bytecount = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
@@ -33,6 +34,7 @@ omp-core = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
 omp-hashline = { workspace = true }
+omp-memory = { workspace = true }
 omp-proto = { workspace = true }
 omp-py = { workspace = true }
 omp-settings = { workspace = true }

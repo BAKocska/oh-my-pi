@@ -20,6 +20,8 @@ struct Gist {
 	owner:       Option<Owner>,
 	created_at:  String,
 	updated_at:  String,
+	#[serde(default)]
+	comments:    u64,
 	files:       GistFiles,
 }
 
@@ -33,6 +35,12 @@ struct GistFile {
 	filename: String,
 	language: Option<String>,
 	content:  String,
+}
+#[derive(Deserialize)]
+struct GistComment {
+	user:       Option<Owner>,
+	created_at: String,
+	body:       String,
 }
 
 struct GistFiles(Vec<GistFile>);
@@ -149,6 +157,24 @@ pub(super) async fn render<C: HttpClient + Sync>(
 		markdown.push('\n');
 		markdown.push_str(&file.content);
 		markdown.push_str("\n```\n\n");
+	}
+	if gist.comments > 0
+		&& let Some(comments) =
+			api_json::<_, Vec<GistComment>>(client, &format!("{API_ROOT}/{gist_id}/comments")).await?
+		&& !comments.is_empty()
+	{
+		write!(markdown, "---\n\n## Comments ({})\n\n", comments.len())
+			.expect("writing to a String cannot fail");
+		for comment in comments {
+			let author = comment
+				.user
+				.as_ref()
+				.map(|user| user.login.as_str())
+				.filter(|login| !login.is_empty())
+				.unwrap_or("anonymous");
+			write!(markdown, "### @{author} · {}\n\n{}\n\n", comment.created_at, comment.body)
+				.expect("writing to a String cannot fail");
+		}
 	}
 
 	let mut result = RenderResult::markdown(&markdown, "github-gist");

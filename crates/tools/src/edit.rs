@@ -606,6 +606,7 @@ pub fn tool_with_snapshots<D: EditDocuments, S: EditSnapshotStore>(
 				}),
 				exec:      None,
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

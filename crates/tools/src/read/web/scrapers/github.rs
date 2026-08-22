@@ -23,6 +23,12 @@ enum Kind {
 	Issue(u64),
 	Issues,
 	Pull(u64),
+	Discussions,
+	Discussion(u64),
+	Actions,
+	Workflow(String),
+	Run(u64),
+	Job(u64),
 	Other,
 }
 
@@ -57,6 +63,10 @@ pub(super) async fn render<C: HttpClient + Sync>(
 		Kind::Commit => render_commit(client, &target).await,
 		Kind::Issue(_) | Kind::Pull(_) => render_issue(client, &target).await,
 		Kind::Issues => render_issues(client, &target).await,
+		Kind::Discussions | Kind::Discussion(_) => render_discussions(client, &target).await,
+		Kind::Actions | Kind::Workflow(_) | Kind::Run(_) | Kind::Job(_) => {
+			render_actions(client, &target).await
+		},
 		Kind::Other => Ok(None),
 	}
 }
@@ -109,6 +119,22 @@ fn parse(url: &Url) -> Option<Target> {
 			None,
 		),
 		"pulls" => (Kind::Other, None, None),
+		"discussions" => (
+			sub.first()
+				.and_then(|number| number.parse().ok())
+				.map_or(Kind::Discussions, Kind::Discussion),
+			None,
+			None,
+		),
+		"actions" => match sub {
+			[] => (Kind::Actions, None, None),
+			["workflows", workflow, ..] => (Kind::Workflow((*workflow).to_owned()), None, None),
+			["runs", run, "job", job, ..] => {
+				(job.parse().map_or(Kind::Other, Kind::Job), Some((*run).to_owned()), None)
+			},
+			["runs", run, ..] => (run.parse().map_or(Kind::Other, Kind::Run), None, None),
+			_ => (Kind::Other, None, None),
+		},
 		_ => (Kind::Other, None, None),
 	};
 	Some(Target { owner, repo, kind, reference, path })
@@ -416,6 +442,230 @@ async fn render_issues<C: HttpClient + Sync>(
 	Ok(Some(markdown_result(markdown, "github-issues", "Fetched via GitHub API")))
 }
 
+async fn render_discussions<C: HttpClient + Sync>(
+	client: &C,
+	target: &Target,
+) -> Result<Option<RenderResult>, WebError> {
+	match &target.kind {
+		Kind::Discussions => {
+			let endpoint = repo_endpoint(target, "/discussions?per_page=30");
+			let Some(discussions): Option<Vec<Discussion>> = api_json(client, &endpoint).await? else {
+				return Ok(None);
+			};
+			let mut markdown = format!("# {}/{} - Discussions\n\n", target.owner, target.repo);
+			for discussion in discussions {
+				writeln!(
+					markdown,
+					"- **#{}** {} · {} · @{} · {} comments\n  {}\n",
+					discussion.number,
+					discussion.title,
+					discussion.category.name,
+					discussion.user.login,
+					discussion.comments,
+					discussion.created_at
+				)
+				.expect("writing to a String cannot fail");
+			}
+			Ok(Some(markdown_result(
+				markdown,
+				"github-discussions",
+				"Fetched discussions via GitHub API",
+			)))
+		},
+		Kind::Discussion(number) => {
+			let endpoint = repo_endpoint(target, &format!("/discussions/{number}"));
+			let Some(discussion): Option<Discussion> = api_json(client, &endpoint).await? else {
+				return Ok(None);
+			};
+			let mut markdown = format!(
+				"# {}\n\n**Discussion #{}** · {} · @{}\nCreated: {} · Updated: {}\n\n---\n\n{}\n",
+				discussion.title,
+				discussion.number,
+				discussion.category.name,
+				discussion.user.login,
+				discussion.created_at,
+				discussion.updated_at,
+				discussion
+					.body
+					.as_deref()
+					.unwrap_or("*No description provided.*")
+			);
+			if discussion.comments > 0 {
+				let endpoint =
+					repo_endpoint(target, &format!("/discussions/{number}/comments?per_page=100"));
+				if let Some(comments) = api_json::<_, Vec<DiscussionComment>>(client, &endpoint).await?
+					&& !comments.is_empty()
+				{
+					write!(markdown, "\n---\n\n## Comments ({})\n\n", comments.len())
+						.expect("writing to a String cannot fail");
+					for comment in comments {
+						write!(
+							markdown,
+							"### @{} · {}\n\n{}\n\n---\n\n",
+							comment.user.login, comment.created_at, comment.body
+						)
+						.expect("writing to a String cannot fail");
+					}
+				}
+			}
+			Ok(Some(markdown_result(
+				markdown,
+				"github-discussion",
+				"Fetched discussion via GitHub API",
+			)))
+		},
+		_ => Ok(None),
+	}
+}
+
+async fn render_actions<C: HttpClient + Sync>(
+	client: &C,
+	target: &Target,
+) -> Result<Option<RenderResult>, WebError> {
+	match &target.kind {
+		Kind::Actions => {
+			let workflows_endpoint = repo_endpoint(target, "/actions/workflows?per_page=50");
+			let runs_endpoint = repo_endpoint(target, "/actions/runs?per_page=30");
+			let Some(workflows): Option<WorkflowList> = api_json(client, &workflows_endpoint).await?
+			else {
+				return Ok(None);
+			};
+			let runs = api_json::<_, RunList>(client, &runs_endpoint)
+				.await?
+				.unwrap_or_default();
+			let mut markdown =
+				format!("# {}/{} - Actions\n\n## Workflows\n\n", target.owner, target.repo);
+			for workflow in workflows.workflows {
+				writeln!(
+					markdown,
+					"- **{}** · {} · `{}`",
+					workflow.name, workflow.state, workflow.path
+				)
+				.expect("writing to a String cannot fail");
+			}
+			markdown.push_str("\n## Recent runs\n\n");
+			render_run_rows(&mut markdown, &runs.workflow_runs);
+			Ok(Some(markdown_result(
+				markdown,
+				"github-actions",
+				"Fetched workflows and runs via GitHub API",
+			)))
+		},
+		Kind::Workflow(workflow) => {
+			let workflow = percent_encode_path(workflow);
+			let workflow_endpoint = repo_endpoint(target, &format!("/actions/workflows/{workflow}"));
+			let runs_endpoint =
+				repo_endpoint(target, &format!("/actions/workflows/{workflow}/runs?per_page=30"));
+			let Some(details): Option<Workflow> = api_json(client, &workflow_endpoint).await? else {
+				return Ok(None);
+			};
+			let runs = api_json::<_, RunList>(client, &runs_endpoint)
+				.await?
+				.unwrap_or_default();
+			let mut markdown = format!(
+				"# {}\n\n**State:** {} · **Path:** `{}`\n\n## Runs\n\n",
+				details.name, details.state, details.path
+			);
+			render_run_rows(&mut markdown, &runs.workflow_runs);
+			Ok(Some(markdown_result(
+				markdown,
+				"github-workflow",
+				"Fetched workflow runs via GitHub API",
+			)))
+		},
+		Kind::Run(run_id) => {
+			let run_endpoint = repo_endpoint(target, &format!("/actions/runs/{run_id}"));
+			let jobs_endpoint =
+				repo_endpoint(target, &format!("/actions/runs/{run_id}/jobs?per_page=100"));
+			let Some(run): Option<WorkflowRun> = api_json(client, &run_endpoint).await? else {
+				return Ok(None);
+			};
+			let jobs = api_json::<_, JobList>(client, &jobs_endpoint)
+				.await?
+				.unwrap_or_default();
+			let mut markdown = String::new();
+			render_run(&mut markdown, &run);
+			markdown.push_str("\n## Jobs\n\n");
+			for job in jobs.jobs {
+				render_job(&mut markdown, &job);
+			}
+			Ok(Some(markdown_result(
+				markdown,
+				"github-actions-run",
+				"Fetched run and jobs via GitHub API",
+			)))
+		},
+		Kind::Job(job_id) => {
+			let endpoint = repo_endpoint(target, &format!("/actions/jobs/{job_id}"));
+			let Some(job): Option<ActionJob> = api_json(client, &endpoint).await? else {
+				return Ok(None);
+			};
+			let mut markdown = format!("# Job {}\n\n", job.name);
+			render_job(&mut markdown, &job);
+			Ok(Some(markdown_result(markdown, "github-actions-job", "Fetched job via GitHub API")))
+		},
+		_ => Ok(None),
+	}
+}
+
+fn render_run_rows(markdown: &mut String, runs: &[WorkflowRun]) {
+	for run in runs {
+		writeln!(
+			markdown,
+			"- **{}** · {} · {} · `{}` · {}",
+			run.name,
+			run.status,
+			run.conclusion.as_deref().unwrap_or("pending"),
+			run.head_branch.as_deref().unwrap_or("detached"),
+			run.created_at
+		)
+		.expect("writing to a String cannot fail");
+	}
+}
+
+fn render_run(markdown: &mut String, run: &WorkflowRun) {
+	writeln!(
+		markdown,
+		"# {}\n\n**Run #{}** · {} · {}\n**Branch:** `{}` · **Event:** {} · **Created:** {}\n",
+		run.name,
+		run.run_number,
+		run.status,
+		run.conclusion.as_deref().unwrap_or("pending"),
+		run.head_branch.as_deref().unwrap_or("detached"),
+		run.event,
+		run.created_at
+	)
+	.expect("writing to a String cannot fail");
+}
+
+fn render_job(markdown: &mut String, job: &ActionJob) {
+	writeln!(
+		markdown,
+		"### {}\n\n{} · {} · `{}`\n",
+		job.name,
+		job.status,
+		job.conclusion.as_deref().unwrap_or("pending"),
+		job.runner_name.as_deref().unwrap_or("unassigned")
+	)
+	.expect("writing to a String cannot fail");
+	for step in &job.steps {
+		writeln!(
+			markdown,
+			"- {}. {} — {} ({})",
+			step.number,
+			step.name,
+			step.status,
+			step.conclusion.as_deref().unwrap_or("pending")
+		)
+		.expect("writing to a String cannot fail");
+	}
+	markdown.push('\n');
+}
+
+fn percent_encode_path(value: &str) -> String {
+	url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
 async fn render_commit<C: HttpClient + Sync>(
 	client: &C,
 	target: &Target,
@@ -653,6 +903,90 @@ struct IssueListItem {
 	#[serde(default)]
 	labels:       Vec<Label>,
 	pull_request: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct DiscussionCategory {
+	name: String,
+}
+
+#[derive(Deserialize)]
+struct Discussion {
+	number:     u64,
+	title:      String,
+	user:       User,
+	category:   DiscussionCategory,
+	created_at: String,
+	updated_at: String,
+	body:       Option<String>,
+	#[serde(default)]
+	comments:   u64,
+}
+
+#[derive(Deserialize)]
+struct DiscussionComment {
+	user:       User,
+	created_at: String,
+	body:       String,
+}
+
+#[derive(Deserialize)]
+struct WorkflowList {
+	#[serde(default)]
+	workflows: Vec<Workflow>,
+}
+
+#[derive(Deserialize)]
+struct Workflow {
+	name:  String,
+	path:  String,
+	state: String,
+}
+
+#[derive(Default, Deserialize)]
+struct RunList {
+	#[serde(default)]
+	workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowRun {
+	#[serde(default)]
+	name:        String,
+	#[serde(default)]
+	run_number:  u64,
+	#[serde(default)]
+	status:      String,
+	conclusion:  Option<String>,
+	head_branch: Option<String>,
+	#[serde(default)]
+	event:       String,
+	#[serde(default)]
+	created_at:  String,
+}
+
+#[derive(Default, Deserialize)]
+struct JobList {
+	#[serde(default)]
+	jobs: Vec<ActionJob>,
+}
+
+#[derive(Deserialize)]
+struct ActionJob {
+	name:        String,
+	status:      String,
+	conclusion:  Option<String>,
+	runner_name: Option<String>,
+	#[serde(default)]
+	steps:       Vec<ActionStep>,
+}
+
+#[derive(Deserialize)]
+struct ActionStep {
+	name:       String,
+	status:     String,
+	conclusion: Option<String>,
+	number:     u64,
 }
 
 #[derive(Deserialize)]

@@ -449,6 +449,7 @@ pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
 				exec:      None,
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(
@@ -932,7 +933,14 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}
 		if self.policy.render_markdown && markit::supports_path(path) {
 			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-			match markit::convert_cached(&self.sources, path, &bytes).await {
+			match markit::convert_cached(
+				&self.sources,
+				markit::DocumentMetadata::from_path(path),
+				&bytes,
+				markit::ConversionOptions::default(),
+			)
+			.await
+			{
 				Ok(Some(converted)) => {
 					let converted = converted.conversion;
 					let mut text = format!("Content-Type: text/markdown\n{}", converted.text);

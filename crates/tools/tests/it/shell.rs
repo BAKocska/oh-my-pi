@@ -138,6 +138,9 @@ impl ShellExec for FakeExec {
 					channel:  OutputChannel::Stdout,
 					data:     text.into(),
 					sequence: 1,
+					exec_id:  Bytes::new(),
+					started:  false,
+					terminal: false,
 				}));
 				events.push_back(RunEvent::Exit(status(ExecOutcome::Exited)));
 			},
@@ -147,7 +150,14 @@ impl ShellExec for FakeExec {
 					(OutputChannel::Stderr, CowBytes::from_static(b"two"), 5),
 					(OutputChannel::Stdout, CowBytes::from_static(b"three"), 6),
 				] {
-					events.push_back(RunEvent::Output(Update { channel, data, sequence }));
+					events.push_back(RunEvent::Output(Update {
+						channel,
+						data,
+						sequence,
+						exec_id: Bytes::new(),
+						started: false,
+						terminal: false,
+					}));
 				}
 				events.push_back(RunEvent::Exit(status(ExecOutcome::Exited)));
 			},
@@ -157,6 +167,9 @@ impl ShellExec for FakeExec {
 					channel:  OutputChannel::Stdout,
 					data:     CowBytes::owned(Bytes::from(vec![b'x'; 16])),
 					sequence: 1,
+					exec_id:  Bytes::new(),
+					started:  false,
+					terminal: false,
 				}));
 				let mut terminal = status(ExecOutcome::Exited);
 				terminal.spilled_output = Some(omp_tool::BlobRef {
@@ -464,6 +477,9 @@ fn output_update_clones_share_owned_bytes() {
 		channel:  OutputChannel::Stdout,
 		data:     CowBytes::owned(Bytes::from(vec![1, 2, 3, 4])),
 		sequence: 1,
+		exec_id:  Bytes::new(),
+		started:  false,
+		terminal: false,
 	};
 	let cloned = update.clone();
 	assert_eq!(update.data.as_ptr(), cloned.data.as_ptr());
@@ -481,6 +497,9 @@ fn shell_updates_map_exactly_to_live_invoke_input_chunks() {
 			channel:  source,
 			data:     CowBytes::owned(Bytes::from(vec![7, 8, 9])),
 			sequence: 42,
+			exec_id:  Bytes::new(),
+			started:  false,
+			terminal: false,
 		};
 		let source_ptr = update.data.as_ptr();
 		let input = tool.invoke_input(&update, "invocation-17").unwrap();

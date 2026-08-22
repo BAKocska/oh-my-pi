@@ -142,6 +142,7 @@ pub fn tool<B: SearchBackend>(backend: Arc<B>) -> WebSearch<B> {
 					max_requests: 1,
 					max_usd:      Usd::from_nanos(u64::MAX),
 				}),
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

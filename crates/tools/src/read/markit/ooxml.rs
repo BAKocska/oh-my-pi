@@ -1,7 +1,7 @@
 //! Shared OOXML archive, XML, and Markdown helpers.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, HashSet},
 	io::Cursor,
 	path::{Component, Path, PathBuf},
 };
@@ -52,16 +52,88 @@ impl<'a> Archive<'a> {
 		self.entries.contains_key(path)
 	}
 
-	pub(super) fn read_xml(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+	pub(super) fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
 		let Some(source_path) = self.entries.get(path) else {
 			return Ok(None);
 		};
-		let bytes = self
+		self
 			.archive
 			.read(source_path)
-			.map_err(|error| format!("could not read {path}: {error}"))?;
+			.map(Some)
+			.map_err(|error| format!("could not read {path}: {error}"))
+	}
+
+	pub(super) fn read_xml(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+		let Some(bytes) = self.read(path)? else {
+			return Ok(None);
+		};
 		validate_entity_expansion_cap(&bytes)?;
 		Ok(Some(bytes))
+	}
+}
+
+pub(super) fn attachment_name(path: &str, ordinal: usize, used: &mut HashSet<String>) -> String {
+	let source = Path::new(path)
+		.file_name()
+		.and_then(|name| name.to_str())
+		.unwrap_or("");
+	let mut name = source
+		.chars()
+		.take(120)
+		.map(|character| {
+			if character.is_alphanumeric() || matches!(character, '.' | '-' | '_') {
+				character
+			} else {
+				'_'
+			}
+		})
+		.collect::<String>();
+	if name.is_empty() || matches!(name.as_str(), "." | "..") {
+		name = format!("image-{ordinal}");
+	}
+	if used.insert(name.clone()) {
+		return name;
+	}
+	let (stem, extension) = name.rsplit_once('.').unwrap_or((name.as_str(), ""));
+	for duplicate in 2.. {
+		let candidate = if extension.is_empty() {
+			format!("{stem}-{duplicate}")
+		} else {
+			format!("{stem}-{duplicate}.{extension}")
+		};
+		if used.insert(candidate.clone()) {
+			return candidate;
+		}
+	}
+	unreachable!("duplicate ordinal space is unbounded")
+}
+
+pub(super) fn image_media_type(path: &str, bytes: &[u8]) -> &'static str {
+	if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+		return "image/png";
+	}
+	if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+		return "image/jpeg";
+	}
+	if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+		return "image/gif";
+	}
+	if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+		return "image/webp";
+	}
+	match Path::new(path)
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.unwrap_or("")
+		.to_ascii_lowercase()
+		.as_str()
+	{
+		"bmp" => "image/bmp",
+		"emf" => "image/emf",
+		"svg" => "image/svg+xml",
+		"tif" | "tiff" => "image/tiff",
+		"wmf" => "image/wmf",
+		_ => "application/octet-stream",
 	}
 }
 

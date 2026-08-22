@@ -175,8 +175,11 @@ impl WebError {
 /// Stable identity of one document-conversion cache lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DocumentCacheRequest {
-	/// Digest of the source bytes, never a source path or content snippet.
+	/// BLAKE3 digest of the source bytes, never a source path or content
+	/// snippet.
 	pub source_digest:     Hash32,
+	/// BLAKE3 digest of canonical conversion options.
+	pub options_digest:    Hash32,
 	/// Stable converter identity.
 	pub converter:         &'static str,
 	/// Converter implementation and cache-schema version.

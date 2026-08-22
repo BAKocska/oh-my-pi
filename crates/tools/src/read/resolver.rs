@@ -213,7 +213,7 @@ pub enum Scheme {
 	Pr,
 	/// A remote SSH resource.
 	Ssh,
-	/// Security scan state.
+	/// Reserved security-review scheme; intentionally unmounted.
 	Security,
 	/// A granted vault resource.
 	Vault,

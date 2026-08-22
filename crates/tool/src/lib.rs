@@ -315,6 +315,25 @@ impl InferenceEffects {
 		self.max_requests == 0 && self.max_usd.as_nanos() == 0
 	}
 }
+/// Maximum declared native desktop authority for one tool revision.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DesktopEffects {
+	/// Whether framebuffer capture and display/window enumeration are permitted.
+	pub capture:       bool,
+	/// Whether accessibility-tree reads are permitted.
+	pub accessibility: bool,
+	/// Whether pointer, keyboard, focus, and accessibility mutation are
+	/// permitted.
+	pub input:         bool,
+}
+
+impl DesktopEffects {
+	/// Returns whether this desktop domain grants no authority.
+	#[must_use]
+	pub const fn is_empty(&self) -> bool {
+		!self.capture && !self.accessibility && !self.input
+	}
+}
 
 /// Maximum declared effect envelope for one tool revision.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -325,6 +344,8 @@ pub struct Effects {
 	pub exec:      Option<ExecEffects>,
 	/// Inference authority, absent when the domain is denied.
 	pub inference: Option<InferenceEffects>,
+	/// Native desktop authority, absent when the domain is denied.
+	pub desktop:   Option<DesktopEffects>,
 	/// Maximum spawned subagents.
 	pub subagents: u32,
 }
@@ -334,7 +355,7 @@ const _: () = assert!(size_of::<Effects>() <= 96, "Effects must stay compact");
 impl Effects {
 	/// Empty deny-all envelope for an explicitly effect-free tool.
 	pub const fn empty() -> Self {
-		Self { documents: None, exec: None, inference: None, subagents: 0 }
+		Self { documents: None, exec: None, inference: None, desktop: None, subagents: 0 }
 	}
 
 	/// Returns whether `self` grants no authority.
@@ -346,6 +367,7 @@ impl Effects {
 				.inference
 				.as_ref()
 				.is_none_or(InferenceEffects::is_empty)
+			&& self.desktop.as_ref().is_none_or(DesktopEffects::is_empty)
 			&& self.subagents == 0
 	}
 
@@ -386,6 +408,15 @@ impl Effects {
 			maximum.inference.as_ref(),
 			InferenceEffects::is_empty,
 			|value, max| value.max_requests <= max.max_requests && value.max_usd <= max.max_usd,
+		) && optional_subset(
+			self.desktop.as_ref(),
+			maximum.desktop.as_ref(),
+			DesktopEffects::is_empty,
+			|value, max| {
+				(!value.capture || max.capture)
+					&& (!value.accessibility || max.accessibility)
+					&& (!value.input || max.input)
+			},
 		)
 	}
 
@@ -465,6 +496,15 @@ impl From<&Effects> for omp_proto::policy::v1::EffectEnvelope {
 					props:        None,
 				}
 			}),
+			desktop:   value
+				.desktop
+				.as_ref()
+				.map(|desktop| omp_proto::policy::v1::DesktopEffects {
+					capture:       desktop.capture,
+					accessibility: desktop.accessibility,
+					input:         desktop.input,
+					props:         None,
+				}),
 			subagents: value.subagents,
 			props:     None,
 		}
@@ -506,6 +546,11 @@ impl TryFrom<&omp_proto::policy::v1::EffectEnvelope> for Effects {
 					})
 				})
 				.transpose()?,
+			desktop:   value.desktop.as_ref().map(|desktop| DesktopEffects {
+				capture:       desktop.capture,
+				accessibility: desktop.accessibility,
+				input:         desktop.input,
+			}),
 			subagents: value.subagents,
 		})
 	}

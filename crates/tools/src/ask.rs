@@ -3,6 +3,7 @@
 use std::{fmt, sync::Arc};
 
 use async_stream::stream;
+use async_trait::async_trait;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
@@ -11,6 +12,7 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 const RESERVED_LABELS: [&str; 3] = ["Other (type your own)", "Chat about this", "Next →"];
 
@@ -120,6 +122,25 @@ pub struct Presentation {
 	/// Whether selection used the noninteractive fallback.
 	pub headless: bool,
 }
+/// One ordered spoken line for an ask dialog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpokenLine {
+	/// Text spoken in presentation order.
+	pub text:        Str,
+	/// Whether this line identifies the recommended option.
+	pub recommended: bool,
+}
+
+/// Cancellable host-owned dialog vocalizer.
+#[async_trait]
+pub trait AskVocalizer: Send + Sync + 'static {
+	/// Speaks the complete ordered dialog or returns silently when disabled.
+	async fn speak(
+		&self,
+		lines: &[SpokenLine],
+		cancellation: CancellationToken,
+	) -> Result<(), Fault>;
+}
 /// Deterministic noninteractive picker: every recommended choice wins.
 #[derive(Default)]
 pub struct HeadlessPresenter;
@@ -138,11 +159,19 @@ impl AskPresenter for HeadlessPresenter {
 /// Ask tool backed by a UI presentation bridge.
 pub struct Ask {
 	presenter: Arc<dyn AskPresenter>,
+	vocalizer: Option<Arc<dyn AskVocalizer>>,
 	spec:      ToolSpec,
 }
 /// Creates `ask@1` with the specified environment presentation bridge.
 pub fn tool(presenter: Arc<dyn AskPresenter>) -> Ask {
-	Ask { presenter, spec: spec() }
+	Ask { presenter, vocalizer: None, spec: spec() }
+}
+/// Creates `ask@1` with ordered cancellable speech.
+pub fn tool_with_vocalizer(
+	presenter: Arc<dyn AskPresenter>,
+	vocalizer: Arc<dyn AskVocalizer>,
+) -> Ask {
+	Ask { presenter, vocalizer: Some(vocalizer), spec: spec() }
 }
 /// Creates `ask@1` with explicit headless recommendation selection.
 pub fn headless_tool() -> Ask {
@@ -184,7 +213,48 @@ impl Tool for Ask {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Update, Payload, Fault>> + Send + 'c {
-		stream! { let arguments = match params.whole::<Params>().await { Ok(value) => value, Err(error) => { yield param_event(error); return; } }; if let Err(error) = params.interruptable().committed().await { yield commit_event(error); return; } if let Err(fault) = validate(&arguments.questions) { yield done(Err(fault)); return; } let result = self.presenter.present(&arguments.questions).map(|presentation| Payload { answers: presentation.answers, headless: presentation.headless }); yield done(result); }
+		stream! {
+			let arguments = match params.whole::<Params>().await {
+				Ok(value) => value,
+				Err(error) => { yield param_event(error); return; },
+			};
+			if let Err(error) = params.interruptable().committed().await {
+				yield commit_event(error);
+				return;
+			}
+			if let Err(fault) = validate(&arguments.questions) {
+				yield done(Err(fault));
+				return;
+			}
+			if let Some(vocalizer) = &self.vocalizer {
+				let cancellation = CancellationToken::new();
+				let lines = spoken_lines(&arguments.questions);
+				let speech = vocalizer.speak(&lines, cancellation.clone());
+				tokio::pin!(speech);
+				tokio::select! {
+					result = &mut speech => {
+						if let Err(fault) = result {
+							yield done(Err(fault));
+							return;
+						}
+					},
+					interrupt = params.next_interrupt() => {
+						cancellation.cancel();
+						if let Ok(interrupt) = interrupt {
+							yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+						} else {
+							yield Ev::Aborted(Abort::InputDropped);
+						}
+						return;
+					},
+				}
+			}
+			let result = self.presenter.present(&arguments.questions).map(|presentation| Payload {
+				answers: presentation.answers,
+				headless: presentation.headless,
+			});
+			yield done(result);
+		}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
@@ -197,6 +267,30 @@ impl Tool for Ask {
 	}
 }
 /// Checks identifiers, choices, and defaults before a host sees a request.
+/// Projects questions, options, previews, and recommendations into
+/// deterministic speech order.
+#[must_use]
+pub fn spoken_lines(questions: &[Question]) -> Vec<SpokenLine> {
+	let mut lines = Vec::new();
+	for question in questions {
+		if let Some(header) = &question.header {
+			lines.push(SpokenLine { text: header.clone(), recommended: false });
+		}
+		lines.push(SpokenLine { text: question.question.clone(), recommended: false });
+		for (index, option) in question.options.iter().enumerate() {
+			let recommended = question.recommended == Some(index);
+			lines.push(SpokenLine { text: option.label.clone(), recommended });
+			if let Some(description) = &option.description {
+				lines.push(SpokenLine { text: description.clone(), recommended });
+			}
+			if let Some(preview) = &option.preview {
+				lines.push(SpokenLine { text: preview.clone(), recommended });
+			}
+		}
+	}
+	lines
+}
+
 pub fn validate(questions: &[Question]) -> Result<(), Fault> {
 	if questions.is_empty() {
 		return Err(invalid("`questions` must not be empty"));

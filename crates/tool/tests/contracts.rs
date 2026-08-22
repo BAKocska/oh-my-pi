@@ -20,14 +20,14 @@ use omp_tool::{
 	Abort, AbortKind, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry,
 	ArgSpecRegistryError, ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails,
 	CallOutcomeDetailsError, CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint,
-	ConstraintDisposition, DocEffects, Effects, ErasedEv, ErasedOutcome, Ev, ExecEffects,
-	ExpectedArtifact, Fallback, GoalToolState, GrammarSyntax, InclusionPolicy, IncomingParams,
-	InferenceEffects, Interrupt, InterruptWaitError, JobKind, JobMetadata, JobOwner, JobRef,
-	JobStatus, LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion, LiftedCall,
-	LoweringCaps, MemoryToolState, ModelClass, ParamError, Part, PolicyDenied, Precedence,
-	Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall, RecordedCallOwned,
-	Registry, RegistryError, RegistryLeaf, RepairKind, Rev, Tool, ToolIdentity, ToolSpec,
-	ToolTerminal, Usd, call_outcome_details,
+	ConstraintDisposition, DesktopEffects, DocEffects, Effects, ErasedEv, ErasedOutcome, Ev,
+	ExecEffects, ExpectedArtifact, Fallback, GoalToolState, GrammarSyntax, InclusionPolicy,
+	IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, JobKind, JobMetadata, JobOwner,
+	JobRef, JobStatus, LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion,
+	LiftedCall, LoweringCaps, MemoryToolState, ModelClass, ParamError, Part, PolicyDenied,
+	Precedence, Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall,
+	RecordedCallOwned, Registry, RegistryError, RegistryLeaf, RepairKind, Rev, Tool, ToolIdentity,
+	ToolSpec, ToolTerminal, Usd, call_outcome_details,
 	render::{RenderFold, RenderRegistryError, ViewState},
 };
 use serde::{Deserialize, Serialize};
@@ -1638,6 +1638,11 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 			max_requests: 3,
 			max_usd:      "1.25".parse().expect("canonical decimal"),
 		}),
+		desktop:   Some(DesktopEffects {
+			capture:       true,
+			accessibility: true,
+			input:         false,
+		}),
 		subagents: 2,
 	};
 	let narrowed = Effects {
@@ -1652,6 +1657,11 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 		inference: Some(InferenceEffects {
 			max_requests: 1,
 			max_usd:      "0.5".parse().expect("canonical decimal"),
+		}),
+		desktop:   Some(DesktopEffects {
+			capture:       true,
+			accessibility: false,
+			input:         false,
 		}),
 		subagents: 0,
 	};
@@ -1668,6 +1678,9 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	widened.exec.as_mut().unwrap().network = false;
 	widened.documents =
 		Some(DocEffects { read: true, write_globs: Arc::from([sf!("src/../secrets/**")]) });
+	assert!(!widened.is_subset_of(&maximum));
+	widened.documents = narrowed.documents.clone();
+	widened.desktop.as_mut().unwrap().input = true;
 	assert!(!widened.is_subset_of(&maximum));
 	assert!(!maximum.is_subset_of(&Effects::empty()));
 

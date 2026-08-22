@@ -482,6 +482,7 @@ pub fn tool_with_policy_and_conflicts<D: WriteDocuments>(
 				}),
 				exec:      None,
 				inference: None,
+				desktop:   None,
 				subagents: 0,
 			},
 			projection_code: omp_tool::native_projection_code(

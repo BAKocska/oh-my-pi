@@ -239,10 +239,13 @@ pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Faul
 			let items = params
 				.items
 				.ok_or_else(|| invalid("`items` is required for append"))?;
-			let target = phases
-				.iter_mut()
-				.find(|entry| entry.phase == phase)
-				.ok_or_else(|| missing("phase", &phase))?;
+			let target = match resolve_phase_index(phases, &phase) {
+				Some(index) => &mut phases[index],
+				None => {
+					phases.push(Phase { phase: title_case(&phase), items: Vec::new() });
+					phases.last_mut().expect("phase was appended")
+				},
+			};
 			target.items.extend(items.into_iter().map(|text| Item {
 				text,
 				status: Status::Pending,
@@ -250,59 +253,188 @@ pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Faul
 			}));
 		},
 		op => {
-			let phase = required(params.phase, "phase")?;
-			let item = required(params.item, "item")?;
-			let target = phases
-				.iter_mut()
-				.find(|entry| entry.phase == phase)
-				.ok_or_else(|| missing("phase", &phase))?;
-			if op == Op::Rm {
-				let index = target
-					.items
-					.iter()
-					.position(|entry| entry.text == item)
-					.ok_or_else(|| missing("item", &item))?;
-				target.items.remove(index);
+			if params.phase.is_none() && params.item.is_none() {
+				if op == Op::Rm {
+					phases.clear();
+				} else if matches!(op, Op::Done | Op::Drop) {
+					for item in phases.iter_mut().flat_map(|phase| &mut phase.items) {
+						set_status(item, op, params.reason.as_ref())?;
+					}
+				} else {
+					return Err(invalid("this operation requires an item"));
+				}
 				return Ok(phases.clone());
 			}
-			let entry = target
-				.items
-				.iter_mut()
-				.find(|entry| entry.text == item)
-				.ok_or_else(|| missing("item", &item))?;
-			match op {
-				Op::Start => {
-					entry.status = Status::InProgress;
-					entry.reason = None;
+			let phase_index = match params.phase.as_ref() {
+				Some(phase) => {
+					resolve_phase_index(phases, phase).ok_or_else(|| missing("phase", phase))?
 				},
-				Op::Done => {
-					entry.status = Status::Completed;
-					entry.reason = None;
-				},
-				Op::Drop => {
-					entry.status = Status::Abandoned;
-					entry.reason = None;
-				},
-				Op::Block => {
-					entry.status = Status::Blocked;
-					entry.reason = Some(
-						params
-							.reason
-							.ok_or_else(|| invalid("`reason` is required for block"))?,
-					);
-				},
-				Op::Unblock => {
-					if entry.status != Status::Blocked {
-						return Err(invalid("only blocked items can be unblocked"));
+				None => resolve_item(phases, params.item.as_deref().unwrap_or_default())
+					.map(|(phase, _)| phase)
+					.ok_or_else(|| missing("item", params.item.as_deref().unwrap_or_default()))?,
+			};
+			if params.item.is_none() {
+				if op == Op::Rm {
+					phases.remove(phase_index);
+				} else if matches!(op, Op::Done | Op::Drop) {
+					for item in &mut phases[phase_index].items {
+						set_status(item, op, params.reason.as_ref())?;
 					}
-					entry.status = Status::Pending;
-					entry.reason = None;
-				},
-				Op::Init | Op::Rm | Op::Append | Op::View => unreachable!(),
+				} else {
+					return Err(invalid("this operation requires an item"));
+				}
+				return Ok(phases.clone());
 			}
+			let item = params.item.as_ref().expect("item presence checked");
+			let item_index = resolve_item_in_phase(&phases[phase_index].items, item)
+				.ok_or_else(|| missing("item", item))?;
+			if op == Op::Rm {
+				phases[phase_index].items.remove(item_index);
+				return Ok(phases.clone());
+			}
+			set_status(&mut phases[phase_index].items[item_index], op, params.reason.as_ref())?;
 		},
 	}
 	Ok(phases.clone())
+}
+
+fn set_status(item: &mut Item, op: Op, reason: Option<&Str>) -> Result<(), Fault> {
+	match op {
+		Op::Start => {
+			item.status = Status::InProgress;
+			item.reason = None;
+		},
+		Op::Done => {
+			item.status = Status::Completed;
+			item.reason = None;
+		},
+		Op::Drop => {
+			item.status = Status::Abandoned;
+			item.reason = None;
+		},
+		Op::Block => {
+			item.status = Status::Blocked;
+			item.reason = Some(
+				reason
+					.cloned()
+					.ok_or_else(|| invalid("`reason` is required for block"))?,
+			);
+		},
+		Op::Unblock => {
+			if item.status != Status::Blocked {
+				return Err(invalid("only blocked items can be unblocked"));
+			}
+			item.status = Status::Pending;
+			item.reason = None;
+		},
+		Op::Init | Op::Rm | Op::Append | Op::View => unreachable!(),
+	}
+	Ok(())
+}
+
+/// Resolves a phase by case-insensitive exact, unique prefix, then unique
+/// substring match.
+#[must_use]
+pub fn resolve_phase_index(phases: &[Phase], query: &str) -> Option<usize> {
+	let query = query.trim().to_ascii_lowercase();
+	if query.is_empty() {
+		return None;
+	}
+	phases
+		.iter()
+		.position(|phase| phase.phase.to_ascii_lowercase() == query)
+		.or_else(|| {
+			unique_index(phases.iter().map(|phase| phase.phase.as_str()), |name| {
+				name.to_ascii_lowercase().starts_with(&query)
+			})
+		})
+		.or_else(|| {
+			unique_index(phases.iter().map(|phase| phase.phase.as_str()), |name| {
+				name.to_ascii_lowercase().contains(&query)
+			})
+		})
+}
+
+/// Resolves one task across phases, preferring a unique actionable match.
+#[must_use]
+pub fn resolve_item(phases: &[Phase], query: &str) -> Option<(usize, usize)> {
+	let query = query.trim().to_ascii_lowercase();
+	if query.is_empty() {
+		return None;
+	}
+	for (phase_index, phase) in phases.iter().enumerate() {
+		if let Some(item_index) = phase
+			.items
+			.iter()
+			.position(|item| item.text.to_ascii_lowercase() == query)
+		{
+			return Some((phase_index, item_index));
+		}
+	}
+	let matches = phases
+		.iter()
+		.enumerate()
+		.flat_map(|(phase_index, phase)| {
+			let query = &query;
+			phase
+				.items
+				.iter()
+				.enumerate()
+				.filter_map(move |(item_index, item)| {
+					item.text.to_ascii_lowercase().contains(query).then_some((
+						phase_index,
+						item_index,
+						matches!(item.status, Status::Pending | Status::InProgress),
+					))
+				})
+		})
+		.collect::<Vec<_>>();
+	if matches.len() == 1 {
+		return matches.first().map(|&(phase, item, _)| (phase, item));
+	}
+	let mut active = matches.iter().filter(|(_, _, active)| *active);
+	let first = active.next()?;
+	active.next().is_none().then_some((first.0, first.1))
+}
+
+fn resolve_item_in_phase(items: &[Item], query: &str) -> Option<usize> {
+	let query = query.trim().to_ascii_lowercase();
+	items
+		.iter()
+		.position(|item| item.text.to_ascii_lowercase() == query)
+		.or_else(|| {
+			unique_index(items.iter().map(|item| item.text.as_str()), |text| {
+				text.to_ascii_lowercase().contains(&query)
+			})
+		})
+}
+
+fn unique_index<'a>(
+	values: impl Iterator<Item = &'a str>,
+	matches: impl Fn(&str) -> bool,
+) -> Option<usize> {
+	let mut indexes = values
+		.enumerate()
+		.filter_map(|(index, value)| matches(value).then_some(index));
+	let first = indexes.next()?;
+	indexes.next().is_none().then_some(first)
+}
+
+fn title_case(value: &str) -> Str {
+	let mut output = String::with_capacity(value.len());
+	for (index, word) in value.split_whitespace().enumerate() {
+		if index > 0 {
+			output.push(' ');
+		}
+		let mut graphemes = xutf::graphemes_str(word);
+		if let Some(first) = graphemes.next() {
+			output.extend(first.chars().flat_map(char::to_uppercase));
+		}
+		for grapheme in graphemes {
+			output.push_str(grapheme);
+		}
+	}
+	Str::from(output)
 }
 fn required(value: Option<Str>, name: &str) -> Result<Str, Fault> {
 	value.ok_or_else(|| invalid(&format!("`{name}` is required")))
@@ -313,39 +445,135 @@ fn invalid(message: &str) -> Fault {
 fn missing(kind: &str, value: &str) -> Fault {
 	Fault::Missing { message: sf!("{kind} not found: {value}") }
 }
-/// Formats the durable state as a Markdown checklist.
+/// Formats the durable state as editable Markdown.
 pub fn render(phases: &[Phase]) -> String {
-	phases
-		.iter()
-		.enumerate()
-		.map(|(index, phase)| {
-			let items = phase
-				.items
-				.iter()
-				.map(|item| {
-					let mark = match item.status {
-						Status::Completed => "x",
-						_ => " ",
-					};
-					let suffix = match item.status {
-						Status::Pending | Status::Completed => String::new(),
-						status => format!(
-							" ({status}{})",
-							item
-								.reason
-								.as_ref()
-								.map(|reason| format!(": {reason}"))
-								.unwrap_or_default()
-						),
-					};
-					format!("- [{mark}] {}{suffix}", item.text)
-				})
-				.collect::<Vec<_>>()
-				.join("\n");
-			format!("{}. {}\n{}", index + 1, phase.phase, items)
-		})
-		.collect::<Vec<_>>()
-		.join("\n\n")
+	if phases.is_empty() {
+		return "# Todos\n".to_owned();
+	}
+	let mut output = String::new();
+	for (phase_index, phase) in phases.iter().enumerate() {
+		if phase_index != 0 {
+			output.push('\n');
+		}
+		output.push_str("# ");
+		output.push_str(&phase.phase);
+		output.push('\n');
+		for item in &phase.items {
+			let marker = match item.status {
+				Status::Pending => ' ',
+				Status::InProgress => '/',
+				Status::Completed => 'x',
+				Status::Abandoned => '-',
+				Status::Blocked => '!',
+			};
+			output.push_str("- [");
+			output.push(marker);
+			output.push_str("] ");
+			output.push_str(&item.text);
+			if item.status == Status::Blocked
+				&& let Some(reason) = &item.reason
+			{
+				output.push_str(" <!-- blocker: ");
+				output.push_str(reason);
+				output.push_str(" -->");
+			}
+			output.push('\n');
+		}
+	}
+	output
+}
+
+/// Parses an editable Markdown checklist into canonical phased todo state.
+pub fn parse_markdown(markdown: &str) -> Result<Vec<Phase>, Fault> {
+	let mut phases = Vec::<Phase>::new();
+	for (line_index, raw) in markdown.lines().enumerate() {
+		let line = raw.trim();
+		if line.is_empty() {
+			continue;
+		}
+		if let Some(phase) = parse_heading(line) {
+			phases.push(Phase { phase: Str::new(phase), items: Vec::new() });
+			continue;
+		}
+		let Some((marker, content)) = parse_checklist(line) else {
+			return Err(invalid(&format!(
+				"Line {}: unrecognized todo Markdown syntax",
+				line_index + 1
+			)));
+		};
+		let status = match marker {
+			' ' => Status::Pending,
+			'/' | '>' => Status::InProgress,
+			'x' | 'X' => Status::Completed,
+			'-' | '~' => Status::Abandoned,
+			'!' => Status::Blocked,
+			_ => {
+				return Err(invalid(&format!(
+					"Line {}: unknown status marker `[{marker}]`",
+					line_index + 1
+				)));
+			},
+		};
+		if phases.is_empty() {
+			phases.push(Phase { phase: sf!("Todos"), items: Vec::new() });
+		}
+		let (text, reason) = if status == Status::Blocked {
+			parse_blocker(content)
+		} else {
+			(content.trim(), None)
+		};
+		if text.is_empty() {
+			return Err(invalid(&format!("Line {}: todo text is empty", line_index + 1)));
+		}
+		phases
+			.last_mut()
+			.expect("a default phase was inserted")
+			.items
+			.push(Item { text: Str::new(text), status, reason: reason.map(Str::new) });
+	}
+	Ok(phases)
+}
+
+fn parse_heading(line: &str) -> Option<&str> {
+	let depth = line.bytes().take_while(|byte| *byte == b'#').count();
+	if !(1..=6).contains(&depth) {
+		return None;
+	}
+	line
+		.get(depth..)
+		.map(str::trim)
+		.filter(|heading| !heading.is_empty())
+}
+
+fn parse_checklist(line: &str) -> Option<(char, &str)> {
+	if !matches!(line.as_bytes().first(), Some(b'-' | b'*' | b'+')) {
+		return None;
+	}
+	let mut rest = line.get(1..)?.trim_start();
+	rest = rest.strip_prefix('\\').unwrap_or(rest);
+	rest = rest.strip_prefix('[')?;
+	let marker = rest.chars().next()?;
+	rest = rest.get(marker.len_utf8()..)?;
+	rest = rest.strip_prefix('\\').unwrap_or(rest);
+	rest = rest.strip_prefix(']')?;
+	let content = rest.trim_start();
+	(!content.is_empty()).then_some((marker, content))
+}
+
+fn parse_blocker(content: &str) -> (&str, Option<&str>) {
+	let Some(comment) = content.rfind("<!--") else {
+		return (content.trim(), None);
+	};
+	let Some(body) = content
+		.get(comment + 4..)
+		.and_then(|rest| rest.strip_suffix("-->"))
+	else {
+		return (content.trim(), None);
+	};
+	let Some(reason) = body.trim().strip_prefix("blocker:") else {
+		return (content.trim(), None);
+	};
+	(content[..comment].trim(), Some(reason.trim()))
 }
 const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
@@ -453,5 +681,92 @@ mod tests {
 		})
 		.unwrap();
 		assert_eq!(phases[0].items[0].status, Status::Pending);
+	}
+	#[test]
+	fn fuzzy_resolution_prefers_exact_and_unique_actionable_matches() {
+		let mut phases = vec![
+			Phase {
+				phase: sf!("Build Runtime"),
+				items: vec![
+					Item { text: sf!("Port router"), status: Status::Completed, reason: None },
+					Item { text: sf!("Test router"), status: Status::Pending, reason: None },
+				],
+			},
+			Phase {
+				phase: sf!("Build UI"),
+				items: vec![Item {
+					text:   sf!("Render router"),
+					status: Status::Completed,
+					reason: None,
+				}],
+			},
+		];
+		assert_eq!(resolve_phase_index(&phases, "runtime"), Some(0));
+		assert_eq!(resolve_item(&phases, "test"), Some((0, 1)));
+		apply(&mut phases, Params {
+			op:     Op::Done,
+			list:   None,
+			phase:  Some(sf!("runtime")),
+			item:   Some(sf!("test")),
+			items:  None,
+			reason: None,
+		})
+		.expect("fuzzy transition");
+		assert_eq!(phases[0].items[1].status, Status::Completed);
+	}
+
+	#[test]
+	fn phase_and_all_mutations_are_supported() {
+		let mut phases = init();
+		apply(&mut phases, Params {
+			op:     Op::Done,
+			list:   None,
+			phase:  Some(sf!("bui")),
+			item:   None,
+			items:  None,
+			reason: None,
+		})
+		.expect("phase complete");
+		assert_eq!(phases[0].items[0].status, Status::Completed);
+		apply(&mut phases, Params {
+			op:     Op::Rm,
+			list:   None,
+			phase:  None,
+			item:   None,
+			items:  None,
+			reason: None,
+		})
+		.expect("clear");
+		assert!(phases.is_empty());
+	}
+	#[test]
+	fn editable_markdown_round_trips_every_status_and_block_reason() {
+		let phases = vec![Phase {
+			phase: sf!("Build"),
+			items: vec![
+				Item { text: sf!("pending"), status: Status::Pending, reason: None },
+				Item { text: sf!("active"), status: Status::InProgress, reason: None },
+				Item { text: sf!("done"), status: Status::Completed, reason: None },
+				Item { text: sf!("dropped"), status: Status::Abandoned, reason: None },
+				Item {
+					text:   sf!("blocked"),
+					status: Status::Blocked,
+					reason: Some(sf!("waiting for owner")),
+				},
+			],
+		}];
+		let markdown = render(&phases);
+		assert_eq!(parse_markdown(&markdown).expect("round-trip"), phases);
+		assert_eq!(
+			parse_markdown("# Imported\n* \\[>\\] active\n+ [~] dropped\n")
+				.expect("aliases")
+				.first()
+				.expect("phase")
+				.items
+				.iter()
+				.map(|item| item.status)
+				.collect::<Vec<_>>(),
+			vec![Status::InProgress, Status::Abandoned]
+		);
 	}
 }
