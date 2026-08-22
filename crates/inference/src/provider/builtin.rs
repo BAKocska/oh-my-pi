@@ -636,6 +636,7 @@ fn codec_binding(
 				OperationKind::Chat,
 				OperationKind::Embed,
 				OperationKind::GenerateImage,
+				OperationKind::Speak,
 				OperationKind::Transcribe,
 				OperationKind::Realtime,
 			]),

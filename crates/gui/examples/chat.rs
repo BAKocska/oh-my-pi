@@ -536,6 +536,7 @@ fn mock_sessions() -> Vec<SessionRow> {
 		id:     Str::from(id),
 		label:  Str::from(label),
 		detail: Str::from(detail),
+		pinned: false,
 	})
 	.collect()
 }

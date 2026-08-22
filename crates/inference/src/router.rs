@@ -8,6 +8,7 @@ use std::{
 };
 
 use omp_core::{Str, sf};
+use tower::ServiceExt as _;
 
 use crate::{
 	call::{Call, ContentPart, OperationCall, Role, Target},
@@ -24,6 +25,22 @@ use crate::{
 	receipt::{ExecutionBudget, ExecutionReceipt, ReasonId},
 	registry::Registry,
 };
+
+/// Plans and dispatches one raw call against the same immutable registry.
+///
+/// The returned [`crate::answer::Answer`] retains handshake accounting needed
+/// by media settlement; callers that only need a typed body should use
+/// [`crate::client::Client`].
+pub async fn execute_registry_call(
+	registry: Registry,
+	mut call: Call,
+	plan_ttl: Duration,
+) -> Result<crate::answer::Answer, Error> {
+	let router = Router::new(registry.clone(), plan_ttl);
+	let plan = <Router as Planner>::plan(&router, &call, Instant::now())?;
+	call.execution = Some(Arc::new(plan));
+	registry.service().oneshot(call).await
+}
 
 /// One exact model/route candidate produced by catalog resolution.
 #[derive(Clone, Debug)]
