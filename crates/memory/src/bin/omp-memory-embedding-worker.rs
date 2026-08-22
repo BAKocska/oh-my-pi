@@ -1,0 +1,59 @@
+//! Stdio entry point for the isolated Mnemopi embedding worker.
+
+use omp_core::Str;
+use omp_memory::embedding::{
+	protocol::{InboundFrame, LogLevel, MAX_FRAME_BYTES, OutboundFrame},
+	worker::EmbeddingWorker,
+};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> std::io::Result<()> {
+	let generation = std::env::var("OMP_MEMORY_WORKER_GENERATION")
+		.ok()
+		.and_then(|value| value.parse::<u64>().ok())
+		.unwrap_or(0);
+	let mut input = BufReader::new(tokio::io::stdin());
+	let mut output = tokio::io::stdout();
+	let mut worker = EmbeddingWorker::new();
+	let mut frame = Vec::new();
+	loop {
+		frame.clear();
+		let bytes = input.read_until(b'\n', &mut frame).await?;
+		if bytes == 0 {
+			return Ok(());
+		}
+		if frame.len() > MAX_FRAME_BYTES + 1 {
+			write_frame(&mut output, &OutboundFrame::Log {
+				level:   LogLevel::Error,
+				message: Str::new_static("embedding input frame exceeded limit"),
+			})
+			.await?;
+			continue;
+		}
+		if frame.last() == Some(&b'\n') {
+			frame.pop();
+		}
+		let inbound = match serde_json::from_slice::<InboundFrame>(&frame) {
+			Ok(inbound) => inbound,
+			Err(_) => {
+				write_frame(&mut output, &OutboundFrame::Log {
+					level:   LogLevel::Error,
+					message: Str::new_static("embedding input frame was invalid JSON"),
+				})
+				.await?;
+				continue;
+			},
+		};
+		for response in worker.handle(inbound, generation) {
+			write_frame(&mut output, &response).await?;
+		}
+	}
+}
+
+async fn write_frame(output: &mut tokio::io::Stdout, frame: &OutboundFrame) -> std::io::Result<()> {
+	let encoded = serde_json::to_vec(frame).map_err(std::io::Error::other)?;
+	output.write_all(&encoded).await?;
+	output.write_all(b"\n").await?;
+	output.flush().await
+}
