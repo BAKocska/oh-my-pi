@@ -3,9 +3,10 @@ use std::{
 	fmt::Write as _,
 	io::{self, Write},
 	ops::Range,
+	path::Path,
 };
 
-use omp_core::CowBytes;
+use omp_core::{CowBytes, Str};
 use smallvec::SmallVec;
 
 use crate::{
@@ -3274,12 +3275,56 @@ fn close_active_link(output: &mut String, active_style: &mut Style, hyperlinks: 
 
 fn emit_link_open(output: &mut String, id: LinkId) {
 	let _ = with_link_url(id, |url| {
+		let Some(url) = sanitize_link_target(url) else {
+			return;
+		};
 		let _ = write!(output, esc!(osc, "8;id={};"), id.get());
-		for ch in url.chars().filter(|ch| !matches!(ch, '\x1b' | '\x07')) {
-			output.push(ch);
-		}
+		output.push_str(url);
 		output.push_str(esc!(st));
 	});
+}
+
+/// Rejects URI targets containing terminal control bytes.
+///
+/// OSC payloads are not an escaping context: dropping individual bytes can
+/// turn an attacker-controlled target into a different valid URI, so an
+/// unsafe target is rejected as a whole.
+#[must_use]
+pub fn sanitize_link_target(target: &str) -> Option<&str> {
+	(!target.is_empty() && !target.bytes().any(|byte| byte <= 0x1f || byte == 0x7f))
+		.then_some(target)
+}
+
+/// Builds an encoded `file://` OSC target with optional editor position
+/// parameters.
+#[must_use]
+pub fn file_link_target(path: &Path, line: Option<u32>, column: Option<u32>) -> Option<Str> {
+	let absolute = if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		std::env::current_dir().ok()?.join(path)
+	};
+	let raw = absolute.to_string_lossy();
+	if sanitize_link_target(&raw).is_none() {
+		return None;
+	}
+	let mut target = String::with_capacity(raw.len() + 32);
+	target.push_str("file://");
+	for byte in raw.bytes() {
+		if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+			target.push(char::from(byte));
+		} else {
+			let _ = write!(target, "%{byte:02X}");
+		}
+	}
+	if let Some(line) = line {
+		let _ = write!(target, "?line={line}");
+	}
+	if let Some(column) = column {
+		let separator = if line.is_some() { '&' } else { '?' };
+		let _ = write!(target, "{separator}col={column}");
+	}
+	Some(Str::from(target))
 }
 
 fn emit_style(output: &mut String, style: Style) {

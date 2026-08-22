@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod advisor_config;
 pub mod agent_hub;
 mod approval;
 pub mod ask;
@@ -16,16 +17,22 @@ pub mod frame;
 pub mod gradient;
 pub mod host;
 pub mod log_viewer;
+pub mod modes;
 mod overlays;
 pub mod palette;
 pub mod picker;
+pub mod plan_review;
 pub mod protocol_probe;
 pub mod provider_picker;
 pub mod pty;
 pub mod queue;
 pub mod raw_stream;
 pub mod scene;
+pub mod selection_overlay;
+pub mod settings_overlay;
 pub mod sidebar;
+pub mod status_line;
+pub mod vibe_wall;
 pub mod welcome;
 
 pub mod slots;
@@ -42,7 +49,11 @@ pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
 pub use pty::{PtyEvent, PtyOutputQueue, PtyOverlay, PtyStatus, TerminalState};
-pub use scene::{Chat, ChatKey, RenderedFrame};
+pub use scene::{
+	Chat, ChatKey, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer, RenderedFrame,
+};
+pub use selection_overlay::{SelectionEvent, SelectionOverlay, SelectionPurpose};
+pub use settings_overlay::{SettingChange, SettingsEvent, SettingsOverlay};
 pub use sidebar::Sidebar;
 pub use welcome::{Welcome, WelcomeEvent};
 
@@ -104,33 +115,52 @@ pub struct SessionRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentRow {
 	/// Stable agent identity.
-	pub id:            Str,
+	pub id:               Str,
 	/// User-facing agent name.
-	pub name:          Str,
+	pub name:             Str,
 	/// Parent identity, absent for a root.
-	pub parent:        Option<Str>,
+	pub parent:           Option<Str>,
 	/// Hierarchy depth.
-	pub depth:         u16,
+	pub depth:            u16,
 	/// Allocation-free lifecycle status snapshot.
-	pub status:        Str,
+	pub status:           Str,
 	/// Currently executing tool, when known.
-	pub tool:          Option<Str>,
+	pub tool:             Option<Str>,
 	/// Token consumption, when known.
-	pub tokens:        Option<u64>,
+	pub tokens:           Option<u64>,
 	/// Resolved delegated-agent definition badge.
-	pub definition:    Option<Str>,
+	pub definition:       Option<Str>,
 	/// Requested model selector badge.
-	pub model:         Option<Str>,
+	pub model:            Option<Str>,
 	/// Model that served the latest request.
-	pub serving_model: Option<Str>,
+	pub serving_model:    Option<Str>,
 	/// Bounded transcript/activity preview supplied by the tree owner.
-	pub transcript:    Str,
+	pub transcript:       Str,
+	/// Deterministic assignment brief recovered from the child journal.
+	pub assignment:       Option<Str>,
+	/// Assistant requests committed in the current generation.
+	pub requests:         u32,
+	/// Tool calls committed in the current generation.
+	pub tool_calls:       u32,
+	/// Latest provider context size.
+	pub context_tokens:   u64,
+	/// Durable cost attributed to the current generation, in micro-USD.
+	pub cost_micros:      u64,
+	/// Structured terminal verdict, when the generation has settled.
+	pub terminal_kind:    Option<Str>,
+	/// Retained terminal summary.
+	pub terminal_summary: Option<Str>,
+	/// Durable full-output artifact URI, when available.
+	pub artifact_uri:     Option<Str>,
+	/// Whether this row is an immutable terminal snapshot retained for
+	/// scrollback.
+	pub frozen:           bool,
 	/// Whether the backend currently accepts steering for this node.
-	pub can_steer:     bool,
+	pub can_steer:        bool,
 	/// Whether the backend currently accepts cold revival for this node.
-	pub can_revive:    bool,
+	pub can_revive:       bool,
 	/// Whether the backend currently accepts cancellation for this node.
-	pub can_kill:      bool,
+	pub can_kill:         bool,
 }
 
 /// Core-owned transcript frame category.
@@ -372,6 +402,13 @@ pub enum Intent {
 	},
 	/// Abort the active turn.
 	Abort,
+	/// Create a goal from the retained guided interview.
+	SetGoal {
+		/// Interview objective.
+		objective:    Str,
+		/// Optional positive hard token budget.
+		token_budget: Option<u64>,
+	},
 	/// Steer one selected child through the core-owned agent authority.
 	AgentSteer {
 		/// Stable agent identity.
@@ -445,6 +482,53 @@ pub enum Intent {
 	Help,
 	/// Quit the host.
 	Quit,
+	/// Restore every producer-authored input that has not started to the
+	/// composer.
+	Dequeue,
+	/// Retry the latest durable user turn.
+	Retry,
+	/// Cycle forward or backward through the active model roster.
+	CycleModel {
+		/// `true` cycles to the previous roster entry.
+		backward: bool,
+	},
+	/// Toggle reasoning between off and the last/default enabled level.
+	ToggleThinking,
+	/// Cycle to the next supported reasoning effort.
+	CycleThinking,
+	/// Toggle planning mode through the backend mode authority.
+	TogglePlan,
+	/// Toggle real-time voice mode.
+	ToggleLive,
+	/// Toggle speech-to-text capture.
+	ToggleStt,
+	/// Suspend the terminal application after restoring terminal modes.
+	Suspend,
+	/// Re-query terminal appearance and force a complete repaint.
+	ResetDisplay,
+	/// Apply schema-driven settings mutations as a preview or persistent commit.
+	ApplySettings {
+		/// Typed reflected field changes.
+		changes: Vec<SettingChange>,
+		/// Whether to persist the generation.
+		commit:  bool,
+	},
+	/// Commit one retained copy, hook, advisor, or history selection.
+	Select {
+		/// Backend-owned workflow.
+		purpose: SelectionPurpose,
+		/// Stable selected key.
+		key:     Str,
+	},
+}
+
+/// One queued composer submission returned by the backend before it starts.
+#[derive(Clone)]
+pub struct QueuedPrompt {
+	/// Exact user-authored text.
+	pub text:        Str,
+	/// Attachments staged with the text.
+	pub attachments: Vec<Attachment>,
 }
 
 /// One user-message target offered by history rewind.
@@ -460,6 +544,13 @@ pub struct RewindTargetRow {
 #[derive(Clone)]
 pub enum BackendEvent {
 	/// Replay a user message from durable history.
+	/// Open the retained guided-goal interview.
+	OpenGuidedGoal,
+	/// Open the retained plan review surface over resolved Markdown.
+	OpenPlanReview {
+		/// Exact approved or proposed plan Markdown.
+		content: Str,
+	},
 	/// Present one pending durable approval ticket.
 	ApprovalPending(ApprovalTicketView),
 	/// Remove a settled or withdrawn approval ticket.
@@ -481,6 +572,8 @@ pub enum BackendEvent {
 		/// Attachments submitted with the prompt.
 		attachments: Vec<Attachment>,
 	},
+	/// Restore a batch of unstarted queued prompts to the composer.
+	QueuedPromptsRestored(Vec<QueuedPrompt>),
 	/// Begin a streamed assistant message.
 	AssistantBegin {
 		/// Stable message identifier.
@@ -583,8 +676,31 @@ pub enum BackendEvent {
 	TranscriptFrame(TranscriptFrame),
 	/// Replace the live `AgentTree` roster projection.
 	AgentRoster(Vec<AgentRow>),
+	/// Apply schema-driven settings mutations as a preview or persistent commit.
+	ApplySettings {
+		/// Typed reflected field changes.
+		changes: Vec<SettingChange>,
+		/// Whether to persist the generation.
+		commit:  bool,
+	},
+	/// Commit one retained copy, hook, advisor, or history selection.
+	Select {
+		/// Backend-owned workflow.
+		purpose: SelectionPurpose,
+		/// Stable selected key.
+		key:     Str,
+	},
 	/// Replace the reflected settings schema and open its TUI surface.
 	SettingsSchema(Vec<SettingRow>),
+	/// Open a generic workflow selector over backend-projected rows.
+	OpenSelection {
+		/// Overlay title.
+		title:   Str,
+		/// Backend-owned workflow.
+		purpose: SelectionPurpose,
+		/// Stable selector rows.
+		rows:    Vec<ListRow>,
+	},
 	/// Replace role-filtered slash-command completion data.
 	SlashCommands(Vec<omp_tui::Command>),
 	/// Request the live agent hierarchy overlay.
@@ -607,6 +723,21 @@ pub enum BackendEvent {
 	ThemePreview(omp_tui::Theme),
 	/// Update tiny-title model download activity.
 	ModelDownloadProgress(ModelDownloadProgress),
+	/// Start realtime voice composer takeover.
+	LiveVoiceStarted,
+	/// Update realtime voice phase, levels, and volatile user transcript.
+	LiveVoiceUpdated {
+		/// Current provider/controller phase.
+		phase:        LiveVoicePhase,
+		/// Microphone input RMS level.
+		input_level:  f32,
+		/// Speaker output RMS level.
+		output_level: f32,
+		/// Latest volatile user transcript.
+		transcript:   Str,
+	},
+	/// Stop realtime voice and restore the ordinary composer.
+	LiveVoiceStopped,
 	/// Replace the session title.
 	SessionTitle(Str),
 	/// Open the model picker with these rows and current selection.

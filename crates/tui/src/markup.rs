@@ -1256,6 +1256,7 @@ fn unified_diff_line(line: &str) -> (DiffKind, &str) {
 		Some(b'+') if !line.starts_with("+++") => (DiffKind::Add, &line[1..]),
 		Some(b'-') if !line.starts_with("---") => (DiffKind::Remove, &line[1..]),
 		Some(b' ') => (DiffKind::Context, &line[1..]),
+		Some(b'!') => (DiffKind::Diagnostic, line[1..].strip_prefix(' ').unwrap_or(&line[1..])),
 		_ if line.starts_with("@@")
 			|| line.starts_with("diff ")
 			|| line.starts_with("+++")

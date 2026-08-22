@@ -26,7 +26,8 @@ use smallvec::SmallVec;
 
 use crate::{
 	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
-	StatusFacts, StatusLayout, StatusSeparator, SubmitMode, TranscriptFrame, TranscriptFrameKind,
+	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, TranscriptFrame,
+	TranscriptFrameKind,
 	frame::{FrameError, FrameIdentity, FrameMutation, RetainedFrames, render_frame_tml},
 	slots::{Mount, Slots},
 };
@@ -41,7 +42,195 @@ const BRAND_FADE: Duration = Duration::from_millis(450);
 const FADE_FRAME: Duration = Duration::from_millis(40);
 const SPECULATION_PULSE: Duration = Duration::from_millis(600);
 const STATUS_ID: &str = "status";
+use strum::IntoStaticStr;
 const INPUT_ID: &str = "input";
+
+const LIVE_VOICE_ROWS: u16 = 4;
+const LIVE_VOICE_FRAME: Duration = Duration::from_millis(50);
+
+/// Provider phase displayed while realtime voice owns the composer.
+#[derive(Clone, Copy, Debug, Default, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase", const_into_str)]
+pub enum LiveVoicePhase {
+	/// Establishing signaling and media channels.
+	#[default]
+	Connecting,
+	/// Waiting for user speech.
+	Listening,
+	/// Provider is preparing a response.
+	Thinking,
+	/// Remote audio is playing.
+	Speaking,
+	/// Durable coding work is active.
+	Working,
+	/// Transport is closing.
+	Closing,
+	/// Session failed and is awaiting teardown.
+	Error,
+}
+
+/// Host action produced by realtime voice takeover key handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveVoiceAction {
+	/// Apply the new microphone mute state.
+	SetMuted(bool),
+	/// Terminate realtime voice and restore the composer.
+	Close,
+}
+
+/// Animated realtime voice composer takeover.
+#[derive(Clone, Debug)]
+pub struct LiveVoiceVisualizer {
+	phase:        LiveVoicePhase,
+	muted:        bool,
+	input_level:  f32,
+	output_level: f32,
+	history:      VecDeque<u8>,
+	transcript:   Str,
+}
+
+impl Default for LiveVoiceVisualizer {
+	fn default() -> Self {
+		Self {
+			phase:        LiveVoicePhase::Connecting,
+			muted:        false,
+			input_level:  0.0,
+			output_level: 0.0,
+			history:      VecDeque::with_capacity(32),
+			transcript:   Str::default(),
+		}
+	}
+}
+
+impl LiveVoiceVisualizer {
+	/// Updates provider phase.
+	pub const fn set_phase(&mut self, phase: LiveVoicePhase) {
+		self.phase = phase;
+	}
+
+	/// Records bounded microphone and playback levels.
+	pub fn set_levels(&mut self, input: f32, output: f32) {
+		self.input_level = sanitize_level(input);
+		self.output_level = sanitize_level(output);
+		let combined = self.input_level.max(self.output_level);
+		self.history.push_back((combined * 8.0).round() as u8);
+		while self.history.len() > 32 {
+			self.history.pop_front();
+		}
+	}
+
+	/// Replaces the volatile user transcript displayed beneath the meter.
+	pub fn set_transcript(&mut self, transcript: Str) {
+		self.transcript = transcript;
+	}
+
+	/// Whether microphone transmission is muted.
+	#[must_use]
+	pub const fn muted(&self) -> bool {
+		self.muted
+	}
+
+	fn toggle_mute(&mut self) -> LiveVoiceAction {
+		self.muted = !self.muted;
+		LiveVoiceAction::SetMuted(self.muted)
+	}
+}
+
+fn sanitize_level(level: f32) -> f32 {
+	if level.is_finite() {
+		level.clamp(0.0, 1.0)
+	} else {
+		0.0
+	}
+}
+fn draw_live_voice_visualizer(
+	frame: &mut Frame,
+	rect: Rect,
+	visualizer: &LiveVoiceVisualizer,
+	elapsed: Duration,
+	ctx: &UiContext,
+) {
+	if rect.width < 4 || rect.height < LIVE_VOICE_ROWS {
+		return;
+	}
+	let state_color = match visualizer.phase {
+		LiveVoicePhase::Connecting | LiveVoicePhase::Thinking => ctx.theme.info,
+		LiveVoicePhase::Listening => ctx.theme.ok,
+		LiveVoicePhase::Speaking => ctx.theme.accent,
+		LiveVoicePhase::Working => ctx.theme.warn,
+		LiveVoicePhase::Closing => ctx.theme.muted,
+		LiveVoicePhase::Error => ctx.theme.err,
+	};
+	draw_box(frame, rect, ink(state_color), panel_style(ctx.theme), ctx.charset, ctx.native_decor);
+	let icon = match (ctx.charset, visualizer.phase) {
+		(Charset::Ascii, LiveVoicePhase::Listening) => ">",
+		(Charset::Ascii, LiveVoicePhase::Speaking) => "<",
+		(Charset::Ascii, LiveVoicePhase::Thinking | LiveVoicePhase::Connecting) => "*",
+		(Charset::Ascii, LiveVoicePhase::Working) => "+",
+		(Charset::Ascii, LiveVoicePhase::Closing | LiveVoicePhase::Error) => "!",
+		(_, LiveVoicePhase::Listening) => "●",
+		(_, LiveVoicePhase::Speaking) => "◖",
+		(_, LiveVoicePhase::Thinking | LiveVoicePhase::Connecting) => "◌",
+		(_, LiveVoicePhase::Working) => "◆",
+		(_, LiveVoicePhase::Closing | LiveVoicePhase::Error) => "×",
+	};
+	let phase: &'static str = visualizer.phase.into();
+	let mute = if visualizer.muted {
+		"muted · space unmutes"
+	} else {
+		"space mutes"
+	};
+	draw_line(
+		frame,
+		rect.x.saturating_add(1),
+		rect.y.saturating_add(1),
+		rect.width.saturating_sub(2),
+		&[
+			Span::new(icon, ink(state_color).bold()),
+			Span::new(" ", ink(ctx.theme.muted)),
+			Span::new(phase, ink(state_color).bold()),
+			Span::new(" · ", ink(ctx.theme.muted)),
+			Span::new(mute, ink(ctx.theme.muted)),
+			Span::new(" · esc closes", ink(ctx.theme.muted)),
+		],
+	);
+	let mut x = rect.x.saturating_add(1);
+	let available = rect.width.saturating_sub(2);
+	let meter_width = available.min(32);
+	let glyphs = if ctx.charset == Charset::Ascii {
+		[".", ":", "-", "=", "#"]
+	} else {
+		["▁", "▂", "▄", "▆", "█"]
+	};
+	let phase_offset = usize::try_from(elapsed.as_millis() / 100).unwrap_or(0);
+	for index in 0..meter_width {
+		let history_index = visualizer
+			.history
+			.len()
+			.saturating_sub(usize::from(meter_width - index));
+		let level = visualizer.history.get(history_index).copied().unwrap_or(0);
+		let animated =
+			if matches!(visualizer.phase, LiveVoicePhase::Connecting | LiveVoicePhase::Thinking) {
+				level.max(((phase_offset + usize::from(index)) % 5) as u8)
+			} else {
+				level
+			};
+		let glyph = glyphs[usize::from(animated).min(8) * (glyphs.len() - 1) / 8];
+		x = frame.put(x, rect.y.saturating_add(2), glyph, ink(state_color));
+	}
+	if meter_width < available && !visualizer.transcript.is_empty() {
+		let text = truncate_to_width(
+			visualizer.transcript.as_str(),
+			available.saturating_sub(meter_width).saturating_sub(1),
+		);
+		frame.put(
+			x.saturating_add(1),
+			rect.y.saturating_add(2),
+			text.text,
+			ink(ctx.theme.fg).italic(),
+		);
+	}
+}
 
 /// One retained chat document update and its exact repainted row ranges.
 pub struct RenderedFrame<'a> {
@@ -432,6 +621,100 @@ impl ToolGroup {
 
 struct CompactionEntry {
 	label: Str,
+}
+
+fn sanitize_thinking_text(text: &str, prose_only: bool) -> Option<String> {
+	if text.is_empty() {
+		return None;
+	}
+	let canonical = text.trim();
+	if canonical.is_empty()
+		|| canonical
+			.bytes()
+			.all(|byte| matches!(byte, b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0xe2 | 0x80 | 0xa6))
+	{
+		return None;
+	}
+	let mut output = Vec::<String>::new();
+	let mut fence: Option<(u8, usize)> = None;
+	let lines = text.split('\n').collect::<Vec<_>>();
+	for (index, line) in lines.iter().enumerate() {
+		if let Some((marker, length)) = fence {
+			if fence_marker(line).is_some_and(|(candidate, candidate_len, suffix)| {
+				candidate == marker && candidate_len >= length && suffix.trim().is_empty()
+			}) {
+				fence = None;
+			}
+			if !prose_only {
+				output.push((*line).to_owned());
+			}
+			continue;
+		}
+		if comment_noise(line, index + 1 == lines.len()) {
+			continue;
+		}
+		if let Some((marker, length, suffix)) = fence_marker(line)
+			&& !(marker == b'`' && suffix.contains('`'))
+		{
+			fence = Some((marker, length));
+			if prose_only {
+				append_thinking_ellipsis(&mut output);
+			} else {
+				output.push((*line).to_owned());
+			}
+			continue;
+		}
+		output.push((*line).to_owned());
+	}
+	let formatted = output.join("\n");
+	(!formatted.trim().is_empty()).then_some(formatted)
+}
+
+fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+	let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+	if indentation > 3 {
+		return None;
+	}
+	let bytes = line.as_bytes();
+	let marker = *bytes.get(indentation)?;
+	if !matches!(marker, b'`' | b'~') {
+		return None;
+	}
+	let length = bytes[indentation..]
+		.iter()
+		.take_while(|byte| **byte == marker)
+		.count();
+	(length >= 3).then(|| (marker, length, &line[indentation + length..]))
+}
+
+fn comment_noise(line: &str, last: bool) -> bool {
+	let trimmed = line.trim();
+	let empty = trimmed
+		.strip_prefix("<!--")
+		.and_then(|body| body.strip_suffix("-->"))
+		.is_some_and(|body| body.trim().is_empty());
+	empty
+		|| (last
+			&& trimmed
+				.strip_prefix("<!--")
+				.is_some_and(|body| body.trim().is_empty()))
+}
+
+fn append_thinking_ellipsis(lines: &mut Vec<String>) {
+	if let Some(last) = lines.iter_mut().rev().find(|line| !line.trim().is_empty()) {
+		let trimmed = last.trim_end();
+		if trimmed.ends_with("...") {
+			last.truncate(trimmed.len());
+		} else if trimmed.ends_with('.') {
+			last.truncate(trimmed.len() - 1);
+			last.push_str("...");
+		} else {
+			last.truncate(trimmed.len());
+			last.push_str("...");
+		}
+	} else {
+		lines.push("...".to_owned());
+	}
 }
 
 struct LiveAssistant {
@@ -1178,6 +1461,8 @@ pub struct Chat {
 	celebration_until:  Option<Duration>,
 	attribution:        Option<Attribution>,
 	keyword_accent:     KeywordAccent,
+	live_voice:         Option<LiveVoiceVisualizer>,
+	live_voice_action:  Option<LiveVoiceAction>,
 }
 
 impl Chat {
@@ -1236,6 +1521,8 @@ impl Chat {
 			slots: Slots::new(ctx.clone()),
 			attribution: None,
 			keyword_accent: KeywordAccent::default(),
+			live_voice: None,
+			live_voice_action: None,
 		}
 	}
 
@@ -1292,8 +1579,54 @@ impl Chat {
 		self.bump_live();
 	}
 
+	/// Starts realtime voice composer takeover.
+	pub fn start_live_voice(&mut self) {
+		self.live_voice = Some(LiveVoiceVisualizer::default());
+		self.live_voice_action = None;
+		self.bump_live();
+	}
+
+	/// Restores the ordinary composer after realtime voice teardown.
+	pub fn stop_live_voice(&mut self) {
+		self.live_voice = None;
+		self.live_voice_action = None;
+		self.refresh_composer();
+		self.bump_live();
+	}
+
+	/// Mutably borrows the active visualizer for provider event projection.
+	pub fn live_voice_mut(&mut self) -> Option<&mut LiveVoiceVisualizer> {
+		self.bump_live();
+		self.live_voice.as_mut()
+	}
+
+	/// Takes the most recent mute/close action.
+	pub const fn take_live_voice_action(&mut self) -> Option<LiveVoiceAction> {
+		self.live_voice_action.take()
+	}
+
 	/// Routes a key through the composer.
 	pub fn handle_key(&mut self, key: Key) -> ChatKey {
+		if key == Key::Ctrl('l') {
+			if self.live_voice.is_some() {
+				self.stop_live_voice();
+			} else {
+				self.start_live_voice();
+			}
+			return ChatKey::Consumed;
+		}
+		if let Some(visualizer) = self.live_voice.as_mut() {
+			self.live_voice_action = match key {
+				Key::Char(' ') => Some(visualizer.toggle_mute()),
+				Key::Esc | Key::Ctrl('c') => {
+					visualizer.set_phase(LiveVoicePhase::Closing);
+					Some(LiveVoiceAction::Close)
+				},
+				_ => None,
+			};
+			self.bump_live();
+			return ChatKey::Consumed;
+		}
 		if key == Key::Ctrl('o') {
 			self.toggle_latest_tool();
 			return ChatKey::Consumed;
@@ -1423,8 +1756,12 @@ impl Chat {
 	}
 
 	/// Returns the composer block height used for pointer hit testing.
-	pub const fn composer_rows(&self) -> u16 {
-		self.editor_ui.height()
+	pub fn composer_rows(&mut self) -> u16 {
+		if self.live_voice.is_some() {
+			LIVE_VOICE_ROWS
+		} else {
+			self.editor_ui.height()
+		}
 	}
 
 	/// Returns whether the latest status snapshot says a turn is active.
@@ -1509,13 +1846,19 @@ impl Chat {
 				.as_str()
 				.strip_prefix("*Thinking:* ")
 				.unwrap_or(message.text.as_str());
-			let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
 			if message.thinking {
-				let elapsed = elapsed_label(self.started_at.elapsed().saturating_sub(message.started));
-				self
-					.transcript
-					.push(Entry::Thinking(ThinkingEntry { body, elapsed, expanded: false }));
+				if let Some(body) = sanitize_thinking_text(body, true) {
+					let elapsed =
+						elapsed_label(self.started_at.elapsed().saturating_sub(message.started));
+					let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
+					self.transcript.push(Entry::Thinking(ThinkingEntry {
+						body,
+						elapsed,
+						expanded: false,
+					}));
+				}
 			} else {
+				let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
 				self.transcript.push(Entry::Assistant(body));
 			}
 			self.bump_live();
@@ -2030,6 +2373,41 @@ impl Chat {
 		self.set_composer_text(text.as_str());
 	}
 
+	/// Prepends every unstarted queued prompt to the current draft and restores
+	/// its attachment descriptors without re-probing their sources.
+	pub fn restore_queued_prompts(&mut self, prompts: Vec<QueuedPrompt>) {
+		if prompts.is_empty() {
+			return;
+		}
+		let mut queued = String::new();
+		let mut attachments = Vec::new();
+		for prompt in prompts {
+			if let Some(index) = self
+				.transcript
+				.iter()
+				.rposition(|entry| matches!(entry, Entry::User(user) if user.body.text == prompt.text))
+			{
+				self.transcript.remove(index);
+			}
+			if !queued.is_empty() {
+				queued.push_str("\n\n");
+			}
+			queued.push_str(prompt.text.as_str());
+			attachments.extend(prompt.attachments);
+		}
+		let draft = self.composer_text();
+		if !draft.trim().is_empty() {
+			queued.push_str("\n\n");
+			queued.push_str(&draft);
+		}
+		self.attachments.restore(attachments);
+		self.drawn_entries = 0;
+		self.transcript_rows = 0;
+		self.height_floor = 0;
+		self.last_viewport = Size::new(0, 0);
+		self.set_composer_text(&queued);
+	}
+
 	/// Removes committed and live transcript content.
 	pub fn clear_history(&mut self) {
 		self.transcript.clear();
@@ -2053,6 +2431,7 @@ impl Chat {
 			BackendEvent::PromptDropped { text, attachments } => {
 				self.restore_dropped_prompt(text, attachments);
 			},
+			BackendEvent::QueuedPromptsRestored(prompts) => self.restore_queued_prompts(prompts),
 			BackendEvent::AssistantBegin { id } => self.begin_assistant(id),
 			BackendEvent::AssistantDelta { id, text } => {
 				self.append_assistant(id.as_str(), text.as_str());
@@ -2085,6 +2464,19 @@ impl Chat {
 				self.download_activity = Some(DownloadActivity::new(progress, now));
 				self.bump_live();
 			},
+			BackendEvent::LiveVoiceStarted => self.start_live_voice(),
+			BackendEvent::LiveVoiceUpdated { phase, input_level, output_level, transcript } => {
+				if self.live_voice.is_none() {
+					self.start_live_voice();
+				}
+				if let Some(visualizer) = self.live_voice.as_mut() {
+					visualizer.set_phase(phase);
+					visualizer.set_levels(input_level, output_level);
+					visualizer.set_transcript(transcript);
+				}
+				self.bump_live();
+			},
+			BackendEvent::LiveVoiceStopped => self.stop_live_voice(),
 			BackendEvent::SessionTitle(title) => self.set_session_title(title),
 			BackendEvent::HistoryCleared => self.clear_history(),
 			BackendEvent::Ack { interrupted } => {
@@ -2093,6 +2485,8 @@ impl Chat {
 				}
 			},
 			event @ (BackendEvent::ApprovalPending(_)
+			| BackendEvent::OpenGuidedGoal
+			| BackendEvent::OpenPlanReview { .. }
 			| BackendEvent::ApprovalSettled { .. }
 			| BackendEvent::PtyStarted { .. }
 			| BackendEvent::PtyOutput { .. }
@@ -2104,7 +2498,10 @@ impl Chat {
 			| BackendEvent::RewindTargets(_)
 			| BackendEvent::AuthPrompt { .. }
 			| BackendEvent::AuthPromptClose
+			| BackendEvent::ApplySettings { .. }
+			| BackendEvent::Select { .. }
 			| BackendEvent::SettingsSchema(_)
+			| BackendEvent::OpenSelection { .. }
 			| BackendEvent::OpenAgentTree
 			| BackendEvent::CopyToClipboard(_)
 			| BackendEvent::Pause
@@ -2205,7 +2602,17 @@ impl Chat {
 			self.draw_working(&mut frame, working_y, elapsed);
 		}
 		self.draw_session_title(&mut frame, title_y);
-		frame.blit(self.editor_ui.frame(), 0, editor_height, 0, editor_y);
+		if let Some(visualizer) = self.live_voice.as_ref() {
+			draw_live_voice_visualizer(
+				&mut frame,
+				Rect::new(0, editor_y, content_width, LIVE_VOICE_ROWS),
+				visualizer,
+				elapsed,
+				&self.ctx,
+			);
+		} else {
+			frame.blit(self.editor_ui.frame(), 0, editor_height, 0, editor_y);
+		}
 		let mut remaining = panel_y;
 		for entry in self.transcript.iter().rev() {
 			if remaining == 0 {
@@ -2396,10 +2803,20 @@ impl Chat {
 		if !self.frame.noselect().contains(&hud) {
 			self.frame.push_noselect(hud);
 		}
-		if repaint_suffix || editor_changed {
-			self
-				.frame
-				.blit(self.editor_ui.frame(), 0, editor_height, 0, editor_y);
+		if repaint_suffix || editor_changed || (self.live_voice.is_some() && live_changed) {
+			if let Some(visualizer) = self.live_voice.as_ref() {
+				draw_live_voice_visualizer(
+					&mut self.frame,
+					Rect::new(0, editor_y, content_width, LIVE_VOICE_ROWS),
+					visualizer,
+					elapsed,
+					&self.ctx,
+				);
+			} else {
+				self
+					.frame
+					.blit(self.editor_ui.frame(), 0, editor_height, 0, editor_y);
+			}
 		}
 		let frame_size = self.frame.size();
 		let rails = if let Some(attribution) = self.attribution.as_ref() {

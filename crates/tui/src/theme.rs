@@ -217,6 +217,131 @@ fn resolve_color(
 	Err(ThemeError::Color { token: Str::new(token), value: Str::new_static("variable cycle") })
 }
 
+/// Derives a stable TrueColor accent from a session name and active theme.
+///
+/// Dark surfaces use the warm 0–120° band. Supplying a light-surface
+/// luminance selects the cool 180–300° band and lowers lightness until WCAG
+/// 3:1 contrast is met. Occupied theme hues are avoided by at least 10° when
+/// the selected band has room.
+#[must_use]
+pub fn session_accent_color(
+	name: &str,
+	theme_colors: &[Color],
+	surface_luminance: Option<f64>,
+) -> Color {
+	let (hue_start, hue_end) = if surface_luminance.is_some() {
+		(180_u32, 300_u32)
+	} else {
+		(0_u32, 120_u32)
+	};
+	let mut hash = 5_381_u32;
+	for unit in name.encode_utf16() {
+		hash = hash.wrapping_mul(33) ^ u32::from(unit);
+	}
+	let mut hue = hue_start + hash % (hue_end - hue_start);
+	let occupied = theme_colors
+		.iter()
+		.filter_map(|color| match *color {
+			Color::Rgb(red, green, blue) => rgb_hue(red, green, blue),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	if occupied
+		.iter()
+		.any(|occupied| hue_distance(f64::from(hue), *occupied) < 10.0)
+	{
+		'search: for distance in 1..=hue_end - hue_start {
+			for candidate in
+				[hue.saturating_add(distance).min(hue_end), hue.saturating_sub(distance).max(hue_start)]
+			{
+				if occupied
+					.iter()
+					.all(|occupied| hue_distance(f64::from(candidate), *occupied) >= 10.0)
+				{
+					hue = candidate;
+					break 'search;
+				}
+			}
+		}
+	}
+	let mut lightness = 0.72;
+	if let Some(surface_luminance) = surface_luminance {
+		let cap = ((surface_luminance + 0.05) / 3.0 - 0.05).max(0.0);
+		if relative_luminance(hsl_rgb(f64::from(hue), 0.9, lightness)) > cap {
+			let mut low = 0.0;
+			let mut high = lightness;
+			for _ in 0..20 {
+				let middle = (low + high) / 2.0;
+				if relative_luminance(hsl_rgb(f64::from(hue), 0.9, middle)) > cap {
+					high = middle;
+				} else {
+					low = middle;
+				}
+			}
+			lightness = low;
+		}
+	}
+	let [red, green, blue] = hsl_rgb(f64::from(hue), 0.9, lightness);
+	Color::Rgb(red, green, blue)
+}
+
+fn rgb_hue(red: u8, green: u8, blue: u8) -> Option<f64> {
+	let red = f64::from(red) / 255.0;
+	let green = f64::from(green) / 255.0;
+	let blue = f64::from(blue) / 255.0;
+	let maximum = red.max(green).max(blue);
+	let minimum = red.min(green).min(blue);
+	let delta = maximum - minimum;
+	if maximum == 0.0 || delta / maximum < 0.1 {
+		return None;
+	}
+	let sector = if maximum == red {
+		((green - blue) / delta).rem_euclid(6.0)
+	} else if maximum == green {
+		(blue - red) / delta + 2.0
+	} else {
+		(red - green) / delta + 4.0
+	};
+	Some(sector * 60.0)
+}
+
+fn hue_distance(left: f64, right: f64) -> f64 {
+	let distance = (left - right).abs();
+	distance.min(360.0 - distance)
+}
+
+fn hsl_rgb(hue: f64, saturation: f64, lightness: f64) -> [u8; 3] {
+	let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+	let sector = hue / 60.0;
+	let secondary = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+	let (red, green, blue) = match sector as u8 {
+		0 => (chroma, secondary, 0.0),
+		1 => (secondary, chroma, 0.0),
+		2 => (0.0, chroma, secondary),
+		3 => (0.0, secondary, chroma),
+		4 => (secondary, 0.0, chroma),
+		_ => (chroma, 0.0, secondary),
+	};
+	let offset = lightness - chroma / 2.0;
+	[
+		((red + offset) * 255.0).round().clamp(0.0, 255.0) as u8,
+		((green + offset) * 255.0).round().clamp(0.0, 255.0) as u8,
+		((blue + offset) * 255.0).round().clamp(0.0, 255.0) as u8,
+	]
+}
+
+fn relative_luminance([red, green, blue]: [u8; 3]) -> f64 {
+	let linear = |value: u8| {
+		let value = f64::from(value) / 255.0;
+		if value <= 0.04045 {
+			value / 12.92
+		} else {
+			((value + 0.055) / 1.055).powf(2.4)
+		}
+	};
+	0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

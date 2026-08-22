@@ -77,6 +77,12 @@ pub enum Key {
 	FollowUp,
 	/// Shift+Enter: literal newline in multiline text entry.
 	ShiftEnter,
+	/// Alt/Shift+Up: restore the newest queued follow-up to the composer.
+	RestoreQueue,
+	/// Ctrl+Shift+P: cycle backward through the host's model roster.
+	CyclePrevious,
+	/// Alt+Shift+P: toggle the host's planning mode.
+	PlanToggle,
 	/// Ctrl/Alt+Left: previous word boundary.
 	WordLeft,
 	/// Ctrl/Alt+Right: next word boundary.
@@ -1414,7 +1420,7 @@ const DEFAULT_BINDINGS: &[(Key, u8, Key)] = &[
 	(Key::Right, 4, Key::WordRight),
 	(Key::Left, 1, Key::SelectLeft),
 	(Key::Right, 1, Key::SelectRight),
-	(Key::Up, 1, Key::SelectUp),
+	(Key::Up, 1, Key::RestoreQueue),
 	(Key::Down, 1, Key::SelectDown),
 	(Key::Home, 1, Key::SelectHome),
 	(Key::End, 1, Key::SelectEnd),
@@ -1441,7 +1447,11 @@ const DEFAULT_BINDINGS: &[(Key, u8, Key)] = &[
 	(Key::Char('v'), 5, Key::PasteRaw),
 	// xterm modifyOtherKeys emits the shifted codepoint, so this exact row must win
 	// before shift-folding `Ctrl+Shift+V` into the smart-paste `Ctrl+v` row.
+	(Key::Up, 2, Key::RestoreQueue),
+	(Key::Up, 3, Key::RestoreQueue),
 	(Key::Char('V'), 5, Key::PasteRaw),
+	(Key::Char('P'), 5, Key::CyclePrevious),
+	(Key::Char('P'), 3, Key::PlanToggle),
 	// pi tui.input.newLine: Shift/Ctrl-Enter spelling; Alt+Enter maps to FollowUp.
 	// Rows cover each combination so the semantics stay table-owned.
 	(Key::Char('j'), 4, Key::ShiftEnter),

@@ -629,6 +629,7 @@ fn encode_key(key: Key, application_cursor: bool) -> Option<Bytes> {
 		Key::Tab => b"\t",
 		Key::Space => b" ",
 		Key::Backspace => b"\x7f",
+		Key::RestoreQueue | Key::CyclePrevious | Key::PlanToggle => b"",
 		Key::Function(1) => b"\x1bOP",
 		Key::Function(2) => b"\x1bOQ",
 		Key::Function(3) => b"\x1bOR",

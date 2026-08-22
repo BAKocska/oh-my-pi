@@ -1744,6 +1744,14 @@ impl Terminal {
 		self.appearance
 	}
 
+	/// Requests a debounced OSC 11 appearance refresh.
+	///
+	/// Hosts use this after an explicit display reset so theme observers see
+	/// the terminal's current luminance before the forced repaint.
+	pub fn refresh_appearance(&self) -> io::Result<()> {
+		self.debounce_appearance_query()
+	}
+
 	/// Returns the effective geometry from the latest in-band resize report.
 	///
 	/// The operating-system size replaces reported dimensions when they

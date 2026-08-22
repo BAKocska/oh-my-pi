@@ -640,6 +640,27 @@ impl Component for EditInput {
 				}
 			}
 			let mut runs = overlay_chip_runs(&runs, &chips, content.text.len());
+			let mut keyword_runs: SmallVec<(usize, usize, Style), 16> = SmallVec::new();
+			for &(keyword_start, keyword_end) in &self.keyword_spans {
+				let from = keyword_start.max(start);
+				let to = keyword_end.min(scanned);
+				if from >= to {
+					continue;
+				}
+				let keyword_len = text[keyword_start..keyword_end].chars().count().max(1);
+				let mut position = text[keyword_start..from].chars().count();
+				for (offset, character) in text[from..to].char_indices() {
+					let run_start = from - start + offset;
+					let run_end = run_start + character.len_utf8();
+					keyword_runs.push((
+						run_start,
+						run_end,
+						keyword_gradient_style(position, keyword_len),
+					));
+					position += 1;
+				}
+			}
+			runs = overlay_chip_runs(&runs, &keyword_runs, content.text.len());
 			if matches!(self.style, ComposerStyle::Field | ComposerStyle::Rail) {
 				for run in &mut runs {
 					run.style = run.style.bg(pc.ctx.theme.panel);
@@ -960,6 +981,24 @@ fn chip_style(marker: &str) -> Option<Style> {
 }
 
 /// Whether a paste is large enough to collapse into an attachment chip.
+/// Returns the cool teal-to-violet gradient used for magic editor keywords.
+fn keyword_gradient_style(position: usize, len: usize) -> Style {
+	const START: [u8; 3] = [45, 212, 191];
+	const END: [u8; 3] = [139, 92, 246];
+	let denominator = len.saturating_sub(1).max(1);
+	let blend = |from: u8, to: u8| {
+		let from = usize::from(from);
+		let to = usize::from(to);
+		u8::try_from((from * denominator.saturating_sub(position) + to * position) / denominator)
+			.unwrap_or(to as u8)
+	};
+	Style::new().fg(Color::Rgb(
+		blend(START[0], END[0]),
+		blend(START[1], END[1]),
+		blend(START[2], END[2]),
+	))
+}
+
 fn collapses_to_chip(text: &str) -> bool {
 	text.len() > 1000 || text.bytes().filter(|byte| *byte == b'\n').count() >= 10
 }
@@ -1184,6 +1223,22 @@ impl Attachments {
 			.filter(|staged| !staged.hidden)
 			.map(|staged| staged.attachment)
 			.collect()
+	}
+
+	/// Restores descriptors previously drained by [`Attachments::take`].
+	///
+	/// Queue-dequeue uses this to make a submitted follow-up editable again
+	/// without re-reading image files or rebuilding collapsed-paste previews.
+	pub fn restore(&self, attachments: Vec<Attachment>) {
+		if attachments.is_empty() {
+			return;
+		}
+		let mut state = self.state.borrow_mut();
+		for attachment in attachments {
+			state.counter = state.counter.max(attachment.marker);
+			state.staged.push(Staged { attachment, hidden: false });
+		}
+		state.version += 1;
 	}
 
 	/// Shows exactly the attachments `visible` accepts and hides the rest

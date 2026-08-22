@@ -85,6 +85,7 @@ struct FieldData {
 	options:  SmallVec<Str, 8>,
 	value:    FieldValue,
 	required: bool,
+	masked:   bool,
 	pattern:  Option<Str>,
 	min:      i64,
 	max:      i64,
@@ -154,6 +155,7 @@ impl FieldData {
 			options,
 			value,
 			required: field.props.flag(Prop::Required),
+			masked: field.props.flag(Prop::Mask),
 			pattern: field.props.str_of(Prop::Match).cloned(),
 			min: i64_prop(Prop::Min).unwrap_or(i64::MIN),
 			max: i64_prop(Prop::Max).unwrap_or(i64::MAX),
@@ -454,6 +456,9 @@ impl Component for Form {
 				Key::Up if len > 0 => self.sub_cursor = (self.sub_cursor + len - 1) % len,
 				Key::Down if len > 0 => self.sub_cursor = (self.sub_cursor + 1) % len,
 				Key::Space if field.kind == FieldKind::Multi => toggle_multi(field, self.sub_cursor),
+				Key::Left | Key::Right if field.kind == FieldKind::Multi => {
+					reorder_multi(field, self.sub_cursor, key == Key::Right);
+				},
 				Key::Enter => {
 					if field.kind != FieldKind::Multi
 						&& let Some(option) = field.options.get(usize::from(self.sub_cursor))
@@ -631,6 +636,26 @@ fn toggle_multi(field: &mut FieldData, index: u16) {
 	}
 }
 
+fn reorder_multi(field: &mut FieldData, option_index: u16, forward: bool) {
+	let Some(option) = field.options.get(usize::from(option_index)) else {
+		return;
+	};
+	let FieldValue::Many(values) = &mut field.value else {
+		return;
+	};
+	let Some(at) = values.iter().position(|value| value == option) else {
+		return;
+	};
+	let next = if forward {
+		(at + 1).min(values.len().saturating_sub(1))
+	} else {
+		at.saturating_sub(1)
+	};
+	if at != next {
+		values.swap(at, next);
+	}
+}
+
 fn field_value(field: &FieldData) -> Value {
 	match &field.value {
 		FieldValue::Bool(value) => Value::Bool(*value),
@@ -718,7 +743,16 @@ fn paint_field_value(
 			}
 			x
 		},
-		(FieldValue::Text(text), _) => frame.put(x, y, text, tint(base(&ctx.theme))),
+		(FieldValue::Text(text), _) => frame.put(
+			x,
+			y,
+			if field.masked && !text.is_empty() {
+				ctx.charset.icon_named("secret").unwrap_or("secret")
+			} else {
+				text
+			},
+			tint(base(&ctx.theme)),
+		),
 	}
 }
 

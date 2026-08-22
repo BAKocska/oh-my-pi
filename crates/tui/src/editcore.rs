@@ -4,7 +4,14 @@
 //! [`Editor`] built on top of it (pluggable completion, inline ghost
 //! hints, emoji expansion, prompt history).
 
-use std::{cell::Cell, cmp::Reverse, collections::HashMap, ops::Range, sync::LazyLock};
+use std::{
+	cell::Cell,
+	cmp::Reverse,
+	collections::HashMap,
+	ops::Range,
+	path::{Path, PathBuf},
+	sync::{Arc, LazyLock},
+};
 
 use im::Vector;
 use omp_core::{Str, sf, str::IntoStr};
@@ -2138,11 +2145,13 @@ impl Editor {
 /// One slash-command palette entry completed by [`SlashCommands`].
 #[derive(Clone)]
 pub struct Command {
-	name:        Str,
-	description: Str,
-	aliases:     SmallVec<Str, 1>,
-	args:        Box<[CommandArg]>,
-	hint:        Option<Str>,
+	name:         Str,
+	description:  Str,
+	aliases:      SmallVec<Str, 1>,
+	args:         Box<[CommandArg]>,
+	hint:         Option<Str>,
+	dynamic_args: Option<Arc<dyn Fn(&str) -> Box<[CommandArgument]> + Send + Sync>>,
+	status:       Option<Arc<dyn Fn() -> Str + Send + Sync>>,
 }
 
 /// One argument candidate completed after a command name (`/mcp add …`).
@@ -2152,17 +2161,47 @@ struct CommandArg {
 	description: Str,
 	usage:       Option<Str>,
 }
+/// One dynamic slash-command argument candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandArgument {
+	/// Text inserted into the editor.
+	pub value:       Str,
+	/// One-line candidate description.
+	pub description: Str,
+	/// Ghosted usage after insertion.
+	pub usage:       Option<Str>,
+}
 
 impl Command {
 	/// Builds a palette entry from its name, blurb, and alias spellings.
 	pub fn new(name: &str, description: &str, aliases: &[&str]) -> Self {
 		Self {
-			name:        Str::new(name),
-			description: Str::new(description),
-			aliases:     aliases.iter().map(Str::new).collect(),
-			args:        Box::default(),
-			hint:        None,
+			name:         Str::new(name),
+			description:  Str::new(description),
+			aliases:      aliases.iter().map(Str::new).collect(),
+			args:         Box::default(),
+			hint:         None,
+			dynamic_args: None,
+			status:       None,
 		}
+	}
+
+	/// Supplies live argument candidates. The provider runs only while this
+	/// command's first argument is being completed.
+	#[must_use]
+	pub fn with_dynamic_args(
+		mut self,
+		provider: impl Fn(&str) -> Box<[CommandArgument]> + Send + Sync + 'static,
+	) -> Self {
+		self.dynamic_args = Some(Arc::new(provider));
+		self
+	}
+
+	/// Supplies a live status line for the command-palette description.
+	#[must_use]
+	pub fn with_status(mut self, provider: impl Fn() -> Str + Send + Sync + 'static) -> Self {
+		self.status = Some(Arc::new(provider));
+		self
 	}
 
 	/// Argument candidates offered once the command name is complete:
@@ -2230,10 +2269,9 @@ impl SlashCommands {
 		}
 		let prefix_start = line_start + line.len() - trimmed.len();
 		let query = body.to_ascii_lowercase();
-		if self
-			.find(body)
-			.is_some_and(|command| command.args.is_empty() && command.hint.is_none())
-		{
+		if self.find(body).is_some_and(|command| {
+			command.args.is_empty() && command.dynamic_args.is_none() && command.hint.is_none()
+		}) {
 			return None;
 		}
 		let mut ranked: SmallVec<(u16, Suggestion), 8> = SmallVec::new();
@@ -2253,7 +2291,12 @@ impl SlashCommands {
 				ranked.push((score, Suggestion {
 					value:       sf!("/{selected_name} "),
 					display:     SuggestionDisplay::Text(selected_name.clone()),
-					description: Some(command.description.clone()),
+					description: Some(
+						command
+							.status
+							.as_ref()
+							.map_or_else(|| command.description.clone(), |status| status()),
+					),
 					hint:        command.hint.clone(),
 					category:    Some(sf!("Commands")),
 					match_spans: fuzzy_match_spans(selected_name, &query),
@@ -2280,22 +2323,44 @@ impl SlashCommands {
 			return None;
 		}
 		let command = self.find(name)?;
-		if command.args.is_empty() {
+		let dynamic = command
+			.dynamic_args
+			.as_ref()
+			.map(|provider| provider(partial))
+			.unwrap_or_default();
+		let paths = (command.name == "move")
+			.then(|| filesystem_path_arguments(partial))
+			.unwrap_or_default();
+		if command.args.is_empty() && dynamic.is_empty() && paths.is_empty() {
 			return None;
 		}
 		let prefix_start = cursor - partial.len();
 		let query = partial.to_ascii_lowercase();
 		let mut ranked: SmallVec<(u16, Suggestion), 8> = SmallVec::new();
-		for arg in &command.args {
-			let score = command_score(&query, &arg.name);
+		for arg in command
+			.args
+			.iter()
+			.map(|arg| CommandArgument {
+				value:       arg.name.clone(),
+				description: arg.description.clone(),
+				usage:       arg.usage.clone(),
+			})
+			.chain(dynamic.into_vec())
+			.chain(paths)
+		{
+			let score = command_score(&query, &arg.value.to_ascii_lowercase());
 			if score > 0 {
 				ranked.push((score, Suggestion {
-					value:       sf!("{} ", arg.name),
-					display:     SuggestionDisplay::Text(arg.name.clone()),
+					value:       if arg.usage.is_some() {
+						sf!("{} ", arg.value)
+					} else {
+						arg.value.clone()
+					},
+					display:     SuggestionDisplay::Text(arg.value.clone()),
 					description: Some(arg.description.clone()),
-					hint:        None,
+					hint:        arg.usage.clone(),
 					category:    Some(sf!("Arguments")),
-					match_spans: fuzzy_match_spans(&arg.name, &query),
+					match_spans: fuzzy_match_spans(&arg.value, &query),
 				}));
 			}
 		}
@@ -2306,6 +2371,78 @@ impl SlashCommands {
 			.collect::<SuggestionList>();
 		(!items.is_empty()).then_some(Suggestions { prefix_start, items })
 	}
+}
+
+fn filesystem_path_arguments(partial: &str) -> Vec<CommandArgument> {
+	if partial == "~" {
+		return vec![CommandArgument {
+			value:       Str::new_static("~/"),
+			description: Str::new_static("home directory"),
+			usage:       None,
+		}];
+	}
+	let expanded = if let Some(rest) = partial.strip_prefix('~') {
+		let Some(home) = std::env::var_os("HOME") else {
+			return Vec::new();
+		};
+		PathBuf::from(home).join(rest.trim_start_matches(['/', '\\']))
+	} else if partial.is_empty() {
+		PathBuf::from(".")
+	} else {
+		PathBuf::from(partial)
+	};
+	if expanded
+		.components()
+		.any(|component| component.as_os_str() == ".git")
+	{
+		return Vec::new();
+	}
+	let (directory, prefix) = if partial.is_empty() || partial.ends_with(['/', '\\']) {
+		(expanded.as_path(), "")
+	} else {
+		(
+			expanded.parent().unwrap_or_else(|| Path::new(".")),
+			expanded
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or(""),
+		)
+	};
+	let Ok(entries) = std::fs::read_dir(directory) else {
+		return Vec::new();
+	};
+	let typed_parent = partial
+		.rfind(['/', '\\'])
+		.map_or("", |separator| &partial[..=separator]);
+	let mut candidates = Vec::new();
+	for entry in entries.flatten() {
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else {
+			continue;
+		};
+		if name == ".git" || !name.starts_with(prefix) {
+			continue;
+		}
+		let is_directory = entry.path().is_dir();
+		let mut value =
+			String::with_capacity(typed_parent.len() + name.len() + usize::from(is_directory));
+		value.push_str(typed_parent);
+		value.push_str(name);
+		if is_directory {
+			value.push(std::path::MAIN_SEPARATOR);
+		}
+		candidates.push(CommandArgument {
+			value:       Str::new(value),
+			description: if is_directory {
+				Str::new_static("directory")
+			} else {
+				Str::new_static("file")
+			},
+			usage:       None,
+		});
+	}
+	candidates.sort_by(|left, right| left.value.cmp(&right.value));
+	candidates
 }
 
 impl EditorCompletion for SlashCommands {

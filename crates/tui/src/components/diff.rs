@@ -19,6 +19,8 @@ pub enum DiffKind {
 	Add,
 	/// A removed line.
 	Remove,
+	/// A revision-bound diagnostic attached to the diff.
+	Diagnostic,
 }
 
 /// A single line in a diff.
@@ -186,6 +188,8 @@ impl DiffView {
 		p_add.push(Style::new().fg(ok), prefixes.add);
 		let mut p_remove = Prefix::default();
 		p_remove.push(Style::new().fg(err), prefixes.remove);
+		let mut p_diagnostic = Prefix::default();
+		p_diagnostic.push(Style::new().fg(ctx.theme.warn).bold(), "! ");
 
 		let mut c_header = Prefix::default();
 		c_header.push(Style::new().fg(info).bold(), prefixes.continuation);
@@ -195,6 +199,8 @@ impl DiffView {
 		c_add.push(Style::new().fg(ok), prefixes.continuation);
 		let mut c_remove = Prefix::default();
 		c_remove.push(Style::new().fg(err), prefixes.continuation);
+		let mut c_diagnostic = Prefix::default();
+		c_diagnostic.push(Style::new().fg(ctx.theme.warn), prefixes.continuation);
 
 		let mut context_run = (0, 0, false, false);
 		for (offset, line) in self.lines[self.rendered_lines..].iter().enumerate() {
@@ -217,6 +223,19 @@ impl DiffView {
 				let near_before = context_run.2 && index - context_run.0 < count;
 				let near_after = context_run.3 && context_run.1 - index <= count;
 				if !near_before && !near_after {
+					let first_omitted = context_run.0 + usize::from(context_run.2).saturating_mul(count);
+					let last_omitted = context_run
+						.1
+						.saturating_sub(usize::from(context_run.3).saturating_mul(count));
+					if index == first_omitted && first_omitted < last_omitted {
+						let omitted = last_omitted - first_omitted;
+						let mut wrap = (&mut self.rich).wrap_chars_prefixed(width, &p_header, &c_header);
+						wrap.run(
+							Style::new().fg(muted).italic(),
+							&format!("… {omitted} unchanged lines …"),
+						);
+						wrap.newline();
+					}
 					continue;
 				}
 			}
@@ -225,6 +244,7 @@ impl DiffView {
 				DiffKind::Context => (&p_context, &c_context, Style::new().fg(ctx.theme.fg)),
 				DiffKind::Add => (&p_add, &c_add, Style::new().fg(ok)),
 				DiffKind::Remove => (&p_remove, &c_remove, Style::new().fg(err)),
+				DiffKind::Diagnostic => (&p_diagnostic, &c_diagnostic, Style::new().fg(ctx.theme.warn)),
 			};
 
 			let mut wrap = (&mut self.rich).wrap_chars_prefixed(width, prefix, cont);
@@ -275,11 +295,13 @@ impl DiffView {
 				DiffKind::Context => muted,
 				DiffKind::Add => add,
 				DiffKind::Remove => remove,
+				DiffKind::Diagnostic => self.cached_colorblind.then_some(add).unwrap_or(info),
 			};
 			let prefix = match line.kind {
 				DiffKind::Header | DiffKind::Context => "  ",
 				DiffKind::Add => "+ ",
 				DiffKind::Remove => "- ",
+				DiffKind::Diagnostic => "! ",
 			};
 			let mut wrap = (&mut self.rich).wrap_chars(width);
 			wrap.run(Style::new().fg(color), prefix);
