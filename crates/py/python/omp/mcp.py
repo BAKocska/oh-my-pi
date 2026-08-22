@@ -16,9 +16,9 @@ from urllib.parse import urlsplit
 
 from _omp import Duration
 
-from ._errors import NotWiredError, SpecError
+from ._errors import SpecError
 from .devices import Device, Precedence
-from .placement import Restart
+from .placement import Place, Restart
 from .policy import Tier
 
 
@@ -407,26 +407,141 @@ class McpServer:
         )
 
 
-def mount(spec: McpMount) -> tuple[Device, ...]:
+def _transport_payload(transport: McpTransport) -> dict[str, object]:
+    if isinstance(transport, Stdio):
+        return {
+            "type": transport.kind.value,
+            "command": transport.command,
+            "args": list(transport.args),
+            "env": dict(transport.env or _EMPTY_MAP),
+            "cwd": transport.cwd,
+        }
+    return {
+        "type": transport.kind.value,
+        "url": transport.url,
+        "headers": dict(transport.headers or _EMPTY_MAP),
+    }
+
+
+def _mount_payload(spec: McpMount) -> dict[str, object]:
+    return {
+        "server": spec.server,
+        "transport": _transport_payload(spec.transport),
+        "auth": {
+            "kind": spec.auth.kind.value,
+            "scopes": list(spec.auth.scopes),
+            "name": spec.auth.name,
+        },
+        "include": list(spec.include),
+        "exclude": list(spec.exclude),
+        "rename": dict(spec.rename),
+        "docs": dict(spec.docs),
+        "precedence": int(spec.precedence),
+        "tier": spec.tier.value,
+        "timeout": str(spec.timeout),
+        "restart": spec.restart.value,
+    }
+
+
+def _mounted_device(server: str, row: Mapping[str, object]) -> Device:
+    name = _non_empty(row.get("name"), "mcp.mount device name")
+    family = _non_empty(row.get("family"), "mcp.mount device family")
+    rev = row.get("rev")
+    definition = row.get("definition")
+    if not isinstance(rev, int) or rev < 0:
+        raise SpecError("mcp.mount device revision must be a non-negative integer")
+    if not isinstance(definition, Mapping):
+        raise SpecError("mcp.mount device definition must be a mapping")
+    original_name = _non_empty(definition.get("name"), "mcp.mount MCP tool name")
+    schema = definition.get("inputSchema")
+    if schema is not None and not isinstance(schema, dict):
+        raise SpecError("mcp.mount tool inputSchema must be a mapping")
+    documentation = row.get("documentation")
+    if documentation is not None and not isinstance(documentation, str):
+        raise SpecError("mcp.mount device documentation must be a string")
+
+    async def body(**arguments: object) -> object:
+        from . import _control_request
+
+        return await _control_request(
+            "omp.mcp.invoke",
+            server=server,
+            tool=original_name,
+            arguments=arguments,
+        )
+
+    device = Device(
+        name=name,
+        family=family,
+        rev=rev,
+        place=Place.ENV,
+        precedence=int(Precedence.DEFAULT),
+        replaces=None,
+        schema=schema,
+        docs=documentation,
+        summary=definition.get("description")
+        if isinstance(definition.get("description"), str)
+        else None,
+        body=body,
+    )
+    device.mounted = True
+    return device
+
+
+async def mount(spec: McpMount) -> tuple[Device, ...]:
     """Mount a validated MCP server through the Environment-owned CONTROL arm."""
 
     if not isinstance(spec, McpMount):
         raise SpecError("mcp.mount requires an McpMount declaration")
-    del spec
-    raise NotWiredError("omp.mcp.mount")
+    from . import _control_request
+
+    result = await _control_request("omp.mcp.mount", spec=_mount_payload(spec))
+    if not isinstance(result, Mapping) or not isinstance(result.get("devices"), Sequence):
+        raise SpecError("omp.mcp.mount returned an invalid device catalog")
+    return tuple(_mounted_device(spec.server, row) for row in result["devices"])
 
 
-def unmount(server: str) -> None:
+async def unmount(server: str) -> None:
     """Unmount every device from one MCP server and release its connection."""
 
-    _server_name(server, "mcp.unmount server")
-    raise NotWiredError("omp.mcp.unmount")
+    server = _server_name(server, "mcp.unmount server")
+    from . import _control_request
+
+    await _control_request("omp.mcp.unmount", server=server)
 
 
-def servers() -> tuple[McpServer, ...]:
+async def servers() -> tuple[McpServer, ...]:
     """Read MCP connection state through the Environment-owned CONTROL arm."""
 
-    raise NotWiredError("omp.mcp.servers")
+    from . import _control_request
+
+    result = await _control_request("omp.mcp.servers")
+    if not isinstance(result, Mapping) or not isinstance(result.get("servers"), Sequence):
+        raise SpecError("omp.mcp.servers returned an invalid inventory")
+    states = {
+        0: McpServerState.DISCONNECTED,
+        1: McpServerState.DISCONNECTED,
+        2: McpServerState.CONNECTING,
+        3: McpServerState.CONNECTED,
+        4: McpServerState.RECONNECTING,
+        5: McpServerState.FAILED,
+    }
+    inventory: list[McpServer] = []
+    for row in result["servers"]:
+        if not isinstance(row, Mapping):
+            raise SpecError("omp.mcp.servers returned an invalid server row")
+        raw_state = row.get("state")
+        if raw_state not in states:
+            raise SpecError("omp.mcp.servers returned an unknown lifecycle state")
+        inventory.append(
+            McpServer(
+                name=row.get("name"),
+                state=states[raw_state],
+                endpoints=tuple(row.get("endpoints", ())),
+                last_error=row.get("last_error"),
+            )
+        )
+    return tuple(inventory)
 
 
 __all__ = (

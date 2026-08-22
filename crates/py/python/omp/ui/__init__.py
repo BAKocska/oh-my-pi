@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator as _AsyncIterator
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
+import asyncio as _asyncio
 import inspect as _inspect
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
@@ -40,6 +41,10 @@ class CommandDenied(PermissionError, _OmpError):
 
 class ShortcutError(ValueError, _OmpError):
     """A shortcut is malformed or unavailable."""
+
+
+class TerminalInputDenied(PermissionError, _OmpError):
+    """Raw terminal input was not declared, granted, focused, or interactive."""
 
 
 _SHORTCUT_MODIFIERS = ("ctrl", "alt", "shift", "super")
@@ -717,6 +722,100 @@ def set_working_message(content: Tml | None) -> None: """Synchronously replace t
 def set_title(title: str | None) -> None: """Synchronously update the terminal title."""; _emit("set_title", title=title)
 def bell() -> None: """Synchronously queue one attention bell."""; _emit("bell")
 def set_progress(state: Progress) -> None: """Synchronously set terminal taskbar progress."""; _emit("set_progress", state=state)
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalInputFrame:
+    """One bounded raw terminal-input frame from the focused interactive host."""
+
+    sequence: int
+    data: bytes
+    focus_token: str
+
+
+@dataclass(slots=True)
+class _TerminalInputBinding:
+    granted: bool
+    headless: bool
+    focus_token: str
+    subscribe: Callable[[str], object]
+    cancel: Callable[[str], object]
+    queue: _asyncio.Queue[TerminalInputFrame | None] = field(
+        default_factory=lambda: _asyncio.Queue(maxsize=32)
+    )
+    active: bool = False
+
+
+_terminal_input_binding: ContextVar[_TerminalInputBinding | None] = ContextVar(
+    "omp_ui_terminal_input_binding", default=None
+)
+
+
+def _install_terminal_input(
+    *,
+    granted: bool,
+    headless: bool,
+    focus_token: str,
+    subscribe: Callable[[str], object],
+    cancel: Callable[[str], object],
+) -> None:
+    """Install the host-authenticated raw-input lease for this context."""
+
+    _terminal_input_binding.set(
+        _TerminalInputBinding(granted, headless, focus_token, subscribe, cancel)
+    )
+
+
+def _feed_terminal_input(frame: TerminalInputFrame) -> bool:
+    """Deliver one host-validated frame without blocking the terminal reader."""
+
+    binding = _terminal_input_binding.get()
+    if (
+        binding is None
+        or not binding.active
+        or frame.focus_token != binding.focus_token
+        or len(frame.data) > 4096
+        or binding.queue.full()
+    ):
+        return False
+    binding.queue.put_nowait(frame)
+    return True
+
+
+async def terminal_input() -> _AsyncIterator[TerminalInputFrame]:
+    """Yield raw keystroke frames while this extension owns the focus lease.
+
+    The manifest must declare ``ui.raw-input`` and the durable grant must cover
+    it. Headless hosts always reject the subscription. Cancellation releases
+    the host focus lease even when the consumer exits with an exception.
+    """
+
+    binding = _terminal_input_binding.get()
+    if binding is None or not binding.granted:
+        raise TerminalInputDenied("ui.raw-input is not declared and durably granted")
+    if binding.headless:
+        raise TerminalInputDenied("raw terminal input is unavailable in headless mode")
+    if binding.active:
+        raise TerminalInputDenied("this extension already owns a raw-input subscription")
+    binding.active = True
+    subscribed = binding.subscribe(binding.focus_token)
+    if _inspect.isawaitable(subscribed):
+        await subscribed
+    try:
+        while True:
+            frame = await binding.queue.get()
+            if frame is None:
+                return
+            if frame.focus_token != binding.focus_token or len(frame.data) > 4096:
+                continue
+            yield frame
+    finally:
+        binding.active = False
+        cancelled = binding.cancel(binding.focus_token)
+        if _inspect.isawaitable(cancelled):
+            await cancelled
+
+
 def image(source: object, *, w: int | None = None, h: int | None = None, trim: bool = False) -> Tml:
     """Queue image materialization and return its stable markup placeholder."""
     _emit("image", source=source, w=w, h=h, trim=trim)

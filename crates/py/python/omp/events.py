@@ -820,6 +820,55 @@ class HostReconnectEvent:
     uptime: Duration
 
 
+@dataclass(frozen=True, slots=True)
+class TtsrTriggeredEvent:
+    """Observe one authoritative TTSR rule activation."""
+
+    session_id: str
+    turn_id: str
+    sequence: int
+    rule: str
+    matched: str
+    interrupted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TodoReminderEvent:
+    """Observe one authoritative unresolved-todo reminder."""
+
+    session_id: str
+    turn_id: str
+    sequence: int
+    pending: int
+    reminder: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetryLifecycleEvent:
+    """Observe the start or terminal outcome of one inference retry."""
+
+    session_id: str
+    turn_id: str
+    sequence: int
+    attempt: int
+    maximum: int
+    delay_ms: int
+    reason: str
+    outcome: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackLifecycleEvent:
+    """Observe an inference fallback application or success."""
+
+    session_id: str
+    turn_id: str
+    sequence: int
+    source_model: str
+    target_model: str
+    reason: str
+
+
 _EVENT_NAMES = (
     "session_start", "session_shutdown", "session_switch", "session_switched",
     "session_branch", "session_branched", "session_rewind", "session_rewound",
@@ -834,10 +883,11 @@ _EVENT_NAMES = (
     "capability_budget", "model_changed", "credential_disabled", "compaction",
     "compaction_done", "thread_projection", "subagent_spawn", "worker_state",
     "job_registered", "job_settled", "extension_activate", "extension_load",
-    "extension_unload", "host_reconnect",
+    "extension_unload", "host_reconnect", "ttsr_triggered", "todo_reminder",
+    "retry_start", "retry_end", "fallback_applied", "fallback_succeeded",
 )
 EVENT_IDS: Final[Mapping[str, int]] = MappingProxyType(
-    {name: event_id for event_id, name in enumerate(_EVENT_NAMES)}
+    {name: event_id for event_id, name in enumerate(_EVENT_NAMES, start=1)}
 )
 """Stable dense event identifiers used by the subscription bitmap."""
 
@@ -940,6 +990,12 @@ _EVENT_METADATA = {
     "extension_load": (ExtensionLoadEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
     "extension_unload": (ExtensionUnloadEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, False, _DOMAIN, None, {}),
     "host_reconnect": (HostReconnectEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "ttsr_triggered": (TtsrTriggeredEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "todo_reminder": (TodoReminderEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "retry_start": (RetryLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "retry_end": (RetryLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "fallback_applied": (FallbackLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "fallback_succeeded": (FallbackLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
 }
 
 

@@ -334,6 +334,7 @@ class DeclarationSnapshot:
 
     entry_kinds: tuple[EntryKindDefinition, ...]
     tools: frozenset[_ToolKey]
+    capabilities: frozenset[str]
     hooks: frozenset[_HookKey]
     services: frozenset[_ServiceKey]
     telemetry: tuple[TelemetryDefinition, ...] = ()
@@ -381,6 +382,7 @@ class DeclarationRegistry:
         "_prompt_slots",
         "_telemetry",
         "_manifest_hooks",
+        "_manifest_capabilities",
         "_manifest_executables",
         "_uniform_manifest_configured",
         "_manifest_requires",
@@ -426,6 +428,7 @@ class DeclarationRegistry:
         self._service_instances: dict[_ServiceKey, object] = {}
         self._manifest_tools: frozenset[_ToolKey] = frozenset()
         self._manifest_hooks: frozenset[_HookKey] = frozenset()
+        self._manifest_capabilities: frozenset[str] = frozenset()
         self._manifest_services: frozenset[_ServiceKey] = frozenset()
         self._manifest_executables: dict[
             tuple[str, str], _ExecutableDeclaration
@@ -455,6 +458,7 @@ class DeclarationRegistry:
         *,
         tools: Iterable[_ToolKey] = (),
         hooks: Iterable[_HookKey] = (),
+        capabilities: Iterable[str] = (),
         services: Iterable[_ServiceKey] = (),
         requires: Iterable[_ServiceKey] = (),
         declarations: Iterable[
@@ -529,6 +533,13 @@ class DeclarationRegistry:
                 manifest_hooks.add(_manifest_hook_key(executable.key))
         self._manifest_tools = frozenset(manifest_tools)
         self._manifest_hooks = frozenset(manifest_hooks)
+        normalized_capabilities = frozenset(capabilities)
+        if any(
+            not isinstance(capability, str) or not capability
+            for capability in normalized_capabilities
+        ):
+            raise ManifestError("omp.toml", "capabilities", "capabilities must be non-empty strings")
+        self._manifest_capabilities = normalized_capabilities
         self._manifest_services = frozenset(_service_key(*item) for item in services)
         self._manifest_requires = frozenset(_service_key(*item) for item in requires)
         self._manifest_executables = executable_declarations
@@ -1157,6 +1168,7 @@ class DeclarationRegistry:
         return DeclarationSnapshot(
             entry_kinds=self.entry_kind_definitions(),
             tools=frozenset(self._tools),
+            capabilities=self._manifest_capabilities,
             hooks=frozenset(self._hooks),
             services=frozenset(self._services),
             commands=self.command_definitions(),
@@ -1350,6 +1362,7 @@ def configure_manifest(
     *,
     tools: Iterable[_ToolKey] = (),
     hooks: Iterable[_HookKey] = (),
+    capabilities: Iterable[str] = (),
     services: Iterable[_ServiceKey] = (),
     requires: Iterable[_ServiceKey] = (),
     declarations: Iterable[
@@ -1362,6 +1375,7 @@ def configure_manifest(
     registry.configure_manifest(
         tools=tools,
         hooks=hooks,
+        capabilities=capabilities,
         services=services,
         requires=requires,
         declarations=declarations,

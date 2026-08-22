@@ -79,6 +79,10 @@ class Denied(EnvError):
     """The scoped connection or sandbox denied the operation."""
 
 
+class DirectFilesystemDenied(PermissionError, OmpError):
+    """The trusted direct-filesystem escape was not declared and granted."""
+
+
 class QuotaExceeded(EnvError):
     """A DATA-plane hard quota is exhausted."""
 
@@ -533,6 +537,85 @@ class DocEvent:
 _binding: contextvars.ContextVar[tuple[Any, EnvInfo] | None] = contextvars.ContextVar(
     "omp_env_binding", default=None
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectFilesystemGrant:
+    """Durable provenance for the exceptional direct-filesystem capability."""
+
+    extension_id: str
+    publisher: str
+    capability_digest: str
+    grant_id: str
+    granted_at: str
+    generation: int
+
+
+_direct_filesystem_binding: contextvars.ContextVar[
+    tuple[Any, DirectFilesystemGrant] | None
+] = contextvars.ContextVar("omp_direct_filesystem_binding", default=None)
+
+
+def _install_direct_filesystem_backend(
+    backend: Any, grant: DirectFilesystemGrant | None
+) -> None:
+    """Install the distinct trusted escape backend after Core grant admission."""
+
+    _direct_filesystem_binding.set(None if grant is None else (backend, grant))
+
+
+class DirectFilesystem:
+    """Declared trusted path escape, deliberately separate from Environment."""
+
+    async def request(
+        self,
+        operation: str,
+        path: str | Path,
+        *,
+        data: bytes | None = None,
+    ) -> object:
+        """Perform one audited direct operation through the escape CONTROL arm."""
+
+        binding = _direct_filesystem_binding.get()
+        if binding is None:
+            raise DirectFilesystemDenied(
+                "trusted.direct-filesystem is not declared and durably granted"
+            )
+        backend, grant = binding
+        path = Path(path)
+        if not path.is_absolute():
+            raise ValueError("direct-filesystem paths must be absolute")
+        if operation not in {"read", "write", "stat", "list", "mkdir", "remove"}:
+            raise ValueError("unsupported direct-filesystem operation")
+        if data is not None and (type(data) is not bytes or len(data) > 1_048_576):
+            raise ValueError("direct-filesystem payload exceeds 1 MiB")
+        request = getattr(backend, "direct_filesystem_request", None)
+        if request is None:
+            raise NotWiredError("omp.env.direct_filesystem")
+        arguments = {
+            "operation": operation,
+            "path": str(path),
+            "data": data,
+            "grant": grant,
+        }
+        result = request(arguments)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    def grant(self) -> DirectFilesystemGrant:
+        """Return immutable durable grant provenance without performing I/O."""
+
+        binding = _direct_filesystem_binding.get()
+        if binding is None:
+            raise DirectFilesystemDenied(
+                "trusted.direct-filesystem is not declared and durably granted"
+            )
+        return binding[1]
+
+
+direct_filesystem = DirectFilesystem()
+"""The explicitly exceptional filesystem capability; never an Environment alias."""
 
 
 def _install_backend(backend: Any, environment_info: EnvInfo) -> None:
@@ -1899,6 +1982,9 @@ __all__ = (
     "DocEvent",
     "DocEventKind",
     "Denied",
+    "DirectFilesystem",
+    "DirectFilesystemDenied",
+    "DirectFilesystemGrant",
     "Disconnected",
     "Doc",
     "EffectsNotAuthorized",
@@ -1968,6 +2054,7 @@ __all__ = (
     "Txn",
     "WorktreeInfo",
     "blobs",
+    "direct_filesystem",
     "docs",
     "find",
     "fs",

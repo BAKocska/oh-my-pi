@@ -8,6 +8,7 @@ installed, both operations fail closed with :class:`omp.NotWiredError`.
 from __future__ import annotations
 
 import re
+import contextvars
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -15,7 +16,7 @@ from ._errors import NotWiredError
 
 
 _MASKED_PLACEHOLDER = re.compile(
-    r"\$\$(?:[A-Z][A-Z0-9_]*_)?[0-9a-z]{12}(?::[ULCM])?\$\$"
+    r"\$\$(?:[A-Z0-9]+_)?[A-Z0-9]{12}(?::[ULCM])?\$\$"
 )
 
 
@@ -43,20 +44,64 @@ class SecretRule:
     mode: SecretMode = SecretMode.OBFUSCATE
     label: str = ""
     replacement: str | None = None
+    flags: str | None = None
+
+
+_backend: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "omp_secrets_backend", default=None
+)
+
+
+def _install_backend(backend: object | None) -> None:
+    """Install Core's invocation-scoped secret declaration and masking bridge."""
+    _backend.set(backend)
+
+
+def _wire_rule(rule: SecretRule) -> dict[str, object]:
+    if not isinstance(rule, SecretRule):
+        raise TypeError("declare expects a SecretRule")
+    kind = {
+        SecretKind.LITERAL: "plain",
+        SecretKind.REGEX: "regex",
+        SecretKind.ENV: "env",
+    }[rule.kind]
+    mode = {
+        SecretMode.OBFUSCATE: "obfuscate",
+        SecretMode.REDACT: "replace",
+    }[rule.mode]
+    return {
+        "kind": kind,
+        "mode": mode,
+        "content": rule.pattern,
+        "friendly_name": rule.label or None,
+        "replacement": rule.replacement,
+        "flags": rule.flags,
+    }
 
 
 def declare(rule: SecretRule) -> None:
     """Declare one secret rule through the host-owned declaration arm."""
 
-    del rule
-    raise NotWiredError("omp.secrets.declare")
+    backend = _backend.get()
+    declare_secret = None if backend is None else getattr(backend, "declare_secret", None)
+    if declare_secret is None:
+        raise NotWiredError("omp.secrets.declare")
+    declare_secret(_wire_rule(rule))
 
 
 def mask(text: str) -> str:
     """Return Core's masked projection without exposing secret bytes to Python."""
 
-    del text
-    raise NotWiredError("omp.secrets.mask")
+    if not isinstance(text, str):
+        raise TypeError("mask expects a string")
+    backend = _backend.get()
+    mask_secret = None if backend is None else getattr(backend, "mask_secret", None)
+    if mask_secret is None:
+        raise NotWiredError("omp.secrets.mask")
+    masked = mask_secret(text)
+    if not isinstance(masked, str):
+        raise TypeError("Core secret mask returned a non-string value")
+    return masked
 
 
 def is_masked(text: str) -> bool:

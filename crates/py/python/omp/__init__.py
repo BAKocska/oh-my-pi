@@ -230,6 +230,7 @@ def _install_control_backend(backend: _Any) -> None:
     """Install the host-owned CONTROL bridge in the active invocation context."""
     _control_backend.set(backend)
     from . import _context as _context_module
+    from . import secrets as _secrets
     from . import telemetry as _telemetry
     from . import ui as _ui
     from .devices import _install_catalog_view
@@ -237,6 +238,7 @@ def _install_control_backend(backend: _Any) -> None:
     _install_catalog_view(getattr(backend, "device_catalog", None))
     _ui._install_effect_sink(getattr(backend, "effect", None))
     _telemetry._install_instrument_sink(getattr(backend, "instrument", None))
+    _secrets._install_backend(getattr(backend, "secrets", backend))
     _context_module._install_log_sink(getattr(backend, "log", None))
 
 
