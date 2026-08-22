@@ -313,10 +313,9 @@ fn undecided_prefix(prefix: &str) -> bool {
 		|| matches!(trimmed, "-" | "*" | "+" | "--" | "**" | "__" | "`" | "``" | "~" | "~~")
 		|| trimmed.chars().all(|character| character.is_ascii_digit()) && chars <= 3
 		|| (chars <= 4
-			&& trimmed
-				.strip_suffix(['.', ')'])
-				.is_some_and(|value| !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())))
-		|| trimmed.chars().all(|ch| ch == '>')
+			&& trimmed.strip_suffix(['.', ')']).is_some_and(|value| {
+				!value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+			})) || trimmed.chars().all(|ch| ch == '>')
 }
 
 fn is_rule(line: &str) -> bool {

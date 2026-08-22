@@ -312,8 +312,7 @@ impl LivePeerCore {
 		peer
 			.set_remote_description(answer)
 			.await
-			.map_err(|error| format!("Failed to install the live SDP answer: {error}"))
-	?;
+			.map_err(|error| format!("Failed to install the live SDP answer: {error}"))?;
 		Ok(())
 	}
 

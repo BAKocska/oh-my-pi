@@ -111,7 +111,7 @@ fn cbor_text(value: &str) -> Result<Vec<u8>, AttestationError> {
 }
 
 fn cbor_map(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>, AttestationError> {
-	let size : usize= entries
+	let size: usize = entries
 		.iter()
 		.map(|(key, value)| key.len() + value.len())
 		.sum();
