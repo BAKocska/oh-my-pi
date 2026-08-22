@@ -14,7 +14,10 @@ use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CatalogAlias, ModelAvailability, ModelKey, ModelSpec, ProviderId, RouteDef, RouteId};
+use crate::{
+	Availability, CatalogAlias, ModelAvailability, ModelKey, ModelSpec, ProviderId, RouteDef,
+	RouteId,
+};
 
 /// A configured or built-in role that expands to an ordered selector chain.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -749,6 +752,43 @@ pub fn find_slow(
 		mru,
 		ParsedSelector { model: Str::default(), upstream: None, thinking: None, route: None },
 		"slow",
+	)
+	.ok()
+	.or_else(|| pick_default(models, routes, mru))
+}
+
+/// Finds a visual-design-capable fallback. A native image-input declaration
+/// is the data-driven signal; no model-name allowlist participates.
+pub fn find_designer(
+	models: &[ModelSpec],
+	routes: &[RouteDef],
+	mru: &BTreeMap<(ProviderId, ModelKey), u64>,
+) -> Option<SelectedModel> {
+	let candidates = models
+		.iter()
+		.filter(|model| {
+			model.availability != ModelAvailability::Disabled
+				&& model
+					.capabilities
+					.chat
+					.as_ref()
+					.is_some_and(|chat| matches!(chat.image_input, Availability::Native(_)))
+		})
+		.flat_map(move |model| {
+			model.routes.iter().filter_map(move |id| {
+				routes
+					.iter()
+					.find(|route| route.id == *id)
+					.map(move |route| (route.provider.clone(), model))
+			})
+		})
+		.collect();
+	choose_candidates(
+		candidates,
+		routes,
+		mru,
+		ParsedSelector { model: Str::default(), upstream: None, thinking: None, route: None },
+		"designer",
 	)
 	.ok()
 	.or_else(|| pick_default(models, routes, mru))

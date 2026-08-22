@@ -348,6 +348,53 @@ pub fn resolve_thinking_selector(
 	policy.efforts.get(index).copied()
 }
 
+/// Invalid task-level effort selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TaskThinkingError {
+	/// The operator ceiling excludes the resolved model's entire effort ladder.
+	#[error(
+		"model has no supported thinking effort at or below task.maxEffort={ceiling} (model floor \
+		 is {floor})"
+	)]
+	CeilingBelowFloor {
+		/// Configured task ceiling.
+		ceiling: ThinkingEffort,
+		/// Lowest model-supported effort.
+		floor:   ThinkingEffort,
+	},
+}
+
+/// Maps a task `lo`/`med`/`hi` selector over the full model ladder, then
+/// clamps the result to `task.maxEffort`.
+///
+/// A ceiling below the model floor is rejected rather than silently selecting
+/// an unsupported effort.
+pub fn resolve_task_thinking_selector(
+	policy: &ThinkingPolicy,
+	selector: ThinkingEffortSelector,
+	max_effort: Option<ThinkingEffort>,
+) -> Result<Option<ThinkingEffort>, TaskThinkingError> {
+	let Some(floor) = policy.efforts.first().copied() else {
+		return Ok(None);
+	};
+	let selected = match selector {
+		ThinkingEffortSelector::Lo => floor,
+		ThinkingEffortSelector::Med => policy.efforts[(policy.efforts.len() - 1) / 2],
+		ThinkingEffortSelector::Hi => *policy.efforts.last().expect("nonempty effort ladder"),
+	};
+	let Some(max_effort) = max_effort else {
+		return Ok(Some(selected));
+	};
+	let ceiling = policy
+		.efforts
+		.iter()
+		.rev()
+		.copied()
+		.find(|effort| *effort <= max_effort)
+		.ok_or(TaskThinkingError::CeilingBelowFloor { ceiling: max_effort, floor })?;
+	Ok(Some(selected.min(ceiling)))
+}
+
 /// Reports whether a controllable ladder has an effort at or below a ceiling.
 ///
 /// An absent policy represents an uncontrollable ladder and is compatible

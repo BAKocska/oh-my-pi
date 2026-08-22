@@ -1,6 +1,7 @@
 //! Protocol-neutral bounded transport framing.
 
 pub mod browser;
+pub mod capture;
 pub mod cassette;
 pub mod connect;
 pub mod custom;
@@ -15,6 +16,10 @@ pub mod websocket_transport;
 #[cfg(test)]
 mod tests;
 
+pub use capture::{
+	CaptureSnapshot, CaptureSummary, CapturedFrame, DEFAULT_CAPTURE_FRAME_BYTES,
+	DEFAULT_CAPTURE_FRAMES, DEFAULT_SUBSCRIBER_FRAMES, RawProviderCapture, global_provider_capture,
+};
 pub use connect::{ConnectDecoder, ConnectEnvelope, ConnectEnvelopeKind};
 pub use custom::{CustomEndpoint, CustomEndpointError, CustomEndpointMode};
 pub use eventstream::{

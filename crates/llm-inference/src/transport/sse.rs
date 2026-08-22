@@ -260,6 +260,11 @@ impl IncrementalFramer for SseDecoder {
 			return Ok(SmallVec::new());
 		}
 		self.state.ensure_open(FramingProtocol::Sse)?;
+		super::capture::global_provider_capture().capture(
+			None,
+			"sse",
+			&String::from_utf8_lossy(&chunk),
+		);
 		self.append(chunk);
 		let mut output = SmallVec::new();
 		while let Some(len) = self.next_event_len() {

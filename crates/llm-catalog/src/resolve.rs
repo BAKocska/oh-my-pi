@@ -3,6 +3,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
+use globset::GlobBuilder;
 use omp_core::{IntoStr, Str};
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +82,50 @@ impl FallbackChain {
 	pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ModelSelector> + '_ {
 		std::iter::once(&self.primary).chain(self.fallbacks.iter())
 	}
+}
+
+/// Policy for returning from a successfully selected fallback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum FallbackRevertPolicy {
+	/// Keep the fallback selected until an explicit model change.
+	#[default]
+	Never,
+	/// Reconsider the primary after this cooldown.
+	CooldownExpiry {
+		/// Cooldown measured from fallback selection.
+		cooldown_ms: u64,
+	},
+}
+
+/// Per-selector thinking adjustment applied only while that fallback is active.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FallbackThinkingAdjustment {
+	/// Exact, alias, or wildcard selector receiving the adjustment.
+	pub selector: ModelSelector,
+	/// Requested thinking spelling; `None` disables thinking.
+	pub thinking: Option<Str>,
+}
+
+/// Runtime policy layered over an immutable fallback chain.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FallbackRuntimePolicy {
+	/// Selector-specific thinking overrides.
+	pub thinking: Box<[FallbackThinkingAdjustment]>,
+	/// Primary-model reconsideration policy.
+	pub revert:   FallbackRevertPolicy,
+}
+
+/// Resolved model plus fallback-only runtime adjustments.
+#[derive(Clone, Debug)]
+pub struct FallbackResolution {
+	/// Catalog resolution selected by the chain.
+	pub resolved:     ResolvedModel,
+	/// Thinking adjustment for the selected selector.
+	pub thinking:     Option<Option<Str>>,
+	/// Earliest wall-clock millisecond at which primary reconsideration is
+	/// allowed.
+	pub revert_at_ms: Option<u64>,
 }
 
 /// A provider-scoped alias supplied by a discovery or user overlay.
@@ -557,6 +602,40 @@ impl<'a> CatalogResolver<'a> {
 		Err(ResolveError::FallbacksExhausted(failures.into_boxed_slice()))
 	}
 
+	/// Resolves a chain with selector-specific thinking and fallback reversion
+	/// policy.
+	pub fn resolve_with_policy(
+		&self,
+		chain: &FallbackChain,
+		constraints: &ResolutionConstraints,
+		policy: &FallbackRuntimePolicy,
+		now_ms: u64,
+	) -> Result<FallbackResolution, ResolveError> {
+		let mut failures = Vec::new();
+		for (index, selector) in chain.iter().enumerate() {
+			match self.resolve_one(selector, constraints) {
+				Ok(resolved) => {
+					let thinking = policy
+						.thinking
+						.iter()
+						.find(|adjustment| &adjustment.selector == selector)
+						.map(|adjustment| adjustment.thinking.clone());
+					let revert_at_ms = (index != 0)
+						.then(|| match policy.revert {
+							FallbackRevertPolicy::Never => None,
+							FallbackRevertPolicy::CooldownExpiry { cooldown_ms } => {
+								Some(now_ms.saturating_add(cooldown_ms))
+							},
+						})
+						.flatten();
+					return Ok(FallbackResolution { resolved, thinking, revert_at_ms });
+				},
+				Err(error) => failures.push(error),
+			}
+		}
+		Err(ResolveError::FallbacksExhausted(failures.into_boxed_slice()))
+	}
+
 	/// Resolves every satisfiable explicitly named selector without inventing
 	/// candidates.
 	pub fn resolve_candidates(
@@ -570,12 +649,73 @@ impl<'a> CatalogResolver<'a> {
 			.collect()
 	}
 
+	fn resolve_wildcard(
+		&self,
+		wildcard: &ExactSelector,
+		constraints: &ResolutionConstraints,
+	) -> Result<ResolvedModel, ResolveError> {
+		if !self
+			.base
+			.providers
+			.iter()
+			.any(|provider| provider.id == wildcard.provider)
+		{
+			return Err(ResolveError::ProviderNotFound(wildcard.provider.clone()));
+		}
+		let matcher = GlobBuilder::new(wildcard.model.as_str())
+			.case_insensitive(true)
+			.literal_separator(false)
+			.build()
+			.map_err(|_| ResolveError::ModelNotFound(wildcard.clone()))?
+			.compile_matcher();
+		let mut candidates = BTreeMap::<ModelKey, ()>::new();
+		for model in self.base.models {
+			if model_has_provider(model, &wildcard.provider, self.base.routes)
+				&& (matcher.is_match(model.key.as_str())
+					|| matcher.is_match(
+						model
+							.key
+							.as_str()
+							.rsplit_once('/')
+							.map_or(model.key.as_str(), |(_, bare)| bare),
+					)) {
+				candidates.insert(model.key.clone(), ());
+			}
+		}
+		for overlay in &self.overlays {
+			for entry in &overlay.models {
+				if entry.selector.provider == wildcard.provider
+					&& let Some(model) = &entry.added
+					&& (matcher.is_match(model.key.as_str())
+						|| matcher.is_match(
+							model
+								.key
+								.as_str()
+								.rsplit_once('/')
+								.map_or(model.key.as_str(), |(_, bare)| bare),
+						)) {
+					candidates.insert(model.key.clone(), ());
+				}
+			}
+		}
+		for (model, ()) in candidates {
+			let selector = ModelSelector::Exact(ExactSelector::new(wildcard.provider.clone(), model));
+			if let Ok(resolved) = self.resolve_one(&selector, constraints) {
+				return Ok(resolved);
+			}
+		}
+		Err(ResolveError::ModelNotFound(wildcard.clone()))
+	}
+
 	fn resolve_one(
 		&self,
 		selector: &ModelSelector,
 		constraints: &ResolutionConstraints,
 	) -> Result<ResolvedModel, ResolveError> {
 		let exact = self.expand_selector(selector)?;
+		if contains_glob_meta(exact.model.as_str()) {
+			return self.resolve_wildcard(&exact, constraints);
+		}
 		if !self
 			.base
 			.providers
@@ -761,6 +901,12 @@ fn validate_overlay(overlay: &CatalogOverlay, scope: UnsafeTrustScope) -> Result
 		}
 	}
 	Ok(())
+}
+
+fn contains_glob_meta(value: &str) -> bool {
+	value
+		.bytes()
+		.any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{'))
 }
 
 fn model_has_provider(model: &ModelSpec, provider: &ProviderId<str>, routes: &[RouteDef]) -> bool {

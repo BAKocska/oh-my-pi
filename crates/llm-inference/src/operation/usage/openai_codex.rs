@@ -487,6 +487,79 @@ pub struct CodexResetConsumeResult {
 	/// HTTP response status.
 	pub status: u16,
 }
+/// Why autonomous recovery is spending a saved Codex reset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum CodexRedemptionReason {
+	/// Preserve an otherwise successful partial generation after quota
+	/// exhaustion.
+	Salvage,
+	/// Restore a request that produced no usable output.
+	Restore,
+}
+
+/// Session-local coordinator for autonomous saved-reset redemption.
+#[derive(Clone, Debug)]
+pub struct CodexRedemptionCoordinator {
+	cooldown:            Duration,
+	next_attempt:        Option<Instant>,
+	history_generation:  u64,
+	redeemed_generation: Option<u64>,
+}
+
+impl CodexRedemptionCoordinator {
+	/// Creates a coordinator with the minimum interval between provider
+	/// mutations.
+	#[must_use]
+	pub const fn new(cooldown: Duration) -> Self {
+		Self { cooldown, next_attempt: None, history_generation: 0, redeemed_generation: None }
+	}
+
+	/// Resets per-history redemption state after a compaction reseeds Codex.
+	pub const fn post_compaction_reset(&mut self) {
+		self.history_generation = self.history_generation.wrapping_add(1);
+		self.redeemed_generation = None;
+	}
+
+	/// Lists, selects, and consumes the soonest-expiring available reset.
+	///
+	/// At most one successful redemption is admitted for each compacted
+	/// history generation, and every provider mutation arms the cooldown.
+	pub async fn redeem(
+		&mut self,
+		_reason: CodexRedemptionReason,
+		access_token: &str,
+		account_id: Option<&str>,
+		http: &dyn OAuthHttpClient,
+		now: Instant,
+	) -> Result<Option<CodexResetConsumeResult>, UsageFetchError> {
+		if self.redeemed_generation == Some(self.history_generation)
+			|| self.next_attempt.is_some_and(|next| now < next)
+		{
+			return Ok(None);
+		}
+		self.next_attempt = Some(now + self.cooldown);
+		let credits = list_codex_reset_credits(access_token, account_id, http).await?;
+		if credits.available_count == 0 {
+			return Ok(None);
+		}
+		let Some(credit) = pick_soonest_expiring_credit(&credits.credits) else {
+			return Ok(None);
+		};
+		let result =
+			consume_codex_reset_credit(access_token, account_id, &credit.id, None, http).await?;
+		if result.ok {
+			self.redeemed_generation = Some(self.history_generation);
+		}
+		Ok(Some(result))
+	}
+}
+
+impl Default for CodexRedemptionCoordinator {
+	fn default() -> Self {
+		Self::new(Duration::from_secs(60))
+	}
+}
 
 /// Lists saved Codex rate-limit reset credits.
 pub async fn list_codex_reset_credits(

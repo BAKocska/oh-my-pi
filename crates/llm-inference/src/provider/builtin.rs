@@ -1010,6 +1010,24 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 		let mut encoded =
 			encode_wire_request(self.codec.as_ref(), &encode_context, &call.operation, execution)?;
 		merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
+		let header_names = encoded
+			.headers
+			.iter()
+			.map(|header| header.name.as_str())
+			.collect::<Vec<_>>()
+			.join(",");
+		let capture_payload = format!(
+			"{:?} {:?} {} headers=[{}] request_body_limit={}",
+			encoded.operation, encoded.method, encoded.uri, header_names, encoded.bounds.request_body,
+		);
+		crate::transport::global_provider_capture().capture(
+			call
+				.session
+				.as_ref()
+				.map(|session| session.conversation.as_str()),
+			"request.pre_dispatch",
+			&capture_payload,
+		);
 		let mut timeout = self.transport_timeout;
 		if let Some(deadline) = call.deadline {
 			timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));

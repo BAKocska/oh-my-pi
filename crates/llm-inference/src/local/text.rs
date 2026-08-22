@@ -16,6 +16,7 @@ use xutf::{Encoding, Utf8};
 
 use super::{
 	artifact::ArtifactStore,
+	device::TinyDevice,
 	runtime::{
 		LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt, LocalResult,
 		LocalRuntime, MemoryPool,
@@ -54,6 +55,8 @@ pub struct TextConfig {
 	pub threads:         usize,
 	/// Transformer layers offloaded to the compiled GPU backend.
 	pub gpu_layers:      u32,
+	/// Named device preference and deterministic CPU fallback policy.
+	pub device:          TinyDevice,
 	/// Estimated resident bytes charged before loading.
 	pub resident_bytes:  usize,
 	/// Admission limit; currently must be one because llama.cpp access is
@@ -83,11 +86,13 @@ impl TextConfig {
 		let resident_bytes = usize::try_from(shard.spec.bytes).map_err(|_| {
 			LocalError::new(LocalErrorKind::Overloaded, "tiny-model GGUF exceeds address space")
 		})?;
+		let device = TinyDevice::from_environment()?;
 		Ok(Self {
 			model_path: artifact.path().to_path_buf(),
 			context_tokens: spec.context_tokens,
 			threads,
 			gpu_layers,
+			device,
 			resident_bytes,
 			max_concurrency: 1,
 			idle_timeout,
@@ -290,12 +295,31 @@ impl TextAdapter {
 				let backend = LlamaBackend::init().map_err(|error| {
 					LocalError::new(LocalErrorKind::Backend, format!("llama.cpp init failed: {error}"))
 				})?;
-				let params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
-				let model = LlamaModel::load_from_file(&backend, &config.model_path, &params).map_err(
-					|error| {
-						LocalError::new(LocalErrorKind::Backend, format!("GGUF load failed: {error}"))
-					},
-				)?;
+				let mut devices = config.device.load_order();
+				let first = devices.next().unwrap_or(TinyDevice::Cpu);
+				let first_params =
+					LlamaModelParams::default().with_n_gpu_layers(first.gpu_layers(config.gpu_layers));
+				let model =
+					match LlamaModel::load_from_file(&backend, &config.model_path, &first_params) {
+						Ok(model) => model,
+						Err(first_error) => {
+							let Some(fallback) = devices.next() else {
+								return Err(LocalError::new(
+									LocalErrorKind::Backend,
+									format!("GGUF load failed: {first_error}"),
+								));
+							};
+							let fallback_params = LlamaModelParams::default()
+								.with_n_gpu_layers(fallback.gpu_layers(config.gpu_layers));
+							LlamaModel::load_from_file(&backend, &config.model_path, &fallback_params)
+								.map_err(|error| {
+									LocalError::new(
+										LocalErrorKind::Backend,
+										format!("GGUF CPU fallback failed: {error}"),
+									)
+								})?
+						},
+					};
 				Ok(LlamaEngine { backend, model, context_tokens, threads: config.threads })
 			},
 			memory,

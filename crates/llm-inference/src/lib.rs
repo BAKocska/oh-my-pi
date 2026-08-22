@@ -15,6 +15,7 @@ pub mod body;
 pub mod call;
 pub mod client;
 pub mod codec;
+pub mod debug_wire;
 pub mod difficulty;
 pub mod discovery;
 pub mod error;
