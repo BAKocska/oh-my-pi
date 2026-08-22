@@ -43,6 +43,15 @@ pub struct Sidebar {
 impl Sidebar {
 	/// Builds a passive, initially visible rail from backend status facts.
 	pub fn new(facts: &StatusFacts, ctx: &UiContext) -> Self {
+		Self::with_visibility(facts, ctx, true)
+	}
+
+	/// Builds a passive rail that remains hidden until the user opens it.
+	pub fn new_hidden(facts: &StatusFacts, ctx: &UiContext) -> Self {
+		Self::with_visibility(facts, ctx, false)
+	}
+
+	fn with_visibility(facts: &StatusFacts, ctx: &UiContext, open: bool) -> Self {
 		let options = OverlayOptions::default()
 			.anchor(OverlayAnchor::Right)
 			.width(Dim::Cells(WIDTH))
@@ -54,7 +63,7 @@ impl Sidebar {
 			ui,
 			ctx: ctx.clone(),
 			options,
-			open: true,
+			open,
 			focused: false,
 			turn_started: facts.turn_started,
 			elapsed_seconds: 0,

@@ -11,7 +11,7 @@ use std::{
 
 use omp_core::{Str, sf};
 use omp_tui::{
-	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent, dom,
+	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Size, Ui, UiContext, UiEvent, dom,
 };
 
 use crate::{

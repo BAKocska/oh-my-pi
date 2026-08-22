@@ -59,6 +59,11 @@ impl AskBinding {
 	pub async fn recv(&self) -> Result<AskRequest, flume::RecvError> {
 		self.receiver.recv_async().await
 	}
+
+	/// Receives a pending canonical dialog request without waiting.
+	pub fn try_recv(&self) -> Option<AskRequest> {
+		self.receiver.try_recv().ok()
+	}
 }
 
 impl Drop for AskBinding {

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use omp_core::{IntoStr, Str, sf};
+use omp_core::{Str, sf};
 use omp_tui::{
 	Dim, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Prop, Size, Ui, UiContext, UiEvent,
 	components::{Field, Form, Tabs},

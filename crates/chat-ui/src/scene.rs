@@ -2000,7 +2000,7 @@ impl Chat {
 				rev: tool.rev,
 				label,
 				ok,
-				expanded: false,
+				expanded: true,
 				view: tool.view,
 				images: tool.images,
 			};

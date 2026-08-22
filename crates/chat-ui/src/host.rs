@@ -1,13 +1,14 @@
-//! Terminal host for the host-agnostic immediate-mode chat scene.
+//! Interactive chat state and its terminal host for the host-agnostic
+//! immediate-mode chat scene.
 
 use std::{collections::VecDeque, io, io::Write, time::Duration};
 
 use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
 use omp_tui::{
-	AltScreenUse, CursorStyle, DebugOp, DebugQuery, InputEvent, Key, Layer, Mouse, Notification,
-	PaintStats, Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext,
-	Urgency, detect,
+	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, InputEvent, Key, Layer, Mouse,
+	MouseReport, Notification, PaintStats, Pasted, Renderer, Size, Terminal, TerminalEvent,
+	TerminalOptions, TtyOut, UiContext, Urgency, detect,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
@@ -30,6 +31,8 @@ use crate::{
 const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
 const PASTE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest interval before a retained host observes a background event.
+const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Answers the chat-owned half of the terminal debug protocol.
 fn answer_debug(query: DebugQuery, chat: &mut Chat) {
@@ -72,7 +75,7 @@ impl PasteRead {
 	}
 }
 
-/// Terminal-host lifecycle controls.
+/// Interactive chat-host lifecycle controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostOptions {
 	/// Whether to show the welcome session index before entering chat.
@@ -102,7 +105,7 @@ impl Default for HostOptions {
 const DOUBLE_LEFT_MIN: Duration = Duration::from_millis(40);
 const DOUBLE_LEFT_MAX: Duration = Duration::from_millis(500);
 
-/// Reason the terminal host returned to its production caller.
+/// Reason an interactive chat host returned to its production caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostExit {
 	/// The user or backend closed the host.
@@ -115,7 +118,7 @@ pub enum HostExit {
 	Suspend,
 }
 
-/// Terminal host result with the final unsent composer draft.
+/// Interactive host result with the final unsent composer draft.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostOutcome {
 	/// Why the host returned.
@@ -360,9 +363,14 @@ impl ChatHost {
 		viewport: Size,
 		models: Vec<ModelRow>,
 		current_model: usize,
+		sidebar_open: bool,
 	) -> Self {
 		let status = chat.status();
-		let sidebar = Sidebar::new(&status, ctx);
+		let sidebar = if sidebar_open {
+			Sidebar::new(&status, ctx)
+		} else {
+			Sidebar::new_hidden(&status, ctx)
+		};
 		chat.set_right_inset(sidebar.reserved(viewport));
 		Self {
 			chat,
@@ -422,7 +430,358 @@ impl ChatHost {
 	}
 }
 
-fn rail_layers(sidebar: &mut Sidebar, viewport: Size) -> SmallVec<Layer<'_>, 2> {
+/// Host-neutral retained chat state for native application hosts.
+///
+/// It owns the same overlays, input routing, backend protocol, and draft
+/// boundary as the terminal host while exposing retained frames directly.
+pub struct RetainedChat {
+	host:                   ChatHost,
+	ctx:                    UiContext,
+	events:                 Receiver<BackendEvent>,
+	intents:                Sender<Intent>,
+	exit_on_session_change: bool,
+	ask_binding:            ask::AskBinding,
+	viewport:               Size,
+	settled:                bool,
+	preview:                Frame,
+	pending_exit:           Option<HostExit>,
+	pending_clipboard:      Option<Str>,
+}
+
+/// One retained chat paint for a non-terminal host.
+pub struct RetainedChatFrame<'a> {
+	/// Document grid, potentially taller than the live viewport.
+	pub frame:       &'a Frame,
+	/// Live viewport dimensions in cells.
+	pub viewport:    Size,
+	/// Document-tail rows reserved for the composer.
+	pub editor_rows: u16,
+	/// Viewport-anchored overlays in paint order.
+	pub layers:      SmallVec<Layer<'a>, 4>,
+}
+
+/// A host operation requested by retained chat state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetainedChatEffect {
+	/// No host action is needed.
+	Ignored,
+	/// State changed and the host should repaint.
+	Consumed,
+	/// Close the active chat surface with this lifecycle result.
+	Quit(HostExit),
+	/// Read a matching system clipboard representation.
+	Clipboard(ClipboardRead),
+	/// Copy text through the host's clipboard authority.
+	SetClipboard(Str),
+}
+
+impl RetainedChat {
+	/// Creates an active chat surface after session selection.
+	pub fn new(
+		mut chat: Chat,
+		ctx: UiContext,
+		events: Receiver<BackendEvent>,
+		intents: Sender<Intent>,
+		options: HostOptions,
+		initial_draft: Str,
+	) -> Self {
+		chat.set_composer_text(initial_draft.as_str());
+		let viewport = Size::new(0, 0);
+		Self {
+			host: ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false),
+			ctx,
+			events,
+			intents,
+			exit_on_session_change: options.exit_on_session_change,
+			ask_binding: ask::bind(),
+			viewport,
+			settled: true,
+			preview: Frame::new(viewport),
+			pending_exit: None,
+			pending_clipboard: None,
+		}
+	}
+
+	/// Updates the cell viewport, deferring expensive layout until settled.
+	pub fn resize(&mut self, viewport: Size, settled: bool) {
+		self.viewport = viewport;
+		self.settled = settled;
+		self
+			.host
+			.chat
+			.set_right_inset(self.host.sidebar.reserved(viewport));
+		send_pty_resize(&mut self.host, viewport, &self.intents);
+	}
+
+	/// Pumps backend and dialog events, returning any required host operation.
+	pub fn poll(&mut self) -> RetainedChatEffect {
+		let changed = self.drain();
+		if let Some(exit) = self.pending_exit.take() {
+			return RetainedChatEffect::Quit(exit);
+		}
+		if let Some(text) = self.pending_clipboard.take() {
+			return RetainedChatEffect::SetClipboard(text);
+		}
+		if changed {
+			RetainedChatEffect::Consumed
+		} else {
+			RetainedChatEffect::Ignored
+		}
+	}
+
+	/// Renders the active chat and its viewport overlays.
+	pub fn render(&mut self) -> RetainedChatFrame<'_> {
+		let viewport = self.viewport;
+		let editor_rows = self.host.chat.composer_rows();
+		if !self.settled {
+			self.preview = self.host.chat.render_resize_preview(viewport);
+			let mut layers = rail_layers(&mut self.host.sidebar, viewport);
+			if let Some(overlay) = self.host.overlay.as_mut() {
+				layers.push(overlay.layer(viewport));
+			}
+			return RetainedChatFrame { frame: &self.preview, viewport, editor_rows, layers };
+		}
+		let rendered = self.host.chat.render(viewport);
+		let mut layers = rail_layers(&mut self.host.sidebar, viewport);
+		if let Some(overlay) = self.host.overlay.as_mut() {
+			layers.push(overlay.layer(viewport));
+		}
+		RetainedChatFrame { frame: rendered.frame, viewport, editor_rows, layers }
+	}
+
+	/// Routes one keyboard event through the active overlay or chat composer.
+	pub fn key(&mut self, key: Key) -> RetainedChatEffect {
+		if let Some(overlay) = self.host.overlay.as_mut() {
+			if key == Key::Ctrl('c') {
+				send(&self.intents, Intent::Quit);
+				return RetainedChatEffect::Quit(HostExit::Quit);
+			}
+			let event = overlay.handle_key(key);
+			return self.apply_overlay(event);
+		}
+		if key == Key::Ctrl('b') {
+			self.host.sidebar.toggle();
+			self
+				.host
+				.chat
+				.set_right_inset(self.host.sidebar.reserved(self.viewport));
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::RestoreQueue {
+			send(&self.intents, Intent::Dequeue);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::CyclePrevious {
+			self.host.cycle_model(true, &self.intents);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Ctrl('p') {
+			self.host.cycle_model(false, &self.intents);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::BackTab {
+			send(&self.intents, Intent::CycleThinking);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Ctrl('t') {
+			let _ = self.host.chat.handle_key(key);
+			send(&self.intents, Intent::ToggleThinking);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Alt('r') {
+			send(&self.intents, Intent::Retry);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::PlanToggle {
+			send(&self.intents, Intent::TogglePlan);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::CtrlAlt('l') {
+			send(&self.intents, Intent::ToggleLive);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::CtrlAlt('s') {
+			send(&self.intents, Intent::ToggleStt);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Ctrl('k') {
+			self.host.overlay =
+				Some(Overlay::Palette(CommandPalette::open(palette_entries(), &self.ctx)));
+			return RetainedChatEffect::Consumed;
+		}
+		if self.host.sidebar.focused() {
+			if key == Key::Ctrl('c') {
+				send(&self.intents, Intent::Quit);
+				return RetainedChatEffect::Quit(HostExit::Quit);
+			}
+			self.host.sidebar.handle_key(key);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Alt('a') || key == Key::Ctrl('s') {
+			open_agents(&mut self.host, &self.ctx);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Alt('m') || key == Key::Alt('p') {
+			self.host.open_models(&self.ctx);
+			return RetainedChatEffect::Consumed;
+		}
+		if let Some(scope) = ClipboardRead::for_key(key) {
+			return RetainedChatEffect::Clipboard(scope);
+		}
+		if key == Key::Esc && self.host.chat.is_working() {
+			self.host.last_esc = None;
+			send(&self.intents, Intent::Abort);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Esc && self.host.chat.composer_empty() {
+			let now = Instant::now();
+			if self
+				.host
+				.last_esc
+				.is_some_and(|last| now.duration_since(last) <= DOUBLE_ESC)
+			{
+				self.host.last_esc = None;
+				send(&self.intents, Intent::RewindRequest);
+			} else {
+				self.host.last_esc = Some(now);
+			}
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Left
+			&& self.host.chat.composer_empty()
+			&& !self.host.chat.agent_roster().is_empty()
+			&& self.host.left_double_tap()
+		{
+			open_agents_armed(&mut self.host, &self.ctx);
+			return RetainedChatEffect::Consumed;
+		}
+		self.host.last_esc = None;
+		let result = self.host.chat.handle_key(key);
+		let copied = self.host.chat.take_copied();
+		while let Some((text, attachments, mode)) = self.host.chat.take_submission() {
+			if text.trim() == "/images" {
+				self.host.overlay = Some(Overlay::Images(ImageOverlay::open(
+					&self.host.chat.composer_attachments(),
+					&self.ctx,
+				)));
+				continue;
+			}
+			send(&self.intents, Intent::Submit { text, attachments, mode });
+		}
+		if result == ChatKey::Quit {
+			send(&self.intents, Intent::Quit);
+			return RetainedChatEffect::Quit(HostExit::Quit);
+		}
+		if let Some(text) = copied {
+			return RetainedChatEffect::SetClipboard(text);
+		}
+		match result {
+			ChatKey::Consumed => RetainedChatEffect::Consumed,
+			ChatKey::Ignored => RetainedChatEffect::Ignored,
+			ChatKey::Quit => unreachable!("quit returned above"),
+		}
+	}
+
+	/// Routes one pointer event through the active overlay or chat surface.
+	pub fn mouse(&mut self, report: MouseReport) -> RetainedChatEffect {
+		if let Some(overlay) = self.host.overlay.as_mut() {
+			let event = overlay.handle_mouse(report.col, report.row, report.kind, self.viewport);
+			return self.apply_overlay(event);
+		}
+		if !self
+			.host
+			.sidebar
+			.handle_mouse(report.col, report.row, report.kind, self.viewport)
+		{
+			self.host.chat.handle_mouse(&report);
+		}
+		RetainedChatEffect::Consumed
+	}
+
+	/// Routes clipboard text into the active overlay or chat composer.
+	pub fn paste(&mut self, text: &str, raw: bool) -> RetainedChatEffect {
+		if let Some(overlay) = self.host.overlay.as_mut() {
+			let event = overlay.handle_paste(text);
+			return self.apply_overlay(event);
+		}
+		if !self.host.sidebar.focused() {
+			if raw {
+				self.host.chat.handle_paste_raw(text);
+			} else {
+				self.host.chat.handle_paste(text);
+			}
+		}
+		RetainedChatEffect::Consumed
+	}
+
+	/// Returns the lifecycle outcome with the current unsent composer draft.
+	pub fn outcome(&self, exit: HostExit) -> HostOutcome {
+		host_outcome(&self.host, exit)
+	}
+
+	/// Returns the next paint deadline while preserving background event
+	/// latency.
+	pub fn tick(&self) -> Duration {
+		self
+			.host
+			.chat
+			.next_wake()
+			.map_or(BACKEND_POLL_INTERVAL, |wake| wake.min(BACKEND_POLL_INTERVAL))
+	}
+
+	fn apply_overlay(&mut self, event: OverlayEvent) -> RetainedChatEffect {
+		match apply_overlay_event(
+			&mut self.host,
+			event,
+			&self.ctx,
+			self.viewport,
+			&self.intents,
+			self.exit_on_session_change,
+		) {
+			Some(exit) => RetainedChatEffect::Quit(exit),
+			None => RetainedChatEffect::Consumed,
+		}
+	}
+
+	fn drain(&mut self) -> bool {
+		let mut changed = false;
+		loop {
+			match self.events.try_recv() {
+				Ok(BackendEvent::NewSessionRequested) if self.exit_on_session_change => {
+					self.pending_exit = Some(HostExit::NewSession);
+					changed = true;
+				},
+				Ok(BackendEvent::CopyToClipboard(text)) => {
+					self.pending_clipboard = Some(text);
+					changed = true;
+				},
+				Ok(event) => {
+					apply_backend(&mut self.host, event, &self.ctx);
+					send_pty_resize(&mut self.host, self.viewport, &self.intents);
+					changed = true;
+				},
+				Err(flume::TryRecvError::Empty) => break,
+				Err(flume::TryRecvError::Disconnected) => {
+					self.pending_exit = Some(HostExit::Quit);
+					changed = true;
+					break;
+				},
+			}
+		}
+		while let Some(request) = self.ask_binding.try_recv() {
+			if self.host.overlay.is_some() {
+				request.fail("another modal dialog is already active");
+			} else {
+				let dialog = AskDialog::open(request.question.clone(), &self.ctx);
+				self.host.overlay = Some(Overlay::Ask { dialog, request });
+				changed = true;
+			}
+		}
+		changed
+	}
+}
+
+fn rail_layers(sidebar: &mut Sidebar, viewport: Size) -> SmallVec<Layer<'_>, 4> {
 	sidebar
 		.layer(viewport, Instant::now().into())
 		.into_iter()
@@ -775,7 +1134,7 @@ async fn run_chat(
 	error_notify: bool,
 	title_enabled: bool,
 ) -> io::Result<HostOutcome> {
-	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model);
+	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model, true);
 	let ask_binding = ask::bind();
 	{
 		let rendered = host.chat.render(viewport);
@@ -1724,11 +2083,14 @@ async fn deadline(at: Option<Instant>) {
 
 #[cfg(test)]
 mod tests {
-	use omp_tui::{Rect, Renderer, Size, Style, UiContext};
+	use omp_tui::{Key, Rect, Renderer, Size, Style, UiContext};
 	use smallvec::SmallVec;
 
-	use super::{Duration, Instant, ResizeState, present};
-	use crate::{Chat, RenderedFrame};
+	use super::{
+		Duration, HostExit, HostOptions, Instant, ResizeState, RetainedChat, RetainedChatEffect,
+		present,
+	};
+	use crate::{BackendEvent, Chat, RenderedFrame};
 
 	#[test]
 	fn resize_settle_window_restarts_at_each_event() {
@@ -1737,6 +2099,44 @@ mod tests {
 		state.observe(started_at + Duration::from_millis(100), true);
 		assert!(!state.settled(started_at + Duration::from_millis(219)));
 		assert!(state.settled(started_at + Duration::from_millis(220)));
+	}
+	#[test]
+	fn retained_chat_exits_for_a_backend_session_transition() {
+		let ctx = UiContext::default();
+		let (events, receiver) = flume::unbounded();
+		let (intents, _requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		events
+			.send(BackendEvent::NewSessionRequested)
+			.expect("retained chat receiver remains connected");
+
+		assert_eq!(chat.poll(), RetainedChatEffect::Quit(HostExit::NewSession));
+	}
+	#[test]
+	fn retained_chat_opens_its_sidebar_only_on_ctrl_b() {
+		let ctx = UiContext::default();
+		let (_events, receiver) = flume::unbounded();
+		let (intents, _requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		chat.resize(Size::new(120, 30), true);
+
+		assert!(chat.render().layers.is_empty());
+		assert_eq!(chat.key(Key::Ctrl('b')), RetainedChatEffect::Consumed);
+		assert_eq!(chat.render().layers.len(), 1);
 	}
 
 	#[test]
