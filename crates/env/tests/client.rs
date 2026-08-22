@@ -12,8 +12,8 @@ use bytes::Bytes;
 use frame::{client_frame, data_event, data_request, document_op, document_result, server_frame};
 use omp_core::{EnvPath, sf};
 use omp_env::{
-	ClientError, DataScope, EnvClient, InvocationEvent, LspStreamEvent, SearchEvent,
-	TransactionOutcome, WalkEvent, frame,
+	ClientError, DataScope, EnvClient, InvocationEvent, InvocationGrant, LspStreamEvent,
+	SearchEvent, TransactionOutcome, WalkEvent, frame,
 };
 use omp_proto::document::v1::{self as document, commit_transaction_response};
 
@@ -102,6 +102,61 @@ fn data_response(result: document_result::Result) -> server_frame::Body {
 		})),
 		..frame::DataResponse::default()
 	})
+}
+
+#[test]
+fn invocation_grants_are_clone_local_and_stamped_on_each_request() {
+	let (client, transport) = EnvClient::in_process(0);
+	let denied = client.with_invocation_grant(InvocationGrant::unrestricted().deny_pty());
+	let allowed = client.with_invocation_grant(InvocationGrant::unrestricted());
+	let (requests, responses) = transport.into_parts();
+	let server = thread::spawn(move || {
+		for expected in [("denied", true), ("allowed", false)] {
+			let frame = receive(&requests);
+			let request_id = frame.request_id;
+			assert!(matches!(
+				frame.scope,
+				Some(scope)
+					if scope.invocation_id == expected.0 && scope.pty_denied == expected.1
+			));
+			respond(
+				&responses,
+				request_id,
+				server_frame::Body::InvocationAccepted(frame::InvokeAccepted {
+					invocation_id: expected.0.into(),
+					..frame::InvokeAccepted::default()
+				}),
+			);
+			let committed = receive(&requests);
+			assert_eq!(committed.request_id, request_id);
+			assert!(matches!(
+				committed.scope,
+				Some(scope)
+					if scope.invocation_id == expected.0
+						&& scope.effect_token == Bytes::from_static(b"scope-token")
+						&& scope.pty_denied == expected.1
+			));
+		}
+	});
+
+	let denied_call = block_on(denied.invoke(invoke_request("denied"))).expect("denied invocation");
+	block_on(denied_call.commit_args(
+		Bytes::from_static(b"{}"),
+		Bytes::from_static(b"scope-token"),
+		1,
+		None,
+	))
+	.expect("commit denied scope");
+	let allowed_call =
+		block_on(allowed.invoke(invoke_request("allowed"))).expect("allowed invocation");
+	block_on(allowed_call.commit_args(
+		Bytes::from_static(b"{}"),
+		Bytes::from_static(b"scope-token"),
+		1,
+		None,
+	))
+	.expect("commit allowed scope");
+	server.join().expect("server");
 }
 
 #[test]

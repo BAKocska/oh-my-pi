@@ -28,10 +28,11 @@ use omp_proto::{
 		DestroyWorktree, EventStreamError, EventStreamKind, ExecRequest, ExecStarted, ExitEvent,
 		Interrupt, InvocationScope, InvokeAccepted, InvokeTool, ListProcesses, MaterializeSite,
 		MergeWorktree, OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame,
-		ProcessCommandAccepted, ProcessList, ProcessOutput, ProcessStarted, ProcessStateEvent,
-		ProtocolError, ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg, SearchRequest,
-		SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest, SiteMaterialized,
-		StartProcess, StdinFrame, StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest,
+		PresenceRegistered, PresenceReleased, ProcessCommandAccepted, ProcessList, ProcessOutput,
+		ProcessStarted, ProcessStateEvent, ProtocolError, ProtocolErrorCode, RegisterPresence,
+		ReleasePresence, Retire, SearchComplete, SearchMatchMsg, SearchRequest, SendInput,
+		ServerFrame, ServerHello, SignalProcess, SignalRequest, SiteMaterialized, StartProcess,
+		StdinFrame, StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest,
 		WorktreeResult, cancel_request, client_frame, data_event, data_request, data_response,
 		document_op, document_result, server_frame, worktree_op,
 	},
@@ -109,6 +110,8 @@ pub struct DataScope {
 	pub host_generation:    u64,
 	/// Generation of the owning session.
 	pub session_generation: u64,
+	/// Whether this invocation is forbidden from allocating pseudo-terminals.
+	pub pty_denied:         bool,
 }
 
 impl DataScope {
@@ -124,7 +127,15 @@ impl DataScope {
 			effect_token,
 			host_generation,
 			session_generation,
+			pty_denied: false,
 		}
+	}
+
+	/// Narrows this invocation so no environment operation can allocate a PTY.
+	#[must_use]
+	pub const fn deny_pty(mut self) -> Self {
+		self.pty_denied = true;
+		self
 	}
 
 	fn wire(&self) -> InvocationScope {
@@ -133,6 +144,43 @@ impl DataScope {
 			effect_token: self.effect_token.clone(),
 			host_generation: self.host_generation,
 			session_generation: self.session_generation,
+			pty_denied: self.pty_denied,
+			..InvocationScope::default()
+		}
+	}
+}
+
+/// Session-minted restrictions stamped on each top-level tool invocation.
+///
+/// Restrictions only narrow authority. Cloning an [`EnvClient`] with a
+/// different grant does not mutate the shared transport or another session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InvocationGrant {
+	pty_denied: bool,
+}
+
+impl InvocationGrant {
+	/// Creates an unrestricted invocation grant.
+	pub const fn unrestricted() -> Self {
+		Self { pty_denied: false }
+	}
+
+	/// Denies pseudo-terminal allocation for invocations carrying this grant.
+	#[must_use]
+	pub const fn deny_pty(mut self) -> Self {
+		self.pty_denied = true;
+		self
+	}
+
+	/// Returns whether pseudo-terminal allocation is denied.
+	pub const fn pty_denied(self) -> bool {
+		self.pty_denied
+	}
+
+	fn wire(self, invocation_id: &str) -> InvocationScope {
+		InvocationScope {
+			invocation_id: invocation_id.to_owned(),
+			pty_denied: self.pty_denied,
 			..InvocationScope::default()
 		}
 	}
@@ -146,6 +194,7 @@ impl DataScope {
 #[derive(Clone, Debug)]
 pub struct EnvClient {
 	inner: Arc<ClientInner>,
+	grant: InvocationGrant,
 }
 #[derive(Clone)]
 struct SharedClientEntry {
@@ -423,6 +472,7 @@ pub struct RequestStream {
 pub struct Invocation {
 	client: EnvClient,
 	id:     Str,
+	grant:  InvocationGrant,
 	stream: RequestStream,
 	guard:  Option<RunGuard>,
 }
@@ -693,7 +743,15 @@ impl EnvClient {
 		let _ = std::thread::spawn(move || route_cancellations(cancellations, outgoing));
 		let closer = Arc::downgrade(&inner);
 		let _ = std::thread::spawn(move || route_lease_closes(closer, lease_closes));
-		Self { inner }
+		Self { inner, grant: InvocationGrant::unrestricted() }
+	}
+
+	/// Returns a transport-sharing client whose tool invocations carry `grant`.
+	///
+	/// The grant is immutable and local to the returned clone.
+	#[must_use]
+	pub fn with_invocation_grant(&self, grant: InvocationGrant) -> Self {
+		Self { inner: Arc::clone(&self.inner), grant }
 	}
 
 	/// Creates an in-process client/server frame channel.
@@ -800,6 +858,37 @@ impl EnvClient {
 		{
 			server_frame::Body::ShutdownAcknowledged(acknowledged) => Ok(acknowledged),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ShutdownAcknowledged" }),
+		}
+	}
+
+	/// Registers this connection as one live project client.
+	///
+	/// The daemon durably publishes the lease and removes it if this connection
+	/// closes before [`Self::release_presence`] is called.
+	pub async fn register_presence(
+		&self,
+		request: RegisterPresence,
+	) -> Result<PresenceRegistered, ClientError> {
+		match self
+			.one_shot(client_frame::Body::RegisterPresence(request), None)
+			.await?
+		{
+			server_frame::Body::PresenceRegistered(registered) => Ok(registered),
+			_ => Err(ClientError::UnexpectedResponse { expected: "PresenceRegistered" }),
+		}
+	}
+
+	/// Explicitly releases this connection's daemon presence lease.
+	pub async fn release_presence(
+		&self,
+		request: ReleasePresence,
+	) -> Result<PresenceReleased, ClientError> {
+		match self
+			.one_shot(client_frame::Body::ReleasePresence(request), None)
+			.await?
+		{
+			server_frame::Body::PresenceReleased(released) => Ok(released),
+			_ => Err(ClientError::UnexpectedResponse { expected: "PresenceReleased" }),
 		}
 	}
 
@@ -1118,9 +1207,12 @@ impl EnvClient {
 	pub async fn invoke(&self, request: InvokeTool) -> Result<Invocation, ClientError> {
 		let id = Str::new(request.invocation_id.as_str());
 		let (stream, guard) = self
-			.open_guarded(client_frame::Body::InvokeTool(request), None)
+			.open_guarded_wire(
+				client_frame::Body::InvokeTool(request),
+				Some(self.grant.wire(id.as_str())),
+			)
 			.await?;
-		Ok(Invocation { client: self.clone(), id, stream, guard: Some(guard) })
+		Ok(Invocation { client: self.clone(), id, grant: self.grant, stream, guard: Some(guard) })
 	}
 
 	/// Opens a persistent, server-owned exec session rooted at `cwd`.
@@ -1303,10 +1395,20 @@ impl EnvClient {
 		body: client_frame::Body,
 		scope: Option<&DataScope>,
 	) -> Result<(RequestStream, RunGuard), ClientError> {
+		self
+			.open_guarded_wire(body, scope.map(DataScope::wire))
+			.await
+	}
+
+	async fn open_guarded_wire(
+		&self,
+		body: client_frame::Body,
+		scope: Option<InvocationScope>,
+	) -> Result<(RequestStream, RunGuard), ClientError> {
 		let request_id = self.allocate_request_id()?;
 		let stream = self.register(request_id);
 		let guard = RunGuard::new(request_id, self.inner.cancel.clone());
-		if self.send(request_id, body, scope).await.is_err() {
+		if self.send_wire(request_id, body, scope).await.is_err() {
 			stream.unregister();
 			guard.relinquish();
 			return Err(ClientError::TransportClosed);
@@ -1327,14 +1429,20 @@ impl EnvClient {
 		scope: Option<&DataScope>,
 	) -> Result<(), ClientError> {
 		self
+			.send_wire(request_id, body, scope.map(DataScope::wire))
+			.await
+	}
+
+	async fn send_wire(
+		&self,
+		request_id: u64,
+		body: client_frame::Body,
+		scope: Option<InvocationScope>,
+	) -> Result<(), ClientError> {
+		self
 			.inner
 			.outgoing
-			.send_async(ClientFrame {
-				request_id,
-				body: Some(body),
-				scope: scope.map(DataScope::wire),
-				..ClientFrame::default()
-			})
+			.send_async(ClientFrame { request_id, body: Some(body), scope, ..ClientFrame::default() })
 			.await
 			.map_err(|_| ClientError::TransportClosed)
 	}
@@ -2132,9 +2240,11 @@ impl Invocation {
 		authorized_at_ms: u64,
 		effects: Option<omp_proto::policy::v1::EffectEnvelope>,
 	) -> Result<(), ClientError> {
+		let mut scope = self.grant.wire(self.id.as_str());
+		scope.effect_token = effect_token.clone();
 		self
 			.client
-			.send(
+			.send_wire(
 				self.stream.request_id,
 				client_frame::Body::ArgsCommitted(ArgsCommitted {
 					invocation_id: self.id.to_string(),
@@ -2144,7 +2254,7 @@ impl Invocation {
 					effects,
 					..ArgsCommitted::default()
 				}),
-				None,
+				Some(scope),
 			)
 			.await
 	}
