@@ -1828,7 +1828,10 @@ fn execute_search<M: Matcher, W: Write>(
 	{
 		return SIGPIPE_EXIT_CODE;
 	}
-	if out.flush().is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe) {
+	if out
+		.flush()
+		.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+	{
 		return SIGPIPE_EXIT_CODE;
 	}
 	if opts.quiet {
@@ -1912,7 +1915,10 @@ impl Utility for Rg {
 					return 2;
 				},
 			};
-			if out.flush().is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe) {
+			if out
+				.flush()
+				.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+			{
 				return SIGPIPE_EXIT_CODE;
 			}
 			return if outcome.had_error {

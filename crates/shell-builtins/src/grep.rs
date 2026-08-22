@@ -1420,7 +1420,10 @@ fn execute_search<M: Matcher>(
 		}
 	}
 
-	if out.flush().is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe) {
+	if out
+		.flush()
+		.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+	{
 		return SIGPIPE_EXIT_CODE;
 	}
 	if opts.quiet {
