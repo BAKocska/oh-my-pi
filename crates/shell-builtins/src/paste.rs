@@ -14,9 +14,11 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::display::Quotable;
 
-use crate::host::{Host, Stdin, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Stdin, Utility, format_usage, matches_parser, os_bytes, util},
+	support::quote::Quotable,
+};
 
 mod options {
 	pub const DELIMITER: &str = "delimiters";

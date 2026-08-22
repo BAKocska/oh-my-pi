@@ -14,9 +14,11 @@ use clap::ArgMatches;
 use memchr::memrchr_iter;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use thiserror::Error;
-use uucore::{display::Quotable, line_ending::LineEnding};
 
-use crate::host::{Host, Utility, matches_parser, util};
+use crate::{
+	host::{Host, Utility, matches_parser, util},
+	support::{line_ending::LineEnding, quote::Quotable},
+};
 
 const BUF_SIZE: usize = 65536;
 
@@ -121,10 +123,7 @@ mod parse {
 
 	use std::ffi::OsString;
 
-	use uucore::parser::{
-		parse_signed_num::{SignPrefix, parse_signed_num_max},
-		parse_size::ParseSizeError,
-	};
+	use crate::support::parse::{ParseSizeError, SignPrefix, parse_signed_num_max};
 
 	#[derive(PartialEq, Eq, Debug)]
 	pub(super) struct ParseError;
@@ -1317,7 +1316,7 @@ fn head_backwards_file(
 ) -> io::Result<u64> {
 	let st = input.metadata()?;
 	let seekable = is_seekable(input);
-	let blksize_limit = uucore::fs::sane_blksize::sane_blksize_from_metadata(&st);
+	let blksize_limit = crate::support::fsutil::sane_blksize::sane_blksize_from_metadata(&st);
 	if !seekable || st.len() <= blksize_limit || options.presume_input_pipe {
 		head_backwards_without_seek_file(input, output, options)
 	} else {

@@ -13,9 +13,11 @@ use memchr::memmem;
 use memmap2::Mmap;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use thiserror::Error;
-use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::quote::Quotable,
+};
 
 mod options {
 	pub static BEFORE: &str = "before";

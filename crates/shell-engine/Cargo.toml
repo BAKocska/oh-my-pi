@@ -32,7 +32,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-uucore = { workspace = true }
 xutf = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]

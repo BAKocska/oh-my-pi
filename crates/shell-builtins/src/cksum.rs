@@ -14,21 +14,22 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches, Command, ValueHint, builder::ValueParser};
 use omp_core::encoding::hex::decode;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{
-	checksum::{
-		AlgoKind, BlakeLength, ChecksumError, ReadingMode, SUPPORTED_ALGORITHMS, ShaLength,
-		SizedAlgoKind, digest_reader, escape_filename, parse_blake_length, unescape_filename,
-	},
-	display::Quotable,
-	hardware::{HasHardwareFeatures as _, SimdPolicy},
-	line_ending::LineEnding,
-	os_str_from_bytes,
-	quoting_style::{QuotingStyle, locale_aware_escape_name},
-	read_os_string_lines,
-	sum::{self, Blake2b, Blake3, DigestOutput},
-};
 
-use crate::host::{Host, Utility, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Utility, matches_parser, os_bytes, util},
+	support::{
+		checksum::{
+			AlgoKind, BlakeLength, ChecksumError, DigestOutput, ReadingMode, SUPPORTED_ALGORITHMS,
+			ShaLength, SizedAlgoKind, digest_reader, escape_filename, os_str_from_bytes,
+			parse_blake_length, read_os_string_lines,
+			sum::{self, Blake2b, Blake3},
+			unescape_filename,
+		},
+		line_ending::LineEnding,
+		quote::{Quotable, QuotingStyle, locale_aware_escape_name},
+		sys::hardware::{HasHardwareFeatures as _, SimdPolicy},
+	},
+};
 
 #[derive(Debug, Clone)]
 struct Failure(String);
@@ -1513,8 +1514,6 @@ fn identify_algo_name_and_length(
 
 	// check if we are called with XXXsum (example: md5sum) but we detected a
 	// different algo parsing the file (for example SHA1 (f) = d...)
-	//
-	// Also handle the case cksum -s sm3 but the file contains other formats
 	if let Some(algo_name_input) = algo_name_input {
 		match (algo_name_input, line_algo) {
 			(l, r) if l == r => (),

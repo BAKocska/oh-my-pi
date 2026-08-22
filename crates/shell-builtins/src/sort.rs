@@ -112,7 +112,7 @@ mod buffer_hint {
 
 	fn available_memory_hint() -> Option<usize> {
 		#[cfg(target_os = "linux")]
-		if let Some(bytes) = uucore::parser::parse_size::available_memory_bytes() {
+		if let Some(bytes) = crate::support::parse::available_memory_bytes() {
 			return Some(clamp_hint(bytes / 4));
 		}
 
@@ -2487,22 +2487,19 @@ use rand::{RngExt as _, rng};
 use rayon::slice::ParallelSliceMut;
 use rustc_hash::{FxHashMap, FxHasher};
 use thiserror::Error;
-use uucore::{
-	display::Quotable,
-	extendedbigdecimal::ExtendedBigDecimal,
-	line_ending::LineEnding,
-	parser::{
-		num_parser::{ExtendedParser, ExtendedParserError},
-		parse_size::{ParseSizeError, Parser},
-		shortcut_value_parser::ShortcutValueParser,
-	},
-	posix::{MODERN, TRADITIONAL},
-	version_cmp::version_cmp,
-};
 
 use crate::{
 	host::{Host, Utility, format_usage, rayon_global_pool_available, util},
 	sort::{buffer_hint::automatic_buffer_size, tmp_dir::TmpDirWrapper},
+	support::{
+		clap_ext::ShortcutValueParser,
+		line_ending::LineEnding,
+		num::{ExtendedBigDecimal, ExtendedParser, ExtendedParserError},
+		parse::{ParseSizeError, Parser},
+		posix::{MODERN, TRADITIONAL, posix_version},
+		quote::Quotable,
+		version_cmp::version_cmp,
+	},
 };
 
 type SortResult<T> = Result<T, SortError>;
@@ -3869,7 +3866,7 @@ const STDIN_FILE: &str = "-";
 /// Legacy `+POS1 [-POS2]` syntax is permitted unless `_POSIX2_VERSION` is in
 /// the [TRADITIONAL, MODERN) range (matches GNU behaviour).
 fn allows_traditional_usage() -> bool {
-	!matches!(uucore::posix::posix_version(), Some(ver) if (TRADITIONAL..MODERN).contains(&ver))
+	!matches!(posix_version(), Some(ver) if (TRADITIONAL..MODERN).contains(&ver))
 }
 
 #[derive(Debug, Clone)]

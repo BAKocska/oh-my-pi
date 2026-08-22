@@ -12,9 +12,9 @@ mod count_fast {
 
 	#[cfg(unix)]
 	use libc::{_SC_PAGESIZE, S_IFREG, sysconf};
-	use uucore::hardware::SimdPolicy;
 
 	use super::{WordCountable, wc_simd_allowed, word_count::WordCount};
+	use crate::support::sys::hardware::SimdPolicy;
 	#[cfg(windows)]
 	const FILE_ATTRIBUTE_ARCHIVE: u32 = 32;
 	#[cfg(windows)]
@@ -25,8 +25,9 @@ mod count_fast {
 
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	use libc::S_IFIFO;
+
 	#[cfg(any(target_os = "linux", target_os = "android"))]
-	use uucore::pipes::{MAX_ROOTLESS_PIPE_SIZE, pipe, splice, splice_exact};
+	use crate::support::sys::pipes::{MAX_ROOTLESS_PIPE_SIZE, pipe, splice, splice_exact};
 
 	const BUF_SIZE: usize = 256 * 1024;
 
@@ -38,7 +39,7 @@ mod count_fast {
 	#[inline]
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn count_bytes_using_splice(fd: &impl AsFd) -> Result<usize, usize> {
-		let null_file = uucore::pipes::dev_null().ok_or(0_usize)?;
+		let null_file = crate::support::sys::pipes::dev_null().ok_or(0_usize)?;
 		// todo: avoid generating broker if input is pipe (fcntl_setpipe_size succeed)
 		// and directly splice() to /dev/null to save RAM usage
 		let (pipe_rd, pipe_wr) = pipe().map_err(|_| 0_usize)?;
@@ -548,19 +549,20 @@ use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use thiserror::Error;
 use utf8::{BufReadDecoder, BufReadDecoderError};
-use uucore::{
-	display::Quotable,
-	hardware::{HardwareFeature, HasHardwareFeatures as _, SimdPolicy},
-	parser::shortcut_value_parser::ShortcutValueParser,
-	quoting_style::{self, QuotingStyle},
-};
 
 use self::{
 	count_fast::{count_bytes_chars_and_lines_fast, count_bytes_fast},
 	countable::WordCountable,
 	word_count::WordCount,
 };
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes_lossy, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, os_bytes_lossy, util},
+	support::{
+		clap_ext::ShortcutValueParser,
+		quote::{self as quoting_style, Quotable, QuotingStyle},
+		sys::hardware::{HardwareFeature, HasHardwareFeatures as _, SimdPolicy},
+	},
+};
 
 /// The minimum character width for formatting counts when reading from stdin.
 const MINIMUM_WIDTH: usize = 7;

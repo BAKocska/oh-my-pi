@@ -4,11 +4,11 @@
 
 use clap::ArgMatches;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::checksum::AlgoKind;
 
 use crate::{
 	cksum,
 	host::{Host, Utility, matches_parser, util},
+	support::checksum::AlgoKind,
 };
 
 /// Parsed `sha224sum` invocation.
@@ -23,7 +23,9 @@ impl Utility for Sha224sum {
 	const USAGE_ERROR: u8 = 2;
 
 	fn run(self, host: &mut Host) -> i32 {
-		cksum::run(host, AlgoKind::Sha224, self.matches, None)
+		let algo =
+			AlgoKind::from_bin_name(Self::NAME).expect("sha224sum is a supported checksum utility");
+		cksum::run(host, algo, self.matches, None)
 	}
 }
 

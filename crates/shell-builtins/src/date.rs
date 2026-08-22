@@ -788,7 +788,8 @@ use jiff::{
 	fmt::strtime::{self, BrokenDownTime, Config, PosixCustom},
 	tz::{Offset, TimeZone, TimeZoneDatabase},
 };
-use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
+
+use crate::support::{clap_ext::ShortcutValueParser, quote::Quotable};
 
 // Options
 const DATE: &str = "date";

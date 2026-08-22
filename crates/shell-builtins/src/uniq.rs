@@ -12,13 +12,15 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{
-	display::Quotable,
-	parser::shortcut_value_parser::ShortcutValueParser,
-	posix::{OBSOLETE, posix_version},
-};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{
+		clap_ext::ShortcutValueParser,
+		posix::{OBSOLETE, posix_version},
+		quote::Quotable,
+	},
+};
 
 mod options {
 	pub static ALL_REPEATED: &str = "all-repeated";
@@ -358,13 +360,16 @@ fn opt_parsed(opt_name: &str, matches: &ArgMatches) -> PortResult<Option<usize>>
 /// `uniq +1 file` would equal `uniq -s1 file`
 /// `uniq +1 -s2 file` would equal `uniq -s2 file`
 /// `uniq -s2 +3 file` would equal `uniq -s3 file`
-fn handle_obsolete(args: impl uucore::Args) -> (Vec<OsString>, Option<usize>, Option<usize>) {
+fn handle_obsolete(
+	args: impl IntoIterator<Item = OsString>,
+) -> (Vec<OsString>, Option<usize>, Option<usize>) {
 	let mut skip_fields_old = None;
 	let mut skip_chars_old = None;
 	let mut preceding_long_opt_req_value = false;
 	let mut preceding_short_opt_req_value = false;
 
 	let filtered_args = args
+		.into_iter()
 		.filter_map(|os_slice| {
 			filter_args(
 				os_slice,

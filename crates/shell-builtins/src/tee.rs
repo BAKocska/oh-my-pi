@@ -15,9 +15,11 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::PossibleValue};
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
-use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, matches_parser, util};
+use crate::{
+	host::{Host, Utility, matches_parser, util},
+	support::quote::Quotable,
+};
 
 mod options {
 	pub const APPEND: &str = "append";

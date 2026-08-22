@@ -26,9 +26,11 @@ use rand::{
 };
 use tempfile::Builder;
 use thiserror::Error;
-use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, os_bytes, util},
+	support::quote::Quotable,
+};
 
 static DEFAULT_TEMPLATE: &str = "tmp.XXXXXXXXXX";
 

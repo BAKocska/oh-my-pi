@@ -15,6 +15,7 @@ mod factory;
 mod host;
 mod proc_match;
 mod proc_snapshot;
+mod support;
 
 mod b2sum;
 mod base32;

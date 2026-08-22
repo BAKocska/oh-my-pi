@@ -12,9 +12,11 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{display::Quotable, line_ending::LineEnding};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{line_ending::LineEnding, quote::Quotable},
+};
 
 mod options {
 	pub const COLUMN_1: &str = "1";

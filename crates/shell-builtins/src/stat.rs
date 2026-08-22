@@ -56,23 +56,26 @@ mod imp {
 	};
 
 	use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
-	use thiserror::Error;
-	use uucore::display::Quotable;
-	#[cfg(windows)]
-	use uucore::time::{FormatSystemTimeFallback, format_system_time, system_time_to_sec};
 	#[cfg(unix)]
-	use uucore::{
+	use libc::mode_t;
+	use thiserror::Error;
+
+	#[cfg(unix)]
+	use crate::support::{
 		entries,
-		fs::{display_permissions, major, minor},
-		fsext::{
+		fsutil::{display_permissions, major, minor},
+		mounts::{
 			FsMeta, MetadataTimeField, StatFs, metadata_get_time, pretty_filetype, pretty_fstype,
 			read_fs_list, statfs,
 		},
-		libc::mode_t,
-		time::{FormatSystemTimeFallback, format_system_time, system_time_to_sec},
 	};
-
-	use crate::host::{self, Host, Utility, matches_parser};
+	use crate::{
+		host::{self, Host, Utility, matches_parser},
+		support::{
+			quote::Quotable,
+			sys::time::{FormatSystemTimeFallback, format_system_time, system_time_to_sec},
+		},
+	};
 
 	const ABOUT: &str = "Display file or file system status.";
 	const USAGE: &str = "stat [OPTION]... FILE...";
@@ -2188,7 +2191,7 @@ for details about the options it supports.";
 			}
 		}
 
-		/// Human-readable file type for `%F`, mirroring uucore's
+		/// Human-readable file type for `%F`, mirroring the Unix
 		/// `pretty_filetype` for the types reachable on Windows.
 		pub fn file_type_str(mode: u32, size: u64) -> String {
 			match mode & 0o170000 {

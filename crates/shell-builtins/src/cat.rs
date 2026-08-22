@@ -15,9 +15,11 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use memchr::memchr2;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use thiserror::Error;
-use uucore::{display::Quotable, fast_inc::fast_inc_one};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{num::fast_inc_one, quote::Quotable},
+};
 
 // Allocate 32 digits for the line number. An estimate is that we can print
 // about 1e8 lines/second, so 32 digits lasts for billions of universe

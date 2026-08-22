@@ -12,12 +12,14 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{
-	display::Quotable,
-	parser::parse_size::{ParseSizeError, Parser, allow_list_with_all_suffixes},
-};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{
+		parse::{ParseSizeError, Parser, allow_list_with_all_suffixes},
+		quote::Quotable,
+	},
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TruncateMode {

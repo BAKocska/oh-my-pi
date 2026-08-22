@@ -25,26 +25,30 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use thiserror::Error;
-#[cfg(unix)]
-use uucore::fs::{display_permissions_unix, make_fifo};
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "redox"))))]
-use uucore::fsxattr;
-use uucore::{
-	backup_control::{self, BackupMode, source_is_target_backup},
-	display::Quotable,
-	fs::{
-		MissingHandling, ResolveMode, are_hardlinks_or_one_way_symlink_to_same_file,
-		are_hardlinks_to_same_file, canonicalize, path_ends_with_terminator,
-	},
-	update_control::{self, UpdateMode},
-};
 
 #[cfg(unix)]
 use self::hardlink::{
 	HardlinkGroupScanner, HardlinkOptions, HardlinkTracker, create_hardlink_context,
 	with_optional_hardlink_context,
 };
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+#[cfg(unix)]
+use crate::support::fsutil::{display_permissions_unix, make_fifo};
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "redox"))))]
+use crate::support::xattr as fsxattr;
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{
+		backup::{
+			self as backup_control, BackupMode, source_is_target_backup,
+			update_control::{self, UpdateMode},
+		},
+		fsutil::{
+			MissingHandling, ResolveMode, are_hardlinks_or_one_way_symlink_to_same_file,
+			are_hardlinks_to_same_file, canonicalize, path_ends_with_terminator,
+		},
+		quote::Quotable,
+	},
+};
 
 #[derive(Debug, Error)]
 enum MvError {
@@ -1664,9 +1668,9 @@ mod hardlink {
 	};
 
 	use rustc_hash::FxHashMap;
-	use uucore::display::Quotable;
 
 	use super::Host;
+	use crate::support::quote::Quotable;
 
 	/// Tracks hardlinks during cross-partition moves to preserve them
 	#[derive(Debug, Default)]

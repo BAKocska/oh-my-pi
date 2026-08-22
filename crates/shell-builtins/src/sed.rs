@@ -7426,12 +7426,14 @@ pub mod in_place {
 
 	use omp_shell_engine::openfiles::OpenFile;
 	use tempfile::NamedTempFile;
-	use uucore::display::Quotable;
 
-	use crate::sed::{
-		command::ProcessingContext,
-		error_handling::{IoContext, SedError, SedResult},
-		fast_io::OutputBuffer,
+	use crate::{
+		sed::{
+			command::ProcessingContext,
+			error_handling::{IoContext, SedError, SedResult},
+			fast_io::OutputBuffer,
+		},
+		support::quote::Quotable,
 	};
 
 	/// Context for in-place editing
@@ -7507,8 +7509,7 @@ pub mod in_place {
 				.map_err_context(|| format!("error creating temporary file in {}", dir.quote()))?;
 
 			// TODO: On Unix use fchown(metadata.{uid,dig}) and fchmod(mode)
-			// on let fd = temp_file.as_file().as_raw_fd() when uucore::libc
-			// support them.
+			// on let fd = temp_file.as_file().as_raw_fd() when libc APIs support them.
 			#[cfg(unix)]
 			{
 				let mode = metadata.mode() & 0o7777;
@@ -7753,9 +7754,10 @@ pub mod named_writer {
 		rc::Rc,
 	};
 
-	use uucore::display::Quotable;
-
-	use crate::sed::error_handling::{ScriptLocation, SedResult, runtime_error};
+	use crate::{
+		sed::error_handling::{ScriptLocation, SedResult, runtime_error},
+		support::quote::Quotable,
+	};
 
 	thread_local! {
 		 /// Global list of all writers that should be flushed at shutdown
@@ -7847,8 +7849,6 @@ pub mod processor {
 
 	use std::{borrow::Cow, cell::RefCell, path::PathBuf, rc::Rc};
 
-	use uucore::display::Quotable;
-
 	use crate::{
 		host::Host,
 		sed::{
@@ -7862,6 +7862,7 @@ pub mod processor {
 			in_place::InPlace,
 			named_writer,
 		},
+		support::quote::Quotable,
 	};
 
 	/// Return the specified command variant or panic.
@@ -8826,9 +8827,11 @@ pub mod script_line_provider {
 	};
 
 	use omp_shell_engine::openfiles::OpenFile;
-	use uucore::display::Quotable;
 
-	use crate::sed::error_handling::{IoContext, SedResult};
+	use crate::{
+		sed::error_handling::{IoContext, SedResult},
+		support::quote::Quotable,
+	};
 
 	#[derive(Debug, PartialEq)]
 	/// The specification of a script: through a string or a file

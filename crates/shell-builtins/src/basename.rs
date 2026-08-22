@@ -7,9 +7,11 @@ use std::{ffi::OsString, io::Write, path::PathBuf};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{display::Quotable, line_ending::LineEnding};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, os_bytes, util},
+	support::{line_ending::LineEnding, quote::Quotable},
+};
 
 mod options {
 	pub static MULTIPLE: &str = "multiple";

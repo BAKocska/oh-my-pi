@@ -335,7 +335,7 @@ pub mod matchers {
 				// NotADirectory is nightly-only
 				#[cfg(unix)]
 				{
-					if self.raw == Some(uucore::libc::ENOTDIR) {
+					if self.raw == Some(libc::ENOTDIR) {
 						return true;
 					}
 				}
@@ -346,7 +346,7 @@ pub mod matchers {
 			/// Check for ErrorKind::FilesystemLoop.
 			pub fn is_loop(&self) -> bool {
 				#[cfg(unix)]
-				return self.raw == Some(uucore::libc::ELOOP);
+				return self.raw == Some(libc::ELOOP);
 
 				#[cfg(not(unix))]
 				return false;
@@ -804,10 +804,7 @@ pub mod matchers {
 				return Ok(cache.fs_type.clone());
 			}
 
-			// `read_fs_list` reports failures through uucore's error type; the mount
-			// table is either readable or it is not, so flatten it to an io error.
-			let fs_list =
-				uucore::fsext::read_fs_list().map_err(|err| io::Error::other(err.to_string()))?;
+			let fs_list = crate::support::mounts::read_fs_list()?;
 			let result = fs_list
 				.into_iter()
 				.find(|fs| fs.dev_id == dev_id)
@@ -866,7 +863,7 @@ pub mod matchers {
 			}
 		}
 	}
-	mod glob {
+	mod fnmatch {
 		// Copyright 2022 Tavian Barnes
 		//
 		// Use of this source code is governed by a MIT-style
@@ -1132,7 +1129,7 @@ pub mod matchers {
 
 		use std::{io::Write, path::PathBuf};
 
-		use super::{Matcher, MatcherIO, WalkEntry, glob::Pattern};
+		use super::{Matcher, MatcherIO, WalkEntry, fnmatch::Pattern};
 
 		fn read_link_target(file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> Option<PathBuf> {
 			match file_info.path().read_link() {
@@ -1156,7 +1153,7 @@ pub mod matchers {
 		}
 
 		/// This matcher makes a comparison of the link target against a shell
-		/// wildcard pattern. See `glob::Pattern` for details on the exact
+		/// wildcard pattern. See `fnmatch::Pattern` for details on the exact
 		/// syntax.
 		pub struct LinkNameMatcher {
 			pattern: Pattern,
@@ -1548,74 +1545,8 @@ pub mod matchers {
 		use super::{Matcher, MatcherIO, WalkEntry};
 
 		#[cfg(unix)]
-		fn format_permissions(mode: uucore::libc::mode_t) -> String {
-			let file_type = match mode & (uucore::libc::S_IFMT as uucore::libc::mode_t) {
-				uucore::libc::S_IFDIR => "d",
-				uucore::libc::S_IFREG => "-",
-				_ => "?",
-			};
-
-			// S_$$USR means "user permissions"
-			let user_perms = format!(
-				"{}{}{}",
-				if mode & uucore::libc::S_IRUSR != 0 {
-					"r"
-				} else {
-					"-"
-				},
-				if mode & uucore::libc::S_IWUSR != 0 {
-					"w"
-				} else {
-					"-"
-				},
-				if mode & uucore::libc::S_IXUSR != 0 {
-					"x"
-				} else {
-					"-"
-				}
-			);
-
-			// S_$$GRP means "group permissions"
-			let group_perms = format!(
-				"{}{}{}",
-				if mode & uucore::libc::S_IRGRP != 0 {
-					"r"
-				} else {
-					"-"
-				},
-				if mode & uucore::libc::S_IWGRP != 0 {
-					"w"
-				} else {
-					"-"
-				},
-				if mode & uucore::libc::S_IXGRP != 0 {
-					"x"
-				} else {
-					"-"
-				}
-			);
-
-			// S_$$OTH means "other permissions"
-			let other_perms = format!(
-				"{}{}{}",
-				if mode & uucore::libc::S_IROTH != 0 {
-					"r"
-				} else {
-					"-"
-				},
-				if mode & uucore::libc::S_IWOTH != 0 {
-					"w"
-				} else {
-					"-"
-				},
-				if mode & uucore::libc::S_IXOTH != 0 {
-					"x"
-				} else {
-					"-"
-				}
-			);
-
-			format!("{}{}{}{}", file_type, user_perms, group_perms, other_perms)
+		fn format_permissions(mode: libc::mode_t) -> String {
+			crate::support::fsutil::display_permissions_unix(u32::from(mode), true)
 		}
 
 		#[cfg(windows)]
@@ -1664,8 +1595,6 @@ pub mod matchers {
 			) {
 				use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-				use nix::unistd::{Gid, Group, Uid, User};
-
 				let metadata = file_info.metadata().unwrap();
 
 				let inode_number = metadata.ino();
@@ -1684,17 +1613,10 @@ pub mod matchers {
 						number_of_blocks + (4 - (remainder))
 					}
 				};
-				let permission =
-					{ format_permissions(metadata.permissions().mode() as uucore::libc::mode_t) };
+				let permission = format_permissions(metadata.permissions().mode() as libc::mode_t);
 				let hard_links = metadata.nlink();
-				let user = {
-					let uid = metadata.uid();
-					User::from_uid(Uid::from_raw(uid)).unwrap().unwrap().name
-				};
-				let group = {
-					let gid = metadata.gid();
-					Group::from_gid(Gid::from_raw(gid)).unwrap().unwrap().name
-				};
+				let user = crate::support::entries::uid2usr(metadata.uid()).unwrap();
+				let group = crate::support::entries::gid2grp(metadata.gid()).unwrap();
 				let size = metadata.size();
 				let last_modified = {
 					let system_time = metadata.modified().unwrap();
@@ -1831,10 +1753,10 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use super::{Matcher, MatcherIO, WalkEntry, glob::Pattern};
+		use super::{Matcher, MatcherIO, WalkEntry, fnmatch::Pattern};
 
 		/// This matcher makes a comparison of the name against a shell wildcard
-		/// pattern. See `glob::Pattern` for details on the exact syntax.
+		/// pattern. See `fnmatch::Pattern` for details on the exact syntax.
 		pub struct NameMatcher {
 			pattern: Pattern,
 		}
@@ -1869,10 +1791,10 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use super::{Matcher, MatcherIO, WalkEntry, glob::Pattern};
+		use super::{Matcher, MatcherIO, WalkEntry, fnmatch::Pattern};
 
 		/// This matcher makes a comparison of the path against a shell wildcard
-		/// pattern. See `glob::Pattern` for details on the exact syntax.
+		/// pattern. See `fnmatch::Pattern` for details on the exact syntax.
 		pub struct PathMatcher {
 			pattern: Pattern,
 		}
@@ -1904,10 +1826,9 @@ pub mod matchers {
 
 		use std::{error::Error, io::Write};
 
-		#[cfg(unix)]
-		use uucore::mode::{parse_numeric, parse_symbolic};
-
 		use super::{Matcher, MatcherIO, WalkEntry};
+		#[cfg(unix)]
+		use crate::support::mode::{parse_numeric, parse_symbolic};
 
 		#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 		#[cfg(unix)]
@@ -2544,8 +2465,8 @@ pub mod matchers {
 				#[cfg(unix)]
 				FormatDirective::Filesystem => {
 					let dev_id = meta()?.dev().to_string();
-					let fs_list =
-						uucore::fsext::read_fs_list().expect("Could not find the filesystem info");
+					let fs_list = crate::support::mounts::read_fs_list()
+						.expect("Could not find the filesystem info");
 					fs_list
 						.into_iter()
 						.find(|fs| fs.dev_id == dev_id)
@@ -2559,7 +2480,7 @@ pub mod matchers {
 				FormatDirective::Group { as_name } => {
 					let gid = meta()?.gid();
 					if *as_name {
-						uucore::entries::gid2grp(gid).unwrap_or_else(|_| gid.to_string())
+						crate::support::entries::gid2grp(gid).unwrap_or_else(|_| gid.to_string())
 					} else {
 						gid.to_string()
 					}
@@ -2591,7 +2512,7 @@ pub mod matchers {
 					.to_string_lossy(),
 
 				FormatDirective::Permissions(PermissionsFormat::Symbolic) => {
-					uucore::fs::display_permissions(meta()?, true).into()
+					crate::support::fsutil::display_permissions(meta()?, true).into()
 				},
 				#[cfg(not(unix))]
 				FormatDirective::Permissions(PermissionsFormat::Octal) => "777".into(),
@@ -2657,7 +2578,7 @@ pub mod matchers {
 				FormatDirective::User { as_name } => {
 					let uid = meta()?.uid();
 					if *as_name {
-						uucore::entries::uid2usr(uid).unwrap_or_else(|_| uid.to_string())
+						crate::support::entries::uid2usr(uid).unwrap_or_else(|_| uid.to_string())
 					} else {
 						uid.to_string()
 					}
@@ -2896,10 +2817,8 @@ pub mod matchers {
 
 		use std::{error::Error, path::Path};
 
-		use uucore::fs::FileInformation;
-
 		use super::{Follow, Matcher, MatcherIO, WalkEntry, WalkError};
-		use crate::host::Host;
+		use crate::{host::Host, support::fsutil::FileInformation};
 
 		pub struct SameFileMatcher {
 			info: FileInformation,

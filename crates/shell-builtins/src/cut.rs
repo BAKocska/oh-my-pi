@@ -11,9 +11,15 @@ use std::{
 use bstr::io::BufReadExt;
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{display::Quotable, line_ending::LineEnding, ranges::Range};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, os_bytes, util},
+	support::{
+		line_ending::LineEnding,
+		quote::Quotable,
+		ranges::{Range, complement},
+	},
+};
 
 /// Parsed `cut` invocation.
 pub(crate) struct Cut {
@@ -360,9 +366,9 @@ impl Default for Delimiter<'_> {
 	}
 }
 
-fn list_to_ranges(list: &str, complement: bool) -> Result<Vec<Range>, String> {
-	if complement {
-		Range::from_list(list).map(|r| uucore::ranges::complement(&r))
+fn list_to_ranges(list: &str, should_complement: bool) -> Result<Vec<Range>, String> {
+	if should_complement {
+		Range::from_list(list).map(|r| complement(&r))
 	} else {
 		Range::from_list(list)
 	}

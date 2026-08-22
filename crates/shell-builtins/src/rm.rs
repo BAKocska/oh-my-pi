@@ -21,12 +21,15 @@ use clap::{
 	parser::ValueSource,
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
+use omp_core::NormalizePath;
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use parking_lot::Mutex;
 use thiserror::Error;
-use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, os_bytes, util},
+	support::{clap_ext::ShortcutValueParser, quote::Quotable},
+};
 
 macro_rules! show_error {
 	($host:expr, $($args:tt)+) => {{
@@ -71,15 +74,15 @@ mod platform {
 	use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt, path::Path};
 
 	use indicatif::ProgressBar;
-	use uucore::{
-		display::Quotable,
-		safe_traversal::{DirFd, SymlinkBehavior},
-	};
 
 	use super::{
 		Host, InteractiveMode, Options, is_dir_empty, is_readable_metadata, prompt_descend,
 		remove_file, show_permission_denied_error, show_removal_error, verbose_removed_directory,
 		verbose_removed_file,
+	};
+	use crate::support::{
+		quote::Quotable,
+		safe_traversal::{DirFd, SymlinkBehavior},
 	};
 
 	#[inline]
@@ -563,15 +566,14 @@ enum RmError {
 /// Helper function to print verbose message for removed file
 fn verbose_removed_file(host: &mut Host, path: &Path, options: &Options) {
 	if options.verbose {
-		let _ = writeln!(host.stdout, "removed {}", uucore::fs::normalize_path(path).quote());
+		let _ = writeln!(host.stdout, "removed {}", path.normalize().quote());
 	}
 }
 
 /// Helper function to print verbose message for removed directory
 fn verbose_removed_directory(host: &mut Host, path: &Path, options: &Options) {
 	if options.verbose {
-		let _ =
-			writeln!(host.stdout, "removed directory {}", uucore::fs::normalize_path(path).quote());
+		let _ = writeln!(host.stdout, "removed directory {}", path.normalize().quote());
 	}
 }
 
@@ -1112,7 +1114,7 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 		// Check if the path (potentially with trailing slash) resolves to root
 		// This needs to happen before symlink_metadata to catch cases like "rootlink/"
 		// where rootlink is a symlink to root.
-		if uucore::fs::path_ends_with_terminator(file)
+		if crate::support::fsutil::path_ends_with_terminator(file)
 			&& options.recursive
 			&& options.preserve_root
 			&& is_root_path(host, file)

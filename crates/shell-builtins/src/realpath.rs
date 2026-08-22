@@ -13,13 +13,15 @@ use clap::{
 	builder::{TypedValueParser, ValueParserFactory},
 };
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{
-	display::Quotable,
-	fs::{MissingHandling, ResolveMode, canonicalize, make_path_relative_to},
-	line_ending::LineEnding,
-};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, os_bytes, util},
+	support::{
+		fsutil::{MissingHandling, ResolveMode, canonicalize, make_path_relative_to},
+		line_ending::LineEnding,
+		quote::Quotable,
+	},
+};
 
 const OPT_QUIET: &str = "quiet";
 const OPT_STRIP: &str = "strip";

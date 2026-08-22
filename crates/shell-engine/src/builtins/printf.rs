@@ -1,9 +1,9 @@
-use std::{ffi::OsString, io::Write, ops::ControlFlow};
+use std::io::Write;
 
 use clap::Parser;
-use uucore::format;
 
-use crate::{Error, ErrorKind, ExecutionResult, builtins, escape, expansion};
+use super::printf_engine;
+use crate::{ErrorKind, ExecutionResult, builtins, escape, expansion};
 
 /// Format a string.
 #[derive(Parser)]
@@ -57,8 +57,11 @@ fn format(format_and_args: &[String], writer: impl Write) -> Result<(), crate::E
 		// It has hard-coded expectation of backslash-style escaping instead of quoting.
 		[fmt, arg] if fmt == "%q" => format_special_case_for_percent_q(None, arg, writer),
 		[fmt, arg] if fmt == "~%q" => format_special_case_for_percent_q(Some("~"), arg, writer),
-		// Handle format string with arguments using uucore
-		[fmt, args @ ..] => format_via_uucore(fmt, args.iter(), writer),
+		// Handle a format string with arguments using the first-party engine.
+		[fmt, args @ ..] => printf_engine::format(fmt, args, writer).map_err(|error| match error {
+			printf_engine::PrintfError::Io(error) => error.into(),
+			error => ErrorKind::PrintfInvalidUsage(format!("printf formatting error: {error}")).into(),
+		}),
 		// Handle case with no format string (we shouldn't be able to get here since clap will
 		// fail parsing when the format string is missing)
 		[] => Err(ErrorKind::PrintfInvalidUsage("missing operand".into()).into()),
@@ -81,70 +84,6 @@ fn format_special_case_for_percent_q(
 	Ok(())
 }
 
-fn format_via_uucore(
-	format_string: &str,
-	args: impl Iterator<Item = impl Into<OsString>>,
-	mut writer: impl Write,
-) -> Result<(), crate::Error> {
-	// Convert string arguments to FormatArgument::Unparsed
-	let format_args: Vec<_> = args
-		.map(|s| format::FormatArgument::Unparsed(s.into()))
-		.collect();
-
-	// Parse format string once.
-	let format_items = parse_format_string(format_string)?;
-
-	// Wrap the format arguments.
-	let mut format_args_wrapper = format::FormatArguments::new(&format_args);
-
-	// Keep going until we've exhausted all format arguments. Also make sure to run
-	// at least once even if there's no format arguments.
-	while format_args.is_empty() || !format_args_wrapper.is_exhausted() {
-		// Process all format items, in order. We'll bail when we're told to stop.
-		for item in &format_items {
-			let control_flow =
-				item
-					.write(&mut writer, &mut format_args_wrapper)
-					.map_err(|e| match e {
-						// Propagate I/O errors directly so they can be handled appropriately
-						format::FormatError::IoError(io_err) => Error::from(io_err),
-						// Wrap other format errors
-						other => Error::from(ErrorKind::PrintfInvalidUsage(std::format!(
-							"printf formatting error: {other}"
-						))),
-					})?;
-
-			if control_flow == ControlFlow::Break(()) {
-				break;
-			}
-		}
-
-		// Start next batch if not exhausted
-		if !format_args_wrapper.is_exhausted() {
-			format_args_wrapper.start_next_batch();
-		}
-
-		if format_args.is_empty() {
-			break;
-		}
-	}
-
-	Ok(())
-}
-
-fn parse_format_string(
-	format_string: &str,
-) -> Result<Vec<format::FormatItem<format::EscapedChar>>, crate::Error> {
-	let format_items: Result<Vec<_>, _> =
-		format::parse_spec_and_escape(format_string.as_bytes()).collect();
-
-	// Observe any errors we encountered along the way.
-	let format_items = format_items
-		.map_err(|e| ErrorKind::PrintfInvalidUsage(format!("printf parsing error: {e}")))?;
-
-	Ok(format_items)
-}
-
 #[cfg(test)]
 #[expect(
 	clippy::panic_in_result_fn,
@@ -154,37 +93,33 @@ mod tests {
 	use super::*;
 	use crate::TestResult as Result;
 
-	fn sprintf_via_uucore(
-		format_string: &str,
-		args: impl Iterator<Item = impl Into<OsString>>,
-	) -> Result<String> {
+	fn sprintf(format_string: &str, args: &[&str]) -> Result<String> {
+		let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
 		let mut result = vec![];
-		format_via_uucore(format_string, args, &mut result)?;
+		printf_engine::format(format_string, &args, &mut result)?;
 
 		Ok(String::from_utf8(result)?)
 	}
 
 	#[test]
 	fn test_basic_sprintf() -> Result<()> {
-		assert_eq!(sprintf_via_uucore("%s", std::iter::once(&"xyz"))?, "xyz");
-		assert_eq!(sprintf_via_uucore(r"%d\n", std::iter::once(&"1"))?, "1\n");
+		assert_eq!(sprintf("%s", &["xyz"])?, "xyz");
+		assert_eq!(sprintf(r"%d\n", &["1"])?, "1\n");
 
 		Ok(())
 	}
 
 	#[test]
 	fn test_sprintf_without_args() -> Result<()> {
-		let empty: [&str; 0] = [];
-
-		assert_eq!(sprintf_via_uucore("xyz", empty.iter())?, "xyz");
-		assert_eq!(sprintf_via_uucore("%s|", empty.iter())?, "|");
+		assert_eq!(sprintf("xyz", &[])?, "xyz");
+		assert_eq!(sprintf("%s|", &[])?, "|");
 
 		Ok(())
 	}
 
 	#[test]
 	fn test_sprintf_with_cycles() -> Result<()> {
-		assert_eq!(sprintf_via_uucore("%s|", ["x", "y"].iter())?, "x|y|");
+		assert_eq!(sprintf("%s|", &["x", "y"])?, "x|y|");
 
 		Ok(())
 	}

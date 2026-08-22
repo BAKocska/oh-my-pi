@@ -21,21 +21,21 @@ use clap::{
 	Arg, ArgAction, ArgMatches, Command,
 	builder::{NonEmptyStringValueParser, PossibleValue, ValueParser},
 };
+#[cfg(unix)]
+use libc::{S_IXGRP, S_IXOTH, S_IXUSR};
 use lscolors::Colorable;
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 #[cfg(unix)]
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use thiserror::Error;
-#[cfg(unix)]
-use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
-use uucore::{
-	display::Quotable, fs::FileInformation, fsext::metadata_get_time,
-	parser::shortcut_value_parser::ShortcutValueParser, version_cmp::version_cmp,
-};
 
-use crate::host::{
-	Host, StreamWriter, Utility, format_usage, matches_parser, os_bytes_lossy, util,
+use crate::{
+	host::{Host, StreamWriter, Utility, format_usage, matches_parser, os_bytes_lossy, util},
+	support::{
+		clap_ext::ShortcutValueParser, fsutil::FileInformation, mounts::metadata_get_time,
+		quote::Quotable, version_cmp::version_cmp,
+	},
 };
 
 mod colors {
@@ -571,7 +571,7 @@ mod colors {
 			let has_capabilities = style_manager
 				.colors
 				.has_explicit_style_for(Indicator::Capabilities)
-				&& uucore::fsxattr::has_security_cap_acl(&path.p_buf);
+				&& crate::support::xattr::has_security_cap_acl(&path.p_buf);
 
 			// If the file has capabilities, use a specific style for `ca` (capabilities)
 			if has_capabilities {
@@ -890,20 +890,41 @@ mod config {
 		rc::Rc,
 	};
 
-	use glob::Pattern;
 	use jiff::tz::TimeZone;
 	use lscolors::LsColors;
-	use uucore::{
-		display::Quotable,
-		format::human::SizeFormat,
-		fsext::MetadataTimeField,
+	use omp_walker::glob as walker_patterns;
+	use walker_patterns::{CompiledPattern, GlobError};
+
+	use crate::support::{
+		human::SizeFormat,
 		line_ending::LineEnding,
-		parser::{parse_glob, parse_size::parse_size_non_zero_u64},
-		quoting_style::QuotingStyle,
-		time::format,
+		mounts::MetadataTimeField,
+		parse::parse_size_non_zero_u64,
+		quote::{Quotable, QuotingStyle},
+		sys::time::format,
 	};
 
 	const DEFAULT_TAB_SIZE: usize = 8;
+
+	fn compile_ignore_pattern(pattern: &str) -> Result<CompiledPattern, GlobError> {
+		let mut characters: Vec<char> = pattern.chars().collect();
+		let mut index = 0;
+		while index + 3 < characters.len() {
+			if characters[index] == '[' && characters[index + 1] == '^' {
+				let Some(closing) = characters[index + 3..]
+					.iter()
+					.position(|character| *character == ']')
+				else {
+					break;
+				};
+				characters[index + 1] = '!';
+				index += closing + 4;
+			} else {
+				index += 1;
+			}
+		}
+		CompiledPattern::new(&characters.into_iter().collect::<String>())
+	}
 
 	use super::{
 		Host, LsError, LsRuntime,
@@ -1038,7 +1059,7 @@ mod config {
 		pub(crate) recursive: bool,
 		pub(crate) reverse: bool,
 		pub(crate) dereference: Dereference,
-		pub(crate) ignore_patterns: Vec<Pattern>,
+		pub(crate) ignore_patterns: Vec<CompiledPattern>,
 		pub(crate) size_format: SizeFormat,
 		pub(crate) directory: bool,
 		pub(crate) time: MetadataTimeField,
@@ -1233,8 +1254,39 @@ mod config {
 		let colorterm = host.var("COLORTERM").map(OsString::from);
 
 		// Search function in the TERM struct to manage the wildcards
+		const COLOR_TERMS: &[&str] = &[
+			"Eterm",
+			"alacritty*",
+			"ansi",
+			"*color*",
+			"con[0-9]*x[0-9]*",
+			"cons25",
+			"console",
+			"cygwin",
+			"*direct*",
+			"dtterm",
+			"foot",
+			"gnome",
+			"hurd",
+			"jfbterm",
+			"konsole",
+			"kterm",
+			"linux",
+			"linux-c",
+			"mlterm",
+			"putty",
+			"rxvt*",
+			"screen*",
+			"st",
+			"terminator",
+			"tmux*",
+			"vt100",
+			"wezterm*",
+			"xterm*",
+		];
+
 		let term_matches = |term: &OsStr| -> bool {
-			uucore::colors::TERMS.iter().any(|&pattern| {
+			COLOR_TERMS.iter().any(|&pattern| {
 				term == pattern
 					|| (pattern.ends_with('*')
 						&& term
@@ -1509,20 +1561,11 @@ mod config {
 
 		let calculate_term_size = || {
 			#[cfg(unix)]
+			if let Ok(fd) = host.stdout.try_borrow_as_fd()
+				&& let Ok(size) = rustix::termios::tcgetwinsize(fd)
+				&& size.ws_col > 0
 			{
-				use std::os::fd::AsRawFd;
-				if let Ok(fd) = host.stdout.try_borrow_as_fd() {
-					let mut size =
-						uucore::libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-					// SAFETY: `size` is valid for writes and `fd` remains borrowed
-					// for the duration of the ioctl.
-					if unsafe {
-						uucore::libc::ioctl(fd.as_raw_fd(), uucore::libc::TIOCGWINSZ, &mut size)
-					} == 0 && size.ws_col > 0
-					{
-						return size.ws_col;
-					}
-				}
+				return size.ws_col;
 			}
 			DEFAULT_TERM_WIDTH
 		};
@@ -1723,11 +1766,11 @@ mod config {
 				Default::default()
 			};
 
-			let mut ignore_patterns: Vec<Pattern> = Vec::new();
+			let mut ignore_patterns = Vec::new();
 
 			if options.get_flag(options::IGNORE_BACKUPS) {
-				ignore_patterns.push(Pattern::new("*~").unwrap());
-				ignore_patterns.push(Pattern::new(".*~").unwrap());
+				ignore_patterns.push(CompiledPattern::new("*~").unwrap());
+				ignore_patterns.push(CompiledPattern::new(".*~").unwrap());
 			}
 
 			for pattern in options
@@ -1735,7 +1778,7 @@ mod config {
 				.into_iter()
 				.flatten()
 			{
-				if let Ok(p) = parse_glob::from_str(pattern) {
+				if let Ok(p) = compile_ignore_pattern(pattern) {
 					ignore_patterns.push(p);
 				} else {
 					let _ = writeln!(
@@ -1752,7 +1795,7 @@ mod config {
 					.into_iter()
 					.flatten()
 				{
-					if let Ok(p) = parse_glob::from_str(pattern) {
+					if let Ok(p) = compile_ignore_pattern(pattern) {
 						ignore_patterns.push(p);
 					} else {
 						let _ = writeln!(
@@ -1965,7 +2008,7 @@ mod config {
 					// See GNU documentation, set format to "locale" if LC_TIME="POSIX",
 					// else just strip the prefix and continue (even "posix+FORMAT" is
 					// supported).
-					// TODO: This needs to be moved to uucore and handled by icu?
+					// TODO: Handle this through locale-aware time formatting.
 					if host.var("LC_TIME") == Some("POSIX") || host.var("LC_ALL") == Some("POSIX") {
 						return ok(LOCALE_FORMAT);
 					}
@@ -2345,7 +2388,6 @@ mod display {
 		time::SystemTime,
 	};
 
-	use glob::MatchOptions;
 	use jiff::{
 		Zoned,
 		fmt::{
@@ -2353,12 +2395,6 @@ mod display {
 			strtime::{BrokenDownTime, Config as TimeFormatConfig},
 		},
 	};
-	#[cfg(unix)]
-	use rustc_hash::FxHashMap;
-	#[cfg(unix)]
-	use uucore::entries;
-	#[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
-	use uucore::fsxattr::has_acl;
 	#[cfg(any(
 		target_os = "linux",
 		target_os = "macos",
@@ -2371,14 +2407,9 @@ mod display {
 		target_os = "illumos",
 		target_os = "solaris"
 	))]
-	use uucore::libc::{dev_t, major, minor};
-	use uucore::{
-		format::human::human_readable,
-		fs::display_permissions,
-		fsext::metadata_get_time,
-		quoting_style::{QuotingStyle, locale_aware_escape_dir_name, locale_aware_escape_name},
-		time::system_time_to_sec,
-	};
+	use libc::dev_t;
+	#[cfg(unix)]
+	use rustc_hash::FxHashMap;
 
 	use super::{
 		Config, ListState, LsError, PathData,
@@ -2387,7 +2418,20 @@ mod display {
 		dired::{self, DiredOutput},
 		get_block_size,
 	};
-	use crate::host::os_bytes_lossy;
+	#[cfg(unix)]
+	use crate::support::entries;
+	#[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
+	use crate::support::xattr::has_acl;
+	use crate::{
+		host::os_bytes_lossy,
+		support::{
+			fsutil::{display_permissions, major, minor},
+			human::human_readable,
+			mounts::metadata_get_time,
+			quote::{QuotingStyle, locale_aware_escape_dir_name, locale_aware_escape_name},
+			sys::time::system_time_to_sec,
+		},
+	};
 
 	// Fields that can be removed or added to the long format
 	pub(crate) struct LongFormat {
@@ -2544,14 +2588,8 @@ mod display {
 			return false;
 		}
 
-		// check if it is among ignore_patterns
-		let options = MatchOptions {
-			// setting require_literal_leading_dot to match behavior in GNU ls
-			require_literal_leading_dot: true,
-			require_literal_separator:   false,
-			case_sensitive:              true,
-		};
-
+		// Check whether the basename is ignored. GNU fnmatch requires a literal
+		// leading dot: a wildcard pattern cannot make a dotfile visible here.
 		let file_name = entry.file_name();
 		// If the decoding fails, still match best we can
 		// FIXME: use OsStrings or Paths once we have a glob crate that supports it:
@@ -2564,10 +2602,10 @@ mod display {
 			None => file_name.to_string_lossy(),
 		};
 
-		!config
-			.ignore_patterns
-			.iter()
-			.any(|p| p.matches_with(&file_name, options))
+		!config.ignore_patterns.iter().any(|pattern| {
+			(!file_name.starts_with('.') || pattern.pattern().starts_with('.'))
+				&& pattern.matches(&file_name)
+		})
 	}
 
 	fn display_dir_entry_size(
@@ -5356,7 +5394,7 @@ fn get_block_size(md: &Metadata, config: &Config) -> u64 {
 	*/
 	#[cfg(unix)]
 	{
-		use uucore::format::human::SizeFormat;
+		use crate::support::human::SizeFormat;
 
 		let raw_blocks = if md.file_type().is_char_device() || md.file_type().is_block_device() {
 			0u64
@@ -5459,6 +5497,35 @@ mod integration_tests {
 
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "visible-name\n");
+	}
+
+	#[test]
+	fn ignore_patterns_require_a_literal_leading_dot() {
+		let dir = tempfile::tempdir().unwrap();
+		for name in [".dot~", "plain~", "keep"] {
+			File::create(dir.path().join(name)).unwrap();
+		}
+
+		let (code, capture) = run_util::<Ls>(&["-a", "-1", "--ignore=*~"], "", dir.path());
+		assert_eq!(code, 0);
+		let output = capture.out();
+		assert!(output.lines().any(|line| line == ".dot~"));
+		assert!(!output.lines().any(|line| line == "plain~"));
+
+		let (code, capture) = run_util::<Ls>(&["-a", "-1", "--ignore=.*~"], "", dir.path());
+		assert_eq!(code, 0);
+		assert!(!capture.out().lines().any(|line| line == ".dot~"));
+	}
+
+	#[test]
+	fn ignore_patterns_accept_gnu_caret_negation() {
+		let dir = tempfile::tempdir().unwrap();
+		File::create(dir.path().join("a")).unwrap();
+		File::create(dir.path().join("b")).unwrap();
+
+		let (code, capture) = run_util::<Ls>(&["-1", "--ignore=[^a]"], "", dir.path());
+		assert_eq!(code, 0);
+		assert_eq!(capture.out(), "a\n");
 	}
 
 	#[test]

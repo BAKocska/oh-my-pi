@@ -4,11 +4,11 @@
 
 use clap::{ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::encoding::Format;
 
 use crate::{
 	base32::{base_app, run_base},
 	host::{Host, Utility, matches_parser, util},
+	support::basenc::Codec,
 };
 
 const ABOUT: &str = "encode/decode data and print to standard output\nWith no FILE, or when FILE \
@@ -29,7 +29,7 @@ impl Utility for Base64 {
 	const NAME: &'static str = "base64";
 
 	fn run(self, host: &mut Host) -> i32 {
-		run_base(&self.matches, Format::Base64, host)
+		run_base(&self.matches, Codec::Base64, host)
 	}
 }
 

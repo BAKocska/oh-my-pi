@@ -7,20 +7,16 @@ mod args {
 	use std::{ffi::OsString, io::Write, time::Duration};
 
 	use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
-	use uucore::{
-		display::Quotable,
-		parser::{
-			parse_signed_num::{SignPrefix, parse_signed_num_max},
-			parse_size::ParseSizeError,
-			parse_time,
-			shortcut_value_parser::ShortcutValueParser,
-		},
-	};
 
 	#[cfg(test)]
 	use crate::tail::parse;
 	use crate::{
 		host::{Host, format_usage},
+		support::{
+			clap_ext::ShortcutValueParser,
+			parse::{ParseSizeError, SignPrefix, parse_signed_num_max, parse_time},
+			quote::Quotable,
+		},
 		tail::{TailError, TailResult, paths::Input, platform},
 	};
 
@@ -1544,12 +1540,12 @@ mod follow {
 
 		use notify::{RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 		use omp_shell_engine::openfiles::OpenFile;
-		use uucore::display::Quotable;
-		#[cfg(target_os = "linux")]
-		use uucore::signals::ensure_stdout_not_broken;
 
+		#[cfg(target_os = "linux")]
+		use crate::support::sys::signals::ensure_stdout_not_broken;
 		use crate::{
 			host::{Host, StreamWriter},
+			support::quote::Quotable,
 			tail::{
 				TailError, TailResult,
 				args::{FollowMode, Settings},
@@ -2820,9 +2816,11 @@ use follow::Observer;
 use memchr::{memchr_iter, memrchr_iter};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use paths::{FileExtTail, HeaderPrinter, Input, InputKind};
-use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, matches_parser, util};
+use crate::{
+	host::{Host, Utility, matches_parser, util},
+	support::quote::Quotable,
+};
 
 const SIGPIPE_EXIT_CODE: i32 = 141;
 
@@ -3275,7 +3273,8 @@ fn tail_file(
 		match open_result {
 			Ok(mut file) => {
 				let st = file.metadata()?;
-				let blksize_limit = uucore::fs::sane_blksize::sane_blksize_from_metadata(&st);
+				let blksize_limit =
+					crate::support::fsutil::sane_blksize::sane_blksize_from_metadata(&st);
 				header_printer.print_input(input, &mut observer.stdout);
 				let mut reader;
 				if !settings.presume_input_pipe

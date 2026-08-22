@@ -11,13 +11,15 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, parser::ValuesRef};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-#[cfg(all(unix, target_os = "linux"))]
-use uucore::fsxattr;
-#[cfg(not(windows))]
-use uucore::mode;
-use uucore::{display::Quotable, fs};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+#[cfg(not(windows))]
+use crate::support::mode;
+#[cfg(all(unix, target_os = "linux"))]
+use crate::support::xattr as fsxattr;
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{fsutil as fs, quote::Quotable},
+};
 
 const DEFAULT_PERM: u32 = 0o777;
 

@@ -18,15 +18,18 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use thiserror::Error;
-use uucore::{
-	backup_control::{self, BackupMode},
-	display::Quotable,
-	fs::{
-		MissingHandling, ResolveMode, canonicalize, make_path_relative_to, paths_refer_to_same_file,
+
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{
+		backup::{self as backup_control, BackupMode},
+		fsutil::{
+			MissingHandling, ResolveMode, canonicalize, make_path_relative_to,
+			paths_refer_to_same_file,
+		},
+		quote::Quotable,
 	},
 };
-
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
 
 struct Settings {
 	overwrite:      OverwriteMode,

@@ -4,11 +4,11 @@
 
 use clap::ArgMatches;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::checksum::{AlgoKind, BlakeLength, parse_blake_length};
 
 use crate::{
 	cksum,
 	host::{Host, Utility, matches_parser, util},
+	support::checksum::{AlgoKind, BlakeLength, parse_blake_length},
 };
 
 /// Parsed `b2sum` invocation.
@@ -23,10 +23,12 @@ impl Utility for B2sum {
 	const USAGE_ERROR: u8 = 2;
 
 	fn run(self, host: &mut Host) -> i32 {
+		let algo =
+			AlgoKind::from_bin_name(Self::NAME).expect("b2sum is a supported checksum utility");
 		let length = self
 			.matches
 			.get_one::<String>("length")
-			.map(|value| parse_blake_length(AlgoKind::Blake2b, BlakeLength::String(value)))
+			.map(|value| parse_blake_length(algo, BlakeLength::String(value)))
 			.transpose();
 		let length = match length {
 			Ok(length) => length,
@@ -35,7 +37,7 @@ impl Utility for B2sum {
 				return 1;
 			},
 		};
-		cksum::run(host, AlgoKind::Blake2b, self.matches, length)
+		cksum::run(host, algo, self.matches, length)
 	}
 }
 

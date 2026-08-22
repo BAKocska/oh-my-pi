@@ -32,6 +32,8 @@ mod mapfile;
 mod popd;
 #[cfg(any(unix, windows))]
 mod printf;
+#[cfg(any(unix, windows))]
+mod printf_engine;
 mod pushd;
 mod pwd;
 mod read;

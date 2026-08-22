@@ -28,11 +28,11 @@ use rustix::fs::Timestamps;
 #[cfg(unix)]
 use rustix::fs::futimens;
 use thiserror::Error as ThisError;
-#[cfg(target_os = "linux")]
-use uucore::libc;
-use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::{clap_ext::ShortcutValueParser, quote::Quotable},
+};
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct FileTime {

@@ -12,17 +12,535 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::{
-	extendedbigdecimal::ExtendedBigDecimal,
-	fast_inc::fast_inc,
-	format::{Format, num_format, num_format::FloatVariant},
+
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::num::{ExtendedBigDecimal, fast_inc},
 };
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+mod seq_format {
+	use std::io::{self, Write};
+
+	use bigdecimal::{BigDecimal, num_bigint::ToBigInt};
+	use num_traits::{Signed, Zero};
+	use thiserror::Error;
+
+	use crate::support::num::ExtendedBigDecimal;
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+	pub(super) enum FloatVariant {
+		Decimal,
+		Scientific,
+		Shortest,
+		Hexadecimal,
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+	enum Case {
+		Lower,
+		Upper,
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+	pub(super) enum NumberAlignment {
+		Left,
+		RightSpace,
+		RightZero,
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	pub(super) struct FloatFormat {
+		pub(super) variant:   FloatVariant,
+		pub(super) width:     usize,
+		pub(super) alignment: NumberAlignment,
+		pub(super) precision: Option<usize>,
+		case:                 Case,
+		force_decimal:        bool,
+		positive_sign:        Option<u8>,
+	}
+
+	impl Default for FloatFormat {
+		fn default() -> Self {
+			Self {
+				variant:       FloatVariant::Decimal,
+				width:         0,
+				alignment:     NumberAlignment::Left,
+				precision:     None,
+				case:          Case::Lower,
+				force_decimal: false,
+				positive_sign: None,
+			}
+		}
+	}
+
+	#[derive(Debug, Error)]
+	pub(super) enum SeqFormatError {
+		#[error("format has no % directive")]
+		NoDirective,
+		#[error("format has too many % directives")]
+		TooManyDirectives,
+		#[error("invalid conversion specification")]
+		InvalidSpecification,
+		#[error("formatting width is too large")]
+		WidthTooLarge,
+	}
+
+	pub(super) struct SeqFormat {
+		prefix:    Vec<u8>,
+		suffix:    Vec<u8>,
+		formatter: FloatFormat,
+	}
+
+	impl SeqFormat {
+		pub(super) fn from_formatter(formatter: FloatFormat) -> Self {
+			Self { prefix: Vec::new(), suffix: Vec::new(), formatter }
+		}
+
+		pub(super) fn parse(source: &str) -> Result<Self, SeqFormatError> {
+			let bytes = source.as_bytes();
+			let mut prefix = Vec::new();
+			let mut suffix = Vec::new();
+			let mut formatter = None;
+			let mut index = 0;
+			while index < bytes.len() {
+				if bytes[index] != b'%' {
+					if formatter.is_some() {
+						suffix.push(bytes[index]);
+					} else {
+						prefix.push(bytes[index]);
+					}
+					index += 1;
+					continue;
+				}
+				if bytes.get(index + 1) == Some(&b'%') {
+					if formatter.is_some() {
+						suffix.push(b'%');
+					} else {
+						prefix.push(b'%');
+					}
+					index += 2;
+					continue;
+				}
+				if formatter.is_some() {
+					return Err(SeqFormatError::TooManyDirectives);
+				}
+
+				index += 1;
+				let mut left = false;
+				let mut plus = false;
+				let mut space = false;
+				let mut alternate = false;
+				let mut zero = false;
+				while let Some(flag) = bytes.get(index) {
+					match flag {
+						b'-' => left = true,
+						b'+' => plus = true,
+						b' ' => space = true,
+						b'#' => alternate = true,
+						b'0' => zero = true,
+						_ => break,
+					}
+					index += 1;
+				}
+
+				let width_start = index;
+				while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+					index += 1;
+				}
+				let width = if index == width_start {
+					0
+				} else {
+					source[width_start..index]
+						.parse()
+						.map_err(|_| SeqFormatError::WidthTooLarge)?
+				};
+				if width > 1_000_000 {
+					return Err(SeqFormatError::WidthTooLarge);
+				}
+
+				let precision = if bytes.get(index) == Some(&b'.') {
+					index += 1;
+					let precision_start = index;
+					while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+						index += 1;
+					}
+					Some(if index == precision_start {
+						0
+					} else {
+						source[precision_start..index]
+							.parse()
+							.map_err(|_| SeqFormatError::InvalidSpecification)?
+					})
+				} else {
+					None
+				};
+
+				if bytes.get(index) == Some(&b'L') {
+					index += 1;
+				}
+				let conversion = *bytes
+					.get(index)
+					.ok_or(SeqFormatError::InvalidSpecification)?;
+				index += 1;
+				let (variant, case) = match conversion {
+					b'f' => (FloatVariant::Decimal, Case::Lower),
+					b'F' => (FloatVariant::Decimal, Case::Upper),
+					b'e' => (FloatVariant::Scientific, Case::Lower),
+					b'E' => (FloatVariant::Scientific, Case::Upper),
+					b'g' => (FloatVariant::Shortest, Case::Lower),
+					b'G' => (FloatVariant::Shortest, Case::Upper),
+					b'a' => (FloatVariant::Hexadecimal, Case::Lower),
+					b'A' => (FloatVariant::Hexadecimal, Case::Upper),
+					_ => return Err(SeqFormatError::InvalidSpecification),
+				};
+				formatter = Some(FloatFormat {
+					variant,
+					width,
+					alignment: if left {
+						NumberAlignment::Left
+					} else if zero {
+						NumberAlignment::RightZero
+					} else {
+						NumberAlignment::RightSpace
+					},
+					precision,
+					case,
+					force_decimal: alternate,
+					positive_sign: plus.then_some(b'+').or_else(|| space.then_some(b' ')),
+				});
+			}
+
+			Ok(Self { prefix, suffix, formatter: formatter.ok_or(SeqFormatError::NoDirective)? })
+		}
+
+		pub(super) fn fmt(
+			&self,
+			mut writer: impl Write,
+			value: &ExtendedBigDecimal,
+		) -> io::Result<()> {
+			writer.write_all(&self.prefix)?;
+			self.formatter.fmt(&mut writer, value)?;
+			writer.write_all(&self.suffix)
+		}
+	}
+
+	impl FloatFormat {
+		pub(super) fn decimal(width: usize, precision: usize) -> Self {
+			Self {
+				variant: FloatVariant::Decimal,
+				width,
+				alignment: NumberAlignment::RightZero,
+				precision: Some(precision),
+				..Self::default()
+			}
+		}
+
+		pub(super) fn shortest() -> Self {
+			Self { variant: FloatVariant::Shortest, ..Self::default() }
+		}
+
+		fn fmt(&self, writer: impl Write, value: &ExtendedBigDecimal) -> io::Result<()> {
+			let (absolute, negative) = match value {
+				ExtendedBigDecimal::BigDecimal(decimal) => (Some(decimal.abs()), decimal.is_negative()),
+				ExtendedBigDecimal::MinusZero => (Some(BigDecimal::zero()), true),
+				ExtendedBigDecimal::Infinity => (None, false),
+				ExtendedBigDecimal::MinusInfinity => (None, true),
+				ExtendedBigDecimal::Nan => (None, false),
+				ExtendedBigDecimal::MinusNan => (None, true),
+			};
+			let finite = absolute.is_some();
+			let text = if let Some(decimal) = absolute {
+				match self.variant {
+					FloatVariant::Decimal => {
+						format_decimal(&decimal, self.precision, self.force_decimal)
+					},
+					FloatVariant::Scientific => {
+						format_scientific(&decimal, self.precision, self.case, self.force_decimal)
+					},
+					FloatVariant::Shortest => {
+						format_shortest(&decimal, self.precision, self.case, self.force_decimal)
+					},
+					FloatVariant::Hexadecimal => {
+						format_hexadecimal(&decimal, self.precision, self.case, self.force_decimal)
+					},
+				}
+			} else {
+				let mut text =
+					if matches!(value, ExtendedBigDecimal::Infinity | ExtendedBigDecimal::MinusInfinity)
+					{
+						"inf".to_owned()
+					} else {
+						"nan".to_owned()
+					};
+				if self.case == Case::Upper {
+					text.make_ascii_uppercase();
+				}
+				text
+			};
+			let sign = if negative {
+				Some(b'-')
+			} else {
+				self.positive_sign
+			};
+			let alignment = if finite || self.alignment != NumberAlignment::RightZero {
+				self.alignment
+			} else {
+				NumberAlignment::RightSpace
+			};
+			write_output(writer, sign, &text, self.width, alignment)
+		}
+	}
+
+	fn format_decimal(decimal: &BigDecimal, precision: Option<usize>, force: bool) -> String {
+		let precision = precision.unwrap_or(6);
+		if precision == 0 {
+			let (integer, scale) = decimal.as_bigint_and_scale();
+			if scale == 0 && !force {
+				return integer.to_str_radix(10);
+			}
+			if force {
+				return format!("{decimal:.0}.");
+			}
+		}
+		format!("{decimal:.precision$}")
+	}
+
+	fn decimal_digits_with_precision(decimal: &BigDecimal, precision: usize) -> (String, i64) {
+		let rounded = decimal.with_prec(precision as u64);
+		let (fraction, mut scale) = rounded.as_bigint_and_exponent();
+		let mut digits = fraction.to_str_radix(10);
+		if digits.len() == precision + 1 {
+			digits.truncate(precision);
+			scale -= 1;
+		}
+		(digits, -scale + precision as i64 - 1)
+	}
+
+	fn format_scientific(
+		decimal: &BigDecimal,
+		precision: Option<usize>,
+		case: Case,
+		force: bool,
+	) -> String {
+		let precision = precision.unwrap_or(6);
+		let exponent_char = if case == Case::Lower { 'e' } else { 'E' };
+		if decimal.is_zero() {
+			return if force && precision == 0 {
+				format!("0.{exponent_char}+00")
+			} else {
+				format!("{:.precision$}{exponent_char}+00", 0.0)
+			};
+		}
+		let (digits, exponent) = decimal_digits_with_precision(decimal, precision + 1);
+		let (first, rest) = digits.split_at(1);
+		let dot = if !rest.is_empty() || (precision == 0 && force) {
+			"."
+		} else {
+			""
+		};
+		format!("{first}{dot}{rest}{exponent_char}{exponent:+03}")
+	}
+
+	fn format_shortest(
+		decimal: &BigDecimal,
+		precision: Option<usize>,
+		case: Case,
+		force: bool,
+	) -> String {
+		let precision = precision.unwrap_or(6).max(1);
+		if decimal.is_zero() {
+			return match (force, precision) {
+				(true, 1) => "0.".to_owned(),
+				(true, _) => format!("{:.*}", precision - 1, 0.0),
+				(false, _) => "0".to_owned(),
+			};
+		}
+		let (digits, exponent) = decimal_digits_with_precision(decimal, precision);
+		let mut output = String::with_capacity(precision + 8);
+		if exponent < -4 || exponent >= precision as i64 {
+			let (first, rest) = digits.split_at(1);
+			output.push_str(first);
+			output.push('.');
+			output.push_str(rest);
+			if !force {
+				trim_fraction(&mut output);
+			}
+			output.push(if case == Case::Lower { 'e' } else { 'E' });
+			output.push(if exponent < 0 { '-' } else { '+' });
+			let absolute = exponent.unsigned_abs();
+			if absolute < 10 {
+				output.push('0');
+			}
+			output.push_str(&absolute.to_string());
+		} else {
+			if exponent < 0 {
+				output.push_str("0.");
+				output.extend(std::iter::repeat_n('0', -exponent as usize - 1));
+				output.push_str(&digits);
+			} else {
+				let split = exponent as usize + 1;
+				if split < digits.len() {
+					let (whole, fraction) = digits.split_at(split);
+					output.push_str(whole);
+					output.push('.');
+					output.push_str(fraction);
+				} else {
+					output.push_str(&digits);
+					output.extend(std::iter::repeat_n('0', split - digits.len()));
+					if force {
+						output.push('.');
+					}
+				}
+			}
+			if !force {
+				trim_fraction(&mut output);
+			}
+		}
+		output
+	}
+
+	fn format_hexadecimal(
+		decimal: &BigDecimal,
+		precision: Option<usize>,
+		case: Case,
+		force: bool,
+	) -> String {
+		let max_precision = precision.unwrap_or(15);
+		let (prefix, exponent_char) = if case == Case::Lower {
+			("0x", 'p')
+		} else {
+			("0X", 'P')
+		};
+		if decimal.is_zero() {
+			return if force && precision.unwrap_or(0) == 0 {
+				format!("{prefix}0.{exponent_char}+0")
+			} else {
+				format!("{prefix}{:.*}{exponent_char}+0", precision.unwrap_or(0), 0.0)
+			};
+		}
+
+		let (fraction_10, scale) = decimal.as_bigint_and_exponent();
+		let exponent_10 = -scale;
+		let (mut fraction_2, mut exponent_2) = if exponent_10 >= 0 {
+			(fraction_10 * 5.to_bigint().unwrap().pow(exponent_10 as u32), exponent_10)
+		} else {
+			let margin = ((max_precision + 1) as i64 * 4 - fraction_10.bits() as i64).max(0)
+				+ -exponent_10 * 3
+				+ 1;
+			(
+				(fraction_10 << margin) / 5.to_bigint().unwrap().pow(-exponent_10 as u32),
+				exponent_10 - margin,
+			)
+		};
+		const BEFORE_BITS: usize = 4;
+		let wanted_bits = (BEFORE_BITS + max_precision * 4) as u64;
+		let bits = fraction_2.bits();
+		exponent_2 += bits as i64 - wanted_bits as i64;
+		if bits > wanted_bits {
+			fraction_2 >>= bits - wanted_bits - 1;
+			let round_up = fraction_2.bit(0);
+			fraction_2 >>= 1;
+			if round_up {
+				fraction_2 += 1;
+				if fraction_2.bits() > wanted_bits {
+					fraction_2 >>= 4;
+					exponent_2 += 4;
+				}
+			}
+		} else {
+			fraction_2 <<= wanted_bits - bits;
+		}
+
+		let mut digits = fraction_2.to_str_radix(16);
+		if case == Case::Upper {
+			digits.make_ascii_uppercase();
+		}
+		let (first, rest) = digits.split_at(1);
+		let mut rest = rest.to_owned();
+		if precision.is_none() {
+			while rest.ends_with('0') {
+				rest.pop();
+			}
+		}
+		let dot = if !rest.is_empty() || (precision.unwrap_or(0) == 0 && force) {
+			"."
+		} else {
+			""
+		};
+		let exponent = exponent_2 + (4 * max_precision) as i64;
+		format!("{prefix}{first}{dot}{rest}{exponent_char}{exponent:+}")
+	}
+
+	fn trim_fraction(text: &mut String) {
+		if let Some(dot) = text.find('.') {
+			while text.ends_with('0') {
+				text.pop();
+			}
+			if text.len() == dot + 1 {
+				text.pop();
+			}
+		}
+	}
+
+	fn write_output(
+		mut writer: impl Write,
+		sign: Option<u8>,
+		text: &str,
+		width: usize,
+		alignment: NumberAlignment,
+	) -> io::Result<()> {
+		let sign_len = usize::from(sign.is_some());
+		let remaining = width.saturating_sub(sign_len);
+		if width > 1_000_000 {
+			return Err(io::Error::new(io::ErrorKind::OutOfMemory, "formatting width too large"));
+		}
+		if width == 0 {
+			if let Some(sign) = sign {
+				writer.write_all(&[sign])?;
+			}
+			return writer.write_all(text.as_bytes());
+		}
+		match alignment {
+			NumberAlignment::Left => {
+				if let Some(sign) = sign {
+					writer.write_all(&[sign])?;
+				}
+				write!(writer, "{text:<remaining$}")
+			},
+			NumberAlignment::RightSpace => {
+				let total = text.len() + sign_len;
+				for _ in 0..width.saturating_sub(total) {
+					writer.write_all(b" ")?;
+				}
+				if let Some(sign) = sign {
+					writer.write_all(&[sign])?;
+				}
+				writer.write_all(text.as_bytes())
+			},
+			NumberAlignment::RightZero => {
+				if let Some(sign) = sign {
+					writer.write_all(&[sign])?;
+				}
+				let (prefix, rest) = if text.len() >= 2 && text[..2].eq_ignore_ascii_case("0x") {
+					(&text[..2], &text[2..])
+				} else {
+					("", text)
+				};
+				writer.write_all(prefix.as_bytes())?;
+				let digits_width = remaining.saturating_sub(prefix.len());
+				for _ in 0..digits_width.saturating_sub(rest.len()) {
+					writer.write_all(b"0")?;
+				}
+				writer.write_all(rest.as_bytes())
+			},
+		}
+	}
+}
 
 mod number {
 	use num_traits::Zero;
-	use uucore::extendedbigdecimal::ExtendedBigDecimal;
+
+	use crate::support::num::ExtendedBigDecimal;
 
 	/// A number with a specified number of integer and fractional digits.
 	///
@@ -74,12 +592,8 @@ mod numberparse {
 	//! [`PreciseNumber`] struct.
 	use std::str::FromStr;
 
-	use uucore::{
-		extendedbigdecimal::ExtendedBigDecimal,
-		parser::num_parser::{ExtendedParser, ExtendedParserError},
-	};
-
 	use super::number::PreciseNumber;
+	use crate::support::num::{ExtendedBigDecimal, ExtendedParser, ExtendedParserError};
 
 	/// An error returned when parsing a number fails.
 	#[derive(Debug, PartialEq, Eq)]
@@ -195,9 +709,9 @@ mod numberparse {
 	#[cfg(test)]
 	mod tests {
 		use bigdecimal::BigDecimal;
-		use uucore::extendedbigdecimal::ExtendedBigDecimal;
 
 		use super::{super::number::PreciseNumber, ParseNumberError};
+		use crate::support::num::ExtendedBigDecimal;
 
 		/// Convenience function for parsing a [`Number`] and unwrapping.
 		fn parse(s: &str) -> ExtendedBigDecimal {
@@ -423,9 +937,9 @@ mod error {
 	// strings from upstream's locales/en-US.ftl.
 
 	use thiserror::Error;
-	use uucore::display::Quotable;
 
 	use super::numberparse::ParseNumberError;
+	use crate::support::quote::Quotable;
 
 	#[derive(Debug, Error)]
 	pub enum SeqError {
@@ -460,7 +974,11 @@ mod error {
 	}
 }
 
-use self::{error::SeqError, number::PreciseNumber};
+use self::{
+	error::SeqError,
+	number::PreciseNumber,
+	seq_format::{FloatFormat, SeqFormat},
+};
 
 const OPT_SEPARATOR: &str = "separator";
 const OPT_TERMINATOR: &str = "terminator";
@@ -611,7 +1129,7 @@ fn seq_main(matches: &ArgMatches, host: &mut Host) -> Result<(), Box<dyn Error>>
 	// If a format was passed on the command line, use that.
 	// If not, use some default format based on parameters precision.
 	let (format, padding, fast_allowed) = if let Some(str) = options.format {
-		(Format::<num_format::Float, &ExtendedBigDecimal>::parse(str)?, 0, false)
+		(SeqFormat::parse(str)?, 0, false)
 	} else {
 		let precision = select_precision(&first, &increment, &last);
 
@@ -632,19 +1150,13 @@ fn seq_main(matches: &ArgMatches, host: &mut Host) -> Result<(), Box<dyn Error>>
 
 		let formatter = match precision {
 			// format with precision: decimal floats and integers
-			Some(precision) => num_format::Float {
-				variant: FloatVariant::Decimal,
-				width: padding,
-				alignment: num_format::NumberAlignment::RightZero,
-				precision: Some(precision),
-				..Default::default()
-			},
+			Some(precision) => FloatFormat::decimal(padding, precision),
 			// format without precision: hexadecimal floats
-			None => num_format::Float { variant: FloatVariant::Shortest, ..Default::default() },
+			None => FloatFormat::shortest(),
 		};
 		// Allow fast printing if precision is 0 (integer inputs), `print_seq` will do
 		// further checks.
-		(Format::from_formatter(formatter), padding, precision == Some(0))
+		(SeqFormat::from_formatter(formatter), padding, precision == Some(0))
 	};
 
 	let result = print_seq(
@@ -800,7 +1312,7 @@ fn print_seq(
 	range: RangeFloat,
 	separator: &OsStr,
 	terminator: &OsStr,
-	format: &Format<num_format::Float, &ExtendedBigDecimal>,
+	format: &SeqFormat,
 	fast_allowed: bool,
 	padding: usize, // Used by fast path only
 ) -> std::io::Result<()> {
@@ -914,6 +1426,26 @@ mod tests {
 	#[test]
 	fn custom_format_is_preserved() {
 		assert_eq!(run(&["-f", "%04.1f", "1", "2"]), (0, "01.0\n02.0\n".into(), String::new()));
+	}
+
+	#[test]
+	fn custom_general_format_selects_fixed_and_scientific_forms() {
+		assert_eq!(
+			run(&["-f", "%.3g", "0.00001", "0.00001", "0.00003"]),
+			(0, "1e-05\n2e-05\n3e-05\n".into(), String::new())
+		);
+		assert_eq!(
+			run(&["-f", "%.3g", "1", "499", "999"]),
+			(0, "1\n500\n999\n".into(), String::new())
+		);
+	}
+
+	#[test]
+	fn custom_scientific_format_preserves_precision_and_literals() {
+		assert_eq!(
+			run(&["-f", "value=%+.2e%%", "1", "2"]),
+			(0, "value=+1.00e+00%\nvalue=+2.00e+00%\n".into(), String::new())
+		);
 	}
 
 	#[test]

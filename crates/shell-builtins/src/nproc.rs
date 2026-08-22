@@ -6,9 +6,11 @@ use std::{io::Write, thread};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
-use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, Utility, format_usage, matches_parser, util},
+	support::quote::Quotable,
+};
 
 static OPT_ALL: &str = "all";
 static OPT_IGNORE: &str = "ignore";
