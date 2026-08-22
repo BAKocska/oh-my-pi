@@ -86,6 +86,25 @@ pub struct PendingIssue {
 	/// Exact payload bytes referenced by the row.
 	pub payload: Vec<u8>,
 }
+/// User-authored disposition for a revision-bound telemetry report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Decision {
+	/// Keep the report private and terminally local-only.
+	LocalOnly,
+	/// Consent to upload this exact target revision.
+	Upload,
+}
+
+/// Revision-bound consent emitted by user interaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsentIntent {
+	/// Durable local issue id.
+	pub issue_id: Str,
+	/// Exact report revision shown when consent was requested.
+	pub revision: Str,
+	/// User-authored disposition.
+	pub decision: Decision,
+}
 /// Filter for a cross-session `AutoQA` issue inventory.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IssueInventoryFilter {

@@ -434,6 +434,16 @@ pub struct SessionPage {
 	/// Source authority of these rows.
 	pub authority: IndexAuthority,
 }
+/// One durable parent edge in a session lineage, ordered root first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLink {
+	/// Session at this point in the lineage.
+	pub id:     SessionId,
+	/// Immediate parent, absent for a lineage root.
+	pub parent: Option<SessionId>,
+	/// Parent checkpoint inherited by this child when indexed, when known.
+	pub at:     Option<u64>,
+}
 
 /// SQL grouping dimension for usage queries.
 #[derive(Debug, Clone, Copy, Display, EnumString, IntoStaticStr, PartialEq, Eq, Hash)]
@@ -919,6 +929,62 @@ impl SessionIndex {
 		Ok(sessions)
 	}
 
+	/// Returns one exact authoritative session row without scanning a journal.
+	///
+	/// The row is absent when the session is not indexed. Canonical accounting
+	/// is loaded from receipt rows exactly as it is for [`Self::list`].
+	pub fn get(&self, session: &SessionId) -> Result<Option<SessionInfo>, Error> {
+		let connection = self.connection.lock();
+		let mut info = connection
+			.query_row(
+				"SELECT id, title, title_source, cwd, project, created_ms, updated_ms, status,
+				        kind, parent, entries, turns, journal_watermark, last_event_index, remote
+				 FROM sessions WHERE id = ?1",
+				[session.0.as_str()],
+				decode_session,
+			)
+			.optional()?;
+		if let Some(info) = &mut info {
+			let (usage, cost, models) = session_accounting(&connection, &info.id)?;
+			info.usage = usage;
+			info.cost = cost;
+			info.models = models;
+		}
+		Ok(info)
+	}
+
+	/// Returns the durable ancestry ending at `session`, ordered root first.
+	///
+	/// The index currently retains only the parent session id; checkpoint
+	/// positions remain journal truth and are therefore reported as absent
+	/// rather than inferred.
+	pub fn lineage(&self, session: &SessionId) -> Result<Vec<SessionLink>, Error> {
+		let connection = self.connection.lock();
+		let mut statement = connection.prepare(
+			"WITH RECURSIVE ancestry(id, parent, depth) AS (
+			   SELECT id, parent, 0 FROM sessions WHERE id = ?1
+			   UNION ALL
+			   SELECT parent.id, parent.parent, ancestry.depth + 1
+			   FROM sessions parent JOIN ancestry ON parent.id = ancestry.parent
+			 )
+			 SELECT id, parent FROM ancestry ORDER BY depth DESC",
+		)?;
+		let rows = statement.query_map([session.0.as_str()], |row| {
+			Ok(SessionLink {
+				id:     SessionId(Str::new(row.get::<_, String>(0)?)),
+				parent: row
+					.get::<_, Option<String>>(1)?
+					.map(|value| SessionId(Str::new(value))),
+				at:     None,
+			})
+		})?;
+		let mut links = Vec::new();
+		for row in rows {
+			links.push(row?);
+		}
+		Ok(links)
+	}
+
 	/// Executes SQL aggregation over write-time receipt rows.
 	pub fn usage(&self, query: &UsageQuery) -> Result<Vec<UsageBucket>, Error> {
 		let (sql, values) = usage_sql(query)?;
@@ -1145,13 +1211,13 @@ impl SessionIndex {
 		Ok(())
 	}
 
-	/// Returns persisted slash-command invocation counts keyed by canonical name.
+	/// Returns persisted slash-command invocation counts keyed by canonical
+	/// name.
 	pub fn command_usage(&self) -> Result<BTreeMap<Str, u64>, Error> {
 		let connection = self.connection.lock();
 		let mut statement = connection.prepare("SELECT name, count FROM command_usage")?;
-		let rows = statement.query_map([], |row| {
-			Ok((Str::new(row.get::<_, String>(0)?), row.get::<_, u64>(1)?))
-		})?;
+		let rows = statement
+			.query_map([], |row| Ok((Str::new(row.get::<_, String>(0)?), row.get::<_, u64>(1)?)))?;
 		let mut counts = BTreeMap::new();
 		for row in rows {
 			let (name, count) = row?;

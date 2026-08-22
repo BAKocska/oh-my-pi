@@ -170,7 +170,9 @@ fn command_usage_accumulates_and_survives_reopen() {
 
 	let reopened = SessionIndex::open(&path).expect("reopen index");
 	assert_eq!(
-		reopened.command_usage().expect("list command use after restart"),
+		reopened
+			.command_usage()
+			.expect("list command use after restart"),
 		expected
 	);
 	reopened
