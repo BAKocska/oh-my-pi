@@ -1,7 +1,6 @@
 // Model-lineage compat for "mimo"; regenerated from the frozen census using class taxonomy selectors.
 
 class "mimo" {
-	edit-revision "sloppy.1"
 	on "aimlapi" "huggingface" "kilo" "nanogpt" "novita" "opencode-go" "opencode-zen" "openrouter" \
 		"venice" "zenmux" {
 		family "v2" {

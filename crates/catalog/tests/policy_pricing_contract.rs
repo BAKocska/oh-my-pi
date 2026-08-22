@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use omp_core::sf;
-use omp_llm_catalog::{
+use omp_catalog::{
 	ApplyPatchWireKind, CatalogSource, ComputerUseConfigSupport, ComputerUseWireSupport,
 	ExtendedContextMode, MaxOutputTokensEmission, NanoUsd, PremiumMultiplier, Price, PriceTier,
 	PriceUnit, Pricing, ProvenanceKind, SourceModelRecord, SourceProviderRecord, ThinkingEffort,
 	ThinkingMode, UsageDimensions, WirePolicy, compile,
 };
+use omp_core::sf;
 
 fn source_provider() -> SourceProviderRecord {
 	serde_json::from_str(

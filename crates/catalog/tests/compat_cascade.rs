@@ -13,12 +13,12 @@
 
 use std::{collections::BTreeMap, fs, path::Path};
 
-use omp_core::SemVer;
-use omp_llm_catalog::{
+use omp_catalog::{
 	BUNDLED_COMPAT, CascadeError, Catalog, ClassificationInput, ClassificationPhase, CompatCascade,
 	EffortTier, KNOWN_AXES, ModelKey, ResolveTarget, ThinkingEffort, ThinkingFormat, WirePolicy,
 	classify,
 };
+use omp_core::SemVer;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -232,13 +232,12 @@ fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
 	// These axes postdate the frozen oracle snapshot. They stay explicit until
 	// the next intentional snapshot refresh; compat KDL may use them without
 	// rewriting source digests in an unrelated port.
-	oracle_axes
-		.extend([
-			"glyph_tokenization".to_owned(),
-			"leaked_thinking_healer".to_owned(),
-			"template_reasoning_effort".to_owned(),
-			"thinking_tool_choice_conflict".to_owned(),
-		]);
+	oracle_axes.extend([
+		"glyph_tokenization".to_owned(),
+		"leaked_thinking_healer".to_owned(),
+		"template_reasoning_effort".to_owned(),
+		"thinking_tool_choice_conflict".to_owned(),
+	]);
 	oracle_axes.sort_unstable();
 	oracle_axes.dedup();
 	let mut known: Vec<String> = KNOWN_AXES
@@ -742,10 +741,9 @@ fn run_identity_case(case: &Case) {
 #[test]
 fn opencode_responses_downgrade_forced_tool_choice() {
 	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
-	for (provider, model) in [
-		("opencode-go", "muse-spark-1.2-contributor"),
-		("opencode-zen", "muse-spark-1.2"),
-	] {
+	for (provider, model) in
+		[("opencode-go", "muse-spark-1.2-contributor"), ("opencode-zen", "muse-spark-1.2")]
+	{
 		let resolved = cascade
 			.resolve(&ResolveTarget {
 				provider,
@@ -764,18 +762,15 @@ fn opencode_responses_downgrade_forced_tool_choice() {
 	}
 	let control = cascade
 		.resolve(&ResolveTarget {
-			provider: "openai",
-			class: "openai",
-			family: Some("gpt"),
-			revision: Some(SemVer::new(5, 0, 0)),
-			model: "gpt-5",
+			provider:  "openai",
+			class:     "openai",
+			family:    Some("gpt"),
+			revision:  Some(SemVer::new(5, 0, 0)),
+			model:     "gpt-5",
 			reasoning: true,
 		})
 		.expect("OpenAI compat resolves");
-	assert_ne!(
-		control.wire.get("supports_forced_tool_choice"),
-		Some(&Value::Bool(false))
-	);
+	assert_ne!(control.wire.get("supports_forced_tool_choice"), Some(&Value::Bool(false)));
 }
 
 fn run_policy_case(cascade: &CompatCascade, case: &Case) {

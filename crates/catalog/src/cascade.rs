@@ -869,18 +869,21 @@ impl RuleAxes {
 			return Ok(());
 		}
 		if written == "edit-revision" {
-			let value =
-				node_value(node, AxisKind::Scalar).filter(|value| {
+			let value = node_value(node, AxisKind::Scalar)
+				.filter(|value| {
 					value
 						.as_str()
 						.is_some_and(|revision| !revision.trim().is_empty())
-				}).ok_or_else(
-					|| CascadeError::MalformedDirective {
-						file:      file.to_str(),
-						directive: written.to_str(),
-					},
-				)?;
-			if self.catalog.insert("editRevision".to_str(), value).is_some() {
+				})
+				.ok_or_else(|| CascadeError::MalformedDirective {
+					file:      file.to_str(),
+					directive: written.to_str(),
+				})?;
+			if self
+				.catalog
+				.insert("editRevision".to_str(), value)
+				.is_some()
+			{
 				return Err(CascadeError::DuplicateAxis {
 					file: file.to_str(),
 					axis: "editRevision".to_str(),

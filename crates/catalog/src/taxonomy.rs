@@ -339,14 +339,7 @@ impl Taxonomy {
 		if !saw_collapse || collapse.is_empty() {
 			return malformed("taxonomy", "collapse");
 		}
-		Ok(Self {
-			classes,
-			collapse,
-			lanes,
-			effort_families,
-			routing_variants,
-			discovery,
-		})
+		Ok(Self { classes, collapse, lanes, effort_families, routing_variants, discovery })
 	}
 
 	/// Returns the full responses-route hint group containing `provider` —
@@ -563,14 +556,13 @@ impl Taxonomy {
 		}
 		(Cow::Borrowed(model), None, false)
 	}
+
 	/// Whether `provider` declares dynamic effort-sibling families.
 	pub(crate) fn supports_dynamic_effort_siblings(&self, provider: &str) -> bool {
 		self
 			.effort_families
 			.iter()
-			.any(|family| {
-				family.provider.eq_ignore_ascii_case(provider) && !family.logical.is_empty()
-			})
+			.any(|family| family.provider.eq_ignore_ascii_case(provider) && !family.logical.is_empty())
 	}
 
 	/// Returns the standard-lane id when `model` ends in a declared effort lane.
@@ -1010,7 +1002,11 @@ fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>
 	};
 	let mut families = Vec::new();
 	let mut unique = BTreeSet::new();
-	for child in children.nodes().iter().filter(|child| child.name().value() == "effort-family") {
+	for child in children
+		.nodes()
+		.iter()
+		.filter(|child| child.name().value() == "effort-family")
+	{
 		validate_properties(file, child, "effort-family", &[])?;
 		let arguments = positional_strings(child);
 		let [provider, logical] = arguments.as_slice() else {
@@ -1025,10 +1021,8 @@ fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>
 		{
 			return malformed(file, "effort-family");
 		}
-		families.push(EffortFamily {
-			provider: ProviderId::new(provider),
-			logical: logical.to_str(),
-		});
+		families
+			.push(EffortFamily { provider: ProviderId::new(provider), logical: logical.to_str() });
 	}
 	Ok(families)
 }

@@ -18,8 +18,8 @@ use crate::{
 	DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EvidenceConfidence, ExactSelector,
 	ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits, ModelOverlay,
 	ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Pricing, ProvenanceKind,
-	ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingPolicyId,
-	ThinkingEffort, ThinkingRouting, WireModelId, WirePolicyId, classify,
+	ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingEffort,
+	ThinkingPolicyId, ThinkingRouting, WireModelId, WirePolicyId, classify,
 	classify::{strip_effort_lane, supports_dynamic_effort_siblings},
 };
 
@@ -485,9 +485,7 @@ impl DiscoveryNormalizer {
 					.map(|alias| CatalogAlias {
 						alias,
 						target: ModelKey::new(classification.logical_model.clone()),
-						rationale: sf!(
-							"provider discovery declared an alternate wire model identifier",
-						),
+						rationale: sf!("provider discovery declared an alternate wire model identifier",),
 						provenance: row.source.clone(),
 					})
 			})
@@ -696,20 +694,21 @@ fn dynamic_effort_group_is_safe(
 		observed_at_ms: None,
 	});
 	if nested.effort.is_some()
-		|| candidate_logicals.iter().any(|(candidate_provider, candidate)| {
-			candidate_provider == provider
-				&& candidate != logical
-				&& candidate.as_str().starts_with(logical.as_str())
-				&& classify(ClassificationInput {
-					phase:          ClassificationPhase::DiscoveryNormalizer,
-					provider:       provider.as_str(),
-					model:          candidate.as_str(),
-					observed_at_ms: None,
-				})
-				.logical_model
-				.as_str() == logical.as_str()
-		})
-	{
+		|| candidate_logicals
+			.iter()
+			.any(|(candidate_provider, candidate)| {
+				candidate_provider == provider
+					&& candidate != logical
+					&& candidate.as_str().starts_with(logical.as_str())
+					&& classify(ClassificationInput {
+						phase:          ClassificationPhase::DiscoveryNormalizer,
+						provider:       provider.as_str(),
+						model:          candidate.as_str(),
+						observed_at_ms: None,
+					})
+					.logical_model
+					.as_str() == logical.as_str()
+			}) {
 		return false;
 	}
 	let standard = strip_effort_lane(provider.as_str(), logical.as_str());
@@ -1044,7 +1043,7 @@ mod tests {
 				.iter()
 				.map(|alias| alias.definition.alias.as_str())
 				.collect::<Vec<_>>(),
-			["a-alias", "z-alias"]
+			["a-alias", "provider/a-alias", "provider/z-alias", "z-alias"]
 		);
 		assert_eq!(page.continuation, DiscoveryContinuation::Cursor {
 			query_parameter: sf!("after"),
@@ -1302,7 +1301,11 @@ mod tests {
 			.expect("unsafe group remains live");
 		assert_eq!(normalized.len(), 3);
 		assert!(normalized.iter().any(|item| item.model.key == "review-low"));
-		assert!(normalized.iter().any(|item| item.model.key == "review-high"));
+		assert!(
+			normalized
+				.iter()
+				.any(|item| item.model.key == "review-high")
+		);
 	}
 
 	#[test]

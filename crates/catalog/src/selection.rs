@@ -862,7 +862,11 @@ pub fn retry_fallback_chain_key(
 		let Some(prefix) = key.strip_suffix("/*") else {
 			continue;
 		};
-		if full == prefix.as_str() || full.strip_prefix(prefix.as_str()).is_some_and(|tail| tail.starts_with('/')) {
+		if full == prefix.as_str()
+			|| full
+				.strip_prefix(prefix.as_str())
+				.is_some_and(|tail| tail.starts_with('/'))
+		{
 			if prefix.len() > wildcard_len {
 				wildcard = Some(key.clone());
 				wildcard_len = prefix.len();
@@ -880,9 +884,11 @@ pub fn retry_fallback_chain_key(
 		else {
 			return false;
 		};
-		let Some(selected) = role.selectors.iter().find_map(|selector| {
-			select_model(models, routes, aliases, roles, mru, selector).ok()
-		}) else {
+		let Some(selected) = role
+			.selectors
+			.iter()
+			.find_map(|selector| select_model(models, routes, aliases, roles, mru, selector).ok())
+		else {
 			return false;
 		};
 		selected.provider == current.provider && selected.model == current.model

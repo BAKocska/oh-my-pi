@@ -5,8 +5,7 @@ use std::{
 	str::FromStr,
 };
 
-use omp_core::SemVer;
-use omp_llm_catalog::{
+use omp_catalog::{
 	Availability, EmbeddingInputBits, EvidenceConfidence, ModalityBits, ModelAvailability,
 	OperationKind, ProvenanceKind,
 	classify::{ClassificationInput, ClassificationPhase, EffortTier, classify},
@@ -23,6 +22,7 @@ use omp_llm_catalog::{
 	snapshot::{Catalog, SnapshotProvenance},
 	thinking::{ThinkingEffort, ThinkingMode, ThinkingPolicy},
 };
+use omp_core::SemVer;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -518,7 +518,7 @@ struct CompatShape {
 	#[serde(rename = "wire/thinking_format")]
 	thinking_format: Option<String>,
 	#[serde(rename = "wire/extra_body")]
-	extra_body: Option<omp_llm_catalog::policy::ReasoningBodyOverride>,
+	extra_body: Option<omp_catalog::policy::ReasoningBodyOverride>,
 	#[serde(rename = "wire/when_thinking")]
 	when_thinking: Option<FixtureWhenThinking>,
 }
@@ -526,7 +526,7 @@ struct CompatShape {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FixtureWhenThinking {
-	extra_body:      omp_llm_catalog::policy::ReasoningBodyOverride,
+	extra_body:      omp_catalog::policy::ReasoningBodyOverride,
 	thinking_format: ThinkingFormat,
 }
 
@@ -553,9 +553,7 @@ impl CompatShape {
 		policy.reasoning.effort_map = self
 			.reasoning_effort_map
 			.into_iter()
-			.map(|(effort, value)| {
-				(omp_llm_catalog::thinking::ThinkingEffort::from(effort), value.into())
-			})
+			.map(|(effort, value)| (omp_catalog::thinking::ThinkingEffort::from(effort), value.into()))
 			.collect();
 		policy.reasoning.replay_unsigned = self.replay_unsigned_thinking;
 		policy.tool.requires_assistant_content = self.requires_assistant_content_for_tool_calls;
@@ -569,7 +567,7 @@ impl CompatShape {
 		policy.streaming.watchdog =
 			self
 				.stream_idle_timeout_ms
-				.map(|idle_ms| omp_llm_catalog::policy::StreamWatchdog {
+				.map(|idle_ms| omp_catalog::policy::StreamWatchdog {
 					first_event_ms: None,
 					idle_ms:        Some(idle_ms),
 				});
@@ -592,7 +590,7 @@ impl CompatShape {
 		policy.reasoning.when_thinking =
 			self
 				.when_thinking
-				.map(|value| omp_llm_catalog::policy::WhenThinkingPolicy {
+				.map(|value| omp_catalog::policy::WhenThinkingPolicy {
 					extra_body:      value.extra_body,
 					thinking_format: value.thinking_format,
 				});
@@ -743,7 +741,7 @@ struct QwenThinking {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixturePrice {
-	unit:      omp_llm_catalog::pricing::PriceUnit,
+	unit:      omp_catalog::pricing::PriceUnit,
 	nanos_usd: u64,
 }
 
@@ -768,7 +766,7 @@ impl From<FixtureEffort> for EffortTier {
 	}
 }
 
-impl From<FixtureEffort> for omp_llm_catalog::thinking::ThinkingEffort {
+impl From<FixtureEffort> for omp_catalog::thinking::ThinkingEffort {
 	fn from(value: FixtureEffort) -> Self {
 		match value {
 			FixtureEffort::Off => Self::Off,
@@ -782,7 +780,7 @@ impl From<FixtureEffort> for omp_llm_catalog::thinking::ThinkingEffort {
 	}
 }
 
-fn compiler_classification(model: &str) -> omp_llm_catalog::classify::ModelClassification {
+fn compiler_classification(model: &str) -> omp_catalog::classify::ModelClassification {
 	classify(ClassificationInput {
 		phase: ClassificationPhase::CatalogCompiler,
 		provider: "fixture",
@@ -913,7 +911,7 @@ fn interactive_oauth_contracts_preserve_provider_parameters_and_identity() {
 	let OAuthFlowSpec::Pkce { completion, authorize_parameters, .. } = &google.flow else {
 		panic!("Google login must use an authorization-code flow");
 	};
-	assert_eq!(*completion, omp_llm_catalog::provider::OAuthCompletion::PasteCallbackUrl);
+	assert_eq!(*completion, omp_catalog::provider::OAuthCompletion::PasteCallbackUrl);
 	assert!(
 		authorize_parameters
 			.iter()
@@ -1384,15 +1382,16 @@ fn every_normalized_logical_model_matches_typed_semantic_oracle_fields() {
 			wire_policy
 				.tool
 				.computer_use
-				.map(|support| { support == omp_llm_catalog::policy::ComputerUseWireSupport::Native }),
+				.map(|support| { support == omp_catalog::policy::ComputerUseWireSupport::Native }),
 			behavior.supports_computer_use,
 			"{} computer-use evidence",
 			expected.id
 		);
 		assert_eq!(
-			wire_policy.tool.computer_use_config.map(|support| {
-				support == omp_llm_catalog::policy::ComputerUseConfigSupport::Supported
-			}),
+			wire_policy
+				.tool
+				.computer_use_config
+				.map(|support| { support == omp_catalog::policy::ComputerUseConfigSupport::Supported }),
 			behavior.supports_computer_use_config,
 			"{} computer-use config evidence",
 			expected.id
@@ -1401,7 +1400,7 @@ fn every_normalized_logical_model_matches_typed_semantic_oracle_fields() {
 			wire_policy
 				.context
 				.max_output_tokens
-				.map(|emission| { emission == omp_llm_catalog::policy::MaxOutputTokensEmission::Omit }),
+				.map(|emission| { emission == omp_catalog::policy::MaxOutputTokensEmission::Omit }),
 			behavior.omit_max_output_tokens,
 			"{} output-token field emission",
 			expected.id
@@ -2200,7 +2199,7 @@ fn exact_override_rows_and_qwen_collapses_remain_present_and_auditable() {
 			assert!(
 				routes.iter().any(|route| {
 					(route.codex_transport
-						== omp_llm_catalog::provider::CodexTransportPreference::WebsocketPreferred)
+						== omp_catalog::provider::CodexTransportPreference::WebsocketPreferred)
 						== prefer_websockets
 				}),
 				"{} websocket preference",
@@ -2673,12 +2672,12 @@ fn every_thinking_profile_is_interned_and_attached_to_its_exact_model_set() {
 		.collect::<BTreeSet<_>>();
 	assert_eq!(
 		actual_ids.difference(&expected_ids).collect::<Vec<_>>(),
-		Vec::<&omp_llm_catalog::ThinkingPolicyId>::new(),
+		Vec::<&omp_catalog::ThinkingPolicyId>::new(),
 		"unexpected compiled thinking policies"
 	);
 	assert_eq!(
 		expected_ids.difference(&actual_ids).collect::<Vec<_>>(),
-		Vec::<&omp_llm_catalog::ThinkingPolicyId>::new(),
+		Vec::<&omp_catalog::ThinkingPolicyId>::new(),
 		"missing compiled thinking policies"
 	);
 	for model in &compiled.models {

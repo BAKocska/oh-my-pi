@@ -292,7 +292,7 @@ Run all commands from the workspace root. Keep inputs and generated output in st
 ### 1. Dump the full classified roster
 
 ```sh
-cargo run -p omp-llm-catalog --example dump_identity > /tmp/compat-identity.tsv
+cargo run -p omp-catalog --example dump_identity > /tmp/compat-identity.tsv
 ```
 
 The TSV columns are `id`, `provider`, `class`, `family`, `revision`, and `reasoning`, in frozen normalized-catalog order. Join it with `fixtures/llm-oracle/catalog-policy/compat-profiles.json` and `thinking-profiles.json`. For each desired member set, test candidates against the entire roster and accept one only when it selects exactly that set within its class and any `on` provider scope. Use this deterministic candidate order:
@@ -312,20 +312,20 @@ The ID scheme is `compat.cascade.<group>.<stem>.v1`, where group is `taxonomy`, 
 The following runnable update preserves non-compat IDs and provenance, replaces every compat KDL entry, refreshes every locked hash, sorts by ID, and recomputes `source_digest` as `sha256(concat(id + NUL + path + NUL + sha256 + NUL))`:
 
 ```sh
-cargo build -p omp-llm-catalog --example generate_snapshot
+cargo build -p omp-catalog --example generate_snapshot
 python3 - <<'PY'
 from pathlib import Path
 import hashlib, json
 
 root = Path.cwd()
-lock_path = root / "crates/llm-catalog/data/sources.lock.json"
+lock_path = root / "crates/catalog/data/sources.lock.json"
 lock = json.loads(lock_path.read_text())
 inputs = {
     item["id"]: item
     for item in lock["inputs"]
     if not item["id"].startswith("compat.cascade.")
 }
-for path in sorted((root / "crates/llm-catalog/compat").glob("*/*.kdl")):
+for path in sorted((root / "crates/catalog/compat").glob("*/*.kdl")):
     relative = path.relative_to(root).as_posix()
     group, stem = path.parent.name, path.stem
     item_id = f"compat.cascade.{group}.{stem}.v1"
@@ -358,10 +358,10 @@ Run the generator binary built before the source-lock update:
 
 This verifies the source lock and rewrites:
 
-- `crates/llm-catalog/data/catalog.normalized.json`
-- `crates/llm-catalog/data/catalog.postcard`
+- `crates/catalog/data/catalog.normalized.json`
+- `crates/catalog/data/catalog.postcard`
 
-`crates/llm-catalog/data/catalog.normalized.json` is the full compiled catalog: providers, routes, models, wire policies, thinking policies, and revision. `fixtures/llm-oracle/catalog/models.normalized.json` is a different, reduced 4,225-model archival schema. Never copy or compare the full compiled artifact over the reduced fixture.
+`crates/catalog/data/catalog.normalized.json` is the full compiled catalog: providers, routes, models, wire policies, thinking policies, and revision. `fixtures/llm-oracle/catalog/models.normalized.json` is a different, reduced 4,225-model archival schema. Never copy or compare the full compiled artifact over the reduced fixture.
 
 The reduced fixture changes only when `models.json.zst` changes or a reviewed collapse-policy port folds frozen siblings (for example the Cursor Grok `-fast` lane, pi PR #8988). Its loader is pinned to
 `52b111a4abc8d76064abc4f58afda931edee9833`; the checked-in projector preserves the
@@ -372,12 +372,12 @@ root=$PWD
 revision=52b111a4abc8d76064abc4f58afda931edee9833
 tree=/work/.tree/omp-catalog-oracle
 git worktree add --detach "$tree" "$revision"
-mkdir -p "$tree/crates/llm-catalog/examples"
+mkdir -p "$tree/crates/catalog/examples"
 cp "$root/fixtures/llm-oracle/catalog/project_normalized.rs" \
-  "$tree/crates/llm-catalog/examples/project_normalized.rs"
+  "$tree/crates/catalog/examples/project_normalized.rs"
 cargo run --locked --manifest-path "$tree/Cargo.toml" \
-  -p omp-llm-catalog --example project_normalized -- \
-  "$tree/crates/llm-catalog/models.json.zst" \
+  -p omp-catalog --example project_normalized -- \
+  "$tree/crates/catalog/models.json.zst" \
   "$root/fixtures/llm-oracle/catalog/models.json.zst" \
   "$root/fixtures/llm-oracle/catalog/models.normalized.json"
 git worktree remove "$tree"
@@ -433,6 +433,6 @@ If a refrozen corpus file is also a source-lock input, rebuild the generator whi
 ```sh
 ./target/debug/examples/generate_snapshot
 python3 fixtures/llm-oracle/validate.py --self-test
-cargo test -p omp-llm-catalog --lib taxonomy
-cargo test -p omp-llm-catalog --test compat_cascade
+cargo test -p omp-catalog --lib taxonomy
+cargo test -p omp-catalog --test compat_cascade
 ```

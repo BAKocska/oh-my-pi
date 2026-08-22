@@ -1,9 +1,6 @@
 // Model-lineage compat for "deepseek"; regenerated from the frozen census using class taxonomy selectors.
 
 class "deepseek" {
-	family "flash" {
-		edit-revision "sloppy.1"
-	}
 	on "aiand" "aimlapi" "alibaba-token-plan" "baseten" "coreweave" "deepseek" "fireworks" \
 		"huggingface" "kilo" "nanogpt" "novita" "nvidia" "opencode-go" "opencode-zen" "together" \
 		"venice" "vercel-ai-gateway" "wafer-serverless" "zenmux" {

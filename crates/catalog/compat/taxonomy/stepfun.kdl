@@ -2,5 +2,4 @@ class "stepfun" {
 	bounded "step"
 
 	family "step" glob="*step*"
-	family "step-3.7-flash" glob="*step*3.7*flash*" priority=10
 }

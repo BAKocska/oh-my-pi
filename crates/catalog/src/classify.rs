@@ -397,14 +397,8 @@ mod tests {
 	#[test]
 	fn bundled_dynamic_cursor_families_are_data_driven() {
 		assert!(supports_dynamic_effort_siblings("CURSOR"));
-		assert_eq!(
-			strip_effort_lane("cursor", "gpt-5.6-luna-fast"),
-			"gpt-5.6-luna"
-		);
-		assert_eq!(
-			strip_effort_lane("other", "gpt-5.6-luna-fast"),
-			"gpt-5.6-luna-fast"
-		);
+		assert_eq!(strip_effort_lane("cursor", "gpt-5.6-luna-fast"), "gpt-5.6-luna");
+		assert_eq!(strip_effort_lane("other", "gpt-5.6-luna-fast"), "gpt-5.6-luna-fast");
 	}
 
 	#[test]
@@ -437,10 +431,7 @@ mod tests {
 		// Coding SKUs do not carry a wedged effort suffix. Other Cursor lanes
 		// are classified structurally, then batch safety decides collapse.
 		assert_eq!(cursor("grok-code-fast-1").logical_model.as_str(), "grok-code-fast-1");
-		assert_eq!(
-			cursor("claude-opus-5-high-fast").logical_model.as_str(),
-			"claude-opus-5-fast"
-		);
+		assert_eq!(cursor("claude-opus-5-high-fast").logical_model.as_str(), "claude-opus-5-fast");
 	}
 
 	#[test]

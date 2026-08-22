@@ -6,7 +6,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use omp_llm_catalog::{Catalog, SnapshotProvenance, compile_oracle};
+use omp_catalog::{Catalog, SnapshotProvenance, compile_oracle};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 

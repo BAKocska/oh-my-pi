@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 
-use omp_llm_catalog::{ClassificationInput, ClassificationPhase, classify};
+use omp_catalog::{ClassificationInput, ClassificationPhase, classify};
 use serde::Deserialize;
 
 const MODELS: &str = include_str!("../../../fixtures/llm-oracle/catalog/models.normalized.json");

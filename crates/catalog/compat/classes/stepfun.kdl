@@ -1,9 +1,6 @@
 // Model-lineage compat for "stepfun"; regenerated from the frozen census using class taxonomy selectors.
 
 class "stepfun" {
-	family "step-3.7-flash" {
-		edit-revision "sloppy.1"
-	}
 	on "aimlapi" "huggingface" "kilo" "nanogpt" "novita" "nvidia" "stepfun" "stepfun-plan" \
 		"vercel-ai-gateway" "zenmux" {
 		family "step" {
