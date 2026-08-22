@@ -309,7 +309,6 @@ After analysis, write AGENTS.md to the project root."#;
 
 /// Returns native workflow templates used only when no discovered command
 /// claims the same name.
-#[must_use]
 pub fn embedded_workflow_commands() -> [CommandContribution; 1] {
 	[CommandContribution {
 		name:        sf!("init"),
@@ -353,7 +352,6 @@ pub struct CommandRoster {
 
 impl CommandRoster {
 	/// Aggregates builtins followed by provider feeds in precedence order.
-	#[must_use]
 	pub fn new(sources: Vec<Vec<CommandContribution>>) -> Self {
 		let mut ordered = Vec::with_capacity(sources.len().saturating_add(1));
 		ordered.push(builtin_available());
@@ -367,7 +365,6 @@ impl CommandRoster {
 	}
 
 	/// Slash commands offered by the chat composer's completion palette.
-	#[must_use]
 	pub fn completions(&self) -> Vec<Command> {
 		self.available.iter().map(to_completion).collect()
 	}
@@ -379,7 +376,6 @@ impl CommandRoster {
 
 	/// Renders help from the same winning roster used by completion and
 	/// dispatch.
-	#[must_use]
 	pub fn help_text(&self) -> String {
 		render_help(&self.available)
 	}
@@ -586,7 +582,6 @@ pub struct ParsedSlash<'a> {
 
 /// Parses a syntactically command-shaped line. Paths containing another `/`
 /// and ordinary prompt text return `None` for model passthrough.
-#[must_use]
 pub fn parse_slash(text: &str) -> Option<ParsedSlash<'_>> {
 	let text = text.trim();
 	let body = text.strip_prefix('/')?;

@@ -179,13 +179,11 @@ impl Usd {
 	pub const ZERO: Self = Self(0);
 
 	/// Creates an exact amount from nano-US dollars.
-	#[must_use]
 	pub const fn from_nanos(nanos: u64) -> Self {
 		Self(nanos)
 	}
 
 	/// Returns the exact nano-US-dollar magnitude.
-	#[must_use]
 	pub const fn as_nanos(self) -> u64 {
 		self.0
 	}
@@ -276,7 +274,6 @@ pub struct DocEffects {
 
 impl DocEffects {
 	/// Returns whether this document domain grants no authority.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		!self.read && self.write_globs.is_empty()
 	}
@@ -293,7 +290,6 @@ pub struct ExecEffects {
 
 impl ExecEffects {
 	/// Returns whether this process domain grants no authority.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.commands.is_empty() && !self.network
 	}
@@ -310,7 +306,6 @@ pub struct InferenceEffects {
 
 impl InferenceEffects {
 	/// Returns whether this inference domain grants no authority.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.max_requests == 0 && self.max_usd.as_nanos() == 0
 	}
@@ -329,7 +324,6 @@ pub struct DesktopEffects {
 
 impl DesktopEffects {
 	/// Returns whether this desktop domain grants no authority.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		!self.capture && !self.accessibility && !self.input
 	}
@@ -359,7 +353,6 @@ impl Effects {
 	}
 
 	/// Returns whether `self` grants no authority.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.documents.as_ref().is_none_or(DocEffects::is_empty)
 			&& self.exec.as_ref().is_none_or(ExecEffects::is_empty)
@@ -376,7 +369,6 @@ impl Effects {
 	/// Executable `*` is the explicit unrestricted ceiling. Write-glob
 	/// narrowing recognizes exact ceilings, `**`, and lexical descendants of a
 	/// `path/**` ceiling; uncertain glob-language implication fails closed.
-	#[must_use]
 	pub fn is_subset_of(&self, maximum: &Self) -> bool {
 		self.subagents <= maximum.subagents
 			&& optional_subset(
@@ -421,7 +413,6 @@ impl Effects {
 	}
 
 	/// Accepts an invocation envelope only when it narrows this declaration.
-	#[must_use]
 	pub fn narrow(&self, requested: Self) -> Option<Self> {
 		requested.is_subset_of(self).then_some(requested)
 	}
@@ -592,7 +583,6 @@ pub struct ToolSpec {
 /// `module_source` must contain the source bytes that implement the tool's
 /// projection. Package identity separates equal source shipped by unrelated
 /// crates, while source bytes move the identity when projection code changes.
-#[must_use]
 pub fn native_projection_code(
 	crate_name: &str,
 	crate_version: &str,
@@ -713,7 +703,6 @@ pub enum Dialect {
 
 impl Dialect {
 	/// Classifies a revision family without consulting model names.
-	#[must_use]
 	pub fn for_rev(rev: &Rev) -> Self {
 		rev.family.parse().unwrap_or_default()
 	}
@@ -783,7 +772,6 @@ pub struct PromptCaps {
 
 impl PromptCaps {
 	/// Combines model-wide limits with the dialect of `live_rev`.
-	#[must_use]
 	pub fn for_tool(base: CapsBase, live_rev: &Rev) -> Self {
 		Self {
 			maximum_parts:      base.maximum_parts,
@@ -795,7 +783,6 @@ impl PromptCaps {
 	}
 
 	/// Returns the model-wide inputs independent of a tool revision.
-	#[must_use]
 	pub const fn base(self) -> CapsBase {
 		CapsBase {
 			maximum_parts:      self.maximum_parts,
@@ -1042,14 +1029,12 @@ pub enum CallOutcome<P, F> {
 
 impl<P, F> CallOutcome<P, F> {
 	/// Creates a non-policy abort, deriving its coarse class from `abort`.
-	#[must_use]
 	pub const fn aborted(abort: Abort) -> Self {
 		let kind = abort.kind();
 		Self::Aborted { abort, kind, policy: None }
 	}
 
 	/// Creates a structured policy denial.
-	#[must_use]
 	pub const fn policy_denied(abort: Abort, policy: PolicyDenied) -> Self {
 		Self::Aborted { abort, kind: AbortKind::PolicyDenied, policy: Some(policy) }
 	}
@@ -1272,7 +1257,6 @@ const _: () =
 
 impl ArgSpecRegistry {
 	/// Creates an empty mutable declaration table.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -1333,14 +1317,12 @@ impl ArgSpecRegistry {
 	}
 
 	/// Reports whether the declaration table is immutable.
-	#[must_use]
 	pub const fn is_sealed(&self) -> bool {
 		self.sealed
 	}
 
 	/// Borrows the declaration for one exact revision and canonical or alias
 	/// path.
-	#[must_use]
 	pub fn get(&self, rev: &Rev, path: &[ArgPath]) -> Option<&ArgSpec> {
 		let revision = self.revisions.get(rev)?;
 		revision.specs.get(*revision.path_ids.get(path)?)
@@ -1348,7 +1330,6 @@ impl ArgSpecRegistry {
 
 	/// Borrows the declaration and its dense path identifier for one exact
 	/// revision and canonical or alias path.
-	#[must_use]
 	pub fn get_with_id(&self, rev: &Rev, path: &[ArgPath]) -> Option<(u32, &ArgSpec)> {
 		let revision = self.revisions.get(rev)?;
 		let path_id = *revision.path_ids.get(path)?;
@@ -1462,7 +1443,6 @@ pub enum Abort {
 
 impl Abort {
 	/// Returns the coarse class implied by this owner-reported reason.
-	#[must_use]
 	pub const fn kind(&self) -> AbortKind {
 		match self {
 			Self::Skipped { .. } | Self::InputDropped => AbortKind::Skipped,
@@ -1683,7 +1663,6 @@ pub struct JobMetadata {
 
 impl JobMetadata {
 	/// Builds metadata for work that begins running as it is registered.
-	#[must_use]
 	pub fn running(kind: JobKind, label: Str, started_at_ms: u64) -> Self {
 		Self {
 			kind,

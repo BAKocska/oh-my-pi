@@ -44,7 +44,6 @@ pub enum CompletionError {
 ///
 /// This uses one `str::find` per short choice and allocates nothing. Ties
 /// retain the caller's earlier choice, making the choice ladder deterministic.
-#[must_use]
 pub fn select_choice<'a>(text: &str, choices: &'a [Str]) -> Option<&'a Str> {
 	let mut selected: Option<(&Str, usize)> = None;
 	for choice in choices {

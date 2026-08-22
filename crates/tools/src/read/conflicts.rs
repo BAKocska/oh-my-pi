@@ -497,7 +497,6 @@ impl ConflictRegistry {
 	}
 
 	/// Returns a registered conflict by session-local ID.
-	#[must_use]
 	pub fn get(&self, id: usize) -> Option<RegisteredConflict> {
 		self.0.lock().by_id.get(&id).cloned()
 	}
@@ -520,7 +519,6 @@ impl ConflictRegistry {
 	}
 
 	/// Returns current registrations in numeric order.
-	#[must_use]
 	pub fn entries(&self) -> Vec<RegisteredConflict> {
 		let state = self.0.lock();
 		let mut entries = state.by_id.values().cloned().collect::<Vec<_>>();
@@ -591,7 +589,6 @@ pub struct ConflictResolver {
 
 impl ConflictResolver {
 	/// Creates a resolver sharing `registry` with conflict-scanning readers.
-	#[must_use]
 	pub const fn new(registry: ConflictRegistry) -> Self {
 		Self { registry }
 	}
@@ -647,7 +644,6 @@ pub struct ConflictSplice {
 }
 
 /// Parses exact side directives while preserving all custom text verbatim.
-#[must_use]
 pub fn parse_replacement(content: Str) -> ConflictReplacement {
 	match content.trim().as_str() {
 		"@ours" => ConflictReplacement::Ours,

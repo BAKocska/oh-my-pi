@@ -246,7 +246,6 @@ impl StringList {
 /// Scans direct and nested `SKILL.md` declarations from ordered sources,
 /// follows only contained symlinks, applies source/name gates before claiming
 /// names, and realpath-deduplicates declarations.
-#[must_use]
 pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> SkillDiscovery {
 	if !settings.enabled {
 		return SkillDiscovery::default();
@@ -468,7 +467,6 @@ fn parse_skill(path: &Path) -> Result<(SkillHeader, String), serde_yaml::Error> 
 }
 
 /// Returns whether a skill name is a safe, URL-addressable identifier.
-#[must_use]
 pub fn safe_skill_name(name: &str) -> bool {
 	!name.is_empty()
 		&& name != "."
@@ -511,7 +509,6 @@ fn managed_link_count(metadata: &fs::Metadata) -> u64 {
 /// Small allocation-free wildcard matcher used for configuration globs.
 /// `*` spans any bytes and `?` spans one byte; repeated stars naturally cover
 /// `**` without introducing a second pattern dialect.
-#[must_use]
 pub fn glob_matches(pattern: &str, candidate: &str) -> bool {
 	let pattern = pattern.as_bytes();
 	let candidate = candidate.as_bytes();

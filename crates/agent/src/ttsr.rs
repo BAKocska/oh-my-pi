@@ -57,7 +57,6 @@ pub enum TtsrInterruptMode {
 
 impl TtsrInterruptMode {
 	/// Reports whether this mode interrupts `source`.
-	#[must_use]
 	pub const fn interrupts(self, source: TtsrSource) -> bool {
 		match self {
 			Self::Never => false,
@@ -250,7 +249,6 @@ impl TtsrRegistry {
 	/// Names disabled by settings are removed before precedence resolution. A
 	/// user declaration claims its name even when malformed, so a broken user
 	/// override never silently re-enables the same bundled rule.
-	#[must_use]
 	pub fn from_layers(
 		settings: TtsrSettings,
 		user_rules: impl IntoIterator<Item = TtsrRule>,
@@ -345,7 +343,6 @@ impl TtsrRegistry {
 	}
 
 	/// Reports whether at least one active rule has a structural condition.
-	#[must_use]
 	pub fn has_ast_rules(&self) -> bool {
 		self.settings.enabled
 			&& self
@@ -500,7 +497,6 @@ impl TtsrRegistry {
 	}
 
 	/// Returns the frozen settings for interruption and context handling.
-	#[must_use]
 	pub const fn settings(&self) -> &TtsrSettings {
 		&self.settings
 	}

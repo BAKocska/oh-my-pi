@@ -63,7 +63,6 @@ impl DocumentCacheKey {
 	}
 
 	/// Returns the underlying BLAKE3 digest.
-	#[must_use]
 	pub const fn digest(self) -> Hash32 {
 		self.0
 	}
@@ -179,13 +178,11 @@ pub struct DocumentCache {
 
 impl DocumentCache {
 	/// Opens a cache rooted at `root`. The directory is created lazily on write.
-	#[must_use]
 	pub fn open(root: impl Into<PathBuf>) -> Self {
 		Self { root: root.into() }
 	}
 
 	/// Returns the cache directory.
-	#[must_use]
 	pub fn root(&self) -> &Path {
 		&self.root
 	}

@@ -32,7 +32,6 @@ pub enum QuoteContext {
 ///
 /// Single-quoted occurrences are retained for diagnostics but callers must not
 /// materialize them because shell single quotes suppress substitution.
-#[must_use]
 pub fn scan(input: &str) -> Vec<Occurrence> {
 	let bytes = input.as_bytes();
 	let mut found = Vec::new();
@@ -102,7 +101,6 @@ pub fn scan(input: &str) -> Vec<Occurrence> {
 
 /// Replaces materialized URIs using shell-safe spelling for their quote
 /// context. Missing mappings and single-quoted occurrences are left unchanged.
-#[must_use]
 pub fn replace(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 	let occurrences = scan(input);
 	let mut output = String::with_capacity(input.len());
@@ -135,7 +133,6 @@ pub fn replace(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 ///
 /// Environment values and the dedicated `cwd` parameter are transported as
 /// data, so shell quoting there would become part of the path.
-#[must_use]
 pub fn replace_plain(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 	let occurrences = scan(input);
 	let mut output = String::with_capacity(input.len());

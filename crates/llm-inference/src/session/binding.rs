@@ -34,7 +34,6 @@ impl CredentialAffinityDigest {
 	///
 	/// `key` must come from the credential authority and must never be
 	/// journaled.
-	#[must_use]
 	pub fn derive(
 		key: &[u8; 32],
 		provider: &omp_llm_catalog::ProviderId<str>,
@@ -57,7 +56,6 @@ impl CredentialAffinityDigest {
 	/// Restores already-derived opaque journal evidence.
 	///
 	/// Only canonical lowercase BLAKE3-256 hex is accepted.
-	#[must_use]
 	pub fn parse(value: &str) -> Option<Self> {
 		value
 			.parse::<Hash32>()
@@ -66,7 +64,6 @@ impl CredentialAffinityDigest {
 	}
 
 	/// Borrows the opaque canonical digest.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}

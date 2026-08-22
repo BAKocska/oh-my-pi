@@ -95,7 +95,6 @@ pub struct Params {
 
 impl Params {
 	/// Exact desktop authority required by this invocation.
-	#[must_use]
 	pub const fn required_effects(&self) -> DesktopEffects {
 		match self.action {
 			Action::Capabilities | Action::ListDisplays | Action::ListWindows | Action::Capture => {
@@ -167,7 +166,6 @@ pub struct Computer {
 }
 
 /// Creates `computer@1`.
-#[must_use]
 pub fn tool(host: Arc<dyn ComputerHost>) -> Computer {
 	Computer {
 		host,

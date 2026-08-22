@@ -14,7 +14,6 @@ use strum::{Display, EnumString};
 ///
 /// Times before [`UNIX_EPOCH`] are clamped to the epoch, preserving the
 /// formatter's historical behavior.
-#[must_use]
 pub fn format_rfc3339(time: SystemTime) -> String {
 	let seconds = time
 		.duration_since(UNIX_EPOCH)
@@ -35,7 +34,6 @@ pub fn format_rfc3339(time: SystemTime) -> String {
 /// are accepted case-insensitively, the fractional second may contain one to
 /// nine digits, and the time zone may be `Z` or a numeric `±HH:MM` offset.
 /// Returns [`None`] for invalid dates, times, offsets, or syntax.
-#[must_use]
 pub fn parse_rfc3339(value: &str) -> Option<SystemTime> {
 	if value.len() < 20
 		|| value.as_bytes().get(4) != Some(&b'-')
@@ -226,19 +224,16 @@ pub struct Duration {
 
 impl Duration {
 	/// Creates a duration from an integer and an explicit unit.
-	#[must_use]
 	pub const fn new(value: u64, unit: DurationUnit) -> Self {
 		Self { value, unit }
 	}
 
 	/// Returns the integer magnitude in this value's original unit.
-	#[must_use]
 	pub const fn value(self) -> u64 {
 		self.value
 	}
 
 	/// Returns the unit in which this value was specified.
-	#[must_use]
 	pub const fn unit(self) -> DurationUnit {
 		self.unit
 	}

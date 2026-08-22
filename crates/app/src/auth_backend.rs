@@ -28,7 +28,6 @@ use zeroize::Zeroizing;
 pub(crate) use crate::envd::mcp::auth_authority::{CombinedAuthAuthority, CredentialAuthority};
 
 /// Composes provider and MCP leasing over the one encrypted credential store.
-#[must_use]
 pub(crate) fn combined_authority(
 	store: std::sync::Arc<omp_llm_inference::auth::CredentialStore>,
 ) -> CombinedAuthAuthority {
@@ -46,7 +45,6 @@ pub(crate) struct EnvCommandCredentialExecutor {
 
 impl EnvCommandCredentialExecutor {
 	/// Creates a bounded command credential executor rooted at `cwd`.
-	#[must_use]
 	pub(crate) const fn new(
 		client: EnvClient,
 		cwd: EnvPath,

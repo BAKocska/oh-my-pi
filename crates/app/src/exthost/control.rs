@@ -47,7 +47,6 @@ pub struct RawInputAuthority {
 
 impl RawInputAuthority {
 	/// Builds the gate from Core-authenticated manifest and durable-grant facts.
-	#[must_use]
 	pub fn new(
 		extension_id: impl Into<Str>,
 		generation: u64,
@@ -129,7 +128,6 @@ impl RawInputAuthority {
 	}
 
 	/// Extension identity stamped on focus and cancellation diagnostics.
-	#[must_use]
 	pub const fn extension_id(&self) -> &Str {
 		&self.extension_id
 	}
@@ -320,7 +318,6 @@ impl ExtensionSecretDeclarations {
 	}
 
 	/// Returns the sealed declarations, or no value before activation.
-	#[must_use]
 	pub fn sealed_rules(&self) -> Option<&[SecretRule]> {
 		self.sealed.then_some(&self.rules)
 	}
@@ -566,7 +563,6 @@ impl Default for HostRequestMap {
 
 impl HostRequestMap {
 	/// Creates an empty map whose first invocation receives request id one.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self {
 			next_request_id: 1,
@@ -987,7 +983,6 @@ pub struct JournalControl {
 
 impl JournalControl {
 	/// Binds a journal dispatcher to core-authenticated connection identity.
-	#[must_use]
 	pub const fn new(
 		sender: ControlSender,
 		extension: Str,
@@ -1263,7 +1258,6 @@ impl JournalControl {
 }
 
 /// Wraps one streamed journal row for a correlated host reply.
-#[must_use]
 pub const fn journal_row_reply(body: journal_host_envelope::Body) -> JournalHostEnvelope {
 	JournalHostEnvelope { body: Some(body), props: None }
 }

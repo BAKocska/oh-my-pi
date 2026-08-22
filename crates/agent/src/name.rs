@@ -37,7 +37,6 @@ pub struct AgentNameAllocator {
 
 impl AgentNameAllocator {
 	/// Creates an allocator with the advisor artifact stem permanently reserved.
-	#[must_use]
 	pub fn new() -> Self {
 		let mut taken = HashSet::new();
 		taken.insert(Str::new_static(RESERVED_ADVISOR));

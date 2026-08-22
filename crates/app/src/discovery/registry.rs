@@ -449,13 +449,11 @@ impl std::fmt::Debug for DiscoveryRegistry {
 impl DiscoveryRegistry {
 	/// Creates an empty registry from one immutable settings projection and one
 	/// composition-owned cache.
-	#[must_use]
 	pub fn new(settings: Arc<DiscoverySettings>, cache: Arc<DiscoveryCache>) -> Self {
 		Self { providers: Vec::new(), settings, cache }
 	}
 
 	/// Returns the composition-owned cache supplied to providers.
-	#[must_use]
 	pub fn cache(&self) -> &Arc<DiscoveryCache> {
 		&self.cache
 	}
@@ -480,7 +478,6 @@ impl DiscoveryRegistry {
 	}
 
 	/// Lists every registered provider in deterministic collation order.
-	#[must_use]
 	pub fn providers(&self) -> Vec<ProviderInfo> {
 		self
 			.providers
@@ -490,7 +487,6 @@ impl DiscoveryRegistry {
 	}
 
 	/// Returns one provider introspection row.
-	#[must_use]
 	pub fn provider(&self, provider_id: &str) -> Option<ProviderInfo> {
 		self
 			.providers
@@ -500,7 +496,6 @@ impl DiscoveryRegistry {
 	}
 
 	/// Lists every canonical capability and its registered providers.
-	#[must_use]
 	pub fn capabilities(&self) -> Vec<CapabilityInfo> {
 		CAPABILITY_METADATA
 			.iter()
@@ -509,7 +504,6 @@ impl DiscoveryRegistry {
 	}
 
 	/// Returns one canonical capability introspection row.
-	#[must_use]
 	pub fn capability(&self, kind: CapabilityKind) -> CapabilityInfo {
 		let metadata = CAPABILITY_METADATA
 			.iter()

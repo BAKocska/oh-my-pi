@@ -89,7 +89,6 @@ pub struct YieldPayloadValidator {
 
 impl YieldPayloadValidator {
 	/// Creates a validator for an optional declared output schema.
-	#[must_use]
 	pub const fn new(schema: Option<Value>, strict: bool) -> Self {
 		Self { schema, strict, has_incremental_sections: false, schema_retries: 0 }
 	}
@@ -153,7 +152,6 @@ impl YieldPayloadValidator {
 	}
 
 	/// Returns whether at least one incremental section was accepted.
-	#[must_use]
 	pub const fn has_incremental_sections(&self) -> bool {
 		self.has_incremental_sections
 	}
@@ -232,7 +230,6 @@ pub struct OutputSchemaResolution {
 }
 
 /// Resolves schemas in caller → definition frontmatter → session order.
-#[must_use]
 pub fn resolve_output_schema(
 	caller: Option<&Value>,
 	frontmatter: Option<&Value>,
@@ -305,7 +302,6 @@ pub struct YieldAssembler {
 
 impl YieldAssembler {
 	/// Creates an empty assembler using the effective schema for array hints.
-	#[must_use]
 	pub const fn new(schema: Option<Value>) -> Self {
 		Self { schema, items: Vec::new() }
 	}
@@ -519,7 +515,6 @@ pub enum AgentStatus {
 impl AgentStatus {
 	/// Decodes the compact atomic representation, treating corrupt values as
 	/// failed.
-	#[must_use]
 	pub const fn from_atomic(value: u8) -> Self {
 		match value {
 			0 => Self::Pending,
@@ -534,7 +529,6 @@ impl AgentStatus {
 	}
 
 	/// Reports whether this status cannot receive another turn.
-	#[must_use]
 	pub const fn terminal(self) -> bool {
 		matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Exhausted)
 	}
@@ -553,7 +547,6 @@ pub enum SpawnPolicy {
 
 impl SpawnPolicy {
 	/// Reports whether `definition` is allowed by this exact policy.
-	#[must_use]
 	pub fn allows(&self, definition: &str) -> bool {
 		match self {
 			Self::Disabled => false,
@@ -565,7 +558,6 @@ impl SpawnPolicy {
 	}
 
 	/// Returns the inherited default definition for a child spawn.
-	#[must_use]
 	pub fn default_definition(&self) -> Option<&str> {
 		match self {
 			Self::Only(allowed) => allowed.first().map(Str::as_str),
@@ -725,7 +717,6 @@ impl AgentDefinition {
 	/// The caller feeds this chain into the catalog's ordinary candidate
 	/// planner, ensuring agent, prewalk, and advisor selection use identical
 	/// glob/role/fallback semantics.
-	#[must_use]
 	pub fn effective_model_chain<'a>(
 		&'a self,
 		overrides: &'a BTreeMap<Str, Str>,
@@ -757,7 +748,6 @@ impl AgentDefinition {
 	}
 
 	/// Resolves a configured per-agent override ahead of frontmatter.
-	#[must_use]
 	pub fn effective_model<'a>(&'a self, overrides: &'a BTreeMap<Str, Str>) -> Option<&'a str> {
 		overrides
 			.iter()
@@ -1151,7 +1141,6 @@ pub struct Budget {
 
 impl Budget {
 	/// Clamps this budget to the unspent remainder represented by `parent`.
-	#[must_use]
 	pub fn clamped_to(self, parent: BudgetRemainder) -> Self {
 		Self {
 			max_requests:      clamp(self.max_requests, parent.requests),
@@ -1289,7 +1278,6 @@ pub struct AgentNode {
 
 impl AgentNode {
 	/// Returns this node's allocation-free lifecycle state.
-	#[must_use]
 	pub fn status(&self) -> AgentStatus {
 		AgentStatus::from_atomic(self.status.load(Ordering::Acquire))
 	}
@@ -1305,19 +1293,16 @@ impl AgentNode {
 	}
 
 	/// Returns a clone of the latest roster activity text.
-	#[must_use]
 	pub fn activity(&self) -> Str {
 		self.activity.lock().clone()
 	}
 
 	/// Returns subtree usage used by this node's inherited budget.
-	#[must_use]
 	pub fn usage(&self) -> Usage {
 		self.budget.lock().usage
 	}
 
 	/// Returns statistics from receipts directly owned by this node.
-	#[must_use]
 	pub fn direct_statistics(&self) -> TreeStatistics {
 		self.budget.lock().direct_stats.clone()
 	}
@@ -1529,6 +1514,7 @@ fn wake_waiters(state: &ConcurrencyState) {
 	}
 }
 
+#[must_use]
 struct WaitRegistration {
 	controller: Weak<ConcurrencyController>,
 	ticket:     Option<u64>,
@@ -1547,6 +1533,7 @@ impl Drop for WaitRegistration {
 /// Dropping it releases every held unit. A waiter must call
 /// [`Self::release_for_wait`] before awaiting a child and [`Self::reacquire`]
 /// afterwards; this is the release-while-waiting accounting rule.
+#[must_use]
 pub struct SpawnPermit {
 	controller: Arc<ConcurrencyController>,
 	held:       bool,
@@ -1583,7 +1570,6 @@ impl SpawnPermit {
 	}
 
 	/// Returns how many concurrency units this reservation represents.
-	#[must_use]
 	pub const fn units(&self) -> usize {
 		self.units
 	}
@@ -1610,7 +1596,6 @@ pub struct AgentTree {
 impl AgentTree {
 	/// Creates an empty tree with explicit depth, concurrency, and queue
 	/// ceilings.
-	#[must_use]
 	pub fn new(max_depth: u16, max_concurrency: usize, max_queue: usize) -> Self {
 		let (roster_watch, _) = tokio::sync::watch::channel(0_u64);
 		Self {
@@ -1626,7 +1611,6 @@ impl AgentTree {
 	}
 
 	/// Creates a tree with the standard session ceilings.
-	#[must_use]
 	pub fn standard(max_depth: u16) -> Self {
 		Self::new(max_depth, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_ADMISSION_QUEUE)
 	}
@@ -1745,14 +1729,12 @@ impl AgentTree {
 	}
 
 	/// Returns a node by stable identity without scanning the roster.
-	#[must_use]
 	pub fn node(&self, id: &str) -> Option<Arc<AgentNode>> {
 		let index = *self.by_id.read().get(id)?;
 		self.nodes.get(index).cloned()
 	}
 
 	/// Returns a node by session-local name without scanning the roster.
-	#[must_use]
 	pub fn named(&self, name: &str) -> Option<Arc<AgentNode>> {
 		let folded = name.to_ascii_lowercase();
 		let index = *self.by_name.read().get(folded.as_str())?;
@@ -1768,13 +1750,11 @@ impl AgentTree {
 	///
 	/// Consumers obtain the allocation-free roster after `changed()`; this
 	/// avoids UI polling while keeping node storage append-only.
-	#[must_use]
 	pub fn watch_roster(&self) -> tokio::sync::watch::Receiver<u64> {
 		self.roster_watch.subscribe()
 	}
 
 	/// Returns the current monotonic roster generation.
-	#[must_use]
 	pub fn roster_generation(&self) -> u64 {
 		self.roster_generation.load(Ordering::Acquire)
 	}
@@ -1893,7 +1873,6 @@ impl AgentTree {
 	///
 	/// Recursive aggregation walks direct node receipts rather than adding the
 	/// already inherited budget totals, so each descendant contributes once.
-	#[must_use]
 	pub fn statistics(&self, node_id: &str, recursive: bool) -> Option<TreeStatistics> {
 		let root = self.node(node_id)?;
 		if !recursive {
@@ -1934,7 +1913,6 @@ impl AgentTree {
 	}
 
 	/// Returns the live tree-wide concurrency ceiling (`0` means unlimited).
-	#[must_use]
 	pub fn max_concurrency(&self) -> usize {
 		self.concurrency.limit()
 	}

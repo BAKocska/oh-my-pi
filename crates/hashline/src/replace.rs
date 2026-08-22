@@ -285,7 +285,6 @@ pub enum ReplaceError {
 
 impl ReplaceError {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}

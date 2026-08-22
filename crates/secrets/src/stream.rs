@@ -7,7 +7,6 @@ pub struct PlaceholderStream {
 
 impl PlaceholderStream {
 	/// Creates an empty placeholder-aware stream buffer.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { pending: String::new() }
 	}
@@ -28,7 +27,6 @@ impl PlaceholderStream {
 	}
 
 	/// Returns the currently withheld possible placeholder prefix.
-	#[must_use]
 	pub fn pending(&self) -> &str {
 		&self.pending
 	}

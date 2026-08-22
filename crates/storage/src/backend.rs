@@ -66,7 +66,6 @@ impl FileStore {
 	}
 
 	/// Returns the backing path.
-	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
@@ -140,7 +139,6 @@ where
 	S: ByteJournalStore,
 {
 	/// Wraps one backend in the sole journal-writer transaction protocol.
-	#[must_use]
 	pub const fn new(store: S) -> Self {
 		Self { store, poisoned: false }
 	}
@@ -176,19 +174,16 @@ where
 	}
 
 	/// Returns whether an indeterminate outcome halted future writes.
-	#[must_use]
 	pub const fn is_poisoned(&self) -> bool {
 		self.poisoned
 	}
 
 	/// Borrows the byte target for read-only daemon services.
-	#[must_use]
 	pub const fn store(&self) -> &S {
 		&self.store
 	}
 
 	/// Mutably borrows the target while retaining single-writer ownership.
-	#[must_use]
 	pub const fn store_mut(&mut self) -> &mut S {
 		&mut self.store
 	}
@@ -205,13 +200,11 @@ pub struct IndexedStore<S> {
 
 impl<S> IndexedStore<S> {
 	/// Marks a byte store as attached to the daemon's derived index path.
-	#[must_use]
 	pub const fn new(inner: S) -> Self {
 		Self { inner }
 	}
 
 	/// Consumes the marker and returns its exact-byte store.
-	#[must_use]
 	pub fn into_inner(self) -> S {
 		self.inner
 	}

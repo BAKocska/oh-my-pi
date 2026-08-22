@@ -72,7 +72,6 @@ pub struct JsonRepairStage {
 
 impl JsonRepairStage {
 	/// Creates a repair stage with catalog policy evidence and explicit limits.
-	#[must_use]
 	pub fn new(
 		enforcement: JsonEnforcement,
 		limits: JsonRepairLimits,

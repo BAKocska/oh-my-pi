@@ -377,7 +377,6 @@ impl AccountPool {
 	}
 
 	/// Returns the active usage-aware reserve policy.
-	#[must_use]
 	pub fn quota_reserve(&self) -> QuotaReservePolicy {
 		self.state.read().quota_reserve
 	}

@@ -89,7 +89,6 @@ impl BranchSummaryCoordinator {
 	}
 
 	/// Returns whether detached work is active.
-	#[must_use]
 	pub const fn is_running(&self) -> bool {
 		self.running.is_some()
 	}

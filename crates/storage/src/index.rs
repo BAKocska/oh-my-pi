@@ -683,7 +683,6 @@ impl SessionIndex {
 	}
 
 	/// Returns whether this handle is authoritative or an offline cache.
-	#[must_use]
 	pub const fn authority(&self) -> IndexAuthority {
 		self.authority
 	}

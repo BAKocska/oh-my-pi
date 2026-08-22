@@ -34,13 +34,11 @@ pub struct KagiSearchCodec;
 
 impl KagiSearchCodec {
 	/// Creates a Kagi Search API codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}
 
 	/// Returns the stable catalog identifier for this codec.
-	#[must_use]
 	pub const fn id(self) -> &'static str {
 		CODEC_ID
 	}
@@ -146,7 +144,6 @@ pub struct KagiSearchDecoder {
 
 impl KagiSearchDecoder {
 	/// Creates fresh state for one Kagi search response.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { buffer: BytesMut::new(), finished: false }
 	}

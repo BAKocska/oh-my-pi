@@ -1011,7 +1011,6 @@ pub struct SystemArtifactFetcher {
 
 impl SystemArtifactFetcher {
 	/// Constructs a pooled HTTP/1.1 and HTTP/2 artifact fetcher.
-	#[must_use]
 	pub fn new() -> Self {
 		let _ = rustls::crypto::ring::default_provider().install_default();
 		let connector = HttpsConnectorBuilder::new()

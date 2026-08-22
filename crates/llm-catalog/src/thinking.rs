@@ -66,7 +66,6 @@ pub struct ThinkingEffortMetadata {
 
 impl ThinkingEffort {
 	/// Returns allocation-free picker and status metadata.
-	#[must_use]
 	pub const fn metadata(self) -> ThinkingEffortMetadata {
 		let (label, description) = match self {
 			Self::Off => ("off", "No reasoning"),
@@ -126,7 +125,6 @@ pub enum ThinkingMode {
 
 impl ThinkingMode {
 	/// Returns the canonical static spelling for this control mode.
-	#[must_use]
 	pub const fn into_str(&self) -> &'static str {
 		match self {
 			Self::Effort => "effort",
@@ -163,7 +161,6 @@ pub enum ReasoningMode {
 
 impl ReasoningMode {
 	/// Returns the canonical static spelling for this serving path.
-	#[must_use]
 	pub const fn into_str(&self) -> &'static str {
 		match self {
 			Self::Pro => "pro",
@@ -244,7 +241,6 @@ impl ThinkingPolicy {
 	}
 
 	/// Reports whether an effort may be selected.
-	#[must_use]
 	pub fn supports(&self, effort: ThinkingEffort) -> bool {
 		if effort == ThinkingEffort::Off {
 			return self.requires_effort != Some(true);
@@ -253,19 +249,16 @@ impl ThinkingPolicy {
 	}
 
 	/// Returns the configured budget for an effort.
-	#[must_use]
 	pub fn budget(&self, effort: ThinkingEffort) -> Option<u64> {
 		self.effort_budgets.get(&effort).copied()
 	}
 
 	/// Serializes the profile into deterministic structural bytes.
-	#[must_use]
 	pub fn canonical_bytes(&self) -> Vec<u8> {
 		serde_json::to_vec(self).expect("typed thinking policy always serializes")
 	}
 
 	/// Returns the stable content-derived profile identifier.
-	#[must_use]
 	pub fn content_id(&self) -> ThinkingPolicyId {
 		ThinkingPolicyId::from(content_id("thinking", &self.canonical_bytes()))
 	}
@@ -289,7 +282,6 @@ pub struct ThinkingRouting {
 /// Unsupported intermediate levels clamp downward to the greatest
 /// model-supported effort. `Off` remains available unless the model requires
 /// reasoning.
-#[must_use]
 pub fn clamp_thinking_effort(
 	policy: &ThinkingPolicy,
 	requested: Option<ThinkingEffort>,
@@ -324,7 +316,6 @@ pub fn clamp_thinking_effort(
 ///
 /// The median of an even-sized ladder is the lower middle. A ceiling below the
 /// model floor has no compatible selection.
-#[must_use]
 pub fn resolve_thinking_selector(
 	policy: &ThinkingPolicy,
 	selector: ThinkingEffortSelector,
@@ -399,7 +390,6 @@ pub fn resolve_task_thinking_selector(
 ///
 /// An absent policy represents an uncontrollable ladder and is compatible
 /// because no effort can be forwarded.
-#[must_use]
 pub fn thinking_ceiling_compatible(
 	policy: Option<&ThinkingPolicy>,
 	ceiling: ThinkingEffort,
@@ -576,7 +566,6 @@ impl ThinkingPolicyTable {
 	}
 
 	/// Gets an interned profile by identifier.
-	#[must_use]
 	pub fn get(&self, id: &ThinkingPolicyId<str>) -> Option<&ThinkingPolicy> {
 		self.entries.get(id)
 	}
@@ -587,13 +576,11 @@ impl ThinkingPolicyTable {
 	}
 
 	/// Returns the number of distinct structural profiles.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
 	/// Reports whether no profile is interned.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.entries.is_empty()
 	}

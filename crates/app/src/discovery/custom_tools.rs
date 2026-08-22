@@ -126,7 +126,6 @@ enum JsonHandler {
 /// Scans native roots without importing or executing any source. Canonical
 /// paths are deduplicated before parsing; source priority and lexical path
 /// order make name collisions deterministic.
-#[must_use]
 pub fn discover(roots: impl IntoIterator<Item = ToolRoot>) -> CustomToolDiscovery {
 	let mut roots = roots.into_iter().collect::<Vec<_>>();
 	roots.sort_by(|left, right| {

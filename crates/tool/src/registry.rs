@@ -262,7 +262,6 @@ pub struct DeviceTarget<'a> {
 
 impl DeviceTarget<'_> {
 	/// Returns the durable identity selected by this device address.
-	#[must_use]
 	pub fn identity(&self) -> ToolIdentity {
 		ToolIdentity { name: self.name.clone(), rev: self.rev.clone() }
 	}
@@ -422,7 +421,6 @@ impl<T> Default for LeafReplacementRegistry<T> {
 
 impl<T> LeafReplacementRegistry<T> {
 	/// Creates an empty dynamic leaf catalog at epoch zero.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -492,7 +490,6 @@ impl<T> LeafReplacementRegistry<T> {
 
 	/// Returns an immutable old-or-new snapshot ordered by name, revision,
 	/// root, then claimant.
-	#[must_use]
 	pub fn snapshot(&self) -> LeafCatalogSnapshot<T> {
 		let state = self.state.read();
 		let mut leaves = state
@@ -517,13 +514,11 @@ impl<T> LeafReplacementRegistry<T> {
 	}
 
 	/// Returns the current published catalog epoch.
-	#[must_use]
 	pub fn epoch(&self) -> u64 {
 		self.state.read().epoch
 	}
 
 	/// Resolves a retained historical owner/name/revision implementation.
-	#[must_use]
 	pub fn historical(&self, owner: &LeafOwner, name: &str, rev: &Rev) -> Option<Arc<T>> {
 		self
 			.state
@@ -658,7 +653,6 @@ pub struct ProjectionKey {
 impl ProjectionKey {
 	/// Creates the content-addressed key for one exact verdict and projection
 	/// context.
-	#[must_use]
 	pub fn new(
 		identity: &ToolIdentity,
 		verdict: &[u8],
@@ -684,7 +678,6 @@ impl ProjectionKey {
 	}
 
 	/// Returns the opaque cache digest.
-	#[must_use]
 	pub const fn digest(&self) -> [u8; 32] {
 		self.cache_hash
 	}
@@ -1250,7 +1243,6 @@ impl Registry {
 	/// Checkpoint/rewind pairing is a safety invariant and therefore applies to
 	/// restricted lists. Every other convenience expansion is top-level only
 	/// and never widens a restricted child.
-	#[must_use]
 	pub fn resolve_inclusions(
 		&self,
 		requested: Option<&[Str]>,
@@ -1363,7 +1355,6 @@ impl Registry {
 
 	/// Borrows one exact-revision argument declaration by canonical or alias
 	/// path.
-	#[must_use]
 	pub fn arg_spec(&self, rev: &Rev, path: &[crate::ArgPath]) -> Option<&ArgSpec> {
 		self.arg_specs.get(rev, path)
 	}
@@ -1378,7 +1369,6 @@ impl Registry {
 	}
 
 	/// Borrows the exact-revision renderer registry.
-	#[must_use]
 	pub const fn render_registry(&self) -> &RenderRegistry {
 		&self.renderers
 	}
@@ -1391,7 +1381,6 @@ impl Registry {
 	}
 
 	/// Borrows a cached renderer for one exact identity.
-	#[must_use]
 	pub fn renderer(&self, identity: &ToolIdentity) -> Option<RenderEntry<'_>> {
 		self.renderers.get(identity)
 	}
@@ -1534,7 +1523,6 @@ impl Registry {
 	///
 	/// A claimant-qualified name resolves a shadow without promoting it into
 	/// catalog iteration.
-	#[must_use]
 	pub fn live_identity(&self, name: &str) -> Option<(&Str, &Rev)> {
 		let (name, claimant) = split_claimant(name);
 		let (stored_name, claim) = self.live.get_key_value(name)?;
@@ -1546,7 +1534,6 @@ impl Registry {
 	/// `selected = None` projects all visible slots. A selected set matches
 	/// [`Self::advertise_selected`] inclusion semantics, including explicitly
 	/// selected hidden slots. Worker and device declarations are absent.
-	#[must_use]
 	pub const fn prompt_projection<'a>(
 		&'a self,
 		selected: Option<&'a [Str]>,
@@ -1574,7 +1561,6 @@ impl Registry {
 	}
 
 	/// Borrows the resolved claim and its shadow provenance.
-	#[must_use]
 	pub fn claim(&self, name: &str) -> Option<&Claim> {
 		self.live.get(name)
 	}
@@ -1677,7 +1663,6 @@ impl Registry {
 	}
 
 	/// Returns the BLAKE3-256 digest of policy-resolved model-visible slots.
-	#[must_use]
 	pub fn slot_hash(&self) -> Hash32 {
 		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-tool/slots/v1\0");
@@ -1698,7 +1683,6 @@ impl Registry {
 
 	/// Returns the BLAKE3-256 digest of mounted device availability and
 	/// claimant-qualified reachability.
-	#[must_use]
 	pub fn device_hash(&self) -> Hash32 {
 		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-tool/devices/v1\0");
@@ -1735,7 +1719,6 @@ impl Registry {
 
 	/// Returns the BLAKE3-256 digest of every registered revision and its
 	/// projection implementation.
-	#[must_use]
 	pub fn projection_hash(&self) -> Hash32 {
 		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-tool/projections/v1\0");

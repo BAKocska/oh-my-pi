@@ -36,13 +36,11 @@ pub struct PerplexitySearchCodec;
 
 impl PerplexitySearchCodec {
 	/// Constructs the Perplexity Sonar standalone-search codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}
 
 	/// Returns the stable catalog identifier for this codec.
-	#[must_use]
 	pub const fn id(self) -> &'static str {
 		CODEC_ID
 	}
@@ -193,7 +191,6 @@ pub struct PerplexitySearchDecoder {
 
 impl PerplexitySearchDecoder {
 	/// Constructs a fresh unary decoder for one canonical search request.
-	#[must_use]
 	pub fn new(request: &SearchRequest) -> Self {
 		Self {
 			bytes:          BytesMut::new(),

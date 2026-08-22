@@ -90,7 +90,6 @@ impl WhisperConfig {
 }
 
 /// Resolves persisted preset ids, falling back to Parakeet for stale values.
-#[must_use]
 pub fn resolve_stt_preset(id: Option<&str>) -> SttPreset {
 	id.and_then(|id| SttPreset::from_str(id).ok())
 		.unwrap_or(DEFAULT_STT_PRESET)
@@ -208,7 +207,6 @@ impl SpeechToTextAdapter {
 	}
 
 	/// Returns the resolved preset, including stale-id fallback.
-	#[must_use]
 	pub const fn preset(&self) -> SttPreset {
 		match self {
 			Self::Whisper { preset, .. } => *preset,

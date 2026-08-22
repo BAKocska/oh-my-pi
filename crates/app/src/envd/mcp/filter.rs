@@ -71,7 +71,6 @@ pub struct FilterResult {
 }
 
 /// Detects native-covered Exa/browser mounts and records leaf suppression.
-#[must_use]
 pub fn filter_native_coverage(
 	servers: &BTreeMap<Str, ResolvedServer>,
 	coverage: &NativeCoverage,

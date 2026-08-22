@@ -39,7 +39,6 @@ pub enum EventStreamHeaderValue {
 
 impl EventStreamHeaderValue {
 	/// Borrows this value when it is a string header.
-	#[must_use]
 	pub fn as_str(&self) -> Option<&str> {
 		match self {
 			Self::String(value) => Some(value.as_str()),
@@ -68,7 +67,6 @@ pub struct EventStreamMessage {
 
 impl EventStreamMessage {
 	/// Returns the first header with the exact requested name.
-	#[must_use]
 	pub fn header(&self, name: &str) -> Option<&EventStreamHeaderValue> {
 		self
 			.headers
@@ -78,7 +76,6 @@ impl EventStreamMessage {
 	}
 
 	/// Returns the first exact-name string header.
-	#[must_use]
 	pub fn string_header(&self, name: &str) -> Option<&str> {
 		self.header(name).and_then(EventStreamHeaderValue::as_str)
 	}
@@ -104,13 +101,11 @@ impl Default for EventStreamDecoder {
 
 impl EventStreamDecoder {
 	/// Creates a decoder with 16 MiB message and 128 KiB header bounds.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::with_limits(DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_HEADERS_BYTES)
 	}
 
 	/// Creates a decoder with explicit total-message and header-block bounds.
-	#[must_use]
 	pub fn with_limits(max_message_bytes: usize, max_headers_bytes: usize) -> Self {
 		Self {
 			buffer: BytesMut::new(),
@@ -139,7 +134,6 @@ impl EventStreamDecoder {
 	}
 
 	/// Returns retained bytes belonging to an incomplete message.
-	#[must_use]
 	pub fn buffered_len(&self) -> usize {
 		self.buffer.len()
 	}

@@ -64,7 +64,6 @@ pub struct AgentHub {
 
 impl AgentHub {
 	/// Opens a hub over a snapshot projected from the sole-authority agent tree.
-	#[must_use]
 	pub fn open(rows: &[AgentRow], ctx: &UiContext) -> Self {
 		let rows = rows.to_vec();
 		let frozen = BTreeMap::new();

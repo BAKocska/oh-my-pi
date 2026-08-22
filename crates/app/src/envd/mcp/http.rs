@@ -67,7 +67,6 @@ pub struct WreqExchange {
 }
 impl WreqExchange {
 	/// Creates a redirect-disabled bounded exchange.
-	#[must_use]
 	pub fn new() -> Self {
 		Self {
 			client: wreq::Client::builder()

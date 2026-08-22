@@ -48,7 +48,6 @@ pub enum PositionEncoding {
 impl PositionEncoding {
 	/// Parses a negotiated LSP position encoding, defaulting unknown values to
 	/// UTF-16.
-	#[must_use]
 	pub fn from_lsp_name(name: Option<&str>) -> Self {
 		match name {
 			Some("utf-8") => Self::Utf8,
@@ -58,7 +57,6 @@ impl PositionEncoding {
 	}
 
 	/// Returns the canonical LSP spelling of this encoding.
-	#[must_use]
 	pub const fn as_lsp_name(self) -> &'static str {
 		match self {
 			Self::Utf8 => "utf-8",

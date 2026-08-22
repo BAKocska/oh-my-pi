@@ -129,7 +129,6 @@ impl AdvisorEmissionGuard {
 
 /// Classifies unsafe output before any advisor tool dispatch or primary
 /// delivery.
-#[must_use]
 pub fn quarantine_advisor_turn(
 	requested_tools: &[Str],
 	available_tools: &[Str],
@@ -169,7 +168,6 @@ pub fn quarantine_advisor_turn(
 }
 
 /// Normalizes an advice note for dedupe and content-free filtering.
-#[must_use]
 pub fn normalize_advice(note: &str) -> Str {
 	let mut normalized = String::with_capacity(note.len());
 	let mut separator = false;

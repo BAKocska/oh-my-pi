@@ -21,7 +21,6 @@ impl std::fmt::Debug for SecretRedactor {
 
 impl SecretRedactor {
 	/// Builds a redaction-only projection from one sealed rule snapshot.
-	#[must_use]
 	pub fn new(rules: impl IntoIterator<Item = SecretRule>) -> Self {
 		let rules = rules
 			.into_iter()
@@ -31,7 +30,6 @@ impl SecretRedactor {
 	}
 
 	/// Irreversibly replaces every declared secret match.
-	#[must_use]
 	pub fn redact(&mut self, text: &str) -> String {
 		self.transform.obfuscate(text)
 	}

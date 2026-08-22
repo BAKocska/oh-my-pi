@@ -10,13 +10,11 @@ pub(crate) struct WorkspaceRootHost {
 
 impl WorkspaceRootHost {
 	/// Creates the canonical primary grant from Environment identity facts.
-	#[must_use]
 	pub(crate) fn new(canonical_uri: &str, grant_id: Bytes) -> Self {
 		Self { primary: pb::WorkspaceRoot { canonical_uri: canonical_uri.to_owned(), grant_id } }
 	}
 
 	/// Returns the ordered canonical grants for this Environment generation.
-	#[must_use]
 	pub(crate) fn snapshot(&self) -> pb::WorkspaceRootSet {
 		pb::WorkspaceRootSet {
 			revision:      1,

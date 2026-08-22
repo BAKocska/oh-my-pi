@@ -32,7 +32,6 @@ pub struct ApprovalOverlay {
 
 impl ApprovalOverlay {
 	/// Opens one pending ticket with all merged reasons visible.
-	#[must_use]
 	pub fn open(ticket: ApprovalTicketView, ctx: &UiContext) -> Self {
 		let width = DIALOG_WIDTH;
 		let ui = build(&ticket, width, ctx);
@@ -47,7 +46,6 @@ impl ApprovalOverlay {
 	}
 
 	/// Returns the stable durable ticket identity.
-	#[must_use]
 	pub fn ticket_id(&self) -> &Str {
 		&self.ticket.ticket_id
 	}
@@ -153,7 +151,6 @@ fn build(ticket: &ApprovalTicketView, width: u16, ctx: &UiContext) -> Ui {
 
 /// Elides the middle of an exact command while preserving both
 /// authority-bearing ends.
-#[must_use]
 pub fn middle_elide(text: &str, max_chars: usize) -> Str {
 	if text.chars().count() <= max_chars {
 		return Str::new(text);

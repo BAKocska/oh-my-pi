@@ -79,7 +79,6 @@ impl SherpaConfig {
 }
 
 /// Returns typed target support before a caller attempts artifact acquisition.
-#[must_use]
 pub fn availability() -> AvailabilityEvidence {
 	#[cfg(any(
 		all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),

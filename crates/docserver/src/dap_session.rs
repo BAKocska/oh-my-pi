@@ -133,7 +133,6 @@ pub enum DapApprovalTier {
 impl DapAction {
 	/// Returns immutable env-side tier data; presentation layers do not decide
 	/// it.
-	#[must_use]
 	pub const fn approval_tier(self) -> DapApprovalTier {
 		match self {
 			Self::StackTrace
@@ -170,7 +169,6 @@ impl DapAction {
 	}
 
 	/// Returns the standard DAP command for direct request actions.
-	#[must_use]
 	pub const fn command(self) -> Option<&'static str> {
 		match self {
 			Self::Continue => Some("continue"),
@@ -531,31 +529,26 @@ impl DapSession {
 	}
 
 	/// Returns the stable session identity.
-	#[must_use]
 	pub fn id(&self) -> &str {
 		self.id.as_str()
 	}
 
 	/// Returns the selected adapter name.
-	#[must_use]
 	pub fn adapter(&self) -> &str {
 		self.adapter.as_str()
 	}
 
 	/// Returns the current lifecycle state.
-	#[must_use]
 	pub fn state(&self) -> DapSessionState {
 		*self.state.lock()
 	}
 
 	/// Returns the adapter initialize capabilities.
-	#[must_use]
 	pub fn capabilities(&self) -> Value {
 		self.capabilities.read().clone()
 	}
 
 	/// Returns the current revision fence.
-	#[must_use]
 	pub fn revision(&self) -> u64 {
 		self.revision.load(Ordering::Acquire)
 	}
@@ -570,7 +563,6 @@ impl DapSession {
 	}
 
 	/// Reports whether the launch contract granted this action tier.
-	#[must_use]
 	pub fn grants(&self, tier: DapApprovalTier) -> bool {
 		match tier {
 			DapApprovalTier::ReadOnly => self.read_granted.load(Ordering::Acquire),
@@ -579,7 +571,6 @@ impl DapSession {
 	}
 
 	/// Returns the bounded event payload ceiling set at launch.
-	#[must_use]
 	pub fn event_byte_limit(&self) -> usize {
 		usize::try_from(self.event_byte_limit.load(Ordering::Acquire)).unwrap_or(usize::MAX)
 	}
@@ -1052,7 +1043,6 @@ impl DapSession {
 	}
 
 	/// Returns the retained tail of adapter/debuggee output.
-	#[must_use]
 	pub fn output_snapshot(&self) -> Vec<u8> {
 		self.output.lock().iter().copied().collect()
 	}

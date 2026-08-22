@@ -124,7 +124,6 @@ pub trait VerdictSpill {
 
 impl SpillDiverter {
 	/// Binds the diverter to the Environment's unique blob store.
-	#[must_use]
 	pub const fn new(store: Arc<BlobStore>) -> Self {
 		Self { store }
 	}
@@ -260,7 +259,6 @@ pub struct RestartBackoff {
 
 impl RestartBackoff {
 	/// Starts a one-second to thirty-second restart schedule.
-	#[must_use]
 	pub fn new() -> Self {
 		Self {
 			next:      Duration::from_secs(1),
@@ -307,7 +305,6 @@ pub struct WorkerSupervisor {
 
 impl WorkerSupervisor {
 	/// Creates a supervisor with immediate-refusal worker and spawn ceilings.
-	#[must_use]
 	pub fn new(layer_ceiling: u64, spawn_ceiling: u64) -> Self {
 		let (terminate_tx, terminate_rx) = flume::unbounded();
 		Self {
@@ -383,7 +380,6 @@ impl WorkerSupervisor {
 	}
 
 	/// Returns the current route for a named worker.
-	#[must_use]
 	pub fn route(&self, name: &str) -> Option<WorkerRoute> {
 		self.workers.lock().get(name).cloned()
 	}
@@ -409,7 +405,6 @@ impl WorkerSupervisor {
 	}
 
 	/// Returns the number of DATA frames rejected by the sole generation fence.
-	#[must_use]
 	pub fn stale_frame_count(&self) -> u64 {
 		self.stale_frames.load(Ordering::Relaxed)
 	}

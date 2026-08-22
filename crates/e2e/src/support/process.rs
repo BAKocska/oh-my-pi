@@ -62,6 +62,7 @@ pub fn omp_binary() -> io::Result<PathBuf> {
 
 /// Child process placed in its own process group and killed as a tree on drop.
 #[derive(Debug)]
+#[must_use]
 pub struct OwnedProcess {
 	child:  Child,
 	group:  Option<i32>,
@@ -83,13 +84,11 @@ impl OwnedProcess {
 	}
 
 	/// Returns the operating-system child identifier while it is known.
-	#[must_use]
 	pub fn id(&self) -> Option<u32> {
 		self.child.id()
 	}
 
 	/// Returns the dedicated Unix process-group identifier.
-	#[must_use]
 	pub const fn process_group(&self) -> Option<i32> {
 		self.group
 	}
@@ -158,7 +157,6 @@ impl Drop for OwnedProcess {
 
 /// Reports whether any process remains in a Unix process group.
 #[cfg(unix)]
-#[must_use]
 pub fn process_group_alive(group: i32) -> bool {
 	match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None) {
 		Ok(()) | Err(nix::errno::Errno::EPERM) => true,

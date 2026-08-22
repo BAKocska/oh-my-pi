@@ -44,7 +44,6 @@ pub struct GithubCopilotUsageFetcher {
 
 impl GithubCopilotUsageFetcher {
 	/// Constructs a fetcher over the application's bounded OAuth HTTP client.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}

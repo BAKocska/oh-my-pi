@@ -54,7 +54,6 @@ pub enum EditorError {
 ///
 /// Environment values are trimmed but otherwise parsed later as shell words;
 /// no shell is invoked.
-#[must_use]
 pub fn resolve_editor_command() -> String {
 	resolve_editor_command_from(
 		std::env::var("VISUAL").ok().as_deref(),
@@ -63,7 +62,6 @@ pub fn resolve_editor_command() -> String {
 }
 
 /// Deterministic resolution helper used by settings and tests.
-#[must_use]
 pub fn resolve_editor_command_from(visual: Option<&str>, editor: Option<&str>) -> String {
 	visual
 		.map(str::trim)
@@ -132,6 +130,7 @@ const fn platform_editor() -> &'static str {
 	if cfg!(windows) { "notepad" } else { "vi" }
 }
 
+#[must_use]
 struct DraftFile {
 	path: PathBuf,
 	file: File,

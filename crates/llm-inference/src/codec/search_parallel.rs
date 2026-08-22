@@ -37,7 +37,6 @@ pub struct ParallelSearchCodec;
 
 impl ParallelSearchCodec {
 	/// Creates a Parallel Search beta codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}

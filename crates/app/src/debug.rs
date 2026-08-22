@@ -142,7 +142,6 @@ pub enum ReportKind {
 }
 
 /// Resolves every stable catalog action to one concrete launcher target.
-#[must_use]
 pub fn target(action: DebugAction, caps: omp_tui::TerminalCaps) -> DebugTarget {
 	match action {
 		DebugAction::OpenArtifacts => DebugTarget::ArtifactFolder,
@@ -181,7 +180,6 @@ pub struct SystemFacts {
 }
 
 /// Collects bounded host facts without invoking platform debuggers.
-#[must_use]
 pub fn collect_system_facts() -> SystemFacts {
 	let shell = std::env::var("SHELL")
 		.or_else(|_| std::env::var("COMSPEC"))
@@ -230,7 +228,6 @@ pub struct TerminalFacts {
 }
 
 /// Projects already-negotiated TUI capabilities without probing a second time.
-#[must_use]
 pub fn collect_terminal_facts(caps: omp_tui::TerminalCaps) -> TerminalFacts {
 	let scrollback = if caps.margin_scrollback {
 		"margin scrollback"
@@ -269,7 +266,6 @@ pub fn export_transcript(directory: &Path, text: &str) -> std::io::Result<PathBu
 }
 
 /// Converts a generated artifact path into a safe OSC 8/open-action URL.
-#[must_use]
 pub fn artifact_url(path: &Path) -> Option<url::Url> {
 	url::Url::from_file_path(path).ok()
 }
@@ -302,13 +298,11 @@ const fn platform_memory_bytes() -> Option<u64> {
 }
 
 /// Stable string form used by selector rows.
-#[must_use]
 pub fn action_key(action: DebugAction) -> Str {
 	let value: &'static str = action.into();
 	Str::new_static(value)
 }
 /// Projects the app-owned catalog into the host-agnostic selector model.
-#[must_use]
 pub fn selector_rows() -> Vec<omp_chat_ui::debug_selector::DebugActionRow> {
 	ACTIONS
 		.iter()

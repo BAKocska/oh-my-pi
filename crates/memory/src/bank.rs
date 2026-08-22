@@ -28,7 +28,6 @@ impl BankId {
 	}
 
 	/// Borrows the identifier.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}
@@ -110,7 +109,6 @@ impl BankScope {
 
 /// Returns the isolated SQLite file for `bank`; the shared bank alone owns the
 /// primary DB.
-#[must_use]
 pub fn database_path(db_dir: &Path, global: &BankId, bank: &BankId) -> PathBuf {
 	if bank == global {
 		db_dir.join("mnemopi.db")

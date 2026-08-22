@@ -217,21 +217,18 @@ const ASSETS: [PromptAsset; 32] = [
 ];
 
 /// Returns one immutable asset without allocation.
-#[must_use]
 #[inline]
 pub const fn prompt_asset(id: PromptAssetId) -> &'static PromptAsset {
 	&ASSETS[id as usize]
 }
 
 /// Iterates over the complete deterministic built-in catalog.
-#[must_use]
 #[inline]
 pub fn prompt_assets() -> impl ExactSizeIterator<Item = &'static PromptAsset> + Clone {
 	ASSETS.iter()
 }
 
 /// Returns the rich asset selected by a live execution mode.
-#[must_use]
 pub const fn mode_prompt_asset(mode: PromptMode) -> &'static PromptAsset {
 	let id = match mode {
 		PromptMode::Plan => PromptAssetId::ModePlan,

@@ -25,7 +25,6 @@ impl SourcePosition {
 	/// # Arguments
 	///
 	/// * `offset` - The offset to apply.
-	#[must_use]
 	pub const fn offset(&self, offset: &SourcePositionOffset) -> Self {
 		Self {
 			index:  self.index + offset.index,

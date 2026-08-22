@@ -18,7 +18,6 @@ pub struct ModelPlan {
 
 impl ModelPlan {
 	/// Returns candidates in dispatch order.
-	#[must_use]
 	pub fn candidates(&self) -> &[SelectionCandidate] {
 		&self.candidates
 	}
@@ -54,7 +53,6 @@ pub enum ModelPlanError {
 
 /// Resolves an ordered selector chain without consulting credential state.
 /// Resolves the catalog's preferred available model.
-#[must_use]
 pub fn default_model_plan(catalog: &Catalog) -> Option<ModelPlan> {
 	let selected = pick_default(catalog.models(), catalog.routes(), &BTreeMap::new())?;
 	let selector = Str::new(selected.model.as_str());

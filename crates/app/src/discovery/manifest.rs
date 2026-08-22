@@ -166,7 +166,6 @@ pub struct SourceProvenance {
 impl SourceProvenance {
 	/// Constructs an unrevisioned native source. Providers should replace this
 	/// with authority revisions whenever their input authority supplies them.
-	#[must_use]
 	pub fn native(source_id: impl Into<Str>, path: PathBuf, scope: SourceScope) -> Self {
 		Self {
 			source_id: source_id.into(),
@@ -686,7 +685,6 @@ const _: () =
 
 impl CapabilityPayload {
 	/// Returns this payload's static capability family.
-	#[must_use]
 	pub const fn kind(&self) -> CapabilityKind {
 		match self {
 			Self::Skills(_) => CapabilityKind::Skills,
@@ -707,7 +705,6 @@ impl CapabilityPayload {
 	}
 
 	/// Returns payload-local enablement before source and provider policy.
-	#[must_use]
 	pub const fn declared_enabled(&self) -> bool {
 		match self {
 			Self::Mcps(value) => value.enabled,
@@ -717,13 +714,11 @@ impl CapabilityPayload {
 
 	/// Tests provider-independent semantic equivalence. At present MCP endpoint
 	/// aliases are the canonical capability family with equivalence semantics.
-	#[must_use]
 	pub fn semantically_equivalent(&self, other: &Self) -> bool {
 		matches!((self, other), (Self::Mcps(left), Self::Mcps(right)) if left.same_connection(right))
 	}
 
 	/// Validates required canonical fields without executing or resolving data.
-	#[must_use]
 	pub fn validation_issue(&self) -> Option<ValidationIssue> {
 		let missing_name = |name: &Str| name.is_empty().then_some(ValidationIssue::MissingName);
 		let missing_path = |path: &Path| {
@@ -818,13 +813,11 @@ pub struct DiscoveredCapability {
 
 impl DiscoveredCapability {
 	/// Constructs a keyed, enabled declaration.
-	#[must_use]
 	pub fn keyed(key: impl Into<Str>, payload: CapabilityPayload, source: SourceProvenance) -> Self {
 		Self { key: Some(key.into()), semantic_key: None, enabled: true, payload, source }
 	}
 
 	/// Constructs an unkeyed, enabled declaration.
-	#[must_use]
 	pub const fn unkeyed(payload: CapabilityPayload, source: SourceProvenance) -> Self {
 		Self { key: None, semantic_key: None, enabled: true, payload, source }
 	}
@@ -847,7 +840,6 @@ pub struct CapabilityRecord {
 
 impl CapabilityRecord {
 	/// Returns the static capability family.
-	#[must_use]
 	pub const fn kind(&self) -> CapabilityKind {
 		self.payload.kind()
 	}
@@ -949,7 +941,6 @@ pub const BUNDLED_AGENT_PRIORITY: i32 = 100;
 /// Foreign product roots are intentionally not accepted by this API. Extension
 /// roots are already-authorized native OMP package roots and contribute only
 /// their `agents` sibling.
-#[must_use]
 pub fn agent_declarations(
 	project_root: &Path,
 	user_home: Option<&Path>,
@@ -993,7 +984,6 @@ pub struct AgentDiscoveryCacheKey {
 
 impl AgentDiscoveryCacheKey {
 	/// Canonicalizes a working directory without making a missing root fatal.
-	#[must_use]
 	pub fn new(cwd: &Path, settings_generation: u64, extension_generation: u64) -> Self {
 		Self {
 			cwd: std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),

@@ -99,7 +99,6 @@ pub struct MemoryEditTool {
 }
 
 /// Creates `memory_edit@1` over one active runtime.
-#[must_use]
 pub fn tool(runtime: Arc<MemoryRuntime>) -> MemoryEditTool {
 	MemoryEditTool {
 		runtime,

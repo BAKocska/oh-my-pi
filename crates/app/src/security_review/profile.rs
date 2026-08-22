@@ -22,7 +22,6 @@ readSummarize: false
 /// Builds the canonical profile. App registration installs this definition
 /// after discovery so project, extension, and user declarations cannot widen
 /// its authority.
-#[must_use]
 pub fn definition() -> AgentDefinition {
 	let role = omp_agent::prompt_assets::prompt_asset(
 		omp_agent::prompt_assets::PromptAssetId::AgentSecurityReviewer,
@@ -45,7 +44,6 @@ pub fn definition() -> AgentDefinition {
 /// This rejects widened or shadowed definitions before they reach an ordinary
 /// child spawn. Environment-side tool and LSP admission remain authoritative
 /// for each invocation.
-#[must_use]
 pub fn is_canonical(definition: &AgentDefinition) -> bool {
 	const TOOLS: &[&str] = &["read", "grep", "glob", "lsp", "task", "yield"];
 	definition.name == PROFILE_ID
@@ -63,13 +61,11 @@ pub fn is_canonical(definition: &AgentDefinition) -> bool {
 /// Returns whether a tool name is explicitly denied by the local reviewer
 /// profile. This diagnostic helper never grants a tool; registration and
 /// Environment admission own enforcement.
-#[must_use]
 pub fn denied_tool(name: &str) -> bool {
 	!matches!(name, "read" | "grep" | "glob" | "lsp" | "task" | "yield")
 }
 
 /// Stable profile name as an owned OMP string for spawn requests.
-#[must_use]
 pub fn profile_name() -> Str {
 	Str::new_static(PROFILE_ID)
 }

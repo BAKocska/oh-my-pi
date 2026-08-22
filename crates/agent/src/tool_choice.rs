@@ -161,7 +161,6 @@ pub struct ToolChoiceQueue {
 
 impl ToolChoiceQueue {
 	/// Creates an empty queue.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self {
 			queue:               VecDeque::new(),
@@ -243,7 +242,6 @@ impl ToolChoiceQueue {
 	}
 
 	/// Returns whether a choice is awaiting settlement.
-	#[must_use]
 	pub const fn has_in_flight(&self) -> bool {
 		self.in_flight.is_some()
 	}
@@ -278,7 +276,6 @@ impl ToolChoiceQueue {
 	}
 
 	/// Returns whether at least one preview invoker is pending.
-	#[must_use]
 	pub fn has_pending_invoker(&self) -> bool {
 		!self.pending_invokers.is_empty()
 	}
@@ -292,7 +289,6 @@ impl ToolChoiceQueue {
 	}
 
 	/// Returns metadata for the most recently registered pending invoker.
-	#[must_use]
 	pub fn pending_head(&self) -> Option<PendingInvokerHead<'_>> {
 		self
 			.pending_invokers
@@ -334,13 +330,11 @@ impl ToolChoiceQueue {
 	}
 
 	/// Returns the number of directive generators retained in service order.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.queue.len()
 	}
 
 	/// Returns whether no directives or active claim remain.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.queue.is_empty() && self.in_flight.is_none()
 	}

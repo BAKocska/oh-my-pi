@@ -20,7 +20,6 @@ pub const PERSISTENCE_TRUNCATION_NOTICE: &str = "\n\n[Session persistence trunca
 /// count whenever that count fits beside the visible notice.
 ///
 /// Replaying an already bounded value returns it byte-for-byte unchanged.
-#[must_use]
 pub fn truncate_persisted_text(value: &str) -> Str {
 	let characters = xutf::codepoints::<Utf8>(value.as_bytes()).count();
 	if characters <= MAX_PERSISTED_CHARS {

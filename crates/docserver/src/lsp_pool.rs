@@ -58,7 +58,6 @@ where
 	E: StdError + Send + Sync + 'static,
 {
 	/// Creates a pool with an explicit negative-cache lifetime.
-	#[must_use]
 	pub fn new(backoff: Duration) -> Self {
 		Self { backoff, entries: Mutex::new(HashMap::new()) }
 	}
@@ -137,7 +136,6 @@ where
 	}
 
 	/// Returns whether a fingerprint has any ready, failed, or in-flight slot.
-	#[must_use]
 	pub fn contains(&self, key: &LspPoolKey) -> bool {
 		self.entries.lock().contains_key(key)
 	}

@@ -51,7 +51,6 @@ pub struct LogViewer {
 
 impl LogViewer {
 	/// Opens the viewer on a newest bounded chunk.
-	#[must_use]
 	pub fn open(entries: Vec<LogEntry>, current_pid: u32, has_older: bool, ctx: &UiContext) -> Self {
 		let mut viewer = Self {
 			entries,
@@ -166,7 +165,6 @@ impl LogViewer {
 	}
 
 	/// Requests older data when the cursor is at the oldest visible entry.
-	#[must_use]
 	pub fn older_event(&self) -> LogViewerEvent {
 		if self.has_older && self.cursor == 0 {
 			LogViewerEvent::LoadOlder

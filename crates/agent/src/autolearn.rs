@@ -74,7 +74,6 @@ pub struct AutolearnController {
 
 impl AutolearnController {
 	/// Creates a controller from the current live settings projection.
-	#[must_use]
 	pub const fn new(settings: AutolearnSettings) -> Self {
 		Self {
 			settings,
@@ -156,7 +155,6 @@ impl AutolearnController {
 	}
 
 	/// Whether the turn currently running is the controller's private capture.
-	#[must_use]
 	pub const fn capture_in_flight(&self) -> bool {
 		self.capture_in_flight
 	}
@@ -168,7 +166,6 @@ const fn suppressed_mode(mode: ExecutionMode) -> bool {
 
 /// Builds stable standing guidance from the tools actually active for this
 /// session.
-#[must_use]
 pub fn standing_guidance(manage_skill: bool, learn: bool) -> Option<PromptNamedInput> {
 	if !manage_skill {
 		return None;
@@ -186,7 +183,6 @@ pub fn standing_guidance(manage_skill: bool, learn: bool) -> Option<PromptNamedI
 }
 
 /// Builds the one synthetic Idle-mailbox capture input.
-#[must_use]
 pub fn capture_interrupt() -> Interrupt {
 	let mut props = ValueMap::default();
 	props
@@ -210,7 +206,6 @@ pub fn capture_interrupt() -> Interrupt {
 }
 
 /// Returns whether a durable item is the private capture marker.
-#[must_use]
 pub fn is_capture_item(item: &Item) -> bool {
 	item
 		.props

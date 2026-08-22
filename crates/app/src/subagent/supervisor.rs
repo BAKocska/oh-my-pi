@@ -50,7 +50,6 @@ pub struct SupervisedRuntime<C: TurnClient> {
 
 impl<C: TurnClient> SupervisedRuntime<C> {
 	/// Creates a supervised runtime around a fully configured durable loop.
-	#[must_use]
 	pub fn new(agent: Agent<C>) -> Self {
 		Self { agent, resources: Vec::new() }
 	}
@@ -102,7 +101,6 @@ pub struct SessionSupervisor<C: TurnClient + Send + 'static> {
 
 impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 	/// Creates one supervisor for a session's complete child roster.
-	#[must_use]
 	pub fn new(tree: Arc<AgentTree>) -> Self {
 		Self {
 			tree,
@@ -124,7 +122,6 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 	}
 
 	/// Returns the parent board used for self-delivering durable child turns.
-	#[must_use]
 	pub fn parent_jobs(&self) -> Option<Arc<JobBoard>> {
 		self.parent_jobs.read().clone()
 	}
@@ -317,7 +314,6 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 	}
 
 	/// Returns retained state without requiring a live listener or child loop.
-	#[must_use]
 	pub fn state(&self, id: &str) -> Option<Arc<SubagentRunState>> {
 		self
 			.children

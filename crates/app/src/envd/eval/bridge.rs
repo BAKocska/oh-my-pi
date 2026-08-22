@@ -281,6 +281,7 @@ impl BridgeDispatcher {
 	}
 }
 
+#[must_use]
 struct RegistrationLease {
 	dispatcher: BridgeDispatcher,
 	grant:      BridgeGrant,
@@ -576,6 +577,7 @@ impl EvalSessionConfig {
 }
 
 /// Revocable parent binding for one embedded session owner.
+#[must_use]
 pub struct ParentBindingLease {
 	parents:    Arc<Mutex<BTreeMap<Str, ParentBinding>>>,
 	owner:      Str,

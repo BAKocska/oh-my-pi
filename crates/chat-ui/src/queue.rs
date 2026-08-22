@@ -13,7 +13,6 @@ pub struct QueueItem {
 
 /// Splits delimiter or sequential-list shorthand into queued messages.
 /// Ordinary prose always returns exactly one item.
-#[must_use]
 pub fn split(text: &str) -> Vec<QueueItem> {
 	let trimmed = text.trim();
 	if let Some(body) = trimmed

@@ -125,7 +125,6 @@ pub struct RewriteBlockAccumulator {
 
 impl RewriteBlockAccumulator {
 	/// Creates an empty accumulator.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { buffer: String::new(), line: String::new(), fence: None }
 	}

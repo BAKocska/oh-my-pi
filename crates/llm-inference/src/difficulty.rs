@@ -63,25 +63,21 @@ impl Difficulty {
 	];
 
 	/// Clamps this level to an explicit effort ceiling.
-	#[must_use]
 	pub fn clamped(self, ceiling: Self) -> Self {
 		self.min(ceiling)
 	}
 
 	/// Clamps an `auto` provisional level below the maximum rung.
-	#[must_use]
 	pub fn provisional(self, ceiling: Self) -> Self {
 		self.min(Self::High).min(ceiling)
 	}
 
 	/// Stable lowercase classifier label.
-	#[must_use]
 	pub const fn label(self) -> &'static str {
 		Self::ONLINE_LABELS[self as usize].0
 	}
 
 	/// Converts this classifier rung to the canonical reasoning effort.
-	#[must_use]
 	pub const fn effort(self) -> omp_proto::omp::inference::v1::Effort {
 		use omp_proto::omp::inference::v1::Effort;
 		match self {
@@ -158,7 +154,6 @@ impl AutoDifficulty {
 	///
 	/// A missing or blank reason is an explicit no-op hook and bypasses backend
 	/// classification; a non-empty reason keeps normal classification active.
-	#[must_use]
 	pub fn with_prewalk_reason(mut self, reason: Option<&str>) -> Self {
 		self.prewalk_noop = reason.is_none_or(|reason| reason.trim().is_empty());
 		self
@@ -192,7 +187,6 @@ pub struct OnlineDifficultyError {
 
 impl OnlineDifficultyError {
 	/// Constructs a backend-classified failure.
-	#[must_use]
 	pub fn new(message: impl Into<Str>, transient: bool) -> Self {
 		Self { message: message.into(), transient }
 	}
@@ -213,7 +207,6 @@ pub struct DifficultyClassifier {
 
 impl DifficultyClassifier {
 	/// Creates an empty classifier cache.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -256,7 +249,6 @@ impl DifficultyClassifier {
 	///
 	/// This is useful while an online or local classifier is unavailable and for
 	/// callers that receive a prewalk no-op result before backend selection.
-	#[must_use]
 	pub fn fallback(
 		&self,
 		input: &str,
@@ -377,7 +369,6 @@ impl DifficultyClassifier {
 }
 
 /// Removes control bytes, normalizes whitespace, and bounds classifier input.
-#[must_use]
 pub fn sanitize_classifier_input(input: &str) -> Str {
 	let mut output = String::with_capacity(input.len().min(INPUT_LIMIT));
 	let mut pending_space = false;

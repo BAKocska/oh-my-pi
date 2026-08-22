@@ -40,13 +40,11 @@ impl Default for SseDecoder {
 
 impl SseDecoder {
 	/// Creates a decoder with the default 16 MiB event bound.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::with_max_frame_bytes(DEFAULT_MAX_FRAME_BYTES)
 	}
 
 	/// Creates a decoder with an explicit maximum encoded event size.
-	#[must_use]
 	pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
 		Self {
 			buffer:          BytesMut::new(),
@@ -77,25 +75,21 @@ impl SseDecoder {
 	}
 
 	/// Returns bytes retained for the incomplete event.
-	#[must_use]
 	pub fn buffered_len(&self) -> usize {
 		self.buffer.len()
 	}
 
 	/// Returns the most recently accepted `id:` field.
-	#[must_use]
 	pub fn last_event_id(&self) -> Option<&str> {
 		self.last_event_id.as_ref().map(Str::as_str)
 	}
 
 	/// Returns the most recently accepted non-negative `retry:` value.
-	#[must_use]
 	pub const fn retry_ms(&self) -> Option<u64> {
 		self.retry_ms
 	}
 
 	/// Returns whether the terminal `[DONE]` sentinel was consumed.
-	#[must_use]
 	pub const fn is_done(&self) -> bool {
 		self.done_sentinel
 	}

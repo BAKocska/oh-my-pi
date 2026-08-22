@@ -46,13 +46,11 @@ pub struct LspBindingId(u64);
 impl LspBindingId {
 	/// Reconstructs a binding identity from its registry-local integer
 	/// representation.
-	#[must_use]
 	pub const fn from_u64(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the registry-local integer representation.
-	#[must_use]
 	pub const fn get(self) -> u64 {
 		self.0
 	}
@@ -68,7 +66,6 @@ pub struct LspBindingHandle {
 
 impl LspBindingHandle {
 	/// Returns the stable binding identity.
-	#[must_use]
 	pub const fn binding_id(self) -> LspBindingId {
 		self.binding_id
 	}
@@ -116,7 +113,6 @@ impl LspSelector {
 	}
 
 	/// Creates a selector matching every document.
-	#[must_use]
 	pub const fn all() -> Self {
 		Self {
 			languages:     Vec::new(),
@@ -145,25 +141,21 @@ impl LspSelector {
 	}
 
 	/// Returns the language restrictions in declaration order.
-	#[must_use]
 	pub fn languages(&self) -> &[LanguageId] {
 		&self.languages
 	}
 
 	/// Returns the URI-scheme restrictions in declaration order.
-	#[must_use]
 	pub fn schemes(&self) -> &[Str] {
 		&self.schemes
 	}
 
 	/// Returns the path glob restrictions in declaration order.
-	#[must_use]
 	pub fn path_patterns(&self) -> &[Str] {
 		&self.path_patterns
 	}
 
 	/// Reports whether this selector accepts a URI and language classification.
-	#[must_use]
 	pub fn matches(&self, uri: &Url, language: Option<&LanguageId>) -> bool {
 		let language_matches = self.languages.is_empty()
 			|| language.is_some_and(|language| self.languages.iter().any(|item| item == language));
@@ -216,39 +208,33 @@ impl LspBindingSpec {
 	}
 
 	/// Returns the unique binding name.
-	#[must_use]
 	pub fn name(&self) -> &str {
 		self.name.as_str()
 	}
 
 	/// Returns the deterministic selection priority. Higher values run first.
-	#[must_use]
 	pub const fn priority(&self) -> i32 {
 		self.priority
 	}
 
 	/// Returns the binding selector.
-	#[must_use]
 	pub const fn selector(&self) -> &LspSelector {
 		&self.selector
 	}
 
 	/// Marks whether this binding is a linter/checker.
-	#[must_use]
 	pub const fn with_linter(mut self, is_linter: bool) -> Self {
 		self.is_linter = is_linter;
 		self
 	}
 
 	/// Installs ancestor root markers used to exclude unrelated files.
-	#[must_use]
 	pub fn with_root_markers(mut self, root_markers: Vec<Str>) -> Self {
 		self.root_markers = root_markers;
 		self
 	}
 
 	/// Applies lifecycle timing policy from the resolved declaration.
-	#[must_use]
 	pub const fn with_lifecycle(
 		mut self,
 		idle_timeout: Option<Duration>,
@@ -260,13 +246,11 @@ impl LspBindingSpec {
 	}
 
 	/// Returns whether this is a linter/checker binding.
-	#[must_use]
 	pub const fn is_linter(&self) -> bool {
 		self.is_linter
 	}
 
 	/// Returns configured ancestor root markers.
-	#[must_use]
 	pub fn root_markers(&self) -> &[Str] {
 		&self.root_markers
 	}
@@ -293,13 +277,11 @@ pub struct LspBindingInfo {
 
 impl LspBindingInfo {
 	/// Returns the binding identity.
-	#[must_use]
 	pub const fn id(&self) -> LspBindingId {
 		self.id
 	}
 
 	/// Returns the binding declaration.
-	#[must_use]
 	pub const fn spec(&self) -> &LspBindingSpec {
 		&self.spec
 	}
@@ -316,19 +298,16 @@ pub struct LspLeaseBinding {
 
 impl LspLeaseBinding {
 	/// Returns the installed binding description.
-	#[must_use]
 	pub const fn info(&self) -> &LspBindingInfo {
 		&self.info
 	}
 
 	/// Returns the selector-resolved synchronization policy.
-	#[must_use]
 	pub const fn sync_policy(&self) -> &SyncPolicy {
 		&self.sync_policy
 	}
 
 	/// Returns exact `InitializeResult` capability JSON.
-	#[must_use]
 	pub const fn capabilities_json(&self) -> &Bytes {
 		&self.capabilities_json
 	}
@@ -363,44 +342,37 @@ pub struct TaggedLspEvent {
 
 impl TaggedLspEvent {
 	/// Returns the server binding that emitted the event.
-	#[must_use]
 	pub const fn binding_id(&self) -> LspBindingId {
 		self.binding_id
 	}
 
 	/// Returns the server binding name captured with the event.
-	#[must_use]
 	pub fn binding_name(&self) -> &str {
 		self.binding_name.as_str()
 	}
 
 	/// Returns the inbound LSP method.
-	#[must_use]
 	pub fn method(&self) -> &str {
 		self.method.as_str()
 	}
 
 	/// Returns the exact inbound JSON parameters.
-	#[must_use]
 	pub const fn params_json(&self) -> &Bytes {
 		&self.params_json
 	}
 
 	/// Returns the daemon revision proven by a URI/version pair, if any.
-	#[must_use]
 	pub const fn revision(&self) -> Option<Revision> {
 		self.revision
 	}
 
 	/// Returns the document identity proven by the binding's public version
 	/// history, if the notification names one unambiguously.
-	#[must_use]
 	pub const fn document_identity(&self) -> Option<&(DocumentId, Url)> {
 		self.document_identity.as_ref()
 	}
 
 	/// Returns the document identity proven for this notification, if any.
-	#[must_use]
 	pub fn document_id(&self) -> Option<DocumentId> {
 		self
 			.document_identity
@@ -409,7 +381,6 @@ impl TaggedLspEvent {
 	}
 
 	/// Returns the document URI proven for this notification, if any.
-	#[must_use]
 	pub fn document_uri(&self) -> Option<&Url> {
 		self.document_identity.as_ref().map(|(_, uri)| uri)
 	}
@@ -475,19 +446,16 @@ pub struct LspBindingEvent {
 
 impl LspBindingEvent {
 	/// Returns the binding affected by this change.
-	#[must_use]
 	pub const fn binding_id(&self) -> LspBindingId {
 		self.binding_id
 	}
 
 	/// Returns the affected open document for document-scoped policy changes.
-	#[must_use]
 	pub const fn document_id(&self) -> Option<DocumentId> {
 		self.document_id
 	}
 
 	/// Returns the lifecycle or policy transition.
-	#[must_use]
 	pub const fn kind(&self) -> LspBindingEventKind {
 		self.kind
 	}
@@ -525,32 +493,27 @@ pub struct LspDocumentLease {
 
 impl LspDocumentLease {
 	/// Returns the underlying document-store lease identity.
-	#[must_use]
 	pub const fn lease_id(&self) -> LeaseId {
 		self.lease_id
 	}
 
 	/// Returns the committed head admitted by the open operation.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns selected bindings in deterministic priority order.
-	#[must_use]
 	pub fn binding_ids(&self) -> &[LspBindingId] {
 		&self.binding_ids
 	}
 
 	/// Returns this lease's ordered committed-document event stream.
-	#[must_use]
 	pub const fn events(&self) -> &flume::Receiver<Result<DocumentEvent, DocumentEventStreamError>> {
 		&self.events
 	}
 
 	/// Splits the lease into its identity, initial head, selected bindings, and
 	/// event stream.
-	#[must_use]
 	pub fn into_parts(
 		self,
 	) -> (
@@ -643,6 +606,7 @@ pub struct LspRegistry {
 }
 
 /// Releases actor-event publication for one committed inbound LSP transaction.
+#[must_use]
 pub(crate) struct LspPublicationBarrier {
 	registry:       LspRegistry,
 	transaction_id: TransactionId,
@@ -682,7 +646,6 @@ impl std::fmt::Debug for LspRegistry {
 
 impl LspRegistry {
 	/// Creates an empty registry above a document store.
-	#[must_use]
 	pub fn new(store: DocumentStore) -> Self {
 		Self {
 			inner: Arc::new(RegistryInner {
@@ -695,7 +658,6 @@ impl LspRegistry {
 	}
 
 	/// Returns the project document store used for revision admission.
-	#[must_use]
 	pub fn document_store(&self) -> &DocumentStore {
 		&self.inner.store
 	}
@@ -704,7 +666,6 @@ impl LspRegistry {
 	///
 	/// Receivers observe [`broadcast::error::RecvError::Lagged`] when they fall
 	/// behind instead of silently losing notifications.
-	#[must_use]
 	pub fn subscribe_events(&self) -> broadcast::Receiver<LspRegistryEvent> {
 		self.inner.events.subscribe()
 	}
@@ -820,7 +781,6 @@ impl LspRegistry {
 	}
 
 	/// Runs periodic inactivity reaping until cancelled.
-	#[must_use]
 	pub fn spawn_idle_reaper(
 		&self,
 		interval: Duration,
@@ -1750,7 +1710,6 @@ impl LspRegistry {
 	}
 
 	/// Returns the negotiated position encoding for a diagnostic event.
-	#[must_use]
 	pub fn diagnostic_position_encoding(
 		&self,
 		event: &TaggedLspEvent,
@@ -2874,7 +2833,6 @@ const fn lsp_document<'a>(
 
 /// Finds the nearest ancestor containing any configured root marker. Glob
 /// markers are matched only against direct children of each ancestor.
-#[must_use]
 pub fn root_marker_ancestor(file: &Path, markers: &[Str]) -> Option<PathBuf> {
 	let mut directory = if file.is_dir() {
 		file.to_owned()

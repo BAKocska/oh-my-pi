@@ -39,7 +39,6 @@ impl IndexRun {
 	///
 	/// Debug builds assert that every adjacent pair is consecutive. An empty
 	/// slice produces an empty run.
-	#[must_use]
 	pub fn from_contiguous(indexes: &[u64]) -> Self {
 		debug_assert!(
 			indexes
@@ -53,7 +52,6 @@ impl IndexRun {
 	}
 
 	/// Returns the first physical index, if this run is non-empty.
-	#[must_use]
 	pub const fn first(self) -> Option<u64> {
 		if self.count == 0 {
 			None
@@ -63,13 +61,11 @@ impl IndexRun {
 	}
 
 	/// Returns the number of physical indexes in this run.
-	#[must_use]
 	pub fn len(self) -> usize {
 		usize::try_from(self.count).expect("index count fits in usize")
 	}
 
 	/// Returns whether this run contains no physical indexes.
-	#[must_use]
 	pub const fn is_empty(self) -> bool {
 		self.count == 0
 	}

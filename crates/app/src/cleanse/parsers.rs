@@ -101,7 +101,6 @@ pub struct ParserInput<'a> {
 }
 
 /// Parses one invocation into deduplicated project-relative diagnostics.
-#[must_use]
 pub fn parse(kind: ParserKind, input: &ParserInput<'_>) -> Vec<Diagnostic> {
 	let combined = if input.stderr.is_empty() {
 		input.stdout.to_owned()

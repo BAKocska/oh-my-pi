@@ -17,7 +17,6 @@ pub enum KeyPlatform {
 
 impl KeyPlatform {
 	/// Returns the platform of the current application build.
-	#[must_use]
 	pub const fn current() -> Self {
 		#[cfg(target_os = "macos")]
 		{
@@ -41,7 +40,6 @@ const DEQUEUE_DEFAULT: &[&str] = &["ctrl+up"];
 const NO_FALLBACK: &[&str] = &[];
 
 /// Resolves platform-specific fallback chords for an unconfigured action.
-#[must_use]
 pub fn fallback_chords(action: &str, platform: KeyPlatform) -> &'static [&'static str] {
 	match (action, platform) {
 		("app.message.follow_up", KeyPlatform::Windows) => FOLLOW_UP_WINDOWS,

@@ -22,7 +22,6 @@ pub struct Measurement {
 }
 
 /// Parses finite `METRIC name=value` lines, rejecting prototype-pollution keys.
-#[must_use]
 pub fn parse_metric_lines(output: &str) -> Metrics {
 	let mut metrics = BTreeMap::new();
 	for line in output.lines() {
@@ -46,7 +45,6 @@ pub fn parse_metric_lines(output: &str) -> Metrics {
 }
 
 /// Parses and recursively sanitizes `ASI key=value` lines.
-#[must_use]
 pub fn parse_asi_lines(output: &str) -> Asi {
 	let mut asi = Asi::new();
 	for line in output.lines() {
@@ -102,7 +100,6 @@ fn sanitize_json(value: serde_json::Value) -> Option<serde_json::Value> {
 }
 
 /// Infers pi's conventional unit suffix from a metric key.
-#[must_use]
 pub fn infer_metric_unit(name: &str) -> &'static str {
 	if name.ends_with("µs") || name.ends_with("_µs") {
 		"µs"
@@ -120,7 +117,6 @@ pub fn infer_metric_unit(name: &str) -> &'static str {
 }
 
 /// Returns whether `current` improves on `best`.
-#[must_use]
 pub const fn is_better(current: f64, best: f64, direction: MetricDirection) -> bool {
 	match direction {
 		MetricDirection::Lower => current < best,
@@ -129,7 +125,6 @@ pub const fn is_better(current: f64, best: f64, direction: MetricDirection) -> b
 }
 
 /// Computes improvement divided by median absolute deviation.
-#[must_use]
 pub fn mad_confidence(
 	measurements: &[Measurement],
 	segment: u32,
@@ -185,7 +180,6 @@ fn median(values: &[f64]) -> f64 {
 }
 
 /// Normalizes one repository-relative path specification.
-#[must_use]
 pub fn normalize_path(value: &str) -> Str {
 	let value = value.trim().replace('\\', "/");
 	let value = value.trim_start_matches("./").trim_end_matches('/');
@@ -197,7 +191,6 @@ pub fn normalize_path(value: &str) -> Str {
 }
 
 /// Returns whether a path is equal to or below one normalized path prefix.
-#[must_use]
 pub fn path_matches(path: &str, prefix: &str) -> bool {
 	let path = normalize_path(path);
 	let prefix = normalize_path(prefix);
@@ -209,7 +202,6 @@ pub fn path_matches(path: &str, prefix: &str) -> bool {
 }
 
 /// Computes scope violations for changed paths.
-#[must_use]
 pub fn scope_deviations(
 	paths: impl IntoIterator<Item = Str>,
 	scope: &[Str],
@@ -232,7 +224,6 @@ pub fn scope_deviations(
 }
 
 /// Makes a bounded, dated branch candidate matching pi's namespace.
-#[must_use]
 pub fn branch_candidate(goal: Option<&str>, date: &str, suffix: Option<u32>) -> Str {
 	let mut slug = String::new();
 	for character in goal.unwrap_or("experiment").chars() {

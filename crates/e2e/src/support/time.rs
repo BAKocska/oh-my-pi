@@ -89,7 +89,6 @@ pub struct DeterministicBarrier(Arc<TokioBarrier>);
 
 impl DeterministicBarrier {
 	/// Creates an N-party reusable barrier.
-	#[must_use]
 	pub fn new(parties: usize) -> Self {
 		Self(Arc::new(TokioBarrier::new(parties)))
 	}

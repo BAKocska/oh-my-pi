@@ -229,7 +229,6 @@ impl Default for Scheduler {
 
 impl Scheduler {
 	/// Creates an empty durable schedule projection.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { schedules: Mutex::new(HashMap::new()), completed: Mutex::new(HashSet::new()) }
 	}
@@ -249,7 +248,6 @@ impl Scheduler {
 	}
 
 	/// Returns a copy of a declared schedule.
-	#[must_use]
 	pub fn schedule(&self, id: &str) -> Option<Schedule> {
 		self.schedules.lock().get(id).cloned()
 	}
@@ -309,7 +307,6 @@ impl Scheduler {
 	}
 
 	/// Applies a missed-run policy to already-calculated missed timestamps.
-	#[must_use]
 	pub fn recover_missed(&self, schedule_id: &str, missed: &[u64]) -> Vec<u64> {
 		let mut schedules = self.schedules.lock();
 		let Some(schedule) = schedules.get_mut(schedule_id) else {
@@ -349,7 +346,6 @@ const fn validate(schedule: &Schedule) -> Result<(), ScheduleError> {
 }
 
 /// Constructs the stable idempotency key for an occurrence.
-#[must_use]
 pub fn firing_key(schedule_id: &str, at_ms: u64) -> Str {
 	sf!("{schedule_id}:{at_ms}")
 }

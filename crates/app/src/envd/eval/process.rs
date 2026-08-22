@@ -1591,7 +1591,6 @@ fn spawn_env_allowed(name: &OsStr) -> bool {
 /// Selection follows the explicit override, active virtual environment,
 /// project virtual environments, Conda, uv, pyenv, then `PATH`. Production
 /// falls back to the embedded `CPython` identity when this returns `None`.
-#[must_use]
 pub fn discover_external_python(cwd: &Path, explicit: Option<&OsStr>) -> Option<PathBuf> {
 	let executable = if cfg!(windows) {
 		"python.exe"

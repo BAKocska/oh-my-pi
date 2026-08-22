@@ -37,7 +37,6 @@ pub struct SyntheticUsageFetcher {
 }
 impl SyntheticUsageFetcher {
 	/// Constructs a fetcher over the shared bounded HTTP client.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}

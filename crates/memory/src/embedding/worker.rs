@@ -31,7 +31,6 @@ impl Default for EmbeddingWorker {
 
 impl EmbeddingWorker {
 	/// Creates an unloaded worker.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self {
 			#[cfg(feature = "local-embedding")]

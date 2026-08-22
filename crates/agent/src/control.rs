@@ -127,7 +127,6 @@ type JournalReplyResult<T> = Result<T, JournalError>;
 /// The channel is unbounded because every durable request already has a bounded
 /// protobuf frame and backpressure happens at the worker request correlation
 /// slot. The receiver must stay with the sole [`Journal`] owner.
-#[must_use]
 pub fn channel() -> (ControlSender, ControlMailbox) {
 	let (commands, receiver) = flume::unbounded();
 	let checkpoint_state = Arc::new(Mutex::new(CheckpointState::default()));

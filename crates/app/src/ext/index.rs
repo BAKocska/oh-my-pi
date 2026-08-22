@@ -183,7 +183,6 @@ impl SignedIndex {
 	}
 
 	/// Looks up one non-yanked exact release.
-	#[must_use]
 	pub fn release(&self, id: &str, version: &str) -> Option<(&IndexExtension, &IndexRelease)> {
 		let extension = self
 			.extensions

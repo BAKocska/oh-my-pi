@@ -112,7 +112,6 @@ impl Pattern {
 	/// # Arguments
 	///
 	/// * `value` - Whether or not to enable extended globbing (extglob).
-	#[must_use]
 	pub const fn set_extended_globbing(mut self, value: bool) -> Self {
 		self.enable_extended_globbing = value;
 		self
@@ -123,7 +122,6 @@ impl Pattern {
 	/// # Arguments
 	///
 	/// * `value` - Whether or not to enable multiline matching.
-	#[must_use]
 	pub const fn set_multiline(mut self, value: bool) -> Self {
 		self.multiline = value;
 		self
@@ -134,7 +132,6 @@ impl Pattern {
 	/// # Arguments
 	///
 	/// * `value` - Whether or not to enable case-insensitive matching.
-	#[must_use]
 	pub const fn set_case_insensitive(mut self, value: bool) -> Self {
 		self.case_insensitive = value;
 		self

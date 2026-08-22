@@ -81,13 +81,11 @@ impl Default for OpenAiEmbeddingCodec {
 impl OpenAiEmbeddingCodec {
 	/// Constructs a codec from route-protocol constants; model evidence is
 	/// supplied per call.
-	#[must_use]
 	pub const fn new(profile: OpenAiEmbeddingProfile) -> Self {
 		Self { profile }
 	}
 
 	/// Constructs the fixed direct `OpenAI` `/embeddings` protocol profile.
-	#[must_use]
 	pub fn for_openai_protocol() -> Self {
 		Self::new(openai_protocol_profile())
 	}

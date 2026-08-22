@@ -236,13 +236,11 @@ impl LspCapabilities {
 	}
 
 	/// Returns the exact capability JSON supplied at construction.
-	#[must_use]
 	pub const fn raw_json(&self) -> &Bytes {
 		&self.raw
 	}
 
 	/// Resolves static and dynamic capabilities for a URI and language.
-	#[must_use]
 	pub fn policy_for(&self, uri: &Url, language: Option<&str>) -> SyncPolicy {
 		self.resolve(uri, language).public
 	}
@@ -665,7 +663,6 @@ impl LspServer {
 	}
 
 	/// Returns the current pending-request count and inactivity duration.
-	#[must_use]
 	pub fn activity(&self) -> LspActivity {
 		let activity = self.inner.activity.lock();
 		LspActivity { idle_for: activity.last.elapsed(), pending_requests: activity.pending }

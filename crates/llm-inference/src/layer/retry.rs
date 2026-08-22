@@ -60,7 +60,6 @@ impl TransportRetryLayer {
 	}
 
 	/// Overrides full-jitter bounds from the typed retry settings snapshot.
-	#[must_use]
 	pub const fn with_backoff(mut self, backoff: RetryBackoff) -> Self {
 		self.backoff = backoff;
 		self
@@ -160,7 +159,6 @@ where
 /// Calculates `Uniform(0, min(maximum, base * 2^attempt))`.
 ///
 /// `sample` is injected for deterministic tests; production uses OS entropy.
-#[must_use]
 pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> std::time::Duration {
 	let factor = 1_u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
 	let ceiling = policy

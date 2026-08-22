@@ -120,7 +120,6 @@ pub struct ResolvedAdvisorSchedule {
 
 impl AdvisorConfigSnapshot {
 	/// Resolves enabled advisors against the session's actual built-in tools.
-	#[must_use]
 	pub fn schedule(
 		&self,
 		primary_session: &str,
@@ -214,7 +213,6 @@ impl AdvisorConfigSnapshot {
 ///
 /// Files are applied user-first and then project ancestor-to-leaf. Duplicate
 /// advisor slugs therefore resolve to the closest project declaration.
-#[must_use]
 pub fn discover(cwd: &Path, agent_dir: Option<&Path>) -> AdvisorConfigSnapshot {
 	let home = std::env::var_os("HOME").map_or_else(|| cwd.to_path_buf(), PathBuf::from);
 	let agent_dir = agent_dir.map_or_else(|| user_config_root(&home), Path::to_path_buf);
@@ -425,7 +423,6 @@ pub struct AdvisorProviderSessions {
 
 impl AdvisorProviderSessions {
 	/// Returns the existing provider affinity id or allocates it once.
-	#[must_use]
 	pub fn get_or_create(&self, primary_session: &str, advisor_slug: &str) -> Str {
 		let key = (Str::new(primary_session), Str::new(advisor_slug));
 		let mut ids = self.ids.lock();

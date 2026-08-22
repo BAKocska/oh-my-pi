@@ -371,10 +371,10 @@ float_cmp = "allow" # Tests mostly do this + we know what we're doing
 # Functions & Closures
 # ──────────────────────────────────────────────────────────────────────────────
 inline_always = "allow"                      # Needed for performance-critical code
-must_use_candidate = "allow"                 # Not every function needs #[must_use]
+must_use_candidate = "allow"                 # Only lifecycle guards opt into #[must_use]
 needless_pass_by_value = "allow"
 redundant_closure_for_method_calls = "allow" # .map(ToString::to_string) can be clearer
-return_self_not_must_use = "allow"           # Builder pattern methods
+return_self_not_must_use = "allow"           # Builder chains do not require #[must_use]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Structs & Types

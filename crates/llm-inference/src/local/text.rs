@@ -206,7 +206,6 @@ impl ClassifierLadder {
 	}
 
 	/// Borrows the accepted labels in their deterministic ladder order.
-	#[must_use]
 	pub fn labels(&self) -> &[Str] {
 		&self.labels
 	}

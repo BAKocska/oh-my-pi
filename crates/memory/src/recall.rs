@@ -133,7 +133,6 @@ pub struct RecallEngine<'a> {
 
 impl<'a> RecallEngine<'a> {
 	/// Creates recall over project-first scoped stores.
-	#[must_use]
 	pub const fn new(
 		stores: &'a [BankStore],
 		project_bank: &'a BankId,
@@ -386,7 +385,6 @@ fn normalize(vector: &[f32]) -> Option<Vec<f32>> {
 }
 
 /// Removes literal project-bank terms for a second shared-bank recall pass.
-#[must_use]
 pub fn derive_shared_fallback(query: &str, project: &BankId, shared: &BankId) -> Option<String> {
 	if project == shared {
 		return None;

@@ -127,7 +127,6 @@ fn validate_doc_path(relative: &str) -> Result<(), Fault> {
 /// Scores a case-insensitive fuzzy subsequence match.
 ///
 /// Exact, prefix, and substring matches outrank scattered subsequences.
-#[must_use]
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<u32> {
 	if query.is_empty() {
 		return Some(1);
@@ -233,13 +232,11 @@ impl Scheme {
 
 	/// Parses a caller spelling, mapping syntactically valid unrecognized names
 	/// to [`Scheme::Unknown`].
-	#[must_use]
 	pub fn parse(value: &str) -> Self {
 		Self::from_str(value).unwrap_or(Self::Unknown)
 	}
 
 	/// Whether this scheme's resource grammar permits a trailing read selector.
-	#[must_use]
 	pub const fn accepts_selectors(self) -> bool {
 		!matches!(self, Self::Mcp | Self::Unknown)
 	}
@@ -269,7 +266,6 @@ pub struct ResolverId(usize);
 
 impl ResolverId {
 	/// Returns the resolver's constructor-order index.
-	#[must_use]
 	pub const fn index(self) -> usize {
 		self.0
 	}
@@ -444,7 +440,6 @@ pub struct SchemeEntry {
 impl SchemeEntry {
 	/// Constructs metadata, deriving canonical member and selector vocabulary
 	/// from the dense scheme.
-	#[must_use]
 	pub fn new(scheme: Scheme, readable: bool, mintable: bool, description: impl Into<Str>) -> Self {
 		Self {
 			scheme,
@@ -463,7 +458,6 @@ impl SchemeEntry {
 	}
 
 	/// Declares list, path, and completion capabilities.
-	#[must_use]
 	pub const fn with_capabilities(
 		mut self,
 		listable: bool,
@@ -478,14 +472,12 @@ impl SchemeEntry {
 
 	/// Bypasses generic byte truncation because the resolver owns a complete
 	/// bounded body (used by installed skill/rule documents).
-	#[must_use]
 	pub const fn with_whole_body(mut self, whole_body: bool) -> Self {
 		self.whole_body = whole_body;
 		self
 	}
 
 	/// Sets editability and the resolver-owned revision.
-	#[must_use]
 	pub const fn with_stamp(mut self, immutable: bool, revision: u64) -> Self {
 		self.immutable = immutable;
 		self.revision = revision;
@@ -557,7 +549,6 @@ impl<R> ResolverTableBuilder<R> {
 	}
 
 	/// Freezes registrations into an O(1) dispatch table.
-	#[must_use]
 	pub fn build(self) -> ResolverTable<R> {
 		let mut routes = SparseMap::with_capacity(Scheme::ALL.len());
 		let mut hasher = Hash32::hasher();
@@ -610,56 +601,47 @@ impl<R> Default for ResolverTable<R> {
 
 impl<R> ResolverTable<R> {
 	/// Starts an empty metadata-bearing resolver builder.
-	#[must_use]
 	pub fn builder() -> ResolverTableBuilder<R> {
 		ResolverTableBuilder::default()
 	}
 
 	/// Returns the dense route map used by dispatch.
-	#[must_use]
 	pub const fn routes(&self) -> &SparseMap<Scheme, ResolverId> {
 		&self.routes
 	}
 
 	/// Returns every registered scheme's live metadata.
-	#[must_use]
 	pub const fn entries(&self) -> &[SchemeEntry] {
 		&self.entries
 	}
 
 	/// Captures immutable metadata under the constructor-derived device digest.
-	#[must_use]
 	pub fn snapshot(&self) -> SchemeSnapshot {
 		SchemeSnapshot { device_hash: self.device_hash, entries: self.entries.clone() }
 	}
 
 	/// Returns the constructor-derived device digest.
-	#[must_use]
 	pub const fn device_hash(&self) -> [u8; 32] {
 		self.device_hash
 	}
 
 	/// Returns the immutable device-hash-keyed catalog revision.
-	#[must_use]
 	pub const fn revision(&self) -> u64 {
 		self.revision
 	}
 
 	/// Whether this deployment has a bounded raw-scheme fallback.
-	#[must_use]
 	pub const fn has_unknown_fallback(&self) -> bool {
 		self.unknown_fallback.is_some()
 	}
 
 	/// Returns metadata for one installed scheme.
-	#[must_use]
 	pub fn entry(&self, scheme: Scheme) -> Option<&SchemeEntry> {
 		let id = *self.routes.get(scheme)?;
 		self.entries.get(id.index())
 	}
 
 	/// Returns the live capability for one installed scheme.
-	#[must_use]
 	pub fn capability(&self, scheme: Scheme) -> Option<ResourceCapability> {
 		let entry = self.entry(scheme)?;
 		Some(ResourceCapability {
@@ -695,7 +677,6 @@ impl<R> ResolverTable<R> {
 	}
 
 	/// Returns the resolver selected for `scheme`.
-	#[must_use]
 	pub fn get(&self, scheme: Scheme) -> Option<&R> {
 		let id = *self.routes.get(scheme)?;
 		self.resolvers.get(id.index())
@@ -1023,7 +1004,6 @@ pub struct ArtifactResolver<C, B> {
 
 impl<C, B> ArtifactResolver<C, B> {
 	/// Constructs an artifact resolver with an empty line-offset cache.
-	#[must_use]
 	pub fn new(catalog: C, blobs: B) -> Self {
 		Self { catalog, blobs, lines: LineOffsetCache::default() }
 	}

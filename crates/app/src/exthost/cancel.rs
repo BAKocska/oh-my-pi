@@ -66,13 +66,11 @@ pub struct CancellationLadder {
 
 impl CancellationLadder {
 	/// Begins cancellation by sending `CancelDispatch` to the Python task scope.
-	#[must_use]
 	pub const fn begin(&self) -> CancellationOutcome {
 		CancellationOutcome::DispatchCancel
 	}
 
 	/// Advances after the first grace to the Python asynchronous exception.
-	#[must_use]
 	pub const fn interrupt_after_grace(&self) -> CancellationOutcome {
 		CancellationOutcome::InterruptThread
 	}
@@ -113,7 +111,6 @@ impl CancellationLadder {
 	}
 
 	/// Returns whether the extension was disabled by repeated forced kills.
-	#[must_use]
 	pub fn disabled(&self, extension: &HostKey) -> bool {
 		self
 			.forced_kills

@@ -28,7 +28,6 @@ macro_rules! record_id {
 		impl $name {
 			/// Borrows the identifier as text.
 			#[inline]
-			#[must_use]
 			pub fn as_str(&self) -> &str {
 				self.0.as_str()
 			}
@@ -635,7 +634,6 @@ pub struct InvocationTransitionError {
 
 impl InvocationTransitionError {
 	/// Returns the phase whose fact invariant was violated.
-	#[must_use]
 	pub const fn phase(self) -> InvocationPhase {
 		self.phase
 	}

@@ -32,7 +32,6 @@ pub struct GoalOutcome {
 }
 
 /// Renders live goal context for a typed prompt slot.
-#[must_use]
 pub fn prompt_context(goal: &Goal, todo: Option<&str>) -> Str {
 	let budget = goal
 		.token_budget

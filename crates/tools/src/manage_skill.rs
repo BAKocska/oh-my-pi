@@ -153,7 +153,6 @@ pub struct ManageSkillTool<A> {
 }
 
 /// Creates `manage_skill@1` over Environment-owned publication authority.
-#[must_use]
 pub fn tool<A: ManagedSkillAuthority>(authority: Arc<A>) -> ManageSkillTool<A> {
 	ManageSkillTool {
 		authority,

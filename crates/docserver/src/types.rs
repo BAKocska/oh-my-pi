@@ -52,19 +52,16 @@ macro_rules! opaque_id {
 
 		impl $name {
 			/// Creates an identifier from its stable 16-byte representation.
-			#[must_use]
 			pub const fn from_bytes(bytes: [u8; ID_LENGTH]) -> Self {
 				Self(bytes)
 			}
 
 			/// Returns the stable 16-byte representation.
-			#[must_use]
 			pub const fn as_bytes(&self) -> &[u8; ID_LENGTH] {
 				&self.0
 			}
 
 			/// Consumes the identifier and returns its stable byte representation.
-			#[must_use]
 			pub const fn into_bytes(self) -> [u8; ID_LENGTH] {
 				self.0
 			}
@@ -101,32 +98,27 @@ pub struct Revision {
 impl Revision {
 	/// Computes a revision for `content` at the supplied document-local
 	/// sequence.
-	#[must_use]
 	pub fn for_content(sequence: u64, content: &[u8]) -> Self {
 		Self { sequence, content_hash: Hash32::sum(content).into_bytes() }
 	}
 
 	/// Reconstructs a revision from a sequence and an already computed BLAKE3
 	/// hash.
-	#[must_use]
 	pub const fn from_hash(sequence: u64, content_hash: [u8; 32]) -> Self {
 		Self { sequence, content_hash }
 	}
 
 	/// Returns the document-local monotone sequence.
-	#[must_use]
 	pub const fn sequence(self) -> u64 {
 		self.sequence
 	}
 
 	/// Returns the BLAKE3-256 content hash.
-	#[must_use]
 	pub const fn content_hash(&self) -> &[u8; 32] {
 		&self.content_hash
 	}
 
 	/// Reports whether this revision identifies the supplied exact bytes.
-	#[must_use]
 	pub fn matches(self, content: &[u8]) -> bool {
 		self.content_hash == Hash32::sum(content).into_bytes()
 	}
@@ -157,7 +149,6 @@ impl LanguageId {
 	}
 
 	/// Returns the language identifier as text.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}
@@ -236,7 +227,6 @@ impl FileUriKey {
 	}
 
 	/// Returns the canonical percent-encoded file URI.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}
@@ -275,7 +265,6 @@ impl<V> Default for EquivalentUriMap<V> {
 
 impl<V> EquivalentUriMap<V> {
 	/// Creates an empty equivalent-URI map.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -301,13 +290,11 @@ impl<V> EquivalentUriMap<V> {
 	}
 
 	/// Returns the number of canonical file identities.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
 	/// Reports whether no canonical file identity is stored.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.entries.is_empty()
 	}
@@ -360,31 +347,26 @@ impl DocumentHead {
 	}
 
 	/// Returns the document identity.
-	#[must_use]
 	pub const fn document_id(&self) -> DocumentId {
 		self.document_id
 	}
 
 	/// Returns the committed revision.
-	#[must_use]
 	pub const fn revision(&self) -> Revision {
 		self.revision
 	}
 
 	/// Returns whether the document exists on disk.
-	#[must_use]
 	pub const fn presence(&self) -> DocumentPresence {
 		self.presence
 	}
 
 	/// Returns the interpretation of the document bytes.
-	#[must_use]
 	pub const fn kind(&self) -> &DocumentKind {
 		&self.kind
 	}
 
 	/// Returns the exact byte length.
-	#[must_use]
 	pub const fn byte_length(&self) -> u64 {
 		self.byte_length
 	}
@@ -425,20 +407,17 @@ impl DocumentSnapshot {
 	}
 
 	/// Returns the committed document head.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns the shared exact document bytes.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Splits the snapshot into its head and shared bytes without copying
 	/// content.
-	#[must_use]
 	pub fn into_parts(self) -> (DocumentHead, Bytes) {
 		(self.head, self.content)
 	}
@@ -454,7 +433,6 @@ pub struct FileMetadata {
 
 impl FileMetadata {
 	/// Captures the stable metadata fields used by document persistence.
-	#[must_use]
 	pub fn from_std(metadata: &fs::Metadata) -> Self {
 		Self {
 			byte_length: metadata.len(),
@@ -465,25 +443,21 @@ impl FileMetadata {
 
 	/// Constructs metadata from fields observed through a capability filesystem
 	/// handle.
-	#[must_use]
 	pub const fn new(byte_length: u64, modified: Option<SystemTime>, readonly: bool) -> Self {
 		Self { byte_length, modified, readonly }
 	}
 
 	/// Returns the file length in bytes.
-	#[must_use]
 	pub const fn byte_length(&self) -> u64 {
 		self.byte_length
 	}
 
 	/// Returns the last modification timestamp when the filesystem supplies one.
-	#[must_use]
 	pub const fn modified(&self) -> Option<SystemTime> {
 		self.modified
 	}
 
 	/// Reports whether the captured permissions were read-only.
-	#[must_use]
 	pub const fn readonly(&self) -> bool {
 		self.readonly
 	}
@@ -498,25 +472,21 @@ pub struct FileFingerprint {
 
 impl FileFingerprint {
 	/// Hashes the exact bytes read under `metadata`.
-	#[must_use]
 	pub fn for_content(metadata: FileMetadata, content: &[u8]) -> Self {
 		Self { metadata, content_hash: Hash32::sum(content).into_bytes() }
 	}
 
 	/// Returns the captured filesystem metadata.
-	#[must_use]
 	pub const fn metadata(&self) -> &FileMetadata {
 		&self.metadata
 	}
 
 	/// Returns the BLAKE3-256 hash of the bytes read from disk.
-	#[must_use]
 	pub const fn content_hash(&self) -> &[u8; 32] {
 		&self.content_hash
 	}
 
 	/// Reports whether both metadata and exact bytes still match.
-	#[must_use]
 	pub fn matches(&self, metadata: &FileMetadata, content: &[u8]) -> bool {
 		self.metadata == *metadata && self.content_hash == Hash32::sum(content).into_bytes()
 	}
@@ -541,25 +511,21 @@ macro_rules! half_open_range {
 			}
 
 			/// Returns the inclusive start coordinate.
-			#[must_use]
 			pub const fn start(self) -> u64 {
 				self.start
 			}
 
 			/// Returns the exclusive end coordinate.
-			#[must_use]
 			pub const fn end(self) -> u64 {
 				self.end
 			}
 
 			/// Returns the number of coordinates covered by the range.
-			#[must_use]
 			pub const fn len(self) -> u64 {
 				self.end - self.start
 			}
 
 			/// Reports whether the range is empty.
-			#[must_use]
 			pub const fn is_empty(self) -> bool {
 				self.start == self.end
 			}
@@ -625,6 +591,7 @@ impl Eq for ServerConfig {}
 
 /// Exclusive daemon authority held on the stable project directory itself.
 #[derive(Debug)]
+#[must_use]
 pub struct AuthorityLock {
 	root: fs::File,
 	held: Arc<AtomicBool>,
@@ -690,7 +657,6 @@ impl ServerConfig {
 	}
 
 	/// Sets the executable-generation identity advertised to document clients.
-	#[must_use]
 	pub fn with_server_build(mut self, build: impl Into<Str>) -> Self {
 		self.server_build = build.into();
 		self
@@ -698,13 +664,11 @@ impl ServerConfig {
 
 	/// Returns the executable-generation identity advertised to document
 	/// clients.
-	#[must_use]
 	pub const fn server_build(&self) -> &Str {
 		&self.server_build
 	}
 
 	/// Returns the canonical absolute Environment root.
-	#[must_use]
 	pub fn environment_root(&self) -> &Path {
 		&self.environment_root
 	}
@@ -760,26 +724,22 @@ impl ServerConfig {
 	}
 
 	/// Returns the number of immutable revisions retained per active document.
-	#[must_use]
 	pub const fn revision_capacity(&self) -> NonZeroUsize {
 		self.revision_capacity
 	}
 
 	/// Sets the number of immutable revisions retained per active document.
-	#[must_use]
 	pub const fn with_revision_capacity(mut self, capacity: NonZeroUsize) -> Self {
 		self.revision_capacity = capacity;
 		self
 	}
 
 	/// Returns the largest document snapshot admitted into memory.
-	#[must_use]
 	pub const fn max_document_bytes(&self) -> NonZeroU64 {
 		self.max_document_bytes
 	}
 
 	/// Sets the largest document snapshot admitted into memory.
-	#[must_use]
 	pub const fn with_max_document_bytes(mut self, limit: NonZeroU64) -> Self {
 		self.max_document_bytes = limit;
 		self

@@ -108,13 +108,11 @@ impl Default for ToolSettings {
 impl ToolSettings {
 	/// Whether a named tool is available after applying the default-enabled
 	/// rule.
-	#[must_use]
 	pub fn enabled(&self, name: &str) -> bool {
 		self.enabled.get(name).copied().unwrap_or(true)
 	}
 
 	/// Resolves and receipts one invocation against its live declared effects.
-	#[must_use]
 	pub fn approval_for(
 		&self,
 		invocation_id: impl Into<Str>,

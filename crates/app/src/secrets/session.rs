@@ -51,25 +51,21 @@ impl SecretSessionSnapshot {
 	}
 
 	/// Returns the boundary generation that sealed this snapshot.
-	#[must_use]
 	pub const fn generation(&self) -> u64 {
 		self.generation
 	}
 
 	/// Returns the complete ordered rule snapshot.
-	#[must_use]
 	pub fn rules(&self) -> &[SecretRule] {
 		&self.rules
 	}
 
 	/// Locks the session-local transform state.
-	#[must_use]
 	pub fn transform(&self) -> MutexGuard<'_, SecretObfuscator> {
 		self.transform.lock()
 	}
 
 	/// Returns the shared session transform for provider and agent-loop wiring.
-	#[must_use]
 	pub fn transform_handle(&self) -> Arc<Mutex<SecretObfuscator>> {
 		Arc::clone(&self.transform)
 	}

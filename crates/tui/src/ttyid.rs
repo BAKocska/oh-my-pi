@@ -39,7 +39,6 @@ pub const UNKNOWN_TERMINAL_ID: &str = "unknown";
 /// The TTY device name takes priority. When standard input is not a TTY, common
 /// multiplexer and terminal-emulator environment variables are consulted from
 /// the innermost to the outermost terminal.
-#[must_use]
 pub fn terminal_id() -> Str {
 	#[cfg(unix)]
 	{
@@ -60,7 +59,6 @@ pub fn terminal_id() -> Str {
 ///
 /// This is the deterministic core of [`terminal_id`]. The environment callback
 /// should return the value for the requested variable, or `None` when unset.
-#[must_use]
 pub fn terminal_id_with(
 	tty_path: Option<&Path>,
 	mut env: impl FnMut(&str) -> Option<OsString>,

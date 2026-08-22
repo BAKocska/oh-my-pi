@@ -454,7 +454,6 @@ impl Default for CompactionSettings {
 impl CompactionSettings {
 	/// Resolves duplicates while preserving the user's first-occurrence order.
 	/// Disabled automatic compaction resolves to an empty ladder.
-	#[must_use]
 	pub fn method_order(&self) -> CompactionMethodOrder {
 		if self.enabled {
 			CompactionMethodOrder::resolve(&self.method_order)
@@ -464,7 +463,6 @@ impl CompactionSettings {
 	}
 
 	/// Returns speculation options consumed by the agent coordinator.
-	#[must_use]
 	pub const fn speculation_options(&self) -> omp_agent::CompactionSpeculationOptions {
 		omp_agent::CompactionSpeculationOptions {
 			enabled:            self.async_enabled,
@@ -511,7 +509,6 @@ impl Default for AutoThinkingSettings {
 
 impl AutoThinkingSettings {
 	/// Builds immutable classifier inputs for an ordinary turn.
-	#[must_use]
 	pub const fn for_turn(self) -> omp_llm_inference::AutoDifficulty {
 		omp_llm_inference::AutoDifficulty {
 			provisional:  self.provisional,
@@ -522,7 +519,6 @@ impl AutoThinkingSettings {
 	}
 
 	/// Builds classifier inputs for a prewalk turn and applies its no-op hook.
-	#[must_use]
 	pub fn for_prewalk_turn(
 		self,
 		reason_to_execute: Option<&str>,
@@ -677,7 +673,6 @@ impl CollabSettings {
 
 	/// Resolves a trimmed participant name as setting → OS account →
 	/// `anonymous`.
-	#[must_use]
 	pub fn resolved_display_name(&self) -> Str {
 		let os_name = os_username();
 		resolve_collab_display_name(&self.display_name, os_name.as_deref())
@@ -881,7 +876,6 @@ pub fn current_with_overlays(
 
 impl Settings {
 	/// Returns the resolved runtime durations.
-	#[must_use]
 	pub const fn runtime_durations(&self) -> RuntimeDurations {
 		self.runtime
 	}

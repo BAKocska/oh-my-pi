@@ -27,7 +27,6 @@ pub struct FunctionSummary {
 }
 
 /// Converts runtime work samples into a folded-stack attachment.
-#[must_use]
 pub fn folded(samples: &[WorkSample]) -> ProfilePayload {
 	let mut weights = BTreeMap::<&str, u64>::new();
 	for sample in samples {
@@ -46,7 +45,6 @@ pub fn folded(samples: &[WorkSample]) -> ProfilePayload {
 }
 
 /// Builds a bounded top-functions table from native work samples.
-#[must_use]
 pub fn top_functions(samples: &[WorkSample], limit: usize) -> Vec<FunctionSummary> {
 	let total = samples
 		.iter()
@@ -85,7 +83,6 @@ pub fn top_functions(samples: &[WorkSample], limit: usize) -> Vec<FunctionSummar
 
 /// Renders an honest native-sample SVG bar flamegraph without browser profiler
 /// formats.
-#[must_use]
 pub fn flamegraph_svg(samples: &[WorkSample]) -> ProfilePayload {
 	let rows = top_functions(samples, 60);
 	let width = 1200_u64;
@@ -125,7 +122,6 @@ pub fn flamegraph_svg(samples: &[WorkSample]) -> ProfilePayload {
 
 /// Creates a redacted raw-stream attachment with an explicit private format
 /// label.
-#[must_use]
 pub fn raw_stream_dump(text: &str) -> ProfilePayload {
 	ProfilePayload {
 		path:   "raw-stream.txt".to_owned(),

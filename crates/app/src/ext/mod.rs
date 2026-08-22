@@ -162,7 +162,6 @@ pub struct ExtensionError {
 
 impl ExtensionError {
 	/// Creates a typed diagnostic.
-	#[must_use]
 	pub fn new(code: ExtensionCode, detail: impl AsRef<str>) -> Self {
 		Self { code, detail: Str::new(detail) }
 	}

@@ -22,7 +22,6 @@ static GLOBAL_PROVIDER_CAPTURE: LazyLock<RawProviderCapture> =
 	LazyLock::new(RawProviderCapture::default);
 
 /// Returns the process-global always-on provider capture authority.
-#[must_use]
 pub fn global_provider_capture() -> &'static RawProviderCapture {
 	&GLOBAL_PROVIDER_CAPTURE
 }
@@ -102,7 +101,6 @@ impl Default for RawProviderCapture {
 
 impl RawProviderCapture {
 	/// Builds an always-redacting ring with explicit hard bounds.
-	#[must_use]
 	pub fn new(capacity: usize, frame_bytes: usize, subscriber_capacity: usize) -> Self {
 		let redactor = credential_rules().ok().map(SecretRedactor::new);
 		Self {
@@ -162,7 +160,6 @@ impl RawProviderCapture {
 	}
 
 	/// Snapshots either the global ring or frames belonging to one session.
-	#[must_use]
 	pub fn snapshot(&self, session: Option<&str>) -> CaptureSnapshot {
 		let state = self.inner.lock();
 		let frames = state
@@ -183,7 +180,6 @@ impl RawProviderCapture {
 
 	/// Subscribes to global fan-out (`None`) or one exact session. The returned
 	/// channel is bounded and slow viewers never block inference.
-	#[must_use]
 	pub fn subscribe(&self, session: Option<&str>) -> flume::Receiver<CapturedFrame> {
 		let (sender, receiver) = flume::bounded(self.subscriber_capacity);
 		self

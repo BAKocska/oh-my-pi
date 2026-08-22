@@ -137,7 +137,6 @@ impl Router {
 	}
 
 	/// Installs the immutable runtime settings projection used for planning.
-	#[must_use]
 	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
 		self.settings = settings;
 		self
@@ -145,7 +144,6 @@ impl Router {
 
 	/// Returns the configured selector for one harness-owned auxiliary model
 	/// use.
-	#[must_use]
 	pub const fn special_selector(
 		&self,
 		purpose: omp_llm_catalog::settings::SpecialModelPurpose,

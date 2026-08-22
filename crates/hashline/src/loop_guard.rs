@@ -34,25 +34,21 @@ pub struct NoopRecord {
 
 impl NoopRecord {
 	/// Returns the consecutive identical no-op count including this attempt.
-	#[must_use]
 	pub const fn count(&self) -> usize {
 		self.count
 	}
 
 	/// Returns whether guidance remains soft or must be raised as a failure.
-	#[must_use]
 	pub const fn severity(&self) -> NoopSeverity {
 		self.severity
 	}
 
 	/// Returns the user-facing escalating diagnostic.
-	#[must_use]
 	pub fn diagnostic(&self) -> &str {
 		&self.diagnostic
 	}
 
 	/// Returns true when the caller must escalate to a tool failure.
-	#[must_use]
 	pub const fn should_escalate(&self) -> bool {
 		matches!(self.severity, NoopSeverity::Hard)
 	}
@@ -66,7 +62,6 @@ pub struct NoopLoopGuard {
 
 impl NoopLoopGuard {
 	/// Creates an empty per-session guard.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -132,13 +127,11 @@ impl NoopLoopGuard {
 	}
 
 	/// Returns the number of canonical paths with an active no-op counter.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
 	/// Returns whether the guard contains no active counters.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.entries.is_empty()
 	}
@@ -147,7 +140,6 @@ impl NoopLoopGuard {
 /// Computes a stable compact fingerprint for logs and metrics.
 ///
 /// Loop identity deliberately uses retained exact bytes instead of this hash.
-#[must_use]
 pub fn hash_patch_input(input: &[u8]) -> u32 {
 	xxh32(input, 0)
 }

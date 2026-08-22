@@ -82,13 +82,11 @@ impl Default for WebSocketTransport {
 
 impl WebSocketTransport {
 	/// Creates a WebSocket transport using the workspace rustls connector.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { ready_permit: false, captures: Arc::new(Mutex::new(Vec::new())) }
 	}
 
 	/// Returns stable attempt-ordered sanitized capture snapshots.
-	#[must_use]
 	pub fn captures(&self) -> Vec<WebSocketCapture> {
 		let mut captures = self
 			.captures

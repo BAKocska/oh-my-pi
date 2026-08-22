@@ -34,7 +34,6 @@ pub(crate) struct GithubService {
 }
 
 impl GithubService {
-	#[must_use]
 	pub(crate) fn new(
 		root: PathBuf,
 		state_dir: &Path,

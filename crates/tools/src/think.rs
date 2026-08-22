@@ -51,7 +51,6 @@ pub struct Think {
 }
 
 /// Creates `think@1`.
-#[must_use]
 pub fn tool() -> Think {
 	Think {
 		spec: ToolSpec {

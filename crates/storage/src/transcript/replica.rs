@@ -148,25 +148,21 @@ impl Replica {
 	}
 
 	/// Returns the stable local replica session identity.
-	#[must_use]
 	pub const fn session_id(&self) -> &SessionId {
 		&self.header.id
 	}
 
 	/// Returns the guest-local workspace root retained by the replica header.
-	#[must_use]
 	pub fn local_cwd(&self) -> &Path {
 		&self.header.cwd
 	}
 
 	/// Returns the secret-free host provenance.
-	#[must_use]
 	pub const fn remote_provenance(&self) -> &RemoteProvenance {
 		&self.header.remote
 	}
 
 	/// Returns the highest durably applied physical host revision.
-	#[must_use]
 	pub const fn host_revision_watermark(&self) -> u64 {
 		self.watermark
 	}

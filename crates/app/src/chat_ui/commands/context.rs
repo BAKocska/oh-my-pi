@@ -11,7 +11,6 @@ command!(context, 400, "context", [], "Show anchored context usage", [Context], 
 
 /// Renders only fields from an already anchored snapshot; this function never
 /// re-tokenizes or consults mutable chat state.
-#[must_use]
 pub fn render(snapshot: &ContextSnapshot) -> Str {
 	let mut output = String::with_capacity(320);
 	let _ = writeln!(

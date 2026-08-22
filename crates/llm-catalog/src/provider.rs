@@ -618,7 +618,6 @@ pub struct DiscoverySpec {
 impl DiscoverySpec {
 	/// Returns the periodic polling interval after applying the five-second
 	/// floor required for background discovery.
-	#[must_use]
 	pub fn polling_interval(&self) -> Option<Duration> {
 		self
 			.interval

@@ -26,19 +26,16 @@ impl Scratch {
 	}
 
 	/// Returns the private root containing all fixture-owned paths.
-	#[must_use]
 	pub fn root(&self) -> &Path {
 		self.root.path()
 	}
 
 	/// Returns the scratch workspace root.
-	#[must_use]
 	pub fn project(&self) -> &Path {
 		&self.project
 	}
 
 	/// Returns the state root kept outside the workspace.
-	#[must_use]
 	pub fn state(&self) -> &Path {
 		&self.state
 	}
@@ -56,7 +53,6 @@ impl Scratch {
 	}
 
 	/// Returns an endpoint path under the private state directory.
-	#[must_use]
 	pub fn socket(&self, name: &str) -> PathBuf {
 		self.state.join(name)
 	}

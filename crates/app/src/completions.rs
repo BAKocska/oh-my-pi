@@ -12,7 +12,6 @@ pub fn generate_script(shell: Shell, output: &mut dyn io::Write) {
 }
 
 /// Generates a shell script into owned bytes.
-#[must_use]
 pub fn script(shell: Shell) -> Vec<u8> {
 	let mut output = Vec::new();
 	generate_script(shell, &mut output);

@@ -298,7 +298,6 @@ fn redacted_server(server: &McpServerConfig) -> serde_json::Value {
 }
 
 /// Returns the selected native settings path.
-#[must_use]
 pub fn path(data_dir: &Path, project: &Path, scope: ConfigScope) -> PathBuf {
 	match scope {
 		ConfigScope::Global => data_dir.join("config.toml"),

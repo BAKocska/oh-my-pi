@@ -117,13 +117,11 @@ pub fn flatten_slots(
 }
 
 /// Whether the stable `dyn` slot is present under `policy`.
-#[must_use]
 pub const fn dyn_enabled(policy: ToolsPolicy) -> bool {
 	!matches!(policy, ToolsPolicy::ToolOnly)
 }
 
 /// Returns a parameter forbidden by the stable flat `dyn` envelope, if any.
-#[must_use]
 pub fn reserved_parameter(schema: &SchemaValue) -> Option<Str> {
 	let properties = schema.get("properties")?.as_object()?;
 	properties
@@ -205,7 +203,6 @@ pub enum OperationError {
 
 impl OperationError {
 	/// The fixed valid-op listing used by the structured fault projection.
-	#[must_use]
 	pub const fn valid_ops() -> &'static [&'static str] {
 		&["search", "docs", "invoke"]
 	}
@@ -243,7 +240,6 @@ pub fn parse_operation(value: &str) -> Result<Operation, OperationError> {
 }
 
 /// Converts a malformed `do_` envelope to the schema-echoing structured issue.
-#[must_use]
 pub fn operation_issue(error: OperationError) -> DeviceIssue {
 	let expected = match &error {
 		OperationError::Empty => "one of search, docs/<path>, invoke/<path>",
@@ -381,7 +377,6 @@ pub fn render_prompt_docs<'a>(
 }
 
 /// Renders a bounded nearest-match fragment from deterministic catalog rows.
-#[must_use]
 pub fn render_near_miss<'a>(path: &str, devices: impl Iterator<Item = MountedDevice<'a>>) -> Str {
 	let needle = path.rsplit('/').next().unwrap_or(path);
 	let mut scored = BTreeMap::<(u8, Str), MountedDevice<'a>>::new();

@@ -37,7 +37,6 @@ pub fn reserve_historical_stems(tree: &AgentTree, directory: &Path) -> std::io::
 }
 
 /// Normalizes a tiny-model one-line label when no caller name was supplied.
-#[must_use]
 pub fn normalize_generated_label(candidate: &str) -> Option<Str> {
 	let line = candidate.lines().next()?.trim();
 	if line.is_empty() {

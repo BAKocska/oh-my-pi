@@ -69,7 +69,6 @@ const CAPABILITY_SIBLINGS: &[(&str, CapabilityKind)] = &[
 /// Enumerates explicit and enabled installed/link package roots, then lowers
 /// existing sibling capability paths. Canonical roots and declaration paths
 /// are deduplicated so link aliases never execute or render twice.
-#[must_use]
 pub fn discover(
 	installed: &InstalledRecord,
 	explicit: &[ExtensionRoot],
@@ -189,7 +188,6 @@ pub fn invalidate_after_transaction(
 
 /// Returns package roots suitable for scoped SDK composition without consulting
 /// process-global state.
-#[must_use]
 pub fn sdk_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<ExtensionRoot> {
 	paths
 		.into_iter()

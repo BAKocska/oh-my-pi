@@ -35,7 +35,6 @@ pub struct DiscoverySettings {
 
 impl DiscoverySettings {
 	/// Returns whether the provider is enabled by the immutable projection.
-	#[must_use]
 	pub fn provider_enabled(&self, provider_id: &str) -> bool {
 		!self
 			.disabled_providers
@@ -44,7 +43,6 @@ impl DiscoverySettings {
 	}
 
 	/// Returns whether the provider-defined source is enabled.
-	#[must_use]
 	pub fn source_enabled(&self, source_id: &str) -> bool {
 		!self
 			.disabled_sources
@@ -53,7 +51,6 @@ impl DiscoverySettings {
 	}
 
 	/// Returns whether user configuration explicitly claims this bundled name.
-	#[must_use]
 	pub fn shadows_builtin(&self, kind: CapabilityKind, key: &str) -> bool {
 		self
 			.builtin_shadows

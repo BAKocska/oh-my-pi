@@ -76,7 +76,6 @@ pub struct SettingsEditorPanel {
 
 impl SettingsPaths {
 	/// Resolves standard native paths and `OMP_CONFIG_FILES` overlays.
-	#[must_use]
 	pub fn discover(data_dir: &Path, project_root: Option<&Path>) -> Self {
 		let overlays = env::var_os("OMP_CONFIG_FILES")
 			.map(|value| env::split_paths(&value).collect())
@@ -191,19 +190,16 @@ impl SettingsManager {
 	}
 
 	/// Returns the current immutable snapshot synchronously.
-	#[must_use]
 	pub fn snapshot(&self) -> Arc<SettingsSnapshot> {
 		Arc::clone(&self.snapshot.read())
 	}
 
 	/// Returns startup/write quarantine diagnostics without secret values.
-	#[must_use]
 	pub fn diagnostics(&self) -> Vec<QuarantineDiagnostic> {
 		self.diagnostics.read().clone()
 	}
 
 	/// Subscribes an owning runtime to its domain revision.
-	#[must_use]
 	pub fn subscribe<D: SettingsDomain>(&self) -> Subscription {
 		let current = self.snapshot().domain_revision(D::DOMAIN);
 		self.publisher.subscribe(D::DOMAIN, current)
@@ -215,7 +211,6 @@ impl SettingsManager {
 	}
 
 	/// Finds a reflected field by exact dotted path.
-	#[must_use]
 	pub fn field(&self, path: &str) -> Option<FieldDescriptor> {
 		registered_domains()
 			.into_iter()
@@ -224,7 +219,6 @@ impl SettingsManager {
 	}
 
 	/// Iterates reflected fields in stable domain/order/path order.
-	#[must_use]
 	pub fn fields(&self) -> Vec<FieldDescriptor> {
 		let mut fields = registered_domains()
 			.into_iter()
@@ -242,7 +236,6 @@ impl SettingsManager {
 	}
 
 	/// Builds a current, secret-safe editor model from typed descriptors.
-	#[must_use]
 	pub fn editor_panels(&self) -> Vec<SettingsEditorPanel> {
 		const IDS: &[&str] = &[
 			"appearance",

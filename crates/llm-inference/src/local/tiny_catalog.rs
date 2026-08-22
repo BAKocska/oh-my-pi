@@ -264,7 +264,6 @@ pub const MEMORY_MODELS: [TinyModelSpec; 5] = [
 pub const CLASSIFIER_MODELS: &[TinyModelSpec] = &MEMORY_MODELS;
 
 /// Resolves a model by stable id across title and memory registries.
-#[must_use]
 pub fn model(id: &str) -> Option<&'static TinyModelSpec> {
 	TITLE_MODELS
 		.iter()
@@ -273,7 +272,6 @@ pub fn model(id: &str) -> Option<&'static TinyModelSpec> {
 }
 
 /// Borrows the exact registry for one workload.
-#[must_use]
 pub const fn models(workload: TinyWorkload) -> &'static [TinyModelSpec] {
 	match workload {
 		TinyWorkload::Title => &TITLE_MODELS,

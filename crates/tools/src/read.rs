@@ -1474,7 +1474,6 @@ fn pdf_image_member(input: &str) -> Option<PdfImageMember<'_>> {
 /// multibyte sequence truncated at the sniff boundary is tolerated, while any
 /// genuinely invalid byte still fails — matching the strict whole-file decode
 /// the plain-text read path performs afterwards.
-#[must_use]
 pub fn is_probably_binary_header(header: &[u8]) -> bool {
 	if header.contains(&0) {
 		return true;

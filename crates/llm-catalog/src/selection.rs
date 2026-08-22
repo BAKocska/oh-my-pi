@@ -211,7 +211,6 @@ impl ModelScope {
 	}
 
 	/// Reports whether a full provider/model identity is enabled.
-	#[must_use]
 	pub fn allows(&self, provider: &ProviderId<str>, model: &ModelKey<str>) -> bool {
 		if self.patterns.is_empty() {
 			return true;
@@ -232,7 +231,6 @@ impl ModelScope {
 	/// Returns configured patterns that did not match a concrete model. Exact
 	/// provider/model declarations remain selectable and fail only when
 	/// invoked.
-	#[must_use]
 	pub fn synthetic_declarations(&self, models: &[ModelSpec], routes: &[RouteDef]) -> Vec<Str> {
 		self
 			.patterns
@@ -795,7 +793,6 @@ pub fn find_designer(
 }
 
 /// Builds deterministic known roles from built-ins and configured metadata.
-#[must_use]
 pub fn known_roles(configured: &[ModelRole]) -> Vec<ModelRole> {
 	let mut roles = configured.to_vec();
 	for id in BUILTIN_ROLE_IDS {

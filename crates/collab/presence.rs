@@ -35,7 +35,6 @@ pub struct PresenceFacts {
 
 impl PresenceFacts {
 	/// Constructs host facts. The host is included in the participant count.
-	#[must_use]
 	pub const fn host(connection: ConnectionState, connected_peers: usize) -> Self {
 		Self {
 			role: CollabRole::Host,
@@ -46,7 +45,6 @@ impl PresenceFacts {
 	}
 
 	/// Constructs guest facts from the host-published total participant count.
-	#[must_use]
 	pub const fn guest(
 		connection: ConnectionState,
 		participant_count: usize,
@@ -56,25 +54,21 @@ impl PresenceFacts {
 	}
 
 	/// Returns the local role.
-	#[must_use]
 	pub const fn role(self) -> CollabRole {
 		self.role
 	}
 
 	/// Returns the current connection state.
-	#[must_use]
 	pub const fn connection(self) -> ConnectionState {
 		self.connection
 	}
 
 	/// Returns every participant, including the host.
-	#[must_use]
 	pub const fn participant_count(self) -> usize {
 		self.participant_count
 	}
 
 	/// Reports whether local mutation controls must be disabled.
-	#[must_use]
 	pub const fn read_only(self) -> bool {
 		self.read_only
 	}

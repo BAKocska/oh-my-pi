@@ -109,13 +109,11 @@ pub struct TransportError {
 
 impl TransportError {
 	/// Constructs a pre-dispatch failure.
-	#[must_use]
 	pub const fn pre_dispatch(cause: TransportFailure) -> Self {
 		Self { dispatch: DispatchState::PreDispatch, cause }
 	}
 
 	/// Constructs a failure after request handoff.
-	#[must_use]
 	pub const fn effects_unknown(cause: TransportFailure) -> Self {
 		Self { dispatch: DispatchState::EffectsUnknown, cause }
 	}

@@ -102,25 +102,21 @@ pub struct RedisStore<T> {
 
 impl<T> RedisStore<T> {
 	/// Creates a store for one namespaced journal key.
-	#[must_use]
 	pub fn new(transport: T, key: impl Into<String>) -> Self {
 		Self { transport, key: key.into(), length: None }
 	}
 
 	/// Returns the Lua append script for concrete client adapters.
-	#[must_use]
 	pub const fn append_script() -> &'static str {
 		APPEND_SCRIPT
 	}
 
 	/// Returns the Lua rollback script for concrete client adapters.
-	#[must_use]
 	pub const fn truncate_script() -> &'static str {
 		TRUNCATE_SCRIPT
 	}
 
 	/// Consumes the store and returns its transport.
-	#[must_use]
 	pub fn into_transport(self) -> T {
 		self.transport
 	}

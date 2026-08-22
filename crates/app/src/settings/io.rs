@@ -267,6 +267,7 @@ fn replace_after_eperm(
 	Ok(())
 }
 
+#[must_use]
 struct FileLock {
 	file: File,
 }

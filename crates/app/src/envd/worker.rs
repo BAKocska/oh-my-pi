@@ -102,7 +102,6 @@ const _: () =
 
 impl HostKey {
 	/// Builds a host identity.
-	#[must_use]
 	pub fn new(layer: impl Into<Str>, tier: impl Into<Str>, extension: impl Into<Str>) -> Self {
 		Self(Arc::new(HostKeyFields {
 			layer:     layer.into(),
@@ -112,25 +111,21 @@ impl HostKey {
 	}
 
 	/// Returns the extension layer, such as project or user.
-	#[must_use]
 	pub fn layer(&self) -> &Str {
 		&self.0.layer
 	}
 
 	/// Returns the trust or sandbox tier.
-	#[must_use]
 	pub fn tier(&self) -> &Str {
 		&self.0.tier
 	}
 
 	/// Returns the stable extension identity.
-	#[must_use]
 	pub fn extension(&self) -> &Str {
 		&self.0.extension
 	}
 
 	/// Returns the ordered identity fields used by scoped binding derivation.
-	#[must_use]
 	pub fn fields(&self) -> [&str; 3] {
 		[self.layer().as_str(), self.tier().as_str(), self.extension().as_str()]
 	}
@@ -156,7 +151,6 @@ pub struct ExtHostSpec {
 impl ExtHostSpec {
 	/// Builds an isolated extension configuration from an authenticated
 	/// manifest.
-	#[must_use]
 	pub fn new(key: HostKey, manifest: ExtensionManifest) -> Self {
 		Self {
 			key,
@@ -261,7 +255,6 @@ pub struct ExtHostConfig {
 }
 impl ExtHostConfig {
 	/// Builds the production configuration from authenticated session context.
-	#[must_use]
 	pub fn new(
 		executable: PathBuf,
 		principal: omp_core::Principal,
@@ -424,6 +417,7 @@ pub enum WorkerEvent {
 /// Dropping a live handle requests cancellation. The supervisor then kills only
 /// the worker process group, reports effects-unknown, and replaces the worker
 /// before it accepts the next invocation.
+#[must_use]
 pub struct WorkerInvocation {
 	id:                 u64,
 	invocation_id:      Str,
@@ -459,20 +453,17 @@ impl WorkerInvocation {
 
 	/// Returns the host generation that must fence this invocation's DATA
 	/// requests.
-	#[must_use]
 	pub const fn host_generation(&self) -> u64 {
 		self.host_generation
 	}
 
 	/// Returns the session generation that must fence this invocation's DATA
 	/// requests.
-	#[must_use]
 	pub const fn session_generation(&self) -> u64 {
 		self.session_generation
 	}
 
 	/// Returns whether the registered declaration selected streamed arguments.
-	#[must_use]
 	pub const fn streams_args(&self) -> bool {
 		self.streams_args
 	}
@@ -832,7 +823,6 @@ impl ExtHostSupervisor {
 	}
 
 	/// Returns declarations paired with their owning host identity.
-	#[must_use]
 	pub fn registrations(&self) -> &[OwnedToolDecl] {
 		&self.registrations
 	}

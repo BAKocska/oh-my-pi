@@ -163,7 +163,6 @@ impl Default for HttpTransport {
 
 impl HttpTransport {
 	/// Constructs a pooled rustls client supporting HTTP/1.1 and HTTP/2.
-	#[must_use]
 	pub fn new() -> Self {
 		Self {
 			inner:        Some(pooled_client()),
@@ -179,7 +178,6 @@ impl HttpTransport {
 	/// session construction. Failure is intentionally unobservable beyond the
 	/// typed scheduling result because preconnect is only a latency
 	/// optimization.
-	#[must_use]
 	pub fn preconnect_host(base_url: &Url) -> PreconnectLaunch {
 		if !matches!(base_url.scheme(), "http" | "https") {
 			return PreconnectLaunch::UnsupportedEndpoint;
@@ -211,7 +209,6 @@ impl HttpTransport {
 
 	/// Returns deterministic snapshots of completed and in-flight sanitized
 	/// captures.
-	#[must_use]
 	pub fn captures(&self) -> Vec<HttpCapture> {
 		let mut captures: Vec<_> = self
 			.captures

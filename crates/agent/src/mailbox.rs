@@ -124,7 +124,6 @@ pub struct Interrupt {
 /// The write token and its audit digest are intentionally absent from durable
 /// item properties. Tool effects produced by this input still traverse the
 /// normal Environment grant and durable approval path.
-#[must_use]
 pub fn remote_principal_interrupt(
 	mut item: Item,
 	class: InterruptClass,
@@ -158,7 +157,6 @@ pub fn remote_principal_interrupt(
 ///
 /// Availability is deliberately visible only at the turn boundary: changing a
 /// device catalog cannot preempt an in-flight tool batch.
-#[must_use]
 pub fn device_availability_interrupt(item: Item) -> Interrupt {
 	Interrupt {
 		class: InterruptClass::TurnBoundary,
@@ -173,7 +171,6 @@ pub fn device_availability_interrupt(item: Item) -> Interrupt {
 /// preserves the source and fences even though the live mailbox source is not
 /// itself persisted. Delivery is a system item restricted to a turn boundary
 /// and therefore cannot split or reorder an already emitted tool batch.
-#[must_use]
 pub fn deferred_diagnostics_interrupt(
 	text: Str,
 	document: Str,
@@ -296,7 +293,6 @@ pub struct DeferredCommands {
 
 impl DeferredCommands {
 	/// Creates an empty queue.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { next_order: 0, pending: VecDeque::new() }
 	}
@@ -346,13 +342,11 @@ impl DeferredCommands {
 	}
 
 	/// Returns the unstarted command count.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.pending.len()
 	}
 
 	/// Reports whether no commands await admission.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.pending.is_empty()
 	}

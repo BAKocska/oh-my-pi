@@ -40,7 +40,6 @@ pub struct CursorUsageFetcher {
 }
 impl CursorUsageFetcher {
 	/// Constructs a Cursor usage fetcher.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}

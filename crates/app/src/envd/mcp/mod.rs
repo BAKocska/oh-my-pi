@@ -244,7 +244,6 @@ impl McpService {
 	}
 
 	/// Borrows the environment's one persistent definition cache.
-	#[must_use]
 	pub fn cache(&self) -> &Arc<McpDefinitionCache> {
 		&self.cache
 	}
@@ -279,13 +278,11 @@ impl McpService {
 	}
 
 	/// Returns an immutable old-or-new leaf catalog snapshot.
-	#[must_use]
 	pub fn leaf_snapshot(&self) -> LeafCatalogSnapshot<McpLeaf> {
 		self.leaves.snapshot()
 	}
 
 	/// Returns the current environment-wide definition epoch.
-	#[must_use]
 	pub fn definition_epoch(&self) -> u64 {
 		self.definition_epoch.load(Ordering::Acquire)
 	}
@@ -385,7 +382,6 @@ impl McpService {
 	}
 
 	/// Returns deterministic lifecycle status, optionally filtered by name.
-	#[must_use]
 	pub fn status(&self, name: Option<&str>) -> pb::McpStatusResult {
 		let state = self.state.read();
 		let definition_epoch = self.definition_epoch();

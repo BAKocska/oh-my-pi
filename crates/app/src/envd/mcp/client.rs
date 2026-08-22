@@ -38,7 +38,6 @@ pub struct McpClient {
 
 impl McpClient {
 	/// Creates a client with a stable snapshot of Environment workspace roots.
-	#[must_use]
 	pub fn new(transport: Arc<dyn McpTransport>, roots: Arc<[Str]>) -> Self {
 		Self { transport, roots }
 	}
@@ -120,7 +119,6 @@ impl McpClient {
 	}
 
 	/// Borrows the shared transport for resource, prompt, and tool clients.
-	#[must_use]
 	pub fn transport(&self) -> &Arc<dyn McpTransport> {
 		&self.transport
 	}

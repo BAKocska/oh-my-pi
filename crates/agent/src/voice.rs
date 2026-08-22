@@ -43,7 +43,6 @@ MUST preserve one-assistant continuity: converse here, delegate execution, and c
 pub const LIVE_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
 
 /// Renders live instructions with bounded user/account identity substitution.
-#[must_use]
 pub fn render_live_instructions(first_name: &str, username: &str) -> Str {
 	let first_name = first_name.trim().chars().take(64).collect::<String>();
 	let username = username.trim().chars().take(64).collect::<String>();
@@ -55,7 +54,6 @@ pub fn render_live_instructions(first_name: &str, username: &str) -> Str {
 }
 
 /// Wraps one canonical delegated final answer for the realtime peer.
-#[must_use]
 pub fn live_final_message(message: &str) -> Str {
 	let mut output = String::with_capacity(LIVE_FINAL_MESSAGE_PREFIX.len() + message.len());
 	output.push_str(LIVE_FINAL_MESSAGE_PREFIX);

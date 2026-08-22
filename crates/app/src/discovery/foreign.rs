@@ -135,7 +135,6 @@ const FAMILIES: &[Family] = &[
 /// Imports only static content below the supplied repository root. The API has
 /// no home-directory parameter by design, preventing accidental user-profile
 /// probing.
-#[must_use]
 pub fn discover(
 	repository_root: &Path,
 	settings: &ForeignContentSettings,

@@ -201,7 +201,6 @@ pub struct InferenceAttribution {
 
 impl InferenceAttribution {
 	/// Attribution for harness-owned requests that have no extension caller.
-	#[must_use]
 	pub fn core() -> Self {
 		Self { principal: PrincipalId::from("core"), extension: sf!("core") }
 	}
@@ -260,7 +259,6 @@ impl Call {
 	}
 
 	/// Replaces the default harness attribution before request dispatch.
-	#[must_use]
 	pub fn with_attribution(mut self, attribution: InferenceAttribution) -> Self {
 		self.attribution = attribution;
 		self
@@ -550,7 +548,6 @@ pub enum ToolInputConstraint {
 }
 impl ToolInputConstraint {
 	/// Returns the JSON Schema declaration when this input is structured JSON.
-	#[must_use]
 	pub const fn json_schema(&self) -> Option<(&OpaqueJson, bool)> {
 		match self {
 			Self::JsonSchema { parameters, strict } => Some((parameters, *strict)),
@@ -559,7 +556,6 @@ impl ToolInputConstraint {
 	}
 
 	/// Returns the exact grammar declaration when this input is freeform text.
-	#[must_use]
 	pub const fn grammar(&self) -> Option<&ToolGrammar> {
 		match self {
 			Self::JsonSchema { .. } => None,
@@ -1211,7 +1207,6 @@ pub struct SearchRequest {
 
 impl SearchRequest {
 	/// Constructs a canonical search request with automatic provider selection.
-	#[must_use]
 	pub fn new(query: impl Into<Str>, max_results: u32) -> Self {
 		let query = query.into();
 		Self {

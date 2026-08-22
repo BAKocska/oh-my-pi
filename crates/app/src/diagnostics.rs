@@ -49,7 +49,6 @@ pub struct BundleSpec {
 
 impl BundleSpec {
 	/// Applies production bundle limits to the required inputs.
-	#[must_use]
 	pub fn new(output: PathBuf, journal: PathBuf, settings: serde_json::Value) -> Self {
 		Self {
 			output,

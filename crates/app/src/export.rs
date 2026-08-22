@@ -183,7 +183,6 @@ pub struct HtmlThemePalette {
 
 impl HtmlThemePalette {
 	/// Translates a live TUI theme into browser CSS colors.
-	#[must_use]
 	pub fn from_theme(theme: Theme) -> Self {
 		Self {
 			foreground: css_color(theme.fg, "#c8ccd4"),

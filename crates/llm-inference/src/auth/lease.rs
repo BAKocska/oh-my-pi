@@ -109,7 +109,6 @@ pub struct CredentialLease {
 
 impl CredentialLease {
 	/// Constructs an API-key lease at a one-way secret ingress boundary.
-	#[must_use]
 	pub fn api_key(meta: LeaseMeta, secret: SecretString) -> Self {
 		Self {
 			inner:             Arc::new(LeaseInner { meta, material: LeaseMaterial::ApiKey(secret) }),
@@ -119,7 +118,6 @@ impl CredentialLease {
 	}
 
 	/// Constructs an OAuth or application-default bearer lease.
-	#[must_use]
 	pub fn bearer(meta: LeaseMeta, secret: SecretString) -> Self {
 		Self {
 			inner:             Arc::new(LeaseInner { meta, material: LeaseMaterial::Bearer(secret) }),
@@ -129,7 +127,6 @@ impl CredentialLease {
 	}
 
 	/// Constructs a provider session-token lease.
-	#[must_use]
 	pub fn session_token(meta: LeaseMeta, secret: SecretString) -> Self {
 		Self {
 			inner:             Arc::new(LeaseInner {
@@ -142,7 +139,6 @@ impl CredentialLease {
 	}
 
 	/// Constructs an AWS signing lease at a one-way secret ingress boundary.
-	#[must_use]
 	pub fn aws_sigv4(
 		meta: LeaseMeta,
 		access_key_id: SecretString,
@@ -164,19 +160,16 @@ impl CredentialLease {
 	}
 
 	/// Returns non-secret account metadata.
-	#[must_use]
 	pub fn meta(&self) -> &LeaseMeta {
 		&self.inner.meta
 	}
 
 	/// Returns the credential category without revealing material.
-	#[must_use]
 	pub fn kind(&self) -> CredentialKind {
 		self.inner.material.kind()
 	}
 
 	/// Returns whether this generation is already expired at `now`.
-	#[must_use]
 	pub fn is_expired_at(&self, now: SystemTime) -> bool {
 		self
 			.inner
@@ -421,25 +414,21 @@ pub struct AppliedCredentials {
 
 impl AppliedCredentials {
 	/// Returns sanitized scheme evidence.
-	#[must_use]
 	pub const fn scheme(&self) -> AuthScheme {
 		self.scheme
 	}
 
 	/// Returns when a time-sensitive signature will be produced.
-	#[must_use]
 	pub const fn signed_at(&self) -> SystemTime {
 		self.signed_at
 	}
 
 	/// Returns whether finalization requires exact buffered request bytes.
-	#[must_use]
 	pub const fn requires_buffered_body(&self) -> bool {
 		matches!(self.scheme, AuthScheme::AwsSigV4)
 	}
 
 	/// Returns whether this credential may only be placed through a sealed body.
-	#[must_use]
 	pub const fn requires_sealed_body(&self) -> bool {
 		matches!(
 			&self.spec,
@@ -507,13 +496,11 @@ impl AppliedCredentials {
 	}
 
 	/// Returns the non-secret account identity for admission evidence.
-	#[must_use]
 	pub fn account(&self) -> &AccountId<str> {
 		&self.lease.meta().account
 	}
 
 	/// Returns the non-secret principal identity for session affinity.
-	#[must_use]
 	pub fn principal(&self) -> &PrincipalId<str> {
 		&self.lease.meta().principal
 	}
@@ -719,7 +706,6 @@ pub enum CredentialApplyError {
 }
 
 /// Creates deterministic non-secret metadata for ephemeral credentials.
-#[must_use]
 pub const fn ephemeral_meta(
 	account: AccountId,
 	principal: PrincipalId,

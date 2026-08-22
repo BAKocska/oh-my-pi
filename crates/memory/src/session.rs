@@ -43,7 +43,6 @@ pub struct ShutdownOutcome {
 
 impl SessionMemory {
 	/// Creates a top-level lifecycle owner.
-	#[must_use]
 	pub fn top_level(runtime: Arc<MemoryRuntime>) -> Self {
 		Self {
 			shared:    Arc::new(SharedSession {
@@ -57,13 +56,11 @@ impl SessionMemory {
 
 	/// Creates a subagent alias sharing bank/runtime state but suppressing every
 	/// automatic hook.
-	#[must_use]
 	pub fn child(&self) -> Self {
 		Self { shared: Arc::clone(&self.shared), top_level: false }
 	}
 
 	/// Borrows the shared runtime for explicit child-invoked tools.
-	#[must_use]
 	pub fn runtime(&self) -> &Arc<MemoryRuntime> {
 		&self.shared.runtime
 	}

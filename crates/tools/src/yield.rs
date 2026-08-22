@@ -86,7 +86,6 @@ pub struct Yield {
 }
 
 /// Creates `yield@1`.
-#[must_use]
 pub fn tool() -> Yield {
 	Yield {
 		spec: ToolSpec {

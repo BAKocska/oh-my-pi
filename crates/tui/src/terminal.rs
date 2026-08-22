@@ -98,6 +98,7 @@ mod platform {
 	pub(super) struct State {
 		original: Option<Termios>,
 	}
+	#[must_use]
 	pub(super) struct StderrGuard {
 		reader:   Option<File>,
 		captured: CapturedStderr,
@@ -682,6 +683,7 @@ mod platform {
 		original_output: u32,
 		raw:             bool,
 	}
+	#[must_use]
 	pub(super) struct StderrGuard {
 		writer:   Option<File>,
 		reader:   Option<File>,

@@ -167,6 +167,7 @@ impl PlaybackWriter {
 }
 
 /// A running default-speaker stream with one gapless FIFO across every write.
+#[must_use]
 pub struct PlaybackStream {
 	device: Option<PlaybackDevice>,
 	writer: Option<PlaybackWriter>,
@@ -280,6 +281,7 @@ impl Drop for PlaybackStream {
 
 /// A running default-microphone stream delivering non-empty mono `f32`
 /// chunks on the backend's realtime thread.
+#[must_use]
 pub struct CaptureStream {
 	device: Option<CaptureDevice>,
 	levels: AudioLevelStream,

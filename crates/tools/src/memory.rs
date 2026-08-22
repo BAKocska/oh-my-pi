@@ -172,19 +172,16 @@ pub struct RetainTool {
 }
 
 /// Creates the revisioned recall leaf.
-#[must_use]
 pub fn recall_tool(runtime: Arc<MemoryRuntime>) -> RecallTool {
 	RecallTool { runtime, spec: spec::<RecallParams>("recall", RECALL_DESCRIPTION) }
 }
 
 /// Creates the revisioned reflect leaf.
-#[must_use]
 pub fn reflect_tool<H: ReflectionHost>(runtime: Arc<MemoryRuntime>, host: H) -> ReflectTool<H> {
 	ReflectTool { runtime, host, spec: spec::<ReflectParams>("reflect", REFLECT_DESCRIPTION) }
 }
 
 /// Creates the revisioned retain leaf.
-#[must_use]
 pub fn retain_tool(runtime: Arc<MemoryRuntime>) -> RetainTool {
 	RetainTool { runtime, spec: spec::<RetainParams>("retain", RETAIN_DESCRIPTION) }
 }

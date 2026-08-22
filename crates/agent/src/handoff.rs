@@ -48,7 +48,6 @@ pub struct HandoffCommit {
 
 impl HandoffSummary {
 	/// Renders the structured fields into the portable child context summary.
-	#[must_use]
 	pub fn render(&self) -> Str {
 		sf!(
 			"## Completed\n{}\n\n## Remaining\n{}\n\n## Decisions\n{}",
@@ -61,7 +60,6 @@ impl HandoffSummary {
 
 impl HandoffCommit {
 	/// Builds the sole compact event seeded into the child journal.
-	#[must_use]
 	pub fn compact(&self, tokens_before: u64, tokens_after: Option<u64>) -> Compact {
 		Compact {
 			summary: self.summary.render(),
@@ -80,7 +78,6 @@ impl HandoffCommit {
 impl HandoffRequest {
 	/// Fences and assembles a child commit only while the parent leaf is
 	/// current.
-	#[must_use]
 	pub fn commit_if_current(
 		self,
 		current_checkpoint: u64,

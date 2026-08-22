@@ -152,7 +152,6 @@ pub struct LearnTool<A> {
 
 /// Creates `learn@1` over one active Mnemopi runtime and managed-skill
 /// authority.
-#[must_use]
 pub fn tool<A: ManagedSkillAuthority>(
 	memory: Arc<MemoryRuntime>,
 	authority: Arc<A>,

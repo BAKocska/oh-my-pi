@@ -34,7 +34,6 @@ pub struct ConnectEnvelope {
 
 impl ConnectEnvelope {
 	/// Returns whether the message payload uses negotiated compression.
-	#[must_use]
 	pub const fn is_compressed(&self) -> bool {
 		self.flags & FLAG_COMPRESSED != 0
 	}
@@ -60,13 +59,11 @@ impl Default for ConnectDecoder {
 
 impl ConnectDecoder {
 	/// Creates a decoder with the default 16 MiB payload bound.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::with_max_payload_bytes(DEFAULT_MAX_FRAME_BYTES)
 	}
 
 	/// Creates a decoder with an explicit maximum payload size.
-	#[must_use]
 	pub fn with_max_payload_bytes(max_payload_bytes: usize) -> Self {
 		Self {
 			buffer:            BytesMut::new(),
@@ -95,13 +92,11 @@ impl ConnectDecoder {
 	}
 
 	/// Returns retained bytes belonging to an incomplete envelope.
-	#[must_use]
 	pub fn buffered_len(&self) -> usize {
 		self.buffer.len()
 	}
 
 	/// Returns whether an end-stream envelope was consumed.
-	#[must_use]
 	pub const fn is_ended(&self) -> bool {
 		self.ended
 	}

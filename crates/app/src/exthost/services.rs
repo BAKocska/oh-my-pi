@@ -25,7 +25,6 @@ pub struct ServiceKey {
 
 impl ServiceKey {
 	/// Creates a service identity.
-	#[must_use]
 	pub fn new(name: impl Into<Str>, rev: u32) -> Self {
 		Self { name: name.into(), rev }
 	}
@@ -40,7 +39,6 @@ pub struct ServiceManifest {
 
 impl ServiceManifest {
 	/// Normalizes provider declarations and consumer requirements.
-	#[must_use]
 	pub fn new(
 		provides: impl IntoIterator<Item = ServiceKey>,
 		requires: impl IntoIterator<Item = ServiceKey>,
@@ -77,7 +75,6 @@ impl ServiceDeclarationDrift {
 	}
 
 	/// Returns whether the provider sets are equal.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.missing.is_empty() && self.unexpected.is_empty()
 	}
@@ -313,7 +310,6 @@ pub struct ServiceBroker {
 impl ServiceBroker {
 	/// Creates an empty broker fenced to one session epoch. This is inert until
 	/// manifests are published and providers activate.
-	#[must_use]
 	pub fn new(session_generation: u64) -> Self {
 		let (cancellations_tx, cancellations_rx) = flume::unbounded();
 		Self {
@@ -553,7 +549,6 @@ impl ServiceBroker {
 	}
 
 	/// Returns the number of in-flight correlated calls.
-	#[must_use]
 	pub fn pending_len(&self) -> usize {
 		self.pending.lock().len()
 	}

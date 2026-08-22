@@ -42,7 +42,6 @@ pub struct VibeWall {
 
 impl VibeWall {
 	/// Opens a wall from one immutable worker snapshot.
-	#[must_use]
 	pub fn open(rows: &[VibeWorkerRow], ctx: &UiContext) -> Self {
 		let width = 100;
 		Self {

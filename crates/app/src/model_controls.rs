@@ -54,7 +54,6 @@ pub struct ModelControls {
 
 impl ModelControls {
 	/// Restores durable settings without creating a journal event.
-	#[must_use]
 	pub fn from_durable(durable_roles: BTreeMap<Str, ModelKey>) -> Self {
 		Self { durable_roles, ..Self::default() }
 	}
@@ -95,7 +94,6 @@ impl ModelControls {
 	}
 
 	/// Returns the effective model for a role.
-	#[must_use]
 	pub fn effective(&self, role: &str) -> Option<&ModelKey> {
 		self
 			.override_
@@ -106,7 +104,6 @@ impl ModelControls {
 	}
 
 	/// Returns the active journaled override.
-	#[must_use]
 	pub const fn session_override(&self) -> Option<&JournaledModelOverride> {
 		self.override_.as_ref()
 	}

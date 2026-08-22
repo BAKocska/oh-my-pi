@@ -23,7 +23,6 @@ pub enum Scope {
 
 impl Scope {
 	/// Returns the corresponding extension layer.
-	#[must_use]
 	pub const fn layer(self) -> Layer {
 		match self {
 			Self::Client => Layer::Client,
@@ -76,7 +75,6 @@ pub struct CliContribution {
 
 impl CliContribution {
 	/// Publisher-qualified declaration identity.
-	#[must_use]
 	pub fn qualified_name(&self) -> Str {
 		Str::from(format!("{}/{}:--{}", self.publisher, self.extension, self.name))
 	}
@@ -163,7 +161,6 @@ impl CliContributionSet {
 	}
 
 	/// Returns one contribution by long name.
-	#[must_use]
 	pub fn get(&self, name: &str) -> Option<&CliContribution> {
 		self.entries.get(name)
 	}
@@ -382,7 +379,6 @@ pub struct EffectiveExtensionConfig {
 /// Folds ordered client then workspace overlays. P7 is represented directly as
 /// the `disabled` accumulator so no caller can accidentally implement a
 /// first-wins exception.
-#[must_use]
 pub fn fold_extension(scopes: &[ScopedOverlay], id: &Str) -> EffectiveExtensionConfig {
 	let mut result = EffectiveExtensionConfig::default();
 	for scope in scopes {
@@ -461,7 +457,6 @@ pub enum OfflineMode {
 impl ExtensionEnvironment {
 	/// Reads the `OMP_EXT_*` configuration surface. Flag equivalence is wired by
 	/// `ExtCli`; this type deliberately has no CLI dependency.
-	#[must_use]
 	pub fn from_environment() -> Self {
 		let value = |name| env::var(name).ok().filter(|value| !value.is_empty());
 		let comma = |name| {
@@ -507,7 +502,6 @@ impl ExtensionEnvironment {
 
 	/// Returns the diagnostic emitted when an ambient site override bypasses
 	/// managed per-host site-tree selection.
-	#[must_use]
 	pub const fn site_override_warning(&self) -> Option<ExtensionCode> {
 		if self.site_override.is_some() {
 			Some(ExtensionCode::WSiteOverride)
@@ -532,7 +526,6 @@ pub struct AmbientPaths {
 /// Builds ambient discovery paths. Workspace paths are included on the
 /// workspace side; callers do not invoke this for a remote workspace on the
 /// client. Compatibility roots are diagnostic-only (`W-FOREIGN-ROOT`).
-#[must_use]
 pub fn ambient_paths(
 	data_dir: &std::path::Path,
 	workspace: Option<&std::path::Path>,
@@ -569,7 +562,6 @@ pub enum ReplacementDecision {
 /// Applies P4's declaration, publisher-match, and policy gates. A denial is
 /// deterministic: callers retain or re-admit the client instance rather than
 /// allowing both instances to coexist.
-#[must_use]
 pub fn workspace_replacement(
 	replace_declared: bool,
 	client_publisher: &Str,
@@ -642,7 +634,6 @@ pub struct Declaration {
 }
 
 /// Lowers authoring `[[tools]]` entries into the static declaration table.
-#[must_use]
 pub fn lower_tools(tools: impl IntoIterator<Item = ToolManifestEntry>) -> Vec<Declaration> {
 	tools
 		.into_iter()

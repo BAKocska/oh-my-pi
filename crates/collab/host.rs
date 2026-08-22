@@ -35,7 +35,6 @@ pub enum VisibilityClass {
 
 impl VisibilityClass {
 	/// Converts a public class to the protobuf vocabulary.
-	#[must_use]
 	pub const fn to_wire(self) -> WireVisibility {
 		match self {
 			Self::PublicTranscript => WireVisibility::PublicTranscript,
@@ -67,13 +66,11 @@ pub struct AuthenticatedPeer {
 
 impl AuthenticatedPeer {
 	/// Returns the immutable principal stamped onto admitted mutations.
-	#[must_use]
 	pub const fn principal(&self) -> &RemotePrincipal {
 		&self.principal
 	}
 
 	/// Returns whether this peer is restricted to observation.
-	#[must_use]
 	pub fn read_only(&self) -> bool {
 		!self.principal.may_mutate()
 	}
@@ -87,7 +84,6 @@ pub struct HostAdmission {
 
 impl HostAdmission {
 	/// Creates a room-scoped host admission authority.
-	#[must_use]
 	pub const fn new(room_id: Str, write_token: WriteToken) -> Self {
 		Self { room_id, write_token }
 	}
@@ -485,7 +481,6 @@ pub enum TranscriptReadError {
 }
 
 /// Classifies an agent registry row without exposing advisor identities.
-#[must_use]
 pub const fn registry_visibility(is_advisor: bool) -> VisibilityClass {
 	if is_advisor {
 		VisibilityClass::HostLocal
@@ -495,7 +490,6 @@ pub const fn registry_visibility(is_advisor: bool) -> VisibilityClass {
 }
 
 /// Classifies EventBus channels; only the two task channels are peer-visible.
-#[must_use]
 pub fn bus_visibility(channel: i32) -> VisibilityClass {
 	use omp_proto::collab::v1::bus_event::Channel;
 	match Channel::try_from(channel) {

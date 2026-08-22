@@ -92,7 +92,6 @@ pub enum ContextDiagnostic {
 /// ancestor-walked, `@path` expansion reuses the canonical context importer,
 /// exact bytes deduplicate in favor of the closest source, and roots retain
 /// Environment order.
-#[must_use]
 pub fn discover(
 	roots: &[GrantedContextRoot],
 	options: &ContextDiscoveryOptions,
@@ -179,7 +178,6 @@ pub fn discover(
 
 /// Projects exact context bytes into the agent prompt contract without
 /// filesystem access.
-#[must_use]
 pub fn prompt_files(snapshot: &ContextSnapshot) -> Arc<[ContextFile]> {
 	snapshot
 		.items
@@ -194,7 +192,6 @@ pub fn prompt_files(snapshot: &ContextSnapshot) -> Arc<[ContextFile]> {
 
 /// Lowers an immutable context snapshot into registry declarations without
 /// re-reading the filesystem.
-#[must_use]
 pub fn declarations(snapshot: &ContextSnapshot) -> Vec<DiscoveredCapability> {
 	snapshot
 		.items

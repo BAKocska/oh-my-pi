@@ -27,19 +27,16 @@ pub struct RevisionToken(Bytes);
 
 impl RevisionToken {
 	/// Copies an opaque token into shared immutable storage.
-	#[must_use]
 	pub fn new(token: impl AsRef<[u8]>) -> Self {
 		Self(Bytes::copy_from_slice(token.as_ref()))
 	}
 
 	/// Wraps an already shared opaque token without copying.
-	#[must_use]
 	pub const fn from_bytes(token: Bytes) -> Self {
 		Self(token)
 	}
 
 	/// Returns the opaque token bytes for round-tripping to its caller.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &Bytes {
 		&self.0
 	}
@@ -64,37 +61,31 @@ pub struct Snapshot {
 
 impl Snapshot {
 	/// Returns the canonical path associated with this retained revision.
-	#[must_use]
 	pub fn path(&self) -> &str {
 		&self.path
 	}
 
 	/// Returns the exact shared bytes, including any BOM and original newlines.
-	#[must_use]
 	pub const fn bytes(&self) -> &Bytes {
 		&self.bytes
 	}
 
 	/// Returns the four-hex representation tag displayed in hashline headers.
-	#[must_use]
 	pub fn tag(&self) -> &str {
 		&self.tag
 	}
 
 	/// Returns the exact opaque revision identity.
-	#[must_use]
 	pub const fn revision(&self) -> &RevisionToken {
 		&self.revision
 	}
 
 	/// Returns the store-local observation sequence for LRU ordering.
-	#[must_use]
 	pub const fn recorded_at(&self) -> u64 {
 		self.recorded_at
 	}
 
 	/// Returns one-indexed lines displayed from exactly this revision.
-	#[must_use]
 	pub fn seen_lines(&self) -> &BTreeSet<usize> {
 		&self.seen_lines
 	}
@@ -153,7 +144,6 @@ pub enum SnapshotStoreError {
 
 impl SnapshotStoreError {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}
@@ -219,7 +209,6 @@ pub enum SnapshotLookupError {
 
 impl SnapshotLookupError {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}
@@ -375,7 +364,6 @@ impl SnapshotStore {
 	}
 
 	/// Enumerates every retained candidate for a tag across all paths.
-	#[must_use]
 	pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Snapshot>> {
 		self
 			.histories
@@ -521,13 +509,11 @@ impl SnapshotStore {
 	}
 
 	/// Returns the number of retained canonical paths.
-	#[must_use]
 	pub fn path_count(&self) -> usize {
 		self.histories.len()
 	}
 
 	/// Returns the summed byte lengths used for retention accounting.
-	#[must_use]
 	pub const fn retained_bytes(&self) -> usize {
 		self.total_bytes
 	}
@@ -569,7 +555,6 @@ impl SnapshotStore {
 ///
 /// A UTF-8 BOM is excluded, and spaces, tabs, and carriage returns immediately
 /// before LF or EOF are ignored, matching hashline's textual tag normalization.
-#[must_use]
 pub fn compute_snapshot_tag(exact: &[u8]) -> Str {
 	let exact = exact.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(exact);
 	Str::new_inline(hash_tag16(normalized_file_xxh32(exact)).as_str())

@@ -158,7 +158,6 @@ pub enum ApplyError {
 
 impl ApplyError {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}

@@ -163,7 +163,6 @@ impl SpawnBatchV1 {
 
 	/// Preflights each item independently so one registration error does not
 	/// discard valid siblings.
-	#[must_use]
 	pub fn preflight_items(&self) -> Vec<Result<(), SpawnContractError>> {
 		let mut ids = HashSet::new();
 		let mut names = HashSet::new();
@@ -299,7 +298,6 @@ pub struct SpawnResultV1 {
 
 impl SpawnResultV1 {
 	/// Constructs a current-revision result and enforces disposition bounds.
-	#[must_use]
 	pub fn new(
 		stable_id: Str,
 		name: Str,

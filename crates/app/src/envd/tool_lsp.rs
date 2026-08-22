@@ -213,7 +213,6 @@ pub struct DocumentLspControl {
 
 impl DocumentLspControl {
 	/// Binds the project document authority.
-	#[must_use]
 	pub fn new(documents: DocumentHost, exec: ExecHost) -> Self {
 		Self {
 			documents,

@@ -55,7 +55,6 @@ pub const REGISTRATION: ModelRegistration = ModelRegistration {
 
 /// Resolves a voice, falling back for stale ids and the legacy `default`
 /// sentinel.
-#[must_use]
 pub fn resolve_voice(requested: Option<&str>) -> &'static VoiceSpec {
 	requested
 		.filter(|voice| *voice != "default")

@@ -462,7 +462,6 @@ impl TokenParseState {
 /// consuming piped stdin. It returns an empty list for grouping, expansion,
 /// heredoc, malformed quote, or dangling-escape syntax whose execution context
 /// cannot be represented by a flat segment list.
-#[must_use]
 pub fn flat_shell_segments(command: &str) -> Vec<FlatShellCommandSegment<'_>> {
 	let bytes = command.as_bytes();
 	let mut segments = Vec::new();

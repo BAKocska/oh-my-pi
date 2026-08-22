@@ -433,7 +433,6 @@ impl Default for Theme {
 
 impl Theme {
 	/// Quantizes every semantic token for terminals without truecolor.
-	#[must_use]
 	pub const fn quantized_256(self) -> Self {
 		Self {
 			fg:        self.fg.quantized_256(),

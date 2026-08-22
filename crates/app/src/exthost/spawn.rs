@@ -116,7 +116,6 @@ pub struct HostChildLimit {
 
 impl HostChildLimit {
 	/// Creates a lazy-spawn admission bound.
-	#[must_use]
 	pub fn new(limit: usize) -> Self {
 		Self { limit, live: Arc::new(AtomicUsize::new(0)) }
 	}

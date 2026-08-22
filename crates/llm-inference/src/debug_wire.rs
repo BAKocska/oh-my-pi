@@ -36,7 +36,6 @@ pub fn shrink_tool_schema(value: &mut Value) {
 
 /// Returns a UTF-8-safe head/tail projection with an explicit byte-count
 /// elision marker. Inputs at or below `max_bytes` are copied unchanged.
-#[must_use]
 pub fn trim_wire_text(text: &str, max_bytes: usize) -> String {
 	if text.len() <= max_bytes {
 		return text.to_owned();
@@ -63,7 +62,6 @@ pub fn trim_wire_text(text: &str, max_bytes: usize) -> String {
 /// Appends a sanitized response-metadata comment to a debug payload.
 ///
 /// Metadata values are escaped so they cannot terminate the private comment.
-#[must_use]
 pub fn response_metadata_comment(
 	provider_request_id: Option<&str>,
 	status: Option<u16>,

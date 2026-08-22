@@ -99,7 +99,6 @@ pub trait ContinuationSource: Send + Sync {
 
 impl ContinuationLedger {
 	/// Creates a zeroed ledger with an already-clamped cap.
-	#[must_use]
 	pub const fn new(cap: u32) -> Self {
 		Self { consecutive: 0, total: 0, cap, last_ms: 0, refusals: 0, owner: None }
 	}
@@ -203,7 +202,6 @@ impl HookEvent for AgentSettledEvent {
 }
 
 /// Converts a hook's fail-open settled result into a loop continuation.
-#[must_use]
 pub fn from_hook(result: AgentSettled, owner: Str, item: Item) -> Continuation {
 	match result {
 		AgentSettled::Continue => {
@@ -217,7 +215,6 @@ pub fn from_hook(result: AgentSettled, owner: Str, item: Item) -> Continuation {
 ///
 /// Detached job settlement is deliberately excluded: job facts are next-turn
 /// data, not an autonomous-loop signal.
-#[must_use]
 pub const fn continues_loop(source: &InterruptSource) -> bool {
 	matches!(
 		source,

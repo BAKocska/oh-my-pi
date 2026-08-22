@@ -90,7 +90,6 @@ pub fn read_snapcompact_savings(
 ///
 /// Temporary/internal execution roots have no dashboard signal and return
 /// `None`.
-#[must_use]
 pub fn normalize_project_path(path: &Path) -> Option<PathBuf> {
 	let clean = path.to_string_lossy().replace('\\', "/");
 	let clean = clean.trim_end_matches('/');
@@ -120,7 +119,6 @@ pub fn normalize_project_path(path: &Path) -> Option<PathBuf> {
 /// `projects_by_session` is sourced from durable session metadata. Raw prompt
 /// text is neither accepted nor retained. Disabled consent produces an empty
 /// result without inspecting facts.
-#[must_use]
 pub fn aggregate_snapcompact_savings(
 	consent: LocalAnalyticsConsent,
 	records: &[SnapcompactSavingsRecord],
@@ -192,7 +190,6 @@ pub struct ClientProviderUsage {
 
 impl ClientProviderUsage {
 	/// Returns the full token burn represented by all billable buckets.
-	#[must_use]
 	pub const fn total_tokens(&self) -> u64 {
 		self
 			.input_tokens
@@ -214,7 +211,6 @@ pub struct ClientUsageClientSummary {
 /// `None` means no client reported provider usage, allowing callers to fall
 /// back to local telemetry rather than interpreting missing broker data as
 /// zero burn.
-#[must_use]
 pub fn sum_fleet_tokens(clients: &[ClientUsageClientSummary]) -> Option<BTreeMap<Str, u64>> {
 	let mut totals = BTreeMap::new();
 	for provider in clients.iter().flat_map(|client| &client.providers) {
@@ -255,7 +251,6 @@ pub struct UsageWindowAnalytics {
 
 /// Derives bounded quota analytics from one stable limit's chronological
 /// observations.
-#[must_use]
 pub fn analyze_usage_window(
 	group: &UsageWindowGroup<'_>,
 	curve_points: usize,
@@ -319,7 +314,6 @@ pub struct UsageWindowGroup<'a> {
 ///
 /// Duration labels are presentation metadata and deliberately never enter the
 /// key: two distinct provider limits may share the same daily or weekly label.
-#[must_use]
 pub fn group_usage_windows_by_limit_id(
 	snapshots: &[UsageWindowSnapshot],
 ) -> Vec<UsageWindowGroup<'_>> {

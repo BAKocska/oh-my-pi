@@ -36,7 +36,6 @@ pub struct Eligibility {
 
 impl Eligibility {
 	/// Returns whether startup presentation may be emitted to this terminal.
-	#[must_use]
 	pub fn allows(self, terminal: bool) -> bool {
 		terminal && !self.resume && !self.quiet && !self.timing
 	}

@@ -50,7 +50,6 @@ pub struct BlobRef {
 impl BlobRef {
 	/// Returns the digest as 64 lowercase hexadecimal characters in stack
 	/// storage.
-	#[must_use]
 	pub const fn to_hex(&self) -> ArrayStr<32> {
 		self.hash.to_hex()
 	}
@@ -202,7 +201,6 @@ impl BlobStore {
 	}
 
 	/// Returns the filesystem root that owns this blob namespace.
-	#[must_use]
 	pub fn root(&self) -> &Path {
 		&self.root
 	}
@@ -295,7 +293,6 @@ impl BlobStore {
 	}
 
 	/// Returns whether the referenced blob path currently exists as a file.
-	#[must_use]
 	pub fn has(&self, reference: &BlobRef) -> bool {
 		self.path(reference).is_file()
 	}
@@ -304,7 +301,6 @@ impl BlobStore {
 	///
 	/// The layout is
 	/// `<root>/blobs/<first-byte-hex>/<second-byte-hex>/<full-64-hex>`.
-	#[must_use]
 	pub fn path(&self, reference: &BlobRef) -> PathBuf {
 		let hash = reference.to_hex();
 		self
@@ -351,7 +347,6 @@ impl BlobStore {
 	///
 	/// The path is `<root>/<distribution>-<version>-<tag>-<blake3-16>`, the
 	/// stable store convention shared by every materializer using this store.
-	#[must_use]
 	pub fn unpacked_wheel_path(&self, wheel: &WheelName, reference: &BlobRef) -> PathBuf {
 		let digest = reference.to_hex();
 		self.root.join(format!(

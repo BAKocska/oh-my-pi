@@ -197,6 +197,7 @@ pub fn attach_for(owner: Str, backend: Arc<ChatHubBackend>) -> HubAttachment {
 	HubAttachment { owner, previous }
 }
 
+#[must_use]
 pub struct HubAttachment {
 	owner:    Str,
 	previous: Option<Arc<ChatHubBackend>>,

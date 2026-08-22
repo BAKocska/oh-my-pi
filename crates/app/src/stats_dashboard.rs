@@ -30,7 +30,6 @@ $('range').onchange=load;$('theme').onclick=()=>{const root=document.documentEle
 </script></body></html>"##;
 
 /// Looks up an embedded production dashboard asset.
-#[must_use]
 pub fn asset(path: &str) -> Option<Asset> {
 	match path {
 		"/" | "/index.html" => Some(Asset {

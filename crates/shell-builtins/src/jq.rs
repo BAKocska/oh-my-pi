@@ -987,6 +987,7 @@ thread_local! {
 	static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
+#[must_use]
 struct RuntimeGuard;
 
 impl RuntimeGuard {

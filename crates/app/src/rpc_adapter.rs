@@ -119,7 +119,6 @@ struct RpcGeneration {
 impl InferenceRpc {
 	/// Creates an RPC projection over one immutable registry generation and the
 	/// same provider-conversation planner installed in its route stack.
-	#[must_use]
 	pub fn new(
 		registry: Registry,
 		sessions: ConversationSessionPlanner,
@@ -134,7 +133,6 @@ impl InferenceRpc {
 	/// This is an integration-test seam only. Gateway context, turn replay, and
 	/// duplex projection remain owned by this service.
 	#[doc(hidden)]
-	#[must_use]
 	pub fn new_for_test(
 		registry: Registry,
 		sessions: ConversationSessionPlanner,
@@ -166,7 +164,6 @@ impl InferenceRpc {
 	}
 
 	/// Replaces web-search routing settings for this immutable RPC facade.
-	#[must_use]
 	pub fn with_search_settings(
 		mut self,
 		settings: omp_llm_inference::search_settings::WebSearchSettings,

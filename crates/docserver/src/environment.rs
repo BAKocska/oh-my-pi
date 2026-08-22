@@ -23,13 +23,11 @@ pub struct WorkspaceLeaseId([u8; 16]);
 
 impl WorkspaceLeaseId {
 	/// Constructs an identity from its wire representation.
-	#[must_use]
 	pub const fn from_bytes(bytes: [u8; 16]) -> Self {
 		Self(bytes)
 	}
 
 	/// Returns the wire representation.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; 16] {
 		&self.0
 	}
@@ -71,6 +69,7 @@ struct WorkspaceLeaseRecord {
 	paths: Vec<PathBuf>,
 }
 
+#[must_use]
 pub(crate) struct WorkspaceMutationGuard {
 	table: WorkspaceLeaseTable,
 	owner: [u8; 16],
@@ -320,7 +319,6 @@ impl Environment {
 	}
 
 	/// Starts isolated edit provenance and lease ownership for one connection.
-	#[must_use]
 	pub fn session(&self) -> EnvironmentSession {
 		EnvironmentSession {
 			inner: Arc::new(SessionInner {
@@ -333,68 +331,57 @@ impl Environment {
 	}
 
 	/// Returns the shared immutable document store.
-	#[must_use]
 	pub fn store(&self) -> &DocumentStore {
 		&self.inner.store
 	}
 
 	/// Returns the project-scoped LSP binding registry.
-	#[must_use]
 	pub fn lsp(&self) -> &LspRegistry {
 		&self.inner.lsp
 	}
 
 	/// Returns the project-scoped DAP adapter registry.
-	#[must_use]
 	pub fn dap_adapters(&self) -> &DapAdapterRegistry {
 		&self.inner.dap_adapters
 	}
 
 	/// Returns the project-scoped live DAP session registry.
-	#[must_use]
 	pub fn dap_sessions(&self) -> &DapSessionRegistry {
 		&self.inner.dap_sessions
 	}
 
 	/// Returns the revisioned transaction coordinator.
-	#[must_use]
 	pub fn transactions(&self) -> &TransactionCoordinator<LspRegistry> {
 		&self.inner.transactions
 	}
 
 	/// Returns the actor-aware path service.
-	#[must_use]
 	pub fn paths(&self) -> &PathService {
 		&self.inner.paths
 	}
 
 	/// Returns the structural summary service.
-	#[must_use]
 	pub fn summaries(&self) -> &SummaryService {
 		&self.inner.summaries
 	}
 
 	/// Returns the canonical project root URI.
-	#[must_use]
 	pub fn root_uri(&self) -> &Url {
 		&self.inner.root_uri
 	}
 
 	/// Returns the stable identity of this running project authority.
-	#[must_use]
 	pub fn workspace_id(&self) -> &[u8; 16] {
 		&self.inner.workspace_id
 	}
 
 	/// Returns the identity scoping the in-memory transaction outcome ledger.
-	#[must_use]
 	pub fn server_epoch(&self) -> &[u8; 16] {
 		&self.inner.server_epoch
 	}
 
 	/// Returns the executable-generation identity advertised to document
 	/// clients.
-	#[must_use]
 	pub fn server_build(&self) -> &str {
 		self.inner.server_build.as_str()
 	}
@@ -447,13 +434,11 @@ impl std::fmt::Debug for EnvironmentSession {
 
 impl EnvironmentSession {
 	/// Returns the project authority shared by this connection.
-	#[must_use]
 	pub fn environment(&self) -> &Environment {
 		&self.inner.environment
 	}
 
 	/// Returns this connection's authority identity.
-	#[must_use]
 	pub fn owner(&self) -> [u8; 16] {
 		self.inner.owner
 	}
@@ -520,7 +505,6 @@ impl EnvironmentSession {
 	}
 
 	/// Returns this connection's isolated edit-format registry.
-	#[must_use]
 	pub fn edit_adapters(&self) -> &EditAdapterRegistry {
 		&self.inner.adapters
 	}

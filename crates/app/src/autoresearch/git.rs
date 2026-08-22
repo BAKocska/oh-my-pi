@@ -178,7 +178,6 @@ pub struct StatusPath {
 }
 
 /// Parses line or NUL framed porcelain-v1 status, retaining both rename paths.
-#[must_use]
 pub fn parse_status(status: &[u8]) -> Vec<StatusPath> {
 	if status.contains(&0) {
 		parse_status_nul(status)
@@ -245,7 +244,6 @@ fn add_path(entries: &mut BTreeMap<Str, bool>, raw: &[u8], untracked: bool) {
 }
 
 /// Computes exact paths introduced or changed since the run started.
-#[must_use]
 pub fn run_delta(before: &[Str], current_status: &[u8], session: &SessionConfig) -> ScopeDelta {
 	let before = before
 		.iter()
@@ -377,7 +375,6 @@ fn fixed_metrics_json(intent: &DispositionIntent) -> Str {
 }
 
 /// Returns whether a mutation completed successfully.
-#[must_use]
 pub const fn applied(outcome: &MutationOutcome) -> bool {
 	outcome.is_applied()
 }

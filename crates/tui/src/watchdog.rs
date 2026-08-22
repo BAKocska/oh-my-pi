@@ -92,7 +92,6 @@ pub struct LoopWatchdogCore {
 
 impl LoopWatchdogCore {
 	/// Create a watchdog core with the latest wall and process CPU times.
-	#[must_use]
 	pub fn new(now: Duration, cpu_time: Duration) -> Self {
 		Self {
 			last_tick:     now,
@@ -120,7 +119,6 @@ impl LoopWatchdogCore {
 	/// Returns one report after 250 ms without a tick. Further checks stay
 	/// silent until [`Self::tick`] records progress. A gap over 60 seconds is
 	/// suppressed only when the process consumed little CPU during it.
-	#[must_use]
 	pub fn check(&mut self, now: Duration, cpu_time: Duration) -> Option<StallReport> {
 		let elapsed = now.saturating_sub(self.last_tick);
 		let cpu_elapsed = cpu_time.saturating_sub(self.last_cpu_time);
@@ -151,6 +149,7 @@ struct Shared {
 /// [`Self::set_phase`] when entering a diagnostic phase. A background probe
 /// invokes the supplied callback once per continuous stall longer than 250 ms.
 /// Long gaps are ignored as system sleep only when process CPU time stayed low.
+#[must_use]
 pub struct LoopWatchdog {
 	origin: Instant,
 	shared: Arc<(Mutex<Shared>, Condvar)>,
@@ -159,7 +158,6 @@ pub struct LoopWatchdog {
 
 impl LoopWatchdog {
 	/// Start a watchdog and send detected stalls to `report`.
-	#[must_use]
 	pub fn new(report: impl Fn(Duration, &str) + Send + 'static) -> Self {
 		let origin = Instant::now();
 		let initial_cpu = process_cpu_time().unwrap_or(Duration::ZERO);

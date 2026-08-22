@@ -334,6 +334,7 @@ impl Drop for ChatAuthWorker {
 	}
 }
 
+#[must_use]
 struct AuthActivity(Arc<AtomicBool>);
 
 impl Drop for AuthActivity {

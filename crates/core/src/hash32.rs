@@ -18,38 +18,32 @@ pub struct Hash32([u8; 32]);
 
 impl Hash32 {
 	/// Creates a digest from its raw bytes.
-	#[must_use]
 	pub const fn new(bytes: [u8; 32]) -> Self {
 		Self(bytes)
 	}
 
 	/// Returns the raw digest bytes.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; 32] {
 		&self.0
 	}
 
 	/// Consumes the digest and returns its raw bytes.
-	#[must_use]
 	pub const fn into_bytes(self) -> [u8; 32] {
 		self.0
 	}
 
 	/// Returns the digest as 64 lowercase hexadecimal characters in stack
 	/// storage.
-	#[must_use]
 	pub const fn to_hex(&self) -> ArrayStr<32> {
 		hex::encode_n(&self.0)
 	}
 
 	/// Returns the BLAKE3-256 digest of `bytes` in one shot.
-	#[must_use]
 	pub fn sum(bytes: impl AsRef<[u8]>) -> Self {
 		Self(*blake3::hash(bytes.as_ref()).as_bytes())
 	}
 
 	/// Returns an incremental BLAKE3-256 hasher finalizing into a [`Hash32`].
-	#[must_use]
 	pub fn hasher() -> Hasher {
 		Hasher::new()
 	}
@@ -65,7 +59,6 @@ pub struct Hasher(blake3::Hasher);
 
 impl Hasher {
 	/// Creates an empty hasher.
-	#[must_use]
 	pub fn new() -> Self {
 		Self(blake3::Hasher::new())
 	}
@@ -88,7 +81,6 @@ impl Hasher {
 	}
 
 	/// Returns the digest of everything absorbed so far.
-	#[must_use]
 	pub fn finalize(&self) -> Hash32 {
 		Hash32(*self.0.finalize().as_bytes())
 	}

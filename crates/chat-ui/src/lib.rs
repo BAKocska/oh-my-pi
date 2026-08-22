@@ -225,7 +225,6 @@ pub struct ActivityWaveform {
 
 impl ActivityWaveform {
 	/// Creates an empty activity history.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { bands: [0; 24], len: 0 }
 	}
@@ -245,7 +244,6 @@ impl ActivityWaveform {
 	}
 
 	/// Borrows populated bands from oldest to newest.
-	#[must_use]
 	pub fn bands(&self) -> &[u8] {
 		&self.bands[..usize::from(self.len)]
 	}

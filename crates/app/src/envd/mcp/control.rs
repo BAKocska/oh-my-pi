@@ -27,7 +27,6 @@ pub struct McpControl {
 impl McpControl {
 	/// Binds CONTROL dispatch to the same manager used by RPC, dyn, and
 	/// `mcp://` reads.
-	#[must_use]
 	pub fn new(manager: Arc<McpManager>, resolver: Arc<dyn ControlMountResolver>) -> Self {
 		Self { manager, resolver }
 	}

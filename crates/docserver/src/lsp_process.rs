@@ -482,7 +482,6 @@ impl LspProcess {
 	}
 
 	/// Returns the installed registry identity.
-	#[must_use]
 	pub const fn binding_id(&self) -> LspBindingId {
 		self.binding_id
 	}
@@ -1366,13 +1365,11 @@ pub struct InboundDispatch {
 
 impl InboundDispatch {
 	/// Creates a successful immediate response from exact raw JSON result bytes.
-	#[must_use]
 	pub fn success(result_json: Bytes) -> Self {
 		Self { response: Ok(result_json), post_response: None }
 	}
 
 	/// Creates a successful response followed by deferred reconciliation work.
-	#[must_use]
 	pub fn success_then(result_json: Bytes, post_response: LspPostResponse) -> Self {
 		Self { response: Ok(result_json), post_response: Some(post_response) }
 	}

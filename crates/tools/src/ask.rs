@@ -269,7 +269,6 @@ impl Tool for Ask {
 /// Checks identifiers, choices, and defaults before a host sees a request.
 /// Projects questions, options, previews, and recommendations into
 /// deterministic speech order.
-#[must_use]
 pub fn spoken_lines(questions: &[Question]) -> Vec<SpokenLine> {
 	let mut lines = Vec::new();
 	for question in questions {

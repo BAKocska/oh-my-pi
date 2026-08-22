@@ -19,7 +19,6 @@ pub struct TokenRateMeter {
 
 impl TokenRateMeter {
 	/// Starts a fresh generation sample.
-	#[must_use]
 	pub fn start(now: Instant) -> Self {
 		Self { started: now, streamed_bytes: 0, final_tokens: None }
 	}
@@ -37,7 +36,6 @@ impl TokenRateMeter {
 	}
 
 	/// Calculates rounded tokens per second at `now`.
-	#[must_use]
 	pub fn rate(&self, now: Instant) -> Option<u64> {
 		let elapsed = now.saturating_duration_since(self.started);
 		if elapsed < MIN_SAMPLE_DURATION {

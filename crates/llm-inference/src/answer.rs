@@ -1010,7 +1010,6 @@ pub struct UsageQuantity {
 
 impl UsageQuantity {
 	/// Constructs a fixed-point quantity.
-	#[must_use]
 	pub const fn new(units: u64, decimal_exponent: u8) -> Self {
 		Self { units, decimal_exponent }
 	}
@@ -1072,7 +1071,6 @@ pub struct UsageResetCredits {
 impl UsageResetCredits {
 	/// Returns the soonest expiry among credits that are available or have no
 	/// provider status.
-	#[must_use]
 	pub fn soonest_expiry(&self) -> Option<SystemTime> {
 		self
 			.credits

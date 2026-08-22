@@ -52,7 +52,6 @@ pub struct ActiveContentSnapshots {
 
 /// Discovers native repository/user content once and freezes the skill/rule
 /// winners used by a session composition.
-#[must_use]
 pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 	let home = std::env::var_os("HOME").map_or_else(|| root.to_path_buf(), std::path::PathBuf::from);
 	let mut discovered =
@@ -125,13 +124,11 @@ pub struct DiscoverySnapshot {
 
 impl DiscoverySnapshot {
 	/// Returns the complete diagnostics and claims for one capability family.
-	#[must_use]
 	pub fn result(&self, kind: CapabilityKind) -> Option<&CapabilityResult> {
 		self.results.get(&kind)
 	}
 
 	/// Returns one immutable winning set for its domain owner.
-	#[must_use]
 	pub fn winning_set(&self, kind: CapabilityKind) -> Option<&[Arc<CapabilityRecord>]> {
 		self
 			.results
@@ -145,7 +142,6 @@ impl DiscoverySnapshot {
 	}
 
 	/// Returns data-only domain dispatch sets in canonical capability order.
-	#[must_use]
 	pub fn dispatch_sets(&self) -> &[WinningCapabilitySet] {
 		&self.winning_sets
 	}
@@ -164,7 +160,6 @@ impl DiscoveryComposition {
 	/// Starts one session composition. The registry's cache is installed into
 	/// the load context so no provider can accidentally use a process-global or
 	/// sibling-session cache.
-	#[must_use]
 	pub fn new(registry: DiscoveryRegistry, mut context: LoadContext) -> Self {
 		context.cache = Arc::clone(registry.cache());
 		Self { registry, context }
@@ -219,7 +214,6 @@ pub fn normalize(
 }
 
 /// Returns the route restriction carried by an authenticated discovery request.
-#[must_use]
 pub const fn route_scope(route: RouteId) -> RouteId {
 	route
 }

@@ -155,7 +155,6 @@ pub struct GoalTool<C> {
 }
 
 /// Creates `goal@1`; production composition registers it as hidden.
-#[must_use]
 pub fn tool<C: GoalControl>(control: C) -> GoalTool<C> {
 	GoalTool {
 		control,

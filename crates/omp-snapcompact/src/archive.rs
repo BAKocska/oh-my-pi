@@ -125,7 +125,6 @@ pub enum ArchiveError {
 pub type ArchiveResult<T, E = ArchiveError> = std::result::Result<T, E>;
 
 /// Resolves a wire API name to its image billing family.
-#[must_use]
 pub fn billing_family(api: Option<&str>) -> BillingFamily {
 	match api {
 		Some("anthropic-messages" | "bedrock-converse-stream") => BillingFamily::Anthropic,
@@ -141,7 +140,6 @@ pub fn billing_family(api: Option<&str>) -> BillingFamily {
 }
 
 /// Returns the conservative request image budget for a provider.
-#[must_use]
 pub fn provider_image_budget(provider: Option<&str>) -> usize {
 	match provider {
 		Some("anthropic" | "amazon-bedrock" | "openrouter") => 90,
@@ -152,7 +150,6 @@ pub fn provider_image_budget(provider: Option<&str>) -> usize {
 }
 
 /// Returns the bounded number of archive frames available to a provider.
-#[must_use]
 pub fn provider_frame_budget(provider: Option<&str>, existing_images: usize) -> usize {
 	provider_image_budget(provider)
 		.saturating_sub(existing_images)
@@ -175,7 +172,6 @@ fn billed_tokens(family: BillingFamily, frame_size: u32) -> u64 {
 }
 
 /// Selects Pi's eval-winning geometry for a model and carrying API.
-#[must_use]
 pub fn resolve_shape(target: ShapeTarget<'_>) -> Shape {
 	let family = billing_family(target.api);
 	let id = target.model_id.unwrap_or_default().to_ascii_lowercase();

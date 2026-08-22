@@ -49,7 +49,6 @@ pub enum BlockError {
 
 impl BlockError {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}

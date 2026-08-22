@@ -59,7 +59,6 @@ impl RelayEndpoint {
 	}
 
 	/// Returns the normalized relay origin.
-	#[must_use]
 	pub const fn as_url(&self) -> &Url {
 		&self.0
 	}
@@ -72,7 +71,6 @@ impl RelayEndpoint {
 	}
 
 	/// Transfers the validated URL to a transport owner.
-	#[must_use]
 	pub fn into_url(self) -> Url {
 		self.0
 	}
@@ -99,7 +97,6 @@ impl WebEndpoint {
 	}
 
 	/// Derives the matching browser origin from a relay.
-	#[must_use]
 	pub fn from_relay(relay: &RelayEndpoint) -> Self {
 		let mut url = relay.0.clone();
 		let scheme = if url.scheme() == "wss" {
@@ -113,7 +110,6 @@ impl WebEndpoint {
 	}
 
 	/// Returns the validated browser base.
-	#[must_use]
 	pub const fn as_url(&self) -> &Url {
 		&self.0
 	}
@@ -135,19 +131,16 @@ pub enum LinkCredentials {
 
 impl LinkCredentials {
 	/// Constructs read-only credentials.
-	#[must_use]
 	pub const fn read_only(key: [u8; ROOM_KEY_BYTES]) -> Self {
 		Self::ReadOnly(key)
 	}
 
 	/// Constructs full-access credentials.
-	#[must_use]
 	pub const fn full(key: [u8; ROOM_KEY_BYTES], write_token: [u8; WRITE_TOKEN_BYTES]) -> Self {
 		Self::Full { key, write_token }
 	}
 
 	/// Returns the room key.
-	#[must_use]
 	pub const fn key(&self) -> &[u8; ROOM_KEY_BYTES] {
 		match self {
 			Self::ReadOnly(key) | Self::Full { key, .. } => key,
@@ -155,7 +148,6 @@ impl LinkCredentials {
 	}
 
 	/// Returns a write token only for full-access links.
-	#[must_use]
 	pub fn write_token(&self) -> Option<WriteToken> {
 		match self {
 			Self::ReadOnly(_) => None,
@@ -164,7 +156,6 @@ impl LinkCredentials {
 	}
 
 	/// Reports whether the credentials are read-only.
-	#[must_use]
 	pub const fn is_read_only(&self) -> bool {
 		matches!(self, Self::ReadOnly(_))
 	}
@@ -229,38 +220,32 @@ impl HostedRoom {
 
 impl CollabLink {
 	/// Creates one room link from validated components.
-	#[must_use]
 	pub const fn new(relay: RelayEndpoint, room_id: RoomId, credentials: LinkCredentials) -> Self {
 		Self { relay, room_id, credentials }
 	}
 
 	/// Returns the relay origin.
-	#[must_use]
 	pub const fn relay(&self) -> &RelayEndpoint {
 		&self.relay
 	}
 
 	/// Returns the room identifier.
-	#[must_use]
 	pub const fn room_id(&self) -> &RoomId {
 		&self.room_id
 	}
 
 	/// Returns the link credentials.
-	#[must_use]
 	pub const fn credentials(&self) -> &LinkCredentials {
 		&self.credentials
 	}
 
 	/// Returns the exact OMP-v1 WebSocket room endpoint.
-	#[must_use]
 	pub fn room_url(&self) -> Url {
 		self.relay.room_url(&self.room_id)
 	}
 
 	/// Renders the compact CLI form. The default relay collapses to
 	/// `<room>.<credential>`; other secure relays omit only `wss://`.
-	#[must_use]
 	pub fn compact(&self) -> String {
 		let room = encode_room_id(&self.room_id);
 		let credential = self.credentials.encoded();
@@ -277,7 +262,6 @@ impl CollabLink {
 
 	/// Renders a browser deep link. Credentials remain exclusively in the URL
 	/// fragment and therefore never enter an HTTP request target.
-	#[must_use]
 	pub fn browser(&self, web: &WebEndpoint) -> String {
 		format!("{}/#{}", web.as_url().as_str().trim_end_matches('/'), self.compact())
 	}

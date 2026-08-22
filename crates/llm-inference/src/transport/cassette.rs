@@ -195,7 +195,6 @@ impl Drop for CassetteCaptureFinalizer {
 
 impl CassetteTransport {
 	/// Creates a cassette with no artificial readiness delay.
-	#[must_use]
 	pub fn new(attempts: impl Into<Arc<[CassetteAttempt]>>) -> Self {
 		Self {
 			attempts:                   attempts.into(),
@@ -208,7 +207,6 @@ impl CassetteTransport {
 	}
 
 	/// Makes the next readiness cycle return `Pending` this many times.
-	#[must_use]
 	pub const fn with_pending_ready_polls(mut self, polls: usize) -> Self {
 		self.pending_ready_polls = polls;
 		self
@@ -221,7 +219,6 @@ impl CassetteTransport {
 	/// exact total observed byte count and whether retention was truncated.
 	/// Headers and credentials are never captured; provider frames remain
 	/// redacted.
-	#[must_use]
 	pub const fn with_request_body_capture(mut self, max_bytes: NonZeroUsize) -> Self {
 		self.request_body_capture_limit = Some(max_bytes);
 		self
@@ -229,7 +226,6 @@ impl CassetteTransport {
 
 	/// Returns a stable snapshot of structural captures and any explicitly
 	/// enabled request payload evidence.
-	#[must_use]
 	pub fn captures(&self) -> Vec<CassetteCapture> {
 		let mut captures = self.captures.0.lock().clone();
 		captures.sort_by_key(|capture| capture.attempt);

@@ -334,7 +334,6 @@ fn set_status(item: &mut Item, op: Op, reason: Option<&Str>) -> Result<(), Fault
 
 /// Resolves a phase by case-insensitive exact, unique prefix, then unique
 /// substring match.
-#[must_use]
 pub fn resolve_phase_index(phases: &[Phase], query: &str) -> Option<usize> {
 	let query = query.trim().to_ascii_lowercase();
 	if query.is_empty() {
@@ -356,7 +355,6 @@ pub fn resolve_phase_index(phases: &[Phase], query: &str) -> Option<usize> {
 }
 
 /// Resolves one task across phases, preferring a unique actionable match.
-#[must_use]
 pub fn resolve_item(phases: &[Phase], query: &str) -> Option<(usize, usize)> {
 	let query = query.trim().to_ascii_lowercase();
 	if query.is_empty() {

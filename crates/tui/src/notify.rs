@@ -102,7 +102,6 @@ pub enum NotificationSound {
 
 impl NotificationSound {
 	/// Returns the OSC 99 sound identifier.
-	#[must_use]
 	pub const fn into_str(&self) -> &'static str {
 		match self {
 			Self::Silent => "silent",
@@ -160,7 +159,6 @@ pub struct Notification {
 
 impl Notification {
 	/// Starts a structured notification builder.
-	#[must_use]
 	pub fn builder() -> NotificationBuilder {
 		NotificationBuilder::default()
 	}
@@ -174,35 +172,30 @@ pub struct NotificationBuilder {
 
 impl NotificationBuilder {
 	/// Sets the notification title.
-	#[must_use]
 	pub fn title(mut self, title: impl IntoStr) -> Self {
 		self.notification.title = Some(title.into_str());
 		self
 	}
 
 	/// Sets the notification body.
-	#[must_use]
 	pub fn body(mut self, body: impl IntoStr) -> Self {
 		self.notification.body = Some(body.into_str());
 		self
 	}
 
 	/// Sets the stable OSC 99 identifier.
-	#[must_use]
 	pub fn id(mut self, id: impl IntoStr) -> Self {
 		self.notification.id = Some(id.into_str());
 		self
 	}
 
 	/// Appends one notification category.
-	#[must_use]
 	pub fn notification_type(mut self, notification_type: impl IntoStr) -> Self {
 		self.notification.types.push(notification_type.into_str());
 		self
 	}
 
 	/// Appends notification categories in iteration order.
-	#[must_use]
 	pub fn notification_types<I, S>(mut self, notification_types: I) -> Self
 	where
 		I: IntoIterator<Item = S>,
@@ -216,42 +209,36 @@ impl NotificationBuilder {
 	}
 
 	/// Sets notification urgency.
-	#[must_use]
 	pub const fn urgency(mut self, urgency: Urgency) -> Self {
 		self.notification.urgency = Some(urgency);
 		self
 	}
 
 	/// Sets the icon name.
-	#[must_use]
 	pub fn icon_name(mut self, icon_name: impl IntoStr) -> Self {
 		self.notification.icon_name = Some(icon_name.into_str());
 		self
 	}
 
 	/// Sets the requested notification sound.
-	#[must_use]
 	pub const fn sound(mut self, sound: NotificationSound) -> Self {
 		self.notification.sound = Some(sound);
 		self
 	}
 
 	/// Sets the terminal action request.
-	#[must_use]
 	pub const fn actions(mut self, actions: NotificationAction) -> Self {
 		self.notification.actions = Some(actions);
 		self
 	}
 
 	/// Sets the expiry timeout in milliseconds.
-	#[must_use]
 	pub const fn expires_ms(mut self, expires_ms: i64) -> Self {
 		self.notification.expires_ms = Some(expires_ms);
 		self
 	}
 
 	/// Finishes the notification.
-	#[must_use]
 	pub fn build(self) -> Notification {
 		self.notification
 	}

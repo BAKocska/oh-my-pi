@@ -691,7 +691,6 @@ pub struct AgentGoalControl {
 
 impl AgentGoalControl {
 	/// Binds the active session modes until the returned lease is dropped.
-	#[must_use]
 	pub fn bind(&self, modes: Arc<crate::modes::ExecutionModes>) -> AgentGoalBinding {
 		let id = self
 			.next_id
@@ -719,6 +718,7 @@ impl AgentGoalControl {
 }
 
 /// Sole-owner lease for one active goal-mode binding.
+#[must_use]
 pub struct AgentGoalBinding {
 	control: AgentGoalControl,
 	id:      u64,

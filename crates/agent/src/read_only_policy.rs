@@ -33,7 +33,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
 /// Empty declarations inherit their parent's tools and are therefore never
 /// classified as read-only. Unknown names fail closed and this function never
 /// adds tools to the definition.
-#[must_use]
 pub fn is_read_only_agent(definition: &AgentDefinition) -> bool {
 	!definition.tools.is_empty()
 		&& definition

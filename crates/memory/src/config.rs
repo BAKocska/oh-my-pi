@@ -85,7 +85,6 @@ pub enum EmbeddingVariant {
 
 impl EmbeddingVariant {
 	/// Returns the model identifier sent to the isolated embedding worker.
-	#[must_use]
 	pub const fn model_id(self) -> Option<&'static str> {
 		match self {
 			Self::English => Some("BAAI/bge-base-en-v1.5"),
@@ -283,7 +282,6 @@ impl Default for MnemopiSettings {
 
 impl MnemopiSettings {
 	/// Applies parity floors and bounded operational ceilings.
-	#[must_use]
 	pub fn normalize(mut self) -> Self {
 		self.retain_every_n_turns = self.retain_every_n_turns.clamp(1, 10_000);
 		self.recall_limit = self.recall_limit.clamp(1, 50);

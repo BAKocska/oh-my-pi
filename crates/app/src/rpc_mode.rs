@@ -183,6 +183,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	write_result
 }
 
+#[must_use]
 struct StdinClaim;
 
 impl StdinClaim {
@@ -359,6 +360,7 @@ pub(crate) struct HostResourceBroker {
 	state:    Mutex<HostResourceState>,
 }
 
+#[must_use]
 struct PendingHostRequestGuard<'a> {
 	broker:     &'a HostResourceBroker,
 	id:         String,

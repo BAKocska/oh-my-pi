@@ -21,13 +21,11 @@ pub struct FrameConfig {
 
 impl FrameConfig {
 	/// Creates a framing policy with a nonzero encoded-payload limit.
-	#[must_use]
 	pub const fn new(max_frame_bytes: NonZeroUsize) -> Self {
 		Self { max_frame_bytes }
 	}
 
 	/// Returns the maximum encoded protobuf payload length.
-	#[must_use]
 	pub const fn max_frame_bytes(self) -> usize {
 		self.max_frame_bytes.get()
 	}

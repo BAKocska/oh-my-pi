@@ -69,7 +69,6 @@ pub struct PromptsClient {
 
 impl PromptsClient {
 	/// Creates a prompt facade.
-	#[must_use]
 	pub fn new(transport: Arc<dyn McpTransport>) -> Self {
 		Self { transport }
 	}

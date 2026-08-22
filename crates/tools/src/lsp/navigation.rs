@@ -68,7 +68,6 @@ fn is_word_character(character: char) -> bool {
 }
 
 /// Normalizes LSP Location and LocationLink results to a bounded location list.
-#[must_use]
 pub fn normalize_locations(value: &Value, limit: usize) -> Vec<Value> {
 	let values = value
 		.as_array()
@@ -91,7 +90,6 @@ pub fn normalize_locations(value: &Value, limit: usize) -> Vec<Value> {
 }
 
 /// Extracts Markdown, MarkedString, and plaintext hover contents.
-#[must_use]
 pub fn hover_text(contents: &Value) -> Str {
 	fn append(value: &Value, output: &mut String) {
 		match value {

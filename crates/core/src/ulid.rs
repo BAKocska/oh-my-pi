@@ -38,7 +38,6 @@ impl Ulid {
 	/// Entropy comes from `rand`'s thread-local cryptographically secure
 	/// generator, which is initially seeded and periodically reseeded from the
 	/// operating system. Generation is not monotonic within one millisecond.
-	#[must_use]
 	pub fn generate() -> Self {
 		let timestamp = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -61,13 +60,11 @@ impl Ulid {
 	}
 
 	/// Returns the big-endian 16-byte representation of this ULID.
-	#[must_use]
 	pub const fn to_bytes(self) -> [u8; 16] {
 		self.0.to_be_bytes()
 	}
 
 	/// Creates a ULID from its big-endian 16-byte representation.
-	#[must_use]
 	pub const fn from_bytes(bytes: [u8; 16]) -> Self {
 		Self(u128::from_be_bytes(bytes))
 	}

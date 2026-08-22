@@ -385,7 +385,6 @@ impl CredentialKeyMode {
 	/// Selects the OS keychain only for exact `OMP_LLM_KEYCHAIN=1`. When the
 	/// variable is unset, an interactive macOS process uses an owner-only local
 	/// key file; unattended processes and any other set value fail closed.
-	#[must_use]
 	pub fn from_environment() -> Self {
 		let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 		Self::from_value(std::env::var_os(KEYCHAIN_OPT_IN_ENV).as_deref(), interactive)
@@ -408,7 +407,6 @@ pub struct DaemonConfig {
 
 impl DaemonConfig {
 	/// Creates the standard owner-local daemon configuration.
-	#[must_use]
 	pub fn local(endpoint: impl Into<LocalEndpoint>) -> Self {
 		let data_dir = std::env::var_os(DATA_DIR_ENV)
 			.map(PathBuf::from)
@@ -420,7 +418,6 @@ impl DaemonConfig {
 
 	/// Overrides the directory containing encrypted credentials and session
 	/// state.
-	#[must_use]
 	pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
 		self.data_dir = Some(data_dir);
 		self
@@ -1012,19 +1009,16 @@ impl DaemonHandle {
 	}
 
 	/// Returns registry readiness facts.
-	#[must_use]
 	pub const fn readiness(&self) -> &DaemonReadiness {
 		&self.readiness
 	}
 
 	/// Returns a clone-cheap comprehensive operation service.
-	#[must_use]
 	pub fn service(&self) -> ProviderService {
 		self.registry.service_with_observer(TracingObservation)
 	}
 
 	/// Creates a typed client using caller-provided call metadata.
-	#[must_use]
 	pub fn client(&self, meta: omp_llm_inference::CallMeta) -> Client<ProviderService, Router> {
 		Client::new(self.service(), Router::new(self.registry.clone(), Duration::from_secs(30)), meta)
 	}

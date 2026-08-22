@@ -14,7 +14,6 @@ pub struct PlanReadProtection {
 
 impl PlanReadProtection {
 	/// Creates a matcher for the current active plan reference.
-	#[must_use]
 	pub fn new(active: impl Into<Str>) -> Self {
 		Self { active: active.into() }
 	}
@@ -26,7 +25,6 @@ impl PlanReadProtection {
 
 	/// Returns whether a completed tool outcome must survive every compaction
 	/// method. Only `read` outcomes are eligible.
-	#[must_use]
 	pub fn retains(&self, tool: &str, path: &str) -> bool {
 		tool == "read" && (targets(path, DEFAULT_PLAN_URL) || targets(path, self.active.as_str()))
 	}

@@ -240,19 +240,16 @@ impl HeadlessSession {
 	}
 
 	/// Returns the durable session identifier.
-	#[must_use]
 	pub fn session_id(&self) -> &str {
 		self.session_id.as_str()
 	}
 
 	/// Returns the canonical replay projection loaded before the first turn.
-	#[must_use]
 	pub fn initial_items(&self) -> &[Item] {
 		&self.initial_items
 	}
 
 	/// Returns the Environment client owned alongside the agent.
-	#[must_use]
 	pub const fn env(&self) -> &omp_env::EnvClient {
 		&self.env
 	}
@@ -283,7 +280,6 @@ impl HeadlessSession {
 	}
 
 	/// Returns the current session-effective model selector.
-	#[must_use]
 	pub fn model(&self) -> Str {
 		Str::new(self.state.snapshot().turn.params.model.as_str())
 	}
@@ -338,7 +334,6 @@ impl HeadlessSession {
 	///
 	/// Protocol hosts use this before borrowing the session mutably for a
 	/// submission so cancellation never contends on their session mutex.
-	#[must_use]
 	pub fn interrupt_handle(&self) -> SessionHandle {
 		self.session.clone()
 	}
@@ -354,13 +349,11 @@ impl HeadlessSession {
 	}
 
 	/// Returns the session-scoped execution modes.
-	#[must_use]
 	pub fn modes(&self) -> &ExecutionModes {
 		self.modes.as_ref()
 	}
 
 	/// Returns the append-only agent roster.
-	#[must_use]
 	pub fn tree(&self) -> &Arc<AgentTree> {
 		&self.tree
 	}
@@ -371,7 +364,6 @@ impl HeadlessSession {
 	}
 
 	/// Returns the generation-fenced extension lifecycle sink.
-	#[must_use]
 	pub const fn lifecycle_sink(&self) -> &HeadlessLifecycleSink {
 		&self.lifecycle
 	}
@@ -382,13 +374,11 @@ impl HeadlessSession {
 	}
 
 	/// Returns the durable approval book.
-	#[must_use]
 	pub fn approval_book(&self) -> &Arc<ApprovalBook> {
 		&self.approval_book
 	}
 
 	/// Returns the awaitable approval route.
-	#[must_use]
 	pub const fn approval_route(&self) -> &ApprovalRoute {
 		&self.approval_route
 	}

@@ -72,7 +72,6 @@ pub struct ReviewOutput {
 }
 
 /// Returns the strict JSON Schema supplied to the ordinary child-agent runtime.
-#[must_use]
 pub fn strict_result_schema() -> Value {
 	json!({
 		"type": "object",

@@ -28,7 +28,6 @@ impl DevicePath {
 	}
 
 	/// Returns the unqualified root device token.
-	#[must_use]
 	pub const fn root(&self) -> &Str {
 		&self.name
 	}

@@ -137,7 +137,6 @@ pub struct AdviseTool {
 }
 
 /// Creates `advise@1` over a session-scoped queue.
-#[must_use]
 pub fn tool(queue: AdvisorAdviceQueue) -> AdviseTool {
 	AdviseTool {
 		queue,

@@ -44,7 +44,6 @@ pub struct ThemeWatcher {
 
 impl ThemeWatcher {
 	/// Creates an empty watcher.
-	#[must_use]
 	pub fn new() -> Self {
 		Self {
 			active: ArcSwapOption::empty(),
@@ -73,13 +72,11 @@ impl ThemeWatcher {
 	}
 
 	/// Loads the active immutable revision without locking.
-	#[must_use]
 	pub fn current(&self) -> Option<Arc<ThemeRevision>> {
 		self.active.load_full()
 	}
 
 	/// Resolves the active semantic palette for an appearance and color mode.
-	#[must_use]
 	pub fn palette(&self, appearance: Appearance, truecolor: bool) -> Option<Theme> {
 		let active = self.active.load_full()?;
 		Some(if truecolor {

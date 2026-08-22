@@ -591,7 +591,6 @@ const FAMILIES: &[Family] = &[
 ];
 
 /// Discovers the full checker matrix from a bounded project file snapshot.
-#[must_use]
 pub fn discover(
 	project_root: &Path,
 	files: &[PathBuf],
@@ -767,7 +766,6 @@ pub fn parse_custom_specs(json: &str) -> Result<Vec<CustomCheckerSpec>, serde_js
 }
 
 /// Resolves schema-valid custom checker proposals without shell interpretation.
-#[must_use]
 pub fn custom_suite(
 	project_root: &Path,
 	specs: Vec<CustomCheckerSpec>,

@@ -21,7 +21,6 @@ pub struct GoalBudgetReport {
 
 impl GoalBudgetReport {
 	/// Derives exact completion accounting from a goal projection.
-	#[must_use]
 	pub fn from_goal(goal: &Goal) -> Self {
 		let remaining = goal
 			.token_budget
@@ -39,7 +38,6 @@ impl GoalBudgetReport {
 	}
 
 	/// Renders the instruction shown to the model on completion.
-	#[must_use]
 	pub fn model_prompt(&self) -> Str {
 		let budget = self
 			.budget

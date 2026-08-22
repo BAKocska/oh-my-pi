@@ -53,7 +53,6 @@ pub enum MetadataError {
 	Transport,
 }
 /// Deterministic RFC 9728 protected-resource metadata candidates.
-#[must_use]
 pub fn protected_resource_candidates(resource: &str) -> Vec<Url> {
 	let Ok(base) = Url::parse(resource) else {
 		return Vec::new();
@@ -204,7 +203,6 @@ pub fn parse_authorization_server_metadata(
 
 /// Builds deterministic RFC 8414/OIDC metadata candidates for a possibly
 /// path-scoped issuer. The path-prefixed form is tried before the origin form.
-#[must_use]
 pub fn metadata_candidates(issuer: &str) -> Vec<Url> {
 	let Ok(base) = Url::parse(issuer) else {
 		return Vec::new();

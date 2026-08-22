@@ -173,13 +173,11 @@ impl BankStore {
 	}
 
 	/// Returns the non-secret SQLite path for diagnostics only.
-	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
 
 	/// Returns the owning bank.
-	#[must_use]
 	pub const fn bank(&self) -> &BankId {
 		&self.bank
 	}

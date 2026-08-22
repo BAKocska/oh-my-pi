@@ -161,7 +161,6 @@ pub struct PinnedMyersWindow {
 
 impl PinnedMyersWindow {
 	/// Creates an empty streaming window.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -212,25 +211,21 @@ impl PinnedMyersWindow {
 	}
 
 	/// Exact append-only numbered rows currently retained by the window.
-	#[must_use]
 	pub fn text(&self) -> &str {
 		self.text.as_str()
 	}
 
 	/// Number of distinct rows retained across the streamed alignments.
-	#[must_use]
 	pub fn row_count(&self) -> usize {
 		self.rows.len()
 	}
 
 	/// Exact number of added rows in the latest complete candidate.
-	#[must_use]
 	pub const fn added_lines(&self) -> usize {
 		self.added_lines
 	}
 
 	/// Exact number of removed rows in the latest complete candidate.
-	#[must_use]
 	pub const fn removed_lines(&self) -> usize {
 		self.removed_lines
 	}
@@ -563,7 +558,6 @@ enum PreviewLine<'a> {
 /// Added rows already use post-edit numbers. Context rows are renumbered by the
 /// running add/remove offset, removed text is omitted, and long added runs
 /// elide their middle without losing statistics.
-#[must_use]
 pub fn build_compact_diff_preview(diff: &str, options: CompactDiffOptions) -> CompactDiffPreview {
 	let edge_lines = options.max_added_run_context.max(1);
 	let mut formatted = Vec::<PreviewLine<'_>>::new();

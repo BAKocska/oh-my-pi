@@ -217,7 +217,6 @@ impl ExecutionControlFlow {
 	/// Attempts to decrement the loop levels for `BreakLoop` or `ContinueLoop`.
 	/// If the levels reach zero, transitions to `Normal`. If the control flow is
 	/// not a loop break or continue, no changes are made.
-	#[must_use]
 	pub const fn try_decrement_loop_levels(&self) -> Self {
 		match self {
 			Self::BreakLoop { levels: 0 } | Self::ContinueLoop { levels: 0 } => Self::Normal,

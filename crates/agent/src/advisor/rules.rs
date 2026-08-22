@@ -160,7 +160,6 @@ pub fn parse_watchdog_yaml(source: &str, yaml: &str) -> Result<WatchdogRuleSet, 
 ///
 /// Shared instructions concatenate in discovery order. A later advisor with an
 /// existing slug replaces that declaration without changing roster position.
-#[must_use]
 pub fn merge_watchdog_rules(rule_sets: impl IntoIterator<Item = WatchdogRuleSet>) -> AdvisorRoster {
 	let mut shared = String::new();
 	let mut advisors = Vec::<AdvisorRule>::new();
@@ -185,7 +184,6 @@ pub fn merge_watchdog_rules(rule_sets: impl IntoIterator<Item = WatchdogRuleSet>
 }
 
 /// Produces the durable slug used by advisor child identities.
-#[must_use]
 pub fn slugify_advisor_name(name: &str) -> Str {
 	let mut slug = String::with_capacity(name.len());
 	let mut separator = false;
@@ -213,7 +211,6 @@ pub fn slugify_advisor_name(name: &str) -> Str {
 /// Unknown tools are dropped. An explicit empty list remains empty; an
 /// omitted or unknown-only nonempty list falls back to the available
 /// members of [`DEFAULT_ADVISOR_TOOLS`].
-#[must_use]
 pub fn evaluate_advisor_tools(
 	rule: &AdvisorRule,
 	available: impl IntoIterator<Item = impl AsRef<str>>,

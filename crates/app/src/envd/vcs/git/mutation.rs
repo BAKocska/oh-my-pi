@@ -159,7 +159,6 @@ pub enum MutationOutcome {
 
 impl MutationOutcome {
 	/// Returns whether Git completed successfully.
-	#[must_use]
 	pub const fn is_applied(&self) -> bool {
 		matches!(self, Self::Applied(_))
 	}

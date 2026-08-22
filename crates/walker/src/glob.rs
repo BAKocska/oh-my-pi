@@ -54,31 +54,26 @@ impl CompiledPattern {
 	}
 
 	/// Creates a builder for `pattern` with fnmatch-style defaults.
-	#[must_use]
 	pub const fn builder(pattern: &str) -> PatternBuilder<'_> {
 		PatternBuilder::new(pattern)
 	}
 
 	/// Escapes all glob metacharacters so `text` is matched literally.
-	#[must_use]
 	pub fn escape(text: &str) -> String {
 		globset::escape(text)
 	}
 
 	/// Returns whether this pattern matches `candidate`.
-	#[must_use]
 	pub fn matches(&self, candidate: &str) -> bool {
 		self.0.matcher.is_match(candidate)
 	}
 
 	/// Returns whether this pattern matches `candidate` as a filesystem path.
-	#[must_use]
 	pub fn matches_path(&self, candidate: &Path) -> bool {
 		self.0.matcher.is_match(candidate)
 	}
 
 	/// Returns the source pattern.
-	#[must_use]
 	pub fn pattern(&self) -> &str {
 		&self.0.pattern
 	}
@@ -124,20 +119,17 @@ pub struct PatternBuilder<'a> {
 impl<'a> PatternBuilder<'a> {
 	/// Creates a builder with fnmatch-style literal separators and
 	/// case-sensitive matching.
-	#[must_use]
 	pub const fn new(pattern: &'a str) -> Self {
 		Self { pattern, literal_separator: true, case_insensitive: false }
 	}
 
 	/// Sets whether wildcards may match path separators.
-	#[must_use]
 	pub const fn literal_separator(mut self, enabled: bool) -> Self {
 		self.literal_separator = enabled;
 		self
 	}
 
 	/// Sets whether matching ignores case.
-	#[must_use]
 	pub const fn case_insensitive(mut self, enabled: bool) -> Self {
 		self.case_insensitive = enabled;
 		self
@@ -186,25 +178,21 @@ impl CompiledGlobSet {
 	}
 
 	/// Creates a builder for a compiled pattern set.
-	#[must_use]
 	pub const fn builder() -> GlobSetBuilder {
 		GlobSetBuilder::new()
 	}
 
 	/// Returns whether any pattern matches `candidate`.
-	#[must_use]
 	pub fn matches(&self, candidate: &str) -> bool {
 		self.0.matcher.is_match(candidate)
 	}
 
 	/// Returns whether any pattern matches `candidate` as a filesystem path.
-	#[must_use]
 	pub fn matches_path(&self, candidate: &Path) -> bool {
 		self.0.matcher.is_match(candidate)
 	}
 
 	/// Returns the ordered source patterns.
-	#[must_use]
 	pub fn patterns(&self) -> &[String] {
 		&self.0.patterns
 	}
@@ -248,20 +236,17 @@ pub struct GlobSetBuilder {
 
 impl GlobSetBuilder {
 	/// Creates a case-sensitive builder whose wildcards may cross separators.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { literal_separator: false, case_insensitive: false }
 	}
 
 	/// Sets whether wildcards may match path separators.
-	#[must_use]
 	pub const fn literal_separator(mut self, enabled: bool) -> Self {
 		self.literal_separator = enabled;
 		self
 	}
 
 	/// Sets whether matching ignores case.
-	#[must_use]
 	pub const fn case_insensitive(mut self, enabled: bool) -> Self {
 		self.case_insensitive = enabled;
 		self
@@ -316,13 +301,11 @@ impl CompiledWalkGlob {
 	}
 
 	/// Returns whether `relative` matches any compiled pattern.
-	#[must_use]
 	pub fn is_match(&self, relative: &str) -> bool {
 		self.0.matches(relative)
 	}
 
 	/// Returns the normalized source patterns.
-	#[must_use]
 	pub fn patterns(&self) -> &[String] {
 		self.0.patterns()
 	}

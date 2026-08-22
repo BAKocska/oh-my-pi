@@ -107,7 +107,6 @@ pub struct ModelClassification {
 }
 
 /// Classifies one source identity without consulting process state.
-#[must_use]
 pub fn classify(input: ClassificationInput<'_>) -> ModelClassification {
 	classify_with_taxonomy(input, taxonomy())
 }

@@ -63,7 +63,6 @@ pub struct Handshake {
 
 impl Handshake {
 	/// Starts a role-appropriate handshake.
-	#[must_use]
 	pub const fn new(role: RelayRole) -> Self {
 		let state = match role {
 			RelayRole::Host => HandshakeState::AwaitingHello,
@@ -73,7 +72,6 @@ impl Handshake {
 	}
 
 	/// Returns current handshake progress.
-	#[must_use]
 	pub const fn state(&self) -> HandshakeState {
 		self.state
 	}
@@ -105,7 +103,6 @@ impl Handshake {
 	}
 
 	/// Constructs a guest hello frame.
-	#[must_use]
 	pub fn hello(sequence: u64, hello: Hello) -> CollabFrame {
 		CollabFrame {
 			protocol_revision: PROTOCOL_REVISION,
@@ -116,7 +113,6 @@ impl Handshake {
 	}
 
 	/// Constructs a host welcome frame.
-	#[must_use]
 	pub fn welcome(sequence: u64, welcome: Welcome) -> CollabFrame {
 		CollabFrame {
 			protocol_revision: PROTOCOL_REVISION,
@@ -166,19 +162,16 @@ impl ReconnectQueue {
 	}
 
 	/// Returns queued frame count.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.frames.len()
 	}
 
 	/// Returns whether no frames are queued.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.frames.is_empty()
 	}
 
 	/// Returns total encoded bytes retained.
-	#[must_use]
 	pub const fn bytes(&self) -> usize {
 		self.bytes
 	}
@@ -385,7 +378,6 @@ impl RelayClient {
 	}
 
 	/// Returns the reconnect/backpressure queue.
-	#[must_use]
 	pub const fn pending(&self) -> &ReconnectQueue {
 		&self.pending
 	}

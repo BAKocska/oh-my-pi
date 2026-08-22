@@ -166,7 +166,6 @@ pub struct RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA, H = NoHookHandle> {
 impl<I, SS, SM, AP, AC, RL, EN, CA> RouteStackLayers<I, SS, SM, AP, AC, RL, EN, CA> {
 	/// Threads one concrete cold-path hook dispatcher through every inference
 	/// seam without introducing dynamic dispatch.
-	#[must_use]
 	pub fn with_hook<H: HookHandle>(
 		self,
 		hook: H,

@@ -167,7 +167,6 @@ pub enum SnapshotError {
 impl Catalog {
 	/// Returns the process-wide embedded catalog, panicking with validation
 	/// evidence on corruption.
-	#[must_use]
 	pub fn embedded() -> &'static Self {
 		match Self::try_embedded() {
 			Ok(catalog) => catalog,
@@ -348,81 +347,68 @@ impl Catalog {
 	}
 
 	/// Returns the immutable catalog revision.
-	#[must_use]
 	pub const fn revision(&self) -> &crate::CatalogRevision {
 		&self.compiled.revision
 	}
 
 	/// Returns the verified compiler census.
-	#[must_use]
 	pub const fn census(&self) -> crate::compile::CompilerCensus {
 		self.compiled.census
 	}
 
 	/// Returns providers in stable identifier order.
-	#[must_use]
 	pub fn providers(&self) -> &[ProviderDef] {
 		&self.compiled.providers
 	}
 
 	/// Returns routes in stable identifier order.
-	#[must_use]
 	pub fn routes(&self) -> &[RouteDef] {
 		&self.compiled.routes
 	}
 
 	/// Returns models in stable key order.
-	#[must_use]
 	pub fn models(&self) -> &[ModelSpec] {
 		&self.compiled.models
 	}
 
 	/// Returns interned authentication specifications in stable identifier
 	/// order.
-	#[must_use]
 	pub fn auth_specs(&self) -> &[AuthSpec] {
 		&self.compiled.auth_specs
 	}
 
 	/// Returns interned public OAuth flow specifications in stable identifier
 	/// order.
-	#[must_use]
 	pub fn oauth_specs(&self) -> &[OAuthSpec] {
 		&self.compiled.oauth_specs
 	}
 
 	/// Returns interned safe header profiles in stable identifier order.
-	#[must_use]
 	pub fn header_profiles(&self) -> &[HeaderProfile] {
 		&self.compiled.header_profiles
 	}
 
 	/// Returns interned discovery specifications in stable identifier order.
-	#[must_use]
 	pub fn discovery_specs(&self) -> &[DiscoverySpec] {
 		&self.compiled.discovery_specs
 	}
 
 	/// Returns aliases in stable selector order.
-	#[must_use]
 	pub fn aliases(&self) -> &[CatalogAlias] {
 		&self.compiled.aliases
 	}
 
 	/// Returns the source-lock digest bound into this snapshot.
-	#[must_use]
 	pub const fn source_digest(&self) -> &[u8; 32] {
 		&self.source_digest
 	}
 
 	/// Returns the hash of the normalized JSON reviewed with this snapshot.
-	#[must_use]
 	pub const fn normalized_json_sha256(&self) -> &[u8; 32] {
 		&self.normalized_json_sha256
 	}
 
 	/// Looks up one provider by exact stable identifier.
-	#[must_use]
 	pub fn provider(&self, id: &ProviderId<str>) -> Option<&ProviderDef> {
 		self
 			.compiled
@@ -433,7 +419,6 @@ impl Catalog {
 	}
 
 	/// Returns authored conservative discovery defaults for one exact provider.
-	#[must_use]
 	pub fn discovery_defaults(
 		&self,
 		id: &ProviderId<str>,
@@ -442,7 +427,6 @@ impl Catalog {
 	}
 
 	/// Looks up one route by exact stable identifier.
-	#[must_use]
 	pub fn route(&self, id: &RouteId<str>) -> Option<&RouteDef> {
 		self
 			.compiled
@@ -453,14 +437,12 @@ impl Catalog {
 	}
 
 	/// Looks up one model by exact normalized key.
-	#[must_use]
 	pub fn model(&self, key: &ModelKey<str>) -> Option<&ModelSpec> {
 		let index = self.model_position(key)?;
 		Some(&self.compiled.models[index])
 	}
 
 	/// Looks up a model only when it is exposed by the requested provider.
-	#[must_use]
 	pub fn model_for_provider(
 		&self,
 		provider: &ProviderId<str>,
@@ -494,7 +476,6 @@ impl Catalog {
 	}
 
 	/// Resolves an exact alias to its canonical model record.
-	#[must_use]
 	pub fn resolve_alias(&self, alias: &str) -> Option<&ModelSpec> {
 		let index = self
 			.compiled
@@ -505,7 +486,6 @@ impl Catalog {
 	}
 
 	/// Looks up an interned authentication specification.
-	#[must_use]
 	pub fn auth_spec(&self, id: &AuthSpecId<str>) -> Option<&AuthSpec> {
 		self
 			.compiled
@@ -516,7 +496,6 @@ impl Catalog {
 	}
 
 	/// Looks up an interned public OAuth flow specification.
-	#[must_use]
 	pub fn oauth_spec(&self, id: &OAuthSpecId<str>) -> Option<&OAuthSpec> {
 		self
 			.compiled
@@ -527,7 +506,6 @@ impl Catalog {
 	}
 
 	/// Looks up an interned safe header profile.
-	#[must_use]
 	pub fn header_profile(&self, id: &HeaderProfileId<str>) -> Option<&HeaderProfile> {
 		self
 			.compiled
@@ -538,7 +516,6 @@ impl Catalog {
 	}
 
 	/// Looks up an interned discovery specification.
-	#[must_use]
 	pub fn discovery_spec(&self, id: &DiscoverySpecId<str>) -> Option<&DiscoverySpec> {
 		self
 			.compiled
@@ -549,7 +526,6 @@ impl Catalog {
 	}
 
 	/// Looks up an interned wire policy without re-hashing it.
-	#[must_use]
 	pub fn wire_policy(&self, id: &WirePolicyId<str>) -> Option<&WirePolicy> {
 		let index = self
 			.wire_policy_ids
@@ -559,7 +535,6 @@ impl Catalog {
 	}
 
 	/// Looks up an interned thinking policy without re-hashing it.
-	#[must_use]
 	pub fn thinking_policy(&self, id: &ThinkingPolicyId<str>) -> Option<&ThinkingPolicy> {
 		let index = self
 			.thinking_policy_ids

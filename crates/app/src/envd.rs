@@ -517,12 +517,10 @@ impl ProjectEnvironment {
 		})
 	}
 
-	#[must_use]
 	pub(crate) const fn client(&self) -> &EnvClient {
 		&self.client
 	}
 
-	#[must_use]
 	pub(crate) fn registry(&self) -> Arc<Registry> {
 		Arc::clone(&self.registry)
 	}
@@ -555,7 +553,6 @@ impl ProjectEnvironment {
 		self.lifecycle.server.memory_runtime()
 	}
 
-	#[must_use]
 	pub(crate) fn eval_bridge(&self) -> Arc<eval::SessionBridgeHost> {
 		Arc::clone(&self.eval_bridge)
 	}
@@ -565,28 +562,23 @@ impl ProjectEnvironment {
 		Arc::clone(&self.reflection_bridge)
 	}
 
-	#[must_use]
 	pub(crate) fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
 		self.eval_control.clone()
 	}
 
-	#[must_use]
 	pub(crate) fn search_bridge(&self) -> Arc<search_backend::SearchBridgeHost> {
 		Arc::clone(&self.search_bridge)
 	}
 
-	#[must_use]
 	pub(crate) fn github_credentials(&self) -> Arc<github_url::GithubCredentialBridge> {
 		Arc::clone(&self.github_credentials)
 	}
 
-	#[must_use]
 	pub(crate) fn goal_control(&self) -> tools::AgentGoalControl {
 		self.goal_control.clone()
 	}
 
 	/// Returns the Environment-owned authoritative sessions index.
-	#[must_use]
 	pub(crate) fn sessions_index(&self) -> Arc<omp_storage::index::SessionIndex> {
 		self.lifecycle.server.sessions_index()
 	}

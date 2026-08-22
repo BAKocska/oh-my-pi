@@ -298,7 +298,6 @@ pub mod omp_aggregate {
 
 	/// Builds the dynamic per-stop-reason count key used on `invoke_agent`
 	/// spans.
-	#[must_use]
 	pub fn chats_stop_reason(reason: &str) -> String {
 		let mut key =
 			String::with_capacity(CHATS_STOP_REASON_PREFIX.len() + reason.len() + ".count".len());

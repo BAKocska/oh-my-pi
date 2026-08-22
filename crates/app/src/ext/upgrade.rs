@@ -88,7 +88,6 @@ pub struct UninstallPlan {
 }
 
 /// Computes uninstall effects without mutating either state file.
-#[must_use]
 pub fn plan_uninstall(
 	installed: &InstalledRecord,
 	lock: &LockFile,

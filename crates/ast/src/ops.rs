@@ -81,13 +81,11 @@ pub struct CompiledRewrite {
 }
 
 /// Resolves an optional API strictness to ast-grep strictness.
-#[must_use]
 pub fn resolve_strictness(value: Option<AstMatchStrictness>) -> MatchStrictness {
 	value.map_or(MatchStrictness::Smart, Into::into)
 }
 
 /// Returns supported language aliases as a comma-separated list.
-#[must_use]
 pub fn supported_lang_list() -> String {
 	SupportLang::sorted_aliases().join(", ")
 }
@@ -110,7 +108,6 @@ pub fn resolve_language(lang: Option<&str>, file_path: &Path) -> Result<SupportL
 }
 
 /// Reports whether a file has an explicit or inferable language.
-#[must_use]
 pub fn is_supported_file(file_path: &Path, explicit_lang: Option<&str>) -> bool {
 	if explicit_lang.is_some() {
 		return true;
@@ -273,7 +270,6 @@ pub fn compile_rewrite_rules(
 }
 
 /// Collects all matches for compiled patterns in source order per pattern.
-#[must_use]
 pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]) -> Vec<AstMatch> {
 	let ast = language.ast_grep(source);
 	let mut matches = Vec::new();
@@ -420,7 +416,6 @@ fn build_globset(patterns: &[String]) -> Result<CompiledGlobSet, std::io::Error>
 }
 
 /// Reports whether a path pattern contains supported glob syntax.
-#[must_use]
 pub fn has_glob_syntax(pattern: &str) -> bool {
 	pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
 }

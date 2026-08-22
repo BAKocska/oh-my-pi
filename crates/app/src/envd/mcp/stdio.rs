@@ -47,7 +47,6 @@ pub enum StdioPlatform {
 
 impl StdioPlatform {
 	/// Current host platform.
-	#[must_use]
 	pub const fn host() -> Self {
 		if cfg!(windows) {
 			Self::Windows

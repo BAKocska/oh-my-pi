@@ -68,7 +68,6 @@ include!(env!("OMP_PY_FROZEN_DISTRIBUTIONS"));
 ///
 /// Resolver rule R7 reads this runtime metadata rather than duplicating a
 /// requirements list in application code.
-#[must_use]
 pub const fn frozen_distributions() -> &'static [(&'static str, &'static str)] {
 	FROZEN_DISTRIBUTIONS
 }
@@ -113,7 +112,6 @@ impl Error for InitError {}
 /// Configures and boots the embedded interpreter. Created by
 /// [`Engine::builder`].
 #[derive(Debug, Default)]
-#[must_use = "call .init() to boot the interpreter"]
 pub struct Builder {
 	site_packages: Option<PathBuf>,
 }
@@ -171,7 +169,6 @@ impl Engine {
 	///
 	/// The returned path is read-only; changing the search path after isolated
 	/// initialization would violate the one-entry embedding contract.
-	#[must_use]
 	pub fn site_packages(&self) -> &std::path::Path {
 		&self.site_packages
 	}

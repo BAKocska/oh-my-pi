@@ -242,7 +242,6 @@ impl QuotaState {
 
 	/// Reports whether any current known remaining/limit pair is below the
 	/// configured percentage. Unknown or reset-stale pairs do not fail closed.
-	#[must_use]
 	pub fn below_remaining_percent(&self, now: SystemTime, percent: u8) -> bool {
 		let percent = u128::from(percent.min(100));
 		self.windows.values().any(|window| {

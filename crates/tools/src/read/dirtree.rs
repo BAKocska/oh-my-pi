@@ -361,7 +361,6 @@ fn apply_prompt_line_cap(rows: &mut Vec<RenderedLine>) {
 }
 
 /// Renders a flat, deterministic directory-mention listing with relative ages.
-#[must_use]
 pub fn render_directory_mention(entries: &[DirEntry], now_ms: u64, limit: usize) -> Str {
 	let mut entries = entries.iter().collect::<Vec<_>>();
 	entries.sort_unstable_by(|left, right| {

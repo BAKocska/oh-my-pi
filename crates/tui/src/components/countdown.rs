@@ -24,7 +24,6 @@ pub struct Countdown {
 
 impl Countdown {
 	/// Creates a countdown beginning at presentation time `started`.
-	#[must_use]
 	pub fn new(label: impl IntoStr, started: Duration, duration: Duration) -> Self {
 		let label = label.into_str();
 		let millis = duration.as_millis();
@@ -34,7 +33,6 @@ impl Countdown {
 	}
 
 	/// Returns the remaining whole seconds, rounding a partial second up.
-	#[must_use]
 	pub fn remaining(&self, now: Duration) -> u64 {
 		let left = self
 			.duration
@@ -44,7 +42,6 @@ impl Countdown {
 	}
 
 	/// Reports whether the deadline has elapsed.
-	#[must_use]
 	pub fn expired(&self, now: Duration) -> bool {
 		now.saturating_sub(self.started) >= self.duration
 	}

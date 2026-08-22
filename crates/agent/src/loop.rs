@@ -115,14 +115,12 @@ pub struct AgentRunSummary {
 
 impl AgentRunSummary {
 	/// Projects a committed outcome into the authoritative typed settlement.
-	#[must_use]
 	pub fn settled(outcome: Outcome, committed_turns: u32, interrupted: bool) -> Self {
 		run_summary(Some(outcome), committed_turns, interrupted)
 	}
 
 	/// Constructs the typed terminal-fault projection used when `submit`
 	/// returns an error before committing an outcome.
-	#[must_use]
 	pub const fn terminal_fault() -> Self {
 		Self {
 			outcome:         None,
@@ -134,7 +132,6 @@ impl AgentRunSummary {
 	}
 
 	/// Constructs an intentional silent compaction transition.
-	#[must_use]
 	pub fn silent_compaction_transition(outcome: Option<Outcome>, committed_turns: u32) -> Self {
 		let final_assistant = outcome.as_ref().and_then(authoritative_assistant);
 		Self {
@@ -148,7 +145,6 @@ impl AgentRunSummary {
 
 	/// Returns the authoritative assistant text projected from the last
 	/// committed outcome.
-	#[must_use]
 	pub fn final_assistant(&self) -> Option<&str> {
 		self.final_assistant.as_deref()
 	}
@@ -428,6 +424,7 @@ pub trait RunActivity: Send + Sync + 'static {
 	fn exit(&self);
 }
 
+#[must_use]
 struct RunActivityGuard(Arc<dyn RunActivity>);
 
 type TurnCompletion =
@@ -629,7 +626,6 @@ impl<C: TurnClient> Agent<C> {
 
 	/// Returns the environment authority used for out-of-band live execution
 	/// control.
-	#[must_use]
 	pub fn environment(&self) -> EnvClient {
 		self.env.clone()
 	}
@@ -669,13 +665,11 @@ impl<C: TurnClient> Agent<C> {
 	}
 
 	/// Returns Core's latest loop-repetition and progress evidence.
-	#[must_use]
 	pub const fn loop_signal(&self) -> &LoopSignal {
 		&self.loop_signal
 	}
 
 	/// Returns the latest recursive continuation ledger projection.
-	#[must_use]
 	pub const fn continuations(&self) -> &ContinuationLedger {
 		&self.continuations
 	}
@@ -692,7 +686,6 @@ impl<C: TurnClient> Agent<C> {
 	}
 
 	/// Returns the shared non-blocking telemetry fan-out handle.
-	#[must_use]
 	pub fn firehose(&self) -> Arc<Firehose> {
 		Arc::clone(&self.firehose)
 	}

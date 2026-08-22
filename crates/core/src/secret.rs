@@ -64,7 +64,6 @@ pub struct SecretBox<T: Zeroize + ?Sized> {
 
 impl<T: Zeroize + ?Sized> SecretBox<T> {
 	/// Wraps owned boxed secret material.
-	#[must_use]
 	pub const fn new(secret: Box<T>) -> Self {
 		Self { inner: secret }
 	}
@@ -108,7 +107,6 @@ pub struct Secret {
 
 impl Secret {
 	/// Wraps owned secret bytes.
-	#[must_use]
 	pub const fn new(bytes: Vec<u8>) -> Self {
 		Self { bytes }
 	}
@@ -119,13 +117,11 @@ impl Secret {
 	}
 
 	/// Returns the secret length without exposing its contents.
-	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.bytes.len()
 	}
 
 	/// Returns whether this secret is empty without exposing its contents.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.bytes.is_empty()
 	}

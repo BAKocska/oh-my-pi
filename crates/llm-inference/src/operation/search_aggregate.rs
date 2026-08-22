@@ -34,7 +34,6 @@ pub struct ConsensusResult {
 /// Merges completed engine pages, normalizing tracking noise and retaining the
 /// best representative. Sorting prefers agreement, then reciprocal-rank score,
 /// then normalized URL for deterministic ties.
-#[must_use]
 pub fn aggregate_public_web(pages: &[EngineResults], limit: usize) -> Vec<ConsensusResult> {
 	let mut by_url: HashMap<String, ConsensusResult> = HashMap::new();
 	for page in pages {

@@ -4,7 +4,6 @@ use std::fmt::Write as _;
 
 /// Renders a JSON Schema as compact TypeScript-like definitions and the
 /// terminal yield envelope required by the agent protocol.
-#[must_use]
 pub fn render(schema: &serde_json::Value) -> String {
 	let mut output = String::new();
 	if let Some(definitions) = schema.get("$defs").and_then(serde_json::Value::as_object) {

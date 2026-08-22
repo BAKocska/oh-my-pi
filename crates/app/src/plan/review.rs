@@ -19,13 +19,11 @@ pub struct PlanApprovalDetails {
 
 impl PlanApprovalDetails {
 	/// Captures approval details from a resolved artifact.
-	#[must_use]
 	pub fn resolved(artifact: &PlanArtifact) -> Self {
 		Self { artifact: artifact.url.clone(), title: artifact.title.clone(), exists: true }
 	}
 
 	/// Projects this proposal into the existing durable native approval route.
-	#[must_use]
 	pub fn approval_spec(&self) -> ApprovalSpec {
 		ApprovalSpec {
 			title:         sf!("Approve plan: {}", self.title),

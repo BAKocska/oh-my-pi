@@ -74,7 +74,6 @@ impl DocServerTask {
 	}
 
 	/// Returns the owner-local document endpoint.
-	#[must_use]
 	pub fn socket(&self) -> &Path {
 		&self.socket
 	}

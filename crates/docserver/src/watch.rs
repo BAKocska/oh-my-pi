@@ -65,6 +65,7 @@ impl Binding {
 /// callback on notify's event thread. It does not create an intermediate event
 /// queue. Dropping or explicitly unwatching the handle deactivates its
 /// callback.
+#[must_use]
 pub struct ActiveFileWatch {
 	callback: SharedCallback,
 	binding:  Option<Binding>,
@@ -85,7 +86,6 @@ impl ActiveFileWatch {
 	}
 
 	/// Returns the exact canonical-parent path currently being filtered.
-	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self
 			.binding
@@ -95,7 +95,6 @@ impl ActiveFileWatch {
 	}
 
 	/// Returns the generation attached to events from the current binding.
-	#[must_use]
 	pub const fn generation(&self) -> u64 {
 		self
 			.binding
@@ -238,7 +237,6 @@ fn watch_path_missing(error: &notify::Error) -> bool {
 /// This function is pure and deliberately conservative: unknown or malformed
 /// events concerning the watched path require a rescan, while unrelated paths
 /// and access-only activity produce no document event.
-#[must_use]
 pub fn classify_event(target: &Path, event: &Event) -> Option<FileWatchKind> {
 	if event.need_rescan() {
 		return Some(FileWatchKind::RescanRequired);

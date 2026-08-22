@@ -20,7 +20,6 @@ const WIDTH: u16 = 30;
 const MIN_VIEWPORT: Size = Size::new(96, 20);
 
 /// Sums all visible right rail widths instead of privileging one sidebar.
-#[must_use]
 pub fn reserved_rails(viewport: Size, widths: impl IntoIterator<Item = u16>) -> RailWidths {
 	widths
 		.into_iter()

@@ -33,20 +33,17 @@ pub struct HttpRequest {
 
 impl HttpRequest {
 	/// Creates a GET request with the web reader's default size limit.
-	#[must_use]
 	pub fn new(url: impl IntoStr) -> Self {
 		Self { url: url.into_str(), headers: SmallVec::new(), max_bytes: MAX_BYTES }
 	}
 
 	/// Adds a request header.
-	#[must_use]
 	pub fn with_header(mut self, name: impl IntoStr, value: impl IntoStr) -> Self {
 		self.headers.push((name.into_str(), value.into_str()));
 		self
 	}
 
 	/// Overrides the maximum response-body size.
-	#[must_use]
 	pub const fn with_max_bytes(mut self, max_bytes: usize) -> Self {
 		self.max_bytes = max_bytes;
 		self
@@ -70,13 +67,11 @@ pub struct HttpResponse {
 
 impl HttpResponse {
 	/// Returns whether the status is in the successful 2xx range.
-	#[must_use]
 	pub const fn is_success(&self) -> bool {
 		self.status >= 200 && self.status < 300
 	}
 
 	/// Looks up a response header using ASCII case-insensitive matching.
-	#[must_use]
 	pub fn header(&self, name: &str) -> Option<&str> {
 		self
 			.headers
@@ -85,7 +80,6 @@ impl HttpResponse {
 	}
 
 	/// Decodes the body as UTF-8, replacing malformed sequences.
-	#[must_use]
 	pub fn text(&self) -> Str {
 		let units = xutf::transcode::<Utf8, Utf8>(&self.body);
 		String::from_units(units).into()
@@ -107,7 +101,6 @@ pub struct RenderResult {
 
 impl RenderResult {
 	/// Builds a markdown result and applies the shared cleanup and size cap.
-	#[must_use]
 	pub fn markdown(content: &str, method: impl IntoStr) -> Self {
 		let (content, truncated) = finalize_output(content);
 		let mut notes = SmallVec::new();
@@ -166,7 +159,6 @@ impl WebError {
 	}
 
 	/// Returns the stable model-facing error message.
-	#[must_use]
 	pub fn message(&self) -> Str {
 		self.to_string().into()
 	}
@@ -234,7 +226,6 @@ pub trait HttpClient {
 }
 
 /// Cleans repeated blank lines and caps rendered output.
-#[must_use]
 pub fn finalize_output(content: &str) -> (Str, bool) {
 	let mut cleaned = String::with_capacity(content.len());
 	let mut newline_run = 0_u8;
@@ -267,7 +258,6 @@ pub fn finalize_output(content: &str) -> (Str, bool) {
 }
 
 /// Returns whether a response is a recognizable bot-block page worth retrying.
-#[must_use]
 pub fn is_bot_blocked(status: u16, content: &str) -> bool {
 	if status != 403 && status != 503 {
 		return false;

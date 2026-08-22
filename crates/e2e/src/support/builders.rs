@@ -6,7 +6,6 @@ use omp_proto::{inference::v1 as inference, thread::v1 as thread};
 use omp_tool::{TOOL_REV_PROP, ToolIdentity};
 
 /// Builds one canonical text message item with no authority sequence stamp.
-#[must_use]
 pub fn message_item(role: thread::Role, text: impl Into<String>) -> thread::Item {
 	thread::Item {
 		kind: Some(thread::item::Kind::Message(thread::Message {
@@ -18,19 +17,16 @@ pub fn message_item(role: thread::Role, text: impl Into<String>) -> thread::Item
 }
 
 /// Builds one canonical user text item.
-#[must_use]
 pub fn user_item(text: impl Into<String>) -> thread::Item {
 	message_item(thread::Role::User, text)
 }
 
 /// Builds one canonical assistant text item.
-#[must_use]
 pub fn assistant_item(text: impl Into<String>) -> thread::Item {
 	message_item(thread::Role::Assistant, text)
 }
 
 /// Builds a canonical revision-stamped tool-call item.
-#[must_use]
 pub fn tool_call_item(
 	created_at_ms: u64,
 	call_id: impl Into<String>,
@@ -73,19 +69,16 @@ pub fn tool_result_item(
 }
 
 /// Builds the first successful event in an admitted turn.
-#[must_use]
 pub const fn accepted_event(replay: bool) -> inference::TurnEvent {
 	turn_event(inference::turn_event::Event::Accepted(inference::Accepted { replay }))
 }
 
 /// Builds one terminal canonical turn outcome event.
-#[must_use]
 pub const fn outcome_event(outcome: inference::Outcome) -> inference::TurnEvent {
 	turn_event(inference::turn_event::Event::Outcome(outcome))
 }
 
 /// Wraps a generated inference event body.
-#[must_use]
 pub const fn turn_event(event: inference::turn_event::Event) -> inference::TurnEvent {
 	inference::TurnEvent { event: Some(event) }
 }

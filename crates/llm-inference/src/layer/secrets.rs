@@ -100,7 +100,6 @@ pub struct SecretStreamRestorer {
 
 impl SecretStreamRestorer {
 	/// Creates an empty restorer.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { buffer: PlaceholderStream::new() }
 	}

@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 pub const DOCUMENT_CACHE_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Opens the user-wide conversion cache beneath the application data root.
-#[must_use]
 pub fn user_document_cache(data_dir: &Path) -> DocumentCache {
 	DocumentCache::open(data_dir.join("cache").join("documents"))
 }
@@ -28,7 +27,6 @@ pub fn user_document_cache(data_dir: &Path) -> DocumentCache {
 /// Production project state is `<data>/projects/<project-key>`; isolated
 /// callers that provide another layout retain that directory as their cache
 /// scope rather than guessing an unrelated parent.
-#[must_use]
 pub fn project_document_cache(state_dir: &Path) -> DocumentCache {
 	let data_dir = state_dir
 		.parent()
@@ -48,13 +46,11 @@ pub struct DocumentCacheCollector {
 
 impl DocumentCacheCollector {
 	/// Creates a collector with the 256 MiB/default-age policy.
-	#[must_use]
 	pub fn new(cache: DocumentCache) -> Self {
 		Self { cache, policy: DocumentCachePolicy::default(), interval: DOCUMENT_CACHE_GC_INTERVAL }
 	}
 
 	/// Replaces collection policy, primarily for bounded operational tests.
-	#[must_use]
 	pub const fn with_policy(mut self, policy: DocumentCachePolicy) -> Self {
 		self.policy = policy;
 		self
@@ -74,7 +70,6 @@ impl DocumentCacheCollector {
 	/// reachability projection; blob-backed cache entries in it are never
 	/// evicted. Collection errors are logged and retried at the next interval
 	/// because the cache is an optimization, never request authority.
-	#[must_use]
 	pub fn spawn(
 		self,
 		shutdown: CancellationToken,

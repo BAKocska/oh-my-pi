@@ -29,7 +29,6 @@ pub fn current() -> &'static str {
 ///
 /// Replacement requires a known local identity; a daemon with an unknown
 /// (empty) identity predates build identification and counts as stale.
-#[must_use]
 pub fn is_stale(ours: &str, theirs: &str) -> bool {
 	!ours.is_empty() && ours != theirs
 }

@@ -128,7 +128,6 @@ impl OwnershipMap {
 	}
 
 	/// Returns whether `module` is listed in `owner`'s wheel RECORD.
-	#[must_use]
 	pub(crate) fn owns(&self, module: &str, owner: &str) -> bool {
 		let needle = Ownership { module: Str::from(module), owner: Str::from(owner) };
 		self.entries.binary_search(&needle).is_ok()
@@ -344,7 +343,6 @@ fn canonical_files(files: Vec<pb::SiteFile>) -> Result<BTreeMap<Str, pb::SiteFil
 }
 
 /// Returns every importable module path represented by a site manifest.
-#[must_use]
 pub fn record_modules(files: &[pb::SiteFile]) -> Vec<Str> {
 	files
 		.iter()

@@ -50,7 +50,6 @@ impl Default for OverlayStack {
 
 impl OverlayStack {
 	/// Creates an empty stack at generation zero.
-	#[must_use]
 	pub fn empty() -> Self {
 		Self { overlays: Arc::from([]), sources: Arc::from([]), generation: 0 }
 	}
@@ -59,7 +58,6 @@ impl OverlayStack {
 	/// precedence. Repeated source identities are collapsed to their final
 	/// supplied layer; use [`Self::with_replaced`] to advance a published
 	/// generation.
-	#[must_use]
 	pub fn from_layers(layers: impl IntoIterator<Item = (OverlaySource, CatalogOverlay)>) -> Self {
 		let mut sources = Vec::new();
 		let mut overlays = Vec::new();
@@ -76,26 +74,22 @@ impl OverlayStack {
 	}
 
 	/// Returns the monotonically increasing publication generation.
-	#[must_use]
 	pub const fn generation(&self) -> u64 {
 		self.generation
 	}
 
 	/// Returns overlays in increasing precedence order.
-	#[must_use]
 	pub fn overlays(&self) -> &[CatalogOverlay] {
 		&self.overlays
 	}
 
 	/// Returns source identities in the same order as [`Self::overlays`].
-	#[must_use]
 	pub fn sources(&self) -> &[OverlaySource] {
 		&self.sources
 	}
 
 	/// Publishes `overlay` for `source`, replacing that source's prior layer and
 	/// advancing the generation exactly once.
-	#[must_use]
 	pub fn with_replaced(&self, source: OverlaySource, overlay: CatalogOverlay) -> Self {
 		let mut sources = self.sources.to_vec();
 		let mut overlays = self.overlays.to_vec();
@@ -131,13 +125,11 @@ impl Default for OverlayStore {
 
 impl OverlayStore {
 	/// Creates a store with one published immutable stack.
-	#[must_use]
 	pub fn new(initial: OverlayStack) -> Self {
 		Self { current: ArcSwap::from_pointee(initial) }
 	}
 
 	/// Loads one stable generation without locking.
-	#[must_use]
 	pub fn load(&self) -> Arc<OverlayStack> {
 		self.current.load_full()
 	}
@@ -174,41 +166,35 @@ pub struct CatalogOverlayBuilder {
 impl CatalogOverlayBuilder {
 	/// Starts an overlay with one auditable source applied to every changed
 	/// field during resolution.
-	#[must_use]
 	pub const fn new(source: ProvenanceSource) -> Self {
 		Self { source, models: Vec::new(), routes: Vec::new(), aliases: Vec::new() }
 	}
 
 	/// Adds one model addition or field-granular patch.
-	#[must_use]
 	pub fn with_model(mut self, overlay: ModelOverlay) -> Self {
 		self.models.push(overlay);
 		self
 	}
 
 	/// Adds one route addition or field-granular patch.
-	#[must_use]
 	pub fn with_route(mut self, overlay: RouteOverlay) -> Self {
 		self.routes.push(overlay);
 		self
 	}
 
 	/// Adds one provider-scoped exact alias.
-	#[must_use]
 	pub fn with_alias(mut self, alias: ScopedAlias) -> Self {
 		self.aliases.push(alias);
 		self
 	}
 
 	/// Adds provider-scoped aliases in their declared order.
-	#[must_use]
 	pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = ScopedAlias>) -> Self {
 		self.aliases.extend(aliases);
 		self
 	}
 
 	/// Freezes the accumulated layer for publication in an [`OverlayStack`].
-	#[must_use]
 	pub fn build(self) -> CatalogOverlay {
 		CatalogOverlay {
 			source:  self.source,
@@ -232,25 +218,21 @@ struct ProviderDeclarationIdentity {
 
 impl ProviderDeclarationId {
 	/// Creates a stable identity for one admitted extension declaration.
-	#[must_use]
 	pub fn new(publisher: Str, extension_id: Str, declaration_id: Str) -> Self {
 		Self(Arc::new(ProviderDeclarationIdentity { publisher, extension_id, declaration_id }))
 	}
 
 	/// Returns the publisher identity from the admitted extension manifest.
-	#[must_use]
 	pub fn publisher(&self) -> &Str {
 		&self.0.publisher
 	}
 
 	/// Returns the extension identifier under [`Self::publisher`].
-	#[must_use]
 	pub fn extension_id(&self) -> &Str {
 		&self.0.extension_id
 	}
 
 	/// Returns the declaration identifier within the extension.
-	#[must_use]
 	pub fn declaration_id(&self) -> &Str {
 		&self.0.declaration_id
 	}
@@ -380,7 +362,6 @@ pub struct ProviderDeclarations {
 impl ProviderDeclarations {
 	/// Captures declarations in deterministic admission order for provenance
 	/// only; it is never used as a conflict tie-break.
-	#[must_use]
 	pub fn new(declarations: impl IntoIterator<Item = ProviderDeclaration>) -> Self {
 		Self { declarations: declarations.into_iter().collect::<Vec<_>>().into() }
 	}

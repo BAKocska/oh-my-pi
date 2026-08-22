@@ -211,7 +211,6 @@ impl Storage {
 	}
 
 	/// Returns the projection and artifact layout.
-	#[must_use]
 	pub const fn paths(&self) -> &StoragePaths {
 		&self.paths
 	}

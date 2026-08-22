@@ -42,7 +42,6 @@ pub struct CaptureGrant {
 
 impl CaptureGrant {
 	/// Returns the effective capture level after explicit grant checks.
-	#[must_use]
 	pub fn effective(self) -> Capture {
 		if self.capture == Capture::Content && !self.capture_content {
 			Capture::Structure
@@ -166,7 +165,6 @@ pub struct PromptFingerprint {
 
 impl PromptFingerprint {
 	/// Computes a fingerprint and its diff from the preceding assembled prompt.
-	#[must_use]
 	pub fn compute(
 		previous: Option<&Self>,
 		previous_bytes: &[u8],
@@ -465,7 +463,6 @@ pub enum Event {
 
 impl Event {
 	/// Returns this event's subscription kind.
-	#[must_use]
 	pub const fn kind(&self) -> Kind {
 		match self {
 			Self::SessionStart(_) => Kind::SessionStart,
@@ -491,7 +488,6 @@ impl Event {
 	/// This deliberately runs outside [`Firehose::publish`]: the hot path shares
 	/// one `Arc<Event>`, while CONTROL delivery receives a field-classed copy.
 	/// `None` means the subscription's effective capture level is disabled.
-	#[must_use]
 	pub fn materialize_for(&self, grant: CaptureGrant) -> Option<Self> {
 		let level = grant.effective();
 		if level == Capture::None {
@@ -581,7 +577,6 @@ impl Default for Inner {
 
 impl Firehose {
 	/// Creates an empty firehose.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -665,6 +660,7 @@ impl Firehose {
 }
 
 /// Receiving side of one bounded telemetry subscription.
+#[must_use]
 pub struct SubscriptionHandle {
 	inner:    Weak<Inner>,
 	id:       u64,
@@ -679,7 +675,6 @@ impl SubscriptionHandle {
 	}
 
 	/// Snapshots loss accounting for this subscription.
-	#[must_use]
 	pub fn drop_stats(&self) -> DropStats {
 		self.counters.snapshot()
 	}

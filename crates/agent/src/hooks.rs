@@ -50,7 +50,6 @@ pub struct When {
 
 impl When {
 	/// Returns whether this filter accepts the supplied target and name.
-	#[must_use]
 	pub fn matches(&self, target: &str, name: &str) -> bool {
 		(self.names.is_empty() || self.names.iter().any(|value| value.as_str() == name))
 			&& (self.targets.is_empty() || self.targets.iter().any(|value| value.as_str() == target))
@@ -107,7 +106,6 @@ pub struct GateEvent {
 
 impl GateEvent {
 	/// Creates an unmodified gate event from canonical requested facts.
-	#[must_use]
 	pub fn new(target: Str, args: Bytes) -> Self {
 		Self {
 			requested_target:    target.clone(),
@@ -374,7 +372,6 @@ pub struct HookGate {
 
 impl HookGate {
 	/// Creates a gate and the bounded lossy observer-dispatch receiver.
-	#[must_use]
 	pub fn channel() -> (Self, flume::Receiver<HookDispatch>) {
 		let (dispatch, receive) = flume::bounded(OBSERVE_HANDLER_CAP);
 		(
@@ -422,7 +419,6 @@ impl HookGate {
 
 	/// Returns whether an event has any subscribed or fail-closed stub bit.
 	#[inline]
-	#[must_use]
 	pub fn subscribed(&self, event: HookEventId) -> bool {
 		self.mask[0].load(Ordering::Relaxed) & event_bit(event) != 0
 	}
@@ -450,7 +446,6 @@ impl HookGate {
 
 	/// Returns the number of observer frames dropped due to bounded
 	/// backpressure.
-	#[must_use]
 	pub fn dropped_notifies(&self) -> u64 {
 		self.dropped_notifies.load(Ordering::Relaxed)
 	}

@@ -377,7 +377,6 @@ pub use recovery_kind::RecoveryKind;
 
 impl RecoveryKind {
 	/// Returns the stable snake-case recovery code derived by `strum`.
-	#[must_use]
 	pub const fn as_str(&self) -> &'static str {
 		self.into_str()
 	}

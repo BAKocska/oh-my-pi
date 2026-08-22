@@ -48,6 +48,7 @@ impl std::fmt::Display for EnvironmentScope {
 
 /// A guard that pushes a scope onto a shell environment and pops it when
 /// dropped.
+#[must_use]
 pub(crate) struct ScopeGuard<'a, SE: extensions::ShellExtensions> {
 	scope_type: EnvironmentScope,
 	shell:      &'a mut crate::Shell<SE>,

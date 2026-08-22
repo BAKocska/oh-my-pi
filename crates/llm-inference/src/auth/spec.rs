@@ -473,7 +473,6 @@ pub struct HeaderPlacement {
 
 impl HeaderPlacement {
 	/// Standard `Authorization: Bearer …` placement.
-	#[must_use]
 	pub fn bearer() -> Self {
 		Self { name: sf!("authorization"), prefix: sf!("Bearer ") }
 	}

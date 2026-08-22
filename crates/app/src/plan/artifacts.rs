@@ -78,13 +78,11 @@ pub struct PlanArtifactStore {
 impl PlanArtifactStore {
 	/// Creates an authority rooted at the session's already-authorized local
 	/// artifact directory.
-	#[must_use]
 	pub fn new(root: PathBuf) -> Self {
 		Self { root }
 	}
 
 	/// Returns the local artifact root.
-	#[must_use]
 	pub fn root(&self) -> &Path {
 		&self.root
 	}

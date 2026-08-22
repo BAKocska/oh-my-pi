@@ -65,7 +65,6 @@ pub struct ChildSnapshotOptions<'a> {
 }
 
 /// Clones a parent runtime snapshot while applying only child attenuation.
-#[must_use]
 pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>) -> AgentSnapshot {
 	let mut child = parent.clone();
 	child.workspace.cwd = options.cwd.to_path_buf();
@@ -114,7 +113,6 @@ pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>)
 
 /// Resolves caller → model suffix → frontmatter → pattern and clamps every
 /// source to both configured and advertised ceilings.
-#[must_use]
 pub fn resolve_effort(
 	caller: Option<SpawnEffort>,
 	model: Option<&str>,

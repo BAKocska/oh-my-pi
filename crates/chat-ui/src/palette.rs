@@ -50,14 +50,12 @@ impl PaletteEntry {
 	}
 
 	/// Adds a right-aligned shortcut hint.
-	#[must_use]
 	pub fn key(mut self, key: impl IntoStr) -> Self {
 		self.key = key.into_str();
 		self
 	}
 
 	/// Uses the accent color, appropriate for slash-command insertion rows.
-	#[must_use]
 	pub const fn accent(mut self, accent: bool) -> Self {
 		self.accent = accent;
 		self

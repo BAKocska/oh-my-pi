@@ -4,7 +4,6 @@ use omp_core::{Str, StrMut};
 use serde_json::Value;
 
 /// Stable SymbolKind label.
-#[must_use]
 pub fn symbol_kind(kind: u64) -> &'static str {
 	const LABELS: [&str; 27] = [
 		"unknown",
@@ -39,7 +38,6 @@ pub fn symbol_kind(kind: u64) -> &'static str {
 }
 
 /// Bounded structural JSON projection with symbol labels and location lines.
-#[must_use]
 pub fn structured(value: &Value, limit: usize) -> Str {
 	let values = value
 		.as_array()

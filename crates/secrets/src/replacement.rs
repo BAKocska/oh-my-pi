@@ -21,7 +21,6 @@ pub struct RegexMatchContext<'a> {
 }
 
 /// Generates pi's deterministic, byte-length-preserving `ZZ` replacement.
-#[must_use]
 pub fn generate_deterministic_replacement(secret: &str) -> String {
 	let length = secret.encode_utf16().count();
 	if length == 0 {
@@ -45,7 +44,6 @@ pub fn generate_deterministic_replacement(secret: &str) -> String {
 
 /// Computes Bun-compatible Wyhash used by deterministic secret-safe
 /// fingerprints.
-#[must_use]
 pub fn bun_wyhash(input: &[u8]) -> u64 {
 	const SECRET: [u64; 4] =
 		[0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db, 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3];
@@ -108,7 +106,6 @@ fn read8(input: &[u8], offset: usize) -> u64 {
 }
 
 /// Perturbs the sentinel when a whole replacement would equal its secret.
-#[must_use]
 pub fn ensure_distinct_replacement(mut replacement: String, secret: &str) -> String {
 	if !replacement.is_empty() && replacement == secret {
 		let alternate = if replacement.as_bytes()[0] == REPLACEMENT_CHARS[0] {
@@ -123,7 +120,6 @@ pub fn ensure_distinct_replacement(mut replacement: String, secret: &str) -> Str
 
 /// Tests whether a candidate is re-matched over its substituted span in full
 /// context.
-#[must_use]
 pub fn regex_rematches_in_context(
 	candidate: &str,
 	regex: &Regex,
@@ -154,7 +150,6 @@ pub fn regex_rematches_in_context(
 
 /// Performs pi's bounded fixed-point search for a same-length non-matching
 /// marker.
-#[must_use]
 pub fn find_non_matching_replacement(
 	value: &str,
 	regex: &Regex,
@@ -202,7 +197,6 @@ pub fn find_non_matching_replacement(
 }
 
 /// Builds a deterministic key-derived replacement run for a pathological regex.
-#[must_use]
 pub fn build_keyed_replacement_run(key: &str, length: usize) -> String {
 	let mut output = String::with_capacity(length);
 	let mut block = 0_u64;
@@ -241,7 +235,6 @@ fn decimal_bytes(mut value: u64) -> ([u8; 20], usize) {
 
 /// Chooses a stable default replacement, using the keyed pathological fallback
 /// when required.
-#[must_use]
 pub fn regex_replacement(
 	value: &str,
 	regex: &Regex,
@@ -267,7 +260,6 @@ pub fn regex_replacement(
 
 /// Reports whether a default regex replacement cannot safely distinguish a 1–2
 /// byte match.
-#[must_use]
 pub fn regex_has_unresolvable_short_match_fallback(regex: &Regex) -> bool {
 	[1_usize, 2].into_iter().any(|length| {
 		let probe = "\0".repeat(length);

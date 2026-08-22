@@ -49,7 +49,6 @@ pub struct XaiOauthUsageFetcher {
 }
 impl XaiOauthUsageFetcher {
 	/// Constructs an xAI OAuth usage fetcher.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}

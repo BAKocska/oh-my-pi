@@ -27,7 +27,6 @@ pub struct PrewalkGate {
 
 impl PrewalkGate {
 	/// Resolves settings overrides ahead of definition frontmatter.
-	#[must_use]
 	pub fn resolve(definition: &AgentDefinition, settings: &TaskSettings) -> Self {
 		let prewalk = setting_override(&settings.agent_prewalk, definition.name.as_str())
 			.or_else(|| auxiliary_selector(definition.prewalk.as_ref()));
@@ -46,7 +45,6 @@ impl PrewalkGate {
 	}
 
 	/// Whether the prewalk pass is pending and `todo` may remain enabled.
-	#[must_use]
 	pub const fn armed(&self) -> bool {
 		self.armed
 	}
@@ -57,7 +55,6 @@ impl PrewalkGate {
 	}
 
 	/// Returns the durable features copied into revival metadata.
-	#[must_use]
 	pub const fn features(&self) -> &RevivalAgentFeatures {
 		&self.features
 	}

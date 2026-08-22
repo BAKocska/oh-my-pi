@@ -71,19 +71,16 @@ impl ContextPatchCommit {
 	}
 
 	/// Returns the immutable snapshot revision observed by the callback.
-	#[must_use]
 	pub const fn base_snapshot_rev(&self) -> u64 {
 		self.base_snapshot_rev
 	}
 
 	/// Returns the journaled derived-IR revision.
-	#[must_use]
 	pub const fn derived_ir_revision(&self) -> u32 {
 		self.derived_ir_revision
 	}
 
 	/// Returns stable-id projection operations.
-	#[must_use]
 	pub fn patches(&self) -> &[PatchOp] {
 		&self.patches
 	}
@@ -167,25 +164,21 @@ impl RequestTuning {
 	}
 
 	/// Returns the sampling-temperature override.
-	#[must_use]
 	pub const fn temperature(&self) -> Option<f32> {
 		self.temperature
 	}
 
 	/// Returns the generated-token ceiling.
-	#[must_use]
 	pub const fn max_tokens(&self) -> Option<u32> {
 		self.max_tokens
 	}
 
 	/// Returns ordered stop strings.
-	#[must_use]
 	pub fn stop_sequences(&self) -> &[Str] {
 		&self.stop_sequences
 	}
 
 	/// Returns sanitized public headers.
-	#[must_use]
 	pub fn public_headers(&self) -> &[(Str, Str)] {
 		&self.public_headers
 	}
@@ -236,7 +229,6 @@ pub struct SdkCredentialSource {
 
 impl SdkCredentialSource {
 	/// Creates a process-local credential source for one session.
-	#[must_use]
 	pub const fn new(session_id: Str, callback: CredentialCallback) -> Self {
 		Self { session_id, callback }
 	}
@@ -360,7 +352,6 @@ pub struct CallbackSet {
 
 impl CallbackSet {
 	/// Returns the handle-owned typed event fan-out.
-	#[must_use]
 	pub const fn events_bus(&self) -> &EventBus {
 		&self.events_bus
 	}

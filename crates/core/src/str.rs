@@ -1717,7 +1717,6 @@ impl StrMut {
 	}
 
 	/// Builds a [`Str`] from `self`.
-	#[must_use]
 	#[inline]
 	pub fn freeze(self) -> Str {
 		Str(match self.0 {

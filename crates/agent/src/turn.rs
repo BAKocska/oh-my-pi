@@ -150,7 +150,6 @@ impl Error {
 	}
 
 	/// Returns the loop-owned recovery timing for this typed failure.
-	#[must_use]
 	pub fn recovery(&self) -> Option<Recovery> {
 		match self {
 			Self::Conflict(_) | Self::NeedFull(_) => None,

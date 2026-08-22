@@ -156,7 +156,6 @@ pub enum DiskState {
 
 impl DiskState {
 	/// Returns the fingerprint when the file is present.
-	#[must_use]
 	pub const fn fingerprint(&self) -> Option<&FileFingerprint> {
 		match self {
 			Self::Present { fingerprint, .. } => Some(fingerprint),
@@ -165,7 +164,6 @@ impl DiskState {
 	}
 
 	/// Returns the exact bytes when the file is present.
-	#[must_use]
 	pub const fn content(&self) -> Option<&Bytes> {
 		match self {
 			Self::Present { content, .. } => Some(content),
@@ -192,7 +190,6 @@ pub struct TerminalRowCapture {
 
 impl TerminalRowCapture {
 	/// Creates a capture with fixed row and per-row scalar bounds.
-	#[must_use]
 	pub fn new(max_rows: usize, max_columns: usize) -> Self {
 		Self {
 			rows:        VecDeque::with_capacity(max_rows.min(4096)),
@@ -226,7 +223,6 @@ impl TerminalRowCapture {
 }
 
 /// Removes ANSI escapes and terminal control characters from one bounded row.
-#[must_use]
 pub fn sanitize_terminal_row(row: &str, max_columns: usize) -> Str {
 	let stripped = row.to_owned().into_ansi_stripped();
 	let mut clean = String::with_capacity(stripped.len().min(max_columns));
@@ -278,7 +274,6 @@ impl EditorBufferSync {
 	}
 
 	/// Returns the exact bytes currently authoritative for the editor buffer.
-	#[must_use]
 	pub const fn observed(&self) -> &DiskState {
 		&self.observed
 	}
@@ -364,6 +359,7 @@ impl fmt::Debug for LocalFs {
 }
 
 /// A fully written same-directory temporary awaiting an actor-owned commit.
+#[must_use]
 pub struct PreparedWrite {
 	owner:            Arc<LocalFsInner>,
 	parent:           Dir,
@@ -508,7 +504,6 @@ impl LocalFs {
 	}
 
 	/// Returns the canonical ambient identity of the capability root.
-	#[must_use]
 	pub fn root_path(&self) -> &Path {
 		&self.inner.root_path
 	}

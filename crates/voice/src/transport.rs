@@ -66,7 +66,6 @@ pub struct LiveTransportOptions {
 
 impl LiveTransportOptions {
 	/// Creates options with the pi-parity data-channel timeout.
-	#[must_use]
 	pub fn new(
 		session_id: Str,
 		instructions: Str,
@@ -387,7 +386,6 @@ fn session_headers(options: &LiveTransportOptions, attestation: Option<&str>) ->
 }
 
 /// Extracts a validated server-assigned `rtc_*` call ID from Location.
-#[must_use]
 pub fn parse_live_call_id(location: &str) -> Option<&str> {
 	location
 		.split_once('?')

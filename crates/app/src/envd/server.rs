@@ -335,7 +335,6 @@ pub(crate) struct ExtensionDataBinding {
 impl ExtensionDataBinding {
 	/// Derives the deterministic owner-local socket path and the exact
 	/// built-in read/walk/search grant set for `key`.
-	#[must_use]
 	pub(crate) fn built_in(
 		state_dir: &Path,
 		key: HostKey,
@@ -491,7 +490,7 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 }
 
 /// Sole-owner lease for Agent CONTROL routes installed in one environment.
-#[must_use = "dropping the binding releases Agent CONTROL routing"]
+#[must_use]
 pub(crate) struct AgentControlBinding {
 	server: Arc<EnvServer>,
 	id:     u64,
@@ -837,7 +836,6 @@ fn worker_info(route: &WorkerRoute) -> pb::WorkerInfo {
 }
 
 impl EnvServer {
-	#[must_use]
 	fn new(
 		identity: ServerIdentity,
 		documents: DocumentHost,
@@ -1288,7 +1286,6 @@ impl EnvServer {
 	}
 
 	/// Returns the exact registry shared by this server's dispatch paths.
-	#[must_use]
 	pub fn registry(&self) -> Arc<Registry> {
 		Arc::clone(&self.registry)
 	}
@@ -1351,7 +1348,6 @@ impl EnvServer {
 
 	/// Returns the single authoritative sessions index shared with the Agent
 	/// Journal.
-	#[must_use]
 	pub(crate) fn sessions_index(&self) -> Arc<SessionIndex> {
 		Arc::clone(&self.sessions_index)
 	}

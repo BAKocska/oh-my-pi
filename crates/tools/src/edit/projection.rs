@@ -38,7 +38,6 @@ impl ProjectionMatcher {
 	/// `matcher` must exclude the incomplete trailing entry. Consequently, new
 	/// raw argument fragments which do not complete another entry retain the
 	/// same digest and entry count.
-	#[must_use]
 	pub fn new<I, P>(dialect: ProjectionDialect, matcher: &[u8], paths: I, entries: usize) -> Self
 	where
 		I: IntoIterator<Item = P>,
@@ -60,7 +59,6 @@ impl ProjectionMatcher {
 	/// The parent digest prevents a cache shared by concurrent invocations from
 	/// seeding a later projection from an unrelated matcher with the same path
 	/// and entry count.
-	#[must_use]
 	pub fn fragment<I, P>(previous: &Self, matcher: &[u8], paths: I, entries: usize) -> Self
 	where
 		I: IntoIterator<Item = P>,
@@ -76,31 +74,26 @@ impl ProjectionMatcher {
 	}
 
 	/// Edit grammar represented by this matcher.
-	#[must_use]
 	pub const fn dialect(&self) -> ProjectionDialect {
 		self.dialect
 	}
 
 	/// Digest of the complete matcher prefix.
-	#[must_use]
 	pub const fn digest(&self) -> Hash32 {
 		self.digest
 	}
 
 	/// Digest of the immediately preceding complete matcher, when known.
-	#[must_use]
 	pub const fn parent_digest(&self) -> Option<Hash32> {
 		self.parent
 	}
 
 	/// Canonical paths discovered in authored order.
-	#[must_use]
 	pub fn paths(&self) -> &[Str] {
 		&self.paths
 	}
 
 	/// Number of complete parsed entries represented by the digest.
-	#[must_use]
 	pub const fn entries(&self) -> usize {
 		self.entries
 	}
@@ -124,7 +117,6 @@ pub struct ProjectionRevision {
 
 impl ProjectionRevision {
 	/// Creates a source revision identity.
-	#[must_use]
 	pub fn new(path: impl Into<Str>, revision: impl Into<Str>) -> Self {
 		Self { path: path.into(), revision: revision.into() }
 	}
@@ -174,13 +166,11 @@ impl Default for ProjectionCache {
 
 impl ProjectionCache {
 	/// Creates a cache with the default bounded capacities.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Creates a cache with explicit capacities, clamped to the built-in bounds.
-	#[must_use]
 	pub fn with_limits(source_revisions: usize, projection_windows: usize) -> Self {
 		let source_limit = source_revisions.clamp(1, DEFAULT_SOURCE_REVISIONS);
 		let projection_limit = projection_windows.clamp(1, DEFAULT_PROJECTION_WINDOWS);
@@ -193,7 +183,6 @@ impl ProjectionCache {
 	}
 
 	/// Returns exact cached bytes for `revision`.
-	#[must_use]
 	pub fn source(&self, revision: &ProjectionRevision) -> Option<&Bytes> {
 		self
 			.sources
@@ -203,7 +192,6 @@ impl ProjectionCache {
 	}
 
 	/// Returns a zero-copy range of exact cached bytes for `revision`.
-	#[must_use]
 	pub fn source_chunk(&self, revision: &ProjectionRevision, range: Range<usize>) -> Option<Bytes> {
 		let bytes = self.source(revision)?;
 		(range.start <= range.end && range.end <= bytes.len()).then(|| bytes.slice(range))
@@ -245,7 +233,6 @@ impl ProjectionCache {
 	/// [`ProjectionLookup::Cached`]; a changed matcher with the same entry count
 	/// returns [`ProjectionLookup::Pending`]. Neither case lets a partial
 	/// trailing operation reach the diff.
-	#[must_use]
 	pub fn lookup(
 		&self,
 		matcher: &ProjectionMatcher,
@@ -284,7 +271,6 @@ impl ProjectionCache {
 	///
 	/// Returns `false` without retaining the window when any named source
 	/// revision is absent.
-	#[must_use]
 	pub fn insert_projection(
 		&mut self,
 		matcher: ProjectionMatcher,
@@ -345,7 +331,6 @@ pub struct SectionView<'a> {
 }
 
 /// Renders one section's exact model-facing success/diagnostic text.
-#[must_use]
 pub fn render_section(view: SectionView<'_>) -> Str {
 	match view.op {
 		SectionOp::Delete => return sf!("Deleted {}", view.path),
@@ -384,7 +369,6 @@ pub fn render_section(view: SectionView<'_>) -> Str {
 }
 
 /// Joins independently rendered section responses with pi's single blank row.
-#[must_use]
 pub fn render_sections(sections: &[Str]) -> Str {
 	let capacity =
 		sections.iter().map(Str::len).sum::<usize>() + sections.len().saturating_sub(1) * 2;
@@ -400,7 +384,6 @@ pub fn render_sections(sections: &[Str]) -> Str {
 
 /// Formats one syntax-aware block resolution using authored locator
 /// coordinates.
-#[must_use]
 pub fn format_block_resolution(resolution: &ResolvedBlock) -> Str {
 	let label = match resolution.operation.as_str() {
 		"replace" => format!("PUT {}*:", resolution.anchor_line),

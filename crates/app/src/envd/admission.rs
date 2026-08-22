@@ -96,7 +96,6 @@ pub enum ApprovalTier {
 
 impl ApprovalTier {
 	/// Resolves the highest approval tier present in `effects`.
-	#[must_use]
 	pub fn from_effects(effects: &Effects) -> Self {
 		if effects.subagents != 0
 			|| effects
@@ -156,7 +155,6 @@ pub struct ResolvedApproval {
 ///
 /// Per-tool overrides remain authoritative in every mode. Without one, modes
 /// approve tiers up to `read`, `write`, and `exec`, respectively.
-#[must_use]
 pub fn resolve_approval(
 	invocation_id: impl Into<Str>,
 	tool_name: impl Into<Str>,

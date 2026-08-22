@@ -18,7 +18,6 @@ use crate::transcript::{
 /// This is the forward renderer used when no native-item residue has yet been
 /// captured. The same [`Dialect::default_item`] implementation is called by
 /// [`capture`] and [`rebuild`].
-#[must_use]
 pub fn emit<D: Dialect + ?Sized>(blocks: &[Block], dialect: &D, rev: Rev) -> Vec<Value> {
 	blocks
 		.iter()
@@ -34,7 +33,6 @@ pub fn emit<D: Dialect + ?Sized>(blocks: &[Block], dialect: &D, rev: Rev) -> Vec
 /// records `~ord` only when wire order and neutral block order differ. The
 /// returned vector is parallel to `blocks`; grouped followers are represented
 /// by `None` because their leading capsule owns the native item.
-#[must_use]
 pub fn capture<D: Dialect + ?Sized>(
 	blocks: &[Block],
 	items: &[Value],
@@ -108,7 +106,6 @@ pub fn capture<D: Dialect + ?Sized>(
 /// `"j"` joins them without a separator. Blocks without a capsule for `dialect`
 /// yield nothing, and every reserved marker is consumed before the item reaches
 /// wire output.
-#[must_use]
 pub fn rebuild<D: Dialect + ?Sized>(blocks: &[Block], dialect: &D, rev: Rev) -> Vec<Value> {
 	let dialect_id = dialect.id();
 	let dialect_name = dialect_id.0.as_str();
@@ -177,7 +174,6 @@ pub fn rebuild<D: Dialect + ?Sized>(blocks: &[Block], dialect: &D, rev: Rev) -> 
 /// blocks are dropped because they have no neutral projection; consequently
 /// signatures and encrypted/model-bound content can never cross the provider
 /// boundary.
-#[must_use]
 pub fn rebuild_cross(blocks: &[Block]) -> Vec<Value> {
 	let dialect = Oai;
 	blocks

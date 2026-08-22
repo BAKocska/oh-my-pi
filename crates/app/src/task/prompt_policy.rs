@@ -27,7 +27,6 @@ pub struct TaskPromptPolicyInput {
 ///
 /// This function performs no model or supervisor I/O. Callers must supply one
 /// already-resolved model identifier and one immutable supervisor snapshot.
-#[must_use]
 pub fn freeze(model_id: &str, input: TaskPromptPolicyInput) -> DelegationPromptInput {
 	DelegationPromptInput {
 		enabled:         input.enabled,
@@ -46,7 +45,6 @@ pub fn freeze(model_id: &str, input: TaskPromptPolicyInput) -> DelegationPromptI
 /// Provider qualification, thinking selectors, and route suffixes do not
 /// change the underlying model version. GPT-5.60 and other versions do not
 /// match the 5.6 policy.
-#[must_use]
 pub fn uses_codex_task_prompt(model_id: &str) -> bool {
 	let bare = model_id.rsplit('/').next().unwrap_or(model_id);
 	let bare = bare.split([':', '@']).next().unwrap_or(bare);

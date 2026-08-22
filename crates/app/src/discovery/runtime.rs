@@ -28,7 +28,6 @@ pub struct DiscoveryRuntime {
 
 impl DiscoveryRuntime {
 	/// Creates a coordinator with explicit disabled-provider precedence.
-	#[must_use]
 	pub fn new(
 		cache: Arc<DiscoveryStore>,
 		overlays: Arc<OverlayStore>,
@@ -45,7 +44,6 @@ impl DiscoveryRuntime {
 	/// Reports picker/call eligibility. Explicit disable is the only discovery
 	/// state that erases a configured declaration; missing or failed discovery
 	/// remains selectable.
-	#[must_use]
 	pub fn provider_selectable(&self, provider: &omp_llm_catalog::ProviderId<str>) -> bool {
 		!self.disabled.contains(provider)
 	}

@@ -586,6 +586,7 @@ mod foreground {
 		CoreResult, DesktopError, KeyName, Modifiers, MouseButton, PointerEvent, background, capture,
 	};
 
+	#[must_use]
 	struct ForegroundGuard {
 		previous: windows_sys::Win32::Foundation::HWND,
 		target:   windows_sys::Win32::Foundation::HWND,

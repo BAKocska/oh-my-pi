@@ -54,7 +54,6 @@ impl RedirectPolicy {
 	}
 
 	/// Current request URL.
-	#[must_use]
 	pub fn url(&self) -> &Url {
 		&self.current
 	}
@@ -136,7 +135,6 @@ impl Origin {
 }
 
 /// Returns the redirect location as UTF-8 when present.
-#[must_use]
 pub fn redirect_location(headers: &HeaderMap) -> Option<&str> {
 	headers.get(LOCATION).and_then(|value| value.to_str().ok())
 }

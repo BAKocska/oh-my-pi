@@ -48,7 +48,6 @@ pub struct ProviderErrorLayer<H = NoHookHandle> {
 
 impl ProviderErrorLayer<NoHookHandle> {
 	/// Creates a layer with no provider-error subscription.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { hook: None }
 	}
@@ -56,7 +55,6 @@ impl ProviderErrorLayer<NoHookHandle> {
 
 impl ProviderErrorLayer<NoHookHandle> {
 	/// Attaches a concrete dispatcher to this route stack.
-	#[must_use]
 	pub const fn with_hook<T: HookHandle>(self, hook: T) -> ProviderErrorLayer<T> {
 		ProviderErrorLayer { hook: Some(hook) }
 	}

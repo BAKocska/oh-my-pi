@@ -28,7 +28,6 @@ pub struct SessionIdentity {
 
 impl SessionIdentity {
 	/// Creates a durable identity over one authoritative journal.
-	#[must_use]
 	pub fn new(id: impl Into<Str>, journal_path: impl Into<PathBuf>) -> Self {
 		Self {
 			id:                id.into(),
@@ -65,7 +64,6 @@ pub enum SessionRevivalError {
 
 impl SessionRevivalError {
 	/// Wraps a typed application composition error.
-	#[must_use]
 	pub fn composition(source: impl std::error::Error + Send + Sync + 'static) -> Self {
 		Self::Composition { source: Box::new(source) }
 	}
@@ -103,7 +101,6 @@ pub struct SessionLifecycleSubscription {
 
 impl SessionLifecycleSubscription {
 	/// Returns the latest lifecycle state.
-	#[must_use]
 	pub fn current(&self) -> SessionLifecycle {
 		*self.rx.borrow()
 	}
@@ -167,7 +164,6 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
 	/// Takes ownership of one fully composed native agent loop.
-	#[must_use]
 	pub fn from_agent<C>(agent: Agent<C>) -> Self
 	where
 		C: TurnClient + Send + 'static,
@@ -179,7 +175,6 @@ impl SessionRuntime {
 
 	/// Registers one synchronous authority-release action run when this runtime
 	/// is disposed, replaced during revival, or dropped after actor shutdown.
-	#[must_use]
 	pub fn on_dispose(mut self, callback: impl FnOnce() + Send + 'static) -> Self {
 		self.dispose.push(Box::new(callback));
 		self
@@ -265,13 +260,11 @@ impl SessionHandle {
 	}
 
 	/// Returns the stable journal identity.
-	#[must_use]
 	pub fn identity(&self) -> &SessionIdentity {
 		&self.inner.identity
 	}
 
 	/// Returns typed construction, fallback, LSP, and launch diagnostics.
-	#[must_use]
 	pub fn diagnostics(&self) -> &SessionDiagnostics {
 		&self.inner.diagnostics
 	}
@@ -289,20 +282,17 @@ impl SessionHandle {
 	}
 
 	/// Adds a bounded lossy typed-event subscription suitable for host UI.
-	#[must_use]
 	pub fn subscribe(&self, capacity: usize) -> omp_agent::LossyEventSubscription {
 		self.inner.callbacks.events_bus().subscribe_ui(capacity)
 	}
 
 	/// Adds an ordered lossless typed-event subscription suitable for an SDK
 	/// host.
-	#[must_use]
 	pub fn subscribe_lossless(&self) -> EventSubscription {
 		self.inner.callbacks.events_bus().subscribe_lossless()
 	}
 
 	/// Subscribes to in-memory lifecycle transitions.
-	#[must_use]
 	pub fn lifecycle(&self) -> SessionLifecycleSubscription {
 		SessionLifecycleSubscription { rx: self.inner.lifecycle.subscribe() }
 	}

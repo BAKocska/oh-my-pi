@@ -47,7 +47,6 @@ pub enum Severity {
 impl Severity {
 	/// Converts the LSP numeric severity, treating absent and unknown values as
 	/// errors.
-	#[must_use]
 	pub const fn from_lsp(value: Option<u64>) -> Self {
 		match value {
 			Some(2) => Self::Warning,
@@ -157,7 +156,6 @@ fn code_string(value: serde_json::Value) -> Option<Str> {
 
 /// Removes diagnostics from orphan TypeScript files when their code requires a
 /// project.
-#[must_use]
 pub fn filter_orphan_typescript(diagnostics: &mut Vec<Diagnostic>, has_project_root: bool) {
 	if has_project_root {
 		return;
@@ -179,7 +177,6 @@ pub fn filter_orphan_typescript(diagnostics: &mut Vec<Diagnostic>, has_project_r
 
 /// Deduplicates cross-source findings by range and message, preserving all
 /// source names.
-#[must_use]
 pub fn normalize(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 	let mut positions = HashMap::<(Str, Range, Str), usize>::new();
 	let mut output = Vec::<Diagnostic>::with_capacity(diagnostics.len());

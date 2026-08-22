@@ -103,7 +103,6 @@ pub struct ContentLengthDecoder {
 
 impl ContentLengthDecoder {
 	/// Creates an empty decoder.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -171,7 +170,6 @@ impl ContentLengthDecoder {
 	}
 
 	/// Returns buffered bytes that do not yet form a complete frame.
-	#[must_use]
 	pub fn remainder(&self) -> &[u8] {
 		&self.buffer
 	}
@@ -184,7 +182,6 @@ impl ContentLengthDecoder {
 	}
 
 	/// Returns the lifetime number of non-fatal resynchronizations.
-	#[must_use]
 	pub const fn resync_count(&self) -> u64 {
 		self.resync_count
 	}
@@ -291,7 +288,6 @@ pub struct RpcFrameDecoder {
 
 impl RpcFrameDecoder {
 	/// Creates an empty logical frame decoder.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -402,7 +398,6 @@ fn json_usize(object: &Map<String, Value>, key: &'static str) -> Result<usize, F
 /// `streamed_message_ids` are removed before sizing. If shrinking cannot fit
 /// the frame, a small structured overflow frame matching the original kind is
 /// returned.
-#[must_use]
 pub fn encode_json_v1<S: BuildHasher>(
 	value: &Value,
 	streamed_message_ids: &HashSet<String, S>,

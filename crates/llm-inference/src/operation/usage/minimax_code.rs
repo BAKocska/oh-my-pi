@@ -38,13 +38,11 @@ pub struct MiniMaxCodeUsageFetcher {
 }
 impl MiniMaxCodeUsageFetcher {
 	/// Constructs the international `MiniMax` fetcher.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self::with_provider(http, PROVIDER, BASE)
 	}
 
 	/// Constructs the mainland-China `MiniMax` fetcher.
-	#[must_use]
 	pub fn china(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self::with_provider(http, PROVIDER_CN, BASE_CN)
 	}

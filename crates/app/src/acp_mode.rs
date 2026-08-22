@@ -2916,7 +2916,6 @@ pub enum RemoteOperation {
 impl RemoteOperation {
 	/// Wraps a shell line for a spec-conformant ACP client which spawns
 	/// `command` plus `args` directly.
-	#[must_use]
 	pub fn shell(
 		command: Str,
 		cwd: Option<Str>,
@@ -2937,7 +2936,6 @@ impl RemoteOperation {
 	}
 
 	/// Encodes this operation as a JSON-RPC request for the ACP client.
-	#[must_use]
 	pub fn request(&self, id: Value, session_id: &str) -> Value {
 		let (method, arguments) = match self {
 			Self::ReadText { path, line, limit } => (

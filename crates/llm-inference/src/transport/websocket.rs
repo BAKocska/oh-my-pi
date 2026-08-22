@@ -107,13 +107,11 @@ impl Default for WebSocketDecoder {
 
 impl WebSocketDecoder {
 	/// Creates a server-frame decoder with the default 16 MiB message bound.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::with_config(DEFAULT_MAX_FRAME_BYTES, WebSocketMasking::Unmasked)
 	}
 
 	/// Creates a decoder with explicit message size and masking policy.
-	#[must_use]
 	pub fn with_config(max_message_bytes: usize, masking: WebSocketMasking) -> Self {
 		Self {
 			wire: BytesMut::new(),
@@ -164,13 +162,11 @@ impl WebSocketDecoder {
 	}
 
 	/// Returns raw and fragmented payload bytes currently retained.
-	#[must_use]
 	pub fn buffered_len(&self) -> usize {
 		self.wire.len().saturating_add(self.message.len())
 	}
 
 	/// Returns whether a close message was received.
-	#[must_use]
 	pub const fn is_closed(&self) -> bool {
 		self.closed
 	}

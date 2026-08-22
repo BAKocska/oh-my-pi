@@ -10,7 +10,6 @@ static PLACEHOLDER_KEY: LazyLock<String> = LazyLock::new(resolve_key);
 ///
 /// Persistence failure never blocks a headless session, but the warning makes
 /// the loss of cross-restart restoration explicit and actionable.
-#[must_use]
 pub fn placeholder_key() -> &'static str {
 	PLACEHOLDER_KEY.as_str()
 }

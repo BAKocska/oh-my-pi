@@ -14,7 +14,6 @@ pub struct DomainSubscription<D> {
 
 impl<D: SettingsDomain> DomainSubscription<D> {
 	/// Subscribes to `D` without introducing settings reads in the runtime loop.
-	#[must_use]
 	pub fn new(manager: &SettingsManager) -> Self {
 		Self { inner: manager.subscribe::<D>(), _marker: std::marker::PhantomData }
 	}

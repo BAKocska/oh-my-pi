@@ -177,7 +177,6 @@ pub struct EncodedRequest {
 }
 impl EncodedRequest {
 	/// Constructs an ordinary credential-free encoded request.
-	#[must_use]
 	pub const fn new(
 		operation: OperationKind,
 		method: RequestMethod,
@@ -217,7 +216,6 @@ impl EncodeAttempt {
 	const TEMPLATE_EFFORT_REJECTED: u64 = 1 << 33;
 
 	/// Returns the identity with the zero-based attempt index set to `index`.
-	#[must_use]
 	pub const fn with_index(self, index: u32) -> Self {
 		Self(self.0 & !(u32::MAX as u64) | index as u64)
 	}
@@ -233,7 +231,6 @@ impl EncodeAttempt {
 	}
 
 	/// Returns the identity with the transactional-hold flag set to `value`.
-	#[must_use]
 	pub const fn with_provisional(self, value: bool) -> Self {
 		Self(if value {
 			self.0 | Self::PROVISIONAL
@@ -251,7 +248,6 @@ impl EncodeAttempt {
 
 	/// Returns the identity with the template-effort-rejection flag set to
 	/// `value`.
-	#[must_use]
 	pub const fn with_template_effort_rejected(self, value: bool) -> Self {
 		Self(if value {
 			self.0 | Self::TEMPLATE_EFFORT_REJECTED

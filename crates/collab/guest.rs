@@ -22,7 +22,6 @@ use thiserror::Error;
 ///
 /// Every command outside this closed set is host-owned and must be refused
 /// before command dispatch.
-#[must_use]
 pub fn guest_command_allowed(command: &str) -> bool {
 	let name = command
 		.trim()
@@ -177,13 +176,11 @@ impl GuestStateMirror {
 	}
 
 	/// Returns the latest host state.
-	#[must_use]
 	pub const fn state(&self) -> Option<&SessionStateUpdate> {
 		self.state.as_ref()
 	}
 
 	/// Returns the effective reasoning effort reported by the host.
-	#[must_use]
 	pub fn reasoning_effort(&self) -> Option<&str> {
 		self.state.as_ref()?.thinking_level.as_deref()
 	}
@@ -270,7 +267,6 @@ impl GuestUiRequests {
 	}
 
 	/// Returns whether a request is still presented.
-	#[must_use]
 	pub fn contains(&self, request_id: u32) -> bool {
 		self.pending.contains_key(&request_id)
 	}
@@ -362,7 +358,6 @@ impl GuestReplica {
 	}
 
 	/// Returns the durable replica.
-	#[must_use]
 	pub const fn replica(&self) -> &Replica {
 		&self.replica
 	}

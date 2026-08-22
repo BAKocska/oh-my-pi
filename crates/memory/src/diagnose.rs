@@ -42,7 +42,6 @@ pub fn inspect(store: &BankStore) -> Result<BankDiagnostic> {
 }
 
 /// Whether every authoritative and derived index check is healthy.
-#[must_use]
 pub fn healthy(report: &BankDiagnostic) -> bool {
 	report.integrity.integrity.as_str() == "ok"
 		&& report.integrity.vector_current
@@ -50,7 +49,6 @@ pub fn healthy(report: &BankDiagnostic) -> bool {
 }
 
 /// Returns generation health without opening raw database paths to callers.
-#[must_use]
 pub const fn generations(report: &BankDiagnostic) -> IndexGeneration {
 	report.integrity.generations
 }

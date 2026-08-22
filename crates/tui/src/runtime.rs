@@ -428,7 +428,6 @@ pub struct AppEnv {
 
 /// Returns whether a chord is reserved by core terminal, clipboard, or input
 /// handling and therefore unavailable to extension shortcut declarations.
-#[must_use]
 pub const fn is_core_chord(chord: Chord) -> bool {
 	matches!(
 		chord.key,

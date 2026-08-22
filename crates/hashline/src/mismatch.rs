@@ -50,20 +50,17 @@ pub struct MismatchError {
 
 impl MismatchError {
 	/// Builds the exact model-facing pi rejection message.
-	#[must_use]
 	pub fn new(details: MismatchDetails) -> Self {
 		let message = format_mismatch(&details);
 		Self { details, message: message.into() }
 	}
 
 	/// Returns all structured mismatch facts.
-	#[must_use]
 	pub const fn details(&self) -> &MismatchDetails {
 		&self.details
 	}
 
 	/// Returns the exact model-facing rejection text.
-	#[must_use]
 	pub fn display_message(&self) -> &str {
 		&self.message
 	}
@@ -78,7 +75,6 @@ impl fmt::Display for MismatchError {
 impl std::error::Error for MismatchError {}
 
 /// Formats numbered current-file context around stale anchors.
-#[must_use]
 pub fn format_anchored_context(anchor_lines: &[usize], file_lines: &[Str]) -> Vec<Str> {
 	let mut display_lines = Vec::new();
 	for &line in anchor_lines {

@@ -245,19 +245,16 @@ impl Default for FoldState {
 
 impl ViewState {
 	/// Creates an empty fold state, not yet bound to an identity.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Borrows the exact identity bound by the first fold or view.
-	#[must_use]
 	pub fn identity(&self) -> Option<&ToolIdentity> {
 		self.identity.as_deref()
 	}
 
 	/// Returns the number of raw updates retained for a generic fallback.
-	#[must_use]
 	pub const fn raw_update_count(&self) -> usize {
 		match &self.fold {
 			FoldState::Updates(updates) => updates.len(),
@@ -402,7 +399,6 @@ pub struct RenderEntry<'a> {
 
 impl RenderEntry<'_> {
 	/// Borrows the exact registered identity.
-	#[must_use]
 	pub fn identity(&self) -> &ToolIdentity {
 		self.identity
 	}
@@ -468,7 +464,6 @@ pub struct RenderRegistry {
 
 impl RenderRegistry {
 	/// Creates an empty renderer registry.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -490,7 +485,6 @@ impl RenderRegistry {
 	}
 
 	/// Borrows the renderer cached for this exact identity.
-	#[must_use]
 	pub fn get(&self, identity: &ToolIdentity) -> Option<RenderEntry<'_>> {
 		let (stored, render) = self.entries.get_key_value(identity)?;
 		Some(RenderEntry { identity: stored, render: render.as_ref() })

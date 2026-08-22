@@ -111,7 +111,6 @@ pub struct ProductionConnector {
 impl ProductionConnector {
 	/// Creates a connector whose relative stdio paths belong to this
 	/// Environment.
-	#[must_use]
 	pub fn new(workspace_root: PathBuf) -> Self {
 		Self { workspace_root, http: Arc::new(WreqExchange::new()) }
 	}
@@ -279,7 +278,6 @@ pub struct McpManager {
 impl McpManager {
 	/// Creates an Environment-scoped supervisor. Call [`Self::start`] to mount a
 	/// complete resolved declaration set.
-	#[must_use]
 	pub fn new(
 		service: Arc<McpService>,
 		connector: Arc<dyn McpConnector>,
@@ -492,14 +490,12 @@ impl McpManager {
 	}
 
 	/// Returns deterministic server inventory from the shared Environment owner.
-	#[must_use]
 	pub fn servers(&self) -> pb::McpStatusResult {
 		self.service.status(None)
 	}
 
 	/// Returns the immutable current MCP definition catalog for CONTROL and dyn
 	/// registry epoch consumers.
-	#[must_use]
 	pub fn catalog_snapshot(&self) -> omp_tool::LeafCatalogSnapshot<super::McpLeaf> {
 		self.service.leaf_snapshot()
 	}

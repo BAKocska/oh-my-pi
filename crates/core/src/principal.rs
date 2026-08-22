@@ -50,7 +50,6 @@ const _: () =
 
 impl RemotePrincipal {
 	/// Creates a principal from host-authenticated relay and credential facts.
-	#[must_use]
 	pub fn new(
 		peer_id: u32,
 		display_name: Str,
@@ -68,37 +67,31 @@ impl RemotePrincipal {
 	}
 
 	/// Returns the relay-assigned peer identifier.
-	#[must_use]
 	pub fn peer_id(&self) -> u32 {
 		self.0.peer_id
 	}
 
 	/// Returns the sanitized, human-readable peer name.
-	#[must_use]
 	pub fn display_name(&self) -> &str {
 		self.0.display_name.as_str()
 	}
 
 	/// Returns the host-verified collaboration credential tier.
-	#[must_use]
 	pub fn credential_tier(&self) -> CredentialTier {
 		self.0.credential_tier
 	}
 
 	/// Returns the stable room identifier.
-	#[must_use]
 	pub fn room_id(&self) -> &str {
 		self.0.room_id.as_str()
 	}
 
 	/// Returns the accepted write-token digest used for audit linkage.
-	#[must_use]
 	pub fn token_digest(&self) -> Option<Hash32> {
 		self.0.token_digest
 	}
 
 	/// Returns whether this peer may submit host mutations.
-	#[must_use]
 	pub fn may_mutate(&self) -> bool {
 		matches!(self.0.credential_tier, CredentialTier::FullAccess)
 	}
@@ -133,19 +126,16 @@ pub struct Principal {
 impl Principal {
 	/// Creates an authenticated principal from its stable identifier and safe
 	/// human-readable display name.
-	#[must_use]
 	pub const fn new(id: Str, display: Str) -> Self {
 		Self { id, display }
 	}
 
 	/// Returns the stable principal identifier.
-	#[must_use]
 	pub fn id(&self) -> &str {
 		self.id.as_str()
 	}
 
 	/// Returns the human-readable principal name intended for UI surfaces.
-	#[must_use]
 	pub fn display(&self) -> &str {
 		self.display.as_str()
 	}
@@ -167,19 +157,16 @@ pub struct ArtifactDigest([u8; 32]);
 
 impl ArtifactDigest {
 	/// Creates an artifact digest from its raw BLAKE3-256 bytes.
-	#[must_use]
 	pub const fn new(bytes: [u8; 32]) -> Self {
 		Self(bytes)
 	}
 
 	/// Returns the raw BLAKE3-256 digest bytes.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; 32] {
 		&self.0
 	}
 
 	/// Consumes the digest and returns its raw bytes.
-	#[must_use]
 	pub const fn into_bytes(self) -> [u8; 32] {
 		self.0
 	}
@@ -276,7 +263,6 @@ const _: () = assert!(std::mem::size_of::<Provenance>() <= 16, "Provenance must 
 
 impl Provenance {
 	/// Creates provenance from core-authenticated extension installation facts.
-	#[must_use]
 	pub fn new(
 		publisher: Str,
 		extension_id: Str,
@@ -298,43 +284,36 @@ impl Provenance {
 	}
 
 	/// Returns the publisher key fingerprint.
-	#[must_use]
 	pub fn publisher(&self) -> &str {
 		self.0.publisher.as_str()
 	}
 
 	/// Returns the dotted extension identifier.
-	#[must_use]
 	pub fn extension_id(&self) -> &str {
 		self.0.extension_id.as_str()
 	}
 
 	/// Returns the exact extension version.
-	#[must_use]
 	pub fn version(&self) -> &str {
 		self.0.version.as_str()
 	}
 
 	/// Returns the exact extension artifact digest.
-	#[must_use]
 	pub fn artifact_digest(&self) -> ArtifactDigest {
 		self.0.artifact_digest
 	}
 
 	/// Returns the installation layer.
-	#[must_use]
 	pub fn layer(&self) -> &str {
 		self.0.layer.as_str()
 	}
 
 	/// Returns the conferred trust tier.
-	#[must_use]
 	pub fn tier(&self) -> &str {
 		self.0.tier.as_str()
 	}
 
 	/// Returns the host incarnation generation.
-	#[must_use]
 	pub fn generation(&self) -> u64 {
 		self.0.generation
 	}

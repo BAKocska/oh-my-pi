@@ -263,7 +263,6 @@ pub enum GitLabDelegatingCodec {
 impl GitLabDelegatingCodec {
 	/// Constructs the selected shared codec from typed route data, never
 	/// provider names.
-	#[must_use]
 	pub fn from_route(route: &GitLabDirectRoute) -> Self {
 		match route.delegation {
 			GitLabDelegationTarget::OpenAiChat => Self::OpenAiChat(OpenAiChatCodec::default()),
@@ -381,7 +380,6 @@ pub struct GitLabWorkflowCodec;
 
 impl GitLabWorkflowCodec {
 	/// Constructs the workflow codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}

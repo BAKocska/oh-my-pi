@@ -280,6 +280,7 @@ fn create_dir(
 
 /// Restores the process umask when directory creation finishes or unwinds.
 #[cfg(unix)]
+#[must_use]
 struct UmaskGuard(rustix::fs::Mode);
 
 #[cfg(unix)]

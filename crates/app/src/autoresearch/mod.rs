@@ -49,7 +49,6 @@ pub fn decode_custom(custom: &Custom) -> Result<Option<JournalFact>, serde_json:
 }
 
 /// Returns the strict JSON Schema for one autoresearch tool.
-#[must_use]
 pub fn tool_schema(name: &str) -> Option<serde_json::Value> {
 	match name {
 		"init_experiment" => Some(serde_json::json!({
@@ -101,7 +100,6 @@ pub fn tool_schema(name: &str) -> Option<serde_json::Value> {
 }
 
 /// Phase-one setup prompt installed when mode starts before initialization.
-#[must_use]
 pub fn setup_prompt(goal: Option<&str>) -> Str {
 	Str::from(format!(
 		"Autoresearch setup phase. Objective: {}. Inspect existing measurements and build \
@@ -113,7 +111,6 @@ pub fn setup_prompt(goal: Option<&str>) -> Str {
 }
 
 /// Iteration prompt containing every durable control input.
-#[must_use]
 pub fn experiment_prompt(
 	session: &SessionConfig,
 	baseline: Option<f64>,

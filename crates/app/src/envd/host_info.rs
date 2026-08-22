@@ -28,7 +28,6 @@ pub(crate) struct HostInfoHost {
 impl HostInfoHost {
 	/// Creates a host-info authority whose null-inclusive GPU cache is stored in
 	/// Environment state rather than the project tree.
-	#[must_use]
 	pub(crate) fn new(state_dir: &Path) -> Self {
 		Self { gpu_cache_path: state_dir.join("host-info.json"), gpus: OnceCell::new() }
 	}

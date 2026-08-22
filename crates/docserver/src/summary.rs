@@ -100,7 +100,6 @@ pub enum SummarySegment {
 
 impl SummarySegment {
 	/// Returns the first original source line in this segment.
-	#[must_use]
 	pub const fn start_line(&self) -> u32 {
 		match self {
 			Self::Kept { start_line, .. } | Self::Elided { start_line, .. } => *start_line,
@@ -108,7 +107,6 @@ impl SummarySegment {
 	}
 
 	/// Returns the last original source line in this segment.
-	#[must_use]
 	pub const fn end_line(&self) -> u32 {
 		match self {
 			Self::Kept { end_line, .. } | Self::Elided { end_line, .. } => *end_line,
@@ -261,7 +259,6 @@ pub struct SummaryService {
 
 impl SummaryService {
 	/// Creates an empty 48-entry summary service.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}

@@ -32,7 +32,6 @@ struct State {
 
 impl TimeoutHandle {
 	/// Creates a watchdog. `None` disables timeout accounting.
-	#[must_use]
 	pub fn new(window: Option<Duration>) -> Self {
 		let window = window.map(normalize_window);
 		Self {
@@ -65,13 +64,11 @@ impl TimeoutHandle {
 	}
 
 	/// Returns the active cell generation for timeout-escalation guards.
-	#[must_use]
 	pub fn generation(&self) -> u64 {
 		self.inner.state.lock().generation
 	}
 
 	/// Reports whether `generation` still names the active or expired cell.
-	#[must_use]
 	pub fn is_current(&self, generation: u64) -> bool {
 		self.inner.state.lock().generation == generation
 	}
@@ -80,7 +77,6 @@ impl TimeoutHandle {
 	///
 	/// Pauses are reference-counted so concurrent bridge calls cannot resume the
 	/// cell while another host-assisted wait is still in flight.
-	#[must_use]
 	pub fn pause(&self) -> TimeoutPause {
 		let mut state = self.inner.state.lock();
 		let generation = state.generation;
@@ -181,6 +177,7 @@ impl TimeoutHandle {
 /// RAII pause token. Dropping the last outstanding token starts a fresh full
 /// timeout window.
 #[derive(Debug)]
+#[must_use]
 pub struct TimeoutPause {
 	timeout:    Option<TimeoutHandle>,
 	generation: u64,

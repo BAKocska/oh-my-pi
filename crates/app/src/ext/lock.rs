@@ -504,7 +504,6 @@ pub(crate) fn atomic_toml<T: Serialize>(path: &Path, value: &T) -> io::Result<()
 }
 
 /// Builds the source table used by reproducible lock entries.
-#[must_use]
 pub fn index_source(index: &str, distribution: &Str) -> toml::Value {
 	let mut source = toml::map::Map::new();
 	source.insert("index".to_owned(), toml::Value::String(index.to_owned()));

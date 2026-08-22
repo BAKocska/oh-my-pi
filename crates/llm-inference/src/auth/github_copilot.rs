@@ -44,20 +44,17 @@ const COPILOT_USER_URL: &str = "https://api.github.com/copilot_internal/user";
 const MAX_PROBE_DURATION: Duration = Duration::from_secs(10);
 
 /// Returns whether `host` is one of GitHub's public hosts.
-#[must_use]
 pub fn is_public_github_host(host: &str) -> bool {
 	let normalized = host.trim().to_ascii_lowercase();
 	PUBLIC_GITHUB_HOSTS.contains(&normalized.as_str())
 }
 
 /// Returns whether `base_url` is exactly the personal Copilot endpoint.
-#[must_use]
 pub fn is_personal_base_url(base_url: &str) -> bool {
 	base_url == PERSONAL_GITHUB_COPILOT_BASE_URL
 }
 
 /// Normalizes a domain or URL to its hostname.
-#[must_use]
 pub fn normalize_domain(input: &str) -> Option<Str> {
 	let trimmed = input.trim();
 	if trimmed.is_empty() {
@@ -76,7 +73,6 @@ pub fn normalize_domain(input: &str) -> Option<Str> {
 }
 
 /// Normalizes an enterprise GitHub domain, rejecting public GitHub hosts.
-#[must_use]
 pub fn normalize_enterprise_domain(input: &str) -> Option<Str> {
 	let trimmed = input.trim();
 	if trimmed.is_empty() {
@@ -92,7 +88,6 @@ pub fn normalize_enterprise_domain(input: &str) -> Option<Str> {
 }
 
 /// Normalizes a secure Copilot API endpoint and removes all trailing slashes.
-#[must_use]
 pub fn normalize_api_endpoint(input: &str) -> Option<Str> {
 	let trimmed = input.trim();
 	if !trimmed.starts_with("https://") {
@@ -106,7 +101,6 @@ pub fn normalize_api_endpoint(input: &str) -> Option<Str> {
 }
 
 /// Resolves the Copilot API base URL for an optional enterprise domain.
-#[must_use]
 pub fn copilot_base_url(enterprise_domain: Option<&str>) -> Str {
 	let Some(domain) = enterprise_domain.and_then(normalize_enterprise_domain) else {
 		return sf!(PERSONAL_GITHUB_COPILOT_BASE_URL);
@@ -188,7 +182,6 @@ fn parse_copilot_envelope(raw: &str) -> Option<ParsedCopilotApiKey> {
 
 /// Parses a JSON Copilot credential envelope or preserves a bare token
 /// verbatim.
-#[must_use]
 pub fn parse_copilot_api_key(raw: &str) -> ParsedCopilotApiKey {
 	parse_copilot_envelope(raw).unwrap_or_else(|| ParsedCopilotApiKey {
 		access_token:   SecretString::from(raw.to_owned()),
@@ -260,7 +253,6 @@ pub struct GithubCopilotShaper {
 
 impl GithubCopilotShaper {
 	/// Constructs a shaper using the supplied bounded OAuth HTTP transport.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self {
 			provider: ProviderId::from("github-copilot"),
@@ -270,7 +262,6 @@ impl GithubCopilotShaper {
 	}
 
 	/// Provider whose credentials this shaper rewrites.
-	#[must_use]
 	pub fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}

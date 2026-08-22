@@ -110,7 +110,6 @@ fn bounded_description(description: &str) -> Str {
 
 /// Merges complete file declarations over embedded templates. File order is
 /// caller precedence order; the first file with a canonical name wins.
-#[must_use]
 pub fn merge(
 	files: impl IntoIterator<Item = CommandPayload>,
 	embedded: impl IntoIterator<Item = EmbeddedCommand>,

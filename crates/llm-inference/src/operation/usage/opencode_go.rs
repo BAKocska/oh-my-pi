@@ -66,7 +66,6 @@ pub struct OpenCodeGoUsageFetcher {
 
 impl OpenCodeGoUsageFetcher {
 	/// Constructs a fetcher over the shared bounded HTTP client.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self::with_base_url(http, DEFAULT_BASE_URL)
 	}

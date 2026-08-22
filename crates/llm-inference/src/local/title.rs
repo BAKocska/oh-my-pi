@@ -19,7 +19,6 @@ static WORD: LazyLock<Regex> =
 
 /// True when a first message is only greeting, acknowledgement, punctuation,
 /// or bare numbers and should not be sent to a small title model.
-#[must_use]
 pub fn is_low_signal_title_input(message: &str) -> bool {
 	let cleaned = if is_preformatted_chat_context(message) {
 		strip_chat_scaffolding(message)
@@ -38,7 +37,6 @@ pub fn is_low_signal_title_input(message: &str) -> bool {
 
 /// Removes title envelopes/quotes/terminal punctuation, rejects sentinels and
 /// out-of-contract output, and reconciles casing against the source message.
-#[must_use]
 pub fn normalize_generated_title(value: Option<&str>, source_text: Option<&str>) -> Option<Str> {
 	let first = value?.trim().lines().next()?.trim();
 	let mut title = first.trim_matches(['"', '\'']).trim();

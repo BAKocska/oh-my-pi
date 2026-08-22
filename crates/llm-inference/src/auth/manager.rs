@@ -71,13 +71,11 @@ pub enum CredentialAffinityError {
 
 impl CredentialAffinityResolver {
 	/// Creates a resolver from credential-authority-owned random bytes.
-	#[must_use]
 	pub fn new(key: [u8; 32]) -> Self {
 		Self { key: Zeroizing::new(key) }
 	}
 
 	/// Computes opaque affinity for one inference-owned account record.
-	#[must_use]
 	pub fn digest(&self, account: &AccountRecord) -> CredentialAffinityDigest {
 		CredentialAffinityDigest::derive(
 			&self.key,
@@ -586,7 +584,6 @@ pub struct StoredOAuthRefreshEngine<C, K> {
 
 impl<C, K> StoredOAuthRefreshEngine<C, K> {
 	/// Constructs an OAuth refresh adapter over one shared coordinator.
-	#[must_use]
 	pub const fn new(
 		catalog: Arc<Catalog>,
 		store: Arc<CredentialStore>,
@@ -843,7 +840,6 @@ impl AuthManager {
 
 	/// Returns the shared catalog-aware credential source used by route
 	/// execution.
-	#[must_use]
 	pub const fn credential_broker(&self) -> &CredentialBroker {
 		&self.broker
 	}

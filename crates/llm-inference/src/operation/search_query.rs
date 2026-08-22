@@ -54,7 +54,6 @@ pub struct SearchQuery {
 
 impl SearchQuery {
 	/// Whether any result-filterable constraint is present.
-	#[must_use]
 	pub fn has_constraints(&self) -> bool {
 		!self.sites.is_empty()
 			|| !self.excluded_sites.is_empty()
@@ -70,7 +69,6 @@ impl SearchQuery {
 
 	/// Renders only the free-text terms, retaining phrases, exclusions and OR
 	/// groups.
-	#[must_use]
 	pub fn text(&self) -> Str {
 		Str::new(render_terms(&self.terms, QuerySyntax::GOOGLE))
 	}
@@ -141,7 +139,6 @@ enum AllMode {
 }
 
 /// Parses a raw query without dropping unknown or malformed syntax.
-#[must_use]
 pub fn parse_search_query(raw: &str) -> SearchQuery {
 	let mut query = SearchQuery { raw: Str::new(raw), ..SearchQuery::default() };
 	let tokens = tokenize(raw);
@@ -312,7 +309,6 @@ pub fn parse_search_query(raw: &str) -> SearchQuery {
 }
 
 /// Parses flexible date spellings into validated ISO `YYYY-MM-DD`.
-#[must_use]
 pub fn parse_date_value(value: &str) -> Option<Str> {
 	let value = value.trim();
 	let parts = value
@@ -360,7 +356,6 @@ pub fn parse_date_value(value: &str) -> Option<Str> {
 }
 
 /// Rebuilds a query using only syntax supported by an engine.
-#[must_use]
 pub fn format_query(query: &SearchQuery, syntax: QuerySyntax) -> Str {
 	let mut parts = Vec::new();
 	let text = render_terms(&query.terms, syntax);

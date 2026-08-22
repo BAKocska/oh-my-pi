@@ -56,7 +56,6 @@ pub struct RawStreamViewer {
 
 impl RawStreamViewer {
 	/// Opens a viewer on a bounded ring snapshot.
-	#[must_use]
 	pub fn open(frames: Vec<RawFrame>, summary: StreamSummary, ctx: &UiContext) -> Self {
 		let cursor = frames.len().saturating_sub(1);
 		let mut viewer = Self {

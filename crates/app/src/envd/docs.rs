@@ -163,6 +163,7 @@ type PendingDapEvents = HashMap<Bytes, Vec<DapRegistryEvent>>;
 /// Dropping the lease sends a best-effort close request, keeping lease release
 /// resource-owned even when an executor future is cancelled.
 #[derive(Debug)]
+#[must_use]
 pub struct DocumentLease {
 	lease_id: Bytes,
 	head:     pb::DocumentHead,
@@ -208,6 +209,7 @@ impl DocumentLease {
 }
 /// Connection-owned exclusive workspace reservation.
 #[derive(Debug)]
+#[must_use]
 pub struct WorkspaceLease {
 	lease_id: Bytes,
 	host:     Arc<Inner>,
@@ -1210,6 +1212,7 @@ impl Drop for Inner {
 	}
 }
 
+#[must_use]
 struct PendingRequest {
 	inner:      Arc<Inner>,
 	request_id: u64,

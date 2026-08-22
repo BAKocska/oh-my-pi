@@ -26,20 +26,17 @@ pub struct McpConfigStore {
 
 impl McpConfigStore {
 	/// Creates a store for one OMP-owned configuration path.
-	#[must_use]
 	pub fn new(path: PathBuf) -> Self {
 		Self { path, invalidate: None }
 	}
 
 	/// Adds discovery-cache invalidation after each committed replacement.
-	#[must_use]
 	pub fn with_invalidator(mut self, invalidate: Arc<dyn Fn(&Path) + Send + Sync>) -> Self {
 		self.invalidate = Some(invalidate);
 		self
 	}
 
 	/// Returns the owned file path.
-	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
@@ -327,6 +324,7 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 	Ok(())
 }
 
+#[must_use]
 struct DirectoryLock {
 	path: PathBuf,
 }

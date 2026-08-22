@@ -5,7 +5,6 @@ use serde_json::{Map, Value, json};
 use super::Action;
 
 /// Returns the standard JSON-RPC method for an action.
-#[must_use]
 pub const fn method(action: Action) -> Option<&'static str> {
 	match action {
 		Action::Definition => Some("textDocument/definition"),
@@ -22,7 +21,6 @@ pub const fn method(action: Action) -> Option<&'static str> {
 }
 
 /// Adds textDocument and position to raw object parameters only when absent.
-#[must_use]
 pub fn auto_parameters(
 	params: Option<Value>,
 	uri: Option<&str>,

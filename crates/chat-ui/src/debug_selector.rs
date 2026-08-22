@@ -23,7 +23,6 @@ pub struct DebugSelector {
 
 impl DebugSelector {
 	/// Opens the selector over the app-owned action catalog.
-	#[must_use]
 	pub fn open(actions: &[DebugActionRow], ctx: &UiContext) -> Self {
 		let rows = actions
 			.iter()
@@ -52,7 +51,6 @@ impl DebugSelector {
 	}
 
 	/// Returns the selected stable action key.
-	#[must_use]
 	pub fn key(&self, index: usize) -> Option<&Str> {
 		self.picker.key(index)
 	}

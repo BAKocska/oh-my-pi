@@ -51,37 +51,31 @@ pub struct LiveSet {
 
 impl LiveSet {
 	/// Creates an empty live set.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { bits: SparseSet::new(), order: Vec::new() }
 	}
 
 	/// Returns the number of live physical event indexes.
-	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.order.len()
 	}
 
 	/// Returns whether no physical event index is live.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.order.is_empty()
 	}
 
 	/// Returns whether a physical event index belongs to the live chain.
-	#[must_use]
 	pub fn contains(&self, index: u64) -> bool {
 		self.bits.contains(index)
 	}
 
 	/// Returns the reusable membership bitmap's capacity in bits.
-	#[must_use]
 	pub const fn capacity(&self) -> usize {
 		self.bits.capacity()
 	}
 
 	/// Returns the reusable ordered chain's element capacity.
-	#[must_use]
 	pub const fn chain_capacity(&self) -> usize {
 		self.order.capacity()
 	}
@@ -193,25 +187,21 @@ pub struct Log {
 
 impl Log {
 	/// Returns the line-zero identity header.
-	#[must_use]
 	pub const fn header(&self) -> &Header {
 		&self.header
 	}
 
 	/// Returns the number of physical event lines, including tombstones.
-	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.events.len()
 	}
 
 	/// Returns structured diagnostics in physical source order.
-	#[must_use]
 	pub fn diagnostics(&self) -> &[ReadDiagnostic] {
 		&self.diagnostics
 	}
 
 	/// Returns damage counters without rescanning journal bytes.
-	#[must_use]
 	pub fn counters(&self) -> ReadCounters {
 		let mut counters = ReadCounters::default();
 		for diagnostic in &self.diagnostics {
@@ -224,13 +214,11 @@ impl Log {
 	}
 
 	/// Returns whether the transcript contains no event lines.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.events.is_empty()
 	}
 
 	/// Returns the entry at a physical event index.
-	#[must_use]
 	pub fn get(&self, index: u64) -> Option<&Entry> {
 		usize::try_from(index)
 			.ok()
@@ -257,7 +245,6 @@ impl Log {
 	///
 	/// Callers making repeated projections should retain a [`LiveSet`] and use
 	/// [`Self::live_into`] instead.
-	#[must_use]
 	pub fn live(&self) -> Vec<u64> {
 		let mut live = LiveSet::new();
 		self.live_into(&mut live);
@@ -525,7 +512,6 @@ impl Reader {
 	/// Parses complete lines appended since the previous refresh.
 	/// Creates a fileless reader paired with
 	/// [`crate::transcript::Writer::create_lazy`].
-	#[must_use]
 	pub fn pending(path: &Path, header: Header) -> Self {
 		Self {
 			path:              path.to_owned(),
@@ -661,13 +647,11 @@ impl Reader {
 	}
 
 	/// Returns the decoded transcript prefix.
-	#[must_use]
 	pub const fn log(&self) -> &Log {
 		&self.log
 	}
 
 	/// Returns the live-chain projection for the decoded prefix.
-	#[must_use]
 	pub const fn live(&self) -> &LiveSet {
 		&self.live
 	}
@@ -684,7 +668,6 @@ impl Reader {
 	}
 
 	/// Returns damage counters for the decoded prefix and current tail.
-	#[must_use]
 	pub fn counters(&self) -> ReadCounters {
 		let mut counters = self.log.counters();
 		if self.tail_diagnostic.is_some() {
@@ -694,25 +677,21 @@ impl Reader {
 	}
 
 	/// Returns the physical index assigned to the next complete event.
-	#[must_use]
 	pub fn next_index(&self) -> u64 {
 		u64::try_from(self.log.len()).expect("event indexes fit in u64")
 	}
 
 	/// Returns the complete-line byte watermark.
-	#[must_use]
 	pub const fn append_offset(&self) -> u64 {
 		self.watermark
 	}
 
 	/// Returns whether bytes remain after the complete-line watermark.
-	#[must_use]
 	pub const fn has_torn_tail(&self) -> bool {
 		self.tail_bytes != 0
 	}
 
 	/// Returns the incomplete byte count after the complete-line watermark.
-	#[must_use]
 	pub const fn tail_bytes(&self) -> u64 {
 		self.tail_bytes
 	}

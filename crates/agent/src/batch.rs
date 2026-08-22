@@ -70,7 +70,6 @@ impl ExecutionModeHandle {
 	}
 
 	/// Returns the current execution mode.
-	#[must_use]
 	pub fn get(&self) -> ExecutionMode {
 		match self.0.load(Ordering::Acquire) {
 			1 => ExecutionMode::Plan,
@@ -84,7 +83,6 @@ impl ExecutionModeHandle {
 
 	/// Builds immutable invocation metadata and performs one-way prewalk/yolo
 	/// automation on the first mutating tool.
-	#[must_use]
 	pub fn invocation_props(&self, effects: &Effects) -> value_pb::ValueMap {
 		let mut mode = self.get();
 		let mut fields = BTreeMap::new();
@@ -141,7 +139,6 @@ impl ExecutionModeHandle {
 }
 
 /// Returns whether an effect envelope may mutate Environment-owned state.
-#[must_use]
 pub fn effects_mutate_environment(effects: &Effects) -> bool {
 	effects
 		.documents
@@ -188,7 +185,6 @@ impl From<ClientError> for BatchError {
 	}
 }
 /// Returns the subscription-mask bit for one stable hook event id.
-#[must_use]
 pub const fn hook_event_mask(event: HookEventId) -> u128 {
 	1_u128 << event as u32
 }
@@ -236,7 +232,6 @@ pub struct InvocationHookBus {
 
 impl InvocationHookBus {
 	/// Creates a hook bus and its single CONTROL-side request receiver.
-	#[must_use]
 	pub fn channel() -> (Self, flume::Receiver<InvocationHookRequest>) {
 		let (tx, rx) = flume::unbounded();
 		(Self { union: Arc::new(AtomicU128::new(0)), tx }, rx)
@@ -248,7 +243,6 @@ impl InvocationHookBus {
 	}
 
 	/// Returns the currently published union mask.
-	#[must_use]
 	pub fn union_mask(&self) -> u128 {
 		self.union.load(Ordering::Acquire)
 	}

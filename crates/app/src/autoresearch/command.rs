@@ -92,7 +92,6 @@ pub fn parse(arguments: &str) -> Result<Command, ParseError> {
 }
 
 /// Context-sensitive slash completions.
-#[must_use]
 pub fn completions(arguments: &str) -> &'static [&'static str] {
 	let trimmed = arguments.trim_start();
 	if trimmed.starts_with("clear ") {

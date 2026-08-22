@@ -559,6 +559,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+#[must_use]
 struct SocketCleanup {
 	path:  PathBuf,
 	dev:   u64,

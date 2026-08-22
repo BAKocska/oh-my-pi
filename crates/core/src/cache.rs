@@ -41,7 +41,6 @@ impl<K: Hash + Eq, V> MemoCache<K, V> {
 	/// Creates an empty cache holding at most `capacity` entries.
 	///
 	/// A zero-capacity cache is valid and never stores entries.
-	#[must_use]
 	pub fn new(capacity: usize) -> Self {
 		let table_len = capacity.saturating_mul(2).max(1).next_power_of_two();
 		let mut slots = Vec::with_capacity(table_len);
@@ -113,14 +112,12 @@ impl<K: Hash + Eq, V> MemoCache<K, V> {
 
 	/// Returns the number of cached entries.
 	#[inline]
-	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.len
 	}
 
 	/// Returns whether the cache contains no entries.
 	#[inline]
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.len == 0
 	}

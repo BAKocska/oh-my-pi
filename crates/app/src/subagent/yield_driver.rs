@@ -45,7 +45,6 @@ pub struct YieldDriver {
 
 impl YieldDriver {
 	/// Creates enforcement for a schema-bound or otherwise required result.
-	#[must_use]
 	pub const fn new(required: bool) -> Self {
 		Self {
 			required,

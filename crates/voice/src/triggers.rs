@@ -27,7 +27,6 @@ pub struct SubmitDecision {
 }
 
 /// Evaluates one completed utterance without modifying it.
-#[must_use]
 pub fn evaluate_submit_trigger(utterance: &str, trigger: SubmitTrigger) -> SubmitDecision {
 	let trimmed = utterance.trim();
 	if trimmed.is_empty() || trigger == SubmitTrigger::Never {

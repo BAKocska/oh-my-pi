@@ -77,7 +77,6 @@ impl DapAdapterSpec {
 	}
 
 	/// Applies launch or attach defaults without replacing caller values.
-	#[must_use]
 	pub fn merged_arguments(
 		&self,
 		attach: bool,
@@ -94,7 +93,6 @@ impl DapAdapterSpec {
 
 	/// Applies adapter-specific launch defaults derived from the resolved
 	/// program. Delve debugs Go sources/directories and executes binaries.
-	#[must_use]
 	pub fn launch_arguments(
 		&self,
 		program: &Path,
@@ -122,7 +120,6 @@ pub struct DapAdapterId(u64);
 
 impl DapAdapterId {
 	/// Returns the registry-local integer.
-	#[must_use]
 	pub const fn get(self) -> u64 {
 		self.0
 	}
@@ -364,7 +361,6 @@ fn resolve_path_command(command: &str) -> Option<PathBuf> {
 }
 
 /// Locates the js-debug server script in pi-compatible priority order.
-#[must_use]
 pub fn discover_js_debug_server(
 	project_root: &Path,
 	home: &Path,
@@ -392,7 +388,6 @@ pub fn discover_js_debug_server(
 
 /// Converts known adapter startup diagnostics into actionable installation
 /// guidance without hiding the original process failure.
-#[must_use]
 pub fn dap_startup_guidance(adapter: &str, diagnostic: &str) -> Option<Str> {
 	if adapter == "debugpy"
 		&& (diagnostic.contains("No module named debugpy")

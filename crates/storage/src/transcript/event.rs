@@ -347,56 +347,47 @@ impl Custom {
 	}
 
 	/// Returns the declared entry-kind name.
-	#[must_use]
 	pub fn kind(&self) -> &str {
 		self.kind.as_str()
 	}
 
 	/// Returns the recorded schema revision.
-	#[must_use]
 	pub fn rev(&self) -> Option<&str> {
 		self.rev.as_deref()
 	}
 
 	/// Returns the optional extension-local source.
-	#[must_use]
 	pub fn source(&self) -> Option<&str> {
 		self.source.as_deref()
 	}
 
 	/// Returns the authenticated acting principal.
-	#[must_use]
 	pub const fn principal(&self) -> &Principal {
 		&self.principal
 	}
 
 	/// Returns the authenticated extension provenance.
-	#[must_use]
 	pub const fn provenance(&self) -> &Provenance {
 		&self.provenance
 	}
 
 	/// Returns the canonical data bytes.
-	#[must_use]
 	pub fn data(&self) -> Option<&RawValue> {
 		self.data.as_deref()
 	}
 
 	/// Returns the materialized model-context projection.
-	#[must_use]
 	pub const fn context(&self) -> Option<&Content> {
 		self.context.as_ref()
 	}
 
 	/// Returns whether clients should display the event.
-	#[must_use]
 	pub const fn display(&self) -> bool {
 		self.display
 	}
 
 	/// Returns the same per-revision attribution key and value used by tool
 	/// thread items.
-	#[must_use]
 	pub fn rev_attribution(&self) -> Option<(&'static str, &str)> {
 		self
 			.rev

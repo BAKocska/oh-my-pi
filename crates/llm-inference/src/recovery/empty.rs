@@ -23,14 +23,12 @@ pub struct UnexpectedStopEvidence {
 }
 
 /// Returns whether pi's secondary unexpected-stop classifier should run.
-#[must_use]
 pub const fn is_unexpected_stop_candidate(evidence: UnexpectedStopEvidence) -> bool {
 	evidence.end_turn && !evidence.tool_call && (evidence.visible_text || evidence.signed_thinking)
 }
 
 /// Builds the bounded retry guidance injected after a classified unexpected
 /// stop.
-#[must_use]
 pub fn unexpected_stop_guidance(retry: u32, maximum: u32) -> Str {
 	sf!(
 		"<system-injection>\nYou said you would continue with a tool call or action but stopped. \
@@ -99,7 +97,6 @@ pub struct EmptyCompletionStage {
 
 impl EmptyCompletionStage {
 	/// Creates an observer with catalog policy evidence.
-	#[must_use]
 	pub const fn new(wire_policy: WirePolicyId, attempt: u32) -> Self {
 		Self {
 			wire_policy,

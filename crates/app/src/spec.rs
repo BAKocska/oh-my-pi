@@ -23,7 +23,6 @@ pub struct PromptSlots {
 
 impl PromptSlots {
 	/// Materializes the ordered system message consumed by inference.
-	#[must_use]
 	pub fn combined(self) -> Option<Str> {
 		match (self.system, self.append) {
 			(Some(system), Some(append)) => Some(Str::from(format!("{system}\n\n{append}"))),

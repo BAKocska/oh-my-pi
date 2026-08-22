@@ -92,25 +92,21 @@ pub struct LspSessionBinding {
 
 impl LspSessionBinding {
 	/// Wraps a registry-issued generation-fenced binding.
-	#[must_use]
 	pub fn new(name: impl Into<Str>, handle: LspBindingHandle, status: LspWarmupStatus) -> Self {
 		Self { name: name.into(), handle, status: Arc::new(RwLock::new(status)) }
 	}
 
 	/// Returns the host-visible server name.
-	#[must_use]
 	pub fn name(&self) -> &str {
 		self.name.as_str()
 	}
 
 	/// Returns the stable registry-local binding identity.
-	#[must_use]
 	pub fn binding_id(&self) -> u64 {
 		self.handle.binding_id().get()
 	}
 
 	/// Returns the latest warmup state.
-	#[must_use]
 	pub fn status(&self) -> LspWarmupStatus {
 		*self.status.read()
 	}
@@ -145,31 +141,26 @@ pub struct SessionDiagnostics {
 
 impl SessionDiagnostics {
 	/// Returns the ordered primary and fallback candidate diagnostics.
-	#[must_use]
 	pub fn models(&self) -> &[ModelFallbackDiagnostic] {
 		&self.models
 	}
 
 	/// Returns the effective thinking clamp.
-	#[must_use]
 	pub const fn thinking(&self) -> &ThinkingDiagnostic {
 		&self.thinking
 	}
 
 	/// Returns the effective service-tier clamp.
-	#[must_use]
 	pub const fn service_tier(&self) -> &ServiceTierDiagnostic {
 		&self.service_tier
 	}
 
 	/// Returns the latest launch/preconnect facts.
-	#[must_use]
 	pub fn launch(&self) -> LaunchDiagnostic {
 		self.launch.read().clone()
 	}
 
 	/// Returns opaque language-server bindings and their live warmup states.
-	#[must_use]
 	pub fn lsp_bindings(&self) -> &[LspSessionBinding] {
 		&self.lsp
 	}

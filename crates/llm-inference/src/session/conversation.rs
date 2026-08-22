@@ -536,7 +536,7 @@ impl<I> ConversationState<I> {
 pub(crate) type SharedState<I> = Arc<Mutex<ConversationState<I>>>;
 
 /// A private staged append whose drop structurally aborts the draft.
-#[must_use = "dropping a turn draft rolls it back"]
+#[must_use]
 pub struct TurnDraft<I> {
 	pub(crate) state:        SharedState<I>,
 	pub(crate) draft:        u64,

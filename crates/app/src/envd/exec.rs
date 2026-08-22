@@ -171,6 +171,7 @@ pub enum ProcessEvent {
 /// Dropping this value requests TERM-then-KILL teardown of only this command's
 /// process groups unless [`ExecHost::detach_exec`] retained the exact run as a
 /// named process. The shell session is owned by [`ExecHost`] and survives.
+#[must_use]
 pub struct ExecRun {
 	id:      Bytes,
 	events:  flume::Receiver<ExecEvent>,
@@ -293,6 +294,7 @@ struct ProcessStreamState {
 	subscribers: Vec<flume::Sender<ProcessEvent>>,
 }
 
+#[must_use]
 struct ProcessReservation {
 	host: Weak<HostInner>,
 	name: Str,
@@ -461,7 +463,6 @@ impl ExecHost {
 	}
 
 	/// Injects the production GitHub resource cache owned by the Environment.
-	#[must_use]
 	pub fn with_github_cache(self, cache: Arc<omp_storage::github_cache::GithubCache>) -> Self {
 		*self.inner.github_cache.lock() = Some(cache);
 		self
@@ -591,7 +592,6 @@ impl ExecHost {
 	}
 
 	/// Returns whether a persistent session is owned by this Environment.
-	#[must_use]
 	pub fn contains_session(&self, session: &[u8]) -> bool {
 		self.inner.sessions.lock().contains_key(session)
 	}

@@ -197,13 +197,11 @@ pub struct RegistryHandle {
 
 impl RegistryHandle {
 	/// Starts publication from one fully constructed registry.
-	#[must_use]
 	pub fn new(registry: Registry) -> Self {
 		Self { current: Arc::new(ArcSwap::from_pointee(registry)) }
 	}
 
 	/// Loads exactly one immutable registry snapshot for a lookup.
-	#[must_use]
 	pub fn load(&self) -> RegistrySnapshot {
 		RegistrySnapshot { registry: self.current.load_full() }
 	}
@@ -231,7 +229,6 @@ impl RegistryHandle {
 
 impl Registry {
 	/// Moves this immutable registry behind an atomic rebuild publication point.
-	#[must_use]
 	pub fn into_handle(self) -> RegistryHandle {
 		RegistryHandle::new(self)
 	}
@@ -252,7 +249,6 @@ impl RegistryBuilder {
 	/// Sets the generation captured by plans after this complete registry is
 	/// rebuilt. Call this after all construction-time registrations so a catalog
 	/// overlay generation is preserved exactly.
-	#[must_use]
 	pub const fn with_generation(mut self, generation: u64) -> Self {
 		self.generation = generation;
 		self
@@ -260,7 +256,6 @@ impl RegistryBuilder {
 
 	/// Sets the default inference envelope for extensions without a dedicated
 	/// policy.
-	#[must_use]
 	pub fn with_default_inference_budget(
 		self,
 		per_turn: InferenceBudget,
@@ -273,7 +268,6 @@ impl RegistryBuilder {
 	}
 
 	/// Sets hard turn and session ceilings for one extension.
-	#[must_use]
 	pub fn with_inference_budget(
 		self,
 		extension: Str,

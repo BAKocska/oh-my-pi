@@ -58,7 +58,6 @@ pub struct SkillSnapshot {
 
 impl SkillSnapshot {
 	/// Freezes winning skill records in case-insensitive name/path order.
-	#[must_use]
 	pub fn from_records(records: &[Arc<CapabilityRecord>]) -> Self {
 		let mut ordered = records
 			.iter()
@@ -87,7 +86,6 @@ impl SkillSnapshot {
 	}
 
 	/// Freezes provider declarations before registry provenance attachment.
-	#[must_use]
 	pub fn from_declarations(declarations: &[DiscoveredCapability]) -> Self {
 		Self::from_skills(
 			declarations
@@ -103,7 +101,6 @@ impl SkillSnapshot {
 	}
 
 	/// Freezes already parsed declarations, useful for custom/managed sources.
-	#[must_use]
 	pub fn from_skills(mut skills: Vec<ActiveSkill>) -> Self {
 		let mut claimed = BTreeSet::new();
 		skills.retain(|skill| claimed.insert(skill.name.clone()));
@@ -126,13 +123,11 @@ impl SkillSnapshot {
 
 	/// All active skills, including hidden/model-disabled entries reachable by
 	/// an explicit user invocation or internal URL.
-	#[must_use]
 	pub fn all(&self) -> &[ActiveSkill] {
 		&self.ordered
 	}
 
 	/// Looks up a skill without allocating.
-	#[must_use]
 	pub fn get(&self, name: &str) -> Option<&ActiveSkill> {
 		self.by_name.get(name).map(|index| &self.ordered[*index])
 	}
@@ -154,7 +149,6 @@ impl SkillSnapshot {
 
 	/// Resolves the frozen whole skill body. Filesystem changes after snapshot
 	/// creation are intentionally unobservable through this route.
-	#[must_use]
 	pub fn resolve_body(&self, name: &str) -> Option<&str> {
 		self.get(name).map(|skill| skill.body.as_str())
 	}
@@ -163,7 +157,6 @@ impl SkillSnapshot {
 /// Projects visible and autoload skill inventories into immutable named prompt
 /// inputs. Autoload entries carry their frozen body; visible entries carry the
 /// model-selectable description and `skill://` origin.
-#[must_use]
 pub fn prompt_inputs(snapshot: &SkillSnapshot) -> Arc<[PromptNamedInput]> {
 	snapshot
 		.all()
@@ -216,7 +209,6 @@ pub struct ParsedSkillInvocation {
 
 /// Detects leading and mid-prompt skill invocations while preserving local
 /// `!`/`!!` and `$`/`$$` execution branches and other leading slash commands.
-#[must_use]
 pub fn parse_invocation(text: &str) -> Option<ParsedSkillInvocation> {
 	let trimmed = text.trim_start();
 	if let Some(rest) = trimmed.strip_prefix("/skill:") {
@@ -279,7 +271,6 @@ pub struct SkillResolver {
 impl SkillResolver {
 	/// Creates a resolver which cannot observe skill winner changes after this
 	/// call.
-	#[must_use]
 	pub fn new(snapshot: Arc<SkillSnapshot>) -> Self {
 		Self { snapshot, lines: LineOffsetCache::default() }
 	}
@@ -466,7 +457,6 @@ pub enum SkillInvocationKind {
 
 /// Renders an invocation from frozen content, with distinct user/autoload
 /// provenance and explicit base/contain roots.
-#[must_use]
 pub fn render_invocation(skill: &ActiveSkill, args: &str, kind: SkillInvocationKind) -> Str {
 	let args = args.trim();
 	let mut output = String::new();

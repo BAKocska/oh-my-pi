@@ -56,25 +56,21 @@ impl InvocationPhase {
 	];
 
 	/// Returns the stable zero-based protocol discriminant.
-	#[must_use]
 	pub const fn ordinal(self) -> u8 {
 		self as u8
 	}
 
 	/// Returns whether this phase is terminal.
-	#[must_use]
 	pub const fn is_terminal(self) -> bool {
 		matches!(self, Self::Settled)
 	}
 
 	/// Returns whether a direct transition from `self` to `next` is legal.
-	#[must_use]
 	pub const fn can_transition_to(self, next: Self) -> bool {
 		self.ordinal() + 1 == next.ordinal()
 	}
 
 	/// Returns whether this invocation has reached `required`.
-	#[must_use]
 	pub const fn has_reached(self, required: Self) -> bool {
 		self.ordinal() >= required.ordinal()
 	}
@@ -83,7 +79,6 @@ impl InvocationPhase {
 	///
 	/// Settled invocations cannot start new work even when they reached the
 	/// operation's minimum phase earlier.
-	#[must_use]
 	pub const fn allows_operation(self, minimum: Self) -> bool {
 		!self.is_terminal() && self.has_reached(minimum)
 	}
@@ -127,7 +122,6 @@ impl LifecyclePhase {
 		[Self::Declared, Self::Frozen, Self::Verified, Self::Active, Self::Degraded];
 
 	/// Returns the stable zero-based vocabulary position.
-	#[must_use]
 	pub const fn ordinal(self) -> u8 {
 		self as u8
 	}
@@ -193,7 +187,6 @@ pub enum RestartReason {
 
 impl RestartReason {
 	/// Returns the coarse activation reason exposed to extension handlers.
-	#[must_use]
 	pub const fn activate_reason(self) -> ActivateReason {
 		match self {
 			Self::HotReload => ActivateReason::HotReload,

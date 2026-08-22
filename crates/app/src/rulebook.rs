@@ -116,7 +116,6 @@ pub struct RuleSnapshot {
 
 impl RuleSnapshot {
 	/// Freezes provider declarations before registry provenance attachment.
-	#[must_use]
 	pub fn from_declarations(
 		declarations: &[DiscoveredCapability],
 		settings: &RulebookSettings,
@@ -163,7 +162,6 @@ impl RuleSnapshot {
 
 	/// Freezes authored/package winners and optional bundled fallbacks. Exact
 	/// blocks already present in any other prompt source are omitted.
-	#[must_use]
 	pub fn from_records(
 		records: &[Arc<CapabilityRecord>],
 		settings: &RulebookSettings,
@@ -217,7 +215,6 @@ impl RuleSnapshot {
 	}
 
 	/// Freezes already lowered rules.
-	#[must_use]
 	pub fn freeze(rules: Vec<ActiveRule>) -> Self {
 		let by_name = rules
 			.iter()
@@ -252,7 +249,6 @@ impl RuleSnapshot {
 	}
 
 	/// Every active rule in deterministic precedence order.
-	#[must_use]
 	pub fn all(&self) -> &[ActiveRule] {
 		&self.ordered
 	}
@@ -273,13 +269,11 @@ impl RuleSnapshot {
 	}
 
 	/// Looks up a frozen rule.
-	#[must_use]
 	pub fn get(&self, name: &str) -> Option<&ActiveRule> {
 		self.by_name.get(name).map(|index| &self.ordered[*index])
 	}
 
 	/// Resolves frozen whole-body content for `rule://<name>`.
-	#[must_use]
 	pub fn resolve_body(&self, name: &str) -> Option<&str> {
 		self.get(name).map(|rule| rule.declaration.content.as_str())
 	}
@@ -287,7 +281,6 @@ impl RuleSnapshot {
 	/// Synthesizes scoped sticky `RULES.md` contributions for a target path.
 	/// User rules render before project rules only when precedence already
 	/// placed them there; exact content is never emitted twice.
-	#[must_use]
 	pub fn sticky_rules_markdown(&self, target_path: &str) -> Str {
 		let mut output = String::new();
 		for rule in self
@@ -308,9 +301,7 @@ impl RuleSnapshot {
 
 /// Projects active rules into immutable prompt inputs without re-reading their
 /// declaration files.
-#[must_use]
 /// Compiles the frozen discovery winners into the agent stream matcher.
-#[must_use]
 pub fn ttsr_registry(snapshot: &RuleSnapshot) -> (TtsrRegistry, Vec<TtsrCompileError>) {
 	let mut authored = Vec::new();
 	let mut builtins = Vec::new();
@@ -363,7 +354,6 @@ pub struct RuleResolver {
 impl RuleResolver {
 	/// Creates a resolver which cannot observe rule winner or file changes after
 	/// this call.
-	#[must_use]
 	pub fn new(snapshot: Arc<RuleSnapshot>) -> Self {
 		Self { snapshot, lines: LineOffsetCache::default() }
 	}

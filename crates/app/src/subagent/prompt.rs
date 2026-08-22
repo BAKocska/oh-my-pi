@@ -64,7 +64,6 @@ pub struct SubagentPromptInput<'a> {
 }
 
 /// Composes the complete child prompt without creating a second policy owner.
-#[must_use]
 pub fn compose(input: SubagentPromptInput<'_>) -> Str {
 	let mut output = String::with_capacity(
 		input.definition.description.len() + input.definition.prompt.len() + 1_024,
@@ -167,7 +166,6 @@ pub fn compose(input: SubagentPromptInput<'_>) -> Str {
 }
 
 /// Projects one live roster node without transferring scheduling authority.
-#[must_use]
 pub fn peer_from_node(node: &AgentNode) -> (Str, Str, Str, Str) {
 	(
 		node.name.clone(),

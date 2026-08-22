@@ -52,7 +52,6 @@ pub struct AttachmentIndex {
 
 impl AttachmentIndex {
 	/// Indexes image blobs from the latest user message containing at least one.
-	#[must_use]
 	pub fn from_thread(thread: &Thread) -> Self {
 		let Some(blobs) = thread
 			.items
@@ -91,7 +90,6 @@ impl AttachmentIndex {
 	}
 
 	/// Returns indexed attachments in positional order.
-	#[must_use]
 	pub fn entries(&self) -> &[Attachment] {
 		&self.entries
 	}
@@ -129,7 +127,6 @@ pub fn publish_session_attachments(session: &str, thread: &Thread) {
 }
 
 /// Returns the latest immutable attachment projection for one live session.
-#[must_use]
 pub fn session_attachments(session: &str) -> Option<Arc<AttachmentIndex>> {
 	SESSION_ATTACHMENTS.read().get(session).cloned()
 }
@@ -313,7 +310,6 @@ pub enum NormalizeAttachmentError<E> {
 }
 
 /// Returns the conservative per-request image count for a provider.
-#[must_use]
 pub fn provider_image_budget(provider: Option<&str>) -> usize {
 	match provider {
 		Some("anthropic" | "amazon-bedrock" | "openrouter") => 90,
@@ -327,7 +323,6 @@ pub fn provider_image_budget(provider: Option<&str>) -> usize {
 ///
 /// Tool-result messages that lose their only part receive a visible omission
 /// marker so provider message shape remains valid.
-#[must_use]
 pub fn clamp_provider_images(thread: &mut Thread, provider: Option<&str>) -> usize {
 	let budget = provider_image_budget(provider);
 	let total = thread
@@ -393,7 +388,6 @@ pub fn clamp_provider_images(thread: &mut Thread, provider: Option<&str>) -> usi
 /// `descriptions` are positional against [`AttachmentIndex`]. Missing
 /// descriptions produce a bounded neutral marker rather than exposing binary
 /// data to a model that cannot consume it.
-#[must_use]
 pub fn describe_images_for_text_model(
 	thread: &mut Thread,
 	model_accepts_images: bool,

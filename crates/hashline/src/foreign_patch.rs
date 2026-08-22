@@ -22,7 +22,6 @@ pub enum ForeignPatchFile {
 
 impl ForeignPatchFile {
 	/// Authored source path.
-	#[must_use]
 	pub fn path(&self) -> &str {
 		match self {
 			Self::Add { path, .. } | Self::Delete { path } | Self::Update { path, .. } => path,

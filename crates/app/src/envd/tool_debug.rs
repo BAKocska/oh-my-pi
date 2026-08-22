@@ -21,7 +21,6 @@ pub struct DocumentDebugControl {
 
 impl DocumentDebugControl {
 	/// Binds the project document authority.
-	#[must_use]
 	pub fn new(documents: DocumentHost) -> Self {
 		Self { documents, sessions: Arc::new(RwLock::new(BTreeMap::new())) }
 	}

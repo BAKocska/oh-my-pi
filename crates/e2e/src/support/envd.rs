@@ -147,26 +147,22 @@ impl EnvHarness {
 	}
 
 	/// Returns the hello-complete environment client.
-	#[must_use]
 	pub const fn client(&self) -> &EnvClient {
 		&self.client
 	}
 
 	/// Returns a clone of the hello-complete environment client.
-	#[must_use]
 	pub fn client_clone(&self) -> EnvClient {
 		self.client.clone()
 	}
 
 	/// Returns the final production registry assembled beside environment
 	/// resources.
-	#[must_use]
 	pub fn registry(&self) -> Arc<Registry> {
 		self.server.registry()
 	}
 
 	/// Returns the owner-local environment socket.
-	#[must_use]
 	pub fn socket(&self) -> &Path {
 		&self.socket
 	}
@@ -216,19 +212,16 @@ pub struct ProcessEnvHarness {
 
 impl ProcessEnvHarness {
 	/// Returns the hello-complete environment client.
-	#[must_use]
 	pub const fn client(&self) -> &EnvClient {
 		&self.client
 	}
 
 	/// Returns a clone of the hello-complete environment client.
-	#[must_use]
 	pub fn client_clone(&self) -> EnvClient {
 		self.client.clone()
 	}
 
 	/// Returns the environment endpoint.
-	#[must_use]
 	pub fn socket(&self) -> &Path {
 		&self.socket
 	}
@@ -277,13 +270,11 @@ impl FramedEnvConnection {
 	}
 
 	/// Returns the decoded environment client.
-	#[must_use]
 	pub const fn client(&self) -> &EnvClient {
 		&self.client
 	}
 
 	/// Returns a clone sharing this connection's correlation router.
-	#[must_use]
 	pub fn client_clone(&self) -> EnvClient {
 		self.client.clone()
 	}

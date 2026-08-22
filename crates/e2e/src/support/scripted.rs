@@ -42,19 +42,16 @@ pub struct ScriptedTurn {
 
 impl ScriptedTurn {
 	/// Scripts an ordered successful event stream.
-	#[must_use]
 	pub fn events(events: impl IntoIterator<Item = TurnEvent>) -> Self {
 		Self { steps: events.into_iter().map(ScriptedStep::from).collect() }
 	}
 
 	/// Scripts an ordered stream that may terminate with a typed turn error.
-	#[must_use]
 	pub fn results(events: impl IntoIterator<Item = Result<TurnEvent, Error>>) -> Self {
 		Self { steps: events.into_iter().map(ScriptedStep::from).collect() }
 	}
 
 	/// Scripts events interleaved with externally released deterministic gates.
-	#[must_use]
 	pub fn steps(steps: impl IntoIterator<Item = ScriptedStep>) -> Self {
 		Self { steps: steps.into_iter().collect() }
 	}
@@ -83,7 +80,6 @@ pub struct ScriptedTurnClient {
 
 impl ScriptedTurnClient {
 	/// Creates a client that consumes exactly one script per opened turn.
-	#[must_use]
 	pub fn new(scripts: impl IntoIterator<Item = ScriptedTurn>) -> Self {
 		Self {
 			scripts:  Arc::new(Mutex::new(scripts.into_iter().collect())),
@@ -93,13 +89,11 @@ impl ScriptedTurnClient {
 
 	/// Returns a stable snapshot of all opened turns and submitted invocation
 	/// frames.
-	#[must_use]
 	pub fn captures(&self) -> Vec<CapturedTurn> {
 		self.captured.lock().clone()
 	}
 
 	/// Returns the number of scripts not yet consumed.
-	#[must_use]
 	pub fn remaining(&self) -> usize {
 		self.scripts.lock().len()
 	}

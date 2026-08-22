@@ -13,7 +13,6 @@ const MAX_PAGES: usize = 1_024;
 
 /// Selects the most-specific RFC 6570 template whose literal segments occur in
 /// order in `uri`. More literal bytes win; ties are lexical and deterministic.
-#[must_use]
 pub fn best_template<'a>(
 	templates: &'a [ResourceTemplate],
 	uri: &str,
@@ -112,7 +111,6 @@ pub struct ResourcesClient {
 
 impl ResourcesClient {
 	/// Creates a resource facade.
-	#[must_use]
 	pub fn new(transport: Arc<dyn McpTransport>) -> Self {
 		Self { transport }
 	}

@@ -97,7 +97,6 @@ fn validate_text_edits(
 }
 
 /// Produces a bounded deterministic dry-run summary.
-#[must_use]
 pub fn preview(edit: &Value) -> Str {
 	let mut output = StrMut::new("");
 	if let Some(changes) = edit.get("changes").and_then(Value::as_object) {

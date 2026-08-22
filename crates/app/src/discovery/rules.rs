@@ -88,7 +88,6 @@ impl StringList {
 
 /// Loads nested Markdown rules, normalizes TTSR scope shorthand, and retains
 /// only declarative (never executable) conditions.
-#[must_use]
 pub fn discover(sources: &[RuleSource]) -> RuleDiscovery {
 	let mut result = RuleDiscovery::default();
 	let mut names = BTreeSet::new();
@@ -309,7 +308,6 @@ fn likely_file_glob(value: &str) -> bool {
 
 /// Splits comma-separated scopes without breaking nested tool glob arguments,
 /// bracket expressions, braces, or quoted tokens.
-#[must_use]
 pub fn split_scope_tokens(value: &str) -> Vec<String> {
 	let mut output = Vec::new();
 	let mut start = 0;
@@ -361,7 +359,6 @@ fn push_scope(value: &str, output: &mut Vec<String>) {
 /// Converts a leading PCRE flag group into Rust-regex scoped flags. Supported
 /// `i`, `m`, and `s` retain their meaning; unknown flags stay literal so the
 /// runtime compiler can diagnose them instead of silently changing meaning.
-#[must_use]
 pub fn normalize_pcre_inline_flags(pattern: &str) -> String {
 	let Some(flags_end) = pattern
 		.strip_prefix("(?")
@@ -382,7 +379,6 @@ fn dedupe(values: &mut Vec<Str>) {
 }
 
 /// Tests whether a rule's applicability globs include a path.
-#[must_use]
 pub fn applies_to(rule: &RulePayload, path: &str) -> bool {
 	rule.globs.is_empty()
 		|| rule

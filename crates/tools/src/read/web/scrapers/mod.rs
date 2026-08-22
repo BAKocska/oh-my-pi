@@ -89,7 +89,6 @@ impl Scraper {
 	];
 
 	/// Returns whether this scraper recognizes a URL.
-	#[must_use]
 	pub fn matches(self, url: &Url) -> bool {
 		match self {
 			Self::GitHubGist => github_gist::matches(url),
@@ -149,7 +148,6 @@ fn first_registered_matching(mut predicate: impl FnMut(Scraper) -> bool) -> Opti
 }
 
 /// Selects the first registered scraper that recognizes `url`.
-#[must_use]
 pub fn scraper_for(url: &Url) -> Option<Scraper> {
 	first_registered_matching(|scraper| scraper.matches(url))
 }

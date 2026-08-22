@@ -37,7 +37,6 @@ pub struct FrameIdentity {
 
 impl FrameIdentity {
 	/// Creates an exact identity for a locally projected retained frame.
-	#[must_use]
 	pub fn new(kind: impl IntoStr, rev: impl IntoStr, stable_id: impl IntoStr) -> Self {
 		Self {
 			kind:      kind.into_str(),
@@ -47,19 +46,16 @@ impl FrameIdentity {
 	}
 
 	/// Borrows the semantic frame kind.
-	#[must_use]
 	pub fn kind(&self) -> &str {
 		self.kind.as_str()
 	}
 
 	/// Borrows the schema revision.
-	#[must_use]
 	pub fn rev(&self) -> &str {
 		self.rev.as_str()
 	}
 
 	/// Borrows the producer-stable frame identity.
-	#[must_use]
 	pub fn stable_id(&self) -> &str {
 		self.stable_id.as_str()
 	}
@@ -135,25 +131,21 @@ pub struct RetainedFrames {
 
 impl RetainedFrames {
 	/// Creates an empty retained-frame store.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Returns the retained frame count.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.frames.len()
 	}
 
 	/// Reports whether no frames are retained.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.frames.is_empty()
 	}
 
 	/// Borrows one frame by its exact `(kind, rev, stable_id)` identity.
-	#[must_use]
 	pub fn get(&self, identity: &FrameIdentity) -> Option<&RetainedFrame> {
 		self.frames.get(identity)
 	}
@@ -250,7 +242,6 @@ fn validate_key(key: Option<&RetainedFrameKey>) -> Result<FrameIdentity, FrameEr
 
 /// Builds the enhanced card for a known typed frame revision, otherwise
 /// returns the producer's required generic TML fallback.
-#[must_use]
 pub fn render_frame_tml(frame: &RetainedFrame) -> Str {
 	let fallback = || {
 		frame

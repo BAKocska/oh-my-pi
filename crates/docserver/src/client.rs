@@ -45,7 +45,6 @@ impl<T, E> TerminalEventReceiver<T, E> {
 	}
 
 	/// Returns whether this receiver has observed a terminal error or closure.
-	#[must_use]
 	pub fn is_terminal(&self) -> bool {
 		self.terminal.load(Ordering::Acquire)
 	}

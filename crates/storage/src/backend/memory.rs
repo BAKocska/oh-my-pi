@@ -14,25 +14,21 @@ pub struct MemoryStore {
 
 impl MemoryStore {
 	/// Creates an empty memory journal.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { bytes: Vec::new() }
 	}
 
 	/// Creates a journal from existing v4 bytes.
-	#[must_use]
 	pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
 		Self { bytes: bytes.into() }
 	}
 
 	/// Returns the exact stored bytes.
-	#[must_use]
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.bytes
 	}
 
 	/// Freezes the journal for clone-cheap snapshot distribution.
-	#[must_use]
 	pub fn snapshot(&self) -> Arc<[u8]> {
 		Arc::from(self.bytes.as_slice())
 	}

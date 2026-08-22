@@ -32,7 +32,6 @@ pub struct SupervisorConfig {
 
 impl SupervisorConfig {
 	/// Creates Pi-compatible request deadlines for an executable.
-	#[must_use]
 	pub fn new(executable: impl Into<PathBuf>) -> Self {
 		Self {
 			executable:      executable.into(),
@@ -55,7 +54,6 @@ pub struct EmbeddingSupervisor {
 
 impl EmbeddingSupervisor {
 	/// Creates an unloaded supervisor without spawning a process.
-	#[must_use]
 	pub const fn new(config: SupervisorConfig) -> Self {
 		Self {
 			config,

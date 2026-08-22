@@ -31,14 +31,12 @@ impl OverlayPanel {
 	}
 
 	/// Adds vertical padding inside the shared border.
-	#[must_use]
 	pub fn pad_y(mut self, rows: u16) -> Self {
 		self.inner.props_mut().set(Prop::PadY, rows);
 		self
 	}
 
 	/// Appends panel content.
-	#[must_use]
 	pub fn child(mut self, children: impl IntoChildren) -> Self {
 		self.inner = self.inner.child(children);
 		self

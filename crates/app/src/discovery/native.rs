@@ -40,7 +40,6 @@ pub struct NativeDirectories {
 ///
 /// Explicit OMP variables win. Otherwise the corresponding XDG variable is
 /// used, followed by the XDG home-relative default.
-#[must_use]
 pub fn native_directories(home: &Path) -> NativeDirectories {
 	fn root(omp: &str, xdg: &str, fallback: &Path) -> PathBuf {
 		env::var_os(omp)
@@ -240,7 +239,6 @@ pub struct NativeDiscovery {
 /// Discovers the canonical native content surface from realpath-deduplicated
 /// roots. Roots are ordered explicit, nearest project, then user unless
 /// explicit-only mode is selected.
-#[must_use]
 pub fn discover_capabilities(
 	cwd: &Path,
 	home: &Path,

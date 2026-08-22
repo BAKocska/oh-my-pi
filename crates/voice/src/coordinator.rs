@@ -261,6 +261,7 @@ impl AudioCoordinator {
 
 /// Exclusive microphone lease. Dropping or explicitly releasing it restores
 /// every policy change owned by the lease.
+#[must_use]
 pub struct MicrophoneLease {
 	inner: Option<Arc<Inner>>,
 	id:    u64,
@@ -299,6 +300,7 @@ impl Drop for MicrophoneLease {
 
 /// Push-to-talk ducking lease nested beneath a speech-to-text microphone
 /// lease.
+#[must_use]
 pub struct PushToTalkLease {
 	inner:         Option<Arc<Inner>>,
 	microphone_id: u64,
@@ -321,6 +323,7 @@ impl Drop for PushToTalkLease {
 }
 
 /// Independent local-TTS suspension lease.
+#[must_use]
 pub struct TtsSuspensionLease {
 	inner: Option<Arc<Inner>>,
 }

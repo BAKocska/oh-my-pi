@@ -154,7 +154,6 @@ impl ConstraintBudget {
 	///
 	/// The same `(slot_hash, route)` reuses its assignment. A changed live set
 	/// supplies a new hash; choosing a different route supplies a new route id.
-	#[must_use]
 	pub fn assign(
 		&self,
 		slot_hash: [u8; 32],
@@ -249,7 +248,6 @@ pub struct ForcedCallDecision {
 }
 
 /// Chooses the forced-call ladder without provider-name special cases.
-#[must_use]
 pub fn forced_call_ladder(
 	choice: &crate::call::Setting<crate::call::ToolChoice>,
 	caps: ForcedCallCaps,
@@ -294,7 +292,6 @@ pub fn forced_call_ladder(
 }
 
 /// Applies a forced-call decision to canonical chat input before encoding.
-#[must_use]
 pub fn apply_forced_call_decision(
 	request: &crate::call::ChatRequest,
 	decision: &ForcedCallDecision,

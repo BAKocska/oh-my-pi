@@ -102,7 +102,6 @@ impl Default for EditAdapterRegistry {
 }
 impl EditAdapterRegistry {
 	/// Creates an empty session-scoped registry.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { adapters: RwLock::new(HashMap::new()) }
 	}
@@ -116,7 +115,6 @@ impl EditAdapterRegistry {
 	/// options are `replace_all: bool`, `allow_fuzzy: bool`, and
 	/// `threshold: number`, with omitted fields inheriting [`ReplaceOptions`]
 	/// defaults.
-	#[must_use]
 	pub fn with_built_ins() -> Self {
 		let mut adapters = HashMap::new();
 		adapters.insert(

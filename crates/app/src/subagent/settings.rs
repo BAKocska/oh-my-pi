@@ -484,14 +484,12 @@ pub struct LiveTaskSettings {
 
 impl LiveTaskSettings {
 	/// Installs an initial typed projection and its concurrency ceiling.
-	#[must_use]
 	pub fn new(initial: Arc<TaskSettings>, tree: Arc<AgentTree>) -> Self {
 		tree.resize_concurrency(initial.max_concurrency);
 		Self { current: Arc::new(RwLock::new(initial)), tree }
 	}
 
 	/// Returns the immutable projection to capture for one new spawn.
-	#[must_use]
 	pub fn snapshot(&self) -> Arc<TaskSettings> {
 		Arc::clone(&self.current.read())
 	}

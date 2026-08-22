@@ -119,7 +119,6 @@ pub struct OAuthCustomDispatcher {
 
 impl OAuthCustomDispatcher {
 	/// Constructs an empty dispatcher.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { handlers: Vec::new() }
 	}
@@ -222,7 +221,6 @@ pub struct OAuthEngine<'a, C, K, R = SystemEntropySource> {
 
 impl<'a, C, K> OAuthEngine<'a, C, K, SystemEntropySource> {
 	/// Constructs an engine using operating-system cryptographic entropy.
-	#[must_use]
 	pub const fn new(http: &'a C, clock: &'a K) -> Self {
 		Self { http, clock, entropy: SystemEntropySource }
 	}
@@ -235,7 +233,6 @@ where
 	R: OAuthEntropy,
 {
 	/// Constructs an engine with deterministic injectable entropy.
-	#[must_use]
 	pub const fn with_entropy(http: &'a C, clock: &'a K, entropy: R) -> Self {
 		Self { http, clock, entropy }
 	}
@@ -792,19 +789,16 @@ pub struct OAuthTokenSet {
 
 impl OAuthTokenSet {
 	/// Returns whether the response contains a renewable grant.
-	#[must_use]
 	pub const fn is_refreshable(&self) -> bool {
 		self.refresh_token.is_some()
 	}
 
 	/// Returns the non-secret token type evidence.
-	#[must_use]
 	pub fn token_type(&self) -> &str {
 		&self.token_type
 	}
 
 	/// Returns the relative lifetime reported by the token endpoint.
-	#[must_use]
 	pub const fn expires_in(&self) -> Option<Duration> {
 		self.expires_in
 	}
@@ -1033,7 +1027,6 @@ pub use oauth_provider_code::OAuthProviderCode;
 
 impl OAuthProviderCode {
 	/// Stable machine-readable string representation of this error code.
-	#[must_use]
 	pub const fn as_str(&self) -> &'static str {
 		(*self).into_str()
 	}

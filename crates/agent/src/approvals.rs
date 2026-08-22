@@ -114,7 +114,6 @@ pub struct ApprovalTicket {
 impl ApprovalTicket {
 	/// Converts this ticket to the typed transcript payload filed on creation or
 	/// merge.
-	#[must_use]
 	pub fn filed_record(&self) -> omp_storage::transcript::ApprovalTicketFiled {
 		omp_storage::transcript::ApprovalTicketFiled {
 			ticket_id:     self.ticket_id.clone(),
@@ -144,7 +143,6 @@ impl ApprovalTicket {
 
 	/// Converts a terminal decision or withdrawal to its typed transcript
 	/// payload.
-	#[must_use]
 	pub fn decision_record(&self) -> Option<omp_storage::transcript::ApprovalDecided> {
 		let state = match self.state {
 			TicketState::Pending => return None,
@@ -230,7 +228,6 @@ impl ApprovalInbox {
 
 impl ApprovalRoute {
 	/// Creates a route and its single host inbox.
-	#[must_use]
 	pub fn new(book: Arc<ApprovalBook>) -> (Self, ApprovalInbox) {
 		let (tx, rx) = flume::unbounded();
 		(Self { book, tx }, ApprovalInbox { rx })
@@ -328,6 +325,7 @@ fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
 	}
 }
 /// Invocation-owned guard that withdraws an unanswered ticket on drop.
+#[must_use]
 pub struct ApprovalGuard<'a> {
 	book:      &'a ApprovalBook,
 	ticket_id: Str,
@@ -341,7 +339,6 @@ impl Drop for ApprovalGuard<'_> {
 
 impl ApprovalBook {
 	/// Creates an empty Core ticket index.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self {
 			next_id:       AtomicU64::new(1),
@@ -411,13 +408,11 @@ impl ApprovalBook {
 
 	/// Returns pending tickets in filing order.
 	/// Returns one ticket by its authenticated durable identity.
-	#[must_use]
 	pub fn ticket(&self, ticket_id: &str) -> Option<ApprovalTicket> {
 		self.tickets.lock().get(ticket_id).cloned()
 	}
 
 	/// Returns pending tickets in filing order.
-	#[must_use]
 	pub fn pending(&self) -> Vec<ApprovalTicket> {
 		self
 			.tickets
@@ -508,7 +503,6 @@ impl ApprovalBook {
 	}
 
 	/// Returns a guard which withdraws this ticket unless it is decided first.
-	#[must_use]
 	pub fn guard(&self, ticket_id: &str) -> Option<ApprovalGuard<'_>> {
 		self
 			.tickets

@@ -330,7 +330,6 @@ fn terminate_raw_handle(handle: RawHandle) -> bool {
 /// Checks whether a duplicated Windows process handle still refers to a running
 /// process.
 #[cfg(windows)]
-#[must_use]
 pub fn process_handle_is_running(handle: &OwnedHandle) -> bool {
 	use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
 
@@ -341,7 +340,6 @@ pub fn process_handle_is_running(handle: &OwnedHandle) -> bool {
 
 /// Terminates the process referenced by a duplicated Windows process handle.
 #[cfg(windows)]
-#[must_use]
 pub fn terminate_process_handle(handle: &OwnedHandle) -> bool {
 	terminate_raw_handle(handle.as_raw_handle())
 }

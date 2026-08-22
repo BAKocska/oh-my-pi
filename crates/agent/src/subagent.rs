@@ -82,7 +82,6 @@ pub struct SubagentProgressSnapshot {
 
 impl SubagentProgressSnapshot {
 	/// Constructs a snapshot while enforcing the retained activity bound.
-	#[must_use]
 	pub fn bounded(mut self) -> Self {
 		let original_len = self.activity.len();
 		truncate_utf8(&mut self.activity, MAX_PROGRESS_ACTIVITY_BYTES);
@@ -106,7 +105,6 @@ pub struct SubagentDisposition {
 
 impl SubagentDisposition {
 	/// Enforces caller-visible preview bounds without copying heap-backed text.
-	#[must_use]
 	pub fn bounded(mut self) -> Self {
 		if let Some(preview) = self.preview.as_mut() {
 			let original_len = preview.len();
@@ -149,7 +147,6 @@ pub struct SubagentTerminalStatus {
 
 impl SubagentTerminalStatus {
 	/// Enforces terminal summary and disposition bounds.
-	#[must_use]
 	pub fn bounded(mut self) -> Self {
 		truncate_utf8(&mut self.summary, MAX_TERMINAL_SUMMARY_BYTES);
 		self.disposition = self.disposition.bounded();
@@ -274,7 +271,6 @@ pub struct SubagentRunState {
 
 impl SubagentRunState {
 	/// Creates retained state for a new durable identity.
-	#[must_use]
 	pub fn new(agent_id: Str) -> Self {
 		let state = Self {
 			agent_id,
@@ -290,31 +286,26 @@ impl SubagentRunState {
 	}
 
 	/// Stable identity shared by every generation.
-	#[must_use]
 	pub const fn agent_id(&self) -> &Str {
 		&self.agent_id
 	}
 
 	/// Current generation.
-	#[must_use]
 	pub fn generation(&self) -> SubagentGeneration {
 		SubagentGeneration(self.generation.load(Ordering::Acquire))
 	}
 
 	/// Current lifecycle.
-	#[must_use]
 	pub fn lifecycle(&self) -> SubagentLifecycle {
 		decode_lifecycle(self.lifecycle.load(Ordering::Acquire))
 	}
 
 	/// Latest bounded progress snapshot.
-	#[must_use]
 	pub fn progress(&self) -> SubagentProgressSnapshot {
 		self.progress.lock().clone()
 	}
 
 	/// Terminal status of the current generation, if settled.
-	#[must_use]
 	pub fn terminal(&self) -> Option<SubagentTerminalStatus> {
 		self.terminal.lock().clone()
 	}

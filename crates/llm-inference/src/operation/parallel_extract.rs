@@ -66,7 +66,6 @@ pub struct ParallelExtractDocument {
 
 impl ParallelExtractDocument {
 	/// Returns excerpts joined with blank lines, then full content as fallback.
-	#[must_use]
 	pub fn content(&self) -> Str {
 		let nonempty = self
 			.excerpts

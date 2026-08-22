@@ -351,7 +351,6 @@ pub struct SpecialWriteControl {
 
 impl SpecialWriteControl {
 	/// Creates a pending special-write control.
-	#[must_use]
 	pub fn new() -> Self {
 		Self {
 			state:  Arc::new(AtomicU8::new(SPECIAL_WRITE_PENDING)),
@@ -391,7 +390,6 @@ impl SpecialWriteControl {
 	}
 
 	/// Returns whether cancellation has been requested.
-	#[must_use]
 	pub fn is_cancelled(&self) -> bool {
 		self.cancel.is_cancelled()
 	}

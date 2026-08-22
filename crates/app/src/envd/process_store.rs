@@ -36,7 +36,6 @@ pub struct ProcessStoreSnapshot {
 
 impl ProcessStoreSnapshot {
 	/// Creates an empty snapshot for the current daemon.
-	#[must_use]
 	pub const fn new(daemon: ProcessIdentity) -> Self {
 		Self {
 			version: PROCESS_STORE_VERSION,
@@ -48,7 +47,6 @@ impl ProcessStoreSnapshot {
 
 	/// Returns active records oldest-to-newest, followed by at most ten newest
 	/// terminal records.
-	#[must_use]
 	pub fn ordered_records(&self) -> Vec<&ProcessRecord> {
 		let mut active = Vec::new();
 		let mut terminal = Vec::new();
@@ -171,7 +169,6 @@ pub struct ProcessStore {
 
 impl ProcessStore {
 	/// Returns the directory containing all named-process runtime state.
-	#[must_use]
 	pub fn process_root(&self) -> PathBuf {
 		self
 			.path
@@ -181,7 +178,6 @@ impl ProcessStore {
 	}
 
 	/// Uses `path` as the complete versioned metadata file.
-	#[must_use]
 	pub fn new(path: impl Into<PathBuf>) -> Self {
 		Self { path: path.into() }
 	}

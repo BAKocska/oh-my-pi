@@ -229,7 +229,6 @@ impl ProductionDependencies {
 	}
 
 	/// Installs application-composed provider console usage backends.
-	#[must_use]
 	pub fn with_usage_manager(
 		mut self,
 		manager: crate::operation::usage::ConsoleUsageManager,
@@ -240,7 +239,6 @@ impl ProductionDependencies {
 
 	/// Installs the immutable runtime settings projection used by every route
 	/// stack.
-	#[must_use]
 	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
 		self.provider_admission = Arc::new(
 			settings

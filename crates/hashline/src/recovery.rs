@@ -26,19 +26,16 @@ impl ByteRange {
 	}
 
 	/// Returns the inclusive start byte offset.
-	#[must_use]
 	pub const fn start(self) -> u64 {
 		self.start
 	}
 
 	/// Returns the exclusive end byte offset.
-	#[must_use]
 	pub const fn end(self) -> u64 {
 		self.end
 	}
 
 	/// Returns whether this range contains no bytes.
-	#[must_use]
 	pub const fn is_empty(self) -> bool {
 		self.start == self.end
 	}
@@ -53,19 +50,16 @@ pub struct RecoveryEdit {
 
 impl RecoveryEdit {
 	/// Creates a base-coordinate exact-byte replacement.
-	#[must_use]
 	pub const fn new(range: ByteRange, replacement: Bytes) -> Self {
 		Self { range, replacement }
 	}
 
 	/// Returns the retained-base byte range.
-	#[must_use]
 	pub const fn range(&self) -> ByteRange {
 		self.range
 	}
 
 	/// Returns the exact replacement bytes.
-	#[must_use]
 	pub const fn replacement(&self) -> &Bytes {
 		&self.replacement
 	}
@@ -80,13 +74,11 @@ pub struct ExactByteEdit {
 
 impl ExactByteEdit {
 	/// Returns the live-coordinate byte range.
-	#[must_use]
 	pub const fn range(&self) -> ByteRange {
 		self.range
 	}
 
 	/// Returns the exact replacement bytes.
-	#[must_use]
 	pub const fn replacement(&self) -> &Bytes {
 		&self.replacement
 	}
@@ -101,13 +93,11 @@ pub struct LineRange {
 
 impl LineRange {
 	/// Returns the first one-indexed line.
-	#[must_use]
 	pub const fn start(self) -> usize {
 		self.start
 	}
 
 	/// Returns the last one-indexed line.
-	#[must_use]
 	pub const fn end(self) -> usize {
 		self.end
 	}
@@ -125,31 +115,26 @@ pub struct RecoveredEdit {
 
 impl RecoveredEdit {
 	/// Returns the authored retained-base byte range.
-	#[must_use]
 	pub const fn original_range(&self) -> ByteRange {
 		self.original_range
 	}
 
 	/// Returns the relocated live pre-edit byte range.
-	#[must_use]
 	pub const fn current_range(&self) -> ByteRange {
 		self.current_range
 	}
 
 	/// Returns the replacement's post-edit byte range.
-	#[must_use]
 	pub const fn final_range(&self) -> ByteRange {
 		self.final_range
 	}
 
 	/// Returns the retained-base logical lines used as anchors.
-	#[must_use]
 	pub const fn original_lines(&self) -> LineRange {
 		self.original_lines
 	}
 
 	/// Returns the uniquely mapped live logical lines.
-	#[must_use]
 	pub const fn current_lines(&self) -> LineRange {
 		self.current_lines
 	}
@@ -164,13 +149,11 @@ pub struct LineMapping {
 
 impl LineMapping {
 	/// Returns the retained-base one-indexed line.
-	#[must_use]
 	pub const fn original(self) -> usize {
 		self.original
 	}
 
 	/// Returns the live one-indexed line.
-	#[must_use]
 	pub const fn current(self) -> usize {
 		self.current
 	}
@@ -189,31 +172,26 @@ pub struct RecoveryResult {
 impl RecoveryResult {
 	/// Returns the exact finalized bytes, preserving untouched BOM and newline
 	/// bytes.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Returns canonical live-coordinate edits producing `content`.
-	#[must_use]
 	pub fn canonical_edits(&self) -> &[ExactByteEdit] {
 		&self.canonical_edits
 	}
 
 	/// Returns authored original/live/final coordinate provenance.
-	#[must_use]
 	pub fn recovered_edits(&self) -> &[RecoveredEdit] {
 		&self.recovered_edits
 	}
 
 	/// Returns changed byte ranges in finalized-output coordinates.
-	#[must_use]
 	pub fn changed_ranges(&self) -> &[ByteRange] {
 		&self.changed_ranges
 	}
 
 	/// Returns every validated retained-to-live line mapping used by recovery.
-	#[must_use]
 	pub fn line_mappings(&self) -> &[LineMapping] {
 		&self.line_mappings
 	}
@@ -306,7 +284,6 @@ pub enum RecoveryError {
 
 impl RecoveryError {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}

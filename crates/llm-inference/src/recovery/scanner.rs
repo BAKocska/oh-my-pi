@@ -23,7 +23,6 @@ impl Default for Utf8Scanner {
 
 impl Utf8Scanner {
 	/// Creates a validator with explicit retained-tail and diagnostic bounds.
-	#[must_use]
 	pub fn new(max_pending: usize, diagnostic_bytes: usize) -> Self {
 		Self {
 			pending: BytesMut::with_capacity(max_pending.min(UTF8_TAIL)),
@@ -132,7 +131,6 @@ pub struct TagScanner {
 
 impl TagScanner {
 	/// Creates a scanner for catalog-selected delimiters.
-	#[must_use]
 	pub fn new(delimiters: &'static [Delimiter], max_block_bytes: usize) -> Self {
 		assert!(
 			delimiters
@@ -149,7 +147,6 @@ impl TagScanner {
 	}
 
 	/// Returns a monotonic work counter useful for enforcing amortization tests.
-	#[must_use]
 	pub const fn bytes_examined(&self) -> u64 {
 		self.bytes_examined
 	}

@@ -7,7 +7,6 @@ use omp_core::Str;
 use super::types::{Assignment, Diagnostic, FileIssues, Severity};
 
 /// Groups diagnostics by file and calculates pi's severity/detail weight.
-#[must_use]
 pub fn group_by_file(diagnostics: &[Diagnostic]) -> Vec<FileIssues> {
 	let mut grouped = BTreeMap::<Option<Str>, Vec<Diagnostic>>::new();
 	for diagnostic in diagnostics {
@@ -47,7 +46,6 @@ fn weight(diagnostic: &Diagnostic) -> u64 {
 }
 
 /// LPT-packs file-disjoint groups into at most `agents` assignments.
-#[must_use]
 pub fn pack(groups: Vec<FileIssues>, agents: usize) -> Vec<Assignment> {
 	if groups.is_empty() || agents == 0 {
 		return Vec::new();

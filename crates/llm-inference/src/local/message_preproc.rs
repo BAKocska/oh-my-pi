@@ -14,7 +14,6 @@ static HASH: LazyLock<Regex> =
 
 /// Removes ANSI styles, paired tag envelopes, fenced code, and long hashes,
 /// then middle-truncates while preserving twice as much leading context.
-#[must_use]
 pub fn preprocess_tiny_message(message: &str) -> Str {
 	let without_ansi = ANSI.replace_all(message, "");
 	let without_tags = strip_paired_tags(&without_ansi);
@@ -33,7 +32,6 @@ pub fn preprocess_tiny_message(message: &str) -> Str {
 }
 
 /// Formats one cleaned user message in the structural title envelope.
-#[must_use]
 pub fn format_title_user_message(message: &str) -> Str {
 	if is_preformatted_chat_context(message) {
 		return Str::from(message);
@@ -52,7 +50,6 @@ pub struct TitleConversationTurn<'a> {
 }
 
 /// Formats recent cleaned turns as one bounded structural chat context.
-#[must_use]
 pub fn format_title_conversation_context(turns: &[TitleConversationTurn<'_>]) -> Str {
 	let mut output = String::from("<chat>");
 	for turn in turns {
@@ -73,14 +70,12 @@ pub fn format_title_conversation_context(turns: &[TitleConversationTurn<'_>]) ->
 }
 
 /// Whether a message is already a full structural chat context.
-#[must_use]
 pub fn is_preformatted_chat_context(message: &str) -> bool {
 	let trimmed = message.trim();
 	trimmed.starts_with("<chat>") && trimmed.ends_with("</chat>")
 }
 
 /// Removes structural chat tags while retaining their text for signal checks.
-#[must_use]
 pub fn strip_chat_scaffolding(message: &str) -> String {
 	["chat", "user", "assistant", "think"]
 		.into_iter()

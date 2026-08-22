@@ -12,13 +12,11 @@ pub const CODEC_ID: &str = "search-brave";
 pub struct BraveSearchCodec;
 impl BraveSearchCodec {
 	/// Creates the codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}
 
 	/// Returns its stable identifier.
-	#[must_use]
 	pub const fn id(self) -> &'static str {
 		CODEC_ID
 	}

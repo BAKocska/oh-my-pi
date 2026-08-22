@@ -59,7 +59,6 @@ impl Default for SpeakableStream {
 
 impl SpeakableStream {
 	/// Creates an empty stream.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self {
 			mode:          BlockMode::LineStart,
@@ -327,7 +326,6 @@ fn is_rule(line: &str) -> bool {
 }
 
 /// Normalizes one complete Markdown fragment without segmenting it.
-#[must_use]
 pub fn normalize_speakable(raw: &str) -> String {
 	let value = IMAGE.replace_all(raw, "$1");
 	let value = LINK.replace_all(&value, "$1");

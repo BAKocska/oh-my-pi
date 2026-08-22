@@ -20,19 +20,16 @@ pub struct TrackedText {
 
 impl TrackedText {
 	/// Creates a tracked input whose bytes all originate with the caller.
-	#[must_use]
 	pub fn input(text: &str) -> Self {
 		Self { text: text.to_owned(), origin: vec![Origin::Input; text.len()] }
 	}
 
 	/// Returns the transformed text.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		&self.text
 	}
 
 	/// Returns the origin tags over a byte range.
-	#[must_use]
 	pub fn origins(&self, range: Range<usize>) -> &[Origin] {
 		&self.origin[range]
 	}
@@ -58,7 +55,6 @@ impl TrackedText {
 	}
 
 	/// Consumes this value and returns its text.
-	#[must_use]
 	pub fn into_string(self) -> String {
 		self.text
 	}

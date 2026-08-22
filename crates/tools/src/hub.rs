@@ -249,7 +249,6 @@ pub struct HubRouter<B> {
 
 impl<B> HubRouter<B> {
 	/// Creates an empty owner router.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { backends: DashMap::new() }
 	}
@@ -265,7 +264,6 @@ impl<B> HubRouter<B> {
 	}
 
 	/// Returns whether an owner currently has a routed composition.
-	#[must_use]
 	pub fn contains(&self, owner: &str) -> bool {
 		self.backends.contains_key(owner)
 	}

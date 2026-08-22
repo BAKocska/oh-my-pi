@@ -64,7 +64,6 @@ impl ManagedSkillCandidate {
 	}
 
 	/// Serializes the complete bounded `SKILL.md` file.
-	#[must_use]
 	pub fn serialize(&self) -> Str {
 		let mut output = StrMut::with_capacity(self.serialized_len());
 		output.push_str("---\nname: ");
@@ -100,7 +99,6 @@ impl ManagedSkillCandidate {
 
 /// Returns whether an on-disk managed name has the exact post-normalization
 /// shape.
-#[must_use]
 pub fn is_valid_name(name: &str) -> bool {
 	let bytes = name.as_bytes();
 	(1..=MAX_NAME_BYTES).contains(&bytes.len())
@@ -112,7 +110,6 @@ pub fn is_valid_name(name: &str) -> bool {
 
 /// Neutralizes persisted generated descriptions before writing and every prompt
 /// render.
-#[must_use]
 pub fn sanitize_description(raw: &str) -> Str {
 	let mut output = StrMut::with_capacity(raw.len().min(240));
 	let mut whitespace = true;

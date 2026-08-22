@@ -527,7 +527,6 @@ pub struct LanguageIds {
 ///
 /// `.env` and `.env.*` are presentation-only text formats and therefore do
 /// not pretend to have an AST parser.
-#[must_use]
 pub fn language_ids_from_path(path: &Path) -> Option<LanguageIds> {
 	let name = path.file_name()?.to_str()?;
 	if name.eq_ignore_ascii_case(".env")
@@ -542,13 +541,11 @@ pub fn language_ids_from_path(path: &Path) -> Option<LanguageIds> {
 }
 
 /// Returns the syntax-highlighter identifier inferred from `path`.
-#[must_use]
 pub fn highlight_language_id(path: &Path) -> Option<&'static str> {
 	language_ids_from_path(path).map(|ids| ids.highlight)
 }
 
 /// Returns the LSP language identifier, falling back to `plaintext`.
-#[must_use]
 pub fn lsp_language_id(path: &Path) -> &'static str {
 	language_ids_from_path(path).map_or("plaintext", |ids| ids.lsp)
 }

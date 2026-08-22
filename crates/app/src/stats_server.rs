@@ -92,7 +92,6 @@ pub struct RunningServer {
 
 impl RunningServer {
 	/// Bound address, including the selected ephemeral port.
-	#[must_use]
 	pub const fn address(&self) -> SocketAddr {
 		self.address
 	}

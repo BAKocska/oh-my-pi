@@ -34,7 +34,6 @@ pub const API_PROVIDER_LADDER: [SearchCredentialMode; 3] =
 	[SearchCredentialMode::Oauth, SearchCredentialMode::ApiKey, SearchCredentialMode::BorrowedToken];
 
 /// Selects the first available mode without exposing credential values.
-#[must_use]
 pub fn select_search_credential(
 	ladder: &[SearchCredentialMode],
 	mut available: impl FnMut(SearchCredentialMode) -> bool,
@@ -44,7 +43,6 @@ pub fn select_search_credential(
 
 /// Whether a provider is eligible for automatic fallback. Anonymous and
 /// keyless modes remain explicit-only unless the provider opts into auto.
-#[must_use]
 pub fn automatically_available(
 	selected: Option<SearchCredentialMode>,
 	allow_anonymous: bool,

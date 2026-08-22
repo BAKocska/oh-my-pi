@@ -414,62 +414,53 @@ impl Error {
 	}
 
 	/// Attaches the provider involved in the failed execution.
-	#[must_use]
 	pub fn provider(mut self, provider: ProviderId) -> Self {
 		self.provider = Some(Box::new(provider));
 		self
 	}
 
 	/// Attaches the route involved in the failed execution.
-	#[must_use]
 	pub fn route(mut self, route: RouteId) -> Self {
 		self.route = Some(Box::new(route));
 		self
 	}
 
 	/// Attaches the logical request identity.
-	#[must_use]
 	pub fn request_id(mut self, request_id: RequestId) -> Self {
 		self.request_id = Some(Box::new(request_id));
 		self
 	}
 
 	/// Attaches an HTTP-like status when available.
-	#[must_use]
 	pub const fn status(mut self, status: Option<u16>) -> Self {
 		self.status = status;
 		self
 	}
 
 	/// Attaches a structured provider or runtime error code.
-	#[must_use]
 	pub fn code(mut self, code: Str) -> Self {
 		self.code = Some(code);
 		self
 	}
 
 	/// Attaches an optional structured provider or runtime error code.
-	#[must_use]
 	pub fn optional_code(mut self, code: Option<Str>) -> Self {
 		self.code = code;
 		self
 	}
 
 	/// Marks whether ordinary output had become visible.
-	#[must_use]
 	pub const fn committed(mut self, committed: bool) -> Self {
 		self.committed = committed;
 		self
 	}
 
 	/// Attaches typed supplemental evidence.
-	#[must_use]
 	pub fn detail(mut self, detail: ErrorDetail) -> Self {
 		self.evidence.detail = Some(detail);
 		self
 	}
 
-	#[must_use]
 	pub(crate) fn typed_source(mut self, source: MediaOperationError) -> Self {
 		self.evidence.source = Some(source);
 		self
@@ -524,7 +515,6 @@ impl std::error::Error for Error {
 }
 
 /// Classifies one failed search attempt without retaining provider body text.
-#[must_use]
 pub fn search_provider_failure(error: &Error) -> SearchProviderFailure {
 	let kind = match (error.status, error.kind) {
 		(Some(401 | 403), _) | (_, ErrorKind::Authentication | ErrorKind::Authorization) => {

@@ -30,7 +30,6 @@ pub struct TruncatedText<'a> {
 /// The returned prefix always ends on a grapheme boundary. When truncation is
 /// necessary and at least one cell is available, one cell is reserved for an
 /// ellipsis that the caller paints as a separate span.
-#[must_use]
 pub fn truncate_to_width(text: &str, max_width: u16) -> TruncatedText<'_> {
 	let max_width = usize::from(max_width);
 	let prefix_limit = max_width.saturating_sub(1);

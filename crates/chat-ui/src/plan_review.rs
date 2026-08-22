@@ -33,7 +33,6 @@ pub struct PlanReviewAnnotations {
 
 impl PlanReviewAnnotations {
 	/// Renders feedback into one deterministic model-visible refinement prompt.
-	#[must_use]
 	pub fn prompt(&self, sections: &[PlanReviewSection]) -> Str {
 		let mut output = String::from("Revise the approved plan using this review feedback:");
 		if !self.overall.trim().is_empty() {
@@ -85,7 +84,6 @@ pub struct PlanReviewOverlay {
 
 impl PlanReviewOverlay {
 	/// Parses markdown and opens a full-height review overlay.
-	#[must_use]
 	pub fn open(plan: &str, annotations: PlanReviewAnnotations, ctx: &UiContext) -> Self {
 		let sections = split_plan_sections(plan);
 		let width = 96;
@@ -165,7 +163,6 @@ impl PlanReviewOverlay {
 	}
 
 	/// Borrows parsed sections in TOC order.
-	#[must_use]
 	pub fn sections(&self) -> &[PlanReviewSection] {
 		&self.sections
 	}
@@ -279,7 +276,6 @@ fn build_review(
 }
 
 /// Splits a Markdown plan into reviewable heading segments.
-#[must_use]
 pub fn split_plan_sections(plan: &str) -> Vec<PlanReviewSection> {
 	let mut starts = Vec::<(usize, u8, Str)>::new();
 	for (offset, line) in line_offsets(plan) {

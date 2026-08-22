@@ -3739,7 +3739,6 @@ pub mod matchers {
 			self.should_skip_dir = true;
 		}
 
-		#[must_use]
 		pub fn should_skip_current_dir(&self) -> bool {
 			self.should_skip_dir
 		}
@@ -3748,7 +3747,6 @@ pub mod matchers {
 			self.exit_code = code;
 		}
 
-		#[must_use]
 		pub fn exit_code(&self) -> i32 {
 			self.exit_code
 		}
@@ -3757,12 +3755,10 @@ pub mod matchers {
 			self.quit = true;
 		}
 
-		#[must_use]
 		pub fn should_quit(&self) -> bool {
 			self.quit
 		}
 
-		#[must_use]
 		pub fn now(&self) -> SystemTime {
 			self.deps.now()
 		}
@@ -4676,7 +4672,6 @@ struct StandardDependencies {
 }
 
 impl StandardDependencies {
-	#[must_use]
 	fn new(host: &Host) -> Self {
 		Self { output: Rc::new(RefCell::new(host.stdout_clone())), now: SystemTime::now() }
 	}

@@ -51,7 +51,6 @@ pub struct EditorConfigOptions {
 ///
 /// Section matching and ancestor precedence remain with the caller so this
 /// parser never reads the ambient filesystem.
-#[must_use]
 pub fn parse_editorconfig_section(section: &str) -> EditorConfigOptions {
 	let mut options = EditorConfigOptions::default();
 	for raw in section.lines() {
@@ -90,7 +89,6 @@ fn boolean(value: &str) -> Option<bool> {
 }
 
 /// Resolves EditorConfig over indentation sniffing over the two-space fallback.
-#[must_use]
 pub fn resolve(content: &str, editorconfig: Option<EditorConfigOptions>) -> FormatOptions {
 	let sniffed = sniff_indent(content);
 	let config = editorconfig.unwrap_or_default();
@@ -143,7 +141,6 @@ const fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
 }
 
 /// Applies resolved whitespace/newline flags after a formatter returns.
-#[must_use]
 pub fn enforce(content: &str, options: FormatOptions) -> Str {
 	let mut output = String::with_capacity(content.len().saturating_add(1));
 	for segment in content.split_inclusive('\n') {

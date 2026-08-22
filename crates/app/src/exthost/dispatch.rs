@@ -365,7 +365,6 @@ pub enum DispatchError {
 
 impl DispatchRouter {
 	/// Creates a router for one authenticated child generation.
-	#[must_use]
 	pub fn new(host: HostKey, generation: u64) -> Self {
 		Self {
 			host,
@@ -524,7 +523,6 @@ impl DispatchRouter {
 	}
 
 	/// Returns the authenticated host identity.
-	#[must_use]
 	pub const fn host(&self) -> &HostKey {
 		&self.host
 	}

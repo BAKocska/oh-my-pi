@@ -537,7 +537,6 @@ impl Default for FamilyServiceTierPolicy {
 
 impl FamilyServiceTierPolicy {
 	/// Resolves one concrete tier before canonical intent negotiation.
-	#[must_use]
 	pub fn resolve(
 		&self,
 		family: ProviderFamily,
@@ -568,7 +567,6 @@ impl FamilyServiceTierPolicy {
 
 impl ServiceTier {
 	/// Validates and constructs a family-defined wire tier.
-	#[must_use]
 	pub fn for_family(family: ProviderFamily, name: &str) -> Option<Self> {
 		let priority = match (family, name) {
 			(ProviderFamily::OpenAi, "auto" | "default") => 0,

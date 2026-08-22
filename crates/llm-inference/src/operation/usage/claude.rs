@@ -48,7 +48,6 @@ pub struct ClaudeUsageFetcher {
 
 impl ClaudeUsageFetcher {
 	/// Constructs a fetcher over the application's shared bounded HTTP client.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}
@@ -78,7 +77,6 @@ impl ConsoleUsageFetcher for ClaudeUsageFetcher {
 }
 
 /// Normalizes an Anthropic API or OAuth URL to the Claude OAuth account API.
-#[must_use]
 pub fn normalize_claude_base_url(base_url: Option<&str>) -> Str {
 	let Some(trimmed) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
 		return sf!(DEFAULT_ENDPOINT);

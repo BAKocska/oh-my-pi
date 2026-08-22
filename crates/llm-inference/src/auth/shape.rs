@@ -39,7 +39,6 @@ pub enum ProviderShaper {
 
 impl ProviderShaper {
 	/// Provider whose credentials this shaper rewrites.
-	#[must_use]
 	pub fn provider(&self) -> &ProviderId<str> {
 		match self {
 			Self::GithubCopilot(shaper) => shaper.provider(),
@@ -81,7 +80,6 @@ pub struct CredentialShaperRegistry {
 
 impl CredentialShaperRegistry {
 	/// Creates an empty credential-shaper registry.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { shapers: HashMap::new() }
 	}
@@ -97,7 +95,6 @@ impl CredentialShaperRegistry {
 	}
 
 	/// Returns the shaper registered for `provider`, if any.
-	#[must_use]
 	pub fn get(&self, provider: &ProviderId<str>) -> Option<&ProviderShaper> {
 		self.shapers.get(provider)
 	}

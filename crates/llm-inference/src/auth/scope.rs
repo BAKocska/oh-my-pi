@@ -13,13 +13,11 @@ pub struct CredentialScope {
 
 impl CredentialScope {
 	/// Builds a scope from manifest `credentials.*` provider globs.
-	#[must_use]
 	pub const fn new(allow: Arc<[Str]>) -> Self {
 		Self { allow }
 	}
 
 	/// Returns whether a provider identifier is permitted by this scope.
-	#[must_use]
 	pub fn allows(&self, provider: &str) -> bool {
 		self
 			.allow

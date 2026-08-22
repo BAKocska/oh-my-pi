@@ -57,7 +57,6 @@ pub enum HeaderValueSource {
 impl ProviderConfig {
 	/// Classifies configured headers without resolving or copying secret
 	/// material into the catalog.
-	#[must_use]
 	pub fn header_sources(&self) -> Vec<(Str, HeaderValueSource)> {
 		self
 			.headers

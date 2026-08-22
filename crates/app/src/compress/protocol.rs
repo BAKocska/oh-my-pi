@@ -37,7 +37,6 @@ pub struct Protocol {
 
 impl Protocol {
 	/// Creates a ledger for `source`.
-	#[must_use]
 	pub fn new(source: &str) -> Self {
 		Self {
 			source_words:  words(source),
@@ -105,37 +104,31 @@ impl Protocol {
 	}
 
 	/// Newest draft.
-	#[must_use]
 	pub fn latest(&self) -> Option<&Draft> {
 		self.drafts.last()
 	}
 
 	/// Whether a separately reviewed draft is accepted.
-	#[must_use]
 	pub const fn approved(&self) -> bool {
 		self.approved
 	}
 
 	/// Approval verdict.
-	#[must_use]
 	pub fn verdict(&self) -> Option<&str> {
 		self.verdict.as_deref()
 	}
 
 	/// Number of submitted drafts.
-	#[must_use]
 	pub fn rounds(&self) -> u32 {
 		self.drafts.len().try_into().unwrap_or(u32::MAX)
 	}
 
 	/// Estimated source token count.
-	#[must_use]
 	pub const fn source_tokens(&self) -> usize {
 		self.source_tokens
 	}
 
 	/// Source/draft word and token delta.
-	#[must_use]
 	pub fn metrics(&self, draft: &Draft) -> Metrics {
 		let draft_tokens = estimate_tokens(draft.text.as_str());
 		Metrics {
@@ -170,7 +163,6 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 /// Exactly the two advertised tool schemas.
-#[must_use]
 pub fn tool_schemas() -> [(&'static str, serde_json::Value); 2] {
 	[
 		(

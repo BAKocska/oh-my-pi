@@ -12,19 +12,16 @@ pub struct PkceMaterial {
 
 impl PkceMaterial {
 	/// Borrows the public S256 challenge.
-	#[must_use]
 	pub fn challenge(&self) -> &str {
 		self.challenge.as_str()
 	}
 
 	/// Borrows the public authorization state.
-	#[must_use]
 	pub fn state(&self) -> &str {
 		self.state.as_str()
 	}
 
 	/// Consumes the material, retaining the verifier as a secret.
-	#[must_use]
 	pub fn into_parts(self) -> (SecretString, Str, Str) {
 		(self.verifier, self.challenge, self.state)
 	}

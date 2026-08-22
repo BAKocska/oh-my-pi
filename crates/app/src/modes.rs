@@ -54,7 +54,6 @@ pub struct ProtocolDefaults {
 
 impl StartupMode {
 	/// Returns invocation-local defaults for this mode.
-	#[must_use]
 	pub const fn defaults(self) -> ProtocolDefaults {
 		match self {
 			Self::Interactive => ProtocolDefaults {
@@ -158,7 +157,6 @@ pub struct GoalUsage {
 
 impl GoalUsage {
 	/// Returns budget spend while excluding reused cached input.
-	#[must_use]
 	pub const fn charged_tokens(self) -> u64 {
 		self
 			.input_tokens
@@ -275,7 +273,6 @@ impl PromptSource for ModeAwarePromptSource {
 
 impl ExecutionModes {
 	/// Creates a mode authority whose invocation metadata is enforced env-side.
-	#[must_use]
 	pub fn new(handle: ExecutionModeHandle) -> Self {
 		Self {
 			state: Arc::new(Mutex::new(ModeState::default())),
@@ -288,7 +285,6 @@ impl ExecutionModes {
 	}
 
 	/// Restores the latest journal-folded autonomous state.
-	#[must_use]
 	pub fn from_projection(handle: ExecutionModeHandle, projection: ModeProjection) -> Self {
 		let modes = Self::new(handle);
 		{
@@ -325,7 +321,6 @@ impl ExecutionModes {
 	}
 
 	/// Returns the projection to append after every lifecycle mutation.
-	#[must_use]
 	pub fn projection(&self) -> ModeProjection {
 		let state = self.state.lock();
 		ModeProjection { plan: state.plan_seen.then(|| state.plan.clone()), goal: state.goal.clone() }
@@ -370,7 +365,6 @@ impl ExecutionModes {
 	}
 
 	/// Applies the newest queued plan transition at settlement.
-	#[must_use]
 	pub fn settle_plan_transition(&self) -> PlanModelTransition {
 		self
 			.plan_binding
@@ -382,7 +376,6 @@ impl ExecutionModes {
 	}
 
 	/// Returns the active mode, reconciling one-way prewalk/yolo transitions.
-	#[must_use]
 	pub fn active(&self) -> ActiveMode {
 		let effective = match self.handle.get() {
 			ExecutionMode::Standard => ActiveMode::Standard,
@@ -438,7 +431,6 @@ impl ExecutionModes {
 	}
 
 	/// Returns the durable plan projection.
-	#[must_use]
 	pub fn plan(&self) -> Option<PlanState> {
 		let state = self.state.lock();
 		state.plan_seen.then(|| state.plan.clone())
@@ -476,7 +468,6 @@ impl ExecutionModes {
 	}
 
 	/// Maps the active runtime mode onto the built-in prompt vocabulary.
-	#[must_use]
 	pub fn prompt_mode(&self) -> Option<PromptMode> {
 		match self.active() {
 			ActiveMode::Standard => None,
@@ -488,7 +479,6 @@ impl ExecutionModes {
 	}
 
 	/// Wraps an existing prompt source with the active mode `SlotSource`.
-	#[must_use]
 	pub fn prompt_source(&self, base: Arc<dyn PromptSource>) -> Arc<dyn PromptSource> {
 		Arc::new(ModeAwarePromptSource { base, modes: self.clone() })
 	}
@@ -569,7 +559,6 @@ impl ExecutionModes {
 	}
 
 	/// Returns the latest goal projection.
-	#[must_use]
 	pub fn goal(&self) -> Option<Goal> {
 		self.state.lock().goal.clone()
 	}
@@ -580,7 +569,6 @@ impl ExecutionModes {
 	}
 
 	/// Returns the current goal todo context.
-	#[must_use]
 	pub fn goal_todo_context(&self) -> Option<Str> {
 		self.state.lock().goal_todo_context.clone()
 	}
@@ -761,7 +749,6 @@ impl ExecutionModes {
 	}
 
 	/// Produces the settled-boundary goal decision using Core loop evidence.
-	#[must_use]
 	pub fn goal_continuation(&self, signal: &LoopSignal, now_ms: u64) -> Continuation {
 		let mut state = self.state.lock();
 		let Some(goal) = state.goal.clone() else {
@@ -803,7 +790,6 @@ impl ExecutionModes {
 	}
 
 	/// Returns the owner policy applied to goal continuations.
-	#[must_use]
 	pub const fn continuation_policy(&self) -> ContinuationPolicy {
 		self.policy
 	}

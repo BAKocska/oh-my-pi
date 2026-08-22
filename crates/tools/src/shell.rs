@@ -39,7 +39,6 @@ fn omit_schema_format(schema: &mut schemars::Schema) {
 ///
 /// Each segment retains original spelling and identifies whether it consumes
 /// the preceding pipeline stage.
-#[must_use]
 pub fn command_segments(
 	command: &str,
 ) -> Vec<omp_shell_engine::parser::FlatShellCommandSegment<'_>> {
@@ -539,7 +538,6 @@ pub fn shell_with_timeout_bounds<E: ShellExec>(
 
 impl<E: ShellExec> ShellTool<E> {
 	/// Overrides the finite timeout bounds supplied by the execution placement.
-	#[must_use]
 	pub const fn with_timeout_bounds(mut self, timeout_bounds: TimeoutBounds) -> Self {
 		self.timeout_bounds = timeout_bounds;
 		self
@@ -547,7 +545,6 @@ impl<E: ShellExec> ShellTool<E> {
 
 	/// Applies automatic foreground detachment policy from the owning settings
 	/// snapshot.
-	#[must_use]
 	pub const fn with_auto_background(mut self, enabled: bool, threshold: Duration) -> Self {
 		self.auto_background_enabled = enabled;
 		self.auto_background_threshold = threshold;

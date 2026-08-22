@@ -41,7 +41,6 @@ pub struct RuntimePromptMemorySource {
 
 impl RuntimePromptMemorySource {
 	/// Creates a source sharing one active runtime.
-	#[must_use]
 	pub fn new(runtime: Arc<MemoryRuntime>, token_budget: usize) -> Self {
 		Self { runtime, token_budget, request: RwLock::new(PromptMemoryRequest::default()) }
 	}
@@ -85,7 +84,6 @@ pub struct ReflectionBridgeHost {
 
 impl ReflectionBridgeHost {
 	/// Creates an unbound bridge for immutable registry construction.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { host: OnceLock::new() }
 	}
@@ -128,6 +126,7 @@ impl std::fmt::Debug for ReflectionBridgeHost {
 /// Registered top-level memory runtime. Dropping it removes only the
 /// contextless URL lookup; existing parent/subagent handles keep their shared
 /// banks alive.
+#[must_use]
 pub struct RegisteredMemoryRuntime {
 	session_id: Str,
 	runtime:    Arc<MemoryRuntime>,
@@ -135,13 +134,11 @@ pub struct RegisteredMemoryRuntime {
 
 impl RegisteredMemoryRuntime {
 	/// Borrows the live Off/Mnemopi runtime.
-	#[must_use]
 	pub const fn runtime(&self) -> &Arc<MemoryRuntime> {
 		&self.runtime
 	}
 
 	/// Creates the top-level lifecycle handle shared with subagents.
-	#[must_use]
 	pub fn session(&self) -> SessionMemory {
 		SessionMemory::top_level(Arc::clone(&self.runtime))
 	}
@@ -211,7 +208,6 @@ pub struct InferenceExtractionLane<C> {
 impl<C> InferenceExtractionLane<C> {
 	/// Resolves the configured memory lane to the app's canonical inference
 	/// model selector. `None` mode advertises no lane.
-	#[must_use]
 	pub fn from_settings(
 		client: C,
 		mut params: ChatParams,
@@ -230,7 +226,6 @@ impl<C> InferenceExtractionLane<C> {
 	}
 
 	/// Creates a lane from an app-resolved model selector.
-	#[must_use]
 	pub fn with_selector(client: C, mut params: ChatParams, selector: &str) -> Self {
 		params.tools.clear();
 		params.tool_choice = None;

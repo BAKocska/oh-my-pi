@@ -89,17 +89,16 @@ pub struct PendingIssue {
 
 /// A cancellation guard for a core-side query.
 #[derive(Clone, Debug, Default)]
+#[must_use]
 pub struct QueryGuard(Arc<AtomicBool>);
 
 impl QueryGuard {
 	/// Creates an uncancelled query guard.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Returns whether query work should stop.
-	#[must_use]
 	pub fn cancelled(&self) -> bool {
 		self.0.load(Ordering::Relaxed)
 	}
@@ -311,13 +310,11 @@ impl TelemetryIndex {
 	}
 
 	/// Returns the current byte-offset watermark of `telemetry.bin`.
-	#[must_use]
 	pub fn watermark(&self) -> TelemetryWatermark {
 		TelemetryWatermark(self.next_offset.load(Ordering::Acquire))
 	}
 
 	/// Returns the session side-file path.
-	#[must_use]
 	pub fn side_path(&self) -> &Path {
 		&self.side_path
 	}

@@ -9,7 +9,6 @@ unsafe extern "C" {
 }
 
 /// Returns `CPython`'s identifier for the attached current thread.
-#[must_use]
 pub fn current_thread_id() -> u64 {
 	// SAFETY: callers use this only while their thread is attached to CPython.
 	unsafe { PyThread_get_thread_ident() as u64 }
@@ -21,7 +20,6 @@ pub fn current_thread_id() -> u64 {
 /// Returns `true` only when `CPython` selected exactly one thread state.
 /// `CPython`'s documented recovery for an ambiguous selection is performed
 /// before returning.
-#[must_use]
 pub fn interrupt(_py: Python<'_>, thread_id: u64) -> bool {
 	let Ok(id) = c_long::try_from(thread_id) else {
 		return false;

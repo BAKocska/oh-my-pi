@@ -65,6 +65,7 @@ struct Selected<'a> {
 	artifact:  &'a IndexArtifact,
 }
 
+#[must_use]
 struct UpdateLock(PathBuf);
 
 impl Drop for UpdateLock {
@@ -168,7 +169,6 @@ pub fn registry(args: RegistryArgs) -> miette::Result<()> {
 ///
 /// This path is intentionally read-only: it does not download artifacts,
 /// mutate TOFU pins, refresh extension indexes, or write a seen marker.
-#[must_use]
 pub fn startup_available() -> Option<Str> {
 	let (index, _) = load_index(None, None).ok()?;
 	let target = platform_target();

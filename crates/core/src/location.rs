@@ -63,7 +63,6 @@ macro_rules! path_type {
 			}
 
 			/// Returns the path spelling without allocating.
-			#[must_use]
 			pub fn as_str(&self) -> &str {
 				self.0.as_str()
 			}
@@ -160,25 +159,21 @@ impl ToolPath {
 	}
 
 	/// Returns the canonical path spelling without allocating.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.text.as_str()
 	}
 
 	/// Returns the root device name.
-	#[must_use]
 	pub fn name(&self) -> &str {
 		&self.as_str()[..usize::from(self.name_end)]
 	}
 
 	/// Returns the optional sub-tool name.
-	#[must_use]
 	pub fn sub(&self) -> Option<&str> {
 		self.range(self.sub_start, self.sub_end)
 	}
 
 	/// Returns the optional `publisher/extension` claimant.
-	#[must_use]
 	pub fn claimant(&self) -> Option<&str> {
 		if self.claimant_start == NO_OFFSET {
 			None
@@ -188,7 +183,6 @@ impl ToolPath {
 	}
 
 	/// Returns the claimant's publisher component when qualified.
-	#[must_use]
 	pub fn publisher(&self) -> Option<&str> {
 		if self.claimant_start == NO_OFFSET {
 			None
@@ -200,7 +194,6 @@ impl ToolPath {
 	}
 
 	/// Returns the claimant's extension component when qualified.
-	#[must_use]
 	pub fn extension(&self) -> Option<&str> {
 		if self.extension_start == NO_OFFSET {
 			None
@@ -275,38 +268,32 @@ impl ArtifactUrl {
 	}
 
 	/// Creates a canonical session-local artifact URL.
-	#[must_use]
 	pub fn from_ordinal(ordinal: u64) -> Self {
 		Self(Str::from(format!("artifact://{ordinal}")))
 	}
 
 	/// Creates a canonical durable artifact URL from a BLAKE3-256 digest.
-	#[must_use]
 	pub fn from_digest(digest: [u8; 32]) -> Self {
 		Self(Str::from(format!("artifact://b3/{}", crate::hex::encode(&digest))))
 	}
 
 	/// Returns the complete wire-form URL without allocating.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}
 
 	/// Returns the canonical resource component with its selector removed.
-	#[must_use]
 	pub fn resource(&self) -> &str {
 		let resource = self.after_scheme();
 		resource.split_once(':').map_or(resource, |parts| parts.0)
 	}
 
 	/// Returns the optional trailing selector without its `:` delimiter.
-	#[must_use]
 	pub fn selector(&self) -> Option<&str> {
 		self.after_scheme().split_once(':').map(|parts| parts.1)
 	}
 
 	/// Returns the parsed canonical artifact address.
-	#[must_use]
 	pub fn address(&self) -> ArtifactAddress<'_> {
 		if let Some(digest) = self.resource().strip_prefix("b3/") {
 			ArtifactAddress::Digest(digest)
@@ -321,7 +308,6 @@ impl ArtifactUrl {
 	}
 
 	/// Returns the session-local ordinal, or [`None`] for a durable address.
-	#[must_use]
 	pub fn ordinal(&self) -> Option<u64> {
 		match self.address() {
 			ArtifactAddress::Ordinal(ordinal) => Some(ordinal),
@@ -331,7 +317,6 @@ impl ArtifactUrl {
 
 	/// Returns the borrowed durable digest, or [`None`] for a session-local
 	/// address.
-	#[must_use]
 	pub fn digest(&self) -> Option<&str> {
 		match self.address() {
 			ArtifactAddress::Ordinal(_) => None,
@@ -397,13 +382,11 @@ macro_rules! typed_url {
 			}
 
 			/// Returns the complete wire-form URL without allocating.
-			#[must_use]
 			pub fn as_str(&self) -> &str {
 				self.0.as_str()
 			}
 
 			/// Returns the resource component with its selector removed.
-			#[must_use]
 			pub fn resource(&self) -> &str {
 				self
 					.after_scheme()
@@ -412,7 +395,6 @@ macro_rules! typed_url {
 			}
 
 			/// Returns the optional trailing selector without its `:` delimiter.
-			#[must_use]
 			pub fn selector(&self) -> Option<&str> {
 				self.after_scheme().split_once(':').map(|parts| parts.1)
 			}
@@ -469,7 +451,6 @@ impl WorkspaceUri {
 	}
 
 	/// Returns the canonical URI without allocating.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}

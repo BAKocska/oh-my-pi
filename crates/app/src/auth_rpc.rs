@@ -44,7 +44,6 @@ pub struct AuthRpc {
 
 impl AuthRpc {
 	/// Wraps one immutable comprehensive registry.
-	#[must_use]
 	pub fn new(registry: Registry) -> Self {
 		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())) }
 	}

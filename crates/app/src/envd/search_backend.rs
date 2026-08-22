@@ -35,7 +35,6 @@ enum SearchFacade {
 
 impl SearchBridgeHost {
 	/// Creates an unbound host for registry construction.
-	#[must_use]
 	pub(crate) const fn new() -> Self {
 		Self { inference: OnceLock::new() }
 	}

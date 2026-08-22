@@ -3289,7 +3289,6 @@ fn emit_link_open(output: &mut String, id: LinkId) {
 /// OSC payloads are not an escaping context: dropping individual bytes can
 /// turn an attacker-controlled target into a different valid URI, so an
 /// unsafe target is rejected as a whole.
-#[must_use]
 pub fn sanitize_link_target(target: &str) -> Option<&str> {
 	(!target.is_empty() && !target.bytes().any(|byte| byte <= 0x1f || byte == 0x7f))
 		.then_some(target)
@@ -3297,7 +3296,6 @@ pub fn sanitize_link_target(target: &str) -> Option<&str> {
 
 /// Builds an encoded `file://` OSC target with optional editor position
 /// parameters.
-#[must_use]
 pub fn file_link_target(path: &Path, line: Option<u32>, column: Option<u32>) -> Option<Str> {
 	let absolute = if path.is_absolute() {
 		path.to_path_buf()

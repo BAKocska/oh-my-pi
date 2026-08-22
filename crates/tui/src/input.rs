@@ -1215,7 +1215,6 @@ impl Chord {
 	}
 
 	/// Writes the canonical portable chord spelling.
-	#[must_use]
 	pub fn label(self) -> Str {
 		let mut label = String::new();
 		for (active, name) in [

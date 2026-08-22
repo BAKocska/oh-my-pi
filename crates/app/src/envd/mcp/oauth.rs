@@ -188,7 +188,6 @@ pub struct McpOAuth {
 
 impl McpOAuth {
 	/// Creates an Environment-owned OAuth coordinator.
-	#[must_use]
 	pub fn new(
 		http: Arc<dyn OAuthHttpClient>,
 		authority: Arc<CombinedAuthAuthority>,
@@ -488,7 +487,6 @@ pub enum OAuthFlowError {
 
 impl OAuthFlowError {
 	/// Classifies whether retained refresh material remains eligible for retry.
-	#[must_use]
 	pub const fn class(&self) -> OAuthFailureClass {
 		match self {
 			Self::UnsupportedChallenge

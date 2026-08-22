@@ -35,20 +35,17 @@ enum LogoInner {
 impl Logo {
 	/// Creates an unresolved logo cell; the backing image or monogram is
 	/// chosen on first layout from the packaged asset table.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { props: Props::new(), slot: crate::component::next_slot(), inner: LogoInner::Pending }
 	}
 
 	/// Sets a string property on the logo element.
-	#[must_use]
 	pub fn with_str(mut self, prop: Prop, value: impl IntoStr) -> Self {
 		self.props.set(prop, value.into_str());
 		self
 	}
 
 	/// Sets a property on the logo element.
-	#[must_use]
 	pub fn with(mut self, prop: Prop, value: impl Into<crate::props::PropValue>) -> Self {
 		self.props.set(prop, value);
 		self

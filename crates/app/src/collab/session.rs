@@ -84,7 +84,6 @@ pub struct CollabCommandResult {
 
 impl CollabCommandResult {
 	/// Constructs an inactive result after stop or leave.
-	#[must_use]
 	pub const fn inactive() -> Self {
 		Self {
 			presence:      None,
@@ -128,14 +127,12 @@ impl CollabCommandHandle {
 	}
 
 	/// Returns the most recently published role/connection/participant facts.
-	#[must_use]
 	pub fn presence(&self) -> Option<PresenceFacts> {
 		*self.presence.borrow()
 	}
 
 	/// Subscribes to role and presence changes for command filtering and status
 	/// rendering.
-	#[must_use]
 	pub fn subscribe_presence(&self) -> watch::Receiver<Option<PresenceFacts>> {
 		self.presence.clone()
 	}
@@ -149,7 +146,6 @@ pub struct CollabSessionAuthority {
 
 impl CollabSessionAuthority {
 	/// Constructs the sole authority and its clone-cheap UI handle.
-	#[must_use]
 	pub fn new() -> (Self, CollabCommandHandle) {
 		let (commands, requests) = flume::bounded(COMMAND_CAPACITY);
 		let (presence, observed_presence) = watch::channel(None);
@@ -178,7 +174,6 @@ impl CollabSessionAuthority {
 ///
 /// The returned task owns every active relay socket. Dropping all command
 /// handles ends the loop and closes the current room.
-#[must_use]
 pub fn spawn_session_owner(authority: CollabSessionAuthority) -> JoinHandle<()> {
 	tokio::spawn(authority.run())
 }
@@ -391,7 +386,6 @@ pub struct CollabOwnerRequest {
 
 impl CollabOwnerRequest {
 	/// Returns the requested operation.
-	#[must_use]
 	pub const fn command(&self) -> &CollabOwnerCommand {
 		&self.command
 	}

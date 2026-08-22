@@ -164,7 +164,6 @@ pub struct AntigravityLabels {
 }
 
 /// Wraps a typed `GenerateContent` request for Gemini CLI CCA.
-#[must_use]
 pub const fn wrap_request(
 	request: GenerateContentRequest,
 	model: Str,
@@ -175,7 +174,6 @@ pub const fn wrap_request(
 
 /// Shapes a typed `GenerateContent` request as Antigravity without model-name
 /// heuristics.
-#[must_use]
 pub fn wrap_antigravity_request(
 	mut request: GenerateContentRequest,
 	model: Str,
@@ -252,7 +250,6 @@ pub struct CcaHeaders {
 impl CcaHeaders {
 	/// Builds Gemini CLI's public fingerprint from explicit platform
 	/// coordinates.
-	#[must_use]
 	pub fn gemini_cli(model: &str, platform: &str, arch: &str) -> Self {
 		Self {
 			user_agent:      format!("GeminiCLI/0.46.0/{model} ({platform}; {arch}; terminal)").into(),
@@ -263,7 +260,6 @@ impl CcaHeaders {
 	}
 
 	/// Builds Antigravity's public fingerprint from explicit policy inputs.
-	#[must_use]
 	pub fn antigravity(
 		fingerprint: &AntigravityFingerprint,
 		interleaved_thinking: bool,
@@ -313,7 +309,6 @@ impl Default for AntigravityFingerprint {
 
 impl AntigravityFingerprint {
 	/// Renders the `User-Agent` value expected by Cloud Code Assist.
-	#[must_use]
 	pub fn user_agent(&self) -> Str {
 		omp_core::sf!(
 			"antigravity/hub/{} (aidev_client; os_type={}; arch={}; cl={})",
@@ -330,7 +325,6 @@ impl AntigravityFingerprint {
 /// Returns `None` when no well-formed `version:` line carries a
 /// `major.minor.patch` release triple; malformed values on a matching line
 /// stop the scan, mirroring the reference parser.
-#[must_use]
 pub fn parse_antigravity_manifest_version(manifest: &str) -> Option<Str> {
 	for line in manifest.lines() {
 		let Some(rest) = line.trim_start().strip_prefix("version") else {
@@ -806,7 +800,6 @@ pub fn thought_signature_to_wire(signature: &Bytes) -> Result<Str, GoogleCodecEr
 }
 
 /// Converts CCA's continuation-proof string to opaque canonical bytes.
-#[must_use]
 pub fn thought_signature_from_wire(signature: &str) -> Bytes {
 	Bytes::copy_from_slice(signature.as_bytes())
 }

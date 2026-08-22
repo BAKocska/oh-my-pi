@@ -113,7 +113,6 @@ impl Default for EditBuffer {
 }
 
 impl EditBuffer {
-	#[must_use]
 	/// Creates a buffer with the cursor at the end of sanitized `text`.
 	pub fn new(text: &str) -> Self {
 		let text = sanitize_paste(text);
@@ -143,19 +142,16 @@ impl EditBuffer {
 		self.xml = xml;
 	}
 
-	#[must_use]
 	/// Returns the visible marker text.
 	pub fn text(&self) -> &str {
 		&self.text
 	}
 
-	#[must_use]
 	/// Returns the UTF-8 byte cursor.
 	pub const fn cursor(&self) -> usize {
 		self.cursor
 	}
 
-	#[must_use]
 	/// Returns the normalized selected UTF-8 byte range, or `None` when
 	/// collapsed.
 	pub fn selection(&self) -> Option<Range<usize>> {
@@ -172,7 +168,6 @@ impl EditBuffer {
 		Some(start..end)
 	}
 
-	#[must_use]
 	/// Returns the selected visible text.
 	pub fn selected_text(&self) -> Option<&str> {
 		self.selection().map(|range| &self.text[range])
@@ -198,7 +193,6 @@ impl EditBuffer {
 		self.copied.take()
 	}
 
-	#[must_use]
 	/// Returns the selected display-column span intersecting `row`.
 	pub fn selection_span(&self, row: &VisualRow<'_>) -> Option<(u16, u16)> {
 		let selection = self.selection()?;
@@ -210,13 +204,11 @@ impl EditBuffer {
 		Some((cell_width(&row.text[..start - row.start]), cell_width(&row.text[..end - row.start])))
 	}
 
-	#[must_use]
 	/// Returns the number of logical newline-delimited lines.
 	pub fn line_count(&self) -> usize {
 		self.text.bytes().filter(|byte| *byte == b'\n').count() + 1
 	}
 
-	#[must_use]
 	/// Returns the zero-based logical cursor line.
 	pub fn cursor_line(&self) -> usize {
 		self.text[..self.cursor]
@@ -225,7 +217,6 @@ impl EditBuffer {
 			.count()
 	}
 
-	#[must_use]
 	/// Returns the cursor's cell column within its logical line.
 	pub fn cursor_column(&self) -> u16 {
 		let (start, _) = self.line_bounds();
@@ -369,7 +360,6 @@ impl EditBuffer {
 		BufferOutcome::Changed
 	}
 
-	#[must_use]
 	/// Returns text with every atomic reference expanded to its payload.
 	pub fn expanded_text(&self) -> String {
 		let mut atoms: SmallVec<&Atom, 4> = self.atoms.iter().collect();
@@ -547,14 +537,12 @@ impl EditBuffer {
 	///
 	/// Keyboard editing keeps the cursor in view. A manual viewport scroll
 	/// remains detached until the next editing command.
-	#[must_use]
 	pub fn rows(&self, width_limit: u16, max_rows: usize) -> SmallVec<VisualRow<'_>, 8> {
 		self.rows_with_metrics(width_limit, max_rows).0
 	}
 
 	/// Returns visible rows and `(first, visible, total)` viewport metrics from
 	/// one wrapping pass.
-	#[must_use]
 	pub fn rows_with_metrics(
 		&self,
 		width_limit: u16,
@@ -609,19 +597,16 @@ impl EditBuffer {
 		next != current
 	}
 
-	#[must_use]
 	/// Returns the clipped visual row count.
 	pub fn visual_height(&self, width: u16, max_rows: usize) -> usize {
 		self.segments(width.max(1)).len().min(max_rows)
 	}
 
-	#[must_use]
 	/// Reports whether the cursor is at the document's visual start.
 	pub fn at_visual_start(&self) -> bool {
 		self.segment_at_cursor(&self.segments(self.layout_width)) == 0 && self.cursor == 0
 	}
 
-	#[must_use]
 	/// Reports whether the cursor is at the document's visual end.
 	pub fn at_visual_end(&self) -> bool {
 		let segments = self.segments(self.layout_width);
@@ -1411,14 +1396,12 @@ impl Suggestion {
 	}
 
 	/// Explanatory text shown beside the label.
-	#[must_use]
 	pub fn with_description(mut self, description: impl IntoStr) -> Self {
 		self.description = Some(description.into_str());
 		self
 	}
 
 	/// Ghost text shown after the cursor while this row is selected.
-	#[must_use]
 	pub fn with_hint(mut self, hint: impl IntoStr) -> Self {
 		self.hint = Some(hint.into_str());
 		self
@@ -1426,14 +1409,12 @@ impl Suggestion {
 
 	/// Assigns a category. The picker retains one non-selectable header at each
 	/// category boundary inside the visible window.
-	#[must_use]
 	pub fn with_category(mut self, category: impl IntoStr) -> Self {
 		self.category = Some(category.into_str());
 		self
 	}
 
 	/// Assigns UTF-8 byte spans to emphasize within the dropdown label.
-	#[must_use]
 	pub fn with_match_spans(mut self, spans: impl IntoIterator<Item = (u16, u16)>) -> Self {
 		self.match_spans = spans
 			.into_iter()
@@ -1443,31 +1424,26 @@ impl Suggestion {
 	}
 
 	/// Returns the row category, when present.
-	#[must_use]
 	pub fn category(&self) -> Option<&str> {
 		self.category.as_deref()
 	}
 
 	/// Returns UTF-8 byte match spans in the dropdown label.
-	#[must_use]
 	pub fn match_spans(&self) -> &[(u16, u16)] {
 		&self.match_spans
 	}
 
 	/// Returns the row's dropdown label.
-	#[must_use]
 	pub const fn display(&self) -> &SuggestionDisplay {
 		&self.display
 	}
 
 	/// Returns optional explanatory text shown beside the label.
-	#[must_use]
 	pub fn description(&self) -> Option<&str> {
 		self.description.as_deref()
 	}
 
 	/// Returns the text inserted when this row is accepted.
-	#[must_use]
 	pub const fn value(&self) -> &Str {
 		&self.value
 	}
@@ -1562,7 +1538,6 @@ pub struct Picker {
 
 impl Picker {
 	/// Returns the centered five-row suggestion window and its first index.
-	#[must_use]
 	pub fn visible_suggestions(&self) -> (usize, &[Suggestion]) {
 		let visible = self.suggestions.len().min(PICKER_ROWS);
 		let max_start = self.suggestions.len().saturating_sub(visible);
@@ -1571,7 +1546,6 @@ impl Picker {
 	}
 
 	/// Returns visible rows including category headers.
-	#[must_use]
 	pub fn visible_rows(&self) -> SmallVec<PickerRow<'_>, 8> {
 		let (start, suggestions) = self.visible_suggestions();
 		let mut rows = SmallVec::new();
@@ -1589,19 +1563,16 @@ impl Picker {
 	}
 
 	/// Returns the selected suggestion's absolute index.
-	#[must_use]
 	pub const fn selected(&self) -> usize {
 		self.selected
 	}
 
 	/// Returns the total number of matching suggestions.
-	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.suggestions.len()
 	}
 
 	/// Reports whether no suggestions matched (never true for a live picker).
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.suggestions.is_empty()
 	}
@@ -1638,7 +1609,6 @@ pub struct Editor {
 
 impl Editor {
 	/// Creates an empty editor with the given feature switches.
-	#[must_use]
 	pub fn new(options: EditorOptions) -> Self {
 		let mut buffer = EditBuffer::default();
 		buffer.set_xml(options.xml);
@@ -1684,25 +1654,21 @@ impl Editor {
 
 	/// Returns the feature switches the editor was built with, so
 	/// renderers can honor them (e.g. XML highlighting).
-	#[must_use]
 	pub const fn options(&self) -> EditorOptions {
 		self.options
 	}
 
 	/// Returns the visible text, with paste markers unexpanded.
-	#[must_use]
 	pub fn text(&self) -> &str {
 		self.buffer.text()
 	}
 
 	/// Returns the open completion dropdown, if any.
-	#[must_use]
 	pub const fn picker(&self) -> Option<&Picker> {
 		self.picker.as_ref()
 	}
 
 	/// Returns the rows the open completion dropdown occupies (0 when closed).
-	#[must_use]
 	pub fn picker_height(&self) -> u16 {
 		u16::try_from(
 			self
@@ -1738,7 +1704,6 @@ impl Editor {
 
 	/// Returns visible input rows and `(first, visible, total)` viewport
 	/// metrics from one wrapping pass.
-	#[must_use]
 	pub fn view_rows_with_metrics(
 		&self,
 		width: u16,
@@ -1760,7 +1725,6 @@ impl Editor {
 		self.refresh();
 	}
 
-	#[must_use]
 	/// Returns the selected display-column span intersecting `row`.
 	pub fn selection_span(&self, row: &VisualRow<'_>) -> Option<(u16, u16)> {
 		self.buffer.selection_span(row)
@@ -1993,7 +1957,6 @@ impl Editor {
 
 	/// Byte ranges of atomic markers in the visible text; see
 	/// [`EditBuffer::atom_ranges`].
-	#[must_use]
 	pub fn atom_ranges(&self) -> SmallVec<(usize, usize), 4> {
 		self.buffer.atom_ranges()
 	}
@@ -2083,7 +2046,6 @@ impl Editor {
 	/// Dim ghost text rendered after the cursor: the selected suggestion's
 	/// hint while the dropdown is open, otherwise the completion engine's
 	/// latest [`EditorCompletion::hint`].
-	#[must_use]
 	pub fn inline_hint(&self) -> Option<Str> {
 		if let Some(picker) = &self.picker
 			&& let Some(hint) = &picker.suggestions[picker.selected].hint
@@ -2188,7 +2150,6 @@ impl Command {
 
 	/// Supplies live argument candidates. The provider runs only while this
 	/// command's first argument is being completed.
-	#[must_use]
 	pub fn with_dynamic_args(
 		mut self,
 		provider: impl Fn(&str) -> Box<[CommandArgument]> + Send + Sync + 'static,
@@ -2198,7 +2159,6 @@ impl Command {
 	}
 
 	/// Supplies a live status line for the command-palette description.
-	#[must_use]
 	pub fn with_status(mut self, provider: impl Fn() -> Str + Send + Sync + 'static) -> Self {
 		self.status = Some(Arc::new(provider));
 		self
@@ -2207,7 +2167,6 @@ impl Command {
 	/// Argument candidates offered once the command name is complete:
 	/// `(name, description, usage)`, with `""` usage meaning none. Usage
 	/// text ghosts after the argument pi-style (`<path>`, `<a> <b>`).
-	#[must_use]
 	pub fn with_args(mut self, args: &[(&str, &str, &str)]) -> Self {
 		self.args = args
 			.iter()
@@ -2222,7 +2181,6 @@ impl Command {
 
 	/// Usage hint shown as dim ghost text after the cursor, pi-style
 	/// (e.g. `<name> [--scope project|user]`).
-	#[must_use]
 	pub fn with_hint(mut self, hint: &str) -> Self {
 		self.hint = Some(Str::new(hint));
 		self

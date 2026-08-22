@@ -52,7 +52,6 @@ pub struct WorkspaceTreeBuilder {
 
 impl WorkspaceTreeBuilder {
 	/// Creates a builder with production prompt-tree bounds.
-	#[must_use]
 	pub fn new(root: impl Into<PathBuf>) -> Self {
 		Self {
 			root:          root.into(),
@@ -193,7 +192,6 @@ impl WorkspaceTreeBuilder {
 	}
 
 	/// Returns the walk root.
-	#[must_use]
 	pub fn root(&self) -> &Path {
 		&self.root
 	}

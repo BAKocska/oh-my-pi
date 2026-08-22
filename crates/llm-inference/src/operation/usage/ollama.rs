@@ -26,13 +26,11 @@ pub struct OllamaUsageFetcher {
 
 impl OllamaUsageFetcher {
 	/// Constructs the local Ollama fetcher.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { provider: ProviderId::from(OLLAMA) }
 	}
 
 	/// Constructs the Ollama Cloud fetcher.
-	#[must_use]
 	pub fn cloud() -> Self {
 		Self { provider: ProviderId::from(OLLAMA_CLOUD) }
 	}

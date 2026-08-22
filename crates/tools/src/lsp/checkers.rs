@@ -103,7 +103,6 @@ pub enum Preset {
 }
 
 /// Builds a pi-compatible bounded command for one workspace/file.
-#[must_use]
 pub fn request(preset: Preset, workspace: &Path, target: Option<&Path>) -> CheckerRequest {
 	let target = target.map(|path| Str::from(path.to_string_lossy().as_ref()));
 	let (program, mut args): (&str, Vec<Str>) = match preset {
@@ -152,7 +151,6 @@ pub fn request(preset: Preset, workspace: &Path, target: Option<&Path>) -> Check
 
 /// Selects the nearest authority-discovered `go.work` directory, otherwise the
 /// workspace.
-#[must_use]
 pub fn go_workspace<'a>(
 	file: &Path,
 	workspace: &'a Path,
@@ -166,7 +164,6 @@ pub fn go_workspace<'a>(
 }
 
 /// Enforces the common 50-line projection bound.
-#[must_use]
 pub fn bounded_lines(text: &str) -> Str {
 	Str::from(text.lines().take(50).collect::<Vec<_>>().join("\n"))
 }

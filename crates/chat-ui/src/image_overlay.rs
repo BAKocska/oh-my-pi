@@ -41,7 +41,6 @@ pub struct ImageOverlay {
 impl ImageOverlay {
 	/// Opens over image attachments only; text attachments remain staged but
 	/// hidden.
-	#[must_use]
 	pub fn open(attachments: &[Attachment], ctx: &UiContext) -> Self {
 		let images = attachments
 			.iter()

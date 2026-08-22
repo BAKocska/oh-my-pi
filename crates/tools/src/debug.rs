@@ -85,7 +85,6 @@ pub enum Action {
 
 impl Action {
 	/// Whether the Environment classifies this action as inspection-only.
-	#[must_use]
 	pub const fn read_only(self) -> bool {
 		matches!(
 			self,
@@ -277,7 +276,6 @@ pub struct DebugTool<C> {
 }
 
 /// Creates the revisioned debug tool.
-#[must_use]
 pub fn tool<C: DebugControl>(control: C, maximum: Duration) -> DebugTool<C> {
 	DebugTool {
 		control,
@@ -444,7 +442,6 @@ fn protocol_issue(message: Str) -> ArgIssue {
 }
 
 /// Builds the bounded model projection used by environment bridges.
-#[must_use]
 pub fn render(action: Action, data: &Value) -> Str {
 	debug_render::render(action, data)
 }

@@ -21,6 +21,7 @@ use serde_json::json;
 
 use crate::cli::GcArgs;
 
+#[must_use]
 struct GcLock(PathBuf);
 
 impl Drop for GcLock {

@@ -46,7 +46,6 @@ pub struct BoundaryLayout {
 /// Fits left and right status groups around a flexible boundary.
 ///
 /// Returns `None` when both groups plus `minimum_boundary` do not fit.
-#[must_use]
 pub const fn boundary_layout(
 	x: u16,
 	width: u16,
@@ -69,7 +68,6 @@ pub const fn boundary_layout(
 }
 
 /// Number of cells filled by a proportional context gauge.
-#[must_use]
 pub const fn context_gauge_cells(width: u16, used: u64, total: u64) -> u16 {
 	if total == 0 {
 		return 0;
@@ -80,7 +78,6 @@ pub const fn context_gauge_cells(width: u16, used: u64, total: u64) -> u16 {
 
 /// Returns the themed accent shared by the compaction threshold marker and
 /// context-window usage labels.
-#[must_use]
 pub const fn compaction_threshold_color(theme: &Theme) -> Color {
 	theme.accent
 }
@@ -90,7 +87,6 @@ pub const fn compaction_threshold_color(theme: &Theme) -> Color {
 /// Subscription-backed spend uses the dedicated Nerd Font icon where
 /// available and an `S` prefix elsewhere. A zero-cost subscription still
 /// renders its semantic subscription marker.
-#[must_use]
 pub fn spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> Str {
 	if amount_nanos == 0 {
 		return if subscription {
@@ -110,7 +106,6 @@ pub fn spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> S
 }
 
 /// Formats advisor-model spend with the charset's advisor degradation.
-#[must_use]
 pub fn advisor_spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> Str {
 	let spend = spend_label(amount_nanos, subscription, charset);
 	if spend.is_empty() {

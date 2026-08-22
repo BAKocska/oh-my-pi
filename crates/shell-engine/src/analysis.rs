@@ -54,7 +54,6 @@ pub struct ScriptIr {
 impl ScriptIr {
 	/// Returns whether the script has no writes, network sinks, or opaque
 	/// execution.
-	#[must_use]
 	pub fn is_read_only(&self) -> bool {
 		self.writes.is_empty()
 			&& self.net.is_empty()
@@ -63,7 +62,6 @@ impl ScriptIr {
 	}
 
 	/// Returns whether any known or dynamic write may escape `root`.
-	#[must_use]
 	pub fn writes_outside(&self, root: &str) -> bool {
 		self.writes.iter().any(|path| {
 			path.dynamic || !within_root(path.resolved.as_deref().unwrap_or(&path.lexical), root)

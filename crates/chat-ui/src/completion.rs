@@ -50,13 +50,11 @@ pub struct CompletionChain {
 
 impl CompletionChain {
 	/// Builds an empty ordered source chain.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { sources: SmallVec::new() }
 	}
 
 	/// Appends a lower-precedence source.
-	#[must_use]
 	pub fn source(mut self, source: Box<dyn EditorCompletion>) -> Self {
 		self.sources.push(source);
 		self
@@ -100,7 +98,6 @@ pub struct DeferredCompletion {
 
 impl DeferredCompletion {
 	/// Starts one worker for `source` with the supplied trigger table.
-	#[must_use]
 	pub fn new(
 		triggers: impl IntoIterator<Item = (char, CompletionTrigger)>,
 		source: Arc<dyn CompletionSource>,

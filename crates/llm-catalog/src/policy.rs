@@ -105,7 +105,6 @@ policy_enum!(/// Provider wire mode used for ordinary or extended context.
 impl ExtendedContextMode {
 	/// Converts explicit source evidence without collapsing `false` into
 	/// absence.
-	#[must_use]
 	pub const fn from_enabled(enabled: bool) -> Self {
 		if enabled {
 			Self::Extended
@@ -115,7 +114,6 @@ impl ExtendedContextMode {
 	}
 
 	/// Reports whether extended context must be enabled on the wire.
-	#[must_use]
 	pub const fn is_extended(self) -> bool {
 		matches!(self, Self::Extended)
 	}
@@ -131,7 +129,6 @@ policy_enum!(/// Whether premium-priced extended context is available to selecti
 );
 impl ExtendedContextPolicy {
 	/// Converts the user-facing extended-context setting into typed policy.
-	#[must_use]
 	pub const fn from_enabled(enabled: bool) -> Self {
 		if enabled {
 			Self::Enabled
@@ -144,7 +141,6 @@ impl ExtendedContextPolicy {
 	///
 	/// Disabling extended context only affects models with a replacement price
 	/// tier. Unknown limits remain unknown rather than being invented.
-	#[must_use]
 	pub fn effective_context_window(
 		self,
 		declared_context_window: Option<u64>,
@@ -338,7 +334,6 @@ pub struct StreamWatchdog {
 
 impl StreamWatchdog {
 	/// Returns the configured first-event timeout.
-	#[must_use]
 	pub const fn first_event_timeout(self) -> Option<Duration> {
 		match self.first_event_ms {
 			Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
@@ -347,7 +342,6 @@ impl StreamWatchdog {
 	}
 
 	/// Returns the configured idle timeout.
-	#[must_use]
 	pub const fn idle_timeout(self) -> Option<Duration> {
 		match self.idle_ms {
 			Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
@@ -608,7 +602,6 @@ impl WirePolicy {
 	///
 	/// `const` so neutral policies can back `static` placeholders without lazy
 	/// initialization.
-	#[must_use]
 	pub const fn overrides() -> Self {
 		Self {
 			role:       RolePolicy {
@@ -690,7 +683,6 @@ impl WirePolicy {
 	///
 	/// `const` so the baseline can back `static` placeholders without lazy
 	/// initialization; every field overwritten here is `Copy`.
-	#[must_use]
 	pub const fn baseline() -> Self {
 		let mut policy = Self::overrides();
 		policy.role.multiple_system_messages = Some(true);
@@ -720,13 +712,11 @@ impl WirePolicy {
 	}
 
 	/// Serializes the policy into deterministic structural bytes.
-	#[must_use]
 	pub fn canonical_bytes(&self) -> Vec<u8> {
 		serde_json::to_vec(self).expect("typed wire policy always serializes")
 	}
 
 	/// Returns the stable content-derived policy identifier.
-	#[must_use]
 	pub fn content_id(&self) -> WirePolicyId {
 		WirePolicyId::from(content_id("wire", &self.canonical_bytes()))
 	}
@@ -753,7 +743,6 @@ impl WirePolicyTable {
 	}
 
 	/// Gets an interned policy by identifier.
-	#[must_use]
 	pub fn get(&self, id: &WirePolicyId<str>) -> Option<&WirePolicy> {
 		self.entries.get(id)
 	}
@@ -764,13 +753,11 @@ impl WirePolicyTable {
 	}
 
 	/// Returns the number of distinct structural policies.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
 	/// Reports whether no policy is interned.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.entries.is_empty()
 	}

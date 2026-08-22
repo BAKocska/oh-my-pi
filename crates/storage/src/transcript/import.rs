@@ -67,7 +67,6 @@ impl ImportedTranscript {
 	/// The label targets the imported message's physical event index, preserving
 	/// provenance for assistant and tool-result entries whose message schema has
 	/// no attribution field.
-	#[must_use]
 	pub fn into_events(self, format: ForeignFormat, first_event_index: u64) -> Vec<Event> {
 		let marker: &'static str = format.into();
 		let mut events = Vec::with_capacity(self.entries.len().saturating_mul(2));
@@ -90,7 +89,6 @@ impl ImportedTranscript {
 
 /// Parses a Claude Code or Codex JSONL journal without allowing one damaged
 /// physical record to discard later complete messages.
-#[must_use]
 pub fn parse_foreign_jsonl(format: ForeignFormat, input: &str) -> ImportedTranscript {
 	let mut output = ImportedTranscript::default();
 	for (offset, line) in input.lines().enumerate() {

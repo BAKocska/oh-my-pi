@@ -101,7 +101,6 @@ static BLAME_STOP: LazyLock<Regex> =
 	LazyLock::new(|| Regex::new(r"(?i)^\s*stop\s+[A-Za-z]+ing\b").expect("regex"));
 
 /// Computes prompt-free local counters for one message.
-#[must_use]
 pub fn analyze_user_sentiment(text: &str) -> UserSentimentMetrics {
 	let text = text.trim();
 	if text.is_empty() {

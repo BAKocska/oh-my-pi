@@ -125,7 +125,6 @@ impl LiveVoiceVisualizer {
 	}
 
 	/// Whether microphone transmission is muted.
-	#[must_use]
 	pub const fn muted(&self) -> bool {
 		self.muted
 	}
@@ -454,7 +453,6 @@ pub struct Attribution {
 
 impl Attribution {
 	/// Creates the reserved attribution band from its seven provenance fields.
-	#[must_use]
 	pub const fn new(septet: [Str; 7]) -> Self {
 		Self { septet }
 	}
@@ -1739,7 +1737,6 @@ impl Chat {
 	}
 
 	/// Clones the staged attachment descriptors for read-only overlays.
-	#[must_use]
 	pub fn composer_attachments(&self) -> Vec<Attachment> {
 		self.attachments.snapshot()
 	}
@@ -2268,7 +2265,6 @@ impl Chat {
 
 	/// Serializes the retained visible transcript in presentation order for
 	/// explicit owner-requested export. Live mutable tails are excluded.
-	#[must_use]
 	pub fn visible_transcript_text(&self) -> String {
 		let mut output = String::new();
 		for entry in &self.transcript {
@@ -2424,7 +2420,6 @@ impl Chat {
 
 	/// Applies scene-owned backend mutations and returns events owned by host
 	/// overlays.
-	#[must_use]
 	pub fn apply_backend_event(&mut self, event: BackendEvent) -> Option<BackendEvent> {
 		match event {
 			BackendEvent::UserReplayed { text, chips } => self.push_user(text.as_str(), chips),
@@ -2634,7 +2629,6 @@ impl Chat {
 	}
 
 	/// Returns the current unsent composer text.
-	#[must_use]
 	pub fn composer_text(&self) -> String {
 		self.editor_ui.values()[INPUT_ID]
 			.as_str()

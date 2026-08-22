@@ -264,7 +264,6 @@ impl Default for AgentRegistry {
 
 impl AgentRegistry {
 	/// Returns the one process-global registry.
-	#[must_use]
 	pub fn global() -> &'static Self {
 		static GLOBAL: LazyLock<AgentRegistry> = LazyLock::new(AgentRegistry::new);
 		&GLOBAL
@@ -272,7 +271,6 @@ impl AgentRegistry {
 
 	/// Creates an independent registry, primarily for an isolated daemon or
 	/// test.
-	#[must_use]
 	pub fn new() -> Self {
 		let (generation, _) = tokio::sync::watch::channel(0_u64);
 		Self {
@@ -286,13 +284,11 @@ impl AgentRegistry {
 
 	/// Subscribes to every registration, lifecycle, activity, and history
 	/// change.
-	#[must_use]
 	pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
 		self.inner.generation.subscribe()
 	}
 
 	/// Returns the current process-global generation.
-	#[must_use]
 	pub fn generation(&self) -> u64 {
 		*self.inner.generation.borrow()
 	}
@@ -374,7 +370,6 @@ impl AgentRegistry {
 	}
 
 	/// Returns one record and its CAS revision.
-	#[must_use]
 	pub fn record(&self, id: &str) -> Option<(AgentRecord, u64)> {
 		let records = self.inner.records.lock();
 		let (_, entry) = find_record(&records, id)?;
@@ -382,7 +377,6 @@ impl AgentRegistry {
 	}
 
 	/// Lists the roster deterministically, optionally retaining advisors.
-	#[must_use]
 	pub fn roster(&self, include_advisors: bool) -> Vec<AgentRecord> {
 		let mut records = self
 			.inner
@@ -405,7 +399,6 @@ impl AgentRegistry {
 	///
 	/// Advisor identities, transcript paths, workspace/session ids, models,
 	/// activity text, and historical artifacts remain host-local.
-	#[must_use]
 	pub fn collab_snapshot(&self) -> CollabRegistrySnapshot {
 		let generation = self.generation();
 		let agents = self
@@ -535,7 +528,6 @@ impl AgentRegistry {
 	}
 
 	/// Returns retained bounded-prefix diagnostics, oldest first.
-	#[must_use]
 	pub fn discovery_diagnostics(&self) -> Vec<DiscoveryDiagnostic> {
 		self.inner.diagnostics.lock().iter().cloned().collect()
 	}
@@ -588,7 +580,6 @@ impl AgentRegistry {
 	/// Replaces the live in-memory transcript projection for one session.
 	///
 	/// Returns whether a matching live registry entry was present.
-	#[must_use]
 	pub fn set_live_history(&self, session: &str, history: Vec<u8>) -> bool {
 		let mut records = self.inner.records.lock();
 		let Some(entry) = records
@@ -622,7 +613,6 @@ impl AgentRegistry {
 	}
 
 	/// Renders the live/parked/disk transcript index used by `history://`.
-	#[must_use]
 	pub fn history_index(&self) -> String {
 		let mut output = String::from(
 			"| id | name | kind | status | parent/depth | definition | model → serving | task | last \
@@ -846,6 +836,7 @@ impl InboxState {
 	}
 }
 
+#[must_use]
 struct WaitRegistration {
 	state:      Arc<InboxState>,
 	generation: u64,
@@ -928,13 +919,11 @@ pub struct Broker {
 
 impl Broker {
 	/// Creates a broker using the process-global lifecycle registry.
-	#[must_use]
 	pub fn new(project: Str) -> Self {
 		Self::with_registry(project, AgentRegistry::global().clone())
 	}
 
 	/// Creates a broker with an explicit registry.
-	#[must_use]
 	pub fn with_registry(project: Str, registry: AgentRegistry) -> Self {
 		let (generation, _) = tokio::sync::watch::channel(0_u64);
 		let (events, _) = tokio::sync::broadcast::channel(MAILBOX_CAPACITY);
@@ -951,13 +940,11 @@ impl Broker {
 	}
 
 	/// Returns the registry shared with URL resolvers and roster projections.
-	#[must_use]
 	pub fn registry(&self) -> &AgentRegistry {
 		&self.inner.registry
 	}
 
 	/// Subscribes to message-id-bearing delivery events.
-	#[must_use]
 	pub fn subscribe_routes(&self) -> tokio::sync::broadcast::Receiver<RoutedEvent> {
 		self.inner.events.subscribe()
 	}
@@ -1275,7 +1262,6 @@ impl Broker {
 	}
 
 	/// Lists currently messageable node identities for the project or a session.
-	#[must_use]
 	pub fn peers(&self, session: Option<&str>) -> SmallVec<Str, 4> {
 		self
 			.inner
@@ -1393,7 +1379,6 @@ impl BrokerInbox {
 	}
 
 	/// Returns the unread FIFO count.
-	#[must_use]
 	pub fn unread_count(&self) -> usize {
 		self.state.queue.lock().len()
 	}
@@ -1464,7 +1449,6 @@ const fn class(mode: DeliveryMode) -> InterruptClass {
 }
 
 /// Encodes a peer message as the canonical thread item journaled by the loop.
-#[must_use]
 pub fn peer_item(message: &PeerMessage) -> Item {
 	let mut text = String::new();
 	crate::prompt_assets::render_parent_irc(&mut text, message.from.as_str(), message.text.as_str());
@@ -1480,7 +1464,6 @@ pub fn peer_item(message: &PeerMessage) -> Item {
 }
 
 /// Returns the current epoch milliseconds for caller-created messages.
-#[must_use]
 pub fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)

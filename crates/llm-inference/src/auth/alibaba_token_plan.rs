@@ -101,7 +101,6 @@ struct SerializableEnvelope<'a> {
 }
 
 /// Parses either a bare Token Plan API key or its JSON credential envelope.
-#[must_use]
 pub fn parse_alibaba_token_plan_credential(raw: &str) -> Option<AlibabaTokenPlanCredential> {
 	let raw = raw.trim();
 	if raw.is_empty() {
@@ -127,7 +126,6 @@ pub fn parse_alibaba_token_plan_credential(raw: &str) -> Option<AlibabaTokenPlan
 }
 
 /// Serializes Token Plan material, using a bare key when no metadata is needed.
-#[must_use]
 pub fn serialize_alibaba_token_plan_credential(
 	token: &str,
 	cookie: Option<&str>,
@@ -179,13 +177,11 @@ pub struct AlibabaTokenPlanShaper {
 
 impl AlibabaTokenPlanShaper {
 	/// Constructs the Alibaba Token Plan credential shaper.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { provider: ProviderId::from(PROVIDER) }
 	}
 
 	/// Provider whose credentials this shaper rewrites.
-	#[must_use]
 	pub fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
@@ -268,7 +264,6 @@ pub struct AlibabaTokenPlanLoginEngine {
 
 impl AlibabaTokenPlanLoginEngine {
 	/// Constructs a persistent provider-scoped Token Plan login engine.
-	#[must_use]
 	pub fn new(
 		catalog: Arc<Catalog>,
 		store: Arc<CredentialStore>,

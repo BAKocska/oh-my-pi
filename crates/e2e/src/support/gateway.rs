@@ -145,14 +145,12 @@ impl ScriptedGateway {
 	}
 
 	/// Returns the model key routed to the scripted provider.
-	#[must_use]
 	pub fn model(&self) -> &str {
 		self.model.as_str()
 	}
 
 	/// Returns the owner-local gateway endpoint accepted by `omp chat
 	/// --gateway`.
-	#[must_use]
 	pub fn endpoint(&self) -> &Path {
 		&self.socket
 	}
@@ -172,7 +170,6 @@ impl ScriptedGateway {
 	}
 
 	/// Returns secret-safe canonical calls observed by the provider seam.
-	#[must_use]
 	pub fn calls(&self) -> Vec<CapturedCall> {
 		self.provider.calls()
 	}

@@ -125,7 +125,6 @@ pub struct TaskDescriptionSnapshot<'a> {
 }
 
 /// Builds the task portion of the eval description from one session snapshot.
-#[must_use]
 pub fn task_description(snapshot: TaskDescriptionSnapshot<'_>) -> Str {
 	let mut output = String::with_capacity(EVAL_DESCRIPTION.len() + 2_048);
 	output.push_str(EVAL_DESCRIPTION);
@@ -687,7 +686,6 @@ pub struct TailBuffer {
 
 impl TailBuffer {
 	/// Creates a live buffer with a hard byte bound.
-	#[must_use]
 	pub fn new(max_bytes: usize) -> Self {
 		Self {
 			head: Vec::with_capacity(max_bytes / 2),
@@ -904,7 +902,6 @@ fn eval_controlled_described<E: EvalExec>(
 
 impl<E: EvalExec> EvalTool<E> {
 	/// Overrides how long eval cells wait before managed detachment.
-	#[must_use]
 	pub const fn with_auto_background_threshold(mut self, threshold: Duration) -> Self {
 		self.auto_background_threshold = threshold;
 		self

@@ -24,14 +24,12 @@ pub trait NormalizePath {
 	/// components cancel preceding normal components. Parent components above
 	/// an absolute root are discarded, while leading parent components in a
 	/// relative path are preserved.
-	#[must_use]
 	fn normalize(&self) -> PathBuf;
 
 	/// Normalizes a relative path that must not escape its starting directory.
 	///
 	/// Returns `None` for absolute or prefixed paths and when a parent-directory
 	/// component would escape above the path's starting directory.
-	#[must_use]
 	fn try_normalize(&self) -> Option<PathBuf>;
 }
 

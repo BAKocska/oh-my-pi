@@ -268,7 +268,6 @@ fn finding(
 
 /// Returns paths referenced by the active lock/install generation. GC callers
 /// retain these even when their version cache is otherwise unreachable.
-#[must_use]
 pub fn active_paths(request: &DoctorRequest<'_>) -> Vec<PathBuf> {
 	vec![
 		request.lock_path.to_path_buf(),

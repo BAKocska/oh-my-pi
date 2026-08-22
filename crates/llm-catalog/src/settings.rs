@@ -52,7 +52,6 @@ impl Default for ThinkingBudgets {
 
 impl ThinkingBudgets {
 	/// Returns the configured budget for a concrete effort.
-	#[must_use]
 	pub const fn for_effort(self, effort: ThinkingEffort) -> Option<u64> {
 		match effort {
 			ThinkingEffort::Off => None,
@@ -295,7 +294,6 @@ impl ModelSettings {
 
 	/// Returns a stable provider preference rank; unlisted providers follow
 	/// listed ones.
-	#[must_use]
 	pub fn provider_rank(&self, provider: &str) -> usize {
 		self
 			.provider_order
@@ -305,7 +303,6 @@ impl ModelSettings {
 	}
 
 	/// Resolves route family and provider-specific tier policy.
-	#[must_use]
 	pub fn service_tier_for_route(
 		&self,
 		provider: &str,
@@ -320,7 +317,6 @@ impl ModelSettings {
 	}
 
 	/// Resolves a family/audience service tier into the concrete wire value.
-	#[must_use]
 	pub fn service_tier(
 		&self,
 		family: ProviderFamily,
@@ -347,7 +343,6 @@ impl ModelSettings {
 	}
 
 	/// Reports whether a concrete route satisfies configured wire preferences.
-	#[must_use]
 	pub fn wire_route_allowed(
 		&self,
 		provider: &str,
@@ -373,7 +368,6 @@ impl ModelSettings {
 
 	/// Applies the configured OpenRouter suffix only when the model has no
 	/// explicit variant.
-	#[must_use]
 	pub fn openrouter_wire_model(&self, provider: &str, model: &WireModelId<str>) -> WireModelId {
 		if provider != "openrouter"
 			|| self.openrouter_variant == OpenRouterVariant::Default
@@ -388,7 +382,6 @@ impl ModelSettings {
 	}
 
 	/// Selects the configured model for one harness-owned auxiliary purpose.
-	#[must_use]
 	pub const fn special_selector(&self, purpose: SpecialModelPurpose) -> &Str {
 		match purpose {
 			SpecialModelPurpose::Tiny => &self.tiny_selector,
@@ -399,7 +392,6 @@ impl ModelSettings {
 	}
 
 	/// Returns a bounded first-event timeout derived from provider settings.
-	#[must_use]
 	pub const fn plan_ttl(&self) -> Duration {
 		Duration::from_secs(30)
 	}
@@ -557,7 +549,6 @@ const fn field(
 omp_settings::inventory::submit! { DomainRegistration::of::<ModelSettings>() }
 
 /// Resolves provider family from canonical route and model identities.
-#[must_use]
 pub fn provider_family(provider: &str, model: Option<&str>) -> ProviderFamily {
 	let model = model.unwrap_or_default();
 	if provider.contains("anthropic")

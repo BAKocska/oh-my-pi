@@ -1381,7 +1381,6 @@ impl Ui {
 	///
 	/// Hosts and test harnesses use this to inspect the mounted component
 	/// tree; mutation stays inside the retained update path.
-	#[must_use]
 	pub const fn root(&self) -> &Cached {
 		&self.root
 	}

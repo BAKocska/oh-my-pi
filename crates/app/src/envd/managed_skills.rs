@@ -36,7 +36,6 @@ pub struct ManagedSkills {
 impl ManagedSkills {
 	/// Creates an authority with an immutable set of authored names which
 	/// generated skills may never claim.
-	#[must_use]
 	pub fn new(root: PathBuf, authored_names: BTreeSet<Str>) -> Self {
 		Self {
 			root,
@@ -49,7 +48,6 @@ impl ManagedSkills {
 	}
 
 	/// Returns the latest Environment-refreshed generated-skill inventory.
-	#[must_use]
 	pub fn inventory(&self) -> Arc<SkillSnapshot> {
 		Arc::clone(&self.inventory.read())
 	}
@@ -236,6 +234,7 @@ impl ManagedSkillAuthority for ManagedSkills {
 	}
 }
 
+#[must_use]
 struct NameLock<'a> {
 	owner: &'a ManagedSkills,
 	name:  Str,

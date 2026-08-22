@@ -115,7 +115,6 @@ pub struct SessionTitleState {
 impl SessionTitleState {
 	/// Returns whether this turn may start title generation. User titles are
 	/// immutable to automatic refreshes; assistant titles refresh after replans.
-	#[must_use]
 	pub fn should_generate(&self, input: &str, replanned: bool) -> bool {
 		if self.source == Some(TitleSource::User) || is_low_signal_title_input(input) {
 			return false;
@@ -209,7 +208,6 @@ pub async fn generate_online_title(
 }
 
 /// Collapses a user-invoked skill expansion back to its stable title chip.
-#[must_use]
 pub fn skill_title_input(name: &str, args: &str) -> Str {
 	let name = name.trim();
 	let args = args.trim();
@@ -223,7 +221,6 @@ pub fn skill_title_input(name: &str, args: &str) -> Str {
 
 /// Deterministically rejects greetings, acknowledgements, bare numbers, and
 /// punctuation-only input before any model request.
-#[must_use]
 pub fn is_low_signal_title_input(input: &str) -> bool {
 	for token in input
 		.split(|character: char| !character.is_alphanumeric())
@@ -242,7 +239,6 @@ pub fn is_low_signal_title_input(input: &str) -> bool {
 
 /// Normalizes marker/plain/JSON title responses and rejects leaked reasoning,
 /// overlong answers, punctuation junk, and the `none` sentinel.
-#[must_use]
 pub fn normalize_generated_title(raw: &str) -> Option<Str> {
 	let visible = extract_visible_title(raw)?;
 	let mut title = unwrap_json_title(visible.trim());

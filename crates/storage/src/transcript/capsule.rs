@@ -18,7 +18,6 @@ use crate::transcript::{
 /// summaries. They are reusable only by the exact provider and model that
 /// created them; accepting them after a provider switch would silently erase
 /// model context that cannot be reconstructed from the capsule.
-#[must_use]
 pub fn checkpoint_reusable(provider: &ProviderId, model: &ModelId, active: &ModelRef) -> bool {
 	provider == &active.provider && model == &active.model
 }
@@ -82,13 +81,11 @@ pub struct DefaultCtx<'a> {
 
 impl<'a> DefaultCtx<'a> {
 	/// Builds context for a native item projected by one block.
-	#[must_use]
 	pub const fn single(kind: &'a BlockKind) -> Self {
 		Self { kind, following: &[], join: None }
 	}
 
 	/// Builds context for an item spanning this block and same-kind followers.
-	#[must_use]
 	pub const fn grouped(
 		kind: &'a BlockKind,
 		following: &'a [&'a BlockKind],
@@ -98,19 +95,16 @@ impl<'a> DefaultCtx<'a> {
 	}
 
 	/// Returns the leading neutral block kind.
-	#[must_use]
 	pub const fn kind(&self) -> &'a BlockKind {
 		self.kind
 	}
 
 	/// Returns the number of neutral blocks projected by the item.
-	#[must_use]
 	pub fn np(&self) -> u32 {
 		u32::try_from(self.following.len().saturating_add(1)).unwrap_or(u32::MAX)
 	}
 
 	/// Returns the requested multi-part join mode.
-	#[must_use]
 	pub const fn join(&self) -> Option<JoinMode> {
 		self.join
 	}
@@ -119,12 +113,10 @@ impl<'a> DefaultCtx<'a> {
 /// A provider dialect with deterministic, peek-free native-item defaults.
 pub trait Dialect {
 	/// Returns the stable dialect identifier stored in replay capsules.
-	#[must_use]
 	fn id(&self) -> DialectId;
 
 	/// Renders a native-item default using only neutral block content and a
 	/// rules revision.
-	#[must_use]
 	fn default_item(&self, ctx: DefaultCtx<'_>, rev: Rev) -> Value;
 }
 
@@ -253,7 +245,6 @@ pub fn split_markers(
 ///
 /// Fields are replaced atomically. Default fields absent from `actual` are
 /// represented by the typed `~omit` marker.
-#[must_use]
 pub fn diff(default: &Value, actual: &Value) -> BTreeMap<Str, Box<RawValue>> {
 	let mut fields = BTreeMap::new();
 	let default = default.as_object();
@@ -282,7 +273,6 @@ pub fn diff(default: &Value, actual: &Value) -> BTreeMap<Str, Box<RawValue>> {
 
 /// Applies whole-field capsule replacements and omissions to a rendered
 /// default.
-#[must_use]
 pub fn overlay(default: Value, f: &BTreeMap<Str, Box<RawValue>>) -> Value {
 	let mut object = match default {
 		Value::Object(object) => object,

@@ -53,6 +53,7 @@ pub enum PowerError {
 
 /// RAII assertion released on success, failure, cancellation, panic unwind, or
 /// shutdown.
+#[must_use]
 pub struct PowerAssertion {
 	child: Option<Child>,
 }
@@ -87,7 +88,6 @@ impl PowerAssertion {
 	}
 
 	/// Returns whether this process currently owns a host assertion helper.
-	#[must_use]
 	pub const fn is_active(&self) -> bool {
 		self.child.is_some()
 	}
@@ -101,7 +101,6 @@ pub struct PowerActivity {
 
 impl PowerActivity {
 	/// Creates a run activity hook for `mode`.
-	#[must_use]
 	pub fn new(mode: SleepPrevention) -> Arc<Self> {
 		Arc::new(Self { mode, assertion: Mutex::new(None) })
 	}

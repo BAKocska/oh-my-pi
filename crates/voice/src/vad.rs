@@ -76,7 +76,6 @@ impl Default for StreamEndpointer {
 
 impl StreamEndpointer {
 	/// Creates an endpointer. Invalid zero/range values are safely bounded.
-	#[must_use]
 	pub fn new(mut config: EndpointerConfig) -> Self {
 		config.sample_rate = config.sample_rate.max(1);
 		config.frame_ms = config.frame_ms.max(1);
@@ -105,7 +104,6 @@ impl StreamEndpointer {
 	}
 
 	/// Returns the current adaptive ambient RMS floor.
-	#[must_use]
 	pub const fn noise_floor(&self) -> f32 {
 		self.noise_floor
 	}

@@ -128,13 +128,11 @@ impl<S: AdvisorStatisticsSink> AdvisorTranscriptStore<S> {
 	}
 
 	/// Returns historical totals observed by this store instance.
-	#[must_use]
 	pub fn totals(&self, advisor_id: &str) -> AdvisorUsageTotals {
 		self.totals.get(advisor_id).copied().unwrap_or_default()
 	}
 
 	/// Returns the stable JSONL path for one advisor id.
-	#[must_use]
 	pub fn path_for(&self, advisor_id: &str) -> PathBuf {
 		self
 			.root

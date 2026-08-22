@@ -35,7 +35,6 @@ pub struct StatsApi {
 
 impl StatsApi {
 	/// Creates an API backed by the authoritative receipt index.
-	#[must_use]
 	pub fn new(index: Arc<SessionIndex>, sync_lock: PathBuf) -> Self {
 		Self { index, sync_lock }
 	}

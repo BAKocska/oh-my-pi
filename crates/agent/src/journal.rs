@@ -111,13 +111,11 @@ pub struct WorkspaceRoots {
 
 impl WorkspaceRoots {
 	/// Returns the current primary root after future-only moves are folded.
-	#[must_use]
 	pub fn primary(&self) -> &Path {
 		&self.primary
 	}
 
 	/// Returns ordered secondary roots after all durable mutations are folded.
-	#[must_use]
 	pub fn secondary(&self) -> &[PathBuf] {
 		&self.secondary
 	}
@@ -371,7 +369,6 @@ pub struct ReplicationSubscription {
 
 impl ReplicationSubscription {
 	/// Returns the host revision fenced by the catch-up snapshot.
-	#[must_use]
 	pub const fn host_revision(&self) -> u64 {
 		self.host_revision
 	}
@@ -382,7 +379,6 @@ impl ReplicationSubscription {
 	}
 
 	/// Returns the number of catch-up records not yet consumed.
-	#[must_use]
 	pub fn catch_up_len(&self) -> usize {
 		self.catch_up.len()
 	}
@@ -1028,7 +1024,6 @@ impl Journal {
 	}
 
 	/// Returns the durable session identity owned by this journal.
-	#[must_use]
 	pub const fn session_id(&self) -> &transcript::SessionId {
 		&self.session_id
 	}
@@ -1242,7 +1237,6 @@ impl Journal {
 
 	/// Returns the latest durable context position reconstructed from journal
 	/// boundaries.
-	#[must_use]
 	pub const fn context_position(&self) -> ContextPosition {
 		ContextPosition {
 			anchor:   self.prompt_anchor,
@@ -1522,7 +1516,6 @@ impl Journal {
 	}
 
 	/// Borrows the live entry-kind registry for scoped query validation.
-	#[must_use]
 	pub const fn entry_kinds(&self) -> &EntryKindRegistry {
 		&self.entry_kinds
 	}
@@ -1532,7 +1525,6 @@ impl Journal {
 	///
 	/// Live-fact writers advance phases during the turn, so post-outcome
 	/// replay ladders consult this to skip steps the journal already passed.
-	#[must_use]
 	pub fn invocation_phase(&self, invocation_id: &str) -> Option<InvocationPhase> {
 		self
 			.invocations
@@ -3340,7 +3332,6 @@ impl Journal {
 
 	/// Returns unclaimed durable input events, including inputs released by an
 	/// aborted turn during crash replay.
-	#[must_use]
 	pub fn recoverable_input_events(&self) -> &[u64] {
 		if self.released_inputs.is_empty() {
 			self
@@ -3353,13 +3344,11 @@ impl Journal {
 	}
 
 	/// Returns input events released from trailing aborted turns.
-	#[must_use]
 	pub(crate) fn released_input_events(&self) -> &[u64] {
 		&self.released_inputs
 	}
 
 	/// Returns unclaimed durable detached-job settlement event IDs.
-	#[must_use]
 	pub fn recoverable_settlement_events(&self) -> &[u64] {
 		&self.recoverable_settlements
 	}
@@ -3368,7 +3357,6 @@ impl Journal {
 	///
 	/// Inputs released by an aborted turn remain startup-visible under a fresh
 	/// logical turn identity when no later staged submission exists.
-	#[must_use]
 	pub fn pending_input_submission(&self) -> Option<(&Str, &[u64])> {
 		self
 			.pending_inputs
@@ -3384,7 +3372,6 @@ impl Journal {
 
 	/// Returns whether a startup-visible submission is reclaimed from an aborted
 	/// turn.
-	#[must_use]
 	pub(crate) fn is_released_submission(&self, turn_id: &str) -> bool {
 		self
 			.released_turn_id
@@ -3413,13 +3400,11 @@ impl Journal {
 	}
 
 	/// Returns whether a turn has a terminal durable receipt.
-	#[must_use]
 	pub fn contains_turn(&self, turn_id: &str) -> bool {
 		self.receipts.contains_key(turn_id)
 	}
 
 	/// Returns the authoritative committed prompt identity and head event IDs.
-	#[must_use]
 	pub fn active_prompt(&self) -> Option<(Hash32, &[u64])> {
 		self
 			.active_prompt
@@ -3428,19 +3413,16 @@ impl Journal {
 	}
 
 	/// Returns the most recently appended terminal receipt in physical order.
-	#[must_use]
 	pub const fn latest_receipt(&self) -> Option<&TurnReceipt> {
 		self.last_receipt.as_ref()
 	}
 
 	/// Returns the durable terminal receipt for one logical turn.
-	#[must_use]
 	pub fn receipt(&self, turn_id: &str) -> Option<&TurnReceipt> {
 		self.receipts.get(turn_id)
 	}
 
 	/// Returns whether a failed turn identity has a durable abort settlement.
-	#[must_use]
 	pub fn is_turn_aborted(&self, turn_id: &str) -> bool {
 		self.aborted.contains_key(turn_id)
 	}
@@ -3450,7 +3432,6 @@ impl Journal {
 	///
 	/// A successful receipt or a non-recoverable abort fences older failures so
 	/// a later caller-authored submission starts with a fresh retry cap.
-	#[must_use]
 	pub fn trailing_aborts(&self) -> u32 {
 		let boundary = self
 			.aborted
@@ -3474,7 +3455,6 @@ impl Journal {
 	}
 
 	/// Returns the number of canonical item events observed by this writer.
-	#[must_use]
 	pub const fn item_count(&self) -> u64 {
 		self.item_count
 	}

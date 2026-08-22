@@ -120,77 +120,66 @@ impl Default for OverlayOptions {
 
 impl OverlayOptions {
 	/// Sets the requested width.
-	#[must_use]
 	pub const fn width(mut self, width: Dim) -> Self {
 		self.width = Some(width);
 		self
 	}
 
 	/// Sets the minimum width in cells.
-	#[must_use]
 	pub const fn min_width(mut self, min_width: u16) -> Self {
 		self.min_width = Some(min_width);
 		self
 	}
 
 	/// Sets the maximum height.
-	#[must_use]
 	pub const fn max_height(mut self, max_height: Dim) -> Self {
 		self.max_height = Some(max_height);
 		self
 	}
 
 	/// Sets the stacking height.
-	#[must_use]
 	pub const fn z(mut self, z: i16) -> Self {
 		self.z = z;
 		self
 	}
 
 	/// Sets the fallback anchor position.
-	#[must_use]
 	pub const fn anchor(mut self, anchor: OverlayAnchor) -> Self {
 		self.anchor = anchor;
 		self
 	}
 
 	/// Sets the horizontal offset in cells.
-	#[must_use]
 	pub const fn offset_x(mut self, offset_x: i16) -> Self {
 		self.offset_x = offset_x;
 		self
 	}
 
 	/// Sets the vertical offset in cells.
-	#[must_use]
 	pub const fn offset_y(mut self, offset_y: i16) -> Self {
 		self.offset_y = offset_y;
 		self
 	}
 
 	/// Sets an explicit absolute or percentage row.
-	#[must_use]
 	pub const fn row(mut self, row: Dim) -> Self {
 		self.row = Some(row);
 		self
 	}
 
 	/// Sets an explicit absolute or percentage column.
-	#[must_use]
 	pub const fn col(mut self, col: Dim) -> Self {
 		self.col = Some(col);
 		self
 	}
 
 	/// Sets the viewport-edge insets.
-	#[must_use]
 	pub const fn margin(mut self, margin: OverlayMargin) -> Self {
 		self.margin = margin;
 		self
 	}
 
 	/// Sets the minimum viewport required for visibility.
-	#[must_use]
 	pub const fn min_viewport(mut self, min_viewport: Size) -> Self {
 		self.min_viewport = min_viewport;
 		self
@@ -201,7 +190,6 @@ impl OverlayOptions {
 	/// [`crate::Ui::focus_overlay`] hands the keyboard to the layer on
 	/// demand; a click inside its band does the same, and a click outside
 	/// (or an unconsumed `Esc`) returns it.
-	#[must_use]
 	pub const fn non_modal(mut self) -> Self {
 		self.modal = false;
 		self
@@ -209,7 +197,6 @@ impl OverlayOptions {
 
 	/// Stretches a retained overlay tree to the full available viewport
 	/// height.
-	#[must_use]
 	pub const fn fill_height(mut self) -> Self {
 		self.fill_height = true;
 		self

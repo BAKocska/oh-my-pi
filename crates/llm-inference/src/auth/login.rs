@@ -47,7 +47,6 @@ impl LoginCancellation {
 	}
 
 	/// Returns whether cancellation has been requested.
-	#[must_use]
 	pub fn is_cancelled(&self) -> bool {
 		self.cancelled.load(Ordering::Acquire)
 	}
@@ -78,7 +77,6 @@ pub struct LoginDriver {
 
 impl LoginDriver {
 	/// Returns the stable session identity.
-	#[must_use]
 	pub fn id(&self) -> &LoginSessionId<str> {
 		&self.id
 	}
@@ -135,7 +133,6 @@ impl LoginDriver {
 	}
 
 	/// Returns a clone-cheap cancellation capability.
-	#[must_use]
 	pub fn cancellation(&self) -> LoginCancellation {
 		self.cancellation.clone()
 	}

@@ -232,7 +232,6 @@ pub struct Registration<SE: extensions::ShellExtensions> {
 
 impl<SE: extensions::ShellExtensions> Registration<SE> {
 	/// Updates the given registration to mark it for a special builtin.
-	#[must_use]
 	pub const fn special(self) -> Self {
 		Self { special_builtin: true, ..self }
 	}
@@ -241,7 +240,6 @@ impl<SE: extensions::ShellExtensions> Registration<SE> {
 	/// background command. The first word argument becomes the launched command,
 	/// and the wrapper itself is skipped so `$!` can refer to the real child
 	/// PID.
-	#[must_use]
 	pub const fn transparent_background_wrapper(self) -> Self {
 		Self { transparent_background_wrapper: true, ..self }
 	}

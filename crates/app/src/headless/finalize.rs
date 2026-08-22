@@ -35,7 +35,6 @@ pub struct FinalizerBudget {
 impl FinalizerBudget {
 	/// Normal successful completion: ten minutes for advisor catch-up and the
 	/// configured Mnemopi consolidation bound.
-	#[must_use]
 	pub const fn success(mnemopi: Duration) -> Self {
 		Self {
 			advisor: Duration::from_secs(600),
@@ -46,7 +45,6 @@ impl FinalizerBudget {
 	}
 
 	/// Terminal failure: every remaining phase is bounded by thirty seconds.
-	#[must_use]
 	pub const fn terminal_error() -> Self {
 		Self {
 			advisor:   Duration::from_secs(30),
@@ -83,7 +81,6 @@ pub struct HeadlessFinalizerHandle {
 impl HeadlessFinalizerHandle {
 	/// Creates an empty finalizer. Disabled authorities therefore complete
 	/// immediately without sleeps.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { advisor: None, mnemopi: None, telemetry: None }
 	}

@@ -57,7 +57,6 @@ impl Default for PlanState {
 impl PlanState {
 	/// Creates the next enabled projection, preserving the active artifact and
 	/// workflow while recording re-entry.
-	#[must_use]
 	pub fn entered(previous: Option<&Self>) -> Self {
 		let mut state = previous.cloned().unwrap_or_default();
 		state.reentry = previous.is_some();
@@ -66,7 +65,6 @@ impl PlanState {
 	}
 
 	/// Returns the disabled projection without discarding the plan reference.
-	#[must_use]
 	pub fn exited(&self) -> Self {
 		let mut state = self.clone();
 		state.enabled = false;

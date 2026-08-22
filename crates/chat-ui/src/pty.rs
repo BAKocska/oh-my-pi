@@ -92,7 +92,6 @@ impl PtyOutputQueue {
 	}
 
 	/// Returns the number of chunks dropped from the live projection.
-	#[must_use]
 	pub const fn dropped(&self) -> u64 {
 		self.dropped
 	}
@@ -115,7 +114,6 @@ pub struct TerminalState {
 
 impl TerminalState {
 	/// Creates a blank terminal with PI-parity scrollback capacity.
-	#[must_use]
 	pub fn new(rows: u16, columns: u16) -> Self {
 		let rows = rows.max(1);
 		let columns = columns.max(1);
@@ -237,13 +235,11 @@ impl TerminalState {
 	}
 
 	/// Returns whether DEC application-cursor mode is active.
-	#[must_use]
 	pub const fn application_cursor(&self) -> bool {
 		self.application_cursor
 	}
 
 	/// Copies the visible viewport as plain rows.
-	#[must_use]
 	pub fn visible_lines(&self) -> Vec<Str> {
 		self
 			.screen
@@ -420,7 +416,6 @@ pub struct PtyOverlay {
 
 impl PtyOverlay {
 	/// Opens a running terminal overlay.
-	#[must_use]
 	pub fn open(id: Str, command: Str, ctx: &UiContext) -> Self {
 		let width = 80;
 		let height = 24;
@@ -446,7 +441,6 @@ impl PtyOverlay {
 	}
 
 	/// Returns the stable tool-call identity owning this overlay.
-	#[must_use]
 	pub fn id(&self) -> &Str {
 		&self.id
 	}
@@ -527,7 +521,6 @@ impl PtyOverlay {
 	}
 
 	/// Returns the current PTY dimensions as `(rows, columns)`.
-	#[must_use]
 	pub fn dimensions(&self) -> (u16, u16) {
 		(self.height.saturating_sub(4).max(1), self.width.saturating_sub(2).max(1))
 	}

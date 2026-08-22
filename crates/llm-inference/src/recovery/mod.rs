@@ -30,7 +30,6 @@ pub struct DiagnosticContext {
 
 impl DiagnosticContext {
 	/// Captures at most `limit` bytes from the beginning and end of `input`.
-	#[must_use]
 	pub fn capture(input: &[u8], limit: usize) -> Self {
 		if input.len() <= limit {
 			return Self {
@@ -48,19 +47,16 @@ impl DiagnosticContext {
 	}
 
 	/// Borrows the explicitly bounded byte preview.
-	#[must_use]
 	pub fn preview(&self) -> &[u8] {
 		&self.preview
 	}
 
 	/// Returns the complete input length without retaining the complete input.
-	#[must_use]
 	pub const fn input_bytes(&self) -> usize {
 		self.input_bytes
 	}
 
 	/// Returns whether bytes were omitted between the retained ends.
-	#[must_use]
 	pub const fn is_truncated(&self) -> bool {
 		self.truncated
 	}

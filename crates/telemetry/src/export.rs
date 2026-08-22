@@ -93,7 +93,6 @@ pub struct ExportStats {
 
 impl ExportTarget {
 	/// Returns whether this target requires explicit network egress capability.
-	#[must_use]
 	pub const fn requires_network(&self) -> bool {
 		matches!(self, Self::Otlp(_))
 	}

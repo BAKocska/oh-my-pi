@@ -69,7 +69,6 @@ impl std::fmt::Debug for StatsIngestor {
 
 impl StatsIngestor {
 	/// Starts a bounded worker pool. `worker_count` is clamped to at least one.
-	#[must_use]
 	pub fn new(database: Arc<StatsDb>, worker_count: usize, queue_capacity: usize) -> Self {
 		let (sender, receiver) = flume::bounded(queue_capacity.max(1));
 		let mut workers = Vec::with_capacity(worker_count.max(1));

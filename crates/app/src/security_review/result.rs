@@ -41,19 +41,16 @@ impl ReviewScope {
 	}
 
 	/// Canonical workspace root.
-	#[must_use]
 	pub fn root(&self) -> &Path {
 		&self.root
 	}
 
 	/// Canonical bounded target.
-	#[must_use]
 	pub fn target(&self) -> &Path {
 		&self.target
 	}
 
 	/// Returns the target as a workspace-relative path for the child assignment.
-	#[must_use]
 	pub fn relative_target(&self) -> &Path {
 		self
 			.target

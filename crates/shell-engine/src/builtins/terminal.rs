@@ -16,6 +16,7 @@ pub(crate) struct Settings {
 }
 
 /// Restores a terminal's original mode when dropped.
+#[must_use]
 pub(crate) struct AutoModeGuard {
 	initial: sys::terminal::Config,
 	file:    openfiles::OpenFile,

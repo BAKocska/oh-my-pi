@@ -14,7 +14,6 @@ pub(super) fn decode_json<T: DeserializeOwned>(response: &HttpResponse) -> Resul
 ///
 /// Malformed escapes and decoded byte sequences that are not UTF-8 return
 /// `None`; `+` remains a literal plus because this decodes a path, not a form.
-#[must_use]
 pub(super) fn percent_decode_component(component: &str) -> Option<String> {
 	let bytes = component.as_bytes();
 	let mut decoded = Vec::with_capacity(bytes.len());
@@ -38,7 +37,6 @@ pub(super) fn percent_decode_component(component: &str) -> Option<String> {
 }
 
 /// Encodes a JavaScript `encodeURIComponent` component from UTF-8 bytes.
-#[must_use]
 pub(super) fn encode_uri_component(component: &str) -> String {
 	const HEX: &[u8; 16] = b"0123456789ABCDEF";
 	let mut encoded = String::with_capacity(component.len());
@@ -66,7 +64,6 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 /// Builds a cleaned, capped markdown render result.
-#[must_use]
 pub(super) fn build_result(content: &str, method: impl IntoStr) -> RenderResult {
 	RenderResult::markdown(content, method)
 }
@@ -105,7 +102,6 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> 
 }
 
 /// Formats a date-like ISO string as `YYYY-MM-DD`, or returns an empty string.
-#[must_use]
 pub(super) fn format_iso_date(value: &str) -> Str {
 	let bytes = value.as_bytes();
 	if bytes.len() >= 10
@@ -122,7 +118,6 @@ pub(super) fn format_iso_date(value: &str) -> Str {
 }
 
 /// Formats Unix milliseconds as a UTC `YYYY-MM-DD` date.
-#[must_use]
 pub(super) fn format_unix_date(milliseconds: i64) -> Str {
 	let days = milliseconds.div_euclid(86_400_000);
 	let (year, month, day) = civil_from_days(days);
@@ -146,7 +141,6 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 }
 
 /// Decodes the common HTML entities emitted by supported APIs.
-#[must_use]
 pub(super) fn decode_html_entities(text: &str) -> Str {
 	text
 		.replace("&lt;", "<")
@@ -162,7 +156,6 @@ pub(super) fn decode_html_entities(text: &str) -> Str {
 }
 
 /// Formats seconds as `H:MM:SS` or `M:SS`.
-#[must_use]
 pub(super) fn format_media_duration(total_seconds: u64) -> Str {
 	let hours = total_seconds / 3_600;
 	let minutes = total_seconds % 3_600 / 60;
@@ -175,7 +168,6 @@ pub(super) fn format_media_duration(total_seconds: u64) -> Str {
 }
 
 /// Formats an integer with ASCII thousands separators.
-#[must_use]
 pub(super) fn format_number(number: u64) -> Str {
 	let digits = number.to_string();
 	let mut result = String::with_capacity(digits.len() + digits.len() / 3);
@@ -190,7 +182,6 @@ pub(super) fn format_number(number: u64) -> Str {
 }
 /// Formats a number with the compact K/M/B notation used by pi registry
 /// projections.
-#[must_use]
 pub(super) fn format_compact_number(number: u64) -> Str {
 	match number {
 		0..=999 => number.to_string().into(),

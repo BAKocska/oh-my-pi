@@ -105,7 +105,6 @@ pub fn substitute_package_placeholders(
 }
 
 /// Recursively substitutes placeholders in literal environment maps.
-#[must_use]
 pub fn substitute_environment(
 	environment: &BTreeMap<Str, Str>,
 	package_root: &Path,

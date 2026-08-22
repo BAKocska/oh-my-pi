@@ -78,7 +78,6 @@ pub struct CommandProvenance {
 
 impl CommandProvenance {
 	/// Provenance shared by compiled commands.
-	#[must_use]
 	pub fn builtin() -> Self {
 		Self {
 			source:     sf!("builtin"),
@@ -215,13 +214,11 @@ pub struct CommandRoster {
 
 impl CommandRoster {
 	/// Builds the inventory roster with no dynamic contributions.
-	#[must_use]
 	pub fn builtins() -> Self {
 		Self::with_contributions([], &ShadowPolicy::default())
 	}
 
 	/// Builds inventory declarations plus atomically published contributions.
-	#[must_use]
 	pub fn with_contributions(
 		generations: impl IntoIterator<Item = CommandGeneration>,
 		policy: &ShadowPolicy,
@@ -233,7 +230,6 @@ impl CommandRoster {
 
 	/// Builds inventory declarations while omitting disabled builtins before
 	/// help, completion, advertisement, and dispatch indexes are derived.
-	#[must_use]
 	pub fn with_contributions_filtered(
 		generations: impl IntoIterator<Item = CommandGeneration>,
 		policy: &ShadowPolicy,
@@ -250,7 +246,6 @@ impl CommandRoster {
 
 	/// Builds one atomic roster from compiled declarations and source
 	/// generations.
-	#[must_use]
 	pub fn build(
 		builtins: impl IntoIterator<Item = CommandDeclaration>,
 		generations: impl IntoIterator<Item = CommandGeneration>,
@@ -299,13 +294,11 @@ impl CommandRoster {
 	}
 
 	/// Slash completion entries derived from the winning roster.
-	#[must_use]
 	pub fn completions(&self) -> Vec<omp_tui::Command> {
 		self.completions_for(CommandRole::Owner)
 	}
 
 	/// Slash completion entries filtered for the collaboration role.
-	#[must_use]
 	pub fn completions_for(&self, role: CommandRole) -> Vec<omp_tui::Command> {
 		use smallvec::SmallVec;
 		self
@@ -336,7 +329,6 @@ impl CommandRoster {
 	}
 
 	/// Advertises the same winning roster used by dispatch.
-	#[must_use]
 	pub fn advertised(
 		&self,
 		surface: CommandSurface,
@@ -369,7 +361,6 @@ impl CommandRoster {
 	}
 
 	/// Renders help from the same filtered declarations used by completion.
-	#[must_use]
 	pub fn help_text(
 		&self,
 		surface: CommandSurface,

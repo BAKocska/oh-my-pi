@@ -38,7 +38,6 @@ pub struct SettingsSnapshot {
 
 impl SettingsSnapshot {
 	/// Constructs a production snapshot from an already composed document.
-	#[must_use]
 	pub fn persistent(
 		revision: Revision,
 		domain_revisions: BTreeMap<&'static str, DomainRevision>,
@@ -53,7 +52,6 @@ impl SettingsSnapshot {
 	}
 
 	/// Constructs a read-only snapshot.
-	#[must_use]
 	pub fn read_only(document: toml::Table) -> Self {
 		Self {
 			revision:         Revision(0),
@@ -64,7 +62,6 @@ impl SettingsSnapshot {
 	}
 
 	/// Constructs a filesystem-isolated snapshot from a merged root document.
-	#[must_use]
 	pub fn isolated_document(document: toml::Table) -> Self {
 		Self {
 			revision:         Revision(0),
@@ -99,19 +96,16 @@ impl SettingsSnapshot {
 	}
 
 	/// Returns the whole-document revision.
-	#[must_use]
 	pub const fn revision(&self) -> Revision {
 		self.revision
 	}
 
 	/// Returns the construction mode.
-	#[must_use]
 	pub const fn mode(&self) -> SnapshotMode {
 		self.mode
 	}
 
 	/// Returns one domain's current revision, or zero before its first change.
-	#[must_use]
 	pub fn domain_revision(&self, domain: &str) -> DomainRevision {
 		self
 			.domain_revisions
@@ -121,7 +115,6 @@ impl SettingsSnapshot {
 	}
 
 	/// Borrows the merged TOML document for reflected reads.
-	#[must_use]
 	pub fn document(&self) -> &toml::Table {
 		&self.document
 	}
@@ -149,19 +142,16 @@ pub struct TypedProjection<D> {
 
 impl<D> TypedProjection<D> {
 	/// Borrows the projected settings.
-	#[must_use]
 	pub fn get(&self) -> &D {
 		&self.value
 	}
 
 	/// Clones the shared projected settings handle.
-	#[must_use]
 	pub fn shared(&self) -> Arc<D> {
 		Arc::clone(&self.value)
 	}
 
 	/// Returns the domain revision represented by this projection.
-	#[must_use]
 	pub const fn revision(&self) -> DomainRevision {
 		self.revision
 	}
@@ -175,7 +165,6 @@ pub struct SnapshotPublisher {
 
 impl SnapshotPublisher {
 	/// Creates a subscription that wakes only when `domain` advances.
-	#[must_use]
 	pub fn subscribe(&self, domain: &'static str, current: DomainRevision) -> Subscription {
 		let (sender, receiver) = flume::unbounded();
 		self.subscribers.lock().push(sender);

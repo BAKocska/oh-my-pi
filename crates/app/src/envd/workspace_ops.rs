@@ -146,6 +146,7 @@ struct IsolationOwner<'a> {
 
 const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner";
 
+#[must_use]
 struct WorktreeBuild {
 	root:  PathBuf,
 	armed: bool,

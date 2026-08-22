@@ -64,7 +64,6 @@ pub struct CombinedAuthAuthority {
 
 impl CombinedAuthAuthority {
 	/// Composes both credential domains over one already-open encrypted store.
-	#[must_use]
 	pub fn new(store: Arc<CredentialStore>) -> Self {
 		Self { stored: StoredCredentialSource::new(store.clone()), store }
 	}
@@ -79,7 +78,6 @@ impl CombinedAuthAuthority {
 
 	/// Derives a non-reversible account identity from profile and MCP server
 	/// identity. The source URL/name is never persisted as affinity.
-	#[must_use]
 	pub fn mcp_affinity(
 		profile: &str,
 		server_identity: &str,

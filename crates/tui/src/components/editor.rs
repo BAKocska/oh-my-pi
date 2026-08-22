@@ -91,7 +91,6 @@ pub struct ComposerLayout {
 
 impl ComposerStyle {
 	/// Resolves row chrome and status placement for `charset`.
-	#[must_use]
 	pub const fn layout(self, _charset: Charset) -> ComposerLayout {
 		let gutter_width = match self {
 			Self::Claude | Self::Borderless | Self::Rule | Self::Pi => 2,
@@ -137,7 +136,6 @@ impl ComposerStyle {
 	}
 
 	/// Prompt gutter for the first editable row.
-	#[must_use]
 	pub const fn prompt_gutter(self, charset: Charset) -> &'static str {
 		match self {
 			Self::Claude | Self::Borderless | Self::Rule => charset.cursor(),
@@ -147,7 +145,6 @@ impl ComposerStyle {
 	}
 
 	/// Total rows reserved below the editor for standalone status.
-	#[must_use]
 	pub const fn standalone_status_rows(self) -> u16 {
 		match self {
 			Self::Box => 0,
@@ -202,7 +199,6 @@ pub struct KeywordAccent {
 
 impl KeywordAccent {
 	/// Creates an immutable keyword set. Empty values are ignored.
-	#[must_use]
 	pub fn new(keywords: impl IntoIterator<Item = Str>) -> Self {
 		Self {
 			keywords: keywords
@@ -213,13 +209,11 @@ impl KeywordAccent {
 	}
 
 	/// Uses an already shared immutable keyword set without copying it.
-	#[must_use]
 	pub fn from_shared(keywords: Arc<[Str]>) -> Self {
 		Self { keywords }
 	}
 
 	/// Finds case-insensitive whole-word keyword spans in one immutable text.
-	#[must_use]
 	pub fn matched_spans(&self, text: &str) -> SmallVec<(usize, usize), 8> {
 		let mut spans = SmallVec::new();
 		for (at, _) in text.char_indices() {
@@ -291,7 +285,6 @@ impl EditInput {
 	}
 
 	/// Selects the built-in composer chrome.
-	#[must_use]
 	pub const fn composer_style(mut self, style: ComposerStyle) -> Self {
 		self.style = style;
 		self
@@ -1196,7 +1189,6 @@ impl Attachments {
 	}
 
 	/// Clones visible attachment descriptors without mutating the staged queue.
-	#[must_use]
 	pub fn snapshot(&self) -> Vec<Attachment> {
 		self
 			.state
@@ -1329,7 +1321,6 @@ impl EditorPane {
 	}
 
 	/// Selects built-in chrome for the editable surface and status placement.
-	#[must_use]
 	pub fn composer_style(mut self, style: ComposerStyle) -> Self {
 		self.set_composer_style(style);
 		self
@@ -1345,7 +1336,6 @@ impl EditorPane {
 	}
 
 	/// Selects the data-driven composer keyword accent policy.
-	#[must_use]
 	pub fn keyword_accent(mut self, accent: KeywordAccent) -> Self {
 		self.set_keyword_accent(accent);
 		self
@@ -1360,13 +1350,11 @@ impl EditorPane {
 	}
 
 	/// Returns the active composer chrome.
-	#[must_use]
 	pub const fn style(&self) -> ComposerStyle {
 		self.style
 	}
 
 	/// Sets the composer's completion source (for example, slash commands).
-	#[must_use]
 	pub fn completion(mut self, completion: Box<dyn Completion>) -> Self {
 		self.set_completion(completion);
 		self
@@ -1910,6 +1898,7 @@ pub trait ExternalEditorTerminal {
 }
 
 /// RAII terminal suspension that restores the UI on every exit path.
+#[must_use]
 pub struct ExternalEditorSuspension<'a, T: ExternalEditorTerminal + ?Sized> {
 	terminal: Option<&'a mut T>,
 }

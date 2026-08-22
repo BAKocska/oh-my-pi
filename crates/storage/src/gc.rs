@@ -208,13 +208,11 @@ pub struct ArtifactPage {
 
 impl ArtifactRecord {
 	/// Returns the short session-local address for this artifact.
-	#[must_use]
 	pub fn url(&self) -> ArtifactUrl {
 		ArtifactUrl::from_ordinal(self.ordinal)
 	}
 
 	/// Returns the cross-session digest address when retention is durable.
-	#[must_use]
 	pub fn durable_url(&self) -> Option<ArtifactUrl> {
 		(self.lifetime == ArtifactLifetime::Durable)
 			.then(|| ArtifactUrl::from_digest(self.reference.hash.into_bytes()))
@@ -224,7 +222,6 @@ impl ArtifactRecord {
 	///
 	/// The owning session receives the short ordinal. Other sessions receive the
 	/// durable digest form; non-durable records have no cross-session address.
-	#[must_use]
 	pub fn url_for(&self, session: &SessionId) -> Option<ArtifactUrl> {
 		if &self.session == session {
 			Some(self.url())

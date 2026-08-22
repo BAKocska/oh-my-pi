@@ -409,7 +409,7 @@ impl<I> SqliteConversationStore<I> {
 }
 
 /// A private SQLite turn transaction staged entirely outside committed tables.
-#[must_use = "dropping a SQLite turn draft rolls it back"]
+#[must_use]
 pub struct SqliteTurnDraft<I> {
 	connection:   Arc<Mutex<Connection>>,
 	conversation: ConversationId,

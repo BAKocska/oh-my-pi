@@ -42,7 +42,6 @@ impl ProcessIdentity {
 
 	/// Projects this verified identity into the additive env v1 supervision
 	/// schema.
-	#[must_use]
 	pub fn to_wire(&self) -> omp_proto::env::v1::ProcessIdentity {
 		omp_proto::env::v1::ProcessIdentity {
 			pid:              u64::from(self.pid),
@@ -54,7 +53,6 @@ impl ProcessIdentity {
 
 	/// Verifies a wire identity against the currently running operating-system
 	/// process.
-	#[must_use]
 	pub fn verify_wire(wire: &omp_proto::env::v1::ProcessIdentity) -> bool {
 		let Ok(pid) = u32::try_from(wire.pid) else {
 			return false;

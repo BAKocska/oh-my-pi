@@ -71,7 +71,6 @@ impl std::fmt::Debug for PathService {
 impl PathService {
 	/// Creates a path service sharing the supplied store and transaction
 	/// coordinator.
-	#[must_use]
 	pub const fn new(
 		store: DocumentStore,
 		transactions: TransactionCoordinator<LspRegistry>,

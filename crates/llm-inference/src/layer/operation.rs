@@ -69,7 +69,6 @@ impl OperationPolicyLayer {
 	}
 
 	/// Installs the immutable runtime settings projection applied before policy.
-	#[must_use]
 	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
 		self.settings = settings;
 		self

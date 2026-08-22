@@ -189,7 +189,6 @@ impl<T: Transport> SqlStore<T> {
 	}
 
 	/// Returns the selected prepared SQL, primarily for adapter verification.
-	#[must_use]
 	pub const fn statements(&self) -> [&'static str; 5] {
 		[
 			self.queries.ddl,

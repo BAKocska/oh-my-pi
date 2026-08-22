@@ -68,7 +68,6 @@ impl ContextFile {
 	}
 
 	/// Attaches the canonical source origin retained by discovery.
-	#[must_use]
 	pub fn with_origin(mut self, origin: impl Into<Str>) -> Self {
 		self.origin = origin.into();
 		self
@@ -491,7 +490,6 @@ impl WorkspaceInput {
 
 	/// Attaches a stable source-control identity.
 	#[inline]
-	#[must_use]
 	pub fn with_vcs(mut self, vcs: VcsIdentity) -> Self {
 		self.vcs = Some(vcs);
 		self
@@ -551,7 +549,6 @@ pub struct BandHash([u8; 32]);
 
 impl BandHash {
 	/// Returns the digest bytes.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; 32] {
 		&self.0
 	}
@@ -652,7 +649,6 @@ pub struct CachedContribution {
 
 impl CachedContribution {
 	/// Creates a contribution from host-validated immutable bytes.
-	#[must_use]
 	pub fn new(bytes: impl Into<Str>) -> Self {
 		Self { bytes: bytes.into() }
 	}
@@ -714,13 +710,11 @@ pub struct ModePromptSource {
 
 impl ModePromptSource {
 	/// Creates the prompt source for an active mode.
-	#[must_use]
 	pub const fn new(mode: PromptMode) -> Self {
 		Self { mode }
 	}
 
 	/// Wraps this source in the canonical volatile status slot.
-	#[must_use]
 	pub fn registration(self) -> SlotRegistration {
 		SlotRegistration {
 			decl:   SlotDecl {
@@ -880,13 +874,11 @@ impl PromptPatchSet {
 	}
 
 	/// Returns the ordered patches.
-	#[must_use]
 	pub fn patches(&self) -> &[SlotPatch] {
 		&self.patches
 	}
 
 	/// Returns the accepted byte-expansion ceiling.
-	#[must_use]
 	pub const fn max_byte_expansion(&self) -> usize {
 		self.max_byte_expansion
 	}
@@ -930,7 +922,6 @@ pub struct SlotAssembler {
 impl SlotAssembler {
 	/// Creates an assembler, sorting registrations by class, declared slot,
 	/// priority, and owner.
-	#[must_use]
 	pub fn new(mut registrations: Vec<SlotRegistration>) -> Self {
 		registrations.sort_by(|left, right| {
 			left
@@ -950,14 +941,12 @@ impl SlotAssembler {
 	}
 
 	/// Attaches the durable journal sink used for rejected volatile sources.
-	#[must_use]
 	pub fn with_journal(mut self, journal: Arc<dyn VolatilePromptJournal>) -> Self {
 		self.journal = Some(journal);
 		self
 	}
 
 	/// Installs one already-validated patch set at the snapshot boundary.
-	#[must_use]
 	pub fn with_patches(mut self, patches: PromptPatchSet) -> Self {
 		self.patches = patches;
 		self
@@ -1238,7 +1227,6 @@ macro_rules! fixed_prompt_source {
 	($source:ty, $text:ident, $slot:expr, $owner:literal) => {
 		impl $source {
 			/// Wraps this frozen built-in source in its canonical slot.
-			#[must_use]
 			pub fn registration(self) -> SlotRegistration {
 				SlotRegistration {
 					decl:   SlotDecl {
@@ -1282,7 +1270,6 @@ pub struct RuntimePromptSource;
 
 impl RuntimePromptSource {
 	/// Wraps conditional runtime policy in the stable runtime slot.
-	#[must_use]
 	pub fn registration(self) -> SlotRegistration {
 		SlotRegistration {
 			decl:   SlotDecl {
@@ -1319,7 +1306,6 @@ pub struct ProjectPromptSource;
 
 impl ProjectPromptSource {
 	/// Wraps project/workstation context in the stable workspace slot.
-	#[must_use]
 	pub fn registration(self) -> SlotRegistration {
 		SlotRegistration {
 			decl:   SlotDecl {

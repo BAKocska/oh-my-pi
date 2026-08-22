@@ -140,7 +140,6 @@ impl VibeSwarmMonitor {
 	const TRACE_CAP: usize = 40;
 
 	/// Creates an empty monitor.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { screens: BTreeMap::new(), order: Vec::new(), started: Instant::now() }
 	}
@@ -237,7 +236,6 @@ impl VibeSwarmMonitor {
 	}
 
 	/// Returns a spawn-order snapshot and aggregate output throughput.
-	#[must_use]
 	pub fn snapshot(&self, now: Instant) -> VibeMonitorSnapshot {
 		let screens = self
 			.order
@@ -266,7 +264,6 @@ impl VibeSwarmMonitor {
 	}
 
 	/// Computes dynamic TV-wall cells for the supplied viewport width.
-	#[must_use]
 	pub fn tv_wall_frames(&self, viewport_width: u16) -> Vec<VibeTvWallFrame> {
 		let count = self.order.len();
 		if count == 0 {
@@ -415,6 +412,7 @@ static BACKEND: LazyLock<RwLock<Option<Arc<dyn VibeBackend>>>> =
 	LazyLock::new(|| RwLock::new(None));
 
 /// Restores the preceding chat-scoped vibe backend when dropped.
+#[must_use]
 pub(crate) struct Attachment {
 	previous: Option<Arc<dyn VibeBackend>>,
 }
@@ -436,7 +434,6 @@ pub struct Vibe {
 }
 
 /// Creates the single five-verb vibe device.
-#[must_use]
 pub fn tool() -> Vibe {
 	Vibe {
 		spec: ToolSpec {
@@ -542,7 +539,6 @@ pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'sta
 
 impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 	/// Creates a wave runner and its app-owned TTL/mode-exit scheduler.
-	#[must_use]
 	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<ExecutionModes>) -> Arc<Self> {
 		let backend = Arc::new(Self {
 			parent,

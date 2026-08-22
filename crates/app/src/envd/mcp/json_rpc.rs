@@ -44,7 +44,6 @@ pub struct RequestIdAllocator {
 
 impl RequestIdAllocator {
 	/// Creates an allocator. Snowflake sequence entropy never enters logs.
-	#[must_use]
 	pub fn new() -> Self {
 		let mut bytes = [0_u8; 4];
 		let snowflake_seq = if SystemRandom::new().fill(&mut bytes).is_ok() {
@@ -114,7 +113,6 @@ pub struct JsonRpcRequest<'a, P> {
 
 impl<'a, P> JsonRpcRequest<'a, P> {
 	/// Creates a JSON-RPC 2.0 request.
-	#[must_use]
 	pub const fn new(id: RequestId, method: &'a str, params: P) -> Self {
 		Self { jsonrpc: "2.0", id, method, params }
 	}
@@ -210,7 +208,6 @@ pub async fn call_mcp<P: Serialize, T: DeserializeOwned>(
 
 /// Parses the first JSON `data: ` payload, skipping keep-alives and `[DONE]`,
 /// then falls back to parsing the complete response as JSON.
-#[must_use]
 pub fn parse_sse(text: &str) -> Option<Value> {
 	for line in text.lines() {
 		let Some(data) = line.strip_prefix("data: ") else {
@@ -231,7 +228,6 @@ pub fn parse_sse(text: &str) -> Option<Value> {
 
 /// Redacts credential-shaped query parameters without altering non-sensitive
 /// parameters. Unparseable URLs lose their complete query string.
-#[must_use]
 pub fn redact_url_for_log(url: &str) -> Str {
 	let Ok(mut parsed) = url::Url::parse(url) else {
 		return Str::from(url.split_once('?').map_or(url, |(base, _)| base));

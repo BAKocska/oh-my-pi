@@ -124,13 +124,11 @@ impl StatsDb {
 	}
 
 	/// Returns the database path.
-	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
 
 	/// Returns whether derived user counters may be ingested.
-	#[must_use]
 	pub const fn consent(&self) -> LocalAnalyticsConsent {
 		self.consent
 	}

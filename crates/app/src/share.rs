@@ -472,7 +472,6 @@ impl ShareProjection {
 	///
 	/// Redaction is independent of reversible provider obfuscation. Only
 	/// `export.shareRedactSecrets = false` bypasses this walk.
-	#[must_use]
 	pub fn materialize(
 		mut snapshot: Value,
 		policy: ExportSettings,
@@ -487,7 +486,6 @@ impl ShareProjection {
 
 	/// Applies the leakage policy and progressively trims the projection to a
 	/// deterministic serialization budget.
-	#[must_use]
 	pub fn materialize_bounded(
 		snapshot: Value,
 		policy: ExportSettings,

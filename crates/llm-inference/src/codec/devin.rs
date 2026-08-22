@@ -249,7 +249,6 @@ impl CascadeSession {
 	}
 
 	/// Returns the typed reconnect state without changing logical identities.
-	#[must_use]
 	pub fn reconnect(&self) -> Self {
 		Self { reconnect_attempt: self.reconnect_attempt.saturating_add(1), ..self.clone() }
 	}
@@ -292,19 +291,16 @@ pub struct DevinCodec {
 
 impl DevinCodec {
 	/// Constructs a codec with verified official client metadata.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Constructs a codec with route-approved non-secret client identity fields.
-	#[must_use]
 	pub const fn with_metadata(metadata: DevinClientMetadata) -> Self {
 		Self { metadata }
 	}
 
 	/// Encodes a credential-free discovery request template.
-	#[must_use]
 	pub fn discovery_request(&self) -> Bytes {
 		Bytes::from(
 			GetCliModelConfigsRequest { metadata: Some(self.metadata_wire()) }.encode_to_vec(),
@@ -981,7 +977,6 @@ struct ConnectStatus {
 
 /// Classifies a Connect status with explicit request evidence rather than
 /// message heuristics.
-#[must_use]
 pub fn classify_cascade_error(code: &str, evidence: CascadeRequestEvidence) -> Error {
 	let context_overflow = code == "invalid_argument" && evidence.cumulative_large_read_output;
 	let error = if context_overflow {

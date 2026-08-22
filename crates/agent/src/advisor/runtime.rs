@@ -90,7 +90,6 @@ pub struct ImmuneTurnAccount {
 
 impl ImmuneTurnAccount {
 	/// Creates accounting with the configured number of completed primary turns.
-	#[must_use]
 	pub const fn new(configured: u32) -> Self {
 		Self { configured, remaining: 0, last_completed_id: None }
 	}
@@ -114,13 +113,11 @@ impl ImmuneTurnAccount {
 	}
 
 	/// Remaining primary completions before interrupting advice is enabled.
-	#[must_use]
 	pub const fn remaining(&self) -> u32 {
 		self.remaining
 	}
 
 	/// Chooses the pi-parity route without mutating accounting.
-	#[must_use]
 	pub fn evaluate(&self, severity: AdviceSeverity, context: DeliveryContext) -> AdviceDelivery {
 		if severity == AdviceSeverity::Nit {
 			return AdviceDelivery::Aside;
@@ -189,7 +186,6 @@ pub struct BoundedAdvisorHistory<T> {
 impl<T> BoundedAdvisorHistory<T> {
 	/// Creates a history window. Zero bounds retain no entries but cursors still
 	/// advance.
-	#[must_use]
 	pub fn new(entry_limit: usize, byte_limit: usize) -> Self {
 		Self { entries: VecDeque::new(), entry_limit, byte_limit, retained_bytes: 0, next_cursor: 0 }
 	}
@@ -214,7 +210,6 @@ impl<T> BoundedAdvisorHistory<T> {
 	}
 
 	/// Cursor after the newest observed source entry.
-	#[must_use]
 	pub const fn next_cursor(&self) -> u64 {
 		self.next_cursor
 	}
@@ -231,7 +226,6 @@ impl<T> BoundedAdvisorHistory<T> {
 impl<T: Clone> BoundedAdvisorHistory<T> {
 	/// Returns entries at or after `cursor`, signaling re-prime if that cursor
 	/// was evicted.
-	#[must_use]
 	pub fn delta_after(&self, cursor: u64) -> AdvisorHistoryDelta<T> {
 		let oldest = self
 			.entries
@@ -304,7 +298,6 @@ pub struct AdvisorDeliveryRouter {
 
 impl AdvisorDeliveryRouter {
 	/// Creates a router and its two externally consumed channels.
-	#[must_use]
 	pub fn channel(
 		immune_turns: u32,
 	) -> (Self, flume::Receiver<RoutedAdvice>, flume::Receiver<RoutedAdvice>) {
@@ -359,7 +352,6 @@ impl AdvisorDeliveryRouter {
 	}
 
 	/// Remaining post-steer immune completions.
-	#[must_use]
 	pub const fn immune_turns_remaining(&self) -> u32 {
 		self.immunity.remaining()
 	}
@@ -402,7 +394,6 @@ pub struct AdvisorDeltaSync {
 
 impl AdvisorDeltaSync {
 	/// Creates a coordinator with optional session-secret obfuscation.
-	#[must_use]
 	pub fn new(
 		maintenance_interval: Duration,
 		obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
@@ -435,7 +426,6 @@ impl AdvisorDeltaSync {
 	}
 
 	/// Reports whether proactive provider-context maintenance is due.
-	#[must_use]
 	pub fn maintenance_due(&self, now: Instant) -> bool {
 		now.saturating_duration_since(self.last_maintenance) >= self.maintenance_interval
 	}

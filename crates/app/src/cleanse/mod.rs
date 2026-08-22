@@ -195,7 +195,6 @@ fn cancelled() -> CleanseExit {
 }
 
 /// Assignment brief installed in each bounded repair child.
-#[must_use]
 pub fn assignment_prompt(assignment: &Assignment, report: &Report) -> Str {
 	let mut text = String::from(
 		"Fix only the assigned whole-file diagnostics. Use LSP only when granted; coordinate \
@@ -231,7 +230,6 @@ pub fn assignment_prompt(assignment: &Assignment, report: &Report) -> Str {
 }
 
 /// Strict JSON Schema installed for the freeform checker-discovery child.
-#[must_use]
 pub fn discovery_schema() -> serde_json::Value {
 	serde_json::json!({
 		"type": "array",

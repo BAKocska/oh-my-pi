@@ -47,7 +47,6 @@ pub struct DiscoveryEndpoint {
 
 impl DiscoveryEndpoint {
 	/// Returns the complete-request deadline for this endpoint.
-	#[must_use]
 	pub fn deadline(&self) -> Duration {
 		if self.is_loopback() {
 			Duration::from_millis(900)
@@ -57,7 +56,6 @@ impl DiscoveryEndpoint {
 	}
 
 	/// Reports whether the configured host is an IP loopback or `localhost`.
-	#[must_use]
 	pub fn is_loopback(&self) -> bool {
 		url::Url::parse(self.base_url.as_str())
 			.ok()
@@ -72,7 +70,6 @@ impl DiscoveryEndpoint {
 }
 
 /// Returns the only endpoints eligible for unconfigured automatic probing.
-#[must_use]
 pub fn known_loopback_endpoints() -> Box<[DiscoveryEndpoint]> {
 	Box::new([
 		DiscoveryEndpoint {
@@ -114,7 +111,6 @@ pub fn configured_endpoint(
 }
 
 /// Detects likely proxy families without turning detection into authority.
-#[must_use]
 pub fn supported_endpoint_types(base_url: &str) -> Box<[DiscoveryEndpointKind]> {
 	let lower = base_url.to_ascii_lowercase();
 	if lower.contains("11434") || lower.contains("ollama") {

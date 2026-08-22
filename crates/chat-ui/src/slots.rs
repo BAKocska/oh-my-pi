@@ -23,7 +23,6 @@ pub struct MountId(Str);
 
 impl MountId {
 	/// Creates an identity from the wire slot key.
-	#[must_use]
 	pub fn new(key: impl Into<Str>) -> Self {
 		Self(key.into())
 	}
@@ -49,31 +48,26 @@ pub struct Mount {
 
 impl Mount {
 	/// Returns the mount's stable identity.
-	#[must_use]
 	pub const fn id(&self) -> &MountId {
 		&self.id
 	}
 
 	/// Returns the protocol placement discriminant.
-	#[must_use]
 	pub const fn placement(&self) -> i32 {
 		self.placement
 	}
 
 	/// Returns the last rectangle resolved during composition.
-	#[must_use]
 	pub const fn rect(&self) -> Rect {
 		self.rect
 	}
 
 	/// Returns the layout suggestion supplied by the extension.
-	#[must_use]
 	pub const fn order(&self) -> i32 {
 		self.order
 	}
 
 	/// Returns whether this mount participates in layout.
-	#[must_use]
 	pub const fn visible(&self) -> bool {
 		self.visible
 	}
@@ -118,7 +112,6 @@ pub struct Damage {
 
 impl Damage {
 	/// Returns whether applying the effect changed visible state.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.rects.is_empty() && !self.status && self.refusal.is_none()
 	}
@@ -161,7 +154,6 @@ pub struct Slots {
 
 impl Slots {
 	/// Creates an empty registry for one extension.
-	#[must_use]
 	pub fn new(ctx: UiContext) -> Self {
 		Self { mounts: SparseMap::new(), by_placement: SparseMap::new(), ctx }
 	}
@@ -215,13 +207,11 @@ impl Slots {
 	}
 
 	/// Returns the mount count for this extension registry.
-	#[must_use]
 	pub fn len(&self) -> usize {
 		self.mounts.len()
 	}
 
 	/// Returns whether no mount is live.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.mounts.is_empty()
 	}
@@ -299,7 +289,6 @@ impl Slots {
 	}
 
 	/// Produces mount keys and resolved rectangles for the `slots` debug op.
-	#[must_use]
 	pub fn debug_mounts(&self) -> SmallVec<MountSnapshot, 4> {
 		self
 			.mounts()
@@ -313,7 +302,6 @@ impl Slots {
 }
 
 /// Lets user-owned layout take precedence over extension ordering suggestions.
-#[must_use]
 pub fn arbitrate_order(user_order: Option<i32>, suggested_order: i32) -> i32 {
 	user_order.unwrap_or(suggested_order)
 }
@@ -323,7 +311,6 @@ pub fn arbitrate_order(user_order: Option<i32>, suggested_order: i32) -> i32 {
 pub type UserLayout = SparseMap<MountId, i32>;
 
 /// Resolves a suggested order against the user's saved layout.
-#[must_use]
 pub fn arbitrate_with_user_layout(layout: &UserLayout, id: &MountId, suggested_order: i32) -> i32 {
 	layout.get(id).copied().unwrap_or(suggested_order)
 }

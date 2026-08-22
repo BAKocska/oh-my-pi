@@ -46,7 +46,6 @@ pub struct GoalStatusCard {
 
 impl GoalStatusCard {
 	/// Builds a card from the latest durable projection.
-	#[must_use]
 	pub fn new(facts: &GoalCardFacts) -> Self {
 		let status = sf!("{}", facts.status);
 		let usage = facts.token_budget.map_or_else(
@@ -154,7 +153,6 @@ pub struct GuidedGoalInterview {
 
 impl GuidedGoalInterview {
 	/// Opens at the objective question.
-	#[must_use]
 	pub fn open(ctx: &UiContext) -> Self {
 		Self {
 			step:      InterviewStep::Objective,

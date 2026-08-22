@@ -108,7 +108,6 @@ impl Color {
 
 	/// Quantizes a 24-bit color to the nearest xterm 256-color cube or
 	/// grayscale entry. Default and already-indexed colors pass through.
-	#[must_use]
 	pub const fn quantized_256(self) -> Self {
 		let Self::Rgb(red, green, blue) = self else {
 			return self;

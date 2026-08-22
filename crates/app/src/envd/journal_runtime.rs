@@ -100,7 +100,6 @@ impl ExternalJournalActor {
 	}
 
 	/// Returns the endpoint installed into each authenticated extension host.
-	#[must_use]
 	pub(crate) fn sender(&self) -> flume::Sender<ExternalJournalCall> {
 		self.sender.clone()
 	}

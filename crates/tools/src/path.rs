@@ -16,7 +16,6 @@ pub enum HostPaths {
 
 impl HostPaths {
 	/// Returns the current host path vocabulary.
-	#[must_use]
 	pub const fn current() -> Self {
 		if cfg!(windows) {
 			Self::Windows
@@ -37,14 +36,12 @@ pub struct NormalizedTarget {
 
 impl NormalizedTarget {
 	/// Reports whether recovery changed the authored spelling.
-	#[must_use]
 	pub fn recovered(&self) -> bool {
 		self.authored != self.canonical
 	}
 
 	/// Returns filesystem spellings used only after the canonical spelling is
 	/// missing.
-	#[must_use]
 	pub fn recovery_candidates(&self) -> Vec<Str> {
 		let mut candidates = Vec::new();
 		let screenshot = self
@@ -61,7 +58,6 @@ impl NormalizedTarget {
 	}
 
 	/// Returns a model-facing recovery notice when the target changed.
-	#[must_use]
 	pub fn recovery_notice(&self) -> Option<Str> {
 		self.recovered().then(|| {
 			Str::from(format!(
@@ -77,7 +73,6 @@ impl NormalizedTarget {
 /// The pass is deliberately lexical: it never stats the target and therefore
 /// behaves identically for reads, writes, and edits. Filesystem owners remain
 /// responsible for canonical containment and symlink policy.
-#[must_use]
 pub fn normalize_target(input: &str, home: Option<&Path>, host: HostPaths) -> NormalizedTarget {
 	let authored = Str::new(input);
 	let mut path = trim_outer_quotes(input.trim());
@@ -314,7 +309,6 @@ pub struct PathSelector {
 	pub selector: Option<Str>,
 }
 /// Splits a trailing colon selector while retaining `C:` and `C:\...` drives.
-#[must_use]
 pub fn split_colon_selector(input: &str) -> PathSelector {
 	let drive_end = usize::from(
 		input.len() >= 2 && input.as_bytes()[0].is_ascii_alphabetic() && input.as_bytes()[1] == b':',

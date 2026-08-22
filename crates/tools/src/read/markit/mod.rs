@@ -62,7 +62,6 @@ pub struct DocumentMetadata<'a> {
 
 impl<'a> DocumentMetadata<'a> {
 	/// Creates metadata for a source without a trusted media type.
-	#[must_use]
 	pub const fn from_path(path: &'a Path) -> Self {
 		Self { path, media_type: None }
 	}
@@ -113,7 +112,6 @@ impl Conversion {
 	}
 
 	/// Borrows converted Markdown.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.text.as_str()
 	}

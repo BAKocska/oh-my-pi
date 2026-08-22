@@ -235,7 +235,6 @@ impl DomainRegistration {
 	}
 
 	/// Returns the type-owned descriptor.
-	#[must_use]
 	pub fn descriptor(&self) -> DomainDescriptor {
 		(self.descriptor)()
 	}

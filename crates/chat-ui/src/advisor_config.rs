@@ -63,7 +63,6 @@ impl WatchdogConfigEditor {
 	/// `legacy_path` is also removed when the saved document is empty,
 	/// preventing an old single-advisor file from silently reviving fallback
 	/// configuration.
-	#[must_use]
 	pub fn open(
 		path: impl Into<Str>,
 		legacy_path: Option<Str>,
@@ -138,7 +137,6 @@ impl WatchdogConfigEditor {
 	}
 
 	/// Returns the exact current editor buffer.
-	#[must_use]
 	pub fn document(&self) -> String {
 		self.ui.values()["watchdog-editor"]
 			.as_str()
@@ -182,7 +180,6 @@ fn build_editor(document: &str, width: u16, height: u16, ctx: &UiContext) -> Ui 
 ///
 /// Returns `None` for an empty document so the host can apply the deletion
 /// fallback instead of writing a semantically empty file.
-#[must_use]
 pub fn serialize_watchdog_yaml(document: &WatchdogEditorDocument) -> Option<Str> {
 	if document
 		.instructions

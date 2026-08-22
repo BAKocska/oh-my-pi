@@ -19,13 +19,11 @@ impl NanoUsd {
 	pub const ZERO: Self = Self(0);
 
 	/// Creates an amount from nano-US dollars.
-	#[must_use]
 	pub const fn from_nanos(nanos: u64) -> Self {
 		Self(nanos)
 	}
 
 	/// Returns the amount in nano-US dollars.
-	#[must_use]
 	pub const fn as_nanos(self) -> u64 {
 		self.0
 	}
@@ -154,7 +152,6 @@ impl Pricing {
 	/// Returns the exclusive threshold where standard pricing ends.
 	///
 	/// A schedule without replacement tiers has no premium-context boundary.
-	#[must_use]
 	pub fn standard_pricing_boundary(&self) -> Option<u64> {
 		self.tiers.first().map(|tier| tier.prompt_tokens_above)
 	}
@@ -231,7 +228,6 @@ pub struct UsageDimensions {
 
 impl UsageDimensions {
 	/// Returns total prompt tokens used for tier selection.
-	#[must_use]
 	pub const fn prompt_tokens(self) -> Option<u64> {
 		let Some(tokens) = self.input_tokens.checked_add(self.cache_read_tokens) else {
 			return None;
@@ -268,13 +264,11 @@ impl PremiumMultiplier {
 	pub const SCALE: u64 = 1_000_000;
 
 	/// Constructs a multiplier from its millionth-scale integer.
-	#[must_use]
 	pub const fn from_millionths(millionths: u64) -> Self {
 		Self(millionths)
 	}
 
 	/// Returns the millionth-scale integer.
-	#[must_use]
 	pub const fn as_millionths(self) -> u64 {
 		self.0
 	}

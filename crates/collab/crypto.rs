@@ -32,13 +32,11 @@ impl RoomId {
 	}
 
 	/// Imports an exact-width room identifier decoded from an OMP link.
-	#[must_use]
 	pub const fn from_bytes(bytes: [u8; ROOM_ID_BYTES]) -> Self {
 		Self(bytes)
 	}
 
 	/// Returns the fixed-size identifier bytes.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; ROOM_ID_BYTES] {
 		&self.0
 	}
@@ -59,19 +57,16 @@ impl WriteToken {
 	}
 
 	/// Imports an exact-width token.
-	#[must_use]
 	pub const fn from_bytes(bytes: [u8; WRITE_TOKEN_BYTES]) -> Self {
 		Self(bytes)
 	}
 
 	/// Returns the token bytes for credential link construction.
-	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; WRITE_TOKEN_BYTES] {
 		&self.0
 	}
 
 	/// Compares an untrusted candidate without data-dependent early exit.
-	#[must_use]
 	pub fn matches(&self, candidate: &[u8]) -> bool {
 		let mut difference = candidate.len() ^ WRITE_TOKEN_BYTES;
 		for (index, expected) in self.0.iter().copied().enumerate() {

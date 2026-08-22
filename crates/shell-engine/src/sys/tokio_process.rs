@@ -32,7 +32,6 @@ pub(crate) fn validate_pty_application(application: &Path) -> std::io::Result<()
 /// ConPTY does not expose Unix process-group signals. Writing ETX follows the
 /// terminal path and gives the foreground console process the same Ctrl+C
 /// event it receives from an interactive keyboard.
-#[must_use]
 pub(crate) fn pty_sigint_input(signal: &str) -> Option<&'static [u8]> {
 	#[cfg(windows)]
 	if signal.eq_ignore_ascii_case("SIGINT") {

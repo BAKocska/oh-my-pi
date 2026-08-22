@@ -83,7 +83,6 @@ pub struct ProjectSnapshot {
 
 /// Converts one Environment repository snapshot into stable facts. Non-repo
 /// and unavailable snapshots intentionally produce no block.
-#[must_use]
 pub fn repository_facts(
 	workspace_root: &Path,
 	snapshot: &RepositorySnapshot,
@@ -112,7 +111,6 @@ fn uri_path(uri: &str) -> Option<PathBuf> {
 /// Builds a depth-three, gitignore-aware, mtime-sorted prompt tree and collects
 /// scoped `AGENTS.md` paths from the same bounded walker result. The caller
 /// invokes this only when the default-off workspace-tree setting is enabled.
-#[must_use]
 pub fn build_workspace_tree(root: &Path) -> WorkspaceTree {
 	let request = WalkRequest::new(root)
 		.hidden(false)
@@ -245,7 +243,6 @@ pub fn build_workspace_tree(root: &Path) -> WorkspaceTree {
 }
 
 /// Freezes repository facts and optional workspace trees in granted-root order.
-#[must_use]
 pub fn freeze(
 	roots: &[PathBuf],
 	repository_snapshots: &[RepositorySnapshot],
@@ -281,7 +278,6 @@ pub fn freeze(
 }
 
 /// Returns a stable nested-repository identity relative to its granted root.
-#[must_use]
 pub fn nested_repository_identity(facts: &RepositoryFacts) -> Option<PathBuf> {
 	(facts.worktree_root != facts.workspace_root).then(|| {
 		facts
@@ -293,7 +289,6 @@ pub fn nested_repository_identity(facts: &RepositoryFacts) -> Option<PathBuf> {
 }
 
 /// Projects repository facts into the prompt contract.
-#[must_use]
 pub fn prompt_repositories(snapshot: &ProjectSnapshot) -> Arc<[RepositoryInput]> {
 	snapshot
 		.repositories
@@ -315,7 +310,6 @@ pub fn prompt_repositories(snapshot: &ProjectSnapshot) -> Arc<[RepositoryInput]>
 }
 
 /// Projects bounded per-root trees into the prompt contract.
-#[must_use]
 pub fn prompt_trees(snapshot: &ProjectSnapshot) -> Arc<[WorkspaceTreeInput]> {
 	snapshot
 		.trees
@@ -330,7 +324,6 @@ pub fn prompt_trees(snapshot: &ProjectSnapshot) -> Arc<[WorkspaceTreeInput]> {
 }
 
 /// Projects the first nested repository relative identity, if present.
-#[must_use]
 pub fn prompt_active_repository(snapshot: &ProjectSnapshot) -> Option<ActiveRepositoryInput> {
 	snapshot
 		.active_repository
@@ -354,7 +347,6 @@ fn path_uri(path: &Path) -> Str {
 
 /// Deduplicates `AGENTS.md` paths across per-root trees while retaining root
 /// order and the global pi-compatible cap.
-#[must_use]
 pub fn merged_agents_files(trees: &[WorkspaceTree]) -> Arc<[PathBuf]> {
 	let mut seen = BTreeSet::new();
 	let mut output = Vec::new();

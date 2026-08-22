@@ -46,7 +46,6 @@ impl HookPhase {
 		[Self::Precheck, Self::Transform, Self::Review, Self::Approval, Self::Observe];
 
 	/// Returns the stable zero-based position in the hook procedure.
-	#[must_use]
 	pub const fn ordinal(self) -> u8 {
 		self as u8
 	}
@@ -92,7 +91,6 @@ impl HookDecision {
 		[Self::Allow, Self::Deny, Self::Modify, Self::Defer, Self::RequireApproval];
 
 	/// Returns whether this decision is legal in `phase`.
-	#[must_use]
 	pub const fn is_legal_in(self, phase: HookPhase) -> bool {
 		matches!(
 			(phase, self),

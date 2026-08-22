@@ -46,7 +46,6 @@ impl AdvisorFallbackChain {
 	}
 
 	/// Borrows selectors in exact fallback order.
-	#[must_use]
 	pub fn selectors(&self) -> &[Str] {
 		&self.selectors
 	}
@@ -119,7 +118,6 @@ impl AdvisorRetryManager {
 	}
 
 	/// Selects the next permitted attempt for one stable advisor id.
-	#[must_use]
 	pub fn next(&mut self, advisor_id: &str, now: Instant) -> AdvisorRetryDecision {
 		let state = self
 			.states
@@ -149,7 +147,6 @@ impl AdvisorRetryManager {
 	}
 
 	/// Records a failed attempt and advances retry/fallback policy.
-	#[must_use]
 	pub fn record_failure(
 		&mut self,
 		advisor_id: &str,

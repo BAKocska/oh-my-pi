@@ -62,43 +62,36 @@ pub struct SessionBlueprint {
 
 impl SessionBlueprint {
 	/// Returns the immutable owned session options.
-	#[must_use]
 	pub const fn options(&self) -> &SessionOptions {
 		&self.options
 	}
 
 	/// Returns the ordered primary and granted roots.
-	#[must_use]
 	pub fn roots(&self) -> &[WorkspaceRootDescriptor] {
 		&self.roots
 	}
 
 	/// Returns the credential-blind model fallback plan.
-	#[must_use]
 	pub const fn model_plan(&self) -> &ModelPlan {
 		&self.model_plan
 	}
 
 	/// Returns the canonical compiled prompt.
-	#[must_use]
 	pub const fn prompt(&self) -> &RenderedPrompt {
 		&self.prompt
 	}
 
 	/// Returns the immutable prompt/workspace authority snapshot.
-	#[must_use]
 	pub const fn workspace(&self) -> &WorkspaceInput {
 		&self.workspace
 	}
 
 	/// Returns the authority-built registry shared with the production loop.
-	#[must_use]
 	pub const fn registry(&self) -> &Arc<Registry> {
 		&self.registry
 	}
 
 	/// Returns callback subscriptions and opaque credential resolver.
-	#[must_use]
 	pub const fn callbacks(&self) -> &CallbackSet {
 		&self.callbacks
 	}
@@ -112,14 +105,12 @@ impl SessionBlueprint {
 	}
 
 	/// Returns typed model, thinking, LSP, and launch diagnostics.
-	#[must_use]
 	pub const fn diagnostics(&self) -> &SessionDiagnostics {
 		&self.diagnostics
 	}
 
 	/// Returns the typed provider obfuscation authority, when the host supplied
 	/// the complete bidirectional transform path.
-	#[must_use]
 	pub const fn secret_obfuscator(&self) -> Option<&Arc<Mutex<SecretObfuscator>>> {
 		self.secret_obfuscator.as_ref()
 	}
@@ -139,7 +130,6 @@ impl SessionBlueprint {
 
 	/// Consumes the blueprint into a durable handle over a fully composed live
 	/// runtime and an optional journal-backed cold-revival factory.
-	#[must_use]
 	pub fn launch(
 		self,
 		identity: SessionIdentity,
@@ -159,7 +149,6 @@ impl SessionBlueprint {
 
 	/// Consumes the blueprint into a cold handle that revives from its journal
 	/// before accepting the first submission in this process.
-	#[must_use]
 	pub fn revive(
 		self,
 		identity: SessionIdentity,
@@ -177,20 +166,17 @@ impl SessionBlueprint {
 	}
 
 	/// Returns the complete shape fingerprint used for fork cache inheritance.
-	#[must_use]
 	pub const fn shape(&self) -> Hash32 {
 		self.shape
 	}
 
 	/// Returns the inherited parent prompt-cache key when the complete session
 	/// shape is unchanged.
-	#[must_use]
 	pub const fn inherited_prompt_cache_key(&self) -> Option<PromptHash> {
 		self.inherited_prompt_cache_key
 	}
 
 	/// Consumes the blueprint and returns its shared versioned tool registry.
-	#[must_use]
 	pub fn into_registry(self) -> Arc<Registry> {
 		self.registry
 	}
@@ -238,7 +224,6 @@ pub struct SessionBuilder {
 
 impl SessionBuilder {
 	/// Starts a session over owned options and an authority-built registry.
-	#[must_use]
 	pub fn new(options: SessionOptions, registry: Arc<Registry>) -> Self {
 		Self {
 			options,
@@ -257,7 +242,6 @@ impl SessionBuilder {
 	/// Starts a full fork, tentatively inheriting the parent's provider affinity
 	/// and prompt-cache key. Build-time shape comparison invalidates the cache
 	/// key when any shape-changing option differs.
-	#[must_use]
 	pub fn fork_from(
 		parent: &SessionBlueprint,
 		options: SessionOptions,
@@ -274,84 +258,72 @@ impl SessionBuilder {
 	/// Declares the stable implementation revision of shape-changing context or
 	/// request-tuning callbacks. Without this revision, full forks remain safe
 	/// by declining prompt-cache inheritance.
-	#[must_use]
 	pub fn callback_shape_revision(mut self, revision: Hash32) -> Self {
 		self.callback_shape_revision = Some(revision);
 		self
 	}
 
 	/// Adds one static typed prompt contribution.
-	#[must_use]
 	pub fn prompt_contribution(mut self, contribution: PromptContribution) -> Self {
 		self.contributions.push(contribution);
 		self
 	}
 
 	/// Installs a deterministic provider-system-prompt callback.
-	#[must_use]
 	pub fn system_prompt_callback(mut self, callback: SystemPromptCallback) -> Self {
 		self.callbacks.system_prompt = Some(callback);
 		self
 	}
 
 	/// Installs a deterministic title-system-prompt callback.
-	#[must_use]
 	pub fn title_prompt_callback(mut self, callback: SystemPromptCallback) -> Self {
 		self.callbacks.title_prompt = Some(callback);
 		self
 	}
 
 	/// Installs a stable-id provider-context projection callback.
-	#[must_use]
 	pub fn context_callback(mut self, callback: ContextPatchHandler) -> Self {
 		self.callbacks.context = Some(callback);
 		self
 	}
 
 	/// Installs inference-owned opaque credential resolution.
-	#[must_use]
 	pub fn credential_callback(mut self, callback: CredentialCallback) -> Self {
 		self.callbacks.credential = Some(callback);
 		self
 	}
 
 	/// Installs typed provider-request tuning.
-	#[must_use]
 	pub fn request_tuning_callback(mut self, callback: RequestTuningCallback) -> Self {
 		self.callbacks.request_tuning = Some(callback);
 		self
 	}
 
 	/// Subscribes to read-only agent events.
-	#[must_use]
 	pub fn on_event(mut self, callback: EventCallback) -> Self {
 		self.callbacks.events.push(callback);
 		self
 	}
 
 	/// Installs the first-provider-dispatch notification.
-	#[must_use]
 	pub fn on_first_dispatch(mut self, callback: FirstDispatchCallback) -> Self {
 		self.callbacks.first_dispatch = Some(callback);
 		self
 	}
 
 	/// Installs deferred usage-reserve confirmation at the typed host boundary.
-	#[must_use]
 	pub fn usage_confirmation(mut self, callback: UsageConfirmationCallback) -> Self {
 		self.callbacks.usage_confirmation = Some(callback);
 		self
 	}
 
 	/// Adds one generation-fenced opaque LSP binding and its warmup state.
-	#[must_use]
 	pub fn lsp_binding(mut self, binding: LspSessionBinding) -> Self {
 		self.lsp_bindings.push(binding);
 		self
 	}
 
 	/// Installs the consent-configured telemetry fan-out used for launch facts.
-	#[must_use]
 	pub fn firehose(mut self, firehose: Arc<Firehose>) -> Self {
 		self.firehose = Some(firehose);
 		self
@@ -362,21 +334,18 @@ impl SessionBuilder {
 	/// The builder retains only the process-local transform handle. Credential
 	/// bytes and callback-returned leases never enter the blueprint shape or
 	/// journal state.
-	#[must_use]
 	pub fn secret_obfuscator(mut self, obfuscator: Arc<Mutex<SecretObfuscator>>) -> Self {
 		self.secret_obfuscator = Some(obfuscator);
 		self
 	}
 
 	/// Installs UI-context updates at the host boundary.
-	#[must_use]
 	pub fn ui_context_callback(mut self, callback: UiContextCallback) -> Self {
 		self.callbacks.ui_context = Some(callback);
 		self
 	}
 
 	/// Declares one host-local protocol resolver.
-	#[must_use]
 	pub fn local_protocol(
 		mut self,
 		scheme: impl Into<Str>,
@@ -391,7 +360,6 @@ impl SessionBuilder {
 
 	/// Mutably exposes the typed callback collection for event, context,
 	/// credential, title, UI, and local-protocol registration.
-	#[must_use]
 	pub const fn callbacks_mut(&mut self) -> &mut CallbackSet {
 		&mut self.callbacks
 	}

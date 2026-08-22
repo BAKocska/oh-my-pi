@@ -10,7 +10,6 @@ pub struct ActionId(Str);
 
 impl ActionId {
 	/// Creates an action identity supplied by an extension declaration.
-	#[must_use]
 	pub fn new(id: impl Into<Str>) -> Self {
 		Self(id.into())
 	}
@@ -36,7 +35,6 @@ pub struct Actions {
 
 impl Actions {
 	/// Creates an empty shortcut table.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { shortcuts: SmallVec::new() }
 	}
@@ -61,7 +59,6 @@ impl Actions {
 	}
 
 	/// Resolves an already-unclaimed chord to its extension action.
-	#[must_use]
 	pub fn dispatch(&self, chord: Chord) -> Option<&ActionId> {
 		self
 			.shortcuts
@@ -72,7 +69,6 @@ impl Actions {
 	/// Resolves a key emitted by [`omp_tui::AppEvent::Key`], the runtime's
 	/// unclaimed-key path. Semantic modifier keys are already encoded in
 	/// [`Key`]; plain decoded keys use an empty modifier set.
-	#[must_use]
 	pub fn dispatch_key(&self, key: Key) -> Option<&ActionId> {
 		self.dispatch(Chord::new(key, Mods::default()))
 	}

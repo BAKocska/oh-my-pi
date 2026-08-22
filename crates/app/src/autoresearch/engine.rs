@@ -189,7 +189,6 @@ where
 	}
 
 	/// Returns the reconstructed runtime state.
-	#[must_use]
 	pub const fn runtime(&self) -> &RuntimeState {
 		&self.runtime
 	}
@@ -613,7 +612,6 @@ where
 	}
 
 	/// Hidden continuation prompt admitted only after the parent settles.
-	#[must_use]
 	pub fn continuation_prompt(&mut self, parent_settled: bool) -> Option<Str> {
 		if !parent_settled || !self.runtime.enabled || !self.runtime.resume_armed {
 			return None;

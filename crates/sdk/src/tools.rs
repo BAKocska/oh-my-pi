@@ -71,7 +71,6 @@ pub struct AutoLearnCaptureSnapshot {
 
 impl AutoLearnCaptureSnapshot {
 	/// Detaches transcript state and strips provider-owned replay metadata.
-	#[must_use]
 	pub fn detached(model: impl Into<Str>, items: impl IntoIterator<Item = Item>) -> Self {
 		Self { model: model.into(), items: items.into_iter().map(strip_provider_state).collect() }
 	}
@@ -122,13 +121,11 @@ pub struct AutoLearnCaptureRunner {
 
 impl AutoLearnCaptureRunner {
 	/// Binds the process-local capture executor.
-	#[must_use]
 	pub fn new(executor: impl AutoLearnCaptureExecutor) -> Self {
 		Self { executor: Arc::new(executor) }
 	}
 
 	/// Starts one detached private capture task.
-	#[must_use]
 	pub fn spawn(
 		&self,
 		snapshot: AutoLearnCaptureSnapshot,
@@ -218,13 +215,11 @@ pub struct ToolRegistryBuilder {
 
 impl ToolRegistryBuilder {
 	/// Starts from an authority-built production registry.
-	#[must_use]
 	pub const fn from_production(registry: Registry) -> Self {
 		Self { registry }
 	}
 
 	/// Starts an empty registry for hosts that register every authority.
-	#[must_use]
 	pub fn empty() -> Self {
 		Self { registry: Registry::new() }
 	}
@@ -251,7 +246,6 @@ impl ToolRegistryBuilder {
 	}
 
 	/// Returns the completed versioned registry.
-	#[must_use]
 	pub fn finish(self) -> Registry {
 		self.registry
 	}

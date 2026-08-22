@@ -12,7 +12,6 @@ pub struct ProgressReporter {
 impl ProgressReporter {
 	/// Creates a bounded reporter. Quiet and non-TTY callers receive a hidden
 	/// draw target while retaining the same accounting contract.
-	#[must_use]
 	pub fn bounded(length: u64, message: impl Into<String>, quiet: bool) -> Self {
 		let bar = if quiet || !std::io::stderr().is_terminal() {
 			ProgressBar::hidden()

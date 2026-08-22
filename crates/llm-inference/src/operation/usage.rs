@@ -113,7 +113,6 @@ pub struct UsageFetcherRegistry {
 impl UsageFetcherRegistry {
 	/// Builds one immutable registry, retaining the last fetcher for duplicate
 	/// provider ids.
-	#[must_use]
 	pub fn new(fetchers: impl IntoIterator<Item = Arc<dyn ConsoleUsageFetcher>>) -> Self {
 		let fetchers = fetchers
 			.into_iter()
@@ -145,7 +144,6 @@ pub struct ConsoleUsageManager {
 
 impl ConsoleUsageManager {
 	/// Constructs a manager over application-registered usage fetchers.
-	#[must_use]
 	pub const fn new(
 		catalog: Arc<Catalog>,
 		credentials: CredentialBroker,

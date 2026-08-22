@@ -79,19 +79,16 @@ pub struct ContentSlice {
 
 impl ContentSlice {
 	/// Returns the inclusive byte or line coordinate supplied by the caller.
-	#[must_use]
 	pub const fn start(&self) -> u64 {
 		self.start
 	}
 
 	/// Returns the exclusive byte or line coordinate supplied by the caller.
-	#[must_use]
 	pub const fn end(&self) -> u64 {
 		self.end
 	}
 
 	/// Returns exact shared bytes covered by this interval.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
@@ -115,13 +112,11 @@ pub struct ReadResult {
 
 impl ReadResult {
 	/// Returns the committed head that owns the returned bytes.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns the selected snapshot bytes.
-	#[must_use]
 	pub const fn body(&self) -> &ReadBody {
 		&self.body
 	}
@@ -159,49 +154,41 @@ pub struct DocumentEvent {
 
 impl DocumentEvent {
 	/// Returns the document-local, strictly increasing event sequence.
-	#[must_use]
 	pub const fn event_sequence(&self) -> u64 {
 		self.event_sequence
 	}
 
 	/// Returns why the head was published.
-	#[must_use]
 	pub const fn kind(&self) -> DocumentEventKind {
 		self.kind
 	}
 
 	/// Returns the installed head visible to subsequent reads.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns the active path captured with this event.
-	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
 
 	/// Returns the head revision that preceded this event.
-	#[must_use]
 	pub const fn previous_revision(&self) -> Revision {
 		self.previous_revision
 	}
 
 	/// Returns the transaction responsible for a committed event.
-	#[must_use]
 	pub const fn transaction_id(&self) -> Option<TransactionId> {
 		self.transaction_id
 	}
 
 	/// Returns reservations invalidated before this event was installed.
-	#[must_use]
 	pub fn invalidated_transaction_ids(&self) -> &[TransactionId] {
 		&self.invalidated_transaction_ids
 	}
 
 	/// Returns the former path for a rename event when one is known.
-	#[must_use]
 	pub fn previous_path(&self) -> Option<&Path> {
 		self.previous_path.as_deref()
 	}
@@ -217,25 +204,21 @@ pub struct OpenedDocument {
 
 impl OpenedDocument {
 	/// Returns the lease that keeps this document active.
-	#[must_use]
 	pub const fn lease_id(&self) -> LeaseId {
 		self.lease_id
 	}
 
 	/// Returns the head installed before this open completed.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns this lease's ordered event subscription.
-	#[must_use]
 	pub const fn events(&mut self) -> &mut broadcast::Receiver<DocumentEvent> {
 		&mut self.events
 	}
 
 	/// Splits the result into its lease, head, and event subscription.
-	#[must_use]
 	pub fn into_parts(self) -> (LeaseId, DocumentHead, broadcast::Receiver<DocumentEvent>) {
 		(self.lease_id, self.head, self.events)
 	}
@@ -747,6 +730,7 @@ impl Drop for RegistryInner {
 }
 
 /// Exclusive registry claim for a future path rebind.
+#[must_use]
 pub struct PathReservation {
 	registry:    Weak<RegistryInner>,
 	document_id: DocumentId,

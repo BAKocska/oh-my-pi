@@ -48,6 +48,7 @@ impl AskRequest {
 }
 
 /// Exclusive binding installed by the active terminal host.
+#[must_use]
 pub struct AskBinding {
 	receiver:   flume::Receiver<AskRequest>,
 	generation: u64,
@@ -74,7 +75,6 @@ impl Drop for AskBinding {
 
 /// Binds the process-wide Ask presenter to the currently active TUI host.
 /// A later binding cleanly replaces a stale/disconnected host.
-#[must_use]
 pub fn bind() -> AskBinding {
 	let (sender, receiver) = flume::unbounded();
 	let generation = NEXT_BINDING.fetch_add(1, Ordering::Relaxed);
@@ -90,7 +90,6 @@ pub struct UiRequestPresenter;
 ///
 /// When no interactive host is bound, it deliberately delegates to the
 /// documented deterministic headless policy instead of inventing UI answers.
-#[must_use]
 pub fn presenter() -> Arc<dyn AskPresenter> {
 	Arc::new(UiRequestPresenter)
 }
@@ -160,7 +159,6 @@ pub struct AskDialog {
 
 impl AskDialog {
 	/// Opens a typed Ask question.
-	#[must_use]
 	pub fn open(question: Question, ctx: &UiContext) -> Self {
 		let width = 72;
 		Self {

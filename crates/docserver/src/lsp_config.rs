@@ -182,7 +182,6 @@ pub struct ResolvedLspConfig {
 
 impl ResolvedLspServer {
 	/// Lowers a resolved declaration into the process-owned startup shape.
-	#[must_use]
 	pub fn to_process_config(&self) -> crate::lsp_process::LspProcessConfig {
 		let path_patterns = self
 			.file_types

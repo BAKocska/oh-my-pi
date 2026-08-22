@@ -79,13 +79,11 @@ impl CompactionTier {
 	];
 
 	/// Returns whether this rung preserves all non-targeted projection items.
-	#[must_use]
 	pub const fn is_lossless(self) -> bool {
 		matches!(self, Self::Prune | Self::DropMedia)
 	}
 
 	/// Stable lower-case name used by settings and journal display metadata.
-	#[must_use]
 	pub const fn setting_name(self) -> &'static str {
 		match self {
 			Self::Prune => "prune",
@@ -108,7 +106,6 @@ pub const SPECULATION_LEAD_MIN_TOKENS: u64 = 8_192;
 pub const SPECULATION_LEAD_MAX_TOKENS: u64 = 32_000;
 
 /// Returns the pre-threshold lead used for speculative compaction.
-#[must_use]
 pub fn speculation_lead_tokens(threshold_tokens: u64) -> u64 {
 	((threshold_tokens as f64 * SPECULATION_LEAD_FRACTION).floor() as u64)
 		.clamp(SPECULATION_LEAD_MIN_TOKENS, SPECULATION_LEAD_MAX_TOKENS)
@@ -132,7 +129,6 @@ impl Default for CompactionMethodOrder {
 
 impl CompactionMethodOrder {
 	/// Resolves a configured list while preserving first-occurrence order.
-	#[must_use]
 	pub fn resolve(configured: &[CompactionTier]) -> Self {
 		let mut tiers = SmallVec::new();
 		for &tier in configured {
@@ -144,7 +140,6 @@ impl CompactionMethodOrder {
 	}
 
 	/// Returns the exact enabled fallback order.
-	#[must_use]
 	pub fn as_slice(&self) -> &[CompactionTier] {
 		&self.tiers
 	}
@@ -155,7 +150,6 @@ impl CompactionMethodOrder {
 	}
 
 	/// Filters unsupported tiers without disturbing fallback order.
-	#[must_use]
 	pub fn available(&self, mut supported: impl FnMut(CompactionTier) -> bool) -> Self {
 		Self { tiers: self.iter().filter(|&tier| supported(tier)).collect() }
 	}
@@ -165,7 +159,6 @@ impl CompactionMethodOrder {
 	/// Mechanical lossless/elision rungs do not decide summary strategy. A
 	/// local snapshot rung does: because it is immediate, it suppresses later
 	/// remote or handoff speculation.
-	#[must_use]
 	pub fn speculation_tier(&self) -> Option<CompactionTier> {
 		for &tier in &self.tiers {
 			match tier {
@@ -307,7 +300,6 @@ impl Default for CompactionCoordinator {
 
 impl CompactionCoordinator {
 	/// Returns the speculation slot state used by status surfaces.
-	#[must_use]
 	pub const fn speculation_state(&self) -> SpeculationState {
 		match &self.slot {
 			SpeculationSlot::Idle => SpeculationState::Idle,
@@ -547,7 +539,6 @@ impl ManualCompactionRequest {
 	}
 
 	/// Resolves the one-off method order without mutating durable settings.
-	#[must_use]
 	pub fn method_order(&self, configured: &CompactionMethodOrder) -> CompactionMethodOrder {
 		match self.mode {
 			None => configured.clone(),
@@ -701,7 +692,6 @@ pub enum CompactionBoundary {
 /// Idle maintenance is deliberately lossless and begins only after ninety
 /// minutes. Threshold and mid-turn boundaries retain their distinct durable
 /// reasons while sharing the coordinator.
-#[must_use]
 pub fn boundary_reason(
 	boundary: CompactionBoundary,
 	usage: ContextUsage,
@@ -737,7 +727,6 @@ pub struct ContextUsageBreakdown {
 
 impl ContextUsageBreakdown {
 	/// Returns the saturating sum of independently measured categories.
-	#[must_use]
 	pub const fn total(self) -> u64 {
 		self
 			.system_tokens
@@ -783,7 +772,6 @@ pub struct ContextUsage {
 
 impl ContextUsage {
 	/// Creates usage while deriving the usable window from its reserve.
-	#[must_use]
 	pub const fn new(
 		total_tokens: u64,
 		context_window: u64,
@@ -816,7 +804,6 @@ impl ContextUsage {
 
 	/// Replaces the discrete category breakdown without changing authoritative
 	/// provider total usage.
-	#[must_use]
 	pub const fn with_breakdown(mut self, breakdown: ContextUsageBreakdown) -> Self {
 		self.breakdown = breakdown;
 		self
@@ -824,7 +811,6 @@ impl ContextUsage {
 
 	/// Marks the usage as in-flight and includes a conservative current-turn
 	/// token estimate in threshold calculations.
-	#[must_use]
 	pub const fn extrapolate_in_flight(mut self, added_tokens: u64) -> Self {
 		self.in_flight = true;
 		self.in_flight_tokens = added_tokens;
@@ -833,7 +819,6 @@ impl ContextUsage {
 
 	/// Records the exact prompt delta across a committed history rewrite and
 	/// advances the durable compaction epoch.
-	#[must_use]
 	pub const fn after_history_rewrite(
 		mut self,
 		before_prompt_tokens: u64,
@@ -849,13 +834,11 @@ impl ContextUsage {
 	}
 
 	/// Returns prompt occupancy including the in-flight extrapolation.
-	#[must_use]
 	pub const fn effective_total_tokens(self) -> u64 {
 		self.total_tokens.saturating_add(self.in_flight_tokens)
 	}
 
 	/// Returns occupancy of the usable context window.
-	#[must_use]
 	pub fn fraction(self) -> f64 {
 		if self.usable_tokens == 0 {
 			return f64::INFINITY;
@@ -864,13 +847,11 @@ impl ContextUsage {
 	}
 
 	/// Returns the target token count at the configured trigger threshold.
-	#[must_use]
 	pub fn target_tokens(self) -> u64 {
 		(self.usable_tokens as f64 * self.threshold_fraction).floor() as u64
 	}
 
 	/// Returns whether occupancy reaches the configured auto-compaction trigger.
-	#[must_use]
 	pub fn over_threshold(self) -> bool {
 		self.fraction() >= self.threshold_fraction
 	}
@@ -905,7 +886,6 @@ impl CompactionHysteresis {
 	}
 
 	/// Returns whether the next threshold crossing can trigger compaction.
-	#[must_use]
 	pub const fn armed(self) -> bool {
 		self.armed
 	}
@@ -1001,7 +981,6 @@ pub struct LosslessReceipt {
 
 /// Plans lossless `PRUNE` and `DROP_MEDIA` work without mutating the
 /// projection.
-#[must_use]
 pub fn plan_lossless(items: &[ProjectionItem]) -> LosslessPlan {
 	plan_lossless_with_warm_suffix(items, PROMPT_CACHE_WARM_SUFFIX_TOKENS, |_| false)
 }
@@ -1015,7 +994,6 @@ pub fn plan_lossless(items: &[ProjectionItem]) -> LosslessPlan {
 /// shake/drop-media, and asynchronous callers using this shared planner; plan
 /// file reads can therefore remain lossless without agent depending on app
 /// artifact policy.
-#[must_use]
 pub fn plan_lossless_with_warm_suffix(
 	items: &[ProjectionItem],
 	warm_suffix_tokens: u64,
@@ -1311,7 +1289,6 @@ impl DomainReturn for Option<CompactionVerdict> {
 }
 
 /// Encodes a domain compaction verdict for a `HookGate::gate_domain` reply.
-#[must_use]
 pub fn encode_domain_verdict(verdict: Option<&CompactionVerdict>) -> Bytes {
 	let wire = match verdict {
 		None => WireCompactionVerdict { kind: "none".to_owned(), ..Default::default() },
@@ -1404,7 +1381,6 @@ impl CompactionResolution {
 	/// Only this path carries ordered superseded-summary metadata into
 	/// `Journal::compact`; cancellation and delegated/default outcomes leave
 	/// durable compaction to their respective built-in rungs.
-	#[must_use]
 	pub fn into_compact(self) -> Option<Compact> {
 		let Self::Custom { mut winner, losers } = self else {
 			return None;
@@ -1482,14 +1458,12 @@ pub struct RemoteCheckpoint {
 
 impl RemoteCheckpoint {
 	/// Returns whether this opaque checkpoint is safe for the active model.
-	#[must_use]
 	pub fn reusable_for(&self, active: &ModelRef) -> bool {
 		checkpoint_reusable(&self.provider, &self.model, active)
 	}
 
 	/// Converts this verified checkpoint into the existing durable transcript
 	/// representation used by the `REMOTE` rung.
-	#[must_use]
 	pub fn into_event(self) -> Kind {
 		Kind::NativeCheckpoint { provider: self.provider, model: self.model, items: self.items }
 	}

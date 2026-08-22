@@ -31,7 +31,6 @@ pub struct NativeGitResolver {
 impl NativeGitResolver {
 	/// Creates a resolver over the Environment Git runner and an app-owned
 	/// content cache.
-	#[must_use]
 	pub fn new(runner: GitRunner, cache_root: PathBuf) -> Self {
 		Self { commands: GitCommands::new(runner.clone()), runner, cache_root }
 	}
@@ -235,7 +234,6 @@ pub struct UvRequest {
 impl UvRequest {
 	/// Constructs the exact argv passed to `uv`. This stays pure so callers can
 	/// show `resolve --explain` without touching the network.
-	#[must_use]
 	pub fn argv(&self) -> Vec<OsString> {
 		let mut argv = vec![
 			OsString::from("pip"),
@@ -348,7 +346,6 @@ impl ResolvePlan {
 	}
 
 	/// Returns the exact `uv` argv for every target, for `resolve --explain`.
-	#[must_use]
 	pub fn explain(&self) -> Vec<Vec<OsString>> {
 		self.requests.iter().map(UvRequest::argv).collect()
 	}

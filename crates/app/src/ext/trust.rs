@@ -44,7 +44,6 @@ pub struct GrantsFile {
 }
 
 /// Returns whether an existing grant covers exactly this identity and digest.
-#[must_use]
 pub fn grant_covers(
 	grants: &GrantsFile,
 	id: &Str,
@@ -299,7 +298,6 @@ impl RevocationsFile {
 	/// Resolver integration evaluates the recorded PEP 440 predicate against
 	/// its candidate version; callers must treat any returned predicate as a
 	/// hard R10 exclusion, including for locked candidates.
-	#[must_use]
 	pub fn predicate_for(&self, id: &Str) -> Option<&RevokedVersion> {
 		self.revoked.iter().find(|entry| entry.id == *id)
 	}
@@ -315,7 +313,6 @@ impl RevocationsFile {
 
 	/// Returns the documented stale-list decision. RFC 3339 UTC strings sort
 	/// lexicographically, which keeps this policy allocation-free and explicit.
-	#[must_use]
 	pub fn freshness(&self, now: &str, strict_offline: bool) -> RevocationFreshness {
 		if self.valid_until.as_str() >= now {
 			RevocationFreshness::Fresh
@@ -329,7 +326,6 @@ impl RevocationsFile {
 
 /// Produces the consent digest from normalized capabilities and hard-tool
 /// claims. Sorting makes semantically equal manifests produce one grant key.
-#[must_use]
 pub fn capability_digest(
 	capabilities: impl IntoIterator<Item = Str>,
 	hard_tools: impl IntoIterator<Item = Str>,

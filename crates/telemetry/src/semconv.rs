@@ -36,7 +36,6 @@ macro_rules! vocab {
 		}
 		impl $name {
 			#[doc = $as_str_doc]
-			#[must_use]
 			pub const fn as_str(self) -> &'static str {
 				match self {
 					$(Self::$variant => $wire,)*
@@ -208,7 +207,6 @@ impl Operation {
 	/// destination agent name. A handoff with only a destination is named
 	/// `handoff to {destination}`; with both names it uses a literal U+2192
 	/// right arrow: `handoff {source} → {destination}`.
-	#[must_use]
 	pub fn span_name(self, primary: Option<&str>, secondary: Option<&str>) -> String {
 		match self {
 			Self::InvokeAgent => {
@@ -287,7 +285,6 @@ impl CaptureMode {
 	/// Missing, empty, and unrecognized values disable capture. Matching is
 	/// ASCII-case-insensitive after trimming. `true`, `1`, `yes`, and `full`
 	/// select full capture; `summary` selects summary capture.
-	#[must_use]
 	pub fn from_env_value(value: Option<&str>) -> Self {
 		let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
 			return Self::None;
@@ -324,7 +321,6 @@ vocab! {
 }
 impl StopReason {
 	/// Maps this pi stop reason to the finish reason emitted on chat spans.
-	#[must_use]
 	pub const fn finish_reason(self) -> FinishReason {
 		match self {
 			Self::Stop => FinishReason::Stop,
@@ -353,7 +349,6 @@ vocab! {
 /// Maps a raw pi stop reason to the span's normalized finish-reason value.
 ///
 /// Unknown values return `None`, matching pi's switch default.
-#[must_use]
 pub fn map_stop_reason(reason: &str) -> Option<&'static str> {
 	reason
 		.parse::<StopReason>()
@@ -392,7 +387,6 @@ impl ErrorType {
 	///
 	/// Successful tools have no `error.type`. A thrown error may replace the
 	/// `ToolError` value with its free-form JavaScript error class name.
-	#[must_use]
 	pub const fn for_tool_status(status: ToolStatus) -> Option<Self> {
 		match status {
 			ToolStatus::Ok => None,
@@ -409,7 +403,6 @@ impl ErrorType {
 ///
 /// The match table is transcribed exactly from pi. Unknown and empty provider
 /// identifiers pass through unchanged.
-#[must_use]
 pub fn normalize_provider(raw: &str) -> &str {
 	match raw {
 		"amazon-bedrock" => "aws.bedrock",

@@ -162,7 +162,6 @@ pub struct LeakedThinkingStage {
 
 impl LeakedThinkingStage {
 	/// Creates a stage from catalog policy, without inspecting a model name.
-	#[must_use]
 	pub fn new(config: ThinkingRecoveryConfig) -> Self {
 		let patterns = match config.dialect {
 			DialectThinking::Generic => GENERIC_PATTERNS,

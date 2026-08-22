@@ -311,7 +311,6 @@ impl DapProtocol {
 	}
 
 	/// Reports whether the protocol transport has closed.
-	#[must_use]
 	pub fn is_closed(&self) -> bool {
 		self.inner.closed.is_cancelled()
 	}

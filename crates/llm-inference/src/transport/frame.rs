@@ -212,7 +212,6 @@ pub struct RawChunkFramer {
 
 impl RawChunkFramer {
 	/// Creates a pass-through framer with an explicit per-chunk bound.
-	#[must_use]
 	pub fn new(max_chunk_bytes: usize) -> Self {
 		Self { max_chunk_bytes: max_chunk_bytes.max(1), state: FramerState::Open }
 	}
@@ -233,7 +232,6 @@ impl RawChunkFramer {
 	}
 
 	/// Returns zero because this framer never retains payload bytes.
-	#[must_use]
 	pub const fn buffered_len(&self) -> usize {
 		0
 	}

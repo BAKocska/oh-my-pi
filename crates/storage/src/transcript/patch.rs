@@ -16,13 +16,11 @@ pub enum Patch<T> {
 
 impl<T> Patch<T> {
 	/// Returns whether this patch leaves the field unchanged.
-	#[must_use]
 	pub const fn is_unchanged(&self) -> bool {
 		matches!(self, Self::Unchanged)
 	}
 
 	/// Borrows the value held by a set patch.
-	#[must_use]
 	pub const fn as_ref(&self) -> Patch<&T> {
 		match self {
 			Self::Unchanged => Patch::Unchanged,
@@ -53,7 +51,6 @@ impl<T> Patch<T> {
 	}
 
 	/// Converts from the nested-option representation used by serde fields.
-	#[must_use]
 	pub fn from_nested_option(value: Option<Option<T>>) -> Self {
 		match value {
 			None => Self::Unchanged,

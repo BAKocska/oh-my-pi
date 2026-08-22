@@ -15,7 +15,6 @@ pub struct LocalEndpoint(PathBuf);
 
 impl LocalEndpoint {
 	/// Borrows the operating-system endpoint path.
-	#[must_use]
 	pub fn as_path(&self) -> &Path {
 		&self.0
 	}

@@ -164,7 +164,6 @@ pub struct Browser {
 }
 
 /// Creates `browser@1`.
-#[must_use]
 pub fn tool(host: Arc<dyn BrowserHost>) -> Browser {
 	Browser {
 		host,

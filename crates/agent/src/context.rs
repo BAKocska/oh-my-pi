@@ -152,7 +152,6 @@ impl RefFlags {
 	pub const USELESS: Self = Self(1 << 1);
 
 	/// Returns whether this flag set contains `flag`.
-	#[must_use]
 	pub const fn contains(self, flag: Self) -> bool {
 		self.0 & flag.0 != 0
 	}
@@ -319,7 +318,6 @@ pub enum ContextProjection {
 ///
 /// Native reasoning wins. Explicitly unsupported reasoning activates the tool;
 /// unknown capability evidence does not silently change the tool surface.
-#[must_use]
 pub fn external_thinking_for_model(capabilities: &omp_llm_inference::ModelCapabilities) -> bool {
 	capabilities
 		.chat
@@ -333,7 +331,6 @@ pub fn external_thinking_for_model(capabilities: &omp_llm_inference::ModelCapabi
 /// The provider never receives a modified signed reasoning block. Plaintext is
 /// preserved in a neutral note so the next turn can continue without exposing
 /// the note in ordinary transcript presentation.
-#[must_use]
 pub fn demote_interrupted_reasoning(thread: &mut Thread) -> bool {
 	let Some(message) = thread
 		.items
@@ -390,7 +387,6 @@ pub fn demote_interrupted_reasoning(thread: &mut Thread) -> bool {
 ///
 /// Callers pass preformatted values from the session snapshot; this function
 /// never consults ambient time or process cwd, so replay bytes remain stable.
-#[must_use]
 pub fn inject_first_turn_metadata(thread: &mut Thread, date: &str, cwd: &str) -> bool {
 	if thread.items.iter().any(|item| {
 		item
@@ -435,7 +431,6 @@ pub fn inject_first_turn_metadata(thread: &mut Thread, date: &str, cwd: &str) ->
 /// `event_indexes` is projection order and supplies stable ids.  A short event
 /// list is rejected by omitting unmatched tail items, rather than inventing
 /// unstable ids.
-#[must_use]
 pub fn project_context(
 	thread: Thread,
 	event_indexes: &[u64],
@@ -467,7 +462,6 @@ pub fn project_context(
 /// earlier whole-handler-drop contract; handler execution failure remains
 /// whole-handler fail-open, but a handler's invalid operation does not discard
 /// its siblings.
-#[must_use]
 pub fn apply_patches(
 	mut thread: Thread,
 	view: &ContextView,

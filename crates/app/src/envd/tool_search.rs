@@ -230,6 +230,7 @@ async fn resource_glob(
 	Ok(WalkResult { matches, missing_paths, timed_out: false, truncated })
 }
 
+#[must_use]
 struct CancelOnDrop(CancellationToken);
 
 impl Drop for CancelOnDrop {

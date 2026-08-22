@@ -27,7 +27,6 @@ pub struct AccountDiscoveredModel {
 
 /// Merges account-scoped catalogs deterministically without persisting
 /// credential material.
-#[must_use]
 pub fn merge_account_catalogs(catalogs: &[AccountCatalog]) -> Vec<AccountDiscoveredModel> {
 	let mut merged = BTreeMap::<(ProviderId, WireModelId), AccountDiscoveredModel>::new();
 	for catalog in catalogs {

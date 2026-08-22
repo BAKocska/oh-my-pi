@@ -60,13 +60,11 @@ pub struct StateRevision(u64);
 
 impl StateRevision {
 	/// Creates a revision from its persisted integer value.
-	#[must_use]
 	pub const fn new(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the persisted integer value.
-	#[must_use]
 	pub const fn get(self) -> u64 {
 		self.0
 	}
@@ -87,13 +85,11 @@ pub struct ScopeKey {
 
 impl ScopeKey {
 	/// Returns the scope class.
-	#[must_use]
 	pub const fn scope(&self) -> StateScope {
 		self.scope
 	}
 
 	/// Returns the core-resolved authority identifier.
-	#[must_use]
 	pub fn authority(&self) -> &str {
 		self.authority.as_str()
 	}
@@ -108,13 +104,11 @@ pub struct StateEntryId {
 
 impl StateEntryId {
 	/// Returns the scope instance containing the entry.
-	#[must_use]
 	pub const fn scope(&self) -> &ScopeKey {
 		&self.scope
 	}
 
 	/// Returns the entry's monotonic revision.
-	#[must_use]
 	pub const fn revision(&self) -> StateRevision {
 		self.revision
 	}
@@ -170,19 +164,16 @@ impl DurableRequest {
 	}
 
 	/// Returns the correlation identifier for this attempt.
-	#[must_use]
 	pub fn request_id(&self) -> &str {
 		self.request_id.as_str()
 	}
 
 	/// Returns the stable retry key, when supplied.
-	#[must_use]
 	pub fn idempotency_key(&self) -> Option<&str> {
 		self.idempotency_key.as_deref()
 	}
 
 	/// Returns the generations carried by the request.
-	#[must_use]
 	pub const fn generation(&self) -> GenerationFence {
 		self.generation
 	}
@@ -262,7 +253,6 @@ impl StateAuthority {
 	}
 
 	/// Attaches authority-owned organization membership.
-	#[must_use]
 	pub fn with_organization(mut self, access: OrganizationAccess) -> Self {
 		self.organization = Some(access);
 		self
@@ -283,32 +273,27 @@ impl StateAuthority {
 	}
 
 	/// Returns the authenticated principal.
-	#[must_use]
 	pub const fn principal(&self) -> &Principal {
 		&self.principal
 	}
 
 	/// Returns the exact authenticated extension incarnation stamped on writes.
-	#[must_use]
 	pub const fn provenance(&self) -> &Provenance {
 		&self.provenance
 	}
 
 	/// Returns the core's current host and session generations.
-	#[must_use]
 	pub const fn generation(&self) -> GenerationFence {
 		self.generation
 	}
 
 	/// Returns the writing extension's own namespace.
-	#[must_use]
 	pub fn namespace(&self) -> &str {
 		self.namespace.as_str()
 	}
 
 	/// Returns the authenticated session id for delegation to the session
 	/// journal.
-	#[must_use]
 	pub fn session_id(&self) -> &str {
 		self.session.as_str()
 	}
@@ -333,7 +318,6 @@ impl StateAuthority {
 	}
 
 	/// Returns whether this authority may read `namespace`.
-	#[must_use]
 	pub fn may_read_namespace(&self, namespace: &str) -> bool {
 		namespace == self.namespace
 			|| self
@@ -399,7 +383,6 @@ const _: () = assert!(size_of::<StateChange>() <= 288, "StateChange must stay co
 
 impl StateChange {
 	/// Returns the scope revision assigned to the change.
-	#[must_use]
 	pub const fn revision(&self) -> StateRevision {
 		match self {
 			Self::Entry(entry) => entry.id.revision,
@@ -1041,6 +1024,7 @@ impl StateStore {
 
 /// A cancellation-safe scoped state watcher. Dropping it unregisters the sender
 /// immediately; a slow watcher never blocks the active authority writer.
+#[must_use]
 pub struct StateWatcher {
 	receiver: Receiver<StateChange>,
 	owner:    Weak<StateInner>,

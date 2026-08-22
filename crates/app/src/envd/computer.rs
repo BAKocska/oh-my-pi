@@ -20,7 +20,6 @@ pub(crate) struct ComputerSessionHost {
 }
 
 impl ComputerSessionHost {
-	#[must_use]
 	pub(crate) fn new(blobs: BlobHost) -> Arc<Self> {
 		Arc::new(Self { session: DesktopSession::new(None), blobs })
 	}

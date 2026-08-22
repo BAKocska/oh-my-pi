@@ -100,7 +100,6 @@ pub struct Params {
 
 impl Params {
 	/// Whether this operation mutates GitHub or local worktree state.
-	#[must_use]
 	pub const fn mutates(&self) -> bool {
 		matches!(self.op, Operation::PrCreate | Operation::PrCheckout | Operation::PrPush)
 	}
@@ -152,7 +151,6 @@ pub struct Github {
 }
 
 /// Creates `github@1`.
-#[must_use]
 pub fn tool(host: Arc<dyn GithubHost>) -> Github {
 	Github {
 		host,

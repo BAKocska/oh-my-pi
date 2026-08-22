@@ -113,7 +113,6 @@ pub struct DataScope {
 
 impl DataScope {
 	/// Creates invocation-bound DATA authority.
-	#[must_use]
 	pub fn new(
 		invocation_id: impl Into<Str>,
 		effect_token: Bytes,
@@ -274,7 +273,6 @@ pub struct ActiveExecControl {
 
 impl ActiveExecControl {
 	/// Returns the opaque execution identity.
-	#[must_use]
 	pub fn exec_id(&self) -> &Bytes {
 		&self.exec
 	}
@@ -523,6 +521,7 @@ pub struct TransactionId {
 
 /// An open, connection-owned document lease.
 #[derive(Debug)]
+#[must_use]
 pub struct DocumentLease {
 	client:   EnvClient,
 	scope:    DataScope,
@@ -674,7 +673,6 @@ impl EnvClient {
 	/// `outgoing` carries client frames to the transport and `incoming` carries
 	/// decoded server frames back. A dispatcher thread performs correlation;
 	/// this client owns no async runtime or world resource.
-	#[must_use]
 	pub fn from_channels(outgoing: Sender<ClientFrame>, incoming: Receiver<ServerFrame>) -> Self {
 		let (events_tx, events) = flume::unbounded();
 		let (cancel, cancellations) = flume::unbounded();
@@ -704,7 +702,6 @@ impl EnvClient {
 	/// backpressure to ordinary asynchronous frame sends; guard cancellation is
 	/// first queued on a separate unbounded control channel so drop never
 	/// blocks.
-	#[must_use]
 	pub fn in_process(capacity: usize) -> (Self, InProcessEnvTransport) {
 		let (requests_tx, requests) = channel(capacity);
 		let (responses, responses_rx) = channel(capacity);
@@ -752,7 +749,6 @@ impl EnvClient {
 	}
 
 	/// Returns the cached server handshake, if this client has completed one.
-	#[must_use]
 	pub fn info(&self) -> Option<ServerHello> {
 		self.inner.info.lock().clone()
 	}
@@ -772,7 +768,6 @@ impl EnvClient {
 	///
 	/// The returned surface deliberately exposes no tool invocation, named
 	/// process, blob deletion, hello, or retire operation.
-	#[must_use]
 	pub fn worker_scope(&self, scope: DataScope) -> WorkerEnvClient {
 		WorkerEnvClient { client: self.clone(), scope, last_transaction: Arc::new(Mutex::new(None)) }
 	}
@@ -1025,7 +1020,6 @@ impl EnvClient {
 	}
 
 	/// Creates a cloneable out-of-band control handle for one active execution.
-	#[must_use]
 	pub fn active_exec_control(&self, exec: Bytes) -> ActiveExecControl {
 		ActiveExecControl { client: self.clone(), exec }
 	}
@@ -1116,7 +1110,6 @@ impl EnvClient {
 	///
 	/// Clones share one queue; callers should normally keep a single receiver
 	/// and distribute events according to application policy.
-	#[must_use]
 	pub fn server_events(&self) -> Receiver<ServerFrame> {
 		self.inner.events.clone()
 	}
@@ -1435,13 +1428,11 @@ impl EnvClient {
 
 impl WorkerEnvClient {
 	/// Returns this worker client's immutable invocation authority.
-	#[must_use]
 	pub const fn scope(&self) -> &DataScope {
 		&self.scope
 	}
 
 	/// Returns the cached server handshake, if negotiation completed.
-	#[must_use]
 	pub fn info(&self) -> Option<ServerHello> {
 		self.client.info()
 	}
@@ -1596,7 +1587,6 @@ impl WorkerEnvClient {
 
 	/// Returns the epoch-qualified id of the most recently attempted
 	/// transaction.
-	#[must_use]
 	pub fn last_transaction(&self) -> Option<TransactionId> {
 		self.last_transaction.lock().clone()
 	}
@@ -1955,13 +1945,11 @@ impl WorkerEnvClient {
 
 impl DocumentLease {
 	/// Returns the opaque lease id, valid only on this connection.
-	#[must_use]
 	pub const fn id(&self) -> &Bytes {
 		&self.lease_id
 	}
 
 	/// Returns the head pinned when this lease opened.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
@@ -2009,7 +1997,6 @@ impl Drop for DocumentLease {
 
 impl DocumentRead {
 	/// Returns the head from which this response was read.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		self
 			.response
@@ -2020,7 +2007,6 @@ impl DocumentRead {
 
 	/// Returns the complete content bytes, or `None` when the response contains
 	/// requested slices.
-	#[must_use]
 	pub const fn content(&self) -> Option<&Bytes> {
 		let Some(read_document_response::Body::Content(content)) = self.response.body.as_ref() else {
 			return None;
@@ -2029,7 +2015,6 @@ impl DocumentRead {
 	}
 
 	/// Returns disjoint content slices when ranges were requested.
-	#[must_use]
 	pub const fn slices(&self) -> Option<&document::ContentSlices> {
 		let Some(read_document_response::Body::Slices(slices)) = self.response.body.as_ref() else {
 			return None;
@@ -2038,7 +2023,6 @@ impl DocumentRead {
 	}
 
 	/// Consumes this wrapper and returns the canonical wire response.
-	#[must_use]
 	pub fn into_response(self) -> ReadDocumentResponse {
 		self.response
 	}
@@ -2056,7 +2040,6 @@ impl InProcessEnvTransport {
 	}
 
 	/// Splits this transport into the server's receive and send endpoints.
-	#[must_use]
 	pub fn into_parts(self) -> (Receiver<ClientFrame>, Sender<ServerFrame>) {
 		(self.requests, self.responses)
 	}
@@ -2064,7 +2047,6 @@ impl InProcessEnvTransport {
 
 impl RequestStream {
 	/// Returns the correlation identifier carried by every frame in this stream.
-	#[must_use]
 	pub const fn request_id(&self) -> u64 {
 		self.request_id
 	}
@@ -2114,13 +2096,11 @@ impl Drop for RequestStream {
 
 impl Invocation {
 	/// Returns the invocation's logical identifier.
-	#[must_use]
 	pub fn invocation_id(&self) -> &str {
 		&self.id
 	}
 
 	/// Returns the request-scoped cancellation guard.
-	#[must_use]
 	pub const fn guard(&self) -> &RunGuard {
 		self
 			.guard
@@ -2232,7 +2212,6 @@ impl Invocation {
 	///
 	/// The returned stream can continue observing its terminal event, but its
 	/// drop no longer requests cancellation.
-	#[must_use]
 	pub fn relinquish(mut self) -> RequestStream {
 		if let Some(guard) = self.guard.take() {
 			guard.relinquish();
@@ -2250,7 +2229,6 @@ impl Invocation {
 
 impl ExecRun {
 	/// Returns the request-scoped command cancellation guard.
-	#[must_use]
 	pub const fn guard(&self) -> &RunGuard {
 		self
 			.guard
@@ -2317,7 +2295,6 @@ impl ExecRun {
 	}
 
 	/// Explicitly leaves a detached command owned by the environment service.
-	#[must_use]
 	pub fn relinquish(mut self) -> RequestStream {
 		if let Some(guard) = self.guard.take() {
 			guard.relinquish();
@@ -2707,7 +2684,6 @@ impl BlobDownload {
 
 impl BlobUpload {
 	/// Returns the correlation identifier shared by every upload frame.
-	#[must_use]
 	pub const fn request_id(&self) -> u64 {
 		self.request_id
 	}

@@ -18,7 +18,6 @@ use super::{
 use crate::cli::EnvdArgs;
 
 /// Derives the stable pipe identity for one fully scoped extension binding.
-#[must_use]
 pub(crate) fn extension_pipe_endpoint(binding: &ExtensionDataBinding) -> PathBuf {
 	scoped_pipe_endpoint(binding.path())
 }

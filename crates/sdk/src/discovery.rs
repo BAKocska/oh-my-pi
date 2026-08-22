@@ -114,7 +114,6 @@ pub struct DiscoveryLoader {
 
 impl DiscoveryLoader {
 	/// Creates a loader with production-safe discovery bounds.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self {
 			max_assets:          2_000,

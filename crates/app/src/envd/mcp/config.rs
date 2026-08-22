@@ -46,7 +46,6 @@ impl ConfigSourceKind {
 	}
 
 	/// Whether OMP may mutate this source directly.
-	#[must_use]
 	pub const fn writable(self) -> bool {
 		matches!(self, Self::Project | Self::User | Self::Root)
 	}
@@ -258,7 +257,6 @@ pub struct McpServerConfig {
 
 impl McpServerConfig {
 	/// Resolves the transport inferred by the file schema.
-	#[must_use]
 	pub fn resolved_transport(&self) -> TransportKind {
 		self.transport.unwrap_or(if self.command.is_some() {
 			TransportKind::Stdio
@@ -332,7 +330,6 @@ pub struct ResolvedConfig {
 
 /// Loads and resolves already parsed sources. Project sources are excluded
 /// before name ownership when `enable_project_config` is false.
-#[must_use]
 pub fn resolve_sources(sources: &[ConfigSource], enable_project_config: bool) -> ResolvedConfig {
 	let user = sources
 		.iter()
@@ -381,7 +378,6 @@ pub fn resolve_sources(sources: &[ConfigSource], enable_project_config: bool) ->
 
 /// Validates one complete MCP file and returns every independently actionable
 /// issue.
-#[must_use]
 pub fn validate_file(file: &McpConfigFile) -> Vec<ConfigValidationError> {
 	let mut errors = Vec::new();
 	for name in file
@@ -419,7 +415,6 @@ pub fn validate_server_name(name: &str) -> Result<(), ConfigValidationError> {
 
 /// Validates transport exclusivity, headers, authentication, and revision
 /// preferences.
-#[must_use]
 pub fn validate_server(name: &str, server: &McpServerConfig) -> Vec<ConfigValidationError> {
 	let mut errors = Vec::new();
 	let has_command = server

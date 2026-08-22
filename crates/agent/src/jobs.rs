@@ -120,7 +120,6 @@ impl JobBoard {
 	}
 
 	/// Returns a process-local sequential job identifier.
-	#[must_use]
 	pub fn next_id(&self) -> Str {
 		Str::from(
 			self
@@ -241,7 +240,6 @@ impl JobBoard {
 	}
 
 	/// Copies pending descriptors in stable job-identifier order.
-	#[must_use]
 	pub fn snapshot(&self) -> Vec<JobRef> {
 		self.inner.prune_recent();
 		let pending = self.inner.pending.lock();
@@ -306,14 +304,12 @@ impl JobBoard {
 	}
 
 	/// Copies bounded terminal deliveries that exhausted their retry budget.
-	#[must_use]
 	pub fn dead_letters(&self) -> Vec<JobRef> {
 		self.inner.dead_letters.lock().values().cloned().collect()
 	}
 
 	/// Suppresses automatic delivery for selected jobs until a settlement is
 	/// claimed or the returned watch is dropped.
-	#[must_use]
 	pub fn watch(&self, ids: Option<&[Str]>) -> JobWatch {
 		let mut pending = self.inner.pending.lock();
 		let selected = match ids {
@@ -414,7 +410,6 @@ impl JobBoard {
 	}
 
 	/// Selects the next adaptive smart-wait deadline for one owner.
-	#[must_use]
 	pub fn next_smart_wait(&self, owner: &str) -> StdDuration {
 		let now = std::time::Instant::now();
 		let mut states = self.inner.poll.lock();
@@ -762,6 +757,7 @@ pub struct JobSettlement {
 }
 
 /// Exclusive claim on one settlement held outside the board lock.
+#[must_use]
 pub struct SettlementLease {
 	inner:   Weak<JobBoardInner>,
 	job_id:  Str,
@@ -789,6 +785,7 @@ impl Drop for SettlementLease {
 }
 
 /// Settlement subscription which temporarily suppresses normal delivery.
+#[must_use]
 pub struct JobWatch {
 	inner:      Arc<JobBoardInner>,
 	ids:        BTreeSet<Str>,
@@ -797,7 +794,6 @@ pub struct JobWatch {
 
 impl JobWatch {
 	/// Returns whether no selected pending job remains.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.ids.is_empty()
 	}

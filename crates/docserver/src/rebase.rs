@@ -29,19 +29,16 @@ pub struct ByteEdit {
 impl ByteEdit {
 	/// Creates an edit from its base-coordinate range and exact replacement
 	/// bytes.
-	#[must_use]
 	pub const fn new(range: ByteRange, replacement: Bytes) -> Self {
 		Self { range, replacement }
 	}
 
 	/// Returns the half-open range replaced by this edit.
-	#[must_use]
 	pub const fn range(&self) -> ByteRange {
 		self.range
 	}
 
 	/// Returns the exact replacement bytes.
-	#[must_use]
 	pub const fn replacement(&self) -> &Bytes {
 		&self.replacement
 	}
@@ -55,13 +52,11 @@ pub struct RebaseConflict {
 
 impl RebaseConflict {
 	/// Returns the sorted conflicting ranges in base coordinates.
-	#[must_use]
 	pub fn ranges(&self) -> &[ByteRange] {
 		&self.ranges
 	}
 
 	/// Consumes this conflict and returns its base-coordinate ranges.
-	#[must_use]
 	pub fn into_ranges(self) -> Vec<ByteRange> {
 		self.ranges
 	}
@@ -77,19 +72,16 @@ pub struct AppliedEdits {
 
 impl AppliedEdits {
 	/// Returns the exact finalized bytes.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Returns changed half-open ranges in finalized output coordinates.
-	#[must_use]
 	pub fn changed_ranges(&self) -> &[ByteRange] {
 		&self.changed_ranges
 	}
 
 	/// Consumes the result into its exact bytes and finalized changed ranges.
-	#[must_use]
 	pub fn into_parts(self) -> (Bytes, Vec<ByteRange>) {
 		(self.content, self.changed_ranges)
 	}

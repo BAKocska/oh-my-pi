@@ -29,7 +29,6 @@ pub struct DetachedJob {
 }
 
 /// Builds the canonical session-lifetime terminal for managed detached work.
-#[must_use]
 pub fn managed_job_terminal<P, F>(
 	job: DetachedJob,
 	kind: JobKind,
@@ -55,13 +54,11 @@ pub fn managed_job_terminal<P, F>(
 }
 
 /// Formats the model-facing notice for a newly detached job.
-#[must_use]
 pub fn format_background_notice(job_id: &str) -> Str {
 	sf!("Backgrounded as job {job_id}; result will be delivered automatically.")
 }
 
 /// Allocates the next stable managed-job name for one tool instance.
-#[must_use]
 pub fn next_background_name(prefix: &str, sequence: &AtomicU64) -> Str {
 	sf!("{prefix}-bg-{}", sequence.fetch_add(1, Ordering::Relaxed))
 }
@@ -71,7 +68,6 @@ pub fn next_background_name(prefix: &str, sequence: &AtomicU64) -> Str {
 /// A one-second buffer lets a short invocation settle inline instead of being
 /// detached immediately before its deadline. A zero threshold backgrounds
 /// immediately.
-#[must_use]
 pub fn resolve_auto_background_wait(threshold: Duration, timeout: Option<Duration>) -> Duration {
 	let Some(timeout) = timeout else {
 		return threshold;
@@ -104,7 +100,6 @@ pub struct ForegroundWait {
 
 impl ForegroundWait {
 	/// Starts a foreground wait using the shared threshold/timeout policy.
-	#[must_use]
 	pub fn new(threshold: Duration, timeout: Option<Duration>) -> Self {
 		Self {
 			deadline: std::time::Instant::now() + resolve_auto_background_wait(threshold, timeout),

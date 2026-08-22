@@ -36,7 +36,6 @@ pub struct JsonTreePreview {
 }
 
 /// Renders JSON as a bounded plain-text tree without terminal escapes.
-#[must_use]
 pub fn preview(value: &Value, bounds: JsonTreeBounds) -> JsonTreePreview {
 	let bounds = JsonTreeBounds {
 		max_depth:        bounds.max_depth.min(MAX_DEPTH_LIMIT),

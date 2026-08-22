@@ -40,7 +40,6 @@ pub struct EditorGradient {
 impl EditorGradient {
 	/// Builds a gradient after sorting stops by position. Empty gradients remain
 	/// transparent to callers through [`Self::color`].
-	#[must_use]
 	pub fn new(mut stops: Vec<GradientStop>) -> Self {
 		stops.sort_unstable_by_key(|stop| stop.at);
 		stops.dedup_by_key(|stop| stop.at);
@@ -48,7 +47,6 @@ impl EditorGradient {
 	}
 
 	/// Resolves one level to an interpolated RGB triple.
-	#[must_use]
 	pub fn color(&self, level: u8) -> Option<(u8, u8, u8)> {
 		let first = *self.stops.first()?;
 		if level <= first.at {

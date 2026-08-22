@@ -81,37 +81,31 @@ impl SecretRule {
 	}
 
 	/// Returns the match kind.
-	#[must_use]
 	pub const fn kind(&self) -> SecretKind {
 		self.kind
 	}
 
 	/// Returns the masking mode.
-	#[must_use]
 	pub const fn mode(&self) -> SecretMode {
 		self.mode
 	}
 
 	/// Returns the declared literal or pattern.
-	#[must_use]
 	pub fn content(&self) -> &str {
 		self.content.as_str()
 	}
 
 	/// Returns the optional literal replacement.
-	#[must_use]
 	pub fn replacement(&self) -> Option<&str> {
 		self.replacement.as_deref()
 	}
 
 	/// Returns the optional unsanitized display label.
-	#[must_use]
 	pub fn friendly_name(&self) -> Option<&str> {
 		self.friendly_name.as_deref()
 	}
 
 	/// Returns the compiled expression for a regex rule.
-	#[must_use]
 	pub fn regex(&self) -> Option<&Regex> {
 		self.regex.as_ref()
 	}

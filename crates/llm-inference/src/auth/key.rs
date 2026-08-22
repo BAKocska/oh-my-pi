@@ -24,13 +24,11 @@ pub struct KeyId(Str);
 
 impl KeyId {
 	/// Creates a key identifier from stored text.
-	#[must_use]
 	pub fn new(value: impl IntoStr) -> Self {
 		Self(value.into_str())
 	}
 
 	/// Borrows the identifier as text.
-	#[must_use]
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}
@@ -56,13 +54,11 @@ pub struct EncryptionKey {
 
 impl EncryptionKey {
 	/// Constructs key material from an explicit 256-bit value.
-	#[must_use]
 	pub fn new(id: KeyId, bytes: [u8; KEY_BYTES]) -> Self {
 		Self { id, bytes: Zeroizing::new(bytes) }
 	}
 
 	/// Returns the non-secret key identifier.
-	#[must_use]
 	pub const fn id(&self) -> &KeyId {
 		&self.id
 	}
@@ -145,7 +141,6 @@ pub struct HeadlessKeySource {
 
 impl HeadlessKeySource {
 	/// Creates a source containing one active key.
-	#[must_use]
 	pub fn new(id: KeyId, bytes: [u8; KEY_BYTES]) -> Self {
 		Self {
 			active: RwLock::new(id.clone()),
@@ -383,7 +378,6 @@ pub struct FallbackKeySource<P, F> {
 
 impl<P, F> FallbackKeySource<P, F> {
 	/// Creates a key source with a read-only historical fallback.
-	#[must_use]
 	pub const fn new(primary: P, fallback: F) -> Self {
 		Self { primary, fallback }
 	}
@@ -425,7 +419,6 @@ pub struct OsCredentialKeySource {
 impl OsCredentialKeySource {
 	/// Creates an explicitly opted-in service/account namespace without
 	/// performing I/O.
-	#[must_use]
 	pub fn new(service: impl Into<Arc<str>>, account: impl Into<Arc<str>>) -> Self {
 		Self { service: service.into(), account: account.into() }
 	}

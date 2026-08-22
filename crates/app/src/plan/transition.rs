@@ -33,7 +33,6 @@ impl ModelSelection {
 	}
 
 	/// Captures the effective coding selection from an agent snapshot.
-	#[must_use]
 	pub fn capture(state: &AgentState) -> Self {
 		let snapshot = state.snapshot();
 		Self {

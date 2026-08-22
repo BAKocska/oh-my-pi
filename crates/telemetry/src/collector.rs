@@ -256,13 +256,11 @@ pub struct RunCollector {
 
 impl RunCollector {
 	/// Creates an empty collector.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Returns whether the run-end transition has already fired.
-	#[must_use]
 	pub const fn run_ended(&self) -> bool {
 		self.run_ended
 	}
@@ -427,7 +425,6 @@ impl RunCollector {
 	}
 
 	/// Builds the current summary and coverage without consuming the collector.
-	#[must_use]
 	pub fn snapshot(&self, step_count: u64) -> (RunSummary, RunCoverage) {
 		(self.build_summary(step_count), self.build_coverage())
 	}
@@ -526,7 +523,6 @@ const fn increment_tool_status(counters: &mut ToolCounters, status: ToolStatus) 
 }
 
 /// Sums multiple run summaries, merging keyed maps and sorting set-like output.
-#[must_use]
 pub fn aggregate_summaries(summaries: &[RunSummary]) -> RunSummary {
 	let mut out = RunSummary::default();
 	let mut unavailable = BTreeSet::new();
@@ -576,7 +572,6 @@ fn merge_counts(target: &mut BTreeMap<Str, u64>, source: &BTreeMap<Str, u64>) {
 }
 
 /// Union-merges coverage values and re-derives unused tools.
-#[must_use]
 pub fn aggregate_coverage(coverages: &[RunCoverage]) -> RunCoverage {
 	let mut available = BTreeSet::new();
 	let mut invoked = BTreeSet::new();
@@ -663,7 +658,6 @@ pub struct CalculatedCost {
 }
 
 /// Calculates pi's per-bucket cost without rounding.
-#[must_use]
 pub fn calculate_cost(rates: CostRates, usage: CostUsage) -> CalculatedCost {
 	let orchestration = usage.orchestration.unwrap_or_default();
 	let input = rates.input / 1_000_000.0 * (usage.input + orchestration.input);
@@ -684,7 +678,6 @@ pub fn calculate_cost(rates: CostRates, usage: CostUsage) -> CalculatedCost {
 /// It uses the flat 5m rate without TTL detail; otherwise it charges 5m plus
 /// residual at the stored rate and 1h at twice the base input rate. The stored
 /// 5m rate represents Anthropic's 1.25x provider semantics.
-#[must_use]
 pub fn cache_write_cost(rates: CostRates, usage: CostUsage) -> f64 {
 	let rate_5m = rates.cache_write / 1_000_000.0;
 	let Some(cttl) = usage.cttl else {

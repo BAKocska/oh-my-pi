@@ -24,7 +24,6 @@ static CREDENTIAL_MASKER: LazyLock<Option<Mutex<SecretObfuscator>>> = LazyLock::
 ///
 /// Masking is mandatory. If the core credential grammar cannot initialize,
 /// this fails closed by replacing the entire value.
-#[must_use]
 pub fn redact_sensitive_credentials(text: &str) -> String {
 	let Some(masker) = CREDENTIAL_MASKER.as_ref() else {
 		return REDACTED.to_owned();

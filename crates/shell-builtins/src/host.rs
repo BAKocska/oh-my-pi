@@ -537,7 +537,6 @@ thread_local! {
 /// A panic raised here is, by construction, about to be caught at the builtin
 /// boundary, so the native crash hook treats it as recoverable and keeps it out
 /// of the user-facing crash report.
-#[must_use]
 pub fn panic_scope_active() -> bool {
 	PANIC_SCOPE_DEPTH.with(|depth| depth.get() > 0)
 }
@@ -551,7 +550,6 @@ pub fn set_rayon_global_pool_available(available: bool) {
 }
 
 /// Whether utility builtins may enter Rayon's process-global worker pool.
-#[must_use]
 pub fn rayon_global_pool_available() -> bool {
 	RAYON_GLOBAL_POOL_AVAILABLE.load(Ordering::SeqCst)
 }

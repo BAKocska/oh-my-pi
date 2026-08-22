@@ -39,13 +39,11 @@ pub struct Grants(Arc<[Str]>);
 
 impl Grants {
 	/// Returns every capability this Environment actually implements.
-	#[must_use]
 	pub fn all() -> Self {
 		Self(CAPABILITIES.iter().copied().map(Str::new_static).collect())
 	}
 
 	/// Retains supported capabilities from `grants`, removing duplicates.
-	#[must_use]
 	pub fn supported<I, S>(grants: I) -> Self
 	where
 		I: IntoIterator<Item = S>,
@@ -64,7 +62,6 @@ impl Grants {
 	}
 
 	/// Computes the requested intersection without granting unsupported names.
-	#[must_use]
 	pub fn requested(&self, requested: &[String]) -> Self {
 		Self::supported(
 			requested
@@ -75,13 +72,11 @@ impl Grants {
 	}
 
 	/// Computes an exact set intersection.
-	#[must_use]
 	pub fn intersection(&self, other: &Self) -> Self {
 		Self::supported(self.iter().filter(|capability| other.contains(capability)))
 	}
 
 	/// Returns whether this set contains `capability` exactly.
-	#[must_use]
 	pub fn contains(&self, capability: &str) -> bool {
 		self.0.iter().any(|grant| grant.as_str() == capability)
 	}
@@ -93,7 +88,6 @@ impl Grants {
 
 	/// Converts Core's narrowed effect envelope into exact DATA capability
 	/// bounds.
-	#[must_use]
 	pub fn from_effect_envelope(envelope: &omp_proto::policy::v1::EffectEnvelope) -> Self {
 		let mut grants = Vec::with_capacity(10);
 		if let Some(documents) = &envelope.documents {
@@ -143,7 +137,6 @@ pub enum LspOperationTier {
 }
 
 /// Returns the immutable tier for one raw LSP request method.
-#[must_use]
 pub fn lsp_request_tier(method: &str) -> LspOperationTier {
 	match method {
 		"workspace/executeCommand"
@@ -160,7 +153,6 @@ pub fn lsp_request_tier(method: &str) -> LspOperationTier {
 /// Only connection lifecycle controls are query-tier. Every other raw
 /// notification fails closed as a mutation because vendor methods can execute
 /// arbitrary server commands.
-#[must_use]
 pub fn lsp_notification_tier(method: &str) -> LspOperationTier {
 	match method {
 		"initialized" | "$/cancelRequest" | "$/setTrace" | "exit" => LspOperationTier::ReadOnly,
@@ -169,7 +161,6 @@ pub fn lsp_notification_tier(method: &str) -> LspOperationTier {
 }
 
 /// Returns the exact grant required by an LSP operation tier.
-#[must_use]
 pub const fn lsp_tier_capability(tier: LspOperationTier) -> &'static str {
 	match tier {
 		LspOperationTier::ReadOnly => "env.lsp",
@@ -178,13 +169,11 @@ pub const fn lsp_tier_capability(tier: LspOperationTier) -> &'static str {
 }
 
 /// Returns the immutable Environment tier for one DAP action.
-#[must_use]
 pub const fn dap_action_tier(action: omp_docserver::DapAction) -> omp_docserver::DapApprovalTier {
 	action.approval_tier()
 }
 
 /// Classifies one DAP wire action, failing closed for unknown/custom commands.
-#[must_use]
 pub fn dap_command_tier(command: &str) -> omp_docserver::DapApprovalTier {
 	command
 		.parse::<omp_docserver::DapAction>()
@@ -192,7 +181,6 @@ pub fn dap_command_tier(command: &str) -> omp_docserver::DapApprovalTier {
 }
 
 /// Returns the exact DATA capability required by one DAP action.
-#[must_use]
 pub const fn dap_action_capability(action: omp_docserver::DapAction) -> &'static str {
 	match dap_action_tier(action) {
 		omp_docserver::DapApprovalTier::ReadOnly => "env.dap.read",
@@ -201,7 +189,6 @@ pub const fn dap_action_capability(action: omp_docserver::DapAction) -> &'static
 }
 
 /// Returns the exact DATA capability required by one DAP wire command.
-#[must_use]
 pub fn dap_command_capability(command: &str) -> &'static str {
 	match dap_command_tier(command) {
 		omp_docserver::DapApprovalTier::ReadOnly => "env.dap.read",
@@ -303,7 +290,6 @@ pub struct AuthorityTable {
 
 impl AuthorityTable {
 	/// Allocates an opaque connection owner used to bind tokens and leases.
-	#[must_use]
 	pub fn connection_owner(&self) -> u64 {
 		self
 			.next_connection
@@ -382,7 +368,6 @@ impl AuthorityTable {
 	}
 
 	/// Returns whether `invocation_id` names a live extension-worker invocation.
-	#[must_use]
 	pub fn is_worker_invocation(&self, host: &HostKey, invocation_id: &str) -> bool {
 		self
 			.state
@@ -571,7 +556,6 @@ type AuthorityTableRef = Arc<AuthorityTable>;
 
 impl QuotaAccount {
 	/// Creates accounting for an owner or extension connection.
-	#[must_use]
 	pub const fn new(table: AuthorityTableRef, host: Option<HostKey>) -> Self {
 		Self { table, host, usage: [0; Quota::COUNT] }
 	}

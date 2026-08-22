@@ -51,13 +51,11 @@ pub struct DiscoveryCache {
 
 impl DiscoveryCache {
 	/// Creates an empty composition-local cache.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Returns a shared parsed declaration set only for an exact revision key.
-	#[must_use]
 	pub fn get(&self, key: &ParsedCacheKey) -> Option<Arc<[DiscoveredCapability]>> {
 		self.entries.read().get(key).cloned()
 	}
@@ -109,7 +107,6 @@ impl DiscoveryCache {
 	}
 
 	/// Returns bounded cache cardinality diagnostics without exposing payloads.
-	#[must_use]
 	pub fn stats(&self) -> CacheStats {
 		let entries = self.entries.read();
 		let providers = entries

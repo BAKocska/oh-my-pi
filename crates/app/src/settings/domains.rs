@@ -226,7 +226,6 @@ pub enum NotifyToggle {
 
 impl NotifyToggle {
 	/// Returns whether the notification is enabled.
-	#[must_use]
 	pub const fn enabled(self) -> bool {
 		matches!(self, Self::On)
 	}
@@ -624,7 +623,6 @@ impl Default for TtsrSettings {
 impl TtsrSettings {
 	/// Freezes this persisted projection for the agent matcher, retaining the
 	/// agent's repeat policy defaults.
-	#[must_use]
 	pub fn for_agent(&self) -> omp_agent::TtsrSettings {
 		let defaults = omp_agent::TtsrSettings::default();
 		omp_agent::TtsrSettings {

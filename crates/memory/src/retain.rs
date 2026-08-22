@@ -71,7 +71,6 @@ pub struct Retainer<'a> {
 
 impl<'a> Retainer<'a> {
 	/// Creates a coordinator. The turn interval is clamped to at least one.
-	#[must_use]
 	pub fn new(
 		store: &'a BankStore,
 		session_id: &'a str,
@@ -136,13 +135,11 @@ impl<'a> Retainer<'a> {
 }
 
 /// Frames all substantive messages with explicit role/end markers.
-#[must_use]
 pub fn format_durable_transcript(messages: &[RetentionMessage<'_>]) -> Option<Str> {
 	format_messages(messages.iter().copied(), true)
 }
 
 /// Frames only user-authored messages for fact/entity extraction.
-#[must_use]
 pub fn format_extraction_text(messages: &[RetentionMessage<'_>]) -> Option<Str> {
 	format_messages(
 		messages
@@ -155,13 +152,11 @@ pub fn format_extraction_text(messages: &[RetentionMessage<'_>]) -> Option<Str> 
 
 /// Formats every substantive message without protocol markers for embedding and
 /// FTS.
-#[must_use]
 pub fn format_embedding_text(messages: &[RetentionMessage<'_>]) -> Option<Str> {
 	format_messages(messages.iter().copied(), false)
 }
 
 /// Removes retention protocol markers from recalled episode content.
-#[must_use]
 pub fn strip_protocol_markers(content: &str) -> Str {
 	let mut output = String::with_capacity(content.len());
 	for line in content.lines() {

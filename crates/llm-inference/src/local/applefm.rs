@@ -141,7 +141,6 @@ mod error_code {
 
 	impl AppleFmErrorCode {
 		/// Stable machine-readable string representation of this error code.
-		#[must_use]
 		pub const fn as_str(&self) -> &'static str {
 			(*self).into_str()
 		}
@@ -233,7 +232,6 @@ mod support_state {
 
 	impl AppleFmSupportState {
 		/// Returns the stable planning-evidence code for this availability state.
-		#[must_use]
 		pub const fn code(self) -> &'static str {
 			self.into_str()
 		}
@@ -285,13 +283,11 @@ const _: () = assert!(
 
 impl AppleFmAvailabilityEvidence {
 	/// Whether the narrow ABI seam exposes native tools.
-	#[must_use]
 	pub const fn tools(&self) -> bool {
 		matches!(self.tool_evidence, AppleFmFeatureEvidence::Native)
 	}
 
 	/// Whether the narrow ABI seam exposes native schema-guided generation.
-	#[must_use]
 	pub const fn structured_generation(&self) -> bool {
 		matches!(self.structured_generation_evidence, AppleFmFeatureEvidence::Native)
 	}

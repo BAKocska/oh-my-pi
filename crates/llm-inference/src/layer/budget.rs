@@ -241,7 +241,6 @@ pub struct OverallBudgetLayer {
 
 impl OverallBudgetLayer {
 	/// Creates the outer execution boundary with one shared inference ledger.
-	#[must_use]
 	pub const fn new(ledger: InferenceLedger) -> Self {
 		Self { ledger }
 	}

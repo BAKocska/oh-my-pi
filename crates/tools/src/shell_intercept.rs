@@ -33,7 +33,6 @@ pub struct Guidance {
 }
 
 /// Compiles only rules whose alternative tool is live.
-#[must_use]
 pub fn compile(rules: &[Rule], live_tools: &[Str]) -> Vec<CompiledRule> {
 	let live = live_tools.iter().map(Str::as_str).collect::<BTreeSet<_>>();
 	rules
@@ -52,7 +51,6 @@ pub fn compile(rules: &[Rule], live_tools: &[Str]) -> Vec<CompiledRule> {
 }
 
 /// Returns the first matching configured recommendation.
-#[must_use]
 pub fn analyze_configured(command: &str, rules: &[CompiledRule]) -> Option<Guidance> {
 	for candidate in candidates(command) {
 		for rule in rules {
@@ -72,7 +70,6 @@ pub fn analyze_configured(command: &str, rules: &[CompiledRule]) -> Option<Guida
 /// Segments consuming piped stdin are deliberately ignored: path-oriented
 /// tools cannot reproduce their stream semantics. Leading assignments and
 /// redirections are removed before classifying the executable.
-#[must_use]
 pub fn analyze(command: &str, live_tools: &[Str]) -> Option<Guidance> {
 	let live = live_tools.iter().map(Str::as_str).collect::<BTreeSet<_>>();
 	for candidate in candidates(command) {

@@ -69,7 +69,6 @@ pub enum Action {
 
 impl Action {
 	/// Whether the action may mutate workspace state.
-	#[must_use]
 	pub const fn mutative(self, apply: Option<bool>) -> bool {
 		match self {
 			Self::Rename | Self::RenameFile => !matches!(apply, Some(false)),
@@ -189,7 +188,6 @@ pub struct LspTool<C> {
 }
 
 /// Creates discoverable `lsp@1` with an environment-configured timeout ceiling.
-#[must_use]
 pub fn tool<C: LspControl>(control: C, maximum: Duration) -> LspTool<C> {
 	LspTool {
 		control,

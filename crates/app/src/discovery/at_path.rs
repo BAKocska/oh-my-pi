@@ -32,7 +32,6 @@ pub fn expand_at_text(text: &str, source: &Path) -> io::Result<String> {
 ///
 /// Mentions require a prose boundary, so email addresses and Git remotes do not
 /// become filesystem reads. Unquoted surrounding punctuation is stripped.
-#[must_use]
 pub fn extract_path_mentions(text: &str) -> Vec<String> {
 	let mut mentions = Vec::new();
 	let mut cursor = 0;

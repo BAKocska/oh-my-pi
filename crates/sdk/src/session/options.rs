@@ -157,7 +157,6 @@ pub struct SessionOptions {
 
 impl SessionOptions {
 	/// Creates options for one required primary root.
-	#[must_use]
 	pub fn new(cwd: impl Into<PathBuf>) -> Self {
 		Self {
 			cwd: cwd.into(),

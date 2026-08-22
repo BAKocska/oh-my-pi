@@ -278,13 +278,11 @@ pub struct CollabEvent {
 
 impl CollabEvent {
 	/// Returns the explicit peer visibility class.
-	#[must_use]
 	pub const fn visibility(&self) -> CollabEventVisibility {
 		self.visibility
 	}
 
 	/// Returns the allowlisted immutable agent event.
-	#[must_use]
 	pub fn event(&self) -> &AgentEvent {
 		&self.event
 	}

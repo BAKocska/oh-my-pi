@@ -8,7 +8,6 @@ use super::{
 };
 
 /// Returns the isolated managed-skills directory beneath the active agent root.
-#[must_use]
 pub fn root(agent_root: &Path) -> PathBuf {
 	agent_root.join("managed-skills")
 }
@@ -18,7 +17,6 @@ pub fn root(agent_root: &Path) -> PathBuf {
 /// Callers append this provider after every authored source. The final
 /// first-wins merge therefore makes generated skills dead-last without giving
 /// the managed directory any way to override authored content.
-#[must_use]
 use std::fs;
 pub fn discover_dead_last(agent_root: &Path, settings: &SkillDiscoverySettings) -> SkillDiscovery {
 	let managed_root = root(agent_root);

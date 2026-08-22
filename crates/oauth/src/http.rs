@@ -51,7 +51,6 @@ impl OAuthHttpRequest {
 	}
 
 	/// Consumes the request into transport-ready parts.
-	#[must_use]
 	pub fn into_parts(self) -> (Method, Url, HeaderMap, Option<SecretString>) {
 		(self.method, self.url, self.headers, self.body)
 	}
@@ -99,7 +98,6 @@ pub struct SystemOAuthHttpClient {
 
 impl SystemOAuthHttpClient {
 	/// Constructs a pooled HTTP/1.1 and HTTP/2 client.
-	#[must_use]
 	pub fn new() -> Self {
 		let _ = rustls::crypto::ring::default_provider().install_default();
 		let connector = HttpsConnectorBuilder::new()

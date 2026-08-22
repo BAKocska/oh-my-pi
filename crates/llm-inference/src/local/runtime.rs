@@ -131,6 +131,7 @@ impl MemoryPool {
 
 /// RAII memory reservation released on drop.
 #[derive(Debug)]
+#[must_use]
 pub struct MemoryReservation {
 	pool:  Arc<MemoryPool>,
 	bytes: usize,
@@ -198,6 +199,7 @@ impl AdmissionControl {
 
 /// Admission permit released on drop.
 #[derive(Debug)]
+#[must_use]
 pub struct AdmissionPermit(Arc<AdmissionControl>);
 
 impl Drop for AdmissionPermit {

@@ -64,7 +64,6 @@ pub struct CommandCredentialResolver {
 
 impl CommandCredentialResolver {
 	/// Creates a resolver over an injected Environment executor.
-	#[must_use]
 	pub fn new(executor: Arc<dyn CommandCredentialExecutor>, failure_ttl: Duration) -> Self {
 		Self { executor, failure_ttl, cache: Mutex::new(BTreeMap::new()) }
 	}

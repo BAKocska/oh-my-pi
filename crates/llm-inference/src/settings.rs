@@ -132,7 +132,6 @@ pub(crate) fn active_fallback(primary: &ModelKey<str>) -> Option<ModelKey> {
 
 impl RetrySettings {
 	/// Returns the total attempt bound installed on calls that retain defaults.
-	#[must_use]
 	pub const fn max_attempts(&self) -> u32 {
 		if self.enabled {
 			self.max_retries.saturating_add(1)
@@ -142,7 +141,6 @@ impl RetrySettings {
 	}
 
 	/// Returns the retry middleware policy.
-	#[must_use]
 	pub const fn backoff(&self) -> RetryBackoff {
 		RetryBackoff {
 			base:    Duration::from_millis(self.base_delay_ms),
@@ -410,7 +408,6 @@ impl Default for ProviderRuntimeSettings {
 impl ProviderRuntimeSettings {
 	/// Resolves a provider concurrency limit; zero and absent entries are
 	/// unlimited.
-	#[must_use]
 	pub fn in_flight_limit(&self, provider: &ProviderId<str>) -> Option<usize> {
 		self
 			.max_in_flight

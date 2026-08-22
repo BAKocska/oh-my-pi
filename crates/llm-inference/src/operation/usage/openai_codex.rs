@@ -46,7 +46,6 @@ pub struct OpenAiCodexUsageFetcher {
 
 impl OpenAiCodexUsageFetcher {
 	/// Constructs a fetcher over the application's shared bounded HTTP client.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}
@@ -79,7 +78,6 @@ impl ConsoleUsageFetcher for OpenAiCodexUsageFetcher {
 ///
 /// Streaming proxies and provider response paths are intentionally ignored:
 /// `wham` account endpoints exist only on `chatgpt.com` and `chat.openai.com`.
-#[must_use]
 pub fn normalize_codex_base_url(base_url: Option<&str>) -> Str {
 	let Some(trimmed) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
 		return sf!(CODEX_BASE_URL);
@@ -99,7 +97,6 @@ pub fn normalize_codex_base_url(base_url: Option<&str>) -> Str {
 }
 
 /// Extracts `ChatGPT` account id and normalized email claims from a JWT.
-#[must_use]
 pub fn parse_codex_jwt_identity(token: &str) -> (Option<Str>, Option<Str>) {
 	let mut parts = token.split('.');
 	let (Some(_header), Some(payload), Some(_signature), None) =
@@ -510,7 +507,6 @@ pub struct CodexRedemptionCoordinator {
 impl CodexRedemptionCoordinator {
 	/// Creates a coordinator with the minimum interval between provider
 	/// mutations.
-	#[must_use]
 	pub const fn new(cooldown: Duration) -> Self {
 		Self { cooldown, next_attempt: None, history_generation: 0, redeemed_generation: None }
 	}
@@ -642,7 +638,6 @@ fn parse_credit(value: &Value) -> Option<CodexResetCredit> {
 /// Undated available credits rank after dated credits. When no row is
 /// available, the first row is returned so the backend can surface its own
 /// business outcome.
-#[must_use]
 pub fn pick_soonest_expiring_credit(credits: &[CodexResetCredit]) -> Option<&CodexResetCredit> {
 	let mut best = None;
 	let mut best_expiry = None;

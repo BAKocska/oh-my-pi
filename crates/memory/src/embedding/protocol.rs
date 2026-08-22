@@ -60,7 +60,6 @@ pub enum InboundFrame {
 
 impl InboundFrame {
 	/// Correlation identifier.
-	#[must_use]
 	pub fn id(&self) -> &str {
 		match self {
 			Self::Ping { id } | Self::Init { id, .. } | Self::Embed { id, .. } => id.as_str(),

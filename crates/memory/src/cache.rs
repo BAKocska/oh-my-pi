@@ -58,13 +58,11 @@ impl Default for RecallCache {
 
 impl RecallCache {
 	/// Creates the default 128-entry cache.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::with_capacity(DEFAULT_CAPACITY)
 	}
 
 	/// Creates a cache with a bounded capacity.
-	#[must_use]
 	pub fn with_capacity(capacity: usize) -> Self {
 		Self { entries: Mutex::new(VecDeque::new()), capacity: capacity.clamp(1, 1024) }
 	}

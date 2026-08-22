@@ -35,13 +35,11 @@ pub struct TavilySearchCodec;
 
 impl TavilySearchCodec {
 	/// Creates a Tavily search codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}
 
 	/// Returns the stable registry identifier for this codec.
-	#[must_use]
 	pub const fn id(self) -> &'static str {
 		CODEC_ID
 	}
@@ -195,7 +193,6 @@ pub struct TavilySearchDecoder {
 
 impl TavilySearchDecoder {
 	/// Creates an empty Tavily response decoder.
-	#[must_use]
 	pub fn new() -> Self {
 		Self { buffer: BytesMut::new(), finished: false, require_answer: false }
 	}

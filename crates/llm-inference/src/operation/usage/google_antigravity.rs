@@ -48,7 +48,6 @@ pub struct GoogleAntigravityUsageFetcher {
 }
 impl GoogleAntigravityUsageFetcher {
 	/// Constructs an Antigravity usage fetcher.
-	#[must_use]
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
 		Self { provider: ProviderId::from(PROVIDER), http }
 	}

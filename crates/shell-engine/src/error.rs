@@ -395,7 +395,6 @@ where
 
 impl Error {
 	/// Marks this error as fatal.
-	#[must_use]
 	pub const fn into_fatal(mut self) -> Self {
 		self.fatal = true;
 		self

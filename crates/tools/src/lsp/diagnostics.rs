@@ -24,7 +24,6 @@ pub struct DiagnosticResult {
 
 impl DiagnosticResult {
 	/// Normalizes, sorts, and bounds findings.
-	#[must_use]
 	pub fn new(diagnostics: Vec<Diagnostic>, complete: bool) -> Self {
 		let diagnostics = normalize(diagnostics);
 		let omitted = diagnostics.len().saturating_sub(MAX_DIAGNOSTICS);
@@ -37,7 +36,6 @@ impl DiagnosticResult {
 }
 
 /// Renders source-tagged findings grouped by folded file path.
-#[must_use]
 pub fn render(result: &DiagnosticResult) -> Str {
 	if result.diagnostics.is_empty() {
 		return if result.complete {

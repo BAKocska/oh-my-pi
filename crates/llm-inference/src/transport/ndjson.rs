@@ -25,13 +25,11 @@ impl Default for NdjsonDecoder {
 
 impl NdjsonDecoder {
 	/// Creates a decoder with the default 16 MiB record bound.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::with_max_frame_bytes(DEFAULT_MAX_FRAME_BYTES)
 	}
 
 	/// Creates a decoder with an explicit maximum record size.
-	#[must_use]
 	pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
 		Self {
 			buffer:          BytesMut::new(),
@@ -59,7 +57,6 @@ impl NdjsonDecoder {
 	}
 
 	/// Returns retained bytes belonging to the incomplete record.
-	#[must_use]
 	pub fn buffered_len(&self) -> usize {
 		self.buffer.len()
 	}

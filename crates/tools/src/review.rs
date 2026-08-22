@@ -35,7 +35,6 @@ pub enum FindingPriority {
 
 impl FindingPriority {
 	/// Stable zero-based severity order.
-	#[must_use]
 	pub const fn ordinal(self) -> u8 {
 		match self {
 			Self::P0 => 0,
@@ -46,7 +45,6 @@ impl FindingPriority {
 	}
 
 	/// Stable semantic status symbol used by presentation layers.
-	#[must_use]
 	pub const fn status_symbol(self) -> &'static str {
 		match self {
 			Self::P0 => "status.error",
@@ -100,7 +98,6 @@ pub enum OverallCorrectness {
 }
 
 /// Converts canonical strings or numeric ordinals into P0-P3 priority.
-#[must_use]
 pub fn normalize_finding_priority(value: &Value) -> Option<FindingPriority> {
 	match value {
 		Value::String(value) => value.parse().ok(),
@@ -116,7 +113,6 @@ pub fn normalize_finding_priority(value: &Value) -> Option<FindingPriority> {
 }
 
 /// Parses a reviewer finding, rejecting incomplete or out-of-range payloads.
-#[must_use]
 pub fn parse_finding_details(value: &Value) -> Option<FindingDetails> {
 	let object = value.as_object()?;
 	let confidence = finite_confidence(object.get("confidence")?)?;
@@ -137,7 +133,6 @@ pub fn parse_finding_details(value: &Value) -> Option<FindingDetails> {
 }
 
 /// Parses the final reviewer verdict and validates its confidence bound.
-#[must_use]
 pub fn parse_review_verdict(value: &Value) -> Option<ReviewVerdict> {
 	let object = value.as_object()?;
 	Some(ReviewVerdict {
@@ -148,7 +143,6 @@ pub fn parse_review_verdict(value: &Value) -> Option<ReviewVerdict> {
 }
 
 /// Produces a deterministic one-line verdict summary for logs and compact UI.
-#[must_use]
 pub fn verdict_summary(verdict: &ReviewVerdict, findings: &[FindingDetails]) -> Str {
 	let highest = findings.iter().map(|finding| finding.priority).min();
 	match highest {

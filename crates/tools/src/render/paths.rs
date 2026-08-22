@@ -18,13 +18,11 @@ pub struct PathTreeInput<'a> {
 
 impl<'a> PathTreeInput<'a> {
 	/// Creates a path input whose file-event key is the original path.
-	#[must_use]
 	pub const fn new(path: &'a str, is_dir: bool) -> Self {
 		Self { path, is_dir, key: None }
 	}
 
 	/// Creates a path input with an explicit file-event lookup key.
-	#[must_use]
 	pub const fn with_key(path: &'a str, is_dir: bool, key: &'a str) -> Self {
 		Self { path, is_dir, key: Some(key) }
 	}
@@ -127,13 +125,11 @@ impl GroupedTreeEvent<'_> {
 	/// Consumers insert a separator only when something has already been
 	/// emitted. Every directory and every root-level file starts a section;
 	/// nested files stay attached to the directory header above them.
-	#[must_use]
 	pub const fn starts_group(self) -> bool {
 		matches!(self.kind, GroupedTreeEventKind::Directory) || self.depth == 0
 	}
 
 	/// Returns the number of `#` characters in this event's grouped header.
-	#[must_use]
 	pub const fn heading_level(self) -> usize {
 		self.depth + 1
 	}
@@ -143,7 +139,6 @@ impl GroupedTreeEvent<'_> {
 ///
 /// URL-like paths are retained whole as root-level files because their slash
 /// components do not represent workspace directories.
-#[must_use]
 pub fn is_url_like_path(path: &str) -> bool {
 	let Some((scheme, _)) = path.split_once("://") else {
 		return false;
@@ -160,7 +155,6 @@ pub fn is_url_like_path(path: &str) -> bool {
 /// file basenames under the same node keep the first key, matching glob retry
 /// deduplication behavior. Directory-only inputs remain visible as leaf
 /// headers.
-#[must_use]
 pub fn build_path_tree<'a>(entries: impl IntoIterator<Item = PathTreeInput<'a>>) -> PathTree {
 	let mut root = BuilderNode::default();
 	for input in entries {
@@ -282,7 +276,6 @@ impl<'a> Iterator for PathTreeIter<'a> {
 }
 
 /// Walks `tree` depth-first with single-child directory chains already folded.
-#[must_use]
 pub fn walk_path_tree(tree: &PathTree) -> PathTreeIter<'_> {
 	PathTreeIter { stack: vec![WalkFrame::new(&tree.root, 0)] }
 }
@@ -292,7 +285,6 @@ pub fn walk_path_tree(tree: &PathTree) -> PathTreeIter<'_> {
 /// Directory headers carry one `#` per depth and retain a trailing slash. File
 /// leaves are bare. Unlike grouped grep sections, this compact listing contains
 /// no blank separator lines.
-#[must_use]
 pub fn format_grouped_paths<P: AsRef<str>>(paths: &[P]) -> String {
 	format_grouped_paths_annotated(paths, |_| "")
 }
@@ -302,7 +294,6 @@ pub fn format_grouped_paths<P: AsRef<str>>(paths: &[P]) -> String {
 ///
 /// `annotate` receives the full original path key, not the displayed basename;
 /// its returned text is appended verbatim.
-#[must_use]
 pub fn format_grouped_paths_annotated<P, F, A>(paths: &[P], mut annotate: F) -> String
 where
 	P: AsRef<str>,

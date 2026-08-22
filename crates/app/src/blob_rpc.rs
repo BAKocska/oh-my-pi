@@ -21,7 +21,6 @@ pub struct BlobRpc {
 
 impl BlobRpc {
 	/// Wraps a daemon-owned blob store.
-	#[must_use]
 	pub const fn new(store: Arc<BlobStore>) -> Self {
 		Self { store }
 	}

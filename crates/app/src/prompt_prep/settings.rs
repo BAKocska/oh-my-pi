@@ -80,7 +80,6 @@ impl Default for PromptSettings {
 impl PromptSettings {
 	/// Applies invocation overrides and the explicit `NULL_PROMPT=true`
 	/// developer/test escape hatch before freezing a turn snapshot.
-	#[must_use]
 	pub fn with_cli(mut self, cli: &crate::cli::PromptArgs) -> Self {
 		if let Some(value) = cli.personality {
 			self.personality = value;

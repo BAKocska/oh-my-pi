@@ -105,7 +105,6 @@ impl omp_tools::ask::AskVocalizer for AskVocalizer {
 }
 
 /// Creates the production ask-dialog vocalizer.
-#[must_use]
 pub(crate) fn ask_vocalizer(
 	backend: Arc<SearchBridgeHost>,
 ) -> Arc<dyn omp_tools::ask::AskVocalizer> {
@@ -200,7 +199,6 @@ pub struct MediaDevice {
 }
 
 /// Creates the `image_gen@1` dynamic device.
-#[must_use]
 pub fn image_gen(backend: Arc<SearchBridgeHost>, blobs: BlobHost, root: PathBuf) -> MediaDevice {
 	media_device(
 		"image_gen",
@@ -213,7 +211,6 @@ pub fn image_gen(backend: Arc<SearchBridgeHost>, blobs: BlobHost, root: PathBuf)
 }
 
 /// Creates the `tts@1` dynamic device.
-#[must_use]
 pub fn tts(backend: Arc<SearchBridgeHost>, blobs: BlobHost, root: PathBuf) -> MediaDevice {
 	media_device(
 		"tts",
@@ -602,7 +599,6 @@ pub struct ReportIssue {
 }
 
 /// Creates `report_issue@1` over the project `AutoQA` store.
-#[must_use]
 pub fn report_issue(store: Arc<TelemetryIndex>) -> ReportIssue {
 	ReportIssue {
 		spec: ToolSpec {

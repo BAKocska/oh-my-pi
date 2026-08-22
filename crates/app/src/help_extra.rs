@@ -43,7 +43,6 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 ];
 
 /// Renders the extended reference appended to clap's root help.
-#[must_use]
 pub fn render() -> String {
 	let mut output = String::from("Environment variables:\n");
 	for (name, description) in ENVIRONMENT_VARIABLES {

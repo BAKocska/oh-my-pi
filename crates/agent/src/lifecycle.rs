@@ -22,25 +22,21 @@ pub struct PromptMemoryQuery<'a> {
 impl<'a> PromptMemoryQuery<'a> {
 	/// Creates a query from committed turn-input journal ids and bounded user
 	/// text.
-	#[must_use]
 	pub const fn new(turn_id: &'a str, item_events: &'a [u64], user_text: &'a str) -> Self {
 		Self { turn_id, item_events, user_text }
 	}
 
 	/// Stable fresh turn identity.
-	#[must_use]
 	pub const fn turn_id(self) -> &'a str {
 		self.turn_id
 	}
 
 	/// Committed physical turn-input item ids.
-	#[must_use]
 	pub const fn item_events(self) -> &'a [u64] {
 		self.item_events
 	}
 
 	/// Bounded canonical user text for semantic recall.
-	#[must_use]
 	pub const fn user_text(self) -> &'a str {
 		self.user_text
 	}
@@ -118,20 +114,17 @@ impl MemoryExtractionWindow {
 	}
 
 	/// Stable settled turn identity.
-	#[must_use]
 	pub const fn turn_id(&self) -> &Str {
 		&self.turn_id
 	}
 
 	/// Previous memory record to consolidate, when this extraction supersedes
 	/// one.
-	#[must_use]
 	pub const fn source_memory_id(&self) -> Option<&Str> {
 		self.source_memory_id.as_ref()
 	}
 
 	/// Physical journal item ids resolved by the app-owned journal authority.
-	#[must_use]
 	pub fn item_events(&self) -> &[u64] {
 		&self.item_events
 	}
@@ -165,7 +158,6 @@ pub struct MemoryHooks {
 
 impl MemoryHooks {
 	/// Creates a publisher. Disabled publishers perform no sends or memory work.
-	#[must_use]
 	pub const fn new(enabled: bool, sender: flume::Sender<MemoryHookEvent>) -> Self {
 		Self { enabled, sender }
 	}
@@ -178,7 +170,6 @@ impl MemoryHooks {
 	}
 
 	/// Whether this session may perform memory work.
-	#[must_use]
 	pub const fn enabled(&self) -> bool {
 		self.enabled
 	}
@@ -213,7 +204,6 @@ pub struct ShutdownTask {
 
 impl ShutdownTask {
 	/// Associates an already-spawned task with its shutdown stage.
-	#[must_use]
 	pub const fn new(stage: ShutdownStage, task: JoinHandle<()>) -> Self {
 		Self { stage, task }
 	}

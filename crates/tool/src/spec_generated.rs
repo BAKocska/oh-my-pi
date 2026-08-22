@@ -1124,7 +1124,6 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 ];
 
 /// Returns every canonical runtime symbol row without allocation.
-#[must_use]
 pub const fn runtime_symbols() -> &'static [RuntimeSymbolSpec] {
 	RUNTIME_SYMBOLS
 }
@@ -1139,14 +1138,12 @@ pub static RUNTIME_DURATION_METADATA: &[RuntimeDurationMetadata] = &[RuntimeDura
 }];
 
 /// Returns typed runtime-duration metadata without allocation.
-#[must_use]
 pub const fn runtime_duration_metadata() -> &'static [RuntimeDurationMetadata] {
 	RUNTIME_DURATION_METADATA
 }
 
 /// Returns canonical operation metadata by public symbol or internal dispatch
 /// key.
-#[must_use]
 pub fn operation_spec(symbol_name: &str) -> Option<&'static OperationSpec> {
 	RUNTIME_SYMBOLS
 		.iter()

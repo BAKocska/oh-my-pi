@@ -60,20 +60,17 @@ pub struct PromptCompiler {
 
 impl PromptCompiler {
 	/// Creates an empty compiler.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self { contributions: Vec::new(), callback: None }
 	}
 
 	/// Adds one immutable typed contribution.
-	#[must_use]
 	pub fn contribution(mut self, contribution: PromptContribution) -> Self {
 		self.contributions.push(contribution);
 		self
 	}
 
 	/// Installs the provider-system-prompt callback.
-	#[must_use]
 	pub fn callback(mut self, callback: SystemPromptCallback) -> Self {
 		self.callback = Some(callback);
 		self

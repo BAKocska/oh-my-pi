@@ -13,7 +13,6 @@ pub fn select(profile: Option<Str>) {
 }
 
 /// Returns the bootstrap-selected profile, including the environment fallback.
-#[must_use]
 pub fn selected() -> Option<&'static str> {
 	SELECTED_PROFILE
 		.get()

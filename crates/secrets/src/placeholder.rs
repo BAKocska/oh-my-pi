@@ -41,7 +41,6 @@ impl CaseHint {
 }
 
 /// Infers pi's U/L/C/M ASCII case hint.
-#[must_use]
 pub fn infer_case_hint(secret: &str) -> Option<CaseHint> {
 	let mut has_upper = false;
 	let mut has_lower = false;
@@ -76,7 +75,6 @@ pub fn infer_case_hint(secret: &str) -> Option<CaseHint> {
 
 /// Removes non-alphanumerics, uppercases, and caps a model-visible label at 32
 /// bytes.
-#[must_use]
 pub fn sanitize_friendly_name(name: &str) -> Option<String> {
 	let sanitized: String = name
 		.bytes()
@@ -88,7 +86,6 @@ pub fn sanitize_friendly_name(name: &str) -> Option<String> {
 }
 
 /// Normalizes arbitrary text for a label/secret collision check.
-#[must_use]
 pub fn sanitize_for_collision_check(value: &str) -> String {
 	value
 		.bytes()
@@ -98,7 +95,6 @@ pub fn sanitize_for_collision_check(value: &str) -> String {
 }
 
 /// Reports whether exposing a sanitized label would expose the secret itself.
-#[must_use]
 pub fn sanitized_label_collides_with_secret(label: &str, secret: &str) -> bool {
 	!secret.is_empty()
 		&& (label.contains(secret)
@@ -106,7 +102,6 @@ pub fn sanitized_label_collides_with_secret(label: &str, secret: &str) -> bool {
 }
 
 /// Builds pi's 12-character, least-significant-digit-first base36 HMAC tag.
-#[must_use]
 pub fn build_hash_base(key: &str, value: &str) -> String {
 	let mut mac =
 		Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts every key size");
@@ -122,7 +117,6 @@ pub fn build_hash_base(key: &str, value: &str) -> String {
 }
 
 /// Formats `$$[LABEL_]BASE[:HINT]$$`.
-#[must_use]
 pub fn build_placeholder(hint: Option<CaseHint>, base: &str, label: Option<&str>) -> String {
 	let label_len = label.map_or(0, |value| value.len() + 1);
 	let mut output =
@@ -142,7 +136,6 @@ pub fn build_placeholder(hint: Option<CaseHint>, base: &str, label: Option<&str>
 }
 
 /// Returns the label-free alias of a labeled placeholder.
-#[must_use]
 pub fn placeholder_without_friendly_name(placeholder: &str) -> Option<String> {
 	let body = placeholder.strip_prefix("$$")?.strip_suffix("$$")?;
 	let underscore = body.find('_')?;
@@ -201,7 +194,6 @@ pub struct PlaceholderScanner<'a> {
 
 impl<'a> PlaceholderScanner<'a> {
 	/// Creates a scanner over one complete message.
-	#[must_use]
 	pub const fn new(text: &'a str) -> Self {
 		Self { text, cursor: 0 }
 	}
@@ -232,7 +224,6 @@ impl<'a> Iterator for PlaceholderScanner<'a> {
 
 /// Restores complete placeholders across one message, recursively rescanning
 /// only when a restored entry is declared recursive.
-#[must_use]
 pub fn deobfuscate_placeholders(
 	text: &str,
 	mut lookup: impl FnMut(&str) -> Option<PlaceholderEntry>,
@@ -283,7 +274,6 @@ pub struct PlaceholderRegistry {
 
 impl PlaceholderRegistry {
 	/// Creates an empty registry.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -342,13 +332,11 @@ impl PlaceholderRegistry {
 	}
 
 	/// Looks up only a token registered exactly by this snapshot.
-	#[must_use]
 	pub fn lookup_exact(&self, placeholder: &str) -> Option<&PlaceholderEntry> {
 		self.entries.get(placeholder)
 	}
 
 	/// Looks up either a canonical labeled placeholder or its label-free alias.
-	#[must_use]
 	pub fn lookup(&self, placeholder: &str) -> Option<&PlaceholderEntry> {
 		self.entries.get(placeholder).or_else(|| {
 			placeholder_without_friendly_name(placeholder)
@@ -358,14 +346,12 @@ impl PlaceholderRegistry {
 	}
 
 	/// Restores registered placeholders across one complete message.
-	#[must_use]
 	pub fn deobfuscate(&self, text: &str) -> String {
 		deobfuscate_placeholders(text, |placeholder| self.lookup(placeholder).cloned())
 	}
 }
 
 /// Returns whether one rule can require a persistent placeholder key.
-#[must_use]
 pub fn rule_needs_placeholder_key(rule: &SecretRule) -> bool {
 	match rule.mode() {
 		SecretMode::Obfuscate => true,
@@ -375,7 +361,6 @@ pub fn rule_needs_placeholder_key(rule: &SecretRule) -> bool {
 
 /// Simulates pi's ordered plain-replacement phase before deciding to persist a
 /// key.
-#[must_use]
 pub fn rules_need_placeholder_key(rules: &[SecretRule]) -> bool {
 	let mut phase = Vec::<(&str, String)>::new();
 	for rule in rules {

@@ -23,14 +23,12 @@ pub struct ReplicationPayload<'a> {
 
 impl<'a> ReplicationPayload<'a> {
 	/// Returns the original borrowed value or its reduced owned shadow.
-	#[must_use]
 	pub fn value(&self) -> &Value {
 		&self.value
 	}
 
 	/// Returns zero for an unchanged payload, otherwise the successful pass
 	/// count.
-	#[must_use]
 	pub const fn passes(&self) -> u8 {
 		self.passes
 	}

@@ -22,13 +22,11 @@ pub struct ConsumedResult {
 
 impl ConsumedResult {
 	/// Creates a silent consumed result.
-	#[must_use]
 	pub const fn silent() -> Self {
 		Self { status: None }
 	}
 
 	/// Creates a consumed result with one status message.
-	#[must_use]
 	pub fn status(status: impl Into<Str>) -> Self {
 		Self { status: Some(status.into()) }
 	}

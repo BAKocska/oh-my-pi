@@ -32,7 +32,6 @@ pub(crate) struct GithubCredentialBridge {
 }
 
 impl GithubCredentialBridge {
-	#[must_use]
 	pub(crate) const fn new() -> Self {
 		Self { authority: OnceLock::new() }
 	}

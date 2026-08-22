@@ -82,7 +82,6 @@ impl DiffView {
 	}
 
 	/// Sets one diff property.
-	#[must_use]
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		self.props.set(prop, value);
 		self

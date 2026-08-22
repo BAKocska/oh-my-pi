@@ -223,7 +223,6 @@ pub enum ApplyWarning {
 
 impl ApplyWarning {
 	/// Returns the stable machine-readable diagnostic code.
-	#[must_use]
 	pub fn code(&self) -> &'static str {
 		self.into()
 	}
@@ -234,7 +233,6 @@ impl ApplyWarning {
 	/// Distinct from [`ApplyWarning::source_line`]: hashline addresses both
 	/// patch-language rows and source rows, and a warning names at most one of
 	/// the two coordinate spaces.
-	#[must_use]
 	pub const fn patch_line(&self) -> Option<usize> {
 		match self {
 			Self::ReplacementIndentationRepaired { line, .. } => Some(*line),
@@ -254,7 +252,6 @@ impl ApplyWarning {
 	///
 	/// For [`ApplyWarning::AfterLineLandingShifted`] this is the repaired
 	/// landing, not the originally authored anchor.
-	#[must_use]
 	pub const fn source_line(&self) -> Option<usize> {
 		match self {
 			Self::AfterLineLandingShifted { to, .. } => Some(*to),

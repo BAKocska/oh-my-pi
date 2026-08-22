@@ -43,19 +43,16 @@ pub struct AutoQaConsent {
 
 impl AutoQaConsent {
 	/// Opens a consent surface over one already-redacted local report.
-	#[must_use]
 	pub const fn new(request: ConsentRequest) -> Self {
 		Self { request }
 	}
 
 	/// Borrows the exact revision-bound request shown to the user.
-	#[must_use]
 	pub const fn request(&self) -> &ConsentRequest {
 		&self.request
 	}
 
 	/// Produces a durable host intent only from an explicit UI selection.
-	#[must_use]
 	pub fn decide(self, decision: Decision) -> ConsentIntent {
 		ConsentIntent { issue_id: self.request.issue_id, revision: self.request.revision, decision }
 	}

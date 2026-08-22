@@ -30,7 +30,6 @@ pub enum StreamRecoveryKind {
 }
 
 /// Classifies reset/stall evidence without inspecting provider names.
-#[must_use]
 pub fn classify_stream_recovery(
 	code: Option<&str>,
 	committed: bool,
@@ -54,7 +53,6 @@ pub fn classify_stream_recovery(
 }
 
 /// Corrective prompt for a detected thinking loop.
-#[must_use]
 pub fn thinking_loop_redirect() -> Str {
 	Str::new_static(
 		"<system-interrupt reason=\"thinking_loop_detected\">Loop guard interrupted prior turn. \

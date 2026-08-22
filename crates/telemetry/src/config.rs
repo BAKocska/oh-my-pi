@@ -370,13 +370,11 @@ impl Default for TelemetryConfig {
 
 impl TelemetryConfig {
 	/// Returns the configured tracer name.
-	#[must_use]
 	pub fn tracer_name(&self) -> &str {
 		&self.tracer_name
 	}
 
 	/// Resolves the explicit tracer or lazily obtains the named global tracer.
-	#[must_use]
 	pub fn resolve_tracer(&self) -> Arc<BoxedTracer> {
 		self
 			.tracer
@@ -385,7 +383,6 @@ impl TelemetryConfig {
 	}
 
 	/// Resolves static and dynamic attributes in pi's merge order.
-	#[must_use]
 	pub fn attributes_for_span(
 		&self,
 		context: &TelemetryAttributeContext<'_>,
@@ -418,7 +415,6 @@ impl TelemetryConfig {
 	}
 
 	/// Normalizes a provider, falling back to [`semconv::normalize_provider`].
-	#[must_use]
 	pub fn normalized_provider(&self, provider: Option<&str>) -> Option<Str> {
 		let Some(normalizer) = &self.normalize_provider else {
 			return provider
@@ -443,7 +439,6 @@ impl TelemetryConfig {
 	}
 
 	/// Normalizes an agent name, preserving pi's built-in identity behavior.
-	#[must_use]
 	pub fn normalized_agent_name(&self, name: Option<&str>) -> Option<Str> {
 		let Some(normalizer) = &self.normalize_agent_name else {
 			return name.filter(|value| !value.is_empty()).map(Str::new);
@@ -463,7 +458,6 @@ impl TelemetryConfig {
 
 	/// Normalizes the name within an agent identity without changing its other
 	/// fields.
-	#[must_use]
 	pub fn normalized_agent_identity(
 		&self,
 		agent: &TelemetryAgentIdentity,
@@ -479,7 +473,6 @@ impl TelemetryConfig {
 	///
 	/// `catalog_priced` is the caller's model-catalog lookup. It is also used if
 	/// the custom estimator errors or panics, so telemetry cannot break a turn.
-	#[must_use]
 	pub fn estimate_cost(
 		&self,
 		context: &CostEstimatorContext<'_>,
@@ -571,7 +564,6 @@ impl TelemetryConfig {
 	}
 
 	/// Serializes a bounded request summary, honoring a custom override.
-	#[must_use]
 	pub fn serialize_request_messages(&self, request: RequestContent<'_>) -> Option<Str> {
 		if let Some(serializer) = &self.content_serializer.request_messages {
 			return self.serialized_result(invoke(&**serializer, request));
@@ -583,7 +575,6 @@ impl TelemetryConfig {
 	}
 
 	/// Serializes a bounded response-text summary, honoring a custom override.
-	#[must_use]
 	pub fn serialize_response_text(&self, response: ResponseContent<'_>) -> Option<Str> {
 		if let Some(serializer) = &self.content_serializer.response_text {
 			return self.serialized_result(invoke(&**serializer, response));
@@ -595,7 +586,6 @@ impl TelemetryConfig {
 	}
 
 	/// Serializes a bounded response-tool-call summary, honoring an override.
-	#[must_use]
 	pub fn serialize_response_tool_calls(&self, response: ResponseContent<'_>) -> Option<Str> {
 		if let Some(serializer) = &self.content_serializer.response_tool_calls {
 			return self.serialized_result(invoke(&**serializer, response));
@@ -607,7 +597,6 @@ impl TelemetryConfig {
 	}
 
 	/// Serializes bounded tool-call arguments, honoring a custom override.
-	#[must_use]
 	pub fn serialize_tool_call_arguments(&self, value: &JsonValue) -> Option<Str> {
 		self.serialize_json(
 			self.content_serializer.tool_call_arguments.as_ref(),
@@ -617,7 +606,6 @@ impl TelemetryConfig {
 	}
 
 	/// Serializes a bounded tool result, honoring a custom override.
-	#[must_use]
 	pub fn serialize_tool_call_result(&self, value: &JsonValue) -> Option<Str> {
 		self.serialize_json(
 			self.content_serializer.tool_call_result.as_ref(),

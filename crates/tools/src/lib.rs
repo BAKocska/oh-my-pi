@@ -52,7 +52,6 @@ const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 ];
 
 /// Returns the stable native builtin and hidden identity set.
-#[must_use]
 pub const fn builtin_tool_identities() -> &'static [BuiltinToolIdentity] {
 	BUILTIN_TOOL_IDENTITIES
 }

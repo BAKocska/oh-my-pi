@@ -5,7 +5,6 @@ use std::ffi::OsString;
 use omp_core::Str;
 
 /// Classifies a documented-looking obsolete management invocation.
-#[must_use]
 pub fn redirect(arguments: &[OsString]) -> Option<Str> {
 	let positional = arguments
 		.iter()

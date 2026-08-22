@@ -12,7 +12,6 @@ const MAX_ROWS: usize = 100;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
 /// Formats one structured debug result with stable bounds.
-#[must_use]
 pub fn render(action: Action, data: &Value) -> Str {
 	match action {
 		Action::Sessions => sessions(data),

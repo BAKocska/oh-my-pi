@@ -58,7 +58,6 @@ pub enum Easing {
 
 impl Easing {
 	/// Maps linear progress onto the eased curve; both ends clamp to `[0, 1]`.
-	#[must_use]
 	pub fn apply(self, t: f32) -> f32 {
 		let t = t.clamp(0.0, 1.0);
 		match self {
@@ -80,7 +79,6 @@ impl Easing {
 /// Values a [`Tween`] can interpolate.
 pub trait Lerp: Copy {
 	/// Blends from `self` toward `to` at eased progress `t` in `[0, 1]`.
-	#[must_use]
 	fn lerp(self, to: Self, t: f32) -> Self;
 }
 

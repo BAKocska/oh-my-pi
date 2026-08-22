@@ -38,7 +38,6 @@ pub enum MessageTextKind {
 /// System instructions, schemas, thinking/signatures, binary content, and
 /// non-operator developer instructions remain byte-identical. Assistant replay
 /// is re-obfuscated because the journal is local raw truth.
-#[must_use]
 pub fn obfuscate_message_text(
 	obfuscator: &mut SecretObfuscator,
 	kind: MessageTextKind,
@@ -60,7 +59,6 @@ pub fn obfuscate_message_text(
 }
 
 /// Applies inbound restoration only to provider/model-authored fields.
-#[must_use]
 pub fn restore_message_text(
 	obfuscator: &SecretObfuscator,
 	kind: MessageTextKind,

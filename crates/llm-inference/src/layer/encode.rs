@@ -65,7 +65,6 @@ impl<E> EncodeLayer<E, NoHookHandle> {
 }
 impl<E> EncodeLayer<E, NoHookHandle> {
 	/// Attaches the concrete hook dispatcher for this route stack.
-	#[must_use]
 	pub fn with_hook<T: HookHandle>(self, hook: T) -> EncodeLayer<E, T> {
 		EncodeLayer {
 			encoder:     self.encoder,
@@ -183,7 +182,6 @@ pub struct PrepareCredentials {
 
 impl PrepareCredentials {
 	/// Creates a route-scoped credential adapter.
-	#[must_use]
 	pub const fn new(spec: AuthSpec) -> Self {
 		Self { spec }
 	}
@@ -229,7 +227,6 @@ impl<P> CredentialApplyLayer<P, NoHookHandle> {
 }
 impl<P> CredentialApplyLayer<P, NoHookHandle> {
 	/// Attaches the concrete hook dispatcher for per-attempt provider signing.
-	#[must_use]
 	pub fn with_hook<T: HookHandle>(self, hook: T) -> CredentialApplyLayer<P, T> {
 		CredentialApplyLayer { applier: self.applier, hook: Some(hook) }
 	}

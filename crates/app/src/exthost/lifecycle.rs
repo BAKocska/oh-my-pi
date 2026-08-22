@@ -35,7 +35,6 @@ pub struct AvailabilityBatch {
 
 impl AvailabilityBatch {
 	/// Decodes one `LifecycleWorkerEnvelope.set_availability` body.
-	#[must_use]
 	pub fn from_wire(wire: SetAvailability) -> Self {
 		Self {
 			deltas: wire
@@ -109,7 +108,6 @@ pub struct HeadlessLifecycleSink {
 
 impl HeadlessLifecycleSink {
 	/// Creates a sink for one session incarnation.
-	#[must_use]
 	pub fn new(session_generation: u64) -> (Self, HeadlessLifecycleSubscription) {
 		let (tx, rx) = flume::unbounded();
 		(
@@ -236,7 +234,6 @@ pub struct RegistryAvailabilitySink {
 
 impl RegistryAvailabilitySink {
 	/// Binds a shared catalog and the agent's turn-boundary mailbox producer.
-	#[must_use]
 	pub const fn new(registry: Arc<Registry>, mailbox: MailboxSender) -> Self {
 		Self { registry, mailbox }
 	}
@@ -288,7 +285,6 @@ pub struct ToolDeclarationKey {
 
 impl ToolDeclarationKey {
 	/// Creates a tool declaration identity.
-	#[must_use]
 	pub fn new(name: impl Into<Str>, family: impl Into<Str>, rev: u16) -> Self {
 		Self { name: name.into(), family: family.into(), rev }
 	}
@@ -305,7 +301,6 @@ pub struct HookDeclarationKey {
 
 impl HookDeclarationKey {
 	/// Creates a hook declaration identity.
-	#[must_use]
 	pub fn new(event: impl Into<Str>, phase: HookPhase) -> Self {
 		Self { event: event.into(), phase }
 	}
@@ -332,7 +327,6 @@ pub struct DeclarationSet {
 
 impl DeclarationSet {
 	/// Builds normalized declaration sets from any input order.
-	#[must_use]
 	pub fn new(
 		tools: impl IntoIterator<Item = ToolDeclarationKey>,
 		hooks: impl IntoIterator<Item = HookDeclarationKey>,
@@ -347,7 +341,6 @@ impl DeclarationSet {
 
 	/// Adds the exact static action and sanctioned-escape declarations admitted
 	/// from the manifest before Python starts.
-	#[must_use]
 	pub fn with_runtime(
 		mut self,
 		actions: impl IntoIterator<Item = Str>,
@@ -374,7 +367,6 @@ impl DeclarationSet {
 	}
 
 	/// Returns whether a sanctioned escape was statically admitted.
-	#[must_use]
 	pub fn permits(&self, capability: EscapeCapability) -> bool {
 		self.escapes.contains(&capability)
 	}
@@ -432,7 +424,6 @@ impl DeclarationDrift {
 	}
 
 	/// Returns whether the two declaration sets were equal.
-	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.missing_tools.is_empty()
 			&& self.unexpected_tools.is_empty()
@@ -460,7 +451,6 @@ pub enum ActivationTrigger {
 
 impl ActivationTrigger {
 	/// Returns whether this trigger requires an extension-host child.
-	#[must_use]
 	pub const fn requires_host(self) -> bool {
 		!matches!(self, Self::Static)
 	}
@@ -492,14 +482,12 @@ pub struct PrincipalAuthority {
 
 impl PrincipalAuthority {
 	/// Pins a daemon to its authenticated operating-system principal.
-	#[must_use]
 	pub const fn new(principal: Principal) -> Self {
 		Self { principal }
 	}
 
 	/// Returns the core-owned principal used for extension contexts and durable
 	/// stamps.
-	#[must_use]
 	pub const fn principal(&self) -> &Principal {
 		&self.principal
 	}
@@ -641,7 +629,6 @@ pub struct ExtensionManifest {
 
 impl ExtensionManifest {
 	/// Builds a mandatory manifest contract from deployment-owned data.
-	#[must_use]
 	pub fn new(
 		provenance: Provenance,
 		entry: impl Into<Str>,
@@ -666,7 +653,6 @@ impl ExtensionManifest {
 	///
 	/// Callers must still supply core-authenticated provenance and resource
 	/// limits; there is no permissive default or runtime-derived expectation.
-	#[must_use]
 	pub fn py_eval(
 		provenance: Provenance,
 		resource_limits: impl IntoIterator<Item = QuotaSpec>,
@@ -683,7 +669,6 @@ impl ExtensionManifest {
 	}
 
 	/// Creates a lifecycle machine fenced to one session epoch.
-	#[must_use]
 	pub fn lifecycle(
 		&self,
 		session_started_at: SystemTime,
@@ -746,7 +731,6 @@ impl LifecycleMachine {
 	}
 
 	/// Returns the machine's current child lifecycle phase.
-	#[must_use]
 	pub const fn phase(&self) -> LifecyclePhase {
 		self.phase
 	}

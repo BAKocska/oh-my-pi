@@ -10,6 +10,7 @@ use flume::Sender;
 /// Detached work must call [`Self::relinquish`] explicitly before the guard is
 /// dropped.
 #[derive(Debug)]
+#[must_use]
 pub struct RunGuard {
 	state: GuardState,
 }
@@ -27,13 +28,11 @@ impl RunGuard {
 	}
 
 	/// Returns the request correlation identifier scoped by this guard.
-	#[must_use]
 	pub const fn request_id(&self) -> u64 {
 		self.state.request_id
 	}
 
 	/// Returns whether dropping this guard will request cancellation.
-	#[must_use]
 	pub fn is_armed(&self) -> bool {
 		self.state.armed.load(Ordering::Acquire)
 	}
@@ -67,6 +66,7 @@ impl Drop for RunGuard {
 /// control lane. A lease is generation-specific, so a late drop cannot
 /// terminate a replacement worker with the same name.
 #[derive(Debug)]
+#[must_use]
 pub struct WorkerLease {
 	state: WorkerLeaseState,
 }
@@ -81,7 +81,6 @@ struct WorkerLeaseState {
 
 impl WorkerLease {
 	/// Creates an armed lease for one worker generation.
-	#[must_use]
 	pub fn new(
 		name: impl Into<omp_core::Str>,
 		generation: u64,
@@ -98,13 +97,11 @@ impl WorkerLease {
 	}
 
 	/// Returns the leased worker generation.
-	#[must_use]
 	pub const fn generation(&self) -> u64 {
 		self.state.generation
 	}
 
 	/// Returns whether dropping this lease will terminate its generation.
-	#[must_use]
 	pub fn is_armed(&self) -> bool {
 		self.state.armed.load(Ordering::Acquire)
 	}

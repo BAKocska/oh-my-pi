@@ -1234,7 +1234,6 @@ pub struct ChatArgs {
 
 impl ChatArgs {
 	/// Returns the default options for an interactive project chat.
-	#[must_use]
 	pub fn default_interactive() -> Self {
 		Self {
 			model:            None,

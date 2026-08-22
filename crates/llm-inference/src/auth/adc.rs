@@ -75,7 +75,6 @@ pub struct AdcEngine<'a, C, R = SystemAdcRuntime> {
 
 impl<'a, C> AdcEngine<'a, C, SystemAdcRuntime> {
 	/// Constructs an engine over the operating-system source boundary.
-	#[must_use]
 	pub const fn system(http: &'a C, runtime: &'a SystemAdcRuntime) -> Self {
 		Self { http, runtime }
 	}
@@ -87,7 +86,6 @@ where
 	R: AdcRuntime,
 {
 	/// Constructs an engine over an injectable source boundary.
-	#[must_use]
 	pub const fn new(http: &'a C, runtime: &'a R) -> Self {
 		Self { http, runtime }
 	}

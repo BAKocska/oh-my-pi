@@ -284,7 +284,6 @@ impl MemoryRuntime {
 	}
 
 	/// Advertises only capabilities actually provided by the selected backend.
-	#[must_use]
 	pub fn capabilities(&self) -> Capabilities {
 		match &self.backend {
 			RuntimeBackend::Off => Capabilities::default(),
@@ -301,19 +300,16 @@ impl MemoryRuntime {
 	}
 
 	/// Whether Mnemopi effects are live.
-	#[must_use]
 	pub fn is_active(&self) -> bool {
 		matches!(self.backend, RuntimeBackend::Mnemopi(_))
 	}
 
 	/// Device/prompt invalidation generation.
-	#[must_use]
 	pub fn generation(&self) -> u64 {
 		self.generation.load(Ordering::Acquire)
 	}
 
 	/// Standardized status for interactive, headless, RPC, and URL surfaces.
-	#[must_use]
 	pub fn status(&self) -> RuntimeStatus {
 		match &self.backend {
 			RuntimeBackend::Off => RuntimeStatus {
@@ -789,7 +785,6 @@ impl RuntimeRegistry {
 	}
 
 	/// Resolves one live runtime and prunes dead entries on miss.
-	#[must_use]
 	pub fn lookup(session_id: &str) -> Option<Arc<MemoryRuntime>> {
 		if let Some(runtime) = RUNTIMES.read().get(session_id).and_then(Weak::upgrade) {
 			return Some(runtime);
@@ -803,7 +798,6 @@ impl RuntimeRegistry {
 	/// Multiple worktree sessions may share the same bank identity. The
 	/// lexicographically smallest live session id wins so contextless callers
 	/// never depend on hash-map iteration order.
-	#[must_use]
 	pub fn lookup_primary_root(primary_root: &Path) -> Option<Arc<MemoryRuntime>> {
 		let mut runtimes = RUNTIMES.write();
 		runtimes.retain(|_, runtime| runtime.strong_count() != 0);

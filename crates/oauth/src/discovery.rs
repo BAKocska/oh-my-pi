@@ -41,14 +41,12 @@ pub struct AuthChallenge {
 ///
 /// Header evidence wins over body aliases. Invalid endpoint URLs are ignored;
 /// they are never forwarded into browser or token requests.
-#[must_use]
 pub fn discover_auth_challenge(headers: &HeaderMap, body: &str) -> Option<AuthChallenge> {
 	discover_auth_challenge_with_base(headers, body, None)
 }
 
 /// Parses a challenge while resolving relative MCP metadata hints against the
 /// configured server URL.
-#[must_use]
 pub fn discover_auth_challenge_with_base(
 	headers: &HeaderMap,
 	body: &str,

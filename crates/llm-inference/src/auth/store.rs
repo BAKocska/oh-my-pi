@@ -270,13 +270,11 @@ pub struct StoredCredentialSource {
 
 impl StoredCredentialSource {
 	/// Creates an opaque lease source over an opened encrypted credential store.
-	#[must_use]
 	pub const fn new(store: Arc<CredentialStore>) -> Self {
 		Self { store }
 	}
 
 	/// Returns the underlying store for secret-free account metadata operations.
-	#[must_use]
 	pub const fn store(&self) -> &Arc<CredentialStore> {
 		&self.store
 	}

@@ -35,7 +35,6 @@ pub struct ProtocolProbe {
 impl ProtocolProbe {
 	/// Opens the probe using capabilities already negotiated by the live
 	/// terminal.
-	#[must_use]
 	pub fn open(caps: TerminalCaps, ctx: &UiContext) -> Self {
 		let mut probe = Self {
 			ui: Ui::from_root(dom! { <text/> }, 1, ctx.clone()),

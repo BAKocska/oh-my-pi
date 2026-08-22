@@ -15,7 +15,6 @@ pub struct SemVer {
 
 impl SemVer {
 	/// Creates a semantic version from its three components.
-	#[must_use]
 	pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
 		Self { major, minor, patch }
 	}
@@ -26,7 +25,6 @@ impl SemVer {
 	///
 	/// Panics when the literal is malformed or any component exceeds [`u8`].
 	#[doc(hidden)]
-	#[must_use]
 	pub const fn __from_macro_literal(literal: &str) -> Self {
 		let bytes = literal.as_bytes();
 		let mut components = [0_u8; 3];

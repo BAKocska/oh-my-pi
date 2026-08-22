@@ -83,7 +83,6 @@ pub struct TextMutation {
 
 impl TextMutation {
 	/// Creates a text mutation.
-	#[must_use]
 	pub const fn new(
 		base_revision: Revision,
 		proposal: TextProposal,
@@ -94,25 +93,21 @@ impl TextMutation {
 	}
 
 	/// Returns the expected committed base.
-	#[must_use]
 	pub const fn base_revision(&self) -> Revision {
 		self.base_revision
 	}
 
 	/// Returns the proposed transition.
-	#[must_use]
 	pub const fn proposal(&self) -> &TextProposal {
 		&self.proposal
 	}
 
 	/// Returns stale-base behavior.
-	#[must_use]
 	pub const fn stale_policy(&self) -> StalePolicy {
 		self.stale_policy
 	}
 
 	/// Returns formatting behavior.
-	#[must_use]
 	pub const fn format_policy(&self) -> FormatPolicy {
 		self.format_policy
 	}
@@ -137,7 +132,6 @@ pub struct CreateMutation {
 
 impl CreateMutation {
 	/// Creates a create-or-replace mutation.
-	#[must_use]
 	pub const fn new(
 		content: Bytes,
 		existing_document: ExistingDocumentPolicy,
@@ -147,19 +141,16 @@ impl CreateMutation {
 	}
 
 	/// Returns proposed bytes.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Returns existing-target behavior.
-	#[must_use]
 	pub const fn existing_document(&self) -> ExistingDocumentPolicy {
 		self.existing_document
 	}
 
 	/// Returns formatting behavior.
-	#[must_use]
 	pub const fn format_policy(&self) -> FormatPolicy {
 		self.format_policy
 	}
@@ -173,13 +164,11 @@ pub struct DeleteMutation {
 
 impl DeleteMutation {
 	/// Creates a deletion against an exact committed revision.
-	#[must_use]
 	pub const fn new(base_revision: Revision) -> Self {
 		Self { base_revision }
 	}
 
 	/// Returns the exact source revision.
-	#[must_use]
 	pub const fn base_revision(&self) -> Revision {
 		self.base_revision
 	}
@@ -204,7 +193,6 @@ pub struct MoveMutation {
 
 impl MoveMutation {
 	/// Creates a move request.
-	#[must_use]
 	pub const fn new(
 		base_revision: Revision,
 		destination: Url,
@@ -214,19 +202,16 @@ impl MoveMutation {
 	}
 
 	/// Returns the exact source revision.
-	#[must_use]
 	pub const fn base_revision(&self) -> Revision {
 		self.base_revision
 	}
 
 	/// Returns the destination URI.
-	#[must_use]
 	pub const fn destination(&self) -> &Url {
 		&self.destination
 	}
 
 	/// Returns the destination precondition.
-	#[must_use]
 	pub const fn destination_precondition(&self) -> MoveDestinationPrecondition {
 		self.destination_precondition
 	}
@@ -243,7 +228,6 @@ pub struct MoveWithContentMutation {
 
 impl MoveWithContentMutation {
 	/// Creates an atomic move-with-content request.
-	#[must_use]
 	pub const fn new(
 		base_revision: Revision,
 		destination: Url,
@@ -255,31 +239,26 @@ impl MoveWithContentMutation {
 	}
 
 	/// Returns the exact source revision.
-	#[must_use]
 	pub const fn base_revision(&self) -> Revision {
 		self.base_revision
 	}
 
 	/// Returns the destination URI.
-	#[must_use]
 	pub const fn destination(&self) -> &Url {
 		&self.destination
 	}
 
 	/// Returns the destination precondition.
-	#[must_use]
 	pub const fn destination_precondition(&self) -> MoveDestinationPrecondition {
 		self.destination_precondition
 	}
 
 	/// Returns the final destination bytes.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Returns formatting behavior.
-	#[must_use]
 	pub const fn format_policy(&self) -> FormatPolicy {
 		self.format_policy
 	}
@@ -309,19 +288,16 @@ pub struct DocumentMutation {
 
 impl DocumentMutation {
 	/// Creates a targeted operation.
-	#[must_use]
 	pub const fn new(target: DocumentTarget, operation: MutationOperation) -> Self {
 		Self { target, operation }
 	}
 
 	/// Returns the target.
-	#[must_use]
 	pub const fn target(&self) -> &DocumentTarget {
 		&self.target
 	}
 
 	/// Returns the requested operation.
-	#[must_use]
 	pub const fn operation(&self) -> &MutationOperation {
 		&self.operation
 	}
@@ -336,19 +312,16 @@ pub struct TransactionRequest {
 
 impl TransactionRequest {
 	/// Creates a transaction request.
-	#[must_use]
 	pub const fn new(transaction_id: TransactionId, operations: Vec<DocumentMutation>) -> Self {
 		Self { transaction_id, operations }
 	}
 
 	/// Returns the server-epoch-scoped idempotency key.
-	#[must_use]
 	pub const fn transaction_id(&self) -> TransactionId {
 		self.transaction_id
 	}
 
 	/// Returns operations in declared overlay order.
-	#[must_use]
 	pub fn operations(&self) -> &[DocumentMutation] {
 		&self.operations
 	}
@@ -367,7 +340,6 @@ pub struct FormatRequest {
 
 impl FormatRequest {
 	/// Creates formatter input.
-	#[must_use]
 	pub const fn new(
 		transaction_id: TransactionId,
 		operation_index: u32,
@@ -380,37 +352,31 @@ impl FormatRequest {
 	}
 
 	/// Returns the transaction id.
-	#[must_use]
 	pub const fn transaction_id(&self) -> TransactionId {
 		self.transaction_id
 	}
 
 	/// Returns the declared operation index.
-	#[must_use]
 	pub const fn operation_index(&self) -> u32 {
 		self.operation_index
 	}
 
 	/// Returns the committed snapshot used to synchronize the formatter.
-	#[must_use]
 	pub const fn base(&self) -> &Arc<DocumentSnapshot> {
 		&self.base
 	}
 
 	/// Returns the candidate document URI.
-	#[must_use]
 	pub const fn uri(&self) -> &Url {
 		&self.uri
 	}
 
 	/// Returns the optional language classification.
-	#[must_use]
 	pub const fn language_id(&self) -> Option<&LanguageId> {
 		self.language_id.as_ref()
 	}
 
 	/// Returns exact provisional bytes.
-	#[must_use]
 	pub const fn candidate(&self) -> &Bytes {
 		&self.candidate
 	}
@@ -424,19 +390,16 @@ pub struct FormatResult {
 
 impl FormatResult {
 	/// Creates a formatter result.
-	#[must_use]
 	pub const fn new(content: Bytes) -> Self {
 		Self { content }
 	}
 
 	/// Returns formatted bytes.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Consumes the result into formatted bytes.
-	#[must_use]
 	pub fn into_content(self) -> Bytes {
 		self.content
 	}
@@ -455,7 +418,6 @@ pub struct PublishedDocument {
 
 impl PublishedDocument {
 	/// Creates a committed publication.
-	#[must_use]
 	pub const fn new(
 		transaction_id: TransactionId,
 		operation_index: u32,
@@ -468,37 +430,31 @@ impl PublishedDocument {
 	}
 
 	/// Returns the transaction id.
-	#[must_use]
 	pub const fn transaction_id(&self) -> TransactionId {
 		self.transaction_id
 	}
 
 	/// Returns the declared operation index.
-	#[must_use]
 	pub const fn operation_index(&self) -> u32 {
 		self.operation_index
 	}
 
 	/// Returns the installed actor head.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns exact bytes belonging to the installed head.
-	#[must_use]
 	pub const fn content(&self) -> &Bytes {
 		&self.content
 	}
 
 	/// Returns the committed URI.
-	#[must_use]
 	pub const fn uri(&self) -> &Url {
 		&self.uri
 	}
 
 	/// Returns the former URI for a move.
-	#[must_use]
 	pub const fn previous_uri(&self) -> Option<&Url> {
 		self.previous_uri.as_ref()
 	}
@@ -516,7 +472,6 @@ pub struct RevertedDocument {
 
 impl RevertedDocument {
 	/// Creates an uncommitted-candidate rollback.
-	#[must_use]
 	pub const fn new(
 		transaction_id: TransactionId,
 		operation_index: u32,
@@ -528,31 +483,26 @@ impl RevertedDocument {
 	}
 
 	/// Returns the transaction which created the discarded candidate.
-	#[must_use]
 	pub const fn transaction_id(&self) -> TransactionId {
 		self.transaction_id
 	}
 
 	/// Returns one declared operation which formatted this document.
-	#[must_use]
 	pub const fn operation_index(&self) -> u32 {
 		self.operation_index
 	}
 
 	/// Returns the original public committed snapshot.
-	#[must_use]
 	pub const fn snapshot(&self) -> &Arc<DocumentSnapshot> {
 		&self.snapshot
 	}
 
 	/// Returns the public snapshot URI.
-	#[must_use]
 	pub const fn uri(&self) -> &Url {
 		&self.uri
 	}
 
 	/// Returns the public snapshot language classification.
-	#[must_use]
 	pub const fn language_id(&self) -> Option<&LanguageId> {
 		self.language_id.as_ref()
 	}
@@ -651,31 +601,26 @@ pub struct DocumentConflict {
 
 impl DocumentConflict {
 	/// Returns the declared operation index.
-	#[must_use]
 	pub const fn operation_index(&self) -> u32 {
 		self.operation_index
 	}
 
 	/// Returns the expected base revision.
-	#[must_use]
 	pub const fn expected(&self) -> Revision {
 		self.expected
 	}
 
 	/// Returns the current committed head.
-	#[must_use]
 	pub const fn current(&self) -> &DocumentHead {
 		&self.current
 	}
 
 	/// Returns the URI captured with the conflicting head.
-	#[must_use]
 	pub const fn uri(&self) -> &Url {
 		&self.uri
 	}
 
 	/// Returns conflicting base-coordinate ranges.
-	#[must_use]
 	pub fn conflicting_ranges(&self) -> &[ByteRange] {
 		&self.conflicting_ranges
 	}
@@ -696,49 +641,41 @@ pub struct OperationResult {
 
 impl OperationResult {
 	/// Returns the declared operation index.
-	#[must_use]
 	pub const fn operation_index(&self) -> u32 {
 		self.operation_index
 	}
 
 	/// Returns the installed head.
-	#[must_use]
 	pub const fn head(&self) -> &DocumentHead {
 		&self.head
 	}
 
 	/// Returns the URI installed with the operation result.
-	#[must_use]
 	pub const fn uri(&self) -> &Url {
 		&self.uri
 	}
 
 	/// Reports whether non-overlapping rebase was used.
-	#[must_use]
 	pub const fn rebased(&self) -> bool {
 		self.rebased
 	}
 
 	/// Reports whether formatter output was committed.
-	#[must_use]
 	pub const fn formatted(&self) -> bool {
 		self.formatted
 	}
 
 	/// Returns the revision submitted before server-side formatting.
-	#[must_use]
 	pub const fn submitted_revision(&self) -> Revision {
 		self.submitted_revision
 	}
 
 	/// Returns ranges in finalized-head coordinates.
-	#[must_use]
 	pub fn changed_ranges(&self) -> &[ByteRange] {
 		&self.changed_ranges
 	}
 
 	/// Returns the former URI for a successful move.
-	#[must_use]
 	pub const fn previous_uri(&self) -> Option<&Url> {
 		self.previous_uri.as_ref()
 	}
@@ -782,7 +719,6 @@ pub enum TransactionOutcome {
 
 impl TransactionOutcome {
 	/// Returns the shared idempotency key.
-	#[must_use]
 	pub const fn transaction_id(&self) -> TransactionId {
 		match self {
 			Self::Committed { transaction_id, .. }
@@ -807,13 +743,11 @@ impl TransactionBuildError {
 	}
 
 	/// Returns the stable rejection classification.
-	#[must_use]
 	pub const fn reason(&self) -> TransactionRejectReason {
 		self.reason
 	}
 
 	/// Returns the human-readable lowering failure.
-	#[must_use]
 	pub fn message(&self) -> &str {
 		self.message.as_str()
 	}
@@ -839,7 +773,6 @@ enum LedgerEntry {
 
 impl TransactionCoordinator<NoFormatCoordinator> {
 	/// Creates a coordinator with formatting disabled.
-	#[must_use]
 	pub fn new(store: DocumentStore, server_epoch: [u8; 16]) -> Self {
 		Self::with_formatter(store, server_epoch, NoFormatCoordinator)
 	}
@@ -847,7 +780,6 @@ impl TransactionCoordinator<NoFormatCoordinator> {
 
 impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 	/// Creates a coordinator using the supplied formatting and publication seam.
-	#[must_use]
 	pub fn with_formatter(store: DocumentStore, server_epoch: [u8; 16], formatter: F) -> Self {
 		Self {
 			inner: Arc::new(CoordinatorInner {
@@ -860,7 +792,6 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 	}
 
 	/// Returns the epoch which scopes the in-memory terminal outcome ledger.
-	#[must_use]
 	pub fn server_epoch(&self) -> &[u8; 16] {
 		&self.inner.server_epoch
 	}

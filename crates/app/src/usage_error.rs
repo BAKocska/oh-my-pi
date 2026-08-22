@@ -14,7 +14,6 @@ pub struct CliUsageError {
 
 impl CliUsageError {
 	/// Creates a usage error with the standard help pointer.
-	#[must_use]
 	pub fn new(message: impl Into<String>) -> Self {
 		Self { message: message.into() }
 	}

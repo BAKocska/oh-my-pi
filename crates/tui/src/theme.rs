@@ -40,7 +40,6 @@ impl JsonTheme {
 	}
 
 	/// Selects the palette matching the terminal's current appearance.
-	#[must_use]
 	pub const fn for_appearance(&self, appearance: Appearance) -> Theme {
 		match appearance {
 			Appearance::Dark => self.dark,
@@ -49,7 +48,6 @@ impl JsonTheme {
 	}
 
 	/// Selects and quantizes the palette for an indexed-color terminal.
-	#[must_use]
 	pub const fn for_appearance_256(&self, appearance: Appearance) -> Theme {
 		self.for_appearance(appearance).quantized_256()
 	}
@@ -223,7 +221,6 @@ fn resolve_color(
 /// luminance selects the cool 180–300° band and lowers lightness until WCAG
 /// 3:1 contrast is met. Occupied theme hues are avoided by at least 10° when
 /// the selected band has room.
-#[must_use]
 pub fn session_accent_color(
 	name: &str,
 	theme_colors: &[Color],

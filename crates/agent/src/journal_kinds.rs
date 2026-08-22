@@ -144,7 +144,6 @@ pub struct EntryKindRegistry {
 
 impl EntryKindRegistry {
 	/// Creates an empty registry.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -224,7 +223,6 @@ impl EntryKindRegistry {
 	}
 
 	/// Reports whether a name belongs to the core-readable namespace.
-	#[must_use]
 	pub fn can_read_core(kind: &str) -> bool {
 		!kind.contains('.') || kind.starts_with("omp.")
 	}

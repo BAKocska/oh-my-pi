@@ -36,7 +36,6 @@ static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(||
 
 /// Returns the complete native catalog using project → user → extension →
 /// bundled precedence.
-#[must_use]
 pub fn discover(root: &Path, security_enabled: bool) -> Arc<BTreeMap<Str, AgentDefinition>> {
 	let home = std::env::var_os("HOME").map(PathBuf::from);
 	let extensions = extension_roots(root, home.as_deref());

@@ -35,13 +35,11 @@ pub struct ExaSearchCodec;
 
 impl ExaSearchCodec {
 	/// Creates an Exa Search codec.
-	#[must_use]
 	pub const fn new() -> Self {
 		Self
 	}
 
 	/// Returns the stable catalog identifier for this codec.
-	#[must_use]
 	pub const fn id(self) -> &'static str {
 		CODEC_ID
 	}

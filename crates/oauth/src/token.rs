@@ -28,25 +28,21 @@ pub struct TokenGrant {
 
 impl TokenGrant {
 	/// Returns whether the grant can be refreshed.
-	#[must_use]
 	pub const fn is_refreshable(&self) -> bool {
 		self.refresh_token.is_some()
 	}
 
 	/// Returns the non-secret token type.
-	#[must_use]
 	pub fn token_type(&self) -> &str {
 		self.token_type.as_str()
 	}
 
 	/// Returns the relative expiry reported by the server.
-	#[must_use]
 	pub const fn expires_in(&self) -> Option<Duration> {
 		self.expires_in
 	}
 
 	/// Consumes the grant into secret-bearing protocol parts.
-	#[must_use]
 	pub fn into_parts(self) -> (SecretString, Option<SecretString>, Str, Option<Duration>) {
 		(self.access_token, self.refresh_token, self.token_type, self.expires_in)
 	}

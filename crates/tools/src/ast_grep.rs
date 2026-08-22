@@ -73,7 +73,6 @@ pub struct AstGrep {
 	spec: ToolSpec,
 }
 
-#[must_use]
 pub fn tool(root: PathBuf) -> AstGrep {
 	AstGrep {
 		root,

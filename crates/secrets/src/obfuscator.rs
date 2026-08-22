@@ -49,14 +49,12 @@ impl std::fmt::Debug for SecretObfuscator {
 
 impl SecretObfuscator {
 	/// Constructs a transform with an already resolved placeholder key.
-	#[must_use]
 	pub fn new(rules: Vec<SecretRule>, key: impl Into<String>) -> Self {
 		Self::build(rules, Some(key.into()), None)
 	}
 
 	/// Constructs a transform whose key is resolved only when a reversible regex
 	/// actually matches.
-	#[must_use]
 	pub fn with_lazy_key(
 		rules: Vec<SecretRule>,
 		key_provider: impl FnOnce() -> String + Send + 'static,
@@ -101,7 +99,6 @@ impl SecretObfuscator {
 	}
 
 	/// Returns whether the snapshot contains any effective rule.
-	#[must_use]
 	pub const fn has_secrets(&self) -> bool {
 		self.has_secrets
 	}
@@ -178,7 +175,6 @@ impl SecretObfuscator {
 	///
 	/// Complete placeholders minted by this snapshot are atomic, making repeated
 	/// calls a fixed point.
-	#[must_use]
 	pub fn obfuscate(&mut self, text: &str) -> String {
 		if !self.has_secrets || text.is_empty() {
 			return text.to_owned();
@@ -275,7 +271,6 @@ impl SecretObfuscator {
 	}
 
 	/// Restores only keyed placeholders minted by this session snapshot.
-	#[must_use]
 	pub fn deobfuscate(&self, text: &str) -> String {
 		deobfuscate_placeholders(text, |placeholder| self.lookup_placeholder(placeholder).cloned())
 	}

@@ -239,7 +239,6 @@ impl OwnerPipeListener {
 	}
 
 	/// Returns the endpoint made ready by [`Self::bind`].
-	#[must_use]
 	pub fn endpoint(&self) -> &Path {
 		&self.endpoint
 	}

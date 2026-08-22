@@ -97,7 +97,6 @@ impl Dashboard {
 	}
 
 	/// Produces a compact, renderer-neutral sticky summary.
-	#[must_use]
 	pub fn sticky_text(&self) -> Str {
 		let name = self.name.as_deref().unwrap_or("Autoresearch");
 		let best = self.best.map_or_else(

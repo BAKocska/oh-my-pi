@@ -52,7 +52,6 @@ pub struct QuotaSpec {
 
 impl QuotaSpec {
 	/// Creates one quota definition.
-	#[must_use]
 	pub fn new(
 		name: impl Into<Str>,
 		per_extension_limit: u64,
@@ -183,7 +182,6 @@ pub struct ControlQuotaLedger {
 impl ControlQuotaLedger {
 	/// Creates an empty ledger. Every admitted manifest must register its own
 	/// limits before the extension can send CONTROL work.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -373,19 +371,16 @@ impl<T> Default for FairControlQueue<T> {
 
 impl<T> FairControlQueue<T> {
 	/// Creates an empty fair queue.
-	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Returns the number of queued operations.
-	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.len
 	}
 
 	/// Returns whether no CONTROL operation is queued.
-	#[must_use]
 	pub const fn is_empty(&self) -> bool {
 		self.len == 0
 	}

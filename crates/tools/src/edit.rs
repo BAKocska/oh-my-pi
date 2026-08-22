@@ -146,7 +146,6 @@ pub fn resolve_edit_revision(
 }
 
 /// Checks that projection capabilities came from the selected dialect family.
-#[must_use]
 pub fn revision_matches_caps(revision: &Rev, caps: &PromptCaps) -> bool {
 	is_registered_edit_revision(revision) && Dialect::for_rev(revision) == caps.dialect
 }

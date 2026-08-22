@@ -171,7 +171,6 @@ pub struct DialectStage {
 
 impl DialectStage {
 	/// Creates a scanner from catalog policy evidence.
-	#[must_use]
 	pub fn new(
 		dialect: Dialect,
 		wire_policy: WirePolicyId,
