@@ -1,10 +1,18 @@
 //! Host-side peer authentication, visibility classification, and mutation
 //! admission.
 
+use std::{
+	collections::BTreeMap,
+	error::Error as StdError,
+	io::{Read, Seek, SeekFrom},
+	path::Path,
+};
+
+use bytes::Bytes;
 use omp_core::{CredentialTier, Hash32, RemotePrincipal, Str, sf};
 use omp_proto::collab::v1::{
-	AbortRequest, AgentCommand, Hello, PromptRequest, UiResponse, VisibilityClass as WireVisibility,
-	collab_frame,
+	AbortRequest, AgentCommand, CollabFrame, Hello, PromptRequest, TranscriptChunk, UiRequest,
+	UiRequestEnd, UiResponse, VisibilityClass as WireVisibility, agent_command, collab_frame,
 };
 use thiserror::Error;
 
@@ -194,6 +202,287 @@ pub enum AdmissionError {
 		action: MutationAction,
 	},
 }
+/// Maximum transcript payload returned by one incremental guest fetch.
+pub const TRANSCRIPT_READ_CAP: usize = 4 * 1024 * 1024;
+
+/// One peer-targeted host frame.
+#[derive(Clone, Debug)]
+pub struct TargetedFrame {
+	/// Destination relay peer.
+	pub peer_id: u32,
+	/// Plain collaboration payload; the relay owner encrypts it.
+	pub frame:   CollabFrame,
+}
+
+/// First writable-guest answer to a host UI request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostUiAnswer {
+	/// Settled request identity.
+	pub request_id: u32,
+	/// Answering peer.
+	pub peer_id:    u32,
+	/// Selected/editor value; `None` is a genuine guest cancel.
+	pub value:      Option<String>,
+}
+
+/// Host-owned UI request set with writable-only broadcast and late-join replay.
+#[derive(Default)]
+pub struct HostUiDispatcher {
+	next_id: u32,
+	pending: BTreeMap<u32, UiRequest>,
+}
+
+impl HostUiDispatcher {
+	/// Starts a request and emits it to every currently writable guest.
+	///
+	/// Returns `None` without retaining the request when no writable peer is
+	/// connected.
+	pub fn begin<'a>(
+		&mut self,
+		mut request: UiRequest,
+		peers: impl IntoIterator<Item = (u32, &'a AuthenticatedPeer)>,
+	) -> Option<Vec<TargetedFrame>> {
+		let writable = peers
+			.into_iter()
+			.filter(|(_, peer)| !peer.read_only())
+			.map(|(peer_id, _)| peer_id)
+			.collect::<Vec<_>>();
+		if writable.is_empty() {
+			return None;
+		}
+		self.next_id = self.next_id.wrapping_add(1).max(1);
+		request.request_id = self.next_id;
+		let frame = collab_frame(request.clone(), collab_frame::Payload::UiRequest);
+		self.pending.insert(request.request_id, request);
+		Some(
+			writable
+				.into_iter()
+				.map(|peer_id| TargetedFrame { peer_id, frame: frame.clone() })
+				.collect(),
+		)
+	}
+
+	/// Replays every pending request to a newly authenticated writable guest.
+	pub fn replay_for_join(&self, peer_id: u32, peer: &AuthenticatedPeer) -> Vec<TargetedFrame> {
+		if peer.read_only() {
+			return Vec::new();
+		}
+		self
+			.pending
+			.values()
+			.map(|request| TargetedFrame {
+				peer_id,
+				frame: collab_frame(request.clone(), collab_frame::Payload::UiRequest),
+			})
+			.collect()
+	}
+
+	/// Settles a pending request on the first writable response and emits
+	/// `ui_request_end` cleanup to all writable peers.
+	pub fn answer<'a>(
+		&mut self,
+		peer_id: u32,
+		peer: &AuthenticatedPeer,
+		response: UiResponse,
+		peers: impl IntoIterator<Item = (u32, &'a AuthenticatedPeer)>,
+	) -> Result<Option<(HostUiAnswer, Vec<TargetedFrame>)>, HostRouteError> {
+		if peer.read_only() {
+			return Err(HostRouteError::ReadOnly);
+		}
+		if self.pending.remove(&response.request_id).is_none() {
+			return Ok(None);
+		}
+		let answer = HostUiAnswer { request_id: response.request_id, peer_id, value: response.value };
+		let end = UiRequestEnd { request_id: answer.request_id };
+		let frame = collab_frame(end, collab_frame::Payload::UiRequestEnd);
+		let cleanup = peers
+			.into_iter()
+			.filter(|(_, peer)| !peer.read_only())
+			.map(|(peer_id, _)| TargetedFrame { peer_id, frame: frame.clone() })
+			.collect();
+		Ok(Some((answer, cleanup)))
+	}
+
+	/// Cancels one host request and emits writable-guest cleanup.
+	pub fn cancel<'a>(
+		&mut self,
+		request_id: u32,
+		peers: impl IntoIterator<Item = (u32, &'a AuthenticatedPeer)>,
+	) -> Vec<TargetedFrame> {
+		if self.pending.remove(&request_id).is_none() {
+			return Vec::new();
+		}
+		let end = UiRequestEnd { request_id };
+		let frame = collab_frame(end, collab_frame::Payload::UiRequestEnd);
+		peers
+			.into_iter()
+			.filter(|(_, peer)| !peer.read_only())
+			.map(|(peer_id, _)| TargetedFrame { peer_id, frame: frame.clone() })
+			.collect()
+	}
+
+	/// Drains every request during host teardown.
+	pub fn cancel_all<'a>(
+		&mut self,
+		peers: impl IntoIterator<Item = (u32, &'a AuthenticatedPeer)> + Clone,
+	) -> Vec<TargetedFrame> {
+		let ids = self.pending.keys().copied().collect::<Vec<_>>();
+		let mut frames = Vec::new();
+		for id in ids {
+			frames.extend(self.cancel(id, peers.clone()));
+		}
+		frames
+	}
+}
+
+/// Host agent class used to keep advisors outside the collaboration surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostAgentClass {
+	/// Main session loop.
+	Main,
+	/// User-visible task subagent.
+	Subagent,
+	/// Read-only advisor transcript.
+	Advisor,
+}
+
+/// App-owned agent lifecycle operations callable by authorized guests.
+pub trait HostAgentRuntime {
+	/// Concrete lifecycle failure.
+	type Error: StdError + Send + Sync + 'static;
+
+	/// Classifies one registry identity, or returns `None` when absent.
+	fn class(&self, agent_id: &str) -> Option<HostAgentClass>;
+	/// Revives if needed and steers a chat message.
+	fn chat(&self, agent_id: &str, text: &str) -> Result<(), Self::Error>;
+	/// Aborts a running loop and releases it.
+	fn kill(&self, agent_id: &str) -> Result<(), Self::Error>;
+	/// Revives a parked or cold agent.
+	fn revive(&self, agent_id: &str) -> Result<(), Self::Error>;
+}
+
+/// Routes one authenticated guest agent operation.
+pub fn route_agent_command<R: HostAgentRuntime>(
+	peer: &AuthenticatedPeer,
+	command: &AgentCommand,
+	runtime: &R,
+) -> Result<(), AgentCommandError<R::Error>> {
+	if peer.read_only() {
+		return Err(AgentCommandError::ReadOnly);
+	}
+	let Some(class) = runtime.class(command.agent_id.as_str()) else {
+		return Err(AgentCommandError::UnknownAgent);
+	};
+	if class == HostAgentClass::Advisor {
+		return Err(AgentCommandError::Advisor);
+	}
+	match agent_command::Command::try_from(command.command) {
+		Ok(agent_command::Command::Chat) => {
+			let text = command
+				.text
+				.as_deref()
+				.map(str::trim)
+				.filter(|text| !text.is_empty())
+				.ok_or(AgentCommandError::EmptyChat)?;
+			runtime.chat(&command.agent_id, text)?;
+		},
+		Ok(agent_command::Command::Kill) => runtime.kill(&command.agent_id)?,
+		Ok(agent_command::Command::Revive) => runtime.revive(&command.agent_id)?,
+		Err(_) => return Err(AgentCommandError::UnknownCommand),
+	}
+	Ok(())
+}
+
+/// Reads a bounded, UTF-8 and JSONL-aligned transcript increment.
+pub fn read_transcript_chunk(
+	path: &Path,
+	request_id: u32,
+	from_byte: u64,
+) -> Result<TranscriptChunk, TranscriptReadError> {
+	let mut file = std::fs::File::open(path)?;
+	let size = file.metadata()?.len();
+	if size <= from_byte {
+		return Ok(TranscriptChunk {
+			request_id,
+			text_utf8: Bytes::new(),
+			new_size: size,
+			error: None,
+		});
+	}
+	let remaining = size - from_byte;
+	let wanted = usize::try_from(remaining.min(TRANSCRIPT_READ_CAP as u64))
+		.expect("bounded transcript read fits usize");
+	let mut bytes = vec![0_u8; wanted];
+	file.seek(SeekFrom::Start(from_byte))?;
+	file.read_exact(&mut bytes)?;
+	let reached_eof = from_byte + wanted as u64 >= size;
+	if !reached_eof {
+		let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+			return Err(TranscriptReadError::EntryTooLarge);
+		};
+		bytes.truncate(end + 1);
+	}
+	std::str::from_utf8(&bytes)?;
+	let new_size = if reached_eof {
+		size
+	} else {
+		from_byte + bytes.len() as u64
+	};
+	Ok(TranscriptChunk { request_id, text_utf8: Bytes::from(bytes), new_size, error: None })
+}
+
+fn collab_frame<T>(message: T, wrap: impl FnOnce(T) -> collab_frame::Payload) -> CollabFrame {
+	CollabFrame {
+		protocol_revision: PROTOCOL_REVISION,
+		payload: Some(wrap(message)),
+		..CollabFrame::default()
+	}
+}
+
+/// Host UI routing failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum HostRouteError {
+	/// A viewer attempted to answer a dialog.
+	#[error("UI responses are disabled on a read-only collaboration link")]
+	ReadOnly,
+}
+
+/// Guest agent-command routing failure.
+#[derive(Debug, Error)]
+pub enum AgentCommandError<E: StdError + 'static> {
+	/// A viewer attempted agent control.
+	#[error("agent control is disabled on a read-only collaboration link")]
+	ReadOnly,
+	/// The requested agent is absent.
+	#[error("collaboration agent does not exist")]
+	UnknownAgent,
+	/// Advisors never enter the guest-visible registry.
+	#[error("advisor transcripts are read-only")]
+	Advisor,
+	/// Chat requires non-whitespace text.
+	#[error("collaboration agent chat message is empty")]
+	EmptyChat,
+	/// The wire carried an unknown command enum value.
+	#[error("collaboration agent command is unknown")]
+	UnknownCommand,
+	/// The app-owned lifecycle operation failed.
+	#[error(transparent)]
+	Runtime(#[from] E),
+}
+
+/// Incremental transcript read failure.
+#[derive(Debug, Error)]
+pub enum TranscriptReadError {
+	/// Transcript file access failed.
+	#[error(transparent)]
+	Io(#[from] std::io::Error),
+	/// A single JSONL row exceeded the reply cap.
+	#[error("transcript entry exceeds the 4 MiB collaboration fetch cap")]
+	EntryTooLarge,
+	/// Journal bytes were not valid UTF-8.
+	#[error(transparent)]
+	Utf8(#[from] std::str::Utf8Error),
+}
 
 /// Classifies an agent registry row without exposing advisor identities.
 #[must_use]
@@ -268,6 +557,52 @@ mod tests {
 		assert_eq!(
 			authority.admit_mutation(&peer, &payload).unwrap_err(),
 			AdmissionError::ReadOnly { action: MutationAction::Abort }
+		);
+	}
+	#[test]
+	fn ui_dispatch_settles_first_writable_answer_and_replays_late_joiners() {
+		let authority = admission();
+		let writable = authority
+			.authenticate(7, &Hello {
+				protocol_revision: PROTOCOL_REVISION,
+				display_name:      "guest".to_owned(),
+				write_token:       Some(vec![9; 16].into()),
+				client_version:    String::new(),
+			})
+			.expect("authenticate");
+		let mut dispatcher = HostUiDispatcher::default();
+		let frames = dispatcher
+			.begin(
+				UiRequest {
+					title: "Choose".to_owned(),
+					spec: Some(omp_proto::collab::v1::ui_request::Spec::Editor(
+						omp_proto::collab::v1::EditorSpec { prefill: None },
+					)),
+					..UiRequest::default()
+				},
+				[(7, &writable)],
+			)
+			.expect("writable peer");
+		let request_id = match frames[0].frame.payload.as_ref() {
+			Some(collab_frame::Payload::UiRequest(request)) => request.request_id,
+			_ => panic!("UI request frame"),
+		};
+		assert_eq!(dispatcher.replay_for_join(8, &writable).len(), 1);
+
+		let settled = dispatcher
+			.answer(7, &writable, UiResponse { request_id, value: Some("answer".to_owned()) }, [
+				(7, &writable),
+				(8, &writable),
+			])
+			.expect("answer")
+			.expect("first answer");
+		assert_eq!(settled.0.value.as_deref(), Some("answer"));
+		assert_eq!(settled.1.len(), 2);
+		assert!(
+			dispatcher
+				.answer(7, &writable, UiResponse { request_id, value: None }, [(7, &writable)],)
+				.expect("duplicate")
+				.is_none()
 		);
 	}
 }

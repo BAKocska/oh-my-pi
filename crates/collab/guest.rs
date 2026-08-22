@@ -1,8 +1,15 @@
 //! Guest-side snapshot reseed and live transcript-v4 append fencing.
 
-use std::path::{Path, PathBuf};
+use std::{
+	collections::BTreeMap,
+	path::{Path, PathBuf},
+};
 
-use omp_proto::collab::v1::{JournalRecord, SnapshotChunk, VisibilityClass};
+use omp_core::{Str, sf};
+use omp_proto::collab::v1::{
+	AgentSummary, ContextUsage, JournalRecord, ModelMetadata, RegistrySnapshot, SessionStateUpdate,
+	SnapshotChunk, UiRequest, VisibilityClass, agent_summary, ui_request,
+};
 use omp_storage::transcript::{
 	SessionId,
 	replica::{
@@ -76,6 +83,243 @@ pub enum GuestInputError {
 	/// Viewer credentials cannot prompt or mutate the host.
 	#[error("this collaboration link is read-only")]
 	ReadOnly,
+}
+/// Host activity edge applied to the guest's local spinner and activity meter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestActivityTransition {
+	/// The host became active; start the local activity meter and loader.
+	Started,
+	/// The host became idle; stop the local activity meter and every transient
+	/// loader.
+	Stopped,
+	/// The host activity state did not change.
+	Unchanged,
+}
+
+/// Canonical guest footer facts projected from the latest host state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestFooterFacts {
+	/// Number of participants including the host and this guest.
+	pub participants:    usize,
+	/// Number of prompts queued on the host.
+	pub queued_messages: u32,
+	/// Whether the host is currently aborting a turn.
+	pub aborting:        bool,
+}
+
+/// Effects a UI owner applies after one state update.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuestStateEffects {
+	/// Activity edge for loader/meter reconciliation.
+	pub activity:       GuestActivityTransition,
+	/// Host-authored terminal title; this never changes the guest cwd.
+	pub terminal_title: Str,
+	/// Footer facts for the collaboration status segment.
+	pub footer:         GuestFooterFacts,
+	/// Provider-real context estimate reported by the host.
+	pub context:        Option<ContextUsage>,
+}
+
+/// Guest-local mirror of host presentation state and visible agents.
+///
+/// The mirror deliberately contains no relay credentials, host filesystem
+/// authority, agent paths, model credentials, or advisor rows.
+#[derive(Default)]
+pub struct GuestStateMirror {
+	state:          Option<SessionStateUpdate>,
+	models:         BTreeMap<Str, ModelMetadata>,
+	agents:         BTreeMap<Str, AgentSummary>,
+	host_streaming: bool,
+}
+
+impl GuestStateMirror {
+	/// Applies one authoritative host-state snapshot and returns UI effects.
+	pub fn apply_state(&mut self, mut state: SessionStateUpdate) -> GuestStateEffects {
+		if let Some(context) = state.context_usage.as_mut() {
+			context.percent = if context.context_window == 0 {
+				0.0
+			} else {
+				(context.tokens as f64 * 100.0 / context.context_window as f64) as f32
+			};
+		}
+		if let Some(model) = state.model.as_ref() {
+			self.models.insert(Str::new(&model.id), model.clone());
+		}
+		let activity = match (self.host_streaming, state.is_streaming) {
+			(false, true) => GuestActivityTransition::Started,
+			(true, false) => GuestActivityTransition::Stopped,
+			_ => GuestActivityTransition::Unchanged,
+		};
+		self.host_streaming = state.is_streaming;
+		let terminal_title = if state.session_name.trim().is_empty() {
+			sf!("OMP collaboration")
+		} else {
+			Str::new(state.session_name.trim())
+		};
+		let footer = GuestFooterFacts {
+			participants:    state.participants.len().max(1),
+			queued_messages: state.queued_message_count,
+			aborting:        state.is_aborting,
+		};
+		let context = state.context_usage.clone();
+		self.state = Some(state);
+		GuestStateEffects { activity, terminal_title, footer, context }
+	}
+
+	/// Replaces the visible subagent registry with the host snapshot.
+	pub fn apply_registry(&mut self, snapshot: RegistrySnapshot) {
+		self.agents.clear();
+		for agent in snapshot.agents {
+			if agent_summary::Kind::try_from(agent.kind).is_ok() {
+				self.agents.insert(Str::new(&agent.id), agent);
+			}
+		}
+	}
+
+	/// Returns the latest host state.
+	#[must_use]
+	pub const fn state(&self) -> Option<&SessionStateUpdate> {
+		self.state.as_ref()
+	}
+
+	/// Returns the effective reasoning effort reported by the host.
+	#[must_use]
+	pub fn reasoning_effort(&self) -> Option<&str> {
+		self.state.as_ref()?.thinking_level.as_deref()
+	}
+
+	/// Iterates the model catalog learned from host state updates.
+	pub fn models(&self) -> impl ExactSizeIterator<Item = &ModelMetadata> + DoubleEndedIterator {
+		self.models.values()
+	}
+
+	/// Iterates the latest visible agent registry mirror.
+	pub fn agents(&self) -> impl ExactSizeIterator<Item = &AgentSummary> + DoubleEndedIterator {
+		self.agents.values()
+	}
+}
+
+/// Guest UI presentation hook implemented by the interactive app boundary.
+pub trait GuestUiHooks {
+	/// Presents one host-owned select dialog.
+	fn present_select(
+		&mut self,
+		request_id: u32,
+		title: &str,
+		spec: &omp_proto::collab::v1::SelectSpec,
+	);
+	/// Presents one host-owned editor dialog.
+	fn present_editor(
+		&mut self,
+		request_id: u32,
+		title: &str,
+		spec: &omp_proto::collab::v1::EditorSpec,
+	);
+	/// Dismisses a presented dialog without answering the host.
+	fn dismiss(&mut self, request_id: u32);
+}
+
+/// Ordered guest dialog owner. Resync and leave dismiss newest-first.
+#[derive(Default)]
+pub struct GuestUiRequests {
+	pending: BTreeMap<u32, UiRequest>,
+	order:   Vec<u32>,
+}
+
+impl GuestUiRequests {
+	/// Presents a valid host request through the matching UI hook.
+	pub fn present(
+		&mut self,
+		request: UiRequest,
+		hooks: &mut impl GuestUiHooks,
+	) -> Result<(), GuestUiError> {
+		let spec = request.spec.as_ref().ok_or(GuestUiError::MissingSpec)?;
+		if self.pending.contains_key(&request.request_id) {
+			hooks.dismiss(request.request_id);
+			self.order.retain(|id| *id != request.request_id);
+		}
+		match spec {
+			ui_request::Spec::Select(spec) => {
+				hooks.present_select(request.request_id, &request.title, spec);
+			},
+			ui_request::Spec::Editor(spec) => {
+				hooks.present_editor(request.request_id, &request.title, spec);
+			},
+		}
+		self.order.push(request.request_id);
+		self.pending.insert(request.request_id, request);
+		Ok(())
+	}
+
+	/// Dismisses one request after `ui_request_end`.
+	pub fn end(&mut self, request_id: u32, hooks: &mut impl GuestUiHooks) -> bool {
+		let existed = self.pending.remove(&request_id).is_some();
+		if existed {
+			self.order.retain(|id| *id != request_id);
+			hooks.dismiss(request_id);
+		}
+		existed
+	}
+
+	/// Dismisses all requests in reverse presentation order on resync or leave.
+	pub fn dismiss_all(&mut self, hooks: &mut impl GuestUiHooks) {
+		for request_id in self.order.drain(..).rev() {
+			hooks.dismiss(request_id);
+		}
+		self.pending.clear();
+	}
+
+	/// Returns whether a request is still presented.
+	#[must_use]
+	pub fn contains(&self, request_id: u32) -> bool {
+		self.pending.contains_key(&request_id)
+	}
+}
+
+/// Local session destination restored after leaving a replica.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalSessionRestore {
+	/// Resume the exact prior local transcript.
+	Saved(PathBuf),
+	/// Return to a fresh unsaved local session.
+	Unsaved,
+}
+
+/// Exactly-once guest session restoration owner.
+#[derive(Default)]
+pub struct GuestSessionRestore {
+	return_to: Option<LocalSessionRestore>,
+	active:    bool,
+}
+
+impl GuestSessionRestore {
+	/// Captures the local session before switching to the remote replica.
+	pub fn begin(&mut self, session_file: Option<&Path>) {
+		self.return_to = Some(session_file.map_or(LocalSessionRestore::Unsaved, |path| {
+			LocalSessionRestore::Saved(path.to_path_buf())
+		}));
+		self.active = true;
+	}
+
+	/// Restores after intentional leave or a terminal disconnect.
+	///
+	/// A reconnecting relay does not call this method; callers invoke it only
+	/// after reconnect is exhausted.
+	pub fn take(&mut self) -> Option<LocalSessionRestore> {
+		if !self.active {
+			return None;
+		}
+		self.active = false;
+		self.return_to.take()
+	}
+}
+
+/// Guest dialog protocol failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum GuestUiError {
+	/// A request had neither a select nor editor specification.
+	#[error("collaboration UI request has no presentation specification")]
+	MissingSpec,
 }
 
 /// Maximum physical records retained in one in-flight snapshot accumulator.
@@ -260,5 +504,52 @@ mod tests {
 		assert_eq!(admit_guest_input("hello", true), Err(GuestInputError::ReadOnly));
 		assert_eq!(admit_guest_input("/help", true), Ok(GuestInputDisposition::LocalCommand),);
 		assert_eq!(admit_guest_input("hello", false), Ok(GuestInputDisposition::RemotePrompt),);
+	}
+	#[test]
+	fn state_mirror_reconciles_activity_catalog_registry_and_context() {
+		let mut mirror = GuestStateMirror::default();
+		let effects = mirror.apply_state(SessionStateUpdate {
+			is_streaming: true,
+			queued_message_count: 2,
+			session_name: "remote".to_owned(),
+			model: Some(ModelMetadata {
+				id:             "model-1".to_owned(),
+				name:           "Model".to_owned(),
+				provider:       "provider".to_owned(),
+				context_window: 100,
+			}),
+			thinking_level: Some("high".to_owned()),
+			context_usage: Some(ContextUsage {
+				tokens:         25,
+				context_window: 100,
+				percent:        0.0,
+			}),
+			participants: vec![Default::default(), Default::default()],
+			..SessionStateUpdate::default()
+		});
+		assert_eq!(effects.activity, GuestActivityTransition::Started);
+		assert_eq!(effects.footer.participants, 2);
+		assert_eq!(effects.context.expect("context").percent, 25.0);
+		assert_eq!(mirror.reasoning_effort(), Some("high"));
+		assert_eq!(mirror.models().len(), 1);
+
+		mirror.apply_registry(RegistrySnapshot {
+			agents: vec![AgentSummary { id: "agent-1".to_owned(), ..AgentSummary::default() }],
+		});
+		assert_eq!(mirror.agents().len(), 1);
+		let effects =
+			mirror.apply_state(SessionStateUpdate { is_streaming: false, ..Default::default() });
+		assert_eq!(effects.activity, GuestActivityTransition::Stopped);
+	}
+
+	#[test]
+	fn local_session_restore_is_exactly_once() {
+		let mut restore = GuestSessionRestore::default();
+		restore.begin(Some(Path::new("/tmp/session.jsonl")));
+		assert_eq!(
+			restore.take(),
+			Some(LocalSessionRestore::Saved(PathBuf::from("/tmp/session.jsonl")))
+		);
+		assert_eq!(restore.take(), None);
 	}
 }

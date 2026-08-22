@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use omp_core::base64_url;
+use omp_core::{Str, base64_url};
+use qrcode::{EcLevel, QrCode, render::unicode};
 use thiserror::Error;
 use url::Url;
 
@@ -15,6 +16,24 @@ pub const DEFAULT_RELAY_URL: &str = "wss://my.omp.sh";
 /// OMP-v1 room route. The revision-bearing path prevents accidental pi relay
 /// interoperability.
 pub const ROOM_PATH_PREFIX: &str = "/v1/r/";
+const OSC8_OPEN: &str = "\x1b]8;;";
+const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
+const STRING_TERMINATOR: &str = "\x1b\\";
+const QR_ANSI_DARK_ON_LIGHT: &str = "\x1b[30;47m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// Terminal-ready browser join presentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalJoinPresentation {
+	/// Browser URL with credentials confined to the fragment.
+	pub browser_url: Str,
+	/// Scheme-less label wrapped in an OSC-8 hyperlink.
+	pub hyperlink:   Str,
+	/// ANSI-colored Unicode half-block QR rows with a four-module quiet zone.
+	pub qr_rows:     Vec<Str>,
+	/// Minimum terminal columns required to display the QR rows.
+	pub min_columns: usize,
+}
 
 /// A query-free native OMP collaboration relay origin.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -263,11 +282,62 @@ impl CollabLink {
 		format!("{}/#{}", web.as_url().as_str().trim_end_matches('/'), self.compact())
 	}
 
+	/// Builds a scannable terminal QR code and OSC-8 browser link.
+	pub fn terminal_join(
+		&self,
+		web: &WebEndpoint,
+	) -> Result<TerminalJoinPresentation, TerminalLinkError> {
+		let browser_url = self.browser(web);
+		let display = browser_url
+			.strip_prefix("https://")
+			.or_else(|| browser_url.strip_prefix("http://"))
+			.unwrap_or(&browser_url);
+		let hyperlink = osc8_hyperlink(&browser_url, display);
+		let code = QrCode::with_error_correction_level(browser_url.as_bytes(), EcLevel::M)?;
+		let rendered = code
+			.render::<unicode::Dense1x2>()
+			.quiet_zone(true)
+			.module_dimensions(1, 1)
+			.build();
+		let qr_rows = rendered
+			.lines()
+			.map(|row| Str::from(format!("{QR_ANSI_DARK_ON_LIGHT}{row}{ANSI_RESET}")))
+			.collect::<Vec<_>>();
+		let min_columns = rendered
+			.lines()
+			.map(str::chars)
+			.map(Iterator::count)
+			.max()
+			.unwrap_or(0);
+		Ok(TerminalJoinPresentation {
+			browser_url: Str::from(browser_url),
+			hyperlink,
+			qr_rows,
+			min_columns,
+		})
+	}
+
 	/// Parses compact, relay, legacy-hash, percent-mangled, scheme-less, and
 	/// nested browser forms without accepting a non-v1 room route.
 	pub fn parse(input: &str) -> Result<Self, LinkError> {
 		parse_inner(input, 0)
 	}
+}
+
+/// Wraps a safe browser target in an OSC-8 hyperlink.
+///
+/// Control characters are stripped from the visible label. Callers should
+/// pass a URL produced by [`CollabLink::browser`].
+pub fn osc8_hyperlink(target: &str, label: &str) -> Str {
+	let safe_target = target
+		.chars()
+		.filter(|character| !character.is_control())
+		.collect::<String>();
+	let safe_label = label
+		.chars()
+		.filter(|character| !character.is_control())
+		.collect::<String>();
+	Str::from(format!("{OSC8_OPEN}{safe_target}{STRING_TERMINATOR}{safe_label}{OSC8_CLOSE}"))
 }
 
 fn parse_inner(input: &str, depth: u8) -> Result<CollabLink, LinkError> {
@@ -427,6 +497,13 @@ pub enum EndpointError {
 	#[error("collaboration endpoint must not include a path")]
 	BasePath,
 }
+/// Terminal join-link rendering failure.
+#[derive(Debug, Error)]
+pub enum TerminalLinkError {
+	/// Browser link exceeded QR byte-mode capacity.
+	#[error(transparent)]
+	Qr(#[from] qrcode::types::QrError),
+}
 
 /// Invalid OMP-v1 collaboration room link.
 #[derive(Debug, Error)]
@@ -526,5 +603,22 @@ mod tests {
 			CollabLink::parse(&format!("wss://relay.example/r/room.{secret}")),
 			Err(LinkError::RoomPath)
 		));
+	}
+	#[test]
+	fn terminal_join_is_scannable_and_osc8_linked() {
+		let presentation = link(true)
+			.terminal_join(&WebEndpoint::parse("https://collab.example").expect("web"))
+			.expect("terminal join");
+		assert!(presentation.browser_url.contains('#'));
+		assert!(presentation.hyperlink.starts_with(OSC8_OPEN));
+		assert!(presentation.hyperlink.ends_with(OSC8_CLOSE));
+		assert!(!presentation.qr_rows.is_empty());
+		assert!(
+			presentation
+				.qr_rows
+				.iter()
+				.all(|row| { row.starts_with(QR_ANSI_DARK_ON_LIGHT) && row.ends_with(ANSI_RESET) })
+		);
+		assert!(presentation.min_columns > 0);
 	}
 }

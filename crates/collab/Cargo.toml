@@ -22,6 +22,7 @@ omp-core.workspace = true
 omp-proto.workspace = true
 omp-storage.workspace = true
 prost.workspace = true
+qrcode.workspace = true
 rand.workspace = true
 ring.workspace = true
 serde.workspace = true
