@@ -7,6 +7,7 @@ reaction dispatch land with the host-side campaign runtime.
 from __future__ import annotations
 import inspect
 import json
+import os
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
@@ -20,8 +21,8 @@ from ._registry import registry
 from ._verdicts import Done
 from .hooks import LateRegistration, OnFailure
 
-
 _CampaignTarget = TypeVar("_CampaignTarget", bound=Callable[..., object] | type)
+_CAMPAIGN_INSTANCES: dict[str, object] = {}
 
 
 class CampaignContractError(OmpError, ValueError):
@@ -483,6 +484,59 @@ def campaign(
 
     return decorate
 
+
+def _sealed_campaign_declaration(
+    host_generation: int,
+) -> dict[str, object]:
+    """Project the authoritative frozen campaign table for host publication."""
+    if not registry.sealed:
+        raise RuntimeError("campaign declarations publish only after FREEZE")
+    if (
+        isinstance(host_generation, bool)
+        or not isinstance(host_generation, int)
+        or host_generation < 1
+    ):
+        raise ValueError("campaign declaration generation must be positive")
+    from .provider import _wire_value
+
+    manifests: list[dict[str, object]] = []
+    for declaration in registry.snapshot().campaigns:
+        if isinstance(declaration.exhaust, Exhaust):
+            exhaust: object = declaration.exhaust.value
+        else:
+            exhaust = {
+                "verdict": _verdict_name(declaration.exhaust),
+                "payload": json.loads(_verdict_payload(declaration.exhaust)),
+            }
+        manifests.append({
+            "id": declaration.id,
+            "rev": declaration.rev,
+            "points": [point.value for point in declaration.points],
+            "scope": declaration.scope.value,
+            "exhaust": exhaust,
+            "state_family": (
+                None if declaration.state is None else declaration.state.family
+            ),
+            "state_rev": (
+                None if declaration.state is None else declaration.state.rev
+            ),
+            "ladder": _wire_value(declaration.ladder),
+            "policy": _wire_value(declaration.policy),
+            "when": _wire_value(declaration.when),
+            "on_failure": declaration.on_failure.value,
+            "claims": list(declaration.claims),
+            "binds": list(declaration.binds),
+            "composes": declaration.composes,
+        })
+    return {
+        "generation": host_generation,
+        "table_rev": 1,
+        "point_table": list(POINT_TABLE),
+        "verdict_table": list(VERDICT_TABLE),
+        "manifests": manifests,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class ActiveCampaign:
     """One active or queued engagement projected by Core."""
@@ -503,6 +557,8 @@ async def engage(
     """Engage one declared campaign through the host CONTROL authority."""
 
     declaration = _campaign_declaration(campaign)
+    if not isinstance(queue, bool):
+        raise TypeError("campaign queue must be bool")
     payload = None
     if state is not None:
         if declaration.state is None:
@@ -522,6 +578,10 @@ async def engage(
 async def active(*, extension: str | None = None) -> tuple[ActiveCampaign, ...]:
     """List own engagements, or another extension with ``campaigns.read``."""
 
+    if extension is not None and (
+        not isinstance(extension, str) or not extension
+    ):
+        raise ValueError("campaign extension must be a non-empty string or None")
     from . import _control_request
 
     rows = await _control_request("omp.campaigns.active", extension=extension)
@@ -537,9 +597,10 @@ async def disengage(engagement: str) -> bool:
         raise ValueError("engagement must be a non-empty string")
     from . import _control_request
 
-    return bool(
-        await _control_request("omp.campaigns.disengage", engagement=engagement)
-    )
+    result = await _control_request("omp.campaigns.disengage", engagement=engagement)
+    if not isinstance(result, bool):
+        raise TypeError("omp.campaigns.disengage host result must be bool")
+    return result
 
 
 async def dispatch_campaign_react(
@@ -547,14 +608,40 @@ async def dispatch_campaign_react(
     point: Point | str,
     event_payload: bytes,
     state_payload: bytes = b"",
+    *,
+    engagement_id: str = "",
+    campaign_rev: int | None = None,
+    event_rev: int = 1,
+    host_generation: int | None = None,
+    session_generation: int | None = None,
 ) -> dict[str, object]:
-    """Run one declared handler and return a revision-1 wire reaction mapping."""
+    """Run one generation-fenced handler and return a typed wire reaction."""
 
     declaration = _campaign_declaration(campaign)
     point = Point(point)
+    if point not in declaration.points:
+        raise CampaignContractError(
+            f"campaign {campaign!r} is not subscribed to point {point.value!r}"
+        )
+    if campaign_rev is None:
+        campaign_rev = declaration.rev
+    if campaign_rev != declaration.rev:
+        raise CampaignContractError(
+            f"campaign revision {campaign_rev} is stale; expected {declaration.rev}"
+        )
+    if event_rev != 1:
+        raise CampaignContractError(f"unsupported campaign event revision {event_rev}")
+    _validate_dispatch_generation(
+        "OMP_EXT_HOST_GENERATION", host_generation, "host"
+    )
+    _validate_dispatch_generation(
+        "OMP_EXT_SESSION_GENERATION", session_generation, "session"
+    )
+    if host_generation is not None and not engagement_id:
+        raise CampaignContractError("host campaign dispatch requires an engagement id")
     try:
         event = json.loads(event_payload.decode("utf-8")) if event_payload else {}
-    except (UnicodeDecodeError, ValueError) as error:
+    except (AttributeError, UnicodeDecodeError, ValueError) as error:
         raise CampaignContractError("campaign event payload is malformed") from error
     state = None
     if declaration.state is not None and state_payload:
@@ -562,8 +649,15 @@ async def dispatch_campaign_react(
     target = declaration.target
     callback = target
     if isinstance(target, type):
-        instance = target()
+        instance = _CAMPAIGN_INSTANCES.get(campaign)
+        if instance is None:
+            instance = target()
+            _CAMPAIGN_INSTANCES[campaign] = instance
         callback = getattr(instance, "react", instance)
+    if not callable(callback):
+        raise CampaignContractError(
+            f"campaign {campaign!r} implementation has no callable react handler"
+        )
     result = callback(event, state) if declaration.state is not None else callback(event)
     if inspect.isawaitable(result):
         result = await result
@@ -573,6 +667,10 @@ async def dispatch_campaign_react(
         and len(result) == 2
         and isinstance(result[0], (Verdict, Done))
     ):
+        if declaration.state is None:
+            raise CampaignContractError(
+                "stateless campaign handler cannot return replacement state"
+            )
         result, new_state = result
     if not isinstance(result, (Verdict, Done)):
         raise CampaignContractError("campaign handler returned no campaign verdict")
@@ -580,11 +678,39 @@ async def dispatch_campaign_react(
     if declaration.state is not None and new_state is not None:
         state_bytes = declaration.state.encode(new_state)
     return {
+        "engagement_id": engagement_id,
+        "campaign_rev": campaign_rev,
         "point": point.value,
         "verdict": _verdict_name(result),
         "verdict_payload": _verdict_payload(result),
         "new_state": state_bytes,
     }
+
+
+def _validate_dispatch_generation(
+    variable: str,
+    actual: int | None,
+    label: str,
+) -> None:
+    expected_value = os.environ.get(variable)
+    if expected_value is None:
+        if actual is not None and (
+            isinstance(actual, bool) or not isinstance(actual, int) or actual < 1
+        ):
+            raise CampaignContractError(
+                f"campaign {label} generation must be a positive integer"
+            )
+        return
+    try:
+        expected = int(expected_value)
+    except ValueError as error:
+        raise CampaignContractError(
+            f"worker {label} generation is malformed"
+        ) from error
+    if actual != expected:
+        raise CampaignContractError(
+            f"stale campaign {label} generation {actual!r}; expected {expected}"
+        )
 
 
 def _campaign_declaration(campaign: str) -> CampaignDeclaration:
@@ -609,12 +735,24 @@ def _active_campaign(
     state: object | None = row.get("state")
     if declaration is not None and declaration.state is not None and isinstance(state, str):
         state = declaration.state.decode(state)
+    engagement_id = row.get("id")
+    extension = row.get("extension")
+    queued = row.get("queued", False)
+    if not isinstance(engagement_id, str) or not engagement_id:
+        raise StateDecodeError("campaign engagement id must be a non-empty string")
+    if not campaign:
+        raise StateDecodeError("campaign engagement campaign must be non-empty")
+    if not isinstance(extension, str) or not extension:
+        raise StateDecodeError("campaign engagement extension must be non-empty")
+    if not isinstance(queued, bool):
+        raise StateDecodeError("campaign engagement queued must be bool")
+
     return ActiveCampaign(
-        id=str(row.get("id", "")),
+        id=engagement_id,
         campaign=campaign,
-        extension=str(row.get("extension", "")),
+        extension=extension,
         state=state,
-        queued=bool(row.get("queued", False)),
+        queued=queued,
     )
 
 
@@ -638,7 +776,11 @@ def _verdict_name(verdict: Verdict | Done[Any]) -> str:
 
 def _verdict_payload(verdict: Verdict | Done[Any]) -> bytes:
     value = asdict(verdict) if is_dataclass(verdict) else {}
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    from .provider import _wire_value
+
+    return json.dumps(
+        _wire_value(value), sort_keys=True, separators=(",", ":")
+    ).encode()
 
 
 def _declaration_names(name: str, values: Sequence[str]) -> tuple[str, ...]:

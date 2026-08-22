@@ -6,7 +6,7 @@ import asyncio
 import builtins as _builtins
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
 from typing import Literal, TypeAlias
 
@@ -22,9 +22,8 @@ from _omp import (
 
 from . import limits as _limits
 from . import Fault
-from ._errors import NotWiredError
 from ._verdicts import BlobPart, TextPart
-from .policy import PolicyDenied
+from .policy import PolicyDenied, RuleRef
 
 
 DEFAULT_MAX_DEPTH = 2
@@ -153,6 +152,136 @@ class Completion:
 _DEFAULT = object()
 
 
+def _duration_ms(value: Duration | None) -> int | None:
+    return None if value is None else round(value.seconds * 1000)
+
+
+def _duration(value: object) -> Duration:
+    if isinstance(value, Duration):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return Duration(f"{value}ms")
+    if isinstance(value, str):
+        return Duration(value)
+    raise TypeError("CONTROL duration must be milliseconds or a duration string")
+
+
+def _mapping(value: object, what: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{what} response must be a mapping")
+    return value
+
+
+def _rows(value: object, what: str) -> Sequence[object]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(f"{what} response must be a sequence")
+    return value
+
+
+def _wire(value: object) -> object:
+    """Convert a frozen public value to the JSON-only CONTROL representation."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Duration):
+        return _duration_ms(value)
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, (AgentUrl, ArtifactUrl, EnvPath, HistoryUrl, WorkspaceUri)):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _wire(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return [_wire(item) for item in sorted(value, key=str)]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_wire(item) for item in value]
+    if is_dataclass(value):
+        return {item.name: _wire(getattr(value, item.name)) for item in fields(value)}
+    uri = getattr(value, "uri", None)
+    if isinstance(uri, str):
+        return uri
+    raise TypeError(f"{type(value).__name__} is not JSON-serializable for CONTROL")
+
+
+async def _request(operation: str, /, **arguments: object) -> object:
+    from . import _control_request
+
+    try:
+        return await _control_request(operation, **arguments)
+    except Exception as error:
+        code = getattr(error, "code", None)
+        details = getattr(error, "details", None)
+        detail = details if isinstance(details, Mapping) else {}
+        message = str(error)
+        if code == "CompletionFailed":
+            raise CompletionFailed(
+                str(detail.get("reason", message)),
+                None if detail.get("raw") is None else str(detail["raw"]),
+                _usage(detail.get("usage", {})),
+            ) from error
+        if code == "SpawnDenied":
+            raise SpawnDenied(
+                str(detail.get("reason", message)),
+                None if detail.get("field") is None else str(detail["field"]),
+            ) from error
+        if code == "DepthExceeded":
+            raise DepthExceeded(
+                int(detail.get("depth", 0)),
+                int(detail.get("max_depth", 0)),
+            ) from error
+        if code == "ConcurrencyExhausted":
+            raise ConcurrencyExhausted(
+                int(detail.get("running", 0)),
+                int(detail.get("queued", 0)),
+                int(detail.get("max_concurrency", 0)),
+            ) from error
+        if code == "AgentGone":
+            raise AgentGone(
+                str(detail.get("ref", "")),
+                AgentStatus(str(detail.get("status", AgentStatus.ABORTED.value))),
+                str(detail.get("transcript_url", "")),
+            ) from error
+        if code == "RewindPending":
+            raise RewindPending(str(detail.get("turn_id", ""))) from error
+        if code == "SnapshotUnsupported":
+            raise SnapshotUnsupported(
+                str(detail.get("capability", "env:workspace.snapshot"))
+            ) from error
+        if code == "ScheduleRejected":
+            raise ScheduleRejected(
+                str(detail.get("reason", message)),
+                None if detail.get("field") is None else str(detail["field"]),
+            ) from error
+        if code == "PolicyDenied":
+            rules = tuple(
+                RuleRef(str(rule.get("id", "")))
+                for rule in detail.get("rules", ())
+                if isinstance(rule, Mapping)
+            )
+            raise PolicyDenied(
+                reason=str(detail.get("reason", message)),
+                code=str(detail.get("code", "policy_denied")),
+                decision_id=str(detail.get("decision_id", "")),
+                rules=rules,
+            ) from error
+        if code == "AgentsError":
+            raise AgentsError(message) from error
+        raise
+
+
+def _usage(value: object) -> Usage:
+    row = _mapping(value, "agent usage")
+    return Usage(
+        input_tokens=int(row.get("input_tokens", 0)),
+        cached_input_tokens=int(row.get("cached_input_tokens", 0)),
+        output_tokens=int(row.get("output_tokens", 0)),
+        reasoning_tokens=int(row.get("reasoning_tokens", 0)),
+        cache_write_tokens=int(row.get("cache_write_tokens", 0)),
+        requests=int(row.get("requests", 0)),
+        cost_usd=float(row.get("cost_usd", 0.0)),
+        wall=_duration(row.get("wall_ms", row.get("wall", 0))),
+    )
+
+
 async def completion(
     prompt: str | Sequence[TextPart | BlobPart],
     *,
@@ -174,8 +303,39 @@ async def completion(
             raise TypeError(
                 "completion prompt must be str or a sequence of TextPart and BlobPart values"
             )
-    del prompt, role, system, choices, schema, default, scope, max_output_tokens, deadline, labels
-    raise NotWiredError("omp.agents.completion")
+        prompt_wire: object = [
+            {"kind": "text", "text": part.text}
+            if isinstance(part, TextPart)
+            else {"kind": "blob", "blob": _wire(part.blob), "alt": part.alt}
+            for part in prompt
+        ]
+    else:
+        prompt_wire = prompt
+    if choices is not None and schema is not None:
+        raise ValueError("completion choices and schema are mutually exclusive")
+    arguments: dict[str, object] = {
+        "prompt": prompt_wire,
+        "role": role,
+        "system": system,
+        "choices": _wire(choices),
+        "schema": _wire(schema),
+        "scope": scope,
+        "max_output_tokens": max_output_tokens,
+        "deadline_ms": _duration_ms(deadline),
+        "labels": _wire(labels or {}),
+    }
+    if default is not _DEFAULT:
+        arguments["default"] = _wire(default)
+    row = _mapping(await _request("omp.agents.completion", **arguments), "completion")
+    return Completion(
+        text=str(row.get("text", "")),
+        choice=None if row.get("choice") is None else str(row["choice"]),
+        data=row.get("data"),
+        usage=_usage(row.get("usage", {})),
+        model=str(row.get("model", "")),
+        fell_back=bool(row.get("fell_back", False)),
+        fault=row.get("fault"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,18 +389,42 @@ class LoopSignal:
 
 async def continuations() -> ContinuationLedger:
     """Read the current recursive continuation ledger."""
-    raise NotWiredError("omp.agents.continuations")
+    row = _mapping(await _request("omp.agents.continuations"), "continuations")
+    return ContinuationLedger(
+        consecutive=int(row.get("consecutive", 0)),
+        total=int(row.get("total", 0)),
+        cap=int(row.get("cap", 0)),
+        last_ms=int(row.get("last_ms", 0)),
+        refusals=int(row.get("refusals", 0)),
+        owner=None if row.get("owner") is None else str(row["owner"]),
+    )
 
 
 async def set_continuation_policy(policy: ContinuationPolicy) -> None:
     """Set this extension's continuation policy."""
-    del policy
-    raise NotWiredError("omp.agents.set_continuation_policy")
+    if not isinstance(policy, ContinuationPolicy):
+        raise TypeError("policy must be ContinuationPolicy")
+    await _request(
+        "omp.agents.set_continuation_policy",
+        policy={
+            "max_consecutive": policy.max_consecutive,
+            "max_total": policy.max_total,
+            "min_interval_ms": _duration_ms(policy.min_interval),
+            "on_exhausted": policy.on_exhausted,
+        },
+    )
 
 
 async def loop_signal() -> LoopSignal:
     """Read the Core's current conservative loop-stall signal."""
-    raise NotWiredError("omp.agents.loop_signal")
+    row = _mapping(await _request("omp.agents.loop_signal"), "loop signal")
+    return LoopSignal(
+        repeats=int(row.get("repeats", 0)),
+        digest=str(row.get("digest", "")),
+        no_progress_turns=int(row.get("no_progress_turns", 0)),
+        empty_output_retries=int(row.get("empty_output_retries", 0)),
+        stalled=bool(row.get("stalled", False)),
+    )
 
 
 class DeliveryMode(StrEnum):
@@ -399,6 +583,132 @@ class SubagentResult:
     worktree: WorktreeOutcome | None
 
 
+def _spec_wire(spec: SubagentSpec) -> dict[str, object]:
+    wire = _wire(spec)
+    assert isinstance(wire, dict)
+    return wire
+
+
+def _spec(value: object) -> SubagentSpec:
+    row = _mapping(value, "subagent spec")
+    budget_value = row.get("budget")
+    budget = None
+    if budget_value is not None:
+        item = _mapping(budget_value, "subagent budget")
+        budget = Budget(
+            max_requests=None if item.get("max_requests") is None else int(item["max_requests"]),
+            max_input_tokens=None
+            if item.get("max_input_tokens") is None
+            else int(item["max_input_tokens"]),
+            max_output_tokens=None
+            if item.get("max_output_tokens") is None
+            else int(item["max_output_tokens"]),
+            max_usd=None if item.get("max_usd") is None else float(item["max_usd"]),
+            max_wall=None if item.get("max_wall") is None else _duration(item["max_wall"]),
+        )
+    return SubagentSpec(
+        task=str(row.get("task", "")),
+        name=None if row.get("name") is None else str(row["name"]),
+        agent=str(row.get("agent", "task")),
+        system_prompt=None
+        if row.get("system_prompt") is None
+        else str(row["system_prompt"]),
+        model=None if row.get("model") is None else str(row["model"]),
+        on_model_unavailable=str(row.get("on_model_unavailable", "fail")),
+        thinking=None
+        if row.get("thinking") is None
+        else ThinkingLevel(str(row["thinking"])),
+        allowed_devices=None
+        if row.get("allowed_devices") is None
+        else frozenset(str(item) for item in _rows(row["allowed_devices"], "allowed devices")),
+        disallowed_devices=frozenset(
+            str(item)
+            for item in _rows(row.get("disallowed_devices", ()), "disallowed devices")
+        ),
+        isolation=Isolation(str(row.get("isolation", Isolation.CLEAN.value))),
+        max_depth=int(row.get("max_depth", 1)),
+        cwd=None if row.get("cwd") is None else EnvPath(str(row["cwd"])),
+        worktree=bool(row.get("worktree", False)),
+        merge=MergeMode(str(row.get("merge", MergeMode.NONE.value))),
+        env_vars={
+            str(key): str(item)
+            for key, item in _mapping(row.get("env_vars", {}), "environment variables").items()
+        },
+        background=bool(row.get("background", False)),
+        output_schema=None
+        if row.get("output_schema") is None
+        else dict(_mapping(row["output_schema"], "output schema")),
+        schema_mode=str(row.get("schema_mode", "permissive")),
+        deadline=None if row.get("deadline") is None else _duration(row["deadline"]),
+        request_budget=None
+        if row.get("request_budget") is None
+        else int(row["request_budget"]),
+        budget=budget,
+        labels={
+            str(key): str(item)
+            for key, item in _mapping(row.get("labels", {}), "subagent labels").items()
+        },
+    )
+
+
+def _worktree(value: object | None) -> WorktreeOutcome | None:
+    if value is None:
+        return None
+    row = _mapping(value, "worktree outcome")
+    return WorktreeOutcome(
+        path=EnvPath(str(row["path"])),
+        merge=MergeMode(str(row.get("merge", MergeMode.NONE.value))),
+        applied=bool(row.get("applied", False)),
+        branch=None if row.get("branch") is None else str(row["branch"]),
+        patch_url=None
+        if row.get("patch_url") is None
+        else ArtifactUrl(str(row["patch_url"])),
+        conflicts=tuple(
+            str(item) for item in _rows(row.get("conflicts", ()), "worktree conflicts")
+        ),
+    )
+
+
+def _result(value: object) -> SubagentResult:
+    row = _mapping(value, "subagent result")
+    return SubagentResult(
+        run_id=str(row["run_id"]),
+        session_id=str(row["session_id"]),
+        name=str(row["name"]),
+        status=RunStatus(str(row["status"])),
+        text=str(row.get("text", "")),
+        data=row.get("data"),
+        fault=row.get("fault"),
+        usage=_usage(row.get("usage", {})),
+        subtree_usage=_usage(row.get("subtree_usage", {})),
+        turns=int(row.get("turns", 0)),
+        model=str(row.get("model", "")),
+        model_fallback=bool(row.get("model_fallback", False)),
+        warnings=tuple(
+            str(item) for item in _rows(row.get("warnings", ()), "subagent warnings")
+        ),
+        output_url=AgentUrl(str(row["output_url"])),
+        transcript_url=HistoryUrl(str(row["transcript_url"])),
+        worktree=_worktree(row.get("worktree")),
+    )
+
+
+def _progress(value: object) -> Progress:
+    row = _mapping(value, "subagent progress")
+    return Progress(
+        status=RunStatus(str(row["status"])),
+        turns=int(row.get("turns", 0)),
+        requests=int(row.get("requests", 0)),
+        tool_calls=int(row.get("tool_calls", 0)),
+        context_tokens=int(row.get("context_tokens", 0)),
+        context_window=int(row.get("context_window", 0)),
+        usage=_usage(row.get("usage", {})),
+        activity=str(row.get("activity", "")),
+        model=str(row.get("model", "")),
+        last_activity_ms=int(row.get("last_activity_ms", 0)),
+    )
+
+
 class Receipt(StrEnum):
     """Delivery disposition for an inter-agent message."""
 
@@ -450,18 +760,27 @@ class SubagentHandle:
 
     async def status(self) -> RunStatus:
         """Read the child's current lifecycle state."""
-        raise NotWiredError("omp.agents.SubagentHandle.status")
+        response = await _request("omp.agents.status", run_id=self.run_id)
+        if isinstance(response, Mapping):
+            response = response.get("status")
+        return RunStatus(str(response))
 
     async def progress(self) -> Progress:
         """Read a sanitized progress snapshot."""
-        raise NotWiredError("omp.agents.SubagentHandle.progress")
+        return _progress(await _request("omp.agents.progress", run_id=self.run_id))
 
     async def steer(
         self, text: str, *, mode: DeliveryMode = DeliveryMode.ASIDE
     ) -> Receipt:
         """Post a message into the child's mailbox."""
-        del text, mode
-        raise NotWiredError("omp.agents.SubagentHandle.steer")
+        if not text:
+            raise ValueError("steer text must be non-empty")
+        response = await _request(
+            "omp.agents.steer", run_id=self.run_id, text=text, mode=mode.value
+        )
+        if isinstance(response, Mapping):
+            response = response.get("receipt")
+        return Receipt(str(response))
 
     async def cancel(
         self,
@@ -470,22 +789,31 @@ class SubagentHandle:
         grace: Duration = STEER_GRACE,
     ) -> None:
         """Cancel the child and its structural resources."""
-        del reason, grace
-        raise NotWiredError("omp.agents.SubagentHandle.cancel")
+        await _request(
+            "omp.agents.cancel",
+            run_id=self.run_id,
+            reason=reason,
+            grace_ms=_duration_ms(grace),
+        )
 
     async def wait(self, *, timeout: Duration | None = None) -> SubagentResult:
         """Wait for a terminal child result."""
-        del timeout
-        raise NotWiredError("omp.agents.SubagentHandle.wait")
+        response = await _request(
+            "omp.agents.wait",
+            run_id=self.run_id,
+            timeout_ms=_duration_ms(timeout),
+        )
+        return _result(response)
 
     async def result(self) -> SubagentResult | None:
         """Return the terminal result without blocking, when available."""
-        raise NotWiredError("omp.agents.SubagentHandle.result")
+        response = await _request("omp.agents.result", run_id=self.run_id)
+        return None if response is None else _result(response)
 
     async def release(self) -> None:
         """Relinquish structural ownership of the child."""
+        await _request("omp.agents.release", run_id=self.run_id)
         self._released = True
-        raise NotWiredError("omp.agents.SubagentHandle.release")
 
     async def __aenter__(self) -> SubagentHandle:
         """Enter structural ownership of this child."""
@@ -498,16 +826,55 @@ class SubagentHandle:
             await self.cancel()
 
 
+def _handle(value: object, fallback_spec: SubagentSpec | None = None) -> SubagentHandle:
+    row = _mapping(value, "subagent handle")
+    spec_value = row.get("spec")
+    resolved_spec = fallback_spec if spec_value is None else _spec(spec_value)
+    if resolved_spec is None:
+        raise TypeError("subagent handle response omitted spec")
+    return SubagentHandle(
+        run_id=str(row["run_id"]),
+        session_id=str(row["session_id"]),
+        name=str(row["name"]),
+        agent=str(row.get("agent", resolved_spec.agent)),
+        depth=int(row.get("depth", 0)),
+        effective_max_depth=int(row.get("effective_max_depth", resolved_spec.max_depth)),
+        spec=resolved_spec,
+        worktree_path=None
+        if row.get("worktree_path") is None
+        else EnvPath(str(row["worktree_path"])),
+        output_url=AgentUrl(str(row["output_url"])),
+        transcript_url=HistoryUrl(str(row["transcript_url"])),
+    )
+
+
 async def spawn(spec: SubagentSpec) -> SubagentHandle:
     """Admit and start one child agent."""
-    del spec
-    raise NotWiredError("omp.agents.spawn")
+    if not isinstance(spec, SubagentSpec):
+        raise TypeError("spec must be SubagentSpec")
+    return _handle(
+        await _request("omp.agents.spawn", spec=_spec_wire(spec)),
+        fallback_spec=spec,
+    )
 
 
 async def spawn_all(specs: Sequence[SubagentSpec]) -> _builtins.list[SubagentHandle]:
     """Atomically admit and start a batch of child agents."""
-    del specs
-    raise NotWiredError("omp.agents.spawn_all")
+    if not isinstance(specs, Sequence) or isinstance(specs, (str, bytes)):
+        raise TypeError("specs must be a sequence of SubagentSpec")
+    frozen = tuple(specs)
+    if any(not isinstance(spec, SubagentSpec) for spec in frozen):
+        raise TypeError("specs must contain only SubagentSpec values")
+    response = _rows(
+        await _request(
+            "omp.agents.spawn_all",
+            specs=[_spec_wire(spec) for spec in frozen],
+        ),
+        "spawn_all",
+    )
+    if len(response) != len(frozen):
+        raise TypeError("spawn_all response cardinality does not match request")
+    return [_handle(row, fallback_spec=spec) for row, spec in zip(response, frozen)]
 
 
 class AgentKind(StrEnum):
@@ -559,21 +926,54 @@ class SpawnLimits:
     spawn_allowed: bool
 
 
+def _agent_ref(value: object) -> AgentRef:
+    row = _mapping(value, "agent roster row")
+    return AgentRef(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        kind=AgentKind(str(row["kind"])),
+        status=AgentStatus(str(row["status"])),
+        agent=str(row.get("agent", row.get("definition", ""))),
+        parent=None if row.get("parent") is None else str(row["parent"]),
+        depth=int(row.get("depth", 0)),
+        activity=str(row.get("activity", "")),
+        last_activity_ms=int(row.get("last_activity_ms", 0)),
+        usage=_usage(row.get("usage", {})),
+        output_url=AgentUrl(str(row["output_url"])),
+        transcript_url=HistoryUrl(str(row["transcript_url"])),
+    )
+
+
 async def get(ref: str) -> SubagentHandle:
     """Resolve an agent reference to a live handle."""
-    del ref
-    raise NotWiredError("omp.agents.get")
+    if not ref:
+        raise ValueError("agent ref must be non-empty")
+    return _handle(await _request("omp.agents.get", ref=ref))
 
 
 async def revive(ref: str) -> SubagentHandle:
     """Cold-revive a parked child session."""
-    del ref
-    raise NotWiredError("omp.agents.revive")
+    if not ref:
+        raise ValueError("agent ref must be non-empty")
+    return _handle(await _request("omp.agents.revive", ref=ref))
 
 
 async def limits() -> SpawnLimits:
     """Read current child-spawn ceilings."""
-    raise NotWiredError("omp.agents.limits")
+    row = _mapping(await _request("omp.agents.limits"), "spawn limits")
+    current_depth = int(row.get("depth", 0))
+    global depth
+    depth = current_depth
+    return SpawnLimits(
+        max_depth=int(row.get("max_depth", 0)),
+        depth=current_depth,
+        max_concurrency=int(row.get("max_concurrency", 0)),
+        running=int(row.get("running", 0)),
+        queued=int(row.get("queued", 0)),
+        continuation_cap=int(row.get("continuation_cap", 0)),
+        continuations_used=int(row.get("continuations_used", 0)),
+        spawn_allowed=bool(row.get("spawn_allowed", False)),
+    )
 
 
 
@@ -592,6 +992,28 @@ class Message:
     session_id: str
 
 
+def _message(value: object) -> Message:
+    row = _mapping(value, "agent message")
+    return Message(
+        id=str(row["id"]),
+        from_=str(row.get("from_", row.get("from", ""))),
+        to=str(row["to"]),
+        text=str(row.get("text", row.get("message", ""))),
+        mode=DeliveryMode(str(row.get("mode", DeliveryMode.ASIDE.value))),
+        reply_to=None
+        if row.get("reply_to", row.get("replyTo")) is None
+        else str(row.get("reply_to", row.get("replyTo"))),
+        sent_ms=int(row.get("sent_ms", row.get("sentMs", 0))),
+        session_id=str(row.get("session_id", row.get("sessionId", ""))),
+    )
+
+
+def _receipt(value: object) -> Receipt:
+    if isinstance(value, Mapping):
+        value = value.get("receipt", value.get("outcome"))
+    return Receipt(str(value))
+
+
 async def send(
     to: str,
     text: str,
@@ -602,8 +1024,18 @@ async def send(
     timeout: Duration = Duration("60s"),
 ) -> Receipt | Message:
     """Send a message to an addressable agent."""
-    del to, text, mode, reply_to, await_reply, timeout
-    raise NotWiredError("omp.agents.send")
+    if not to:
+        raise ValueError("message recipient must be non-empty")
+    response = await _request(
+        "omp.agents.send",
+        to=to,
+        text=text,
+        mode=mode.value,
+        reply_to=reply_to,
+        await_reply=await_reply,
+        timeout_ms=_duration_ms(timeout),
+    )
+    return _message(response) if await_reply else _receipt(response)
 
 
 async def broadcast(
@@ -613,14 +1045,22 @@ async def broadcast(
     mode: DeliveryMode = DeliveryMode.ASIDE,
 ) -> dict[str, Receipt]:
     """Send a message to every agent in a scope."""
-    del text, scope, mode
-    raise NotWiredError("omp.agents.broadcast")
+    row = _mapping(
+        await _request(
+            "omp.agents.broadcast", text=text, scope=scope, mode=mode.value
+        ),
+        "broadcast",
+    )
+    return {str(peer): _receipt(receipt) for peer, receipt in row.items()}
 
 
 async def inbox(*, peek: bool = False, limit: int | None = None) -> _builtins.list[Message]:
     """Drain or inspect this agent's buffered mailbox."""
-    del peek, limit
-    raise NotWiredError("omp.agents.inbox")
+    response = _rows(
+        await _request("omp.agents.inbox", peek=peek, limit=limit),
+        "agent inbox",
+    )
+    return [_message(row) for row in response]
 
 
 async def wait_for(
@@ -630,16 +1070,24 @@ async def wait_for(
     timeout: Duration = Duration("60s"),
 ) -> Message | None:
     """Wait for a matching inter-agent message."""
-    del sender, reply_to, timeout
-    raise NotWiredError("omp.agents.wait_for")
+    response = await _request(
+        "omp.agents.wait_for",
+        sender=sender,
+        reply_to=reply_to,
+        timeout_ms=_duration_ms(timeout),
+    )
+    return None if response is None else _message(response)
 
 
 async def peers(
     *, scope: Literal["session", "project"] = "session"
 ) -> _builtins.list[AgentRef]:
     """List messageable peers in a scope."""
-    del scope
-    raise NotWiredError("omp.agents.peers")
+    response = _rows(
+        await _request("omp.agents.peers", scope=scope),
+        "agent peers",
+    )
+    return [_agent_ref(row) for row in response]
 
 
 async def inject(
@@ -650,8 +1098,14 @@ async def inject(
     role: Literal["user", "system"] = "system",
 ) -> Receipt:
     """Inject an out-of-band item into this agent's mailbox."""
-    del prompt, mode, visible, role
-    raise NotWiredError("omp.agents.inject")
+    response = await _request(
+        "omp.agents.inject",
+        prompt=prompt,
+        mode=mode.value,
+        visible=visible,
+        role=role,
+    )
+    return _receipt(response)
 
 
 class RestoreScope(StrEnum):
@@ -725,9 +1179,69 @@ class Snapshot:
     partial: bool
 
 
+def _conflict(value: object) -> Conflict:
+    row = _mapping(value, "restore conflict")
+    return Conflict(
+        path=EnvPath(str(row["path"])),
+        reason=str(row["reason"]),
+        lease_holder=None
+        if row.get("lease_holder") is None
+        else str(row["lease_holder"]),
+    )
+
+
+def _restore_report(value: object) -> RestoreReport:
+    row = _mapping(value, "restore report")
+    return RestoreReport(
+        from_generation=int(row.get("from_generation", 0)),
+        to_generation=int(row.get("to_generation", 0)),
+        written=int(row.get("written", 0)),
+        deleted=int(row.get("deleted", 0)),
+        unchanged=int(row.get("unchanged", 0)),
+        conflicts=tuple(
+            _conflict(item)
+            for item in _rows(row.get("conflicts", ()), "restore conflicts")
+        ),
+        undo_snapshot_id=str(row["undo_snapshot_id"]),
+        dry_run=bool(row.get("dry_run", False)),
+    )
+
+
+def _snapshot(value: object) -> Snapshot:
+    row = _mapping(value, "workspace snapshot")
+    return Snapshot(
+        id=str(row["id"]),
+        generation=int(row["generation"]),
+        label=None if row.get("label") is None else str(row["label"]),
+        created_ms=int(row["created_ms"]),
+        root=WorkspaceUri(str(row["root"])),
+        parent=None if row.get("parent") is None else str(row["parent"]),
+        tree_hash=str(row["tree_hash"]),
+        entry_count=int(row.get("entry_count", 0)),
+        bytes=int(row.get("bytes", 0)),
+        partial=bool(row.get("partial", False)),
+    )
+
+
 async def rewind_targets() -> _builtins.list[RewindTarget]:
     """List live user-message rewind targets oldest first."""
-    raise NotWiredError("omp.agents.rewind_targets")
+    response = _rows(
+        await _request("omp.agents.rewind_targets"),
+        "rewind targets",
+    )
+    return [
+        RewindTarget(
+            event=int(row["event"]),
+            keep=None if row.get("keep") is None else int(row["keep"]),
+            text=str(row.get("text", "")),
+            ts_ms=int(row.get("ts_ms", 0)),
+            snapshot_id=None
+            if row.get("snapshot_id") is None
+            else str(row["snapshot_id"]),
+        )
+        for item in response
+        for row in (_mapping(item, "rewind target"),)
+    ]
 
 
 async def rewind(
@@ -738,22 +1252,49 @@ async def rewind(
     dry_run: bool = False,
 ) -> RewindReport:
     """Atomically rewind thread state and optionally workspace state."""
-    del to, scope, snapshot_id, dry_run
-    raise NotWiredError("omp.agents.rewind")
+    row = _mapping(
+        await _request(
+            "omp.agents.rewind",
+            to=to,
+            scope=scope.value,
+            snapshot_id=snapshot_id,
+            dry_run=dry_run,
+        ),
+        "rewind report",
+    )
+    return RewindReport(
+        head=int(row.get("head", 0)),
+        dropped_items=int(row.get("dropped_items", 0)),
+        scope=RestoreScope(str(row.get("scope", scope.value))),
+        restore=None
+        if row.get("restore") is None
+        else _restore_report(row["restore"]),
+        dry_run=bool(row.get("dry_run", dry_run)),
+    )
 
 
 async def snapshot(
     *, label: str | None = None, paths: Sequence[str] | None = None
 ) -> Snapshot:
     """Capture a content-addressed workspace generation."""
-    del label, paths
-    raise NotWiredError("omp.agents.snapshot")
+    return _snapshot(
+        await _request(
+            "omp.agents.snapshot",
+            label=label,
+            paths=None if paths is None else [str(path) for path in paths],
+        )
+    )
 
 
 async def snapshots(*, limit: int = 50) -> _builtins.list[Snapshot]:
     """List workspace snapshots newest first."""
-    del limit
-    raise NotWiredError("omp.agents.snapshots")
+    if limit < 0:
+        raise ValueError("snapshot limit must be non-negative")
+    response = _rows(
+        await _request("omp.agents.snapshots", limit=limit),
+        "workspace snapshots",
+    )
+    return [_snapshot(row) for row in response]
 
 
 async def restore(
@@ -763,8 +1304,16 @@ async def restore(
     dry_run: bool = False,
 ) -> RestoreReport:
     """Restore files from a content-addressed workspace generation."""
-    del snapshot_id, paths, dry_run
-    raise NotWiredError("omp.agents.restore")
+    if not snapshot_id:
+        raise ValueError("snapshot_id must be non-empty")
+    return _restore_report(
+        await _request(
+            "omp.agents.restore",
+            snapshot_id=snapshot_id,
+            paths=None if paths is None else [str(path) for path in paths],
+            dry_run=dry_run,
+        )
+    )
 
 
 class MissedRunPolicy(StrEnum):
@@ -893,6 +1442,127 @@ class Firing:
     detail: str | None
 
 
+def _trigger_wire(trigger: Trigger) -> dict[str, object]:
+    if isinstance(trigger, Cron):
+        return {"kind": "cron", "expr": trigger.expr, "tz": trigger.tz}
+    if isinstance(trigger, Every):
+        return {
+            "kind": "every",
+            "interval_ms": _duration_ms(trigger.interval),
+            "jitter_ms": _duration_ms(trigger.jitter),
+            "align": trigger.align,
+        }
+    if isinstance(trigger, At):
+        return {"kind": "at", "epoch_ms": trigger.epoch_ms}
+    if isinstance(trigger, AfterIdle):
+        return {"kind": "after_idle", "idle_ms": _duration_ms(trigger.idle)}
+    raise TypeError("trigger must be Cron, Every, At, or AfterIdle")
+
+
+def _trigger(value: object) -> Trigger:
+    row = _mapping(value, "schedule trigger")
+    kind = str(row.get("kind", ""))
+    if kind == "cron":
+        return Cron(str(row["expr"]), str(row.get("tz", "UTC")))
+    if kind == "every":
+        return Every(
+            _duration(row["interval_ms"]),
+            _duration(row.get("jitter_ms", 0)),
+            bool(row.get("align", False)),
+        )
+    if kind == "at":
+        return At(int(row["epoch_ms"]))
+    if kind == "after_idle":
+        return AfterIdle(_duration(row["idle_ms"]))
+    raise TypeError(f"unknown schedule trigger kind: {kind!r}")
+
+
+def _delivery_wire(delivery: Delivery) -> dict[str, object]:
+    if isinstance(delivery, Inject):
+        return {
+            "kind": "inject",
+            "prompt": delivery.prompt,
+            "mode": delivery.mode.value,
+            "visible": delivery.visible,
+        }
+    if isinstance(delivery, Spawn):
+        spec = _spec_wire(delivery.spec)
+        spec["background"] = True
+        return {"kind": "spawn", "spec": spec}
+    raise TypeError("delivery must be Inject or Spawn")
+
+
+def _delivery(value: object) -> Delivery:
+    row = _mapping(value, "schedule delivery")
+    kind = str(row.get("kind", ""))
+    if kind == "inject":
+        return Inject(
+            prompt=str(row["prompt"]),
+            mode=DeliveryMode(str(row.get("mode", DeliveryMode.NEXT_TURN.value))),
+            visible=bool(row.get("visible", False)),
+        )
+    if kind == "spawn":
+        return Spawn(_spec(row["spec"]))
+    raise TypeError(f"unknown schedule delivery kind: {kind!r}")
+
+
+def _schedule_budget(value: object | None) -> ScheduleBudget | None:
+    if value is None:
+        return None
+    row = _mapping(value, "schedule budget")
+    return ScheduleBudget(
+        max_usd_per_firing=None
+        if row.get("max_usd_per_firing") is None
+        else float(row["max_usd_per_firing"]),
+        max_usd_per_window=None
+        if row.get("max_usd_per_window") is None
+        else float(row["max_usd_per_window"]),
+        window=_duration(row.get("window_ms", row.get("window", 2_592_000_000))),
+        max_requests_per_firing=None
+        if row.get("max_requests_per_firing") is None
+        else int(row["max_requests_per_firing"]),
+    )
+
+
+def _schedule(value: object) -> Schedule:
+    row = _mapping(value, "schedule")
+    return Schedule(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        trigger=_trigger(row["trigger"]),
+        delivery=_delivery(row["delivery"]),
+        scope=ScheduleScope(str(row["scope"])),
+        enabled=bool(row.get("enabled", False)),
+        owner=str(row.get("owner", "")),
+        principal=str(row.get("principal", "")),
+        artifact_digest=str(row.get("artifact_digest", "")),
+        upgrade=UpgradePolicy(str(row.get("upgrade", UpgradePolicy.PINNED.value))),
+        missed=MissedRunPolicy(str(row.get("missed", MissedRunPolicy.COALESCE.value))),
+        budget=_schedule_budget(row.get("budget")),
+        overlap=str(row.get("overlap", "skip")),
+        created_ms=int(row.get("created_ms", 0)),
+        next_ms=None if row.get("next_ms") is None else int(row["next_ms"]),
+        last_ms=None if row.get("last_ms") is None else int(row["last_ms"]),
+        fire_count=int(row.get("fire_count", 0)),
+        miss_count=int(row.get("miss_count", 0)),
+    )
+
+
+def _firing(value: object) -> Firing:
+    row = _mapping(value, "schedule firing")
+    return Firing(
+        schedule_id=str(row["schedule_id"]),
+        idempotency_key=str(row["idempotency_key"]),
+        at_ms=int(row["at_ms"]),
+        late_ms=int(row.get("late_ms", 0)),
+        outcome=str(row["outcome"]),
+        artifact_digest=str(row.get("artifact_digest", "")),
+        principal=str(row.get("principal", "")),
+        run_id=None if row.get("run_id") is None else str(row["run_id"]),
+        detail=None if row.get("detail") is None else str(row["detail"]),
+    )
+
+
 class ScheduleHandle:
     """Live identity and control surface for a durable schedule."""
     id: str
@@ -905,28 +1575,39 @@ class ScheduleHandle:
 
     async def pause(self) -> None:
         """Pause future firings."""
-        raise NotWiredError("omp.agents.ScheduleHandle.pause")
+        await _request("omp.agents.schedule.pause", schedule_id=self.id)
 
     async def resume(self) -> None:
         """Resume future firings."""
-        raise NotWiredError("omp.agents.ScheduleHandle.resume")
+        await _request("omp.agents.schedule.resume", schedule_id=self.id)
 
     async def delete(self) -> None:
         """Delete this durable schedule."""
-        raise NotWiredError("omp.agents.ScheduleHandle.delete")
+        await _request("omp.agents.schedule.delete", schedule_id=self.id)
 
     async def fire_now(self) -> Receipt:
         """Request a journaled manual firing."""
-        raise NotWiredError("omp.agents.ScheduleHandle.fire_now")
+        return _receipt(
+            await _request("omp.agents.schedule.fire_now", schedule_id=self.id)
+        )
 
     async def info(self) -> Schedule:
         """Read the current schedule projection."""
-        raise NotWiredError("omp.agents.ScheduleHandle.info")
+        return _schedule(
+            await _request("omp.agents.schedule.info", schedule_id=self.id)
+        )
 
     async def history(self, limit: int = 20) -> _builtins.list[Firing]:
         """Read durable firing history."""
-        del limit
-        raise NotWiredError("omp.agents.ScheduleHandle.history")
+        response = _rows(
+            await _request(
+                "omp.agents.schedule.history",
+                schedule_id=self.id,
+                limit=limit,
+            ),
+            "schedule firing history",
+        )
+        return [_firing(row) for row in response]
 
 
 async def schedule(
@@ -941,22 +1622,55 @@ async def schedule(
     budget: ScheduleBudget | None = None,
 ) -> ScheduleHandle:
     """Upsert a durable schedule through the scheduler host arm."""
-    del name, trigger, delivery, scope, missed, overlap, upgrade, budget
-    raise NotWiredError("omp.agents.schedule")
+    if not isinstance(name, str) or not name:
+        raise ScheduleRejected("name must be non-empty", field="name")
+    budget_wire = None
+    if budget is not None:
+        budget_wire = {
+            "max_usd_per_firing": budget.max_usd_per_firing,
+            "max_usd_per_window": budget.max_usd_per_window,
+            "window_ms": _duration_ms(budget.window),
+            "max_requests_per_firing": budget.max_requests_per_firing,
+        }
+    row = _mapping(
+        await _request(
+            "omp.agents.schedule",
+            name=name,
+            trigger=_trigger_wire(trigger),
+            delivery=_delivery_wire(delivery),
+            scope=scope.value,
+            missed=missed.value,
+            overlap=overlap,
+            upgrade=upgrade.value,
+            budget=budget_wire,
+        ),
+        "schedule handle",
+    )
+    return ScheduleHandle(str(row["id"]), str(row.get("name", name)))
 
 
 async def schedules(
     *, scope: ScheduleScope | None = None, owner: str | None = None
 ) -> _builtins.list[Schedule]:
     """List visible durable schedules."""
-    del scope, owner
-    raise NotWiredError("omp.agents.schedules")
+    response = _rows(
+        await _request(
+            "omp.agents.schedules",
+            scope=None if scope is None else scope.value,
+            owner=owner,
+        ),
+        "schedules",
+    )
+    return [_schedule(row) for row in response]
 
 
 async def unschedule(name_or_id: str) -> bool:
     """Delete a schedule by owner-local name or stable identifier."""
-    del name_or_id
-    raise NotWiredError("omp.agents.unschedule")
+    if not name_or_id:
+        raise ValueError("schedule name or id must be non-empty")
+    return bool(
+        await _request("omp.agents.unschedule", name_or_id=name_or_id)
+    )
 
 
 class TimerHandle:
@@ -1034,8 +1748,16 @@ async def list(
     include_parked: bool = True,
 ) -> _builtins.list[AgentRef]:
     """List visible agents in tree order."""
-    del kind, status, include_parked
-    raise NotWiredError("omp.agents.list")
+    response = _rows(
+        await _request(
+            "omp.agents.list",
+            kind=None if kind is None else kind.value,
+            status=None if status is None else status.value,
+            include_parked=include_parked,
+        ),
+        "agent roster",
+    )
+    return [_agent_ref(row) for row in response]
 
 __all__ = (
     "AfterIdle",

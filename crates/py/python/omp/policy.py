@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import fnmatch
 import inspect
-from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
-from enum import IntFlag, StrEnum
-from typing import Final, TypeAlias
+import types
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from enum import Enum, IntFlag, StrEnum
+from typing import Any, Final, TypeAlias, get_args, get_origin, get_type_hints
 
-from _omp import Duration, EnvPath, OmpError, WorkspaceUri
+from _omp import Duration, EnvPath, HostDisconnected, OmpError, WorkspaceUri
 
 from ._errors import NotWiredError
 from ._registry import registry as _declarations
@@ -684,10 +685,11 @@ class PolicyDenied(OmpError):
 class ProfileHandle:
     """Represent an installed scoped sandbox profile."""
     profile: SandboxProfile
+    _handle_id: str = field(repr=False, compare=False)
 
     async def revoke(self) -> None:
         """Revoke the installed profile contribution."""
-        raise NotWiredError("omp.policy.ProfileHandle.revoke")
+        await _request("omp.policy.revoke", handle_id=self._handle_id)
 
 class PolicyError(OmpError):
     """Base error for policy transport and revision failures."""
@@ -701,39 +703,191 @@ class ProfileWidened(PolicyError):
 class EnforcementUnavailable(PolicyError):
     """No available backend can satisfy required confinement."""
 
+def _wire(value: object) -> object:
+    """Project frozen policy values onto the JSON CONTROL vocabulary."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Duration):
+        return value.seconds
+    if isinstance(value, (EnvPath, WorkspaceUri)):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return {
+            field.name: _wire(getattr(value, field.name))
+            for field in fields(value)
+            if not field.name.startswith("_")
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _wire(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_wire(item) for item in value]
+    raise TypeError(f"{type(value).__name__} is not JSON-serializable policy data")
+
+
+def _decode(value: object, expected: object) -> Any:
+    """Decode one host response into the frozen policy type graph."""
+    if expected is Any or expected is object:
+        return value
+    if value is None:
+        if expected is type(None) or type(None) in get_args(expected):
+            return None
+        raise TypeError(f"host response for {expected!r} must not be null")
+    origin = get_origin(expected)
+    arguments = get_args(expected)
+    if origin in (types.UnionType, getattr(types, "UnionType", object)) or (
+        origin is not None and str(origin) == "typing.Union"
+    ):
+        if type(None) in arguments and len(arguments) == 2:
+            member = next(item for item in arguments if item is not type(None))
+            return _decode(value, member)
+        errors: list[Exception] = []
+        for member in arguments:
+            try:
+                return _decode(value, member)
+            except (KeyError, TypeError, ValueError) as error:
+                errors.append(error)
+        raise TypeError(f"response does not match {expected!r}") from errors[-1]
+    if origin is tuple:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            raise TypeError("host response must be a sequence")
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            return tuple(_decode(item, arguments[0]) for item in value)
+        if len(value) != len(arguments):
+            raise TypeError("host response tuple has the wrong length")
+        return tuple(_decode(item, item_type) for item, item_type in zip(value, arguments))
+    if origin is frozenset:
+        return frozenset(_decode(item, arguments[0]) for item in value)
+    if origin is list:
+        return [_decode(item, arguments[0]) for item in value]
+    if isinstance(expected, type) and isinstance(value, expected):
+        return value
+    if isinstance(expected, type) and issubclass(expected, Enum):
+        return expected(value)
+    if expected is Duration:
+        return Duration(seconds=float(value))
+    if expected in (EnvPath, WorkspaceUri):
+        return expected(str(value))
+    if isinstance(expected, type) and is_dataclass(expected):
+        if not isinstance(value, Mapping):
+            raise TypeError(f"host response for {expected.__name__} must be an object")
+        hints = get_type_hints(expected)
+        required = {
+            field.name
+            for field in fields(expected)
+            if field.default is MISSING and field.default_factory is MISSING
+        }
+        if not required.issubset(value):
+            raise KeyError(f"host response for {expected.__name__} is missing required fields")
+        return expected(
+            **{
+                field.name: _decode(value[field.name], hints.get(field.name, Any))
+                for field in fields(expected)
+                if field.name in value and not field.name.startswith("_")
+            }
+        )
+    if expected in (str, int, float, bool):
+        if not isinstance(value, expected):
+            raise TypeError(f"host response must be {expected.__name__}")
+        return value
+    return value
+
+
+async def _request(operation: str, /, **arguments: object) -> Any:
+    from . import _control_backend, _control_request
+
+    if _control_backend.get() is None:
+        raise NotWiredError(operation)
+    try:
+        return await _control_request(
+            operation, **{name: _wire(value) for name, value in arguments.items()}
+        )
+    except HostDisconnected as error:
+        raise PolicyError(f"{operation} CONTROL authority disconnected") from error
+
+
 async def parse(script: str, *, cwd: EnvPath | None = None) -> BashIR:
     """Parse shell source into host-analyzed Bash IR."""
-    del script, cwd
-    raise NotWiredError("omp.policy.parse")
+    if not isinstance(script, str):
+        raise TypeError("script must be str")
+    return _decode(
+        await _request("omp.policy.parse", script=script, cwd=cwd),
+        BashIR,
+    )
 
 async def match_paths(path: str, *patterns: str, cwd: EnvPath | None = None, access: Access | None = None) -> tuple[PathRef, ...]:
     """Match a path using the host's policy path semantics."""
-    del path, patterns, cwd, access
-    raise NotWiredError("omp.policy.match_paths")
+    if not isinstance(path, str):
+        raise TypeError("path must be str")
+    if any(not isinstance(pattern, str) for pattern in patterns):
+        raise TypeError("patterns must contain only str values")
+    if access is not None and not isinstance(access, Access):
+        raise TypeError("access must be omp.Access or None")
+    return _decode(
+        await _request(
+            "omp.policy.match_paths",
+            path=path,
+            patterns=patterns,
+            cwd=cwd,
+            access=access,
+        ),
+        tuple[PathRef, ...],
+    )
 
 async def capabilities() -> SandboxCapabilities:
     """Return sandbox capabilities available on the host."""
-    raise NotWiredError("omp.policy.capabilities")
+    return _decode(
+        await _request("omp.policy.capabilities"),
+        SandboxCapabilities,
+    )
 
 async def effective_profile(*, session: str | None = None) -> SandboxProfile:
     """Return the composed profile installed for a session."""
-    del session
-    raise NotWiredError("omp.policy.effective_profile")
+    return _decode(
+        await _request("omp.policy.effective_profile", session=session),
+        SandboxProfile,
+    )
 
 async def enforcement(*, session: str | None = None) -> SandboxEnforcement:
     """Return the confinement receipt for a session."""
-    del session
-    raise NotWiredError("omp.policy.enforcement")
+    return _decode(
+        await _request("omp.policy.enforcement", session=session),
+        SandboxEnforcement,
+    )
 
 async def install(profile: SandboxProfile, *, scope: PolicyScope = PolicyScope.SESSION) -> ProfileHandle:
     """Install a scoped profile that can only narrow confinement."""
-    del profile, scope
-    raise NotWiredError("omp.policy.install")
+    if not isinstance(profile, SandboxProfile):
+        raise TypeError("profile must be omp.SandboxProfile")
+    if not isinstance(scope, PolicyScope):
+        raise TypeError("scope must be omp.PolicyScope")
+    response = await _request("omp.policy.install", profile=profile, scope=scope)
+    if not isinstance(response, Mapping):
+        raise TypeError("policy install response must be an object")
+    handle_id = response.get("handle_id")
+    if not isinstance(handle_id, str) or not handle_id:
+        raise TypeError("policy install response must contain handle_id")
+    installed = _decode(response.get("profile", _wire(profile)), SandboxProfile)
+    return ProfileHandle(installed, handle_id)
 
 async def amend(patch: SandboxProfile, *, scope: PolicyScope, reason: str, approval: ApprovalSpec | None = None) -> None:
     """Apply a scoped profile amendment under policy authority."""
-    del patch, scope, reason, approval
-    raise NotWiredError("omp.policy.amend")
+    if not isinstance(patch, SandboxProfile):
+        raise TypeError("patch must be omp.SandboxProfile")
+    if not isinstance(scope, PolicyScope):
+        raise TypeError("scope must be omp.PolicyScope")
+    if not isinstance(reason, str):
+        raise TypeError("reason must be str")
+    if approval is not None and not isinstance(approval, ApprovalSpec):
+        raise TypeError("approval must be omp.ApprovalSpec or None")
+    await _request(
+        "omp.policy.amend",
+        patch=patch,
+        scope=scope,
+        reason=reason,
+        approval=approval,
+    )
 
 def approver(
     name: str,
@@ -770,26 +924,61 @@ def approver(
 
 async def pending() -> tuple[ApprovalTicket, ...]:
     """Return pending approval tickets in filing order."""
-    raise NotWiredError("omp.policy.pending")
+    return _decode(
+        await _request("omp.policy.pending"),
+        tuple[ApprovalTicket, ...],
+    )
 
 
 def tier_of(target: CallTarget) -> Tier:
     """Return the effective approval tier for a logical call target.
 
     Core owns tier resolution because it composes frozen declarations with
-    session configuration. This frozen half rejects values outside the closed
-    ``CallTarget`` union before reaching the not-yet-installed host arm.
+    session configuration. The synchronous API must therefore use a host-installed
+    authoritative snapshot; until that snapshot is present, it fails closed
+    rather than guessing from declarations alone.
     """
     if not isinstance(target, (CoreTool, DeviceCall, McpCall)):
         raise TypeError("tier_of expects an omp.CallTarget")
-    raise NotWiredError("omp.tier_of")
+    if isinstance(target, CoreTool):
+        identity = {"kind": "core", "name": target.name, "rev": target.rev}
+    elif isinstance(target, DeviceCall):
+        identity = {
+            "kind": "device",
+            "name": target.name,
+            "family": target.family,
+            "rev": target.rev,
+        }
+    else:
+        identity = {"kind": "mcp", "server": target.server, "tool": target.tool}
+    from . import _control_backend
+
+    backend = _control_backend.get()
+    resolver = None if backend is None else getattr(backend, "tier_of", None)
+    if resolver is None:
+        raise PolicyError("Core policy authority snapshot is unavailable")
+    try:
+        resolved = resolver(identity)
+    except HostDisconnected as error:
+        raise PolicyError("Core policy authority snapshot is unavailable") from error
+    if resolved is None:
+        raise PolicyError(f"Core policy authority has no tier for {identity!r}")
+    try:
+        return Tier(resolved)
+    except (TypeError, ValueError) as error:
+        raise PolicyError(
+            f"Core policy authority returned invalid tier {resolved!r}"
+        ) from error
 
 
 async def decide(ticket_id: str, decision: ApprovalDecision) -> None:
     """Resolve a ticket; an identical decision after an idempotent re-offer is a no-op."""
 
-    del ticket_id, decision
-    raise NotWiredError("omp.policy.decide")
+    if not isinstance(ticket_id, str) or not ticket_id:
+        raise ValueError("ticket_id must be a non-empty string")
+    if not isinstance(decision, ApprovalDecision):
+        raise TypeError("decision must be omp.ApprovalDecision")
+    await _request("omp.policy.decide", ticket_id=ticket_id, decision=decision)
 
 
 __all__ = (

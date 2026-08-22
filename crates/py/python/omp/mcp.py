@@ -423,6 +423,19 @@ def _transport_payload(transport: McpTransport) -> dict[str, object]:
     }
 
 
+def _json_value(value: object) -> bool:
+    if value is None or type(value) in (str, int, float, bool):
+        return True
+    if isinstance(value, list):
+        return all(_json_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return all(
+            isinstance(key, str) and _json_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
 def _mount_payload(spec: McpMount) -> dict[str, object]:
     return {
         "server": spec.server,
@@ -443,12 +456,20 @@ def _mount_payload(spec: McpMount) -> dict[str, object]:
     }
 
 
-def _mounted_device(server: str, row: Mapping[str, object]) -> Device:
+def _mounted_device(
+    server: str,
+    row: Mapping[str, object],
+    *,
+    precedence: Precedence,
+) -> Device:
     name = _non_empty(row.get("name"), "mcp.mount device name")
     family = _non_empty(row.get("family"), "mcp.mount device family")
     rev = row.get("rev")
+    returned_server = row.get("server")
+    if returned_server is not None and returned_server != server:
+        raise SpecError("mcp.mount returned a device owned by another server")
     definition = row.get("definition")
-    if not isinstance(rev, int) or rev < 0:
+    if isinstance(rev, bool) or not isinstance(rev, int) or not 0 <= rev <= 65535:
         raise SpecError("mcp.mount device revision must be a non-negative integer")
     if not isinstance(definition, Mapping):
         raise SpecError("mcp.mount device definition must be a mapping")
@@ -463,19 +484,52 @@ def _mounted_device(server: str, row: Mapping[str, object]) -> Device:
     async def body(**arguments: object) -> object:
         from . import _control_request
 
-        return await _control_request(
+        if not _json_value(arguments):
+            raise TypeError("MCP tool arguments must be JSON-serializable")
+        result = await _control_request(
             "omp.mcp.invoke",
             server=server,
             tool=original_name,
             arguments=arguments,
         )
+        if not isinstance(result, Mapping):
+            raise SpecError("omp.mcp.invoke returned an invalid result")
+        for field_name in (
+            "is_error",
+            "truncated",
+            "auth_retried",
+            "effects_unknown",
+        ):
+            if not isinstance(result.get(field_name), bool):
+                raise SpecError(
+                    f"omp.mcp.invoke returned an invalid {field_name} flag"
+                )
+        retry_count = result.get("retry_count")
+        if (
+            isinstance(retry_count, bool)
+            or not isinstance(retry_count, int)
+            or retry_count < 0
+        ):
+            raise SpecError("omp.mcp.invoke returned an invalid retry count")
+        dispatch_certainty = result.get("dispatch_certainty")
+        if (
+            isinstance(dispatch_certainty, bool)
+            or not isinstance(dispatch_certainty, int)
+            or dispatch_certainty not in range(4)
+        ):
+            raise SpecError(
+                "omp.mcp.invoke returned an invalid dispatch certainty"
+            )
+        if not _json_value(result):
+            raise SpecError("omp.mcp.invoke returned a non-JSON result")
+        return result
 
     device = Device(
         name=name,
         family=family,
         rev=rev,
         place=Place.ENV,
-        precedence=int(Precedence.DEFAULT),
+        precedence=int(precedence),
         replaces=None,
         schema=schema,
         docs=documentation,
@@ -496,9 +550,20 @@ async def mount(spec: McpMount) -> tuple[Device, ...]:
     from . import _control_request
 
     result = await _control_request("omp.mcp.mount", spec=_mount_payload(spec))
-    if not isinstance(result, Mapping) or not isinstance(result.get("devices"), Sequence):
+    if (
+        not isinstance(result, Mapping)
+        or isinstance(result.get("devices"), (str, bytes))
+        or not isinstance(result.get("devices"), Sequence)
+    ):
         raise SpecError("omp.mcp.mount returned an invalid device catalog")
-    return tuple(_mounted_device(spec.server, row) for row in result["devices"])
+    devices: list[Device] = []
+    for row in result["devices"]:
+        if not isinstance(row, Mapping):
+            raise SpecError("omp.mcp.mount returned an invalid device row")
+        devices.append(
+            _mounted_device(spec.server, row, precedence=spec.precedence)
+        )
+    return tuple(devices)
 
 
 async def unmount(server: str) -> None:
@@ -507,7 +572,12 @@ async def unmount(server: str) -> None:
     server = _server_name(server, "mcp.unmount server")
     from . import _control_request
 
-    await _control_request("omp.mcp.unmount", server=server)
+    result = await _control_request("omp.mcp.unmount", server=server)
+    if (
+        not isinstance(result, Mapping)
+        or not isinstance(result.get("removed"), bool)
+    ):
+        raise SpecError("omp.mcp.unmount returned an invalid lifecycle result")
 
 
 async def servers() -> tuple[McpServer, ...]:
@@ -516,7 +586,11 @@ async def servers() -> tuple[McpServer, ...]:
     from . import _control_request
 
     result = await _control_request("omp.mcp.servers")
-    if not isinstance(result, Mapping) or not isinstance(result.get("servers"), Sequence):
+    if (
+        not isinstance(result, Mapping)
+        or isinstance(result.get("servers"), (str, bytes))
+        or not isinstance(result.get("servers"), Sequence)
+    ):
         raise SpecError("omp.mcp.servers returned an invalid inventory")
     states = {
         0: McpServerState.DISCONNECTED,
@@ -525,6 +599,11 @@ async def servers() -> tuple[McpServer, ...]:
         3: McpServerState.CONNECTED,
         4: McpServerState.RECONNECTING,
         5: McpServerState.FAILED,
+        "disconnected": McpServerState.DISCONNECTED,
+        "connecting": McpServerState.CONNECTING,
+        "connected": McpServerState.CONNECTED,
+        "reconnecting": McpServerState.RECONNECTING,
+        "failed": McpServerState.FAILED,
     }
     inventory: list[McpServer] = []
     for row in result["servers"]:
@@ -533,11 +612,41 @@ async def servers() -> tuple[McpServer, ...]:
         raw_state = row.get("state")
         if raw_state not in states:
             raise SpecError("omp.mcp.servers returned an unknown lifecycle state")
+        resource_rows = row.get("resources", ())
+        if isinstance(resource_rows, (str, bytes)) or not isinstance(
+            resource_rows, Sequence
+        ):
+            raise SpecError("omp.mcp.servers returned invalid resources")
+        resources: list[McpResource] = []
+        for resource in resource_rows:
+            if not isinstance(resource, Mapping):
+                raise SpecError("omp.mcp.servers returned an invalid resource")
+            resources.append(
+                McpResource(
+                    uri=resource.get("uri"),
+                    name=resource.get("name"),
+                    media_type=resource.get("media_type"),
+                    template=resource.get("template", False),
+                )
+            )
+        endpoints = row.get("endpoints", ())
+        prompts = row.get("prompts", ())
+        if (
+            isinstance(endpoints, (str, bytes))
+            or not isinstance(endpoints, Sequence)
+            or isinstance(prompts, (str, bytes))
+            or not isinstance(prompts, Sequence)
+        ):
+            raise SpecError("omp.mcp.servers returned invalid endpoint metadata")
         inventory.append(
             McpServer(
                 name=row.get("name"),
                 state=states[raw_state],
-                endpoints=tuple(row.get("endpoints", ())),
+                protocol_version=row.get("protocol_version"),
+                instructions=row.get("instructions"),
+                endpoints=tuple(endpoints),
+                resources=tuple(resources),
+                prompts=tuple(prompts),
                 last_error=row.get("last_error"),
             )
         )

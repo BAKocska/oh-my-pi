@@ -15,13 +15,15 @@ call form one host transition, one catalog notification, and one journal item.
 ``enable`` and ``disable`` are convenience batch constructors over that same
 operation.  Thus dynamic MCP leaves use the ordinary ``omp.devices`` mounted
 set rather than maintaining a second registry or re-registering on reconnect.
-The Part 2 host arm is not present in this freeze half, so mutating post-FREEZE
-methods raise :class:`omp.NotWiredError` at CALL time. Catalog listing remains
-a synchronous read over frozen declarations and any installed host view.
+Runtime mutations ride the common CONTROL bridge.  The host validates them
+against the frozen manifest and returns its authoritative catalog projection;
+Python never maintains a competing device registry.
 """
 from __future__ import annotations
 
 import contextvars
+import inspect
+import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
@@ -282,6 +284,8 @@ _catalog_view: contextvars.ContextVar[tuple[DeviceInfo, ...] | None] = (
     contextvars.ContextVar("omp_device_catalog_view", default=None)
 )
 
+_dynamic_bodies: dict[str, Callable[..., Any]] = {}
+
 
 def _install_catalog_view(rows: Iterable[DeviceInfo] | None) -> None:
     """Install the host's immutable device-catalog view for this invocation."""
@@ -292,6 +296,177 @@ def _install_catalog_view(rows: Iterable[DeviceInfo] | None) -> None:
     if any(not isinstance(row, DeviceInfo) for row in frozen):
         raise TypeError("device catalog rows must be DeviceInfo values")
     _catalog_view.set(frozen)
+
+
+def _json_value(value: object, field: str) -> object:
+    """Copy one value through JSON so CONTROL never sees Python-only objects."""
+    try:
+        return json.loads(
+            json.dumps(value, separators=(",", ":"), allow_nan=False)
+        )
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{field} must contain only JSON-serializable values") from error
+
+
+def _path_from_wire(value: object) -> ToolPath:
+    if not isinstance(value, str) or not value:
+        raise DeviceError("device catalog path must be a non-empty string")
+    path, marker, claimant = value.partition("@")
+    root, separator, subpath = path.partition("/")
+    return ToolPath(
+        root,
+        subpath if separator else None,
+        claimant if marker else None,
+    )
+
+
+def _effects_from_wire(value: object) -> Effects | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise DeviceError("device catalog effects must be a mapping or None")
+    documents = value.get("documents")
+    execution = value.get("exec")
+    inference = value.get("inference")
+    if documents is not None and not isinstance(documents, Mapping):
+        raise DeviceError("device catalog document effects must be a mapping")
+    if execution is not None and not isinstance(execution, Mapping):
+        raise DeviceError("device catalog exec effects must be a mapping")
+    if inference is not None and not isinstance(inference, Mapping):
+        raise DeviceError("device catalog inference effects must be a mapping")
+    return Effects(
+        documents=DocEffects(
+            read=bool(documents.get("read", False)),
+            write_globs=tuple(documents.get("write_globs", ())),
+        ) if documents is not None else None,
+        exec=ExecEffects(
+            commands=tuple(execution.get("commands", ())),
+            network=bool(execution.get("network", False)),
+        ) if execution is not None else None,
+        inference=InferenceEffects(
+            max_requests=int(inference.get("max_requests", 0)),
+            max_usd=float(inference.get("max_usd", 0.0)),
+        ) if inference is not None else None,
+        subagents=int(value.get("subagents", 0)),
+    )
+
+
+def _catalog_row_from_wire(value: object) -> DeviceInfo:
+    if not isinstance(value, Mapping):
+        raise DeviceError("device catalog rows must be mappings")
+    provenance = value.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise DeviceError("device catalog provenance must be a mapping")
+
+    def string(row: Mapping[object, object], key: str) -> str:
+        item = row.get(key)
+        if not isinstance(item, str):
+            raise TypeError(f"device catalog {key} must be str")
+        return item
+
+    def integer(row: Mapping[object, object], key: str) -> int:
+        item = row.get(key)
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise TypeError(f"device catalog {key} must be int")
+        return item
+
+    def boolean(key: str) -> bool:
+        item = value.get(key)
+        if not isinstance(item, bool):
+            raise TypeError(f"device catalog {key} must be bool")
+        return item
+
+    def optional_string(key: str) -> str | None:
+        item = value.get(key)
+        if item is not None and not isinstance(item, str):
+            raise TypeError(f"device catalog {key} must be str or None")
+        return item
+
+    try:
+        return DeviceInfo(
+            name=string(value, "name"),
+            family=string(value, "family"),
+            rev=integer(value, "rev"),
+            identity=string(value, "identity"),
+            claimant=string(value, "claimant"),
+            path=_path_from_wire(value["path"]),
+            summary=optional_string("summary"),
+            place=Place.parse(value["place"]),
+            precedence=integer(value, "precedence"),
+            tier=Tier(value["tier"]),
+            effects=_effects_from_wire(value.get("effects")),
+            mounted=boolean("mounted"),
+            enabled=boolean("enabled"),
+            available=boolean("available"),
+            reason=optional_string("reason"),
+            shadowed_by=optional_string("shadowed_by"),
+            source=string(value, "source"),
+            provenance=Provenance(
+                publisher=string(provenance, "publisher"),
+                extension_id=string(provenance, "extension_id"),
+                version=string(provenance, "version"),
+                artifact_digest=string(provenance, "artifact_digest"),
+                layer=string(provenance, "layer"),
+                tier=string(provenance, "tier"),
+                generation=integer(provenance, "generation"),
+            ),
+            slotted=boolean("slotted"),
+            schema_bytes=integer(value, "schema_bytes"),
+            schema_tokens=integer(value, "schema_tokens"),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise DeviceError("omp.devices returned an invalid catalog row") from error
+
+
+def _accept_catalog_response(
+    response: object,
+    *,
+    operation: str,
+) -> tuple[DeviceInfo, ...]:
+    if not isinstance(response, Mapping):
+        raise DeviceError(f"{operation} returned an invalid response")
+    catalog = response.get("catalog")
+    if (
+        not isinstance(catalog, Iterable)
+        or isinstance(catalog, (str, bytes, Mapping))
+    ):
+        raise DeviceError(f"{operation} returned no authoritative catalog")
+    rows = tuple(_catalog_row_from_wire(row) for row in catalog)
+    _install_catalog_view(rows)
+    return rows
+
+
+async def _dispatch_device(
+    path: str,
+    args: Mapping[str, object],
+    *,
+    family: str | None = None,
+    rev: int | None = None,
+) -> object:
+    """Run one host-placed body selected by the authoritative router."""
+    if not isinstance(path, str) or not path:
+        raise DeviceUnavailable("dynamic device callback omitted its path")
+    if not isinstance(args, Mapping):
+        raise SchemaError("dynamic device callback args must be a mapping")
+    body = _dynamic_bodies.get(path)
+    if body is None:
+        candidates = tuple(
+            definition.body
+            for definition in registry.snapshot().device_definitions
+            if definition.name == path
+            and (family is None or definition.family == family)
+            and (rev is None or definition.rev == rev)
+        )
+        if len(candidates) != 1:
+            raise DeviceUnavailable(
+                f"authoritative catalog selected unknown or ambiguous "
+                f"host device {path!r}"
+            )
+        body = candidates[0]
+    result = body(**dict(args))
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def _declared_rows() -> tuple[DeviceInfo, ...]:
@@ -551,9 +726,14 @@ class MountSpec:
             raise TypeError("dynamic device body must be callable")
         if not isinstance(self.schema, Mapping):
             raise TypeError("dynamic device schema must be a mapping")
-        object.__setattr__(self, "schema", MappingProxyType(dict(self.schema)))
+        schema = _json_value(dict(self.schema), "dynamic device schema")
+        if not isinstance(schema, dict):
+            raise TypeError("dynamic device schema must encode as a JSON object")
+        object.__setattr__(self, "schema", MappingProxyType(schema))
         if not isinstance(self.summary, str):
             raise TypeError("dynamic device summary must be a string")
+        if self.docs is not None and not isinstance(self.docs, str):
+            raise TypeError("dynamic device docs must be a string or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +749,8 @@ class AvailabilityDelta:
             raise ValueError("availability path must be a non-empty string")
         if not isinstance(self.mounted, bool):
             raise TypeError("availability mounted must be bool")
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise TypeError("availability reason must be a string or None")
         if self.mounted and self.reason is not None:
             raise ValueError("an available device cannot carry an unavailable reason")
 
@@ -587,17 +769,71 @@ class DynamicDeviceParent:
         return f"{self.name}/{_subpath(subpath)}"
 
     async def mount_many(self, *specs: MountSpec) -> tuple[str, ...]:
-        """Mount discovered leaves in one runtime request.
+        """Atomically mount discovered leaves beneath this frozen parent."""
+        from . import _control_backend, _control_request
 
-        The Part 2 host arm owns atomic validation and dispatch installation.
-        """
-        del specs
-        raise NotWiredError("omp.devices.dynamic_mount")
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.devices.dynamic_mount")
+        if any(not isinstance(spec, MountSpec) for spec in specs):
+            raise TypeError("mount_many expects only omp.MountSpec values")
+        paths = tuple(self.path(spec.subpath) for spec in specs)
+        if len(set(paths)) != len(paths):
+            raise DeviceError("dynamic mount contains duplicate paths")
+        if any(path in _dynamic_bodies for path in paths):
+            raise DeviceError("dynamic device path is already mounted")
+
+        staged = {
+            path: spec.body
+            for path, spec in zip(paths, specs, strict=True)
+        }
+        _dynamic_bodies.update(staged)
+        try:
+            response = await _control_request(
+                "omp.devices.dynamic_mount",
+                parent={
+                    "name": self.name,
+                    "family": self.family,
+                    "rev": self.rev,
+                    "place": self.place,
+                },
+                specs=[
+                    {
+                        "path": path,
+                        "subpath": spec.subpath,
+                        "schema": dict(spec.schema),
+                        "summary": spec.summary,
+                        "docs": spec.docs,
+                    }
+                    for path, spec in zip(paths, specs, strict=True)
+                ],
+            )
+            if not isinstance(response, Mapping):
+                raise DeviceError(
+                    "omp.devices.dynamic_mount returned an invalid response"
+                )
+            returned = response.get("paths")
+            if (
+                not isinstance(returned, Iterable)
+                or isinstance(returned, (str, bytes, Mapping))
+                or tuple(returned) != paths
+            ):
+                raise DeviceError(
+                    "omp.devices.dynamic_mount returned mismatched paths"
+                )
+            _accept_catalog_response(
+                response, operation="omp.devices.dynamic_mount"
+            )
+        except BaseException:
+            for path, body in staged.items():
+                if _dynamic_bodies.get(path) is body:
+                    _dynamic_bodies.pop(path, None)
+            raise
+        return paths
 
     async def mount(self, spec: MountSpec) -> str:
         """Mount one discovered leaf through the same runtime operation."""
-        del spec
-        raise NotWiredError("omp.devices.dynamic_mount")
+        mounted, = await self.mount_many(spec)
+        return mounted
 
 
 class Devices:
@@ -618,28 +854,63 @@ class Devices:
         place: str = "host",
     ) -> DynamicDeviceParent:
         """Declare a manifest-backed dynamic parent during IMPORT."""
-        parent = DynamicDeviceParent(_segment(name), family, rev, place)
+        try:
+            parsed_place = Place.parse(place)
+        except (TypeError, ValueError) as error:
+            raise DeviceError(str(error)) from error
+        if not isinstance(family, str):
+            raise TypeError("dynamic device family must be a string")
+        if not isinstance(rev, int) or isinstance(rev, bool):
+            raise TypeError("dynamic device rev must be int")
+        parent = DynamicDeviceParent(
+            _segment(name), family, rev, str(parsed_place)
+        )
         registry.register_tool(parent.name, parent.family, parent.rev, parent)
         return parent
 
     async def set_availability(self, *deltas: AvailabilityDelta) -> None:
         """Apply one atomic mounted-set transition for all supplied deltas."""
-        del deltas
-        raise NotWiredError("omp.devices.set_availability")
+        from . import _control_backend, _control_request
+
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.devices.set_availability")
+        if any(not isinstance(delta, AvailabilityDelta) for delta in deltas):
+            raise TypeError("set_availability expects omp.AvailabilityDelta values")
+        response = await _control_request(
+            "omp.devices.set_availability",
+            deltas=[
+                {
+                    "path": delta.path,
+                    "mounted": delta.mounted,
+                    "reason": delta.reason,
+                }
+                for delta in deltas
+            ],
+        )
+        _accept_catalog_response(
+            response, operation="omp.devices.set_availability"
+        )
 
     async def enable(self, *paths: str) -> None:
         """Enable paths as one availability transition."""
-        del paths
-        raise NotWiredError("omp.devices.set_availability")
+        await self.set_availability(
+            *(AvailabilityDelta(path, True) for path in paths)
+        )
 
     async def disable(self, *paths: str, reason: str | None = None) -> None:
         """Disable paths as one availability transition with one reason."""
-        del paths, reason
-        raise NotWiredError("omp.devices.set_availability")
+        await self.set_availability(
+            *(AvailabilityDelta(path, False, reason) for path in paths)
+        )
 
-    async def refresh(self) -> tuple[object, ...]:
+    async def refresh(self) -> tuple[DeviceInfo, ...]:
         """Recompute ordinary availability predicates as one transition."""
-        raise NotWiredError("omp.devices.refresh")
+        from . import _control_backend, _control_request
+
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.devices.refresh")
+        response = await _control_request("omp.devices.refresh")
+        return _accept_catalog_response(response, operation="omp.devices.refresh")
 
     async def invoke(
         self,
@@ -659,11 +930,18 @@ class Devices:
 
         if _control_backend.get() is None:
             raise NotWiredError("omp.devices.invoke")
+        if not isinstance(path, str) or not path:
+            raise ValueError("device invocation path must be a non-empty string")
+        if not isinstance(args, Mapping):
+            raise TypeError("device invocation args must be a mapping")
+        if deadline is not None and not isinstance(deadline, Duration):
+            raise TypeError("device invocation deadline must be omp.Duration or None")
+        encoded_args = _json_value(dict(args), "device invocation args")
         return await _control_request(
             "omp.devices.invoke",
             path=path,
-            args=args,
-            deadline=deadline,
+            args=encoded_args,
+            deadline=str(deadline) if deadline is not None else None,
         )
 
     def list(self, *, mounted_only: bool = True) -> tuple[DeviceInfo, ...]:

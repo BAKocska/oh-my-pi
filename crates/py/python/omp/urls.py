@@ -8,7 +8,14 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 
-from _omp import AgentUrl, ArtifactUrl, EnvPath, HistoryUrl, OmpError
+from _omp import (
+    AgentUrl,
+    ArtifactUrl,
+    EnvPath,
+    HistoryUrl,
+    HostDisconnected,
+    OmpError,
+)
 from _omp_url_vocab import (
     SCHEMES as _SCHEMES,
     SELECTOR_GRAMMAR,
@@ -327,17 +334,39 @@ async def read(
     url: str | Url | TypedUrl,
     selector: str | None = None,
 ) -> str:
-    """Read a URL through the package's existing host resolver."""
+    """Read a URL through the authoritative host resolver."""
 
-    from . import _read_url
+    from . import _control_request
 
-    target = url.text if isinstance(url, Url) else str(url)
+    parsed = url if isinstance(url, Url) else parse(url)
+    capabilities = schemes()
+    if not capabilities:
+        raise HostDisconnected("no URL capability snapshot is installed")
+    info = capabilities.get(parsed.scheme)
+    if info is None or not info.readable:
+        raise SchemeNotReadable(
+            f"scheme {parsed.scheme.value!r} is not readable in this deployment"
+        )
+    if parsed.selector is not None and not info.selectors:
+        raise SelectorError(
+            f"scheme {parsed.scheme.value!r} does not support read selectors"
+        )
+
+    target = parsed.text
     if selector is not None:
-        parsed_selector = parse_selector(selector)
-        if parsed_selector is None:
-            raise SelectorError("selector must not be empty")
+        if parsed.selector is not None:
+            raise SelectorError("URL already contains a read selector")
+        parse_selector(selector)
+        if not info.selectors:
+            raise SelectorError(
+                f"scheme {parsed.scheme.value!r} does not support read selectors"
+            )
         target = f"{target}:{selector}"
-    return await _read_url(target)
+
+    result = await _control_request("omp.urls.read", url=target)
+    if not isinstance(result, str):
+        raise UrlError("host URL resolver returned a non-string result")
+    return result
 
 
 def _invalid_selector(text: str) -> str:

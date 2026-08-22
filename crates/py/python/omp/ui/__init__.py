@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 import asyncio as _asyncio
 import inspect as _inspect
+import warnings as _warnings
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
 from string import Formatter
@@ -606,10 +607,12 @@ class _RendererRegistration:
 _handles: dict[str, "SlotHandle"] = {}
 _message_renderers: dict[str, Callable[[MessageView, RenderCtx], Tml | None]] = {}
 _completion_handlers: dict[str, Callable[..., object]] = {}
+_completion_triggers: dict[str, Trigger] = {}
 _shortcut_handlers: dict[str, Callable[..., object]] = {}
 _device_renderers: dict[tuple[str, str, int], _RendererRegistration] = {}
 _fold_failures: set[tuple[str, str]] = set()
 _command_handlers: dict[str, Callable[..., object]] = {}
+_command_completers: dict[str, Callable[..., object]] = {}
 _activation_handlers: dict[str, Callable[..., object]] = {}
 
 
@@ -635,34 +638,87 @@ def _wire(value: object) -> object:
 def _emit(kind: str, **body: object) -> None:
     sink = _effect_sink.get()
     if sink is None:
+        from .. import _control_backend
+
+        if _control_backend.get() is not None:
+            _warnings.warn(
+                f"configured CONTROL host has no UI effect sink; dropped {kind!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return
     try:
         sink({"kind": kind, "body": _wire(body)})
     except Exception:
         # Effects are explicitly fail-open: a dead renderer never breaks a turn.
+        _warnings.warn(
+            f"UI effect sink failed; dropped {kind!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return
 
 
 class OverlayHandle:
     """Async owner handle for one retained overlay."""
-    __slots__ = ("id", "_hidden")
-    def __init__(self, overlay_id: str) -> None: self.id, self._hidden = overlay_id, False
-    def set(self, content: Tml) -> None: _emit("overlay_set", id=self.id, content=content)
-    def patch(self, id: str, *, text: Tml | str | None = None, **props: object) -> None: _emit("overlay_patch", overlay=self.id, id=id, text=text, props=props)
+
+    __slots__ = ("id", "_closed", "_hidden")
+
+    def __init__(self, overlay_id: str) -> None:
+        self.id, self._closed, self._hidden = overlay_id, False, False
+
+    def set(self, content: Tml) -> None:
+        if not self._closed:
+            _emit("overlay_set", id=self.id, content=content)
+
+    def patch(
+        self, id: str, *, text: Tml | str | None = None, **props: object
+    ) -> None:
+        if not self._closed:
+            _emit("overlay_patch", overlay=self.id, id=id, text=text, props=props)
+
     @property
-    def hidden(self) -> bool: return self._hidden
+    def hidden(self) -> bool:
+        return self._hidden
+
     @hidden.setter
-    def hidden(self, value: bool) -> None: self._hidden = bool(value); _emit("overlay_hidden", id=self.id, hidden=self._hidden)
-    def focus(self) -> None: _emit("overlay_focus", id=self.id)
-    def blur(self) -> None: _emit("overlay_blur", id=self.id)
+    def hidden(self, value: bool) -> None:
+        if not self._closed:
+            self._hidden = bool(value)
+            _emit("overlay_hidden", id=self.id, hidden=self._hidden)
+
+    def focus(self) -> None:
+        if not self._closed:
+            _emit("overlay_focus", id=self.id)
+
+    def blur(self) -> None:
+        if not self._closed:
+            _emit("overlay_blur", id=self.id)
+
     async def values(self) -> dict[str, object]:
+        if self._closed:
+            return {}
         result = await _request("overlay_values", id=self.id)
         return result if isinstance(result, dict) else {}
-    async def close(self) -> None: await _request("overlay_close", id=self.id)
-    async def wait(self) -> DialogOutcome: return await _dialog("overlay_wait", id=self.id)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await _request("overlay_close", id=self.id)
+
+    async def wait(self) -> DialogOutcome:
+        if self._closed:
+            return _unavailable()
+        outcome = await _dialog("overlay_wait", id=self.id)
+        self._closed = True
+        return outcome
+
     async def events(self) -> _AsyncIterator[OverlayEvent]:
         """Yield only the watched and terminal interactions fed by the host."""
 
+        if self._closed:
+            return
         source = await _request("overlay_events", id=self.id)
         if hasattr(source, "__aiter__"):
             async for event in source:
@@ -672,8 +728,12 @@ class OverlayHandle:
         ):
             for event in source:
                 yield _overlay_event(event)
-    async def __aenter__(self) -> "OverlayHandle": return self
-    async def __aexit__(self, *_: object) -> None: await self.close()
+
+    async def __aenter__(self) -> "OverlayHandle":
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
 
 
 class SlotHandle:
@@ -769,6 +829,12 @@ def _install_terminal_input(
 def _feed_terminal_input(frame: TerminalInputFrame) -> bool:
     """Deliver one host-validated frame without blocking the terminal reader."""
 
+    if isinstance(frame, Mapping):
+        frame = TerminalInputFrame(
+            sequence=int(frame["sequence"]),
+            data=bytes(frame["data"]),
+            focus_token=str(frame["focus_token"]),
+        )
     binding = _terminal_input_binding.get()
     if (
         binding is None
@@ -845,7 +911,16 @@ def _unavailable() -> DialogOutcome:
 async def presentation() -> Presentation:
     """Return current presentation facts, or a no-UI value when unavailable."""
     result = await _request("presentation")
-    return Presentation(**result) if isinstance(result, dict) else Presentation()
+    if not isinstance(result, Mapping):
+        return Presentation()
+    body = dict(result)
+    try:
+        body["charset"] = Charset(body.get("charset", Charset.UNICODE))
+        body["appearance"] = Appearance(body.get("appearance", Appearance.DARK))
+        body["graphics"] = Graphics(body.get("graphics", Graphics.CELLS))
+        return Presentation(**body)
+    except (TypeError, ValueError):
+        return Presentation()
 
 
 async def icons(prefix: str = "") -> tuple[str, ...]:
@@ -862,13 +937,28 @@ async def editor_text() -> str:
 
 async def _dialog(kind: str, **body: object) -> DialogOutcome:
     result = await _request(kind, **body)
-    if not isinstance(result, dict):
+    if not isinstance(result, Mapping):
         return _unavailable()
+    decoded = dict(result)
     try:
-        if "reason" in result and result["reason"] is not None:
-            result["reason"] = DialogCancel(result["reason"])
-        return DialogOutcome(**result)
-    except (TypeError, ValueError):
+        if decoded.get("reason") is not None:
+            decoded["reason"] = DialogCancel(decoded["reason"])
+        decoded["values"] = tuple(decoded.get("values", ()))
+        decoded["fields"] = dict(decoded.get("fields", {}))
+        decoded["answers"] = tuple(
+            answer
+            if isinstance(answer, AskAnswer)
+            else AskAnswer(
+                question_id=str(answer["question_id"]),
+                selected=tuple(answer.get("selected", ())),
+                freeform=answer.get("freeform"),
+                note=answer.get("note"),
+                timed_out=bool(answer.get("timed_out", False)),
+            )
+            for answer in decoded.get("answers", ())
+        )
+        return DialogOutcome(**decoded)
+    except (KeyError, TypeError, ValueError):
         return _unavailable()
 
 
@@ -943,10 +1033,68 @@ def renderer(
 
 def _dispatch_renderer(name: str, family: str, rev: int, view: object, ctx: RenderCtx) -> Tml | None:
     """Run one exact device fold; failures select the native fallback."""
+    if isinstance(ctx, Mapping):
+        body = dict(ctx)
+        body["charset"] = Charset(body["charset"])
+        body["appearance"] = Appearance(body["appearance"])
+        body["graphics"] = Graphics(body["graphics"])
+        body["place"] = RenderPlace(body["place"])
+        ctx = RenderCtx(**body)
     registration = _device_renderers.get((name, family, rev))
     if registration is None:
         return None
     try:
+        if isinstance(view, Mapping):
+            from _omp import Duration, InvocationPhase
+            from .._verdicts import (
+                Faulted,
+                Ok,
+                Rev,
+                ToolIdentity,
+                View,
+                dumps,
+                loads,
+            )
+
+            definition = _declarations.device_definition(name, family, rev)
+            device = definition.body
+            body = dict(view)
+
+            def decode(shape_name: str, value: object) -> object:
+                shape = getattr(device, shape_name, None)
+                if not isinstance(shape, type) or isinstance(value, shape):
+                    return value
+                return loads(dumps(value), shape)
+
+            verdict = body.get("verdict")
+            if isinstance(verdict, Mapping):
+                verdict_body = dict(verdict)
+                arm = verdict_body.get("kind")
+                if arm in ("ok", "payload") or "payload" in verdict_body:
+                    raw = verdict_body.get("value", verdict_body.get("payload"))
+                    verdict = Ok(decode("Payload", raw))
+                elif arm in ("fault", "faulted") or "fault" in verdict_body:
+                    raw = verdict_body.get("value", verdict_body.get("fault"))
+                    verdict = Faulted(decode("Fault", raw))
+            updates = tuple(
+                decode("Update", update) for update in body.get("updates", ())
+            )
+            elapsed = body.get("elapsed", "0s")
+            if not isinstance(elapsed, Duration):
+                elapsed = Duration(str(elapsed))
+            phase = body.get("phase", "OPEN")
+            if not isinstance(phase, InvocationPhase):
+                phase = getattr(InvocationPhase, str(phase).upper())
+            view = View(
+                identity=ToolIdentity(name, Rev(family, rev)),
+                call_id=str(body.get("call_id", "")),
+                updates=updates,
+                state=body.get("state"),
+                verdict=verdict,
+                elapsed=elapsed,
+                phase=phase,
+                presentation=dict(body.get("presentation", {})),
+            )
         value = registration.function(view, ctx)
         if value is not None and not isinstance(value, Tml):
             raise TypeError("renderer folds must return Tml or None")
@@ -958,6 +1106,15 @@ def _dispatch_renderer(name: str, family: str, rev: int, view: object, ctx: Rend
 
 def _dispatch_message_renderer(kind: str, message: MessageView, ctx: RenderCtx) -> Tml | None:
     """Run one deadline-owned message fold; ``None`` selects native rendering."""
+    if isinstance(message, Mapping):
+        message = MessageView(**dict(message))
+    if isinstance(ctx, Mapping):
+        body = dict(ctx)
+        body["charset"] = Charset(body["charset"])
+        body["appearance"] = Appearance(body["appearance"])
+        body["graphics"] = Graphics(body["graphics"])
+        body["place"] = RenderPlace(body["place"])
+        ctx = RenderCtx(**body)
     function = _message_renderers.get(kind)
     if function is None:
         return None
@@ -972,9 +1129,14 @@ def _dispatch_message_renderer(kind: str, message: MessageView, ctx: RenderCtx) 
 
 def completion(trigger: Trigger) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Register one asynchronous completion fold by static trigger prefix."""
+    if not isinstance(trigger, Trigger):
+        raise TypeError("completion trigger must be Trigger")
     def decorate(function: Callable[..., object]) -> Callable[..., object]:
+        if not callable(function):
+            raise TypeError("completion providers must be callable")
         _declarations.register_ui("completion", trigger.prefix, function)
         _completion_handlers[trigger.prefix] = function
+        _completion_triggers[trigger.prefix] = trigger
         return function
     return decorate
 
@@ -994,11 +1156,49 @@ def on_activate(prefix: str) -> Callable[[Callable[..., object]], Callable[..., 
     return decorate
 
 
+def _completion_item(value: object) -> CompletionItem:
+    if isinstance(value, CompletionItem):
+        return value
+    if isinstance(value, Mapping):
+        return CompletionItem(**dict(value))
+    raise TypeError("completion providers must return CompletionItem values")
+
+
+
+async def _dispatch_completion(
+    trigger: str, query: str, ctx: object
+) -> tuple[CompletionItem, ...]:
+    """Run one deadline-owned completion fold, failing open to no candidates."""
+
+    function = _completion_handlers.get(trigger)
+    declaration = _completion_triggers.get(trigger)
+    if function is None or declaration is None:
+        return ()
+    try:
+        result = function(query, ctx)
+        if _inspect.isawaitable(result):
+            result = await result
+        if result is None:
+            return ()
+        if isinstance(result, (str, bytes, bytearray, Mapping)):
+            raise TypeError("completion providers must return an iterable of CompletionItem")
+        return tuple(
+            _completion_item(item)
+            for item in tuple(result)[: declaration.max_results]
+        )
+    except Exception:
+        _fold_failures.add((trigger, "completion"))
+        return ()
+
 async def _dispatch_activation(
     activation: Activation, ctx: object
 ) -> None:
     """Dispatch one host-originated transcript activation to its closest prefix."""
 
+    if isinstance(activation, Mapping):
+        body = dict(activation)
+        body["source"] = ActivationSource(body["source"])
+        activation = Activation(**body)
     if not isinstance(activation, Activation):
         raise TypeError("activation dispatch requires Activation")
     matches = (
@@ -1051,7 +1251,20 @@ async def dynamic_mount(*specs: CommandMountSpec) -> tuple[str, ...]:
 
     if _control_backend.get() is None:
         raise NotWiredError("omp.ui.dynamic_mount")
-    mounted = await _control_request("omp.ui.dynamic_mount", commands=specs)
+    mounted = await _control_request(
+        "omp.ui.dynamic_mount",
+        commands=[
+            {
+                "name": spec.name,
+                "aliases": list(spec.aliases),
+                "description": spec.description,
+                "args": _wire(spec.args),
+                "hint": spec.hint,
+                "dynamic_completions": spec.arg_completions is not None,
+            }
+            for spec in specs
+        ],
+    )
     if (
         not isinstance(mounted, (tuple, list))
         or len(mounted) != len(specs)
@@ -1060,7 +1273,78 @@ async def dynamic_mount(*specs: CommandMountSpec) -> tuple[str, ...]:
         raise TypeError("omp.ui.dynamic_mount returned invalid command names")
     for spec in specs:
         _command_handlers[spec.name] = spec.handler
+        if spec.arg_completions is not None:
+            _command_completers[spec.name] = spec.arg_completions
     return tuple(mounted)
+
+async def _dispatch_shortcut(action: Action | Mapping[str, object], ctx: object) -> None:
+    """Deliver one host-matched shortcut action to its exact registered callback."""
+
+    if isinstance(action, Mapping):
+        body = dict(action)
+        body["phase"] = Phase(body["phase"])
+        action = Action(**body)
+    if not isinstance(action, Action):
+        raise TypeError("shortcut dispatch requires Action")
+    function = _shortcut_handlers.get(action.action_id)
+    if function is None:
+        return
+    result = function(action, ctx)
+    if _inspect.isawaitable(result):
+        await result
+
+
+
+async def _dispatch_command(
+    invocation: Invocation | Mapping[str, object], ctx: object
+) -> CommandResult | None:
+    """Deliver one slash-command invocation and validate its closed result vocabulary."""
+
+    if isinstance(invocation, Mapping):
+        body = dict(invocation)
+        body["argv"] = tuple(body.get("argv", ()))
+        body["mode"] = InvocationMode(body["mode"])
+        invocation = Invocation(**body)
+    if not isinstance(invocation, Invocation):
+        raise TypeError("command dispatch requires Invocation")
+    function = _command_handlers.get(invocation.name)
+    if function is None:
+        raise CommandDenied(f"unknown command {invocation.name!r}")
+    result = function(invocation, ctx)
+    if _inspect.isawaitable(result):
+        result = await result
+    if result is not None and not isinstance(result, (Consumed, Prompt)):
+        raise TypeError("command handlers must return Consumed, Prompt, or None")
+    return result
+
+
+
+async def _dispatch_command_completion(
+    name: str, query: ArgQuery | Mapping[str, object], ctx: object
+) -> tuple[CompletionItem, ...]:
+    """Run one command argument-completion fold, failing open to static arguments."""
+
+    if isinstance(query, Mapping):
+        body = dict(query)
+        body["argv"] = tuple(body.get("argv", ()))
+        query = ArgQuery(**body)
+    if not isinstance(query, ArgQuery):
+        raise TypeError("command completion dispatch requires ArgQuery")
+    function = _command_completers.get(name)
+    if function is None:
+        return ()
+    try:
+        result = function(query, ctx)
+        if _inspect.isawaitable(result):
+            result = await result
+        if result is None:
+            return ()
+        if isinstance(result, (str, bytes, bytearray, Mapping)):
+            raise TypeError("command completers must return CompletionItem values")
+        return tuple(_completion_item(item) for item in result)
+    except Exception:
+        _fold_failures.add((name, "command_completion"))
+        return ()
 
 
 def command(name: str, *, aliases: Sequence[str] = (), description: str = "", args: Sequence[Arg] = (), hint: str | None = None, arg_completions: Callable[..., object] | None = None) -> Callable[[Callable[..., object]], Callable[..., object]]:
@@ -1080,6 +1364,8 @@ def command(name: str, *, aliases: Sequence[str] = (), description: str = "", ar
             function,
         )
         _command_handlers[name] = function
+        if arg_completions is not None:
+            _command_completers[name] = arg_completions
         return function
     return decorate
 

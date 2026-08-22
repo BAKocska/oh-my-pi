@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -10,6 +11,7 @@ from typing import Any
 from _omp import Duration, EnvPath, OmpError
 
 from ._errors import NotWiredError
+from .journal import EntryId, JournalEntry
 
 
 class SessionError(OmpError):
@@ -107,8 +109,9 @@ class Cost:
     estimated: bool = False
 
     input_nanos_usd: int | None = None
-    output_nanos_usd: int | None = None
     
+    output_nanos_usd: int | None = None
+
     @property
     def usd(self) -> float:
         """Return the display value in USD."""
@@ -196,17 +199,275 @@ class UsageReport:
     truncated: bool
 
 
-def current() -> SessionInfo:
-    """Read the current session's index projection."""
+def _wire_filter(value: SessionFilter | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, SessionFilter):
+        raise TypeError("filter must be an omp.SessionFilter or None")
+    return {
+        "project": value.project,
+        "since_ms": value.since_ms,
+        "until_ms": value.until_ms,
+        "status": (
+            None if value.status is None else [status.value for status in value.status]
+        ),
+        "kind": None if value.kind is None else [kind.value for kind in value.kind],
+        "contains_kind": value.contains_kind,
+        "limit": value.limit,
+    }
 
-    raise NotWiredError("omp.sessions.current")
+
+def _wire_query(value: UsageQuery) -> dict[str, object]:
+    if not isinstance(value, UsageQuery):
+        raise TypeError("query must be an omp.UsageQuery")
+    return {
+        "since_ms": value.since_ms,
+        "until_ms": value.until_ms,
+        "group_by": [group.value for group in value.group_by],
+        "bucket": value.bucket.value,
+        "filter": _wire_filter(value.filter),
+        "include_subagents": value.include_subagents,
+    }
+
+
+def _decode_duration(value: object) -> Duration:
+    if isinstance(value, Duration):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return Duration(f"{int(value['value'])}{value['unit']}")
+        except (KeyError, TypeError, ValueError) as error:
+            raise TypeError("usage duration is malformed") from error
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return Duration(
+            str(value) if isinstance(value, str) else None,
+            seconds=None if isinstance(value, str) else float(value),
+        )
+    raise TypeError("usage duration is malformed")
+
+
+def _decode_usage(value: object) -> Usage:
+    if isinstance(value, Usage):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("session usage must be a mapping")
+    try:
+        detail = value.get("detail", {})
+        if not isinstance(detail, Mapping):
+            raise TypeError("usage detail must be a mapping")
+        return Usage(
+            input=int(value.get("input", 0)),
+            output=int(value.get("output", 0)),
+            cache_read=int(value.get("cache_read", 0)),
+            cache_write=int(value.get("cache_write", 0)),
+            reasoning=int(value.get("reasoning", 0)),
+            premium_requests=int(value.get("premium_requests", 0)),
+            context=None if value.get("context") is None else int(value["context"]),
+            total=int(value.get("total", 0)),
+            accuracy=UsageAccuracy(
+                str(value.get("accuracy", UsageAccuracy.EXACT.value)).lower()
+            ),
+            detail=dict(detail),
+        )
+    except (TypeError, ValueError) as error:
+        raise TypeError("session usage response is malformed") from error
+
+
+def _decode_cost(value: object) -> Cost:
+    if isinstance(value, Cost):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("session cost must be a mapping")
+    try:
+        return Cost(
+            nanos_usd=int(value.get("nanos_usd", 0)),
+            estimated=bool(value.get("estimated", False)),
+            input_nanos_usd=(
+                None
+                if value.get("input_nanos_usd") is None
+                else int(value["input_nanos_usd"])
+            ),
+            output_nanos_usd=(
+                None
+                if value.get("output_nanos_usd") is None
+                else int(value["output_nanos_usd"])
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise TypeError("session cost response is malformed") from error
+
+
+def _decode_session(value: object) -> SessionInfo:
+    if isinstance(value, SessionInfo):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("session response must be a mapping")
+    try:
+        models = value.get("models", ())
+        if not isinstance(models, Sequence) or isinstance(
+            models, (str, bytes, bytearray)
+        ):
+            raise TypeError("session models must be a sequence")
+        raw_cwd = value["cwd"]
+        cwd = raw_cwd if isinstance(raw_cwd, EnvPath) else EnvPath(str(raw_cwd))
+        return SessionInfo(
+            id=str(value["id"]),
+            title=None if value.get("title") is None else str(value["title"]),
+            title_source=TitleSource(str(value["title_source"]).lower()),
+            cwd=cwd,
+            project=str(value["project"]),
+            created_ms=int(value["created_ms"]),
+            updated_ms=int(value["updated_ms"]),
+            status=SessionStatus(str(value["status"]).lower()),
+            kind=SessionKind(str(value["kind"]).lower()),
+            parent=None if value.get("parent") is None else str(value["parent"]),
+            entries=int(value["entries"]),
+            turns=int(value["turns"]),
+            usage=_decode_usage(value["usage"]),
+            cost=_decode_cost(value["cost"]),
+            models=tuple(str(model) for model in models),
+            remote=bool(value["remote"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise TypeError("session response is malformed") from error
+
+
+def _decode_link(value: object) -> SessionLink:
+    if isinstance(value, SessionLink):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("session lineage row must be a mapping")
+    try:
+        return SessionLink(
+            id=str(value["id"]),
+            parent=None if value.get("parent") is None else str(value["parent"]),
+            at=None if value.get("at") is None else int(value["at"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise TypeError("session lineage row is malformed") from error
+
+
+def _decode_bucket(value: object) -> UsageBucket:
+    if isinstance(value, UsageBucket):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("usage bucket must be a mapping")
+    key = value.get("key", {})
+    if not isinstance(key, Mapping):
+        raise TypeError("usage bucket key must be a mapping")
+    try:
+        return UsageBucket(
+            key={str(name): str(item) for name, item in key.items()},
+            start_ms=None if value.get("start_ms") is None else int(value["start_ms"]),
+            usage=_decode_usage(value["usage"]),
+            cost=_decode_cost(value["cost"]),
+            requests=int(value["requests"]),
+            errors=int(value["errors"]),
+            duration=_decode_duration(value["duration"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise TypeError("usage bucket response is malformed") from error
+
+
+def _decode_usage_report(value: object) -> UsageReport:
+    if isinstance(value, UsageReport):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("usage report must be a mapping")
+    groups = value.get("groups", ())
+    series = value.get("series", ())
+    if (
+        not isinstance(groups, Sequence)
+        or isinstance(groups, (str, bytes, bytearray))
+        or not isinstance(series, Sequence)
+        or isinstance(series, (str, bytes, bytearray))
+    ):
+        raise TypeError("usage report groups and series must be sequences")
+    try:
+        return UsageReport(
+            total=_decode_bucket(value["total"]),
+            groups=tuple(_decode_bucket(row) for row in groups),
+            series=tuple(_decode_bucket(row) for row in series),
+            sessions=int(value["sessions"]),
+            truncated=bool(value["truncated"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise TypeError("usage report response is malformed") from error
+
+
+def _decode_entry_id(value: object, session_id: str) -> EntryId:
+    if isinstance(value, EntryId):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return EntryId(session_id, value)
+    if isinstance(value, str):
+        return EntryId.parse(value)
+    if isinstance(value, Mapping):
+        try:
+            return EntryId(str(value.get("session", session_id)), int(value["index"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise TypeError("journal entry id is malformed") from error
+    raise TypeError("journal entry id is malformed")
+
+
+def _decode_raw(value: object) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("journal raw payload must be base64")
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError as error:
+        raise TypeError("journal raw payload has invalid base64") from error
+
+
+def _decode_journal_entry(value: object, session_id: str) -> JournalEntry[Any]:
+    if isinstance(value, JournalEntry):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("journal entry response must be a mapping")
+    artifact = value.get("artifact")
+    if artifact is not None:
+        from .artifacts import _decode_ref
+
+        artifact = _decode_ref(artifact)
+    try:
+        return JournalEntry(
+            id=_decode_entry_id(value["id"], session_id),
+            kind=str(value["kind"]),
+            rev=str(value["rev"]),
+            ts=int(value["ts"]),
+            principal=value.get("principal"),
+            provenance=value.get("provenance"),
+            value=value.get("value"),
+            raw=_decode_raw(value["raw"]),
+            display=bool(value.get("display", False)),
+            in_context=bool(value.get("in_context", False)),
+            artifact=artifact,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise TypeError("journal entry response is malformed") from error
+
+
+def current() -> SessionInfo:
+    """Read the current session's host-materialized index projection."""
+
+    from . import _control_backend
+
+    backend = _control_backend.get()
+    getter = None if backend is None else getattr(backend, "current_session", None)
+    if getter is None:
+        raise NotWiredError("omp.sessions.current")
+    return _decode_session(getter())
 
 
 async def list(filter: SessionFilter | None = None) -> Sequence[SessionInfo]:
     """List visible sessions by newest indexed activity."""
 
-    del filter
-    raise NotWiredError("omp.sessions.list")
+    rows = await _request("omp.sessions.list", filter=_wire_filter(filter))
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        raise TypeError("session list response must be a sequence")
+    return tuple(_decode_session(row) for row in rows)
 
 
 async def _request(operation: str, /, **arguments: object) -> Any:
@@ -222,25 +483,34 @@ async def _request(operation: str, /, **arguments: object) -> Any:
 async def get(session_id: str) -> SessionInfo:
     """Return one visible session's indexed metadata."""
 
-    return await _request("omp.sessions.get", session_id=session_id)
+    return _decode_session(
+        await _request("omp.sessions.get", session_id=session_id)
+    )
 
 
 async def lineage(session_id: str) -> Sequence[SessionLink]:
     """Return the durable lineage reaching a session, oldest first."""
 
-    return await _request("omp.sessions.lineage", session_id=session_id)
+    rows = await _request("omp.sessions.lineage", session_id=session_id)
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        raise TypeError("session lineage response must be a sequence")
+    return tuple(_decode_link(row) for row in rows)
 
 
 async def resume(session_id: str) -> SessionInfo:
     """Resume an interactive session and journal the host transition receipt."""
 
-    return await _request("omp.sessions.resume", session_id=session_id)
+    return _decode_session(
+        await _request("omp.sessions.resume", session_id=session_id)
+    )
 
 
 async def rename(session_id: str, title: str) -> SessionInfo:
     """Assign a user title and journal the durable rename receipt."""
 
-    return await _request("omp.sessions.rename", session_id=session_id, title=title)
+    return _decode_session(
+        await _request("omp.sessions.rename", session_id=session_id, title=title)
+    )
 
 
 async def delete(session_id: str) -> None:
@@ -256,8 +526,21 @@ async def delete(session_id: str) -> None:
 async def usage(query: UsageQuery) -> UsageReport:
     """Aggregate token and cost usage from the write-time index."""
 
-    del query
-    raise NotWiredError("omp.sessions.usage")
+    return _decode_usage_report(
+        await _request("omp.sessions.usage", query=_wire_query(query))
+    )
+
+
+def _wire_bound(value: object | None, session_id: str, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, EntryId):
+        if value.session != session_id:
+            raise ValueError(f"{name} belongs to a different session")
+        return value.index
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise TypeError(f"{name} must be an EntryId, non-negative int, or None")
 
 
 async def journal(
@@ -268,11 +551,34 @@ async def journal(
     until: object | None = None,
     live: bool = True,
 ) -> AsyncIterator[Any]:
-    """Stream decoded historical entries through the future storage host arm."""
+    """Stream decoded historical entries in bounded authoritative pages."""
 
-    del session_id, kinds, since, until, live
-    raise NotWiredError("omp.sessions.journal")
-    yield
+    cursor: str | None = None
+    while True:
+        response = await _request(
+            "omp.sessions.journal",
+            session_id=session_id,
+            kinds=None if kinds is None else [str(kind) for kind in kinds],
+            since=_wire_bound(since, session_id, "since"),
+            until=_wire_bound(until, session_id, "until"),
+            live=bool(live),
+            cursor=cursor,
+        )
+        if not isinstance(response, Mapping):
+            raise TypeError("session journal response must be a page mapping")
+        rows = response.get("entries", ())
+        if not isinstance(rows, Sequence) or isinstance(
+            rows, (str, bytes, bytearray)
+        ):
+            raise TypeError("session journal page entries must be a sequence")
+        for row in rows:
+            yield _decode_journal_entry(row, session_id)
+        if bool(response.get("done", False)):
+            return
+        next_cursor = response.get("cursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise TypeError("session journal page omitted its continuation cursor")
+        cursor = next_cursor
 
 
 __all__ = (

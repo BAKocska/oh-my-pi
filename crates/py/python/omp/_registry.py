@@ -8,11 +8,24 @@ transports.
 
 from __future__ import annotations
 
+import importlib
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
-from enum import StrEnum
-from typing import Annotated, Protocol, TypeVar, get_args, get_origin, get_type_hints
+from dataclasses import MISSING, dataclass, fields, is_dataclass, replace
+from enum import Enum, StrEnum
+from types import UnionType
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    Protocol,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from _omp import QuotaStatus, ResourceReceipt, resources
 
@@ -145,6 +158,15 @@ class DeclarationDrift(ExtensionError, RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ServiceMethodDefinition:
+    """Structural wire contract for one public service method."""
+
+    name: str
+    input_schema: Mapping[str, object]
+    result_schema: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class ServiceDefinition:
     """One sealed ``@omp.service`` implementation."""
 
@@ -152,6 +174,7 @@ class ServiceDefinition:
     rev: int
     implementation: type
     methods: tuple[str, ...]
+    method_schemas: tuple[ServiceMethodDefinition, ...]
     trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +272,48 @@ class DeviceDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class PreludeParamSpec:
+    """Immutable metadata for one eval-prelude helper parameter."""
+
+    name: str
+    kind: str
+    default_json: str | None
+    annotation: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreludeDefinition:
+    """One import-time eval-prelude helper declaration."""
+
+    name: str
+    rev: int
+    doc: str
+    summary: str
+    params: tuple[PreludeParamSpec, ...]
+    body: object
+    handler: object
+    module: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerToolDefinition:
+    """One runnable tool projection retained by the sealed worker registry."""
+
+    name: str
+    family: str
+    rev: int
+    description: str
+    schema: object
+    strict: bool | None
+    streams_args: bool
+    handler: object
+    source_module: str
+    kind: str
+    place: object
+    legacy: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ChildDeviceDefinition:
     """One static route projected below a declared parent device."""
 
@@ -338,6 +403,7 @@ class DeclarationSnapshot:
     capabilities: frozenset[str]
     hooks: frozenset[_HookKey]
     services: frozenset[_ServiceKey]
+    preludes: tuple[PreludeDefinition, ...] = ()
     telemetry: tuple[TelemetryDefinition, ...] = ()
     commands: tuple[CommandDefinition, ...] = ()
     shortcuts: tuple[ShortcutDefinition, ...] = ()
@@ -383,6 +449,7 @@ class DeclarationRegistry:
         "_hook_definitions",
         "_campaigns",
         "_prompt_slots",
+        "_preludes",
         "_telemetry",
         "_manifest_hooks",
         "_manifest_capabilities",
@@ -391,6 +458,7 @@ class DeclarationRegistry:
         "_manifest_requires",
         "_manifest_services",
         "_manifest_tools",
+        "_legacy_worker_tools",
         "_sealed",
         "_service_instances",
         "_services",
@@ -427,6 +495,7 @@ class DeclarationRegistry:
         self._export_sequence = 0
         self._extension_id: str | None = None
         self._prompt_slots: dict[tuple[str, str], PromptSlotDefinition] = {}
+        self._preludes: dict[str, PreludeDefinition] = {}
         self._services: dict[_ServiceKey, ServiceDefinition] = {}
         self._workers: dict[_WorkerKey, WorkerDefinition] = {}
         self._service_instances: dict[_ServiceKey, object] = {}
@@ -439,6 +508,7 @@ class DeclarationRegistry:
         ] = {}
         self._uniform_manifest_configured = False
         self._manifest_requires: frozenset[_ServiceKey] = frozenset()
+        self._legacy_worker_tools: dict[_ToolKey, WorkerToolDefinition] = {}
 
     @property
     def sealed(self) -> bool:
@@ -523,6 +593,7 @@ class DeclarationRegistry:
             or self._verdict_renderers
             or self._shortcuts
             or self._approvers
+            or self._preludes
         ):
             raise RuntimeError("manifest must be configured before declaration import")
         if declarations is not None:
@@ -599,6 +670,104 @@ class DeclarationRegistry:
             )
             self._device_states[key] = (True, None)
         return declaration
+
+    def register_legacy_worker_tool(
+        self, declaration: Mapping[str, object]
+    ) -> WorkerToolDefinition:
+        """Normalize a documented ``OMP_TOOLS`` row into this registry."""
+
+        if not isinstance(declaration, Mapping):
+            raise TypeError("OMP_TOOLS entries must be mappings")
+        name = declaration.get("name")
+        if not isinstance(name, str) or not name:
+            raise TypeError("OMP_TOOLS name must be a non-empty string")
+        rev_value = declaration.get("rev", "1")
+        if not isinstance(rev_value, str):
+            raise TypeError("OMP_TOOLS rev must be a string")
+        family, separator, number = rev_value.rpartition(".")
+        if not separator:
+            family, number = "", rev_value
+        if not number.isascii() or not number.isdigit():
+            raise ValueError("OMP_TOOLS rev must be '<family>.<n>' or a bare integer")
+        rev = int(number)
+        key = _tool_key(name, family, rev)
+        handler = declaration.get("handler")
+        if not callable(handler):
+            raise TypeError(f"Python tool {name!r} handler is not callable")
+        description = declaration.get("description", "")
+        if not isinstance(description, str):
+            raise TypeError("OMP_TOOLS description must be a string")
+        schema = declaration.get(
+            "schema",
+            {"type": "object", "additionalProperties": True},
+        )
+        if not isinstance(schema, (str, Mapping)):
+            raise TypeError("OMP_TOOLS schema must be JSON text or a mapping")
+        if isinstance(schema, str):
+            decoded = json.loads(schema)
+            if not isinstance(decoded, Mapping):
+                raise TypeError("OMP_TOOLS schema JSON must encode an object")
+        strict = declaration.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise TypeError("OMP_TOOLS strict must be bool or None")
+        streams_args = declaration.get("streams_args", False)
+        if not isinstance(streams_args, bool):
+            raise TypeError("OMP_TOOLS streams_args must be bool")
+        source_module = getattr(handler, "__module__", "")
+        if not isinstance(source_module, str) or not source_module:
+            raise TypeError("OMP_TOOLS handler must have a source module")
+        projected = WorkerToolDefinition(
+            name=name,
+            family=family,
+            rev=rev,
+            description=description,
+            schema=schema,
+            strict=strict,
+            streams_args=streams_args,
+            handler=handler,
+            source_module=source_module,
+            kind="legacy",
+            place="host",
+            legacy=True,
+        )
+        self.register_tool(name, family, rev, handler)
+        self._legacy_worker_tools[key] = projected
+        return projected
+
+    def worker_tool_definitions(self) -> tuple[WorkerToolDefinition, ...]:
+        """Project every sealed tool identity to one runnable worker row."""
+
+        if not self._verified:
+            raise RuntimeError("worker tools are unavailable before FREEZE")
+        projected: list[WorkerToolDefinition] = []
+        for key in sorted(self._tools):
+            if key in self._legacy_worker_tools:
+                projected.append(self._legacy_worker_tools[key])
+                continue
+            definition = self._device_definitions.get(key)
+            if definition is None:
+                raise RuntimeError(f"sealed tool {key!r} has no worker projection")
+            body = definition.body
+            source_module = getattr(body, "__module__", "")
+            if not isinstance(source_module, str) or not source_module:
+                raise TypeError(f"device {definition.name!r} body has no source module")
+            kind = getattr(body, "__omp_tool_kind__", "soft")
+            projected.append(
+                WorkerToolDefinition(
+                    name=definition.name,
+                    family=definition.family,
+                    rev=definition.rev,
+                    description=_worker_description(definition),
+                    schema=_worker_schema(definition, kind),
+                    strict=True if kind == "hard" else None,
+                    streams_args=False,
+                    handler=_worker_handler(definition, kind),
+                    source_module=source_module,
+                    kind=kind,
+                    place=str(definition.place),
+                )
+            )
+        return tuple(projected)
 
     def register_child_device(
         self,
@@ -919,6 +1088,17 @@ class DeclarationRegistry:
 
         return tuple(self._workers[key] for key in sorted(self._workers))
 
+    def register_prelude(self, definition: PreludeDefinition) -> object:
+        """Record one eval-prelude helper and its worker invocation adapter."""
+
+        self._insert(self._preludes, definition.name, definition, "prelude")
+        return definition.body
+
+    def prelude_definitions(self) -> tuple[PreludeDefinition, ...]:
+        """Return eval-prelude helpers in deterministic name order."""
+
+        return tuple(self._preludes[key] for key in sorted(self._preludes))
+
     def register_command(
         self,
         name: str,
@@ -1046,7 +1226,13 @@ class DeclarationRegistry:
             raise TypeError(f"service public methods must be async: {names}")
         if not methods:
             raise TypeError("a service must declare at least one public async method")
-        definition = ServiceDefinition(key[0], key[1], implementation, methods)
+        method_schemas = tuple(
+            _service_method_definition(method_name, getattr(implementation, method_name))
+            for method_name in methods
+        )
+        definition = ServiceDefinition(
+            key[0], key[1], implementation, methods, method_schemas
+        )
         self._insert(self._services, key, definition, "service")
         return implementation
 
@@ -1063,10 +1249,12 @@ class DeclarationRegistry:
         missing_services: frozenset[_ServiceKey] = frozenset()
         undeclared_services: frozenset[_ServiceKey] = frozenset()
         if self._configured:
-            missing_tools = self._manifest_tools.difference(self._tools)
-            undeclared_tools = frozenset(self._tools).difference(
-                self._manifest_tools
+            actual_tools = frozenset(self._tools).union(
+                (definition.name, "prelude", definition.rev)
+                for definition in self._preludes.values()
             )
+            missing_tools = self._manifest_tools.difference(actual_tools)
+            undeclared_tools = actual_tools.difference(self._manifest_tools)
             missing_hooks = self._manifest_hooks.difference(self._hooks)
             undeclared_hooks = frozenset(self._hooks).difference(
                 self._manifest_hooks
@@ -1187,6 +1375,7 @@ class DeclarationRegistry:
             capabilities=self._manifest_capabilities,
             hooks=frozenset(self._hooks),
             services=frozenset(self._services),
+            preludes=self.prelude_definitions(),
             commands=self.command_definitions(),
             shortcuts=self.shortcut_definitions(),
             telemetry=tuple(self._telemetry[key] for key in sorted(self._telemetry)),
@@ -1274,6 +1463,7 @@ class DeclarationRegistry:
             + sum(len(candidates) for candidates in self._provider_candidates.values())
             + len(self._workers)
             + len(self._exports)
+            + len(self._preludes)
         )
         if count >= MAX_DECLARATIONS:
             raise DeclarationLimit(count + 1, MAX_DECLARATIONS)
@@ -1303,12 +1493,19 @@ class ControlServiceTransport(Protocol):
 class ServiceClient:
     """Dynamic typed-service proxy bound to an exact name and revision."""
 
-    __slots__ = ("_name", "_rev", "_transport")
+    __slots__ = ("_methods", "_name", "_rev", "_transport")
 
-    def __init__(self, name: str, rev: int, transport: ControlServiceTransport) -> None:
+    def __init__(
+        self,
+        name: str,
+        rev: int,
+        transport: ControlServiceTransport,
+        methods: Mapping[str, Mapping[str, object]],
+    ) -> None:
         self._name = name
         self._rev = rev
         self._transport = transport
+        self._methods = methods
 
     @property
     def name(self) -> str:
@@ -1323,12 +1520,12 @@ class ServiceClient:
         return self._rev
 
     def __getattr__(self, method: str) -> Callable[..., Awaitable[object]]:
-        if method.startswith("_"):
+        if method.startswith("_") or method not in self._methods:
             raise AttributeError(method)
 
         async def invoke(*args: object, **kwargs: object) -> object:
             return await self._transport.request(
-                "service.call",
+                "omp.services.call",
                 {
                     "name": self._name,
                     "rev": self._rev,
@@ -1365,8 +1562,32 @@ class Services:
         transport = self._transport
         if transport is None:
             raise RuntimeError("CONTROL service transport is unavailable before ACTIVATE")
-        await transport.request("service.connect", {"name": key[0], "rev": key[1]})
-        return ServiceClient(key[0], key[1], transport)
+        connected = await transport.request(
+            "omp.services.connect", {"name": key[0], "rev": key[1]}
+        )
+        if not isinstance(connected, Mapping):
+            raise TypeError("service connect response must carry method schemas")
+        rows = connected.get("methods")
+        if not isinstance(rows, (tuple, list)):
+            raise TypeError("service connect response has no method schema list")
+        methods: dict[str, Mapping[str, object]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise TypeError("service method schema row must be a mapping")
+            method = row.get("name")
+            input_schema = row.get("input_schema")
+            result_schema = row.get("result_schema")
+            if (
+                not isinstance(method, str)
+                or not isinstance(input_schema, Mapping)
+                or not isinstance(result_schema, Mapping)
+            ):
+                raise TypeError("service method schema row is malformed")
+            methods[method] = {
+                "input_schema": input_schema,
+                "result_schema": result_schema,
+            }
+        return ServiceClient(key[0], key[1], transport, methods)
 
 
 registry = DeclarationRegistry()
@@ -1405,6 +1626,138 @@ def freeze_declarations() -> DeclarationSnapshot:
     """Runs the FREEZE transition without socket or filesystem work."""
 
     return registry.freeze()
+
+def prelude_definitions() -> tuple[PreludeDefinition, ...]:
+    """Return registered eval-prelude helpers in deterministic name order."""
+
+    return registry.prelude_definitions()
+
+def bootstrap_worker_registry(
+    manifest_json: str,
+    modules: Iterable[str],
+) -> tuple[tuple[WorkerToolDefinition, ...], str]:
+    """Configure, sequentially import, seal, and project one admitted worker."""
+
+    manifest = json.loads(manifest_json)
+    if not isinstance(manifest, Mapping):
+        raise TypeError("worker manifest snapshot must encode an object")
+    configure_manifest(
+        tools=manifest.get("tools", ()),
+        hooks=manifest.get("hooks", ()),
+        capabilities=manifest.get("capabilities", ()),
+        services=manifest.get("services", ()),
+        requires=manifest.get("requires", ()),
+        declarations=manifest.get("declarations"),
+        extension=manifest.get("extension"),
+    )
+    seen: set[str] = set()
+    for module_name in modules:
+        if not isinstance(module_name, str) or not module_name:
+            raise TypeError("worker import modules must be non-empty strings")
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        module = importlib.import_module(module_name)
+        legacy = getattr(module, "OMP_TOOLS", ())
+        for declaration in legacy:
+            register_legacy_worker_tool(declaration)
+    freeze_declarations()
+    return project_worker_registry()
+
+def register_legacy_worker_tool(
+    declaration: Mapping[str, object],
+) -> WorkerToolDefinition:
+    """Register one documented legacy ``OMP_TOOLS`` row before FREEZE."""
+
+    return registry.register_legacy_worker_tool(declaration)
+
+
+def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
+    """Project the complete sealed registry for the production stdio worker."""
+
+    if not registry.sealed:
+        raise RuntimeError("worker registry projection requires FREEZE")
+    snapshot = registry.snapshot()
+    tools = registry.worker_tool_definitions()
+    metadata = {
+        "tools": [
+            {
+                "name": tool.name,
+                "family": tool.family,
+                "rev": tool.rev,
+                "kind": tool.kind,
+                "place": str(tool.place),
+                "source_module": tool.source_module,
+            }
+            for tool in tools
+        ],
+        "hooks": [list(key) for key in sorted(snapshot.hooks)],
+        "services": [
+            {
+                "name": definition.name,
+                "rev": definition.rev,
+                "source_module": definition.implementation.__module__,
+                "methods": [
+                    _worker_wire_value(method)
+                    for method in definition.method_schemas
+                ],
+            }
+            for definition in snapshot.service_definitions
+        ],
+        "entry_kinds": [_worker_wire_value(value) for value in snapshot.entry_kinds],
+        "providers": [_worker_wire_value(value) for value in snapshot.providers],
+        "campaigns": [_worker_wire_value(value) for value in snapshot.campaigns],
+        "commands": [_worker_wire_value(value) for value in snapshot.commands],
+        "shortcuts": [_worker_wire_value(value) for value in snapshot.shortcuts],
+        "telemetry": [_worker_wire_value(value) for value in snapshot.telemetry],
+        "prompt_slots": [_worker_wire_value(value) for value in snapshot.prompt_slots],
+        "workers": [_worker_wire_value(value) for value in snapshot.workers],
+        "exports": [_worker_wire_value(value) for value in snapshot.exports],
+        "approvers": [_worker_wire_value(value) for value in snapshot.approvers],
+        "completions": [_worker_wire_value(value) for value in snapshot.completions],
+        "message_renderers": [
+            _worker_wire_value(value) for value in snapshot.message_renderers
+        ],
+        "verdict_renderers": [
+            _worker_wire_value(value) for value in snapshot.verdict_renderers
+        ],
+    }
+    return tools, json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+
+
+def _worker_wire_value(value: object) -> object:
+    """Lower declaration metadata without serializing executable Python objects."""
+
+    if callable(value):
+        module = getattr(value, "__module__", None)
+        qualname = getattr(value, "__qualname__", None)
+        if not isinstance(module, str) or not isinstance(qualname, str):
+            raise TypeError("registered callback has no stable qualified name")
+        return {"$omp.callable": f"{module}.{qualname}"}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return _worker_wire_value(value.value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _worker_wire_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_worker_wire_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [
+            _worker_wire_value(item)
+            for item in sorted(value, key=lambda item: repr(item))
+        ]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _worker_wire_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    return str(value)
 
 
 
@@ -1686,6 +2039,281 @@ def _provider_declaration_id(definition: ProviderDefinition) -> str:
     return _declaration_holder(definition.spec)
 
 
+def _worker_description(definition: DeviceDefinition) -> str:
+    if definition.summary:
+        return definition.summary
+    candidates = (
+        definition.docs if isinstance(definition.docs, str) else None,
+        inspect.getdoc(definition.body),
+    )
+    for candidate in candidates:
+        if candidate:
+            for line in candidate.splitlines():
+                if line.strip():
+                    return line.strip()
+    return ""
+
+def _service_method_definition(
+    name: str, method: object
+) -> ServiceMethodDefinition:
+    try:
+        signature = inspect.signature(method)
+        hints = get_type_hints(method, include_extras=True)
+    except (NameError, TypeError, ValueError) as error:
+        raise TypeError(f"service method {name!r} annotations are not resolvable") from error
+    properties: dict[str, object] = {}
+    required: list[str] = []
+    additional = False
+    for parameter in signature.parameters.values():
+        if parameter.name in {"self", "cls"}:
+            continue
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            raise TypeError(f"service method {name!r} may not declare *args")
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            additional = True
+            continue
+        annotation = hints.get(parameter.name, parameter.annotation)
+        if annotation is inspect.Parameter.empty:
+            raise TypeError(
+                f"service method {name!r} argument {parameter.name!r} is untyped"
+            )
+        properties[parameter.name] = _schema_for_annotation(annotation)
+        if parameter.default is inspect.Parameter.empty:
+            required.append(parameter.name)
+    result_annotation = hints.get("return", signature.return_annotation)
+    if result_annotation is inspect.Signature.empty:
+        raise TypeError(f"service method {name!r} return is untyped")
+    input_schema: dict[str, object] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": additional,
+    }
+    if required:
+        input_schema["required"] = required
+    return ServiceMethodDefinition(
+        name=name,
+        input_schema=input_schema,
+        result_schema=_schema_for_annotation(result_annotation),
+    )
+
+
+def service_json_value(value: object) -> object:
+    """Recursively lower a typed service value to reversible JSON data."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return {
+            "$omp.enum": f"{type(value).__module__}.{type(value).__qualname__}",
+            "value": service_json_value(value.value),
+        }
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            "$omp.type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "$omp.fields": {
+                field.name: service_json_value(getattr(value, field.name))
+                for field in fields(value)
+            },
+        }
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("service result mappings must have string keys")
+        return {key: service_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [service_json_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [
+            service_json_value(item)
+            for item in sorted(value, key=lambda item: repr(item))
+        ]
+    to_json = getattr(value, "to_json", None)
+    if callable(to_json):
+        return {
+            "$omp.type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "$omp.value": service_json_value(to_json()),
+        }
+    raise TypeError(
+        f"unsupported service result type "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+
+def _worker_schema(definition: DeviceDefinition, kind: object) -> object:
+    if isinstance(definition.schema, Mapping):
+        return dict(definition.schema)
+    if isinstance(definition.schema, type):
+        return _schema_for_annotation(definition.schema)
+    try:
+        signature = inspect.signature(definition.body)
+        hints = get_type_hints(definition.body, include_extras=True)
+    except (NameError, TypeError, ValueError):
+        return {"type": "object", "additionalProperties": True}
+    parameters = tuple(signature.parameters.values())
+    if kind in {"soft", "hard"} and hasattr(definition.body, "__omp_tool_kind__"):
+        properties: dict[str, object] = {}
+        required: list[str] = []
+        additional = False
+        for parameter in parameters:
+            if parameter.name == "ctx":
+                continue
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                continue
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                additional = True
+                continue
+            annotation = hints.get(parameter.name, parameter.annotation)
+            properties[parameter.name] = _schema_for_annotation(annotation)
+            if parameter.default is inspect.Parameter.empty:
+                required.append(parameter.name)
+        schema: dict[str, object] = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": additional,
+        }
+        if required:
+            schema["required"] = required
+        return schema
+    argument = next(
+        (parameter for parameter in parameters if parameter.name != "ctx"),
+        None,
+    )
+    if argument is None:
+        return {"type": "object", "additionalProperties": False}
+    annotation = hints.get(argument.name, argument.annotation)
+    if annotation is inspect.Parameter.empty:
+        return {"type": "object", "additionalProperties": True}
+    return _schema_for_annotation(annotation)
+
+
+
+def _schema_for_annotation(annotation: object) -> dict[str, object]:
+    from . import Field
+
+    metadata: tuple[object, ...] = ()
+    if get_origin(annotation) is Annotated:
+        annotation, *metadata = get_args(annotation)
+    origin = get_origin(annotation)
+    arguments = get_args(annotation)
+    if annotation in {Any, object, inspect.Parameter.empty}:
+        schema: dict[str, object] = {}
+    elif annotation is str:
+        schema = {"type": "string"}
+    elif annotation is bool:
+        schema = {"type": "boolean"}
+    elif annotation is int:
+        schema = {"type": "integer"}
+    elif annotation is float:
+        schema = {"type": "number"}
+    elif annotation in {None, type(None)}:
+        schema = {"type": "null"}
+    elif origin is Literal:
+        values = list(arguments)
+        schema = {"enum": values}
+        if values and all(isinstance(value, str) for value in values):
+            schema["type"] = "string"
+    elif origin in {Union, UnionType}:
+        schema = {"anyOf": [_schema_for_annotation(item) for item in arguments]}
+    elif origin in {list, set, frozenset, tuple}:
+        item = arguments[0] if arguments else Any
+        schema = {"type": "array", "items": _schema_for_annotation(item)}
+    elif origin in {dict, Mapping}:
+        item = arguments[1] if len(arguments) > 1 else Any
+        schema = {
+            "type": "object",
+            "additionalProperties": _schema_for_annotation(item),
+        }
+    elif isinstance(annotation, type) and issubclass(annotation, Enum):
+        schema = {
+            "enum": [item.value for item in annotation],
+            "x-omp-python-type": f"{annotation.__module__}.{annotation.__qualname__}",
+        }
+    elif isinstance(annotation, type):
+        try:
+            hints = get_type_hints(annotation, include_extras=True)
+        except (NameError, TypeError):
+            hints = inspect.get_annotations(annotation, eval_str=False)
+        properties = {
+            name: _schema_for_annotation(field_annotation)
+            for name, field_annotation in hints.items()
+        }
+        required = list(properties)
+        if is_dataclass(annotation):
+            required = [
+                field.name
+                for field in fields(annotation)
+                if field.default is MISSING and field.default_factory is MISSING
+            ]
+        schema = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": False,
+        }
+        if required:
+            schema["required"] = required
+        if is_dataclass(annotation):
+            schema["x-omp-python-type"] = (
+                f"{annotation.__module__}.{annotation.__qualname__}"
+            )
+    else:
+        schema = {}
+    for item in metadata:
+        if isinstance(item, Field) and item.description:
+            schema["description"] = item.description
+    return schema
+
+
+
+def _worker_handler(
+    definition: DeviceDefinition, kind: object
+) -> Callable[[Mapping[str, object], object], Awaitable[object]]:
+    body = definition.body
+    ergonomic = kind in {"soft", "hard"} and hasattr(body, "__omp_tool_kind__")
+
+    async def invoke(params: Mapping[str, object], context: object) -> object:
+        if not isinstance(params, Mapping):
+            raise TypeError("worker tool arguments must decode to an object")
+        if ergonomic:
+            signature = inspect.signature(body)
+            positional: list[object] = []
+            keywords: dict[str, object] = {}
+            consumed: set[str] = set()
+            has_var_kwargs = False
+            for parameter in signature.parameters.values():
+                if parameter.name == "ctx":
+                    value = context
+                elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    has_var_kwargs = True
+                    continue
+                elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                    continue
+                elif parameter.name in params:
+                    value = params[parameter.name]
+                    consumed.add(parameter.name)
+                elif parameter.default is not inspect.Parameter.empty:
+                    continue
+                else:
+                    raise TypeError(f"missing required tool argument {parameter.name!r}")
+                if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                    positional.append(value)
+                else:
+                    keywords[parameter.name] = value
+            unexpected = set(params).difference(consumed)
+            if unexpected and not has_var_kwargs:
+                raise TypeError(f"unexpected tool argument {sorted(unexpected)[0]!r}")
+            if has_var_kwargs:
+                keywords.update((name, params[name]) for name in unexpected)
+            result = body(*positional, **keywords)
+        else:
+            parameters = tuple(inspect.signature(body).parameters.values())
+            result = body(params, context) if len(parameters) > 1 else body(params)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    return invoke
+
+
 def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ...]:
     from . import Coerce, Field, SchemaError
 
@@ -1817,6 +2445,8 @@ __all__ = (
     "ChildDeviceDefinition",
     "DeviceDefinition",
     "DeclarationSnapshot",
+    "PreludeDefinition",
+    "PreludeParamSpec",
     "MAX_DECLARATIONS",
     "QuotaExceeded",
     "EntryKindDefinition",
@@ -1825,11 +2455,14 @@ __all__ = (
     "ResourceReceipt",
     "ServiceClient",
     "ServiceDefinition",
+    "ServiceMethodDefinition",
     "Services",
+    "WorkerToolDefinition",
     "entry_kind",
     "configure_manifest",
     "dispatch_service",
     "freeze_declarations",
+    "prelude_definitions",
     "registry",
     "resources",
     "service",

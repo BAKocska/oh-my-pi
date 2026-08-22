@@ -27,7 +27,6 @@ from typing import (
 
 from _omp import Duration, InvocationPhase, OmpError
 
-from ._errors import NotWiredError
 from ._verdicts import Aborted, Detached, Done, Rev, Update
 
 
@@ -296,6 +295,17 @@ class Repair:
 MAX_NESTING_DEPTH = 128
 INTERRUPT_GRACE = Duration("150ms")
 MAX_PENDING_PULLS = 1
+_PARAM_OPERATIONS = MappingProxyType(
+    {
+        "args": "omp.params.args",
+        "raw": "omp.params.raw",
+        "committed": "omp.params.committed",
+        "next_interrupt": "omp.params.next_interrupt",
+        "pull": "omp.params.pull",
+        "array_next": "omp.params.array_next",
+        "object_next": "omp.params.object_next",
+    }
+)
 
 
 def params(cls: type[Any] | None = None) -> type[Any] | Callable[[type[Any]], type[Any]]:
@@ -507,7 +517,9 @@ class IncomingParams:
     async def args(self, shape: type[Any] | None = None) -> Any:
         """Wait for strict finalization and decode the canonical argument object."""
         target = self._shape if shape is None else shape
-        result = await self._request("args", shape=target)
+        if target is not None and not isinstance(target, type):
+            raise TypeError("IncomingParams.args shape must be a type or None")
+        result = await self._request("args", expected=_expected_shape(target))
         return _typed_value(result, target)
 
     async def raw(self) -> str:
@@ -572,7 +584,9 @@ class IncomingParams:
         if counts_as_pull:
             self._pending = True
         try:
-            request = self._dispatch(action, **arguments)
+            request = self._dispatch(
+                action, interruptible=interruptible, **arguments
+            )
             if not interruptible:
                 result = await request
             else:
@@ -610,13 +624,15 @@ class IncomingParams:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def _dispatch(self, action: str, **arguments: object) -> Any:
-        from . import _control_backend, _control_request
+        from . import _control_request
 
-        operation = f"omp.params.{action}"
-        if _control_backend.get() is None:
-            raise NotWiredError(operation)
+        operation = _PARAM_OPERATIONS.get(action)
+        if operation is None:
+            raise ParamsMisuse(f"unknown parameter cursor operation {action!r}")
         return await _control_request(
-            operation, invocation_id=self.invocation_id, **arguments
+            operation,
+            invocation_id=self.invocation_id,
+            **_json_arguments(arguments),
         )
 
     def _unwrap(self, result: Any) -> Any:
@@ -627,14 +643,41 @@ class IncomingParams:
             return None
         if isinstance(result, Mapping) and "issue" in result:
             raise ArgFault(_as_issue(result["issue"]))
+        if isinstance(result, Mapping) and "aborted" in result:
+            reason = result["aborted"]
+            if not isinstance(reason, str) or not reason:
+                raise ParamsProtocol("host returned an invalid commit abort")
+            raise CommitAborted(reason)
+        if isinstance(result, Mapping) and "interrupt" in result:
+            raise Interrupted(_as_interrupt(result["interrupt"]))
+        if isinstance(result, Mapping) and result.get("closed") is True:
+            raise InterruptClosed()
+        if isinstance(result, Mapping) and "protocol_error" in result:
+            detail = result["protocol_error"]
+            if not isinstance(detail, str) or not detail:
+                raise ParamsProtocol("host returned an invalid protocol error")
+            raise ParamsProtocol(detail)
         if isinstance(result, Mapping) and "value" in result:
             repairs = result.get("repairs", ())
+            if isinstance(repairs, (str, bytes)) or not isinstance(
+                repairs, (list, tuple)
+            ):
+                raise ParamsProtocol("host returned an invalid repair list")
             for repair in repairs:
                 self._repairs.append(_as_repair(repair))
+            interrupts = result.get("interrupts", ())
+            if isinstance(interrupts, (str, bytes)) or not isinstance(
+                interrupts, (list, tuple)
+            ):
+                raise ParamsProtocol("host returned an invalid interrupt list")
+            for interrupt in interrupts:
+                self._push_interrupt(_as_interrupt(interrupt))
             phase = result.get("phase")
             if phase is not None:
                 self._advance(_as_phase(phase))
             return result["value"]
+        if not _is_json_value(result):
+            raise ParamsProtocol("host returned a non-JSON cursor result")
         return result
 
     def _advance(self, phase: InvocationPhase) -> None:
@@ -692,7 +735,9 @@ class Arg:
         self._finished = False
 
     def __await__(self):
-        return self._pull("value", target=self._declared).__await__()
+        return self._pull(
+            "value", expected=_expected_shape(self._declared)
+        ).__await__()
 
     async def text(self) -> str:
         value = await self._pull("text")
@@ -735,7 +780,10 @@ class Arg:
     async def typed(self, target: type[Any]) -> Any:
         if not isinstance(target, type):
             raise TypeError("Arg.typed target must be a type")
-        return _typed_value(await self._pull("typed", target=target), target)
+        return _typed_value(
+            await self._pull("typed", expected=_expected_shape(target)),
+            target,
+        )
 
     async def raw(self) -> str:
         value = await self._pull("raw")
@@ -759,7 +807,11 @@ class Arg:
 
     async def optional(self, default: Any) -> Any:
         try:
-            return await self._pull("value", optional=True, target=self._declared)
+            return await self._pull(
+                "value",
+                optional=True,
+                expected=_expected_shape(self._declared),
+            )
         except ArgFault as error:
             if error.kind is ArgIssueKind.MISSING:
                 return default
@@ -994,8 +1046,10 @@ class InterruptibleParams:
 
     async def args(self, shape: type[Any] | None = None) -> Any:
         target = self._params._shape if shape is None else shape
+        if target is not None and not isinstance(target, type):
+            raise TypeError("InterruptibleParams.args shape must be a type or None")
         result = await self._params._request(
-            "args", interruptible=True, shape=target
+            "args", interruptible=True, expected=_expected_shape(target)
         )
         return _typed_value(result, target)
 
@@ -1099,7 +1153,7 @@ def _as_issue(value: object) -> ArgIssue:
     try:
         return ArgIssue(
             tuple(value.get("path", ())),
-            str(value["expected"]),
+            value["expected"],
             ArgIssueKind(value["kind"]),
             example=value.get("example"),
             found=value.get("found"),
@@ -1117,7 +1171,7 @@ def _as_repair(value: object) -> Repair:
         return Repair(
             tuple(value.get("path", ())),
             RepairKind(value["kind"]),
-            str(value["detail"]),
+            value["detail"],
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ParamsProtocol("host returned an invalid repair") from error
@@ -1128,8 +1182,8 @@ def _as_interrupt(value: object) -> Interrupt:
         return value
     if isinstance(value, Mapping):
         try:
-            return Interrupt(str(value["kind"]), str(value["reason"]))
-        except KeyError as error:
+            return Interrupt(value["kind"], value["reason"])
+        except (KeyError, TypeError) as error:
             raise ParamsProtocol("host returned an invalid interrupt") from error
     raise ParamsProtocol("host returned an invalid interrupt")
 
@@ -1137,10 +1191,60 @@ def _as_interrupt(value: object) -> Interrupt:
 def _as_phase(value: object) -> InvocationPhase:
     if isinstance(value, InvocationPhase):
         return value
-    try:
-        return InvocationPhase[value] if isinstance(value, str) else InvocationPhase(value)
-    except (KeyError, TypeError, ValueError) as error:
-        raise ParamsProtocol("host returned an invalid invocation phase") from error
+    phases = (
+        InvocationPhase.OPEN,
+        InvocationPhase.ARGS_FINALIZED,
+        InvocationPhase.ADMISSION,
+        InvocationPhase.ADMITTED,
+        InvocationPhase.ASSISTANT_ITEM_COMMITTED,
+        InvocationPhase.EFFECTS_AUTHORIZED,
+        InvocationPhase.SETTLED,
+    )
+    if isinstance(value, str):
+        normalized = value.upper()
+        for phase in phases:
+            if phase.value.upper() == normalized:
+                return phase
+    elif isinstance(value, int) and not isinstance(value, bool):
+        for phase in phases:
+            if phase.ordinal == value:
+                return phase
+    raise ParamsProtocol("host returned an invalid invocation phase")
+
+
+def _expected_shape(target: object) -> str:
+    if target is None or target is Any:
+        return "any JSON value"
+    origin = get_origin(target)
+    if origin is not None:
+        return str(target)
+    names = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+        type(None): "null",
+    }
+    if target in names:
+        return names[target]
+    return getattr(target, "__name__", str(target))
+
+
+def _json_arguments(arguments: Mapping[str, object]) -> dict[str, object]:
+    """Lower cursor metadata to the shared JSON CONTROL vocabulary."""
+
+    lowered: dict[str, object] = {}
+    for key, value in arguments.items():
+        if key == "path" or key == "aliases":
+            value = list(value)  # type: ignore[arg-type]
+        elif key == "coercions":
+            value = [item.value for item in value]  # type: ignore[union-attr]
+        if not _is_json_value(value):
+            raise ParamsMisuse(f"{key} is not JSON-serializable cursor metadata")
+        lowered[key] = value
+    return lowered
 
 
 def _shape_name(value: object) -> str:

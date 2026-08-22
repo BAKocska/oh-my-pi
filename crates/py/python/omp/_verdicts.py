@@ -561,9 +561,71 @@ class SpillBudget:
     always: bool = False
 
 
+def _validate_projection(
+    value: object, caps: PromptCaps
+) -> list[TextPart | JsonPart | BlobPart]:
+    if not isinstance(value, list):
+        raise TypeError("device prompt projections must return a list")
+    if any(not isinstance(part, (TextPart, JsonPart, BlobPart)) for part in value):
+        raise TypeError("device prompt projections must contain only Part values")
+    if len(value) > caps.maximum_parts:
+        raise BudgetError("device prompt projection exceeded maximum_parts")
+    text_bytes = sum(
+        len(part.text.encode("utf-8"))
+        if isinstance(part, TextPart)
+        else len(part.json)
+        if isinstance(part, JsonPart)
+        else 0
+        for part in value
+    )
+    if text_bytes > caps.maximum_text_bytes:
+        raise BudgetError("device prompt projection exceeded maximum_text_bytes")
+    if not caps.media and any(isinstance(part, BlobPart) for part in value):
+        raise BudgetError("device prompt projection emitted media without media capability")
+    return value
+
+
+def _dispatch_prompt(
+    name: str,
+    family: str,
+    rev: int,
+    view: Ok[Any] | Faulted[Any],
+    caps: PromptCaps,
+) -> list[TextPart | JsonPart | BlobPart]:
+    """Run the exact registered device projection selected by the host."""
+
+    from ._registry import registry
+
+    if not isinstance(view, (Ok, Faulted)):
+        raise TypeError("device prompt view must be Ok or Faulted")
+    if not isinstance(caps, PromptCaps):
+        raise TypeError("device prompt caps must be PromptCaps")
+    definition = registry.device_definition(name, family, rev)
+    projector = getattr(definition.body, "prompt", None)
+    if not callable(projector):
+        raise LookupError(f"device {name!r}@{family or name}.{rev} has no prompt projection")
+    return _validate_projection(projector(view, caps), caps)
+
+
 def prompt(view: Ok[Any] | Faulted[Any], caps: PromptCaps) -> list[TextPart | JsonPart | BlobPart]:
-    """Dispatch a prompt projection once the host projection arm is wired."""
-    raise NotWiredError("verdict prompt projection dispatch is not wired")
+    """Dispatch to the sole registered projection owning this verdict shape."""
+
+    from ._registry import registry
+
+    if not isinstance(view, (Ok, Faulted)):
+        raise TypeError("device prompt view must be Ok or Faulted")
+    payload = view.payload if isinstance(view, Ok) else view.fault
+    matches: list[tuple[str, str, int]] = []
+    for definition in registry.device_definitions():
+        projector = getattr(definition.body, "prompt", None)
+        shape_name = "Payload" if isinstance(view, Ok) else "Fault"
+        shape = getattr(definition.body, shape_name, None)
+        if callable(projector) and isinstance(shape, type) and type(payload) is shape:
+            matches.append((definition.name, definition.family, definition.rev))
+    if len(matches) != 1:
+        detail = "no registered owner" if not matches else "multiple registered owners"
+        raise LookupError(f"{detail} for {type(payload).__qualname__}")
+    return _dispatch_prompt(*matches[0], view, caps)
 
 
 class _ShapeMismatch(ValueError):

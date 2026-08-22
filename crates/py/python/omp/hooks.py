@@ -1,15 +1,24 @@
-"""Pure-Python hook declarations and decisions.
-
-Importing this module only records declarations.  The CONTROL dispatcher is a
-separate host arm and is deliberately unavailable in the surface-freeze wave.
-"""
+"""Pure-Python hook declarations, CONTROL dispatch, and decision codecs."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import asyncio
+import inspect
+import math
+import types
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
-from typing import Any, ClassVar, Final, TypeAlias, TypeVar
+from typing import (
+    Any,
+    ClassVar,
+    Final,
+    TypeAlias,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from _omp import Duration, OmpError
 
@@ -298,7 +307,8 @@ _EVENT_NAMES = (
     "capability_budget", "model_changed", "credential_disabled", "compaction",
     "compaction_done", "context_reset", "thread_projection", "subagent_spawn", "worker_state",
     "job_registered", "job_settled", "extension_activate", "extension_load",
-    "extension_unload", "host_reconnect",
+    "extension_unload", "host_reconnect", "ttsr_triggered", "todo_reminder",
+    "retry_start", "retry_end", "fallback_applied", "fallback_succeeded",
 )
 
 
@@ -327,6 +337,8 @@ _OBSERVATION_EVENTS = frozenset(
         "capability_budget", "model_changed", "credential_disabled",
         "compaction_done", "context_reset", "worker_state", "job_registered", "job_settled",
         "extension_activate", "extension_load", "extension_unload", "host_reconnect",
+        "ttsr_triggered", "todo_reminder", "retry_start", "retry_end",
+        "fallback_applied", "fallback_succeeded",
     }
 )
 _DOMAIN_EVENTS = frozenset(
@@ -395,6 +407,33 @@ def hook(
             raise HookContractError(f"unknown hook failure policy {on_failure!r}") from error
     if event in _OBSERVATION_EVENTS and on_failure is not None:
         raise HookContractError("observation hooks do not accept on_failure")
+    from .events import spec as event_spec
+
+    try:
+        catalog = event_spec(event)
+    except UnknownEvent:
+        catalog = None
+    if (
+        catalog is not None
+        and catalog.on_failure is OnFailure.DENY
+        and on_failure is OnFailure.DEFER
+    ):
+        raise HookContractError(
+            f"{event!r} is fail-closed and cannot lower on_failure to DEFER"
+        )
+    if timeout is not None:
+        if not isinstance(timeout, Duration):
+            raise TypeError("timeout must be omp.Duration or None")
+        if timeout.seconds <= 0:
+            raise HookContractError("hook timeout must be greater than zero")
+        if (
+            catalog is not None
+            and timeout.seconds > catalog.ceiling_timeout.seconds
+        ):
+            raise HookContractError(
+                f"hook timeout exceeds {event!r} ceiling "
+                f"{catalog.ceiling_timeout}"
+            )
     if not isinstance(order, int) or isinstance(order, bool):
         raise TypeError("order must be an integer")
     if registry_phase != HookPhase.TRANSFORM and order != 0:
@@ -403,6 +442,11 @@ def hook(
         raise HookContractError(f"stream event {event!r} requires coalesce")
     if event not in _STREAM_EVENTS and coalesce is not None:
         raise HookContractError(f"non-stream event {event!r} does not accept coalesce")
+    if coalesce is not None:
+        if not isinstance(coalesce, Duration):
+            raise TypeError("coalesce must be omp.Duration or None")
+        if coalesce.seconds < 0.016:
+            raise HookContractError("stream hook coalesce must be at least 16ms")
     if provider is not None:
         if when is not None and when.provider is not None:
             raise HookContractError("provider and When.provider are mutually exclusive")
@@ -434,10 +478,542 @@ def hook(
     return decorate
 
 
-async def dispatch_hook(*_args: object, **_kwargs: object) -> object:
-    """Fail at call time until Part 4 installs the CONTROL hook dispatcher."""
+def _target_to_wire(target: CallTarget) -> dict[str, object]:
+    if isinstance(target, CoreTool):
+        return {
+            "kind": TargetKind.CORE.value,
+            "name": target.name,
+            "rev": target.rev,
+            "args": _wire_value(target.args),
+        }
+    if isinstance(target, DeviceCall):
+        return {
+            "kind": TargetKind.DEVICE.value,
+            "name": target.name,
+            "family": target.family,
+            "rev": target.rev,
+            "args": _wire_value(target.args),
+        }
+    if isinstance(target, McpCall):
+        return {
+            "kind": TargetKind.MCP.value,
+            "server": target.server,
+            "tool": target.tool,
+            "args": _wire_value(target.args),
+        }
+    raise HookContractError(f"unknown call target {type(target).__name__}")
 
-    raise NotWiredError("omp hook CONTROL dispatch is not wired")
+
+def _target_from_wire(value: object) -> CallTarget:
+    if not isinstance(value, Mapping):
+        raise HookContractError("hook target must be a mapping")
+    kind = value.get("kind")
+    args = value.get("args")
+    if not isinstance(args, Mapping):
+        raise HookContractError("hook target args must be a mapping")
+    if any(not isinstance(key, str) for key in args):
+        raise HookContractError("hook target args keys must be strings")
+    try:
+        if kind == TargetKind.CORE.value:
+            name = value["name"]
+            rev = value["rev"]
+            if not isinstance(name, str) or not isinstance(rev, str):
+                raise HookContractError(
+                    "core hook target name and rev must be strings"
+                )
+            return CoreTool(name, rev, dict(args))
+        if kind == TargetKind.DEVICE.value:
+            name = value["name"]
+            family = value["family"]
+            rev = value["rev"]
+            if any(
+                not isinstance(field, str)
+                for field in (name, family, rev)
+            ):
+                raise HookContractError(
+                    "device hook target name, family, and rev must be strings"
+                )
+            return DeviceCall(name, family, rev, dict(args))
+        if kind == TargetKind.MCP.value:
+            server = value["server"]
+            tool = value["tool"]
+            if not isinstance(server, str) or not isinstance(tool, str):
+                raise HookContractError(
+                    "MCP hook target server and tool must be strings"
+                )
+            return McpCall(server, tool, dict(args))
+    except KeyError as error:
+        raise HookContractError("hook target omitted a required field") from error
+    raise HookContractError(f"unknown hook target kind {kind!r}")
+
+
+def _approval_to_wire(spec: ApprovalSpec) -> dict[str, object]:
+    if not isinstance(spec, ApprovalSpec):
+        raise HookContractError("RequireApproval requires an ApprovalSpec")
+    if any(
+        not isinstance(value, str)
+        for value in (spec.title, spec.body, spec.subject)
+    ):
+        raise HookContractError(
+            "approval title, body, and subject must be strings"
+        )
+    return {
+        "title": spec.title,
+        "body": spec.body,
+        "subject": spec.subject,
+        "kind": spec.kind.value,
+        "scopes": [scope.value for scope in spec.scopes],
+        "default": spec.default,
+        "route": spec.route.value,
+        "approver": spec.approver,
+        "timeout": str(spec.timeout),
+        "unreachable": spec.unreachable.value,
+        "require_human": spec.require_human,
+        "pattern": spec.pattern,
+        "evidence": list(spec.evidence),
+    }
+
+
+def _approval_from_wire(value: object) -> ApprovalSpec:
+    if not isinstance(value, Mapping):
+        raise HookContractError("approval decision spec must be a mapping")
+    try:
+        title = value["title"]
+        body = value["body"]
+        subject = value["subject"]
+    except KeyError as error:
+        raise HookContractError("invalid approval decision spec") from error
+    if any(
+        not isinstance(field, str)
+        for field in (title, body, subject)
+    ):
+        raise HookContractError(
+            "approval title, body, and subject must be strings"
+        )
+
+    scopes = value.get(
+        "scopes",
+        (PolicyScope.ONCE.value, PolicyScope.SESSION.value),
+    )
+    evidence = value.get("evidence", ())
+    if (
+        not isinstance(scopes, Sequence)
+        or isinstance(scopes, (str, bytes))
+        or not all(isinstance(scope, str) for scope in scopes)
+    ):
+        raise HookContractError("approval scopes must be a sequence of strings")
+    if (
+        not isinstance(evidence, Sequence)
+        or isinstance(evidence, (str, bytes))
+        or not all(isinstance(item, str) for item in evidence)
+    ):
+        raise HookContractError(
+            "approval evidence must be a sequence of strings"
+        )
+
+    default = value.get("default")
+    approver = value.get("approver")
+    timeout = value.get("timeout", str(APPROVAL_DEADLINE))
+    require_human = value.get("require_human", False)
+    pattern = value.get("pattern")
+    if default is not None and not isinstance(default, bool):
+        raise HookContractError("approval default must be bool or None")
+    if approver is not None and not isinstance(approver, str):
+        raise HookContractError("approval approver must be a string or None")
+    if not isinstance(timeout, str):
+        raise HookContractError("approval timeout must be a string")
+    if not isinstance(require_human, bool):
+        raise HookContractError("approval require_human must be bool")
+    if pattern is not None and not isinstance(pattern, str):
+        raise HookContractError("approval pattern must be a string or None")
+
+    try:
+        return ApprovalSpec(
+            title=title,
+            body=body,
+            subject=subject,
+            kind=ApprovalKind(value.get("kind", ApprovalKind.EXEC.value)),
+            scopes=tuple(PolicyScope(scope) for scope in scopes),
+            default=default,
+            route=ApprovalRoute(value.get("route", ApprovalRoute.AUTO.value)),
+            approver=approver,
+            timeout=Duration(timeout),
+            unreachable=Unreachable(
+                value.get("unreachable", Unreachable.FAIL_CLOSED.value)
+            ),
+            require_human=require_human,
+            pattern=pattern,
+            evidence=tuple(evidence),
+        )
+    except (TypeError, ValueError) as error:
+        raise HookContractError("invalid approval decision spec") from error
+
+
+def _decision_to_wire(decision: HookDecision) -> dict[str, object]:
+    if isinstance(decision, Allow):
+        if decision.reason is not None and not isinstance(decision.reason, str):
+            raise HookContractError("Allow.reason must be a string or None")
+        return {"kind": "allow", "reason": decision.reason}
+    if isinstance(decision, Deny):
+        if not isinstance(decision.reason, str):
+            raise HookContractError("Deny.reason must be a string")
+        if not isinstance(decision.fatal, bool):
+            raise HookContractError("Deny.fatal must be bool")
+        if decision.code is not None and not isinstance(decision.code, str):
+            raise HookContractError("Deny.code must be a string or None")
+        return {
+            "kind": "deny",
+            "reason": decision.reason,
+            "fatal": decision.fatal,
+            "code": decision.code,
+        }
+    if isinstance(decision, Modify):
+        patch: dict[str, object] | None = None
+        unset: list[str] = []
+        if decision.patch is not None:
+            patch = {}
+            for key, value in decision.patch.items():
+                if not isinstance(key, str):
+                    raise HookContractError("Modify.patch keys must be strings")
+                if value is UNSET:
+                    unset.append(key)
+                else:
+                    patch[key] = _wire_value(value)
+        return {
+            "kind": "modify",
+            "target": (
+                _target_to_wire(decision.target)
+                if decision.target is not None
+                else None
+            ),
+            "args": (
+                _wire_value(decision.args)
+                if decision.args is not None
+                else None
+            ),
+            "patch": patch,
+            "unset": unset,
+            "reason": decision.reason,
+        }
+    if isinstance(decision, Defer):
+        if decision.note is not None and not isinstance(decision.note, str):
+            raise HookContractError("Defer.note must be a string or None")
+        return {"kind": "defer", "note": decision.note}
+    if isinstance(decision, RequireApproval):
+        return {
+            "kind": "require_approval",
+            "spec": _approval_to_wire(decision.spec),
+        }
+    raise HookContractError(
+        f"hook returned unsupported decision {type(decision).__name__}"
+    )
+
+
+def _decision_from_wire(value: object) -> HookDecision:
+    if not isinstance(value, Mapping):
+        raise HookContractError("hook decision response must be a mapping")
+    kind = value.get("kind")
+    if kind == "allow":
+        reason = value.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise HookContractError(
+                "Allow response reason must be a string or None"
+            )
+        return Allow(reason)
+    if kind == "deny":
+        reason = value.get("reason")
+        if not isinstance(reason, str):
+            raise HookContractError("Deny response requires a reason")
+        fatal = value.get("fatal", False)
+        if not isinstance(fatal, bool):
+            raise HookContractError("Deny response fatal must be bool")
+        code = value.get("code")
+        if code is not None and not isinstance(code, str):
+            raise HookContractError(
+                "Deny response code must be a string or None"
+            )
+        return Deny(reason, fatal=fatal, code=code)
+    if kind == "modify":
+        target = value.get("target")
+        args = value.get("args")
+        patch_value = value.get("patch")
+        unset = value.get("unset", ())
+        reason = value.get("reason")
+        if args is not None and not isinstance(args, Mapping):
+            raise HookContractError("Modify args response must be a mapping")
+        if patch_value is not None and not isinstance(patch_value, Mapping):
+            raise HookContractError("Modify patch response must be a mapping")
+        if (
+            not isinstance(unset, Sequence)
+            or isinstance(unset, (str, bytes))
+        ):
+            raise HookContractError("Modify unset response must be a sequence")
+        if reason is not None and not isinstance(reason, str):
+            raise HookContractError(
+                "Modify response reason must be a string or None"
+            )
+        if args is not None and any(
+            not isinstance(key, str) for key in args
+        ):
+            raise HookContractError("Modify args keys must be strings")
+        if patch_value is not None and any(
+            not isinstance(key, str) for key in patch_value
+        ):
+            raise HookContractError("Modify patch keys must be strings")
+        if not all(isinstance(key, str) for key in unset):
+            raise HookContractError("Modify unset keys must be strings")
+
+        patch = dict(patch_value) if patch_value is not None else None
+        if patch is not None and any(key in patch for key in unset):
+            raise HookContractError(
+                "Modify response cannot patch and unset the same key"
+            )
+        if unset:
+            if patch is None:
+                patch = {}
+            patch.update((key, UNSET) for key in unset)
+        return Modify(
+            target=_target_from_wire(target) if target is not None else None,
+            args=dict(args) if args is not None else None,
+            patch=patch,
+            reason=reason,
+        )
+    if kind == "defer":
+        note = value.get("note")
+        if note is not None and not isinstance(note, str):
+            raise HookContractError(
+                "Defer response note must be a string or None"
+            )
+        return Defer(note)
+    if kind == "require_approval":
+        return RequireApproval(_approval_from_wire(value.get("spec")))
+    raise HookContractError(f"unknown hook decision kind {kind!r}")
+
+
+def _wire_value(value: object) -> object:
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, float) and not math.isfinite(value):
+        raise HookContractError("non-finite floats cannot cross CONTROL")
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if value is UNSET:
+        raise HookContractError("UNSET is legal only as a Modify.patch value")
+    if isinstance(value, Duration):
+        return str(value)
+    if isinstance(value, (CoreTool, DeviceCall, McpCall)):
+        return _target_to_wire(value)
+    if isinstance(value, Mapping):
+        encoded: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise HookContractError("CONTROL mapping keys must be strings")
+            encoded[key] = _wire_value(item)
+        return encoded
+    if isinstance(value, (tuple, list, frozenset)):
+        return [_wire_value(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _wire_value(getattr(value, field.name))
+            for field in fields(value)
+            if not field.name.startswith("_")
+        }
+    raise HookContractError(
+        f"{type(value).__name__} cannot cross the hook CONTROL boundary"
+    )
+
+
+def _value_from_wire(annotation: object, value: object) -> object:
+    if annotation in (Any, object):
+        return value
+    if annotation == CallTarget:
+        return _target_from_wire(value)
+    origin = get_origin(annotation)
+    arguments = get_args(annotation)
+    if origin in (types.UnionType,):
+        if (
+            isinstance(value, Mapping)
+            and value.get("kind") in {kind.value for kind in TargetKind}
+            and any(
+                candidate in (CoreTool, DeviceCall, McpCall)
+                for candidate in arguments
+            )
+        ):
+            return _target_from_wire(value)
+        for candidate in arguments:
+            if candidate is type(None) and value is None:
+                return None
+            try:
+                return _value_from_wire(candidate, value)
+            except (HookContractError, TypeError, ValueError):
+                continue
+        raise HookContractError(f"value does not match {annotation!r}")
+    if origin is not None and str(origin) == "typing.Union":
+        for candidate in arguments:
+            if candidate is type(None) and value is None:
+                return None
+            try:
+                return _value_from_wire(candidate, value)
+            except (HookContractError, TypeError, ValueError):
+                continue
+        raise HookContractError(f"value does not match {annotation!r}")
+    if origin in (tuple, list, frozenset, Sequence):
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            raise HookContractError("hook sequence field must be a sequence")
+        item_type = arguments[0] if arguments else Any
+        converted = [_value_from_wire(item_type, item) for item in value]
+        return tuple(converted) if origin is tuple else (
+            frozenset(converted) if origin is frozenset else converted
+        )
+    if origin in (dict, Mapping):
+        if not isinstance(value, Mapping):
+            raise HookContractError("hook mapping field must be a mapping")
+        value_type = arguments[1] if len(arguments) == 2 else Any
+        return {
+            str(key): _value_from_wire(value_type, item)
+            for key, item in value.items()
+        }
+    if isinstance(annotation, type) and issubclass(annotation, StrEnum):
+        return annotation(value)
+    if annotation is Duration:
+        return Duration(str(value))
+    if isinstance(annotation, type) and is_dataclass(annotation):
+        if not isinstance(value, Mapping):
+            raise HookContractError(
+                f"{annotation.__name__} payload must be a mapping"
+            )
+        hints = get_type_hints(annotation)
+        kwargs = {
+            field.name: _value_from_wire(
+                hints.get(field.name, Any), value[field.name]
+            )
+            for field in fields(annotation)
+            if not field.name.startswith("_") and field.name in value
+        }
+        try:
+            return annotation(**kwargs)
+        except (TypeError, ValueError) as error:
+            raise HookContractError(
+                f"invalid {annotation.__name__} hook payload"
+            ) from error
+    return value
+
+
+def _validate_decision(decision: object, phase: HookPhase) -> HookDecision | None:
+    if phase is HookPhase.OBSERVE:
+        if decision is not None:
+            raise HookContractError("OBSERVE hooks must return None")
+        return None
+    if decision is None:
+        decision = Defer()
+    legal: tuple[type, ...]
+    if phase is HookPhase.PRECHECK:
+        legal = (Deny, Defer)
+    elif phase is HookPhase.TRANSFORM:
+        legal = (Modify, Defer)
+    elif phase is HookPhase.REVIEW:
+        legal = (Allow, Deny, Defer)
+    else:
+        legal = (RequireApproval, Allow, Deny, Defer)
+    if not isinstance(decision, legal):
+        raise HookContractError(
+            f"{type(decision).__name__} is illegal in {phase.value.upper()}"
+        )
+    return decision
+
+
+async def _dispatch_hook_callback(
+    event: str,
+    phase: str,
+    name: str,
+    payload: object,
+    context: object | None = None,
+) -> object:
+    """Execute exactly one host-selected frozen subscription."""
+    from ._context import Context
+    from .events import spec as event_spec
+
+    catalog = event_spec(event)
+    hook_phase: HookPhase | None
+    if phase == "domain":
+        hook_phase = None
+    else:
+        try:
+            hook_phase = HookPhase(phase)
+        except ValueError as error:
+            raise HookContractError(
+                f"unknown dispatched hook phase {phase!r}"
+            ) from error
+    matches = tuple(
+        definition.handler
+        for definition in registry.snapshot().hook_definitions
+        if definition.event == event
+        and definition.phase == (
+            "domain" if hook_phase is None else hook_phase.value
+        )
+        and definition.handler.name == name
+    )
+    if len(matches) != 1:
+        raise HookContractError(
+            f"host selected unknown hook subscription {name!r} "
+            f"for {event!r}/{phase!r}"
+        )
+    declaration = matches[0]
+    event_value = _value_from_wire(catalog.payload, payload)
+    if context is None:
+        try:
+            context_value = Context.current()
+        except LookupError as error:
+            raise HookContractError(
+                "host hook dispatch omitted its callback context"
+            ) from error
+    elif isinstance(context, Context):
+        context_value = context
+    else:
+        context_value = _value_from_wire(Context, context)
+
+    async def call_handler() -> object:
+        result = declaration.handler(event_value, context_value)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    timeout = declaration.timeout or catalog.default_timeout
+    if timeout.seconds > 0:
+        result = await asyncio.wait_for(call_handler(), timeout.seconds)
+    else:
+        result = await call_handler()
+    if hook_phase is None:
+        return _wire_value(result)
+    decision = _validate_decision(result, hook_phase)
+    if isinstance(decision, Deny) and decision.fatal:
+        if catalog.latency is LatencyClass.CALL:
+            raise HookContractError("fatal=True is illegal for CALL hooks")
+    return None if decision is None else _decision_to_wire(decision)
+
+
+async def dispatch_hook(event: str, payload: object = None) -> HookDecision:
+    """Dispatch one event through Core's composed CONTROL decision procedure."""
+    from . import _control_backend, _control_request
+
+    if _control_backend.get() is None:
+        raise NotWiredError("omp.hooks.dispatch")
+    if not isinstance(event, str):
+        raise TypeError("hook event must be a string")
+    from .events import spec as event_spec
+
+    catalog = event_spec(event)
+    if not catalog.gateable:
+        raise HookContractError(
+            f"event {event!r} has no composed HookDecision"
+        )
+    response = await _control_request(
+        "omp.hooks.dispatch",
+        event=event,
+        event_rev=catalog.rev,
+        payload=_wire_value(payload),
+    )
+    return _decision_from_wire(response)
 
 __all__ = (
     "APPROVAL_DEADLINE", "DEFAULT_HOOK_TIMEOUT", "Allow", "ApprovalKind", "ApprovalRoute",

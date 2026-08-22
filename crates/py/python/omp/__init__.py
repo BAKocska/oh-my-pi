@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio as _asyncio
 import contextvars as _contextvars
 import inspect as _inspect
+import keyword as _keyword
+import json as _json
 import os as _os
 import re as _re
 from dataclasses import KW_ONLY as _KW_ONLY
@@ -713,6 +715,7 @@ from .limits import (
 )
 from . import creds as creds
 from . import secrets as secrets
+from . import scribe as scribe
 from .creds import CredentialMeta, ScopedToken
 from .secrets import SecretKind, SecretMode, SecretRule
 from .params import (
@@ -816,6 +819,8 @@ from .urls import (
 from ._registry import (
     DeclarationDrift,
     DeviceDefinition as _DeviceDefinition,
+    PreludeDefinition as _PreludeDefinition,
+    PreludeParamSpec as _PreludeParamSpec,
     DeclarationRegistry,
     MAX_DECLARATIONS,
     DeclarationSnapshot,
@@ -1101,6 +1106,7 @@ from .packages import (
 
 
 _DEVICE_NAME_PATTERN = _re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_PRELUDE_PARAM_NAME_PATTERN = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_DEVICE_NAMES = frozenset(
     {"resolve", "reject", "propose", "report_issue"}
 )
@@ -1226,52 +1232,133 @@ def device(
 
 
 def tool(
-    name: str | _Any | None = None,
+    name: str | _Callable[..., _Any] | None = None,
     *,
     kind: str = "soft",
-    effects: _Any = None,
-    tier: _Any = None,
+    effects: Effects | None = None,
+    tier: Tier | None = None,
     rev: int = 1,
-):
+) -> _Callable[[_Callable[..., _Any]], Device] | Device:
     """Declare an ergonomic host leaf on the existing device registry path."""
     if kind not in {"soft", "hard"}:
         raise ValueError("tool kind must be 'soft' or 'hard'")
     if not isinstance(rev, int) or isinstance(rev, bool):
         raise TypeError("tool rev must be int")
 
-    def decorate(function: _Any) -> _Any:
+    def decorate(function: _Any) -> Device:
         tool_name = function.__name__ if name is None or callable(name) else name
         function.__omp_place__ = Place.HOST
         function.__omp_tool_kind__ = kind
         function.__omp_effects__ = effects
         function.__omp_tier__ = tier
-        definition = _DeviceDefinition(
-            name=tool_name,
-            family="",
+        return device(
+            tool_name,
+            family=_declarations.extension_id or "",
             rev=rev,
-            place=Place.HOST,
-            summary=None,
-            docs=None,
-            schema=None,
-            examples=(),
-            available=None,
-            precedence=Precedence.DEFAULT,
-            replaces=None,
-            intents=(),
             effects=effects,
-            tier=tier,
-            deadline=None,
-            aliases=None,
-            body=function,
+            tier=Tier.WRITE if tier is None else tier,
+        )(function)
+
+    if callable(name):
+        return decorate(name)
+    return decorate
+
+
+def prelude(
+    name: str | _Callable[..., _Any] | None = None,
+    *,
+    rev: int = 1,
+    summary: str | None = None,
+) -> _Callable[[_Callable[..., _Any]], _Callable[..., _Any]] | _Callable[..., _Any]:
+    """Declare a documented synchronous helper in every eval namespace."""
+    if not isinstance(rev, int) or isinstance(rev, bool):
+        raise TypeError("prelude rev must be int")
+    if not 1 <= rev <= 65_535:
+        raise ValueError("prelude rev must be a positive unsigned 16-bit integer")
+    if summary is not None and not isinstance(summary, str):
+        raise TypeError("prelude summary must be str or None")
+
+    def decorate(function: _Any) -> _Callable[..., _Any]:
+        if not callable(function):
+            raise TypeError("@omp.prelude may decorate only a callable")
+        resolved_name = (
+            function.__name__ if name is None or callable(name) else name
         )
-        _declarations.register_tool(
-            tool_name, "", rev, function, definition=definition
+        if (
+            not isinstance(resolved_name, str)
+            or _DEVICE_NAME_PATTERN.fullmatch(resolved_name) is None
+        ):
+            raise DeviceNameError(f"invalid prelude name {resolved_name!r}")
+        if resolved_name in _RESERVED_DEVICE_NAMES or _keyword.iskeyword(
+            resolved_name
+        ):
+            raise DeviceNameError(f"reserved prelude name {resolved_name!r}")
+
+        params: list[_PreludeParamSpec] = []
+        for parameter in _inspect.signature(function).parameters.values():
+            if (
+                _PRELUDE_PARAM_NAME_PATTERN.fullmatch(parameter.name) is None
+                or _keyword.iskeyword(parameter.name)
+            ):
+                raise SchemaError(
+                    f"prelude parameter {parameter.name!r} has an invalid name"
+                )
+            if parameter.kind is _inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                kind = "positional_or_keyword"
+            elif parameter.kind is _inspect.Parameter.KEYWORD_ONLY:
+                kind = "keyword_only"
+            else:
+                raise SchemaError(
+                    f"prelude parameter {parameter.name!r} has unsupported "
+                    f"kind {parameter.kind.name}"
+                )
+            default_json: str | None = None
+            if parameter.default is not _inspect.Parameter.empty:
+                try:
+                    default_json = _json.dumps(parameter.default, allow_nan=False)
+                except (TypeError, ValueError) as error:
+                    raise SchemaError(
+                        f"prelude parameter {parameter.name!r} has a non-JSON default"
+                    ) from error
+            annotation = (
+                None
+                if parameter.annotation is _inspect.Parameter.empty
+                else _inspect.formatannotation(parameter.annotation)
+            )
+            params.append(
+                _PreludeParamSpec(
+                    name=parameter.name,
+                    kind=kind,
+                    default_json=default_json,
+                    annotation=annotation,
+                )
+            )
+
+        doc = _inspect.getdoc(function) or ""
+        resolved_summary = summary or (doc.splitlines()[0] if doc else "")
+
+        def _handler(arguments: _Mapping[str, object]) -> object:
+            return function(**arguments)
+
+        _declarations.register_prelude(
+            _PreludeDefinition(
+                name=resolved_name,
+                rev=rev,
+                doc=doc,
+                summary=resolved_summary,
+                params=tuple(params),
+                body=function,
+                handler=_handler,
+                module=function.__module__.split(".")[0],
+            )
         )
         return function
 
     if callable(name):
         return decorate(name)
     return decorate
+
+
 urls._bind_scheme_source(_scheme_snapshot)
 
 RUNTIME_METADATA = _runtime_metadata()
@@ -1711,6 +1798,7 @@ __all__ += (
     "manifest",
     "mcp",
     "params",
+    "prelude",
     "require",
     "resources",
     "restart_reason",

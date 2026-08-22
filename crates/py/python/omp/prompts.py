@@ -99,11 +99,22 @@ def prompt_slot(slot: str, *, priority: int = 0, cls: SlotClass | None = None):
 
 
 async def invalidate(slot: str) -> int:
-    """Invalidate this extension's contribution through the future prompt host arm."""
+    """Invalidate this extension's contribution through the prompt-head owner."""
 
     if slot not in _SLOT_CLASSES:
         raise UnknownSlot(f"unknown or non-writable prompt slot: {slot!r}")
-    raise NotWiredError("omp.prompts.invalidate")
+    if _SLOT_CLASSES[slot] is SlotClass.FROZEN:
+        raise SlotClassConflict(f"{slot!r} is frozen and cannot be invalidated")
+    from . import _control_backend, _control_request
+
+    if _control_backend.get() is None:
+        raise NotWiredError("omp.prompts.invalidate")
+    generation = await _control_request("omp.prompts.invalidate", slot=slot)
+    if not isinstance(generation, int) or isinstance(generation, bool):
+        raise TypeError("prompt invalidation response must be an integer generation")
+    if generation < 0:
+        raise ValueError("prompt invalidation generation must be non-negative")
+    return generation
 
 
 __all__ = (

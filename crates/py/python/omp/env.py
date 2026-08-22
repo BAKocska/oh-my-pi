@@ -11,6 +11,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import os
 from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -25,7 +26,7 @@ from _omp import (
     EnvPath,
     EnvUnavailable,
     PlacementError,
-    _read_bytes_blocking,
+    _open_environment_scope,
 )
 
 from . import EffectsNotAuthorized, Fault, OmpError, StaleGeneration
@@ -293,7 +294,16 @@ class WorktreeInfo:
 
 async def worktree() -> WorktreeInfo | None:
     """Return current worktree topology through the capability-gated host arm."""
-    raise NotWiredError("omp.env.worktree")
+    result = await _request("omp.env.worktree")
+    if result is None or isinstance(result, WorktreeInfo):
+        return result
+    if not isinstance(result, Mapping):
+        raise TypeError("worktree backend returned invalid topology")
+    values = dict(result)
+    root = values.get("root")
+    if not isinstance(root, EnvPath):
+        values["root"] = EnvPath(root)
+    return WorktreeInfo(**values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,9 +628,112 @@ direct_filesystem = DirectFilesystem()
 """The explicitly exceptional filesystem capability; never an Environment alias."""
 
 
-def _install_backend(backend: Any, environment_info: EnvInfo) -> None:
-    """Install one invocation-scoped backend in the active Python context."""
-    _binding.set((backend, environment_info))
+@dataclass(frozen=True, slots=True)
+class _BindingTokens:
+    environment: contextvars.Token[tuple[Any, EnvInfo] | None]
+    direct_filesystem: contextvars.Token[
+        tuple[Any, DirectFilesystemGrant] | None
+    ]
+
+
+def _install_backend(
+    backend: Any,
+    environment_info: EnvInfo,
+    *,
+    direct_filesystem_backend: Any | None = None,
+    direct_filesystem_grant: DirectFilesystemGrant | None = None,
+) -> _BindingTokens:
+    """Install invocation-scoped DATA authority and return exact reset tokens."""
+
+    if not isinstance(environment_info, EnvInfo):
+        raise TypeError("environment_info must be an omp.env.EnvInfo")
+    if (direct_filesystem_backend is None) != (direct_filesystem_grant is None):
+        raise ValueError(
+            "direct-filesystem backend and durable grant must be installed together"
+        )
+    environment = _binding.set((backend, environment_info))
+    direct_filesystem = _direct_filesystem_binding.set(
+        None
+        if direct_filesystem_grant is None
+        else (direct_filesystem_backend, direct_filesystem_grant)
+    )
+    return _BindingTokens(environment, direct_filesystem)
+
+
+def _reset_backend(tokens: _BindingTokens) -> None:
+    """Remove one invocation's authority without disturbing its parent context."""
+
+    if not isinstance(tokens, _BindingTokens):
+        raise TypeError("tokens must be returned by omp.env._install_backend")
+    _direct_filesystem_binding.reset(tokens.direct_filesystem)
+    _binding.reset(tokens.environment)
+
+async def _install_invocation_backend(
+    authority: Mapping[str, Any],
+    control_backend: Any | None = None,
+) -> _BindingTokens | None:
+    """Authenticate one host invocation's DATA scope and install its authority."""
+
+    data = authority.get("data")
+    if data is None:
+        return None
+    if not isinstance(data, Mapping):
+        raise TypeError("dispatch DATA authority must be a mapping")
+    socket = os.environ.get("OMP_EXT_ENV_SOCKET")
+    if not socket:
+        raise EnvUnavailable("this placement has no Environment DATA socket")
+    invocation = data.get("invocation")
+    effect_token = data.get("effect_token")
+    host_generation = data.get("host_generation")
+    session_generation = data.get("session_generation")
+    pty_denied = data.get("pty_denied", False)
+    if not isinstance(invocation, str) or not invocation:
+        raise ValueError("dispatch DATA authority has no invocation id")
+    if type(effect_token) is not bytes or not effect_token:
+        raise ValueError("dispatch DATA authority has no effect token")
+    if type(host_generation) is not int or host_generation < 1:
+        raise ValueError("dispatch DATA authority has an invalid host generation")
+    if type(session_generation) is not int or session_generation < 1:
+        raise ValueError("dispatch DATA authority has an invalid session generation")
+    if type(pty_denied) is not bool:
+        raise TypeError("dispatch DATA pty_denied fence must be bool")
+    backend, raw_info = await asyncio.to_thread(
+        _open_environment_scope,
+        socket,
+        invocation,
+        effect_token,
+        host_generation,
+        session_generation,
+        pty_denied,
+    )
+    if not isinstance(raw_info, Mapping):
+        raise TypeError("native DATA handshake returned invalid Environment info")
+    environment_info = EnvInfo(
+        workspace_id=raw_info["workspace_id"],
+        root=EnvPath(raw_info["root"]),
+        server_epoch=raw_info["server_epoch"],
+        server_version=raw_info["server_version"],
+        server_build=raw_info["server_build"],
+        schema_rev=raw_info["schema_rev"],
+        capabilities=frozenset(Capability(cap) for cap in raw_info["capabilities"]),
+        remote=raw_info["remote"],
+    )
+    direct = authority.get("direct_filesystem")
+    if direct is None:
+        return _install_backend(backend, environment_info)
+    if control_backend is None:
+        raise DirectFilesystemDenied(
+            "direct-filesystem grant has no authoritative CONTROL backend"
+        )
+    if not isinstance(direct, Mapping):
+        raise TypeError("direct-filesystem authority must be a mapping")
+    grant = DirectFilesystemGrant(**direct)
+    return _install_backend(
+        backend,
+        environment_info,
+        direct_filesystem_backend=control_backend,
+        direct_filesystem_grant=grant,
+    )
 
 
 def _snapshot_backend() -> Any:
@@ -688,21 +801,21 @@ async def _stream(operation: str, /, **arguments: Any) -> AsyncIterator[Any]:
             yield item
         return
     iterator = iter(source)
-    while True:
-        item = await asyncio.to_thread(_next_stream_item, iterator)
-        if item is _STREAM_END:
-            return
-        yield item
+    try:
+        while True:
+            item = await asyncio.to_thread(_next_stream_item, iterator)
+            if item is _STREAM_END:
+                return
+            yield item
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
 
 
 async def _read_bytes(path: EnvPath) -> bytes:
     path = _env_path(path)
-    binding = _binding.get()
-    backend = None if binding is None else binding[0]
-    if backend is None:
-        value = await asyncio.to_thread(_read_bytes_blocking, path)
-    else:
-        value = await _request("omp.env.docs.read_bytes", path=path)
+    value = await _request("omp.env.docs.read_bytes", path=path)
     if type(value) is not bytes:
         raise TypeError("Environment read_bytes backend must return bytes")
     return value
@@ -811,7 +924,20 @@ class Doc:
 
     def events(self) -> AsyncIterator[DocEvent]:
         """Yield ordered document events until close or stream loss."""
-        return _stream("omp.env.docs.Doc.events", lease=self._lease)
+        return self._events()
+
+    async def _events(self) -> AsyncIterator[DocEvent]:
+        async for value in _stream("omp.env.docs.Doc.events", lease=self._lease):
+            if isinstance(value, DocEvent):
+                yield value
+                continue
+            if not isinstance(value, Mapping):
+                raise TypeError("document backend returned an invalid event")
+            values = dict(value)
+            values["kind"] = DocEventKind(values["kind"])
+            values["revision"] = _as_revision(values["revision"])
+            values["previous_revision"] = _as_revision(values["previous_revision"])
+            yield DocEvent(**values)
 
     async def __aenter__(self) -> Doc:
         return self
@@ -884,7 +1010,7 @@ class _Docs:
             return result
         if not isinstance(result, Mapping) or "lease" not in result:
             raise TypeError("document backend returned an invalid open receipt")
-        return Doc(result["lease"], path, result.get("revision"))
+        return Doc(result["lease"], path, _as_revision(result.get("revision")))
 
     def transaction(self, *, txn_id: bytes | None = None) -> Txn:
         """Create an atomic document transaction handle."""
@@ -1534,7 +1660,7 @@ class ProcessInfo:
     name: str
     generation: int
     state: ProcState
-    status: Completed
+    status: Completed | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1545,6 +1671,32 @@ class ProcessOutput:
     channel: Channel
     data: bytes
     sequence: int
+
+def _as_process_info(value: Any) -> ProcessInfo:
+    if isinstance(value, ProcessInfo):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("process backend returned invalid process information")
+    values = dict(value)
+    state = values.get("state")
+    if not isinstance(state, ProcState):
+        values["state"] = ProcState(state)
+    status = values.get("status")
+    if status is not None:
+        values["status"] = _as_completed(status)
+    return ProcessInfo(**values)
+
+
+def _as_process_output(value: Any) -> ProcessOutput:
+    if isinstance(value, ProcessOutput):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("process backend returned invalid process output")
+    values = dict(value)
+    channel = values.get("channel")
+    if not isinstance(channel, Channel):
+        values["channel"] = Channel(channel)
+    return ProcessOutput(**values)
 
 
 class Lifecycle(StrEnum):
@@ -1594,8 +1746,6 @@ async def _http_request(
         raise TypeError("redirects must be an int")
     if not 0 <= redirects <= 10:
         raise ValueError("redirects must be between 0 and 10")
-    if _binding.get() is None:
-        raise NotWiredError(public_name)
     if type(body) is not bytes:
         raise TypeError("HTTP request body must be bytes")
     result = await _request(
@@ -1696,38 +1846,64 @@ class Pty:
 class Process:
     """Stable named-process generation handle."""
 
-    __slots__ = ("name", "generation")
+    __slots__ = ("name", "generation", "_endpoint")
 
-    def __init__(self, name: str, generation: int) -> None:
+    def __init__(
+        self, name: str, generation: int, endpoint: str | None = None
+    ) -> None:
         self.name = name
         self.generation = generation
+        self._endpoint = endpoint
 
     @property
     def endpoint(self) -> str:
         """Return the generation-fenced loopback or Unix endpoint."""
-        raise NotWiredError("omp.env.Process.endpoint")
+        if self._endpoint is not None:
+            return self._endpoint
+        backend = _snapshot_backend()
+        endpoint = getattr(backend, "process_endpoint", None)
+        if endpoint is None:
+            raise Unsupported(
+                "the Environment did not expose a process endpoint authority"
+            )
+        value = endpoint(self.name, self.generation)
+        if type(value) is not str or not value:
+            raise Stale(
+                f"process {self.name!r} generation {self.generation} has no endpoint"
+            )
+        return value
 
 
     async def info(self) -> ProcessInfo:
         """Return the current generation snapshot."""
-        return await _request(
-            "omp.env.Process.info", name=self.name, generation=self.generation
+        return _as_process_info(
+            await _request(
+                "omp.env.Process.info", name=self.name, generation=self.generation
+            )
         )
 
-    def output(self, *, after: int = 0) -> AsyncIterator[ProcessOutput]:
-        """Yield retained and live ordered process output."""
-        return _stream(
+    async def _output(self, after: int) -> AsyncIterator[ProcessOutput]:
+        async for value in _stream(
             "omp.env.Process.output",
             name=self.name,
             generation=self.generation,
             after=after,
-        )
+        ):
+            yield _as_process_output(value)
+
+    def output(self, *, after: int = 0) -> AsyncIterator[ProcessOutput]:
+        """Yield retained and live ordered process output."""
+        return self._output(after)
+
+    async def _states(self) -> AsyncIterator[ProcessInfo]:
+        async for value in _stream(
+            "omp.env.Process.states", name=self.name, generation=self.generation
+        ):
+            yield _as_process_info(value)
 
     def states(self) -> AsyncIterator[ProcessInfo]:
         """Yield named-process lifecycle transitions."""
-        return _stream(
-            "omp.env.Process.states", name=self.name, generation=self.generation
-        )
+        return self._states()
 
     async def send(self, data: bytes) -> None:
         """Send bytes to process stdin."""
@@ -1736,6 +1912,14 @@ class Process:
             name=self.name,
             generation=self.generation,
             data=data,
+        )
+
+    async def eof(self) -> None:
+        """Close process stdin."""
+        await _request(
+            "omp.env.Process.eof",
+            name=self.name,
+            generation=self.generation,
         )
 
     async def send_secret(self, name: str, value: str) -> None:
@@ -1759,24 +1943,26 @@ class Process:
 
     async def stop(self, **options: Any) -> ProcessInfo:
         """Stop the process tree and return its terminal state."""
-        return await _request(
-            "omp.env.Process.stop",
-            name=self.name,
-            generation=self.generation,
-            **options,
+        return _as_process_info(
+            await _request(
+                "omp.env.Process.stop",
+                name=self.name,
+                generation=self.generation,
+                **options,
+            )
         )
 
     async def restart(self) -> Process:
         """Restart from the retained launch spec and return the next generation."""
-        if _binding.get() is None:
-            raise NotWiredError("omp.env.Process.restart")
         result = await _request(
             "omp.env.Process.restart", name=self.name, generation=self.generation
         )
         return (
             result
             if isinstance(result, Process)
-            else Process(result["name"], result["generation"])
+            else Process(
+                result["name"], result["generation"], result.get("endpoint")
+            )
         )
 
 
@@ -1830,9 +2016,12 @@ class _Sh:
         cwd = options.get("cwd")
         if cwd is not None:
             options["cwd"] = _env_path(cwd, "cwd")
-        return _as_completed(
-            await _request("omp.env.sh.run", script=script, **options)
-        )
+        session = self.session(**options)
+        try:
+            run = await session.run(script)
+            return await run.wait()
+        finally:
+            await session.close()
 
     def parse(self, script: str) -> Any:
         """Parse a script without executing it or performing I/O."""
@@ -1849,14 +2038,18 @@ class _Proc:
         if cwd is not None:
             options["cwd"] = _env_path(cwd, "cwd")
         result = await _request("omp.env.proc.start", name=name, script=script, **options)
-        return result if isinstance(result, Process) else Process(result["name"], result["generation"])
+        return (
+            result
+            if isinstance(result, Process)
+            else Process(result["name"], result["generation"], result.get("endpoint"))
+        )
 
     async def adopt(self, name: str) -> Process | None:
         """Adopt a live named process if present."""
         result = await _request("omp.env.proc.adopt", name=name)
         if result is None or isinstance(result, Process):
             return result
-        return Process(result["name"], result["generation"])
+        return Process(result["name"], result["generation"], result.get("endpoint"))
 
     async def ensure(
         self,
@@ -1891,12 +2084,15 @@ class _Proc:
         return (
             result
             if isinstance(result, Process)
-            else Process(result["name"], result["generation"])
+            else Process(
+                result["name"], result["generation"], result.get("endpoint")
+            )
         )
 
     async def list(self) -> list[ProcessInfo]:
         """List named processes visible to this connection."""
-        return await _request("omp.env.proc.list")
+        values = await _request("omp.env.proc.list")
+        return [_as_process_info(value) for value in values]
 
 
 class _Blobs:
@@ -1904,7 +2100,24 @@ class _Blobs:
 
     async def put(self, data: Any) -> BlobRef:
         """Store bytes or an iterable/async iterable of byte chunks."""
-        return await _request("omp.env.blobs.put", data=data)
+        if type(data) is bytes or isinstance(data, EnvPath):
+            return await _request("omp.env.blobs.put", data=data)
+        writer = self.writer()
+        try:
+            if hasattr(data, "__aiter__"):
+                async for chunk in data:
+                    if type(chunk) is not bytes:
+                        raise TypeError("blob chunks must be bytes")
+                    await writer.write(chunk)
+            else:
+                for chunk in data:
+                    if type(chunk) is not bytes:
+                        raise TypeError("blob chunks must be bytes")
+                    await writer.write(chunk)
+            return await writer.commit()
+        except BaseException:
+            writer.abort()
+            raise
 
     def writer(self) -> BlobWriter:
         """Create an incremental blob upload context manager."""

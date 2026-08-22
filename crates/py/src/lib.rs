@@ -43,8 +43,7 @@ use std::{
 };
 
 pub use bindings::{
-	bind_duration, bind_principal, install_environment_client, set_environment_root,
-	set_resource_receipt, set_scheme_snapshot,
+	bind_duration, bind_principal, set_environment_root, set_resource_receipt, set_scheme_snapshot,
 };
 pub use pyo3;
 use pyo3::{ffi, prelude::*};

@@ -17,10 +17,12 @@ pub mod append_vec;
 pub mod cache;
 pub mod cow_bytes;
 /// Stable local and UTC display-time formatting.
+pub mod dirs;
 pub mod display_time;
 pub mod encoding;
 pub mod hash32;
 pub mod location;
+pub mod open;
 pub mod path;
 pub mod phase;
 pub mod principal;

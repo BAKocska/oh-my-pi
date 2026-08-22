@@ -7,6 +7,8 @@ import warnings
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from datetime import datetime, timedelta
 from enum import Enum, StrEnum
 from types import MappingProxyType, ModuleType
@@ -252,9 +254,161 @@ def _subscribe(
             replay_limit,
             function,
         )
+        qualified_name = (
+            f"{getattr(function, '__module__', '')}."
+            f"{getattr(function, '__qualname__', '')}"
+        )
+        _subscription_handlers[qualified_name] = function
+        _subscription_batches[qualified_name] = batch is not None
+        _subscription_coalesce_keys[qualified_name] = coalesce_key
+        _subscription_stats.setdefault(qualified_name, _EMPTY_DROP_STATS)
         return function
 
     return decorate
+
+
+_EMPTY_DROP_STATS = DropStats(0, 0, 0, 0, 0, 0, None, 0)
+_subscription_handlers: dict[str, Callable[..., object]] = {}
+_subscription_batches: dict[str, bool] = {}
+_subscription_coalesce_keys: dict[str, Callable[[object], Hashable] | None] = {}
+_subscription_stats: dict[str, DropStats] = {}
+
+
+def _drop_stats(value: object) -> DropStats:
+    if isinstance(value, DropStats):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("telemetry drop stats must be a mapping")
+    return DropStats(**dict(value))
+
+
+def _event_from_wire(value: object) -> object:
+    """Decode one host telemetry record into its frozen Python event view."""
+
+    if not isinstance(value, Mapping):
+        return value
+    body = dict(value)
+    try:
+        kind = Kind(body["kind"])
+    except (KeyError, TypeError, ValueError):
+        return value
+    body["kind"] = kind
+    event_type = {
+        Kind.SESSION_START: SessionStart,
+        Kind.SESSION_END: SessionEnd,
+        Kind.TURN_START: TurnStart,
+        Kind.TURN_END: TurnEnd,
+        Kind.MODEL_REQUEST: ModelRequest,
+        Kind.CAPABILITY_DEGRADED: CapabilityDegraded,
+        Kind.COMPACTION: Compaction,
+        Kind.ISSUE_REPORT: IssueReport,
+    }.get(kind)
+    if event_type is None:
+        if isinstance(body.get("trace"), Mapping):
+            body["trace"] = TraceRef(**dict(body["trace"]))
+        return Envelope(
+            **{
+                item.name: body[item.name]
+                for item in dataclass_fields(Envelope)
+                if item.name in body
+            }
+        )
+    if "trace" in body and isinstance(body["trace"], Mapping):
+        body["trace"] = TraceRef(**dict(body["trace"]))
+    for name in ("tokens", "usage"):
+        if name in body and isinstance(body[name], Mapping):
+            body[name] = Tokens(**dict(body[name]))
+    if "cost" in body and isinstance(body["cost"], Mapping):
+        body["cost"] = Cost(**dict(body["cost"]))
+    if "context" in body and isinstance(body["context"], Mapping):
+        body["context"] = ContextSnapshot(**dict(body["context"]))
+    if "place" in body:
+        body["place"] = Place.parse(body["place"])
+    if "stop" in body:
+        body["stop"] = StopReason(body["stop"])
+    if "rev" in body and isinstance(body["rev"], str):
+        body["rev"] = Rev.parse(body["rev"])
+    if "degraded" in body:
+        body["degraded"] = tuple(
+            Degradation(
+                what=str(item["what"]),
+                detail=str(item["detail"]),
+                action=DegradeAction(item["action"]),
+            )
+            if isinstance(item, Mapping)
+            else item
+            for item in body["degraded"]
+        )
+    if "extensions" in body:
+        body["extensions"] = tuple(
+            ExtensionRef(**dict(item)) if isinstance(item, Mapping) else item
+            for item in body["extensions"]
+        )
+    if "prompt" in body and isinstance(body["prompt"], Mapping):
+        prompt = dict(body["prompt"])
+        if isinstance(prompt.get("slots"), Mapping):
+            prompt["slots"] = {
+                str(name): (
+                    PromptSlotFingerprint(
+                        **(dict(item) | {"band": SlotClass(item["band"])})
+                    )
+                    if isinstance(item, Mapping)
+                    else item
+                )
+                for name, item in prompt["slots"].items()
+            }
+        body["prompt"] = PromptFingerprint(**prompt)
+    for name in (
+        "devices",
+        "core_tools",
+        "tools_used",
+        "artifacts_promoted",
+        "repairs",
+        "labels",
+    ):
+        if name in body:
+            body[name] = tuple(body[name])
+    accepted = {item.name for item in dataclass_fields(event_type)}
+    return event_type(**{name: item for name, item in body.items() if name in accepted})
+
+
+async def _dispatch_subscription(
+    qualified_name: str,
+    event: object,
+    ctx: object,
+    stats: DropStats | Mapping[str, object] | None = None,
+) -> None:
+    """Deliver one host-filtered event or batch to its exact declared sink."""
+
+    function = _subscription_handlers.get(qualified_name)
+    if function is None:
+        raise SubscriptionError(f"unknown telemetry subscription {qualified_name!r}")
+    if stats is not None:
+        _subscription_stats[qualified_name] = _drop_stats(stats)
+    if _subscription_batches[qualified_name]:
+        if not isinstance(event, Sequence) or isinstance(
+            event, (str, bytes, bytearray, Mapping)
+        ):
+            raise TypeError("batched telemetry delivery requires a sequence")
+        payload: object = tuple(_event_from_wire(item) for item in event)
+    else:
+        payload = _event_from_wire(event)
+    result = function(payload, ctx)
+    if hasattr(result, "__await__"):
+        await result
+
+
+def _subscription_coalesce_key(qualified_name: str, event: object) -> Hashable:
+    """Evaluate one declared host-side coalescing key against a typed event."""
+
+    function = _subscription_coalesce_keys.get(qualified_name)
+    if function is None:
+        raise SubscriptionError(
+            f"telemetry subscription {qualified_name!r} has no coalescing key"
+        )
+    key = function(_event_from_wire(event))
+    hash(key)
+    return key
 
 
 _instrument_sink: ContextVar[Any | None] = ContextVar(
@@ -499,9 +653,10 @@ class ExportStats:
 class ExportHandle:
     """Live handle for a declaratively registered export target."""
 
-    __slots__ = ("_target",)
+    __slots__ = ("_id", "_target")
 
-    def __init__(self, target: ExportTarget) -> None:
+    def __init__(self, export_id: int, target: ExportTarget) -> None:
+        self._id = export_id
         self._target = target
 
     @property
@@ -513,12 +668,29 @@ class ExportHandle:
     async def stop(self) -> None:
         """Stop this export target after a final flush."""
 
-        raise NotWiredError("omp.telemetry.ExportHandle.stop")
+        from . import _control_backend, _control_request
+
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.telemetry.ExportHandle.stop")
+        await _control_request(
+            "omp.telemetry.export.stop", export_id=self._id
+        )
 
     async def stats(self) -> ExportStats:
         """Return current delivery statistics for this export target."""
 
-        raise NotWiredError("omp.telemetry.ExportHandle.stats")
+        from . import _control_backend, _control_request
+
+        if _control_backend.get() is None:
+            raise NotWiredError("omp.telemetry.ExportHandle.stats")
+        result = await _control_request(
+            "omp.telemetry.export.stats", export_id=self._id
+        )
+        if isinstance(result, ExportStats):
+            return result
+        if not isinstance(result, Mapping):
+            raise TypeError("omp.telemetry.export.stats returned invalid statistics")
+        return ExportStats(**dict(result))
 
 
 def export(
@@ -550,21 +722,34 @@ def export(
         sample=sample,
     )
     _declarations.register_export(definition)
-    return ExportHandle(target)
+    return ExportHandle(len(_declarations.export_definitions()) - 1, target)
 
 
 async def flush(*, timeout: Duration = Duration("10s")) -> bool:
     """Force every registered export target to flush."""
 
-    del timeout
-    raise NotWiredError("omp.telemetry.flush")
+    from . import _control_backend, _control_request
+
+    if not isinstance(timeout, Duration):
+        raise TypeError("timeout must be omp.Duration")
+    if _control_backend.get() is None:
+        raise NotWiredError("omp.telemetry.flush")
+    try:
+        result = await _control_request("omp.telemetry.flush", timeout=str(timeout))
+    except Exception:
+        return False
+    return result is True
 
 
 def dropped(sink: object | None = None) -> DropStats | Mapping[str, DropStats]:
     """Read host-side loss counters for one or all subscriptions."""
 
-    del sink
-    raise NotWiredError("omp.telemetry.dropped")
+    if sink is None:
+        return MappingProxyType(dict(_subscription_stats))
+    qualified_name = (
+        f"{getattr(sink, '__module__', '')}.{getattr(sink, '__qualname__', '')}"
+    )
+    return _subscription_stats.get(qualified_name, _EMPTY_DROP_STATS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -915,6 +1100,15 @@ def _query_wire(value: object) -> object:
         return value.isoformat()
     if isinstance(value, timedelta):
         return value.total_seconds()
+    if isinstance(value, Duration):
+        return str(value)
+    if isinstance(value, (EnvPath, ArtifactUrl)):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _query_wire(getattr(value, item.name))
+            for item in dataclass_fields(value)
+        }
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, Mapping):
@@ -922,6 +1116,55 @@ def _query_wire(value: object) -> object:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_query_wire(item) for item in value]
     return value
+
+
+def _row_from_wire(value: object) -> Row:
+    if isinstance(value, Row):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("telemetry query row must be a mapping")
+    body = dict(value)
+    return Row(
+        events=tuple(_event_from_wire(item) for item in body.get("events", ())),
+        bindings={
+            str(name): _event_from_wire(item)
+            for name, item in dict(body.get("bindings", {})).items()
+        },
+        session=str(body["session"]),
+        turn=int(body["turn"]),
+        _values=dict(body.get("values", body.get("_values", {}))),
+    )
+
+
+def _query_result_from_wire(value: object) -> QueryResult:
+    if isinstance(value, QueryResult):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("omp.telemetry.query returned an invalid result")
+    body = dict(value)
+    body["rows"] = tuple(_row_from_wire(row) for row in body.get("rows", ()))
+    return QueryResult(**body)
+
+
+def _rev_from_wire(value: object) -> Rev:
+    if isinstance(value, Rev):
+        return value
+    if isinstance(value, str):
+        return Rev.parse(value)
+    if isinstance(value, Mapping):
+        return Rev(family=str(value.get("family", "")), n=int(value["n"]))
+    raise TypeError("telemetry revision must be a string or mapping")
+
+
+def _rev_metrics_from_wire(value: object) -> RevMetrics:
+    if isinstance(value, RevMetrics):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("telemetry revision metrics must be a mapping")
+    body = dict(value)
+    body["rev"] = _rev_from_wire(body["rev"])
+    return RevMetrics(**body)
+
 
 
 async def query(q: Query) -> QueryResult:
@@ -939,7 +1182,8 @@ async def query(q: Query) -> QueryResult:
         raise QueryError("query window must be non-negative")
     if _control_backend.get() is None:
         raise NotWiredError("omp.telemetry.query")
-    return await _control_request("omp.telemetry.query", query=_query_wire(q))
+    result = await _control_request("omp.telemetry.query", query=_query_wire(q))
+    return _query_result_from_wire(result)
 
 
 async def rev_metrics(
@@ -972,7 +1216,11 @@ async def rev_metrics(
         since=_query_wire(since),
         scope=parsed_scope.value,
     )
-    return result if isinstance(result, tuple) else tuple(result)
+    if not isinstance(result, Sequence) or isinstance(
+        result, (str, bytes, bytearray, Mapping)
+    ):
+        raise TypeError("omp.telemetry.rev_metrics returned an invalid result")
+    return tuple(_rev_metrics_from_wire(item) for item in result)
 
 
 semconv: Mapping[str, str] = MappingProxyType(
@@ -1070,7 +1318,15 @@ def attributes(event: Event) -> Mapping[str, object]:
 class Span:
     """Async context manager for one extension-owned trace span."""
 
-    __slots__ = ("_attrs", "_events", "_fault", "_handle", "_name", "_trace")
+    __slots__ = (
+        "_attrs",
+        "_events",
+        "_fault",
+        "_handle",
+        "_name",
+        "_opened",
+        "_trace",
+    )
 
     def __init__(
         self,
@@ -1082,6 +1338,7 @@ class Span:
         self._events: list[tuple[str, Mapping[str, object]]] = []
         self._fault: tuple[str, str] | None = None
         self._handle: object | None = None
+        self._opened = False
         self._trace = TraceRef("", "", False)
 
     @property
@@ -1118,11 +1375,17 @@ class Span:
 
         if _control_backend.get() is None:
             raise NotWiredError("omp.telemetry.span")
-        opened = await _control_request(
-            "omp.telemetry.span.open",
-            name=self._name,
-            attributes=dict(self._attrs),
-        )
+        try:
+            opened = await _control_request(
+                "omp.telemetry.span.open",
+                name=self._name,
+                attributes=dict(self._attrs),
+            )
+        except Exception:
+            return self
+        if opened is None:
+            return self
+        self._opened = True
         if isinstance(opened, Mapping):
             self._handle = opened.get("handle")
             trace = opened.get("trace")
@@ -1141,20 +1404,21 @@ class Span:
 
         if exc_type is not None and isinstance(exc_type, type):
             self._fault = (exc_type.__name__, str(exc))
+        if not self._opened:
+            return False
         try:
             await _control_request(
                 "omp.telemetry.span.close",
                 handle=self._handle,
-                attributes=dict(self._attrs),
+                attributes=_query_wire(self._attrs),
                 events=[
                     {"name": name, "attributes": dict(attrs)}
                     for name, attrs in self._events
                 ],
-                fault=self._fault,
+                fault=list(self._fault) if self._fault is not None else None,
             )
         except Exception:
-            if exc_type is None:
-                raise
+            pass
         return False
 
 

@@ -1,8 +1,9 @@
 """Declare secret rules while keeping masking entirely inside Core.
 
 The extension declares rules, and Core applies them to host-owned bytes. Secret
-bytes never round-trip through Python for masking; until the host arms are
-installed, both operations fail closed with :class:`omp.NotWiredError`.
+bytes never round-trip through Python for masking. Declaration publication and
+masking use synchronous host seams because both public operations are synchronous;
+the host keeps the rule snapshot and masking key authoritative.
 """
 
 from __future__ import annotations
@@ -45,6 +46,20 @@ class SecretRule:
     label: str = ""
     replacement: str | None = None
     flags: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pattern, str) or not self.pattern:
+            raise ValueError("secret rule pattern must be a non-empty string")
+        if not isinstance(self.kind, SecretKind):
+            raise TypeError("secret rule kind must be a SecretKind")
+        if not isinstance(self.mode, SecretMode):
+            raise TypeError("secret rule mode must be a SecretMode")
+        if not isinstance(self.label, str):
+            raise TypeError("secret rule label must be a string")
+        if self.replacement is not None and not isinstance(self.replacement, str):
+            raise TypeError("secret rule replacement must be a string or None")
+        if self.flags is not None and not isinstance(self.flags, str):
+            raise TypeError("secret rule flags must be a string or None")
 
 
 _backend: contextvars.ContextVar[object | None] = contextvars.ContextVar(

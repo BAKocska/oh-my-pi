@@ -1,16 +1,18 @@
 """Pure provider-catalog declarations.
 
 This module mirrors the public source vocabulary compiled into
-``crates/llm-catalog``.  Importing it only constructs immutable Python values;
+``crates/catalog``.  Importing it only constructs immutable Python values;
 provider registration is recorded in the local declaration table and performs
 no credential, network, filesystem, CONTROL, or DATA access.
 """
 from __future__ import annotations
 
+import base64
+import inspect
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from decimal import Decimal
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
@@ -24,6 +26,48 @@ from ._errors import SpecError, NotWiredError
 _T = TypeVar("_T", bound=type)
 _V = TypeVar("_V")
 _EMPTY_MAP: Mapping[Any, Any] = MappingProxyType({})
+_PROVIDER_INSTANCES: dict[str, object] = {}
+
+
+def _wire_value(value: object) -> object:
+    """Lower one provider value to the JSON-only CONTROL vocabulary."""
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, IntEnum):
+        return int(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return {"$bytes": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, BlobRef):
+        return {"hash": value.hex, "size": value.size}
+    if isinstance(value, EnvPath):
+        return str(value)
+    if isinstance(value, Duration):
+        return {"$duration": str(value)}
+    if isinstance(value, Secret):
+        raise TypeError("provider CONTROL payloads cannot contain credential secrets")
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _wire_value(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, Mapping):
+        encoded: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, (str, StrEnum)):
+                raise TypeError("provider CONTROL mapping keys must be strings")
+            encoded[str(key)] = _wire_value(item)
+        return encoded
+    if isinstance(value, (tuple, list)):
+        return [_wire_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_wire_value(item) for item in sorted(value, key=repr)]
+    raise TypeError(
+        f"{type(value).__name__} is not JSON-serializable for provider CONTROL"
+    )
 
 
 class Api(StrEnum):
@@ -1261,6 +1305,88 @@ class ProviderSpec:
                 )
             aliases[key] = target
 
+
+def _blob_ref(value: object) -> BlobRef:
+    if isinstance(value, BlobRef):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("provider media result requires a BlobRef mapping")
+    raw_hash = value.get("hash")
+    if isinstance(raw_hash, str):
+        try:
+            digest = bytes.fromhex(raw_hash)
+        except ValueError as error:
+            raise TypeError("provider BlobRef hash must be hexadecimal") from error
+    elif isinstance(raw_hash, Mapping) and isinstance(raw_hash.get("$bytes"), str):
+        try:
+            digest = base64.b64decode(raw_hash["$bytes"], validate=True)
+        except ValueError as error:
+            raise TypeError("provider BlobRef hash must be base64") from error
+    else:
+        raise TypeError("provider BlobRef hash must be hexadecimal")
+    size = value.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise TypeError("provider BlobRef size must be a non-negative integer")
+    return BlobRef(digest, size)
+
+
+def _provider_result(
+    operation: Operation,
+    value: object,
+) -> ImageResult | SpeechResult | TranscriptionResult | RealtimeSession:
+    expected_type = {
+        Operation.GENERATE_IMAGE: ImageResult,
+        Operation.SPEAK: SpeechResult,
+        Operation.TRANSCRIBE: TranscriptionResult,
+        Operation.REALTIME: RealtimeSession,
+    }[operation]
+    if isinstance(value, expected_type):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"omp.provider.request host result must be {expected_type.__name__}"
+        )
+    if operation is Operation.GENERATE_IMAGE:
+        images = value.get("images")
+        if not isinstance(images, Sequence) or isinstance(images, (str, bytes)):
+            raise TypeError("ImageResult.images must be a sequence")
+        return ImageResult(
+            tuple(_blob_ref(image) for image in images),
+            value["cost_nanos_usd"],
+        )
+    if operation is Operation.SPEAK:
+        return SpeechResult(
+            _blob_ref(value["audio"]),
+            AudioFormat(value["format"]),
+            value["cost_nanos_usd"],
+        )
+    if operation is Operation.TRANSCRIBE:
+        return TranscriptionResult(
+            str(value["text"]),
+            None if value.get("language") is None else str(value["language"]),
+            value["cost_nanos_usd"],
+        )
+    endpoint = value.get("endpoint")
+    credential = value.get("credential")
+    if not isinstance(endpoint, (RealtimeEndpointRef, Mapping)):
+        raise TypeError("RealtimeSession.endpoint must be an endpoint reference")
+    if not isinstance(credential, (RealtimeCredentialRef, Mapping)):
+        raise TypeError("RealtimeSession.credential must be a credential reference")
+    endpoint_id = endpoint.id if isinstance(endpoint, RealtimeEndpointRef) else endpoint["id"]
+    credential_id = (
+        credential.id
+        if isinstance(credential, RealtimeCredentialRef)
+        else credential["id"]
+    )
+    return RealtimeSession(
+        str(value["id"]),
+        RealtimeEndpointRef(str(endpoint_id)),
+        RealtimeCredentialRef(str(credential_id)),
+        value["expires_at_ms"],
+        Transport(value["transport"]),
+    )
+
+
 class ProviderHandle:
     """Refer to one provider declaration and its host-owned CONTROL operations."""
 
@@ -1307,17 +1433,28 @@ class ProviderHandle:
         """Atomically replace this provider declaration through CONTROL."""
         if not isinstance(spec, ProviderSpec):
             raise TypeError("ProviderHandle.replace requires a ProviderSpec")
+        if spec.id != self.id:
+            raise ValueError("replacement ProviderSpec.id must match the provider handle")
         await _provider_control_request("omp.provider.replace", provider=self.id, spec=spec)
+        self._spec = spec
 
-    async def models(self) -> tuple[ModelSpec, ...]:
+    async def models(self) -> tuple[ModelCard, ...]:
         """Return the provider's resolved model cards through CONTROL."""
-        return await _provider_control_request("omp.provider.models", provider=self.id)
+        result = await _provider_control_request("omp.provider.models", provider=self.id)
+        if not isinstance(result, Iterable) or isinstance(
+            result, (str, bytes, bytearray, Mapping)
+        ):
+            raise TypeError("omp.provider.models host result must be a model-card sequence")
+        return tuple(_model_card(card) for card in result)
 
     async def is_authenticated(self) -> bool:
         """Return whether an eligible provider principal is available."""
-        return await _provider_control_request(
+        result = await _provider_control_request(
             "omp.provider.is_authenticated", provider=self.id
         )
+        if not isinstance(result, bool):
+            raise TypeError("omp.provider.is_authenticated host result must be bool")
+        return result
 
     async def request(
         self,
@@ -1337,12 +1474,13 @@ class ProviderHandle:
             )
         if not isinstance(request, expected):
             raise TypeError(f"{operation.name} requires {expected.__name__}")
-        return await _provider_control_request(
+        result = await _provider_control_request(
             "omp.provider.request",
             provider=self.id,
             operation=operation,
             request=request,
         )
+        return _provider_result(operation, result)
 
 
 async def _provider_control_request(operation: str, /, **arguments: object) -> Any:
@@ -1350,7 +1488,101 @@ async def _provider_control_request(operation: str, /, **arguments: object) -> A
 
     if _control_backend.get() is None:
         raise NotWiredError(f"{operation} CONTROL dispatch is not wired")
-    return await _control_request(operation, **arguments)
+    return await _control_request(
+        operation,
+        **{name: _wire_value(value) for name, value in arguments.items()},
+    )
+
+
+def _provider_definition(provider_id: str) -> object:
+    for definition in registry.snapshot().providers:
+        if definition.id == provider_id:
+            return definition
+    raise LookupError(f"provider declaration is not registered: {provider_id!r}")
+
+
+def _activate_provider_implementation(provider_id: str) -> object | None:
+    """Construct one sealed provider implementation for callback dispatch."""
+    if not registry.sealed:
+        raise RuntimeError("provider implementations activate only after FREEZE")
+    definition = _provider_definition(provider_id)
+    implementation = definition.implementation
+    if implementation is None:
+        return None
+    instance = _PROVIDER_INSTANCES.get(provider_id)
+    if instance is None:
+        instance = implementation()
+        _PROVIDER_INSTANCES[provider_id] = instance
+    return instance
+
+
+def _sealed_provider_declarations() -> tuple[dict[str, object], ...]:
+    """Project the authoritative frozen provider table for host publication."""
+    if not registry.sealed:
+        raise RuntimeError("provider declarations publish only after FREEZE")
+    rows: list[dict[str, object]] = []
+    for definition in registry.snapshot().providers:
+        callbacks: list[dict[str, object]] = []
+        implementation = definition.implementation
+        if implementation is not None:
+            for _attribute, member in inspect.getmembers(implementation):
+                for hook in getattr(member, "__omp_hooks__", ()):
+                    when = _wire_value(hook.when)
+                    if when is None:
+                        when = {"provider": [definition.id]}
+                    elif isinstance(when, dict) and when.get("provider") is None:
+                        when["provider"] = [definition.id]
+                    callbacks.append({
+                        "event": hook.event,
+                        "phase": str(getattr(hook.phase, "value", hook.phase)),
+                        "name": hook.name,
+                        "when": when,
+                        "order": hook.order,
+                        "on_failure": (
+                            None
+                            if hook.on_failure is None
+                            else hook.on_failure.value
+                        ),
+                        "timeout": _wire_value(hook.timeout),
+                        "coalesce": _wire_value(hook.coalesce),
+                        "concurrency": hook.concurrency,
+                        "threadsafe": hook.threadsafe,
+                    })
+        rows.append({
+            "id": definition.id,
+            "spec": _wire_value(definition.spec),
+            "priority": definition.priority,
+            "extends": definition.extends,
+            "replaces": definition.replaces,
+            "has_implementation": implementation is not None,
+            "callbacks": callbacks,
+            "activation": "eager-prompt",
+        })
+    return tuple(rows)
+
+
+async def dispatch_provider_callback(
+    provider_id: str,
+    callback_name: str,
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Dispatch one host-selected cold-path callback on the activated instance."""
+    instance = _activate_provider_implementation(provider_id)
+    if instance is None:
+        raise LookupError(f"provider {provider_id!r} has no callback implementation")
+    implementation = type(instance)
+    for attribute, member in inspect.getmembers(implementation):
+        if any(
+            hook.name == callback_name
+            for hook in getattr(member, "__omp_hooks__", ())
+        ):
+            result = getattr(instance, attribute)(*args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+    raise LookupError(
+        f"provider {provider_id!r} has no callback {callback_name!r}"
+    )
+
 
 class Facet(StrEnum):
     """Identify an inference facet exposed by a resolved model card."""
@@ -1484,7 +1716,21 @@ def _model_event(value: object) -> ModelEvent:
     if isinstance(raw_cursor, Cursor):
         cursor = raw_cursor
     elif isinstance(raw_cursor, Mapping):
-        cursor = Cursor(epoch=raw_cursor["epoch"], generation=raw_cursor["generation"])
+        raw_epoch = raw_cursor.get("epoch")
+        if (
+            isinstance(raw_epoch, Mapping)
+            and isinstance(raw_epoch.get("$bytes"), str)
+        ):
+            try:
+                raw_epoch = base64.b64decode(raw_epoch["$bytes"], validate=True)
+            except ValueError as error:
+                raise TypeError("model catalog cursor epoch must be base64") from error
+        if not isinstance(raw_epoch, bytes):
+            raise TypeError("model catalog cursor epoch must be bytes")
+        generation = raw_cursor.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise TypeError("model catalog cursor generation must be int")
+        cursor = Cursor(epoch=raw_epoch, generation=generation)
     else:
         raise TypeError("model catalog event requires a Cursor")
     upserted = value.get("upserted")
@@ -1521,6 +1767,15 @@ async def _watch_model_events(
     for event in source:
         yield _model_event(event)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.epoch, bytes) or not self.epoch:
+            raise ValueError("model catalog cursor epoch must be non-empty bytes")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 0
+        ):
+            raise ValueError("model catalog cursor generation must be non-negative")
 
 class WatchModels:
     """Subscribe to typed updates from the host-owned merged model catalog."""
@@ -1529,6 +1784,8 @@ class WatchModels:
 
     def __init__(self, since: Cursor | None = None) -> None:
         """Create a subscription optionally resuming after ``since``."""
+        if since is not None and not isinstance(since, Cursor):
+            raise TypeError("watch_models since must be Cursor or None")
         self.since = since
 
     def events(self) -> AsyncIterator[ModelEvent]:
@@ -1855,10 +2112,7 @@ class Intent:
 class _Intents:
     """Manage this extension's keyed session-level intent contributions."""
 
-    __slots__ = ("_declared",)
-
-    def __init__(self) -> None:
-        self._declared: dict[str, tuple[Intent, ...]] = {}
+    __slots__ = ()
 
     @staticmethod
     def _validate(key: str, values: tuple[Intent, ...]) -> None:
@@ -1866,27 +2120,44 @@ class _Intents:
             raise SpecError("intent contribution key must be a non-empty string")
         if not all(isinstance(value, Intent) for value in values):
             raise SpecError("intent contributions must contain only Intent values")
+        for value in values:
+            if not isinstance(value.kind, IntentKind):
+                raise SpecError("intent kind must be IntentKind")
+            if not isinstance(value.on_unsupported, Fallback):
+                raise SpecError("intent on_unsupported must be Fallback")
+            if (
+                isinstance(value.priority, bool)
+                or not isinstance(value.priority, int)
+                or not 0 <= value.priority <= 0xFFFFFFFF
+            ):
+                raise SpecError("intent priority must be an unsigned 32-bit integer")
+
+    @staticmethod
+    def _emit(operation: str, **arguments: object) -> None:
+        from . import _control_backend
+
+        backend = _control_backend.get()
+        sink = getattr(backend, "intent_effect", None)
+        if not callable(sink):
+            raise NotWiredError(f"{operation} CONTROL effect dispatch is not wired")
+        sink(operation, arguments)
 
     def set(self, key: str, /, *values: Intent) -> None:
-        """Replace one keyed contribution, preserving it if dispatch is rejected."""
+        """Queue replacement of one keyed contribution for host arbitration."""
         self._validate(key, values)
-        raise NotWiredError("omp.intents.set CONTROL dispatch is not wired")
+        self._emit("omp.intents.set", key=key, intents=values)
 
     def clear(self, key: str, /) -> None:
-        """Clear one keyed contribution, preserving it if dispatch is rejected."""
+        """Queue removal of one keyed contribution for host arbitration."""
         self._validate(key, ())
-        raise NotWiredError("omp.intents.clear CONTROL dispatch is not wired")
+        self._emit("omp.intents.clear", key=key)
 
     def declared(self, key: str | None = None, /) -> tuple[Intent, ...]:
-        """Return only this extension's accepted intent contributions."""
+        """Return no speculative state; accepted contributions live in the host."""
         if key is not None:
             self._validate(key, ())
-            return self._declared.get(key, ())
-        return tuple(
-            value
-            for contribution in self._declared.values()
-            for value in contribution
-        )
+            return ()
+        return ()
 
 
 intents = _Intents()
