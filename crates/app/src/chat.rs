@@ -3173,7 +3173,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 				) {
 					tracing::warn!(%error, "failed to suspend process group");
 				}
-							eval_control.request_reset();
+				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
 				let prompt_workspace = state.snapshot().workspace.clone();
 				session = open_session(
@@ -3198,7 +3198,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 				next.workspace = prompt_workspace;
 				next.workspace.model.identifier = Str::new(&model);
 				state = AgentState::new(next);
-},
+			},
 			omp_chat_ui::host::HostExit::Resume(id) => {
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();

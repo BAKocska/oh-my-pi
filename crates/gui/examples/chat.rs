@@ -500,19 +500,8 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					"Ctrl+P models · Ctrl+K commands · Ctrl+B sidebar",
 				)));
 			},
-			Intent::Login(_)
-			| Intent::AgentSteer { .. }
-			| Intent::AgentRevive { .. }
-			| Intent::AgentKill { .. }
-			| Intent::AuthAnswer { .. }
-			| Intent::AuthCancel
-			| Intent::RewindRequest
-			| Intent::PtyInput { .. }
-			| Intent::PtyResize { .. }
-			| Intent::PtyKill { .. }
-			| Intent::Approval { .. }
-			| Intent::Rewind { .. } => {},
 			Intent::Quit => break,
+			_ => {},
 		}
 	}
 }

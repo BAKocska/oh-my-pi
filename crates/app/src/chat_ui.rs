@@ -1721,7 +1721,7 @@ where
 	}
 
 	fn shake(&mut self, args: Str) -> CommandFuture<'_> {
-		let tier = match args.trim() {
+		let tier = match args.trim().as_str() {
 			"" | "elide" => omp_agent::CompactionTier::Elide,
 			"drop-media" | "images" => omp_agent::CompactionTier::DropMedia,
 			_ => {
@@ -1968,7 +1968,12 @@ where
 	fn export(&mut self, request: commands::ExportRequest) -> CommandFuture<'_> {
 		let backend = self.backend;
 		let workspace = std::path::PathBuf::from(self.state.workspace_root.as_str());
-		let state_dir = crate::project_state::directory(self.data_dir, &workspace);
+		let state_dir = match crate::project_state::directory(self.data_dir, &workspace) {
+			Ok(state_dir) => state_dir,
+			Err(_) => {
+				return self.unavailable("project state directory is unavailable");
+			},
+		};
 		let journal = state_dir
 			.join("sessions")
 			.join(format!("{}.jsonl", self.state.session_id));
@@ -2036,7 +2041,12 @@ where
 	fn share(&mut self, args: Str) -> CommandFuture<'_> {
 		let backend = self.backend;
 		let workspace = std::path::PathBuf::from(self.state.workspace_root.as_str());
-		let state_dir = crate::project_state::directory(self.data_dir, &workspace);
+		let state_dir = match crate::project_state::directory(self.data_dir, &workspace) {
+			Ok(state_dir) => state_dir,
+			Err(_) => {
+				return self.unavailable("project state directory is unavailable");
+			},
+		};
 		let journal = state_dir
 			.join("sessions")
 			.join(format!("{}.jsonl", self.state.session_id));
@@ -2617,7 +2627,7 @@ where
 					send_backend(backend, BackendEvent::Notice(message));
 				},
 				Ok(ChatCommand::Settings) => {
-					send_backend(backend, BackendEvent::SettingsSchema(setting_rows()));
+					send_backend(backend, BackendEvent::SettingsSchema(setting_rows(&state.settings)));
 				},
 				Ok(ChatCommand::Theme(args)) => match load_theme_preview(state, args.as_str()).await {
 					Ok(theme) => {
@@ -4584,29 +4594,6 @@ fn send_status(
 			separator: StatusSeparator::Dot,
 		}),
 	);
-}
-
-fn setting_rows() -> Vec<omp_chat_ui::SettingRow> {
-	omp_settings::registered_domains()
-		.into_iter()
-		.flat_map(|domain| {
-			domain.fields.iter().map(move |field| {
-				let kind: &'static str = field.kind.into();
-				omp_chat_ui::SettingRow {
-					panel:       sf!("interaction"),
-					domain:      sf!(domain.name),
-					path:        sf!(field.path),
-					label:       sf!(field.label),
-					description: sf!(field.description),
-					kind:        sf!(kind),
-					secret:      field.secret,
-					value:       None,
-					options:     Vec::new(),
-					visible:     true,
-				}
-			})
-		})
-		.collect()
 }
 
 fn send_backend(sender: &flume::Sender<BackendEvent>, event: BackendEvent) {

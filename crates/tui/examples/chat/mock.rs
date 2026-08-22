@@ -112,12 +112,8 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					"Ctrl+P models · Ctrl+K commands · Ctrl+B sidebar · Esc Esc rewind",
 				)));
 			},
-			Intent::AgentSteer { .. } | Intent::AgentRevive { .. } | Intent::AgentKill { .. } => {},
-			Intent::PtyInput { .. }
-			| Intent::PtyResize { .. }
-			| Intent::PtyKill { .. }
-			| Intent::Approval { .. } => {},
 			Intent::Quit => break,
+			_ => {},
 		}
 	}
 }
