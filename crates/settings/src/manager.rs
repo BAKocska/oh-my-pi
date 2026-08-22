@@ -7,16 +7,16 @@ use std::{
 	sync::Arc,
 };
 
-use omp_settings::{
-	DomainRevision, DynamicOption, FieldDescriptor, OptionProvider, Revision, SettingScope,
-	SettingsDomain, SettingsSnapshot, SnapshotPublisher, Subscription, deep_merge,
-	registered_domains,
-};
 use parking_lot::{Mutex, RwLock};
 
-use super::io::{
-	DocumentMutation, QuarantineDiagnostic, SettingsIoError, mutate_document, read_document,
-	read_or_quarantine,
+use crate::{
+	DomainRevision, DynamicOption, FieldDescriptor, OptionProvider, Revision, SettingScope,
+	SettingsDomain, SettingsSnapshot, SnapshotPublisher, Subscription, deep_merge,
+	io::{
+		DocumentMutation, QuarantineDiagnostic, SettingsIoError, mutate_document, read_document,
+		read_or_quarantine,
+	},
+	registered_domains,
 };
 
 /// Selected writable native settings layer.
@@ -480,18 +480,25 @@ fn panel_for_domain(domain: &str) -> &'static str {
 	}
 }
 
+/// Applies every linked layer normalizer to one persisted document.
+fn normalize_layer(document: &mut toml::Table) {
+	for normalizer in inventory::iter::<crate::LayerNormalizer> {
+		normalizer.apply(document);
+	}
+}
+
 fn compose_document(
 	mut global: toml::Table,
 	mut project: toml::Table,
 	mut overlays: Vec<toml::Table>,
 	mut runtime: toml::Table,
 ) -> toml::Table {
-	crate::subagent::settings::normalize_persisted_agent_overrides(&mut global);
-	crate::subagent::settings::normalize_persisted_agent_overrides(&mut project);
+	normalize_layer(&mut global);
+	normalize_layer(&mut project);
 	for overlay in &mut overlays {
-		crate::subagent::settings::normalize_persisted_agent_overrides(overlay);
+		normalize_layer(overlay);
 	}
-	crate::subagent::settings::normalize_persisted_agent_overrides(&mut runtime);
+	normalize_layer(&mut runtime);
 	let mut document = toml::Table::new();
 	for domain in registered_domains() {
 		deep_merge(&mut document, (domain.default_document)());
@@ -584,12 +591,12 @@ pub enum SettingsManagerError {
 	Migration(#[from] super::migrate::MigrationError),
 	/// Typed schema validation failed.
 	#[error(transparent)]
-	Validation(#[from] omp_settings::ValidationError),
+	Validation(#[from] crate::ValidationError),
 	/// Typed snapshot projection failed.
 	#[error(transparent)]
 	Projection {
 		#[from]
-		source: omp_settings::SnapshotError,
+		source: crate::SnapshotError,
 	},
 	/// Linked domain fragments disagreed about a shared field contract.
 	#[error("conflicting linked settings field {path}")]
@@ -610,8 +617,81 @@ pub enum SettingsManagerError {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeMap;
+
+	use serde::{Deserialize, Serialize};
+
 	use super::*;
-	use crate::settings::Settings;
+	use crate::{
+		FieldDescriptor, LayerNormalizer, SettingKind, SettingScope, SettingsDomain, SettingsSnapshot,
+	};
+
+	const PROBE_SCOPES: &[SettingScope] =
+		&[SettingScope::Global, SettingScope::Project, SettingScope::Runtime];
+
+	/// Prefix-less aggregate standing in for an application core domain.
+	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+	struct CoreProbe {
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		default_model: Option<String>,
+	}
+
+	impl SettingsDomain for CoreProbe {
+		const DOMAIN: &'static str = "probe-core";
+		const FIELDS: &'static [FieldDescriptor] = &[FieldDescriptor {
+			path:        "default_model",
+			label:       "Default Model",
+			description: "Model selected by default.",
+			kind:        SettingKind::Text,
+			scopes:      PROBE_SCOPES,
+			order:       0,
+			options:     None,
+			condition:   None,
+			secret:      false,
+		}];
+		const PREFIX: Option<&'static str> = None;
+	}
+
+	inventory::submit! {
+		crate::DomainRegistration::of::<CoreProbe>()
+	}
+
+	/// Table-shaped domain whose values accept booleans on disk.
+	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+	struct ToggleProbe {
+		#[serde(default)]
+		toggles: BTreeMap<String, String>,
+	}
+
+	impl SettingsDomain for ToggleProbe {
+		const DOMAIN: &'static str = "probe";
+		const FIELDS: &'static [FieldDescriptor] = &[];
+	}
+
+	inventory::submit! {
+		crate::DomainRegistration::of::<ToggleProbe>()
+	}
+
+	fn normalize_probe_toggles(document: &mut toml::Table) {
+		let Some(probe) = document
+			.get_mut("probe")
+			.and_then(toml::Value::as_table_mut)
+		else {
+			return;
+		};
+		let Some(toggles) = probe.get_mut("toggles").and_then(toml::Value::as_table_mut) else {
+			return;
+		};
+		for (_, value) in toggles.iter_mut() {
+			if let toml::Value::Boolean(enabled) = value {
+				*value = toml::Value::String(if *enabled { "on" } else { "off" }.to_owned());
+			}
+		}
+	}
+
+	inventory::submit! {
+		LayerNormalizer::new(normalize_probe_toggles)
+	}
 
 	#[test]
 	fn domain_subscription_wakes_on_owning_revision() {
@@ -622,14 +702,14 @@ mod tests {
 			overlays: Vec::new(),
 		})
 		.expect("manager");
-		let mut subscription = manager.subscribe::<Settings>();
+		let mut subscription = manager.subscribe::<CoreProbe>();
 		manager
 			.set_sync(MutationScope::Runtime, "default_model", "demo/model")
 			.expect("mutation");
 		let snapshot = subscription.recv().expect("revision");
 		assert_eq!(
 			snapshot
-				.project::<Settings>()
+				.project::<CoreProbe>()
 				.expect("projection")
 				.get()
 				.default_model
@@ -637,7 +717,6 @@ mod tests {
 			Some("demo/model"),
 		);
 	}
-	use crate::subagent::settings::TaskSettings;
 
 	#[test]
 	fn layering_precedence_is_defaults_global_project_overlay_runtime() {
@@ -658,7 +737,7 @@ mod tests {
 		.expect("manager");
 		let projected = manager
 			.snapshot()
-			.project::<Settings>()
+			.project::<CoreProbe>()
 			.expect("projection");
 		assert_eq!(projected.get().default_model.as_deref(), Some("overlay"));
 		manager
@@ -666,29 +745,20 @@ mod tests {
 			.expect("override");
 		let projected = manager
 			.snapshot()
-			.project::<Settings>()
+			.project::<CoreProbe>()
 			.expect("projection");
 		assert_eq!(projected.get().default_model.as_deref(), Some("runtime"));
 	}
-	
+
 	#[test]
-	fn boolean_agent_overrides_normalize_before_layer_merging() {
-		let global = toml::from_str(
-			"[task.agentPrewalk]\nlibrarian = true\ntask = true\n\
-			 [task.agentAdvisor]\nlibrarian = false\ntask = false\n",
-		)
-		.expect("global layer");
-		let project = toml::from_str(
-			"[task.agentPrewalk]\nlibrarian = false\n\
-			 [task.agentAdvisor]\nlibrarian = true\n",
-		)
-		.expect("project layer");
+	fn registered_normalizers_run_before_layer_merging() {
+		let global =
+			toml::from_str("[probe.toggles]\nleft = true\nright = true\n").expect("global layer");
+		let project = toml::from_str("[probe.toggles]\nleft = false\n").expect("project layer");
 		let document = compose_document(global, project, Vec::new(), toml::Table::new());
 		let snapshot = SettingsSnapshot::isolated_document(document);
-		let settings = snapshot.project::<TaskSettings>().expect("task projection");
-		assert_eq!(settings.get().agent_prewalk.get("librarian").map(|value| value.as_str()), Some("off"));
-		assert_eq!(settings.get().agent_prewalk.get("task").map(|value| value.as_str()), Some("on"));
-		assert_eq!(settings.get().agent_advisor.get("librarian").map(|value| value.as_str()), Some("on"));
-		assert_eq!(settings.get().agent_advisor.get("task").map(|value| value.as_str()), Some("off"));
+		let settings = snapshot.project::<ToggleProbe>().expect("probe projection");
+		assert_eq!(settings.get().toggles.get("left").map(String::as_str), Some("off"));
+		assert_eq!(settings.get().toggles.get("right").map(String::as_str), Some("on"));
 	}
 }

@@ -2,9 +2,7 @@
 
 use std::sync::Arc;
 
-use omp_settings::{SettingsDomain, Subscription, TypedProjection};
-
-use super::manager::SettingsManager;
+use crate::{SettingsDomain, Subscription, TypedProjection, manager::SettingsManager};
 
 /// Typed revision stream installed into one owning runtime.
 pub struct DomainSubscription<D> {
@@ -47,5 +45,5 @@ pub enum DomainSubscriptionError {
 	Closed(#[from] flume::RecvError),
 	/// The new snapshot did not decode as the owning domain.
 	#[error(transparent)]
-	Projection(#[from] omp_settings::SnapshotError),
+	Projection(#[from] crate::SnapshotError),
 }

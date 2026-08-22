@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::io::{SettingsIoError, atomic_replace};
+use crate::io::{SettingsIoError, atomic_replace};
 
 const MARKER: &str = ".settings-migration-v1";
 const RECORD: &str = "settings-migration.toml";
@@ -75,7 +75,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 			.map_err(|source| MigrationError::Read { path: settings_json.clone(), source })?;
 		let value: serde_json::Value = omp_slopjson::from_str(&source)?;
 		let table = json_table(value)?;
-		omp_settings::deep_merge(&mut document, table);
+		crate::deep_merge(&mut document, table);
 		record.sources.push("settings.json".to_owned());
 		backup_file(&settings_json)?;
 	}
@@ -83,7 +83,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 	let database = data_dir.join("agent.db");
 	if database.exists() {
 		if let Some(table) = read_database_settings(&database)? {
-			omp_settings::deep_merge(&mut document, table);
+			crate::deep_merge(&mut document, table);
 			record.sources.push("agent.db:settings".to_owned());
 			backup_file(&database)?;
 		}
@@ -103,7 +103,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 		};
 		// Native values already chosen by the user win over imported legacy data.
 		let mut imported = document;
-		omp_settings::deep_merge(&mut imported, current);
+		crate::deep_merge(&mut imported, current);
 		current = imported;
 		atomic_replace(&config, &toml::to_string_pretty(&current)?)?;
 	}
