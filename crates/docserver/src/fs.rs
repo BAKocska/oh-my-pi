@@ -18,6 +18,7 @@ use omp_core::Hash32;
 use omp_core::{Str, sf};
 #[cfg(test)]
 use parking_lot::Mutex;
+use xutf::IntoAnsiStripped as _;
 
 use crate::{Error, FileFingerprint, FileMetadata, Result, ServerConfig};
 
@@ -180,6 +181,147 @@ pub enum DiskExpectation {
 	Missing,
 	/// The destination must still have this exact stable fingerprint.
 	Present(FileFingerprint),
+}
+/// Bounded terminal rows captured after ANSI and control sanitization.
+#[derive(Clone, Debug)]
+pub struct TerminalRowCapture {
+	rows:        VecDeque<Str>,
+	max_rows:    usize,
+	max_columns: usize,
+}
+
+impl TerminalRowCapture {
+	/// Creates a capture with fixed row and per-row scalar bounds.
+	#[must_use]
+	pub fn new(max_rows: usize, max_columns: usize) -> Self {
+		Self {
+			rows:        VecDeque::with_capacity(max_rows.min(4096)),
+			max_rows:    max_rows.min(4096),
+			max_columns: max_columns.min(16 * 1024),
+		}
+	}
+
+	/// Appends terminal output, retaining only the newest complete bounded rows.
+	pub fn push(&mut self, output: &str) {
+		for row in output.split(['\r', '\n']) {
+			if row.is_empty() && self.rows.back().is_some_and(|last| last.is_empty()) {
+				continue;
+			}
+			if self.max_rows == 0 {
+				continue;
+			}
+			self
+				.rows
+				.push_back(sanitize_terminal_row(row, self.max_columns));
+			while self.rows.len() > self.max_rows {
+				self.rows.pop_front();
+			}
+		}
+	}
+
+	/// Iterates captured rows from oldest to newest without allocating.
+	pub fn rows(&self) -> impl ExactSizeIterator<Item = &Str> + DoubleEndedIterator + '_ {
+		self.rows.iter()
+	}
+}
+
+/// Removes ANSI escapes and terminal control characters from one bounded row.
+#[must_use]
+pub fn sanitize_terminal_row(row: &str, max_columns: usize) -> Str {
+	let stripped = row.to_owned().into_ansi_stripped();
+	let mut clean = String::with_capacity(stripped.len().min(max_columns));
+	let mut columns = 0usize;
+	for character in stripped.chars() {
+		if columns >= max_columns {
+			break;
+		}
+		match character {
+			'\t' => clean.push(' '),
+			character if !character.is_control() => clean.push(character),
+			_ => {},
+		}
+		columns += 1;
+	}
+	Str::new(clean)
+}
+
+/// Result of reconciling an ACP editor buffer with the authoritative disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EditorBufferState {
+	/// Disk still matches the last committed editor buffer.
+	InSync(DiskState),
+	/// A format-on-save or another writer changed disk; the returned state is
+	/// the new authoritative editor buffer.
+	Drifted(DiskState),
+}
+
+/// Revision-fenced ACP editor write bridge.
+///
+/// The bridge snapshots exact disk state before each write, commits through
+/// [`LocalFs`], and then detects post-save formatter drift without guessing
+/// which bytes won.
+pub struct EditorBufferSync {
+	path:     PathBuf,
+	observed: DiskState,
+}
+/// Prepared replacement minted by one [`EditorBufferSync`] baseline.
+pub struct PreparedEditorWrite {
+	write: PreparedWrite,
+}
+
+impl EditorBufferSync {
+	/// Opens one editor buffer from a stable disk snapshot.
+	pub fn open(filesystem: &LocalFs, path: impl AsRef<Path>) -> Result<Self> {
+		let path = path.as_ref().to_path_buf();
+		let observed = filesystem.stable_read(&path)?;
+		Ok(Self { path, observed })
+	}
+
+	/// Returns the exact bytes currently authoritative for the editor buffer.
+	#[must_use]
+	pub const fn observed(&self) -> &DiskState {
+		&self.observed
+	}
+
+	/// Prepares an atomic editor replacement fenced by the last synchronized
+	/// disk revision.
+	pub fn prepare_write(
+		&self,
+		filesystem: &LocalFs,
+		content: Bytes,
+	) -> Result<PreparedEditorWrite> {
+		let expected = match &self.observed {
+			DiskState::Present { fingerprint, .. } => DiskExpectation::Present(fingerprint.clone()),
+			DiskState::Missing => DiskExpectation::Missing,
+		};
+		filesystem
+			.prepare_write(&self.path, content, expected)
+			.map(|write| PreparedEditorWrite { write })
+	}
+
+	/// Commits a prepared editor write and makes its exact result the new
+	/// synchronization baseline.
+	pub fn commit(
+		&mut self,
+		filesystem: &LocalFs,
+		prepared: PreparedEditorWrite,
+	) -> Result<&DiskState> {
+		self.observed = filesystem.commit_prepared(prepared.write)?;
+		Ok(&self.observed)
+	}
+
+	/// Re-reads after format-on-save and reports whether the editor buffer must
+	/// be replaced with formatter-authored bytes.
+	pub fn reconcile_after_save(&mut self, filesystem: &LocalFs) -> Result<EditorBufferState> {
+		let current = filesystem.stable_read(&self.path)?;
+		let drifted = current != self.observed;
+		self.observed = current.clone();
+		Ok(if drifted {
+			EditorBufferState::Drifted(current)
+		} else {
+			EditorBufferState::InSync(current)
+		})
+	}
 }
 
 #[cfg(test)]

@@ -1773,7 +1773,13 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 			},
 			Ok(Ok(result)) => {
 				plan.format_attempted = true;
-				if std::str::from_utf8(result.content()).is_ok() {
+								if format_cancel.is_cancelled() {
+					return Err(PlanningFailure::cancelled(
+						operation_index,
+						"transaction cancelled during formatting",
+					));
+				}
+if std::str::from_utf8(result.content()).is_ok() {
 					Ok((result.into_content(), true))
 				} else if policy == FormatPolicy::BestEffort {
 					Ok((candidate, false))

@@ -3674,7 +3674,7 @@ mod tests {
 		.unwrap()
 		.unwrap();
 		transport.release.notify_one();
-		assert_eq!(formatting.await.unwrap().unwrap().content(), &Bytes::from_static(b"candidate"),);
+		assert_eq!(formatting.await.unwrap().unwrap().content(), &Bytes::from_static(b"candidate\n"),);
 		let public_lease = tokio::time::timeout(std::time::Duration::from_secs(1), public_open)
 			.await
 			.unwrap()
@@ -3700,7 +3700,7 @@ mod tests {
 		transport.release.notify_one();
 		assert_eq!(
 			second_format.await.unwrap().unwrap().content(),
-			&Bytes::from_static(b"candidate-two"),
+			&Bytes::from_static(b"candidate-two\n"),
 		);
 		let bound_server = registry.binding(binding_id).unwrap().server;
 		let (version, _) = bound_server
