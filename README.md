@@ -30,13 +30,14 @@ names are `omp-` prefixed; directory names are not.
 | `slopjson` | Tolerant JSON for malformed, partial, and streaming documents                                                |
 | `hashline` | Disk-free hashline patch parsing/application over immutable byte snapshots                                   |
 | `ast`      | Tree-sitter source analysis, structural search, AST-aware editing                                            |
+| `grep`     | Synchronous regex and PCRE2 search over memory and workspace files                                           |
 
 ### Inference
 
 | Crate           | What it is                                                                                                   |
 | --------------- | ------------------------------------------------------------------------------------------------------------ |
-| `llm-catalog`   | Typed offline provider/route/model/capability catalog (embedded snapshot, no runtime heuristics)             |
-| `llm-inference` | Typed request/response contracts and `Client` over the Tower service stack (routing, auth, retries, budgets) |
+| `catalog`   | Typed offline provider/route/model/capability catalog (embedded snapshot, no runtime heuristics)             |
+| `inference` | Typed request/response contracts and `Client` over the Tower service stack (routing, auth, retries, budgets) |
 
 ### Services
 
@@ -48,6 +49,11 @@ names are `omp-` prefixed; directory names are not.
 | `docserver` | Local document authority: filesystem, revisions, transactions, watch, LSP ops |
 | `telemetry` | OpenTelemetry instrumentation, metrics, export, redaction                     |
 | `env`       | Typed client boundary for environment services                                |
+| `envd`      | Project environment daemon: filesystem, process, document, tool, and extension-host authority |
+| `serve`     | Tonic gRPC projections for inference, authentication, and content-addressed blob services |
+| `oauth`     | Provider-independent bounded OAuth discovery, PKCE authorization, callback, registration, and token primitives |
+| `collab`    | Versioned, bounded collaboration substrate: room cryptography, Protobuf framing, replication, relay transport |
+| `memory`    | Durable default-off Mnemopi memory banks, recall, retention, and isolated embeddings |
 
 ### Agent
 
@@ -55,8 +61,12 @@ names are `omp-` prefixed; directory names are not.
 | ---------------- | ------------------------------------------------------------------------------------ |
 | `tool` / `tools` | Typed revisioned tool contracts/registry, and the resource-owning built-in executors |
 | `agent`          | Durable, interruptible agent-loop foundations                                        |
+| `driver`         | Headless session composition, execution modes, orchestration, discovery, and settings                       |
 | `app`            | Production CLI application and daemon                                                |
 | `e2e`            | Executable cross-crate acceptance proofs                                             |
+| `ext`            | Extension configuration, dependency resolution, lockfiles, index metadata, and local trust state |
+| `sdk`            | Stable native embedding facade for OMP sessions, callbacks, discovery, and tools |
+| `snapcompact`    | Pure-Rust bitmap archive rendering and provider-aware framing for context compaction |
 
 ### Shell
 
@@ -71,10 +81,22 @@ names are `omp-` prefixed; directory names are not.
 | Crate          | What it is                                                                    |
 | -------------- | ----------------------------------------------------------------------------- |
 | `tui`          | Retained-mode terminal UI: components, rendering, input, terminal integration |
-| `tui-macros`   | `dom!` procedural markup macro for component trees                            |
+| `chat-ui`      | Host-agnostic immediate-mode chat scene and overlays shared by omp frontends |
+| `macros`       | Procedural macros for declarative TUI markup and per-thread function caching |
 | `gui`          | GPU-accelerated native window host for omp-tui apps                           |
+| `desktop`      | Actor-owned native desktop capture, input, and accessibility automation |
+| `webview`      | Pluggable embedded-browser surfaces using system webviews or installed Chromium/Firefox |
 | `py`           | Embedded free-threaded CPython runtime with frozen stdlib                     |
+| `voice`        | Cross-platform audio capture, playback, metering, and ownership coordination for OMP voice features |
 | `voice-kokoro` | Kokoro-82M text-to-speech on candle with Metal acceleration                   |
+
+### Infrastructure
+
+| Crate      | What it is |
+| ---------- | ---------- |
+| `settings` | Typed reflected settings schemas and immutable revisioned snapshots |
+| `secrets`  | Secret-rule validation, reversible keyed placeholders, and provider-bound text redaction |
+| `sandbox`  | Deferred isolation boundary for OMP process confinement |
 
 ### Top level
 

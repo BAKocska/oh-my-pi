@@ -7,17 +7,34 @@ rewrite of `pi`: port observable behavior, not TS shape.
 
 ## Architecture
 
-- `crates/app`: startup, CLI dispatch, production composition. Domain crates
-  implement; app wires, never duplicates.
+- `crates/app`: process startup plus CLI, TUI, ACP, RPC, and print adapters.
+  It presents compositions built by `omp-driver`; hidden same-binary child
+  dispatch delegates to `omp-envd` entry points and does not make app the host.
+- `crates/driver`: headless coding-agent harness core — session and environment
+  composition, execution modes, orchestration, discovery, settings, and the
+  higher-layer bridges injected into `omp-envd`. `crates/driver` +
+  `crates/app` = the production stack (driver composes, app presents); other
+  libraries NEVER build a second production stack.
+- `crates/settings`: typed settings schemas, immutable snapshot projections,
+  persistence IO, migration, and live subscriptions (`omp-settings`).
+- `crates/ext`: extension configuration, dependency resolution, lockfiles,
+  index metadata, and trust domain (`omp-ext`).
+- `crates/serve`: gRPC transport projections serving inference, auth, and
+  blob services (`omp-serve`).
 - `crates/core|storage|proto|rpc|telemetry`: allocation-aware primitives,
   append-only transcript/blob persistence, wire contracts, RPC, observability.
 - `crates/agent`: durable turn state, interrupts, event projection, tool
-  batching. `crates/llm-catalog`: model/provider data (`data/`) + transports.
-  `crates/llm-inference`: typed requests → concrete Tower services, routing,
+  batching. `crates/catalog`: model/provider data (`data/`) + transports.
+  `crates/inference`: typed requests → concrete Tower services, routing,
   recovery middleware → `ChatEvent` streams.
-- `crates/tool`: revisioned tool contracts; `crates/tools`: implementations;
-  `crates/env`: isolated project processes. `crates/docserver|ast|walker|hashline`:
-  document authority, syntax, fs discovery, anchored edits.
+- `crates/tool`: revisioned tool contracts; `crates/tools`: implementations.
+  `crates/env` (`omp-env`) is the typed environment-protocol client and owns no
+  host resources. `crates/envd` (`omp-envd`) is the live project-environment
+  host: daemon transport, filesystem/process/document/tool authorities, and
+  Python extension-host/worker supervision. Host changes go to `omp-envd`;
+  client protocol APIs go to `omp-env`.
+  `crates/docserver|ast|walker|hashline`: document authority, syntax, fs
+  discovery, anchored edits.
   `crates/shell|shell-engine|shell-builtins`: facade, parser/runtime, built-ins.
 - `crates/tui`+`tui-macros`: retained declarative DOM; `crates/gui`: native.
   Neither owns agent/provider policy.
@@ -30,13 +47,15 @@ rewrite of `pi`: port observable behavior, not TS shape.
 - `.omp/tools`, `scripts`, `crates/*/scripts`: agent tooling, release gen,
   subsystem setup.
 
-Turn flow: `app/src/main.rs` (worker entry, telemetry, `OmpCli` →
-`omp_app::run`; command tree `cli.rs`) → `app/src/chat.rs` (authorities,
-transcript journal, pending state, tool registry + `AgentSnapshot`) →
-`agent/src/loop.rs` (mailbox input/interrupts, `TurnClient`, typed tool batches
-via env boundary, durable `AgentEvent`s) → `llm-inference` (facade + Tower
-spine, `src/lib.rs`; streamed events → storage → `app/src/chat_ui.rs`) → TUI
-retained tree → terminal output materialized once at final renderer.
+Turn flow: `app/src/main.rs` (process bootstrap and hidden `omp-envd` child
+entry dispatch) → `omp_app::run` / `app/src/cli.rs` (command and presentation
+adapter) → `omp-driver` chat/headless composition (environment, registries,
+journal, agent session, and higher-layer host bridges) → `omp-envd`
+project-environment host, reached through `omp-env` clients for effects →
+`agent/src/loop.rs` (mailbox input/interrupts, `TurnClient`, typed tool batches,
+durable `AgentEvent`s) → `omp-inference` (facade + Tower spine; streamed events
+→ storage → app adapter) → TUI retained tree → terminal output materialized
+once at final renderer.
 
 ## Commands
 
@@ -91,8 +110,10 @@ Taxonomy: domain prefix after `omp-` (`omp-llm-*`, `omp-shell*`).
 **transport** = provider wire protocol ≠ **dialect** = thread rendering to the
 LLM; NEVER conflate. Providers = catalog data entries; code only for genuinely
 distinct wire behavior; routing stays in inference. `omp-tool` defines
-contracts, `omp-tools` implements — never inverted. Daemons = app subcommands,
-never standalone `*-d` crates.
+contracts, `omp-tools` implements — never inverted. Public daemon commands and
+same-binary child roles are dispatched by app; daemon implementation belongs
+in its host crate (`omp-envd` for the project environment), never in app
+presentation internals.
 
 Style: pinned nightly (`rust-toolchain.toml`), edition 2024. Lints in root
 `[workspace.lints.*]`; `#[allow]` requires `reason`. `cargo fmt` (hard tabs,
@@ -112,8 +133,11 @@ variant→string table (`vocab!`, `crates/telemetry/src/semconv.rs`). New bare
 match table = reviewer-reject; migrate on touch.
 
 Composition/errors/state:
-- `crates/app` = DI boundary (registries, concrete Tower services,
-  `TurnClient`s, authorities). Libraries NEVER build a second production stack.
+- `crates/driver` is the reusable DI boundary for registries, concrete Tower
+  services, `TurnClient`s, environment sessions, and higher-layer host
+  bridges. `crates/app` adapts that composition to commands and presentation;
+  it NEVER owns environment-host, extension-host, or Python-worker internals.
+  Libraries NEVER build a second production stack.
 - Library errors: `thiserror`, every variant `#[error("…")]`. Hand-written
   `impl Display`/`impl Error` on errors = reviewer-reject. Errors NEVER pass
   through formatters: string-payload variants (`Variant(Str)`,
@@ -518,8 +542,11 @@ master stream to a VT emulator (e.g. `pyte`) for screen assertions.
 - `insta` snapshots: shell parser/tokenizer. `proptest`: encoding, zero-copy
   slicing, transcript replay, round-trip invariants. Review snapshots; NEVER
   accept blindly.
-- `crates/app/tests`: production registry, RPC, daemon, document, CLI
-  composition — prefer these seams over mocks of production authority.
+- Test at the owning seam: `crates/envd` for environment-host, extension-host,
+  and Python-worker behavior; `crates/env` for client/protocol behavior;
+  `crates/driver` for headless/session composition; `crates/app` for CLI,
+  presentation, and protocol adapters. Prefer these seams over mocks of
+  production authority.
 - `crates/e2e/tests/p1_doc_race.rs`…`p8_baselines.rs`: authoritative for
   concurrency, cancellation, detached jobs, schema isolation, prefix
   stability, crash/replay, real-PTY lifecycle, recorded perf. Bounded waits +
