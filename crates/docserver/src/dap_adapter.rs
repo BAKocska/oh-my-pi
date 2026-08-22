@@ -10,6 +10,8 @@ use parking_lot::RwLock;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub(crate) const SKIP_ATTACH_REQUEST: &str = "skipAttachRequest";
+
 /// How a debug adapter exchanges DAP frames with the document authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DapTransport {
@@ -47,6 +49,7 @@ pub struct DapAdapterSpec {
 	/// Defaults merged below caller launch arguments.
 	pub launch_defaults: Map<String, Value>,
 	/// Defaults merged below caller attach arguments.
+	/// `skipAttachRequest: true` marks an adapter that is already attached.
 	pub attach_defaults: Map<String, Value>,
 	/// Lower values win the deterministic preference tie-break.
 	pub preference: u16,
@@ -88,7 +91,23 @@ impl DapAdapterSpec {
 			self.launch_defaults.clone()
 		};
 		merged.extend(supplied.clone());
+		if attach {
+			merged.remove(SKIP_ATTACH_REQUEST);
+			if self.skip_attach_request() {
+				merged.insert(SKIP_ATTACH_REQUEST.to_owned(), Value::Bool(true));
+			}
+		}
 		merged
+	}
+
+	/// Returns whether this adapter establishes its target connection before
+	/// the DAP handshake and therefore needs no `attach` request.
+	pub fn skip_attach_request(&self) -> bool {
+		self
+			.attach_defaults
+			.get(SKIP_ATTACH_REQUEST)
+			.and_then(Value::as_bool)
+			.unwrap_or(false)
 	}
 
 	/// Applies adapter-specific launch defaults derived from the resolved
