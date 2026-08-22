@@ -6598,6 +6598,7 @@ dependencies = [
  "omp-tool",
  "parking_lot",
  "regex",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -6808,6 +6809,7 @@ dependencies = [
  "prost",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
+ "strum",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -6826,6 +6828,7 @@ dependencies = [
  "omp-proto",
  "omp-storage",
  "prost",
+ "qrcode",
  "rand 0.10.2",
  "ring",
  "serde",
@@ -6920,6 +6923,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "xutf",
 ]
 
 [[package]]
@@ -7102,6 +7106,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "protox",
+ "regex",
  "ring",
  "rusqlite",
  "rustls",
@@ -7438,6 +7443,7 @@ dependencies = [
  "omp-ar",
  "omp-core",
  "omp-proto",
+ "omp-telemetry",
  "omp-tool",
  "parking_lot",
  "pretty_assertions",
@@ -7588,14 +7594,25 @@ name = "omp-voice"
 version = "0.1.0"
 dependencies = [
  "audiopus_sys",
+ "block2 0.6.2",
  "bytes",
  "flume",
+ "futures",
+ "http",
  "libc",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "omp-core",
  "opus",
  "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
  "strum",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite",
+ "url",
  "webrtc",
  "windows-sys 0.61.2",
 ]
@@ -8936,6 +8953,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"
