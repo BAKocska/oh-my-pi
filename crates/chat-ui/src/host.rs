@@ -6,10 +6,9 @@ use std::{collections::VecDeque, io, io::Write, time::Duration};
 use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
 use omp_tui::{
-	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, InputEvent, Key, Layer, Mouse,
+	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, Icon, InputEvent, Key, Layer, Mouse,
 	MouseReport, Notification, PaintStats, Pasted, Renderer, ResizeScrollbackMode, Size, Terminal,
 	TerminalEvent, TerminalOptions, TtyOut, UiContext, Urgency, detect,
-	Icon,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
@@ -349,15 +348,15 @@ async fn run_welcome(
 }
 
 struct ChatHost {
-	chat:              Chat,
-	session_title:     Str,
-	sidebar:           Sidebar,
-	overlay:           Option<Overlay>,
-	models:            Vec<ModelRow>,
-	current_model:     usize,
-	last_esc:          Option<Instant>,
-	last_left:         Option<Instant>,
-	left_taps:         u8,
+	chat:                    Chat,
+	session_title:           Str,
+	sidebar:                 Sidebar,
+	overlay:                 Option<Overlay>,
+	models:                  Vec<ModelRow>,
+	current_model:           usize,
+	last_esc:                Option<Instant>,
+	last_left:               Option<Instant>,
+	left_taps:               u8,
 	pending_approvals:       usize,
 	approval_queue:          VecDeque<crate::ApprovalTicketView>,
 	suppress_history_replay: bool,
@@ -1677,8 +1676,8 @@ fn open_sessions(host: &mut ChatHost, sessions: Vec<SessionRow>, ctx: &UiContext
 	let rows: Vec<ListRow> = sessions
 		.into_iter()
 		.map(|row| ListRow {
-			key: row.id,
-			label: if row.pinned {
+			key:    row.id,
+			label:  if row.pinned {
 				sf!("{} {}", ctx.charset.icon(Icon::Pin), row.label)
 			} else {
 				row.label

@@ -536,16 +536,17 @@ fn draw_sessions(
 	for y in top + 4..=top + 11 {
 		frame.put(panel_x, y, vertical.encode_utf8(&mut glyph), on_card(theme, theme.border));
 	}
-	let rows = std::iter::once((sf!("New session"), sf!("NEW"))).chain(
-		sessions
-			.iter()
-			.take(3)
-			.map(|row| (if row.pinned {
-				sf!("{} {}", charset.icon(Icon::Pin), row.label)
-			} else {
-				row.label.clone()
-			}, row.detail.clone())),
-	);
+	let rows =
+		std::iter::once((sf!("New session"), sf!("NEW"))).chain(sessions.iter().take(3).map(|row| {
+			(
+				if row.pinned {
+					sf!("{} {}", charset.icon(Icon::Pin), row.label)
+				} else {
+					row.label.clone()
+				},
+				row.detail.clone(),
+			)
+		}));
 	for (index, (label, detail)) in rows.enumerate() {
 		let y = top + 4 + index as u16 * 2;
 		if index == selected {
@@ -1101,6 +1102,7 @@ mod tests {
 	}
 	#[test]
 	fn pinned_session_uses_the_active_charset_icon() {
+		use omp_tui::Icon;
 		let ctx = context();
 		let mut sessions = sessions();
 		sessions[0].pinned = true;

@@ -2825,8 +2825,11 @@ impl Chat {
 		let band_reflow = !viewport_rebuild
 			&& ((self.last_editor_height != 0 && editor_height != self.last_editor_height)
 				|| panel_height != self.last_panel_height);
-		let repaint_suffix =
-			viewport_rebuild || content_reflow || new_rows > 0 || band_reflow || tail_repaint_from.is_some();
+		let repaint_suffix = viewport_rebuild
+			|| content_reflow
+			|| new_rows > 0
+			|| band_reflow
+			|| tail_repaint_from.is_some();
 		if viewport_rebuild {
 			self.frame = Frame::new(Size::new(viewport.width, document_height));
 		} else {
@@ -4463,7 +4466,10 @@ mod tests {
 		let frame = chat.render(viewport).frame;
 		let status_row = viewport.height - rows;
 		assert_eq!(
-			frame.cell(viewport.width - 2, status_row).style().foreground_color(),
+			frame
+				.cell(viewport.width - 2, status_row)
+				.style()
+				.foreground_color(),
 			border,
 			"the unfilled gauge reaches the box's right boundary when the right group is empty",
 		);
@@ -4480,7 +4486,8 @@ mod tests {
 		let started = chat.render(Size::new(80, 24));
 		assert_eq!(started.stable_rows, stable_rows);
 
-		chat.tool_view("wait", sf!("<col><text>job-a running</text><text>job-b running</text></col>"));
+		chat
+			.tool_view("wait", sf!("<col><text>job-a running</text><text>job-b running</text></col>"));
 		let first = chat.render(Size::new(80, 24));
 		assert_eq!(first.stable_rows, stable_rows);
 		chat.tool_view("wait", sf!("<col><text>job-a done</text><text>job-b running</text></col>"));

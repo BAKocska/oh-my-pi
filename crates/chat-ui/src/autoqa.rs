@@ -14,27 +14,7 @@ pub struct ConsentRequest {
 	/// Redacted payload summary; never raw prompt/provider bytes.
 	pub summary:  Str,
 }
-
-/// User-authored upload disposition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Decision {
-	/// Keep the report private and terminally local-only.
-	LocalOnly,
-	/// Consent to upload this exact target revision.
-	Upload,
-}
-
-/// Consent emitted by UI interaction rather than model arguments.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConsentIntent {
-	/// Durable local issue id.
-	pub issue_id: Str,
-	/// Revision observed by the confirmation surface.
-	pub revision: Str,
-	/// User-authored disposition.
-	pub decision: Decision,
-}
-
+pub use omp_storage::telemetry_index::{ConsentIntent, Decision};
 /// Modal state for one AutoQA consent request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoQaConsent {

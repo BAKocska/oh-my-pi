@@ -228,7 +228,12 @@ mod tests {
 	fn rows() -> Vec<SessionRow> {
 		["anthropic", "github-copilot", "deepseek"]
 			.into_iter()
-			.map(|id| SessionRow { id: sf!(id), label: sf!(id), detail: Str::default(), pinned: false })
+			.map(|id| SessionRow {
+				id:     sf!(id),
+				label:  sf!(id),
+				detail: Str::default(),
+				pinned: false,
+			})
 			.collect()
 	}
 
