@@ -7584,6 +7584,7 @@ dependencies = [
  "arboard",
  "flume",
  "im",
+ "image",
  "layout-rs",
  "mermaid-text",
  "nix 0.31.3",
