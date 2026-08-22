@@ -52,13 +52,15 @@ use omp_proto::{
 use omp_storage::transcript::{
 	ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
 	ProviderId as JournalProviderId,
+	SessionId,
 };
+use omp_storage::index::SessionIndex;
 use omp_telemetry::firehose::{
 	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
 };
 use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::ViewState};
 use omp_tui::{
-	SlashCommands, Suggestion, SuggestionList, UiContext,
+	Command, Icon, SlashCommands, Suggestion, SuggestionList, UiContext,
 	components::{AttachmentContent, KeywordAccent},
 	detect,
 };
@@ -70,7 +72,7 @@ use crate::{
 			ConsumedResult, DispatchResult, FlowCommandHost, McpRequest, ModelCommandHost,
 			ParsedFlags, SessionCommandHost, SessionRequest, ShellCommandHost, WorkspaceRequest,
 		},
-		input::{ChatCommand, CommandContribution, CommandRoster, ParsedTurnBudget},
+		input::{ChatCommand, CommandContribution, CommandRoster, CommandUsage, ParsedTurnBudget},
 	},
 	modes::{CampaignHandle, Goal, GoalStatus, GoalUsage},
 	settings::Settings,
@@ -207,6 +209,8 @@ pub struct ResumeChoice {
 	pub label:  Str,
 	/// Recency and identity details shown beneath the name.
 	pub detail: Str,
+	/// Whether the session is pinned above ordinary recency ordering.
+	pub pinned: bool,
 }
 
 /// Durable session facts required to initialize the designed chat scene.
@@ -240,16 +244,18 @@ enum UiCmd {
 	},
 	Compact {
 		request: omp_agent::ManualCompactionRequest,
-		reply:   flume::Sender<Result<omp_agent::ManualCompactionOutcome, String>>,
 	},
 	Shake {
-		tier:  omp_agent::CompactionTier,
-		reply: flume::Sender<Result<omp_agent::ManualShakeOutcome, String>>,
+		mode: omp_agent::ManualShakeMode,
 	},
 	Campaign {
 		operation: CampaignOperation,
 		reply:     flume::Sender<Result<CampaignMutation, omp_agent::AgentError>>,
 	},
+}
+enum MaintenanceEvent {
+	Compact(Result<omp_agent::ManualCompactionOutcome, omp_agent::AgentError>),
+	Shake(Result<(omp_agent::ManualShakeOutcome, Vec<Item>), omp_agent::AgentError>),
 }
 enum CampaignOperation {
 	Engage { spec: &'static str, queue: bool, prompt_slot: Option<&'static str> },
@@ -480,6 +486,7 @@ struct BridgeState {
 	vision_override: Option<InspectImageMode>,
 	settings: Settings,
 	commands: CommandRoster,
+	command_usage: Arc<CommandUsage>,
 	typed_commands: commands::CommandRoster,
 	skills: Arc<crate::skills::SkillSnapshot>,
 	approvals: HashMap<Str, ApprovalRequest>,
@@ -578,6 +585,8 @@ fn command_role(collab: Option<&crate::collab::session::CollabCommandHandle>) ->
 }
 struct ChatSceneSeed {
 	typed_commands: commands::CommandRoster,
+	command_usage:  Arc<CommandUsage>,
+	skills:         Arc<crate::skills::SkillSnapshot>,
 	role:           CommandRole,
 	workspace_root: PathBuf,
 	composer_style: omp_tui::components::ComposerStyle,
@@ -590,8 +599,15 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 		.map(|keyword| Str::from(keyword.text))
 		.collect();
 	chat.set_keyword_accent(KeywordAccent::from_shared(accent_keywords));
+	let mut commands = seed.typed_commands.completions_for(seed.role);
+	commands.extend(seed.skills.all().iter().map(|skill| {
+		let name = format!("skill:{}", skill.name);
+		Command::new(&name, skill.description.as_str(), &[]).with_icon(Icon::Skill)
+	}));
+	let command_usage = Arc::clone(&seed.command_usage);
 	let completion = CompletionChain::new()
-		.source(Box::new(SlashCommands::new(seed.typed_commands.completions_for(seed.role))))
+		.source(Box::new(SlashCommands::new(commands)
+				.with_usage(move |name| command_usage.count(name))))
 		.source(Box::new(DeferredCompletion::new(
 			[
 				('@', CompletionTrigger::Mention),
@@ -615,10 +631,12 @@ pub async fn run<C, R>(
 	modes: Arc<CampaignHandle>,
 	auth: Option<ChatAuth>,
 	data_dir: PathBuf,
+	session_index: Arc<SessionIndex>,
 	workspace_root: PathBuf,
 	local_root: PathBuf,
 	security_enabled: bool,
 	title_enabled: bool,
+	resize_scrollback: omp_tui::ResizeScrollbackMode,
 	command_sources: Vec<Vec<CommandContribution>>,
 	skills: Arc<crate::skills::SkillSnapshot>,
 	mut approval_inbox: Option<ApprovalInbox>,
@@ -685,6 +703,8 @@ where
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
 	let (error_tx, error_rx) = flume::unbounded::<String>();
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
+	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
+	let maintenance_registry = Arc::clone(&registry);
 	let mut agent_task = tokio::spawn(async move {
 		if startup_pending {
 			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
@@ -727,36 +747,36 @@ where
 					let _ = reply.send(result);
 				},
 				UiCmd::Retry { reply } => {
-					let result = match agent.rewind_targets() {
-						Ok(targets) => match targets.last() {
-							Some(target) => match agent.rewind(target.keep) {
-								Ok(items) => {
-									let item = input::user_message(target.text.as_str());
-									let turn_id =
-										TurnId::new(format!("retry-{}", omp_core::Ulid::generate()));
-									match agent.submit([item], turn_id).await {
-										Ok(_) => Ok((items, target.text.clone())),
-										Err(error) => Err(error.to_string()),
-									}
-								},
-								Err(error) => Err(error.to_string()),
-							},
-							None => Err(String::from("no user turn is available to retry")),
-						},
-						Err(error) => Err(error.to_string()),
-					};
+					let turn_id = TurnId::new(format!("retry-{}", omp_core::Ulid::generate()));
+					let result = agent
+						.retry_last_turn(turn_id)
+						.await
+						.map_err(|error| error.to_string())
+						.and_then(|outcome| {
+							outcome
+								.map(|(items, text, _summary)| (items, text))
+								.ok_or_else(|| String::from("no user turn is available to retry"))
+						});
 					let _ = reply.send(result);
 				},
-				UiCmd::Compact { request, reply } => {
+				UiCmd::Compact { request  } => {
 					let result = agent
 						.compact_manual(request)
-						.await
-						.map_err(|error| error.to_string());
-					let _ = reply.send(result);
+						.await;
+					let _ = maintenance_tx.send(MaintenanceEvent::Compact(result));
 				},
-				UiCmd::Shake { tier, reply } => {
-					let result = agent.shake_manual(tier).map_err(|error| error.to_string());
-					let _ = reply.send(result);
+				UiCmd::Shake { mode } => {
+					let result = agent.shake_manual(mode).and_then(|outcome| {
+						let journal = agent.journal().load()?;
+						let projected = omp_agent::project_journal(
+							&journal,
+							journal.as_ref(),
+							maintenance_registry.as_ref(),
+							&crate::chat::CHAT_CAPS_BASE,
+						)?;
+						Ok((outcome, projected.items))
+					});
+					let _ = maintenance_tx.send(MaintenanceEvent::Shake(result));
 				},
 				UiCmd::Campaign { operation, reply } => {
 					let result = match operation {
@@ -792,6 +812,7 @@ where
 	let typed_commands = structural_roster(&command_sources, security_enabled);
 	let chat_commands = typed_commands.clone();
 	let commands = CommandRoster::new(command_sources);
+	let command_usage = Arc::new(CommandUsage::load(session_index).into_diagnostic()?);
 	let initial_command_role = command_role(collab.as_ref());
 	let (backend_tx, backend_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
@@ -857,12 +878,15 @@ where
 		vision_override: None,
 		settings: crate::settings::current(&data_dir).into_diagnostic()?,
 		commands,
+		command_usage: Arc::clone(&command_usage),
 		typed_commands,
 		skills,
 		approvals: HashMap::new(),
 	};
 	let chat_seed = ChatSceneSeed {
 		typed_commands: chat_commands,
+		command_usage,
+		skills: Arc::clone(&skills),
 		role: initial_command_role,
 		workspace_root,
 		composer_style: state.settings.composer.shape,
@@ -919,6 +943,51 @@ where
 										},
 										Ok(message) = error_rx.recv_async() => {
 											send_backend(&backend_tx, BackendEvent::Error(Str::from(message)));
+										},
+										Ok(event) = maintenance_rx.recv_async() => {
+											match event {
+												MaintenanceEvent::Compact(Ok(outcome)) => {
+													send_backend(
+														&backend_tx,
+														BackendEvent::Notice(compaction_notice(&outcome)),
+													);
+												},
+												MaintenanceEvent::Compact(Err(
+													omp_agent::AgentError::CompactionCancelled(
+														omp_agent::CompactionCancellation::UserInterrupt,
+													),
+												)) => {},
+												MaintenanceEvent::Compact(Err(error)) => {
+													send_backend(
+														&backend_tx,
+														BackendEvent::Error(sf!("Compaction failed: {error}")),
+													);
+												},
+												MaintenanceEvent::Shake(Ok((outcome, items))) => {
+													state.active_parts.clear();
+													state.streaming_tools.clear();
+													state.tools.clear();
+													state.part_serial = 0;
+													send_backend(&backend_tx, BackendEvent::HistoryCleared);
+													replay_items(
+														&backend_tx,
+														&items,
+														&mut state.tools,
+														&mut state.part_serial,
+														registry.as_ref(),
+													);
+													send_backend(
+														&backend_tx,
+														BackendEvent::Notice(shake_notice(&outcome)),
+													);
+												},
+												MaintenanceEvent::Shake(Err(error)) => {
+													send_backend(
+														&backend_tx,
+														BackendEvent::Error(sf!("Shake failed: {error}")),
+													);
+												},
+											}
 										},
 										Ok(ack) = ack_rx.recv_async() => {
 											state.submit_pending = false;
@@ -1074,6 +1143,7 @@ where
 		completion_notify: true,
 		error_notify: true,
 		title_enabled,
+		resize_scrollback,
 	};
 	let (host_result, bridge_result): (
 		miette::Result<omp_chat_ui::host::HostOutcome>,
@@ -1307,6 +1377,7 @@ pub async fn run_guest(
 			completion_notify:      true,
 			error_notify:           true,
 			title_enabled:          true,
+			resize_scrollback:      omp_tui::ResizeScrollbackMode::Append,
 		},
 		initial_draft,
 	);
@@ -1651,6 +1722,42 @@ fn goal_status(goal: Option<Goal>) -> Str {
 		goal.time_used_seconds, goal.objective
 	))
 }
+fn compaction_notice(outcome: &omp_agent::ManualCompactionOutcome) -> Str {
+	if outcome.frame_count == 0 {
+		sf!(
+			"Compacted with {} at event {}: {} → {} tokens.",
+			outcome.method,
+			outcome.event,
+			outcome.tokens_before,
+			outcome.tokens_after,
+		)
+	} else {
+		sf!(
+			"Compacted with {} at event {}: {} → {} tokens · {} bitmap frames.",
+			outcome.method,
+			outcome.event,
+			outcome.tokens_before,
+			outcome.tokens_after,
+			outcome.frame_count,
+		)
+	}
+}
+
+fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
+	match outcome.mode {
+		omp_agent::ManualShakeMode::Thinking => sf!(
+			"Dropped {} thinking block{} from this session.",
+			outcome.replaced_regions,
+			if outcome.replaced_regions == 1 { "" } else { "s" },
+		),
+		omp_agent::ManualShakeMode::Elide | omp_agent::ManualShakeMode::DropMedia => sf!(
+			"Shook context with {}: {} regions, {} bytes reclaimed.",
+			outcome.mode,
+			outcome.replaced_regions,
+			outcome.removed_bytes,
+		),
+	}
+}
 
 struct LiveCommandHost<'a, R> {
 	backend:       &'a flume::Sender<BackendEvent>,
@@ -1752,6 +1859,20 @@ where
 	}
 }
 
+fn pin_target(selector: &str, choices: &[ResumeChoice]) -> Result<Str, Str> {
+	if let Some(exact) = choices.iter().find(|choice| choice.id == selector) {
+		return Ok(exact.id.clone());
+	}
+	let mut matches = choices.iter().filter(|choice| choice.id.starts_with(selector));
+	let Some(first) = matches.next() else {
+		return Err(sf!("Session \"{selector}\" not found."));
+	};
+	if matches.next().is_some() {
+		return Err(sf!("Session \"{selector}\" is ambiguous."));
+	}
+	Ok(first.id.clone())
+}
+
 impl<R> SessionCommandHost for LiveCommandHost<'_, R>
 where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
@@ -1840,6 +1961,7 @@ where
 				id:     id.clone(),
 				label:  id,
 				detail: sf!("selected session"),
+				pinned: false,
 			}])
 		} else {
 			match (self.list_sessions)() {
@@ -1862,8 +1984,45 @@ where
 				);
 				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
 			},
-			SessionRequest::Delete | SessionRequest::Pin(_) => {
+			SessionRequest::Delete => {
 				self.unavailable("This session mutation is not attached to the live journal owner.")
+			},
+			SessionRequest::Pin(selector) => {
+				let session = if let Some(selector) = selector {
+					let choices = match (self.list_sessions)() {
+						Ok(choices) => choices,
+						Err(error) => return Box::pin(async move { Err(error) }),
+					};
+					match pin_target(&selector, &choices) {
+						Ok(session) => session,
+						Err(message) => {
+							return Box::pin(async move {
+								Ok(CommandResult::Consumed(ConsumedResult::status(message)))
+							});
+						},
+					}
+				} else {
+					self.state.session_id.clone()
+				};
+				let root = std::path::Path::new(self.state.workspace_root.as_str());
+				let sessions_dir = match crate::project_state::directory(self.data_dir, root)
+					.into_diagnostic()
+				{
+					Ok(directory) => directory.join("sessions"),
+					Err(error) => return Box::pin(async move { Err(error) }),
+				};
+				let result = crate::session_manager::PinStore::new(&sessions_dir)
+					.toggle(&SessionId(session))
+					.into_diagnostic();
+				Box::pin(async move {
+					let pinned = result?;
+					let status = if pinned {
+						"Session pinned to the top of the resume list."
+					} else {
+						"Session unpinned."
+					};
+					Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+				})
 			},
 		}
 	}
@@ -2254,63 +2413,31 @@ where
 
 	fn compact(&mut self, request: omp_agent::ManualCompactionRequest) -> CommandFuture<'_> {
 		Box::pin(async move {
-			let (reply, outcome) = flume::bounded(1);
 			self
 				.commands_tx
-				.send_async(UiCmd::Compact { request, reply })
+				.send_async(UiCmd::Compact { request })
 				.await
 				.into_diagnostic()?;
-			match outcome.recv_async().await.into_diagnostic()? {
-				Ok(outcome) => {
-					let notice = if outcome.frame_count == 0 {
-						sf!(
-							"Compacted with {} at event {}: {} → {} tokens.",
-							outcome.method,
-							outcome.event,
-							outcome.tokens_before,
-							outcome.tokens_after,
-						)
-					} else {
-						sf!(
-							"Compacted with {} at event {}: {} → {} tokens · {} bitmap frames.",
-							outcome.method,
-							outcome.event,
-							outcome.tokens_before,
-							outcome.tokens_after,
-							outcome.frame_count,
-						)
-					};
-					Ok(CommandResult::Consumed(ConsumedResult::status(notice)))
-				},
-				Err(error) => Ok(CommandResult::Consumed(ConsumedResult::status(error))),
-			}
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
 	}
 
 	fn shake(&mut self, args: Str) -> CommandFuture<'_> {
-		let tier = match args.trim().as_str() {
-			"" | "elide" => omp_agent::CompactionTier::Elide,
-			"drop-media" | "images" => omp_agent::CompactionTier::DropMedia,
+		let mode = match args.trim().as_str() {
+			"" | "elide" => omp_agent::ManualShakeMode::Elide,
+			"drop-media" | "images" => omp_agent::ManualShakeMode::DropMedia,
+			"thinking" => omp_agent::ManualShakeMode::Thinking,
 			_ => {
-				return self.unavailable("usage: /shake [elide|drop-media]");
+				return self.unavailable("usage: /shake [elide|drop-media|thinking]");
 			},
 		};
 		Box::pin(async move {
-			let (reply, outcome) = flume::bounded(1);
 			self
 				.commands_tx
-				.send_async(UiCmd::Shake { tier, reply })
+				.send_async(UiCmd::Shake { mode })
 				.await
 				.into_diagnostic()?;
-			match outcome.recv_async().await.into_diagnostic()? {
-				Ok(outcome) => Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
-					"Shook context with {}: {} regions, {} bytes reclaimed.",
-					outcome.tier,
-					outcome.replaced_regions,
-					outcome.removed_bytes,
-				)))),
-				Err(error) => Ok(CommandResult::Consumed(ConsumedResult::status(error))),
-			}
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
 	}
 
@@ -3051,6 +3178,23 @@ where
 				return Ok(false);
 			}
 			let roster = state.typed_commands.clone();
+			if let Some(name) = roster
+				.command_usage_name(&text)
+				.or_else(|| {
+					if text.trim_start().starts_with("/skill:") {
+						crate::skills::parse_invocation(&text).and_then(|skill| {
+							state
+								.skills
+								.get(skill.name.as_str())
+								.map(|_| sf!("skill:{}", skill.name))
+						})
+					} else {
+						state.commands.command_usage_name(&text)
+					}
+				})
+			{
+				let _ = state.command_usage.record(name.as_str(), now_ms());
+			}
 			let mut command_host = LiveCommandHost {
 				backend,
 				commands_tx,
@@ -3775,7 +3919,15 @@ where
 					match reply_rx.recv_async().await {
 						Ok(Ok(items)) => {
 							state.tools.clear();
-							send_backend(backend, BackendEvent::HistoryCleared);
+							let user_index = state
+								.rewind_targets
+								.iter()
+								.position(|candidate| candidate.event == target.event)
+								.unwrap_or_default();
+							send_backend(backend, BackendEvent::HistoryRewind {
+								user_index,
+								text: target.text.clone(),
+							});
 							replay_items(
 								backend,
 								&items,
@@ -3783,6 +3935,7 @@ where
 								&mut state.part_serial,
 								registry,
 							);
+							send_backend(backend, BackendEvent::HistoryReplayFinished);
 							state.rewind_targets.clear();
 						},
 						Ok(Err(error)) => send_backend(backend, BackendEvent::Error(Str::from(error))),
@@ -4605,6 +4758,15 @@ fn replay_items(
 		}
 	}
 }
+/// Projects canonical transcript items into the backend events used by offline rendering.
+pub(crate) fn replay_backend_events(items: &[Item], registry: &Registry) -> Vec<BackendEvent> {
+	let (backend, events) = flume::unbounded();
+	let mut tools = HashMap::new();
+	let mut serial = 0;
+	replay_items(&backend, items, &mut tools, &mut serial, registry);
+	drop(backend);
+	events.try_iter().collect()
+}
 
 fn ensure_tool_started(
 	backend: &flume::Sender<BackendEvent>,
@@ -4857,6 +5019,12 @@ fn render_tool_result_view(
 }
 
 fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
+	if name == "edit"
+		&& let Some(input) = args.get("input").and_then(|value| value.as_str())
+		&& let Some(detail) = edit_input_title(input)
+	{
+		return sf!("{name} · {detail}");
+	}
 	let detail = ["title", "path", "command", "pattern", "query"]
 		.into_iter()
 		.find_map(|key| args.get(key).and_then(|value| value.as_str()))
@@ -4870,6 +5038,25 @@ fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
 				.and_then(|header| header.split_once('#').map(|(path, _)| path))
 		});
 	detail.map_or_else(|| name.clone(), |detail| sf!("{name} · {detail}"))
+}
+fn edit_input_title(input: &str) -> Option<Str> {
+	let mut paths = Vec::new();
+	for line in input.lines() {
+		let Some(opener) = line.trim_start().strip_prefix('§') else {
+			continue;
+		};
+		let path = opener.strip_prefix('*').unwrap_or(opener).trim();
+		if path.is_empty() || paths.contains(&path) {
+			continue;
+		}
+		paths.push(path);
+	}
+	let first = paths.first()?;
+	Some(if paths.len() == 1 {
+		Str::new(*first)
+	} else {
+		sf!("{first} (+{} more)", paths.len() - 1)
+	})
 }
 
 fn send_tool_result_images(backend: &flume::Sender<BackendEvent>, call_id: &Str, item: &Item) {
@@ -5006,6 +5193,7 @@ fn provider_rows(catalog: &Catalog, current: Option<&str>) -> Vec<SessionRow> {
 			id:     Str::from(provider.id.as_str()),
 			label:  provider.name.clone(),
 			detail: sf!(if oauth { "OAuth" } else { "API key" }),
+			pinned: false,
 		})
 		.collect()
 }
@@ -5030,7 +5218,12 @@ fn provider_uses_oauth(catalog: &Catalog, provider: &ProviderDef) -> bool {
 fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
 	choices
 		.into_iter()
-		.map(|choice| SessionRow { id: choice.id, label: choice.label, detail: choice.detail })
+		.map(|choice| SessionRow {
+			id: choice.id,
+			label: choice.label,
+			detail: choice.detail,
+			pinned: choice.pinned,
+		})
 		.collect()
 }
 
@@ -5092,7 +5285,11 @@ async fn switch_model(
 		}
 		state.settings.default_model = Some(key.clone());
 	}
-	state_handle.update(|snapshot| snapshot.turn.params.model.clone_from(&key));
+	state_handle.update(|snapshot| {
+		snapshot.turn.params.model.clone_from(&key);
+		snapshot.reasoning_dialect =
+			crate::chat::interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
+	});
 	state.model = key;
 	state.context_window = spec.limits.context_window;
 	send_models_updated(backend, state);
@@ -6009,6 +6206,23 @@ mod tests {
 			props: rev.map(revision_props),
 			..Default::default()
 		}
+	}
+	
+	#[test]
+	fn edit_tool_title_lists_distinct_sparse_opener_paths() {
+		let args = omp_slopjson::parse_streaming(
+			"{\"input\":\"§src/one.rs\\nold\\n§\\n§*src/two.rs\\n§src/one.rs\"}",
+		);
+		assert_eq!(
+			tool_title(&Str::new_static("edit"), &args),
+			"edit · src/one.rs (+1 more)"
+		);
+	}
+	
+	#[test]
+	fn edit_tool_title_keeps_hashline_header_fallback() {
+		let args = omp_slopjson::parse_streaming("{\"input\":\"[src/main.rs#abc]\\npatch\"}");
+		assert_eq!(tool_title(&Str::new_static("edit"), &args), "edit · src/main.rs");
 	}
 
 	#[test]

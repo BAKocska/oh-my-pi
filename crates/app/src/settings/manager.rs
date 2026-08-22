@@ -481,11 +481,17 @@ fn panel_for_domain(domain: &str) -> &'static str {
 }
 
 fn compose_document(
-	global: toml::Table,
-	project: toml::Table,
-	overlays: Vec<toml::Table>,
-	runtime: toml::Table,
+	mut global: toml::Table,
+	mut project: toml::Table,
+	mut overlays: Vec<toml::Table>,
+	mut runtime: toml::Table,
 ) -> toml::Table {
+	crate::subagent::settings::normalize_persisted_agent_overrides(&mut global);
+	crate::subagent::settings::normalize_persisted_agent_overrides(&mut project);
+	for overlay in &mut overlays {
+		crate::subagent::settings::normalize_persisted_agent_overrides(overlay);
+	}
+	crate::subagent::settings::normalize_persisted_agent_overrides(&mut runtime);
 	let mut document = toml::Table::new();
 	for domain in registered_domains() {
 		deep_merge(&mut document, (domain.default_document)());
@@ -631,6 +637,7 @@ mod tests {
 			Some("demo/model"),
 		);
 	}
+	use crate::subagent::settings::TaskSettings;
 
 	#[test]
 	fn layering_precedence_is_defaults_global_project_overlay_runtime() {
@@ -662,5 +669,26 @@ mod tests {
 			.project::<Settings>()
 			.expect("projection");
 		assert_eq!(projected.get().default_model.as_deref(), Some("runtime"));
+	}
+	
+	#[test]
+	fn boolean_agent_overrides_normalize_before_layer_merging() {
+		let global = toml::from_str(
+			"[task.agentPrewalk]\nlibrarian = true\ntask = true\n\
+			 [task.agentAdvisor]\nlibrarian = false\ntask = false\n",
+		)
+		.expect("global layer");
+		let project = toml::from_str(
+			"[task.agentPrewalk]\nlibrarian = false\n\
+			 [task.agentAdvisor]\nlibrarian = true\n",
+		)
+		.expect("project layer");
+		let document = compose_document(global, project, Vec::new(), toml::Table::new());
+		let snapshot = SettingsSnapshot::isolated_document(document);
+		let settings = snapshot.project::<TaskSettings>().expect("task projection");
+		assert_eq!(settings.get().agent_prewalk.get("librarian").map(|value| value.as_str()), Some("off"));
+		assert_eq!(settings.get().agent_prewalk.get("task").map(|value| value.as_str()), Some("on"));
+		assert_eq!(settings.get().agent_advisor.get("librarian").map(|value| value.as_str()), Some("on"));
+		assert_eq!(settings.get().agent_advisor.get("task").map(|value| value.as_str()), Some("off"));
 	}
 }

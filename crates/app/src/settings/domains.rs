@@ -106,6 +106,8 @@ pub struct TuiSettings {
 	pub max_inline_images: u16,
 	/// Keep prompt chrome stable during IME preedit.
 	pub ime_safe_cursor:   bool,
+	/// Native-scrollback policy after a settled in-place width resize.
+	pub resize_scrollback: omp_tui::ResizeScrollbackMode,
 }
 
 impl Default for TuiSettings {
@@ -117,6 +119,7 @@ impl Default for TuiSettings {
 			tight:             false,
 			max_inline_images: default_max_inline_images(),
 			ime_safe_cursor:   false,
+			resize_scrollback: omp_tui::ResizeScrollbackMode::Append,
 		}
 	}
 }
@@ -159,6 +162,13 @@ impl SettingsDomain for TuiSettings {
 			"Keep prompt chrome stable during IME preedit.",
 			SettingKind::Boolean,
 			60,
+		),
+		field(
+			"tui.resizeScrollback",
+			"Resize Scrollback",
+			"Refresh stale-width pane history by appending, rebuilding, or preserving it.",
+			SettingKind::Enum(&["append", "rebuild", "preserve"]),
+			70,
 		),
 	];
 }
