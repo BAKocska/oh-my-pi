@@ -13,6 +13,27 @@ describe("renderMermaidAscii", () => {
 		expect(rendered).not.toContain("──A─");
 	});
 
+	it("renders routed LR edges after shifting a subgraph from negative coordinates", () => {
+		const rendered = renderMermaidAscii(
+			[
+				"graph LR",
+				"  subgraph S[Done]",
+				"    A",
+				"  end",
+				"  A --> C",
+				"  A --> D",
+				"  D --> E",
+				"  C --> F",
+				"  F --> G",
+				"  D --> G",
+			].join("\n"),
+			{ colorMode: "none" },
+		);
+
+		expect(rendered).toContain("│ Done  │");
+		expect(rendered).toContain("└──────►│ G │");
+	});
+
 	it("renders Unicode and ASCII state pseudostates with distinct UML markers", () => {
 		const source = ["stateDiagram-v2", "  [*] --> Created", "  Created --> [*]"].join("\n");
 		const unicode = renderMermaidAscii(source, { colorMode: "none" });

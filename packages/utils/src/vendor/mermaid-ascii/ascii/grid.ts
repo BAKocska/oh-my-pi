@@ -11,7 +11,14 @@ import type {
   GridCoord, DrawingCoord, Direction, AsciiGraph, AsciiNode, AsciiSubgraph,
 } from './types'
 import { gridKey } from './types'
-import { mkCanvas, setCanvasSizeToGrid, setRoleCanvasSizeToGrid } from './canvas'
+import {
+  getCanvasSize,
+  increaseRoleCanvasSize,
+  increaseSize,
+  mkCanvas,
+  setCanvasSizeToGrid,
+  setRoleCanvasSizeToGrid,
+} from './canvas'
 import { determinePath, determineLabelLine } from './edge-routing'
 import { analyzeEdgeBundles, processBundles } from './edge-bundling'
 import { drawBox } from './draw'
@@ -374,6 +381,10 @@ export function offsetDrawingForSubgraphs(graph: AsciiGraph): void {
       node.drawingCoord.y += offsetY
     }
   }
+
+  const [maxX, maxY] = getCanvasSize(graph.canvas)
+  increaseSize(graph.canvas, maxX + offsetX, maxY + offsetY)
+  increaseRoleCanvasSize(graph.roleCanvas, maxX + offsetX, maxY + offsetY)
 }
 
 // ============================================================================
