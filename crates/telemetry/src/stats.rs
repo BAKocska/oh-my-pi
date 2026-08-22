@@ -1,8 +1,179 @@
 //! Provider usage-window and broker-fleet aggregation.
 
-use std::collections::BTreeMap;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fs,
+	path::{Path, PathBuf},
+};
 
 use omp_core::Str;
+use serde::Deserialize;
+use thiserror::Error;
+/// Explicit local-analytics consent. Derived counters are inert unless enabled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalAnalyticsConsent {
+	/// Do not ingest or aggregate user-derived facts.
+	#[default]
+	Disabled,
+	/// Permit local, prompt-free derived counters.
+	Enabled,
+}
+
+/// One durable Snapcompact savings fact.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapcompactSavingsRecord {
+	/// Observation time in epoch milliseconds.
+	pub ts:           u64,
+	/// Durable journal path identifying the source session.
+	pub session:      Str,
+	/// Serving provider.
+	pub provider:     Str,
+	/// Serving model.
+	pub model:        Str,
+	/// Tool call whose historical result was rasterized.
+	pub tool_call_id: Str,
+	/// Estimated tokens kept off the provider wire.
+	pub saved_tokens: u64,
+}
+
+/// One UTC-day savings bucket.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SnapcompactDailySavings {
+	/// UTC day start in epoch milliseconds.
+	pub day_ms:       u64,
+	/// Deduplicated token savings.
+	pub saved_tokens: u64,
+	/// Distinct `(session, tool-call)` savings facts.
+	pub hits:         u64,
+}
+
+/// Aggregate Snapcompact savings and normalized project choices.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SnapcompactSavingsStats {
+	/// Total token savings across selected facts.
+	pub saved_tokens: u64,
+	/// Deduplicated fact count.
+	pub hits:         u64,
+	/// Chronological UTC-day series, including no synthetic empty days.
+	pub daily:        Vec<SnapcompactDailySavings>,
+	/// Canonical logical project roots present in the facts.
+	pub projects:     Vec<PathBuf>,
+}
+
+/// Savings journal read failure. Malformed individual lines are ignored.
+#[derive(Debug, Error)]
+pub enum SnapcompactStatsError {
+	/// Journal I/O failed.
+	#[error("failed to read Snapcompact savings journal")]
+	Io(#[from] std::io::Error),
+}
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// Reads append-only Snapcompact facts. A missing journal is an empty input.
+pub fn read_snapcompact_savings(
+	path: &Path,
+) -> Result<Vec<SnapcompactSavingsRecord>, SnapcompactStatsError> {
+	let text = match fs::read_to_string(path) {
+		Ok(text) => text,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(error.into()),
+	};
+	Ok(text
+		.lines()
+		.filter_map(|line| serde_json::from_str(line).ok())
+		.collect())
+}
+
+/// Collapses conventional worktree paths to their logical project root.
+///
+/// Temporary/internal execution roots have no dashboard signal and return
+/// `None`.
+#[must_use]
+pub fn normalize_project_path(path: &Path) -> Option<PathBuf> {
+	let clean = path.to_string_lossy().replace('\\', "/");
+	let clean = clean.trim_end_matches('/');
+	if clean.is_empty()
+		|| clean == "/tmp"
+		|| clean.starts_with("/tmp/")
+		|| clean.starts_with("/var/folders/")
+		|| clean.contains("/.omp/wt/")
+		|| clean.contains("/omp-bash-exec/")
+		|| clean.contains("/pi-bash-exec/")
+	{
+		return None;
+	}
+	for marker in ["/.wt/", "/.worktrees/", "-wt/", "-worktrees/", ".wt/"] {
+		if let Some(index) = clean.find(marker) {
+			let root = &clean[..index];
+			if !root.is_empty() {
+				return Some(PathBuf::from(root));
+			}
+		}
+	}
+	Some(PathBuf::from(clean))
+}
+
+/// Aggregates daily, deduplicated Snapcompact savings.
+///
+/// `projects_by_session` is sourced from durable session metadata. Raw prompt
+/// text is neither accepted nor retained. Disabled consent produces an empty
+/// result without inspecting facts.
+#[must_use]
+pub fn aggregate_snapcompact_savings(
+	consent: LocalAnalyticsConsent,
+	records: &[SnapcompactSavingsRecord],
+	projects_by_session: &BTreeMap<Str, PathBuf>,
+	cutoff_ms: Option<u64>,
+	selected_project: Option<&Path>,
+) -> SnapcompactSavingsStats {
+	if consent == LocalAnalyticsConsent::Disabled {
+		return SnapcompactSavingsStats::default();
+	}
+	let selected_project = selected_project.and_then(normalize_project_path);
+	let mut seen = BTreeSet::new();
+	let mut buckets = BTreeMap::<u64, SnapcompactDailySavings>::new();
+	let mut projects = BTreeSet::new();
+	let mut stats = SnapcompactSavingsStats::default();
+	for record in records {
+		if record.saved_tokens == 0 || cutoff_ms.is_some_and(|cutoff| record.ts < cutoff) {
+			continue;
+		}
+		let key = (record.session.clone(), record.tool_call_id.clone());
+		if !seen.insert(key) {
+			continue;
+		}
+		let project = projects_by_session
+			.get(&record.session)
+			.and_then(|path| normalize_project_path(path));
+		if let Some(project) = &project {
+			projects.insert(project.clone());
+		}
+		if let Some(selected) = &selected_project
+			&& project
+				.as_deref()
+				.is_none_or(|project| !same_or_descendant(project, selected))
+		{
+			continue;
+		}
+		stats.saved_tokens = stats.saved_tokens.saturating_add(record.saved_tokens);
+		stats.hits = stats.hits.saturating_add(1);
+		let day_ms = record.ts / DAY_MS * DAY_MS;
+		let bucket = buckets
+			.entry(day_ms)
+			.or_insert(SnapcompactDailySavings { day_ms, ..SnapcompactDailySavings::default() });
+		bucket.saved_tokens = bucket.saved_tokens.saturating_add(record.saved_tokens);
+		bucket.hits = bucket.hits.saturating_add(1);
+	}
+	stats.daily = buckets.into_values().collect();
+	stats.projects = projects.into_iter().collect();
+	stats
+}
+
+fn same_or_descendant(candidate: &Path, parent: &Path) -> bool {
+	candidate == parent || candidate.starts_with(parent)
+}
 
 /// Token buckets reported for one provider by one broker client.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

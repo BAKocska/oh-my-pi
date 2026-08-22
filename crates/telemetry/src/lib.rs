@@ -27,5 +27,6 @@ pub mod metrics;
 pub mod redact;
 pub mod semconv;
 pub mod semconv_gen;
+pub mod sentiment;
 pub mod span;
 pub mod stats;
