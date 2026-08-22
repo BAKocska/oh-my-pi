@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::{
 	TurnOptions,
 	prompt::{
-		PromptError, PromptSource, RenderedPrompt, WorkspaceInput, WorkspacePromptSource,
+		CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, WorkspaceInput,
 		render_prompt,
 	},
 };
@@ -115,7 +115,7 @@ impl AgentSnapshot {
 			enabled_tools: Arc::from([]),
 			registry,
 			workspace,
-			prompt_source: Arc::new(WorkspacePromptSource),
+			prompt_source: Arc::new(CanonicalPromptSource),
 			defer_interrupts: false,
 			deadline: None,
 			retry: RetryPolicy::default(),

@@ -8,7 +8,10 @@ use std::sync::{
 use bytes::Bytes;
 use omp_core::{Str, ToolPath};
 use omp_llm_inference::TurnId;
-use omp_proto::{inference::v1::TurnEvent, thread::v1::Item};
+use omp_proto::{
+	inference::v1::{TurnEvent, turn_event},
+	thread::v1::Item,
+};
 use omp_storage::transcript::TitleSource;
 use omp_tool::{Rev, ToolIdentity};
 use parking_lot::Mutex;
@@ -251,6 +254,39 @@ pub enum AgentEvent {
 		message: Str,
 	},
 }
+/// Explicit collaboration visibility assigned by the EventBus projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum CollabEventVisibility {
+	/// Canonical user-visible turn content.
+	PublicTranscript,
+	/// Credential-free lifecycle or registry presentation state.
+	PublicPresentation,
+}
+
+/// One allowlisted collaboration projection.
+///
+/// Construction is private to [`EventBus`], so an arbitrary internal
+/// [`AgentEvent`] cannot be smuggled into the collaboration stream.
+#[derive(Clone, Debug)]
+pub struct CollabEvent {
+	visibility: CollabEventVisibility,
+	event:      Arc<AgentEvent>,
+}
+
+impl CollabEvent {
+	/// Returns the explicit peer visibility class.
+	#[must_use]
+	pub const fn visibility(&self) -> CollabEventVisibility {
+		self.visibility
+	}
+
+	/// Returns the allowlisted immutable agent event.
+	#[must_use]
+	pub fn event(&self) -> &AgentEvent {
+		&self.event
+	}
+}
 
 #[derive(Debug)]
 struct LossySender {
@@ -258,10 +294,17 @@ struct LossySender {
 	dropped: Arc<AtomicU64>,
 }
 
+#[derive(Debug)]
+struct CollabSender {
+	tx:      flume::Sender<Arc<CollabEvent>>,
+	dropped: Arc<AtomicU64>,
+}
+
 #[derive(Debug, Default)]
 struct Subscribers {
 	lossless: Vec<flume::Sender<Arc<AgentEvent>>>,
 	lossy:    Vec<LossySender>,
+	collab:   Vec<CollabSender>,
 }
 
 #[derive(Debug, Default)]
@@ -318,6 +361,21 @@ impl EventBus {
 	}
 
 	/// Publishes an already shared event without another event allocation.
+
+	/// Adds a bounded subscriber receiving only explicitly allowlisted peer
+	/// facts.
+	pub fn subscribe_collab(&self, capacity: usize) -> CollabEventSubscription {
+		let (tx, rx) = flume::bounded(capacity);
+		let dropped = Arc::new(AtomicU64::new(0));
+		self
+			.inner
+			.subscribers
+			.lock()
+			.collab
+			.push(CollabSender { tx, dropped: dropped.clone() });
+		CollabEventSubscription { rx, dropped }
+	}
+
 	pub fn publish_shared(&self, event: Arc<AgentEvent>) -> Arc<AgentEvent> {
 		let mut subscribers = self.inner.subscribers.lock();
 		subscribers
@@ -334,6 +392,22 @@ impl EventBus {
 				},
 				Err(flume::TrySendError::Disconnected(_)) => false,
 			});
+		if !subscribers.collab.is_empty()
+			&& let Some(visibility) = collab_visibility(&event)
+		{
+			let projection = Arc::new(CollabEvent { visibility, event: event.clone() });
+			subscribers
+				.collab
+				.retain(|subscriber| match subscriber.tx.try_send(projection.clone()) {
+					Ok(()) => true,
+					Err(flume::TrySendError::Full(_)) => {
+						subscriber.dropped.fetch_add(1, Ordering::Relaxed);
+						self.inner.dropped_lossy.fetch_add(1, Ordering::Relaxed);
+						true
+					},
+					Err(flume::TrySendError::Disconnected(_)) => false,
+				});
+		}
 		event
 	}
 
@@ -402,6 +476,35 @@ impl EventBus {
 	}
 }
 
+fn collab_visibility(event: &AgentEvent) -> Option<CollabEventVisibility> {
+	match event {
+		AgentEvent::TitleChanged { .. }
+		| AgentEvent::RunStateChanged { .. }
+		| AgentEvent::PhaseChanged { .. }
+		| AgentEvent::RosterChanged { .. }
+		| AgentEvent::PlanStateChanged { .. }
+		| AgentEvent::JobRegistered { .. }
+		| AgentEvent::JobSettled { .. } => Some(CollabEventVisibility::PublicPresentation),
+		AgentEvent::ToolObserved { visibility: EventVisibility::User, .. } => {
+			Some(CollabEventVisibility::PublicTranscript)
+		},
+		AgentEvent::Turn { event, .. }
+			if matches!(
+				event.event.as_ref(),
+				Some(
+					turn_event::Event::PartStart(_)
+						| turn_event::Event::PartDelta(_)
+						| turn_event::Event::PartEnd(_)
+						| turn_event::Event::Outcome(_)
+				)
+			) =>
+		{
+			Some(CollabEventVisibility::PublicTranscript)
+		},
+		_ => None,
+	}
+}
+
 /// Receiving half of an ordered lossless event subscription.
 pub struct EventSubscription {
 	rx: flume::Receiver<Arc<AgentEvent>>,
@@ -419,6 +522,40 @@ impl EventSubscription {
 	}
 
 	/// Returns the number of events currently buffered for this subscriber.
+	pub fn len(&self) -> usize {
+		self.rx.len()
+	}
+
+	/// Returns whether this subscriber currently has no buffered events.
+	pub fn is_empty(&self) -> bool {
+		self.rx.is_empty()
+	}
+}
+
+/// Receiving half of an ordered bounded collaboration projection.
+pub struct CollabEventSubscription {
+	rx:      flume::Receiver<Arc<CollabEvent>>,
+	dropped: Arc<AtomicU64>,
+}
+
+impl CollabEventSubscription {
+	/// Receives the next retained allowlisted event asynchronously.
+	pub async fn recv(&self) -> Result<Arc<CollabEvent>, flume::RecvError> {
+		self.rx.recv_async().await
+	}
+
+	/// Attempts to receive the next retained allowlisted event without blocking.
+	pub fn try_recv(&self) -> Result<Arc<CollabEvent>, flume::TryRecvError> {
+		self.rx.try_recv()
+	}
+
+	/// Returns the cumulative number of collaboration events dropped for this
+	/// subscriber.
+	pub fn dropped(&self) -> u64 {
+		self.dropped.load(Ordering::Relaxed)
+	}
+
+	/// Returns the number of retained collaboration events currently buffered.
 	pub fn len(&self) -> usize {
 		self.rx.len()
 	}

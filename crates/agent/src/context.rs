@@ -19,8 +19,12 @@ use thiserror::Error;
 pub struct ContextSnapshot {
 	/// Stable turn identity shared by every measurement.
 	pub turn_id:             Str,
-	/// Projection revision measured by the tokenizer.
-	pub projection_revision: u64,
+	/// Physical journal event anchoring the prompt projection.
+	pub prompt_anchor:       u64,
+	/// Monotonic durable context revision measured by the tokenizer.
+	pub context_revision:    u64,
+	/// Durable compaction/reset epoch measured by the tokenizer.
+	pub compaction_epoch:    u64,
 	/// Model context-window ceiling.
 	pub window_tokens:       u64,
 	/// Complete request input at this anchor.
@@ -29,6 +33,8 @@ pub struct ContextSnapshot {
 	pub system_tokens:       Option<u64>,
 	/// Conversation-message tokens, or `None` when unavailable.
 	pub message_tokens:      Option<u64>,
+	/// Installed skill prompt tokens, or `None` when unavailable.
+	pub skill_tokens:        Option<u64>,
 	/// Tool declaration/result tokens, or `None` when unavailable.
 	pub tool_tokens:         Option<u64>,
 	/// Reserved runtime-buffer tokens, or `None` when unavailable.
@@ -50,8 +56,14 @@ impl ContextSnapshot {
 			.turn_id
 			.clone()
 			.ok_or(ContextSnapshotError::MissingAnchor)?;
-		let projection_revision = receipt
-			.projection_revision
+		let prompt_anchor = receipt
+			.prompt_anchor
+			.ok_or(ContextSnapshotError::MissingAnchor)?;
+		let context_revision = receipt
+			.context_revision
+			.ok_or(ContextSnapshotError::MissingAnchor)?;
+		let compaction_epoch = receipt
+			.compaction_epoch
 			.ok_or(ContextSnapshotError::MissingAnchor)?;
 		let window_tokens = receipt
 			.window_tokens
@@ -65,6 +77,7 @@ impl ContextSnapshot {
 		let categorized_tokens = [
 			receipt.system_tokens,
 			receipt.message_tokens,
+			receipt.skill_tokens,
 			receipt.tool_tokens,
 			receipt.buffer_tokens,
 		]
@@ -79,11 +92,14 @@ impl ContextSnapshot {
 		}
 		Ok(Self {
 			turn_id,
-			projection_revision,
+			prompt_anchor,
+			context_revision,
+			compaction_epoch,
 			window_tokens,
 			input_tokens,
 			system_tokens: receipt.system_tokens,
 			message_tokens: receipt.message_tokens,
+			skill_tokens: receipt.skill_tokens,
 			tool_tokens: receipt.tool_tokens,
 			buffer_tokens: receipt.buffer_tokens,
 			unclassified_tokens: input_tokens - categorized_tokens,

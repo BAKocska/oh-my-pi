@@ -100,8 +100,6 @@ pub enum PromptAssetId {
 	ModePlan,
 	/// Plan-validation prewalk mode.
 	ModePrewalk,
-	/// Durable lesson extraction mode.
-	ModeAutolearn,
 	/// Autonomous goal mode.
 	ModeGoal,
 	/// Multi-agent orchestration mode.
@@ -153,7 +151,7 @@ macro_rules! asset {
 	};
 }
 
-const ASSETS: [PromptAsset; 33] = [
+const ASSETS: [PromptAsset; 32] = [
 	asset!(PersonalityDefault, Personality, Runtime, Stable, "../prompts/personality/default.md"),
 	asset!(PersonalityFriendly, Personality, Runtime, Stable, "../prompts/personality/friendly.md"),
 	asset!(
@@ -205,7 +203,6 @@ const ASSETS: [PromptAsset; 33] = [
 	asset!(AgentInit, Agent, Role, Frozen, "../prompts/roles/init.md"),
 	asset!(ModePlan, Mode, Status, Volatile, "../prompts/modes/plan.md"),
 	asset!(ModePrewalk, Mode, Status, Volatile, "../prompts/modes/prewalk.md"),
-	asset!(ModeAutolearn, Mode, Status, Volatile, "../prompts/modes/autolearn.md"),
 	asset!(ModeGoal, Mode, Status, Volatile, "../prompts/modes/goal.md"),
 	asset!(ModeVibe, Mode, Status, Volatile, "../prompts/modes/vibe.md"),
 	asset!(ModeMemoryPipeline, Mode, Status, Volatile, "../prompts/modes/memory-pipeline.md"),
@@ -239,7 +236,6 @@ pub const fn mode_prompt_asset(mode: PromptMode) -> &'static PromptAsset {
 	let id = match mode {
 		PromptMode::Plan => PromptAssetId::ModePlan,
 		PromptMode::Prewalk => PromptAssetId::ModePrewalk,
-		PromptMode::Autolearn => PromptAssetId::ModeAutolearn,
 		PromptMode::Goal => PromptAssetId::ModeGoal,
 		PromptMode::Vibe => PromptAssetId::ModeVibe,
 		PromptMode::MemoryPipeline => PromptAssetId::ModeMemoryPipeline,

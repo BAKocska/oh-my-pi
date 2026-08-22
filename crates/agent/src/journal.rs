@@ -7,16 +7,24 @@ use std::{
 	sync::Arc,
 };
 
+use bytes::Bytes;
 use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, sf};
-use omp_proto::{inference::v1::Outcome, thread::v1::Item};
+use omp_proto::{
+	inference::v1::Outcome,
+	thread::v1::{Item, Role, item, part},
+};
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
 use omp_storage::{
-	index::{EventProjection, IndexedEvent, IndexedWriteError, JournalPosition, SessionIndex},
+	blob::BlobRef,
+	index::{
+		ContextPosition, EventProjection, IndexedEvent, IndexedWriteError, JournalPosition,
+		SessionIndex,
+	},
 	transcript::{
-		self, AmendPatch, ApprovalDecided, ApprovalTicketFiled, Event, Header, HookOutcome,
-		ItemRecord, JobRegistered, JobSettled, Kind, Log, ModelChange, Patch, Pin, PolicyDecision,
-		PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState,
-		RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
+		self, AmendPatch, ApprovalDecided, ApprovalTicketFiled, ChildSessionInit, Event, Header,
+		HookOutcome, ItemRecord, JobRegistered, JobSettled, Kind, Log, ModelChange, Patch, Pin,
+		PolicyDecision, PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader,
+		RefreshState, RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
 		event::Custom,
 		msg::Content,
 		writer::{AppendManyError, IndexRun, JournalError as WriterError},
@@ -310,6 +318,92 @@ pub struct JournalCustomEntry {
 	/// Strictly decoded custom record with verbatim canonical raw bytes.
 	pub entry: Custom,
 }
+/// Visibility assigned to one physical transcript-v4 record for collaboration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum ReplicationVisibility {
+	/// Exact canonical journal bytes may be replicated to authenticated guests.
+	PublicTranscript,
+	/// The physical revision is retained as an omission marker, without payload
+	/// bytes.
+	HostLocalOmitted,
+}
+
+/// One ordered physical transcript-v4 record offered to a collaboration host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicationRecord {
+	/// One-based physical host-journal revision.
+	pub revision:   u64,
+	/// Visibility decision made by the journal owner.
+	pub visibility: ReplicationVisibility,
+	/// Exact public record or a non-semantic host-local omission marker.
+	pub json:       Bytes,
+}
+
+/// Terminal status for a bounded journal replication subscription.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicationTerminal {
+	/// The host bridge failed to consume records within the bounded lag window.
+	Lagged {
+		/// Last revision successfully offered to the bridge.
+		after: u64,
+	},
+	/// The authoritative journal owner closed.
+	Closed,
+}
+
+/// Catch-up plus ordered live transcript-v4 replication delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicationEvent {
+	/// A committed physical record, including visibility-preserving omissions.
+	Record(ReplicationRecord),
+	/// The live subscription ended and must not be reused.
+	Terminal(ReplicationTerminal),
+}
+
+/// Catch-up snapshot and bounded live stream captured under the sole journal
+/// owner.
+pub struct ReplicationSubscription {
+	catch_up:      VecDeque<ReplicationRecord>,
+	live:          flume::Receiver<ReplicationEvent>,
+	host_revision: u64,
+}
+
+impl ReplicationSubscription {
+	/// Returns the host revision fenced by the catch-up snapshot.
+	#[must_use]
+	pub const fn host_revision(&self) -> u64 {
+		self.host_revision
+	}
+
+	/// Removes the next catch-up record in physical revision order.
+	pub fn next_catch_up(&mut self) -> Option<ReplicationRecord> {
+		self.catch_up.pop_front()
+	}
+
+	/// Returns the number of catch-up records not yet consumed.
+	#[must_use]
+	pub fn catch_up_len(&self) -> usize {
+		self.catch_up.len()
+	}
+
+	/// Receives the next committed live record or terminal status.
+	pub async fn recv(&self) -> Result<ReplicationEvent, flume::RecvError> {
+		self.live.recv_async().await
+	}
+
+	/// Attempts to receive a live record without waiting.
+	pub fn try_recv(&self) -> Result<ReplicationEvent, flume::TryRecvError> {
+		self.live.try_recv()
+	}
+}
+
+const REPLICATION_LAG_CAPACITY: usize = 256;
+
+struct ReplicationSubscriber {
+	last:   u64,
+	sender: flume::Sender<ReplicationEvent>,
+}
 /// Session-scoped compare-and-swap value backed by a physical journal event.
 #[derive(Clone, Debug)]
 pub struct SessionStateValue {
@@ -400,6 +494,9 @@ pub enum JournalError {
 	/// This owner previously observed indeterminate durability.
 	#[error("journal session is halted after an indeterminate write")]
 	Halted,
+	/// Child initialization was attempted after another durable event.
+	#[error("child initialization must be the first journal event")]
+	ChildInitNotFirst,
 	/// A durable request was sent by a stale host or session generation.
 	#[error(
 		"stale journal generation: expected host {expected_host}/session {expected_session}, got \
@@ -470,6 +567,16 @@ pub enum JournalError {
 		/// Rebuildable index failure.
 		#[source]
 		source:      omp_storage::index::Error,
+	},
+	/// The journal committed but its collaboration projection could not be
+	/// encoded.
+	#[error("journal event {event_index} committed but replication projection failed: {source}")]
+	ReplicationAfterJournal {
+		/// Durable event index that must not be appended again.
+		event_index: u64,
+		/// Transcript-v4 projection failure.
+		#[source]
+		source:      transcript::Error,
 	},
 	/// A sequence amendment targeted a non-item event.
 	#[error("sequence amendment target {0} is not a canonical item")]
@@ -564,35 +671,40 @@ const _: () = assert!(std::mem::size_of::<JournalError>() <= 128, "JournalError 
 
 /// Append-only transcript owner with an in-memory terminal-turn index.
 pub struct Journal {
-	path:                    PathBuf,
-	writer:                  Writer,
-	reader:                  Mutex<CachedReader>,
-	receipts:                BTreeMap<Str, TurnReceipt>,
-	starts:                  BTreeMap<Str, (u64, TurnStart)>,
-	aborted:                 BTreeMap<Str, (u64, AbortDisposition)>,
-	claims:                  BTreeMap<u64, Str>,
-	last_start:              Option<TurnStart>,
-	session_id:              transcript::SessionId,
-	last_receipt:            Option<TurnReceipt>,
-	last_receipt_event:      Option<u64>,
-	active_prompt:           Option<ActivePrompt>,
-	pending:                 BTreeMap<Str, PendingItems>,
-	pending_jobs:            BTreeMap<Str, (u64, JobRef)>,
-	settled_jobs:            BTreeMap<Str, (u64, Item)>,
-	authorized_batches:      BTreeMap<Str, (u64, Vec<Str>)>,
+	path: PathBuf,
+	writer: Writer,
+	reader: Mutex<CachedReader>,
+	receipts: BTreeMap<Str, TurnReceipt>,
+	starts: BTreeMap<Str, (u64, TurnStart)>,
+	aborted: BTreeMap<Str, (u64, AbortDisposition)>,
+	claims: BTreeMap<u64, Str>,
+	last_start: Option<TurnStart>,
+	session_id: transcript::SessionId,
+	last_receipt: Option<TurnReceipt>,
+	last_receipt_event: Option<u64>,
+	active_prompt: Option<ActivePrompt>,
+	pending: BTreeMap<Str, PendingItems>,
+	pending_jobs: BTreeMap<Str, (u64, JobRef)>,
+	settled_jobs: BTreeMap<Str, (u64, Item)>,
+	authorized_batches: BTreeMap<Str, (u64, Vec<Str>)>,
 	recoverable_settlements: Vec<u64>,
-	released_inputs:         Vec<u64>,
-	released_turn_id:        Option<Str>,
-	pending_inputs:          VecDeque<(Str, Vec<u64>)>,
-	item_count:              u64,
-	entry_kinds:             EntryKindRegistry,
-	invocations:             HashMap<Str, (u64, transcript::InvocationTransition)>,
-	generations:             JournalGenerations,
-	request_replays:         HashMap<ReplayKey, Vec<u64>>,
-	halted:                  bool,
-	session_index:           Option<(Arc<SessionIndex>, transcript::SessionId)>,
-	state_subscribers:       HashMap<u64, SessionStateSubscriber>,
-	next_state_subscriber:   u64,
+	released_inputs: Vec<u64>,
+	released_turn_id: Option<Str>,
+	pending_inputs: VecDeque<(Str, Vec<u64>)>,
+	item_count: u64,
+	context_revision: u64,
+	compaction_epoch: u64,
+	prompt_anchor: Option<u64>,
+	entry_kinds: EntryKindRegistry,
+	invocations: HashMap<Str, (u64, transcript::InvocationTransition)>,
+	generations: JournalGenerations,
+	request_replays: HashMap<ReplayKey, Vec<u64>>,
+	halted: bool,
+	session_index: Option<(Arc<SessionIndex>, transcript::SessionId)>,
+	state_subscribers: HashMap<u64, SessionStateSubscriber>,
+	next_state_subscriber: u64,
+	replication_subscribers: HashMap<u64, ReplicationSubscriber>,
+	next_replication_subscriber: u64,
 }
 
 impl Journal {
@@ -622,6 +734,9 @@ impl Journal {
 			pending_inputs: VecDeque::new(),
 			settled_jobs: BTreeMap::new(),
 			item_count: 0,
+			context_revision: 0,
+			compaction_epoch: 0,
+			prompt_anchor: None,
 			entry_kinds: EntryKindRegistry::new(),
 			invocations: HashMap::new(),
 			generations: JournalGenerations::default(),
@@ -630,6 +745,8 @@ impl Journal {
 			session_index: None,
 			state_subscribers: HashMap::new(),
 			next_state_subscriber: 0,
+			replication_subscribers: HashMap::new(),
+			next_replication_subscriber: 0,
 		})
 	}
 
@@ -644,6 +761,9 @@ impl Journal {
 		let mut pending_jobs = BTreeMap::new();
 		let mut settled_jobs = BTreeMap::new();
 		let mut item_count = 0_u64;
+		let mut context_revision = 0_u64;
+		let mut compaction_epoch = 0_u64;
+		let mut prompt_anchor = None;
 		let mut last_receipt = None;
 		let mut last_receipt_event = None;
 		let mut authorized_batches = BTreeMap::new();
@@ -660,6 +780,12 @@ impl Journal {
 			match &event.kind {
 				Kind::Item(record) => {
 					item_count = item_count.saturating_add(1);
+					advance_message_position(
+						&record.item,
+						index,
+						&mut context_revision,
+						&mut prompt_anchor,
+					);
 					if let Some(turn_id) = &record.turn_id {
 						pending.entry(turn_id.clone()).or_default().push((
 							index,
@@ -670,6 +796,12 @@ impl Journal {
 				},
 				Kind::TurnInput(input) => {
 					item_count = item_count.saturating_add(1);
+					advance_message_position(
+						&input.item,
+						index,
+						&mut context_revision,
+						&mut prompt_anchor,
+					);
 					if !turn_inputs.contains_key(input.turn_id.as_str()) {
 						turn_input_order.push(input.turn_id.clone());
 					}
@@ -751,6 +883,10 @@ impl Journal {
 						});
 					}
 					invocations.insert(transition.invocation_id.clone(), (index, transition.clone()));
+				},
+				Kind::Reset | Kind::Compact { .. } => {
+					context_revision = context_revision.saturating_add(1);
+					compaction_epoch = compaction_epoch.saturating_add(1);
 				},
 				_ => {},
 			}
@@ -860,6 +996,9 @@ impl Journal {
 			released_inputs,
 			released_turn_id,
 			item_count,
+			context_revision,
+			compaction_epoch,
+			prompt_anchor,
 			entry_kinds: EntryKindRegistry::new(),
 			invocations,
 			generations: JournalGenerations::default(),
@@ -868,6 +1007,8 @@ impl Journal {
 			session_index: None,
 			state_subscribers: HashMap::new(),
 			next_state_subscriber: 0,
+			replication_subscribers: HashMap::new(),
+			next_replication_subscriber: 0,
 		})
 	}
 
@@ -929,7 +1070,9 @@ impl Journal {
 		match self.writer.append_atomic(events) {
 			Ok(indexes) => {
 				self.refresh_after_append(expected, events.len())?;
-				Ok(indexes.into_vec())
+				let indexes = indexes.into_vec();
+				self.publish_replication(&indexes, events)?;
+				Ok(indexes)
 			},
 			Err(WriterError::RolledBack { source }) => {
 				self.reader.get_mut().transcript.refresh()?;
@@ -950,7 +1093,9 @@ impl Journal {
 		match self.writer.append_atomic(std::slice::from_ref(event)) {
 			Ok(indexes) => {
 				self.refresh_after_append(expected, 1)?;
-				Ok(indexes[0])
+				let index = indexes[0];
+				self.publish_replication(std::slice::from_ref(&index), std::slice::from_ref(event))?;
+				Ok(index)
 			},
 			Err(WriterError::RolledBack { source }) => {
 				self.reader.get_mut().transcript.refresh()?;
@@ -964,6 +1109,37 @@ impl Journal {
 				Err(JournalError::AtomicTooLarge { entries, maximum })
 			},
 		}
+	}
+
+	/// Appends the first production child initialization record.
+	///
+	/// Every content-addressed snapshot must be placed before this call. The
+	/// resulting event is the durable cross-process revival anchor.
+	pub fn append_child_init(
+		&mut self,
+		ts: u64,
+		system_prompt: BlobRef,
+		tools: Vec<Str>,
+		output_schema: Option<Box<RawValue>>,
+		revival: ChildSessionInit,
+	) -> Result<u64, JournalError> {
+		if !self.load()?.is_empty() {
+			return Err(JournalError::ChildInitNotFirst);
+		}
+		let agent = Some(revival.parent_id.clone());
+		self.append(&Event {
+			ts,
+			kind: Kind::Init { system_prompt, tools, agent, output_schema, revival: Some(revival) },
+		})
+	}
+
+	/// Appends one durable child lifecycle transition linked to its Init event.
+	pub fn append_child_lifecycle(
+		&mut self,
+		ts: u64,
+		entry: omp_storage::transcript::ChildLifecycleEntry,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::ChildLifecycle(entry) })
 	}
 
 	/// Atomically creates a branch or fork child with ruled lineage semantics.
@@ -1064,9 +1240,131 @@ impl Journal {
 		self.session_index = Some((index, session));
 	}
 
+	/// Returns the latest durable context position reconstructed from journal
+	/// boundaries.
+	#[must_use]
+	pub const fn context_position(&self) -> ContextPosition {
+		ContextPosition {
+			anchor:   self.prompt_anchor,
+			revision: self.context_revision,
+			epoch:    self.compaction_epoch,
+		}
+	}
+
+	fn next_message_position(
+		&mut self,
+		item: &Item,
+	) -> Result<Option<ContextPosition>, JournalError> {
+		let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+			return Ok(None);
+		};
+		let anchor = if message.role == Role::User as i32 {
+			Some(self.prepare_append()?)
+		} else {
+			self.prompt_anchor
+		};
+		Ok(Some(ContextPosition {
+			anchor,
+			revision: self.context_revision.saturating_add(1),
+			epoch: self.compaction_epoch,
+		}))
+	}
+
+	fn commit_message_position(&mut self, item: &Item, event_index: u64) {
+		advance_message_position(
+			item,
+			event_index,
+			&mut self.context_revision,
+			&mut self.prompt_anchor,
+		);
+	}
+
 	/// Returns the complete committed journal byte watermark.
 	pub fn byte_watermark(&self) -> Result<u64, JournalError> {
 		Ok(self.writer.byte_watermark()?)
+	}
+
+	/// Subscribes to a complete ordered catch-up and bounded live committed
+	/// records.
+	///
+	/// Catch-up is captured and the subscriber is registered while this sole
+	/// owner is mutably borrowed, so no journal commit can fall between them.
+	/// Host-local records become omission markers at the same physical revision;
+	/// their payload bytes never enter the collaboration channel.
+	pub fn subscribe_replication(&mut self) -> Result<ReplicationSubscription, JournalError> {
+		if self.halted {
+			return Err(JournalError::Halted);
+		}
+		let (catch_up, host_revision) = {
+			let log = self.load()?;
+			let host_revision = u64::try_from(log.len()).expect("transcript event count fits in u64");
+			let mut catch_up = VecDeque::with_capacity(log.len());
+			for index in 0..host_revision {
+				let record = match log.get(index) {
+					Some(transcript::Entry::Ok(event)) => {
+						replication_record(index, Some(event)).map_err(|source| {
+							JournalError::ReplicationAfterJournal { event_index: index, source }
+						})?
+					},
+					_ => replication_record(index, None).map_err(|source| {
+						JournalError::ReplicationAfterJournal { event_index: index, source }
+					})?,
+				};
+				catch_up.push_back(record);
+			}
+			(catch_up, host_revision)
+		};
+		let (sender, live) = flume::bounded(REPLICATION_LAG_CAPACITY + 1);
+		let subscriber = self.next_replication_subscriber;
+		self.next_replication_subscriber = self.next_replication_subscriber.wrapping_add(1);
+		self
+			.replication_subscribers
+			.insert(subscriber, ReplicationSubscriber { last: host_revision, sender });
+		Ok(ReplicationSubscription { catch_up, live, host_revision })
+	}
+
+	fn publish_replication(
+		&mut self,
+		indexes: &[u64],
+		events: &[Event],
+	) -> Result<(), JournalError> {
+		if self.replication_subscribers.is_empty() {
+			return Ok(());
+		}
+		debug_assert_eq!(indexes.len(), events.len());
+		for (&index, event) in indexes.iter().zip(events) {
+			let record = replication_record(index, Some(event)).map_err(|source| {
+				JournalError::ReplicationAfterJournal { event_index: index, source }
+			})?;
+			self.replication_subscribers.retain(|_, subscriber| {
+				if subscriber.sender.is_disconnected() {
+					return false;
+				}
+				if subscriber.sender.len() >= REPLICATION_LAG_CAPACITY {
+					let _ = subscriber.sender.try_send(ReplicationEvent::Terminal(
+						ReplicationTerminal::Lagged { after: subscriber.last },
+					));
+					return false;
+				}
+				match subscriber
+					.sender
+					.try_send(ReplicationEvent::Record(record.clone()))
+				{
+					Ok(()) => {
+						subscriber.last = record.revision;
+						true
+					},
+					Err(flume::TrySendError::Disconnected(_)) => false,
+					Err(flume::TrySendError::Full(_)) => {
+						let _ = subscriber.sender.try_send(ReplicationEvent::Terminal(
+							ReplicationTerminal::Lagged { after: subscriber.last },
+						));
+						false
+					},
+				}
+			});
+		}
+		Ok(())
 	}
 
 	fn append_indexed_event(
@@ -1736,6 +2034,12 @@ impl Journal {
 				.try_send(SessionStateWatchEvent::Terminal(SessionStateWatchTerminal::Closed));
 		}
 		self.state_subscribers.clear();
+		for subscriber in self.replication_subscribers.values() {
+			let _ = subscriber
+				.sender
+				.try_send(ReplicationEvent::Terminal(ReplicationTerminal::Closed));
+		}
+		self.replication_subscribers.clear();
 	}
 
 	/// Returns the authenticated extension's latest live SESSION-scoped value.
@@ -2149,13 +2453,20 @@ impl Journal {
 		let Kind::Item(record) = &event.kind else {
 			unreachable!("constructed item event");
 		};
+		let prompt = self
+			.session_index
+			.is_some()
+			.then(|| user_prompt_text(&record.item))
+			.flatten();
+		let context = self.next_message_position(&record.item)?;
 		let appended = self.append_indexed_event(
 			ts,
 			"item",
-			EventProjection::ThreadItem { item: &record.item },
+			EventProjection::ThreadItem { item: &record.item, prompt: prompt.as_deref(), context },
 			&event,
 		)?;
 		self.item_count = self.item_count.saturating_add(1);
+		self.commit_message_position(&record.item, appended.index);
 		if let Some(source) = appended.index_error {
 			return Err(JournalError::SessionIndexAfterJournal {
 				event_index: appended.index,
@@ -2187,14 +2498,21 @@ impl Journal {
 		let Kind::TurnInput(input) = &event.kind else {
 			unreachable!("constructed turn-input event");
 		};
+		let prompt = self
+			.session_index
+			.is_some()
+			.then(|| user_prompt_text(&input.item))
+			.flatten();
+		let context = self.next_message_position(&input.item)?;
 		let appended = self.append_indexed_event(
 			ts,
 			"turn_input",
-			EventProjection::ThreadItem { item: &input.item },
+			EventProjection::ThreadItem { item: &input.item, prompt: prompt.as_deref(), context },
 			&event,
 		)?;
 		let index = appended.index;
 		self.item_count = self.item_count.saturating_add(1);
+		self.commit_message_position(&input.item, index);
 		if let Some((_, events)) = self
 			.pending_inputs
 			.iter_mut()
@@ -2482,7 +2800,32 @@ impl Journal {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::TransitionWhilePending);
 		}
-		self.append(&Event { ts, kind: Kind::Reset })
+		let event = Event { ts, kind: Kind::Reset };
+		let context = ContextPosition {
+			anchor:   None,
+			revision: self.context_revision.saturating_add(1),
+			epoch:    self.compaction_epoch.saturating_add(1),
+		};
+		let appended = self.append_indexed_event(
+			ts,
+			"reset",
+			EventProjection::Context {
+				anchor:   context.anchor,
+				revision: context.revision,
+				epoch:    context.epoch,
+			},
+			&event,
+		)?;
+		self.context_revision = context.revision;
+		self.compaction_epoch = context.epoch;
+		self.prompt_anchor = None;
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal {
+				event_index: appended.index,
+				source,
+			});
+		}
+		Ok(appended.index)
 	}
 
 	/// Requests a fresh provider-native session while preserving the canonical
@@ -2588,7 +2931,7 @@ impl Journal {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::CompactWhilePending);
 		}
-		self.append(&Event {
+		let event = Event {
 			ts,
 			kind: Kind::Compact {
 				summary:       compact.summary,
@@ -2601,7 +2944,31 @@ impl Journal {
 				superseded:    compact.superseded,
 				snapcompact:   compact.snapcompact,
 			},
-		})
+		};
+		let context = ContextPosition {
+			anchor:   self.prompt_anchor,
+			revision: self.context_revision.saturating_add(1),
+			epoch:    self.compaction_epoch.saturating_add(1),
+		};
+		let appended = self.append_indexed_event(
+			ts,
+			"compact",
+			EventProjection::Context {
+				anchor:   context.anchor,
+				revision: context.revision,
+				epoch:    context.epoch,
+			},
+			&event,
+		)?;
+		self.context_revision = context.revision;
+		self.compaction_epoch = context.epoch;
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal {
+				event_index: appended.index,
+				source,
+			});
+		}
+		Ok(appended.index)
 	}
 
 	/// Returns the earliest live turn start that lacks a terminal receipt.
@@ -2630,6 +2997,54 @@ impl Journal {
 				_ => Err(JournalError::InvalidTurnInput(*target)),
 			})
 			.collect()
+	}
+
+	/// Renders bounded user text directly from committed physical item ids.
+	///
+	/// This validates every id through the journal owner and avoids cloning
+	/// canonical item/message arrays solely to prepare a proactive recall query.
+	pub fn bounded_user_text_at(
+		&self,
+		targets: &[u64],
+		max_chars: usize,
+	) -> Result<Str, JournalError> {
+		let log = self.load()?;
+		let mut text = String::with_capacity(max_chars.min(4096));
+		let mut chars = 0_usize;
+		for target in targets {
+			let item = match log.get(*target) {
+				Some(transcript::Entry::Ok(event)) => {
+					event_item(&event.kind).ok_or(JournalError::InvalidTurnInput(*target))?
+				},
+				_ => return Err(JournalError::InvalidTurnInput(*target)),
+			};
+			if chars == max_chars {
+				continue;
+			}
+			let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+				continue;
+			};
+			if message.role != Role::User as i32 {
+				continue;
+			}
+			for part in &message.parts {
+				let Some(part::Kind::Text(value)) = part.kind.as_ref() else {
+					continue;
+				};
+				if !text.is_empty() && chars < max_chars {
+					text.push('\n');
+					chars = chars.saturating_add(1);
+				}
+				for character in value.chars().take(max_chars.saturating_sub(chars)) {
+					text.push(character);
+					chars = chars.saturating_add(1);
+				}
+				if chars == max_chars {
+					break;
+				}
+			}
+		}
+		Ok(Str::new(text))
 	}
 
 	/// Returns metadata from the most recently opened logical turn.
@@ -2670,6 +3085,7 @@ impl Journal {
 			crate::project::truncate_item_for_persistence(item);
 		}
 		if let Some(receipt) = self.receipts.get(turn_id) {
+			stamp_outcome_context(&mut outcome, self.context_position());
 			if receipt.outcome != outcome {
 				return Err(JournalError::TurnReplayMismatch(Str::new(turn_id)));
 			}
@@ -2710,15 +3126,22 @@ impl Journal {
 			let Kind::Item(record) = &event.kind else {
 				unreachable!("constructed gateway item event");
 			};
+			let prompt = self
+				.session_index
+				.is_some()
+				.then(|| user_prompt_text(&record.item))
+				.flatten();
+			let context = self.next_message_position(&record.item)?;
 			let appended = self.append_indexed_event(
 				ts,
 				"item",
-				EventProjection::ThreadItem { item: &record.item },
+				EventProjection::ThreadItem { item: &record.item, prompt: prompt.as_deref(), context },
 				&event,
 			)?;
 			let index = appended.index;
 			item_events.push(index);
 			self.item_count = self.item_count.saturating_add(1);
+			self.commit_message_position(&record.item, index);
 			self
 				.pending
 				.entry(turn_id.clone())
@@ -2731,6 +3154,7 @@ impl Journal {
 		if mismatch || replayed < existing.len() {
 			return Err(JournalError::TurnReplayMismatch(turn_id));
 		}
+		stamp_outcome_context(&mut outcome, self.context_position());
 		let receipt = TurnReceipt {
 			turn_id: turn_id.clone(),
 			prompt_hash: start.prompt_hash,
@@ -3055,12 +3479,74 @@ impl Journal {
 		self.item_count
 	}
 }
+
+#[derive(Serialize)]
+struct ReplicationOmission {
+	ts:  u64,
+	k:   &'static str,
+	rev: &'static str,
+}
+
+fn replication_visibility(kind: &Kind) -> ReplicationVisibility {
+	match kind {
+		Kind::Msg(_)
+		| Kind::Item(_)
+		| Kind::Rewind { .. }
+		| Kind::Compact { .. }
+		| Kind::Branch { .. }
+		| Kind::Reset
+		| Kind::ProviderReset
+		| Kind::Title { .. }
+		| Kind::ForkedFrom { .. }
+		| Kind::Aborted { .. }
+		| Kind::Amend { .. }
+		| Kind::TurnInput(_)
+		| Kind::JobSettled(_)
+		| Kind::TurnReceipt(_)
+		| Kind::Label { .. } => ReplicationVisibility::PublicTranscript,
+		Kind::Infer { cred_pin, .. } if cred_pin.is_unchanged() => {
+			ReplicationVisibility::PublicTranscript
+		},
+		Kind::Custom(custom) if custom.kind() == "collab-prompt" && custom.display() => {
+			ReplicationVisibility::PublicTranscript
+		},
+		_ => ReplicationVisibility::HostLocalOmitted,
+	}
+}
+
+fn replication_record(
+	index: u64,
+	event: Option<&Event>,
+) -> Result<ReplicationRecord, transcript::Error> {
+	let revision = index.saturating_add(1);
+	let visibility = event
+		.map_or(ReplicationVisibility::HostLocalOmitted, |event| replication_visibility(&event.kind));
+	let json = match (visibility, event) {
+		(ReplicationVisibility::PublicTranscript, Some(event)) => {
+			let mut json = Vec::new();
+			transcript::write_line(event, &mut json)?;
+			Bytes::from(json)
+		},
+		_ => Bytes::from(serde_json::to_vec(&ReplicationOmission {
+			ts:  event.map_or(0, |event| event.ts),
+			k:   "collab_omitted",
+			rev: "host_local.v1",
+		})?),
+	};
+	Ok(ReplicationRecord { revision, visibility, json })
+}
+
 impl Drop for Journal {
 	fn drop(&mut self) {
 		for subscriber in self.state_subscribers.values() {
 			let _ = subscriber
 				.sender
 				.try_send(SessionStateWatchEvent::Terminal(SessionStateWatchTerminal::Closed));
+		}
+		for subscriber in self.replication_subscribers.values() {
+			let _ = subscriber
+				.sender
+				.try_send(ReplicationEvent::Terminal(ReplicationTerminal::Closed));
 		}
 	}
 }
@@ -3335,6 +3821,53 @@ fn refresh_invariant(message: &'static str) -> JournalError {
 		std::io::ErrorKind::InvalidData,
 		message,
 	)))
+}
+
+fn stamp_outcome_context(outcome: &mut Outcome, context: ContextPosition) {
+	let Some(snapshot) = outcome.context_snapshot.as_mut() else {
+		return;
+	};
+	snapshot.prompt_anchor = context.anchor;
+	snapshot.context_revision = Some(context.revision);
+	snapshot.compaction_epoch = Some(context.epoch);
+}
+
+fn advance_message_position(
+	item: &Item,
+	event_index: u64,
+	revision: &mut u64,
+	prompt_anchor: &mut Option<u64>,
+) {
+	let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+		return;
+	};
+	*revision = revision.saturating_add(1);
+	if message.role == Role::User as i32 {
+		*prompt_anchor = Some(event_index);
+	}
+}
+
+fn user_prompt_text(item: &Item) -> Option<String> {
+	let item::Kind::Message(message) = item.kind.as_ref()? else {
+		return None;
+	};
+	if message.role != Role::User as i32 {
+		return None;
+	}
+	let mut prompt = String::new();
+	for value in message
+		.parts
+		.iter()
+		.filter_map(|part| match part.kind.as_ref() {
+			Some(part::Kind::Text(value)) => Some(value.as_str()),
+			_ => None,
+		}) {
+		if !prompt.is_empty() {
+			prompt.push('\n');
+		}
+		prompt.push_str(value);
+	}
+	(!prompt.is_empty()).then_some(prompt)
 }
 
 const fn event_item(kind: &Kind) -> Option<&Item> {

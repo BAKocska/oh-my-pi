@@ -158,6 +158,44 @@ pub struct AgentRecord {
 	pub history:          AgentHistory,
 }
 
+/// Credential-free registry row safe for collaboration presentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollabAgentRecord {
+	/// Stable process identity.
+	pub id:               Str,
+	/// Sanitized display name.
+	pub name:             Str,
+	/// Main or task-subagent classification; advisors are never representable.
+	pub kind:             CollabAgentKind,
+	/// Visible parent agent identity.
+	pub parent:           Option<Str>,
+	/// Current lifecycle state.
+	pub status:           RegistryStatus,
+	/// Whether a bounded transcript fetch may be requested.
+	pub has_transcript:   bool,
+	/// Last activity change in epoch milliseconds.
+	pub last_activity_ms: u64,
+}
+
+/// Agent kinds permitted in collaboration registry snapshots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum CollabAgentKind {
+	/// Main session agent.
+	Main,
+	/// User-visible task subagent.
+	Sub,
+}
+
+/// Generation-fenced collaboration registry snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollabRegistrySnapshot {
+	/// Monotonic process-global registry generation.
+	pub generation: u64,
+	/// Deterministically ordered public registry rows.
+	pub agents:     Arc<[CollabAgentRecord]>,
+}
+
 /// Registry compare-and-swap or persistence failure.
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -361,6 +399,37 @@ impl AgentRegistry {
 				.then_with(|| left.id.cmp(&right.id))
 		});
 		records
+	}
+
+	/// Returns a generation-fenced, credential-free collaboration roster.
+	///
+	/// Advisor identities, transcript paths, workspace/session ids, models,
+	/// activity text, and historical artifacts remain host-local.
+	#[must_use]
+	pub fn collab_snapshot(&self) -> CollabRegistrySnapshot {
+		let generation = self.generation();
+		let agents = self
+			.roster(false)
+			.into_iter()
+			.filter_map(|record| {
+				let kind = match record.kind {
+					AgentKind::Main => CollabAgentKind::Main,
+					AgentKind::Subagent => CollabAgentKind::Sub,
+					AgentKind::Advisor => return None,
+				};
+				Some(CollabAgentRecord {
+					id: record.id,
+					name: record.name,
+					kind,
+					parent: record.parent,
+					status: record.status,
+					has_transcript: record.transcript.is_some(),
+					last_activity_ms: record.last_activity_ms,
+				})
+			})
+			.collect::<Vec<_>>()
+			.into();
+		CollabRegistrySnapshot { generation, agents }
 	}
 
 	/// CAS-updates one lifecycle state.
@@ -1458,6 +1527,7 @@ fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
 
 	let mut definition = None;
 	let mut parent = None;
+	let mut display_name = None;
 	let mut depth = 1;
 	let mut model = None;
 	let mut serving_model = None;
@@ -1483,6 +1553,12 @@ fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
 			Kind::Init { agent, revival: Some(revival), .. } => {
 				saw_revival = true;
 				parent = agent;
+				if !revival.parent_id.is_empty() {
+					parent = Some(revival.parent_id);
+				}
+				if !revival.display_name.is_empty() {
+					display_name = Some(revival.display_name);
+				}
 				depth = revival.depth;
 				definition = Some(revival.definition);
 				model = Some(revival.model_role);
@@ -1543,6 +1619,7 @@ fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
 		.file_stem()
 		.and_then(std::ffi::OsStr::to_str)
 		.map_or_else(|| id.clone(), Str::new);
+	let name = display_name.unwrap_or(name);
 	Ok(ColdScan::Record(AgentRecord {
 		id,
 		name,

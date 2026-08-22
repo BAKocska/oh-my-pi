@@ -18,7 +18,9 @@ use omp_proto::{
 use omp_secrets::{json::deobfuscate_json, obfuscator::SecretObfuscator};
 use omp_storage::{
 	blob::BlobStore,
-	transcript::{CallId, Entry, InvocationTransition, Kind, SnapcompactArchive},
+	transcript::{
+		CallId, ChildLifecycleEntry, Entry, InvocationTransition, Kind, SnapcompactArchive,
+	},
 };
 use omp_telemetry::firehose::{
 	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
@@ -34,9 +36,9 @@ use thiserror::Error;
 use crate::{
 	AgentRegistry, BatchError, CompactionCoordinator, CompactionMethodOrder, Journal, JournalError,
 	Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome, ManualCompactionRequest,
-	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptError, SnapcompactPreparation,
-	TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession,
-	YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
+	SnapcompactPreparation, TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, TurnClient,
+	TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	batch::{
 		ExecutionModeHandle, InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest,
 		SpeculativeCall, ToolBatch,
@@ -54,6 +56,7 @@ use crate::{
 	journal::{AbortDisposition, TurnInputRecord, TurnOptionsRecord, TurnStart},
 	mailbox::DrainPoint,
 	project::project_journal,
+	prompt::{PromptError, PromptHash},
 	state::AgentState,
 	turn::{Error as TurnError, empty_stop},
 };
@@ -66,6 +69,7 @@ const EMPTY_OUTPUT_RETRY_CAP: u8 = 3;
 const EMPTY_OUTPUT_RETRY_DETAIL: &str =
 	"Assistant returned no final output after retry cap; try switching models";
 const CONTROL_DRAIN_LIMIT: usize = 32;
+const MEMORY_RECALL_QUERY_MAX_CHARS: usize = 32 * 1024;
 
 /// Typed settlement of one complete caller submission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -477,7 +481,7 @@ pub struct Agent<C: TurnClient> {
 	phase: AgentPhase,
 	control_serviced_during_turn: bool,
 	context: Option<ContextRef>,
-	prompt_hash: Option<crate::PromptHash>,
+	prompt_hash: Option<PromptHash>,
 	prompt_head_events: Vec<u64>,
 	settled_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
@@ -487,11 +491,13 @@ pub struct Agent<C: TurnClient> {
 	last_toolset_hash: Option<Hash32>,
 	firehose: Arc<Firehose>,
 	run_activity: Option<Arc<dyn RunActivity>>,
+	prompt_memory_source: Option<Arc<dyn PromptMemorySnapshotSource>>,
 	secret_obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
 	compaction: CompactionCoordinator,
 	blob_store: Option<BlobStore>,
 	ttsr: Option<TtsrRegistry>,
 	deferred_ttsr: Vec<DeferredTtsr>,
+	autolearn: Option<crate::AutolearnController>,
 }
 
 impl<C: TurnClient> Agent<C> {
@@ -581,11 +587,13 @@ impl<C: TurnClient> Agent<C> {
 			firehose: Arc::new(Firehose::new()),
 			last_toolset_hash,
 			run_activity: None,
+			prompt_memory_source: None,
 			secret_obfuscator: None,
 			compaction: CompactionCoordinator::default(),
 			blob_store: None,
 			ttsr: None,
 			deferred_ttsr: Vec::new(),
+			autolearn: None,
 		}
 	}
 
@@ -687,6 +695,16 @@ impl<C: TurnClient> Agent<C> {
 	/// Returns the durable journal owner.
 	pub const fn journal(&self) -> &Journal {
 		&self.journal
+	}
+
+	/// Appends one supervisor-owned child lifecycle transition through the
+	/// session's sole mutable journal authority.
+	pub fn record_child_lifecycle(
+		&mut self,
+		ts: u64,
+		entry: ChildLifecycleEntry,
+	) -> Result<u64, JournalError> {
+		self.journal.append_child_lifecycle(ts, entry)
 	}
 
 	/// Installs the app-owned content-addressed store used by durable bitmap
@@ -938,7 +956,42 @@ impl<C: TurnClient> Agent<C> {
 		items: impl IntoIterator<Item = Item>,
 		root_turn_id: TurnId,
 	) -> Result<AgentRunSummary, AgentError> {
+		if let Some(controller) = self.autolearn.as_mut() {
+			controller.begin_primary(self.execution_mode.get());
+		}
+		let capture_root = root_turn_id.clone();
 		let result = self.submit_inner(items, root_turn_id).await;
+		let aborted = result.as_ref().map_or(true, |summary| summary.interrupted);
+		let mut decision = if let Some(controller) = self.autolearn.as_mut() {
+			if aborted {
+				controller.abort();
+				crate::CaptureDecision::None
+			} else {
+				controller.finish_primary(self.execution_mode.get(), false)
+			}
+		} else {
+			crate::CaptureDecision::None
+		};
+		let mut capture_index = 0_u32;
+		while decision == crate::CaptureDecision::Enqueue {
+			capture_index = capture_index.saturating_add(1);
+			let _ = self
+				.mailbox
+				.sender()
+				.try_enqueue(crate::capture_interrupt());
+			let turn_id = TurnId::new(sf!("{}-autolearn-{}", capture_root.as_str(), capture_index));
+			let capture = self.submit_inner(std::iter::empty(), turn_id).await;
+			let capture_aborted = capture.as_ref().map_or(true, |summary| summary.interrupted);
+			if let Err(error) = &capture {
+				let _ = error;
+			}
+			decision = self
+				.autolearn
+				.as_mut()
+				.map_or(crate::CaptureDecision::None, |controller| {
+					controller.finish_capture(capture_aborted)
+				});
+		}
 		if result.is_err() {
 			self.transition(AgentPhase::Idle);
 		}
@@ -1261,6 +1314,12 @@ impl<C: TurnClient> Agent<C> {
 							tool: result.call_id().clone(),
 							..FirehoseToolCall::default()
 						})));
+					if result.outcome().is_some()
+						&& let Some(controller) = self.autolearn.as_mut()
+						&& !controller.capture_in_flight()
+					{
+						controller.observe_settled_tool_execution();
+					}
 					if let Some(outcome) = result.outcome().cloned() {
 						let call_id = result.call_id().clone();
 						self
@@ -1514,6 +1573,19 @@ impl<C: TurnClient> Agent<C> {
 		self.run_activity = Some(activity);
 	}
 
+	/// Installs the app/runtime adapter sampled immediately before each fresh
+	/// provider prompt is rendered.
+	pub fn set_prompt_memory_source(&mut self, source: Arc<dyn PromptMemorySnapshotSource>) {
+		self.prompt_memory_source = Some(source);
+	}
+
+	/// Installs Pi-compatible substantive-turn detection and synthetic capture.
+	pub fn set_autolearn(&mut self, settings: crate::AutolearnSettings) {
+		self.autolearn = settings
+			.enabled
+			.then(|| crate::AutolearnController::new(settings));
+	}
+
 	async fn run_turn(
 		&mut self,
 		turn_id: TurnId,
@@ -1524,12 +1596,30 @@ impl<C: TurnClient> Agent<C> {
 			activity.enter();
 			RunActivityGuard(Arc::clone(activity))
 		});
-		let snapshot = self.state.snapshot();
 		let durable = self
 			.journal
 			.pending_turn()
 			.filter(|start| start.turn_id.as_str() == turn_id.as_str())
 			.cloned();
+		let capture_turn = durable.is_none()
+			&& self
+				.journal
+				.items_at(&pending)?
+				.iter()
+				.any(crate::is_capture_item);
+		if durable.is_none()
+			&& let Some(source) = &self.prompt_memory_source
+		{
+			let user_text = self
+				.journal
+				.bounded_user_text_at(&pending, MEMORY_RECALL_QUERY_MAX_CHARS)?;
+			let query = PromptMemoryQuery::new(turn_id.as_str(), &pending, user_text.as_str());
+			let memory = source.snapshot(query);
+			self
+				.state
+				.update(|snapshot| snapshot.workspace.memory = memory);
+		}
+		let snapshot = self.state.snapshot();
 		if let Some(start) = durable.as_ref() {
 			let current = snapshot.registry.slot_hash();
 			if current != start.toolset_hash
@@ -1580,7 +1670,19 @@ impl<C: TurnClient> Agent<C> {
 			self.prompt_hash = Some(rendered.hash);
 		}
 		let frozen_enabled_tools: Arc<[Str]> = durable.as_ref().map_or_else(
-			|| Arc::clone(&snapshot.enabled_tools),
+			|| {
+				if capture_turn {
+					snapshot
+						.enabled_tools
+						.iter()
+						.filter(|name| matches!(name.as_str(), "dyn" | "manage_skill" | "learn"))
+						.cloned()
+						.collect::<Vec<_>>()
+						.into()
+				} else {
+					Arc::clone(&snapshot.enabled_tools)
+				}
+			},
 			|start| Arc::from(start.enabled_tools.clone()),
 		);
 		let mut resume_input = durable.as_ref().map(|start| match &start.input {
@@ -2601,6 +2703,9 @@ fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
 		},
 		crate::mailbox::InterruptSource::Peer { from } => {
 			format!("peer {} steered", from.as_str()).to_str()
+		},
+		crate::mailbox::InterruptSource::Remote { principal } => {
+			sf!("remote guest {} steered", principal.display_name())
 		},
 		crate::mailbox::InterruptSource::DeferredDiagnostics { document, revision, .. } => {
 			format!("deferred diagnostics for {} at revision {}", document.as_str(), revision).to_str()

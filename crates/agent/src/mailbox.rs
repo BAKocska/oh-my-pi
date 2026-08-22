@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use omp_core::{Str, sf};
+use omp_core::{RemotePrincipal, Str, sf};
 use omp_proto::{
 	inference::v1 as inference,
 	thread::v1::{self as thread, Item},
@@ -80,6 +80,11 @@ pub enum InterruptSource {
 		/// Stable sender identity.
 		from: Str,
 	},
+	/// Authenticated mutation admitted from a writable collaboration peer.
+	Remote {
+		/// Immutable room, peer, and credential-tier provenance.
+		principal: RemotePrincipal,
+	},
 	/// Revision-fenced diagnostics completed after the inline write budget.
 	DeferredDiagnostics {
 		/// Stable document identity supplied by document authority.
@@ -93,6 +98,15 @@ pub enum InterruptSource {
 	Producer(Str),
 }
 
+/// Durable item property marking a host-admitted collaboration mutation.
+pub const REMOTE_PRINCIPAL_PROP: &str = "omp/collab/remote";
+/// Durable item property retaining the relay peer id for audit linkage.
+pub const REMOTE_PEER_ID_PROP: &str = "omp/collab/peer-id";
+/// Durable item property retaining the sanitized guest display name.
+pub const REMOTE_DISPLAY_NAME_PROP: &str = "omp/collab/display-name";
+/// Durable item property retaining the secret-free collaboration room identity.
+pub const REMOTE_ROOM_ID_PROP: &str = "omp/collab/room-id";
+
 /// Canonical thread input delivered asynchronously to the agent loop.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Interrupt {
@@ -102,6 +116,42 @@ pub struct Interrupt {
 	pub item:   Item,
 	/// Typed attribution for the producer of this input.
 	pub source: InterruptSource,
+}
+
+/// Builds a Core-mailbox interrupt stamped with authenticated remote
+/// provenance.
+///
+/// The write token and its audit digest are intentionally absent from durable
+/// item properties. Tool effects produced by this input still traverse the
+/// normal Environment grant and durable approval path.
+#[must_use]
+pub fn remote_principal_interrupt(
+	mut item: Item,
+	class: InterruptClass,
+	principal: RemotePrincipal,
+) -> Interrupt {
+	let props = item.props.get_or_insert_with(inference::ValueMap::default);
+	props
+		.fields
+		.insert(REMOTE_PRINCIPAL_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::Bool(true)),
+		});
+	props
+		.fields
+		.insert(REMOTE_PEER_ID_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::Uint(u64::from(principal.peer_id()))),
+		});
+	props
+		.fields
+		.insert(REMOTE_DISPLAY_NAME_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::String(principal.display_name().to_owned())),
+		});
+	props
+		.fields
+		.insert(REMOTE_ROOM_ID_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::String(principal.room_id().to_owned())),
+		});
+	Interrupt { class, item, source: InterruptSource::Remote { principal } }
 }
 
 /// Builds the deferred catalog-change interrupt used for device availability.

@@ -225,6 +225,7 @@ pub const fn continues_loop(source: &InterruptSource) -> bool {
 			| InterruptSource::Continuation { .. }
 			| InterruptSource::Schedule { .. }
 			| InterruptSource::Peer { .. }
+			| InterruptSource::Remote { .. }
 			| InterruptSource::DeferredDiagnostics { .. }
 	)
 }

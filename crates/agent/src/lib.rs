@@ -12,8 +12,10 @@
 #[macro_use]
 extern crate omp_core;
 
+pub mod advisor;
 mod approvals;
 pub mod attachments;
+mod autolearn;
 mod batch;
 pub mod branch_summary;
 mod broker;
@@ -29,6 +31,7 @@ mod inproc;
 mod jobs;
 mod journal;
 pub mod journal_kinds;
+pub mod lifecycle;
 mod r#loop;
 mod mailbox;
 mod name;
@@ -58,15 +61,20 @@ pub use attachments::{
 	clamp_provider_images, describe_images_for_text_model, normalize_latest_inline_images,
 	provider_image_budget,
 };
+pub use autolearn::{
+	AutolearnController, AutolearnSettings, CAPTURE_PROP, CaptureDecision, DEFAULT_MIN_TOOL_CALLS,
+	capture_interrupt, is_capture_item, standing_guidance,
+};
 pub use batch::{
 	BatchError, BatchResult, CommittedCall, EXECUTION_MODE_PROP, ExecutionMode, ExecutionModeHandle,
 	InvocationAdmission, InvocationHookBus, InvocationHookRequest, PLAN_YOLO_PROP,
 	PREWALK_REASON_PROP, SpeculativeCall, ToolBatch, effects_mutate_environment, hook_event_mask,
 };
 pub use broker::{
-	AgentHistory, AgentRecord, AgentRegistry, Broker, BrokerError, BrokerInbox, DeliveryMode,
-	DeliveryReceipt, DiscoveryDiagnostic, DiscoveryDiagnosticKind, ParkLease, PeerMessage, Receipt,
-	RegistryError, RegistryStatus, RevivalRequest, RoutedEvent, now_ms as broker_now_ms, peer_item,
+	AgentHistory, AgentRecord, AgentRegistry, Broker, BrokerError, BrokerInbox, CollabAgentKind,
+	CollabAgentRecord, CollabRegistrySnapshot, DeliveryMode, DeliveryReceipt, DiscoveryDiagnostic,
+	DiscoveryDiagnosticKind, ParkLease, PeerMessage, Receipt, RegistryError, RegistryStatus,
+	RevivalRequest, RoutedEvent, now_ms as broker_now_ms, peer_item,
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCoordinator,
@@ -94,8 +102,9 @@ pub use continuation::{
 };
 pub use control::{ControlError, ControlSender, RewindAck};
 pub use events::{
-	AgentEvent, AgentPhase, AgentRunState, EventBus, EventProvenance, EventSubscription,
-	EventVisibility, LossyEventSubscription, PeerRelayObservation, PlanState,
+	AgentEvent, AgentPhase, AgentRunState, CollabEvent, CollabEventSubscription,
+	CollabEventVisibility, EventBus, EventProvenance, EventSubscription, EventVisibility,
+	LossyEventSubscription, PeerRelayObservation, PlanState,
 };
 pub use hooks::{
 	AgentSettled, Composition, ContextPatch, DomainReturn, GateDecision, GateError, GateEvent,
@@ -110,11 +119,17 @@ pub use jobs::{
 pub use journal::{
 	AbortDisposition, ChildKind, Compact, Journal, JournalAuthor, JournalCustomEntry, JournalError,
 	JournalGenerations, JournalOperation, JournalQuery, JournalReply, JournalRequest,
-	JournalRequestStamp, PendingCustomEntry, SessionStateValue, SessionStateWatchEvent,
-	SessionStateWatchTerminal, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
-	WorkspaceRoots,
+	JournalRequestStamp, PendingCustomEntry, ReplicationEvent, ReplicationRecord,
+	ReplicationSubscription, ReplicationTerminal, ReplicationVisibility, SessionStateValue,
+	SessionStateWatchEvent, SessionStateWatchTerminal, TurnInputRecord, TurnOptionsRecord,
+	TurnReceipt, TurnStart, WorkspaceRoots,
 };
 pub use journal_kinds::{EntryKindDecl, EntryKindError, EntryKindRegistry, KindRecord, LiftHook};
+pub use lifecycle::{
+	MAX_MEMORY_EXTRACTION_ITEMS, MemoryExtractionWindow, MemoryExtractionWindowError,
+	MemoryHookEvent, MemoryHooks, PromptMemoryQuery, PromptMemorySnapshotSource, ShutdownOutcome,
+	ShutdownStage, ShutdownTask, shutdown_ordered,
+};
 pub use r#loop::{
 	AbortHandle, Agent, AgentError, AgentRunSummary, RewindTarget, RunActivity, RunSettlement,
 };
@@ -122,8 +137,9 @@ pub use mailbox::{
 	DEFERRED_DIAGNOSTIC_DOCUMENT_PROP, DEFERRED_DIAGNOSTIC_GENERATION_PROP,
 	DEFERRED_DIAGNOSTIC_REVISION_PROP, DeferredCommand, DeferredCommandKind, DeferredCommands,
 	DeferredContext, DeferredSettlement, DeferredSettlementStatus, DrainPoint, Interrupt,
-	InterruptClass, InterruptSource, Mailbox, MailboxSender, deferred_diagnostics_interrupt,
-	device_availability_interrupt,
+	InterruptClass, InterruptSource, Mailbox, MailboxSender, REMOTE_DISPLAY_NAME_PROP,
+	REMOTE_PEER_ID_PROP, REMOTE_PRINCIPAL_PROP, REMOTE_ROOM_ID_PROP, deferred_diagnostics_interrupt,
+	device_availability_interrupt, remote_principal_interrupt,
 };
 pub use name::{AgentNameAllocator, AgentNameError};
 pub use omp_llm_inference::TurnId;
@@ -149,9 +165,10 @@ pub use prompt::{
 	ConventionsPromptSource, DeliveryPromptSource, EagerTaskPolicy, HostInfoInput, ModePromptSource,
 	ModelPromptInput, MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource,
 	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptError, PromptHash,
-	PromptMode, PromptNamedInput, PromptOut, PromptPatchSet, PromptSchemeInput, PromptSettingsInput,
-	PromptSource, PromptToolExampleInput, PromptToolInput, RenderedPrompt, RepositoryInput,
-	RolePromptSource, RuntimePromptSource, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotPatch,
+	PromptMemoryInput, PromptMemorySlotInput, PromptMode, PromptNamedInput, PromptOut,
+	PromptPatchSet, PromptSchemeInput, PromptSettingsInput, PromptSource, PromptToolExampleInput,
+	PromptToolInput, RenderedPrompt, RepositoryInput, RolePromptSource, RuntimePromptSource,
+	SECURITY_REVIEW_INSTRUCTION_V1, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotPatch,
 	SlotRegistration, SlotSource, ToolInventoryMode, VcsIdentity, VolatilePrompt,
 	VolatilePromptJournal, WorkflowPromptSource, WorkspaceInput, WorkspacePromptSource,
 	WorkspaceRootInput, WorkspaceRootsInput, WorkspaceTreeInput, render_prompt,
