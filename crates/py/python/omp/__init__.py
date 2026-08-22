@@ -1073,6 +1073,8 @@ from .provider import (
 )
 from . import hooks as hooks
 from .hooks import *
+from . import campaigns as campaigns
+from .campaigns import *
 from . import events as events
 from .events import *
 # Hooks and policy document the same top-level approval deadline; policy owns
@@ -1716,4 +1718,9 @@ __all__ += (
     "services",
     "tier_of",
 )
-__all__ += hooks.__all__ + events.__all__ + ("hooks", "events")
+__all__ += (
+    hooks.__all__
+    + campaigns.__all__
+    + events.__all__
+    + ("hooks", "campaigns", "events")
+)

@@ -43,6 +43,7 @@ for name in omp.__all__:
 for suffix in (
     "agents", "context", "policy", "limits", "telemetry", "provider",
     "env", "ui", "hooks", "events", "prompts", "packages",
+    "campaigns",
     "sessions", "journal", "artifacts", "index", "diagnostics", "urls", "devices",
 ):
     module = importlib.import_module(f"omp.{suffix}")
@@ -183,8 +184,190 @@ registry_module.configure_manifest(
         executable_declaration(
             "model-request-telemetry", "telemetry", "model_request"
         ),
+        executable_declaration(
+            "surface-campaign", "campaign", "surface-campaign"
+        ),
+        executable_declaration(
+            "composing-campaign", "campaign", "composing-campaign"
+        ),
+        executable_declaration(
+            "react-campaign", "campaign", "react-campaign"
+        ),
+        executable_declaration(
+            "three-turn-campaign", "campaign", "three-turn-campaign"
+        ),
     ),
 )
+
+@dataclasses.dataclass
+class SurfaceCampaignState:
+    attempts: int = 0
+
+
+@omp.campaign(
+    "surface-campaign",
+    at=(omp.CONTEXT, omp.SETTLE),
+    ladder=omp.Ladder(3, max_turns=4),
+    scope=omp.CampaignScope.SESSION,
+    state=SurfaceCampaignState,
+    state_family="acme.surface-campaign",
+    claims=("mode", "worktree"),
+    binds=("Toolset",),
+)
+class SurfaceCampaign:
+    pass
+
+
+@omp.campaign(
+    "composing-campaign",
+    at=omp.CONTEXT,
+    scope="session",
+    binds=("Model",),
+    composes=True,
+)
+class ComposingCampaign:
+    pass
+
+
+campaign_declarations = {
+    declaration.id: declaration
+    for declaration in registry_module.registry.snapshot().campaigns
+}
+surface_campaign = campaign_declarations["surface-campaign"]
+assert surface_campaign.id == "surface-campaign"
+assert surface_campaign.points == (omp.Point.CONTEXT, omp.Point.SETTLE)
+assert surface_campaign.state.wire_name == "acme.surface-campaign@1"
+assert surface_campaign.claims == ("mode", "worktree")
+assert surface_campaign.binds == ("Toolset",)
+assert not surface_campaign.composes
+assert campaign_declarations["composing-campaign"].composes
+surface_state = SurfaceCampaignState(attempts=2)
+encoded_surface_state = surface_campaign.state.encode(surface_state)
+assert surface_campaign.state.decode(encoded_surface_state) == surface_state
+schema_error = expect_raises(
+    omp.StateSchemaMismatch,
+    lambda: omp.StateVersion(
+        "acme.surface-campaign", 2, SurfaceCampaignState
+    ).decode(encoded_surface_state),
+)
+assert schema_error.expected == "acme.surface-campaign@2"
+assert schema_error.actual == "acme.surface-campaign@1"
+handoff = omp.Deny("readonly", engage=omp.EngageRequest("surface-campaign"))
+assert handoff.engage.campaign == "surface-campaign"
+
+
+@omp.campaign("react-campaign", at=omp.SETTLE)
+def react_campaign(event):
+    assert event == {"turn": 3}
+    return omp.Continue()
+
+
+@dataclasses.dataclass(frozen=True)
+class ThreeTurnState:
+    turns: int = 0
+
+
+@omp.campaign(
+    "three-turn-campaign",
+    at=omp.SETTLE,
+    state=ThreeTurnState,
+    state_family="acme.three-turn",
+)
+def three_turn_campaign(event, state):
+    next_state = ThreeTurnState(state.turns + 1)
+    verdict = omp.Force("write") if next_state.turns == 3 else omp.Continue()
+    return verdict, next_state
+
+
+reacted = asyncio.run(
+    omp.dispatch_campaign_react(
+        "react-campaign",
+        omp.SETTLE,
+        b'{"turn":3}',
+    )
+)
+assert reacted["verdict"] == "continue"
+
+
+three_turn_declaration = next(
+    declaration
+    for declaration in registry_module.registry.snapshot().campaigns
+    if declaration.id == "three-turn-campaign"
+)
+three_turn_state = three_turn_declaration.state.encode(ThreeTurnState())
+three_turn_verdicts = []
+for turn in range(1, 4):
+    reaction = asyncio.run(
+        omp.dispatch_campaign_react(
+            "three-turn-campaign",
+            omp.SETTLE,
+            b"{}",
+            three_turn_state,
+        )
+    )
+    three_turn_verdicts.append(reaction["verdict"])
+    three_turn_state = reaction["new_state"]
+assert three_turn_verdicts == ["continue", "continue", "force"]
+assert three_turn_declaration.state.decode(three_turn_state) == ThreeTurnState(3)
+
+
+class CampaignBackend:
+    async def request(self, operation, arguments):
+        if operation == "omp.campaigns.engage":
+            return {
+                "id": "eng-1",
+                "campaign": arguments["campaign"],
+                "extension": "acme-ext",
+                "state": arguments["state"],
+            }
+        if operation == "omp.campaigns.active":
+            return [{
+                "id": "eng-1",
+                "campaign": "surface-campaign",
+                "extension": "acme-ext",
+                "state": encoded_surface_state.decode(),
+            }]
+        if operation == "omp.campaigns.disengage":
+            return arguments["engagement"] == "eng-1"
+        raise AssertionError(operation)
+
+
+campaign_backend_token = omp._control_backend.set(CampaignBackend())
+try:
+    engaged = asyncio.run(omp.campaigns.engage("surface-campaign", state=surface_state))
+    assert engaged.state == surface_state
+    assert asyncio.run(omp.campaigns.active()) == (engaged,)
+    assert asyncio.run(omp.campaigns.disengage("eng-1"))
+finally:
+    omp._control_backend.reset(campaign_backend_token)
+
+
+mode_claim_error = expect_raises(
+    omp.ModeClaimRequired,
+    lambda: omp.campaign(
+        "stealth-mode",
+        at=omp.CONTEXT,
+        scope="session",
+        binds=("Model",),
+    ),
+)
+assert mode_claim_error.campaign == "stealth-mode"
+assert mode_claim_error.binding == "Model"
+expect_raises(
+    omp.CampaignContractError,
+    lambda: omp.campaign("stream-extension", at=omp.STREAM),
+)
+assert omp.POINT_TABLE == (
+    "context", "tool_choice", "pre_model", "stream", "admission",
+    "batch", "turn_end", "settle", "idle",
+)
+assert omp.VERDICT_TABLE == (
+    "pass", "inject", "patch", "hold", "deny", "continue",
+    "force", "cut", "bind", "done", "exhausted", "escalate",
+)
+assert omp.Continue().inject is None
+assert omp.Force("write").tool == "write"
+assert omp.Done().result is None
 
 
 # Shared exception payloads remain inspectable across the frozen boundary.
@@ -2090,6 +2273,11 @@ assert "JournalError" in omp.journal.__all__
 
 # FREEZE evaluates deferred availability exactly once and seals the projection.
 snapshot = registry_module.freeze_declarations()
+assert surface_campaign in snapshot.campaigns
+expect_raises(
+    omp.LateRegistration,
+    lambda: omp.campaign("late-campaign", at=omp.IDLE),
+)
 assert bare_definition in snapshot.providers
 assert ("surface_device/inspect/detail", "", 1) in snapshot.tools
 assert ("surface_device/inspect/annotated", "surface-routes", 1) in snapshot.tools

@@ -53,6 +53,7 @@ _EXECUTABLE_KINDS = frozenset(
         "soft",
         "hard",
         "hook",
+        "campaign",
         "worker",
         "provider",
         "prompt_slot",
@@ -354,6 +355,7 @@ class DeclarationSnapshot:
     completions: tuple[UIDefinition, ...] = ()
     message_renderers: tuple[UIDefinition, ...] = ()
     verdict_renderers: tuple[UIDefinition, ...] = ()
+    campaigns: tuple[object, ...] = ()
 
 
 class DeclarationRegistry:
@@ -379,6 +381,7 @@ class DeclarationRegistry:
         "_provider_candidates",
         "_hooks",
         "_hook_definitions",
+        "_campaigns",
         "_prompt_slots",
         "_telemetry",
         "_manifest_hooks",
@@ -418,6 +421,7 @@ class DeclarationRegistry:
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookKey, object] = {}
         self._hook_definitions: dict[_HookKey, HookDefinition] = {}
+        self._campaigns: dict[str, object] = {}
         self._telemetry: dict[str, TelemetryDefinition] = {}
         self._exports: dict[int, ExportDefinition] = {}
         self._export_sequence = 0
@@ -511,6 +515,7 @@ class DeclarationRegistry:
         if (
             self._tools
             or self._hooks
+            or self._campaigns
             or self._services
             or self._commands
             or self._completions
@@ -722,6 +727,16 @@ class DeclarationRegistry:
             key[0], key[1], handler, trigger
         )
         return handler
+    def register_campaign(self, campaign_id: str, declaration: object) -> object:
+        """Record one campaign decorator during sequential manifest import."""
+
+        self._insert(self._campaigns, campaign_id, declaration, "campaign")
+        return declaration
+
+    def campaign_definitions(self) -> tuple[object, ...]:
+        """Return campaign declarations in stable identifier order."""
+
+        return tuple(self._campaigns[key] for key in sorted(self._campaigns))
 
     def register_approver(
         self,
@@ -1141,6 +1156,7 @@ class DeclarationRegistry:
         declarations.update(
             ("hook", _manifest_hook_static_key(key)) for key in self._hooks
         )
+        declarations.update(("campaign", key) for key in self._campaigns)
         declarations.update(("service", key[0]) for key in self._services)
         declarations.update(("command", key) for key in self._commands)
         declarations.update(("shortcut", key) for key in self._shortcuts)
@@ -1208,6 +1224,7 @@ class DeclarationRegistry:
                 self._verdict_renderers[key]
                 for key in sorted(self._verdict_renderers, key=repr)
             ),
+            campaigns=self.campaign_definitions(),
         )
 
 
@@ -1248,6 +1265,7 @@ class DeclarationRegistry:
             + len(self._verdict_renderers)
             + len(self._shortcuts)
             + len(self._hooks)
+            + len(self._campaigns)
             + len(self._approvers)
             + len(self._services)
             + len(self._entry_kinds)
