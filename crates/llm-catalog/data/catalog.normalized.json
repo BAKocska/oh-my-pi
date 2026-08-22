@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "revision": "catalog-88c3d604ce623012f5928db874e81b486f4d0ad7b51e7461042ebaba515c15a8",
+  "revision": "catalog-bf06418b1d8203562ea888b519697ca84f33c287731241f1327ba585f388d945",
   "census": {
     "raw_models": 4302,
     "logical_models": 4225,
-    "providers": 107,
+    "providers": 111,
     "raw_provider_keys": 80,
-    "urls": 118,
+    "urls": 119,
     "transports": 16,
     "active_transports": 13
   },
@@ -1314,6 +1314,30 @@
       "mapping": "concrete"
     },
     {
+      "id": "kimi-search",
+      "name": "Kimi Search",
+      "auth": [
+        "auth-d832426e9949423d42ccd4d1bb548cb6cc3c2a021d1fae0afb3bad75adc2bc00"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": true,
+        "refresh": true,
+        "principal_quota": true
+      },
+      "routes": [
+        "kimi-search/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Kimi hosted search is a standalone search route"
+        }
+      }
+    },
+    {
       "id": "litellm",
       "name": "Litellm",
       "auth": [
@@ -1998,6 +2022,30 @@
       }
     },
     {
+      "id": "parallel-extract",
+      "name": "Parallel Extract",
+      "auth": [
+        "auth-ca2483fc9797e37107e4c332673e1740e2ffd0bca0dd834337cb7774107f1b9d"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "parallel-extract/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Parallel extract is a standalone web-resource operation"
+        }
+      }
+    },
+    {
       "id": "perplexity",
       "name": "Perplexity",
       "auth": [
@@ -2272,7 +2320,7 @@
       "id": "searxng",
       "name": "Searxng",
       "auth": [
-        "auth-488d882493579add6393c9d1e1bcafcd24f472306b3f729d93622c9b27f9216c"
+        "auth-4f15fbd03c5a7b5ac1a02528be20236dadbe852910f1dfef8d7d9c23a39008ac"
       ],
       "management": {
         "operations": 8192,
@@ -2458,6 +2506,30 @@
         }
       },
       "mapping": "concrete"
+    },
+    {
+      "id": "synthetic-search",
+      "name": "Synthetic Search",
+      "auth": [
+        "auth-ef2bc8b31271b69cc2e9cd510c5d1d3e58347e2a936635dd118a6d8ce18988f5"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "synthetic-search/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Synthetic hosted search is a standalone search route"
+        }
+      }
     },
     {
       "id": "tavily",
@@ -2937,6 +3009,30 @@
         "alias": {
           "target": "zai",
           "reason": "Pi keeps a sign-in-only id whose minted key is stored under zai"
+        }
+      }
+    },
+    {
+      "id": "zai-search",
+      "name": "Zai Search",
+      "auth": [
+        "auth-22289198a1e4c925fa454f482b339c828fc13973b1d386d421c170ab89150ae9"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "zai-search/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Z.AI hosted search is a standalone search route"
         }
       }
     },
@@ -3778,24 +3874,26 @@
       "signing": null
     },
     {
-      "id": "auth-488d882493579add6393c9d1e1bcafcd24f472306b3f729d93622c9b27f9216c",
-      "kind": "bearer",
+      "id": "auth-4f15fbd03c5a7b5ac1a02528be20236dadbe852910f1dfef8d7d9c23a39008ac",
+      "kind": "basic",
       "header_name": "authorization",
       "query_parameter": null,
-      "prefix": "Bearer ",
+      "prefix": "Basic ",
       "sealed_body": null,
       "scopes": [],
       "audience": null,
       "account_scope": "provider",
       "credential_sources": [
         {
-          "environment": {
-            "ordered_names": [
-              "OMP_SEARXNG_API_KEY"
+          "basic_environment": {
+            "username_names": [
+              "OMP_SEARXNG_USERNAME"
+            ],
+            "password_names": [
+              "OMP_SEARXNG_PASSWORD"
             ]
           }
-        },
-        "stored"
+        }
       ],
       "oauth": null,
       "signing": null
@@ -8423,6 +8521,36 @@
       "priority": null
     },
     {
+      "id": "kimi-search/primary",
+      "provider": "kimi-search",
+      "codec_profile": "standard",
+      "codec": "search-kimi",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://api.kimi.com/coding/v1",
+        "region": null
+      },
+      "auth": "auth-d832426e9949423d42ccd4d1bb548cb6cc3c2a021d1fae0afb3bad75adc2bc00",
+      "headers": "headers-sha256-d4fcbec5c76e9aa646669305f95a6d8124eb60b5961f71ba70246254466f9f0d",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://api.kimi.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
       "id": "litellm/primary",
       "provider": "litellm",
       "codec_profile": "standard",
@@ -9135,6 +9263,36 @@
       },
       "trust_domain": {
         "origin": "https://oai.endpoints.kepler.ai.cloud.ovh.net",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "parallel-extract/primary",
+      "provider": "parallel-extract",
+      "codec_profile": "standard",
+      "codec": "parallel-extract",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://api.parallel.ai",
+        "region": null
+      },
+      "auth": "auth-ca2483fc9797e37107e4c332673e1740e2ffd0bca0dd834337cb7774107f1b9d",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 40960,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://api.parallel.ai",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -12932,7 +13090,7 @@
         "base_url": "http://127.0.0.1:8080",
         "region": null
       },
-      "auth": "auth-488d882493579add6393c9d1e1bcafcd24f472306b3f729d93622c9b27f9216c",
+      "auth": "auth-4f15fbd03c5a7b5ac1a02528be20236dadbe852910f1dfef8d7d9c23a39008ac",
       "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
       "discovery": null,
       "capability_limits": {
@@ -13095,6 +13253,36 @@
       },
       "trust_domain": {
         "origin": "https://api.stepfun.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "synthetic-search/primary",
+      "provider": "synthetic-search",
+      "codec_profile": "standard",
+      "codec": "search-synthetic",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://api.synthetic.new/openai/v1",
+        "region": null
+      },
+      "auth": "auth-ef2bc8b31271b69cc2e9cd510c5d1d3e58347e2a936635dd118a6d8ce18988f5",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://api.synthetic.new",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -13597,6 +13785,36 @@
       "discovery": null,
       "capability_limits": {
         "operations": 8193,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://api.z.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "zai-search/primary",
+      "provider": "zai-search",
+      "codec_profile": "standard",
+      "codec": "search-zai",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "region": null
+      },
+      "auth": "auth-22289198a1e4c925fa454f482b339c828fc13973b1d386d421c170ab89150ae9",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
         "maximum_context_tokens": null,
         "maximum_output_tokens": null,
         "disable_server_state": false,

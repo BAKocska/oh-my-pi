@@ -53,11 +53,11 @@ pub const ORACLE_RAW_MODELS: usize = 4_302;
 /// Verified normalized logical model count of the checked-in oracle.
 pub const ORACLE_LOGICAL_MODELS: usize = 4_225;
 /// Verified curated provider count.
-pub const ORACLE_PROVIDERS: usize = 107;
+pub const ORACLE_PROVIDERS: usize = 111;
 /// Verified number of provider keys present in raw model records.
 pub const ORACLE_RAW_PROVIDER_KEYS: usize = 80;
 /// Verified number of distinct route URLs.
-pub const ORACLE_URLS: usize = 118;
+pub const ORACLE_URLS: usize = 119;
 /// Full transport vocabulary size in the oracle.
 pub const ORACLE_TRANSPORTS: usize = 16;
 /// Transport variants active in the checked-in oracle.
@@ -372,6 +372,15 @@ pub enum SourceAuth {
 		#[serde(default)]
 		env: Vec<Str>,
 	},
+	/// RFC 7617 basic authentication from independently named secrets.
+	Basic {
+		/// Username environment lookup order.
+		#[serde(default)]
+		username_env: Vec<Str>,
+		/// Password environment lookup order.
+		#[serde(default)]
+		password_env: Vec<Str>,
+	},
 	/// Optional bearer token.
 	OptionalBearer {
 		/// Environment lookup order.
@@ -655,6 +664,8 @@ pub enum SourceFacet {
 	Realtime,
 	/// Standalone web search.
 	WebSearch,
+	/// Bounded web-resource extraction.
+	WebExtract,
 	/// Token counting and conversion.
 	Tokenization,
 }
@@ -2861,6 +2872,7 @@ fn facet_operations(facets: &[SourceFacet]) -> OperationBits {
 			SourceFacet::AudioTranscription => operations.insert_kind(OperationKind::Transcribe),
 			SourceFacet::Realtime => operations.insert_kind(OperationKind::Realtime),
 			SourceFacet::WebSearch => operations.insert_kind(OperationKind::Search),
+			SourceFacet::WebExtract => operations.insert_kind(OperationKind::Extract),
 			SourceFacet::Tokenization => {
 				operations.insert_kind(OperationKind::CountTokens);
 				operations.insert_kind(OperationKind::Tokenize);
@@ -4493,6 +4505,22 @@ fn compile_auth(
 					None,
 				)
 			},
+			SourceAuth::Basic { username_env, password_env } => {
+				credential_sources.push(CredentialSourceSpec::BasicEnvironment {
+					username_names: canonical_env_names(username_env)?,
+					password_names: canonical_env_names(password_env)?,
+				});
+				(
+					AuthSpecKind::Basic,
+					Some(sf!("authorization")),
+					None,
+					Some(sf!("Basic ")),
+					None,
+					AccountScope::Provider,
+					None,
+					None,
+				)
+			},
 			SourceAuth::DevinSession { env } => {
 				if !env.is_empty() {
 					credential_sources.push(CredentialSourceSpec::Environment {
@@ -4878,7 +4906,7 @@ mod tests {
 [providers.synthetic]
 transport = "open-ai-chat"
 base_url = "https://example.test/v1"
-facets = ["audio_speech", "audio_transcription", "realtime", "web_search"]
+facets = ["audio_speech", "audio_transcription", "realtime", "web_search", "web_extract"]
 discovery = { kind = "open-ai-models", label = "Synthetic", authoritative = true }
 pending_facets = ["image_generation"]
 "#;
@@ -4896,6 +4924,7 @@ pending_facets = ["image_generation"]
 			OperationKind::Transcribe,
 			OperationKind::Realtime,
 			OperationKind::Search,
+			OperationKind::Extract,
 		] {
 			assert!(model.capabilities.operations.contains_kind(operation), "{operation}");
 		}

@@ -936,7 +936,7 @@ fn interactive_oauth_contracts_preserve_provider_parameters_and_identity() {
 	}
 }
 
-const fn all_operations() -> [OperationKind; 15] {
+const fn all_operations() -> [OperationKind; 16] {
 	[
 		OperationKind::Chat,
 		OperationKind::CountTokens,
@@ -953,6 +953,7 @@ const fn all_operations() -> [OperationKind; 15] {
 		OperationKind::DiscoverModels,
 		OperationKind::Auth,
 		OperationKind::Native,
+		OperationKind::Extract,
 	]
 }
 
@@ -1063,7 +1064,7 @@ fn compiled_catalog_matches_the_complete_frozen_census() {
 	let compiled = compile_frozen_oracle();
 	assert_eq!(expected.schema_version, 1);
 	assert_eq!(compiled.schema_version, 1);
-	assert_eq!(expected.curated_provider_catalog.provider_count, 94);
+	assert_eq!(expected.curated_provider_catalog.provider_count, 111);
 	assert_eq!(expected.normalized_catalog.model_count, 4_225);
 	assert_eq!(expected.normalized_catalog.unique_identity_count, 4_225);
 	assert_eq!(expected.raw_catalog.provider_key_count, 80);
@@ -1071,10 +1072,10 @@ fn compiled_catalog_matches_the_complete_frozen_census() {
 	assert_eq!(expected.raw_catalog.row_count - expected.normalized_catalog.model_count, 77);
 	assert_eq!(expected.transports.variant_count, 16);
 	assert_eq!(expected.transports.active_count, 13);
-	assert_eq!(expected.urls.distinct_count, 108);
+	assert_eq!(expected.urls.distinct_count, 119);
 	assert_eq!(compiled.providers.len(), expected.curated_provider_catalog.provider_count);
 	assert_eq!(compiled.models.len(), expected.normalized_catalog.model_count);
-	assert_eq!(compiled.routes.len(), 210, "frozen distinct route-shape census");
+	assert_eq!(compiled.routes.len(), 227, "frozen distinct route-shape census");
 	assert_eq!(
 		compiled
 			.routes
@@ -1179,11 +1180,25 @@ fn compiled_catalog_matches_the_complete_frozen_census() {
 		"openai-chat",
 		"openai-codex",
 		"openai-responses",
+		"parallel-extract",
+		"search-brave",
+		"search-duckduckgo",
+		"search-ecosia",
 		"search-exa",
+		"search-firecrawl",
+		"search-google",
+		"search-jina",
 		"search-kagi",
+		"search-kimi",
+		"search-mojeek",
 		"search-parallel",
 		"search-perplexity",
+		"search-searxng",
+		"search-startpage",
+		"search-synthetic",
 		"search-tavily",
+		"search-tinyfish",
+		"search-zai",
 	]
 	.into_iter()
 	.map(str::to_owned)

@@ -123,6 +123,8 @@ pub enum OperationKind {
 	Auth,
 	/// Executes an allowlisted native-wire operation.
 	Native,
+	/// Extracts bounded content from a set of web resources.
+	Extract,
 }
 
 bitset!(/// Compact membership set for [`OperationKind`] values.

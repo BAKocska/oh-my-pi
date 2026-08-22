@@ -96,6 +96,8 @@ pub enum AuthSpecKind {
 	None,
 	/// Static API key authentication.
 	ApiKey,
+	/// RFC 7617 username and password authentication.
+	Basic,
 	/// Bearer token authentication.
 	Bearer,
 	/// OAuth authorization and refresh.
@@ -177,6 +179,14 @@ pub enum CredentialSourceSpec {
 	Environment {
 		/// Environment variable names in exact lookup order.
 		ordered_names: Box<[Str]>,
+	},
+	/// Reads an RFC 7617 username and password from independent environment
+	/// lookup orders.
+	BasicEnvironment {
+		/// Username environment variable names in exact lookup order.
+		username_names: Box<[Str]>,
+		/// Password environment variable names in exact lookup order.
+		password_names: Box<[Str]>,
 	},
 	/// Reads an encrypted credential from the account store.
 	Stored,
