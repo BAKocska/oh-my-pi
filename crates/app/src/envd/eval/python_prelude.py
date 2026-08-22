@@ -42,6 +42,13 @@ if "__omp_prelude_loaded__" not in globals():
         """Emit structured status event for TUI rendering."""
         _omp_display({"application/x-omp-status": {"op": op, **data}}, raw=True)
 
+    def __omp_consume_bridge_progress__(name: str, event):
+        """Render one correlated host update before its bridge response settles."""
+        if isinstance(event, dict) and isinstance(event.get("op"), str):
+            _omp_display({"application/x-omp-status": event}, raw=True)
+        else:
+            _emit_status("tool", name=name, update=event)
+
     def env(key: str | None = None, value: str | None = None):
         """Get/set environment variables."""
         if key is None:
@@ -460,9 +467,10 @@ if "__omp_prelude_loaded__" not in globals():
         prompt,
         *,
         agent="task",
-        label=None,
-        schema=None,
-        schema_mode=None,
+        name=None,
+        effort=None,
+        outputSchema=None,
+        schemaMode=None,
         isolated=None,
         apply=None,
         merge=None,
@@ -470,19 +478,21 @@ if "__omp_prelude_loaded__" not in globals():
     ):
         """Run a subagent and return its final output or structured data.
 
-        `schema` overrides agent and session schemas. `schema_mode` is
+        `outputSchema` overrides agent and session schemas. `schemaMode` is
         `"permissive"` or `"strict"`. `handle=True` returns the child output
         reference and metadata, with parsed data under `"data"` when available.
         """
         args = {"prompt": prompt}
         if agent is not None:
             args["agent"] = agent
-        if label is not None:
-            args["label"] = label
-        if schema is not None:
-            args["schema"] = schema
-        if schema_mode is not None:
-            args["schemaMode"] = schema_mode
+        if name is not None:
+            args["name"] = name
+        if effort is not None:
+            args["effort"] = effort
+        if outputSchema is not None:
+            args["outputSchema"] = outputSchema
+        if schemaMode is not None:
+            args["schemaMode"] = schemaMode
         if isolated is not None:
             args["isolated"] = bool(isolated)
         if apply is not None:
@@ -493,8 +503,11 @@ if "__omp_prelude_loaded__" not in globals():
             args["handle"] = True
         res = _bridge_call("__agent__", args)
         text = res.get("text") if isinstance(res, dict) else res
-        has_data = isinstance(res, dict) and "data" in res
-        parsed = res["data"] if has_data else json.loads(text) if schema is not None else text
+        has_data = isinstance(res, dict) and res.get("data") is not None
+        if outputSchema is not None and isinstance(res, dict) and res.get("schema") is not None and not has_data:
+            parsed = {"error": res["schema"], "text": text}
+        else:
+            parsed = res["data"] if has_data else json.loads(text) if outputSchema is not None else text
         if not handle:
             return parsed
         details = res.get("details") if isinstance(res, dict) else None
@@ -513,7 +526,7 @@ if "__omp_prelude_loaded__" not in globals():
             "id": details["id"],
             "agent": details.get("agent"),
         }
-        if has_data or schema is not None:
+        if has_data or outputSchema is not None:
             node["data"] = parsed
         for src_key, dst_key in (
             ("isolated", "isolated"),
@@ -527,25 +540,16 @@ if "__omp_prelude_loaded__" not in globals():
                 node[dst_key] = details[src_key]
         return node
 
-    # Eval fan-out must stay bounded even if an older/unconfigured host reports
-    # task.maxConcurrency as unlimited (0), malformed, or implausibly large.
-    _MAX_PARALLEL_WORKERS = 32
-
     def _concurrency_limit():
-        """Return the finite worker-pool ceiling advertised by the host.
-
-        The host's task concurrency setting is honored up to the defensive
-        process-local ceiling. Missing, zero, negative, malformed, and excessive
-        values all use that ceiling rather than creating one thread per item.
-        """
+        """Return the live worker-pool ceiling, or ``None`` for unlimited."""
         try:
             snap = _bridge_call("__concurrency__", {}) or {}
             n = int(snap.get("limit") or 0)
         except Exception:
-            return _MAX_PARALLEL_WORKERS
-        if n <= 0:
-            return _MAX_PARALLEL_WORKERS
-        return min(n, _MAX_PARALLEL_WORKERS)
+            return 32
+        if n < 0:
+            return 32
+        return None if n == 0 else n
 
     class _AwaitableList(list):
         """Completed list result accepted by both sync and ``await`` syntax."""
@@ -555,61 +559,78 @@ if "__omp_prelude_loaded__" not in globals():
             return self
 
 
-    def _pool_map(items, fn):
-        """Run ``fn`` over ``items`` through a bounded thread pool.
+    def _pool_map(items, fn, *, allSettled=False):
+        """Run ``fn`` over ``items`` through a bounded, ordered worker pool.
 
-        Preserves input order, barriers until every task settles, and raises the
-        lowest-index exception if any task failed. Each task runs inside a copy
-        of the submitting thread's context so the ``_CURRENT_RID`` ContextVar
-        propagates and bridge calls (agent(), tool.*, etc.) keep working.
+        The default cancels queued siblings on the first failure. ``allSettled``
+        waits for every item and returns ordered fulfilled/rejected records.
+        Each worker inherits the submitting bridge ContextVar.
         """
         import concurrent.futures, contextvars
 
         items = list(items)
         if not items:
             return _AwaitableList()
-        workers = min(_concurrency_limit(), len(items))
+        limit = _concurrency_limit()
+        workers = len(items) if limit is None else min(limit, len(items))
         results = _AwaitableList(None for _ in items)
-        errors = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {}
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        futures = {}
+        failed = False
+        try:
             for i, item in enumerate(items):
                 ctx = contextvars.copy_context()
                 futures[pool.submit(ctx.run, fn, item)] = i
-            for fut in concurrent.futures.as_completed(futures):
-                i = futures[fut]
-                try:
-                    results[i] = fut.result()
-                except BaseException as exc:  # noqa: BLE001 - propagate to caller
-                    errors[i] = exc
-        if errors:
-            raise errors[min(errors)]
-        return results
+            if allSettled:
+                for fut in concurrent.futures.as_completed(futures):
+                    i = futures[fut]
+                    try:
+                        results[i] = {"status": "fulfilled", "value": fut.result()}
+                    except BaseException as exc:  # noqa: BLE001 - settlement captures reason
+                        results[i] = {"status": "rejected", "reason": exc}
+                return results
+            pending = set(futures)
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_EXCEPTION
+                )
+                for fut in done:
+                    i = futures[fut]
+                    try:
+                        results[i] = fut.result()
+                    except BaseException:
+                        failed = True
+                        for sibling in pending:
+                            sibling.cancel()
+                        raise
+            return results
+        finally:
+            pool.shutdown(wait=not failed, cancel_futures=failed)
 
-    def parallel(thunks):
+    def parallel(thunks, *, allSettled=False):
         """Run zero-arg callables through a bounded pool, preserving input order.
 
         Barriers until all finish; re-raises the lowest-index exception if any
-        thunk raised. Pool width honors the host limit within the defensive cap.
+        thunk raised. Pool width honors the live host limit; zero is unlimited.
         """
         thunks = list(thunks)
         for t in thunks:
             if not callable(t):
                 raise TypeError("parallel() expects an iterable of zero-arg callables")
-        return _pool_map(thunks, lambda t: t())
+        return _pool_map(thunks, lambda t: t(), allSettled=allSettled)
 
-    def pipeline(items, *stages):
+    def pipeline(items, *stages, allSettled=False):
         """Map items left-to-right through one-arg stage callables.
 
         Every item clears stage N before any item enters stage N+1 (barrier per
         stage). Stage 1 receives the original item; later stages receive the
-        previous stage's result. Pool width honors the defensive host limit.
+        previous stage's result. Pool width honors the live host limit; zero is unlimited.
         """
         current = _AwaitableList(items)
         for stage in stages:
             if not callable(stage):
                 raise TypeError("pipeline() stages must be callables")
-            current = _pool_map(current, stage)
+            current = _pool_map(current, stage, allSettled=allSettled)
         return current
 
     def log(message):

@@ -15,7 +15,7 @@ use omp_agent::{
 	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnClient, TurnId,
 	TurnInput, TurnOptions, TurnSession, WorkspaceInput,
 };
-use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
+use omp_app::envd::{EnvServer, worker::ExtHostConfig};
 use omp_core::{Str, sf};
 use omp_e2e::support::{
 	AllowAdmission, Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
@@ -411,7 +411,9 @@ async fn assert_artifact(env: &RealEnv, item: &thread::Item, job: &JobRef, expec
 	let artifact: SettlementArtifact =
 		serde_json::from_slice(&raw).expect("structured process-settlement artifact");
 	assert_eq!(artifact.job_id, job.id.as_str());
-	let JobOwner::NamedProcess { name, generation } = &job.owner;
+	let JobOwner::NamedProcess { name, generation } = &job.owner else {
+		panic!("expected NamedProcess owner");
+	};
 	assert_eq!(artifact.owner.name, name.as_str());
 	assert_eq!(artifact.owner.generation, *generation);
 	assert_eq!(artifact.expected_artifact.description, job.artifact.description.as_str());
@@ -461,6 +463,10 @@ async fn wait_terminal(client: &EnvClient, name: &str, generation: u64) {
 			name: name.to_owned(),
 			after_sequence: 0,
 			generation,
+			max_bytes: 16 * 1024 * 1024,
+			terminal_text: false,
+			terminal_columns: 0,
+			terminal_rows: 0,
 			props: None,
 		})
 		.await
@@ -674,6 +680,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 			name:       Str::from(early_name),
 			generation: started.generation,
 		},
+		metadata: std::sync::Arc::default(),
 		artifact: ExpectedArtifact {
 			description: sf!("expected PNG render"),
 			media_type:  Some(sf!("image/png")),

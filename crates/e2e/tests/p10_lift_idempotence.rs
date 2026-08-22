@@ -54,12 +54,12 @@ async fn p10_edit_lift_is_idempotent_across_journal_projections() -> Result<()> 
 
 	let mut registry = Registry::new();
 	registry.register(
-		edit::replace_tool(documents.clone(), FormatPolicy::Configured),
+		edit::replace_tool(documents.clone(), FormatPolicy::BestEffort),
 		Presentation::Slot,
 		claims(),
 	)?;
 	registry.register(
-		edit::tool(documents, FormatPolicy::Configured),
+		edit::tool(documents, FormatPolicy::BestEffort),
 		Presentation::Slot,
 		claims(),
 	)?;

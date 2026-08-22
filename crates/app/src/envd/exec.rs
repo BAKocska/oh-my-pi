@@ -1,10 +1,12 @@
 //! Environment-daemon process and persistent shell-session host.
 
 use std::{
-	collections::{HashMap, HashSet},
-	io::{Read, Write as _},
+	collections::{BTreeSet, HashMap, HashSet},
+	fs,
+	io::{self, Read, Write as _},
 	os::fd::{AsFd as _, AsRawFd as _},
-	path::PathBuf,
+	path::{Path, PathBuf},
+	process::{Command, Stdio},
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,10 +19,12 @@ use futures::future::try_join_all;
 use omp_core::{Hash32, Str, sf};
 use omp_proto::{
 	env::v1::{
-		AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecOutcome, ExecRequest, ExecStarted,
-		ExecStatusMsg, ExitEvent, OpenSessionRequest, OpenSessionResponse, OutputAttached,
-		OutputChannel, OutputFrame, ProcessCommandAccepted, ProcessInfo, ProcessList, ProcessOutput,
-		ProcessStarted, ProcessState, PtySpec, ReadyProbe, StartProcess, ready_probe,
+		AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecBackendCapabilities,
+		ExecCapabilitiesRequest, ExecControlKind, ExecControlRequest, ExecControlResult,
+		ExecFinalCwd, ExecFinalCwdRequest, ExecOutcome, ExecRequest, ExecStarted, ExecStatusMsg,
+		ExitEvent, OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputChannel,
+		OutputFrame, ProcessCommandAccepted, ProcessInfo, ProcessList, ProcessOutput, ProcessSpec,
+		ProcessStarted, ProcessState, PtySpec, ReadyProbe, RestartPolicy, StartProcess, ready_probe,
 	},
 	toolhost::v1::{HostFrame, Ping, WorkerFrame, host_frame, worker_frame},
 };
@@ -32,9 +36,21 @@ use omp_shell_engine::{
 use parking_lot::Mutex;
 use prost::Message as _;
 use regex::bytes::Regex;
+use url::Url;
+
+use super::{
+	process_identity::ProcessIdentity,
+	process_log::ProcessLog,
+	process_store::{
+		DaemonLease, ProcessPhase, ProcessRecord, ProcessStore, ProcessStoreSnapshot, RestartRecord,
+	},
+};
 
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+const RESTART_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
+const RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
+const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Content identity of the process environment inherited by new shell sessions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -56,6 +72,24 @@ pub enum ExecError {
 	/// The requested execution does not exist or has already finished.
 	#[error("execution was not found")]
 	RunNotFound,
+	/// Final working-directory metadata is not retained for this execution.
+	#[error("execution final working directory was not found")]
+	FinalCwdNotFound,
+	/// Final working-directory metadata did not match the caller's fence.
+	#[error("execution final working-directory revision is stale")]
+	StaleFinalCwdRevision,
+	/// An exec-session request used an incompatible schema revision.
+	#[error("exec-session wire revision does not match the Environment schema")]
+	WireRevision,
+	/// A requested shell profile is not advertised by this backend.
+	#[error("shell profile {profile:?} is not supported by this backend")]
+	UnsupportedShellProfile {
+		/// Requested profile name.
+		profile: Str,
+	},
+	/// The control operation was outside the declared vocabulary.
+	#[error("exec control kind is invalid")]
+	InvalidControl,
 	/// The requested named process does not exist.
 	#[error("named process {0:?} was not found")]
 	ProcessNotFound(Str),
@@ -92,6 +126,21 @@ pub enum ExecError {
 	/// The target actor has stopped.
 	#[error("exec session has closed")]
 	SessionClosed,
+	/// A named process used an invalid durable name.
+	#[error("process name must be 1-48 ASCII letters, digits, dot, underscore, or hyphen")]
+	InvalidProcessName,
+	/// Detached processes cannot retain a pseudo-terminal.
+	#[error("detached processes cannot use a PTY")]
+	DetachedPty,
+	/// Durable process metadata could not be committed.
+	#[error(transparent)]
+	ProcessStore(#[from] super::process_store::StoreError),
+	/// A durable operating-system identity could not be captured.
+	#[error(transparent)]
+	ProcessIdentity(#[from] super::process_identity::IdentityError),
+	/// Another daemon already owns the durable process namespace.
+	#[error(transparent)]
+	ProcessLease(#[from] super::process_store::LeaseError),
 }
 
 /// One ordered event emitted by an execution.
@@ -179,25 +228,63 @@ pub struct ExecHost {
 }
 
 struct HostInner {
-	next_id:     AtomicU64,
-	sessions:    Mutex<HashMap<Bytes, SessionHandle>>,
-	runs:        Mutex<HashMap<Bytes, Weak<RunControl>>>,
-	processes:   Mutex<HashMap<Str, Arc<NamedProcess>>>,
-	starting:    Mutex<HashSet<Str>>,
-	environment: Mutex<WorkspaceEnvironment>,
+	next_id:       AtomicU64,
+	next_revision: AtomicU64,
+	sessions:      Mutex<HashMap<Bytes, SessionHandle>>,
+	runs:          Mutex<HashMap<Bytes, Weak<RunControl>>>,
+	final_cwds:    Mutex<HashMap<Bytes, ExecFinalCwd>>,
+	processes:     Mutex<HashMap<Str, Arc<NamedProcess>>>,
+	starting:      Mutex<HashSet<Str>>,
+	environment:   Mutex<WorkspaceEnvironment>,
+	github_cache:  Mutex<Option<Arc<omp_storage::github_cache::GithubCache>>>,
+	persistence:   Mutex<Option<ProcessPersistence>>,
+	next_order:    AtomicU64,
+}
+
+struct ProcessPersistence {
+	store:    ProcessStore,
+	snapshot: ProcessStoreSnapshot,
+	_lease:   DaemonLease,
 }
 
 #[derive(Clone)]
 struct SessionHandle {
-	tx:  flume::Sender<SessionCommand>,
-	pty: Option<PtySpec>,
+	tx:             flume::Sender<SessionCommand>,
+	pty:            Option<PtySpec>,
+	command_prefix: Str,
+	user_shell:     Option<UserShell>,
+}
+#[derive(Clone)]
+struct UserShell {
+	executable: Str,
+	args:       Arc<[Str]>,
+	login:      bool,
 }
 
 struct NamedProcess {
+	host:       Weak<HostInner>,
 	name:       Str,
 	generation: u64,
 	control:    Arc<RunControl>,
 	stream:     Mutex<ProcessStreamState>,
+	log:        Mutex<ProcessLog>,
+	spec:       ProcessSpec,
+	ready:      Arc<[ReadyProbe]>,
+	identity:   ProcessIdentity,
+	started_at: Instant,
+	detached:   bool,
+	persist:    bool,
+	stopping:   AtomicBool,
+	restarts:   Mutex<RestartSupervisor>,
+}
+
+/// Result of applying graceful shutdown to managed process trees.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShutdownSummary {
+	/// Processes sent through graceful cancellation.
+	pub stopped: u32,
+	/// Verified detached persistent processes spared.
+	pub spared:  u32,
 }
 
 struct ProcessStreamState {
@@ -209,6 +296,81 @@ struct ProcessStreamState {
 struct ProcessReservation {
 	host: Weak<HostInner>,
 	name: Str,
+}
+
+/// Generation-fenced restart accounting for one named process.
+#[derive(Debug)]
+pub struct RestartSupervisor {
+	policy:               RestartPolicy,
+	configured_delay:     Duration,
+	max_restarts:         Option<u32>,
+	restart_count:        u32,
+	consecutive_failures: u32,
+	history:              Vec<RestartRecord>,
+}
+
+impl RestartSupervisor {
+	fn from_spec(spec: Option<&omp_proto::env::v1::RestartSpec>) -> Self {
+		let policy = spec
+			.and_then(|spec| RestartPolicy::try_from(spec.policy).ok())
+			.unwrap_or(RestartPolicy::Never);
+		Self {
+			policy,
+			configured_delay: spec.map_or(RESTART_BASE_DELAY, |spec| {
+				Duration::from_millis(spec.delay_ms).max(RESTART_BASE_DELAY)
+			}),
+			max_restarts: spec.and_then(|spec| spec.max_restarts),
+			restart_count: 0,
+			consecutive_failures: 0,
+			history: Vec::new(),
+		}
+	}
+
+	fn recovered(record: &ProcessRecord, spec: Option<&omp_proto::env::v1::RestartSpec>) -> Self {
+		let mut supervisor = Self::from_spec(spec);
+		supervisor.restart_count = record.restart_count;
+		supervisor.consecutive_failures = record.consecutive_failures;
+		supervisor.history.clone_from(&record.restart_history);
+		supervisor
+	}
+
+	fn decide(
+		&mut self,
+		failed: bool,
+		uptime: Duration,
+		exit_code: Option<i32>,
+	) -> Option<Duration> {
+		let enabled = matches!(self.policy, RestartPolicy::Always)
+			|| matches!(self.policy, RestartPolicy::OnFailure) && failed;
+		if !enabled
+			|| self
+				.max_restarts
+				.is_some_and(|max| self.restart_count >= max)
+		{
+			return None;
+		}
+		if uptime >= RESTART_HEALTHY_UPTIME {
+			self.consecutive_failures = 0;
+		} else {
+			self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+		}
+		self.restart_count = self.restart_count.saturating_add(1);
+		let exponent = self.consecutive_failures.min(5);
+		let delay = self
+			.configured_delay
+			.saturating_mul(1_u32 << exponent)
+			.min(RESTART_MAX_DELAY);
+		self.history.push(RestartRecord {
+			at_ms: unix_time_ms(),
+			exit_code,
+			delay_ms: delay.as_millis().try_into().unwrap_or(u64::MAX),
+			failure_count: self.consecutive_failures,
+		});
+		if self.history.len() > 32 {
+			self.history.remove(0);
+		}
+		Some(delay)
+	}
 }
 
 struct RunControl {
@@ -237,13 +399,15 @@ struct SpawnBook {
 }
 
 struct SessionCommand {
-	exec:      Bytes,
-	source:    Str,
-	timeout:   Option<Duration>,
-	pty:       Option<PtySpec>,
-	control:   Arc<RunControl>,
-	cancel_rx: flume::Receiver<CancelRequest>,
-	events:    flume::Sender<ExecEvent>,
+	host:           Weak<HostInner>,
+	exec:           Bytes,
+	source:         Str,
+	timeout:        Option<Duration>,
+	pty:            Option<PtySpec>,
+	control:        Arc<RunControl>,
+	cancel_rx:      flume::Receiver<CancelRequest>,
+	events:         flume::Sender<ExecEvent>,
+	github_targets: Vec<super::admission::GithubMutationTarget>,
 }
 
 impl Default for ExecHost {
@@ -257,14 +421,50 @@ impl ExecHost {
 	pub fn new() -> Self {
 		Self {
 			inner: Arc::new(HostInner {
-				next_id:     AtomicU64::new(1),
-				sessions:    Mutex::new(HashMap::new()),
-				runs:        Mutex::new(HashMap::new()),
-				processes:   Mutex::new(HashMap::new()),
-				starting:    Mutex::new(HashSet::new()),
-				environment: Mutex::new(read_workspace_environment()),
+				next_id:       AtomicU64::new(1),
+				next_revision: AtomicU64::new(1),
+				sessions:      Mutex::new(HashMap::new()),
+				runs:          Mutex::new(HashMap::new()),
+				final_cwds:    Mutex::new(HashMap::new()),
+				processes:     Mutex::new(HashMap::new()),
+				starting:      Mutex::new(HashSet::new()),
+				environment:   Mutex::new(read_workspace_environment()),
+				github_cache:  Mutex::new(None),
+				persistence:   Mutex::new(None),
+				next_order:    AtomicU64::new(1),
 			}),
 		}
+	}
+
+	/// Enables durable named-process metadata and recovers verified detached
+	/// generations before accepting new launches.
+	pub fn with_process_store(self, store: ProcessStore) -> Result<Self, ExecError> {
+		let daemon = ProcessIdentity::current()?;
+		let mut snapshot = store
+			.load()?
+			.unwrap_or_else(|| ProcessStoreSnapshot::new(daemon.clone()));
+		snapshot.daemon = daemon;
+		let records = snapshot.processes.clone();
+		fs::create_dir_all(store.process_root())?;
+		let next_order = records
+			.iter()
+			.flat_map(|record| [record.started_order, record.recent_order])
+			.max()
+			.unwrap_or(0)
+			.saturating_add(1);
+		self.inner.next_order.store(next_order, Ordering::Relaxed);
+		let lease = DaemonLease::acquire(&store.process_root().join("envd.lease"))?;
+		store.save(&snapshot)?;
+		*self.inner.persistence.lock() = Some(ProcessPersistence { store, snapshot, _lease: lease });
+		self.recover_records(records)?;
+		Ok(self)
+	}
+
+	/// Injects the production GitHub resource cache owned by the Environment.
+	#[must_use]
+	pub fn with_github_cache(self, cache: Arc<omp_storage::github_cache::GithubCache>) -> Self {
+		*self.inner.github_cache.lock() = Some(cache);
+		self
 	}
 
 	/// Opens a persistent shell carrying its own cwd and environment state.
@@ -272,6 +472,24 @@ impl ExecHost {
 		&self,
 		request: OpenSessionRequest,
 	) -> Result<OpenSessionResponse, ExecError> {
+		let profile = request.shell_profile.as_ref();
+		if let Some(profile) = profile {
+			let requested = profile.profile.trim();
+			let supported = matches!(requested, "" | "brush" | "user" | "bash" | "zsh" | "fish");
+			let external = !matches!(requested, "" | "brush");
+			if profile.wire_revision != omp_proto::SCHEMA_REV
+				|| !supported
+				|| external && profile.executable.trim().is_empty()
+			{
+				return Err(ExecError::UnsupportedShellProfile {
+					profile: Str::from(if requested.is_empty() {
+						"brush"
+					} else {
+						requested
+					}),
+				});
+			}
+		}
 		let cwd = cwd_from_uri(&request.cwd_uri)?.map_or_else(std::env::current_dir, Ok)?;
 		let variables = Arc::clone(&self.inner.environment.lock().variables);
 		let mut builder = Shell::builder()
@@ -295,8 +513,24 @@ impl ExecHost {
 				.set_env_global("TERM", terminal)
 				.map_err(shell_error)?;
 		}
+		if let Some(profile) = profile {
+			apply_env_delta(&mut shell, profile.env_delta.as_ref()).map_err(shell_error)?;
+		}
 		apply_env_delta(&mut shell, request.env_delta.as_ref()).map_err(shell_error)?;
 
+		let command_prefix =
+			profile.map_or_else(Str::default, |profile| Str::from(profile.command_prefix.trim()));
+		let user_shell = profile.and_then(|profile| {
+			(!matches!(profile.profile.trim(), "" | "brush")).then(|| UserShell {
+				executable: Str::from(profile.executable.trim()),
+				args:       profile
+					.args
+					.iter()
+					.map(|arg| Str::from(arg.as_str()))
+					.collect(),
+				login:      profile.login,
+			})
+		});
 		let session = self.new_id();
 		let lease = self.new_id();
 		let (tx, rx) = flume::unbounded();
@@ -312,12 +546,18 @@ impl ExecHost {
 			.inner
 			.sessions
 			.lock()
-			.insert(session.clone(), SessionHandle { tx, pty: request.pty.clone() });
+			.insert(session.clone(), SessionHandle {
+				tx,
+				pty: request.pty.clone(),
+				command_prefix,
+				user_shell,
+			});
 
 		Ok(OpenSessionResponse {
 			session,
 			lease,
 			cwd_uri: request.cwd_uri,
+			capabilities: Some(Self::backend_capabilities()),
 			props: Default::default(),
 		})
 	}
@@ -350,6 +590,80 @@ impl ExecHost {
 		})
 	}
 
+	/// Returns whether a persistent session is owned by this Environment.
+	#[must_use]
+	pub fn contains_session(&self, session: &[u8]) -> bool {
+		self.inner.sessions.lock().contains_key(session)
+	}
+
+	/// Returns revisioned capabilities for a live session.
+	pub fn capabilities(
+		&self,
+		request: &ExecCapabilitiesRequest,
+	) -> Result<ExecBackendCapabilities, ExecError> {
+		if request.wire_revision != omp_proto::SCHEMA_REV {
+			return Err(ExecError::WireRevision);
+		}
+		if !self.contains_session(&request.session) {
+			return Err(ExecError::SessionNotFound);
+		}
+		Ok(Self::backend_capabilities())
+	}
+
+	/// Applies one typed control operation to a live execution.
+	pub fn control(&self, request: &ExecControlRequest) -> Result<ExecControlResult, ExecError> {
+		if request.wire_revision != omp_proto::SCHEMA_REV {
+			return Err(ExecError::WireRevision);
+		}
+		let control = self.run(&request.exec)?;
+		if control.finished.load(Ordering::Acquire) {
+			return Ok(ExecControlResult { exec: request.exec.clone(), accepted: false });
+		}
+		match ExecControlKind::try_from(request.control).map_err(|_| ExecError::InvalidControl)? {
+			ExecControlKind::Interrupt => control.spawns.signal(ProcessSignal::Interrupt)?,
+			ExecControlKind::Terminate => {
+				control.cancel(Duration::from_millis(request.grace_ms).min(Duration::from_secs(30)));
+			},
+			ExecControlKind::Kill => control.spawns.signal(ProcessSignal::Kill)?,
+			ExecControlKind::Unspecified => return Err(ExecError::InvalidControl),
+		}
+		Ok(ExecControlResult { exec: request.exec.clone(), accepted: true })
+	}
+
+	/// Reads final working-directory metadata through an exact revision fence.
+	pub fn final_cwd(&self, request: &ExecFinalCwdRequest) -> Result<ExecFinalCwd, ExecError> {
+		if request.wire_revision != omp_proto::SCHEMA_REV {
+			return Err(ExecError::WireRevision);
+		}
+		let final_cwd = self
+			.inner
+			.final_cwds
+			.lock()
+			.get(&request.exec)
+			.cloned()
+			.ok_or(ExecError::FinalCwdNotFound)?;
+		if request.expected_revision != 0 && request.expected_revision != final_cwd.revision {
+			return Err(ExecError::StaleFinalCwdRevision);
+		}
+		Ok(final_cwd)
+	}
+
+	fn backend_capabilities() -> ExecBackendCapabilities {
+		ExecBackendCapabilities {
+			persistent_sessions: true,
+			pty:                 true,
+			signals:             true,
+			resize:              true,
+			final_cwd:           true,
+			materialization:     true,
+			shell_profiles:      ["brush", "user", "bash", "zsh", "fish"]
+				.into_iter()
+				.map(String::from)
+				.collect(),
+			wire_revision:       omp_proto::SCHEMA_REV,
+		}
+	}
+
 	/// Starts a script in a session. A session serializes its scripts.
 	pub async fn exec(
 		&self,
@@ -366,6 +680,24 @@ impl ExecHost {
 		let source = request
 			.source
 			.ok_or_else(|| ExecError::Shell(sf!("missing script")))?;
+		let github_targets = super::admission::bash_ir(
+			"shell",
+			&serde_json::json!({ "command": source.text.as_str() }),
+			Path::new("/"),
+			Path::new("/"),
+		)
+		.map_or_else(Vec::new, |bash| super::admission::github_mutation_targets(&bash));
+		let persistent_cd = simple_cd(&source.text);
+		let source = if session.command_prefix.is_empty() {
+			Str::from(source.text)
+		} else {
+			sf!("{} {}", session.command_prefix, source.text)
+		};
+		let source = session
+			.user_shell
+			.as_ref()
+			.filter(|_| !persistent_cd)
+			.map_or(source.clone(), |shell| user_shell_command(shell, &source));
 		let exec = self.new_id();
 		let (events_tx, events) = flume::unbounded();
 		let (cancel_tx, cancel_rx) = flume::bounded(1);
@@ -377,13 +709,15 @@ impl ExecHost {
 			retained: Mutex::new(None),
 		});
 		let command = SessionCommand {
+			host: Arc::downgrade(&self.inner),
 			exec: exec.clone(),
-			source: Str::from(source.text),
+			source,
 			timeout,
 			pty: session.pty,
 			control: control.clone(),
 			cancel_rx,
 			events: events_tx,
+			github_targets,
 		};
 		session
 			.tx
@@ -450,27 +784,53 @@ impl ExecHost {
 		let spec = request
 			.spec
 			.ok_or_else(|| ExecError::Shell(sf!("missing process spec")))?;
+		if spec.detached && spec.pty.is_some() {
+			return Err(ExecError::DetachedPty);
+		}
+		if spec.detached {
+			self.launch_detached(name, spec, ready, 1, None).await
+		} else {
+			self.launch_attached(name, spec, ready, 1, None).await
+		}
+	}
+
+	async fn launch_attached(
+		&self,
+		name: Str,
+		spec: ProcessSpec,
+		ready: Vec<ReadyProbe>,
+		generation: u64,
+		recovered: Option<&ProcessRecord>,
+	) -> Result<ProcessStarted, ExecError> {
+		let (prior_end, prior_rotations) =
+			recovered.map_or((0, 0), |record| (record.log_end_offset, record.log_rotations));
+		let log = ProcessLog::create(self.process_dir(&name), prior_end, prior_rotations)?;
 		let opened = self
 			.open_session(OpenSessionRequest {
-				cwd_uri:   spec.cwd_uri,
-				env_delta: spec.env_delta,
-				pty:       spec.pty,
-				lease:     None,
-				props:     Default::default(),
+				cwd_uri:       spec.cwd_uri.clone(),
+				env_delta:     spec.env_delta.clone(),
+				pty:           spec.pty.clone(),
+				lease:         None,
+				shell_profile: None,
+				props:         Default::default(),
 			})
 			.await?;
 		let (started, run) = self
 			.exec(
 				ExecRequest {
 					session: opened.session,
-					source:  spec.source,
+					source:  spec.source.clone(),
 					props:   Default::default(),
 				},
 				None,
 			)
 			.await?;
-		let generation = 1;
+		let supervisor = recovered.map_or_else(
+			|| RestartSupervisor::from_spec(spec.restart.as_ref()),
+			|record| RestartSupervisor::recovered(record, spec.restart.as_ref()),
+		);
 		let process = Arc::new(NamedProcess {
+			host: Arc::downgrade(&self.inner),
 			name: name.clone(),
 			generation,
 			control: run.control.clone(),
@@ -483,49 +843,425 @@ impl ExecHost {
 					} else {
 						ProcessState::Starting as i32
 					},
-					status: None,
-					props: Default::default(),
+					ready_pending: ready_condition_names(&ready),
+					props: spec.props.clone(),
+					..ProcessInfo::default()
 				},
 				history:     Vec::new(),
 				subscribers: Vec::new(),
 			}),
+			log: Mutex::new(log),
+			spec: spec.clone(),
+			ready: ready.clone().into(),
+			identity: ProcessIdentity::current()?,
+			started_at: Instant::now(),
+			detached: false,
+			persist: spec.persist,
+			stopping: AtomicBool::new(false),
+			restarts: Mutex::new(supervisor),
 		});
 		self
 			.inner
 			.processes
 			.lock()
 			.insert(name.clone(), process.clone());
+		self.persist_process(
+			&process,
+			if ready.is_empty() {
+				ProcessPhase::Running
+			} else {
+				ProcessPhase::WaitingReady
+			},
+		)?;
 		tokio::spawn(forward_named_process(process.clone(), run, started.exec));
 		if let Err(error) = try_join_all(
 			ready
-				.into_iter()
+				.iter()
+				.cloned()
 				.map(|probe| wait_ready_probe(process.clone(), probe)),
 		)
 		.await
 		{
+			process.stopping.store(true, Ordering::Release);
 			process.control.cancel(CANCEL_GRACE);
-			self.inner.processes.lock().remove(&name);
+			self.persist_process(&process, ProcessPhase::Failed)?;
 			return Err(error);
 		}
-		let terminal = {
+		if !ready.is_empty() {
 			let mut stream = process.stream.lock();
-			if stream.info.state == ProcessState::Starting as i32 {
-				stream.info.state = ProcessState::Ready as i32;
-				let info = stream.info.clone();
-				stream.broadcast(ProcessEvent::State(info));
-				false
-			} else {
-				process_state_is_terminal(stream.info.state)
+			if process_state_is_terminal(stream.info.state) {
+				return Err(ExecError::Readiness(sf!(
+					"process exited while readiness probes were running",
+				)));
 			}
-		};
-		if terminal {
-			process.control.cancel(CANCEL_GRACE);
-			self.inner.processes.lock().remove(&name);
-			return Err(ExecError::Readiness(sf!(
-				"process exited while readiness probes were running",
-			)));
+			stream.info.state = ProcessState::Ready as i32;
+			stream.info.ready_pending.clear();
+			let info = stream.info.clone();
+			stream.broadcast(ProcessEvent::State(info));
+			drop(stream);
+			self.persist_process(&process, ProcessPhase::Running)?;
 		}
-		Ok(ProcessStarted { name: process.name.to_string(), generation, props: Default::default() })
+		Ok(ProcessStarted {
+			name: process.name.to_string(),
+			generation,
+			identity: None,
+			log_offset: process.log.lock().end_offset(),
+			props: spec.props.clone(),
+		})
+	}
+
+	async fn launch_detached(
+		&self,
+		name: Str,
+		mut spec: ProcessSpec,
+		ready: Vec<ReadyProbe>,
+		generation: u64,
+		recovered: Option<&ProcessRecord>,
+	) -> Result<ProcessStarted, ExecError> {
+		spec.persist = true;
+		let (prior_end, prior_rotations) =
+			recovered.map_or((0, 0), |record| (record.log_end_offset, record.log_rotations));
+		let log = ProcessLog::create(self.process_dir(&name), prior_end, prior_rotations)?;
+		let output = log.child_output()?;
+		let stderr = output.try_clone()?;
+		let source = spec
+			.source
+			.as_ref()
+			.ok_or_else(|| ExecError::Shell(sf!("missing process script")))?
+			.text
+			.clone();
+		let cwd = cwd_from_uri(&spec.cwd_uri)?.map_or_else(std::env::current_dir, Ok)?;
+		let mut command = detached_command(&source);
+		command
+			.current_dir(cwd)
+			.stdin(Stdio::null())
+			.stdout(Stdio::from(output))
+			.stderr(Stdio::from(stderr));
+		if let Some(delta) = spec.env_delta.as_ref() {
+			command.envs(&delta.set);
+			for name in &delta.unset {
+				command.env_remove(name);
+			}
+		}
+		configure_detached_group(&mut command);
+		let mut child = command.spawn()?;
+		let pid = child.id();
+		let initial_identity = match ProcessIdentity::capture(pid) {
+			Ok(identity) => identity,
+			Err(error) => {
+				let _ = signal_process_group(pid as i32, ProcessSignal::Kill);
+				let _ = child.wait();
+				return Err(error.into());
+			},
+		};
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		let identity = match ProcessIdentity::capture(pid) {
+			Ok(identity) if identity.start_generation == initial_identity.start_generation => identity,
+			Ok(_) => {
+				let _ = signal_process_group(pid as i32, ProcessSignal::Kill);
+				let _ = child.wait();
+				return Err(ExecError::RunNotFound);
+			},
+			Err(super::process_identity::IdentityError::NotFound { .. }) => initial_identity,
+			Err(error) => {
+				let _ = signal_process_group(pid as i32, ProcessSignal::Kill);
+				let _ = child.wait();
+				return Err(error.into());
+			},
+		};
+		let (cancel_tx, cancel_rx) = flume::bounded(1);
+		let control = Arc::new(RunControl {
+			cancel_tx,
+			input: Mutex::new(None),
+			spawns: Arc::new(SpawnBook { groups: Mutex::new(vec![pid as i32]) }),
+			finished: AtomicBool::new(false),
+			retained: Mutex::new(None),
+		});
+		let mut supervisor = RestartSupervisor::from_spec(spec.restart.as_ref());
+		if let Some(record) = recovered {
+			supervisor = RestartSupervisor::recovered(record, spec.restart.as_ref());
+		}
+		let process = Arc::new(NamedProcess {
+			host: Arc::downgrade(&self.inner),
+			name: name.clone(),
+			generation,
+			control,
+			stream: Mutex::new(ProcessStreamState {
+				info:        ProcessInfo {
+					name: name.to_string(),
+					generation,
+					state: if ready.is_empty() {
+						ProcessState::Running as i32
+					} else {
+						ProcessState::Starting as i32
+					},
+					identity: Some(identity.to_wire()),
+					ready_pending: ready_condition_names(&ready),
+					props: spec.props.clone(),
+					..ProcessInfo::default()
+				},
+				history:     Vec::new(),
+				subscribers: Vec::new(),
+			}),
+			log: Mutex::new(log),
+			spec: spec.clone(),
+			ready: ready.clone().into(),
+			identity: identity.clone(),
+			started_at: Instant::now(),
+			detached: true,
+			persist: true,
+			stopping: AtomicBool::new(false),
+			restarts: Mutex::new(supervisor),
+		});
+		self.persist_process(
+			&process,
+			if ready.is_empty() {
+				ProcessPhase::Running
+			} else {
+				ProcessPhase::WaitingReady
+			},
+		)?;
+		self
+			.inner
+			.processes
+			.lock()
+			.insert(name.clone(), process.clone());
+		spawn_detached_monitor(process.clone(), Some(child), cancel_rx);
+
+		if let Err(error) = try_join_all(
+			ready
+				.iter()
+				.cloned()
+				.map(|probe| wait_ready_probe(process.clone(), probe)),
+		)
+		.await
+		{
+			process.stopping.store(true, Ordering::Release);
+			process.control.cancel(CANCEL_GRACE);
+			self.persist_process(&process, ProcessPhase::Failed)?;
+			return Err(error);
+		}
+		if !ready.is_empty() {
+			let mut stream = process.stream.lock();
+			if process_state_is_terminal(stream.info.state) {
+				return Err(ExecError::Readiness(sf!(
+					"process exited while readiness probes were running",
+				)));
+			}
+			stream.info.state = ProcessState::Ready as i32;
+			stream.info.ready_pending.clear();
+			let info = stream.info.clone();
+			stream.broadcast(ProcessEvent::State(info));
+			drop(stream);
+			self.persist_process(&process, ProcessPhase::Running)?;
+		}
+		Ok(ProcessStarted {
+			name: name.to_string(),
+			generation,
+			identity: Some(identity.to_wire()),
+			log_offset: process.log.lock().end_offset(),
+			props: spec.props.clone(),
+		})
+	}
+
+	fn process_dir(&self, name: &str) -> PathBuf {
+		self
+			.inner
+			.persistence
+			.lock()
+			.as_ref()
+			.map_or_else(
+				|| std::env::temp_dir().join(format!("omp-processes-{}", std::process::id())),
+				|persistence| persistence.store.process_root(),
+			)
+			.join(name)
+	}
+
+	fn persist_process(&self, process: &NamedProcess, phase: ProcessPhase) -> Result<(), ExecError> {
+		let process_dir = self.process_dir(&process.name);
+		let mut persistence = self.inner.persistence.lock();
+		let Some(persistence) = persistence.as_mut() else {
+			return Ok(());
+		};
+		let stream = process.stream.lock();
+		let log = process.log.lock();
+		let supervisor = process.restarts.lock();
+		let existing = persistence
+			.snapshot
+			.processes
+			.iter()
+			.find(|record| record.name == process.name && record.generation == process.generation);
+		let started_order = existing.map_or_else(
+			|| self.inner.next_order.fetch_add(1, Ordering::Relaxed),
+			|record| record.started_order,
+		);
+		let recent_order = if phase.is_terminal() {
+			self.inner.next_order.fetch_add(1, Ordering::Relaxed)
+		} else {
+			existing.map_or(0, |record| record.recent_order)
+		};
+		let record = ProcessRecord {
+			name: process.name.clone(),
+			spec_wire: process.spec.encode_to_vec(),
+			ready_wire: process
+				.ready
+				.iter()
+				.map(|probe| probe.encode_to_vec())
+				.collect(),
+			process_dir,
+			generation: process.generation,
+			identity: process.identity.clone(),
+			detached: process.detached,
+			persist: process.persist,
+			phase,
+			log_start_offset: log.start_offset(),
+			log_end_offset: log.end_offset(),
+			log_rotations: log.rotations(),
+			restart_count: supervisor.restart_count,
+			consecutive_failures: supervisor.consecutive_failures,
+			restart_history: supervisor.history.clone(),
+			started_order,
+			recent_order,
+		};
+		drop(supervisor);
+		drop(log);
+		drop(stream);
+		if let Some(slot) = persistence
+			.snapshot
+			.processes
+			.iter_mut()
+			.find(|record| record.name == process.name)
+		{
+			*slot = record;
+		} else {
+			persistence.snapshot.processes.push(record);
+		}
+		if let Some(current) = persistence.store.load()? {
+			persistence.snapshot.shutdown_acknowledgement = current.shutdown_acknowledgement;
+		}
+		persistence.store.save(&persistence.snapshot)?;
+		Ok(())
+	}
+
+	fn recover_records(&self, records: Vec<ProcessRecord>) -> Result<(), ExecError> {
+		for record in records {
+			if !record.phase.is_active() {
+				continue;
+			}
+			if !record.detached || !record.persist || !record.identity.verify()? {
+				self.mark_recovered_terminal(&record, ProcessPhase::Exited)?;
+				continue;
+			}
+			let Ok(spec) = ProcessSpec::decode(record.spec_wire.as_slice()) else {
+				self.mark_recovered_terminal(&record, ProcessPhase::Failed)?;
+				continue;
+			};
+			let ready: Vec<_> = record
+				.ready_wire
+				.iter()
+				.filter_map(|wire| ReadyProbe::decode(wire.as_slice()).ok())
+				.collect();
+			let log = ProcessLog::reopen(
+				&record.process_dir,
+				record.log_start_offset,
+				record.log_end_offset,
+				record.log_rotations,
+			)?;
+			let (cancel_tx, cancel_rx) = flume::bounded(1);
+			let control = Arc::new(RunControl {
+				cancel_tx,
+				input: Mutex::new(None),
+				spawns: Arc::new(SpawnBook { groups: Mutex::new(vec![record.identity.pid as i32]) }),
+				finished: AtomicBool::new(false),
+				retained: Mutex::new(None),
+			});
+			let state = match record.phase {
+				ProcessPhase::WaitingReady | ProcessPhase::Starting => ProcessState::Starting,
+				ProcessPhase::Running => ProcessState::Running,
+				_ => ProcessState::Exited,
+			};
+			let process = Arc::new(NamedProcess {
+				host: Arc::downgrade(&self.inner),
+				name: record.name.clone(),
+				generation: record.generation,
+				control,
+				stream: Mutex::new(ProcessStreamState {
+					info:        ProcessInfo {
+						name: record.name.to_string(),
+						generation: record.generation,
+						state: state as i32,
+						identity: Some(record.identity.to_wire()),
+						log_start_offset: record.log_start_offset,
+						log_end_offset: record.log_end_offset,
+						restart_count: record.restart_count,
+						consecutive_failures: record.consecutive_failures,
+						ready_pending: if state == ProcessState::Starting {
+							ready_condition_names(&ready)
+						} else {
+							Vec::new()
+						},
+						props: spec.props.clone(),
+						..ProcessInfo::default()
+					},
+					history:     Vec::new(),
+					subscribers: Vec::new(),
+				}),
+				log: Mutex::new(log),
+				spec: spec.clone(),
+				ready: ready.into(),
+				identity: record.identity.clone(),
+				started_at: Instant::now(),
+				detached: true,
+				persist: true,
+				stopping: AtomicBool::new(false),
+				restarts: Mutex::new(RestartSupervisor::recovered(&record, spec.restart.as_ref())),
+			});
+			self
+				.inner
+				.processes
+				.lock()
+				.insert(record.name.clone(), process.clone());
+			spawn_detached_monitor(process.clone(), None, cancel_rx);
+			if state == ProcessState::Starting {
+				tokio::spawn(resume_recovered_readiness(process));
+			}
+		}
+		Ok(())
+	}
+
+	fn persisted_record(&self, name: &str) -> Option<ProcessRecord> {
+		self
+			.inner
+			.persistence
+			.lock()
+			.as_ref()?
+			.snapshot
+			.processes
+			.iter()
+			.find(|record| record.name.as_str() == name)
+			.cloned()
+	}
+
+	fn mark_recovered_terminal(
+		&self,
+		record: &ProcessRecord,
+		phase: ProcessPhase,
+	) -> Result<(), ExecError> {
+		let mut persistence = self.inner.persistence.lock();
+		let Some(persistence) = persistence.as_mut() else {
+			return Ok(());
+		};
+		if let Some(stored) = persistence
+			.snapshot
+			.processes
+			.iter_mut()
+			.find(|stored| stored.name == record.name)
+		{
+			stored.phase = phase;
+			stored.recent_order = self.inner.next_order.fetch_add(1, Ordering::Relaxed);
+		}
+		persistence.store.save(&persistence.snapshot)?;
+		Ok(())
 	}
 
 	/// Converts an active foreground execution into a retained named process.
@@ -543,6 +1279,7 @@ impl ExecHost {
 		}
 		let generation = 1;
 		let process = Arc::new(NamedProcess {
+			host: Arc::downgrade(&self.inner),
 			name: name.clone(),
 			generation,
 			control: control.clone(),
@@ -552,27 +1289,63 @@ impl ExecHost {
 					generation,
 					state: ProcessState::Running as i32,
 					status: None,
-					props: Default::default(),
+					..ProcessInfo::default()
 				},
 				history:     Vec::new(),
 				subscribers: Vec::new(),
 			}),
+			log: Mutex::new(ProcessLog::create(self.process_dir(&name), 0, 0)?),
+			spec: ProcessSpec::default(),
+			ready: Arc::from([]),
+			identity: ProcessIdentity::current()?,
+			started_at: Instant::now(),
+			detached: false,
+			persist: false,
+			stopping: AtomicBool::new(false),
+			restarts: Mutex::new(RestartSupervisor::from_spec(None)),
 		});
 		self.inner.processes.lock().insert(name, process.clone());
+		self.persist_process(&process, ProcessPhase::Running)?;
 		*retained = Some(Arc::downgrade(&process));
-		Ok(ProcessStarted { name: process.name.to_string(), generation, props: Default::default() })
+		Ok(ProcessStarted {
+			name: process.name.to_string(),
+			generation,
+			identity: None,
+			log_offset: 0,
+			props: Default::default(),
+		})
 	}
 
-	/// Lists every registered named process in stable name order.
+	/// Lists active processes oldest-to-newest followed by at most ten newest
+	/// terminal records.
 	pub fn list_processes(&self) -> ProcessList {
-		let mut processes: Vec<_> = self
+		let snapshot = self
 			.inner
-			.processes
+			.persistence
 			.lock()
-			.values()
-			.map(|process| process.stream.lock().info.clone())
-			.collect();
-		processes.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+			.as_ref()
+			.map(|persistence| persistence.snapshot.clone());
+		let live = self.inner.processes.lock();
+		let mut processes: Vec<ProcessInfo> = if let Some(snapshot) = snapshot.as_ref() {
+			snapshot
+				.ordered_records()
+				.into_iter()
+				.map(|record| {
+					live.get(&record.name).map_or_else(
+						|| process_info_from_record(record),
+						|process| process.stream.lock().info.clone(),
+					)
+				})
+				.collect()
+		} else {
+			live
+				.values()
+				.map(|process| process.stream.lock().info.clone())
+				.collect()
+		};
+		if snapshot.is_none() {
+			processes.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+		}
 		ProcessList { processes, props: Default::default() }
 	}
 
@@ -581,20 +1354,44 @@ impl ExecHost {
 		let process = self.named_process(&request.name, request.generation)?;
 		let (tx, events) = flume::unbounded();
 		let mut stream = process.stream.lock();
-		let backlog = stream
-			.history
-			.iter()
-			.filter(|event| event.sequence > request.after_sequence)
-			.cloned()
-			.collect();
+		let max_bytes = if request.max_bytes == 0 {
+			super::process_log::MAX_LOG_READ_BYTES
+		} else {
+			request.max_bytes
+		};
+		let (data, rotated) = process
+			.log
+			.lock()
+			.read_after(request.after_sequence, max_bytes)?;
+		let backlog = if data.is_empty() {
+			Vec::new()
+		} else {
+			let log_offset = request.after_sequence.max(stream.info.log_start_offset);
+			let sequence = log_offset.saturating_add(data.len() as u64);
+			vec![ProcessOutput {
+				name: process.name.to_string(),
+				generation: process.generation,
+				channel: OutputChannel::Stdout as i32,
+				data: data.into(),
+				sequence,
+				log_offset,
+				terminal_text: false,
+				truncated: rotated,
+				props: Default::default(),
+			}]
+		};
 		stream.subscribers.push(tx);
 		let state = stream.info.clone();
 		drop(stream);
 		Ok(ProcessAttachment {
 			attached: OutputAttached {
-				name:       request.name.clone(),
+				name: request.name.clone(),
 				generation: process.generation,
-				props:      Default::default(),
+				log_start_offset: state.log_start_offset,
+				log_end_offset: state.log_end_offset,
+				rotated,
+				terminal_text: request.terminal_text,
+				props: Default::default(),
 			},
 			backlog,
 			state,
@@ -611,7 +1408,12 @@ impl ExecHost {
 	) -> Result<ProcessCommandAccepted, ExecError> {
 		let process = self.named_process(name, generation)?;
 		write_input(&process.control, data)?;
-		Ok(ProcessCommandAccepted { name: name.to_owned(), props: Default::default() })
+		Ok(ProcessCommandAccepted {
+			name: name.to_owned(),
+			shutdown_acknowledged: false,
+			generation,
+			props: Default::default(),
+		})
 	}
 
 	/// Sends a named signal to every group owned by a named process.
@@ -626,7 +1428,12 @@ impl ExecHost {
 			return Err(ExecError::RunNotFound);
 		}
 		process.control.spawns.signal(parse_signal(signal)?)?;
-		Ok(ProcessCommandAccepted { name: name.to_owned(), props: Default::default() })
+		Ok(ProcessCommandAccepted {
+			name: name.to_owned(),
+			shutdown_acknowledged: false,
+			generation,
+			props: Default::default(),
+		})
 	}
 
 	/// TERM-then-KILLs a named process. Its registration and terminal state
@@ -638,8 +1445,37 @@ impl ExecHost {
 		grace: Duration,
 	) -> Result<ProcessCommandAccepted, ExecError> {
 		let process = self.named_process(name, generation)?;
+		process.stopping.store(true, Ordering::Release);
 		process.control.cancel(grace);
-		Ok(ProcessCommandAccepted { name: name.to_owned(), props: Default::default() })
+		Ok(ProcessCommandAccepted {
+			name: name.to_owned(),
+			shutdown_acknowledged: false,
+			generation,
+			props: Default::default(),
+		})
+	}
+
+	/// Gracefully stops every managed process except a verified detached,
+	/// persistent generation that can be safely re-adopted.
+	pub fn shutdown_managed(&self, grace: Duration) -> ShutdownSummary {
+		let processes: Vec<_> = self.inner.processes.lock().values().cloned().collect();
+		let mut summary = ShutdownSummary { stopped: 0, spared: 0 };
+		for process in processes {
+			let verified = process
+				.stream
+				.lock()
+				.info
+				.identity
+				.as_ref()
+				.is_some_and(super::process_identity::ProcessIdentity::verify_wire);
+			if process.detached && process.persist && verified {
+				summary.spared = summary.spared.saturating_add(1);
+			} else {
+				process.control.cancel(grace);
+				summary.stopped = summary.stopped.saturating_add(1);
+			}
+		}
+		summary
 	}
 
 	fn named_process(&self, name: &str, generation: u64) -> Result<Arc<NamedProcess>, ExecError> {
@@ -672,6 +1508,15 @@ impl ExecHost {
 	}
 
 	fn reserve_process(&self, name: Str) -> Result<ProcessReservation, ExecError> {
+		if name.is_empty()
+			|| name.len() > 48
+			|| !name
+				.as_bytes()
+				.iter()
+				.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+		{
+			return Err(ExecError::InvalidProcessName);
+		}
 		if !self.inner.starting.lock().insert(name.clone()) {
 			return Err(ExecError::ProcessExists(name));
 		}
@@ -745,14 +1590,14 @@ async fn session_loop(mut shell: Shell, commands: flume::Receiver<SessionCommand
 	loop {
 		let command = if let Some(deadline) = cancellation_deadline {
 			tokio::select! {
-				command = commands.recv_async() => match command {
-					Ok(command) => command,
-					Err(_) => break,
-				},
-				() = tokio::time::sleep_until(deadline) => {
-					cancellation_deadline = None;
-					continue;
-				},
+				  command = commands.recv_async() => match command {
+						 Ok(command) => command,
+						 Err(_) => break,
+				  },
+				  () = tokio::time::sleep_until(deadline) => {
+						 cancellation_deadline = None;
+						 continue;
+				  },
 			}
 		} else {
 			match commands.recv_async().await {
@@ -764,7 +1609,12 @@ async fn session_loop(mut shell: Shell, commands: flume::Receiver<SessionCommand
 		if let Some(deadline) = cancellation_deadline {
 			match tokio::time::timeout_at(deadline, command.cancel_rx.recv_async()).await {
 				Ok(Ok(_) | Err(_)) => {
-					finish_session_command(&command, RunTerminal::Cancelled, Duration::ZERO);
+					finish_session_command(
+						&command,
+						RunTerminal::Cancelled,
+						Duration::ZERO,
+						shell.working_dir(),
+					);
 					cancellation_deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
 					continue;
 				},
@@ -781,14 +1631,16 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 	let started_at = Instant::now();
 	match command.cancel_rx.try_recv() {
 		Ok(_) | Err(flume::TryRecvError::Disconnected) => {
-			finish_session_command(&command, RunTerminal::Cancelled, started_at.elapsed());
+			finish_session_command(
+				&command,
+				RunTerminal::Cancelled,
+				started_at.elapsed(),
+				shell.working_dir(),
+			);
 			return true;
 		},
 		Err(flume::TryRecvError::Empty) => {},
 	}
-	let _ = command
-		.events
-		.send(ExecEvent::Started { exec_id: command.exec.clone() });
 	let cancel_rx = command.cancel_rx.clone();
 	let setup = setup_io(
 		command.pty.as_ref(),
@@ -797,9 +1649,17 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		command.events.clone(),
 	);
 	let Ok((mut params, readers)) = setup else {
-		finish_session_command(&command, RunTerminal::Failed, started_at.elapsed());
+		finish_session_command(
+			&command,
+			RunTerminal::Failed,
+			started_at.elapsed(),
+			shell.working_dir(),
+		);
 		return false;
 	};
+	let _ = command
+		.events
+		.send(ExecEvent::Started { exec_id: command.exec.clone() });
 	params.process_group_policy = omp_shell_engine::ProcessGroupPolicy::NewProcessGroup;
 	params.set_spawn_observer(command.control.spawns.clone());
 	let source_info = SourceInfo::from("env/v1 exec");
@@ -814,19 +1674,19 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		let execution = shell.run_string(command.source.to_string(), &source_info, &params);
 		tokio::pin!(execution);
 		tokio::select! {
-			result = &mut execution => match result {
-				Ok(result) => RunTerminal::Exited(i32::from(u8::from(result.exit_code))),
-				Err(_error) => RunTerminal::Failed,
-			},
-			request = cancel_rx.recv_async() => {
-				let request = request.unwrap_or(CancelRequest { grace: CANCEL_GRACE });
-				command.control.spawns.terminate(request.grace).await;
-				RunTerminal::Cancelled
-			},
-			() = &mut timeout => {
-				command.control.spawns.terminate(CANCEL_GRACE).await;
-				RunTerminal::Timeout
-			},
+			  result = &mut execution => match result {
+					 Ok(result) => RunTerminal::Exited(i32::from(u8::from(result.exit_code))),
+					 Err(_error) => RunTerminal::Failed,
+			  },
+			  request = cancel_rx.recv_async() => {
+					 let request = request.unwrap_or(CancelRequest { grace: CANCEL_GRACE });
+					 command.control.spawns.terminate(request.grace).await;
+					 RunTerminal::Cancelled
+			  },
+			  () = &mut timeout => {
+					 command.control.spawns.terminate(CANCEL_GRACE).await;
+					 RunTerminal::Timeout
+			  },
 		}
 	};
 	drop(params);
@@ -835,17 +1695,58 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		let _ = reader.await;
 	}
 	let cancelled = result == RunTerminal::Cancelled;
-	finish_session_command(&command, result, started_at.elapsed());
+	finish_session_command(&command, result, started_at.elapsed(), shell.working_dir());
 	cancelled
 }
 
-fn finish_session_command(command: &SessionCommand, result: RunTerminal, elapsed: Duration) {
+fn finish_session_command(
+	command: &SessionCommand,
+	result: RunTerminal,
+	elapsed: Duration,
+	working_dir: &std::path::Path,
+) {
 	let retained = command.control.retained.lock();
 	command.control.finished.store(true, Ordering::Release);
+	let (final_cwd_uri, final_cwd_revision) = command.host.upgrade().map_or_else(
+		|| (String::new(), 0),
+		|host| {
+			let revision = host.next_revision.fetch_add(1, Ordering::Relaxed);
+			let cwd_uri = Url::from_directory_path(working_dir)
+				.expect("shell working directory must be an absolute file URI")
+				.to_string();
+			host
+				.final_cwds
+				.lock()
+				.insert(command.exec.clone(), ExecFinalCwd {
+					exec: command.exec.clone(),
+					cwd_uri: cwd_uri.clone(),
+					revision,
+					terminal: true,
+				});
+			(cwd_uri, revision)
+		},
+	);
+	if result == RunTerminal::Exited(0)
+		&& !command.github_targets.is_empty()
+		&& let Some(host) = command.host.upgrade()
+		&& let Some(cache) = host.github_cache.lock().clone()
+	{
+		let active_repo = github_repository(working_dir);
+		let repos = command
+			.github_targets
+			.iter()
+			.filter_map(|target| target.repo.clone().or_else(|| active_repo.clone()))
+			.collect::<BTreeSet<_>>();
+		for repo in repos {
+			let _ = cache.invalidate_repo(&repo);
+		}
+	}
 	let event = ExecEvent::Exit(ExitEvent {
-		exec:   command.exec.clone(),
+		exec: command.exec.clone(),
 		status: Some(result.status(elapsed)),
-		props:  Default::default(),
+		final_cwd_uri,
+		final_cwd_revision,
+		props: Default::default(),
 	});
 	let _ = command.events.send(event.clone());
 	if let Some(process) = retained.as_ref().and_then(Weak::upgrade) {
@@ -955,7 +1856,7 @@ fn spawn_reader<R: Read + Send + 'static>(
 	tokio::task::spawn_blocking(move || {
 		let mut buffer = vec![0_u8; OUTPUT_CHUNK_BYTES];
 		loop {
-			let read = match reader.read(&mut buffer) {
+			let read = match read_chunk(&mut reader, &mut buffer) {
 				Ok(0) | Err(_) => break,
 				Ok(read) => read,
 			};
@@ -981,6 +1882,294 @@ fn spawn_reader<R: Read + Send + 'static>(
 	})
 }
 
+fn read_chunk(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+	loop {
+		match reader.read(buffer) {
+			Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+			result => return result,
+		}
+	}
+}
+
+async fn resume_recovered_readiness(process: Arc<NamedProcess>) {
+	let probes = process.ready.to_vec();
+	let passed = try_join_all(
+		probes
+			.into_iter()
+			.map(|probe| wait_ready_probe(process.clone(), probe)),
+	)
+	.await
+	.is_ok();
+	if !passed || process.control.finished.load(Ordering::Acquire) {
+		return;
+	}
+	let mut stream = process.stream.lock();
+	if stream.info.state != ProcessState::Starting as i32 {
+		return;
+	}
+	stream.info.state = ProcessState::Ready as i32;
+	stream.info.ready_pending.clear();
+	let info = stream.info.clone();
+	stream.broadcast(ProcessEvent::State(info));
+	drop(stream);
+	if let Some(host) = process.host.upgrade() {
+		let _ = ExecHost { inner: host }.persist_process(&process, ProcessPhase::Running);
+	}
+}
+
+fn spawn_detached_monitor(
+	process: Arc<NamedProcess>,
+	mut child: Option<std::process::Child>,
+	cancel_rx: flume::Receiver<CancelRequest>,
+) {
+	let runtime = tokio::runtime::Handle::current();
+	tokio::task::spawn_blocking(move || {
+		let mut cancelled = false;
+		let exit_code = loop {
+			if let Ok(cancel) = cancel_rx.try_recv() {
+				cancelled = true;
+				let _ = process.control.spawns.signal(ProcessSignal::Terminate);
+				std::thread::sleep(cancel.grace);
+				if process.identity.verify().unwrap_or(false) {
+					let _ = process.control.spawns.signal(ProcessSignal::Kill);
+				}
+			}
+			let status = if let Some(child) = child.as_mut() {
+				child.try_wait().ok().flatten().map(|status| status.code())
+			} else if process.identity.verify().unwrap_or(false) {
+				None
+			} else {
+				Some(None)
+			};
+			let chunk = { process.log.lock().poll_external() };
+			if let Ok(Some(chunk)) = chunk {
+				route_log_chunk(&process, chunk);
+				if let Some(host) = process.host.upgrade() {
+					let phase = phase_for_state(process.stream.lock().info.state);
+					let _ = ExecHost { inner: host }.persist_process(&process, phase);
+				}
+			}
+			if let Some(code) = status {
+				break code;
+			}
+			std::thread::sleep(Duration::from_millis(100));
+		};
+		process.control.finished.store(true, Ordering::Release);
+		runtime.spawn(async move {
+			settle_named_process(process, exit_code, cancelled);
+		});
+	});
+}
+
+fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, cancelled: bool) {
+	let Some(inner) = process.host.upgrade() else {
+		return;
+	};
+	let host = ExecHost { inner };
+	let current = host
+		.inner
+		.processes
+		.lock()
+		.get(&process.name)
+		.is_some_and(|current| Arc::ptr_eq(current, &process));
+	if !current || process_state_is_terminal(process.stream.lock().info.state) {
+		return;
+	}
+	let failed = exit_code.is_none_or(|code| code != 0) && !cancelled;
+	let uptime = process.started_at.elapsed();
+	let restart_delay = if process.stopping.load(Ordering::Acquire) || cancelled {
+		None
+	} else {
+		process.restarts.lock().decide(failed, uptime, exit_code)
+	};
+	{
+		let supervisor = process.restarts.lock();
+		let mut stream = process.stream.lock();
+		stream.info.restart_count = supervisor.restart_count;
+		stream.info.consecutive_failures = supervisor.consecutive_failures;
+		stream.info.status = Some(if cancelled {
+			RunTerminal::Cancelled.status(uptime)
+		} else {
+			exit_code
+				.map_or(RunTerminal::Failed, RunTerminal::Exited)
+				.status(uptime)
+		});
+		stream.info.state = if cancelled {
+			ProcessState::Stopped as i32
+		} else if failed {
+			ProcessState::Failed as i32
+		} else {
+			ProcessState::Exited as i32
+		};
+		stream.info.ready_pending.clear();
+		let info = stream.info.clone();
+		stream.broadcast(ProcessEvent::State(info));
+	}
+	let phase = if cancelled {
+		ProcessPhase::Stopped
+	} else if failed {
+		ProcessPhase::Failed
+	} else {
+		ProcessPhase::Exited
+	};
+	let _ = host.persist_process(&process, phase);
+	let Some(delay) = restart_delay else {
+		return;
+	};
+	let record = host.persisted_record(&process.name);
+	let spec = process.spec.clone();
+	let ready = process.ready.to_vec();
+	let name = process.name.clone();
+	let generation = process.generation.saturating_add(1);
+	let detached = process.detached;
+	tokio::spawn(async move {
+		tokio::time::sleep(delay).await;
+		if process.stopping.load(Ordering::Acquire)
+			|| !host
+				.inner
+				.processes
+				.lock()
+				.get(&name)
+				.is_some_and(|current| Arc::ptr_eq(current, &process))
+		{
+			return;
+		}
+		if detached {
+			let _ = host
+				.launch_detached(name, spec, ready, generation, record.as_ref())
+				.await;
+		} else {
+			let _ = host
+				.launch_attached(name, spec, ready, generation, record.as_ref())
+				.await;
+		}
+	});
+}
+
+fn route_log_chunk(process: &NamedProcess, chunk: super::process_log::LogChunk) {
+	if chunk.data.is_empty() {
+		return;
+	}
+	let mut stream = process.stream.lock();
+	let sequence = chunk.offset.saturating_add(chunk.data.len() as u64);
+	let log = process.log.lock();
+	stream.info.log_start_offset = log.start_offset();
+	stream.info.log_end_offset = log.end_offset();
+	let output = ProcessOutput {
+		name: process.name.to_string(),
+		generation: process.generation,
+		channel: OutputChannel::Stdout as i32,
+		data: chunk.data.into(),
+		sequence,
+		log_offset: chunk.offset,
+		terminal_text: false,
+		truncated: chunk.truncated,
+		props: Default::default(),
+	};
+	stream.history.push(output.clone());
+	trim_history(&mut stream.history);
+	stream.broadcast(ProcessEvent::Output(output));
+}
+
+fn trim_history(history: &mut Vec<ProcessOutput>) {
+	let mut bytes = history
+		.iter()
+		.map(|output| output.data.len())
+		.sum::<usize>();
+	let mut remove = 0;
+	while bytes > super::process_log::MAX_LOG_READ_BYTES as usize && remove < history.len() {
+		bytes = bytes.saturating_sub(history[remove].data.len());
+		remove += 1;
+	}
+	if remove > 0 {
+		history.drain(..remove);
+	}
+}
+
+fn ready_condition_names(ready: &[ReadyProbe]) -> Vec<String> {
+	ready
+		.iter()
+		.filter_map(|probe| match probe.probe.as_ref() {
+			Some(ready_probe::Probe::Log(_)) => Some(String::from("log")),
+			Some(ready_probe::Probe::Tcp(_)) => Some(String::from("port")),
+			Some(ready_probe::Probe::Ping(_)) => Some(String::from("ping")),
+			None => None,
+		})
+		.collect()
+}
+
+fn process_info_from_record(record: &ProcessRecord) -> ProcessInfo {
+	let props = ProcessSpec::decode(record.spec_wire.as_slice())
+		.ok()
+		.and_then(|spec| spec.props);
+	let state = match record.phase {
+		ProcessPhase::Starting | ProcessPhase::WaitingReady => ProcessState::Starting,
+		ProcessPhase::Running => ProcessState::Running,
+		ProcessPhase::Exited => ProcessState::Exited,
+		ProcessPhase::Stopped => ProcessState::Stopped,
+		ProcessPhase::Failed => ProcessState::Failed,
+	};
+	ProcessInfo {
+		name: record.name.to_string(),
+		generation: record.generation,
+		state: state as i32,
+		identity: Some(record.identity.to_wire()),
+		log_start_offset: record.log_start_offset,
+		log_end_offset: record.log_end_offset,
+		restart_count: record.restart_count,
+		consecutive_failures: record.consecutive_failures,
+		props,
+		..ProcessInfo::default()
+	}
+}
+
+fn phase_for_state(state: i32) -> ProcessPhase {
+	match ProcessState::try_from(state) {
+		Ok(ProcessState::Starting) => ProcessPhase::WaitingReady,
+		Ok(ProcessState::Ready | ProcessState::Running) => ProcessPhase::Running,
+		Ok(ProcessState::Stopped) => ProcessPhase::Stopped,
+		Ok(ProcessState::Exited) => ProcessPhase::Exited,
+		_ => ProcessPhase::Failed,
+	}
+}
+
+#[cfg(unix)]
+fn detached_command(source: &str) -> Command {
+	let mut command = Command::new("/bin/sh");
+	command.arg("-lc").arg(source);
+	command
+}
+
+#[cfg(windows)]
+fn detached_command(source: &str) -> Command {
+	let mut command = Command::new("cmd.exe");
+	command.arg("/d").arg("/s").arg("/c").arg(source);
+	command
+}
+
+#[cfg(unix)]
+fn configure_detached_group(command: &mut Command) {
+	use std::os::unix::process::CommandExt as _;
+	command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_detached_group(command: &mut Command) {
+	use std::os::windows::process::CommandExt as _;
+
+	use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+	command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+fn unix_time_ms() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::SystemTime::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
+}
+
 async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Result<(), ExecError> {
 	let timeout = Duration::from_millis(probe.timeout_ms);
 	match probe.probe {
@@ -992,15 +2181,19 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 				let mut output = Vec::new();
 				for frame in backlog {
 					output.extend_from_slice(&frame.data);
+					trim_readiness_window(&mut output);
 				}
-				if pattern.is_match(&output) {
+				if let Some(matched) = pattern.find(&output) {
+					record_ready_match(&process, &output[matched.start()..matched.end()]);
 					return Ok(());
 				}
 				while let Ok(event) = events.recv_async().await {
 					match event {
 						ProcessEvent::Output(frame) => {
 							output.extend_from_slice(&frame.data);
-							if pattern.is_match(&output) {
+							trim_readiness_window(&mut output);
+							if let Some(matched) = pattern.find(&output) {
+								record_ready_match(&process, &output[matched.start()..matched.end()]);
 								return Ok(());
 							}
 						},
@@ -1032,6 +2225,7 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 						.await
 						.is_ok()
 					{
+						clear_ready_pending(&process, "port");
 						return Ok(());
 					}
 					tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1058,9 +2252,10 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 							output.extend_from_slice(&frame.data);
 							while let Some(worker) = take_worker_frame(&mut output)? {
 								if matches!(
-									&worker.body,
-									Some(worker_frame::Body::Pong(pong)) if pong.nonce == ping.nonce
+									  &worker.body,
+									  Some(worker_frame::Body::Pong(pong)) if pong.nonce == ping.nonce
 								) {
+									clear_ready_pending(&process, "ping");
 									return Ok(());
 								}
 							}
@@ -1081,6 +2276,32 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 		},
 		None => Err(ExecError::Readiness(sf!("readiness probe has no kind"))),
 	}
+}
+
+fn trim_readiness_window(output: &mut Vec<u8>) {
+	const WINDOW: usize = 64 * 1024;
+	if output.len() > WINDOW {
+		output.drain(..output.len() - WINDOW);
+	}
+}
+
+fn record_ready_match(process: &NamedProcess, matched: &[u8]) {
+	let matched = &matched[..matched.len().min(500)];
+	let mut stream = process.stream.lock();
+	stream.info.ready_match = String::from_utf8_lossy(matched).into_owned();
+	stream.info.ready_pending.retain(|pending| pending != "log");
+	let info = stream.info.clone();
+	stream.broadcast(ProcessEvent::State(info));
+}
+
+fn clear_ready_pending(process: &NamedProcess, condition: &str) {
+	let mut stream = process.stream.lock();
+	stream
+		.info
+		.ready_pending
+		.retain(|pending| pending != condition);
+	let info = stream.info.clone();
+	stream.broadcast(ProcessEvent::State(info));
 }
 
 fn readiness_events(process: &NamedProcess) -> (Vec<ProcessOutput>, flume::Receiver<ProcessEvent>) {
@@ -1134,10 +2355,16 @@ fn take_worker_frame(buffer: &mut BytesMut) -> Result<Option<WorkerFrame>, ExecE
 
 async fn forward_named_process(process: Arc<NamedProcess>, run: ExecRun, _exec: Bytes) {
 	while let Some(event) = run.next_event().await {
-		let terminal = matches!(event, ExecEvent::Exit(_));
-		route_named_event(&process, event);
-		if terminal {
-			break;
+		match event {
+			ExecEvent::Exit(exit) => {
+				let status = exit.status.as_ref();
+				let exit_code = status.and_then(|status| status.exit_code);
+				let cancelled =
+					status.is_some_and(|status| status.outcome == ExecOutcome::Cancelled as i32);
+				settle_named_process(process, exit_code, cancelled);
+				break;
+			},
+			event => route_named_event(&process, event),
 		}
 	}
 }
@@ -1146,17 +2373,36 @@ fn route_named_event(process: &NamedProcess, event: ExecEvent) {
 	match event {
 		ExecEvent::Started { .. } => {},
 		ExecEvent::Output(output) => {
-			let output = ProcessOutput {
-				name:       process.name.to_string(),
-				generation: process.generation,
-				channel:    output.channel,
-				data:       output.data,
-				sequence:   output.sequence,
-				props:      Default::default(),
+			let terminal_text = output.channel == OutputChannel::Pty as i32;
+			let log_offset = match process.log.lock().append(&output.data) {
+				Ok(offset) => offset,
+				Err(_) => return,
 			};
 			let mut stream = process.stream.lock();
+			let log = process.log.lock();
+			stream.info.log_start_offset = log.start_offset();
+			stream.info.log_end_offset = log.end_offset();
+			drop(log);
+			let output = ProcessOutput {
+				name: process.name.to_string(),
+				generation: process.generation,
+				channel: output.channel,
+				sequence: log_offset.saturating_add(output.data.len() as u64),
+				data: output.data,
+				log_offset,
+				terminal_text,
+				truncated: false,
+				props: Default::default(),
+			};
 			stream.history.push(output.clone());
+			trim_history(&mut stream.history);
 			stream.broadcast(ProcessEvent::Output(output));
+			drop(stream);
+			if let Some(host) = process.host.upgrade() {
+				let host = ExecHost { inner: host };
+				let phase = phase_for_state(process.stream.lock().info.state);
+				let _ = host.persist_process(process, phase);
+			}
 		},
 		ExecEvent::Exit(exit) => {
 			let mut stream = process.stream.lock();
@@ -1169,6 +2415,11 @@ fn route_named_event(process: &NamedProcess, event: ExecEvent) {
 			let info = stream.info.clone();
 			drop(process.control.input.lock());
 			stream.broadcast(ProcessEvent::State(info));
+			let phase = phase_for_state(stream.info.state);
+			drop(stream);
+			if let Some(host) = process.host.upgrade() {
+				let _ = ExecHost { inner: host }.persist_process(process, phase);
+			}
 		},
 	}
 }
@@ -1217,6 +2468,97 @@ fn read_workspace_environment() -> WorkspaceEnvironment {
 		variables: variables.into(),
 		digest:    WorkspaceEnvironmentDigest(hasher.finalize()),
 	}
+}
+
+fn github_repository(cwd: &Path) -> Option<Str> {
+	if let Ok(repo) = std::env::var("GH_REPO")
+		&& let Some(repo) = github_repo_from_remote(&repo)
+	{
+		return Some(repo);
+	}
+	for ancestor in cwd.ancestors() {
+		let config = ancestor.join(".git/config");
+		let Ok(contents) = fs::read_to_string(config) else {
+			continue;
+		};
+		let mut origin = false;
+		for line in contents.lines() {
+			let line = line.trim();
+			if line.starts_with('[') {
+				origin = line == r#"[remote "origin"]"#;
+				continue;
+			}
+			if origin
+				&& let Some(remote) = line
+					.strip_prefix("url")
+					.and_then(|line| line.trim_start().strip_prefix('='))
+				&& let Some(repo) = github_repo_from_remote(remote.trim())
+			{
+				return Some(repo);
+			}
+		}
+	}
+	None
+}
+
+fn github_repo_from_remote(remote: &str) -> Option<Str> {
+	let path = remote
+		.strip_prefix("git@github.com:")
+		.or_else(|| remote.strip_prefix("https://github.com/"))
+		.or_else(|| remote.strip_prefix("http://github.com/"))
+		.or_else(|| remote.strip_prefix("ssh://git@github.com/"))?
+		.trim_end_matches('/')
+		.trim_end_matches(".git");
+	let mut parts = path.split('/');
+	let owner = parts.next()?;
+	let repo = parts.next()?;
+	if parts.next().is_some()
+		|| owner.is_empty()
+		|| repo.is_empty()
+		|| !owner
+			.bytes()
+			.chain(repo.bytes())
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+	{
+		return None;
+	}
+	Some(sf!("{owner}/{repo}"))
+}
+
+fn simple_cd(command: &str) -> bool {
+	let command = command.trim();
+	command.strip_prefix("cd").is_some_and(|rest| {
+		rest.starts_with(char::is_whitespace)
+			&& !rest
+				.chars()
+				.any(|character| matches!(character, '\n' | ';' | '&' | '|' | '<' | '>'))
+	})
+}
+
+fn user_shell_command(shell: &UserShell, command: &str) -> Str {
+	let mut rendered = String::new();
+	push_shell_word(&mut rendered, &shell.executable);
+	for argument in shell.args.iter() {
+		rendered.push(' ');
+		push_shell_word(&mut rendered, argument);
+	}
+	if shell.login {
+		rendered.push_str(" -l");
+	}
+	rendered.push_str(" -c ");
+	push_shell_word(&mut rendered, command);
+	Str::new(rendered)
+}
+
+fn push_shell_word(output: &mut String, word: &str) {
+	output.push('\'');
+	for part in word.split('\'') {
+		if !output.ends_with('\'') {
+			output.push_str("'\\''");
+		}
+		output.push_str(part);
+	}
+	output.push('\'');
 }
 
 fn cwd_from_uri(uri: &str) -> Result<Option<PathBuf>, ExecError> {
@@ -1276,4 +2618,109 @@ fn shell_error(error: omp_shell_engine::Error) -> ExecError {
 
 fn errno_io(error: nix::errno::Errno) -> ExecError {
 	ExecError::Io(std::io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct InterruptedReader {
+		interrupts: usize,
+		bytes:      &'static [u8],
+	}
+
+	impl Read for InterruptedReader {
+		fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+			if self.interrupts > 0 {
+				self.interrupts -= 1;
+				return Err(io::Error::from(io::ErrorKind::Interrupted));
+			}
+			let length = self.bytes.len().min(buffer.len());
+			buffer[..length].copy_from_slice(&self.bytes[..length]);
+			self.bytes = &self.bytes[length..];
+			Ok(length)
+		}
+	}
+
+	#[tokio::test]
+	async fn exec_session_reports_capabilities_and_revision_fenced_final_cwd() {
+		let root = tempfile::tempdir().unwrap();
+		let nested = root.path().join("nested");
+		std::fs::create_dir(&nested).unwrap();
+		let host = ExecHost::new();
+		let opened = host
+			.open_session(OpenSessionRequest {
+				cwd_uri: Url::from_directory_path(root.path()).unwrap().to_string(),
+				shell_profile: Some(omp_proto::env::v1::ShellProfileInput {
+					profile: String::from("brush"),
+					wire_revision: omp_proto::SCHEMA_REV,
+					..Default::default()
+				}),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let capabilities = host
+			.capabilities(&ExecCapabilitiesRequest {
+				session:       opened.session.clone(),
+				wire_revision: omp_proto::SCHEMA_REV,
+			})
+			.unwrap();
+		assert!(capabilities.final_cwd);
+		assert!(capabilities.materialization);
+		assert_eq!(capabilities.shell_profiles, [String::from("brush")]);
+
+		let (started, run) = host
+			.exec(
+				ExecRequest {
+					session: opened.session,
+					source: Some(omp_proto::env::v1::Script {
+						text: String::from("cd nested"),
+						..Default::default()
+					}),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+		loop {
+			match run.next_event().await {
+				Some(ExecEvent::Exit(_)) => break,
+				Some(_) => {},
+				None => panic!("exec event stream closed before exit"),
+			}
+		}
+		let final_cwd = host
+			.final_cwd(&ExecFinalCwdRequest {
+				exec:              started.exec.clone(),
+				expected_revision: 0,
+				wire_revision:     omp_proto::SCHEMA_REV,
+			})
+			.unwrap();
+		assert!(final_cwd.terminal);
+		assert_eq!(
+			Url::parse(&final_cwd.cwd_uri)
+				.unwrap()
+				.to_file_path()
+				.unwrap(),
+			nested,
+		);
+		assert!(matches!(
+			host.final_cwd(&ExecFinalCwdRequest {
+				exec:              started.exec,
+				expected_revision: final_cwd.revision + 1,
+				wire_revision:     omp_proto::SCHEMA_REV,
+			}),
+			Err(ExecError::StaleFinalCwdRevision),
+		));
+	}
+
+	#[test]
+	fn reader_retries_unbounded_interrupted_reads_before_collecting_output() {
+		let mut reader = InterruptedReader { interrupts: 32, bytes: b"complete" };
+		let mut output = [0_u8; 16];
+		let read = read_chunk(&mut reader, &mut output).expect("interrupted reads should retry");
+		assert_eq!(&output[..read], b"complete");
+	}
 }

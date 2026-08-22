@@ -1,21 +1,27 @@
 //! Chat-owned composition for the unified hub tool.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	sync::{Arc, LazyLock},
 	time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
-use omp_agent::{Broker, BrokerInbox, CancelOutcome, DeliveryMode, JobBoard, PeerMessage};
+use omp_agent::{
+	AgentEvent, Broker, BrokerInbox, CancelOutcome, DeliveryMode, EventBus, JobBoard, JobError,
+	PeerMessage, PeerRelayObservation, TurnClient,
+};
 use omp_core::{Duration, DurationUnit, Str, sf};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
-use omp_proto::env::v1::{
-	AttachOutput, EnvironmentDelta, ListProcesses, ProcessSpec, PtySpec, ReadyLog, ReadyProbe,
-	ReadyTcp, RestartSpec, Script, SendInput, SignalProcess, StartProcess, StopProcess, ready_probe,
-	send_input,
+use omp_proto::{
+	env::v1::{
+		AttachOutput, EnvironmentDelta, ListProcesses, ProcessSpec, PtySpec, ReadyLog, ReadyProbe,
+		ReadyTcp, RestartSpec, Script, SendInput, SignalProcess, StartProcess, StopProcess,
+		ready_probe, send_input,
+	},
+	inference::v1::{Value, ValueMap, value},
 };
-use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobOwner, JobRef, Tool};
+use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef, Tool};
 use omp_tools::hub::{Fault, HubBackend, HubRouter, Op, Params, Request, Response, RestartPolicy};
 use parking_lot::Mutex;
 use serde_json::json;
@@ -28,21 +34,27 @@ pub fn tool() -> impl Tool {
 	omp_tools::hub::tool(ChatHubRoute)
 }
 
-/// Installs one live chat composition, restoring the prior one on drop.
+/// Installs the main live chat composition, restoring the prior one on drop.
 pub fn attach(backend: Arc<ChatHubBackend>) -> HubAttachment {
-	let previous = ROUTER.attach(sf!(DEFAULT_ROUTE), backend);
-	HubAttachment { previous }
+	attach_for(sf!(DEFAULT_ROUTE), backend)
+}
+
+/// Installs one agent-addressed chat composition without replacing Main.
+pub fn attach_for(owner: Str, backend: Arc<ChatHubBackend>) -> HubAttachment {
+	let previous = ROUTER.attach(owner.clone(), backend);
+	HubAttachment { owner, previous }
 }
 
 pub struct HubAttachment {
+	owner:    Str,
 	previous: Option<Arc<ChatHubBackend>>,
 }
 
 impl Drop for HubAttachment {
 	fn drop(&mut self) {
-		ROUTER.detach(DEFAULT_ROUTE);
+		ROUTER.detach(&self.owner);
 		if let Some(previous) = self.previous.take() {
-			ROUTER.attach(sf!(DEFAULT_ROUTE), previous);
+			ROUTER.attach(self.owner.clone(), previous);
 		}
 	}
 }
@@ -55,21 +67,42 @@ impl HubBackend for ChatHubRoute {
 		&'a self,
 		_caller_id: &'a str,
 		request: Request,
+		updates: &'a flume::Sender<Response>,
 	) -> Result<Response, Fault> {
-		// The native env connection is the authenticated owner; the live chat
-		// attachment supplies the narrower agent identity used for peer routing.
-		ROUTER.execute(DEFAULT_ROUTE, request).await
+		// Child invocations route by stable agent identity. Calls without a
+		// child attachment belong to the main session composition.
+		let owner = if ROUTER.contains(_caller_id) {
+			_caller_id
+		} else {
+			DEFAULT_ROUTE
+		};
+		ROUTER.execute(owner, request, updates).await
+	}
+}
+
+pub(crate) trait AgentCancellation: Send + Sync {
+	fn cancel(&self, id: &str) -> Result<(), Str>;
+}
+
+impl<C: TurnClient + Send + 'static> AgentCancellation
+	for crate::subagent::supervisor::SessionSupervisor<C>
+{
+	fn cancel(&self, id: &str) -> Result<(), Str> {
+		crate::subagent::supervisor::SessionSupervisor::cancel(self, id)
+			.map_err(|error| Str::from(error.to_string()))
 	}
 }
 
 pub struct ChatHubBackend {
-	broker:   Broker,
-	inbox:    tokio::sync::Mutex<BrokerInbox>,
-	jobs:     Arc<JobBoard>,
-	env:      EnvClient,
-	agent_id: Str,
-	session:  Str,
-	launches: Mutex<BTreeMap<Str, Params>>,
+	broker:     Broker,
+	inbox:      tokio::sync::Mutex<BrokerInbox>,
+	jobs:       Arc<JobBoard>,
+	env:        EnvClient,
+	agent_id:   Str,
+	session:    Str,
+	launches:   Mutex<BTreeMap<Str, Params>>,
+	relay_task: Option<tokio::task::JoinHandle<()>>,
+	canceller:  Option<Arc<dyn AgentCancellation>>,
 }
 
 impl ChatHubBackend {
@@ -80,7 +113,29 @@ impl ChatHubBackend {
 		env: EnvClient,
 		agent_id: Str,
 		session: Str,
+		relay_bus: Option<EventBus>,
+		canceller: Option<Arc<dyn AgentCancellation>>,
 	) -> Self {
+		let relay_task = relay_bus.map(|bus| {
+			let mut routes = broker.subscribe_routes();
+			tokio::spawn(async move {
+				loop {
+					match routes.recv().await {
+						Ok(event) if event.relay_to_main => {
+							bus.publish(AgentEvent::PeerRelay(Arc::new(PeerRelayObservation {
+								id:      event.message.id,
+								from:    event.message.from,
+								to:      event.delivery.to,
+								text:    event.message.text,
+								outcome: event.delivery.outcome,
+							})));
+						},
+						Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+						Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+					}
+				}
+			})
+		});
 		Self {
 			broker,
 			inbox: tokio::sync::Mutex::new(inbox),
@@ -89,13 +144,50 @@ impl ChatHubBackend {
 			agent_id,
 			session,
 			launches: Mutex::new(BTreeMap::new()),
+			relay_task,
+			canceller,
 		}
 	}
 
 	fn response(value: serde_json::Value) -> Result<Response, Fault> {
+		Self::response_with(value, false)
+	}
+
+	fn response_with(value: serde_json::Value, useless: bool) -> Result<Response, Fault> {
 		serde_json::to_string_pretty(&value)
-			.map(|text| Response { text: Str::from(text), useless: false })
+			.map(|text| Response { text: Str::from(text), useless })
 			.map_err(|error| fault(error.to_string()))
+	}
+
+	fn roster_json(&self) -> Vec<serde_json::Value> {
+		self
+			.broker
+			.registry()
+			.roster(false)
+			.into_iter()
+			.map(|record| {
+				let unread = self.broker.unread_count(&record.id).unwrap_or(0);
+				json!({
+					"id": record.id,
+					"name": record.name,
+					"kind": record.kind.to_string(),
+					"status": record.status.to_string(),
+					"parent": record.parent,
+					"session": record.session,
+					"depth": record.depth,
+					"activity": record.activity,
+					"lastActivityMs": record.last_activity_ms,
+					"unread": unread,
+					"definition": record.definition,
+					"model": record.model,
+					"servingModel": record.serving_model,
+					"task": record.task,
+					"terminal": record.history.terminal.map(|terminal| format!("{terminal:?}")),
+					"output": record.history.output_path.map(|path| path.display().to_string()),
+					"patch": record.history.patch_path.map(|path| path.display().to_string()),
+				})
+			})
+			.collect()
 	}
 
 	async fn process_generation(&self, name: &str) -> Result<u64, Fault> {
@@ -119,73 +211,141 @@ impl ChatHubBackend {
 		if to.eq_ignore_ascii_case(self.agent_id.as_str()) {
 			return Err(fault("cannot send a hub message to the calling agent"));
 		}
+		if params.await_reply && (to == "all" || to == "project:all" || to.starts_with("session:")) {
+			return Err(fault("awaited hub sends require one direct recipient"));
+		}
 		let id = Str::from(omp_core::Ulid::generate().to_string());
 		let message = PeerMessage {
-			id:         id.clone(),
-			from:       self.agent_id.clone(),
-			to:         to.clone(),
-			text:       params.message.clone().unwrap_or_default(),
-			mode:       DeliveryMode::Aside,
-			reply_to:   params.reply_to.clone(),
-			sent_ms:    now_ms(),
-			session_id: self.session.clone(),
+			id:            id.clone(),
+			from:          self.agent_id.clone(),
+			to:            to.clone(),
+			text:          params.message.clone().unwrap_or_default(),
+			mode:          DeliveryMode::Aside,
+			reply_to:      params.reply_to.clone(),
+			sent_ms:       now_ms(),
+			session_id:    self.session.clone(),
+			expects_reply: params.await_reply,
 		};
-		let receipts = self
+		let deliveries = self
 			.broker
-			.send(message)
+			.route(message)
 			.map_err(|error| fault(error.to_string()))?;
 		if params.await_reply {
+			if deliveries
+				.iter()
+				.all(|delivery| delivery.outcome == omp_agent::Receipt::Failed)
+			{
+				return Self::response(json!({ "deliveries": deliveries_json(&deliveries) }));
+			}
+			let recipient = deliveries
+				.first()
+				.map(|delivery| delivery.to.clone())
+				.unwrap_or(to);
 			let timeout = wait_timeout(params.timeout_ms);
 			let reply = self
 				.inbox
 				.lock()
 				.await
-				.wait_for_timeout(Some(to.as_str()), Some(id.as_str()), timeout)
+				.wait_for_timeout(Some(recipient.as_str()), Some(id.as_str()), timeout)
 				.await
 				.map_err(|error| fault(error.to_string()))?;
-			return Self::response(
-				json!({ "receipt": receipts.first().map(ToString::to_string), "reply": reply.map(message_json) }),
-			);
+			return Self::response(json!({
+				"deliveries": deliveries_json(&deliveries),
+				"reply": reply.map(message_json),
+			}));
 		}
 		Self::response(json!({
-			"id": id,
-			"receipts": receipts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+			  "id": id,
+			  "deliveries": deliveries_json(&deliveries),
 		}))
 	}
 
-	async fn wait(&self, params: &Params) -> Result<Response, Fault> {
+	async fn wait(
+		&self,
+		params: &Params,
+		updates: &flume::Sender<Response>,
+	) -> Result<Response, Fault> {
 		if params.name.is_some() {
 			return self.process_wait(params).await;
 		}
+		let timeout = match params.timeout_ms {
+			None => Some(self.jobs.next_smart_wait(&self.agent_id)),
+			Some(0) => None,
+			Some(milliseconds) => Some(StdDuration::from_millis(milliseconds)),
+		};
+		let started = now_ms();
+		let progress_jobs = Arc::clone(&self.jobs);
+		let progress_ids = params.ids.clone();
+		let progress_updates = updates.clone();
+		tokio::spawn(async move {
+			loop {
+				tokio::time::sleep(StdDuration::from_millis(500)).await;
+				let jobs = progress_jobs
+					.snapshot()
+					.into_iter()
+					.filter(|job| {
+						progress_ids
+							.as_ref()
+							.is_none_or(|ids| ids.contains(&job.id))
+					})
+					.map(job_json)
+					.collect::<Vec<_>>();
+				let Ok(response) = ChatHubBackend::response_with(
+					json!({ "waitingMs": now_ms().saturating_sub(started), "jobs": jobs }),
+					true,
+				) else {
+					return;
+				};
+				match progress_updates.try_send(response) {
+					Ok(()) | Err(flume::TrySendError::Full(_)) => {},
+					Err(flume::TrySendError::Disconnected(_)) => return,
+				}
+			}
+		});
 		let mut jobs = self.jobs.watch(params.ids.as_deref());
 		if jobs.is_empty() {
 			let message = self
 				.inbox
 				.lock()
 				.await
-				.wait_for_timeout(params.from_peer.as_deref(), None, wait_timeout(params.timeout_ms))
+				.wait_for_timeout(params.from_peer.as_deref(), None, timeout)
 				.await
 				.map_err(|error| fault(error.to_string()))?;
-			return Self::response(json!({ "message": message.map(message_json) }));
+			if params.timeout_ms.is_none() {
+				self.jobs.record_smart_wait_end(&self.agent_id);
+			}
+			let useless = message.is_none();
+			return Self::response_with(json!({ "message": message.map(message_json) }), useless);
 		}
 		let mut inbox = self.inbox.lock().await;
-		let timeout = wait_timeout(params.timeout_ms);
 		let result = async {
 			tokio::select! {
-				biased;
-				peer = inbox.wait_for_timeout(params.from_peer.as_deref(), None, timeout) => {
-					peer.map(|message| (message.map(message_json), None)).map_err(|error| fault(error.to_string()))
-				},
-				settlement = jobs.next() => Ok((None, settlement)),
+				  biased;
+				  peer = inbox.wait_for_timeout(params.from_peer.as_deref(), None, timeout) => {
+						 peer.map(|message| (message.map(message_json), None)).map_err(|error| fault(error.to_string()))
+				  },
+				  settlement = jobs.next() => Ok((None, settlement)),
 			}
 		};
 		let (peer, settlement) = if let Some(timeout) = timeout {
-			tokio::time::timeout(timeout, result)
-				.await
-				.map_err(|_| fault("hub wait timed out"))??
+			match tokio::time::timeout(timeout, result).await {
+				Ok(result) => result?,
+				Err(_) => {
+					if params.timeout_ms.is_none() {
+						self.jobs.record_smart_wait_end(&self.agent_id);
+					}
+					return Self::response_with(
+						json!({ "timeout": true, "waitedMs": now_ms().saturating_sub(started) }),
+						true,
+					);
+				},
+			}
 		} else {
 			result.await?
 		};
+		if params.timeout_ms.is_none() {
+			self.jobs.record_smart_wait_end(&self.agent_id);
+		}
 		if let Some(settlement) = settlement {
 			let id = settlement.job.id.clone();
 			let item = format!("{:?}", settlement.item);
@@ -195,25 +355,54 @@ impl ChatHubBackend {
 				.map_err(|error| fault(error.to_string()))?;
 			return Self::response(json!({ "job": id, "settled": true, "item": item }));
 		}
-		Self::response(json!({ "message": peer }))
+		Self::response_with(json!({ "message": peer }), peer.is_none())
 	}
 
 	async fn cancel_jobs(&self, params: &Params) -> Result<Response, Fault> {
 		let grace = Duration::new(5, DurationUnit::Seconds);
 		let mut outcomes = BTreeMap::new();
 		for id in params.ids.as_deref().unwrap_or_default() {
-			let outcome = self
-				.jobs
-				.cancel(id, grace)
-				.await
-				.map_err(|error| fault(error.to_string()))?;
-			outcomes.insert(id.as_str(), match outcome {
-				CancelOutcome::Missing => "missing",
-				CancelOutcome::AlreadySettled => "already_settled",
-				CancelOutcome::Accepted => "accepted",
-			});
+			let outcome = match self.jobs.cancel(id, grace).await {
+				Ok(CancelOutcome::Accepted) => json!({ "status": "accepted" }),
+				Ok(CancelOutcome::AlreadySettled) => json!({ "status": "already_settled" }),
+				Err(JobError::AgentLoopCancellation { agent_id }) => self.cancel_agent(&agent_id),
+				Err(error) => return Err(fault(error.to_string())),
+				Ok(CancelOutcome::Missing) => self.cancel_agent(id),
+			};
+			outcomes.insert(id.as_str(), outcome);
 		}
 		Self::response(json!({ "jobs": outcomes }))
+	}
+
+	fn cancel_agent(&self, id: &str) -> serde_json::Value {
+		let Some((record, _)) = self.broker.registry().record(id) else {
+			return json!({ "status": "missing" });
+		};
+		let salvage = json!({
+			"output": record.history.output_path.map(|path| path.display().to_string()),
+			"patch": record.history.patch_path.map(|path| path.display().to_string()),
+			"branch": record.history.branch,
+		});
+		match record.status {
+			omp_agent::RegistryStatus::Running | omp_agent::RegistryStatus::Idle => {
+				match self
+					.canceller
+					.as_ref()
+					.map(|canceller| canceller.cancel(&record.id))
+				{
+					Some(Ok(())) => {
+						json!({ "status": "accepted", "agent": record.id, "salvage": salvage })
+					},
+					Some(Err(error)) => {
+						json!({ "status": "failed", "agent": record.id, "error": error, "salvage": salvage })
+					},
+					None => json!({ "status": "unavailable", "agent": record.id, "salvage": salvage }),
+				}
+			},
+			omp_agent::RegistryStatus::Parked => {
+				json!({ "status": "not_running", "agent": record.id, "salvage": salvage })
+			},
+		}
 	}
 
 	async fn start(&self, params: &Params) -> Result<Response, Fault> {
@@ -299,7 +488,9 @@ impl ChatHubBackend {
 						.unwrap_or(true)
 						.then(|| PtySpec { terminal: "xterm-256color".to_owned(), ..Default::default() }),
 					restart:   Some(RestartSpec { policy: restart as i32, ..Default::default() }),
-					props:     None,
+					detached:  params.detached,
+					persist:   params.persist,
+					props:     Some(owner_process_props(&self.session, &self.agent_id)),
 				}),
 				ready,
 				props: None,
@@ -312,21 +503,76 @@ impl ChatHubBackend {
 		} else {
 			ArtifactLifetime::Session
 		};
-		self.jobs.register(JobRef {
+		let label = Str::from(format!("completion of named process {}", started.name));
+		let started_at_ms = now_ms();
+		let mut metadata = JobMetadata::running(JobKind::Shell, label.clone(), started_at_ms);
+		metadata.owner_session = Some(self.session.clone());
+		let job = JobRef {
 			id:       Str::from(format!("process:{}:{}", started.name, started.generation)),
 			owner:    JobOwner::NamedProcess {
 				name:       Str::from(started.name.clone()),
 				generation: started.generation,
 			},
-			artifact: ExpectedArtifact {
-				description: Str::from(format!("completion of named process {}", started.name)),
-				media_type: None,
-				lifetime,
-			},
-		});
+			metadata: Arc::new(metadata),
+			artifact: ExpectedArtifact { description: label, media_type: None, lifetime },
+		};
+		if let Err(error) = self.jobs.try_register(job) {
+			let _ = self
+				.env
+				.stop_process(StopProcess {
+					name:       started.name.clone(),
+					grace_ms:   250,
+					generation: started.generation,
+					props:      None,
+				})
+				.await;
+			return Err(fault(error.to_string()));
+		}
 		Self::response(
 			json!({ "name": started.name, "generation": started.generation, "ready": true }),
 		)
+	}
+
+	async fn ensure_owned_process_jobs(&self) -> Result<(), Fault> {
+		let processes = self
+			.env
+			.list_processes(ListProcesses { props: None })
+			.await
+			.map_err(|error| fault(error.to_string()))?
+			.processes;
+		let mut live = BTreeSet::new();
+		for process in processes {
+			if process_owner(process.props.as_ref())
+				!= Some((self.session.as_str(), self.agent_id.as_str()))
+			{
+				continue;
+			}
+			live.insert((Str::from(process.name.clone()), process.generation));
+			let label = Str::from(format!("completion of named process {}", process.name));
+			let mut metadata = JobMetadata::running(JobKind::Shell, label.clone(), now_ms());
+			metadata.owner_session = Some(self.session.clone());
+			let job = JobRef {
+				id:       Str::from(format!("process:{}:{}", process.name, process.generation)),
+				owner:    JobOwner::NamedProcess {
+					name:       Str::from(process.name.clone()),
+					generation: process.generation,
+				},
+				metadata: Arc::new(metadata),
+				artifact: ExpectedArtifact {
+					description: label,
+					media_type:  None,
+					lifetime:    ArtifactLifetime::Session,
+				},
+			};
+			self
+				.jobs
+				.reattach(job)
+				.map_err(|error| fault(error.to_string()))?;
+		}
+		self
+			.jobs
+			.release_missing_process_leases(&self.session, &live);
+		Ok(())
 	}
 
 	async fn process_wait(&self, params: &Params) -> Result<Response, Fault> {
@@ -341,6 +587,10 @@ impl ChatHubBackend {
 				name: name.to_owned(),
 				after_sequence: params.cursor.unwrap_or(0),
 				generation,
+				max_bytes: 64 * 1024,
+				terminal_text: false,
+				terminal_columns: 0,
+				terminal_rows: 0,
 				props: None,
 			})
 			.await
@@ -378,6 +628,10 @@ impl ChatHubBackend {
 				name: name.to_owned(),
 				after_sequence: params.cursor.unwrap_or(0),
 				generation,
+				max_bytes: 2 * 1024 * 1024,
+				terminal_text: false,
+				terminal_columns: 0,
+				terminal_rows: 0,
 				props: None,
 			})
 			.await
@@ -466,24 +720,52 @@ impl ChatHubBackend {
 	}
 }
 
+impl Drop for ChatHubBackend {
+	fn drop(&mut self) {
+		if let Some(task) = self.relay_task.take() {
+			task.abort();
+		}
+	}
+}
+
 impl HubBackend for ChatHubBackend {
 	async fn execute<'a>(
 		&'a self,
 		_caller_id: &'a str,
 		request: Request,
+		updates: &'a flume::Sender<Response>,
 	) -> Result<Response, Fault> {
 		let params = request.params;
+		if matches!(
+			params.op,
+			Op::Jobs
+				| Op::Wait
+				| Op::Cancel
+				| Op::Ps | Op::Logs
+				| Op::Stop
+				| Op::Restart
+				| Op::Describe
+		) || (params.op == Op::Send && params.name.is_some())
+		{
+			self.ensure_owned_process_jobs().await?;
+		}
 		match params.op {
 			Op::Send if params.to.is_some() => self.peer_send(&params).await,
 			Op::Send => self.process_send(&params).await,
-			Op::Wait => self.wait(&params).await,
+			Op::Wait => self.wait(&params, updates).await,
 			Op::Inbox => Self::response(
 				json!({ "messages": self.inbox.lock().await.inbox(params.peek).into_iter().map(message_json).collect::<Vec<_>>() }),
 			),
-			Op::List => Self::response(json!({ "peers": self.broker.peers(None) })),
-			Op::Jobs => Self::response(
-				json!({ "jobs": self.jobs.snapshot().into_iter().map(|job| job.id).collect::<Vec<_>>() }),
-			),
+			Op::List => Self::response(json!({ "peers": self.roster_json() })),
+			Op::Jobs => Self::response(json!({
+				"jobs": self.jobs.snapshot().into_iter().map(job_json).collect::<Vec<_>>(),
+				"agents": self.roster_json().into_iter().filter(|agent| {
+					matches!(
+						agent.get("status").and_then(serde_json::Value::as_str),
+						Some("running" | "idle")
+					)
+				}).collect::<Vec<_>>(),
+			})),
 			Op::Cancel => self.cancel_jobs(&params).await,
 			Op::Start => self.start(&params).await,
 			Op::Ps => {
@@ -492,9 +774,9 @@ impl HubBackend for ChatHubBackend {
 					.list_processes(ListProcesses { props: None })
 					.await
 					.map_err(|error| fault(error.to_string()))?;
-				Self::response(
-					json!({ "processes": list.processes.into_iter().map(|process| json!({ "name": process.name, "generation": process.generation, "state": process.state })).collect::<Vec<_>>() }),
-				)
+				Self::response(json!({
+					"processes": list.processes.into_iter().map(process_json).collect::<Vec<_>>()
+				}))
 			},
 			Op::Logs => self.logs(&params).await,
 			Op::Stop => {
@@ -555,9 +837,11 @@ impl HubBackend for ChatHubBackend {
 					.processes
 					.into_iter()
 					.find(|process| process.name == name);
-				Self::response(
-					json!({ "name": name, "generation": process.as_ref().map(|process| process.generation), "state": process.as_ref().map(|process| process.state), "retained": launch.is_some() }),
-				)
+				Self::response(json!({
+					"name": name,
+					"process": process.map(process_json),
+					"retained": launch.is_some(),
+				}))
 			},
 		}
 	}
@@ -570,8 +854,111 @@ const fn wait_timeout(timeout_ms: Option<u64>) -> Option<StdDuration> {
 	}
 }
 
+fn process_json(process: omp_proto::env::v1::ProcessInfo) -> serde_json::Value {
+	let pid = process.identity.as_ref().map(|identity| identity.pid);
+	let started_at_ms = process
+		.identity
+		.as_ref()
+		.map(|identity| identity.started_at_ms);
+	let uptime_ms = started_at_ms.map(|started| now_ms().saturating_sub(started));
+	json!({
+		"name": process.name,
+		"generation": process.generation,
+		"state": omp_proto::env::v1::ProcessState::try_from(process.state)
+			.map_or_else(|_| format!("state_{}", process.state), |state| format!("{state:?}").to_lowercase()),
+		"pid": pid,
+		"startedAtMs": started_at_ms,
+		"uptimeMs": uptime_ms,
+		"status": process.status.map(|status| json!({
+			"outcome": omp_proto::env::v1::ExecOutcome::try_from(status.outcome)
+				.map_or_else(|_| format!("outcome_{}", status.outcome), |outcome| format!("{outcome:?}").to_lowercase()),
+			"exitCode": status.exit_code,
+			"signal": status.signal,
+			"wallClockMs": status.wall_clock_ms,
+		})),
+		"logStart": process.log_start_offset,
+		"logEnd": process.log_end_offset,
+		"restartCount": process.restart_count,
+		"consecutiveFailures": process.consecutive_failures,
+	})
+}
+
+fn owner_process_props(session: &str, agent: &str) -> ValueMap {
+	ValueMap {
+		fields: BTreeMap::from([
+			(String::from("omp/owner-session"), Value {
+				kind: Some(value::Kind::String(session.to_owned())),
+			}),
+			(String::from("omp/owner-agent"), Value {
+				kind: Some(value::Kind::String(agent.to_owned())),
+			}),
+		]),
+	}
+}
+
+fn process_owner(props: Option<&ValueMap>) -> Option<(&str, &str)> {
+	let props = props?;
+	let string = |key| {
+		props
+			.fields
+			.get(key)?
+			.kind
+			.as_ref()
+			.and_then(|kind| match kind {
+				value::Kind::String(value) => Some(value.as_str()),
+				_ => None,
+			})
+	};
+	Some((string("omp/owner-session")?, string("omp/owner-agent")?))
+}
+
+fn job_json(job: JobRef) -> serde_json::Value {
+	let now = now_ms();
+	let owner = match &job.owner {
+		JobOwner::NamedProcess { name, generation } => {
+			json!({ "kind": "named_process", "name": name, "generation": generation })
+		},
+		JobOwner::AgentLoop { agent_id } => json!({ "kind": "agent_loop", "agent": agent_id }),
+	};
+	json!({
+		"id": job.id,
+		"kind": job.metadata.kind.to_string(),
+		"status": job.metadata.status.to_string(),
+		"label": job.metadata.label,
+		"owner": owner,
+		"createdAtMs": job.metadata.created_at_ms,
+		"startedAtMs": job.metadata.started_at_ms,
+		"settledAtMs": job.metadata.settled_at_ms,
+		"ownerSession": job.metadata.owner_session,
+		"model": job.metadata.model,
+		"result": job.metadata.result,
+		"error": job.metadata.error,
+		"durationMs": job.metadata.started_at_ms.map(|started| {
+			job.metadata.settled_at_ms.unwrap_or(now).saturating_sub(started)
+		}),
+		"artifact": {
+			"description": job.artifact.description,
+			"mediaType": job.artifact.media_type,
+			"lifetime": job.artifact.lifetime.to_string(),
+		},
+	})
+}
+
 fn message_json(message: PeerMessage) -> serde_json::Value {
 	json!({ "id": message.id, "from": message.from, "to": message.to, "message": message.text, "replyTo": message.reply_to, "sentMs": message.sent_ms })
+}
+
+fn deliveries_json(deliveries: &[omp_agent::DeliveryReceipt]) -> Vec<serde_json::Value> {
+	deliveries
+		.iter()
+		.map(|delivery| {
+			json!({
+				"to": delivery.to,
+				"outcome": delivery.outcome.to_string(),
+				"history": delivery.history_uri,
+			})
+		})
+		.collect()
 }
 
 fn command_text(application: &str, args: &[Str]) -> String {

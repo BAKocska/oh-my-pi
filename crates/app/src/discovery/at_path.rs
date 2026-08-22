@@ -6,6 +6,9 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+const LEADING_PUNCTUATION: &[char] = &['`', '"', '\'', '(', '[', '{', '<'];
+const TRAILING_PUNCTUATION: &[char] =
+	&[')', ']', '}', '>', '.', ',', ';', ':', '!', '?', '"', '\'', '`'];
 /// Maximum number of nested `@path` edges; the root is depth zero.
 pub const MAX_AT_PATH_DEPTH: usize = 5;
 
@@ -13,6 +16,67 @@ pub const MAX_AT_PATH_DEPTH: usize = 5;
 pub fn expand_at_paths(path: &Path) -> io::Result<String> {
 	let mut visited = BTreeSet::new();
 	expand(path, 0, &mut visited)
+}
+/// Extracts unique `@path`, `@'path'`, and `@"path"` mentions in first-seen
+/// order.
+///
+/// Mentions require a prose boundary, so email addresses and Git remotes do not
+/// become filesystem reads. Unquoted surrounding punctuation is stripped.
+#[must_use]
+pub fn extract_path_mentions(text: &str) -> Vec<String> {
+	let mut mentions = Vec::new();
+	let mut cursor = 0;
+	while cursor < text.len() {
+		let Some(relative) = text[cursor..].find('@') else {
+			break;
+		};
+		let at = cursor + relative;
+		let Some((raw, end, quoted)) = mention_token(text, at) else {
+			cursor = at + 1;
+			continue;
+		};
+		let cleaned = if quoted {
+			raw.trim()
+		} else {
+			raw.trim()
+				.trim_start_matches(LEADING_PUNCTUATION)
+				.trim_end_matches(TRAILING_PUNCTUATION)
+				.trim()
+		};
+		if !cleaned.is_empty()
+			&& !cleaned.contains('@')
+			&& !cleaned.contains("://")
+			&& !mentions.iter().any(|existing| existing == cleaned)
+		{
+			mentions.push(cleaned.to_owned());
+		}
+		cursor = end.max(at + 1);
+	}
+	mentions
+}
+
+fn mention_token(text: &str, at: usize) -> Option<(&str, usize, bool)> {
+	if text.as_bytes().get(at) != Some(&b'@') || !is_mention_boundary(text, at) {
+		return None;
+	}
+	let start = at + 1;
+	let first = text[start..].chars().next()?;
+	if matches!(first, '\'' | '"') {
+		let content_start = start + first.len_utf8();
+		let relative_end = text[content_start..].find(first)?;
+		let content_end = content_start + relative_end;
+		return Some((&text[content_start..content_end], content_end + first.len_utf8(), true));
+	}
+	let end = text[start..]
+		.find(|character: char| character.is_whitespace() || character == '@')
+		.map_or(text.len(), |offset| start + offset);
+	Some((&text[start..end], end, false))
+}
+
+fn is_mention_boundary(text: &str, at: usize) -> bool {
+	text[..at].chars().next_back().is_none_or(|previous| {
+		previous.is_whitespace() || matches!(previous, '(' | '[' | '{' | '<' | '"' | '\'' | '`')
+	})
 }
 
 fn expand(path: &Path, depth: usize, visited: &mut BTreeSet<PathBuf>) -> io::Result<String> {
@@ -112,10 +176,7 @@ fn expand_line(
 }
 
 fn is_address_prefix(line: &str, at: usize) -> bool {
-	let Some(previous) = line[..at].chars().next_back() else {
-		return false;
-	};
-	previous.is_ascii_alphanumeric() || matches!(previous, '.' | '-' | '_')
+	!is_mention_boundary(line, at)
 }
 
 fn resolve_path(base: &Path, token: &str) -> io::Result<PathBuf> {
@@ -156,6 +217,24 @@ mod tests {
 			"child. user@example.test git@github.com:a/b `@child.md`\n```\n@child.md\n```\n"
 		);
 	}
+
+	#[test]
+	fn extracts_quoted_paths_and_strips_balanced_punctuation() {
+		assert_eq!(
+			extract_path_mentions(
+				r#"Read @src/main.rs, @"docs/design notes.md" and (@'other notes.txt'). Ignore me@example.test and git@github.com:a/b."#,
+			),
+			["src/main.rs", "docs/design notes.md", "other notes.txt"]
+		);
+	}
+
+	#[test]
+	fn mention_extraction_preserves_first_seen_order_and_deduplicates() {
+		assert_eq!(extract_path_mentions("@b.rs @a.rs @b.rs https://example/@not-a-path"), [
+			"b.rs", "a.rs"
+		]);
+	}
+
 	#[test]
 	fn cycle_and_depth_are_bounded() {
 		let tree = tempfile::tempdir().expect("tree");

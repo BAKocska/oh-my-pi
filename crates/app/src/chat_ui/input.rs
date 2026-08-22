@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use omp_agent::Budget;
 use omp_core::{Str, sf};
@@ -148,8 +148,15 @@ pub const COMMANDS: &[CommandSpec] = &[
 	CommandSpec {
 		name:        "model",
 		aliases:     &["models"],
-		description: "Change the selected model",
+		description: "Change the durable default model",
 		usage:       "[model]",
+		subcommands: &[],
+	},
+	CommandSpec {
+		name:        "switch",
+		aliases:     &[],
+		description: "Temporarily change this session's model",
+		usage:       "<model>",
 		subcommands: &[],
 	},
 	CommandSpec {
@@ -170,6 +177,13 @@ pub const COMMANDS: &[CommandSpec] = &[
 		name:        "clear",
 		aliases:     &[],
 		description: "Clear conversation context in place",
+		usage:       "",
+		subcommands: &[],
+	},
+	CommandSpec {
+		name:        "fresh",
+		aliases:     &[],
+		description: "Reset provider account affinity for the next turn",
 		usage:       "",
 		subcommands: &[],
 	},
@@ -460,14 +474,20 @@ pub enum ChatCommand {
 	Help,
 	/// Start provider authentication.
 	Login(Option<Str>),
-	/// Update the session model.
+	/// Update the durable model preference.
 	Model(Str),
+	/// Apply a journaled session-only model override.
+	Switch(Str),
 	/// Open the catalog model picker.
 	ModelPicker,
 	/// Open the durable-session picker.
 	Resume,
 	/// Start a new durable session.
 	NewSession,
+	/// Append a same-journal context reset.
+	Clear,
+	/// Append a provider-account reset hint without changing journal identity.
+	Fresh,
 	/// List active background jobs.
 	Jobs,
 	/// Open settings.
@@ -486,6 +506,15 @@ pub enum ChatCommand {
 	Vibe(Str),
 	/// Control prewalk mode with raw subcommand arguments.
 	Prewalk(Str),
+	/// Invoke one frozen session skill with surrounding user prose as arguments.
+	Skill {
+		/// Stable skill name.
+		name:   Str,
+		/// User prose outside the invocation token.
+		args:   Str,
+		/// Optional per-turn budget parsed from surrounding prose.
+		budget: Option<ParsedTurnBudget>,
+	},
 	/// A recognized command whose backend is not available yet.
 	Unavailable { command: Str, reason: Str },
 	/// Exit cleanly.
@@ -545,6 +574,11 @@ pub fn parse_slash(text: &str) -> Option<ParsedSlash<'_>> {
 pub enum InputError {
 	/// A quoted argument was not terminated.
 	UnterminatedQuote,
+	/// A built-in command requires a non-empty argument.
+	MissingArgument {
+		/// Command missing its required argument.
+		command: Str,
+	},
 	/// A `+Nk` budget prefix used zero, overflowed, or was malformed.
 	InvalidBudget,
 }
@@ -553,7 +587,10 @@ impl std::fmt::Display for InputError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::UnterminatedQuote => f.write_str("unterminated quoted command argument"),
-			Self::InvalidBudget => f.write_str("turn budget must use +Nk or +Nk! with N > 0"),
+			Self::MissingArgument { command } => write!(f, "/{command} requires an argument"),
+			Self::InvalidBudget => {
+				f.write_str("turn budget must use a positive +N, +Nk, or +Nm directive")
+			},
 		}
 	}
 }
@@ -575,20 +612,23 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		text:   Str::from(text),
 		budget: budget.clone(),
 	};
-	let Some(parsed) = parse_slash(text) else {
-		return Ok(submit(text));
+	if let Some(skill) = crate::skills::parse_invocation(&text) {
+		return Ok(ChatCommand::Skill { name: skill.name, args: skill.args, budget });
+	}
+	let Some(parsed) = parse_slash(&text) else {
+		return Ok(submit(&text));
 	};
 	let Some(available) = available.iter().find(|command| {
 		command.name == parsed.name || command.aliases.iter().any(|alias| alias == parsed.name)
 	}) else {
-		return Ok(submit(text));
+		return Ok(submit(&text));
 	};
 	if !available.builtin {
 		let Some(template) = &available.template else {
-			return Ok(submit(text));
+			return Ok(submit(&text));
 		};
 		let args = tokenize_args(parsed.args)?;
-		let expanded = expand_arguments(template, &args);
+		let expanded = expand_arguments_with_fallback(template, &args, parsed.args);
 		return Ok(ChatCommand::Submit {
 			item: Box::new(user_message(&expanded)),
 			text: Str::from(expanded),
@@ -604,8 +644,12 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		"login" => ChatCommand::Login((!parsed.args.is_empty()).then(|| Str::from(parsed.args))),
 		"model" if parsed.args.is_empty() => ChatCommand::ModelPicker,
 		"model" => ChatCommand::Model(Str::from(parsed.args)),
+		"switch" if !parsed.args.is_empty() => ChatCommand::Switch(Str::from(parsed.args)),
+		"switch" => return Err(InputError::MissingArgument { command: sf!("switch") }),
 		"resume" => ChatCommand::Resume,
 		"new" => ChatCommand::NewSession,
+		"clear" => ChatCommand::Clear,
+		"fresh" => ChatCommand::Fresh,
 		"jobs" => ChatCommand::Jobs,
 		"settings" => ChatCommand::Settings,
 		"agents" => ChatCommand::Agents,
@@ -616,7 +660,6 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		"vibe" => ChatCommand::Vibe(Str::from(parsed.args)),
 		"prewalk" => ChatCommand::Prewalk(Str::from(parsed.args)),
 		"quit" => ChatCommand::Quit,
-		"clear" => unavailable("clear", "the agent backend does not expose in-place context reset"),
 		"compact" => unavailable("compact", "manual compaction is not exposed by the agent backend"),
 		"todo" => unavailable("todo", "interactive todo storage is not attached to this session"),
 		_ => unreachable!("every builtin has a dispatch arm"),
@@ -624,42 +667,77 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 	Ok(command)
 }
 
-/// Splits an optional leading `+Nk` / `+Nk!` directive from prompt text.
-pub fn parse_budget_prefix(text: &str) -> Result<(&str, Option<ParsedTurnBudget>), InputError> {
-	let trimmed = text.trim_start();
-	let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-	let token = &trimmed[..end];
-	if !token
-		.as_bytes()
-		.get(1)
-		.is_some_and(|byte| byte.is_ascii_digit())
-	{
-		return Ok((text, None));
+/// Finds and removes one standalone `+N`, `+Nk`, or `+Nm` (`!`) directive.
+///
+/// The directive may occur anywhere at whitespace token boundaries. Fractional
+/// values are rounded after applying the suffix multiplier; all surrounding
+/// prose is retained.
+pub fn parse_budget_prefix(
+	text: &str,
+) -> Result<(Cow<'_, str>, Option<ParsedTurnBudget>), InputError> {
+	let mut start = 0;
+	for token in text.split_inclusive(char::is_whitespace) {
+		let bare = token.trim_end_matches(char::is_whitespace);
+		if let Some((tokens, hard)) = parse_budget_token(bare)? {
+			let end = start + bare.len();
+			let mut prompt = String::with_capacity(text.len().saturating_sub(bare.len()));
+			prompt.push_str(&text[..start]);
+			let suffix = &text[end..];
+			if prompt.ends_with(char::is_whitespace) && suffix.starts_with(char::is_whitespace) {
+				prompt.push_str(suffix.trim_start_matches(char::is_whitespace));
+			} else {
+				prompt.push_str(suffix);
+			}
+			let prompt = prompt.trim().to_owned();
+			return Ok((
+				Cow::Owned(prompt),
+				Some(ParsedTurnBudget {
+					agent: Budget { max_output_tokens: Some(tokens), ..Budget::default() },
+					task: TaskBudget {
+						total_tokens:     tokens,
+						remaining_tokens: hard.then_some(tokens),
+					},
+					hard,
+				}),
+			));
+		}
+		start += token.len();
 	}
-	let (body, hard) = token
-		.strip_suffix("k!")
-		.map(|body| (body, true))
-		.or_else(|| token.strip_suffix('k').map(|body| (body, false)))
-		.ok_or(InputError::InvalidBudget)?;
-	let thousands = body
-		.strip_prefix('+')
-		.filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
-		.ok_or(InputError::InvalidBudget)?
-		.parse::<u64>()
+	Ok((Cow::Borrowed(text), None))
+}
+
+fn parse_budget_token(token: &str) -> Result<Option<(u64, bool)>, InputError> {
+	let Some(body) = token.strip_prefix('+') else {
+		return Ok(None);
+	};
+	let (body, hard) = body
+		.strip_suffix('!')
+		.map_or((body, false), |body| (body, true));
+	let (number, multiplier) = match body.as_bytes().last().copied() {
+		Some(b'k' | b'K') => (&body[..body.len() - 1], 1_000_f64),
+		Some(b'm' | b'M') => (&body[..body.len() - 1], 1_000_000_f64),
+		_ => (body, 1_f64),
+	};
+	if number.is_empty()
+		|| number.bytes().filter(|byte| *byte == b'.').count() > 1
+		|| !number
+			.bytes()
+			.all(|byte| byte.is_ascii_digit() || byte == b'.')
+	{
+		return Ok(None);
+	}
+	let value = number
+		.parse::<f64>()
 		.map_err(|_| InputError::InvalidBudget)?;
-	let tokens = thousands
-		.checked_mul(1_000)
-		.filter(|tokens| *tokens > 0)
-		.ok_or(InputError::InvalidBudget)?;
-	let remainder = trimmed[end..].trim_start();
-	Ok((
-		remainder,
-		Some(ParsedTurnBudget {
-			agent: Budget { max_output_tokens: Some(tokens), ..Budget::default() },
-			task: TaskBudget { total_tokens: tokens, remaining_tokens: hard.then_some(tokens) },
-			hard,
-		}),
-	))
+	let scaled = value * multiplier;
+	if !scaled.is_finite() || scaled <= 0.0 || scaled > u64::MAX as f64 {
+		return Err(InputError::InvalidBudget);
+	}
+	let tokens = scaled.round() as u64;
+	if tokens == 0 {
+		return Err(InputError::InvalidBudget);
+	}
+	Ok(Some((tokens, hard)))
 }
 
 const fn unavailable(command: &'static str, reason: &'static str) -> ChatCommand {
@@ -713,13 +791,25 @@ pub fn tokenize_args(raw: &str) -> Result<Vec<Str>, InputError> {
 	Ok(args)
 }
 
-/// Expands `$1`, `$2`, `$@`, and `$ARGUMENTS` once. Values are never scanned
-/// again, preventing recursive substitution.
+/// Expands `$1`, `$2`, `$@`, `$@[start:length]`, and `$ARGUMENTS` once.
+///
+/// Positional substitutions use tokenized arguments while aggregate forms
+/// preserve their canonical joined spelling.
+/// Slice starts are one-based. An omitted length (including a trailing colon)
+/// selects through the final argument. Non-positive and out-of-range slices
+/// expand to empty text. Values are never scanned again, preventing recursive
+/// substitution.
 pub fn expand_arguments(template: &str, args: &[Str]) -> String {
+	let joined = args.iter().map(Str::as_str).collect::<Vec<_>>().join(" ");
+	expand_arguments_with_fallback(template, args, &joined)
+}
+
+fn expand_arguments_with_fallback(template: &str, args: &[Str], fallback: &str) -> String {
 	let joined = args.iter().map(Str::as_str).collect::<Vec<_>>().join(" ");
 	let mut expanded = String::with_capacity(template.len().saturating_add(joined.len()));
 	let bytes = template.as_bytes();
 	let mut at = 0;
+	let mut substituted = false;
 	while at < bytes.len() {
 		if bytes[at] != b'$' {
 			let ch = template[at..]
@@ -731,11 +821,31 @@ pub fn expand_arguments(template: &str, args: &[Str]) -> String {
 			continue;
 		}
 		if template[at..].starts_with("$ARGUMENTS") {
+			substituted = true;
 			expanded.push_str(&joined);
 			at += "$ARGUMENTS".len();
 			continue;
 		}
+		if let Some((end, start, length)) = argument_slice(&template[at..]) {
+			substituted = true;
+			if start > 0 {
+				let start = start - 1;
+				if start < args.len() {
+					let end =
+						length.map_or(args.len(), |length| start.saturating_add(length).min(args.len()));
+					for (index, value) in args[start..end].iter().enumerate() {
+						if index > 0 {
+							expanded.push(' ');
+						}
+						expanded.push_str(value);
+					}
+				}
+			}
+			at += end;
+			continue;
+		}
 		if template[at..].starts_with("$@") {
+			substituted = true;
 			expanded.push_str(&joined);
 			at += 2;
 			continue;
@@ -745,6 +855,7 @@ pub fn expand_arguments(template: &str, args: &[Str]) -> String {
 			end += 1;
 		}
 		if end > at + 1 {
+			substituted = true;
 			let index = template[at + 1..end].parse::<usize>().unwrap_or(0);
 			if index > 0
 				&& let Some(value) = args.get(index - 1)
@@ -757,7 +868,28 @@ pub fn expand_arguments(template: &str, args: &[Str]) -> String {
 		expanded.push('$');
 		at += 1;
 	}
+	if !substituted && !fallback.is_empty() {
+		if !expanded.is_empty() && !expanded.ends_with(char::is_whitespace) {
+			expanded.push(' ');
+		}
+		expanded.push_str(fallback);
+	}
 	expanded
+}
+
+fn argument_slice(template: &str) -> Option<(usize, usize, Option<usize>)> {
+	let body = template.strip_prefix("$@[")?;
+	let close = body.find(']')?;
+	let selector = &body[..close];
+	let (start, length) = match selector.split_once(':') {
+		Some((start, "")) => (start, None),
+		Some((start, length)) => (start, Some(length.parse().ok()?)),
+		None => (selector, None),
+	};
+	if start.is_empty() || !start.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	Some((3 + close + 1, start.parse().ok()?, length))
 }
 
 /// Builds the canonical user-message item used by submissions and steering.
@@ -816,6 +948,10 @@ mod tests {
 		assert_eq!(commands.parse_input("/live"), Ok(ChatCommand::Live));
 		assert_eq!(parse_slash("/model: smol"), Some(ParsedSlash { name: "model", args: "smol" }));
 		assert_eq!(commands.parse_input("/model:smol"), Ok(ChatCommand::Model(sf!("smol"))));
+		assert_eq!(
+			commands.parse_input("/switch anthropic/opus"),
+			Ok(ChatCommand::Switch(sf!("anthropic/opus")))
+		);
 		assert_eq!(commands.parse_input("/q"), Ok(ChatCommand::Quit));
 		assert_eq!(submit_text(commands.parse_input("/unknown arg").unwrap()), "/unknown arg");
 		assert_eq!(
@@ -903,10 +1039,28 @@ mod tests {
 		let hard = hard.unwrap();
 		assert_eq!(hard.task.remaining_tokens, Some(2_000));
 		assert!(hard.hard);
-		for invalid in ["+0k no", "+2x no", "+2k!"] {
+		for invalid in ["+0k no", "+2k!"] {
 			assert_eq!(commands.parse_input(invalid), Err(InputError::InvalidBudget));
 		}
+		assert_eq!(submit_text(commands.parse_input("+2x no").unwrap()), "+2x no");
 		assert_eq!(submit_text(commands.parse_input("+context please").unwrap()), "+context please");
+
+		let ChatCommand::Submit { text, budget: Some(fractional), .. } =
+			commands.parse_input("please +1.5k investigate").unwrap()
+		else {
+			panic!("fractional non-leading budget")
+		};
+		assert_eq!(text, "please investigate");
+		assert_eq!(fractional.task.total_tokens, 1_500);
+
+		let ChatCommand::Submit { text, budget: Some(millions), .. } =
+			commands.parse_input("ship this +0.25m! safely").unwrap()
+		else {
+			panic!("million hard budget")
+		};
+		assert_eq!(text, "ship this safely");
+		assert_eq!(millions.task.total_tokens, 250_000);
+		assert_eq!(millions.task.remaining_tokens, Some(250_000));
 	}
 
 	#[test]
@@ -919,6 +1073,18 @@ mod tests {
 			 five $1 fifth=$1"
 		);
 		assert_eq!(tokenize_args("'open"), Err(InputError::UnterminatedQuote));
+	}
+	#[test]
+	fn all_argument_slices_use_pi_one_based_bounds() {
+		let args = [sf!("a"), sf!("b"), sf!("c"), sf!("d")];
+		assert_eq!(expand_arguments("$@[2]", &args), "b c d");
+		assert_eq!(expand_arguments("$@[2:2]", &args), "b c");
+		assert_eq!(expand_arguments("$@[3:]", &args), "c d");
+		assert_eq!(expand_arguments("$@[5:] $@[0:] $@[2:0]", &args), "  ");
+		assert_eq!(
+			expand_arguments("$@[2] literal=$@[x] recursive=$1", &[sf!("$@"), sf!("b")]),
+			"b literal=$@ b[x] recursive=$@"
+		);
 	}
 
 	#[test]

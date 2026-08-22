@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use omp_app::{
 	envd::{
-		server::EnvServer,
+		EnvServer,
 		worker::{ExtHostConfig, ExtHostSpec, HostKey, WORKER_ARG},
 	},
 	exthost::{

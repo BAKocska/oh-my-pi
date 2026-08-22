@@ -2,14 +2,18 @@
 
 mod bridge;
 mod process;
+pub mod spawn;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use bridge::NoopBridgeProgress;
 #[cfg(test)]
 pub use bridge::{
 	BridgeCapabilities, BridgeDispatcher, BridgeHost, install_python_bridge, install_python_prelude,
 };
-pub use bridge::{BridgeHostError, EvalSessionConfig, ParentSessionHost, SessionBridgeHost};
+pub use bridge::{
+	BridgeHostError, BridgeProgressSink, EvalSessionConfig, ParentSessionHost, SessionBridgeHost,
+};
 pub use process::{EVAL_CHILD_ARG, ProcessEvalExec, run_eval_child_entry};
 
 /// Python helpers installed once in every persistent eval namespace.

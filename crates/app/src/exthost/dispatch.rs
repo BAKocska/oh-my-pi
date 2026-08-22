@@ -6,12 +6,20 @@ use std::{
 	time::Instant,
 };
 
+use omp_agent::JournalCustomEntry;
 use omp_core::{CowBytes, SparseMap, Str};
-use omp_proto::toolhost::v1::{WorkerFrame, lifecycle_worker_envelope, worker_frame};
+use omp_proto::toolhost::v1::{
+	Dispatch as HookDispatch, HookEventId, HookHostEnvelope, LifecycleEventContext,
+	TtsrTriggeredEventV1, WorkerFrame, hook_host_envelope, lifecycle_worker_envelope,
+	ui_worker_envelope, worker_frame,
+};
 use parking_lot::Mutex;
+use prost::Message;
 use thiserror::Error;
 
-use super::lifecycle::{AvailabilityBatch, AvailabilitySink};
+use super::lifecycle::{
+	AvailabilityBatch, AvailabilitySink, HeadlessLifecycleSink, HeadlessSinkError,
+};
 use crate::envd::worker::HostKey;
 
 /// Per-declaration callback overlap policy.
@@ -43,6 +51,142 @@ impl CallbackConcurrency {
 pub struct EventDeadline {
 	/// Monotonic expiration instant.
 	pub at: Instant,
+}
+
+/// Maximum encoded payload for an observational extension lifecycle event.
+pub const MAX_LIFECYCLE_EVENT_BYTES: usize = 8 * 1024;
+
+/// One revisioned observational lifecycle fact ready for hook dispatch.
+#[derive(Clone, Debug)]
+pub struct LifecycleEvent {
+	/// Closed protocol event identifier.
+	pub id:       HookEventId,
+	/// Payload schema revision.
+	pub revision: u32,
+	/// Already encoded revision-specific payload.
+	pub payload:  CowBytes<'static>,
+}
+
+/// Invalid revisioned lifecycle event payload.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum LifecycleEventError {
+	/// The event is not one of the sanctioned observational lifecycle facts.
+	#[error("hook event is not a sanctioned lifecycle observation")]
+	Unsupported,
+	/// Only revision 1 is currently admitted.
+	#[error("unsupported lifecycle event revision {0}")]
+	Revision(u32),
+	/// Encoded payload exceeded the extension event ceiling.
+	#[error("lifecycle event payload exceeds {MAX_LIFECYCLE_EVENT_BYTES} bytes")]
+	PayloadTooLarge,
+}
+
+impl LifecycleEvent {
+	/// Validates an authoritative event and encodes its hook envelope. The
+	/// resulting bytes still travel through the ordinary dispatch router,
+	/// deadline, quota, cancellation, and failure-policy path.
+	pub fn encode(
+		self,
+		dispatch_id: u64,
+		deadline_ms: u64,
+	) -> Result<CowBytes<'static>, LifecycleEventError> {
+		if !matches!(
+			self.id,
+			HookEventId::HookEventTtsrTriggered
+				| HookEventId::HookEventTodoReminder
+				| HookEventId::HookEventRetryStart
+				| HookEventId::HookEventRetryEnd
+				| HookEventId::HookEventFallbackApplied
+				| HookEventId::HookEventFallbackSucceeded
+		) {
+			return Err(LifecycleEventError::Unsupported);
+		}
+		if self.revision != 1 {
+			return Err(LifecycleEventError::Revision(self.revision));
+		}
+		if self.payload.len() > MAX_LIFECYCLE_EVENT_BYTES {
+			return Err(LifecycleEventError::PayloadTooLarge);
+		}
+		let envelope = HookHostEnvelope {
+			body:  Some(hook_host_envelope::Body::Dispatch(HookDispatch {
+				event_id: self.id as i32,
+				event_rev: self.revision,
+				dispatch_id,
+				phase: omp_proto::toolhost::v1::HookPhase::Observe as i32,
+				payload: self.payload.clone().into_bytes(),
+				deadline_ms,
+				subscription_ids: Vec::new(),
+				props: None,
+			})),
+			props: None,
+		};
+		Ok(CowBytes::from(envelope.encode_to_vec()))
+	}
+}
+
+const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
+const MAX_EVENT_ID_BYTES: usize = 128;
+const MAX_EVENT_TEXT_BYTES: usize = 4096;
+
+/// Projection failure for one durable authoritative lifecycle journal fact.
+#[derive(Debug, Error)]
+pub enum JournalLifecycleEventError {
+	/// The core-authored TTSR payload is absent.
+	#[error("TTSR journal entry has no data payload")]
+	MissingPayload,
+	/// The core-authored TTSR payload did not match its fixed revision.
+	#[error("TTSR journal entry payload is malformed")]
+	InvalidPayload(#[source] serde_json::Error),
+	/// A required provenance identifier exceeded the event protocol bound.
+	#[error("TTSR lifecycle event provenance exceeds protocol bounds")]
+	ProvenanceTooLarge,
+}
+
+#[derive(serde::Deserialize)]
+struct TtsrInjection<'a> {
+	turn_id: &'a str,
+	rules:   Vec<&'a str>,
+	content: &'a str,
+}
+
+/// Projects the authoritative durable TTSR custom entry into the revisioned
+/// extension event. Raw streamed deltas are deliberately not accepted by this
+/// seam; the physical journal index supplies the exactly-once sequence.
+pub fn ttsr_event_from_journal(
+	session_id: &str,
+	entry: &JournalCustomEntry,
+) -> Result<Option<LifecycleEvent>, JournalLifecycleEventError> {
+	if entry.entry.kind() != TTSR_INJECTION_KIND {
+		return Ok(None);
+	}
+	let raw = entry
+		.entry
+		.data()
+		.ok_or(JournalLifecycleEventError::MissingPayload)?;
+	let payload: TtsrInjection<'_> =
+		serde_json::from_str(raw.get()).map_err(JournalLifecycleEventError::InvalidPayload)?;
+	if session_id.len() > MAX_EVENT_ID_BYTES || payload.turn_id.len() > MAX_EVENT_ID_BYTES {
+		return Err(JournalLifecycleEventError::ProvenanceTooLarge);
+	}
+	let mut rules = payload.rules.join(",");
+	rules.truncate(rules.floor_char_boundary(MAX_EVENT_TEXT_BYTES));
+	let mut matched = payload.content.to_owned();
+	matched.truncate(matched.floor_char_boundary(MAX_EVENT_TEXT_BYTES));
+	let event = TtsrTriggeredEventV1 {
+		context: Some(LifecycleEventContext {
+			session_id: session_id.to_owned(),
+			turn_id:    payload.turn_id.to_owned(),
+			sequence:   entry.index,
+		}),
+		rule: rules,
+		matched,
+		interrupted: true,
+	};
+	Ok(Some(LifecycleEvent {
+		id:       HookEventId::HookEventTtsrTriggered,
+		revision: 1,
+		payload:  CowBytes::from(event.encode_to_vec()),
+	}))
 }
 
 /// Invocation bytes awaiting host dispatch.
@@ -83,6 +227,17 @@ struct Pending {
 struct ExtensionActor {
 	running: usize,
 	queued:  VecDeque<DispatchRequest>,
+}
+
+/// Failure while projecting a verified worker frame into a headless sink.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum HeadlessDispatchError {
+	/// Worker dispatch generation or correlation was stale.
+	#[error(transparent)]
+	Dispatch(#[from] DispatchError),
+	/// The owning headless lifecycle sink rejected the frame.
+	#[error(transparent)]
+	Sink(#[from] HeadlessSinkError),
 }
 
 /// One generation-fenced host router.
@@ -206,6 +361,33 @@ impl DispatchRouter {
 		};
 		sink.set_availability(AvailabilityBatch::from_wire(availability));
 		Ok(true)
+	}
+
+	/// Consumes typed UI effects and requests into the shared headless sink.
+	///
+	/// Returns `true` only for a retained UI payload. Registration and dispatch
+	/// result frames remain owned by their dedicated registries.
+	pub fn dispatch_headless_ui(
+		&self,
+		generation: u64,
+		frame: WorkerFrame,
+		sink: &HeadlessLifecycleSink,
+	) -> Result<bool, HeadlessDispatchError> {
+		self.accept_frame(generation, &frame)?;
+		let Some(worker_frame::Body::Ui(ui)) = frame.body else {
+			return Ok(false);
+		};
+		match ui.body {
+			Some(ui_worker_envelope::Body::Effect(effect)) => {
+				sink.ui_effect(generation, effect)?;
+				Ok(true)
+			},
+			Some(ui_worker_envelope::Body::Request(request)) => {
+				sink.ui_request(generation, request)?;
+				Ok(true)
+			},
+			_ => Ok(false),
+		}
 	}
 
 	/// Completes a correlation and releases one serialized callback slot.

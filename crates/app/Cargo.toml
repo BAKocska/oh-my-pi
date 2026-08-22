@@ -26,12 +26,14 @@ local-stt = ["local", "omp-llm-inference/local-stt"]
 local-tts = ["local", "omp-llm-inference/local-tts"]
 
 [dependencies]
+arc-swap = { workspace = true }
 async-stream.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 bytecount.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 ring = { workspace = true }
 encoding_rs = { workspace = true }
 flume.workspace = true
@@ -42,6 +44,9 @@ http.workspace = true
 im = { workspace = true }
 itertools.workspace = true
 libc.workspace = true
+image.workspace = true
+indicatif.workspace = true
+inventory.workspace = true
 miette = { workspace = true }
 omp-agent.workspace = true
 omp-ar = { workspace = true }
@@ -53,14 +58,20 @@ omp-grep.workspace = true
 omp-hashline.workspace = true
 omp-llm-catalog.workspace = true
 omp-llm-inference.workspace = true
+omp-memory.workspace = true
+omp-oauth.workspace = true
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-py.workspace = true
 omp-rpc.workspace = true
+omp-sdk.workspace = true
+omp-settings.workspace = true
+omp-secrets.workspace = true
 omp-storage.workspace = true
 omp-shell-engine.workspace = true
 omp-telemetry.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
+omp-voice.workspace = true
 omp-slopjson.workspace = true
 omp-tools.workspace = true
 omp-walker.workspace = true
@@ -68,16 +79,20 @@ nix.workspace = true
 parking_lot.workspace = true
 pyo3.workspace = true
 rusqlite.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
 schemars.workspace = true
 wreq.workspace = true
 prost.workspace = true
 regex.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tower.workspace = true
+rand.workspace = true
 tracing.workspace = true
 url.workspace = true
 xutf.workspace = true

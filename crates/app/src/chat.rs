@@ -1,5 +1,6 @@
 //! Durable project-chat composition.
 
+mod agents;
 #[path = "chat_hub.rs"]
 mod hub_backend;
 
@@ -8,7 +9,7 @@ pub(crate) fn chat_hub_tool() -> impl omp_tool::Tool {
 }
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fs::File,
 	io::{BufRead as _, BufReader},
 	path::{Path, PathBuf},
@@ -23,9 +24,11 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use miette::IntoDiagnostic as _;
 use omp_agent::{
-	Agent, AgentKind, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget, CompletionError,
-	CompletionRequest, InProcTurnClient, Journal, RpcTurnClient, TurnClient, TurnId, TurnInput,
-	TurnOptions, TurnSession as _, WorkspaceInput, project_journal, resolve_completion,
+	Agent, AgentKind, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget, ChildKind,
+	CompletionError, CompletionRequest, InProcTurnClient, Journal, MAX_YIELD_SCHEMA_RETRIES,
+	RpcTurnClient, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _, WorkspaceInput,
+	WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator, project_journal,
+	resolve_completion,
 };
 use omp_core::{ExposeSecret as _, Str, sf};
 use omp_llm_catalog::GrammarBits;
@@ -42,6 +45,7 @@ use omp_proto::{
 	inference::v1 as inference_pb,
 	thread::v1::{Item, Message, Part, Role, Thread, item, part},
 };
+use omp_sdk::{SessionBlueprint, SessionBuilder, SessionOptions};
 use omp_storage::{
 	index::{IndexedWriteError, NewSession, SessionIndex, SessionKind},
 	transcript::{Header, Kind, SessionId, read_header, read_line},
@@ -59,7 +63,7 @@ use crate::{
 	cli::{ChatArgs, ThinkingLevel},
 };
 
-const CHAT_CAPS_BASE: CapsBase = CapsBase {
+pub(crate) const CHAT_CAPS_BASE: CapsBase = CapsBase {
 	maximum_parts:      1,
 	maximum_text_bytes: 64 * 1024,
 	media:              false,
@@ -91,7 +95,7 @@ pub enum ChatError {
 		#[source]
 		source: std::io::Error,
 	},
-	/// The requested resume identity is not a canonical ULID.
+	/// The requested resume identity is not a canonical ULID or lowercase UUID.
 	#[error("invalid chat session id: {0}")]
 	InvalidResume(Str),
 	/// The requested durable session does not exist.
@@ -109,9 +113,25 @@ pub enum ChatError {
 	/// Durable transcript state failed to open, create, or project.
 	#[error(transparent)]
 	Journal(#[from] omp_agent::JournalError),
+	/// Durable compaction blob placement could not be initialized.
+	#[error(transparent)]
+	Blob(#[from] omp_storage::blob::Error),
+	/// Owner-local session discovery state failed.
+	#[error(transparent)]
+	SessionResolve(#[from] crate::project_state::SessionResolveError),
+	/// Owner-local draft persistence failed.
+	#[error(transparent)]
+	Draft(#[from] crate::session_manager::DraftError),
+	/// Cross-process loop revival failed.
+	#[error(transparent)]
+	Revival(#[from] omp_agent::RevivalError),
 	/// The authoritative write-time sessions index failed.
 	#[error(transparent)]
 	SessionIndex(omp_storage::index::Error),
+	/// A durable session was requested without an authoritative write-time
+	/// index.
+	#[error("durable session storage has no authoritative index")]
+	MissingSessionIndex,
 	/// A durable transcript could not be projected into canonical replay items.
 	#[error(transparent)]
 	Projection(#[from] omp_agent::ProjectionError),
@@ -127,9 +147,23 @@ pub enum ChatError {
 	/// A tool schema could not be encoded for the turn protocol.
 	#[error("could not encode tool schema")]
 	ToolSchema(#[source] serde_json::Error),
+	/// A requested tool is absent after native and extension discovery.
+	#[error("unknown tool `{name}`; valid tools: {valid:?}")]
+	UnknownTool {
+		/// Requested normalized name.
+		name:  Str,
+		/// Fully discovered valid names.
+		valid: Vec<Str>,
+	},
 	/// The live tool registry could not lower its advertised slots.
 	#[error(transparent)]
 	ToolRegistry(#[from] omp_tool::RegistryError),
+	/// Shared SDK session planning failed before loop construction.
+	#[error(transparent)]
+	SessionBuild(#[from] omp_sdk::SessionBuildError),
+	/// Process-global parked-session discovery failed.
+	#[error(transparent)]
+	AgentRegistry(#[from] omp_agent::RegistryError),
 	/// The requested model selector names a catalog route, not a model.
 	#[error("`{selector}` is a route id, not a model{hint}")]
 	ModelSelectorIsRoute {
@@ -152,23 +186,69 @@ pub enum ChatError {
 	/// The interactive terminal shell failed.
 	#[error("interactive chat shell failed: {0}")]
 	Ui(miette::Report),
+	/// Startup automation mode conflicts with the active execution state.
+	#[error(transparent)]
+	Mode(#[from] crate::modes::ModeError),
+	/// Durable autonomous-mode projection could not be loaded or attached.
+	#[error(transparent)]
+	ModePersistence(#[from] crate::modes::persistence::ModePersistenceError),
 	/// The platform cannot enforce the Phase 3 owner-local environment contract.
 	#[error("interactive chat requires Unix owner-local project authorities")]
 	UnsupportedPlatform,
 }
 
-struct Session {
-	id:            Str,
-	journal:       Journal,
-	initial_items: Vec<omp_proto::thread::v1::Item>,
+pub(crate) struct Session {
+	pub(crate) id:            Str,
+	pub(crate) journal:       Journal,
+	pub(crate) initial_items: Vec<omp_proto::thread::v1::Item>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SessionOpen<'a> {
+	New,
+	Resume(&'a Str),
+	ResumeMoved(&'a Str),
+	Fork(&'a Str),
+	Ephemeral,
+}
+
+struct EphemeralSessions {
+	path: Option<PathBuf>,
+}
+
+impl EphemeralSessions {
+	fn create() -> Result<Self, ChatError> {
+		let path = std::env::temp_dir()
+			.join("omp")
+			.join("sessions")
+			.join(omp_core::Ulid::generate().to_string());
+		ensure_state_directory(&path)?;
+		Ok(Self { path: Some(path) })
+	}
+
+	fn path(&self) -> &Path {
+		self
+			.path
+			.as_deref()
+			.expect("ephemeral session path remains live")
+	}
+}
+
+impl Drop for EphemeralSessions {
+	fn drop(&mut self) {
+		if let Some(path) = self.path.take() {
+			let _ = std::fs::remove_dir_all(path);
+		}
+	}
 }
 
 struct ChatScope<'a> {
-	catalog:       &'a omp_llm_catalog::snapshot::Catalog,
-	root:          &'a Path,
-	sessions_dir:  &'a Path,
-	session_index: Arc<SessionIndex>,
-	registry:      Arc<Registry>,
+	catalog:          &'a omp_llm_catalog::snapshot::Catalog,
+	root:             &'a Path,
+	sessions_dir:     &'a Path,
+	session_index:    Arc<SessionIndex>,
+	registry:         Arc<Registry>,
+	persist_sessions: bool,
 }
 pub(crate) struct ChatAuthWorker {
 	ui:   ChatAuth,
@@ -258,7 +338,7 @@ fn auth_error_message(error: &omp_llm_inference::Error) -> Str {
 	}
 }
 fn chat_login_failure(
-	provider: &omp_llm_catalog::ProviderId,
+	provider: &omp_llm_catalog::ProviderId<str>,
 	error: &omp_llm_inference::Error,
 ) -> ChatLoginFailure {
 	if error.kind == ErrorKind::CredentialStorageUnavailable {
@@ -388,7 +468,7 @@ async fn run_chat_login(
 async fn send_auth_response(
 	session: &omp_llm_inference::answer::AuthSession,
 	input: AuthInput,
-	provider: &omp_llm_catalog::ProviderId,
+	provider: &omp_llm_catalog::ProviderId<str>,
 ) -> Result<(), Str> {
 	session
 		.responses
@@ -418,9 +498,9 @@ mod auth_worker_tests {
 			omp_llm_inference::error::RetryAction::Never,
 			omp_llm_inference::receipt::ExecutionReceipt::default(),
 		);
-		let provider = omp_llm_catalog::ProviderId::from("test-provider");
+		let provider = omp_llm_catalog::ProviderId::from_ref("test-provider");
 		assert!(matches!(
-			chat_login_failure(&provider, &error),
+			chat_login_failure(provider, &error),
 			ChatLoginFailure::CredentialStorageLocked
 		));
 	}
@@ -448,39 +528,7 @@ mod auth_worker_tests {
 	}
 }
 fn discover_chat_agents(root: &Path) -> Arc<BTreeMap<Str, omp_agent::AgentDefinition>> {
-	use crate::discovery::manifest::{CapabilityDeclaration, CapabilityKind};
-
-	let mut declarations = vec![CapabilityDeclaration {
-		id:       sf!("project-agents"),
-		kind:     CapabilityKind::Agents,
-		root:     root.join(".omp/agents"),
-		priority: 100,
-	}];
-	if let Some(home) = std::env::var_os("HOME") {
-		declarations.push(CapabilityDeclaration {
-			id:       sf!("user-agents"),
-			kind:     CapabilityKind::Agents,
-			root:     PathBuf::from(home).join(".omp/agent/agents"),
-			priority: 50,
-		});
-	}
-	let mut definitions = crate::discovery::manifest::discover_agents(&declarations)
-		.definitions
-		.into_iter()
-		.collect::<BTreeMap<_, _>>();
-	definitions
-		.entry(sf!("task"))
-		.or_insert_with(|| omp_agent::AgentDefinition {
-			name:           sf!("task"),
-			description:    sf!("General-purpose subagent"),
-			tools:          Box::default(),
-			spawns:         omp_agent::SpawnPolicy::Any,
-			model:          None,
-			thinking_level: None,
-			blocking:       false,
-			prompt:         sf!("Complete the delegated task and report the result."),
-		});
-	Arc::new(definitions)
+	agents::discover(root)
 }
 
 #[derive(Clone)]
@@ -492,16 +540,18 @@ struct ChatParentContext {
 	session_index: Arc<SessionIndex>,
 	definitions:   Arc<BTreeMap<Str, omp_agent::AgentDefinition>>,
 	tree:          Arc<AgentTree>,
+	task_settings: crate::subagent::settings::LiveTaskSettings,
 }
 
-pub(crate) struct ChatParentHost<C: TurnClient + Clone + 'static> {
-	client:  C,
-	env:     omp_env::EnvClient,
-	broker:  omp_agent::Broker,
-	context: Mutex<ChatParentContext>,
+pub(crate) struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
+	client:     C,
+	env:        omp_env::EnvClient,
+	broker:     omp_agent::Broker,
+	supervisor: Arc<crate::subagent::supervisor::SessionSupervisor<C>>,
+	context:    Mutex<ChatParentContext>,
 }
 
-impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
+impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	pub(crate) fn new(
 		client: C,
 		env: omp_env::EnvClient,
@@ -512,10 +562,24 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 		session_index: Arc<SessionIndex>,
 	) -> Self {
 		let definitions = discover_chat_agents(&root);
+		let tree = Arc::new(AgentTree::new(
+			8,
+			DEFAULT_EVAL_CONCURRENCY_LIMIT,
+			omp_agent::DEFAULT_MAX_ADMISSION_QUEUE,
+		));
+		if let Err(error) = crate::subagent::artifacts::reserve_historical_stems(
+			tree.as_ref(),
+			&sessions_dir.join("eval-agents"),
+		) {
+			tracing::warn!(error = %error, "could not reserve historical subagent artifact names");
+		}
+		let supervisor =
+			Arc::new(crate::subagent::supervisor::SessionSupervisor::new(Arc::clone(&tree)));
 		Self {
 			client,
 			env,
 			broker: omp_agent::Broker::new(Str::from(root.to_string_lossy().as_ref())),
+			supervisor,
 			context: Mutex::new(ChatParentContext {
 				state,
 				session_id,
@@ -523,13 +587,27 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 				root,
 				session_index,
 				definitions,
-				tree: Arc::new(AgentTree::new(
-					8,
-					DEFAULT_EVAL_CONCURRENCY_LIMIT,
-					omp_agent::DEFAULT_MAX_ADMISSION_QUEUE,
-				)),
+				task_settings: crate::subagent::settings::LiveTaskSettings::new(
+					Arc::new(crate::subagent::settings::TaskSettings::default()),
+					Arc::clone(&tree),
+				),
+				tree,
 			}),
 		}
+	}
+
+	/// Applies a reloaded task projection to admission and later child
+	/// snapshots.
+	pub(crate) fn apply_task_settings(
+		&self,
+		settings: Arc<crate::subagent::settings::TaskSettings>,
+	) {
+		self.supervisor.apply_settings(Arc::clone(&settings));
+		self.context.lock().task_settings.apply(settings);
+	}
+
+	fn bind_parent_jobs(&self, jobs: Arc<omp_agent::JobBoard>) {
+		self.supervisor.bind_parent_jobs(jobs);
 	}
 
 	pub(crate) fn update(&self, state: AgentState, session_id: Str) {
@@ -549,6 +627,130 @@ impl<C: TurnClient + Clone + 'static> ChatParentHost<C> {
 
 	pub(crate) fn session_id(&self) -> Str {
 		self.context.lock().session_id.clone()
+	}
+
+	async fn run_eval_agent(
+		&self,
+		id: &str,
+		items: Vec<Item>,
+		turn_id: TurnId,
+	) -> Result<omp_agent::AgentRunSummary, crate::envd::eval::BridgeHostError> {
+		let mut budget = self.context.lock().state.subscribe();
+		let run = self.supervisor.run(id, items, turn_id);
+		tokio::pin!(run);
+		loop {
+			tokio::select! {
+				result = &mut run => {
+					return result.map_err(|error| {
+						crate::envd::eval::BridgeHostError::message(error.to_string())
+					});
+				},
+				changed = budget.changed() => {
+					if changed.is_err() {
+						continue;
+					}
+					let exhausted = budget
+						.borrow_and_update()
+						.turn
+						.params
+						.task_budget
+						.is_some_and(|budget| budget.remaining_tokens == Some(0));
+					if exhausted {
+						let _ = self.supervisor.cancel(id);
+					}
+				},
+			}
+		}
+	}
+
+	async fn validate_agent_summary(
+		&self,
+		id: &str,
+		schema: Option<Value>,
+		strict: bool,
+		mut summary: omp_agent::AgentRunSummary,
+	) -> Result<(String, Option<Value>, Option<Value>), crate::envd::eval::BridgeHostError> {
+		if let Some(outcome) = summary.outcome.as_ref() {
+			self
+				.context
+				.lock()
+				.tree
+				.debit_outcome(id, outcome)
+				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		}
+		let Some(schema) = schema else {
+			let text = summary
+				.outcome
+				.as_ref()
+				.map_or_else(|| "(interrupted)".to_owned(), bridge_outcome_text);
+			return Ok((text, None, None));
+		};
+		let mut validator = YieldPayloadValidator::new(Some(schema), strict);
+		let mut retries = 0_u8;
+		loop {
+			let text = summary
+				.outcome
+				.as_ref()
+				.map_or_else(|| "(interrupted)".to_owned(), bridge_outcome_text);
+			match summary.yield_payload(&mut validator) {
+				Ok(Some(payload)) => {
+					if let Some(error) = payload.error {
+						return Ok((text, None, Some(json!({ "status": "failed", "error": error }))));
+					}
+					if let Some(data) = payload.data {
+						let schema_status = payload.schema_overridden.then(|| {
+							json!({
+								"status": "invalid",
+								"mode": "permissive",
+								"salvaged": true,
+								"warning": crate::subagent::yield_driver::WARNING_SCHEMA_OVERRIDDEN,
+							})
+						});
+						return Ok((text, Some(data), schema_status));
+					}
+				},
+				Ok(None) => {},
+				Err(error) if retries >= MAX_YIELD_SCHEMA_RETRIES => {
+					let warning = matches!(&error, omp_agent::YieldPayloadError::MissingData)
+						.then_some(crate::subagent::yield_driver::WARNING_NULL_YIELD);
+					return Ok((
+						text,
+						None,
+						Some(json!({
+							"status": "invalid",
+							"mode": if strict { "strict" } else { "permissive" },
+							"error": error.to_string(),
+							"warning": warning,
+						})),
+					));
+				},
+				Err(_) => {},
+			}
+			if retries >= MAX_YIELD_SCHEMA_RETRIES {
+				return Ok((
+					text,
+					None,
+					Some(json!({
+						"status": "unavailable",
+						"mode": if strict { "strict" } else { "permissive" },
+						"error": "child did not submit a terminal structured yield",
+						"warning": crate::subagent::yield_driver::WARNING_MISSING_YIELD,
+					})),
+				));
+			}
+			retries = retries.saturating_add(1);
+			summary = self
+				.run_eval_agent(
+					id,
+					vec![bridge_message(
+						Role::User,
+						"Your terminal yield did not satisfy the requested JSON Schema. Submit the \
+						 complete corrected object as result.data now.",
+					)],
+					TurnId::new(format!("eval-agent-schema-retry-{}", omp_core::Ulid::generate())),
+				)
+				.await?;
+		}
 	}
 }
 
@@ -579,8 +781,35 @@ fn bridge_outcome_text(outcome: &inference_pb::Outcome) -> String {
 }
 
 #[async_trait]
-impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for ChatParentHost<C> {
-	async fn completion(&self, args: Value) -> Result<Value, crate::envd::eval::BridgeHostError> {
+impl<C: TurnClient + Clone + Send + 'static> crate::envd::eval::ParentSessionHost
+	for ChatParentHost<C>
+{
+	fn eval_session_config(
+		&self,
+	) -> Result<crate::envd::eval::EvalSessionConfig, crate::envd::eval::BridgeHostError> {
+		let context = self.context.lock();
+		let session_root = context.sessions_dir.join(context.session_id.as_str());
+		Ok(crate::envd::eval::EvalSessionConfig {
+			cwd:              context.root.clone(),
+			local_roots_json: Some(Str::from(
+				json!({ "local": session_root.join("local").to_string_lossy() }).to_string(),
+			)),
+			artifacts_dir:    Some(Str::from(session_root.to_string_lossy().as_ref())),
+			session_file:     Some(Str::from(
+				context
+					.sessions_dir
+					.join(format!("{}.jsonl", context.session_id))
+					.to_string_lossy()
+					.as_ref(),
+			)),
+		})
+	}
+
+	async fn completion(
+		&self,
+		args: Value,
+		_progress: &dyn crate::envd::eval::BridgeProgressSink,
+	) -> Result<Value, crate::envd::eval::BridgeHostError> {
 		let choices = args.get("choices").and_then(Value::as_array).map_or_else(
 			smallvec::SmallVec::new,
 			|values| {
@@ -632,11 +861,21 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			});
 		}
 		let mut items = Vec::new();
-		if let Some(system) = args.get("system").and_then(Value::as_str) {
-			items.push(bridge_message(Role::System, system));
-		}
+		items.push(bridge_message(
+			Role::System,
+			args
+				.get("system")
+				.and_then(Value::as_str)
+				.unwrap_or("Follow the user's instruction and return only the requested result."),
+		));
 		items.push(bridge_message(Role::User, prompt));
-		let options = TurnOptions { context_id: None, params, executor: None, props: None };
+		let options = TurnOptions {
+			context_id: None,
+			params,
+			executor: None,
+			props: None,
+			provider_reset: false,
+		};
 		let mut turn = self
 			.client
 			.turn(
@@ -683,13 +922,17 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		Err(crate::envd::eval::BridgeHostError::message("completion turn ended without an outcome"))
 	}
 
-	async fn agent(&self, args: Value) -> Result<Value, crate::envd::eval::BridgeHostError> {
-		let prompt = args
-			.get("prompt")
-			.and_then(Value::as_str)
-			.ok_or_else(|| crate::envd::eval::BridgeHostError::message("agent prompt is required"))?;
-		let kind = args.get("agent").and_then(Value::as_str).unwrap_or("task");
+	async fn agent(
+		&self,
+		args: Value,
+		progress: &dyn crate::envd::eval::BridgeProgressSink,
+	) -> Result<Value, crate::envd::eval::BridgeHostError> {
+		let mut request = crate::envd::eval::spawn::SpawnRequestV1::from_bridge_args(&args)
+			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		let prompt = request.prompt.as_str();
+		let kind = request.agent.as_str();
 		let context = self.context.lock().clone();
+		let task_settings = context.task_settings.snapshot();
 		let definition = context
 			.definitions
 			.iter()
@@ -700,37 +943,119 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 					"agent type '{kind}' is not available in this session"
 				))
 			})?;
-		let system_prompt = match (definition.description.is_empty(), definition.prompt.is_empty()) {
-			(true, true) => sf!("Complete the delegated task."),
-			(false, true) => definition.description.clone(),
-			(true, false) => definition.prompt.clone(),
-			(false, false) => {
-				Str::from(format!("{}\n\n{}", definition.description, definition.prompt))
-			},
-		};
-		let apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
-		let merge = args.get("merge").and_then(Value::as_bool).unwrap_or(false);
-		if apply && merge {
+		if task_settings
+			.disabled_agents
+			.iter()
+			.any(|name| name.as_str().eq_ignore_ascii_case(definition.name.as_str()))
+		{
 			return Err(crate::envd::eval::BridgeHostError::message(
-				"agent options 'apply' and 'merge' are mutually exclusive",
+				"requested agent is disabled by live task settings",
 			));
 		}
-		let explicitly_isolated = args.get("isolated").and_then(Value::as_bool);
-		if explicitly_isolated == Some(false) && (apply || merge) {
+		let session_schema = context
+			.state
+			.snapshot()
+			.turn
+			.params
+			.response_format
+			.as_ref()
+			.and_then(|format| format.kind.as_ref())
+			.and_then(|kind| match kind {
+				inference_pb::response_format::Kind::JsonSchema(schema) => {
+					serde_json::from_slice(&schema.schema_json).ok()
+				},
+				inference_pb::response_format::Kind::Grammar(_) => None,
+			});
+		let schema_resolution = omp_agent::resolve_output_schema(
+			request.output_schema.as_ref(),
+			definition.output_schema.as_ref(),
+			session_schema.as_ref(),
+		);
+		request.output_schema = schema_resolution.schema;
+		let apply = request.isolation.apply;
+		let merge = request.isolation.merge;
+		let isolated = request.isolation.requested;
+		let id = request
+			.stable_id
+			.clone()
+			.unwrap_or_else(|| Str::from(omp_core::Ulid::generate().to_string()));
+		let mut display_name = request
+			.name
+			.clone()
+			.or_else(|| context.tree.node(id.as_str()).map(|node| node.name.clone()))
+			.unwrap_or_else(|| id.clone());
+		progress.progress(json!({
+			"op": "agent",
+			"id": id,
+			"name": display_name,
+			"agent": kind,
+			"status": "running",
+		}))?;
+		if self.supervisor.state(&id).is_some() {
+			if isolated || apply || merge {
+				return Err(crate::envd::eval::BridgeHostError::message(
+					"follow-up turns retain their existing workspace disposition",
+				));
+			}
+			let summary = self
+				.run_eval_agent(
+					id.as_str(),
+					vec![bridge_message(Role::User, prompt)],
+					TurnId::new(format!("eval-agent-followup-{}", omp_core::Ulid::generate())),
+				)
+				.await?;
+			let (text, data, schema_status) = self
+				.validate_agent_summary(
+					id.as_str(),
+					request.output_schema.clone(),
+					matches!(request.schema_mode, crate::envd::eval::spawn::SpawnSchemaMode::Strict),
+					summary,
+				)
+				.await?;
+			let artifact_dir = context.sessions_dir.join(context.session_id.as_str());
+			let artifact = artifact_dir.join(format!("{id}.md"));
+			let bounded = crate::subagent::output::persist_bounded(
+				&artifact,
+				sf!("agent://{}", id),
+				&text,
+				None,
+				false,
+			)
+			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			let visible_text = bounded.preview.unwrap_or_default();
+			progress.progress(json!({
+				"op": "agent",
+				"id": id,
+				"name": display_name,
+				"agent": kind,
+				"status": if schema_status.is_some() && data.is_none() { "failed" } else { "completed" },
+			}))?;
+			return Ok(json!({
+				"text": visible_text,
+				"data": data,
+				"schema": schema_status,
+				"handle": format!("agent://{id}"),
+				"details": {
+					"id": id,
+					"name": display_name,
+					"agent": kind,
+					"followUp": true,
+					"output": format!("agent://{id}"),
+				},
+			}));
+		}
+		if context
+			.state
+			.snapshot()
+			.turn
+			.params
+			.task_budget
+			.is_some_and(|budget| budget.remaining_tokens == Some(0))
+		{
 			return Err(crate::envd::eval::BridgeHostError::message(
-				"agent apply/merge requires an isolated worktree",
+				"hard turn token budget is exhausted; subagent spawn refused",
 			));
 		}
-		let isolated = explicitly_isolated.unwrap_or(apply || merge);
-		if args.get("schema").is_some() || args.get("schemaMode").is_some() {
-			return Err(crate::envd::eval::BridgeHostError::message(
-				"structured subagent output is not supported by this session",
-			));
-		}
-		let id = args
-			.get("_id")
-			.and_then(Value::as_str)
-			.map_or_else(|| Str::from(omp_core::Ulid::generate().to_string()), Str::from);
 		let directory = context.sessions_dir.join("eval-agents");
 		let (worktree_id, child_root, isolated_environment) = if isolated {
 			let created = self
@@ -765,30 +1090,38 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 		} else {
 			(None, context.root.clone(), None)
 		};
-		let name = args
-			.get("label")
-			.and_then(Value::as_str)
-			.map_or_else(|| id.clone(), Str::from);
-		let _permit = context
+		let child_budget = context
+			.state
+			.snapshot()
+			.turn
+			.params
+			.task_budget
+			.and_then(|budget| budget.remaining_tokens)
+			.map_or_else(Budget::default, |remaining| Budget {
+				max_output_tokens: Some(remaining),
+				..Budget::default()
+			});
+		let parent_id = context
 			.tree
-			.admit(1)
-			.await
-			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+			.node(context.session_id.as_str())
+			.map(|parent| parent.id.clone())
+			.ok_or_else(|| {
+				crate::envd::eval::BridgeHostError::message(
+					"parent agent is not registered for subagent admission",
+				)
+			})?;
 		let node = context
 			.tree
-			.register(
+			.register_child(
 				id.clone(),
-				name,
-				AgentKind::Subagent,
-				context
-					.tree
-					.node(context.session_id.as_str())
-					.map(|parent| parent.id.clone()),
+				request.name.as_deref(),
+				&definition,
+				parent_id,
 				context.session_id.clone(),
-				Budget::default(),
+				child_budget,
 			)
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
-		node.set_status(AgentStatus::Running);
+		display_name = node.name.clone();
 		std::fs::create_dir_all(&directory)
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		let parent = SessionId(context.session_id.clone());
@@ -801,50 +1134,36 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			Some(&parent),
 		)
 		.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
-		let mut child_snapshot = context.state.snapshot().as_ref().clone();
-		child_snapshot.workspace.cwd = child_root.clone();
-		if let Some(model) = definition.effective_model(&BTreeMap::new()) {
-			child_snapshot.turn.params.model = model.to_owned();
-		}
-		if let Some(level) = definition.thinking_level.as_deref() {
-			let effort = match level {
-				"off" => inference_pb::Effort::Off,
-				"minimal" | "min" => inference_pb::Effort::Minimal,
-				"low" | "lo" => inference_pb::Effort::Low,
-				"medium" | "med" => inference_pb::Effort::Medium,
-				"high" | "hi" => inference_pb::Effort::High,
-				"max" => inference_pb::Effort::Max,
-				"xhigh" => inference_pb::Effort::Xhigh,
-				_ => inference_pb::Effort::Unspecified,
-			};
-			child_snapshot.turn.params.thinking =
-				Some(inference_pb::Reasoning { effort: effort as i32, ..Default::default() });
-		}
-		let may_spawn = definition.spawns.default_definition().is_some();
-		let declared_tools = &definition.tools;
-		child_snapshot.enabled_tools = child_snapshot
-			.enabled_tools
-			.iter()
-			.filter(|name| {
-				!matches!(name.as_str(), "checkpoint" | "rewind")
-					&& (may_spawn || name.as_str() != "eval")
-					&& (declared_tools.is_empty()
-						|| name.as_str() == "hub"
-						|| declared_tools.iter().any(|allowed| allowed == *name))
-			})
-			.cloned()
-			.collect::<Vec<_>>()
-			.into();
-		child_snapshot.turn.params.tools.retain(|tool| {
-			!matches!(tool.name.as_str(), "checkpoint" | "rewind")
-				&& (may_spawn || tool.name.as_str() != "eval")
-				&& (declared_tools.is_empty()
-					|| tool.name == "hub"
-					|| declared_tools.iter().any(|allowed| allowed == &tool.name))
-		});
+		let parent_snapshot = context.state.snapshot();
+		let selected_model = definition.effective_model(&task_settings.agent_model_overrides);
+		let inherited_pattern = parent_snapshot.turn.params.model.as_str();
+		let prewalk = crate::subagent::prewalk::PrewalkGate::resolve(&definition, &task_settings);
+		let inference_role = sf!("subagent:{}", id);
+		let child_snapshot = crate::subagent::snapshot::child_snapshot(
+			parent_snapshot.as_ref(),
+			crate::subagent::snapshot::ChildSnapshotOptions {
+				definition: &definition,
+				settings: &task_settings,
+				cwd: &child_root,
+				selected_model,
+				inference_role: Some(inference_role.as_str()),
+				inherited_pattern: Some(inherited_pattern),
+				caller_effort: request.effort,
+				model_ceiling: None,
+				plan_mode: false,
+				enable_lsp: request.enable_lsp,
+				prewalk_gate: prewalk.armed(),
+			},
+		);
 		let child_env = isolated_environment
 			.as_ref()
 			.map_or_else(|| self.env.clone(), |environment| environment.client().clone());
+		let child_content = crate::discovery::active_content_snapshots(&child_root);
+		let (child_ttsr, child_ttsr_diagnostics) =
+			crate::rulebook::ttsr_registry(child_content.rules.as_ref());
+		for error in child_ttsr_diagnostics {
+			tracing::warn!(%error, agent = %id, "subagent TTSR rule condition was rejected");
+		}
 		let mut child = Agent::new(
 			self.client.clone(),
 			child_env.clone(),
@@ -852,7 +1171,8 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			journal,
 			CHAT_CAPS_BASE,
 		);
-		let _control_binding = if let Some(environment) = &isolated_environment {
+		child.set_ttsr_registry(child_ttsr);
+		let control_binding = if let Some(environment) = &isolated_environment {
 			let binding = environment
 				.bind_agent_control(child.control())
 				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
@@ -865,41 +1185,89 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 			.broker
 			.register(&node, child.mailbox())
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
-		let _hub = hub_backend::attach(Arc::new(hub_backend::ChatHubBackend::new(
-			self.broker.clone(),
-			inbox,
-			Arc::clone(child.jobs()),
-			child_env.clone(),
+		let hub = hub_backend::attach_for(
 			id.clone(),
-			context.session_id.clone(),
-		)));
-		let summary = match child
-			.submit(
-				[
+			Arc::new(hub_backend::ChatHubBackend::new(
+				self.broker.clone(),
+				inbox,
+				Arc::clone(child.jobs()),
+				child_env.clone(),
+				id.clone(),
+				context.session_id.clone(),
+				None,
+				Some(self.supervisor.clone()),
+			)),
+		);
+		let mut runtime = crate::subagent::supervisor::SupervisedRuntime::new(child);
+		if let Some(binding) = control_binding {
+			runtime.retain(binding);
+		}
+		runtime.retain(hub);
+		if let Some(environment) = isolated_environment {
+			runtime.retain(environment);
+		}
+		self
+			.supervisor
+			.register(Arc::clone(&node), runtime, None)
+			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		let peer_values = context
+			.tree
+			.roster()
+			.map(|peer| crate::subagent::prompt::peer_from_node(peer))
+			.collect::<Vec<_>>();
+		let peers = peer_values
+			.iter()
+			.map(|(name, role, status, activity)| crate::subagent::prompt::PromptPeer {
+				name:     name.as_str(),
+				role:     role.as_str(),
+				status:   status.as_str(),
+				activity: activity.as_str(),
+			})
+			.collect::<Vec<_>>();
+		let model = selected_model.unwrap_or(inherited_pattern);
+		let codex_style = {
+			let model = model.to_ascii_lowercase();
+			model.contains("codex") || model.contains("gpt-5")
+		};
+		let system_prompt =
+			crate::subagent::prompt::compose(crate::subagent::prompt::SubagentPromptInput {
+				definition:        &definition,
+				shared_context:    None,
+				plan_path:         None,
+				plan_content:      None,
+				workspace_root:    &child_root,
+				output_schema:     request.output_schema.as_ref(),
+				self_name:         node.name.as_str(),
+				self_role:         definition.name.as_str(),
+				irc_enabled:       true,
+				roster_generation: context.tree.roster_generation(),
+				peers:             &peers,
+				capabilities:      crate::subagent::prompt::ModelFamilyCapabilities {
+					codex_style,
+					parallel_tool_calls: true,
+					structured_yield: request.output_schema.is_some(),
+				},
+				plan_mode:         false,
+				eager:             task_settings.eager,
+			});
+		let summary = self
+			.run_eval_agent(
+				id.as_str(),
+				vec![
 					bridge_message(Role::System, system_prompt.as_str()),
 					bridge_message(Role::User, prompt),
 				],
 				TurnId::new(format!("eval-agent-{}", omp_core::Ulid::generate())),
 			)
-			.await
-		{
-			Ok(summary) => {
-				node.set_status(AgentStatus::Completed);
-				summary
-			},
-			Err(error) => {
-				node.set_status(AgentStatus::Failed);
-				return Err(crate::envd::eval::BridgeHostError::message(error.to_string()));
-			},
-		};
-		let text = summary
-			.outcome
-			.as_ref()
-			.map_or_else(|| "(interrupted)".to_owned(), bridge_outcome_text);
-		drop(_hub);
-		drop(child);
-		drop(child_env);
-		drop(isolated_environment);
+			.await?;
+		let (text, data, schema_status) = self
+			.validate_agent_summary(
+				id.as_str(),
+				request.output_schema.clone(),
+				matches!(request.schema_mode, crate::envd::eval::spawn::SpawnSchemaMode::Strict),
+				summary,
+			)
+			.await?;
 		let mut disposition = None;
 		if let Some(worktree_id) = worktree_id.as_ref()
 			&& (apply || merge)
@@ -929,35 +1297,40 @@ impl<C: TurnClient + Clone + 'static> crate::envd::eval::ParentSessionHost for C
 				"artifactSize": merged.artifact_size,
 				"branch": merged.branch,
 			}));
-			self
-				.env
-				.destroy_worktree(omp_proto::env::v1::DestroyWorktree {
-					id: worktree_id.to_string(),
-					force: true,
-					..Default::default()
-				})
-				.await
-				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		}
 		let artifact_dir = context.sessions_dir.join(context.session_id.as_str());
-		std::fs::create_dir_all(&artifact_dir)
-			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
 		let artifact = artifact_dir.join(format!("{id}.md"));
-		let temporary = artifact_dir.join(format!(".{id}.tmp"));
-		std::fs::write(&temporary, text.as_bytes())
-			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
-		std::fs::rename(&temporary, &artifact)
-			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		let bounded = crate::subagent::output::persist_bounded(
+			&artifact,
+			sf!("agent://{}", id),
+			&text,
+			worktree_id.clone(),
+			false,
+		)
+		.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		let visible_text = bounded.preview.unwrap_or_default();
+		progress.progress(json!({
+			"op": "agent",
+			"id": id,
+			"name": display_name,
+			"agent": kind,
+			"status": if schema_status.is_some() && data.is_none() { "failed" } else { "completed" },
+		}))?;
 		Ok(json!({
-			"text": text,
+			"text": visible_text,
+			"data": data,
+			"schema": schema_status,
+			"handle": format!("agent://{id}"),
 			"details": {
 				"id": id,
+				"name": display_name,
 				"agent": kind,
 				"blocking": definition.blocking,
 				"isolated": isolated,
 				"worktree": worktree_id,
 				"root": isolated.then(|| child_root.to_string_lossy().into_owned()),
 				"disposition": disposition,
+				"output": format!("agent://{id}"),
 			},
 		}))
 	}
@@ -997,17 +1370,97 @@ pub(crate) enum ChatStart {
 	clippy::future_not_send,
 	reason = "the interactive chat future owns a thread-confined terminal scene"
 )]
-pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> {
+pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<()> {
 	use miette::{Context as _, IntoDiagnostic as _};
-	let root = canonical_project(&args.project).map_err(|e| miette::miette!(e))?;
+	let launch_root = canonical_project(&args.project).map_err(|e| miette::miette!(e))?;
 	let data_dir = crate::cli::data_dir(None)?;
+	let mut root = launch_root.clone();
+	let mut selected_sessions_dir = None;
+	let mut selected_index_path = None;
+	let mut picked_resume = None;
+	let mut resume_moved = false;
+	if start == ChatStart::SessionIndex {
+		let Some(selection) = crate::pickers::pick_session(&data_dir, args.session_dir.as_deref())
+			.await
+			.map_err(|error| miette::miette!(error))?
+		else {
+			return Ok(());
+		};
+		picked_resume = Some(selection.session.id.0.clone());
+		selected_sessions_dir = Some(selection.sessions_dir);
+		selected_index_path = Some(selection.database_path);
+		start = ChatStart::Session;
+		let recorded_root = PathBuf::from(selection.session.project.as_str());
+		if recorded_root.is_dir() {
+			root = canonical_project(&recorded_root).map_err(|error| miette::miette!(error))?;
+		} else {
+			let choices = [
+				omp_chat_ui::ListRow {
+					key:    sf!("move"),
+					label:  sf!("Move session"),
+					detail: Str::from(launch_root.to_string_lossy().as_ref()),
+				},
+				omp_chat_ui::ListRow {
+					key:    sf!("cancel"),
+					label:  sf!("Cancel"),
+					detail: sf!("Keep the journal unchanged"),
+				},
+			];
+			if crate::pickers::run_list("Project missing", &choices)
+				.await
+				.map_err(|error| miette::miette!(error))?
+				!= Some(0)
+			{
+				return Ok(());
+			}
+			resume_moved = true;
+			eprintln!(
+				"Session project `{}` no longer exists; moving future workspace access to `{}`.",
+				recorded_root.display(),
+				launch_root.display()
+			);
+		}
+	}
 	let catalog =
 		omp_llm_catalog::snapshot::Catalog::try_embedded().map_err(|e| miette::miette!(e))?;
-	let settings = crate::settings::Settings::load(&data_dir);
+	let settings =
+		crate::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
+	let roles = crate::discovery::roles::resolve_launch_roles(
+		catalog,
+		args.model.as_deref(),
+		args.smol.as_deref(),
+		args.slow.as_deref(),
+		args.plan.as_deref(),
+	)
+	.map_err(|error| miette::miette!(error))?;
+	for selector in args
+		.models
+		.as_ref()
+		.into_iter()
+		.flat_map(|selectors| selectors.0.iter())
+	{
+		resolve_model_selector(catalog, selector).map_err(|error| miette::miette!(error))?;
+	}
+	for root in &args.add_dir {
+		std::fs::canonicalize(root)
+			.into_diagnostic()
+			.wrap_err_with(|| {
+				format!("additional workspace root `{}` is unavailable", root.display())
+			})?;
+	}
+	let plan_selection = roles
+		.plan
+		.as_ref()
+		.map(|model| crate::plan::ModelSelection { model: model.as_str().into(), thinking: None });
 	let interrupt_grace = settings.runtime_durations().interrupt_grace;
 	let auto_thinking = settings.auto_thinking;
-	let model = match args
-		.model
+	let power_mode = crate::power::configured(&data_dir).into_diagnostic()?;
+	let explicit_model = roles
+		.primary
+		.as_ref()
+		.map(|model| Str::from(model.as_str()))
+		.or_else(|| args.model.clone());
+	let model = match explicit_model
 		.clone()
 		.or_else(|| settings.default_model.map(Str::from))
 	{
@@ -1016,13 +1469,39 @@ pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> 
 			.await?
 			.ok_or_else(|| miette::miette!("no model configured — run `omp` again to finish setup"))?,
 	};
-	let model = resolve_model_selector(catalog, model.as_str()).map_err(|e| miette::miette!(e))?;
+	let model = match resolve_model_selector(catalog, model.as_str()) {
+		Ok(model) => model,
+		Err(error) if explicit_model.is_none() => {
+			let fallback = fallback_model_selector(catalog).ok_or_else(|| miette::miette!(error))?;
+			eprintln!(
+				"Saved model `{}` is unavailable; using `{}` for this session without changing the \
+				 saved preference.",
+				model, fallback
+			);
+			fallback
+		},
+		Err(error) => return Err(miette::miette!(error).into()),
+	};
 	let state_dir =
 		crate::project_state::directory(&data_dir, &root).map_err(|e| miette::miette!(e))?;
-	let sessions_dir = state_dir.join("sessions");
 	ensure_state_directory(&state_dir).map_err(|e| miette::miette!(e))?;
+	let ephemeral_sessions = if args.no_session {
+		Some(EphemeralSessions::create().map_err(|error| miette::miette!(error))?)
+	} else {
+		None
+	};
+	let sessions_dir = if let Some(ephemeral) = &ephemeral_sessions {
+		ephemeral.path().to_owned()
+	} else if let Some(selected) = selected_sessions_dir {
+		selected
+	} else if let Some(configured) = args.session_dir.as_deref() {
+		ensure_state_directory(configured).map_err(|error| miette::miette!(error))?;
+		std::fs::canonicalize(configured).into_diagnostic()?
+	} else {
+		state_dir.join("sessions")
+	};
 	ensure_state_directory(&sessions_dir).map_err(|e| miette::miette!(e))?;
-	let resume = args.resume.clone();
+	let requested_resume = picked_resume.or_else(|| args.resume.clone());
 	let env_socket = crate::project_state::environment_socket(&state_dir);
 	let document_socket = crate::project_state::document_socket(&state_dir);
 	let environment = crate::envd::ProjectEnvironment::connect_or_start(
@@ -1035,61 +1514,224 @@ pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> 
 	)
 	.await
 	.map_err(|e| miette::miette!(e))?;
-	let session_index = environment.sessions_index();
+	let session_index = if let Some(database) = selected_index_path {
+		Arc::new(
+			SessionIndex::open(database)
+				.map_err(|error| miette::miette!(ChatError::SessionIndex(error)))?,
+		)
+	} else if args.session_dir.is_some() && !args.no_session {
+		Arc::new(
+			SessionIndex::open(sessions_dir.join("sessions.sqlite3"))
+				.map_err(|error| miette::miette!(ChatError::SessionIndex(error)))?,
+		)
+	} else {
+		environment.sessions_index()
+	};
+	let breadcrumbs = crate::project_state::TerminalBreadcrumbs::new(&data_dir)
+		.map_err(|error| miette::miette!(error))?;
+	let terminal_id = omp_tui::ttyid::terminal_id();
+	let resume = if let Some(resume) = requested_resume {
+		if strict_session_id(&resume).is_ok() {
+			Some(resume)
+		} else {
+			let root_text = root.to_string_lossy();
+			let page = session_index
+				.list(&omp_storage::index::SessionFilter {
+					project: Some(Str::from(root_text.as_ref())),
+					limit: 200,
+					..Default::default()
+				})
+				.map_err(|error| miette::miette!(error))?;
+			Some(
+				crate::project_state::resolve_session_selector(&page.sessions, resume.as_str())
+					.map_err(|error| miette::miette!(error))?
+					.0,
+			)
+		}
+	} else if let Some(selector) = args.continue_session.as_deref() {
+		if selector == "@terminal" {
+			breadcrumbs
+				.read(terminal_id.as_str())
+				.map_err(|error| miette::miette!(error))?
+				.map(|session| session.0)
+		} else {
+			let root_text = root.to_string_lossy();
+			let page = session_index
+				.list(&omp_storage::index::SessionFilter {
+					project: Some(Str::from(root_text.as_ref())),
+					limit: 200,
+					..Default::default()
+				})
+				.map_err(|error| miette::miette!(error))?;
+			Some(
+				crate::project_state::resolve_session_selector(&page.sessions, selector)
+					.map_err(|error| miette::miette!(error))?
+					.0,
+			)
+		}
+	} else {
+		None
+	};
+	let fork = if let Some(selector) = args.fork.as_ref() {
+		if strict_session_id(selector).is_ok() {
+			Some(selector.clone())
+		} else {
+			let root_text = root.to_string_lossy();
+			let page = session_index
+				.list(&omp_storage::index::SessionFilter {
+					project: Some(Str::from(root_text.as_ref())),
+					limit: 200,
+					..Default::default()
+				})
+				.map_err(|error| miette::miette!(error))?;
+			Some(
+				crate::project_state::resolve_session_selector(&page.sessions, selector.as_str())
+					.map_err(|error| miette::miette!(error))?
+					.0,
+			)
+		}
+	} else {
+		None
+	};
 	let env = environment.client().clone();
 	let eval_bridge = environment.eval_bridge();
 	let eval_control = environment.eval_control();
 
 	let registry = environment.registry();
-	let session = open_session(
+	let session_open = if args.no_session {
+		SessionOpen::Ephemeral
+	} else if let Some(source) = fork.as_ref() {
+		SessionOpen::Fork(source)
+	} else if let Some(source) = resume.as_ref() {
+		if resume_moved {
+			SessionOpen::ResumeMoved(source)
+		} else {
+			SessionOpen::Resume(source)
+		}
+	} else {
+		SessionOpen::New
+	};
+	let mut session = open_session(
 		&root,
 		&sessions_dir,
-		resume.as_ref(),
+		session_open,
 		registry.as_ref(),
-		Arc::clone(&session_index),
+		(!args.no_session).then(|| Arc::clone(&session_index)),
 	)
 	.map_err(|e| miette::miette!(e))?;
+	if matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_)) {
+		let pending_turn = session.journal.pending_turn().is_some();
+		let pending_jobs = session.journal.pending_jobs().count();
+		if pending_turn || pending_jobs != 0 {
+			eprintln!(
+				"Warning: resumed session has {} pending tool call(s){}.",
+				pending_jobs,
+				if pending_turn {
+					" and an interrupted turn"
+				} else {
+					""
+				}
+			);
+		}
+	}
+	let blueprint = session_blueprint(
+		model.as_str(),
+		catalog,
+		&root,
+		&args.add_dir,
+		&session.id,
+		Arc::clone(&registry),
+	)
+	.map_err(|error| miette::miette!(error))?;
 	let mut snapshot =
-		agent_snapshot(model.as_str(), catalog, &root, &session.id, Arc::clone(&registry))
-			.map_err(|e| miette::miette!(e))?;
+		agent_snapshot(&blueprint, catalog).map_err(|error| miette::miette!(error))?;
 	if let Some(level) = args.thinking {
 		let effort = thinking_effort(level, auto_thinking);
 		snapshot.turn.params.thinking =
 			Some(inference_pb::Reasoning { effort: effort as i32, ..Default::default() });
 	}
+	if resume.is_some() {
+		let path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
+		let Session { id, journal, initial_items: _ } = session;
+		let revived = omp_agent::revive_existing(&path, journal, snapshot)
+			.map_err(|error| miette::miette!(error))?;
+		session = Session { id, journal: revived.journal, initial_items: revived.live_items };
+		snapshot = revived.snapshot;
+		if let Some(model) = revived.model_override
+			&& !model.fallback
+		{
+			snapshot.turn.params.model = format!("{}/{}", model.model.provider.0, model.model.model.0);
+		}
+		if !model_selector_is_selectable(catalog, &snapshot.turn.params.model) {
+			let saved = snapshot.turn.params.model.clone();
+			let fallback = fallback_model_selector(catalog)
+				.ok_or_else(|| miette::miette!("no selectable model is available to resume"))?;
+			snapshot.turn.params.model = fallback.as_str().to_owned();
+			eprintln!(
+				"Session model `{saved}` is unavailable; resumed with `{fallback}` without changing \
+				 the session pin."
+			);
+		}
+	}
+	apply_launch_tool_selection(&mut snapshot, &args, registry.as_ref())
+		.map_err(|error| miette::miette!(error))?;
 	let state = AgentState::new(snapshot);
+	let initial_mode = if args.plan_mode {
+		crate::modes::ActiveMode::Plan
+	} else if args.prewalk {
+		crate::modes::ActiveMode::Prewalk
+	} else {
+		crate::modes::ActiveMode::Standard
+	};
 
 	if let Some(endpoint) = args.gateway {
 		let channel = omp_rpc::uds::connect(endpoint.as_path())
 			.await
 			.into_diagnostic()
 			.wrap_err_with(|| format!("could not connect to {endpoint}"))?;
+		environment
+			.search_bridge()
+			.bind_remote(channel.clone())
+			.into_diagnostic()?;
 		Box::pin(run_ui(
 			RpcTurnClient::new(channel),
 			&environment,
 			env,
 			state,
 			session,
+			blueprint,
 			Arc::clone(&eval_bridge),
 			eval_control.clone(),
 			None,
 			data_dir.clone(),
+			power_mode,
+			initial_mode,
+			plan_selection,
 			ChatScope {
 				catalog,
 				root: &root,
 				sessions_dir: &sessions_dir,
 				session_index: Arc::clone(&session_index),
 				registry,
+				persist_sessions: !args.no_session,
 			},
 			start,
 		))
 		.await
 		.into_diagnostic()?;
 	} else {
-		let (inference_registry, inference) =
-			crate::daemon::production_inference(&data_dir, Arc::clone(&registry))
+		let (inference_registry, inference, credential_authority) =
+			crate::daemon::production_inference(&data_dir, Arc::clone(&registry), Some(&root))
 				.await
 				.into_diagnostic()?;
+		environment
+			.search_bridge()
+			.bind(inference.clone())
+			.into_diagnostic()?;
+		environment
+			.github_credentials()
+			.bind(credential_authority)
+			.map_err(|_| miette::miette!("GitHub credential authority is already bound"))?;
 		let client = InProcTurnClient::new(inference)
 			.await
 			.map_err(ChatError::from)
@@ -1100,16 +1742,21 @@ pub(crate) async fn run(args: ChatArgs, start: ChatStart) -> miette::Result<()> 
 			env,
 			state,
 			session,
+			blueprint,
 			eval_bridge,
 			eval_control,
 			Some(inference_registry),
 			data_dir,
+			power_mode,
+			initial_mode,
+			plan_selection,
 			ChatScope {
 				catalog,
 				root: &root,
 				sessions_dir: &sessions_dir,
 				session_index: Arc::clone(&session_index),
 				registry,
+				persist_sessions: !args.no_session,
 			},
 			start,
 		))
@@ -1135,16 +1782,20 @@ pub(crate) async fn run(_args: ChatArgs, _start: ChatStart) -> miette::Result<()
 	clippy::future_not_send,
 	reason = "the designed terminal host remains confined to its event-loop thread"
 )]
-async fn run_ui<C: TurnClient + Clone + 'static>(
+async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 	client: C,
 	environment: &crate::envd::ProjectEnvironment,
 	env: omp_env::EnvClient,
 	mut state: AgentState,
 	mut session: Session,
+	mut blueprint: SessionBlueprint,
 	eval_bridge: Arc<crate::envd::eval::SessionBridgeHost>,
 	eval_control: omp_tools::eval::EvalSessionControl,
 	auth_registry: Option<InferenceRegistry>,
 	data_dir: PathBuf,
+	power_mode: crate::power::SleepPrevention,
+	initial_mode: crate::modes::ActiveMode,
+	plan_selection: Option<crate::plan::ModelSelection>,
 	scope: ChatScope<'_>,
 	mut start: ChatStart,
 ) -> Result<(), ChatError> {
@@ -1157,37 +1808,65 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		scope.root.to_path_buf(),
 		Arc::clone(&scope.session_index),
 	));
-	eval_bridge
-		.bind_parent(parent.clone())
+	let _eval_parent_binding = eval_bridge
+		.bind_sdk_parent(parent.session_id(), parent.clone())
 		.map_err(|error| ChatError::EvalBridge(Str::from(error.to_string())))?;
+	let cold_agents = scope.sessions_dir.join("eval-agents");
+	if cold_agents.is_dir() {
+		omp_agent::AgentRegistry::global().discover_transcripts(&cold_agents)?;
+	}
 	let auth = auth_registry.map(ChatAuthWorker::start);
+	let drafts = crate::session_manager::DraftStore::new(&data_dir)?;
+	let breadcrumbs = crate::project_state::TerminalBreadcrumbs::new(&data_dir)?;
+	let terminal_id = omp_tui::ttyid::terminal_id();
 	loop {
+		if scope.persist_sessions {
+			breadcrumbs.restamp(terminal_id.as_str(), &SessionId(session.id.clone()))?;
+		}
 		parent.update(state.clone(), session.id.clone());
 		let session_root = scope.sessions_dir.join(session.id.as_str());
 		ensure_state_directory(&session_root)?;
 		ensure_state_directory(&session_root.join("local"))?;
-		eval_bridge.set_session_config(crate::envd::eval::EvalSessionConfig {
-			local_roots_json: Str::from(
-				json!({ "local": session_root.join("local").to_string_lossy() }).to_string(),
-			),
-			artifacts_dir:    Str::from(session_root.to_string_lossy().as_ref()),
-			session_file:     Str::from(
-				scope
-					.sessions_dir
-					.join(format!("{}.jsonl", session.id))
-					.to_string_lossy()
-					.as_ref(),
-			),
-		});
 		let context_window = {
 			let current = state.snapshot();
 			model_context_window(scope.catalog, &current.turn.params.model)
 		};
 		let Session { id, journal, initial_items } = session;
 		let current_id = id.clone();
+		let content = crate::discovery::active_content_snapshots(scope.root);
+		let (ttsr, ttsr_diagnostics) = crate::rulebook::ttsr_registry(content.rules.as_ref());
+		for error in ttsr_diagnostics {
+			tracing::warn!(%error, "TTSR rule condition was rejected");
+		}
 		let mut agent =
 			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
-		let modes = Arc::new(crate::modes::ExecutionModes::new(agent.execution_mode()));
+		agent.set_ttsr_registry(ttsr);
+		blueprint.configure_agent(&mut agent);
+		parent.bind_parent_jobs(Arc::clone(agent.jobs()));
+		agent.set_blob_store(omp_storage::blob::BlobStore::open(&data_dir)?);
+		agent.set_run_activity(crate::power::PowerActivity::new(power_mode));
+		let (mode_store, projection) = crate::modes::persistence::ModePersistence::open(
+			agent.journal(),
+			agent.control(),
+			id.as_str(),
+			scope.root.to_string_lossy().as_ref(),
+		)?;
+		let restored_plan = projection
+			.as_ref()
+			.and_then(|projection| projection.plan.as_ref())
+			.is_some_and(|plan| plan.enabled);
+		let modes = Arc::new(crate::modes::ExecutionModes::from_projection(
+			agent.execution_mode(),
+			projection.unwrap_or_default(),
+		));
+		modes.attach_persistence(mode_store);
+		modes.bind_plan_selection(state.clone(), plan_selection.clone());
+		match initial_mode {
+			crate::modes::ActiveMode::Plan if !restored_plan => modes.enter_plan(false)?,
+			crate::modes::ActiveMode::Prewalk => modes.arm_prewalk()?,
+			_ => {},
+		}
+		let _goal_binding = environment.goal_control().bind(Arc::clone(&modes));
 		state.update(|snapshot| {
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
@@ -1195,8 +1874,18 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 		let _control_binding = environment.bind_agent_control(agent.control())?;
 		environment.bind_device_availability(agent.mailbox());
 		let tree = parent.tree();
+		let root_budget = state
+			.snapshot()
+			.turn
+			.params
+			.task_budget
+			.and_then(|budget| budget.remaining_tokens)
+			.map_or_else(Budget::default, |remaining| Budget {
+				max_output_tokens: Some(remaining),
+				..Budget::default()
+			});
 		let node = tree
-			.register(id.clone(), sf!("Main"), AgentKind::Main, None, id.clone(), Budget::default())
+			.register(id.clone(), sf!("Main"), AgentKind::Main, None, id.clone(), root_budget)
 			.map_err(|error| ChatError::EvalBridge(Str::from(error.to_string())))?;
 		node.set_status(AgentStatus::Running);
 		let broker = parent.broker();
@@ -1210,9 +1899,21 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			env.clone(),
 			id.clone(),
 			id.clone(),
+			Some(agent.events().clone()),
+			Some(parent.supervisor.clone()),
 		)));
 		let _vibe = crate::vibe::attach_chat(Arc::clone(&parent), Arc::clone(&modes));
-		let exit = chat_ui::run(
+		let initial_draft = if scope.persist_sessions {
+			drafts
+				.consume(&SessionId(current_id.clone()))?
+				.unwrap_or_default()
+		} else {
+			String::new()
+		};
+		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
+		let (_approval_route, approval_inbox) =
+			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
+		let outcome = chat_ui::run(
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window },
 			Arc::clone(&scope.registry),
@@ -1220,14 +1921,21 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 			modes,
 			auth.as_ref().map(|worker| &worker.ui),
 			data_dir.clone(),
+			scope.root.to_path_buf(),
 			Vec::new(),
+			content.skills,
+			Some(approval_inbox),
 			|| resume_choices(scope.sessions_dir, scope.root, Some(&current_id)).into_diagnostic(),
 			matches!(start, ChatStart::SessionIndex),
+			Str::from(initial_draft),
 		)
 		.await
 		.map_err(ChatError::Ui)?;
+		if scope.persist_sessions {
+			drafts.save(&SessionId(current_id.clone()), outcome.draft.as_str())?;
+		}
 		start = ChatStart::Session;
-		match exit {
+		match outcome.exit {
 			omp_chat_ui::host::HostExit::Quit => break,
 			omp_chat_ui::host::HostExit::Resume(id) => {
 				eval_control.request_reset();
@@ -1235,17 +1943,31 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 				session = open_session(
 					scope.root,
 					scope.sessions_dir,
-					Some(&id),
+					SessionOpen::Resume(&id),
 					scope.registry.as_ref(),
-					Arc::clone(&scope.session_index),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
 				)?;
-				state = AgentState::new(agent_snapshot(
+				crate::envd::migrate_session_artifacts(
+					scope.sessions_dir,
+					current_id.as_str(),
+					session.id.as_str(),
+				)
+				.map_err(|source| ChatError::ProjectState {
+					path: scope.sessions_dir.to_owned(),
+					source,
+				})?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
 					&model,
 					scope.catalog,
 					scope.root,
+					&additional_roots,
 					&session.id,
 					Arc::clone(&scope.registry),
-				)?);
+				)?;
+				state = AgentState::new(agent_snapshot(&blueprint, scope.catalog)?);
 			},
 			omp_chat_ui::host::HostExit::NewSession => {
 				eval_control.request_reset();
@@ -1253,17 +1975,35 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 				session = open_session(
 					scope.root,
 					scope.sessions_dir,
-					None,
+					if scope.persist_sessions {
+						SessionOpen::New
+					} else {
+						SessionOpen::Ephemeral
+					},
 					scope.registry.as_ref(),
-					Arc::clone(&scope.session_index),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
 				)?;
-				state = AgentState::new(agent_snapshot(
+				crate::envd::migrate_session_artifacts(
+					scope.sessions_dir,
+					current_id.as_str(),
+					session.id.as_str(),
+				)
+				.map_err(|source| ChatError::ProjectState {
+					path: scope.sessions_dir.to_owned(),
+					source,
+				})?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
 					&model,
 					scope.catalog,
 					scope.root,
+					&additional_roots,
 					&session.id,
 					Arc::clone(&scope.registry),
-				)?);
+				)?;
+				state = AgentState::new(agent_snapshot(&blueprint, scope.catalog)?);
 			},
 		}
 	}
@@ -1273,10 +2013,12 @@ async fn run_ui<C: TurnClient + Clone + 'static>(
 	Ok(())
 }
 
-fn model_context_window(catalog: &omp_llm_catalog::snapshot::Catalog, model: &str) -> Option<u64> {
-	let key = omp_llm_catalog::ModelKey::from(model);
+pub(crate) fn model_context_window(
+	catalog: &omp_llm_catalog::snapshot::Catalog,
+	model: &str,
+) -> Option<u64> {
 	catalog
-		.model(&key)
+		.model(omp_llm_catalog::ModelKey::from_ref(model))
 		.or_else(|| catalog.resolve_alias(model))
 		.and_then(|spec| spec.limits.context_window)
 }
@@ -1286,12 +2028,37 @@ fn model_context_window(catalog: &omp_llm_catalog::snapshot::Catalog, model: &st
 /// Unknown or missing capability evidence keeps tools advertised; only
 /// explicit `Unsupported` evidence (e.g. Apple's on-device model) strips them.
 fn model_rejects_tools(catalog: &omp_llm_catalog::snapshot::Catalog, model: &str) -> bool {
-	let key = omp_llm_catalog::ModelKey::from(model);
 	catalog
-		.model(&key)
+		.model(omp_llm_catalog::ModelKey::from_ref(model))
 		.or_else(|| catalog.resolve_alias(model))
 		.and_then(|spec| spec.capabilities.chat.as_ref())
 		.is_some_and(|chat| chat.tools.is_unsupported())
+}
+
+fn model_selector_is_selectable(
+	catalog: &omp_llm_catalog::snapshot::Catalog,
+	selector: &str,
+) -> bool {
+	if selector.starts_with('@') {
+		return true;
+	}
+	catalog
+		.model(omp_llm_catalog::ModelKey::from_ref(selector))
+		.or_else(|| catalog.resolve_alias(selector))
+		.is_some_and(|model| {
+			model.availability != omp_llm_catalog::ModelAvailability::Disabled
+				&& model
+					.routes
+					.iter()
+					.any(|route| catalog.route(route).is_some())
+		})
+}
+
+fn fallback_model_selector(catalog: &omp_llm_catalog::snapshot::Catalog) -> Option<Str> {
+	let mru = BTreeMap::new();
+	omp_llm_catalog::find_smol(catalog.models(), catalog.routes(), &mru)
+		.or_else(|| omp_llm_catalog::pick_default(catalog.models(), catalog.routes(), &mru))
+		.map(|selected| Str::from(selected.model.as_str()))
 }
 
 /// Canonicalizes a `--model` selector to its exact catalog key.
@@ -1300,13 +2067,13 @@ fn model_rejects_tools(catalog: &omp_llm_catalog::snapshot::Catalog, model: &str
 /// key; role selectors (`@…`) defer to downstream resolution. A route id or
 /// unknown selector fails fast instead of surfacing as a mid-turn
 /// `TargetNotFound`.
-fn resolve_model_selector(
+pub(crate) fn resolve_model_selector(
 	catalog: &omp_llm_catalog::snapshot::Catalog,
 	selector: &str,
 ) -> Result<Str, ChatError> {
 	if selector.starts_with('@')
 		|| catalog
-			.model(&omp_llm_catalog::ModelKey::from(selector))
+			.model(omp_llm_catalog::ModelKey::from_ref(selector))
 			.is_some()
 	{
 		return Ok(selector.into());
@@ -1314,7 +2081,7 @@ fn resolve_model_selector(
 	if let Some(spec) = catalog.resolve_alias(selector) {
 		return Ok(spec.key.as_str().into());
 	}
-	if let Some(route) = catalog.route(&omp_llm_catalog::RouteId::from(selector)) {
+	if let Some(route) = catalog.route(omp_llm_catalog::RouteId::from_ref(selector)) {
 		// Models bound to this exact route, else every model the provider serves.
 		let mut candidates: Vec<&str> = catalog
 			.models()
@@ -1368,7 +2135,7 @@ fn resolve_model_selector(
 	Err(ChatError::UnknownModel { selector: selector.into(), suggestions })
 }
 
-fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
+pub(crate) fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
 	let root = std::fs::canonicalize(path)
 		.map_err(|source| ChatError::Project { path: path.to_owned(), source })?;
 	if !root.is_dir() {
@@ -1377,52 +2144,83 @@ fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
 	Ok(root)
 }
 
-fn open_session(
+pub(crate) fn open_session(
 	root: &Path,
 	sessions_dir: &Path,
-	resume: Option<&Str>,
+	open: SessionOpen<'_>,
 	registry: &Registry,
-	session_index: Arc<SessionIndex>,
+	session_index: Option<Arc<SessionIndex>>,
 ) -> Result<Session, ChatError> {
-	let id = match resume {
-		Some(id) => strict_session_id(id)?,
-		None => Str::from(omp_core::Ulid::generate().to_string()),
+	let source = match open {
+		SessionOpen::Resume(id) | SessionOpen::ResumeMoved(id) | SessionOpen::Fork(id) => {
+			Some(strict_session_id(id)?)
+		},
+		SessionOpen::New | SessionOpen::Ephemeral => None,
+	};
+	let id = if matches!(open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_)) {
+		source.clone().expect("resume has a validated source")
+	} else {
+		Str::from(omp_core::Ulid::generate().to_string())
 	};
 	let path = sessions_dir.join(format!("{}.jsonl", id.as_str()));
-	let (journal, initial_items) = if resume.is_some() {
-		validate_session_file(&path).map_err(|source| {
-			if source.kind() == std::io::ErrorKind::NotFound {
-				ChatError::MissingResume(id.clone())
-			} else {
-				ChatError::ProjectState { path: path.clone(), source }
+	let mut journal = match open {
+		SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_) => {
+			validate_session_file(&path).map_err(|source_error| {
+				if source_error.kind() == std::io::ErrorKind::NotFound {
+					ChatError::MissingResume(id.clone())
+				} else {
+					ChatError::ProjectState { path: path.clone(), source: source_error }
+				}
+			})?;
+			let mut journal = Journal::open(&path)?;
+			let view = journal.load()?;
+			if view.header().id.0 != id {
+				return Err(ChatError::SessionMismatch(id));
 			}
-		})?;
-		let mut journal = Journal::open(&path)?;
-		let view = journal.load()?;
-		if view.header().id.0 != id {
-			return Err(ChatError::SessionMismatch(id));
-		}
-		if view.header().cwd != root {
-			return Err(ChatError::SessionProjectMismatch { session: id });
-		}
-		let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
-		drop(view);
-		journal.attach_session_index(Arc::clone(&session_index), SessionId(id.clone()));
-		(journal, initial_items)
-	} else {
-		let journal = create_indexed_journal(
+			let recorded_root = view.header().cwd.clone();
+			drop(view);
+			let current_root = journal.workspace_roots(&recorded_root)?;
+			if current_root.primary() != root && !matches!(open, SessionOpen::ResumeMoved(_)) {
+				return Err(ChatError::SessionProjectMismatch { session: id });
+			}
+			let index = session_index.ok_or(ChatError::MissingSessionIndex)?;
+			journal.attach_session_index(index, SessionId(id.clone()));
+			if current_root.primary() != root {
+				journal.move_workspace_root(now_ms(), root.to_owned())?;
+			}
+			journal
+		},
+		SessionOpen::Fork(_) => {
+			let source_id = source.as_ref().expect("fork has a validated source");
+			let source_path = sessions_dir.join(format!("{}.jsonl", source_id.as_str()));
+			validate_session_file(&source_path).map_err(|source_error| {
+				if source_error.kind() == std::io::ErrorKind::NotFound {
+					ChatError::MissingResume(source_id.clone())
+				} else {
+					ChatError::ProjectState { path: source_path.clone(), source: source_error }
+				}
+			})?;
+			let index = session_index.ok_or(ChatError::MissingSessionIndex)?;
+			create_indexed_fork(&source_path, &path, root, &id, source_id, index)?
+		},
+		SessionOpen::New => create_indexed_journal(
 			&path,
 			root,
 			&id,
-			Arc::clone(&session_index),
+			session_index.ok_or(ChatError::MissingSessionIndex)?,
 			SessionKind::Interactive,
 			None,
-		)?;
-		let view = journal.load()?;
-		let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
-		drop(view);
-		(journal, initial_items)
+		)?,
+		SessionOpen::Ephemeral => Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(id.clone()),
+			created: now_ms(),
+			cwd:     root.to_owned(),
+		})?,
 	};
+	let view = journal.load()?;
+	let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
+	drop(view);
 	Ok(Session { id, journal, initial_items })
 }
 
@@ -1465,6 +2263,64 @@ fn create_indexed_journal(
 		) => {
 			return Err(ChatError::SessionIndex(error));
 		},
+	};
+	journal.attach_session_index(session_index, session_id);
+	Ok(journal)
+}
+
+fn create_indexed_fork(
+	source_path: &Path,
+	child_path: &Path,
+	root: &Path,
+	child_id: &Str,
+	source_id: &Str,
+	session_index: Arc<SessionIndex>,
+) -> Result<Journal, ChatError> {
+	let source = Journal::open(source_path)?;
+	let source_view = source.load()?;
+	if source_view.header().id.0 != *source_id {
+		return Err(ChatError::SessionMismatch(source_id.clone()));
+	}
+	let recorded_root = source_view.header().cwd.clone();
+	drop(source_view);
+	if source.workspace_roots(&recorded_root)?.primary() != root {
+		return Err(ChatError::SessionProjectMismatch { session: source_id.clone() });
+	}
+	let session_id = SessionId(child_id.clone());
+	let parent_id = SessionId(source_id.clone());
+	let created_ms = now_ms();
+	let root_text = root.to_string_lossy();
+	let request = NewSession {
+		id: &session_id,
+		cwd: root_text.as_ref(),
+		project: root_text.as_ref(),
+		created_ms,
+		kind: SessionKind::Interactive,
+		parent: Some(&parent_id),
+		remote: false,
+	};
+	let result = session_index.create_session(&request, || {
+		let journal = source.create_child(
+			child_path,
+			&Header {
+				v:       4,
+				id:      session_id.clone(),
+				created: created_ms,
+				cwd:     root.to_owned(),
+			},
+			created_ms,
+			ChildKind::Fork,
+		)?;
+		let watermark = journal.byte_watermark()?;
+		Ok::<_, omp_agent::JournalError>((journal, watermark))
+	});
+	let mut journal = match result {
+		Ok(journal) => journal,
+		Err(IndexedWriteError::Journal(error)) => return Err(error.into()),
+		Err(
+			IndexedWriteError::IndexBeforeJournal(error)
+			| IndexedWriteError::IndexAfterJournal { source: error, .. },
+		) => return Err(ChatError::SessionIndex(error)),
 	};
 	journal.attach_session_index(session_index, session_id);
 	Ok(journal)
@@ -1613,23 +2469,86 @@ fn relative_time(modified: SystemTime) -> Str {
 }
 
 fn strict_session_id(id: &Str) -> Result<Str, ChatError> {
-	let parsed = id
-		.as_str()
-		.parse::<omp_core::Ulid>()
-		.map_err(|_| ChatError::InvalidResume(id.clone()))?;
-	if parsed.to_string() != id.as_str() {
-		return Err(ChatError::InvalidResume(id.clone()));
+	if let Ok(parsed) = id.as_str().parse::<omp_core::Ulid>()
+		&& parsed.to_string() == id.as_str()
+	{
+		return Ok(id.clone());
 	}
-	Ok(id.clone())
+	let bytes = id.as_bytes();
+	let canonical_uuid = bytes.len() == 36
+		&& bytes.iter().enumerate().all(|(index, byte)| {
+			if matches!(index, 8 | 13 | 18 | 23) {
+				*byte == b'-'
+			} else {
+				byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f')
+			}
+		});
+	if canonical_uuid {
+		Ok(id.clone())
+	} else {
+		Err(ChatError::InvalidResume(id.clone()))
+	}
 }
 
-fn agent_snapshot(
+/// Resolves the shared SDK blueprint over the production registry and durable
+/// journal identity used by chat and print construction.
+pub(crate) fn session_blueprint(
 	model: &str,
 	catalog: &omp_llm_catalog::snapshot::Catalog,
 	root: &Path,
+	additional_roots: &[PathBuf],
 	session_id: &Str,
 	registry: Arc<Registry>,
+) -> Result<SessionBlueprint, ChatError> {
+	let mut options = SessionOptions::new(root);
+	options.additional_roots = additional_roots
+		.iter()
+		.map(|path| {
+			std::fs::canonicalize(path)
+				.map_err(|source| ChatError::Project { path: path.clone(), source })
+		})
+		.collect::<Result<Vec<_>, _>>()?
+		.into_boxed_slice();
+	options.identity.id = Some(session_id.clone());
+	options.model_selectors = Box::new([Str::new(model)]);
+	let mut workspace = WorkspaceInput::new(root, Arc::from([]));
+	let mut roots = Vec::with_capacity(options.additional_roots.len() + 1);
+	for (index, path) in std::iter::once(&options.cwd)
+		.chain(options.additional_roots.iter())
+		.enumerate()
+	{
+		let uri = omp_sdk::Url::from_directory_path(path).map_err(|()| {
+			ChatError::SessionBuild(omp_sdk::SessionBuildError::InvalidRoot { path: path.clone() })
+		})?;
+		let grant = if index == 0 {
+			sf!("primary")
+		} else {
+			sf!("root-{index}")
+		};
+		roots.push(WorkspaceRootInput::new(
+			Str::new(uri.as_str()),
+			bytes::Bytes::copy_from_slice(grant.as_bytes()),
+		));
+	}
+	workspace.roots =
+		WorkspaceRootsInput { revision: 0, primary: roots.first().cloned(), roots: roots.into() };
+	SessionBuilder::new(options, registry)
+		.firehose(Arc::new(omp_telemetry::firehose::Firehose::new()))
+		.build(catalog, &workspace)
+		.map_err(Into::into)
+}
+
+pub(crate) fn agent_snapshot(
+	blueprint: &SessionBlueprint,
+	catalog: &omp_llm_catalog::snapshot::Catalog,
 ) -> Result<AgentSnapshot, ChatError> {
+	let model = blueprint
+		.model_plan()
+		.candidates()
+		.first()
+		.map(|candidate| candidate.selector.as_str())
+		.ok_or(omp_sdk::SessionBuildError::NoDefaultModel)?;
+	let registry = blueprint.registry();
 	let advertised = if model_rejects_tools(catalog, model) {
 		Vec::new()
 	} else {
@@ -1662,6 +2581,12 @@ fn agent_snapshot(
 			strict:      Some(strict),
 		});
 	}
+	let session_id = blueprint
+		.options()
+		.identity
+		.id
+		.as_ref()
+		.expect("SessionBuilder always assigns a session id");
 	let turn = TurnOptions {
 		context_id: Some(session_id.clone()),
 		params: inference_pb::ChatParams {
@@ -1671,9 +2596,56 @@ fn agent_snapshot(
 		},
 		..TurnOptions::default()
 	};
-	let mut snapshot = AgentSnapshot::new(turn, WorkspaceInput::new(root, Arc::from([])), registry);
+	let mut snapshot = AgentSnapshot::new(turn, blueprint.workspace().clone(), Arc::clone(registry));
 	snapshot.enabled_tools = enabled_tools.into();
 	Ok(snapshot)
+}
+
+fn apply_launch_tool_selection(
+	snapshot: &mut AgentSnapshot,
+	args: &ChatArgs,
+	registry: &Registry,
+) -> Result<(), ChatError> {
+	let known = registry
+		.prompt_projection(None)
+		.entries()
+		.map(|entry| entry.name.clone())
+		.collect::<BTreeSet<_>>();
+	let requested = args
+		.tools
+		.as_ref()
+		.map(|tools| tools.0.iter().cloned().collect::<BTreeSet<_>>());
+	if let Some(requested) = &requested
+		&& let Some(unknown) = requested.iter().find(|name| !known.contains(*name))
+	{
+		return Err(ChatError::UnknownTool {
+			name:  unknown.clone(),
+			valid: known.into_iter().collect(),
+		});
+	}
+	let allowed = |name: &str| {
+		if args.no_tools {
+			return false;
+		}
+		if args.no_lsp && (name.contains("lsp") || matches!(name, "diagnostics" | "format")) {
+			return false;
+		}
+		requested
+			.as_ref()
+			.is_none_or(|requested| requested.contains(name))
+	};
+	snapshot
+		.turn
+		.params
+		.tools
+		.retain(|tool| allowed(&tool.name));
+	snapshot.enabled_tools = snapshot
+		.enabled_tools
+		.iter()
+		.filter(|name| allowed(name))
+		.cloned()
+		.collect();
+	Ok(())
 }
 
 fn thinking_effort(
@@ -1705,7 +2677,7 @@ fn now_ms() -> u64 {
 		.unwrap_or(u64::MAX)
 }
 
-fn ensure_state_directory(path: &Path) -> Result<(), ChatError> {
+pub(crate) fn ensure_state_directory(path: &Path) -> Result<(), ChatError> {
 	std::fs::create_dir_all(path)
 		.map_err(|source| ChatError::ProjectState { path: path.to_owned(), source })
 }
@@ -1799,10 +2771,10 @@ mod tests {
 
 		// Explicit precedence pair: the same flat id exists both as a canonical
 		// provider key and verbatim under the aggregator.
-		let native = omp_llm_catalog::ModelKey::from("anthropic/claude-fable-5");
-		let shadowed = omp_llm_catalog::ModelKey::from("openrouter/anthropic/claude-fable-5");
-		assert!(catalog.model(&native).is_some(), "fixture key missing from catalog");
-		assert!(catalog.model(&shadowed).is_some(), "fixture aggregator key missing from catalog");
+		let native = omp_llm_catalog::ModelKey::from_ref("anthropic/claude-fable-5");
+		let shadowed = omp_llm_catalog::ModelKey::from_ref("openrouter/anthropic/claude-fable-5");
+		assert!(catalog.model(native).is_some(), "fixture key missing from catalog");
+		assert!(catalog.model(shadowed).is_some(), "fixture aggregator key missing from catalog");
 		assert_eq!(
 			resolve_model_selector(catalog, "anthropic/claude-fable-5")
 				.expect("canonical provider key resolves")
@@ -1834,7 +2806,7 @@ mod tests {
 				continue;
 			};
 			if catalog
-				.provider(&omp_llm_catalog::ProviderId::from(named_provider))
+				.provider(omp_llm_catalog::ProviderId::from_ref(named_provider))
 				.is_some()
 			{
 				flat_ids.insert((flat_id, named_provider));
@@ -1843,7 +2815,7 @@ mod tests {
 		assert!(!flat_ids.is_empty(), "the catalog carries aggregator flat ids to check");
 		for (flat_id, named_provider) in flat_ids {
 			let resolved = catalog
-				.model(&omp_llm_catalog::ModelKey::from(flat_id))
+				.model(omp_llm_catalog::ModelKey::from_ref(flat_id))
 				.or_else(|| catalog.resolve_alias(flat_id));
 			if let Some(spec) = resolved {
 				assert!(
@@ -1972,7 +2944,7 @@ mod tests {
 			receipt::ExecutionReceipt,
 		};
 
-		let provider = omp_llm_catalog::ProviderId::from("kimi-code");
+		let provider = omp_llm_catalog::ProviderId::from_ref("kimi-code");
 		let error = Error::new(
 			ErrorKind::Authentication,
 			ErrorPhase::Authentication,
@@ -1982,7 +2954,7 @@ mod tests {
 		.status(Some(401))
 		.code(sf!("invalid_grant"))
 		.detail(ErrorDetail::provider(sf!("device authorization expired")));
-		let ChatLoginFailure::Message(message) = chat_login_failure(&provider, &error) else {
+		let ChatLoginFailure::Message(message) = chat_login_failure(provider, &error) else {
 			panic!("an authentication error is a plain login failure message");
 		};
 		assert!(message.contains("provider `kimi-code`"));
@@ -2037,9 +3009,11 @@ mod tests {
 		let session = open_session(
 			&root,
 			&sessions_dir,
-			Some(&id),
+			SessionOpen::Resume(&id),
 			&Registry::new(),
-			Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).expect("session index")),
+			Some(Arc::new(
+				SessionIndex::open(state_dir.join("sessions.sqlite3")).expect("session index"),
+			)),
 		)
 		.expect("resume session");
 		assert_eq!(session.id, id);
@@ -2187,11 +3161,11 @@ mod tests {
 		let session = open_session(
 			&root,
 			&sessions_dir,
-			Some(&id),
+			SessionOpen::Resume(&id),
 			&Registry::new(),
-			Arc::new(
+			Some(Arc::new(
 				SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("session index"),
-			),
+			)),
 		)
 		.expect("torn session resumes");
 		assert_eq!(session.id, id);
@@ -2211,6 +3185,7 @@ mod tests {
 			outcomes: Arc::new(Mutex::new(VecDeque::from([
 				parent_outcome("completion answer"),
 				parent_outcome("agent answer"),
+				parent_outcome("follow-up answer"),
 			]))),
 			inputs:   Arc::clone(&inputs),
 			options:  Arc::clone(&options),
@@ -2239,6 +3214,7 @@ mod tests {
 		let completion = crate::envd::eval::ParentSessionHost::completion(
 			&host,
 			json!({"prompt":"complete this","model":"default"}),
+			&crate::envd::eval::NoopBridgeProgress,
 		)
 		.await
 		.expect("live completion call");
@@ -2254,6 +3230,7 @@ mod tests {
 			crate::envd::eval::ParentSessionHost::agent(
 				&host,
 				json!({"prompt":"delegate this","agent":"task"}),
+				&crate::envd::eval::NoopBridgeProgress,
 			),
 		)
 		.await
@@ -2261,15 +3238,23 @@ mod tests {
 		.expect("live agent call");
 		assert_eq!(agent["text"], "agent answer");
 		assert_eq!(agent["details"]["agent"], "task");
-		assert!(
-			agent["details"]["id"]
-				.as_str()
-				.is_some_and(|id| !id.is_empty()),
-			"agent bridge did not return its durable child id"
-		);
+		let stable_id = agent["details"]["id"]
+			.as_str()
+			.filter(|id| !id.is_empty())
+			.expect("agent bridge did not return its durable child id");
+		let follow_up = crate::envd::eval::ParentSessionHost::agent(
+			&host,
+			json!({"prompt":"follow up","agent":"task","stableId":stable_id}),
+			&crate::envd::eval::NoopBridgeProgress,
+		)
+		.await
+		.expect("retained child follow-up");
+		assert_eq!(follow_up["text"], "follow-up answer");
+		assert_eq!(follow_up["details"]["id"], stable_id);
+		assert_eq!(follow_up["details"]["followUp"], true);
 
 		let options = options.lock();
-		assert_eq!(options.len(), 2);
+		assert_eq!(options.len(), 3);
 		assert!(
 			options[1]
 				.params
@@ -2280,7 +3265,7 @@ mod tests {
 		);
 		drop(options);
 		let inputs = inputs.lock();
-		assert_eq!(inputs.len(), 2);
+		assert_eq!(inputs.len(), 3);
 		assert!(matches!(&inputs[0], TurnInput::Full(thread)
 			if bridge_outcome_text(&inference_pb::Outcome {
 				output: thread.items.clone(),
@@ -2295,6 +3280,17 @@ mod tests {
 						&& message.parts.iter().any(|part| matches!(
 							&part.kind,
 							Some(part::Kind::Text(text)) if text == "delegate this"
+						))
+			))
+		));
+		assert!(matches!(&inputs[2], TurnInput::Full(thread)
+			if thread.items.iter().any(|item| matches!(
+				&item.kind,
+				Some(item::Kind::Message(message))
+					if message.role == i32::from(Role::User)
+						&& message.parts.iter().any(|part| matches!(
+							&part.kind,
+							Some(part::Kind::Text(text)) if text == "follow up"
 						))
 			))
 		));

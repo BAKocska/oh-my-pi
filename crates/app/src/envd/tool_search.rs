@@ -1,7 +1,7 @@
 //! App-owned workspace adapter for the generic grep and glob executors.
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{HashMap, HashSet, VecDeque},
 	fmt,
 	future::Future,
 	path::{Component, Path, PathBuf},
@@ -16,7 +16,12 @@ use omp_tools::{
 	grep::{
 		self, SearchMatch, SearchResult, SearchRoot, SearchRootKind, SearchSnapshot, WorkspaceSearch,
 	},
-	read::{ReadSources as _, archive, web},
+	read::{
+		ReadSources as _, archive,
+		resolver::{ResolverTable, Scheme},
+		selector::parse_uri,
+		web,
+	},
 };
 use omp_walker::{
 	CompiledWalkGlob, FileType, FollowLinks, SizeHintPolicy, WalkDecision, WalkDetail, WalkError,
@@ -31,19 +36,24 @@ const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Cloneable bridge from generic search tools to the app-owned workspace and
 /// session document state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkspaceSearchAdapter {
 	host:         WorkspaceHost,
 	documents:    DocumentHost,
 	read_sources: ReadSourceAdapter,
+	resolvers:    std::sync::Arc<ResolverTable<super::tool_url::UrlResolver>>,
 }
 
 impl WorkspaceSearchAdapter {
-	/// Wraps the concrete workspace owner and session document host used by the
-	/// environment daemon.
-	pub(crate) fn new(host: WorkspaceHost, documents: DocumentHost) -> Self {
-		let read_sources = ReadSourceAdapter::new(documents.clone(), host.clone());
-		Self { host, documents, read_sources }
+	/// Wraps the concrete workspace owner, session document host, and shared
+	/// cache-enabled read source used by the environment daemon.
+	pub(crate) fn new(
+		host: WorkspaceHost,
+		documents: DocumentHost,
+		read_sources: ReadSourceAdapter,
+		resolvers: std::sync::Arc<ResolverTable<super::tool_url::UrlResolver>>,
+	) -> Self {
+		Self { host, documents, read_sources, resolvers }
 	}
 }
 
@@ -105,6 +115,117 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 			result
 		}
 	}
+
+	fn glob_resource(
+		&self,
+		request: glob::WalkRequest,
+	) -> impl Future<Output = Option<Result<WalkResult, glob::Fault>>> + Send + '_ {
+		let resolvers = std::sync::Arc::clone(&self.resolvers);
+		async move {
+			if !request.path.as_str().split(';').any(|target| {
+				target.trim().to_ascii_lowercase().starts_with("ssh://")
+					|| target.trim().to_ascii_lowercase().starts_with("vault://")
+			}) {
+				return None;
+			}
+			Some(remote_glob(&resolvers, request).await)
+		}
+	}
+}
+
+async fn remote_glob(
+	resolvers: &ResolverTable<super::tool_url::UrlResolver>,
+	request: glob::WalkRequest,
+) -> Result<WalkResult, glob::Fault> {
+	let mut matches = Vec::new();
+	let mut missing_paths = Vec::new();
+	let mut truncated = false;
+	for target in request
+		.path
+		.as_str()
+		.split(';')
+		.map(str::trim)
+		.filter(|target| !target.is_empty())
+	{
+		let parsed = parse_uri(target)
+			.map_err(|error| glob::Fault::Workspace { message: Str::new(error.to_string()) })?
+			.ok_or_else(|| glob::Fault::UnsupportedScheme { scheme: Str::new_static("file") })?;
+		if !matches!(parsed.scheme, Scheme::Ssh | Scheme::Vault) {
+			return Err(glob::Fault::UnsupportedScheme {
+				scheme: Str::new(parsed.raw_scheme.to_ascii_lowercase()),
+			});
+		}
+		if parsed.selector_text.is_some() || parsed.query.is_some() {
+			return Err(glob::Fault::Workspace {
+				message: Str::new_static("remote glob targets do not accept read selectors or queries"),
+			});
+		}
+		let resource = parsed.resource;
+		let wildcard = resource.find(['*', '?', '[']);
+		let (base, pattern) = if let Some(index) = wildcard {
+			let slash = resource[..index].rfind('/').unwrap_or(resource.len());
+			(&resource[..slash], resource)
+		} else {
+			let slash = resource.rfind('/').unwrap_or(resource.len());
+			(&resource[..slash], resource)
+		};
+		let compiled =
+			CompiledWalkGlob::new([pattern]).map_err(|error| glob::Fault::InvalidPattern {
+				pattern: Str::new(pattern),
+				message: Str::new(error.to_string()),
+			})?;
+		let mut pending = VecDeque::from([Str::new(base)]);
+		let mut listed_any = false;
+		while let Some(directory) = pending.pop_front() {
+			if matches.len() >= request.limit as usize || pending.len() > 10_000 {
+				truncated = true;
+				break;
+			}
+			let Some(listed) = resolvers
+				.list(parsed.scheme, &directory, request.limit as usize + 1, 1024 * 1024)
+				.await
+			else {
+				return Err(glob::Fault::UnsupportedScheme {
+					scheme: Str::new(parsed.raw_scheme.to_ascii_lowercase()),
+				});
+			};
+			let listed = match listed {
+				Ok(value) => value,
+				Err(error) if !listed_any => {
+					missing_paths.push(Str::new(target));
+					break;
+				},
+				Err(_) => {
+					truncated = true;
+					break;
+				},
+			};
+			listed_any = true;
+			truncated |= listed.truncated;
+			for entry in listed.entries {
+				let child = entry
+					.uri
+					.split_once("://")
+					.map_or(entry.uri.as_str(), |(_, value)| value);
+				if compiled.is_match(child) && (request.hidden || !entry.name.starts_with('.')) {
+					matches.push(WalkMatch {
+						path:        entry.uri.clone(),
+						modified_ms: 0,
+						is_dir:      entry.directory,
+					});
+				}
+				if entry.directory && (request.hidden || !entry.name.starts_with('.')) {
+					pending.push_back(Str::new(child));
+				}
+			}
+		}
+	}
+	if matches.is_empty() && !missing_paths.is_empty() {
+		return Err(glob::Fault::PathNotFound { paths: missing_paths });
+	}
+	matches.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+	matches.dedup_by(|left, right| left.path == right.path);
+	Ok(WalkResult { matches, missing_paths, timed_out: false, truncated })
 }
 
 struct CancelOnDrop(CancellationToken);

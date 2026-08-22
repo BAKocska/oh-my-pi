@@ -135,7 +135,7 @@ pub(crate) async fn run(args: EnvdArgs) -> Result<(), EnvdError> {
 	let root = workspace.root().to_path_buf();
 	let data_dir = crate::cli::data_dir(None)
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()))?;
-	let settings = crate::settings::Settings::load(&data_dir);
+	let settings = crate::settings::current(&data_dir).map_err(std::io::Error::other)?;
 	let interrupt_grace = settings.runtime_durations().interrupt_grace;
 	let state_dir = if let Some(path) = args.state_dir {
 		path

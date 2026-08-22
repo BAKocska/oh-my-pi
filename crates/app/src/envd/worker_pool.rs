@@ -11,7 +11,7 @@ use std::{
 };
 
 use flume::{Receiver, Sender};
-use omp_core::{CowBytes, Str};
+use omp_core::{CowBytes, Str, encoding::hex};
 use omp_env::WorkerLease;
 use omp_proto::env::v1::WorkerData;
 use omp_storage::blob::BlobStore;
@@ -142,6 +142,27 @@ impl SpillDiverter {
 			hash: reference.hash.as_bytes().to_vec().into(),
 			size: reference.size,
 			..omp_proto::thread::v1::Blob::default()
+		})
+	}
+}
+
+impl omp_tools::edit::EditSnapshotStore for SpillDiverter {
+	async fn store_snapshot(
+		&self,
+		bytes: bytes::Bytes,
+	) -> Result<omp_tool::BlobRef, omp_tools::edit::SnapshotFault> {
+		let blob = self
+			.put_reader(bytes.as_ref())
+			.map_err(|_| omp_tools::edit::SnapshotFault::Store)?;
+		let hash: &[u8; 32] = blob
+			.hash
+			.as_ref()
+			.try_into()
+			.map_err(|_| omp_tools::edit::SnapshotFault::Store)?;
+		Ok(omp_tool::BlobRef {
+			hash:       Str::from(hex::encode_n(hash).as_str()),
+			media_type: Str::new_static("application/octet-stream"),
+			byte_len:   blob.size,
 		})
 	}
 }

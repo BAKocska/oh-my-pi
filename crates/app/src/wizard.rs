@@ -29,7 +29,6 @@ use crate::{
 		AuthPromptKind, CREDENTIAL_STORAGE_LOCKED_MESSAGE, ChatAuthEvent, auth_input,
 		prompt_masks_input,
 	},
-	settings::Settings,
 };
 
 const STATUS_ID: &str = "wizard-status";
@@ -180,9 +179,17 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(AppEvent::Changed { id, value })
 					if id.as_str() == MODEL_SELECT_ID && step == Step::Model =>
 				{
-					Settings { default_model: Some(value.to_string()), ..Settings::default() }
-						.save(data_dir)
-						.into_diagnostic()?;
+					crate::settings::manager::SettingsManager::open(
+						crate::settings::manager::SettingsPaths::discover(data_dir, None),
+					)
+					.into_diagnostic()?
+					.set(
+						crate::settings::manager::MutationScope::Global,
+						"default_model",
+						value.as_str(),
+					)
+					.await
+					.into_diagnostic()?;
 					break 'wizard Some(value);
 				},
 				Some(AppEvent::OverlayClosed(_)) => match step {

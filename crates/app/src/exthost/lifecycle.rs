@@ -1,6 +1,14 @@
 //! Extension declaration, verification, and activation lifecycle.
 
-use std::{collections::BTreeSet, future::Future, sync::Arc, time::SystemTime};
+use std::{
+	collections::BTreeSet,
+	future::Future,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicU64, Ordering},
+	},
+	time::SystemTime,
+};
 
 use omp_agent::{HookPhase, MailboxSender, device_availability_interrupt};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
@@ -8,6 +16,7 @@ use omp_core::{Provenance, Str};
 use omp_proto::{
 	thread::v1::{Item, Message, Part, Role, item, part},
 	toolhost::v1::SetAvailability,
+	ui::v1::{UiEffect, UiRequest},
 };
 use omp_tool::{AvailabilityDelta, Registry};
 use thiserror::Error;
@@ -41,6 +50,174 @@ impl AvailabilityBatch {
 		}
 	}
 }
+/// One generation-stamped extension observation retained by a headless host.
+#[derive(Clone, Debug)]
+pub struct HeadlessLifecycleEvent {
+	/// Session incarnation which owns the sink.
+	pub session_generation: u64,
+	/// Authenticated extension-host incarnation.
+	pub host_generation:    u64,
+	/// Typed lifecycle payload.
+	pub kind:               HeadlessLifecycleKind,
+}
+
+/// Extension observations supported by every headless protocol host.
+#[derive(Clone, Debug)]
+pub enum HeadlessLifecycleKind {
+	/// One extension generation activated.
+	Activated(ActivationEvent),
+	/// The command registry changed and hosts must refresh their roster.
+	CommandRosterInvalidated,
+	/// A retained, non-blocking UI effect.
+	UiEffect(Box<UiEffect>),
+	/// A correlated UI request requiring a typed answer.
+	UiRequest(Box<UiRequest>),
+	/// A typed extension lifecycle failure.
+	ExtensionError {
+		/// Extension whose lifecycle failed.
+		extension: Str,
+		/// Typed lifecycle failure.
+		error:     LifecycleError,
+	},
+}
+
+/// Lossless receiving half of a [`HeadlessLifecycleSink`].
+pub struct HeadlessLifecycleSubscription {
+	rx: flume::Receiver<Arc<HeadlessLifecycleEvent>>,
+}
+
+impl HeadlessLifecycleSubscription {
+	/// Receives the next extension observation.
+	pub async fn recv(&self) -> Result<Arc<HeadlessLifecycleEvent>, flume::RecvError> {
+		self.rx.recv_async().await
+	}
+
+	/// Attempts to receive the next observation without waiting.
+	pub fn try_recv(&self) -> Result<Arc<HeadlessLifecycleEvent>, flume::TryRecvError> {
+		self.rx.try_recv()
+	}
+}
+
+/// Lossless generation fence shared by print, RPC, and ACP session owners.
+#[derive(Clone)]
+pub struct HeadlessLifecycleSink {
+	session_generation: u64,
+	host_generation:    Arc<AtomicU64>,
+	active:             Arc<AtomicBool>,
+	tx:                 flume::Sender<Arc<HeadlessLifecycleEvent>>,
+}
+
+impl HeadlessLifecycleSink {
+	/// Creates a sink for one session incarnation.
+	#[must_use]
+	pub fn new(session_generation: u64) -> (Self, HeadlessLifecycleSubscription) {
+		let (tx, rx) = flume::unbounded();
+		(
+			Self {
+				session_generation,
+				host_generation: Arc::new(AtomicU64::new(0)),
+				active: Arc::new(AtomicBool::new(false)),
+				tx,
+			},
+			HeadlessLifecycleSubscription { rx },
+		)
+	}
+
+	/// Advances the accepted host generation after supervised activation.
+	pub fn activate(&self, event: ActivationEvent) -> Result<(), HeadlessSinkError> {
+		let generation = event.generation;
+		let mut current = self.host_generation.load(Ordering::Acquire);
+		loop {
+			if generation < current {
+				return Err(HeadlessSinkError::StaleGeneration {
+					expected: current,
+					actual:   generation,
+				});
+			}
+			match self.host_generation.compare_exchange_weak(
+				current,
+				generation,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => break,
+				Err(observed) => current = observed,
+			}
+		}
+		self.active.store(true, Ordering::Release);
+		self.publish(generation, HeadlessLifecycleKind::Activated(event))
+	}
+
+	/// Publishes a command-roster invalidation for the active host generation.
+	pub fn invalidate_commands(&self, generation: u64) -> Result<(), HeadlessSinkError> {
+		self.publish(generation, HeadlessLifecycleKind::CommandRosterInvalidated)
+	}
+
+	/// Publishes a retained UI effect for the active host generation.
+	pub fn ui_effect(&self, generation: u64, effect: UiEffect) -> Result<(), HeadlessSinkError> {
+		self.publish(generation, HeadlessLifecycleKind::UiEffect(Box::new(effect)))
+	}
+
+	/// Publishes a correlated UI request for the active host generation.
+	pub fn ui_request(&self, generation: u64, request: UiRequest) -> Result<(), HeadlessSinkError> {
+		self.publish(generation, HeadlessLifecycleKind::UiRequest(Box::new(request)))
+	}
+
+	/// Publishes a typed extension error for the active host generation.
+	pub fn extension_error(
+		&self,
+		generation: u64,
+		extension: impl Into<Str>,
+		error: LifecycleError,
+	) -> Result<(), HeadlessSinkError> {
+		self.publish(generation, HeadlessLifecycleKind::ExtensionError {
+			extension: extension.into(),
+			error,
+		})
+	}
+
+	fn publish(
+		&self,
+		generation: u64,
+		kind: HeadlessLifecycleKind,
+	) -> Result<(), HeadlessSinkError> {
+		if !self.active.load(Ordering::Acquire) {
+			return Err(HeadlessSinkError::Inactive);
+		}
+		let expected = self.host_generation.load(Ordering::Acquire);
+		if generation != expected {
+			return Err(HeadlessSinkError::StaleGeneration { expected, actual: generation });
+		}
+		self
+			.tx
+			.send(Arc::new(HeadlessLifecycleEvent {
+				session_generation: self.session_generation,
+				host_generation: generation,
+				kind,
+			}))
+			.map_err(|_| HeadlessSinkError::Disconnected)
+	}
+}
+
+/// Rejection from a generation-stamped headless lifecycle sink.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum HeadlessSinkError {
+	/// A worker attempted to publish before supervised activation.
+	#[error("headless extension host is not active")]
+	Inactive,
+	/// An old worker attempted to publish.
+	#[error("stale headless host generation: expected {expected}, got {actual}")]
+	StaleGeneration {
+		/// Active host generation.
+		expected: u64,
+		/// Published generation.
+		actual:   u64,
+	},
+	/// The owning headless session has already disposed its subscription.
+	#[error("headless lifecycle sink is disconnected")]
+	Disconnected,
+}
+
 /// App-side destination for a verified `SetAvailability` CONTROL frame.
 pub trait AvailabilitySink: Send + Sync {
 	/// Applies one complete worker availability batch.
@@ -134,11 +311,23 @@ impl HookDeclarationKey {
 	}
 }
 
-/// Canonical tool and hook existence sets for one extension.
+/// Runtime capability declarations whose use must fail closed when absent.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum EscapeCapability {
+	/// Focus-owned bounded raw terminal-input subscription.
+	RawTerminalInput,
+	/// Trusted direct-filesystem escape with durable grant provenance.
+	DirectFilesystem,
+}
+
+/// Canonical tool, hook, action, and sanctioned-escape existence sets for one
+/// extension.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeclarationSet {
-	tools: BTreeSet<ToolDeclarationKey>,
-	hooks: BTreeSet<HookDeclarationKey>,
+	tools:   BTreeSet<ToolDeclarationKey>,
+	hooks:   BTreeSet<HookDeclarationKey>,
+	actions: BTreeSet<Str>,
+	escapes: BTreeSet<EscapeCapability>,
 }
 
 impl DeclarationSet {
@@ -148,7 +337,25 @@ impl DeclarationSet {
 		tools: impl IntoIterator<Item = ToolDeclarationKey>,
 		hooks: impl IntoIterator<Item = HookDeclarationKey>,
 	) -> Self {
-		Self { tools: tools.into_iter().collect(), hooks: hooks.into_iter().collect() }
+		Self {
+			tools:   tools.into_iter().collect(),
+			hooks:   hooks.into_iter().collect(),
+			actions: BTreeSet::new(),
+			escapes: BTreeSet::new(),
+		}
+	}
+
+	/// Adds the exact static action and sanctioned-escape declarations admitted
+	/// from the manifest before Python starts.
+	#[must_use]
+	pub fn with_runtime(
+		mut self,
+		actions: impl IntoIterator<Item = Str>,
+		escapes: impl IntoIterator<Item = EscapeCapability>,
+	) -> Self {
+		self.actions = actions.into_iter().collect();
+		self.escapes = escapes.into_iter().collect();
+		self
 	}
 
 	/// Iterates over tool identities in canonical order.
@@ -160,28 +367,67 @@ impl DeclarationSet {
 	pub fn hooks(&self) -> impl DoubleEndedIterator<Item = &HookDeclarationKey> + ExactSizeIterator {
 		self.hooks.iter()
 	}
+
+	/// Iterates exact action names in canonical order.
+	pub fn actions(&self) -> impl DoubleEndedIterator<Item = &Str> + ExactSizeIterator {
+		self.actions.iter()
+	}
+
+	/// Returns whether a sanctioned escape was statically admitted.
+	#[must_use]
+	pub fn permits(&self, capability: EscapeCapability) -> bool {
+		self.escapes.contains(&capability)
+	}
 }
 
 /// Exact differences between the manifest and frozen runtime registry.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeclarationDrift {
 	/// Manifest tools absent from the runtime registry.
-	pub missing_tools:    Box<[ToolDeclarationKey]>,
+	pub missing_tools:      Box<[ToolDeclarationKey]>,
 	/// Runtime tools absent from the manifest.
-	pub unexpected_tools: Box<[ToolDeclarationKey]>,
+	pub unexpected_tools:   Box<[ToolDeclarationKey]>,
 	/// Manifest hooks absent from the runtime registry.
-	pub missing_hooks:    Box<[HookDeclarationKey]>,
+	pub missing_hooks:      Box<[HookDeclarationKey]>,
 	/// Runtime hooks absent from the manifest.
-	pub unexpected_hooks: Box<[HookDeclarationKey]>,
+	pub unexpected_hooks:   Box<[HookDeclarationKey]>,
+	/// Manifest actions absent from the runtime registry.
+	pub missing_actions:    Box<[Str]>,
+	/// Runtime actions absent from the manifest.
+	pub unexpected_actions: Box<[Str]>,
+	/// Manifest sanctioned escapes absent from the runtime registry.
+	pub missing_escapes:    Box<[EscapeCapability]>,
+	/// Runtime sanctioned escapes absent from the manifest.
+	pub unexpected_escapes: Box<[EscapeCapability]>,
 }
 
 impl DeclarationDrift {
 	fn between(expected: &DeclarationSet, actual: &DeclarationSet) -> Self {
 		Self {
-			missing_tools:    expected.tools.difference(&actual.tools).cloned().collect(),
-			unexpected_tools: actual.tools.difference(&expected.tools).cloned().collect(),
-			missing_hooks:    expected.hooks.difference(&actual.hooks).cloned().collect(),
-			unexpected_hooks: actual.hooks.difference(&expected.hooks).cloned().collect(),
+			missing_tools:      expected.tools.difference(&actual.tools).cloned().collect(),
+			unexpected_tools:   actual.tools.difference(&expected.tools).cloned().collect(),
+			missing_hooks:      expected.hooks.difference(&actual.hooks).cloned().collect(),
+			unexpected_hooks:   actual.hooks.difference(&expected.hooks).cloned().collect(),
+			missing_actions:    expected
+				.actions
+				.difference(&actual.actions)
+				.cloned()
+				.collect(),
+			unexpected_actions: actual
+				.actions
+				.difference(&expected.actions)
+				.cloned()
+				.collect(),
+			missing_escapes:    expected
+				.escapes
+				.difference(&actual.escapes)
+				.copied()
+				.collect(),
+			unexpected_escapes: actual
+				.escapes
+				.difference(&expected.escapes)
+				.copied()
+				.collect(),
 		}
 	}
 
@@ -192,6 +438,10 @@ impl DeclarationDrift {
 			&& self.unexpected_tools.is_empty()
 			&& self.missing_hooks.is_empty()
 			&& self.unexpected_hooks.is_empty()
+			&& self.missing_actions.is_empty()
+			&& self.unexpected_actions.is_empty()
+			&& self.missing_escapes.is_empty()
+			&& self.unexpected_escapes.is_empty()
 	}
 }
 

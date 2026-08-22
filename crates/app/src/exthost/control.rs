@@ -1,6 +1,223 @@
 //! Extension-host CONTROL request correlation and argument-stream fencing.
 
-use std::collections::BTreeMap;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	str::FromStr as _,
+};
+
+/// Maximum raw terminal-input frame admitted from the interactive terminal.
+pub const MAX_RAW_TERMINAL_FRAME_BYTES: usize = 4096;
+/// Maximum payload admitted through the trusted direct-filesystem escape.
+pub const MAX_DIRECT_FILESYSTEM_BYTES: usize = 1024 * 1024;
+
+/// Focus-owned raw-input admission failure.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum RawInputError {
+	/// The admitted static manifest omitted `ui.raw-input`.
+	#[error("raw terminal input was not declared by the extension manifest")]
+	Undeclared,
+	/// No exact durable capability grant covers the active manifest.
+	#[error("raw terminal input is not durably granted")]
+	Ungranted,
+	/// Raw terminal input is unavailable without an interactive terminal.
+	#[error("raw terminal input is unavailable in headless mode")]
+	Headless,
+	/// A request or frame belongs to a stale worker generation.
+	#[error("raw terminal input generation is stale")]
+	StaleGeneration,
+	/// Another extension owns the terminal focus lease.
+	#[error("terminal focus is owned by another extension")]
+	FocusOwned,
+	/// The frame exceeded the protocol ceiling.
+	#[error("raw terminal input frame exceeds {MAX_RAW_TERMINAL_FRAME_BYTES} bytes")]
+	FrameTooLarge,
+}
+
+/// Generation-fenced raw-input focus authority.
+#[derive(Debug)]
+pub struct RawInputAuthority {
+	extension_id: Str,
+	generation:   u64,
+	declared:     bool,
+	granted:      bool,
+	interactive:  bool,
+	focus_token:  Option<Str>,
+	sequence:     u64,
+}
+
+impl RawInputAuthority {
+	/// Builds the gate from Core-authenticated manifest and durable-grant facts.
+	#[must_use]
+	pub fn new(
+		extension_id: impl Into<Str>,
+		generation: u64,
+		declared: bool,
+		granted: bool,
+		interactive: bool,
+	) -> Self {
+		Self {
+			extension_id: extension_id.into(),
+			generation,
+			declared,
+			granted,
+			interactive,
+			focus_token: None,
+			sequence: 0,
+		}
+	}
+
+	/// Acquires the sole raw-input focus lease.
+	pub fn subscribe(
+		&mut self,
+		generation: u64,
+		focus_token: impl Into<Str>,
+	) -> Result<(), RawInputError> {
+		if !self.declared {
+			return Err(RawInputError::Undeclared);
+		}
+		if !self.granted {
+			return Err(RawInputError::Ungranted);
+		}
+		if !self.interactive {
+			return Err(RawInputError::Headless);
+		}
+		if generation != self.generation {
+			return Err(RawInputError::StaleGeneration);
+		}
+		if self.focus_token.is_some() {
+			return Err(RawInputError::FocusOwned);
+		}
+		self.focus_token = Some(focus_token.into());
+		Ok(())
+	}
+
+	/// Validates and returns a bounded frame for the owning extension.
+	pub fn frame(
+		&mut self,
+		generation: u64,
+		focus_token: &str,
+		data: &[u8],
+	) -> Result<omp_proto::toolhost::v1::RawTerminalInputFrame, RawInputError> {
+		if generation != self.generation {
+			return Err(RawInputError::StaleGeneration);
+		}
+		if self.focus_token.as_deref() != Some(focus_token) {
+			return Err(RawInputError::FocusOwned);
+		}
+		if data.len() > MAX_RAW_TERMINAL_FRAME_BYTES {
+			return Err(RawInputError::FrameTooLarge);
+		}
+		self.sequence = self.sequence.saturating_add(1);
+		Ok(omp_proto::toolhost::v1::RawTerminalInputFrame {
+			sequence:    self.sequence,
+			data:        bytes::Bytes::copy_from_slice(data),
+			focus_token: focus_token.to_owned(),
+		})
+	}
+
+	/// Releases the focus lease. Cancellation is idempotent only for the exact
+	/// owner token.
+	pub fn cancel(&mut self, generation: u64, focus_token: &str) -> Result<(), RawInputError> {
+		if generation != self.generation {
+			return Err(RawInputError::StaleGeneration);
+		}
+		if self.focus_token.as_deref() != Some(focus_token) {
+			return Err(RawInputError::FocusOwned);
+		}
+		self.focus_token = None;
+		Ok(())
+	}
+
+	/// Extension identity stamped on focus and cancellation diagnostics.
+	#[must_use]
+	pub const fn extension_id(&self) -> &Str {
+		&self.extension_id
+	}
+}
+
+/// Durable grant identity for the trusted direct-filesystem escape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectFilesystemGrant {
+	/// Extension identity.
+	pub extension_id:      Str,
+	/// TOFU-pinned publisher key.
+	pub publisher:         Str,
+	/// Exact manifest capability digest.
+	pub capability_digest: Str,
+	/// Durable grant record identity.
+	pub grant_id:          Str,
+	/// Worker generation covered by the activation receipt.
+	pub generation:        u64,
+}
+
+/// Validated direct-filesystem request carrying immutable audit provenance.
+#[derive(Clone, Debug)]
+pub struct AuditedDirectFilesystemRequest {
+	/// Requested operation from the closed vocabulary.
+	pub operation: Str,
+	/// Absolute local host path.
+	pub path:      std::path::PathBuf,
+	/// Optional bounded request bytes.
+	pub data:      bytes::Bytes,
+	/// Durable grant facts appended to the audit journal before execution.
+	pub grant:     DirectFilesystemGrant,
+}
+
+/// Trusted direct-filesystem escape rejection.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum DirectFilesystemError {
+	/// Static manifest omitted the exceptional capability.
+	#[error("trusted direct-filesystem capability was not declared")]
+	Undeclared,
+	/// Durable grant facts do not cover this generation and capability digest.
+	#[error("trusted direct-filesystem grant is absent or stale")]
+	Ungranted,
+	/// Operation is outside the closed escape vocabulary.
+	#[error("unsupported direct-filesystem operation")]
+	Operation,
+	/// Escape requests must carry an absolute local path.
+	#[error("direct-filesystem path must be absolute")]
+	RelativePath,
+	/// Payload exceeded the escape ceiling.
+	#[error("direct-filesystem payload exceeds {MAX_DIRECT_FILESYSTEM_BYTES} bytes")]
+	PayloadTooLarge,
+}
+
+/// Validates the exceptional filesystem protocol arm without translating it
+/// into an Environment operation.
+pub fn admit_direct_filesystem(
+	request: omp_proto::toolhost::v1::DirectFilesystemRequest,
+	declared: bool,
+	grant: Option<&DirectFilesystemGrant>,
+) -> Result<AuditedDirectFilesystemRequest, DirectFilesystemError> {
+	if !declared {
+		return Err(DirectFilesystemError::Undeclared);
+	}
+	let grant = grant
+		.filter(|grant| {
+			grant.grant_id == request.grant_id
+				&& grant.generation == request.generation
+				&& grant.capability_digest.as_bytes() == request.capability_digest.as_ref()
+		})
+		.ok_or(DirectFilesystemError::Ungranted)?;
+	if !matches!(request.operation.as_str(), "read" | "write" | "stat" | "list" | "mkdir" | "remove")
+	{
+		return Err(DirectFilesystemError::Operation);
+	}
+	if request.data.len() > MAX_DIRECT_FILESYSTEM_BYTES {
+		return Err(DirectFilesystemError::PayloadTooLarge);
+	}
+	let path = std::path::PathBuf::from(request.absolute_path);
+	if !path.is_absolute() {
+		return Err(DirectFilesystemError::RelativePath);
+	}
+	Ok(AuditedDirectFilesystemRequest {
+		operation: Str::new(request.operation),
+		path,
+		data: request.data,
+		grant: grant.clone(),
+	})
+}
 
 use bytes::Bytes;
 use omp_agent::{
@@ -18,12 +235,13 @@ use omp_proto::{
 	thread::v1::{Part, part},
 	toolhost::v1::{
 		AdoptArtifact, AppendEntriesAtomic, AppendEntry, ArtifactRow, DeclareEntryKinds,
-		EntryAppended, JournalHostEnvelope, JournalRow, JournalWorkerEnvelope, ListArtifacts,
-		ListSessions, PinArtifact, PullReply, PullRequest, QueryJournal, QueryUsage, SessionRow,
-		StatArtifact, StateCas, StateGet, StateScope, StateWatch, UsageReport, journal_host_envelope,
-		journal_worker_envelope,
+		DeclareSecretRules, EntryAppended, JournalHostEnvelope, JournalRow, JournalWorkerEnvelope,
+		ListArtifacts, ListSessions, PinArtifact, PullReply, PullRequest, QueryJournal, QueryUsage,
+		SecretRuleDeclaration, SessionRow, StatArtifact, StateCas, StateGet, StateScope, StateWatch,
+		UsageReport, journal_host_envelope, journal_worker_envelope,
 	},
 };
+use omp_secrets::rule::{SecretKind, SecretMode, SecretRule, SecretRuleError};
 use omp_storage::{
 	blob::BlobRef,
 	transcript::msg::{Content, UserBlock},
@@ -33,6 +251,240 @@ use thiserror::Error;
 
 /// Maximum number of unresolved cursor pulls accepted for one invocation.
 pub const MAX_PENDING_PULLS: usize = 1;
+/// Maximum declarations accepted from one extension activation.
+pub const MAX_EXTENSION_SECRET_RULES: usize = 64;
+const MAX_SECRET_CONTENT_BYTES: usize = 16 * 1024;
+const MAX_SECRET_METADATA_BYTES: usize = 256;
+
+/// A generation-fenced, activation-sealed extension secret declaration set.
+#[derive(Debug, Default)]
+pub struct ExtensionSecretDeclarations {
+	extension_id: Option<Str>,
+	generation:   u64,
+	sealed:       bool,
+	rules:        Vec<SecretRule>,
+}
+
+impl ExtensionSecretDeclarations {
+	/// Validates and appends one bounded declaration frame before activation is
+	/// sealed.
+	pub fn declare(&mut self, frame: DeclareSecretRules) -> Result<(), SecretDeclarationError> {
+		if self.sealed {
+			return Err(SecretDeclarationError::Sealed);
+		}
+		if frame.extension_id.is_empty() {
+			return Err(SecretDeclarationError::MissingExtension);
+		}
+		if self
+			.extension_id
+			.as_deref()
+			.is_some_and(|id| id != frame.extension_id)
+		{
+			return Err(SecretDeclarationError::ExtensionMismatch);
+		}
+		if self.generation != 0 && self.generation != frame.activation_generation {
+			return Err(SecretDeclarationError::GenerationMismatch {
+				expected: self.generation,
+				actual:   frame.activation_generation,
+			});
+		}
+		if self.rules.len().saturating_add(frame.rules.len()) > MAX_EXTENSION_SECRET_RULES {
+			return Err(SecretDeclarationError::TooManyRules);
+		}
+		let mut validated = Vec::with_capacity(frame.rules.len());
+		for declaration in frame.rules {
+			validated.push(validate_secret_declaration(declaration)?);
+		}
+		self
+			.extension_id
+			.get_or_insert_with(|| Str::new(frame.extension_id));
+		self.generation = frame.activation_generation;
+		self.rules.extend(validated);
+		Ok(())
+	}
+
+	/// Seals declarations at the matching activation boundary and returns the
+	/// immutable rules.
+	pub fn seal(
+		&mut self,
+		activation_generation: u64,
+	) -> Result<&[SecretRule], SecretDeclarationError> {
+		if self.generation != 0 && self.generation != activation_generation {
+			return Err(SecretDeclarationError::GenerationMismatch {
+				expected: self.generation,
+				actual:   activation_generation,
+			});
+		}
+		self.sealed = true;
+		Ok(&self.rules)
+	}
+
+	/// Returns the sealed declarations, or no value before activation.
+	#[must_use]
+	pub fn sealed_rules(&self) -> Option<&[SecretRule]> {
+		self.sealed.then_some(&self.rules)
+	}
+}
+
+/// Fail-closed extension secret declaration validation error.
+#[derive(Debug, Error)]
+pub enum SecretDeclarationError {
+	/// Declarations were sent after activation sealing.
+	#[error("secret declarations are sealed for this activation")]
+	Sealed,
+	/// The frame omitted its owning extension identity.
+	#[error("secret declaration frame has no extension identity")]
+	MissingExtension,
+	/// A frame attempted to change extension identity.
+	#[error("secret declaration frame extension identity does not match its connection")]
+	ExtensionMismatch,
+	/// A stale or future activation generation was supplied.
+	#[error("secret declaration generation {actual} does not match {expected}")]
+	GenerationMismatch { expected: u64, actual: u64 },
+	/// The extension exceeded its declaration bound.
+	#[error("extension secret declaration limit exceeded")]
+	TooManyRules,
+	/// A declaration field exceeded the wire bound.
+	#[error("extension secret declaration field exceeds its byte bound")]
+	FieldTooLong,
+	/// A declaration used an unknown kind.
+	#[error("extension secret declaration kind is invalid")]
+	InvalidKind,
+	/// A declared environment variable is absent or non-Unicode.
+	#[error("extension secret environment declaration cannot be resolved")]
+	Environment(#[source] std::env::VarError),
+	/// A declaration used an unknown mode.
+	#[error("extension secret declaration mode is invalid")]
+	InvalidMode,
+	/// Core rule validation failed.
+	#[error("extension secret declaration is invalid")]
+	InvalidRule(#[from] SecretRuleError),
+}
+
+fn validate_secret_declaration(
+	declaration: SecretRuleDeclaration,
+) -> Result<SecretRule, SecretDeclarationError> {
+	if declaration.content.len() > MAX_SECRET_CONTENT_BYTES
+		|| declaration.kind.len() > MAX_SECRET_METADATA_BYTES
+		|| declaration.mode.len() > MAX_SECRET_METADATA_BYTES
+		|| declaration
+			.replacement
+			.as_ref()
+			.is_some_and(|value| value.len() > MAX_SECRET_CONTENT_BYTES)
+		|| declaration
+			.flags
+			.as_ref()
+			.is_some_and(|value| value.len() > MAX_SECRET_METADATA_BYTES)
+		|| declaration
+			.friendly_name
+			.as_ref()
+			.is_some_and(|value| value.len() > MAX_SECRET_METADATA_BYTES)
+	{
+		return Err(SecretDeclarationError::FieldTooLong);
+	}
+	let (kind, content) = if declaration.kind.eq_ignore_ascii_case("env") {
+		let value =
+			std::env::var(&declaration.content).map_err(SecretDeclarationError::Environment)?;
+		(SecretKind::Plain, value)
+	} else {
+		(
+			SecretKind::from_str(&declaration.kind)
+				.map_err(|_| SecretDeclarationError::InvalidKind)?,
+			declaration.content,
+		)
+	};
+	let mode =
+		SecretMode::from_str(&declaration.mode).map_err(|_| SecretDeclarationError::InvalidMode)?;
+	SecretRule::new(
+		kind,
+		mode,
+		content,
+		declaration.replacement.map(Str::new),
+		declaration.flags.as_deref(),
+		declaration.friendly_name.map(Str::new),
+	)
+	.map_err(Into::into)
+}
+
+/// Generation-fenced CLI values delivered once at activation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationCliValue {
+	/// Declaration sink key owned by this extension.
+	pub sink:  Str,
+	/// Typed contributed value.
+	pub value: crate::cli::bootstrap::ContributedValue,
+}
+
+/// Per-extension activation value gate.
+#[derive(Debug)]
+pub struct ContributedValueDelivery {
+	extension:  Str,
+	generation: u64,
+	delivered:  bool,
+	values:     Vec<ActivationCliValue>,
+}
+
+/// Contributed-value delivery rejection.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ContributedValueError {
+	/// A parsed value has no matching static owner/sink declaration.
+	#[error("extension CLI value `{0}` is not declared by its owning manifest")]
+	Undeclared(Str),
+	/// Activation belongs to a different child generation.
+	#[error("extension CLI activation generation {actual} does not match {expected}")]
+	StaleGeneration { expected: u64, actual: u64 },
+	/// Values were requested twice for one activation.
+	#[error("extension CLI values were already delivered for this activation")]
+	AlreadyDelivered,
+}
+
+impl ContributedValueDelivery {
+	/// Builds one declaration-checked delivery gate. Values belonging to other
+	/// extensions are not copied into this owner.
+	pub fn new(
+		extension: impl Into<Str>,
+		generation: u64,
+		declarations: &crate::ext::config::CliContributionSet,
+		values: &[crate::cli::bootstrap::ContributedCliValue],
+	) -> Result<Self, ContributedValueError> {
+		let extension = extension.into();
+		let prefix = format!("{extension}:--");
+		let declared = declarations
+			.iter()
+			.map(|(_, declaration)| (declaration.qualified_name(), declaration.sink.key.clone()))
+			.collect::<BTreeSet<_>>();
+		let mut owned = Vec::new();
+		for value in values
+			.iter()
+			.filter(|value| value.owner.starts_with(&prefix))
+		{
+			if !declared.contains(&(value.owner.clone(), value.sink.clone())) {
+				return Err(ContributedValueError::Undeclared(value.owner.clone()));
+			}
+			owned.push(ActivationCliValue { sink: value.sink.clone(), value: value.value.clone() });
+		}
+		Ok(Self { extension, generation, delivered: false, values: owned })
+	}
+
+	/// Takes the typed values exactly once for the matching live generation.
+	pub fn deliver(
+		&mut self,
+		extension: &str,
+		generation: u64,
+	) -> Result<Vec<ActivationCliValue>, ContributedValueError> {
+		if extension != self.extension || generation != self.generation {
+			return Err(ContributedValueError::StaleGeneration {
+				expected: self.generation,
+				actual:   generation,
+			});
+		}
+		if self.delivered {
+			return Err(ContributedValueError::AlreadyDelivered);
+		}
+		self.delivered = true;
+		Ok(std::mem::take(&mut self.values))
+	}
+}
 
 /// Correlation established by the host between environment and worker identity.
 #[derive(Clone, Debug, Eq, PartialEq)]

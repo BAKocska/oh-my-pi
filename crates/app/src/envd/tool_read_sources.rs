@@ -5,6 +5,7 @@ use std::{
 	future::{Future, ready},
 	io,
 	path::{Component, Path, PathBuf},
+	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,10 +17,14 @@ use http::{
 };
 use omp_core::{Hash32, Str, sf};
 use omp_hashline::RevisionToken;
+use omp_storage::document_cache::{DocumentCache, DocumentCacheKey};
 use omp_tools::read::{
 	DirectoryEntry, DirectorySource, Fault, ReadLease, ReadSources, SNAPSHOT_MAX_BYTES,
 	SnapshotRecord, SourceKind, SourceStat,
-	web::types::{HttpClient, HttpRequest, HttpResponse, MAX_BYTES, USER_AGENTS, WebError},
+	web::types::{
+		CachedDocument, DocumentCacheLocation, DocumentCacheRequest, HttpClient, HttpRequest,
+		HttpResponse, MAX_BYTES, USER_AGENTS, WebError,
+	},
 };
 use omp_walker::{FileType, WalkDetail, WalkOrder, WalkRequest};
 use tokio::io::AsyncReadExt as _;
@@ -395,15 +400,26 @@ fn days_from_civil(mut year: i64, month: u32, day: u32) -> i64 {
 /// I/O.
 #[derive(Clone, Debug)]
 pub struct ReadSourceAdapter {
-	documents: DocumentHost,
-	workspace: WorkspaceHost,
-	http:      SystemHttpClient,
+	documents:      DocumentHost,
+	workspace:      WorkspaceHost,
+	http:           SystemHttpClient,
+	document_cache: Arc<DocumentCache>,
 }
 
 impl ReadSourceAdapter {
-	/// Creates a source adapter over one project environment's shared resources.
-	pub(crate) fn new(documents: DocumentHost, workspace: WorkspaceHost) -> Self {
-		Self { documents, workspace, http: SystemHttpClient::new() }
+	/// Creates a source adapter over one project environment's shared resources
+	/// and the user-wide document-conversion cache.
+	pub(crate) fn new(
+		documents: DocumentHost,
+		workspace: WorkspaceHost,
+		document_cache: DocumentCache,
+	) -> Self {
+		Self {
+			documents,
+			workspace,
+			http: SystemHttpClient::new(),
+			document_cache: Arc::new(document_cache),
+		}
 	}
 
 	async fn stat_path(&self, authored: &str) -> Result<SourceStat, Fault> {
@@ -443,6 +459,75 @@ impl HttpClient for ReadSourceAdapter {
 	) -> impl Future<Output = Result<HttpResponse, WebError>> + Send + '_ {
 		self.http.get(request)
 	}
+
+	async fn document_cache_get(&self, request: DocumentCacheRequest) -> Option<CachedDocument> {
+		let cache = self.document_cache.clone();
+		let result = tokio::task::spawn_blocking(move || {
+			let key = document_cache_key(request)?;
+			let entry = cache.get(key, SystemTime::now())?;
+			Ok::<_, omp_storage::document_cache::DocumentCacheError>(entry.map(|entry| {
+				CachedDocument {
+					content:  entry.content,
+					location: DocumentCacheLocation {
+						key:  entry.metadata.key.digest(),
+						blob: entry.metadata.blob,
+					},
+				}
+			}))
+		})
+		.await;
+		match result {
+			Ok(Ok(cached)) => cached,
+			Ok(Err(error)) => {
+				tracing::debug!(%error, "document conversion cache lookup failed");
+				None
+			},
+			Err(error) => {
+				tracing::debug!(%error, "document conversion cache lookup task failed");
+				None
+			},
+		}
+	}
+
+	async fn document_cache_put(
+		&self,
+		request: DocumentCacheRequest,
+		content: Bytes,
+	) -> Option<CachedDocument> {
+		let cache = self.document_cache.clone();
+		let published = content.clone();
+		let result = tokio::task::spawn_blocking(move || {
+			let key = document_cache_key(request)?;
+			let metadata = cache.put(key, &published, SystemTime::now(), None)?;
+			Ok::<_, omp_storage::document_cache::DocumentCacheError>(DocumentCacheLocation {
+				key:  metadata.key.digest(),
+				blob: metadata.blob,
+			})
+		})
+		.await;
+		match result {
+			Ok(Ok(location)) => Some(CachedDocument { content, location }),
+			Ok(Err(error)) => {
+				tracing::debug!(%error, "document conversion cache publication failed");
+				None
+			},
+			Err(error) => {
+				tracing::debug!(%error, "document conversion cache publication task failed");
+				None
+			},
+		}
+	}
+}
+
+fn document_cache_key(
+	request: DocumentCacheRequest,
+) -> Result<DocumentCacheKey, omp_storage::document_cache::DocumentCacheError> {
+	DocumentCacheKey::derive(
+		request.source_digest,
+		request.converter,
+		request.converter_version,
+		&serde_json::Value::Object(Default::default()),
+	)
 }
 
 /// One app-owned lease whose bytes remain stable until drop.

@@ -1,12 +1,59 @@
 //! Durable project-scoped model-role assignments.
 
 use omp_core::Str;
-use omp_llm_catalog::{ModelRole, SelectionError, upsert_role_assignment};
+use omp_llm_catalog::{
+	ModelKey, ModelRole, SelectionError, select_model, snapshot::Catalog, upsert_role_assignment,
+};
 use omp_storage::state::{DurableRequest, Error, StateAuthority, StateScope, StateStore};
 use thiserror::Error as ThisError;
 
 const ROLE_KIND: &str = "model-roles";
-const ROLE_SCHEMA: &str = "1";
+const ROLE_SCHEMA: &str = "2";
+/// Invocation-local resolved model roles after CLI-over-environment precedence.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LaunchRoles {
+	/// Primary model when explicitly overridden.
+	pub primary: Option<ModelKey>,
+	/// Fast/low-cost model.
+	pub smol:    Option<ModelKey>,
+	/// Deep-reasoning model.
+	pub slow:    Option<ModelKey>,
+	/// Planning model.
+	pub plan:    Option<ModelKey>,
+}
+
+/// Resolves role selectors through the catalog authority. CLI values override
+/// `OMP_*_MODEL`; unsupported thinking annotations are rejected by catalog
+/// selection rather than clamped client-side.
+pub fn resolve_launch_roles(
+	catalog: &Catalog,
+	primary: Option<&str>,
+	smol: Option<&str>,
+	slow: Option<&str>,
+	plan: Option<&str>,
+) -> Result<LaunchRoles, SelectionError> {
+	let resolve = |cli: Option<&str>, variable: &str| -> Result<Option<ModelKey>, SelectionError> {
+		let environment = std::env::var(variable).ok();
+		let Some(selector) = cli.or(environment.as_deref()) else {
+			return Ok(None);
+		};
+		select_model(
+			catalog.models(),
+			catalog.routes(),
+			catalog.aliases(),
+			&[],
+			&Default::default(),
+			selector,
+		)
+		.map(|selected| Some(selected.model))
+	};
+	Ok(LaunchRoles {
+		primary: resolve(primary, "OMP_DEFAULT_MODEL")?,
+		smol:    resolve(smol, "OMP_SMOL_MODEL")?,
+		slow:    resolve(slow, "OMP_SLOW_MODEL")?,
+		plan:    resolve(plan, "OMP_PLAN_MODEL")?,
+	})
+}
 /// Failure while validating or durably saving a role assignment.
 #[derive(Debug, ThisError)]
 pub enum RolePersistenceError {
@@ -18,32 +65,84 @@ pub enum RolePersistenceError {
 	Storage(#[from] Error),
 }
 
+fn load_roles(
+	store: &StateStore,
+	authority: &StateAuthority,
+	scope: StateScope,
+) -> Result<Vec<ModelRole>, Error> {
+	let Some(entry) = store.latest(authority, scope, authority.namespace(), ROLE_KIND)? else {
+		return Ok(Vec::new());
+	};
+	Ok(serde_json::from_slice(&entry.raw)?)
+}
+
 /// Loads the latest project role assignment snapshot for the core namespace.
 pub fn load_project_roles(
 	store: &StateStore,
 	authority: &StateAuthority,
 ) -> Result<Vec<ModelRole>, Error> {
-	let Some(entry) =
-		store.latest(authority, StateScope::Project, authority.namespace(), ROLE_KIND)?
-	else {
-		return Ok(Vec::new());
-	};
-	Ok(serde_json::from_slice(&entry.raw)?)
+	load_roles(store, authority, StateScope::Project)
+}
+
+/// Loads the latest global/user role assignment snapshot.
+pub fn load_global_roles(
+	store: &StateStore,
+	authority: &StateAuthority,
+) -> Result<Vec<ModelRole>, Error> {
+	load_roles(store, authority, StateScope::User)
+}
+
+/// Merges global and project roles with project records winning per stable role
+/// id.
+pub fn load_effective_roles(
+	store: &StateStore,
+	authority: &StateAuthority,
+) -> Result<Vec<ModelRole>, Error> {
+	let mut roles = load_global_roles(store, authority)?;
+	for project in load_project_roles(store, authority)? {
+		if let Some(existing) = roles.iter_mut().find(|role| role.id == project.id) {
+			*existing = project;
+		} else {
+			roles.push(project);
+		}
+	}
+	Ok(omp_llm_catalog::known_roles(&roles))
 }
 
 /// Appends a complete replacement snapshot for project-scoped role resolution.
 ///
 /// `StateStore` supplies durable ordering and idempotency; callers use the
 /// returned request's project authority rather than writing workspace files.
+fn save_roles(
+	store: &StateStore,
+	authority: &StateAuthority,
+	scope: StateScope,
+	roles: &[ModelRole],
+	request: &DurableRequest,
+) -> Result<(), Error> {
+	let data = serde_json::to_vec(roles)?;
+	store.append(authority, scope, ROLE_KIND, ROLE_SCHEMA, &data, request)?;
+	Ok(())
+}
+
+/// Saves project-scoped roles.
 pub fn save_project_roles(
 	store: &StateStore,
 	authority: &StateAuthority,
 	roles: &[ModelRole],
 	request: &DurableRequest,
 ) -> Result<(), Error> {
-	let data = serde_json::to_vec(roles)?;
-	store.append(authority, StateScope::Project, ROLE_KIND, ROLE_SCHEMA, &data, request)?;
-	Ok(())
+	save_roles(store, authority, StateScope::Project, roles, request)
+}
+
+/// Saves global/user-scoped roles.
+pub fn save_global_roles(
+	store: &StateStore,
+	authority: &StateAuthority,
+	roles: &[ModelRole],
+	request: &DurableRequest,
+) -> Result<(), Error> {
+	save_roles(store, authority, StateScope::User, roles, request)
 }
 
 /// Validates and durably upserts one project-scoped role assignment.

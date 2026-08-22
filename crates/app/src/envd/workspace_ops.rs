@@ -137,6 +137,13 @@ struct DurableWorktreeRecord {
 	class:       String,
 	source_root: PathBuf,
 }
+#[derive(Serialize)]
+struct IsolationOwner<'a> {
+	pid: u32,
+	id:  &'a str,
+}
+
+const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner";
 
 struct WorktreeBuild {
 	root:  PathBuf,
@@ -280,8 +287,20 @@ impl WorkspaceOperations {
 		}
 		fs::create_dir(&root)?;
 		let mut build = WorktreeBuild { root: root.clone(), armed: true };
+		let owner_pid = if request.owner_pid == 0 {
+			std::process::id()
+		} else {
+			request.owner_pid
+		};
+		let owner = serde_json::to_vec(&IsolationOwner { pid: owner_pid, id: id.as_str() }).map_err(
+			|error| WorkspaceOperationError::InvalidWorktreeRecord(Str::from(error.to_string())),
+		)?;
+		fs::write(root.join(ISOLATION_OWNER_FILE), owner)?;
 		let manifest = self.load_manifest(&snapshot.snapshot_id)?;
 		for entry in manifest.entries.values() {
+			if entry.path.as_str() == ISOLATION_OWNER_FILE {
+				continue;
+			}
 			if cancel.is_cancelled() {
 				return Err(WorkspaceError::Cancelled.into());
 			}
@@ -304,11 +323,7 @@ impl WorkspaceOperations {
 			base: Str::from(snapshot.snapshot_id),
 			generation,
 			branch: None,
-			owner_pid: if request.owner_pid == 0 {
-				std::process::id()
-			} else {
-				request.owner_pid
-			},
+			owner_pid,
 		};
 		self.write_worktree_record(&record)?;
 		build.armed = false;
@@ -410,7 +425,8 @@ impl WorkspaceOperations {
 		cancel: &CancellationToken,
 	) -> Result<pb::WorkspaceSnapshot, WorkspaceOperationError> {
 		let root = fs::canonicalize(root)?;
-		if root != self.inner.workspace.root() {
+		let isolated = root != self.inner.workspace.root();
+		if isolated {
 			self.ensure_registered_root(&root)?;
 		}
 		let prefixes = normalize_prefixes(paths)?;
@@ -434,7 +450,10 @@ impl WorkspaceOperations {
 		let mut bytes = 0_u64;
 		let mut failure = None;
 		host.walk_stream(&request, cancel, |entry| {
-			if entry.file_type != FileType::File || !selected(entry.relative_path, &prefixes) {
+			if entry.file_type != FileType::File
+				|| (isolated && entry.relative_path == ISOLATION_OWNER_FILE)
+				|| !selected(entry.relative_path, &prefixes)
+			{
 				return ControlFlow::Continue(());
 			}
 			let result = (|| {

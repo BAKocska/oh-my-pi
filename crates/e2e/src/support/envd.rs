@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use omp_app::envd::{server::EnvServer, worker::ExtHostConfig};
+use omp_app::envd::{EnvServer, worker::ExtHostConfig};
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
 use omp_proto::{
 	SCHEMA_REV,

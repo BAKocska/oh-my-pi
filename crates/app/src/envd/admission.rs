@@ -13,8 +13,180 @@ use omp_shell_engine::{
 	parser::{Parser, ParserOptions},
 };
 use omp_tool::Effects;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+/// Default approval posture applied before one invocation reaches interactive
+/// admission.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum ApprovalMode {
+	/// Read-only effects proceed; writes and execution require confirmation.
+	AlwaysAsk,
+	/// Read and workspace-write effects proceed; execution requires
+	/// confirmation.
+	Write,
+	/// Every declared tier proceeds unless a per-tool policy overrides it.
+	#[default]
+	Yolo,
+}
+
+/// User policy for one named tool.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ApprovalPolicy {
+	/// Proceed without an interactive decision.
+	Allow,
+	/// Refuse the invocation.
+	Deny,
+	/// Require an interactive durable decision.
+	Prompt,
+}
+
+/// Conservative capability tier derived from a tool's declared [`Effects`].
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
+	strum::Display,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ApprovalTier {
+	/// No mutation, process, inference, or subagent effects.
+	Read,
+	/// Declared document mutation without execution-class effects.
+	Write,
+	/// Process, network, inference, or subagent authority.
+	Exec,
+}
+
+impl ApprovalTier {
+	/// Resolves the highest approval tier present in `effects`.
+	#[must_use]
+	pub fn from_effects(effects: &Effects) -> Self {
+		if effects.subagents != 0
+			|| effects
+				.exec
+				.as_ref()
+				.is_some_and(|effect| !effect.is_empty())
+			|| effects
+				.inference
+				.as_ref()
+				.is_some_and(|effect| !effect.is_empty())
+		{
+			Self::Exec
+		} else if effects
+			.documents
+			.as_ref()
+			.is_some_and(|effect| !effect.write_globs.is_empty())
+		{
+			Self::Write
+		} else {
+			Self::Read
+		}
+	}
+}
+
+/// Authority that selected one durable approval policy.
+#[derive(
+	Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, strum::Display, strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ApprovalSource {
+	/// The active approval mode's tier ceiling.
+	Mode,
+	/// A named per-tool user override.
+	User,
+}
+
+/// Stable per-invocation approval outcome suitable for the admission receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolvedApproval {
+	/// Stable invocation identity.
+	pub invocation_id: Str,
+	/// Exact live tool name evaluated.
+	pub tool_name:     Str,
+	/// Tier derived from the live revision's declared effects.
+	pub tier:          ApprovalTier,
+	/// Effective policy.
+	pub policy:        ApprovalPolicy,
+	/// Authority which selected the policy.
+	pub source:        ApprovalSource,
+	/// User policy key, present only for a per-tool override.
+	pub policy_key:    Option<Str>,
+}
+
+/// Resolves a durable invocation decision from the declared effect ceiling.
+///
+/// Per-tool overrides remain authoritative in every mode. Without one, modes
+/// approve tiers up to `read`, `write`, and `exec`, respectively.
+#[must_use]
+pub fn resolve_approval(
+	invocation_id: impl Into<Str>,
+	tool_name: impl Into<Str>,
+	effects: &Effects,
+	mode: ApprovalMode,
+	override_policy: Option<ApprovalPolicy>,
+) -> ResolvedApproval {
+	let invocation_id = invocation_id.into();
+	let tool_name = tool_name.into();
+	let tier = ApprovalTier::from_effects(effects);
+	let (policy, source, policy_key) = override_policy.map_or_else(
+		|| {
+			let allowed = match mode {
+				ApprovalMode::AlwaysAsk => tier <= ApprovalTier::Read,
+				ApprovalMode::Write => tier <= ApprovalTier::Write,
+				ApprovalMode::Yolo => true,
+			};
+			(
+				if allowed {
+					ApprovalPolicy::Allow
+				} else {
+					ApprovalPolicy::Prompt
+				},
+				ApprovalSource::Mode,
+				None,
+			)
+		},
+		|policy| (policy, ApprovalSource::User, Some(tool_name.clone())),
+	);
+	ResolvedApproval { invocation_id, tool_name, tier, policy, source, policy_key }
+}
 
 /// A finalized admission result, with policy transformation applied before the
 /// executor can observe arguments.
@@ -48,6 +220,85 @@ pub enum AdmissionError {
 	/// The query's single response has already been accepted.
 	#[error("admission response was already supplied")]
 	AlreadyAnswered,
+}
+
+/// One cache invalidation target derived from a mutating GitHub CLI command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GithubMutationTarget {
+	/// Explicit `owner/repo`, absent when the command targets the active
+	/// repository.
+	pub(crate) repo:   Option<Str>,
+	/// Resource family (`issue` or `pr`).
+	pub(crate) kind:   Str,
+	/// Explicit issue or pull-request number when statically known.
+	pub(crate) number: Option<u64>,
+}
+
+/// Derives only mutating issue/PR operations from admitted BashIR.
+///
+/// Dynamic words are ignored rather than guessed, and read-only `gh` actions
+/// never invalidate cache entries.
+pub(crate) fn github_mutation_targets(bash: &BashIr) -> Vec<GithubMutationTarget> {
+	let mut targets = Vec::new();
+	for command in &bash.commands {
+		if command.name.as_deref() != Some("gh")
+			|| command.argv.iter().any(|argument| argument.dynamic)
+		{
+			continue;
+		}
+		let argv = command
+			.argv
+			.iter()
+			.map(|argument| argument.text.as_str())
+			.collect::<Vec<_>>();
+		let Some(kind_index) = argv
+			.iter()
+			.position(|argument| matches!(*argument, "issue" | "pr"))
+		else {
+			continue;
+		};
+		let Some(action) = argv.get(kind_index + 1).copied() else {
+			continue;
+		};
+		if !matches!(
+			action,
+			"create"
+				| "edit" | "close"
+				| "reopen"
+				| "delete"
+				| "comment"
+				| "lock" | "unlock"
+				| "pin" | "unpin"
+				| "transfer"
+				| "merge"
+				| "ready"
+				| "review"
+		) {
+			continue;
+		}
+		let repo = option_value(&argv, "-R")
+			.or_else(|| option_value(&argv, "--repo"))
+			.or_else(|| inline_option(&argv, "--repo="))
+			.map(Str::new);
+		let number = argv
+			.iter()
+			.skip(kind_index + 2)
+			.find_map(|argument| argument.trim_start_matches('#').parse::<u64>().ok());
+		targets.push(GithubMutationTarget { repo, kind: Str::new(argv[kind_index]), number });
+	}
+	targets
+}
+
+fn option_value<'a>(arguments: &[&'a str], option: &str) -> Option<&'a str> {
+	arguments
+		.windows(2)
+		.find_map(|pair| (pair[0] == option).then_some(pair[1]))
+}
+
+fn inline_option<'a>(arguments: &[&'a str], prefix: &str) -> Option<&'a str> {
+	arguments
+		.iter()
+		.find_map(|argument| argument.strip_prefix(prefix))
 }
 
 /// Env-owned one-shot admission state for one invocation.
@@ -248,7 +499,7 @@ fn merge_patch(target: &mut Value, patch: Value) {
 	}
 }
 
-fn bash_ir(tool_name: &str, args: &Value, cwd: &Path, root: &Path) -> Option<BashIr> {
+pub(crate) fn bash_ir(tool_name: &str, args: &Value, cwd: &Path, root: &Path) -> Option<BashIr> {
 	if tool_name != "shell" {
 		return None;
 	}
@@ -291,14 +542,18 @@ fn invalid_patch_denial(invocation_id: &str) -> PolicyDenied {
 
 #[cfg(test)]
 mod tests {
-	use std::{path::Path, time::Duration};
+	use std::{path::Path, sync::Arc, time::Duration};
 
 	use bytes::Bytes;
 	use omp_core::sf;
 	use omp_proto::policy::v1::{EffectEnvelope, ExecEffects};
-	use omp_tool::{Effects, ExecEffects as ToolExecEffects};
+	use omp_tool::{DocEffects, Effects, ExecEffects as ToolExecEffects, InferenceEffects, Usd};
 
-	use super::{AdmissionDecision, AdmissionGate, apply_admission_patch, effects_narrow_or_refuse};
+	use super::{
+		AdmissionDecision, AdmissionGate, ApprovalMode, ApprovalPolicy, ApprovalSource, ApprovalTier,
+		apply_admission_patch, bash_ir, effects_narrow_or_refuse, github_mutation_targets,
+		resolve_approval,
+	};
 
 	#[tokio::test]
 	async fn deadline_synthesizes_a_structured_denial() {
@@ -324,6 +579,86 @@ mod tests {
 		.expect("valid merge patch");
 		assert_eq!(raw, Bytes::from_static(br#"{"command":"echo effective"}"#));
 		assert_eq!(bash.expect("shell facts").source, "echo effective");
+	}
+
+	#[test]
+	fn approval_modes_resolve_from_declared_effects() {
+		let read = Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::from([]) }),
+			..Effects::empty()
+		};
+		let write = Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::from([sf!("**")]) }),
+			..Effects::empty()
+		};
+		let exec = Effects {
+			inference: Some(InferenceEffects { max_requests: 1, max_usd: Usd::from_nanos(1) }),
+			..Effects::empty()
+		};
+
+		let read_decision = resolve_approval("read-1", "read", &read, ApprovalMode::AlwaysAsk, None);
+		assert_eq!(read_decision.tier, ApprovalTier::Read);
+		assert_eq!(read_decision.policy, ApprovalPolicy::Allow);
+		assert_eq!(read_decision.source, ApprovalSource::Mode);
+
+		let write_prompt =
+			resolve_approval("write-1", "write", &write, ApprovalMode::AlwaysAsk, None);
+		assert_eq!(write_prompt.tier, ApprovalTier::Write);
+		assert_eq!(write_prompt.policy, ApprovalPolicy::Prompt);
+
+		let write_allowed = resolve_approval("write-2", "write", &write, ApprovalMode::Write, None);
+		assert_eq!(write_allowed.policy, ApprovalPolicy::Allow);
+
+		let exec_prompt = resolve_approval("eval-1", "eval", &exec, ApprovalMode::Write, None);
+		assert_eq!(exec_prompt.tier, ApprovalTier::Exec);
+		assert_eq!(exec_prompt.policy, ApprovalPolicy::Prompt);
+	}
+
+	#[test]
+	fn per_tool_override_is_authoritative_and_receipted() {
+		let effects = Effects {
+			exec: Some(ToolExecEffects { commands: Arc::from([sf!("*")]), network: true }),
+			..Effects::empty()
+		};
+		let decision = resolve_approval(
+			"shell-7",
+			"shell",
+			&effects,
+			ApprovalMode::Yolo,
+			Some(ApprovalPolicy::Deny),
+		);
+		assert_eq!(decision.policy, ApprovalPolicy::Deny);
+		assert_eq!(decision.source, ApprovalSource::User);
+		assert_eq!(decision.policy_key.as_deref(), Some("shell"));
+		assert_eq!(
+			serde_json::to_value(&decision).expect("durable approval receipt serializes"),
+			serde_json::json!({
+				"invocation_id": "shell-7",
+				"tool_name": "shell",
+				"tier": "exec",
+				"policy": "deny",
+				"source": "user",
+				"policy_key": "shell"
+			})
+		);
+	}
+
+	#[test]
+	fn derives_only_static_mutating_github_targets() {
+		let bash = bash_ir(
+			"shell",
+			&serde_json::json!({
+				"command": "gh issue edit 42 --repo Owner/Repo && gh pr view 7"
+			}),
+			Path::new("/work"),
+			Path::new("/work"),
+		)
+		.unwrap();
+		let targets = github_mutation_targets(&bash);
+		assert_eq!(targets.len(), 1);
+		assert_eq!(targets[0].repo.as_deref(), Some("Owner/Repo"));
+		assert_eq!(targets[0].kind, "issue");
+		assert_eq!(targets[0].number, Some(42));
 	}
 
 	#[test]

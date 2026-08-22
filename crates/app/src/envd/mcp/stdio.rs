@@ -1,0 +1,879 @@
+//! Environment-owned NDJSON child-process MCP transport.
+
+use std::{
+	collections::{BTreeMap, HashMap},
+	ffi::{OsStr, OsString},
+	path::{Path, PathBuf},
+	process::Stdio,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+	time::Duration,
+};
+
+use omp_core::Str;
+use parking_lot::Mutex;
+use serde_json::{Value, json};
+use tokio::{
+	io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+	process::{Child, ChildStdin, Command},
+	sync::{Mutex as AsyncMutex, oneshot},
+};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+	json_rpc::{RequestId, RequestIdAllocator, RequestIdFormat},
+	transport::{
+		DispatchState, IncomingMessage, McpTransport, ServerResponseError, TransportError,
+		TransportFailure, TransportFuture, TransportResponse,
+	},
+};
+
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const TERM_GRACE: Duration = Duration::from_secs(1);
+const KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Platform family used for deterministic spawn-policy selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioPlatform {
+	/// Windows console/PATHEXT behavior.
+	Windows,
+	/// macOS processes stay in the inherited session for TCC prompts.
+	Macos,
+	/// Other POSIX systems use a detached session.
+	Posix,
+}
+
+impl StdioPlatform {
+	/// Current host platform.
+	#[must_use]
+	pub const fn host() -> Self {
+		if cfg!(windows) {
+			Self::Windows
+		} else if cfg!(target_os = "macos") {
+			Self::Macos
+		} else {
+			Self::Posix
+		}
+	}
+}
+
+/// Validated stdio transport configuration.
+#[derive(Clone, Debug)]
+pub struct StdioConfig {
+	/// Executable or Windows command shim.
+	pub command:           PathBuf,
+	/// Exact argument vector.
+	pub args:              Vec<Str>,
+	/// Exact child environment additions.
+	pub env:               BTreeMap<Str, OsString>,
+	/// Child working directory.
+	pub cwd:               PathBuf,
+	/// Per-request deadline; `None` disables it.
+	pub timeout:           Option<Duration>,
+	/// Request-ID encoding.
+	pub request_id_format: RequestIdFormat,
+}
+
+/// Derived platform spawn vector, independently fixture-testable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpawnPlan {
+	/// Executable passed to process creation.
+	pub executable:       OsString,
+	/// Exact argument vector.
+	pub args:             Vec<OsString>,
+	/// Whether POSIX creates a detached session.
+	pub detached_session: bool,
+	/// Whether Windows requires verbatim command-line forwarding.
+	pub windows_verbatim: bool,
+}
+
+/// Resolves platform session and Windows batch behavior.
+pub fn resolve_spawn_plan(
+	config: &StdioConfig,
+	platform: StdioPlatform,
+	command_resolved: bool,
+	comspec: Option<&OsStr>,
+) -> Result<SpawnPlan, SpawnPlanError> {
+	if platform != StdioPlatform::Windows {
+		return Ok(SpawnPlan {
+			executable:       config.command.as_os_str().to_owned(),
+			args:             config
+				.args
+				.iter()
+				.map(|value| OsString::from(value.as_str()))
+				.collect(),
+			detached_session: platform == StdioPlatform::Posix,
+			windows_verbatim: false,
+		});
+	}
+	let extension = config
+		.command
+		.extension()
+		.and_then(OsStr::to_str)
+		.unwrap_or_default();
+	let batch = extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat");
+	if command_resolved && !batch {
+		return Ok(SpawnPlan {
+			executable:       config.command.as_os_str().to_owned(),
+			args:             config
+				.args
+				.iter()
+				.map(|value| OsString::from(value.as_str()))
+				.collect(),
+			detached_session: false,
+			windows_verbatim: false,
+		});
+	}
+	let shell = comspec.unwrap_or_else(|| OsStr::new("cmd.exe"));
+	let line = windows_batch_line(&config.command.to_string_lossy(), &config.args)?;
+	Ok(SpawnPlan {
+		executable:       shell.to_owned(),
+		args:             ["/d", "/e:ON", "/v:OFF", "/c"]
+			.into_iter()
+			.map(OsString::from)
+			.chain([OsString::from(line)])
+			.collect(),
+		detached_session: false,
+		windows_verbatim: true,
+	})
+}
+
+fn windows_batch_line(command: &str, args: &[Str]) -> Result<String, SpawnPlanError> {
+	validate_windows_token(command)?;
+	let mut line = format!("\"\"{}\"", escape_windows_quoted(command));
+	for arg in args {
+		line.push(' ');
+		line.push_str(&escape_windows_argument(arg)?);
+	}
+	line.push('"');
+	Ok(line)
+}
+
+fn validate_windows_token(value: &str) -> Result<(), SpawnPlanError> {
+	if value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
+		Err(SpawnPlanError::ControlCharacter)
+	} else {
+		Ok(())
+	}
+}
+
+fn escape_windows_argument(value: &str) -> Result<String, SpawnPlanError> {
+	validate_windows_token(value)?;
+	let safe = !value.is_empty()
+		&& !value.ends_with('\\')
+		&& value
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || b"#$*+-./:?@\\_".contains(&byte));
+	Ok(if safe {
+		value.to_owned()
+	} else {
+		format!("\"{}\"", escape_windows_quoted(value))
+	})
+}
+
+fn escape_windows_quoted(value: &str) -> String {
+	let mut output = String::with_capacity(value.len());
+	let mut backslashes = 0;
+	for character in value.chars() {
+		match character {
+			'\\' => {
+				backslashes += 1;
+				output.push(character);
+			},
+			'"' => {
+				for _ in 0..backslashes {
+					output.push('\\');
+				}
+				output.push_str("\"\"");
+				backslashes = 0;
+			},
+			'%' => {
+				output.push_str("%%cd:~,%");
+				backslashes = 0;
+			},
+			_ => {
+				output.push(character);
+				backslashes = 0;
+			},
+		}
+	}
+	for _ in 0..backslashes {
+		output.push('\\');
+	}
+	output
+}
+
+/// Spawn-vector validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SpawnPlanError {
+	/// Windows batch tokens cannot safely contain NUL, CR, or LF.
+	#[error("Windows MCP batch token contains a command-terminating control character")]
+	ControlCharacter,
+}
+
+async fn resolve_host_spawn_plan(config: &StdioConfig) -> Result<SpawnPlan, SpawnPlanError> {
+	let platform = StdioPlatform::host();
+	if platform != StdioPlatform::Windows {
+		return resolve_spawn_plan(config, platform, true, None);
+	}
+	let resolved = resolve_windows_command(&config.command, &config.cwd, &config.env).await;
+	let mut concrete = config.clone();
+	if let Some(path) = resolved.as_ref() {
+		concrete.command = path.clone();
+	}
+	if let Some(plan) = resolve_windows_npm_shim(&concrete).await {
+		return Ok(plan);
+	}
+	let comspec = config
+		.env
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case("COMSPEC"))
+		.map(|(_, value)| value.as_os_str());
+	resolve_spawn_plan(&concrete, platform, resolved.is_some(), comspec)
+}
+
+async fn resolve_windows_command(
+	command: &Path,
+	cwd: &Path,
+	environment: &BTreeMap<Str, OsString>,
+) -> Option<PathBuf> {
+	let path_value = environment
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+		.map(|(_, value)| value.clone())
+		.or_else(|| std::env::var_os("PATH"));
+	let path_ext = environment
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case("PATHEXT"))
+		.and_then(|(_, value)| value.to_str().map(str::to_owned))
+		.or_else(|| std::env::var("PATHEXT").ok())
+		.unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned());
+	let extensions: Vec<&str> = path_ext
+		.split(';')
+		.filter(|value| !value.is_empty())
+		.collect();
+	let explicit_extension = command
+		.extension()
+		.and_then(OsStr::to_str)
+		.is_some_and(|extension| {
+			extensions.iter().any(|candidate| {
+				candidate
+					.trim_start_matches('.')
+					.eq_ignore_ascii_case(extension)
+			})
+		});
+	let names: Vec<OsString> = if explicit_extension {
+		vec![command.as_os_str().to_owned()]
+	} else {
+		extensions
+			.iter()
+			.map(|extension| {
+				let mut value = command.as_os_str().to_owned();
+				value.push(extension);
+				value
+			})
+			.collect()
+	};
+	let has_segment = command.components().count() > 1;
+	let mut directories = vec![cwd.to_path_buf()];
+	if !has_segment {
+		if let Some(path) = path_value {
+			directories.extend(std::env::split_paths(&path));
+		}
+	}
+	for directory in directories {
+		for name in &names {
+			let candidate = if has_segment {
+				let path = PathBuf::from(name);
+				if path.is_absolute() {
+					path
+				} else {
+					cwd.join(path)
+				}
+			} else {
+				directory.join(name)
+			};
+			if tokio::fs::metadata(&candidate).await.is_ok() {
+				return Some(candidate);
+			}
+		}
+	}
+	explicit_extension.then(|| command.to_path_buf())
+}
+
+async fn resolve_windows_npm_shim(config: &StdioConfig) -> Option<SpawnPlan> {
+	let extension = config.command.extension().and_then(OsStr::to_str)?;
+	if !matches!(extension.to_ascii_lowercase().as_str(), "cmd" | "bat")
+		|| config.command.components().count() <= 1
+		|| config
+			.command
+			.file_stem()
+			.and_then(OsStr::to_str)
+			.is_some_and(|name| name.eq_ignore_ascii_case("npx"))
+	{
+		return None;
+	}
+	let content = tokio::fs::read_to_string(&config.command).await.ok()?;
+	let interpreter = regex::Regex::new(r#"(?i)SET\s+"_prog=([^%"][^"]*)""#)
+		.ok()?
+		.captures(&content)?
+		.get(1)?
+		.as_str();
+	if !Path::new(interpreter)
+		.file_stem()
+		.and_then(OsStr::to_str)
+		.is_some_and(|name| name.eq_ignore_ascii_case("node"))
+	{
+		return None;
+	}
+	let raw_target = regex::Regex::new(r#"(?i)"%_prog%"\s+"([^"]+)"\s+%\*"#)
+		.ok()?
+		.captures(&content)?
+		.get(1)?
+		.as_str();
+	let shim_dir = config.command.parent()?;
+	let relative = raw_target
+		.trim_start_matches("%~dp0")
+		.trim_start_matches("%dp0%")
+		.trim_start_matches(['\\', '/']);
+	let target = shim_dir.join(relative.replace('\\', std::path::MAIN_SEPARATOR_STR));
+	let sibling_node = shim_dir.join("node.exe");
+	let executable = if tokio::fs::metadata(&sibling_node).await.is_ok() {
+		sibling_node.into_os_string()
+	} else {
+		OsString::from("node")
+	};
+	Some(SpawnPlan {
+		executable,
+		args: std::iter::once(target.into_os_string())
+			.chain(
+				config
+					.args
+					.iter()
+					.map(|value| OsString::from(value.as_str())),
+			)
+			.collect(),
+		detached_session: false,
+		windows_verbatim: false,
+	})
+}
+
+enum PendingResult {
+	Value(Value),
+	RpcError(i64),
+	Closed,
+}
+
+struct Inner {
+	stdin:       AsyncMutex<ChildStdin>,
+	child:       AsyncMutex<Option<Child>>,
+	pending:     Mutex<HashMap<RequestId, oneshot::Sender<PendingResult>>>,
+	incoming_tx: flume::Sender<IncomingMessage>,
+	incoming_rx: flume::Receiver<IncomingMessage>,
+	ids:         Mutex<RequestIdAllocator>,
+	id_format:   RequestIdFormat,
+	timeout:     Option<Duration>,
+	detached:    bool,
+	closed:      AtomicBool,
+}
+
+/// Concurrent newline-delimited JSON-RPC child transport.
+#[derive(Clone)]
+pub struct StdioTransport {
+	inner: Arc<Inner>,
+}
+
+impl StdioTransport {
+	/// Spawns and connects one Environment-owned process tree.
+	pub async fn spawn(config: StdioConfig) -> Result<Self, TransportError> {
+		let plan = resolve_host_spawn_plan(&config)
+			.await
+			.map_err(|_| TransportError::pre_dispatch(TransportFailure::Correlation))?;
+		let mut command = Command::new(&plan.executable);
+		#[cfg(not(windows))]
+		command.args(&plan.args);
+		#[cfg(windows)]
+		if plan.windows_verbatim {
+			use std::os::windows::process::CommandExt as _;
+			let (line, ordinary) = plan
+				.args
+				.split_last()
+				.ok_or_else(|| TransportError::pre_dispatch(TransportFailure::Correlation))?;
+			command.args(ordinary);
+			command.as_std_mut().raw_arg(line);
+		} else {
+			command.args(&plan.args);
+		}
+		command
+			.current_dir(&config.cwd)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.kill_on_drop(true);
+		for (name, value) in &config.env {
+			command.env(name.as_str(), value);
+		}
+		#[cfg(all(unix, not(target_os = "macos")))]
+		if plan.detached_session {
+			use std::os::unix::process::CommandExt as _;
+			// SAFETY: `setsid` has no memory-safety preconditions and this callback
+			// performs no allocation between fork and exec.
+			unsafe {
+				command.as_std_mut().pre_exec(|| {
+					if libc::setsid() == -1 {
+						Err(std::io::Error::last_os_error())
+					} else {
+						Ok(())
+					}
+				});
+			}
+		}
+		#[cfg(target_os = "macos")]
+		{
+			use std::os::unix::process::CommandExt as _;
+			// A separate process group preserves the inherited macOS session/TCC
+			// attachment while still giving teardown authority over descendants.
+			command.as_std_mut().process_group(0);
+		}
+		#[cfg(windows)]
+		{
+			command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+		}
+		let mut child = command
+			.spawn()
+			.map_err(|source| TransportError::pre_dispatch(TransportFailure::Spawn(source)))?;
+		let stdin = child
+			.stdin
+			.take()
+			.ok_or_else(|| TransportError::pre_dispatch(TransportFailure::Closed))?;
+		let stdout = child
+			.stdout
+			.take()
+			.ok_or_else(|| TransportError::pre_dispatch(TransportFailure::Closed))?;
+		let stderr = child
+			.stderr
+			.take()
+			.ok_or_else(|| TransportError::pre_dispatch(TransportFailure::Closed))?;
+		let (incoming_tx, incoming_rx) = flume::bounded(256);
+		let inner = Arc::new(Inner {
+			stdin: AsyncMutex::new(stdin),
+			child: AsyncMutex::new(Some(child)),
+			pending: Mutex::new(HashMap::new()),
+			incoming_tx,
+			incoming_rx,
+			ids: Mutex::new(RequestIdAllocator::default()),
+			id_format: config.request_id_format,
+			timeout: config.timeout,
+			detached: cfg!(unix),
+			closed: AtomicBool::new(false),
+		});
+		tokio::spawn(read_stdout(Arc::clone(&inner), stdout));
+		tokio::spawn(async move {
+			let mut stderr = stderr;
+			let mut buffer = [0_u8; 4096];
+			while stderr.read(&mut buffer).await.is_ok_and(|read| read != 0) {}
+		});
+		Ok(Self { inner })
+	}
+
+	async fn send(
+		&self,
+		value: &Value,
+		cancellation: &CancellationToken,
+	) -> Result<DispatchState, TransportError> {
+		if self.inner.closed.load(Ordering::Acquire) {
+			return Err(TransportError::pre_dispatch(TransportFailure::Closed));
+		}
+		let mut frame = serde_json::to_vec(value)
+			.map_err(|source| TransportError::pre_dispatch(TransportFailure::Json(source)))?;
+		if frame.len() >= MAX_FRAME_BYTES {
+			return Err(TransportError::pre_dispatch(TransportFailure::FrameTooLarge));
+		}
+		frame.push(b'\n');
+		let mut stdin = tokio::select! {
+			() = cancellation.cancelled() => return Err(TransportError::pre_dispatch(TransportFailure::Cancelled)),
+			stdin = self.inner.stdin.lock() => stdin,
+		};
+		let write = async {
+			stdin.write_all(&frame).await?;
+			stdin.flush().await
+		};
+		tokio::select! {
+			() = cancellation.cancelled() => Err(TransportError::effects_unknown(TransportFailure::Cancelled)),
+			result = write => result.map(|()| DispatchState::Dispatched).map_err(|source| TransportError::effects_unknown(TransportFailure::Io(source))),
+		}
+	}
+
+	async fn request_inner(
+		&self,
+		method: &str,
+		params: Value,
+		cancellation: CancellationToken,
+	) -> Result<TransportResponse, TransportError> {
+		let id = self
+			.inner
+			.ids
+			.lock()
+			.next(self.inner.id_format)
+			.map_err(|_| TransportError::pre_dispatch(TransportFailure::Correlation))?;
+		let (sender, receiver) = oneshot::channel();
+		self.inner.pending.lock().insert(id.clone(), sender);
+		let frame = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+		if let Err(error) = self.send(&frame, &cancellation).await {
+			self.inner.pending.lock().remove(&id);
+			return Err(error);
+		}
+		let receive = async { receiver.await.unwrap_or(PendingResult::Closed) };
+		let pending = if let Some(timeout) = self.inner.timeout {
+			tokio::select! {
+				() = cancellation.cancelled() => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::Cancelled)); },
+				result = tokio::time::timeout(timeout, receive) => match result { Ok(value) => value, Err(_) => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::TimedOut)); } },
+			}
+		} else {
+			tokio::select! { () = cancellation.cancelled() => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::Cancelled)); }, value = receive => value }
+		};
+		match pending {
+			PendingResult::Value(result) => {
+				Ok(TransportResponse { id, result, dispatch: DispatchState::Responded })
+			},
+			PendingResult::RpcError(code) => Err(TransportError {
+				dispatch: DispatchState::Responded,
+				cause:    TransportFailure::JsonRpc { code },
+			}),
+			PendingResult::Closed => Err(TransportError::effects_unknown(TransportFailure::Closed)),
+		}
+	}
+
+	async fn close_inner(&self) -> Result<(), TransportError> {
+		if self.inner.closed.swap(true, Ordering::AcqRel) {
+			return Ok(());
+		}
+		close_pending(&self.inner);
+		let Some(mut child) = self.inner.child.lock().await.take() else {
+			return Ok(());
+		};
+		let pid = child.id();
+		signal_child(pid, self.inner.detached, false);
+		let exited = tokio::time::timeout(TERM_GRACE, child.wait()).await.is_ok();
+		if !exited || self.inner.detached {
+			signal_child(pid, self.inner.detached, true);
+			if !exited {
+				let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+			}
+		}
+		Ok(())
+	}
+}
+
+impl McpTransport for StdioTransport {
+	fn request<'a>(
+		&'a self,
+		method: &'a str,
+		params: Value,
+		cancellation: CancellationToken,
+	) -> TransportFuture<'a, Result<TransportResponse, TransportError>> {
+		Box::pin(self.request_inner(method, params, cancellation))
+	}
+
+	fn notify<'a>(
+		&'a self,
+		method: &'a str,
+		params: Value,
+		cancellation: CancellationToken,
+	) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+		Box::pin(async move {
+			self
+				.send(&json!({"jsonrpc":"2.0", "method":method, "params":params}), &cancellation)
+				.await
+		})
+	}
+
+	fn next_message<'a>(
+		&'a self,
+		cancellation: CancellationToken,
+	) -> TransportFuture<'a, Result<IncomingMessage, TransportError>> {
+		Box::pin(async move {
+			tokio::select! { () = cancellation.cancelled() => Err(TransportError::pre_dispatch(TransportFailure::Cancelled)), message = self.inner.incoming_rx.recv_async() => message.map_err(|_| TransportError::pre_dispatch(TransportFailure::Closed)) }
+		})
+	}
+
+	fn respond<'a>(
+		&'a self,
+		id: RequestId,
+		result: Result<Value, ServerResponseError>,
+		cancellation: CancellationToken,
+	) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+		Box::pin(async move {
+			let frame = match result {
+				Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
+				Err(error) => {
+					json!({"jsonrpc":"2.0", "id":id, "error":{"code":error.code,"message":error.message,"data":error.data}})
+				},
+			};
+			self.send(&frame, &cancellation).await
+		})
+	}
+
+	fn close(&self) -> TransportFuture<'_, Result<(), TransportError>> {
+		Box::pin(self.close_inner())
+	}
+}
+
+async fn read_stdout(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
+	let mut reader = BufReader::new(stdout);
+	let mut frame = Vec::new();
+	loop {
+		frame.clear();
+		match reader.read_until(b'\n', &mut frame).await {
+			Ok(0) | Err(_) => break,
+			Ok(_) if frame.len() > MAX_FRAME_BYTES => break,
+			Ok(_) => match serde_json::from_slice::<Value>(&frame) {
+				Ok(value) => dispatch(&inner, value),
+				Err(_) => break,
+			},
+		}
+	}
+	inner.closed.store(true, Ordering::Release);
+	close_pending(&inner);
+	let _ = inner.incoming_tx.try_send(IncomingMessage::Closed);
+}
+
+fn dispatch(inner: &Inner, message: Value) {
+	let Some(object) = message.as_object() else {
+		return;
+	};
+	if let Some(id_value) = object.get("id")
+		&& (object.contains_key("result") || object.contains_key("error"))
+		&& let Ok(id) = serde_json::from_value::<RequestId>(id_value.clone())
+		&& let Some(pending) = inner.pending.lock().remove(&id)
+	{
+		let result = object
+			.get("error")
+			.and_then(|error| error.get("code"))
+			.and_then(Value::as_i64)
+			.map_or_else(
+				|| PendingResult::Value(object.get("result").cloned().unwrap_or(Value::Null)),
+				PendingResult::RpcError,
+			);
+		let _ = pending.send(result);
+		return;
+	}
+	let Some(method) = object.get("method").and_then(Value::as_str) else {
+		return;
+	};
+	let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+	let incoming = match object
+		.get("id")
+		.and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+	{
+		Some(id) => IncomingMessage::Request { id, method: Str::from(method), params },
+		None => IncomingMessage::Notification { method: Str::from(method), params },
+	};
+	let _ = inner.incoming_tx.try_send(incoming);
+}
+
+fn close_pending(inner: &Inner) {
+	for (_, sender) in inner.pending.lock().drain() {
+		let _ = sender.send(PendingResult::Closed);
+	}
+}
+
+fn signal_child(pid: Option<u32>, detached: bool, hard: bool) {
+	#[cfg(unix)]
+	if let Some(pid) = pid {
+		let signal = if hard {
+			nix::sys::signal::Signal::SIGKILL
+		} else {
+			nix::sys::signal::Signal::SIGTERM
+		};
+		let raw = nix::unistd::Pid::from_raw(pid.cast_signed());
+		let _ = nix::sys::signal::kill(
+			if detached {
+				nix::unistd::Pid::from_raw(-raw.as_raw())
+			} else {
+				raw
+			},
+			signal,
+		);
+	}
+	#[cfg(windows)]
+	{
+		let _ = (pid, detached, hard);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::env;
+
+	use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+	use super::*;
+
+	#[tokio::test]
+	async fn npm_cmd_shim_bypasses_cmd_exe_for_node_target() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let shim = scratch.path().join("server.cmd");
+		tokio::fs::write(
+			&shim,
+			"@SET \"_prog=node\"\r\n\"%_prog%\"  \"%~dp0\\node_modules\\server\\index.js\" %*\r\n",
+		)
+		.await
+		.expect("shim");
+		let config = StdioConfig {
+			command:           shim,
+			args:              vec![Str::from("arg")],
+			env:               BTreeMap::new(),
+			cwd:               scratch.path().to_path_buf(),
+			timeout:           None,
+			request_id_format: RequestIdFormat::Number,
+		};
+		let plan = resolve_windows_npm_shim(&config).await.expect("bypass");
+		assert_eq!(plan.executable, OsString::from("node"));
+		assert!(
+			plan.args[0]
+				.to_string_lossy()
+				.ends_with("node_modules/server/index.js")
+		);
+		assert_eq!(plan.args[1], "arg");
+	}
+
+	#[test]
+	fn platform_spawn_vectors_cover_sessions_and_batbadbut() {
+		let config = StdioConfig {
+			command:           PathBuf::from(r"C:\work\%TOKEN%\server.cmd"),
+			args:              vec![Str::from("hello & goodbye"), Str::from("plain")],
+			env:               BTreeMap::new(),
+			cwd:               PathBuf::from("."),
+			timeout:           None,
+			request_id_format: RequestIdFormat::Number,
+		};
+		assert!(
+			resolve_spawn_plan(&config, StdioPlatform::Posix, true, None)
+				.expect("posix")
+				.detached_session
+		);
+		assert!(
+			!resolve_spawn_plan(&config, StdioPlatform::Macos, true, None)
+				.expect("mac")
+				.detached_session
+		);
+		let windows =
+			resolve_spawn_plan(&config, StdioPlatform::Windows, true, Some(OsStr::new("cmd.exe")))
+				.expect("windows");
+		assert!(windows.windows_verbatim);
+		let line = windows.args.last().expect("line").to_string_lossy();
+		assert!(line.contains("%%cd:~,%TOKEN%%cd:~,%"));
+		assert!(line.contains("\"hello & goodbye\""));
+	}
+
+	#[tokio::test]
+	async fn concurrent_ndjson_fixture_correlates_and_closes() {
+		let executable = env::current_exe().expect("test executable");
+		let transport = StdioTransport::spawn(StdioConfig {
+			command:           executable,
+			args:              vec![
+				Str::from("--exact"),
+				Str::from("envd::mcp::stdio::tests::stdio_fixture_child"),
+				Str::from("--nocapture"),
+			],
+			env:               BTreeMap::from([(
+				Str::from("OMP_MCP_STDIO_FIXTURE"),
+				OsString::from("1"),
+			)]),
+			cwd:               env::current_dir().expect("cwd"),
+			timeout:           Some(Duration::from_secs(5)),
+			request_id_format: RequestIdFormat::Number,
+		})
+		.await
+		.expect("spawn");
+		let (left, right) = tokio::join!(
+			transport.request("echo", json!({"value":"left"}), CancellationToken::new()),
+			transport.request("echo", json!({"value":"right"}), CancellationToken::new())
+		);
+		assert_eq!(left.expect("left").result["value"], "left");
+		assert_eq!(right.expect("right").result["value"], "right");
+		transport.close().await.expect("close");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn close_terminates_descendant_process_group() {
+		let executable = env::current_exe().expect("test executable");
+		let transport = StdioTransport::spawn(StdioConfig {
+			command:           executable,
+			args:              vec![
+				Str::from("--exact"),
+				Str::from("envd::mcp::stdio::tests::stdio_fixture_child"),
+				Str::from("--nocapture"),
+			],
+			env:               BTreeMap::from([(
+				Str::from("OMP_MCP_STDIO_FIXTURE"),
+				OsString::from("1"),
+			)]),
+			cwd:               env::current_dir().expect("cwd"),
+			timeout:           Some(Duration::from_secs(5)),
+			request_id_format: RequestIdFormat::Number,
+		})
+		.await
+		.expect("spawn");
+		let response = transport
+			.request("spawn-grandchild", json!({}), CancellationToken::new())
+			.await
+			.expect("request");
+		let pid = response.result["pid"].as_i64().expect("pid");
+		transport.close().await.expect("close");
+		let pid = nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid range"));
+		for _ in 0..20 {
+			if nix::sys::signal::kill(pid, None).is_err() {
+				return;
+			}
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+		panic!("stdio descendant survived process-group teardown");
+	}
+
+	#[tokio::test]
+	async fn stdio_fixture_child() {
+		if env::var_os("OMP_MCP_STDIO_FIXTURE").is_none() {
+			return;
+		}
+		let mut input = BufReader::new(tokio::io::stdin()).lines();
+		let mut output = tokio::io::stdout();
+		while let Ok(Some(line)) = input.next_line().await {
+			let request: Value = serde_json::from_str(&line).expect("request");
+			let result = if request["method"] == "spawn-grandchild" {
+				#[cfg(unix)]
+				{
+					let child = tokio::process::Command::new("/bin/sh")
+						.args(["-c", "trap '' TERM; exec sleep 30"])
+						.stdin(Stdio::null())
+						.stdout(Stdio::null())
+						.stderr(Stdio::null())
+						.spawn()
+						.expect("grandchild");
+					json!({"pid": child.id().expect("grandchild pid")})
+				}
+				#[cfg(windows)]
+				{
+					json!({})
+				}
+			} else {
+				request["params"].clone()
+			};
+			let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+			output
+				.write_all(
+					serde_json::to_string(&response)
+						.expect("response")
+						.as_bytes(),
+				)
+				.await
+				.expect("write");
+			output.write_all(b"\n").await.expect("newline");
+			output.flush().await.expect("flush");
+		}
+	}
+}

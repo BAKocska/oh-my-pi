@@ -1,13 +1,19 @@
 //! Persisted application settings and layered extension configuration.
 
 use std::{
-	fmt, fs, io,
+	fmt,
 	path::{Path, PathBuf},
 };
+
+pub mod io;
+pub mod manager;
+pub mod migrate;
+pub mod subscription;
 
 use omp_agent::{CompactionMethodOrder, CompactionTier};
 use omp_core::{Duration, DurationError};
 use omp_llm_inference::{Difficulty, DifficultyBackend};
+pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 use omp_tool::DEFAULT_INTERRUPT_GRACE;
 use omp_tui::components::ComposerStyle;
 use serde::{
@@ -15,10 +21,275 @@ use serde::{
 	de::{self, Visitor},
 };
 
+pub use crate::envd::tool_settings::ToolSettings;
 use crate::ext::config::{ExtensionOverlay, Scope, ScopedOverlay};
 
-const SETTINGS_FILE: &str = "config.toml";
-const SETTINGS_TEMP_FILE: &str = "config.toml.tmp";
+const PERSISTED_SCOPES: &[omp_settings::SettingScope] = &[
+	omp_settings::SettingScope::Global,
+	omp_settings::SettingScope::Project,
+	omp_settings::SettingScope::Runtime,
+];
+
+const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
+	omp_settings::FieldDescriptor {
+		path:        "default_model",
+		label:       "Default model",
+		description: "Default model selector for interactive chat.",
+		kind:        omp_settings::SettingKind::String,
+		scopes:      PERSISTED_SCOPES,
+		order:       10,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "runtime.interrupt_grace",
+		label:       "Interrupt grace",
+		description: "Courtesy interval before forced interruption.",
+		kind:        omp_settings::SettingKind::Duration,
+		scopes:      PERSISTED_SCOPES,
+		order:       20,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "compaction.enabled",
+		label:       "Automatic compaction",
+		description: "Enable automatic context compaction.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       40,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "compaction.async_enabled",
+		label:       "Speculative compaction",
+		description: "Allow latency-bearing methods to run speculatively.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       41,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "compaction.method_order",
+		label:       "Compaction methods",
+		description: "Ordered automatic compaction fallback ladder.",
+		kind:        omp_settings::SettingKind::Array,
+		scopes:      PERSISTED_SCOPES,
+		order:       42,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "compaction.threshold_fraction",
+		label:       "Compaction threshold",
+		description: "Usable-context fraction that triggers compaction.",
+		kind:        omp_settings::SettingKind::Number,
+		scopes:      PERSISTED_SCOPES,
+		order:       43,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "compaction.keep_recent_tokens",
+		label:       "Recent tokens",
+		description: "Recent-context growth retained around speculative summaries.",
+		kind:        omp_settings::SettingKind::Integer,
+		scopes:      PERSISTED_SCOPES,
+		order:       44,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "auto_thinking.backend",
+		label:       "Auto-thinking backend",
+		description: "Classifier backend.",
+		kind:        omp_settings::SettingKind::Enum(&["online", "local"]),
+		scopes:      PERSISTED_SCOPES,
+		order:       50,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "auto_thinking.provisional",
+		label:       "Provisional effort",
+		description: "Effort used while classification settles.",
+		kind:        omp_settings::SettingKind::Enum(&[
+			"off", "minimal", "low", "medium", "high", "max",
+		]),
+		scopes:      PERSISTED_SCOPES,
+		order:       51,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "auto_thinking.ceiling",
+		label:       "Effort ceiling",
+		description: "Maximum auto-classified effort.",
+		kind:        omp_settings::SettingKind::Enum(&[
+			"off", "minimal", "low", "medium", "high", "max",
+		]),
+		scopes:      PERSISTED_SCOPES,
+		order:       52,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "auto_thinking.allow_max",
+		label:       "Allow maximum effort",
+		description: "Allow the online classifier to choose maximum effort.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       53,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "memory.backend",
+		label:       "Memory backend",
+		description: "Default-off durable memory backend.",
+		kind:        omp_settings::SettingKind::Enum(&["off", "mnemopi"]),
+		scopes:      PERSISTED_SCOPES,
+		order:       54,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "mnemopi.scoping",
+		label:       "Mnemopi bank scope",
+		description: "Canonical-project and shared-bank recall policy.",
+		kind:        omp_settings::SettingKind::Enum(&[
+			"global",
+			"per-project",
+			"per-project-tagged",
+		]),
+		scopes:      PERSISTED_SCOPES,
+		order:       55,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "memory.backend", equals: "mnemopi" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "autolearn.enabled",
+		label:       "Automatic learning",
+		description: "Enable managed-skill guidance and capture eligibility.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       56,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "plan.enabled",
+		label:       "Plan mode",
+		description: "Enable the planning execution mode.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       60,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "plan.default_on_startup",
+		label:       "Start in plan mode",
+		description: "Enter plan mode at the start of a fresh interactive session.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       61,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "plan.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "worktree.base",
+		label:       "Worktree base",
+		description: "Base directory for Environment-owned isolated worktrees.",
+		kind:        omp_settings::SettingKind::Path,
+		scopes:      PERSISTED_SCOPES,
+		order:       60,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "composer.shape",
+		label:       "Composer shape",
+		description: "Interactive composer chrome.",
+		kind:        omp_settings::SettingKind::Enum(&[
+			"box",
+			"claude",
+			"pi",
+			"borderless",
+			"rule",
+			"field",
+			"rail",
+		]),
+		scopes:      PERSISTED_SCOPES,
+		order:       70,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "extensions",
+		label:       "Extensions",
+		description: "Client-scope extension overlay.",
+		kind:        omp_settings::SettingKind::Table,
+		scopes:      PERSISTED_SCOPES,
+		order:       80,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "images.auto_resize",
+		label:       "Auto-resize images",
+		description: "Resize large prompt images to 2000x2000 while preserving format.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       81,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "secrets.enabled",
+		label:       "Provider secret obfuscation",
+		description: "Obfuscate configured secrets in provider-bound projections.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       82,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "export.shareRedactSecrets",
+		label:       "Share secret redaction",
+		description: "Irreversibly redact configured secrets from share snapshots.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       83,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+];
 
 /// Runtime durations shared by the agent, eval, and extension-host control
 /// planes.
@@ -33,57 +304,6 @@ pub struct RuntimeDurations {
 impl Default for RuntimeDurations {
 	fn default() -> Self {
 		Self { interrupt_grace: DEFAULT_INTERRUPT_GRACE }
-	}
-}
-
-/// Tool exposure and timeout policy resolved from the layered settings stack.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ToolSettings {
-	/// Explicit per-tool enablement overrides; absent names remain enabled.
-	#[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-	pub enabled:      std::collections::BTreeMap<omp_core::Str, bool>,
-	/// Global ceiling for tool deadlines.
-	#[serde(
-		default,
-		alias = "maxTimeout",
-		skip_serializing_if = "Option::is_none",
-		with = "optional_duration"
-	)]
-	pub max_timeout:  Option<Duration>,
-	/// Optional pinned edit revision (`rep.1` or `hl.1`) for this client.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub edit_dialect: Option<omp_core::Str>,
-}
-
-impl ToolSettings {
-	/// Whether a named tool is available after applying the default-enabled
-	/// rule.
-	#[must_use]
-	pub fn enabled(&self, name: &str) -> bool {
-		self.enabled.get(name).copied().unwrap_or(true)
-	}
-}
-
-mod optional_duration {
-	use super::*;
-
-	pub fn serialize<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: Serializer,
-	{
-		match value {
-			Some(value) => serializer.serialize_some(&value.to_string()),
-			None => serializer.serialize_none(),
-		}
-	}
-
-	pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
-		Option::<String>::deserialize(deserializer)?
-			.map(|value| value.parse().map_err(de::Error::custom))
-			.transpose()
 	}
 }
 
@@ -215,6 +435,27 @@ impl AutoThinkingSettings {
 	}
 }
 
+/// Persisted planning-mode defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanSettings {
+	/// Whether plan mode is available.
+	#[serde(default = "default_plan_enabled")]
+	pub enabled:            bool,
+	/// Whether fresh interactive sessions begin in plan mode.
+	#[serde(default)]
+	pub default_on_startup: bool,
+}
+
+const fn default_plan_enabled() -> bool {
+	true
+}
+
+impl Default for PlanSettings {
+	fn default() -> Self {
+		Self { enabled: true, default_on_startup: false }
+	}
+}
+
 /// Placement policy for Environment-owned isolated worktrees.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeSettings {
@@ -231,8 +472,44 @@ pub struct ComposerSettings {
 	pub shape: ComposerStyle,
 }
 
+/// Prompt image attachment policy.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ImageSettings {
+	/// Resize dimensions above the provider-compatible ceiling.
+	#[serde(default = "default_true")]
+	pub auto_resize: bool,
+}
+
+impl Default for ImageSettings {
+	fn default() -> Self {
+		Self { auto_resize: true }
+	}
+}
+
+/// Reversible provider-bound secret policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecretsSettings {
+	/// Whether complete bidirectional provider obfuscation is enabled.
+	#[serde(default)]
+	pub enabled: bool,
+}
+
+/// Irreversible export-boundary policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExportSettings {
+	/// Whether share snapshots are irreversibly redacted before leaving Core.
+	#[serde(default = "default_true", rename = "shareRedactSecrets")]
+	pub share_redact_secrets: bool,
+}
+
+impl Default for ExportSettings {
+	fn default() -> Self {
+		Self { share_redact_secrets: true }
+	}
+}
+
 /// Persisted client-scope preferences under `<data_dir>/config.toml`.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
 	/// Model key selected as the default for interactive chat.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,6 +526,18 @@ pub struct Settings {
 	/// Automatic per-turn reasoning classification.
 	#[serde(default)]
 	pub auto_thinking: AutoThinkingSettings,
+	/// Planning-mode availability and startup policy.
+	#[serde(default)]
+	pub plan:          PlanSettings,
+	/// Default-off memory backend selector.
+	#[serde(default)]
+	pub memory:        MemorySettings,
+	/// Mnemopi-specific durable bank and lifecycle settings.
+	#[serde(default)]
+	pub mnemopi:       MnemopiSettings,
+	/// Automatic-learning capture settings.
+	#[serde(default)]
+	pub autolearn:     AutolearnSettings,
 	/// Isolated worktree placement policy.
 	#[serde(default)]
 	pub worktree:      WorktreeSettings,
@@ -258,46 +547,65 @@ pub struct Settings {
 	/// Client-scope extension overlay.
 	#[serde(default)]
 	pub extensions:    ExtensionOverlay,
+	/// Prompt image attachment policy.
+	#[serde(default)]
+	pub images:        ImageSettings,
+	/// Reversible provider-bound secret policy.
+	#[serde(default)]
+	pub secrets:       SecretsSettings,
+	/// Irreversible export-boundary policy.
+	#[serde(default)]
+	pub export:        ExportSettings,
+}
+
+impl omp_settings::SettingsDomain for Settings {
+	const DOMAIN: &'static str = "app-core";
+	const FIELDS: &'static [omp_settings::FieldDescriptor] = CORE_FIELDS;
+	const PREFIX: Option<&'static str> = None;
+
+	fn validate(&self) -> Result<(), omp_settings::ValidationError> {
+		if self
+			.default_model
+			.as_deref()
+			.is_some_and(|model| model.trim().is_empty())
+			|| self.extensions.validate(Scope::Client).is_err()
+			|| !(0.0..=1.0).contains(&self.compaction.threshold_fraction)
+			|| self.compaction.threshold_fraction == 0.0
+		{
+			return Err(omp_settings::ValidationError::DomainInvariant { domain: Self::DOMAIN });
+		}
+		Ok(())
+	}
+}
+
+omp_settings::inventory::submit! {
+	omp_settings::DomainRegistration::of::<Settings>()
+}
+
+/// Loads the current typed projection through the single settings authority.
+pub fn current(data_dir: &Path) -> Result<Settings, manager::SettingsManagerError> {
+	current_with_overlays(data_dir, &[])
+}
+
+/// Loads settings with ordered invocation-local native TOML overlays.
+pub fn current_with_overlays(
+	data_dir: &Path,
+	overlays: &[PathBuf],
+) -> Result<Settings, manager::SettingsManagerError> {
+	let project = std::env::current_dir().ok();
+	let mut paths = manager::SettingsPaths::discover(data_dir, project.as_deref());
+	paths.overlays.extend_from_slice(overlays);
+	let manager = manager::SettingsManager::open(paths)?;
+	let projection = manager
+		.snapshot()
+		.project::<Settings>()
+		.map_err(|error| manager::SettingsManagerError::Projection { source: error })?;
+	let mut settings = projection.get().clone();
+	settings.mnemopi = settings.mnemopi.normalize();
+	Ok(settings)
 }
 
 impl Settings {
-	/// Loads the client settings from `data_dir`, falling back to defaults when
-	/// absent or corrupt. Invalid extension overlays are refused by
-	/// [`Self::extension_scopes`] rather than silently admitted.
-	#[must_use]
-	pub fn load(data_dir: &Path) -> Self {
-		fs::read_to_string(data_dir.join(SETTINGS_FILE))
-			.ok()
-			.and_then(|data| toml::from_str(&data).ok())
-			.unwrap_or_default()
-	}
-
-	/// Loads and validates client extension configuration without the
-	/// compatibility fallback used by the chat preferences path.
-	///
-	/// Extension admission must use this entry point so a secret in
-	/// `[extensions.settings]` is refused as `E-SETTING-SECRET`.
-	pub fn load_checked(data_dir: &Path) -> Result<Self, crate::ext::ExtensionError> {
-		let path = data_dir.join(SETTINGS_FILE);
-		if !path.exists() {
-			return Ok(Self::default());
-		}
-		let data = fs::read_to_string(path).map_err(|error| {
-			crate::ext::ExtensionError::new(
-				crate::ext::ExtensionCode::EManifestParse,
-				error.to_string(),
-			)
-		})?;
-		let settings: Self = toml::from_str(&data).map_err(|error| {
-			crate::ext::ExtensionError::new(
-				crate::ext::ExtensionCode::EManifestParse,
-				error.to_string(),
-			)
-		})?;
-		settings.extensions.validate(Scope::Client)?;
-		Ok(settings)
-	}
-
 	/// Returns the resolved runtime durations.
 	#[must_use]
 	pub const fn runtime_durations(&self) -> RuntimeDurations {
@@ -319,15 +627,6 @@ impl Settings {
 		}
 		Ok(scopes)
 	}
-
-	/// Atomically saves client-scope settings to `<data_dir>/config.toml`.
-	pub fn save(&self, data_dir: &Path) -> io::Result<()> {
-		fs::create_dir_all(data_dir)?;
-		let data = toml::to_string_pretty(self).map_err(io::Error::other)?;
-		let temporary = data_dir.join(SETTINGS_TEMP_FILE);
-		fs::write(&temporary, data)?;
-		fs::rename(temporary, data_dir.join(SETTINGS_FILE))
-	}
 }
 
 #[cfg(test)]
@@ -336,23 +635,22 @@ mod tests {
 
 	use super::*;
 	#[test]
-	fn settings_round_trip() {
-		let data_dir = tempfile::tempdir().expect("create temporary data directory");
-
+	fn isolated_snapshot_round_trip() {
 		let settings = Settings {
 			default_model: Some("anthropic/claude-sonnet-4".to_owned()),
 			..Settings::default()
 		};
-
-		settings.save(data_dir.path()).expect("save settings");
-
-		let loaded = Settings::load(data_dir.path());
-		assert_eq!(loaded.default_model, settings.default_model);
+		let snapshot = omp_settings::SettingsSnapshot::isolated(settings.clone()).expect("snapshot");
+		let loaded = snapshot.project::<Settings>().expect("projection");
+		assert_eq!(loaded.get().default_model, settings.default_model);
 		assert_eq!(
-			loaded.runtime_durations().interrupt_grace,
+			loaded.get().runtime_durations().interrupt_grace,
 			settings.runtime_durations().interrupt_grace,
 		);
-		assert_eq!(loaded.runtime_durations().interrupt_grace.unit(), DurationUnit::Milliseconds,);
+		assert_eq!(
+			loaded.get().runtime_durations().interrupt_grace.unit(),
+			DurationUnit::Milliseconds,
+		);
 	}
 
 	#[test]
@@ -409,6 +707,17 @@ mod tests {
 	}
 
 	#[test]
+	fn plan_settings_use_owned_nested_keys() {
+		let settings: Settings = toml::from_str("[plan]\nenabled = true\ndefault_on_startup = true")
+			.expect("plan settings parse");
+		assert!(settings.plan.enabled);
+		assert!(settings.plan.default_on_startup);
+		let encoded = toml::to_string(&settings).expect("plan settings serialize");
+		assert!(encoded.contains("[plan]"));
+		assert!(encoded.contains("default_on_startup = true"));
+	}
+
+	#[test]
 	fn composer_shape_uses_nested_appearance_setting() {
 		let settings: Settings =
 			toml::from_str("[composer]\nshape = \"rail\"").expect("composer settings parse");
@@ -439,13 +748,21 @@ mod tests {
 	}
 
 	#[test]
-	fn corrupt_settings_fall_back_to_default() {
+	fn corrupt_settings_are_quarantined_with_diagnostics() {
 		let data_dir = tempfile::tempdir().expect("create temporary data directory");
-		fs::write(data_dir.path().join(SETTINGS_FILE), "not valid toml")
-			.expect("write corrupt settings");
-
-		let loaded = Settings::load(data_dir.path());
-		assert!(loaded.default_model.is_none());
+		let path = data_dir.path().join("config.toml");
+		std::fs::write(&path, "not valid toml").expect("write corrupt settings");
+		let manager = manager::SettingsManager::open(manager::SettingsPaths {
+			global:   path.clone(),
+			project:  None,
+			overlays: Vec::new(),
+		})
+		.expect("manager");
+		let diagnostics = manager.diagnostics();
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(diagnostics[0].path, path);
+		assert!(diagnostics[0].backup_path.exists());
+		assert!(!path.exists());
 	}
 }
 

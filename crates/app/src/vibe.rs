@@ -308,12 +308,15 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 			let child_label = label.clone();
 			let handle = tokio::spawn(async move {
 				parent
-					.agent(json!({
-						"prompt": prompt,
-						"agent": kind,
-						"label": child_label,
-						"_id": child_id,
-					}))
+					.agent(
+						json!({
+							"prompt": prompt,
+							"agent": kind,
+							"label": child_label,
+							"_id": child_id,
+						}),
+						&crate::envd::eval::NoopBridgeProgress,
+					)
 					.await
 					.map_err(|error| Fault::new(error.to_string()))
 			});
@@ -373,6 +376,7 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 					.duration_since(UNIX_EPOCH)
 					.map_or(0, |duration| duration.as_millis() as u64),
 				session_id,
+				expects_reply: false,
 			})
 			.map_err(|error| Fault::new(error.to_string()))?;
 		Ok(json!({

@@ -18,7 +18,7 @@ use omp_docserver::{
 };
 use omp_hashline::{Clipboard, NoopLoopGuard, SnapshotStore};
 use omp_proto::document::v1 as pb;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -51,6 +51,15 @@ pub struct EventStreamError {
 	pub skipped_events: u64,
 	/// Server-provided diagnostic.
 	pub message:        Str,
+}
+
+/// One ordered DAP output or lifecycle event.
+#[derive(Clone, Debug)]
+pub enum DapRegistryEvent {
+	/// Bounded adapter or debuggee output.
+	Output(pb::DapOutput),
+	/// Bounded adapter lifecycle or debugger event.
+	Event(pb::DapEvent),
 }
 
 /// One connection-wide LSP registry event.
@@ -100,6 +109,7 @@ type DocumentEventResult = Result<pb::DocumentEvent, EventStreamError>;
 type DocumentEventSender = flume::Sender<DocumentEventResult>;
 type DocumentEventSubscribers = HashMap<Bytes, (Bytes, DocumentEventSender)>;
 type PendingDocumentEvents = HashMap<Bytes, Vec<DocumentEventResult>>;
+type PendingDapEvents = HashMap<Bytes, Vec<DapRegistryEvent>>;
 
 /// A document-server lease pinned to the revision returned by `OpenDocument`.
 ///
@@ -229,10 +239,12 @@ pub enum DocumentError {
 #[derive(Debug)]
 struct Inner {
 	hello:                    DocumentHello,
+	resource_mutations:       RwLock<Option<ResourceMutationServices>>,
 	writer:                   flume::Sender<pb::ClientFrame>,
 	pending:                  Arc<Mutex<HashMap<u64, flume::Sender<pb::ServerFrame>>>>,
 	document_events:          Arc<Mutex<DocumentEventSubscribers>>,
 	pending_document_events:  Arc<Mutex<PendingDocumentEvents>>,
+	pending_dap_events:       Arc<Mutex<PendingDapEvents>>,
 	document_event_sequences: Arc<Mutex<HashMap<Bytes, u64>>>,
 	lsp_event_sender:         flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
 	lsp_events:               Mutex<Option<LspEvents>>,
@@ -245,11 +257,26 @@ struct Inner {
 
 /// Concrete env-side owner of one multiplexed `document/v1` client connection.
 #[derive(Clone, Debug)]
+pub(super) struct ResourceMutationServices {
+	pub(super) ssh:   super::ssh::SshService,
+	pub(super) vault: super::vault::VaultService,
+}
+
+#[derive(Clone, Debug)]
 pub struct DocumentHost {
 	inner: Arc<Inner>,
 }
 
 impl DocumentHost {
+	/// Installs the app-owned capability-checked internal resource writers.
+	pub(super) fn set_resource_mutations(&self, services: ResourceMutationServices) {
+		*self.inner.resource_mutations.write() = Some(services);
+	}
+
+	pub(super) fn resource_mutations(&self) -> Option<ResourceMutationServices> {
+		self.inner.resource_mutations.read().clone()
+	}
+
 	/// Connects to an already-running document server and completes its hello.
 	pub async fn connect<S>(stream: S) -> Result<Self, DocumentError>
 	where
@@ -309,10 +336,12 @@ impl DocumentHost {
 		let (lsp_event_sender, lsp_event_receiver) = terminal_event_channel();
 		let inner = Arc::new(Inner {
 			hello,
+			resource_mutations: RwLock::new(None),
 			writer: write_tx,
 			pending: Arc::new(Mutex::new(HashMap::new())),
 			document_events: Arc::new(Mutex::new(HashMap::new())),
 			pending_document_events: Arc::new(Mutex::new(HashMap::new())),
+			pending_dap_events: Arc::new(Mutex::new(HashMap::new())),
 			document_event_sequences: Arc::new(Mutex::new(HashMap::new())),
 			lsp_event_sender,
 			lsp_events: Mutex::new(Some(LspEvents { receiver: lsp_event_receiver })),
@@ -341,6 +370,7 @@ impl DocumentHost {
 		let reader_document_events = Arc::clone(&inner.document_events);
 		let reader_document_event_sequences = Arc::clone(&inner.document_event_sequences);
 		let reader_pending_document_events = Arc::clone(&inner.pending_document_events);
+		let reader_pending_dap_events = Arc::clone(&inner.pending_dap_events);
 		let reader_lsp_events = inner.lsp_event_sender.clone();
 		let reader_shutdown = inner.shutdown.clone();
 		tokio::spawn(async move {
@@ -361,6 +391,7 @@ impl DocumentHost {
 							&reader_document_events,
 							&reader_pending_document_events,
 							&reader_document_event_sequences,
+							&reader_pending_dap_events,
 							&reader_lsp_events,
 						);
 					}
@@ -839,6 +870,73 @@ impl DocumentHost {
 		Ok(response)
 	}
 
+	/// Launches a DAP session and returns lifecycle/output events emitted before
+	/// the launch response.
+	pub async fn dap_launch(
+		&self,
+		request: pb::DapLaunchRequest,
+		cancel: &CancellationToken,
+	) -> Result<(pb::DapSessionResponse, Vec<DapRegistryEvent>), DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::DapLaunch(request), cancel)
+			.await?;
+		let pb::server_frame::Body::DapSession(response) = body else {
+			return Err(unexpected("DAP session response"));
+		};
+		let events = self.take_dap_events(response.session.as_ref())?;
+		Ok((response, events))
+	}
+
+	/// Attaches a DAP session and returns lifecycle/output events emitted before
+	/// the attach response.
+	pub async fn dap_attach(
+		&self,
+		request: pb::DapAttachRequest,
+		cancel: &CancellationToken,
+	) -> Result<(pb::DapSessionResponse, Vec<DapRegistryEvent>), DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::DapAttach(request), cancel)
+			.await?;
+		let pb::server_frame::Body::DapSession(response) = body else {
+			return Err(unexpected("DAP session response"));
+		};
+		let events = self.take_dap_events(response.session.as_ref())?;
+		Ok((response, events))
+	}
+
+	/// Executes one revision-fenced DAP action and returns the ordered events
+	/// emitted before its terminal response.
+	pub async fn dap_action(
+		&self,
+		request: pb::DapActionRequest,
+		cancel: &CancellationToken,
+	) -> Result<(pb::DapActionResponse, Vec<DapRegistryEvent>), DocumentError> {
+		let body = self
+			.request(pb::client_frame::Body::DapAction(request), cancel)
+			.await?;
+		let pb::server_frame::Body::DapAction(response) = body else {
+			return Err(unexpected("DAP action response"));
+		};
+		let events = self.take_dap_events(response.session.as_ref())?;
+		Ok((response, events))
+	}
+
+	fn take_dap_events(
+		&self,
+		session: Option<&pb::DapSessionRef>,
+	) -> Result<Vec<DapRegistryEvent>, DocumentError> {
+		let session = session.ok_or_else(|| unexpected("DAP response session identity"))?;
+		if session.session_id.is_empty() {
+			return Err(unexpected("non-empty DAP response session identity"));
+		}
+		Ok(self
+			.inner
+			.pending_dap_events
+			.lock()
+			.remove(&session.session_id)
+			.unwrap_or_default())
+	}
+
 	/// Returns the authority-resolved LSP bindings for a document.
 	pub async fn get_lsp_bindings(
 		&self,
@@ -1084,6 +1182,7 @@ fn dispatch_event_frame(
 	document_events: &Mutex<DocumentEventSubscribers>,
 	pending_document_events: &Mutex<PendingDocumentEvents>,
 	document_event_sequences: &Mutex<HashMap<Bytes, u64>>,
+	dap_events: &Mutex<PendingDapEvents>,
 	lsp_events: &flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
 ) {
 	match body {
@@ -1121,6 +1220,32 @@ fn dispatch_event_frame(
 					.entry(document_id)
 					.or_default()
 					.push(Ok(event));
+			}
+		},
+		pb::server_frame::Body::DapOutput(output) => {
+			if let Some(session) = output
+				.session
+				.as_ref()
+				.filter(|session| !session.session_id.is_empty())
+			{
+				dap_events
+					.lock()
+					.entry(session.session_id.clone())
+					.or_default()
+					.push(DapRegistryEvent::Output(output));
+			}
+		},
+		pb::server_frame::Body::DapEvent(event) => {
+			if let Some(session) = event
+				.session
+				.as_ref()
+				.filter(|session| !session.session_id.is_empty())
+			{
+				dap_events
+					.lock()
+					.entry(session.session_id.clone())
+					.or_default()
+					.push(DapRegistryEvent::Event(event));
 			}
 		},
 		pb::server_frame::Body::LspEvent(event) => {

@@ -416,7 +416,7 @@ fn account_meta(account: AccountSummary) -> Result<pb::CredentialMeta, Status> {
 	})
 }
 
-fn parse_account_id(account: &AccountId) -> Result<u64, Status> {
+fn parse_account_id(account: &AccountId<str>) -> Result<u64, Status> {
 	account.as_str().parse().map_err(|_| {
 		Status::failed_precondition(
 			"account identity cannot be represented by the retained numeric auth RPC schema",

@@ -5,9 +5,12 @@
 //! durable state.
 
 pub mod config;
+pub mod doctor;
+pub mod index;
 pub mod lock;
 pub mod resolver;
 pub mod trust;
+pub mod upgrade;
 
 use std::{error::Error, fmt};
 

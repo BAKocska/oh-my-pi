@@ -122,16 +122,77 @@ impl Grants {
 	}
 }
 
+/// Immutable Environment tier for a language-server operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LspOperationTier {
+	/// Query-only operation.
+	ReadOnly,
+	/// Operation that may mutate workspace state or execute a server command.
+	Mutation,
+}
+
+/// Returns the immutable tier for one raw LSP request method.
+#[must_use]
+pub fn lsp_request_tier(method: &str) -> LspOperationTier {
+	match method {
+		"workspace/executeCommand"
+		| "textDocument/rename"
+		| "workspace/willCreateFiles"
+		| "workspace/willRenameFiles"
+		| "workspace/willDeleteFiles" => LspOperationTier::Mutation,
+		_ => LspOperationTier::ReadOnly,
+	}
+}
+
+/// Returns the immutable tier for one raw LSP notification method.
+///
+/// Only connection lifecycle controls are query-tier. Every other raw
+/// notification fails closed as a mutation because vendor methods can execute
+/// arbitrary server commands.
+#[must_use]
+pub fn lsp_notification_tier(method: &str) -> LspOperationTier {
+	match method {
+		"initialized" | "$/cancelRequest" | "$/setTrace" | "exit" => LspOperationTier::ReadOnly,
+		_ => LspOperationTier::Mutation,
+	}
+}
+
+/// Returns the exact grant required by an LSP operation tier.
+#[must_use]
+pub const fn lsp_tier_capability(tier: LspOperationTier) -> &'static str {
+	match tier {
+		LspOperationTier::ReadOnly => "env.lsp",
+		LspOperationTier::Mutation => "env.doc.write",
+	}
+}
+
 /// Returns the immutable Environment tier for one DAP action.
 #[must_use]
 pub const fn dap_action_tier(action: omp_docserver::DapAction) -> omp_docserver::DapApprovalTier {
 	action.approval_tier()
 }
 
+/// Classifies one DAP wire action, failing closed for unknown/custom commands.
+#[must_use]
+pub fn dap_command_tier(command: &str) -> omp_docserver::DapApprovalTier {
+	command
+		.parse::<omp_docserver::DapAction>()
+		.map_or(omp_docserver::DapApprovalTier::Execution, dap_action_tier)
+}
+
 /// Returns the exact DATA capability required by one DAP action.
 #[must_use]
 pub const fn dap_action_capability(action: omp_docserver::DapAction) -> &'static str {
 	match dap_action_tier(action) {
+		omp_docserver::DapApprovalTier::ReadOnly => "env.dap.read",
+		omp_docserver::DapApprovalTier::Execution => "env.dap.execute",
+	}
+}
+
+/// Returns the exact DATA capability required by one DAP wire command.
+#[must_use]
+pub fn dap_command_capability(command: &str) -> &'static str {
+	match dap_command_tier(command) {
 		omp_docserver::DapApprovalTier::ReadOnly => "env.dap.read",
 		omp_docserver::DapApprovalTier::Execution => "env.dap.execute",
 	}
@@ -572,6 +633,33 @@ impl Drop for QuotaAccount {
 				Quota::STREAM_FANOUT,
 			] {
 				self.table.release(host, quota, self.usage[quota.index]);
+			}
+		}
+
+		#[cfg(test)]
+		mod tests {
+			use super::*;
+
+			#[test]
+			fn dap_tiers_match_pi_and_unknown_actions_fail_closed() {
+				assert_eq!(dap_command_capability("variables"), "env.dap.read");
+				assert_eq!(dap_command_capability("read_memory"), "env.dap.read");
+				assert_eq!(dap_command_capability("evaluate"), "env.dap.execute");
+				assert_eq!(dap_command_capability("continue"), "env.dap.execute");
+				assert_eq!(dap_command_capability("vendor_mutation"), "env.dap.execute");
+			}
+
+			#[test]
+			fn mutative_lsp_methods_require_write_before_effects_authorization() {
+				assert_eq!(lsp_tier_capability(lsp_request_tier("textDocument/hover")), "env.lsp");
+				assert_eq!(
+					lsp_tier_capability(lsp_request_tier("workspace/executeCommand")),
+					"env.doc.write"
+				);
+				assert_eq!(
+					lsp_tier_capability(lsp_notification_tier("workspace/didRenameFiles")),
+					"env.doc.write"
+				);
 			}
 		}
 	}

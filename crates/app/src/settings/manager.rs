@@ -1,0 +1,561 @@
+//! Production settings authority and layering manager.
+
+use std::{
+	collections::BTreeMap,
+	env,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
+
+use omp_settings::{
+	DomainRevision, FieldDescriptor, Revision, SettingScope, SettingsDomain, SettingsSnapshot,
+	SnapshotPublisher, Subscription, deep_merge, registered_domains,
+};
+use parking_lot::{Mutex, RwLock};
+
+use super::io::{
+	DocumentMutation, QuarantineDiagnostic, SettingsIoError, mutate_document, read_document,
+	read_or_quarantine,
+};
+
+/// Selected writable native settings layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationScope {
+	/// User/profile `config.toml`.
+	Global,
+	/// Nearest project `.omp/config.toml`.
+	Project,
+	/// Process-local, non-persistent override.
+	Runtime,
+}
+
+impl MutationScope {
+	const fn schema_scope(self) -> SettingScope {
+		match self {
+			Self::Global => SettingScope::Global,
+			Self::Project => SettingScope::Project,
+			Self::Runtime => SettingScope::Runtime,
+		}
+	}
+}
+
+/// Native source paths used by the settings authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsPaths {
+	/// User/profile native settings file.
+	pub global:   PathBuf,
+	/// Optional nearest project native settings file.
+	pub project:  Option<PathBuf>,
+	/// Ordered read-only native overlays.
+	pub overlays: Vec<PathBuf>,
+}
+
+impl SettingsPaths {
+	/// Resolves standard native paths and `OMP_CONFIG_FILES` overlays.
+	#[must_use]
+	pub fn discover(data_dir: &Path, project_root: Option<&Path>) -> Self {
+		let overlays = env::var_os("OMP_CONFIG_FILES")
+			.map(|value| env::split_paths(&value).collect())
+			.unwrap_or_default();
+		let project = project_root.map(|root| {
+			root
+				.ancestors()
+				.find(|ancestor| ancestor.join(".omp").is_dir())
+				.unwrap_or(root)
+				.join(".omp/config.toml")
+		});
+		Self { global: data_dir.join("config.toml"), project, overlays }
+	}
+}
+
+/// Sole production writer for reflected native settings.
+pub struct SettingsManager {
+	paths:       SettingsPaths,
+	runtime:     RwLock<toml::Table>,
+	snapshot:    RwLock<Arc<SettingsSnapshot>>,
+	publisher:   SnapshotPublisher,
+	mutation:    Mutex<()>,
+	read_only:   bool,
+	diagnostics: RwLock<Vec<QuarantineDiagnostic>>,
+}
+
+impl SettingsManager {
+	/// Loads and validates a writable production authority.
+	pub fn open(paths: SettingsPaths) -> Result<Self, SettingsManagerError> {
+		let preflight = read_or_quarantine(&paths.global)?;
+		if let Some(data_dir) = paths.global.parent() {
+			super::migrate::migrate_legacy_settings(data_dir)?;
+		}
+		let manager = Self::load(paths, false)?;
+		if let Some(diagnostic) = preflight.quarantine {
+			report_quarantine(&diagnostic);
+			manager.diagnostics.write().push(diagnostic);
+		}
+		Ok(manager)
+	}
+
+	/// Loads a read-only authority without migration or mutation rights.
+	pub fn open_read_only(paths: SettingsPaths) -> Result<Self, SettingsManagerError> {
+		Self::load(paths, true)
+	}
+
+	/// Constructs a filesystem-isolated authority from a merged document.
+	pub fn isolated(document: toml::Table) -> Result<Self, SettingsManagerError> {
+		validate_document(&document)?;
+		let snapshot = SettingsSnapshot::isolated_document(document);
+		Ok(Self {
+			paths:       SettingsPaths {
+				global:   PathBuf::new(),
+				project:  None,
+				overlays: Vec::new(),
+			},
+			runtime:     RwLock::new(toml::Table::new()),
+			snapshot:    RwLock::new(Arc::new(snapshot)),
+			publisher:   SnapshotPublisher::default(),
+			mutation:    Mutex::new(()),
+			read_only:   true,
+			diagnostics: RwLock::new(Vec::new()),
+		})
+	}
+
+	fn load(paths: SettingsPaths, read_only: bool) -> Result<Self, SettingsManagerError> {
+		validate_registry()?;
+		let mut diagnostics = Vec::new();
+		let global = if read_only {
+			read_document(&paths.global)?
+		} else {
+			let read = read_or_quarantine(&paths.global)?;
+			if let Some(diagnostic) = read.quarantine {
+				report_quarantine(&diagnostic);
+				diagnostics.push(diagnostic);
+			}
+			read.document
+		};
+		let project = match &paths.project {
+			Some(path) if read_only => read_document(path)?,
+			Some(path) => {
+				let read = read_or_quarantine(path)?;
+				if let Some(diagnostic) = read.quarantine {
+					report_quarantine(&diagnostic);
+					diagnostics.push(diagnostic);
+				}
+				read.document
+			},
+			None => toml::Table::new(),
+		};
+		let overlays = load_overlays(&paths.overlays)?;
+		let document = compose_document(global, project, overlays, toml::Table::new());
+		validate_document(&document)?;
+		let revisions = registered_domains()
+			.into_iter()
+			.map(|domain| (domain.name, DomainRevision(1)))
+			.collect();
+		let snapshot = if read_only {
+			SettingsSnapshot::read_only(document)
+		} else {
+			SettingsSnapshot::persistent(Revision(1), revisions, document)
+		};
+		Ok(Self {
+			paths,
+			runtime: RwLock::new(toml::Table::new()),
+			snapshot: RwLock::new(Arc::new(snapshot)),
+			publisher: SnapshotPublisher::default(),
+			mutation: Mutex::new(()),
+			read_only,
+			diagnostics: RwLock::new(diagnostics),
+		})
+	}
+
+	/// Returns the current immutable snapshot synchronously.
+	#[must_use]
+	pub fn snapshot(&self) -> Arc<SettingsSnapshot> {
+		Arc::clone(&self.snapshot.read())
+	}
+
+	/// Returns startup/write quarantine diagnostics without secret values.
+	#[must_use]
+	pub fn diagnostics(&self) -> Vec<QuarantineDiagnostic> {
+		self.diagnostics.read().clone()
+	}
+
+	/// Subscribes an owning runtime to its domain revision.
+	#[must_use]
+	pub fn subscribe<D: SettingsDomain>(&self) -> Subscription {
+		let current = self.snapshot().domain_revision(D::DOMAIN);
+		self.publisher.subscribe(D::DOMAIN, current)
+	}
+
+	fn record_quarantine(&self, diagnostic: QuarantineDiagnostic) {
+		report_quarantine(&diagnostic);
+		self.diagnostics.write().push(diagnostic);
+	}
+
+	/// Finds a reflected field by exact dotted path.
+	#[must_use]
+	pub fn field(&self, path: &str) -> Option<FieldDescriptor> {
+		registered_domains()
+			.into_iter()
+			.flat_map(|domain| domain.fields.iter().copied())
+			.find(|field| field.path == path)
+	}
+
+	/// Iterates reflected fields in stable domain/order/path order.
+	#[must_use]
+	pub fn fields(&self) -> Vec<FieldDescriptor> {
+		let mut fields = registered_domains()
+			.into_iter()
+			.flat_map(|domain| domain.fields.iter().copied())
+			.collect::<Vec<_>>();
+		fields.sort_unstable_by_key(|field| field.path);
+		fields.dedup_by_key(|field| field.path);
+		fields.sort_unstable_by(|left, right| {
+			left
+				.order
+				.cmp(&right.order)
+				.then_with(|| left.path.cmp(right.path))
+		});
+		fields
+	}
+
+	/// Sets one reflected value. Persistent mutations are serialized, lock and
+	/// re-read the target, then merge only this whole field before replacement.
+	pub async fn set(
+		&self,
+		scope: MutationScope,
+		path: &str,
+		raw: &str,
+	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		self.set_sync(scope, path, raw)
+	}
+
+	/// Synchronous mutation entry point for non-async application callbacks.
+	pub fn set_sync(
+		&self,
+		scope: MutationScope,
+		path: &str,
+		raw: &str,
+	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		let field = self
+			.field(path)
+			.ok_or_else(|| SettingsManagerError::UnsupportedKey { path: path.to_owned() })?;
+		if scope != MutationScope::Runtime && !field.scopes.contains(&scope.schema_scope()) {
+			return Err(SettingsManagerError::UnsupportedScope { path: field.path, scope });
+		}
+		let value = field.parse(raw)?;
+		self.apply(scope, DocumentMutation::Set { path: field.path, value })
+	}
+
+	/// Removes one reflected value from the selected layer.
+	pub async fn unset(
+		&self,
+		scope: MutationScope,
+		path: &str,
+	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		self.unset_sync(scope, path)
+	}
+
+	/// Synchronous unset entry point for non-async application callbacks.
+	pub fn unset_sync(
+		&self,
+		scope: MutationScope,
+		path: &str,
+	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		let field = self
+			.field(path)
+			.ok_or_else(|| SettingsManagerError::UnsupportedKey { path: path.to_owned() })?;
+		if scope != MutationScope::Runtime && !field.scopes.contains(&scope.schema_scope()) {
+			return Err(SettingsManagerError::UnsupportedScope { path: field.path, scope });
+		}
+		self.apply(scope, DocumentMutation::Unset { path: field.path })
+	}
+
+	fn apply(
+		&self,
+		scope: MutationScope,
+		mutation: DocumentMutation,
+	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		if self.read_only {
+			return Err(SettingsManagerError::ReadOnly);
+		}
+		let _guard = self.mutation.lock();
+		let mut candidate = self.snapshot().document().clone();
+		apply_runtime(&mut candidate, &mutation);
+		validate_document(&candidate)?;
+		match scope {
+			MutationScope::Global => {
+				let read = mutate_document(&self.paths.global, std::slice::from_ref(&mutation))?;
+				if let Some(diagnostic) = read.quarantine {
+					self.record_quarantine(diagnostic);
+				}
+			},
+			MutationScope::Project => {
+				let path = self
+					.paths
+					.project
+					.as_ref()
+					.ok_or(SettingsManagerError::NoProjectScope)?;
+				let read = mutate_document(path, std::slice::from_ref(&mutation))?;
+				if let Some(diagnostic) = read.quarantine {
+					self.record_quarantine(diagnostic);
+				}
+			},
+			MutationScope::Runtime => apply_runtime(&mut self.runtime.write(), &mutation),
+		}
+		self.reload()
+	}
+
+	fn reload(&self) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		let global_read = read_or_quarantine(&self.paths.global)?;
+		if let Some(diagnostic) = global_read.quarantine {
+			self.record_quarantine(diagnostic);
+		}
+		let global = global_read.document;
+		let project = if let Some(path) = self.paths.project.as_deref() {
+			let read = read_or_quarantine(path)?;
+			if let Some(diagnostic) = read.quarantine {
+				self.record_quarantine(diagnostic);
+			}
+			read.document
+		} else {
+			toml::Table::new()
+		};
+		let overlays = load_overlays(&self.paths.overlays)?;
+		let document = compose_document(global, project, overlays, self.runtime.read().clone());
+		validate_document(&document)?;
+
+		let previous = self.snapshot();
+		let mut revisions = BTreeMap::new();
+		for domain in registered_domains() {
+			let changed = domain.fields.iter().any(|field| {
+				value_at(previous.document(), field.path) != value_at(&document, field.path)
+			});
+			let old = previous.domain_revision(domain.name);
+			let revision = if changed {
+				DomainRevision(old.0 + 1)
+			} else {
+				old
+			};
+			revisions
+				.entry(domain.name)
+				.and_modify(|current| {
+					if revision > *current {
+						*current = revision;
+					}
+				})
+				.or_insert(revision);
+		}
+		let snapshot = Arc::new(SettingsSnapshot::persistent(
+			Revision(previous.revision().0 + 1),
+			revisions,
+			document,
+		));
+		*self.snapshot.write() = Arc::clone(&snapshot);
+		self.publisher.publish(Arc::clone(&snapshot));
+		Ok(snapshot)
+	}
+}
+
+fn report_quarantine(diagnostic: &QuarantineDiagnostic) {
+	tracing::warn!(
+		path = %diagnostic.path.display(),
+		backup_path = %diagnostic.backup_path.display(),
+		line = diagnostic.line,
+		column = diagnostic.column,
+		"quarantined corrupt native settings TOML",
+	);
+}
+
+fn compose_document(
+	global: toml::Table,
+	project: toml::Table,
+	overlays: Vec<toml::Table>,
+	runtime: toml::Table,
+) -> toml::Table {
+	let mut document = toml::Table::new();
+	for domain in registered_domains() {
+		deep_merge(&mut document, (domain.default_document)());
+	}
+	deep_merge(&mut document, global);
+	deep_merge(&mut document, project);
+	for overlay in overlays {
+		deep_merge(&mut document, overlay);
+	}
+	deep_merge(&mut document, runtime);
+	document
+}
+
+fn validate_registry() -> Result<(), SettingsManagerError> {
+	let mut paths = BTreeMap::new();
+	for domain in registered_domains() {
+		for field in domain.fields {
+			if let Some(previous) = paths.insert(field.path, *field)
+				&& (previous.kind != field.kind
+					|| previous.scopes != field.scopes
+					|| previous.secret != field.secret)
+			{
+				return Err(SettingsManagerError::ConflictingField { path: field.path });
+			}
+		}
+	}
+	Ok(())
+}
+
+fn validate_document(document: &toml::Table) -> Result<(), SettingsManagerError> {
+	for domain in registered_domains() {
+		(domain.validate)(document)?;
+	}
+	Ok(())
+}
+
+fn load_overlays(paths: &[PathBuf]) -> Result<Vec<toml::Table>, SettingsManagerError> {
+	paths
+		.iter()
+		.map(|path| read_document(path).map_err(Into::into))
+		.collect()
+}
+
+fn value_at<'a>(document: &'a toml::Table, path: &str) -> Option<&'a toml::Value> {
+	let mut segments = path.split('.');
+	let first = segments.next()?;
+	let mut value = document.get(first)?;
+	for segment in segments {
+		value = value.as_table()?.get(segment)?;
+	}
+	Some(value)
+}
+
+fn apply_runtime(document: &mut toml::Table, mutation: &DocumentMutation) {
+	fn set(document: &mut toml::Table, path: &str, value: toml::Value) {
+		let mut segments = path.split('.').peekable();
+		let mut current = document;
+		while let Some(segment) = segments.next() {
+			if segments.peek().is_none() {
+				current.insert(segment.to_owned(), value);
+				return;
+			}
+			let value = current
+				.entry(segment.to_owned())
+				.or_insert_with(|| toml::Value::Table(toml::Table::new()));
+			if !value.is_table() {
+				*value = toml::Value::Table(toml::Table::new());
+			}
+			current = value.as_table_mut().expect("table established above");
+		}
+	}
+	fn unset(document: &mut toml::Table, path: &str) {
+		let mut segments = path.split('.').peekable();
+		let mut current = document;
+		while let Some(segment) = segments.next() {
+			if segments.peek().is_none() {
+				current.remove(segment);
+				return;
+			}
+			let Some(next) = current.get_mut(segment).and_then(toml::Value::as_table_mut) else {
+				return;
+			};
+			current = next;
+		}
+	}
+	match mutation {
+		DocumentMutation::Set { path, value } => set(document, path, value.clone()),
+		DocumentMutation::Unset { path } => unset(document, path),
+	}
+}
+
+/// Settings authority failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsManagerError {
+	/// Native persistence failed.
+	#[error(transparent)]
+	Io(#[from] SettingsIoError),
+	/// Legacy migration failed.
+	#[error(transparent)]
+	Migration(#[from] super::migrate::MigrationError),
+	/// Typed schema validation failed.
+	#[error(transparent)]
+	Validation(#[from] omp_settings::ValidationError),
+	/// Typed snapshot projection failed.
+	#[error(transparent)]
+	Projection {
+		#[from]
+		source: omp_settings::SnapshotError,
+	},
+	/// Linked domain fragments disagreed about a shared field contract.
+	#[error("conflicting linked settings field {path}")]
+	ConflictingField { path: &'static str },
+	/// No domain owns the requested path.
+	#[error("unsupported settings key {path}")]
+	UnsupportedKey { path: String },
+	/// The field cannot be written at the selected scope.
+	#[error("setting {path} cannot be written at scope {scope:?}")]
+	UnsupportedScope { path: &'static str, scope: MutationScope },
+	/// Project scope was requested without a project root.
+	#[error("project settings scope is unavailable")]
+	NoProjectScope,
+	/// Mutation was attempted through a read-only authority.
+	#[error("settings authority is read-only")]
+	ReadOnly,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::settings::Settings;
+
+	#[test]
+	fn domain_subscription_wakes_on_owning_revision() {
+		let tree = tempfile::tempdir().expect("tree");
+		let manager = SettingsManager::open(SettingsPaths {
+			global:   tree.path().join("config.toml"),
+			project:  None,
+			overlays: Vec::new(),
+		})
+		.expect("manager");
+		let mut subscription = manager.subscribe::<Settings>();
+		manager
+			.set_sync(MutationScope::Runtime, "default_model", "demo/model")
+			.expect("mutation");
+		let snapshot = subscription.recv().expect("revision");
+		assert_eq!(
+			snapshot
+				.project::<Settings>()
+				.expect("projection")
+				.get()
+				.default_model
+				.as_deref(),
+			Some("demo/model"),
+		);
+	}
+
+	#[test]
+	fn layering_precedence_is_defaults_global_project_overlay_runtime() {
+		let tree = tempfile::tempdir().expect("tree");
+		let global = tree.path().join("global/config.toml");
+		let project = tree.path().join("project/.omp/config.toml");
+		let overlay = tree.path().join("overlay.toml");
+		std::fs::create_dir_all(global.parent().expect("global parent")).expect("global dir");
+		std::fs::create_dir_all(project.parent().expect("project parent")).expect("project dir");
+		std::fs::write(&global, "default_model = 'global'").expect("global");
+		std::fs::write(&project, "default_model = 'project'").expect("project");
+		std::fs::write(&overlay, "default_model = 'overlay'").expect("overlay");
+		let manager = SettingsManager::open(SettingsPaths {
+			global,
+			project: Some(project),
+			overlays: vec![overlay],
+		})
+		.expect("manager");
+		let projected = manager
+			.snapshot()
+			.project::<Settings>()
+			.expect("projection");
+		assert_eq!(projected.get().default_model.as_deref(), Some("overlay"));
+		manager
+			.set_sync(MutationScope::Runtime, "default_model", "runtime")
+			.expect("override");
+		let projected = manager
+			.snapshot()
+			.project::<Settings>()
+			.expect("projection");
+		assert_eq!(projected.get().default_model.as_deref(), Some("runtime"));
+	}
+}

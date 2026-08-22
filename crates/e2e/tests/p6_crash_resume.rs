@@ -37,7 +37,7 @@ use omp_agent::{
 use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
-	envd::{server::EnvServer, worker::ExtHostConfig},
+	envd::{EnvServer, worker::ExtHostConfig},
 };
 use omp_core::{Str, sf};
 use omp_e2e::support::{
@@ -590,7 +590,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 		.release_response()
 		.expect("release gated provider response");
 	let replay = gateway
-		.wait_turn_replay(&ProviderTurnId::from(pending_turn.as_str()), Duration::from_secs(10))
+		.wait_turn_replay(ProviderTurnId::from_ref(pending_turn.as_str()), Duration::from_secs(10))
 		.await
 		.expect("gateway committed exact turn replay while chat was frozen");
 	assert!(!replay.outcome.is_empty(), "gateway replay omitted terminal outcome");

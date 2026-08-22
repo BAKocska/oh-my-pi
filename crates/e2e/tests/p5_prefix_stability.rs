@@ -133,7 +133,7 @@ impl AuthLoginEngine for UnusedLogin {
 		self.0
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId) -> bool {
+	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
 		true
 	}
 
@@ -410,14 +410,15 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 	let client = Instrumented::new(gateway(&scratch, cassette, Arc::clone(&tools_v1)).await);
 	let probe = client.clone();
 	let options = TurnOptions {
-		context_id: Some(sf!("p5-context")),
-		params:     pb::ChatParams {
+		context_id:     Some(sf!("p5-context")),
+		params:         pb::ChatParams {
 			model: MODEL.to_owned(),
 			tools: vec![tool_def(1)],
 			..Default::default()
 		},
-		executor:   None,
-		props:      None,
+		executor:       None,
+		props:          None,
+		provider_reset: false,
 	};
 	let workspace = WorkspaceInput::new(
 		scratch.project(),

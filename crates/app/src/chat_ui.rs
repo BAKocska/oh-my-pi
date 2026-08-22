@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod input;
 
 use std::{
@@ -14,12 +15,17 @@ use std::{
 use bytes::Bytes;
 use miette::IntoDiagnostic as _;
 use omp_agent::{
-	Agent, AgentEvent, AgentPhase, AgentState, AgentTree, Interrupt, InterruptClass,
-	InterruptSource, RewindTarget, TurnClient,
+	Agent, AgentEvent, AgentPhase, AgentState, AgentTree, ApprovalDecision, ApprovalInbox,
+	ApprovalRequest, ApprovalSource, Interrupt, InterruptClass, InterruptSource, RewindTarget,
+	TurnClient,
 };
 use omp_chat_ui::{
-	ActivityWaveform, AgentRow, Attachment, BackendEvent, Chat, Intent, ModelRow, RewindTargetRow,
-	SessionRow, StatusFacts, SubmitMode, TranscriptFrame, TranscriptFrameKind,
+	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
+	Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts, SubmitMode, TranscriptFrame,
+	TranscriptFrameKind,
+	completion::{
+		CompletionChain, CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion,
+	},
 	host::{HostExit, HostOptions},
 };
 use omp_core::{Hash32, SecretString, Str, encoding::hex, sf};
@@ -29,17 +35,33 @@ use omp_llm_catalog::{
 };
 use omp_llm_inference::{call::AuthInput, id::TurnId};
 use omp_proto::{
+	env::v1::ExecControlKind,
 	inference::v1::{part_start, turn_event::Event, value},
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
+};
+use omp_storage::transcript::{
+	ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
+	ProviderId as JournalProviderId,
 };
 use omp_telemetry::firehose::{
 	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
 };
 use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::ViewState};
-use omp_tui::{UiContext, components::AttachmentContent, detect};
+use omp_tui::{
+	SlashCommands, Suggestion, SuggestionList, UiContext,
+	components::{AttachmentContent, KeywordAccent},
+	detect,
+};
 
 use crate::{
-	chat_ui::input::{ChatCommand, CommandContribution, CommandRoster, ParsedTurnBudget},
+	chat_ui::{
+		commands::{
+			CommandFuture, CommandResult, CommandRole, CommandSurface, ConfigCommandHost,
+			ConsumedResult, DispatchResult, FlowCommandHost, ModelCommandHost, ParsedFlags,
+			SessionCommandHost, SessionRequest, ShellCommandHost, WorkspaceRequest,
+		},
+		input::{ChatCommand, CommandContribution, CommandRoster, ParsedTurnBudget},
+	},
 	modes::{ActiveMode, ExecutionModes, Goal, GoalStatus, GoalUsage},
 	settings::Settings,
 };
@@ -200,6 +222,13 @@ enum UiCmd {
 		to:    Option<u64>,
 		reply: flume::Sender<Result<Vec<Item>, String>>,
 	},
+	Retry {
+		reply: flume::Sender<Result<(Vec<Item>, Str), String>>,
+	},
+	Compact {
+		request: omp_agent::ManualCompactionRequest,
+		reply:   flume::Sender<Result<omp_agent::ManualCompactionOutcome, String>>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,10 +249,135 @@ struct ToolDisplay {
 	fold:     ViewState,
 }
 
+struct RegistryCompletionCache {
+	generation: u64,
+	records:    Vec<(Str, Str)>,
+}
+
+struct ProjectCompletionSource {
+	paths:    Vec<Str>,
+	registry: omp_agent::AgentRegistry,
+	agents:   parking_lot::Mutex<RegistryCompletionCache>,
+}
+
+impl ProjectCompletionSource {
+	fn scan(root: &std::path::Path) -> Self {
+		let paths = omp_walker::WalkRequest::new(root)
+			.hidden(false)
+			.gitignore(true)
+			.skip_git(true)
+			.depth(1, 64)
+			.limit(2_000)
+			.collect()
+			.map(|outcome| {
+				outcome
+					.entries
+					.into_iter()
+					.map(|entry| Str::from(entry.path))
+					.collect()
+			})
+			.unwrap_or_default();
+		Self {
+			paths,
+			registry: omp_agent::AgentRegistry::global().clone(),
+			agents: parking_lot::Mutex::new(RegistryCompletionCache {
+				generation: u64::MAX,
+				records:    Vec::new(),
+			}),
+		}
+	}
+
+	fn internal_urls(&self, query: &str) -> SuggestionList {
+		let lower = query.to_ascii_lowercase();
+		let scheme = if lower.starts_with("agent://") {
+			Some("agent://")
+		} else if lower.starts_with("history://") {
+			Some("history://")
+		} else {
+			None
+		};
+		let Some(scheme) = scheme else {
+			return INTERNAL_URI_SCHEMES
+				.iter()
+				.filter(|candidate| candidate.contains(lower.as_str()))
+				.map(|candidate| {
+					Suggestion::new(*candidate, *candidate)
+						.with_category("Internal URLs")
+						.with_description("bounded retained URI source")
+				})
+				.collect();
+		};
+		let generation = self.registry.generation();
+		let mut cache = self.agents.lock();
+		if cache.generation != generation {
+			cache.records = self
+				.registry
+				.roster(false)
+				.into_iter()
+				.map(|record| (record.id, record.status.to_string().into()))
+				.collect();
+			cache.generation = generation;
+		}
+		let needle = &lower[scheme.len()..];
+		cache
+			.records
+			.iter()
+			.filter(|(id, _)| id.to_ascii_lowercase().contains(needle))
+			.take(64)
+			.map(|(id, status)| {
+				Suggestion::new(sf!("{scheme}{id}"), id.clone())
+					.with_category("Agent journals")
+					.with_description(status.clone())
+			})
+			.collect()
+	}
+}
+
+impl CompletionSource for ProjectCompletionSource {
+	fn complete(&self, query: CompletionQuery) -> SuggestionList {
+		let needle = query.query.to_ascii_lowercase();
+		match query.trigger {
+			CompletionTrigger::Mention => self
+				.paths
+				.iter()
+				.filter(|path| path.to_ascii_lowercase().contains(&needle))
+				.take(48)
+				.map(|path| {
+					Suggestion::new(sf!("@{path}"), path.clone())
+						.with_category("Workspace paths")
+						.with_description("gitignore-aware project path")
+				})
+				.collect(),
+			CompletionTrigger::Hash => {
+				let label = if needle.is_empty() {
+					sf!("GitHub index unavailable")
+				} else {
+					sf!("#{needle} · index unavailable")
+				};
+				[Suggestion::new(sf!("#{needle}"), label)
+					.with_category("GitHub")
+					.with_description(
+						"Issue/PR cache is unavailable; no per-keystroke network request was made",
+					)]
+				.into_iter()
+				.collect()
+			},
+			CompletionTrigger::Custom => self.internal_urls(query.query.as_str()),
+			CompletionTrigger::Slash => SuggestionList::new(),
+		}
+	}
+}
+
+const INTERNAL_URI_SCHEMES: &[&str] =
+	&["local://", "artifact://", "agent://", "history://", "mcp://", "skill://", "rule://"];
+
 struct BridgeState {
 	model:             String,
+	environment:       omp_env::EnvClient,
+	active_ptys:       HashMap<Str, omp_env::ActiveExecControl>,
 	context_window:    Option<u64>,
 	context_tokens:    u64,
+	context_snapshot:  Option<omp_agent::ContextSnapshot>,
 	cost_nanos:        u64,
 	queued:            usize,
 	jobs:              HashSet<Str>,
@@ -242,6 +396,9 @@ struct BridgeState {
 	replaying_turn:    bool,
 	settings:          Settings,
 	commands:          CommandRoster,
+	typed_commands:    commands::CommandRoster,
+	skills:            Arc<crate::skills::SkillSnapshot>,
+	approvals:         HashMap<Str, ApprovalRequest>,
 }
 
 fn subscribe_chat_events(bus: &omp_agent::EventBus) -> omp_agent::EventSubscription {
@@ -261,16 +418,22 @@ pub async fn run<'a, C, R>(
 	modes: Arc<ExecutionModes>,
 	auth: Option<&'a ChatAuth>,
 	data_dir: PathBuf,
+	workspace_root: PathBuf,
 	command_sources: Vec<Vec<CommandContribution>>,
+	skills: Arc<crate::skills::SkillSnapshot>,
+	mut approval_inbox: Option<ApprovalInbox>,
 	mut list_sessions: R,
 	welcome: bool,
-) -> miette::Result<HostExit>
+	initial_draft: Str,
+) -> miette::Result<omp_chat_ui::host::HostOutcome>
 where
 	C: TurnClient + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + 'a,
 {
 	let bus = agent.events().clone();
+	let environment = agent.environment();
 	let mailbox = agent.mailbox();
+	let control = agent.control();
 	// Turn deltas and their authoritative outcome share this stream. Dropping
 	// either can leave a blank or permanently partial transcript.
 	let agent_events = subscribe_chat_events(&bus);
@@ -347,6 +510,34 @@ where
 					let result = agent.rewind(to).map_err(|error| error.to_string());
 					let _ = reply.send(result);
 				},
+				UiCmd::Retry { reply } => {
+					let result = match agent.rewind_targets() {
+						Ok(targets) => match targets.last() {
+							Some(target) => match agent.rewind(target.keep) {
+								Ok(items) => {
+									let item = input::user_message(target.text.as_str());
+									let turn_id =
+										TurnId::new(format!("retry-{}", omp_core::Ulid::generate()));
+									match agent.submit([item], turn_id).await {
+										Ok(_) => Ok((items, target.text.clone())),
+										Err(error) => Err(error.to_string()),
+									}
+								},
+								Err(error) => Err(error.to_string()),
+							},
+							None => Err(String::from("no user turn is available to retry")),
+						},
+						Err(error) => Err(error.to_string()),
+					};
+					let _ = reply.send(result);
+				},
+				UiCmd::Compact { request, reply } => {
+					let result = agent
+						.compact_manual(request)
+						.await
+						.map_err(|error| error.to_string());
+					let _ = reply.send(result);
+				},
 			}
 		}
 	});
@@ -354,8 +545,24 @@ where
 	let caps = detect();
 	let ctx = UiContext::default().with_terminal_caps(&caps);
 	let mut chat = Chat::new(&ctx);
+	let accent_keywords: Arc<[Str]> = omp_agent::prompt_assets::PROMPT_KEYWORDS
+		.iter()
+		.map(|keyword| Str::from(keyword.text))
+		.collect();
+	chat.set_keyword_accent(KeywordAccent::from_shared(accent_keywords));
 	let commands = CommandRoster::new(command_sources);
-	chat.set_slash_commands(commands.completions());
+	let typed_commands = commands::CommandRoster::builtins();
+	let completion = CompletionChain::new()
+		.source(Box::new(SlashCommands::new(typed_commands.completions())))
+		.source(Box::new(DeferredCompletion::new(
+			[
+				('@', CompletionTrigger::Mention),
+				('#', CompletionTrigger::Hash),
+				(':', CompletionTrigger::Custom),
+			],
+			Arc::new(ProjectCompletionSource::scan(&workspace_root)),
+		)));
+	chat.set_completion(Box::new(completion));
 	let (backend_tx, backend_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
 	let snapshot = agent_state.snapshot();
@@ -363,8 +570,11 @@ where
 	drop(snapshot);
 	let mut state = BridgeState {
 		model,
+		environment,
+		active_ptys: HashMap::new(),
 		context_window: session.context_window,
 		context_tokens: 0,
+		context_snapshot: None,
 		cost_nanos: 0,
 		queued: 0,
 		jobs: HashSet::new(),
@@ -381,8 +591,11 @@ where
 		live_activity: ActivityWaveform::new(),
 		pending_auth_kind: None,
 		replaying_turn: false,
-		settings: Settings::load(&data_dir),
+		settings: crate::settings::current(&data_dir).into_diagnostic()?,
 		commands,
+		typed_commands,
+		skills,
+		approvals: HashMap::new(),
 	};
 	chat.set_composer_style(state.settings.composer.shape);
 
@@ -420,6 +633,7 @@ where
 						&ui_tx,
 						&mailbox,
 						&abort,
+						&control,
 						&agent_state,
 						&modes,
 						auth,
@@ -458,6 +672,14 @@ where
 				Some(event) = next_auth_event(auth) => {
 					handle_auth_event(&backend_tx, &mut state, event);
 				},
+				Some(request) = next_approval_request(&mut approval_inbox) => {
+					let ticket_id = request.ticket.ticket_id.clone();
+					send_backend(
+						&backend_tx,
+						BackendEvent::ApprovalPending(approval_ticket_view(&request.ticket)),
+					);
+					state.approvals.insert(ticket_id, request);
+				},
 				Ok(event) = agent_events.recv() => {
 					if matches!(&*event, AgentEvent::RosterChanged { .. }) {
 						publish_agent_roster(&backend_tx, &tree, &session_id, &mut last_roster);
@@ -492,10 +714,14 @@ where
 		Ok::<(), miette::Report>(())
 	};
 
-	let host = omp_chat_ui::host::run_with_options(chat, ctx, backend_rx, intent_tx, HostOptions {
-		welcome,
-		exit_on_session_change: true,
-	});
+	let host = omp_chat_ui::host::run_with_draft(
+		chat,
+		ctx,
+		backend_rx,
+		intent_tx,
+		HostOptions { welcome, exit_on_session_change: true },
+		initial_draft,
+	);
 	let (host_result, bridge_result) = tokio::join!(host, bridge);
 	if tokio::time::timeout(Duration::from_secs(3), &mut agent_task)
 		.await
@@ -646,7 +872,10 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		},
 	};
 	match result {
-		Ok(goal) => send_backend(backend, BackendEvent::Notice(goal_status(Some(goal)))),
+		Ok(goal) => {
+			let _ = modes.persist_projection();
+			send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+		},
 		Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
 	}
 }
@@ -686,13 +915,405 @@ fn goal_status(goal: Option<Goal>) -> Str {
 	))
 }
 
-#[allow(clippy::too_many_arguments, reason = "the bridge owns one explicit production seam")]
+struct LiveCommandHost<'a, R> {
+	backend:       &'a flume::Sender<BackendEvent>,
+	commands_tx:   &'a flume::Sender<UiCmd>,
+	abort:         &'a omp_agent::AbortHandle,
+	control:       &'a omp_agent::ControlSender,
+	agent_state:   &'a AgentState,
+	modes:         &'a ExecutionModes,
+	auth:          Option<&'a ChatAuth>,
+	data_dir:      &'a std::path::Path,
+	list_sessions: &'a mut R,
+	bus:           &'a omp_agent::EventBus,
+	registry:      &'a Registry,
+	dropped:       u64,
+	roster:        commands::CommandRoster,
+	state:         &'a mut BridgeState,
+}
+
+fn silent_command() -> CommandFuture<'static> {
+	Box::pin(async { Ok(CommandResult::Consumed(ConsumedResult::silent())) })
+}
+
+impl<R> LiveCommandHost<'_, R> {
+	fn unavailable(&self, message: &'static str) -> CommandFuture<'static> {
+		send_backend(self.backend, BackendEvent::Error(sf!(message)));
+		silent_command()
+	}
+}
+
+impl<R> ShellCommandHost for LiveCommandHost<'_, R>
+where
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+{
+	fn help(&mut self) -> CommandFuture<'_> {
+		let help = self
+			.roster
+			.help_text(CommandSurface::Tui, CommandRole::Owner, true, |_| true);
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(Str::from(help)))) })
+	}
+
+	fn new_session(&mut self) -> CommandFuture<'_> {
+		send_backend(self.backend, BackendEvent::NewSessionRequested);
+		silent_command()
+	}
+
+	fn jobs(&mut self) -> CommandFuture<'_> {
+		let mut jobs: Vec<_> = self.state.jobs.iter().map(Str::as_str).collect();
+		jobs.sort_unstable();
+		let message = if jobs.is_empty() {
+			sf!("No active background jobs.")
+		} else {
+			Str::from(format!(
+				"**Active jobs ({})**\n{}",
+				jobs.len(),
+				jobs
+					.into_iter()
+					.map(|job| format!("- `{job}`"))
+					.collect::<Vec<_>>()
+					.join("\n"),
+			))
+		};
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(message))) })
+	}
+
+	fn agents(&mut self) -> CommandFuture<'_> {
+		send_backend(self.backend, BackendEvent::OpenAgentTree);
+		silent_command()
+	}
+
+	fn pause(&mut self) -> CommandFuture<'_> {
+		send_backend(self.backend, BackendEvent::Pause);
+		silent_command()
+	}
+
+	fn quit(&mut self) -> CommandFuture<'_> {
+		if chat_active(self.state.submit_pending, self.bus.phase()) {
+			self.abort.abort();
+		}
+		Box::pin(async { Ok(CommandResult::Exit) })
+	}
+}
+
+impl<R> SessionCommandHost for LiveCommandHost<'_, R>
+where
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+{
+	fn clear(&mut self) -> CommandFuture<'_> {
+		Box::pin(async move {
+			self
+				.control
+				.reset(omp_agent::broker_now_ms())
+				.await
+				.into_diagnostic()?;
+			self.state.context_tokens = 0;
+			self.state.context_snapshot = None;
+			send_backend(self.backend, BackendEvent::HistoryCleared);
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
+	}
+
+	fn fresh(&mut self) -> CommandFuture<'_> {
+		Box::pin(async move {
+			self
+				.control
+				.provider_reset(omp_agent::broker_now_ms())
+				.await
+				.into_diagnostic()?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(
+				"Provider session will be refreshed on the next turn.",
+			)))
+		})
+	}
+
+	fn rename(&mut self, title: Str) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before renaming.",
+				)));
+			}
+			self
+				.control
+				.set_title(omp_agent::broker_now_ms(), title.clone())
+				.await
+				.into_diagnostic()?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(sf!("Session renamed to `{title}`."))))
+		})
+	}
+
+	fn retry(&mut self) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before retrying.",
+				)));
+			}
+			let (reply_tx, reply_rx) = flume::bounded(1);
+			self
+				.commands_tx
+				.send_async(UiCmd::Retry { reply: reply_tx })
+				.await
+				.into_diagnostic()?;
+			match reply_rx.recv_async().await {
+				Ok(Ok((items, text))) => {
+					self.state.tools.clear();
+					send_backend(self.backend, BackendEvent::HistoryCleared);
+					replay_items(
+						self.backend,
+						&items,
+						&mut self.state.tools,
+						&mut self.state.part_serial,
+						self.registry,
+					);
+					send_backend(self.backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
+					Ok(CommandResult::Consumed(ConsumedResult::silent()))
+				},
+				Ok(Err(error)) => Ok(CommandResult::Consumed(ConsumedResult::status(error))),
+				Err(_) => Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Agent retry reply channel is closed.",
+				))),
+			}
+		})
+	}
+
+	fn resume(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
+		let result = if let Some(id) = selector {
+			BackendEvent::Sessions(vec![SessionRow {
+				id:     id.clone(),
+				label:  id,
+				detail: sf!("selected session"),
+			}])
+		} else {
+			match (self.list_sessions)() {
+				Ok(sessions) => BackendEvent::Sessions(session_rows(sessions)),
+				Err(error) => return Box::pin(async move { Err(error) }),
+			}
+		};
+		send_backend(self.backend, result);
+		silent_command()
+	}
+
+	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_> {
+		match request {
+			SessionRequest::Info => {
+				let status = sf!(
+					"Model: `{}` · context: {} tokens · queued: {}",
+					self.state.model,
+					self.state.context_tokens,
+					self.state.queued,
+				);
+				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
+			},
+			SessionRequest::Delete | SessionRequest::Pin(_) => {
+				self.unavailable("This session mutation is not attached to the live journal owner.")
+			},
+		}
+	}
+
+	fn workspace(&mut self, _: WorkspaceRequest) -> CommandFuture<'_> {
+		self.unavailable("This workspace mutation is not attached to the live Environment owner.")
+	}
+}
+
+impl<R> ModelCommandHost for LiveCommandHost<'_, R>
+where
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+{
+	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if let Some(selector) = selector {
+				switch_model(
+					self.backend,
+					self.agent_state,
+					self.data_dir,
+					selector.as_str(),
+					self.state,
+					self.control,
+					true,
+				)
+				.await;
+			} else {
+				send_open_models(self.backend, self.state);
+			}
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
+	}
+
+	fn switch(&mut self, selector: Str) -> CommandFuture<'_> {
+		Box::pin(async move {
+			switch_model(
+				self.backend,
+				self.agent_state,
+				self.data_dir,
+				selector.as_str(),
+				self.state,
+				self.control,
+				false,
+			)
+			.await;
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
+	}
+}
+
+impl<R> ConfigCommandHost for LiveCommandHost<'_, R>
+where
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+{
+	fn settings(&mut self) -> CommandFuture<'_> {
+		send_backend(self.backend, BackendEvent::SettingsSchema(setting_rows()));
+		silent_command()
+	}
+
+	fn setup(&mut self) -> CommandFuture<'_> {
+		self.unavailable("Provider setup requires an attached account authority.")
+	}
+
+	fn providers(&mut self) -> CommandFuture<'_> {
+		self.unavailable("Provider listing requires an attached account authority.")
+	}
+
+	fn login(&mut self, provider: Option<Str>) -> CommandFuture<'_> {
+		handle_login(self.backend, self.auth, provider, self.state);
+		silent_command()
+	}
+
+	fn logout(&mut self, _: Option<Str>) -> CommandFuture<'_> {
+		self.unavailable("Provider logout requires an attached account authority.")
+	}
+}
+
+impl<R> FlowCommandHost for LiveCommandHost<'_, R>
+where
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+{
+	fn context(&mut self) -> CommandFuture<'_> {
+		let Some(snapshot) = self.state.context_snapshot.as_ref() else {
+			return self.unavailable("No complete context receipt has been projected yet.");
+		};
+		let rendered = commands::context::render(snapshot);
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(rendered))) })
+	}
+
+	fn compact(&mut self, request: omp_agent::ManualCompactionRequest) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let (reply, outcome) = flume::bounded(1);
+			self
+				.commands_tx
+				.send_async(UiCmd::Compact { request, reply })
+				.await
+				.into_diagnostic()?;
+			match outcome.recv_async().await.into_diagnostic()? {
+				Ok(outcome) => {
+					let notice = if outcome.frame_count == 0 {
+						sf!(
+							"Compacted with {} at event {}: {} → {} tokens.",
+							outcome.method,
+							outcome.event,
+							outcome.tokens_before,
+							outcome.tokens_after,
+						)
+					} else {
+						sf!(
+							"Compacted with {} at event {}: {} → {} tokens · {} bitmap frames.",
+							outcome.method,
+							outcome.event,
+							outcome.tokens_before,
+							outcome.tokens_after,
+							outcome.frame_count,
+						)
+					};
+					Ok(CommandResult::Consumed(ConsumedResult::status(notice)))
+				},
+				Err(error) => Ok(CommandResult::Consumed(ConsumedResult::status(error))),
+			}
+		})
+	}
+
+	fn shake(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Context shake is not attached to this interactive session.")
+	}
+
+	fn usage(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Usage receipts are not attached to this interactive session.")
+	}
+
+	fn stats(&mut self, _: ParsedFlags) -> CommandFuture<'_> {
+		self.unavailable("Stats service is not attached to this interactive session.")
+	}
+
+	fn plan(&mut self, args: Str) -> CommandFuture<'_> {
+		handle_plan_command(self.backend, self.modes, args.as_str());
+		silent_command()
+	}
+
+	fn vibe(&mut self, args: Str) -> CommandFuture<'_> {
+		handle_vibe_command(self.backend, self.modes, args.as_str());
+		silent_command()
+	}
+
+	fn todo(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Todo mutation is not attached to this interactive session.")
+	}
+
+	fn plan_review(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Plan review is not attached to this interactive session.")
+	}
+
+	fn guided_goal(&mut self, args: Str) -> CommandFuture<'_> {
+		handle_goal_command(self.backend, self.modes, args.as_str());
+		silent_command()
+	}
+
+	fn loop_command(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Loop control is not attached to this interactive session.")
+	}
+
+	fn queue(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Queue control is not attached to this interactive session.")
+	}
+
+	fn force(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Forced tool choice is not attached to this interactive session.")
+	}
+
+	fn fast(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Fast tier control is not attached to this interactive session.")
+	}
+
+	fn prewalk(&mut self, args: Str) -> CommandFuture<'_> {
+		handle_prewalk_command(self.backend, self.modes, args.as_str());
+		silent_command()
+	}
+
+	fn btw(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Ephemeral asides are not attached to this interactive session.")
+	}
+
+	fn tan(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Background asides are not attached to this interactive session.")
+	}
+
+	fn omfg(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("TTSR rule generation is not attached to this interactive session.")
+	}
+
+	fn live(&mut self, _: Str) -> CommandFuture<'_> {
+		self.state.live_enabled = !self.state.live_enabled;
+		send_status(self.backend, self.state, self.bus, self.dropped);
+		silent_command()
+	}
+}
+
 async fn handle_intent<R>(
 	intent: Intent,
 	backend: &flume::Sender<BackendEvent>,
 	commands_tx: &flume::Sender<UiCmd>,
 	mailbox: &omp_agent::MailboxSender,
 	abort: &omp_agent::AbortHandle,
+	control: &omp_agent::ControlSender,
 	agent_state: &AgentState,
 	modes: &ExecutionModes,
 	auth: Option<&ChatAuth>,
@@ -707,137 +1328,230 @@ where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
 {
 	match intent {
-		Intent::Submit { text, attachments, mode } => match state.commands.parse_input(&text) {
-			Ok(ChatCommand::Nothing) => {
-				if should_abort_empty(chat_active(state.submit_pending, bus.phase()), state.queued) {
-					abort.abort();
-				}
-			},
-			Ok(ChatCommand::Help) => {
-				send_backend(backend, BackendEvent::Notice(Str::from(state.commands.help_text())));
-			},
-			Ok(ChatCommand::Login(provider)) => {
-				if chat_active(state.submit_pending, bus.phase()) {
-					send_backend(
-						backend,
-						BackendEvent::Error(
-							sf!("Wait for the active turn to finish before logging in.",),
-						),
-					);
-				} else {
-					handle_login(backend, auth, provider, state);
-				}
-			},
-			Ok(ChatCommand::Model(selector)) => {
-				switch_model(backend, agent_state, data_dir, selector.as_str(), state);
-			},
-			Ok(ChatCommand::ModelPicker) => send_open_models(backend, state),
-			Ok(ChatCommand::Resume) => {
-				if chat_active(state.submit_pending, bus.phase()) {
-					send_backend(
-						backend,
-						BackendEvent::Error(sf!(
-							"Wait for the active turn to finish before resuming another session.",
-						)),
-					);
-				} else {
-					match list_sessions() {
-						Ok(choices) => {
-							send_backend(backend, BackendEvent::Sessions(session_rows(choices)));
-						},
-						Err(error) => send_backend(
-							backend,
-							BackendEvent::Error(sf!("Could not list sessions: {error}")),
-						),
+		Intent::Submit { text, attachments, mode } => {
+			let roster = state.typed_commands.clone();
+			let mut command_host = LiveCommandHost {
+				backend,
+				commands_tx,
+				abort,
+				control,
+				agent_state,
+				modes,
+				auth,
+				data_dir,
+				list_sessions,
+				bus,
+				registry,
+				dropped,
+				roster: roster.clone(),
+				state,
+			};
+			let dispatch = roster
+				.dispatch(&text, CommandSurface::Tui, &mut command_host)
+				.await?;
+			let text = match dispatch {
+				DispatchResult::Passthrough(text) => text.to_string(),
+				DispatchResult::Handled(CommandResult::Prompt(prompt)) => prompt.text.to_string(),
+				DispatchResult::Handled(CommandResult::Consumed(consumed)) => {
+					if let Some(status) = consumed.status {
+						send_backend(backend, BackendEvent::Notice(status));
 					}
-				}
-			},
-			Ok(ChatCommand::NewSession) => {
-				if chat_active(state.submit_pending, bus.phase()) {
+					return Ok(false);
+				},
+				DispatchResult::Handled(CommandResult::Exit) => return Ok(true),
+			};
+			match state.commands.parse_input(&text) {
+				Ok(ChatCommand::Nothing) => {
+					if should_abort_empty(chat_active(state.submit_pending, bus.phase()), state.queued) {
+						abort.abort();
+					}
+				},
+				Ok(ChatCommand::Help) => {
 					send_backend(
 						backend,
-						BackendEvent::Error(sf!(
-							"Wait for the active turn to finish before starting a new session.",
-						)),
+						BackendEvent::Notice(Str::from(state.typed_commands.help_text(
+							CommandSurface::Tui,
+							CommandRole::Owner,
+							true,
+							|_| true,
+						))),
 					);
-				} else {
-					send_backend(backend, BackendEvent::NewSessionRequested);
-				}
-			},
-			Ok(ChatCommand::Jobs) => {
-				let mut jobs: Vec<_> = state.jobs.iter().map(Str::as_str).collect();
-				jobs.sort_unstable();
-				let message = if jobs.is_empty() {
-					sf!("No active background jobs.")
-				} else {
-					Str::from(format!(
-						"**Active jobs ({})**\n{}",
-						jobs.len(),
-						jobs
-							.into_iter()
-							.map(|job| format!("- `{job}`"))
-							.collect::<Vec<_>>()
-							.join("\n"),
-					))
-				};
-				send_backend(backend, BackendEvent::Notice(message));
-			},
-			Ok(ChatCommand::Settings) => send_backend(backend, BackendEvent::OpenSettings),
-			Ok(ChatCommand::Live) => {
-				state.live_enabled = !state.live_enabled;
-				if state.live_enabled {
-					state.live_activity = ActivityWaveform::new();
-				}
-				send_backend(
-					backend,
-					BackendEvent::Notice(sf!(if state.live_enabled {
-						"Live activity waveform enabled."
+				},
+				Ok(ChatCommand::Login(provider)) => {
+					if chat_active(state.submit_pending, bus.phase()) {
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!(
+								"Wait for the active turn to finish before logging in.",
+							)),
+						);
 					} else {
-						"Live activity waveform disabled."
-					})),
-				);
-				send_status(backend, state, bus, dropped);
-			},
-			Ok(ChatCommand::Plan(args)) => handle_plan_command(backend, modes, args.as_str()),
-			Ok(ChatCommand::Goal(args)) => handle_goal_command(backend, modes, args.as_str()),
-			Ok(ChatCommand::Vibe(args)) => handle_vibe_command(backend, modes, args.as_str()),
-			Ok(ChatCommand::Prewalk(args)) => handle_prewalk_command(backend, modes, args.as_str()),
-			Ok(ChatCommand::Agents) => send_backend(backend, BackendEvent::OpenAgentTree),
-			Ok(ChatCommand::Pause) => send_backend(backend, BackendEvent::Pause),
-			Ok(ChatCommand::Unavailable { command, reason }) => {
-				send_backend(backend, BackendEvent::Error(sf!("/{command} unavailable: {reason}")));
-			},
-			Ok(ChatCommand::Quit) => {
-				if chat_active(state.submit_pending, bus.phase()) {
-					abort.abort();
-				}
-				return Ok(true);
-			},
-			Ok(ChatCommand::Submit { item, text: prompt_text, budget }) => {
-				if auth.is_some_and(ChatAuth::is_active) {
+						handle_login(backend, auth, provider, state);
+					}
+				},
+				Ok(ChatCommand::Model(selector)) => {
+					switch_model(
+						backend,
+						agent_state,
+						data_dir,
+						selector.as_str(),
+						state,
+						control,
+						true,
+					)
+					.await;
+				},
+				Ok(ChatCommand::Switch(selector)) => {
+					switch_model(
+						backend,
+						agent_state,
+						data_dir,
+						selector.as_str(),
+						state,
+						control,
+						false,
+					)
+					.await;
+				},
+				Ok(ChatCommand::ModelPicker) => send_open_models(backend, state),
+				Ok(ChatCommand::Resume) => {
+					if chat_active(state.submit_pending, bus.phase()) {
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!(
+								"Wait for the active turn to finish before resuming another session.",
+							)),
+						);
+					} else {
+						match list_sessions() {
+							Ok(choices) => {
+								send_backend(backend, BackendEvent::Sessions(session_rows(choices)));
+							},
+							Err(error) => send_backend(
+								backend,
+								BackendEvent::Error(sf!("Could not list sessions: {error}")),
+							),
+						}
+					}
+				},
+				Ok(ChatCommand::NewSession) => {
+					if chat_active(state.submit_pending, bus.phase()) {
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!(
+								"Wait for the active turn to finish before starting a new session.",
+							)),
+						);
+					} else {
+						send_backend(backend, BackendEvent::NewSessionRequested);
+					}
+				},
+				Ok(ChatCommand::Clear) => {
+					if chat_active(state.submit_pending, bus.phase()) {
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!(
+								"Wait for the active turn to finish before clearing context.",
+							)),
+						);
+					} else {
+						match control.reset(omp_agent::broker_now_ms()).await {
+							Ok(_) => {
+								state.context_tokens = 0;
+								send_backend(backend, BackendEvent::HistoryCleared);
+							},
+							Err(error) => send_backend(
+								backend,
+								BackendEvent::Error(sf!("Could not clear context: {error}")),
+							),
+						}
+					}
+				},
+				Ok(ChatCommand::Fresh) => {
+					if chat_active(state.submit_pending, bus.phase()) {
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!(
+								"Wait for the active turn to finish before resetting the provider.",
+							)),
+						);
+					} else {
+						match control.provider_reset(omp_agent::broker_now_ms()).await {
+							Ok(_) => send_backend(
+								backend,
+								BackendEvent::Notice(sf!(
+									"Provider session will be refreshed on the next turn.",
+								)),
+							),
+							Err(error) => send_backend(
+								backend,
+								BackendEvent::Error(sf!("Could not refresh provider session: {error}")),
+							),
+						}
+					}
+				},
+				Ok(ChatCommand::Jobs) => {
+					let mut jobs: Vec<_> = state.jobs.iter().map(Str::as_str).collect();
+					jobs.sort_unstable();
+					let message = if jobs.is_empty() {
+						sf!("No active background jobs.")
+					} else {
+						Str::from(format!(
+							"**Active jobs ({})**\n{}",
+							jobs.len(),
+							jobs
+								.into_iter()
+								.map(|job| format!("- `{job}`"))
+								.collect::<Vec<_>>()
+								.join("\n"),
+						))
+					};
+					send_backend(backend, BackendEvent::Notice(message));
+				},
+				Ok(ChatCommand::Settings) => {
+					send_backend(backend, BackendEvent::SettingsSchema(setting_rows()));
+				},
+				Ok(ChatCommand::Live) => {
+					state.live_enabled = !state.live_enabled;
+					if state.live_enabled {
+						state.live_activity = ActivityWaveform::new();
+					}
 					send_backend(
 						backend,
-						BackendEvent::Error(sf!(
-							"Wait for provider authentication to finish before submitting.",
-						)),
+						BackendEvent::Notice(sf!(if state.live_enabled {
+							"Live activity waveform enabled."
+						} else {
+							"Live activity waveform disabled."
+						})),
 					);
-				} else {
-					let active = chat_active(state.submit_pending, bus.phase());
-					let pending_prompt = (!active).then(|| PendingPrompt {
-						text:        prompt_text.clone(),
-						attachments: attachments.clone(),
-					});
-					let mut item = *item;
-					let chips = lower_attachments(&mut item, attachments, |message| {
+					send_status(backend, state, bus, dropped);
+				},
+				Ok(ChatCommand::Plan(args)) => handle_plan_command(backend, modes, args.as_str()),
+				Ok(ChatCommand::Goal(args)) => handle_goal_command(backend, modes, args.as_str()),
+				Ok(ChatCommand::Vibe(args)) => handle_vibe_command(backend, modes, args.as_str()),
+				Ok(ChatCommand::Prewalk(args)) => handle_prewalk_command(backend, modes, args.as_str()),
+				Ok(ChatCommand::Skill { name, args, budget }) => {
+					let Some(skill) = state.skills.get(name.as_str()) else {
+						send_backend(backend, BackendEvent::Error(sf!("Unknown skill `{name}`.")));
+						return Ok(false);
+					};
+					let rendered = crate::skills::render_invocation(
+						skill,
+						args.as_str(),
+						crate::skills::SkillInvocationKind::User,
+					);
+					let mut item = input::user_message(rendered.as_str());
+					let chips = lower_attachments(&mut item, attachments.clone(), |message| {
 						send_backend(backend, BackendEvent::Error(message));
 					});
+					let active = chat_active(state.submit_pending, bus.phase());
 					let delivered = if active {
 						apply_turn_budget(agent_state, budget.as_ref());
 						let delivered = mailbox
 							.try_enqueue(Interrupt {
 								class: active_submit_class(mode),
 								item,
-								source: InterruptSource::Producer(sf!("user")),
+								source: InterruptSource::Producer(sf!("user skill")),
 							})
 							.is_ok();
 						if !delivered {
@@ -852,26 +1566,147 @@ where
 							.is_ok()
 					};
 					if delivered {
-						send_backend(backend, BackendEvent::UserReplayed { text: prompt_text, chips });
+						send_backend(backend, BackendEvent::UserReplayed {
+							text: Str::from(text),
+							chips,
+						});
 						if active {
 							state.queued = state.queued.saturating_add(1);
 						} else {
 							state.turn_started.get_or_insert_with(Instant::now);
-							state.pending_prompt = pending_prompt;
 						}
 					} else {
 						state.submit_pending = false;
-						state.pending_prompt = None;
 						send_backend(backend, BackendEvent::Error(sf!("Agent input channel is closed.")));
 					}
-				}
-			},
-			Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
+				},
+				Ok(ChatCommand::Agents) => send_backend(backend, BackendEvent::OpenAgentTree),
+				Ok(ChatCommand::Pause) => send_backend(backend, BackendEvent::Pause),
+				Ok(ChatCommand::Unavailable { command, reason }) => {
+					send_backend(backend, BackendEvent::Error(sf!("/{command} unavailable: {reason}")));
+				},
+				Ok(ChatCommand::Quit) => {
+					if chat_active(state.submit_pending, bus.phase()) {
+						abort.abort();
+					}
+					return Ok(true);
+				},
+				Ok(ChatCommand::Submit { item, text: prompt_text, budget }) => {
+					if auth.is_some_and(ChatAuth::is_active) {
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!(
+								"Wait for provider authentication to finish before submitting.",
+							)),
+						);
+					} else {
+						let active = chat_active(state.submit_pending, bus.phase());
+						let pending_prompt = (!active).then(|| PendingPrompt {
+							text:        prompt_text.clone(),
+							attachments: attachments.clone(),
+						});
+						let mut item = *item;
+						let chips = lower_attachments(&mut item, attachments, |message| {
+							send_backend(backend, BackendEvent::Error(message));
+						});
+						let delivered = if active {
+							apply_turn_budget(agent_state, budget.as_ref());
+							let delivered = mailbox
+								.try_enqueue(Interrupt {
+									class: active_submit_class(mode),
+									item,
+									source: InterruptSource::Producer(sf!("user")),
+								})
+								.is_ok();
+							if !delivered {
+								apply_turn_budget(agent_state, None);
+							}
+							delivered
+						} else {
+							state.submit_pending = true;
+							commands_tx
+								.send_async(UiCmd::Submit { item: Box::new(item), budget })
+								.await
+								.is_ok()
+						};
+						if delivered {
+							send_backend(backend, BackendEvent::UserReplayed { text: prompt_text, chips });
+							if active {
+								state.queued = state.queued.saturating_add(1);
+							} else {
+								state.turn_started.get_or_insert_with(Instant::now);
+								state.pending_prompt = pending_prompt;
+							}
+						} else {
+							state.submit_pending = false;
+							state.pending_prompt = None;
+							send_backend(
+								backend,
+								BackendEvent::Error(sf!("Agent input channel is closed.")),
+							);
+						}
+					}
+				},
+				Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
+			}
 		},
 		Intent::Abort => {
 			if chat_active(state.submit_pending, bus.phase()) {
+				let _ = modes.interrupt_goal(now_ms(), true);
+				let _ = modes.flush_projection().await;
 				abort.abort();
 			}
+		},
+		Intent::PtyInput { id, data } => {
+			let result = match state.active_ptys.get(id.as_str()) {
+				Some(control) => control.stdin(data).await,
+				None => Ok(false),
+			};
+			if let Err(error) = result {
+				send_backend(backend, BackendEvent::Error(sf!("PTY input failed: {error}")));
+			}
+		},
+		Intent::PtyResize { id, rows, columns } => {
+			if let Some(control) = state.active_ptys.get(id.as_str()) {
+				let _ = control.resize(u32::from(rows), u32::from(columns)).await;
+			}
+		},
+		Intent::PtyKill { id } => {
+			let result = match state.active_ptys.get(id.as_str()).cloned() {
+				Some(control) => control.cancel(ExecControlKind::Kill, 0).await,
+				None => Ok(false),
+			};
+			match result {
+				Ok(true) => {
+					state.active_ptys.remove(id.as_str());
+					send_backend(backend, BackendEvent::PtyFinished {
+						id,
+						status: omp_chat_ui::PtyStatus::Killed,
+						exit_code: Some(137),
+					});
+				},
+				Ok(false) => {},
+				Err(error) => {
+					send_backend(backend, BackendEvent::Error(sf!("PTY force-kill failed: {error}")))
+				},
+			}
+		},
+		Intent::Approval { ticket_id, action } => {
+			let Some(request) = state.approvals.remove(ticket_id.as_str()) else {
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Approval `{ticket_id}` is no longer pending.")),
+				);
+				return Ok(false);
+			};
+			let decision = approval_decision(&request, action);
+			if request.respond(decision).is_err() {
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Approval `{ticket_id}` was already settled.")),
+				);
+			}
+			send_backend(backend, BackendEvent::ApprovalSettled { ticket_id });
 		},
 		Intent::RewindRequest => {
 			if chat_active(state.submit_pending, bus.phase()) {
@@ -957,7 +1792,7 @@ where
 			}
 		},
 		Intent::SwitchModel(model) => {
-			switch_model(backend, agent_state, data_dir, model.as_str(), state);
+			switch_model(backend, agent_state, data_dir, model.as_str(), state, control, false).await;
 		},
 		Intent::Login(provider) => {
 			if chat_active(state.submit_pending, bus.phase()) {
@@ -1008,7 +1843,15 @@ where
 			}
 		},
 		Intent::Help => {
-			send_backend(backend, BackendEvent::Notice(Str::from(state.commands.help_text())));
+			send_backend(
+				backend,
+				BackendEvent::Notice(Str::from(state.typed_commands.help_text(
+					CommandSurface::Tui,
+					CommandRole::Owner,
+					true,
+					|_| true,
+				))),
+			);
 		},
 		Intent::Quit => {
 			if chat_active(state.submit_pending, bus.phase()) {
@@ -1099,9 +1942,13 @@ fn handle_agent_event(
 	dropped: u64,
 ) {
 	match event {
-		AgentEvent::Turn { event, .. } => match &event.event {
-			Some(Event::Accepted(accepted)) => state.replaying_turn = accepted.replay,
+		AgentEvent::Turn { turn_id, event } => match &event.event {
+			Some(Event::Accepted(accepted)) => {
+				state.replaying_turn = accepted.replay;
+				modes.begin_streaming();
+			},
 			Some(Event::Outcome(outcome)) => {
+				let _ = modes.settle_plan_transition();
 				if state.replaying_turn {
 					replay_items(
 						backend,
@@ -1121,9 +1968,26 @@ fn handle_agent_event(
 				}
 				if let Some(snapshot) = &outcome.context_snapshot {
 					state.context_tokens = snapshot.prompt_tokens;
+					if let Some(window_tokens) = state.context_window
+						&& snapshot.prompt_tokens <= window_tokens
+					{
+						state.context_snapshot = Some(omp_agent::ContextSnapshot {
+							turn_id: Str::from(turn_id.as_str()),
+							projection_revision: state.part_serial,
+							window_tokens,
+							input_tokens: snapshot.prompt_tokens,
+							system_tokens: None,
+							message_tokens: None,
+							tool_tokens: None,
+							buffer_tokens: None,
+							unclassified_tokens: snapshot.prompt_tokens,
+							slack_tokens: window_tokens - snapshot.prompt_tokens,
+							snapcompact_savings: None,
+						});
+					}
 				}
 				if let Some(usage) = &outcome.usage {
-					let _ = modes.record_goal_usage(
+					let _ = modes.checkpoint_goal_usage(
 						GoalUsage {
 							input_tokens:        usage.input_tokens,
 							cache_write_tokens:  usage.cache_write_tokens,
@@ -1243,11 +2107,43 @@ fn handle_agent_event(
 		AgentEvent::ToolUpdate { call_id, json } => {
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				ensure_tool_started(backend, call_id, tool, true);
+				if tool.identity.name == "shell"
+					&& let Ok(update) = serde_json::from_slice::<omp_tools::shell::Update>(json)
+					&& update.terminal
+				{
+					if update.started && !update.exec_id.is_empty() {
+						state.active_ptys.insert(
+							call_id.clone(),
+							state
+								.environment
+								.active_exec_control(update.exec_id.clone()),
+						);
+						let command = tool
+							.args
+							.get("command")
+							.and_then(|value| value.as_str())
+							.map_or_else(|| sf!("interactive shell"), Str::from);
+						send_backend(backend, BackendEvent::PtyStarted { id: call_id.clone(), command });
+					}
+					if !update.data.is_empty() {
+						send_backend(backend, BackendEvent::PtyOutput {
+							id:    call_id.clone(),
+							chunk: Bytes::copy_from_slice(update.data.as_ref()),
+						});
+					}
+				}
 				let view = fold_tool_update(registry, tool, json.clone());
 				send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 			}
 		},
 		AgentEvent::ToolFinished { call_id, item } => {
+			if state.active_ptys.remove(call_id.as_str()).is_some() {
+				send_backend(backend, BackendEvent::PtyFinished {
+					id:        call_id.clone(),
+					status:    omp_chat_ui::PtyStatus::Exited,
+					exit_code: None,
+				});
+			}
 			let mut tool = state.tools.remove(call_id.as_str());
 			let (identity, ok, view) = render_tool_result_view(registry, item, tool.as_ref());
 			if let Some(tool) = tool.as_mut() {
@@ -1256,6 +2152,7 @@ fn handle_agent_event(
 				send_backend(backend, BackendEvent::ToolStarted {
 					id:    call_id.clone(),
 					name:  identity.name.clone(),
+					rev:   Str::from(identity.rev.to_string()),
 					title: identity.name,
 				});
 			}
@@ -1268,6 +2165,21 @@ fn handle_agent_event(
 		AgentEvent::JobSettled { job_id } => {
 			state.jobs.remove(job_id);
 		},
+		AgentEvent::PeerRelay(observation) => {
+			send_backend(
+				backend,
+				BackendEvent::TranscriptFrame(TranscriptFrame {
+					kind:   TranscriptFrameKind::Peer,
+					title:  sf!(
+						"IRC {} → {} · {}",
+						observation.from,
+						observation.to,
+						observation.outcome
+					),
+					detail: Some(observation.text.clone()),
+				}),
+			);
+		},
 		AgentEvent::Failed { message, .. } => {
 			send_backend(
 				backend,
@@ -1279,6 +2191,10 @@ fn handle_agent_event(
 			);
 		},
 		AgentEvent::Snapshot(_)
+		| AgentEvent::ToolObserved { .. }
+		| AgentEvent::PlanStateChanged { .. }
+		| AgentEvent::TitleChanged { .. }
+		| AgentEvent::RunStateChanged { .. }
 		| AgentEvent::PhaseChanged { .. }
 		| AgentEvent::RosterChanged { .. } => {},
 	}
@@ -1310,6 +2226,7 @@ fn replay_items(
 				send_backend(backend, BackendEvent::ToolStarted {
 					id: id.clone(),
 					name: identity.name.clone(),
+					rev: Str::from(identity.rev.to_string()),
 					title,
 				});
 				tools.insert(id, ToolDisplay { identity, args, started: true, fold: ViewState::new() });
@@ -1322,6 +2239,7 @@ fn replay_items(
 					send_backend(backend, BackendEvent::ToolStarted {
 						id:    id.clone(),
 						name:  identity.name.clone(),
+						rev:   Str::from(identity.rev.to_string()),
 						title: identity.name.clone(),
 					});
 				}
@@ -1349,6 +2267,7 @@ fn ensure_tool_started(
 	send_backend(backend, BackendEvent::ToolStarted {
 		id: call_id.clone(),
 		name: tool.identity.name.clone(),
+		rev: Str::from(tool.identity.rev.to_string()),
 		title,
 	});
 	tool.started = true;
@@ -1751,44 +2670,73 @@ fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
 		.collect()
 }
 
-fn switch_model(
+async fn switch_model(
 	backend: &flume::Sender<BackendEvent>,
 	state_handle: &AgentState,
 	data_dir: &std::path::Path,
 	selector: &str,
 	state: &mut BridgeState,
+	control: &omp_agent::ControlSender,
+	durable: bool,
 ) {
-	match select_model(state_handle, Catalog::embedded(), selector) {
-		Some(spec) => {
-			state.model = spec.key.to_string();
-			state.context_window = spec.limits.context_window;
-			state.settings.default_model = Some(state.model.clone());
-			if let Err(error) = state.settings.save(data_dir) {
-				send_backend(
-					backend,
-					BackendEvent::Error(sf!("Could not save the default model: {error}")),
-				);
-			}
-			send_models_updated(backend, state);
-		},
-		None => send_backend(backend, BackendEvent::Error(sf!("Unknown model: {selector}"))),
+	let catalog = Catalog::embedded();
+	let Some(spec) = resolve_model(catalog, selector) else {
+		send_backend(backend, BackendEvent::Error(sf!("Unknown model: {selector}")));
+		return;
+	};
+	if !durable {
+		let Some(route) = spec.routes.first().and_then(|route| catalog.route(route)) else {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Model {selector} has no selectable provider route.")),
+			);
+			return;
+		};
+		let change = JournalModelChange {
+			role:     sf!("temporary"),
+			model:    JournalModelRef {
+				provider: JournalProviderId(Str::new(route.provider.as_str())),
+				api:      Str::new(route.codec.as_str()),
+				model:    JournalModelId(Str::new(spec.key.as_str())),
+			},
+			fallback: false,
+		};
+		if let Err(error) = control.model_override(now_ms(), change).await {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Could not save the session model override: {error}")),
+			);
+			return;
+		}
 	}
-}
 
-fn select_model<'a>(
-	state: &AgentState,
-	catalog: &'a Catalog,
-	selector: &str,
-) -> Option<&'a ModelSpec> {
-	let spec = resolve_model(catalog, selector)?;
 	let key = spec.key.to_string();
-	state.update(|snapshot| snapshot.turn.params.model.clone_from(&key));
-	Some(spec)
+	if durable {
+		let manager = crate::settings::manager::SettingsManager::open(
+			crate::settings::manager::SettingsPaths::discover(data_dir, None),
+		);
+		if let Err(error) = manager.and_then(|manager| {
+			manager
+				.set_sync(crate::settings::manager::MutationScope::Global, "default_model", &key)
+				.map(|_| ())
+		}) {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Could not save the default model: {error}")),
+			);
+			return;
+		}
+		state.settings.default_model = Some(key.clone());
+	}
+	state_handle.update(|snapshot| snapshot.turn.params.model.clone_from(&key));
+	state.model = key;
+	state.context_window = spec.limits.context_window;
+	send_models_updated(backend, state);
 }
 
 fn resolve_model<'a>(catalog: &'a Catalog, selector: &str) -> Option<&'a ModelSpec> {
 	catalog
-		.model(&ModelKey::from(selector))
+		.model(ModelKey::from_ref(selector))
 		.or_else(|| catalog.resolve_alias(selector))
 }
 
@@ -1807,8 +2755,7 @@ fn model_uses_subscription(catalog: &Catalog, selector: &str) -> bool {
 }
 
 fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str> {
-	let provider_id = ProviderId::from(requested.as_str());
-	let Some(provider) = catalog.provider(&provider_id) else {
+	let Some(provider) = catalog.provider(ProviderId::from_ref(requested.as_str())) else {
 		return Err(sf!(
 			"Unknown provider `{requested}`. Use `/login` to choose an available provider."
 		));
@@ -1898,6 +2845,25 @@ fn send_status(
 	);
 }
 
+fn setting_rows() -> Vec<omp_chat_ui::SettingRow> {
+	omp_settings::registered_domains()
+		.into_iter()
+		.flat_map(|domain| {
+			domain.fields.iter().map(move |field| {
+				let kind: &'static str = field.kind.into();
+				omp_chat_ui::SettingRow {
+					domain:      sf!(domain.name),
+					path:        sf!(field.path),
+					label:       sf!(field.label),
+					description: sf!(field.description),
+					kind:        sf!(kind),
+					secret:      field.secret,
+				}
+			})
+		})
+		.collect()
+}
+
 fn send_backend(sender: &flume::Sender<BackendEvent>, event: BackendEvent) {
 	let _ = sender.send(event);
 }
@@ -1976,6 +2942,85 @@ fn url_shaped(value: &str) -> bool {
 		.next()
 		.is_some_and(|first| first.is_ascii_alphabetic())
 		&& chars.all(|char| char.is_ascii_alphanumeric() || matches!(char, '+' | '-' | '.'))
+}
+
+fn approval_ticket_view(ticket: &omp_agent::ApprovalTicket) -> ApprovalTicketView {
+	let title = ticket
+		.reasons
+		.first()
+		.map_or_else(|| sf!("Tool approval"), |reason| reason.title.clone());
+	let detail = Str::new(
+		ticket
+			.reasons
+			.iter()
+			.map(|reason| reason.body.as_str())
+			.collect::<Vec<_>>()
+			.join("\n\n"),
+	);
+	let subject = Str::new(
+		ticket
+			.reasons
+			.iter()
+			.map(|reason| reason.subject.as_str())
+			.collect::<Vec<_>>()
+			.join("\n"),
+	);
+	let always_scope = ticket
+		.reasons
+		.iter()
+		.flat_map(|reason| reason.scopes.iter())
+		.next()
+		.cloned();
+	let evidence = ticket
+		.reasons
+		.iter()
+		.flat_map(|reason| reason.evidence.iter().cloned())
+		.collect();
+	ApprovalTicketView {
+		ticket_id: ticket.ticket_id.clone(),
+		invocation_id: ticket.invocation_id.clone(),
+		title,
+		detail,
+		subject,
+		always_scope,
+		evidence,
+	}
+}
+
+fn approval_decision(request: &ApprovalRequest, action: ApprovalAction) -> ApprovalDecision {
+	let (approved, scope, reason) = match action {
+		ApprovalAction::AllowOnce => (true, sf!("once"), None),
+		ApprovalAction::AllowAlways => {
+			let scope = request
+				.ticket
+				.reasons
+				.iter()
+				.flat_map(|reason| reason.scopes.iter())
+				.next()
+				.cloned()
+				.unwrap_or_else(|| sf!("always"));
+			(true, scope, None)
+		},
+		ApprovalAction::Reject => (false, sf!("once"), Some(sf!("rejected by user"))),
+		ApprovalAction::Amend(subject) => {
+			(false, sf!("amend"), Some(sf!("replacement subject requested: {subject}")))
+		},
+	};
+	ApprovalDecision {
+		approved,
+		scope,
+		source: ApprovalSource::User,
+		decided_by: None,
+		reason,
+		audited: false,
+	}
+}
+
+async fn next_approval_request(inbox: &mut Option<ApprovalInbox>) -> Option<ApprovalRequest> {
+	match inbox {
+		Some(inbox) => inbox.recv().await.ok(),
+		None => pending().await,
+	}
 }
 
 async fn next_auth_event(auth: Option<&ChatAuth>) -> Option<ChatAuthEvent> {
@@ -2069,6 +3114,7 @@ mod tests {
 			model:             "test/model".to_owned(),
 			context_window:    None,
 			context_tokens:    0,
+			context_snapshot:  None,
 			cost_nanos:        0,
 			queued:            0,
 			jobs:              HashSet::new(),
@@ -2087,6 +3133,7 @@ mod tests {
 			replaying_turn:    false,
 			settings:          Settings::default(),
 			commands:          CommandRoster::new(Vec::new()),
+			skills:            Default::default(),
 		}
 	}
 
@@ -2351,7 +3398,7 @@ mod tests {
 
 	struct TestRenderer(&'static str);
 
-	impl omp_tool::render::Render for TestRenderer {
+	impl omp_tool::render::RenderFold for TestRenderer {
 		type Outcome = serde_json::Value;
 		type State = TestFold;
 		type Update = TestUpdate;

@@ -25,7 +25,7 @@ use nix::{
 };
 use omp_app::{
 	envd::{
-		server::EnvServer,
+		EnvServer,
 		worker::{ExtHostConfig, ExtHostSpec, HostKey},
 	},
 	exthost::{

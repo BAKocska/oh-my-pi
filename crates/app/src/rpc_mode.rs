@@ -2,11 +2,12 @@
 
 use std::{
 	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	future::Future,
 	path::{Path, PathBuf},
 	process::Stdio,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, AtomicU8, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,16 +15,18 @@ use std::{
 use flume::{Receiver, Sender};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::Str;
-use omp_llm_catalog::ModelKey;
+use omp_core::{ExposeSecret as _, SecretString, Str};
+use omp_llm_catalog::{ModelKey, ProviderId};
 use omp_llm_inference::{
 	Client, Registry,
+	answer::{AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPromptKind, AuthSession},
+	auth::manager::AuthManager,
 	call::{
-		CallMeta, ChatRequest, ContentPart, Message, NegotiationPolicy, Role, Sampling, Setting,
-		Target,
+		AuthInput, AuthMethod, AuthRequest, CallMeta, ChatRequest, ContentPart, LoginRequest,
+		Message, NegotiationPolicy, Role, Sampling, Setting, Target,
 	},
 	event::ChatEvent,
-	id::RequestId as InferenceRequestId,
+	id::{LoginSessionId, RequestId as InferenceRequestId},
 	receipt::ExecutionBudget,
 };
 use omp_rpc::{
@@ -33,8 +36,13 @@ use omp_rpc::{
 	},
 	protocol::{
 		ExtensionUiResponse, HostToolCall, HostToolCancel, HostToolDefinition, HostToolResult,
-		HostToolUpdate, OAuthProvider, PROTOCOL_V1, PROTOCOL_V2, ReadyFrame, RequestId, RpcErrorCode,
-		RpcRequest, RpcResponse, SubagentMessages,
+		HostToolUpdate, HostUriCancel, HostUriOperation, HostUriRequest, HostUriResult,
+		HostUriScheme, MAX_HOST_URI_DESCRIPTION_BYTES, MAX_HOST_URI_NOTE_BYTES, MAX_HOST_URI_NOTES,
+		MAX_HOST_URI_SCHEME_BYTES, MAX_HOST_URI_SCHEMES, OAuthProvider, PROTOCOL_V1, PROTOCOL_V2,
+		ReadyFrame, RequestId, RpcAuthAccount, RpcAuthAnswerFrame, RpcAuthEvent, RpcAuthEventFrame,
+		RpcAuthInputKind, RpcAuthMethod, RpcAuthPromptKind, RpcAuthTerminalFrame,
+		RpcAuthTerminalOutcome, RpcErrorCode, RpcRequest, RpcResponse, RpcTurnOutcome,
+		SubagentMessages,
 	},
 };
 use parking_lot::Mutex;
@@ -68,17 +76,17 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	// embedding client before this process starts.
 
 	let data = data_dir(None)?;
+	let configured_model = crate::settings::current(&data)
+		.into_diagnostic()?
+		.default_model
+		.map(Str::from);
 	let model = args
 		.model
-		.or_else(|| {
-			crate::settings::Settings::load(&data)
-				.default_model
-				.map(Str::from)
-		})
+		.or(configured_model)
 		.ok_or_else(|| miette!("rpc mode requires --model or config.default_model"))?;
 	let store =
 		crate::daemon::open_credential_store(data.join("credentials.db")).into_diagnostic()?;
-	let registry = crate::daemon::production_registry(&data, store)
+	let (registry, auth) = crate::daemon::production_rpc_registry(&data, store)
 		.await
 		.into_diagnostic()?;
 	let models = registry
@@ -87,6 +95,17 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		.iter()
 		.map(|entry| entry.key.as_str().to_owned())
 		.collect::<Vec<_>>();
+	let authenticated = match auth
+		.execute(AuthRequest::ListAccounts { provider: None })
+		.await
+	{
+		Ok(AuthAnswer::Accounts(accounts)) => accounts
+			.into_iter()
+			.filter(|account| account.state == AccountState::Active)
+			.map(|account| account.provider.as_str().to_owned())
+			.collect::<HashSet<_>>(),
+		_ => HashSet::new(),
+	};
 	let providers = registry
 		.catalog()
 		.providers()
@@ -95,7 +114,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 			id:            entry.id.as_str().to_owned(),
 			name:          entry.name.to_string(),
 			available:     true,
-			authenticated: false,
+			authenticated: authenticated.contains(entry.id.as_str()),
 		})
 		.collect::<Vec<_>>();
 	let preferred_provider = args.provider.map(|provider| provider.to_string());
@@ -111,9 +130,16 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		.into_diagnostic()?;
 	emit(&output_tx, ready)?;
 
+	let host_resources = Arc::new(HostResourceBroker::new(output_tx.clone()));
+	crate::envd::tool_url::host::bind(&host_resources)
+		.map_err(|_| miette!("RPC host URI resolver is already bound"))?;
 	let runtime = Arc::new(Runtime {
 		registry,
+		auth,
+		commands: crate::chat_ui::commands::CommandRoster::builtins(),
 		output: output_tx.clone(),
+		host_resources,
+		shutdown: ShutdownCoordinator::default(),
 		negotiated,
 		state: Mutex::new(ServerState::new(
 			model.to_string(),
@@ -125,6 +151,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		)),
 	});
 	runtime.notify_session_start()?;
+	runtime.notify_available_commands()?;
 
 	let (input_tx, input_rx) = flume::unbounded();
 	let reader = tokio::spawn(read_frames(tokio::io::stdin(), input_tx));
@@ -138,7 +165,13 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 			active.cancellation.cancel();
 		}
 		state.pending_host_tools.clear();
+		for pending in state.pending_auth.values() {
+			pending.cancellation.cancel();
+		}
 	}
+	runtime.host_resources.shutdown("RPC client disconnected")?;
+	crate::envd::tool_url::host::unbind(&runtime.host_resources);
+	runtime.shutdown.shutdown().await;
 	let read_result = reader.await.into_diagnostic()?;
 	drop(runtime);
 	drop(output_tx);
@@ -241,22 +274,29 @@ where
 async fn dispatch_inputs(runtime: Arc<Runtime>, receiver: Receiver<Input>) -> miette::Result<()> {
 	let (ordinary_tx, ordinary_rx) = flume::unbounded();
 	let worker_runtime = runtime.clone();
-	let worker = tokio::spawn(async move {
+	let worker = async move {
 		while let Ok(value) = ordinary_rx.recv_async().await {
 			worker_runtime.handle_request(value).await?;
 		}
 		Ok::<_, miette::Report>(())
-	});
-
-	while let Ok(input) = receiver.recv_async().await {
-		match input {
-			Input::Malformed(message) => runtime.send_error(None, "parse", "parse_error", message)?,
-			Input::Request(value) if is_immediate_frame(&value) => runtime.handle_immediate(value)?,
-			Input::Request(value) => ordinary_tx.send_async(value).await.into_diagnostic()?,
+	};
+	let reader = async move {
+		while let Ok(input) = receiver.recv_async().await {
+			match input {
+				Input::Malformed(message) => {
+					runtime.send_error(None, "parse", "parse_error", message)?;
+				},
+				Input::Request(value) if is_immediate_frame(&value) => {
+					runtime.handle_immediate(value).await?;
+				},
+				Input::Request(value) => ordinary_tx.send_async(value).await.into_diagnostic()?,
+			}
 		}
-	}
-	drop(ordinary_tx);
-	worker.await.into_diagnostic()?
+		drop(ordinary_tx);
+		Ok::<_, miette::Report>(())
+	};
+	let (worker, reader) = tokio::join!(worker, reader);
+	worker.and(reader)
 }
 
 fn is_immediate_frame(value: &Value) -> bool {
@@ -269,15 +309,382 @@ fn is_immediate_frame(value: &Value) -> bool {
 				| "host_tool_update"
 				| "host_tool_result"
 				| "host_tool_cancel"
+				| "host_uri_result"
+				| "auth_answer"
 		)
 	)
 }
 
+const RESERVED_HOST_URI_SCHEMES: &[&str] = &[
+	"agent",
+	"artifact",
+	"attachment",
+	"conflict",
+	"file",
+	"history",
+	"http",
+	"https",
+	"issue",
+	"job",
+	"local",
+	"mcp",
+	"memory",
+	"omp",
+	"pr",
+	"rule",
+	"security",
+	"skill",
+	"ssh",
+	"vault",
+];
+
+struct PendingHostResource {
+	generation: u64,
+	settle:     Sender<HostUriResult>,
+}
+
+#[derive(Default)]
+struct HostResourceState {
+	generation: u64,
+	schemes:    BTreeMap<String, HostUriScheme>,
+	pending:    HashMap<String, PendingHostResource>,
+}
+
+/// Generation-fenced broker for virtual resources owned by the RPC host.
+pub(crate) struct HostResourceBroker {
+	output:   Sender<Value>,
+	sequence: AtomicU64,
+	state:    Mutex<HostResourceState>,
+}
+
+struct PendingHostRequestGuard<'a> {
+	broker:     &'a HostResourceBroker,
+	id:         String,
+	generation: u64,
+}
+
+impl Drop for PendingHostRequestGuard<'_> {
+	fn drop(&mut self) {
+		if self.broker.state.lock().pending.remove(&self.id).is_some() {
+			let _ = self.broker.emit_cancel(self.generation, self.id.clone());
+		}
+	}
+}
+
+impl HostResourceBroker {
+	fn new(output: Sender<Value>) -> Self {
+		Self { output, sequence: AtomicU64::new(1), state: Mutex::new(HostResourceState::default()) }
+	}
+
+	fn replace(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let generation = params
+			.get("generation")
+			.and_then(Value::as_u64)
+			.ok_or_else(|| CommandError::new("invalid_params", "generation must be an integer"))?;
+		let raw_schemes = params
+			.get("schemes")
+			.and_then(Value::as_array)
+			.ok_or_else(|| CommandError::new("invalid_params", "schemes must be an array"))?;
+		if raw_schemes.len() > MAX_HOST_URI_SCHEMES {
+			return Err(CommandError::new(
+				"host_uri_limit",
+				format!("at most {MAX_HOST_URI_SCHEMES} host URI schemes may be registered"),
+			));
+		}
+
+		let mut schemes = BTreeMap::new();
+		for raw in raw_schemes {
+			let mut definition = serde_json::from_value::<HostUriScheme>(raw.clone())
+				.map_err(|error| CommandError::new("invalid_params", error.to_string()))?;
+			let normalized = normalize_host_uri_scheme(&definition.scheme)?;
+			if definition
+				.description
+				.as_ref()
+				.is_some_and(|description| description.len() > MAX_HOST_URI_DESCRIPTION_BYTES)
+			{
+				return Err(CommandError::new(
+					"host_uri_description_limit",
+					"host URI scheme description exceeds the protocol limit",
+				));
+			}
+			definition.scheme.clone_from(&normalized);
+			if schemes.insert(normalized, definition).is_some() {
+				return Err(CommandError::new(
+					"duplicate_host_uri_scheme",
+					"host URI schemes must be unique after normalization",
+				));
+			}
+		}
+
+		let pending = {
+			let mut state = self.state.lock();
+			if generation <= state.generation {
+				return Err(CommandError::new(
+					"stale_generation",
+					format!(
+						"host URI generation {generation} does not advance generation {}",
+						state.generation
+					),
+				));
+			}
+			let pending = std::mem::take(&mut state.pending);
+			state.generation = generation;
+			state.schemes = schemes;
+			pending
+		};
+		for (target_id, pending) in pending {
+			self
+				.emit_cancel(pending.generation, target_id)
+				.map_err(CommandError::transport)?;
+		}
+		let schemes = self
+			.state
+			.lock()
+			.schemes
+			.keys()
+			.cloned()
+			.collect::<Vec<_>>();
+		Ok(json!({ "generation": generation, "schemes": schemes }))
+	}
+
+	/// Resolves a host-owned resource read through the active generation.
+	async fn read(
+		&self,
+		url: &str,
+		cancellation: CancellationToken,
+	) -> Result<HostUriResult, CommandError> {
+		self
+			.request(HostUriOperation::Read, url, None, cancellation)
+			.await
+	}
+
+	/// Dispatches a declared-writable host resource through the active
+	/// generation.
+	async fn write(
+		&self,
+		url: &str,
+		content: String,
+		cancellation: CancellationToken,
+	) -> Result<HostUriResult, CommandError> {
+		self
+			.request(HostUriOperation::Write, url, Some(content), cancellation)
+			.await
+	}
+
+	/// Resolves one URL for the Environment-owned host fallback.
+	pub(crate) async fn resolve_read(&self, url: &str) -> Result<HostUriResult, Str> {
+		self
+			.read(url, CancellationToken::new())
+			.await
+			.map_err(|error| Str::from(error.message))
+	}
+
+	/// Writes one URL after the active declaration admits mutation.
+	pub(crate) async fn resolve_write(
+		&self,
+		url: &str,
+		content: String,
+	) -> Result<HostUriResult, Str> {
+		self
+			.write(url, content, CancellationToken::new())
+			.await
+			.map_err(|error| Str::from(error.message))
+	}
+
+	async fn request(
+		&self,
+		operation: HostUriOperation,
+		url: &str,
+		content: Option<String>,
+		cancellation: CancellationToken,
+	) -> Result<HostUriResult, CommandError> {
+		let scheme = url
+			.split_once(':')
+			.map(|(scheme, _)| scheme)
+			.ok_or_else(|| CommandError::new("invalid_host_uri", "host URI requires a scheme"))?;
+		let (generation, immutable) = {
+			let state = self.state.lock();
+			let definition = state.schemes.get(scheme).ok_or_else(|| {
+				CommandError::new("host_uri_not_found", "host URI scheme is not registered")
+			})?;
+			if operation == HostUriOperation::Write && !definition.writable {
+				return Err(CommandError::new(
+					"host_uri_read_only",
+					"host URI scheme did not declare writable access",
+				));
+			}
+			(state.generation, definition.immutable)
+		};
+		let id = format!("host-uri-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
+		let (settle, result) = flume::bounded(1);
+		self
+			.state
+			.lock()
+			.pending
+			.insert(id.clone(), PendingHostResource { generation, settle });
+		let _pending_guard = PendingHostRequestGuard { broker: self, id: id.clone(), generation };
+		let frame = HostUriRequest {
+			kind: "host_uri_request".into(),
+			id: id.clone(),
+			generation,
+			operation,
+			url: url.to_owned(),
+			content,
+		};
+		if let Err(error) =
+			emit(&self.output, serde_json::to_value(frame).map_err(CommandError::json)?)
+		{
+			self.state.lock().pending.remove(&id);
+			return Err(CommandError::transport(error));
+		}
+
+		tokio::select! {
+			() = cancellation.cancelled() => {
+				let removed = self.state.lock().pending.remove(&id);
+				if removed.is_some() {
+					self.emit_cancel(generation, id).map_err(CommandError::transport)?;
+				}
+				Err(CommandError::new("host_uri_cancelled", "host URI operation was cancelled"))
+			},
+			result = result.recv_async() => {
+				let mut result = result.map_err(|_| {
+					CommandError::new("host_uri_unavailable", "host URI route was replaced or disconnected")
+				})?;
+				if result.is_error {
+					return Err(CommandError::new(
+						"host_uri_failed",
+						result.error.take().or(result.content.take()).unwrap_or_else(|| {
+							"host rejected the URI operation".into()
+						}),
+					));
+				}
+				if operation == HostUriOperation::Read && result.content.is_none() {
+					result.content = Some(String::new());
+				}
+				result.immutable = result.immutable.or(Some(immutable));
+				Ok(result)
+			},
+		}
+	}
+
+	fn resolve(&self, mut result: HostUriResult) -> miette::Result<bool> {
+		let invalid_metadata = result.notes.len() > MAX_HOST_URI_NOTES
+			|| result
+				.notes
+				.iter()
+				.any(|note| note.len() > MAX_HOST_URI_NOTE_BYTES)
+			|| result
+				.content_type
+				.as_ref()
+				.is_some_and(|content_type| content_type.as_str().is_empty());
+		let pending = {
+			let mut state = self.state.lock();
+			if state.generation != result.generation
+				|| state
+					.pending
+					.get(&result.id)
+					.is_none_or(|pending| pending.generation != result.generation)
+			{
+				return Ok(false);
+			}
+			state.pending.remove(&result.id)
+		};
+		let Some(pending) = pending else {
+			return Ok(false);
+		};
+		if invalid_metadata {
+			result.content = None;
+			result.content_type = None;
+			result.notes.clear();
+			result.immutable = None;
+			result.is_error = true;
+			result.error = Some("host URI result metadata exceeds the protocol bounds".into());
+		}
+		Ok(pending.settle.send(result).is_ok())
+	}
+
+	fn shutdown(&self, _reason: &str) -> miette::Result<()> {
+		let pending = {
+			let mut state = self.state.lock();
+			state.schemes.clear();
+			std::mem::take(&mut state.pending)
+		};
+		for (target_id, pending) in pending {
+			self.emit_cancel(pending.generation, target_id)?;
+		}
+		Ok(())
+	}
+
+	fn emit_cancel(&self, generation: u64, target_id: String) -> miette::Result<()> {
+		let frame = HostUriCancel {
+			kind: "host_uri_cancel".into(),
+			id: format!("host-uri-cancel-{}", self.sequence.fetch_add(1, Ordering::Relaxed)),
+			generation,
+			target_id,
+		};
+		emit(&self.output, serde_json::to_value(frame).into_diagnostic()?)
+	}
+}
+
+fn normalize_host_uri_scheme(raw: &str) -> Result<String, CommandError> {
+	let scheme = raw.trim().to_ascii_lowercase();
+	let mut bytes = scheme.bytes();
+	if scheme.is_empty()
+		|| scheme.len() > MAX_HOST_URI_SCHEME_BYTES
+		|| !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+		|| !bytes
+			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"+.-".contains(&byte))
+	{
+		return Err(CommandError::new(
+			"invalid_host_uri_scheme",
+			"host URI schemes must match ^[a-z][a-z0-9+.-]*$",
+		));
+	}
+	if RESERVED_HOST_URI_SCHEMES
+		.binary_search(&scheme.as_str())
+		.is_ok()
+	{
+		return Err(CommandError::new(
+			"reserved_host_uri_scheme",
+			format!("host URI scheme is owned by the environment: {scheme}://"),
+		));
+	}
+	Ok(scheme)
+}
+
+#[derive(Default)]
+struct ShutdownCoordinator {
+	tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl ShutdownCoordinator {
+	fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+		self.tasks.lock().push(tokio::spawn(future));
+	}
+
+	async fn shutdown(&self) {
+		let tasks = std::mem::take(&mut *self.tasks.lock());
+		for mut task in tasks {
+			if tokio::time::timeout(Duration::from_secs(1), &mut task)
+				.await
+				.is_err()
+			{
+				task.abort();
+				let _ = task.await;
+			}
+		}
+	}
+}
+
 struct Runtime {
-	registry:   Registry,
-	output:     Sender<Value>,
-	negotiated: Arc<AtomicU8>,
-	state:      Mutex<ServerState>,
+	registry:       Registry,
+	auth:           AuthManager,
+	commands:       crate::chat_ui::commands::CommandRoster,
+	output:         Sender<Value>,
+	host_resources: Arc<HostResourceBroker>,
+	shutdown:       ShutdownCoordinator,
+	negotiated:     Arc<AtomicU8>,
+	state:          Mutex<ServerState>,
 }
 
 impl Runtime {
@@ -291,6 +698,9 @@ impl Runtime {
 		if request.command == "bash" {
 			return self.start_bash(request);
 		}
+		if request.command == "login" {
+			return self.handle_login(request).await;
+		}
 		let id = request.id.clone();
 		let command = request.command.clone();
 		let result = self.execute(&command, &request.params).await;
@@ -300,7 +710,7 @@ impl Runtime {
 		}
 	}
 
-	fn handle_immediate(self: &Arc<Self>, value: Value) -> miette::Result<()> {
+	async fn handle_immediate(self: &Arc<Self>, value: Value) -> miette::Result<()> {
 		match value.get("type").and_then(Value::as_str) {
 			Some("bash") => {
 				let request = match serde_json::from_value::<RpcRequest>(value) {
@@ -342,6 +752,46 @@ impl Runtime {
 			},
 			Some("host_tool_update" | "host_tool_result" | "host_tool_cancel") => {
 				self.handle_side_channel(value)
+			},
+			Some("host_uri_result") => {
+				let result = match serde_json::from_value::<HostUriResult>(value) {
+					Ok(result) => result,
+					Err(error) => {
+						return self.send_error(
+							None,
+							"host_uri_result",
+							"invalid_request",
+							error.to_string(),
+						);
+					},
+				};
+				if self.host_resources.resolve(result)? {
+					Ok(())
+				} else {
+					self.send_error(
+						None,
+						"host_uri_result",
+						"stale_host_uri_result",
+						"host URI result is stale or unknown",
+					)
+				}
+			},
+			Some("auth_answer") => {
+				let answer = match serde_json::from_value::<RpcAuthAnswerFrame>(value) {
+					Ok(answer) => answer,
+					Err(error) => {
+						return self.send_error(
+							None,
+							"auth_answer",
+							"invalid_request",
+							error.to_string(),
+						);
+					},
+				};
+				match self.answer_auth(answer).await {
+					Ok(()) => Ok(()),
+					Err(error) => self.send_error(None, "auth_answer", error.code, error.message),
+				}
 			},
 			_ => self.send_error(None, "side_channel", "invalid_request", "unknown immediate frame"),
 		}
@@ -387,7 +837,7 @@ impl Runtime {
 			},
 		};
 		let runtime = self.clone();
-		tokio::spawn(async move {
+		self.shutdown.spawn(async move {
 			let data = tokio::select! {
 				() = cancellation.cancelled() => {
 					json!({
@@ -472,11 +922,27 @@ impl Runtime {
 					.get("streamingBehavior")
 					.and_then(Value::as_str)
 					.unwrap_or("prompt");
-				self.submit_prompt(text, behavior)?;
-				self
-					.notify(json!({ "type": "prompt_result", "invoked": true }))
-					.map_err(CommandError::transport)?;
-				Ok(json!({ "invoked": true }))
+				match self.intercept_command(&text).await? {
+					CommandIntercept::Passthrough => {
+						self.submit_prompt(text, behavior)?;
+						self
+							.notify(json!({ "type": "prompt_result", "invoked": true }))
+							.map_err(CommandError::transport)?;
+						Ok(json!({ "invoked": true }))
+					},
+					CommandIntercept::Prompt(prompt) => {
+						self.submit_prompt(prompt, behavior)?;
+						self
+							.notify(json!({ "type": "prompt_result", "invoked": true }))
+							.map_err(CommandError::transport)?;
+						Ok(json!({ "invoked": true, "command": true }))
+					},
+					CommandIntercept::Consumed => Ok(json!({ "invoked": false, "command": true })),
+					CommandIntercept::Exit => {
+						let _ = self.abort(false, None)?;
+						Ok(json!({ "invoked": false, "command": true, "exit": true }))
+					},
+				}
 			},
 			"steer" => {
 				let message = text(params, "message")
@@ -545,19 +1011,87 @@ impl Runtime {
 			"handoff" => self.handoff(params),
 			"export_html" => self.export_html(),
 			"get_login_providers" => self.login_providers(),
-			"login" => self.login(params),
 			"set_host_tools" => self.set_host_tools(params),
 			"call_host_tool" => self.call_host_tool(params),
+			"set_host_uri_schemes" => self.host_resources.replace(params),
 			"set_subagent_subscription" => self.set_subscription(params),
 			"get_subagents" => self.get_subagents(),
 			"get_subagent_messages" => self.get_subagent_messages(params).await,
-			"get_available_commands" => Ok(json!({ "commands": supported_commands() })),
+			"get_available_commands" => Ok(self.available_commands_value()),
 			"bash" | "abort_bash" => Err(CommandError::new(
 				"invalid_request",
 				"shell commands must be dispatched through the asynchronous command path",
 			)),
 			_ => Err(CommandError::new("unknown_command", format!("unknown RPC command `{command}`"))),
 		}
+	}
+
+	async fn intercept_command(
+		self: &Arc<Self>,
+		text: &str,
+	) -> Result<CommandIntercept, CommandError> {
+		use crate::chat_ui::commands::{CommandResult, CommandSurface, DispatchResult};
+		let mut host = RpcCommandHost { runtime: self.clone(), roster: self.commands.clone() };
+		let dispatched = self
+			.commands
+			.dispatch(text, CommandSurface::Text, &mut host)
+			.await
+			.map_err(|error| CommandError::new("command_failed", error.to_string()))?;
+		match dispatched {
+			DispatchResult::Passthrough(_) => Ok(CommandIntercept::Passthrough),
+			DispatchResult::Handled(CommandResult::Prompt(prompt)) => {
+				Ok(CommandIntercept::Prompt(prompt.text.to_string()))
+			},
+			DispatchResult::Handled(CommandResult::Consumed(result)) => {
+				if let Some(status) = result.status {
+					self
+						.notify(json!({
+							"type": "command_output",
+							"stream": "stdout",
+							"content": status.as_str(),
+							"generation": 0,
+						}))
+						.map_err(CommandError::transport)?;
+				}
+				Ok(CommandIntercept::Consumed)
+			},
+			DispatchResult::Handled(CommandResult::Exit) => Ok(CommandIntercept::Exit),
+		}
+	}
+
+	fn available_commands_value(&self) -> Value {
+		use crate::chat_ui::commands::{CommandCapability, CommandRole, CommandSurface};
+		let commands = self
+			.commands
+			.advertised(CommandSurface::Text, CommandRole::Owner, true, |capability| {
+				matches!(capability, CommandCapability::Session)
+			})
+			.into_iter()
+			.map(|command| {
+				json!({
+					"name": command.name.as_str(),
+					"description": command.description.as_str(),
+					"argumentHint": command.argument_hint.as_ref().map(Str::as_str),
+					"source": command.provenance.source.as_str(),
+					"generation": command.provenance.generation,
+				})
+			})
+			.collect::<Vec<_>>();
+		let generation = commands
+			.iter()
+			.filter_map(|command| command.get("generation").and_then(Value::as_u64))
+			.max()
+			.unwrap_or(0);
+		json!({ "generation": generation, "commands": commands })
+	}
+
+	fn notify_available_commands(&self) -> miette::Result<()> {
+		let mut frame = self.available_commands_value();
+		frame
+			.as_object_mut()
+			.expect("available command projection is an object")
+			.insert("type".into(), Value::String("available_commands_update".into()));
+		self.notify(frame)
 	}
 
 	fn submit_prompt(self: &Arc<Self>, message: String, behavior: &str) -> Result<(), CommandError> {
@@ -580,7 +1114,9 @@ impl Runtime {
 		state.active = Some(cancellation.clone());
 		drop(state);
 		let runtime = self.clone();
-		tokio::spawn(async move { runtime.conversation_loop(message, cancellation).await });
+		self
+			.shutdown
+			.spawn(async move { runtime.conversation_loop(message, cancellation).await });
 		Ok(())
 	}
 
@@ -633,7 +1169,7 @@ impl Runtime {
 		let mut events = match client.execute(request).await {
 			Ok(events) => events,
 			Err(error) => {
-				self.notify(json!({ "type": "agent_end", "sessionId": session_id, "error": error.to_string(), "aborted": false }))
+				self.notify(json!({ "type": "agent_end", "sessionId": session_id, "outcome": RpcTurnOutcome::Fault, "error": error.to_string(), "aborted": false }))
 					.map_err(CommandError::transport)?;
 				return Err(CommandError::new("inference_error", error.to_string()));
 			},
@@ -641,6 +1177,7 @@ impl Runtime {
 		let mut assistant = String::new();
 		let mut completed = false;
 		let mut aborted = false;
+		let mut fault = false;
 		loop {
 			tokio::select! {
 				() = cancellation.cancelled() => {
@@ -662,6 +1199,7 @@ impl Runtime {
 						Ok(ChatEvent::Completed(_)) => completed = true,
 						Ok(_) => {},
 						Err(error) => {
+							fault = true;
 							self.notify(json!({ "type": "agent_event", "event": { "type": "error", "message": error.to_string() }, "sessionId": session_id }))
 								.map_err(CommandError::transport)?;
 							break;
@@ -675,9 +1213,17 @@ impl Runtime {
 		{
 			session.push_message("assistant", &assistant);
 		}
+		let outcome = if aborted {
+			RpcTurnOutcome::CallerAbort
+		} else if completed && !fault {
+			RpcTurnOutcome::Success
+		} else {
+			RpcTurnOutcome::Fault
+		};
 		self.notify(json!({
 			"type": "agent_end",
 			"sessionId": session_id,
+			"outcome": outcome,
 			"aborted": aborted,
 			"completed": completed,
 			"message": if assistant.is_empty() { Value::Null } else { json!({ "role": "assistant", "content": assistant }) },
@@ -1063,24 +1609,246 @@ impl Runtime {
 		Ok(oauth_providers_value(&state.providers))
 	}
 
-	fn login(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
-		let params = parse_params::<LoginParams>(params)?;
-		let state = self.state.lock();
-		if !state
+	async fn handle_login(self: &Arc<Self>, request: RpcRequest) -> miette::Result<()> {
+		let params = match parse_params::<LoginParams>(&request.params) {
+			Ok(params) => params,
+			Err(error) => {
+				return self.send_error(request.id, "login", error.code, error.message);
+			},
+		};
+		if !self
+			.state
+			.lock()
 			.providers
 			.iter()
 			.any(|candidate| candidate.id == params.provider_id)
 		{
-			return Err(CommandError::new(
+			return self.send_error(
+				request.id,
+				"login",
 				"provider_not_found",
 				format!("unknown provider `{}`", params.provider_id),
-			));
+			);
 		}
-		Err(CommandError::new(
-			"interactive_login_required",
-			"this provider login requires an interactive authentication exchange; use `omp auth \
-			 login`",
-		))
+		let provider = ProviderId::from(params.provider_id.as_str());
+		let method = params.method.map(auth_method);
+		let answer = self
+			.auth
+			.execute(AuthRequest::Login(LoginRequest { provider, method }))
+			.await;
+		let session = match answer {
+			Ok(AuthAnswer::Session(session)) => session,
+			Ok(_) => {
+				return self.send_error(
+					request.id,
+					"login",
+					"invalid_auth_answer",
+					"authentication manager returned a non-session login answer",
+				);
+			},
+			Err(error) => {
+				return self.send_error(request.id, "login", "auth_failed", error.to_string());
+			},
+		};
+		let session_id = session.id.as_str().to_owned();
+		{
+			let mut state = self.state.lock();
+			if state.pending_auth.contains_key(&session_id) {
+				return self.send_error(
+					request.id,
+					"login",
+					"auth_session_exists",
+					"authentication session is already active",
+				);
+			}
+			state.pending_auth.insert(session_id.clone(), PendingAuth {
+				cancellation: CancellationToken::new(),
+				prompt:       None,
+			});
+		}
+		self.send_success(
+			request.id,
+			"login",
+			json!({
+				"providerId": params.provider_id,
+				"sessionId": session_id,
+				"outcome": "started",
+			}),
+		)?;
+		self.start_auth_forwarder(session);
+		Ok(())
+	}
+
+	fn start_auth_forwarder(self: &Arc<Self>, session: AuthSession) {
+		let session_id = session.id.as_str().to_owned();
+		let cancellation = self
+			.state
+			.lock()
+			.pending_auth
+			.get(&session_id)
+			.map(|pending| pending.cancellation.clone())
+			.expect("authentication session inserted before forwarding");
+		let runtime = self.clone();
+		self.shutdown.spawn(async move {
+			loop {
+				let event = tokio::select! {
+					() = cancellation.cancelled() => {
+						let _ = runtime.auth.execute(AuthRequest::Submit {
+							session: LoginSessionId::from(session_id.as_str()),
+							input: AuthInput::Cancel,
+						}).await;
+						let _ = runtime.notify_auth_terminal(
+							&session_id,
+							RpcAuthTerminalOutcome::Cancelled,
+							None,
+							None,
+						);
+						break;
+					},
+					event = session.events.recv_async() => event,
+				};
+				let event = match event {
+					Ok(Ok(event)) => event,
+					Ok(Err(error)) => {
+						let _ = runtime.notify_auth_terminal(
+							&session_id,
+							RpcAuthTerminalOutcome::Failed,
+							None,
+							Some(error.to_string()),
+						);
+						break;
+					},
+					Err(_) => {
+						let _ = runtime.notify_auth_terminal(
+							&session_id,
+							RpcAuthTerminalOutcome::Failed,
+							None,
+							Some("authentication event stream closed before completion".into()),
+						);
+						break;
+					},
+				};
+				match event {
+					AuthEvent::OpenUrl(url) => {
+						let _ = runtime.notify_auth_event(&session_id, RpcAuthEvent::OpenUrl {
+							url: url.to_string(),
+						});
+					},
+					AuthEvent::ShowDeviceCode { code, verification_url } => {
+						let _ = runtime.notify_auth_event(&session_id, RpcAuthEvent::DeviceCode {
+							code:             code.expose_secret().to_owned(),
+							verification_url: verification_url.to_string(),
+						});
+					},
+					AuthEvent::Prompt(prompt) => {
+						let input = auth_prompt_kind(prompt.input);
+						if let Some(pending) = runtime.state.lock().pending_auth.get_mut(&session_id) {
+							pending.prompt = Some((prompt.id.to_string(), input));
+						}
+						let _ = runtime.notify_auth_event(&session_id, RpcAuthEvent::Prompt {
+							prompt_id: prompt.id.to_string(),
+							message: prompt.message.to_string(),
+							input,
+						});
+					},
+					AuthEvent::Waiting => {
+						let _ = runtime.notify_auth_event(&session_id, RpcAuthEvent::Waiting);
+					},
+					AuthEvent::Complete(account) => {
+						if let Some(provider) = runtime
+							.state
+							.lock()
+							.providers
+							.iter_mut()
+							.find(|provider| provider.id == account.provider.as_str())
+						{
+							provider.authenticated = true;
+						}
+						let _ = runtime.notify_auth_terminal(
+							&session_id,
+							RpcAuthTerminalOutcome::Completed,
+							Some(auth_account(account)),
+							None,
+						);
+						break;
+					},
+				}
+			}
+			runtime.state.lock().pending_auth.remove(&session_id);
+		});
+	}
+
+	async fn answer_auth(&self, answer: RpcAuthAnswerFrame) -> Result<(), CommandError> {
+		let expected = self
+			.state
+			.lock()
+			.pending_auth
+			.get(&answer.session_id)
+			.map(|pending| pending.prompt.clone())
+			.ok_or_else(|| {
+				CommandError::new("auth_session_not_found", "authentication session is not active")
+			})?;
+		if answer.input != RpcAuthInputKind::Cancel {
+			let (prompt_id, prompt_kind) = expected.ok_or_else(|| {
+				CommandError::new(
+					"auth_prompt_not_pending",
+					"authentication prompt is not awaiting input",
+				)
+			})?;
+			if answer.prompt_id.as_deref() != Some(prompt_id.as_str()) {
+				return Err(CommandError::new(
+					"stale_auth_prompt",
+					"authentication answer does not match the pending prompt",
+				));
+			}
+			if !auth_input_matches(answer.input, prompt_kind) {
+				return Err(CommandError::new(
+					"invalid_auth_input",
+					"authentication answer kind does not match the pending prompt",
+				));
+			}
+		}
+		let input = rpc_auth_input(answer.input, answer.value)?;
+		self
+			.auth
+			.execute(AuthRequest::Submit {
+				session: LoginSessionId::from(answer.session_id.as_str()),
+				input,
+			})
+			.await
+			.map_err(|error| CommandError::new("auth_failed", error.to_string()))?;
+		if answer.input == RpcAuthInputKind::Cancel {
+			if let Some(pending) = self.state.lock().pending_auth.get(&answer.session_id) {
+				pending.cancellation.cancel();
+			}
+		} else if let Some(pending) = self.state.lock().pending_auth.get_mut(&answer.session_id) {
+			pending.prompt = None;
+		}
+		Ok(())
+	}
+
+	fn notify_auth_event(&self, session_id: &str, event: RpcAuthEvent) -> miette::Result<()> {
+		let frame =
+			RpcAuthEventFrame { kind: "auth_event".into(), session_id: session_id.to_owned(), event };
+		self.notify(serde_json::to_value(frame).into_diagnostic()?)
+	}
+
+	fn notify_auth_terminal(
+		&self,
+		session_id: &str,
+		outcome: RpcAuthTerminalOutcome,
+		account: Option<RpcAuthAccount>,
+		error: Option<String>,
+	) -> miette::Result<()> {
+		let frame = RpcAuthTerminalFrame {
+			kind: "auth_terminal".into(),
+			session_id: session_id.to_owned(),
+			outcome,
+			account,
+			code: error.as_ref().map(|_| RpcErrorCode::new("auth_failed")),
+			error,
+		};
+		self.notify(serde_json::to_value(frame).into_diagnostic()?)
 	}
 
 	fn set_host_tools(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
@@ -1381,6 +2149,305 @@ impl Runtime {
 	}
 }
 
+struct RpcCommandHost {
+	runtime: Arc<Runtime>,
+	roster:  crate::chat_ui::commands::CommandRoster,
+}
+
+fn command_status<'a>(status: impl Into<Str>) -> crate::chat_ui::commands::CommandFuture<'a> {
+	let status = status.into();
+	Box::pin(async move {
+		Ok(crate::chat_ui::commands::CommandResult::Consumed(
+			crate::chat_ui::commands::ConsumedResult::status(status),
+		))
+	})
+}
+
+fn unavailable_command<'a>(name: &'static str) -> crate::chat_ui::commands::CommandFuture<'a> {
+	Box::pin(async move { Err(miette!("command /{name} is unavailable in this RPC session")) })
+}
+
+impl crate::chat_ui::commands::ShellCommandHost for RpcCommandHost {
+	fn help(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		use crate::chat_ui::commands::{CommandCapability, CommandRole, CommandSurface};
+		command_status(self.roster.help_text(
+			CommandSurface::Text,
+			CommandRole::Owner,
+			true,
+			|capability| matches!(capability, CommandCapability::Session),
+		))
+	}
+
+	fn new_session(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime
+				.new_session(&Map::new())
+				.map_err(|error| miette!(error.message))?;
+			Ok(crate::chat_ui::commands::CommandResult::Consumed(
+				crate::chat_ui::commands::ConsumedResult::status("Started a new session."),
+			))
+		})
+	}
+
+	fn jobs(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("jobs")
+	}
+
+	fn agents(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("agents")
+	}
+
+	fn pause(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("pause")
+	}
+
+	fn quit(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		Box::pin(async { Ok(crate::chat_ui::commands::CommandResult::Exit) })
+	}
+}
+
+impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
+	fn clear(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime.state.lock().current_mut().messages.clear();
+			Ok(crate::chat_ui::commands::CommandResult::Consumed(
+				crate::chat_ui::commands::ConsumedResult::status("Session context cleared."),
+			))
+		})
+	}
+
+	fn fresh(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		self.clear()
+	}
+
+	fn rename(&mut self, title: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime
+				.rename_session(title.as_str())
+				.map_err(|error| miette!(error.message))?;
+			Ok(crate::chat_ui::commands::CommandResult::Consumed(
+				crate::chat_ui::commands::ConsumedResult::status("Session renamed."),
+			))
+		})
+	}
+
+	fn retry(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			let prompt = runtime
+				.state
+				.lock()
+				.current_session()
+				.messages
+				.iter()
+				.rev()
+				.find(|message| message.role == "user")
+				.map(|message| message.content.clone())
+				.ok_or_else(|| miette!("session has no user prompt to retry"))?;
+			runtime
+				.submit_prompt(prompt, "prompt")
+				.map_err(|error| miette!(error.message))?;
+			Ok(crate::chat_ui::commands::CommandResult::Consumed(
+				crate::chat_ui::commands::ConsumedResult::status("Retry started."),
+			))
+		})
+	}
+
+	fn resume(&mut self, selector: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let Some(selector) = selector else {
+			return unavailable_command("resume");
+		};
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime
+				.switch_session(selector.as_str())
+				.map_err(|error| miette!(error.message))?;
+			Ok(crate::chat_ui::commands::CommandResult::Consumed(
+				crate::chat_ui::commands::ConsumedResult::status("Session resumed."),
+			))
+		})
+	}
+
+	fn session(
+		&mut self,
+		request: crate::chat_ui::commands::SessionRequest,
+	) -> crate::chat_ui::commands::CommandFuture<'_> {
+		use crate::chat_ui::commands::SessionRequest;
+		if !matches!(request, SessionRequest::Info) {
+			return unavailable_command("session");
+		}
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			let value = runtime
+				.session_stats()
+				.map_err(|error| miette!(error.message))?;
+			command_status(value.to_string()).await
+		})
+	}
+
+	fn workspace(
+		&mut self,
+		_request: crate::chat_ui::commands::WorkspaceRequest,
+	) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("workspace")
+	}
+}
+
+impl crate::chat_ui::commands::ModelCommandHost for RpcCommandHost {
+	fn model(&mut self, selector: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let Some(selector) = selector else {
+			return unavailable_command("model");
+		};
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime
+				.set_string_config("model", selector.as_str())
+				.map_err(|error| miette!(error.message))?;
+			command_status("Model updated.").await
+		})
+	}
+
+	fn switch(&mut self, selector: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		self.model(Some(selector))
+	}
+}
+
+impl crate::chat_ui::commands::ConfigCommandHost for RpcCommandHost {
+	fn settings(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("settings")
+	}
+
+	fn setup(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("setup")
+	}
+
+	fn providers(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let providers = oauth_providers_value(&self.runtime.state.lock().providers).to_string();
+		command_status(providers)
+	}
+
+	fn login(&mut self, _provider: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("login")
+	}
+
+	fn logout(&mut self, _provider: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("logout")
+	}
+}
+
+impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
+	fn context(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let value = self
+			.runtime
+			.last_assistant()
+			.map_or_else(|error| error.message, |value| value.to_string());
+		command_status(value)
+	}
+
+	fn compact(
+		&mut self,
+		_request: omp_agent::ManualCompactionRequest,
+	) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime.compact().map_err(|error| miette!(error.message))?;
+			command_status("Context compacted.").await
+		})
+	}
+
+	fn shake(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("shake")
+	}
+
+	fn usage(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("usage")
+	}
+
+	fn stats(
+		&mut self,
+		_flags: crate::chat_ui::commands::ParsedFlags,
+	) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("stats")
+	}
+
+	fn plan(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("plan")
+	}
+
+	fn vibe(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("vibe")
+	}
+
+	fn todo(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("todo")
+	}
+
+	fn plan_review(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("plan-review")
+	}
+
+	fn guided_goal(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("guided-goal")
+	}
+
+	fn loop_command(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("loop")
+	}
+
+	fn queue(&mut self, prompt: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime
+				.submit_prompt(prompt.to_string(), "followUp")
+				.map_err(|error| miette!(error.message))?;
+			command_status("Prompt queued.").await
+		})
+	}
+
+	fn force(&mut self, _tool: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("force")
+	}
+
+	fn fast(&mut self, args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let enabled = matches!(args.trim().as_str(), "" | "on" | "true");
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			runtime
+				.set_bool_config("fastMode", enabled)
+				.map_err(|error| miette!(error.message))?;
+			command_status(if enabled {
+				"Fast mode enabled."
+			} else {
+				"Fast mode disabled."
+			})
+			.await
+		})
+	}
+
+	fn prewalk(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("prewalk")
+	}
+
+	fn btw(&mut self, _prompt: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("btw")
+	}
+
+	fn tan(&mut self, _prompt: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("tan")
+	}
+
+	fn omfg(&mut self, _instruction: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("omfg")
+	}
+
+	fn live(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("live")
+	}
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetModelParams {
@@ -1398,6 +2465,8 @@ struct SwitchSessionParams {
 #[serde(rename_all = "camelCase")]
 struct LoginParams {
 	provider_id: String,
+	#[serde(default)]
+	method:      Option<RpcAuthMethod>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1431,9 +2500,21 @@ struct ConfigState {
 	todos:           Vec<Value>,
 }
 
+enum CommandIntercept {
+	Passthrough,
+	Prompt(String),
+	Consumed,
+	Exit,
+}
+
 struct ActiveBash {
 	id:           String,
 	cancellation: CancellationToken,
+}
+
+struct PendingAuth {
+	cancellation: CancellationToken,
+	prompt:       Option<(String, RpcAuthPromptKind)>,
 }
 
 enum HostSideChannel {
@@ -1455,6 +2536,7 @@ struct ServerState {
 	session_dir:        Option<PathBuf>,
 	host_tools:         BTreeMap<String, Value>,
 	pending_host_tools: HashMap<String, PendingHostTool>,
+	pending_auth:       HashMap<String, PendingAuth>,
 	subscription:       Subscription,
 	subagents:          HashMap<String, SubagentSnapshot>,
 	transcript_lru:     VecDeque<(String, u64)>,
@@ -1496,6 +2578,7 @@ impl ServerState {
 			session_dir,
 			host_tools: BTreeMap::new(),
 			pending_host_tools: HashMap::new(),
+			pending_auth: HashMap::new(),
 			subscription: Subscription::Off,
 			subagents: HashMap::new(),
 			transcript_lru: VecDeque::new(),
@@ -1799,6 +2882,97 @@ const fn is_word_byte(byte: u8) -> bool {
 	byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+fn auth_method(method: RpcAuthMethod) -> AuthMethod {
+	match method {
+		RpcAuthMethod::ApiKey => AuthMethod::ApiKey,
+		RpcAuthMethod::OauthPkce => AuthMethod::OAuthPkce,
+		RpcAuthMethod::OauthDevice => AuthMethod::OAuthDevice,
+		RpcAuthMethod::ApplicationDefault => AuthMethod::ApplicationDefault,
+		RpcAuthMethod::AwsCredentialChain => AuthMethod::AwsCredentialChain,
+		RpcAuthMethod::SessionToken => AuthMethod::SessionToken,
+	}
+}
+
+fn auth_prompt_kind(kind: AuthPromptKind) -> RpcAuthPromptKind {
+	match kind {
+		AuthPromptKind::AuthorizationCode => RpcAuthPromptKind::AuthorizationCode,
+		AuthPromptKind::ApiKey => RpcAuthPromptKind::ApiKey,
+		AuthPromptKind::SessionToken => RpcAuthPromptKind::SessionToken,
+		AuthPromptKind::PlainText => RpcAuthPromptKind::PlainText,
+		AuthPromptKind::OptionalSecret => RpcAuthPromptKind::OptionalSecret,
+		AuthPromptKind::Confirmation => RpcAuthPromptKind::Confirmation,
+	}
+}
+
+fn auth_input_matches(input: RpcAuthInputKind, prompt: RpcAuthPromptKind) -> bool {
+	matches!(
+		(input, prompt),
+		(RpcAuthInputKind::AuthorizationCode, RpcAuthPromptKind::AuthorizationCode)
+			| (RpcAuthInputKind::ApiKey, RpcAuthPromptKind::ApiKey)
+			| (RpcAuthInputKind::SessionToken, RpcAuthPromptKind::SessionToken)
+			| (RpcAuthInputKind::PlainText, RpcAuthPromptKind::PlainText)
+			| (RpcAuthInputKind::OptionalSecret, RpcAuthPromptKind::OptionalSecret)
+			| (RpcAuthInputKind::DeviceConfirmed, RpcAuthPromptKind::Confirmation)
+			| (RpcAuthInputKind::CallbackUrl, RpcAuthPromptKind::AuthorizationCode)
+	)
+}
+
+fn rpc_auth_input(
+	kind: RpcAuthInputKind,
+	value: Option<String>,
+) -> Result<AuthInput, CommandError> {
+	let required = |value: Option<String>| {
+		value.ok_or_else(|| {
+			CommandError::new("invalid_auth_input", "authentication input requires a value")
+		})
+	};
+	match kind {
+		RpcAuthInputKind::AuthorizationCode => {
+			Ok(AuthInput::AuthorizationCode(SecretString::from(required(value)?)))
+		},
+		RpcAuthInputKind::ApiKey => Ok(AuthInput::ApiKey(SecretString::from(required(value)?))),
+		RpcAuthInputKind::SessionToken => {
+			Ok(AuthInput::SessionToken(SecretString::from(required(value)?)))
+		},
+		RpcAuthInputKind::CallbackUrl => {
+			Ok(AuthInput::CallbackUrl(SecretString::from(required(value)?)))
+		},
+		RpcAuthInputKind::PlainText => Ok(AuthInput::PlainText(Str::from(required(value)?))),
+		RpcAuthInputKind::OptionalSecret => {
+			Ok(AuthInput::OptionalSecret(SecretString::from(value.unwrap_or_default())))
+		},
+		RpcAuthInputKind::DeviceConfirmed => {
+			if value.is_some() {
+				return Err(CommandError::new(
+					"invalid_auth_input",
+					"device confirmation does not accept a value",
+				));
+			}
+			Ok(AuthInput::DeviceConfirmed)
+		},
+		RpcAuthInputKind::Cancel => {
+			if value.is_some() {
+				return Err(CommandError::new(
+					"invalid_auth_input",
+					"authentication cancellation does not accept a value",
+				));
+			}
+			Ok(AuthInput::Cancel)
+		},
+	}
+}
+
+fn auth_account(account: AccountSummary) -> RpcAuthAccount {
+	RpcAuthAccount {
+		account_id:  account.account.as_str().to_owned(),
+		provider_id: account.provider.as_str().to_owned(),
+		principal:   account
+			.principal
+			.map(|principal| principal.as_str().to_owned()),
+		label:       account.label.map(|label| label.to_string()),
+	}
+}
+
 fn oauth_providers_value(providers: &[OAuthProvider]) -> Value {
 	json!({ "providers": providers })
 }
@@ -1949,6 +3123,7 @@ const fn supported_commands() -> &'static [&'static str] {
 		"login",
 		"set_host_tools",
 		"call_host_tool",
+		"set_host_uri_schemes",
 		"set_subagent_subscription",
 		"get_subagents",
 		"get_subagent_messages",

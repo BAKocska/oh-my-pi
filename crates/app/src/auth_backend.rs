@@ -3,20 +3,149 @@
 use std::{
 	io::{self, IsTerminal as _, Write as _},
 	path::PathBuf,
+	time::Duration,
 };
 
 use miette::{IntoDiagnostic as _, Result, miette};
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-use omp_core::ExposeSecret as _;
+use omp_core::{EnvPath, ExposeSecret as _, SecretString, Str};
+use omp_env::{EnvClient, ExecEvent};
 use omp_llm_catalog::ProviderId;
 use omp_llm_inference::{
 	Client,
 	answer::{AuthAnswer, AuthEvent, AuthPrompt, AuthPromptKind, AuthResponse},
+	auth::{CommandCredentialError, CommandCredentialExecutor, CommandExecutionFuture},
 	call::{AuthInput, AuthRequest, CallMeta, LoginRequest, Target},
 	id::{AccountId, RequestId},
 	receipt::ExecutionBudget,
 };
+use omp_proto::env::v1::{
+	CloseSessionRequest, ExecOutcome, ExecRequest, OpenSessionRequest, OutputChannel, Script,
+};
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
+
+pub(crate) use crate::envd::mcp::auth_authority::{CombinedAuthAuthority, CredentialAuthority};
+
+/// Composes provider and MCP leasing over the one encrypted credential store.
+#[must_use]
+pub(crate) fn combined_authority(
+	store: std::sync::Arc<omp_llm_inference::auth::CredentialStore>,
+) -> CombinedAuthAuthority {
+	CombinedAuthAuthority::new(store)
+}
+
+/// Environment-backed executor for `!command` credential sources.
+#[derive(Clone, Debug)]
+pub(crate) struct EnvCommandCredentialExecutor {
+	client:     EnvClient,
+	cwd:        EnvPath,
+	timeout:    Duration,
+	max_stdout: usize,
+}
+
+impl EnvCommandCredentialExecutor {
+	/// Creates a bounded command credential executor rooted at `cwd`.
+	#[must_use]
+	pub(crate) const fn new(
+		client: EnvClient,
+		cwd: EnvPath,
+		timeout: Duration,
+		max_stdout: usize,
+	) -> Self {
+		Self { client, cwd, timeout, max_stdout }
+	}
+
+	async fn execute_inner(
+		&self,
+		command: Str,
+		cancellation: CancellationToken,
+	) -> Result<SecretString, CommandCredentialError> {
+		let opened = self
+			.client
+			.open_session(&self.cwd, OpenSessionRequest::default())
+			.await
+			.map_err(|_| CommandCredentialError::Execution)?;
+		let session = opened.session.clone();
+		let run = self
+			.client
+			.exec(ExecRequest {
+				session: opened.session,
+				source: Some(Script { text: command.to_string(), ..Script::default() }),
+				..ExecRequest::default()
+			})
+			.await;
+		let result = match run {
+			Ok(mut run) => {
+				let mut stdout = Zeroizing::new(Vec::new());
+				loop {
+					let event = tokio::select! {
+						() = cancellation.cancelled() => {
+							Err(CommandCredentialError::Cancelled)
+						},
+						event = tokio::time::timeout(self.timeout, run.next_event()) => {
+							match event {
+								Ok(event) => event.map_err(|_| CommandCredentialError::Execution),
+								Err(_) => Err(CommandCredentialError::Timeout),
+							}
+						},
+					};
+					let event = match event {
+						Ok(event) => event,
+						Err(error) => break Err(error),
+					};
+					match event {
+						Some(ExecEvent::Output(frame))
+							if frame.channel == OutputChannel::Stdout as i32 =>
+						{
+							if stdout.len().saturating_add(frame.data.len()) > self.max_stdout {
+								break Err(CommandCredentialError::OutputTooLarge);
+							}
+							stdout.extend_from_slice(&frame.data);
+						},
+						Some(ExecEvent::Exit(exit)) => {
+							let Some(status) = exit.status else {
+								break Err(CommandCredentialError::Execution);
+							};
+							if status.outcome == ExecOutcome::Timeout as i32 {
+								break Err(CommandCredentialError::Timeout);
+							}
+							if status.outcome == ExecOutcome::Cancelled as i32 {
+								break Err(CommandCredentialError::Cancelled);
+							}
+							if status.outcome != ExecOutcome::Exited as i32 || status.exit_code != Some(0)
+							{
+								break Err(CommandCredentialError::Execution);
+							}
+							let text = std::str::from_utf8(&stdout)
+								.map_err(|_| CommandCredentialError::InvalidUtf8)?;
+							let trimmed = text.trim();
+							if trimmed.is_empty() {
+								break Err(CommandCredentialError::Empty);
+							}
+							break Ok(SecretString::from(trimmed));
+						},
+						Some(ExecEvent::Started(_) | ExecEvent::Output(_)) => {},
+						None => break Err(CommandCredentialError::Execution),
+					}
+				}
+			},
+			Err(_) => Err(CommandCredentialError::Execution),
+		};
+		let _ = self
+			.client
+			.close_session(CloseSessionRequest { session, ..CloseSessionRequest::default() })
+			.await;
+		result
+	}
+}
+
+impl CommandCredentialExecutor for EnvCommandCredentialExecutor {
+	fn execute(&self, command: Str, cancellation: CancellationToken) -> CommandExecutionFuture {
+		let executor = self.clone();
+		Box::pin(async move { executor.execute_inner(command, cancellation).await })
+	}
+}
 
 use crate::cli::AuthCommand;
 

@@ -28,11 +28,14 @@ use crate::{
 	},
 	protocol::{
 		Environment, EventCategory, ExtensionUiResponse, HostToolCall, HostToolCancel,
-		HostToolDefinition, HostToolResult, HostToolUpdate, NegotiateProtocolParams,
-		NegotiateProtocolResult, NewSessionParams, OAuthProvider, PROTOCOL_V1, PROTOCOL_V2,
-		PromptParams, ProtocolVersion, ReadyFrame, RequestId, RpcErrorCode, RpcEvent, RpcRequest,
-		RpcResponse, SubagentMessages, SubagentSnapshot, SubscriptionLevel, TranscriptCursorError,
-		TranscriptPage, TranscriptPageParams,
+		HostToolDefinition, HostToolResult, HostToolUpdate, HostUriCancel, HostUriContentType,
+		HostUriOperation, HostUriRequest, HostUriResult, HostUriScheme,
+		MAX_HOST_URI_DESCRIPTION_BYTES, MAX_HOST_URI_SCHEME_BYTES, MAX_HOST_URI_SCHEMES,
+		NegotiateProtocolParams, NegotiateProtocolResult, NewSessionParams, OAuthProvider,
+		PROTOCOL_V1, PROTOCOL_V2, PromptParams, ProtocolVersion, ReadyFrame, RequestId,
+		RpcAuthAnswerFrame, RpcAuthMethod, RpcErrorCode, RpcEvent, RpcRequest, RpcResponse,
+		SubagentMessages, SubagentSnapshot, SubscriptionLevel, TranscriptCursorError, TranscriptPage,
+		TranscriptPageParams,
 	},
 };
 
@@ -236,6 +239,136 @@ impl ClientHostTool {
 	}
 }
 
+/// Context passed to a host-resource handler.
+#[derive(Clone, Debug)]
+pub struct HostUriContext {
+	cancellation: watch::Receiver<bool>,
+}
+
+impl HostUriContext {
+	/// Returns whether the server cancelled this operation.
+	pub fn is_cancelled(&self) -> bool {
+		*self.cancellation.borrow()
+	}
+
+	/// Resolves when the server cancels this operation.
+	pub async fn cancelled(&mut self) {
+		if *self.cancellation.borrow() {
+			return;
+		}
+		while self.cancellation.changed().await.is_ok() {
+			if *self.cancellation.borrow() {
+				return;
+			}
+		}
+	}
+}
+
+/// Result returned by a host-resource handler.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostUriResponse {
+	/// Resolved read content or optional error context.
+	pub content:      Option<String>,
+	/// Resolved content type.
+	pub content_type: Option<HostUriContentType>,
+	/// Caller-facing resolution notes.
+	pub notes:        Vec<String>,
+	/// Per-resolution immutable override.
+	pub immutable:    Option<bool>,
+	/// Whether the operation failed.
+	pub is_error:     bool,
+	/// Preferred failure description.
+	pub error:        Option<String>,
+}
+
+impl HostUriResponse {
+	/// Creates a successful plain-text read response.
+	pub fn text(content: impl Into<String>) -> Self {
+		Self {
+			content: Some(content.into()),
+			content_type: Some(HostUriContentType::new(HostUriContentType::TEXT)),
+			..Self::default()
+		}
+	}
+
+	/// Creates a terminal host-resource failure.
+	pub fn error(error: impl Into<String>) -> Self {
+		Self { is_error: true, error: Some(error.into()), ..Self::default() }
+	}
+}
+
+/// Host-resource implementation stored by the SDK.
+///
+/// The handler owns both read and write dispatch so one registration and one
+/// cancellation context fence the complete scheme generation.
+pub trait HostUriHandler: Send + Sync + 'static {
+	/// Starts one host-resource operation.
+	fn start(
+		&self,
+		operation: HostUriOperation,
+		url: String,
+		content: Option<String>,
+		context: HostUriContext,
+	) -> JoinHandle<HostUriResponse>;
+}
+
+impl<F> HostUriHandler for F
+where
+	F: Fn(HostUriOperation, String, Option<String>, HostUriContext) -> JoinHandle<HostUriResponse>
+		+ Send
+		+ Sync
+		+ 'static,
+{
+	fn start(
+		&self,
+		operation: HostUriOperation,
+		url: String,
+		content: Option<String>,
+		context: HostUriContext,
+	) -> JoinHandle<HostUriResponse> {
+		self(operation, url, content, context)
+	}
+}
+
+/// One host-owned URI scheme paired with its asynchronous handler.
+#[derive(Clone)]
+pub struct ClientHostUriScheme {
+	/// Scheme declaration advertised through `set_host_uri_schemes`.
+	pub definition: HostUriScheme,
+	/// Handler invoked for read and declared-writable operations.
+	pub handler:    Arc<dyn HostUriHandler>,
+}
+
+impl std::fmt::Debug for ClientHostUriScheme {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("ClientHostUriScheme")
+			.field("definition", &self.definition)
+			.finish_non_exhaustive()
+	}
+}
+
+impl ClientHostUriScheme {
+	/// Pairs a scheme declaration with its asynchronous handler.
+	pub fn new<H>(definition: HostUriScheme, handler: H) -> Self
+	where
+		H: HostUriHandler,
+	{
+		Self { definition, handler: Arc::new(handler) }
+	}
+}
+
+#[derive(Clone, Default)]
+struct HostUriRegistry {
+	generation: u64,
+	schemes:    HashMap<String, ClientHostUriScheme>,
+}
+
+struct HostUriCancellation {
+	generation: u64,
+	sender:     watch::Sender<bool>,
+}
+
 /// Filtered typed subscription over the client's event broadcast.
 pub struct EventStream {
 	receiver: broadcast::Receiver<RpcEvent>,
@@ -275,6 +408,8 @@ struct ClientState {
 	extension_ui:       broadcast::Sender<crate::protocol::ExtensionUiRequest>,
 	host_tools:         RwLock<HashMap<String, Arc<dyn HostToolHandler>>>,
 	host_cancellations: Mutex<HashMap<String, watch::Sender<bool>>>,
+	host_uri_schemes:   RwLock<HostUriRegistry>,
+	host_uri_active:    Mutex<HashMap<String, HostUriCancellation>>,
 	ready:              Mutex<Option<oneshot::Sender<ReadyFrame>>>,
 	protocol:           AtomicU8,
 	sequence:           AtomicU64,
@@ -331,6 +466,20 @@ impl ClientState {
 				let cancel: HostToolCancel = serde_json::from_value(value)?;
 				if let Some(sender) = self.host_cancellations.lock().await.get(&cancel.target_id) {
 					let _ = sender.send(true);
+				}
+				return Ok(());
+			},
+			Some("host_uri_request") => {
+				let request: HostUriRequest = serde_json::from_value(value)?;
+				self.start_host_uri(request).await;
+				return Ok(());
+			},
+			Some("host_uri_cancel") => {
+				let cancel: HostUriCancel = serde_json::from_value(value)?;
+				if let Some(active) = self.host_uri_active.lock().await.get(&cancel.target_id)
+					&& active.generation == cancel.generation
+				{
+					let _ = active.sender.send(true);
 				}
 				return Ok(());
 			},
@@ -419,6 +568,91 @@ impl ClientState {
 		});
 	}
 
+	async fn start_host_uri(self: &Arc<Self>, request: HostUriRequest) {
+		let scheme = request
+			.url
+			.split_once(':')
+			.map(|(scheme, _)| scheme)
+			.unwrap_or_default();
+		let handler = {
+			let registry = self.host_uri_schemes.read().await;
+			if registry.generation != request.generation {
+				None
+			} else {
+				registry
+					.schemes
+					.get(scheme)
+					.filter(|registered| {
+						request.operation == HostUriOperation::Read || registered.definition.writable
+					})
+					.map(|registered| Arc::clone(&registered.handler))
+			}
+		};
+		let Some(handler) = handler else {
+			let frame = HostUriResult {
+				kind:         "host_uri_result".into(),
+				id:           request.id,
+				generation:   request.generation,
+				content:      None,
+				content_type: None,
+				notes:        Vec::new(),
+				immutable:    None,
+				is_error:     true,
+				error:        Some("host URI request belongs to a stale or unavailable route".into()),
+			};
+			if let Ok(value) = serde_json::to_value(frame) {
+				let _ = self.send_value(&value).await;
+			}
+			return;
+		};
+
+		let (cancel_tx, cancel_rx) = watch::channel(false);
+		self
+			.host_uri_active
+			.lock()
+			.await
+			.insert(request.id.clone(), HostUriCancellation {
+				generation: request.generation,
+				sender:     cancel_tx,
+			});
+		let task = handler.start(request.operation, request.url, request.content, HostUriContext {
+			cancellation: cancel_rx,
+		});
+		let state = Arc::clone(self);
+		let request_id = request.id;
+		let generation = request.generation;
+		let _task = tokio::spawn(async move {
+			let response = match task.await {
+				Ok(response) => response,
+				Err(_) => HostUriResponse::error("host URI handler task failed"),
+			};
+			let cancelled = state
+				.host_uri_active
+				.lock()
+				.await
+				.remove(&request_id)
+				.is_none_or(|active| *active.sender.borrow());
+			let current_generation = state.host_uri_schemes.read().await.generation;
+			if cancelled || current_generation != generation {
+				return;
+			}
+			let frame = HostUriResult {
+				kind: "host_uri_result".into(),
+				id: request_id,
+				generation,
+				content: response.content,
+				content_type: response.content_type,
+				notes: response.notes,
+				immutable: response.immutable,
+				is_error: response.is_error,
+				error: response.error,
+			};
+			if let Ok(value) = serde_json::to_value(frame) {
+				let _ = state.send_value(&value).await;
+			}
+		});
+	}
+
 	async fn fail_all(&self, reason: impl Into<String>) {
 		let reason = reason.into();
 		self.ready.lock().await.take();
@@ -430,20 +664,27 @@ impl ClientState {
 		for (_, cancellation) in cancellations {
 			let _ = cancellation.send(true);
 		}
+		let uri_cancellations = std::mem::take(&mut *self.host_uri_active.lock().await);
+		for (_, cancellation) in uri_cancellations {
+			let _ = cancellation.sender.send(true);
+		}
+		*self.host_uri_schemes.write().await = HostUriRegistry::default();
 	}
 }
 
 /// Programmatic child-process client for `omp rpc`.
 pub struct RpcClient {
-	state:             Arc<ClientState>,
-	child:             Mutex<Option<Child>>,
-	stderr:            Arc<Mutex<Vec<u8>>>,
-	request_ids:       AtomicU64,
-	request_timeout:   Duration,
-	termination_grace: Duration,
-	reader_task:       JoinHandle<()>,
-	writer_task:       JoinHandle<()>,
-	stderr_task:       JoinHandle<()>,
+	state:                 Arc<ClientState>,
+	child:                 Mutex<Option<Child>>,
+	stderr:                Arc<Mutex<Vec<u8>>>,
+	request_ids:           AtomicU64,
+	host_uri_generation:   AtomicU64,
+	host_uri_registration: Mutex<()>,
+	request_timeout:       Duration,
+	termination_grace:     Duration,
+	reader_task:           JoinHandle<()>,
+	writer_task:           JoinHandle<()>,
+	stderr_task:           JoinHandle<()>,
 }
 
 impl RpcClient {
@@ -496,6 +737,8 @@ impl RpcClient {
 			extension_ui:       extension_ui_tx,
 			host_tools:         RwLock::new(HashMap::new()),
 			host_cancellations: Mutex::new(HashMap::new()),
+			host_uri_schemes:   RwLock::new(HostUriRegistry::default()),
+			host_uri_active:    Mutex::new(HashMap::new()),
 			ready:              Mutex::new(Some(ready_tx)),
 			protocol:           AtomicU8::new(PROTOCOL_V1),
 			sequence:           AtomicU64::new(1),
@@ -578,7 +821,9 @@ impl RpcClient {
 			state,
 			child: Mutex::new(Some(child)),
 			stderr,
-			request_ids: AtomicU64::new(0),
+			request_ids: AtomicU64::new(1),
+			host_uri_generation: AtomicU64::new(0),
+			host_uri_registration: Mutex::new(()),
 			request_timeout: options.request_timeout,
 			termination_grace: options.termination_grace,
 			reader_task,
@@ -1011,13 +1256,21 @@ impl RpcClient {
 			.providers)
 	}
 
-	/// Starts an OAuth flow. UI requests are received through
-	/// [`Self::extension_ui_requests`].
+	/// Starts the provider's default typed authentication flow.
 	pub async fn login(&self, provider_id: &str) -> Result<Value, ClientError> {
+		self.login_with_method(provider_id, None).await
+	}
+
+	/// Starts a typed authentication flow.
+	pub async fn login_with_method(
+		&self,
+		provider_id: &str,
+		method: Option<RpcAuthMethod>,
+	) -> Result<Value, ClientError> {
 		self
 			.request_with_timeout(
 				"login",
-				&json!({"providerId":provider_id}),
+				&json!({"providerId":provider_id,"method":method}),
 				Duration::from_secs(600),
 			)
 			.await
@@ -1056,6 +1309,105 @@ impl RpcClient {
 			.request::<_, ToolNames>("set_host_tools", &json!({"tools":definitions}))
 			.await?
 			.tool_names)
+	}
+
+	/// Replaces every host-owned URI scheme as one generation.
+	pub async fn set_host_uri_schemes(
+		&self,
+		schemes: Vec<ClientHostUriScheme>,
+	) -> Result<Vec<String>, ClientError> {
+		let _registration = self.host_uri_registration.lock().await;
+		if schemes.len() > MAX_HOST_URI_SCHEMES {
+			return Err(ClientError::InvalidResponse(format!(
+				"at most {MAX_HOST_URI_SCHEMES} host URI schemes may be registered"
+			)));
+		}
+		let generation = self
+			.host_uri_generation
+			.try_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1))
+			.map(|previous| previous + 1)
+			.map_err(|_| {
+				ClientError::InvalidResponse("host URI generation space is exhausted".into())
+			})?;
+		let mut registered = HashMap::with_capacity(schemes.len());
+		for mut scheme in schemes {
+			let normalized = scheme.definition.scheme.trim().to_ascii_lowercase();
+			let mut bytes = normalized.bytes();
+			if normalized.is_empty()
+				|| normalized.len() > MAX_HOST_URI_SCHEME_BYTES
+				|| !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+				|| !bytes.all(|byte| {
+					byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"+.-".contains(&byte)
+				}) {
+				return Err(ClientError::InvalidResponse(
+					"host URI schemes must match ^[a-z][a-z0-9+.-]*$".into(),
+				));
+			}
+			if scheme
+				.definition
+				.description
+				.as_ref()
+				.is_some_and(|description| description.len() > MAX_HOST_URI_DESCRIPTION_BYTES)
+			{
+				return Err(ClientError::InvalidResponse(
+					"host URI scheme description exceeds the protocol limit".into(),
+				));
+			}
+			scheme.definition.scheme = normalized.clone();
+			if registered.insert(normalized, scheme).is_some() {
+				return Err(ClientError::InvalidResponse(
+					"host URI schemes must be unique after normalization".into(),
+				));
+			}
+		}
+		let definitions = registered
+			.values()
+			.map(|registered| registered.definition.clone())
+			.collect::<Vec<_>>();
+		let previous = {
+			let mut registry = self.state.host_uri_schemes.write().await;
+			std::mem::replace(&mut *registry, HostUriRegistry { generation, schemes: registered })
+		};
+
+		#[derive(serde::Deserialize)]
+		struct RegisteredSchemes {
+			generation: u64,
+			schemes:    Vec<String>,
+		}
+		let response = self
+			.request::<_, RegisteredSchemes>(
+				"set_host_uri_schemes",
+				&json!({"generation":generation,"schemes":definitions}),
+			)
+			.await;
+		match response {
+			Ok(response) if response.generation == generation => Ok(response.schemes),
+			Ok(response) => {
+				let mut registry = self.state.host_uri_schemes.write().await;
+				if registry.generation == generation {
+					*registry = previous;
+				}
+				Err(ClientError::InvalidResponse(format!(
+					"host URI generation mismatch: requested {generation}, received {}",
+					response.generation
+				)))
+			},
+			Err(error) => {
+				let mut registry = self.state.host_uri_schemes.write().await;
+				if registry.generation == generation {
+					*registry = previous;
+				}
+				Err(error)
+			},
+		}
+	}
+
+	/// Sends typed input to an active authentication exchange.
+	pub async fn respond_auth(&self, response: RpcAuthAnswerFrame) -> Result<(), ClientError> {
+		self
+			.state
+			.send_value(&serde_json::to_value(response)?)
+			.await
 	}
 
 	/// Configures subagent lifecycle/progress/event publication.
@@ -1203,6 +1555,8 @@ mod tests {
 			extension_ui,
 			host_tools: RwLock::new(HashMap::new()),
 			host_cancellations: Mutex::new(HashMap::new()),
+			host_uri_schemes: RwLock::new(HostUriRegistry::default()),
+			host_uri_active: Mutex::new(HashMap::new()),
 			ready: Mutex::new(None),
 			protocol: AtomicU8::new(PROTOCOL_V2),
 			sequence: AtomicU64::new(1),

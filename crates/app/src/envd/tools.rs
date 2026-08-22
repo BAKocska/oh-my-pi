@@ -1,8 +1,13 @@
 //! Production built-in tool registry assembly.
 
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::LazyLock;
+use std::{
+	future::Future,
+	sync::{
+		Arc, LazyLock,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{SystemTime, UNIX_EPOCH},
+};
 
 use omp_core::{Duration, Hash32, Str, sf};
 use omp_proto::{
@@ -25,18 +30,21 @@ use parking_lot::RwLock;
 use super::{
 	EnvdError,
 	blobs::BlobHost,
-	docs::DocumentHost,
+	docs::{DocumentHost, ResourceMutationServices},
 	eval::{ProcessEvalExec, SessionBridgeHost},
 	exec::ExecHost,
+	exec_settings::{AcpRouting, AcpSettings, ShellSettings},
 	media_devices,
+	search_backend::SearchBridgeHost,
+	tool_lsp::DocumentLspControl,
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
+	tool_settings::ToolSettings,
 	tool_shell::ShellExecHost,
 	tool_url::production_url_resolvers,
 	worker::ExtHostSupervisor,
 	workspace::WorkspaceHost,
 };
-use crate::settings::ToolSettings;
 
 /// Builds the complete registry shared by environment dispatch and the agent.
 ///
@@ -47,12 +55,18 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	documents: &DocumentHost,
 	blobs: &BlobHost,
 	exec: &ExecHost,
+	state_dir: &std::path::Path,
+	session_id: &str,
+	github_cache: Arc<omp_storage::github_cache::GithubCache>,
+	mcp: &Arc<super::mcp::McpService>,
 	workspace: &WorkspaceHost,
 	telemetry: &Arc<omp_storage::telemetry_index::TelemetryIndex>,
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
 	tool_settings: &ToolSettings,
+	shell_settings: &ShellSettings,
+	acp_settings: &AcpSettings,
 	device_invoker: I,
 	policy: ToolsPolicy,
 	mut registry: Registry,
@@ -62,9 +76,27 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		Arc<SessionBridgeHost>,
 		omp_tools::eval::EvalSessionControl,
 		AgentCheckpointControl,
+		Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
+		AgentGoalControl,
+		Arc<SearchBridgeHost>,
+		Arc<super::github_url::GithubCredentialBridge>,
 	),
 	EnvdError,
 > {
+	registry.protect_core_claims([
+		"read",
+		"write",
+		"shell",
+		"edit",
+		"glob",
+		"eval",
+		"task",
+		"hub",
+		"learn",
+		"manage_skill",
+		"computer",
+		"lsp",
+	]);
 	for name in [
 		"read",
 		"edit",
@@ -76,7 +108,9 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		"todo",
 		"ask",
 		"fetch",
+		"web_search",
 		"think",
+		"goal",
 		"yield",
 		"checkpoint",
 		"rewind",
@@ -86,6 +120,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		"report_issue",
 		"vibe",
 		"dyn",
+		"lsp",
 	] {
 		ensure_name_absent(&registry, name)?;
 	}
@@ -99,23 +134,39 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	)?;
 	registry.register(crate::vibe::tool(), Presentation::Device, builtin_device_claims())?;
 	let checkpoint_control = AgentCheckpointControl::default();
-	let read_sources = ReadSourceAdapter::new(documents.clone(), workspace.clone());
-	let conflicts = Arc::new(ConflictRegistry::default());
-	let resolvers = production_url_resolvers(Arc::clone(&conflicts));
-	let read = omp_tools::read::tool_with_resolvers_and_conflicts(
-		read_sources.clone(),
-		blobs.clone(),
-		resolvers,
-		Arc::clone(&conflicts),
+	let search_bridge = Arc::new(SearchBridgeHost::new());
+	let github_credentials = Arc::new(super::github_url::GithubCredentialBridge::new());
+	let ssh = super::ssh::SshService::new(
+		super::ssh::HostStore::load(&state_dir.join("ssh/hosts.toml"))
+			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 	);
-	let read_identity = read.spec().identity();
-	if tool_settings.enabled("read") {
-		registry.register(read, Presentation::Slot, core_claims())?;
-	}
-	let fetch = omp_tools::fetch::tool(read_sources);
-	if tool_settings.enabled("fetch") {
-		registry.register(fetch, Presentation::Slot, core_claims())?;
-	}
+	let vault = super::vault::VaultService::load(&state_dir.join("vaults.toml"))
+		.map_err(|error| EnvdError::State(Str::new(error.to_string())))?;
+	documents.set_resource_mutations(ResourceMutationServices {
+		ssh:   ssh.clone(),
+		vault: vault.clone(),
+	});
+	let read_sources = ReadSourceAdapter::new(
+		documents.clone(),
+		workspace.clone(),
+		super::document_cache::project_document_cache(state_dir),
+	);
+	let conflicts = Arc::new(ConflictRegistry::default());
+	let active = crate::discovery::active_content_snapshots(workspace.root());
+	let resolvers = production_url_resolvers(
+		Arc::clone(&conflicts),
+		blobs.store().clone(),
+		session_id,
+		state_dir.join("local"),
+		workspace.root().to_path_buf(),
+		github_cache,
+		Arc::clone(&github_credentials),
+		crate::skills::SkillResolver::new(active.skills),
+		crate::rulebook::RuleResolver::new(active.rules),
+		Arc::clone(mcp),
+		ssh,
+		vault,
+	);
 	let edit_pin = tool_settings
 		.edit_dialect
 		.as_deref()
@@ -123,45 +174,166 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		.transpose()
 		.map_err(|error| EnvdError::EditDialect(error.to_string().into()))?;
 	let environment_edit_dialect = std::env::var("OMP_EDIT_DIALECT").ok();
+	let force_hashline = std::env::var_os("OMP_STRICT_EDIT_MODE").is_some();
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
 		pin: edit_pin.as_ref(),
+		force_hashline,
 		..EditRevisionCandidates::default()
 	})
 	.map_err(EnvdError::EditDialect)?
 	.revision;
-	let replace_edit = omp_tools::edit::replace_tool(documents.clone(), FormatPolicy::Configured);
-	let replace_identity = replace_edit.spec().identity();
-	let edit = omp_tools::edit::tool(documents.clone(), FormatPolicy::Configured);
-	let hashline_identity = edit.spec().identity();
-	let edit_identity = if selected_edit == replace_identity.rev {
-		replace_identity.clone()
-	} else {
-		hashline_identity
-	};
+	let read = omp_tools::read::tool_with_policy(
+		read_sources.clone(),
+		blobs.clone(),
+		Arc::clone(&resolvers),
+		Arc::clone(&conflicts),
+		omp_tools::read::ReadPolicy {
+			fetch_enabled:      tool_settings.fetch_enabled,
+			render_markdown:    tool_settings.render_markdown,
+			auto_resize_images: tool_settings.auto_resize_images,
+			hashline_headers:   tool_settings.enabled("edit") && selected_edit.family.as_str() == "hl",
+		},
+	);
+	let read_identity = read.spec().identity();
+	if tool_settings.enabled("read") {
+		registry.register(read, Presentation::Slot, core_claims())?;
+	}
+	let fetch = omp_tools::fetch::tool(read_sources.clone());
+	if tool_settings.enabled("fetch") && tool_settings.fetch_enabled {
+		registry.register(fetch, Presentation::Slot, core_claims())?;
+	}
+	if tool_settings.enabled("web_search") {
+		registry.register(
+			omp_tools::web_search::tool(Arc::clone(&search_bridge)),
+			Presentation::Slot,
+			core_claims(),
+		)?;
+	}
+
+	let mut hashline_edit = Some(omp_tools::edit::tool_with_snapshots(
+		documents.clone(),
+		blobs.clone(),
+		tool_settings.format_policy,
+	));
+	let mut replace_edit =
+		Some(omp_tools::edit::replace_tool(documents.clone(), tool_settings.format_policy));
+	let mut patch_edit =
+		Some(omp_tools::edit::patch_tool(documents.clone(), tool_settings.format_policy));
+	let mut apply_patch_edit =
+		Some(omp_tools::edit::apply_patch_tool(documents.clone(), tool_settings.format_policy));
+	let mut sloppy_edit =
+		Some(omp_tools::edit::sloppy_tool(documents.clone(), tool_settings.format_policy));
+	let edit_identity = [
+		hashline_edit
+			.as_ref()
+			.expect("constructed")
+			.spec()
+			.identity(),
+		replace_edit
+			.as_ref()
+			.expect("constructed")
+			.spec()
+			.identity(),
+		patch_edit.as_ref().expect("constructed").spec().identity(),
+		apply_patch_edit
+			.as_ref()
+			.expect("constructed")
+			.spec()
+			.identity(),
+		sloppy_edit.as_ref().expect("constructed").spec().identity(),
+	]
+	.into_iter()
+	.find(|identity| identity.rev == selected_edit)
+	.ok_or_else(|| EnvdError::EditDialect(sf!("selected edit revision is not registered")))?
+	.clone();
 	if tool_settings.enabled("edit") {
-		if selected_edit == replace_identity.rev {
-			registry.register(edit, Presentation::Slot, core_claims())?;
-			registry.register(replace_edit, Presentation::Slot, core_claims())?;
-		} else {
-			registry.register(replace_edit, Presentation::Slot, core_claims())?;
-			registry.register(edit, Presentation::Slot, core_claims())?;
+		let mut edits = [
+			(
+				hashline_edit
+					.as_ref()
+					.expect("constructed")
+					.spec()
+					.identity(),
+				0_u8,
+			),
+			(
+				replace_edit
+					.as_ref()
+					.expect("constructed")
+					.spec()
+					.identity(),
+				1,
+			),
+			(patch_edit.as_ref().expect("constructed").spec().identity(), 2),
+			(
+				apply_patch_edit
+					.as_ref()
+					.expect("constructed")
+					.spec()
+					.identity(),
+				3,
+			),
+			(sloppy_edit.as_ref().expect("constructed").spec().identity(), 4),
+		];
+		edits.sort_by_key(|(identity, _)| identity.rev == selected_edit);
+		for (_, index) in edits {
+			match index {
+				0 => registry.register(
+					hashline_edit.take().expect("once"),
+					Presentation::Slot,
+					core_claims(),
+				)?,
+				1 => registry.register(
+					replace_edit.take().expect("once"),
+					Presentation::Slot,
+					core_claims(),
+				)?,
+				2 => registry.register(
+					patch_edit.take().expect("once"),
+					Presentation::Slot,
+					core_claims(),
+				)?,
+				3 => registry.register(
+					apply_patch_edit.take().expect("once"),
+					Presentation::Slot,
+					core_claims(),
+				)?,
+				4 => registry.register(
+					sloppy_edit.take().expect("once"),
+					Presentation::Slot,
+					core_claims(),
+				)?,
+				_ => unreachable!(),
+			}
 		}
 	}
-	let write = omp_tools::write::tool_with_conflicts(documents.clone(), conflicts);
+	let write = omp_tools::write::tool_with_policy_and_conflicts(
+		documents.clone(),
+		conflicts,
+		tool_settings.format_policy,
+	);
 	let write_identity = write.spec().identity();
 	if tool_settings.enabled("write") {
 		registry.register(write, Presentation::Slot, core_claims())?;
 	}
-	let shell = omp_tools::shell::shell_with_timeout_bounds(
-		ShellExecHost::new(exec.clone(), root_uri.clone()),
-		shell_timeout_bounds(tool_settings),
-	);
-	let shell_identity = shell.spec().identity();
-	if tool_settings.enabled("shell") {
-		registry.register(shell, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("lsp") {
+		let maximum = tool_settings
+			.max_timeout
+			.and_then(|duration| duration.to_std().ok())
+			.unwrap_or_else(|| std::time::Duration::from_secs(300));
+		registry.register(
+			omp_tools::lsp::tool(DocumentLspControl::new(documents.clone()), maximum),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
-	let search = WorkspaceSearchAdapter::new(workspace.clone(), documents.clone());
+	let search = WorkspaceSearchAdapter::new(
+		workspace.clone(),
+		documents.clone(),
+		read_sources.clone(),
+		Arc::clone(&resolvers),
+	);
 	let grep = omp_tools::grep::tool(search.clone(), blobs.clone());
 	let grep_identity = grep.spec().identity();
 	if tool_settings.enabled("grep") {
@@ -172,15 +344,42 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	if tool_settings.enabled("glob") {
 		registry.register(glob, Presentation::Slot, core_claims())?;
 	}
-	let eval_host = Arc::new(SessionBridgeHost::new());
-	let eval_exec =
-		ProcessEvalExec::production(Arc::clone(&eval_host), interrupt_grace, blobs.clone())
-			.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
-	let (eval_tool, eval_control) = omp_tools::eval::eval_controlled(eval_exec);
-	let eval_identity = eval_tool.spec().identity();
-	if tool_settings.enabled("eval") {
-		registry.register(eval_tool, Presentation::Slot, core_claims())?;
+	if tool_settings.enabled("ast_grep") {
+		registry.register(
+			omp_tools::ast_grep::tool(workspace.root().to_path_buf()),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
+	if tool_settings.enabled("ast_edit") {
+		registry.register(
+			omp_tools::ast_edit::tool(workspace.root().to_path_buf()),
+			Presentation::Slot,
+			core_claims(),
+		)?;
+	}
+	let eval_host = Arc::new(SessionBridgeHost::new());
+	let mut eval_control = omp_tools::eval::EvalSessionControl::default();
+	let eval_identity = if tool_settings.enabled("eval") {
+		match preflight_python_eval(Arc::clone(&eval_host), interrupt_grace, blobs.clone()) {
+			Ok(eval_exec) => {
+				let (eval_tool, control) = omp_tools::eval::eval_controlled(eval_exec);
+				let identity = eval_tool.spec().identity();
+				registry.register(eval_tool, Presentation::Slot, core_claims())?;
+				eval_control = control;
+				Some(identity)
+			},
+			Err(error) => {
+				tracing::warn!(
+					error = %error,
+					"eval omitted because CPython is unreachable; run `just setup-python` and restart OMP"
+				);
+				None
+			},
+		}
+	} else {
+		None
+	};
 	if tool_settings.enabled("todo") {
 		registry.register(omp_tools::todo::tool(), Presentation::Slot, core_claims())?;
 	}
@@ -193,6 +392,14 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	}
 	if tool_settings.enabled("think") {
 		registry.register(omp_tools::think::tool(), Presentation::Slot, core_claims())?;
+	}
+	let goal_control = AgentGoalControl::default();
+	if tool_settings.enabled("goal") {
+		registry.register(
+			omp_tools::goal::tool(goal_control.clone()),
+			Presentation::Hidden,
+			core_claims(),
+		)?;
 	}
 	if tool_settings.enabled("hub") {
 		registry.register(crate::chat::chat_hub_tool(), Presentation::Slot, core_claims())?;
@@ -215,14 +422,57 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 			core_claims(),
 		)?;
 	}
+	let shell_identity = if tool_settings.enabled("shell") && shell_settings.enabled {
+		let sibling_tools = registry
+			.live_identities()
+			.filter_map(|(name, _)| {
+				(name != "shell" && registry.presentation(name).ok() == Some(Presentation::Slot))
+					.then(|| name.clone())
+			})
+			.collect::<Arc<[_]>>();
+		let snapshot = omp_tools::shell::ShellPromptSnapshot {
+			sibling_tools,
+			platform: Str::new(std::env::consts::OS),
+			embedded_builtins: shell_settings.embedded_builtins,
+			interceptor_enabled: shell_settings.interceptor.enabled,
+			interceptor_rules: shell_settings
+				.interceptor
+				.patterns
+				.iter()
+				.map(|rule| omp_tools::shell_intercept::Rule {
+					pattern: rule.pattern.clone(),
+					tool:    rule.tool.clone(),
+					message: rule.message.clone(),
+				})
+				.collect(),
+			acp_routing: acp_settings.routing != AcpRouting::Never,
+			profile: Str::new(<&'static str>::from(shell_settings.profile)),
+			command_prefix: shell_settings.command_prefix.is_some(),
+			minimizer_enabled: shell_settings.minimizer.enabled,
+		};
+		let shell = omp_tools::shell::shell_with_snapshot_and_timeout_bounds(
+			ShellExecHost::new(exec.clone(), root_uri.clone(), shell_settings.clone()),
+			shell_timeout_bounds(tool_settings),
+			&snapshot,
+		)
+		.with_auto_background(
+			shell_settings.auto_background.enabled,
+			std::time::Duration::from_millis(shell_settings.auto_background.threshold_ms),
+		);
+		let identity = shell.spec().identity();
+		registry.register(shell, Presentation::Slot, core_claims())?;
+		Some(identity)
+	} else {
+		None
+	};
 	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
 		edit:  tool_settings.enabled("edit").then_some(edit_identity),
 		grep:  tool_settings.enabled("grep").then_some(grep_identity),
 		glob:  tool_settings.enabled("glob").then_some(glob_identity),
-		shell: tool_settings.enabled("shell").then_some(shell_identity),
+		shell: shell_identity,
 		write: tool_settings.enabled("write").then_some(write_identity),
 		read:  tool_settings.enabled("read").then_some(read_identity),
-		eval:  tool_settings.enabled("eval").then_some(eval_identity),
+		eval:  eval_identity,
 	})
 	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
 	let flattened_slots = if policy == ToolsPolicy::ToolOnly {
@@ -282,8 +532,158 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	eval_host
 		.bind_registry(Arc::clone(&registry))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
-	Ok((registry, eval_host, eval_control, checkpoint_control))
+	Ok((
+		registry,
+		eval_host,
+		eval_control,
+		checkpoint_control,
+		resolvers,
+		goal_control,
+		search_bridge,
+		github_credentials,
+	))
 }
+#[derive(Clone)]
+struct GoalBinding {
+	id:    u64,
+	modes: Arc<crate::modes::ExecutionModes>,
+}
+
+/// Late-bound durable goal-mode authority for the active chat session.
+#[derive(Clone, Default)]
+pub struct AgentGoalControl {
+	binding: Arc<RwLock<Option<GoalBinding>>>,
+	next_id: Arc<AtomicU64>,
+}
+
+impl AgentGoalControl {
+	/// Binds the active session modes until the returned lease is dropped.
+	#[must_use]
+	pub fn bind(&self, modes: Arc<crate::modes::ExecutionModes>) -> AgentGoalBinding {
+		let id = self
+			.next_id
+			.fetch_add(1, Ordering::Relaxed)
+			.saturating_add(1);
+		*self.binding.write() = Some(GoalBinding { id, modes });
+		AgentGoalBinding { control: self.clone(), id }
+	}
+
+	fn modes(&self) -> Result<Arc<crate::modes::ExecutionModes>, omp_tools::goal::Fault> {
+		self
+			.binding
+			.read()
+			.as_ref()
+			.map(|binding| Arc::clone(&binding.modes))
+			.ok_or(omp_tools::goal::Fault::Unavailable)
+	}
+
+	fn unbind(&self, id: u64) {
+		let mut binding = self.binding.write();
+		if binding.as_ref().is_some_and(|binding| binding.id == id) {
+			*binding = None;
+		}
+	}
+}
+
+/// Sole-owner lease for one active goal-mode binding.
+pub struct AgentGoalBinding {
+	control: AgentGoalControl,
+	id:      u64,
+}
+
+impl Drop for AgentGoalBinding {
+	fn drop(&mut self) {
+		self.control.unbind(self.id);
+	}
+}
+
+impl omp_tools::goal::GoalControl for AgentGoalControl {
+	fn apply(
+		&self,
+		params: omp_tools::goal::Params,
+	) -> impl Future<Output = Result<Option<omp_tools::goal::Goal>, omp_tools::goal::Fault>> + Send + '_
+	{
+		let modes = self.modes();
+		async move {
+			let modes = modes?;
+			let now = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_millis()
+				.try_into()
+				.unwrap_or(u64::MAX);
+			let outcome = match params.op {
+				omp_tools::goal::Operation::Create => crate::goal::GoalOutcome {
+					lifecycle: crate::goal::GoalLifecycle::Created,
+					goal:      Some(
+						modes
+							.set_goal(
+								params
+									.objective
+									.ok_or(omp_tools::goal::Fault::ObjectiveRequired)?,
+								params.token_budget,
+								now,
+							)
+							.map_err(map_goal_error)?,
+					),
+				},
+				omp_tools::goal::Operation::Get => crate::goal::GoalOutcome {
+					lifecycle: crate::goal::GoalLifecycle::Current,
+					goal:      modes.goal(),
+				},
+				omp_tools::goal::Operation::Complete => crate::goal::GoalOutcome {
+					lifecycle: crate::goal::GoalLifecycle::Completed,
+					goal:      Some(modes.complete_goal(now).map_err(map_goal_error)?),
+				},
+				omp_tools::goal::Operation::Resume => crate::goal::GoalOutcome {
+					lifecycle: crate::goal::GoalLifecycle::Resumed,
+					goal:      Some(modes.resume_goal(now).map_err(map_goal_error)?),
+				},
+				omp_tools::goal::Operation::Drop => crate::goal::GoalOutcome {
+					lifecycle: crate::goal::GoalLifecycle::Dropped,
+					goal:      Some(modes.drop_goal(now).map_err(map_goal_error)?),
+				},
+			};
+			modes
+				.flush_projection()
+				.await
+				.map_err(|_| omp_tools::goal::Fault::Unavailable)?;
+			Ok(outcome.goal.map(project_goal))
+		}
+	}
+}
+
+fn map_goal_error(error: crate::modes::ModeError) -> omp_tools::goal::Fault {
+	match error {
+		crate::modes::ModeError::NoGoal => omp_tools::goal::Fault::NoGoal,
+		crate::modes::ModeError::EmptyObjective => omp_tools::goal::Fault::ObjectiveRequired,
+		crate::modes::ModeError::InvalidBudget => omp_tools::goal::Fault::InvalidBudget,
+		crate::modes::ModeError::Conflict { .. } | crate::modes::ModeError::InvalidPlanArtifact => {
+			omp_tools::goal::Fault::ModeConflict
+		},
+		crate::modes::ModeError::InvalidGoalTransition { .. }
+		| crate::modes::ModeError::GoalExists => omp_tools::goal::Fault::InvalidTransition,
+	}
+}
+
+fn project_goal(goal: crate::modes::Goal) -> omp_tools::goal::Goal {
+	let status = match goal.status {
+		crate::modes::GoalStatus::Active => omp_tools::goal::Status::Active,
+		crate::modes::GoalStatus::Paused => omp_tools::goal::Status::Paused,
+		crate::modes::GoalStatus::BudgetLimited => omp_tools::goal::Status::BudgetLimited,
+		crate::modes::GoalStatus::Complete => omp_tools::goal::Status::Complete,
+		crate::modes::GoalStatus::Dropped => omp_tools::goal::Status::Dropped,
+	};
+	omp_tools::goal::Goal {
+		id: goal.id,
+		objective: goal.objective,
+		status,
+		token_budget: goal.token_budget,
+		tokens_used: goal.tokens_used,
+		time_used_secs: goal.time_used_seconds,
+	}
+}
+
 #[derive(Clone)]
 struct CheckpointBinding {
 	id:     u64,
@@ -311,40 +711,80 @@ impl AgentCheckpointControl {
 		}
 	}
 
-	fn sender(&self) -> Result<omp_agent::ControlSender, Str> {
+	fn sender(&self) -> Result<omp_agent::ControlSender, omp_tools::checkpoint::CheckpointFault> {
 		self
 			.sender
 			.read()
 			.as_ref()
 			.map(|binding| binding.sender.clone())
-			.ok_or_else(|| sf!("active Agent CONTROL is not bound"))
+			.ok_or_else(|| omp_tools::checkpoint::CheckpointFault {
+				code:    omp_tools::checkpoint::FaultCode::Control,
+				message: sf!("active Agent CONTROL is not bound"),
+			})
 	}
 }
 
 impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
-	async fn checkpoint(&self, label: Str) -> Result<u64, Str> {
-		self
+	async fn checkpoint(
+		&self,
+		goal: Str,
+	) -> Result<omp_tools::checkpoint::CheckpointAck, omp_tools::checkpoint::CheckpointFault> {
+		let ack = self
 			.sender()?
-			.checkpoint(label)
+			.checkpoint(goal)
 			.await
-			.map_err(|error| Str::from(error.to_string()))
+			.map_err(checkpoint_fault)?;
+		Ok(omp_tools::checkpoint::CheckpointAck { token: ack.token, started_at: ack.started_at })
 	}
 
 	async fn schedule_rewind(
 		&self,
-		target: u64,
-		scope: Str,
-	) -> Result<omp_tools::checkpoint::RewindAck, Str> {
+		token: Str,
+		report: Str,
+	) -> Result<omp_tools::checkpoint::RewindAck, omp_tools::checkpoint::CheckpointFault> {
 		let ack = self
 			.sender()?
-			.schedule_rewind(target, scope)
+			.schedule_rewind(token, report)
 			.await
-			.map_err(|error| Str::from(error.to_string()))?;
-		Ok(omp_tools::checkpoint::RewindAck { target: ack.target, receipt: ack.receipt })
+			.map_err(checkpoint_fault)?;
+		Ok(omp_tools::checkpoint::RewindAck { token: ack.token, receipt: ack.receipt })
 	}
 }
 
-#[cfg(test)]
+fn checkpoint_fault(
+	error: omp_agent::control::ControlError,
+) -> omp_tools::checkpoint::CheckpointFault {
+	let (code, message) = match error {
+		omp_agent::control::ControlError::CheckpointAlreadyActive => {
+			(omp_tools::checkpoint::FaultCode::AlreadyActive, sf!("checkpoint already active"))
+		},
+		omp_agent::control::ControlError::NoActiveCheckpoint => (
+			omp_tools::checkpoint::FaultCode::NoActive,
+			sf!("no active checkpoint; create a checkpoint before calling rewind"),
+		),
+		omp_agent::control::ControlError::CheckpointAlreadyCompleted => (
+			omp_tools::checkpoint::FaultCode::AlreadyCompleted,
+			sf!("checkpoint already completed; continue from the retained rewind report"),
+		),
+		omp_agent::control::ControlError::WrongCheckpointToken => (
+			omp_tools::checkpoint::FaultCode::WrongToken,
+			sf!("checkpoint token does not belong to the active session"),
+		),
+		omp_agent::control::ControlError::EmptyRewindReport => {
+			(omp_tools::checkpoint::FaultCode::EmptyReport, sf!("rewind report must not be empty"))
+		},
+		omp_agent::control::ControlError::RewindAlreadyScheduled => (
+			omp_tools::checkpoint::FaultCode::AlreadyScheduled,
+			sf!("rewind already scheduled for the active checkpoint"),
+		),
+		omp_agent::control::ControlError::Closed | omp_agent::control::ControlError::Journal(_) => (
+			omp_tools::checkpoint::FaultCode::Control,
+			sf!("active Agent CONTROL checkpoint operation failed"),
+		),
+	};
+	omp_tools::checkpoint::CheckpointFault { code, message }
+}
+
 pub(super) fn python_engine() -> Result<Arc<omp_py::Engine>, EnvdError> {
 	static ENGINE: LazyLock<Result<Arc<omp_py::Engine>, Str>> = LazyLock::new(|| {
 		omp_py::Engine::builder()
@@ -356,6 +796,16 @@ pub(super) fn python_engine() -> Result<Arc<omp_py::Engine>, EnvdError> {
 		.as_ref()
 		.map(Arc::clone)
 		.map_err(|error| EnvdError::Eval(error.clone()))
+}
+
+fn preflight_python_eval(
+	host: Arc<SessionBridgeHost>,
+	interrupt_grace: Duration,
+	blobs: BlobHost,
+) -> Result<ProcessEvalExec, EnvdError> {
+	python_engine()?;
+	ProcessEvalExec::production(host, interrupt_grace, blobs)
+		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))
 }
 
 fn ensure_name_absent(registry: &Registry, name: &str) -> Result<(), EnvdError> {

@@ -1,13 +1,34 @@
 //! App-owned internal URL resolver composition.
 
+#[path = "tool_url/artifact.rs"]
+mod artifact;
+#[path = "tool_url/docs.rs"]
+mod docs;
+#[path = "tool_url/host.rs"]
+pub(crate) mod host;
+#[path = "tool_url/local.rs"]
+pub(super) mod local;
+#[path = "tool_url/mcp.rs"]
+mod mcp;
+#[path = "tool_url/memory.rs"]
+mod memory;
+#[path = "tool_url/ssh.rs"]
+pub(super) mod ssh;
+#[path = "tool_url/vault.rs"]
+pub(super) mod vault;
+
 use std::sync::Arc;
 
-use omp_agent::AgentRegistry;
+use omp_agent::{AgentKind, AgentRegistry};
 use omp_core::{CowBytes, Str};
 use omp_tools::read::{
 	Fault,
 	conflicts::{ConflictRegistry, ConflictResolver},
-	resolver::{LineOffsetCache, Resolve, ResolverTable, Scheme, SchemeEntry},
+	json_query::{apply_query, parse_query, path_to_query, render_value},
+	resolver::{
+		LineOffsetCache, Resolve, ResolverTable, ResourceCompletion, ResourceEntry, ResourceList,
+		Scheme, SchemeEntry, fuzzy_score,
+	},
 	selector::ParsedSelector,
 };
 
@@ -34,23 +55,161 @@ impl Resolve for RegistryResolver {
 		resource: &'a str,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		self.read_query(resource, None, selector).await
+	}
+
+	async fn read_query<'a>(
+		&'a self,
+		resource: &'a str,
+		query: Option<&'a str>,
+		selector: &'a ParsedSelector,
+	) -> Result<CowBytes<'static>, Fault> {
 		let bytes = match self.resource {
-			RegistryResource::Agent => AgentRegistry::global().resolve_agent(resource),
-			RegistryResource::History => AgentRegistry::global().resolve_history(resource),
-		}
-		.map_err(|error| Fault::Source { message: Str::from(error.to_string()) })?;
+			RegistryResource::Agent => {
+				let (base, path) = resource.split_once('/').unwrap_or((resource, ""));
+				if query.is_some() && !path.is_empty() {
+					return Err(Fault::Invalid {
+						message: Str::new_static("agent:// cannot combine path extraction with ?q=."),
+					});
+				}
+				if let Some(query) = query {
+					let expression = parse_agent_query(query)?;
+					AgentRegistry::global()
+						.resolve_agent_query(resource, &expression)
+						.map_err(registry_fault)?
+				} else {
+					match AgentRegistry::global().resolve_agent(resource) {
+						Ok(bytes) => bytes,
+						Err(_) if !path.is_empty() => {
+							let bytes = AgentRegistry::global()
+								.resolve_agent(base)
+								.map_err(registry_fault)?;
+							project_json(bytes, None, Some(path))?
+						},
+						Err(error) => return Err(registry_fault(error)),
+					}
+				}
+			},
+			RegistryResource::History => {
+				if AgentRegistry::global()
+					.record(resource.trim_matches('/'))
+					.is_some_and(|(record, _)| record.kind == AgentKind::Advisor)
+				{
+					return Err(Fault::Source {
+						message: Str::new_static("Agent history resource was not found."),
+					});
+				}
+				let bytes = AgentRegistry::global()
+					.resolve_history(resource)
+					.map_err(registry_fault)?;
+				render_history(resource, bytes)?
+			},
+		};
 		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
+	}
+
+	async fn list(
+		&self,
+		resource: &str,
+		max_entries: usize,
+		max_bytes: usize,
+	) -> Result<ResourceList, Fault> {
+		if !resource.trim_matches('/').is_empty() {
+			return Err(Fault::Invalid {
+				message: Str::new_static(
+					"Agent resource listing is supported only at the scheme root.",
+				),
+			});
+		}
+		let mut entries = Vec::new();
+		let mut bytes = 0usize;
+		let mut truncated = false;
+		for record in AgentRegistry::global().roster(false) {
+			let uri = match self.resource {
+				RegistryResource::Agent => format!("agent://{}", record.id),
+				RegistryResource::History => format!("history://{}", record.id),
+			};
+			let entry_bytes = uri.len().saturating_add(record.name.len());
+			if entries.len() == max_entries || bytes.saturating_add(entry_bytes) > max_bytes {
+				truncated = true;
+				break;
+			}
+			bytes += entry_bytes;
+			entries.push(ResourceEntry {
+				uri:       Str::new(uri),
+				name:      record.id,
+				directory: false,
+				size:      0,
+			});
+		}
+		Ok(ResourceList { entries, truncated })
+	}
+
+	async fn complete(
+		&self,
+		query: &str,
+		max_results: usize,
+	) -> Result<Vec<ResourceCompletion>, Fault> {
+		let scheme = match self.resource {
+			RegistryResource::Agent => "agent",
+			RegistryResource::History => "history",
+		};
+		let mut matches = AgentRegistry::global()
+			.roster(false)
+			.into_iter()
+			.filter_map(|record| {
+				let score =
+					fuzzy_score(query, &record.id).or_else(|| fuzzy_score(query, &record.name))?;
+				Some(ResourceCompletion {
+					value: Str::new(format!("{scheme}://{}", record.id)),
+					description: record.name,
+					score,
+				})
+			})
+			.collect::<Vec<_>>();
+		matches.sort_unstable_by(|left, right| {
+			right
+				.score
+				.cmp(&left.score)
+				.then_with(|| left.value.cmp(&right.value))
+		});
+		matches.truncate(max_results);
+		Ok(matches)
 	}
 }
 
 /// Constructor-owned resolver union used by the production read registry.
 pub(super) enum UrlResolver {
+	/// RPC host-owned generation-fenced resources.
+	Host(host::HostUriResolver),
+	/// Session artifacts by ordinal or durable digest.
+	Artifact(artifact::ArtifactUrlResolver),
 	/// Agent output and child artifacts.
 	Agent(RegistryResolver),
 	/// Read-only agent transcript index and bodies.
 	History(RegistryResolver),
+	/// Direct GitHub issue views.
+	Issue(super::github_url::GithubResolver),
+	/// Direct GitHub pull-request views and diffs.
+	Pr(super::github_url::GithubResolver),
+	/// Session-local scratch files.
+	Local(local::LocalResolver),
+	/// Active-session bounded memory projections.
+	Memory(memory::MemoryUrlResolver),
+	/// Configured native SSH hosts.
+	Ssh(ssh::SshResolver),
+	/// Configured local vaults.
+	Vault(vault::VaultResolver),
+	/// Explicit resources from mounted MCP servers.
+	Mcp(mcp::McpUrlResolver),
+	/// Active installed skill content.
+	Skill(crate::skills::SkillResolver),
+	/// Active installed rule content.
+	Rule(crate::rulebook::RuleResolver),
 	/// Session-registered merge conflict regions.
 	Conflict(ConflictResolver),
+	/// Packaged harness documentation.
+	Docs(docs::DocsResolver),
 }
 
 impl Resolve for UrlResolver {
@@ -60,8 +219,120 @@ impl Resolve for UrlResolver {
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
 		match self {
+			Self::Host(resolver) => resolver.read(resource, selector).await,
+			Self::Artifact(resolver) => resolver.read(resource, selector).await,
 			Self::Agent(resolver) | Self::History(resolver) => resolver.read(resource, selector).await,
+			Self::Issue(resolver) | Self::Pr(resolver) => resolver.read(resource, selector).await,
+			Self::Local(resolver) => resolver.read(resource, selector).await,
+			Self::Memory(resolver) => resolver.read(resource, selector).await,
+			Self::Ssh(resolver) => resolver.read(resource, selector).await,
+			Self::Vault(resolver) => resolver.read(resource, selector).await,
+			Self::Mcp(resolver) => resolver.read(resource, selector).await,
+			Self::Skill(resolver) => resolver.read(resource, selector).await,
+			Self::Rule(resolver) => resolver.read(resource, selector).await,
 			Self::Conflict(resolver) => resolver.read(resource, selector).await,
+			Self::Docs(resolver) => resolver.read(resource, selector).await,
+		}
+	}
+
+	async fn read_query<'a>(
+		&'a self,
+		resource: &'a str,
+		query: Option<&'a str>,
+		selector: &'a ParsedSelector,
+	) -> Result<CowBytes<'static>, Fault> {
+		match self {
+			Self::Host(resolver) => resolver.read_query(resource, query, selector).await,
+			Self::Agent(resolver) | Self::History(resolver) => {
+				resolver.read_query(resource, query, selector).await
+			},
+			Self::Issue(resolver) | Self::Pr(resolver) => {
+				resolver.read_query(resource, query, selector).await
+			},
+			Self::Ssh(resolver) => resolver.read_query(resource, query, selector).await,
+			Self::Vault(resolver) if query.is_some() => {
+				resolver.read_query(resource, query, selector).await
+			},
+			_ => self.read(resource, selector).await,
+		}
+	}
+
+	async fn list(
+		&self,
+		resource: &str,
+		max_entries: usize,
+		max_bytes: usize,
+	) -> Result<ResourceList, Fault> {
+		match self {
+			Self::Host(_) => Err(Fault::Invalid {
+				message: Str::new_static("Host resources do not support listing."),
+			}),
+			Self::Artifact(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Agent(resolver) | Self::History(resolver) => {
+				resolver.list(resource, max_entries, max_bytes).await
+			},
+			Self::Local(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Memory(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Ssh(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Vault(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Mcp(_) => Err(Fault::Invalid {
+				message: Str::new_static(
+					"MCP resources are discovered through the mounted server device.",
+				),
+			}),
+			Self::Skill(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Rule(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Docs(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Issue(_) | Self::Pr(_) => Err(Fault::Invalid {
+				message: Str::new_static("GitHub list resources are read as Markdown."),
+			}),
+			Self::Conflict(_) => {
+				Err(Fault::Invalid { message: Str::new_static("Conflict resources cannot be listed.") })
+			},
+		}
+	}
+
+	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
+		match self {
+			Self::Host(_) => Err(Fault::Invalid {
+				message: Str::new_static("Host resources have no local materializable path."),
+			}),
+			Self::Artifact(resolver) => resolver.path(resource).await,
+			Self::Local(resolver) => resolver.path(resource).await,
+			Self::Ssh(_) | Self::Vault(_) => Err(Fault::Invalid {
+				message: Str::new_static(
+					"Remote and vault resources have no local materializable path.",
+				),
+			}),
+			Self::Mcp(_) => Err(Fault::Invalid {
+				message: Str::new_static("MCP resources have no local materializable path."),
+			}),
+			_ => Err(Fault::Invalid {
+				message: Str::new_static("This resource has no materializable path."),
+			}),
+		}
+	}
+
+	async fn complete(
+		&self,
+		query: &str,
+		max_results: usize,
+	) -> Result<Vec<ResourceCompletion>, Fault> {
+		match self {
+			Self::Host(_) => Ok(Vec::new()),
+			Self::Artifact(resolver) => resolver.complete(query, max_results).await,
+			Self::Agent(resolver) | Self::History(resolver) => {
+				resolver.complete(query, max_results).await
+			},
+			Self::Local(resolver) => resolver.complete(query, max_results).await,
+			Self::Memory(resolver) => resolver.complete(query, max_results).await,
+			Self::Ssh(resolver) => resolver.complete(query, max_results).await,
+			Self::Vault(resolver) => resolver.complete(query, max_results).await,
+			Self::Mcp(resolver) => resolver.complete(query, max_results).await,
+			Self::Skill(resolver) => resolver.complete(query, max_results).await,
+			Self::Rule(resolver) => resolver.complete(query, max_results).await,
+			Self::Docs(resolver) => resolver.complete(query, max_results).await,
+			Self::Issue(_) | Self::Pr(_) | Self::Conflict(_) => Ok(Vec::new()),
 		}
 	}
 }
@@ -69,17 +340,130 @@ impl Resolve for UrlResolver {
 /// Builds the production internal URL table and shared conflict registry.
 pub(super) fn production_url_resolvers(
 	conflicts: Arc<ConflictRegistry>,
+	blob_store: omp_storage::blob::BlobStore,
+	session_id: &str,
+	local_root: std::path::PathBuf,
+	workspace_root: std::path::PathBuf,
+	github_cache: Arc<omp_storage::github_cache::GithubCache>,
+	github_credentials: Arc<super::github_url::GithubCredentialBridge>,
+	skills: crate::skills::SkillResolver,
+	rules: crate::rulebook::RuleResolver,
+	mcp: Arc<super::mcp::McpService>,
+	ssh: super::ssh::SshService,
+	vault: super::vault::VaultService,
 ) -> Arc<ResolverTable<UrlResolver>> {
 	let mut builder = ResolverTable::builder();
 	builder
+		.install_unknown_fallback(UrlResolver::Host(host::HostUriResolver::new()))
+		.expect("RPC host URL fallback is unique");
+	if let Some(runtime) =
+		omp_memory::RuntimeRegistry::lookup(session_id).filter(|runtime| runtime.is_active())
+	{
+		builder
+			.register(
+				SchemeEntry::new(Scheme::Memory, true, false, "bounded active Mnemopi memory")
+					.with_capabilities(true, false, true),
+				UrlResolver::Memory(memory::MemoryUrlResolver::new(runtime)),
+			)
+			.expect("memory URL resolver is unique");
+	}
+	builder
 		.register(
-			SchemeEntry::new(Scheme::Agent, true, false, "settled agent output and child artifacts"),
+			SchemeEntry::new(Scheme::Ssh, true, false, "configured native SSH/SFTP hosts")
+				.with_capabilities(true, false, true)
+				.with_stamp(false, 1),
+			UrlResolver::Ssh(ssh::SshResolver::new(ssh)),
+		)
+		.expect("ssh URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Vault, true, false, "configured symlink-confined vaults")
+				.with_capabilities(true, false, true)
+				.with_stamp(false, 1),
+			UrlResolver::Vault(vault::VaultResolver::new(vault)),
+		)
+		.expect("vault URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Mcp, true, false, "resources from mounted MCP servers")
+				.with_capabilities(false, false, true)
+				.with_whole_body(true),
+			UrlResolver::Mcp(mcp::McpUrlResolver::new(mcp)),
+		)
+		.expect("mcp URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Issue, true, false, "direct GitHub issues"),
+			UrlResolver::Issue(super::github_url::GithubResolver::new(
+				super::github_url::GithubScheme::Issue,
+				workspace_root.clone(),
+				Arc::clone(&github_cache),
+				Arc::clone(&github_credentials),
+			)),
+		)
+		.expect("issue URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Pr, true, false, "direct GitHub pull requests and diffs"),
+			UrlResolver::Pr(super::github_url::GithubResolver::new(
+				super::github_url::GithubScheme::PullRequest,
+				workspace_root,
+				github_cache,
+				github_credentials,
+			)),
+		)
+		.expect("pr URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(
+				Scheme::Artifact,
+				true,
+				false,
+				"session artifacts by ordinal or durable digest",
+			)
+			.with_capabilities(true, true, true),
+			UrlResolver::Artifact(
+				artifact::ArtifactUrlResolver::open(blob_store, session_id)
+					.expect("artifact catalog opens with the environment blob store"),
+			),
+		)
+		.expect("artifact URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Local, false, false, "session-local scratch files")
+				.with_capabilities(true, true, true),
+			UrlResolver::Local(
+				local::LocalResolver::open(local_root).expect("session local root can be created"),
+			),
+		)
+		.expect("local URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Skill, true, false, "active installed skills")
+				.with_capabilities(true, false, true)
+				.with_whole_body(true),
+			UrlResolver::Skill(skills),
+		)
+		.expect("skill URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Rule, true, false, "active installed rules")
+				.with_capabilities(true, false, true)
+				.with_whole_body(true),
+			UrlResolver::Rule(rules),
+		)
+		.expect("rule URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Agent, true, false, "settled agent output and child artifacts")
+				.with_capabilities(true, false, true),
 			UrlResolver::Agent(RegistryResolver::new(RegistryResource::Agent)),
 		)
 		.expect("agent URL resolver is unique");
 	builder
 		.register(
-			SchemeEntry::new(Scheme::History, true, false, "read-only agent transcript index"),
+			SchemeEntry::new(Scheme::History, true, false, "read-only agent transcript index")
+				.with_capabilities(true, false, true),
 			UrlResolver::History(RegistryResolver::new(RegistryResource::History)),
 		)
 		.expect("history URL resolver is unique");
@@ -89,10 +473,136 @@ pub(super) fn production_url_resolvers(
 			UrlResolver::Conflict(ConflictResolver::new((*conflicts).clone())),
 		)
 		.expect("conflict URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Omp, true, false, "packaged OMP documentation")
+				.with_capabilities(true, false, true),
+			UrlResolver::Docs(docs::DocsResolver::default()),
+		)
+		.expect("omp URL resolver is unique");
 	Arc::new(builder.build())
 }
+fn parse_agent_query(query: &str) -> Result<Str, Fault> {
+	let mut selected = None;
+	for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+		if name == "q" {
+			if selected.replace(value.into_owned()).is_some() {
+				return Err(Fault::Invalid {
+					message: Str::new_static("agent:// accepts exactly one ?q= value."),
+				});
+			}
+		} else {
+			return Err(Fault::Invalid {
+				message: Str::new(format!("Unsupported agent:// query parameter '{name}'.")),
+			});
+		}
+	}
+	selected
+		.filter(|value| !value.is_empty())
+		.map(Str::new)
+		.ok_or_else(|| Fault::Invalid {
+			message: Str::new_static("agent:// query form requires a nonempty ?q= value."),
+		})
+}
 
-fn select_bytes(
+fn project_json(bytes: Vec<u8>, query: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, Fault> {
+	let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
+		Fault::Invalid { message: Str::new(format!("Agent output is not valid JSON: {source}")) }
+	})?;
+	let query = if let Some(query) = query {
+		let mut selected = None;
+		for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+			if name == "q" {
+				if selected.replace(value.into_owned()).is_some() {
+					return Err(Fault::Invalid {
+						message: Str::new_static("agent:// accepts exactly one ?q= value."),
+					});
+				}
+			} else {
+				return Err(Fault::Invalid {
+					message: Str::new(format!("Unsupported agent:// query parameter '{name}'.")),
+				});
+			}
+		}
+		Str::new(selected.ok_or_else(|| Fault::Invalid {
+			message: Str::new_static("agent:// query form requires a nonempty ?q= value."),
+		})?)
+	} else if let Some(path) = path {
+		path_to_query(path).map_err(json_fault)?
+	} else {
+		return Ok(bytes);
+	};
+	if query.is_empty() {
+		return Err(Fault::Invalid {
+			message: Str::new_static("agent:// JSON query cannot be empty."),
+		});
+	}
+	let tokens = parse_query(&query).map_err(json_fault)?;
+	let selected = apply_query(&value, &tokens).map_err(json_fault)?;
+	render_value(selected, 8 * 1024 * 1024)
+		.map(|rendered| rendered.as_bytes().to_vec())
+		.map_err(json_fault)
+}
+
+fn render_history(resource: &str, bytes: Vec<u8>) -> Result<Vec<u8>, Fault> {
+	if resource.trim_matches('/').is_empty() {
+		return Ok(bytes);
+	}
+	let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+		message: Str::new_static("Agent transcript is not UTF-8 text."),
+	})?;
+	let mut output = format!("# {} transcript\n\n", resource.trim_matches('/'));
+	let mut rendered = 0usize;
+	for line in text.lines().filter(|line| !line.trim().is_empty()) {
+		let value: serde_json::Value =
+			serde_json::from_str(line).map_err(|source| Fault::Invalid {
+				message: Str::new(format!("Agent transcript contains invalid JSONL: {source}")),
+			})?;
+		let role = find_json_string(&value, "role");
+		let content = find_json_string(&value, "text")
+			.or_else(|| find_json_string(&value, "content"))
+			.or_else(|| find_json_string(&value, "message"));
+		if let Some(content) = content {
+			output.push_str("## ");
+			output.push_str(role.unwrap_or("event"));
+			output.push_str("\n\n");
+			output.push_str(content);
+			output.push_str("\n\n");
+			rendered += 1;
+		}
+	}
+	if rendered == 0 {
+		output.push_str("_Transcript contains no renderable message text._\n");
+	}
+	Ok(output.into_bytes())
+}
+
+fn find_json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+	match value {
+		serde_json::Value::Object(object) => object
+			.get(key)
+			.and_then(serde_json::Value::as_str)
+			.or_else(|| {
+				object
+					.values()
+					.find_map(|value| find_json_string(value, key))
+			}),
+		serde_json::Value::Array(values) => {
+			values.iter().find_map(|value| find_json_string(value, key))
+		},
+		_ => None,
+	}
+}
+
+fn registry_fault(error: impl std::fmt::Display) -> Fault {
+	Fault::Source { message: Str::new(error.to_string()) }
+}
+
+fn json_fault(error: impl std::fmt::Display) -> Fault {
+	Fault::Invalid { message: Str::new(error.to_string()) }
+}
+
+pub(super) fn select_bytes(
 	lines: &LineOffsetCache,
 	resource: &str,
 	bytes: CowBytes<'static>,

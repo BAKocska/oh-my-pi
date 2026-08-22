@@ -21,8 +21,8 @@ use omp_llm_inference::{
 	answer::{
 		Artifact, ArtifactBody, AudioChunk, ChatControl, ChatControlError, GenerationEvent,
 		ImageArtifact, NativeResponse, NativeResponseBody, RealtimeEvent as CanonicalRealtimeEvent,
-		RealtimeInput, SearchResults, TranscriptEvent, UsageReport, UsageStatus, UsageUnit,
-		UsageWindowKind, VideoArtifact,
+		RealtimeInput, SearchFailureKind, SearchResults, TranscriptEvent, UsageReport, UsageStatus,
+		UsageUnit, UsageWindowKind, VideoArtifact,
 	},
 	call::{
 		AudioFormat, Background, CallMeta, ContentPart, ContextStrategy, CountAccuracy,
@@ -34,7 +34,7 @@ use omp_llm_inference::{
 		ToolChoice, ToolDefinition, ToolInputConstraint, TranscriptionRequest, TruncationPolicy,
 		UsageRequest, UsageScope, VideoRequest,
 	},
-	error::{Error, ErrorDetail, ErrorKind},
+	error::{Error, ErrorDetail, ErrorKind, aggregate_search_failures, search_provider_failure},
 	event::{
 		BlockKind, ChatEvent, Completion, FinishReason, InvokeComplete, InvokeInput,
 		WorkflowActionResponse, WorkflowResponse, WorkflowResponseKind,
@@ -43,7 +43,11 @@ use omp_llm_inference::{
 		AccountId, ConversationId, RequestId, Revision as ProviderRevision, ToolCallId,
 		TurnId as ProviderTurnId,
 	},
-	operation::job::{JobCancelError, JobCancellationReceipt},
+	operation::{
+		job::{JobCancelError, JobCancellationReceipt},
+		search::fallback_allowed as search_fallback_allowed,
+		search_query::{parse_date_value, parse_search_query},
+	},
 	receipt::{Cost, ExecutionBudget, RecoveryKind, Usage, UsageSource},
 	router::Router,
 	session::{ConversationSessionPlanner, TurnReplay},
@@ -77,6 +81,7 @@ pub struct InferenceRpc {
 	test_live_responses: Option<flume::Sender<WorkflowResponse>>,
 	contexts:            Arc<Mutex<BTreeMap<String, RpcContext>>>,
 	generations:         Arc<Mutex<BTreeMap<String, RpcGeneration>>>,
+	search_settings:     Arc<omp_llm_inference::search_settings::WebSearchSettings>,
 }
 
 #[derive(Clone, Default)]
@@ -156,7 +161,18 @@ impl InferenceRpc {
 			epoch: epoch.into(),
 			contexts: Arc::new(Mutex::new(BTreeMap::new())),
 			generations: Arc::new(Mutex::new(BTreeMap::new())),
+			search_settings: Arc::new(Default::default()),
 		}
+	}
+
+	/// Replaces web-search routing settings for this immutable RPC facade.
+	#[must_use]
+	pub fn with_search_settings(
+		mut self,
+		settings: omp_llm_inference::search_settings::WebSearchSettings,
+	) -> Self {
+		self.search_settings = Arc::new(settings);
+		self
 	}
 
 	fn cursor(&self) -> pb::Cursor {
@@ -205,14 +221,13 @@ impl InferenceRpc {
 	/// the typed `TargetNotFound`.
 	fn target(&self, selector: &str, operation: OperationKind) -> Result<Target, Status> {
 		if !selector.is_empty() {
-			let key = ModelKey::from(selector);
 			let catalog = self.registry.catalog();
-			if catalog.model(&key).is_none()
+			if catalog.model(ModelKey::from_ref(selector)).is_none()
 				&& let Some(spec) = catalog.resolve_alias(selector)
 			{
 				return Ok(Target::Model(spec.key.clone()));
 			}
-			return Ok(Target::Model(key));
+			return Ok(Target::Model(ModelKey::from(selector)));
 		}
 		self
 			.registry
@@ -231,13 +246,22 @@ impl InferenceRpc {
 		target: Target,
 		request: RequestId,
 	) -> Client<omp_llm_inference::ProviderService, Router> {
+		self.client_with_deadline(target, request, None)
+	}
+
+	fn client_with_deadline(
+		&self,
+		target: Target,
+		request: RequestId,
+		deadline: Option<Instant>,
+	) -> Client<omp_llm_inference::ProviderService, Router> {
 		Client::new(
 			self.registry.service(),
 			Router::new(self.registry.clone(), Duration::from_secs(30)),
 			CallMeta {
 				id: request,
 				target,
-				deadline: None,
+				deadline,
 				budget: ExecutionBudget::default(),
 				session: None,
 			},
@@ -269,7 +293,7 @@ impl InferenceRpc {
 		operation: OperationKind,
 	) -> Result<Target, Status> {
 		if let Some(provider) = provider {
-			return Ok(Target::ProviderService(provider.clone()));
+			return Ok(Target::ProviderService(provider.to_owned()));
 		}
 		self
 			.registry
@@ -287,6 +311,7 @@ impl InferenceRpc {
 		&self,
 		turn: ProviderTurnId,
 		input: Option<&pb::turn_request::Input>,
+		provider_reset: bool,
 	) -> Result<ResolvedTurn, Status> {
 		let strategy = ContextStrategy::Replay;
 		match input {
@@ -326,13 +351,15 @@ impl InferenceRpc {
 					.sessions
 					.create_conversation()
 					.map_err(conversation_status)?;
-				let conversation = root.conversation().clone();
-				let revision = root.revision().clone();
+				let conversation = root.conversation().to_owned();
+				let revision = root.revision().to_owned();
 				let provider_session = SessionRequest {
 					conversation: conversation.clone(),
 					revision: revision.clone(),
 					turn,
 					strategy,
+					append_only: true,
+					provider_reset,
 					forked: false,
 				};
 				Ok(ResolvedTurn {
@@ -427,9 +454,9 @@ impl InferenceRpc {
 							.map_err(conversation_status)?;
 						(
 							committed_messages.clone(),
-							root.conversation().clone(),
-							root.revision().clone(),
-							[(0u64, root.revision().clone())].into_iter().collect(),
+							root.conversation().to_owned(),
+							root.revision().to_owned(),
+							[(0u64, root.revision().to_owned())].into_iter().collect(),
 							true,
 						)
 					};
@@ -438,6 +465,8 @@ impl InferenceRpc {
 					revision,
 					turn,
 					strategy,
+					append_only: true,
+					provider_reset,
 					forked,
 				};
 				Ok(ResolvedTurn {
@@ -505,16 +534,23 @@ impl pb::inference_server::Inference for InferenceRpc {
 			.params
 			.as_ref()
 			.ok_or_else(|| Status::invalid_argument("TurnRequest.params is required"))?;
-		let mut resolved = match self.resolve_turn_input(turn.clone(), open.input.as_ref()) {
-			Ok(resolved) => resolved,
-			Err(status) => {
-				let Some(event) = turn_recovery_event(&status, open.input.as_ref(), &self.contexts)
-				else {
-					return Err(status);
-				};
-				return Ok(Response::new(Box::pin(stream::once(async move { Ok(event) }))));
-			},
-		};
+		let provider_reset = open
+			.props
+			.as_ref()
+			.and_then(|props| props.fields.get(omp_agent::PROVIDER_RESET_PROP))
+			.and_then(|value| value.kind.as_ref())
+			.is_some_and(|kind| matches!(kind, pb::value::Kind::Bool(true)));
+		let mut resolved =
+			match self.resolve_turn_input(turn.clone(), open.input.as_ref(), provider_reset) {
+				Ok(resolved) => resolved,
+				Err(status) => {
+					let Some(event) = turn_recovery_event(&status, open.input.as_ref(), &self.contexts)
+					else {
+						return Err(status);
+					};
+					return Ok(Response::new(Box::pin(stream::once(async move { Ok(event) }))));
+				},
+			};
 		let projection = Arc::new(Mutex::new(TurnProjection::default()));
 		let request_id = RequestId::from(open.turn_id.as_str());
 		if resolved.provider_session.is_some() {
@@ -1035,8 +1071,45 @@ impl pb::inference_server::Inference for InferenceRpc {
 			(true, false) => Some(request.country.as_str().into()),
 			(true, true) => None,
 		};
+		let mut parsed_query = parse_search_query(&request.query);
+		if !request.after.is_empty() {
+			parsed_query.after =
+				Some(parse_date_value(&request.after).ok_or_else(|| {
+					Status::invalid_argument("SearchRequest.after must be a valid date")
+				})?);
+		}
+		if !request.before.is_empty() {
+			parsed_query.before = Some(parse_date_value(&request.before).ok_or_else(|| {
+				Status::invalid_argument("SearchRequest.before must be a valid date")
+			})?);
+		}
+		let provider =
+			(!request.engine.is_empty()).then(|| ProviderId::from(request.engine.as_str()));
+		let timeout = if request.timeout_ms == 0 {
+			Duration::from_secs(u64::from(self.search_settings.timeout_seconds))
+		} else {
+			Duration::from_millis(u64::from(request.timeout_ms)).min(Duration::from_secs(300))
+		};
+		let temperature = request.temperature.map(|value| value as f32);
+		if temperature.is_some_and(|value| !value.is_finite()) {
+			return Err(Status::invalid_argument("SearchRequest.temperature must be finite"));
+		}
+		let excluded_providers = self
+			.search_settings
+			.exclusions
+			.iter()
+			.map(|provider| ProviderId::from(provider.as_str()))
+			.collect::<Vec<_>>();
+		let provider_order = self
+			.search_settings
+			.order
+			.iter()
+			.map(|provider| ProviderId::from(provider.as_str()))
+			.filter(|provider| !excluded_providers.contains(provider))
+			.collect::<Vec<_>>();
 		let operation = SearchRequest {
 			query: request.query.as_str().into(),
+			parsed_query: Arc::new(parsed_query),
 			include_domains: request
 				.allowed_domains
 				.iter()
@@ -1051,18 +1124,61 @@ impl pb::inference_server::Inference for InferenceRpc {
 				.into(),
 			recency,
 			locale,
-			max_results: request.limit,
+			max_results: if request.limit == 0 {
+				10
+			} else {
+				request.limit
+			},
+			retrieval_results: (request.num_search_results != 0).then_some(request.num_search_results),
+			max_output_tokens: (request.max_tokens != 0).then_some(request.max_tokens),
+			temperature,
+			provider: provider.clone(),
+			provider_order: provider_order.clone().into(),
+			excluded_providers: excluded_providers.into(),
+			attempt_timeout: timeout,
 			synthesize_answer: Setting::Prefer(true),
 			negotiation: NegotiationPolicy::default(),
 		};
-		let target = if request.engine.is_empty() {
-			self.target("", OperationKind::Search)?
-		} else {
-			Target::ProviderService(ProviderId::from(request.engine.as_str()))
-		};
-		let mut client = self.client(target, rpc_request_id("search"));
-		let answer = client.execute(operation).await.map_err(inference_status)?;
-		Ok(Response::new(search_response(answer)))
+		let providers = provider.map_or(provider_order, |provider| vec![provider]);
+		if providers.is_empty() {
+			return Err(Status::failed_precondition(
+				"web search provider order is empty after exclusions",
+			));
+		}
+		let explicit = operation.provider.is_some();
+		let mut failures = Vec::new();
+		for (index, provider) in providers.iter().enumerate() {
+			let mut client = self.client_with_deadline(
+				Target::ProviderService(provider.clone()),
+				rpc_request_id("search"),
+				Some(Instant::now() + timeout),
+			);
+			match client.execute(operation.clone()).await {
+				Ok(mut answer) => {
+					let mut prior = failures
+						.iter()
+						.map(search_provider_failure)
+						.collect::<Vec<_>>();
+					prior.append(&mut answer.metadata.failures);
+					answer.metadata.failures = prior;
+					return Ok(Response::new(search_response(answer)));
+				},
+				Err(error) => {
+					let has_next = !explicit && index + 1 < providers.len();
+					let can_fallback = has_next
+						&& error
+							.receipt()
+							.attempts
+							.last()
+							.is_some_and(|attempt| search_fallback_allowed(&error, attempt.body));
+					failures.push(error);
+					if !can_fallback {
+						break;
+					}
+				},
+			}
+		}
+		Err(inference_status(aggregate_search_failures(failures)))
 	}
 
 	async fn generate_video(
@@ -1854,18 +1970,20 @@ fn chat_request(
 		.sampling
 		.as_ref()
 		.map_or_else(Sampling::default, |sampling| Sampling {
-			temperature:       sampling.temperature.map(|value| value as f32),
-			top_p:             sampling.top_p.map(|value| value as f32),
-			top_k:             sampling.top_k,
-			seed:              None,
-			stop:              sampling
+			min_p:              None,
+			repetition_penalty: None,
+			temperature:        sampling.temperature.map(|value| value as f32),
+			top_p:              sampling.top_p.map(|value| value as f32),
+			top_k:              sampling.top_k,
+			seed:               None,
+			stop:               sampling
 				.stop
 				.iter()
 				.map(|value| Str::from(value.as_str()))
 				.collect::<Vec<_>>()
 				.into(),
-			presence_penalty:  sampling.presence_penalty.map(|value| value as f32),
-			frequency_penalty: sampling.frequency_penalty.map(|value| value as f32),
+			presence_penalty:   sampling.presence_penalty.map(|value| value as f32),
+			frequency_penalty:  sampling.frequency_penalty.map(|value| value as f32),
 		});
 	Ok(omp_llm_inference::call::ChatRequest {
 		messages: messages.into(),
@@ -2510,7 +2628,7 @@ fn turn_events(
 									Status::internal("completed provider turn has no committed revision")
 								})?
 								.revision()
-								.clone(),
+								.to_owned(),
 						)
 					} else {
 						None
@@ -2523,7 +2641,7 @@ fn turn_events(
 							messages.extend(items_messages(&outcome.output)?);
 							let head = next_revision.head;
 							if let Some(provider_revision) = provider_revision.as_ref() {
-								resolved.provider_heads.insert(head, provider_revision.clone());
+								resolved.provider_heads.insert(head, provider_revision.to_owned());
 							}
 							Some((
 								context_id.clone(),
@@ -2659,13 +2777,15 @@ fn speak_event(chunk: AudioChunk) -> pb::SpeakEvent {
 }
 
 fn search_response(answer: SearchResults) -> pb::SearchResponse {
+	let omp_llm_inference::answer::SearchResults { results, answer, usage, metadata } = answer;
+	let engine = metadata
+		.provider
+		.as_ref()
+		.map_or_else(String::new, |provider| provider.as_str().to_owned());
 	pb::SearchResponse {
-		engine:         String::new(),
-		answer:         answer
-			.answer
-			.map_or_else(String::new, |answer| answer.as_str().to_owned()),
-		sources:        answer
-			.results
+		engine,
+		answer: answer.map_or_else(String::new, |answer| answer.as_str().to_owned()),
+		sources: results
 			.into_iter()
 			.map(|result| pb::search_response::Source {
 				url:          result.url.as_str().to_owned(),
@@ -2677,19 +2797,71 @@ fn search_response(answer: SearchResults) -> pb::SearchResponse {
 					.published_at
 					.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
 					.map_or_else(String::new, |duration| duration.as_secs().to_string()),
-				author:       String::new(),
+				author:       result
+					.author
+					.map_or_else(String::new, |author| author.as_str().to_owned()),
 				score:        result.score.map(f64::from),
 			})
 			.collect(),
-		citations:      Vec::new(),
-		search_queries: Vec::new(),
-
-		related:     Vec::new(),
-		warnings:    Vec::new(),
-		usage:       Some(proto_usage(answer.usage)),
-		cost:        None,
+		citations: metadata
+			.citations
+			.into_iter()
+			.map(|citation| pb::search_response::Citation {
+				url:        citation.url.as_str().to_owned(),
+				title:      citation
+					.title
+					.map_or_else(String::new, |title| title.as_str().to_owned()),
+				cited_text: citation
+					.cited_text
+					.map_or_else(String::new, |text| text.as_str().to_owned()),
+				start:      citation.start,
+				end:        citation.end,
+			})
+			.collect(),
+		search_queries: metadata
+			.search_queries
+			.into_iter()
+			.map(String::from)
+			.collect(),
+		related: metadata
+			.related_questions
+			.into_iter()
+			.map(String::from)
+			.collect(),
+		warnings: metadata.warnings.into_iter().map(String::from).collect(),
+		usage: Some(proto_usage(usage)),
+		cost: None,
 		unsupported: Vec::new(),
-		props:       None,
+		account: metadata
+			.account
+			.map_or_else(String::new, |account| account.as_str().to_owned()),
+		auth_mode: metadata
+			.auth_mode
+			.map_or_else(String::new, |mode| mode.as_str().to_owned()),
+		failures: metadata
+			.failures
+			.into_iter()
+			.map(|failure| pb::search_response::Failure {
+				provider: failure.provider.as_str().to_owned(),
+				kind:     search_failure_kind(failure.kind) as i32,
+				status:   failure.status.map(u32::from),
+				code:     failure
+					.code
+					.map_or_else(String::new, |code| code.as_str().to_owned()),
+			})
+			.collect(),
+		props: None,
+	}
+}
+
+fn search_failure_kind(kind: SearchFailureKind) -> pb::search_response::failure::Kind {
+	match kind {
+		SearchFailureKind::Authentication => pb::search_response::failure::Kind::Authentication,
+		SearchFailureKind::Quota => pb::search_response::failure::Kind::Quota,
+		SearchFailureKind::ModelNotFound => pb::search_response::failure::Kind::ModelNotFound,
+		SearchFailureKind::Transport => pb::search_response::failure::Kind::Transport,
+		SearchFailureKind::Timeout => pb::search_response::failure::Kind::Timeout,
+		SearchFailureKind::Provider => pb::search_response::failure::Kind::Provider,
 	}
 }
 fn usage_response(report: UsageReport) -> pb::UsageResponse {
@@ -2858,6 +3030,17 @@ fn realtime_event(event: CanonicalRealtimeEvent) -> Result<pb::RealtimeEvent, St
 		}),
 		CanonicalRealtimeEvent::InputCommitted => {
 			pb::realtime_event::Event::InputCommitted(pb::RealtimeInputCommitted {})
+		},
+		CanonicalRealtimeEvent::Phase(_)
+		| CanonicalRealtimeEvent::Transcript(_)
+		| CanonicalRealtimeEvent::Delegation(_)
+		| CanonicalRealtimeEvent::Muted(_) => {
+			return Err(Status::failed_precondition(
+				"core live events require the live voice RPC projection",
+			));
+		},
+		CanonicalRealtimeEvent::CloseReceipt(_) => {
+			pb::realtime_event::Event::Closed(pb::RealtimeClosed {})
 		},
 		CanonicalRealtimeEvent::Closed => pb::realtime_event::Event::Closed(pb::RealtimeClosed {}),
 		CanonicalRealtimeEvent::Chat(chat) => {
@@ -3248,7 +3431,15 @@ mod tests {
 			receipt: receipt.into(),
 		};
 
-		assert_eq!(completion.receipt.plan.route.as_ref().map(RouteId::as_str), Some("route-fork"));
+		assert_eq!(
+			completion
+				.receipt
+				.plan
+				.route
+				.as_ref()
+				.map(|route| route.as_str()),
+			Some("route-fork")
+		);
 		assert_eq!(completion.receipt.recoveries.len(), 1);
 		let outcome = build_turn_outcome(&TurnProjection::default(), &completion, None, 0);
 		assert_eq!(outcome.provider, "provider-fork");

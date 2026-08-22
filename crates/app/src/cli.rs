@@ -11,6 +11,7 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
@@ -233,37 +234,84 @@ impl FromStr for ToolNames {
 	}
 }
 
+pub mod bootstrap;
+pub mod profile_bootstrap;
+pub mod routing;
+/// Non-empty comma-separated selector list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectorList(
+	/// Ordered selectors.
+	pub Vec<Str>,
+);
+
+impl FromStr for SelectorList {
+	type Err = String;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		let values = value.split(',').map(str::trim).collect::<Vec<_>>();
+		if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+			return Err("expected a non-empty comma-separated list".into());
+		}
+		Ok(Self(values.into_iter().map(Str::from).collect()))
+	}
+}
+
 /// Top-level parser for the production `omp` executable.
 #[derive(Clone, Debug, Parser)]
 #[command(
 	name = "omp",
 	version,
 	about = "OMP coding agent and inference runtime",
-	after_long_help = "Environment: OMP_DATA_DIR selects application state; OMP_PROFILE selects a \
-	                   profile; OMP_WORKTREE_DIR overrides worktree.base."
+	after_long_help = crate::help_extra::render()
 )]
 pub struct OmpCli {
 	/// Enable an extension specification for this invocation.
 	#[arg(long, global = true, value_name = "SPEC", conflicts_with = "no_ext")]
-	pub ext:              Vec<Str>,
+	pub ext:               Vec<Str>,
 	/// Load only this local extension path for this invocation.
 	#[arg(long = "ext-only", global = true, value_name = "PATH", conflicts_with = "no_ext")]
-	pub ext_only:         Vec<PathBuf>,
+	pub ext_only:          Vec<PathBuf>,
+	/// Load exactly these absolute Python modules through the trusted
+	/// supervisor.
+	#[arg(
+		long = "trusted-extension",
+		global = true,
+		value_name = "ABSOLUTE_PATH",
+		value_parser = trusted_extension_path,
+		conflicts_with_all = ["ext", "ext_only", "no_ext"]
+	)]
+	pub trusted_extension: Vec<PathBuf>,
 	/// Suppress all configured extensions for this invocation.
-	#[arg(long = "no-ext", global = true, conflicts_with_all = ["ext", "ext_only"])]
-	pub no_ext:           bool,
+	#[arg(
+		long = "no-ext",
+		global = true,
+		conflicts_with_all = ["ext", "ext_only", "trusted_extension"]
+	)]
+	pub no_ext:            bool,
 	/// Suppress the workspace extension layer for this invocation.
 	#[arg(long = "no-workspace-ext", global = true)]
-	pub no_workspace_ext: bool,
+	pub no_workspace_ext:  bool,
 	/// Operation to run. Defaults to interactive project chat.
 	#[command(subcommand)]
-	pub command:          Option<Command>,
+	pub command:           Option<Command>,
 	/// Change to this project directory before dispatch.
 	#[arg(long, global = true, value_name = "PATH")]
-	pub cwd:              Option<PathBuf>,
+	pub cwd:               Option<PathBuf>,
 	/// Permit running interactively from the home directory.
 	#[arg(long, global = true)]
-	pub allow_home:       bool,
+	pub allow_home:        bool,
+	/// Select a named profile before settings and extensions are loaded.
+	#[arg(skip)]
+	pub profile:           Option<Str>,
+	/// Install a shell wrapper for the selected profile and exit.
+	#[arg(skip)]
+	pub alias:             Option<Str>,
+	/// Run deterministic native subsystem probes before chat startup.
+	#[arg(long, global = true)]
+	pub smoke_test:        bool,
+	/// Typed contributed values excluded from prompt positionals.
+	#[arg(skip)]
+	pub contributed:       Vec<bootstrap::ContributedCliValue>,
 }
 
 /// Production application commands.
@@ -281,6 +329,9 @@ pub enum Command {
 	Print(PrintArgs),
 	/// Run the stateful Content-Length framed RPC server on standard I/O.
 	Rpc(RpcArgs),
+	/// Run RPC with retained UI frame support.
+	#[command(name = "rpc-ui")]
+	RpcUi(RpcArgs),
 	/// Run the Agent Client Protocol server over newline-delimited JSON.
 	Acp(AcpArgs),
 	/// Run one typed operation in process.
@@ -303,10 +354,47 @@ pub enum Command {
 	Models(ModelsArgs),
 	/// Inspect or clear Environment-owned worktrees.
 	Worktree(WorktreeArgs),
+	/// Generate a static shell completion script.
+	Completions {
+		/// Target shell.
+		#[arg(value_enum)]
+		shell: CompletionShell,
+	},
+	/// Emit dynamic model or session completion candidates.
+	#[command(name = "__complete", hide = true)]
+	Complete {
+		/// Candidate class.
+		#[arg(value_enum)]
+		kind:   crate::complete_cmd::CompletionKind,
+		/// Optional fuzzy prefix after `--`.
+		#[arg(last = true, default_value = "")]
+		prefix: Str,
+	},
 	/// Auth-broker verbs are retained as structured errors until a broker
 	/// backend lands.
 	#[command(name = "auth-broker")]
 	AuthBroker(AuthBrokerArgs),
+}
+
+/// Shell completion target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CompletionShell {
+	/// Bash.
+	Bash,
+	/// Z shell.
+	Zsh,
+	/// Fish.
+	Fish,
+}
+
+impl From<CompletionShell> for Shell {
+	fn from(value: CompletionShell) -> Self {
+		match value {
+			CompletionShell::Bash => Self::Bash,
+			CompletionShell::Zsh => Self::Zsh,
+			CompletionShell::Fish => Self::Fish,
+		}
+	}
 }
 
 /// Foreign transcript import options.
@@ -379,6 +467,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "print", aliases: &["p"] },
 	CommandSpec { name: "infer", aliases: &[] },
 	CommandSpec { name: "rpc", aliases: &[] },
+	CommandSpec { name: "rpc-ui", aliases: &[] },
 	CommandSpec { name: "acp", aliases: &[] },
 	CommandSpec { name: "auth", aliases: &[] },
 	CommandSpec { name: "auth-broker", aliases: &[] },
@@ -389,13 +478,15 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "models", aliases: &["model"] },
 	CommandSpec { name: "import-session", aliases: &[] },
 	CommandSpec { name: "worktree", aliases: &[] },
+	CommandSpec { name: "completions", aliases: &[] },
+	CommandSpec { name: "__complete", aliases: &[] },
 ];
 
 /// Returns whether a root command shares the launch option surface.
 fn is_launch_command(argument: &OsString) -> bool {
 	matches!(
 		argument.to_string_lossy().as_ref(),
-		"chat" | "i" | "launch" | "print" | "p" | "rpc" | "acp"
+		"chat" | "i" | "launch" | "print" | "p" | "rpc" | "rpc-ui" | "acp"
 	)
 }
 
@@ -412,6 +503,9 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 		"--cwd"
 			| "--ext"
 			| "--ext-only"
+			| "--trusted-extension"
+			| "--profile"
+			| "--alias"
 			| "--model"
 			| "--project"
 			| "--gateway"
@@ -425,6 +519,21 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--max-time"
 			| "--tools"
 			| "--mode"
+			| "--follow-up"
+			| "--provider"
+			| "--provider-session-id"
+			| "--prompt-cache-key"
+			| "--config"
+			| "--add-dir"
+			| "--smol"
+			| "--slow"
+			| "--plan"
+			| "--models"
+			| "--prewalk-into"
+			| "--skills"
+			| "--api-key"
+			| "--system-prompt"
+			| "--append-system-prompt"
 			| "--follow-up"
 	);
 	if consumes_value {
@@ -441,6 +550,17 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--py-eval"
 			| "--print-thoughts"
 			| "--shape-transcript"
+			| "--acp-terminal-auth"
+			| "--smoke-test"
+			| "--plan-mode"
+			| "--prewalk"
+			| "--no-prewalk"
+			| "--no-tools"
+			| "--no-lsp"
+			| "--no-pty"
+			| "--no-skills"
+			| "--no-rules"
+			| "--no-title"
 			| "--acp-terminal-auth"
 	)
 	.then_some(false)
@@ -483,12 +603,71 @@ pub struct EnvdArgs {
 	#[arg(long, value_name = "SECONDS", default_value_t = 900)]
 	pub idle_timeout:     u64,
 }
+/// Typed prompt overrides shared by launch-shaped commands.
+#[derive(Clone, Debug, Default, Args)]
+pub struct PromptArgs {
+	/// Select the prompt personality preset.
+	#[arg(long, value_name = "PRESET")]
+	pub personality:             Option<omp_agent::Personality>,
+	/// Surface the active model identifier in workstation facts.
+	#[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+	pub include_model_in_prompt: Option<bool>,
+	/// Include Environment-owned workstation facts.
+	#[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+	pub include_workstation:     Option<bool>,
+	/// Include a bounded workspace tree.
+	#[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+	pub include_workspace_tree:  Option<bool>,
+	/// Permit Mermaid diagram rendering guidance.
+	#[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+	pub render_mermaid:          Option<bool>,
+	/// Include enabled skills in prompt assembly.
+	#[arg(
+		long = "skills-enabled",
+		value_name = "BOOL",
+		num_args = 0..=1,
+		default_missing_value = "true"
+	)]
+	pub skills_enabled:          Option<bool>,
+	/// Replace customizable prompt slots from a file path or literal string.
+	#[arg(long = "system-prompt", visible_alias = "system", value_name = "PATH_OR_TEXT")]
+	pub custom_prompt:           Option<Str>,
+	/// Append guidance from a file path or literal string.
+	#[arg(
+		long = "append-system-prompt",
+		visible_aliases = ["append-prompt", "append-system"],
+		value_name = "PATH_OR_TEXT"
+	)]
+	pub append_prompt:           Option<Str>,
+	/// Explicitly bypass provider prompt items for developer and test use.
+	#[arg(long)]
+	pub null_prompt:             bool,
+}
+
 /// Interactive project-chat options.
 #[derive(Clone, Debug, Args)]
 pub struct ChatArgs {
 	/// Catalog model key, alias, or role.
 	#[arg(long)]
 	pub model:            Option<Str>,
+	/// Provider preference for the selected model.
+	#[arg(long)]
+	pub provider:         Option<Str>,
+	/// Fast/low-cost model-role selector.
+	#[arg(long)]
+	pub smol:             Option<Str>,
+	/// Deep-reasoning model-role selector.
+	#[arg(long)]
+	pub slow:             Option<Str>,
+	/// Planning model-role selector.
+	#[arg(long)]
+	pub plan:             Option<Str>,
+	/// Ordered model selectors available for interactive cycling.
+	#[arg(long)]
+	pub models:           Option<SelectorList>,
+	/// Provider session selector, never inferred from prompt text.
+	#[arg(long = "provider-session-id")]
+	pub provider_session: Option<Str>,
 	/// Project root whose environment and durable sessions are used.
 	#[arg(long, value_name = "PATH", default_value = ".")]
 	pub project:          PathBuf,
@@ -499,19 +678,23 @@ pub struct ChatArgs {
 	#[arg(long, value_name = "ULID")]
 	pub resume:           Option<Str>,
 	/// Continue a UUID session.
-	#[arg(long = "continue", short = 'c', value_name = "SESSION", conflicts_with = "fork")]
+	#[arg(
+		long = "continue",
+		short = 'c',
+		value_name = "SESSION",
+		num_args = 0..=1,
+		default_missing_value = "@terminal",
+		conflicts_with = "fork"
+	)]
 	pub continue_session: Option<Str>,
 	/// Fork an existing session before opening the chat.
-	// Hidden until the session migration backend lands; dispatch rejects it.
-	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session"], hide = true)]
+	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session", "no_session"])]
 	pub fork:             Option<Str>,
 	/// Do not persist a durable session for this chat.
-	// Hidden until the session migration backend lands; dispatch rejects it.
-	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork"], hide = true)]
+	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork"])]
 	pub no_session:       bool,
-	/// Override the session storage directory.
-	// Hidden until the session migration backend lands; dispatch rejects it.
-	#[arg(long, value_name = "PATH", hide = true)]
+	/// Override the native session storage directory.
+	#[arg(long, value_name = "PATH")]
 	pub session_dir:      Option<PathBuf>,
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
 	#[arg(long)]
@@ -526,11 +709,58 @@ pub struct ChatArgs {
 	#[arg(long)]
 	pub max_time:         Option<CliDuration>,
 	/// Restrict enabled tools to these normalized names.
-	#[arg(long)]
+	#[arg(long, conflicts_with = "no_tools")]
 	pub tools:            Option<ToolNames>,
-	/// Enable the environment-owned Python expression-evaluation tool.
+	/// Disable every built-in tool.
+	#[arg(long)]
+	pub no_tools:         bool,
+	/// Disable LSP tools, formatting, and diagnostics.
+	#[arg(long)]
+	pub no_lsp:           bool,
+	/// Disable PTY-backed shell execution.
+	#[arg(long)]
+	pub no_pty:           bool,
+	/// Enter read-only planning mode at startup.
+	#[arg(long = "plan-mode")]
+	pub plan_mode:        bool,
+	/// Enter prewalk automation.
+	#[arg(long, conflicts_with = "no_prewalk")]
+	pub prewalk:          bool,
+	/// Disable configured prewalk automation.
+	#[arg(long, conflicts_with = "prewalk")]
+	pub no_prewalk:       bool,
+	/// Model selector used when prewalk begins.
+	#[arg(long)]
+	pub prewalk_into:     Option<Str>,
+	/// Read-only native TOML settings overlays in precedence order.
+	#[arg(long = "config", value_name = "TOML")]
+	pub config:           Vec<PathBuf>,
+	/// Additional authorized workspace roots.
+	#[arg(long = "add-dir", value_name = "PATH")]
+	pub add_dir:          Vec<PathBuf>,
+	/// Comma-separated skill glob filters.
+	#[arg(long)]
+	pub skills:           Option<SelectorList>,
+	/// Disable skill discovery.
+	#[arg(long, conflicts_with = "skills")]
+	pub no_skills:        bool,
+	/// Disable rule discovery.
+	#[arg(long)]
+	pub no_rules:         bool,
+	/// Disable generated terminal titles.
+	#[arg(long)]
+	pub no_title:         bool,
+	/// Ephemeral provider API key; never journaled.
+	#[arg(long)]
+	pub api_key:          Option<Str>,
+	/// Ephemeral provider prompt-cache affinity.
+	#[arg(long = "prompt-cache-key")]
+	pub prompt_cache_key: Option<Str>,
 	#[arg(long)]
 	pub py_eval:          bool,
+	/// Typed prompt settings and invocation overrides.
+	#[command(flatten)]
+	pub prompt_settings:  PromptArgs,
 }
 
 impl ChatArgs {
@@ -539,6 +769,12 @@ impl ChatArgs {
 	pub fn default_interactive() -> Self {
 		Self {
 			model:            None,
+			provider:         None,
+			smol:             None,
+			slow:             None,
+			plan:             None,
+			models:           None,
+			provider_session: None,
 			project:          ".".into(),
 			gateway:          None,
 			resume:           None,
@@ -551,7 +787,23 @@ impl ChatArgs {
 			approval_mode:    None,
 			max_time:         None,
 			tools:            None,
+			no_tools:         false,
+			no_lsp:           false,
+			no_pty:           false,
+			plan_mode:        false,
+			prewalk:          false,
+			no_prewalk:       false,
+			prewalk_into:     None,
+			config:           Vec::new(),
+			add_dir:          Vec::new(),
+			skills:           None,
+			no_skills:        false,
+			no_rules:         false,
+			no_title:         false,
+			api_key:          None,
+			prompt_cache_key: None,
 			py_eval:          false,
+			prompt_settings:  PromptArgs::default(),
 		}
 	}
 }
@@ -561,6 +813,24 @@ pub struct PrintArgs {
 	/// Catalog model key. Falls back to `config.default_model`.
 	#[arg(long)]
 	pub model:            Option<Str>,
+	/// Read-only native TOML settings overlays in precedence order.
+	#[arg(long = "config", value_name = "TOML")]
+	pub config:           Vec<PathBuf>,
+	/// Additional authorized roots used by Environment-backed print tools.
+	#[arg(long = "add-dir", value_name = "PATH")]
+	pub add_dir:          Vec<PathBuf>,
+	/// Fast/low-cost model-role selector.
+	#[arg(long)]
+	pub smol:             Option<Str>,
+	/// Deep-reasoning model-role selector.
+	#[arg(long)]
+	pub slow:             Option<Str>,
+	/// Planning model-role selector.
+	#[arg(long)]
+	pub plan:             Option<Str>,
+	/// Model cycling list shared with interactive launch metadata.
+	#[arg(long)]
+	pub models:           Option<SelectorList>,
 	/// Emit newline-delimited JSON events rather than final text.
 	#[arg(long, value_parser = ["text", "json"], default_value = "text")]
 	pub mode:             String,
@@ -580,14 +850,29 @@ pub struct PrintArgs {
 	#[arg(long)]
 	pub max_time:         Option<CliDuration>,
 	/// Restrict enabled tools to these normalized names.
-	#[arg(long)]
+	#[arg(long, conflicts_with = "no_tools")]
 	pub tools:            Option<ToolNames>,
+	/// Disable every tool for this invocation.
+	#[arg(long)]
+	pub no_tools:         bool,
+	/// Disable LSP-backed tools.
+	#[arg(long)]
+	pub no_lsp:           bool,
+	/// Disable PTY-backed tools.
+	#[arg(long)]
+	pub no_pty:           bool,
 	/// Additional user messages applied in order after the initial prompt.
 	#[arg(long = "follow-up", value_name = "TEXT")]
 	pub follow_ups:       Vec<Str>,
+	/// Enter plan mode with one explicitly authorized mutation transition.
+	#[arg(long)]
+	pub plan_yolo:        bool,
 	/// Drop provider payloads and partial transcript snapshots from NDJSON.
 	#[arg(long)]
 	pub shape_transcript: bool,
+	/// Typed prompt settings and invocation overrides.
+	#[command(flatten)]
+	pub prompt_settings:  PromptArgs,
 	/// Prompt words; `@path` includes a typed attachment.
 	#[arg(num_args = 0..)]
 	pub prompt:           Vec<Str>,
@@ -680,6 +965,88 @@ pub struct ConfigArgs {
 	pub command: ConfigCommand,
 }
 
+/// Writable native settings scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ConfigScope {
+	/// User/profile settings.
+	#[default]
+	Global,
+	/// Nearest project `.omp/config.toml`.
+	Project,
+}
+
+/// Writable native MCP configuration scope.
+#[derive(
+	Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, strum::Display, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "lowercase")]
+pub enum McpConfigScope {
+	/// User-level `~/.omp/mcp.json`.
+	Global,
+	/// Project-owned `.omp/mcp.json`.
+	#[default]
+	Project,
+	/// Project-root `.mcp.json`.
+	Root,
+}
+
+/// Native MCP configuration operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum McpConfigCommand {
+	/// List configured MCP servers.
+	List {
+		/// Restrict the listing to one native scope.
+		#[arg(long, value_enum)]
+		scope: Option<McpConfigScope>,
+		/// Emit structured JSON.
+		#[arg(long)]
+		json:  bool,
+	},
+	/// Read one configured MCP server.
+	Get {
+		/// Server name.
+		name: Str,
+	},
+	/// Add a validated MCP server from a JSON object.
+	Add {
+		/// Server name.
+		name:   Str,
+		/// MCP server JSON object.
+		config: Str,
+		/// Writable native scope.
+		#[arg(long, value_enum, default_value_t)]
+		scope:  McpConfigScope,
+	},
+	/// Insert or replace a validated MCP server from a JSON object.
+	Update {
+		/// Server name.
+		name:   Str,
+		/// MCP server JSON object.
+		config: Str,
+		/// Writable native scope.
+		#[arg(long, value_enum, default_value_t)]
+		scope:  McpConfigScope,
+	},
+	/// Remove an MCP server from one native scope.
+	Remove {
+		/// Server name.
+		name:  Str,
+		/// Writable native scope.
+		#[arg(long, value_enum, default_value_t)]
+		scope: McpConfigScope,
+	},
+	/// Enable a server, using a native override for read-only manifest sources.
+	Enable {
+		/// Server name.
+		name: Str,
+	},
+	/// Disable a server, using a native override for read-only manifest sources.
+	Disable {
+		/// Server name.
+		name: Str,
+	},
+}
+
 /// Schema-validated settings operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum ConfigCommand {
@@ -700,14 +1067,30 @@ pub enum ConfigCommand {
 		key:   Str,
 		/// Typed value.
 		value: Str,
+		/// Writable native scope.
+		#[arg(long, value_enum, default_value_t)]
+		scope: ConfigScope,
 	},
-	/// Reset one schema key to its default.
-	Reset {
+	/// Remove one schema key from a writable layer.
+	Unset {
 		/// Schema key.
-		key: Str,
+		key:   Str,
+		/// Writable native scope.
+		#[arg(long, value_enum, default_value_t)]
+		scope: ConfigScope,
 	},
-	/// Print the active settings file path.
-	Path,
+	/// Print a native settings file path.
+	Path {
+		/// Writable native scope.
+		#[arg(long, value_enum, default_value_t)]
+		scope: ConfigScope,
+	},
+	/// Manage native MCP server configuration.
+	Mcp {
+		/// MCP operation.
+		#[command(subcommand)]
+		command: McpConfigCommand,
+	},
 }
 
 /// Model catalog command tree.
@@ -857,6 +1240,7 @@ enum DispatchTarget {
 	Chat,
 	Print,
 	Rpc,
+	RpcUi,
 	Acp,
 	Infer,
 	Auth,
@@ -868,6 +1252,8 @@ enum DispatchTarget {
 	Models,
 	AuthBroker,
 	Worktree,
+	Completions,
+	Complete,
 }
 
 #[cfg(test)]
@@ -876,6 +1262,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		None | Some(Command::Chat(_)) => DispatchTarget::Chat,
 		Some(Command::Print(_)) => DispatchTarget::Print,
 		Some(Command::Rpc(_)) => DispatchTarget::Rpc,
+		Some(Command::RpcUi(_)) => DispatchTarget::RpcUi,
 		Some(Command::Acp(_)) => DispatchTarget::Acp,
 		Some(Command::Serve(_)) => DispatchTarget::Serve,
 		Some(Command::Envd(_)) => DispatchTarget::Envd,
@@ -892,6 +1279,8 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Config(_)) => DispatchTarget::Config,
 		Some(Command::Models(_)) => DispatchTarget::Models,
 		Some(Command::Worktree(_)) => DispatchTarget::Worktree,
+		Some(Command::Completions { .. }) => DispatchTarget::Completions,
+		Some(Command::Complete { .. }) => DispatchTarget::Complete,
 		Some(Command::AuthBroker(_)) => DispatchTarget::AuthBroker,
 	}
 }
@@ -911,6 +1300,22 @@ fn chat_start(args: &mut ChatArgs) -> crate::chat::ChatStart {
 	reason = "chat dispatch preserves the thread-confined omp_tui::App future"
 )]
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
+	if cli.smoke_test {
+		return crate::smoke_test::run().await;
+	}
+	if let Some(alias) = cli.alias.as_deref() {
+		let profile = cli.profile.as_deref().ok_or_else(|| {
+			crate::usage_error::CliUsageError::new("--alias requires --profile or OMP_PROFILE")
+		})?;
+		let installed = crate::profile_alias::install(alias, profile, None).into_diagnostic()?;
+		println!(
+			"installed {} profile wrapper `{}` in {}",
+			installed.shell,
+			installed.name,
+			installed.path.display()
+		);
+		return Ok(());
+	}
 	if let Some(cwd) = cli.cwd.as_deref() {
 		std::env::set_current_dir(cwd).into_diagnostic()?;
 	}
@@ -927,31 +1332,12 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Envd(args) => crate::envd::run(args).await,
 		Command::Chat(mut args) => {
 			let start = chat_start(&mut args);
-			if args.fork.is_some() || args.no_session || args.session_dir.is_some() {
-				return Err(
-					crate::usage_error::CliUsageError::new(
-						"fork, --no-session, and --session-dir require the session migration backend",
-					)
-					.into(),
-				);
-			}
-			if let Some(session) = args.continue_session.take() {
-				if !looks_like_uuid(session.as_str()) {
-					return Err(
-						crate::usage_error::CliUsageError::new(
-							"--continue expects a UUID session identifier",
-						)
-						.into(),
-					);
-				}
-				args.resume = Some(session);
-			}
 			crate::startup_notice::show_once(&data_dir(None)?, args.model.as_ref())
 				.into_diagnostic()?;
 			Box::pin(crate::chat::run(args, start)).await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
-		Command::Rpc(args) => crate::rpc_mode::run(args).await,
+		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
 		Command::Auth(args) => auth(args).await,
@@ -968,6 +1354,11 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Config(args) => crate::config_cmd::run(&data_dir(None)?, &args.command),
 		Command::Models(args) => crate::models_cmd::run(&args),
 		Command::Worktree(args) => crate::worktree_cmd::run(&data_dir(None)?, &args),
+		Command::Completions { shell } => {
+			let bytes = crate::completions::script(shell.into());
+			std::io::Write::write_all(&mut std::io::stdout(), &bytes).into_diagnostic()
+		},
+		Command::Complete { kind, prefix } => crate::complete_cmd::run(kind, &prefix),
 		Command::AuthBroker(args) => Err(
 			crate::usage_error::CliUsageError::new(format!(
 				"auth-broker {:?} is unavailable: this build has no auth-broker backend",
@@ -982,7 +1373,17 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 /// options, normalizing bare prompts, and selecting print mode for a
 /// non-interactive empty invocation.
 pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<OmpCli, clap::Error> {
-	let mut arguments: Vec<OsString> = arguments.into_iter().collect();
+	use clap::error::ErrorKind;
+	let profile = profile_bootstrap::extract(arguments)
+		.map_err(|error| clap::Error::raw(ErrorKind::InvalidValue, error.to_string()))?;
+	profile_bootstrap::select(profile.profile.clone());
+	if let Some(message) = routing::redirect(&profile.arguments) {
+		return Err(clap::Error::raw(ErrorKind::InvalidSubcommand, message.to_string()));
+	}
+	let mut bootstrap = bootstrap::run(profile.arguments, builtin_contribution_names())
+		.map_err(|error| clap::Error::raw(ErrorKind::InvalidValue, error.to_string()))?;
+	profile_bootstrap::remove_boundaries(&mut bootstrap.arguments);
+	let mut arguments = bootstrap.arguments;
 	normalize_hidden_command(&mut arguments);
 	if !std::io::stdin().is_terminal()
 		&& first_positional(&arguments).is_none()
@@ -1003,7 +1404,49 @@ pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Om
 	}
 	normalize_hidden_command(&mut arguments);
 	normalize_bare_resume(&mut arguments);
-	OmpCli::try_parse_from(arguments)
+	let mut cli = OmpCli::try_parse_from(arguments)?;
+	cli.profile = profile.profile;
+	cli.alias = profile.alias;
+	cli.contributed = bootstrap.values;
+	Ok(cli)
+}
+
+fn builtin_contribution_names() -> impl Iterator<Item = Str> {
+	[
+		"add-dir",
+		"alias",
+		"allow-home",
+		"api-key",
+		"config",
+		"cwd",
+		"ext",
+		"ext-only",
+		"model",
+		"models",
+		"no-ext",
+		"no-lsp",
+		"no-pty",
+		"no-rules",
+		"no-skills",
+		"no-title",
+		"no-tools",
+		"plan",
+		"prewalk",
+		"prewalk-into",
+		"profile",
+		"provider",
+		"provider-session-id",
+		"plan-mode",
+		"skills",
+		"slow",
+		"smol",
+		"system-prompt",
+		"append-system-prompt",
+		"tools",
+		"trusted-extension",
+	]
+	.into_iter()
+	.map(Str::new_static)
 }
 
 fn normalize_hidden_command(arguments: &mut Vec<OsString>) {
@@ -1097,11 +1540,10 @@ fn is_command(argument: &OsString) -> bool {
 		.any(|entry| entry.name == argument || entry.aliases.contains(&argument.as_ref()))
 }
 
-fn looks_like_uuid(value: &str) -> bool {
-	value.len() == 36
-		&& value.bytes().enumerate().all(|(index, byte)| {
-			matches!(index, 8 | 13 | 18 | 23) && byte == b'-' || byte.is_ascii_hexdigit()
-		})
+fn trusted_extension_path(value: &str) -> Result<PathBuf, String> {
+	crate::envd::site::validate_trusted_module(Path::new(value))
+		.map(|module| module.path)
+		.map_err(|error| error.to_string())
 }
 
 fn is_home_dir() -> miette::Result<bool> {
@@ -1223,12 +1665,15 @@ pub(crate) fn data_dir(explicit: Option<PathBuf>) -> miette::Result<PathBuf> {
 	if let Some(path) = explicit {
 		return Ok(path);
 	}
-	if let Some(path) = std::env::var_os("OMP_DATA_DIR") {
-		return Ok(path.into());
-	}
-	let home =
-		std::env::var_os("HOME").ok_or_else(|| miette!("HOME or OMP_DATA_DIR must be set"))?;
-	Ok(PathBuf::from(home).join(".local/share/omp"))
+	let base = if let Some(path) = std::env::var_os("OMP_DATA_DIR") {
+		PathBuf::from(path)
+	} else {
+		let home =
+			std::env::var_os("HOME").ok_or_else(|| miette!("HOME or OMP_DATA_DIR must be set"))?;
+		PathBuf::from(home).join(".local/share/omp")
+	};
+	Ok(crate::cli::profile_bootstrap::selected()
+		.map_or(base.clone(), |profile| base.join("profiles").join(profile)))
 }
 
 fn catalog_import(args: &CatalogImportArgs) -> miette::Result<()> {
@@ -1469,6 +1914,35 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_prompt_override_surface() {
+		let cli = parse(&[
+			"omp",
+			"chat",
+			"--personality=pragmatic",
+			"--include-model-in-prompt=false",
+			"--include-workstation",
+			"--include-workspace-tree",
+			"--render-mermaid=false",
+			"--skills=false",
+			"--system-prompt=SYSTEM.md",
+			"--append-prompt=extra",
+			"--null-prompt",
+		]);
+		let Some(Command::Chat(args)) = cli.command else {
+			panic!("chat command");
+		};
+		assert_eq!(args.prompt_settings.personality, Some(omp_agent::Personality::Pragmatic));
+		assert_eq!(args.prompt_settings.include_model_in_prompt, Some(false));
+		assert_eq!(args.prompt_settings.include_workstation, Some(true));
+		assert_eq!(args.prompt_settings.include_workspace_tree, Some(true));
+		assert_eq!(args.prompt_settings.render_mermaid, Some(false));
+		assert_eq!(args.prompt_settings.skills_enabled, Some(false));
+		assert_eq!(args.prompt_settings.custom_prompt.as_deref(), Some("SYSTEM.md"));
+		assert_eq!(args.prompt_settings.append_prompt.as_deref(), Some("extra"));
+		assert!(args.prompt_settings.null_prompt);
+	}
+
+	#[test]
 	fn parses_every_auth_branch() {
 		assert!(matches!(
 			parse(&["omp", "auth", "login", "provider"]).command,
@@ -1586,9 +2060,7 @@ mod tests {
 	}
 
 	#[test]
-	fn normalizes_continue_uuid_and_rejects_non_uuid() {
-		assert!(looks_like_uuid("550e8400-e29b-41d4-a716-446655440000"));
-		assert!(!looks_like_uuid("not-a-session"));
+	fn parses_continue_selector_and_session_modes() {
 		let Some(Command::Chat(args)) = parse(&[
 			"omp",
 			"chat",

@@ -76,9 +76,12 @@ fn all_executable_command_paths_parse_with_omp_names() {
 				| Command::Models(_)
 				| Command::AuthBroker(_)
 				| Command::Rpc(_)
+				| Command::RpcUi(_)
 				| Command::Acp(_)
 				| Command::ImportSession(_)
-				| Command::Worktree(_),
+				| Command::Worktree(_)
+				| Command::Completions { .. }
+				| Command::Complete { .. },
 			) => {},
 			None => panic!("explicit subcommands must parse to Some"),
 		}

@@ -41,7 +41,12 @@ impl PreludeHost {
 
 #[async_trait]
 impl BridgeHost for PreludeHost {
-	async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError> {
+	async fn call(
+		&self,
+		name: &str,
+		args: Value,
+		_progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
 		self.calls.lock().push((name.to_owned(), args.clone()));
 		match name {
 			"echo" => Ok(args),
@@ -182,7 +187,7 @@ assert _tool_statuses[-2:] == [
 ]
 assert completion("prompt", model="smol") == "completed"
 assert completion("prompt", schema={"type": "object"}) == {"answer": 42}
-_child = agent("do work", handle=True, isolated=True)
+_child = agent("do work", name="Worker", effort="high", handle=True, isolated=True)
 assert _child == {
     "text": "child output", "output": "child output", "handle": "agent://child-1",
     "id": "child-1", "agent": "task", "isolated": True,
@@ -224,13 +229,13 @@ def _observed_parallel_width(item_count):
 		run(
 			py,
 			&globals,
-			"assert _observed_parallel_width(1000) == [32]\n".to_owned(),
+			"assert _observed_parallel_width(1000) == [1000]\n".to_owned(),
 		)?;
 		host.set_concurrency_limit(10_000);
 		run(
 			py,
 			&globals,
-			"assert _observed_parallel_width(1000) == [32]\n".to_owned(),
+			"assert _observed_parallel_width(1000) == [1000]\n".to_owned(),
 		)?;
 		host.set_concurrency_limit(3);
 		run(py, &globals, "assert _observed_parallel_width(1000) == [3]\n".to_owned())?;
@@ -245,7 +250,9 @@ def _observed_parallel_width(item_count):
 			.iter()
 			.any(|(name, args)| name == "echo" && args["i"] == "py prelude")
 	);
-	assert!(calls.iter().any(|(name, _)| name == "__agent__"));
+	assert!(calls.iter().any(|(name, args)| {
+		name == "__agent__" && args["name"] == "Worker" && args["effort"] == "high"
+	}));
 	assert!(calls.iter().any(|(name, _)| name == "__completion__"));
 	drop(calls);
 }

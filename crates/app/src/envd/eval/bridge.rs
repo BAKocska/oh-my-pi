@@ -2,6 +2,7 @@ use std::{
 	collections::BTreeMap,
 	ffi::CString,
 	fmt,
+	path::PathBuf,
 	sync::{
 		Arc, OnceLock,
 		atomic::{AtomicU64, Ordering},
@@ -17,7 +18,7 @@ use omp_tool::{
 	CapsBase, ErasedEv, ErasedOutcome, IncomingParams, ModelClass, Part, PromptCaps, Registry,
 	ToolIdentity, ToolRoute,
 };
-use omp_tools::eval::{idle_timeout::TimeoutHandle, kernel::NamespaceInstaller};
+use omp_tools::eval::{RuntimeSnapshot, idle_timeout::TimeoutHandle, kernel::NamespaceInstaller};
 use parking_lot::Mutex;
 use pyo3::{
 	exceptions::PyRuntimeError,
@@ -148,19 +149,42 @@ impl BridgeHostError {
 	}
 }
 
+/// Correlated, ordered progress destination for one bridge request.
+pub trait BridgeProgressSink: Send + Sync {
+	/// Emits one bounded progress event before the terminal response.
+	fn progress(&self, event: Value) -> Result<(), BridgeHostError>;
+}
+
+pub(crate) struct NoopBridgeProgress;
+
+impl BridgeProgressSink for NoopBridgeProgress {
+	fn progress(&self, _event: Value) -> Result<(), BridgeHostError> {
+		Ok(())
+	}
+}
+
 /// Real host-side boundary used for ordinary tools and the privileged eval
 /// completion/agent/budget operations. Implementations receive only calls that
 /// passed grant authentication and capability checks.
 #[async_trait]
 pub trait BridgeHost: Send + Sync {
-	async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError>;
+	async fn call(
+		&self,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError>;
 }
 
 #[async_trait]
 pub(super) trait ChildBridgeTransport: Send + Sync {
 	fn capabilities(&self) -> BridgeCapabilities;
-	fn session_config(&self) -> Option<EvalSessionConfig>;
-	async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError>;
+	async fn call(
+		&self,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError>;
 }
 
 struct Registration {
@@ -218,6 +242,7 @@ impl BridgeDispatcher {
 		grant: &BridgeGrant,
 		name: &str,
 		args: Value,
+		progress: &dyn BridgeProgressSink,
 	) -> Result<Value, BridgeCallError> {
 		let (host, timeout) = {
 			let registrations = self.inner.registrations.lock();
@@ -239,7 +264,7 @@ impl BridgeDispatcher {
 		};
 
 		timeout
-			.host_wait(host.call(name, args))
+			.host_wait(host.call(name, args, progress))
 			.await
 			.map_err(|error| BridgeCallError::Host { message: Str::from(error.to_string()) })
 	}
@@ -343,12 +368,26 @@ pub struct BridgeClient {
 
 impl BridgeClient {
 	pub(crate) async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeCallError> {
+		self
+			.call_with_progress(name, args, &NoopBridgeProgress)
+			.await
+	}
+
+	pub(crate) async fn call_with_progress(
+		&self,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeCallError> {
 		let Some(abort) = &self.abort else {
-			return self.dispatcher.dispatch(&self.grant, name, args).await;
+			return self
+				.dispatcher
+				.dispatch(&self.grant, name, args, progress)
+				.await;
 		};
 		let token = abort.token().ok_or(BridgeCallError::NoActiveCell)?;
 		tokio::select! {
-			result = self.dispatcher.dispatch(&self.grant, name, args) => result,
+			result = self.dispatcher.dispatch(&self.grant, name, args, progress) => result,
 			() = token.cancelled() => Err(BridgeCallError::CellCancelled),
 		}
 	}
@@ -402,7 +441,12 @@ impl RegistryBridgeHost {
 
 #[async_trait]
 impl BridgeHost for RegistryBridgeHost {
-	async fn call(&self, name: &str, mut args: Value) -> Result<Value, BridgeHostError> {
+	async fn call(
+		&self,
+		name: &str,
+		mut args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
 		let Some((live_name, revision)) = self.registry.live_identity(name) else {
 			return Err(BridgeHostError::message(format!("Unknown tool from py runtime: {name}")));
 		};
@@ -426,20 +470,21 @@ impl BridgeHost for RegistryBridgeHost {
 			.args_committed(Str::from(raw))
 			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let mut events = self.registry.invoke(name, params).map_err(registry_error)?;
-		let mut updates = Vec::new();
 		while let Some(event) = events.next().await {
 			match event.map_err(registry_error)? {
 				ErasedEv::Update(update) => {
-					updates.push(serde_json::from_slice(&update).map_err(|error| {
-						BridgeHostError::message(format!(
-							"tool {name} returned invalid update JSON: {error}"
-						))
-					})?);
+					let update: serde_json::Value =
+						serde_json::from_slice(&update).map_err(|error| {
+							BridgeHostError::message(format!(
+								"tool {name} returned invalid update JSON: {error}"
+							))
+						})?;
+					progress.progress(json!({ "op": "tool", "name": name, "update": update }))?;
 				},
 				ErasedEv::Done(ErasedOutcome::Detached(job)) => {
 					let value = serde_json::to_value(job)
 						.map_err(|error| BridgeHostError::message(error.to_string()))?;
-					return Ok(bridge_envelope(value, updates));
+					return Ok(value);
 				},
 				ErasedEv::Done(ErasedOutcome::Done { verdict, .. }) => {
 					let projected = self
@@ -468,18 +513,12 @@ impl BridgeHost for RegistryBridgeHost {
 							_ => value = json!({ "text": value, "hasError": true }),
 						}
 					}
-					return Ok(bridge_envelope(value, updates));
+					return Ok(value);
 				},
 			}
 		}
 		Err(BridgeHostError::message(format!("tool {name} ended without a terminal result")))
 	}
-}
-fn bridge_envelope(value: Value, updates: Vec<Value>) -> Value {
-	json!({
-		"__omp_bridge_value__": value,
-		"__omp_bridge_updates__": updates,
-	})
 }
 
 /// Optional capabilities owned by the live parent agent session.
@@ -489,32 +528,103 @@ fn bridge_envelope(value: Value, updates: Vec<Value>) -> Value {
 /// corresponding bridge names are omitted from the grant.
 #[async_trait]
 pub trait ParentSessionHost: Send + Sync {
-	async fn completion(&self, args: Value) -> Result<Value, BridgeHostError>;
-	async fn agent(&self, args: Value) -> Result<Value, BridgeHostError>;
+	/// Freezes the filesystem and managed-environment authority of the current
+	/// parent session.
+	fn eval_session_config(&self) -> Result<EvalSessionConfig, BridgeHostError>;
+
+	async fn completion(
+		&self,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError>;
+	async fn agent(
+		&self,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError>;
 	async fn concurrency(&self, args: Value) -> Result<Value, BridgeHostError>;
 	async fn budget(&self, args: Value) -> Result<Value, BridgeHostError>;
 }
 
-#[derive(Clone)]
+/// Filesystem and managed-environment authority projected by a live parent
+/// session into one eval run.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvalSessionConfig {
-	pub(crate) local_roots_json: Str,
-	pub(crate) artifacts_dir:    Str,
-	pub(crate) session_file:     Str,
+	/// Environment-authorized working directory for each cell.
+	pub cwd:              PathBuf,
+	/// Serialized bounded `local://` root projection, or removal when absent.
+	pub local_roots_json: Option<Str>,
+	/// Session artifact directory, or removal when absent.
+	pub artifacts_dir:    Option<Str>,
+	/// Append-only session journal path, or removal when absent.
+	pub session_file:     Option<Str>,
+}
+
+impl EvalSessionConfig {
+	fn runtime_snapshot(&self) -> RuntimeSnapshot {
+		RuntimeSnapshot {
+			cwd:         Some(self.cwd.clone()),
+			managed_env: [
+				(sf!("OMP_EVAL_LOCAL_ROOTS"), self.local_roots_json.clone()),
+				(sf!("OMP_ARTIFACTS_DIR"), self.artifacts_dir.clone()),
+				(sf!("OMP_SESSION_FILE"), self.session_file.clone()),
+			]
+			.into_iter()
+			.collect(),
+		}
+	}
+}
+
+/// Revocable parent binding for one embedded session owner.
+pub struct ParentBindingLease {
+	parents:    Arc<Mutex<BTreeMap<Str, ParentBinding>>>,
+	owner:      Str,
+	generation: Ulid,
+}
+
+impl Drop for ParentBindingLease {
+	fn drop(&mut self) {
+		let mut parents = self.parents.lock();
+		if parents
+			.get(&self.owner)
+			.is_some_and(|binding| binding.generation == self.generation)
+		{
+			parents.remove(&self.owner);
+		}
+	}
+}
+
+struct ParentBinding {
+	generation:   Ulid,
+	parent:       Arc<dyn ParentSessionHost>,
+	strict_owner: bool,
+}
+
+#[derive(Clone)]
+struct RuntimeLease {
+	binding_owner: Str,
+	generation:    Ulid,
+	parent:        Arc<dyn ParentSessionHost>,
 }
 
 /// Late-bound host used to break the registry/eval construction cycle.
 ///
-/// Binding is one-shot: the namespace installer cannot be redirected to a
-/// different project registry after a grant has been minted.
+/// The registry is immutable, while parent routes are revocable and keyed by
+/// authenticated owner. A frozen runtime holds the exact parent selected for
+/// that owner until the eval session is released.
 pub struct SessionBridgeHost {
-	registry: OnceLock<Arc<Registry>>,
-	parent:   OnceLock<Arc<dyn ParentSessionHost>>,
-	config:   Mutex<Option<EvalSessionConfig>>,
+	registry:          OnceLock<Arc<Registry>>,
+	parents:           Arc<Mutex<BTreeMap<Str, ParentBinding>>>,
+	runtime_snapshots: Mutex<BTreeMap<(Str, Bytes), RuntimeLease>>,
 }
 
 impl SessionBridgeHost {
 	pub(crate) fn new() -> Self {
-		Self { registry: OnceLock::new(), parent: OnceLock::new(), config: Mutex::new(None) }
+		Self {
+			registry:          OnceLock::new(),
+			parents:           Arc::new(Mutex::new(BTreeMap::new())),
+			runtime_snapshots: Mutex::new(BTreeMap::new()),
+		}
 	}
 
 	pub(crate) fn bind_registry(&self, registry: Arc<Registry>) -> Result<(), BridgeHostError> {
@@ -526,20 +636,88 @@ impl SessionBridgeHost {
 
 	pub(crate) fn bind_parent(
 		&self,
+		owner: Str,
 		parent: Arc<dyn ParentSessionHost>,
-	) -> Result<(), BridgeHostError> {
+	) -> Result<ParentBindingLease, BridgeHostError> {
+		self.bind_parent_with_scope(owner, parent, false)
+	}
+
+	/// Binds one SDK session without the single-parent compatibility fallback.
+	///
+	/// Eval runs presenting any other owner id are rejected even while this is
+	/// the only active binding, preventing sequential or concurrent embedders
+	/// from routing cells through the wrong parent.
+	pub(crate) fn bind_sdk_parent(
+		&self,
+		owner: Str,
+		parent: Arc<dyn ParentSessionHost>,
+	) -> Result<ParentBindingLease, BridgeHostError> {
+		self.bind_parent_with_scope(owner, parent, true)
+	}
+
+	fn bind_parent_with_scope(
+		&self,
+		owner: Str,
+		parent: Arc<dyn ParentSessionHost>,
+		strict_owner: bool,
+	) -> Result<ParentBindingLease, BridgeHostError> {
+		if owner.is_empty() {
+			return Err(BridgeHostError::message("eval bridge parent owner is empty"));
+		}
+		let generation = Ulid::generate();
+		let mut parents = self.parents.lock();
+		if parents.contains_key(&owner) {
+			return Err(BridgeHostError::message("eval bridge parent owner is already bound"));
+		}
+		parents.insert(owner.clone(), ParentBinding { generation, parent, strict_owner });
+		drop(parents);
+		Ok(ParentBindingLease { parents: Arc::clone(&self.parents), owner, generation })
+	}
+
+	fn parent_for(
+		&self,
+		owner: &str,
+	) -> Result<(Str, Ulid, Arc<dyn ParentSessionHost>), BridgeHostError> {
+		let parents = self.parents.lock();
+		if let Some(binding) = parents.get(owner) {
+			return Ok((Str::new(owner), binding.generation, Arc::clone(&binding.parent)));
+		}
+		if parents.len() == 1 {
+			let (binding_owner, binding) = parents.iter().next().expect("one parent exists");
+			if !binding.strict_owner {
+				return Ok((binding_owner.clone(), binding.generation, Arc::clone(&binding.parent)));
+			}
+		}
+		Err(BridgeHostError::message("eval bridge parent session is not bound for this owner"))
+	}
+
+	pub(super) fn freeze_runtime(
+		&self,
+		owner: &str,
+		session: &Bytes,
+	) -> Result<RuntimeSnapshot, BridgeHostError> {
+		let (binding_owner, generation, parent) = self.parent_for(owner)?;
+		let config = parent.eval_session_config()?;
 		self
-			.parent
-			.set(parent)
-			.map_err(|_| BridgeHostError::message("eval bridge parent session is already bound"))
+			.runtime_snapshots
+			.lock()
+			.insert((Str::new(owner), session.clone()), RuntimeLease {
+				binding_owner,
+				generation,
+				parent,
+			});
+		Ok(config.runtime_snapshot())
 	}
 
-	pub(crate) fn set_session_config(&self, config: EvalSessionConfig) {
-		*self.config.lock() = Some(config);
+	pub(super) fn release_runtime(&self, owner: &str, session: &Bytes) {
+		self
+			.runtime_snapshots
+			.lock()
+			.remove(&(Str::new(owner), session.clone()));
 	}
 
-	pub(super) fn session_config(&self) -> Option<EvalSessionConfig> {
-		self.config.lock().clone()
+	pub(super) fn clear_runtimes(&self) {
+		self.runtime_snapshots.lock().clear();
 	}
 
 	pub(super) fn capabilities(&self) -> Result<BridgeCapabilities, BridgeHostError> {
@@ -557,7 +735,7 @@ impl SessionBridgeHost {
 			})
 			.map(|(name, _)| name.clone());
 		let capabilities = BridgeCapabilities::new(tools);
-		Ok(if self.parent.get().is_some() {
+		Ok(if !self.parents.lock().is_empty() {
 			capabilities
 				.with_completion()
 				.with_agent()
@@ -567,60 +745,67 @@ impl SessionBridgeHost {
 			capabilities
 		})
 	}
-}
 
-#[async_trait]
-impl BridgeHost for SessionBridgeHost {
-	async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError> {
+	pub(super) async fn call_for(
+		&self,
+		owner: &str,
+		session: &Bytes,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
+		let (binding_owner, generation, parent) = self
+			.runtime_snapshots
+			.lock()
+			.get(&(Str::new(owner), session.clone()))
+			.map(|lease| (lease.binding_owner.clone(), lease.generation, Arc::clone(&lease.parent)))
+			.ok_or_else(|| BridgeHostError::message("eval bridge runtime lease is not active"))?;
+		if !self
+			.parents
+			.lock()
+			.get(&binding_owner)
+			.is_some_and(|binding| binding.generation == generation)
+		{
+			return Err(BridgeHostError::message("eval bridge parent lease was revoked"));
+		}
+		self.call_with_parent(parent, name, args, progress).await
+	}
+
+	async fn call_with_parent(
+		&self,
+		parent: Arc<dyn ParentSessionHost>,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
 		match name {
-			COMPLETION => {
-				self
-					.parent
-					.get()
-					.ok_or_else(|| {
-						BridgeHostError::message("completion is unavailable in this session")
-					})?
-					.completion(args)
-					.await
-			},
-			AGENT => {
-				self
-					.parent
-					.get()
-					.ok_or_else(|| {
-						BridgeHostError::message("subagents are unavailable in this session")
-					})?
-					.agent(args)
-					.await
-			},
-			CONCURRENCY => {
-				self
-					.parent
-					.get()
-					.ok_or_else(|| {
-						BridgeHostError::message("concurrency control is unavailable in this session")
-					})?
-					.concurrency(args)
-					.await
-			},
-			BUDGET => {
-				self
-					.parent
-					.get()
-					.ok_or_else(|| BridgeHostError::message("budget is unavailable in this session"))?
-					.budget(args)
-					.await
-			},
+			COMPLETION => parent.completion(args, progress).await,
+			AGENT => parent.agent(args, progress).await,
+			CONCURRENCY => parent.concurrency(args).await,
+			BUDGET => parent.budget(args).await,
 			_ => {
 				let registry = self
 					.registry
 					.get()
 					.ok_or_else(|| BridgeHostError::message("eval bridge registry is not bound"))?;
 				RegistryBridgeHost::new(Arc::clone(registry))
-					.call(name, args)
+					.call(name, args, progress)
 					.await
 			},
 		}
+	}
+}
+
+#[async_trait]
+impl BridgeHost for SessionBridgeHost {
+	async fn call(
+		&self,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
+		let (_, _, parent) = self.parent_for("__unscoped_eval_bridge__")?;
+		self.call_with_parent(parent, name, args, progress).await
 	}
 }
 
@@ -636,16 +821,17 @@ impl NamespaceHost {
 	fn capabilities(&self) -> BridgeCapabilities {
 		self.0.capabilities()
 	}
-
-	fn session_config(&self) -> Option<EvalSessionConfig> {
-		self.0.session_config()
-	}
 }
 
 #[async_trait]
 impl BridgeHost for NamespaceHost {
-	async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError> {
-		self.0.call(name, args).await
+	async fn call(
+		&self,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
+		self.0.call(name, args, progress).await
 	}
 }
 
@@ -677,15 +863,6 @@ impl BridgeNamespaceInstaller {
 			cells: Mutex::new(BTreeMap::new()),
 		}
 	}
-
-	fn inject_config(&self, globals: &Bound<'_, PyDict>) -> PyResult<()> {
-		if let Some(config) = self.host.session_config() {
-			globals.set_item("OMP_EVAL_LOCAL_ROOTS", config.local_roots_json.as_str())?;
-			globals.set_item("OMP_ARTIFACTS_DIR", config.artifacts_dir.as_str())?;
-			globals.set_item("OMP_SESSION_FILE", config.session_file.as_str())?;
-		}
-		Ok(())
-	}
 }
 
 impl NamespaceInstaller for BridgeNamespaceInstaller {
@@ -700,7 +877,6 @@ impl NamespaceInstaller for BridgeNamespaceInstaller {
 			.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 		let abort = Arc::new(CellAbort::default());
 		let client = registration.client().with_abort(Arc::clone(&abort));
-		self.inject_config(globals)?;
 		install_python_bridge(py, globals, client.clone(), self.runtime.clone())?;
 		install_python_prelude(py, globals)?;
 		self
@@ -731,7 +907,6 @@ impl NamespaceInstaller for BridgeNamespaceInstaller {
 		cell_id: &Bytes,
 		timeout: Option<std::time::Duration>,
 	) -> PyResult<TimeoutHandle> {
-		self.inject_config(globals)?;
 		let state = self.namespaces.lock();
 		let namespace = state.get(&(globals.as_ptr() as usize)).ok_or_else(|| {
 			PyRuntimeError::new_err("eval namespace has no bridge cancellation scope")
@@ -806,10 +981,41 @@ fn projected_parts(parts: Vec<Part>) -> Result<Value, BridgeHostError> {
 	Ok(json!({ "text": text, "json": json_parts, "blobs": blobs }))
 }
 
+struct PythonProgressSink {
+	globals: Py<PyDict>,
+	name:    Str,
+}
+
+impl BridgeProgressSink for PythonProgressSink {
+	fn progress(&self, event: Value) -> Result<(), BridgeHostError> {
+		let encoded = serde_json::to_string(&event)
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
+		Python::attach(|py| {
+			let globals = self.globals.bind(py);
+			let consumer = globals
+				.get_item("__omp_consume_bridge_progress__")
+				.map_err(|error| BridgeHostError::message(error.to_string()))?
+				.ok_or_else(|| {
+					BridgeHostError::message("Python bridge progress consumer is missing")
+				})?;
+			let json_module = PyModule::import(py, "json")
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
+			let event = json_module
+				.call_method1("loads", (encoded,))
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
+			consumer
+				.call1((self.name.as_str(), event))
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
+			Ok(())
+		})
+	}
+}
+
 #[pyclass(frozen)]
 struct PythonBridgeCallable {
 	client:  BridgeClient,
 	runtime: Handle,
+	globals: Py<PyDict>,
 }
 
 #[pymethods]
@@ -825,8 +1031,14 @@ impl PythonBridgeCallable {
 		let args = serde_json::from_str(&encoded).map_err(|error| {
 			PyRuntimeError::new_err(format!("bridge arguments are not JSON: {error}"))
 		})?;
+		let progress =
+			PythonProgressSink { globals: self.globals.clone_ref(py), name: Str::new(name) };
 		let value = py
-			.detach(|| self.runtime.block_on(self.client.call(name, args)))
+			.detach(|| {
+				self
+					.runtime
+					.block_on(self.client.call_with_progress(name, args, &progress))
+			})
 			.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 		let encoded = serde_json::to_string(&value)
 			.map_err(|error| PyRuntimeError::new_err(format!("bridge result is not JSON: {error}")))?;
@@ -844,7 +1056,10 @@ pub fn install_python_bridge(
 	runtime: Handle,
 ) -> PyResult<()> {
 	globals.set_item("__omp_bridge_session__", client.session())?;
-	globals.set_item("__omp_bridge_call__", Py::new(py, PythonBridgeCallable { client, runtime })?)
+	globals.set_item(
+		"__omp_bridge_call__",
+		Py::new(py, PythonBridgeCallable { client, runtime, globals: globals.clone().unbind() })?,
+	)
 }
 
 /// Loads the normative helper prelude once into a persistent namespace.
@@ -877,7 +1092,12 @@ mod tests {
 
 	#[async_trait]
 	impl BridgeHost for RecordingHost {
-		async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError> {
+		async fn call(
+			&self,
+			name: &str,
+			args: Value,
+			_progress: &dyn BridgeProgressSink,
+		) -> Result<Value, BridgeHostError> {
 			self.calls.fetch_add(1, Ordering::Relaxed);
 			if self.fail {
 				return Err(BridgeHostError::message("host exploded"));
@@ -899,11 +1119,28 @@ mod tests {
 
 	#[async_trait]
 	impl ParentSessionHost for RecordingParent {
-		async fn completion(&self, args: Value) -> Result<Value, BridgeHostError> {
+		fn eval_session_config(&self) -> Result<EvalSessionConfig, BridgeHostError> {
+			Ok(EvalSessionConfig {
+				cwd:              PathBuf::from("/runtime"),
+				local_roots_json: Some(Str::new_static(r#"{"local":"/runtime/local"}"#)),
+				artifacts_dir:    Some(sf!("/runtime/artifacts")),
+				session_file:     Some(sf!("/runtime/session.jsonl")),
+			})
+		}
+
+		async fn completion(
+			&self,
+			args: Value,
+			_progress: &dyn BridgeProgressSink,
+		) -> Result<Value, BridgeHostError> {
 			Ok(self.response("completion", args))
 		}
 
-		async fn agent(&self, args: Value) -> Result<Value, BridgeHostError> {
+		async fn agent(
+			&self,
+			args: Value,
+			_progress: &dyn BridgeProgressSink,
+		) -> Result<Value, BridgeHostError> {
 			Ok(self.response("agent", args))
 		}
 
@@ -1069,11 +1306,12 @@ mod tests {
 			BridgeCapabilities::new([])
 		}
 
-		fn session_config(&self) -> Option<EvalSessionConfig> {
-			None
-		}
-
-		async fn call(&self, _name: &str, _args: Value) -> Result<Value, BridgeHostError> {
+		async fn call(
+			&self,
+			_name: &str,
+			_args: Value,
+			_progress: &dyn BridgeProgressSink,
+		) -> Result<Value, BridgeHostError> {
 			Ok(Value::Null)
 		}
 	}
@@ -1118,6 +1356,49 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn runtime_snapshots_are_keyed_by_owner_and_eval_session() {
+		let parent = Arc::new(RecordingParent { calls: AtomicUsize::new(0) });
+		let host = SessionBridgeHost::new();
+		let _binding = host
+			.bind_parent(sf!("owner-a"), parent)
+			.expect("bind parent");
+		let first = Bytes::from_static(b"eval-a");
+		let second = Bytes::from_static(b"eval-b");
+		let snapshot = host
+			.freeze_runtime("owner-a", &first)
+			.expect("freeze first");
+		host
+			.freeze_runtime("owner-a", &second)
+			.expect("freeze second");
+		host
+			.freeze_runtime("owner-b", &first)
+			.expect("freeze other owner");
+		assert_eq!(snapshot.cwd, Some(PathBuf::from("/runtime")));
+		assert_eq!(host.runtime_snapshots.lock().len(), 3);
+		host.release_runtime("owner-a", &first);
+		assert_eq!(host.runtime_snapshots.lock().len(), 2);
+	}
+
+	#[tokio::test]
+	async fn dropping_parent_binding_revokes_frozen_runtime_routes() {
+		let parent = Arc::new(RecordingParent { calls: AtomicUsize::new(0) });
+		let host = SessionBridgeHost::new();
+		host
+			.bind_registry(Arc::new(Registry::new()))
+			.expect("bind registry");
+		let binding = host.bind_parent(sf!("owner"), parent).expect("bind parent");
+		let session = Bytes::from_static(b"eval-a");
+		host
+			.freeze_runtime("owner", &session)
+			.expect("freeze runtime");
+		drop(binding);
+		assert!(matches!(
+			host.call_for("owner", &session, BUDGET, json!({}), &NoopBridgeProgress).await,
+			Err(BridgeHostError::Message(message)) if message == "eval bridge parent lease was revoked"
+		));
+	}
+
 	#[tokio::test]
 	async fn parent_helpers_use_only_the_bound_session_host() {
 		let parent = Arc::new(RecordingParent { calls: AtomicUsize::new(0) });
@@ -1125,7 +1406,9 @@ mod tests {
 		host
 			.bind_registry(Arc::new(Registry::new()))
 			.expect("bind registry");
-		host.bind_parent(parent.clone()).expect("bind parent");
+		let _binding = host
+			.bind_parent(sf!("owner"), parent.clone())
+			.expect("bind parent");
 		let capabilities = host.capabilities().expect("bound capabilities");
 		let registration = dispatcher()
 			.register(sf!("owner"), sf!("cell"), capabilities, host, TimeoutHandle::new(None))
@@ -1168,26 +1451,34 @@ mod tests {
 		Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None }
 	}
 
+	struct RecordingProgress(Mutex<Vec<Value>>);
+
+	impl BridgeProgressSink for RecordingProgress {
+		fn progress(&self, event: Value) -> Result<(), BridgeHostError> {
+			self.0.lock().push(event);
+			Ok(())
+		}
+	}
+
 	#[tokio::test]
-	async fn registry_bridge_preserves_ordered_updates_in_its_private_envelope() {
+	async fn registry_bridge_streams_ordered_updates_before_its_response() {
 		let mut registry = Registry::new();
 		registry
 			.register(StreamingProbe::new("update_probe", false), Presentation::Slot, test_claims())
 			.expect("register update probe");
 		let host = RegistryBridgeHost::new(Arc::new(registry));
+		let progress = RecordingProgress(Mutex::new(Vec::new()));
 		assert_eq!(
 			host
-				.call("update_probe", json!({"i":"py prelude"}))
+				.call("update_probe", json!({"i":"py prelude"}), &progress)
 				.await
 				.expect("bridge probe call"),
-			json!({
-				"__omp_bridge_value__": "done",
-				"__omp_bridge_updates__": [
-					{"step": 1},
-					{"step": 2}
-				]
-			})
+			json!("done")
 		);
+		assert_eq!(*progress.0.lock(), vec![
+			json!({"op":"tool","name":"update_probe","update":{"step":1}}),
+			json!({"op":"tool","name":"update_probe","update":{"step":2}}),
+		]);
 	}
 
 	#[tokio::test]
@@ -1202,7 +1493,7 @@ mod tests {
 			.expect("register invalid update probe");
 		let host = RegistryBridgeHost::new(Arc::new(registry));
 		let error = host
-			.call("invalid_update_probe", json!({}))
+			.call("invalid_update_probe", json!({}), &NoopBridgeProgress)
 			.await
 			.expect_err("invalid update serialization unexpectedly succeeded");
 		assert_eq!(error.to_string(), "tool value serialization failed: invalid probe update");

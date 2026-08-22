@@ -47,6 +47,48 @@ pub enum SiteError {
 	SiteMissing,
 }
 
+/// Exact operator-selected trusted Python module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedModule {
+	/// Canonical absolute module file.
+	pub path:   PathBuf,
+	/// Importable single-module name.
+	pub module: Str,
+}
+
+/// Validates `--trusted-extension` as one absolute Python module, never a
+/// directory or ambient sibling-discovery root.
+pub fn validate_trusted_module(path: &Path) -> Result<TrustedModule, SiteError> {
+	if !path.is_absolute() || path.extension().and_then(|value| value.to_str()) != Some("py") {
+		return Err(trusted_load_error(path, "expected an absolute .py module path"));
+	}
+	let canonical = fs::canonicalize(path)
+		.map_err(|_| trusted_load_error(path, "module does not exist or cannot be resolved"))?;
+	if !canonical.is_file() {
+		return Err(trusted_load_error(path, "trusted module is not a regular file"));
+	}
+	let module = canonical
+		.file_stem()
+		.and_then(|value| value.to_str())
+		.filter(|value| python_identifier(value))
+		.map(Str::new)
+		.ok_or_else(|| trusted_load_error(path, "module filename is not a Python identifier"))?;
+	Ok(TrustedModule { path: canonical, module })
+}
+
+fn python_identifier(value: &str) -> bool {
+	let mut bytes = value.bytes();
+	matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+		&& bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn trusted_load_error(path: &Path, detail: &'static str) -> SiteError {
+	SiteError::TrustedLoad(ExtensionError::new(
+		ExtensionCode::ETrustedLoad,
+		format!("{}: {detail}", path.display()),
+	))
+}
+
 /// Sorted, persisted `RECORD` ownership entries for one materialized tree.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OwnershipMap {

@@ -11,8 +11,8 @@ use bytes::Bytes;
 use futures::Stream;
 use omp_app::{
 	envd::{
+		EnvServer,
 		exec::{ExecEvent as HostExecEvent, ExecHost},
-		server::EnvServer,
 		worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
 		workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
 	},

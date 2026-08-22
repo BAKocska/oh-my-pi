@@ -20,10 +20,14 @@ use omp_tool::BlobRef;
 use omp_tools::{
 	edit::{
 		CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
-		EditPrepared, EditProposal, Fault as EditFault, FormatPolicy, NoopResult, PrepareRequest,
-		RejectionReason, StalePolicy,
+		EditPrepared, EditProposal, EditSnapshotStore, Fault as EditFault, FormatPolicy, NoopResult,
+		PrepareRequest, RejectionReason, SnapshotFault, StalePolicy,
 	},
-	read::{Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES, conflicts::splice_registered},
+	read::{
+		Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES,
+		conflicts::splice_registered,
+		mutation::{MutationCapability, ResourceMutationReceipt, ResourceMutationRequest},
+	},
 	write::{
 		ConflictSpliceRequest, ConflictSpliceResult, Fault as WriteFault, PlainWriteRequest,
 		PlainWriteResult, SpecialWriteControl, WriteCommitError, WriteDisposition, WriteDocuments,
@@ -39,6 +43,118 @@ use super::{
 };
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
+
+/// Permission outcomes which qualify for the attributed privileged path.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PrivilegedMutationFault {
+	/// POSIX `EPERM`.
+	#[error("operation not permitted")]
+	OperationNotPermitted {
+		/// Filesystem failure retaining the exact target and source errno.
+		#[source]
+		source: omp_docserver::Error,
+	},
+	/// POSIX `EACCES`.
+	#[error("permission denied")]
+	PermissionDenied {
+		/// Filesystem failure retaining the exact target and source errno.
+		#[source]
+		source: omp_docserver::Error,
+	},
+	/// POSIX `EROFS`.
+	#[error("read-only filesystem")]
+	ReadOnlyFilesystem {
+		/// Filesystem failure retaining the exact target and source errno.
+		#[source]
+		source: omp_docserver::Error,
+	},
+	/// A non-permission document or filesystem failure.
+	#[error("privileged mutation failed")]
+	Other {
+		/// Typed document failure.
+		#[source]
+		source: omp_docserver::Error,
+	},
+	/// The supplied expected revision did not identify the current exact bytes.
+	#[error("privileged mutation expected revision is stale")]
+	StaleRevision,
+}
+
+/// Executes one approved write through the capability-rooted document
+/// filesystem, with an exact presence/content precondition.
+pub(super) fn privileged_write(
+	root: &Path,
+	target: &Path,
+	content: Bytes,
+	expected_present: bool,
+	expected_hash: Option<&[u8; 32]>,
+	mode: u32,
+) -> Result<omp_docserver::fs::DiskState, PrivilegedMutationFault> {
+	use omp_docserver::fs::{DiskExpectation, DiskState, LocalFs};
+
+	let config = omp_docserver::ServerConfig::new(root).map_err(classify_privileged)?;
+	let filesystem = LocalFs::new(&config).map_err(classify_privileged)?;
+	let expected = match (expected_present, filesystem.stable_read(target)) {
+		(true, Ok(DiskState::Present { content, fingerprint })) => {
+			if expected_hash.is_some_and(|hash| Hash32::sum(&content).as_bytes() != hash) {
+				return Err(PrivilegedMutationFault::StaleRevision);
+			}
+			DiskExpectation::Present(fingerprint)
+		},
+		(false, Ok(DiskState::Missing)) => DiskExpectation::Missing,
+		(true, Ok(DiskState::Missing)) | (false, Ok(DiskState::Present { .. })) => {
+			return Err(PrivilegedMutationFault::StaleRevision);
+		},
+		(_, Err(error)) => return Err(classify_privileged(error)),
+	};
+	let prepared = filesystem
+		.prepare_write_with_mode(target, content, expected, mode)
+		.map_err(classify_privileged)?;
+	filesystem
+		.commit_prepared(prepared)
+		.map_err(classify_privileged)
+}
+
+/// Executes one approved unlink through an already-open parent handle without
+/// following the final component.
+pub(super) fn privileged_unlink(
+	root: &Path,
+	target: &Path,
+	expected_present: bool,
+	expected_hash: Option<&[u8; 32]>,
+	recursive: bool,
+) -> Result<omp_docserver::fs::DiskState, PrivilegedMutationFault> {
+	let config = omp_docserver::ServerConfig::new(root).map_err(classify_privileged)?;
+	let filesystem = omp_docserver::fs::LocalFs::new(&config).map_err(classify_privileged)?;
+	if let Some(expected_hash) = expected_hash {
+		let state = filesystem
+			.stable_read(target)
+			.map_err(classify_privileged)?;
+		let Some(content) = state.content() else {
+			return Err(PrivilegedMutationFault::StaleRevision);
+		};
+		if Hash32::sum(content).as_bytes() != expected_hash {
+			return Err(PrivilegedMutationFault::StaleRevision);
+		}
+	}
+	filesystem
+		.remove_no_follow_if(target, expected_present, recursive)
+		.map_err(classify_privileged)
+}
+
+fn classify_privileged(error: omp_docserver::Error) -> PrivilegedMutationFault {
+	let errno = match &error {
+		omp_docserver::Error::Persistence { source, .. }
+		| omp_docserver::Error::Io { source, .. } => source.raw_os_error(),
+		_ => None,
+	};
+	match errno {
+		Some(libc::EPERM) => PrivilegedMutationFault::OperationNotPermitted { source: error },
+		Some(libc::EACCES) => PrivilegedMutationFault::PermissionDenied { source: error },
+		Some(libc::EROFS) => PrivilegedMutationFault::ReadOnlyFilesystem { source: error },
+		_ => PrivilegedMutationFault::Other { source: error },
+	}
+}
 
 struct ResolvedDestination {
 	uri:  Str,
@@ -68,6 +184,17 @@ pub struct PreparedDocument {
 	raw_base_bytes: Bytes,
 	notebook:       bool,
 	warnings:       Vec<Str>,
+}
+
+impl EditSnapshotStore for BlobHost {
+	async fn store_snapshot(&self, bytes: Bytes) -> Result<BlobRef, SnapshotFault> {
+		let id = self.put(&bytes).map_err(|_| SnapshotFault::Store)?;
+		Ok(BlobRef {
+			hash:       Str::from(hex::encode_n(&id.hash).as_str()),
+			media_type: sf!("application/octet-stream"),
+			byte_len:   id.size,
+		})
+	}
 }
 
 impl ReadBlobs for BlobHost {
@@ -344,6 +471,7 @@ impl EditDocuments for DocumentHost {
 					.head
 					.as_ref()
 					.ok_or_else(|| edit_unknown("committed operation omitted its document head"))?;
+				validate_committed_metadata(operation, head).map_err(edit_unknown)?;
 				let revision = revision_identity(head).map_err(edit_unknown)?;
 				let content = read_committed_view(
 					self,
@@ -360,12 +488,14 @@ impl EditDocuments for DocumentHost {
 
 		let mut snapshots = self.snapshot_store().lock();
 		for (index, proposal) in proposals.iter().enumerate() {
+			omp_walker::invalidate_path(std::path::Path::new(&prepared[index].path));
 			match &proposal.action {
 				EditAction::Delete => snapshots.invalidate(&prepared[index].path),
 				EditAction::Move { .. } => {
 					let destination = move_paths[index]
 						.as_ref()
 						.expect("move proposals retain a canonical destination");
+					omp_walker::invalidate_path(std::path::Path::new(destination));
 					snapshots
 						.relocate(&prepared[index].path, destination.clone())
 						.map_err(|error| edit_unknown(error.to_string()))?;
@@ -706,6 +836,83 @@ fn recover_edit_path(
 	Some((resolved, vec![warning], resolved_path))
 }
 
+fn recover_workspace_suffix(
+	host: &DocumentHost,
+	authored_path: &str,
+) -> Result<Option<(ResolvedDocument, Vec<Str>, Str)>, String> {
+	if Url::parse(authored_path).is_ok() {
+		return Ok(None);
+	}
+	let suffix = normalize_relative(Path::new(authored_path))?;
+	let root_url = Url::parse(host.hello().root_uri.as_str())
+		.map_err(|error| format!("document workspace root is not a valid URI: {error}"))?;
+	let root = root_url
+		.to_file_path()
+		.map_err(|()| "document workspace root is not a local file URI".to_owned())?;
+	let mut pending = vec![root.clone()];
+	let mut matches = Vec::new();
+	let mut visited = 0_usize;
+	while let Some(directory) = pending.pop() {
+		let entries = match std::fs::read_dir(&directory) {
+			Ok(entries) => entries,
+			Err(_) => continue,
+		};
+		for entry in entries.flatten() {
+			visited += 1;
+			if visited > 100_000 {
+				return Err("workspace suffix recovery exceeded its 100000-entry bound".to_owned());
+			}
+			let path = entry.path();
+			let name = entry.file_name();
+			if name == ".git" || name == "node_modules" || name == "target" {
+				continue;
+			}
+			let Ok(kind) = entry.file_type() else {
+				continue;
+			};
+			if kind.is_dir() {
+				pending.push(path);
+			} else if kind.is_file()
+				&& path
+					.strip_prefix(&root)
+					.is_ok_and(|relative| relative.ends_with(&suffix))
+			{
+				matches.push(path);
+				if matches.len() > 1 {
+					break;
+				}
+			}
+		}
+		if matches.len() > 1 {
+			break;
+		}
+	}
+	match matches.as_slice() {
+		[] => Ok(None),
+		[path] => {
+			let relative = path
+				.strip_prefix(&root)
+				.map_err(|_| "recovered path escaped workspace root".to_owned())?;
+			let display = Str::from(relative.to_string_lossy().replace('\\', "/"));
+			let uri = Url::from_file_path(path)
+				.map_err(|()| "recovered path cannot be represented as a file URI".to_owned())?;
+			let resolved = resolve_document(host, uri.as_str())?;
+			let warning = sf!(
+				"Path \"{}\" does not exist; uniquely recovered workspace suffix \"{}\" as {}. Future \
+				 edits must use the canonical recovered path.",
+				authored_path,
+				suffix.display(),
+				display
+			);
+			Ok(Some((resolved, vec![warning], display)))
+		},
+		_ => Err(format!(
+			"Path \"{authored_path}\" is ambiguous: more than one workspace file ends with \"{}\"",
+			suffix.display()
+		)),
+	}
+}
+
 fn resolve_move_destination(
 	host: &DocumentHost,
 	input: &str,
@@ -820,6 +1027,39 @@ fn revision_identity(head: &pb::DocumentHead) -> Result<Str, String> {
 	Ok(sf!("{}:{}", revision.sequence, hex::encode_n(hash).as_str()))
 }
 
+fn validate_committed_metadata(
+	operation: &pb::OperationResult,
+	head: &pb::DocumentHead,
+) -> Result<(), String> {
+	let committed_revision = head
+		.revision
+		.as_ref()
+		.ok_or_else(|| "committed document head omitted its revision".to_owned())?;
+	let committed_document = head
+		.document
+		.as_ref()
+		.ok_or_else(|| "committed document head omitted its document reference".to_owned())?;
+	let diagnostics = operation.diagnostics.as_ref().ok_or_else(|| {
+		"committed operation omitted its revision-bound diagnostic batch".to_owned()
+	})?;
+	if diagnostics.committed_revision.as_ref() != Some(committed_revision)
+		|| diagnostics.document.as_ref() != Some(committed_document)
+	{
+		return Err("committed diagnostic batch names a different document revision".to_owned());
+	}
+	let drift = operation
+		.format_drift
+		.as_ref()
+		.ok_or_else(|| "committed operation omitted client-format drift metadata".to_owned())?;
+	if drift.submitted_revision.is_none()
+		|| drift.committed_revision.as_ref() != Some(committed_revision)
+		|| drift.committed_content_hash != committed_revision.content_hash
+	{
+		return Err("client-format drift metadata does not name the committed revision".to_owned());
+	}
+	Ok(())
+}
+
 fn document_path(head: &pb::DocumentHead) -> Result<Str, String> {
 	let uri = head
 		.document
@@ -870,7 +1110,9 @@ const fn proposed_text_mutation(
 
 const fn protocol_format_policy(format_policy: FormatPolicy) -> i32 {
 	match format_policy {
-		FormatPolicy::Configured => pb::FormatPolicy::BestEffort as i32,
+		FormatPolicy::Disabled => pb::FormatPolicy::Disabled as i32,
+		FormatPolicy::BestEffort => pb::FormatPolicy::BestEffort as i32,
+		FormatPolicy::Required => pb::FormatPolicy::Required as i32,
 	}
 }
 
@@ -1054,7 +1296,7 @@ fn format_line_ranges(lines: &[usize]) -> String {
 	output.join(", ")
 }
 
-fn transaction_id(server_epoch: &[u8]) -> Bytes {
+pub(super) fn transaction_id(server_epoch: &[u8]) -> Bytes {
 	let sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
 	let now = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -1201,6 +1443,54 @@ where
 }
 
 impl WriteDocuments for DocumentHost {
+	async fn write_resource(
+		&self,
+		request: ResourceMutationRequest,
+	) -> Result<Option<ResourceMutationReceipt>, WriteCommitError> {
+		let Some(services) = self.resource_mutations() else {
+			return Ok(None);
+		};
+		let byte_len = request.content.len() as u64;
+		match request.capability {
+			MutationCapability::Ssh => {
+				let Some(resource) = request.uri.strip_prefix("ssh://") else {
+					return Err(write_rejected("invalid SSH mutation URI".to_owned()));
+				};
+				let (alias, path) = super::tool_url::ssh::parse_resource(resource.as_str())
+					.map_err(|fault| write_rejected(fault.message().clone()))?;
+				services
+					.ssh
+					.write(&alias, &path, request.content.as_bytes())
+					.await
+					.map_err(|error| write_rejected(error.to_string()))?;
+			},
+			MutationCapability::Vault => {
+				let Some(resource) = request.uri.strip_prefix("vault://") else {
+					return Err(write_rejected("invalid vault mutation URI".to_owned()));
+				};
+				let resource = resource.as_str();
+				let resource = resource.split_once('?').map_or(resource, |(path, _)| path);
+				let (vault, path) = super::tool_url::vault::parse_resource(resource)
+					.map_err(|fault| write_rejected(fault.message().clone()))?;
+				services
+					.vault
+					.write(&vault, &path, request.content.as_bytes(), 8 * 1024 * 1024)
+					.map_err(|error| write_rejected(error.to_string()))?;
+			},
+			MutationCapability::Attachment => return Ok(None),
+			MutationCapability::Host => {
+				super::tool_url::host::write(&request.uri, request.content.to_string())
+					.await
+					.map_err(|error| write_rejected(error.to_string()))?;
+			},
+		}
+		Ok(Some(ResourceMutationReceipt {
+			canonical_uri: request.uri,
+			byte_len,
+			revision: NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed),
+		}))
+	}
+
 	fn probe_literal(
 		&self,
 		path: Str,
@@ -1292,7 +1582,7 @@ impl WriteDocuments for DocumentHost {
 					operation: Some(pb::document_mutation::Operation::Create(pb::CreateMutation {
 						content:           content.clone(),
 						existing_document: pb::ExistingDocumentPolicy::ReplaceExisting as i32,
-						format_policy:     pb::FormatPolicy::Disabled as i32,
+						format_policy:     protocol_format_policy(request.format_policy),
 					})),
 				}],
 				&CancellationToken::new(),
@@ -1347,6 +1637,8 @@ impl WriteDocuments for DocumentHost {
 			.ok_or_else(|| WriteCommitError::EffectsUnknown {
 				reason: "committed operation omitted its document head".into(),
 			})?;
+		validate_committed_metadata(operation, head)
+			.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
 		let revision = revision_identity(head)
 			.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
 		let resolved_path = document_path(head)
@@ -1684,6 +1976,8 @@ async fn splice_conflict_document(
 		.ok_or_else(|| WriteCommitError::EffectsUnknown {
 			reason: "conflict splice omitted its committed document head".into(),
 		})?;
+	validate_committed_metadata(operation, head)
+		.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
 	let committed_revision = revision_identity(head)
 		.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
 	let resolved_path = document_path(head)
@@ -1743,6 +2037,28 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn privileged_permission_errnos_remain_distinct() {
+		for (errno, expected) in
+			[(libc::EPERM, "EPERM"), (libc::EACCES, "EACCES"), (libc::EROFS, "EROFS")]
+		{
+			let error = omp_docserver::Error::Persistence {
+				path:   PathBuf::from("/target"),
+				source: std::io::Error::from_raw_os_error(errno),
+			};
+			let classified = classify_privileged(error);
+			let actual = match classified {
+				PrivilegedMutationFault::OperationNotPermitted { .. } => "EPERM",
+				PrivilegedMutationFault::PermissionDenied { .. } => "EACCES",
+				PrivilegedMutationFault::ReadOnlyFilesystem { .. } => "EROFS",
+				PrivilegedMutationFault::Other { .. } | PrivilegedMutationFault::StaleRevision => {
+					"other"
+				},
+			};
+			assert_eq!(actual, expected);
+		}
+	}
+
+	#[test]
 	fn rejects_lexical_parent_escape() {
 		assert!(normalize_relative(Path::new("../outside.rs")).is_err());
 		assert_eq!(
@@ -1789,7 +2105,7 @@ mod tests {
 			payload.clone(),
 			revision.clone(),
 			StalePolicy::RebaseNonOverlapping,
-			FormatPolicy::Configured,
+			FormatPolicy::BestEffort,
 		);
 		let Some(pb::text_mutation::Change::ProposedContent(content)) = mutation.change else {
 			panic!("expected proposed content");
@@ -1809,7 +2125,7 @@ mod tests {
 			b"original",
 			revision.clone(),
 			"file:///workspace/destination.txt".to_owned(),
-			FormatPolicy::Configured,
+			FormatPolicy::BestEffort,
 		);
 		let pb::document_mutation::Operation::MoveWithContent(movement) = operation else {
 			panic!("changed move must be one atomic move-with-content mutation");
@@ -2131,7 +2447,7 @@ mod tests {
 				},
 				base_revision: prepared.base_revision.clone(),
 				stale_policy:  StalePolicy::RebaseNonOverlapping,
-				format_policy: FormatPolicy::Configured,
+				format_policy: FormatPolicy::BestEffort,
 			})
 			.collect();
 		let mut batch = host.start_clipboard_batch();

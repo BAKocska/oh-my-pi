@@ -2,26 +2,46 @@
 
 mod admission;
 pub mod blobs;
+mod direnv;
 pub mod docs;
+pub mod document_cache;
 pub(crate) mod eval;
 pub mod exec;
+pub(crate) mod exec_settings;
+mod github_url;
+pub(crate) mod host_info;
 mod http_egress;
 mod journal_runtime;
+pub(crate) mod lsp_settings;
+pub(crate) mod mcp;
 mod media_devices;
 pub mod policy;
-pub mod server;
+pub mod process_identity;
+pub mod process_log;
+pub mod process_store;
+pub mod recovery;
+mod resource_materializer;
+mod search_backend;
+mod server;
+pub mod shell_profile;
 pub(crate) mod site;
+mod ssh;
 mod tool_document;
+mod tool_lsp;
 mod tool_read_sources;
 mod tool_search;
+pub(crate) mod tool_settings;
 mod tool_shell;
-mod tool_url;
+pub(crate) mod tool_url;
 mod tools;
+mod vault;
+pub mod vcs;
 #[cfg(windows)]
 pub mod windows;
 pub mod worker;
 pub mod worker_pool;
 pub mod workspace;
+pub(crate) mod workspace_roots;
 use std::{io, path::Path, sync::Arc};
 
 #[doc(hidden)]
@@ -31,16 +51,26 @@ use omp_core::{Hash32, Str, sf};
 use omp_env::EnvClient;
 use omp_proto::env::v1::{ClientHello, ServerHello};
 use omp_tool::Registry;
-pub use server::EnvdError;
+pub use server::{EnvServer, EnvdError};
 use tokio_util::sync::CancellationToken;
 #[doc(hidden)]
 pub use worker::run_py_worker_entry;
 
 use self::{
-	server::{EnvServer, ExtensionDataBinding},
+	server::ExtensionDataBinding,
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
 use crate::cli::EnvdArgs;
+
+/// Copies session-local artifacts into the replacement session root.
+pub(crate) fn migrate_session_artifacts(
+	sessions_dir: &Path,
+	source_session: &str,
+	destination_session: &str,
+) -> Result<(), std::io::Error> {
+	tool_url::local::migrate_session_artifacts(sessions_dir, source_session, destination_session)
+}
+
 /// Starts the project environment daemon and serves until process shutdown.
 #[cfg(unix)]
 pub async fn run(args: EnvdArgs) -> miette::Result<()> {
@@ -68,6 +98,9 @@ pub(crate) struct ProjectEnvironment {
 	pub(crate) registry: Arc<Registry>,
 	eval_bridge:         Arc<eval::SessionBridgeHost>,
 	eval_control:        omp_tools::eval::EvalSessionControl,
+	search_bridge:       Arc<search_backend::SearchBridgeHost>,
+	github_credentials:  Arc<github_url::GithubCredentialBridge>,
+	goal_control:        tools::AgentGoalControl,
 	lifecycle:           ProjectLifecycle,
 }
 
@@ -293,6 +326,9 @@ impl ProjectEnvironment {
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
 		let eval_control = server.eval_control();
+		let search_bridge = server.search_bridge();
+		let github_credentials = server.github_credentials();
+		let goal_control = server.goal_control();
 		let (client, transport) = EnvClient::in_process(64);
 		let in_process_server = Arc::clone(&server);
 		let in_process =
@@ -302,7 +338,16 @@ impl ProjectEnvironment {
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		hello(&client).await?;
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
-		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
+		Ok(Self {
+			client,
+			registry,
+			eval_bridge,
+			eval_control,
+			search_bridge,
+			github_credentials,
+			goal_control,
+			lifecycle,
+		})
 	}
 
 	#[cfg(unix)]
@@ -328,6 +373,9 @@ impl ProjectEnvironment {
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
 		let eval_control = server.eval_control();
+		let search_bridge = server.search_bridge();
+		let github_credentials = server.github_credentials();
+		let goal_control = server.goal_control();
 		let (client, transport) = EnvClient::in_process(64);
 		let in_process_server = Arc::clone(&server);
 		let in_process = tokio::spawn(async move {
@@ -352,7 +400,16 @@ impl ProjectEnvironment {
 		let mut tasks = vec![in_process, uds];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
-		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
+		Ok(Self {
+			client,
+			registry,
+			eval_bridge,
+			eval_control,
+			search_bridge,
+			github_credentials,
+			goal_control,
+			lifecycle,
+		})
 	}
 
 	#[cfg(windows)]
@@ -379,6 +436,9 @@ impl ProjectEnvironment {
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
 		let eval_control = server.eval_control();
+		let search_bridge = server.search_bridge();
+		let github_credentials = server.github_credentials();
+		let goal_control = server.goal_control();
 		let (client, transport) = EnvClient::in_process(64);
 		let in_process_server = Arc::clone(&server);
 		let in_process = tokio::spawn(async move {
@@ -398,7 +458,16 @@ impl ProjectEnvironment {
 		let mut tasks = vec![in_process, owner];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
-		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
+		Ok(Self {
+			client,
+			registry,
+			eval_bridge,
+			eval_control,
+			search_bridge,
+			github_credentials,
+			goal_control,
+			lifecycle,
+		})
 	}
 
 	/// Starts an embedded Environment rooted at one isolated worktree.
@@ -410,6 +479,9 @@ impl ProjectEnvironment {
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
 		let eval_control = server.eval_control();
+		let search_bridge = server.search_bridge();
+		let github_credentials = server.github_credentials();
+		let goal_control = server.goal_control();
 		let (client, transport) = EnvClient::in_process(64);
 		let in_process_server = Arc::clone(&server);
 		let in_process =
@@ -419,7 +491,16 @@ impl ProjectEnvironment {
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		hello(&client).await?;
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
-		Ok(Self { client, registry, eval_bridge, eval_control, lifecycle })
+		Ok(Self {
+			client,
+			registry,
+			eval_bridge,
+			eval_control,
+			search_bridge,
+			github_credentials,
+			goal_control,
+			lifecycle,
+		})
 	}
 
 	#[must_use]
@@ -440,6 +521,21 @@ impl ProjectEnvironment {
 	#[must_use]
 	pub(crate) fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
 		self.eval_control.clone()
+	}
+
+	#[must_use]
+	pub(crate) fn search_bridge(&self) -> Arc<search_backend::SearchBridgeHost> {
+		Arc::clone(&self.search_bridge)
+	}
+
+	#[must_use]
+	pub(crate) fn github_credentials(&self) -> Arc<github_url::GithubCredentialBridge> {
+		Arc::clone(&self.github_credentials)
+	}
+
+	#[must_use]
+	pub(crate) fn goal_control(&self) -> tools::AgentGoalControl {
+		self.goal_control.clone()
 	}
 
 	/// Returns the Environment-owned authoritative sessions index.

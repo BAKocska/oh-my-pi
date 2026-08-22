@@ -198,7 +198,7 @@ impl ScriptedGateway {
 
 	/// Waits until the durable session store contains the terminal response for
 	/// `turn`.
-	pub async fn wait_turn_replay(&self, turn: &TurnId, limit: Duration) -> Result<TurnReplay> {
+	pub async fn wait_turn_replay(&self, turn: &TurnId<str>, limit: Duration) -> Result<TurnReplay> {
 		within("durable turn replay", limit, async {
 			loop {
 				if let Some(replay) = self

@@ -367,6 +367,15 @@ pub fn verify_artifact_signature(
 	verify_signature(key, &message, signature)
 }
 
+/// Verifies a detached Ed25519 signature over canonical authority-owned bytes.
+pub fn verify_signed_payload(
+	key: &str,
+	message: &[u8],
+	signature: &str,
+) -> Result<(), ExtensionError> {
+	verify_signature(key, message, signature)
+}
+
 fn verify_signature(key: &str, message: &[u8], signature: &str) -> Result<(), ExtensionError> {
 	let key = key.strip_prefix("ed25519:").unwrap_or(key);
 	let signature = signature.strip_prefix("ed25519:sig:").unwrap_or(signature);

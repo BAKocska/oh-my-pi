@@ -41,15 +41,31 @@ use super::{
 	admission::{AdmissionDecision, AdmissionGate, effects_narrow_or_refuse},
 	blobs::{BlobError, BlobHost},
 	docs::{
-		DocumentError, DocumentEvents, DocumentHost, DocumentLease, LspEvents, LspRegistryEvent,
+		DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost, DocumentLease, LspEvents,
+		LspRegistryEvent,
 	},
 	eval::SessionBridgeHost,
 	exec::{ExecError, ExecEvent, ExecHost, ProcessEvent},
+	exec_settings::{AcpSettings, ShellSettings},
+	host_info::HostInfoHost,
 	http_egress::{HttpEgressError, HttpEgressHost},
 	journal_runtime::ExternalJournalActor,
-	policy::{AuthorityTable, DataAuthority, Grants, PolicyError, QuotaAccount},
+	mcp::{
+		McpService,
+		manager::{McpManager, ProductionConnector},
+	},
+	policy::{
+		AuthorityTable, DataAuthority, Grants, PolicyError, QuotaAccount, dap_command_capability,
+		lsp_notification_tier, lsp_request_tier, lsp_tier_capability,
+	},
+	resource_materializer::{MaterializationError, ResourceMaterializer},
 	site::{SiteError, SiteMaterializer, record_modules},
+	tool_document::{PrivilegedMutationFault, privileged_unlink, privileged_write},
 	tools::production_registry,
+	vcs::{
+		self, RepositoryAvailability, SnapshotError,
+		git::{repo::RepositoryError, runner::GitRunner},
+	},
 	worker::{
 		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, JournalRuntime, OpenToolCall,
 		WorkerError, WorkerEvent, WorkerOutcomeKind,
@@ -59,6 +75,7 @@ use super::{
 		WorkspaceError, WorkspaceHost, WorkspaceOperationError, WorkspaceOperations,
 		WorkspaceSearchCase, WorkspaceSearchOptions,
 	},
+	workspace_roots::WorkspaceRootHost,
 };
 use crate::{cli::EnvdArgs, exthost::RegistryAvailabilitySink};
 
@@ -71,6 +88,11 @@ const NATIVE_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const INVOCATION_RESPONSE_SEND_GRACE: Duration = Duration::from_millis(250);
 const WORKER_LAYER_CEILING: u64 = 8;
 const MAX_CONCURRENT_SPAWNS: u64 = 4;
+const MAX_RESOURCE_URI_BYTES: usize = 8 * 1024;
+const MAX_RESOURCE_READ_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESOURCE_LIST_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESOURCE_ENTRIES: usize = 4_096;
+const MAX_RESOURCE_COMPLETIONS: usize = 100;
 static NEXT_CONNECTION_OWNER: AtomicU64 = AtomicU64::new(1);
 static NEXT_AGENT_CONTROL_BINDING: AtomicU64 = AtomicU64::new(1);
 
@@ -179,6 +201,12 @@ pub enum EnvdError {
 	/// The content-addressed blob store could not be opened.
 	#[error("blob host failed: {0}")]
 	Blob(Str),
+	/// The scoped exec materialization store could not be opened.
+	#[error(transparent)]
+	Materialization(#[from] MaterializationError),
+	/// Durable named-process supervision could not be initialized.
+	#[error(transparent)]
+	Exec(#[from] ExecError),
 	/// The authoritative sessions index could not be opened.
 	#[error("sessions index failed: {0}")]
 	SessionIndex(Str),
@@ -481,18 +509,99 @@ pub struct EnvServer {
 	exec:                ExecHost,
 	http_egress:         HttpEgressHost,
 	workspace:           WorkspaceHost,
+	mcp:                 Arc<McpService>,
+	_mcp_manager:        Arc<McpManager>,
+	host_info:           HostInfoHost,
+	workspace_roots:     WorkspaceRootHost,
+	lsp_settings:        super::lsp_settings::LspSettings,
+	resources:           Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
+	_memory_runtime:     crate::memory::RegisteredMemoryRuntime,
 	blobs:               BlobHost,
 	sites:               SiteMaterializer,
+	materializations:    ResourceMaterializer,
 	registry:            Arc<Registry>,
 	workspace_ops:       WorkspaceOperations,
 	ext_hosts:           Arc<ExtHostSupervisor>,
 	eval_bridge:         Arc<SessionBridgeHost>,
 	eval_control:        omp_tools::eval::EvalSessionControl,
+	search_bridge:       Arc<super::search_backend::SearchBridgeHost>,
+	github_credentials:  Arc<super::github_url::GithubCredentialBridge>,
 	checkpoint_control:  super::tools::AgentCheckpointControl,
+	goal_control:        super::tools::AgentGoalControl,
 	sessions_index:      Arc<SessionIndex>,
 	journal_external:    ExternalJournalActor,
 	workers:             Arc<WorkerSupervisor>,
 	authority:           Arc<AuthorityTable>,
+	repository_revision: AtomicU64,
+	process_store:       super::process_store::ProcessStore,
+}
+
+fn execution_settings(
+	data_dir: &Path,
+	project_root: &Path,
+) -> Result<(crate::settings::ToolSettings, ShellSettings, AcpSettings), EnvdError> {
+	let manager = crate::settings::manager::SettingsManager::open(
+		crate::settings::manager::SettingsPaths::discover(data_dir, Some(project_root)),
+	)
+	.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let snapshot = manager.snapshot();
+	let tool = snapshot
+		.project::<crate::settings::ToolSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.clone();
+	let shell = snapshot
+		.project::<ShellSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.clone();
+	let acp = snapshot
+		.project::<AcpSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.clone();
+	Ok((tool, shell, acp))
+}
+
+async fn start_memory_runtime(
+	data_dir: &Path,
+	project_root: &Path,
+	session_id: &Str,
+	exec: &ExecHost,
+) -> Result<crate::memory::RegisteredMemoryRuntime, EnvdError> {
+	let manager = crate::settings::manager::SettingsManager::open(
+		crate::settings::manager::SettingsPaths::discover(data_dir, Some(project_root)),
+	)
+	.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let mut settings = manager
+		.snapshot()
+		.project::<crate::settings::Settings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.clone();
+	settings.mnemopi = settings.mnemopi.normalize();
+	let snapshot = if settings.memory.backend == omp_memory::MemoryBackend::Off {
+		None
+	} else {
+		let cancel = CancellationToken::new();
+		Some(
+			super::vcs::snapshot(
+				project_root,
+				&super::vcs::git::runner::GitRunner::new(exec.clone()),
+				&cancel,
+			)
+			.await
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
+		)
+	};
+	crate::memory::start(
+		&settings,
+		data_dir,
+		session_id.clone(),
+		project_root.to_path_buf(),
+		snapshot.as_ref(),
+	)
+	.map_err(|error| EnvdError::State(Str::from(error.to_string())))
 }
 
 fn open_journal_authorities(
@@ -512,6 +621,93 @@ fn open_journal_authorities(
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 		.map(Arc::new);
 	Ok((Arc::new(sessions_index), state_store))
+}
+
+#[derive(Debug, Error)]
+enum PrivilegedDispatchError {
+	#[error("{0}")]
+	Invalid(&'static str),
+	#[error(transparent)]
+	Mutation(#[from] PrivilegedMutationFault),
+}
+
+fn privileged_presence(value: i32) -> Result<bool, PrivilegedDispatchError> {
+	match pb::ExpectedPresence::try_from(value).ok() {
+		Some(pb::ExpectedPresence::Present) => Ok(true),
+		Some(pb::ExpectedPresence::Missing) => Ok(false),
+		_ => Err(PrivilegedDispatchError::Invalid(
+			"privileged mutation requires an explicit expected presence",
+		)),
+	}
+}
+
+fn privileged_revision_hash(
+	revision: Option<&document_pb::Revision>,
+) -> Result<Option<[u8; 32]>, PrivilegedDispatchError> {
+	revision
+		.map(|revision| {
+			revision.content_hash.as_ref().try_into().map_err(|_| {
+				PrivilegedDispatchError::Invalid(
+					"privileged mutation revision hash must contain 32 bytes",
+				)
+			})
+		})
+		.transpose()
+}
+
+fn canonical_privileged_target(root: &Path, input: &str) -> Result<(String, PathBuf), String> {
+	let uri = Url::parse(input).map_err(|_| "privileged target is not a valid URI".to_owned())?;
+	if uri.scheme() != "file" {
+		return Err("privileged target must be a canonical file URI".to_owned());
+	}
+	let target = uri
+		.to_file_path()
+		.map_err(|()| "privileged target is not a local file URI".to_owned())?;
+	let name = target
+		.file_name()
+		.ok_or_else(|| "privileged target must name a final filesystem entry".to_owned())?;
+	let parent = target
+		.parent()
+		.ok_or_else(|| "privileged target has no parent directory".to_owned())?;
+	let parent = std::fs::canonicalize(parent)
+		.map_err(|error| format!("privileged target parent is not canonical: {error}"))?;
+	let root = std::fs::canonicalize(root)
+		.map_err(|error| format!("Environment root is not canonical: {error}"))?;
+	if parent != root && !parent.starts_with(&root) {
+		return Err("privileged target escapes the Environment root".to_owned());
+	}
+	let target = parent.join(name);
+	let canonical_uri = Url::from_file_path(&target)
+		.map_err(|()| "privileged target cannot be represented as a file URI".to_owned())?
+		.to_string();
+	if canonical_uri != uri.as_str() {
+		return Err(format!("privileged target is not canonical; expected {canonical_uri}"));
+	}
+	Ok((canonical_uri, target))
+}
+
+fn privileged_dispatch_error(error: PrivilegedDispatchError) -> (pb::ProtocolErrorCode, String) {
+	match error {
+		PrivilegedDispatchError::Invalid(message) => {
+			(pb::ProtocolErrorCode::InvalidArgument, message.to_owned())
+		},
+		PrivilegedDispatchError::Mutation(PrivilegedMutationFault::StaleRevision) => (
+			pb::ProtocolErrorCode::PreconditionFailed,
+			"privileged mutation expected state is stale".to_owned(),
+		),
+		PrivilegedDispatchError::Mutation(PrivilegedMutationFault::OperationNotPermitted {
+			source,
+		}) => (pb::ProtocolErrorCode::PermissionDenied, format!("EPERM: {source}")),
+		PrivilegedDispatchError::Mutation(PrivilegedMutationFault::PermissionDenied { source }) => {
+			(pb::ProtocolErrorCode::PermissionDenied, format!("EACCES: {source}"))
+		},
+		PrivilegedDispatchError::Mutation(PrivilegedMutationFault::ReadOnlyFilesystem { source }) => {
+			(pb::ProtocolErrorCode::PermissionDenied, format!("EROFS: {source}"))
+		},
+		PrivilegedDispatchError::Mutation(PrivilegedMutationFault::Other { source }) => {
+			(pb::ProtocolErrorCode::Internal, source.to_string())
+		},
+	}
 }
 
 const fn worker_operation(request: &pb::WorkerOp) -> &'static str {
@@ -543,18 +739,36 @@ impl EnvServer {
 		document_authority: Option<DocumentAuthority>,
 		exec: ExecHost,
 		workspace: WorkspaceHost,
+		mcp: Arc<McpService>,
+		resources: Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
+		memory_runtime: crate::memory::RegisteredMemoryRuntime,
+		lsp_settings: super::lsp_settings::LspSettings,
 		blobs: BlobHost,
 		sites: SiteMaterializer,
+		materializations: ResourceMaterializer,
 		registry: Arc<Registry>,
 		workspace_ops: WorkspaceOperations,
 		ext_hosts: Arc<ExtHostSupervisor>,
 		eval_bridge: Arc<SessionBridgeHost>,
 		eval_control: omp_tools::eval::EvalSessionControl,
+		search_bridge: Arc<super::search_backend::SearchBridgeHost>,
+		github_credentials: Arc<super::github_url::GithubCredentialBridge>,
 		checkpoint_control: super::tools::AgentCheckpointControl,
+		goal_control: super::tools::AgentGoalControl,
 		sessions_index: Arc<SessionIndex>,
 		journal_external: ExternalJournalActor,
 		authority: Arc<AuthorityTable>,
+		state_dir: &Path,
 	) -> Self {
+		let host_info = HostInfoHost::new(state_dir);
+		let workspace_roots =
+			WorkspaceRootHost::new(identity.root_uri.as_str(), identity.workspace_id.clone());
+		let mcp_manager = McpManager::new(
+			Arc::clone(&mcp),
+			Arc::new(ProductionConnector::new(workspace.root().to_path_buf())),
+			Arc::from([identity.root_uri.clone()]),
+			state_dir.join("local"),
+		);
 		Self {
 			identity,
 			documents,
@@ -562,18 +776,33 @@ impl EnvServer {
 			exec,
 			http_egress: HttpEgressHost::new(),
 			workspace,
+			mcp,
+			_mcp_manager: mcp_manager,
+			host_info,
+			workspace_roots,
+			lsp_settings,
+			resources,
+			_memory_runtime: memory_runtime,
 			blobs,
 			sites,
+			materializations,
 			registry,
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
 			eval_control,
+			search_bridge,
+			github_credentials,
 			checkpoint_control,
+			goal_control,
 			sessions_index,
 			journal_external,
 			workers: Arc::new(WorkerSupervisor::new(WORKER_LAYER_CEILING, MAX_CONCURRENT_SPAWNS)),
 			authority,
+			repository_revision: AtomicU64::new(0),
+			process_store: super::process_store::ProcessStore::new(
+				state_dir.join("processes").join("meta.json"),
+			),
 		}
 	}
 
@@ -590,6 +819,11 @@ impl EnvServer {
 		mut ext_host_config: ExtHostConfig,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
+		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+		mcp.bind_config_paths(state_dir, workspace.root());
+		let lsp_settings = super::lsp_settings::load(state_dir, workspace.root())
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let doc_config = omp_docserver::ServerConfig::new(root)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
 			.with_server_build(crate::build_id::current());
@@ -613,7 +847,18 @@ impl EnvServer {
 		ext_host_config.bind_workspace_root(workspace.root());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
-		let exec = ExecHost::new();
+		let github_cache = Arc::new(
+			omp_storage::github_cache::GithubCache::open(
+				state_dir.join("github-cache.sqlite3"),
+				Duration::from_secs(5 * 60),
+			)
+			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+		);
+		let exec = ExecHost::new()
+			.with_process_store(super::process_store::ProcessStore::new(
+				state_dir.join("processes").join("meta.json"),
+			))?
+			.with_github_cache(Arc::clone(&github_cache));
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let telemetry = Arc::new(
 			omp_storage::telemetry_index::TelemetryIndex::open(
@@ -624,13 +869,14 @@ impl EnvServer {
 		);
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
+		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
 		let project_path = Str::from(workspace.root().to_string_lossy().as_ref());
 		let journal_external = ExternalJournalActor::spawn(
 			Arc::clone(&sessions_index),
 			state_store.clone(),
 			blobs.clone(),
-			session_id,
+			session_id.clone(),
 			project_scope,
 			project_path,
 		)?;
@@ -640,17 +886,35 @@ impl EnvServer {
 			blobs.clone(),
 			crate::worktree_cmd::project_worktree_root(state_dir)?,
 		)?;
-		let tool_settings = crate::settings::Settings::load(state_dir).tools;
-		let (registry, eval_bridge, eval_control, checkpoint_control) = production_registry(
+		let (tool_settings, shell_settings, acp_settings) =
+			execution_settings(state_dir, workspace.root())?;
+		let memory_runtime =
+			start_memory_runtime(state_dir, workspace.root(), &session_id, &exec).await?;
+		let (
+			registry,
+			eval_bridge,
+			eval_control,
+			checkpoint_control,
+			resources,
+			goal_control,
+			search_bridge,
+			github_credentials,
+		) = production_registry(
 			&documents,
 			&blobs,
 			&exec,
+			state_dir,
+			session_id.as_str(),
+			Arc::clone(&github_cache),
+			&mcp,
 			&workspace,
 			&telemetry,
 			&hello.root_uri,
 			ext_hosts.as_ref(),
 			interrupt_grace,
 			&tool_settings,
+			&shell_settings,
+			&acp_settings,
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
@@ -668,17 +932,26 @@ impl EnvServer {
 			None,
 			exec,
 			workspace,
+			mcp,
+			resources,
+			memory_runtime,
+			lsp_settings,
 			blobs,
 			sites,
+			materializations,
 			registry,
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
 			eval_control,
+			search_bridge,
+			github_credentials,
 			checkpoint_control,
+			goal_control,
 			sessions_index,
 			journal_external,
 			authority,
+			state_dir,
 		))
 	}
 
@@ -694,6 +967,11 @@ impl EnvServer {
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
 		let root = workspace.root().to_path_buf();
+		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+		mcp.bind_config_paths(state_dir, workspace.root());
+		let lsp_settings = super::lsp_settings::load(state_dir, &root)
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let (documents, document_authority) =
 			connect_or_start_docserver(&root, docserver_socket, doc_connections.clone()).await?;
 		let hello = documents.hello().clone();
@@ -705,7 +983,18 @@ impl EnvServer {
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
-		let exec = ExecHost::new();
+		let github_cache = Arc::new(
+			omp_storage::github_cache::GithubCache::open(
+				state_dir.join("github-cache.sqlite3"),
+				Duration::from_secs(5 * 60),
+			)
+			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+		);
+		let exec = ExecHost::new()
+			.with_process_store(super::process_store::ProcessStore::new(
+				state_dir.join("processes").join("meta.json"),
+			))?
+			.with_github_cache(Arc::clone(&github_cache));
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let telemetry = Arc::new(
 			omp_storage::telemetry_index::TelemetryIndex::open(
@@ -716,13 +1005,14 @@ impl EnvServer {
 		);
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
+		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
 		let project_path = Str::from(root.to_string_lossy().as_ref());
 		let journal_external = ExternalJournalActor::spawn(
 			Arc::clone(&sessions_index),
 			state_store.clone(),
 			blobs.clone(),
-			session_id,
+			session_id.clone(),
 			project_scope,
 			project_path,
 		)?;
@@ -732,17 +1022,35 @@ impl EnvServer {
 			blobs.clone(),
 			crate::worktree_cmd::project_worktree_root(state_dir)?,
 		)?;
-		let tool_settings = crate::settings::Settings::load(state_dir).tools;
-		let (registry, eval_bridge, eval_control, checkpoint_control) = production_registry(
+		let (tool_settings, shell_settings, acp_settings) =
+			execution_settings(state_dir, workspace.root())?;
+		let memory_runtime =
+			start_memory_runtime(state_dir, workspace.root(), &session_id, &exec).await?;
+		let (
+			registry,
+			eval_bridge,
+			eval_control,
+			checkpoint_control,
+			resources,
+			goal_control,
+			search_bridge,
+			github_credentials,
+		) = production_registry(
 			&documents,
 			&blobs,
 			&exec,
+			state_dir,
+			session_id.as_str(),
+			Arc::clone(&github_cache),
+			&mcp,
 			&workspace,
 			&telemetry,
 			&hello.root_uri,
 			ext_hosts.as_ref(),
 			interrupt_grace,
 			&tool_settings,
+			&shell_settings,
+			&acp_settings,
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
@@ -760,17 +1068,26 @@ impl EnvServer {
 			document_authority,
 			exec,
 			workspace,
+			mcp,
+			resources,
+			memory_runtime,
+			lsp_settings,
 			blobs,
 			sites,
+			materializations,
 			registry,
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
 			eval_control,
+			search_bridge,
+			github_credentials,
 			checkpoint_control,
+			goal_control,
 			sessions_index,
 			journal_external,
 			authority,
+			state_dir,
 		))
 	}
 
@@ -858,6 +1175,21 @@ impl EnvServer {
 
 	pub(crate) fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
 		self.eval_control.clone()
+	}
+
+	/// Returns the late-bound canonical search bridge.
+	pub(crate) fn search_bridge(&self) -> Arc<super::search_backend::SearchBridgeHost> {
+		Arc::clone(&self.search_bridge)
+	}
+
+	/// Returns the late-bound GitHub credential projection.
+	pub(crate) fn github_credentials(&self) -> Arc<super::github_url::GithubCredentialBridge> {
+		Arc::clone(&self.github_credentials)
+	}
+
+	/// Returns the goal tool's active-session binding control.
+	pub(crate) fn goal_control(&self) -> super::tools::AgentGoalControl {
+		self.goal_control.clone()
 	}
 
 	/// Returns the single authoritative sessions index shared with the Agent
@@ -1385,6 +1717,40 @@ impl EnvServer {
 						frame.request_id,
 						pb::ProtocolErrorCode::Unsupported,
 						"retire is not available on this transport",
+					)
+					.await;
+				}
+			},
+			client_frame::Body::Shutdown(request) => {
+				let accepted_at_ms = std::time::SystemTime::now()
+					.duration_since(std::time::SystemTime::UNIX_EPOCH)
+					.unwrap_or_default()
+					.as_millis()
+					.try_into()
+					.unwrap_or(u64::MAX);
+				let grace = Duration::from_millis(request.grace_ms);
+				let summary = self.exec.shutdown_managed(grace);
+				let acknowledgement = super::process_store::ShutdownAcknowledgement {
+					accepted_at_ms,
+					stopped: summary.stopped,
+					spared: summary.spared,
+				};
+				if self.process_store.record_shutdown(acknowledgement).is_err() {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::Internal,
+						"failed to durably record process shutdown acknowledgement",
+					)
+					.await;
+				} else {
+					send_body(
+						responses,
+						frame.request_id,
+						server_frame::Body::ShutdownAcknowledged(pb::ShutdownAcknowledged {
+							accepted_at_ms,
+							props: None,
+						}),
 					)
 					.await;
 				}
@@ -2033,6 +2399,130 @@ impl EnvServer {
 					.dispatch_worktree(request_id, request, scope, responses, connection)
 					.await;
 			},
+			Some(Body::HostInfo(request)) => {
+				if request.wire_revision != omp_proto::SCHEMA_REV {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"host-info wire revision does not match the Environment schema",
+					)
+					.await;
+					return;
+				}
+				let info = self.host_info.snapshot(request.max_field_bytes).await;
+				send_data_response(responses, request_id, pb::data_response::Body::HostInfo(info))
+					.await;
+			},
+			Some(Body::WorkspaceRoots(request)) => {
+				if request.wire_revision != omp_proto::SCHEMA_REV {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"workspace-root wire revision does not match the Environment schema",
+					)
+					.await;
+					return;
+				}
+				send_data_response(
+					responses,
+					request_id,
+					pb::data_response::Body::WorkspaceRoots(self.workspace_roots.snapshot()),
+				)
+				.await;
+			},
+			Some(Body::Mcp(request)) => {
+				if !authorize_data_operation(
+					connection,
+					scope,
+					mcp_operation(&request),
+					"env.mcp",
+					responses,
+					request_id,
+				)
+				.await
+				{
+					return;
+				}
+				self
+					.dispatch_mcp(request_id, request, responses, finished, connection)
+					.await;
+			},
+			Some(Body::RepositorySnapshot(request)) => {
+				if !authorize_data_operation(
+					connection,
+					scope,
+					"omp.env.find.walk",
+					"env.search",
+					responses,
+					request_id,
+				)
+				.await
+				{
+					return;
+				}
+				self
+					.dispatch_repository_snapshot(request_id, request, responses)
+					.await;
+			},
+			Some(Body::ExecSession(request)) => {
+				let operation = match request.op.as_ref() {
+					Some(pb::exec_session_op::Op::Materialize(_)) => "omp.env.sh.exec",
+					Some(pb::exec_session_op::Op::ReleaseMaterialization(_)) => {
+						"omp.env.sh.close_session"
+					},
+					Some(pb::exec_session_op::Op::Control(_) | pb::exec_session_op::Op::Signal(_)) => {
+						"omp.env.sh.signal"
+					},
+					Some(pb::exec_session_op::Op::Stdin(_)) => "omp.env.sh.stdin",
+					Some(pb::exec_session_op::Op::Resize(_)) => "omp.env.sh.resize",
+					Some(pb::exec_session_op::Op::Capabilities(_))
+					| Some(pb::exec_session_op::Op::FinalCwd(_)) => "omp.env.sh.open_session",
+					None => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							"exec-session operation is missing",
+						)
+						.await;
+						return;
+					},
+				};
+				if !authorize_data_operation(
+					connection, scope, operation, "env.exec", responses, request_id,
+				)
+				.await
+				{
+					return;
+				}
+				self
+					.dispatch_exec_session(request_id, request, responses)
+					.await;
+			},
+			Some(Body::PrivilegedMutation(request)) => {
+				if !authorize_data_operation(
+					connection,
+					scope,
+					"omp.env.fs.privileged_mutation",
+					"env.fs.write",
+					responses,
+					request_id,
+				)
+				.await
+				{
+					return;
+				}
+				self
+					.dispatch_privileged_mutation(request_id, request, scope, responses)
+					.await;
+			},
+			Some(request @ (Body::DapLaunch(_) | Body::DapAttach(_) | Body::DapAction(_))) => {
+				self
+					.dispatch_dap(request_id, request, scope, responses, finished, connection)
+					.await;
+			},
 			Some(Body::Site(request)) => {
 				if !authorize_data_operation(
 					connection,
@@ -2140,6 +2630,11 @@ impl EnvServer {
 					Err(error) => send_exec_error(responses, request_id, &error).await,
 				}
 			},
+			Some(Body::Resource(request)) => {
+				self
+					.dispatch_resource(request_id, request, scope, responses, finished, connection)
+					.await;
+			},
 			None => {
 				send_error(
 					responses,
@@ -2150,6 +2645,871 @@ impl EnvServer {
 				.await;
 			},
 		}
+	}
+
+	async fn dispatch_resource(
+		&self,
+		request_id: u64,
+		request: pb::ResourceOp,
+		scope: Option<&pb::InvocationScope>,
+		responses: &flume::Sender<pb::ServerFrame>,
+		finished: &flume::Sender<Finished>,
+		connection: &mut ConnectionState,
+	) {
+		use pb::resource_op::Op;
+
+		if !authorize_data_operation(
+			connection,
+			scope,
+			"omp.env.docs.read",
+			"env.doc.read",
+			responses,
+			request_id,
+		)
+		.await
+		{
+			return;
+		}
+		let Some(operation) = request.op else {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"resource operation is missing",
+			)
+			.await;
+			return;
+		};
+		let wire_revision = match &operation {
+			Op::Read(request) => request.wire_revision,
+			Op::List(request) => request.wire_revision,
+			Op::Path(request) => request.wire_revision,
+			Op::Complete(request) => request.wire_revision,
+		};
+		if wire_revision != omp_proto::SCHEMA_REV {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"resource wire revision does not match the Environment schema",
+			)
+			.await;
+			return;
+		}
+
+		match operation {
+			Op::Read(request) => {
+				let Some(uri) = parse_mounted_resource_uri(&request.uri, responses, request_id).await
+				else {
+					return;
+				};
+				let max_bytes = match resource_bound(
+					request.max_bytes,
+					MAX_RESOURCE_READ_BYTES,
+					"resource read max_bytes",
+				) {
+					Ok(bound) => bound,
+					Err(message) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							message,
+						)
+						.await;
+						return;
+					},
+				};
+				let Some(result) = self
+					.resources
+					.read_bounded(uri.scheme, uri.resource, &uri.selector, max_bytes, request.path_only)
+					.await
+				else {
+					send_resource_capability_error(responses, request_id, "read").await;
+					return;
+				};
+				match result {
+					Ok(result) => {
+						let capability = self
+							.resources
+							.capability(uri.scheme)
+							.expect("mounted resource keeps capability metadata");
+						send_resource_result(responses, request_id, pb::ResourceResult {
+							uri:                request.uri,
+							data:               Bytes::copy_from_slice(&result.data),
+							entries:            Vec::new(),
+							canonical_path_uri: result
+								.canonical_path_uri
+								.map_or_else(String::new, |uri| uri.to_string()),
+							capability:         Some(resource_capability_wire(capability)),
+							truncated:          result.truncated,
+						})
+						.await;
+					},
+					Err(fault) => send_resource_fault(responses, request_id, &fault).await,
+				}
+			},
+			Op::List(request) => {
+				let Some(uri) = parse_mounted_resource_uri(&request.uri, responses, request_id).await
+				else {
+					return;
+				};
+				if !matches!(uri.selector, omp_tools::read::selector::ParsedSelector::None) {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"resource list URI cannot include a read selector",
+					)
+					.await;
+					return;
+				}
+				let max_entries = match resource_bound(
+					u64::from(request.max_entries),
+					MAX_RESOURCE_ENTRIES,
+					"resource list max_entries",
+				) {
+					Ok(bound) => bound,
+					Err(message) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							message,
+						)
+						.await;
+						return;
+					},
+				};
+				let max_bytes = match resource_bound(
+					request.max_bytes,
+					MAX_RESOURCE_LIST_BYTES,
+					"resource list max_bytes",
+				) {
+					Ok(bound) => bound,
+					Err(message) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							message,
+						)
+						.await;
+						return;
+					},
+				};
+				let Some(result) = self
+					.resources
+					.list(uri.scheme, uri.resource, max_entries, max_bytes)
+					.await
+				else {
+					send_resource_capability_error(responses, request_id, "list").await;
+					return;
+				};
+				match result {
+					Ok(result) => {
+						let capability = self
+							.resources
+							.capability(uri.scheme)
+							.expect("mounted resource keeps capability metadata");
+						send_resource_result(responses, request_id, pb::ResourceResult {
+							uri:                request.uri,
+							data:               Bytes::new(),
+							entries:            result
+								.entries
+								.into_iter()
+								.map(|entry| pb::ResourceEntry {
+									uri:       entry.uri.to_string(),
+									name:      entry.name.to_string(),
+									directory: entry.directory,
+									size:      entry.size,
+								})
+								.collect(),
+							canonical_path_uri: String::new(),
+							capability:         Some(resource_capability_wire(capability)),
+							truncated:          result.truncated,
+						})
+						.await;
+					},
+					Err(fault) => send_resource_fault(responses, request_id, &fault).await,
+				}
+			},
+			Op::Path(request) => {
+				let Some(uri) = parse_mounted_resource_uri(&request.uri, responses, request_id).await
+				else {
+					return;
+				};
+				let Some(result) = self.resources.path(uri.scheme, uri.resource).await else {
+					send_resource_capability_error(responses, request_id, "path").await;
+					return;
+				};
+				match result {
+					Ok(result) => {
+						let capability = self
+							.resources
+							.capability(uri.scheme)
+							.expect("mounted resource keeps capability metadata");
+						send_resource_result(responses, request_id, pb::ResourceResult {
+							uri:                request.uri,
+							data:               Bytes::new(),
+							entries:            Vec::new(),
+							canonical_path_uri: result
+								.canonical_path_uri
+								.map_or_else(String::new, |uri| uri.to_string()),
+							capability:         Some(resource_capability_wire(capability)),
+							truncated:          false,
+						})
+						.await;
+					},
+					Err(fault) => send_resource_fault(responses, request_id, &fault).await,
+				}
+			},
+			Op::Complete(request) => {
+				let max_results = match resource_bound(
+					u64::from(request.max_results),
+					MAX_RESOURCE_COMPLETIONS,
+					"resource completion max_results",
+				) {
+					Ok(bound) => bound,
+					Err(message) => {
+						send_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							message,
+						)
+						.await;
+						return;
+					},
+				};
+				if request.input.len() > MAX_RESOURCE_URI_BYTES {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"resource completion input exceeds the 8192-byte limit",
+					)
+					.await;
+					return;
+				}
+				if request.catalog_revision != 0
+					&& request.catalog_revision != self.resources.revision()
+				{
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::PreconditionFailed,
+						"resource completion catalog revision is stale",
+					)
+					.await;
+					return;
+				}
+				if let Err(error) = connection.quotas.reserve_stream() {
+					send_policy_error(responses, request_id, error).await;
+					return;
+				}
+				let cancel = CancellationToken::new();
+				connection
+					.requests
+					.insert(request_id, RequestState::DataStream { cancel: cancel.clone() });
+				spawn_resource_completion(
+					request_id,
+					request.input,
+					max_results,
+					Arc::clone(&self.resources),
+					cancel,
+					responses.clone(),
+					finished.clone(),
+				);
+			},
+		}
+	}
+
+	async fn dispatch_privileged_mutation(
+		&self,
+		request_id: u64,
+		request: pb::PrivilegedMutationIntent,
+		scope: Option<&pb::InvocationScope>,
+		responses: &flume::Sender<pb::ServerFrame>,
+	) {
+		if request.wire_revision != omp_proto::SCHEMA_REV {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"privileged-mutation wire revision does not match the Environment schema",
+			)
+			.await;
+			return;
+		}
+		let Some(scope) = scope.filter(|scope| scope.invocation_id == request.invocation_id) else {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::PermissionDenied,
+				"privileged mutation invocation attribution does not match its Environment scope",
+			)
+			.await;
+			return;
+		};
+		let attributed = !scope.effect_token.is_empty()
+			&& request
+				.session
+				.as_ref()
+				.is_some_and(|session| !session.value.is_empty())
+			&& !request.approval_ticket.is_empty()
+			&& request
+				.effect
+				.as_ref()
+				.is_some_and(|effect| !effect.value.is_empty());
+		if !attributed {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::PermissionDenied,
+				"privileged mutation requires session, invocation, effect, and approval attribution",
+			)
+			.await;
+			return;
+		}
+		let Some(mutation) = request.mutation else {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"privileged mutation omitted its write or unlink intent",
+			)
+			.await;
+			return;
+		};
+		let target_uri = match &mutation {
+			pb::privileged_mutation_intent::Mutation::Write(intent) => {
+				intent.canonical_target_uri.as_str()
+			},
+			pb::privileged_mutation_intent::Mutation::Unlink(intent) => {
+				intent.canonical_target_uri.as_str()
+			},
+		};
+		let (canonical_uri, target) =
+			match canonical_privileged_target(self.workspace.root(), target_uri) {
+				Ok(target) => target,
+				Err(message) => {
+					send_error(responses, request_id, pb::ProtocolErrorCode::InvalidArgument, &message)
+						.await;
+					return;
+				},
+			};
+		let root = self.workspace.root().to_path_buf();
+		let operation = tokio::task::spawn_blocking(move || match mutation {
+			pb::privileged_mutation_intent::Mutation::Write(intent) => {
+				let expected_present = privileged_presence(intent.expected_presence)?;
+				let expected = privileged_revision_hash(intent.expected_revision.as_ref())?;
+				privileged_write(
+					&root,
+					&target,
+					intent.content,
+					expected_present,
+					expected.as_ref(),
+					intent.mode,
+				)
+				.map_err(PrivilegedDispatchError::Mutation)?;
+				Ok((document_pb::DocumentPresence::Present, None))
+			},
+			pb::privileged_mutation_intent::Mutation::Unlink(intent) => {
+				let expected_present = privileged_presence(intent.expected_presence)?;
+				let expected = privileged_revision_hash(intent.expected_revision.as_ref())?;
+				privileged_unlink(
+					&root,
+					&target,
+					expected_present,
+					expected.as_ref(),
+					intent.recursive,
+				)
+				.map_err(PrivilegedDispatchError::Mutation)?;
+				Ok((document_pb::DocumentPresence::Missing, None))
+			},
+		})
+		.await;
+		match operation {
+			Ok(Ok((presence, committed_revision))) => {
+				send_data_response(
+					responses,
+					request_id,
+					pb::data_response::Body::PrivilegedMutation(pb::PrivilegedMutationResult {
+						canonical_target_uri: canonical_uri,
+						presence: presence as i32,
+						committed_revision,
+					}),
+				)
+				.await;
+			},
+			Ok(Err(error)) => {
+				let (code, message) = privileged_dispatch_error(error);
+				send_error(responses, request_id, code, &message).await;
+			},
+			Err(error) => {
+				send_error(
+					responses,
+					request_id,
+					pb::ProtocolErrorCode::Internal,
+					&format!("privileged mutation worker failed: {error}"),
+				)
+				.await;
+			},
+		}
+	}
+
+	async fn dispatch_dap(
+		&self,
+		request_id: u64,
+		request: pb::data_request::Body,
+		scope: Option<&pb::InvocationScope>,
+		responses: &flume::Sender<pb::ServerFrame>,
+		finished: &flume::Sender<Finished>,
+		connection: &mut ConnectionState,
+	) {
+		use pb::data_request::Body;
+
+		let (operation, capability) = match &request {
+			Body::DapLaunch(_) => ("omp.env.dap.launch", "env.dap.execute"),
+			Body::DapAttach(_) => ("omp.env.dap.attach", "env.dap.execute"),
+			Body::DapAction(request) => {
+				("omp.env.dap.action", dap_command_capability(&request.command))
+			},
+			_ => unreachable!("DAP dispatch receives only DAP request arms"),
+		};
+		if !authorize_data_operation(connection, scope, operation, capability, responses, request_id)
+			.await
+		{
+			return;
+		}
+		if let Err(error) = connection.quotas.reserve_stream() {
+			send_policy_error(responses, request_id, error).await;
+			return;
+		}
+		let cancel = CancellationToken::new();
+		connection
+			.requests
+			.insert(request_id, RequestState::DataStream { cancel: cancel.clone() });
+		let documents = self.documents.clone();
+		let responses = responses.clone();
+		let finished = finished.clone();
+		tokio::spawn(async move {
+			let result = match request {
+				Body::DapLaunch(request) => documents
+					.dap_launch(request, &cancel)
+					.await
+					.map(|(response, events)| (pb::data_response::Body::DapSession(response), events)),
+				Body::DapAttach(request) => documents
+					.dap_attach(request, &cancel)
+					.await
+					.map(|(response, events)| (pb::data_response::Body::DapSession(response), events)),
+				Body::DapAction(request) => documents
+					.dap_action(request, &cancel)
+					.await
+					.map(|(response, events)| (pb::data_response::Body::DapAction(response), events)),
+				_ => unreachable!("DAP dispatch receives only DAP request arms"),
+			};
+			match result {
+				Ok((response, events)) => {
+					for event in events {
+						let body = match event {
+							DapRegistryEvent::Output(output) => pb::data_event::Body::DapOutput(output),
+							DapRegistryEvent::Event(event) => pb::data_event::Body::DapEvent(event),
+						};
+						send_body(
+							&responses,
+							request_id,
+							server_frame::Body::DataEvent(pb::DataEvent {
+								body: Some(body),
+								..pb::DataEvent::default()
+							}),
+						)
+						.await;
+					}
+					send_data_response(&responses, request_id, response).await;
+				},
+				Err(error) => send_document_error(&responses, request_id, &error).await,
+			}
+			let _ = finished
+				.send_async(Finished { request_id, invocation_id: None })
+				.await;
+		});
+	}
+
+	async fn dispatch_exec_session(
+		&self,
+		request_id: u64,
+		request: pb::ExecSessionOp,
+		responses: &flume::Sender<pb::ServerFrame>,
+	) {
+		use pb::{exec_session_op::Op, exec_session_result::Result};
+
+		let result = match request.op {
+			Some(Op::Materialize(request)) => {
+				if request.wire_revision != omp_proto::SCHEMA_REV {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"materialization wire revision does not match the Environment schema",
+					)
+					.await;
+					return;
+				}
+				if request.session.is_empty() || !self.exec.contains_session(&request.session) {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::NotFound,
+						"materialization exec session was not found",
+					)
+					.await;
+					return;
+				}
+				match self.materializations.materialize(request).await {
+					Ok(lease) => Result::Materialized(lease),
+					Err(error) => {
+						send_materialization_error(responses, request_id, &error).await;
+						return;
+					},
+				}
+			},
+			Some(Op::ReleaseMaterialization(request)) => {
+				if request.wire_revision != omp_proto::SCHEMA_REV {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"materialization release wire revision does not match the Environment schema",
+					)
+					.await;
+					return;
+				}
+				match self.materializations.release(request).await {
+					Ok(released) => Result::MaterializationReleased(released),
+					Err(error) => {
+						send_materialization_error(responses, request_id, &error).await;
+						return;
+					},
+				}
+			},
+			Some(Op::Control(request)) => match self.exec.control(&request) {
+				Ok(controlled) => Result::Controlled(controlled),
+				Err(error) => {
+					send_exec_error(responses, request_id, &error).await;
+					return;
+				},
+			},
+			Some(Op::Stdin(request)) => {
+				match self
+					.exec
+					.stdin(&request.exec, match request.input.as_ref() {
+						Some(pb::stdin_frame::Input::Data(data)) => Some(data.as_ref()),
+						Some(pb::stdin_frame::Input::Eof(_)) => None,
+						None => {
+							send_error(
+								responses,
+								request_id,
+								pb::ProtocolErrorCode::InvalidArgument,
+								"exec stdin operation omitted input",
+							)
+							.await;
+							return;
+						},
+					}) {
+					Ok(()) => Result::Controlled(pb::ExecControlResult {
+						exec:     request.exec,
+						accepted: true,
+					}),
+					Err(error) => {
+						send_exec_error(responses, request_id, &error).await;
+						return;
+					},
+				}
+			},
+			Some(Op::Resize(request)) => {
+				match self
+					.exec
+					.resize(&request.exec, request.rows, request.columns)
+				{
+					Ok(()) => Result::Controlled(pb::ExecControlResult {
+						exec:     request.exec,
+						accepted: true,
+					}),
+					Err(error) => {
+						send_exec_error(responses, request_id, &error).await;
+						return;
+					},
+				}
+			},
+			Some(Op::Signal(request)) => match self.exec.signal(&request.exec, &request.signal) {
+				Ok(()) => {
+					Result::Controlled(pb::ExecControlResult { exec: request.exec, accepted: true })
+				},
+				Err(error) => {
+					send_exec_error(responses, request_id, &error).await;
+					return;
+				},
+			},
+			Some(Op::Capabilities(request)) => match self.exec.capabilities(&request) {
+				Ok(capabilities) => Result::Capabilities(capabilities),
+				Err(error) => {
+					send_exec_error(responses, request_id, &error).await;
+					return;
+				},
+			},
+			Some(Op::FinalCwd(request)) => match self.exec.final_cwd(&request) {
+				Ok(final_cwd) => Result::FinalCwd(final_cwd),
+				Err(error) => {
+					send_exec_error(responses, request_id, &error).await;
+					return;
+				},
+			},
+			None => {
+				send_error(
+					responses,
+					request_id,
+					pb::ProtocolErrorCode::InvalidArgument,
+					"exec-session operation is missing",
+				)
+				.await;
+				return;
+			},
+		};
+		send_data_response(
+			responses,
+			request_id,
+			pb::data_response::Body::ExecSession(pb::ExecSessionResult { result: Some(result) }),
+		)
+		.await;
+	}
+
+	async fn dispatch_mcp(
+		&self,
+		request_id: u64,
+		request: pb::McpOp,
+		responses: &flume::Sender<pb::ServerFrame>,
+		finished: &flume::Sender<Finished>,
+		connection: &mut ConnectionState,
+	) {
+		use pb::mcp_op::Op;
+
+		let Some(operation) = request.op else {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"MCP operation is missing",
+			)
+			.await;
+			return;
+		};
+		if mcp_wire_revision(&operation) != omp_proto::SCHEMA_REV {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::Unsupported,
+				"MCP operation uses an unsupported wire revision",
+			)
+			.await;
+			return;
+		}
+		if let Op::Status(request) = operation {
+			send_data_response(
+				responses,
+				request_id,
+				pb::data_response::Body::Mcp(pb::McpResult {
+					result: Some(pb::mcp_result::Result::Status(
+						self.mcp.status(request.name.as_deref()),
+					)),
+				}),
+			)
+			.await;
+			return;
+		}
+		if let Err(error) = connection.quotas.reserve_stream() {
+			send_policy_error(responses, request_id, error).await;
+			return;
+		}
+		let cancel = CancellationToken::new();
+		connection
+			.requests
+			.insert(request_id, RequestState::DataStream { cancel: cancel.clone() });
+		match operation {
+			Op::Subscribe(request) => match self
+				.mcp
+				.subscribe(request.name.as_deref(), request.after_sequence)
+			{
+				Ok(subscription) => spawn_mcp_subscription(
+					request_id,
+					subscription,
+					cancel,
+					responses.clone(),
+					finished.clone(),
+				),
+				Err(error) => {
+					connection.requests.remove(&request_id);
+					connection.quotas.release_stream();
+					send_mcp_error(responses, request_id, &error).await;
+				},
+			},
+			operation => spawn_mcp_request(
+				request_id,
+				Arc::clone(&self.mcp),
+				operation,
+				cancel,
+				responses.clone(),
+				finished.clone(),
+			),
+		}
+	}
+
+	async fn dispatch_repository_snapshot(
+		&self,
+		request_id: u64,
+		request: pb::RepositorySnapshotRequest,
+		responses: &flume::Sender<pb::ServerFrame>,
+	) {
+		if request.wire_revision != omp_proto::SCHEMA_REV {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"repository snapshot wire revision does not match the Environment schema",
+			)
+			.await;
+			return;
+		}
+		let requested_root = if request.root_uri.is_empty() {
+			self.workspace.root().to_path_buf()
+		} else {
+			let parsed = match Url::parse(&request.root_uri) {
+				Ok(parsed) => parsed,
+				Err(_) => {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"repository root is not a valid URI",
+					)
+					.await;
+					return;
+				},
+			};
+			match parsed.to_file_path() {
+				Ok(path) => path,
+				Err(()) => {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"repository root is not a local file URI",
+					)
+					.await;
+					return;
+				},
+			}
+		};
+		let requested_root = match tokio::fs::canonicalize(&requested_root).await {
+			Ok(root) if root.starts_with(self.workspace.root()) => root,
+			Ok(_) => {
+				send_error(
+					responses,
+					request_id,
+					pb::ProtocolErrorCode::PermissionDenied,
+					"repository root is outside the Environment workspace grant",
+				)
+				.await;
+				return;
+			},
+			Err(_) => {
+				send_error(
+					responses,
+					request_id,
+					pb::ProtocolErrorCode::InvalidArgument,
+					"repository root does not exist",
+				)
+				.await;
+				return;
+			},
+		};
+		let cancel = CancellationToken::new();
+		let snapshot =
+			match vcs::snapshot(&requested_root, &GitRunner::new(self.exec.clone()), &cancel).await {
+				Ok(snapshot) => snapshot,
+				Err(SnapshotError::Repository(RepositoryError::InvalidPointer { .. })) => {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"repository metadata contains an invalid Git pointer",
+					)
+					.await;
+					return;
+				},
+				Err(_) => {
+					send_error(
+						responses,
+						request_id,
+						pb::ProtocolErrorCode::Internal,
+						"repository snapshot could not be captured",
+					)
+					.await;
+					return;
+				},
+			};
+		let availability = match snapshot.availability {
+			RepositoryAvailability::Available => pb::RepositoryAvailability::Available,
+			RepositoryAvailability::NotRepository => pb::RepositoryAvailability::NotRepository,
+			RepositoryAvailability::GitUnavailable => pb::RepositoryAvailability::GitUnavailable,
+		};
+		let worktree_root_uri = snapshot
+			.worktree_root
+			.as_deref()
+			.and_then(|path| Url::from_directory_path(path).ok())
+			.map_or_else(String::new, |url| url.to_string());
+		let primary_root_uri = snapshot
+			.primary_root
+			.as_deref()
+			.and_then(|path| Url::from_directory_path(path).ok())
+			.map_or_else(String::new, |url| url.to_string());
+		self
+			.send_repository_snapshot(
+				request_id,
+				pb::RepositorySnapshot {
+					availability: availability as i32,
+					worktree_root_uri,
+					primary_root_uri,
+					head: snapshot
+						.head
+						.map_or_else(String::new, |head| head.to_string()),
+					branch: snapshot
+						.branch
+						.map_or_else(String::new, |branch| branch.to_string()),
+					staged: snapshot.status_counts.staged,
+					unstaged: snapshot.status_counts.unstaged,
+					untracked: snapshot.status_counts.untracked,
+					revision: self.repository_revision.fetch_add(1, Ordering::Relaxed) + 1,
+					truncated: false,
+				},
+				responses,
+			)
+			.await;
+	}
+
+	async fn send_repository_snapshot(
+		&self,
+		request_id: u64,
+		snapshot: pb::RepositorySnapshot,
+		responses: &flume::Sender<pb::ServerFrame>,
+	) {
+		send_data_response(
+			responses,
+			request_id,
+			pb::data_response::Body::RepositorySnapshot(snapshot),
+		)
+		.await;
 	}
 
 	async fn dispatch_worker(
@@ -2408,6 +3768,18 @@ impl EnvServer {
 			.await;
 			return;
 		};
+		if !self.lsp_settings.enabled
+			&& matches!(&operation, Op::GetLspBindings(_) | Op::LspRequest(_) | Op::LspNotification(_))
+		{
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::Unsupported,
+				"LSP operations are disabled by the resolved project settings",
+			)
+			.await;
+			return;
+		}
 		let (operation_name, required) = match &operation {
 			Op::Open(_) => ("omp.env.docs.open", "env.doc.read"),
 			Op::Close(_) => ("omp.env.docs.close", "env.doc.read"),
@@ -2426,8 +3798,13 @@ impl EnvServer {
 			Op::CreateHardLink(_) => ("omp.env.fs.create_hard_link", "env.fs.write"),
 			Op::SetPermissions(_) => ("omp.env.fs.set_permissions", "env.fs.write"),
 			Op::GetLspBindings(_) => ("omp.env.lsp.get_bindings", "env.lsp"),
-			Op::LspRequest(_) => ("omp.env.lsp.request", "env.lsp"),
-			Op::LspNotification(_) => ("omp.env.lsp.notification", "env.lsp"),
+			Op::LspRequest(request) => {
+				("omp.env.lsp.request", lsp_tier_capability(lsp_request_tier(&request.method)))
+			},
+			Op::LspNotification(request) => (
+				"omp.env.lsp.notification",
+				lsp_tier_capability(lsp_notification_tier(&request.method)),
+			),
 		};
 		if !authorize_data_operation(
 			connection,
@@ -3665,9 +5042,12 @@ impl ConnectionState {
 			},
 			RequestState::ProcessAttach { cancel }
 			| RequestState::BlobGet { cancel }
-			| RequestState::DataStream { cancel }
 			| RequestState::DocumentEvents { cancel, .. }
 			| RequestState::LspEvents { cancel } => cancel.cancel(),
+			RequestState::DataStream { cancel } => {
+				cancel.cancel();
+				self.quotas.release_stream();
+			},
 			RequestState::BlobPut(_) => {},
 		}
 	}
@@ -4431,6 +5811,455 @@ struct WorkspaceSearchOwned {
 	limit:   Option<u64>,
 }
 
+async fn parse_mounted_resource_uri<'a>(
+	input: &'a str,
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+) -> Option<omp_tools::read::selector::ParsedUri<'a>> {
+	if input.len() > MAX_RESOURCE_URI_BYTES {
+		send_error(
+			responses,
+			request_id,
+			pb::ProtocolErrorCode::InvalidArgument,
+			"resource URI exceeds the 8192-byte limit",
+		)
+		.await;
+		return None;
+	}
+	match omp_tools::read::selector::parse_uri(input) {
+		Ok(Some(uri))
+			if !matches!(
+				uri.scheme,
+				omp_tools::read::resolver::Scheme::Unknown
+					| omp_tools::read::resolver::Scheme::File
+					| omp_tools::read::resolver::Scheme::Http
+			) =>
+		{
+			Some(uri)
+		},
+		Ok(Some(_)) => {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::Unsupported,
+				"resource URI scheme is not mounted on the internal resource plane",
+			)
+			.await;
+			None
+		},
+		Ok(None) => {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"resource URI must use hierarchical scheme:// syntax",
+			)
+			.await;
+			None
+		},
+		Err(error) => {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				&error.to_string(),
+			)
+			.await;
+			None
+		},
+	}
+}
+
+fn resource_bound(value: u64, ceiling: usize, name: &'static str) -> Result<usize, &'static str> {
+	let Ok(value) = usize::try_from(value) else {
+		return Err("resource operation bound does not fit this host");
+	};
+	if value == 0 {
+		return Err(match name {
+			"resource read max_bytes" => "resource read max_bytes must be nonzero",
+			"resource list max_entries" => "resource list max_entries must be nonzero",
+			"resource list max_bytes" => "resource list max_bytes must be nonzero",
+			"resource completion max_results" => "resource completion max_results must be nonzero",
+			_ => "resource operation bound must be nonzero",
+		});
+	}
+	if value > ceiling {
+		return Err(match name {
+			"resource read max_bytes" => "resource read max_bytes exceeds the 8 MiB ceiling",
+			"resource list max_entries" => "resource list max_entries exceeds the 4096-entry ceiling",
+			"resource list max_bytes" => "resource list max_bytes exceeds the 2 MiB ceiling",
+			"resource completion max_results" => {
+				"resource completion max_results exceeds the 100-result ceiling"
+			},
+			_ => "resource operation bound exceeds its Environment ceiling",
+		});
+	}
+	Ok(value)
+}
+
+fn resource_capability_wire(
+	capability: omp_tools::read::resolver::ResourceCapability,
+) -> pb::ResourceCapability {
+	pb::ResourceCapability {
+		scheme:      capability.scheme.to_owned(),
+		read:        capability.read,
+		list:        capability.list,
+		path:        capability.path,
+		complete:    capability.complete,
+		device_hash: Bytes::copy_from_slice(&capability.stamp.device_hash),
+		revision:    capability.stamp.revision,
+	}
+}
+
+async fn send_resource_result(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	result: pb::ResourceResult,
+) {
+	send_data_response(
+		responses,
+		request_id,
+		pb::data_response::Body::Resource(pb::ResourceOpResult { result: Some(result) }),
+	)
+	.await;
+}
+
+async fn send_resource_fault(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	fault: &omp_tools::read::Fault,
+) {
+	let code = match fault {
+		omp_tools::read::Fault::Invalid { .. } => pb::ProtocolErrorCode::InvalidArgument,
+		omp_tools::read::Fault::UnknownScheme { .. }
+		| omp_tools::read::Fault::SchemeNotReadable { .. }
+		| omp_tools::read::Fault::Unsupported { .. } => pb::ProtocolErrorCode::Unsupported,
+		omp_tools::read::Fault::Source { .. } => pb::ProtocolErrorCode::NotFound,
+		omp_tools::read::Fault::Web { .. } | omp_tools::read::Fault::Blob { .. } => {
+			pb::ProtocolErrorCode::Internal
+		},
+	};
+	send_error(responses, request_id, code, fault.message()).await;
+}
+
+async fn send_resource_capability_error(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	operation: &str,
+) {
+	send_error(
+		responses,
+		request_id,
+		pb::ProtocolErrorCode::Unsupported,
+		&format!("mounted resource does not support {operation}"),
+	)
+	.await;
+}
+
+const fn mcp_operation(request: &pb::McpOp) -> &'static str {
+	use pb::mcp_op::Op;
+	match request.op.as_ref() {
+		Some(Op::Status(_)) => "omp.env.mcp.status",
+		Some(Op::Subscribe(_)) => "omp.env.mcp.subscribe",
+		Some(Op::Reset(_)) => "omp.env.mcp.reset",
+		Some(Op::LiveHeader(_)) => "omp.env.mcp.live-header",
+		Some(Op::Resource(_)) => "omp.env.mcp.resource",
+		Some(Op::Prompt(_)) => "omp.env.mcp.prompt",
+		Some(Op::Invoke(_)) => "omp.env.mcp.invoke",
+		Some(Op::Config(_)) => "omp.env.mcp.config",
+		None => "omp.env.mcp.invalid",
+	}
+}
+
+const fn mcp_wire_revision(operation: &pb::mcp_op::Op) -> u32 {
+	use pb::mcp_op::Op;
+	match operation {
+		Op::Status(request) => request.wire_revision,
+		Op::Subscribe(request) => request.wire_revision,
+		Op::Reset(request) => request.wire_revision,
+		Op::LiveHeader(request) => request.wire_revision,
+		Op::Resource(request) => request.wire_revision,
+		Op::Prompt(request) => request.wire_revision,
+		Op::Invoke(request) => request.wire_revision,
+		Op::Config(request) => request.wire_revision,
+	}
+}
+
+fn spawn_mcp_request(
+	request_id: u64,
+	service: Arc<McpService>,
+	operation: pb::mcp_op::Op,
+	cancel: CancellationToken,
+	responses: flume::Sender<pb::ServerFrame>,
+	finished: flume::Sender<Finished>,
+) {
+	tokio::spawn(async move {
+		use pb::{mcp_op::Op, mcp_result::Result as McpResult};
+		let result = match operation {
+			Op::Reset(request) => service
+				.reset(request, cancel.clone())
+				.await
+				.map(McpResult::Reset),
+			Op::LiveHeader(request) => service
+				.live_header(request, cancel.clone())
+				.await
+				.map(McpResult::LiveHeader),
+			Op::Resource(request) => service
+				.resource(request, cancel.clone())
+				.await
+				.map(McpResult::Resource),
+			Op::Prompt(request) => service
+				.prompt(request, cancel.clone())
+				.await
+				.map(McpResult::Prompt),
+			Op::Invoke(request) => service
+				.invoke(request, cancel.clone())
+				.await
+				.map(McpResult::Invoke),
+			Op::Config(request) => service.config(request).await.map(McpResult::Config),
+			Op::Status(_) | Op::Subscribe(_) => Err(super::mcp::McpServiceError::InvalidRequest),
+		};
+		if !cancel.is_cancelled() {
+			match result {
+				Ok(result) => {
+					send_data_response(
+						&responses,
+						request_id,
+						pb::data_response::Body::Mcp(pb::McpResult { result: Some(result) }),
+					)
+					.await;
+				},
+				Err(error) => send_mcp_error(&responses, request_id, &error).await,
+			}
+		}
+		let _ = finished
+			.send_async(Finished { request_id, invocation_id: None })
+			.await;
+	});
+}
+
+fn spawn_mcp_subscription(
+	request_id: u64,
+	subscription: super::mcp::ServiceSubscription,
+	cancel: CancellationToken,
+	responses: flume::Sender<pb::ServerFrame>,
+	finished: flume::Sender<Finished>,
+) {
+	tokio::spawn(async move {
+		loop {
+			match subscription.next(&cancel).await {
+				Ok(Some(super::mcp::SubscriptionEvent::Notification(notification))) => {
+					if !send_data_event_sync(
+						&responses,
+						request_id,
+						pb::data_event::Body::McpNotification(notification),
+					) {
+						break;
+					}
+				},
+				Ok(Some(super::mcp::SubscriptionEvent::Status(status))) => {
+					if !send_data_event_sync(
+						&responses,
+						request_id,
+						pb::data_event::Body::McpStatus(status),
+					) {
+						break;
+					}
+				},
+				Err(super::mcp::McpServiceError::Cancelled) => break,
+				Ok(None) | Err(_) => {
+					let _ = responses
+						.send_async(server_frame(
+							request_id,
+							server_frame::Body::EventStreamError(pb::EventStreamError {
+								stream:         pb::EventStreamKind::McpNotification.into(),
+								failure:        pb::EventStreamFailure::Synchronization.into(),
+								invocation_id:  String::new(),
+								exec:           Bytes::new(),
+								process_name:   String::new(),
+								skipped_events: 0,
+								message:        "MCP notification continuity was lost".to_owned(),
+								props:          Default::default(),
+							}),
+						))
+						.await;
+					break;
+				},
+			}
+		}
+		let _ = finished
+			.send_async(Finished { request_id, invocation_id: None })
+			.await;
+	});
+}
+
+async fn send_mcp_error(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	error: &super::mcp::McpServiceError,
+) {
+	use super::mcp::McpServiceError;
+	let code = match error {
+		McpServiceError::InvalidRequest => pb::ProtocolErrorCode::InvalidArgument,
+		McpServiceError::ServerNotFound => pb::ProtocolErrorCode::NotFound,
+		McpServiceError::StaleDefinitionEpoch { .. }
+		| McpServiceError::StaleGeneration
+		| McpServiceError::StaleSequence
+		| McpServiceError::LeafReplacement(_) => pb::ProtocolErrorCode::PreconditionFailed,
+		McpServiceError::ContinuityLost => pb::ProtocolErrorCode::PreconditionFailed,
+		McpServiceError::Cancelled => pb::ProtocolErrorCode::Cancelled,
+		McpServiceError::EpochExhausted | McpServiceError::Backend => pb::ProtocolErrorCode::Internal,
+	};
+	send_error(responses, request_id, code, &error.to_string()).await;
+}
+
+fn spawn_resource_completion(
+	request_id: u64,
+	input: String,
+	max_results: usize,
+	resources: Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
+	cancel: CancellationToken,
+	responses: flume::Sender<pb::ServerFrame>,
+	finished: flume::Sender<Finished>,
+) {
+	tokio::spawn(async move {
+		let result = tokio::select! {
+			() = cancel.cancelled() => None,
+			result = resource_completions(&resources, &input, max_results) => Some(result),
+		};
+		if let Some(result) = result {
+			match result {
+				Ok((completions, truncated)) => {
+					let mut emitted = 0u32;
+					for (completion, capability) in completions {
+						if cancel.is_cancelled() {
+							break;
+						}
+						let event = checked_server_frame(
+							request_id,
+							server_frame::Body::DataEvent(pb::DataEvent {
+								body:  Some(pb::data_event::Body::ResourceCompletion(
+									pb::ResourceCompletion {
+										value:       completion.value.to_string(),
+										description: completion.description.to_string(),
+										capability:  Some(resource_capability_wire(capability)),
+										score:       completion.score,
+									},
+								)),
+								props: Default::default(),
+							}),
+						);
+						if responses.send_async(event).await.is_err() {
+							break;
+						}
+						emitted = emitted.saturating_add(1);
+					}
+					if !cancel.is_cancelled() {
+						let terminal = checked_server_frame(
+							request_id,
+							server_frame::Body::DataEvent(pb::DataEvent {
+								body:  Some(pb::data_event::Body::ResourceCompletionComplete(
+									pb::ResourceCompletionComplete {
+										emitted,
+										truncated,
+										catalog_revision: resources.revision(),
+									},
+								)),
+								props: Default::default(),
+							}),
+						);
+						let _ = responses.send_async(terminal).await;
+					}
+				},
+				Err(message) => {
+					let _ = responses
+						.send_async(server_frame(
+							request_id,
+							server_frame::Body::EventStreamError(pb::EventStreamError {
+								stream: pb::EventStreamKind::ResourceCompletion.into(),
+								failure: pb::EventStreamFailure::Closed.into(),
+								invocation_id: String::new(),
+								exec: Bytes::new(),
+								process_name: String::new(),
+								skipped_events: 0,
+								message,
+								props: Default::default(),
+							}),
+						))
+						.await;
+				},
+			}
+		}
+		let _ = finished
+			.send_async(Finished { request_id, invocation_id: None })
+			.await;
+	});
+}
+
+async fn resource_completions(
+	resources: &omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>,
+	input: &str,
+	max_results: usize,
+) -> Result<
+	(
+		Vec<(
+			omp_tools::read::resolver::ResourceCompletion,
+			omp_tools::read::resolver::ResourceCapability,
+		)>,
+		bool,
+	),
+	String,
+> {
+	use omp_tools::read::resolver::{ResourceCompletion, Scheme, fuzzy_score};
+
+	if let Some((raw_scheme, query)) = input.split_once("://") {
+		let scheme = Scheme::parse(raw_scheme);
+		if scheme == Scheme::Unknown {
+			return Err(format!("resource completion scheme is not mounted: {raw_scheme}"));
+		}
+		let capability = resources
+			.capability(scheme)
+			.filter(|capability| capability.complete)
+			.ok_or_else(|| format!("{raw_scheme}:// does not support completion"))?;
+		let (matches, truncated) = resources
+			.complete(scheme, query, max_results)
+			.await
+			.ok_or_else(|| format!("{raw_scheme}:// does not support completion"))?
+			.map_err(|fault| fault.message().to_string())?;
+		return Ok((
+			matches
+				.into_iter()
+				.map(|completion| (completion, capability.clone()))
+				.collect(),
+			truncated,
+		));
+	}
+
+	let mut matches = resources
+		.capabilities()
+		.filter_map(|capability| {
+			let score = fuzzy_score(input.trim_end_matches(':'), capability.scheme)?;
+			Some((
+				ResourceCompletion {
+					value: Str::new(format!("{}://", capability.scheme)),
+					description: capability.description.clone(),
+					score,
+				},
+				capability,
+			))
+		})
+		.collect::<Vec<_>>();
+	matches.sort_unstable_by(|(left, _), (right, _)| {
+		right
+			.score
+			.cmp(&left.score)
+			.then_with(|| left.value.cmp(&right.value))
+	});
+	let truncated = matches.len() > max_results;
+	matches.truncate(max_results);
+	Ok((matches, truncated))
+}
+
 fn spawn_document_events(
 	request_id: u64,
 	events: DocumentEvents,
@@ -5002,18 +6831,45 @@ fn workspace_walk_request(
 	Ok(walk)
 }
 
+async fn send_materialization_error(
+	responses: &flume::Sender<pb::ServerFrame>,
+	request_id: u64,
+	error: &MaterializationError,
+) {
+	let code = match error {
+		MaterializationError::InvalidUri => pb::ProtocolErrorCode::InvalidArgument,
+		MaterializationError::NotFound => pb::ProtocolErrorCode::NotFound,
+		MaterializationError::UnsupportedScheme => pb::ProtocolErrorCode::Unsupported,
+		MaterializationError::OutsideGrant | MaterializationError::SymbolicLink => {
+			pb::ProtocolErrorCode::PermissionDenied
+		},
+		MaterializationError::TooLarge { .. } => pb::ProtocolErrorCode::ResourceExhausted,
+		MaterializationError::Io(_) => pb::ProtocolErrorCode::Internal,
+	};
+	send_error(responses, request_id, code, &error.to_string()).await;
+}
+
 async fn send_exec_error(
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
 	error: &ExecError,
 ) {
 	let code = match error {
-		ExecError::SessionNotFound | ExecError::RunNotFound | ExecError::ProcessNotFound(_) => {
-			pb::ProtocolErrorCode::NotFound
-		},
+		ExecError::SessionNotFound
+		| ExecError::RunNotFound
+		| ExecError::FinalCwdNotFound
+		| ExecError::ProcessNotFound(_) => pb::ProtocolErrorCode::NotFound,
 		ExecError::ProcessExists(_) => pb::ProtocolErrorCode::AlreadyExists,
-		ExecError::StaleProcessGeneration { .. } => pb::ProtocolErrorCode::PreconditionFailed,
-		ExecError::UnsupportedSignal(_) => pb::ProtocolErrorCode::Unsupported,
+		ExecError::StaleProcessGeneration { .. } | ExecError::StaleFinalCwdRevision => {
+			pb::ProtocolErrorCode::PreconditionFailed
+		},
+		ExecError::UnsupportedSignal(_) | ExecError::UnsupportedShellProfile { .. } => {
+			pb::ProtocolErrorCode::Unsupported
+		},
+		ExecError::WireRevision
+		| ExecError::InvalidControl
+		| ExecError::InvalidProcessName
+		| ExecError::DetachedPty => pb::ProtocolErrorCode::InvalidArgument,
 		_ => pb::ProtocolErrorCode::Internal,
 	};
 	send_error(responses, request_id, code, &error.to_string()).await;
@@ -5551,7 +7407,7 @@ pub async fn run_with_registry(args: EnvdArgs, registry: Registry) -> Result<(),
 	let root = workspace.root().to_path_buf();
 	let data_dir = crate::cli::data_dir(None)
 		.map_err(|error| io::Error::new(io::ErrorKind::NotFound, error.to_string()))?;
-	let settings = crate::settings::Settings::load(&data_dir);
+	let settings = crate::settings::current(&data_dir).map_err(|error| io::Error::other(error))?;
 	let interrupt_grace = settings.runtime_durations().interrupt_grace;
 	let state_dir = if let Some(path) = args.state_dir {
 		path
@@ -5855,9 +7711,15 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
 }
 #[cfg(all(test, unix))]
 mod tests {
+	use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
 	use super::*;
+
+	const TEST_DAP_SESSION_ID: [u8; 16] = [0x2a; 16];
+
 	async fn test_connection(
 		capabilities: &[&str],
+		with_dap: bool,
 	) -> (
 		flume::Sender<pb::ClientFrame>,
 		flume::Receiver<pb::ServerFrame>,
@@ -5872,6 +7734,9 @@ mod tests {
 			.with_server_build("envd-test");
 		let document_environment =
 			omp_docserver::Environment::new(document_config).expect("document environment");
+		if with_dap {
+			install_test_dap(&document_environment).await;
+		}
 		let (document_client, document_server) = tokio::io::duplex(64 * 1024);
 		tokio::spawn(async move {
 			let _ = omp_docserver::connection::serve_connection(
@@ -5927,19 +7792,25 @@ mod tests {
 			documents,
 			None,
 			exec,
-			workspace,
+			workspace.clone(),
+			McpService::open(state.path().join("mcp-cache.sqlite3")).expect("MCP service"),
+			Arc::new(omp_tools::read::resolver::ResolverTable::default()),
+			super::super::lsp_settings::LspSettings::default(),
 			blobs.clone(),
 			SiteMaterializer::open(state.path().join("ext"), blobs.store().clone())
 				.expect("site materializer"),
+			ResourceMaterializer::open(workspace.root(), state.path()).expect("resource materializer"),
 			Arc::new(Registry::new()),
 			workspace_ops,
 			Arc::new(ext_hosts),
 			Arc::new(SessionBridgeHost::new()),
 			omp_tools::eval::EvalSessionControl::default(),
 			crate::envd::tools::AgentCheckpointControl::default(),
+			crate::envd::tools::AgentGoalControl::default(),
 			sessions_index,
 			journal_external,
 			Arc::new(AuthorityTable::default()),
+			state.path(),
 		));
 		let host = HostKey::new("workspace", "sandboxed", "envd-test");
 		let grants = Grants::supported(capabilities.iter().copied());
@@ -5988,6 +7859,134 @@ mod tests {
 		(requests, response_rx, root, state)
 	}
 
+	async fn install_test_dap(environment: &omp_docserver::Environment) {
+		let (client, adapter) = tokio::io::duplex(64 * 1024);
+		tokio::spawn(fake_dap_adapter(adapter));
+		let (reader, writer) = tokio::io::split(client);
+		let session = omp_docserver::DapSession::start(
+			omp_core::hex::encode_n(&TEST_DAP_SESSION_ID).as_str(),
+			"test",
+			omp_docserver::DapProtocol::from_streams(reader, writer),
+			false,
+			serde_json::Map::new(),
+			None,
+		)
+		.await
+		.expect("start fake DAP session");
+		session.set_wire_grants(true, true, 4096);
+		environment.dap_sessions().insert(session);
+	}
+
+	async fn fake_dap_adapter(stream: tokio::io::DuplexStream) {
+		let (reader, mut writer) = tokio::io::split(stream);
+		let mut reader = BufReader::new(reader);
+		let mut next_seq = 1_i64;
+		loop {
+			let mut content_length = None;
+			loop {
+				let mut line = String::new();
+				if reader
+					.read_line(&mut line)
+					.await
+					.ok()
+					.filter(|read| *read > 0)
+					.is_none()
+				{
+					return;
+				}
+				if line == "\r\n" {
+					break;
+				}
+				if let Some(length) = line.strip_prefix("Content-Length: ") {
+					content_length = length.trim().parse::<usize>().ok();
+				}
+			}
+			let Some(content_length) = content_length else {
+				return;
+			};
+			let mut body = vec![0; content_length];
+			if reader.read_exact(&mut body).await.is_err() {
+				return;
+			}
+			let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+				return;
+			};
+			let Some(request_seq) = request.get("seq").and_then(serde_json::Value::as_i64) else {
+				continue;
+			};
+			let Some(command) = request.get("command").and_then(serde_json::Value::as_str) else {
+				continue;
+			};
+			if command == "launch" {
+				if write_fake_dap_message(
+					&mut writer,
+					&serde_json::json!({
+						"seq": next_seq,
+						"type": "event",
+						"event": "initialized",
+						"body": {},
+					}),
+				)
+				.await
+				.is_err()
+				{
+					return;
+				}
+				next_seq += 1;
+			}
+			if command == "variables" {
+				if write_fake_dap_message(
+					&mut writer,
+					&serde_json::json!({
+						"seq": next_seq,
+						"type": "event",
+						"event": "output",
+						"body": {"category": "console", "output": "ready\n"},
+					}),
+				)
+				.await
+				.is_err()
+				{
+					return;
+				}
+				next_seq += 1;
+			}
+			let response_body = if command == "variables" {
+				serde_json::json!({"variables": [{"name": "answer", "value": "42", "variablesReference": 0}]})
+			} else {
+				serde_json::json!({})
+			};
+			if write_fake_dap_message(
+				&mut writer,
+				&serde_json::json!({
+					"seq": next_seq,
+					"type": "response",
+					"request_seq": request_seq,
+					"command": command,
+					"success": true,
+					"body": response_body,
+				}),
+			)
+			.await
+			.is_err()
+			{
+				return;
+			}
+			next_seq += 1;
+		}
+	}
+
+	async fn write_fake_dap_message<W>(writer: &mut W, message: &serde_json::Value) -> io::Result<()>
+	where
+		W: AsyncWrite + Unpin,
+	{
+		let body = serde_json::to_vec(message).map_err(io::Error::other)?;
+		let header = format!("Content-Length: {}\r\n\r\n", body.len());
+		writer.write_all(header.as_bytes()).await?;
+		writer.write_all(&body).await?;
+		writer.flush().await
+	}
+
 	fn data_frame(request_id: u64, body: pb::data_request::Body) -> pb::ClientFrame {
 		pb::ClientFrame {
 			request_id,
@@ -6007,9 +8006,157 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn dap_read_action_streams_output_before_revision_fenced_response() {
+		let (requests, responses, _root, _state) =
+			test_connection(&["env.dap.read", "env.dap.execute"], true).await;
+		requests
+			.send_async(data_frame(
+				1,
+				pb::data_request::Body::DapAction(document_pb::DapActionRequest {
+					session:             Some(document_pb::DapSessionRef {
+						session_id: Bytes::copy_from_slice(&TEST_DAP_SESSION_ID),
+						generation: 1,
+						revision:   1,
+					}),
+					expected_revision:   1,
+					required_capability: document_pb::DapCapability::Read as i32,
+					command:             "variables".to_owned(),
+					arguments_json:      Bytes::from_static(b"{\"variablesReference\":0}"),
+					max_response_bytes:  4096,
+				}),
+			))
+			.await
+			.expect("send DAP read action");
+		let output = responses.recv_async().await.expect("DAP output event");
+		assert!(matches!(
+			output.body,
+			Some(server_frame::Body::DataEvent(pb::DataEvent {
+				body: Some(pb::data_event::Body::DapOutput(document_pb::DapOutput {
+					sequence: 1,
+					ref output,
+					..
+				})),
+				..
+			})) if output.as_ref() == b"ready\n"
+		));
+		let response = responses.recv_async().await.expect("DAP action response");
+		let Some(server_frame::Body::Data(pb::DataResponse {
+			body: Some(pb::data_response::Body::DapAction(response)),
+			..
+		})) = response.body
+		else {
+			panic!("expected DAP action response");
+		};
+		assert!(response.success);
+		assert_eq!(response.session.expect("response session").revision, 2);
+		assert!(
+			response
+				.body_json
+				.windows(b"answer".len())
+				.any(|window| window == b"answer")
+		);
+	}
+
+	#[tokio::test]
+	async fn dap_mutation_is_denied_by_read_only_grants_before_session_effects() {
+		let (requests, responses, _root, _state) = test_connection(&["env.dap.read"], true).await;
+		requests
+			.send_async(data_frame(
+				1,
+				pb::data_request::Body::DapAction(document_pb::DapActionRequest {
+					session:             Some(document_pb::DapSessionRef {
+						session_id: Bytes::copy_from_slice(&TEST_DAP_SESSION_ID),
+						generation: 1,
+						revision:   1,
+					}),
+					expected_revision:   1,
+					required_capability: document_pb::DapCapability::Execute as i32,
+					command:             "continue".to_owned(),
+					arguments_json:      Bytes::from_static(b"{}"),
+					max_response_bytes:  4096,
+				}),
+			))
+			.await
+			.expect("send denied DAP mutation");
+		assert!(matches!(
+			responses.recv_async().await.expect("DAP denial").body,
+			Some(server_frame::Body::Error(pb::ProtocolError { code, .. }))
+				if code == pb::ProtocolErrorCode::PermissionDenied as i32
+		));
+	}
+
+	#[tokio::test]
+	async fn repository_snapshot_returns_only_granted_canonical_root_uris() {
+		let (requests, responses, root, _state) = test_connection(&["env.search"], false).await;
+		let initialized = std::process::Command::new("git")
+			.current_dir(root.path())
+			.args(["init", "-b", "main"])
+			.output()
+			.expect("fixture Git should launch");
+		assert!(
+			initialized.status.success(),
+			"fixture Git init failed: {}",
+			String::from_utf8_lossy(&initialized.stderr)
+		);
+		requests
+			.send_async(data_frame(
+				1,
+				pb::data_request::Body::RepositorySnapshot(pb::RepositorySnapshotRequest {
+					root_uri:          Url::from_directory_path(root.path())
+						.expect("workspace URI")
+						.to_string(),
+					max_changed_paths: 16,
+					wire_revision:     omp_proto::SCHEMA_REV,
+				}),
+			))
+			.await
+			.expect("send repository snapshot");
+		let response = responses.recv_async().await.expect("snapshot response");
+		let Some(server_frame::Body::Data(pb::DataResponse {
+			body: Some(pb::data_response::Body::RepositorySnapshot(snapshot)),
+			..
+		})) = response.body
+		else {
+			panic!("expected repository snapshot response");
+		};
+		assert_eq!(snapshot.availability, pb::RepositoryAvailability::Available as i32);
+		assert_eq!(
+			Url::parse(&snapshot.worktree_root_uri)
+				.expect("worktree URI")
+				.to_file_path()
+				.expect("worktree file URI"),
+			std::fs::canonicalize(root.path()).expect("canonical workspace")
+		);
+		assert_eq!(snapshot.worktree_root_uri, snapshot.primary_root_uri);
+		assert!(snapshot.revision > 0);
+
+		let outside = tempfile::tempdir().expect("outside root");
+		requests
+			.send_async(data_frame(
+				2,
+				pb::data_request::Body::RepositorySnapshot(pb::RepositorySnapshotRequest {
+					root_uri:          Url::from_directory_path(outside.path())
+						.expect("outside URI")
+						.to_string(),
+					max_changed_paths: 0,
+					wire_revision:     omp_proto::SCHEMA_REV,
+				}),
+			))
+			.await
+			.expect("send outside snapshot");
+		assert!(matches!(
+			responses.recv_async().await.expect("outside response").body,
+			Some(server_frame::Body::Error(pb::ProtocolError {
+				code,
+				..
+			})) if code == pb::ProtocolErrorCode::PermissionDenied as i32
+		));
+	}
+
+	#[tokio::test]
 	async fn extension_site_write_is_refused_even_with_grant() {
 		let (requests, responses, root, _state) =
-			test_connection(&["env.doc.read", "env.site"]).await;
+			test_connection(&["env.doc.read", "env.site"], false).await;
 		let path = root.path().join("sample.txt");
 		std::fs::write(&path, b"hello document").expect("write document");
 		let uri = Url::from_file_path(&path)
@@ -6086,7 +8233,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn data_walk_and_search_stream_incrementally_to_completion() {
-		let (requests, responses, root, _state) = test_connection(&["env.walk", "env.search"]).await;
+		let (requests, responses, root, _state) =
+			test_connection(&["env.walk", "env.search"], false).await;
 		std::fs::write(root.path().join("a.txt"), b"needle\n").expect("write first");
 		std::fs::write(root.path().join("b.txt"), b"other needle\n").expect("write second");
 		requests

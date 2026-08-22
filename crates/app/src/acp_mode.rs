@@ -57,13 +57,13 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 	let registry = crate::daemon::production_registry(&data, store)
 		.await
 		.into_diagnostic()?;
+	let configured_model = crate::settings::current(&data)
+		.into_diagnostic()?
+		.default_model
+		.map(Str::from);
 	let model = args
 		.model
-		.or_else(|| {
-			crate::settings::Settings::load(&data)
-				.default_model
-				.map(Str::from)
-		})
+		.or(configured_model)
 		.ok_or_else(|| miette!("acp mode requires --model or config.default_model"))?;
 	let models = registry
 		.catalog()

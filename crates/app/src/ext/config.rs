@@ -32,6 +32,158 @@ impl Scope {
 	}
 }
 
+/// Static extension CLI value shape.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CliValueKind {
+	/// Presence-only flag.
+	Boolean,
+	/// Required string value.
+	String,
+	/// Optional string value; bare presence yields `true` at the sink.
+	OptionalString,
+}
+
+/// Declaration-checked sink key exposed only to the owning extension.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CliValueSink {
+	/// Stable key used by the extension activation payload.
+	pub key: Str,
+}
+
+/// One static extension CLI contribution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CliContribution {
+	/// TOFU-qualified publisher name.
+	pub publisher:      Str,
+	/// Extension id within the publisher namespace.
+	pub extension:      Str,
+	/// Long flag spelling without leading dashes.
+	pub name:           Str,
+	/// Human-readable help text.
+	pub description:    Str,
+	/// Typed value shape.
+	pub kind:           CliValueKind,
+	/// Optional typed default represented in manifest JSON.
+	#[serde(default)]
+	pub default:        Option<serde_json::Value>,
+	/// Explicit operator-approved built-in shadow declaration.
+	#[serde(default)]
+	pub shadow_builtin: bool,
+	/// Owning extension's activation sink.
+	pub sink:           CliValueSink,
+}
+
+impl CliContribution {
+	/// Publisher-qualified declaration identity.
+	#[must_use]
+	pub fn qualified_name(&self) -> Str {
+		Str::from(format!("{}/{}:--{}", self.publisher, self.extension, self.name))
+	}
+
+	/// Validates static syntax and default type.
+	pub fn validate(&self) -> Result<(), CliCollision> {
+		if !qualified_component(&self.publisher)
+			|| !qualified_component(&self.extension)
+			|| !flag_name(&self.name)
+			|| self.sink.key.is_empty()
+		{
+			return Err(CliCollision::Invalid(self.qualified_name()));
+		}
+		let valid_default = match (&self.kind, &self.default) {
+			(_, None) => true,
+			(CliValueKind::Boolean, Some(value)) => value.is_boolean(),
+			(CliValueKind::String | CliValueKind::OptionalString, Some(value)) => value.is_string(),
+		};
+		if !valid_default {
+			return Err(CliCollision::InvalidDefault(self.qualified_name()));
+		}
+		Ok(())
+	}
+}
+
+/// Deterministic contribution collision diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CliCollision {
+	/// Static contribution syntax is invalid.
+	#[error("invalid extension CLI contribution `{0}`")]
+	Invalid(Str),
+	/// A typed default does not match the contribution kind.
+	#[error("invalid default for extension CLI contribution `{0}`")]
+	InvalidDefault(Str),
+	/// Two extensions own one spelling.
+	#[error("extension CLI flag `--{name}` is declared by both {first} and {second}")]
+	Duplicate {
+		/// Colliding long name.
+		name:   Str,
+		/// First qualified owner.
+		first:  Str,
+		/// Second qualified owner.
+		second: Str,
+	},
+	/// A built-in collision lacked an explicit shadow declaration.
+	#[error("extension CLI flag `{owner}` collides with built-in `--{name}` without shadow_builtin")]
+	Builtin {
+		/// Colliding long name.
+		name:  Str,
+		/// Qualified owner.
+		owner: Str,
+	},
+}
+
+/// Validated, name-sorted final contribution set.
+#[derive(Clone, Debug, Default)]
+pub struct CliContributionSet {
+	entries: BTreeMap<Str, CliContribution>,
+}
+
+impl CliContributionSet {
+	/// Validates declarations and configured built-in shadow precedence.
+	pub fn build(
+		contributions: impl IntoIterator<Item = CliContribution>,
+		builtins: impl IntoIterator<Item = Str>,
+	) -> Result<Self, CliCollision> {
+		let builtins = builtins.into_iter().collect::<BTreeSet<_>>();
+		let mut entries = BTreeMap::new();
+		for contribution in contributions {
+			contribution.validate()?;
+			let owner = contribution.qualified_name();
+			if builtins.contains(&contribution.name) && !contribution.shadow_builtin {
+				return Err(CliCollision::Builtin { name: contribution.name.clone(), owner });
+			}
+			if let Some(first) = entries.insert(contribution.name.clone(), contribution.clone()) {
+				return Err(CliCollision::Duplicate {
+					name:   contribution.name,
+					first:  first.qualified_name(),
+					second: owner,
+				});
+			}
+		}
+		Ok(Self { entries })
+	}
+
+	/// Returns one contribution by long name.
+	#[must_use]
+	pub fn get(&self, name: &str) -> Option<&CliContribution> {
+		self.entries.get(name)
+	}
+
+	/// Iterates in stable long-name order.
+	pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Str, &CliContribution)> {
+		self.entries.iter()
+	}
+}
+
+fn qualified_component(value: &str) -> bool {
+	!value.is_empty()
+		&& value
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn flag_name(value: &str) -> bool {
+	qualified_component(value) && !value.starts_with('-')
+}
 /// A source specification accepted by extension discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourceSpec {
@@ -50,14 +202,21 @@ pub enum SourceSpec {
 	/// A commit-pinned Git source.
 	Git {
 		/// Canonical Git repository URL.
-		repository: String,
+		repository:   String,
 		/// Immutable commit or annotated tag.
-		revision:   Str,
+		revision:     Str,
+		/// Optional contained repository subdirectory.
+		subdirectory: Option<PathBuf>,
 	},
 	/// A local development source.
 	Path(PathBuf),
-	/// A hash-addressable archive URL.
-	Url(String),
+	/// A hash-addressed archive URL.
+	Url {
+		/// HTTPS artifact URL.
+		url:    String,
+		/// Required SHA-256 digest.
+		sha256: Str,
+	},
 }
 
 impl SourceSpec {
@@ -77,22 +236,66 @@ impl SourceSpec {
 			},
 			"pypi" if !rest.is_empty() => Ok(Self::Pypi { distribution: Str::new(rest) }),
 			"git" => {
-				let (repository, revision) = rest.rsplit_once('@').ok_or_else(|| {
+				let (source, subdirectory) = rest
+					.split_once('#')
+					.map_or((rest, None), |(source, subdirectory)| {
+						(source, Some(PathBuf::from(subdirectory)))
+					});
+				let (repository, revision) = source.rsplit_once('@').ok_or_else(|| {
 					ExtensionError::new(
 						ExtensionCode::EGitFloating,
 						"git source must name a commit or annotated tag",
 					)
 				})?;
-				if revision.is_empty() {
+				let pinned_commit = matches!(revision.len(), 40 | 64)
+					&& revision.bytes().all(|byte| byte.is_ascii_hexdigit());
+				let explicit_tag =
+					revision.starts_with("refs/tags/") && revision.len() > "refs/tags/".len();
+				if !pinned_commit && !explicit_tag {
 					return Err(ExtensionError::new(
 						ExtensionCode::EGitFloating,
-						"git source has an empty revision",
+						"git source revision must be a full commit or explicit refs/tags name",
 					));
 				}
-				Ok(Self::Git { repository: repository.to_owned(), revision: Str::new(revision) })
+				if subdirectory.as_ref().is_some_and(|path| {
+					path.as_os_str().is_empty()
+						|| path.is_absolute()
+						|| path.components().any(|component| {
+							matches!(
+								component,
+								std::path::Component::ParentDir
+									| std::path::Component::RootDir
+									| std::path::Component::Prefix(_)
+							)
+						})
+				}) {
+					return Err(ExtensionError::new(
+						ExtensionCode::EIntegrity,
+						"git subdirectory must be a contained relative path",
+					));
+				}
+				Ok(Self::Git {
+					repository: repository.to_owned(),
+					revision: Str::new(revision),
+					subdirectory,
+				})
 			},
 			"path" if !rest.is_empty() => Ok(Self::Path(PathBuf::from(rest))),
-			"url" if rest.starts_with("https://") => Ok(Self::Url(rest.to_owned())),
+			"url" if rest.starts_with("https://") => {
+				let (url, sha256) = rest.rsplit_once("#sha256=").ok_or_else(|| {
+					ExtensionError::new(
+						ExtensionCode::EIntegrity,
+						"url source must end with #sha256=<digest>",
+					)
+				})?;
+				if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+					return Err(ExtensionError::new(
+						ExtensionCode::EIntegrity,
+						"url source has an invalid SHA-256 digest",
+					));
+				}
+				Ok(Self::Url { url: url.to_owned(), sha256: Str::new(sha256) })
+			},
 			"link" => Err(ExtensionError::new(
 				ExtensionCode::ELockLink,
 				"link is an installed.toml development overlay, not a source",

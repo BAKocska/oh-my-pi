@@ -317,6 +317,10 @@ pub enum EventCategory {
 	ExtensionUi,
 	/// Host-tool call or cancellation.
 	HostTool,
+	/// Host-resource request or cancellation.
+	HostResource,
+	/// Authentication exchange or terminal outcome.
+	Authentication,
 	/// A future event not yet classified by this SDK.
 	Other,
 }
@@ -366,6 +370,8 @@ impl RpcEvent {
 			},
 			"extension_ui_request" => EventCategory::ExtensionUi,
 			"host_tool_call" | "host_tool_cancel" => EventCategory::HostTool,
+			"host_uri_request" | "host_uri_cancel" => EventCategory::HostResource,
+			"auth_event" | "auth_terminal" => EventCategory::Authentication,
 			_ => EventCategory::Other,
 		}
 	}
@@ -446,6 +452,322 @@ pub struct OAuthProvider {
 	pub available:     bool,
 	/// Whether credentials are currently available.
 	pub authenticated: bool,
+}
+
+/// Maximum number of host-owned URI schemes accepted in one generation.
+pub const MAX_HOST_URI_SCHEMES: usize = 32;
+/// Maximum byte length of a normalized host-owned URI scheme.
+pub const MAX_HOST_URI_SCHEME_BYTES: usize = 64;
+/// Maximum byte length of a host-owned URI scheme description.
+pub const MAX_HOST_URI_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum number of resolution notes accepted from a host.
+pub const MAX_HOST_URI_NOTES: usize = 32;
+/// Maximum byte length of one host resolution note.
+pub const MAX_HOST_URI_NOTE_BYTES: usize = 4 * 1024;
+
+/// One host-owned virtual URI scheme.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUriScheme {
+	/// URL scheme without the `://` suffix.
+	pub scheme:      String,
+	/// Optional caller-facing description.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub description: Option<String>,
+	/// Whether writes may cross the environment boundary for this scheme.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub writable:    bool,
+	/// Whether reads suppress mutable hashline projections by default.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub immutable:   bool,
+}
+
+/// Operation requested from a host-owned URI scheme.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostUriOperation {
+	/// Resolve immutable or mutable resource content.
+	Read,
+	/// Replace resource content through the environment effect boundary.
+	Write,
+}
+
+/// Content type attached to a host-owned URI resolution.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostUriContentType(pub String);
+
+impl HostUriContentType {
+	/// JSON text.
+	pub const JSON: &'static str = "application/json";
+	/// Markdown text.
+	pub const MARKDOWN: &'static str = "text/markdown";
+	/// Plain text and the default when the host omits a content type.
+	pub const TEXT: &'static str = "text/plain";
+
+	/// Creates an extensible content type.
+	pub fn new(content_type: impl Into<String>) -> Self {
+		Self(content_type.into())
+	}
+
+	/// Returns the wire value.
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+/// Server request for one operation on a host-owned URI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUriRequest {
+	/// Frame discriminator.
+	#[serde(rename = "type")]
+	pub kind:       String,
+	/// Request identifier used by result and cancellation frames.
+	pub id:         String,
+	/// Registration generation that owns this request.
+	pub generation: u64,
+	/// Requested operation.
+	pub operation:  HostUriOperation,
+	/// Complete virtual URL.
+	pub url:        String,
+	/// Replacement content, present only for writes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub content:    Option<String>,
+}
+
+/// Server request to cancel an in-flight host URI operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUriCancel {
+	/// Frame discriminator.
+	#[serde(rename = "type")]
+	pub kind:       String,
+	/// Cancellation frame identifier.
+	pub id:         String,
+	/// Registration generation that owned the request.
+	pub generation: u64,
+	/// Request identifier to cancel.
+	pub target_id:  String,
+}
+
+/// Host result for one URI operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUriResult {
+	/// Frame discriminator.
+	#[serde(rename = "type")]
+	pub kind:         String,
+	/// Request identifier being settled.
+	pub id:           String,
+	/// Registration generation that handled the request.
+	pub generation:   u64,
+	/// Resolved content for reads or optional error context.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub content:      Option<String>,
+	/// Content metadata. Omission means `text/plain`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub content_type: Option<HostUriContentType>,
+	/// Bounded caller-facing resolution notes.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub notes:        Vec<String>,
+	/// Per-resolution override of the scheme's immutable declaration.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub immutable:    Option<bool>,
+	/// Whether this is a terminal failure.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub is_error:     bool,
+	/// Preferred terminal failure description.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error:        Option<String>,
+}
+
+/// Public authentication method for an RPC login request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcAuthMethod {
+	/// Static API key.
+	ApiKey,
+	/// Browser-based OAuth with PKCE.
+	OauthPkce,
+	/// OAuth device authorization.
+	OauthDevice,
+	/// Application-default credentials.
+	ApplicationDefault,
+	/// AWS credential chain.
+	AwsCredentialChain,
+	/// Provider session token.
+	SessionToken,
+}
+
+/// Expected response form for an authentication prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcAuthPromptKind {
+	/// OAuth authorization code.
+	AuthorizationCode,
+	/// Static API key.
+	ApiKey,
+	/// Provider session token.
+	SessionToken,
+	/// Visible plain text.
+	PlainText,
+	/// Optional secret text.
+	OptionalSecret,
+	/// Yes-or-no confirmation.
+	Confirmation,
+}
+
+/// Kind of caller input submitted to an authentication session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcAuthInputKind {
+	/// OAuth authorization code.
+	AuthorizationCode,
+	/// Static API key.
+	ApiKey,
+	/// Provider session token.
+	SessionToken,
+	/// OAuth callback URL.
+	CallbackUrl,
+	/// Visible plain text.
+	PlainText,
+	/// Optional secret text.
+	OptionalSecret,
+	/// Device-code authorization completed externally.
+	DeviceConfirmed,
+	/// Cancel the login.
+	Cancel,
+}
+
+/// Non-secret authenticated account projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAuthAccount {
+	/// Stable opaque account identifier.
+	pub account_id:  String,
+	/// Provider identifier.
+	pub provider_id: String,
+	/// Optional public principal.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub principal:   Option<String>,
+	/// Optional caller-facing label.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub label:       Option<String>,
+}
+
+/// Authentication exchange event emitted by the server.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RpcAuthEvent {
+	/// Open a browser at a public authorization URL.
+	OpenUrl {
+		/// Public URL.
+		url: String,
+	},
+	/// Display a short-lived device code and its public verification URL.
+	DeviceCode {
+		/// Short-lived device code.
+		code:             String,
+		/// Public verification URL.
+		verification_url: String,
+	},
+	/// Ask the host for typed input.
+	Prompt {
+		/// Stable prompt identifier.
+		prompt_id: String,
+		/// Caller-facing message.
+		message:   String,
+		/// Required input form.
+		input:     RpcAuthPromptKind,
+	},
+	/// Provider-side authorization is pending.
+	Waiting,
+}
+
+/// Authentication event frame correlated to one login session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAuthEventFrame {
+	/// Frame discriminator.
+	#[serde(rename = "type")]
+	pub kind:       String,
+	/// Login session identifier.
+	pub session_id: String,
+	/// Typed exchange event.
+	#[serde(flatten)]
+	pub event:      RpcAuthEvent,
+}
+
+/// Caller answer to one authentication exchange.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAuthAnswerFrame {
+	/// Frame discriminator.
+	#[serde(rename = "type")]
+	pub kind:       String,
+	/// Login session identifier.
+	pub session_id: String,
+	/// Prompt identifier when answering a prompt.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_id:  Option<String>,
+	/// Typed input discriminator.
+	pub input:      RpcAuthInputKind,
+	/// Secret or visible input. Omitted for confirmation and cancellation.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub value:      Option<String>,
+}
+
+/// Typed terminal authentication outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcAuthTerminalOutcome {
+	/// Credentials were persisted and are available to inference.
+	Completed,
+	/// The caller cancelled the exchange.
+	Cancelled,
+	/// The exchange failed terminally.
+	Failed,
+}
+
+/// Terminal authentication frame emitted exactly once per login session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAuthTerminalFrame {
+	/// Frame discriminator.
+	#[serde(rename = "type")]
+	pub kind:       String,
+	/// Login session identifier.
+	pub session_id: String,
+	/// Typed terminal outcome.
+	pub outcome:    RpcAuthTerminalOutcome,
+	/// Successful non-secret account projection.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub account:    Option<RpcAuthAccount>,
+	/// Stable failure classification.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub code:       Option<RpcErrorCode>,
+	/// Caller-facing terminal failure.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error:      Option<String>,
+}
+
+/// Typed terminal outcome for an agent turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcTurnOutcome {
+	/// The turn completed successfully.
+	Success,
+	/// The turn completed with a non-fatal warning.
+	Warning,
+	/// The caller aborted the turn.
+	CallerAbort,
+	/// The turn transitioned through silent compaction.
+	SilentTransition,
+	/// The model exhausted its output token budget.
+	MaxTokens,
+	/// The turn settled with a terminal fault.
+	Fault,
 }
 
 /// Host-owned tool advertised to the agent.

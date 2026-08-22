@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use omp_app::{
 	envd::{
-		server::EnvServer,
+		EnvServer,
 		worker::{ExtHostConfig, ExtHostSpec, HostKey},
 	},
 	exthost::{

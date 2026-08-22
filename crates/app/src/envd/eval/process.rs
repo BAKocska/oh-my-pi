@@ -16,11 +16,11 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use omp_core::{CowBytes, Duration as OmpDuration, DurationError, Str, Ulid, sf};
+use omp_core::{CowBytes, Duration as OmpDuration, DurationError, Str, Ulid, encoding::hex, sf};
 use omp_tool::BlobRef;
 use omp_tools::eval::{
 	CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, OutputChannel,
-	PythonException, RunCompletion, RunEvent, RunRequest, Session, Update,
+	PythonException, RunCompletion, RunEvent, RunRequest, RuntimeSnapshot, Session, Update,
 	idle_timeout::TimeoutHandle, kernel::EmbeddedPython,
 };
 use parking_lot::Mutex;
@@ -29,15 +29,15 @@ use serde_json::Value;
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
 	process::{Child, ChildStdin, ChildStdout, Command},
-	sync::{Mutex as AsyncMutex, oneshot},
+	sync::Mutex as AsyncMutex,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{
 	super::blobs::BlobHost,
 	bridge::{
-		BridgeCapabilities, BridgeHost, BridgeHostError, BridgeNamespaceInstaller,
-		ChildBridgeTransport, EvalSessionConfig, SessionBridgeHost,
+		BridgeCapabilities, BridgeHostError, BridgeNamespaceInstaller, BridgeProgressSink,
+		ChildBridgeTransport, SessionBridgeHost,
 	},
 };
 
@@ -45,10 +45,16 @@ use super::{
 pub const EVAL_CHILD_ARG: &str = "__omp-eval-child";
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BRIDGE_PROGRESS_BYTES: usize = 256 * 1024;
 const CHILD_TIMEOUT_EXIT: i32 = 124;
 const SECRET_MARKERS: &[&str] =
 	&["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "PRIVATE_KEY", "CREDENTIAL"];
 const OUTPUT_SPILL_THRESHOLD: usize = 128 * 1024;
+const MAX_RUNTIME_CWD_BYTES: usize = 16 * 1024;
+const MAX_MANAGED_ENV_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_MANAGED_ENV_BYTES: usize = 2 * 1024 * 1024;
+const MANAGED_ENV_KEYS: [&str; 3] =
+	["OMP_ARTIFACTS_DIR", "OMP_EVAL_LOCAL_ROOTS", "OMP_SESSION_FILE"];
 
 /// Production [`EvalExec`] that owns one killable same-binary child per
 /// session.
@@ -72,14 +78,12 @@ struct ProcessEvalInner {
 pub struct KernelKey {
 	/// Tool-owner session namespace.
 	pub session:     Bytes,
-	/// Canonical working directory inherited by the kernel.
-	pub cwd:         PathBuf,
 	/// Interpreter identity selected for this kernel.
 	pub interpreter: PathBuf,
 }
 
 struct ProcessSession {
-	id:          Bytes,
+	owner:       Str,
 	key:         KernelKey,
 	child:       AsyncMutex<Option<EvalChild>>,
 	run_gate:    Arc<AsyncMutex<()>>,
@@ -135,20 +139,39 @@ impl EvalExec for ProcessEvalExec {
 	type Run = ProcessEvalRun;
 
 	fn open_session(&self) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
-		let id = Bytes::from(format!("py-process-{}", Ulid::generate()));
-		let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-		let key = KernelKey { session: id.clone(), cwd, interpreter: self.inner.interpreter.clone() };
-		self.inner.sessions.lock().insert(
-			id.clone(),
-			Arc::new(ProcessSession {
-				id: id.clone(),
-				key,
-				child: AsyncMutex::new(None),
-				run_gate: Arc::new(AsyncMutex::new(())),
-				needs_reset: AtomicBool::new(false),
-			}),
-		);
-		std::future::ready(Ok(Session { id }))
+		std::future::ready(Ok(self.create_session("__direct_eval_owner__")))
+	}
+
+	fn open_session_for(
+		&self,
+		owner: &str,
+	) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
+		std::future::ready(Ok(self.create_session(owner)))
+	}
+
+	fn runtime_snapshot(&self, owner: &str, session: &Session) -> Result<RuntimeSnapshot, Fault> {
+		let owned = self
+			.inner
+			.sessions
+			.lock()
+			.get(&session.id)
+			.cloned()
+			.ok_or_else(|| Fault::SessionLost {
+				message: sf!("unknown supervised Python process session"),
+			})?;
+		if owned.owner != owner {
+			return Err(Fault::SessionLost {
+				message: sf!("eval session owner does not match the authenticated invocation"),
+			});
+		}
+		self
+			.inner
+			.host
+			.freeze_runtime(owner, &session.id)
+			.map_err(|error| Fault::Resource {
+				operation: sf!("runtime_snapshot"),
+				message:   Str::from(error.to_string()),
+			})
 	}
 
 	fn run<'a>(
@@ -175,6 +198,10 @@ impl EvalExec for ProcessEvalExec {
 		let owned = self.inner.sessions.lock().get(&session.id).cloned();
 		async move {
 			if let Some(owned) = owned {
+				self
+					.inner
+					.host
+					.release_runtime(owned.owner.as_str(), &owned.key.session);
 				owned.needs_reset.store(true, Ordering::Release);
 				if let Some(mut child) = owned.child.lock().await.take() {
 					child.terminate().await;
@@ -185,6 +212,7 @@ impl EvalExec for ProcessEvalExec {
 	}
 
 	fn dispose_all(&self) {
+		self.inner.host.clear_runtimes();
 		let sessions = self
 			.inner
 			.sessions
@@ -206,6 +234,22 @@ impl EvalExec for ProcessEvalExec {
 }
 
 impl ProcessEvalExec {
+	fn create_session(&self, owner: &str) -> Session {
+		let id = Bytes::from(format!("py-process-{}", Ulid::generate()));
+		let key = KernelKey { session: id.clone(), interpreter: self.inner.interpreter.clone() };
+		self.inner.sessions.lock().insert(
+			id.clone(),
+			Arc::new(ProcessSession {
+				owner: Str::new(owner),
+				key,
+				child: AsyncMutex::new(None),
+				run_gate: Arc::new(AsyncMutex::new(())),
+				needs_reset: AtomicBool::new(false),
+			}),
+		);
+		Session { id }
+	}
+
 	async fn start_run(
 		&self,
 		session: &Session,
@@ -224,8 +268,10 @@ impl ProcessEvalExec {
 		request.reset |= forced_reset || disposable;
 		let effective_reset = request.reset;
 		let number = self.inner.next_cell.fetch_add(1, Ordering::Relaxed);
-		let cell_id =
-			Bytes::from(format!("{}:cell-{number}", String::from_utf8_lossy(session.id.as_ref())));
+		let cell_id = Bytes::from(format!(
+			"{}:cell-{number}",
+			String::from_utf8_lossy(owned.key.session.as_ref())
+		));
 		let (events_tx, events) = flume::unbounded();
 		let cancelled = CancellationToken::new();
 		let task_cancelled = cancelled.clone();
@@ -252,8 +298,12 @@ impl ProcessEvalExec {
 			if child_slot.is_none() {
 				match EvalChild::spawn(
 					&executable,
-					&owned.id,
-					&owned.key.cwd,
+					&owned.key.session,
+					request
+						.runtime
+						.cwd
+						.as_deref()
+						.unwrap_or_else(|| Path::new(".")),
 					Arc::clone(&host),
 					interrupt_grace,
 				)
@@ -272,7 +322,17 @@ impl ProcessEvalExec {
 			}
 			let child = child_slot.as_mut().expect("eval child initialized above");
 			let keep = child
-				.run_cell(cell_id, request, task_cancelled, &events_tx, host, &owned.needs_reset, blobs)
+				.run_cell(
+					cell_id,
+					request,
+					task_cancelled,
+					&events_tx,
+					owned.owner.as_str(),
+					&owned.key.session,
+					host,
+					&owned.needs_reset,
+					blobs,
+				)
 				.await && !disposable;
 			if !keep {
 				child.terminate().await;
@@ -308,6 +368,17 @@ impl EvalRun for ProcessEvalRun {
 
 	fn reset(&self) -> bool {
 		self.effective_reset
+	}
+}
+
+struct ProgressChannel(flume::Sender<Value>);
+
+impl BridgeProgressSink for ProgressChannel {
+	fn progress(&self, event: Value) -> Result<(), BridgeHostError> {
+		self
+			.0
+			.send(event)
+			.map_err(|_| BridgeHostError::message("eval bridge progress receiver was dropped"))
 	}
 }
 
@@ -398,8 +469,8 @@ impl EvalChild {
 	) -> Result<Self, ProcessError> {
 		let interrupt_grace_std = interrupt_grace.to_std()?;
 		let capabilities = host.capabilities()?.allowed_names();
-		let config = host.session_config().map(WireSessionConfig::from);
 		let token = Str::from(Ulid::generate().to_string());
+		let parent_pid = std::process::id();
 		let mut command = Command::new(executable);
 		command
 			.arg(EVAL_CHILD_ARG)
@@ -446,8 +517,8 @@ impl EvalChild {
 		write_frame(&mut process.stdin, &ParentFrame::Init {
 			token,
 			session_id: session_id.clone(),
+			parent_pid,
 			capabilities,
-			config,
 			interrupt_grace: Str::from(interrupt_grace.to_string()),
 		})
 		.await?;
@@ -469,6 +540,8 @@ impl EvalChild {
 		request: RunRequest,
 		cancelled: CancellationToken,
 		events: &flume::Sender<Result<RunEvent, Fault>>,
+		owner: &str,
+		session: &Bytes,
 		host: Arc<SessionBridgeHost>,
 		needs_reset: &AtomicBool,
 		blobs: Option<BlobHost>,
@@ -491,6 +564,7 @@ impl EvalChild {
 			code: request.code,
 			timeout_ns,
 			reset: request.reset,
+			runtime: request.runtime,
 		})
 		.await
 		{
@@ -502,7 +576,7 @@ impl EvalChild {
 		let mut result = None;
 		let mut display_outputs = Vec::new();
 		let mut exception = None;
-		let mut spill = OutputSpill::new(blobs);
+		let mut spill = OutputSpill::new(blobs.clone());
 		let mut wire_sequence = 0_u64;
 		loop {
 			let frame = tokio::select! {
@@ -571,7 +645,10 @@ impl EvalChild {
 					let _ = events.send(Ok(RunEvent::Output(update)));
 				},
 				ChildFrame::Display { run_id: actual, output } if actual == run_id => {
-					display_outputs.push(output);
+					upsert_display_output(
+						&mut display_outputs,
+						normalize_display_output(output, blobs.as_ref()),
+					);
 				},
 				ChildFrame::Result { run_id: actual, value } if actual == run_id => {
 					result = Some(value);
@@ -643,19 +720,40 @@ impl EvalChild {
 							continue;
 						},
 					}
-					let call = timeout.host_wait(host.call(name.as_str(), args));
+					let (progress_tx, progress_rx) = flume::unbounded();
+					let progress = ProgressChannel(progress_tx);
+					let call =
+						timeout.host_wait(host.call_for(owner, session, name.as_str(), args, &progress));
 					tokio::pin!(call);
-					let response = tokio::select! {
-						() = cancelled.cancelled() => {
-							needs_reset.store(true, Ordering::Release);
-							timeout.dispose();
-							self.interrupt();
-							let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
-								elapsed_ms(started),
-							))));
-							return false;
-						},
-						result = &mut call => result,
+					let response = loop {
+						tokio::select! {
+							biased;
+							() = cancelled.cancelled() => {
+								needs_reset.store(true, Ordering::Release);
+								timeout.dispose();
+								self.interrupt();
+								let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
+									elapsed_ms(started),
+								))));
+								return false;
+							},
+							event = progress_rx.recv_async() => {
+								let Ok(event) = event else {
+									continue;
+								};
+								if serde_json::to_vec(&event).is_ok_and(|encoded| {
+									encoded.len() <= MAX_BRIDGE_PROGRESS_BYTES
+								}) && write_frame(&mut self.stdin, &ParentFrame::BridgeProgress {
+									run_id,
+									request_id,
+									event,
+								}).await.is_err() {
+									needs_reset.store(true, Ordering::Release);
+									return false;
+								}
+							},
+							result = &mut call => break result,
+						}
 					};
 					let (value, error) = match response {
 						Ok(value) => (Some(value), None),
@@ -779,8 +877,8 @@ enum ParentFrame {
 	Init {
 		token:           Str,
 		session_id:      Bytes,
+		parent_pid:      u32,
 		capabilities:    Vec<Str>,
-		config:          Option<WireSessionConfig>,
 		interrupt_grace: Str,
 	},
 	Run {
@@ -789,6 +887,12 @@ enum ParentFrame {
 		code:       Str,
 		timeout_ns: Option<u64>,
 		reset:      bool,
+		runtime:    RuntimeSnapshot,
+	},
+	BridgeProgress {
+		run_id:     u64,
+		request_id: u64,
+		event:      Value,
 	},
 	BridgeResponse {
 		request_id: u64,
@@ -846,48 +950,31 @@ enum ChildFrame {
 	},
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct WireSessionConfig {
-	local_roots_json: Str,
-	artifacts_dir:    Str,
-	session_file:     Str,
-}
-
-impl From<EvalSessionConfig> for WireSessionConfig {
-	fn from(config: EvalSessionConfig) -> Self {
-		Self {
-			local_roots_json: config.local_roots_json,
-			artifacts_dir:    config.artifacts_dir,
-			session_file:     config.session_file,
-		}
-	}
-}
-
-impl From<WireSessionConfig> for EvalSessionConfig {
-	fn from(config: WireSessionConfig) -> Self {
-		Self {
-			local_roots_json: config.local_roots_json,
-			artifacts_dir:    config.artifacts_dir,
-			session_file:     config.session_file,
-		}
-	}
+enum ChildBridgeEvent {
+	Progress(Value),
+	Response(Result<Value, Str>),
 }
 
 struct ChildBridgeHost {
 	token:        Str,
 	capabilities: BridgeCapabilities,
-	config:       Option<EvalSessionConfig>,
 	outgoing:     flume::Sender<ChildFrame>,
-	pending:      Mutex<BTreeMap<u64, oneshot::Sender<Result<Value, Str>>>>,
+	pending:      Mutex<BTreeMap<u64, flume::Sender<ChildBridgeEvent>>>,
 	next_request: AtomicU64,
 	active_run:   AtomicU64,
 }
 
 impl ChildBridgeHost {
+	fn progress(&self, request_id: u64, event: Value) {
+		if let Some(pending) = self.pending.lock().get(&request_id) {
+			let _ = pending.send(ChildBridgeEvent::Progress(event));
+		}
+	}
+
 	fn resolve(&self, request_id: u64, result: Result<Value, Str>) {
 		let pending = self.pending.lock().remove(&request_id);
 		if let Some(pending) = pending {
-			let _ = pending.send(result);
+			let _ = pending.send(ChildBridgeEvent::Response(result));
 		}
 	}
 }
@@ -898,17 +985,18 @@ impl ChildBridgeTransport for ChildBridgeHost {
 		self.capabilities.clone()
 	}
 
-	fn session_config(&self) -> Option<EvalSessionConfig> {
-		self.config.clone()
-	}
-
-	async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeHostError> {
+	async fn call(
+		&self,
+		name: &str,
+		args: Value,
+		progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
 		if !self.capabilities.allows(name) {
 			return Err(BridgeHostError::message(format!("bridge capability denied: {name}")));
 		}
 		let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
 		let run_id = self.active_run.load(Ordering::Acquire);
-		let (sender, receiver) = oneshot::channel();
+		let (sender, receiver) = flume::unbounded();
 		self.pending.lock().insert(request_id, sender);
 		if self
 			.outgoing
@@ -924,10 +1012,17 @@ impl ChildBridgeTransport for ChildBridgeHost {
 			self.pending.lock().remove(&request_id);
 			return Err(BridgeHostError::message("eval parent bridge disconnected"));
 		}
-		receiver
-			.await
-			.map_err(|_| BridgeHostError::message("eval parent bridge response was dropped"))?
-			.map_err(BridgeHostError::message)
+		loop {
+			match receiver.recv_async().await {
+				Ok(ChildBridgeEvent::Progress(event)) => progress.progress(event)?,
+				Ok(ChildBridgeEvent::Response(result)) => {
+					return result.map_err(BridgeHostError::message);
+				},
+				Err(_) => {
+					return Err(BridgeHostError::message("eval parent bridge response was dropped"));
+				},
+			}
+		}
 	}
 }
 
@@ -1106,29 +1201,127 @@ fn start_fd_capture(
 	Ok(CaptureBarrier::default())
 }
 
+/// Validates the parent identity before the embedded interpreter starts.
+fn validate_parent_identity(parent_pid: u32) -> Result<(), ProcessError> {
+	if parent_pid <= 1 {
+		return Err(ProcessError::InvalidParentIdentity);
+	}
+	#[cfg(unix)]
+	{
+		// SAFETY: getppid has no preconditions and does not access memory.
+		let actual = unsafe { libc::getppid() };
+		if actual <= 1 || u32::try_from(actual).ok() != Some(parent_pid) {
+			return Err(ProcessError::InvalidParentIdentity);
+		}
+	}
+	Ok(())
+}
+
+/// Starts a process-local watchdog. Protocol EOF is the pipe half of this
+/// contract; POSIX additionally detects reparenting while an active cell keeps
+/// the protocol reader alive.
+fn start_parent_watchdog(parent_pid: u32) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		std::thread::Builder::new()
+			.name("omp-eval-parent-watchdog".to_owned())
+			.spawn(move || {
+				loop {
+					std::thread::sleep(Duration::from_millis(100));
+					// SAFETY: getppid has no preconditions and does not access memory.
+					let actual = unsafe { libc::getppid() };
+					if actual <= 1 || u32::try_from(actual).ok() != Some(parent_pid) {
+						terminate_orphaned_process_group();
+					}
+				}
+			})?;
+	}
+	#[cfg(not(unix))]
+	let _ = parent_pid;
+	Ok(())
+}
+
+fn terminate_orphaned_process_group() {
+	#[cfg(unix)]
+	{
+		// The eval child is its own process-group leader. Killing the entire
+		// group prevents user-spawned descendants from surviving host loss.
+		// SAFETY: getpgrp has no preconditions; kill addresses that process group.
+		let group = unsafe { libc::getpgrp() };
+		let process = unsafe { libc::getpid() };
+		if group > 1 && group == process {
+			unsafe {
+				libc::kill(-group, libc::SIGKILL);
+			}
+		} else {
+			std::process::exit(0);
+		}
+	}
+	#[cfg(not(unix))]
+	std::process::exit(0);
+}
+
+fn validate_runtime_snapshot(snapshot: RuntimeSnapshot) -> Result<RuntimeSnapshot, ProcessError> {
+	let cwd = snapshot
+		.cwd
+		.as_deref()
+		.ok_or(ProcessError::MissingRuntimeCwd)?;
+	if !cwd.is_absolute()
+		|| cwd.as_os_str().as_encoded_bytes().is_empty()
+		|| cwd.as_os_str().as_encoded_bytes().len() > MAX_RUNTIME_CWD_BYTES
+	{
+		return Err(ProcessError::InvalidRuntimeCwd);
+	}
+	if snapshot.managed_env.len() != MANAGED_ENV_KEYS.len()
+		|| MANAGED_ENV_KEYS
+			.iter()
+			.any(|key| !snapshot.managed_env.contains_key(*key))
+	{
+		return Err(ProcessError::InvalidManagedEnvironment);
+	}
+	let mut total = 0usize;
+	for (key, value) in &snapshot.managed_env {
+		if !MANAGED_ENV_KEYS.contains(&key.as_str()) {
+			return Err(ProcessError::InvalidManagedEnvironment);
+		}
+		total = total.saturating_add(key.len());
+		if let Some(value) = value {
+			if value.len() > MAX_MANAGED_ENV_VALUE_BYTES || value.as_bytes().contains(&0) {
+				return Err(ProcessError::InvalidManagedEnvironment);
+			}
+			total = total.saturating_add(value.len());
+		}
+	}
+	if total > MAX_MANAGED_ENV_BYTES {
+		return Err(ProcessError::InvalidManagedEnvironment);
+	}
+	Ok(snapshot)
+}
+
 /// Runs the hidden eval child entry before ordinary CLI or telemetry startup.
 pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 	let ShieldedProtocol { input, mut output, capture } = shield_protocol_fds()?;
 	let mut stdin = BufReader::new(input);
-	let (token, capabilities, config, interrupt_grace) =
+	let (token, parent_pid, capabilities, interrupt_grace) =
 		match read_frame::<_, ParentFrame>(&mut stdin).await? {
 			Some(ParentFrame::Init {
 				token,
 				session_id: _,
+				parent_pid,
 				capabilities,
-				config,
 				interrupt_grace,
-			}) => (token, capabilities, config, interrupt_grace.parse::<OmpDuration>()?),
+			}) => (token, parent_pid, capabilities, interrupt_grace.parse::<OmpDuration>()?),
 			Some(_) => {
 				return Err(ProcessError::Protocol(sf!("Init must be the first eval child frame",)));
 			},
 			None => return Ok(()),
 		};
+	validate_parent_identity(parent_pid)?;
+	start_parent_watchdog(parent_pid)?;
 	let (outgoing, outgoing_rx) = flume::unbounded();
 	let child_host = Arc::new(ChildBridgeHost {
 		token,
 		capabilities: BridgeCapabilities::from_allowed_names(capabilities),
-		config: config.map(EvalSessionConfig::from),
 		outgoing,
 		pending: Mutex::new(BTreeMap::new()),
 		next_request: AtomicU64::new(1),
@@ -1157,7 +1350,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 	let active = Arc::new(AtomicBool::new(false));
 	loop {
 		match read_frame::<_, ParentFrame>(&mut stdin).await? {
-			Some(ParentFrame::Run { run_id, cell_id, code, timeout_ns, reset }) => {
+			Some(ParentFrame::Run { run_id, cell_id, code, timeout_ns, reset, runtime }) => {
 				if active.swap(true, Ordering::AcqRel) {
 					child_host
 						.outgoing
@@ -1168,11 +1361,13 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 					continue;
 				}
 				child_host.active_run.store(run_id, Ordering::Release);
+				let runtime = validate_runtime_snapshot(runtime)?;
 				let mut run = match eval
 					.run(&session, RunRequest {
 						code,
 						timeout: timeout_ns.map(Duration::from_nanos),
 						reset,
+						runtime,
 					})
 					.await
 				{
@@ -1260,6 +1455,14 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 					}
 				});
 			},
+			Some(ParentFrame::BridgeProgress { run_id, request_id, event })
+				if run_id == child_host.active_run.load(Ordering::Acquire) =>
+			{
+				child_host.progress(request_id, event);
+			},
+			Some(ParentFrame::BridgeProgress { .. }) => {
+				return Err(ProcessError::Protocol(sf!("stale eval bridge progress frame")));
+			},
 			Some(ParentFrame::BridgeResponse { request_id, value, error }) => {
 				let result = match (value, error) {
 					(Some(value), None) => Ok(value),
@@ -1272,7 +1475,10 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 				return Err(ProcessError::Protocol(sf!("duplicate eval child Init frame")));
 			},
 			Some(ParentFrame::Exit) => break,
-			None => break,
+			None => {
+				terminate_orphaned_process_group();
+				break;
+			},
 		}
 	}
 	writer.abort();
@@ -1295,6 +1501,18 @@ pub enum ProcessError {
 	/// Parent and child violated the expected protocol sequence.
 	#[error("eval child protocol violation: {0}")]
 	Protocol(Str),
+	/// Init did not name the process that actually owns the child.
+	#[error("eval child parent identity is invalid")]
+	InvalidParentIdentity,
+	/// A run omitted its authoritative working directory.
+	#[error("eval child runtime snapshot omitted its working directory")]
+	MissingRuntimeCwd,
+	/// A run supplied a non-absolute or oversized working directory.
+	#[error("eval child runtime working directory is invalid")]
+	InvalidRuntimeCwd,
+	/// A run supplied missing, unknown, oversized, or malformed managed values.
+	#[error("eval child managed environment snapshot is invalid")]
+	InvalidManagedEnvironment,
 	/// The child could not initialize embedded Python.
 	#[error("eval child embedded Python failed: {0}")]
 	Python(Str),
@@ -1498,6 +1716,87 @@ fn resolve_omp_executable() -> io::Result<PathBuf> {
 	))
 }
 
+fn status_event_key(event: &Value) -> Option<Str> {
+	let object = event.as_object()?;
+	let op = object.get("op")?.as_str()?;
+	if let Some(key) = object.get("key").and_then(Value::as_str) {
+		return Some(sf!("{op}:{key}"));
+	}
+	match op {
+		"agent" => object
+			.get("id")
+			.and_then(Value::as_str)
+			.map(|id| sf!("agent:{id}")),
+		"phase" => Some(sf!("phase")),
+		"log" => object
+			.get("message")
+			.and_then(Value::as_str)
+			.map(|message| sf!("log:{message}")),
+		_ => None,
+	}
+}
+
+fn upsert_display_output(outputs: &mut Vec<DisplayOutput>, output: DisplayOutput) {
+	let DisplayOutput::Status { event } = &output else {
+		outputs.push(output);
+		return;
+	};
+	let Some(key) = status_event_key(event) else {
+		outputs.push(output);
+		return;
+	};
+	if let Some(index) = outputs.iter().position(|existing| {
+		matches!(existing, DisplayOutput::Status { event } if status_event_key(event).as_ref() == Some(&key))
+	}) {
+		outputs[index] = output;
+	} else {
+		outputs.push(output);
+	}
+}
+
+fn normalize_display_output(output: DisplayOutput, blobs: Option<&BlobHost>) -> DisplayOutput {
+	let DisplayOutput::ImageData { data, mime_type } = output else {
+		return output;
+	};
+	let reject = |reason: &'static str| DisplayOutput::Status {
+		event: serde_json::json!({ "op": "display", "error": reason }),
+	};
+	let Some(expected_kind) = (match mime_type.as_str() {
+		"image/png" => Some(omp_tools::read::image::ImageKind::Png),
+		"image/jpeg" => Some(omp_tools::read::image::ImageKind::Jpeg),
+		_ => None,
+	}) else {
+		return reject("unsupported eval image media type");
+	};
+	let bytes = Bytes::copy_from_slice(data.as_ref());
+	if !omp_tools::read::image::sniff_metadata(&bytes)
+		.is_some_and(|metadata| metadata.kind == expected_kind)
+	{
+		return reject("malformed eval image payload");
+	}
+	let processed = match omp_tools::read::image::process_image(bytes) {
+		Ok(Some(processed)) => processed,
+		Ok(None) => return reject("malformed eval image payload"),
+		Err(_) => return reject("eval image payload exceeds the image limit"),
+	};
+	let Some(host) = blobs else {
+		return reject("eval image storage is unavailable");
+	};
+	let id = match host.put(&processed.data) {
+		Ok(id) => id,
+		Err(_) => return reject("eval image persistence failed"),
+	};
+	DisplayOutput::Image {
+		blob:        BlobRef {
+			hash:       Str::from(hex::encode_n(&id.hash).as_str()),
+			media_type: processed.media_type.clone(),
+			byte_len:   id.size,
+		},
+		mime_type:   processed.media_type,
+		description: processed.description,
+	}
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
 	u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -1564,6 +1863,182 @@ mod tests {
 		assert!(!spawn_env_allowed(OsStr::new("AWS_SECRET_ACCESS_KEY")));
 		assert!(!spawn_env_allowed(OsStr::new("OMP_EVAL_TOKEN")));
 		assert!(!spawn_env_allowed(OsStr::new("RANDOM_AMBIENT_VALUE")));
+	}
+
+	fn runtime_snapshot(cwd: PathBuf) -> RuntimeSnapshot {
+		RuntimeSnapshot {
+			cwd:         Some(cwd),
+			managed_env: MANAGED_ENV_KEYS
+				.into_iter()
+				.map(|key| (Str::new(key), None))
+				.collect(),
+		}
+	}
+
+	#[test]
+	fn runtime_snapshot_validation_requires_scoped_cwd_and_exact_managed_keys() {
+		let cwd = std::env::current_dir().expect("current directory");
+		assert!(validate_runtime_snapshot(runtime_snapshot(cwd.clone())).is_ok());
+
+		let mut missing = runtime_snapshot(cwd.clone());
+		missing.managed_env.remove("OMP_SESSION_FILE");
+		assert!(matches!(
+			validate_runtime_snapshot(missing),
+			Err(ProcessError::InvalidManagedEnvironment)
+		));
+
+		let mut unknown = runtime_snapshot(cwd);
+		unknown
+			.managed_env
+			.insert(sf!("OMP_UNKNOWN"), Some(sf!("value")));
+		assert!(matches!(
+			validate_runtime_snapshot(unknown),
+			Err(ProcessError::InvalidManagedEnvironment)
+		));
+
+		assert!(matches!(
+			validate_runtime_snapshot(RuntimeSnapshot::default()),
+			Err(ProcessError::MissingRuntimeCwd)
+		));
+	}
+
+	#[cfg(unix)]
+	fn process_exists(pid: u32) -> bool {
+		let pid = i32::try_from(pid).expect("test PID fits pid_t");
+		// SAFETY: signal zero performs existence/permission checking only.
+		unsafe { libc::kill(pid, 0) == 0 }
+	}
+
+	#[cfg(unix)]
+	#[test]
+	#[ignore = "subprocess helper launched by \
+	            parent_death_watchdog_terminates_kernel_and_descendants"]
+	fn parent_watchdog_subprocess_helper() {
+		let parent_pid = std::env::var("OMP_EVAL_TEST_PARENT_PID")
+			.expect("helper parent PID")
+			.parse::<u32>()
+			.expect("numeric helper parent PID");
+		let state = PathBuf::from(std::env::var_os("OMP_EVAL_TEST_STATE").expect("helper state"));
+		// SAFETY: the helper has no descendants yet and moves itself into a new
+		// process group whose id is its own pid.
+		assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+		let descendant = std::process::Command::new("/bin/sleep")
+			.arg("60")
+			.spawn()
+			.expect("spawn descendant");
+		std::fs::write(state, format!("{}\n{}\n", std::process::id(), descendant.id()))
+			.expect("publish helper identities");
+		start_parent_watchdog(parent_pid).expect("start parent watchdog");
+		loop {
+			std::thread::sleep(Duration::from_secs(60));
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	#[ignore = "subprocess helper launched by \
+	            parent_death_watchdog_terminates_kernel_and_descendants"]
+	fn parent_watchdog_intermediate_helper() {
+		let state = PathBuf::from(std::env::var_os("OMP_EVAL_TEST_STATE").expect("helper state"));
+		let executable = std::env::current_exe().expect("test executable");
+		let mut helper = std::process::Command::new(executable)
+			.args(["--ignored", "parent_watchdog_subprocess_helper"])
+			.env("OMP_EVAL_TEST_PARENT_PID", std::process::id().to_string())
+			.env("OMP_EVAL_TEST_STATE", &state)
+			.spawn()
+			.expect("spawn watchdog helper");
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while !state.is_file() && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		if !state.is_file() {
+			let _ = helper.kill();
+			panic!("watchdog helper did not publish readiness");
+		}
+		drop(helper);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn parent_death_watchdog_terminates_kernel_and_descendants() {
+		let scratch = tempfile::tempdir().expect("watchdog scratch");
+		let state = scratch.path().join("identities");
+		let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+			.args(["--ignored", "parent_watchdog_intermediate_helper"])
+			.env("OMP_EVAL_TEST_STATE", &state)
+			.status()
+			.expect("run intermediate parent");
+		assert!(status.success(), "intermediate parent must publish a live child");
+		let identities = std::fs::read_to_string(&state).expect("read helper identities");
+		let mut identities = identities
+			.lines()
+			.map(|line| line.parse::<u32>().expect("numeric helper identity"));
+		let kernel = identities.next().expect("kernel identity");
+		let descendant = identities.next().expect("descendant identity");
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while (process_exists(kernel) || process_exists(descendant)) && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		if process_exists(kernel) {
+			// SAFETY: the PID was created by this test and is only cleaned up
+			// after the watchdog contract failed.
+			unsafe { libc::kill(i32::try_from(kernel).unwrap_or(i32::MAX), libc::SIGKILL) };
+		}
+		if process_exists(descendant) {
+			unsafe { libc::kill(i32::try_from(descendant).unwrap_or(i32::MAX), libc::SIGKILL) };
+		}
+		assert!(!process_exists(kernel), "orphaned eval kernel survived its parent");
+		assert!(!process_exists(descendant), "orphaned eval descendant survived its parent");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn parent_identity_matches_the_actual_protocol_pipe_owner() {
+		// SAFETY: getppid has no preconditions and does not access memory.
+		let parent = unsafe { libc::getppid() };
+		let parent = u32::try_from(parent).expect("parent PID is positive");
+		validate_parent_identity(parent).expect("actual parent validates");
+		assert!(matches!(
+			validate_parent_identity(parent.saturating_add(1)),
+			Err(ProcessError::InvalidParentIdentity)
+		));
+	}
+
+	#[test]
+	fn status_updates_replace_stable_phase_and_log_keys() {
+		let mut outputs = Vec::new();
+		for event in [
+			serde_json::json!({"op":"phase","title":"first"}),
+			serde_json::json!({"op":"phase","title":"second"}),
+			serde_json::json!({"op":"log","message":"same","progress":1}),
+			serde_json::json!({"op":"log","message":"same","progress":2}),
+		] {
+			upsert_display_output(&mut outputs, DisplayOutput::Status { event });
+		}
+		assert_eq!(outputs.len(), 2);
+		assert!(matches!(
+			&outputs[0],
+			DisplayOutput::Status { event } if event["title"] == "second"
+		));
+		assert!(matches!(
+			&outputs[1],
+			DisplayOutput::Status { event } if event["progress"] == 2
+		));
+	}
+
+	#[test]
+	fn malformed_image_becomes_status_without_dropping_other_output() {
+		let output = normalize_display_output(
+			DisplayOutput::ImageData {
+				data:      CowBytes::from(b"not a png".to_vec()),
+				mime_type: sf!("image/png"),
+			},
+			None,
+		);
+		assert!(matches!(
+			output,
+			DisplayOutput::Status { event } if event["op"] == "display"
+		));
 	}
 
 	#[tokio::test]

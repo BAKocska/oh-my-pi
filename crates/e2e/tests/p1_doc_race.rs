@@ -108,7 +108,7 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 		let identity = ToolIdentity { name: sf!("edit"), rev: Rev { family: sf!("hl"), n: 1 } };
 		let mut registry = Registry::new();
 		registry.register(
-			edit::tool(direct_a.clone(), FormatPolicy::Configured),
+			edit::tool(direct_a.clone(), FormatPolicy::BestEffort),
 			Presentation::Slot,
 			Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None },
 		)?;

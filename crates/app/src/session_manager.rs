@@ -1,0 +1,103 @@
+//! Owner-local session UI state that is deliberately excluded from journals and
+//! replication.
+
+use std::{
+	io,
+	path::{Path, PathBuf},
+};
+
+use omp_core::encoding::hex;
+use omp_storage::{atomic, transcript::SessionId};
+use thiserror::Error;
+
+/// Draft persistence failure.
+#[derive(Debug, Error)]
+pub enum DraftError {
+	/// Draft directory or file access failed.
+	#[error("session draft I/O failed")]
+	Io(#[from] io::Error),
+	/// Atomic draft publication failed.
+	#[error("failed to publish session draft")]
+	Atomic(#[from] atomic::Error),
+}
+
+/// Private, owner-local unsent composer buffers keyed by session identity.
+pub struct DraftStore {
+	directory: PathBuf,
+}
+
+impl DraftStore {
+	/// Opens the private draft directory below the owner's application data
+	/// root.
+	pub fn new(data_dir: &Path) -> Result<Self, DraftError> {
+		let directory = data_dir.join("drafts");
+		std::fs::create_dir_all(&directory)?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt as _;
+			std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+		}
+		Ok(Self { directory })
+	}
+
+	fn path(&self, session: &SessionId) -> PathBuf {
+		let digest = omp_core::Hash32::sum(session.0.as_bytes());
+		let short: &[u8; 16] = digest.as_bytes()[..16]
+			.try_into()
+			.expect("a Blake3 digest contains 16 prefix bytes");
+		self.directory.join(hex::encode_n(short).as_str())
+	}
+
+	/// Atomically saves the current unsent composer text, or removes an empty
+	/// draft.
+	pub fn save(&self, session: &SessionId, draft: &str) -> Result<(), DraftError> {
+		let path = self.path(session);
+		if draft.is_empty() {
+			match std::fs::remove_file(path) {
+				Ok(()) => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			}
+			return Ok(());
+		}
+		atomic::commit(&path, draft.as_bytes(), || true)?;
+		Ok(())
+	}
+
+	/// Takes a saved draft exactly once after restart or session switch.
+	pub fn consume(&self, session: &SessionId) -> Result<Option<String>, DraftError> {
+		let path = self.path(session);
+		let claimed = path.with_extension(format!("claimed-{}", omp_core::Ulid::generate()));
+		match std::fs::rename(&path, &claimed) {
+			Ok(()) => {},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(error.into()),
+		}
+		let result = std::fs::read_to_string(&claimed);
+		let removal = std::fs::remove_file(&claimed);
+		match (result, removal) {
+			(Ok(draft), Ok(())) => Ok(Some(draft)),
+			(Err(error), _) | (Ok(_), Err(error)) => Err(error.into()),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_core::Str;
+	use tempfile::tempdir;
+
+	use super::*;
+
+	#[test]
+	fn draft_is_private_and_consumed_once() {
+		let temp = tempdir().expect("tempdir");
+		let store = DraftStore::new(temp.path()).expect("draft store");
+		let session = SessionId(Str::from("session-one"));
+		store
+			.save(&session, "unfinished prompt")
+			.expect("save draft");
+		assert_eq!(store.consume(&session).expect("consume"), Some("unfinished prompt".to_owned()));
+		assert_eq!(store.consume(&session).expect("consume again"), None);
+	}
+}

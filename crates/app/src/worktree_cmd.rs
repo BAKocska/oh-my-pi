@@ -1,14 +1,37 @@
 //! Environment-owned worktree discovery and maintenance commands.
 
 use std::{
+	collections::BTreeSet,
 	fs, io,
 	path::{Path, PathBuf},
+	process::{Command, Stdio},
 };
 
 use miette::IntoDiagnostic as _;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{WorktreeArgs, WorktreeCommand};
+
+/// Current isolation-owner marker written by workspace operations.
+const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner";
+/// pi-compatible isolation-owner marker recognized during cleanup.
+const LEGACY_ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner.json";
+
+/// Owner metadata parsed from an isolation marker file.
+#[derive(Debug, Deserialize)]
+struct IsolationOwner {
+	pid: u32,
+}
+
+/// Classification facts derived for a directory without a durable record.
+struct Classification {
+	class:       &'static str,
+	orphan:      bool,
+	owner_pid:   Option<u32>,
+	source_root: Option<PathBuf>,
+	branch:      Option<String>,
+	parent_repo: Option<PathBuf>,
+}
 
 #[derive(Debug, Deserialize)]
 struct DurableRecord {
@@ -38,6 +61,13 @@ pub struct WorktreeRow {
 	pub source_root: Option<PathBuf>,
 	/// Internal branch disposition, when one was produced.
 	pub branch:      Option<String>,
+	/// Containing repository for validated PR checkouts.
+	#[serde(skip)]
+	pub parent_repo: Option<PathBuf>,
+	/// Whether a clear operation removed this worktree.
+	pub removed:     Option<bool>,
+	/// Failure detail when removal or pruning failed.
+	pub error:       Option<String>,
 	#[serde(skip)]
 	record_path:     Option<PathBuf>,
 }
@@ -45,7 +75,7 @@ pub struct WorktreeRow {
 /// Resolves the project-specific worktree root used by the Environment.
 pub(crate) fn project_worktree_root(state_dir: &Path) -> io::Result<PathBuf> {
 	let data_dir = data_dir_from_project_state(state_dir);
-	let base = configured_base(&data_dir);
+	let base = configured_base(&data_dir)?;
 	let project_key = state_dir
 		.file_name()
 		.filter(|name| !name.is_empty())
@@ -68,15 +98,21 @@ fn data_dir_from_project_state(state_dir: &Path) -> PathBuf {
 		.map_or_else(|| state_dir.to_path_buf(), Path::to_path_buf)
 }
 
-fn configured_base(data_dir: &Path) -> PathBuf {
+fn configured_base(data_dir: &Path) -> io::Result<PathBuf> {
 	if let Some(path) = std::env::var_os("OMP_WORKTREE_DIR").filter(|value| !value.is_empty()) {
-		return PathBuf::from(path);
+		return Ok(PathBuf::from(path));
 	}
-	match crate::settings::Settings::load(data_dir).worktree.base {
-		Some(path) if path.is_absolute() => path,
-		Some(path) => data_dir.join(path),
-		None => data_dir.join("worktrees"),
-	}
+	Ok(
+		match crate::settings::current(data_dir)
+			.map_err(io::Error::other)?
+			.worktree
+			.base
+		{
+			Some(path) if path.is_absolute() => path,
+			Some(path) => data_dir.join(path),
+			None => data_dir.join("worktrees"),
+		},
+	)
 }
 
 pub(crate) fn run(data_dir: &Path, args: &WorktreeArgs) -> miette::Result<()> {
@@ -90,13 +126,35 @@ pub(crate) fn run(data_dir: &Path, args: &WorktreeArgs) -> miette::Result<()> {
 			print_rows(&rows, *json).into_diagnostic()
 		},
 		WorktreeCommand::Clear { all, dry_run, json } => {
-			let selected = rows
+			let mut selected = rows
 				.into_iter()
 				.filter(|row| *all || row.orphan)
 				.collect::<Vec<_>>();
 			if !dry_run {
-				for row in &selected {
-					remove_worktree(row).into_diagnostic()?;
+				let mut parents_to_prune = BTreeSet::new();
+				for row in &mut selected {
+					match remove_worktree(row) {
+						Ok(parent) => {
+							row.removed = Some(true);
+							if let Some(parent) = parent {
+								parents_to_prune.insert(parent);
+							}
+						},
+						Err(error) => {
+							row.removed = Some(false);
+							row.error = Some(error.to_string());
+						},
+					}
+				}
+				for parent in parents_to_prune {
+					if let Err(error) = prune_git_worktrees(&parent) {
+						for row in &mut selected {
+							if row.parent_repo.as_ref() == Some(&parent) {
+								row.removed = Some(false);
+								row.error = Some(error.to_string());
+							}
+						}
+					}
 				}
 			}
 			print_rows(&selected, *json).into_diagnostic()
@@ -106,7 +164,7 @@ pub(crate) fn run(data_dir: &Path, args: &WorktreeArgs) -> miette::Result<()> {
 
 fn discover(data_dir: &Path) -> io::Result<Vec<WorktreeRow>> {
 	let mut roots = Vec::new();
-	let base = configured_base(data_dir);
+	let base = configured_base(data_dir)?;
 	if base.is_dir() {
 		for entry in fs::read_dir(&base)? {
 			let entry = entry?;
@@ -152,6 +210,9 @@ fn discover_root(root: &Path, rows: &mut Vec<WorktreeRow>) -> io::Result<()> {
 					owner_pid:   None,
 					source_root: None,
 					branch:      None,
+					parent_repo: None,
+					removed:     None,
+					error:       None,
 					record_path: Some(entry.path()),
 				});
 				continue;
@@ -173,6 +234,9 @@ fn discover_root(root: &Path, rows: &mut Vec<WorktreeRow>) -> io::Result<()> {
 				owner_pid: Some(record.owner_pid),
 				source_root: Some(record.source_root),
 				branch: record.branch,
+				parent_repo: None,
+				removed: None,
+				error: None,
 				record_path: Some(entry.path()),
 			});
 		}
@@ -186,49 +250,166 @@ fn discover_root(root: &Path, rows: &mut Vec<WorktreeRow>) -> io::Result<()> {
 		if rows.iter().any(|row| row.path == entry.path()) {
 			continue;
 		}
-		let class = classify_unregistered(&entry.path())?;
+		let classified = classify_unregistered(&entry.path())?;
 		rows.push(WorktreeRow {
-			id: name.to_string_lossy().into_owned(),
-			path: entry.path(),
-			class,
-			orphan: true,
-			owner_pid: None,
-			source_root: None,
-			branch: None,
+			id:          name.to_string_lossy().into_owned(),
+			path:        entry.path(),
+			class:       classified.class,
+			orphan:      classified.orphan,
+			owner_pid:   classified.owner_pid,
+			source_root: classified.source_root,
+			branch:      classified.branch,
+			parent_repo: classified.parent_repo,
+			removed:     None,
+			error:       None,
 			record_path: None,
 		});
 	}
 	Ok(())
 }
 
-fn classify_unregistered(path: &Path) -> io::Result<&'static str> {
+fn classify_unregistered(path: &Path) -> io::Result<Classification> {
 	if fs::read_dir(path)?.next().is_none() {
-		return Ok("empty");
+		return Ok(Classification {
+			class:       "empty",
+			orphan:      true,
+			owner_pid:   None,
+			source_root: None,
+			branch:      None,
+			parent_repo: None,
+		});
 	}
-	if path
-		.file_name()
-		.and_then(|name| name.to_str())
-		.and_then(|name| name.rsplit_once('-').map(|(_, suffix)| suffix))
-		.is_some_and(|suffix| omp_core::Ulid::from_string(suffix).is_ok())
-	{
-		return Ok("task-isolation");
+	let owner = read_isolation_owner(path);
+	let has_mount = ["m", "merged"]
+		.into_iter()
+		.any(|name| path.join(name).is_dir());
+	if owner.is_some() || has_mount {
+		let owner_pid = owner.as_ref().map(|owner| owner.pid);
+		return Ok(Classification {
+			class: "task-isolation",
+			orphan: owner_pid.is_none_or(|pid| !process_is_live(pid)),
+			owner_pid,
+			source_root: None,
+			branch: None,
+			parent_repo: None,
+		});
 	}
 	if path.join(".git").is_file()
-		|| path
-			.file_name()
-			.is_some_and(|name| name.to_string_lossy().starts_with("pr-"))
+		&& let Some((parent_repo, branch)) = validate_pr_checkout(path)
 	{
-		Ok("pr-checkout")
-	} else {
-		Ok("stray")
+		return Ok(Classification {
+			class:       "pr-checkout",
+			orphan:      false,
+			owner_pid:   None,
+			source_root: None,
+			branch:      Some(branch),
+			parent_repo: Some(parent_repo),
+		});
 	}
+	Ok(Classification {
+		class:       "stray",
+		orphan:      true,
+		owner_pid:   None,
+		source_root: None,
+		branch:      None,
+		parent_repo: None,
+	})
 }
 
-fn remove_worktree(row: &WorktreeRow) -> io::Result<()> {
-	if row.path.is_dir() {
-		fs::remove_dir_all(&row.path)?;
-	} else if row.path.exists() && row.record_path.as_ref() != Some(&row.path) {
-		fs::remove_file(&row.path)?;
+fn read_isolation_owner(path: &Path) -> Option<IsolationOwner> {
+	[ISOLATION_OWNER_FILE, LEGACY_ISOLATION_OWNER_FILE]
+		.into_iter()
+		.find_map(|name| {
+			fs::read(path.join(name))
+				.ok()
+				.and_then(|bytes| serde_json::from_slice::<IsolationOwner>(&bytes).ok())
+				.filter(|owner| owner.pid != 0)
+		})
+}
+
+fn validate_pr_checkout(path: &Path) -> Option<(PathBuf, String)> {
+	let Ok(pointer) = fs::read_to_string(path.join(".git")) else {
+		return None;
+	};
+	let Some(raw_gitdir) = pointer
+		.lines()
+		.find_map(|line| line.strip_prefix("gitdir:"))
+	else {
+		return None;
+	};
+	let raw_gitdir = raw_gitdir.trim();
+	if raw_gitdir.is_empty() {
+		return None;
+	}
+	let gitdir = PathBuf::from(raw_gitdir);
+	let gitdir = if gitdir.is_absolute() {
+		gitdir
+	} else {
+		path.join(gitdir)
+	};
+	let Ok(gitdir) = fs::canonicalize(gitdir) else {
+		return None;
+	};
+	if !gitdir.is_dir() {
+		return None;
+	}
+	let Ok(commondir) = fs::read_to_string(gitdir.join("commondir")) else {
+		return None;
+	};
+	let commondir = commondir.trim();
+	if commondir.is_empty() {
+		return None;
+	}
+	let commondir = PathBuf::from(commondir);
+	let commondir = if commondir.is_absolute() {
+		commondir
+	} else {
+		gitdir.join(commondir)
+	};
+	let Ok(commondir) = fs::canonicalize(commondir) else {
+		return None;
+	};
+	if !commondir.is_dir() || commondir.file_name().is_none_or(|name| name != ".git") {
+		return None;
+	}
+	let Some(parent_repo) = commondir.parent() else {
+		return None;
+	};
+	if !parent_repo.is_dir() {
+		return None;
+	}
+	let Ok(head) = fs::read_to_string(gitdir.join("HEAD")) else {
+		return None;
+	};
+	let Some(branch) = head
+		.trim()
+		.strip_prefix("ref: refs/heads/")
+		.filter(|branch| !branch.is_empty())
+	else {
+		return None;
+	};
+	Some((parent_repo.to_path_buf(), branch.to_owned()))
+}
+
+fn remove_worktree(row: &WorktreeRow) -> io::Result<Option<PathBuf>> {
+	let mut parent_to_prune = row.parent_repo.clone();
+	if let Some(parent) = &row.parent_repo
+		&& row.class == "pr-checkout"
+	{
+		match run_git(parent, &[
+			std::ffi::OsStr::new("worktree"),
+			std::ffi::OsStr::new("remove"),
+			std::ffi::OsStr::new("--force"),
+			row.path.as_os_str(),
+		]) {
+			Ok(true) => {},
+			Ok(false) | Err(_) => {
+				remove_path(&row.path, row.record_path.as_deref())?;
+				parent_to_prune = Some(parent.clone());
+			},
+		}
+	} else {
+		remove_path(&row.path, row.record_path.as_deref())?;
 	}
 	if let Some(record) = &row.record_path
 		&& let Some(container) = record.parent().and_then(Path::parent)
@@ -254,7 +435,42 @@ fn remove_worktree(row: &WorktreeRow) -> io::Result<()> {
 	if let Some(parent) = row.path.parent() {
 		prune_empty(parent)?;
 	}
-	Ok(())
+	Ok(parent_to_prune)
+}
+
+fn remove_path(path: &Path, record_path: Option<&Path>) -> io::Result<()> {
+	if path.is_dir() {
+		fs::remove_dir_all(path)
+	} else if path.exists() && record_path != Some(path) {
+		fs::remove_file(path)
+	} else {
+		Ok(())
+	}
+}
+
+fn prune_git_worktrees(parent: &Path) -> io::Result<()> {
+	if run_git(parent, &[std::ffi::OsStr::new("worktree"), std::ffi::OsStr::new("prune")])? {
+		Ok(())
+	} else {
+		Err(io::Error::other("git worktree prune failed"))
+	}
+}
+
+fn run_git(cwd: &Path, args: &[&std::ffi::OsStr]) -> io::Result<bool> {
+	let mut command = Command::new("git");
+	command
+		.current_dir(cwd)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.env_remove("GIT_DIR")
+		.env_remove("GIT_COMMON_DIR")
+		.env_remove("GIT_WORK_TREE")
+		.env_remove("GIT_INDEX_FILE")
+		.env("GIT_TERMINAL_PROMPT", "0")
+		.args(["-c", "core.askPass=", "-c", "core.editor=true"])
+		.args(args);
+	Ok(command.status()?.success())
 }
 
 fn prune_empty(path: &Path) -> io::Result<()> {
@@ -276,6 +492,9 @@ fn print_rows(rows: &[WorktreeRow], json: bool) -> io::Result<()> {
 	for row in rows {
 		let status = if row.orphan { "orphan" } else { "live" };
 		writeln!(output, "{}\t{}\t{}\t{}", row.id, row.class, status, row.path.display())?;
+		if let Some(error) = &row.error {
+			writeln!(output, "\tfailed: {error}")?;
+		}
 	}
 	Ok(())
 }
@@ -322,14 +541,14 @@ mod tests {
 		let root = tempfile::tempdir().expect("root");
 		let empty = root.path().join("empty");
 		fs::create_dir(&empty).expect("empty");
-		assert_eq!(classify_unregistered(&empty).unwrap(), "empty");
+		assert_eq!(classify_unregistered(&empty).unwrap().class, "empty");
 		let pr = root.path().join("pr-42");
 		fs::create_dir(&pr).expect("pr");
 		fs::write(pr.join("file"), b"x").expect("file");
-		assert_eq!(classify_unregistered(&pr).unwrap(), "pr-checkout");
+		assert_eq!(classify_unregistered(&pr).unwrap().class, "stray");
 		let stray = root.path().join("other");
 		fs::create_dir(&stray).expect("stray");
 		fs::write(stray.join("file"), b"x").expect("file");
-		assert_eq!(classify_unregistered(&stray).unwrap(), "stray");
+		assert_eq!(classify_unregistered(&stray).unwrap().class, "stray");
 	}
 }

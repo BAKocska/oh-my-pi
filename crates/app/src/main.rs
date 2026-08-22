@@ -2,6 +2,48 @@
 
 use std::process::ExitCode;
 
+fn process_bootstrap() {
+	// Safety: this runs as the first statement in `main`, before OMP starts any
+	// daemon, worker, or application thread that could concurrently read env.
+	unsafe {
+		std::env::remove_var("MallocStackLogging");
+		std::env::remove_var("MallocStackLoggingNoCompact");
+	}
+	set_process_title();
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn set_process_title() {
+	// Safety: `c\"omp\"` is static, NUL terminated, and valid for setprogname.
+	unsafe { libc::setprogname(c"omp".as_ptr()) };
+}
+
+#[cfg(target_os = "linux")]
+fn set_process_title() {
+	// Safety: PR_SET_NAME reads at most sixteen bytes from this static C string.
+	unsafe {
+		libc::prctl(libc::PR_SET_NAME, c"omp".as_ptr());
+	}
+}
+
+#[cfg(windows)]
+fn set_process_title() {
+	let title = "omp\0".encode_utf16().collect::<Vec<_>>();
+	// Safety: `title` is NUL terminated and remains alive for the call.
+	unsafe {
+		windows_sys::Win32::System::Console::SetConsoleTitleW(title.as_ptr());
+	}
+}
+
+#[cfg(not(any(
+	target_os = "macos",
+	target_os = "ios",
+	target_os = "freebsd",
+	target_os = "linux",
+	windows
+)))]
+fn set_process_title() {}
+
 fn install_panic_hook() {
 	std::panic::set_hook(Box::new(|info| {
 		eprintln!("\x1b[31momp internal error:\x1b[0m {info}");
@@ -10,6 +52,7 @@ fn install_panic_hook() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+	process_bootstrap();
 	install_panic_hook();
 	if std::env::args_os()
 		.nth(1)

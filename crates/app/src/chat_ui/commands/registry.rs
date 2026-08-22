@@ -1,0 +1,416 @@
+//! Immutable structural command router shared by every presentation surface.
+
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+
+use omp_core::{Str, sf};
+
+use super::{
+	CommandHost,
+	result::{CommandResult, DispatchResult, PromptResult},
+};
+
+/// Runtime authority required before a command may be advertised or invoked.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CommandCapability {
+	/// Durable session journal access.
+	Session,
+	/// Workspace authority access.
+	Workspace,
+	/// Model/catalog configuration access.
+	Model,
+	/// Provider credential authority access.
+	Credentials,
+	/// Context projection and accounting access.
+	Context,
+	/// Active turn execution control.
+	Execution,
+	/// Owner-only mutation authority.
+	Owner,
+}
+
+/// Presentation surface on which a command may appear.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CommandSurface {
+	/// Interactive terminal UI.
+	Tui,
+	/// Agent Client Protocol client.
+	Acp,
+	/// Plain text or RPC client.
+	Text,
+}
+
+/// Collaboration role used only for presentation filtering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandRole {
+	/// Local owner or collaboration host.
+	Owner,
+	/// Invited collaboration guest.
+	Guest,
+}
+
+/// Stable category of a command contribution.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CommandSourceKind {
+	/// Command compiled into OMP.
+	Builtin,
+	/// OMP skill invocation.
+	Skill,
+	/// Signed native extension.
+	Extension,
+	/// Project or user native custom command.
+	Custom,
+	/// OMP Markdown command asset.
+	Markdown,
+}
+
+/// Source identity retained through completion, help, and dispatch.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CommandProvenance {
+	/// Stable source identifier.
+	pub source:     Str,
+	/// Human-readable origin label.
+	pub label:      Str,
+	/// Source category.
+	pub kind:       CommandSourceKind,
+	/// Atomic discovery generation supplying this declaration.
+	pub generation: u64,
+}
+
+impl CommandProvenance {
+	/// Provenance shared by compiled commands.
+	#[must_use]
+	pub fn builtin() -> Self {
+		Self {
+			source:     sf!("builtin"),
+			label:      sf!("OMP"),
+			kind:       CommandSourceKind::Builtin,
+			generation: 0,
+		}
+	}
+}
+
+/// One immutable argument suggestion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArgumentHint {
+	/// Text inserted by completion.
+	pub value:       Str,
+	/// Explanation displayed beside the value.
+	pub description: Str,
+}
+
+/// Executable implementation attached to one declaration.
+#[derive(Clone)]
+pub enum CommandImplementation {
+	/// Structural handler whose generated wrapper parses the declared grammar.
+	Handler(super::CommandHandler),
+	/// Prompt template. `$ARGUMENTS` is replaced exactly once.
+	Prompt(Str),
+}
+
+impl std::fmt::Debug for CommandImplementation {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Handler(_) => formatter.write_str("Handler(..)"),
+			Self::Prompt(template) => formatter.debug_tuple("Prompt").field(template).finish(),
+		}
+	}
+}
+
+/// One complete declaration consumed by parsing, help, completion, and
+/// dispatch.
+#[derive(Clone, Debug)]
+pub struct CommandDeclaration {
+	/// Stable ordering among compiled declarations.
+	pub order:           u16,
+	/// Canonical spelling without `/`.
+	pub name:            Str,
+	/// Alternate spellings without `/`.
+	pub aliases:         Arc<[Str]>,
+	/// One-line help and completion text.
+	pub description:     Str,
+	/// Argument grammar rendered by help and completion.
+	pub argument_hint:   Option<Str>,
+	/// Immutable argument candidates.
+	pub hints:           Arc<[ArgumentHint]>,
+	/// Required runtime capabilities.
+	pub capabilities:    Arc<[CommandCapability]>,
+	/// Supported presentation surfaces.
+	pub surfaces:        Arc<[CommandSurface]>,
+	/// Whether collaboration guests may see this command.
+	pub guest_visible:   bool,
+	/// ACP-specific description override.
+	pub acp_description: Option<Str>,
+	/// Source identity.
+	pub provenance:      CommandProvenance,
+	/// Executable implementation.
+	pub implementation:  CommandImplementation,
+}
+
+/// One compiled declaration factory submitted by [`inventory`].
+pub struct BuiltinRegistration {
+	/// Builds the declaration without retaining mutable global state.
+	pub declaration: fn() -> CommandDeclaration,
+}
+
+inventory::collect!(BuiltinRegistration);
+
+/// Explicit source-qualified permission to replace one builtin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShadowRule {
+	/// Builtin canonical name being replaced.
+	pub builtin: Str,
+	/// Exact contribution source identifier.
+	pub source:  Str,
+	/// Exact contribution canonical name.
+	pub command: Str,
+}
+
+/// Roster construction policy. Builtins win unless a rule matches exactly.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShadowPolicy {
+	/// Explicit builtin replacement rules.
+	pub rules: Arc<[ShadowRule]>,
+}
+
+impl ShadowPolicy {
+	fn permits(&self, builtin: &str, declaration: &CommandDeclaration) -> bool {
+		self.rules.iter().any(|rule| {
+			rule.builtin == builtin
+				&& rule.source == declaration.provenance.source
+				&& rule.command == declaration.name
+		})
+	}
+}
+
+/// A source generation published atomically by discovery.
+#[derive(Clone, Debug)]
+pub struct CommandGeneration {
+	/// Source generation identity.
+	pub provenance:   CommandProvenance,
+	/// All declarations in the generation.
+	pub declarations: Arc<[CommandDeclaration]>,
+}
+
+/// Lightweight declaration copied to completion, help, or ACP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvertisedCommand {
+	/// Canonical slash spelling.
+	pub name:          Str,
+	/// Description appropriate to the requested surface.
+	pub description:   Str,
+	/// Inline argument placeholder.
+	pub argument_hint: Option<Str>,
+	/// Immutable argument candidates.
+	pub hints:         Arc<[ArgumentHint]>,
+	/// Source identity shown to the user.
+	pub provenance:    CommandProvenance,
+}
+
+/// Immutable winning command generation.
+#[derive(Clone)]
+pub struct CommandRoster {
+	commands:  Arc<[CommandDeclaration]>,
+	spellings: Arc<HashMap<Str, usize>>,
+}
+
+impl CommandRoster {
+	/// Builds the inventory roster with no dynamic contributions.
+	#[must_use]
+	pub fn builtins() -> Self {
+		Self::with_contributions([], &ShadowPolicy::default())
+	}
+
+	/// Builds inventory declarations plus atomically published contributions.
+	#[must_use]
+	pub fn with_contributions(
+		generations: impl IntoIterator<Item = CommandGeneration>,
+		policy: &ShadowPolicy,
+	) -> Self {
+		let mut builtins: Vec<_> = inventory::iter::<BuiltinRegistration>
+			.into_iter()
+			.map(|registration| (registration.declaration)())
+			.collect();
+		builtins.sort_unstable_by_key(|declaration| declaration.order);
+		Self::build(builtins, generations, policy)
+	}
+
+	/// Builds one atomic roster from compiled declarations and source
+	/// generations.
+	#[must_use]
+	pub fn build(
+		builtins: impl IntoIterator<Item = CommandDeclaration>,
+		generations: impl IntoIterator<Item = CommandGeneration>,
+		policy: &ShadowPolicy,
+	) -> Self {
+		let mut commands: Vec<CommandDeclaration> = builtins.into_iter().collect();
+		let builtin_count = commands.len();
+		for generation in generations {
+			for mut declaration in generation.declarations.iter().cloned() {
+				declaration.provenance = generation.provenance.clone();
+				if let Some((index, builtin)) = commands
+					.iter()
+					.take(builtin_count)
+					.enumerate()
+					.find(|(_, builtin)| builtin.name == declaration.name)
+				{
+					if policy.permits(builtin.name.as_str(), &declaration) {
+						commands[index] = declaration;
+					}
+					continue;
+				}
+				commands.push(declaration);
+			}
+		}
+
+		let mut winners = Vec::<CommandDeclaration>::with_capacity(commands.len());
+		let mut spellings = HashMap::<Str, usize>::new();
+		for declaration in commands {
+			if spellings.contains_key(&declaration.name) {
+				continue;
+			}
+			let index = winners.len();
+			spellings.insert(declaration.name.clone(), index);
+			for alias in declaration.aliases.iter() {
+				spellings.entry(alias.clone()).or_insert(index);
+			}
+			winners.push(declaration);
+		}
+		Self { commands: winners.into(), spellings: Arc::new(spellings) }
+	}
+
+	/// Slash completion entries derived from the winning roster.
+	#[must_use]
+	pub fn completions(&self) -> Vec<omp_tui::Command> {
+		use smallvec::SmallVec;
+		self
+			.commands
+			.iter()
+			.map(|declaration| {
+				let aliases: SmallVec<&str, 2> = declaration.aliases.iter().map(Str::as_str).collect();
+				let mut command = omp_tui::Command::new(
+					declaration.name.as_str(),
+					declaration.description.as_str(),
+					&aliases,
+				);
+				if !declaration.hints.is_empty() {
+					let hints: Vec<_> = declaration
+						.hints
+						.iter()
+						.map(|hint| (hint.value.as_str(), hint.description.as_str(), ""))
+						.collect();
+					command = command.with_args(&hints);
+				}
+				if let Some(hint) = &declaration.argument_hint {
+					command = command.with_hint(hint);
+				}
+				command
+			})
+			.collect()
+	}
+
+	/// Advertises the same winning roster used by dispatch.
+	#[must_use]
+	pub fn advertised(
+		&self,
+		surface: CommandSurface,
+		role: CommandRole,
+		skill_commands: bool,
+		available: impl Fn(CommandCapability) -> bool,
+	) -> Vec<AdvertisedCommand> {
+		self
+			.commands
+			.iter()
+			.filter(|command| command.surfaces.contains(&surface))
+			.filter(|command| role == CommandRole::Owner || command.guest_visible)
+			.filter(|command| skill_commands || command.provenance.kind != CommandSourceKind::Skill)
+			.filter(|command| command.capabilities.iter().copied().all(&available))
+			.map(|command| AdvertisedCommand {
+				name:          command.name.clone(),
+				description:   if surface == CommandSurface::Acp {
+					command
+						.acp_description
+						.clone()
+						.unwrap_or_else(|| command.description.clone())
+				} else {
+					command.description.clone()
+				},
+				argument_hint: command.argument_hint.clone(),
+				hints:         command.hints.clone(),
+				provenance:    command.provenance.clone(),
+			})
+			.collect()
+	}
+
+	/// Renders help from the same filtered declarations used by completion.
+	#[must_use]
+	pub fn help_text(
+		&self,
+		surface: CommandSurface,
+		role: CommandRole,
+		skill_commands: bool,
+		available: impl Fn(CommandCapability) -> bool,
+	) -> String {
+		use std::fmt::Write as _;
+		let advertised = self.advertised(surface, role, skill_commands, available);
+		let mut output = String::with_capacity(advertised.len().saturating_mul(56));
+		for command in advertised {
+			let _ = write!(output, "/{}", command.name);
+			if let Some(hint) = command.argument_hint {
+				let _ = write!(output, " {hint}");
+			}
+			let _ = writeln!(output, " — {} [{}]", command.description, command.provenance.label);
+		}
+		output
+	}
+
+	/// Parses and dispatches recognized input; unknown input remains a prompt.
+	pub fn dispatch<'a>(
+		&'a self,
+		text: &'a str,
+		surface: CommandSurface,
+		host: &'a mut dyn CommandHost,
+	) -> Pin<Box<dyn Future<Output = miette::Result<DispatchResult>> + 'a>> {
+		Box::pin(async move {
+			let Some(body) = text.strip_prefix('/') else {
+				return Ok(DispatchResult::Passthrough(Str::new(text)));
+			};
+			if body.is_empty() || body.starts_with('/') {
+				return Ok(DispatchResult::Passthrough(Str::new(text)));
+			}
+			let split = body.find(char::is_whitespace).unwrap_or(body.len());
+			let token = &body[..split];
+			let trailing = body[split..].trim();
+			let mut candidate = token;
+			let mut colon_args = "";
+			let (index, args) = loop {
+				if let Some(index) = self.spellings.get(candidate).copied() {
+					let args = match (colon_args.is_empty(), trailing.is_empty()) {
+						(true, _) => trailing,
+						(false, true) => colon_args,
+						(false, false) => return Ok(DispatchResult::Passthrough(Str::new(text))),
+					};
+					break (index, args);
+				}
+				let Some((prefix, suffix)) = candidate.rsplit_once(':') else {
+					return Ok(DispatchResult::Passthrough(Str::new(text)));
+				};
+				candidate = prefix;
+				colon_args = suffix;
+			};
+			let declaration = &self.commands[index];
+			if !declaration.surfaces.contains(&surface) {
+				return Ok(DispatchResult::Passthrough(Str::new(text)));
+			}
+			let result = match &declaration.implementation {
+				CommandImplementation::Handler(handler) => {
+					handler(host, args, &declaration.provenance).await?
+				},
+				CommandImplementation::Prompt(template) => CommandResult::Prompt(PromptResult {
+					text:       Str::from(template.replace("$ARGUMENTS", args)),
+					provenance: declaration.provenance.clone(),
+				}),
+			};
+			Ok(DispatchResult::Handled(result))
+		})
+	}
+}
