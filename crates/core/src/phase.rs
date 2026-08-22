@@ -5,6 +5,116 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
 /// Canonical ordered state of one tool invocation.
+/// One fixed decision point in the closed agent loop.
+///
+/// Discriminants are stable bit positions in [`PointSet`].
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
+)]
+#[repr(u8)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE", const_into_str)]
+pub enum Point {
+	/// Context projection and prompt injection.
+	Context    = 0,
+	/// Resolution of the next required tool.
+	ToolChoice = 1,
+	/// Final gate before model sampling.
+	PreModel   = 2,
+	/// Streaming output inspection.
+	Stream     = 3,
+	/// Per-invocation admission.
+	Admission  = 4,
+	/// In-flight tool batch supervision.
+	Batch      = 5,
+	/// Observation after a committed turn.
+	TurnEnd    = 6,
+	/// Settlement and continuation arbitration.
+	Settle     = 7,
+	/// Idle mailbox wake arbitration.
+	Idle       = 8,
+}
+
+impl Point {
+	/// Every decision point in loop order.
+	pub const ALL: [Self; 9] = [
+		Self::Context,
+		Self::ToolChoice,
+		Self::PreModel,
+		Self::Stream,
+		Self::Admission,
+		Self::Batch,
+		Self::TurnEnd,
+		Self::Settle,
+		Self::Idle,
+	];
+
+	/// Returns this point's stable bit position.
+	pub const fn ordinal(self) -> u8 {
+		self as u8
+	}
+
+	/// Returns the singleton set containing this point.
+	pub const fn set(self) -> PointSet {
+		PointSet(1_u16 << self.ordinal())
+	}
+}
+
+/// Compact subscription mask over the closed [`Point`] vocabulary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct PointSet(u16);
+
+impl PointSet {
+	/// Every currently defined decision point.
+	pub const ALL: Self = Self((1_u16 << Point::ALL.len()) - 1);
+	/// The empty point set.
+	pub const EMPTY: Self = Self(0);
+
+	/// Creates a set from raw bits, discarding bits outside the vocabulary.
+	pub const fn from_bits(bits: u16) -> Self {
+		Self(bits & Self::ALL.0)
+	}
+
+	/// Returns the raw stable bit mask.
+	pub const fn bits(self) -> u16 {
+		self.0
+	}
+
+	/// Returns whether the set contains `point`.
+	pub const fn contains(self, point: Point) -> bool {
+		self.0 & point.set().0 != 0
+	}
+
+	/// Returns the union with `other`.
+	pub const fn union(self, other: Self) -> Self {
+		Self(self.0 | other.0)
+	}
+
+	/// Returns the set with `point` inserted.
+	pub const fn with(self, point: Point) -> Self {
+		self.union(point.set())
+	}
+}
+
+impl From<Point> for PointSet {
+	fn from(point: Point) -> Self {
+		point.set()
+	}
+}
+
 ///
 /// Each transition fixes additional durable facts. Discriminants are stable
 /// protocol vocabulary and therefore match the state-machine order.
@@ -201,7 +311,17 @@ impl RestartReason {
 
 #[cfg(test)]
 mod tests {
-	use super::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
+	use super::{ActivateReason, InvocationPhase, LifecyclePhase, Point, PointSet, RestartReason};
+	#[test]
+	fn point_set_is_a_stable_nine_bit_mask() {
+		assert_eq!(PointSet::ALL.bits(), 0x01ff);
+		for (ordinal, point) in Point::ALL.into_iter().enumerate() {
+			assert_eq!(usize::from(point.ordinal()), ordinal);
+			assert!(PointSet::ALL.contains(point));
+			assert_eq!(PointSet::from(point).bits(), 1 << ordinal);
+		}
+		assert_eq!(PointSet::from_bits(u16::MAX), PointSet::ALL);
+	}
 
 	#[test]
 	fn discriminants_and_transitions_are_canonical() {

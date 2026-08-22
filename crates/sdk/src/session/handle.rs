@@ -3,8 +3,8 @@
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
 
 use omp_agent::{
-	AbortHandle, Agent, AgentError, AgentEvent, AgentRunSummary, EventSubscription, TurnClient,
-	TurnId,
+	AbortHandle, Agent, AgentError, AgentEvent, AgentRunSummary, CampaignEntry, CampaignMachine,
+	CampaignSpec, EngageOptions, EngageReceipt, EventSubscription, TurnClient, TurnId,
 };
 use omp_core::Str;
 use omp_proto::thread::v1::Item;
@@ -136,9 +136,21 @@ pub enum SessionHandleError {
 
 type SubmitFuture<'a> =
 	Pin<Box<dyn Future<Output = Result<AgentRunSummary, AgentError>> + Send + 'a>>;
+type EngageFuture<'a> = Pin<
+	Box<dyn Future<Output = Result<(EngageReceipt, Vec<CampaignEntry>), AgentError>> + Send + 'a>,
+>;
+type DisengageFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<(bool, Vec<CampaignEntry>), AgentError>> + Send + 'a>>;
 
 trait RuntimeDriver: Send {
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a>;
+	fn engage<'a>(
+		&'a mut self,
+		spec: Arc<CampaignSpec>,
+		machine: Box<dyn CampaignMachine>,
+		options: EngageOptions,
+	) -> EngageFuture<'a>;
+	fn disengage<'a>(&'a mut self, engagement: Str, now_ms: u64) -> DisengageFuture<'a>;
 }
 
 struct AgentRuntime<C: TurnClient + Send + 'static> {
@@ -148,6 +160,27 @@ struct AgentRuntime<C: TurnClient + Send + 'static> {
 impl<C: TurnClient + Send + 'static> RuntimeDriver for AgentRuntime<C> {
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a> {
 		Box::pin(self.agent.submit(items, turn_id))
+	}
+
+	fn engage<'a>(
+		&'a mut self,
+		spec: Arc<CampaignSpec>,
+		machine: Box<dyn CampaignMachine>,
+		options: EngageOptions,
+	) -> EngageFuture<'a> {
+		Box::pin(async move {
+			let receipt = self.agent.engage_campaign(spec, machine, options)?;
+			let entries = self.agent.arbiter().campaigns().entries();
+			Ok((receipt, entries))
+		})
+	}
+
+	fn disengage<'a>(&'a mut self, engagement: Str, now_ms: u64) -> DisengageFuture<'a> {
+		Box::pin(async move {
+			let removed = self.agent.disengage_campaign(engagement.as_str(), now_ms)?;
+			let entries = self.agent.arbiter().campaigns().entries();
+			Ok((removed, entries))
+		})
 	}
 }
 
@@ -194,6 +227,17 @@ enum Command {
 		items:   Vec<Item>,
 		turn_id: TurnId,
 		reply:   flume::Sender<Result<AgentRunSummary, SessionHandleError>>,
+	},
+	EngageCampaign {
+		spec:    Arc<CampaignSpec>,
+		machine: Box<dyn CampaignMachine>,
+		options: EngageOptions,
+		reply:   flume::Sender<Result<(EngageReceipt, Vec<CampaignEntry>), SessionHandleError>>,
+	},
+	DisengageCampaign {
+		engagement: Str,
+		now_ms:     u64,
+		reply:      flume::Sender<Result<(bool, Vec<CampaignEntry>), SessionHandleError>>,
 	},
 	Dispose {
 		reply: flume::Sender<()>,
@@ -316,6 +360,46 @@ impl SessionHandle {
 			.map_err(|_| SessionHandleError::Closed)?
 	}
 
+	/// Engages and journals a campaign on the actor-owned agent loop.
+	pub async fn engage_campaign(
+		&self,
+		spec: Arc<CampaignSpec>,
+		machine: Box<dyn CampaignMachine>,
+		options: EngageOptions,
+	) -> Result<(EngageReceipt, Vec<CampaignEntry>), SessionHandleError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.inner
+			.commands
+			.send_async(Command::EngageCampaign { spec, machine, options, reply })
+			.await
+			.map_err(|_| SessionHandleError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| SessionHandleError::Closed)?
+	}
+
+	/// Disengages a campaign and returns the resulting complete campaign
+	/// projection.
+	pub async fn disengage_campaign(
+		&self,
+		engagement: Str,
+		now_ms: u64,
+	) -> Result<(bool, Vec<CampaignEntry>), SessionHandleError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.inner
+			.commands
+			.send_async(Command::DisengageCampaign { engagement, now_ms, reply })
+			.await
+			.map_err(|_| SessionHandleError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| SessionHandleError::Closed)?
+	}
+
 	/// Interrupts the active submission without waiting for the actor mailbox.
 	pub fn interrupt(&self) {
 		if let Some(abort) = self.inner.abort.lock().as_ref() {
@@ -358,6 +442,30 @@ async fn run_handle_actor(
 				shared.lifecycle.send_replace(SessionLifecycle::Disposed);
 				let _ = reply.send(());
 				continue;
+			},
+			Command::EngageCampaign { spec, machine, options, reply } => {
+				let Some(live) = runtime.as_mut() else {
+					let _ = reply.send(Err(SessionHandleError::NotRevivable));
+					continue;
+				};
+				let result = live
+					.driver
+					.engage(spec, machine, options)
+					.await
+					.map_err(SessionHandleError::from);
+				let _ = reply.send(result);
+			},
+			Command::DisengageCampaign { engagement, now_ms, reply } => {
+				let Some(live) = runtime.as_mut() else {
+					let _ = reply.send(Err(SessionHandleError::NotRevivable));
+					continue;
+				};
+				let result = live
+					.driver
+					.disengage(engagement, now_ms)
+					.await
+					.map_err(SessionHandleError::from);
+				let _ = reply.send(result);
 			},
 			Command::Submit { items, turn_id, reply } => {
 				if runtime.is_none() {

@@ -48,7 +48,7 @@ pub use location::{
 	ToolPath, WorkspaceUri,
 };
 pub use path::NormalizePath;
-pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
+pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, Point, PointSet, RestartReason};
 pub use principal::{
 	ArtifactDigest, ArtifactDigestError, CredentialTier, Principal, Provenance, RemotePrincipal,
 };
