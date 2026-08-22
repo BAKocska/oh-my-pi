@@ -1,0 +1,31 @@
+[package]
+name = "omp-collab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Bounded encrypted relay and replication substrate for OMP collaboration"
+readme = "README.md"
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+omp-proto.workspace = true
+prost.workspace = true
+rand.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
