@@ -23,7 +23,7 @@ use winit::{
 	application::ApplicationHandler,
 	event::{ElementState, MouseScrollDelta, WindowEvent},
 	event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-	keyboard::{NamedKey, SmolStr},
+	keyboard::NamedKey,
 	window::{Window, WindowId},
 };
 
@@ -284,7 +284,7 @@ impl ApplicationHandler for App {
 						}
 					},
 					winit::keyboard::Key::Character(text) if down => {
-						send_text(pane, &text);
+						send_text(pane, text.as_str());
 					},
 					_ => {},
 				}
@@ -296,7 +296,7 @@ impl ApplicationHandler for App {
 
 /// Types `text` into the page: plain characters insert as text, chorded
 /// characters (ctrl/meta held) go through the key path so shortcuts work.
-fn send_text(pane: &Pane, text: &SmolStr) {
+fn send_text(pane: &Pane, text: &str) {
 	if pane.mods.ctrl || pane.mods.meta {
 		if let Some(c) = text.chars().next() {
 			let key = Key::Char(c);
@@ -306,7 +306,7 @@ fn send_text(pane: &Pane, text: &SmolStr) {
 			let _ = pane.view.input(Input::KeyUp { key, modifiers: pane.mods });
 		}
 	} else {
-		let _ = pane.view.input(Input::Text(text.as_str().into()));
+		let _ = pane.view.input(Input::Text(text.into()));
 	}
 }
 
