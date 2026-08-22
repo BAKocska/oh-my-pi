@@ -17,7 +17,13 @@ pub mod chromium;
 pub mod firefox;
 pub mod ws;
 
-use std::{io::Cursor, path::Path, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{
+	io::Cursor,
+	path::{Path, PathBuf},
+	sync::Arc,
+	thread::JoinHandle,
+	time::Duration,
+};
 
 use bytes::Bytes;
 use omp_core::{IntoStr, Str, encoding::base64, sf};
@@ -44,6 +50,29 @@ pub enum Command {
 		js:    Str,
 		/// Result callback, invoked on the driver thread.
 		reply: Option<Box<dyn FnOnce(Str) + Send>>,
+	},
+	/// Return the engine's native accessibility tree.
+	AccessibilityTree {
+		/// Completion channel.
+		reply: flume::Sender<Result<serde_json::Value>>,
+	},
+	/// Set local files on a file-input element.
+	UploadFiles {
+		/// JavaScript expression resolving to the input element.
+		element: Str,
+		/// Canonical local paths supplied by the host.
+		paths:   Vec<PathBuf>,
+		/// Completion channel.
+		reply:   flume::Sender<Result<()>>,
+	},
+	/// Capture a PNG screenshot, optionally clipped or beyond the viewport.
+	Screenshot {
+		/// CSS-pixel clip `[x, y, width, height]`.
+		clip:      Option<[f64; 4]>,
+		/// Capture the full document.
+		full_page: bool,
+		/// Completion channel.
+		reply:     flume::Sender<Result<Bytes>>,
 	},
 	/// History back.
 	Back,
@@ -87,10 +116,31 @@ pub struct RemoteView {
 	thread:   Option<JoinHandle<()>>,
 }
 
+/// Cross-thread cancellation handle for a remote browser surface.
+#[derive(Clone)]
+pub struct CloseHandle {
+	commands: flume::Sender<Command>,
+}
+
+impl CloseHandle {
+	/// Request immediate bounded browser shutdown.
+	pub fn close(&self) -> Result<()> {
+		self
+			.commands
+			.send(Command::Close)
+			.map_err(|_| Error::Closed)
+	}
+}
+
 impl RemoteView {
 	/// Send a command to the driver; [`Error::Closed`] once it has exited.
 	pub fn send(&self, cmd: Command) -> Result<()> {
 		self.commands.send(cmd).map_err(|_| Error::Closed)
+	}
+
+	/// Clone a cancellation-only handle.
+	pub fn close_handle(&self) -> CloseHandle {
+		CloseHandle { commands: self.commands.clone() }
 	}
 }
 

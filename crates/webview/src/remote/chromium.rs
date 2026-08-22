@@ -325,11 +325,23 @@ async fn wire_page(cdp: &mut Cdp, page: &PageOptions) -> Result<()> {
 		.await?;
 	cdp.cmd("Page.addScriptToEvaluateOnNewDocument", json!({ "source": IPC_SHIM }))
 		.await?;
+	if !page.headers.is_empty() {
+		let headers = page
+			.headers
+			.iter()
+			.map(|(name, value)| (name.to_string(), Value::String(value.to_string())))
+			.collect::<serde_json::Map<_, _>>();
+		cdp.cmd("Network.enable", json!({})).await?;
+		cdp.cmd("Network.setExtraHTTPHeaders", json!({ "headers": headers }))
+			.await?;
+	}
 	for script in &page.init_scripts {
 		cdp.cmd("Page.addScriptToEvaluateOnNewDocument", json!({ "source": &**script }))
 			.await?;
 	}
-	cdp.cmd("Page.enable", json!({})).await.map(drop)
+	cdp.cmd("Page.enable", json!({})).await?;
+	cdp.cmd("DOM.enable", json!({})).await?;
+	cdp.cmd("Accessibility.enable", json!({})).await.map(drop)
 }
 
 /// Live CDP connection driving one page target.
@@ -513,6 +525,13 @@ impl Cdp {
 				.await
 				.map(drop),
 			Command::Eval { js, reply } => return self.eval(&js, reply).await,
+			Command::AccessibilityTree { reply } => return self.accessibility_tree(reply).await,
+			Command::UploadFiles { element, paths, reply } => {
+				return self.upload_files(&element, &paths, reply).await;
+			},
+			Command::Screenshot { clip, full_page, reply } => {
+				return self.screenshot(clip, full_page, reply).await;
+			},
 			Command::Back => self.history_step(-1).await,
 			Command::Forward => self.history_step(1).await,
 			Command::Reload => self.cmd("Page.reload", json!({})).await.map(drop),
@@ -562,6 +581,141 @@ impl Cdp {
 	}
 
 	/// Step through session history; a no-op at either history edge.
+	async fn accessibility_tree(&mut self, reply: flume::Sender<Result<Value>>) -> Result<()> {
+		match self
+			.cmd("Accessibility.getFullAXTree", json!({ "depth": -1 }))
+			.await
+		{
+			Ok(value) => {
+				let _ = reply.send(Ok(value));
+				Ok(())
+			},
+			Err(Error::Protocol(message)) => {
+				let _ = reply.send(Err(Error::Protocol(message)));
+				Ok(())
+			},
+			Err(error) => Err(error),
+		}
+	}
+
+	async fn upload_files(
+		&mut self,
+		element: &str,
+		paths: &[std::path::PathBuf],
+		reply: flume::Sender<Result<()>>,
+	) -> Result<()> {
+		let result = async {
+			let evaluated = self
+				.cmd(
+					"Runtime.evaluate",
+					json!({
+						"expression": element,
+						"returnByValue": false,
+						"awaitPromise": true,
+					}),
+				)
+				.await?;
+			let object_id = evaluated
+				.pointer("/result/objectId")
+				.and_then(Value::as_str)
+				.ok_or_else(|| Error::Protocol("file input selector did not resolve".to_str()))?;
+			let described = self
+				.cmd("DOM.describeNode", json!({ "objectId": object_id }))
+				.await?;
+			let backend_node_id = described
+				.pointer("/node/backendNodeId")
+				.and_then(Value::as_u64)
+				.ok_or_else(|| Error::Protocol("file input has no backend node id".to_str()))?;
+			let files = paths
+				.iter()
+				.map(|path| path.to_string_lossy().into_owned())
+				.collect::<Vec<_>>();
+			self
+				.cmd(
+					"DOM.setFileInputFiles",
+					json!({ "files": files, "backendNodeId": backend_node_id }),
+				)
+				.await
+				.map(drop)
+		}
+		.await;
+		match result {
+			Ok(()) => {
+				let _ = reply.send(Ok(()));
+				Ok(())
+			},
+			Err(Error::Protocol(message)) => {
+				let _ = reply.send(Err(Error::Protocol(message)));
+				Ok(())
+			},
+			Err(error) => Err(error),
+		}
+	}
+
+	async fn screenshot(
+		&mut self,
+		mut clip: Option<[f64; 4]>,
+		full_page: bool,
+		reply: flume::Sender<Result<bytes::Bytes>>,
+	) -> Result<()> {
+		let result = async {
+			if full_page {
+				let metrics = self.cmd("Page.getLayoutMetrics", json!({})).await?;
+				let size = metrics
+					.get("cssContentSize")
+					.or_else(|| metrics.get("contentSize"))
+					.ok_or_else(|| Error::Protocol("layout metrics omitted content size".to_str()))?;
+				clip = Some([
+					size.get("x").and_then(Value::as_f64).unwrap_or_default(),
+					size.get("y").and_then(Value::as_f64).unwrap_or_default(),
+					size
+						.get("width")
+						.and_then(Value::as_f64)
+						.unwrap_or_default(),
+					size
+						.get("height")
+						.and_then(Value::as_f64)
+						.unwrap_or_default(),
+				]);
+			}
+			let mut params = json!({
+				"format": "png",
+				"captureBeyondViewport": full_page || clip.is_some(),
+				"fromSurface": true,
+			});
+			if let Some([x, y, width, height]) = clip {
+				params["clip"] = json!({
+					"x": x,
+					"y": y,
+					"width": width,
+					"height": height,
+					"scale": 1,
+				});
+			}
+			let captured = self.cmd("Page.captureScreenshot", params).await?;
+			let data = captured
+				.get("data")
+				.and_then(Value::as_str)
+				.ok_or_else(|| Error::Protocol("screenshot omitted image data".to_str()))?;
+			base64::decode(data)
+				.into_vec()
+				.map(bytes::Bytes::from)
+				.map_err(|source| Error::ScreencastFrameBase64 { source })
+		}
+		.await;
+		match result {
+			Ok(bytes) => {
+				let _ = reply.send(Ok(bytes));
+				Ok(())
+			},
+			Err(Error::Protocol(message)) => {
+				let _ = reply.send(Err(Error::Protocol(message)));
+				Ok(())
+			},
+			Err(error) => Err(error),
+		}
+	}
+
 	async fn history_step(&mut self, delta: i64) -> Result<()> {
 		let history = self.cmd("Page.getNavigationHistory", json!({})).await?;
 		let current = history

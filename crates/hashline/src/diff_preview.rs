@@ -1,7 +1,7 @@
 //! Compact current-coordinate previews for numbered exact-edit diffs.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, HashSet},
 	fmt::Write as _,
 	path::Path,
 	str::Utf8Error,
@@ -141,6 +141,107 @@ pub fn numbered_diff(
 	}
 	let text = add_structural_context(text.freeze(), &base, &current, path);
 	Ok(NumberedDiff { text, added_lines, removed_lines })
+}
+/// Append-only view of successive Myers diffs for one pinned document revision.
+///
+/// Streaming edit arguments are append-only, but a fresh Myers alignment can
+/// move an already visible row when a later complete operation supplies more
+/// context. This window retains every row it has exposed and appends only rows
+/// first observed in a later alignment. Callers must advance it only after the
+/// parser reports another complete operation; an incomplete trailing operation
+/// therefore cannot appear as a committed change.
+#[derive(Clone, Default)]
+pub struct PinnedMyersWindow {
+	revision:      Option<Str>,
+	text:          StrMut,
+	rows:          HashSet<Str>,
+	added_lines:   usize,
+	removed_lines: usize,
+}
+
+impl PinnedMyersWindow {
+	/// Creates an empty streaming window.
+	#[must_use]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Advances the window from the latest complete candidate.
+	///
+	/// A different `revision` starts a new window because row coordinates from
+	/// the prior base are no longer meaningful. For one revision, the returned
+	/// text is prefix-monotonic: bytes previously returned by
+	/// [`text`](Self::text) are never changed or removed.
+	///
+	/// # Errors
+	/// Returns the UTF-8 fault from [`numbered_diff`].
+	pub fn advance(
+		&mut self,
+		revision: &str,
+		base: &[u8],
+		current: &[u8],
+		path: Option<&Path>,
+	) -> Result<bool, Utf8Error> {
+		let diff = numbered_diff(base, current, path)?;
+		if self.revision.as_deref() != Some(revision) {
+			self.reset(Str::new(revision));
+		}
+
+		self.added_lines = diff.added_lines;
+		self.removed_lines = diff.removed_lines;
+		let has_novel_change = diff
+			.text
+			.lines()
+			.any(|row| is_change_row(row) && !self.rows.contains(row));
+		if !has_novel_change {
+			return Ok(false);
+		}
+
+		let initial_len = self.text.len();
+		for row in diff.text.lines() {
+			if self.rows.contains(row) {
+				continue;
+			}
+			if !self.text.is_empty() {
+				self.text.push('\n');
+			}
+			self.text.push_str(row);
+			self.rows.insert(Str::new(row));
+		}
+		Ok(self.text.len() != initial_len)
+	}
+
+	/// Exact append-only numbered rows currently retained by the window.
+	#[must_use]
+	pub fn text(&self) -> &str {
+		self.text.as_str()
+	}
+
+	/// Number of distinct rows retained across the streamed alignments.
+	#[must_use]
+	pub fn row_count(&self) -> usize {
+		self.rows.len()
+	}
+
+	/// Exact number of added rows in the latest complete candidate.
+	#[must_use]
+	pub const fn added_lines(&self) -> usize {
+		self.added_lines
+	}
+
+	/// Exact number of removed rows in the latest complete candidate.
+	#[must_use]
+	pub const fn removed_lines(&self) -> usize {
+		self.removed_lines
+	}
+
+	fn reset(&mut self, revision: Str) {
+		self.revision = Some(revision);
+		self.text = StrMut::default();
+		self.rows.clear();
+		self.added_lines = 0;
+		self.removed_lines = 0;
+	}
 }
 
 fn add_structural_context(text: Str, base: &str, current: &str, path: Option<&Path>) -> Str {
@@ -638,6 +739,56 @@ mod tests {
 		});
 		assert_eq!(preview.preview, "3:x\n4:y\n5:z");
 	}
+	#[test]
+	fn pinned_myers_window_is_prefix_monotonic_across_complete_fragments() {
+		let base = b"alpha\nsame\nsame\nomega\n";
+		let mut window = PinnedMyersWindow::new();
+		assert!(
+			window
+				.advance("rev-1", base, b"alpha\nFIRST\nsame\nomega\n", None)
+				.unwrap()
+		);
+		let first = window.text().to_owned();
+		assert!(
+			window
+				.advance("rev-1", base, b"prefix\nalpha\nFIRST\nsame\nomega\n", None,)
+				.unwrap()
+		);
+		assert!(window.text().starts_with(&first));
+		assert!(window.text().len() > first.len());
+		assert_eq!((window.added_lines(), window.removed_lines()), (2, 1));
+	}
+
+	#[test]
+	fn pinned_myers_window_ignores_repeated_and_incomplete_candidates() {
+		let base = b"one\ntwo\nthree\n";
+		let current = b"one\nTWO\nthree\n";
+		let mut window = PinnedMyersWindow::new();
+		window.advance("rev-1", base, current, None).unwrap();
+		let complete = window.text().to_owned();
+		assert!(!window.advance("rev-1", base, current, None).unwrap());
+		assert_eq!(window.text(), complete);
+		assert!(
+			!window
+				.advance("rev-1", base, b"one\ntwo\nthree\n", None)
+				.unwrap()
+		);
+		assert_eq!(window.text(), complete);
+	}
+
+	#[test]
+	fn pinned_myers_window_resets_on_revision_change() {
+		let mut window = PinnedMyersWindow::new();
+		window.advance("rev-1", b"a\nb\n", b"a\nB\n", None).unwrap();
+		assert!(window.text().contains("+2|B"));
+		let retained = window.text().to_owned();
+		assert!(window.advance("rev-2", b"x\n", b"\xff", None).is_err());
+		assert_eq!(window.text(), retained);
+		window.advance("rev-2", b"x\ny\n", b"x\nY\n", None).unwrap();
+		assert!(!window.text().contains("+2|B"));
+		assert!(window.text().contains("+2|Y"));
+	}
+
 	#[test]
 	fn numbered_replacement_has_true_counts_and_context() {
 		let diff = numbered_diff(b"alpha\nold\nomega\n", b"alpha\nnew\nomega\n", None).unwrap();

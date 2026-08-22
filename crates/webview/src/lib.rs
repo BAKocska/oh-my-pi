@@ -60,6 +60,7 @@
 //! The `OMP_WEBVIEW_BROWSER` environment variable (path to a browser binary)
 //! overrides [`Engine::find`]'s discovery for remote surfaces.
 
+pub mod automation;
 mod discover;
 mod error;
 mod event;
@@ -86,6 +87,7 @@ pub use crate::{
 	geometry::Rect,
 	input::{Input, Key, Modifiers, MouseButton},
 	options::{EngineKind, FrameConfig, FrameFormat, SurfaceKind, WindowConfig},
+	remote::CloseHandle,
 };
 use crate::{
 	event::SharedState,
@@ -217,6 +219,12 @@ impl WebViewBuilder {
 	/// Custom user-agent string.
 	pub fn user_agent(mut self, ua: impl IntoStr) -> Self {
 		self.page.user_agent = Some(ua.to_str());
+		self
+	}
+
+	/// Add a public HTTP header to remote page navigations.
+	pub fn header(mut self, name: impl IntoStr, value: impl IntoStr) -> Self {
+		self.page.headers.push((name.to_str(), value.to_str()));
 		self
 	}
 
@@ -541,6 +549,15 @@ impl WebView {
 	/// Last observed document title.
 	pub fn title(&self) -> Str {
 		self.state.lock().title.clone()
+	}
+
+	/// Return a cross-thread cancellation handle for a remote surface.
+	pub fn close_handle(&self) -> Option<CloseHandle> {
+		match &self.inner {
+			Inner::Remote(view) => Some(view.close_handle()),
+			#[cfg(target_os = "macos")]
+			Inner::Wk(_) | Inner::WkFrames(_) => None,
+		}
 	}
 
 	/// Event stream; clone the receiver to consume from another thread.

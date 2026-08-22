@@ -57,6 +57,9 @@ pub enum Error {
 	#[error("png: {0}")]
 	Png(#[source] png::DecodingError),
 
+	/// A captured RGBA frame could not be encoded as PNG.
+	#[error("png encode: {0}")]
+	PngEncode(#[source] png::EncodingError),
 	/// A websocket message contained malformed JSON.
 	#[error("malformed message: {0}")]
 	MalformedMessage(#[from] serde_json::Error),

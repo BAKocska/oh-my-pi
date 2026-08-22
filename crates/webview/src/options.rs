@@ -39,6 +39,8 @@ pub struct PageOptions {
 	pub html:         Option<Str>,
 	/// Custom user-agent string.
 	pub user_agent:   Option<Str>,
+	/// Public HTTP headers applied to remote page navigations.
+	pub headers:      Vec<(Str, Str)>,
 	/// Transparent page background.
 	pub transparent:  bool,
 	/// Solid background color (RGBA), ignored when `transparent`.

@@ -499,6 +499,20 @@ impl Driver {
 			Command::Navigate(url) => self.navigate(link, &url).await,
 			Command::LoadHtml(html) => self.navigate(link, &data_url(&html)).await,
 			Command::Eval { js, reply } => self.eval(link, &js, reply).await,
+			Command::AccessibilityTree { reply } => {
+				let _ = reply
+					.send(Err(Error::Unsupported("native accessibility snapshots require Chromium")));
+				Ok(())
+			},
+			Command::UploadFiles { reply, .. } => {
+				let _ = reply.send(Err(Error::Unsupported("file upload requires Chromium CDP")));
+				Ok(())
+			},
+			Command::Screenshot { reply, .. } => {
+				let _ =
+					reply.send(Err(Error::Unsupported("direct PNG screenshots require Chromium CDP")));
+				Ok(())
+			},
 			Command::Back => self.traverse(link, -1).await,
 			Command::Forward => self.traverse(link, 1).await,
 			Command::Reload => self
