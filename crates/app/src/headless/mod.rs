@@ -304,6 +304,21 @@ impl HeadlessSession {
 	) -> Result<AgentRunSummary, omp_sdk::SessionHandleError> {
 		self.session.submit(items, turn_id).await
 	}
+	/// Rewinds and resubmits the latest durable user turn.
+	pub async fn retry_last_turn(
+		&self,
+		turn_id: TurnId,
+	) -> Result<Option<(Vec<Item>, Str, AgentRunSummary)>, omp_sdk::SessionHandleError> {
+		self.session.retry_last_turn(turn_id).await
+	}
+
+	/// Executes and durably commits one manual compaction.
+	pub async fn compact_manual(
+		&self,
+		request: omp_agent::ManualCompactionRequest,
+	) -> Result<omp_agent::ManualCompactionOutcome, omp_sdk::SessionHandleError> {
+		self.session.compact_manual(request).await
+	}
 
 	/// Returns the durable session identifier.
 	pub fn session_id(&self) -> &str {
@@ -334,6 +349,10 @@ impl HeadlessSession {
 		backend: Option<Arc<dyn crate::envd::docs::AcpDocumentBackend>>,
 	) {
 		self._environment.bind_acp_documents(backend);
+	}
+	/// Replaces the session environment's ask presentation bridge.
+	pub(crate) fn bind_ask_presenter(&self, presenter: Arc<dyn omp_tools::ask::AskPresenter>) {
+		self._environment.bind_ask_presenter(presenter);
 	}
 
 	/// Binds or clears the durable approval authority.

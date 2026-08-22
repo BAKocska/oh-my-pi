@@ -61,6 +61,8 @@ const EMBEDDED_TEXT_LIMIT: usize = 4_000;
 enum AcpPromptIntercept {
 	Prompt(Str),
 	Consumed,
+	Retry,
+	Handoff(Option<Str>),
 	Exit,
 }
 
@@ -244,6 +246,38 @@ struct AcpSession {
 struct AcpDocumentBridge {
 	runtime:    Weak<Runtime>,
 	session_id: Str,
+}
+
+#[derive(Clone)]
+struct AcpAskPresenter {
+	runtime:    Weak<Runtime>,
+	session_id: Str,
+}
+
+impl omp_tools::ask::AskPresenter for AcpAskPresenter {
+	fn present(
+		&self,
+		questions: &[omp_tools::ask::Question],
+	) -> Result<omp_tools::ask::Presentation, omp_tools::ask::Fault> {
+		let runtime = self.runtime.upgrade().ok_or_else(|| ask_fault("ACP peer disconnected"))?;
+		let params = ask_elicitation_params(&self.session_id, questions);
+		let handle = tokio::runtime::Handle::current();
+		let response = tokio::task::block_in_place(|| {
+			handle.block_on(runtime.peer_request("session/unstable_createElicitation", params))
+		})
+		.map_err(|error| omp_tools::ask::Fault::Presenter {
+			message: Str::from(error.to_string()),
+		})?;
+		let accepted = response.get("action").and_then(Value::as_str) == Some("accept");
+		let content = response.get("content").and_then(Value::as_object);
+		if !accepted || content.is_none() {
+			return Err(ask_fault("Ask dialog was dismissed"));
+		}
+		Ok(omp_tools::ask::Presentation {
+			answers:  ask_answers(questions, content.expect("checked form content")),
+			headless: false,
+		})
+	}
 }
 
 impl AcpDocumentBackend for AcpDocumentBridge {
@@ -1041,7 +1075,8 @@ impl Runtime {
 				.is_some_and(|value| value.as_bool().unwrap_or(value.is_object())),
 			elicitation:     client
 				.and_then(|value| value.get("elicitation"))
-				.is_some_and(|value| value.as_bool().unwrap_or(value.is_object())),
+				.and_then(Value::as_object)
+				.is_some_and(|value| value.contains_key("form")),
 		};
 		let mut auth = vec![json!({"id":"none","name":"Configured credentials"})];
 		if state.terminal_auth {
@@ -1166,6 +1201,12 @@ impl Runtime {
 		}
 		headless.set_thinking(reasoning_for(&thinking));
 		let session_id = Str::from(headless.session_id());
+		if capabilities.elicitation {
+			headless.bind_ask_presenter(Arc::new(AcpAskPresenter {
+				runtime:    Arc::downgrade(self),
+				session_id: session_id.clone(),
+			}));
+		}
 		let replay = replay_updates(headless.initial_items(), &root);
 		let events = headless
 			.take_events()
@@ -2004,6 +2045,12 @@ impl Runtime {
 				self.command_output(session_id, sf!("Mode changed to {mode}."))?;
 				return Ok(Some(AcpPromptIntercept::Consumed));
 			},
+			"retry" if args.is_empty() => return Ok(Some(AcpPromptIntercept::Retry)),
+			"handoff" => {
+				return Ok(Some(AcpPromptIntercept::Handoff(
+					(!args.is_empty()).then(|| Str::from(args)),
+				)));
+			},
 			"quit" | "exit" => return Ok(Some(AcpPromptIntercept::Exit)),
 			_ => {},
 		}
@@ -2047,24 +2094,37 @@ impl Runtime {
 		if parts.is_empty() {
 			return Err(miette!("prompt contains no supported content"));
 		}
-		if parts.len() == 1
-			&& let ContentPart::Text { text, .. } = &parts[0]
-			&& let Some(intercept) = self.intercept_prompt(&session_id, text.as_str()).await?
-		{
+		loop {
+			let Some(text) = parts.as_slice().first().and_then(|part| match part {
+				ContentPart::Text { text, .. } if parts.len() == 1 => Some(text.clone()),
+				_ => None,
+			}) else {
+				break;
+			};
+			let Some(intercept) = self.intercept_prompt(&session_id, text.as_str()).await? else {
+				break;
+			};
 			match intercept {
 				AcpPromptIntercept::Prompt(prompt) => {
 					parts = vec![ContentPart::Text { text: prompt, proof: None }];
 				},
 				AcpPromptIntercept::Consumed => {
-					self.respond(request_id, json!({"stopReason":"end_turn","command":true}))?;
+					self.respond(request_id, prompt_settlement("end_turn", true))?;
+					return Ok(());
+				},
+				AcpPromptIntercept::Retry => {
+					self.start_retry(request_id, session_id)?;
+					return Ok(());
+				},
+				AcpPromptIntercept::Handoff(instructions) => {
+					self.start_handoff(request_id, session_id, instructions)?;
 					return Ok(());
 				},
 				AcpPromptIntercept::Exit => {
 					let _ = self.close_session(&params).await;
-					self.respond(
-						request_id,
-						json!({"stopReason":"end_turn","command":true,"exit":true}),
-					)?;
+					let mut response = prompt_settlement("end_turn", true);
+					response["exit"] = json!(true);
+					self.respond(request_id, response)?;
 					return Ok(());
 				},
 			}
@@ -2105,7 +2165,7 @@ impl Runtime {
 			runtime.state.lock().active.remove(&session_id);
 			match result {
 				Ok(reason) => {
-					let _ = runtime.respond(request_id, json!({"stopReason":reason}));
+					let _ = runtime.respond(request_id, prompt_settlement(reason, false));
 				},
 				Err(error) => {
 					let _ = runtime.error(request_id, -32000, error.to_string());
@@ -2113,6 +2173,163 @@ impl Runtime {
 			}
 		});
 		Ok(())
+	}
+
+	fn start_retry(self: &Arc<Self>, request_id: Value, session_id: Str) -> miette::Result<()> {
+		let cancellation = CancellationToken::new();
+		let session = self.claim_turn(&session_id, &cancellation)?;
+		let runtime = Arc::clone(self);
+		tokio::spawn(async move {
+			let result = runtime
+				.run_retry_command(&session_id, session, cancellation)
+				.await;
+			runtime.state.lock().active.remove(&session_id);
+			match result {
+				Ok((reason, status)) => {
+					if let Some(status) = status {
+						let _ = runtime.command_output(&session_id, status);
+					}
+					let _ = runtime.respond(request_id, prompt_settlement(reason, true));
+				},
+				Err(error) => {
+					let _ = runtime.error(request_id, -32000, error.to_string());
+				},
+			}
+		});
+		Ok(())
+	}
+
+	fn start_handoff(
+		self: &Arc<Self>,
+		request_id: Value,
+		session_id: Str,
+		instructions: Option<Str>,
+	) -> miette::Result<()> {
+		let cancellation = CancellationToken::new();
+		let session = self.claim_turn(&session_id, &cancellation)?;
+		let runtime = Arc::clone(self);
+		tokio::spawn(async move {
+			let result = runtime
+				.run_handoff_command(&session_id, session, instructions, cancellation)
+				.await;
+			runtime.state.lock().active.remove(&session_id);
+			match result {
+				Ok((reason, status)) => {
+					if let Some(status) = status {
+						let _ = runtime.command_output(&session_id, status);
+					}
+					let _ = runtime.respond(request_id, prompt_settlement(reason, true));
+				},
+				Err(error) => {
+					let _ = runtime.error(request_id, -32000, error.to_string());
+				},
+			}
+		});
+		Ok(())
+	}
+
+	fn claim_turn(
+		&self,
+		session_id: &Str,
+		cancellation: &CancellationToken,
+	) -> miette::Result<Arc<AcpSession>> {
+		let mut state = self.state.lock();
+		if state.active.contains_key(session_id) {
+			return Err(miette!("session is busy"));
+		}
+		let session = state
+			.sessions
+			.get(session_id)
+			.cloned()
+			.ok_or_else(|| miette!("unknown session `{session_id}`"))?;
+		state
+			.active
+			.insert(session_id.clone(), cancellation.clone());
+		Ok(session)
+	}
+
+	async fn run_retry_command(
+		&self,
+		session_id: &Str,
+		session: Arc<AcpSession>,
+		cancellation: CancellationToken,
+	) -> miette::Result<(&'static str, Option<Str>)> {
+		let headless = session.headless.lock().await;
+		let interrupt = headless.interrupt_handle();
+		let retry =
+			headless.retry_last_turn(omp_agent::TurnId::new(format!("retry-{}", turn_id())));
+		tokio::pin!(retry);
+		let mut interrupted = false;
+		let result = loop {
+			tokio::select! {
+				result = &mut retry => break result,
+				event = session.events.recv() => {
+					if let Ok(event) = event {
+						self.deliver_event(session_id, &session, &event)?;
+					}
+				},
+				() = cancellation.cancelled(), if !interrupted => {
+					interrupted = true;
+					interrupt.interrupt();
+				},
+			}
+		};
+		self.drain_deliveries(session_id, &session).await?;
+		if interrupted || cancellation.is_cancelled() {
+			return Ok(("cancelled", None));
+		}
+		Ok(match result {
+			Ok(Some((_, _, summary))) => {
+				for update in session.mapper.lock().final_delivery(&summary) {
+					self.update(session_id, update)?;
+				}
+				("end_turn", Some(sf!("Retrying the last failed turn.")))
+			},
+			Ok(None) => ("end_turn", Some(sf!("Nothing to retry."))),
+			Err(error) => ("end_turn", Some(sf!("Retry failed: {error}"))),
+		})
+	}
+
+	async fn run_handoff_command(
+		&self,
+		session_id: &Str,
+		session: Arc<AcpSession>,
+		instructions: Option<Str>,
+		cancellation: CancellationToken,
+	) -> miette::Result<(&'static str, Option<Str>)> {
+		let headless = session.headless.lock().await;
+		let interrupt = headless.interrupt_handle();
+		let handoff = headless.compact_manual(omp_agent::ManualCompactionRequest {
+			mode: None,
+			focus: instructions,
+		});
+		tokio::pin!(handoff);
+		let mut interrupted = false;
+		let result = loop {
+			tokio::select! {
+				result = &mut handoff => break result,
+				event = session.events.recv() => {
+					if let Ok(event) = event {
+						self.deliver_event(session_id, &session, &event)?;
+					}
+				},
+				() = cancellation.cancelled(), if !interrupted => {
+					interrupted = true;
+					interrupt.interrupt();
+				},
+			}
+		};
+		self.drain_deliveries(session_id, &session).await?;
+		if interrupted || cancellation.is_cancelled() {
+			return Ok(("cancelled", None));
+		}
+		Ok(match result {
+			Ok(_) => (
+				"end_turn",
+				Some(sf!("Context handed off and compacted in place.")),
+			),
+			Err(error) => ("end_turn", Some(sf!("Handoff failed: {error}"))),
+		})
 	}
 
 	async fn run_prompt(
@@ -2337,6 +2554,14 @@ fn map_settlement(summary: &AgentRunSummary) -> &'static str {
 		RunSettlement::MaxTokens => "max_tokens",
 		RunSettlement::TerminalFault => "refusal",
 	}
+}
+
+fn prompt_settlement(reason: &str, command: bool) -> Value {
+	let mut response = json!({"stopReason":reason});
+	if command {
+		response["command"] = json!(true);
+	}
+	response
 }
 
 fn prompt_items(parts: Vec<ContentPart>) -> Vec<Item> {
@@ -2854,6 +3079,130 @@ fn clamp_thinking_level(model: &str, requested: &str) -> miette::Result<&'static
 	Ok(<&'static str>::from(effective))
 }
 
+fn ask_elicitation_params(session_id: &str, questions: &[omp_tools::ask::Question]) -> Value {
+	let message = if questions.len() == 1 {
+		questions[0].question.to_string()
+	} else {
+		format!("Answer {} questions", questions.len())
+	};
+	json!({
+		"sessionId":session_id,
+		"mode":"form",
+		"message":message,
+		"requestedSchema":ask_elicitation_schema(questions),
+	})
+}
+
+fn ask_elicitation_schema(questions: &[omp_tools::ask::Question]) -> Value {
+	let mut properties = Map::new();
+	for (index, question) in questions.iter().enumerate() {
+		let key = format!("q{index}");
+		let choices = question
+			.options
+			.iter()
+			.map(|option| {
+				let mut choice = Map::from_iter([
+					("const".into(), json!(option.label)),
+					("title".into(), json!(option.label)),
+				]);
+				if let Some(description) = option
+					.description
+					.as_deref()
+					.map(str::trim)
+					.filter(|value| !value.is_empty())
+				{
+					choice.insert("description".into(), json!(description));
+				}
+				Value::Object(choice)
+			})
+			.collect::<Vec<_>>();
+		let mut property = Map::new();
+		property.insert("type".into(), json!(if question.multi { "array" } else { "string" }));
+		property.insert("title".into(), json!(question.question));
+		if let Some(header) = question
+			.header
+			.as_deref()
+			.map(str::trim)
+			.filter(|value| !value.is_empty())
+		{
+			property.insert("description".into(), json!(header));
+		}
+		if question.multi {
+			property.insert("items".into(), json!({"anyOf":choices}));
+		} else {
+			property.insert("oneOf".into(), Value::Array(choices));
+			if let Some(recommended) = question
+				.recommended
+				.and_then(|recommended| question.options.get(recommended))
+			{
+				property.insert("default".into(), json!(recommended.label));
+			}
+		}
+		if !question.options.is_empty() {
+			properties.insert(key.clone(), Value::Object(property));
+		}
+		properties.insert(
+			format!("{key}__other"),
+			json!({"type":"string","title":omp_tools::ask::OTHER_OPTION}),
+		);
+	}
+	json!({"type":"object","properties":properties})
+}
+
+fn ask_answers(
+	questions: &[omp_tools::ask::Question],
+	content: &Map<String, Value>,
+) -> Vec<omp_tools::ask::Answer> {
+	questions
+		.iter()
+		.enumerate()
+		.map(|(index, question)| {
+			let key = format!("q{index}");
+			let offered = |candidate: &str| {
+				question
+					.options
+					.iter()
+					.any(|option| option.label.as_str() == candidate)
+			};
+			let mut selected = if question.multi {
+				content
+					.get(&key)
+					.and_then(Value::as_array)
+					.into_iter()
+					.flatten()
+					.filter_map(Value::as_str)
+					.filter(|candidate| offered(candidate))
+					.map(Str::from)
+					.collect()
+			} else {
+				content
+					.get(&key)
+					.and_then(Value::as_str)
+					.filter(|candidate| offered(candidate))
+					.map(Str::from)
+					.into_iter()
+					.collect()
+			};
+			if let Some(other) = content
+				.get(&format!("{key}__other"))
+				.and_then(Value::as_str)
+				.map(str::trim)
+				.filter(|value| !value.is_empty())
+			{
+				if !question.multi {
+					selected.clear();
+				}
+				selected.push(Str::from(other));
+			}
+			omp_tools::ask::Answer { id: question.id.clone(), selected, timed_out: false }
+		})
+		.collect()
+}
+
+fn ask_fault(message: &'static str) -> omp_tools::ask::Fault {
+	omp_tools::ask::Fault::Presenter { message: Str::new_static(message) }
+}
+
 fn required_text<'a>(params: &'a Map<String, Value>, name: &str) -> miette::Result<&'a str> {
 	params
 		.get(name)
@@ -2992,6 +3341,124 @@ mod tests {
 		.unwrap();
 		assert_eq!(parts.len(), 4);
 		assert_eq!(updates.len(), 4);
+	}
+	#[test]
+	fn command_prompt_settlements_always_close_the_turn() {
+		assert_eq!(
+			prompt_settlement("end_turn", true),
+			json!({"stopReason":"end_turn","command":true})
+		);
+		assert_eq!(
+			prompt_settlement("cancelled", true),
+			json!({"stopReason":"cancelled","command":true})
+		);
+	}
+
+	#[test]
+	fn ask_elicitation_schema_covers_choice_multi_recommended_and_free_text() {
+		let questions = vec![
+			omp_tools::ask::Question {
+				id:          sf!("approach"),
+				question:    sf!("Which approach?"),
+				header:      Some(sf!("Choose one")),
+				options:     vec![
+					omp_tools::ask::OptionItem {
+						label: sf!("A"),
+						description: Some(sf!("Faster")),
+						preview: None,
+					},
+					omp_tools::ask::OptionItem {
+						label: sf!("B"),
+						description: Some(sf!("Safer")),
+						preview: None,
+					},
+				],
+				multi:       false,
+				recommended: Some(1),
+			},
+			omp_tools::ask::Question {
+				id:          sf!("features"),
+				question:    sf!("Which features?"),
+				header:      None,
+				options:     vec![
+					omp_tools::ask::OptionItem {
+						label: sf!("auth"),
+						description: None,
+						preview: None,
+					},
+					omp_tools::ask::OptionItem {
+						label: sf!("search"),
+						description: None,
+						preview: None,
+					},
+				],
+				multi:       true,
+				recommended: None,
+			},
+		];
+
+		let schema = ask_elicitation_schema(&questions);
+		assert_eq!(
+			schema["properties"]["q0"],
+			json!({
+				"type":"string",
+				"title":"Which approach?",
+				"description":"Choose one",
+				"oneOf":[
+					{"const":"A","title":"A","description":"Faster"},
+					{"const":"B","title":"B","description":"Safer"}
+				],
+				"default":"B"
+			})
+		);
+		assert_eq!(
+			schema["properties"]["q1"],
+			json!({
+				"type":"array",
+				"title":"Which features?",
+				"items":{"anyOf":[
+					{"const":"auth","title":"auth"},
+					{"const":"search","title":"search"}
+				]}
+			})
+		);
+		assert_eq!(
+			schema["properties"]["q0__other"],
+			json!({"type":"string","title":"Other (type your own)"})
+		);
+		assert!(schema.get("required").is_none());
+
+		let answers = ask_answers(
+			&questions,
+			json!({"q0":"A","q0__other":" custom ","q1":["auth","unknown"]})
+				.as_object()
+				.expect("form content"),
+		);
+		assert_eq!(answers[0].selected, vec![sf!("custom")]);
+		assert_eq!(answers[1].selected, vec![sf!("auth")]);
+		assert!(answers.iter().all(|answer| !answer.timed_out));
+		let free_text = omp_tools::ask::Question {
+			id:          sf!("details"),
+			question:    sf!("Explain"),
+			header:      None,
+			options:     Vec::new(),
+			multi:       false,
+			recommended: None,
+		};
+		assert!(omp_tools::ask::validate(std::slice::from_ref(&free_text)).is_ok());
+		let free_schema = ask_elicitation_schema(std::slice::from_ref(&free_text));
+		assert!(free_schema["properties"].get("q0").is_none());
+		assert_eq!(
+			free_schema["properties"]["q0__other"],
+			json!({"type":"string","title":"Other (type your own)"})
+		);
+		let free_answers = ask_answers(
+			&[free_text],
+			json!({"q0__other":"free form"})
+				.as_object()
+				.expect("free-text form content"),
+		);
+		assert_eq!(free_answers[0].selected, vec![sf!("free form")]);
 	}
 
 	#[test]

@@ -4,7 +4,8 @@ use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
 
 use omp_agent::{
 	AbortHandle, Agent, AgentError, AgentEvent, AgentRunSummary, CampaignEntry, CampaignMachine,
-	CampaignSpec, EngageOptions, EngageReceipt, EventSubscription, TurnClient, TurnId,
+	CampaignSpec, EngageOptions, EngageReceipt, EventSubscription, ManualCompactionOutcome,
+	ManualCompactionRequest, TurnClient, TurnId,
 };
 use omp_core::Str;
 use omp_proto::thread::v1::Item;
@@ -136,6 +137,10 @@ pub enum SessionHandleError {
 
 type SubmitFuture<'a> =
 	Pin<Box<dyn Future<Output = Result<AgentRunSummary, AgentError>> + Send + 'a>>;
+type RetryFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<Option<(Vec<Item>, Str, AgentRunSummary)>, AgentError>> + Send + 'a>>;
+type CompactFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<ManualCompactionOutcome, AgentError>> + Send + 'a>>;
 type EngageFuture<'a> = Pin<
 	Box<dyn Future<Output = Result<(EngageReceipt, Vec<CampaignEntry>), AgentError>> + Send + 'a>,
 >;
@@ -144,6 +149,8 @@ type DisengageFuture<'a> =
 
 trait RuntimeDriver: Send {
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a>;
+	fn retry<'a>(&'a mut self, turn_id: TurnId) -> RetryFuture<'a>;
+	fn compact<'a>(&'a mut self, request: ManualCompactionRequest) -> CompactFuture<'a>;
 	fn engage<'a>(
 		&'a mut self,
 		spec: Arc<CampaignSpec>,
@@ -160,6 +167,13 @@ struct AgentRuntime<C: TurnClient + Send + 'static> {
 impl<C: TurnClient + Send + 'static> RuntimeDriver for AgentRuntime<C> {
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a> {
 		Box::pin(self.agent.submit(items, turn_id))
+	}
+	fn retry<'a>(&'a mut self, turn_id: TurnId) -> RetryFuture<'a> {
+		Box::pin(self.agent.retry_last_turn(turn_id))
+	}
+
+	fn compact<'a>(&'a mut self, request: ManualCompactionRequest) -> CompactFuture<'a> {
+		Box::pin(self.agent.compact_manual(request))
 	}
 
 	fn engage<'a>(
@@ -227,6 +241,14 @@ enum Command {
 		items:   Vec<Item>,
 		turn_id: TurnId,
 		reply:   flume::Sender<Result<AgentRunSummary, SessionHandleError>>,
+	},
+	Retry {
+		turn_id: TurnId,
+		reply:   flume::Sender<Result<Option<(Vec<Item>, Str, AgentRunSummary)>, SessionHandleError>>,
+	},
+	Compact {
+		request: ManualCompactionRequest,
+		reply:   flume::Sender<Result<ManualCompactionOutcome, SessionHandleError>>,
 	},
 	EngageCampaign {
 		spec:    Arc<CampaignSpec>,
@@ -359,6 +381,41 @@ impl SessionHandle {
 			.await
 			.map_err(|_| SessionHandleError::Closed)?
 	}
+	/// Rewinds and resubmits the latest durable user turn.
+	pub async fn retry_last_turn(
+		&self,
+		turn_id: TurnId,
+	) -> Result<Option<(Vec<Item>, Str, AgentRunSummary)>, SessionHandleError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.inner
+			.commands
+			.send_async(Command::Retry { turn_id, reply })
+			.await
+			.map_err(|_| SessionHandleError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| SessionHandleError::Closed)?
+	}
+
+	/// Executes and commits one manual compaction on the live agent loop.
+	pub async fn compact_manual(
+		&self,
+		request: ManualCompactionRequest,
+	) -> Result<ManualCompactionOutcome, SessionHandleError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.inner
+			.commands
+			.send_async(Command::Compact { request, reply })
+			.await
+			.map_err(|_| SessionHandleError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| SessionHandleError::Closed)?
+	}
 
 	/// Engages and journals a campaign on the actor-owned agent loop.
 	pub async fn engage_campaign(
@@ -465,6 +522,52 @@ async fn run_handle_actor(
 					.disengage(engagement, now_ms)
 					.await
 					.map_err(SessionHandleError::from);
+				let _ = reply.send(result);
+			},
+			Command::Retry { turn_id, reply } => {
+				let Some(live) = runtime.as_mut() else {
+					let _ = reply.send(Err(SessionHandleError::NotRevivable));
+					continue;
+				};
+				shared.lifecycle.send_replace(SessionLifecycle::Running);
+				let retry = live.driver.retry(turn_id);
+				tokio::pin!(retry);
+				let result = loop {
+					tokio::select! {
+						result = &mut retry => break result.map_err(SessionHandleError::from),
+						event = live.events.recv() => {
+							let Ok(event) = event else { continue; };
+							publish_event(&shared, event, constructed_at);
+						},
+					}
+				};
+				while let Ok(event) = live.events.try_recv() {
+					publish_event(&shared, event, constructed_at);
+				}
+				shared.lifecycle.send_replace(SessionLifecycle::Ready);
+				let _ = reply.send(result);
+			},
+			Command::Compact { request, reply } => {
+				let Some(live) = runtime.as_mut() else {
+					let _ = reply.send(Err(SessionHandleError::NotRevivable));
+					continue;
+				};
+				shared.lifecycle.send_replace(SessionLifecycle::Running);
+				let compact = live.driver.compact(request);
+				tokio::pin!(compact);
+				let result = loop {
+					tokio::select! {
+						result = &mut compact => break result.map_err(SessionHandleError::from),
+						event = live.events.recv() => {
+							let Ok(event) = event else { continue; };
+							publish_event(&shared, event, constructed_at);
+						},
+					}
+				};
+				while let Ok(event) = live.events.try_recv() {
+					publish_event(&shared, event, constructed_at);
+				}
+				shared.lifecycle.send_replace(SessionLifecycle::Ready);
 				let _ = reply.send(result);
 			},
 			Command::Submit { items, turn_id, reply } => {
