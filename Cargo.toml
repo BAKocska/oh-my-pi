@@ -20,6 +20,9 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 ast-grep-core = { version = "0.39", default-features = false, features = ["tree-sitter"] }
 argmax = "0.3"
 async-recursion = "1.1"
+async-executor = "1.13"
+async-io = "2"
+async-task = "4.7"
 async-stream = "0.3"
 async-trait = "0.1"
 ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
@@ -28,6 +31,7 @@ audiopus_sys = { version = "0.2.2", features = ["static"] }
 bigdecimal = "0.4"
 blake2 = "0.10"
 blake3 = { version = "1.8", features = ["mmap"] }
+blocking = "1.6"
 block2 = "0.6.2"
 bon = "3"
 bstr = "1"
@@ -60,6 +64,7 @@ foreign-types = "=0.5.0"
 fontdb = "0.24"
 fontdue = "0.9"
 futures = "0.3"
+futures-lite = "2"
 globset = "0.4"
 grep-cli = "0.1"
 grep-matcher = "0.1"
@@ -123,6 +128,7 @@ omp-desktop = { path = "crates/desktop", version = "0.1.0" }
 omp-driver = { path = "crates/driver", version = "0.1.0" }
 omp-env = { path = "crates/env", version = "0.1.0" }
 omp-envd = { path = "crates/envd", version = "0.1.0" }
+omp-executor = { path = "crates/executor" }
 omp-ext = { path = "crates/ext", version = "0.1.0" }
 omp-exthost = { path = "crates/exthost", version = "0.1.0" }
 omp-grep = { path = "crates/grep", version = "0.1.0" }
@@ -203,7 +209,6 @@ self_cell = "1"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 serde_yaml = "0.9"
-handlebars = "6.3"
 sha1 = "0.10"
 sha2 = "0.10"
 sherpa-onnx = "1.13.5"
