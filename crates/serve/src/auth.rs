@@ -243,6 +243,19 @@ impl pb::auth_server::Auth for AuthRpc {
 		request: Request<pb::ListCredentialsRequest>,
 	) -> Result<Response<pb::ListCredentialsResponse>, Status> {
 		let request = request.into_inner();
+		if let Some(control) = &self.control {
+			let requested = (!request.provider.is_empty())
+				.then(|| ProviderId::from(request.provider.as_str()));
+			let credentials = control
+				.accounts(requested.as_ref().map(|provider| &**provider))
+				.into_iter()
+				.map(|account| self.control_meta(account))
+				.collect::<Result<Vec<_>, _>>()?;
+			return Ok(Response::new(pb::ListCredentialsResponse {
+				credentials,
+				cursor: None,
+			}));
+		}
 		let provider = self.provider_for(Some(&request.provider))?;
 		let answer = self
 			.execute(provider.clone(), AuthRequest::ListAccounts { provider: Some(provider) })
@@ -365,6 +378,21 @@ impl pb::auth_server::Auth for AuthRpc {
 		&self,
 		request: Request<pb::RefreshCredentialRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
+		if self.control.is_some() {
+			let account = self.control_account(request.get_ref().id)?;
+			self
+				.control()?
+				.refresh(account.clone())
+				.await
+				.map_err(inference_status)?;
+			let record = self
+				.control()?
+				.accounts(None)
+				.into_iter()
+				.find(|record| record.account == account)
+				.ok_or_else(|| Status::not_found("credential not found"))?;
+			return Ok(Response::new(self.control_meta(record)?));
+		}
 		Ok(Response::new(
 			self
 				.account_operation(request.into_inner().id, true)
@@ -376,10 +404,43 @@ impl pb::auth_server::Auth for AuthRpc {
 		&self,
 		request: Request<pb::DeleteCredentialRequest>,
 	) -> Result<Response<pb::DeleteCredentialResponse>, Status> {
+		if self.control.is_some() {
+			let account = self.control_account(request.get_ref().id)?;
+			self
+				.control()?
+				.delete(account)
+				.await
+				.map_err(inference_status)?;
+			return Ok(Response::new(pb::DeleteCredentialResponse {}));
+		}
 		self
 			.account_operation(request.into_inner().id, false)
 			.await?;
 		Ok(Response::new(pb::DeleteCredentialResponse {}))
+	}
+	async fn reveal_credential(
+		&self,
+		request: Request<pb::RevealCredentialRequest>,
+	) -> Result<Response<pb::RevealCredentialResponse>, Status> {
+		let request = request.into_inner();
+		let account = self.control_account(request.id)?;
+		let record = self
+			.control()?
+			.accounts(None)
+			.into_iter()
+			.find(|record| record.account == account)
+			.ok_or_else(|| Status::not_found("credential not found"))?;
+		if record.provider.as_str() != request.provider {
+			return Err(Status::permission_denied(
+				"credential does not belong to the authorized provider",
+			));
+		}
+		let audit = reveal_audit(request);
+		let secret = self
+			.control()?
+			.reveal(&account, &audit, |secret| secret.expose(|bytes| bytes.to_vec()))
+			.map_err(store_status)?;
+		Ok(Response::new(pb::RevealCredentialResponse { secret: secret.into() }))
 	}
 
 	async fn get_usage(
@@ -637,6 +698,18 @@ fn account_meta(account: AccountSummary) -> Result<pb::CredentialMeta, Status> {
 fn parse_account_id(account: &AccountId<str>) -> Result<u64, Status> {
 	Ok(wire_account_id(account))
 }
+fn reveal_audit(request: pb::RevealCredentialRequest) -> omp_inference::auth::AuditedCredentialReveal {
+	omp_inference::auth::AuditedCredentialReveal {
+		extension:          request.extension.into(),
+		caller_principal:   request.caller_principal.into(),
+		provider:           request.provider.into(),
+		host_generation:    request.host_generation,
+		session_generation: request.session_generation,
+		request_id:         request.request_id,
+		reason:             request.reason.into(),
+	}
+}
+
 fn store_status(error: omp_inference::auth::StoreError) -> Status {
 	match error {
 		omp_inference::auth::StoreError::NotFound => Status::not_found(error.to_string()),
@@ -915,6 +988,28 @@ mod tests {
 	};
 
 	use super::{error_class, pb};
+	use super::reveal_audit;
+
+	#[test]
+	fn reveal_rpc_preserves_authenticated_audit_evidence() {
+		let audit = reveal_audit(pb::RevealCredentialRequest {
+			id: 7,
+			provider: "openai".to_owned(),
+			extension: "fixture.extension".to_owned(),
+			caller_principal: "principal".to_owned(),
+			host_generation: 11,
+			session_generation: 13,
+			request_id: 17,
+			reason: "extension_control_reveal".to_owned(),
+		});
+		assert_eq!(audit.extension.as_str(), "fixture.extension");
+		assert_eq!(audit.caller_principal.as_str(), "principal");
+		assert_eq!(audit.provider.as_str(), "openai");
+		assert_eq!(audit.host_generation, 11);
+		assert_eq!(audit.session_generation, 13);
+		assert_eq!(audit.request_id, 17);
+		assert_eq!(audit.reason.as_str(), "extension_control_reveal");
+	}
 
 	#[test]
 	fn credential_probe_failures_keep_typed_http_health() {

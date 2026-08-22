@@ -8,6 +8,7 @@ use std::{
 };
 
 use omp_core::Str;
+use omp_scribe::Props;
 use omp_tool::Registry;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -15,8 +16,7 @@ use tokio::sync::watch;
 use crate::{
 	InterruptedReasoningDialect, TurnOptions,
 	prompt::{
-		CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, WorkspaceInput,
-		render_prompt,
+		CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, render_prompt,
 	},
 };
 
@@ -95,7 +95,7 @@ pub struct AgentSnapshot {
 	/// Live revisioned tools used for advertisement, projection, and execution.
 	pub registry:          Arc<Registry>,
 	/// Immutable workspace and context-file input.
-	pub workspace:         WorkspaceInput,
+	pub props:             Props,
 	/// Synchronous source used to construct the canonical prompt head.
 	pub prompt_source:     Arc<dyn PromptSource>,
 	/// Dialect policy governing hidden continuity after interrupted reasoning.
@@ -111,12 +111,12 @@ pub struct AgentSnapshot {
 impl AgentSnapshot {
 	/// Creates a snapshot with one live registry and the deterministic workspace
 	/// prompt source.
-	pub fn new(turn: TurnOptions, workspace: WorkspaceInput, registry: Arc<Registry>) -> Self {
+	pub fn new(turn: TurnOptions, props: Props, registry: Arc<Registry>) -> Self {
 		Self {
 			turn,
 			enabled_tools: Arc::from([]),
 			registry,
-			workspace,
+			props,
 			prompt_source: Arc::new(CanonicalPromptSource),
 			reasoning_dialect: InterruptedReasoningDialect::Other,
 			defer_interrupts: false,
@@ -128,13 +128,13 @@ impl AgentSnapshot {
 	/// Renders the prompt twice and returns only a deterministic canonical head.
 	#[inline]
 	pub fn render_prompt(&self) -> Result<RenderedPrompt, PromptError> {
-		render_prompt(self.prompt_source.as_ref(), &self.workspace)
+		render_prompt(self.prompt_source.as_ref(), &self.props)
 	}
 }
 
 impl Default for AgentSnapshot {
 	fn default() -> Self {
-		Self::new(TurnOptions::default(), WorkspaceInput::default(), Arc::new(Registry::new()))
+		Self::new(TurnOptions::default(), Props::default(), Arc::new(Registry::new()))
 	}
 }
 
@@ -145,7 +145,7 @@ impl fmt::Debug for AgentSnapshot {
 			.field("turn", &self.turn)
 			.field("enabled_tools", &self.enabled_tools)
 			.field("registry_hash", &self.registry.slot_hash())
-			.field("workspace", &self.workspace)
+			.field("props", &self.props)
 			.field("prompt_source", &format_args!("<dyn PromptSource>"))
 			.field("reasoning_dialect", &self.reasoning_dialect)
 			.field("defer_interrupts", &self.defer_interrupts)

@@ -47,6 +47,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
 [dev-dependencies]
+insta = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

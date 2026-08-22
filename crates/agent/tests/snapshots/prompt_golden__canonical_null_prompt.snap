@@ -1,0 +1,5 @@
+---
+source: crates/agent/tests/prompt_golden.rs
+expression: canonical_snapshot(&null)
+---
+[]

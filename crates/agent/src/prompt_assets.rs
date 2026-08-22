@@ -1,10 +1,8 @@
 //! Compile-time prompt assets used by live auxiliary prompt consumers.
-//!
-//! Core system policy remains in the typed slot renderers. This catalog owns
-//! only immutable auxiliary text and declares the slot stability each consumer
-//! must preserve.
 
-use std::fmt::Write as _;
+use std::sync::OnceLock;
+
+use omp_scribe::{Props, Template};
 
 use crate::{SlotClass, SlotId};
 
@@ -30,7 +28,7 @@ pub enum PromptAssetFamily {
 /// Prompt behavior activated by an explicit user keyword.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptKeywordBehavior {
-	/// Requests the extended-reasoning presentation and policy path.
+	/// Requests extended reasoning.
 	ExtendedThinking,
 	/// Requests multi-agent orchestration.
 	Orchestration,
@@ -58,94 +56,94 @@ pub const PROMPT_KEYWORDS: &[PromptKeyword] = &[
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum PromptAssetId {
-	/// Default terse personality.
+	/// Default personality.
 	PersonalityDefault,
-	/// Friendly collaborative personality.
+	/// Friendly personality.
 	PersonalityFriendly,
-	/// Pragmatic senior-engineer personality.
+	/// Pragmatic personality.
 	PersonalityPragmatic,
-	/// Automatic continuation reminder.
+	/// Automatic continuation.
 	AutoContinue,
-	/// User steering interjection.
+	/// User steering.
 	UserInterjection,
-	/// Parent-agent IRC steering interjection.
+	/// Parent IRC steering.
 	ParentIrc,
-	/// Empty-stop retry recovery.
+	/// Empty-stop recovery.
 	EmptyStopRetry,
-	/// Unexpected-stop retry recovery.
+	/// Unexpected-stop recovery.
 	UnexpectedStopRetry,
-	/// Repeated tool-call loop redirect.
+	/// Tool-loop redirect.
 	ToolCallLoopRedirect,
-	/// Repeated thinking loop redirect.
+	/// Thinking-loop redirect.
 	ThinkingLoopRedirect,
-	/// Gemini tool-call reminder.
+	/// Gemini tool reminder.
 	GeminiToolCallReminder,
-	/// Auxiliary title-generation system prompt.
+	/// Title prompt.
 	TitleSystem,
-	/// Built-in read-only scout definition.
+	/// Scout definition.
 	AgentScout,
-	/// Built-in reviewer definition.
+	/// Reviewer definition.
 	AgentReviewer,
-	/// Built-in security reviewer definition.
+	/// Security reviewer definition.
 	AgentSecurityReviewer,
-	/// Built-in general task definition.
+	/// Task definition.
 	AgentTask,
-	/// Built-in librarian definition.
+	/// Librarian definition.
 	AgentLibrarian,
-	/// Built-in designer definition.
+	/// Designer definition.
 	AgentDesigner,
-	/// Built-in repository initializer definition.
+	/// Initializer definition.
 	AgentInit,
-	/// Read-only planning mode.
+	/// Plan mode.
 	ModePlan,
-	/// Plan-validation prewalk mode.
+	/// Prewalk mode.
 	ModePrewalk,
-	/// Autonomous goal mode.
+	/// Goal mode.
 	ModeGoal,
-	/// Multi-agent orchestration mode.
+	/// Vibe mode.
 	ModeVibe,
-	/// Durable memory pipeline mode.
+	/// Memory pipeline mode.
 	ModeMemoryPipeline,
-	/// Read-only advisor mode.
+	/// Advisor mode.
 	ModeAdvisor,
-	/// Autonomous experiment/research mode.
+	/// Autoresearch mode.
 	ModeAutoresearch,
 	/// Security audit mode.
 	ModeSecurityAudit,
-	/// Reproducible benchmark mode.
+	/// Benchmark mode.
 	ModeBench,
-	/// Change review mode.
+	/// Review mode.
 	ModeReview,
-	/// Generated-residue cleanse mode.
+	/// Cleanse mode.
 	ModeCleanse,
-	/// Context compression mode.
+	/// Compression mode.
 	ModeCompress,
-	/// Live collaborator coordination mode.
+	/// Live collaboration mode.
 	ModeLiveCollab,
 }
 
-/// Immutable asset bytes and their declared prompt placement.
+/// Immutable asset bytes and declared prompt placement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PromptAsset {
 	/// Typed identity.
 	pub id:      PromptAssetId,
-	/// Semantic asset family.
+	/// Semantic family.
 	pub family:  PromptAssetFamily,
-	/// Destination slot when injected into a provider prompt.
+	/// Destination slot.
 	pub slot:    SlotId,
-	/// Stability band required of the consumer.
+	/// Stability band.
 	pub class:   SlotClass,
-	/// Immutable UTF-8 source bytes.
+	/// Immutable UTF-8 source.
 	pub content: &'static str,
 }
 
 macro_rules! asset {
 	($id:ident, $family:ident, $slot:ident, $class:ident, $path:literal) => {
 		PromptAsset {
-			id:      PromptAssetId::$id,
-			family:  PromptAssetFamily::$family,
-			slot:    SlotId::$slot,
-			class:   SlotClass::$class,
+			id: PromptAssetId::$id,
+			family: PromptAssetFamily::$family,
+			slot: SlotId::$slot,
+			class: SlotClass::$class,
 			content: include_str!($path),
 		}
 	};
@@ -154,45 +152,15 @@ macro_rules! asset {
 const ASSETS: [PromptAsset; 32] = [
 	asset!(PersonalityDefault, Personality, Runtime, Stable, "../prompts/personality/default.md"),
 	asset!(PersonalityFriendly, Personality, Runtime, Stable, "../prompts/personality/friendly.md"),
-	asset!(
-		PersonalityPragmatic,
-		Personality,
-		Runtime,
-		Stable,
-		"../prompts/personality/pragmatic.md"
-	),
+	asset!(PersonalityPragmatic, Personality, Runtime, Stable, "../prompts/personality/pragmatic.md"),
 	asset!(AutoContinue, Lifecycle, Status, Volatile, "../prompts/lifecycle/auto-continue.md"),
 	asset!(UserInterjection, Steering, Status, Volatile, "../prompts/steering/user-interjection.md"),
 	asset!(ParentIrc, Steering, Status, Volatile, "../prompts/steering/parent-irc.md"),
 	asset!(EmptyStopRetry, Recovery, Status, Volatile, "../prompts/recovery/empty-stop-retry.md"),
-	asset!(
-		UnexpectedStopRetry,
-		Recovery,
-		Status,
-		Volatile,
-		"../prompts/recovery/unexpected-stop-retry.md"
-	),
-	asset!(
-		ToolCallLoopRedirect,
-		Recovery,
-		Status,
-		Volatile,
-		"../prompts/recovery/tool-call-loop-redirect.md"
-	),
-	asset!(
-		ThinkingLoopRedirect,
-		Recovery,
-		Status,
-		Volatile,
-		"../prompts/recovery/thinking-loop-redirect.md"
-	),
-	asset!(
-		GeminiToolCallReminder,
-		Recovery,
-		Status,
-		Volatile,
-		"../prompts/recovery/gemini-tool-call-reminder.md"
-	),
+	asset!(UnexpectedStopRetry, Recovery, Status, Volatile, "../prompts/recovery/unexpected-stop-retry.md"),
+	asset!(ToolCallLoopRedirect, Recovery, Status, Volatile, "../prompts/recovery/tool-call-loop-redirect.md"),
+	asset!(ThinkingLoopRedirect, Recovery, Status, Volatile, "../prompts/recovery/thinking-loop-redirect.md"),
+	asset!(GeminiToolCallReminder, Recovery, Status, Volatile, "../prompts/recovery/gemini-tool-call-reminder.md"),
 	asset!(TitleSystem, Title, Guidance, Stable, "../prompts/title/system.md"),
 	asset!(AgentScout, Agent, Role, Frozen, "../prompts/roles/scout.md"),
 	asset!(AgentReviewer, Agent, Role, Frozen, "../prompts/roles/reviewer.md"),
@@ -217,15 +185,40 @@ const ASSETS: [PromptAsset; 32] = [
 ];
 
 /// Returns one immutable asset without allocation.
-#[inline]
 pub const fn prompt_asset(id: PromptAssetId) -> &'static PromptAsset {
 	&ASSETS[id as usize]
 }
 
-/// Iterates over the complete deterministic built-in catalog.
-#[inline]
+/// Iterates over the deterministic built-in catalog.
 pub fn prompt_assets() -> impl ExactSizeIterator<Item = &'static PromptAsset> + Clone {
 	ASSETS.iter()
+}
+
+/// Returns the lazily compiled scribe template for one catalog asset.
+pub fn prompt_template(id: PromptAssetId) -> &'static Template {
+	static TEMPLATES: [OnceLock<Template>; ASSETS.len()] =
+		[const { OnceLock::new() }; ASSETS.len()];
+	TEMPLATES[id as usize].get_or_init(|| {
+		let asset = prompt_asset(id);
+		crate::prompt_engine::engine()
+			.compile(asset_name(id), asset.content)
+			.unwrap_or_else(|error| panic!("invalid embedded prompt asset: {error}"))
+	})
+}
+
+fn asset_name(id: PromptAssetId) -> &'static str {
+	const NAMES: [&str; 32] = [
+		"personality/default", "personality/friendly", "personality/pragmatic",
+		"lifecycle/auto-continue", "steering/user-interjection", "steering/parent-irc",
+		"recovery/empty-stop-retry", "recovery/unexpected-stop-retry",
+		"recovery/tool-call-loop-redirect", "recovery/thinking-loop-redirect",
+		"recovery/gemini-tool-call-reminder", "title/system", "roles/scout", "roles/reviewer",
+		"roles/security-reviewer", "roles/task", "roles/librarian", "roles/designer", "roles/init",
+		"modes/plan", "modes/prewalk", "modes/goal", "modes/vibe", "modes/memory-pipeline",
+		"modes/advisor", "modes/autoresearch", "modes/security-audit", "modes/bench",
+		"modes/review", "modes/cleanse", "modes/compress", "modes/live-collab",
+	];
+	NAMES[id as usize]
 }
 
 /// Returns the rich asset selected by a campaign prompt-slot binding.
@@ -249,79 +242,54 @@ pub fn prompt_slot_asset(slot: &str) -> Option<&'static PromptAsset> {
 	Some(prompt_asset(id))
 }
 
-/// Renders the typed retry count into the immutable empty-stop template.
+/// Renders the typed retry count into the empty-stop template.
 pub fn render_empty_stop_retry(out: &mut String, retry_count: usize, max_retries: usize) {
-	const RETRY: &str = "{{retryCount}}";
-	const MAX: &str = "{{maxRetries}}";
-	let template = prompt_asset(PromptAssetId::EmptyStopRetry).content;
-	let (before_retry, after_retry) = template
-		.split_once(RETRY)
-		.expect("embedded empty-stop asset contains retryCount slot");
-	let (between, after_max) = after_retry
-		.split_once(MAX)
-		.expect("embedded empty-stop asset contains maxRetries slot");
-	out.push_str(before_retry);
-	write!(out, "{retry_count}").expect("writing to String cannot fail");
-	out.push_str(between);
-	write!(out, "{max_retries}").expect("writing to String cannot fail");
-	out.push_str(after_max.trim_end());
+	let mut props = Props::new();
+	props.set(crate::prompt_keys::RETRY_COUNT, retry_count);
+	props.set(crate::prompt_keys::MAX_RETRIES, max_retries);
+	render_into(PromptAssetId::EmptyStopRetry, &props, out);
 }
+
 /// Renders one parent-agent steering notice into an existing buffer.
 pub fn render_parent_irc(out: &mut String, from: &str, message: &str) {
-	const FROM: &str = "{{from}}";
-	const MESSAGE: &str = "{{message}}";
-	let template = prompt_asset(PromptAssetId::ParentIrc).content;
-	let (before_from, after_from) = template
-		.split_once(FROM)
-		.expect("embedded parent IRC asset contains from slot");
-	let (between, after_message) = after_from
-		.split_once(MESSAGE)
-		.expect("embedded parent IRC asset contains message slot");
-	out.reserve(template.len() + from.len() + message.len());
-	out.push_str(before_from);
-	out.push_str(from);
-	out.push_str(between);
-	out.push_str(message);
-	out.push_str(after_message);
+	let mut props = Props::new();
+	props.set(crate::prompt_keys::FROM, from.to_owned());
+	props.set(crate::prompt_keys::MESSAGE, message.to_owned());
+	render_into(PromptAssetId::ParentIrc, &props, out);
 }
+
 /// Renders bounded loop evidence into the repeated-tool-call redirect.
 pub fn render_tool_call_loop_redirect(out: &mut String, count: u32, digest: &str) {
-	const TOOL: &str = "{{tool_name}}";
-	const COUNT: &str = "{{count}}";
-	const ARGUMENTS: &str = "{{arguments_summary}}";
-	const RESULT: &str = "{{result_summary}}";
-	let template = prompt_asset(PromptAssetId::ToolCallLoopRedirect).content;
-	let (before_tool, after_tool) = template
-		.split_once(TOOL)
-		.expect("embedded tool-loop asset contains tool_name slot");
-	let (before_count, after_count) = after_tool
-		.split_once(COUNT)
-		.expect("embedded tool-loop asset contains count slot");
-	let (before_arguments, after_arguments) = after_count
-		.split_once(ARGUMENTS)
-		.expect("embedded tool-loop asset contains arguments_summary slot");
-	let (before_result, after_result) = after_arguments
-		.split_once(RESULT)
-		.expect("embedded tool-loop asset contains result_summary slot");
-	let (before_second_tool, after_second_tool) = after_result
-		.split_once(TOOL)
-		.expect("embedded tool-loop asset contains repeated tool_name slot");
-	out.reserve(template.len() + digest.len());
-	out.push_str(before_tool);
-	out.push_str("the same tool");
-	out.push_str(before_count);
-	write!(out, "{count}").expect("writing to String cannot fail");
-	out.push_str(before_arguments);
-	out.push_str(digest);
-	out.push_str(before_result);
-	out.push_str("See the immediately preceding tool result.");
-	out.push_str(before_second_tool);
-	out.push_str("the same tool");
-	out.push_str(after_second_tool);
+	let mut props = Props::new();
+	props.set(crate::prompt_keys::TOOL_NAME, "the same tool");
+	props.set(crate::prompt_keys::COUNT, count);
+	props.set(crate::prompt_keys::ARGUMENTS_SUMMARY, digest.to_owned());
+	props.set(crate::prompt_keys::RESULT_SUMMARY, "See the immediately preceding tool result.");
+	render_into(PromptAssetId::ToolCallLoopRedirect, &props, out);
 }
+
+fn render_into(id: PromptAssetId, props: &Props, out: &mut String) {
+	prompt_template(id)
+		.render(crate::prompt_engine::engine(), props, out)
+		.expect("typed prompt props satisfy the embedded template");
+}
+
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
+
 	use super::*;
+
+	#[test]
+	fn catalog_templates_parse_and_reference_registered_keys() {
+		let keys = crate::prompt_keys::ALL.iter().copied().collect::<HashSet<_>>();
+		for asset in prompt_assets().filter(|asset| asset.id != PromptAssetId::ModeCompress) {
+			let template = prompt_template(asset.id);
+			for key in template.referenced_keys() {
+				assert!(keys.contains(key), "{} references unregistered key {key}", template.name());
+			}
+		}
+	}
 
 	#[test]
 	fn dynamic_assets_replace_every_typed_slot() {
@@ -329,12 +297,10 @@ mod tests {
 		render_parent_irc(&mut parent, "parent", "steer now");
 		assert!(parent.contains("parent"));
 		assert!(parent.contains("steer now"));
-		assert!(!parent.contains("{{"));
 
 		let mut redirect = String::new();
 		render_tool_call_loop_redirect(&mut redirect, 3, "digest:abc");
 		assert!(redirect.contains("3 consecutive"));
 		assert!(redirect.contains("digest:abc"));
-		assert!(!redirect.contains("{{"));
 	}
 }

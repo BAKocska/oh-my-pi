@@ -41,10 +41,13 @@ mod oneshot;
 mod phases;
 mod project;
 mod prompt;
+pub mod prompt_engine;
+pub mod prompt_keys;
 pub mod prompt_assets;
 mod read_only_policy;
 mod revival;
 mod schedule;
+pub mod scheduler;
 mod state;
 mod subagent;
 pub mod tool_choice;
@@ -176,20 +179,22 @@ pub use phases::{
 pub use project::{
 	ProjectionError, project_journal, project_thread_history, tool_result_item,
 	tool_result_item_canonical_parts, truncate_item_for_persistence,
+	render_compaction_summary,
 };
 pub use prompt::{
 	ActiveRepositoryInput, BandHash, CachedContribution, CanonicalPromptSource, ContextFile,
 	ConventionsPromptSource, DeliveryPromptSource, EagerTaskPolicy, HostInfoInput, ModelPromptInput,
 	MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource,
 	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptError, PromptHash,
-	PromptMemoryInput, PromptMemorySlotInput, PromptNamedInput, PromptOut, PromptPatchSet,
+	PromptFacts, PromptMemoryInput, PromptMemorySlotInput, PromptNamedInput, PromptOut, PromptPatchSet,
 	PromptSchemeInput, PromptSettingsInput, PromptSlotSource, PromptSource, PromptToolExampleInput,
 	PromptToolInput, RenderedPrompt, RepositoryInput, RolePromptSource, RuntimePromptSource,
 	SECURITY_REVIEW_INSTRUCTION_V1, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotPatch,
 	SlotRegistration, SlotSource, ToolInventoryMode, VcsIdentity, VolatilePrompt,
-	VolatilePromptJournal, WorkflowPromptSource, WorkspaceInput, WorkspacePromptSource,
-	WorkspaceRootInput, WorkspaceRootsInput, WorkspaceTreeInput, render_prompt,
+	VolatilePromptJournal, WorkflowPromptSource, WorkspacePromptSource, WorkspaceRootInput,
+	WorkspaceRootsInput, WorkspaceTreeInput, render_prompt,
 };
+pub use omp_scribe::Props;
 pub use read_only_policy::is_read_only_agent;
 pub use revival::{RevivalError, RevivedSession, revive, revive_existing};
 pub use schedule::{
@@ -205,7 +210,7 @@ pub use subagent::{
 };
 pub use tree::{
 	AgentAuxiliary, AgentDefinition, AgentDefinitionError, AgentKind, AgentModelPurpose, AgentNode,
-	AgentStatus, AgentTree, AssembledYield, Budget, BudgetCeiling, BudgetExceeded, BudgetRemainder,
+	AgentStatus, AgentTree, AgentTreeLimits, AssembledYield, Budget, BudgetCeiling, BudgetExceeded, BudgetRemainder,
 	DEFAULT_MAX_ADMISSION_QUEUE, DEFAULT_MAX_CONCURRENCY, EffectsOperation,
 	MAX_YIELD_SCHEMA_RETRIES, OutputSchemaResolution, OutputSchemaSource, SpawnPermit, SpawnPolicy,
 	SpawnRefusal, TreeStatistics, Usage, YieldAssembler, YieldAssemblyError, YieldPayload,

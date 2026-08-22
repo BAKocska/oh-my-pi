@@ -206,6 +206,14 @@ impl_scripted_inference! {
 		list_providers: pb::ListProvidersRequest => pb::ListProvidersResponse,
 		list_models: pb::ListModelsRequest => pb::ListModelsResponse,
 		refresh_models: pb::RefreshModelsRequest => pb::ListModelsResponse,
+		provider_catalog: pb::ProviderCatalogRequest => pb::ProviderCatalogResponse,
+		watch_provider_catalog: pb::WatchProviderCatalogRequest => pb::WatchProviderCatalogResponse,
+		provider_authenticated: pb::ProviderAuthenticatedRequest => pb::ProviderAuthenticatedResponse,
+		declare_provider: pb::ProviderDeclarationRequest => pb::ProviderMutationResponse,
+		replace_provider: pb::ProviderDeclarationRequest => pb::ProviderMutationResponse,
+		retract_provider: pb::RetractProviderRequest => pb::ProviderMutationResponse,
+		execute_provider_request: pb::ProviderOperationRequest => pb::ProviderOperationResponse,
+		mint_provider_session: pb::ProviderOperationRequest => pb::ProviderOperationResponse,
 	}
 	stream {
 		realtime: tonic::Streaming<pb::RealtimeFrame> => Self::RealtimeStream,

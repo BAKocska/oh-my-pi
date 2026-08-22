@@ -2083,7 +2083,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let memory = source.snapshot(query);
 			self
 				.state
-				.update(|snapshot| snapshot.workspace.memory = memory);
+				.update(|snapshot| {
+					let values = [
+						("memory", memory.memory.content),
+						("standing", memory.standing.content),
+						("recall", memory.recall.content),
+					]
+					.into_iter()
+					.filter_map(|(name, content)| {
+						content.map(|content| (name, omp_scribe::Value::from(content)))
+					})
+					.collect::<omp_scribe::Value>();
+					snapshot.props.set(crate::prompt_keys::MEMORY, values);
+				});
 		}
 		let snapshot = self.state.snapshot();
 		if let Some(start) = durable.as_ref() {
@@ -2233,8 +2245,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 					ContextProjection::Unchanged(mut thread)
 					| ContextProjection::View { mut thread, .. } => {
 						if let Ok(date) = omp_core::display_time::local_calendar_date(SystemTime::now()) {
-							let cwd = snapshot.workspace.cwd.to_string_lossy();
-							let _ = crate::inject_first_turn_metadata(&mut thread, &date, &cwd);
+							let cwd = snapshot.props
+								.get(crate::prompt_keys::CWD)
+								.and_then(omp_scribe::Value::as_str)
+								.unwrap_or_default();
+							let _ = crate::inject_first_turn_metadata(&mut thread, &date, cwd);
 						}
 						if std::mem::take(&mut self.pending_reasoning_demotion) {
 							let _ = crate::demote_interrupted_reasoning(
@@ -2983,6 +2998,34 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	fn handle_host_control(&mut self, command: AgentHostCommand) {
 		let result = match command.operation.as_str() {
+			"omp.jobs.register" => (|| {
+				let value = command
+					.arguments
+					.get("job")
+					.cloned()
+					.ok_or_else(|| sf!("durable job descriptor is required"))?;
+				let job: omp_tool::JobRef = serde_json::from_value(value)
+					.map_err(|error| sf!("invalid durable job descriptor: {error}"))?;
+				self
+					.journal
+					.register_job(now_ms(), job.clone())
+					.map_err(|error| sf!("durable job journal failed: {error}"))?;
+				self
+					.jobs
+					.reattach(job.clone())
+					.map_err(|error| sf!("durable job board failed: {error}"))?;
+				if let Some(existing) = self
+					.jobs
+					.snapshot()
+					.into_iter()
+					.find(|existing| existing.id == job.id)
+					&& existing != job
+				{
+					return Err(sf!("durable job id is bound to another descriptor"));
+				}
+				serde_json::to_value(job)
+					.map_err(|error| sf!("durable job response failed: {error}"))
+			})(),
 			"omp.context.view" => self.context_control_view(),
 			"omp.context.usage" => self.context_control_view().and_then(|view| {
 				view

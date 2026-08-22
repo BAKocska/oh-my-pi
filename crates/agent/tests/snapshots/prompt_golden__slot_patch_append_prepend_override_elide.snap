@@ -1,0 +1,11 @@
+---
+source: crates/agent/tests/prompt_golden.rs
+expression: snapshot
+---
+[
+    GoldenItem {
+        index: 0,
+        band: "stable",
+        text: "pre-base-postreplacement",
+    },
+]

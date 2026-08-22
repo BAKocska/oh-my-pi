@@ -5,7 +5,7 @@
 //! projects its existing event stream. It never owns a second turn loop,
 //! transcript, or journal.
 
-use std::{collections::BTreeMap, string::FromUtf8Error, time::SystemTime};
+use std::{collections::BTreeMap, string::FromUtf8Error, sync::LazyLock, time::SystemTime};
 
 use omp_core::Str;
 use omp_inference::{
@@ -16,6 +16,7 @@ use omp_proto::{
 	inference::v1::{Outcome, part_start, turn_event},
 	thread::v1::{Item, Message, Part, Role, item, part},
 };
+use omp_scribe::{Props, Template};
 use strum::IntoStaticStr;
 use thiserror::Error;
 
@@ -23,7 +24,7 @@ use crate::{AgentEvent, AgentRunSummary, broker::now_ms};
 
 /// Voice-friendly provider instruction for the realtime half of the unified
 /// assistant. Placeholders are substituted by [`render_live_instructions`].
-pub const LIVE_VOICE_INSTRUCTIONS: &str = r#"You: omp Live, realtime voice surface of one unified coding assistant for {{firstName}} (OS account: {{username}}).
+pub const LIVE_VOICE_INSTRUCTIONS: &str = r#"You: omp Live, realtime voice surface of one unified coding assistant for {{ first_name }} (OS account: {{ username }}).
 
 RFC 2119: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. NEVER means MUST NOT.
 
@@ -44,13 +45,23 @@ pub const LIVE_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
 
 /// Renders live instructions with bounded user/account identity substitution.
 pub fn render_live_instructions(first_name: &str, username: &str) -> Str {
-	let first_name = first_name.trim().chars().take(64).collect::<String>();
-	let username = username.trim().chars().take(64).collect::<String>();
-	Str::from(
-		LIVE_VOICE_INSTRUCTIONS
-			.replace("{{firstName}}", &first_name)
-			.replace("{{username}}", &username),
-	)
+	static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+		crate::prompt_engine::engine()
+			.compile("voice/live-instructions", LIVE_VOICE_INSTRUCTIONS)
+			.expect("embedded voice instructions template")
+	});
+	let mut props = Props::new();
+	props.set(
+		crate::prompt_keys::FIRST_NAME,
+		first_name.trim().chars().take(64).collect::<String>(),
+	);
+	props.set(
+		crate::prompt_keys::USERNAME,
+		username.trim().chars().take(64).collect::<String>(),
+	);
+	TEMPLATE
+		.render_str(crate::prompt_engine::engine(), &props)
+		.expect("typed voice props satisfy embedded template")
 }
 
 /// Wraps one canonical delegated final answer for the realtime peer.

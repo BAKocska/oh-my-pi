@@ -1,10 +1,10 @@
 //! Pure transcript-to-thread projection and canonical tool-result lowering.
-
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::LazyLock};
 
 use bytes::Bytes;
 use omp_core::{SparseMap, SparseSet, Str, encoding::hex};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+use omp_scribe::{Props, Template};
 use omp_storage::transcript::{AmendPatch, Entry, Kind, LiveSet, Log, truncate_persisted_text};
 use omp_tool::{
 	Abort, CallOutcome, CapsBase, Part as ToolPart, ProjectedCall, PromptCaps, RecordedCallOwned,
@@ -12,19 +12,42 @@ use omp_tool::{
 };
 use serde::Deserialize;
 use thiserror::Error;
+
 const COMPACTION_SUMMARY_CONTEXT: &str = "Prior model work/tool state available.\nMUST build on \
                                           prior work; NEVER duplicate prior \
-                                          work.\n\n<summary>\n{{summary}}\n</summary>\n";
+                                          work.\n\n<summary>\n{{ summary }}\n</summary>\n";
 const HANDOFF_SUMMARY_CONTEXT: &str =
 	include_str!("../prompts/compaction/handoff-summary-context.md");
 
-fn render_compaction_summary(summary: &str, method: Option<&str>) -> String {
+/// Renders the compaction framing captured by the prompt golden suite.
+#[doc(hidden)]
+
+pub fn render_compaction_summary(summary: &str, method: Option<&str>) -> String {
+	static COMPACTION: LazyLock<Template> = LazyLock::new(|| {
+		crate::prompt_engine::engine()
+			.compile("compaction/summary-context", COMPACTION_SUMMARY_CONTEXT)
+			.expect("embedded compaction summary template")
+	});
+	static HANDOFF: LazyLock<Template> = LazyLock::new(|| {
+		crate::prompt_engine::engine()
+			.compile("compaction/handoff-summary-context", HANDOFF_SUMMARY_CONTEXT)
+			.expect("embedded handoff summary template")
+	});
 	let template = if method == Some("handoff") {
-		HANDOFF_SUMMARY_CONTEXT
+		&*HANDOFF
 	} else {
-		COMPACTION_SUMMARY_CONTEXT
+		&*COMPACTION
 	};
-	template.replace("{{summary}}", summary)
+	let mut props = Props::new();
+	props.set(crate::prompt_keys::SUMMARY, summary.to_owned());
+	let mut rendered = template
+		.render_str(crate::prompt_engine::engine(), &props)
+		.expect("typed summary props satisfy compaction template")
+		.to_string();
+	if !rendered.ends_with('\n') {
+		rendered.push('\n');
+	}
+	rendered
 }
 
 /// Canonical thread projection failure.

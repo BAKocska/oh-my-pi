@@ -68,6 +68,43 @@ const RPC_HISTORY_CAPS_BASE: CapsBase = CapsBase {
 
 /// Stream returned by RPC methods whose typed operation produces events.
 pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+/// Authoritative provider application operations exposed only when the
+/// application installs its live provider owner.
+#[tonic::async_trait]
+pub trait ProviderGatewayAuthority: Send + Sync + 'static {
+	async fn catalog(
+		&self,
+		request: pb::ProviderCatalogRequest,
+	) -> Result<pb::ProviderCatalogResponse, Status>;
+	async fn watch_catalog(
+		&self,
+		request: pb::WatchProviderCatalogRequest,
+	) -> Result<pb::WatchProviderCatalogResponse, Status>;
+	async fn authenticated(
+		&self,
+		request: pb::ProviderAuthenticatedRequest,
+	) -> Result<pb::ProviderAuthenticatedResponse, Status>;
+	async fn declare(
+		&self,
+		request: pb::ProviderDeclarationRequest,
+	) -> Result<pb::ProviderMutationResponse, Status>;
+	async fn replace(
+		&self,
+		request: pb::ProviderDeclarationRequest,
+	) -> Result<pb::ProviderMutationResponse, Status>;
+	async fn retract(
+		&self,
+		request: pb::RetractProviderRequest,
+	) -> Result<pb::ProviderMutationResponse, Status>;
+	async fn request(
+		&self,
+		request: pb::ProviderOperationRequest,
+	) -> Result<pb::ProviderOperationResponse, Status>;
+	async fn mint_session(
+		&self,
+		request: pb::ProviderOperationRequest,
+	) -> Result<pb::ProviderOperationResponse, Status>;
+}
 
 /// Projects the canonical catalog and typed operation service onto the retained
 /// OMP RPC schema.
@@ -84,6 +121,7 @@ pub struct InferenceRpc {
 	search_settings:       Arc<omp_inference::search_settings::WebSearchSettings>,
 	session_provider:      Option<ProviderId>,
 	prompt_cache_affinity: Option<Str>,
+	provider_authority:    Option<Arc<dyn ProviderGatewayAuthority>>,
 }
 
 #[derive(Clone, Default)]
@@ -164,7 +202,23 @@ impl InferenceRpc {
 			search_settings: Arc::new(Default::default()),
 			session_provider: None,
 			prompt_cache_affinity: None,
+			provider_authority: None,
 		}
+	}
+
+	/// Installs the application's live provider owner on the gateway surface.
+	pub fn with_provider_authority(
+		mut self,
+		authority: Arc<dyn ProviderGatewayAuthority>,
+	) -> Self {
+		self.provider_authority = Some(authority);
+		self
+	}
+
+	fn provider_authority(&self) -> Result<&Arc<dyn ProviderGatewayAuthority>, Status> {
+		self.provider_authority.as_ref().ok_or_else(|| {
+			Status::failed_precondition("provider application authority is not installed")
+		})
 	}
 
 	/// Replaces web-search routing settings for this immutable RPC facade.
@@ -1478,6 +1532,78 @@ impl pb::inference_server::Inference for InferenceRpc {
 			facet: pb::Facet::Unspecified as i32,
 			available_only: false,
 		})))
+	}
+
+	async fn provider_catalog(
+		&self,
+		request: Request<pb::ProviderCatalogRequest>,
+	) -> Result<Response<pb::ProviderCatalogResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.catalog(request.into_inner()).await?,
+		))
+	}
+
+	async fn watch_provider_catalog(
+		&self,
+		request: Request<pb::WatchProviderCatalogRequest>,
+	) -> Result<Response<pb::WatchProviderCatalogResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.watch_catalog(request.into_inner()).await?,
+		))
+	}
+
+	async fn provider_authenticated(
+		&self,
+		request: Request<pb::ProviderAuthenticatedRequest>,
+	) -> Result<Response<pb::ProviderAuthenticatedResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.authenticated(request.into_inner()).await?,
+		))
+	}
+
+	async fn declare_provider(
+		&self,
+		request: Request<pb::ProviderDeclarationRequest>,
+	) -> Result<Response<pb::ProviderMutationResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.declare(request.into_inner()).await?,
+		))
+	}
+
+	async fn replace_provider(
+		&self,
+		request: Request<pb::ProviderDeclarationRequest>,
+	) -> Result<Response<pb::ProviderMutationResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.replace(request.into_inner()).await?,
+		))
+	}
+
+	async fn retract_provider(
+		&self,
+		request: Request<pb::RetractProviderRequest>,
+	) -> Result<Response<pb::ProviderMutationResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.retract(request.into_inner()).await?,
+		))
+	}
+
+	async fn execute_provider_request(
+		&self,
+		request: Request<pb::ProviderOperationRequest>,
+	) -> Result<Response<pb::ProviderOperationResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.request(request.into_inner()).await?,
+		))
+	}
+
+	async fn mint_provider_session(
+		&self,
+		request: Request<pb::ProviderOperationRequest>,
+	) -> Result<Response<pb::ProviderOperationResponse>, Status> {
+		Ok(Response::new(
+			self.provider_authority()?.mint_session(request.into_inner()).await?,
+		))
 	}
 }
 

@@ -233,6 +233,12 @@ async fn run_invocation(
 	let mut speculative =
 		SpeculativeCall::open(&env, &events, Str::new(call.id.as_str()), identity, deadline).await?;
 	speculative.relay_fragment(fragment).await?;
+	// In-process relays can stay ready throughout; poll owner cancellation once
+	// before crossing the effect-authorization boundary.
+	tokio::task::yield_now().await;
+	if interrupt.borrow().is_some() {
+		return Ok(failed_completion(invocation_id, "invocation interrupted before execution"));
+	}
 	let committed = speculative.commit(raw_args);
 	let (updates_tx, updates_rx) = flume::unbounded();
 	let drive = ToolBatch::new(vec![committed]).drive_streaming(

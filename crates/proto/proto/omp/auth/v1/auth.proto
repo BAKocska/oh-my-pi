@@ -7,15 +7,15 @@ import "omp/inference/v1/common.proto";
 // Broker client surface: credential metadata, login orchestration, secret
 // INGRESS (one-way), block bookkeeping, and usage reporting.
 //
-// Provider token bytes never serialize OUT of the broker. Egress auth
-// happens inside the gateway process through sealed internal leases
-// (constructible only inside the broker module, Debug-redacted, zeroized on
-// drop). Secrets cross the wire in exactly two places, both one-way or
-// scoped:
-//   - ingress: PutApiKey / ImportOAuth / SubmitCode (sealed on arrival,
-//     never readable back through any RPC);
+// Provider token bytes serialize OUT of the broker only through explicitly
+// scoped operations. Routine inference auth remains inside the gateway process
+// through sealed internal leases (Debug-redacted and zeroized on drop).
+// Secrets cross the wire only for:
+//   - ingress: PutApiKey / ImportOAuth / SubmitCode (sealed on arrival);
 //   - egress: MintScopedToken — ephemeral, single-facet, single-session,
-//     for client-direct connections only (realtime/WebRTC).
+//     for client-direct connections only (realtime/WebRTC);
+//   - CONTROL reveal: RevealCredential — authenticated, provider-scoped, and
+//     durably audited before the response is constructed.
 //
 // Mapping from the previous implementation's broker HTTP surface:
 //   GET  /v1/snapshot(?wait=)      -> ListCredentials + WatchCredentials
@@ -70,6 +70,9 @@ service Auth {
   // Re-enable an auto-disabled credential ("I fixed the account").
   rpc EnableCredential(EnableCredentialRequest) returns (CredentialMeta);
   rpc DeleteCredential(DeleteCredentialRequest) returns (DeleteCredentialResponse);
+  // Temporarily exposes one credential only after the broker durably commits
+  // the authenticated CONTROL request evidence.
+  rpc RevealCredential(RevealCredentialRequest) returns (RevealCredentialResponse);
 
   // ── Blocks (rate-limit / quota) ───────────────────────────────────────
   // The gateway observes 429s itself; this exists for scoped-token holders
@@ -265,6 +268,21 @@ message DeleteCredentialRequest {
 }
 
 message DeleteCredentialResponse {}
+
+message RevealCredentialRequest {
+  uint64 id = 1;
+  string provider = 2;
+  string extension = 3;
+  string caller_principal = 4;
+  uint64 host_generation = 5;
+  uint64 session_generation = 6;
+  uint64 request_id = 7;
+  string reason = 8;
+}
+
+message RevealCredentialResponse {
+  bytes secret = 1;
+}
 
 // ── Blocks ────────────────────────────────────────────────────────────────
 

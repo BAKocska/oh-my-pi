@@ -29,6 +29,12 @@ fn main() {
 	let mut protos = Vec::new();
 	collect(&root, &mut protos);
 	protos.sort();
+	// Cargo only tracks the paths it is told about: emitting just `proto/`
+	// misses edits to nested `.proto` files, so every collected source is
+	// registered individually.
+	for proto in &protos {
+		println!("cargo::rerun-if-changed={}", proto.display());
+	}
 	// `src/lib.rs` includes `google.protobuf.rs` unconditionally so the serde
 	// derives reach the well-known types; protox serves this file from its
 	// embedded descriptor set even though it is not under `proto/`.

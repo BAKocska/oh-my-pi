@@ -1380,6 +1380,20 @@ struct ConcurrencyState {
 	next_ticket: u64,
 	waiters:     VecDeque<ConcurrencyWaiter>,
 }
+/// Live agent-tree admission limits and occupancy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentTreeLimits {
+	/// Maximum admitted child depth.
+	pub max_depth:       u16,
+	/// Concurrent run ceiling; zero means unlimited.
+	pub max_concurrency: usize,
+	/// Runs currently holding admission permits.
+	pub active:          usize,
+	/// Run slots currently waiting for admission.
+	pub queued:          usize,
+	/// Maximum queued run slots.
+	pub max_queue:       usize,
+}
 
 /// Race-safe, session-scoped resizable concurrency authority.
 ///
@@ -1757,6 +1771,21 @@ impl AgentTree {
 	/// Returns the current monotonic roster generation.
 	pub fn roster_generation(&self) -> u64 {
 		self.roster_generation.load(Ordering::Acquire)
+	}
+	/// Returns one coherent snapshot of configured limits and live admission
+	/// occupancy.
+	pub fn limits(&self) -> AgentTreeLimits {
+		let state = self.concurrency.state.lock();
+		AgentTreeLimits {
+			max_depth: self.max_depth,
+			max_concurrency: state.limit,
+			active: state.active,
+			queued: state
+				.waiters
+				.iter()
+				.fold(0_usize, |total, waiter| total.saturating_add(waiter.units)),
+			max_queue: self.concurrency.max_queue,
+		}
 	}
 
 	/// Reserves capacity for active agent runs.

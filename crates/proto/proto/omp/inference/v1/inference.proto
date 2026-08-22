@@ -101,6 +101,17 @@ service Inference {
   rpc WatchModels(WatchModelsRequest) returns (stream ModelEvent);
   // Force live discovery now ("I just started ollama").
   rpc RefreshModels(RefreshModelsRequest) returns (ListModelsResponse);
+  // ── Provider application authority ───────────────────────────────────
+  // The authenticated gateway transport carries the exact extension host
+  // and session generation whose CONTROL authority initiated the call.
+  rpc ProviderCatalog(ProviderCatalogRequest) returns (ProviderCatalogResponse);
+  rpc WatchProviderCatalog(WatchProviderCatalogRequest) returns (WatchProviderCatalogResponse);
+  rpc ProviderAuthenticated(ProviderAuthenticatedRequest) returns (ProviderAuthenticatedResponse);
+  rpc DeclareProvider(ProviderDeclarationRequest) returns (ProviderMutationResponse);
+  rpc ReplaceProvider(ProviderDeclarationRequest) returns (ProviderMutationResponse);
+  rpc RetractProvider(RetractProviderRequest) returns (ProviderMutationResponse);
+  rpc ExecuteProviderRequest(ProviderOperationRequest) returns (ProviderOperationResponse);
+  rpc MintProviderSession(ProviderOperationRequest) returns (ProviderOperationResponse);
 
   // Future facets land as new rpcs on this service: Quota (account usage
   // windows), Batch (deferred pricing via the job engine), and
@@ -109,7 +120,111 @@ service Inference {
   // peers.
 }
 
-// ── Context addressing ──────────────────────────────────────────────────
+// Exact caller identity established by the extension CONTROL connection.
+message ProviderCaller {
+  string extension = 1;
+  string artifact_digest = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  string principal_id = 5;
+  string principal_display = 6;
+  string layer = 7;
+  string tier = 8;
+  string trust = 9;
+  repeated string capabilities = 10;
+}
+
+message ProviderCatalogRequest {
+  optional string provider = 1;
+}
+
+message ProviderCatalogResponse {
+  repeated ModelCard models = 1;
+  Cursor cursor = 2;
+}
+
+message WatchProviderCatalogRequest {
+  optional Cursor since = 1;
+}
+
+message WatchProviderCatalogResponse {
+  repeated ModelEvent events = 1;
+}
+
+message ProviderAuthenticatedRequest {
+  string provider = 1;
+}
+
+message ProviderAuthenticatedResponse {
+  bool authenticated = 1;
+}
+
+message ProviderDeclarationRequest {
+  ProviderCaller caller = 1;
+  string provider = 2;
+  bytes document_json = 3;
+  uint64 expected_generation = 4;
+}
+
+message RetractProviderRequest {
+  ProviderCaller caller = 1;
+  string provider = 2;
+  uint64 expected_generation = 3;
+}
+
+message ProviderMutationResponse {
+  Cursor cursor = 1;
+}
+
+message ProviderOperationRequest {
+  ProviderCaller caller = 1;
+  string provider = 2;
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_GENERATE_IMAGE = 1;
+    KIND_SPEAK = 2;
+    KIND_TRANSCRIBE = 3;
+    KIND_REALTIME = 4;
+  }
+  Kind kind = 3;
+  bytes payload_json = 4;
+  uint64 expected_generation = 5;
+}
+
+message ProviderBlob {
+  string hash = 1;
+  uint64 size = 2;
+}
+
+message ProviderOperationResponse {
+  message Image {
+    repeated ProviderBlob images = 1;
+    uint64 cost_nanos_usd = 2;
+  }
+  message Speech {
+    ProviderBlob audio = 1;
+    string format = 2;
+    uint64 cost_nanos_usd = 3;
+  }
+  message Transcription {
+    string text = 1;
+    optional string language = 2;
+    uint64 cost_nanos_usd = 3;
+  }
+  message Realtime {
+    string id = 1;
+    string endpoint = 2;
+    string credential = 3;
+    uint64 expires_at_ms = 4;
+    string transport = 5;
+  }
+  oneof result {
+    Image image = 1;
+    Speech speech = 2;
+    Transcription transcription = 3;
+    Realtime realtime = 4;
+  }
+}
 
 // Handle on a server-held thread plus the caller's view of its state.
 message ContextRef {

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use omp_core::Str;
 use omp_proto::thread::v1::Item;
+use omp_scribe::{Value, map};
 use omp_storage::transcript::{self, Kind, ModelChange};
 use thiserror::Error;
 
@@ -74,27 +75,24 @@ pub fn revive_existing(
 		}
 	}
 	let roots = journal.workspace_roots(&log.header().cwd)?;
-	snapshot.workspace.cwd = roots.primary().to_owned();
-	snapshot.workspace.roots.roots = snapshot
-		.workspace
-		.roots
-		.roots
+	let primary_uri = roots.primary().to_string_lossy().into_owned();
+	snapshot.props.set(crate::prompt_keys::CWD, primary_uri.clone());
+	let primary = map! { "canonical_uri" => primary_uri };
+	let additional = roots
+		.secondary()
 		.iter()
-		.filter(|grant| {
-			snapshot
-				.workspace
-				.roots
-				.primary
-				.as_ref()
-				.is_some_and(|primary| primary.grant_id == grant.grant_id)
-				|| roots
-					.secondary()
-					.iter()
-					.any(|root| grant.canonical_uri.as_str() == root.as_os_str().to_string_lossy())
-		})
-		.cloned()
-		.collect::<Vec<_>>()
-		.into();
+		.map(|root| map! { "canonical_uri" => root.as_os_str().to_string_lossy().into_owned() })
+		.collect::<Vec<_>>();
+	let all = std::iter::once(primary.clone())
+		.chain(additional.iter().cloned())
+		.collect::<Vec<Value>>();
+	snapshot.props.set(
+		crate::prompt_keys::ROOTS,
+		map! { "revision" => 0_i64, "primary" => primary, "roots" => all },
+	);
+	snapshot
+		.props
+		.set(crate::prompt_keys::ADDITIONAL_ROOTS, additional);
 	if let Some(start) = journal.latest_turn_start() {
 		let mounted = &snapshot.registry;
 		snapshot.enabled_tools = start
