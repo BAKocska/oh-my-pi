@@ -99,7 +99,6 @@ pub enum VoiceError {
 
 impl VoiceError {
 	#[cfg(feature = "native-audio")]
-
 	pub(crate) fn backend(message: String) -> Self {
 		Self::Backend { source: Arc::new(io::Error::other(message)) }
 	}
