@@ -116,6 +116,13 @@ build-release:
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
+# Generate the tracked native Python type stub from PyO3 metadata embedded in
+# the statically linked demo executable.
+[group('build & check')]
+gen-py-stubs:
+    cargo build -p omp-py --bin omp-demo --features inspect --locked
+    cargo run -p omp-py --bin stubgen --features inspect --locked -- \
+        "${CARGO_TARGET_DIR:-target}/debug/omp-demo" crates/py/python
 
 # Run every workspace unit/integration test except the e2e suite.
 [group('test')]

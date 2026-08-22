@@ -3775,6 +3775,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "goblin"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17582616a7718cca54cec18e534a76c7c4aec11a8b9a85695712f262fd15a4c8"
+dependencies = [
+ "log",
+ "plain",
+ "scroll",
+]
+
+[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3928,22 +3939,6 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "zerocopy",
-]
-
-[[package]]
-name = "handlebars"
-version = "6.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c54236f9045c8004a77942bebc52145b4844639db934a5c70fe08617fbe61a"
-dependencies = [
- "derive_builder",
- "log",
- "num-order",
- "pest",
- "pest_derive",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5929,21 +5924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-modular"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
-
-[[package]]
-name = "num-order"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "537b596b97c40fcf8056d153049eb22f481c17ebce72a513ec9286e4986d1bb6"
-dependencies = [
- "num-modular",
-]
-
-[[package]]
 name = "num-rational"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6592,6 +6572,7 @@ dependencies = [
  "globset",
  "hifijson",
  "hyper-util",
+ "insta",
  "jaq-core",
  "jaq-json",
  "jaq-std",
@@ -6628,6 +6609,7 @@ name = "omp-app"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-stream",
  "async-trait",
  "blake3",
  "bytes",
@@ -6637,9 +6619,9 @@ dependencies = [
  "flate2",
  "flume",
  "futures",
- "handlebars",
  "image",
  "indicatif",
+ "insta",
  "inventory",
  "jiff",
  "libc",
@@ -6651,9 +6633,11 @@ dependencies = [
  "omp-chat-ui",
  "omp-collab",
  "omp-core",
+ "omp-docserver",
  "omp-driver",
  "omp-env",
  "omp-envd",
+ "omp-executor",
  "omp-ext",
  "omp-grep",
  "omp-gui",
@@ -6662,6 +6646,7 @@ dependencies = [
  "omp-proto",
  "omp-py",
  "omp-rpc",
+ "omp-scribe",
  "omp-sdk",
  "omp-serve",
  "omp-settings",
@@ -6691,6 +6676,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-health",
+ "tower",
  "tracing",
  "url",
  "windows-sys 0.61.2",
@@ -6819,6 +6805,7 @@ dependencies = [
  "bytes",
  "flume",
  "omp-core",
+ "omp-executor",
  "omp-proto",
  "omp-storage",
  "omp-tools",
@@ -6959,7 +6946,6 @@ dependencies = [
  "flume",
  "futures",
  "globset",
- "handlebars",
  "http",
  "http-body-util",
  "hyper",
@@ -6981,6 +6967,7 @@ dependencies = [
  "omp-memory",
  "omp-proto",
  "omp-rpc",
+ "omp-scribe",
  "omp-sdk",
  "omp-secrets",
  "omp-serve",
@@ -7021,6 +7008,7 @@ name = "omp-e2e"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "bytes",
  "flume",
  "futures",
@@ -7033,6 +7021,7 @@ dependencies = [
  "omp-docserver",
  "omp-env",
  "omp-envd",
+ "omp-ext",
  "omp-hashline",
  "omp-inference",
  "omp-proto",
@@ -7072,6 +7061,7 @@ dependencies = [
  "omp-proto",
  "parking_lot",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml",
@@ -7094,7 +7084,9 @@ dependencies = [
  "futures",
  "globset",
  "http",
+ "http-body-util",
  "hyper",
+ "hyper-util",
  "im",
  "libc",
  "miette",
@@ -7154,6 +7146,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-executor"
+version = "0.1.0"
+dependencies = [
+ "async-executor",
+ "async-io",
+ "async-task",
+ "blocking",
+ "futures-lite",
+ "nix 0.31.3",
+ "parking_lot",
+ "rand 0.10.2",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "omp-ext"
 version = "0.1.0"
 dependencies = [
@@ -7163,6 +7171,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "tempfile",
  "thiserror 2.0.20",
  "toml",
 ]
@@ -7370,6 +7379,7 @@ dependencies = [
  "omp-tool",
  "parking_lot",
  "pyo3",
+ "pyo3-introspection",
  "serde_json",
  "tokio",
 ]
@@ -7765,7 +7775,9 @@ name = "omp-tui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "async-io",
  "flume",
+ "futures-lite",
  "im",
  "image",
  "layout-rs",
@@ -7773,6 +7785,7 @@ dependencies = [
  "nix 0.31.3",
  "omp-chat-ui",
  "omp-core",
+ "omp-executor",
  "omp-macros",
  "omp-snapcompact",
  "parking_lot",
@@ -9105,6 +9118,7 @@ version = "0.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4688ddedf473e32662b9b067670129a8afb8c18e351482c70d62ba4a88171e8b"
 dependencies = [
+ "inventory",
  "libc",
  "once_cell",
  "portable-atomic",
@@ -9130,6 +9144,18 @@ checksum = "e591a95526fead067432c3b3a33fc74770b87b1e04e73671090d9c2055a2b327"
 dependencies = [
  "libc",
  "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-introspection"
+version = "0.29.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7dec9663b0beae4f0945ad355ac7146d7d58f442ffaf993751aaee38ed559e4"
+dependencies = [
+ "anyhow",
+ "goblin",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -10167,6 +10193,26 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scroll"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1257cd4248b4132760d6524d6dda4e053bc648c9070b960929bf50cfb1e7add"
+dependencies = [
+ "scroll_derive",
+]
+
+[[package]]
+name = "scroll_derive"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed76efe62313ab6610570951494bdaa81568026e0318eaa55f167de70eeea67d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "scrypt"
