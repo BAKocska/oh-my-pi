@@ -18,7 +18,8 @@ pub const SAVINGS_MARGIN: f64 = 0.9;
 /// Safe image-count floor for an unknown provider.
 pub const DEFAULT_PROVIDER_IMAGE_BUDGET: usize = 5;
 
-/// Whether data-URL text came from intact source or a structure-blind legacy archive slice.
+/// Whether data-URL text came from intact source or a structure-blind legacy
+/// archive slice.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DataUrlContext {
 	/// Intact source text; short non-canonical examples remain prose.
@@ -46,8 +47,14 @@ fn media_token(byte: u8) -> bool {
 	byte.is_ascii_alphanumeric()
 		|| matches!(
 			byte,
-			b'_' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
-				| b'^' | b'|' | b'~'
+			b'_'
+				| b'!' | b'#'
+				| b'$' | b'%'
+				| b'&' | b'\''
+				| b'*' | b'+'
+				| b'-' | b'.'
+				| b'^' | b'|'
+				| b'~'
 		)
 }
 
@@ -99,7 +106,11 @@ fn canonical_base64(payload: &[u8]) -> bool {
 	if !payload.len().is_multiple_of(4) {
 		return false;
 	}
-	let padding = payload.iter().rev().take_while(|&&byte| byte == b'=').count();
+	let padding = payload
+		.iter()
+		.rev()
+		.take_while(|&&byte| byte == b'=')
+		.count();
 	padding <= 2
 		&& payload[..payload.len().saturating_sub(padding)]
 			.iter()
@@ -154,14 +165,20 @@ fn adjacent_markdown_opener(text: &str, data_start: usize, floor: usize) -> Opti
 		}
 	}
 	let opener = opener?;
-	Some(if opener > floor && bytes[opener - 1] == b'!' { opener - 1 } else { opener })
+	Some(if opener > floor && bytes[opener - 1] == b'!' {
+		opener - 1
+	} else {
+		opener
+	})
 }
 
-/// Atomically replaces inline base64 data URLs before any character or frame slicing.
+/// Atomically replaces inline base64 data URLs before any character or frame
+/// slicing.
 ///
-/// Archive context also heals short, non-canonical fragments left by older structure-blind
-/// slices. Matching advances from `data:` prefixes and only scans backward through the adjacent
-/// unprocessed Markdown opener, keeping unmatched-bracket input linear.
+/// Archive context also heals short, non-canonical fragments left by older
+/// structure-blind slices. Matching advances from `data:` prefixes and only
+/// scans backward through the adjacent unprocessed Markdown opener, keeping
+/// unmatched-bracket input linear.
 pub fn elide_data_urls(text: &str, context: DataUrlContext) -> Cow<'_, str> {
 	let bytes = text.as_bytes();
 	let mut search = 0usize;
@@ -201,9 +218,7 @@ pub fn elide_data_urls(text: &str, context: DataUrlContext) -> Cow<'_, str> {
 			let second_start = second_run;
 			while bytes
 				.get(second_run)
-				.is_some_and(|byte| {
-					byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-				})
+				.is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 			{
 				second_run += 1;
 			}
