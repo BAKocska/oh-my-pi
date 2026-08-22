@@ -232,7 +232,6 @@ pub enum CommitError {
 }
 /// Failure while waiting for the next invocation interrupt.
 #[derive(Debug, Error)]
-
 pub enum InterruptWaitError {
 	/// The invocation owner disappeared before sending another interrupt.
 	#[error("invocation event stream closed")]
