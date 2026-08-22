@@ -26,7 +26,9 @@
 > [`12-agents.md`](12-agents.md) (`omp.agents`, `Continue`/`Settle`, `SubagentSpec`, `Usage`),
 > [`13-inference.md`](13-inference.md) (`ModelRef`, `RouteRef`, `omp.Failover`,
 > `CapabilityIntent`, provider event payloads),
-> [`14-deploy.md`](14-deploy.md) (how extension code arrives, layering, install-time trust).
+> [`14-deploy.md`](14-deploy.md) (how extension code arrives, layering, install-time trust),
+> [`15-campaigns.md`](15-campaigns.md) (stateful multi-turn campaigns, engagement hand-off,
+> bounded escalation, and campaign verdict arbitration).
 
 ## 1. Purpose
 

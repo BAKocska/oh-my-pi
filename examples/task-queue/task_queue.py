@@ -5,8 +5,6 @@ from typing import Literal
 
 import omp
 from omp import ui
-from omp.agents import Continue, ContinuationLedger, Settle, continuations
-
 
 _TaskEvent = Literal["queued", "started", "done"]
 _TaskStatus = Literal["queued", "started", "done"]
@@ -78,6 +76,42 @@ def _append_task(task: str, *, idempotency_key: str) -> QueueReceipt:
     return QueueReceipt(task_id=entry_id.index, waiting=waiting)
 
 
+_QUEUE_CAMPAIGN = "task-queue-drain"
+
+
+@omp.campaign(
+    _QUEUE_CAMPAIGN,
+    at=omp.SETTLE,
+    ladder=omp.Ladder(8),
+    exhaust=omp.Exhaust.SETTLE,
+    scope=omp.CampaignScope.SESSION,
+    claims=("task-queue",),
+    on_failure=omp.OnFailure.DEFER,
+)
+def drain_task_queue(event: dict[str, object]) -> object:
+    """Complete the active item, then continue with at most one waiting task."""
+
+    del event
+    tasks = _fold_queue()
+    active = next((item for item in tasks if item.status == "started"), None)
+    if active is not None:
+        omp.journal.append(
+            QueuedTask(event="done", task_id=active.task_id),
+            idempotency_key=f"task-queue:done:{active.task_id}",
+        )
+        tasks = _fold_queue()
+
+    next_task = next((item for item in tasks if item.status == "queued"), None)
+    if next_task is None:
+        return omp.Done()
+
+    omp.journal.append(
+        QueuedTask(event="started", task_id=next_task.task_id),
+        idempotency_key=f"task-queue:start:{next_task.task_id}",
+    )
+    return omp.Continue(inject=next_task.task)
+
+
 @omp.device(
     "queue_task",
     family="queue",
@@ -88,10 +122,12 @@ def _append_task(task: str, *, idempotency_key: str) -> QueueReceipt:
 async def queue_task_device(args: QueueTaskArgs, ctx: omp.Context) -> QueueReceipt:
     """Queue work durably without exposing any waiting task to context."""
 
-    return _append_task(
+    receipt = _append_task(
         args.task,
         idempotency_key=f"task-queue:device:{ctx.invocation}",
     )
+    await omp.campaigns.engage(_QUEUE_CAMPAIGN, queue=True)
+    return receipt
 
 
 @omp.command(
@@ -109,45 +145,6 @@ async def queue_task_command(
         invocation.raw,
         idempotency_key=f"task-queue:command:{ctx.invocation}",
     )
+    await omp.campaigns.engage(_QUEUE_CAMPAIGN, queue=True)
     return ui.Consumed()
 
-
-@omp.hook("agent_settled")
-async def run_next_task(
-    event: omp.AgentSettledEvent, ctx: omp.Context
-) -> Continue | Settle:
-    """Complete the active item, then continue with at most one waiting task."""
-
-    del ctx
-    tasks = _fold_queue()
-    active = next((item for item in tasks if item.status == "started"), None)
-    if active is not None:
-        omp.journal.append(
-            QueuedTask(event="done", task_id=active.task_id),
-            idempotency_key=(
-                f"task-queue:settle:{event.submission_id}:done:{active.task_id}"
-            ),
-        )
-        tasks = _fold_queue()
-
-    next_task = next((item for item in tasks if item.status == "queued"), None)
-    if next_task is None:
-        return Settle()
-
-    ledger: ContinuationLedger = await continuations()
-    if ledger.consecutive >= ledger.cap:
-        return Settle()
-
-    omp.journal.append(
-        QueuedTask(event="started", task_id=next_task.task_id),
-        idempotency_key=(
-            f"task-queue:settle:{event.submission_id}:start:{next_task.task_id}"
-        ),
-    )
-    return Continue(
-        prompt=next_task.task,
-        visible=False,
-        role="system",
-        label="task-queue",
-        collapse_prior=True,
-    )

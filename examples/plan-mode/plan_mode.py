@@ -1,26 +1,18 @@
-"""A session-scoped read-only planning mode with typed plan handoff."""
+"""A Session-scoped planning regime with a read-only campaign guard."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 import omp
-from omp import BashIR
 from omp import ModelRef
 
-_SESSION = omp.StateScope.SESSION
+_CAMPAIGN_ID = "plan-mode"
 _DENIAL_CODE = "plan_readonly"
-
-
-@omp.entry_kind("examples.plan-mode.transition", rev="v.1", display=False)
-@dataclass(frozen=True, slots=True)
-class PlanModeTransition:
-    """Record one session-local transition into or out of planning mode."""
-
-    op: Literal["enter", "exit"]
-    model: ModelRef | None = None
-    thinking: str | None = None
+_PLAN_TOOLSET = ("read", "grep", "glob", "bash", "plan")
+_SESSION = omp.StateScope.SESSION
 
 
 @omp.entry_kind("examples.plan-mode.plan", rev="v.1")
@@ -35,121 +27,187 @@ class Plan:
 
 @dataclass(frozen=True, slots=True)
 class PlanArgs:
-    """Select enter, exit, or status and carry planning configuration or text."""
+    """Select plan-mode entry, exit, or status."""
 
-    op: Literal["enter", "exit", "status"]
+    op: Literal["on", "off", "status"]
     model: ModelRef | None = None
     thinking: str | None = None
     plan: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class _Mode:
-    active: bool = False
-    model: ModelRef | None = None
-    thinking: str | None = None
+class PlanModeState:
+    """Journal the planning selection owned by one campaign engagement."""
+
+    active: bool
+    model_provider: str
+    model_api: str
+    model_name: str
+    thinking: str
+
+    @classmethod
+    def from_selection(cls, model: ModelRef, thinking: str) -> PlanModeState:
+        return cls(
+            active=True,
+            model_provider=model.provider,
+            model_api=model.api,
+            model_name=model.model,
+            thinking=thinking,
+        )
+
+    def model_ref(self) -> ModelRef:
+        return ModelRef(
+            provider=self.model_provider,
+            api=self.model_api,
+            model=self.model_name,
+        )
 
 
-def _fold_mode(current: _Mode, record: object) -> _Mode:
-    transition: PlanModeTransition = record.value  # type: ignore[attr-defined]
-    if transition.op == "exit":
-        return _Mode()
-    return _Mode(active=True, model=transition.model, thinking=transition.thinking)
-
-
-async def _mode() -> _Mode:
-    value, _watermark = await omp.state.fold(
-        PlanModeTransition,
-        _fold_mode,
-        _Mode(),
-        scope=_SESSION,
-    )
-    return value
-
-
-def _status(mode: _Mode) -> dict[str, object]:
+def _status(state: PlanModeState | None) -> dict[str, object]:
     return {
-        "mode": "plan" if mode.active else "execute",
-        "model": mode.model,
-        "thinking": mode.thinking,
+        "mode": "plan" if state is not None and state.active else "execute",
+        "model": state.model_ref() if state is not None and state.active else None,
+        "thinking": state.thinking if state is not None and state.active else None,
     }
+
+
+async def _active_plan_mode() -> omp.ActiveCampaign | None:
+    for engagement in await omp.campaigns.active():
+        if engagement.campaign != _CAMPAIGN_ID or engagement.queued:
+            continue
+        if isinstance(engagement.state, PlanModeState) and engagement.state.active:
+            return engagement
+    return None
+
+
+def _tool_name(event: Mapping[str, object]) -> str | None:
+    target = event.get("target")
+    if isinstance(target, str):
+        return target
+    if isinstance(target, Mapping):
+        name = target.get("name")
+        return name if isinstance(name, str) else None
+    return None
+
+
+def _bash_is_read_only(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return True
+    commands = value.get("commands", ())
+    commands_are_read_only = (
+        isinstance(commands, Sequence)
+        and not isinstance(commands, (str, bytes))
+        and all(
+            isinstance(command, Mapping) and bool(command.get("read_only"))
+            for command in commands
+        )
+    )
+    return (
+        not bool(value.get("writes"))
+        and not bool(value.get("net"))
+        and not bool(value.get("has_dynamic_eval"))
+        and commands_are_read_only
+    )
+
+
+def _is_mutating_call(event: Mapping[str, object]) -> bool:
+    kind = event.get("kind")
+    if kind not in (None, "core"):
+        return False
+    tool = _tool_name(event)
+    if tool in {"write", "edit"}:
+        return True
+    return tool == "bash" and not _bash_is_read_only(event.get("bash"))
+
+
+@omp.campaign(
+    _CAMPAIGN_ID,
+    at=(omp.CONTEXT, omp.PRE_MODEL, omp.ADMISSION, omp.SETTLE),
+    ladder=omp.Ladder(3),
+    exhaust=omp.Exhaust.SETTLE,
+    scope=omp.CampaignScope.SESSION,
+    state=PlanModeState,
+    state_family="examples.plan-mode.state",
+    on_failure=omp.OnFailure.DENY,
+    claims=("mode",),
+    binds=("toolset", "model"),
+)
+def plan_mode(
+    event: dict[str, object],
+    state: PlanModeState,
+) -> tuple[object, PlanModeState]:
+    """Bind planning surfaces, guard writes, and veto premature settlement."""
+
+    if not state.active:
+        return omp.Done(), state
+
+    point = event.get("point")
+    if point == omp.CONTEXT.value:
+        return omp.Bind("toolset", _PLAN_TOOLSET), state
+    if point == omp.PRE_MODEL.value:
+        return (
+            omp.Bind(
+                "model",
+                {
+                    "provider": state.model_provider,
+                    "api": state.model_api,
+                    "model": state.model_name,
+                    "thinking": state.thinking,
+                },
+            ),
+            state,
+        )
+    if point == omp.ADMISSION.value and _is_mutating_call(event):
+        return omp.Deny("plan is read-only", code=_DENIAL_CODE), state
+    if point == omp.SETTLE.value:
+        return (
+            omp.Continue(
+                inject={
+                    "kind": "plan-mode-decision",
+                    "text": "Planning is active; continue using tools or finish with /plan off.",
+                }
+            ),
+            state,
+        )
+    return omp.Pass(), state
 
 
 @omp.tool("plan", kind="soft", rev=1)
 async def plan(args: PlanArgs, ctx: omp.Context) -> dict[str, object]:
-    """Enter planning, publish its completed plan on exit, or report mode status."""
+    """Engage, disengage, or inspect the plan-mode campaign."""
 
     del ctx
-    current = await _mode()
+    engagement = await _active_plan_mode()
     if args.op == "status":
-        return _status(current)
+        state = engagement.state if engagement is not None else None
+        return _status(state if isinstance(state, PlanModeState) else None)
 
-    if args.op == "enter":
+    if args.op == "on":
+        if engagement is not None:
+            raise ValueError("plan mode is already active")
         model = args.model
         thinking = (args.thinking or "").strip()
         if model is None or not thinking:
-            raise ValueError("enter requires model and non-empty thinking selections")
-        await omp.state.append(
-            PlanModeTransition(op="enter", model=model, thinking=thinking),
-            scope=_SESSION,
+            raise ValueError("on requires model and non-empty thinking selections")
+        active = await omp.campaigns.engage(
+            _CAMPAIGN_ID,
+            state=PlanModeState.from_selection(model, thinking),
         )
-        return _status(_Mode(active=True, model=model, thinking=thinking))
+        state = active.state
+        return _status(state if isinstance(state, PlanModeState) else None)
 
-    if not current.active or current.model is None or current.thinking is None:
+    if engagement is None or not isinstance(engagement.state, PlanModeState):
         raise ValueError("plan mode is not active")
     text = (args.plan or "").strip()
     if not text:
-        raise ValueError("exit requires the completed plan")
+        raise ValueError("off requires the completed plan")
+    state = engagement.state
     await omp.state.append(
-        Plan(text=text, model=current.model, thinking=current.thinking),
+        Plan(text=text, model=state.model_ref(), thinking=state.thinking),
         scope=_SESSION,
     )
-    await omp.state.append(PlanModeTransition(op="exit"), scope=_SESSION)
-    result = _status(_Mode())
+    if not await omp.campaigns.disengage(engagement.id):
+        raise RuntimeError("plan-mode campaign could not be disengaged")
+    result = _status(None)
     result["plan"] = text
     return result
-
-
-@omp.hook(
-    "tool_call",
-    phase=omp.HookPhase.PRECHECK,
-    on_failure=omp.OnFailure.DENY,
-)
-async def deny_writes_while_planning(
-    event: omp.ToolCallEvent, ctx: omp.Context
-) -> omp.HookDecision:
-    """Deny core write, edit, and non-read-only bash calls during planning."""
-
-    del ctx
-    if not (await _mode()).active:
-        return omp.Defer()
-    if not isinstance(event.target, omp.CoreTool):
-        return omp.Defer()
-    if event.target.name in {"write", "edit"}:
-        return omp.Deny(
-            "plan mode may not write to the filesystem",
-            code=_DENIAL_CODE,
-        )
-    ir: BashIR | None = event.bash
-    if event.target.name == "bash" and ir is not None and not ir.is_read_only():
-        return omp.Deny(
-            "plan mode may only run read-only shell commands",
-            code=_DENIAL_CODE,
-        )
-    return omp.Defer()
-
-
-@omp.hook("turn_start", phase=omp.HookPhase.TRANSFORM, order=50)
-async def use_plan_inference(
-    event: omp.TurnStartEvent, ctx: omp.Context
-) -> omp.HookDecision:
-    """Switch planning turns to their selected model and thinking level only."""
-
-    del event, ctx
-    mode = await _mode()
-    if not mode.active:
-        return omp.Defer()
-    return omp.Modify(
-        patch={"model": mode.model, "thinking": mode.thinking},
-        reason="plan mode inference selection",
-    )

@@ -1,0 +1,15 @@
+id = "examples.campaign-retry"
+entry = "campaign_retry"
+version = "0.1.0"
+description = "Durable three-turn campaign with bounded tool forcing."
+requires = []
+capabilities = []
+
+[[declarations]]
+id = "three-turn-retry"
+kind = "campaign"
+module = "campaign_retry"
+key = "three-turn-retry"
+trigger = "lazy"
+api = 1
+failure = "fail-open"

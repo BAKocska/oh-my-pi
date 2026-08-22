@@ -19,6 +19,7 @@ omp's Python extension surface, from the process outward.
 | [12-agents.md](12-agents.md) | `omp.agents`: subagents, goal loops, schedules, messaging, rewind |
 | [13-inference.md](13-inference.md) | `@omp.provider`, the provider surface, `omp.creds`, request intents |
 | [14-deploy.md](14-deploy.md) | packaging, distribution, dependency resolution, install/trust lifecycle, `(publisher_key, extension_id)` identity, the manifest declaration table, `WorkspaceUri`, client↔remote layering |
+| [15-campaigns.md](15-campaigns.md) | `@omp.campaign`, fixed decision points, bounded durable engagement state, verdict arbitration, slot claims, and `omp.campaigns.engage/active/disengage` |
 
 Rule of the set: the owner defines, everyone else links. This file names sibling symbols but never redefines them. The rule is machine-enforced, not merely stated: the generated spec (*The generated spec*, build section) fails CI on a duplicate public symbol owner, because the review caught the rule being violated by the most central symbols in the set.
 

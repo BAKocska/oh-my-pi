@@ -4,8 +4,10 @@
 
 ## The omp shape
 
-The port exposes one soft `goal` device with `goal_set`, `goal_status`, and `goal_complete` operations, and stores typed snapshots in `omp.state` at `StateScope.SESSION`. Its only loop seam is the domain-return `agent_settled` hook: an unmet goal returns `Continue(prompt=..., label=..., collapse_prior=True)`, while a completed goal or Core-provided `LoopSignal.stalled` returns `Settle()` (docs/py/05-hooks.md §4.2 and docs/py/12-agents.md, “Autonomous loops”). There is no `turn_end`/`sendMessage` emulation, message-text repeat detector, context-cleanup hook, or local continuation counter; Core's recursive `ContinuationLedger` owns the budget and `collapse_prior` owns marker compaction. A surviving `Continue` remains subject to `defer_interrupts`, so deferred-interrupt sessions defer this hook-driven continuation like every other drain point.
+The soft `goal` device keeps the original `goal_set`, `goal_status`, and `goal_complete` operations and its typed Session snapshots. `goal_set` now engages the Session-scoped `goal-loop` campaign with journaled `GoalCampaignState`; `goal_complete` records completion and disengages that campaign.
+
+At `SETTLE`, the campaign vetoes stopping with `Continue(inject=...)` while the objective is unmet, then returns `Done()` when the goal is complete or Core reports that progress is stalled. This is the first-class veto-the-stop skeleton from docs/py/15-campaigns.md §1, follows the `Continue` law in §2.2, and is the §6 `session_stop hook` porting shape. The old `agent_settled` hook, local loop return types, and manifest hook row are gone. Core's continuation ledger remains the global backstop rather than campaign-private retry bookkeeping.
 
 ## Gaps
 
-- No frozen-vs-docs signature divergence was encountered for the available `omp.state` and `omp.StateScope` surface.
+- The standing `Until`-bounded policy and `Interlock` described in docs/py/15-campaigns.md are not in the frozen v1 surface. This example instead keeps one Session engagement active, emits the available `Continue` verdict while work remains, and terminates it with the available `Done` verdict on completion or stall.

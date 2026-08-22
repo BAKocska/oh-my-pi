@@ -4,12 +4,12 @@
 
 ## The omp shape
 
-The `queue_task` device and `/queue_task` command append typed `QueuedTask` transitions to the session journal. The entry kind deliberately has no `project` method, and the command returns an empty `ui.Consumed()` rather than a `ui.Prompt` or notice, so waiting task text occupies no prompt slot, message, or other context item (docs/py/09-journal.md, “Recognized methods on the decorated class”; docs/py/07-ui.md §4.15). At each `agent_settled` boundary, the hook marks the one started entry done, folds the journal again, and returns `Continue(prompt=<next task>, collapse_prior=True)` for only the oldest waiting entry; an empty queue returns `Settle()` (docs/py/05-hooks.md §4.2; docs/py/12-agents.md, “Autonomous loops”). The journal is the only truth, so process restarts replay the same queue. Continuation capacity comes only from Core's durable `ContinuationLedger`, and an accepted `Continue` still respects `defer_interrupts`.
+The `queue_task` device and `/queue_task` command append typed `QueuedTask` transitions to the session journal, then imperatively engage the Session-scoped `task-queue-drain` campaign with `queue=True` as specified by docs/py/15-campaigns.md §4.3. The entry kind deliberately has no `project` method, and the command returns an empty `ui.Consumed()` rather than a `ui.Prompt` or notice, so waiting task text occupies no prompt slot, message, or other context item (docs/py/09-journal.md, “Recognized methods on the decorated class”; docs/py/07-ui.md §4.15).
+
+At `omp.SETTLE`, the campaign folds the journal, marks the one started entry done, and emits `omp.Continue(inject=<next task>)` for only the oldest waiting entry. A drained queue emits `omp.Done()`. This is doc-15 §1's takeover skeleton and §6's “Todo completion reminder” porting shape expressed through the frozen verdict vocabulary (§2.2, §4.0-4.5), rather than a domain hook that hand-rolls settlement control. The journal remains the only queue state and therefore reconstructs the same ordering after process replacement. `omp.Ladder(8)` provides the campaign-local finite bound; Core's `ContinuationLedger` remains the global backstop underneath it as described in §2.3.
 
 Unlike `goal-loop`, which repeatedly tests and advances one goal until a completion predicate is met, this extension is a work queue: every entry runs once, in insertion order, under strict serialization.
 
 ## Gaps
 
-- `omp.agents.Settle`: frozen `crates/py/python/omp/agents.py:184-187` is a fieldless dataclass, but `docs/py/05-hooks.md` §4.2 calls `Settle(reason=...)`.
-- `omp.agents.Continue`: frozen `crates/py/python/omp/agents.py:173-181` requires `prompt: str`, but `docs/py/05-hooks.md` §4.2 passes the nonexistent `omp.Item.user_note(...)`.
-- `omp.journal.append` / `omp.journal.state`: frozen `crates/py/python/omp/journal.py:65-74,133-146` defines synchronous `append` and exports no `state`, but `docs/py/05-hooks.md` §4.2 awaits both `omp.journal.append(...)` and `omp.journal.state(...)`.
+- Frozen v1 engagement has no idempotency key or atomic engage-if-absent operation. Every enqueue therefore requests an engagement; the named `task-queue` claim and `queue=True` serialize races durably. Once the first engagement drains the journal, redundant queued engagements observe no waiting task and immediately return `omp.Done()`.

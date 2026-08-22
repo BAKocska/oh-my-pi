@@ -13,11 +13,14 @@ rev = 1
 module = "task_queue"
 summary = "Append a task to the hidden, strictly serialized session queue."
 
-[[hooks]]
-event = "agent_settled"
-phase = "domain"
-order = 0
-failure = "settle"
+[[declarations]]
+id = "task-queue-drain"
+kind = "campaign"
+module = "task_queue"
+key = "task-queue-drain"
+trigger = "lazy"
+api = 1
+failure = "fail-open"
 
 [[declarations]]
 id = "queue_task"

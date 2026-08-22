@@ -2,14 +2,17 @@
 
 ## What the pi original did
 
-`@dreki-gg/pi-plan-mode` ran a two-phase plan-ledger workflow: it switched to a planning model, replaced the active tools with a read-only subset, blocked unsafe shell calls, rewrote stale context across transitions, and exposed a loopback plan viewer before execution continued in a clean session.
+`@dreki-gg/pi-plan-mode` assembled a session regime from a planning model and toolset takeover, a standing write guard, and a three-step decision gate before settlement. It also re-registered tools, rewrote stale context, and hosted a loopback plan viewer.
 
 ## The omp shape
 
-The `plan` soft tool appends typed enter/exit transitions to SESSION-scoped `omp.state`; status is rebuilt by folding that log, and exit appends the completed `Plan` to the same session journal before leaving planning mode. While active, a fail-closed `tool_call` PRECHECK returns `Deny(code="plan_readonly")` for core `write`/`edit` calls and for bash whose Core-supplied `BashIR.is_read_only()` is false. A `turn_start` TRANSFORM changes only the planning model and thinking selection. It never patches `enabled_tools` or otherwise mutates the tool array, which remains byte-identical across transitions; this deletes the pi extension's per-transition tool re-registration and its prompt-cache churn. Client-side context rewriting and the loopback HTTP viewer are also deleted (`docs/py/05-hooks.md` §4.3, “Two-phase plan mode”).
+`/plan on` engages one Session-scoped `plan-mode` campaign; `/plan off` records the completed typed `Plan` and disengages it. The selected model and thinking level live in the campaign's journaled `PlanModeState`, not module state or a separately folded transition log.
+
+The campaign declares `binds=("toolset", "model")` and `claims=("mode",)`. Its CONTEXT and PRE_MODEL reactions bind the read-only planning toolset and the selected planning inference configuration. This uses Core's scoped binding stack rather than re-registering tools or patching `enabled_tools`, preserving the byte-identical tool-array concern across transitions. ADMISSION retains the former fail-closed PRECHECK behavior: core `write` and `edit` calls and any bash call that Core's analyzed IR does not classify as read-only receive `Deny("plan is read-only", code="plan_readonly")`. At SETTLE, `Ladder(3)` bounds the decision reminder before `Exhaust.SETTLE` gives up.
+
+This is the regime shape from `docs/py/15-campaigns.md` §7: one Session campaign owns the mode claim, bindings, guard, and bounded decision gate. Client-side context rewriting and the loopback viewer remain deleted.
 
 ## Gaps
 
-- `omp.BashIR` is required by `ToolCallEvent.bash` and `BashIR.is_read_only()` in `docs/py/06-policy.md` §4 and the worked port in `docs/py/05-hooks.md` §4.3, but `crates/py/python/omp/__init__.py` does not import or export it; `crates/py/python/omp/events.py` only names it as an unresolved postponed annotation.
-- `omp.ModelRef` is the documented type of `TurnStartEvent.model` in `docs/py/05-hooks.md` §3.3, but `crates/py/python/omp/__init__.py` does not export it and `crates/py/python/omp/events.py` only names it as an unresolved postponed annotation.
-- `turn_start.thinking` is required to switch model and thinking together, but frozen `TurnStartEvent` in `crates/py/python/omp/events.py` has no `thinking` field, and the mutable-field contract in `docs/py/05-hooks.md` §3.3 lists only `turn_start.{model, route, deadline}`. The extension emits the requested `Modify.patch` key, but the frozen event contract cannot validate or apply it.
+- The §6 plan decision gate specifies a ×3 gate with `revive=reset` and `ResetOn(user prompt)`. Frozen v1 has `Ladder(3)`, but not `revive` or `ResetOn`, so this port has the bound without reset-on-prompt/revival behavior.
+- The §7 regime fields `members` and `dwell` are doc-only. Frozen v1 cannot supervise separate permanent write-guard and transient decision-gate members, so this port approximates the regime with one campaign; it also cannot declare dwell hysteresis.

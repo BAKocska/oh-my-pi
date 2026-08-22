@@ -6,18 +6,15 @@ description = "A session-scoped read-only planning mode with typed plan handoff.
 requires = []
 capabilities = []
 
+[[declarations]]
+id = "plan-mode"
+kind = "campaign"
+module = "plan_mode"
+key = "plan-mode"
+trigger = "lazy"
+api = 1
+failure = "fail-closed"
+
 [[tools]]
 name = "plan"
 kind = "soft"
-
-[[hooks]]
-event = "tool_call"
-phase = "precheck"
-order = 50
-failure = "fail-closed"
-
-[[hooks]]
-event = "turn_start"
-phase = "transform"
-order = 50
-failure = "fail-open"

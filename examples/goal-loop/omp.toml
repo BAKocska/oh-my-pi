@@ -2,7 +2,7 @@ id = "examples.goal-loop"
 entry = "goal_loop"
 kind = "extension"
 version = "0.1.0"
-description = "A session-scoped autonomous goal loop with Core-owned stall and continuation accounting."
+description = "A session-scoped autonomous goal campaign with durable settle control."
 requires = []
 capabilities = []
 
@@ -10,8 +10,11 @@ capabilities = []
 name = "goal"
 kind = "soft"
 
-[[hooks]]
-event = "agent_settled"
-phase = "domain"
-order = 0
-failure = "settle"
+[[declarations]]
+id = "goal-loop"
+kind = "campaign"
+module = "goal_loop"
+key = "goal-loop"
+trigger = "lazy"
+api = 1
+failure = "fail-open"
