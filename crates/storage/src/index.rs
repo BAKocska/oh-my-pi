@@ -8,7 +8,7 @@
 use std::{fmt, path::Path, str::FromStr, time::Duration};
 
 use omp_core::Str;
-use omp_proto::{inference::v1 as pb, prost::Message as _};
+use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 use parking_lot::Mutex;
 use rusqlite::{
 	Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -20,14 +20,14 @@ use thiserror::Error;
 
 use crate::transcript::{SessionId, TitleSource};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS index_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 1);
+INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 3);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     remote INTEGER NOT NULL,
     journal_watermark INTEGER NOT NULL,
     last_event_index INTEGER,
-    repair_watermark INTEGER NOT NULL DEFAULT 0
+    repair_watermark INTEGER NOT NULL DEFAULT 0,
+    serving_provider TEXT,
+    serving_model TEXT,
+    context_anchor INTEGER,
+    context_revision INTEGER NOT NULL DEFAULT 0,
+    compaction_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_recent ON sessions(project, updated_ms DESC, id);
 CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent);
@@ -93,6 +98,39 @@ CREATE TABLE IF NOT EXISTS receipts (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS receipts_time ON receipts(ts_ms, session_id);
 CREATE INDEX IF NOT EXISTS receipts_model ON receipts(provider, model, ts_ms);
+
+CREATE TABLE IF NOT EXISTS item_outcomes (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    event_index INTEGER NOT NULL,
+    user_messages INTEGER NOT NULL DEFAULT 0,
+    assistant_messages INTEGER NOT NULL DEFAULT 0,
+    system_messages INTEGER NOT NULL DEFAULT 0,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    tool_results INTEGER NOT NULL DEFAULT 0,
+    tool_errors INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(session_id, event_index)
+) WITHOUT ROWID;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
+    session_id UNINDEXED,
+    event_index UNINDEXED,
+    prompt,
+    tokenize = 'unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS model_performance (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    event_index INTEGER NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    ttft_ms INTEGER,
+    duration_ms INTEGER,
+    output_tokens INTEGER NOT NULL,
+    PRIMARY KEY(session_id, event_index)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS model_performance_model
+    ON model_performance(provider, model, ts_ms);
 ";
 
 /// Whether an index is writable authority or a stale offline projection.
@@ -170,12 +208,31 @@ pub struct JournalPosition {
 pub enum EventProjection<'a> {
 	/// The event only affects recency, entry count, and kind membership.
 	Plain,
+	/// Private prompt text admitted to the local FTS projection.
+	Prompt {
+		/// Prompt text indexed for owner-local search.
+		text: &'a str,
+	},
+	/// Monotonic context position attached to a durable boundary.
+	Context {
+		/// Prompt anchor event, when one exists.
+		anchor:   Option<u64>,
+		/// Monotonic context revision.
+		revision: u64,
+		/// Monotonic compaction epoch.
+		epoch:    u64,
+	},
 	/// The event changes the session title.
 	Title {
 		/// Assigned title.
 		title:  &'a str,
 		/// Source that assigned the title.
 		source: TitleSource,
+	},
+	/// One canonical thread item used for message and tool-outcome counts.
+	ThreadItem {
+		/// Durable item, counted exactly once at its physical journal event.
+		item: &'a thread_pb::Item,
 	},
 	/// The event is an inference receipt with canonical rich accounting.
 	TurnReceipt {
@@ -449,6 +506,77 @@ pub struct ReceiptAccounting {
 	pub cost:  pb::Cost,
 }
 
+/// Aggregate message, tool, request, token, and cost statistics for one session
+/// tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionStatistics {
+	/// User message items.
+	pub user_messages:      u64,
+	/// Assistant message items.
+	pub assistant_messages: u64,
+	/// System message items.
+	pub system_messages:    u64,
+	/// Tool call items.
+	pub tool_calls:         u64,
+	/// Settled tool result items.
+	pub tool_results:       u64,
+	/// Tool results carrying an error outcome.
+	pub tool_errors:        u64,
+	/// Canonical rich usage across every selected receipt.
+	pub usage:              pb::Usage,
+	/// Canonical cost, including every component field.
+	pub cost:               pb::Cost,
+	/// Durable inference receipt count.
+	pub requests:           u64,
+	/// Failed inference receipt count.
+	pub request_errors:     u64,
+	/// Number of distinct sessions included in the rollup.
+	pub sessions:           u64,
+}
+
+/// One owner-local prompt search result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHit {
+	/// Session containing the prompt.
+	pub session:     SessionId,
+	/// Stable physical event index.
+	pub event_index: u64,
+	/// Exact indexed prompt text.
+	pub prompt:      Str,
+}
+
+/// Monotonic context position projected from durable boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPosition {
+	/// Prompt anchor event, when set.
+	pub anchor:   Option<u64>,
+	/// Context revision.
+	pub revision: u64,
+	/// Compaction epoch.
+	pub epoch:    u64,
+}
+
+/// One settled serving-model performance sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPerformanceSample {
+	/// Session contributing the sample.
+	pub session:       SessionId,
+	/// Physical receipt event index.
+	pub event_index:   u64,
+	/// Epoch-millisecond settlement time.
+	pub ts_ms:         u64,
+	/// Serving provider.
+	pub provider:      Str,
+	/// Serving model.
+	pub model:         Str,
+	/// Time to first token.
+	pub ttft_ms:       Option<u64>,
+	/// Total request duration.
+	pub duration_ms:   Option<u64>,
+	/// Output token count.
+	pub output_tokens: u64,
+}
+
 /// One parser-produced record admitted only through explicit legacy repair.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairRecord<'a> {
@@ -480,6 +608,7 @@ impl SessionIndex {
 		connection.pragma_update(None, "synchronous", "FULL")?;
 		connection.pragma_update(None, "foreign_keys", "ON")?;
 		connection.execute_batch(SCHEMA)?;
+		migrate_schema(&connection)?;
 		check_schema(&connection)?;
 		Ok(Self {
 			connection: Mutex::new(connection),
@@ -508,6 +637,8 @@ impl SessionIndex {
 			connection.pragma_update(None, "journal_mode", "WAL")?;
 			connection.pragma_update(None, "synchronous", "FULL")?;
 			connection.execute_batch(SCHEMA)?;
+		} else {
+			migrate_schema(&connection)?;
 		}
 		check_schema(&connection)?;
 		connection.pragma_update(None, "query_only", true)?;
@@ -736,6 +867,20 @@ impl SessionIndex {
 		Ok(buckets)
 	}
 
+	/// Aggregates one session and, when requested, every lineage descendant.
+	///
+	/// Recursive traversal uses distinct durable session IDs and joins canonical
+	/// receipt/item rows, so parent-embedded task summaries never duplicate
+	/// child accounting.
+	pub fn session_statistics(
+		&self,
+		session: &SessionId,
+		recursive: bool,
+	) -> Result<SessionStatistics, Error> {
+		let connection = self.connection.lock();
+		session_statistics(&connection, session, recursive)
+	}
+
 	/// Loads exact canonical accounting for one receipt without parsing its
 	/// journal.
 	pub fn receipt(
@@ -761,6 +906,118 @@ impl SessionIndex {
 			.transpose()
 	}
 
+	/// Searches private prompt rows with FTS5 and deterministic Unicode
+	/// substring fallback.
+	pub fn search_prompts(&self, query: &str, limit: u32) -> Result<Vec<PromptHit>, Error> {
+		let connection = self.connection.lock();
+		let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+		let mut hits = Vec::new();
+		{
+			let mut statement = connection.prepare(
+				"SELECT session_id, event_index, prompt FROM prompts_fts
+				 WHERE prompts_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+			)?;
+			let rows = statement.query_map(params![phrase, i64::from(limit)], |row| {
+				Ok(PromptHit {
+					session:     SessionId(Str::new(row.get::<_, String>(0)?)),
+					event_index: row.get(1)?,
+					prompt:      Str::new(row.get::<_, String>(2)?),
+				})
+			})?;
+			for row in rows {
+				hits.push(row?);
+			}
+		}
+		if hits.len() < usize::try_from(limit).expect("u32 fits in usize") {
+			let remaining = usize::try_from(limit)
+				.expect("u32 fits in usize")
+				.saturating_sub(hits.len());
+			let mut statement = connection.prepare(
+				"SELECT session_id, event_index, prompt FROM prompts_fts
+				 WHERE instr(lower(prompt), lower(?1)) > 0
+				 ORDER BY rowid DESC LIMIT ?2",
+			)?;
+			let rows = statement.query_map(
+				params![query, i64::try_from(remaining).expect("search limit fits in i64")],
+				|row| {
+					Ok(PromptHit {
+						session:     SessionId(Str::new(row.get::<_, String>(0)?)),
+						event_index: row.get(1)?,
+						prompt:      Str::new(row.get::<_, String>(2)?),
+					})
+				},
+			)?;
+			for row in rows {
+				let hit = row?;
+				if !hits
+					.iter()
+					.any(|known| known.session == hit.session && known.event_index == hit.event_index)
+				{
+					hits.push(hit);
+				}
+			}
+		}
+		hits.truncate(usize::try_from(limit).expect("u32 fits in usize"));
+		Ok(hits)
+	}
+
+	/// Loads the latest monotonic context position for one session.
+	pub fn context_position(&self, session: &SessionId) -> Result<Option<ContextPosition>, Error> {
+		let connection = self.connection.lock();
+		connection
+			.query_row(
+				"SELECT context_anchor, context_revision, compaction_epoch
+				 FROM sessions WHERE id = ?1",
+				[session.0.as_str()],
+				|row| {
+					Ok(ContextPosition {
+						anchor:   row.get(0)?,
+						revision: row.get(1)?,
+						epoch:    row.get(2)?,
+					})
+				},
+			)
+			.optional()
+			.map_err(Error::from)
+	}
+
+	/// Lists settled serving-model samples newest first.
+	pub fn model_performance(
+		&self,
+		provider: &str,
+		model: &str,
+		since_ms: u64,
+		limit: u32,
+	) -> Result<Vec<ModelPerformanceSample>, Error> {
+		let connection = self.connection.lock();
+		let mut statement = connection.prepare(
+			"SELECT session_id, event_index, ts_ms, provider, model, ttft_ms,
+			 duration_ms, output_tokens FROM model_performance
+			 WHERE provider = ?1 AND model = ?2 AND ts_ms >= ?3
+			 ORDER BY ts_ms DESC LIMIT ?4",
+		)?;
+		let rows = statement.query_map(
+			params![provider, model, sql_u64(since_ms, "since_ms")?, i64::from(limit),],
+			|row| {
+				Ok(ModelPerformanceSample {
+					session:       SessionId(Str::new(row.get::<_, String>(0)?)),
+					event_index:   row.get(1)?,
+					ts_ms:         row.get(2)?,
+					provider:      Str::new(row.get::<_, String>(3)?),
+					model:         Str::new(row.get::<_, String>(4)?),
+					ttft_ms:       row.get(5)?,
+					duration_ms:   row.get(6)?,
+					output_tokens: row.get(7)?,
+				})
+			},
+		)?;
+		let mut samples = Vec::new();
+		for row in rows {
+			samples.push(row?);
+		}
+		Ok(samples)
+	}
+
 	const fn require_writer(&self) -> Result<(), Error> {
 		match (self.authority, self.writable) {
 			(IndexAuthority::Authoritative, true) => Ok(()),
@@ -768,6 +1025,42 @@ impl SessionIndex {
 			(IndexAuthority::OfflineCache { .. }, _) => Err(Error::ReadOnlyCache),
 		}
 	}
+}
+
+fn migrate_schema(connection: &Connection) -> Result<(), Error> {
+	let mut version = connection.query_row(
+		"SELECT schema_version FROM index_meta WHERE singleton = 1",
+		[],
+		|row| row.get::<_, i64>(0),
+	)?;
+	if version == 1 {
+		connection.execute_batch(
+			"ALTER TABLE sessions ADD COLUMN serving_provider TEXT;
+			 ALTER TABLE sessions ADD COLUMN serving_model TEXT;
+			 ALTER TABLE sessions ADD COLUMN context_anchor INTEGER;
+			 ALTER TABLE sessions ADD COLUMN context_revision INTEGER NOT NULL DEFAULT 0;
+			 ALTER TABLE sessions ADD COLUMN compaction_epoch INTEGER NOT NULL DEFAULT 0;
+			 UPDATE index_meta SET schema_version = 2 WHERE singleton = 1;",
+		)?;
+		version = 2;
+	}
+	if version == 2 {
+		connection.execute_batch(
+			"CREATE TABLE IF NOT EXISTS item_outcomes (
+			    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+			    event_index INTEGER NOT NULL,
+			    user_messages INTEGER NOT NULL DEFAULT 0,
+			    assistant_messages INTEGER NOT NULL DEFAULT 0,
+			    system_messages INTEGER NOT NULL DEFAULT 0,
+			    tool_calls INTEGER NOT NULL DEFAULT 0,
+			    tool_results INTEGER NOT NULL DEFAULT 0,
+			    tool_errors INTEGER NOT NULL DEFAULT 0,
+			    PRIMARY KEY(session_id, event_index)
+			 ) WITHOUT ROWID;
+			 UPDATE index_meta SET schema_version = 3 WHERE singleton = 1;",
+		)?;
+	}
+	Ok(())
 }
 
 fn check_schema(connection: &Connection) -> Result<(), Error> {
@@ -861,8 +1154,55 @@ fn index_event_inner(
 				params![event.session.0.as_str(), title, <&'static str>::from(source)],
 			)?;
 		},
+		EventProjection::Prompt { text } => {
+			transaction.execute(
+				"INSERT INTO prompts_fts(session_id, event_index, prompt) VALUES (?1, ?2, ?3)",
+				params![event.session.0.as_str(), sql_u64(position.event_index, "event_index")?, text,],
+			)?;
+		},
+		EventProjection::Context { anchor, revision, epoch } => {
+			let changed = transaction.execute(
+				"UPDATE sessions SET context_anchor = ?2, context_revision = ?3,
+				 compaction_epoch = ?4
+				 WHERE id = ?1 AND context_revision <= ?3 AND compaction_epoch <= ?4",
+				params![
+					event.session.0.as_str(),
+					anchor
+						.map(|anchor| sql_u64(anchor, "context_anchor"))
+						.transpose()?,
+					sql_u64(revision, "context_revision")?,
+					sql_u64(epoch, "compaction_epoch")?,
+				],
+			)?;
+			if changed != 1 {
+				return Err(Error::NonMonotonicWatermark);
+			}
+		},
+		EventProjection::ThreadItem { item } => {
+			insert_item_outcome(transaction, event, position, item)?;
+		},
 		EventProjection::TurnReceipt { outcome, failed } => {
 			insert_receipt(transaction, event, position, outcome, failed)?;
+			transaction.execute(
+				"UPDATE sessions SET serving_provider = ?2, serving_model = ?3 WHERE id = ?1",
+				params![event.session.0.as_str(), outcome.provider.as_str(), outcome.model.as_str()],
+			)?;
+			let usage = outcome.usage.as_ref().ok_or(Error::MissingUsage)?;
+			transaction.execute(
+				"INSERT OR REPLACE INTO model_performance(
+				 session_id, event_index, ts_ms, provider, model, ttft_ms, duration_ms, output_tokens
+				 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+				params![
+					event.session.0.as_str(),
+					sql_u64(position.event_index, "event_index")?,
+					sql_u64(event.ts_ms, "ts_ms")?,
+					outcome.provider.as_str(),
+					outcome.model.as_str(),
+					outcome.ttft_ms,
+					outcome.duration_ms,
+					usage.output_tokens,
+				],
+			)?;
 			let status = if failed {
 				SessionStatus::Error
 			} else {
@@ -880,6 +1220,53 @@ fn index_event_inner(
 			])?;
 		},
 	}
+	Ok(())
+}
+
+fn insert_item_outcome(
+	transaction: &Transaction<'_>,
+	event: &IndexedEvent<'_>,
+	position: JournalPosition,
+	item: &thread_pb::Item,
+) -> Result<(), Error> {
+	let mut user_messages = 0_u8;
+	let mut assistant_messages = 0_u8;
+	let mut system_messages = 0_u8;
+	let mut tool_calls = 0_u8;
+	let mut tool_results = 0_u8;
+	let mut tool_errors = 0_u8;
+	match item.kind.as_ref() {
+		Some(thread_pb::item::Kind::Message(message)) => {
+			match thread_pb::Role::try_from(message.role).unwrap_or(thread_pb::Role::Unspecified) {
+				thread_pb::Role::User => user_messages = 1,
+				thread_pb::Role::Assistant => assistant_messages = 1,
+				thread_pb::Role::System => system_messages = 1,
+				thread_pb::Role::Unspecified => {},
+			}
+		},
+		Some(thread_pb::item::Kind::ToolCall(_)) => tool_calls = 1,
+		Some(thread_pb::item::Kind::ToolResult(result)) => {
+			tool_results = 1;
+			tool_errors = u8::from(result.is_error);
+		},
+		None => {},
+	}
+	transaction.execute(
+		"INSERT INTO item_outcomes(
+		 session_id, event_index, user_messages, assistant_messages, system_messages,
+		 tool_calls, tool_results, tool_errors
+		 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+		params![
+			event.session.0.as_str(),
+			sql_u64(position.event_index, "event_index")?,
+			user_messages,
+			assistant_messages,
+			system_messages,
+			tool_calls,
+			tool_results,
+			tool_errors,
+		],
+	)?;
 	Ok(())
 }
 
@@ -1002,6 +1389,87 @@ fn decode_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
 	})
 }
 
+fn session_statistics(
+	connection: &Connection,
+	session: &SessionId,
+	recursive: bool,
+) -> Result<SessionStatistics, Error> {
+	let scope = if recursive {
+		"WITH RECURSIVE subtree(id) AS (
+		    SELECT ?1
+		    UNION
+		    SELECT sessions.id FROM sessions JOIN subtree ON sessions.parent = subtree.id
+		 )"
+	} else {
+		"WITH subtree(id) AS (SELECT ?1)"
+	};
+	let query = UsageQuery { group_by: SmallVec::new(), ..UsageQuery::default() };
+	let mut usage_query = String::from(scope);
+	usage_query.push_str(
+		", scoped AS (
+		    SELECT receipts.* FROM receipts JOIN subtree ON subtree.id = receipts.session_id
+		 ) SELECT ",
+	);
+	usage_query.push_str(USAGE_AGGREGATE_COLUMNS);
+	usage_query.push_str(" FROM scoped HAVING COUNT(*) > 0");
+	let aggregate = connection
+		.query_row(&usage_query, [session.0.as_str()], |row| decode_usage_bucket(row, &query))
+		.optional()?;
+	let (mut usage, cost, requests, request_errors) = aggregate.map_or_else(
+		|| (pb::Usage::default(), pb::Cost::default(), 0, 0),
+		|bucket| (bucket.usage, bucket.cost, bucket.requests, bucket.errors),
+	);
+
+	let mut detail_query = String::from(scope);
+	detail_query.push_str(
+		" SELECT receipts.usage FROM receipts
+		  JOIN subtree ON subtree.id = receipts.session_id
+		  ORDER BY receipts.session_id, receipts.event_index",
+	);
+	let mut statement = connection.prepare(&detail_query)?;
+	let encoded = statement.query_map([session.0.as_str()], |row| row.get::<_, Vec<u8>>(0))?;
+	for row in encoded {
+		let receipt = pb::Usage::decode(row?.as_slice())?;
+		merge_detail(&mut usage.detail, receipt.detail);
+	}
+	drop(statement);
+
+	let mut outcome_query = String::from(scope);
+	outcome_query.push_str(
+		" SELECT
+		    COALESCE(SUM(user_messages), 0),
+		    COALESCE(SUM(assistant_messages), 0),
+		    COALESCE(SUM(system_messages), 0),
+		    COALESCE(SUM(tool_calls), 0),
+		    COALESCE(SUM(tool_results), 0),
+		    COALESCE(SUM(tool_errors), 0)
+		  FROM item_outcomes JOIN subtree ON subtree.id = item_outcomes.session_id",
+	);
+	let (user_messages, assistant_messages, system_messages, tool_calls, tool_results, tool_errors) =
+		connection.query_row(&outcome_query, [session.0.as_str()], |row| {
+			Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+		})?;
+
+	let mut session_count_query = String::from(scope);
+	session_count_query.push_str(" SELECT COUNT(*) FROM subtree");
+	let sessions =
+		connection.query_row(&session_count_query, [session.0.as_str()], |row| row.get(0))?;
+
+	Ok(SessionStatistics {
+		user_messages,
+		assistant_messages,
+		system_messages,
+		tool_calls,
+		tool_results,
+		tool_errors,
+		usage,
+		cost,
+		requests,
+		request_errors,
+		sessions,
+	})
+}
+
 fn session_accounting(
 	connection: &Connection,
 	session: &SessionId,
@@ -1105,6 +1573,18 @@ where
 	sql.push(')');
 }
 
+const USAGE_AGGREGATE_COLUMNS: &str = "
+	SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens),
+	CASE WHEN MIN(accuracy) = MAX(accuracy) THEN MIN(accuracy) ELSE 3 END,
+	SUM(COALESCE(total_tokens, input_tokens + output_tokens + cache_read_tokens +
+	cache_write_tokens)),
+	SUM(context_tokens), SUM(orchestration_input_tokens), SUM(orchestration_cache_read_tokens),
+	SUM(orchestration_output_tokens), SUM(premium_requests), SUM(reasoning_tokens),
+	SUM(cache_ephemeral_5m_tokens), SUM(cache_ephemeral_1h_tokens), SUM(web_search_requests),
+	SUM(web_fetch_requests), SUM(cost_nanos_usd), MAX(cost_estimated), SUM(input_nanos_usd),
+	SUM(output_nanos_usd), SUM(cache_read_nanos_usd), SUM(cache_write_nanos_usd), COUNT(*),
+	SUM(failed), SUM(COALESCE(duration_ms, 0)), COUNT(DISTINCT session_id)";
+
 fn usage_sql(query: &UsageQuery) -> Result<(String, Vec<Value>), Error> {
 	let mut sql = String::from(
 		"WITH scoped AS (SELECT r.*, s.project, s.kind AS session_kind FROM receipts r JOIN \
@@ -1155,18 +1635,8 @@ fn usage_sql(query: &UsageQuery) -> Result<(String, Vec<Value>), Error> {
 		sql.push_str(expression);
 		sql.push_str(" AS bucket_start_ms, ");
 	}
-	sql.push_str(
-		"SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens),
-		 CASE WHEN MIN(accuracy) = MAX(accuracy) THEN MIN(accuracy) ELSE 3 END,
-		 SUM(COALESCE(total_tokens, input_tokens + output_tokens + cache_read_tokens + \
-		 cache_write_tokens)),
-		 SUM(context_tokens), SUM(orchestration_input_tokens), SUM(orchestration_cache_read_tokens),
-		 SUM(orchestration_output_tokens), SUM(premium_requests), SUM(reasoning_tokens),
-		 SUM(cache_ephemeral_5m_tokens), SUM(cache_ephemeral_1h_tokens), SUM(web_search_requests),
-		 SUM(web_fetch_requests), SUM(cost_nanos_usd), MAX(cost_estimated), SUM(input_nanos_usd),
-		 SUM(output_nanos_usd), SUM(cache_read_nanos_usd), SUM(cache_write_nanos_usd), COUNT(*),
-		 SUM(failed), SUM(COALESCE(duration_ms, 0)), COUNT(DISTINCT session_id) FROM scoped",
-	);
+	sql.push_str(USAGE_AGGREGATE_COLUMNS);
+	sql.push_str(" FROM scoped");
 	if group_expressions.is_empty() {
 		sql.push_str(" HAVING COUNT(*) > 0");
 	} else {

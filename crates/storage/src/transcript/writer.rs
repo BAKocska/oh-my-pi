@@ -8,7 +8,7 @@ use std::{
 	io::{Seek, SeekFrom, Write},
 	iter::FusedIterator,
 	mem::size_of,
-	path::Path,
+	path::{Path, PathBuf},
 };
 
 use bytes::BytesMut;
@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 use thiserror::Error as ThisError;
 
 use super::{
-	codec::{Error, Header, read_header, read_line, write_header, write_line},
+	codec::{Error, Header, write_header, write_line},
 	event::{Event, Kind},
 };
 
@@ -123,7 +123,8 @@ impl IntoIterator for IndexRun {
 
 /// A transcript writer that owns the single header and appends event lines.
 pub struct Writer {
-	file:       File,
+	file:       Option<File>,
+	pending:    Option<(PathBuf, Header)>,
 	next_index: u64,
 	line:       BytesMut,
 	poisoned:   bool,
@@ -281,74 +282,76 @@ impl Writer {
 		file.write_all(&line)?;
 		file.sync_data()?;
 		line.clear();
-		Ok(Self { file, next_index: 0, line, poisoned: false })
+		Ok(Self { file: Some(file), pending: None, next_index: 0, line, poisoned: false })
 	}
 
-	/// Opens an existing transcript for append, repairing malformed trailing
-	/// records.
+	/// Opens an existing transcript for append and removes only an unterminated
+	/// Creates a fileless writer whose first append atomically publishes the
+	/// header and first durable event group.
 	///
-	/// Complete malformed lines in the middle remain in place as tombstones so
-	/// physical event indexes stay stable. A malformed trailing run cannot be
-	/// referenced by a later event and is truncated before appending resumes.
-	pub fn open_append(path: &Path) -> Result<Self, Error> {
-		let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-		let mut bytes = Vec::new();
-		std::io::Read::read_to_end(&mut file, &mut bytes)?;
-		if bytes.is_empty() {
-			return Err(Error::MissingHeader);
+	/// Dropping this writer before an append leaves no filesystem entry.
+	pub fn create_lazy(path: &Path, header: &Header) -> Result<Self, Error> {
+		if header.v != 4 {
+			return Err(Error::InvalidHeaderVersion(header.v));
 		}
+		if path.exists() {
+			return Err(Error::Io(std::io::Error::new(
+				std::io::ErrorKind::AlreadyExists,
+				"transcript path already exists",
+			)));
+		}
+		Ok(Self {
+			file:       None,
+			pending:    Some((path.to_owned(), header.clone())),
+			next_index: 0,
+			line:       BytesMut::new(),
+			poisoned:   false,
+		})
+	}
 
-		let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
-			read_header(&bytes)?;
+	/// trailing record.
+	///
+	/// Every newline-terminated malformed record remains a stable tombstone.
+	/// Scanning is bounded by [`super::reader::READ_BUFFER_BYTES`].
+	pub fn open_append(path: &Path) -> Result<Self, Error> {
+		let reader = super::Reader::open(path)?;
+		let next_index = reader.next_index();
+		let append_offset = reader.append_offset();
+		for index in 0..next_index {
+			if let Some(super::Entry::Tombstone(raw)) = reader.log().get(index)
+				&& let Ok(source) = serde_json::from_str::<String>(raw.get())
+				&& serde_json::from_str::<Header>(&source).is_ok()
+			{
+				return Err(Error::DuplicateHeader);
+			}
+		}
+		let header_terminated = append_offset != 0
+			&& std::fs::File::open(path)
+				.and_then(|mut file| {
+					file.seek(SeekFrom::Start(append_offset.saturating_sub(1)))?;
+					let mut byte = [0_u8; 1];
+					std::io::Read::read_exact(&mut file, &mut byte)?;
+					Ok(byte[0] == b'\n')
+				})
+				.unwrap_or(false);
+		drop(reader);
+		let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+		if !header_terminated && next_index == 0 && file.metadata()?.len() == append_offset {
 			file.seek(SeekFrom::End(0))?;
 			file.write_all(b"\n")?;
 			file.sync_data()?;
-			return Ok(Self { file, next_index: 0, line: BytesMut::new(), poisoned: false });
-		};
-		read_header(&bytes[..header_end])?;
-
-		let mut next_index = 0_u64;
-		let mut malformed_tail = None;
-		let mut start = header_end + 1;
-		while let Some(relative_end) = bytes[start..].iter().position(|byte| *byte == b'\n') {
-			let end = start + relative_end;
-			let line = &bytes[start..end];
-			if serde_json::from_slice::<Header>(line).is_ok() {
-				return Err(Error::DuplicateHeader);
-			}
-			if read_line(line).is_ok() {
-				malformed_tail = None;
-			} else if malformed_tail.is_none() {
-				malformed_tail =
-					Some((u64::try_from(start).expect("file offsets fit in u64"), next_index));
-			}
-			next_index = next_index.saturating_add(1);
-			start = end + 1;
-		}
-
-		if start < bytes.len() {
-			let tail = &bytes[start..];
-			if serde_json::from_slice::<Header>(tail).is_ok() {
-				return Err(Error::DuplicateHeader);
-			}
-			if read_line(tail).is_ok() {
-				malformed_tail = None;
-				next_index = next_index.saturating_add(1);
-				file.seek(SeekFrom::End(0))?;
-				file.write_all(b"\n")?;
-				file.sync_data()?;
-			} else if malformed_tail.is_none() {
-				malformed_tail =
-					Some((u64::try_from(start).expect("file offsets fit in u64"), next_index));
-			}
-		}
-		if let Some((offset, repaired_next_index)) = malformed_tail {
-			file.set_len(offset)?;
+		} else if file.metadata()?.len() > append_offset {
+			file.set_len(append_offset)?;
 			file.sync_data()?;
-			next_index = repaired_next_index;
 		}
 		file.seek(SeekFrom::End(0))?;
-		Ok(Self { file, next_index, line: BytesMut::new(), poisoned: false })
+		Ok(Self {
+			file: Some(file),
+			pending: None,
+			next_index,
+			line: BytesMut::new(),
+			poisoned: false,
+		})
 	}
 
 	/// Rejects an attempt to write another header to this transcript.
@@ -388,27 +391,49 @@ impl Writer {
 			return Ok(SmallVec::new());
 		}
 
-		let original_len = self.file.append_len().map_err(|source| AppendManyError {
-			source:   JournalError::RolledBack { source: Error::Io(source) },
-			appended: IndexRun::default(),
-		})?;
+		if self.file.is_none() {
+			return self.materialize_many(events);
+		}
+		let original_len = self
+			.file
+			.as_mut()
+			.expect("pending writer materialized above")
+			.append_len()
+			.map_err(|source| AppendManyError {
+				source:   JournalError::RolledBack { source: Error::Io(source) },
+				appended: IndexRun::default(),
+			})?;
 		let first_index = self.next_index;
 		let mut indexes = SmallVec::with_capacity(ends.len());
 		let mut start = 0;
 		for end in ends {
 			let index = self.next_index;
-			let line_start = match self.file.append_len() {
+			let line_start = match self
+				.file
+				.as_mut()
+				.expect("writer file is materialized")
+				.append_len()
+			{
 				Ok(line_start) => line_start,
 				Err(error) => {
 					let appended = IndexRun::from_contiguous(&indexes);
 					let (source, appended) = if appended.is_empty() {
 						(JournalError::RolledBack { source: Error::Io(error) }, appended)
 					} else {
-						match self.file.sync_data() {
+						match self
+							.file
+							.as_mut()
+							.expect("writer file is materialized")
+							.sync_data()
+						{
 							Ok(()) => (JournalError::RolledBack { source: Error::Io(error) }, appended),
 							Err(write) => {
 								self.next_index = first_index;
-								let rollback = rollback_error(&mut self.file, original_len, write);
+								let rollback = rollback_error(
+									self.file.as_mut().expect("writer file is materialized"),
+									original_len,
+									write,
+								);
 								(self.classify(rollback, appended), IndexRun::default())
 							},
 						}
@@ -417,7 +442,11 @@ impl Writer {
 					return Err(AppendManyError { source, appended });
 				},
 			};
-			let result = append_all(&mut self.file, line_start, &self.line[start..end]);
+			let result = append_all(
+				self.file.as_mut().expect("writer file is materialized"),
+				line_start,
+				&self.line[start..end],
+			);
 			if let Err(source) = result {
 				let journal_error = self.finish_failed_many(source, &indexes, index);
 				self.line.clear();
@@ -428,7 +457,9 @@ impl Writer {
 			start = end;
 		}
 
-		if let Err(source) = commit(&mut self.file, original_len) {
+		if let Err(source) =
+			commit(self.file.as_mut().expect("writer file is materialized"), original_len)
+		{
 			self.next_index = first_index;
 			let source = self.classify(source, IndexRun::from_contiguous(&indexes));
 			self.line.clear();
@@ -460,8 +491,13 @@ impl Writer {
 		if ends.is_empty() {
 			return Ok(SmallVec::new());
 		}
+		if self.file.is_none() {
+			return self.materialize_atomic(events);
+		}
 		let original_len = self
 			.file
+			.as_mut()
+			.expect("writer file is materialized")
 			.append_len()
 			.map_err(|source| JournalError::RolledBack { source: Error::Io(source) })?;
 		let first_index = self.next_index;
@@ -470,8 +506,14 @@ impl Writer {
 				first_index.saturating_add(u64::try_from(offset).expect("event count fits in u64"))
 			})
 			.collect::<SmallVec<u64, 8>>();
-		let result = append_all(&mut self.file, original_len, &self.line)
-			.and_then(|()| commit(&mut self.file, original_len));
+		let result = append_all(
+			self.file.as_mut().expect("writer file is materialized"),
+			original_len,
+			&self.line,
+		)
+		.and_then(|()| {
+			commit(self.file.as_mut().expect("writer file is materialized"), original_len)
+		});
 		self.line.clear();
 		match result {
 			Ok(()) => {
@@ -499,7 +541,75 @@ impl Writer {
 				"transcript byte watermark is unknown after an indeterminate append",
 			)));
 		}
-		Ok(self.file.metadata()?.len())
+		match &self.file {
+			Some(file) => Ok(file.metadata()?.len()),
+			None => Ok(0),
+		}
+	}
+
+	fn materialize_atomic(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, JournalError> {
+		let Some((path, header)) = self.pending.take() else {
+			unreachable!("only pending writers materialize")
+		};
+		let mut bytes = BytesMut::new();
+		if let Err(source) = write_header(&header, &mut bytes) {
+			self.pending = Some((path, header));
+			self.line.clear();
+			return Err(JournalError::RolledBack { source });
+		}
+		bytes.extend_from_slice(b"\n");
+		bytes.extend_from_slice(&self.line);
+		if let Err(source) = crate::atomic::commit(&path, &bytes, || !path.exists()) {
+			self.pending = Some((path, header));
+			self.line.clear();
+			return Err(JournalError::RolledBack { source: Error::Io(std::io::Error::other(source)) });
+		}
+		let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+			Ok(file) => file,
+			Err(source) => {
+				self.poisoned = true;
+				self.line.clear();
+				return Err(
+					JournalIndeterminate {
+						source:   Error::Io(source),
+						written:  IndexRun {
+							first: 0,
+							count: u64::try_from(events.len()).expect("event count fits in u64"),
+						},
+						poisoned: true,
+					}
+					.into(),
+				);
+			},
+		};
+		if let Err(source) = file.seek(SeekFrom::End(0)) {
+			self.poisoned = true;
+			self.line.clear();
+			return Err(
+				JournalIndeterminate {
+					source:   Error::Io(source),
+					written:  IndexRun {
+						first: 0,
+						count: u64::try_from(events.len()).expect("event count fits in u64"),
+					},
+					poisoned: true,
+				}
+				.into(),
+			);
+		}
+		self.file = Some(file);
+		let indexes = (0..events.len())
+			.map(|index| u64::try_from(index).expect("event count fits in u64"))
+			.collect();
+		self.next_index = u64::try_from(events.len()).expect("event count fits in u64");
+		self.line.clear();
+		Ok(indexes)
+	}
+
+	fn materialize_many(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, AppendManyError> {
+		self
+			.materialize_atomic(events)
+			.map_err(|source| AppendManyError { source, appended: IndexRun::default() })
 	}
 
 	fn stage(&mut self, events: &[Event]) -> Result<SmallVec<usize, 8>, Error> {
@@ -507,7 +617,15 @@ impl Writer {
 		let mut ends = SmallVec::with_capacity(events.len());
 		for event in events {
 			validate_event(event)?;
-			write_line(event, &mut self.line)?;
+			if matches!(event.kind, Kind::Msg(_)) {
+				let mut bounded = event.clone();
+				if let Kind::Msg(message) = &mut bounded.kind {
+					message.truncate_for_persistence();
+				}
+				write_line(&bounded, &mut self.line)?;
+			} else {
+				write_line(event, &mut self.line)?;
+			}
 			self.line.extend_from_slice(b"\n");
 			ends.push(self.line.len());
 		}
@@ -704,7 +822,13 @@ mod tests {
 			.create_new(true)
 			.open(directory.path().join("poisoned.jsonl"))
 			.expect("create target");
-		let mut writer = Writer { file, next_index: 7, line: BytesMut::new(), poisoned: false };
+		let mut writer = Writer {
+			file:       Some(file),
+			pending:    None,
+			next_index: 7,
+			line:       BytesMut::new(),
+			poisoned:   false,
+		};
 		let failure = writer.classify(
 			Error::AppendRollback {
 				write:    io::Error::new(io::ErrorKind::StorageFull, "injected write failure"),

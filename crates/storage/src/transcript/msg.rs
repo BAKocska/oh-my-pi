@@ -1,8 +1,8 @@
 //! Conversation messages stored by transcript events.
-
 use omp_core::Str;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::value::RawValue;
+use xutf::{Encoding as _, Utf8};
 
 use super::{
 	block::Block,
@@ -10,6 +10,85 @@ use super::{
 	types::{Attribution, CallId, CtxSnapshot, FeatureId, ModelRef, Stop, Timing, Usage},
 };
 use crate::blob::BlobRef;
+
+/// Maximum Unicode codepoints retained in one persisted string.
+pub const MAX_PERSISTED_CHARS: usize = 500_000;
+/// Visible deterministic suffix applied to oversized persisted strings.
+pub const PERSISTENCE_TRUNCATION_NOTICE: &str = "\n\n[Session persistence truncated large content]";
+
+/// Bounds one persisted string by Unicode codepoints while retaining newline
+/// count whenever that count fits beside the visible notice.
+///
+/// Replaying an already bounded value returns it byte-for-byte unchanged.
+#[must_use]
+pub fn truncate_persisted_text(value: &str) -> Str {
+	let characters = xutf::codepoints::<Utf8>(value.as_bytes()).count();
+	if characters <= MAX_PERSISTED_CHARS {
+		return Str::new(value);
+	}
+	let notice_chars = xutf::codepoints::<Utf8>(PERSISTENCE_TRUNCATION_NOTICE.as_bytes()).count();
+	let newline_count = xutf::codepoints::<Utf8>(value.as_bytes())
+		.filter(|codepoint| *codepoint == u32::from(b'\n'))
+		.count();
+	let retained_newlines = newline_count.min(MAX_PERSISTED_CHARS.saturating_sub(notice_chars));
+	let prefix_chars = MAX_PERSISTED_CHARS
+		.saturating_sub(notice_chars)
+		.saturating_sub(retained_newlines);
+	let mut remaining = value.as_bytes();
+	let mut output = String::with_capacity(MAX_PERSISTED_CHARS);
+	for _ in 0..prefix_chars {
+		if remaining.is_empty() {
+			break;
+		}
+		let codepoint = Utf8::decode(&mut remaining);
+		output.push(char::from_u32(codepoint).unwrap_or(char::REPLACEMENT_CHARACTER));
+	}
+	let prefix_newlines = output.bytes().filter(|byte| *byte == b'\n').count();
+	let missing_newlines = retained_newlines.saturating_sub(prefix_newlines);
+	for _ in 0..missing_newlines {
+		output.push('\n');
+	}
+	output.push_str(PERSISTENCE_TRUNCATION_NOTICE);
+	Str::new(output)
+}
+
+fn truncate_user_blocks(content: &mut [UserBlock]) {
+	for block in content {
+		if let UserBlock::Text { text } = block {
+			*text = truncate_persisted_text(text);
+		}
+	}
+}
+
+impl Msg {
+	/// Applies the durable string bound once at the persistence boundary.
+	///
+	/// Signed provider replay blocks remain byte-exact; their neutral text is
+	/// never changed independently of its replay residue.
+	pub fn truncate_for_persistence(&mut self) {
+		match self {
+			Self::User { content, .. }
+			| Self::Developer { content, .. }
+			| Self::ToolResult { content, .. } => truncate_user_blocks(content),
+			Self::Assistant { content, .. } => {
+				for block in content {
+					if block.re.is_some() {
+						continue;
+					}
+					match &mut block.kind {
+						super::BlockKind::Text { text } | super::BlockKind::Think { text } => {
+							*text = truncate_persisted_text(text);
+						},
+						super::BlockKind::Tool { args, .. } => {
+							*args = truncate_persisted_text(args);
+						},
+						super::BlockKind::Image { .. } | super::BlockKind::Opaque => {},
+					}
+				}
+			},
+		}
+	}
+}
 
 /// User-shaped content that may participate in model context.
 pub type Content = Vec<UserBlock>;

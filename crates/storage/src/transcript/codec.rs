@@ -10,10 +10,11 @@ use thiserror::Error as ThisError;
 
 use super::{
 	event::{
-		ApprovalDecided, ApprovalTicketFiled, Custom, EntryUndecodable, Event, HookOutcome,
-		ItemRecord, JobRegistered, JobSettled, Kind, PolicyDecision, PromptRewriteCommit,
-		PromptRewriteIntent, PromptRewriteStage, SupersededCompaction, ToolBatchAuthorized,
-		TurnAbort, TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
+		ApprovalDecided, ApprovalTicketFiled, ChildLifecycleEntry, ChildSessionInit, Custom,
+		EntryUndecodable, Event, HookOutcome, ItemRecord, JobRegistered, JobSettled, Kind,
+		PolicyDecision, PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage,
+		SnapcompactArchive, SupersededCompaction, ToolBatchAuthorized, TurnAbort, TurnInputItem,
+		TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 	},
 	msg::{Content, Msg},
 	patch::Patch,
@@ -151,12 +152,19 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 	let mut object = Object::new(out);
 	object.field("ts", &event.ts)?;
 	match &event.kind {
-		Kind::Init { system_prompt, tools, agent, output_schema } => {
+		Kind::Init { system_prompt, tools, agent, output_schema, revival } => {
 			object.field("k", "init")?;
 			object.field("system_prompt", system_prompt)?;
 			object.field("tools", tools)?;
 			object.field("agent", agent)?;
 			object.field("output_schema", output_schema)?;
+			if let Some(revival) = revival {
+				object.field("revival", revival)?;
+			}
+		},
+		Kind::ChildLifecycle(value) => {
+			object.field("k", "child_lifecycle")?;
+			object.field("value", value)?;
 		},
 		Kind::Msg(message) => write_msg_fields(&mut object, message)?,
 		Kind::Item(record) => {
@@ -215,6 +223,7 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 			method,
 			warning,
 			superseded,
+			snapcompact,
 		} => {
 			object.field("k", "compact")?;
 			object.field("summary", summary)?;
@@ -231,6 +240,9 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 			if !superseded.is_empty() {
 				object.field("superseded", superseded)?;
 			}
+			if let Some(snapcompact) = snapcompact {
+				object.field("snapcompact", snapcompact)?;
+			}
 		},
 		Kind::Branch { from, summary } => {
 			object.field("k", "branch")?;
@@ -238,13 +250,22 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 			object.field("summary", summary)?;
 		},
 		Kind::Reset => object.field("k", "reset")?,
+		Kind::ProviderReset => object.field("k", "provider_reset")?,
 		Kind::Title { title, source } => {
 			object.field("k", "title")?;
 			object.field("title", title)?;
 			object.field("source", source)?;
 		},
+		Kind::MoveRoot { root } => {
+			object.field("k", "move_root")?;
+			object.field("root", root)?;
+		},
 		Kind::AddDirs { dirs } => {
 			object.field("k", "add_dirs")?;
+			object.field("dirs", dirs)?;
+		},
+		Kind::RemoveDirs { dirs } => {
+			object.field("k", "remove_dirs")?;
 			object.field("dirs", dirs)?;
 		},
 		Kind::ForkedFrom { session, at } => {
@@ -459,7 +480,10 @@ payload!(InitPayload {
 	tools: Vec<Str>,
 	agent: Option<Str>,
 	output_schema: Option<Box<RawValue>>,
+	#[serde(default)]
+	revival: Option<ChildSessionInit>,
 });
+payload!(ChildLifecyclePayload { value: ChildLifecycleEntry });
 payload!(ItemPayload {
 	item: omp_proto::thread::v1::Item,
 	turn_id: Option<Str>,
@@ -500,10 +524,14 @@ payload!(CompactPayload {
 	warning: Option<Str>,
 	#[serde(default)]
 	superseded: Vec<SupersededCompaction>,
+	#[serde(default)]
+	snapcompact: Option<SnapcompactArchive>,
 });
 payload!(BranchPayload { from: u64, summary: Str });
 payload!(TitlePayload { title: Str, source: TitleSource });
+payload!(MoveRootPayload { root: PathBuf });
 payload!(AddDirsPayload { dirs: Vec<PathBuf> });
+payload!(RemoveDirsPayload { dirs: Vec<PathBuf> });
 payload!(ForkedFromPayload { session: SessionId, at: Option<u64> });
 payload!(CheckpointPayload { provider: ProviderId, model: ModelId, items: BlobRef });
 payload!(AbortedPayload { tool_call_ids: Vec<CallId> });
@@ -631,7 +659,11 @@ fn decode_line(line: &[u8]) -> Result<Event, Error> {
 				tools:         payload.tools,
 				agent:         payload.agent,
 				output_schema: payload.output_schema,
+				revival:       payload.revival,
 			}
+		},
+		"child_lifecycle" => {
+			Kind::ChildLifecycle(serde_json::from_slice::<ChildLifecyclePayload>(line)?.value)
 		},
 		"msg" => Kind::Msg(serde_json::from_slice::<Msg>(line)?),
 		"item" => {
@@ -686,6 +718,7 @@ fn decode_line(line: &[u8]) -> Result<Event, Error> {
 				method:        payload.method,
 				warning:       payload.warning,
 				superseded:    payload.superseded,
+				snapcompact:   payload.snapcompact,
 			}
 		},
 		"branch" => {
@@ -693,13 +726,22 @@ fn decode_line(line: &[u8]) -> Result<Event, Error> {
 			Kind::Branch { from: payload.from, summary: payload.summary }
 		},
 		"reset" => Kind::Reset,
+		"provider_reset" => Kind::ProviderReset,
 		"title" => {
 			let payload: TitlePayload = serde_json::from_slice(line)?;
 			Kind::Title { title: payload.title, source: payload.source }
 		},
+		"move_root" => {
+			let payload: MoveRootPayload = serde_json::from_slice(line)?;
+			Kind::MoveRoot { root: payload.root }
+		},
 		"add_dirs" => {
 			let payload: AddDirsPayload = serde_json::from_slice(line)?;
 			Kind::AddDirs { dirs: payload.dirs }
+		},
+		"remove_dirs" => {
+			let payload: RemoveDirsPayload = serde_json::from_slice(line)?;
+			Kind::RemoveDirs { dirs: payload.dirs }
 		},
 		"forked_from" => {
 			let payload: ForkedFromPayload = serde_json::from_slice(line)?;

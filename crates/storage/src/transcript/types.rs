@@ -14,7 +14,7 @@ use super::{
 	raweq::{opt_raw_eq, raw_eq},
 };
 
-macro_rules! string_id {
+macro_rules! record_id {
 	($(#[$meta:meta])* $name:ident, $doc:literal) => {
 		$(#[$meta])*
 		#[doc = $doc]
@@ -27,12 +27,12 @@ macro_rules! string_id {
 	};
 }
 
-string_id!(SessionId, "A stable transcript session identifier.");
-string_id!(CallId, "A bare provider tool-call identifier.");
-string_id!(DialectId, "A replay-capsule dialect identifier such as `oai` or `ant`.");
-string_id!(FeatureId, "A feature identifier reported as unavailable for a turn.");
-string_id!(ProviderId, "A model-provider identifier.");
-string_id!(ModelId, "A provider model identifier.");
+record_id!(SessionId, "A stable transcript session identifier.");
+record_id!(CallId, "A bare provider tool-call identifier.");
+record_id!(DialectId, "A replay-capsule dialect identifier such as `oai` or `ant`.");
+record_id!(FeatureId, "A feature identifier reported as unavailable for a turn.");
+record_id!(ProviderId, "A model-provider identifier.");
+record_id!(ModelId, "A provider model identifier.");
 
 /// The fully qualified model selected for an inference request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,13 +412,13 @@ pub struct Tier(
 	pub Str,
 );
 
-/// A credential pin used to keep a session on a stable provider account.
+/// Opaque credential affinity used to keep a session on a stable account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pin {
 	/// Provider whose credential is pinned.
-	pub provider:   ProviderId,
-	/// Provider-local credential identifier.
-	pub credential: Str,
+	pub provider: ProviderId,
+	/// Keyed affinity digest; never an account id, principal, or credential.
+	pub affinity: Str,
 }
 
 /// Core-authenticated identity and replay result of one durable request.

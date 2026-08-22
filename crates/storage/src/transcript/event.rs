@@ -451,6 +451,76 @@ impl PartialEq for EntryUndecodable {
 
 impl Eq for EntryUndecodable {}
 
+/// Workspace identity required to reconstruct an equivalent child environment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildWorkspaceIdentity {
+	/// Canonical Environment URI of the child root.
+	pub root_uri:     Str,
+	/// Durable isolated-workspace identity, when isolation was requested.
+	pub isolation_id: Option<Str>,
+	/// Content revision of the workspace snapshot used by this generation.
+	pub revision:     Option<Hash32>,
+}
+
+/// Secret-free child initialization facts required for cross-process revival.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildSessionInit {
+	/// Resolved agent definition identity.
+	pub definition:          Str,
+	/// Child depth beneath the main session.
+	pub depth:               u16,
+	/// Content-addressed composed prompt.
+	pub prompt_ref:          BlobRef,
+	/// Content-addressed normalized output schema, when configured.
+	pub schema_ref:          Option<BlobRef>,
+	/// Content-addressed inherited policy snapshot.
+	pub policy_snapshot_ref: BlobRef,
+	/// Content-addressed inherited grant snapshot without credentials.
+	pub grant_snapshot_ref:  BlobRef,
+	/// Content-addressed frozen tool snapshot.
+	pub tool_snapshot_ref:   BlobRef,
+	/// Stable inference role requested for this child.
+	pub model_role:          Str,
+	/// Durable child workspace identity.
+	pub workspace:           ChildWorkspaceIdentity,
+	/// Actual serving model most recently attributed to the child.
+	pub serving_model:       Option<ModelRef>,
+}
+
+/// Durable child lifecycle publication linked to its initialization entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildLifecycleEntry {
+	/// Stable child identity.
+	pub child_id:        Str,
+	/// Monotonic incarnation of the stable identity.
+	pub generation:      u64,
+	/// Physical event index of the child `Init` entry carrying revival facts.
+	pub init_event:      u64,
+	/// Lifecycle state encoded with the core vocabulary.
+	pub lifecycle:       Str,
+	/// Structured terminal classification, when this transition settles.
+	pub terminal_status: Option<Str>,
+}
+
+/// Durable Snapcompact frames and measured admission accounting.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapcompactArchive {
+	/// Normalized archive source used for later re-rendering.
+	pub source:          BlobRef,
+	/// Oldest-to-newest PNG frame blobs.
+	pub frames:          Vec<BlobRef>,
+	/// Active-tokenizer measurement of the source prefix.
+	pub source_tokens:   u64,
+	/// Conservative provider input tokens after imaging.
+	pub image_tokens:    u64,
+	/// Exact retained PNG bytes.
+	pub png_bytes:       u64,
+	/// Source characters dropped to satisfy hard frame and byte budgets.
+	pub truncated_chars: u64,
+	/// Stable shape description used to render these frames.
+	pub shape:           Str,
+}
+
 /// A timestamped transcript event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -473,7 +543,11 @@ pub enum Kind {
 		agent:         Option<Str>,
 		/// Optional response schema, preserved verbatim.
 		output_schema: Option<Box<RawValue>>,
+		/// Secret-free cold-revival facts for a child session.
+		revival:       Option<ChildSessionInit>,
 	},
+	/// Record one retained child lifecycle transition.
+	ChildLifecycle(ChildLifecycleEntry),
 	/// Add a conversation message.
 	Msg(Msg),
 	/// Add one canonical gateway thread item.
@@ -531,6 +605,8 @@ pub enum Kind {
 		warning:       Option<Str>,
 		/// Losing custom-summary proposals in deterministic publisher order.
 		superseded:    Vec<SupersededCompaction>,
+		/// Durable bitmap archive reattached to rebuilt model contexts.
+		snapcompact:   Option<SnapcompactArchive>,
 	},
 	/// Summarize a branch before returning to another chain point.
 	Branch {
@@ -541,6 +617,9 @@ pub enum Kind {
 	},
 	/// Start a fresh chain boundary, as for `/clear`.
 	Reset,
+	/// Request that inference discard provider-native session affinity while
+	/// preserving the canonical journal and context, as for `/fresh`.
+	ProviderReset,
 	/// Assign a session title.
 	Title {
 		/// New title.
@@ -548,9 +627,23 @@ pub enum Kind {
 		/// Source that assigned the title.
 		source: TitleSource,
 	},
+	/// Change the primary working root for future entries without rewriting the
+	/// immutable journal header or prior history.
+	MoveRoot {
+		/// Canonical future primary root.
+		root: PathBuf,
+	},
 	/// Add working directories available to the session.
 	AddDirs {
 		/// Directories added by this event.
+		dirs: Vec<PathBuf>,
+	},
+	/// Remove secondary working directories from the session.
+	///
+	/// The session's primary root is fixed by `Init` metadata and is never
+	/// removed by this mutation during projection.
+	RemoveDirs {
+		/// Directories removed by this event.
 		dirs: Vec<PathBuf>,
 	},
 	/// Record lineage from a source session.
@@ -633,19 +726,23 @@ impl PartialEq for Kind {
 					tools: a_tools,
 					agent: a_agent,
 					output_schema: a_output_schema,
+					revival: a_revival,
 				},
 				Self::Init {
 					system_prompt: b_system_prompt,
 					tools: b_tools,
 					agent: b_agent,
 					output_schema: b_output_schema,
+					revival: b_revival,
 				},
 			) => {
 				a_system_prompt == b_system_prompt
 					&& a_tools == b_tools
 					&& a_agent == b_agent
 					&& opt_raw_eq(a_output_schema.as_deref(), b_output_schema.as_deref())
+					&& a_revival == b_revival
 			},
+			(Self::ChildLifecycle(a), Self::ChildLifecycle(b)) => a == b,
 			(Self::Msg(a_message), Self::Msg(b_message)) => a_message == b_message,
 			(Self::Item(a), Self::Item(b)) => a == b,
 			(
@@ -681,6 +778,7 @@ impl PartialEq for Kind {
 					method: a_method,
 					warning: a_warning,
 					superseded: a_superseded,
+					snapcompact: a_snapcompact,
 				},
 				Self::Compact {
 					summary: b_summary,
@@ -691,6 +789,7 @@ impl PartialEq for Kind {
 					method: b_method,
 					warning: b_warning,
 					superseded: b_superseded,
+					snapcompact: b_snapcompact,
 				},
 			) => {
 				(
@@ -702,6 +801,7 @@ impl PartialEq for Kind {
 					a_method,
 					a_warning,
 					a_superseded,
+					a_snapcompact,
 				) == (
 					b_summary,
 					b_short,
@@ -711,18 +811,21 @@ impl PartialEq for Kind {
 					b_method,
 					b_warning,
 					b_superseded,
+					b_snapcompact,
 				)
 			},
 			(
 				Self::Branch { from: a_from, summary: a_summary },
 				Self::Branch { from: b_from, summary: b_summary },
 			) => (a_from, a_summary) == (b_from, b_summary),
-			(Self::Reset, Self::Reset) => true,
+			(Self::Reset, Self::Reset) | (Self::ProviderReset, Self::ProviderReset) => true,
 			(
 				Self::Title { title: a_title, source: a_source },
 				Self::Title { title: b_title, source: b_source },
 			) => (a_title, a_source) == (b_title, b_source),
+			(Self::MoveRoot { root: a }, Self::MoveRoot { root: b }) => a == b,
 			(Self::AddDirs { dirs: a }, Self::AddDirs { dirs: b }) => a == b,
+			(Self::RemoveDirs { dirs: a }, Self::RemoveDirs { dirs: b }) => a == b,
 			(
 				Self::ForkedFrom { session: a_session, at: a_at },
 				Self::ForkedFrom { session: b_session, at: b_at },

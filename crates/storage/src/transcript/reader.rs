@@ -2,7 +2,7 @@
 
 use std::{
 	fs::{self, File, Metadata},
-	io::{self, Read as _, Seek as _, SeekFrom},
+	io::{self, BufRead as _, BufReader, Seek as _, SeekFrom},
 	iter::FusedIterator,
 	path::{Path, PathBuf},
 };
@@ -152,11 +152,43 @@ impl LiveSet {
 	}
 }
 
+/// Classification of a damaged physical JSONL record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticKind {
+	/// A newline-terminated record could not be decoded.
+	Malformed,
+	/// End-of-file interrupted a record before its newline.
+	Truncated,
+}
+
+/// Bounded reader diagnostic retaining stable physical and byte positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadDiagnostic {
+	/// Zero-based physical event index.
+	pub event_index: u64,
+	/// Byte offset at which the damaged record begins.
+	pub byte_offset: u64,
+	/// Number of source bytes in the damaged record.
+	pub byte_len:    u64,
+	/// Damage classification.
+	pub kind:        DiagnosticKind,
+}
+
+/// Aggregate counters from one bounded JSONL scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadCounters {
+	/// Newline-terminated malformed records.
+	pub malformed: u64,
+	/// Unterminated trailing records.
+	pub truncated: u64,
+}
+
 /// A loaded transcript with physical event indexes preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Log {
-	header: Header,
-	events: Vec<Entry>,
+	header:      Header,
+	events:      Vec<Entry>,
+	diagnostics: Vec<ReadDiagnostic>,
 }
 
 impl Log {
@@ -170,6 +202,25 @@ impl Log {
 	#[must_use]
 	pub const fn len(&self) -> usize {
 		self.events.len()
+	}
+
+	/// Returns structured diagnostics in physical source order.
+	#[must_use]
+	pub fn diagnostics(&self) -> &[ReadDiagnostic] {
+		&self.diagnostics
+	}
+
+	/// Returns damage counters without rescanning journal bytes.
+	#[must_use]
+	pub fn counters(&self) -> ReadCounters {
+		let mut counters = ReadCounters::default();
+		for diagnostic in &self.diagnostics {
+			match diagnostic.kind {
+				DiagnosticKind::Malformed => counters.malformed = counters.malformed.saturating_add(1),
+				DiagnosticKind::Truncated => counters.truncated = counters.truncated.saturating_add(1),
+			}
+		}
+		counters
 	}
 
 	/// Returns whether the transcript contains no event lines.
@@ -381,119 +432,226 @@ pub enum RefreshState {
 /// The reader retains decoded events, live-chain storage, and the byte offset
 /// immediately after the last complete line. Refreshes parse only bytes at or
 /// beyond that watermark.
+/// Maximum retained scratch allocation for ordinary JSONL records. Individual
+/// valid records may grow beyond this bound, but the buffer is dropped rather
+/// than retained after such a record.
+pub const READ_BUFFER_BYTES: usize = 64 * 1024;
+/// Default cooperative batch boundary for long scans.
+pub const VISIT_BATCH_ENTRIES: usize = 8_192;
+
+/// Incremental bounded reader for one append-only transcript.
 pub struct Reader {
 	path:              PathBuf,
-	file:              File,
-	identity:          FileIdentity,
+	file:              Option<File>,
+	identity:          Option<FileIdentity>,
 	watermark:         u64,
 	header_terminated: bool,
 	tail_bytes:        u64,
+	tail_diagnostic:   Option<ReadDiagnostic>,
 	log:               Log,
 	live:              LiveSet,
 }
 
 impl Reader {
-	/// Opens a transcript and parses its complete physical lines.
+	/// Opens a transcript and parses its complete physical lines with bounded
+	/// `BufRead` scratch rather than loading the whole file.
 	pub fn open(path: &Path) -> Result<Self, Error> {
-		let mut file = File::open(path)?;
+		let file = File::open(path)?;
 		let identity = file_identity(&file.metadata()?);
-		let mut bytes = Vec::new();
-		file.read_to_end(&mut bytes)?;
-		if bytes.is_empty() {
+		let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
+		let mut line = Vec::new();
+		let header_bytes = reader.read_until(b'\n', &mut line)?;
+		if header_bytes == 0 {
 			return Err(Error::MissingHeader);
 		}
-
-		let (header, event_start, header_terminated) =
-			if let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') {
-				(read_header(&bytes[..header_end])?, header_end + 1, true)
-			} else {
-				(read_header(&bytes)?, bytes.len(), false)
-			};
-		let event_bytes = &bytes[event_start..];
-		let complete_len = event_bytes
-			.iter()
-			.rposition(|byte| *byte == b'\n')
-			.map_or(0, |end| end + 1);
+		let header_terminated = line.last() == Some(&b'\n');
+		if header_terminated {
+			line.pop();
+		}
+		let header = read_header(&line)?;
+		let mut watermark = u64::try_from(header_bytes).expect("file offsets fit in u64");
 		let mut events = Vec::new();
-		push_complete_entries(&mut events, &event_bytes[..complete_len]);
-		let watermark = u64::try_from(event_start + complete_len).expect("file offsets fit in u64");
-		let tail_bytes =
-			u64::try_from(event_bytes.len() - complete_len).expect("file offsets fit in u64");
-		let log = Log { header, events };
+		let mut diagnostics = Vec::new();
+		let mut tail_bytes = 0_u64;
+		let mut tail_diagnostic = None;
+		let mut event_index = 0_u64;
+		loop {
+			line.clear();
+			let offset = watermark;
+			let read = reader.read_until(b'\n', &mut line)?;
+			if read == 0 {
+				break;
+			}
+			if line.last() != Some(&b'\n') {
+				tail_bytes = u64::try_from(read).expect("file offsets fit in u64");
+				tail_diagnostic = Some(ReadDiagnostic {
+					event_index,
+					byte_offset: offset,
+					byte_len: tail_bytes,
+					kind: DiagnosticKind::Truncated,
+				});
+				break;
+			}
+			line.pop();
+			push_entry_at(
+				&mut events,
+				&mut diagnostics,
+				&line,
+				event_index,
+				offset,
+				DiagnosticKind::Malformed,
+			);
+			watermark =
+				watermark.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
+			event_index = event_index.saturating_add(1);
+		}
+		let file = reader.into_inner();
+		let log = Log { header, events, diagnostics };
 		let mut live = LiveSet::new();
 		log.live_into(&mut live);
 		Ok(Self {
 			path: path.to_owned(),
-			file,
-			identity,
+			file: Some(file),
+			identity: Some(identity),
 			watermark,
 			header_terminated,
 			tail_bytes,
+			tail_diagnostic,
 			log,
 			live,
 		})
 	}
 
 	/// Parses complete lines appended since the previous refresh.
+	/// Creates a fileless reader paired with
+	/// [`crate::transcript::Writer::create_lazy`].
+	#[must_use]
+	pub fn pending(path: &Path, header: Header) -> Self {
+		Self {
+			path:              path.to_owned(),
+			file:              None,
+			identity:          None,
+			watermark:         0,
+			header_terminated: false,
+			tail_bytes:        0,
+			tail_diagnostic:   None,
+			log:               Log { header, events: Vec::new(), diagnostics: Vec::new() },
+			live:              LiveSet::new(),
+		}
+	}
+
 	///
 	/// Replacement or truncation below the complete-line watermark returns an
 	/// error without changing the decoded log or live set.
 	pub fn refresh(&mut self) -> Result<RefreshReport, Error> {
+		if self.file.is_none() {
+			let opened = match Self::open(&self.path) {
+				Ok(opened) => opened,
+				Err(Error::Io(source)) if source.kind() == io::ErrorKind::NotFound => {
+					return Ok(self.report(RefreshState::Unchanged));
+				},
+				Err(error) => return Err(error),
+			};
+			if opened.log.header != self.log.header {
+				return Err(changed_file("materialized transcript header changed"));
+			}
+			let records = opened.next_index();
+			*self = opened;
+			return Ok(self.report(RefreshState::Advanced { records }));
+		}
 		let path_metadata = fs::metadata(&self.path)?;
-		if file_identity(&path_metadata) != self.identity {
+		if Some(file_identity(&path_metadata)) != self.identity {
 			return Err(changed_file("transcript path was replaced"));
 		}
-		let file_len = self.file.metadata()?.len();
+		let file_len = self
+			.file
+			.as_ref()
+			.expect("pending reader handled above")
+			.metadata()?
+			.len();
 		if file_len < self.watermark {
 			return Err(changed_file("transcript was truncated below the read watermark"));
 		}
-
-		self.file.seek(SeekFrom::Start(self.watermark))?;
-		let mut appended = Vec::new();
-		self.file.read_to_end(&mut appended)?;
-		let path_metadata = fs::metadata(&self.path)?;
-		if file_identity(&path_metadata) != self.identity {
-			return Err(changed_file("transcript path was replaced during refresh"));
-		}
-		if self.file.metadata()?.len() < self.watermark {
-			return Err(changed_file("transcript was truncated during refresh"));
-		}
-		if appended.is_empty() {
+		if file_len == self.watermark {
 			self.tail_bytes = 0;
+			self.tail_diagnostic = None;
 			return Ok(self.report(RefreshState::Unchanged));
 		}
-
-		let mut start = 0;
+		let first_event_index = self.next_index();
+		self
+			.file
+			.as_mut()
+			.expect("pending reader handled above")
+			.seek(SeekFrom::Start(self.watermark))?;
+		let mut reader = BufReader::with_capacity(
+			READ_BUFFER_BYTES,
+			self.file.as_mut().expect("pending reader handled above"),
+		);
+		let mut line = Vec::new();
+		let mut consumed = 0_u64;
+		let mut records = 0_u64;
+		let mut entries = Vec::new();
+		let mut diagnostics = Vec::new();
 		let mut header_terminated = self.header_terminated;
+		self.tail_bytes = 0;
+		self.tail_diagnostic = None;
+
 		if !header_terminated {
-			let Some(header_newline) = appended.iter().position(|byte| *byte == b'\n') else {
-				self.tail_bytes = u64::try_from(appended.len()).expect("file offsets fit in u64");
+			let read = reader.read_until(b'\n', &mut line)?;
+			if line.as_slice() != b"\n" {
+				self.tail_bytes = u64::try_from(read).expect("file offsets fit in u64");
+				self.tail_diagnostic = Some(ReadDiagnostic {
+					event_index: first_event_index,
+					byte_offset: self.watermark,
+					byte_len:    self.tail_bytes,
+					kind:        DiagnosticKind::Truncated,
+				});
 				return Ok(self.report(RefreshState::TornTail { records: 0 }));
-			};
-			if header_newline != 0 {
-				return Err(changed_file("bytes were inserted after an unterminated header"));
 			}
-			start = 1;
+			consumed = 1;
 			header_terminated = true;
 		}
 
-		let complete_len = appended[start..]
-			.iter()
-			.rposition(|byte| *byte == b'\n')
-			.map_or(0, |end| end + 1);
-		let consumed = start + complete_len;
-		let mut entries = Vec::new();
-		push_complete_entries(&mut entries, &appended[start..consumed]);
-		let records = u64::try_from(entries.len()).expect("event counts fit in u64");
+		loop {
+			line.clear();
+			let offset = self.watermark.saturating_add(consumed);
+			let read = reader.read_until(b'\n', &mut line)?;
+			if read == 0 {
+				break;
+			}
+			if line.last() != Some(&b'\n') {
+				self.tail_bytes = u64::try_from(read).expect("file offsets fit in u64");
+				self.tail_diagnostic = Some(ReadDiagnostic {
+					event_index: first_event_index.saturating_add(records),
+					byte_offset: offset,
+					byte_len:    self.tail_bytes,
+					kind:        DiagnosticKind::Truncated,
+				});
+				break;
+			}
+			line.pop();
+			push_entry_at(
+				&mut entries,
+				&mut diagnostics,
+				&line,
+				first_event_index.saturating_add(records),
+				offset,
+				DiagnosticKind::Malformed,
+			);
+			consumed = consumed.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
+			records = records.saturating_add(1);
+		}
+
+		let path_metadata = fs::metadata(&self.path)?;
+		if Some(file_identity(&path_metadata)) != self.identity {
+			return Err(changed_file("transcript path was replaced during refresh"));
+		}
 		let first_new = self.log.events.len();
 		self.log.events.extend(entries);
+		self.log.diagnostics.extend(diagnostics);
 		self.log.fold_from(first_new, &mut self.live);
-		self.watermark = self
-			.watermark
-			.checked_add(u64::try_from(consumed).expect("file offsets fit in u64"))
-			.expect("file offsets fit in u64");
+		self.watermark = self.watermark.saturating_add(consumed);
 		self.header_terminated = header_terminated;
-		self.tail_bytes = u64::try_from(appended.len() - consumed).expect("file offsets fit in u64");
 		let state = if self.tail_bytes != 0 {
 			RefreshState::TornTail { records }
 		} else {
@@ -512,6 +670,27 @@ impl Reader {
 	#[must_use]
 	pub const fn live(&self) -> &LiveSet {
 		&self.live
+	}
+
+	/// Iterates permanent malformed diagnostics followed by the current torn
+	/// tail diagnostic, when present.
+	pub fn diagnostics(&self) -> impl Iterator<Item = ReadDiagnostic> + '_ {
+		self
+			.log
+			.diagnostics
+			.iter()
+			.copied()
+			.chain(self.tail_diagnostic)
+	}
+
+	/// Returns damage counters for the decoded prefix and current tail.
+	#[must_use]
+	pub fn counters(&self) -> ReadCounters {
+		let mut counters = self.log.counters();
+		if self.tail_diagnostic.is_some() {
+			counters.truncated = counters.truncated.saturating_add(1);
+		}
+		counters
 	}
 
 	/// Returns the physical index assigned to the next complete event.
@@ -577,50 +756,120 @@ fn changed_file(message: &'static str) -> Error {
 	Error::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
+/// Result of a bounded transcript visitation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisitReport {
+	/// Decoded line-zero header.
+	pub header:      Header,
+	/// Number of physical event records visited.
+	pub records:     u64,
+	/// Damage counters observed during the scan.
+	pub counters:    ReadCounters,
+	/// Structured damaged-record diagnostics.
+	pub diagnostics: Vec<ReadDiagnostic>,
+}
+
 /// Loads a transcript while preserving every physical event index.
+///
+/// Input is consumed one JSONL record at a time; no whole-file byte buffer is
+/// allocated.
 pub fn load(path: &Path) -> Result<Log, Error> {
-	let bytes = fs::read(path)?;
-	if bytes.is_empty() {
+	let mut events = Vec::new();
+	let report = visit_batched(
+		path,
+		VISIT_BATCH_ENTRIES,
+		|_, entry| {
+			events.push(entry);
+			true
+		},
+		|| {},
+	)?;
+	Ok(Log { header: report.header, events, diagnostics: report.diagnostics })
+}
+
+/// Visits physical event records using bounded `BufRead` scratch.
+///
+/// `yield_batch` runs after each `batch_entries` records, allowing async owners
+/// to cooperatively yield without coupling storage to one executor. Returning
+/// `false` from `visit` stops after the current record.
+pub fn visit_batched(
+	path: &Path,
+	batch_entries: usize,
+	mut visit: impl FnMut(u64, Entry) -> bool,
+	mut yield_batch: impl FnMut(),
+) -> Result<VisitReport, Error> {
+	let file = File::open(path)?;
+	let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
+	let mut line = Vec::new();
+	let header_read = reader.read_until(b'\n', &mut line)?;
+	if header_read == 0 {
 		return Err(Error::MissingHeader);
 	}
-	let (header_line, event_bytes) = match bytes.iter().position(|byte| *byte == b'\n') {
-		Some(end) => (&bytes[..end], &bytes[end + 1..]),
-		None => (&bytes[..], &[][..]),
-	};
-	let header = read_header(header_line)?;
-	let mut events = Vec::new();
-	let mut start = 0;
-	for end in event_bytes
-		.iter()
-		.enumerate()
-		.filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
-	{
-		push_entry(&mut events, &event_bytes[start..end]);
-		start = end + 1;
+	if line.last() == Some(&b'\n') {
+		line.pop();
 	}
-	if start < event_bytes.len() {
-		push_entry(&mut events, &event_bytes[start..]);
+	let header = read_header(&line)?;
+	let mut offset = u64::try_from(header_read).expect("file offsets fit in u64");
+	let mut records = 0_u64;
+	let mut diagnostics = Vec::new();
+	let batch_entries = batch_entries.max(1);
+	loop {
+		line.clear();
+		let read = reader.read_until(b'\n', &mut line)?;
+		if read == 0 {
+			break;
+		}
+		let terminated = line.last() == Some(&b'\n');
+		if terminated {
+			line.pop();
+		}
+		let kind = if terminated {
+			DiagnosticKind::Malformed
+		} else {
+			DiagnosticKind::Truncated
+		};
+		let mut entries = Vec::with_capacity(1);
+		push_entry_at(&mut entries, &mut diagnostics, &line, records, offset, kind);
+		let entry = entries
+			.pop()
+			.expect("one source record yields one physical entry");
+		records = records.saturating_add(1);
+		let keep_going = visit(records - 1, entry);
+		offset = offset.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
+		if usize::try_from(records).is_ok_and(|records| records % batch_entries == 0) {
+			yield_batch();
+		}
+		if !keep_going || !terminated {
+			break;
+		}
 	}
-	Ok(Log { header, events })
+	let mut counters = ReadCounters::default();
+	for diagnostic in &diagnostics {
+		match diagnostic.kind {
+			DiagnosticKind::Malformed => counters.malformed = counters.malformed.saturating_add(1),
+			DiagnosticKind::Truncated => counters.truncated = counters.truncated.saturating_add(1),
+		}
+	}
+	Ok(VisitReport { header, records, counters, diagnostics })
 }
 
-fn push_complete_entries(events: &mut Vec<Entry>, bytes: &[u8]) {
-	let mut start = 0;
-	for end in bytes
-		.iter()
-		.enumerate()
-		.filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
-	{
-		push_entry(events, &bytes[start..end]);
-		start = end + 1;
-	}
-	debug_assert_eq!(start, bytes.len());
-}
-
-fn push_entry(events: &mut Vec<Entry>, line: &[u8]) {
+fn push_entry_at(
+	events: &mut Vec<Entry>,
+	diagnostics: &mut Vec<ReadDiagnostic>,
+	line: &[u8],
+	event_index: u64,
+	byte_offset: u64,
+	damage: DiagnosticKind,
+) {
 	if let Ok(event) = read_line(line) {
 		events.push(Entry::Ok(Box::new(event)));
 	} else {
+		diagnostics.push(ReadDiagnostic {
+			event_index,
+			byte_offset,
+			byte_len: u64::try_from(line.len()).expect("record length fits in u64"),
+			kind: damage,
+		});
 		let source = String::from_utf8_lossy(line);
 		let raw = to_raw_value(source.as_ref()).expect("a JSON string is always serializable");
 		events.push(Entry::Tombstone(raw));

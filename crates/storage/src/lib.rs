@@ -8,9 +8,19 @@
 //!   blocks, provider-native residue lives in replay capsules, large payloads
 //!   live in the blob store behind typed [`blob::BlobRef`]s.
 
+pub mod atomic;
+pub mod backend;
 pub mod blob;
+/// User-wide document-conversion cache and daemon-owned collection policy.
+pub mod document_cache;
 pub mod gc;
+/// Rebuildable direct-GitHub response cache.
+pub mod github_cache;
 pub mod index;
+/// Persistent MCP definition-cache storage.
+pub mod mcp_cache;
+/// Persistent secret-placeholder key storage.
+pub mod secret_key;
 pub mod state;
 pub mod telemetry_index;
 pub mod transcript;

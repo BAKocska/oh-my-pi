@@ -8,18 +8,19 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str};
+use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, sf};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::{
 	blob::BlobRef,
 	transcript::{
-		AmendPatch, Attribution, Block, BlockKind, CallId, CtxSnapshot, Custom, DialectId, Entry,
-		EntryUndecodable, Error, Event, FeatureId, Header, InvocationTransition, ItemRecord, Kind,
-		LiveSet, ModelChange, ModelId, ModelRef, Msg, Patch, Pin, PromptRewriteCommit,
-		PromptRewriteIntent, PromptRewriteStage, ProviderId, Reader, RefreshState, Replay,
-		RequestAudit, RequestError, SessionId, Stop, ThinkingSel, Timing, TitleSource,
-		ToolBatchAuthorized, TurnInputItem, TurnInputRecord, TurnOptionsRecord, TurnReceipt,
-		TurnStart, Usage, UserBlock, Writer, load, read_line, write_header, write_line,
+		AmendPatch, Attribution, Block, BlockKind, CallId, ChildLifecycleEntry, ChildSessionInit,
+		ChildWorkspaceIdentity, CtxSnapshot, Custom, DialectId, Entry, EntryUndecodable, Error,
+		Event, FeatureId, Header, InvocationTransition, ItemRecord, Kind, LiveSet, ModelChange,
+		ModelId, ModelRef, Msg, Patch, Pin, PromptRewriteCommit, PromptRewriteIntent,
+		PromptRewriteStage, ProviderId, Reader, RefreshState, Replay, RequestAudit, RequestError,
+		SessionId, Stop, ThinkingSel, Timing, TitleSource, ToolBatchAuthorized, TurnInputItem,
+		TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart, Usage, UserBlock, Writer, load,
+		read_line, write_header, write_line,
 	},
 };
 use omp_tool::{CallOutcome, CallOutcomeDetails};
@@ -120,7 +121,33 @@ fn every_kind() -> Vec<Event> {
 				tools:         vec![text("read"), text("write")],
 				agent:         Some(text("worker")),
 				output_schema: Some(raw(r#"{ "required" : ["x"], "type":"object" }"#)),
+				revival:       Some(ChildSessionInit {
+					definition:          sf!("reviewer"),
+					depth:               2,
+					prompt_ref:          blob(2, 80),
+					schema_ref:          Some(blob(3, 40)),
+					policy_snapshot_ref: blob(4, 20),
+					grant_snapshot_ref:  blob(5, 20),
+					tool_snapshot_ref:   blob(6, 20),
+					model_role:          sf!("subagent:worker"),
+					workspace:           ChildWorkspaceIdentity {
+						root_uri:     sf!("env://workspace/worker"),
+						isolation_id: Some(sf!("iso-worker")),
+						revision:     Some(Hash32::new([7; 32])),
+					},
+					serving_model:       Some(model()),
+				}),
 			},
+		},
+		Event {
+			ts:   2,
+			kind: Kind::ChildLifecycle(ChildLifecycleEntry {
+				child_id:        sf!("worker"),
+				generation:      0,
+				init_event:      0,
+				lifecycle:       sf!("running"),
+				terminal_status: None,
+			}),
 		},
 		Event {
 			ts:   2,
@@ -159,8 +186,8 @@ fn every_kind() -> Vec<Event> {
 				}),
 				tier:     Patch::Clear,
 				cred_pin: Patch::Set(Pin {
-					provider:   ProviderId(text("provider")),
-					credential: text("credential"),
+					provider: ProviderId(text("provider")),
+					affinity: text("affinity"),
 				}),
 			},
 		},
@@ -180,11 +207,14 @@ fn every_kind() -> Vec<Event> {
 		},
 		Event { ts: 8, kind: Kind::Branch { from: 1, summary: text("branch") } },
 		Event { ts: 9, kind: Kind::Reset },
+		Event { ts: 9, kind: Kind::ProviderReset },
+		Event { ts: 9, kind: Kind::MoveRoot { root: PathBuf::from("/future-root") } },
 		Event {
 			ts:   10,
 			kind: Kind::Title { title: text("title"), source: TitleSource::Assistant },
 		},
 		Event { ts: 11, kind: Kind::AddDirs { dirs: vec![PathBuf::from("/tmp/other")] } },
+		Event { ts: 12, kind: Kind::RemoveDirs { dirs: vec![PathBuf::from("/tmp/other")] } },
 		Event {
 			ts:   12,
 			kind: Kind::ForkedFrom { session: SessionId(text("parent")), at: Some(4) },
@@ -578,7 +608,7 @@ fn header_is_single_and_torn_tail_is_truncated() {
 }
 
 #[test]
-fn malformed_trailing_record_is_repaired_before_append() {
+fn malformed_trailing_record_is_preserved_at_its_physical_index() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("session.jsonl");
 	let mut writer = Writer::create(&path, &header()).expect("new transcript");
@@ -595,13 +625,14 @@ fn malformed_trailing_record_is_repaired_before_append() {
 	drop(file);
 
 	let mut writer = Writer::open_append(&path).expect("repair malformed tail");
-	assert_eq!(writer.append(&title(2, "second")).expect("second event"), 1);
+	assert_eq!(writer.append(&title(2, "second")).expect("second event"), 2);
 	drop(writer);
 
 	let log = load(&path).expect("repaired transcript loads");
-	assert_eq!(log.len(), 2);
+	assert_eq!(log.len(), 3);
+	assert!(matches!(log.get(1), Some(Entry::Tombstone(_))));
 	assert!(matches!(
-		log.get(1),
+		log.get(2),
 		Some(Entry::Ok(event)) if matches!(&event.kind, Kind::Title { title, .. } if title.as_str() == "second")
 	));
 }

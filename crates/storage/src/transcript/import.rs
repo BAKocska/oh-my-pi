@@ -3,30 +3,30 @@
 //! Foreign records are deliberately parsed line-by-line: damaged records become
 //! diagnostics while later complete records retain their source line identity.
 
+use std::{
+	fs::File,
+	io::{BufRead as _, BufReader},
+	path::{Path, PathBuf},
+};
+
 use omp_core::{Str, sf, time::parse_rfc3339};
 use serde_json::Value;
+use strum::IntoStaticStr;
+use thiserror::Error;
 
 use super::{
-	Attribution, Block, BlockKind, CallId, Event, Kind, ModelId, ModelRef, Msg, ProviderId, Stop,
-	Timing, Usage, UserBlock,
+	Attribution, Block, BlockKind, CallId, Event, Header, Kind, ModelId, ModelRef, Msg, ProviderId,
+	Stop, Timing, TitleSource, Usage, UserBlock, Writer, load, writer::JournalError,
 };
 
 /// Supported foreign transcript dialects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ForeignFormat {
 	/// Claude Code's JSONL session log.
 	ClaudeCode,
 	/// Codex CLI's rollout JSONL log.
 	Codex,
-}
-
-impl ForeignFormat {
-	const fn marker(self) -> &'static str {
-		match self {
-			Self::ClaudeCode => "claude_code",
-			Self::Codex => "codex",
-		}
-	}
 }
 
 /// One recoverable problem found while scanning a foreign journal.
@@ -69,6 +69,7 @@ impl ImportedTranscript {
 	/// no attribution field.
 	#[must_use]
 	pub fn into_events(self, format: ForeignFormat, first_event_index: u64) -> Vec<Event> {
+		let marker: &'static str = format.into();
 		let mut events = Vec::with_capacity(self.entries.len().saturating_mul(2));
 		for entry in self.entries {
 			let target = first_event_index.saturating_add(events.len() as u64);
@@ -80,7 +81,7 @@ impl ImportedTranscript {
 				.map_or_else(|| entry.source_line.to_string(), ToOwned::to_owned);
 			events.push(Event {
 				ts,
-				kind: Kind::Label { target, label: Some(sf!("imported:{}:{id}", format.marker())) },
+				kind: Kind::Label { target, label: Some(sf!("imported:{marker}:{id}")) },
 			});
 		}
 		events
@@ -377,6 +378,307 @@ fn parse_timestamp(value: Option<&Value>) -> Option<u64> {
 			.and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
 		_ => None,
 	}
+}
+
+/// Durable audit facts from one pi v1/v2 migration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiMigrationRecord {
+	/// Source schema revision; absent headers are v1.
+	pub source_version:  u32,
+	/// Exact source path retained after migration.
+	pub source_path:     PathBuf,
+	/// Exact number of source bytes scanned.
+	pub source_bytes:    u64,
+	/// Unsupported legacy fields reported and omitted.
+	pub dropped_fields:  Vec<Str>,
+	/// Number of canonical v4 message/compaction events produced.
+	pub imported_events: u64,
+}
+
+/// Completed pi legacy import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiImportReport {
+	/// Durable migration audit facts.
+	pub migration:   PiMigrationRecord,
+	/// Per-line malformed/unsupported diagnostics.
+	pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+/// Failure from a pi v1/v2 to v4 file migration.
+#[derive(Debug, Error)]
+pub enum PiImportError {
+	/// Source or destination filesystem operation failed.
+	#[error("pi session migration filesystem operation failed")]
+	Io(#[from] std::io::Error),
+	/// The source declared a schema newer than v2.
+	#[error("unsupported pi session version {0}; importer accepts v1 and v2")]
+	UnsupportedVersion(u32),
+	/// Transcript encoding or validation failed.
+	#[error(transparent)]
+	Transcript(#[from] super::codec::Error),
+	/// Atomic v4 journal publication failed.
+	#[error(transparent)]
+	Journal(#[from] JournalError),
+}
+
+/// Streams a pi v1/v2 JSONL source into a new validated v4 journal.
+///
+/// The source is never modified or removed. The destination is lazily
+/// materialized as one atomic header-plus-migration/event group.
+pub fn import_pi_file(
+	source: &Path,
+	destination: &Path,
+	header: &Header,
+) -> Result<PiImportReport, PiImportError> {
+	let file = File::open(source)?;
+	let mut reader = BufReader::new(file);
+	let mut line = Vec::new();
+	let mut events = Vec::new();
+	let mut diagnostics = Vec::new();
+	let mut dropped_fields = Vec::<Str>::new();
+	let mut source_bytes = 0_u64;
+	let mut source_version = 1_u32;
+	let mut source_line = 0_u64;
+
+	loop {
+		line.clear();
+		let read = reader.read_until(b'\n', &mut line)?;
+		if read == 0 {
+			break;
+		}
+		source_line = source_line.saturating_add(1);
+		source_bytes =
+			source_bytes.saturating_add(u64::try_from(read).expect("source line fits in u64"));
+		if line.last() == Some(&b'\n') {
+			line.pop();
+		}
+		if line.last() == Some(&b'\r') {
+			line.pop();
+		}
+		if line.is_empty() {
+			continue;
+		}
+		let value = match serde_json::from_slice::<Value>(&line) {
+			Ok(value) => value,
+			Err(error) => {
+				diagnostics.push(ImportDiagnostic {
+					line:   source_line,
+					code:   sf!("invalid_json"),
+					reason: Str::new(error.to_string()),
+				});
+				continue;
+			},
+		};
+		let Some(object) = value.as_object() else {
+			diagnostics.push(ImportDiagnostic {
+				line:   source_line,
+				code:   sf!("invalid_record"),
+				reason: sf!("record is not an object"),
+			});
+			continue;
+		};
+		let record_type = object
+			.get("type")
+			.and_then(Value::as_str)
+			.unwrap_or_default();
+		if record_type == "session" {
+			source_version = object
+				.get("version")
+				.and_then(Value::as_u64)
+				.map_or(1, |version| u32::try_from(version).unwrap_or(u32::MAX));
+			if source_version > 2 {
+				return Err(PiImportError::UnsupportedVersion(source_version));
+			}
+			record_dropped_fields(
+				object.keys().map(String::as_str),
+				&["type", "version", "id", "timestamp", "cwd"],
+				source_line,
+				&mut dropped_fields,
+				&mut diagnostics,
+			);
+			continue;
+		}
+
+		let ts = parse_timestamp(object.get("timestamp")).unwrap_or_default();
+		let kind = match record_type {
+			"message" => parse_pi_message(object.get("message")).map(Kind::Msg),
+			"compaction" => {
+				let summary = object
+					.get("summary")
+					.and_then(Value::as_str)
+					.unwrap_or_default();
+				let first_kept = object
+					.get("firstKeptEntryIndex")
+					.or_else(|| object.get("firstKeptEntryId"))
+					.and_then(Value::as_u64)
+					.unwrap_or_default();
+				Some(Kind::Compact {
+					summary: Str::new(summary),
+					short: None,
+					first_kept,
+					tokens_before: object
+						.get("tokensBefore")
+						.and_then(Value::as_u64)
+						.unwrap_or_default(),
+					tokens_after: object.get("tokensAfter").and_then(Value::as_u64),
+					method: Some(sf!("pi_legacy")),
+					warning: None,
+					superseded: Vec::new(),
+					snapcompact: None,
+				})
+			},
+			"title" => object
+				.get("title")
+				.and_then(Value::as_str)
+				.map(|title| Kind::Title { title: Str::new(title), source: TitleSource::Imported }),
+			_ => None,
+		};
+		if let Some(kind) = kind {
+			let target = u64::try_from(events.len()).expect("import event count fits in u64");
+			events.push(Event { ts, kind });
+			events.push(Event {
+				ts,
+				kind: Kind::Label {
+					target,
+					label: Some(sf!("imported:pi:v{source_version}:line:{source_line}")),
+				},
+			});
+		} else {
+			diagnostics.push(ImportDiagnostic {
+				line:   source_line,
+				code:   sf!("unsupported_record"),
+				reason: Str::new(record_type),
+			});
+		}
+	}
+
+	let imported_events = u64::try_from(events.len() / 2).expect("import count fits in u64");
+	let migration_label = sf!(
+		"migration:pi:v{source_version}:bytes:{source_bytes}:dropped:{}:source:{}",
+		dropped_fields.len(),
+		source.to_string_lossy()
+	);
+	events
+		.insert(0, Event { ts: 0, kind: Kind::Label { target: 0, label: Some(migration_label) } });
+	for event in &mut events[1..] {
+		if let Kind::Label { target, .. } = &mut event.kind {
+			*target = target.saturating_add(1);
+		}
+	}
+
+	let mut writer = Writer::create_lazy(destination, header)?;
+	writer.append_atomic(&events)?;
+	drop(writer);
+	load(destination)?;
+	Ok(PiImportReport {
+		migration: PiMigrationRecord {
+			source_version,
+			source_path: source.to_owned(),
+			source_bytes,
+			dropped_fields,
+			imported_events,
+		},
+		diagnostics,
+	})
+}
+
+fn record_dropped_fields<'a>(
+	fields: impl IntoIterator<Item = &'a str>,
+	supported: &[&str],
+	line: u64,
+	dropped: &mut Vec<Str>,
+	diagnostics: &mut Vec<ImportDiagnostic>,
+) {
+	for field in fields {
+		if supported.contains(&field) || dropped.iter().any(|known| known == field) {
+			continue;
+		}
+		let field = Str::new(field);
+		dropped.push(field.clone());
+		diagnostics.push(ImportDiagnostic { line, code: sf!("unsupported_field"), reason: field });
+	}
+}
+
+fn parse_pi_message(value: Option<&Value>) -> Option<Msg> {
+	let message = value?.as_object()?;
+	let role = message.get("role").and_then(Value::as_str)?;
+	if role == "toolResult" {
+		let call = message
+			.get("toolCallId")
+			.and_then(Value::as_str)
+			.unwrap_or("imported-call");
+		let tool = message
+			.get("toolName")
+			.and_then(Value::as_str)
+			.unwrap_or("unknown");
+		return Some(Msg::ToolResult {
+			call:          CallId(Str::new(call)),
+			tool:          Str::new(tool),
+			content:       extract_text(message.get("content"))
+				.into_iter()
+				.map(|text| UserBlock::Text { text })
+				.collect(),
+			details:       None,
+			error:         message
+				.get("isError")
+				.and_then(Value::as_bool)
+				.unwrap_or(false),
+			useless:       false,
+			provider_meta: None,
+		});
+	}
+	if role == "assistant"
+		&& let Some(parts) = message.get("content").and_then(Value::as_array)
+	{
+		let blocks = parts
+			.iter()
+			.filter_map(|part| {
+				let object = part.as_object()?;
+				match object.get("type").and_then(Value::as_str)? {
+					"text" => Some(Block {
+						kind: BlockKind::Text { text: Str::new(object.get("text")?.as_str()?) },
+						re:   None,
+					}),
+					"thinking" => Some(Block {
+						kind: BlockKind::Think {
+							text: Str::new(
+								object
+									.get("thinking")
+									.or_else(|| object.get("text"))?
+									.as_str()?,
+							),
+						},
+						re:   None,
+					}),
+					"toolCall" => Some(Block {
+						kind: BlockKind::Tool {
+							id:   CallId(Str::new(object.get("id")?.as_str()?)),
+							name: Str::new(object.get("name")?.as_str()?),
+							wire: None,
+							args: Str::new(
+								object
+									.get("arguments")
+									.map_or_else(|| "{}".to_owned(), Value::to_string),
+							),
+						},
+						re:   None,
+					}),
+					_ => None,
+				}
+			})
+			.collect::<Vec<_>>();
+		if !blocks.is_empty() {
+			return Some(assistant_message(
+				blocks,
+				message
+					.get("provider")
+					.and_then(Value::as_str)
+					.unwrap_or("imported"),
+				message.get("model"),
+			));
+		}
+	}
+	parse_message(role, message.get("content"), "imported", message.get("model"))
 }
 
 #[cfg(test)]
