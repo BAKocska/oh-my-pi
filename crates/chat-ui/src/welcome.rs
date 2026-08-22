@@ -540,7 +540,11 @@ fn draw_sessions(
 		sessions
 			.iter()
 			.take(3)
-			.map(|row| (row.label.clone(), row.detail.clone())),
+			.map(|row| (if row.pinned {
+				sf!("{} {}", charset.icon(Icon::Pin), row.label)
+			} else {
+				row.label.clone()
+			}, row.detail.clone())),
 	);
 	for (index, (label, detail)) in rows.enumerate() {
 		let y = top + 4 + index as u16 * 2;
@@ -1050,6 +1054,7 @@ mod tests {
 			id:     Str::new(id),
 			label:  Str::new(label),
 			detail: Str::new(detail),
+			pinned: false,
 		})
 		.collect()
 	}
@@ -1093,6 +1098,19 @@ mod tests {
 		);
 		assert!(rows[18].contains('└'), "bottom border closes the card");
 		assert!(has_lit_braille(&rows), "the aperture renders lit braille cells");
+	}
+	#[test]
+	fn pinned_session_uses_the_active_charset_icon() {
+		let ctx = context();
+		let mut sessions = sessions();
+		sessions[0].pinned = true;
+		let mut welcome = Welcome::new(&ctx, sessions);
+		let frame = welcome.render(Size::new(100, 21), Duration::from_millis(2_000));
+		let pin = ctx.charset.icon(Icon::Pin);
+		assert!(
+			(0..frame.size().height).any(|row| frame_row_text(frame, row).contains(pin)),
+			"pinned resume row renders the themed pin icon"
+		);
 	}
 
 	#[test]

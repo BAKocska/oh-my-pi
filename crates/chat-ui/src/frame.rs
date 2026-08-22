@@ -150,6 +150,11 @@ impl RetainedFrames {
 		self.frames.get(identity)
 	}
 
+	/// Retains only frames accepted by `keep`.
+	pub fn retain(&mut self, mut keep: impl FnMut(&FrameIdentity) -> bool) {
+		self.frames.retain(|identity, _| keep(identity));
+	}
+
 	/// Applies one validated ordered envelope.
 	pub fn apply(&mut self, envelope: RetainedFrameEnvelope) -> Result<FrameMutation, FrameError> {
 		if envelope.encoded_len() > MAX_FRAME_ENVELOPE_BYTES {

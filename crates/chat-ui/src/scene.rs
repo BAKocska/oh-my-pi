@@ -1462,6 +1462,7 @@ pub struct Chat {
 	transcript:         Vec<Entry>,
 	drawn_entries:      usize,
 	transcript_rows:    u16,
+	tail_repaint_from:  Option<u16>,
 	last_viewport:      Size,
 	height_floor:       u16,
 	last_editor_height: u16,
@@ -1522,6 +1523,7 @@ impl Chat {
 			transcript: Vec::new(),
 			drawn_entries: 0,
 			transcript_rows: 0,
+			tail_repaint_from: None,
 			last_viewport: Size::new(0, 0),
 			height_floor: 0,
 			last_editor_height: 0,
@@ -2118,18 +2120,22 @@ impl Chat {
 			.or_else(|| summary.lines().find(|line| !line.trim().is_empty()));
 		let method = compaction_method_label(method.as_deref());
 		let mut label = fmts_mut!("{} {method}", self.ctx.charset.icon(Icon::Camera));
-		if let Some(tokens_after) = tokens_after.filter(|_| tokens_before > 0) {
-			let arrow = if self.ctx.charset == Charset::Ascii {
-				"->"
+		if let Some(tokens_after) = tokens_after {
+			if tokens_before > 0 {
+				let arrow = if self.ctx.charset == Charset::Ascii {
+					"->"
+				} else {
+					"→"
+				};
+				let _ = write!(
+					label,
+					" · {}{arrow}{}",
+					compact_count(tokens_before),
+					compact_count(tokens_after),
+				);
 			} else {
-				"→"
-			};
-			let _ = write!(
-				label,
-				" · {}{arrow}{}",
-				compact_count(tokens_before),
-				compact_count(tokens_after),
-			);
+				let _ = write!(label, " to {} tokens", compact_count(tokens_after));
+			}
 		}
 		if let Some(preview) = preview {
 			let _ = write!(label, " · {preview}");
@@ -2429,6 +2435,60 @@ impl Chat {
 		self.set_composer_text(&queued);
 	}
 
+	/// Drops a rewind suffix when every affected row is still mutable.
+	///
+	/// `user_index` is the selected user's chronological index in the current
+	/// branch. `rewind_floor` is the renderer's first mutable document row.
+	/// Returns the new stable-row boundary when an in-place repaint is safe.
+	pub fn truncate_rewind_user(
+		&mut self,
+		user_index: usize,
+		text: &str,
+		rewind_floor: u16,
+	) -> Option<u16> {
+		if self.live_assistant.is_some()
+			|| !self.live_tools.is_empty()
+			|| self.drawn_entries != self.transcript.len()
+			|| self.last_viewport.width == 0
+		{
+			return None;
+		}
+		let width = self.content_width(self.last_viewport);
+		let mut row = 0_u16;
+		let mut users = 0_usize;
+		let mut cut = None;
+		for (index, entry) in self.transcript.iter().enumerate() {
+			if let Entry::User(user) = entry {
+				if users == user_index {
+					if user.body.text != text {
+						return None;
+					}
+					cut = Some((index, row));
+					break;
+				}
+				users += 1;
+			}
+			row = row.saturating_add(Self::entry_height(entry, width));
+		}
+		let (index, row) = cut?;
+		if row < rewind_floor {
+			return None;
+		}
+		self.transcript.truncate(index);
+		let transcript = &self.transcript;
+		self.retained_frames.retain(|identity| {
+			transcript
+				.iter()
+				.any(|entry| matches!(entry, Entry::Retained(frame) if &frame.identity == identity))
+		});
+		self.pinned_error = None;
+		self.drawn_entries = index;
+		self.transcript_rows = row;
+		self.tail_repaint_from = Some(row);
+		self.bump_live();
+		Some(row)
+	}
+
 	/// Removes committed and live transcript content.
 	pub fn clear_history(&mut self) {
 		self.transcript.clear();
@@ -2438,6 +2498,7 @@ impl Chat {
 		self.live_tools.clear();
 		self.drawn_entries = 0;
 		self.transcript_rows = 0;
+		self.tail_repaint_from = None;
 		self.height_floor = 0;
 		self.last_viewport = Size::new(0, 0);
 		self.bump_live();
@@ -2498,7 +2559,8 @@ impl Chat {
 			},
 			BackendEvent::LiveVoiceStopped => self.stop_live_voice(),
 			BackendEvent::SessionTitle(title) => self.set_session_title(title),
-			BackendEvent::HistoryCleared => self.clear_history(),
+			BackendEvent::HistoryRewind { .. } | BackendEvent::HistoryCleared => self.clear_history(),
+			BackendEvent::HistoryReplayFinished => {},
 			BackendEvent::Ack { interrupted } => {
 				if interrupted {
 					self.push_notice("Interrupted.");
@@ -2697,6 +2759,7 @@ impl Chat {
 			self.last_panel_height = 0;
 			self.drawn_entries = 0;
 			self.transcript_rows = 0;
+			self.tail_repaint_from = None;
 			self.frame = Frame::new(viewport);
 			return RenderedFrame {
 				frame:       &self.frame,
@@ -2746,10 +2809,11 @@ impl Chat {
 			transcript_rows.saturating_add(Self::band_height(editor_height, panel_height));
 		self.height_floor = self.height_floor.max(natural_height);
 		let document_height = self.height_floor.max(viewport.height);
+		let tail_repaint_from = self.tail_repaint_from.take();
 		let transcript_damage_start = if viewport_rebuild {
 			0
 		} else {
-			self.transcript_rows
+			tail_repaint_from.unwrap_or(self.transcript_rows)
 		};
 		let editor_y = document_height.saturating_sub(editor_height);
 		let title_y = editor_y.saturating_sub(1);
@@ -2761,7 +2825,8 @@ impl Chat {
 		let band_reflow = !viewport_rebuild
 			&& ((self.last_editor_height != 0 && editor_height != self.last_editor_height)
 				|| panel_height != self.last_panel_height);
-		let repaint_suffix = viewport_rebuild || content_reflow || new_rows > 0 || band_reflow;
+		let repaint_suffix =
+			viewport_rebuild || content_reflow || new_rows > 0 || band_reflow || tail_repaint_from.is_some();
 		if viewport_rebuild {
 			self.frame = Frame::new(Size::new(viewport.width, document_height));
 		} else {
@@ -3646,7 +3711,7 @@ fn context_usage_label(tokens: u64, window: Option<u64>) -> (Str, bool) {
 }
 
 fn visible_width(text: &str) -> u16 {
-	u16::try_from(xutf::width_str(text)).unwrap_or(u16::MAX)
+	omp_tui::cell_width(text)
 }
 const fn base_style(theme: Theme) -> Style {
 	Style::new().fg(theme.fg)
@@ -4103,6 +4168,19 @@ mod tests {
 	}
 
 	#[test]
+	fn compaction_with_unknown_source_reports_only_the_result() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_compaction(sf!("summary"), None, None, 0, Some(20_000));
+		let frame = chat.render(Size::new(100, 24)).frame;
+		let rendered = (0..frame.size().height)
+			.map(|row| row_text(frame, row))
+			.collect::<Vec<_>>()
+			.join(" ");
+		assert!(rendered.contains("compacted to 20k tokens"));
+		assert!(!rendered.contains("0→"));
+	}
+
+	#[test]
 	fn status_pulses_running_speculation_and_holds_armed_in_accent() {
 		let context = ctx();
 		let mut chat = Chat::new(&context);
@@ -4292,6 +4370,47 @@ mod tests {
 	}
 
 	#[test]
+	fn rewind_drops_an_uncommitted_transcript_tail_without_history_rebuild() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_user("first", vec![]);
+		chat.begin_assistant("a");
+		chat.append_assistant("a", "kept");
+		chat.end_assistant("a");
+		chat.push_user("second", vec![]);
+		chat.begin_assistant("b");
+		chat.append_assistant("b", "dropped");
+		chat.end_assistant("b");
+
+		let viewport = Size::new(80, 24);
+		let mut renderer = omp_tui::Renderer::new(Vec::new());
+		let rendered = chat.render(viewport);
+		renderer
+			.present(rendered.frame.clone(), viewport.height, rendered.stable_rows)
+			.unwrap();
+		renderer.writer_mut().clear();
+
+		let stable_rows = chat
+			.truncate_rewind_user(1, "second", renderer.rewind_floor())
+			.expect("the second message is still viewport-local");
+		renderer.truncate_uncommitted_tail(stable_rows).unwrap();
+		let rendered = chat.render(viewport);
+		renderer
+			.present(rendered.frame.clone(), viewport.height, rendered.stable_rows)
+			.unwrap();
+		let output = String::from_utf8(renderer.writer_mut().clone()).unwrap();
+		let visible = (0..rendered.frame.size().height)
+			.map(|row| row_text(rendered.frame, row))
+			.collect::<Vec<_>>()
+			.join(" ");
+
+		assert!(visible.contains("first"));
+		assert!(visible.contains("kept"));
+		assert!(!visible.contains("second"));
+		assert!(!visible.contains("dropped"));
+		assert!(!output.contains("\x1b[3J"));
+	}
+
+	#[test]
 	fn tool_result_images_render_inline_in_committed_cards() {
 		// pi UI-06/UI-20: image payloads returned by tools (including PDF
 		// page screenshots) render inline in the committed card instead of
@@ -4326,6 +4445,53 @@ mod tests {
 		let frame = chat.render(Size::new(80, 24)).frame;
 		assert!((0..frame.size().height).any(|row| row_text(frame, row).contains("done")));
 		assert!((0..frame.size().height).all(|row| !row_text(frame, row).contains('▀')));
+	}
+
+	#[test]
+	fn unnamed_session_keeps_embedded_context_gauge_to_the_right_edge() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_composer_style(ComposerStyle::Box);
+		chat.set_status(StatusFacts {
+			model: sf!("model-a"),
+			context_tokens: 50,
+			context_window: Some(100),
+			..StatusFacts::default()
+		});
+		let viewport = Size::new(80, 24);
+		let rows = chat.composer_rows();
+		let border = chat.ctx.theme.border;
+		let frame = chat.render(viewport).frame;
+		let status_row = viewport.height - rows;
+		assert_eq!(
+			frame.cell(viewport.width - 2, status_row).style().foreground_color(),
+			border,
+			"the unfilled gauge reaches the box's right boundary when the right group is empty",
+		);
+	}
+
+	#[test]
+	fn later_hub_wait_updates_stay_pinned_below_an_earlier_live_tool() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_user("stable", vec![]);
+		let stable_rows = chat.render(Size::new(80, 24)).stable_rows;
+
+		chat.tool_started("bash", "bash", "1", "background bash");
+		chat.tool_started("wait", "hub", "1", "hub wait");
+		let started = chat.render(Size::new(80, 24));
+		assert_eq!(started.stable_rows, stable_rows);
+
+		chat.tool_view("wait", sf!("<col><text>job-a running</text><text>job-b running</text></col>"));
+		let first = chat.render(Size::new(80, 24));
+		assert_eq!(first.stable_rows, stable_rows);
+		chat.tool_view("wait", sf!("<col><text>job-a done</text><text>job-b running</text></col>"));
+		let second = chat.render(Size::new(80, 24));
+		assert_eq!(second.stable_rows, stable_rows);
+		let text = (0..second.frame.size().height)
+			.map(|row| row_text(second.frame, row))
+			.collect::<Vec<_>>()
+			.join(" ");
+		assert!(text.contains("job-a done"));
+		assert!(!text.contains("job-a running"));
 	}
 
 	#[test]

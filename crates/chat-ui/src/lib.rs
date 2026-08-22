@@ -110,6 +110,8 @@ pub struct SessionRow {
 	pub label:  Str,
 	/// Secondary display detail.
 	pub detail: Str,
+	/// Whether the session is pinned above ordinary recency ordering.
+	pub pinned: bool,
 }
 /// One live node projected from the core-owned `AgentTree` roster.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -781,6 +783,15 @@ pub enum BackendEvent {
 	},
 	/// Close the active authentication prompt.
 	AuthPromptClose,
+	/// Begin a rewind replay, identifying the selected user-message boundary.
+	HistoryRewind {
+		/// Chronological user-message index on the current branch.
+		user_index: usize,
+		/// Exact selected user-authored text.
+		text:       Str,
+	},
+	/// Finish the replay bracket opened by [`BackendEvent::HistoryRewind`].
+	HistoryReplayFinished,
 	/// Remove all transcript history.
 	HistoryCleared,
 	/// Acknowledge the active submission.

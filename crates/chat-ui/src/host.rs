@@ -7,8 +7,9 @@ use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
 use omp_tui::{
 	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, InputEvent, Key, Layer, Mouse,
-	MouseReport, Notification, PaintStats, Pasted, Renderer, Size, Terminal, TerminalEvent,
-	TerminalOptions, TtyOut, UiContext, Urgency, detect,
+	MouseReport, Notification, PaintStats, Pasted, Renderer, ResizeScrollbackMode, Size, Terminal,
+	TerminalEvent, TerminalOptions, TtyOut, UiContext, Urgency, detect,
+	Icon,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
@@ -88,6 +89,8 @@ pub struct HostOptions {
 	pub error_notify:           bool,
 	/// Permit generated terminal-title escape sequences.
 	pub title_enabled:          bool,
+	/// Native-scrollback policy after a settled in-place width resize.
+	pub resize_scrollback:      ResizeScrollbackMode,
 }
 
 impl Default for HostOptions {
@@ -98,6 +101,7 @@ impl Default for HostOptions {
 			completion_notify:      true,
 			error_notify:           true,
 			title_enabled:          true,
+			resize_scrollback:      ResizeScrollbackMode::Append,
 		}
 	}
 }
@@ -144,6 +148,7 @@ pub async fn run(
 		completion_notify:      true,
 		error_notify:           true,
 		title_enabled:          true,
+		resize_scrollback:      ResizeScrollbackMode::Append,
 	})
 	.await
 	.map(|_| ())
@@ -186,6 +191,7 @@ pub async fn run_with_draft(
 		Terminal::enter(TerminalOptions::new(caps).cursor_style(CursorStyle::BlinkingBar))?;
 	let mut renderer = Renderer::new(TtyOut::new()?);
 	renderer.apply_caps(&caps)?;
+	renderer.set_resize_scrollback(options.resize_scrollback);
 	let result =
 		run_with_terminal(&mut terminal, &mut renderer, chat, &ctx, &events, &intents, options).await;
 	let scrub = terminal.leave_alt().and_then(|()| renderer.clear_layers());
@@ -352,8 +358,9 @@ struct ChatHost {
 	last_esc:          Option<Instant>,
 	last_left:         Option<Instant>,
 	left_taps:         u8,
-	pending_approvals: usize,
-	approval_queue:    VecDeque<crate::ApprovalTicketView>,
+	pending_approvals:       usize,
+	approval_queue:          VecDeque<crate::ApprovalTicketView>,
+	suppress_history_replay: bool,
 }
 
 impl ChatHost {
@@ -384,6 +391,7 @@ impl ChatHost {
 			left_taps: 0,
 			pending_approvals: 0,
 			approval_queue: VecDeque::new(),
+			suppress_history_replay: false,
 		}
 	}
 
@@ -1424,7 +1432,7 @@ async fn run_chat(
 										_ => {},
 									}
 									let had_overlay = host.overlay.is_some();
-									apply_backend(&mut host, event, ctx);
+									apply_terminal_backend(&mut host, event, ctx, renderer);
 									send_pty_resize(&mut host, viewport, intents);
 									if !had_overlay && host.overlay.is_some() {
 										open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
@@ -1511,6 +1519,42 @@ async fn run_chat(
 
 fn host_outcome(host: &ChatHost, exit: HostExit) -> HostOutcome {
 	HostOutcome { exit, draft: Str::from(host.chat.composer_text()) }
+}
+
+fn apply_terminal_backend(
+	host: &mut ChatHost,
+	event: BackendEvent,
+	ctx: &UiContext,
+	renderer: &mut Renderer<TtyOut>,
+) {
+	match event {
+		BackendEvent::HistoryRewind { user_index, text } => {
+			let rewind_floor = renderer.rewind_floor();
+			let truncated = host
+				.chat
+				.truncate_rewind_user(user_index, text.as_str(), rewind_floor)
+				.and_then(|stable_rows| {
+					renderer
+						.truncate_uncommitted_tail(stable_rows)
+						.ok()
+						.map(|()| stable_rows)
+				})
+				.is_some();
+			host.suppress_history_replay = truncated;
+			if !truncated {
+				host.chat.clear_history();
+			}
+		},
+		BackendEvent::HistoryReplayFinished => {
+			host.suppress_history_replay = false;
+		},
+		BackendEvent::HistoryCleared => {
+			host.suppress_history_replay = false;
+			apply_backend(host, BackendEvent::HistoryCleared, ctx);
+		},
+		event if host.suppress_history_replay => {},
+		event => apply_backend(host, event, ctx),
+	}
 }
 
 fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
@@ -1632,7 +1676,15 @@ fn update_models(host: &mut ChatHost, rows: Vec<ModelRow>, current: usize) {
 fn open_sessions(host: &mut ChatHost, sessions: Vec<SessionRow>, ctx: &UiContext) {
 	let rows: Vec<ListRow> = sessions
 		.into_iter()
-		.map(|row| ListRow { key: row.id, label: row.label, detail: row.detail })
+		.map(|row| ListRow {
+			key: row.id,
+			label: if row.pinned {
+				sf!("{} {}", ctx.charset.icon(Icon::Pin), row.label)
+			} else {
+				row.label
+			},
+			detail: row.detail,
+		})
 		.collect();
 	let picker = ListPicker::open("Resume session", &rows, 0, ctx);
 	host.overlay =
