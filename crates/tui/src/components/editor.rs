@@ -476,12 +476,11 @@ impl Component for EditInput {
 		let composer = self
 			.editor
 			.input_height_for(input_width)
+			.max(4)
 			.saturating_add(chrome.top_rows)
 			.saturating_add(chrome.bottom_rows)
-			.clamp(6, 18);
-		composer
-			.saturating_add(self.editor.picker_height())
-			.clamp(6, 18)
+			.min(18);
+		composer.saturating_add(self.editor.picker_height()).min(18)
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {

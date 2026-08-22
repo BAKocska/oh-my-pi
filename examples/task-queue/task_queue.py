@@ -44,6 +44,13 @@ class _QueueItem:
     status: _TaskStatus
 
 
+@dataclass(frozen=True, slots=True)
+class QueueCampaignState:
+    """Track the task handed out by the last committed campaign reaction."""
+
+    last_handed_task_id: int | None = None
+
+
 def _fold_queue() -> list[_QueueItem]:
     tasks: dict[int, _QueueItem] = {}
     for row in omp.journal.entries(QueuedTask):
@@ -85,31 +92,59 @@ _QUEUE_CAMPAIGN = "task-queue-drain"
     ladder=omp.Ladder(8),
     exhaust=omp.Exhaust.SETTLE,
     scope=omp.CampaignScope.SESSION,
-    claims=("task-queue",),
+    state=QueueCampaignState,
+    state_family="examples.task-queue.campaign-state",
     on_failure=omp.OnFailure.DEFER,
 )
-def drain_task_queue(event: dict[str, object]) -> object:
-    """Complete the active item, then continue with at most one waiting task."""
+def drain_task_queue(
+    event: dict[str, object], state: QueueCampaignState
+) -> tuple[object, QueueCampaignState]:
+    """Complete the previously handed task, then hand out at most one task."""
 
     del event
     tasks = _fold_queue()
+    if state.last_handed_task_id is not None:
+        handed = next(
+            (
+                item
+                for item in tasks
+                if item.task_id == state.last_handed_task_id
+            ),
+            None,
+        )
+        if handed is not None and handed.status == "started":
+            omp.journal.append(
+                QueuedTask(event="done", task_id=handed.task_id),
+                idempotency_key=f"task-queue:done:{handed.task_id}",
+            )
+            tasks = _fold_queue()
+
     active = next((item for item in tasks if item.status == "started"), None)
     if active is not None:
-        omp.journal.append(
-            QueuedTask(event="done", task_id=active.task_id),
-            idempotency_key=f"task-queue:done:{active.task_id}",
+        return (
+            omp.Continue(inject=active.task),
+            replace(state, last_handed_task_id=active.task_id),
         )
-        tasks = _fold_queue()
 
     next_task = next((item for item in tasks if item.status == "queued"), None)
     if next_task is None:
-        return omp.Done()
+        return omp.Done(), replace(state, last_handed_task_id=None)
 
     omp.journal.append(
         QueuedTask(event="started", task_id=next_task.task_id),
         idempotency_key=f"task-queue:start:{next_task.task_id}",
     )
-    return omp.Continue(inject=next_task.task)
+    return (
+        omp.Continue(inject=next_task.task),
+        replace(state, last_handed_task_id=next_task.task_id),
+    )
+
+
+async def _engage_queue_if_absent() -> None:
+    engagements = await omp.campaigns.active()
+    if any(item.campaign == _QUEUE_CAMPAIGN for item in engagements):
+        return
+    await omp.campaigns.engage(_QUEUE_CAMPAIGN, state=QueueCampaignState())
 
 
 @omp.device(
@@ -126,7 +161,7 @@ async def queue_task_device(args: QueueTaskArgs, ctx: omp.Context) -> QueueRecei
         args.task,
         idempotency_key=f"task-queue:device:{ctx.invocation}",
     )
-    await omp.campaigns.engage(_QUEUE_CAMPAIGN, queue=True)
+    await _engage_queue_if_absent()
     return receipt
 
 
@@ -145,6 +180,6 @@ async def queue_task_command(
         invocation.raw,
         idempotency_key=f"task-queue:command:{ctx.invocation}",
     )
-    await omp.campaigns.engage(_QUEUE_CAMPAIGN, queue=True)
+    await _engage_queue_if_absent()
     return ui.Consumed()
 

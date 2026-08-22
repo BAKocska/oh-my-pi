@@ -17,12 +17,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Stable notice appended when a tool leaves a proposal uncommitted.
-pub const PREVIEW_PENDING_NOTICE: &str = "A staged proposal is pending. Finalize it with dyn using do_ `invoke/resolve` or \
-                                          `invoke/reject` and a one-sentence `reason` before using another tool.";
+pub const PREVIEW_PENDING_NOTICE: &str = "A staged proposal is pending. Finalize it with dyn \
+                                          using do_ `invoke/resolve` or `invoke/reject` and a \
+                                          one-sentence `reason` before using another tool.";
 
-/// Exact dynamic-device operation applying the pending proposal (`dyn {"do_":"invoke/resolve",...}`).
+/// Exact dynamic-device operation applying the pending proposal (`dyn
+/// {"do_":"invoke/resolve",...}`).
 pub const RESOLVE_OPERATION: &str = "invoke/resolve";
-/// Exact dynamic-device operation discarding the pending proposal (`dyn {"do_":"invoke/reject",...}`).
+/// Exact dynamic-device operation discarding the pending proposal (`dyn
+/// {"do_":"invoke/reject",...}`).
 pub const REJECT_OPERATION: &str = "invoke/reject";
 /// Why a staged proposal was rejected.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -246,7 +249,10 @@ impl PreviewRegistry {
 /// non-string, or blank.
 pub fn parse_resolution_invoke(input: &Value) -> Result<PreviewDecision, PreviewError> {
 	let object = input.as_object().ok_or(PreviewError::NotResolution)?;
-	let operation = object.get("do_").and_then(Value::as_str).unwrap_or_default();
+	let operation = object
+		.get("do_")
+		.and_then(Value::as_str)
+		.unwrap_or_default();
 	let reason = object
 		.get("reason")
 		.and_then(Value::as_str)
@@ -294,12 +300,10 @@ mod tests {
 			.await
 			.expect("proposal staged");
 		assert!(registry.is_pending(pending.id.as_str()));
-		let decision = parse_resolution_invoke(
-			&json!({
-				"do_": "invoke/resolve",
-				"reason": "Apply the reviewed rewrite."
-			})
-		)
+		let decision = parse_resolution_invoke(&json!({
+			"do_": "invoke/resolve",
+			"reason": "Apply the reviewed rewrite."
+		}))
 		.expect("valid resolution");
 		let outcome = (captured.lock().take().expect("observer called").invoker)(decision.clone())
 			.expect("proposal resolved");

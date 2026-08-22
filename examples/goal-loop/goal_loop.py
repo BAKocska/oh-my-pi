@@ -22,10 +22,9 @@ class GoalState:
 
 @dataclass(frozen=True, slots=True)
 class GoalCampaignState:
-    """Carry the goal fields used by the durable settle decision."""
+    """Carry the objective used by the durable settle decision."""
 
     objective: str
-    met: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,20 +68,15 @@ async def _disengage_goal_campaigns() -> None:
 async def continue_goal(
     event: dict[str, object], state: GoalCampaignState
 ) -> tuple[object, GoalCampaignState]:
-    """Continue an unmet goal and finish when it completes or progress stalls."""
+    """Continue an unmet goal, accepting transient stalls without disengaging."""
 
     current = await _current_goal()
-    if (
-        state.met
-        or current is None
-        or current.met
-        or current.objective != state.objective
-    ):
+    if current is None or current.met or current.objective != state.objective:
         return omp.Done(), state
 
     signal = await loop_signal()
     if signal.stalled:
-        return omp.Done(), state
+        return omp.Pass(), state
 
     return (
         omp.Continue(

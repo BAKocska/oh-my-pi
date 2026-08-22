@@ -97,6 +97,8 @@ pub mod edit;
 pub mod eval;
 /// Reader-mode URL fetching through the shared read conversion pipeline.
 pub mod fetch;
+/// Native renderer lifecycle fixtures for visual QA.
+pub mod gallery;
 /// Direct GitHub API and isolated pull-request operations.
 pub mod github;
 /// Deterministic workspace path matching.

@@ -49,6 +49,7 @@ use omp_core::Str;
 use parking_lot::Mutex;
 
 use crate::{
+	frame::Frame,
 	input::{InputEvent, Key, Mouse, MouseButton, MouseReport},
 	pump::{DebugOp, DebugQuery, TerminalEvent},
 };
@@ -112,6 +113,43 @@ pub struct ScreenSnapshot {
 	pub doc_height: u16,
 	/// Whether viewport layers were composited into this paint.
 	pub overlay:    bool,
+}
+/// Native frame-to-PNG capture failure.
+#[derive(Debug, thiserror::Error)]
+pub enum FramePngError {
+	/// The shared pixel rasterizer rejected the frame geometry or options.
+	#[error(transparent)]
+	Raster(#[from] omp_snapcompact::SnapcompactError),
+}
+
+/// Projects one painted frame to right-trimmed terminal text.
+pub fn frame_text(frame: &Frame) -> String {
+	let mut text = String::new();
+	for row in 0..frame.size().height {
+		if row != 0 {
+			text.push('\n');
+		}
+		text.push_str(&crate::test_support::frame_row_text(frame, row));
+	}
+	text
+}
+
+/// Rasterizes one painted terminal frame to a native PNG.
+///
+/// This reuses the process-local snapcompact pixel backend rather than
+/// launching a terminal recorder or browser.
+pub fn frame_png(frame: &Frame) -> Result<Vec<u8>, FramePngError> {
+	let options = omp_snapcompact::SnapcompactRenderOptions {
+		size:        u32::from(frame.size().width).saturating_mul(8).max(8),
+		font:        Some("8x13".to_owned()),
+		cell_width:  Some(8),
+		cell_height: Some(16),
+		variant:     Some("bw".to_owned()),
+		line_repeat: None,
+		stretch:     Some(false),
+		columns:     Some(1),
+	};
+	omp_snapcompact::render_snapcompact_png(&frame_text(frame), &options).map_err(Into::into)
 }
 
 /// Serves one request the server can acknowledge without host state —

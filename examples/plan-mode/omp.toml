@@ -15,6 +15,15 @@ trigger = "lazy"
 api = 1
 failure = "fail-closed"
 
+[[declarations]]
+id = "plan-decision-gate"
+kind = "campaign"
+module = "plan_mode"
+key = "plan-decision-gate"
+trigger = "lazy"
+api = 1
+failure = "fail-open"
+
 [[tools]]
 name = "plan"
 kind = "soft"

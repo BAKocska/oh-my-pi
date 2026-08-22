@@ -468,6 +468,14 @@ impl RenderRegistry {
 		Self::default()
 	}
 
+	/// Iterates exact registered renderer identities in stable key order.
+	pub fn identities(
+		&self,
+	) -> impl DoubleEndedIterator<Item = &ToolIdentity> + ExactSizeIterator + std::iter::FusedIterator
+	{
+		self.entries.keys().map(Arc::as_ref)
+	}
+
 	/// Registers one renderer for one exact `(name, revision)` identity.
 	pub fn register<R: RenderFold>(
 		&mut self,

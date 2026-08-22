@@ -64,7 +64,7 @@ pub use component::{
 	IntoComponent, PaintCtx, Slot, next_slot,
 };
 pub use context::{Appearance, Charset, Graphics, Grid, JamoWidth, Theme, UiContext};
-pub use debug::respond_debug_query;
+pub use debug::{FramePngError, frame_png, frame_text, respond_debug_query};
 pub use editcore::{
 	BufferOutcome, Command, CommandArgument, CompletionEdit, EditBuffer, EditOutcome, Editor,
 	EditorCompletion, EditorCompletion as Completion, EditorOptions, Picker, PickerRow,

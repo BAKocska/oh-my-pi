@@ -238,6 +238,8 @@ pub enum Fault {
 		/// Resource-owned diagnostic.
 		message:   Str,
 	},
+	/// The authenticated invocation scope forbids pseudo-terminal allocation.
+	PtyDenied,
 	/// An environment key was not a portable shell identifier.
 	InvalidEnvironmentKey {
 		/// Rejected key.
@@ -980,6 +982,7 @@ fn interrupt_reason(
 fn fault_reason(fault: &Fault) -> String {
 	match fault {
 		Fault::Resource { operation, message } => format!("shell {operation} failed: {message}"),
+		Fault::PtyDenied => String::from("shell PTY allocation denied by invocation scope"),
 		Fault::InvalidEnvironmentKey { key } => format!("invalid shell environment key {key:?}"),
 		Fault::AsyncNameRequired => String::from("shell async execution requires a non-empty name"),
 	}

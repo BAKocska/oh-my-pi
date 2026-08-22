@@ -839,6 +839,7 @@ fn render_glob_payload(payload: &crate::glob::Payload) -> Str {
 fn shell_fault(fault: &crate::shell::Fault) -> String {
 	match fault {
 		crate::shell::Fault::Resource { operation, message } => format!("{operation}: {message}"),
+		crate::shell::Fault::PtyDenied => String::from("PTY allocation denied by invocation scope"),
 		crate::shell::Fault::InvalidEnvironmentKey { key } => {
 			format!("invalid shell environment key {key:?}")
 		},

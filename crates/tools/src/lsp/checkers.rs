@@ -255,7 +255,7 @@ fn parse_delimited(text: &str, source: &'static str) -> Vec<Diagnostic> {
 	text
 		.lines()
 		.filter_map(|line| {
-			let (prefix, message) = line.rsplit_once(": ")?;
+			let (prefix, message) = line.split_once(": ")?;
 			let (path, row, column) = parse_location(prefix)?;
 			let (level, code, message) = parse_message(message);
 			Some(Diagnostic {

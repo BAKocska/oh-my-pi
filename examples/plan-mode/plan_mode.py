@@ -10,6 +10,7 @@ import omp
 from omp import ModelRef
 
 _CAMPAIGN_ID = "plan-mode"
+_GATE_CAMPAIGN_ID = "plan-decision-gate"
 _DENIAL_CODE = "plan_readonly"
 _PLAN_TOOLSET = ("read", "grep", "glob", "bash", "plan")
 _SESSION = omp.StateScope.SESSION
@@ -39,7 +40,6 @@ class PlanArgs:
 class PlanModeState:
     """Journal the planning selection owned by one campaign engagement."""
 
-    active: bool
     model_provider: str
     model_api: str
     model_name: str
@@ -48,7 +48,6 @@ class PlanModeState:
     @classmethod
     def from_selection(cls, model: ModelRef, thinking: str) -> PlanModeState:
         return cls(
-            active=True,
             model_provider=model.provider,
             model_api=model.api,
             model_name=model.model,
@@ -65,9 +64,9 @@ class PlanModeState:
 
 def _status(state: PlanModeState | None) -> dict[str, object]:
     return {
-        "mode": "plan" if state is not None and state.active else "execute",
-        "model": state.model_ref() if state is not None and state.active else None,
-        "thinking": state.thinking if state is not None and state.active else None,
+        "mode": "plan" if state is not None else "execute",
+        "model": state.model_ref() if state is not None else None,
+        "thinking": state.thinking if state is not None else None,
     }
 
 
@@ -75,7 +74,14 @@ async def _active_plan_mode() -> omp.ActiveCampaign | None:
     for engagement in await omp.campaigns.active():
         if engagement.campaign != _CAMPAIGN_ID or engagement.queued:
             continue
-        if isinstance(engagement.state, PlanModeState) and engagement.state.active:
+        if isinstance(engagement.state, PlanModeState):
+            return engagement
+    return None
+
+
+async def _active_gate() -> omp.ActiveCampaign | None:
+    for engagement in await omp.campaigns.active():
+        if engagement.campaign == _GATE_CAMPAIGN_ID and not engagement.queued:
             return engagement
     return None
 
@@ -122,24 +128,19 @@ def _is_mutating_call(event: Mapping[str, object]) -> bool:
 
 @omp.campaign(
     _CAMPAIGN_ID,
-    at=(omp.CONTEXT, omp.PRE_MODEL, omp.ADMISSION, omp.SETTLE),
-    ladder=omp.Ladder(3),
-    exhaust=omp.Exhaust.SETTLE,
+    at=(omp.CONTEXT, omp.PRE_MODEL, omp.ADMISSION),
     scope=omp.CampaignScope.SESSION,
     state=PlanModeState,
     state_family="examples.plan-mode.state",
     on_failure=omp.OnFailure.DENY,
-    claims=("mode",),
+    claims=("mode", "worktree"),
     binds=("toolset", "model"),
 )
 def plan_mode(
     event: dict[str, object],
     state: PlanModeState,
 ) -> tuple[object, PlanModeState]:
-    """Bind planning surfaces, guard writes, and veto premature settlement."""
-
-    if not state.active:
-        return omp.Done(), state
+    """Bind planning surfaces, guard writes."""
 
     point = event.get("point")
     if point == omp.CONTEXT.value:
@@ -159,17 +160,25 @@ def plan_mode(
         )
     if point == omp.ADMISSION.value and _is_mutating_call(event):
         return omp.Deny("plan is read-only", code=_DENIAL_CODE), state
-    if point == omp.SETTLE.value:
-        return (
-            omp.Continue(
-                inject={
-                    "kind": "plan-mode-decision",
-                    "text": "Planning is active; continue using tools or finish with /plan off.",
-                }
-            ),
-            state,
-        )
     return omp.Pass(), state
+
+@omp.campaign(
+    _GATE_CAMPAIGN_ID,
+    at=omp.SETTLE,
+    ladder=omp.Ladder(3),
+    exhaust=omp.Exhaust.SETTLE,
+    scope=omp.CampaignScope.RUN,
+)
+def plan_decision_gate(event: dict[str, object]) -> object:
+    """Nudge an active planning run toward an explicit decision."""
+
+    del event
+    return omp.Continue(
+        inject={
+            "kind": "plan-mode-decision",
+            "text": "Planning is active; continue using tools or finish with the plan tool.",
+        }
+    )
 
 
 @omp.tool("plan", kind="soft", rev=1)
@@ -193,6 +202,11 @@ async def plan(args: PlanArgs, ctx: omp.Context) -> dict[str, object]:
             _CAMPAIGN_ID,
             state=PlanModeState.from_selection(model, thinking),
         )
+        try:
+            await omp.campaigns.engage(_GATE_CAMPAIGN_ID)
+        except Exception:
+            await omp.campaigns.disengage(active.id)
+            raise
         state = active.state
         return _status(state if isinstance(state, PlanModeState) else None)
 
@@ -206,6 +220,9 @@ async def plan(args: PlanArgs, ctx: omp.Context) -> dict[str, object]:
         Plan(text=text, model=state.model_ref(), thinking=state.thinking),
         scope=_SESSION,
     )
+    gate = await _active_gate()
+    if gate is not None and not await omp.campaigns.disengage(gate.id):
+        raise RuntimeError("plan-decision-gate campaign could not be disengaged")
     if not await omp.campaigns.disengage(engagement.id):
         raise RuntimeError("plan-mode campaign could not be disengaged")
     result = _status(None)

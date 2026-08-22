@@ -1,6 +1,6 @@
 //! Revisioned model-facing Debug Adapter Protocol tool.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, time::Duration};
 
 use async_stream::stream;
 use futures::Stream;

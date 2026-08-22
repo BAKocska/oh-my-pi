@@ -1483,9 +1483,7 @@ impl Registry {
 	}
 
 	fn insert(&mut self, name: Str, rev: Rev, entry: RegistryEntry) -> Result<(), RegistryError> {
-		if self.protected_core.contains(&name)
-			&& (entry.claims.precedence != Precedence::CORE || entry.claims.claimant != "omp/core")
-		{
+		if self.protected_core.contains(&name) && entry.claims.claimant != "omp/core" {
 			return Err(RegistryError::CoreNameClaim {
 				name,
 				claimant: entry.claims.claimant,

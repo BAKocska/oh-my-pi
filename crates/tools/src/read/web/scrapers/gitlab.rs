@@ -19,7 +19,6 @@ enum Kind {
 	Repo,
 	Blob,
 	Tree,
-	Commits,
 	Issue(i64),
 	MergeRequest(i64),
 }
@@ -154,38 +153,6 @@ pub(super) async fn render<C: HttpClient + Sync>(
 						}
 					}
 					(out, None, "gitlab-tree", "Fetched directory tree via GitLab API")
-				},
-				Kind::Commits => {
-					let reference = target.reference.as_deref().unwrap_or("HEAD");
-					let endpoint = format!(
-						"{API}/projects/{}/repository/commits?ref_name={}&per_page=100",
-						project.id,
-						encode(reference)
-					);
-					let Some(commits): Option<Vec<GitLabCommit>> = get_json(client, endpoint).await
-					else {
-						return Ok(None);
-					};
-					let mut out = format!("# Commit log\n\n**Ref:** `{reference}`\n\n");
-					for commit in commits {
-						let subject = if commit.title.is_empty() {
-							commit.message.lines().next().unwrap_or("")
-						} else {
-							&commit.title
-						};
-						writeln!(
-							out,
-							"- [`{}`]({}) **{}**\n  {} · authored {} · committed {}",
-							commit.short_id,
-							commit.web_url,
-							subject,
-							commit.author_name,
-							format_iso_date(&commit.authored_date),
-							format_iso_date(&commit.committed_date)
-						)
-						.expect("writing to String cannot fail");
-					}
-					(out, None, "gitlab-commits", "Fetched commit log via GitLab API")
 				},
 				Kind::Issue(id) => {
 					let endpoint = format!("{API}/projects/{}/issues/{id}", project.id);
@@ -334,7 +301,6 @@ fn parse(url: &Url) -> Option<Target> {
 		"tree" if !rest.is_empty() => {
 			(Kind::Tree, Some(rest[0].clone()), (!rest[1..].is_empty()).then(|| rest[1..].join("/")))
 		},
-		"commits" if !rest.is_empty() => (Kind::Commits, Some(rest.join("/")), None),
 		"issues" if rest.len() == 1 => (Kind::Issue(parse_js_id(&rest[0])?), None, None),
 		"merge_requests" if rest.len() == 1 => {
 			(Kind::MergeRequest(parse_js_id(&rest[0])?), None, None)
@@ -416,23 +382,6 @@ struct TreeItem {
 	name: String,
 	#[serde(rename = "type")]
 	kind: String,
-}
-#[derive(Deserialize)]
-struct GitLabCommit {
-	#[serde(default)]
-	short_id:       String,
-	#[serde(default)]
-	title:          String,
-	#[serde(default)]
-	message:        String,
-	#[serde(default)]
-	author_name:    String,
-	#[serde(default)]
-	authored_date:  String,
-	#[serde(default)]
-	committed_date: String,
-	#[serde(default)]
-	web_url:        String,
 }
 
 #[derive(Deserialize)]

@@ -29,6 +29,7 @@ layout-rs = { workspace = true }
 mermaid-text = { workspace = true }
 omp-core = { workspace = true }
 omp-macros = { workspace = true }
+omp-snapcompact = { workspace = true }
 png = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
