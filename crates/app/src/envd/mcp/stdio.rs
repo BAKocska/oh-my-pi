@@ -630,7 +630,7 @@ async fn read_stdout(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
 			Ok(_) if frame.len() > MAX_FRAME_BYTES => break,
 			Ok(_) => match serde_json::from_slice::<Value>(&frame) {
 				Ok(value) => dispatch(&inner, value),
-				Err(_) => break,
+				Err(_) => continue,
 			},
 		}
 	}
