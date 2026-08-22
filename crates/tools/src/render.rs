@@ -22,7 +22,7 @@ pub mod truncate;
 /// disabling one tool cannot suppress every unrelated renderer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuiltinRendererIdentities {
-	/// Identity of the native hashline editor, when enabled.
+	/// Identity of the native edit dialect, when enabled.
 	pub edit:       Option<ToolIdentity>,
 	/// Identity of the native regex search tool, when enabled.
 	pub grep:       Option<ToolIdentity>,
@@ -694,18 +694,31 @@ fn fault_view(name: &str, message: &str) -> Str {
 	Str::new(output)
 }
 
+/// Physical wrapped-row budget for collapsed edit diff cards.
+const COLLAPSED_EDIT_DIFF_ROWS: u16 = omp_hashline::diff_preview::COLLAPSED_DIFF_ROWS;
+
 fn render_edit_live(update: Option<&crate::edit::EditUpdate>) -> Str {
 	let Some(update) = update else {
 		return live_view("edit", "preparing");
 	};
 	let mut output = String::from("<col gap=0><row gap=1><text bold>edit</text><text fg=muted>");
+	if let Some(path) = update.paths.first() {
+		output.push_str(" · ");
+		push_text(&mut output, path);
+		if update.paths.len() > 1 {
+			write!(output, " (+{} more)", update.paths.len() - 1)
+				.expect("writing to String cannot fail");
+		}
+		output.push_str(" · ");
+	}
 	write!(
 		output,
 		"preview · {} ops · +{} -{}",
 		update.applied_ops, update.added_lines, update.removed_lines
 	)
 	.expect("writing to String cannot fail");
-	output.push_str("</text></row><diff>");
+	write!(output, "</text></row><diff max={COLLAPSED_EDIT_DIFF_ROWS}>")
+		.expect("writing to String cannot fail");
 	push_text(&mut output, &update.preview);
 	output.push_str("</diff></col>");
 	Str::new(output)
@@ -734,7 +747,8 @@ fn render_edit_payload(payload: &crate::edit::Payload) -> Str {
 		if section.rebased {
 			output.push_str(" · rebased");
 		}
-		output.push_str("</text></row><diff>");
+		write!(output, "</text></row><diff max={COLLAPSED_EDIT_DIFF_ROWS}>")
+			.expect("writing to String cannot fail");
 		push_text(&mut output, &section.diff);
 		for (index, diagnostic) in section.diagnostics.iter().enumerate() {
 			if !section.diff.is_empty() || index > 0 {
@@ -1327,6 +1341,7 @@ mod tests {
 		let (registry, identities) = registry(identities());
 		let update = crate::edit::EditUpdate {
 			applied_ops:   2,
+			paths:         vec![sf!("src/lib.rs"), sf!("src/other.rs")],
 			preview:       sf!("+&lt;already-markup"),
 			added_lines:   3,
 			removed_lines: 1,
@@ -1345,8 +1360,8 @@ mod tests {
 				.view(identities.edit.as_ref().unwrap(), &state, None)
 				.expect("live edit renders")
 				.as_str(),
-			"<col gap=0><row gap=1><text bold>edit</text><text fg=muted>preview · 2 ops · +3 \
-			 -1</text></row><diff>+&amp;lt;already-markup</diff></col>",
+			"<col gap=0><row gap=1><text bold>edit</text><text fg=muted> · src/lib.rs (+1 more) · preview · 2 ops · +3 \
+			 -1</text></row><diff max=40>+&amp;lt;already-markup</diff></col>",
 		);
 
 		let outcome =

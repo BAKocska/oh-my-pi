@@ -10,11 +10,15 @@ use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, Constraint, Effects, Ev, IncomingParams, ParamError, Part,
 	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
+use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-const RESERVED_LABELS: [&str; 3] = ["Other (type your own)", "Chat about this", "Next →"];
+/// Label used for a host-provided free-text alternative.
+pub const OTHER_OPTION: &str = "Other (type your own)";
+
+const RESERVED_LABELS: [&str; 3] = [OTHER_OPTION, "Chat about this", "Next →"];
 
 /// Arguments for `ask@1`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -113,6 +117,30 @@ impl std::error::Error for Fault {}
 pub trait AskPresenter: Send + Sync + 'static {
 	/// Presents ordered questions and returns durable selections.
 	fn present(&self, questions: &[Question]) -> Result<Presentation, Fault>;
+}
+
+/// Replaceable per-environment presentation bridge.
+#[derive(Clone)]
+pub struct PresenterSlot {
+	inner: Arc<RwLock<Arc<dyn AskPresenter>>>,
+}
+
+impl PresenterSlot {
+	/// Creates a slot with the specified fallback presenter.
+	pub fn new(presenter: Arc<dyn AskPresenter>) -> Self {
+		Self { inner: Arc::new(RwLock::new(presenter)) }
+	}
+
+	/// Replaces the presenter used by subsequent ask invocations.
+	pub fn bind(&self, presenter: Arc<dyn AskPresenter>) {
+		*self.inner.write() = presenter;
+	}
+}
+
+impl AskPresenter for PresenterSlot {
+	fn present(&self, questions: &[Question]) -> Result<Presentation, Fault> {
+		self.inner.read().present(questions)
+	}
 }
 /// Presenter result, preserving whether answers came from headless fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -298,9 +326,6 @@ pub fn validate(questions: &[Question]) -> Result<(), Fault> {
 	for question in questions {
 		if question.id.trim().is_empty() || !ids.insert(question.id.clone()) {
 			return Err(invalid("question ids must be non-empty and unique"));
-		}
-		if question.options.is_empty() {
-			return Err(invalid("each question requires at least one option"));
 		}
 		if let Some(index) = question.recommended
 			&& index >= question.options.len()

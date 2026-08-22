@@ -25,6 +25,7 @@ use crate::{
 	path::{HostPaths, normalize_target},
 	render::TextProjection,
 };
+const SLOPPY_DESCRIPTION: &str = include_str!("../sloppy_prompt.txt");
 
 /// Freeform arguments shared by patch-envelope and sloppy revisions.
 ///
@@ -68,7 +69,7 @@ impl FreeformKind {
 				"Apply a Codex begin/add/update/move/delete patch envelope atomically."
 			},
 			Self::Sloppy => {
-				"Apply [path] match/rewrite sections using pi's sloppy edit syntax atomically per file."
+				SLOPPY_DESCRIPTION
 			},
 		}
 	}
@@ -280,7 +281,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 					}
 
 					let (preview, added_lines, removed_lines) = preview(&works, &projections);
-					yield Ev::Update(EditUpdate { applied_ops: projections.len(), preview, added_lines, removed_lines });
+					yield Ev::Update(EditUpdate { applied_ops: projections.len(), paths: works.iter().map(|work| work.prepared.display_path().clone()).collect(), preview, added_lines, removed_lines });
 					match params.committed().await {
 						Ok(_) => {},
 						Err(error) => { yield commit_event(error); return; },
@@ -563,7 +564,7 @@ mod tests {
 	#[test]
 	fn repeated_sloppy_sections_merge_in_authored_order() {
 		let operations =
-			parse_operations(FreeformKind::Sloppy, "[a]\n«\nx\n»\ny\n[a]\n«\ny\n»\nz").expect("parse");
+			parse_operations(FreeformKind::Sloppy, "§a\nx\n»\ny\n§a\ny\n»\nz").expect("parse");
 		assert_eq!(operations.len(), 1);
 		let AuthoredOperation::Sloppy { input, .. } = &operations[0] else {
 			panic!("sloppy")

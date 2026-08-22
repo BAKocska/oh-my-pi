@@ -184,6 +184,9 @@ pub struct Params {
 pub struct EditUpdate {
 	/// Number of parsed low-level operations currently applied.
 	pub applied_ops:   usize,
+	/// Canonical target paths discovered from the streamed arguments.
+	#[serde(default)]
+	pub paths:         Vec<Str>,
 	/// Compact, numbered preview of the current candidate.
 	pub preview:       Str,
 	/// Added rows represented by the preview source diff.
@@ -833,6 +836,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 					}
 					yield Ev::Update(EditUpdate {
 						applied_ops: projections.iter().map(|projection| projection.applied_ops.len()).sum(),
+						paths: parsed_sections.iter().map(|work| work.section_path.clone()).collect(),
 						preview: preview.into(),
 						added_lines,
 						removed_lines,

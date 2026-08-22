@@ -82,7 +82,7 @@ pub fn scan(input: &str) -> Vec<Occurrence> {
 			cursor += input[cursor..].chars().next().map_or(1, char::len_utf8);
 			continue;
 		};
-		let end = uri_end(input, cursor + prefix.len(), quote, substitution_depth);
+		let end = uri_end(input, cursor + prefix.len(), quote);
 		if end > cursor + prefix.len() {
 			found.push(Occurrence {
 				range: cursor..end,
@@ -155,7 +155,7 @@ pub fn replace_plain(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 const PATH_SCHEMES: [&str; 7] =
 	["artifact://", "memory://", "agent://", "local://", "skill://", "rule://", "plan://"];
 
-fn uri_end(input: &str, start: usize, quote: QuoteContext, substitution_depth: usize) -> usize {
+fn uri_end(input: &str, start: usize, quote: QuoteContext) -> usize {
 	let bytes = input.as_bytes();
 	let mut cursor = start;
 	while let Some(&byte) = bytes.get(cursor) {
@@ -164,8 +164,11 @@ fn uri_end(input: &str, start: usize, quote: QuoteContext, substitution_depth: u
 			QuoteContext::Double => byte == b'"',
 			QuoteContext::Unquoted | QuoteContext::Substitution => {
 				byte.is_ascii_whitespace()
-					|| matches!(byte, b'\'' | b'"' | b';' | b'|' | b'&' | b'<' | b'>')
-					|| substitution_depth != 0 && byte == b')'
+					|| matches!(
+						byte,
+						b'\'' | b'"' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b'$' | b'\\'
+							| b')'
+					)
 			},
 		};
 		if terminal {
@@ -221,6 +224,25 @@ mod tests {
 		let paths = BTreeMap::from([(Str::new("local://x"), Str::new("/tmp/a b"))]);
 		assert_eq!(replace("cat local://x 'local://x'", &paths), "cat '/tmp/a b' 'local://x'");
 	}
+
+	#[test]
+	fn unquoted_internal_uris_stop_before_shell_syntax() {
+		let paths = BTreeMap::from([(Str::new("local://x.md"), Str::new("/tmp/a b"))]);
+		for (command, expected) in [
+			("read local://x.md;echo hi", "read '/tmp/a b';echo hi"),
+			("cat local://x.md&&echo hi", "cat '/tmp/a b'&&echo hi"),
+			("cat local://x.md|head", "cat '/tmp/a b'|head"),
+			("cat local://x.md<input", "cat '/tmp/a b'<input"),
+			("cat local://x.md>output", "cat '/tmp/a b'>output"),
+			("cat local://x.md(subshell)", "cat '/tmp/a b'(subshell)"),
+			("cat local://x.md$HOME", "cat '/tmp/a b'$HOME"),
+			(r"cat local://x.md\ suffix", r"cat '/tmp/a b'\ suffix"),
+			("cat local://x.md)", "cat '/tmp/a b')"),
+		] {
+			assert_eq!(replace(command, &paths), expected, "{command}");
+		}
+	}
+
 	#[test]
 	fn data_replacement_does_not_embed_shell_quotes() {
 		let paths = BTreeMap::from([(Str::new("local://x"), Str::new("/tmp/a b"))]);

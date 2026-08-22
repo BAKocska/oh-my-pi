@@ -3,6 +3,8 @@
 use std::{
 	collections::HashMap,
 	fmt::Write,
+	fs::File,
+	io::{Read, Seek, SeekFrom},
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -227,15 +229,44 @@ pub fn is_sqlite_target(display_path: &str, prefix: &[u8]) -> bool {
 	looks_like_sqlite(prefix) && !parse_path_candidates(display_path).is_empty()
 }
 
-/// Opens an existing database read-only and installs pi's three-second busy
-/// timeout.
+/// Opens an existing database for query-only reads and installs pi's
+/// three-second busy timeout.
+///
+/// A cleanly closed WAL database can retain WAL format bytes in its header
+/// after SQLite removes its `-wal` and `-shm` files. SQLite cannot recreate
+/// those sidecars through a read-only file handle, so that case is opened
+/// read-write once and immediately constrained with `query_only`.
 pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
-	let connection = Connection::open_with_flags(
-		path,
-		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-	)?;
+	let flags = if requires_wal_sidecar_initialization(path) {
+		OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
+	} else {
+		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
+	};
+	let connection = Connection::open_with_flags(path, flags)?;
+	connection.pragma_update(None, "query_only", true)?;
 	connection.busy_timeout(Duration::from_millis(3_000))?;
+	connection
+		.query_row("SELECT name FROM sqlite_master LIMIT 1", [], |_| Ok(()))
+		.optional()?;
 	Ok(connection)
+}
+
+fn requires_wal_sidecar_initialization(path: &Path) -> bool {
+	let Ok(mut file) = File::open(path) else {
+		return false;
+	};
+	let mut format_versions = [0; 2];
+	if file.seek(SeekFrom::Start(18)).is_err() || file.read_exact(&mut format_versions).is_err() {
+		return false;
+	}
+	format_versions == [2, 2]
+		&& (!sidecar_path(path, "-wal").exists() || !sidecar_path(path, "-shm").exists())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+	let mut sidecar = path.as_os_str().to_os_string();
+	sidecar.push(suffix);
+	PathBuf::from(sidecar)
 }
 
 /// Finds every extension-boundary split, longest database path first.
@@ -1202,4 +1233,37 @@ pub fn read(path: &Path, authored_target: &str) -> Result<String, Error> {
 		.next()
 		.ok_or_else(|| Error(format!("SQLite path target '{authored_target}' is invalid")))?;
 	read_path(path, &candidate.sub_path, &candidate.query_string)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn opens_clean_wal_database_without_sidecars_as_query_only() {
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("clean.sqlite");
+		let writer = Connection::open(&path).unwrap();
+		writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+		writer
+			.execute_batch("CREATE TABLE records(value TEXT); INSERT INTO records VALUES ('kept');")
+			.unwrap();
+		drop(writer);
+
+		assert_eq!(&std::fs::read(&path).unwrap()[18..20], &[2, 2]);
+		let _ = std::fs::remove_file(sidecar_path(&path, "-wal"));
+		let _ = std::fs::remove_file(sidecar_path(&path, "-shm"));
+
+		let reader = open_read_only(&path).unwrap();
+		let value: String = reader
+			.query_row("SELECT value FROM records", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(value, "kept");
+		assert!(
+			reader
+				.pragma_query_value(None, "query_only", |row| row.get::<_, bool>(0))
+				.unwrap()
+		);
+		assert!(reader.execute("INSERT INTO records VALUES ('changed')", []).is_err());
+	}
 }

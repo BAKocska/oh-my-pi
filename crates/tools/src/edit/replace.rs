@@ -221,7 +221,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 							removed_lines += compact.removed_lines;
 						}
 					}
-					yield Ev::Update(EditUpdate { applied_ops: projections.iter().map(|projection| projection.resolved.len()).sum(), preview: preview.into(), added_lines, removed_lines });
+					yield Ev::Update(EditUpdate { applied_ops: projections.iter().map(|projection| projection.resolved.len()).sum(), paths: works.iter().map(|work| work.prepared.display_path().clone()).collect(), preview: preview.into(), added_lines, removed_lines });
 					match params.committed().await {
 						Ok(_) => {},
 						Err(error) => { yield commit_event(error); return; },
