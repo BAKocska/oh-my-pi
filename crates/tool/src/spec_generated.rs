@@ -481,6 +481,30 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	),
 	symbol!(
 		"docs/py/11-env.md",
+		"omp.env.dap.launch",
+		"(request: DapLaunchRequest) -> DapStream",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await env.dap_launch(request)"
+	),
+	symbol!(
+		"docs/py/11-env.md",
+		"omp.env.dap.attach",
+		"(request: DapAttachRequest) -> DapStream",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await env.dap_attach(request)"
+	),
+	symbol!(
+		"docs/py/11-env.md",
+		"omp.env.dap.action",
+		"(request: DapActionRequest) -> DapStream",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await env.dap_action(request)"
+	),
+	symbol!(
+		"docs/py/11-env.md",
 		"omp.env.find.walk",
 		"(**kwargs) -> AsyncIterator[Entry]",
 		CallbackAbi::None,

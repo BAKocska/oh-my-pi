@@ -3,9 +3,11 @@ use std::fmt::{self, Write as _};
 use omp_core::Str;
 use omp_tool::{
 	CallOutcome, Part, PromptCaps, ToolIdentity,
-	render::{Render, RenderRegistry, RenderRegistryError},
+	render::{RenderFold, RenderRegistry, RenderRegistryError},
 };
 
+/// Bounded JSON-tree previews shared by structured tool views.
+pub mod json_tree;
 /// Grouped path and directory-tree rendering.
 pub mod paths;
 /// Shared line, byte, and column truncation.
@@ -76,7 +78,7 @@ struct EditState {
 
 struct EditRenderer;
 
-impl Render for EditRenderer {
+impl RenderFold for EditRenderer {
 	type Outcome = CallOutcome<crate::edit::Payload, crate::edit::Fault>;
 	type State = EditState;
 	type Update = crate::edit::EditUpdate;
@@ -97,7 +99,7 @@ impl Render for EditRenderer {
 
 struct GrepRenderer;
 
-impl Render for GrepRenderer {
+impl RenderFold for GrepRenderer {
 	type Outcome = CallOutcome<crate::grep::Payload, crate::grep::Fault>;
 	type State = ();
 	type Update = crate::grep::Update;
@@ -118,7 +120,7 @@ impl Render for GrepRenderer {
 
 struct GlobRenderer;
 
-impl Render for GlobRenderer {
+impl RenderFold for GlobRenderer {
 	type Outcome = CallOutcome<crate::glob::Payload, crate::glob::Fault>;
 	type State = ();
 	type Update = crate::glob::Update;
@@ -145,7 +147,7 @@ struct StreamState {
 
 struct ShellRenderer;
 
-impl Render for ShellRenderer {
+impl RenderFold for ShellRenderer {
 	type Outcome = CallOutcome<crate::shell::Payload, crate::shell::Fault>;
 	type State = StreamState;
 	type Update = crate::shell::Update;
@@ -169,7 +171,7 @@ impl Render for ShellRenderer {
 
 struct WriteRenderer;
 
-impl Render for WriteRenderer {
+impl RenderFold for WriteRenderer {
 	type Outcome = CallOutcome<crate::write::Payload, crate::write::Fault>;
 	type State = ();
 	type Update = crate::write::Update;
@@ -195,7 +197,7 @@ struct ReadState {
 
 struct ReadRenderer;
 
-impl Render for ReadRenderer {
+impl RenderFold for ReadRenderer {
 	type Outcome = CallOutcome<crate::read::Payload, crate::read::Fault>;
 	type State = ReadState;
 	type Update = crate::read::Update;
@@ -216,7 +218,7 @@ impl Render for ReadRenderer {
 
 struct EvalRenderer;
 
-impl Render for EvalRenderer {
+impl RenderFold for EvalRenderer {
 	type Outcome = CallOutcome<crate::eval::Payload, crate::eval::Fault>;
 	type State = StreamState;
 	type Update = crate::eval::Update;
@@ -754,15 +756,16 @@ mod tests {
 		let (registry, identities) = registry(identities());
 		let outcome =
 			CallOutcome::<crate::write::Payload, crate::write::Fault>::Ok(crate::write::Payload {
-				resolved_path:    sf!("/tmp/a<&.txt"),
-				display_path:     sf!("a<&.txt"),
-				byte_len:         9,
-				reported_len:     9,
-				disposition:      crate::write::WriteDisposition::Created,
-				stripped_wrapper: false,
-				made_executable:  true,
-				snapshot_tag:     Some(sf!("ABCD")),
-				operation:        crate::write::WriteOperation::Plain,
+				resolved_path:      sf!("/tmp/a<&.txt"),
+				display_path:       sf!("a<&.txt"),
+				canonical_recovery: None,
+				byte_len:           9,
+				reported_len:       9,
+				disposition:        crate::write::WriteDisposition::Created,
+				stripped_wrapper:   false,
+				made_executable:    true,
+				snapshot_tag:       Some(sf!("ABCD")),
+				operation:          crate::write::WriteOperation::Plain,
 			});
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
 		let state = ViewState::new();

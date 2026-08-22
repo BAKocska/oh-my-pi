@@ -422,19 +422,20 @@ fn oversized_display_json_and_spilled_output_lookup_are_exact() {
 fn image_display_projects_blob_without_base64_text() {
 	let mut value = payload();
 	value.display_outputs = vec![DisplayOutput::Image {
-		blob:      BlobRef {
+		blob:        BlobRef {
 			hash:       sf!("sha256:image"),
 			media_type: sf!("image/png"),
 			byte_len:   68,
 		},
-		mime_type: sf!("image/png"),
+		mime_type:   sf!("image/png"),
+		description: sf!("PNG image, 1×1."),
 	}];
 	let parts = project(&value, true);
-	assert_eq!(text(&parts), "(displayed 1 image; no text output)");
+	assert_eq!(text(&parts), "PNG image, 1×1.");
 	assert!(matches!(
 		parts.as_slice(),
 		[Part::Text { .. }, Part::Blob { blob, alt: Some(alt) }]
-			if blob.hash == "sha256:image" && alt == "display image 1"
+			if blob.hash == "sha256:image" && alt == "PNG image, 1×1."
 	));
 }
 

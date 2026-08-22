@@ -7,9 +7,11 @@
 
 use std::{
 	borrow::Cow,
-	collections::{HashMap, VecDeque},
+	collections::{BTreeMap, VecDeque},
 	fmt::Write as _,
 	future::Future,
+	io::Write as _,
+	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -19,6 +21,7 @@ use std::{
 
 use async_stream::stream;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
 use omp_core::{CowBytes, Str, sf};
 use omp_proto::inference::v1::{InvokeInput, invoke_input};
@@ -27,7 +30,6 @@ use omp_tool::{
 	ExecEffects, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, ParamError, Part,
 	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal, Usd,
 };
-use parking_lot::Mutex;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,8 +70,8 @@ tool.<name>(args) → unknown
     Invoke any session tool; `args` = its parameter object.
 completion(prompt, model?="default"|"smol"|"slow", system=None, schema=None) → str | dict
     Oneshot, stateless (no history/tools). `model`: "smol" fast | "default" session | "slow" most capable. `schema` (JSON-Schema) → parsed object.
-agent(prompt, agent?="task", label=None, schema=None, schema_mode?="permissive", isolated=None, apply=None, merge=None, handle=False) → str | dict
-    Run a subagent → final output. `agent` selects a discovered agent; omit it to use `task`. `schema` overrides agent/session schemas; `schemaMode`/`schema_mode`: "permissive" | "strict". Effective schemas return parsed data. `isolated` requests a worktree; `apply`/`merge` control its changes. Background via `local://` files named in the prompt. `handle` → { text, output, handle: "agent://<id>", id, agent }, parsed `data` when structured.
+agent(prompt, agent?="task", name=None, outputSchema=None, schemaMode?="permissive", isolated=None, apply=None, merge=None, handle=False) → str | dict
+    Run a subagent → final output. `agent` selects a discovered agent; omit it to use `task`. `outputSchema` overrides agent/session schemas; `schemaMode`/`schemaMode`: "permissive" | "strict". Effective schemas return parsed data. `isolated` requests a worktree; `apply`/`merge` control its changes. Background via `local://` files named in the prompt. `handle` → { text, output, handle: "agent://<id>", id, agent }, parsed `data` when structured.
 parallel(thunks) → list     pipeline(items, ...stages) → list
 log(message) → None         phase(title) → None
 budget → `budget.total` (ceiling or None), `budget.spent()`, `budget.remaining()`; ceiling `+Nk` advisory, `+Nk!` hard.
@@ -87,6 +89,154 @@ Acyclic waves via `agent(…, handle=true)` + `pipeline`/`parallel`:
 <critical>
 Prior top-level names survive into the next cell — reuse; NEVER re-import/re-declare. Re-read only if file changed since last read.
 </critical>"#;
+
+/// One live discovered agent projected into eval task guidance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskAgentDescription<'a> {
+	/// Stable definition name.
+	pub name:        &'a str,
+	/// Human-readable role.
+	pub description: &'a str,
+	/// Whether every declared tool is read-only.
+	pub read_only:   bool,
+	/// Whether this role executes inline.
+	pub blocking:    bool,
+}
+
+/// Session facts used to build model-facing task guidance once.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskDescriptionSnapshot<'a> {
+	/// Effective default definition.
+	pub default_agent:   &'a str,
+	/// Effective discovered roster after disablement.
+	pub agents:          &'a [TaskAgentDescription<'a>],
+	/// Whether child jobs may continue asynchronously.
+	pub asynchronous:    bool,
+	/// Whether ordered batches are supported.
+	pub batch:           bool,
+	/// Whether isolated workspaces are enabled.
+	pub isolation:       bool,
+	/// Whether IRC coordination is enabled.
+	pub irc:             bool,
+	/// Whether the caller may select effort.
+	pub effort:          bool,
+	/// Effective maximum fan-out (`0` is unlimited).
+	pub max_concurrency: usize,
+}
+
+/// Builds the task portion of the eval description from one session snapshot.
+#[must_use]
+pub fn task_description(snapshot: TaskDescriptionSnapshot<'_>) -> Str {
+	let mut output = String::with_capacity(EVAL_DESCRIPTION.len() + 2_048);
+	output.push_str(EVAL_DESCRIPTION);
+	output.push_str("\n\n<task-runtime>\n");
+	let _ = writeln!(output, "Default agent: `{}`.", snapshot.default_agent);
+	let _ = writeln!(
+		output,
+		"Execution: {}; batches: {}; isolation: {}; IRC: {}; effort: {}; concurrency: {}.",
+		if snapshot.asynchronous {
+			"async jobs"
+		} else {
+			"blocking"
+		},
+		if snapshot.batch {
+			"enabled"
+		} else {
+			"disabled"
+		},
+		if snapshot.isolation {
+			"enabled"
+		} else {
+			"disabled"
+		},
+		if snapshot.irc { "enabled" } else { "disabled" },
+		if snapshot.effort {
+			"enabled"
+		} else {
+			"disabled"
+		},
+		if snapshot.max_concurrency == 0 {
+			"unlimited".to_owned()
+		} else {
+			snapshot.max_concurrency.to_string()
+		},
+	);
+	output.push_str("Available agents:\n");
+	for agent in snapshot.agents {
+		let _ = writeln!(
+			output,
+			"- `{}`{}{}: {}",
+			agent.name,
+			if agent.read_only { " (READ-ONLY)" } else { "" },
+			if agent.blocking { " (BLOCKING)" } else { "" },
+			agent.description,
+		);
+	}
+	output.push_str(
+		"Choose the most specific specialist; omit `agent` only when the default fits. Use \
+		 read-only agents only for investigation. For concurrent siblings, assign disjoint \
+		 ownership and coordinate shared files over IRC before editing.\n</task-runtime>",
+	);
+	Str::from(output)
+}
+
+const STANDARD_TASK_AGENTS: &[TaskAgentDescription<'static>] = &[
+	TaskAgentDescription {
+		name:        "task",
+		description: "General-purpose delegated multi-step work",
+		read_only:   false,
+		blocking:    false,
+	},
+	TaskAgentDescription {
+		name:        "scout",
+		description: "Rapid read-only codebase research",
+		read_only:   true,
+		blocking:    false,
+	},
+	TaskAgentDescription {
+		name:        "sonic",
+		description: "Strictly mechanical updates or data collection",
+		read_only:   false,
+		blocking:    false,
+	},
+	TaskAgentDescription {
+		name:        "designer",
+		description: "UI/UX implementation and visual refinement",
+		read_only:   false,
+		blocking:    false,
+	},
+	TaskAgentDescription {
+		name:        "reviewer",
+		description: "Evidence-backed code review",
+		read_only:   true,
+		blocking:    false,
+	},
+	TaskAgentDescription {
+		name:        "security-reviewer",
+		description: "Read-only repository security review",
+		read_only:   true,
+		blocking:    false,
+	},
+	TaskAgentDescription {
+		name:        "librarian",
+		description: "Source-verified external library research",
+		read_only:   true,
+		blocking:    false,
+	},
+];
+
+fn standard_eval_description() -> Str {
+	task_description(TaskDescriptionSnapshot {
+		default_agent:   "task",
+		agents:          STANDARD_TASK_AGENTS,
+		asynchronous:    false,
+		batch:           true,
+		isolation:       true,
+		irc:             true,
+		effort:          true,
+		max_concurrency: 32,
+	})
+}
 
 const MAX_DISPLAY_TEXT_BYTES: usize = 8_000;
 const MAX_RETAINED_OUTPUT_BYTES: usize = 128 * 1024;
@@ -220,12 +370,22 @@ pub enum DisplayOutput {
 		/// Displayed value.
 		data: Value,
 	},
+	/// Bounded encoded image awaiting host persistence.
+	ImageData {
+		/// Exact encoded PNG or JPEG bytes.
+		#[serde(with = "cow_bytes")]
+		data:      CowBytes<'static>,
+		/// Validated image media type.
+		mime_type: Str,
+	},
 	/// Image already persisted by the host.
 	Image {
 		/// Durable blob containing the encoded image.
-		blob:      BlobRef,
+		blob:        BlobRef,
 		/// Image media type.
-		mime_type: Str,
+		mime_type:   Str,
+		/// Model-visible source/final dimension and encoding note.
+		description: Str,
 	},
 	/// Markdown display value.
 	Markdown {
@@ -365,6 +525,19 @@ pub struct Session {
 	pub id: Bytes,
 }
 
+/// Host-authorized process state applied immediately before one cell.
+///
+/// Managed environment entries are deltas: `Some` replaces a value and `None`
+/// removes it. The app authority sends every managed key on every run so state
+/// cannot leak from a prior owner or session.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeSnapshot {
+	/// Scoped working directory for this cell.
+	pub cwd:         Option<PathBuf>,
+	/// Sanitized managed-environment replacements and removals.
+	pub managed_env: BTreeMap<Str, Option<Str>>,
+}
+
 /// Request to execute one cell in a persistent session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
@@ -374,6 +547,8 @@ pub struct RunRequest {
 	pub timeout: Option<Duration>,
 	/// Whether to replace the persistent namespace first.
 	pub reset:   bool,
+	/// Frozen host-authorized runtime state for this run.
+	pub runtime: RuntimeSnapshot,
 }
 
 /// Ordered event from an active cell.
@@ -426,6 +601,22 @@ pub trait EvalExec: Clone + Send + Sync + 'static {
 
 	/// Opens the persistent Python session owned by this tool instance.
 	fn open_session(&self) -> impl Future<Output = Result<Session, Fault>> + Send + '_;
+
+	/// Opens a persistent session for an authenticated invocation owner.
+	///
+	/// Executors that key resources by owner override this method. Child-local
+	/// and test executors may use the owner-independent default.
+	fn open_session_for(
+		&self,
+		_owner: &str,
+	) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
+		self.open_session()
+	}
+
+	/// Freezes the runtime state authorized for one owner/session pair.
+	fn runtime_snapshot(&self, _owner: &str, _session: &Session) -> Result<RuntimeSnapshot, Fault> {
+		Ok(RuntimeSnapshot::default())
+	}
 
 	/// Starts one cell in an existing session.
 	fn run<'a>(
@@ -480,6 +671,66 @@ fn format_display_json(outputs: &[DisplayOutput]) -> String {
 		rendered.push(format!("display[{index}]:\n{text}"));
 	}
 	rendered.join("\n\n")
+}
+
+/// Bounded live view of an eval cell's ordered text output.
+///
+/// The first and most recent halves are retained. Once output crosses the
+/// bound, a stable truncation marker separates them; memory use never depends
+/// on the total amount produced by the cell.
+pub struct TailBuffer {
+	head:        Vec<u8>,
+	tail:        VecDeque<u8>,
+	total_bytes: usize,
+	max_bytes:   usize,
+}
+
+impl TailBuffer {
+	/// Creates a live buffer with a hard byte bound.
+	#[must_use]
+	pub fn new(max_bytes: usize) -> Self {
+		Self {
+			head: Vec::with_capacity(max_bytes / 2),
+			tail: VecDeque::with_capacity(max_bytes.saturating_sub(max_bytes / 2)),
+			total_bytes: 0,
+			max_bytes,
+		}
+	}
+
+	/// Appends one ordered update and returns the current bounded snapshot.
+	pub fn push(&mut self, update: &Update) -> Update {
+		let head_limit = self.max_bytes / 2;
+		let tail_limit = self.max_bytes.saturating_sub(head_limit);
+		let data = update.data.as_ref();
+		self.total_bytes = self.total_bytes.saturating_add(data.len());
+
+		let head_remaining = head_limit.saturating_sub(self.head.len());
+		let head_len = head_remaining.min(data.len());
+		self.head.extend_from_slice(&data[..head_len]);
+		for byte in &data[head_len..] {
+			if tail_limit == 0 {
+				break;
+			}
+			if self.tail.len() == tail_limit {
+				self.tail.pop_front();
+			}
+			self.tail.push_back(*byte);
+		}
+
+		let mut snapshot = Vec::with_capacity(self.max_bytes.saturating_add(64));
+		snapshot.extend_from_slice(&self.head);
+		let retained = self.head.len().saturating_add(self.tail.len());
+		if self.total_bytes > retained {
+			let omitted = self.total_bytes - retained;
+			let _ = write!(snapshot, "\n[…{omitted} bytes truncated…]\n");
+		}
+		snapshot.extend(self.tail.iter());
+		Update {
+			channel:  update.channel,
+			data:     CowBytes::from(snapshot),
+			sequence: update.sequence,
+		}
+	}
 }
 
 struct OutputRetention {
@@ -548,7 +799,7 @@ impl OutputRetention {
 /// Python-only `eval@1` implementation retaining one lazy session per owner.
 pub struct EvalTool<E: EvalExec> {
 	exec: E,
-	sessions: Mutex<HashMap<Str, Arc<OwnerSession>>>,
+	sessions: DashMap<Str, Arc<OwnerSession>>,
 	control: EvalSessionControl,
 	spec: ToolSpec,
 	next_background_name: AtomicU64,
@@ -588,6 +839,22 @@ pub fn eval<E: EvalExec>(exec: E) -> EvalTool<E> {
 
 /// Constructs `eval@1` together with its owning session reset capability.
 pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl) {
+	eval_controlled_described(exec, standard_eval_description())
+}
+
+/// Constructs `eval@1` with task guidance frozen from one live session
+/// snapshot.
+pub fn eval_controlled_with_task_snapshot<E: EvalExec>(
+	exec: E,
+	snapshot: TaskDescriptionSnapshot<'_>,
+) -> (EvalTool<E>, EvalSessionControl) {
+	eval_controlled_described(exec, task_description(snapshot))
+}
+
+fn eval_controlled_described<E: EvalExec>(
+	exec: E,
+	description: Str,
+) -> (EvalTool<E>, EvalSessionControl) {
 	let disposer = exec.clone();
 	let control = EvalSessionControl {
 		reset_generation: Arc::new(AtomicU64::new(0)),
@@ -595,20 +862,20 @@ pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl
 	};
 	let tool = EvalTool {
 		exec,
-		sessions: Mutex::new(HashMap::new()),
+		sessions: DashMap::new(),
 		control: control.clone(),
 		next_background_name: AtomicU64::new(1),
 		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
 		spec: ToolSpec {
-			name:            sf!("eval"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     Str::new(EVAL_DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
+			name: sf!("eval"),
+			rev: Rev { family: Str::default(), n: 1 },
+			description,
+			schema: omp_tool::schema::<Params>(),
+			constraint: Constraint::Schema {
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
 			},
-			effects:         Effects {
+			effects: Effects {
 				documents: Some(DocEffects {
 					read:        true,
 					write_globs: [sf!("**")].into_iter().collect(),
@@ -687,14 +954,17 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			let reset_generation = self.control.reset_generation.load(Ordering::Acquire);
 			let owned = self
 				.sessions
-				.lock()
-				.entry(owner)
+				.entry(owner.clone())
 				.or_insert_with(|| Arc::new(OwnerSession {
 					session: OnceCell::new(),
 					reset_generation: AtomicU64::new(reset_generation),
 				}))
 				.clone();
-			let session = match owned.session.get_or_try_init(|| self.exec.open_session()).await {
+			let session = match owned
+				.session
+				.get_or_try_init(|| self.exec.open_session_for(owner.as_str()))
+				.await
+			{
 				Ok(session) => session.clone(),
 				Err(fault) => {
 					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
@@ -709,11 +979,19 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
 				return;
 			}
+			let runtime = match self.exec.runtime_snapshot(owner.as_str(), &session) {
+				Ok(runtime) => runtime,
+				Err(fault) => {
+					yield Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false });
+					return;
+				},
+			};
 			let disposable = args.kernel_mode == Some(KernelMode::PerCall);
 			let mut run = match self.exec.run_with_mode(&session, RunRequest {
 				code: args.code.clone(),
 				timeout,
 				reset,
+				runtime,
 			}, disposable).await {
 				Ok(run) => run,
 				Err(fault) => {
@@ -728,6 +1006,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 
 			let mut cell_id = Bytes::new();
 			let mut frames = OutputRetention::new();
+			let mut live_tail = TailBuffer::new(MAX_RETAINED_OUTPUT_BYTES);
 			let mut cancellation_reason: Option<Str> = None;
 			loop {
 				let event = if cancellation_reason.is_some() {
@@ -798,7 +1077,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 					Ok(Some(RunEvent::Started { cell_id: id })) => cell_id = id,
 					Ok(Some(RunEvent::Output(update))) => {
 						frames.push(&update);
-						yield Ev::Update(update);
+						yield Ev::Update(live_tail.push(&update));
 					},
 					Ok(Some(RunEvent::Completed(done))) => {
 						if let Some(reason) = cancellation_reason {
@@ -880,11 +1159,23 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			}
 		}
 		for display in &payload.display_outputs {
-			if let DisplayOutput::Markdown { text } = display {
-				stdout.push_str(text);
-				if !text.ends_with('\n') {
-					stdout.push('\n');
-				}
+			match display {
+				DisplayOutput::Markdown { text } => {
+					stdout.push_str(text);
+					if !text.ends_with('\n') {
+						stdout.push('\n');
+					}
+				},
+				DisplayOutput::Image { description, .. } if !description.is_empty() => {
+					stdout.push_str(description);
+					if !description.ends_with('\n') {
+						stdout.push('\n');
+					}
+				},
+				DisplayOutput::Json { .. }
+				| DisplayOutput::ImageData { .. }
+				| DisplayOutput::Image { .. }
+				| DisplayOutput::Status { .. } => {},
 			}
 		}
 		if let Some(exception) = &payload.status.exception {
@@ -908,7 +1199,9 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 		let image_count = payload
 			.display_outputs
 			.iter()
-			.filter(|output| matches!(output, DisplayOutput::Image { .. }))
+			.filter(|output| {
+				matches!(output, DisplayOutput::Image { .. } | DisplayOutput::ImageData { .. })
+			})
 			.count();
 		let visible_display = if display_text.is_empty() && image_count != 0 && stdout.is_empty() {
 			format!(
@@ -979,11 +1272,15 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				if parts.len() >= usize::from(caps.maximum_parts) {
 					break;
 				}
-				if let DisplayOutput::Image { blob, .. } = output {
+				if let DisplayOutput::Image { blob, description, .. } = output {
 					image_index += 1;
 					parts.push(Part::Blob {
 						blob: blob.clone(),
-						alt:  Some(sf!("display image {image_index}")),
+						alt:  Some(if description.is_empty() {
+							sf!("display image {image_index}")
+						} else {
+							description.clone()
+						}),
 					});
 				}
 			}
@@ -1007,7 +1304,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 }
 
 fn detached_terminal(job: DetachedJob) -> ToolTerminal<Payload, Fault> {
-	managed_job_terminal(job, sf!("eval cell settlement"))
+	managed_job_terminal(job, omp_tool::JobKind::Eval, sf!("eval cell settlement"))
 }
 
 fn param_event<U, P>(error: ParamError) -> Ev<U, P, Fault> {
@@ -1089,6 +1386,30 @@ mod tests {
 			}))
 			.is_err()
 		);
+	}
+
+	#[test]
+	fn tail_buffer_emits_moving_bounded_snapshots() {
+		let mut tail = TailBuffer::new(12);
+		let first = tail.push(&Update {
+			channel:  OutputChannel::Stdout,
+			data:     CowBytes::from(b"abcdef".to_vec()),
+			sequence: 0,
+		});
+		assert_eq!(first.data.as_ref(), b"abcdef");
+
+		let second = tail.push(&Update {
+			channel:  OutputChannel::Stderr,
+			data:     CowBytes::from(b"ghijklmnop".to_vec()),
+			sequence: 1,
+		});
+		let rendered = String::from_utf8_lossy(second.data.as_ref());
+		assert!(rendered.starts_with("abcdef"));
+		assert!(rendered.contains("4 bytes truncated"));
+		assert!(rendered.ends_with("klmnop"));
+		assert_eq!(second.channel, OutputChannel::Stderr);
+		assert_eq!(second.sequence, 1);
+		assert!(second.data.as_ref().len() <= 64);
 	}
 
 	#[test]

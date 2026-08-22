@@ -3,6 +3,307 @@
 use std::path::{Component, Path, PathBuf};
 
 use omp_core::Str;
+use xutf::IntoUnicodeNormalized as _;
+
+/// Host path vocabulary used for platform-specific aliases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostPaths {
+	/// POSIX path spelling.
+	Posix,
+	/// Windows drive, UNC, and extended-length spelling.
+	Windows,
+}
+
+impl HostPaths {
+	/// Returns the current host path vocabulary.
+	#[must_use]
+	pub const fn current() -> Self {
+		if cfg!(windows) {
+			Self::Windows
+		} else {
+			Self::Posix
+		}
+	}
+}
+
+/// One model-authored target after the shared lexical recovery pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedTarget {
+	/// Exact text supplied by the model, before trimming or repair.
+	pub authored:  Str,
+	/// Recovered path/URI spelling passed to selector parsing.
+	pub canonical: Str,
+}
+
+impl NormalizedTarget {
+	/// Reports whether recovery changed the authored spelling.
+	#[must_use]
+	pub fn recovered(&self) -> bool {
+		self.authored != self.canonical
+	}
+
+	/// Returns filesystem spellings used only after the canonical spelling is
+	/// missing.
+	#[must_use]
+	pub fn recovery_candidates(&self) -> Vec<Str> {
+		let mut candidates = Vec::new();
+		let screenshot = self
+			.canonical
+			.replace(" AM.", "\u{202f}AM.")
+			.replace(" PM.", "\u{202f}PM.");
+		if screenshot != self.canonical {
+			candidates.push(Str::from(screenshot));
+		}
+		if self.canonical.contains('\'') {
+			candidates.push(Str::from(self.canonical.replace('\'', "\u{2019}")));
+		}
+		candidates
+	}
+
+	/// Returns a model-facing recovery notice when the target changed.
+	#[must_use]
+	pub fn recovery_notice(&self) -> Option<Str> {
+		self.recovered().then(|| {
+			Str::from(format!(
+				"Resolved authored target `{}` to canonical target `{}`.",
+				self.authored, self.canonical
+			))
+		})
+	}
+}
+
+/// Normalizes one model-authored path before any selector parsing.
+///
+/// The pass is deliberately lexical: it never stats the target and therefore
+/// behaves identically for reads, writes, and edits. Filesystem owners remain
+/// responsible for canonical containment and symlink policy.
+#[must_use]
+pub fn normalize_target(input: &str, home: Option<&Path>, host: HostPaths) -> NormalizedTarget {
+	let authored = Str::new(input);
+	let mut path = trim_outer_quotes(input.trim());
+	path = strip_stray_prefix(path);
+
+	let mut normalized = normalize_spaces_and_quotes(path);
+	if let Some(without_at) = normalized.strip_prefix('@')
+		&& at_prefix_is_shorthand(without_at)
+	{
+		normalized = without_at.to_owned();
+	}
+	normalized = strip_extended_windows_prefix(&normalized);
+	normalized = strip_file_url(&normalized).unwrap_or(normalized);
+	normalized = shell_unescape(&normalized);
+	normalized = normalized.into_nfc();
+	normalized = expand_home(&normalized, home);
+	if host == HostPaths::Windows {
+		normalized = windows_drive_alias(&normalized).unwrap_or(normalized);
+	}
+	NormalizedTarget { authored, canonical: Str::from(normalized) }
+}
+
+fn trim_outer_quotes(input: &str) -> &str {
+	let Some(first) = input.chars().next() else {
+		return input;
+	};
+	let Some(last) = input.chars().next_back() else {
+		return input;
+	};
+	let paired = matches!(
+		(first, last),
+		('"', '"')
+			| ('\'', '\'')
+			| ('\u{2018}', '\u{2019}')
+			| ('\u{201c}', '\u{201d}')
+			| ('\u{2019}', '\u{2019}')
+	);
+	if paired && input.len() > first.len_utf8() + last.len_utf8() {
+		&input[first.len_utf8()..input.len() - last.len_utf8()]
+	} else {
+		input
+	}
+}
+
+fn strip_stray_prefix(input: &str) -> &str {
+	let Some(rest) = input.strip_prefix(':') else {
+		return input;
+	};
+	let path_like = rest.starts_with(['/', '\\', '~'])
+		|| rest.starts_with("./")
+		|| rest.starts_with("../")
+		|| rest.starts_with(".\\")
+		|| rest.starts_with("..\\")
+		|| is_windows_drive(rest);
+	if path_like { rest } else { input }
+}
+
+fn normalize_spaces_and_quotes(input: &str) -> String {
+	let mut output = String::with_capacity(input.len());
+	for character in input.chars() {
+		match character {
+			'\u{00a0}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => {
+				output.push(' ');
+			},
+			'\u{2018}' | '\u{2019}' => output.push('\''),
+			'\u{201c}' | '\u{201d}' => output.push('"'),
+			_ => output.push(character),
+		}
+	}
+	output
+}
+
+fn at_prefix_is_shorthand(input: &str) -> bool {
+	input.starts_with('/')
+		|| input.starts_with('\\')
+		|| input == "~"
+		|| input.starts_with("~/")
+		|| input.starts_with("~\\")
+		|| is_windows_drive(input)
+		|| ["agent://", "artifact://", "skill://", "rule://", "security://", "local:", "mcp://"]
+			.iter()
+			.any(|prefix| input.starts_with(prefix))
+}
+
+fn strip_extended_windows_prefix(input: &str) -> String {
+	if let Some(rest) = input
+		.strip_prefix(r"\\?\UNC\")
+		.or_else(|| input.strip_prefix(r"\\.\UNC\"))
+	{
+		format!(r"\\{rest}")
+	} else if let Some(rest) = input
+		.strip_prefix(r"\\?\")
+		.or_else(|| input.strip_prefix(r"\\.\"))
+	{
+		rest.to_owned()
+	} else {
+		input.to_owned()
+	}
+}
+
+fn strip_file_url(input: &str) -> Option<String> {
+	if !input
+		.get(..7)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+	{
+		return None;
+	}
+	let parsed = url::Url::parse(input).ok()?;
+	if parsed.scheme() != "file" {
+		return None;
+	}
+	if let Ok(path) = parsed.to_file_path() {
+		return Some(path.to_string_lossy().into_owned());
+	}
+	let mut path = percent_decode_path(parsed.path())?;
+	if path.starts_with('/') && path.get(1..).is_some_and(is_windows_drive) {
+		path.remove(0);
+	}
+	if let Some(host) = parsed
+		.host_str()
+		.filter(|host| !host.eq_ignore_ascii_case("localhost"))
+	{
+		return Some(format!(r"\\{host}{}", path.replace('/', r"\")));
+	}
+	Some(path)
+}
+
+fn percent_decode_path(input: &str) -> Option<String> {
+	let mut output = Vec::with_capacity(input.len());
+	let bytes = input.as_bytes();
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] == b'%' {
+			let encoded = bytes.get(index + 1..index + 3)?;
+			let high = hex_digit(encoded[0])?;
+			let low = hex_digit(encoded[1])?;
+			output.push((high << 4) | low);
+			index += 3;
+		} else {
+			output.push(bytes[index]);
+			index += 1;
+		}
+	}
+	String::from_utf8(output).ok()
+}
+
+const fn hex_digit(byte: u8) -> Option<u8> {
+	match byte {
+		b'0'..=b'9' => Some(byte - b'0'),
+		b'a'..=b'f' => Some(byte - b'a' + 10),
+		b'A'..=b'F' => Some(byte - b'A' + 10),
+		_ => None,
+	}
+}
+
+fn shell_unescape(input: &str) -> String {
+	if !input.contains('\\') || !input.contains('/') {
+		return input.to_owned();
+	}
+	let mut output = String::with_capacity(input.len());
+	let mut characters = input.chars().peekable();
+	while let Some(character) = characters.next() {
+		if character == '\\'
+			&& characters.peek().is_some_and(|next| {
+				matches!(next, ' ' | '\t' | '"' | '\'' | '(' | ')' | '{' | '}' | '[' | ']')
+			}) {
+			output.push(characters.next().expect("peeked escaped character"));
+		} else {
+			output.push(character);
+		}
+	}
+	output
+}
+
+fn expand_home(input: &str, home: Option<&Path>) -> String {
+	if !input.starts_with('~') {
+		return input.to_owned();
+	}
+	let home = home
+		.map(Path::to_path_buf)
+		.or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+		.or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from));
+	let Some(mut home) = home else {
+		return input.to_owned();
+	};
+	if input != "~" {
+		let tail = input
+			.strip_prefix("~/")
+			.or_else(|| input.strip_prefix("~\\"))
+			.unwrap_or(&input[1..]);
+		home.push(tail);
+	}
+	home.to_string_lossy().into_owned()
+}
+
+fn windows_drive_alias(input: &str) -> Option<String> {
+	let normalized = input.replace('\\', "/");
+	let parts = normalized.split('/').collect::<Vec<_>>();
+	let (drive, tail) = match parts.as_slice() {
+		["", drive, tail @ ..] if one_drive_letter(drive) => (*drive, tail),
+		["", mnt, drive, tail @ ..] if mnt.eq_ignore_ascii_case("mnt") && one_drive_letter(drive) => {
+			(*drive, tail)
+		},
+		_ => return None,
+	};
+	let mut output = String::with_capacity(input.len() + 1);
+	output.push(drive.as_bytes()[0].to_ascii_uppercase().into());
+	output.push_str(r":\");
+	output.push_str(
+		&tail
+			.iter()
+			.filter(|part| !part.is_empty())
+			.copied()
+			.collect::<Vec<_>>()
+			.join(r"\"),
+	);
+	Some(output)
+}
+
+fn one_drive_letter(input: &str) -> bool {
+	input.len() == 1 && input.as_bytes()[0].is_ascii_alphabetic()
+}
+
+fn is_windows_drive(input: &str) -> bool {
+	input.len() >= 2 && input.as_bytes()[0].is_ascii_alphabetic() && input.as_bytes()[1] == b':'
+}
 
 /// A colon selector split from its path without mistaking Windows drive syntax.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +377,51 @@ mod tests {
 			selector: Some(sf!("4-8")),
 		});
 	}
+	#[test]
+	fn normalizes_pi_parity_path_table() {
+		let home = Path::new("/Users/test");
+		let cases = [
+			("\u{201c}~/My\u{00a0}File.txt\u{201d}", "/Users/test/My File.txt", HostPaths::Posix),
+			(":/tmp/a", "/tmp/a", HostPaths::Posix),
+			("@~/a", "/Users/test/a", HostPaths::Posix),
+			("file:///tmp/a%20b", "/tmp/a b", HostPaths::Posix),
+			("/tmp/escaped\\ name.txt", "/tmp/escaped name.txt", HostPaths::Posix),
+			("/mnt/c/Users/me/a", r"C:\Users\me\a", HostPaths::Windows),
+			("/d/repo", r"D:\repo", HostPaths::Windows),
+			(r"\\?\C:\repo\a", r"C:\repo\a", HostPaths::Windows),
+			(r"\\?\UNC\server\share\a", r"\\server\share\a", HostPaths::Windows),
+			("Cafe\u{301}.txt", "Café.txt", HostPaths::Posix),
+		];
+		for (authored, expected, host) in cases {
+			assert_eq!(
+				normalize_target(authored, Some(home), host).canonical,
+				Str::new(expected),
+				"{authored}"
+			);
+		}
+	}
+
+	#[test]
+	fn offers_macos_screenshot_and_curly_quote_recoveries() {
+		let target =
+			normalize_target("/tmp/Capture d'ecran at 9.41.00 AM.png", None, HostPaths::Posix);
+		assert_eq!(target.recovery_candidates(), vec![
+			Str::new("/tmp/Capture d'ecran at 9.41.00\u{202f}AM.png"),
+			Str::new("/tmp/Capture d\u{2019}ecran at 9.41.00 AM.png"),
+		]);
+	}
+
+	#[test]
+	fn preserves_uri_and_drive_selector_disambiguation_after_normalization() {
+		let uri = normalize_target("artifact://abc:2-4", None, HostPaths::Posix);
+		assert_eq!(uri.canonical, Str::new("artifact://abc:2-4"));
+		let drive = normalize_target(r"C:\repo\a.rs:4-8", None, HostPaths::Windows);
+		assert_eq!(split_colon_selector(&drive.canonical), PathSelector {
+			path:     sf!(r"C:\repo\a.rs"),
+			selector: Some(sf!("4-8")),
+		});
+	}
+
 	#[test]
 	fn confines_relative_paths() {
 		let root = Path::new("/workspace");

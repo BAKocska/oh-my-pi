@@ -13,7 +13,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, StreamExt, executor::block_on};
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 use omp_llm_catalog::GrammarBits;
 use omp_llm_inference::{Adjustment, ToolGrammarSyntax};
 use omp_tool::{
@@ -21,12 +21,14 @@ use omp_tool::{
 	ArgSpecRegistryError, ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails,
 	CallOutcomeDetailsError, CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint,
 	ConstraintDisposition, DocEffects, Effects, ErasedEv, ErasedOutcome, Ev, ExecEffects,
-	ExpectedArtifact, Fallback, GrammarSyntax, IncomingParams, InferenceEffects, Interrupt,
-	InterruptWaitError, JobOwner, JobRef, LiftedCall, LoweringCaps, ModelClass, ParamError, Part,
-	PolicyDenied, Precedence, Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind,
-	RecordedCall, RecordedCallOwned, Registry, RegistryError, RepairKind, Rev, Tool, ToolIdentity,
-	ToolSpec, ToolTerminal, Usd, call_outcome_details,
-	render::{Render, RenderRegistryError, ViewState},
+	ExpectedArtifact, Fallback, GoalToolState, GrammarSyntax, InclusionPolicy, IncomingParams,
+	InferenceEffects, Interrupt, InterruptWaitError, JobKind, JobMetadata, JobOwner, JobRef,
+	JobStatus, LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion, LiftedCall,
+	LoweringCaps, MemoryToolState, ModelClass, ParamError, Part, PolicyDenied, Precedence,
+	Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall, RecordedCallOwned,
+	Registry, RegistryError, RegistryLeaf, RepairKind, Rev, Tool, ToolIdentity, ToolSpec,
+	ToolTerminal, Usd, call_outcome_details,
+	render::{RenderFold, RenderRegistryError, ViewState},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -698,6 +700,183 @@ fn core_precedence_band_rejects_devices_and_overrides() {
 				&& claimant == "publisher/override"
 				&& precedence == Precedence(1_001)
 	));
+}
+
+#[test]
+fn protected_core_claim_rejects_demoting_or_foreign_replacement() {
+	let mut registry = Registry::new();
+	registry.protect_core_claims(["read"]);
+	let foreign = registry
+		.register(
+			fake_tool(1, "foreign", Arc::new(AtomicUsize::new(0))).named("read"),
+			Presentation::Slot,
+			claims("publisher/read", Precedence::INTEGRATION),
+		)
+		.expect_err("reserved essential name rejects foreign claim");
+	assert!(matches!(
+		foreign,
+		RegistryError::CoreNameClaim { name, claimant, precedence }
+			if name == "read"
+				&& claimant == "publisher/read"
+				&& precedence == Precedence::INTEGRATION
+	));
+
+	registry
+		.register(
+			fake_tool(1, "core", Arc::new(AtomicUsize::new(0))).named("read"),
+			Presentation::Slot,
+			claims("omp/core", Precedence::CORE),
+		)
+		.expect("harness core claim occupies reservation");
+	let demotion = registry
+		.register(
+			fake_tool(2, "device", Arc::new(AtomicUsize::new(0))).named("read"),
+			Presentation::Device,
+			claims("publisher/read", Precedence::DEFAULT),
+		)
+		.expect_err("essential slot cannot be demoted through an adapter");
+	assert!(matches!(demotion, RegistryError::CoreNameClaim { name, .. } if name == "read"));
+	assert_eq!(
+		registry
+			.claim("read")
+			.expect("core claim retained")
+			.claimant,
+		"omp/core"
+	);
+}
+
+#[test]
+fn inclusion_closures_pair_safety_tools_without_widening_restricted_children() {
+	let mut registry = Registry::new();
+	for name in [
+		"grep",
+		"edit",
+		"checkpoint",
+		"rewind",
+		"ast_grep",
+		"ast_edit",
+		"recall",
+		"retain",
+		"reflect",
+		"memory_edit",
+		"think",
+		"goal",
+		"learn",
+		"manage_skill",
+	] {
+		registry
+			.register(
+				fake_tool(1, name, Arc::new(AtomicUsize::new(0))).named(name),
+				Presentation::Slot,
+				claims("omp/core", Precedence::CORE),
+			)
+			.expect("unique core tool");
+	}
+	let requested = [sf!("grep"), sf!("checkpoint")];
+	let policy = InclusionPolicy {
+		restricted:        false,
+		top_level:         true,
+		checkpoint:        true,
+		ast:               true,
+		memory:            MemoryToolState::Mnemopi,
+		external_thinking: true,
+		goal:              GoalToolState::Active,
+		autolearn:         true,
+	};
+	assert_eq!(registry.resolve_inclusions(Some(&requested), policy), [
+		sf!("grep"),
+		sf!("checkpoint"),
+		sf!("rewind"),
+		sf!("ast_grep"),
+		sf!("recall"),
+		sf!("retain"),
+		sf!("reflect"),
+		sf!("memory_edit"),
+		sf!("think"),
+		sf!("goal"),
+		sf!("manage_skill"),
+		sf!("learn"),
+	]);
+
+	let restricted = registry.resolve_inclusions(Some(&requested), InclusionPolicy {
+		restricted: true,
+		top_level: false,
+		..policy
+	});
+	assert_eq!(restricted, [sf!("grep"), sf!("checkpoint"), sf!("rewind")]);
+}
+
+#[test]
+fn owner_leaf_replacement_is_atomic_fenced_and_retains_history() {
+	let catalog = LeafReplacementRegistry::<Str>::new();
+	let owner = LeafOwner { root: sf!("mcp"), claimant: sf!("server/example") };
+	let leaf = |name: &str, revision: u16, marker: &str| RegistryLeaf {
+		name:  Str::new(name),
+		rev:   Rev { family: sf!("mcp"), n: revision },
+		code:  Hash32::new([revision as u8; 32]),
+		value: Arc::new(Str::new(marker)),
+	};
+
+	assert_eq!(
+		catalog
+			.replace(owner.clone(), LeafVersion { manager_generation: 2, definition_epoch: 4 }, vec![
+				leaf("beta", 1, "old-beta"),
+				leaf("alpha", 1, "old-alpha")
+			],)
+			.expect("initial replacement"),
+		1
+	);
+	let first = catalog.snapshot();
+	assert_eq!(first.epoch, 1);
+	assert_eq!(
+		first
+			.leaves
+			.iter()
+			.map(|leaf| leaf.name.as_str())
+			.collect::<Vec<_>>(),
+		["alpha", "beta"]
+	);
+
+	assert_eq!(
+		catalog
+			.replace(owner.clone(), LeafVersion { manager_generation: 2, definition_epoch: 4 }, vec![
+				leaf("alpha", 1, "old-alpha"),
+				leaf("beta", 1, "old-beta")
+			],)
+			.expect("identical replacement is a no-op"),
+		1
+	);
+	assert_eq!(catalog.epoch(), 1);
+
+	assert_eq!(
+		catalog
+			.replace(owner.clone(), LeafVersion { manager_generation: 2, definition_epoch: 5 }, vec![
+				leaf("alpha", 2, "new-alpha")
+			],)
+			.expect("new definition epoch replaces complete owner set"),
+		2
+	);
+	let second = catalog.snapshot();
+	assert_eq!(second.leaves.len(), 1);
+	assert_eq!(second.leaves[0].name, "alpha");
+	assert_eq!(second.leaves[0].rev.n, 2);
+	assert_eq!(
+		catalog
+			.historical(&owner, "beta", &Rev { family: sf!("mcp"), n: 1 })
+			.expect("omitted leaf remains historical")
+			.as_str(),
+		"old-beta"
+	);
+
+	let stale = catalog
+		.replace(owner, LeafVersion { manager_generation: 1, definition_epoch: u64::MAX }, Vec::new())
+		.expect_err("older manager generation is fenced");
+	assert!(matches!(stale, LeafReplacementError::Stale {
+		manager_generation: 1,
+		current_generation: 2,
+		..
+	}));
+	assert_eq!(catalog.epoch(), 2);
 }
 
 #[test]
@@ -1754,7 +1933,7 @@ struct CountUpdate {
 
 struct CountRender;
 
-impl Render for CountRender {
+impl RenderFold for CountRender {
 	type Outcome = serde_json::Value;
 	type State = usize;
 	type Update = CountUpdate;
@@ -1845,6 +2024,43 @@ fn render_registry_is_exact_revision_cached_and_falls_back_without_name_lookup()
 }
 
 #[test]
+fn detached_job_owner_and_generation_survive_lifecycle_projection_round_trip() {
+	let process = JobRef {
+		id:       sf!("process:web:7"),
+		owner:    JobOwner::NamedProcess { name: sf!("web"), generation: 7 },
+		metadata: std::sync::Arc::new(JobMetadata {
+			kind:          JobKind::Shell,
+			status:        JobStatus::Running,
+			label:         sf!("web server"),
+			created_at_ms: 11,
+			started_at_ms: Some(13),
+			settled_at_ms: None,
+			owner_session: Some(sf!("session-1")),
+			model:         None,
+			result:        None,
+			error:         None,
+		}),
+		artifact: ExpectedArtifact {
+			description: sf!("web server output"),
+			media_type:  None,
+			lifetime:    ArtifactLifetime::Session,
+		},
+	};
+	let encoded = serde_json::to_vec(&process).expect("job serializes");
+	let decoded: JobRef = serde_json::from_slice(&encoded).expect("job deserializes");
+	assert_eq!(decoded.id, "process:web:7");
+	assert_eq!(decoded.owner, JobOwner::NamedProcess { name: sf!("web"), generation: 7 },);
+	assert_eq!(decoded.metadata.status, JobStatus::Running);
+
+	let agent = JobOwner::AgentLoop { agent_id: sf!("AuthLoader") };
+	let encoded = serde_json::to_vec(&agent).expect("agent owner serializes");
+	assert_eq!(
+		serde_json::from_slice::<JobOwner>(&encoded).expect("agent owner deserializes"),
+		agent,
+	);
+}
+
+#[test]
 fn detached_artifact_lifetime_is_explicit_and_session_is_the_conservative_default() {
 	assert_eq!(ArtifactLifetime::default(), ArtifactLifetime::Session);
 
@@ -1856,6 +2072,7 @@ fn detached_artifact_lifetime_is_explicit_and_session_is_the_conservative_defaul
 		let job = JobRef {
 			id:       sf!("job-7"),
 			owner:    JobOwner::NamedProcess { name: sf!("render"), generation: 3 },
+			metadata: std::sync::Arc::default(),
 			artifact: ExpectedArtifact {
 				description: sf!("rendered video"),
 				media_type: Some(sf!("video/mp4")),

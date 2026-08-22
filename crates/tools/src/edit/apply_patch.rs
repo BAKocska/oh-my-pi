@@ -1,0 +1,462 @@
+//! Apply-patch, patch, and sloppy edit revisions over `EditDocuments`.
+
+use async_stream::stream;
+use bytes::Bytes;
+use futures::{FutureExt, Stream, pin_mut, select_biased};
+use omp_core::{Str, sf};
+use omp_hashline::{
+	foreign_patch::{ForeignPatchFile, parse_foreign_patch},
+	sloppy::{apply_sloppy, split_sloppy_sections},
+	unified_hunk::apply_file_operation,
+};
+use omp_tool::{
+	Abort, Constraint, Dialect, DocEffects, Effects, Ev, IncomingParams, InterruptWaitError, Part,
+	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::{
+	AppliedOp, CommittedSection, EditAction, EditCommitError, EditDocuments, EditPrepared,
+	EditProposal, EditUpdate, Fault, FormatPolicy, Payload, PrepareRequest, ResolvedEdit, SectionOp,
+	SectionPayload, StalePolicy, commit_event, done_fault, param_event,
+};
+use crate::{
+	path::{HostPaths, normalize_target},
+	render::TextProjection,
+};
+
+/// Freeform arguments shared by patch-envelope and sloppy revisions.
+///
+/// Unknown provider-attached keys are deliberately ignored for pi parity;
+/// only `input` is canonicalized into the recorded tool call.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct FreeformEditParams {
+	/// Complete dialect input.
+	#[schemars(with = "String")]
+	pub input: Str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FreeformKind {
+	Patch,
+	ApplyPatch,
+	Sloppy,
+}
+
+impl FreeformKind {
+	const fn family(self) -> &'static str {
+		match self {
+			Self::Patch => "patch",
+			Self::ApplyPatch => "apply_patch",
+			Self::Sloppy => "sloppy",
+		}
+	}
+
+	const fn dialect(self) -> Dialect {
+		match self {
+			Self::Patch => Dialect::Patch,
+			Self::ApplyPatch => Dialect::ApplyPatch,
+			Self::Sloppy => Dialect::Sloppy,
+		}
+	}
+
+	const fn description(self) -> &'static str {
+		match self {
+			Self::Patch => "Apply a Codex begin/add/update/move/delete patch envelope atomically.",
+			Self::ApplyPatch => {
+				"Apply a Codex begin/add/update/move/delete patch envelope atomically."
+			},
+			Self::Sloppy => {
+				"Apply [path] match/rewrite sections using pi's sloppy edit syntax atomically per file."
+			},
+		}
+	}
+}
+
+/// A freeform edit revision.
+pub struct FreeformEditTool<D> {
+	documents:     D,
+	format_policy: FormatPolicy,
+	kind:          FreeformKind,
+	spec:          ToolSpec,
+}
+
+/// Constructs `edit@patch.1`.
+pub fn patch_tool<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+) -> FreeformEditTool<D> {
+	new_tool(documents, format_policy, FreeformKind::Patch)
+}
+
+/// Constructs `edit@apply_patch.1`.
+pub fn apply_patch_tool<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+) -> FreeformEditTool<D> {
+	new_tool(documents, format_policy, FreeformKind::ApplyPatch)
+}
+
+/// Constructs `edit@sloppy.1`.
+pub fn sloppy_tool<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+) -> FreeformEditTool<D> {
+	new_tool(documents, format_policy, FreeformKind::Sloppy)
+}
+
+fn new_tool<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	kind: FreeformKind,
+) -> FreeformEditTool<D> {
+	FreeformEditTool {
+		documents,
+		format_policy,
+		kind,
+		spec: ToolSpec {
+			name:            sf!("edit"),
+			rev:             Rev { family: Str::new_static(kind.family()), n: 1 },
+			description:     Str::new_static(kind.description()),
+			schema:          omp_tool::schema::<FreeformEditParams>(),
+			constraint:      Constraint::Grammar {
+				priority:       100,
+				syntax:         omp_tool::GrammarSyntax::Lark,
+				definition:     Str::new_static(match kind.dialect() {
+					Dialect::Patch | Dialect::ApplyPatch => omp_hashline::grammars::APPLY_PATCH,
+					Dialect::Sloppy => omp_hashline::grammars::SLOPPY,
+					Dialect::Hashline | Dialect::Replace | Dialect::Native => "",
+				}),
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				documents: Some(DocEffects {
+					read:        true,
+					write_globs: [sf!("**")].into_iter().collect(),
+				}),
+				exec:      None,
+				inference: None,
+				subagents: 0,
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("apply_patch.rs"),
+			)
+			.into(),
+		},
+	}
+}
+
+#[derive(Clone, Debug)]
+enum AuthoredOperation {
+	Foreign(ForeignPatchFile),
+	Sloppy { path: Str, input: Str },
+}
+
+impl AuthoredOperation {
+	fn path(&self) -> &str {
+		match self {
+			Self::Foreign(operation) => operation.path(),
+			Self::Sloppy { path, .. } => path,
+		}
+	}
+}
+
+struct Work<P> {
+	op:       AuthoredOperation,
+	prepared: P,
+}
+
+struct Projection {
+	after:     Option<Bytes>,
+	operation: SectionOp,
+	move_dest: Option<Str>,
+	resolved:  Vec<ResolvedEdit>,
+}
+
+impl<D: EditDocuments> Tool for FreeformEditTool<D> {
+	type Fault = Fault;
+	type Params = FreeformEditParams;
+	type Payload = Payload;
+	type Update = EditUpdate;
+
+	fn spec(&self) -> &ToolSpec {
+		&self.spec
+	}
+
+	fn call<'c>(
+		&'c self,
+		mut params: IncomingParams<'c>,
+	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
+		stream! {
+			let FreeformEditParams { input } = match params.whole::<FreeformEditParams>().await {
+				Ok(params) => params,
+				Err(error) => { yield param_event(error); return; },
+			};
+			let operations = match parse_operations(self.kind, &input) {
+				Ok(operations) if !operations.is_empty() => operations,
+				Ok(_) => { yield done_fault(Fault::invalid("No edit operations found.")); return; },
+				Err(error) => { yield done_fault(Fault::invalid(error)); return; },
+			};
+			let mut works = Vec::with_capacity(operations.len());
+			for mut op in operations {
+				let normalized = normalize_target(op.path(), None, HostPaths::current());
+				match &mut op {
+					AuthoredOperation::Foreign(ForeignPatchFile::Add { path, .. })
+					| AuthoredOperation::Foreign(ForeignPatchFile::Delete { path })
+					| AuthoredOperation::Foreign(ForeignPatchFile::Update { path, .. })
+					| AuthoredOperation::Sloppy { path, .. } => *path = normalized.canonical,
+				}
+				let prepared = match self.documents.prepare(PrepareRequest {
+					path: Str::new(op.path()),
+					file_hash: None,
+					anchor_lines: Vec::new(),
+					allow_unpinned: true,
+				}).await {
+					Ok(prepared) => prepared,
+					Err(fault) => { yield done_fault(fault); return; },
+				};
+				if works.iter().any(|work: &Work<D::Prepared>| work.prepared.path() == prepared.path()) {
+					yield done_fault(Fault::invalid("Multiple operations resolve to the same file; merge repeated sloppy sections or use one apply-patch file hunk."));
+					return;
+				}
+				works.push(Work { op, prepared });
+			}
+
+			let mut proposals = Vec::with_capacity(works.len());
+			let mut projections = Vec::with_capacity(works.len());
+			for work in &works {
+				let source = match std::str::from_utf8(work.prepared.authored_bytes()) {
+					Ok(source) => source,
+					Err(_) => { yield done_fault(Fault::invalid("edit dialect requires UTF-8 text")); return; },
+				};
+				let (after, operation, move_dest) = match &work.op {
+					AuthoredOperation::Sloppy { input, .. } => match apply_sloppy(source, input) {
+						Ok(after) => (Some(Bytes::from(after)), SectionOp::Update, None),
+						Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+					},
+					AuthoredOperation::Foreign(operation) => match apply_file_operation(Some(source), operation, false) {
+						Ok(after) => {
+							let section_op = match operation {
+								ForeignPatchFile::Delete { .. } => SectionOp::Delete,
+								ForeignPatchFile::Update { move_to: Some(_), .. } => SectionOp::Move,
+								ForeignPatchFile::Add { .. } | ForeignPatchFile::Update { .. } => SectionOp::Update,
+							};
+							let move_dest = match operation { ForeignPatchFile::Update { move_to, .. } => move_to.clone(), _ => None };
+							(after.map(Bytes::from), section_op, move_dest)
+						},
+						Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+					},
+				};
+				let action = match (operation, after.clone(), move_dest.clone()) {
+					(SectionOp::Delete, _, _) => EditAction::Delete,
+					(SectionOp::Move, Some(content), Some(destination)) => EditAction::Move { destination, content },
+					(_, Some(content), _) => EditAction::Write { content },
+					_ => { yield done_fault(Fault::invalid("invalid edit operation state")); return; },
+				};
+				proposals.push(EditProposal {
+					action: action.clone(),
+					base_revision: work.prepared.base_revision().clone(),
+					stale_policy: StalePolicy::RebaseNonOverlapping,
+					format_policy: self.format_policy,
+				});
+				let resolved = after.as_ref().map_or_else(Vec::new, |after| vec![ResolvedEdit {
+					start: 1,
+					end: source.lines().count().max(1),
+					body: String::from_utf8_lossy(after).lines().map(Str::new).collect(),
+				}]);
+				projections.push(Projection { after,  operation, move_dest, resolved });
+			}
+
+			let (preview, added_lines, removed_lines) = preview(&works, &projections);
+			yield Ev::Update(EditUpdate { applied_ops: projections.len(), preview, added_lines, removed_lines });
+			match params.committed().await {
+				Ok(_) => {},
+				Err(error) => { yield commit_event(error); return; },
+			}
+			let result = {
+				let clipboard = self.documents.start_clipboard_batch();
+				let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
+				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+				let interrupt = params.next_interrupt().fuse();
+				pin_mut!(commit, interrupt);
+				select_biased! {
+					result = commit => Some(result),
+					interrupted = interrupt => { yield Ev::Aborted(match interrupted {
+						Ok(value) => Abort::EffectsUnknown { reason: value.reason },
+						Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
+						Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
+					}); None },
+				}
+			};
+			let Some(result) = result else { return; };
+			match result {
+				Ok(result) if result.sections.len() == works.len() => {
+					for work in &works { self.documents.reset_noop(work.prepared.path()); }
+					yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, &result.sections)), useless: false });
+				},
+				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
+				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
+				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+			}
+		}
+	}
+
+	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
+		let Some(mut out) = TextProjection::new(*caps) else {
+			return Vec::new();
+		};
+		match view {
+			Ok(payload) => {
+				for section in &payload.sections {
+					let _ =
+						out.push(&format!("{} edit completed: {}", self.kind.family(), section.path));
+				}
+			},
+			Err(fault) => {
+				let _ = out.push(&super::rejection_text(fault));
+			},
+		}
+		out.finish()
+	}
+}
+
+fn parse_operations(kind: FreeformKind, input: &str) -> Result<Vec<AuthoredOperation>, String> {
+	match kind {
+		FreeformKind::Patch | FreeformKind::ApplyPatch => parse_foreign_patch(input)
+			.map(|operations| {
+				operations
+					.into_iter()
+					.map(AuthoredOperation::Foreign)
+					.collect()
+			})
+			.map_err(|error| error.to_string()),
+		FreeformKind::Sloppy => {
+			let mut merged = Vec::<AuthoredOperation>::new();
+			for section in split_sloppy_sections(input).map_err(|error| error.to_string())? {
+				if let Some(AuthoredOperation::Sloppy { input, .. }) = merged
+					.iter_mut()
+					.find(|operation| operation.path() == section.path)
+				{
+					*input = sf!("{}\n{}", input, section.input);
+				} else {
+					merged.push(AuthoredOperation::Sloppy { path: section.path, input: section.input });
+				}
+			}
+			Ok(merged)
+		},
+	}
+}
+
+fn preview<P: EditPrepared>(works: &[Work<P>], projections: &[Projection]) -> (Str, usize, usize) {
+	let mut text = String::new();
+	let mut added = 0;
+	let mut removed = 0;
+	for (work, projection) in works.iter().zip(projections) {
+		let after = projection.after.as_deref().unwrap_or_default();
+		if let Ok(diff) = omp_hashline::numbered_diff(
+			work.prepared.base_bytes(),
+			after,
+			Some(std::path::Path::new(work.prepared.display_path().as_str())),
+		) {
+			let compact = omp_hashline::diff_preview::build_compact_diff_preview(
+				&diff.text,
+				omp_hashline::diff_preview::CompactDiffOptions::default(),
+			);
+			if !text.is_empty() && !compact.preview.is_empty() {
+				text.push('\n');
+			}
+			text.push_str(&compact.preview);
+			added += compact.added_lines;
+			removed += compact.removed_lines;
+		}
+	}
+	(text.into(), added, removed)
+}
+
+fn payload<P: EditPrepared>(
+	works: &[Work<P>],
+	projections: &[Projection],
+	committed: &[CommittedSection],
+) -> Payload {
+	Payload {
+		sections: works
+			.iter()
+			.zip(projections)
+			.zip(committed)
+			.map(|((work, projection), committed)| {
+				let after = committed
+					.content
+					.clone()
+					.or_else(|| projection.after.clone())
+					.unwrap_or_default();
+				let diff = omp_hashline::numbered_diff(
+					work.prepared.base_bytes(),
+					&after,
+					Some(std::path::Path::new(work.prepared.display_path().as_str())),
+				)
+				.ok();
+				let compact = diff.as_ref().map(|diff| {
+					omp_hashline::diff_preview::build_compact_diff_preview(
+						&diff.text,
+						omp_hashline::diff_preview::CompactDiffOptions::default(),
+					)
+				});
+				SectionPayload {
+					path: work.prepared.display_path().clone(),
+					canonical_path: work.prepared.path().clone(),
+					op: projection.operation,
+					move_dest: projection.move_dest.clone(),
+					old_revision: work.prepared.base_revision().clone(),
+					new_revision: committed.new_revision.clone(),
+					applied_ops: vec![AppliedOp {
+						kind:       Str::new_static("rewrite"),
+						patch_line: 1,
+						index:      0,
+					}],
+					resolved_edits: projection.resolved.clone(),
+					rebased: committed.rebased,
+					before: work.prepared.base_bytes().clone(),
+					before_blob: None,
+					after,
+					after_blob: None,
+					header: None,
+					diff: diff
+						.as_ref()
+						.map_or_else(Str::default, |diff| diff.text.clone()),
+					preview: compact
+						.as_ref()
+						.map_or_else(Str::default, |compact| compact.preview.clone()),
+					first_changed_line: Some(1),
+					block_resolutions: Vec::new(),
+					warnings: work.prepared.warnings().to_vec(),
+				}
+			})
+			.collect(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn freeform_schemas_ignore_provider_extras() {
+		let params: FreeformEditParams =
+			serde_json::from_str(r#"{"input":"x","provider_cache":true}"#).expect("extras ignored");
+		assert_eq!(params.input, "x");
+	}
+
+	#[test]
+	fn repeated_sloppy_sections_merge_in_authored_order() {
+		let operations =
+			parse_operations(FreeformKind::Sloppy, "[a]\n«\nx\n»\ny\n[a]\n«\ny\n»\nz").expect("parse");
+		assert_eq!(operations.len(), 1);
+		let AuthoredOperation::Sloppy { input, .. } = &operations[0] else {
+			panic!("sloppy")
+		};
+		assert!(input.contains("y\n»\nz"));
+	}
+}

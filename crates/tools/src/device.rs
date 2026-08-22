@@ -33,6 +33,22 @@ pub const PER_DEVICE_DOCS_CAP: usize = 10_000;
 /// UTF-8 byte cap for third-party catalog summaries.
 pub const EXTERNAL_SUMMARY_CAP: usize = 200;
 
+/// Stable model-facing guidance for the live dynamic-device transport.
+pub const PROMPT_GUIDANCE: &str = "\
+`dyn` exposes only the live device catalog. Use `search` to discover, `docs/<path>` for the exact \
+                                   schema and guidance, and `invoke/<path>` with that schema to \
+                                   call a device. Retry an empty or narrow search with different \
+                                   terms; absent devices are unavailable and MUST NOT be \
+                                   advertised or guessed.";
+
+/// Conditional model-facing guidance for the mounted AutoQA recorder.
+pub const AUTO_QA_PROMPT_GUIDANCE: &str = "\
+Automated QA reporting is available through the live `report_issue` device. When a device result \
+                                           contradicts its documented behavior for the supplied \
+                                           parameters, read `docs/report_issue`, then invoke \
+                                           `report_issue` with a concise evidence-backed verdict. \
+                                           False positives are acceptable.";
+
 /// How much dynamic-device documentation is inlined into a prompt.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1070,10 +1086,10 @@ mod tests {
 	use serde_json::json;
 
 	use super::{
-		CatalogQuery, DOCS_TOTAL_BUDGET, DeviceCatalog, DeviceInvokeRequest, DeviceInvoker, DocsMode,
-		DynPayload, EXTERNAL_SUMMARY_CAP, Operation, OperationError, PER_DEVICE_DOCS_CAP,
-		dyn_enabled, dyn_tool, flatten_slots, parse_operation, render_catalog, render_catalog_query,
-		render_prompt_docs, renest_args, reserved_parameter,
+		AUTO_QA_PROMPT_GUIDANCE, CatalogQuery, DOCS_TOTAL_BUDGET, DeviceCatalog, DeviceInvokeRequest,
+		DeviceInvoker, DocsMode, DynPayload, EXTERNAL_SUMMARY_CAP, Operation, OperationError,
+		PER_DEVICE_DOCS_CAP, PROMPT_GUIDANCE, dyn_enabled, dyn_tool, flatten_slots, parse_operation,
+		render_catalog, render_catalog_query, render_prompt_docs, renest_args, reserved_parameter,
 	};
 
 	#[derive(Clone, Default)]
@@ -1159,6 +1175,16 @@ mod tests {
 			route,
 		}
 	}
+	#[test]
+	fn prompt_guidance_uses_only_live_dyn_operations_and_never_xd_urls() {
+		for operation in ["search", "docs/<path>", "invoke/<path>"] {
+			assert!(PROMPT_GUIDANCE.contains(operation));
+		}
+		assert!(AUTO_QA_PROMPT_GUIDANCE.contains("report_issue"));
+		assert!(!PROMPT_GUIDANCE.contains("xd://"));
+		assert!(!AUTO_QA_PROMPT_GUIDANCE.contains("xd://"));
+	}
+
 	#[test]
 	fn do_grammar_refuses_empty_and_trailing_paths() {
 		assert_eq!(parse_operation(""), Err(OperationError::Empty));

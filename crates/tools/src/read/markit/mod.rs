@@ -2,8 +2,14 @@
 
 use std::{fmt, path::Path};
 
-use omp_core::{IntoStr, Str};
-use strum::EnumString;
+use bytes::Bytes;
+use omp_core::{Hash32, IntoStr, Str};
+use serde::{Deserialize, Serialize};
+use strum::{EnumString, IntoStaticStr};
+
+use super::web::types::{CachedDocument, DocumentCacheLocation, DocumentCacheRequest, HttpClient};
+
+const CONVERSION_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+markit.1");
 
 mod doc;
 mod docx;
@@ -20,7 +26,7 @@ mod rtf;
 mod xls;
 mod xlsx;
 
-#[derive(Clone, Copy, EnumString)]
+#[derive(Clone, Copy, EnumString, IntoStaticStr)]
 #[strum(ascii_case_insensitive, serialize_all = "lowercase")]
 enum Format {
 	Pdf,
@@ -42,7 +48,7 @@ enum Format {
 }
 
 /// Markdown produced from a supported document.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Conversion {
 	/// Converted document text.
 	pub text:  Str,
@@ -59,6 +65,26 @@ impl Conversion {
 	const fn plain(text: Str) -> Self {
 		Self { text, note: None, title: None }
 	}
+}
+
+/// Whether a successful conversion came from persistent cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversionCacheStatus {
+	/// Serialized conversion was decoded from a cache hit.
+	Hit,
+	/// Conversion ran and was offered for atomic cache publication.
+	Miss,
+}
+
+/// One typed conversion with its cache outcome and durable location.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachedConversion {
+	/// Typed converter output, identical on cache hits and misses.
+	pub conversion: Conversion,
+	/// Cache lookup outcome.
+	pub status:     ConversionCacheStatus,
+	/// Durable cache location when lookup or publication succeeded.
+	pub location:   Option<DocumentCacheLocation>,
 }
 
 /// A typed document conversion failure.
@@ -132,6 +158,60 @@ pub(crate) fn supports_extension(extension: &str) -> bool {
 	format_from_extension(extension).is_some()
 }
 
+fn cache_request(format: Format, bytes: &[u8]) -> DocumentCacheRequest {
+	DocumentCacheRequest {
+		source_digest:     Hash32::sum(bytes),
+		converter:         format.into(),
+		converter_version: CONVERSION_CACHE_VERSION,
+	}
+}
+
+fn decode_cached(cached: CachedDocument) -> Option<CachedConversion> {
+	let conversion = serde_json::from_slice(&cached.content).ok()?;
+	Some(CachedConversion {
+		conversion,
+		status: ConversionCacheStatus::Hit,
+		location: Some(cached.location),
+	})
+}
+
+/// Converts through the application-owned persistent cache.
+///
+/// Only successfully typed conversions are published. Corrupt cache payloads
+/// are treated as misses and replaced by the fresh successful conversion.
+pub async fn convert_cached<C: HttpClient + Sync>(
+	cache: &C,
+	path: &Path,
+	bytes: &[u8],
+) -> Result<Option<CachedConversion>, MarkitError> {
+	let Some(format) = path
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.and_then(format_from_extension)
+	else {
+		return Ok(None);
+	};
+	let request = cache_request(format, bytes);
+	if let Some(cached) = cache.document_cache_get(request).await
+		&& let Some(converted) = decode_cached(cached)
+	{
+		return Ok(Some(converted));
+	}
+
+	let Some(conversion) = convert_format(format, bytes)? else {
+		return Ok(None);
+	};
+	let location = if let Ok(serialized) = serde_json::to_vec(&conversion) {
+		cache
+			.document_cache_put(request, Bytes::from(serialized))
+			.await
+			.map(|cached| cached.location)
+	} else {
+		None
+	};
+	Ok(Some(CachedConversion { conversion, status: ConversionCacheStatus::Miss, location }))
+}
+
 /// Convert one of the approved document formats to Markdown.
 ///
 /// Unsupported extensions return `Ok(None)`. Once an extension is recognized,
@@ -146,6 +226,10 @@ pub fn convert(path: &Path, bytes: &[u8]) -> Result<Option<Conversion>, MarkitEr
 		return Ok(None);
 	};
 
+	convert_format(format, bytes)
+}
+
+fn convert_format(format: Format, bytes: &[u8]) -> Result<Option<Conversion>, MarkitError> {
 	let conversion = match format {
 		Format::Pdf => pdf::convert(bytes)?,
 		Format::Doc => Conversion::plain(doc::convert(bytes)?),

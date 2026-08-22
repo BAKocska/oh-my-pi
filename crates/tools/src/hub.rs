@@ -1,15 +1,15 @@
 //! Unified peer, job, and environment-owned named-process coordination.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{future::Future, sync::Arc};
 
 use async_stream::stream;
+use dashmap::DashMap;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, Constraint, Effects, Ev, IncomingParams, ParamError, Part,
 	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
-use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -231,6 +231,7 @@ pub trait HubBackend: Send + Sync + 'static {
 		&'a self,
 		caller_id: &'a str,
 		request: Request,
+		updates: &'a flume::Sender<Response>,
 	) -> impl Future<Output = Result<Response, Fault>> + Send + 'a;
 }
 
@@ -240,30 +241,30 @@ pub trait HubBackend: Send + Sync + 'static {
 /// one concrete backend under the authenticated invocation owner and removes it
 /// when that owner retires.
 pub struct HubRouter<B> {
-	backends: RwLock<HashMap<Str, Arc<B>>>,
+	backends: DashMap<Str, Arc<B>>,
 }
 
 impl<B> HubRouter<B> {
 	/// Creates an empty owner router.
 	#[must_use]
 	pub fn new() -> Self {
-		Self { backends: RwLock::new(HashMap::new()) }
+		Self { backends: DashMap::new() }
 	}
 
 	/// Installs or replaces one authenticated owner's composition.
 	pub fn attach(&self, owner: Str, backend: Arc<B>) -> Option<Arc<B>> {
-		self.backends.write().insert(owner, backend)
+		self.backends.insert(owner, backend)
 	}
 
 	/// Removes one owner without disturbing other sessions.
 	pub fn detach(&self, owner: &str) -> Option<Arc<B>> {
-		self.backends.write().remove(owner)
+		self.backends.remove(owner).map(|(_, backend)| backend)
 	}
 
 	/// Returns whether an owner currently has a routed composition.
 	#[must_use]
 	pub fn contains(&self, owner: &str) -> bool {
-		self.backends.read().contains_key(owner)
+		self.backends.contains_key(owner)
 	}
 }
 
@@ -274,16 +275,20 @@ impl<B> Default for HubRouter<B> {
 }
 
 impl<B: HubBackend> HubBackend for HubRouter<B> {
-	async fn execute<'a>(&'a self, caller_id: &'a str, request: Request) -> Result<Response, Fault> {
+	async fn execute<'a>(
+		&'a self,
+		caller_id: &'a str,
+		request: Request,
+		updates: &'a flume::Sender<Response>,
+	) -> Result<Response, Fault> {
 		let backend = self
 			.backends
-			.read()
 			.get(caller_id)
-			.cloned()
+			.map(|entry| Arc::clone(&entry))
 			.ok_or_else(|| Fault {
 				message: sf!("hub owner '{caller_id}' is not attached; the session may have retired"),
 			})?;
-		backend.execute(caller_id, request).await
+		backend.execute(caller_id, request, updates).await
 	}
 }
 
@@ -321,7 +326,7 @@ impl<B: HubBackend> Tool for Hub<B> {
 	type Fault = Fault;
 	type Params = Params;
 	type Payload = Response;
-	type Update = ();
+	type Update = Response;
 
 	fn spec(&self) -> &ToolSpec {
 		&self.spec
@@ -348,12 +353,28 @@ impl<B: HubBackend> Tool for Hub<B> {
 				yield commit_event(error);
 				return;
 			}
-			match self.backend.execute(&caller_id, request).await {
-				Ok(response) => {
-					let useless = response.useless;
-					yield done(Ok(response), useless);
-				},
-				Err(fault) => yield done(Err(fault), false),
+			let (updates_tx, updates_rx) = flume::bounded(1);
+			let execution = self.backend.execute(&caller_id, request, &updates_tx);
+			tokio::pin!(execution);
+			loop {
+				let next = tokio::select! {
+					biased;
+					result = &mut execution => Ok(result),
+					update = updates_rx.recv_async() => Err(update),
+				};
+				match next {
+					Ok(Ok(response)) => {
+						let useless = response.useless;
+						yield done(Ok(response), useless);
+						break;
+					},
+					Ok(Err(fault)) => {
+						yield done(Err(fault), false);
+						break;
+					},
+					Err(Ok(update)) => yield Ev::Update(update),
+					Err(Err(_)) => continue,
+				}
 			}
 		}
 	}
@@ -456,10 +477,10 @@ const fn invalid(message: &'static str) -> Fault {
 	Fault { message: sf!(message) }
 }
 
-const fn done(result: Result<Response, Fault>, useless: bool) -> Ev<(), Response, Fault> {
+const fn done(result: Result<Response, Fault>, useless: bool) -> Ev<Response, Response, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless })
 }
-fn param_event(error: ParamError) -> Ev<(), Response, Fault> {
+fn param_event(error: ParamError) -> Ev<Response, Response, Fault> {
 	match error {
 		ParamError::Args(issue) => Ev::Args(*issue),
 		ParamError::Interrupted(interrupt) => {
@@ -469,7 +490,7 @@ fn param_event(error: ParamError) -> Ev<(), Response, Fault> {
 	}
 }
 
-fn commit_event(error: omp_tool::CommitError) -> Ev<(), Response, Fault> {
+fn commit_event(error: omp_tool::CommitError) -> Ev<Response, Response, Fault> {
 	match error {
 		omp_tool::CommitError::Aborted => Ev::Aborted(Abort::InputDropped),
 		omp_tool::CommitError::Interrupted(interrupt) => {

@@ -1,11 +1,14 @@
 //! Streaming hashline edits over one revision-pinned multi-document
 //! transaction.
 
+pub mod apply_patch;
 pub mod projection;
 pub mod replace;
-
 use std::{fmt::Write as _, future::Future};
 
+pub use apply_patch::{
+	FreeformEditParams, FreeformEditTool, apply_patch_tool, patch_tool, sloppy_tool,
+};
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
@@ -26,7 +29,10 @@ pub use replace::{ReplaceParams, ReplaceTool, replace_tool};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::render::TextProjection;
+use crate::{
+	path::{HostPaths, normalize_target},
+	render::TextProjection,
+};
 
 /// One registered edit argument dialect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +49,9 @@ pub struct EditDialectRegistration {
 pub const EDIT_DIALECTS: &[EditDialectRegistration] = &[
 	EditDialectRegistration { family: "rep", revision: 1, dialect: Dialect::Replace },
 	EditDialectRegistration { family: "hl", revision: 1, dialect: Dialect::Hashline },
+	EditDialectRegistration { family: "patch", revision: 1, dialect: Dialect::Patch },
+	EditDialectRegistration { family: "apply_patch", revision: 1, dialect: Dialect::ApplyPatch },
+	EditDialectRegistration { family: "sloppy", revision: 1, dialect: Dialect::Sloppy },
 ];
 
 /// Provenance of an edit revision decision.
@@ -50,6 +59,8 @@ pub const EDIT_DIALECTS: &[EditDialectRegistration] = &[
 pub enum EditRevisionSource {
 	/// An embedder fixed the tool dialect for its protocol bridge.
 	EmbedderPin,
+	/// Native strict-edit compatibility forced hashline.
+	OperatorStrict,
 	/// The model catalog selected a known-compatible dialect.
 	ModelRule,
 	/// The process-level `OMP_EDIT_DIALECT` selection won.
@@ -68,15 +79,17 @@ pub enum EditRevisionSource {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EditRevisionCandidates<'a> {
 	/// Catalog-selected revision such as `rep.1`.
-	pub model_rule:  Option<&'a Rev>,
+	pub model_rule:     Option<&'a Rev>,
 	/// Optional `OMP_EDIT_DIALECT` value.
-	pub environment: Option<&'a str>,
+	pub environment:    Option<&'a str>,
 	/// Optional layered `edit.revision` value.
-	pub setting:     Option<&'a str>,
+	pub setting:        Option<&'a str>,
 	/// Embedder-fixed revision, which cannot be overridden.
-	pub pin:         Option<&'a Rev>,
+	pub pin:            Option<&'a Rev>,
+	/// Force hashline regardless of catalog, environment, or layered setting.
+	pub force_hashline: bool,
 	/// Reject an unrecognized configured revision instead of falling through.
-	pub strict:      bool,
+	pub strict:         bool,
 }
 
 /// One validated result from [`resolve_edit_revision`].
@@ -99,6 +112,12 @@ pub fn resolve_edit_revision(
 	if let Some(pin) = candidates.pin {
 		return registered_revision(pin, EditRevisionSource::EmbedderPin);
 	}
+	if candidates.force_hashline {
+		return registered_revision(
+			&Rev { family: sf!("hl"), n: 1 },
+			EditRevisionSource::OperatorStrict,
+		);
+	}
 	if let Some(rule) = candidates.model_rule {
 		return registered_revision(rule, EditRevisionSource::ModelRule);
 	}
@@ -112,7 +131,13 @@ pub fn resolve_edit_revision(
 				return Ok(ResolvedEditRevision { revision, source });
 			},
 			_ if candidates.strict => {
-				return Err(format!("unknown edit revision {value:?}; use rep.1 or hl.1").into());
+				return Err(
+					format!(
+						"unknown edit revision {value:?}; use hl.1, rep.1, patch.1, apply_patch.1, or \
+						 sloppy.1"
+					)
+					.into(),
+				);
 			},
 			_ => {},
 		}
@@ -221,6 +246,43 @@ pub struct ResolvedEdit {
 	pub body:  Vec<Str>,
 }
 
+/// Maximum total old/new snapshot bytes retained inline in one edit outcome.
+pub const MAX_EDIT_SNAPSHOT_INLINE_BYTES: usize = 32_768;
+
+/// Failure to durably retain an oversized edit snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SnapshotFault {
+	/// No Environment blob authority was supplied.
+	#[error("oversized edit snapshots require an Environment blob authority")]
+	Unavailable,
+	/// The Environment blob authority rejected durable placement.
+	#[error("the Environment blob authority could not retain an edit snapshot")]
+	Store,
+}
+
+/// Environment-owned durable storage for oversized snapshot bytes.
+pub trait EditSnapshotStore: Send + Sync + 'static {
+	/// Stores exact bytes and returns their typed content identity.
+	fn store_snapshot(
+		&self,
+		bytes: Bytes,
+	) -> impl Future<Output = Result<omp_tool::BlobRef, SnapshotFault>> + Send + '_;
+}
+
+/// Store used only by direct embeddings which do not supply an Environment
+/// blob authority. Inline outcomes remain available; oversized ones fail.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoSnapshotStore;
+
+impl EditSnapshotStore for NoSnapshotStore {
+	fn store_snapshot(
+		&self,
+		_bytes: Bytes,
+	) -> impl Future<Output = Result<omp_tool::BlobRef, SnapshotFault>> + Send + '_ {
+		std::future::ready(Err(SnapshotFault::Unavailable))
+	}
+}
+
 /// Durable successful truth for one file section.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SectionPayload {
@@ -243,10 +305,19 @@ pub struct SectionPayload {
 	pub resolved_edits:     Vec<ResolvedEdit>,
 	/// Whether the document host rebased the committed transition.
 	pub rebased:            bool,
-	/// Exact pre-edit bytes.
+	/// Exact pre-edit bytes when retained inline.
 	pub before:             Bytes,
-	/// Exact post-edit bytes, empty after deletion.
+	/// Blob identity of exact pre-edit bytes when the inline budget was
+	/// exceeded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub before_blob:        Option<omp_tool::BlobRef>,
+	/// Exact post-edit bytes when retained inline, empty after deletion or
+	/// spill.
 	pub after:              Bytes,
+	/// Blob identity of exact post-edit bytes when the inline budget was
+	/// exceeded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub after_blob:         Option<omp_tool::BlobRef>,
 	/// Hashline header for the resulting file, absent after deletion.
 	pub header:             Option<Str>,
 	/// Complete numbered diff.
@@ -272,8 +343,19 @@ pub struct Payload {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FormatPolicy {
-	/// Apply the configured formatter when one is available.
-	Configured,
+	/// Never invoke a formatter.
+	Disabled,
+	/// Use a formatter when available, retaining committed bytes on formatter
+	/// absence or failure.
+	BestEffort,
+	/// Require formatter availability and successful completion.
+	Required,
+}
+
+impl Default for FormatPolicy {
+	fn default() -> Self {
+		Self::BestEffort
+	}
 }
 
 /// Stale-base behavior requested of the transaction coordinator.
@@ -481,23 +563,39 @@ pub trait EditDocuments: Send + Sync + 'static {
 }
 
 /// `edit@hl.1` executor.
-pub struct EditTool<D> {
+pub struct EditTool<D, S = NoSnapshotStore> {
 	documents:     D,
+	snapshots:     S,
 	format_policy: FormatPolicy,
 	spec:          ToolSpec,
 }
 
 /// Constructs the built-in hashline edit tool.
-pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> EditTool<D> {
+pub fn tool<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+) -> EditTool<D, NoSnapshotStore> {
+	tool_with_snapshots(documents, NoSnapshotStore, format_policy)
+}
+
+/// Constructs hashline edit with the Environment's durable snapshot authority.
+pub fn tool_with_snapshots<D: EditDocuments, S: EditSnapshotStore>(
+	documents: D,
+	snapshots: S,
+	format_policy: FormatPolicy,
+) -> EditTool<D, S> {
 	EditTool {
 		documents,
+		snapshots,
 		format_policy,
 		spec: ToolSpec {
 			name:            sf!("edit"),
 			rev:             Rev { family: sf!("hl"), n: 1 },
 			description:     sf!(DESCRIPTION),
 			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
+			constraint:      Constraint::Grammar {
+				syntax:         omp_tool::GrammarSyntax::Lark,
+				definition:     Str::new_static(omp_hashline::grammars::HASHLINE),
 				priority:       100,
 				on_unsupported: omp_tool::Fallback::Unspecified,
 			},
@@ -520,7 +618,7 @@ pub fn tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> Edit
 	}
 }
 
-impl<D: EditDocuments> Tool for EditTool<D> {
+impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 	type Fault = Fault;
 	type Params = Params;
 	type Payload = Payload;
@@ -564,11 +662,24 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 			};
 
 			let mut parsed_sections = Vec::with_capacity(patch.sections.len());
-			for section in patch.sections {
-				let parsed = match section.parse() {
+			for mut section in patch.sections {
+				let normalized = normalize_target(&section.path, None, HostPaths::current());
+				let mut canonical_recovery = normalized.recovery_notice();
+				section.path = normalized.canonical;
+				let mut parsed = match section.parse() {
 					Ok(parsed) => parsed,
 					Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
 				};
+				if let Some(FileOp::Move { dest }) = &mut parsed.file_op {
+					let normalized = normalize_target(dest, None, HostPaths::current());
+					if let Some(notice) = normalized.recovery_notice() {
+						canonical_recovery = Some(match canonical_recovery {
+							Some(existing) => sf!("{existing}\n{notice}"),
+							None => notice,
+						});
+					}
+					*dest = normalized.canonical;
+				}
 				let anchors = match section.collect_anchor_lines() {
 					Ok(anchors) => anchors,
 					Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
@@ -595,6 +706,7 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					file_hash: section.file_hash,
 					parsed,
 					prepared,
+					canonical_recovery,
 				});
 			}
 
@@ -646,7 +758,8 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 						anchor_line: resolution.anchor_line, start: resolution.start, end: resolution.end,
 						operation: Str::new_static(resolution.mode.into()),
 					}).collect(),
-					warnings: work.prepared.warnings().iter().cloned()
+					warnings: work.canonical_recovery.iter().cloned()
+						.chain(work.prepared.warnings().iter().cloned())
 						.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
 						.chain(applied.warnings.iter().map(|warning| Str::from(warning.to_string()))).collect(),
 				});
@@ -696,7 +809,20 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 				if noop.escalate {
 					yield done_fault(Fault::invalid(noop.diagnostic));
 				} else {
-					let payload = build_payload(&parsed_sections, &projections, None);
+					let payload = match build_payload(
+						&self.snapshots,
+						&parsed_sections,
+						&projections,
+						None,
+					).await {
+						Ok(payload) => payload,
+						Err(fault) => {
+							yield Ev::Aborted(Abort::EffectsUnknown {
+								reason: snapshot_fault_reason(fault),
+							});
+							return;
+						},
+					};
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: true });
 				}
 				return;
@@ -736,7 +862,20 @@ impl<D: EditDocuments> Tool for EditTool<D> {
 					for work in &parsed_sections {
 						self.documents.reset_noop(work.prepared.path());
 					}
-					let payload = build_payload(&parsed_sections, &projections, Some(&result.sections));
+					let payload = match build_payload(
+						&self.snapshots,
+						&parsed_sections,
+						&projections,
+						Some(&result.sections),
+					).await {
+						Ok(payload) => payload,
+						Err(fault) => {
+							yield Ev::Aborted(Abort::EffectsUnknown {
+								reason: snapshot_fault_reason(fault),
+							});
+							return;
+						},
+					};
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
 				},
 				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
@@ -836,10 +975,11 @@ fn lift_replace_to_hashline(from: &Rev, call: RecordedCall<'_>) -> Option<Lifted
 }
 
 struct PreparedWork<P> {
-	section_path: Str,
-	file_hash:    Option<Str>,
-	parsed:       omp_hashline::ParsedPatch,
-	prepared:     P,
+	section_path:       Str,
+	file_hash:          Option<Str>,
+	parsed:             omp_hashline::ParsedPatch,
+	prepared:           P,
+	canonical_recovery: Option<Str>,
 }
 
 struct ProjectionWork {
@@ -894,69 +1034,107 @@ fn stale_message<P: EditPrepared>(work: &PreparedWork<P>, recognized: bool) -> S
 	.into()
 }
 
-fn build_payload<P: EditPrepared>(
+async fn build_payload<P: EditPrepared, S: EditSnapshotStore>(
+	snapshots: &S,
 	works: &[PreparedWork<P>],
 	projections: &[ProjectionWork],
 	committed: Option<&[CommittedSection]>,
-) -> Payload {
-	let sections = works
-		.iter()
-		.zip(projections)
-		.enumerate()
-		.map(|(index, (work, projection))| {
-			let move_dest = match &work.parsed.file_op {
-				Some(FileOp::Move { dest }) => Some(dest.clone()),
-				_ => None,
-			};
-			let op = match work.parsed.file_op {
-				Some(FileOp::Rem) => SectionOp::Delete,
-				Some(FileOp::Move { .. }) => SectionOp::Move,
-				None if work.prepared.base_bytes() == &projection.after => SectionOp::Noop,
-				None => SectionOp::Update,
-			};
-			let output_path = move_dest.as_ref().unwrap_or(&work.section_path);
-			let committed_section = committed.and_then(|sections| sections.get(index));
-			let after = if op == SectionOp::Delete {
-				Bytes::new()
-			} else {
-				committed_section
-					.and_then(|section| section.content.clone())
-					.unwrap_or_else(|| projection.after.clone())
-			};
-			let header = (op != SectionOp::Delete)
-				.then(|| format_hashline_header(output_path, &compute_snapshot_tag(&after)));
-			let numbered = numbered_diff(
-				work.prepared.base_bytes(),
-				&after,
-				Some(std::path::Path::new(output_path.as_str())),
-			)
-			.ok();
-			let diff = numbered
-				.as_ref()
-				.map_or_else(Str::default, |diff| diff.text.clone());
-			let preview = build_compact_diff_preview(&diff, CompactDiffOptions::default()).preview;
-			SectionPayload {
-				path: work.section_path.clone(),
-				canonical_path: work.prepared.path().clone(),
-				op,
-				move_dest,
-				old_revision: work.prepared.base_revision().clone(),
-				new_revision: committed_section.and_then(|section| section.new_revision.clone()),
-				applied_ops: projection.applied_ops.clone(),
-				resolved_edits: Vec::new(),
-				rebased: committed_section.is_some_and(|section| section.rebased),
-				before: work.prepared.base_bytes().clone(),
-				after,
-				header,
-				diff,
-				preview,
-				first_changed_line: projection.first_changed_line,
-				block_resolutions: projection.block_resolutions.clone(),
-				warnings: projection.warnings.clone(),
-			}
-		})
-		.collect();
-	Payload { sections }
+) -> Result<Payload, SnapshotFault> {
+	let mut sections = Vec::with_capacity(works.len());
+	let mut inline_remaining = MAX_EDIT_SNAPSHOT_INLINE_BYTES;
+	for (index, (work, projection)) in works.iter().zip(projections).enumerate() {
+		let move_dest = match &work.parsed.file_op {
+			Some(FileOp::Move { dest }) => Some(dest.clone()),
+			_ => None,
+		};
+		let op = match work.parsed.file_op {
+			Some(FileOp::Rem) => SectionOp::Delete,
+			Some(FileOp::Move { .. }) => SectionOp::Move,
+			None if work.prepared.base_bytes() == &projection.after => SectionOp::Noop,
+			None => SectionOp::Update,
+		};
+		let output_path = move_dest.as_ref().unwrap_or(&work.section_path);
+		let committed_section = committed.and_then(|sections| sections.get(index));
+		let exact_after = if op == SectionOp::Delete {
+			Bytes::new()
+		} else {
+			committed_section
+				.and_then(|section| section.content.clone())
+				.unwrap_or_else(|| projection.after.clone())
+		};
+		let header = (op != SectionOp::Delete)
+			.then(|| format_hashline_header(output_path, &compute_snapshot_tag(&exact_after)));
+		let numbered = numbered_diff(
+			work.prepared.base_bytes(),
+			&exact_after,
+			Some(std::path::Path::new(output_path.as_str())),
+		)
+		.ok();
+		let diff = numbered
+			.as_ref()
+			.map_or_else(Str::default, |diff| diff.text.clone());
+		let preview = build_compact_diff_preview(&diff, CompactDiffOptions::default()).preview;
+		let exact_before = work.prepared.base_bytes().clone();
+		let (before, before_blob, after, after_blob) =
+			retain_snapshot_pair(snapshots, exact_before, exact_after, &mut inline_remaining).await?;
+		sections.push(SectionPayload {
+			path: work.section_path.clone(),
+			canonical_path: work.prepared.path().clone(),
+			op,
+			move_dest,
+			old_revision: work.prepared.base_revision().clone(),
+			new_revision: committed_section.and_then(|section| section.new_revision.clone()),
+			applied_ops: projection.applied_ops.clone(),
+			resolved_edits: Vec::new(),
+			rebased: committed_section.is_some_and(|section| section.rebased),
+			before,
+			before_blob,
+			after,
+			after_blob,
+			header,
+			diff,
+			preview,
+			first_changed_line: projection.first_changed_line,
+			block_resolutions: projection.block_resolutions.clone(),
+			warnings: projection.warnings.clone(),
+		});
+	}
+	Ok(Payload { sections })
+}
+
+async fn retain_snapshot_pair<S: EditSnapshotStore>(
+	snapshots: &S,
+	before: Bytes,
+	after: Bytes,
+	inline_remaining: &mut usize,
+) -> Result<(Bytes, Option<omp_tool::BlobRef>, Bytes, Option<omp_tool::BlobRef>), SnapshotFault> {
+	let snapshot_bytes = before.len().saturating_add(after.len());
+	if snapshot_bytes <= *inline_remaining {
+		*inline_remaining -= snapshot_bytes;
+		return Ok((before, None, after, None));
+	}
+	let before_blob = if before.is_empty() {
+		None
+	} else {
+		Some(snapshots.store_snapshot(before).await?)
+	};
+	let after_blob = if after.is_empty() {
+		None
+	} else {
+		Some(snapshots.store_snapshot(after).await?)
+	};
+	Ok((Bytes::new(), before_blob, Bytes::new(), after_blob))
+}
+
+fn snapshot_fault_reason(fault: SnapshotFault) -> Str {
+	match fault {
+		SnapshotFault::Unavailable => {
+			sf!("oversized edit snapshots require an Environment blob authority")
+		},
+		SnapshotFault::Store => {
+			sf!("the Environment blob authority could not retain an edit snapshot")
+		},
+	}
 }
 
 fn op_details(edits: &[omp_hashline::Edit]) -> Vec<AppliedOp> {
@@ -1011,20 +1189,62 @@ fn rejection_text(fault: &Fault) -> Str {
 mod tests {
 	use super::*;
 
+	#[derive(Default)]
+	struct RecordingSnapshots(parking_lot::Mutex<Vec<Bytes>>);
+
+	impl EditSnapshotStore for RecordingSnapshots {
+		async fn store_snapshot(&self, bytes: Bytes) -> Result<omp_tool::BlobRef, SnapshotFault> {
+			let byte_len = u64::try_from(bytes.len()).expect("fixture length");
+			self.0.lock().push(bytes);
+			Ok(omp_tool::BlobRef {
+				hash: sf!("fixture-{byte_len}"),
+				media_type: sf!("application/octet-stream"),
+				byte_len,
+			})
+		}
+	}
+
+	#[tokio::test]
+	async fn oversized_snapshots_route_to_typed_blob_refs() {
+		let store = RecordingSnapshots::default();
+		let before = Bytes::from(vec![b'a'; MAX_EDIT_SNAPSHOT_INLINE_BYTES]);
+		let after = Bytes::from_static(b"new");
+		let mut remaining = MAX_EDIT_SNAPSHOT_INLINE_BYTES;
+		let (inline_before, before_blob, inline_after, after_blob) =
+			retain_snapshot_pair(&store, before.clone(), after.clone(), &mut remaining)
+				.await
+				.expect("spill");
+		assert!(inline_before.is_empty());
+		assert!(inline_after.is_empty());
+		assert_eq!(before_blob.expect("old ref").byte_len, before.len() as u64);
+		assert_eq!(after_blob.expect("new ref").byte_len, after.len() as u64);
+		assert_eq!(&*store.0.lock(), &[before, after]);
+	}
+
 	#[test]
 	fn revision_cascade_is_registered_and_caps_derived() {
 		let model = Rev { family: "rep".into(), n: 1 };
 		let pinned = Rev { family: "hl".into(), n: 1 };
 		let resolved = resolve_edit_revision(EditRevisionCandidates {
-			model_rule:  Some(&model),
-			environment: Some("hl.1"),
-			setting:     Some("rep.1"),
-			pin:         Some(&pinned),
-			strict:      true,
+			model_rule:     Some(&model),
+			environment:    Some("hl.1"),
+			setting:        Some("rep.1"),
+			pin:            Some(&pinned),
+			force_hashline: false,
+			strict:         true,
 		})
 		.expect("registered pinned revision");
 		assert_eq!(resolved.revision, pinned);
 		assert_eq!(resolved.source, EditRevisionSource::EmbedderPin);
+		let strict = resolve_edit_revision(EditRevisionCandidates {
+			model_rule: Some(&model),
+			environment: Some("sloppy.1"),
+			force_hashline: true,
+			..EditRevisionCandidates::default()
+		})
+		.expect("strict hashline");
+		assert_eq!(strict.revision, Rev { family: sf!("hl"), n: 1 });
+		assert_eq!(strict.source, EditRevisionSource::OperatorStrict);
 		assert_eq!(
 			resolve_edit_revision(EditRevisionCandidates {
 				model_rule: Some(&model),
@@ -1070,7 +1290,11 @@ mod tests {
 				strict: true,
 				..EditRevisionCandidates::default()
 			}),
-			Err("unknown edit revision \"unknown.7\"; use rep.1 or hl.1".into())
+			Err(
+				"unknown edit revision \"unknown.7\"; use hl.1, rep.1, patch.1, apply_patch.1, or \
+				 sloppy.1"
+					.into()
+			)
 		);
 	}
 
@@ -1097,7 +1321,9 @@ mod tests {
 				}],
 				rebased:            false,
 				before:             before.clone(),
+				before_blob:        None,
 				after:              Bytes::from_static(b"one\nTWO\n"),
+				after_blob:         None,
 				header:             Some(format_hashline_header(
 					"a.txt",
 					&compute_snapshot_tag(b"one\nTWO\n"),
@@ -1204,13 +1430,13 @@ mod tests {
 		let mut registry = Registry::new();
 		registry
 			.register(
-				replace_tool(NoDocuments, FormatPolicy::Configured),
+				replace_tool(NoDocuments, FormatPolicy::BestEffort),
 				Presentation::Slot,
 				claims.clone(),
 			)
 			.expect("register replacement lift source");
 		registry
-			.register(tool(NoDocuments, FormatPolicy::Configured), Presentation::Slot, claims)
+			.register(tool(NoDocuments, FormatPolicy::BestEffort), Presentation::Slot, claims)
 			.expect("register live hashline destination");
 		let source_args = serde_json::to_vec(&ReplaceParams { edits: Vec::new() })
 			.expect("serialize replacement source args");

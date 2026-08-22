@@ -155,8 +155,9 @@ pub async fn read_resource<C: HttpClient + Sync>(
 
 	if let Some(document_extension) = document_extension(&content_type, &extension) {
 		let path = synthetic_path(document_extension);
-		match markit::convert(&path, &response.body) {
+		match markit::convert_cached(client, &path, &response.body).await {
 			Ok(Some(converted)) => {
+				let converted = converted.conversion;
 				let mut notes = SmallVec::new();
 				notes.push(sf!("Converted with markit"));
 				if let Some(note) = converted.note {

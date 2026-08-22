@@ -111,11 +111,12 @@ pub(super) async fn render<C: HttpClient + Sync>(
 		notes.push(sf!("Fetching PDF for full content..."));
 		if let Ok(pdf) = client.get(HttpRequest::new(pdf_link)).await
 			&& pdf.is_success()
-			&& let Ok(Some(converted)) = markit::convert(Path::new("paper.pdf"), &pdf.body)
-			&& converted.text.encode_utf16().count() > 500
+			&& let Ok(Some(converted)) =
+				markit::convert_cached(client, Path::new("paper.pdf"), &pdf.body).await
+			&& converted.conversion.text.encode_utf16().count() > 500
 		{
 			markdown.push_str("---\n\n## Full Paper\n\n");
-			markdown.push_str(&converted.text);
+			markdown.push_str(&converted.conversion.text);
 			markdown.push('\n');
 			notes.push(sf!("PDF converted via markit"));
 		}

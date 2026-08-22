@@ -3,14 +3,22 @@
 //! The application owns traversal and supplies [`DirEntry`] values. This
 //! module only assembles, caps, formats, and slices those values.
 
-use std::{collections::HashMap, fmt::Write as _};
+use std::{
+	collections::{HashMap, HashSet},
+	fmt::Write as _,
+	time::{Duration, UNIX_EPOCH},
+};
 
-use omp_core::Str;
+use omp_core::{Str, utc_minute};
 
 /// Maximum directory depth rendered below the root.
 pub const MAX_DEPTH: usize = 2;
 /// Maximum retained children for each non-root directory.
 pub const CHILD_LIMIT: usize = 12;
+/// Maximum prompt-tree depth below the root.
+pub const PROMPT_MAX_DEPTH: usize = 3;
+/// Maximum prompt-tree rows, including the root and elision marker.
+pub const PROMPT_LINE_CAP: usize = 120;
 
 /// Filesystem metadata collected by the application for one directory entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +44,8 @@ pub struct DirectoryRender {
 	pub truncated:   bool,
 	/// Resolved path represented by this listing.
 	pub root_path:   Str,
+	/// Directory listings are projections, never editable file snapshots.
+	pub edit_locked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +59,7 @@ struct RenderedLine {
 	label: String,
 	size:  Option<String>,
 	age:   Option<String>,
+	depth: usize,
 }
 
 /// Render application-supplied directory metadata using read's tree layout.
@@ -84,15 +95,10 @@ pub fn render_directory(
 			.push(EntryRef { entry, name, depth });
 	}
 	for children in by_parent.values_mut() {
-		children.sort_unstable_by(|a, b| {
-			b.entry
-				.modified_ms
-				.cmp(&a.entry.modified_ms)
-				.then_with(|| a.name.cmp(b.name))
-		});
+		children.sort_unstable_by(|a, b| a.name.cmp(b.name));
 	}
 
-	let mut rows = vec![RenderedLine { label: ".".into(), size: None, age: None }];
+	let mut rows = vec![RenderedLine { label: ".".into(), size: None, age: None, depth: 0 }];
 	let mut truncated = scan_truncated;
 	render_children("", 0, &by_parent, now_ms, &mut rows, &mut truncated);
 	let formatted = format_lines(&rows);
@@ -105,7 +111,13 @@ pub fn render_directory(
 	let total_lines = all_lines.len();
 
 	if offset.is_none() && limit.is_none() {
-		return DirectoryRender { root_path, text: base.into(), total_lines, truncated };
+		return DirectoryRender {
+			root_path,
+			text: base.into(),
+			total_lines,
+			truncated,
+			edit_locked: true,
+		};
 	}
 
 	let start = offset.unwrap_or(1).saturating_sub(1);
@@ -124,6 +136,7 @@ pub fn render_directory(
 			.into(),
 			total_lines,
 			truncated,
+			edit_locked: true,
 		};
 	}
 	let end = limit.map_or(total_lines, |count| start.saturating_add(count).min(total_lines));
@@ -132,7 +145,7 @@ pub fn render_directory(
 		let remaining = total_lines - end;
 		let _ = write!(text, "\n\n[{remaining} more lines in listing. Use :{} to continue]", end + 1);
 	}
-	DirectoryRender { root_path, text: text.into(), total_lines, truncated }
+	DirectoryRender { root_path, text: text.into(), total_lines, truncated, edit_locked: true }
 }
 
 fn render_children<'a>(
@@ -146,25 +159,26 @@ fn render_children<'a>(
 	let Some(all) = by_parent.get(parent) else {
 		return;
 	};
-	let capped = parent_depth > 0 && all.len() > CHILD_LIMIT;
-	let recent_len = if capped { CHILD_LIMIT - 1 } else { all.len() };
-	for child in &all[..recent_len] {
+	let retained = if parent_depth > 0 {
+		all.len().min(CHILD_LIMIT)
+	} else {
+		all.len()
+	};
+	for child in &all[..retained] {
 		render_entry(*child, parent, by_parent, now_ms, rows, truncated);
 	}
-	if !capped {
+	if retained == all.len() {
 		return;
 	}
 
 	*truncated = true;
-	let omitted = all.len() - CHILD_LIMIT;
+	let omitted = all.len() - retained;
 	rows.push(RenderedLine {
 		label: format!("{}- … {omitted} more", "  ".repeat(parent_depth + 1)),
 		size:  None,
 		age:   None,
+		depth: parent_depth + 1,
 	});
-	if let Some(oldest) = all.last() {
-		render_entry(*oldest, parent, by_parent, now_ms, rows, truncated);
-	}
 }
 
 fn render_entry<'a>(
@@ -180,6 +194,7 @@ fn render_entry<'a>(
 		label: format!("{}- {}{suffix}", "  ".repeat(node.depth), node.name),
 		size:  (!node.entry.is_dir).then(|| format_bytes(node.entry.size)),
 		age:   format_age(now_ms.saturating_sub(node.entry.modified_ms) / 1_000),
+		depth: node.depth,
 	});
 	if !node.entry.is_dir || node.depth >= MAX_DEPTH {
 		return;
@@ -192,10 +207,202 @@ fn render_entry<'a>(
 	render_children(&child_path, node.depth, by_parent, now_ms, rows, truncated);
 }
 
+/// Renders the deterministic workspace tree embedded in the prompt.
+///
+/// The caller supplies a gitignore-aware, hidden-filtered scan. Entries are
+/// ordered by recency, capped to twelve children per directory and depth three,
+/// timestamped to stable UTC minutes, then trimmed deepest-first to 120 rows.
+pub fn render_prompt_directory(
+	root_path: impl Into<Str>,
+	entries: &[DirEntry],
+	scan_truncated: bool,
+) -> DirectoryRender {
+	let root_path = root_path.into();
+	let mut by_parent: HashMap<&str, Vec<EntryRef<'_>>> = HashMap::new();
+	for entry in entries {
+		let path = entry.relative_path.as_str().trim_matches('/');
+		if path.is_empty() {
+			continue;
+		}
+		let depth = path.bytes().filter(|byte| *byte == b'/').count() + 1;
+		if depth > PROMPT_MAX_DEPTH {
+			continue;
+		}
+		let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+		by_parent
+			.entry(parent)
+			.or_default()
+			.push(EntryRef { entry, name, depth });
+	}
+	for children in by_parent.values_mut() {
+		children.sort_unstable_by(|left, right| {
+			right
+				.entry
+				.modified_ms
+				.cmp(&left.entry.modified_ms)
+				.then_with(|| left.name.cmp(right.name))
+		});
+	}
+
+	let mut rows = vec![RenderedLine { label: ".".into(), size: None, age: None, depth: 0 }];
+	let mut truncated = scan_truncated;
+	render_prompt_children("", 0, &by_parent, &mut rows, &mut truncated);
+	let before_cap = rows.len();
+	apply_prompt_line_cap(&mut rows);
+	truncated |= rows.len() != before_cap;
+	let total_lines = rows.len();
+	DirectoryRender {
+		text: if total_lines <= 1 {
+			"(empty directory)".into()
+		} else {
+			format_lines(&rows).into()
+		},
+		total_lines,
+		truncated,
+		root_path,
+		edit_locked: true,
+	}
+}
+
+fn render_prompt_children<'a>(
+	parent: &str,
+	parent_depth: usize,
+	by_parent: &HashMap<&'a str, Vec<EntryRef<'a>>>,
+	rows: &mut Vec<RenderedLine>,
+	truncated: &mut bool,
+) {
+	let Some(all) = by_parent.get(parent) else {
+		return;
+	};
+	let (recent, oldest, omitted) = if all.len() > CHILD_LIMIT {
+		*truncated = true;
+		(&all[..CHILD_LIMIT - 1], all.last(), all.len() - CHILD_LIMIT)
+	} else {
+		(all.as_slice(), None, 0)
+	};
+	for child in recent {
+		render_prompt_entry(*child, parent, by_parent, rows, truncated);
+	}
+	if omitted > 0 {
+		rows.push(RenderedLine {
+			label: format!("{}- … {omitted} more", "  ".repeat(parent_depth + 1)),
+			size:  None,
+			age:   None,
+			depth: parent_depth + 1,
+		});
+	}
+	if let Some(oldest) = oldest {
+		render_prompt_entry(*oldest, parent, by_parent, rows, truncated);
+	}
+}
+
+fn render_prompt_entry<'a>(
+	node: EntryRef<'a>,
+	parent: &str,
+	by_parent: &HashMap<&'a str, Vec<EntryRef<'a>>>,
+	rows: &mut Vec<RenderedLine>,
+	truncated: &mut bool,
+) {
+	let suffix = if node.entry.is_dir { "/" } else { "" };
+	let age = utc_minute(UNIX_EPOCH + Duration::from_millis(node.entry.modified_ms))
+		.ok()
+		.filter(|value| !value.is_empty());
+	rows.push(RenderedLine {
+		label: format!("{}- {}{suffix}", "  ".repeat(node.depth), node.name),
+		size: (!node.entry.is_dir).then(|| format_bytes(node.entry.size)),
+		age,
+		depth: node.depth,
+	});
+	if !node.entry.is_dir || node.depth >= PROMPT_MAX_DEPTH {
+		return;
+	}
+	let child_path = if parent.is_empty() {
+		node.name.to_owned()
+	} else {
+		format!("{parent}/{}", node.name)
+	};
+	render_prompt_children(&child_path, node.depth, by_parent, rows, truncated);
+}
+
+fn apply_prompt_line_cap(rows: &mut Vec<RenderedLine>) {
+	if rows.len() <= PROMPT_LINE_CAP {
+		return;
+	}
+	let target = PROMPT_LINE_CAP - 1;
+	let remove_count = rows.len() - target;
+	let mut removable = rows
+		.iter()
+		.enumerate()
+		.filter(|(_, row)| row.depth > 1)
+		.map(|(index, row)| (index, row.depth))
+		.collect::<Vec<_>>();
+	removable
+		.sort_unstable_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+	let removed = removable
+		.into_iter()
+		.take(remove_count)
+		.map(|(index, _)| index)
+		.collect::<HashSet<_>>();
+	let count = removed.len();
+	let mut index = 0;
+	rows.retain(|_| {
+		let keep = !removed.contains(&index);
+		index += 1;
+		keep
+	});
+	if count > 0 {
+		rows.push(RenderedLine {
+			label: format!("[…{count}ln elided…]"),
+			size:  None,
+			age:   None,
+			depth: 0,
+		});
+	}
+}
+
+/// Renders a flat, deterministic directory-mention listing with relative ages.
+#[must_use]
+pub fn render_directory_mention(entries: &[DirEntry], now_ms: u64, limit: usize) -> Str {
+	let mut entries = entries.iter().collect::<Vec<_>>();
+	entries.sort_unstable_by(|left, right| {
+		left
+			.relative_path
+			.as_str()
+			.to_ascii_lowercase()
+			.cmp(&right.relative_path.as_str().to_ascii_lowercase())
+			.then_with(|| left.relative_path.cmp(&right.relative_path))
+	});
+	let retained = entries.len().min(limit);
+	if retained == 0 {
+		return "(empty directory)".into();
+	}
+	let mut output = String::new();
+	for (index, entry) in entries[..retained].iter().enumerate() {
+		if index > 0 {
+			output.push('\n');
+		}
+		output.push_str(entry.relative_path.as_str());
+		if entry.is_dir {
+			output.push('/');
+		}
+		if let Some(age) = format_age(now_ms.saturating_sub(entry.modified_ms) / 1_000) {
+			let _ = write!(output, " ({age})");
+		}
+	}
+	if retained < entries.len() {
+		let _ = write!(
+			output,
+			"\n\n[{limit} entries limit reached. Use limit={} for more]",
+			limit.saturating_mul(2)
+		);
+	}
+	output.into()
+}
+
 fn format_lines(rows: &[RenderedLine]) -> String {
 	let max_label_len = rows
 		.iter()
-		.map(|row| row.label.encode_utf16().count())
+		.map(|row| xutf::width_str(&row.label))
 		.max()
 		.unwrap_or(0);
 	let mut output = String::new();
@@ -208,7 +415,7 @@ fn format_lines(rows: &[RenderedLine]) -> String {
 			continue;
 		};
 		output.push_str(&row.label);
-		output.extend(std::iter::repeat_n(' ', max_label_len - row.label.encode_utf16().count() + 2));
+		output.extend(std::iter::repeat_n(' ', max_label_len - xutf::width_str(&row.label) + 2));
 		let size = row.size.as_deref().unwrap_or("");
 		output.push_str(size);
 		output.extend(std::iter::repeat_n(' ', 8usize.saturating_sub(size.len())));
@@ -217,6 +424,7 @@ fn format_lines(rows: &[RenderedLine]) -> String {
 	}
 	output
 }
+
 fn format_bytes(bytes: u64) -> String {
 	const KB: f64 = 1024.0;
 	const MB: f64 = 1024.0 * 1024.0;
@@ -251,4 +459,100 @@ fn format_age(seconds: u64) -> Option<String> {
 	} else {
 		"just now".to_owned()
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn entries_are_alphabetical_and_directories_have_slashes() {
+		let entries = [
+			DirEntry {
+				relative_path: "zeta.txt".into(),
+				is_dir:        false,
+				size:          3,
+				modified_ms:   9_000,
+			},
+			DirEntry {
+				relative_path: "alpha".into(),
+				is_dir:        true,
+				size:          0,
+				modified_ms:   1_000,
+			},
+			DirEntry {
+				relative_path: "alpha/b.txt".into(),
+				is_dir:        false,
+				size:          2,
+				modified_ms:   8_000,
+			},
+			DirEntry {
+				relative_path: "alpha/a.txt".into(),
+				is_dir:        false,
+				size:          1,
+				modified_ms:   7_000,
+			},
+		];
+		let rendered = render_directory("root", &entries, false, 10_000, None, None);
+		let alpha = rendered.text.find("- alpha/").unwrap();
+		let nested_a = rendered.text.find("- a.txt").unwrap();
+		let nested_b = rendered.text.find("- b.txt").unwrap();
+		let zeta = rendered.text.find("- zeta.txt").unwrap();
+		assert!(alpha < nested_a && nested_a < nested_b && nested_b < zeta);
+		assert!(rendered.edit_locked);
+	}
+
+	#[test]
+	fn same_input_is_deterministic_across_input_order() {
+		let mut entries = vec![
+			DirEntry {
+				relative_path: "b".into(),
+				is_dir:        false,
+				size:          2,
+				modified_ms:   2,
+			},
+			DirEntry {
+				relative_path: "a".into(),
+				is_dir:        false,
+				size:          1,
+				modified_ms:   1,
+			},
+		];
+		let first = render_directory("root", &entries, false, 10_000, None, None);
+		entries.reverse();
+		let second = render_directory("root", &entries, false, 10_000, None, None);
+		assert_eq!(first, second);
+	}
+
+	#[test]
+	fn prompt_mode_uses_utc_minutes_and_deepest_first_cap() {
+		let mut entries = Vec::new();
+		for group in 0..15 {
+			entries.push(DirEntry {
+				relative_path: format!("group-{group:02}").into(),
+				is_dir:        true,
+				size:          0,
+				modified_ms:   1_735_689_600_000 + group,
+			});
+			for child in 0..12 {
+				entries.push(DirEntry {
+					relative_path: format!("group-{group:02}/child-{child:02}").into(),
+					is_dir:        true,
+					size:          0,
+					modified_ms:   1_735_689_600_000 + child,
+				});
+				entries.push(DirEntry {
+					relative_path: format!("group-{group:02}/child-{child:02}/leaf.txt").into(),
+					is_dir:        false,
+					size:          4,
+					modified_ms:   1_735_689_600_000 + child,
+				});
+			}
+		}
+		let rendered = render_prompt_directory("root", &entries, false);
+		assert!(rendered.total_lines <= PROMPT_LINE_CAP);
+		assert!(rendered.truncated);
+		assert!(rendered.text.contains("2025-01-01 00:00"));
+		assert!(rendered.text.contains("ln elided"));
+	}
 }

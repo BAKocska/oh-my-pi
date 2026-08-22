@@ -10,12 +10,203 @@ use thiserror::Error;
 
 use crate::ToolIdentity;
 
+const JTD_IMPORT_MAX_DEPTH: usize = 64;
+
+/// A malformed or unsupported JSON Type Definition import.
+#[derive(Debug, Error)]
+pub enum JtdImportError {
+	/// More than one JTD form, or a JSON-Schema-only keyword, was supplied.
+	#[error("JTD import must contain exactly one supported RFC 8927 form")]
+	InvalidForm,
+	/// A primitive was outside the supported JTD vocabulary.
+	#[error("JTD import contains an unsupported primitive type")]
+	UnsupportedPrimitive,
+	/// An enum was empty or contained a non-string value.
+	#[error("JTD enum must be a non-empty array of strings")]
+	InvalidEnum,
+	/// A properties form did not contain object-valued property maps.
+	#[error("JTD properties and optionalProperties must be objects")]
+	InvalidProperties,
+	/// A discriminator form was malformed.
+	#[error("JTD discriminator requires a non-empty string and object mapping")]
+	InvalidDiscriminator,
+	/// Recursive input exceeded the bounded import depth.
+	#[error("JTD import exceeds the maximum schema depth")]
+	DepthLimit,
+}
+
+/// Converts one explicit JTD import into canonical JSON Schema.
+///
+/// This is intentionally an import seam, not a second schema authoring path:
+/// the returned value uses JSON Schema exclusively and mixed JTD/JSON Schema
+/// nodes are rejected.
+pub fn import_jtd(schema: &serde_json::Value) -> Result<serde_json::Value, JtdImportError> {
+	convert_jtd(schema, 0)
+}
+
+fn convert_jtd(
+	schema: &serde_json::Value,
+	depth: usize,
+) -> Result<serde_json::Value, JtdImportError> {
+	use serde_json::{Map, Value, json};
+
+	if depth >= JTD_IMPORT_MAX_DEPTH {
+		return Err(JtdImportError::DepthLimit);
+	}
+	let object = schema.as_object().ok_or(JtdImportError::InvalidForm)?;
+	if object.is_empty() {
+		return Ok(json!({}));
+	}
+	let forms = [
+		"type",
+		"enum",
+		"elements",
+		"values",
+		"properties",
+		"optionalProperties",
+		"discriminator",
+		"ref",
+	];
+	let form_count = forms
+		.iter()
+		.filter(|key| object.contains_key(**key))
+		.count();
+	let properties_form =
+		object.contains_key("properties") || object.contains_key("optionalProperties");
+	let effective_forms = form_count
+		.saturating_sub(usize::from(properties_form && object.contains_key("properties")))
+		.saturating_sub(usize::from(properties_form && object.contains_key("optionalProperties")))
+		.saturating_add(usize::from(properties_form));
+	if effective_forms != 1 {
+		return Err(JtdImportError::InvalidForm);
+	}
+	let allowed_companion = |key: &str| {
+		matches!(key, "nullable" | "metadata")
+			|| (key == "mapping" && object.contains_key("discriminator"))
+	};
+	if object
+		.keys()
+		.any(|key| !forms.contains(&key.as_str()) && !allowed_companion(key))
+	{
+		return Err(JtdImportError::InvalidForm);
+	}
+
+	let mut converted = if let Some(kind) = object.get("type") {
+		let kind = kind.as_str().ok_or(JtdImportError::UnsupportedPrimitive)?;
+		let kind = match kind {
+			"boolean" => "boolean",
+			"string" | "timestamp" => "string",
+			"float32" | "float64" => "number",
+			"int8" | "uint8" | "int16" | "uint16" | "int32" | "uint32" => "integer",
+			_ => return Err(JtdImportError::UnsupportedPrimitive),
+		};
+		json!({ "type": kind })
+	} else if let Some(values) = object.get("enum") {
+		let values = values.as_array().ok_or(JtdImportError::InvalidEnum)?;
+		if values.is_empty() || values.iter().any(|value| !value.is_string()) {
+			return Err(JtdImportError::InvalidEnum);
+		}
+		json!({ "enum": values })
+	} else if let Some(elements) = object.get("elements") {
+		json!({ "type": "array", "items": convert_jtd(elements, depth + 1)? })
+	} else if let Some(values) = object.get("values") {
+		json!({
+			"type": "object",
+			"additionalProperties": convert_jtd(values, depth + 1)?
+		})
+	} else if properties_form {
+		let mut properties = Map::new();
+		let mut required = Vec::new();
+		if let Some(values) = object.get("properties") {
+			let values = values
+				.as_object()
+				.ok_or(JtdImportError::InvalidProperties)?;
+			for (name, schema) in values {
+				properties.insert(name.clone(), convert_jtd(schema, depth + 1)?);
+				required.push(Value::String(name.clone()));
+			}
+		}
+		if let Some(values) = object.get("optionalProperties") {
+			let values = values
+				.as_object()
+				.ok_or(JtdImportError::InvalidProperties)?;
+			for (name, schema) in values {
+				if properties.contains_key(name) {
+					return Err(JtdImportError::InvalidProperties);
+				}
+				properties.insert(name.clone(), convert_jtd(schema, depth + 1)?);
+			}
+		}
+		let mut result = Map::from_iter([
+			("type".to_owned(), Value::String("object".to_owned())),
+			("properties".to_owned(), Value::Object(properties)),
+			("additionalProperties".to_owned(), Value::Bool(false)),
+		]);
+		if !required.is_empty() {
+			result.insert("required".to_owned(), Value::Array(required));
+		}
+		Value::Object(result)
+	} else if let Some(discriminator) = object.get("discriminator") {
+		let discriminator = discriminator
+			.as_str()
+			.filter(|value| !value.is_empty())
+			.ok_or(JtdImportError::InvalidDiscriminator)?;
+		let mapping = object
+			.get("mapping")
+			.and_then(Value::as_object)
+			.ok_or(JtdImportError::InvalidDiscriminator)?;
+		if mapping.is_empty() {
+			return Err(JtdImportError::InvalidDiscriminator);
+		}
+		let mut one_of = Vec::with_capacity(mapping.len());
+		for (tag, schema) in mapping {
+			let Value::Object(mut variant) = convert_jtd(schema, depth + 1)? else {
+				return Err(JtdImportError::InvalidDiscriminator);
+			};
+			if variant.get("type").and_then(Value::as_str) != Some("object") {
+				return Err(JtdImportError::InvalidDiscriminator);
+			}
+			let properties = variant
+				.get_mut("properties")
+				.and_then(Value::as_object_mut)
+				.ok_or(JtdImportError::InvalidDiscriminator)?;
+			properties.insert(discriminator.to_owned(), json!({ "const": tag }));
+			let required = variant
+				.entry("required")
+				.or_insert_with(|| Value::Array(Vec::new()))
+				.as_array_mut()
+				.ok_or(JtdImportError::InvalidDiscriminator)?;
+			if !required
+				.iter()
+				.any(|value| value.as_str() == Some(discriminator))
+			{
+				required.push(Value::String(discriminator.to_owned()));
+			}
+			one_of.push(Value::Object(variant));
+		}
+		json!({ "oneOf": one_of })
+	} else if let Some(reference) = object.get("ref") {
+		let reference = reference
+			.as_str()
+			.filter(|value| !value.is_empty())
+			.ok_or(JtdImportError::InvalidForm)?;
+		json!({ "$ref": format!("#/$defs/{reference}") })
+	} else {
+		return Err(JtdImportError::InvalidForm);
+	};
+
+	if object.get("nullable") == Some(&Value::Bool(true)) {
+		converted = json!({ "anyOf": [converted, { "type": "null" }] });
+	}
+	Ok(converted)
+}
+
 /// A typed, pure renderer for one exact tool revision.
 ///
 /// Updates are folded into [`State`](Self::State) synchronously. `view`
 /// receives the current state and, after settlement, the typed durable outcome.
 /// Returning `None` declines to the generic data fallback.
-pub trait Render: Send + Sync + 'static {
+pub trait RenderFold: Send + Sync + 'static {
 	/// Incrementally retained fold state.
 	type State: Default + Send + Sync + 'static;
 	/// Typed ephemeral update decoded from exact JSON bytes.
@@ -165,7 +356,7 @@ trait ErasedRender: Send + Sync {
 
 struct RegisteredRender<R>(R);
 
-impl<R: Render> ErasedRender for RegisteredRender<R> {
+impl<R: RenderFold> ErasedRender for RegisteredRender<R> {
 	fn initial(&self) -> Box<dyn Any + Send + Sync> {
 		Box::new(R::State::default())
 	}
@@ -283,7 +474,7 @@ impl RenderRegistry {
 	}
 
 	/// Registers one renderer for one exact `(name, revision)` identity.
-	pub fn register<R: Render>(
+	pub fn register<R: RenderFold>(
 		&mut self,
 		identity: ToolIdentity,
 		render: R,
@@ -346,6 +537,50 @@ impl RenderRegistry {
 			state.check(identity)?;
 		}
 		generic_view(identity, state, outcome)
+	}
+}
+
+#[cfg(test)]
+mod jtd_tests {
+	use serde_json::json;
+
+	use super::{JtdImportError, import_jtd};
+
+	#[test]
+	fn imports_properties_and_elements_into_closed_json_schema() {
+		let converted = import_jtd(&json!({
+			"properties": {
+				"findings": { "elements": { "type": "string" } },
+				"count": { "type": "uint32" }
+			},
+			"optionalProperties": {
+				"note": { "type": "string" }
+			}
+		}))
+		.expect("valid JTD");
+		assert_eq!(
+			converted,
+			json!({
+				"type": "object",
+				"properties": {
+					"findings": { "type": "array", "items": { "type": "string" } },
+					"count": { "type": "integer" },
+					"note": { "type": "string" }
+				},
+				"additionalProperties": false,
+				"required": ["findings", "count"]
+			})
+		);
+	}
+
+	#[test]
+	fn mixed_json_schema_is_not_an_import_format() {
+		let error = import_jtd(&json!({
+			"type": "string",
+			"description": "JSON Schema annotation"
+		}))
+		.expect_err("mixed authoring formats must be rejected");
+		assert!(matches!(error, JtdImportError::InvalidForm));
 	}
 }
 

@@ -115,7 +115,6 @@ pub struct ByteTruncationResult<'a> {
 }
 
 /// A possibly-owned result from [`truncate_line`].
-#[expect(dead_code, reason = "pi parity primitive retained for streaming adapters")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineTruncationResult<'a> {
 	/// Original line, or its retained prefix followed by an ellipsis.
@@ -150,7 +149,6 @@ pub fn truncate_head_bytes(text: &str, max_bytes: usize) -> ByteTruncationResult
 /// Truncates one line at pi's JavaScript UTF-16 column boundary.
 ///
 /// A truncated line ends with `…`; an unmodified line remains borrowed.
-#[expect(dead_code, reason = "pi parity primitive retained for streaming adapters")]
 pub fn truncate_line(line: &str, max_chars: usize) -> LineTruncationResult<'_> {
 	// Every UTF-16 code unit occupies at least one UTF-8 byte, so this is the
 	// overwhelmingly common no-truncation path without scanning the string.

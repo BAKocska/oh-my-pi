@@ -1,7 +1,7 @@
 //! One-time type erasure, live advertisement, and historical lift composition.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	future::Future,
 	mem::size_of,
 	pin::Pin,
@@ -29,7 +29,7 @@ use crate::{
 	Abort, ArgIssueKind, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError, CallOutcome, Constraint,
 	DeviceIssue, DevicePath, GrammarSyntax, IncomingParams, LiftedCall, Part, Presentation,
 	PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool, ToolIdentity,
-	render::{Render, RenderEntry, RenderRegistry, RenderRegistryError, ViewState},
+	render::{RenderEntry, RenderFold, RenderRegistry, RenderRegistryError, ViewState},
 };
 
 /// Catalog capabilities needed for deterministic tool lowering.
@@ -121,6 +121,81 @@ pub struct Claims {
 	pub replaces:   Option<Str>,
 }
 
+/// Available memory-backed tool portfolio.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MemoryToolState {
+	/// Memory tools and URLs are unavailable.
+	#[default]
+	Disabled,
+	/// The Mnemopi tool portfolio is live.
+	Mnemopi,
+}
+
+/// Frozen durable goal state used while resolving one tool snapshot.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GoalToolState {
+	/// Goal mode is disabled by settings.
+	#[default]
+	Disabled,
+	/// Goal mode is enabled but no goal record exists yet.
+	NoGoal,
+	/// An active goal may be inspected or settled.
+	Active,
+	/// A paused goal is not advertised.
+	Paused,
+	/// A completed goal is not advertised.
+	Complete,
+	/// A dropped goal may be replaced.
+	Dropped,
+}
+
+/// Frozen inputs for deterministic per-session tool inclusion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InclusionPolicy {
+	/// The caller owns a restricted explicit tool list.
+	pub restricted:        bool,
+	/// This is the top-level agent rather than a child.
+	pub top_level:         bool,
+	/// Checkpoint/rewind support is live.
+	pub checkpoint:        bool,
+	/// AST grep/edit implementations are live.
+	pub ast:               bool,
+	/// Memory portfolio available to this session.
+	pub memory:            MemoryToolState,
+	/// The active model delegates thinking to the external think tool.
+	pub external_thinking: bool,
+	/// Durable goal state frozen at the snapshot boundary.
+	pub goal:              GoalToolState,
+	/// Autolearn policy is active.
+	pub autolearn:         bool,
+}
+
 /// Provenance retained for a non-winning claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShadowClaim {
@@ -205,6 +280,311 @@ pub struct AvailabilityDelta {
 	pub mounted: bool,
 	/// Human-readable explanation for an unavailable device.
 	pub reason:  Option<Str>,
+}
+
+/// Dynamic leaf owner qualified by mounted root and authenticated claimant.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LeafOwner {
+	/// Canonical mounted root.
+	pub root:     Str,
+	/// Authenticated claimant identity.
+	pub claimant: Str,
+}
+
+/// Monotone manager fence for one dynamic leaf owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeafVersion {
+	/// Manager process generation.
+	pub manager_generation: u64,
+	/// Definition epoch within that manager generation.
+	pub definition_epoch:   u64,
+}
+
+/// One versioned dynamic registry leaf.
+pub struct RegistryLeaf<T> {
+	/// Canonical leaf name.
+	pub name:  Str,
+	/// Semantic tool revision.
+	pub rev:   Rev,
+	/// Digest of the effective declaration and implementation binding.
+	pub code:  Hash32,
+	/// Owner-specific runtime implementation.
+	pub value: Arc<T>,
+}
+
+impl<T> Clone for RegistryLeaf<T> {
+	fn clone(&self) -> Self {
+		Self {
+			name:  self.name.clone(),
+			rev:   self.rev.clone(),
+			code:  self.code,
+			value: Arc::clone(&self.value),
+		}
+	}
+}
+
+/// One owner-qualified leaf in a published catalog snapshot.
+pub struct PublishedLeaf<T> {
+	/// Authenticated dynamic owner.
+	pub owner: LeafOwner,
+	/// Canonical leaf name.
+	pub name:  Str,
+	/// Semantic tool revision.
+	pub rev:   Rev,
+	/// Effective declaration and binding digest.
+	pub code:  Hash32,
+	/// Owner-specific runtime implementation.
+	pub value: Arc<T>,
+}
+
+impl<T> Clone for PublishedLeaf<T> {
+	fn clone(&self) -> Self {
+		Self {
+			owner: self.owner.clone(),
+			name:  self.name.clone(),
+			rev:   self.rev.clone(),
+			code:  self.code,
+			value: Arc::clone(&self.value),
+		}
+	}
+}
+
+/// Immutable old-or-new snapshot of every effective dynamic leaf.
+pub struct LeafCatalogSnapshot<T> {
+	/// Catalog epoch published for this exact effective set.
+	pub epoch:  u64,
+	/// Deterministically ordered leaves.
+	pub leaves: Arc<[PublishedLeaf<T>]>,
+}
+
+impl<T> Clone for LeafCatalogSnapshot<T> {
+	fn clone(&self) -> Self {
+		Self { epoch: self.epoch, leaves: Arc::clone(&self.leaves) }
+	}
+}
+
+/// Fenced dynamic leaf replacement failure.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum LeafReplacementError {
+	/// Manager generation or definition epoch moved backwards.
+	#[error("dynamic leaf replacement is older than the published owner fence")]
+	Stale {
+		/// Submitted manager generation.
+		manager_generation: u64,
+		/// Submitted definition epoch.
+		definition_epoch:   u64,
+		/// Current manager generation.
+		current_generation: u64,
+		/// Current definition epoch.
+		current_epoch:      u64,
+	},
+	/// One replacement set repeated a canonical leaf name.
+	#[error("dynamic leaf replacement contains a duplicate canonical name")]
+	DuplicateName,
+	/// A replacement reused one fence for a different effective leaf set.
+	#[error("dynamic leaf replacement changed without advancing its owner fence")]
+	ConflictingVersion,
+}
+
+struct LeafCatalogState<T> {
+	epoch:      u64,
+	fences:     BTreeMap<LeafOwner, LeafVersion>,
+	live:       BTreeMap<(LeafOwner, Str), RegistryLeaf<T>>,
+	historical: BTreeMap<(LeafOwner, Str, Rev), Arc<T>>,
+}
+
+impl<T> Default for LeafCatalogState<T> {
+	fn default() -> Self {
+		Self {
+			epoch:      0,
+			fences:     BTreeMap::new(),
+			live:       BTreeMap::new(),
+			historical: BTreeMap::new(),
+		}
+	}
+}
+
+/// Atomic, owner-fenced runtime leaf replacement catalog.
+///
+/// One write swaps an owner's complete leaf set under a single lock. Snapshot
+/// readers copy only `Arc` handles and therefore observe the complete old or
+/// new publication. Historical `(owner, name, revision)` bindings remain
+/// reachable after omission from the live set.
+pub struct LeafReplacementRegistry<T> {
+	state: RwLock<LeafCatalogState<T>>,
+}
+
+impl<T> Default for LeafReplacementRegistry<T> {
+	fn default() -> Self {
+		Self { state: RwLock::new(LeafCatalogState::default()) }
+	}
+}
+
+impl<T> LeafReplacementRegistry<T> {
+	/// Creates an empty dynamic leaf catalog at epoch zero.
+	#[must_use]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Atomically replaces one owner's complete live set and returns the
+	/// published catalog epoch.
+	pub fn replace(
+		&self,
+		owner: LeafOwner,
+		version: LeafVersion,
+		mut leaves: Vec<RegistryLeaf<T>>,
+	) -> Result<u64, LeafReplacementError> {
+		leaves.sort_by(|left, right| {
+			left
+				.name
+				.cmp(&right.name)
+				.then_with(|| left.rev.cmp(&right.rev))
+		});
+		if leaves.windows(2).any(|pair| pair[0].name == pair[1].name) {
+			return Err(LeafReplacementError::DuplicateName);
+		}
+
+		let mut state = self.state.write();
+		let current_version = state.fences.get(&owner).copied();
+		if let Some(current) = current_version
+			&& (version.manager_generation < current.manager_generation
+				|| (version.manager_generation == current.manager_generation
+					&& version.definition_epoch < current.definition_epoch))
+		{
+			return Err(LeafReplacementError::Stale {
+				manager_generation: version.manager_generation,
+				definition_epoch:   version.definition_epoch,
+				current_generation: current.manager_generation,
+				current_epoch:      current.definition_epoch,
+			});
+		}
+
+		let current = state
+			.live
+			.iter()
+			.filter(|((leaf_owner, _), _)| leaf_owner == &owner)
+			.map(|(_, leaf)| leaf)
+			.collect::<Vec<_>>();
+		let changed = current.len() != leaves.len()
+			|| current.iter().zip(&leaves).any(|(left, right)| {
+				left.name != right.name || left.rev != right.rev || left.code != right.code
+			});
+		if !changed {
+			state.fences.insert(owner, version);
+			return Ok(state.epoch);
+		}
+		if current_version == Some(version) {
+			return Err(LeafReplacementError::ConflictingVersion);
+		}
+
+		state.live.retain(|(leaf_owner, _), _| leaf_owner != &owner);
+		for leaf in leaves {
+			state
+				.historical
+				.insert((owner.clone(), leaf.name.clone(), leaf.rev.clone()), Arc::clone(&leaf.value));
+			state.live.insert((owner.clone(), leaf.name.clone()), leaf);
+		}
+		state.fences.insert(owner, version);
+		state.epoch = state.epoch.saturating_add(1);
+		Ok(state.epoch)
+	}
+
+	/// Returns an immutable old-or-new snapshot ordered by name, revision,
+	/// root, then claimant.
+	#[must_use]
+	pub fn snapshot(&self) -> LeafCatalogSnapshot<T> {
+		let state = self.state.read();
+		let mut leaves = state
+			.live
+			.iter()
+			.map(|((owner, _), leaf)| PublishedLeaf {
+				owner: owner.clone(),
+				name:  leaf.name.clone(),
+				rev:   leaf.rev.clone(),
+				code:  leaf.code,
+				value: Arc::clone(&leaf.value),
+			})
+			.collect::<Vec<_>>();
+		leaves.sort_by(|left, right| {
+			left
+				.name
+				.cmp(&right.name)
+				.then_with(|| left.rev.cmp(&right.rev))
+				.then_with(|| left.owner.cmp(&right.owner))
+		});
+		LeafCatalogSnapshot { epoch: state.epoch, leaves: Arc::from(leaves) }
+	}
+
+	/// Returns the current published catalog epoch.
+	#[must_use]
+	pub fn epoch(&self) -> u64 {
+		self.state.read().epoch
+	}
+
+	/// Resolves a retained historical owner/name/revision implementation.
+	#[must_use]
+	pub fn historical(&self, owner: &LeafOwner, name: &str, rev: &Rev) -> Option<Arc<T>> {
+		self
+			.state
+			.read()
+			.historical
+			.get(&(owner.clone(), Str::new(name), rev.clone()))
+			.map(Arc::clone)
+	}
+}
+
+/// One borrowed model-facing tool declaration from the authoritative registry.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolPromptEntry<'a> {
+	/// Policy-resolved wire name.
+	pub name:        &'a Str,
+	/// Exact argument and projection revision.
+	pub revision:    &'a Rev,
+	/// Model-facing purpose.
+	pub description: &'a Str,
+	/// Authoritative JSON Schema bytes.
+	pub schema:      &'a Bytes,
+	/// Declared examples; empty when the tool supplies none.
+	pub examples:    &'a [crate::ToolPromptExample],
+	/// Optional long-form documentation.
+	pub docs:        Option<&'a str>,
+}
+
+/// Allocation-free borrowed view of policy-resolved callable tools.
+///
+/// Entries borrow the registry's exact winning declarations. With a selected
+/// name set, hidden tools appear only when explicitly selected; device-only
+/// declarations never enter the callable inventory.
+#[derive(Clone, Copy)]
+pub struct ToolPromptProjection<'a> {
+	registry: &'a Registry,
+	selected: Option<&'a [Str]>,
+}
+
+impl ToolPromptProjection<'_> {
+	/// Iterates exact model-facing declarations in deterministic wire-name
+	/// order.
+	pub fn entries(&self) -> impl DoubleEndedIterator<Item = ToolPromptEntry<'_>> + '_ {
+		self.registry.live.iter().filter_map(|(name, claim)| {
+			let entry = self.registry.versions.get(name)?.get(&claim.rev)?;
+			let included = match self.selected {
+				Some(selected) => {
+					selected.iter().any(|selected| selected == name)
+						&& matches!(entry.presentation, Presentation::Slot | Presentation::Hidden)
+				},
+				None => entry.presentation == Presentation::Slot,
+			};
+			(included && matches!(entry.tool.route(), ToolRoute::Native)).then(|| ToolPromptEntry {
+				name,
+				revision: &claim.rev,
+				description: &entry.tool.spec().description,
+				schema: &entry.tool.spec().schema,
+				examples: entry.tool.prompt_examples(),
+				docs: entry.tool.prompt_docs(),
+			})
+		})
+	}
 }
 
 /// One live tool declaration ready for inference request construction.
@@ -563,6 +943,8 @@ pub enum RegistryError {
 
 trait ErasedTool: Send + Sync {
 	fn spec(&self) -> &crate::ToolSpec;
+	fn prompt_examples(&self) -> &[crate::ToolPromptExample];
+	fn prompt_docs(&self) -> Option<&str>;
 	fn route(&self) -> &ToolRoute;
 	fn schema(&self) -> &OpaqueJson;
 	fn call<'a>(&'a self, params: IncomingParams<'a>) -> ErasedStream<'a>;
@@ -589,6 +971,14 @@ struct Worker {
 impl ErasedTool for Worker {
 	fn spec(&self) -> &crate::ToolSpec {
 		&self.spec
+	}
+
+	fn prompt_examples(&self) -> &[crate::ToolPromptExample] {
+		&[]
+	}
+
+	fn prompt_docs(&self) -> Option<&str> {
+		None
 	}
 
 	fn route(&self) -> &ToolRoute {
@@ -673,6 +1063,14 @@ impl<T: Tool> Registered<T> {
 impl<T: Tool> ErasedTool for Registered<T> {
 	fn spec(&self) -> &crate::ToolSpec {
 		self.tool.spec()
+	}
+
+	fn prompt_examples(&self) -> &[crate::ToolPromptExample] {
+		self.tool.prompt_examples()
+	}
+
+	fn prompt_docs(&self) -> Option<&str> {
+		self.tool.prompt_docs()
 	}
 
 	fn route(&self) -> &ToolRoute {
@@ -819,6 +1217,7 @@ struct RegistryEntry {
 pub struct Registry {
 	versions:         BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
 	live:             BTreeMap<Str, Claim>,
+	protected_core:   BTreeSet<Str>,
 	unmounted:        RwLock<BTreeMap<Str, Option<Str>>>,
 	arg_specs:        ArgSpecRegistry,
 	renderers:        RenderRegistry,
@@ -829,6 +1228,123 @@ impl Registry {
 	/// Creates an empty registry.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Reserves essential built-in names for harness-owned core claims.
+	///
+	/// Reservations are monotone and may be installed before or after the core
+	/// implementation. Later non-core claims fail instead of shadowing,
+	/// demoting, or blocking the essential slot.
+	pub fn protect_core_claims<I, S>(&mut self, names: I)
+	where
+		I: IntoIterator<Item = S>,
+		S: Into<Str>,
+	{
+		self
+			.protected_core
+			.extend(names.into_iter().map(Into::into));
+	}
+
+	/// Computes the exact live slot names for one frozen session policy.
+	///
+	/// Checkpoint/rewind pairing is a safety invariant and therefore applies to
+	/// restricted lists. Every other convenience expansion is top-level only
+	/// and never widens a restricted child.
+	#[must_use]
+	pub fn resolve_inclusions(
+		&self,
+		requested: Option<&[Str]>,
+		policy: InclusionPolicy,
+	) -> Vec<Str> {
+		let mut names = Vec::new();
+		let mut seen = BTreeSet::new();
+		let push = |name: &str, names: &mut Vec<Str>, seen: &mut BTreeSet<Str>| {
+			if seen.contains(name) || !self.inclusion_allowed(name, requested.is_some(), policy) {
+				return;
+			}
+			if self.live_entry(name).is_ok_and(|entry| {
+				matches!(entry.presentation, Presentation::Slot | Presentation::Hidden)
+			}) {
+				let name = Str::new(name);
+				seen.insert(name.clone());
+				names.push(name);
+			}
+		};
+
+		match requested {
+			Some(requested) => {
+				for name in requested {
+					push(name, &mut names, &mut seen);
+				}
+				if policy.checkpoint {
+					if seen.contains("checkpoint") {
+						push("rewind", &mut names, &mut seen);
+					} else if seen.contains("rewind") {
+						push("checkpoint", &mut names, &mut seen);
+					}
+				}
+				if !policy.restricted {
+					if seen.contains("grep") && policy.ast {
+						push("ast_grep", &mut names, &mut seen);
+					}
+					if seen.contains("edit") && policy.ast {
+						push("ast_edit", &mut names, &mut seen);
+					}
+					if policy.memory == MemoryToolState::Mnemopi {
+						for name in ["recall", "retain", "reflect", "memory_edit"] {
+							push(name, &mut names, &mut seen);
+						}
+					}
+					if policy.external_thinking {
+						push("think", &mut names, &mut seen);
+					}
+					if policy.goal == GoalToolState::Active {
+						push("goal", &mut names, &mut seen);
+					}
+					if policy.autolearn && policy.top_level {
+						push("manage_skill", &mut names, &mut seen);
+						if policy.memory == MemoryToolState::Mnemopi {
+							push("learn", &mut names, &mut seen);
+						}
+					}
+				}
+			},
+			None => {
+				for name in self.live.keys() {
+					push(name, &mut names, &mut seen);
+				}
+			},
+		}
+		names
+	}
+
+	fn inclusion_allowed(&self, name: &str, explicit: bool, policy: InclusionPolicy) -> bool {
+		match name {
+			"checkpoint" | "rewind" => policy.checkpoint && (policy.top_level || explicit),
+			"ast_grep" | "ast_edit" => policy.ast,
+			"recall" | "retain" | "reflect" | "memory_edit" => {
+				policy.memory == MemoryToolState::Mnemopi
+			},
+			"think" => policy.external_thinking,
+			"goal" => {
+				!policy.restricted
+					&& if explicit {
+						matches!(
+							policy.goal,
+							GoalToolState::NoGoal | GoalToolState::Active | GoalToolState::Dropped
+						)
+					} else {
+						policy.goal == GoalToolState::Active
+					}
+			},
+			"manage_skill" => policy.autolearn && (policy.top_level || explicit),
+			"learn" => {
+				policy.autolearn
+					&& policy.memory == MemoryToolState::Mnemopi
+					&& (policy.top_level || explicit)
+			},
+			_ => true,
+		}
 	}
 
 	/// Registers one argument declaration for one exact revision.
@@ -853,7 +1369,7 @@ impl Registry {
 	}
 
 	/// Registers one pure renderer for one exact tool identity.
-	pub fn register_renderer<R: Render>(
+	pub fn register_renderer<R: RenderFold>(
 		&mut self,
 		identity: ToolIdentity,
 		renderer: R,
@@ -978,6 +1494,15 @@ impl Registry {
 	}
 
 	fn insert(&mut self, name: Str, rev: Rev, entry: RegistryEntry) -> Result<(), RegistryError> {
+		if self.protected_core.contains(&name)
+			&& (entry.claims.precedence != Precedence::CORE || entry.claims.claimant != "omp/core")
+		{
+			return Err(RegistryError::CoreNameClaim {
+				name,
+				claimant: entry.claims.claimant,
+				precedence: entry.claims.precedence,
+			});
+		}
 		if entry.claims.precedence > Precedence::CORE
 			|| (entry.presentation == Presentation::Device
 				&& entry.claims.precedence >= Precedence::CORE)
@@ -1014,6 +1539,19 @@ impl Registry {
 		let (name, claimant) = split_claimant(name);
 		let (stored_name, claim) = self.live.get_key_value(name)?;
 		Some((stored_name, claim_revision(claim, claimant)?))
+	}
+
+	/// Borrows callable prompt declarations from the exact winning registry.
+	///
+	/// `selected = None` projects all visible slots. A selected set matches
+	/// [`Self::advertise_selected`] inclusion semantics, including explicitly
+	/// selected hidden slots. Worker and device declarations are absent.
+	#[must_use]
+	pub const fn prompt_projection<'a>(
+		&'a self,
+		selected: Option<&'a [Str]>,
+	) -> ToolPromptProjection<'a> {
+		ToolPromptProjection { registry: self, selected }
 	}
 
 	/// Borrows the complete policy-resolved specification.
@@ -1256,14 +1794,37 @@ impl Registry {
 	/// extension declaration can never displace a core intent when a route is
 	/// capacity-constrained.
 	pub fn advertise(&self, caps: LoweringCaps) -> Result<Vec<LoweredTool>, RegistryError> {
+		self.advertise_matching(caps, |entry| entry.presentation == Presentation::Slot)
+	}
+
+	/// Lowers an exact frozen session selection, including selected hidden
+	/// tools.
+	///
+	/// Unknown, worker-routed, device-only, and unselected declarations are
+	/// omitted. Callers should obtain `names` from [`Self::resolve_inclusions`].
+	pub fn advertise_selected(
+		&self,
+		caps: LoweringCaps,
+		names: &[Str],
+	) -> Result<Vec<LoweredTool>, RegistryError> {
+		let selected = names.iter().collect::<BTreeSet<_>>();
+		self.advertise_matching(caps, |entry| {
+			selected.contains(&entry.tool.spec().name)
+				&& matches!(entry.presentation, Presentation::Slot | Presentation::Hidden)
+		})
+	}
+
+	fn advertise_matching(
+		&self,
+		caps: LoweringCaps,
+		include: impl Fn(&RegistryEntry) -> bool,
+	) -> Result<Vec<LoweredTool>, RegistryError> {
 		let mut entries = self
 			.live
 			.iter()
 			.filter_map(|(name, claim)| {
 				let entry = self.versions.get(name)?.get(&claim.rev)?;
-				(entry.presentation == Presentation::Slot
-					&& matches!(entry.tool.route(), ToolRoute::Native))
-				.then_some(entry)
+				(include(entry) && matches!(entry.tool.route(), ToolRoute::Native)).then_some(entry)
 			})
 			.collect::<Vec<_>>();
 		entries.sort_by(|left, right| {
@@ -1878,6 +2439,10 @@ mod tests {
 			&self.spec
 		}
 
+		fn prompt_docs(&self) -> Option<&str> {
+			Some("long-form lift docs")
+		}
+
 		fn call<'c>(
 			&'c self,
 			_params: IncomingParams<'c>,
@@ -1927,6 +2492,31 @@ mod tests {
 				projection_code: [n as u8; 32],
 			},
 		}
+	}
+
+	#[test]
+	fn prompt_projection_borrows_exact_live_name_revision_schema_and_docs() {
+		let mut registry = Registry::new();
+		registry
+			.register(tool(1), Presentation::Slot, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/prompt"),
+				replaces:   None,
+			})
+			.expect("slot registers");
+		let projection = registry.prompt_projection(None);
+		let entries = projection.entries().collect::<Vec<_>>();
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].name, "lift");
+		assert_eq!(entries[0].revision, &identity(1).rev);
+		assert_eq!(entries[0].description, "lift test");
+		assert_eq!(entries[0].schema.as_ref(), b"{}");
+		assert!(entries[0].examples.is_empty());
+		assert_eq!(entries[0].docs, Some("long-form lift docs"));
+		assert!(std::ptr::eq(
+			entries[0].schema,
+			&registry.live_spec("lift").expect("live spec").schema
+		));
 	}
 
 	#[test]

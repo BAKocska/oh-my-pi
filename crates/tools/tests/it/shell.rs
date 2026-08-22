@@ -202,6 +202,8 @@ fn status(outcome: ExecOutcome) -> ExecStatus {
 		spilled_output: None,
 		aborted: matches!(outcome, ExecOutcome::Timeout | ExecOutcome::Cancelled),
 		effects_unknown: false,
+		final_cwd_uri: None,
+		final_cwd_revision: 0,
 	}
 }
 
@@ -414,7 +416,7 @@ fn async_returns_a_named_session_lifetime_job_reference() {
 #[tokio::test]
 async fn foreground_wait_threshold_detaches_the_exact_running_command() {
 	let tool =
-		shell::shell(FakeExec::default()).with_auto_background_threshold(std::time::Duration::ZERO);
+		shell::shell(FakeExec::default()).with_auto_background(true, std::time::Duration::ZERO);
 	let (feed, params) = IncomingParams::channel();
 	feed
 		.args_committed(sf!(r#"{{"command":"wait"}}"#))

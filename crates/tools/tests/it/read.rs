@@ -1,7 +1,7 @@
 //! Model-facing behavioral contracts for pi-compatible `read@1`.
 
 use std::{
-	collections::{HashMap, VecDeque},
+	collections::VecDeque,
 	fmt::Write as _,
 	future::{Future, ready},
 	ops::Range,
@@ -15,6 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::StreamExt as _;
 use omp_core::{CowBytes, Str, sf};
 use omp_tool::{
@@ -43,9 +44,9 @@ struct FileSource {
 
 #[derive(Clone, Default)]
 struct Sources {
-	files:     Arc<Mutex<HashMap<String, FileSource>>>,
-	dirs:      Arc<Mutex<HashMap<String, (SourceStat, DirectorySource)>>>,
-	suffixes:  Arc<Mutex<HashMap<String, SourceStat>>>,
+	files:     Arc<DashMap<String, FileSource>>,
+	dirs:      Arc<DashMap<String, (SourceStat, DirectorySource)>>,
+	suffixes:  Arc<DashMap<String, SourceStat>>,
 	snapshots: Arc<Mutex<Vec<SnapshotRecord>>>,
 	responses: Arc<Mutex<VecDeque<Result<HttpResponse, WebError>>>>,
 }
@@ -77,16 +78,9 @@ impl ReadSources for Sources {
 	fn stat(&self, path: Str) -> impl Future<Output = Result<SourceStat, Fault>> + Send + '_ {
 		let result = self
 			.files
-			.lock()
 			.get(path.as_str())
 			.map(|source| source.stat.clone())
-			.or_else(|| {
-				self
-					.dirs
-					.lock()
-					.get(path.as_str())
-					.map(|(stat, _)| stat.clone())
-			})
+			.or_else(|| self.dirs.get(path.as_str()).map(|entry| entry.0.clone()))
 			.ok_or_else(|| Fault::source(format!("Path '{path}' not found")));
 		ready(result)
 	}
@@ -95,19 +89,17 @@ impl ReadSources for Sources {
 		&self,
 		path: Str,
 	) -> impl Future<Output = Result<Option<SourceStat>, Fault>> + Send + '_ {
-		ready(Ok(self.suffixes.lock().get(path.as_str()).cloned()))
+		ready(Ok(self.suffixes.get(path.as_str()).map(|stat| stat.clone())))
 	}
 
 	fn open(&self, path: Str) -> impl Future<Output = Result<Self::Lease, Fault>> + Send + '_ {
 		let result = self
 			.files
-			.lock()
 			.get(path.as_str())
-			.cloned()
 			.map(|source| Lease {
-				canonical_path: source.stat.canonical_path,
-				revision:       source.revision,
-				bytes:          source.bytes,
+				canonical_path: source.stat.canonical_path.clone(),
+				revision:       source.revision.clone(),
+				bytes:          source.bytes.clone(),
 			})
 			.ok_or_else(|| Fault::source(format!("Path '{path}' not found")));
 		ready(result)
@@ -116,7 +108,6 @@ impl ReadSources for Sources {
 	fn read_bytes(&self, path: Str) -> impl Future<Output = Result<Bytes, Fault>> + Send + '_ {
 		let result = self
 			.files
-			.lock()
 			.get(path.as_str())
 			.map(|source| source.bytes.clone())
 			.ok_or_else(|| Fault::source(format!("Path '{path}' not found")));
@@ -130,9 +121,8 @@ impl ReadSources for Sources {
 	) -> impl Future<Output = Result<DirectorySource, Fault>> + Send + '_ {
 		let result = self
 			.dirs
-			.lock()
 			.get(path.as_str())
-			.map(|(_, source)| source.clone())
+			.map(|entry| entry.1.clone())
 			.ok_or_else(|| Fault::source(format!("Path '{path}' not found")));
 		ready(result)
 	}
@@ -272,9 +262,8 @@ impl Sources {
 			bytes,
 			revision: sf!("revision-7"),
 		};
-		let mut files = self.files.lock();
-		files.insert(authored.to_owned(), source.clone());
-		files.insert(canonical.to_owned(), source);
+		self.files.insert(authored.to_owned(), source.clone());
+		self.files.insert(canonical.to_owned(), source);
 	}
 
 	fn directory(&self, path: &str, entries: Vec<DirectoryEntry>) {
@@ -285,7 +274,7 @@ impl Sources {
 			byte_len:       0,
 			modified_ms:    Some(u64::MAX),
 		};
-		self.dirs.lock().insert(
+		self.dirs.insert(
 			path.to_owned(),
 			(stat, DirectorySource { root: Str::new(path), entries, truncated: false }),
 		);
@@ -294,12 +283,11 @@ impl Sources {
 	fn directory_symlink(&self, authored: &str, target: &str) {
 		let target_stat = self
 			.dirs
-			.lock()
 			.get(target)
 			.unwrap_or_else(|| panic!("directory symlink target '{target}' exists"))
 			.0
 			.clone();
-		self.files.lock().insert(authored.to_owned(), FileSource {
+		self.files.insert(authored.to_owned(), FileSource {
 			stat:     SourceStat { kind: SourceKind::Symlink, ..target_stat },
 			bytes:    Bytes::new(),
 			revision: sf!("symlink"),
@@ -309,12 +297,11 @@ impl Sources {
 	fn suffix(&self, authored: &str, resolved: &str) {
 		let stat = self
 			.files
-			.lock()
 			.get(resolved)
 			.expect("resolved fixture exists")
 			.stat
 			.clone();
-		self.suffixes.lock().insert(authored.to_owned(), stat);
+		self.suffixes.insert(authored.to_owned(), stat);
 	}
 }
 
@@ -550,8 +537,8 @@ async fn directory_listing_is_depth_two_and_elides_nested_children() {
 			"    - child-08.txt\n",
 			"    - child-09.txt\n",
 			"    - child-10.txt\n",
-			"    - … 2 more\n",
-			"    - child-13.txt",
+			"    - child-11.txt\n",
+			"    - … 2 more",
 		)
 	);
 }
@@ -1204,7 +1191,7 @@ async fn document_raw_selector_returns_converted_markdown_without_line_projectio
 	);
 	assert_eq!(
 		text(sources.clone(), r#"{"path":"report.docx:raw"}"#).await,
-		"Fixture document\n\nConverted café."
+		"Content-Type: text/markdown\nFixture document\n\nConverted café."
 	);
 	assert!(sources.snapshots.lock().is_empty());
 }
@@ -1441,8 +1428,9 @@ async fn dense_resolver_dispatch_applies_the_shared_selector_without_copying_the
 	let table = Arc::new(builder.build());
 	assert_eq!(table.routes().get(Scheme::Artifact).unwrap().index(), 0);
 	assert!(table.routes().get(Scheme::History).is_none());
-	let snapshot = table.snapshot([7; 32]);
-	assert_eq!(snapshot.device_hash, [7; 32]);
+	let snapshot = table.snapshot();
+	assert_ne!(snapshot.device_hash, [0; 32]);
+	assert_eq!(snapshot.device_hash, table.snapshot().device_hash);
 	assert_eq!(snapshot.entries.as_ref(), table.entries());
 
 	let tool = read::tool_with_resolvers(Sources::default(), Blobs::default(), table);

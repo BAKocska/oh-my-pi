@@ -281,58 +281,65 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
 		stream! {
-			let arguments = match params.whole::<Params>().await {
-				Ok(arguments) => arguments,
-				Err(error) => {
-					yield param_event(error);
-					return;
-				},
-			};
-			match params.interruptable().committed().await {
-				Ok(_) => {},
-				Err(error) => {
-					yield commit_event(error);
-					return;
-				},
-			}
+					let arguments = match params.whole::<Params>().await {
+						Ok(arguments) => arguments,
+						Err(error) => {
+							yield param_event(error);
+							return;
+						},
+					};
+					match params.interruptable().committed().await {
+						Ok(_) => {},
+						Err(error) => {
+							yield commit_event(error);
+							return;
+						},
+					}
 
-			let limit = match effective_limit(arguments.limit) {
-				Ok(limit) => limit,
-				Err(fault) => {
-					yield done(Err(fault));
-					return;
-				},
-			};
-			let path = arguments.path.unwrap_or_else(|| sf!("."));
-			if path.trim().is_empty() {
-				yield done(Err(Fault::EmptyPath));
-				return;
-			}
-			if contains_root_target(&path) {
-				yield done(Err(Fault::RootSearch));
-				return;
-			}
-			if let Some(scheme) = unsupported_scheme(&path) {
-				yield done(Err(Fault::UnsupportedScheme { scheme }));
-				return;
-			}
-
-			let request = walk_request(path, arguments.hidden, arguments.gitignore, limit);
-			let operation = async {
-				let result = self.workspace.glob(request).await?;
-				prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await
-			}.fuse();
-			let interruption = params.next_interrupt().fuse();
-			pin_mut!(operation, interruption);
-			select_biased! {
-				result = operation => {
-					yield done(result);
-				},
-				interrupt = interruption => {
-					yield interrupt_event(interrupt, "glob traversal owner disappeared");
-				},
-			}
-		}
+					let limit = match effective_limit(arguments.limit) {
+						Ok(limit) => limit,
+						Err(fault) => {
+							yield done(Err(fault));
+							return;
+						},
+					};
+					let path = arguments.path.unwrap_or_else(|| sf!("."));
+					if path.trim().is_empty() {
+						yield done(Err(Fault::EmptyPath));
+						return;
+					}
+					if contains_root_target(&path) {
+						yield done(Err(Fault::RootSearch));
+						return;
+					}
+					let resource_scheme = unsupported_scheme(&path);
+					let request = walk_request(path, arguments.hidden, arguments.gitignore, limit);
+					if let Some(scheme) = resource_scheme {
+						let resource = self.workspace.glob_resource(request.clone()).await;
+						match resource {
+							Some(Ok(result)) => {
+								yield done(prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await);
+							},
+							Some(Err(fault)) => yield done(Err(fault)),
+							None => yield done(Err(Fault::UnsupportedScheme { scheme })),
+						}
+						return;
+					}
+		let operation = async {
+						let result = self.workspace.glob(request).await?;
+						prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await
+					}.fuse();
+					let interruption = params.next_interrupt().fuse();
+					pin_mut!(operation, interruption);
+					select_biased! {
+						result = operation => {
+							yield done(result);
+						},
+						interrupt = interruption => {
+							yield interrupt_event(interrupt, "glob traversal owner disappeared");
+						},
+					}
+				}
 	}
 
 	fn prompt(&self, view: Result<&Self::Payload, &Self::Fault>, caps: &PromptCaps) -> Vec<Part> {

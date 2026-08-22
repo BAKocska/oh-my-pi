@@ -2,13 +2,18 @@
 
 use std::{
 	future::Future,
-	sync::atomic::{AtomicU64, Ordering},
-	time::Duration,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::{FutureExt, pin_mut};
 use omp_core::{Str, sf};
-use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobOwner, JobRef, ToolTerminal};
+use omp_tool::{
+	ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef, ToolTerminal,
+};
 
 /// Default time a managed tool waits in the foreground before detaching.
 pub const DEFAULT_AUTO_BACKGROUND_THRESHOLD: Duration = Duration::from_secs(60);
@@ -27,15 +32,24 @@ pub struct DetachedJob {
 #[must_use]
 pub fn managed_job_terminal<P, F>(
 	job: DetachedJob,
+	kind: JobKind,
 	description: impl Into<Str>,
 ) -> ToolTerminal<P, F> {
+	let description = description.into();
+	let started_at_ms = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX);
 	ToolTerminal::Detached(JobRef {
 		id:       job.id,
 		owner:    job.owner,
+		metadata: Arc::new(JobMetadata::running(kind, description.clone(), started_at_ms)),
 		artifact: ExpectedArtifact {
-			description: description.into(),
-			media_type:  Some(sf!("application/vnd.omp.process-settlement+json")),
-			lifetime:    ArtifactLifetime::Session,
+			description,
+			media_type: Some(sf!("application/vnd.omp.process-settlement+json")),
+			lifetime: ArtifactLifetime::Session,
 		},
 	})
 }

@@ -338,7 +338,9 @@ fn payload<P: EditPrepared>(
 					resolved_edits: projection.resolved.clone(),
 					rebased: committed.is_some_and(|section| section.rebased),
 					before: work.prepared.base_bytes().clone(),
+					before_blob: None,
 					after: after.clone(),
+					after_blob: None,
 					header: Some(format_hashline_header(
 						work.prepared.display_path(),
 						&omp_hashline::compute_snapshot_tag(&after),

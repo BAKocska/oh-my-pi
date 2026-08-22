@@ -1,9 +1,9 @@
 //! Shared request, response, and rendered-content contracts for web reads.
 
-use std::future::Future;
+use std::future::{Future, ready};
 
 use bytes::Bytes;
-use omp_core::{IntoStr, Str, sf};
+use omp_core::{Hash32, IntoStr, Str, sf};
 use smallvec::SmallVec;
 use xutf::{TextBuf as _, Utf8};
 
@@ -172,13 +172,62 @@ impl WebError {
 	}
 }
 
-/// Application-provided HTTP transport used by the pure web pipeline.
+/// Stable identity of one document-conversion cache lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentCacheRequest {
+	/// Digest of the source bytes, never a source path or content snippet.
+	pub source_digest:     Hash32,
+	/// Stable converter identity.
+	pub converter:         &'static str,
+	/// Converter implementation and cache-schema version.
+	pub converter_version: &'static str,
+}
+
+/// Opaque typed location of one cached conversion artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentCacheLocation {
+	/// Versioned cache-key digest.
+	pub key:  Hash32,
+	/// Content-addressed blob retained by the entry, when present.
+	pub blob: Option<Hash32>,
+}
+
+/// One conversion artifact returned identically after lookup or publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachedDocument {
+	/// Serialized typed conversion.
+	pub content:  Bytes,
+	/// Durable cache location.
+	pub location: DocumentCacheLocation,
+}
+
+/// Application-provided HTTP transport and document-cache boundary used by the
+/// pure web pipeline.
 pub trait HttpClient {
 	/// Performs a bounded GET request without allocating a boxed future.
 	fn get(
 		&self,
 		request: HttpRequest,
 	) -> impl Future<Output = Result<HttpResponse, WebError>> + Send + '_;
+
+	/// Looks up a converted document. Stateless transports may decline caching;
+	/// the production environment overrides this with the user-wide store.
+	fn document_cache_get(
+		&self,
+		_request: DocumentCacheRequest,
+	) -> impl Future<Output = Option<CachedDocument>> + Send + '_ {
+		ready(None)
+	}
+
+	/// Atomically publishes a successful conversion and returns that same typed
+	/// artifact. Conversion failures never call this method.
+	fn document_cache_put(
+		&self,
+		_request: DocumentCacheRequest,
+		_content: Bytes,
+	) -> impl Future<Output = Option<CachedDocument>> + Send + '_ {
+		ready(None)
+	}
 }
 
 /// Cleans repeated blank lines and caps rendered output.

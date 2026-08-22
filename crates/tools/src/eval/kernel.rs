@@ -21,9 +21,9 @@
 //! whole cell without covering anything the async interrupt cannot.
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	sync::{
-		Arc, LazyLock,
+		Arc, LazyLock, Weak,
 		atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 	},
 	thread,
@@ -45,16 +45,20 @@ use pyo3::{
 	prelude::*,
 	pyclass, pymethods,
 	sync::PyOnceLock,
-	types::{PyAnyMethods, PyDict, PyDictMethods, PyModule},
+	types::{PyAnyMethods, PyByteArray, PyBytes, PyDict, PyDictMethods, PyModule, PyTuple},
 };
 use serde_json::Value;
 use tokio::{runtime::Handle, sync::Mutex as AsyncMutex};
 
+#[cfg(test)]
+use super::RuntimeSnapshot;
 use super::{
-	CellOutcome, CellStatus, CellValue, EvalExec, EvalRun, Fault, OutputChannel, PythonException,
-	RunCompletion, RunEvent, RunRequest, Session, Update,
+	CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, OutputChannel,
+	PythonException, RunCompletion, RunEvent, RunRequest, Session, Update,
 	idle_timeout::{TimeoutHandle, TimeoutPause},
 };
+
+const MAX_DISPLAY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 const BOOTSTRAP: &std::ffi::CStr = c_str!(
 	r#"
@@ -333,7 +337,37 @@ async def _omp_run_async(code, ns, want_value, sink):
 def _omp_run(code, ns, want_value, sink):
     if code is None:
         return None
-    return ns["__omp_async_runner"].run(_omp_run_async(code, ns, want_value, sink))
+    runner = ns["__omp_async_runner"]
+    coro = _omp_run_async(code, ns, want_value, sink)
+    try:
+        return runner.run(coro)
+    except BaseException:
+        # An asynchronously raised KeyboardInterrupt can land in the runner's
+        # own plumbing instead of the cell's frames. The cell task is then
+        # left scheduled on the persistent loop and the next cell would run
+        # it first; cancel and drain exactly that task before re-raising.
+        loop = getattr(runner, "_loop", None)
+        if loop is not None and not loop.is_closed():
+            for task in _omp_asyncio.all_tasks(loop):
+                if task.get_coro() is coro and not task.done():
+                    task.cancel()
+                    try:
+                        loop.run_until_complete(task)
+                    except BaseException:
+                        pass
+        raise
+
+def _omp_apply_runtime(cwd, managed_env):
+    if cwd is not None:
+        _omp_os.chdir(cwd)
+        while cwd in _omp_sys.path:
+            _omp_sys.path.remove(cwd)
+        _omp_sys.path.insert(0, cwd)
+    for key, value in managed_env.items():
+        if value is None:
+            _omp_os.environ.pop(key, None)
+        else:
+            _omp_os.environ[key] = value
 
 def _omp_run_cell(source, ns, timeout_control, sink):
     started = _omp_time.perf_counter()
@@ -360,7 +394,8 @@ def _omp_run_cell(source, ns, timeout_control, sink):
                     result_json = None
                 if any(hasattr(value, name) for name in (
                     "_repr_mimebundle_", "_repr_json_", "_repr_markdown_",
-                    "_repr_html_", "_repr_svg_", "_repr_latex_",
+                    "_repr_html_", "_repr_svg_", "_repr_png_", "_repr_jpeg_",
+                    "_repr_latex_",
                 )):
                     presenter = ns.get("display")
                     if callable(presenter):
@@ -499,9 +534,12 @@ impl WorkerState {
 	}
 
 	fn interrupt_if_active(&self, target: &Arc<AtomicBool>) -> Result<(), Fault> {
-		if !self
-			.active
-			.lock()
+		// Raise while holding the registration lock: the worker removes its
+		// registration under this lock before its thread can finish the cell
+		// and exit, so the loaded ident always names a live worker thread and
+		// the exception can never land on a recycled thread id.
+		let active = self.active.lock();
+		if !active
 			.as_ref()
 			.is_some_and(|active| Arc::ptr_eq(&active.cancelled, target))
 		{
@@ -789,11 +827,19 @@ impl DisplayCollector {
 		self.entries.lock().clear();
 	}
 
-	fn drain(&self, py: Python<'_>) -> PyResult<Vec<super::DisplayOutput>> {
+	fn drain(&self, py: Python<'_>) -> PyResult<(Vec<DisplayOutput>, HashSet<usize>)> {
 		let entries = std::mem::take(&mut *self.entries.lock());
 		let mut outputs = Vec::with_capacity(entries.len());
+		let mut displayed_figures = HashSet::new();
 		for (value, raw) in entries {
 			let bound = value.bind(py);
+			if !raw && is_matplotlib_figure(bound)? {
+				if let Ok(Some(output)) = render_matplotlib_figure(py, bound) {
+					displayed_figures.insert(bound.as_ptr() as usize);
+					outputs.push(output);
+				}
+				continue;
+			}
 			if raw {
 				if let Ok(bundle) = bound.cast::<PyDict>()
 					&& let Some(output) = display_bundle(py, bundle)?
@@ -809,14 +855,14 @@ impl DisplayCollector {
 				continue;
 			}
 			if let Some(data) = python_to_json(py, bound)? {
-				outputs.push(super::DisplayOutput::Json { data });
+				outputs.push(DisplayOutput::Json { data });
 			} else {
-				outputs.push(super::DisplayOutput::Markdown {
+				outputs.push(DisplayOutput::Markdown {
 					text: Str::new(bound.repr()?.extract::<String>()?),
 				});
 			}
 		}
-		Ok(outputs)
+		Ok((outputs, displayed_figures))
 	}
 }
 
@@ -829,8 +875,14 @@ fn display_bundle(
 			.map(|event| event.map(|event| super::DisplayOutput::Status { event }));
 	}
 	if let Some(json) = bundle.get_item("application/json")? {
-		return python_to_json(py, &json)
-			.map(|data| data.map(|data| super::DisplayOutput::Json { data }));
+		return python_to_json(py, &json).map(|data| data.map(|data| DisplayOutput::Json { data }));
+	}
+	for mime in ["image/png", "image/jpeg"] {
+		if let Some(image) = bundle.get_item(mime)?
+			&& let Some(data) = bounded_image_bytes(&image)?
+		{
+			return Ok(Some(DisplayOutput::ImageData { data, mime_type: Str::new(mime) }));
+		}
 	}
 	for mime in ["text/markdown", "text/html", "image/svg+xml"] {
 		if let Some(text) = bundle.get_item(mime)? {
@@ -851,12 +903,99 @@ fn display_bundle(
 	Ok(None)
 }
 
+fn bounded_image_bytes(value: &Bound<'_, PyAny>) -> PyResult<Option<CowBytes<'static>>> {
+	let data = if let Ok(bytes) = value.cast::<PyBytes>() {
+		let bytes = bytes.as_bytes();
+		if bytes.is_empty() || bytes.len() > MAX_DISPLAY_IMAGE_BYTES {
+			return Ok(None);
+		}
+		CowBytes::owned(Bytes::copy_from_slice(bytes))
+	} else if let Ok(bytes) = value.cast::<PyByteArray>() {
+		let bytes = bytes.to_vec();
+		if bytes.is_empty() || bytes.len() > MAX_DISPLAY_IMAGE_BYTES {
+			return Ok(None);
+		}
+		CowBytes::owned(Bytes::from(bytes))
+	} else {
+		return Ok(None);
+	};
+	Ok(Some(data))
+}
+
+fn is_matplotlib_figure(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+	let class = value.get_type();
+	Ok(class.module()? == "matplotlib.figure" && class.name()? == "Figure")
+}
+
+fn render_matplotlib_figure(
+	py: Python<'_>,
+	figure: &Bound<'_, PyAny>,
+) -> PyResult<Option<DisplayOutput>> {
+	let io = PyModule::import(py, "io")?;
+	let buffer = io.getattr("BytesIO")?.call0()?;
+	let backend = match PyModule::import(py, "matplotlib.backends.backend_agg") {
+		Ok(backend) => backend,
+		Err(error) if error.is_instance_of::<pyo3::exceptions::PyImportError>(py) => {
+			return Ok(None);
+		},
+		Err(error) => return Err(error),
+	};
+	let canvas = backend.getattr("FigureCanvasAgg")?.call1((figure,))?;
+	canvas.call_method1("print_png", (&buffer,))?;
+	let encoded = buffer.call_method0("getvalue")?;
+	let Some(data) = bounded_image_bytes(&encoded)? else {
+		return Ok(None);
+	};
+	Ok(Some(DisplayOutput::ImageData { data, mime_type: sf!("image/png") }))
+}
+
+fn flush_matplotlib_figures(
+	py: Python<'_>,
+	displayed: &HashSet<usize>,
+) -> PyResult<Vec<DisplayOutput>> {
+	let sys = PyModule::import(py, "sys")?;
+	let modules = sys.getattr("modules")?;
+	let modules = modules.cast::<PyDict>()?;
+	let Some(plt) = modules.get_item("matplotlib.pyplot")? else {
+		return Ok(Vec::new());
+	};
+	let Ok(numbers) = plt.call_method0("get_fignums") else {
+		return Ok(Vec::new());
+	};
+	let mut outputs = Vec::new();
+	for number in numbers.try_iter()? {
+		let number = number?;
+		let figure = match plt.call_method1("figure", (&number,)) {
+			Ok(figure) => figure,
+			Err(_) => continue,
+		};
+		let identity = figure.as_ptr() as usize;
+		if !displayed.contains(&identity)
+			&& let Ok(Some(output)) = render_matplotlib_figure(py, &figure)
+		{
+			outputs.push(output);
+		}
+		let _ = plt.call_method1("close", (&figure,));
+	}
+	Ok(outputs)
+}
+
 fn repr_mime_bundle<'py>(value: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyDict>>> {
 	let py = value.py();
-	if value.hasattr("_repr_mimebundle_")? {
-		let rendered = value.call_method0("_repr_mimebundle_")?;
-		if !rendered.is_none() {
-			return Ok(Some(rendered.cast_into::<PyDict>()?));
+	if value.hasattr("_repr_mimebundle_")?
+		&& let Ok(rendered) = value.call_method0("_repr_mimebundle_")
+		&& !rendered.is_none()
+	{
+		let rendered = if let Ok(tuple) = rendered.cast::<PyTuple>() {
+			let Ok(rendered) = tuple.get_item(0) else {
+				return Ok(None);
+			};
+			rendered
+		} else {
+			rendered
+		};
+		if let Ok(rendered) = rendered.cast_into::<PyDict>() {
+			return Ok(Some(rendered));
 		}
 	}
 	let bundle = PyDict::new(py);
@@ -865,14 +1004,15 @@ fn repr_mime_bundle<'py>(value: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py
 		("_repr_markdown_", "text/markdown"),
 		("_repr_html_", "text/html"),
 		("_repr_svg_", "image/svg+xml"),
+		("_repr_png_", "image/png"),
+		("_repr_jpeg_", "image/jpeg"),
 		("_repr_latex_", "text/latex"),
 	] {
-		if value.hasattr(method)? {
-			let rendered = value.call_method0(method)?;
-			if !rendered.is_none() {
-				bundle.set_item(mime, rendered)?;
-				break;
-			}
+		if value.hasattr(method)?
+			&& let Ok(rendered) = value.call_method0(method)
+			&& !rendered.is_none()
+		{
+			bundle.set_item(mime, rendered)?;
 		}
 	}
 	Ok((!bundle.is_empty()).then_some(bundle))
@@ -1125,6 +1265,200 @@ impl Drop for EmbeddedRun {
 	}
 }
 
+#[cfg(unix)]
+#[derive(Default)]
+struct SigintState {
+	original:  Option<libc::sigaction>,
+	workers:   usize,
+	executing: usize,
+}
+
+#[cfg(unix)]
+static SIGINT_STATE: LazyLock<Mutex<SigintState>> =
+	LazyLock::new(|| Mutex::new(SigintState::default()));
+#[cfg(unix)]
+static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static SIGINT_TARGETS: LazyLock<Mutex<Vec<Weak<WorkerState>>>> =
+	LazyLock::new(|| Mutex::new(Vec::new()));
+#[cfg(unix)]
+static SIGINT_MONITOR: LazyLock<std::io::Result<()>> = LazyLock::new(|| {
+	std::thread::Builder::new()
+		.name("omp-eval-sigint".to_owned())
+		.spawn(|| {
+			loop {
+				if SIGINT_PENDING.swap(false, Ordering::AcqRel) {
+					// Raise while holding the registry lock: executing workers
+					// deregister under this lock before their cell ends, so every
+					// upgraded target still names a live worker thread.
+					let mut targets = SIGINT_TARGETS.lock();
+					targets.retain(|target| target.strong_count() != 0);
+					for target in targets.iter().filter_map(Weak::upgrade) {
+						let _ = target.interrupt_thread();
+					}
+				}
+				std::thread::sleep(StdDuration::from_millis(1));
+			}
+		})
+		.map(drop)
+});
+
+#[cfg(unix)]
+extern "C" fn record_active_sigint(_signal: libc::c_int) {
+	SIGINT_PENDING.store(true, Ordering::Release);
+}
+
+#[cfg(unix)]
+fn set_sigint_action(action: &libc::sigaction) -> PyResult<()> {
+	// SAFETY: `action` is a fully initialized sigaction and the call borrows it.
+	if unsafe { libc::sigaction(libc::SIGINT, action, std::ptr::null_mut()) } == 0 {
+		Ok(())
+	} else {
+		Err(pyo3::exceptions::PyOSError::new_err(std::io::Error::last_os_error().to_string()))
+	}
+}
+
+#[cfg(unix)]
+fn active_sigint_action() -> libc::sigaction {
+	// SAFETY: zero is a valid starting state before sigemptyset initializes the
+	// mask.
+	let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+	action.sa_sigaction = record_active_sigint as *const () as usize;
+	// SAFETY: `sa_mask` points to initialized storage owned by `action`.
+	unsafe { libc::sigemptyset(&mut action.sa_mask) };
+	action
+}
+
+#[cfg(unix)]
+fn ignored_sigint_action() -> libc::sigaction {
+	// SAFETY: zero is a valid starting state before sigemptyset initializes the
+	// mask.
+	let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+	action.sa_sigaction = libc::SIG_IGN;
+	// SAFETY: `sa_mask` points to initialized storage owned by `action`.
+	unsafe { libc::sigemptyset(&mut action.sa_mask) };
+	action
+}
+
+struct IdleSigint {
+	#[cfg(unix)]
+	registered: bool,
+}
+
+impl IdleSigint {
+	fn install() -> PyResult<Self> {
+		#[cfg(unix)]
+		{
+			let mut state = SIGINT_STATE.lock();
+			if state.workers == 0 {
+				// SAFETY: `current` is writable storage populated by sigaction.
+				let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+				// SAFETY: the null action queries SIGINT without changing it.
+				if unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) } != 0 {
+					return Err(pyo3::exceptions::PyOSError::new_err(
+						std::io::Error::last_os_error().to_string(),
+					));
+				}
+				state.original = Some(current);
+				set_sigint_action(&ignored_sigint_action())?;
+			}
+			state.workers += 1;
+			if let Err(error) = LazyLock::force(&SIGINT_MONITOR) {
+				state.workers -= 1;
+				if state.workers == 0
+					&& let Some(original) = state.original.take()
+				{
+					let _ = set_sigint_action(&original);
+				}
+				return Err(pyo3::exceptions::PyOSError::new_err(error.to_string()));
+			}
+		}
+		Ok(Self {
+			#[cfg(unix)]
+			registered:              true,
+		})
+	}
+
+	fn executing(&self, target: Option<&Arc<WorkerState>>) -> PyResult<ExecutingSigint<'_>> {
+		#[cfg(unix)]
+		{
+			let target = target.map(Arc::downgrade);
+			if let Some(target) = target.as_ref() {
+				SIGINT_TARGETS.lock().push(target.clone());
+			}
+			let mut state = SIGINT_STATE.lock();
+			if state.executing == 0
+				&& let Err(error) = set_sigint_action(&active_sigint_action())
+			{
+				drop(state);
+				if let Some(target) = target.as_ref() {
+					SIGINT_TARGETS
+						.lock()
+						.retain(|candidate| !Weak::ptr_eq(candidate, target));
+				}
+				return Err(error);
+			}
+			state.executing += 1;
+			return Ok(ExecutingSigint { idle: self, target });
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = target;
+			Ok(ExecutingSigint { idle: self })
+		}
+	}
+}
+
+impl Drop for IdleSigint {
+	fn drop(&mut self) {
+		#[cfg(unix)]
+		if self.registered {
+			let last = {
+				let mut state = SIGINT_STATE.lock();
+				state.workers = state.workers.saturating_sub(1);
+				if state.workers == 0 {
+					if let Some(original) = state.original.take() {
+						let _ = set_sigint_action(&original);
+					}
+					state.executing = 0;
+					true
+				} else {
+					false
+				}
+			};
+			if last {
+				SIGINT_PENDING.store(false, Ordering::Release);
+				SIGINT_TARGETS.lock().clear();
+			}
+		}
+	}
+}
+
+struct ExecutingSigint<'a> {
+	idle:   &'a IdleSigint,
+	#[cfg(unix)]
+	target: Option<Weak<WorkerState>>,
+}
+
+impl Drop for ExecutingSigint<'_> {
+	fn drop(&mut self) {
+		let _ = self.idle;
+		#[cfg(unix)]
+		{
+			if let Some(target) = self.target.as_ref() {
+				SIGINT_TARGETS
+					.lock()
+					.retain(|candidate| !Weak::ptr_eq(candidate, target));
+			}
+			let mut state = SIGINT_STATE.lock();
+			state.executing = state.executing.saturating_sub(1);
+			if state.executing == 0 && state.workers != 0 {
+				let _ = set_sigint_action(&ignored_sigint_action());
+			}
+		}
+	}
+}
+
 struct WorkerAlive<'a>(&'a AtomicBool);
 
 impl Drop for WorkerAlive<'_> {
@@ -1152,7 +1486,14 @@ fn worker_main(
 				return;
 			},
 		};
-		let (runner, namespace_factory) = setup;
+		let (runner, namespace_factory, apply_runtime) = setup;
+		let idle_sigint = match IdleSigint::install() {
+			Ok(disposition) => disposition,
+			Err(error) => {
+				fail_worker(&commands, Str::new(format_python_error(py, error)));
+				return;
+			},
+		};
 		let mut namespace = match new_namespace(py, &namespace_factory, installer) {
 			Ok(namespace) => namespace,
 			Err(error) => {
@@ -1162,13 +1503,17 @@ fn worker_main(
 		};
 
 		while let Ok(command) = py.detach(|| commands.recv()) {
-			let _ = command
-				.events
-				.send(Ok(RunEvent::Started { cell_id: command.cell_id.clone() }));
+			// A cancellation may land while this command is queued behind an
+			// active cell. Observe it before publishing Started: otherwise a
+			// never-active cell appears live and its cancellation can be mistaken
+			// for an interrupt of the preceding cell.
 			if command_is_stale(state, &command) && !command.request.reset {
 				send_cancelled(&command);
 				continue;
 			}
+			let _ = command
+				.events
+				.send(Ok(RunEvent::Started { cell_id: command.cell_id.clone() }));
 			{
 				let mut active = state.active.lock();
 				*active = Some(ActiveCell {
@@ -1200,7 +1545,16 @@ fn worker_main(
 				send_cancelled(&command);
 				continue;
 			}
-			let result = execute_cell(py, &runner, &namespace, &command, state, installer);
+			let result = execute_cell(
+				py,
+				&runner,
+				&apply_runtime,
+				&namespace,
+				&command,
+				state,
+				installer,
+				&idle_sigint,
+			);
 			clear_active(state, &command.cancelled);
 			match result {
 				Ok(completion) if command.timed_out.load(Ordering::Acquire) => {
@@ -1284,11 +1638,15 @@ fn timed_out_completion(mut completion: RunCompletion) -> RunCompletion {
 	completion
 }
 
-fn prepare_python(py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+fn prepare_python(py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
 	ensure_output_routers(py)?;
 	let module = PyModule::from_code(py, BOOTSTRAP, c_str!("<omp-eval>"), c_str!("_omp_eval"))?;
 	module.setattr("_OMP_SINK", sink_var(py)?)?;
-	Ok((module.getattr("_omp_run_cell")?.unbind(), module.getattr("_omp_new_namespace")?.unbind()))
+	Ok((
+		module.getattr("_omp_run_cell")?.unbind(),
+		module.getattr("_omp_new_namespace")?.unbind(),
+		module.getattr("_omp_apply_runtime")?.unbind(),
+	))
 }
 
 fn ensure_output_routers(py: Python<'_>) -> PyResult<()> {
@@ -1378,13 +1736,28 @@ fn spawn_watchdog(
 fn execute_cell(
 	py: Python<'_>,
 	runner: &Py<PyAny>,
+	apply_runtime: &Py<PyAny>,
 	namespace: &Py<PyDict>,
 	command: &Command,
 	state: &Arc<WorkerState>,
 	installer: &dyn NamespaceInstaller,
+	idle_sigint: &IdleSigint,
 ) -> PyResult<RunCompletion> {
 	let request = &command.request;
 	let cell_id = &command.cell_id;
+	let _executing_sigint = idle_sigint.executing(Some(state))?;
+	let managed_env = PyDict::new(py);
+	for (key, value) in &request.runtime.managed_env {
+		managed_env.set_item(key.as_str(), value.as_ref().map(Str::as_str))?;
+	}
+	match request.runtime.cwd.as_deref() {
+		Some(cwd) => {
+			apply_runtime.bind(py).call1((cwd, &managed_env))?;
+		},
+		None => {
+			apply_runtime.bind(py).call1((py.None(), &managed_env))?;
+		},
+	}
 	let display = namespace
 		.bind(py)
 		.get_item("__omp_display")?
@@ -1452,7 +1825,10 @@ fn execute_cell(
 		.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("duration_ms"))?
 		.extract::<u64>()?;
 
-	let display_outputs = display.borrow(py).drain(py)?;
+	let (mut display_outputs, displayed_figures) = display.borrow(py).drain(py)?;
+	if outcome == CellOutcome::Complete {
+		display_outputs.extend(flush_matplotlib_figures(py, &displayed_figures)?);
+	}
 	Ok(RunCompletion {
 		status: CellStatus {
 			outcome,
@@ -1529,15 +1905,57 @@ fn format_python_error(py: Python<'_>, error: pyo3::PyErr) -> String {
 mod tests {
 	use std::sync::{Arc, LazyLock};
 
+	use parking_lot::RwLock;
+
 	use super::*;
 
 	static ENGINE: LazyLock<Arc<Engine>> =
 		LazyLock::new(|| Arc::new(Engine::builder().init().expect("embedded Python boots")));
 	const TEST_INTERRUPT_GRACE: Duration = Duration::new(1, omp_core::DurationUnit::Milliseconds);
+	/// Every test worker shares one embedded interpreter, so SIGINT disposition
+	/// and delivery plus `sys.modules` are process-global. Cell-running tests
+	/// hold this shared; tests that mutate that global state hold it exclusively
+	/// so their side effects cannot knife concurrently executing cells.
+	static PROCESS_GLOBALS: RwLock<()> = RwLock::new(());
 
 	fn runtime() -> EmbeddedPython {
 		EmbeddedPython::new(Arc::clone(&ENGINE), TEST_INTERRUPT_GRACE)
 			.expect("test interrupt grace is representable")
+	}
+
+	#[cfg(unix)]
+	fn sigint_handler() -> usize {
+		// SAFETY: `current` is writable storage populated by sigaction.
+		let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+		// SAFETY: the null action queries SIGINT without changing it.
+		assert_eq!(unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) }, 0,);
+		current.sa_sigaction
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn sigint_disposition_restores_idle_on_every_exit_path() {
+		let _globals = PROCESS_GLOBALS.write();
+		LazyLock::force(&ENGINE);
+		let original = sigint_handler();
+		let idle = IdleSigint::install().expect("idle SIGINT installs");
+		assert_eq!(sigint_handler(), libc::SIG_IGN);
+
+		{
+			let _executing = idle.executing(None).expect("executing SIGINT installs");
+			assert_eq!(sigint_handler(), record_active_sigint as *const () as usize);
+		}
+		assert_eq!(sigint_handler(), libc::SIG_IGN);
+
+		let failed = (|| -> PyResult<()> {
+			let _executing = idle.executing(None)?;
+			Err(pyo3::exceptions::PyRuntimeError::new_err("cell failed"))
+		})();
+		assert!(failed.is_err());
+		assert_eq!(sigint_handler(), libc::SIG_IGN);
+
+		drop(idle);
+		assert_eq!(sigint_handler(), original);
 	}
 
 	#[test]
@@ -1561,6 +1979,7 @@ mod tests {
 				code: Str::new(code),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("cell starts");
@@ -1598,6 +2017,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn state_persists_then_reset_replaces_namespace() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let (_, first) = run_to_completion(&runtime, &session, "answer = 40", false).await;
@@ -1610,6 +2030,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn stdout_stderr_and_result_keep_separate_boundaries() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let (updates, done) = run_to_completion(
@@ -1713,6 +2134,7 @@ with ThreadPoolExecutor(max_workers=1) as pool:
 
 	#[tokio::test]
 	async fn independent_sessions_execute_concurrently_without_output_cross_talk() {
+		let _globals = PROCESS_GLOBALS.read();
 		const BARRIER_MODULE: &str = "_omp_eval_parallel_barrier";
 		install_barrier(BARRIER_MODULE);
 
@@ -1759,6 +2181,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn sys_stream_reassignment_is_isolated_to_the_owning_worker() {
+		let _globals = PROCESS_GLOBALS.read();
 		const BARRIER_MODULE: &str = "_omp_eval_stream_barrier";
 		install_barrier(BARRIER_MODULE);
 
@@ -1788,6 +2211,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn failed_cell_keeps_prior_state_and_structured_traceback() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		run_to_completion(&runtime, &session, "kept = 7", false).await;
@@ -1801,8 +2225,45 @@ print("right")"#
 		assert_eq!(after.result.expect("result").text, "7");
 	}
 
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn idle_sigint_is_harmless_and_active_sigint_cancels_the_cell() {
+		let _globals = PROCESS_GLOBALS.write();
+		let runtime = runtime();
+		let session = runtime.open_session().await.expect("session opens");
+		let mut run = runtime
+			.run(&session, RunRequest {
+				code:    sf!("print('running', flush=True)\nwhile True: pass"),
+				timeout: Some(StdDuration::from_secs(2)),
+				reset:   false,
+				runtime: RuntimeSnapshot::default(),
+			})
+			.await
+			.expect("active cell starts");
+		loop {
+			match run.next_event().await.expect("active event") {
+				Some(RunEvent::Output(_)) => break,
+				Some(RunEvent::Started { .. }) => {},
+				Some(RunEvent::Completed(done)) => {
+					panic!("cell completed before SIGINT: {:?}", done.status)
+				},
+				None => panic!("cell ended before SIGINT"),
+			}
+		}
+		// SAFETY: this test process installed the CPython execution disposition
+		// before publishing the observed output above.
+		assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0);
+		assert_eq!(completion(&mut run).await.status.outcome, CellOutcome::Cancelled);
+
+		// The completion path must restore idle protection before the next cell.
+		assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0);
+		let (_, next) = run_to_completion(&runtime, &session, "6 * 7", false).await;
+		assert_eq!(next.result.expect("idle SIGINT preserved kernel").json, Some(Value::from(42)));
+	}
+
 	#[tokio::test]
 	async fn cancel_before_a_queued_cell_becomes_active_is_not_lost() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let mut active = runtime
@@ -1810,6 +2271,7 @@ print("right")"#
 				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("active cell starts");
@@ -1820,6 +2282,7 @@ print("right")"#
 				code:    sf!("queued_effect = True"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("queued cell accepted");
@@ -1830,11 +2293,18 @@ print("right")"#
 		assert_eq!(completion(&mut queued).await.status.outcome, CellOutcome::Cancelled);
 		let (_, observed) =
 			run_to_completion(&runtime, &session, "'queued_effect' in globals()", false).await;
-		assert_eq!(observed.result.expect("boolean result").json, Some(Value::Bool(false)));
+		assert_eq!(
+			observed
+				.result
+				.unwrap_or_else(|| panic!("boolean result: {:?}", observed.status))
+				.json,
+			Some(Value::Bool(false))
+		);
 	}
 
 	#[tokio::test]
 	async fn reset_interrupts_active_work_invalidates_queued_cells_and_recreates_state() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		run_to_completion(&runtime, &session, "kept = 7", false).await;
@@ -1843,6 +2313,7 @@ print("right")"#
 				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("active cell starts");
@@ -1852,6 +2323,7 @@ print("right")"#
 				code:    sf!("stale_effect = True"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("stale cell queues");
@@ -1860,6 +2332,7 @@ print("right")"#
 				code:    sf!("('kept' in globals(), 'stale_effect' in globals())"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   true,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("reset cell queues");
@@ -1872,6 +2345,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn timeout_and_dropped_run_leave_the_worker_available_for_the_next_cell() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let mut timed_out = runtime
@@ -1879,6 +2353,7 @@ print("right")"#
 				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_millis(25)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("timed cell starts");
@@ -1889,6 +2364,7 @@ print("right")"#
 				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("dropped cell starts");
@@ -1901,6 +2377,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn top_level_await_returns_the_final_expression() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let (_, done) = run_to_completion(
@@ -1915,7 +2392,184 @@ print("right")"#
 	}
 
 	#[tokio::test]
+	async fn runtime_snapshots_replace_cwd_and_managed_environment() {
+		let _globals = PROCESS_GLOBALS.read();
+		let runtime = runtime();
+		let session = runtime.open_session().await.expect("session opens");
+		let original = std::env::current_dir().expect("current directory");
+		let first = tempfile::tempdir().expect("first runtime directory");
+		let second = tempfile::tempdir().expect("second runtime directory");
+		let snapshot = |cwd: &std::path::Path, session_file: Option<&str>| RuntimeSnapshot {
+			cwd:         Some(cwd.to_path_buf()),
+			managed_env: [
+				(sf!("OMP_ARTIFACTS_DIR"), None),
+				(sf!("OMP_EVAL_LOCAL_ROOTS"), None),
+				(sf!("OMP_SESSION_FILE"), session_file.map(Str::new)),
+			]
+			.into_iter()
+			.collect(),
+		};
+		let mut first_run = runtime
+			.run(&session, RunRequest {
+				code:    sf!("import os\n(os.getcwd(), os.environ.get('OMP_SESSION_FILE'))"),
+				timeout: Some(StdDuration::from_secs(2)),
+				reset:   false,
+				runtime: snapshot(first.path(), Some("first")),
+			})
+			.await
+			.expect("first runtime starts");
+		let first_done = completion(&mut first_run).await;
+		assert_eq!(
+			first_done.result.expect("first result").json,
+			Some(serde_json::json!([
+				first
+					.path()
+					.canonicalize()
+					.expect("canonical first")
+					.to_string_lossy(),
+				"first"
+			])),
+		);
+
+		let mut second_run = runtime
+			.run(&session, RunRequest {
+				code:    sf!("import os\n(os.getcwd(), os.environ.get('OMP_SESSION_FILE') is None)"),
+				timeout: Some(StdDuration::from_secs(2)),
+				reset:   false,
+				runtime: snapshot(second.path(), None),
+			})
+			.await
+			.expect("second runtime starts");
+		let second_done = completion(&mut second_run).await;
+		assert_eq!(
+			second_done.result.expect("second result").json,
+			Some(serde_json::json!([
+				second
+					.path()
+					.canonicalize()
+					.expect("canonical second")
+					.to_string_lossy(),
+				true
+			])),
+		);
+
+		let mut restore = runtime
+			.run(&session, RunRequest {
+				code:    sf!("None"),
+				timeout: Some(StdDuration::from_secs(2)),
+				reset:   false,
+				runtime: snapshot(&original, None),
+			})
+			.await
+			.expect("restoration starts");
+		assert_eq!(completion(&mut restore).await.status.outcome, CellOutcome::Complete);
+	}
+
+	#[tokio::test]
+	async fn binary_repr_and_raw_mime_bundles_preserve_exact_bytes() {
+		let _globals = PROCESS_GLOBALS.read();
+		let runtime = runtime();
+		let session = runtime.open_session().await.expect("session opens");
+		let (_, done) = run_to_completion(
+			&runtime,
+			&session,
+			concat!(
+				"class Png:\n",
+				"    def _repr_png_(self): return bytes([0, 159, 255])\n",
+				"class Jpeg:\n",
+				"    def _repr_jpeg_(self): return bytes([1, 128, 254])\n",
+				"class Bundle:\n",
+				"    def _repr_mimebundle_(self):\n",
+				"        return ({'image/png': bytes([2, 129, 253])}, {})\n",
+				"__omp_display(Png())\n",
+				"__omp_display(Jpeg())\n",
+				"__omp_display(Bundle())\n",
+				"__omp_display({'image/jpeg': bytearray([3, 130, 252])}, raw=True)",
+			),
+			false,
+		)
+		.await;
+		let images = done
+			.display_outputs
+			.into_iter()
+			.map(|output| match output {
+				DisplayOutput::ImageData { data, mime_type } => (data.to_vec(), mime_type),
+				other => panic!("unexpected display output: {other:?}"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(images, vec![
+			(vec![0, 159, 255], sf!("image/png")),
+			(vec![1, 128, 254], sf!("image/jpeg")),
+			(vec![2, 129, 253], sf!("image/png")),
+			(vec![3, 130, 252], sf!("image/jpeg")),
+		]);
+	}
+
+	#[tokio::test]
+	async fn matplotlib_figures_render_through_agg_without_duplicates() {
+		let _globals = PROCESS_GLOBALS.write();
+		let runtime = runtime();
+		let session = runtime.open_session().await.expect("session opens");
+		let (_, done) = run_to_completion(
+			&runtime,
+			&session,
+			r#"
+import sys, types
+matplotlib = types.ModuleType("matplotlib")
+matplotlib.__path__ = []
+backends = types.ModuleType("matplotlib.backends")
+backends.__path__ = []
+backend = types.ModuleType("matplotlib.backends.backend_agg")
+class Figure:
+    pass
+Figure.__module__ = "matplotlib.figure"
+first = Figure()
+first.marker = 1
+second = Figure()
+second.marker = 2
+class FigureCanvasAgg:
+    def __init__(self, value):
+        self.value = value
+    def print_png(self, buffer):
+        buffer.write(bytes([137, 80, 78, 71, self.value.marker, 255]))
+backend.FigureCanvasAgg = FigureCanvasAgg
+pyplot = types.ModuleType("matplotlib.pyplot")
+pyplot.get_fignums = lambda: [1, 2]
+pyplot.figure = lambda number: first if number == 1 else second
+pyplot.close = lambda value: None
+sys.modules["matplotlib"] = matplotlib
+sys.modules["matplotlib.backends"] = backends
+sys.modules["matplotlib.backends.backend_agg"] = backend
+sys.modules["matplotlib.pyplot"] = pyplot
+__omp_display(first)
+"#,
+			false,
+		)
+		.await;
+		run_to_completion(
+			&runtime,
+			&session,
+			"import sys\nfor name in ('matplotlib', 'matplotlib.backends', \
+			 'matplotlib.backends.backend_agg', 'matplotlib.pyplot'):\n    sys.modules.pop(name, \
+			 None)",
+			false,
+		)
+		.await;
+		assert_eq!(done.display_outputs, vec![
+			DisplayOutput::ImageData {
+				data:      CowBytes::owned(Bytes::from_static(b"\x89PNG\x01\xff")),
+				mime_type: sf!("image/png"),
+			},
+			DisplayOutput::ImageData {
+				data:      CowBytes::owned(Bytes::from_static(b"\x89PNG\x02\xff")),
+				mime_type: sf!("image/png"),
+			},
+		],);
+	}
+
+	#[tokio::test]
 	async fn display_collector_preserves_json_and_status_boundaries() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let (_, done) = run_to_completion(
@@ -1939,6 +2593,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn timeout_pause_excludes_host_wait_and_resume_starts_a_fresh_window() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let mut run = runtime
@@ -1952,6 +2607,7 @@ print("right")"#
 				)),
 				timeout: Some(StdDuration::from_millis(100)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("paused cell starts");
@@ -1962,6 +2618,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn sessions_have_isolated_persistent_namespaces() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let first = runtime.open_session().await.expect("first session opens");
 		let second = runtime.open_session().await.expect("second session opens");
@@ -1998,6 +2655,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn poisoned_worker_is_recreated_on_the_next_cell() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = EmbeddedPython::with_installer(
 			Arc::clone(&ENGINE),
 			Arc::new(FailFirstCell(AtomicBool::new(true))),
@@ -2010,6 +2668,7 @@ print("right")"#
 				code:    sf!("1"),
 				timeout: Some(StdDuration::from_secs(1)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("first cell accepted");
@@ -2022,6 +2681,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn cancelling_the_reset_cell_does_not_restore_the_old_namespace() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		run_to_completion(&runtime, &session, "old_state = 1", false).await;
@@ -2030,6 +2690,7 @@ print("right")"#
 				code:    sf!("while True: pass"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("active cell starts");
@@ -2039,6 +2700,7 @@ print("right")"#
 				code:    sf!("'old_state' in globals()"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   true,
+				runtime: RuntimeSnapshot::default(),
 			})
 			.await
 			.expect("reset accepted");
@@ -2052,6 +2714,7 @@ print("right")"#
 	}
 	#[tokio::test]
 	async fn cancelling_one_worker_does_not_interrupt_another_session() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let first_session = runtime.open_session().await.expect("first session opens");
 		let second_session = runtime.open_session().await.expect("second session opens");
@@ -2059,6 +2722,7 @@ print("right")"#
 			code:    sf!("while True: pass"),
 			timeout: Some(StdDuration::from_secs(2)),
 			reset:   false,
+			runtime: RuntimeSnapshot::default(),
 		};
 		let mut first = runtime
 			.run(&first_session, request())
@@ -2085,6 +2749,7 @@ print("right")"#
 
 	#[tokio::test]
 	async fn ipython_style_line_magics_preserve_the_namespace() {
+		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
 		let (_, env_set) =

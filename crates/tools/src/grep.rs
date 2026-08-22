@@ -360,6 +360,15 @@ pub trait WorkspaceSearch: Send + Sync + 'static {
 		&self,
 		request: crate::glob::WalkRequest,
 	) -> impl Future<Output = Result<crate::glob::WalkResult, crate::glob::Fault>> + Send + '_;
+	/// Attempts a resolver-backed glob such as `ssh://`; `None` keeps ordinary
+	/// workspace dispatch or reports an unsupported scheme.
+	fn glob_resource(
+		&self,
+		_request: crate::glob::WalkRequest,
+	) -> impl Future<Output = Option<Result<crate::glob::WalkResult, crate::glob::Fault>>> + Send + '_
+	{
+		std::future::ready(None)
+	}
 }
 
 /// Generic `grep@1` executor over environment-owned workspace and blob

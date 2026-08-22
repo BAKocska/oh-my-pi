@@ -19,6 +19,7 @@
     { "member": "SECURITY", "wire": ["security"], "selectors": true },
     { "member": "VAULT", "wire": ["vault"], "selectors": true },
     { "member": "JOB", "wire": ["job"], "selectors": true },
+    { "member": "ATTACHMENT", "wire": ["attachment"], "selectors": true },
     { "member": "CONFLICT", "wire": ["conflict"], "selectors": true },
     { "member": "UNKNOWN", "wire": [], "selectors": false }
   ]

@@ -260,14 +260,20 @@ fn selector_fixture_docx() -> Vec<u8> {
 async fn read_tool_dispatches_docx_bytes_and_applies_line_selectors_to_converted_text() {
 	let output =
 		read_document_tool_text("fixture.docx:3-3", "fixture.docx", selector_fixture_docx()).await;
-	assert_eq!(output, "2:\n3:alpha\n4:\n5:beta\n6:\n\n[3 more lines in file. Use :7 to continue]");
+	assert_eq!(
+		output,
+		"2:# Range Fixture\n3:\n4:alpha\n5:\n6:beta\n\n[4 more lines in file. Use :7 to continue]"
+	);
 }
 
 #[tokio::test]
 async fn raw_document_reads_bypass_numbering_but_not_document_conversion() {
 	let output =
 		read_document_tool_text("fixture.docx:raw", "fixture.docx", selector_fixture_docx()).await;
-	assert_eq!(output, "# Range Fixture\n\nalpha\n\nbeta\n\ngamma\n\ndelta");
+	assert_eq!(
+		output,
+		"Content-Type: text/markdown\n# Range Fixture\n\nalpha\n\nbeta\n\ngamma\n\ndelta"
+	);
 }
 
 #[tokio::test]
@@ -278,7 +284,7 @@ async fn read_tool_routes_new_document_extensions_through_markit() {
 		br"{\rtf1\ansi Local RTF document\par}".to_vec(),
 	)
 	.await;
-	assert_eq!(output, "Local RTF document\n");
+	assert_eq!(output, "Content-Type: text/markdown\nLocal RTF document\n");
 }
 
 #[tokio::test]
@@ -294,8 +300,8 @@ async fn converted_document_truncation_spills_the_complete_numbered_markdown() {
 	let converted = markit::convert(Path::new("large.docx"), &bytes)
 		.expect("large DOCX conversion succeeds")
 		.expect("DOCX is supported");
-	let numbered = converted
-		.text
+	let framed = format!("Content-Type: text/markdown\n{}", converted.text);
+	let numbered = framed
 		.split("\n")
 		.enumerate()
 		.map(|(index, line)| format!("{}:{line}", index + 1))

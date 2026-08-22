@@ -150,7 +150,7 @@ fn caps(tool: &impl Tool) -> PromptCaps {
 }
 
 async fn invoke(fake: Fake, input: &str) -> (omp_tools::edit::Payload, Vec<Part>) {
-	let edit = tool(fake, FormatPolicy::Configured);
+	let edit = tool(fake, FormatPolicy::BestEffort);
 	let raw = serde_json::json!({ "input": input }).to_string();
 	let (feed, incoming) = IncomingParams::channel();
 	feed.arg_text(raw.clone().into()).unwrap();
@@ -176,7 +176,7 @@ fn text(parts: &[Part]) -> &str {
 
 #[test]
 fn generated_schema_is_semantically_the_pi_edit_schema() {
-	let edit = tool(Fake::with_files(&[]), FormatPolicy::Configured);
+	let edit = tool(Fake::with_files(&[]), FormatPolicy::BestEffort);
 	let actual: serde_json::Value =
 		serde_json::from_slice(&edit.spec().schema).expect("edit schema JSON");
 	assert_eq!(
@@ -209,7 +209,7 @@ fn generated_schema_is_semantically_the_pi_edit_schema() {
 #[tokio::test]
 async fn committed_unknown_fields_are_rejected_before_edit_effects() {
 	let fake = Fake::with_files(&[("a.txt", b"one\n")]);
-	let edit = tool(fake.clone(), FormatPolicy::Configured);
+	let edit = tool(fake.clone(), FormatPolicy::BestEffort);
 	let tag = compute_snapshot_tag(b"one\n");
 	let raw = serde_json::json!({
 		"input": format!("[a.txt#{tag}]\nPUT 1.=1:\n+two"),
@@ -334,7 +334,7 @@ async fn byte_identical_put_escalates_from_exact_soft_diagnostic_to_loop_guard_f
 		);
 	}
 
-	let edit = tool(fake.clone(), FormatPolicy::Configured);
+	let edit = tool(fake.clone(), FormatPolicy::BestEffort);
 	let raw = serde_json::json!({ "input": input }).to_string();
 	let (feed, incoming) = IncomingParams::channel();
 	feed.arg_text(raw.clone().into()).unwrap();
@@ -373,7 +373,7 @@ async fn stale_tag_and_transaction_conflict_messages_are_projected_verbatim() {
 		reason:    RejectionReason::StaleUnrecoverable { message: mismatch.to_string().into() },
 		conflicts: Vec::new(),
 	};
-	let edit = tool(Fake::with_files(&[]), FormatPolicy::Configured);
+	let edit = tool(Fake::with_files(&[]), FormatPolicy::BestEffort);
 	assert_eq!(text(&edit.prompt(Err(&stale), &caps(&edit))), mismatch.display_message());
 
 	let conflict = Fault {
@@ -393,7 +393,7 @@ async fn stale_tag_and_transaction_conflict_messages_are_projected_verbatim() {
 #[tokio::test]
 async fn malformed_and_headerless_input_never_commit_and_preserve_parser_diagnostics() {
 	let fake = Fake::with_files(&[("a.txt", b"one\n")]);
-	let edit = tool(fake.clone(), FormatPolicy::Configured);
+	let edit = tool(fake.clone(), FormatPolicy::BestEffort);
 	for (input, expected) in [
 		("", "No hashline sections found in input."),
 		(

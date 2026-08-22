@@ -23,11 +23,13 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+	path::{HostPaths, normalize_target},
 	read::{
 		conflicts::{
 			ConflictRegistry, ConflictReplacement, RegisteredConflict, parse_conflict_address,
 			parse_replacement,
 		},
+		mutation::{ResourceMutationReceipt, ResourceMutationRequest, route_resource_mutation},
 		resolver::Scheme,
 		selector::{LiteralPathProbe, parse_uri},
 	},
@@ -85,6 +87,13 @@ pub enum WriteDisposition {
 pub enum WriteOperation {
 	/// Plain whole-file create or overwrite.
 	Plain,
+	/// Capability-checked internal resource mutation.
+	Resource {
+		/// Canonical committed URI.
+		uri:      Str,
+		/// Resource revision after commitment.
+		revision: u64,
+	},
 	/// Registered merge-conflict splice.
 	ConflictSplice {
 		/// Session-local conflict ID.
@@ -125,9 +134,11 @@ pub enum WriteOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlainWriteRequest {
 	/// Authored local path, after strict hashline-header unwrapping.
-	pub path:    Str,
+	pub path:          Str,
 	/// Exact text to persist, after display-prefix stripping.
-	pub content: Str,
+	pub content:       Str,
+	/// Frozen formatter policy for this transaction.
+	pub format_policy: crate::edit::FormatPolicy,
 }
 
 /// Resource-owned truth returned after one atomic plain-file transaction.
@@ -170,24 +181,27 @@ pub struct ConflictSpliceResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
 	/// Canonical absolute committed path.
-	pub resolved_path:    Str,
+	pub resolved_path:      Str,
 	/// Stable model-facing committed path.
-	pub display_path:     Str,
+	pub display_path:       Str,
+	/// Recovery notice when the authored target required lexical normalization.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub canonical_recovery: Option<Str>,
 	/// Exact UTF-8 byte length persisted.
-	pub byte_len:         u64,
+	pub byte_len:           u64,
 	/// Pi-compatible JavaScript string length (UTF-16 code units) reported in
 	/// the model-facing success line.
-	pub reported_len:     u64,
+	pub reported_len:       u64,
 	/// Whether the transaction created or replaced the target.
-	pub disposition:      WriteDisposition,
+	pub disposition:        WriteDisposition,
 	/// Whether the content-copy guard stripped read/hashline decoration.
-	pub stripped_wrapper: bool,
+	pub stripped_wrapper:   bool,
 	/// Whether the host added execute bits for a leading shebang.
-	pub made_executable:  bool,
+	pub made_executable:    bool,
 	/// Four-character shared-session snapshot tag, when taggable.
-	pub snapshot_tag:     Option<Str>,
+	pub snapshot_tag:       Option<Str>,
 	/// Typed mutation family and SQLite outcome details.
-	pub operation:        WriteOperation,
+	pub operation:          WriteOperation,
 }
 
 /// Durable typed `write@1` failure.
@@ -358,6 +372,16 @@ impl Default for SpecialWriteControl {
 /// mode bits. For a new shebang file it applies the platform default mode and
 /// adds `a+x`; for an existing shebang file it adds only missing execute bits.
 pub trait WriteDocuments: Send + Sync + 'static {
+	/// Commits an explicitly routed SSH, vault, or attachment mutation after
+	/// the Environment has checked the request's capability.
+	fn write_resource(
+		&self,
+		_request: ResourceMutationRequest,
+	) -> impl Future<Output = Result<Option<ResourceMutationReceipt>, WriteCommitError>> + Send + '_
+	{
+		std::future::ready(Ok(None))
+	}
+
 	/// Probe the exact literal spelling without following a trailing read
 	/// selector. Ambiguous errors return [`LiteralPathProbe::Unknown`].
 	fn probe_literal(
@@ -413,9 +437,10 @@ pub trait WriteDocuments: Send + Sync + 'static {
 
 /// `write@1` executor.
 pub struct WriteTool<D> {
-	documents: D,
-	conflicts: Arc<ConflictRegistry>,
-	spec:      ToolSpec,
+	documents:     D,
+	conflicts:     Arc<ConflictRegistry>,
+	format_policy: crate::edit::FormatPolicy,
+	spec:          ToolSpec,
 }
 
 /// Construct the built-in whole-file write tool.
@@ -428,9 +453,19 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,
 ) -> WriteTool<D> {
+	tool_with_policy_and_conflicts(documents, conflicts, crate::edit::FormatPolicy::BestEffort)
+}
+
+/// Constructs `write@1` with frozen formatting policy and shared conflicts.
+pub fn tool_with_policy_and_conflicts<D: WriteDocuments>(
+	documents: D,
+	conflicts: Arc<ConflictRegistry>,
+	format_policy: crate::edit::FormatPolicy,
+) -> WriteTool<D> {
 	WriteTool {
 		documents,
 		conflicts,
+		format_policy,
 		spec: ToolSpec {
 			name:            sf!("write"),
 			rev:             Rev { family: Str::new(""), n: 1 },
@@ -474,231 +509,292 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
 		stream! {
-			let arguments = match params.whole::<Params>().await {
-				Ok(arguments) => arguments,
-				Err(error) => {
-					yield param_event(error);
-					return;
-				},
-			};
-			let path = Str::new(unwrap_hashline_header_path(&arguments.path));
-			let conflict_request = match parse_uri(&path) {
-				Ok(Some(uri)) if uri.scheme == Scheme::Conflict => {
-					if uri.selector_text.is_some() || uri.resource.contains('/') {
-						yield done(Err(Fault::UriLikeTarget {
-							message: sf!(
-								"Conflict splices target conflict://<id> without a scope or read selector",
-							),
-						}));
-						return;
-					}
-					let address = match parse_conflict_address(uri.resource) {
-						Ok(address) => address,
-						Err(fault) => {
-							yield done(Err(Fault::Document { message: fault.message().clone() }));
+					let arguments = match params.whole::<Params>().await {
+						Ok(arguments) => arguments,
+						Err(error) => {
+							yield param_event(error);
 							return;
 						},
 					};
-					let Some(entry) = self.conflicts.get(address.id) else {
-						yield done(Err(Fault::Document {
-							message: sf!(
-								"Conflict #{} is no longer registered",
-								address.id
-							),
-						}));
-						return;
-					};
-					Some(ConflictSpliceRequest {
-						entry,
-						replacement: parse_replacement(arguments.content.clone()),
-					})
-				},
-				Ok(_) => None,
-				Err(error) => {
-					yield done(Err(Fault::UriLikeTarget { message: Str::new(error.to_string()) }));
-					return;
-				},
-			};
-			if conflict_request.is_none() && let Some(fault) = reject_uri_like_target(&path) {
-				yield done(Err(fault));
-				return;
-			}
-			let stripped = strip_write_content(&arguments.content);
-			let reported_len =
-				u64::try_from(stripped.text.encode_utf16().count()).unwrap_or(u64::MAX);
-
-			match params.interruptable().committed().await {
-				Ok(_) => {},
-				Err(error) => {
-					yield commit_event(error);
-					return;
-				},
-			}
-
-			if let Some(request) = conflict_request {
-				let id = request.entry.id;
-				let operation = self.documents.splice_conflict(request).fuse();
-				let interruption = params.next_interrupt().fuse();
-				pin_mut!(operation, interruption);
-				select_biased! {
-					result = operation => match result {
-						Ok(Some(result)) => {
-							self.conflicts.remove(id);
-							yield done(Ok(Payload {
-								resolved_path: result.write.resolved_path,
-								display_path: result.write.display_path,
-								byte_len: result.write.byte_len,
-								reported_len,
-								disposition: result.write.disposition,
-								stripped_wrapper: stripped.stripped,
-								made_executable: result.write.made_executable,
-								snapshot_tag: result.write.snapshot_tag,
-								operation: WriteOperation::ConflictSplice {
-									id,
-									start_line: result.range.0,
-									end_line: result.range.1,
+					let authored_path = unwrap_hashline_header_path(&arguments.path);
+					let normalized = normalize_target(authored_path, None, HostPaths::current());
+					let path = normalized.canonical.clone();
+					let canonical_recovery = normalized.recovery_notice();
+					let conflict_request = match parse_uri(&path) {
+						Ok(Some(uri)) if uri.scheme == Scheme::Conflict => {
+							if uri.selector_text.is_some() || uri.resource.contains('/') {
+								yield done(Err(Fault::UriLikeTarget {
+									message: sf!(
+										"Conflict splices target conflict://<id> without a scope or read selector",
+									),
+								}));
+								return;
+							}
+							let address = match parse_conflict_address(uri.resource) {
+								Ok(address) => address,
+								Err(fault) => {
+									yield done(Err(Fault::Document { message: fault.message().clone() }));
+									return;
 								},
-							}));
+							};
+							let Some(entry) = self.conflicts.get(address.id) else {
+								yield done(Err(Fault::Document {
+									message: sf!(
+										"Conflict #{} is no longer registered",
+										address.id
+									),
+								}));
+								return;
+							};
+							Some(ConflictSpliceRequest {
+								entry,
+								replacement: parse_replacement(arguments.content.clone()),
+							})
 						},
-						Ok(None) => yield done(Err(Fault::Document {
-							message: sf!(
-								"conflict:// writes are unavailable in this deployment",
-							),
-						})),
-						Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
-						Err(WriteCommitError::EffectsUnknown { reason }) => {
-							yield Ev::Aborted(Abort::EffectsUnknown { reason });
-						},
-					},
-					interrupt = interruption => {
-						yield interrupt_event(interrupt, true);
-					},
-				}
-				return;
-			}
-
-			let archive_result = {
-				let control = SpecialWriteControl::new();
-				let operation = self.documents.write_archive_member(
-					path.clone(),
-					Bytes::copy_from_slice(stripped.text.as_bytes()),
-					control.clone(),
-				).fuse();
-				let interruption = params.next_interrupt().fuse();
-				pin_mut!(operation, interruption);
-				select_biased! {
-					result = operation => match result {
-						Ok(result) => result,
-						Err(fault) => {
-							yield done(Err(Fault::Document { message: fault.message }));
+						Ok(_) => None,
+						Err(error) => {
+							yield done(Err(Fault::UriLikeTarget { message: Str::new(error.to_string()) }));
 							return;
 						},
-					},
-					interrupt = interruption => {
-						let effects_started =
-							control.cancel() == SpecialWriteCancellation::EffectsUnknown;
-						yield interrupt_event(interrupt, effects_started);
-						return;
-					},
-				}
-			};
-			if let Some(result) = archive_result {
-				yield done(Ok(special_payload(result, stripped.stripped, reported_len)));
-				return;
-			}
+					};
+					let stripped = strip_write_content(&arguments.content);
+					let reported_len =
+						u64::try_from(stripped.text.encode_utf16().count()).unwrap_or(u64::MAX);
 
-			let sqlite_result = {
-				let control = SpecialWriteControl::new();
-				let operation = self.documents.write_sqlite_row(
-					path.clone(),
-					stripped.text.clone(),
-					control.clone(),
-				).fuse();
-				let interruption = params.next_interrupt().fuse();
-				pin_mut!(operation, interruption);
-				select_biased! {
-					result = operation => match result {
-						Ok(result) => result,
-						Err(fault) => {
-							yield done(Err(Fault::Document { message: fault.message }));
+					match params.interruptable().committed().await {
+						Ok(_) => {},
+						Err(error) => {
+							yield commit_event(error);
 							return;
 						},
-					},
-					interrupt = interruption => {
-						let effects_started =
-							control.cancel() == SpecialWriteCancellation::EffectsUnknown;
-						yield interrupt_event(interrupt, effects_started);
-						return;
-					},
-				}
-			};
-			if let Some(result) = sqlite_result {
-				yield done(Ok(special_payload(result, stripped.stripped, reported_len)));
-				return;
-			}
+					}
 
-			let literal = {
-				let probe = self.documents.probe_literal(path.clone()).fuse();
-				let interruption = params.next_interrupt().fuse();
-				pin_mut!(probe, interruption);
-				select_biased! {
-					result = probe => match result {
-						Ok(result) => result,
-						Err(fault) => {
-							yield done(Err(fault));
+								let resource_request = match route_resource_mutation(&path, stripped.text.clone()) {
+						Ok(request) => request,
+						Err(error) => {
+							yield done(Err(Fault::Document { message: Str::new(error.to_string()) }));
 							return;
 						},
-					},
-					interrupt = interruption => {
-						yield interrupt_event(interrupt, false);
-						return;
-					},
-				}
-			};
-			if literal == LiteralPathProbe::Missing {
-				if let Some(count) = read_selector_list_misfire(&path) {
-					yield done(Err(Fault::ReadSelectorListMisfire { target: path, count }));
-					return;
-				}
-				if stripped.text.is_empty() {
-					let split = crate::read::selector::split_path_and_selector(&path);
-					if let Some(selector) = split.selector.map(Str::new) {
-						yield done(Err(Fault::ReadSelectorMisfire {
-							target: path.clone(),
-							selector,
-						}));
+					};
+					if let Some(request) = resource_request {
+						let operation = self.documents.write_resource(request).fuse();
+						let interruption = params.next_interrupt().fuse();
+						pin_mut!(operation, interruption);
+						select_biased! {
+							result = operation => match result {
+								Ok(Some(receipt)) => {
+									yield done(Ok(Payload {
+										resolved_path: receipt.canonical_uri.clone(),
+										display_path: receipt.canonical_uri.clone(),
+										canonical_recovery,
+										byte_len: receipt.byte_len,
+										reported_len,
+										disposition: WriteDisposition::Overwrote,
+										stripped_wrapper: stripped.stripped,
+										made_executable: false,
+										snapshot_tag: None,
+										operation: WriteOperation::Resource {
+											uri: receipt.canonical_uri,
+											revision: receipt.revision,
+										},
+									}));
+									return;
+								},
+								Ok(None) => {
+									yield done(Err(Fault::UnsupportedScheme {
+										scheme: Str::new(path.split_once(':').map_or("resource", |(scheme, _)| scheme)),
+									}));
+									return;
+								},
+								Err(WriteCommitError::Rejected(fault)) => {
+									yield done(Err(fault));
+									return;
+								},
+								Err(WriteCommitError::EffectsUnknown { reason }) => {
+									yield Ev::Aborted(Abort::EffectsUnknown { reason });
+									return;
+								},
+							},
+							interrupt = interruption => {
+								yield interrupt_event(interrupt, true);
+								return;
+							},
+						}
+					}
+					if conflict_request.is_none() && let Some(fault) = reject_uri_like_target(&path) {
+						yield done(Err(fault));
 						return;
 					}
-				}
-			}
+		if let Some(request) = conflict_request {
+						let id = request.entry.id;
+						let operation = self.documents.splice_conflict(request).fuse();
+						let interruption = params.next_interrupt().fuse();
+						pin_mut!(operation, interruption);
+						select_biased! {
+							result = operation => match result {
+								Ok(Some(result)) => {
+									self.conflicts.remove(id);
+									yield done(Ok(Payload {
+										resolved_path: result.write.resolved_path,
+										display_path: result.write.display_path,
+										canonical_recovery: canonical_recovery.clone(),
+										byte_len: result.write.byte_len,
+										reported_len,
+										disposition: result.write.disposition,
+										stripped_wrapper: stripped.stripped,
+										made_executable: result.write.made_executable,
+										snapshot_tag: result.write.snapshot_tag,
+										operation: WriteOperation::ConflictSplice {
+											id,
+											start_line: result.range.0,
+											end_line: result.range.1,
+										},
+									}));
+								},
+								Ok(None) => yield done(Err(Fault::Document {
+									message: sf!(
+										"conflict:// writes are unavailable in this deployment",
+									),
+								})),
+								Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
+								Err(WriteCommitError::EffectsUnknown { reason }) => {
+									yield Ev::Aborted(Abort::EffectsUnknown { reason });
+								},
+							},
+							interrupt = interruption => {
+								yield interrupt_event(interrupt, true);
+							},
+						}
+						return;
+					}
 
-			let request = PlainWriteRequest { path, content: stripped.text };
-			let operation = self.documents.write_plain(request).fuse();
-			let interruption = params.next_interrupt().fuse();
-			pin_mut!(operation, interruption);
-			select_biased! {
-				result = operation => match result {
-					Ok(result) => yield done(Ok(Payload {
-						resolved_path: result.resolved_path,
-						display_path: result.display_path,
-						byte_len: result.byte_len,
-						reported_len,
-						disposition: result.disposition,
-						stripped_wrapper: stripped.stripped,
-						made_executable: result.made_executable,
-						snapshot_tag: result.snapshot_tag,
-						operation: WriteOperation::Plain,
-					})),
-					Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
-					Err(WriteCommitError::EffectsUnknown { reason }) => {
-						yield Ev::Aborted(Abort::EffectsUnknown { reason });
-					},
-				},
-				interrupt = interruption => {
-					yield interrupt_event(interrupt, true);
-				},
-			}
-		}
+					let archive_result = {
+						let control = SpecialWriteControl::new();
+						let operation = self.documents.write_archive_member(
+							path.clone(),
+							Bytes::copy_from_slice(stripped.text.as_bytes()),
+							control.clone(),
+						).fuse();
+						let interruption = params.next_interrupt().fuse();
+						pin_mut!(operation, interruption);
+						select_biased! {
+							result = operation => match result {
+								Ok(result) => result,
+								Err(fault) => {
+									yield done(Err(Fault::Document { message: fault.message }));
+									return;
+								},
+							},
+							interrupt = interruption => {
+								let effects_started =
+									control.cancel() == SpecialWriteCancellation::EffectsUnknown;
+								yield interrupt_event(interrupt, effects_started);
+								return;
+							},
+						}
+					};
+					if let Some(result) = archive_result {
+						yield done(Ok(special_payload(result, stripped.stripped, reported_len, canonical_recovery.clone())));
+						return;
+					}
+
+					let sqlite_result = {
+						let control = SpecialWriteControl::new();
+						let operation = self.documents.write_sqlite_row(
+							path.clone(),
+							stripped.text.clone(),
+							control.clone(),
+						).fuse();
+						let interruption = params.next_interrupt().fuse();
+						pin_mut!(operation, interruption);
+						select_biased! {
+							result = operation => match result {
+								Ok(result) => result,
+								Err(fault) => {
+									yield done(Err(Fault::Document { message: fault.message }));
+									return;
+								},
+							},
+							interrupt = interruption => {
+								let effects_started =
+									control.cancel() == SpecialWriteCancellation::EffectsUnknown;
+								yield interrupt_event(interrupt, effects_started);
+								return;
+							},
+						}
+					};
+					if let Some(result) = sqlite_result {
+						yield done(Ok(special_payload(result, stripped.stripped, reported_len, canonical_recovery.clone())));
+						return;
+					}
+
+					let literal = {
+						let probe = self.documents.probe_literal(path.clone()).fuse();
+						let interruption = params.next_interrupt().fuse();
+						pin_mut!(probe, interruption);
+						select_biased! {
+							result = probe => match result {
+								Ok(result) => result,
+								Err(fault) => {
+									yield done(Err(fault));
+									return;
+								},
+							},
+							interrupt = interruption => {
+								yield interrupt_event(interrupt, false);
+								return;
+							},
+						}
+					};
+					if literal == LiteralPathProbe::Missing {
+						if let Some(count) = read_selector_list_misfire(&path) {
+							yield done(Err(Fault::ReadSelectorListMisfire { target: path, count }));
+							return;
+						}
+						if stripped.text.is_empty() {
+							let split = crate::read::selector::split_path_and_selector(&path);
+							if let Some(selector) = split.selector.map(Str::new) {
+								yield done(Err(Fault::ReadSelectorMisfire {
+									target: path.clone(),
+									selector,
+								}));
+								return;
+							}
+						}
+					}
+
+					let request = PlainWriteRequest {
+						path,
+						content: stripped.text,
+						format_policy: self.format_policy,
+					};
+					let operation = self.documents.write_plain(request).fuse();
+					let interruption = params.next_interrupt().fuse();
+					pin_mut!(operation, interruption);
+					select_biased! {
+						result = operation => match result {
+							Ok(result) => yield done(Ok(Payload {
+								resolved_path: result.resolved_path,
+								display_path: result.display_path,
+								canonical_recovery,
+								byte_len: result.byte_len,
+								reported_len,
+								disposition: result.disposition,
+								stripped_wrapper: stripped.stripped,
+								made_executable: result.made_executable,
+								snapshot_tag: result.snapshot_tag,
+								operation: WriteOperation::Plain,
+							})),
+							Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
+							Err(WriteCommitError::EffectsUnknown { reason }) => {
+								yield Ev::Aborted(Abort::EffectsUnknown { reason });
+							},
+						},
+						interrupt = interruption => {
+							yield interrupt_event(interrupt, true);
+						},
+					}
+				}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
@@ -977,10 +1073,12 @@ fn special_payload(
 	result: backends::ResultPayload,
 	stripped_wrapper: bool,
 	reported_len: u64,
+	canonical_recovery: Option<Str>,
 ) -> Payload {
 	Payload {
 		resolved_path: result.resolved_path,
 		display_path: result.display_path,
+		canonical_recovery,
 		byte_len: result.byte_len,
 		reported_len,
 		disposition: result.disposition,
@@ -993,11 +1091,19 @@ fn special_payload(
 
 fn render_payload(payload: &Payload) -> String {
 	let mut output = String::new();
+	if let Some(recovery) = &payload.canonical_recovery {
+		output.push_str(recovery);
+		output.push('\n');
+	}
 	if let Some(tag) = &payload.snapshot_tag {
 		output.push_str(&format_hashline_header(&payload.display_path, tag));
 		output.push('\n');
 	}
 	match &payload.operation {
+		WriteOperation::Resource { uri, revision } => {
+			write!(output, "Wrote {} bytes to {uri} (revision {revision})", payload.byte_len)
+				.expect("writing to String cannot fail");
+		},
 		WriteOperation::Plain | WriteOperation::ArchiveMember => write!(
 			output,
 			"Successfully wrote {} bytes to {}",
@@ -1149,15 +1255,16 @@ mod tests {
 	#[test]
 	fn renders_plain_write_exactly() {
 		let payload = Payload {
-			resolved_path:    "/repo/bin/run".into(),
-			display_path:     "bin/run".into(),
-			byte_len:         10,
-			reported_len:     10,
-			disposition:      WriteDisposition::Created,
-			stripped_wrapper: true,
-			made_executable:  true,
-			snapshot_tag:     Some("A1B2".into()),
-			operation:        WriteOperation::Plain,
+			resolved_path:      "/repo/bin/run".into(),
+			display_path:       "bin/run".into(),
+			canonical_recovery: None,
+			byte_len:           10,
+			reported_len:       10,
+			disposition:        WriteDisposition::Created,
+			stripped_wrapper:   true,
+			made_executable:    true,
+			snapshot_tag:       Some("A1B2".into()),
+			operation:          WriteOperation::Plain,
 		};
 		assert_eq!(
 			render_payload(&payload),
@@ -1169,15 +1276,16 @@ mod tests {
 	#[test]
 	fn renders_archive_count_with_pi_utf16_length() {
 		let payload = Payload {
-			resolved_path:    "/repo/a.zip".into(),
-			display_path:     "a.zip:x.txt".into(),
-			byte_len:         "é😀".len() as u64,
-			reported_len:     "é😀".encode_utf16().count() as u64,
-			disposition:      WriteDisposition::Created,
-			stripped_wrapper: false,
-			made_executable:  false,
-			snapshot_tag:     None,
-			operation:        WriteOperation::ArchiveMember,
+			resolved_path:      "/repo/a.zip".into(),
+			display_path:       "a.zip:x.txt".into(),
+			canonical_recovery: None,
+			byte_len:           "é😀".len() as u64,
+			reported_len:       "é😀".encode_utf16().count() as u64,
+			disposition:        WriteDisposition::Created,
+			stripped_wrapper:   false,
+			made_executable:    false,
+			snapshot_tag:       None,
+			operation:          WriteOperation::ArchiveMember,
 		};
 		assert_eq!(render_payload(&payload), "Successfully wrote 3 bytes to a.zip:x.txt");
 	}
@@ -1185,15 +1293,16 @@ mod tests {
 	#[test]
 	fn renders_sqlite_row_outcomes_exactly() {
 		let payload = Payload {
-			resolved_path:    "/repo/data.db".into(),
-			display_path:     "data.db:items:7".into(),
-			byte_len:         14,
-			reported_len:     14,
-			disposition:      WriteDisposition::Overwrote,
-			stripped_wrapper: false,
-			made_executable:  false,
-			snapshot_tag:     None,
-			operation:        WriteOperation::SqliteUpdate {
+			resolved_path:      "/repo/data.db".into(),
+			display_path:       "data.db:items:7".into(),
+			canonical_recovery: None,
+			byte_len:           14,
+			reported_len:       14,
+			disposition:        WriteDisposition::Overwrote,
+			stripped_wrapper:   false,
+			made_executable:    false,
+			snapshot_tag:       None,
+			operation:          WriteOperation::SqliteUpdate {
 				table:   "items".into(),
 				key:     "7".into(),
 				changed: false,

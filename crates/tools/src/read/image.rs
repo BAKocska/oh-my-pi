@@ -1,6 +1,6 @@
 //! Pure image classification and model-boundary normalization.
 
-use std::{fmt, io::Cursor, path::Path};
+use std::{collections::HashMap, fmt, io::Cursor, path::Path, sync::LazyLock};
 
 use bytes::Bytes;
 use image::{
@@ -13,7 +13,8 @@ use image::{
 	},
 	imageops::FilterType,
 };
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, base64, sf};
+use parking_lot::Mutex;
 
 /// Largest image accepted by the read tool (20 MiB).
 pub const MAX_IMAGE_INPUT_BYTES: usize = 20 * 1024 * 1024;
@@ -27,10 +28,76 @@ pub const MIN_IMAGE_DIMENSION: u32 = 200;
 pub const MAX_IMAGE_OUTPUT_BYTES: usize = 500 * 1024;
 
 const IMAGE_METADATA_HEADER_BYTES: usize = 256 * 1024;
+const DATA_URL_HEADER_MAX_BYTES: usize = 1_024;
+const IMAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const IMAGE_CACHE_MAX_ENTRIES: usize = 128;
 const COMFORTABLE_IMAGE_BYTES: usize = MAX_IMAGE_OUTPUT_BYTES / 4;
 const JPEG_QUALITY: u8 = 80;
 const QUALITY_STEPS: [u8; 4] = [70, 60, 50, 40];
 const SCALE_STEPS: [f64; 5] = [1.0, 0.75, 0.5, 0.35, 0.25];
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ImageCacheKey {
+	digest:       Hash32,
+	auto_resize:  bool,
+	exclude_webp: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ImageCacheEntry {
+	image: ProcessedImage,
+	bytes: usize,
+	used:  u64,
+}
+
+#[derive(Debug, Default)]
+struct ImageCache {
+	entries: HashMap<ImageCacheKey, ImageCacheEntry>,
+	bytes:   usize,
+	clock:   u64,
+}
+
+impl ImageCache {
+	fn get(&mut self, key: ImageCacheKey) -> Option<ProcessedImage> {
+		let entry = self.entries.get_mut(&key)?;
+		self.clock = self.clock.wrapping_add(1);
+		entry.used = self.clock;
+		Some(entry.image.clone())
+	}
+
+	fn insert(&mut self, key: ImageCacheKey, image: &ProcessedImage) {
+		let bytes = image.data.len().max(1);
+		if bytes > IMAGE_CACHE_MAX_BYTES {
+			return;
+		}
+		if let Some(previous) = self.entries.remove(&key) {
+			self.bytes = self.bytes.saturating_sub(previous.bytes);
+		}
+		while self.entries.len() >= IMAGE_CACHE_MAX_ENTRIES
+			|| self.bytes.saturating_add(bytes) > IMAGE_CACHE_MAX_BYTES
+		{
+			let Some(oldest) = self
+				.entries
+				.iter()
+				.min_by_key(|(_, entry)| entry.used)
+				.map(|(key, _)| *key)
+			else {
+				break;
+			};
+			if let Some(removed) = self.entries.remove(&oldest) {
+				self.bytes = self.bytes.saturating_sub(removed.bytes);
+			}
+		}
+		self.clock = self.clock.wrapping_add(1);
+		self.bytes += bytes;
+		self
+			.entries
+			.insert(key, ImageCacheEntry { image: image.clone(), bytes, used: self.clock });
+	}
+}
+
+static IMAGE_CACHE: LazyLock<Mutex<ImageCache>> =
+	LazyLock::new(|| Mutex::new(ImageCache::default()));
 
 /// Supported image encoding discovered from file bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +174,10 @@ pub struct ProcessedImage {
 /// Typed image-processing failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImageFault {
+	/// The string is an image data URL but its header is malformed.
+	InvalidDataUrl,
+	/// The data URL payload is not valid padded standard Base64.
+	InvalidBase64,
 	/// The encoded input exceeds the hard read limit.
 	TooLarge {
 		/// Actual encoded byte count.
@@ -120,6 +191,8 @@ impl ImageFault {
 	/// Exact model-facing failure text used by pi.
 	pub fn message(&self) -> Str {
 		match *self {
+			Self::InvalidDataUrl => sf!("Invalid image data URL."),
+			Self::InvalidBase64 => sf!("Invalid Base64 image data."),
 			Self::TooLarge { bytes, max_bytes } => sf!(
 				"Image file too large: {} exceeds {} limit.",
 				format_bytes(bytes),
@@ -165,6 +238,98 @@ pub fn sniff_metadata(header: &[u8]) -> Option<ImageMetadata> {
 		.or_else(|| parse_webp(header))
 }
 
+/// Extracts one bounded Base64 image data URL.
+///
+/// Non-data URLs, non-image media types, and non-Base64 data URLs return
+/// `Ok(None)`. Image data URLs reject malformed headers and oversized payloads
+/// before allocating decoded storage.
+pub fn extract_base64_image_data_url(input: &str) -> Result<Option<Bytes>, ImageFault> {
+	if !input
+		.as_bytes()
+		.get(..5)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"data:"))
+	{
+		return Ok(None);
+	}
+	let comma = input.find(',').ok_or(ImageFault::InvalidDataUrl)?;
+	if comma > DATA_URL_HEADER_MAX_BYTES {
+		return Err(ImageFault::InvalidDataUrl);
+	}
+	let mut fields = input[5..comma].split(';');
+	let media_type = fields.next().unwrap_or_default().trim();
+	if !media_type
+		.get(..6)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+	{
+		return Ok(None);
+	}
+	if !fields.any(|field| field.trim().eq_ignore_ascii_case("base64")) {
+		return Ok(None);
+	}
+
+	let encoded = input[comma + 1..].as_bytes();
+	let max_encoded = MAX_IMAGE_INPUT_BYTES.div_ceil(3).saturating_mul(4);
+	if encoded.len() > max_encoded {
+		return Err(ImageFault::TooLarge {
+			bytes:     base64::decode_len(encoded.len()),
+			max_bytes: MAX_IMAGE_INPUT_BYTES,
+		});
+	}
+	let decoded = base64::decode(encoded)
+		.into_vec()
+		.map_err(|_| ImageFault::InvalidBase64)?;
+	if decoded.len() > MAX_IMAGE_INPUT_BYTES {
+		return Err(ImageFault::TooLarge {
+			bytes:     decoded.len(),
+			max_bytes: MAX_IMAGE_INPUT_BYTES,
+		});
+	}
+	Ok(Some(Bytes::from(decoded)))
+}
+
+/// Extracts and normalizes a Base64 image data URL through the shared bounded
+/// decoded/resized-result cache.
+pub fn process_image_data_url(
+	input: &str,
+	auto_resize: bool,
+) -> Result<Option<ProcessedImage>, ImageFault> {
+	let Some(bytes) = extract_base64_image_data_url(input)? else {
+		return Ok(None);
+	};
+	process_image_with_policy(bytes, auto_resize)
+}
+
+/// Processes an image according to the invocation-time resize policy.
+///
+/// Disabling resize performs only bounded header inspection and returns the
+/// original allocation unchanged; it never decodes or re-encodes pixels.
+pub fn process_image_with_policy(
+	input: Bytes,
+	auto_resize: bool,
+) -> Result<Option<ProcessedImage>, ImageFault> {
+	if auto_resize {
+		return process_image(input);
+	}
+	if input.len() > MAX_IMAGE_INPUT_BYTES {
+		return Err(ImageFault::TooLarge {
+			bytes:     input.len(),
+			max_bytes: MAX_IMAGE_INPUT_BYTES,
+		});
+	}
+	let Some(metadata) = sniff_metadata(&input[..input.len().min(IMAGE_METADATA_HEADER_BYTES)])
+	else {
+		return Ok(None);
+	};
+	let cache_key =
+		ImageCacheKey { digest: Hash32::sum(&input), auto_resize: false, exclude_webp: false };
+	if let Some(cached) = IMAGE_CACHE.lock().get(cache_key) {
+		return Ok(Some(cached));
+	}
+	let processed = unchanged_image(input, metadata, false);
+	IMAGE_CACHE.lock().insert(cache_key, &processed);
+	Ok(Some(processed))
+}
+
 /// Normalizes an in-memory image for a model.
 ///
 /// The hard input-size limit is enforced before format sniffing; smaller inputs
@@ -186,9 +351,15 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 	};
 
 	let exclude_webp = webp_is_excluded();
+	let cache_key = ImageCacheKey { digest: Hash32::sum(&input), auto_resize: true, exclude_webp };
+	if let Some(cached) = IMAGE_CACHE.lock().get(cache_key) {
+		return Ok(Some(cached));
+	}
 	let decoded = decode_image(&input, metadata.kind);
 	let Ok((image, was_animated)) = decoded else {
-		return Ok(Some(unchanged_image(input, metadata, false)));
+		let processed = unchanged_image(input, metadata, false);
+		IMAGE_CACHE.lock().insert(cache_key, &processed);
+		return Ok(Some(processed));
 	};
 	let original_width = image.width();
 	let original_height = image.height();
@@ -202,7 +373,7 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 		&& input.len() <= COMFORTABLE_IMAGE_BYTES
 		&& !(exclude_webp && metadata.kind == ImageKind::WebP)
 	{
-		return Ok(Some(unchanged_decoded_image(
+		let processed = unchanged_decoded_image(
 			input,
 			metadata.kind,
 			original_width,
@@ -210,11 +381,13 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 			channels,
 			has_alpha,
 			was_animated,
-		)));
+		);
+		IMAGE_CACHE.lock().insert(cache_key, &processed);
+		return Ok(Some(processed));
 	}
 
 	let Some(encoded) = resize_and_encode(&image, exclude_webp, was_animated) else {
-		return Ok(Some(unchanged_decoded_image(
+		let processed = unchanged_decoded_image(
 			input,
 			metadata.kind,
 			original_width,
@@ -222,7 +395,9 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 			channels,
 			has_alpha,
 			was_animated,
-		)));
+		);
+		IMAGE_CACHE.lock().insert(cache_key, &processed);
+		return Ok(Some(processed));
 	};
 	let bytes = encoded.data.len();
 	let dimension_note =
@@ -234,7 +409,7 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 		Some(has_alpha),
 		dimension_note.as_deref(),
 	);
-	Ok(Some(ProcessedImage {
+	let processed = ProcessedImage {
 		data: Bytes::from(encoded.data),
 		media_type: sf!(encoded.kind.media_type()),
 		bytes,
@@ -246,7 +421,9 @@ pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault>
 		was_animated: encoded.was_animated,
 		animation_preserved: encoded.animation_preserved,
 		description,
-	}))
+	};
+	IMAGE_CACHE.lock().insert(cache_key, &processed);
+	Ok(Some(processed))
 }
 
 struct EncodedImage {

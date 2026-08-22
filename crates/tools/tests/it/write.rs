@@ -230,8 +230,9 @@ fn create_records_exact_request_payload_and_hashline_output() {
 	assert!(!payload.stripped_wrapper);
 	assert!(!payload.made_executable);
 	assert_eq!(requests.lock().as_slice(), [PlainWriteRequest {
-		path:    "out.txt".into(),
-		content: "hello\n".into(),
+		path:          "out.txt".into(),
+		content:       "hello\n".into(),
+		format_policy: omp_tools::edit::FormatPolicy::BestEffort,
 	}]);
 }
 
@@ -285,8 +286,9 @@ fn copied_hashline_display_is_stripped_before_commit_with_exact_notice() {
 			.stripped_wrapper
 	);
 	assert_eq!(requests.lock().as_slice(), [PlainWriteRequest {
-		path:    "out.txt".into(),
-		content: "first\nsecond\n".into(),
+		path:          "out.txt".into(),
+		content:       "first\nsecond\n".into(),
+		format_policy: omp_tools::edit::FormatPolicy::BestEffort,
 	}]);
 }
 

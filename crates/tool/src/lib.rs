@@ -24,9 +24,11 @@ pub use omp_proto::inference::v1::Fallback;
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
 	AvailabilityDelta, Claim, Claims, ConstraintDisposition, DeviceTarget, ErasedEv, ErasedOutcome,
-	ErasedStream, LoweredTool, LoweringCaps, MountedDevice, Precedence, ProjectedCall,
-	ProjectedVerdict, ProjectionKey, ProjectionRequest, Registry, RegistryError, ShadowClaim,
-	ToolRoute, WorkerSiteKind,
+	ErasedStream, GoalToolState, InclusionPolicy, LeafCatalogSnapshot, LeafOwner,
+	LeafReplacementError, LeafReplacementRegistry, LeafVersion, LoweredTool, LoweringCaps,
+	MemoryToolState, MountedDevice, Precedence, ProjectedCall, ProjectedVerdict, ProjectionKey,
+	ProjectionRequest, PublishedLeaf, Registry, RegistryError, RegistryLeaf, ShadowClaim,
+	ToolPromptEntry, ToolPromptProjection, ToolRoute, WorkerSiteKind,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
@@ -88,6 +90,8 @@ pub enum Presentation {
 	Slot,
 	/// A catalog entry reached through the dynamic device tool.
 	Device,
+	/// An invokable declaration omitted until a session policy selects it.
+	Hidden,
 }
 /// Session policy deciding whether the model receives tool slots, the dynamic
 /// device transport, or both.
@@ -643,10 +647,18 @@ pub enum Dialect {
 	#[serde(rename = "rep")]
 	#[strum(serialize = "rep")]
 	Replace,
-	/// Patch-envelope or unified-diff input.
+	/// JSON patch-operation input.
 	#[serde(rename = "patch")]
 	#[strum(serialize = "patch")]
 	Patch,
+	/// Codex apply-patch/unified-hunk envelope input.
+	#[serde(rename = "apply_patch")]
+	#[strum(serialize = "apply_patch")]
+	ApplyPatch,
+	/// Sloppy match/rewrite input.
+	#[serde(rename = "sloppy")]
+	#[strum(serialize = "sloppy")]
+	Sloppy,
 	/// A vendor-trained or otherwise unclassified native dialect.
 	#[default]
 	#[serde(rename = "native")]
@@ -867,6 +879,15 @@ pub enum Part {
 	},
 }
 
+/// One model-facing example attached to an exact tool revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolPromptExample {
+	/// Optional short purpose or scenario.
+	pub label:     Option<Str>,
+	/// Canonical JSON argument bytes.
+	pub arguments: Bytes,
+}
+
 /// One typed tool implementation.
 pub trait Tool: Send + Sync + 'static {
 	/// Declared whole-argument shape for tools which opt into whole validation.
@@ -880,6 +901,21 @@ pub trait Tool: Send + Sync + 'static {
 
 	/// Returns this implementation's immutable specification.
 	fn spec(&self) -> &ToolSpec;
+
+	/// Returns model-facing examples for this exact revision.
+	///
+	/// Examples are optional metadata; the registry never invents examples for
+	/// tools that do not declare them.
+	fn prompt_examples(&self) -> &[ToolPromptExample] {
+		&[]
+	}
+
+	/// Returns long-form model-facing documentation for this exact revision.
+	///
+	/// The short purpose remains [`ToolSpec::description`].
+	fn prompt_docs(&self) -> Option<&str> {
+		None
+	}
 
 	/// Executes one invocation from its single linear argument/event stream.
 	fn call<'c>(
@@ -1511,6 +1547,112 @@ pub enum JobOwner {
 		/// Exact process generation observed when detaching.
 		generation: u64,
 	},
+	/// A durable agent loop addressed by its stable registry identifier.
+	AgentLoop {
+		/// Stable agent identifier retained by the journal-backed registry.
+		agent_id: Str,
+	},
+}
+
+/// Kind of execution represented by a detached job.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum JobKind {
+	/// A shell command or supervised named process.
+	#[default]
+	Shell,
+	/// A subagent loop.
+	Task,
+	/// A detached evaluation.
+	Eval,
+}
+
+/// Lifecycle state observed for detached work.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum JobStatus {
+	/// Registered but waiting for its execution slot.
+	Queued,
+	/// Actively executing.
+	#[default]
+	Running,
+	/// Settled successfully.
+	Completed,
+	/// Settled with an error.
+	Failed,
+	/// Cancelled by its owner or caller.
+	Cancelled,
+}
+
+/// Immutable lifecycle snapshot carried with a detached-job descriptor.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct JobMetadata {
+	/// Execution kind used by roster and delivery projections.
+	pub kind:          JobKind,
+	/// Most recently observed lifecycle state.
+	pub status:        JobStatus,
+	/// Human-readable job label.
+	pub label:         Str,
+	/// Registration time in milliseconds since the Unix epoch.
+	pub created_at_ms: u64,
+	/// Execution start time, absent while queued.
+	pub started_at_ms: Option<u64>,
+	/// Settlement time, present only for terminal states.
+	pub settled_at_ms: Option<u64>,
+	/// Durable session that owns delivery and process reattachment.
+	pub owner_session: Option<Str>,
+	/// Actual serving model for agent/evaluation work, when known.
+	pub model:         Option<Str>,
+	/// Bounded successful settlement summary, when known.
+	pub result:        Option<Str>,
+	/// Bounded failed settlement summary, when known.
+	pub error:         Option<Str>,
+}
+
+impl JobMetadata {
+	/// Builds metadata for work that begins running as it is registered.
+	#[must_use]
+	pub fn running(kind: JobKind, label: Str, started_at_ms: u64) -> Self {
+		Self {
+			kind,
+			status: JobStatus::Running,
+			label,
+			created_at_ms: started_at_ms,
+			started_at_ms: Some(started_at_ms),
+			settled_at_ms: None,
+			owner_session: None,
+			model: None,
+			result: None,
+			error: None,
+		}
+	}
 }
 
 /// Detached work and its expected artifact.
@@ -1520,6 +1662,9 @@ pub struct JobRef {
 	pub id:       Str,
 	/// Environment resource that authoritatively reports settlement.
 	pub owner:    JobOwner,
+	/// Lifecycle metadata used by owner-scoped roster and delivery projections.
+	#[serde(default)]
+	pub metadata: Arc<JobMetadata>,
 	/// Artifact expected when the job settles.
 	pub artifact: ExpectedArtifact,
 }

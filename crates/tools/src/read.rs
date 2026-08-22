@@ -13,9 +13,12 @@ use omp_tool::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::render::{
-	TextProjection,
-	truncate::{TruncationOptions, append_blob_truncation_notice, truncate_head},
+use crate::{
+	path::{HostPaths, normalize_target},
+	render::{
+		TextProjection,
+		truncate::{TruncationOptions, append_blob_truncation_notice, truncate_head},
+	},
 };
 
 pub mod archive;
@@ -23,8 +26,11 @@ pub mod conflicts;
 pub mod dirtree;
 pub mod format;
 pub mod image;
+pub mod json_query;
 pub mod markit;
+pub mod mutation;
 pub mod notebook;
+pub mod pdf;
 pub mod profile;
 pub mod resolver;
 pub mod selector;
@@ -48,11 +54,12 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 ## Source kinds
 - Parseable code, no selector → structural summary (declarations only, body elided). Footer names recovery selector — re-issue ONLY those ranges.
 - File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.
-- Directory → depth-limited dirent listing.
+- Directory → deterministic alphabetical depth-limited entries; directories end in / and listings are edit-locked.
 - SQLite (`.sqlite`, `.sqlite3`, `.db`, `.db3`): `file.db` (tables), `file.db:table` (schema+rows), `file.db:table:key` (by PK), `?limit=`/`?where=`/`?q=SELECT`.
 - Archives (`.tar`, `.tar.gz`, `.tgz`, `.zip`, `.asar`, plus ZIP-based `.jar`/`.war`/`.ear`/`.apk`): `archive.ext:path/inside/archive` reads a member.
 - Documents → extracted text. Notebooks → editable cells. Images → decoded inline. `:raw` bypasses converters.
 - URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
+- Internal resources enforce owner byte/entry ceilings; path-only resolution returns metadata without content. Binary/oversized resources return selector or materialized-path guidance rather than inline bytes.
 - Literal `:`, `?`, `#` in URI-like member paths → percent-encode (`%3A`/`%3F`/`%23`).
 
 <critical>
@@ -316,12 +323,37 @@ impl Fault {
 	}
 }
 
+/// Invocation-frozen read behavior selected by the production registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadPolicy {
+	/// Permit HTTP(S) dispatch.
+	pub fetch_enabled:      bool,
+	/// Convert supported documents into Markdown.
+	pub render_markdown:    bool,
+	/// Decode and resize images for model bounds.
+	pub auto_resize_images: bool,
+	/// Record snapshots and expose hashline headers for editable local text.
+	pub hashline_headers:   bool,
+}
+
+impl Default for ReadPolicy {
+	fn default() -> Self {
+		Self {
+			fetch_enabled:      true,
+			render_markdown:    true,
+			auto_resize_images: true,
+			hashline_headers:   true,
+		}
+	}
+}
+
 /// `read@1` executor over unboxed app resource adapters.
 pub struct ReadTool<S, B, R = resolver::NoResolver> {
 	sources:   S,
 	blobs:     B,
 	resolvers: Arc<resolver::ResolverTable<R>>,
 	conflicts: Arc<conflicts::ConflictRegistry>,
+	policy:    ReadPolicy,
 	spec:      ToolSpec,
 }
 
@@ -377,21 +409,43 @@ pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolv
 	resolvers: Arc<resolver::ResolverTable<R>>,
 	conflicts: Arc<conflicts::ConflictRegistry>,
 ) -> ReadTool<S, B, R> {
+	tool_with_policy(sources, blobs, resolvers, conflicts, ReadPolicy::default())
+}
+
+/// Constructs `read@1` with one frozen registry-projection policy.
+pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
+	sources: S,
+	blobs: B,
+	resolvers: Arc<resolver::ResolverTable<R>>,
+	conflicts: Arc<conflicts::ConflictRegistry>,
+	policy: ReadPolicy,
+) -> ReadTool<S, B, R> {
+	let description = if policy.hashline_headers {
+		sf!(DESCRIPTION)
+	} else {
+		Str::new(DESCRIPTION.replace(
+			"- File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy \
+			 `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.",
+			"- File + selector → numbered lines. This registry projection is read-only or has no \
+			 compatible hashline edit revision, so snapshot headers are suppressed.",
+		))
+	};
 	ReadTool {
 		sources,
 		blobs,
 		resolvers,
 		conflicts,
+		policy,
 		spec: ToolSpec {
-			name:            sf!("read"),
-			rev:             Rev { family: Default::default(), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
+			name: sf!("read"),
+			rev: Rev { family: Default::default(), n: 1 },
+			description,
+			schema: omp_tool::schema::<Params>(),
+			constraint: Constraint::Schema {
 				priority:       10,
 				on_unsupported: omp_tool::Fallback::Unspecified,
 			},
-			effects:         Effects {
+			effects: Effects {
 				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
 				exec:      None,
 				inference: None,
@@ -581,10 +635,21 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	}
 
 	async fn execute_target(&self, authored: &str) -> Result<Vec<PayloadPart>, Fault> {
+		let normalized = normalize_target(authored, None, HostPaths::current());
+		let normalization_from = normalized
+			.recovered()
+			.then_some(normalized.authored.as_str());
+		let recovery_candidates = normalized.recovery_candidates();
+		let authored = normalized.canonical.as_str();
 		if let Some(target) = web::parse_target(authored).map_err(|error| match error {
 			web::types::WebError::InvalidUrl(message) => Fault::Invalid { message },
 			other => Fault::Web { message: other.message() },
 		})? {
+			if !self.policy.fetch_enabled {
+				return Err(Fault::Unsupported {
+					message: sf!("URL reads are disabled by tools.fetch.enabled"),
+				});
+			}
 			return self.read_web(target).await;
 		}
 
@@ -600,15 +665,22 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				Some(path)
 			},
 			Some(uri) if uri.scheme == resolver::Scheme::Unknown => {
-				return Err(Fault::UnknownScheme {
-					scheme:  Str::new(uri.raw_scheme),
-					message: sf!("Unknown URL scheme '{}'", uri.raw_scheme),
-				});
+				let Some(result) = self.resolvers.read_unknown(authored, &uri.selector).await else {
+					return Err(Fault::UnknownScheme {
+						scheme:  Str::new(uri.raw_scheme),
+						message: sf!("Unknown URL scheme '{}'", uri.raw_scheme),
+					});
+				};
+				let bytes = result?;
+				let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+					message: sf!("{}:// did not resolve to UTF-8 text", uri.raw_scheme),
+				})?;
+				return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
 			},
 			Some(uri) => {
 				let Some(result) = self
 					.resolvers
-					.read(uri.scheme, uri.resource, &uri.selector)
+					.read_query(uri.scheme, uri.resource, uri.query, &uri.selector)
 					.await
 				else {
 					return Err(Fault::SchemeNotReadable {
@@ -620,6 +692,35 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 					});
 				};
 				let bytes = result?;
+				if uri.scheme == resolver::Scheme::Artifact
+					&& uri.selector.is_raw()
+					&& bytes.len() > SNAPSHOT_MAX_BYTES
+				{
+					return Err(Fault::Invalid {
+						message: sf!(
+							"artifact://{} is too large for a raw inline read ({} bytes); materialize it \
+							 by path or select a bounded range",
+							uri.resource,
+							bytes.len()
+						),
+					});
+				}
+				if uri.scheme == resolver::Scheme::Local
+					&& let Some(loaded) = image::process_image_with_policy(
+						bytes.clone().into_bytes(),
+						self.policy.auto_resize_images,
+					)
+					.map_err(|error| Fault::Source { message: error.message() })?
+				{
+					let blob = self
+						.blobs
+						.store(loaded.data, loaded.media_type.clone())
+						.await?;
+					return Ok(vec![
+						PayloadPart::Text { text: loaded.description.clone() },
+						PayloadPart::Blob { blob, alt: loaded.description },
+					]);
+				}
 				let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 					message: sf!("{}://{} did not resolve to UTF-8 text", uri.raw_scheme, uri.resource),
 				})?;
@@ -641,7 +742,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			for candidate in archive::parse_archive_path_candidates(authored) {
 				let archive_path = candidate.archive_path.as_str();
 				let (stat, suffix_from) = match self.sources.stat(Str::new(archive_path)).await {
-					Ok(stat) => (Some(stat), None),
+					Ok(stat) => (Some(stat), normalization_from),
 					Err(_) => {
 						(self.sources.resolve_suffix(Str::new(archive_path)).await?, Some(archive_path))
 					},
@@ -661,7 +762,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			for candidate in sqlite::parse_path_candidates(authored) {
 				let database = candidate.sqlite_path.to_string_lossy();
 				let (stat, suffix_from) = match self.sources.stat(Str::new(database.as_ref())).await {
-					Ok(stat) => (Some(stat), None),
+					Ok(stat) => (Some(stat), normalization_from),
 					Err(_) => (
 						self
 							.sources
@@ -694,28 +795,69 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				}
 			}
 			if let Some(pdf) = pdf_image_member(split.path) {
-				return Err(Fault::Unsupported {
-					message: sf!(
-						"PDF page-image members are not supported by the pdf-inspector backend; read \
-						 {pdf} for the extracted text"
-					),
-				});
+				let stat = match self.sources.stat(Str::new(pdf.path)).await {
+					Ok(stat) => stat,
+					Err(_) => self
+						.sources
+						.resolve_suffix(Str::new(pdf.path))
+						.await?
+						.ok_or_else(|| Fault::Source {
+							message: sf!("PDF does not exist: {}", pdf.path),
+						})?,
+				};
+				let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
+				let raster = pdf::rasterize_page(bytes, pdf.page)
+					.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?;
+				let blob = self.blobs.store(raster.data, raster.media_type).await?;
+				return Ok(vec![
+					PayloadPart::Text {
+						text: sf!(
+							"Rendered PDF page {} of {} from {} ({}x{} PNG).",
+							raster.page,
+							raster.total_pages,
+							stat.display_path,
+							raster.width,
+							raster.height
+						),
+					},
+					PayloadPart::Blob {
+						blob,
+						alt: sf!(
+							"PDF page {} of {}: {}",
+							raster.page,
+							raster.total_pages,
+							stat.display_path
+						),
+					},
+				]);
 			}
 		}
 
-		let mut recovered_from = None;
+		let mut recovered_from = normalization_from;
 		let mut stat = if literal_wins {
 			literal.expect("literal path was checked above")
 		} else if let Ok(stat) = self.sources.stat(Str::new(split.path)).await {
 			stat
 		} else {
-			let stat = self
-				.sources
-				.resolve_suffix(Str::new(split.path))
-				.await?
-				.ok_or_else(|| Fault::source(format!("Path '{}' not found", split.path)))?;
-			recovered_from = Some(split.path);
-			stat
+			let mut repaired = None;
+			for candidate in recovery_candidates {
+				if let Ok(stat) = self.sources.stat(candidate).await {
+					repaired = Some(stat);
+					break;
+				}
+			}
+			if let Some(stat) = repaired {
+				recovered_from = Some(normalized.authored.as_str());
+				stat
+			} else {
+				let stat = self
+					.sources
+					.resolve_suffix(Str::new(split.path))
+					.await?
+					.ok_or_else(|| Fault::source(format!("Path '{}' not found", split.path)))?;
+				recovered_from = Some(split.path);
+				stat
+			}
 		};
 		let suffix_from = recovered_from;
 
@@ -788,11 +930,12 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				suffix_from,
 			);
 		}
-		if markit::supports_path(path) {
+		if self.policy.render_markdown && markit::supports_path(path) {
 			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-			match markit::convert(path, &bytes) {
+			match markit::convert_cached(&self.sources, path, &bytes).await {
 				Ok(Some(converted)) => {
-					let mut text = converted.text.to_string();
+					let converted = converted.conversion;
+					let mut text = format!("Content-Type: text/markdown\n{}", converted.text);
 					if let Some(note) = converted.note {
 						text = format!("{note}\n{text}");
 					}
@@ -1037,8 +1180,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 
 	async fn read_image(&self, stat: &SourceStat) -> Result<Option<Vec<PayloadPart>>, Fault> {
 		let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-		let Some(loaded) =
-			image::process_image(bytes).map_err(|error| Fault::Source { message: error.message() })?
+		let Some(loaded) = image::process_image_with_policy(bytes, self.policy.auto_resize_images)
+			.map_err(|error| Fault::Source { message: error.message() })?
 		else {
 			return Ok(None);
 		};
@@ -1061,6 +1204,15 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		bytes: &Bytes,
 		suffix_from: Option<&str>,
 	) -> Result<Vec<PayloadPart>, Fault> {
+		if !self.policy.hashline_headers {
+			if let Some(from) = suffix_from {
+				summary.text = format::prepend_suffix_resolution_notice(
+					&summary.text,
+					Some(format::SuffixResolution { from, to: &stat.display_path }),
+				);
+			}
+			return Ok(vec![PayloadPart::Text { text: Str::new(summary.text) }]);
+		}
 		let placeholder = format::format_read_hashline_header(&stat.display_path, "0000");
 		summary.text = format!("{}\n{}", placeholder, summary.text);
 		summary.source_lines.insert(0, format::SourceLines::new());
@@ -1101,6 +1253,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		pinned: Option<(&Str, &Str, &Bytes)>,
 		suffix_from: Option<&str>,
 	) -> Result<Vec<PayloadPart>, Fault> {
+		let pinned = pinned.filter(|_| self.policy.hashline_headers);
 		let placeholder_tag = pinned.filter(|_| !parsed.is_raw()).map(|_| "0000");
 		let mut formatted = format_read_projection(stat, text, parsed, placeholder_tag, suffix_from);
 		append_visible_conflict_warning(
@@ -1289,14 +1442,21 @@ fn append_visible_conflict_warning(
 	formatted.append_conflict_warning(&warning);
 }
 
-fn pdf_image_member(input: &str) -> Option<&str> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PdfImageMember<'a> {
+	path: &'a str,
+	page: usize,
+}
+
+fn pdf_image_member(input: &str) -> Option<PdfImageMember<'_>> {
 	let lower = input.to_ascii_lowercase();
 	let index = lower.find(".pdf:")?;
 	let member = &lower[index + 5..];
-	[".png", ".jpg", ".jpeg", ".webp"]
-		.iter()
-		.any(|extension| member.ends_with(extension))
-		.then_some(&input[..index + 4])
+	let stem = [".png", ".jpg", ".jpeg", ".webp"]
+		.into_iter()
+		.find_map(|extension| member.strip_suffix(extension))?;
+	let page = stem.strip_prefix('p')?.parse().ok()?;
+	(page > 0).then_some(PdfImageMember { path: &input[..index + 4], page })
 }
 
 /// Classifies an in-memory byte header as binary (non-UTF-8 text).

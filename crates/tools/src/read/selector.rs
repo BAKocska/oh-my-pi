@@ -529,8 +529,14 @@ pub struct ParsedUri<'a> {
 	pub scheme:        Scheme,
 	/// Caller spelling before `://`, with case preserved.
 	pub raw_scheme:    &'a str,
-	/// Everything after `://`, with a recognized selector removed.
+	/// Authority before the first slash, with case and any port preserved.
+	pub authority:     &'a str,
+	/// Slash-prefixed hierarchical path, or an empty string.
+	pub path:          &'a str,
+	/// Address payload after `://`, excluding query and selector syntax.
 	pub resource:      &'a str,
+	/// Query text without the leading `?`.
+	pub query:         Option<&'a str>,
 	/// Parsed trailing selector.
 	pub selector:      ParsedSelector,
 	/// Original selector text without its leading colon.
@@ -552,19 +558,48 @@ pub fn parse_uri(input: &str) -> Result<Option<ParsedUri<'_>>, SelectorError> {
 	let scheme = Scheme::parse(raw_scheme);
 	let split = split_uri_selector(input, raw_scheme, scheme);
 	let resource_start = raw_scheme.len() + 3;
-	let resource = &split.path[resource_start..];
-	if (resource.is_empty() && scheme != Scheme::History)
+	let address = &split.path[resource_start..];
+	let (resource, query) = if scheme == Scheme::Mcp {
+		(address, None)
+	} else {
+		(
+			address
+				.split_once('?')
+				.map_or(address, |(resource, _)| resource),
+			input
+				.split_once('?')
+				.map(|(_, query)| query.split_once('#').map_or(query, |(query, _)| query)),
+		)
+	};
+	if (scheme != Scheme::Mcp && input.contains('#'))
+		|| (resource.is_empty() && matches!(scheme, Scheme::File | Scheme::Http | Scheme::Unknown))
 		|| resource
 			.bytes()
 			.any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-	{
+		|| query.is_some_and(|query| {
+			query
+				.bytes()
+				.any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
+		}) {
 		return Err(SelectorError::from_message(format!(
-			"Invalid URL '{input}': resource must contain no whitespace and may be empty only for \
-			 history://."
+			"Invalid URL '{input}': path and query must contain no whitespace or fragment; an empty \
+			 resource is allowed only for a built-in internal scheme root."
 		)));
 	}
+	let (authority, path) = resource
+		.split_once('/')
+		.map_or((resource, ""), |(authority, _)| (authority, &resource[authority.len()..]));
 	let selector = parse_selector(split.selector)?;
-	Ok(Some(ParsedUri { scheme, raw_scheme, resource, selector, selector_text: split.selector }))
+	Ok(Some(ParsedUri {
+		scheme,
+		raw_scheme,
+		authority,
+		path,
+		resource,
+		query,
+		selector,
+		selector_text: split.selector,
+	}))
 }
 
 fn valid_uri_scheme(scheme: &str) -> bool {
@@ -590,20 +625,33 @@ fn split_uri_selector<'a>(raw_path: &'a str, raw_scheme: &str, scheme: Scheme) -
 		return SplitPath { path: raw_path, selector: None };
 	}
 	let scheme_end = raw_scheme.len() + 3;
-	if scheme == Scheme::Ssh && !raw_path[scheme_end..].contains('/') {
+	let query_start = raw_path[scheme_end..]
+		.find(['?', '#'])
+		.map_or(raw_path.len(), |offset| scheme_end + offset);
+	let hierarchical = &raw_path[scheme_end..query_start];
+	if scheme == Scheme::Ssh && !hierarchical.contains('/') {
 		return SplitPath { path: raw_path, selector: None };
 	}
-	let mut path = raw_path;
+	let mut path_end = query_start;
 	let mut first_selector_start = None;
-	while let Some(colon) = path.rfind(':').filter(|colon| *colon >= scheme_end) {
-		if !internal_selector_chunk(&path[colon + 1..]) {
+	while let Some(colon) = raw_path[..path_end]
+		.rfind(':')
+		.filter(|colon| *colon >= scheme_end)
+	{
+		if !internal_selector_chunk(&raw_path[colon + 1..path_end]) {
 			break;
 		}
 		first_selector_start = Some(colon + 1);
-		path = &raw_path[..colon];
+		path_end = colon;
 	}
 	match first_selector_start {
-		Some(start) => SplitPath { path, selector: Some(&raw_path[start..]) },
+		Some(start) if query_start == raw_path.len() => {
+			SplitPath { path: &raw_path[..path_end], selector: Some(&raw_path[start..]) }
+		},
+		Some(start) => SplitPath {
+			path:     &raw_path[..path_end],
+			selector: Some(&raw_path[start..query_start]),
+		},
 		None => SplitPath { path: raw_path, selector: None },
 	}
 }
@@ -762,6 +810,54 @@ mod tests {
 		let history = parse_uri("history://").unwrap().unwrap();
 		assert_eq!(history.scheme, Scheme::History);
 		assert_eq!(history.resource, "");
+	}
+
+	#[test]
+	fn separates_authority_path_query_and_selector_without_treating_ports_as_ranges() {
+		let cases = [
+			(
+				"ssh://alice@example.com:2222/tmp/file:5-7",
+				"alice@example.com:2222",
+				"/tmp/file",
+				None,
+				Some("5-7"),
+			),
+			(
+				"agent://Review/output?q=.result.items[0]",
+				"Review",
+				"/output",
+				Some("q=.result.items[0]"),
+				None,
+			),
+			(
+				"agent://Review/output:raw?q=.result",
+				"Review",
+				"/output",
+				Some("q=.result"),
+				Some("raw"),
+			),
+			("artifact://17:1-20", "17", "", None, Some("1-20")),
+			("skill://plugin:name/file", "plugin:name", "/file", None, None),
+		];
+		for (input, authority, path, query, selector) in cases {
+			let parsed = parse_uri(input).unwrap().unwrap();
+			assert_eq!(parsed.authority, authority, "{input}");
+			assert_eq!(parsed.path, path, "{input}");
+			assert_eq!(parsed.query, query, "{input}");
+			assert_eq!(parsed.selector_text, selector, "{input}");
+		}
+	}
+
+	#[test]
+	fn keeps_opaque_payload_only_inside_explicit_mcp_wrapper() {
+		assert!(parse_uri("urn:example:document").unwrap().is_none());
+		let parsed = parse_uri("mcp://urn:example:document?view=full#part")
+			.unwrap()
+			.unwrap();
+		assert_eq!(parsed.scheme, Scheme::Mcp);
+		assert_eq!(parsed.resource, "urn:example:document?view=full#part");
+		assert_eq!(parsed.query, None);
+		assert_eq!(parsed.selector, ParsedSelector::None);
 	}
 
 	#[test]

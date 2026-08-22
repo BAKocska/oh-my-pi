@@ -1,12 +1,22 @@
 //! Dense URL-scheme dispatch and constructor-owned resolver primitives.
 
-use std::{collections::HashMap, future::Future, ops::Range, str::FromStr as _, sync::Arc};
+use std::{
+	fs,
+	future::Future,
+	io::Read as _,
+	ops::Range,
+	path::{Component, Path, PathBuf},
+	str::FromStr as _,
+	sync::Arc,
+};
 
+use dashmap::DashMap;
+use flate2::read::GzDecoder;
 use omp_core::{
-	CowBytes, Str, sf, sparse_index::TrySparseIndex, sparse_map::SparseMap, sparse_set::SparseSet,
+	CowBytes, Hash32, Str, sf, sparse_index::TrySparseIndex, sparse_map::SparseMap,
+	sparse_set::SparseSet,
 };
 use omp_tool::ArtifactLifetime;
-use parking_lot::RwLock;
 use smallvec::SmallVec;
 use strum::{EnumString, FromRepr, IntoStaticStr, VariantArray};
 
@@ -14,6 +24,140 @@ use super::{
 	Fault,
 	selector::{LineRange, ParsedSelector, SelectorError},
 };
+
+include!(concat!(env!("OUT_DIR"), "/omp_docs.rs"));
+
+/// Constructor-owned compressed harness documentation corpus.
+#[derive(Debug)]
+pub struct DocsArchive {
+	inflated: DashMap<Str, CowBytes<'static>>,
+	dev_root: PathBuf,
+}
+
+impl Default for DocsArchive {
+	fn default() -> Self {
+		Self {
+			inflated: DashMap::new(),
+			dev_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs"),
+		}
+	}
+}
+
+impl DocsArchive {
+	/// Returns sorted packaged document names without inflating bodies.
+	pub fn names(&self) -> impl ExactSizeIterator<Item = &'static str> + Clone {
+		PACKAGED_DOCS.iter().map(|(name, _)| *name)
+	}
+
+	/// Lazily inflates one packaged document, with a confined monorepo fallback.
+	pub fn read(&self, relative: &str) -> Result<Option<CowBytes<'static>>, Fault> {
+		validate_doc_path(relative)?;
+		if let Some(bytes) = self.inflated.get(relative).map(|entry| entry.clone()) {
+			return Ok(Some(bytes));
+		}
+		if let Ok(index) = PACKAGED_DOCS.binary_search_by_key(&relative, |(name, _)| *name) {
+			let mut decoder = GzDecoder::new(PACKAGED_DOCS[index].1);
+			let mut body = Vec::new();
+			decoder
+				.read_to_end(&mut body)
+				.map_err(|source| Fault::Source {
+					message: Str::new(format!("Packaged documentation is corrupt: {source}")),
+				})?;
+			let bytes = CowBytes::from(body);
+			let cached = self
+				.inflated
+				.entry(Str::new(relative))
+				.or_insert_with(|| bytes.clone())
+				.clone();
+			return Ok(Some(cached));
+		}
+		self.read_dev_fallback(relative)
+	}
+
+	fn read_dev_fallback(&self, relative: &str) -> Result<Option<CowBytes<'static>>, Fault> {
+		let root = match self.dev_root.canonicalize() {
+			Ok(root) => root,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(source) => {
+				return Err(Fault::Source {
+					message: Str::new(format!("Cannot open development documentation root: {source}")),
+				});
+			},
+		};
+		let candidate = self.dev_root.join(relative);
+		let canonical = match candidate.canonicalize() {
+			Ok(canonical) => canonical,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(source) => {
+				return Err(Fault::Source {
+					message: Str::new(format!("Cannot open development documentation: {source}")),
+				});
+			},
+		};
+		if !canonical.starts_with(&root) {
+			return Err(Fault::Invalid {
+				message: Str::new_static("omp:// documentation paths cannot escape the docs root."),
+			});
+		}
+		let bytes = fs::read(canonical).map_err(|source| Fault::Source {
+			message: Str::new(format!("Cannot read development documentation: {source}")),
+		})?;
+		Ok(Some(CowBytes::from(bytes)))
+	}
+}
+
+fn validate_doc_path(relative: &str) -> Result<(), Fault> {
+	let path = Path::new(relative);
+	if relative.is_empty()
+		|| relative.contains('\\')
+		|| path.is_absolute()
+		|| path
+			.components()
+			.any(|component| !matches!(component, Component::Normal(_)))
+	{
+		return Err(Fault::Invalid {
+			message: Str::new_static(
+				"Invalid omp:// documentation path; use a relative forward-slash path from the index.",
+			),
+		});
+	}
+	Ok(())
+}
+
+/// Scores a case-insensitive fuzzy subsequence match.
+///
+/// Exact, prefix, and substring matches outrank scattered subsequences.
+#[must_use]
+pub fn fuzzy_score(query: &str, candidate: &str) -> Option<u32> {
+	if query.is_empty() {
+		return Some(1);
+	}
+	let query = query.to_ascii_lowercase();
+	let candidate = candidate.to_ascii_lowercase();
+	if candidate == query {
+		return Some(4_000);
+	}
+	if candidate.starts_with(&query) {
+		return Some(3_000u32.saturating_sub(candidate.len() as u32));
+	}
+	if let Some(index) = candidate.find(&query) {
+		return Some(2_000u32.saturating_sub(index as u32));
+	}
+	let mut query_bytes = query.bytes();
+	let mut wanted = query_bytes.next()?;
+	let mut gaps = 0u32;
+	for byte in candidate.bytes() {
+		if byte == wanted {
+			let Some(next) = query_bytes.next() else {
+				return Some(1_000u32.saturating_sub(gaps));
+			};
+			wanted = next;
+		} else {
+			gaps = gaps.saturating_add(1);
+		}
+	}
+	None
+}
 
 /// Canonical generated-data input shared with the frozen Python URL parser.
 pub const URL_VOCABULARY_JSON: &str = include_str!("../../url-vocab.json");
@@ -75,6 +219,8 @@ pub enum Scheme {
 	Vault,
 	/// Detached-job output.
 	Job,
+	/// A session-owned attachment commit target.
+	Attachment,
 	/// A session-registered merge conflict region.
 	Conflict,
 	/// A syntactically valid scheme outside the built-in vocabulary.
@@ -141,6 +287,129 @@ pub trait Resolve: Send + Sync + 'static {
 		resource: &'a str,
 		selector: &'a ParsedSelector,
 	) -> impl Future<Output = Result<CowBytes<'static>, Fault>> + Send + 'a;
+
+	/// Reads a resource with its URI query preserved.
+	///
+	/// Resolvers which do not own query semantics inherit the ordinary read
+	/// path. Query-aware resolvers override this without forcing allocations on
+	/// the common query-free path.
+	fn read_query<'a>(
+		&'a self,
+		resource: &'a str,
+		query: Option<&'a str>,
+		selector: &'a ParsedSelector,
+	) -> impl Future<Output = Result<CowBytes<'static>, Fault>> + Send + 'a {
+		let _ = query;
+		self.read(resource, selector)
+	}
+
+	/// Lists direct entries below the addressed resource.
+	fn list<'a>(
+		&'a self,
+		_resource: &'a str,
+		_max_entries: usize,
+		_max_bytes: usize,
+	) -> impl Future<Output = Result<ResourceList, Fault>> + Send + 'a {
+		async { Err(Fault::Invalid { message: Str::new_static("This resource cannot be listed.") }) }
+	}
+
+	/// Resolves the addressed resource to an Environment URI without reading
+	/// bytes.
+	fn path<'a>(
+		&'a self,
+		_resource: &'a str,
+	) -> impl Future<Output = Result<Option<Str>, Fault>> + Send + 'a {
+		async {
+			Err(Fault::Invalid {
+				message: Str::new_static("This resource has no materializable path."),
+			})
+		}
+	}
+
+	/// Returns bounded local completion candidates.
+	fn complete<'a>(
+		&'a self,
+		_query: &'a str,
+		_max_results: usize,
+	) -> impl Future<Output = Result<Vec<ResourceCompletion>, Fault>> + Send + 'a {
+		async { Ok(Vec::new()) }
+	}
+}
+
+/// One deterministic resource-list entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceEntry {
+	/// Canonical internal URI.
+	pub uri:       Str,
+	/// Display name.
+	pub name:      Str,
+	/// Whether this entry is a directory.
+	pub directory: bool,
+	/// Exact byte length when known, otherwise zero.
+	pub size:      u64,
+}
+
+/// Bounded list returned by one resolver.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResourceList {
+	/// Deterministically ordered entries.
+	pub entries:   Vec<ResourceEntry>,
+	/// Whether the resolver omitted entries or bytes.
+	pub truncated: bool,
+}
+
+/// One internal-resource completion candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceCompletion {
+	/// Complete URI inserted for the caller.
+	pub value:       Str,
+	/// One-line human-facing description.
+	pub description: Str,
+	/// Match quality; higher values sort first.
+	pub score:       u32,
+}
+
+/// Immutable capability and catalog stamp for one scheme.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceStamp {
+	/// Device catalog digest.
+	pub device_hash: [u8; 32],
+	/// Catalog revision.
+	pub revision:    u64,
+	/// Whether bytes from this scheme are edit-locked.
+	pub immutable:   bool,
+}
+
+/// One installed resolver's live capabilities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceCapability {
+	/// Canonical scheme spelling.
+	pub scheme:      &'static str,
+	/// Bounded content reads.
+	pub read:        bool,
+	/// Deterministic entry listing.
+	pub list:        bool,
+	/// Canonical path-only lookup.
+	pub path:        bool,
+	/// Local autocomplete.
+	pub complete:    bool,
+	/// Immutable capability/catalog stamp.
+	pub stamp:       ResourceStamp,
+	/// Human-facing capability description.
+	pub description: Str,
+}
+
+/// Result of a bounded resource read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceRead {
+	/// Returned bytes; empty for path-only operations.
+	pub data:               CowBytes<'static>,
+	/// Canonical Environment path URI when one exists.
+	pub canonical_path_uri: Option<Str>,
+	/// Whether data was cut at the request ceiling.
+	pub truncated:          bool,
+	/// Immutable capability/catalog stamp.
+	pub stamp:              ResourceStamp,
 }
 
 /// Canonical metadata for one resolver registration.
@@ -154,8 +423,20 @@ pub struct SchemeEntry {
 	pub readable:    bool,
 	/// Whether the current policy permits minting this scheme.
 	pub mintable:    bool,
+	/// Whether direct entry listing is supported.
+	pub listable:    bool,
+	/// Whether canonical path-only resolution is supported.
+	pub pathable:    bool,
+	/// Whether local autocomplete is supported.
+	pub completable: bool,
+	/// Whether resolved resources are edit-locked.
+	pub immutable:   bool,
+	/// Resolver-owned monotone content/catalog revision.
+	pub revision:    u64,
 	/// Whether the scheme resource grammar accepts trailing read selectors.
 	pub selectors:   bool,
+	/// Whether bounded dispatch must return the complete body.
+	pub whole_body:  bool,
 	/// Human-readable live capability description.
 	pub description: Str,
 }
@@ -170,9 +451,45 @@ impl SchemeEntry {
 			member: Str::new(format!("{scheme:?}").to_ascii_uppercase()),
 			readable,
 			mintable,
+			listable: false,
+			pathable: false,
+			completable: false,
+			immutable: true,
+			revision: 1,
 			selectors: scheme.accepts_selectors(),
+			whole_body: false,
 			description: description.into(),
 		}
+	}
+
+	/// Declares list, path, and completion capabilities.
+	#[must_use]
+	pub const fn with_capabilities(
+		mut self,
+		listable: bool,
+		pathable: bool,
+		completable: bool,
+	) -> Self {
+		self.listable = listable;
+		self.pathable = pathable;
+		self.completable = completable;
+		self
+	}
+
+	/// Bypasses generic byte truncation because the resolver owns a complete
+	/// bounded body (used by installed skill/rule documents).
+	#[must_use]
+	pub const fn with_whole_body(mut self, whole_body: bool) -> Self {
+		self.whole_body = whole_body;
+		self
+	}
+
+	/// Sets editability and the resolver-owned revision.
+	#[must_use]
+	pub const fn with_stamp(mut self, immutable: bool, revision: u64) -> Self {
+		self.immutable = immutable;
+		self.revision = revision;
+		self
 	}
 }
 
@@ -199,17 +516,19 @@ pub enum ResolverTableError {
 /// Builder for one immutable constructor-owned resolver table.
 #[derive(Debug)]
 pub struct ResolverTableBuilder<R> {
-	claimed:   SparseSet<Scheme>,
-	entries:   Vec<SchemeEntry>,
-	resolvers: Vec<R>,
+	claimed:          SparseSet<Scheme>,
+	entries:          Vec<SchemeEntry>,
+	resolvers:        Vec<R>,
+	unknown_fallback: Option<R>,
 }
 
 impl<R> Default for ResolverTableBuilder<R> {
 	fn default() -> Self {
 		Self {
-			claimed:   SparseSet::with_capacity(Scheme::ALL.len()),
-			entries:   Vec::new(),
-			resolvers: Vec::new(),
+			claimed:          SparseSet::with_capacity(Scheme::ALL.len()),
+			entries:          Vec::new(),
+			resolvers:        Vec::new(),
+			unknown_fallback: None,
 		}
 	}
 }
@@ -228,19 +547,46 @@ impl<R> ResolverTableBuilder<R> {
 		Ok(())
 	}
 
+	/// Installs one raw-scheme fallback without registering
+	/// [`Scheme::Unknown`] in the dense built-in table.
+	pub fn install_unknown_fallback(&mut self, resolver: R) -> Result<(), ResolverTableError> {
+		if self.unknown_fallback.replace(resolver).is_some() {
+			return Err(ResolverTableError::Duplicate(Scheme::Unknown));
+		}
+		Ok(())
+	}
+
 	/// Freezes registrations into an O(1) dispatch table.
 	#[must_use]
 	pub fn build(self) -> ResolverTable<R> {
 		let mut routes = SparseMap::with_capacity(Scheme::ALL.len());
+		let mut hasher = Hash32::hasher();
 		for (index, entry) in self.entries.iter().enumerate() {
-			if entry.readable {
+			if entry.readable || entry.listable || entry.pathable || entry.completable {
 				routes.insert(entry.scheme, ResolverId(index));
 			}
+			let scheme: &'static str = entry.scheme.into();
+			hasher
+				.update(scheme)
+				.update([entry.readable as u8, entry.listable as u8, entry.pathable as u8])
+				.update([entry.completable as u8, entry.immutable as u8, entry.whole_body as u8])
+				.update(entry.revision.to_le_bytes())
+				.update(entry.description.as_bytes());
 		}
+		let device_hash = hasher.finalize().into_bytes();
+		let revision = u64::from_le_bytes(
+			device_hash[..8]
+				.try_into()
+				.expect("a 32-byte hash always has an 8-byte prefix"),
+		)
+		.max(1);
 		ResolverTable {
 			routes,
 			entries: self.entries.into_boxed_slice(),
 			resolvers: self.resolvers.into_boxed_slice(),
+			unknown_fallback: self.unknown_fallback,
+			device_hash,
+			revision,
 		}
 	}
 }
@@ -248,9 +594,12 @@ impl<R> ResolverTableBuilder<R> {
 /// O(1) scheme dispatch into concrete, constructor-owned resolver state.
 #[derive(Debug)]
 pub struct ResolverTable<R> {
-	routes:    SparseMap<Scheme, ResolverId>,
-	entries:   Box<[SchemeEntry]>,
-	resolvers: Box<[R]>,
+	routes:           SparseMap<Scheme, ResolverId>,
+	entries:          Box<[SchemeEntry]>,
+	resolvers:        Box<[R]>,
+	unknown_fallback: Option<R>,
+	device_hash:      [u8; 32],
+	revision:         u64,
 }
 
 impl<R> Default for ResolverTable<R> {
@@ -278,10 +627,71 @@ impl<R> ResolverTable<R> {
 		&self.entries
 	}
 
-	/// Captures metadata under the registry device-side digest.
+	/// Captures immutable metadata under the constructor-derived device digest.
 	#[must_use]
-	pub fn snapshot(&self, device_hash: [u8; 32]) -> SchemeSnapshot {
-		SchemeSnapshot { device_hash, entries: self.entries.clone() }
+	pub fn snapshot(&self) -> SchemeSnapshot {
+		SchemeSnapshot { device_hash: self.device_hash, entries: self.entries.clone() }
+	}
+
+	/// Returns the constructor-derived device digest.
+	#[must_use]
+	pub const fn device_hash(&self) -> [u8; 32] {
+		self.device_hash
+	}
+
+	/// Returns the immutable device-hash-keyed catalog revision.
+	#[must_use]
+	pub const fn revision(&self) -> u64 {
+		self.revision
+	}
+
+	/// Whether this deployment has a bounded raw-scheme fallback.
+	#[must_use]
+	pub const fn has_unknown_fallback(&self) -> bool {
+		self.unknown_fallback.is_some()
+	}
+
+	/// Returns metadata for one installed scheme.
+	#[must_use]
+	pub fn entry(&self, scheme: Scheme) -> Option<&SchemeEntry> {
+		let id = *self.routes.get(scheme)?;
+		self.entries.get(id.index())
+	}
+
+	/// Returns the live capability for one installed scheme.
+	#[must_use]
+	pub fn capability(&self, scheme: Scheme) -> Option<ResourceCapability> {
+		let entry = self.entry(scheme)?;
+		Some(ResourceCapability {
+			scheme:      entry.scheme.into(),
+			read:        entry.readable,
+			list:        entry.listable,
+			path:        entry.pathable,
+			complete:    entry.completable,
+			stamp:       ResourceStamp {
+				device_hash: self.device_hash,
+				revision:    entry.revision,
+				immutable:   entry.immutable,
+			},
+			description: entry.description.clone(),
+		})
+	}
+
+	/// Iterates installed capabilities in constructor order without allocation.
+	pub fn capabilities(&self) -> impl ExactSizeIterator<Item = ResourceCapability> + '_ {
+		self.entries.iter().map(|entry| ResourceCapability {
+			scheme:      entry.scheme.into(),
+			read:        entry.readable,
+			list:        entry.listable,
+			path:        entry.pathable,
+			complete:    entry.completable,
+			stamp:       ResourceStamp {
+				device_hash: self.device_hash,
+				revision:    entry.revision,
+				immutable:   entry.immutable,
+			},
+			description: entry.description.clone(),
+		})
 	}
 
 	/// Returns the resolver selected for `scheme`.
@@ -293,6 +703,16 @@ impl<R> ResolverTable<R> {
 }
 
 impl<R: Resolve> ResolverTable<R> {
+	/// Dispatches one raw-scheme read through the separately installed
+	/// fallback. The complete authored URI is preserved for the host.
+	pub async fn read_unknown(
+		&self,
+		uri: &str,
+		selector: &ParsedSelector,
+	) -> Option<Result<CowBytes<'static>, Fault>> {
+		Some(self.unknown_fallback.as_ref()?.read(uri, selector).await)
+	}
+
 	/// Dispatches one read, returning `None` when this deployment has no reader
 	/// for the scheme.
 	pub async fn read(
@@ -301,7 +721,160 @@ impl<R: Resolve> ResolverTable<R> {
 		resource: &str,
 		selector: &ParsedSelector,
 	) -> Option<Result<CowBytes<'static>, Fault>> {
-		Some(self.get(scheme)?.read(resource, selector).await)
+		self.read_query(scheme, resource, None, selector).await
+	}
+
+	/// Dispatches one query-preserving read.
+	pub async fn read_query(
+		&self,
+		scheme: Scheme,
+		resource: &str,
+		query: Option<&str>,
+		selector: &ParsedSelector,
+	) -> Option<Result<CowBytes<'static>, Fault>> {
+		let entry = self.entry(scheme)?;
+		entry.readable.then_some(())?;
+		Some(
+			self
+				.get(scheme)?
+				.read_query(resource, query, selector)
+				.await,
+		)
+	}
+
+	/// Performs a byte-bounded read or path-only lookup.
+	pub async fn read_bounded(
+		&self,
+		scheme: Scheme,
+		resource: &str,
+		selector: &ParsedSelector,
+		max_bytes: usize,
+		path_only: bool,
+	) -> Option<Result<ResourceRead, Fault>> {
+		self
+			.read_bounded_query(scheme, resource, None, selector, max_bytes, path_only)
+			.await
+	}
+
+	/// Performs a query-preserving byte-bounded read or path-only lookup.
+	pub async fn read_bounded_query(
+		&self,
+		scheme: Scheme,
+		resource: &str,
+		query: Option<&str>,
+		selector: &ParsedSelector,
+		max_bytes: usize,
+		path_only: bool,
+	) -> Option<Result<ResourceRead, Fault>> {
+		let entry = self.entry(scheme)?;
+		if !entry.readable || (path_only && !entry.pathable) {
+			return None;
+		}
+		let resolver = self.get(scheme)?;
+		let canonical_path_uri = if entry.pathable {
+			match resolver.path(resource).await {
+				Ok(path) => path,
+				Err(error) if path_only => return Some(Err(error)),
+				Err(_) => None,
+			}
+		} else {
+			None
+		};
+		let stamp = ResourceStamp {
+			device_hash: self.device_hash,
+			revision:    entry.revision,
+			immutable:   entry.immutable,
+		};
+		if path_only {
+			return Some(Ok(ResourceRead {
+				data: CowBytes::default(),
+				canonical_path_uri,
+				truncated: false,
+				stamp,
+			}));
+		}
+		let bytes = match resolver.read_query(resource, query, selector).await {
+			Ok(bytes) => bytes,
+			Err(error) => return Some(Err(error)),
+		};
+		let truncated = !entry.whole_body && bytes.len() > max_bytes;
+		let data = if truncated {
+			bytes.slice(..max_bytes).into_owned()
+		} else {
+			bytes
+		};
+		Some(Ok(ResourceRead { data, canonical_path_uri, truncated, stamp }))
+	}
+
+	/// Performs a bounded deterministic listing.
+	pub async fn list(
+		&self,
+		scheme: Scheme,
+		resource: &str,
+		max_entries: usize,
+		max_bytes: usize,
+	) -> Option<Result<ResourceList, Fault>> {
+		let entry = self.entry(scheme)?;
+		entry.listable.then_some(())?;
+		let resolver = self.get(scheme)?;
+		let mut listing = match resolver.list(resource, max_entries, max_bytes).await {
+			Ok(listing) => listing,
+			Err(error) => return Some(Err(error)),
+		};
+		listing.entries.sort_unstable_by(|left, right| {
+			left
+				.name
+				.cmp(&right.name)
+				.then_with(|| left.uri.cmp(&right.uri))
+		});
+		let mut retained = listing.entries.len().min(max_entries);
+		let mut used = 0usize;
+		for (index, entry) in listing.entries[..retained].iter().enumerate() {
+			let bytes = entry.uri.len().saturating_add(entry.name.len());
+			if used.saturating_add(bytes) > max_bytes {
+				retained = index;
+				break;
+			}
+			used += bytes;
+		}
+		if retained < listing.entries.len() {
+			listing.entries.truncate(retained);
+			listing.truncated = true;
+		}
+		Some(Ok(listing))
+	}
+
+	/// Resolves a canonical Environment path without reading bytes.
+	pub async fn path(&self, scheme: Scheme, resource: &str) -> Option<Result<ResourceRead, Fault>> {
+		self
+			.read_bounded(scheme, resource, &ParsedSelector::None, 0, true)
+			.await
+	}
+
+	/// Returns bounded, deterministically sorted completion candidates.
+	pub async fn complete(
+		&self,
+		scheme: Scheme,
+		query: &str,
+		max_results: usize,
+	) -> Option<Result<(Vec<ResourceCompletion>, bool), Fault>> {
+		let entry = self.entry(scheme)?;
+		entry.completable.then_some(())?;
+		let resolver = self.get(scheme)?;
+		let requested = max_results.saturating_add(1);
+		let mut completions = match resolver.complete(query, requested).await {
+			Ok(completions) => completions,
+			Err(error) => return Some(Err(error)),
+		};
+		completions.sort_unstable_by(|left, right| {
+			right
+				.score
+				.cmp(&left.score)
+				.then_with(|| left.value.cmp(&right.value))
+		});
+		let truncated = completions.len() > max_results;
+		completions.truncate(max_results);
+		Some(Ok((completions, truncated)))
 	}
 }
 
@@ -407,12 +980,12 @@ impl LineOffsets {
 /// Cache entries retain offsets only. Returned slices share the resolver's
 /// [`CowBytes`] backing allocation.
 #[derive(Debug, Default)]
-pub struct LineOffsetCache(RwLock<HashMap<Str, Arc<LineOffsets>>>);
+pub struct LineOffsetCache(DashMap<Str, Arc<LineOffsets>>);
 
 impl LineOffsetCache {
 	/// Returns cached offsets for `key`, if the resource has been scanned.
 	fn get(&self, key: &str) -> Option<Arc<LineOffsets>> {
-		self.0.read().get(key).cloned()
+		self.0.get(key).map(|entry| Arc::clone(&entry))
 	}
 
 	/// Scans and caches an immutable resource once.
@@ -423,7 +996,6 @@ impl LineOffsetCache {
 		let offsets = Arc::new(LineOffsets::scan(bytes));
 		self
 			.0
-			.write()
 			.entry(Str::new(key))
 			.or_insert_with(|| offsets.clone())
 			.clone()
@@ -565,4 +1137,80 @@ fn usize_range_to_u64(range: Range<usize>) -> Result<Range<u64>, Fault> {
 		message: sf!("Artifact line offset exceeds the blob protocol range"),
 	})?;
 	Ok(start..end)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[derive(Debug)]
+	struct TestResolver;
+
+	impl Resolve for TestResolver {
+		async fn read<'a>(
+			&'a self,
+			_resource: &'a str,
+			_selector: &'a ParsedSelector,
+		) -> Result<CowBytes<'static>, Fault> {
+			Ok(CowBytes::from(&b"abcdef"[..]))
+		}
+
+		async fn complete(
+			&self,
+			_query: &str,
+			_max_results: usize,
+		) -> Result<Vec<ResourceCompletion>, Fault> {
+			Ok(vec![
+				ResourceCompletion {
+					value:       "skill://beta".into(),
+					description: "second".into(),
+					score:       10,
+				},
+				ResourceCompletion {
+					value:       "skill://alpha".into(),
+					description: "first".into(),
+					score:       10,
+				},
+			])
+		}
+	}
+
+	#[tokio::test]
+	async fn table_stamps_and_bounds_reads_and_completions() {
+		let mut builder = ResolverTable::builder();
+		builder
+			.register(
+				SchemeEntry::new(Scheme::Skill, true, false, "skills")
+					.with_capabilities(false, false, true)
+					.with_stamp(true, 7),
+				TestResolver,
+			)
+			.unwrap();
+		let table = builder.build();
+		let snapshot = table.snapshot();
+		assert_ne!(snapshot.device_hash, [0; 32]);
+		assert_ne!(table.revision(), 0);
+		let read = table
+			.read_bounded(Scheme::Skill, "alpha", &ParsedSelector::None, 3, false)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(&*read.data, b"abc");
+		assert!(read.truncated);
+		assert!(read.stamp.immutable);
+		let (completed, truncated) = table.complete(Scheme::Skill, "", 1).await.unwrap().unwrap();
+		assert_eq!(completed[0].value, "skill://alpha");
+		assert!(truncated);
+	}
+
+	#[test]
+	fn packaged_docs_are_sorted_and_lazily_readable() {
+		let docs = DocsArchive::default();
+		let names = docs.names().collect::<Vec<_>>();
+		assert!(!names.is_empty());
+		assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+		let bytes = docs.read(names[0]).unwrap().unwrap();
+		assert!(!bytes.is_empty());
+		assert!(docs.read("../Cargo.toml").is_err());
+	}
 }

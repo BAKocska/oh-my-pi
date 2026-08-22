@@ -1,11 +1,20 @@
-//! Applies omp-py's final-link requirements to tool integration tests.
+//! Generates packaged documentation and applies omp-py's final-link
+//! requirements.
 
-use std::path::{Path, PathBuf};
+use std::{
+	fmt::Write as _,
+	fs,
+	io::{self, Write as _},
+	path::{Path, PathBuf},
+};
+
+use flate2::{Compression, write::GzEncoder};
 
 fn main() {
+	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	generate_docs_manifest(&manifest).expect("generate compressed omp:// documentation manifest");
 	println!("cargo::rerun-if-env-changed=PYO3_CONFIG_FILE");
 
-	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 	let vendor = std::env::var_os("PYO3_CONFIG_FILE")
 		.map(PathBuf::from)
 		.and_then(|p| {
@@ -31,4 +40,61 @@ fn main() {
 		}
 	}
 	println!("cargo::rustc-link-arg=-Wl,-export_dynamic");
+}
+
+fn generate_docs_manifest(manifest: &Path) -> io::Result<()> {
+	let docs_root = manifest.join("../../docs");
+	println!("cargo::rerun-if-changed={}", docs_root.display());
+	let output_root = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+	let mut paths = Vec::new();
+	collect_markdown(&docs_root, &docs_root, &mut paths)?;
+	paths.sort();
+
+	let mut generated = String::from(
+		"/// Sorted packaged documentation entries: `(relative path, gzip bytes)`.\npub static \
+		 PACKAGED_DOCS: &[(&str, &[u8])] = &[\n",
+	);
+	for (index, relative) in paths.iter().enumerate() {
+		let source = docs_root.join(relative);
+		let body = fs::read(&source)?;
+		let compressed_path = output_root.join(format!("omp-doc-{index}.gz"));
+		let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+		encoder.write_all(&body)?;
+		fs::write(&compressed_path, encoder.finish()?)?;
+		let relative = relative.to_string_lossy().replace('\\', "/");
+		let _ = writeln!(
+			generated,
+			"\t({relative:?}, include_bytes!({compressed:?})),",
+			compressed = compressed_path.display().to_string()
+		);
+	}
+	generated.push_str("];\n");
+	fs::write(output_root.join("omp_docs.rs"), generated)
+}
+
+fn collect_markdown(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+	let entries = match fs::read_dir(directory) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == io::ErrorKind::NotFound && directory == root => return Ok(()),
+		Err(error) => return Err(error),
+	};
+	for entry in entries {
+		let entry = entry?;
+		let file_type = entry.file_type()?;
+		if file_type.is_symlink() {
+			continue;
+		}
+		if file_type.is_dir() {
+			collect_markdown(root, &entry.path(), output)?;
+		} else if file_type.is_file() && entry.path().extension().is_some_and(|ext| ext == "md") {
+			output.push(
+				entry
+					.path()
+					.strip_prefix(root)
+					.expect("entry remains below docs root")
+					.to_path_buf(),
+			);
+		}
+	}
+	Ok(())
 }
