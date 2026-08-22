@@ -81,6 +81,23 @@ message ToolExample {
   bytes args_json = 1;
   optional string description = 2;
 }
+enum PreludeParamKind {
+  PRELUDE_PARAM_KIND_UNSPECIFIED = 0;
+  PRELUDE_PARAM_KIND_POSITIONAL_OR_KEYWORD = 1;
+  PRELUDE_PARAM_KIND_KEYWORD_ONLY = 2;
+}
+
+// Python parameter shape for an eval-prelude helper (declarations with
+// revision family "prelude").
+message PreludeParam {
+  string name = 1;
+  PreludeParamKind kind = 2;
+  // JSON-encoded default value; absent = required parameter.
+  optional bytes default_json = 3;
+  // Display-only annotation text for generated stubs.
+  optional string annotation = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
 message ToolDecl {
   omp.inference.v1.ToolDef definition = 1;
   string rev = 2;
@@ -94,6 +111,7 @@ message ToolDecl {
   bool streams_args = 10;
   // Maximum device envelope; Core may only narrow it at authorization.
   optional omp.policy.v1.EffectEnvelope effects = 11;
+  repeated PreludeParam prelude_params = 12;
   omp.inference.v1.ValueMap props = 15;
 }
 
@@ -365,7 +383,7 @@ message LifecycleWorkerEnvelope {
     ServiceCall service_call = 3;
     ResourceQuery resource_query = 4;
     ServiceResult service_result = 5;
-  DeclareSecretRules declare_secret_rules = 6;
+    DeclareSecretRules declare_secret_rules = 6;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -389,6 +407,7 @@ message DeclareSecretRules {
   repeated SecretRuleDeclaration rules = 3;
   omp.inference.v1.ValueMap props = 15;
 }
+
 // Streaming-argument forwarding and pull cursor.
 message PullRequest {
   string call_id = 1;
@@ -783,6 +802,7 @@ message CampaignWorkerEnvelope {
   }
   omp.inference.v1.ValueMap props = 15;
 }
+
 // Projection, lift, render, and availability operations.
 message ProjectionKey {
   string name = 1;
