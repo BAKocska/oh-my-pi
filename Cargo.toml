@@ -21,6 +21,7 @@ argmax = "0.3"
 async-recursion = "1.1"
 async-stream = "0.3"
 async-trait = "0.1"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
 bigdecimal = "0.4"
 blake2 = "0.10"
 blake3 = { version = "1.8", features = ["mmap"] }
@@ -37,6 +38,7 @@ candle-core = "0.11"
 candle-nn = "0.11"
 cfg-if = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
+clap_complete = "4"
 codesnake = "0.2"
 command-fds = "0.3"
 crc32fast = "1.5"
@@ -50,6 +52,7 @@ fastembed = { version = "5.17.4", default-features = false, features = ["hf-hub-
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 flume = "0.11"
 fontdb = "0.24"
+fontdue = "0.9"
 futures = "0.3"
 globset = "0.4"
 grep-cli = "0.1"
@@ -58,7 +61,9 @@ grep-pcre2 = "0.1"
 grep-printer = "0.3"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+hayro = "0.7.1"
 heapless = { version = "0.9.3", features = ["serde"] }
+hmac = "0.12"
 hifijson = "0.2"
 html-to-markdown-rs = { version = "3.9.2", default-features = false }
 http = "1.5"
@@ -68,6 +73,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = "0.1"
 ignore = "0.4"
 im = { version = "15.1", features = ["serde"] }
+inventory = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 indicatif = "0.18"
 insta = { version = "1.47", features = ["glob", "ron", "redactions"] }
@@ -112,10 +118,17 @@ omp-gui = { path = "crates/gui", version = "0.1.0" }
 omp-hashline = { path = "crates/hashline", version = "0.1.0" }
 omp-llm-catalog = { path = "crates/llm-catalog", version = "0.1.0" }
 omp-llm-inference = { path = "crates/llm-inference", version = "0.1.0" }
+omp-memory = { path = "crates/memory", version = "0.1.0" }
+omp-oauth = { path = "crates/oauth", version = "0.1.0" }
 omp-macros = { path = "crates/macros", version = "0.1.0" }
 omp-proto = { path = "crates/proto", version = "0.1.0" }
 omp-py = { path = "crates/py", version = "0.1.0" }
 omp-rpc = { path = "crates/rpc", version = "0.1.0" }
+omp-collab = { path = "crates/collab", version = "0.1.0" }
+omp-sdk = { path = "crates/sdk", version = "0.1.0" }
+omp-snapcompact = { path = "crates/omp-snapcompact", version = "0.1.0" }
+omp-secrets = { path = "crates/secrets", version = "0.1.0" }
+omp-settings = { path = "crates/settings", version = "0.1.0" }
 omp-sandbox = { path = "crates/sandbox", version = "0.1.0" }
 omp-shell = { path = "crates/shell", version = "0.1.0" }
 omp-shell-builtins = { path = "crates/shell-builtins", version = "0.1.0" }
@@ -127,12 +140,14 @@ omp-tool = { path = "crates/tool", version = "0.1.0" }
 omp-tools = { path = "crates/tools", version = "0.1.0" }
 omp-tui = { path = "crates/tui", version = "0.1.0" }
 omp-voice-kokoro = { path = "crates/voice-kokoro", version = "0.1.0" }
+omp-voice = { path = "crates/voice", version = "0.1.0" }
 omp-webview = { path = "crates/webview", version = "0.1.0" }
 omp-walker = { path = "crates/walker", version = "0.1.0" }
 opentelemetry = "0.32.0"
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["logs", "metrics", "rt-tokio", "trace"] }
+opus = "0.3.1"
 parking_lot = "0.12"
 parking_lot_core = "0.9.12"
 parse_datetime = "0.14"
@@ -160,6 +175,8 @@ rustc-hash = "2"
 rustc-demangle = "0.1"
 rustix = { version = "1.1", features = ["fs", "pipe", "process", "time"] }
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "2.4"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 schemars = "1.2.2"
@@ -168,6 +185,7 @@ rustybuzz = "0.20"
 self_cell = "1"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
+serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
@@ -250,10 +268,11 @@ tree-sitter-yaml = "0.7"
 tree-sitter-zig = "1.1"
 url = "2.5"
 voice-g2p = "0.2.2"
+webrtc = "0.17.2"
 whisper-rs = { version = "0.16", default-features = false }
 wgpu = "30"
 winit = "0.30"
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
 wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["prefix-symbols", "stream", "tokio-rt", "webpki-roots"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 zune-jpeg = "0.5"
