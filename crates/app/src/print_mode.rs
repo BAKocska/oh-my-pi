@@ -99,6 +99,8 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		project: std::env::current_dir().into_diagnostic()?,
 		additional_roots: args.add_dir.clone().into_boxed_slice(),
 		model,
+		initial_campaign: args.plan_yolo.then_some("plan"),
+		initial_prompt_slot: args.plan_yolo.then_some("plan-yolo"),
 		resume: None,
 		fork: None,
 		py_eval: false,
@@ -118,10 +120,6 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 			.into_diagnostic()?;
 	}
 	if args.plan_yolo {
-		session
-			.modes()
-			.enter_plan(true)
-			.map_err(|error| miette!(error))?;
 		session.publish(AgentEvent::PlanStateChanged {
 			from:               PlanState::Inactive,
 			to:                 PlanState::Yolo,

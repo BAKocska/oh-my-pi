@@ -16,15 +16,17 @@ pub use cancel::{
 	CancellationOutcome, MAX_KILL_ESCALATIONS_PER_SESSION,
 };
 pub use dispatch::{
-	CallbackConcurrency, DispatchError, DispatchPending, DispatchRequest, DispatchRouter,
-	EventDeadline,
+	CAMPAIGN_SUBMISSION_TIMEOUT, CallbackConcurrency, CampaignDispatch, CampaignDispatchError,
+	DispatchError, DispatchPending, DispatchRequest, DispatchRouter, EventDeadline,
+	decode_campaign_reaction,
 };
 pub use lifecycle::{
 	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,
-	AvailabilityBatch, AvailabilitySink, DeclarationDrift, DeclarationSet, ExtensionManifest,
-	GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost, LifecycleMachine, Principal,
-	PrincipalAuthority, PrincipalMismatch, RegistryAvailabilitySink, RestartReason,
-	ToolDeclarationKey,
+	AvailabilityBatch, AvailabilitySink, CampaignDeclarationTable, CampaignManifestError,
+	DeclarationDrift, DeclarationSet, ExtensionManifest, GenerationFence, HookDeclarationKey,
+	LifecycleError, LifecycleHost, LifecycleMachine, Principal, PrincipalAuthority,
+	PrincipalMismatch, RegistryAvailabilitySink, RestartReason, ToolDeclarationKey,
+	validate_campaign_manifests,
 };
 pub use quota::{
 	ChargeOutcome, ControlQuotaLedger, FairControlQueue, QuotaBehavior, QuotaError, QuotaExceeded,

@@ -60,7 +60,7 @@ impl BridgeHost for PreludeHost {
 			})),
 			"__completion__" if !args["schema"].is_null() => Ok(json!({ "text": "{\"answer\":42}" })),
 			"__completion__" => Ok(json!({ "text": "completed" })),
-			"__agent__" if !args["schema"].is_null() => Ok(json!({
+			"__agent__" if !args["outputSchema"].is_null() => Ok(json!({
 				"text": "{\"answer\":42}",
 				"data": { "answer": 42 },
 				"details": { "id": "child-structured", "agent": "task" }
@@ -192,7 +192,7 @@ assert _child == {
     "text": "child output", "output": "child output", "handle": "agent://child-1",
     "id": "child-1", "agent": "task", "isolated": True,
 }
-assert agent("structured", schema={"type": "object"}) == {"answer": 42}
+assert agent("structured", outputSchema={"type": "object"}) == {"answer": 42}
 assert parallel([lambda: 1, lambda: 2]) == [1, 2]
 assert pipeline([1, 2], lambda n: n + 1, lambda n: n * 2) == [4, 6]
 log("working")

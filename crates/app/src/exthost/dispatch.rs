@@ -9,9 +9,11 @@ use std::{
 use omp_agent::JournalCustomEntry;
 use omp_core::{CowBytes, SparseMap, Str};
 use omp_proto::toolhost::v1::{
+	CampaignHostEnvelope, CampaignReact, CampaignReaction, CampaignWorkerEnvelope,
 	Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
 	LifecycleEventContext, RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1,
-	WorkerFrame, hook_host_envelope, lifecycle_worker_envelope, ui_worker_envelope, worker_frame,
+	WorkerFrame, campaign_host_envelope, campaign_worker_envelope, hook_host_envelope,
+	lifecycle_worker_envelope, ui_worker_envelope, worker_frame,
 };
 use parking_lot::Mutex;
 use prost::Message;
@@ -286,6 +288,62 @@ pub struct DispatchRequest {
 	pub payload:  CowBytes<'static>,
 }
 
+/// Submission-latency deadline shared by extension campaign callbacks.
+pub const CAMPAIGN_SUBMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One revisioned campaign callback routed through the ordinary actor.
+#[derive(Clone, Debug)]
+pub struct CampaignDispatch {
+	/// Extension actor that owns the campaign declaration.
+	pub extension: Str,
+	/// Revision-1 callback payload.
+	pub react:     CampaignReact,
+}
+
+impl CampaignDispatch {
+	/// Encodes this callback with serialized hook-equivalent reentrancy.
+	pub fn request(mut self, id: u64) -> Result<DispatchRequest, CampaignDispatchError> {
+		if id == 0 {
+			return Err(CampaignDispatchError::ZeroId);
+		}
+		self.react.deadline_ms =
+			u64::try_from(CAMPAIGN_SUBMISSION_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+		let envelope = CampaignHostEnvelope {
+			body:  Some(campaign_host_envelope::Body::React(self.react)),
+			props: None,
+		};
+		Ok(DispatchRequest {
+			id,
+			policy: CallbackConcurrency::Serialized,
+			deadline: EventDeadline { at: Instant::now() + CAMPAIGN_SUBMISSION_TIMEOUT },
+			payload: CowBytes::from(envelope.encode_to_vec()),
+		})
+	}
+}
+
+/// Invalid campaign callback envelope or correlation.
+#[derive(Debug, Error)]
+pub enum CampaignDispatchError {
+	/// Zero cannot identify a correlated callback.
+	#[error("campaign dispatch correlation id must be nonzero")]
+	ZeroId,
+	/// The worker payload was not a campaign reaction.
+	#[error("worker returned no campaign reaction")]
+	MissingReaction,
+	/// The worker payload was malformed protobuf.
+	#[error("worker returned a malformed campaign reaction")]
+	Decode(#[source] prost::DecodeError),
+}
+
+/// Decodes one worker campaign response after ordinary router correlation.
+pub fn decode_campaign_reaction(payload: &[u8]) -> Result<CampaignReaction, CampaignDispatchError> {
+	let envelope = CampaignWorkerEnvelope::decode(payload).map_err(CampaignDispatchError::Decode)?;
+	match envelope.body {
+		Some(campaign_worker_envelope::Body::Reaction(reaction)) => Ok(reaction),
+		_ => Err(CampaignDispatchError::MissingReaction),
+	}
+}
+
 /// Correlated completion receiver returned to the caller.
 pub struct DispatchPending {
 	response: flume::Receiver<Result<CowBytes<'static>, DispatchError>>,
@@ -531,5 +589,52 @@ impl DispatchRouter {
 impl ExtensionActor {
 	fn policy_admits(&self, policy: CallbackConcurrency) -> bool {
 		policy.admits(self.running)
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_proto::toolhost::v1::{
+		CampaignPoint, CampaignVerdictKind, CampaignWorkerEnvelope, campaign_worker_envelope,
+	};
+
+	use super::*;
+
+	#[test]
+	fn campaign_callbacks_use_submission_latency_and_serialized_reentrancy() {
+		let request = CampaignDispatch {
+			extension: Str::new_static("dev.example"),
+			react:     CampaignReact {
+				campaign_id: "retry".to_owned(),
+				engagement_id: "eng-1".to_owned(),
+				campaign_rev: 1,
+				point: CampaignPoint::Settle.into(),
+				..Default::default()
+			},
+		}
+		.request(7)
+		.expect("campaign request");
+		assert_eq!(request.id, 7);
+		assert_eq!(request.policy, CallbackConcurrency::Serialized);
+		let envelope = CampaignHostEnvelope::decode(request.payload.as_ref()).expect("host envelope");
+		let Some(campaign_host_envelope::Body::React(react)) = envelope.body else {
+			panic!("campaign react body");
+		};
+		assert_eq!(react.deadline_ms, 30_000);
+	}
+
+	#[test]
+	fn campaign_reaction_decode_is_revisioned_and_typed() {
+		let expected = CampaignReaction {
+			engagement_id: "eng-1".to_owned(),
+			campaign_rev: 1,
+			verdict: CampaignVerdictKind::Continue.into(),
+			..Default::default()
+		};
+		let bytes = CampaignWorkerEnvelope {
+			body:  Some(campaign_worker_envelope::Body::Reaction(expected.clone())),
+			props: None,
+		}
+		.encode_to_vec();
+		assert_eq!(decode_campaign_reaction(&bytes).unwrap(), expected);
 	}
 }

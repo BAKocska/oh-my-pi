@@ -82,6 +82,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		Arc<crate::memory::ReflectionBridgeHost>,
 		omp_tools::eval::EvalSessionControl,
 		AgentCheckpointControl,
+		omp_tools::staging::PreviewRegistry,
 		Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
 		AgentGoalControl,
 		Arc<SearchBridgeHost>,
@@ -89,6 +90,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 	),
 	EnvdError,
 > {
+	let previews = omp_tools::staging::PreviewRegistry::new();
 	registry.protect_core_claims([
 		"read",
 		"write",
@@ -467,7 +469,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 	}
 	if tool_settings.enabled("ast_edit") {
 		registry.register(
-			omp_tools::ast_edit::tool(workspace.root().to_path_buf()),
+			omp_tools::ast_edit::tool(workspace.root().to_path_buf(), previews.clone()),
 			Presentation::Slot,
 			core_claims(),
 		)?;
@@ -670,6 +672,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		reflection_bridge,
 		eval_control,
 		checkpoint_control,
+		previews,
 		resolvers,
 		goal_control,
 		search_bridge,
@@ -678,8 +681,9 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 }
 #[derive(Clone)]
 struct GoalBinding {
-	id:    u64,
-	modes: Arc<crate::modes::ExecutionModes>,
+	id:     u64,
+	modes:  Arc<crate::modes::CampaignHandle>,
+	sender: omp_agent::ControlSender,
 }
 
 /// Late-bound durable goal-mode authority for the active chat session.
@@ -690,23 +694,23 @@ pub struct AgentGoalControl {
 }
 
 impl AgentGoalControl {
-	/// Binds the active session modes until the returned lease is dropped.
-	pub fn bind(&self, modes: Arc<crate::modes::ExecutionModes>) -> AgentGoalBinding {
+	/// Binds the active session goal projection and Agent campaign authority
+	/// until the returned lease is dropped.
+	pub fn bind(
+		&self,
+		modes: Arc<crate::modes::CampaignHandle>,
+		sender: omp_agent::ControlSender,
+	) -> AgentGoalBinding {
 		let id = self
 			.next_id
 			.fetch_add(1, Ordering::Relaxed)
 			.saturating_add(1);
-		*self.binding.write() = Some(GoalBinding { id, modes });
+		*self.binding.write() = Some(GoalBinding { id, modes, sender });
 		AgentGoalBinding { control: self.clone(), id }
 	}
 
-	fn modes(&self) -> Result<Arc<crate::modes::ExecutionModes>, omp_tools::goal::Fault> {
-		self
-			.binding
-			.read()
-			.as_ref()
-			.map(|binding| Arc::clone(&binding.modes))
-			.ok_or(omp_tools::goal::Fault::Unavailable)
+	fn binding(&self) -> Result<GoalBinding, omp_tools::goal::Fault> {
+		self.binding.read().clone().ok_or(omp_tools::goal::Fault::Unavailable)
 	}
 
 	fn unbind(&self, id: u64) {
@@ -736,9 +740,9 @@ impl omp_tools::goal::GoalControl for AgentGoalControl {
 		params: omp_tools::goal::Params,
 	) -> impl Future<Output = Result<Option<omp_tools::goal::Goal>, omp_tools::goal::Fault>> + Send + '_
 	{
-		let modes = self.modes();
+		let binding = self.binding();
 		async move {
-			let modes = modes?;
+			let GoalBinding { modes, sender, .. } = binding?;
 			let now = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.unwrap_or_default()
@@ -746,56 +750,168 @@ impl omp_tools::goal::GoalControl for AgentGoalControl {
 				.try_into()
 				.unwrap_or(u64::MAX);
 			let outcome = match params.op {
-				omp_tools::goal::Operation::Create => crate::goal::GoalOutcome {
-					lifecycle: crate::goal::GoalLifecycle::Created,
-					goal:      Some(
-						modes
-							.set_goal(
-								params
-									.objective
-									.ok_or(omp_tools::goal::Fault::ObjectiveRequired)?,
-								params.token_budget,
-								now,
-							)
-							.map_err(map_goal_error)?,
-					),
+				omp_tools::goal::Operation::Create => {
+					let objective = params
+						.objective
+						.ok_or(omp_tools::goal::Fault::ObjectiveRequired)?;
+					if objective.trim().is_empty() {
+						return Err(omp_tools::goal::Fault::ObjectiveRequired);
+					}
+					if params.token_budget == Some(0) {
+						return Err(omp_tools::goal::Fault::InvalidBudget);
+					}
+					let (engagement, newly_engaged) = ensure_goal_campaign(&sender).await?;
+					let goal = match modes.set_goal(objective, params.token_budget, now) {
+						Ok(goal) => goal,
+						Err(error) => {
+							if newly_engaged {
+								let _ = sender.disengage_campaign(engagement).await;
+							}
+							return Err(map_goal_error(error));
+						},
+					};
+					if let Err(error) =
+						update_goal_campaign_state(&sender, &engagement, &goal).await
+					{
+						let _ = modes.drop_goal(now);
+						let _ = sender.disengage_campaign(engagement).await;
+						return Err(error);
+					}
+					crate::goal::GoalOutcome {
+						lifecycle: crate::goal::GoalLifecycle::Created,
+						goal:      Some(goal),
+					}
 				},
 				omp_tools::goal::Operation::Get => crate::goal::GoalOutcome {
 					lifecycle: crate::goal::GoalLifecycle::Current,
 					goal:      modes.goal(),
 				},
-				omp_tools::goal::Operation::Complete => crate::goal::GoalOutcome {
-					lifecycle: crate::goal::GoalLifecycle::Completed,
-					goal:      Some(modes.complete_goal(now).map_err(map_goal_error)?),
+				omp_tools::goal::Operation::Complete => {
+					let engagement = active_goal_engagement(&sender)
+						.await?
+						.ok_or(omp_tools::goal::Fault::Unavailable)?;
+					let goal = modes.complete_goal(now).map_err(map_goal_error)?;
+					sender
+						.disengage_campaign(engagement)
+						.await
+						.map_err(map_goal_campaign_error)?;
+					crate::goal::GoalOutcome {
+						lifecycle: crate::goal::GoalLifecycle::Completed,
+						goal:      Some(goal),
+					}
 				},
-				omp_tools::goal::Operation::Resume => crate::goal::GoalOutcome {
-					lifecycle: crate::goal::GoalLifecycle::Resumed,
-					goal:      Some(modes.resume_goal(now).map_err(map_goal_error)?),
+				omp_tools::goal::Operation::Resume => {
+					let (engagement, newly_engaged) = ensure_goal_campaign(&sender).await?;
+					let goal = match modes.resume_goal(now) {
+						Ok(goal) => goal,
+						Err(error) => {
+							if newly_engaged {
+								let _ = sender.disengage_campaign(engagement).await;
+							}
+							return Err(map_goal_error(error));
+						},
+					};
+					if let Err(error) =
+						update_goal_campaign_state(&sender, &engagement, &goal).await
+					{
+						let _ = sender.disengage_campaign(engagement).await;
+						return Err(error);
+					}
+					crate::goal::GoalOutcome {
+						lifecycle: crate::goal::GoalLifecycle::Resumed,
+						goal:      Some(goal),
+					}
 				},
-				omp_tools::goal::Operation::Drop => crate::goal::GoalOutcome {
-					lifecycle: crate::goal::GoalLifecycle::Dropped,
-					goal:      Some(modes.drop_goal(now).map_err(map_goal_error)?),
+				omp_tools::goal::Operation::Drop => {
+					let engagement = active_goal_engagement(&sender)
+						.await?
+						.ok_or(omp_tools::goal::Fault::Unavailable)?;
+					let goal = modes.drop_goal(now).map_err(map_goal_error)?;
+					sender
+						.disengage_campaign(engagement)
+						.await
+						.map_err(map_goal_campaign_error)?;
+					crate::goal::GoalOutcome {
+						lifecycle: crate::goal::GoalLifecycle::Dropped,
+						goal:      Some(goal),
+					}
 				},
 			};
-			modes
-				.flush_projection()
-				.await
-				.map_err(|_| omp_tools::goal::Fault::Unavailable)?;
 			Ok(outcome.goal.map(project_goal))
 		}
 	}
 }
 
-fn map_goal_error(error: crate::modes::ModeError) -> omp_tools::goal::Fault {
+async fn update_goal_campaign_state(
+	sender: &omp_agent::ControlSender,
+	engagement: &Str,
+	goal: &crate::modes::Goal,
+) -> Result<(), omp_tools::goal::Fault> {
+	let state = omp_agent::GoalCampaignState {
+		objective:          goal.objective.clone(),
+		budget_tokens:      goal.token_budget,
+		spent_tokens:       goal.tokens_used,
+		thresholds_crossed: 0,
+	};
+	let payload = bytes::Bytes::from(
+		serde_json::to_vec(&state).expect("goal campaign state has infallible JSON serialization"),
+	);
+	sender
+		.update_campaign_state(engagement.clone(), payload)
+		.await
+		.map_err(map_goal_campaign_error)?;
+	Ok(())
+}
+
+async fn active_goal_engagement(
+	sender: &omp_agent::ControlSender,
+) -> Result<Option<Str>, omp_tools::goal::Fault> {
+	Ok(sender
+		.active_campaigns()
+		.await
+		.map_err(map_goal_campaign_error)?
+		.into_iter()
+		.find(|entry| {
+			entry.spec_id.as_str() == "goal"
+				&& entry.status == omp_agent::CampaignEntryStatus::Engaged
+		})
+		.map(|entry| entry.engagement))
+}
+
+async fn ensure_goal_campaign(
+	sender: &omp_agent::ControlSender,
+) -> Result<(Str, bool), omp_tools::goal::Fault> {
+	if let Some(engagement) = active_goal_engagement(sender).await? {
+		return Ok((engagement, false));
+	}
+	let receipt = sender
+		.engage_regime("goal", false)
+		.await
+		.map_err(map_goal_campaign_error)?;
+	Ok((receipt.engagement, true))
+}
+
+fn map_goal_campaign_error(
+	error: omp_agent::control::ControlError,
+) -> omp_tools::goal::Fault {
 	match error {
-		crate::modes::ModeError::NoGoal => omp_tools::goal::Fault::NoGoal,
-		crate::modes::ModeError::EmptyObjective => omp_tools::goal::Fault::ObjectiveRequired,
-		crate::modes::ModeError::InvalidBudget => omp_tools::goal::Fault::InvalidBudget,
-		crate::modes::ModeError::Conflict { .. } | crate::modes::ModeError::InvalidPlanArtifact => {
-			omp_tools::goal::Fault::ModeConflict
-		},
-		crate::modes::ModeError::InvalidGoalTransition { .. }
-		| crate::modes::ModeError::GoalExists => omp_tools::goal::Fault::InvalidTransition,
+		omp_agent::control::ControlError::CampaignEngage(omp_agent::EngageError::Claim {
+			outcome: omp_agent::ClaimOutcome::Denied { holder, since },
+			..
+		}) => omp_tools::goal::Fault::ClaimDenied { holder, since },
+		_ => omp_tools::goal::Fault::Unavailable,
+	}
+}
+
+fn map_goal_error(error: crate::modes::RegimeError) -> omp_tools::goal::Fault {
+	match error {
+		crate::modes::RegimeError::NoGoal => omp_tools::goal::Fault::NoGoal,
+		crate::modes::RegimeError::EmptyObjective => omp_tools::goal::Fault::ObjectiveRequired,
+		crate::modes::RegimeError::InvalidBudget => omp_tools::goal::Fault::InvalidBudget,
+		crate::modes::RegimeError::CampaignInactive { .. }
+		| crate::modes::RegimeError::InvalidPlanArtifact => omp_tools::goal::Fault::ModeConflict,
+		crate::modes::RegimeError::InvalidGoalTransition { .. }
+		| crate::modes::RegimeError::GoalExists => omp_tools::goal::Fault::InvalidTransition,
 	}
 }
 
@@ -910,7 +1026,12 @@ fn checkpoint_fault(
 			omp_tools::checkpoint::FaultCode::AlreadyScheduled,
 			sf!("rewind already scheduled for the active checkpoint"),
 		),
-		omp_agent::control::ControlError::Closed | omp_agent::control::ControlError::Journal(_) => (
+		omp_agent::control::ControlError::Closed
+		| omp_agent::control::ControlError::Journal(_)
+		| omp_agent::control::ControlError::CampaignEngage(_)
+		| omp_agent::control::ControlError::CampaignDisengage(_)
+		| omp_agent::control::ControlError::CampaignArbiter(_)
+		| omp_agent::control::ControlError::UnknownCoreCampaign { .. } => (
 			omp_tools::checkpoint::FaultCode::Control,
 			sf!("active Agent CONTROL checkpoint operation failed"),
 		),
@@ -1066,4 +1187,40 @@ fn constraint_priority(priority: u32) -> Result<u8, EnvdError> {
 
 const fn worker_declaration_error(message: &'static str) -> EnvdError {
 	EnvdError::WorkerDeclaration(sf!(message))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn goal_create_denial_surfaces_campaign_holder_and_since() {
+		let mut campaigns = omp_agent::CampaignStack::new();
+		let (plan_spec, plan_machine) = omp_agent::core_regime("plan").expect("plan regime");
+		let plan = campaigns
+			.engage(
+				plan_spec,
+				plan_machine,
+				omp_agent::EngageOptions { now_ms: 137, queue: false },
+			)
+			.expect("plan engagement");
+		let (goal_spec, goal_machine) = omp_agent::core_regime("goal").expect("goal regime");
+		let error = campaigns
+			.engage(
+				goal_spec,
+				goal_machine,
+				omp_agent::EngageOptions { now_ms: 211, queue: false },
+			)
+			.expect_err("plan owns the mode slot");
+
+		let fault = map_goal_campaign_error(error.into());
+
+		assert_eq!(
+			fault,
+			omp_tools::goal::Fault::ClaimDenied {
+				holder: plan.engagement,
+				since:  137,
+			}
+		);
+	}
 }

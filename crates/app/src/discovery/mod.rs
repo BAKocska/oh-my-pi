@@ -48,6 +48,8 @@ pub struct ActiveContentSnapshots {
 	pub rules:    Arc<crate::rulebook::RuleSnapshot>,
 	/// Active native Markdown slash commands in discovery precedence order.
 	pub commands: Arc<[crate::chat_ui::input::CommandContribution]>,
+	/// Bounded non-fatal diagnostics emitted while loading static content.
+	pub warnings: Arc<[Str]>,
 }
 
 /// Discovers native repository/user content once and freezes the skill/rule
@@ -59,11 +61,15 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 	let foreign = foreign::discover(root, &foreign::ForeignContentSettings::default());
 	discovered.declarations.extend(foreign.skills);
 	discovered.declarations.extend(foreign.rules);
+	discovered.warnings.extend(foreign.warnings);
 	let managed = managed_skills::discover_dead_last(
 		&native::user_config_root(&home),
 		&skills::SkillDiscoverySettings::default(),
 	);
 	discovered.declarations.extend(managed.declarations);
+	discovered
+		.warnings
+		.extend(managed.warnings.into_iter().map(|warning| warning.message));
 	let mut commands = discovered
 		.declarations
 		.iter()
@@ -99,6 +105,7 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 			&crate::rulebook::RulebookSettings::default(),
 		)),
 		commands: commands.into(),
+		warnings: discovered.warnings.into(),
 	}
 }
 

@@ -13,6 +13,7 @@ use std::{
 	fs::File,
 	io::{BufRead as _, BufReader},
 	path::{Path, PathBuf},
+	pin::Pin,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -133,7 +134,7 @@ pub enum ChatError {
 	Revival(#[from] omp_agent::RevivalError),
 	/// The authoritative write-time sessions index failed.
 	#[error(transparent)]
-	SessionIndex(omp_storage::index::Error),
+	SessionIndex(#[from] omp_storage::index::Error),
 	/// A durable session was requested without an authoritative write-time
 	/// index.
 	#[error("durable session storage has no authoritative index")]
@@ -206,10 +207,10 @@ pub enum ChatError {
 	Ui(miette::Report),
 	/// Startup automation mode conflicts with the active execution state.
 	#[error(transparent)]
-	Mode(#[from] crate::modes::ModeError),
-	/// Durable autonomous-mode projection could not be loaded or attached.
+	Mode(#[from] crate::modes::RegimeError),
+	/// Campaign recovery or durable lifecycle mutation failed.
 	#[error(transparent)]
-	ModePersistence(#[from] crate::modes::persistence::ModePersistenceError),
+	Campaign(#[from] omp_agent::AgentError),
 	/// The platform cannot enforce the Phase 3 owner-local environment contract.
 	#[error("interactive chat requires Unix owner-local project authorities")]
 	UnsupportedPlatform,
@@ -575,7 +576,7 @@ struct ChatParentContext {
 	definitions:   Arc<BTreeMap<Str, omp_agent::AgentDefinition>>,
 	tree:          Arc<AgentTree>,
 	task_settings: crate::subagent::settings::LiveTaskSettings,
-	modes:         Option<Arc<crate::modes::ExecutionModes>>,
+	campaigns:     Option<Arc<crate::modes::CampaignHandle>>,
 }
 /// Core-backed facts consumed by the retained agent-hub presentation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -817,7 +818,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 					Arc::new(crate::subagent::settings::TaskSettings::default()),
 					Arc::clone(&tree),
 				),
-				modes: None,
+				campaigns: None,
 				tree,
 			}),
 			revival: Mutex::new(BTreeMap::new()),
@@ -834,13 +835,13 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		self.context.lock().task_settings.apply(settings);
 	}
 
-	fn bind_execution_modes(&self, modes: Arc<crate::modes::ExecutionModes>) {
-		self.context.lock().modes = Some(modes);
+	fn bind_campaigns(&self, campaigns: Arc<crate::modes::CampaignHandle>) {
+		self.context.lock().campaigns = Some(campaigns);
 	}
 
 	fn approved_plan_reference(&self) -> Option<crate::plan::OverallPlanReference> {
 		let context = self.context.lock();
-		let state = context.modes.as_ref()?.plan()?;
+		let state = context.campaigns.as_ref()?.plan()?;
 		if state.enabled {
 			return None;
 		}
@@ -1612,6 +1613,60 @@ impl<C: TurnClient + Clone + Send + 'static> omp_tools::memory::ReflectionHost
 	}
 }
 
+impl<C: TurnClient + Clone + Send + 'static> crate::session_title::OnlineTitleCompletion
+	for ChatParentHost<C>
+{
+	fn complete_title<'a>(
+		&'a self,
+		roles: &'static [&'static str],
+		system_prompt: &'a str,
+		input: &'a str,
+	) -> Pin<Box<dyn Future<Output = Result<Option<Str>, Str>> + Send + 'a>> {
+		Box::pin(async move {
+			let context = self.context.lock().clone();
+			let mut params = context.state.snapshot().turn.params.clone();
+			params.tools.clear();
+			params.tool_choice = None;
+			params.response_format = None;
+			let role = roles.first().copied().unwrap_or("tiny");
+			params.model = format!("@{role}");
+			let options = TurnOptions {
+				context_id: None,
+				params,
+				executor: None,
+				props: None,
+				provider_reset: false,
+				stream_watchdog: omp_agent::StreamWatchdog::default(),
+			};
+			let items =
+				vec![bridge_message(Role::System, system_prompt), bridge_message(Role::User, input)];
+			let mut turn = self
+				.client
+				.turn(
+					TurnId::new(format!("session-title-{}", omp_core::Ulid::generate())),
+					TurnInput::Full(Thread { items }),
+					&options,
+				)
+				.await
+				.map_err(|error| Str::from(error.to_string()))?;
+			let mut events = turn.events();
+			while let Some(event) = events.next().await {
+				let event = event.map_err(|error| Str::from(error.to_string()))?;
+				match event.event {
+					Some(inference_pb::turn_event::Event::Outcome(outcome)) => {
+						return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
+					},
+					Some(inference_pb::turn_event::Event::Error(error)) => {
+						return Err(Str::from(error.detail));
+					},
+					_ => {},
+				}
+			}
+			Ok(None)
+		})
+	}
+}
+
 #[async_trait]
 impl<C: TurnClient + Clone + Send + 'static> crate::envd::eval::ParentSessionHost
 	for ChatParentHost<C>
@@ -1693,13 +1748,9 @@ impl<C: TurnClient + Clone + Send + 'static> crate::envd::eval::ParentSessionHos
 			});
 		}
 		let mut items = Vec::new();
-		items.push(bridge_message(
-			Role::System,
-			args
-				.get("system")
-				.and_then(Value::as_str)
-				.unwrap_or("Follow the user's instruction and return only the requested result."),
-		));
+		if let Some(system) = args.get("system").and_then(Value::as_str) {
+			items.push(bridge_message(Role::System, system));
+		}
 		items.push(bridge_message(Role::User, prompt));
 		let options = TurnOptions {
 			context_id: None,
@@ -1707,6 +1758,7 @@ impl<C: TurnClient + Clone + Send + 'static> crate::envd::eval::ParentSessionHos
 			executor: None,
 			props: None,
 			provider_reset: false,
+			stream_watchdog: omp_agent::StreamWatchdog::default(),
 		};
 		let mut turn = self
 			.client
@@ -2745,6 +2797,9 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 		min_tool_calls: configured_autolearn.min_tool_calls,
 	};
 	let active_content = crate::discovery::active_content_snapshots(&root);
+	for warning in active_content.warnings.iter() {
+		eprintln!("Extension load warning: {warning}");
+	}
 	let prompt_rules = if args.no_rules {
 		Arc::from([])
 	} else {
@@ -2794,13 +2849,7 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 	snapshot.workspace.host = prepared.host;
 	snapshot.workspace.roots = prepared.roots;
 	let state = AgentState::new(snapshot);
-	let initial_mode = if args.plan_mode {
-		crate::modes::ActiveMode::Plan
-	} else if args.prewalk {
-		crate::modes::ActiveMode::Prewalk
-	} else {
-		crate::modes::ActiveMode::Standard
-	};
+	let initial_campaign = args.plan_mode.then_some("plan");
 
 	if let Some(endpoint) = args.gateway {
 		let channel = omp_rpc::uds::connect(endpoint.as_path())
@@ -2824,9 +2873,10 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 			None,
 			data_dir.clone(),
 			power_mode,
-			initial_mode,
+			initial_campaign,
 			plan_selection,
 			security_enabled,
+			!args.no_title,
 			ChatScope {
 				catalog,
 				root: &root,
@@ -2869,9 +2919,10 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 			Some(inference_registry),
 			data_dir,
 			power_mode,
-			initial_mode,
+			initial_campaign,
 			plan_selection,
 			security_enabled,
+			!args.no_title,
 			ChatScope {
 				catalog,
 				root: &root,
@@ -2902,7 +2953,7 @@ pub(crate) async fn run(_args: ChatArgs, _start: ChatStart) -> miette::Result<()
 
 fn bind_goal_todo_context(
 	events: omp_agent::EventSubscription,
-	modes: std::sync::Weak<crate::modes::ExecutionModes>,
+	modes: std::sync::Weak<crate::modes::CampaignHandle>,
 ) {
 	drop(tokio::spawn(async move {
 		while let Ok(event) = events.recv().await {
@@ -2951,9 +3002,10 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 	auth_registry: Option<InferenceRegistry>,
 	data_dir: PathBuf,
 	power_mode: crate::power::SleepPrevention,
-	initial_mode: crate::modes::ActiveMode,
+	initial_campaign: Option<&'static str>,
 	plan_selection: Option<crate::plan::ModelSelection>,
 	security_enabled: bool,
+	title_enabled: bool,
 	scope: ChatScope<'_>,
 	mut start: ChatStart,
 ) -> Result<(), ChatError> {
@@ -3021,10 +3073,21 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			)?;
 			agent.set_secret_obfuscator(secrets.transform_handle());
 		}
-		agent.set_autolearn(autolearn);
+		agent.set_autolearn(omp_agent::AutolearnSettings {
+			enabled:        false,
+			auto_continue:  false,
+			min_tool_calls: autolearn.min_tool_calls,
+		});
 		agent.set_ttsr_registry(ttsr);
 		agent.set_prompt_memory_source(memory_source.clone());
 		blueprint.configure_agent(&mut agent);
+		match crate::daemon::production_redemption_authority(&data_dir) {
+			Ok(Some(authority)) => agent.set_redemption_authority(authority),
+			Ok(None) => {},
+			Err(error) => {
+				tracing::warn!(%error, "codex redemption authority was not constructed");
+			},
+		}
 		parent.bind_parent_jobs(Arc::clone(agent.jobs()));
 		let blob_store = omp_storage::blob::BlobStore::open(&data_dir)?;
 		let artifact_catalog =
@@ -3056,30 +3119,75 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			}
 		});
 		agent.set_run_activity(crate::power::PowerActivity::new(power_mode));
-		let (mode_store, projection) = crate::modes::persistence::ModePersistence::open(
-			agent.journal(),
-			agent.control(),
-			id.as_str(),
-			scope.root.to_string_lossy().as_ref(),
+		let autolearn_campaign = autolearn
+			.enabled
+			.then(|| crate::autolearn::AutolearnCampaign::new(autolearn));
+		let mut recovered_autolearn = false;
+		agent.recover_campaigns(
+			|spec_id| {
+				if let Some(core) = omp_agent::core_regime(spec_id) {
+					return Some(core);
+				}
+				let Some((spec, machine, _)) = autolearn_campaign.as_ref() else {
+					return None;
+				};
+				if spec_id != crate::autolearn::AUTOLEARN_CAMPAIGN_ID || recovered_autolearn {
+					return None;
+				}
+				recovered_autolearn = true;
+				Some((
+					Arc::clone(spec),
+					Box::new(machine.clone()) as Box<dyn omp_agent::CampaignMachine>,
+				))
+			},
+			now_ms(),
 		)?;
-		let restored_plan = projection
-			.as_ref()
-			.and_then(|projection| projection.plan.as_ref())
-			.is_some_and(|plan| plan.enabled);
-		let modes = Arc::new(crate::modes::ExecutionModes::from_projection(
-			agent.execution_mode(),
-			projection.unwrap_or_default(),
-		));
-		bind_goal_todo_context(agent.events().subscribe_lossless(), Arc::downgrade(&modes));
-		modes.attach_persistence(mode_store);
-		modes.bind_plan_selection(state.clone(), plan_selection.clone());
-		parent.bind_execution_modes(Arc::clone(&modes));
-		match initial_mode {
-			crate::modes::ActiveMode::Plan if !restored_plan => modes.enter_plan(false)?,
-			crate::modes::ActiveMode::Prewalk => modes.arm_prewalk()?,
-			_ => {},
+		if let Some((spec, machine, _)) = autolearn_campaign.as_ref()
+			&& !agent
+				.arbiter()
+				.campaigns()
+				.entries()
+				.iter()
+				.any(|entry| entry.spec_id == crate::autolearn::AUTOLEARN_CAMPAIGN_ID)
+		{
+			let _ = agent.engage_campaign(
+				Arc::clone(spec),
+				Box::new(machine.clone()),
+				omp_agent::EngageOptions { now_ms: now_ms(), queue: false },
+			)?;
 		}
-		let _goal_binding = environment.goal_control().bind(Arc::clone(&modes));
+		let autolearn_task = autolearn_campaign.as_ref().map(|(_, _, handle)| {
+			let events = agent.events().subscribe_lossless();
+			let handle = handle.clone();
+			tokio::spawn(async move {
+				while let Ok(event) = events.recv().await {
+					handle.observe(event.as_ref());
+				}
+			})
+		});
+		if let Some(spec_id) = initial_campaign
+			&& agent
+				.arbiter()
+				.campaigns()
+				.slots()
+				.owner(&omp_agent::SlotClaim::Mode)
+				.is_none()
+		{
+			let (spec, machine) =
+				omp_agent::core_regime(spec_id).expect("startup names a built-in regime");
+			let _ = agent.engage_campaign(spec, machine, omp_agent::EngageOptions {
+				now_ms: now_ms(),
+				queue:  false,
+			})?;
+		}
+		let modes = Arc::new(crate::modes::CampaignHandle::new());
+		modes.sync_campaigns(agent.arbiter().campaigns());
+		bind_goal_todo_context(agent.events().subscribe_lossless(), Arc::downgrade(&modes));
+		modes.bind_plan_selection(state.clone(), plan_selection.clone());
+		parent.bind_campaigns(Arc::clone(&modes));
+		let _goal_binding = environment
+			.goal_control()
+			.bind(Arc::clone(&modes), agent.control());
 		state.update(|snapshot| {
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
@@ -3129,9 +3237,20 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
 		let (collab_authority, collab) = crate::collab::session::CollabSessionAuthority::new();
 		let mut collab_task = crate::collab::session::spawn_session_owner(collab_authority);
+		let title = scope
+			.session_index
+			.subagent_tree(&SessionId(id.clone()))?
+			.into_iter()
+			.next()
+			.map_or_else(crate::session_title::SessionTitleState::default, |session| {
+				crate::session_title::SessionTitleState {
+					title:  session.title,
+					source: session.title_source,
+				}
+			});
 		let outcome = chat_ui::run(
 			agent,
-			ChatUiSession { session_id: id, initial_items, context_window },
+			ChatUiSession { session_id: id, initial_items, context_window, title },
 			Arc::clone(&scope.registry),
 			parent.tree(),
 			Arc::clone(&parent),
@@ -3142,6 +3261,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			scope.root.to_path_buf(),
 			session_root.join("local"),
 			security_enabled,
+			title_enabled,
 			vec![content.commands.to_vec()],
 			content.skills,
 			Some(approval_inbox),
@@ -3150,6 +3270,10 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			Str::from(initial_draft),
 		)
 		.await;
+		if let Some(task) = autolearn_task {
+			task.abort();
+			let _ = task.await;
+		}
 		capture_task.abort();
 		let _ = capture_task.await;
 		if tokio::time::timeout(Duration::from_secs(3), &mut collab_task)
@@ -3282,6 +3406,28 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		auth.shutdown().await;
 	}
 	Ok(())
+}
+
+/// Resolves the catalog streaming watchdog for one model's primary route.
+///
+/// Absent providers, routes, or policies leave both bounds unset, which
+/// disables the loop's stream watchdog entirely.
+pub(crate) fn model_stream_watchdog(
+	catalog: &omp_llm_catalog::snapshot::Catalog,
+	model: &str,
+) -> omp_agent::StreamWatchdog {
+	let watchdog = catalog
+		.model(omp_llm_catalog::ModelKey::from_ref(model))
+		.or_else(|| catalog.resolve_alias(model))
+		.and_then(|spec| spec.routes.first())
+		.and_then(|route| catalog.route(route))
+		.and_then(|route| catalog.provider(&route.provider))
+		.and_then(|provider| catalog.wire_policy(&provider.wire_policy))
+		.and_then(|policy| policy.streaming.watchdog);
+	watchdog.map_or_else(omp_agent::StreamWatchdog::default, |watchdog| omp_agent::StreamWatchdog {
+		first_event_ms: watchdog.first_event_ms,
+		idle_ms:        watchdog.idle_ms,
+	})
 }
 
 pub(crate) fn model_context_window(
@@ -3537,6 +3683,57 @@ fn create_indexed_journal(
 	};
 	journal.attach_session_index(session_index, session_id);
 	Ok(journal)
+}
+
+pub(crate) fn create_indexed_handoff(
+	parent: &Journal,
+	path: &Path,
+	root: &Path,
+	commit: omp_agent::handoff::HandoffCommit,
+	tokens_before: u64,
+	tokens_after: Option<u64>,
+	session_index: Arc<SessionIndex>,
+	save_to_disk: bool,
+) -> Result<Option<Journal>, ChatError> {
+	if !save_to_disk {
+		return Ok(None);
+	}
+	let child_id = SessionId(commit.child_session_id.clone());
+	let parent_id = SessionId(commit.request.parent_session_id.clone());
+	let created_ms = now_ms();
+	let root_text = root.to_string_lossy();
+	let request = NewSession {
+		id: &child_id,
+		cwd: root_text.as_ref(),
+		project: root_text.as_ref(),
+		created_ms,
+		kind: SessionKind::Interactive,
+		parent: Some(&parent_id),
+		remote: false,
+	};
+	let header = Header {
+		v:       4,
+		id:      child_id.clone(),
+		created: created_ms,
+		cwd:     root.to_owned(),
+	};
+	let checkpoint = commit.request.parent_checkpoint;
+	let compact = commit.compact(tokens_before, tokens_after);
+	let result = session_index.create_session(&request, || {
+		let journal = parent.create_handoff_child(path, &header, created_ms, checkpoint, compact)?;
+		let watermark = journal.byte_watermark()?;
+		Ok::<_, omp_agent::JournalError>((journal, watermark))
+	});
+	let mut journal = match result {
+		Ok(journal) => journal,
+		Err(IndexedWriteError::Journal(error)) => return Err(error.into()),
+		Err(
+			IndexedWriteError::IndexBeforeJournal(error)
+			| IndexedWriteError::IndexAfterJournal { source: error, .. },
+		) => return Err(ChatError::SessionIndex(error)),
+	};
+	journal.attach_session_index(session_index, child_id);
+	Ok(Some(journal))
 }
 
 fn create_indexed_fork(
@@ -3865,6 +4062,7 @@ pub(crate) fn agent_snapshot(
 			tools,
 			..inference_pb::ChatParams::default()
 		},
+		stream_watchdog: model_stream_watchdog(catalog, model),
 		..TurnOptions::default()
 	};
 	let mut snapshot = AgentSnapshot::new(turn, blueprint.workspace().clone(), Arc::clone(registry));

@@ -30,6 +30,7 @@ mod server;
 pub mod shell_profile;
 pub(crate) mod site;
 pub(crate) mod ssh;
+mod staged_preview;
 mod tool_debug;
 mod tool_document;
 mod tool_lsp;

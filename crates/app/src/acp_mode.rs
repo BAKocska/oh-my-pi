@@ -1145,6 +1145,8 @@ impl Runtime {
 			project: root.clone(),
 			additional_roots: Box::default(),
 			model: Str::from(model),
+			initial_campaign: (mode == "plan").then_some("plan"),
+			initial_prompt_slot: None,
 			resume,
 			fork,
 			py_eval: false,
@@ -1152,10 +1154,6 @@ impl Runtime {
 		})
 		.await?;
 		if mode == "plan" {
-			headless
-				.modes()
-				.enter_plan(false)
-				.map_err(|error| miette!(error))?;
 			headless.publish(AgentEvent::PlanStateChanged {
 				from:               PlanState::Inactive,
 				to:                 PlanState::Active,
@@ -1617,7 +1615,7 @@ impl Runtime {
 			.headless
 			.lock()
 			.await
-			.modes()
+			.campaigns()
 			.plan()
 			.filter(|state| state.enabled)
 			.ok_or_else(|| miette!("plan mode is not active"))?;
@@ -1643,11 +1641,14 @@ impl Runtime {
 		{
 			let headless = session.headless.lock().await;
 			headless
-				.modes()
+				.campaigns()
 				.set_plan_artifact(artifact.url.clone())
 				.map_err(|error| miette!("{error}"))?;
-			if execute {
-				headless.modes().exit_plan();
+			if execute && let Some(engagement) = headless.campaigns().mode_engagement() {
+				headless
+					.disengage_campaign(engagement)
+					.await
+					.map_err(|error| miette!("{error}"))?;
 			}
 		}
 		if execute {
@@ -1702,19 +1703,28 @@ impl Runtime {
 		let generation = session.meta.lock().session_generation;
 		{
 			let headless = session.headless.lock().await;
-			let from = if headless.modes().plan().is_some() {
+			let from = if headless.campaigns().holds_mode("plan") {
 				PlanState::Active
 			} else {
 				PlanState::Inactive
 			};
 			let to = if mode == "plan" {
-				headless
-					.modes()
-					.enter_plan(false)
-					.map_err(|error| miette!(error))?;
+				if !headless.campaigns().holds_mode("plan") {
+					headless
+						.engage_regime("plan", false)
+						.await
+						.map_err(|error| miette!("{error}"))?;
+				}
 				PlanState::Active
 			} else {
-				headless.modes().exit_plan();
+				if headless.campaigns().holds_mode("plan")
+					&& let Some(engagement) = headless.campaigns().mode_engagement()
+				{
+					headless
+						.disengage_campaign(engagement)
+						.await
+						.map_err(|error| miette!("{error}"))?;
+				}
 				PlanState::Inactive
 			};
 			headless.publish(AgentEvent::PlanStateChanged {

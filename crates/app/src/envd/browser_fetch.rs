@@ -1,15 +1,13 @@
 //! Application-owned browser escalation adapter for inference search.
 
-use std::{
-	future::{Future, poll_fn},
-	thread,
-};
+use std::{future::poll_fn, thread};
 
 use bytes::Bytes;
 use omp_llm_inference::{
 	codec::Cancellation,
 	transport::browser::{
-		BrowserFetch, BrowserFetchError, BrowserFetchRequest, BrowserFetchResponse,
+		BrowserFetch, BrowserFetchError, BrowserFetchFuture, BrowserFetchRequest,
+		BrowserFetchResponse,
 	},
 };
 use omp_webview::{
@@ -25,8 +23,8 @@ impl BrowserFetch for BrowserFetchAdapter {
 		&self,
 		request: BrowserFetchRequest,
 		cancellation: Cancellation,
-	) -> impl Future<Output = Result<BrowserFetchResponse, BrowserFetchError>> + Send + '_ {
-		async move {
+	) -> BrowserFetchFuture<'_> {
+		Box::pin(async move {
 			request.validate()?;
 			if cancellation.is_cancelled() {
 				return Err(BrowserFetchError::Cancelled);
@@ -61,7 +59,7 @@ impl BrowserFetch for BrowserFetchAdapter {
 					Err(BrowserFetchError::TimedOut)
 				},
 			}
-		}
+		})
 	}
 }
 

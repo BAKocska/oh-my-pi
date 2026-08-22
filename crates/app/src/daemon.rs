@@ -19,12 +19,12 @@ use omp_llm_inference::{
 	auth::{
 		AlibabaTokenPlanLoginEngine, AlibabaTokenPlanShaper, AuthLoginEngine, AuthManager,
 		AuthManagerBuildError, CredentialAcquisitionLoginEngine,
-		CredentialAcquisitionLoginEngineError, CredentialBroker, CredentialBrokerEngines,
-		CredentialShaperRegistry, CredentialStore, FileCredentialKeySource, FileKeyError,
-		GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher, OAuthLoginEngine,
-		OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper, SecretLoginEngine,
-		SecretLoginEngineError, StoreError, StoredOAuthRefreshEngine, SystemOAuthClock,
-		SystemOAuthHttpClient, UnavailableKeySource,
+		CredentialAcquisitionLoginEngineError, CredentialAffinityResolver, CredentialBroker,
+		CredentialBrokerEngines, CredentialShaperRegistry, CredentialStore, FileCredentialKeySource,
+		FileKeyError, GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher,
+		OAuthLoginEngine, OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper,
+		SecretLoginEngine, SecretLoginEngineError, StoreError, StoredOAuthRefreshEngine,
+		SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
 	},
 	call::AuthMethod,
 	codec::google_cca::{
@@ -68,7 +68,8 @@ use tokio::{sync::watch, task::JoinHandle};
 use tonic::transport::Server;
 
 use crate::{
-	auth_rpc::AuthRpc, blob_rpc::BlobRpc, endpoint::LocalEndpoint, rpc_adapter::InferenceRpc,
+	auth_rpc::AuthRpc, blob_rpc::BlobRpc, endpoint::LocalEndpoint,
+	envd::browser_fetch::BrowserFetchAdapter, rpc_adapter::InferenceRpc,
 };
 
 const DATA_DIR_ENV: &str = "OMP_DATA_DIR";
@@ -581,6 +582,53 @@ pub async fn production_registry(
 		.await
 		.map(|(registry, ..)| registry)
 }
+/// Builds the production console-usage authority over the canonical
+/// credential and account stores.
+pub(crate) async fn production_usage_manager(
+	data_dir: &Path,
+) -> Result<ConsoleUsageManager, DaemonError> {
+	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
+	production_assembly(data_dir, credential_store)
+		.await
+		.map(|(_, _, _, _, usage)| usage)
+}
+
+/// Builds the production Codex saved-reset redemption authority, when the
+/// embedded catalog carries an `openai-codex` route.
+pub(crate) fn production_redemption_authority(
+	data_dir: &Path,
+) -> Result<Option<std::sync::Arc<dyn omp_agent::RedemptionAuthority>>, DaemonError> {
+	let catalog =
+		omp_llm_catalog::snapshot::Catalog::try_embedded().map_err(DaemonError::Catalog)?;
+	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
+	let stored = Arc::new(crate::auth_backend::combined_authority(credential_store));
+	let credentials = CredentialBroker::system(catalog, CredentialBrokerEngines {
+		stored: Some(stored),
+		..CredentialBrokerEngines::default()
+	})
+	.map_err(|_| {
+		DaemonError::Inference(Box::new(omp_llm_inference::Error::planning(
+			omp_llm_inference::ErrorKind::InvalidRequest,
+			omp_llm_inference::ErrorDetail::target(sf!("catalog-credential-broker-invalid")),
+			Default::default(),
+		)))
+	})?;
+	let accounts = AccountPool::with_store(Arc::new(AccountStateStore::open(
+		&data_dir.join("credentials.db"),
+	)?))?;
+	let http = Arc::new(SystemOAuthHttpClient::new());
+	Ok(omp_llm_inference::operation::usage::openai_codex::CodexRedemption::from_catalog(
+		catalog,
+		credentials,
+		accounts,
+		http,
+	)
+	.map(|service| {
+		std::sync::Arc::new(crate::codex_redemption::CodexRedemptionAuthority::new(
+			std::sync::Arc::new(service),
+		)) as std::sync::Arc<dyn omp_agent::RedemptionAuthority>
+	}))
+}
 
 /// Builds the production inference registry and exposes a clone of its one
 /// authentication manager to the stdio RPC host.
@@ -590,7 +638,7 @@ pub(crate) async fn production_rpc_registry(
 ) -> Result<(Registry, AuthManager), DaemonError> {
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(registry, _, _, auth)| (registry, auth))
+		.map(|(registry, _, _, auth, _)| (registry, auth))
 }
 /// Builds the production inference RPC authority used by both the standalone
 /// gateway and in-process chat turns.
@@ -605,7 +653,8 @@ pub(crate) async fn production_inference(
 ) -> Result<(Registry, InferenceRpc, Arc<dyn crate::auth_backend::CredentialAuthority>), DaemonError>
 {
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
-	let (registry, sessions, authority, _) = production_assembly(data_dir, credential_store).await?;
+	let (registry, sessions, authority, ..) =
+		production_assembly(data_dir, credential_store).await?;
 	let settings = crate::settings::manager::SettingsManager::open(
 		crate::settings::manager::SettingsPaths::discover(data_dir, project_root),
 	)?;
@@ -628,6 +677,7 @@ async fn production_assembly(
 		ConversationSessionPlanner,
 		Arc<dyn crate::auth_backend::CredentialAuthority>,
 		AuthManager,
+		ConsoleUsageManager,
 	),
 	DaemonError,
 > {
@@ -742,7 +792,10 @@ async fn production_assembly(
 		accounts.clone(),
 		login_engines,
 		refresh,
-	)?;
+	)?
+	.with_affinity_resolver(CredentialAffinityResolver::new(
+		*blake3::hash(crate::secrets::key::placeholder_key().as_bytes()).as_bytes(),
+	));
 	let exposed_auth_manager = auth_manager.clone();
 	let usage_fetchers = UsageFetcherRegistry::new([
 		Arc::new(AlibabaTokenPlanUsageFetcher::new(oauth_http.clone()))
@@ -770,6 +823,7 @@ async fn production_assembly(
 		accounts.clone(),
 		usage_fetchers,
 	);
+	let exposed_usage_manager = usage_manager.clone();
 	let mut credential_shapers = CredentialShaperRegistry::new();
 	credential_shapers
 		.register(ProviderShaper::AlibabaTokenPlan(AlibabaTokenPlanShaper::new()))
@@ -798,7 +852,7 @@ async fn production_assembly(
 		sessions.clone(),
 		WebSocketTransport::new(),
 		google_cca,
-		HttpTransport::new(),
+		HttpTransport::new().with_browser_fetch(BrowserFetchAdapter),
 		auth_application,
 		AdmissionController::new(32, 128),
 		Duration::from_secs(60),
@@ -833,7 +887,7 @@ async fn production_assembly(
 		.with_builtins(BuiltinConfig::production(dependencies))?
 		.build()?;
 	let authority: Arc<dyn crate::auth_backend::CredentialAuthority> = stored;
-	Ok((registry, sessions, authority, exposed_auth_manager))
+	Ok((registry, sessions, authority, exposed_auth_manager, exposed_usage_manager))
 }
 
 /// Resolves the Antigravity client version without blocking assembly work:

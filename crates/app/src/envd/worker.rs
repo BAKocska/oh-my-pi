@@ -23,13 +23,15 @@ use omp_proto::{
 	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
 		ActivateExtension, ActivateReason as WireActivateReason, AdmitExtensions, AdmittedExtension,
-		ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CancelTool, ExtensionActivated,
-		ExtensionDecl, FreezeDeclarations, HostFrame, InvokeTool, JournalHostEnvelope,
-		LifecycleHostEnvelope, OutcomeKind, Ping, Pong, PrincipalRef, ProtocolError,
-		ProtocolErrorCode, PullReply, PullRequest, QuotaDrop, QuotaStatus, RegisterTools,
-		ResourceUpdate, RestartReason as WireRestartReason, ServiceDispatch as WireServiceDispatch,
-		ServiceReply, ServiceResult, ToolAborted, ToolArgs, ToolComplete, ToolDecl, ToolUpdate,
-		WorkerFrame, WorkerHello, argument_host_envelope, argument_worker_envelope, host_frame,
+		ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CampaignHostEnvelope, CampaignReact,
+		CampaignReaction, CampaignVerdictKind, CampaignWorkerEnvelope, CancelTool,
+		ExtensionActivated, ExtensionDecl, FreezeDeclarations, HostFrame, InvokeTool,
+		JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping, Pong, PrincipalRef,
+		ProtocolError, ProtocolErrorCode, PullReply, PullRequest, QuotaDrop, QuotaStatus,
+		RegisterTools, ResourceUpdate, RestartReason as WireRestartReason,
+		ServiceDispatch as WireServiceDispatch, ServiceReply, ServiceResult, ToolAborted, ToolArgs,
+		ToolComplete, ToolDecl, ToolUpdate, WorkerFrame, WorkerHello, argument_host_envelope,
+		argument_worker_envelope, campaign_host_envelope, campaign_worker_envelope, host_frame,
 		lifecycle_host_envelope, lifecycle_worker_envelope, worker_frame,
 	},
 };
@@ -3381,6 +3383,32 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					&mut write_scratch,
 				)?;
 			},
+			Some(host_frame::Body::Campaigns(CampaignHostEnvelope {
+				body: Some(campaign_host_envelope::Body::React(react)),
+				..
+			})) => match dispatch_python_campaign(engine, &react) {
+				Ok(reaction) => write_sync_frame(
+					&mut writer,
+					&WorkerFrame {
+						request_id: frame.request_id,
+						body:       Some(worker_frame::Body::Campaigns(CampaignWorkerEnvelope {
+							body:  Some(campaign_worker_envelope::Body::Reaction(reaction)),
+							props: None,
+						})),
+						props:      None,
+					},
+					limit,
+					&mut write_scratch,
+				)?,
+				Err(error) => write_protocol_error(
+					&mut writer,
+					frame.request_id,
+					ProtocolErrorCode::Internal,
+					error.to_string().as_str(),
+					limit,
+					&mut write_scratch,
+				)?,
+			},
 			Some(host_frame::Body::InvokeTool(invoke)) => {
 				let Some(commit_frame) =
 					read_sync_frame::<_, HostFrame>(&mut reader, limit, &mut read_scratch)?
@@ -3468,6 +3496,50 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			)?,
 		}
 	}
+}
+
+fn dispatch_python_campaign(
+	engine: &omp_py::Engine,
+	react: &CampaignReact,
+) -> Result<CampaignReaction, WorkerError> {
+	let point = omp_proto::toolhost::v1::CampaignPoint::try_from(react.point)
+		.map_err(|_| WorkerError::Protocol(sf!("CampaignReact has an invalid point")))?;
+	let point = point
+		.as_str_name()
+		.strip_prefix("CAMPAIGN_POINT_")
+		.expect("campaign point prefix")
+		.to_ascii_lowercase();
+	engine
+		.attach(|py| -> PyResult<CampaignReaction> {
+			let campaigns = PyModule::import(py, "omp.campaigns")?;
+			let awaitable = campaigns.call_method1(
+				"dispatch_campaign_react",
+				(
+					react.campaign_id.as_str(),
+					point.as_str(),
+					react.event_payload.as_ref(),
+					react.state.as_ref(),
+				),
+			)?;
+			let result = PyModule::import(py, "asyncio")?.call_method1("run", (awaitable,))?;
+			let verdict: String = result.get_item("verdict")?.extract()?;
+			let verdict_name = format!("CAMPAIGN_VERDICT_KIND_{}", verdict.to_ascii_uppercase());
+			let verdict = CampaignVerdictKind::from_str_name(&verdict_name)
+				.ok_or_else(|| PyValueError::new_err("campaign returned an unknown verdict"))?;
+			Ok(CampaignReaction {
+				engagement_id:   react.engagement_id.clone(),
+				campaign_rev:    react.campaign_rev,
+				verdict:         verdict.into(),
+				verdict_payload: result
+					.get_item("verdict_payload")?
+					.extract::<Vec<u8>>()?
+					.into(),
+				step:            None,
+				new_state:       result.get_item("new_state")?.extract::<Vec<u8>>()?.into(),
+				props:           None,
+			})
+		})
+		.map_err(WorkerError::from)
 }
 
 fn freeze_python_declarations(engine: &omp_py::Engine) -> Result<(), WorkerError> {

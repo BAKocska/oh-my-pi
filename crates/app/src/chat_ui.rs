@@ -72,7 +72,7 @@ use crate::{
 		},
 		input::{ChatCommand, CommandContribution, CommandRoster, ParsedTurnBudget},
 	},
-	modes::{ActiveMode, ExecutionModes, Goal, GoalStatus, GoalUsage},
+	modes::{CampaignHandle, Goal, GoalStatus, GoalUsage},
 	settings::Settings,
 };
 
@@ -216,6 +216,8 @@ pub struct ChatUiSession {
 	pub initial_items:  Vec<Item>,
 	/// Selected model's total token window, when known by the catalog.
 	pub context_window: Option<u64>,
+	/// Current durable title authority restored from the sessions index.
+	pub title:          crate::session_title::SessionTitleState,
 }
 
 enum UiCmd {
@@ -243,6 +245,19 @@ enum UiCmd {
 		tier:  omp_agent::CompactionTier,
 		reply: flume::Sender<Result<omp_agent::ManualShakeOutcome, String>>,
 	},
+	Campaign {
+		operation: CampaignOperation,
+		reply:     flume::Sender<Result<CampaignMutation, omp_agent::AgentError>>,
+	},
+}
+enum CampaignOperation {
+	Engage { spec: &'static str, queue: bool, prompt_slot: Option<&'static str> },
+	Disengage { engagement: Str },
+}
+
+enum CampaignMutation {
+	Engaged(omp_agent::EngageReceipt),
+	Disengaged(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,49 +435,53 @@ fn inspect_image_enabled(state: &BridgeState) -> bool {
 }
 
 struct BridgeState {
-	model:             String,
-	session_id:        Str,
-	local_root:        PathBuf,
-	collab:            Option<crate::collab::session::CollabCommandHandle>,
-	environment:       omp_env::EnvClient,
-	memory:            Option<Arc<omp_memory::MemoryRuntime>>,
-	workspace_root:    Str,
-	appearance:        omp_tui::Appearance,
-	theme_watcher:     crate::theme_watcher::ThemeWatcher,
-	theme_revision:    u64,
-	deferred:          DeferredCommands,
-	active_ptys:       HashMap<Str, omp_env::ActiveExecControl>,
-	context_window:    Option<u64>,
-	context_tokens:    u64,
-	context_snapshot:  Option<omp_agent::ContextSnapshot>,
-	cost_nanos:        u64,
-	queued:            usize,
-	queued_prompts:    VecDeque<omp_chat_ui::QueuedPrompt>,
-	stt_enabled:       bool,
-	jobs:              HashSet<Str>,
-	attempt:           u32,
-	turn_started:      Option<Instant>,
-	submit_pending:    bool,
-	pending_prompt:    Option<PendingPrompt>,
-	part_serial:       u64,
-	active_parts:      HashMap<u32, Str>,
-	streaming_tools:   HashMap<u32, (Str, Vec<u8>)>,
-	tools:             HashMap<Str, ToolDisplay>,
-	rewind_targets:    Vec<RewindTarget>,
+	model: String,
+	session_id: Str,
+	title: crate::session_title::SessionTitleState,
+	title_replan_refresh_pending: bool,
+	local_root: PathBuf,
+	campaigns: CampaignHandle,
+	campaign_revision: u64,
+	collab: Option<crate::collab::session::CollabCommandHandle>,
+	environment: omp_env::EnvClient,
+	memory: Option<Arc<omp_memory::MemoryRuntime>>,
+	workspace_root: Str,
+	appearance: omp_tui::Appearance,
+	theme_watcher: crate::theme_watcher::ThemeWatcher,
+	theme_revision: u64,
+	deferred: DeferredCommands,
+	active_ptys: HashMap<Str, omp_env::ActiveExecControl>,
+	context_window: Option<u64>,
+	context_tokens: u64,
+	context_snapshot: Option<omp_agent::ContextSnapshot>,
+	cost_nanos: u64,
+	queued: usize,
+	queued_prompts: VecDeque<omp_chat_ui::QueuedPrompt>,
+	stt_enabled: bool,
+	jobs: HashSet<Str>,
+	attempt: u32,
+	turn_started: Option<Instant>,
+	submit_pending: bool,
+	pending_prompt: Option<PendingPrompt>,
+	part_serial: u64,
+	active_parts: HashMap<u32, Str>,
+	streaming_tools: HashMap<u32, (Str, Vec<u8>)>,
+	tools: HashMap<Str, ToolDisplay>,
+	rewind_targets: Vec<RewindTarget>,
 	pending_auth_kind: Option<AuthPromptKind>,
-	live_enabled:      bool,
-	live_activity:     ActivityWaveform,
-	token_rate:        Option<omp_chat_ui::status_line::TokenRateMeter>,
+	live_enabled: bool,
+	live_activity: ActivityWaveform,
+	token_rate: Option<omp_chat_ui::status_line::TokenRateMeter>,
 	tokens_per_second: Option<u64>,
-	thinking:          Option<Str>,
-	session_accent:    Str,
-	replaying_turn:    bool,
-	vision_override:   Option<InspectImageMode>,
-	settings:          Settings,
-	commands:          CommandRoster,
-	typed_commands:    commands::CommandRoster,
-	skills:            Arc<crate::skills::SkillSnapshot>,
-	approvals:         HashMap<Str, ApprovalRequest>,
+	thinking: Option<Str>,
+	session_accent: Str,
+	replaying_turn: bool,
+	vision_override: Option<InspectImageMode>,
+	settings: Settings,
+	commands: CommandRoster,
+	typed_commands: commands::CommandRoster,
+	skills: Arc<crate::skills::SkillSnapshot>,
+	approvals: HashMap<Str, ApprovalRequest>,
 }
 
 fn subscribe_chat_events(bus: &omp_agent::EventBus) -> omp_agent::EventSubscription {
@@ -537,12 +556,13 @@ pub async fn run<'a, C, R>(
 	tree: Arc<AgentTree>,
 	parent: Arc<crate::chat::ChatParentHost<C>>,
 	collab: Option<crate::collab::session::CollabCommandHandle>,
-	modes: Arc<ExecutionModes>,
+	modes: Arc<CampaignHandle>,
 	auth: Option<&'a ChatAuth>,
 	data_dir: PathBuf,
 	workspace_root: PathBuf,
 	local_root: PathBuf,
 	security_enabled: bool,
+	title_enabled: bool,
 	command_sources: Vec<Vec<CommandContribution>>,
 	skills: Arc<crate::skills::SkillSnapshot>,
 	mut approval_inbox: Option<ApprovalInbox>,
@@ -588,8 +608,10 @@ where
 		agent.journal().pending_turn().is_some(),
 		agent.journal().pending_input_submission().is_some(),
 	);
+	modes.sync_campaigns(agent.arbiter().campaigns());
 
 	let submission_state = agent.state().clone();
+	let campaign_projection = modes.clone();
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
 	let (error_tx, error_rx) = flume::unbounded::<String>();
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
@@ -666,6 +688,31 @@ where
 					let result = agent.shake_manual(tier).map_err(|error| error.to_string());
 					let _ = reply.send(result);
 				},
+				UiCmd::Campaign { operation, reply } => {
+					let result = match operation {
+						CampaignOperation::Engage { spec, queue, prompt_slot } => {
+							let (mut spec, machine) = omp_agent::core_regime(spec)
+								.expect("built-in slash command names a core regime");
+							if let Some(prompt_slot) = prompt_slot {
+								Arc::make_mut(&mut spec).binds = Arc::from([omp_agent::ScopedBinding {
+									slot:  omp_agent::BindSlot::PromptSlot,
+									value: Str::new_static(prompt_slot),
+								}]);
+							}
+							agent
+								.engage_campaign(spec, machine, omp_agent::EngageOptions {
+									now_ms: now_ms(),
+									queue,
+								})
+								.map(CampaignMutation::Engaged)
+						},
+						CampaignOperation::Disengage { engagement } => agent
+							.disengage_campaign(engagement.as_str(), now_ms())
+							.map(CampaignMutation::Disengaged),
+					};
+					campaign_projection.sync_campaigns(agent.arbiter().campaigns());
+					let _ = reply.send(result);
+				},
 			}
 		}
 	});
@@ -714,7 +761,11 @@ where
 	let mut state = BridgeState {
 		model,
 		session_id: session_id.clone(),
+		title: session.title,
+		title_replan_refresh_pending: false,
 		local_root,
+		campaigns: modes.as_ref().clone(),
+		campaign_revision: modes.revision(),
 		collab,
 		environment,
 		memory: omp_memory::RuntimeRegistry::lookup(&session_id),
@@ -875,7 +926,13 @@ where
 													generation: tree.roster_generation(),
 												});
 											}
-											if drain_live_activity(&live_events, &mut state) {
+											let campaign_revision = state.campaigns.revision();
+											let campaign_changed =
+												campaign_revision != state.campaign_revision;
+											if campaign_changed {
+												state.campaign_revision = campaign_revision;
+											}
+											if campaign_changed || drain_live_activity(&live_events, &mut state) {
 												send_status(&backend_tx, &state, &bus, 0);
 											}
 										},
@@ -894,6 +951,7 @@ where
 			exit_on_session_change: true,
 			completion_notify: true,
 			error_notify: true,
+			title_enabled,
 		},
 		initial_draft,
 	);
@@ -908,102 +966,222 @@ where
 	bridge_result?;
 	host_result.into_diagnostic()
 }
-const fn mode_name(mode: ActiveMode) -> &'static str {
-	match mode {
-		ActiveMode::Standard => "standard",
-		ActiveMode::Plan => "plan",
-		ActiveMode::Prewalk => "prewalk",
-		ActiveMode::Goal => "goal",
-		ActiveMode::Vibe => "vibe",
+fn campaign_status(modes: &CampaignHandle) -> Str {
+	modes.mode_holder().map_or_else(
+		|| sf!("No campaign holds the mode slot."),
+		|holder| sf!("Mode campaign: **{holder}**"),
+	)
+}
+
+async fn campaign_request(
+	backend: &flume::Sender<BackendEvent>,
+	commands: &flume::Sender<UiCmd>,
+	operation: CampaignOperation,
+) -> Option<Result<CampaignMutation, omp_agent::AgentError>> {
+	let (reply, response) = flume::bounded(1);
+	if commands
+		.send_async(UiCmd::Campaign { operation, reply })
+		.await
+		.is_err()
+	{
+		send_backend(backend, BackendEvent::Error(sf!("Campaign control is unavailable.")));
+		return None;
+	}
+	match response.recv_async().await {
+		Ok(result) => Some(result),
+		Err(_) => {
+			send_backend(backend, BackendEvent::Error(sf!("Campaign control stopped.")));
+			None
+		},
 	}
 }
 
-fn handle_plan_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionModes, args: &str) {
-	let result = match args.trim() {
-		"" | "status" => {
+fn report_campaign_engagement(
+	backend: &flume::Sender<BackendEvent>,
+	modes: &CampaignHandle,
+	spec: &str,
+	result: Result<CampaignMutation, omp_agent::AgentError>,
+) -> Option<omp_agent::EngageReceipt> {
+	match result {
+		Ok(CampaignMutation::Engaged(receipt)) => {
+			match &receipt.outcome {
+				omp_agent::ClaimOutcome::Granted => {
+					send_backend(backend, BackendEvent::Notice(sf!("Mode campaign: **{spec}**")))
+				},
+				omp_agent::ClaimOutcome::Queued { holder, since } => {
+					let holder_name = modes.mode_holder().unwrap_or_else(|| holder.clone());
+					send_backend(
+						backend,
+						BackendEvent::Notice(sf!(
+							"Queued {spec} ticket `{}` behind {holder_name} (holder {holder}, since \
+							 {since}). Cancel with `/{spec} cancel {}`.",
+							receipt.engagement,
+							receipt.engagement,
+						)),
+					);
+				},
+				omp_agent::ClaimOutcome::Denied { .. } => {
+					unreachable!("denied campaign engagement is returned as an error")
+				},
+			}
+			Some(receipt)
+		},
+		Err(omp_agent::AgentError::Arbiter(omp_agent::ArbiterError::Engage(
+			omp_agent::EngageError::Claim {
+				outcome: omp_agent::ClaimOutcome::Denied { holder, since },
+				..
+			},
+		))) => {
+			let holder_name = modes.mode_holder().unwrap_or_else(|| holder.clone());
 			send_backend(
 				backend,
-				BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
+				BackendEvent::Error(sf!(
+					"Cannot engage {spec}: exit {holder_name} first (holder {holder}, since {since})."
+				)),
 			);
-			return;
+			None
 		},
-		"on" => modes.enter_plan(false),
-		"yolo" => modes.enter_plan(true),
-		"off" => {
-			modes.exit_plan();
-			Ok(())
+		Ok(CampaignMutation::Disengaged(_)) => unreachable!("engage returned disengage result"),
+		Err(error) => {
+			send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+			None
 		},
-		_ => {
-			send_backend(backend, BackendEvent::Error(sf!("Usage: /plan [on|yolo|off|status]")));
-			return;
-		},
-	};
-	report_mode_result(backend, result, modes);
+	}
 }
 
-fn handle_prewalk_command(
+async fn engage_campaign(
 	backend: &flume::Sender<BackendEvent>,
-	modes: &ExecutionModes,
+	commands: &flume::Sender<UiCmd>,
+	modes: &CampaignHandle,
+	spec: &'static str,
+	queue: bool,
+	prompt_slot: Option<&'static str>,
+) -> Option<omp_agent::EngageReceipt> {
+	let result =
+		campaign_request(backend, commands, CampaignOperation::Engage { spec, queue, prompt_slot })
+			.await?;
+	report_campaign_engagement(backend, modes, spec, result)
+}
+
+async fn disengage_campaign(
+	backend: &flume::Sender<BackendEvent>,
+	commands: &flume::Sender<UiCmd>,
+	spec: &str,
+	engagement: Str,
+) -> bool {
+	let Some(result) = campaign_request(backend, commands, CampaignOperation::Disengage {
+		engagement: engagement.clone(),
+	})
+	.await
+	else {
+		return false;
+	};
+	match result {
+		Ok(CampaignMutation::Disengaged(true)) => {
+			send_backend(backend, BackendEvent::Notice(sf!("Exited {spec} campaign `{engagement}`.")));
+			true
+		},
+		Ok(CampaignMutation::Disengaged(false)) => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Campaign ticket `{engagement}` is not active.")),
+			);
+			false
+		},
+		Ok(CampaignMutation::Engaged(_)) => unreachable!("disengage returned engage result"),
+		Err(error) => {
+			send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+			false
+		},
+	}
+}
+
+fn queued_flag(args: &str) -> (&str, bool) {
+	args
+		.strip_suffix(" queue=true")
+		.map_or((args, false), |args| (args.trim_end(), true))
+}
+
+async fn handle_plan_command(
+	backend: &flume::Sender<BackendEvent>,
+	commands: &flume::Sender<UiCmd>,
+	modes: &CampaignHandle,
 	args: &str,
 ) {
-	let result = match args.trim() {
-		"" | "status" => {
-			send_backend(
-				backend,
-				BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
-			);
-			return;
+	let (args, queue) = queued_flag(args.trim());
+	match args {
+		"" | "status" => send_backend(backend, BackendEvent::Notice(campaign_status(modes))),
+		"on" | "yolo" => {
+			let prompt_slot = (args == "yolo").then_some("plan-yolo");
+			let _ = engage_campaign(backend, commands, modes, "plan", queue, prompt_slot).await;
 		},
-		"on" => modes.arm_prewalk(),
 		"off" => {
-			modes.disarm_prewalk();
-			Ok(())
+			if modes.mode_holder().as_deref() != Some("plan") {
+				send_backend(backend, BackendEvent::Notice(campaign_status(modes)));
+				return;
+			}
+			if let Some(engagement) = modes.mode_engagement() {
+				let _ = disengage_campaign(backend, commands, "plan", engagement).await;
+			}
 		},
-		_ => {
-			send_backend(backend, BackendEvent::Error(sf!("Usage: /prewalk [on|off|status]")));
-			return;
+		_ if args.starts_with("cancel ") => {
+			let ticket = Str::new(args.trim_start_matches("cancel ").trim());
+			let _ = disengage_campaign(backend, commands, "plan", ticket).await;
 		},
-	};
-	report_mode_result(backend, result, modes);
+		_ => send_backend(
+			backend,
+			BackendEvent::Error(sf!("Usage: /plan [on|yolo|off|status|cancel <ticket>] [queue=true]")),
+		),
+	}
 }
 
-fn handle_vibe_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionModes, args: &str) {
-	let result = match args.trim() {
-		"" | "status" => {
-			send_backend(
-				backend,
-				BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
-			);
-			return;
+async fn handle_vibe_command(
+	backend: &flume::Sender<BackendEvent>,
+	commands: &flume::Sender<UiCmd>,
+	modes: &CampaignHandle,
+	args: &str,
+) {
+	let (args, queue) = queued_flag(args.trim());
+	match args {
+		"" | "status" => send_backend(backend, BackendEvent::Notice(campaign_status(modes))),
+		"on" => {
+			let _ = engage_campaign(backend, commands, modes, "vibe", queue, None).await;
 		},
-		"on" => modes.enter_vibe(),
 		"off" => {
-			modes.exit_vibe();
-			Ok(())
+			if modes.mode_holder().as_deref() != Some("vibe") {
+				send_backend(backend, BackendEvent::Notice(campaign_status(modes)));
+				return;
+			}
+			if let Some(engagement) = modes.mode_engagement() {
+				let _ = disengage_campaign(backend, commands, "vibe", engagement).await;
+			}
 		},
-		_ => {
-			send_backend(backend, BackendEvent::Error(sf!("Usage: /vibe [on|off|status]")));
-			return;
+		_ if args.starts_with("cancel ") => {
+			let ticket = Str::new(args.trim_start_matches("cancel ").trim());
+			let _ = disengage_campaign(backend, commands, "vibe", ticket).await;
 		},
-	};
-	report_mode_result(backend, result, modes);
+		_ => send_backend(
+			backend,
+			BackendEvent::Error(sf!("Usage: /vibe [on|off|status|cancel <ticket>] [queue=true]")),
+		),
+	}
 }
 
-fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionModes, args: &str) {
+async fn handle_goal_command(
+	backend: &flume::Sender<BackendEvent>,
+	commands: &flume::Sender<UiCmd>,
+	modes: &CampaignHandle,
+	args: &str,
+) {
 	let args = args.trim();
 	let (op, rest) = args
 		.split_once(char::is_whitespace)
 		.map_or((args, ""), |(op, rest)| (op, rest.trim()));
-	let result = match op {
-		"" => {
-			send_backend(backend, BackendEvent::OpenGuidedGoal);
-			return;
-		},
-		"status" => {
-			send_backend(backend, BackendEvent::Notice(goal_status(modes.goal())));
-			return;
-		},
+	match op {
+		"" => send_backend(backend, BackendEvent::OpenGuidedGoal),
+		"status" => send_backend(backend, BackendEvent::Notice(goal_status(modes.goal()))),
 		"set" => {
+			let (rest, queue) = queued_flag(rest);
 			let (objective, budget) =
 				rest
 					.rsplit_once(char::is_whitespace)
@@ -1014,53 +1192,84 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 							.ok()
 							.map_or((rest, None), |budget| (objective.trim(), Some(budget)))
 					});
-			modes.set_goal(objective, budget, now_ms())
-		},
-		"pause" => modes.pause_goal(now_ms()),
-		"resume" => modes.resume_goal(now_ms()),
-		"complete" => modes.complete_goal(now_ms()),
-		"drop" => modes.drop_goal(now_ms()),
-		"budget" => {
-			if let Ok(budget) = rest.parse::<u64>() {
-				modes.set_goal_budget(budget)
-			} else {
-				send_backend(
-					backend,
-					BackendEvent::Error(sf!("Usage: /goal budget <positive-tokens>")),
-				);
-				return;
+			if let Some(receipt) = engage_campaign(backend, commands, modes, "goal", queue, None).await
+			{
+				match modes.set_goal(objective, budget, now_ms()) {
+					Ok(goal) => {
+						send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+					},
+					Err(error) => {
+						let _ = disengage_campaign(backend, commands, "goal", receipt.engagement).await;
+						send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+					},
+				}
 			}
 		},
-		_ => {
-			send_backend(
-				backend,
-				BackendEvent::Error(
-					sf!("Usage: /goal [set|pause|resume|complete|drop|budget|status]",),
-				),
-			);
-			return;
+		"pause" | "complete" | "drop" => {
+			let result = match op {
+				"pause" => modes.pause_goal(now_ms()),
+				"complete" => modes.complete_goal(now_ms()),
+				"drop" => modes.drop_goal(now_ms()),
+				_ => unreachable!(),
+			};
+			match result {
+				Ok(goal) => {
+					if modes.mode_holder().as_deref() == Some("goal")
+						&& let Some(engagement) = modes.mode_engagement()
+					{
+						let _ = disengage_campaign(backend, commands, "goal", engagement).await;
+					}
+					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+				},
+				Err(error) => {
+					send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+				},
+			}
 		},
-	};
-	match result {
-		Ok(goal) => {
-			let _ = modes.persist_projection();
-			send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+		"resume" => {
+			let (_, queue) = queued_flag(rest);
+			if let Some(receipt) = engage_campaign(backend, commands, modes, "goal", queue, None).await
+			{
+				match modes.resume_goal(now_ms()) {
+					Ok(goal) => {
+						send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+					},
+					Err(error) => {
+						let _ = disengage_campaign(backend, commands, "goal", receipt.engagement).await;
+						send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+					},
+				}
+			}
 		},
-		Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
-	}
-}
-
-fn report_mode_result(
-	backend: &flume::Sender<BackendEvent>,
-	result: Result<(), crate::modes::ModeError>,
-	modes: &ExecutionModes,
-) {
-	match result {
-		Ok(()) => send_backend(
+		"budget" => match rest.parse::<u64>() {
+			Ok(budget) => match modes.set_goal_budget(budget) {
+				Ok(goal) => {
+					if goal.status == GoalStatus::BudgetLimited
+						&& modes.mode_holder().as_deref() == Some("goal")
+						&& let Some(engagement) = modes.mode_engagement()
+					{
+						let _ = disengage_campaign(backend, commands, "goal", engagement).await;
+					}
+					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+				},
+				Err(error) => {
+					send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+				},
+			},
+			Err(_) => {
+				send_backend(backend, BackendEvent::Error(sf!("Usage: /goal budget <positive-tokens>")))
+			},
+		},
+		"cancel" => {
+			let ticket = Str::new(rest);
+			let _ = disengage_campaign(backend, commands, "goal", ticket).await;
+		},
+		_ => send_backend(
 			backend,
-			BackendEvent::Notice(sf!("Execution mode: **{}**", mode_name(modes.active()))),
+			BackendEvent::Error(sf!(
+				"Usage: /goal [set|pause|resume|complete|drop|budget|status|cancel]"
+			)),
 		),
-		Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error.to_string()))),
 	}
 }
 
@@ -1091,7 +1300,7 @@ struct LiveCommandHost<'a, R> {
 	abort:         &'a omp_agent::AbortHandle,
 	control:       &'a omp_agent::ControlSender,
 	agent_state:   &'a AgentState,
-	modes:         &'a ExecutionModes,
+	modes:         &'a CampaignHandle,
 	auth:          Option<&'a ChatAuth>,
 	data_dir:      &'a std::path::Path,
 	list_sessions: &'a mut R,
@@ -1756,13 +1965,17 @@ where
 	}
 
 	fn plan(&mut self, args: Str) -> CommandFuture<'_> {
-		handle_plan_command(self.backend, self.modes, args.as_str());
-		silent_command()
+		Box::pin(async move {
+			handle_plan_command(self.backend, self.commands_tx, self.modes, args.as_str()).await;
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
 	}
 
 	fn vibe(&mut self, args: Str) -> CommandFuture<'_> {
-		handle_vibe_command(self.backend, self.modes, args.as_str());
-		silent_command()
+		Box::pin(async move {
+			handle_vibe_command(self.backend, self.commands_tx, self.modes, args.as_str()).await;
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
 	}
 
 	fn todo(&mut self, args: Str) -> CommandFuture<'_> {
@@ -1831,8 +2044,10 @@ where
 	}
 
 	fn guided_goal(&mut self, args: Str) -> CommandFuture<'_> {
-		handle_goal_command(self.backend, self.modes, args.as_str());
-		silent_command()
+		Box::pin(async move {
+			handle_goal_command(self.backend, self.commands_tx, self.modes, args.as_str()).await;
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
 	}
 
 	fn loop_command(&mut self, _: Str) -> CommandFuture<'_> {
@@ -1851,9 +2066,8 @@ where
 		self.unavailable("Fast tier control is not attached to this interactive session.")
 	}
 
-	fn prewalk(&mut self, args: Str) -> CommandFuture<'_> {
-		handle_prewalk_command(self.backend, self.modes, args.as_str());
-		silent_command()
+	fn prewalk(&mut self, _: Str) -> CommandFuture<'_> {
+		self.unavailable("Prewalk is not a user-visible mode campaign.")
 	}
 
 	fn btw(&mut self, _: Str) -> CommandFuture<'_> {
@@ -2302,6 +2516,37 @@ where
 	}
 }
 
+async fn maybe_generate_session_title<C>(
+	parent: &crate::chat::ChatParentHost<C>,
+	control: &omp_agent::ControlSender,
+	backend: &flume::Sender<BackendEvent>,
+	state: &mut BridgeState,
+	input: &str,
+	replanned: bool,
+) where
+	C: TurnClient + Clone + Send + 'static,
+{
+	let mut title = state.title.clone();
+	if !title
+		.generate_online(parent, input, crate::session_title::TITLE_SYSTEM_PROMPT, replanned)
+		.await
+	{
+		return;
+	}
+	let Some(generated) = title.title.clone() else {
+		return;
+	};
+	match control.set_generated_title(now_ms(), generated).await {
+		Ok(_) => {
+			if let Some(title_value) = title.title.as_ref() {
+				send_backend(backend, BackendEvent::SessionTitle(title_value.clone()));
+			}
+			state.title = title;
+		},
+		Err(error) => tracing::warn!(%error, "generated session title could not be committed"),
+	}
+}
+
 async fn handle_intent<C, R>(
 	intent: Intent,
 	backend: &flume::Sender<BackendEvent>,
@@ -2310,7 +2555,7 @@ async fn handle_intent<C, R>(
 	abort: &omp_agent::AbortHandle,
 	control: &omp_agent::ControlSender,
 	agent_state: &AgentState,
-	modes: &ExecutionModes,
+	modes: &CampaignHandle,
 	parent: &crate::chat::ChatParentHost<C>,
 	auth: Option<&ChatAuth>,
 	data_dir: &std::path::Path,
@@ -2667,10 +2912,21 @@ where
 					);
 					send_status(backend, state, bus, dropped);
 				},
-				Ok(ChatCommand::Plan(args)) => handle_plan_command(backend, modes, args.as_str()),
-				Ok(ChatCommand::Goal(args)) => handle_goal_command(backend, modes, args.as_str()),
-				Ok(ChatCommand::Vibe(args)) => handle_vibe_command(backend, modes, args.as_str()),
-				Ok(ChatCommand::Prewalk(args)) => handle_prewalk_command(backend, modes, args.as_str()),
+				Ok(ChatCommand::Plan(args)) => {
+					let replanned = modes.plan().is_some();
+					handle_plan_command(backend, commands_tx, modes, args.as_str()).await;
+					state.title_replan_refresh_pending |= replanned;
+				},
+				Ok(ChatCommand::Goal(args)) => {
+					handle_goal_command(backend, commands_tx, modes, args.as_str()).await;
+				},
+				Ok(ChatCommand::Vibe(args)) => {
+					handle_vibe_command(backend, commands_tx, modes, args.as_str()).await;
+				},
+				Ok(ChatCommand::Prewalk(_)) => send_backend(
+					backend,
+					BackendEvent::Error(sf!("Prewalk is not a user-visible mode campaign.")),
+				),
 				Ok(ChatCommand::Skill { name, args, budget }) => {
 					let Some(skill) = state.skills.get(name.as_str()) else {
 						send_backend(backend, BackendEvent::Error(sf!("Unknown skill `{name}`.")));
@@ -2692,6 +2948,21 @@ where
 						args.as_str(),
 						crate::skills::SkillInvocationKind::User,
 					);
+					if !chat_active(state.submit_pending, bus.phase()) {
+						let replanned = std::mem::take(&mut state.title_replan_refresh_pending)
+							&& state.settings.title.refresh_on_replan;
+						let title_input =
+							crate::session_title::skill_title_input(name.as_str(), args.as_str());
+						maybe_generate_session_title(
+							parent,
+							control,
+							backend,
+							state,
+							title_input.as_str(),
+							replanned,
+						)
+						.await;
+					}
 					let mut item = input::user_message(rendered.as_str());
 					let chips = lower_attachments(&mut item, attachments.clone(), |message| {
 						send_backend(backend, BackendEvent::Error(message));
@@ -2757,6 +3028,19 @@ where
 						);
 					} else {
 						let active = chat_active(state.submit_pending, bus.phase());
+						if !active {
+							let replanned = std::mem::take(&mut state.title_replan_refresh_pending)
+								&& state.settings.title.refresh_on_replan;
+							maybe_generate_session_title(
+								parent,
+								control,
+								backend,
+								state,
+								prompt_text.as_str(),
+								replanned,
+							)
+							.await;
+						}
 						let pending_prompt = (!active).then(|| PendingPrompt {
 							text:        prompt_text.clone(),
 							attachments: attachments.clone(),
@@ -2815,19 +3099,29 @@ where
 		},
 		Intent::Abort => {
 			if chat_active(state.submit_pending, bus.phase()) {
-				let _ = modes.interrupt_goal(now_ms(), true);
-				let _ = modes.flush_projection().await;
 				abort.abort();
+				if let Ok(Some(goal)) = modes.interrupt_goal(now_ms(), true) {
+					if let Some(engagement) = modes.mode_engagement() {
+						let _ = disengage_campaign(backend, commands_tx, "goal", engagement).await;
+					}
+					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+				}
 			}
 		},
 		Intent::SetGoal { objective, token_budget } => {
-			match modes.set_goal(objective, token_budget, now_ms()) {
-				Ok(goal) => {
-					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
-				},
-				Err(error) => {
-					send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
-				},
+			if let Some(receipt) =
+				engage_campaign(backend, commands_tx, modes, "goal", false, None).await
+			{
+				match modes.set_goal(objective, token_budget, now_ms()) {
+					Ok(goal) => {
+						send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+					},
+					Err(error) => {
+						let _ =
+							disengage_campaign(backend, commands_tx, "goal", receipt.engagement).await;
+						send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+					},
+				}
 			}
 		},
 		Intent::Dequeue => {
@@ -2895,7 +3189,12 @@ where
 			send_status(backend, state, bus, dropped);
 		},
 		Intent::TogglePlan => {
-			handle_plan_command(backend, modes, "toggle");
+			let operation = if modes.mode_holder().as_deref() == Some("plan") {
+				"off"
+			} else {
+				"on"
+			};
+			handle_plan_command(backend, commands_tx, modes, operation).await;
 		},
 		Intent::ToggleLive => {
 			state.live_enabled = !state.live_enabled;
@@ -3536,7 +3835,7 @@ fn handle_agent_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	event: &AgentEvent,
-	modes: &ExecutionModes,
+	modes: &CampaignHandle,
 	registry: &Registry,
 	bus: &omp_agent::EventBus,
 	dropped: u64,
@@ -3882,7 +4181,11 @@ fn handle_agent_event(
 				}),
 			);
 		},
-		AgentEvent::TitleChanged { title, .. } => {
+		AgentEvent::TitleChanged { title, source } => {
+			state.title = crate::session_title::SessionTitleState {
+				title:  Some(title.clone()),
+				source: Some(*source),
+			};
 			send_backend(backend, BackendEvent::SessionTitle(title.clone()));
 		},
 		AgentEvent::Snapshot(_)
@@ -4574,6 +4877,7 @@ fn send_status(
 			cost_nanos: state.cost_nanos,
 			advisor_cost_nanos: 0,
 			queued: state.queued,
+			visible_slots: state.campaigns.visible_slots(),
 			jobs: state.jobs.len(),
 			attempt: state.attempt,
 			dropped,
@@ -4814,7 +5118,7 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-	use omp_agent::{AgentKind, AgentStatus, Budget, ExecutionModeHandle};
+	use omp_agent::{AgentKind, AgentStatus, Budget};
 	use omp_core::ExposeSecret as _;
 	use omp_tui::{
 		Color, Size, UiContext, components::AttachmentContent, test_support::frame_row_text,
@@ -4934,13 +5238,45 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn campaign_denial_renders_holder_identity_and_since() {
+		let mut stack = omp_agent::CampaignStack::new();
+		let (plan, machine) = omp_agent::core_regime("plan").expect("plan regime");
+		let granted = stack
+			.engage(plan, machine, omp_agent::EngageOptions { now_ms: 41, queue: false })
+			.expect("plan grant");
+		let modes = CampaignHandle::new();
+		modes.sync_campaigns(&stack);
+		let (backend, events) = flume::unbounded();
+		let result = Err(omp_agent::AgentError::Arbiter(omp_agent::ArbiterError::Engage(
+			omp_agent::EngageError::Claim {
+				slot:    omp_agent::SlotClaim::Mode,
+				outcome: omp_agent::ClaimOutcome::Denied {
+					holder: granted.engagement.clone(),
+					since:  41,
+				},
+			},
+		)));
+		assert!(report_campaign_engagement(&backend, &modes, "goal", result).is_none());
+		let BackendEvent::Error(message) = events.recv().expect("denial event") else {
+			panic!("denial must render as an error")
+		};
+		assert!(message.contains("exit plan first"));
+		assert!(message.contains(granted.engagement.as_str()));
+		assert!(message.contains("since 41"));
+	}
+
 	fn test_bridge_state() -> BridgeState {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			model: "test/model".to_owned(),
+			title: crate::session_title::SessionTitleState::default(),
+			title_replan_refresh_pending: false,
 			environment,
 			local_root: std::env::temp_dir(),
 			session_id: sf!("test-session"),
+			campaigns: CampaignHandle::new(),
+			campaign_revision: 0,
 			collab: None,
 			memory: None,
 			workspace_root: sf!("/workspace"),
@@ -4997,7 +5333,7 @@ mod tests {
 	fn active_turn_text_and_submit_errors_project_into_visible_transcript_rows() {
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state();
-		let modes = ExecutionModes::new(ExecutionModeHandle::default());
+		let modes = CampaignHandle::new();
 		let registry = Registry::new();
 		let bus = omp_agent::EventBus::new();
 		for event in [

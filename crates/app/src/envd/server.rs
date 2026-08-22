@@ -531,6 +531,7 @@ pub struct EnvServer {
 	search_bridge:       Arc<super::search_backend::SearchBridgeHost>,
 	github_credentials:  Arc<super::github_url::GithubCredentialBridge>,
 	checkpoint_control:  super::tools::AgentCheckpointControl,
+	previews:            omp_tools::staging::PreviewRegistry,
 	goal_control:        super::tools::AgentGoalControl,
 	sessions_index:      Arc<SessionIndex>,
 	journal_external:    ExternalJournalActor,
@@ -859,6 +860,7 @@ impl EnvServer {
 		search_bridge: Arc<super::search_backend::SearchBridgeHost>,
 		github_credentials: Arc<super::github_url::GithubCredentialBridge>,
 		checkpoint_control: super::tools::AgentCheckpointControl,
+		previews: omp_tools::staging::PreviewRegistry,
 		goal_control: super::tools::AgentGoalControl,
 		sessions_index: Arc<SessionIndex>,
 		journal_external: ExternalJournalActor,
@@ -903,6 +905,7 @@ impl EnvServer {
 			search_bridge,
 			github_credentials,
 			checkpoint_control,
+			previews,
 			goal_control,
 			sessions_index,
 			journal_external,
@@ -1006,6 +1009,7 @@ impl EnvServer {
 			reflection_bridge,
 			eval_control,
 			checkpoint_control,
+			previews,
 			resources,
 			goal_control,
 			search_bridge,
@@ -1063,6 +1067,7 @@ impl EnvServer {
 			search_bridge,
 			github_credentials,
 			checkpoint_control,
+			previews,
 			goal_control,
 			sessions_index,
 			journal_external,
@@ -1149,6 +1154,7 @@ impl EnvServer {
 			reflection_bridge,
 			eval_control,
 			checkpoint_control,
+			previews,
 			resources,
 			goal_control,
 			search_bridge,
@@ -1206,6 +1212,7 @@ impl EnvServer {
 			search_bridge,
 			github_credentials,
 			checkpoint_control,
+			previews,
 			goal_control,
 			sessions_index,
 			journal_external,
@@ -1372,11 +1379,15 @@ impl EnvServer {
 			self.journal_external.unbind_agent(id);
 			return Err(error.into());
 		}
-		self.checkpoint_control.bind(id, sender);
+		self.checkpoint_control.bind(id, sender.clone());
+		self
+			.previews
+			.bind_observer(super::staged_preview::observer(sender));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
 	}
 
 	fn release_agent_control(&self, id: u64) {
+		self.previews.unbind_observer();
 		self.ext_hosts.unbind_journal_runtime(id);
 		self.journal_external.unbind_agent(id);
 		self.checkpoint_control.unbind(id);
@@ -7992,6 +8003,7 @@ mod tests {
 			Arc::new(crate::envd::search_backend::SearchBridgeHost::new()),
 			Arc::new(crate::envd::github_url::GithubCredentialBridge::new()),
 			crate::envd::tools::AgentCheckpointControl::default(),
+			omp_tools::staging::PreviewRegistry::new(),
 			crate::envd::tools::AgentGoalControl::default(),
 			sessions_index,
 			journal_external,
@@ -8191,12 +8203,26 @@ mod tests {
 		}
 	}
 
+	/// App-authority DATA frame: no invocation scope, so admission rides the
+	/// connection grants rather than the worker effect envelope.
+	fn unscoped_data_frame(request_id: u64, body: pb::data_request::Body) -> pb::ClientFrame {
+		pb::ClientFrame {
+			request_id,
+			body: Some(client_frame::Body::Data(pb::DataRequest {
+				body:  Some(body),
+				props: Default::default(),
+			})),
+			scope: None,
+			props: Default::default(),
+		}
+	}
+
 	#[tokio::test]
 	async fn dap_read_action_streams_output_before_revision_fenced_response() {
 		let (requests, responses, _root, _state) =
 			test_connection(&["env.dap.read", "env.dap.execute"], true).await;
 		requests
-			.send_async(data_frame(
+			.send_async(unscoped_data_frame(
 				1,
 				pb::data_request::Body::DapAction(document_pb::DapActionRequest {
 					session:             Some(document_pb::DapSessionRef {

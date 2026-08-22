@@ -734,6 +734,9 @@ mod tests {
 					omp_agent::control::ControlMailboxEvent::Closed => break,
 					omp_agent::control::ControlMailboxEvent::JournalHandled
 					| omp_agent::control::ControlMailboxEvent::Rewind(_) => {},
+					omp_agent::control::ControlMailboxEvent::Campaign(command) => {
+						command.reject_unavailable();
+					},
 				}
 			}
 		});

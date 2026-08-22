@@ -1,16 +1,21 @@
 //! Durable quota-history CLI over the inference-owned account state store.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_llm_catalog::ProviderId;
-use omp_llm_inference::{account::AccountStateStore, id::AccountId};
+use omp_llm_inference::{
+	account::AccountStateStore,
+	answer::{UsageQuantity, UsageReport},
+	call::{UsageRequest, UsageScope},
+	id::AccountId,
+};
 use serde_json::{Value, json};
 
 use crate::cli::UsageArgs;
 
 /// Renders durable quota snapshots or explicitly invalidates them.
-pub fn run(args: UsageArgs) -> miette::Result<()> {
+pub async fn run(args: UsageArgs) -> miette::Result<()> {
 	if args.account.is_some() && args.provider.is_some() {
 		return Err(miette!("--account and --provider are mutually exclusive"));
 	}
@@ -31,8 +36,9 @@ pub fn run(args: UsageArgs) -> miette::Result<()> {
 		return Ok(());
 	}
 
+	let records = store.load_accounts().into_diagnostic()?;
 	let mut rows = Vec::new();
-	for record in store.load_accounts().into_diagnostic()? {
+	for record in &records {
 		if provider
 			.as_ref()
 			.is_some_and(|value| value != &record.provider)
@@ -70,18 +76,98 @@ pub fn run(args: UsageArgs) -> miette::Result<()> {
 			}));
 		}
 	}
+	let manager = crate::daemon::production_usage_manager(&data_dir)
+		.await
+		.into_diagnostic()?;
+	for record in &records {
+		if provider
+			.as_ref()
+			.is_some_and(|value| value != &record.provider)
+			|| account
+				.as_ref()
+				.is_some_and(|value| value != &record.account)
+		{
+			continue;
+		}
+		let Some(route) = record.routes.iter().next() else {
+			continue;
+		};
+		let request = UsageRequest {
+			provider:    Some(record.provider.clone()),
+			account:     Some(record.account.clone()),
+			scope:       UsageScope::All,
+			allow_stale: false,
+		};
+		match manager
+			.execute(
+				&record.provider,
+				route,
+				&request,
+				Instant::now().checked_add(Duration::from_secs(20)),
+			)
+			.await
+		{
+			Ok(report) => merge_fresh(&mut rows, &report),
+			Err(error) => eprintln!(
+				"usage refresh failed for {} / {}: {error}",
+				record.provider.as_str(),
+				mask(record.account.as_str())
+			),
+		}
+	}
 	if args.json {
 		println!("{}", serde_json::to_string_pretty(&rows).into_diagnostic()?);
 		return Ok(());
 	}
 	if rows.is_empty() {
-		println!("no durable quota observations");
+		println!("no quota observations");
 		return Ok(());
 	}
 	for row in rows {
 		print_row(&row);
 	}
 	Ok(())
+}
+
+fn merge_fresh(rows: &mut Vec<Value>, report: &UsageReport) {
+	let provider = report.provider.as_str();
+	let account = mask(report.account.as_str());
+	for window in &report.windows {
+		let consumed = window.amount.consumed.map(quantity_value);
+		let remaining = window.amount.remaining.map(quantity_value);
+		let limit = window.amount.limit.map(quantity_value);
+		let existing = rows.iter_mut().find(|row| {
+			row["provider"].as_str() == Some(provider)
+				&& row["account"].as_str() == Some(account.as_str())
+				&& row["window"].as_str() == Some(window.id.as_str())
+		});
+		if let Some(row) = existing {
+			row["consumed"] = json!(consumed);
+			row["remaining"] = json!(remaining);
+			row["limit"] = json!(limit);
+			row["resetAtMs"] = json!(window.resets_at.and_then(unix_millis));
+			row["observedAtMs"] = json!(unix_millis(window.observed_at));
+			row["fresh"] = json!(true);
+		} else {
+			rows.push(json!({
+				"provider": provider,
+				"account": account,
+				"window": window.id.as_str(),
+				"consumed": consumed,
+				"remaining": remaining,
+				"limit": limit,
+				"resetAtMs": window.resets_at.and_then(unix_millis),
+				"observedAtMs": unix_millis(window.observed_at),
+				"historySamples": 0,
+				"trend": [],
+				"fresh": true,
+			}));
+		}
+	}
+}
+
+fn quantity_value(quantity: UsageQuantity) -> f64 {
+	quantity.units as f64 / 10_f64.powi(i32::from(quantity.decimal_exponent))
 }
 
 fn mask(value: &str) -> String {
@@ -99,15 +185,13 @@ fn unix_millis(time: SystemTime) -> Option<u64> {
 }
 
 fn print_row(row: &Value) {
-	let consumed = row["consumed"]
-		.as_u64()
-		.map_or("?".to_owned(), |value| value.to_string());
-	let limit_value = row["limit"].as_u64();
+	let consumed_value = row["consumed"].as_f64();
+	let consumed = consumed_value.map_or("?".to_owned(), |value| value.to_string());
+	let limit_value = row["limit"].as_f64();
 	let limit = limit_value.map_or("?".to_owned(), |value| value.to_string());
-	let fraction = row["consumed"]
-		.as_u64()
+	let fraction = consumed_value
 		.zip(limit_value)
-		.and_then(|(used, total)| (total != 0).then_some(used as f64 / total as f64));
+		.and_then(|(used, total)| (total != 0.0).then_some(used / total));
 	let bar = quota_bar(fraction);
 	let trend = row["trend"]
 		.as_array()

@@ -27,11 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
-use crate::{
-	chat::ChatParentHost,
-	envd::eval::ParentSessionHost as _,
-	modes::{ActiveMode, ExecutionModes},
-};
+use crate::{chat::ChatParentHost, envd::eval::ParentSessionHost as _, modes::CampaignHandle};
 
 /// A worker requested in a vibe-mode spawn wave.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -531,7 +527,7 @@ struct Worker {
 /// Chat-scoped wave runner backed by durable registered agent loops.
 pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'static> {
 	parent:      Arc<ChatParentHost<C>>,
-	modes:       Arc<ExecutionModes>,
+	modes:       Arc<CampaignHandle>,
 	workers:     Arc<Mutex<BTreeMap<Str, Worker>>>,
 	monitor:     Arc<Mutex<VibeSwarmMonitor>>,
 	seen_active: AtomicBool,
@@ -539,7 +535,7 @@ pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'sta
 
 impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 	/// Creates a wave runner and its app-owned TTL/mode-exit scheduler.
-	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<ExecutionModes>) -> Arc<Self> {
+	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<CampaignHandle>) -> Arc<Self> {
 		let backend = Arc::new(Self {
 			parent,
 			modes,
@@ -560,7 +556,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				let Some(backend) = backend.upgrade() else {
 					break;
 				};
-				if backend.modes.active() == ActiveMode::Vibe {
+				if backend.modes.holds_mode("vibe") {
 					backend.seen_active.store(true, Ordering::Release);
 					let ttl_ms = backend.parent.task_settings().agent_idle_ttl_ms;
 					if ttl_ms != 0 {
@@ -937,7 +933,7 @@ fn now_ms() -> u64 {
 #[async_trait]
 impl<C: omp_agent::TurnClient + Clone + Send + 'static> VibeBackend for ChatVibeBackend<C> {
 	async fn execute(&self, params: Params) -> Result<Value, Fault> {
-		if self.modes.active() != ActiveMode::Vibe {
+		if !self.modes.holds_mode("vibe") {
 			return Err(Fault::new("vibe device requires /vibe on"));
 		}
 		match params.op {
@@ -960,7 +956,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> VibeBackend for ChatVibe
 /// Attaches the vibe device to one chat session.
 pub(crate) fn attach_chat<C: omp_agent::TurnClient + Clone + Send + 'static>(
 	parent: Arc<ChatParentHost<C>>,
-	modes: Arc<ExecutionModes>,
+	modes: Arc<CampaignHandle>,
 ) -> Attachment {
 	attach(ChatVibeBackend::new(parent, modes))
 }

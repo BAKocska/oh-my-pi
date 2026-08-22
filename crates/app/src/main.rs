@@ -91,7 +91,9 @@ async fn main() -> ExitCode {
 		};
 	}
 	omp_telemetry::export::init();
+	omp_app::startup_notice::start_watchdog();
 	let result = omp_app::run().await;
+	omp_app::startup_notice::stop_watchdog();
 	omp_telemetry::export::shutdown();
 	match result {
 		Ok(()) => ExitCode::SUCCESS,

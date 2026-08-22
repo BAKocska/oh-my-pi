@@ -52,6 +52,12 @@ pub async fn run(args: ShareArgs) -> miette::Result<()> {
 	let sealed = seal(&projection).map_err(|error| miette!("{error}"))?;
 	let server = args.server.as_ref().unwrap_or(&configured.share.server_url);
 	let credentials = Arc::new(crate::envd::github_url::GithubCredentialBridge::new());
+	let authority = Arc::new(crate::auth_backend::combined_authority(
+		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?,
+	));
+	credentials
+		.bind(authority)
+		.map_err(|_| miette!("GitHub credential authority is already bound"))?;
 	let store =
 		DirectShareStore::new(server.as_str(), credentials).map_err(|error| miette!("{error}"))?;
 	let result = upload(

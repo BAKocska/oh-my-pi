@@ -244,11 +244,12 @@ impl<C: TurnClient + Clone> InferenceExtractionLane<C> {
 			items: vec![memory_message(Role::System, system), memory_message(Role::User, prompt)],
 		};
 		let options = TurnOptions {
-			context_id:     None,
-			params:         self.params.clone(),
-			executor:       None,
-			props:          None,
-			provider_reset: false,
+			context_id:      None,
+			params:          self.params.clone(),
+			executor:        None,
+			props:           None,
+			provider_reset:  false,
+			stream_watchdog: omp_agent::StreamWatchdog::default(),
 		};
 		let mut turn = self
 			.client

@@ -5,6 +5,8 @@ use std::{
 	fs,
 	io::{self, IsTerminal as _},
 	path::Path,
+	sync::LazyLock,
+	time::{Duration, Instant},
 };
 
 use omp_core::Str;
@@ -12,6 +14,52 @@ use omp_core::Str;
 const NOTICE_VERSION_FILE: &str = "startup-notice-version";
 const MAX_CHANGELOG_BYTES: usize = 64 * 1024;
 const MAX_UNSEEN_RELEASES: usize = 3;
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+
+struct StartupWatchdog {
+	stop:    flume::Sender<()>,
+	started: Instant,
+}
+
+static STARTUP_WATCHDOG: LazyLock<parking_lot::Mutex<Option<StartupWatchdog>>> =
+	LazyLock::new(|| parking_lot::Mutex::new(None));
+
+/// Arms the process startup watchdog until CLI dispatch hands control to a
+/// mode owner.
+pub fn start_watchdog() {
+	let mut state = STARTUP_WATCHDOG.lock();
+	if state.is_some() {
+		return;
+	}
+	let started = Instant::now();
+	let (stop, stopped) = flume::bounded::<()>(1);
+	std::thread::Builder::new()
+		.name("omp-startup-watchdog".to_owned())
+		.spawn(move || {
+			while stopped.recv_timeout(WATCHDOG_INTERVAL).is_err() {
+				eprintln!(
+					"Still starting after {}s — phase: CLI bootstrap / dispatch",
+					started.elapsed().as_secs()
+				);
+			}
+		})
+		.ok();
+	*state = Some(StartupWatchdog { stop, started });
+}
+
+/// Stops the startup watchdog at the mode handoff and emits the requested
+/// machine-oriented timing fact.
+pub fn stop_watchdog() {
+	let watchdog = STARTUP_WATCHDOG.lock().take();
+	let Some(watchdog) = watchdog else {
+		return;
+	};
+	let _ = watchdog.stop.send(());
+	if std::env::var_os("OMP_TIMING").is_some() {
+		eprintln!("OMP_TIMING startup_dispatch_ms={}", watchdog.started.elapsed().as_millis());
+	}
+}
+
 const RELEASE_NOTES: &str = concat!(
 	"# Changelog\n\n",
 	"All notable changes to OMP are recorded here.\n\n",

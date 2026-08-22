@@ -23,26 +23,30 @@ use self::finalize::{FinalizerBudget, FinalizerReport, HeadlessFinalizerHandle};
 use crate::{
 	chat,
 	exthost::lifecycle::{HeadlessLifecycleSink, HeadlessLifecycleSubscription},
-	modes::ExecutionModes,
+	modes::CampaignHandle,
 };
 
 /// Inputs required to create one production headless session.
 #[derive(Clone, Debug)]
 pub struct HeadlessSessionOptions {
 	/// Project root whose Environment owns all effects.
-	pub project:            PathBuf,
+	pub project:             PathBuf,
 	/// Additional Environment-authorized workspace roots.
-	pub additional_roots:   Box<[PathBuf]>,
+	pub additional_roots:    Box<[PathBuf]>,
 	/// Resolved catalog model selector.
-	pub model:              Str,
+	pub model:               Str,
+	/// Built-in regime engaged before the agent moves into its runtime actor.
+	pub initial_campaign:    Option<&'static str>,
+	/// Optional prompt-slot override for the initial campaign.
+	pub initial_prompt_slot: Option<&'static str>,
 	/// Existing durable session to resume, or a fresh journal when absent.
-	pub resume:             Option<Str>,
+	pub resume:              Option<Str>,
 	/// Existing durable session whose live projection is copied into a fork.
-	pub fork:               Option<Str>,
+	pub fork:                Option<Str>,
 	/// Whether the Python eval device is enabled.
-	pub py_eval:            bool,
+	pub py_eval:             bool,
 	/// Session-incarnation fence stamped onto observable events.
-	pub session_generation: u64,
+	pub session_generation:  u64,
 }
 
 /// Single owner of every authority needed by a non-interactive agent loop.
@@ -54,7 +58,7 @@ pub struct HeadlessSession {
 	state:               AgentState,
 	control:             omp_agent::ControlSender,
 	env:                 omp_env::EnvClient,
-	modes:               Arc<ExecutionModes>,
+	campaigns:           Arc<CampaignHandle>,
 	tree:                Arc<AgentTree>,
 	events:              Option<EventSubscription>,
 	lifecycle:           HeadlessLifecycleSink,
@@ -162,23 +166,47 @@ impl HeadlessSession {
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
 		agent.set_autolearn(autolearn);
 		blueprint.configure_agent(&mut agent);
+		match crate::daemon::production_redemption_authority(&state_dir) {
+			Ok(Some(authority)) => agent.set_redemption_authority(authority),
+			Ok(None) => {},
+			Err(error) => {
+				tracing::warn!(%error, "codex redemption authority was not constructed");
+			},
+		}
 		agent.set_ttsr_registry(ttsr);
 		agent
 			.events()
 			.set_session_generation(options.session_generation);
 		let control = agent.control();
-		let (mode_store, projection) = crate::modes::persistence::ModePersistence::open(
-			agent.journal(),
-			control.clone(),
-			session.id.as_str(),
-			root.to_string_lossy().as_ref(),
-		)
-		.map_err(|error| miette::miette!(error))?;
-		let modes = Arc::new(ExecutionModes::from_projection(
-			agent.execution_mode(),
-			projection.unwrap_or_default(),
-		));
-		modes.attach_persistence(mode_store);
+		agent
+			.recover_campaigns(omp_agent::core_regime, now_ms())
+			.into_diagnostic()?;
+		if let Some(spec_id) = options.initial_campaign
+			&& agent
+				.arbiter()
+				.campaigns()
+				.slots()
+				.owner(&omp_agent::SlotClaim::Mode)
+				.is_none()
+		{
+			let (spec, machine) =
+				omp_agent::core_regime(spec_id).expect("headless startup names a core regime");
+			let mut spec = spec;
+			if let Some(prompt_slot) = options.initial_prompt_slot {
+				Arc::make_mut(&mut spec).binds = Arc::from([omp_agent::ScopedBinding {
+					slot:  omp_agent::BindSlot::PromptSlot,
+					value: Str::new_static(prompt_slot),
+				}]);
+			}
+			let _ = agent
+				.engage_campaign(spec, machine, omp_agent::EngageOptions {
+					now_ms: now_ms(),
+					queue:  false,
+				})
+				.into_diagnostic()?;
+		}
+		let modes = Arc::new(CampaignHandle::new());
+		modes.sync_campaigns(agent.arbiter().campaigns());
 		modes.bind_plan_selection(state.clone(), None);
 		state.update(|snapshot| {
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
@@ -214,7 +242,7 @@ impl HeadlessSession {
 			state,
 			control,
 			env,
-			modes,
+			campaigns: modes,
 			tree,
 			events: Some(events),
 			lifecycle,
@@ -348,9 +376,38 @@ impl HeadlessSession {
 		Ok(())
 	}
 
-	/// Returns the session-scoped execution modes.
-	pub fn modes(&self) -> &ExecutionModes {
-		self.modes.as_ref()
+	/// Returns the session-scoped campaign projection.
+	pub fn campaigns(&self) -> &CampaignHandle {
+		self.campaigns.as_ref()
+	}
+
+	/// Engages a built-in regime on the actor-owned campaign stack.
+	pub async fn engage_regime(
+		&self,
+		spec_id: &'static str,
+		queue: bool,
+	) -> Result<omp_agent::EngageReceipt, omp_sdk::SessionHandleError> {
+		let (spec, machine) =
+			omp_agent::core_regime(spec_id).expect("headless command names a built-in regime");
+		let (receipt, entries) = self
+			.session
+			.engage_campaign(spec, machine, omp_agent::EngageOptions { now_ms: now_ms(), queue })
+			.await?;
+		self.campaigns.sync_entries(&entries);
+		Ok(receipt)
+	}
+
+	/// Disengages an active campaign on the actor-owned stack.
+	pub async fn disengage_campaign(
+		&self,
+		engagement: Str,
+	) -> Result<bool, omp_sdk::SessionHandleError> {
+		let (removed, entries) = self
+			.session
+			.disengage_campaign(engagement, now_ms())
+			.await?;
+		self.campaigns.sync_entries(&entries);
+		Ok(removed)
 	}
 
 	/// Returns the append-only agent roster.

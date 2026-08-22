@@ -781,6 +781,8 @@ pub struct LifecycleSettings {
 	pub autoqa_reporting:        bool,
 	/// Redeem an available Codex reset automatically.
 	pub codex_reset_auto_redeem: bool,
+	/// Materialize handoff children as durable indexed journals.
+	pub handoff_save_to_disk:    bool,
 	/// Number of days durable garbage remains eligible for recovery.
 	pub gc_retention_days:       u32,
 	/// Show the interactive startup splash.
@@ -817,6 +819,7 @@ impl Default for LifecycleSettings {
 			auth_broker_gateway:     None,
 			autoqa_reporting:        false,
 			codex_reset_auto_redeem: false,
+			handoff_save_to_disk:    true,
 			gc_retention_days:       30,
 			startup_splash:          true,
 			startup_wizard:          true,
@@ -858,6 +861,13 @@ impl SettingsDomain for LifecycleSettings {
 			"Redeem available Codex resets automatically.",
 			SettingKind::Boolean,
 			30,
+		),
+		field(
+			"lifecycle.handoffSaveToDisk",
+			"Save Handoff Sessions",
+			"Materialize handoff children as durable indexed journals.",
+			SettingKind::Boolean,
+			35,
 		),
 		field(
 			"lifecycle.gcRetentionDays",

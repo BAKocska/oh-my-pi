@@ -1861,6 +1861,7 @@ fn chat_start(args: &mut ChatArgs) -> crate::chat::ChatStart {
 	reason = "chat dispatch preserves the thread-confined omp_tui::App future"
 )]
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
+	crate::startup_notice::stop_watchdog();
 	if let Some(journal) = cli.export.as_deref() {
 		let output = journal.with_extension("html");
 		let exported = crate::export::export_session(journal, &output).into_diagnostic()?;
@@ -1932,7 +1933,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Worktree(args) => crate::worktree_cmd::run(&data_dir(None)?, &args),
 		Command::Stats(args) => crate::stats_cmd::run(args).await,
 		Command::Gc(args) => crate::gc_cmd::run(args),
-		Command::Usage(args) => crate::usage_cmd::run(args),
+		Command::Usage(args) => crate::usage_cmd::run(args).await,
 		Command::Bench(args) => crate::bench_cmd::run(args).await,
 		Command::DryBalance(args) => crate::dry_balance_cmd::run(args).await,
 		Command::TinyModels(args) => crate::tiny_models_cmd::run(args).await,

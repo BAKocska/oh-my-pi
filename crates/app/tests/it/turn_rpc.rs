@@ -302,6 +302,7 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 		executor:       Some(pb::Executor { tools: vec!["exec.shell".to_owned()] }),
 		props:          None,
 		provider_reset: false,
+		stream_watchdog: omp_agent::StreamWatchdog::default(),
 	};
 
 	let first_id = ProviderTurnId::from("turn-full");

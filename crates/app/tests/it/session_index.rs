@@ -75,7 +75,7 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 		})
 		.expect("durable turn start");
 	journal
-		.append_gateway_outcome(4, "turn-1", pb::Outcome {
+		.append_arbiter_outcome(4, "turn-1", pb::Outcome {
 			stop: pb::StopReason::StopEndTurn as i32,
 			usage: Some(pb::Usage {
 				input_tokens: 120,

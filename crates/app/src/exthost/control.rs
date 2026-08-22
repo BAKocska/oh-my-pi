@@ -10,6 +10,34 @@ pub const MAX_RAW_TERMINAL_FRAME_BYTES: usize = 4096;
 /// Maximum payload admitted through the trusted direct-filesystem escape.
 pub const MAX_DIRECT_FILESYSTEM_BYTES: usize = 1024 * 1024;
 
+/// Manifest capability permitting cross-extension campaign projection.
+pub const CAMPAIGNS_READ_CAPABILITY: &str = "campaigns.read";
+
+/// Cross-extension campaign projection authorization failure.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum CampaignAccessError {
+	/// The caller requested another extension without `campaigns.read`.
+	#[error("cross-extension campaign reads require campaigns.read")]
+	ReadCapability,
+}
+
+/// Authorizes own-extension reads and capability-gated cross-extension reads.
+pub fn authorize_campaign_read(
+	caller: &str,
+	target: &str,
+	capabilities: &BTreeSet<Str>,
+) -> Result<(), CampaignAccessError> {
+	if caller == target
+		|| capabilities
+			.iter()
+			.any(|capability| capability.as_str() == CAMPAIGNS_READ_CAPABILITY)
+	{
+		Ok(())
+	} else {
+		Err(CampaignAccessError::ReadCapability)
+	}
+}
+
 /// Focus-owned raw-input admission failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RawInputError {
@@ -1404,5 +1432,21 @@ fn user_block(part: Part) -> Result<UserBlock, JournalControlError> {
 		},
 		Some(part::Kind::Thinking(_) | part::Kind::Fallback(_) | part::Kind::ServerTool(_))
 		| None => Err(JournalControlError::InvalidContext),
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn campaign_reads_are_own_extension_or_capability_gated() {
+		let mut capabilities = BTreeSet::new();
+		assert_eq!(authorize_campaign_read("dev.a", "dev.a", &capabilities), Ok(()));
+		assert_eq!(
+			authorize_campaign_read("dev.a", "dev.b", &capabilities),
+			Err(CampaignAccessError::ReadCapability)
+		);
+		capabilities.insert(Str::new_static(CAMPAIGNS_READ_CAPABILITY));
+		assert_eq!(authorize_campaign_read("dev.a", "dev.b", &capabilities), Ok(()));
 	}
 }

@@ -13,6 +13,10 @@ use omp_storage::transcript::TitleSource;
 /// Pi-parity online role chain. Role resolution performs one completion using
 /// the first available assignment; it must not issue one request per role.
 pub const ONLINE_TITLE_ROLE_CHAIN: [&str; 3] = ["tiny", "commit", "smol"];
+/// System instruction used by production title completions.
+pub const TITLE_SYSTEM_PROMPT: &str = "Generate a concise session title of at most 80 characters. \
+                                       Return only the title, without analysis, quotes, Markdown, \
+                                       or a trailing period.";
 
 const FILLER: &[&str] = &[
 	"hi",
