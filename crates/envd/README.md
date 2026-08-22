@@ -1,0 +1,59 @@
+# omp-envd
+
+`omp-envd` is OMP's live project-environment host. It assembles and serves the
+environment daemon and owns project-scoped filesystem and document access,
+process execution, workspace search, blob storage, tool dispatch, policy, and
+extension runtime resources exposed through the environment protocol.
+
+This is the crate to change for host behavior. `omp-env` is only the typed
+client and framing boundary; it does not contain an alternate host.
+
+## Structure
+
+- `server` owns environment-service dispatch, project state, client
+  connections, and the `EnvServer`/`EnvdError` server boundary.
+- `workspace`, `docs`, `document_cache`, `search_backend`, and `tool_search`
+  provide workspace, search, and document operations.
+- `exec`, `process_store`, `process_log`, `shell_profile`, and `direnv` manage
+  commands, named processes, logs, and shell environment setup.
+- `tools` and the `tool_*` modules implement daemon-backed tool operations.
+- `exthost` owns extension manifests, lifecycle, CONTROL routing, quotas,
+  service routing, cancellation, and the extension-host child entry point.
+  `worker` supervises the same-binary free-threaded Python extension hosts and
+  Python tool workers; `worker_pool` owns named-worker routing and
+  generation-fenced DATA transport.
+- `policy`, `admission`, `http_egress`, `vault`, and `recovery` enforce access
+  decisions and manage durable runtime state.
+- `run` starts the platform transport. `ProjectEnvironment` connects to or
+  starts the project host and retains the client plus host-owned lifetimes.
+
+The `omp` executable recognizes the hidden eval, extension-host, and Python
+worker child arguments because those children re-enter the same binary.
+Their entry functions and runtime implementations remain owned by
+`omp-envd`; `omp-app` only performs process-level dispatch.
+
+## Philosophy
+
+The daemon is the single owner of project environment resources. Clients
+request effects through the typed environment protocol instead of opening
+competing filesystem, process, document, worker, or extension-host
+authorities. Resource lifetimes, policy checks, cancellation, and recovery
+therefore remain attached to daemon-owned project state for both embedded and
+connected transports.
+
+The crate is deliberately below the headless driver and application layers.
+Capabilities that require campaign state, inference composition,
+application-authored content, host RPC resources, or telemetry delivery enter
+through `RegistryBridges`. `omp-driver` constructs those bridges and the
+session composition; `omp-envd` does not import app presentation policy.
+
+## Development
+
+Run `just setup-python` once before commands that link embedded Python. Then
+use the workspace recipes:
+
+- `just check-pkg omp-envd`
+- `just test-pkg omp-envd`
+
+Run joined behavior separately with `just e2e` or the exact narrower E2E
+recipe shown by `just --list`.

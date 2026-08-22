@@ -1,0 +1,67 @@
+//! Core-owned extension-host lifecycle, CONTROL accounting, and service
+//! routing.
+//!
+//! Process ownership remains in [`crate::worker::ExtHostSupervisor`].
+//! Children are spawned lazily at a declared surface's first reach.
+
+pub mod cancel;
+pub mod context;
+pub mod control;
+pub mod dispatch;
+pub mod lifecycle;
+pub mod params;
+pub mod presentation;
+pub mod quota;
+pub mod services;
+pub mod spawn;
+pub use cancel::{
+	CANCEL_GRACE, CancelStage, CancellationError, CancellationJournal, CancellationLadder,
+	CancellationOutcome, MAX_KILL_ESCALATIONS_PER_SESSION,
+};
+pub use context::LiveContextControlOwner;
+pub use control::{
+	ControlAuthority, ControlAuthorityFactory, ControlCompositionError, EnvdControlAuthorities,
+	ExternalControlAuthorities, FixedControlAuthorityFactory, HostControlAuthorityFactory,
+	PersistenceControlAuthorities, PolicyControlAuthorities, PresentationControlAuthorities,
+	ProviderControlAuthorities, RegistryControlAuthorities,
+};
+pub use dispatch::{
+	CAMPAIGN_SUBMISSION_TIMEOUT, CallbackConcurrency, CampaignDispatch, CampaignDispatchError,
+	DispatchError, DispatchPending, DispatchRequest, DispatchRouter, EventDeadline,
+	decode_campaign_reaction,
+};
+pub use lifecycle::{
+	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,
+	AvailabilityBatch, AvailabilitySink, CampaignDeclarationTable, CampaignManifestError,
+	ControlLifecycleHost, DeclarationDrift, DeclarationSet, ExtensionManifest, GenerationFence,
+	HookDeclarationKey, LifecycleError, LifecycleHost, LifecycleMachine, Principal,
+	PrincipalAuthority, PrincipalMismatch, RegistryAvailabilitySink, RestartReason,
+	ToolDeclarationKey, validate_campaign_manifests,
+};
+pub use params::{
+	DIRECT_FILESYSTEM_CAPABILITY, DirectFilesystemAuthorityError, DirectFilesystemControlOwner,
+	DirectFilesystemEntry, DirectFilesystemExecutor, DirectFilesystemJournal,
+	DirectFilesystemOutput, DirectFilesystemStat, MAX_PENDING_PARAMETER_PULLS,
+	ParameterAuthorityError, ParameterControlOwner, ParameterOperation, ParameterPathPart,
+	ParameterPullRequest, ParameterPullResult, ParameterSource,
+};
+pub use presentation::{
+	TelemetryControlAuthority, TelemetryControlRequest, UiControlAuthority, UiControlOwner,
+	UiControlRequest, UiControlResult, VerdictControlAuthority, VerdictControlOwner,
+};
+pub use quota::{
+	ChargeOutcome, ControlQuotaLedger, FairControlQueue, QuotaBehavior, QuotaError, QuotaExceeded,
+	QuotaScope, QuotaSpec, QuotaStatus, ResourceReceipt,
+};
+pub use services::{
+	PendingServiceCall, ServiceBroker, ServiceCallError, ServiceCallId, ServiceCancellation,
+	ServiceConnection, ServiceDeclarationDrift, ServiceDispatch, ServiceError, ServiceKey,
+	ServiceManifest, ServiceRequestMeta, ServiceResponse, ServiceRoute, ServiceTransport,
+};
+pub use spawn::{
+	CONTROL_FD_ENV, ENV_SOCKET_ENV, EXT_HOST_ARG, HostChildLimit, HostLog, HostLogStream,
+	PY_SITE_ENV, RunningHost, RunningHostError, SpawnError, SpawnSpec, SpawnedHost,
+	run_ext_host_entry,
+};
+
+pub use crate::worker::{ControlHostStartError, ExtHostSupervisor, HostKey};
