@@ -141,7 +141,8 @@ pub struct ResolvedDapAdapter {
 	/// Launch defaults.
 	pub launch_defaults: DapProvenanced<Map<String, Value>>,
 	/// Attach defaults.
-	/// `skipAttachRequest: true` marks an adapter that connected before DAP startup.
+	/// `skipAttachRequest: true` marks an adapter that connected before DAP
+	/// startup.
 	pub attach_defaults: DapProvenanced<Map<String, Value>>,
 	/// Directory launch support.
 	pub accepts_directory_program: DapProvenanced<bool>,
@@ -488,17 +489,10 @@ mod tests {
 			),
 			yaml:       false,
 		};
-		let adapters = load_dap_config(
-			std::iter::empty::<DapAdapterSpec>(),
-			&[source],
-		)
-		.unwrap();
+		let adapters = load_dap_config(std::iter::empty::<DapAdapterSpec>(), &[source]).unwrap();
 		let adapter = adapters["pico-openocd"].to_spec().unwrap();
 
 		assert!(adapter.skip_attach_request());
-		assert_eq!(
-			adapter.merged_arguments(true, &Map::new())["skipAttachRequest"],
-			true
-		);
+		assert_eq!(adapter.merged_arguments(true, &Map::new())["skipAttachRequest"], true);
 	}
 }

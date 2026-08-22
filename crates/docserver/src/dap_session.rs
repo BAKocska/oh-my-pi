@@ -300,7 +300,8 @@ pub struct DapSession {
 
 impl DapSession {
 	/// Runs initialize, an optional launch/attach request, and the adapter's
-	/// supported configuration handshake with initialized-event pre-subscription.
+	/// supported configuration handshake with initialized-event
+	/// pre-subscription.
 	pub async fn start(
 		id: impl AsRef<str>,
 		adapter: impl AsRef<str>,
@@ -1215,11 +1216,7 @@ mod tests {
 
 	fn fake_adapter(
 		supports_configuration_done: bool,
-	) -> (
-		DapProtocol,
-		Arc<Mutex<Vec<Str>>>,
-		tokio::task::JoinHandle<()>,
-	) {
+	) -> (DapProtocol, Arc<Mutex<Vec<Str>>>, tokio::task::JoinHandle<()>) {
 		let (client, mut adapter) = tokio::io::duplex(16 * 1024);
 		let (reader, writer) = tokio::io::split(client);
 		let protocol = DapProtocol::from_streams(reader, writer);
@@ -1227,12 +1224,8 @@ mod tests {
 		let request_log = Arc::clone(&requests);
 		let task = tokio::spawn(async move {
 			loop {
-				let Ok(body) = crate::lsp_process::read_frame(
-					&mut adapter,
-					8 * 1024,
-					16 * 1024 * 1024,
-				)
-				.await
+				let Ok(body) =
+					crate::lsp_process::read_frame(&mut adapter, 8 * 1024, 16 * 1024 * 1024).await
 				else {
 					break;
 				};
@@ -1298,10 +1291,7 @@ mod tests {
 			.lock()
 			.iter()
 			.filter(|command| {
-				matches!(
-					command.as_str(),
-					"initialize" | "attach" | "launch" | "configurationDone"
-				)
+				matches!(command.as_str(), "initialize" | "attach" | "launch" | "configurationDone")
 			})
 			.cloned()
 			.collect()
@@ -1348,63 +1338,39 @@ mod tests {
 	#[tokio::test]
 	async fn preattached_session_without_configuration_done_starts_running_immediately() {
 		let (protocol, requests, adapter) = fake_adapter(false);
-		let session = DapSession::start(
-			"preattached",
-			"test",
-			protocol,
-			true,
-			adapter_arguments(true),
-			None,
-		)
-		.await
-		.unwrap();
+		let session =
+			DapSession::start("preattached", "test", protocol, true, adapter_arguments(true), None)
+				.await
+				.unwrap();
 
 		assert_eq!(session.state(), DapSessionState::Running);
-		assert_eq!(
-			handshake_requests(&requests),
-			vec![Str::new_static("initialize")]
-		);
+		assert_eq!(handshake_requests(&requests), vec![Str::new_static("initialize")]);
 		stop_fake_adapter(&session, adapter).await;
 	}
 
 	#[tokio::test]
 	async fn preattached_session_completes_configuration_without_attach_request() {
 		let (protocol, requests, adapter) = fake_adapter(true);
-		let session = DapSession::start(
-			"preattached",
-			"test",
-			protocol,
-			true,
-			adapter_arguments(true),
-			None,
-		)
-		.await
-		.unwrap();
+		let session =
+			DapSession::start("preattached", "test", protocol, true, adapter_arguments(true), None)
+				.await
+				.unwrap();
 
 		assert_eq!(session.state(), DapSessionState::Running);
-		assert_eq!(
-			handshake_requests(&requests),
-			vec![
-				Str::new_static("initialize"),
-				Str::new_static("configurationDone"),
-			]
-		);
+		assert_eq!(handshake_requests(&requests), vec![
+			Str::new_static("initialize"),
+			Str::new_static("configurationDone"),
+		]);
 		stop_fake_adapter(&session, adapter).await;
 	}
 
 	#[tokio::test]
 	async fn normal_attach_request_and_configuration_handshake_are_unchanged() {
 		let (protocol, requests, adapter) = fake_adapter(true);
-		let session = DapSession::start(
-			"attached",
-			"test",
-			protocol,
-			true,
-			adapter_arguments(false),
-			None,
-		)
-		.await
-		.unwrap();
+		let session =
+			DapSession::start("attached", "test", protocol, true, adapter_arguments(false), None)
+				.await
+				.unwrap();
 
 		assert_eq!(session.state(), DapSessionState::Running);
 		let requests = handshake_requests(&requests);
@@ -1415,7 +1381,11 @@ mod tests {
 				.count(),
 			1
 		);
-		assert!(requests.iter().any(|command| command.as_str() == "configurationDone"));
+		assert!(
+			requests
+				.iter()
+				.any(|command| command.as_str() == "configurationDone")
+		);
 		stop_fake_adapter(&session, adapter).await;
 	}
 }
