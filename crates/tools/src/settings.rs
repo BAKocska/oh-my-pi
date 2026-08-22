@@ -6,6 +6,10 @@ use omp_settings::{
 use serde::{Deserialize, Serialize};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
+/// Scope set matching the app root `images.*` registration
+/// (runtime-overridable).
+const PERSISTED_RUNTIME: &[SettingScope] =
+	&[SettingScope::Global, SettingScope::Project, SettingScope::Runtime];
 /// Default number of prior diagnostic identities retained for deduplication.
 pub const DEFAULT_DIAGNOSTIC_HISTORY_CAPACITY: usize = 1_024;
 /// Default maximum diagnostics retained in one committed batch.
@@ -104,12 +108,15 @@ impl SettingsDomain for FetchSettings {
 
 impl SettingsDomain for ImageSettings {
 	const DOMAIN: &'static str = "images";
-	const FIELDS: &'static [FieldDescriptor] = &[field(
-		"images.autoResize",
-		"Auto-resize images",
-		"Resize oversized images before model delivery.",
-		10,
-	)];
+	const FIELDS: &'static [FieldDescriptor] = &[FieldDescriptor {
+		scopes: PERSISTED_RUNTIME,
+		..field(
+			"images.autoResize",
+			"Auto-resize images",
+			"Resize oversized images before model delivery.",
+			10,
+		)
+	}];
 }
 
 impl SettingsDomain for ReadSettings {

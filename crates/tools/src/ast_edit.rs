@@ -76,6 +76,7 @@ pub struct AstEdit {
 	root: PathBuf,
 	spec: ToolSpec,
 }
+
 pub fn tool(root: PathBuf) -> AstEdit {
 	AstEdit {
 		root,
