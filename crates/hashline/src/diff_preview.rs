@@ -18,6 +18,8 @@ use crate::{
 
 const DEFAULT_ADDED_RUN_CONTEXT_LINES: usize = 2;
 const ELISION: &str = "…";
+/// Maximum physical terminal rows shown by a compact, collapsed edit diff.
+pub const COLLAPSED_DIFF_ROWS: u16 = 40;
 
 /// Canonical pi-style numbered diff over exact base and current UTF-8 bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
