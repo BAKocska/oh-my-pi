@@ -862,6 +862,8 @@ pub enum Command {
 	/// Run a single prompt and stream its response to standard output.
 	#[command(alias = "p")]
 	Print(PrintArgs),
+	/// Replay a durable session through the production transcript renderer.
+	Render(crate::render_cmd::RenderArgs),
 	/// Run the stateful Content-Length framed RPC server on standard I/O.
 	Rpc(RpcArgs),
 	/// Run RPC with retained UI frame support.
@@ -1021,6 +1023,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "envd", aliases: &[] },
 	CommandSpec { name: "chat", aliases: &["i", "launch"] },
 	CommandSpec { name: "print", aliases: &["p"] },
+	CommandSpec { name: "render", aliases: &[] },
 	CommandSpec { name: "infer", aliases: &[] },
 	CommandSpec { name: "join", aliases: &[] },
 	CommandSpec { name: "rpc", aliases: &[] },
@@ -1916,6 +1919,7 @@ enum DispatchTarget {
 	Envd,
 	Chat,
 	Print,
+	Render,
 	Rpc,
 	RpcUi,
 	Acp,
@@ -1957,6 +1961,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	match command {
 		None | Some(Command::Chat(_)) => DispatchTarget::Chat,
 		Some(Command::Print(_)) => DispatchTarget::Print,
+		Some(Command::Render(_)) => DispatchTarget::Render,
 		Some(Command::Rpc(_)) => DispatchTarget::Rpc,
 		Some(Command::RpcUi(_)) => DispatchTarget::RpcUi,
 		Some(Command::Acp(_)) => DispatchTarget::Acp,
@@ -2090,6 +2095,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			.await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
+		Command::Render(args) => crate::render_cmd::run(args, &data_dir(None)?),
 		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
@@ -2594,6 +2600,33 @@ mod tests {
 		};
 		assert!(args.model.is_none());
 	}
+	#[test]
+	fn parses_headless_render_profile_flags() {
+		let Some(Command::Render(args)) = parse(&[
+			"omp",
+			"render",
+			"01K3A0",
+			"--width",
+			"96",
+			"--height",
+			"30",
+			"--timing",
+			"--repaint",
+			"3",
+			"--plain",
+		])
+		.command
+		else {
+			panic!("render command");
+		};
+		assert_eq!(args.session.as_deref(), Some("01K3A0"));
+		assert_eq!(args.width, Some(96));
+		assert_eq!(args.height, Some(30));
+		assert!(args.timing && args.plain);
+		assert_eq!(args.repaint, Some(3));
+		assert_eq!(dispatch_target(Some(&Command::Render(args))), DispatchTarget::Render);
+	}
+
 	#[test]
 	fn parses_standalone_join_link() {
 		let Some(Command::Join(args)) = parse(&["omp", "join", "room.credentials"]).command else {

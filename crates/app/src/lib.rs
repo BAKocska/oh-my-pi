@@ -69,6 +69,7 @@ pub mod project_state;
 pub mod prompt_input;
 pub mod prompt_prep;
 pub mod prompt_templates;
+pub mod render_cmd;
 pub mod rpc_adapter;
 pub mod rpc_mode;
 pub mod rulebook;
